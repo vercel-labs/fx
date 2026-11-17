@@ -8,7 +8,7 @@
 //   bun tests/tla/drivers/acp/sessions/driver.ts --model today   # fx before many sessions
 //
 // --model rules (the default) checks many sessions. --model today checks the
-// model of fx before them; a build of #1786 at 13bb8f7a4, chosen with
+// model of fx before them; an older build with one session, chosen with
 // FX_WORKTREE or FX_BIN, fails --model rules. --random sets how many seeded
 // plans run, --steps their length, --seed the seed, and --only a pattern of
 // plan names. No model calls: every reply comes from a fake Gateway the

@@ -10,12 +10,13 @@
 //   bun tests/tla/drivers/acp/turn_events/driver.ts --model root-field   # before sh.fx/commandResult
 //
 // --model rules (the default) checks the turn events rules. --model today
-// checks the model of fx acp before them; a build of #2021, chosen with
-// FX_WORKTREE or FX_BIN, fails --model rules for every client that lists a
-// part. --model root-field checks fx acp with those rules but a root
-// command_result field on shell calls; a build of #2044 fails --model rules
-// for every client. --only takes a pattern of plan names. No model calls: every reply
-// comes from a fake Gateway.
+// checks the model of fx acp before them; a build from before turn events,
+// chosen with FX_WORKTREE or FX_BIN, fails --model rules for every client
+// that lists a part. --model root-field checks fx acp with those rules but a
+// root command_result field on shell calls; a build from before
+// sh.fx/commandResult fails --model rules for every client. --only takes a
+// pattern of plan names. No model calls: every reply comes from a fake
+// Gateway.
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { binary, worktree } from "../../lib/context";

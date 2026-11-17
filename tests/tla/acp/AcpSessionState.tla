@@ -16,7 +16,7 @@
 (*    stopReason.                                                          *)
 (*  - session/status says open while any connection holds the session,   *)
 (*    and gives its state.                                                 *)
-(*  - session/list answers at once, even during a turn (X24).             *)
+(*  - session/list answers at once, even during a turn.                   *)
 (*  - After a session in a folder is saved for the first time, saves a    *)
 (*    turn, gets a title, or is deleted, fx sends a hint to every         *)
 (*    connection that listed that folder or every folder.                 *)
@@ -25,7 +25,7 @@
 (* is an unknown method, which gets -32601, or -32600 while the session it *)
 (* names runs a turn. session/list answers during a turn: since fx acp     *)
 (* holds many sessions (AcpSessions.tla), a turn holds up only requests    *)
-(* for its own session. Before, list got -32600 while any turn ran (X24).  *)
+(* for its own session. Before, list got -32600 while any turn ran.        *)
 (***************************************************************************)
 EXTENDS Integers, Sequences, FiniteSets
 
@@ -55,7 +55,7 @@ VARIABLES
     subs,       \* [Conns -> SUBSET (Folders \cup {All})]: what the client has listed
     seen,       \* [Conns -> [Folders -> Int]]: the version of each folder's list the client holds
     hinted,     \* [Conns -> SUBSET Folders]: hints read since the client last listed the folder
-    refused,    \* the last session/list got -32600 (X24)
+    refused,    \* the last session/list got -32600
     badOrder,   \* an update was read while the client's view said the session wasn't running
     turns, changes
 
@@ -192,7 +192,7 @@ Delete(s) ==
 \* current version of each folder it read.
 \* Whether session/list is refused: never, under the rules and since fx acp
 \* holds many sessions. Before, fx refused it while a turn ran on the
-\* connection (X24).
+\* connection.
 RefusesList(c) == FALSE
 
 List(c, f) ==
@@ -268,7 +268,7 @@ ListFresh ==
     \A c \in Conns, f \in Folders :
         (Covers(c, f) /\ seen[c][f] < ver[f]) => (f \in hinted[c] \/ PendingHint(c, f))
 
-\* session/list is never refused (X24).
+\* session/list is never refused.
 ListAnswered == ~refused
 
 \* A session/status request that any connection sends now gets what is true.
