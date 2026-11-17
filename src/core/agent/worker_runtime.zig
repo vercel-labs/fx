@@ -626,6 +626,13 @@ pub const WorkerRuntime = struct {
     worker_stop_requested: bool = false,
     finalization_failure: ?FinalizationFailure = null,
     worker_cancel_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    /// Set with `worker_cancel_requested` only by a cancel that stops the
+    /// turn: the user's, an approval turn's, a running compaction's, or a
+    /// failed finalization. A steer or a subagent's report that interrupts
+    /// the model, or an image or `$skill` handed off to run next, never sets
+    /// it, so a turn's workspace captures, which watch it, stop only when the
+    /// turn is cancelled (D98). Cleared as each turn starts.
+    turn_cancel_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     /// Set when the user answers a request that waits for them; the request's
     /// recovery reads and clears it (`RequestRecovery.continue_flag`).
     recovery_continue_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
@@ -667,10 +674,18 @@ pub const WorkerRuntime = struct {
     /// `finish_prompt` events pushed and not yet acknowledged. Guarded by
     /// `worker_mutex`; counted only while `commit_gate` is on.
     unacknowledged_finishes: u32 = 0,
-    /// When `unacknowledged_finishes` last left zero, in awake milliseconds.
+    /// When this spell of holding mail began, in awake milliseconds: the first
+    /// time `commitGateRemainingMsLocked` found mail to hold for the commits
+    /// owed. Not when the finish was pushed, so mail that comes late still
+    /// waits for its own limit. Guarded by `worker_mutex`.
     commit_gate_since_ms: i64 = 0,
-    /// Whether this spell of holding mail has been logged.
+    /// Whether this spell of holding mail has begun and been logged
+    /// (`commit_gate_since_ms` is set).
     commit_gate_logged: bool = false,
+    /// Set when the loop's flush of its pacer for the held mail failed
+    /// (`noteCommitGateFlushFailed`), so it does not try again, and log again,
+    /// on every pass. Guarded by `worker_mutex`; cleared with the count.
+    commit_gate_flush_failed: bool = false,
     /// Independent of a pending submission's turn-start hold; protects queued
     /// work until a fresh-session scrollback handoff succeeds or is cancelled.
     session_transition_held: bool = false,
@@ -736,6 +751,12 @@ pub const WorkerRuntime = struct {
         self.worker_mutex.lockUncancelable(io_mod.getIo());
         defer self.worker_mutex.unlock(io_mod.getIo());
         self.compaction_presentation.running(id, stage);
+    }
+
+    pub fn writtenCompactionActivity(self: *WorkerRuntime, id: compaction_activity.OperationId, percent: u8) void {
+        self.worker_mutex.lockUncancelable(io_mod.getIo());
+        defer self.worker_mutex.unlock(io_mod.getIo());
+        self.compaction_presentation.written(id, percent);
     }
 
     pub fn settleCompactionActivity(self: *WorkerRuntime, id: compaction_activity.OperationId, feedback: compaction_activity.Feedback) void {
@@ -902,6 +923,7 @@ pub const WorkerRuntime = struct {
     fn markExplicitCancellationLocked(self: *WorkerRuntime) void {
         self.steering_cancel_turn_id = null;
         self.clearHandoffLocked();
+        self.turn_cancel_requested.store(true, .seq_cst);
         self.worker_cancel_requested.store(true, .seq_cst);
         self.stopCompactionActivityLocked();
         self.worker_cond.broadcast(io_mod.getIo());
@@ -934,6 +956,7 @@ pub const WorkerRuntime = struct {
         });
         self.steering_cancel_turn_id = null;
         self.clearHandoffLocked();
+        self.turn_cancel_requested.store(true, .seq_cst);
         self.worker_cancel_requested.store(true, .seq_cst);
         self.stopCompactionActivityLocked();
         self.worker_cond.broadcast(io_mod.getIo());
@@ -945,6 +968,7 @@ pub const WorkerRuntime = struct {
 
         self.steering_cancel_turn_id = null;
         self.clearHandoffLocked();
+        self.turn_cancel_requested.store(true, .seq_cst);
         self.worker_cancel_requested.store(true, .seq_cst);
         self.stopCompactionActivityLocked();
         _ = self.resolvePendingPermissionLocked(
@@ -958,6 +982,12 @@ pub const WorkerRuntime = struct {
 
     pub fn isCancelRequested(self: *const WorkerRuntime) bool {
         return self.worker_cancel_requested.load(.seq_cst);
+    }
+
+    /// Whether a cancel that stops the turn was requested, as opposed to a
+    /// steer's interrupt of the model (`turn_cancel_requested`).
+    pub fn isTurnCancelRequested(self: *const WorkerRuntime) bool {
+        return self.turn_cancel_requested.load(.seq_cst);
     }
 
     /// The user answered a request that waits for them, for example with
@@ -1101,6 +1131,7 @@ pub const WorkerRuntime = struct {
         }
         self.worker_stop_requested = true;
         self.steering_cancel_turn_id = null;
+        self.turn_cancel_requested.store(true, .seq_cst);
         self.worker_cancel_requested.store(true, .seq_cst);
         self.stopCompactionActivityLocked();
         self.worker_cond.broadcast(io_mod.getIo());
@@ -1342,6 +1373,7 @@ pub const WorkerRuntime = struct {
             self.queued_history = &.{};
         }
         self.direct_steering_closed = false;
+        self.turn_cancel_requested.store(false, .seq_cst);
         self.worker_cancel_requested.store(false, .seq_cst);
         self.worker_processing = true;
         self.active_turn_id = turn_id;
@@ -1458,6 +1490,7 @@ pub const WorkerRuntime = struct {
             return true;
         }
         if (self.active_context_compaction) {
+            self.turn_cancel_requested.store(true, .seq_cst);
             self.worker_cancel_requested.store(true, .seq_cst);
             self.stopCompactionActivityLocked();
             self.worker_cond.broadcast(io_mod.getIo());
@@ -1832,7 +1865,9 @@ pub const WorkerRuntime = struct {
         self.worker_cond.broadcast(io_mod.getIo());
     }
 
-    /// The longest mail that missed a turn waits for that turn's commit.
+    /// The longest mail that missed a turn waits for that turn's commit,
+    /// counted from the first time the gate holds it (`commit_gate_since_ms`),
+    /// not from the moment the turn finished.
     pub const commit_gate_limit_ms: i64 = 5000;
 
     /// Opts this worker into the commit gate. Only a host that applies the
@@ -1874,6 +1909,7 @@ pub const WorkerRuntime = struct {
         if (!self.commit_gate or self.unacknowledged_finishes == 0) return;
         self.unacknowledged_finishes -|= count;
         if (self.unacknowledged_finishes > 0) return;
+        self.commit_gate_flush_failed = false;
         if (self.commit_gate_logged) {
             debug_trace.eventf("worker", "commit_gate_released", .{ .turn_id = self.active_turn_id }, "worker={x} waited_ms={d} reason={s}", .{ @intFromPtr(self), self.commitGateWaitedMsLocked(), reason });
         }
@@ -1882,7 +1918,6 @@ pub const WorkerRuntime = struct {
     }
 
     fn noteFinishPushedLocked(self: *WorkerRuntime) void {
-        if (self.unacknowledged_finishes == 0) self.commit_gate_since_ms = commitGateNowMs();
         self.unacknowledged_finishes +|= 1;
     }
 
@@ -1893,6 +1928,40 @@ pub const WorkerRuntime = struct {
 
     fn commitGateWaitedMsLocked(self: *WorkerRuntime) i64 {
         return @max(0, commitGateNowMs() - self.commit_gate_since_ms);
+    }
+
+    /// The mail the gate holds while a finished turn's commit is
+    /// unacknowledged: the head of the queue when it is a continuation and no
+    /// compaction is queued. Null when the gate holds nothing.
+    fn commitGateHeldHeadLocked(self: *const WorkerRuntime) ?*const QueuedPrompt {
+        if (!self.commit_gate or self.unacknowledged_finishes == 0) return null;
+        if (self.queued_context_compaction != null or self.queued_prompts.items.len == 0) return null;
+        const head = &self.queued_prompts.items[0];
+        if (!head.delivery.isContinuation()) return null;
+        return head;
+    }
+
+    /// Whether the gate holds mail for a commit the loop has not made, and a
+    /// flush of the loop's pacer has not failed for it. The main loop asks
+    /// while a prompt keeps its pacer from showing the finished turn that
+    /// commit waits for, which the next turn's own start would show; that
+    /// start is the work the gate holds back.
+    pub fn commitGateWaitsForCommit(self: *WorkerRuntime) bool {
+        self.worker_mutex.lockUncancelable(io_mod.getIo());
+        defer self.worker_mutex.unlock(io_mod.getIo());
+        return self.commitGateHeldHeadLocked() != null and !self.commit_gate_flush_failed;
+    }
+
+    /// The main loop's note that its flush of the pacer for the held mail
+    /// failed. The gate's time limit still ends the hold; the loop does not
+    /// try again until the count has reached zero. A flush whose commit failed
+    /// has acknowledged it already (`appendFinishedPrompt` does in a `defer`),
+    /// so the count may be zero by now: that hold is over, and a mark set for
+    /// it would outlive it, since nothing clears a mark at a count of zero.
+    pub fn noteCommitGateFlushFailed(self: *WorkerRuntime) void {
+        self.worker_mutex.lockUncancelable(io_mod.getIo());
+        defer self.worker_mutex.unlock(io_mod.getIo());
+        if (self.unacknowledged_finishes > 0) self.commit_gate_flush_failed = true;
     }
 
     /// Null when the gate lets the next work begin; otherwise how many
@@ -1908,24 +1977,31 @@ pub const WorkerRuntime = struct {
     /// still finishes, a failed commit still acknowledges, and a finish the
     /// loop drops unsaved is acknowledged as dropped); a stop of this
     /// worker, which the wait loops check on their own; and
-    /// `commit_gate_limit_ms` after the finish was pushed, when it logs
+    /// `commit_gate_limit_ms` after the gate first held the mail, when it logs
     /// `commit_gate_expired`, forgets the unacknowledged count, and lets the
     /// mail begin as it did before the gate.
+    ///
+    /// The limit counts from the first hold, not from the finish push, so
+    /// mail that comes later than the limit after the turn ended is held for
+    /// the same time as mail that comes at once: the loop's flush for a prompt
+    /// that keeps the pacer from showing the turn runs while the hold stands.
+    /// `waited_ms` in the trace lines `commit_gate_released` and
+    /// `commit_gate_expired` is how long the mail was held in this spell, and
+    /// no longer how long ago the finish was pushed.
     fn commitGateRemainingMsLocked(self: *WorkerRuntime) ?i64 {
-        if (!self.commit_gate or self.unacknowledged_finishes == 0) return null;
-        if (self.queued_context_compaction != null or self.queued_prompts.items.len == 0) return null;
-        const head = self.queued_prompts.items[0];
-        if (!head.delivery.isContinuation()) return null;
+        const head = self.commitGateHeldHeadLocked() orelse return null;
+        if (!self.commit_gate_logged) {
+            self.commit_gate_logged = true;
+            self.commit_gate_since_ms = commitGateNowMs();
+            debug_trace.eventf("worker", "commit_gate_held", .{ .turn_id = head.turn_id }, "worker={x} mail={s} unacknowledged={d}", .{ @intFromPtr(self), @tagName(head.mail), self.unacknowledged_finishes });
+        }
         const waited = self.commitGateWaitedMsLocked();
         if (waited >= commit_gate_limit_ms) {
             debug_trace.eventf("worker", "commit_gate_expired", .{ .turn_id = head.turn_id }, "worker={x} unacknowledged={d} waited_ms={d} mail={s} reason=timeout", .{ @intFromPtr(self), self.unacknowledged_finishes, waited, @tagName(head.mail) });
             self.unacknowledged_finishes = 0;
             self.commit_gate_logged = false;
+            self.commit_gate_flush_failed = false;
             return null;
-        }
-        if (!self.commit_gate_logged) {
-            self.commit_gate_logged = true;
-            debug_trace.eventf("worker", "commit_gate_held", .{ .turn_id = head.turn_id }, "worker={x} mail={s} unacknowledged={d}", .{ @intFromPtr(self), @tagName(head.mail), self.unacknowledged_finishes });
         }
         return commit_gate_limit_ms - waited;
     }
@@ -2256,6 +2332,7 @@ pub const WorkerRuntime = struct {
         if (self.worker_stop_requested) return null;
         if (self.queued_context_compaction) |task| {
             self.queued_context_compaction = null;
+            self.turn_cancel_requested.store(false, .seq_cst);
             self.worker_cancel_requested.store(false, .seq_cst);
             self.worker_processing = true;
             self.active_turn_id = task.turn_id;
@@ -2325,6 +2402,7 @@ pub const WorkerRuntime = struct {
         if (transfer_history) self.queued_history = &.{};
         job.history = job_history;
         self.steering_cancel_turn_id = null;
+        self.turn_cancel_requested.store(false, .seq_cst);
         self.worker_cancel_requested.store(false, .seq_cst);
         self.worker_processing = true;
         self.active_turn_id = job.turn_id;
@@ -2394,6 +2472,7 @@ pub const WorkerRuntime = struct {
         defer self.worker_mutex.unlock(io_mod.getIo());
         if (self.worker_processing or self.worker_stop_requested) return false;
         self.direct_steering_closed = false;
+        self.turn_cancel_requested.store(false, .seq_cst);
         self.worker_cancel_requested.store(false, .seq_cst);
         self.worker_processing = true;
         self.active_turn_id = turn_id;
@@ -3195,6 +3274,16 @@ pub const WorkerRuntime = struct {
         return response;
     }
 
+    /// Whether a turn of this worker waits for the answer to a permission
+    /// request, and has not been stopped. It reads under the lock a request
+    /// holds while its observer registers it, so a request that is being
+    /// registered counts once it is.
+    pub fn permissionWaiting(self: *WorkerRuntime) bool {
+        self.worker_mutex.lockUncancelable(io_mod.getIo());
+        defer self.worker_mutex.unlock(io_mod.getIo());
+        return self.permissionRequestAwaitedLocked();
+    }
+
     pub fn submitPermissionResponse(
         self: *WorkerRuntime,
         expected_request_id: u64,
@@ -3801,6 +3890,36 @@ test "session transfer preserves active and finished prompt snapshots" {
         try std.Io.Dir.accessAbsolute(std.testing.io, path, .{});
         try std.Io.Dir.deleteFileAbsolute(std.testing.io, path);
     }
+}
+
+test "a reader never sees the summary's count fall while the worker writes it" {
+    var runtime: WorkerRuntime = .{};
+    defer runtime.deinit(std.testing.allocator);
+    const id = runtime.beginCompactionActivity(.manual, null);
+    runtime.runCompactionActivity(id, .summary);
+    const Writer = struct {
+        fn run(target: *WorkerRuntime, operation: compaction_activity.OperationId) void {
+            for (0..20_000) |round| {
+                const percent: u8 = @intCast(round * 99 / 20_000);
+                target.writtenCompactionActivity(operation, percent);
+                // A lower count, as a fallback model's reply sends, in between.
+                target.writtenCompactionActivity(operation, percent / 2);
+            }
+            target.writtenCompactionActivity(operation, 100);
+        }
+    };
+    const thread = try std.Thread.spawn(.{}, Writer.run, .{ &runtime, id });
+    var last: u8 = 0;
+    var reads: usize = 0;
+    while (last < 99) : (reads += 1) {
+        const now = runtime.compactionActivitySnapshot().operation.?.written_percent;
+        try std.testing.expect(now >= last);
+        try std.testing.expect(now <= 99);
+        last = now;
+    }
+    thread.join();
+    try std.testing.expectEqual(@as(u8, 99), runtime.compactionActivitySnapshot().operation.?.written_percent);
+    try std.testing.expect(reads > 0);
 }
 
 test "compaction activity survives worker finish without allocating a permission snapshot" {
@@ -5374,6 +5493,36 @@ test "interactive prompt during in-turn compaction activity waits without cancel
         .publication = .committed,
     });
     runtime.finishProcessing();
+}
+
+test "a steer or a hand-off that interrupts the model is not a turn cancel; the user's and an approval's are" {
+    const alloc = std.testing.allocator;
+    const Cancel = enum { interactive, request, approval };
+    for ([_]Cancel{ .interactive, .request, .approval }) |cancel| {
+        var runtime = WorkerRuntime{};
+        defer runtime.deinit(alloc);
+        try std.testing.expect(runtime.beginDirectProcessing(41));
+        try runtime.admitInteractivePrompt(alloc, try makePrompt(alloc, "steer", "model"));
+        try std.testing.expect(runtime.isCancelRequested());
+        try std.testing.expect(!runtime.cancellationStopsTurn());
+        try std.testing.expect(!runtime.isTurnCancelRequested());
+        // An image ends the turn to run next, still without a cancel.
+        try runtime.admitInteractivePrompt(alloc, try makeImagePrompt(alloc, "look", "model"));
+        try std.testing.expectEqual(@as(u64, 41), runtime.handed_off_turn_id);
+        try std.testing.expect(!runtime.isTurnCancelRequested());
+        switch (cancel) {
+            .interactive => runtime.requestInteractiveCancel(),
+            .request => runtime.requestCancel(),
+            .approval => runtime.cancelApprovalTurn(),
+        }
+        try std.testing.expect(runtime.isTurnCancelRequested());
+        try std.testing.expect(runtime.cancellationStopsTurn());
+        runtime.finishProcessing();
+        // The next turn starts clear.
+        try std.testing.expect(runtime.beginDirectProcessing(42));
+        try std.testing.expect(!runtime.isTurnCancelRequested());
+        runtime.finishProcessing();
+    }
 }
 
 test "interactive prompt after in-turn compaction settled steers immediately" {
@@ -9430,6 +9579,258 @@ test "the commit gate holds neither a prompt a user typed, nor compaction, nor a
     try std.testing.expectEqual(@as(u32, 0), plain.unacknowledged_finishes);
 }
 
+test "the worker says its gate waits for a commit only while it holds continuation mail for one" {
+    const alloc = std.testing.allocator;
+
+    var held = WorkerRuntime{};
+    defer held.deinit(alloc);
+    held.enableCommitGate();
+    // No finish, no mail: nothing waits.
+    try std.testing.expect(!held.commitGateWaitsForCommit());
+    try finishedTurnWithMissedMail(alloc, &held);
+    try std.testing.expect(held.commitGateWaitsForCommit());
+    // Asking is not a hold: it logs nothing and starts no spell.
+    try std.testing.expect(!held.commit_gate_logged);
+    held.acknowledgeFinishCommitted();
+    try std.testing.expect(!held.commitGateWaitsForCommit());
+
+    // A prompt a user typed heads the queue and is not held.
+    var typed = WorkerRuntime{};
+    defer typed.deinit(alloc);
+    typed.enableCommitGate();
+    try pushTestFinish(alloc, &typed);
+    try typed.enqueuePrompt(alloc, try makePrompt(alloc, "typed", "model"));
+    try typed.postMail(alloc, try makePrompt(alloc, "a report", "model"));
+    try std.testing.expect(!typed.commitGateWaitsForCommit());
+
+    // Compaction goes ahead of held mail.
+    var compacting = WorkerRuntime{};
+    defer compacting.deinit(alloc);
+    compacting.enableCommitGate();
+    try finishedTurnWithMissedMail(alloc, &compacting);
+    var no_bytes: [0]u8 = .{};
+    var no_history: [0]types.HistoryTurn = .{};
+    compacting.queued_context_compaction = .{ .turn_id = 4, .model = &no_bytes, .api_key = &no_bytes, .history = &no_history };
+    try std.testing.expect(!compacting.commitGateWaitsForCommit());
+    compacting.queued_context_compaction = null;
+
+    // A host that did not opt in counts no finish.
+    var plain = WorkerRuntime{};
+    defer plain.deinit(alloc);
+    try finishedTurnWithMissedMail(alloc, &plain);
+    try std.testing.expect(!plain.commitGateWaitsForCommit());
+}
+
+test "a failed flush stops the loop's asking until the hold is over, and the hold's end clears it" {
+    const alloc = std.testing.allocator;
+
+    // The count reaching zero clears the mark, so the next hold is tried.
+    var released = WorkerRuntime{};
+    defer released.deinit(alloc);
+    released.enableCommitGate();
+    try finishedTurnWithMissedMail(alloc, &released);
+    try pushTestFinish(alloc, &released);
+    try std.testing.expect(released.commitGateWaitsForCommit());
+    released.noteCommitGateFlushFailed();
+    try std.testing.expect(!released.commitGateWaitsForCommit());
+    // One of two finishes is acknowledged: the count is not zero, the mark stays.
+    released.acknowledgeFinishCommitted();
+    try std.testing.expectEqual(@as(u32, 1), released.unacknowledged_finishes);
+    try std.testing.expect(!released.commitGateWaitsForCommit());
+    released.acknowledgeFinishCommitted();
+    try std.testing.expect(!released.commit_gate_flush_failed);
+    try pushTestFinish(alloc, &released);
+    try std.testing.expect(released.commitGateWaitsForCommit());
+
+    // The limit ending the hold clears it too.
+    var expired = WorkerRuntime{};
+    defer expired.deinit(alloc);
+    expired.enableCommitGate();
+    try finishedTurnWithMissedMail(alloc, &expired);
+    expired.noteCommitGateFlushFailed();
+    // The first take holds the mail and starts the limit, which then passes.
+    try std.testing.expect((try expired.tryTakeNextWork(alloc)) == null);
+    expired.commit_gate_since_ms -= WorkerRuntime.commit_gate_limit_ms;
+    freeWorkItem(alloc, (try expired.tryTakeNextWork(alloc)).?);
+    try std.testing.expectEqual(@as(u32, 0), expired.unacknowledged_finishes);
+    try std.testing.expect(!expired.commit_gate_flush_failed);
+}
+
+test "a flush whose commit failed after its acknowledgement leaves no mark for the next hold" {
+    const alloc = std.testing.allocator;
+    var runtime = WorkerRuntime{};
+    defer runtime.deinit(alloc);
+    runtime.enableCommitGate();
+    try finishedTurnWithMissedMail(alloc, &runtime);
+    try std.testing.expect(runtime.commitGateWaitsForCommit());
+
+    // The loop's flush commits the turn and fails, as `appendFinishedPrompt`
+    // does: it acknowledges in a `defer` first, and the flush reports after.
+    runtime.acknowledgeFinishCommitted();
+    runtime.noteCommitGateFlushFailed();
+    try std.testing.expectEqual(@as(u32, 0), runtime.unacknowledged_finishes);
+    try std.testing.expect(!runtime.commit_gate_flush_failed);
+
+    // The next finish holds the mail again, and the loop is asked to flush.
+    try pushTestFinish(alloc, &runtime);
+    try std.testing.expect(runtime.commitGateWaitsForCommit());
+}
+
+/// A worker whose turn 9 finished, `late_ms` ago as far as the limit is
+/// concerned, with a report posted only now, behind it.
+fn finishedTurnWithLateMail(alloc: std.mem.Allocator, runtime: *WorkerRuntime, late_ms: i64) !void {
+    runtime.worker_processing = true;
+    runtime.active_turn_id = 9;
+    runtime.direct_steering_closed = true;
+    try pushTestFinish(alloc, runtime);
+    // A limit that counted from the push has run for `late_ms` by now.
+    runtime.commit_gate_since_ms -= late_ms;
+    try runtime.postMail(alloc, try makePrompt(alloc, "a late report", "model"));
+    try std.testing.expect(runtime.queued_prompts.items[0].delivery.isContinuation());
+    runtime.finishProcessing();
+}
+
+test "mail first held long after the finish was pushed is held, not expired" {
+    const alloc = std.testing.allocator;
+    var runtime = WorkerRuntime{};
+    defer runtime.deinit(alloc);
+    runtime.enableCommitGate();
+    try finishedTurnWithLateMail(alloc, &runtime, 6000);
+
+    // The limit counts from this first hold, so the mail waits for the commit.
+    try std.testing.expect((try runtime.tryTakeNextWork(alloc)) == null);
+    try std.testing.expectEqual(@as(u32, 1), runtime.unacknowledged_finishes);
+    try std.testing.expect(runtime.commitGateWaitsForCommit());
+    try std.testing.expectEqual(@as(usize, 1), runtime.queuedPromptCount());
+
+    runtime.acknowledgeFinishCommitted();
+    const work = (try runtime.tryTakeNextWork(alloc)).?;
+    defer freeWorkItem(alloc, work);
+    try std.testing.expectEqualStrings("a late report", work.prompt.prompt);
+}
+
+test "a hold that began long after the finish still ends at its limit, and says how long it held" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(root);
+    const trace_path = try std.Io.Dir.path.join(alloc, &.{ root, "late-gate.log" });
+    defer alloc.free(trace_path);
+    debug_trace.resetForTest();
+    defer debug_trace.resetForTest();
+    try debug_trace.configureForTestWithScopes(alloc, trace_path, "worker");
+
+    var runtime = WorkerRuntime{};
+    defer runtime.deinit(alloc);
+    runtime.enableCommitGate();
+    try finishedTurnWithLateMail(alloc, &runtime, 6000);
+    try std.testing.expect((try runtime.tryTakeNextWork(alloc)) == null);
+
+    // The commit never comes: the limit after the first hold ends the hold.
+    runtime.commit_gate_since_ms -= WorkerRuntime.commit_gate_limit_ms;
+    const work = (try runtime.tryTakeNextWork(alloc)).?;
+    defer freeWorkItem(alloc, work);
+    try std.testing.expectEqualStrings("a late report", work.prompt.prompt);
+    try std.testing.expectEqual(@as(u32, 0), runtime.unacknowledged_finishes);
+
+    debug_trace.shutdown();
+    var file = try std.Io.Dir.openFileAbsolute(io_mod.getIo(), trace_path, .{});
+    defer file.close(io_mod.getIo());
+    const trace = try io_mod.readFileToEnd(alloc, &file, 1024 * 1024);
+    defer alloc.free(trace);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, trace, "event=commit_gate_held"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, trace, "event=commit_gate_expired"));
+    // `waited_ms` is the hold, about one limit, and not the 6 s since the finish plus the limit.
+    const at = std.mem.find(u8, trace, "event=commit_gate_expired").?;
+    const field = "waited_ms=";
+    const start = at + std.mem.find(u8, trace[at..], field).? + field.len;
+    const end = start + std.mem.findScalar(u8, trace[start..], ' ').?;
+    const waited = try std.fmt.parseInt(i64, trace[start..end], 10);
+    try std.testing.expect(waited >= WorkerRuntime.commit_gate_limit_ms);
+    try std.testing.expect(waited < WorkerRuntime.commit_gate_limit_ms + 1000);
+}
+
+/// What a held spell has left of its limit.
+fn commitGateLeftMs(runtime: *WorkerRuntime) ?i64 {
+    runtime.worker_mutex.lockUncancelable(io_mod.getIo());
+    defer runtime.worker_mutex.unlock(io_mod.getIo());
+    return runtime.commitGateRemainingMsLocked();
+}
+
+test "a hold that its commit released leaves the next hold a whole limit" {
+    const alloc = std.testing.allocator;
+    var runtime = WorkerRuntime{};
+    defer runtime.deinit(alloc);
+    runtime.enableCommitGate();
+    try finishedTurnWithMissedMail(alloc, &runtime);
+    try std.testing.expect((try runtime.tryTakeNextWork(alloc)) == null);
+    runtime.acknowledgeFinishCommitted();
+    freeWorkItem(alloc, (try runtime.tryTakeNextWork(alloc)).?);
+
+    // A second finish and report come long after the first hold began. Its
+    // clock is two limits old, and the new hold must not inherit it.
+    try finishedTurnWithLateMail(alloc, &runtime, 2 * WorkerRuntime.commit_gate_limit_ms);
+    try std.testing.expect((try runtime.tryTakeNextWork(alloc)) == null);
+    try std.testing.expect(runtime.commitGateWaitsForCommit());
+    const left = commitGateLeftMs(&runtime).?;
+    try std.testing.expect(left > WorkerRuntime.commit_gate_limit_ms - 1000);
+    try std.testing.expect(left <= WorkerRuntime.commit_gate_limit_ms);
+
+    runtime.acknowledgeFinishCommitted();
+    freeWorkItem(alloc, (try runtime.tryTakeNextWork(alloc)).?);
+}
+
+test "a hold that ended at its limit leaves the next hold a whole limit" {
+    const alloc = std.testing.allocator;
+    var runtime = WorkerRuntime{};
+    defer runtime.deinit(alloc);
+    runtime.enableCommitGate();
+    try finishedTurnWithMissedMail(alloc, &runtime);
+    try std.testing.expect((try runtime.tryTakeNextWork(alloc)) == null);
+    // The loop never commits: the hold ends at its limit and the mail starts.
+    runtime.commit_gate_since_ms -= WorkerRuntime.commit_gate_limit_ms;
+    freeWorkItem(alloc, (try runtime.tryTakeNextWork(alloc)).?);
+    try std.testing.expectEqual(@as(u32, 0), runtime.unacknowledged_finishes);
+
+    // A second finish and report come long after that hold began, and the
+    // new hold must not inherit its clock.
+    try finishedTurnWithLateMail(alloc, &runtime, 2 * WorkerRuntime.commit_gate_limit_ms);
+    try std.testing.expect((try runtime.tryTakeNextWork(alloc)) == null);
+    try std.testing.expect(runtime.commitGateWaitsForCommit());
+    const left = commitGateLeftMs(&runtime).?;
+    try std.testing.expect(left > WorkerRuntime.commit_gate_limit_ms - 1000);
+    try std.testing.expect(left <= WorkerRuntime.commit_gate_limit_ms);
+
+    runtime.acknowledgeFinishCommitted();
+    freeWorkItem(alloc, (try runtime.tryTakeNextWork(alloc)).?);
+}
+
+test "text a user typed while a turn ran, which missed the turn, waits for its commit like mail" {
+    const alloc = std.testing.allocator;
+    var runtime = WorkerRuntime{};
+    defer runtime.deinit(alloc);
+    runtime.enableCommitGate();
+    runtime.worker_processing = true;
+    runtime.active_turn_id = 9;
+    try runtime.admitInteractivePrompt(alloc, try makePrompt(alloc, "typed while the turn ran", "model"));
+    try pushTestFinish(alloc, &runtime);
+    runtime.finishProcessing();
+
+    // The turn ended before it took the text in, so the text is a
+    // continuation of it, and the gate holds it as it holds mail.
+    try std.testing.expect(runtime.queued_prompts.items[0].delivery.isContinuation());
+    try std.testing.expectEqual(@as(u32, 1), runtime.unacknowledged_finishes);
+    try std.testing.expect(runtime.commitGateWaitsForCommit());
+    try std.testing.expect((try runtime.tryTakeNextWork(alloc)) == null);
+
+    runtime.acknowledgeFinishCommitted();
+    try std.testing.expect(!runtime.commitGateWaitsForCommit());
+    const work = (try runtime.tryTakeNextWork(alloc)).?;
+    defer freeWorkItem(alloc, work);
+    try std.testing.expectEqualStrings("typed while the turn ran", work.prompt.prompt);
+}
+
 test "the commit gate logs what it held, what released it, and the limit it gave up at" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -9456,7 +9857,7 @@ test "the commit gate logs what it held, what released it, and the limit it gave
     stuck.enableCommitGate();
     try finishedTurnWithMissedMail(alloc, &stuck);
     try std.testing.expect((try stuck.tryTakeNextWork(alloc)) == null);
-    // The loop never commits: the finish was pushed longer ago than the limit.
+    // The loop never commits: the hold began longer ago than the limit.
     stuck.commit_gate_since_ms -= WorkerRuntime.commit_gate_limit_ms;
     freeWorkItem(alloc, (try stuck.tryTakeNextWork(alloc)).?);
     try std.testing.expectEqual(@as(u32, 0), stuck.unacknowledged_finishes);
@@ -9528,14 +9929,18 @@ test "a worker held by the commit gate goes on at its limit when the commit neve
     defer runtime.deinit(alloc);
     runtime.enableCommitGate();
     try finishedTurnWithMissedMail(alloc, &runtime);
-    // 150 ms of the limit are left.
+    // The first take holds the mail and starts the limit. 150 ms of it are left.
+    try std.testing.expect((try runtime.tryTakeNextWork(alloc)) == null);
     runtime.commit_gate_since_ms -= WorkerRuntime.commit_gate_limit_ms - 150;
     var waiter: GateWaiter = .{ .runtime = &runtime };
     const started = io_mod.milliTimestamp();
     const thread = try std.Thread.spawn(.{}, GateWaiter.run, .{&waiter});
     thread.join();
+    // It went on at the limit: not at once, and not a whole limit later.
+    const waited = io_mod.milliTimestamp() - started;
     try std.testing.expect(waiter.got_prompt);
-    try std.testing.expect(io_mod.milliTimestamp() - started >= 100);
+    try std.testing.expect(waited >= 100);
+    try std.testing.expect(waited < WorkerRuntime.commit_gate_limit_ms / 2);
     try std.testing.expectEqual(@as(u32, 0), runtime.unacknowledged_finishes);
 }
 

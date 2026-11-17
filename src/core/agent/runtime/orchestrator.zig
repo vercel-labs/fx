@@ -4190,6 +4190,32 @@ fn checkpointToolState(
     };
 }
 
+/// Saves the turn's user message through `append_turn_piece` before its
+/// start capture (D98). A resumed turn is already on disk, so callers skip
+/// it. A failed write is traced and left to the turn's later writes, which
+/// write every piece the session lacks, and never fails the turn.
+fn persistPromptBeforeCapture(
+    deps: *const AgentRuntimeDeps,
+    finalization: *TurnFinalizationGuard,
+    job: QueuedPrompt,
+    current_turn_messages: []const ChatMessage,
+) void {
+    const append = deps.append_turn_piece orelse return;
+    var scratch = std.heap.ArenaAllocator.init(std.heap.c_allocator);
+    defer mem_utils.deinit_arena(scratch);
+    const arena = scratch.allocator();
+    const saved = saved: {
+        const execution = runtime_execution_memory.buildExecutionMemory(arena, current_turn_messages) catch |err| break :saved err;
+        const projected = finalization.persistedExecution(arena, execution) catch |err| break :saved err;
+        append(deps.ctx, .{
+            .user = .{ .text = @constCast(job.prompt), .images = job.images, .work_id = job.work_id, .author = job.author },
+            .execution = projected,
+        }) catch |err| break :saved err;
+        return;
+    };
+    debug_trace.logf("session", "event=prompt_before_capture_unsaved err={s}", .{@errorName(saved)});
+}
+
 /// Hands the model's tool calls to `append_turn_piece` before any of them
 /// runs (D28). Execution memory holds only finished exchanges, so the calls
 /// travel apart, in the form a finished step saves them, with the text of
@@ -6722,6 +6748,17 @@ fn processQueuedPromptInner(
             job.images = images;
         }
     }
+    // The repository as the turn found it, before any request or tool
+    // (D98). The prompt reaches the session first: the capture can take
+    // seconds, and a process killed during it must keep the prompt.
+    if (deps.start_workspace_capture) |start| {
+        const fresh = !job.delivery.isSteering();
+        start(deps.ctx, fresh, .begin);
+        if (fresh and !resumed_request and job.recovery_checkpoint == null) {
+            persistPromptBeforeCapture(deps, finalization, job, within_turn_suffix.items);
+        }
+        start(deps.ctx, fresh, .capture);
+    }
 
     const current_user_message: ChatMessage = .{
         .role = .user,
@@ -7400,7 +7437,14 @@ const CompactionProgress = struct {
     before_summary: ?BeforeSummary,
 
     fn interface(self: *CompactionProgress) compactor.Progress {
-        return .{ .context = self, .report_fn = report };
+        return .{ .context = self, .report_fn = report, .written_fn = written };
+    }
+
+    fn written(context: *anyopaque, percent: u8) void {
+        const self: *CompactionProgress = @ptrCast(@alignCast(context));
+        const id = self.operation_id orelse return;
+        const effect = self.deps.compaction_activity orelse return;
+        if (effect.written) |write| write(self.deps.ctx, id, percent);
     }
 
     fn report(context: *anyopaque, step: compactor.Step) anyerror!void {
@@ -8732,6 +8776,7 @@ fn processQueuedPromptLoop(
                     };
                     defer summary_model.deinit();
                     var compaction_failure: ?compaction_activity.ErrorProvenance = null;
+                    const compaction_started_ms = io_mod.milliTimestamp();
                     const compaction_result = compactContext(arena, deps, .{
                         .activity_origin = if (overflow_pending) .provider_overflow else .automatic,
                         .failure_provenance = &compaction_failure,
@@ -8747,6 +8792,9 @@ fn processQueuedPromptLoop(
                             .trace_ctx = step_ctx,
                         },
                     });
+                    // The turn's duration leaves out the compaction, as its
+                    // live clock does.
+                    summary_accumulator.addCompaction(compaction_started_ms, io_mod.milliTimestamp());
                     // A summary request the provider rejected with 401 renewed
                     // the sign-in; the rest of the turn sends the renewed one.
                     // Taken first: renewing can free the credential the turn
