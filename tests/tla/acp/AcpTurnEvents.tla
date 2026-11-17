@@ -31,8 +31,8 @@
 (* so only the response reaches the client. AcpTurnEventsToday.cfg shows  *)
 (* Complete failing.                                                      *)
 (*                                                                         *)
-(* `CommandMeta` set to FALSE gives fx acp before S8g (#2044 at           *)
-(* 49ccc40cd): every client gets a shell call's command result as a       *)
+(* `CommandMeta` set to FALSE gives fx acp before sh.fx/commandResult:    *)
+(* every client gets a shell call's command result as a                   *)
 (* command_result field at the root of its tool_call_update.              *)
 (* AcpTurnEventsRootField.cfg shows StandardOnly failing.                 *)
 (*                                                                         *)
@@ -49,7 +49,7 @@ EXTENDS Naturals, Sequences, FiniteSets
 
 CONSTANTS
     Rules,          \* TRUE: the turn events rules; FALSE: fx acp before them
-    CommandMeta,    \* TRUE: sh.fx/commandResult (S8g); FALSE: the root field
+    CommandMeta,    \* TRUE: sh.fx/commandResult; FALSE: the root field
     Parts,          \* the parts the client lists
     Ks,             \* compaction ids, 1..n
     MaxProgress,    \* progress reports per turn
@@ -132,7 +132,7 @@ Call ==
 \* A shell call ends. Its tool_call_update is standard ACP and goes to every
 \* client, and its command result rides in it: under the rules in _meta as
 \* sh.fx/commandResult ("meta"), only for a client that lists "command";
-\* before S8g as a command_result field at the update's root ("root").
+\* before it, as a command_result field at the update's root ("root").
 CommandTag == IF Rules /\ CommandMeta
               THEN IF "command" \in Parts THEN "meta" ELSE "none"
               ELSE "root"
