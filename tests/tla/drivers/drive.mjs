@@ -126,6 +126,28 @@ const until = async (check, ms = stepTimeoutMs) => {
   return true;
 };
 const sleep = (ms) => new Promise((resolveWait) => setTimeout(resolveWait, ms));
+// How a reconnect from `cursor` compares with `lines`, a settled read:
+// "same" when it shows exactly the lines after the cursor, "grown" when it
+// shows them and then lines appended after the read's last one, and null for
+// any other difference. The stream is append-only, and a worker that waits on
+// nothing the driver holds can still write a line, such as the `idle` a resume
+// with nothing to continue answers with, so an append is not a loss. `now`, a
+// full read taken after the reconnect, must show the appended lines at the
+// same cursors.
+const reconnected = (lines, cursor, again, now) => {
+  const expected = lines.filter((line) => line.cursor > cursor);
+  if (JSON.stringify(again.slice(0, expected.length)) !== JSON.stringify(expected)) return null;
+  const added = again.slice(expected.length);
+  if (added.length === 0) return "same";
+  let last = lines.at(-1).cursor;
+  for (const line of added) {
+    if (!(line.cursor > last)) return null;
+    last = line.cursor;
+  }
+  if (JSON.stringify(now.slice(0, lines.length)) !== JSON.stringify(lines)) return null;
+  const after = now.filter((line) => line.cursor > cursor);
+  return JSON.stringify(after.slice(0, again.length)) === JSON.stringify(again) ? "grown" : null;
+};
 
 // The lease holders that run, one set for every server, as the agents of one
 // process share libfx's: the driver, as the platform, takes a frozen
@@ -251,31 +273,44 @@ async function harness() {
 
   async function observe() {
     // Every worker now waits on the driver, but a line it wrote can still be
-    // landing: read until two reads agree.
+    // landing: read until two reads agree. A worker can also write a line
+    // the driver holds nothing for, so two reads can agree just before it
+    // lands; a reconnect that shows it means the stream had not settled, and
+    // the stream is read until it does again, so the state comes from the
+    // newer read.
     let lines = await streamLines();
-    for (let reads = 0; reads < 5; reads += 1) {
-      const again = await streamLines();
-      if (JSON.stringify(again) === JSON.stringify(lines)) break;
-      lines = again;
-    }
-    // A reader that reconnects from any cursor sees the same lines after it.
-    if (lines.length > 0) {
+    for (let settles = 0; settles < 5; settles += 1) {
+      for (let reads = 0; reads < 5; reads += 1) {
+        const again = await streamLines();
+        if (JSON.stringify(again) === JSON.stringify(lines)) break;
+        lines = again;
+      }
+      if (lines.length === 0) break;
+      // A reader that reconnects from any cursor sees the same lines after
+      // it, and at most lines appended since.
       const cursor = lines[Math.floor(random() * lines.length)].cursor;
       const again = await streamLines(cursor);
-      const expected = lines.filter((line) => line.cursor > cursor);
-      if (JSON.stringify(again) !== JSON.stringify(expected)) {
+      const grew = again.length > lines.filter((line) => line.cursor > cursor).length;
+      const now = grew ? await streamLines() : lines;
+      const shown = reconnected(lines, cursor, again, now);
+      if (shown === "grown") {
+        lines = now;
+        continue;
+      }
+      if (shown === null) {
         // Which worker wrote what, and what each still waits on, tells a
         // line written late from one a read missed.
         const brief = (items) => items.map((line) => `${line.type}:e${line.epoch ?? 0}@${line.cursor}`).join(" ");
-        const now = await streamLines();
+        const latest = await streamLines();
         assert.fail([
           `reconnecting from cursor ${cursor} shows different lines`,
           `  first read: ${brief(lines)}`,
           `  reconnect:  ${brief(again)}`,
-          `  read again: ${brief(now)}`,
+          `  read again: ${brief(latest)}`,
           `  waiting: requests ${JSON.stringify(requests.map((entry) => `${entry.w}:${entry.kind}`))}, calls ${JSON.stringify(calls.map((entry) => entry.w))}, runs ${runs}, fenced ${JSON.stringify(fenced)}`,
         ].join("\n"));
       }
+      break;
     }
     return {
       pc: Object.fromEntries(Workers.map((w) => [w, position(w, lines)])),
