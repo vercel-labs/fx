@@ -744,9 +744,9 @@ fn withoutSplitSecretRun(value: []const u8, end: usize) usize {
     return cut;
 }
 
-/// How far back `secretSafeSuffixStart` looks for a secret that the tail's
-/// start falls inside.
-const max_secret_lookback = 1024;
+/// How far back `secretSafeSuffixStart` walks for a secret the start falls
+/// inside: longer than a private key or a service account's JSON.
+const max_secret_lookback = 16 * 1024;
 
 /// Where a tail of `value` that would start at `start`, a UTF-8 boundary,
 /// starts instead so it holds no part of a secret the start splits: past the
@@ -766,50 +766,29 @@ pub fn secretSafeSuffixStart(value: []const u8, start: usize) usize {
     }
 }
 
-/// How far back `secretSafeSuffixStart` looks for an assignment whose value
-/// the start falls inside: longer than a private key or a service account's
-/// JSON. No line break falls inside a quoted value.
-const max_assignment_lookback = 16 * 1024;
-/// How many sensitive assignment keys before the start `secretSafeSuffixStart`
-/// checks, so a line of many keys costs little.
-const max_assignment_candidates = 16;
-
 /// `secretSafeSuffixStart`'s rules, applied once.
 fn suffixStartStep(value: []const u8, start: usize) usize {
     if (start == 0 or start >= value.len) return start;
-    // An assignment's quoted value runs to its closing quote or the end of
-    // its line, so it can start far before `start`. Only the sensitive keys
-    // of `=` signs on the same line need the matcher, and only the nearest
-    // `max_assignment_candidates` of them.
-    const window = start -| max_assignment_lookback;
-    const floor = if (std.mem.findScalarLast(u8, value[window..start], '\n')) |line_break| window + line_break + 1 else window;
-    var search_end = start;
-    var candidates: usize = 0;
-    while (candidates < max_assignment_candidates) {
-        const relative = std.mem.findScalarLast(u8, value[floor..search_end], '=') orelse break;
-        const equals = floor + relative;
-        search_end = equals;
-        var key_start = equals;
-        while (key_start > floor and isAssignmentKeyChar(value[key_start - 1])) key_start -= 1;
-        if (key_start == equals or !sensitiveAssignmentKey(value[key_start..equals])) continue;
-        candidates += 1;
-        if (findSecretSpan(value, key_start)) |span| {
-            const span_end = span.prefix_end + span.value_len;
-            if (span_end > start) return @min(span_end, value.len);
+    // Walk the start's line the way `maskSecrets` does, from at most
+    // `max_secret_lookback` bytes back: a start inside a secret it would find
+    // in the whole value moves past that secret, because the tail alone lacks
+    // the start the mask matches on, such as an assignment's key or a quoted
+    // value's opening quote. No secret crosses a line break. Inside a word,
+    // only a URL credential can start, so the walk skips the rest.
+    const window = start -| max_secret_lookback;
+    var at = if (std.mem.findScalarLast(u8, value[window..start], '\n')) |line_break| window + line_break + 1 else window;
+    while (at < start) {
+        if (at > 0 and isAssignmentKeyChar(value[at - 1]) and !std.mem.startsWith(u8, value[at..], "https://")) {
+            at += 1;
+            continue;
         }
-    }
-    // A start inside a secret `maskSecrets` finds in the whole value moves
-    // past that secret: the tail alone lacks the start the mask matches on,
-    // such as an assignment's key or a quoted value's opening quote.
-    var match = start -| max_secret_lookback;
-    while (match < start) {
-        const span = findSecretSpan(value, match) orelse {
-            match += 1;
+        const span = findSecretSpan(value, at) orelse {
+            at += 1;
             continue;
         };
         const span_end = span.prefix_end + span.value_len;
         if (span_end > start) return @min(span_end, value.len);
-        match = @max(span_end, match + 1);
+        at = @max(span_end, at + 1);
     }
     var begin = start;
     if (!std.ascii.isWhitespace(value[start - 1])) {
@@ -1760,6 +1739,31 @@ test "secretSafeSuffixStart skips the rest of a split token or a URL credential"
         const masked = try maskSecrets(arena, long_quoted[secretSafeSuffixStart(long_quoted, long_start)..]);
         try std.testing.expect(std.mem.find(u8, masked, "MIIEvQ") == null);
     }
+
+    // A quoted value can hold more `=` pairs than any candidate cap.
+    var capped: std.Io.Writer.Allocating = .init(arena);
+    try capped.writer.writeAll("export APP_SECRET=\"");
+    for (0..20) |index| try capped.writer.print("x{d}_token=v ", .{index});
+    try capped.writer.writeAll(repeat("hidden part of the value ", 70));
+    try capped.writer.writeAll("\" && run");
+    const capped_value = capped.written();
+    long_start = 1100;
+    while (long_start < capped_value.len) : (long_start += 61) {
+        const masked = try maskSecrets(arena, capped_value[secretSafeSuffixStart(capped_value, long_start)..]);
+        try std.testing.expect(std.mem.find(u8, masked, "hidden") == null);
+    }
+
+    // A key only the assignment prefix list names, not `sensitiveAssignmentKey`.
+    var database: std.Io.Writer.Allocating = .init(arena);
+    try database.writer.writeAll("export DATABASE_URL=\"postgres://u:p@h/db?options=dbsecret ");
+    try database.writer.writeAll(repeat("part of the value ", 70));
+    try database.writer.writeAll("\" && run");
+    const database_value = database.written();
+    long_start = 1100;
+    while (long_start < database_value.len) : (long_start += 61) {
+        const masked = try maskSecrets(arena, database_value[secretSafeSuffixStart(database_value, long_start)..]);
+        try std.testing.expect(std.mem.find(u8, masked, "dbsecret") == null);
+    }
 }
 
 test "secretSafeSuffixStart skips many adjacent secrets without a deep stack" {
@@ -1807,8 +1811,8 @@ test "secretSafeSuffixStart stays cheap on a line of many equals signs" {
         try std.testing.expect(secretSafeSuffixStart(equals, 16000 - back) <= 16000);
     }
 
-    // 3000 sensitive assignments: only the nearest `max_assignment_candidates`
-    // reach the matcher.
+    // 3000 sensitive assignments: the walk jumps past each span, so it stays
+    // linear.
     const assignment = "TOKEN=a ";
     const repeated = try arena.alloc(u8, assignment.len * 3000 + "end".len);
     var index: usize = 0;
@@ -1845,6 +1849,14 @@ test "secretSafePrefixLen and secretSafeSuffixStart leave no part of a planted s
         .{
             .secret = "GCP_SECRET='" ++ repeat("MIIEvQ key part ", 150) ++ "'",
             .probes = &[_][]const u8{"MIIEvQ"},
+        },
+        .{
+            .secret = "APP_SECRET=\"x0_token=v x1_token=v x2_token=v x3_token=v x4_token=v x5_token=v x6_token=v x7_token=v x8_token=v x9_token=v x10_token=v x11_token=v x12_token=v x13_token=v x14_token=v x15_token=v x16_token=v x17_token=v x18_token=v x19_token=v " ++ repeat("hidden part of the value ", 70) ++ "\"",
+            .probes = &[_][]const u8{"hidden"},
+        },
+        .{
+            .secret = "DATABASE_URL=\"postgres://u:p@h/db?options=dbsecret " ++ repeat("part of the value ", 70) ++ "\"",
+            .probes = &[_][]const u8{"dbsecret"},
         },
     };
 
