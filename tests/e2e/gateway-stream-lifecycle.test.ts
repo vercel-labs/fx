@@ -13535,6 +13535,10 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       );
       // Three resends at once, then the fourth block ends the turn.
       expect(gateway.requestCount()).toBe(4);
+      // Each resend is a new attempt, so each prints its own notice.
+      for (const count of [1, 2, 3]) {
+        expect(result.stderr).toContain(`[notice] Blocked by the content filter · retrying (${count}/3)\n`);
+      }
       expect(trace.split("event=content_filter_resend").length - 1).toBe(3);
       // fx ask cannot answer a question, so it never shows one.
       expect(result.stderr).not.toContain("press Esc");

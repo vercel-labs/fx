@@ -433,11 +433,11 @@ pub const RequestRecovery = struct {
     ///   server loop's (`processAllocator()` for `fx acp`, `c_allocator` for
     ///   libfx, and `state.alloc` for subagent children), never an arena, and
     ///   the loop thread already shares it with the prompt thread.
-    /// - `fx ask` (`pushRouteRecoveryStatus`): writes only its two recovery
+    /// - `fx ask` (`pushRouteRecoveryStatus`): writes only its three recovery
     ///   fields. During a send their only other writer is the clear from
     ///   `responding`, under `mutex`, and the result reads them after the
-    ///   ticker is joined. It prints only when the kind changes, which a
-    ///   `retrying` refresh never does.
+    ///   ticker is joined. It prints only when the kind or the attempt
+    ///   changes, which a `retrying` refresh never does.
     /// - Subagent children and the default deps drop the status.
     ///
     /// Single-threaded builds, such as wasm, tick from the transport's
