@@ -20,6 +20,7 @@ const result_commit = @import("result_commit.zig");
 const vision_executor = @import("../agent/runtime/vision_executor.zig");
 const image_provider = @import("../agent/runtime/image_provider.zig");
 const token_pass = @import("../gateway/token_pass.zig");
+const token_pass_team = @import("../gateway/token_pass_team.zig");
 const change_tracker = @import("../workspace/change_tracker.zig");
 const diff_mod = @import("../output/diff.zig");
 const file_mutation = @import("file_mutation.zig");
@@ -121,13 +122,21 @@ test {
     _ = tool_presentation;
 }
 
-/// Shows tool rows: a host's push of tool lifecycle events.
+/// Shows tool rows: a host's push of tool lifecycle events, and where it
+/// keeps the row of a call made through `fx mcp call`, so a resume shows it
+/// again. Null keeps none.
 pub const ToolLifecyclePublisher = struct {
     context: *anyopaque,
     push_fn: *const fn (*anyopaque, types.ToolLifecycleEvent) anyerror!void,
+    save_bridge_call_fn: ?*const fn (*anyopaque, types.BridgeCallRecord) anyerror!void = null,
 
     pub fn push(self: ToolLifecyclePublisher, event: types.ToolLifecycleEvent) anyerror!void {
         return self.push_fn(self.context, event);
+    }
+
+    pub fn saveBridgeCall(self: ToolLifecyclePublisher, record: types.BridgeCallRecord) anyerror!void {
+        const save = self.save_bridge_call_fn orelse return;
+        return save(self.context, record);
     }
 };
 
@@ -1213,11 +1222,14 @@ fn runBridgeCall(
 
 /// The row a bridge call shows in its shell call's group: the row a direct
 /// call of the same MCP tool shows, `Running MCP` and then `Ran MCP`. Only a
-/// host that set `nested_tool_lifecycle` shows it, and a row it could not
-/// show is logged, never a reason to fail the call.
+/// host that set `nested_tool_lifecycle` shows it, and keeps its tool name
+/// and outcome for a resume when the call ends. A row it could not show or
+/// keep is logged, never a reason to fail the call.
 const BridgeCallRow = struct {
     publisher: ToolLifecyclePublisher,
     id: types.ToolLifecycleId,
+    /// The shell call whose command made the call.
+    shell_call_id: []const u8,
     tool: []const u8,
 
     /// Arguments larger than this stay out of the row's details.
@@ -1226,7 +1238,12 @@ const BridgeCallRow = struct {
     fn start(ctx: Context, arena: Allocator, request_id: []const u8, tool: []const u8, arguments_json: []const u8) ?BridgeCallRow {
         const publisher = ctx.nested_tool_lifecycle orelse return null;
         const parent = ctx.output_chunk_lifecycle_id orelse return null;
-        const row: BridgeCallRow = .{ .publisher = publisher, .id = .{ .turn_id = parent.turn_id, .call_id = request_id }, .tool = tool };
+        const row: BridgeCallRow = .{
+            .publisher = publisher,
+            .id = .{ .turn_id = parent.turn_id, .call_id = request_id },
+            .shell_call_id = parent.call_id,
+            .tool = tool,
+        };
         row.begin(ctx, arena, arguments_json) catch |err| {
             debug_trace.logf("mcp-call", "request={s} row not shown err={s}", .{ request_id, @errorName(err) });
             return null;
@@ -1249,16 +1266,21 @@ const BridgeCallRow = struct {
         } });
     }
 
-    fn finish(self: BridgeCallRow, arena: Allocator, kind: types.ToolOutcomeKind) void {
-        const label = switch (kind) {
-            .completed => tool_presentation.mcp_ran_label,
-            .cancelled => "Cancelled",
-            .failed, .denied, .deferred => "Failed",
-        };
-        const summary = tool_presentation.formatToolActionValue(arena, label, self.tool) catch label;
+    fn finish(self: BridgeCallRow, arena: Allocator, outcome: types.BridgeCallOutcome) void {
+        const kind = outcome.toolOutcome();
+        const summary = tool_presentation.bridgeCallRowSummary(arena, self.tool, outcome) catch
+            tool_presentation.bridgeCallRowLabel(outcome);
         self.publisher.push(.{ .terminal = .{ .id = self.id, .outcome = .{ .kind = kind, .summary = summary } } }) catch |err| {
             // The worker's turn end closes a row whose end was lost.
             debug_trace.logf("mcp-call", "request={s} row end not shown err={s}", .{ self.id.call_id, @errorName(err) });
+        };
+        self.publisher.saveBridgeCall(.{
+            .call_id = self.shell_call_id,
+            .request_id = self.id.call_id,
+            .tool = self.tool,
+            .outcome = outcome,
+        }) catch |err| {
+            debug_trace.logf("mcp-call", "request={s} row not saved err={s} dropped=saved_bridge_row", .{ self.id.call_id, @errorName(err) });
         };
     }
 };
@@ -1480,6 +1502,75 @@ test "bridge messages name a requested tool as visible escapes, not raw bytes" {
     const failed = try callBridgeTool(failing.context(), arena, "call-1", name, "{}", .{}, &cancel);
     try std.testing.expectEqual(mcp_call_capability.CallStatus.failed, failed.status);
     try expectBridgeNameQuoted(failed.bytes);
+}
+
+test "a bridge call's row ends, then keeps its shell call, tool, and outcome for a resume, and never its arguments" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const Rows = struct {
+        terminal: std.ArrayList(types.ToolOutcomeKind) = .empty,
+        saved: std.ArrayList(types.BridgeCallRecord) = .empty,
+        refuse_saves: bool = false,
+
+        fn push(raw: *anyopaque, event: types.ToolLifecycleEvent) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (event == .terminal) try self.terminal.append(std.testing.allocator, event.terminal.outcome.kind);
+        }
+
+        fn save(raw: *anyopaque, record: types.BridgeCallRecord) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.refuse_saves) return error.NoOpenTurn;
+            try self.saved.append(std.testing.allocator, record);
+        }
+    };
+    var rows: Rows = .{};
+    defer rows.terminal.deinit(std.testing.allocator);
+    defer rows.saved.deinit(std.testing.allocator);
+    var marker: u8 = 0;
+    var ok_runtime = TestRuntime{ .mcp_ctx = @ptrCast(&marker), .mcp_call_tool = McpFixture.callOk };
+    defer ok_runtime.deinit(std.testing.allocator);
+    var failing_runtime = TestRuntime{ .mcp_ctx = @ptrCast(&marker), .mcp_call_tool = McpFixture.callFailure };
+    defer failing_runtime.deinit(std.testing.allocator);
+    const publisher: ToolLifecyclePublisher = .{ .context = @ptrCast(&rows), .push_fn = Rows.push, .save_bridge_call_fn = Rows.save };
+    var cancel: std.atomic.Value(bool) = .init(false);
+    const secret_arguments = "{\"text\":\"SECRET_ARGUMENT\"}";
+
+    var ok_ctx = ok_runtime.context();
+    ok_ctx.nested_tool_lifecycle = publisher;
+    ok_ctx.output_chunk_lifecycle_id = .{ .turn_id = 4, .call_id = "shell-call-1" };
+    var ok_state = McpCallBridgeState{ .runtime = ok_ctx };
+    const ran = try runBridgeCall(@ptrCast(&ok_state), arena, "fx-mcp-call-7", "mcp_fs_read", secret_arguments, .{}, &cancel);
+    try std.testing.expectEqual(mcp_call_capability.CallStatus.ok, ran.status);
+
+    var failing_ctx = failing_runtime.context();
+    failing_ctx.nested_tool_lifecycle = publisher;
+    failing_ctx.output_chunk_lifecycle_id = .{ .turn_id = 4, .call_id = "shell-call-1" };
+    var failing_state = McpCallBridgeState{ .runtime = failing_ctx };
+    const failed = try runBridgeCall(@ptrCast(&failing_state), arena, "fx-mcp-call-8", "mcp_fs_read", secret_arguments, .{}, &cancel);
+    try std.testing.expectEqual(mcp_call_capability.CallStatus.failed, failed.status);
+
+    try std.testing.expectEqualSlices(types.ToolOutcomeKind, &.{ .completed, .failed }, rows.terminal.items);
+    try std.testing.expectEqual(@as(usize, 2), rows.saved.items.len);
+    for (rows.saved.items, [_][]const u8{ "fx-mcp-call-7", "fx-mcp-call-8" }, [_]types.BridgeCallOutcome{ .completed, .failed }) |record, request_id, outcome| {
+        try std.testing.expectEqualStrings("shell-call-1", record.call_id);
+        try std.testing.expectEqualStrings(request_id, record.request_id);
+        try std.testing.expectEqualStrings("mcp_fs_read", record.tool);
+        try std.testing.expectEqual(outcome, record.outcome);
+    }
+
+    // A record the session can't take is logged; the call still returns.
+    rows.refuse_saves = true;
+    const unsaved = try runBridgeCall(@ptrCast(&ok_state), arena, "fx-mcp-call-9", "mcp_fs_read", secret_arguments, .{}, &cancel);
+    try std.testing.expectEqual(mcp_call_capability.CallStatus.ok, unsaved.status);
+    try std.testing.expectEqual(@as(usize, 2), rows.saved.items.len);
+    try std.testing.expectEqual(@as(usize, 3), rows.terminal.items.len);
+
+    // A host that shows no rows keeps none.
+    rows.refuse_saves = false;
+    var rowless_state = McpCallBridgeState{ .runtime = ok_runtime.context() };
+    _ = try runBridgeCall(@ptrCast(&rowless_state), arena, "fx-mcp-call-10", "mcp_fs_read", secret_arguments, .{}, &cancel);
+    try std.testing.expectEqual(@as(usize, 2), rows.saved.items.len);
 }
 
 const RunCommandBackendState = struct {
@@ -1828,6 +1919,18 @@ fn terminal_lease_cleanup_dispatch_context(
     return dispatch;
 }
 
+/// Stops the shell commands that steering moved to the background during
+/// turn `turn_id`, after the user cancelled that turn. The stop ignores the
+/// turn's cancel flag, which is set by then.
+pub fn stop_steering_detached_commands(ctx: Context, turn_id: u64) !void {
+    var arena_state = std.heap.ArenaAllocator.init(ctx.session_allocator);
+    defer arena_state.deinit();
+    return shell_impl.stopSteeringDetached(
+        terminal_lease_cleanup_dispatch_context(ctx, arena_state.allocator()),
+        turn_id,
+    );
+}
+
 pub fn release_agent_terminal_lease(ctx: Context, session_id: []const u8) !void {
     var arena_state = std.heap.ArenaAllocator.init(ctx.session_allocator);
     defer arena_state.deinit();
@@ -1940,10 +2043,11 @@ fn executeVisionRequest(
         .cancel_flag = state.runtime.cancel_flag,
         .trace_ctx = .{},
         .output_limit = state.runtime.context_limits.image_adapter_output_bytes,
-        // A Token Pass session reads images with a Token Pass model.
-        // A custom connection reads images with its own vision_model.
+        // A Token Pass session of a team with Token Pass reads images with a
+        // Token Pass model. A custom connection reads images with its own
+        // vision_model.
         .model = if (state.runtime.provider == .gateway)
-            token_pass.modelForSideCall(.vision, state.runtime.model, image_provider.default_model)
+            token_pass_team.modelForSideCall(.vision, state.runtime.model, image_provider.default_model)
         else
             state.runtime.provider_capabilities.vision_model orelse image_provider.default_model,
     };

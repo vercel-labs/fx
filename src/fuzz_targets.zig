@@ -25,6 +25,7 @@ test {
     _ = @import("core/app/trace_report.zig");
     _ = @import("core/app/host_record.zig");
     _ = @import("core/config/tool_placement.zig");
+    _ = @import("core/gateway/token_pass_memory.zig");
     _ = @import("core/images/image_attachments.zig");
     _ = @import("core/images/image_data.zig");
     _ = @import("core/images/image_route.zig");
@@ -40,6 +41,7 @@ test {
     _ = @import("core/mcp_host/wire_tests.zig");
     _ = @import("core/session/session_adapter.zig");
     _ = @import("core/profiles/profiles.zig");
+    _ = @import("core/profiles/started_with.zig");
     _ = @import("core/session/session_codec.zig");
     _ = @import("core/session/session_event.zig");
     _ = @import("core/shared/display_width.zig");
@@ -73,5 +75,6 @@ test {
     _ = @import("tools/web/url_policy.zig");
     _ = @import("ui/resize_tests.zig");
     _ = @import("ui/transcript/frozen_prefix_tests.zig");
+    _ = @import("ui/transcript/tool_group_projection.zig");
     _ = @import("ui/transcript/transcript_window_fuzz.zig");
 }

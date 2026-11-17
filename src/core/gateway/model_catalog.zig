@@ -8,7 +8,6 @@ const io_mod = @import("../shared/io.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const sort_utils = @import("../shared/sort_utils.zig");
 const types = @import("../shared/types.zig");
-const token_pass = @import("token_pass.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -391,6 +390,12 @@ pub const ModelCatalogEntry = struct {
     context_window: u32 = 0,
     max_tokens: u32 = 0,
     web_search_price: ?[]u8 = null,
+    /// The id of the model whose Fast mode runs this one; null when the
+    /// catalog names none.
+    fast_variant_of: ?[]u8 = null,
+    /// Whether AI Gateway marks this model as paid by the team's Token Pass.
+    /// Only an AI Gateway catalog for a team with Token Pass marks any.
+    token_pass: bool = false,
 };
 
 pub fn freeModelCatalog(alloc: std.mem.Allocator, entries: *std.ArrayList(ModelCatalogEntry)) void {
@@ -405,6 +410,7 @@ pub fn freeModelCatalogEntry(alloc: std.mem.Allocator, entry: ModelCatalogEntry)
     var reasoning_efforts = entry.reasoning_efforts;
     reasoning_efforts.deinit(alloc);
     if (entry.web_search_price) |price| alloc.free(price);
+    if (entry.fast_variant_of) |base| alloc.free(base);
 }
 
 /// Returns owned model id strings in catalog order; caller frees with `collections.freeStringList`.
@@ -455,11 +461,27 @@ fn cloneModelCatalogEntry(alloc: std.mem.Allocator, entry: ModelCatalogEntry) !M
         .context_window = entry.context_window,
         .max_tokens = entry.max_tokens,
         .web_search_price = null,
+        .token_pass = entry.token_pass,
     };
+    errdefer if (cloned.web_search_price) |price| alloc.free(price);
     if (entry.web_search_price) |price| {
         cloned.web_search_price = try alloc.dupe(u8, price);
     }
+    if (entry.fast_variant_of) |base| {
+        cloned.fast_variant_of = try alloc.dupe(u8, base);
+    }
     return cloned;
+}
+
+/// Whether the Models menu leaves `entry` out: the catalog says Fast mode on
+/// another model runs it, and that model is in `catalog` and offers Fast mode.
+/// The entry stays in the catalog, so a session that names it still runs.
+pub fn foldsIntoFastMode(entry: ModelCatalogEntry, catalog: []const ModelCatalogEntry) bool {
+    const base_id = entry.fast_variant_of orelse return false;
+    for (catalog) |candidate| {
+        if (std.mem.eql(u8, candidate.id, base_id)) return candidate.supports_fast_mode;
+    }
+    return false;
 }
 
 pub fn compareModelCatalogEntries(_: void, a: ModelCatalogEntry, b: ModelCatalogEntry) bool {
@@ -532,19 +554,8 @@ pub fn projectPickerModelCatalog(alloc: std.mem.Allocator, candidates: []const M
     errdefer freeModelCatalog(alloc, &selected);
     try selected.ensureTotalCapacity(alloc, candidates.len);
 
-    // Token Pass models lead the list, so nobody has to scroll the catalog to
-    // find the models a Token Pass pays for.
-    for (token_pass.featured_models) |id| {
-        for (candidates) |candidate| {
-            if (!std.mem.eql(u8, candidate.id, id)) continue;
-            if (!pickerCatalogContains(selected.items, candidate.id)) try appendClonedModelCatalogEntry(alloc, &selected, candidate);
-            break;
-        }
-    }
-
     for (featured_picker_families) |featured| {
-        // A Token Pass model already on top fills its family's slot.
-        var remaining = featured.count -| pickerFamilySelectionCount(selected.items, featured.family);
+        var remaining = featured.count;
         while (remaining > 0) : (remaining -= 1) {
             const candidate = newestUnselectedPickerCandidate(candidates, featured.family, selected.items) orelse break;
             try appendClonedModelCatalogEntry(alloc, &selected, candidate.*);
@@ -607,6 +618,8 @@ fn newestUnselectedPickerProviderCandidate(candidates: []const ModelCatalogEntry
 
 fn isPickerCandidate(candidate: ModelCatalogEntry) bool {
     if (text_utils.containsIgnoreCase(candidate.id, "claude-sonnet")) return false;
+    // A model that Fast mode on another model runs never takes a highlight slot.
+    if (candidate.fast_variant_of != null) return false;
     if (isGlmFastVariant(candidate.id)) return false;
 
     const excluded_variants = [_][]const u8{ "-mini", "-nano", "-oss", "-safeguard" };
@@ -666,14 +679,6 @@ fn pickerProviderLimit(provider: []const u8) usize {
         return extended_picker_provider_limit;
     }
     return picker_provider_limit;
-}
-
-fn pickerFamilySelectionCount(entries: []const ModelCatalogEntry, family: []const u8) usize {
-    var count: usize = 0;
-    for (entries) |entry| {
-        if (std.mem.eql(u8, modelPickerFamily(entry.id), family)) count += 1;
-    }
-    return count;
 }
 
 fn pickerProviderSelectionCount(entries: []const ModelCatalogEntry, provider: []const u8) usize {
@@ -1042,6 +1047,45 @@ test "picker curation skips fast variants in provider scan but keeps them select
     try std.testing.expectEqualStrings("zai/glm-5.2-fast", curated.items[2].id);
 }
 
+test "picker curation keeps a marked fast variant selectable without a highlight slot" {
+    const candidates = [_]ModelCatalogEntry{
+        .{ .id = @constCast("moonshotai/kimi-k3"), .model_type = @constCast("language"), .released = 100, .has_tool_use = true },
+        .{
+            .id = @constCast("moonshotai/kimi-k3-fast"),
+            .model_type = @constCast("language"),
+            .released = 100,
+            .has_tool_use = true,
+            .fast_variant_of = @constCast("moonshotai/kimi-k3"),
+        },
+        .{ .id = @constCast("moonshotai/kimi-k2"), .model_type = @constCast("language"), .released = 90, .has_tool_use = true },
+    };
+
+    var curated = try projectPickerModelCatalog(std.testing.allocator, &candidates);
+    defer freeModelCatalog(std.testing.allocator, &curated);
+
+    try std.testing.expectEqual(@as(usize, 3), curated.items.len);
+    try std.testing.expectEqualStrings("moonshotai/kimi-k3", curated.items[0].id);
+    try std.testing.expectEqualStrings("moonshotai/kimi-k2", curated.items[1].id);
+    try std.testing.expectEqualStrings("moonshotai/kimi-k3-fast", curated.items[2].id);
+    try std.testing.expectEqualStrings("moonshotai/kimi-k3", curated.items[2].fast_variant_of.?);
+}
+
+test "a fast variant folds into its base only when the base is listed and offers Fast mode" {
+    const catalog = [_]ModelCatalogEntry{
+        .{ .id = @constCast("anthropic/claude-opus-5"), .model_type = @constCast("language"), .supports_fast_mode = true },
+        .{ .id = @constCast("anthropic/claude-opus-5-fast"), .model_type = @constCast("language"), .fast_variant_of = @constCast("anthropic/claude-opus-5") },
+        .{ .id = @constCast("provider/plain"), .model_type = @constCast("language") },
+        .{ .id = @constCast("provider/plain-fast"), .model_type = @constCast("language"), .fast_variant_of = @constCast("provider/plain") },
+        .{ .id = @constCast("provider/orphan-fast"), .model_type = @constCast("language"), .fast_variant_of = @constCast("provider/orphan") },
+        .{ .id = @constCast("provider/unmarked-fast"), .model_type = @constCast("language") },
+    };
+
+    const expected = [_]bool{ false, true, false, false, false, false };
+    for (catalog, expected) |entry, folds| {
+        try std.testing.expectEqual(folds, foldsIntoFastMode(entry, &catalog));
+    }
+}
+
 test "projectModelIds preserves order and returns owned copies" {
     var first = [_]u8{ 'a', 'l', 'p', 'h', 'a' };
     var second = [_]u8{ 'b', 'e', 't', 'a' };
@@ -1125,31 +1169,31 @@ test "featured deepseek slot prefers the pro variant at equal recency" {
     try std.testing.expectEqualStrings("deepseek/deepseek-v4-flash", curated.items[2].id);
 }
 
-test "picker lists Token Pass models first without a second slot for their families" {
+test "picker keeps its highlights first and every Token Pass mark" {
     const candidates = [_]ModelCatalogEntry{
         .{ .id = @constCast("anthropic/claude-fable-5"), .model_type = @constCast("language"), .released = 300, .has_tool_use = true },
-        .{ .id = @constCast("openai/gpt-6"), .model_type = @constCast("language"), .released = 290, .has_tool_use = true },
-        .{ .id = @constCast("deepseek/deepseek-v4.1-pro"), .model_type = @constCast("language"), .released = 260, .has_tool_use = true },
-        .{ .id = @constCast("deepseek/deepseek-v4.1-flash"), .model_type = @constCast("language"), .released = 255, .has_tool_use = true },
-        .{ .id = @constCast("zai/glm-5.3"), .model_type = @constCast("language"), .released = 250, .has_tool_use = true },
-        .{ .id = @constCast("zai/glm-5.3-flash"), .model_type = @constCast("language"), .released = 240, .has_tool_use = true },
-        .{ .id = @constCast("moonshotai/kimi-k3"), .model_type = @constCast("language"), .released = 230, .has_tool_use = true },
+        .{ .id = @constCast("openai/gpt-6-sol"), .model_type = @constCast("language"), .released = 290, .has_tool_use = true },
+        .{ .id = @constCast("deepseek/deepseek-v4-pro"), .model_type = @constCast("language"), .released = 260, .has_tool_use = true },
+        .{ .id = @constCast("deepseek/deepseek-v4.1-flash"), .model_type = @constCast("language"), .released = 255, .has_tool_use = true, .token_pass = true },
+        .{ .id = @constCast("zai/glm-5.3"), .model_type = @constCast("language"), .released = 250, .has_tool_use = true, .token_pass = true },
+        .{ .id = @constCast("zai/glm-5.3-flash"), .model_type = @constCast("language"), .released = 240, .has_tool_use = true, .token_pass = true },
+        .{ .id = @constCast("moonshotai/kimi-k3.1-pro"), .model_type = @constCast("language"), .released = 235, .has_tool_use = true, .token_pass = true },
+        .{ .id = @constCast("moonshotai/kimi-k3"), .model_type = @constCast("language"), .released = 230, .has_tool_use = true, .token_pass = true },
         .{ .id = @constCast("zai/glm-5.2"), .model_type = @constCast("language"), .released = 100, .has_tool_use = true },
     };
 
     var curated = try projectPickerModelCatalog(std.testing.allocator, &candidates);
     defer freeModelCatalog(std.testing.allocator, &curated);
 
-    const expected = [_][]const u8{
-        "moonshotai/kimi-k3",
-        "zai/glm-5.3",
-        "zai/glm-5.3-flash",
-        "deepseek/deepseek-v4.1-flash",
-        "anthropic/claude-fable-5",
-        "openai/gpt-6",
-        "deepseek/deepseek-v4.1-pro",
-        "zai/glm-5.2",
-    };
-    try std.testing.expectEqual(expected.len, curated.items.len);
-    for (expected, curated.items) |id, entry| try std.testing.expectEqualStrings(id, entry.id);
+    // The catalog does not know the team, so Token Pass models keep their
+    // usual places; the model menu moves them up for a team with Token Pass.
+    const highlights = [_][]const u8{ "anthropic/claude-fable-5", "openai/gpt-6-sol", "zai/glm-5.3", "deepseek/deepseek-v4-pro" };
+    for (highlights, curated.items[0..highlights.len]) |id, entry| try std.testing.expectEqualStrings(id, entry.id);
+    try std.testing.expectEqual(candidates.len, curated.items.len);
+    for (candidates) |candidate| {
+        const kept = for (curated.items) |entry| {
+            if (std.mem.eql(u8, entry.id, candidate.id)) break entry;
+        } else return error.TestExpectedModel;
+        try std.testing.expectEqual(candidate.token_pass, kept.token_pass);
+    }
 }

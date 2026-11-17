@@ -1,5 +1,6 @@
 // `/effort` opens a footer menu of the current model's reasoning effort
 // levels, like the `/model` menu, and `/effort <level>` applies one directly.
+// Ctrl+T steps through default and the model's levels without opening anything.
 // Every view of the menu is read back from the recorded tape through
 // `fx replay`, and the highlight from the bytes fx wrote for it, so these
 // tests check what the terminal showed, not the live pane alone.
@@ -488,6 +489,66 @@ test.skipIf(!tmuxAvailable())("a model without levels opens no /effort column, a
   expect(readFileSync(current.stderrPath, "utf8")).toBe("");
   await quit(current);
   expect(columnViews(current, "plain-column")).toEqual([]);
+}, TIMEOUT);
+
+test.skipIf(!tmuxAvailable())("Ctrl+T steps from default through the model's levels and back to default, and the next request carries the one in use", async () => {
+  const current = await launch();
+  const { session, gateway } = current;
+  // Over the open /effort menu, Ctrl+T closes it and steps from the level in
+  // use, here from default to the lowest, whatever the menu highlights.
+  await session.sendText("/effort");
+  await waitForEffortMenu(current);
+  await press(session, "Up");
+  await session.sendKeys("C-t");
+  await session.waitForPane((pane) => !pane.includes("Effort 5") && pane.includes("auto · thinker · low"), 5_000);
+  expect(savedEffort(current)).toBe("low");
+
+  // The status line names each level, and the draft stays as typed. After
+  // the highest level comes default, which the status line leaves out.
+  await session.sendLiteral("keep this draft");
+  for (const level of ["medium", "high", "xhigh", "default", "low", "medium"]) {
+    await session.sendKeys("C-t");
+    if (level === "default") {
+      await session.waitForPane((pane) => /^auto · thinker *$/m.test(pane), 5_000);
+      expect(savedEffort(current)).toBe("auto");
+    } else {
+      await session.waitForText(`auto · thinker · ${level}`, 5_000);
+      expect(savedEffort(current)).toBe(level);
+    }
+  }
+  const pane = await session.capturePane();
+  expect(pane).toMatch(/^┃ keep this draft$/m);
+  // The shortcut writes nothing to the transcript.
+  expect(pane).not.toContain("Reasoning effort");
+
+  await session.sendKeys("Enter");
+  await session.waitForText("ANSWER", 10_000);
+  await session.waitForComposer(10_000);
+  expect(readFileSync(current.stderrPath, "utf8")).toBe("");
+  await quit(current);
+
+  const sent = gateway.requests
+    .filter((request) => request.body.includes("keep this draft"))
+    .map((request) => JSON.parse(request.body) as { reasoning?: string })[0];
+  expect(sent?.reasoning).toBe("medium");
+  // Only the /effort command opened the menu, before any level was chosen.
+  const views = menuViews(current, "cycle");
+  expect(views.length).toBeGreaterThan(0);
+  expect(views.every((view) => view.menu.current === "default")).toBe(true);
+}, TIMEOUT);
+
+test.skipIf(!tmuxAvailable())("Ctrl+T on a model without levels says why and saves nothing", async () => {
+  const current = await launch({ model: PLAIN_MODEL });
+  const { session } = current;
+  await session.sendLiteral("keep this draft");
+  await session.sendKeys("C-t");
+  await session.waitForText("acme/plain has no levels to choose from", 5_000);
+  expect(await session.capturePane()).toMatch(/^┃ keep this draft$/m);
+  expect(savedEffort(current)).toBeUndefined();
+  await session.sendKeys("C-u");
+  expect(readFileSync(current.stderrPath, "utf8")).toBe("");
+  await quit(current);
+  expect(menuViews(current, "plain-cycle")).toEqual([]);
 }, TIMEOUT);
 
 /// A shell on a custom model connection (`fixtures/chat-completions.ts`)

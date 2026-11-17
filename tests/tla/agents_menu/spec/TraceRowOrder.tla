@@ -33,7 +33,7 @@ TraceNext ==
 TraceSpec == TraceInit /\ [][TraceNext]_<<vars, trace, at>>
 
 TypeOK ==
-    /\ shown \in [TraceSubs -> {"working", "idle"}]
+    /\ shown \in [TraceSubs -> {"working", "idle", "failed", "stopped"}]
     /\ order \in Seq(TraceSubs)
     /\ rank \in [TraceSubs -> 0..Cardinality(TraceSubs)]
 

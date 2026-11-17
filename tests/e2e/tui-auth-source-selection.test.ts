@@ -448,6 +448,13 @@ function startRequestCatcher() {
   };
 }
 
+/// Waits until the credits fake has seen `count` requests.
+async function waitForCreditsRequests(creditsGateway: { requests: unknown[] }, count: number) {
+  const deadline = Date.now() + TIMEOUT;
+  while (creditsGateway.requests.length < count && Date.now() < deadline) await Bun.sleep(25);
+  expect(creditsGateway.requests).toHaveLength(count);
+}
+
 function startFakeCreditsGateway() {
   const requests: Array<{
     method: string;
@@ -1772,6 +1779,48 @@ tmuxTest("the TUI revokes kept sign-outs on a worker when it starts", async () =
   expect(readFileSync(stderrPath, "utf8")).toBe("");
 }, 60_000);
 
+tmuxTest("the TUI revokes kept MCP sign-outs at their servers when it starts", async () => {
+  home = mkdtempSync(join(tmpdir(), "fx-tui-kept-mcp-sign-out-retry-"));
+  stderrPath = join(home, "stderr.log");
+  writeFileSync(stderrPath, "");
+  gateway = startFakeGateway([]);
+  const forms: Array<{ form: Record<string, string>; authorization: string | null }> = [];
+  const authServer = Bun.serve({
+    hostname: "127.0.0.1",
+    port: 0,
+    async fetch(request) {
+      if (new URL(request.url).pathname !== "/revoke") return new Response(null, { status: 404 });
+      forms.push({ form: Object.fromEntries(new URLSearchParams(await request.text())), authorization: request.headers.get("authorization") });
+      return new Response(null, { status: 200 });
+    },
+  });
+  try {
+    const origin = `http://127.0.0.1:${authServer.port}`;
+    const pending = writeKeptSignOuts(home, "mcp-revocations.json", [{
+      saved_at_ms: Date.now() - 60_000,
+      refresh_token: "earlier-mcp-refresh",
+      token_type_hint: "refresh_token",
+      revocation_endpoint: `${origin}/revoke`,
+      client_id: "mcp-client",
+      client_secret: "mcp-secret",
+      client_auth: "client_secret_basic",
+      server_url: `${origin}/mcp`,
+    }]);
+    session = await startFx(home, stderrPath, gateway);
+    await session.waitForComposer(TIMEOUT);
+    await waitForRemoval(pending);
+    // Sent as the logout's own revocation was: the token and its kind in the
+    // form, and the client's id and secret in the header.
+    expect(forms).toEqual([{
+      form: { token: "earlier-mcp-refresh", token_type_hint: "refresh_token" },
+      authorization: `Basic ${Buffer.from("mcp-client:mcp-secret").toString("base64")}`,
+    }]);
+    expect(readFileSync(stderrPath, "utf8")).toBe("");
+  } finally {
+    authServer.stop(true);
+  }
+}, 60_000);
+
 tmuxTest("fx quits promptly while a Codex revocation still waits", async () => {
   home = mkdtempSync(join(tmpdir(), "fx-tui-codex-logout-quit-"));
   stderrPath = join(home, "stderr.log");
@@ -3012,6 +3061,11 @@ tmuxTest(
     // The login was already on this team, so nothing changed.
     const signedIn = await session.captureFullScrollback();
     expect(signedIn).toContain("Using Vercel team Vercel Labs (vercel-labs).");
+    expect(signedIn).not.toContain("auth: Using Vercel team");
+    expect(signedIn).toContain("Get $150 of tokens for $30 with Vercel Token Pass.");
+    // The link sits behind the name, so the address never shows.
+    expect(signedIn).not.toContain("vercel.com/get/token-pass");
+    expect(signedIn).not.toContain("Preparing Vercel AI Gateway");
     expect(signedIn).not.toContain("Changed Vercel team");
 
     expect(gateway.requests).toHaveLength(2);
@@ -3982,7 +4036,10 @@ tmuxTest(
         pane.includes("Models") &&
         pane.includes("gpt-5.6-sol") &&
         pane.includes("gpt-5.4-mini") &&
-        !pane.includes("openai/gpt-5.6-sol"),
+        !pane
+          .split("\n")
+          .filter((line) => /^\s+\S*gpt-/.test(line))
+          .some((line) => line.includes("openai/gpt-5.6-sol")),
       TIMEOUT,
     );
     expect(codexCatalog).toContain("[All]");
@@ -9566,11 +9623,11 @@ tmuxTest(
       "GET /.well-known/openid-configuration",
       "POST /oauth/token",
     ]);
-    expect(creditsGateway.requests).toEqual([{
-      method: "GET",
-      path: "/v1/credits",
-      authorization: `Bearer ${ACQUIRED_LOGIN_TOKEN}`,
-    }]);
+    // /credits, and the Token Pass check the renewed login starts: both
+    // with the renewed token.
+    await waitForCreditsRequests(creditsGateway, 2);
+    const renewed = { method: "GET", path: "/v1/credits", authorization: `Bearer ${ACQUIRED_LOGIN_TOKEN}` };
+    expect(creditsGateway.requests).toEqual([renewed, renewed]);
     await waitForModelRequestCount(gateway, 2);
     expect(gateway.modelRequests).toHaveLength(2);
     expect(gateway.modelRequests[0].headers.get("authorization")).toBeNull();
@@ -9614,11 +9671,13 @@ tmuxTest(
 
     await session.waitForText("* credits: balance=42", TIMEOUT);
     expect(oauth.requests.filter((request) => request.path === "/oauth/token")).toHaveLength(1);
-    expect(creditsGateway.requests).toEqual([{
-      method: "GET",
-      path: "/v1/credits",
-      authorization: `Bearer ${ACQUIRED_LOGIN_TOKEN}`,
-    }]);
+    // The Token Pass check at launch, with the login that was current
+    // then, and /credits with the renewed one.
+    await waitForCreditsRequests(creditsGateway, 2);
+    expect(creditsGateway.requests).toEqual([
+      { method: "GET", path: "/v1/credits", authorization: `Bearer ${LOGIN_TOKEN}` },
+      { method: "GET", path: "/v1/credits", authorization: `Bearer ${ACQUIRED_LOGIN_TOKEN}` },
+    ]);
     expect(readFileSync(stderrPath, "utf8")).toBe("");
   },
   60_000,
@@ -9731,11 +9790,16 @@ tmuxTest(
       FX_TEST_GATEWAY_CREDITS_URL: creditsGateway.url,
     });
     await session.waitForComposer(TIMEOUT);
+    // The Token Pass check at launch uses the login while it is current.
+    await waitForCreditsRequests(creditsGateway, 1);
     await Bun.sleep(Math.max(0, refreshDueAt - Date.now()) + 250);
 
     await session.sendText("/credits");
     await session.waitForText("Your sign-in has expired. Run /login, then check credits again.", TIMEOUT);
-    expect(creditsGateway.requests).toEqual([]);
+    // /credits sends nothing with the expired login.
+    expect(creditsGateway.requests).toEqual([
+      { method: "GET", path: "/v1/credits", authorization: `Bearer ${LOGIN_TOKEN}` },
+    ]);
     expect(readFileSync(stderrPath, "utf8")).toBe("");
   },
   60_000,

@@ -302,6 +302,9 @@ pub const TurnContext = struct {
     /// The name the parent gave the child, such as `reviewer`, or null for a
     /// one-off. Borrowed for the turn.
     child_name: ?[]const u8 = null,
+    /// What the child is for (`Child.purpose`), or null when it has none.
+    /// Borrowed for the turn.
+    child_purpose: ?[]const u8 = null,
     active_work_id: ?[]const u8 = null,
     phase_context: ?*anyopaque = null,
     phase_fn: ?*const fn (

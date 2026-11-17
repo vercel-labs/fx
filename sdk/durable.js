@@ -961,6 +961,23 @@ function claimName(name, member) {
   }
 }
 
+// The start libfx began last for each key in this process, settled either
+// way. libfx creates a World for each agent, and a durability whose Worlds'
+// starts break when two run at once on one store names that store with
+// `startTurnKey()`, as local() names its folder. Each such start waits for
+// the one before it with its key; every other World starts on its own, so a
+// start that never settles holds only its own agent.
+const worldStarts = new Map();
+function startInTurn(key, start) {
+  const started = (worldStarts.get(key) ?? Promise.resolve()).then(start);
+  const settled = started.then(() => {}, () => {});
+  worldStarts.set(key, settled);
+  void settled.then(() => {
+    if (worldStarts.get(key) === settled) worldStarts.delete(key);
+  });
+  return started;
+}
+
 // libfx starts and closes a World it `owned`, having created it; a World the
 // app passed in stays the app's.
 function createWorldBackend(world, durability) {
@@ -1078,7 +1095,10 @@ function createWorldBackend(world, durability) {
       else liveHolders.delete(holder);
     },
     async start() {
-      if (owned) await world.start?.();
+      if (owned && typeof world.start === "function") {
+        if (typeof durability.startTurnKey === "function") await startInTurn(await durability.startTurnKey(), () => world.start());
+        else await world.start();
+      }
       if (typeof world.getRuntimeDeadline === "function") {
         backend.deadline = () => backend.runtimeDeadline ?? null;
       }

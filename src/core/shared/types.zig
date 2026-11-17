@@ -42,6 +42,9 @@ pub const SemanticNotice = struct {
     tone: NoticeTone,
     body: []const u8,
     visibility: NoticeVisibility = .compact_and_full,
+    /// An optional dim line under the body, indented like a wrapped body row
+    /// and without its own glyph.
+    detail: []const u8 = "",
 };
 
 /// Status glyph leading every semantic notice, keyed by tone. Tool activity
@@ -59,22 +62,26 @@ pub fn noticeGlyph(tone: NoticeTone) []const u8 {
     };
 }
 
-/// Returns a duplicate with owned topic and body bytes. The caller frees it
+/// Returns a duplicate with owned topic, body, and detail bytes. The caller frees it
 /// with `freeSemanticNotice` using the same allocator.
 pub fn dupeSemanticNotice(alloc: std.mem.Allocator, notice: SemanticNotice) std.mem.Allocator.Error!SemanticNotice {
     const topic = try alloc.dupe(u8, notice.topic);
     errdefer alloc.free(topic);
+    const body = try alloc.dupe(u8, notice.body);
+    errdefer alloc.free(body);
     return .{
         .topic = topic,
         .tone = notice.tone,
-        .body = try alloc.dupe(u8, notice.body),
+        .body = body,
         .visibility = notice.visibility,
+        .detail = try alloc.dupe(u8, notice.detail),
     };
 }
 
 pub fn freeSemanticNotice(alloc: std.mem.Allocator, notice: SemanticNotice) void {
     alloc.free(notice.topic);
     alloc.free(notice.body);
+    alloc.free(notice.detail);
 }
 
 /// Converts legacy context-notice text into a semantic notice body while
@@ -1515,6 +1522,79 @@ pub fn freeModelCallRecords(alloc: std.mem.Allocator, records: []const ModelCall
     alloc.free(records);
 }
 
+/// How a call a command made through `fx mcp call` ended.
+pub const BridgeCallOutcome = enum {
+    completed,
+    failed,
+    cancelled,
+
+    pub fn toolOutcome(self: BridgeCallOutcome) ToolOutcomeKind {
+        return switch (self) {
+            .completed => .completed,
+            .failed => .failed,
+            .cancelled => .cancelled,
+        };
+    }
+};
+
+/// A call a command made through `fx mcp call`, which the TUI showed as a
+/// row in its shell call's group. The session keeps it so a resume shows
+/// that row again: the tool's name and how the call ended, never its
+/// arguments or its result. Display data, never sent to the model.
+pub const BridgeCallRecord = struct {
+    /// The shell call whose command made the call.
+    call_id: []const u8,
+    /// The bridge's id for the call.
+    request_id: []const u8,
+    tool: []const u8,
+    outcome: BridgeCallOutcome,
+};
+
+/// Whether a record may be saved and shown: each string short, valid UTF-8
+/// and free of control characters, as a model call record's are
+/// (`validModelCallText`).
+pub fn validBridgeCallRecord(record: BridgeCallRecord) bool {
+    inline for (.{ record.call_id, record.request_id, record.tool }) |text| {
+        if (!validModelCallText(text)) return false;
+    }
+    return true;
+}
+
+/// Caller owns the copy's strings; free them with `freeBridgeCallRecordStrings`.
+pub fn dupeBridgeCallRecord(alloc: std.mem.Allocator, record: BridgeCallRecord) !BridgeCallRecord {
+    const call_id = try alloc.dupe(u8, record.call_id);
+    errdefer alloc.free(call_id);
+    const request_id = try alloc.dupe(u8, record.request_id);
+    errdefer alloc.free(request_id);
+    return .{ .call_id = call_id, .request_id = request_id, .tool = try alloc.dupe(u8, record.tool), .outcome = record.outcome };
+}
+
+pub fn freeBridgeCallRecordStrings(alloc: std.mem.Allocator, record: BridgeCallRecord) void {
+    alloc.free(record.call_id);
+    alloc.free(record.request_id);
+    alloc.free(record.tool);
+}
+
+/// Caller owns the copy; free it with `freeBridgeCallRecords`.
+pub fn dupeBridgeCallRecords(alloc: std.mem.Allocator, records: []const BridgeCallRecord) ![]BridgeCallRecord {
+    const copies = try alloc.alloc(BridgeCallRecord, records.len);
+    var done: usize = 0;
+    errdefer {
+        for (copies[0..done]) |copy| freeBridgeCallRecordStrings(alloc, copy);
+        alloc.free(copies);
+    }
+    for (records, copies) |record, *copy| {
+        copy.* = try dupeBridgeCallRecord(alloc, record);
+        done += 1;
+    }
+    return copies;
+}
+
+pub fn freeBridgeCallRecords(alloc: std.mem.Allocator, records: []const BridgeCallRecord) void {
+    for (records) |record| freeBridgeCallRecordStrings(alloc, record);
+    alloc.free(records);
+}
+
 pub const SteeringDelivery = enum(u8) { queued, applied, not_applied };
 
 pub const FileEvidence = struct {
@@ -1545,6 +1625,11 @@ pub const ExecutionMemory = struct {
     /// The turn's settled model calls, in order, for Ctrl+O. Display data:
     /// never part of what the model is sent.
     model_calls: []ModelCallRecord = &.{},
+    /// The calls the turn's commands made through `fx mcp call`, in the
+    /// order they ended, each naming its shell call. Only a resumed turn
+    /// holds them, for the rows its replay shows; display data, never part
+    /// of what the model is sent.
+    bridge_calls: []BridgeCallRecord = &.{},
 
     pub fn isEmpty(self: ExecutionMemory) bool {
         return self.tool_steps.len == 0 and self.files.len == 0 and self.steering.len == 0 and self.context_notes.len == 0;
@@ -2019,6 +2104,34 @@ pub const ProviderFinishRaw = struct {
     }
 };
 
+/// Gemini's stop reason for a function call it could not write, which the AI
+/// SDK reports as the finish `error`.
+pub const malformed_function_call_reason = "MALFORMED_FUNCTION_CALL";
+
+/// Whether a reply ended because the provider could not read the model's tool
+/// call. The reply's calls never ran, and the same request can fail the same
+/// way, so fx gives the model feedback instead of a plain resend.
+pub fn isMalformedToolCallFinish(
+    finish_reason: ?ProviderFinishReason,
+    finish_reason_raw: ProviderFinishRaw,
+) bool {
+    const reason = finish_reason orelse return false;
+    return reason == .provider_error and
+        std.mem.eql(u8, finish_reason_raw.slice(), malformed_function_call_reason);
+}
+
+test "only a provider error named MALFORMED_FUNCTION_CALL is a malformed tool call" {
+    const malformed = ProviderFinishRaw.init("MALFORMED_FUNCTION_CALL");
+    try std.testing.expect(isMalformedToolCallFinish(.provider_error, malformed));
+    try std.testing.expect(!isMalformedToolCallFinish(.other, malformed));
+    try std.testing.expect(!isMalformedToolCallFinish(.stop, malformed));
+    try std.testing.expect(!isMalformedToolCallFinish(null, malformed));
+    try std.testing.expect(!isMalformedToolCallFinish(.provider_error, ProviderFinishRaw.init("provider_error")));
+    try std.testing.expect(!isMalformedToolCallFinish(.provider_error, ProviderFinishRaw.init("malformed_function_call")));
+    try std.testing.expect(!isMalformedToolCallFinish(.provider_error, ProviderFinishRaw.init("MALFORMED_FUNCTION_CALL_X")));
+    try std.testing.expect(!isMalformedToolCallFinish(.provider_error, ProviderFinishRaw.init("")));
+}
+
 test "provider finish raw keeps a bounded printable copy" {
     try std.testing.expectEqualStrings("UNEXPECTED_TOOL_CALL", ProviderFinishRaw.init("UNEXPECTED_TOOL_CALL").slice());
     try std.testing.expectEqualStrings("", ProviderFinishRaw.init("").slice());
@@ -2038,12 +2151,20 @@ fn fuzzProviderFinishRaw(_: void, smith: *std.testing.Smith) anyerror!void {
         try std.testing.expect(byte >= 0x21 and byte <= 0x7e);
         try std.testing.expectEqual(if (source >= 0x21 and source <= 0x7e) source else '?', byte);
     }
+    // Only the exact reason marks a malformed tool call: a longer one cut to
+    // the capacity, or one whose unprintable bytes became '?', does not.
+    try std.testing.expectEqual(
+        std.mem.eql(u8, input, malformed_function_call_reason),
+        isMalformedToolCallFinish(.provider_error, raw),
+    );
+    try std.testing.expect(!isMalformedToolCallFinish(.other, raw));
 }
 
 test "fuzz provider finish raw" {
     try std.testing.fuzz({}, fuzzProviderFinishRaw, .{
         .corpus = &(@import("fuzz_seed").slices(.{
             "UNEXPECTED_TOOL_CALL",
+            "MALFORMED_FUNCTION_CALL",
             "",
             "BAD\x07REASON",
             "\xc3\xa9 \x00\xff",
@@ -3147,6 +3268,8 @@ pub fn dupeExecutionMemory(alloc: std.mem.Allocator, memory: ExecutionMemory) !E
     const runtime_context = if (memory.runtime_context) |texts| try dupeRuntimeContext(alloc, texts) else null;
     errdefer if (runtime_context) |texts| freeRuntimeContext(alloc, texts);
     const model_calls = try dupeModelCallRecords(alloc, memory.model_calls);
+    errdefer freeModelCallRecords(alloc, model_calls);
+    const bridge_calls = try dupeBridgeCallRecords(alloc, memory.bridge_calls);
     return .{
         .tool_steps = tool_steps,
         .files = files,
@@ -3155,10 +3278,12 @@ pub fn dupeExecutionMemory(alloc: std.mem.Allocator, memory: ExecutionMemory) !E
         .runtime_context = runtime_context,
         .turn_summary = memory.turn_summary,
         .model_calls = model_calls,
+        .bridge_calls = bridge_calls,
     };
 }
 
 pub fn freeExecutionMemory(alloc: std.mem.Allocator, memory: ExecutionMemory) void {
+    freeBridgeCallRecords(alloc, memory.bridge_calls);
     freeModelCallRecords(alloc, memory.model_calls);
     freeToolExecutionSteps(alloc, memory.tool_steps);
     freeFileEvidenceSlice(alloc, memory.files);
