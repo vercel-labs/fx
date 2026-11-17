@@ -1708,13 +1708,14 @@ test "production registry keeps vision route-filtered from ordinary projections"
     }
 }
 
-test "every built-in tool but toolbox, the tools it replaces, and vision can move" {
+test "every built-in tool but toolbox, the tools it replaces, vision, and execute can move" {
     const tool_placement = @import("../core/config/tool_placement.zig");
     const toolbox_core = @import("../core/tooling/toolbox.zig");
     for (all) |tool| {
         const fixed = std.mem.eql(u8, tool.name, toolbox_core.tool_name) or
             toolbox_core.isReplaced(tool.name) or
-            std.mem.eql(u8, tool.name, vision.name);
+            std.mem.eql(u8, tool.name, vision.name) or
+            std.mem.eql(u8, tool.name, execute.name);
         try std.testing.expectEqual(!fixed, tool_placement.Tool.parse(tool.name) != null);
     }
     inline for (@typeInfo(tool_placement.Tool).@"enum".field_names) |name| {

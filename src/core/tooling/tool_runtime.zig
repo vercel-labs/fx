@@ -2082,9 +2082,29 @@ fn typedDispatchContextForCall(
 }
 
 /// Tools a program can't call: `execute` itself, `ask_user_question`, which
-/// would stop the program to wait for the user, and `subagent`, which starts
-/// a whole agent.
-const code_mode_excluded_tools = [_][]const u8{ "execute", "ask_user_question", "subagent" };
+/// would stop the program to wait for the user, `subagent`, which starts a
+/// whole agent, and `toolbox`, whose opens and searches fx decides as the
+/// tool each replaced only for the agent's own calls
+/// (`orchestrator.toolboxSubject`).
+const code_mode_excluded_tools = [_][]const u8{ "execute", "ask_user_question", "subagent", toolbox.tool_name };
+
+/// Whether the agent reaches `name` only through toolbox: a built-in placed
+/// behind it, or an MCP tool the request didn't send.
+fn reachedThroughToolbox(ctx: Context, name: []const u8) bool {
+    if (registeredToolSpec(ctx, name) != null) return containsName(ctx.toolbox_behind, name);
+    return types.isMcpToolName(name) and !containsName(ctx.advertised_dynamic_tool_names, name);
+}
+
+/// Whether this agent has toolbox, as the tools list decides it
+/// (`tool_projection.zig`): registered, inside a live authority, and not
+/// denied for every target outside full access. Without it the tools behind
+/// toolbox are out of reach, for a program as for the model.
+fn toolboxAvailable(ctx: Context) bool {
+    if (ctx.tool_registry.lookup(toolbox.tool_name) == null) return false;
+    if (ctx.live_tool_names) |tools| if (!containsName(tools, toolbox.tool_name)) return false;
+    if (ctx.permission_mode == .yolo) return true;
+    return !permissions.rulesDenyAllTargetsForTool(ctx.permission_rules, toolbox.tool_name);
+}
 
 /// One `execute` call's program, as its tool calls arrive.
 const CodeModeProviderState = struct {
@@ -2158,6 +2178,10 @@ fn executeNestedToolCall(
             .status = .failed,
         };
     }
+    if (reachedThroughToolbox(state.runtime, name) and !toolboxAvailable(state.runtime)) return .{
+        .text = try call_arena.print("{s} is reached through toolbox, which isn't available to this agent.", .{name}),
+        .status = .failed,
+    };
     if (codeModeCancelled(raw)) return error.Cancelled;
     const resolved_mcp = try nestedMcpDefinition(state, name);
     var ctx = state.runtime;
@@ -7859,6 +7883,90 @@ test "a program's shell call takes the arguments the same direct call does" {
         .{ .name = "read_file", .sent = "{\"request\":{\"path\":\"a\"}}", .run = "{\"request\":{\"path\":\"a\"}}" },
     };
     for (cases) |case| try std.testing.expectEqualStrings(case.run, try nestedArguments(&state, case.name, case.sent));
+}
+
+test "a program reaches the tools behind toolbox only while the agent has toolbox" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io_mod.getIo(), .{ .sub_path = "secret.txt", .data = "top secret" });
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(root);
+
+    var rt = TestRuntime{
+        .workspace_root = root,
+        .tool_registry = .{ .tools = &.{ test_builtin_tools.read_file, test_builtin_tools.toolbox } },
+    };
+    defer rt.deinit(alloc);
+    var deny_toolbox = [_]types.PermissionRule{
+        .{ .permission = @constCast("toolbox"), .pattern = @constCast("*"), .action = .deny },
+    };
+    const Case = struct {
+        live_tools: ?[]const []const u8 = null,
+        rules: types.PermissionRuleSet = .{},
+        mode: PermissionMode = .yolo,
+        reads: bool,
+    };
+    const cases = [_]Case{
+        // read_file sits behind toolbox here, so a profile without toolbox...
+        .{ .live_tools = &.{ "execute", "read_file" }, .reads = false },
+        // ...and a rule that denies toolbox keep a program from it, as they
+        // keep the model from it.
+        .{ .rules = .{ .rules = &deny_toolbox }, .mode = .ask, .reads = false },
+        // The control: with toolbox, the same call reads the file.
+        .{ .live_tools = &.{ "execute", "read_file", "toolbox" }, .reads = true },
+    };
+    for (cases) |case| {
+        var arena_state = std.heap.ArenaAllocator.init(alloc);
+        defer arena_state.deinit();
+        var ctx = rt.context();
+        ctx.toolbox_behind = &.{"read_file"};
+        ctx.live_tool_names = case.live_tools;
+        ctx.permission_rules = case.rules;
+        ctx.permission_mode = case.mode;
+        var state: CodeModeProviderState = .{
+            .runtime = ctx,
+            .call = .{ .id = "program", .name = "execute", .arguments_json = "{}" },
+            .arena = arena_state.allocator(),
+        };
+        const result = try executeNestedToolCall(&state, arena_state.allocator(), "read_file", "{\"path\":\"secret.txt\"}");
+        if (case.reads) {
+            try expectContains(result.text, "top secret");
+        } else {
+            try std.testing.expectEqualStrings("read_file is reached through toolbox, which isn't available to this agent.", result.text);
+        }
+    }
+}
+
+test "a program can't call toolbox, and reaches an MCP tool the request didn't send through it" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var rt = TestRuntime{
+        .workspace_root = "/workspace",
+        .tool_registry = .{ .tools = &.{ test_builtin_tools.read_file, test_builtin_tools.toolbox } },
+    };
+    defer rt.deinit(std.testing.allocator);
+    var state: CodeModeProviderState = .{
+        .runtime = rt.context(),
+        .call = .{ .id = "program", .name = "execute", .arguments_json = "{}" },
+        .arena = arena_state.allocator(),
+    };
+    const refused = try executeNestedToolCall(&state, arena_state.allocator(), "toolbox", "{\"search\":\"files\"}");
+    try std.testing.expectEqualStrings("toolbox can't be called from a program. Call it directly instead.", refused.text);
+
+    var ctx = rt.context();
+    const mcp_name = types.mcp_tool_prefix ++ "server__lookup";
+    try std.testing.expect(reachedThroughToolbox(ctx, mcp_name));
+    try std.testing.expect(!reachedThroughToolbox(ctx, "read_file"));
+    // The control: an MCP tool the request sent, like a built-in in the
+    // tools list, is called directly.
+    ctx.advertised_dynamic_tool_names = &.{mcp_name};
+    try std.testing.expect(!reachedThroughToolbox(ctx, mcp_name));
+    ctx.toolbox_behind = &.{"read_file"};
+    try std.testing.expect(reachedThroughToolbox(ctx, "read_file"));
+    // Without toolbox in the registry, nothing behind it is in reach.
+    rt.tool_registry = .{ .tools = &.{test_builtin_tools.read_file} };
+    try std.testing.expect(!toolboxAvailable(rt.context()));
 }
 
 test "an execute call runs its program only while code mode is on" {
