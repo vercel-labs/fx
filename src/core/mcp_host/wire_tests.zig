@@ -586,6 +586,31 @@ fn fuzzEscapedStrings(_: void, smith: *testing.Smith) !void {
     var answer: std.ArrayList(u8) = .empty;
     try appendSpelled(arena, &answer, answer_points[0..answer_count], &script);
 
+    // The same two strings as names in one form. Two names that decode alike are one name, so a form that holds both
+    // is unreadable; and a `required` name that decodes like a property's key finds that property.
+    const want = try decodedByStdJson(arena, server.items);
+    const got = try decodedByStdJson(arena, answer.items);
+    const alike = std.mem.eql(u8, want, got);
+    const twice = try arena.print("{{\"message\":\"m\",\"requestedSchema\":{{\"type\":\"object\",\"properties\":{{{s}:{{\"type\":\"boolean\"}},{s}:{{\"type\":\"boolean\"}}}}}}}}", .{ server.items, answer.items });
+    const named = try arena.print("{{\"message\":\"m\",\"requestedSchema\":{{\"type\":\"object\",\"properties\":{{{s}:{{\"type\":\"boolean\"}}}},\"required\":[{s}]}}}}", .{ server.items, answer.items });
+    for ([_]struct { params: []const u8, what: []const u8, readable_when_alike: bool }{
+        .{ .params = twice, .what = "two property names", .readable_when_alike = false },
+        .{ .params = named, .what = "a property name and a required name", .readable_when_alike = true },
+    }) |shape| {
+        var shape_form: mcp.elicitation.Form = .{};
+        const readable = if (mcp.elicitation.parse(shape.params, &shape_form)) |_| true else |_| false;
+        if (readable != (alike == shape.readable_when_alike)) {
+            std.debug.print("the engine read {s} as {s}, and std.json decodes them {s}: server wrote {s}, answer wrote {s}\n", .{
+                shape.what,
+                if (readable) "readable" else "unreadable",
+                if (alike) "alike" else "apart",
+                server.items,
+                answer.items,
+            });
+            return error.TestUnexpectedResult;
+        }
+    }
+
     const properties = switch (place) {
         0 => try arena.print("{{{s}:{{\"type\":\"boolean\"}}}}", .{server.items}),
         1 => try arena.print("{{\"c\":{{\"type\":\"string\",\"enum\":[{s},\"zz\"]}}}}", .{server.items}),
@@ -603,9 +628,7 @@ fn fuzzEscapedStrings(_: void, smith: *testing.Smith) !void {
 
     // The law: the engine accepts the answer exactly when the two strings are
     // the same string once decoded, as `std.json` decodes them.
-    const want = try decodedByStdJson(arena, server.items);
-    const got = try decodedByStdJson(arena, answer.items);
-    const matches = std.mem.eql(u8, want, got) or (place != 0 and std.mem.eql(u8, got, "zz"));
+    const matches = alike or (place != 0 and std.mem.eql(u8, got, "zz"));
     if (accepted != matches) {
         std.debug.print("the engine {s} {s}, std.json says {s}: server wrote {s}, answer wrote {s}\n", .{
             if (accepted) "accepted" else "refused",
