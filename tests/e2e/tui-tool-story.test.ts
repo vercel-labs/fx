@@ -249,7 +249,7 @@ test.skipIf(!tmuxAvailable())(
     // its own, with the error's line after it.
     expect(treeRows(checks)).toEqual([
       "├ Ran sh check.sh",
-      expect.stringMatching(/^└ .*sh build\.sh · src\/main\.ts:14:15 - error TS2554: Expected 1 arguments, but got 3\.$/),
+      expect.stringMatching(/^└ .*sh build\.sh · Expected 1 arguments, but got 3\.$/),
     ]);
     expect(checks.some((line) => line.includes("✗ exit"))).toBe(false);
 
@@ -460,8 +460,13 @@ test.skipIf(!tmuxAvailable())(
       finalText: "The file is missing.",
     });
     const lines = paneLines(pane);
-    // The reason is ls's own message, not a printed line that names "error".
-    expect(lines.some((line) => /^● Exited \d+ printf, ls · ls: .*missing-file/.test(line))).toBe(true);
+    // The reason is ls's own message, not a printed line that names "error",
+    // without the words that say who spoke, and at most 40 columns.
+    const row = lines.find((line) => /^● Exited \d+ printf, ls · /.test(line));
+    expect(row).toBeDefined();
+    const reason = row!.replace(/^● Exited \d+ printf, ls · /, "").replace(/ ✗$/, "");
+    expect(reason).toMatch(/^(No such file or directory|cannot access 'missing-file': No such f…)$/);
+    expect([...reason].length).toBeLessThanOrEqual(40);
     expect(lines.some((line) => line.includes("error_code") || line.includes('get("error")'))).toBe(false);
   },
   TIMEOUT * 2,
@@ -589,7 +594,9 @@ test.skipIf(!tmuxAvailable())(
     // there, clipped to the width.
     const row = lines.find((line) => /^● .*sh hostile\.sh · /.test(line));
     expect(row).toBeDefined();
-    expect(row!).toContain(" · error: xxxx");
+    // The reason is the error's message alone, without its "error:".
+    expect(row!).toContain(" · xxxx");
+    expect(row!).not.toContain("error:");
     expect(row!).toEndWith("…");
     expect([...row!].length).toBeLessThanOrEqual(width);
     expect(lines.some((line) => line.startsWith("  ✗ "))).toBe(false);

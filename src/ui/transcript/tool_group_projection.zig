@@ -2645,10 +2645,61 @@ fn storyFailureReason(scratch: std.mem.Allocator, detail: ?*const ToolDetailReco
         break :blk null;
     } else null;
     // The row's own status already says how a command ended, such as
-    // "Exited 2" or "Timed out", so the reason is only its line of output.
+    // "Exited 2" or "Timed out", so the reason is only its line of output,
+    // by its message alone and short; Ctrl+O shows the whole output.
     const text = line orelse return null;
-    const safe = try storySafeLine(scratch, if (is_command) text else firstSentence(text), story_reason_max_bytes);
-    return if (safe.len == 0) null else safe;
+    const safe = try storySafeLine(scratch, if (is_command) commandMessage(text) else firstSentence(text), story_reason_max_bytes);
+    if (safe.len == 0) return null;
+    return if (is_command) try clipSummary(scratch, safe, command_reason_max_cols) else safe;
+}
+
+/// The text after the first "error" or "fatal" label in `line`, such as
+/// "error: ", "error[E0308]: " or "error TS2554: ", when text follows it.
+fn afterErrorLabel(line: []const u8) ?[]const u8 {
+    for ([_][]const u8{ "error", "fatal" }) |label| {
+        var start: usize = 0;
+        while (start + label.len <= line.len) : (start += 1) {
+            if (!std.ascii.eqlIgnoreCase(line[start .. start + label.len], label)) continue;
+            if (start > 0 and isNameByte(line[start - 1])) continue;
+            var end = start + label.len;
+            // A code after the label: "[E0308]" right after it, or one word
+            // after a space, such as "TS2554".
+            if (end < line.len and line[end] == '[') {
+                end = (std.mem.findScalarPos(u8, line, end, ']') orelse continue) + 1;
+            } else if (end < line.len and line[end] == ' ') {
+                var code_end = end + 1;
+                while (code_end < line.len and isNameByte(line[code_end])) code_end += 1;
+                if (code_end > end + 1 and std.mem.startsWith(u8, line[code_end..], ": ")) end = code_end;
+            }
+            if (!std.mem.startsWith(u8, line[end..], ": ")) continue;
+            const message = std.mem.trimStart(u8, line[end + 2 ..], " \t");
+            if (message.len > 0) return message;
+        }
+    }
+    return null;
+}
+
+/// The most columns a failed command's reason takes on its row.
+const command_reason_max_cols = 40;
+
+/// An error line's message without the words before it that say who spoke
+/// and where, so "ls: missing-file: No such file or directory" is "No such
+/// file or directory" and "src/main.zig:3:5: error: expected type" is
+/// "expected type". The message starts after an "error" or "fatal" with its
+/// code, as in "src/main.ts:14:15 - error TS2554: Expected 1 arguments", and
+/// after each word with no space that ends in ": ". The line stays whole when
+/// nothing would be left.
+fn commandMessage(line: []const u8) []const u8 {
+    var rest = std.mem.trim(u8, line, " \t");
+    if (afterErrorLabel(rest)) |message| rest = message;
+    while (std.mem.find(u8, rest, ": ")) |colon| {
+        const prefix = rest[0..colon];
+        if (prefix.len == 0 or std.mem.findAny(u8, prefix, " \t") != null) break;
+        const after = std.mem.trimStart(u8, rest[colon + 2 ..], " \t");
+        if (after.len == 0) break;
+        rest = after;
+    }
+    return rest;
 }
 
 /// The first sentence of an error, which says what went wrong. What follows
@@ -5358,7 +5409,7 @@ test "a failed call's mark and words take the failure style" {
     defer command.deinit(alloc);
     const command_bytes = command.entry_actions.items[0].override.bytes;
     errdefer std.debug.print("command:\n{s}\n", .{command_bytes});
-    try std.testing.expect(std.mem.find(u8, command_bytes, "<failure>error: expected ';'<reset><text>") != null);
+    try std.testing.expect(std.mem.find(u8, command_bytes, "<failure>expected ';'<reset><text>") != null);
 }
 
 test "a running read or edit names its file before its arguments arrive" {
@@ -8087,7 +8138,9 @@ test "a failure reason is one line of plain text within the width" {
         // already says how the command ended.
         const reason = projection.entry_actions.items[0].override.bytes;
         try std.testing.expect(std.mem.findScalar(u8, reason, '\n') == null);
-        try std.testing.expect(std.mem.find(u8, reason, " · error: ") != null);
+        // The reason is the error's message, without its "error:".
+        try std.testing.expect(std.mem.find(u8, reason, " · xxx") != null or std.mem.find(u8, reason, " · boom") != null);
+        try std.testing.expect(std.mem.find(u8, reason, "error:") == null);
         try std.testing.expect(std.mem.find(u8, reason, "exit 3 ·") == null);
         try std.testing.expect(display_width.visibleWidthIgnoringAnsi(reason) <= cols);
         try std.testing.expect(std.mem.find(u8, reason, "starting") == null);
@@ -8712,6 +8765,43 @@ test "a failed command's reason is the error it reports, not code it printed" {
     const text = try groupTextForTest(alloc, &entries, &details);
     defer alloc.free(text);
     errdefer std.debug.print("group:\n{s}\n", .{text});
-    try std.testing.expect(std.mem.find(u8, text, "· sed: 1:") != null);
+    // sed's own error line, by its message: what is left of the script it
+    // could not read.
+    try std.testing.expect(std.mem.find(u8, text, "· \",12p") != null);
     try std.testing.expect(std.mem.find(u8, text, "error_code") == null);
+}
+
+test "a failed command's reason is its message alone, at most 40 columns" {
+    try std.testing.expectEqualStrings("No such file or directory", commandMessage("ls: missing-file: No such file or directory"));
+    try std.testing.expectEqualStrings("expected type", commandMessage("src/main.zig:3:5: error: expected type"));
+    try std.testing.expectEqualStrings("bad value", commandMessage("ValueError: bad value"));
+    try std.testing.expectEqualStrings("Expecting value", commandMessage("json.decoder.JSONDecodeError: Expecting value"));
+    try std.testing.expectEqualStrings("mismatched types", commandMessage("error[E0308]: mismatched types"));
+    try std.testing.expectEqualStrings("Expected 1 arguments, but got 3.", commandMessage("src/main.ts:14:15 - error TS2554: Expected 1 arguments, but got 3."));
+    try std.testing.expectEqualStrings("could not compile `app`", commandMessage("error: could not compile `app`"));
+    // A name that holds "error" is no label.
+    try std.testing.expectEqualStrings("1 = 1", commandMessage("terminal_error: 1 = 1"));
+    try std.testing.expectEqualStrings("Test timed out.", commandMessage("Error: Test timed out."));
+    // A word with a space before ": " is part of the message.
+    try std.testing.expectEqualStrings("not a git repository (or any of the parent directories): .git", commandMessage("fatal: not a git repository (or any of the parent directories): .git"));
+    try std.testing.expectEqualStrings("cannot access 'missing-file': No such file or directory", commandMessage("ls: cannot access 'missing-file': No such file or directory"));
+    // A line with no such words, or nothing after them, stays whole.
+    try std.testing.expectEqualStrings("FAIL  quits on click", commandMessage("FAIL  quits on click"));
+    try std.testing.expectEqualStrings("2 tests failed", commandMessage("2 tests failed"));
+    try std.testing.expectEqualStrings("error:", commandMessage("error:"));
+
+    // On a row, the message is cut at 40 columns.
+    const alloc = std.testing.allocator;
+    const entries = [_]TranscriptEntry{
+        .{ .raw_bytes = .{ .id = 1, .bytes = "● Exited 128 git status\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 2, .bytes = "  2s", .class = .turn_summary } },
+    };
+    const details = [_]ToolDetailRecord{storyCommandDetail(1, "{\"action\":\"run\",\"command\":\"git status\"}", 128, "fatal: not a git repository (or any of the parent directories): .git")};
+    const text = try groupTextForTest(alloc, &entries, &details);
+    defer alloc.free(text);
+    errdefer std.debug.print("group:\n{s}\n", .{text});
+    const reason = "not a git repository (or any of the par…";
+    try std.testing.expectEqual(@as(usize, command_reason_max_cols), display_width.visibleWidthIgnoringAnsi(reason));
+    try std.testing.expect(std.mem.find(u8, text, "· " ++ reason) != null);
+    try std.testing.expect(std.mem.find(u8, text, "fatal:") == null);
 }
