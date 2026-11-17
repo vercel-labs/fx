@@ -83,6 +83,7 @@ pub const ResumeProjection = struct {
             .tone = owned.tone,
             .body = owned.body,
             .visibility = owned.visibility,
+            .detail = owned.detail,
         } });
     }
 
@@ -286,6 +287,15 @@ pub const ResumeProjection = struct {
             activity_kind,
             result,
         );
+    }
+
+    pub fn attachHistoricalBridgeCall(
+        self: *ResumeProjection,
+        entry_id: u32,
+        tool: []const u8,
+        outcome: types.ToolOutcomeKind,
+    ) !void {
+        try self.runtime.attachHistoricalBridgeCall(self.alloc, entry_id, tool, outcome);
     }
 
     pub fn attachHistoricalToolCallWithoutResult(

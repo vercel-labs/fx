@@ -47,6 +47,8 @@ const flag_placement = @import("flag_placement.zig");
 const model_capabilities = @import("../config/model_capabilities.zig");
 const model_provider = @import("../config/model_provider.zig");
 const token_pass = @import("../gateway/token_pass.zig");
+const token_pass_team = @import("../gateway/token_pass_team.zig");
+const token_pass_check = @import("../app/token_pass_check.zig");
 const builtin_commands = @import("../../builtins/commands.zig");
 const cli_flags = @import("cli_flags.zig");
 const output_contracts = @import("../output/output_contracts.zig");
@@ -79,6 +81,7 @@ const subagent_tool_host = @import("../subagent/tool_host.zig");
 const subagent_reports = @import("../subagent/reports.zig");
 const subagent_child_state = @import("../subagent/child_state.zig");
 const subagent_model_contract = @import("../subagent/model_contract.zig");
+const subagent_usage = @import("../subagent/usage_ledger.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const test_builtin_gateway = if (std_builtin.is_test)
     @import("../../builtins/gateway.zig")
@@ -332,8 +335,13 @@ pub const PromptRunResult = struct {
     auth_failure: ?auth_runtime.FailureSnapshot = null,
     recovery: ?types.RouteRecoveryStatus = null,
     usage: types.Usage = .{},
+    /// Owned. What each subagent that did work in the run used, in the order
+    /// each first ran; empty when none did. Not part of `usage`, which is
+    /// main's alone.
+    subagents: []subagent_usage.Entry = &.{},
 
     pub fn deinit(self: PromptRunResult, alloc: Allocator) void {
+        subagent_usage.freeEntries(alloc, self.subagents);
         alloc.free(self.assistant_output);
         if (self.final_output.len > 0) alloc.free(self.final_output);
         if (self.final_source.len > 0) alloc.free(self.final_source);
@@ -698,6 +706,10 @@ const AskContext = struct {
     tool_call_records_mutex: std.Io.Mutex = .init,
     web_search_progress_mutex: std.Io.Mutex = .init,
     step_count: usize = 0,
+    /// The usage of every main turn that has ended. The agent keeps only the
+    /// running turn's, and each turn starts it over, so the run's total is
+    /// kept here (`takeTurnUsage`).
+    usage_total: types.Usage = .{},
     web_fetch_runtime: web_fetch_runtime.Runtime = web_fetch_runtime.Runtime.init(.{}),
     web_search_runtime: web_search_runtime.Runtime,
     capability_resolver: gateway_provider.CapabilityResolver = .{},
@@ -892,6 +904,14 @@ const AskContext = struct {
         if (self.cancelFlag().load(.seq_cst)) return error.Cancelled;
     }
 
+    /// Adds the usage the turn that just ended reported to the run's total
+    /// and clears it, so a turn that ends before it starts one adds nothing
+    /// twice. Call it when each main turn ends, however it ends.
+    fn takeTurnUsage(self: *AskContext) void {
+        self.usage_total.add(self.session.agent.turn_usage);
+        self.session.agent.turn_usage = .{};
+    }
+
     fn processInterruptRequested(self: *const AskContext) bool {
         if (comptime supports_headless_interrupt) {
             return self.use_process_interrupt_flag and
@@ -1056,6 +1076,8 @@ const AskContext = struct {
         self.subagent_host.?.authority_resolver.toolbox_behind = &self.toolbox_behind;
         self.v2_children = children;
         self.subagent_host.?.report_sink = .{ .context = self, .post_fn = postAskReport };
+        // The result lists what each subagent that works in this run uses.
+        self.subagent_host.?.trackUsage();
         // What a restart left owed runs as this run's next turns.
         self.subagent_host.?.resumeReports(v2);
     }
@@ -1795,6 +1817,43 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
         );
     }
 
+    // A team with Token Pass starts a new session on the Token Pass default
+    // when nothing chose the model. The check refreshes the saved answer
+    // while the turn runs, and waits for it only when fx has none.
+    var token_pass_run: ?token_pass_check.Check = null;
+    defer if (token_pass_run) |*check| check.finish(alloc, "ask_finished");
+    const token_pass_source: ?credentials.Source = if (ctx.provider == .gateway and cfg.auth_mode != .host_managed) ctx.credential_source else null;
+    if (token_pass_source) |source| {
+        if (token_pass_check.name(alloc, source, ctx.api_key, ctx.account_id, ctx.gateway_team)) |named| {
+            token_pass_run = .{ .named = named, .home = io_mod.homeDir() };
+            token_pass_run.?.begin(
+                alloc,
+                cfg.provider_set.select(.gateway).credits orelse gateway_provider.unavailable_credits_provider,
+                .{ .credential = ctx.api_key, .credential_source = source, .tenant = ctx.gateway_team },
+                token_pass_check.first_prompt_wait_ms,
+            );
+            const nothing_chose_model = startup.model_source == .compiled_default and
+                options.model_override == null and
+                ctx.requested_resume == null and
+                ctx.session.agent.history.items.len == 0;
+            // Without an answer, the catalog's Token Pass marks can answer for
+            // the team; the turn reuses the catalog this loads.
+            if (nothing_chose_model and !token_pass_run.?.has_pass and !token_pass_run.?.answered) {
+                _ = resolveModelCapabilities(&ctx, alloc, ctx.model) catch |err| {
+                    debug_trace.logf("token_pass", "catalog not loaded for the start model err={s}", .{@errorName(err)});
+                };
+                _ = token_pass_run.?.observeCatalog(alloc);
+            }
+            if (token_pass_run.?.has_pass and nothing_chose_model) {
+                debug_trace.logf("token_pass", "start model={s}", .{token_pass.default_model});
+                ctx.model = token_pass.default_model;
+                // Token Pass credit pays only for standard speed.
+                if (options.fast_override == null) ctx.fast_mode = false;
+                if (options.ultrafast_override == null) ctx.ultrafast_mode = false;
+            }
+        }
+    }
+
     const restored_image_catalog = try ctx.session.snapshotImageCatalog(alloc, &.{});
     defer types.freeImageAttachmentSlice(alloc, restored_image_catalog);
     const restored_image_bounds = try image_attachments.calculate_next_image_id(restored_image_catalog);
@@ -1993,10 +2052,16 @@ fn runAskTurn(
     // (`tests/tla/subagent/MainMail.tla` JoinsOpenTurn).
     const processing = marked or (ctx.subagent_host != null and ctx.worker.beginDirectProcessing(job.turn_id));
     defer if (processing) ctx.worker.finishProcessing();
-    options.deps.process_queued_prompt(&ctx.session.agent, deps, semantic_presentation, ctx.lifecycleContext(), config, job) catch |err| switch (err) {
+    const processed = options.deps.process_queued_prompt(&ctx.session.agent, deps, semantic_presentation, ctx.lifecycleContext(), config, job);
+    // The next turn starts the agent's usage over, so this one's is taken
+    // now, whether the turn ended well or not.
+    ctx.takeTurnUsage();
+    processed catch |err| switch (err) {
         error.NonInteractivePermissionRequired => {
             const assistant_output = try alloc.dupe(u8, ctx.assistant_output.items);
             errdefer alloc.free(assistant_output);
+            const subagents = try takeSubagentUsage(ctx, alloc);
+            errdefer subagent_usage.freeEntries(alloc, subagents);
             const tool_calls = try takeToolCallRecords(ctx, alloc);
             return .{
                 .exit_code = 1,
@@ -2004,7 +2069,8 @@ fn runAskTurn(
                 .interrupted = ctx.processInterruptRequested(),
                 .tool_calls = tool_calls,
                 .error_code = "NonInteractivePermissionRequired",
-                .usage = ctx.session.agent.turn_usage,
+                .usage = ctx.usage_total,
+                .subagents = subagents,
             };
         },
         else => {
@@ -2033,11 +2099,15 @@ fn maybeStartAskTitleTask(
     const session_id = ctx.activeSessionId() orelse return null;
     const bundle = ctx.cfg.provider_set.select(ctx.provider);
     const provider_title_model = bundle.title_model orelse return null;
-    // A Token Pass session titles itself with a Token Pass model.
-    const title_model = if (ctx.provider == .gateway)
-        token_pass.modelForSideCall(.title, ctx.model, provider_title_model)
-    else
-        provider_title_model;
+    // A Token Pass session of a team with Token Pass titles itself with a
+    // Token Pass model the catalog marks, so the title waits for the catalog
+    // the turn would load anyway.
+    const title_model = if (ctx.provider == .gateway) title: {
+        _ = resolveModelCapabilities(ctx, ctx.alloc, ctx.model) catch |err| {
+            debug_trace.logf("token_pass", "catalog not loaded for the title model err={s}", .{@errorName(err)});
+        };
+        break :title token_pass_team.modelForSideCall(.title, ctx.model, provider_title_model);
+    } else provider_title_model;
     const agent_stream = bundle.agent_stream orelse return null;
     const excerpt = session_title_generation.promptExcerpt(prompt) orelse return null;
     // A custom connection may need no key; its adapter checks the one it gets.
@@ -2121,6 +2191,8 @@ fn takePromptRunResult(ctx: *AskContext, alloc: Allocator) !PromptRunResult {
     else
         try alloc.dupe(u8, "");
     errdefer if (session_id.len > 0) alloc.free(session_id);
+    const subagents = try takeSubagentUsage(ctx, alloc);
+    errdefer subagent_usage.freeEntries(alloc, subagents);
 
     const tool_calls = try takeToolCallRecords(ctx, alloc);
 
@@ -2140,8 +2212,18 @@ fn takePromptRunResult(ctx: *AskContext, alloc: Allocator) !PromptRunResult {
         .error_code = ctx.typed_error_code,
         .auth_failure = ctx.auth_failure,
         .recovery = ctx.last_recovery_status,
-        .usage = ctx.session.agent.turn_usage,
+        .usage = ctx.usage_total,
+        .subagents = subagents,
     };
+}
+
+/// What each subagent that did work in this run has used so far, a copy for
+/// the result. On a run that ends early a subagent may still be at work; it
+/// shows the replies it has finished. The caller owns the copy and frees it
+/// with `subagent_usage.freeEntries`, as `PromptRunResult.deinit` does.
+fn takeSubagentUsage(ctx: *AskContext, alloc: Allocator) ![]subagent_usage.Entry {
+    const tree = ctx.subagent_host orelse return &.{};
+    return tree.usageSnapshot(alloc);
 }
 
 fn takeToolCallRecords(ctx: *AskContext, alloc: Allocator) ![]ToolCallRecord {
@@ -2960,10 +3042,7 @@ fn shell_action_for_call(arena: Allocator, call: ToolCall) ?ShellAction {
         .object => |object| object,
         else => return null,
     };
-    const request = if (root.get("request")) |value| switch (value) {
-        .object => |object| object,
-        else => return null,
-    } else root;
+    const request = (tool_args.unwrapRequest(arena, root) catch return null) orelse return null;
     const action = switch (request.get("action") orelse return null) {
         .string => |value| value,
         else => return null,
@@ -3075,7 +3154,13 @@ fn questionTextForAskCall(alloc: Allocator, call: ToolCall) !?[]u8 {
     };
     defer parsed.deinit();
     if (parsed.value != .object) return null;
-    const questions_value = parsed.value.object.get("questions") orelse return null;
+    var questions_value = parsed.value.object.get("questions") orelse return null;
+    // The tool reads the batch from JSON text too, so the record names the
+    // same question.
+    tool_args.normalizeCompositeArrayValue(parsed.arena.allocator(), &questions_value) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return null,
+    };
     if (questions_value != .array or questions_value.array.items.len == 0) return null;
     const first = questions_value.array.items[0];
     if (first != .object) return null;
@@ -4118,15 +4203,29 @@ fn renderFinalJsonResult(alloc: Allocator, result: PromptRunResult) ![]u8 {
         }
         try out.writer.writeAll("}");
     }
-    try out.writer.writeAll("],\"usage\":{\"input_tokens\":");
-    try std.json.Stringify.value(result.usage.input_tokens, .{}, &out.writer);
-    try out.writer.writeAll(",\"output_tokens\":");
-    try std.json.Stringify.value(result.usage.output_tokens, .{}, &out.writer);
-    // Present only when the provider reports caching, so a missing count
-    // never reads as zero cached tokens.
-    if (result.usage.cache_read_tokens) |tokens| try out.writer.print(",\"cache_read_tokens\":{d}", .{tokens});
-    if (result.usage.cache_write_tokens) |tokens| try out.writer.print(",\"cache_write_tokens\":{d}", .{tokens});
-    try out.writer.writeAll("}");
+    try out.writer.writeAll("],\"usage\":");
+    try writeUsageJson(&out.writer, result.usage);
+    // Present only when a subagent did work, so a run without one prints the
+    // same JSON as before the field existed. `name` is null only for a child
+    // saved with no name (see `usage_ledger.Entry`).
+    if (result.subagents.len > 0) {
+        try out.writer.writeAll(",\"subagents\":[");
+        for (result.subagents, 0..) |entry, i| {
+            if (i > 0) try out.writer.writeByte(',');
+            try out.writer.writeAll("{\"name\":");
+            if (entry.name) |name| {
+                try std.json.Stringify.value(name, .{}, &out.writer);
+            } else {
+                try out.writer.writeAll("null");
+            }
+            try out.writer.writeAll(",\"id\":");
+            try std.json.Stringify.value(entry.id, .{}, &out.writer);
+            try out.writer.writeAll(",\"usage\":");
+            try writeUsageJson(&out.writer, entry.usage);
+            try out.writer.writeByte('}');
+        }
+        try out.writer.writeByte(']');
+    }
     if (result.error_code) |error_code| {
         try out.writer.writeAll(",\"error\":");
         try std.json.Stringify.value(error_code, .{}, &out.writer);
@@ -4142,6 +4241,20 @@ fn renderFinalJsonResult(alloc: Allocator, result: PromptRunResult) ![]u8 {
     }
     try out.writer.writeAll("}\n");
     return try out.toOwnedSlice();
+}
+
+/// The `usage` object of the result and of each of its `subagents`: one shape,
+/// so a count reads the same wherever it sits.
+fn writeUsageJson(writer: *std.Io.Writer, usage: types.Usage) !void {
+    try writer.writeAll("{\"input_tokens\":");
+    try std.json.Stringify.value(usage.input_tokens, .{}, writer);
+    try writer.writeAll(",\"output_tokens\":");
+    try std.json.Stringify.value(usage.output_tokens, .{}, writer);
+    // Present only when the provider reports caching, so a missing count
+    // never reads as zero cached tokens.
+    if (usage.cache_read_tokens) |tokens| try writer.print(",\"cache_read_tokens\":{d}", .{tokens});
+    if (usage.cache_write_tokens) |tokens| try writer.print(",\"cache_write_tokens\":{d}", .{tokens});
+    try writer.writeAll("}");
 }
 
 /// `exit_code` is the status the process exits with, so the JSON field and the
@@ -4800,8 +4913,6 @@ const TestContextRegistryFixture = struct {
     var gather_calls: usize = 0;
     var process_calls: usize = 0;
     var gather_error: ?context_contract.ProviderError = null;
-    var expected_target_paths: []const []const u8 = &.{};
-    var targets_match: bool = false;
     var expected_queued_image: ?[]const u8 = null;
     var queued_image_folder_rules: bool = false;
     var expected_static_context: ?[]const u8 = null;
@@ -4812,8 +4923,6 @@ const TestContextRegistryFixture = struct {
         gather_calls = 0;
         process_calls = 0;
         gather_error = null;
-        expected_target_paths = &.{};
-        targets_match = false;
         expected_queued_image = null;
         queued_image_folder_rules = false;
         expected_static_context = expected_static;
@@ -4821,17 +4930,8 @@ const TestContextRegistryFixture = struct {
         transient_permission_mode = null;
     }
 
-    fn gather(alloc: Allocator, input: context_contract.InitialContextInput) context_contract.ProviderError!context_contract.ProviderContext {
+    fn gather(alloc: Allocator, _: context_contract.InitialContextInput) context_contract.ProviderError!context_contract.ProviderContext {
         gather_calls += 1;
-        targets_match = input.targets.len == expected_target_paths.len;
-        if (targets_match) {
-            for (input.targets, expected_target_paths) |target, expected_path| {
-                if (target.kind != .file or !std.mem.eql(u8, target.path, expected_path)) {
-                    targets_match = false;
-                    break;
-                }
-            }
-        }
         if (gather_error) |err| return err;
         var result: context_contract.ProviderContext = .{
             .content = try alloc.dupe(u8, test_registry_static_context),
@@ -4871,7 +4971,6 @@ const TestContextRegistryFixture = struct {
         process_calls += 1;
         try std.testing.expect(semantic_presentation == null);
         try std.testing.expectEqual(expected_gather_calls, gather_calls);
-        if (expected_gather_calls > 0) try std.testing.expect(targets_match);
         queued_image_folder_rules = deps.image_folder_rules;
         if (expected_queued_image) |path| {
             try std.testing.expectEqual(@as(usize, 1), job.images.len);
@@ -7715,6 +7814,128 @@ test "ask usage survives normal and typed error result capture" {
     }
 }
 
+/// A saved ask whose first two turns each leave a report to start the next
+/// turn, as a subagent's report does, and whose last turn ends as `ending`.
+const TestRunUsage = struct {
+    const Ending = enum { completed, read_failed, permission_required };
+    /// What each main turn reports. The second reports no cache count.
+    const turns = [_]types.Usage{
+        .{ .input_tokens = 100, .output_tokens = 1, .cache_read_tokens = 10 },
+        .{ .input_tokens = 200, .output_tokens = 2 },
+        .{ .input_tokens = 400, .output_tokens = 4, .cache_read_tokens = 40 },
+    };
+    var started: usize = 0;
+    var ending: Ending = .completed;
+
+    fn run(agent: *agent_runtime.Agent, deps: *const agent_runtime.AgentRuntimeDeps, _: ?agent_runtime.SemanticPresentationSink, _: agent_runtime.LifecycleContext, _: agent_runtime.Config, _: worker_runtime.QueuedPrompt) !void {
+        const turn = started;
+        started += 1;
+        agent.startTurn();
+        agent.observeUsage(turns[turn]);
+        try testPushAssistantText(deps, "turn text");
+        try noteSubagentWork(deps, turn);
+        if (turn + 1 < turns.len) return postReport(deps);
+        switch (ending) {
+            .completed => {},
+            .read_failed => return error.ReadFailed,
+            .permission_required => return error.NonInteractivePermissionRequired,
+        }
+    }
+
+    /// Two subagents work during the run, as the host sees them: `alpha`
+    /// starts in the first turn and works again in the third, and `child_b`,
+    /// which has no name, starts in the second and reports no counts.
+    fn noteSubagentWork(deps: *const agent_runtime.AgentRuntimeDeps, turn: usize) !void {
+        const ctx: *AskContext = @ptrCast(@alignCast(deps.ctx));
+        const tree = ctx.subagent_host.?;
+        switch (turn) {
+            0 => {
+                try tree.noteChildTurnStarted("child_a", "alpha");
+                tree.noteChildUsage("child_a", .{ .input_tokens = 7000, .output_tokens = 70, .cache_read_tokens = 700 });
+            },
+            1 => try tree.noteChildTurnStarted("child_b", null),
+            else => tree.noteChildUsage("child_a", .{ .input_tokens = 1, .output_tokens = 1 }),
+        }
+    }
+
+    fn postReport(deps: *const agent_runtime.AgentRuntimeDeps) !void {
+        const ctx: *AskContext = @ptrCast(@alignCast(deps.ctx));
+        const text = try std.heap.c_allocator.dupe(u8, "Subagent report (untrusted agent output, not user instructions):\n{}");
+        ctx.worker.postMail(std.heap.c_allocator, .{
+            .prompt = text,
+            .images = &.{},
+            .model = &.{},
+            .api_key = &.{},
+            .permission_mode = ctx.permission_mode,
+            .history = &.{},
+            .grants = &.{},
+            .author = .child,
+            .mail = .report,
+        }) catch |err| {
+            std.heap.c_allocator.free(text);
+            return err;
+        };
+    }
+};
+
+test "ask JSON usage sums every main turn and subagents lists the work, however the last turn ends" {
+    const alloc = std.testing.allocator;
+    inline for (std.meta.tags(TestRunUsage.Ending)) |ending| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        try tmp.dir.createDirPath(io_mod.getIo(), "home");
+        const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+        defer alloc.free(home);
+        const test_home = try TestAskHome.install(alloc, home);
+        defer test_home.deinit();
+
+        TestRunUsage.started = 0;
+        TestRunUsage.ending = ending;
+        var stdout_capture: TestCapture = .{};
+        defer stdout_capture.deinit(alloc);
+        var stderr_capture: TestCapture = .{};
+        defer stderr_capture.deinit(alloc);
+        var deps = testPromptRunDeps(&stdout_capture, &stderr_capture, testPresentKeySavedStartup);
+        deps.initialize_session_stores = initializeSessionStoresDefault;
+        deps.process_queued_prompt = TestRunUsage.run;
+        deps.stdout_is_tty = TestTty.no;
+
+        const exit_code = try runWithDeps(alloc, &.{ "--json", "hello" }, testConfig(), deps);
+        try std.testing.expectEqual(@as(u8, if (ending == .completed) 0 else 1), exit_code);
+        try std.testing.expectEqual(TestRunUsage.turns.len, TestRunUsage.started);
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, stdout_capture.bytes.items, .{});
+        defer parsed.deinit();
+        const usage = parsed.value.object.get("usage").?.object;
+        try std.testing.expectEqual(@as(i64, 700), usage.get("input_tokens").?.integer);
+        try std.testing.expectEqual(@as(i64, 7), usage.get("output_tokens").?.integer);
+        try std.testing.expectEqual(@as(i64, 50), usage.get("cache_read_tokens").?.integer);
+        try std.testing.expect(usage.get("cache_write_tokens") == null);
+        // `usage` stays main's alone; each subagent that worked is listed
+        // apart, in the order it first ran.
+        const subagents = parsed.value.object.get("subagents").?.array.items;
+        try std.testing.expectEqual(@as(usize, 2), subagents.len);
+        const alpha = subagents[0].object;
+        try std.testing.expectEqualStrings("alpha", alpha.get("name").?.string);
+        try std.testing.expectEqualStrings("child_a", alpha.get("id").?.string);
+        const alpha_usage = alpha.get("usage").?.object;
+        try std.testing.expectEqual(@as(i64, 7001), alpha_usage.get("input_tokens").?.integer);
+        try std.testing.expectEqual(@as(i64, 71), alpha_usage.get("output_tokens").?.integer);
+        try std.testing.expectEqual(@as(i64, 700), alpha_usage.get("cache_read_tokens").?.integer);
+        const unnamed = subagents[1].object;
+        try std.testing.expect(unnamed.get("name").? == .null);
+        try std.testing.expectEqualStrings("child_b", unnamed.get("id").?.string);
+        const unnamed_usage = unnamed.get("usage").?.object;
+        try std.testing.expect(unnamed_usage.get("input_tokens").? == .null);
+        try std.testing.expect(unnamed_usage.get("output_tokens").? == .null);
+        try std.testing.expect(unnamed_usage.get("cache_read_tokens") == null);
+        switch (ending) {
+            .completed => try std.testing.expect(parsed.value.object.get("error") == null),
+            .read_failed => try std.testing.expectEqualStrings("ReadFailed", parsed.value.object.get("error").?.string),
+            .permission_required => try std.testing.expectEqualStrings("NonInteractivePermissionRequired", parsed.value.object.get("error").?.string),
+        }
+    }
+}
+
 test "ask usage JSON distinguishes unavailable totals from reported zero" {
     const alloc = std.testing.allocator;
     const json = try renderFinalJsonResult(alloc, .{
@@ -7728,6 +7949,46 @@ test "ask usage JSON distinguishes unavailable totals from reported zero" {
     const usage = parsed.value.object.get("usage").?.object;
     try std.testing.expectEqual(@as(i64, 0), usage.get("input_tokens").?.integer);
     try std.testing.expect(usage.get("output_tokens").? == .null);
+}
+
+test "ask JSON lists each subagent with its own usage in the shape of the result's usage" {
+    const alloc = std.testing.allocator;
+    var alpha_id = "child_a".*;
+    var alpha_name = "alpha".*;
+    var other_id = "child_b".*;
+    var entries = [_]subagent_usage.Entry{
+        .{ .id = &alpha_id, .name = &alpha_name, .usage = .{ .input_tokens = 7000, .output_tokens = 70, .cache_read_tokens = 700, .cache_write_tokens = 0 } },
+        .{ .id = &other_id, .name = null },
+    };
+    const json = try renderFinalJsonResult(alloc, .{
+        .exit_code = 0,
+        .assistant_output = &.{},
+        .usage = .{ .input_tokens = 1, .output_tokens = 2 },
+        .subagents = &entries,
+    });
+    defer alloc.free(json);
+    try std.testing.expectEqualStrings(
+        "{\"output\":\"\",\"final_output\":\"\",\"exit_code\":0,\"model\":\"\",\"resolved_provider\":null,\"session_id\":\"\",\"steps\":0,\"tool_calls\":[]," ++
+            "\"usage\":{\"input_tokens\":1,\"output_tokens\":2}," ++
+            "\"subagents\":[{\"name\":\"alpha\",\"id\":\"child_a\",\"usage\":{\"input_tokens\":7000,\"output_tokens\":70,\"cache_read_tokens\":700,\"cache_write_tokens\":0}}," ++
+            "{\"name\":null,\"id\":\"child_b\",\"usage\":{\"input_tokens\":null,\"output_tokens\":null}}]}\n",
+        json,
+    );
+}
+
+test "ask JSON has no subagents field when no subagent worked" {
+    const alloc = std.testing.allocator;
+    const json = try renderFinalJsonResult(alloc, .{
+        .exit_code = 0,
+        .assistant_output = &.{},
+        .usage = .{ .input_tokens = 1, .output_tokens = 2 },
+    });
+    defer alloc.free(json);
+    try std.testing.expect(std.mem.find(u8, json, "subagents") == null);
+    try std.testing.expectEqualStrings(
+        "{\"output\":\"\",\"final_output\":\"\",\"exit_code\":0,\"model\":\"\",\"resolved_provider\":null,\"session_id\":\"\",\"steps\":0,\"tool_calls\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":2}}\n",
+        json,
+    );
 }
 
 test "render final JSON preserves shape escaping order and newline" {
@@ -8173,6 +8434,7 @@ test "shell diagnostic action projection accepts only current actions" {
         .{ .arguments_json = "{\"action\":\"run\"}", .expected = .run },
         .{ .arguments_json = "{\"action\":\"interact\"}", .expected = .interact },
         .{ .arguments_json = "{\"request\":{\"action\":\"stop\"}}", .expected = .stop },
+        .{ .arguments_json = "{\"request\":\"{\\\"action\\\":\\\"interact\\\"}\"}", .expected = .interact },
     };
     for (cases) |case| {
         try std.testing.expectEqual(
@@ -8431,6 +8693,30 @@ test "fx ask JSON records ask_user_question text for matching assertions" {
     try std.testing.expectEqualStrings("What is your GitHub handle?", tool_call.get("question").?.string);
 }
 
+test "fx ask JSON names the question of a batch sent as JSON text" {
+    const alloc = std.testing.allocator;
+    const call = struct {
+        fn of(arguments_json: []const u8) ToolCall {
+            return .{ .id = "question", .name = "ask_user_question", .arguments_json = arguments_json };
+        }
+    }.of;
+
+    const text = (try questionTextForAskCall(alloc, call("{\"questions\":\"[{\\\"question\\\":\\\" Which path? \\\"}]\"}"))).?;
+    defer alloc.free(text);
+    try std.testing.expectEqualStrings("Which path?", text);
+
+    // Text that does not hold a batch names no question, including a batch
+    // encoded twice.
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const twice = try std.json.Stringify.valueAlloc(arena, "[{\"question\":\"Twice?\"}]", .{});
+    for ([_][]const u8{ "not json", "{}", "[]", "[1]", twice }) |questions_text| {
+        const arguments_json = try std.json.Stringify.valueAlloc(arena, .{ .questions = questions_text }, .{});
+        try std.testing.expect((try questionTextForAskCall(alloc, call(arguments_json))) == null);
+    }
+}
+
 test "fx ask JSON clips ask_user_question text at a UTF-8 boundary" {
     const alloc = std.testing.allocator;
     var question_bytes: [257]u8 = undefined;
@@ -8612,10 +8898,9 @@ test "default fx ask keeps image paths out of the initial context and has the ru
     try std.testing.expectEqual(@as(u8, 0), exit_code);
     try std.testing.expectEqual(@as(usize, 1), TestContextRegistryFixture.gather_calls);
     try std.testing.expectEqual(@as(usize, 1), TestContextRegistryFixture.process_calls);
-    // The instructions' context names no target, so an image never changes
-    // them; the turn carries the image's path and the runtime delivers its
-    // folder's rules as a note.
-    try std.testing.expect(TestContextRegistryFixture.targets_match);
+    // The instructions' context cannot name a target, so an image never
+    // changes them; the turn carries the image's path and the runtime
+    // delivers its folder's rules as a note.
     try std.testing.expect(TestContextRegistryFixture.queued_image_folder_rules);
 }
 

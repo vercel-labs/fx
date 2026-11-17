@@ -40,7 +40,7 @@ jobs:
       - name: Setup Zig
         uses: ./.github/actions/setup-zig
         with:
-          version: "0.17.0"
+          version: "0.17.1"
           cache-key: ci-tla-mcp-call
       - name: Setup Bun
         uses: oven-sh/setup-bun@v2

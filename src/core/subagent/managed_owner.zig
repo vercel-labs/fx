@@ -141,6 +141,12 @@ pub const EndHook = struct {
     end_fn: *const fn (*anyopaque, WorkEnd) bool,
 };
 
+/// A running child's current tool call, for status.
+pub const ChildCall = struct {
+    child_id: []const u8,
+    call: live_metrics.Call,
+};
+
 pub const Owner = struct {
     alloc: Allocator,
     /// The parent's children, borrowed (D22).
@@ -313,6 +319,48 @@ pub const Owner = struct {
             if (std.mem.eql(u8, slot.child_id, child_id)) return slot.completion == .running;
         }
         return false;
+    }
+
+    /// The current tool call of `child_id`'s running turn, for status and
+    /// its row in the agent list.
+    pub fn currentCall(self: *Owner, child_id: []const u8) ?live_metrics.Call {
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        for (self.slots.items) |slot| {
+            if (!std.mem.eql(u8, slot.child_id, child_id)) continue;
+            if (slot.completion != .running) return null;
+            return slot.metrics.currentCall();
+        }
+        return null;
+    }
+
+    /// Each running turn's current tool call, by child id, allocated in
+    /// `alloc`. Status reads them before it takes the registry's lock, since
+    /// `wait` takes that lock under this owner's mutex.
+    pub fn currentCalls(self: *Owner, alloc: Allocator) ![]const ChildCall {
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        var calls: std.ArrayList(ChildCall) = .empty;
+        for (self.slots.items) |slot| {
+            if (slot.completion != .running) continue;
+            const call = slot.metrics.currentCall() orelse continue;
+            try calls.append(alloc, .{ .child_id = try alloc.dupe(u8, slot.child_id), .call = call });
+        }
+        return calls.items;
+    }
+
+    /// Records a tool call's start or end in `child_id`'s running turn, for
+    /// a turn whose events reach the host instead of the turn, as a hosted
+    /// child's do in the interactive app. A null `label` ends `call_id`.
+    pub fn noteCall(self: *Owner, child_id: []const u8, call_id: []const u8, label: ?[]const u8, now_ms: i64) void {
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        for (self.slots.items) |slot| {
+            if (!std.mem.eql(u8, slot.child_id, child_id)) continue;
+            if (slot.completion != .running) return;
+            if (label) |text| slot.metrics.callStarted(call_id, text, now_ms) else slot.metrics.callEnded(call_id);
+            return;
+        }
     }
 
     pub fn start(self: *Owner, child_id: []const u8) StartError!StartResult {
@@ -579,6 +627,13 @@ pub const Owner = struct {
         }
         self.mutex.unlock(io_mod.getIo());
 
+        // A slot's thread ends its work in the host's end hook, which walks
+        // every slot in `self.slots`, so each slot stays listed and alive
+        // until all the threads have ended. Freeing one slot as soon as its
+        // own thread has been joined would leave it listed for the others.
+        for (self.slots.items) |slot| {
+            joinSlot(self, slot);
+        }
         for (self.slots.items) |slot| {
             destroySlot(self, slot);
         }
@@ -666,8 +721,19 @@ pub const Owner = struct {
     }
 };
 
+/// Joins the slot's thread, once.
+fn joinSlot(owner: *Owner, slot: *Slot) void {
+    const thread = slot.thread orelse return;
+    thread.join();
+    owner.mutex.lockUncancelable(io_mod.getIo());
+    slot.thread = null;
+    owner.mutex.unlock(io_mod.getIo());
+}
+
+/// Frees the slot. The caller has taken it out of `owner.slots`, or no slot
+/// thread runs any more.
 fn destroySlot(owner: *Owner, slot: *Slot) void {
-    if (slot.thread) |thread| thread.join();
+    joinSlot(owner, slot);
     owner.mutex.lockUncancelable(io_mod.getIo());
     while (slot.waiters != 0) owner.waiters_changed.waitUncancelable(io_mod.getIo(), &owner.mutex);
     owner.mutex.unlock(io_mod.getIo());
@@ -675,6 +741,117 @@ fn destroySlot(owner: *Owner, slot: *Slot) void {
     freeLeftovers(owner.alloc, slot);
     owner.alloc.free(slot.child_id);
     owner.alloc.destroy(slot);
+}
+
+/// An allocator that notes each block of a slot's size that is freed through
+/// it, so a test can tell whether the owner still lists a slot it freed.
+const SlotFreeWatch = struct {
+    backing: Allocator,
+    mutex: std.Io.Mutex = .init,
+    freed: [4]usize = @splat(0),
+    freed_count: usize = 0,
+    /// Set when the first slot is freed.
+    first_freed: std.Io.Event = .unset,
+
+    fn allocator(self: *SlotFreeWatch) Allocator {
+        return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
+    }
+
+    fn alloc(raw: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+        const self: *SlotFreeWatch = @ptrCast(@alignCast(raw));
+        return self.backing.rawAlloc(len, alignment, ret_addr);
+    }
+
+    fn resize(raw: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
+        const self: *SlotFreeWatch = @ptrCast(@alignCast(raw));
+        return self.backing.rawResize(memory, alignment, new_len, ret_addr);
+    }
+
+    fn remap(raw: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
+        const self: *SlotFreeWatch = @ptrCast(@alignCast(raw));
+        return self.backing.rawRemap(memory, alignment, new_len, ret_addr);
+    }
+
+    fn free(raw: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+        const self: *SlotFreeWatch = @ptrCast(@alignCast(raw));
+        if (memory.len == @sizeOf(Slot)) {
+            self.mutex.lockUncancelable(io_mod.getIo());
+            if (self.freed_count < self.freed.len) {
+                self.freed[self.freed_count] = @intFromPtr(memory.ptr);
+                self.freed_count += 1;
+            }
+            self.mutex.unlock(io_mod.getIo());
+            self.first_freed.set(io_mod.getIo());
+        }
+        self.backing.rawFree(memory, alignment, ret_addr);
+    }
+
+    fn wasFreed(self: *SlotFreeWatch, slot: *const Slot) bool {
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        for (self.freed[0..self.freed_count]) |address| {
+            if (address == @intFromPtr(slot)) return true;
+        }
+        return false;
+    }
+};
+
+/// Slot threads that end their work once the owner cancels it, as `slotMain`
+/// ends a work that has no next one: the host's end hook walks the owner's
+/// slots (`Owner.markEnding`). The last thread first waits for the owner to
+/// free the first slot, so its work ends while that slot is being destroyed.
+const TeardownTest = struct {
+    watch: *SlotFreeWatch,
+    checks: std.atomic.Value(usize) = .init(0),
+    listed_freed: std.atomic.Value(usize) = .init(0),
+
+    fn slotMain(self: *TeardownTest, slot: *Slot, last: bool) void {
+        const owner = slot.owner;
+        while (!slot.cancel.load(.seq_cst)) io_mod.sleep(std.time.ns_per_ms);
+        if (last) self.countListedFreed(owner);
+        owner.markEnding(slot.child_id);
+        owner.mutex.lockUncancelable(io_mod.getIo());
+        slot.completion = .unpublished;
+        slot.done.set(io_mod.getIo());
+        owner.waiters_changed.broadcast(io_mod.getIo());
+        owner.mutex.unlock(io_mod.getIo());
+    }
+
+    /// An owner that frees its slots only once no slot thread runs never
+    /// sets the event, so the wait ends at its limit.
+    fn countListedFreed(self: *TeardownTest, owner: *Owner) void {
+        self.watch.first_freed.waitTimeout(io_mod.getIo(), .{ .duration = .{ .clock = .awake, .raw = .fromMilliseconds(50) } }) catch {};
+        owner.mutex.lockUncancelable(io_mod.getIo());
+        defer owner.mutex.unlock(io_mod.getIo());
+        for (owner.slots.items) |slot| {
+            if (self.watch.wasFreed(slot)) _ = self.listed_freed.fetchAdd(1, .seq_cst);
+        }
+        _ = self.checks.fetchAdd(1, .seq_cst);
+    }
+};
+
+test "closing the owner frees no slot that another slot's thread can still reach" {
+    // The first call builds the process's Io, which two threads must not race to do.
+    _ = io_mod.getIo();
+    var watch = SlotFreeWatch{ .backing = std.testing.allocator };
+    const alloc = watch.allocator();
+    var owner = Owner{ .alloc = alloc, .children = undefined, .state_store = undefined, .services = undefined, .authority_resolver = undefined, .approvals = undefined };
+    var fixture = TeardownTest{ .watch = &watch };
+    var closed = false;
+    defer if (!closed) owner.deinit();
+    for ([_][]const u8{ "child-1", "child-2" }, 0..) |name, index| {
+        const slot = try alloc.create(Slot);
+        slot.* = .{ .owner = &owner, .child_id = try alloc.dupe(u8, name) };
+        try owner.slots.append(alloc, slot);
+        slot.thread = try std.Thread.spawn(.{}, TeardownTest.slotMain, .{ &fixture, slot, index == 1 });
+    }
+
+    // The owner cancels both works, joins and frees the first slot, and the
+    // second work ends while it does.
+    closed = true;
+    owner.deinit();
+    try std.testing.expectEqual(@as(usize, 1), fixture.checks.load(.seq_cst));
+    try std.testing.expectEqual(@as(usize, 0), fixture.listed_freed.load(.seq_cst));
 }
 
 test "a cancelled work's cause is the user's stop, else fx's quit, else unknown" {
@@ -918,7 +1095,7 @@ fn slotMain(slot: *Slot) void {
             slot.stopped_by_parent = false;
             slot.stopped_by_user = false;
             slot.closed_by_user = false;
-            slot.metrics = .{};
+            slot.metrics.reset();
             owner.mutex.unlock(io_mod.getIo());
             continue;
         }
@@ -970,6 +1147,7 @@ fn runOne(slot: *Slot) OneOutcome {
     turn.approval_registry = owner.approvals;
     turn.child_id = slot.child_id;
     turn.child_name = if (snapshot.name.len > 0) snapshot.name else null;
+    turn.child_purpose = if (snapshot.purpose.len > 0) snapshot.purpose else null;
     turn.active_work_id = snapshot.active.id;
     turn.phase_context = owner;
     turn.phase_fn = Owner.phaseTransition;
@@ -1287,11 +1465,14 @@ const RunSnapshot = struct {
     instructions: []u8,
     /// The name the parent gave a persistent child, or empty for a one-off.
     name: []u8,
+    /// What the child is for, or empty when it has none.
+    purpose: []u8,
 
     fn deinit(self: *RunSnapshot, alloc: Allocator) void {
         self.active.deinit(alloc);
         if (self.instructions.len > 0) alloc.free(self.instructions);
         if (self.name.len > 0) alloc.free(self.name);
+        if (self.purpose.len > 0) alloc.free(self.purpose);
         self.* = undefined;
     }
 };
@@ -1314,10 +1495,13 @@ fn loadRunSnapshot(owner: *Owner, child_id: []const u8) !RunSnapshot {
         try owner.alloc.dupe(u8, child.instructions());
     errdefer if (instructions.len > 0) owner.alloc.free(instructions);
     const name: []u8 = if (child.agentName()) |value| try owner.alloc.dupe(u8, value) else &.{};
+    errdefer if (name.len > 0) owner.alloc.free(name);
+    const purpose: []u8 = if (child.purpose) |value| try owner.alloc.dupe(u8, value) else &.{};
     return .{
         .active = owned_active,
         .instructions = instructions,
         .name = name,
+        .purpose = purpose,
     };
 }
 
