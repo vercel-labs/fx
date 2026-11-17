@@ -73,7 +73,7 @@ const MUTANTS: Mutant[] = [
   },
   {
     id: "list-busy",
-    note: "session/list is refused while a turn runs on the connection, as today (X24)",
+    note: "session/list is refused while a turn runs on the connection, as today",
     from: `    /\\ IF ~Rules /\\ Busy(c)`,
     to: `    /\\ IF Busy(c)`,
     expect: "ListAnswered",
