@@ -1617,7 +1617,8 @@ fn joinsByArgument(record: *const ToolDetailRecord) bool {
 /// the row of searches with its tool for a search, the row of its file for
 /// an edit or write whose status names it, the latest row of its own tool
 /// for a read, search, edit, or write that names nothing yet or a subagent
-/// call whose status is a bare verb, and the row right before it for a
+/// call whose status is a bare verb, the row of its agent for a subagent
+/// call whose agent has streamed in, and the row right before it for a
 /// command that follows commands. When it ends up on another row, that row
 /// is new, so the group only grows. Null when it likely gets its own row.
 fn pendingCallRow(scratch: std.mem.Allocator, rows: []StoryRow, entry: TranscriptEntry, record: *const ToolDetailRecord) !?*StoryRow {
@@ -1627,9 +1628,16 @@ fn pendingCallRow(scratch: std.mem.Allocator, rows: []StoryRow, entry: Transcrip
     } else if (std.mem.eql(u8, name, "grep_files") or std.mem.eql(u8, name, "glob_files")) {
         for (rows) |*row| if (row.identity.kind == .search and std.mem.eql(u8, storySearchTool(row.identity.key), name)) return row;
     } else if (std.mem.eql(u8, name, "subagent")) {
-        // Only a bare verb, such as "Managing", says the call's action or
-        // agent has not arrived. A status that says more, such as "Subagent
-        // working · inspect auth", is its own row's.
+        // A call whose agent has streamed in, while its message still does,
+        // waits in that agent's row. The first call to an agent shows on its
+        // own row at the end, so the group only grows.
+        if (tooling_presentation.subagentStreamedAgent(record.arguments_json orelse "")) |agent| {
+            for (rows) |*row| if (row.identity.kind == .subagent and std.mem.eql(u8, row.identity.key, agent)) return row;
+            return null;
+        }
+        // Otherwise only a bare verb, such as "Managing", says the call's
+        // action or agent has not arrived. A status that says more, such as
+        // "Subagent working · inspect auth", is its own row's.
         const phrase = std.mem.trim(u8, try entryStatus(scratch, entry) orelse "", " ");
         if (std.mem.findScalar(u8, phrase, ' ') != null) return null;
     } else if (std.mem.eql(u8, name, "edit_file") or std.mem.eql(u8, name, "write_file")) {
@@ -2066,6 +2074,24 @@ fn streamingToolboxIdentity(scratch: std.mem.Allocator, entry: TranscriptEntry, 
     return .{ .kind = .mcp, .key = name };
 }
 
+/// A running subagent call's identity by the agent its status names, such
+/// as "Managing reviewer", while its arguments, which name the agent, have
+/// not arrived or do not parse yet, so a second message to an agent joins
+/// that agent's row at once instead of showing on a row of its own that
+/// folds into it later. Only a status of one verb and one name counts, so
+/// "Subagent working · inspect auth" keeps its own row.
+fn streamingSubagentIdentity(scratch: std.mem.Allocator, entry: TranscriptEntry, detail: ?*const ToolDetailRecord, identity: StoryIdentity) !StoryIdentity {
+    if (identity.kind != .single) return identity;
+    const record = detail orelse return identity;
+    if (record.outcome != null or !std.mem.eql(u8, record.tool_name, "subagent")) return identity;
+    if (storyArgString(scratch, record, "agent") != null) return identity;
+    const phrase = std.mem.trim(u8, try entryStatus(scratch, entry) orelse return identity, " \t\r\n");
+    const space = std.mem.findScalar(u8, phrase, ' ') orelse return identity;
+    const name = phrase[space + 1 ..];
+    if (name.len == 0 or std.mem.findAny(u8, name, " \t") != null) return identity;
+    return .{ .kind = .subagent, .key = name };
+}
+
 fn storyIdentity(scratch: std.mem.Allocator, detail: ?*const ToolDetailRecord) !StoryIdentity {
     const record = detail orelse return .{};
     // A deferred call waits for project instructions and has not run, so it
@@ -2231,7 +2257,7 @@ fn collectStoryRows(
         // runs once they load shows instead, so the hold gets no row; Ctrl+O
         // still shows it.
         if (detail) |record| if (record.outcome == .deferred) continue;
-        const identity = try streamingToolboxIdentity(scratch, entry, detail, try storyIdentity(scratch, detail));
+        const identity = try streamingSubagentIdentity(scratch, entry, detail, try streamingToolboxIdentity(scratch, entry, detail, try storyIdentity(scratch, detail)));
         // A call whose arguments have not arrived yet waits in the row it
         // will most likely join, and shows once they arrive.
         if (identity.kind == .single) if (detail) |record| if (record.outcome == null and (!storyHasArgs(record) or joinsByArgument(record))) {
@@ -8597,6 +8623,38 @@ test "a subagent call whose arguments are still coming waits in the latest subag
         try std.testing.expect(std.mem.find(u8, text, "Managing") == null);
         try std.testing.expect(std.mem.find(u8, text, "└ Read a.zig") != null);
     }
+    // A second message to the same agent, whose agent has streamed in while
+    // its message has not, joins that agent's row at once; one to a new
+    // agent shows on its own row at the end.
+    // The TUI's record of a streaming call has no arguments, only the
+    // status that names the agent, so both shapes count.
+    for ([_][]const u8{ "reviewer", "tester" }) |agent| for ([_]bool{ true, false }) |with_arguments| {
+        const status = try std.mem.concat(alloc, u8, &.{ "● Managing ", agent, "\n" });
+        defer alloc.free(status);
+        const partial: ?[]u8 = if (with_arguments) try std.mem.concat(alloc, u8, &.{ "{\"action\":\"message\",\"agent\":\"", agent, "\",\"message\":\"look at" }) else null;
+        defer if (partial) |value| alloc.free(value);
+        const entries = [_]TranscriptEntry{
+            .{ .raw_bytes = .{ .id = 1, .bytes = "● sent to reviewer · review the change\n", .class = .tool_status } },
+            .{ .raw_bytes = .{ .id = 2, .bytes = "● Read /w/a.zig\n", .class = .tool_status } },
+            .{ .raw_bytes = .{ .id = 3, .bytes = status, .class = .tool_status } },
+        };
+        const details = [_]ToolDetailRecord{
+            .{ .entry_id = 1, .tool_name = @constCast("subagent"), .activity_kind = .subagent, .arguments_json = @constCast("{\"action\":\"message\",\"agent\":\"reviewer\",\"message\":\"review the change\"}"), .outcome = .completed },
+            .{ .entry_id = 2, .tool_name = @constCast("read_file"), .activity_kind = .read, .arguments_json = @constCast("{\"path\":\"/w/a.zig\"}"), .outcome = .completed },
+            .{ .entry_id = 3, .tool_name = @constCast("subagent"), .activity_kind = .subagent, .arguments_json = partial },
+        };
+        const text = try groupTextForTest(alloc, &entries, &details);
+        defer alloc.free(text);
+        errdefer std.debug.print("message to {s} (arguments {}):\n{s}\n", .{ agent, with_arguments, text });
+        if (std.mem.eql(u8, agent, "reviewer")) {
+            // One row for the reviewer, which shows its latest call in place.
+            try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, text, "reviewer"));
+            try std.testing.expect(std.mem.find(u8, text, "├ Managing reviewer") != null);
+            try std.testing.expect(std.mem.find(u8, text, "└ Read a.zig") != null);
+        } else {
+            try std.testing.expect(std.mem.find(u8, text, "└ Managing tester") != null);
+        }
+    };
 }
 
 test "a command that ran after one still running keeps its own row and no check mark" {
