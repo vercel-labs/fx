@@ -16,7 +16,7 @@
 (*    stopReason.                                                          *)
 (*  - session/status says open while any connection holds the session,   *)
 (*    and gives its state.                                                 *)
-(*  - session/list answers at once, even during a turn (X24).             *)
+(*  - session/list answers at once, even during a turn.                   *)
 (*  - After a session in a folder is saved for the first time, saves a    *)
 (*    turn, gets a title, or is deleted, fx sends a hint to every         *)
 (*    connection that listed that folder or every folder.                 *)
@@ -55,7 +55,7 @@ VARIABLES
     subs,       \* [Conns -> SUBSET (Folders \cup {All})]: what the client has listed
     seen,       \* [Conns -> [Folders -> Int]]: the version of each folder's list the client holds
     hinted,     \* [Conns -> SUBSET Folders]: hints read since the client last listed the folder
-    refused,    \* the last session/list got -32600 (X24)
+    refused,    \* the last session/list got -32600
     badOrder,   \* an update was read while the client's view said the session wasn't running
     turns, changes
 
@@ -268,7 +268,7 @@ ListFresh ==
     \A c \in Conns, f \in Folders :
         (Covers(c, f) /\ seen[c][f] < ver[f]) => (f \in hinted[c] \/ PendingHint(c, f))
 
-\* session/list is never refused (X24).
+\* session/list is never refused.
 ListAnswered == ~refused
 
 \* A session/status request that any connection sends now gets what is true.
