@@ -14,8 +14,9 @@
 \* meanwhile. A paste, or another surface taking the footer, closes the list
 \* and keeps the agent shown.
 \*
-\* Typing searches the list (SearchKeys): only the agents whose name or title
-\* has the text stay as rows (`hidden` holds the rest). A search edit that
+\* Typing searches the list (SearchKeys): only the agents whose name, title, or
+\* purpose (what a subagent is for) has the text stay as rows (`hidden` holds
+\* the rest; which agents a text matches is left open). A search edit that
 \* hides the highlighted row moves the highlight to the agent on screen when it
 \* still matches, else to the first match, and shows it, as a move does. With
 \* no match there is no row, and the agent shown stays. While there is a

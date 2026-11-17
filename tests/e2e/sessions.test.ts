@@ -1996,6 +1996,10 @@ test.skipIf(!tmuxAvailable())("/fork asks once and copies the subagents made bef
     expect(copyLog[0].role).toBe("child");
     expect(copyLog[0].parent).toBe(fork);
     expect(copyLog[0].forked_from.id).toBe(helper);
+    // The copy keeps what its source is for, which the agent list shows.
+    const sourcePurpose = childLines(fixture.home, source).find((line) => line.kind === "child_spawned" && line.child === helper)?.data.purpose;
+    expect(typeof sourcePurpose).toBe("string");
+    expect(ownChildLines(fixture.home, fork).find((line) => line.kind === "child_spawned")?.data.purpose).toBe(sourcePurpose);
     const copyText = readFileSync(join(storeRoot(fixture.home), copy, "log.jsonl"), "utf8");
     expect(copyText).toContain("HELPER_ONE_DONE");
     expect(copyText).not.toContain("HELPER_THREE_DONE");

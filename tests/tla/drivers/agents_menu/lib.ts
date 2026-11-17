@@ -44,7 +44,8 @@ export type State = {
   act: string;
 };
 
-/// Letters a search types: each is in some agent's name and not in others'.
+/// Letters a search types: each is in some agent's name, title, or purpose
+/// (a subagent's purpose is its task, `AM_TASK_<name> wait`) and not in others'.
 export const SEARCH_LETTERS = ["a", "b", "e", "f", "g", "l", "m", "p", "t", "x", "z"];
 
 export type WorldOptions = { instances: number; subs: string[]; width?: number; height?: number; label: string };
