@@ -124,8 +124,10 @@ pub fn captureAdmission(
     validateBoundedText(input.model, max_model_bytes) catch return error.InvalidModel;
     // Integration names mirror the parent's MCP catalog, which is already
     // bounded per server by the MCP tool limits, so they carry no count cap.
+    // Rules carry none either: they are the parent's own rules, which the
+    // parent already holds and enforces, and a child must keep every one, so
+    // a cap would only refuse a child to a parent fx runs with them.
     if (input.tool_names.len > max_admission_items or
-        input.rules.rules.len > max_admission_items or
         input.grants.len > max_admission_items)
     {
         return error.TooManyAdmissionItems;
@@ -290,6 +292,25 @@ test "admission still validates each integration name" {
         .effort = .auto,
         .integration_names = &.{""},
     }));
+}
+
+test "admission accepts more rules than the admission item cap" {
+    const alloc = std.testing.allocator;
+    var rules: [max_admission_items + 1]types.PermissionRule = undefined;
+    for (&rules) |*rule| rule.* = .{ .permission = @constCast("mcp_fixture_tool"), .pattern = @constCast("*"), .action = .allow };
+    rules[max_admission_items] = .{ .permission = @constCast("write_file"), .pattern = @constCast("*"), .action = .deny };
+    var snapshot = try captureAdmission(alloc, .{
+        .parent_id = "01J00000000000000000000000",
+        .source_id = "01J00000000000000000000000",
+        .model = "test/model",
+        .effort = .auto,
+        .rules = .{ .rules = &rules },
+    });
+    defer snapshot.deinit(alloc);
+    try std.testing.expectEqual(rules.len, snapshot.rules.rules.len);
+    const last = snapshot.rules.rules[max_admission_items];
+    try std.testing.expectEqualStrings("write_file", last.permission);
+    try std.testing.expectEqual(types.PermissionAction.deny, last.action);
 }
 
 test "admission keeps the item cap for tool names" {
