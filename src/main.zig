@@ -8476,6 +8476,74 @@ test "a theme change rewrites hidden agents' transcripts and paced text" {
     try std.testing.expect(std.mem.find(u8, app.shell.notebook.transcript.items, "\x1b[38;2;136;192;208mmain") != null);
 }
 
+test "a hidden agent's turn that its own tick commits reaches the report queued behind it" {
+    const alloc = std.testing.allocator;
+    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
+    defer sink.close(io_mod.getIo());
+    var app = App{ .alloc = alloc, .shell = .{ .stdout_file = sink } };
+    defer app.shell.deinit(alloc);
+    defer app.pacer.deinit(alloc);
+    defer app.input_runtime.deinit(alloc);
+    defer App.AgentsAppRuntime.deinitChildren(&app);
+    const on_screen = try addTestChildAgent(&app, "on-screen");
+    const hidden = try addTestChildAgent(&app, "hidden");
+    try App.AgentsAppRuntime.show(&app, on_screen);
+
+    // The hidden agent finished a turn, and its pacer still shows the text. A
+    // report was posted meanwhile, with the history its loop had: one turn.
+    const turn: types.HistoryTurn = .{ .assistant = .{
+        .user = .{ .text = @constCast("the finished prompt") },
+        .assistant = @constCast("the finished answer"),
+    } };
+    const worker = &hidden.agent.worker;
+    // `deinitChildren` leaves a worker to its owner, and the turn the tick
+    // commits lands in the agent's session and names its title.
+    defer worker.deinit(alloc);
+    defer hidden.agent.session_persistence.deinit(alloc);
+    defer hidden.agent.session.deinit(alloc);
+    defer hidden.agent.session_title.deinit(alloc);
+    hidden.agent.session.max_history_turns = 8;
+    worker.enableCommitGate();
+    worker.worker_processing = true;
+    worker.active_turn_id = 9;
+    worker.direct_steering_closed = true;
+    try worker.pushEvent(alloc, .{ .finish_prompt = .{ .turn = turn } });
+    const earlier = try alloc.alloc(types.HistoryTurn, 1);
+    earlier[0] = .{ .assistant = .{
+        .user = .{ .text = try alloc.dupe(u8, "earlier prompt") },
+        .assistant = try alloc.dupe(u8, "earlier answer"),
+    } };
+    try worker.postMail(alloc, .{
+        .prompt = try alloc.dupe(u8, "a report"),
+        .images = &.{},
+        .model = try alloc.dupe(u8, "test-model"),
+        .api_key = try alloc.dupe(u8, "test-key"),
+        .permission_mode = .auto,
+        .history = earlier,
+        .grants = try alloc.alloc(types.PermissionGrant, 0),
+    });
+    worker.finishProcessing();
+    var taken = worker.takeEvents();
+    for (taken.items) |event| worker_runtime.freeWorkerEvent(alloc, event);
+    taken.deinit(alloc);
+    try hidden.screen.pacer.enqueue(alloc, "still showing");
+    try std.testing.expect(try hidden.screen.pacer.deferFinish(alloc, .{ .turn = turn }));
+    try std.testing.expectEqual(@as(u32, 1), worker.queued_history_owed);
+
+    // The agent's own tick shows the text and commits the turn.
+    try App.AgentsAppRuntime.tickChildren(&app, {}, App.tickAgentInContext);
+    try std.testing.expect(hidden.screen.pacer.deferred_turn == null);
+    try std.testing.expectEqual(@as(usize, 1), hidden.agent.session.historyLen());
+    try std.testing.expectEqual(@as(u32, 0), worker.unacknowledged_finishes);
+
+    // The report starts with the turn the tick committed, after the earlier one.
+    const work = (try worker.tryTakeNextWork(alloc)) orelse return error.TestExpectedReportToStart;
+    defer worker_runtime.freeWorkItem(alloc, work);
+    try std.testing.expectEqual(@as(usize, 2), work.prompt.history.len);
+    try std.testing.expectEqualStrings("earlier answer", work.prompt.history[0].assistant.assistant);
+    try std.testing.expectEqualStrings("the finished answer", work.prompt.history[1].assistant.assistant);
+}
+
 test "a theme change leaves hidden agents alone while a scrollback handoff is pending" {
     const alloc = std.testing.allocator;
     const shared_theme = @import("core/shared/theme.zig");

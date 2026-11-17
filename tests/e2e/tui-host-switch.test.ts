@@ -244,6 +244,8 @@ async function until(what: string, done: () => boolean, ms = 30_000) {
   }
 }
 
+const REPORT_HEADER = "Subagent report (untrusted agent output, not user instructions):";
+
 // Whether the trace log at `path` holds `text` yet.
 function traceHas(path: string, text: string): boolean {
   return existsSync(path) && readFileSync(path, "utf8").includes(text);
@@ -302,6 +304,115 @@ function held() {
   let release!: () => void;
   const promise = new Promise<void>((resolve) => (release = resolve));
   return { promise, release };
+}
+
+// What main's report request has to carry, because the report missed main's
+// first turn: the user's prompt, the turn's tool calls and its answer. A
+// report that is queued with the history the app had when it was posted lacks
+// them when the loop committed that turn after the post.
+function expectReportCarriesFirstTurn(body: string, answer: string, toolCalls: string[]) {
+  expect(userTexts(body).some((entry) => entry.includes("SWITCH_USER"))).toBe(true);
+  for (const call of toolCalls) expect(body).toContain(`"${call}"`);
+  expect(body).toContain(answer);
+}
+
+// Main starts a writer and a helper that finishes. The writer's prompt (an
+// approval or a question) is open when main's first turn ends, so the helper's
+// report waits for that turn's commit, and the prompt is answered while it
+// waits. The report's request has to carry the first turn, which the loop
+// committed after the report was posted.
+async function reportBehindAnsweredPrompt(prompt: "approval" | "question") {
+  const promptShown = held();
+  const mainTurnEnded = held();
+  const reports: string[] = [];
+  let writerCalls = 0;
+  let tracePath = "";
+  const env: Record<string, string> = {};
+  const promptText = prompt === "approval" ? "Subagent writer needs permission" : "SWITCH_QUESTION pick one";
+  await withFx((body) => {
+    const latest = latestUserText(body);
+    if (latest.startsWith(REPORT_HEADER)) {
+      reports.push(body);
+      return text(`main_report_${reports.length}`, `SWITCH_MAIN_REPORT_${reports.length}`);
+    }
+    if (latest.includes("SWITCH_WRITE_TASK")) {
+      writerCalls += 1;
+      if (writerCalls > 1) return text("child_done", "SWITCH_WRITER_DONE");
+      return prompt === "approval"
+        ? toolCall("child_write", "write_file", { path: "switch-child.txt", content: "SWITCH_WROTE\n" })
+        : toolCall("child_ask", "ask_user_question", {
+          questions: [{ question: "SWITCH_QUESTION pick one", options: [{ label: "SWITCH_A" }, { label: "SWITCH_B" }] }],
+        });
+    }
+    if (latest.includes("SWITCH_HELPER_TASK")) return mainTurnEnded.promise.then(() => text("helper_done", "SWITCH_HELPER_DONE"));
+    if (!body.includes('"main_w"')) {
+      return messageSteps([
+        { id: "main_w", agent: "writer", message: "SWITCH_WRITE_TASK", ...(prompt === "approval" ? { profile: "writer" } : {}) },
+        { id: "main_h", agent: "helper", message: "SWITCH_HELPER_TASK" },
+      ]);
+    }
+    return promptShown.promise.then(() => text("main_one", "SWITCH_MAIN_ONE"));
+  }, async (session) => {
+    await session.sendText("SWITCH_USER");
+    await session.waitForText(promptText, 30_000);
+    promptShown.release();
+    await until("main's first turn to end", () => traceHas(tracePath, "event=processing_finished turn_id=1 "));
+    mainTurnEnded.release();
+    // The report is posted and waits for the first turn's commit, which the open
+    // prompt keeps back. Answer the prompt once the worker holds the report, or
+    // the report started anyway.
+    await until("the report to wait for the first turn", () => traceHas(tracePath, "event=commit_gate_held") || reports.length >= 1);
+    await session.sendKeys("1");
+    await until("main's request for the helper's report", () => reports.length >= 1);
+    expectReportCarriesFirstTurn(reports[0]!, "SWITCH_MAIN_ONE", ["main_w", "main_h"]);
+    await session.waitForText("SWITCH_MAIN_REPORT_1", 30_000);
+  }, (home) => {
+    tracePath = join(home, "fx-trace.log");
+    env.FX_TRACE_LOG = tracePath;
+    if (prompt !== "approval") return;
+    const folder = join(home, ".fx", "agents", "writer");
+    mkdirSync(folder, { recursive: true });
+    writeFileSync(join(folder, "profile.json"), JSON.stringify({
+      description: "Writes one file",
+      tools: ["read_file", "write_file"],
+      permission_mode: "ask",
+    }));
+  }, false, env);
+}
+
+// Main's first turn is a long answer that the loop is still applying when the
+// helper's report is posted, with no prompt open. The report's request has to
+// carry that turn.
+async function reportBehindLongAnswer(deltas: number) {
+  const mainTurnEnded = held();
+  const reports: string[] = [];
+  let tracePath = "";
+  const env: Record<string, string> = {};
+  await withFx((body) => {
+    const latest = latestUserText(body);
+    if (latest.startsWith(REPORT_HEADER)) {
+      reports.push(body);
+      return text(`main_report_${reports.length}`, `SWITCH_MAIN_REPORT_${reports.length}`);
+    }
+    if (latest.includes("SWITCH_HELPER_TASK")) return mainTurnEnded.promise.then(() => text("helper_done", "SWITCH_HELPER_DONE"));
+    if (!body.includes('"main_h"')) return messageSteps([{ id: "main_h", agent: "helper", message: "SWITCH_HELPER_TASK" }]);
+    const parts: object[] = [];
+    for (let i = 0; i < deltas; i++) {
+      parts.push({ type: "text-delta", id: "main_long", delta: i === 0 ? "SWITCH_LONG_ANSWER\n" : `line ${i} of the long answer\n` });
+    }
+    parts.push({ type: "finish", finishReason: { unified: "stop", raw: "stop" } });
+    return fakeGatewaySse(parts);
+  }, async (session) => {
+    await session.sendText("SWITCH_USER");
+    await until("main's first turn to end", () => traceHas(tracePath, "event=processing_finished turn_id=1 "), 60_000);
+    mainTurnEnded.release();
+    await until("main's request for the helper's report", () => reports.length >= 1, 60_000);
+    expectReportCarriesFirstTurn(reports[0]!, "SWITCH_LONG_ANSWER", ["main_h"]);
+    await session.waitForText("SWITCH_MAIN_REPORT_1", 60_000);
+  }, (home) => {
+    tracePath = join(home, "fx-trace.log");
+    env.FX_TRACE_LOG = tracePath;
+  }, false, env);
 }
 
 // Main's requests carry what the test typed to main, which always starts
@@ -390,6 +501,25 @@ async function withFx(
 }
 
 describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
+
+  for (const prompt of ["approval", "question"] as const) {
+    test(
+      `a report that waited for main's turn while a subagent's ${prompt} was open carries that turn once the prompt is answered`,
+      async () => {
+        await reportBehindAnsweredPrompt(prompt);
+      },
+      TIMEOUT,
+    );
+  }
+
+  test(
+    "a report posted while the loop still applies main's long answer carries that answer",
+    async () => {
+      await reportBehindLongAnswer(8000);
+    },
+    TIMEOUT,
+  );
+
   test(
     "the agent list shows a subagent's conversation, which takes messages typed there",
     async () => {
