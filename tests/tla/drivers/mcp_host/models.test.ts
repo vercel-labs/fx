@@ -30,9 +30,10 @@ test("TLC: every model's smoke and stress pass, every planted bug is caught, sta
   // IndicatorClears. UrlRetry's finding is the code before the held call:
   // it ended the call at the -32042 error. HostLifecycle's AtMostOneOwner
   // became the code once a reload kept its host: its smoke and stress
-  // configs check it. McpRules' three are the code before the fix (a rule set
-  // each MCP path picked on its own, so full access ignored deny rules on every
-  // MCP path). SignIn's five findings are fx before the check request
+  // configs check it. McpRules' three are the code before the fix (each MCP
+  // path picked its rule set on its own, so in full access toolbox search and the
+  // open of a small server ignored deny rules, and every other MCP path still
+  // applied them). SignIn's five findings are fx before the check request
   // (a login reported as signed in before the server took it, a refused login
   // saved, a refused login another fx takes), the branch for an unreadable
   // store answering a sign-in's check request first, and a failed refresh after a
