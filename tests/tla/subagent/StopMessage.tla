@@ -20,13 +20,19 @@
 (*            message as soon as the stopped turn has ended;               *)
 (*   closing  is refused, and main hears it: a close is under way, and a  *)
 (*            message after the closed work ends starts a new subagent.   *)
+(*   writing  is refused too: the closed work has ended and its close is  *)
+(*            not written yet. Runtime.settleClose keeps the subagent     *)
+(*            closing until the write returns, so every observer, the     *)
+(*            list, the trace and message admission, sees it closing      *)
+(*            until it is absent.                                         *)
 (* A stop drops main's messages the stopped turn has not read and the      *)
 (* waiting ones, and its answer counts both, so main hears of every        *)
 (* message it loses. A user's stop on the subagent's screen ends the turn  *)
 (* the same way and tells main the same count. A stopped turn reads no     *)
 (* more messages. A close drops and counts the same; a working subagent   *)
-(* is "closing" until its work ends; then no subagent has the name, a stop *)
-(* or close of it is unavailable, and a message starts a new one.          *)
+(* is "closing" until its work ends and "writing" until its close is       *)
+(* written; then no subagent has the name, a stop or close of it is        *)
+(* unavailable, and a message starts a new one.                            *)
 (*                                                                         *)
 (* Main writes a step of one or two calls. Calls to one subagent run in    *)
 (* the order written; calls to different subagents may run in any order.  *)
@@ -55,7 +61,7 @@ CONSTANTS Subs, MsgsPer, MaxSteps, MaxStops, Bug
 
 Bugs == {"none", "today", "refuse_ending", "no_order", "uncounted",
          "join_user_ending", "read_after_stop", "drop_waiting_at_end",
-         "queue_closing", "start_next_turn",
+         "queue_closing", "unmark_early", "start_next_turn",
          "before_idle", "note_after_take", "names_busy"}
 ASSUME Bug \in Bugs
 
@@ -66,11 +72,11 @@ Notes == {"none", "idle", "plain"}
 Msgs == Subs \X (1..MsgsPer)
 NoMsg == <<"none", 0>>
 SubOf(m) == m[1]
-Phases == {"absent", "idle", "starting", "running", "ending_parent", "ending_user", "closing"}
+Phases == {"absent", "idle", "starting", "running", "ending_parent", "ending_user", "closing", "writing"}
 Endings == {"ending_parent", "ending_user"}
 Answers == {"none", "started", "joined", "waits", "refused"}
 Ops == {"none", "step", "send", "stop", "close", "user_stop", "read",
-        "finish", "end", "begin"}
+        "finish", "end", "begin", "write_close"}
 
 Range(sq) == {sq[k] : k \in DOMAIN sq}
 RemoveAt(sq, i) == [k \in 1..(Len(sq) - 1) |-> IF k < i THEN sq[k] ELSE sq[k + 1]]
@@ -181,6 +187,18 @@ RefusesEnding(s) ==
 JoinsEnding(s) ==
     phase[s] = "ending_user" /\ Bug \in {"today", "join_user_ending"}
 
+\* A subagent that is being closed, whose work runs or whose close is not
+\* written yet.
+Marked(s) == phase[s] \in {"closing", "writing"}
+
+\* A message to it is queued, and goes with the close. fx never does: a
+\* closing subagent refuses it. unmark_early is fx before settleClose kept
+\* the mark until the write returned: a subagent whose work had ended was
+\* neither marked nor gone, and took the message.
+QueuesMarked(s) ==
+    \/ phase[s] = "closing" /\ Bug = "queue_closing"
+    \/ phase[s] = "writing" /\ Bug = "unmark_early"
+
 \* fx before the start wait: a message to a starting turn waits for the next.
 StartNextTurn(s) ==
     phase[s] = "starting" /\ Bug \in {"today", "start_next_turn"}
@@ -198,7 +216,7 @@ NamedAtStart(s) ==
       [] Bug = "names_busy" -> {t \in Subs \ {s} : phase[t] # "absent"}
       [] OTHER -> IdleOthers(s)
 
-\* A message to a subagent that has a turn, or is closing.
+\* A message to a subagent that has a turn, or is closing or writing its close.
 SendToBusy(s, m) ==
     \/ /\ StartNextTurn(s)
        /\ waitq' = [waitq EXCEPT ![s] = Append(@, m)]
@@ -224,14 +242,14 @@ SendToBusy(s, m) ==
        /\ told' = [told EXCEPT ![m] = "waits"]
        /\ last' = Event("send", s, m, "waits", 0)
        /\ UNCHANGED <<phase, read, unread, dropped, toldDropped, refusedOpen, coverBroken, stops, lateStart>>
-    \/ /\ phase[s] = "closing"
-       /\ Bug = "queue_closing"
+    \/ /\ Marked(s)
+       /\ QueuesMarked(s)
        /\ waitq' = [waitq EXCEPT ![s] = Append(@, m)]
        /\ told' = [told EXCEPT ![m] = "waits"]
        /\ last' = Event("send", s, m, "waits", 0)
        /\ UNCHANGED <<phase, read, unread, dropped, toldDropped, refusedOpen, coverBroken, stops, lateStart>>
-    \/ /\ phase[s] = "closing"
-       /\ Bug # "queue_closing"
+    \/ /\ Marked(s)
+       /\ ~QueuesMarked(s)
        /\ told' = [told EXCEPT ![m] = "refused"]
        /\ last' = Event("send", s, m, "refused", 0)
        /\ UNCHANGED <<phase, read, unread, waitq, dropped, toldDropped, refusedOpen, coverBroken, stops, lateStart>>
@@ -265,13 +283,13 @@ DoStop(c) ==
     IN
     \* The close already ended the turn and dropped what waited: fx answers
     \* as for a second stop, and drops nothing more.
-    \/ /\ phase[s] = "closing"
+    \/ /\ Marked(s)
        /\ last' = Event("stop", s, NoMsg, "stopped", 0)
        /\ UNCHANGED <<phase, waitq, dropped, toldDropped, coverBroken>>
     \/ /\ phase[s] = "absent"
        /\ last' = Event("stop", s, NoMsg, "unavailable", 0)
        /\ UNCHANGED <<phase, waitq, dropped, toldDropped, coverBroken>>
-    \/ /\ phase[s] \notin {"closing", "absent"}
+    \/ /\ phase[s] \notin {"closing", "writing", "absent"}
        /\ phase' = [phase EXCEPT ![s] = IF @ \in {"starting", "running"} THEN "ending_parent" ELSE @]
        /\ waitq' = [waitq EXCEPT ![s] = <<>>]
        /\ dropped' = dropped \cup waiting
@@ -295,10 +313,10 @@ DoClose(c) ==
           /\ UNCHANGED <<phase, waitq, unread, dropped, toldDropped>>
        \* A second close while the first is ending: fx answers closed and
        \* drops nothing more (`closeChild` in tool_host.zig).
-       \/ /\ phase[s] = "closing"
+       \/ /\ Marked(s)
           /\ last' = Event("close", s, NoMsg, "closed", 0)
           /\ UNCHANGED <<phase, waitq, unread, dropped, toldDropped>>
-       \/ /\ phase[s] \notin {"closing", "absent"}
+       \/ /\ phase[s] \notin {"closing", "writing", "absent"}
           /\ phase' = [phase EXCEPT ![s] = IF @ = "idle" THEN "absent" ELSE "closing"]
           /\ waitq' = [waitq EXCEPT ![s] = <<>>]
           /\ unread' = [unread EXCEPT ![s] = {}]
@@ -396,8 +414,8 @@ Finish(s) ==
                    covered, refusedOpen, coverBroken, lateStart>>
 
 \* The stopped turn ends: its unread messages go, and the waiting ones start
-\* the next turn. A closed subagent's work ends, and a new one may take the
-\* name.
+\* the next turn. A closed subagent's work ends, and its close is written
+\* next (WriteClose); it is closing until then.
 EndStopped(s) ==
     /\ phase[s] \in Endings \cup {"closing"}
     /\ unread' = [unread EXCEPT ![s] = {}]
@@ -409,7 +427,7 @@ EndStopped(s) ==
        ELSE IF phase[s] = "closing"
        THEN /\ dropped' = dropped \cup unread[s] \cup Range(waitq[s])
             /\ waitq' = [waitq EXCEPT ![s] = <<>>]
-            /\ phase' = [phase EXCEPT ![s] = "absent"]
+            /\ phase' = [phase EXCEPT ![s] = "writing"]
             /\ UNCHANGED read
        ELSE /\ dropped' = dropped \cup unread[s]
             /\ IF waitq[s] = <<>>
@@ -425,10 +443,21 @@ EndStopped(s) ==
     /\ UNCHANGED <<toldDropped, told, sent, stops, steps, step, covered,
                    refusedOpen, coverBroken, lateStart>>
 
+\* A closed subagent's close is written once nothing of it runs: the registry
+\* drops it, and a new one may take the name (Runtime.settleClose).
+WriteClose(s) ==
+    /\ phase[s] = "writing"
+    /\ phase' = [phase EXCEPT ![s] = "absent"]
+    /\ last' = Event("write_close", s, NoMsg, "none", 0)
+    /\ UNCHANGED <<unread, waitq, read, dropped, toldDropped, told, sent, stops, steps,
+                   step, covered, refusedOpen, coverBroken, lateStart>>
+    /\ UNCHANGED idleVars
+
 Next ==
     \/ NewStep
     \/ Exec
     \/ \E s \in Subs : UserStop(s) \/ Begin(s) \/ Read(s) \/ Finish(s) \/ EndStopped(s)
+                       \/ WriteClose(s)
 
 Spec == Init /\ [][Next]_vars
 
@@ -464,6 +493,12 @@ RefusedOnlyWhenClosing == refusedOpen = {}
 
 \* A stop never drops a message main wrote after it in the same step.
 StopRunsFirst == ~coverBroken
+
+\* A subagent that is being closed holds no message, waiting or unread: it
+\* would go with the close, unheard of. Runtime.settleClose keeps the mark,
+\* and with it the refusal, until the close is written.
+ClosingHoldsNothing ==
+    \A s \in Subs : Marked(s) => waitq[s] = <<>> /\ unread[s] = {}
 
 \* A message main sends to a turn that is still starting joins that turn:
 \* fx never holds it for a later one (Owner.steer's .starting).

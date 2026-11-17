@@ -344,6 +344,10 @@ pub const SignInRuntime = struct {
     /// Set once when a device code requested on the worker becomes ready, so
     /// the input loop can open the browser for it.
     browser_pending: bool = false,
+    /// The SHA-256 of the access token the newest sign-in saved, so a request
+    /// that waits for this sign-in can tell the login it saved, before its
+    /// team is chosen, from one another fx process saved. Guarded by `mutex`.
+    saved_token_digest: ?[32]u8 = null,
 
     /// Starts an fx login sign-in. On native hosts the issuer discovery and
     /// device-code request run on the sign-in worker, so the input loop never
@@ -360,6 +364,15 @@ pub const SignInRuntime = struct {
             });
         }
         return self.startPreparedWithMode(alloc, null, .{ .oauth_transport = transport }, false);
+    }
+
+    /// Whether `token` is the access token the newest sign-in saved.
+    pub fn savedToken(self: *Self, token: []const u8) bool {
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        const saved = self.saved_token_digest orelse return false;
+        const digest = tokenDigest(token);
+        return std.mem.eql(u8, &saved, &digest);
     }
 
     /// Returns true once after the worker publishes a device code.
@@ -417,6 +430,7 @@ pub const SignInRuntime = struct {
         self.failure = null;
         self.flow = prepared;
         self.browser_pending = false;
+        self.saved_token_digest = null;
         self.poll_state = poll_state;
         self.deps = deps;
         self.deps.poll.cancel_flag = &self.cancel_requested;
@@ -642,6 +656,7 @@ pub const SignInRuntime = struct {
             self.state = .failed;
             return;
         };
+        if (completionAccessToken(&completion)) |access_token| self.saved_token_digest = tokenDigest(access_token);
         self.completion = completion.take();
         self.state = .succeeded;
     }
@@ -754,6 +769,21 @@ fn saveSignIn(_: ?*anyopaque, alloc: Allocator, completion: SignInCompletion) !v
         .chatgpt, .grok => return error.InvalidSignInCompletion,
     };
     try oauth_session.saveNewSession(alloc, session);
+}
+
+fn tokenDigest(token: []const u8) [32]u8 {
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(token, &digest, .{});
+    return digest;
+}
+
+/// The access token `completion` saves, or null when it holds no session.
+fn completionAccessToken(completion: *const SignInCompletion) ?[]const u8 {
+    return switch (completion.*) {
+        .vercel => |*selection| if (selection.session) |*session| session.access_token else null,
+        .chatgpt => |*session| session.access_token,
+        .grok => |*session| session.access_token,
+    };
 }
 
 fn signInPersistenceError(err: anyerror) (Allocator.Error || error{CredentialPersistenceFailed}) {
@@ -2238,6 +2268,30 @@ test "sign-in notifies once after persistence succeeds or fails" {
         }
         _ = runtime.cancel(alloc);
         try std.testing.expectEqual(@as(usize, 1), state.finish_count);
+    }
+}
+
+test "a sign-in remembers the access token it saved, and only once it is saved" {
+    const alloc = std.testing.allocator;
+    for ([_]bool{ false, true }) |fail_save| {
+        var runtime: SignInRuntime = .{};
+        defer runtime.deinit(alloc);
+        var state = CooperativeSignInTestState.init(alloc, &.{.success});
+        defer state.deinit();
+        state.fail_save = fail_save;
+        try std.testing.expect(try runtime.startPreparedCooperative(alloc, try makeTestPreparedLogin(alloc), state.deps()));
+        try std.testing.expect(!runtime.savedToken("access"));
+        runtime.pulseCooperative(alloc);
+        try std.testing.expectEqual(!fail_save, runtime.savedToken("access"));
+        try std.testing.expect(!runtime.savedToken("another-fx-token"));
+        var transition = runtime.pollTransition(alloc);
+        switch (transition) {
+            .succeeded => |*completion| completion.deinit(alloc),
+            .failed => try std.testing.expect(fail_save),
+            else => return error.TestExpectedTerminalSignIn,
+        }
+        // Taking the result keeps it: the team choice comes after.
+        try std.testing.expectEqual(!fail_save, runtime.savedToken("access"));
     }
 }
 

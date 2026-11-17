@@ -20,6 +20,8 @@
 #   read-after-stop      a stopped turn still reads messages                    CountedNeverRead
 #   drop-waiting-at-end  the stopped turn's end drops the waiting messages      NoSilentLoss
 #   queue-closing        a message to a closing subagent waits, and goes with it  NoSilentLoss
+#   unmark-early         a closed subagent whose work ended is unmarked until its
+#                        close is written, and takes a message that goes with it  ClosingHoldsNothing
 #   start-next-turn      a message to a starting turn waits for the next one    JoinsStartingWork
 #   note-after-take      the idle note is decided after the next turn took the
 #                        waiting messages, so it says idle while a turn starts   IdleNoteHonest
@@ -149,6 +151,7 @@ StopMessage stop-message-mutation-join-user-ending NoSilentLoss
 StopMessage stop-message-mutation-read-after-stop CountedNeverRead
 StopMessage stop-message-mutation-drop-waiting-at-end NoSilentLoss
 StopMessage stop-message-mutation-queue-closing NoSilentLoss
+StopMessage stop-message-mutation-unmark-early ClosingHoldsNothing
 StopMessage stop-message-mutation-start-next-turn JoinsStartingWork
 StopMessage stop-message-before-idle IdleNoteHonest
 StopMessage stop-message-before-names NamesTheIdle
