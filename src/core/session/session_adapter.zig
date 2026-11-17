@@ -40,6 +40,9 @@ const builtin = @import("builtin");
 const sm = @import("session_manager");
 /// A line boundary in a session log, for hosts that walk it.
 pub const LogCursor = sm.Cursor;
+/// The session manager's rule for a session id, for code that may not
+/// import the session manager itself.
+pub const validSessionId = sm.validId;
 const debug_trace = @import("../shared/debug_trace.zig");
 const write_test_controls = @import("write_test_controls.zig");
 const io_mod = @import("../shared/io.zig");
