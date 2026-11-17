@@ -956,11 +956,12 @@ const max_tree_query_bytes: usize = 64 * 1024;
 pub fn pathsInTree(arena: Allocator, ready: Ready, cwd: []const u8, head: []const u8, paths: []const []const u8, limits: Limits) Allocator.Error!?[]const []const u8 {
     if (paths.len == 0) return &.{};
     var base = try environment(arena);
+    try blockLazyFetch(&base);
     var found: std.ArrayList([]const u8) = .empty;
     var start: usize = 0;
     while (start < paths.len) {
         var argv: std.ArrayList([]const u8) = .empty;
-        try appendPrelude(arena, &argv, ready);
+        try appendCapturePrelude(arena, &argv, ready);
         try argv.appendSlice(arena, &.{ "--literal-pathspecs", "ls-tree", "-r", "-z", "--name-only", "--full-tree", head, "--" });
         var bytes: usize = 0;
         while (start < paths.len) {

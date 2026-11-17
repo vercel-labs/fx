@@ -865,6 +865,8 @@ fn withGitFailure(base: Outcome, failure: safe_git.Failure) Outcome {
         .timeout => withFailure(base, .unavailable, .timeout),
         .cancelled => withFailure(base, .unavailable, .cancelled),
         .path_rejected => withFailure(base, .failed, .inconsistent),
+        // Config defines a hook for the store that fx cannot turn off.
+        .hooks_refused => withFailure(base, .unavailable, .git_refused),
         .spawn_failed, .input_failed, .read_failed, .output_too_large, .exited_nonzero, .terminated => withFailure(base, .failed, .io_error),
     };
 }
