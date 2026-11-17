@@ -2393,11 +2393,9 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         (value) =>
           /Thinking \(\d+s\) \(↑8 ↓[1-9]\d*(?:\.\d)?k?\)/.test(
             value,
-          ),
-        "reasoning token progress",
-      );
-      expect(reasoningPane).not.toContain(
-        "reasoning tokens should advance while hidden from the transcript",
+          ) &&
+          value.includes("reasoning tokens should advance"),
+        "live reasoning token progress and visible thought",
       );
       expect(queuedGateway.requests).toHaveLength(1);
 
@@ -2408,6 +2406,12 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
           streamingOutputTokens(value) !== null &&
           !value.includes(finalSentinel),
         "first estimated live token progress while text is paced",
+      );
+      // The thought's full text is appendix material: the inline transcript
+      // keeps only the summary row once the answer starts. A short turn's
+      // collapse and Ctrl+O carry it in tui-full-detail.
+      expect(streamingPane).not.toContain(
+        "reasoning tokens should advance while hidden from the transcript",
       );
       const firstOutputTokens = streamingOutputTokens(streamingPane)!;
 

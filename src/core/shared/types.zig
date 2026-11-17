@@ -1630,6 +1630,10 @@ pub const ExecutionMemory = struct {
     /// holds them, for the rows its replay shows; display data, never part
     /// of what the model is sent.
     bridge_calls: []BridgeCallRecord = &.{},
+    /// The model's reasoning during this turn, for Ctrl+O. Display data:
+    /// never part of what the model is sent, and never sent back to a
+    /// provider.
+    reasoning: ?ReasoningRecord = null,
 
     pub fn isEmpty(self: ExecutionMemory) bool {
         return self.tool_steps.len == 0 and self.files.len == 0 and self.steering.len == 0 and self.context_notes.len == 0;
@@ -2041,6 +2045,20 @@ pub const TurnSummary = struct {
     thinking_duration_ms: u64 = 0,
     turn_duration_ms: u64 = 0,
     token_progress: TurnTokenProgress = .{},
+};
+
+/// The model's own words while it thought, kept for the transcript only.
+/// Never part of a request, and never rendered as Markdown.
+pub const ReasoningRecord = struct {
+    /// Owned, terminal-safe text across every thinking phase of the turn,
+    /// separated by a blank line.
+    text: []u8,
+    /// Time spent thinking, summed across phases.
+    duration_ms: u64 = 0,
+    /// Estimated tokens of `text`.
+    tokens: u64 = 0,
+
+    pub const max_text_bytes: usize = 64 * 1024;
 };
 
 pub const ProviderFinishReason = enum {
@@ -2796,6 +2814,22 @@ pub fn historyTurnSummary(turn: HistoryTurn) ?TurnSummary {
     };
 }
 
+pub fn setHistoryTurnReasoning(turn: *HistoryTurn, reasoning: ?ReasoningRecord) void {
+    switch (turn.*) {
+        .assistant => |*entry| entry.execution.reasoning = reasoning,
+        .interrupted => |*entry| entry.execution.reasoning = reasoning,
+        .compacted_summary => {},
+    }
+}
+
+pub fn historyTurnReasoning(turn: HistoryTurn) ?ReasoningRecord {
+    return switch (turn) {
+        .assistant => |entry| entry.execution.reasoning,
+        .interrupted => |entry| entry.execution.reasoning,
+        .compacted_summary => null,
+    };
+}
+
 pub const FinishedPromptProjection = enum {
     history_default,
     assistant_text,
@@ -3270,6 +3304,8 @@ pub fn dupeExecutionMemory(alloc: std.mem.Allocator, memory: ExecutionMemory) !E
     const model_calls = try dupeModelCallRecords(alloc, memory.model_calls);
     errdefer freeModelCallRecords(alloc, model_calls);
     const bridge_calls = try dupeBridgeCallRecords(alloc, memory.bridge_calls);
+    errdefer freeBridgeCallRecords(alloc, bridge_calls);
+    const reasoning = if (memory.reasoning) |record| try dupeReasoningRecord(alloc, record) else null;
     return .{
         .tool_steps = tool_steps,
         .files = files,
@@ -3279,12 +3315,26 @@ pub fn dupeExecutionMemory(alloc: std.mem.Allocator, memory: ExecutionMemory) !E
         .turn_summary = memory.turn_summary,
         .model_calls = model_calls,
         .bridge_calls = bridge_calls,
+        .reasoning = reasoning,
     };
+}
+
+pub fn dupeReasoningRecord(alloc: std.mem.Allocator, record: ReasoningRecord) !ReasoningRecord {
+    return .{
+        .text = try alloc.dupe(u8, record.text),
+        .duration_ms = record.duration_ms,
+        .tokens = record.tokens,
+    };
+}
+
+pub fn freeReasoningRecord(alloc: std.mem.Allocator, record: ReasoningRecord) void {
+    alloc.free(record.text);
 }
 
 pub fn freeExecutionMemory(alloc: std.mem.Allocator, memory: ExecutionMemory) void {
     freeBridgeCallRecords(alloc, memory.bridge_calls);
     freeModelCallRecords(alloc, memory.model_calls);
+    if (memory.reasoning) |record| freeReasoningRecord(alloc, record);
     freeToolExecutionSteps(alloc, memory.tool_steps);
     freeFileEvidenceSlice(alloc, memory.files);
     freePersistedSteering(alloc, memory.steering);

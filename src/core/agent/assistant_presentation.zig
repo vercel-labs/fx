@@ -40,6 +40,9 @@ pub const Event = union(enum) {
     /// what it showed of the attempt when it still can, and otherwise shows
     /// this line after it.
     attempt_restart: []u8,
+    /// One chunk of the model's reasoning. It waits for earlier answer text
+    /// to show, so in the transcript it always sits where it arrived.
+    reasoning_delta: []u8,
 
     pub fn clone(self: Event, alloc: Allocator) Allocator.Error!Event {
         return switch (self) {
@@ -49,13 +52,14 @@ pub const Event = union(enum) {
             .thematic_rule => .thematic_rule,
             .attempt_start => .attempt_start,
             .attempt_restart => |text| .{ .attempt_restart = try alloc.dupe(u8, text) },
+            .reasoning_delta => |text| .{ .reasoning_delta = try alloc.dupe(u8, text) },
         };
     }
 
     pub fn requiresTextDrain(self: Event) bool {
         return switch (self) {
             .text, .attempt_restart => false,
-            .table, .code_block, .thematic_rule, .attempt_start => true,
+            .table, .code_block, .thematic_rule, .attempt_start, .reasoning_delta => true,
         };
     }
 
@@ -73,6 +77,7 @@ pub const Event = union(enum) {
             .code_block => |block| block.language.len +| block.code.len,
             .thematic_rule, .attempt_start => 1,
             .attempt_restart => |text| text.len,
+            .reasoning_delta => |text| text.len,
         };
     }
 
@@ -83,6 +88,7 @@ pub const Event = union(enum) {
             .code_block => |*block| block.deinit(alloc),
             .thematic_rule, .attempt_start => {},
             .attempt_restart => |text| alloc.free(text),
+            .reasoning_delta => |text| alloc.free(text),
         }
         self.* = undefined;
     }
@@ -104,6 +110,14 @@ test "assistant presentation event clone owns nested payloads" {
     defer text.deinit(alloc);
     text_source[0] = 'x';
     try std.testing.expectEqualStrings("ok", text.text);
+
+    var reasoning_source = [_]u8{ 'h', 'm', 'm' };
+    var reasoning = try (Event{ .reasoning_delta = &reasoning_source }).clone(alloc);
+    defer reasoning.deinit(alloc);
+    reasoning_source[0] = 'x';
+    try std.testing.expectEqualStrings("hmm", reasoning.reasoning_delta);
+    try std.testing.expect(reasoning.requiresTextDrain());
+    try std.testing.expectEqual(@as(usize, 3), reasoning.retainedByteCount());
 
     var block_source = [_]u8{ 'z', 'i', 'g' };
     var block = try (Event{ .code_block = .{

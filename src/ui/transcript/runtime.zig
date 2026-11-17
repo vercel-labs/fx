@@ -13,6 +13,8 @@ const activity_runtime = @import("../../core/output/activity_runtime.zig");
 const transcript_release = @import("../../core/output/transcript_release.zig");
 const transcript_presentation = @import("../../core/output/transcript_presentation.zig");
 const full_transcript_page = @import("../../core/output/full_transcript_page.zig");
+const full_transcript_metadata = @import("../../core/output/full_transcript_metadata.zig");
+const token_estimate = @import("../../core/shared/token_estimate.zig");
 const diff_mod = @import("../../core/output/diff.zig");
 const worker_status = @import("../../core/output/worker_status.zig");
 const footer_viewport_runtime = @import("../footer/viewport.zig");
@@ -711,6 +713,28 @@ fn formatTurnSummaryLine(buf: []u8, summary: types.TurnSummary) []const u8 {
     out.print("  {s}", .{turn}) catch return "  ";
     activity_status.appendTokenProgressSuffix(&out, summary.token_progress) catch return out.buffered();
     return out.buffered();
+}
+
+/// `Thought for 12s · 1,204 tokens`, the one line a finished reasoning block
+/// collapses to.
+fn formatReasoningSummaryLine(buf: []u8, elapsed_ms: u64, tokens: u64) []const u8 {
+    const seconds: i64 = @intCast(@min(elapsed_ms / std.time.ms_per_s, @as(u64, std.math.maxInt(i64))));
+    var out: std.Io.Writer = .fixed(buf);
+    out.writeAll("Thought for ") catch return "Thought";
+    activity_status.writeElapsed(&out, seconds) catch return out.buffered();
+    out.writeAll(" · ") catch return out.buffered();
+    full_transcript_metadata.writeCount(&out, tokens) catch return out.buffered();
+    out.print(" token{s}", .{if (tokens == 1) "" else "s"}) catch return out.buffered();
+    return out.buffered();
+}
+
+/// The dim block a reasoning entry holds: terminal-safe text with a single
+/// trailing newline. The caller owns the result.
+fn formatReasoningBlock(alloc: Allocator, text: []const u8) ![]u8 {
+    var end = text.len;
+    while (end > 0 and (text[end - 1] == '\n' or text[end - 1] == '\r')) end -= 1;
+    if (end == 0) return alloc.print("{s}{s}\n", .{ ui_render.dim_style, ui_render.reset_style });
+    return alloc.print("{s}{s}{s}\n", .{ ui_render.dim_style, text[0..end], ui_render.reset_style });
 }
 
 fn lifecycleEventTurnId(event: types.ToolLifecycleEvent) u64 {
@@ -4694,6 +4718,19 @@ pub const TranscriptNotebook = struct {
     command_output_display: CommandOutputDisplayState = .{},
     replaceable_last_line: bool = false,
     replaceable_start: usize = 0,
+    /// The turn whose reasoning is streaming right now, and the trailing
+    /// replaceable entry the stream grows in place.
+    reasoning_active_turn_id: u64 = 0,
+    reasoning_active_entry_id: ?u32 = null,
+    reasoning_active_started_ms: i64 = 0,
+    /// Terminal-safe display text of the current thinking phase.
+    reasoning_active_text: std.ArrayList(u8) = .empty,
+    /// The whole turn's reasoning, across phases, for the turn's saved
+    /// record when it commits.
+    reasoning_turn_id: u64 = 0,
+    reasoning_turn_text: std.ArrayList(u8) = .empty,
+    reasoning_turn_duration_ms: u64 = 0,
+    reasoning_turn_tokens: u64 = 0,
 };
 
 /// The fields of `TranscriptRuntime` that belong to one transcript rather than
@@ -5098,6 +5135,8 @@ pub const TranscriptRuntime = struct {
         self.notebook.command_output_blocks.deinit(alloc);
         for (self.notebook.entries.items) |*entry| entry.deinit(alloc);
         self.notebook.entries.deinit(alloc);
+        self.notebook.reasoning_active_text.deinit(alloc);
+        self.notebook.reasoning_turn_text.deinit(alloc);
         self.transcript_commit_state.deinit(alloc);
         self.footer_viewport.deinit(alloc);
         self.ui_observer.deinit(alloc);
@@ -5667,6 +5706,7 @@ pub const TranscriptRuntime = struct {
         }
         self.notebook.lifecycle_state.deinit(alloc);
         self.notebook.worker_status.reset();
+        self.clearTurnReasoning(alloc);
         self.clearToolDetails(alloc);
         return transcript_store.clearTranscript(self, alloc);
     }
@@ -7130,6 +7170,208 @@ pub const TranscriptRuntime = struct {
         self.markTranscriptContentDirtyFrom(entry_id);
         try self.syncTranscriptWindow(alloc);
         return entry_id;
+    }
+
+    /// Grows the trailing reasoning block with one chunk. The chunk is
+    /// displayed as visible text, so provider bytes cannot drive the
+    /// terminal.
+    pub fn appendReasoningDelta(self: *TranscriptRuntime, alloc: Allocator, turn_id: u64, delta: []const u8) !void {
+        if (delta.len == 0) return;
+        if (self.notebook.reasoning_turn_id != turn_id) {
+            self.clearTurnReasoning(alloc);
+            self.notebook.reasoning_turn_id = turn_id;
+            self.notebook.reasoning_active_turn_id = turn_id;
+            self.notebook.reasoning_active_text.clearRetainingCapacity();
+            self.notebook.reasoning_active_entry_id = null;
+            self.notebook.reasoning_active_started_ms = 0;
+        }
+        // The streaming block is re-rendered whole on each chunk, so it stops
+        // growing at the saved record's bound. A chunk is valid UTF-8 on its
+        // own, so a cut at its end never splits a character.
+        const room = types.ReasoningRecord.max_text_bytes -| self.notebook.reasoning_active_text.items.len;
+        if (room == 0) return;
+        const take = text_utils.utf8PrefixByBytes(delta, room);
+        if (take.len == 0) return;
+        try text_utils.appendTerminalSafeText(alloc, &self.notebook.reasoning_active_text, take);
+        try self.writeActiveReasoningBlock(alloc);
+    }
+
+    /// Ends the reasoning phase: the streaming block becomes the one-line
+    /// summary, and its full text moves to an entry that only Ctrl+O shows.
+    /// Every end of a thinking phase calls this before the next transcript
+    /// row lands, because only the trailing line can be replaced in place.
+    pub fn finalizeActiveReasoning(self: *TranscriptRuntime, alloc: Allocator, now_ms: i64) !void {
+        const active_text = self.notebook.reasoning_active_text.items;
+        if (active_text.len == 0) {
+            self.notebook.reasoning_active_entry_id = null;
+            return;
+        }
+        const started_ms = self.notebook.reasoning_active_started_ms;
+        const elapsed_ms: u64 = if (started_ms > 0 and now_ms >= started_ms)
+            @intCast(now_ms - started_ms)
+        else
+            0;
+        const tokens: u64 = @intCast(token_estimate.textTokens(active_text));
+
+        if (self.notebook.reasoning_turn_text.items.len > 0) {
+            try self.notebook.reasoning_turn_text.appendSlice(alloc, "\n\n");
+        }
+        try self.notebook.reasoning_turn_text.appendSlice(alloc, active_text);
+        self.notebook.reasoning_turn_duration_ms +|= elapsed_ms;
+        self.notebook.reasoning_turn_tokens +|= tokens;
+
+        var line_buf: [96]u8 = undefined;
+        const summary = formatReasoningSummaryLine(&line_buf, elapsed_ms, tokens);
+        const summary_row = try alloc.print("{s}{s}{s}\n", .{ ui_render.dim_style, summary, ui_render.reset_style });
+        defer alloc.free(summary_row);
+
+        var replaced = false;
+        if (self.notebook.reasoning_active_entry_id) |entry_id| {
+            if (transcript_store.replaceableEntryId(self) == entry_id) {
+                replaced = try transcript_store.replaceTrailingTranscriptLineSilent(self, alloc, summary_row);
+                if (replaced) {
+                    _ = self.setRawEntryClass(entry_id, .assistant_reasoning_summary);
+                    self.recomputeCursorFromTranscript();
+                    self.markTranscriptContentDirtyFrom(entry_id);
+                }
+            }
+        }
+        if (!replaced) {
+            // Another row took the tail first, so nothing can be replaced in
+            // place. The summary joins the block instead of being lost.
+            const owned = try alloc.dupe(u8, summary_row);
+            var handed_off = false;
+            errdefer if (!handed_off) alloc.free(owned);
+            const entry_id = try transcript_store.appendRawBytesEntryClassifiedAt(
+                self,
+                alloc,
+                owned,
+                .assistant_reasoning_summary,
+                now_ms,
+            );
+            handed_off = true;
+            self.markTranscriptContentDirtyFrom(entry_id);
+            try self.syncTranscriptWindow(alloc);
+        }
+
+        const full_row = try formatReasoningBlock(alloc, active_text);
+        const full_id = try transcript_store.appendHiddenRawBytesEntryClassifiedAt(
+            self,
+            alloc,
+            full_row,
+            .assistant_reasoning,
+            if (started_ms > 0) started_ms else now_ms,
+        );
+        self.markTranscriptContentDirtyFrom(full_id);
+        try self.syncTranscriptWindow(alloc);
+
+        self.notebook.replaceable_last_line = false;
+        self.notebook.replaceable_start = 0;
+        self.notebook.reasoning_active_entry_id = null;
+        self.notebook.reasoning_active_text.clearRetainingCapacity();
+        self.notebook.reasoning_active_started_ms = 0;
+    }
+
+    /// The committed turn's aggregate reasoning, or null when it never
+    /// thought. The caller owns the record.
+    pub fn peekTurnReasoning(self: *TranscriptRuntime, alloc: Allocator) !?types.ReasoningRecord {
+        const text = self.notebook.reasoning_turn_text.items;
+        if (text.len == 0) return null;
+        const clipped = if (text.len > types.ReasoningRecord.max_text_bytes)
+            text_utils.utf8PrefixByBytes(text, types.ReasoningRecord.max_text_bytes)
+        else
+            text;
+        return .{
+            .text = try alloc.dupe(u8, clipped),
+            .duration_ms = self.notebook.reasoning_turn_duration_ms,
+            .tokens = self.notebook.reasoning_turn_tokens,
+        };
+    }
+
+    pub fn clearTurnReasoning(self: *TranscriptRuntime, alloc: Allocator) void {
+        self.notebook.reasoning_active_text.clearAndFree(alloc);
+        self.notebook.reasoning_turn_text.clearAndFree(alloc);
+        self.notebook.reasoning_active_entry_id = null;
+        self.notebook.reasoning_active_started_ms = 0;
+        self.notebook.reasoning_active_turn_id = 0;
+        self.notebook.reasoning_turn_id = 0;
+        self.notebook.reasoning_turn_duration_ms = 0;
+        self.notebook.reasoning_turn_tokens = 0;
+    }
+
+    /// Replays a saved turn's reasoning: the summary row in place, its full
+    /// text in Ctrl+O only.
+    pub fn appendReasoningRecord(
+        self: *TranscriptRuntime,
+        alloc: Allocator,
+        record: types.ReasoningRecord,
+        created_at_ms: i64,
+    ) !void {
+        if (record.text.len == 0) return;
+        // Saved text is provider output as well, so it is cleaned here too
+        // before it reaches the terminal.
+        var safe: std.ArrayList(u8) = .empty;
+        defer safe.deinit(alloc);
+        try text_utils.appendTerminalSafeText(alloc, &safe, record.text);
+        var line_buf: [96]u8 = undefined;
+        const summary = formatReasoningSummaryLine(&line_buf, record.duration_ms, record.tokens);
+        const summary_row = try alloc.print("{s}{s}{s}\n", .{ ui_render.dim_style, summary, ui_render.reset_style });
+        errdefer alloc.free(summary_row);
+        const summary_id = try transcript_store.appendRawBytesEntryClassifiedAt(
+            self,
+            alloc,
+            summary_row,
+            .assistant_reasoning_summary,
+            created_at_ms,
+        );
+        self.markTranscriptContentDirtyFrom(summary_id);
+        const full_row = try formatReasoningBlock(alloc, safe.items);
+        errdefer alloc.free(full_row);
+        const full_id = try transcript_store.appendHiddenRawBytesEntryClassifiedAt(
+            self,
+            alloc,
+            full_row,
+            .assistant_reasoning,
+            created_at_ms,
+        );
+        self.markTranscriptContentDirtyFrom(full_id);
+        try self.syncTranscriptWindow(alloc);
+    }
+
+    fn writeActiveReasoningBlock(self: *TranscriptRuntime, alloc: Allocator) !void {
+        const block = try formatReasoningBlock(alloc, self.notebook.reasoning_active_text.items);
+        defer alloc.free(block);
+        if (self.notebook.reasoning_active_entry_id) |entry_id| {
+            if (transcript_store.replaceableEntryId(self) == entry_id and
+                try transcript_store.replaceTrailingTranscriptLineSilent(self, alloc, block))
+            {
+                _ = self.setRawEntryClass(entry_id, .assistant_reasoning);
+                self.recomputeCursorFromTranscript();
+                self.markTranscriptContentDirtyFrom(entry_id);
+                return;
+            }
+            // The block stopped being the tail, so it stays as it is and this
+            // phase continues in a new block after it.
+            self.notebook.reasoning_active_entry_id = null;
+        }
+
+        const start_row = self.transcriptCursorRow();
+        const entry_id = try transcript_store.appendReplaceableTranscriptLineSilentClassified(
+            self,
+            alloc,
+            block,
+            .assistant_reasoning,
+        );
+        _ = self.advanceCursor(block);
+        self.setReplaceableRow(start_row);
+        self.notebook.reasoning_active_entry_id = entry_id;
+        if (self.notebook.reasoning_active_started_ms <= 0) {
+            self.notebook.reasoning_active_started_ms = io_mod.milliTimestamp();
+        }
+        if (self.notebook.reasoning_active_turn_id == 0) {
+            self.notebook.reasoning_active_turn_id = self.notebook.reasoning_turn_id;
+        }
+        self.markTranscriptContentDirtyFrom(entry_id);
     }
 
     /// Hands retention to the transcript window: entries leave only when the

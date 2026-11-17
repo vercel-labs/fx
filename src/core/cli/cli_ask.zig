@@ -83,6 +83,7 @@ const subagent_child_state = @import("../subagent/child_state.zig");
 const subagent_model_contract = @import("../subagent/model_contract.zig");
 const subagent_usage = @import("../subagent/usage_ledger.zig");
 const text_utils = @import("../shared/text_utils.zig");
+const token_estimate = @import("../shared/token_estimate.zig");
 const test_builtin_gateway = if (std_builtin.is_test)
     @import("../../builtins/gateway.zig")
 else
@@ -319,6 +320,9 @@ pub const PromptRunResult = struct {
     /// with its Markdown intact; empty when absent. Unlike `final_output`, it
     /// never includes display-only text.
     final_source: []u8 = &.{},
+    /// Owned plaintext of everything the model thought during the run;
+    /// empty when it never reasoned or the provider hides reasoning.
+    reasoning: []u8 = &.{},
     interrupted: bool = false,
     /// The answer could not be written to stdout, or its reader went away;
     /// the turn was still saved.
@@ -345,6 +349,7 @@ pub const PromptRunResult = struct {
         alloc.free(self.assistant_output);
         if (self.final_output.len > 0) alloc.free(self.final_output);
         if (self.final_source.len > 0) alloc.free(self.final_source);
+        if (self.reasoning.len > 0) alloc.free(self.reasoning);
         if (self.model.len > 0) alloc.free(self.model);
         if (self.resolved_provider.len > 0) alloc.free(self.resolved_provider);
         if (self.session_id.len > 0) alloc.free(self.session_id);
@@ -702,6 +707,9 @@ const AskContext = struct {
     assistant_output: std.ArrayList(u8) = .empty,
     final_output: std.ArrayList(u8) = .empty,
     final_source: std.ArrayList(u8) = .empty,
+    /// Every reasoning chunk the provider streamed this run, in arrival
+    /// order. Captured in every output mode; only JSON prints it.
+    reasoning_output: std.ArrayList(u8) = .empty,
     tool_call_records: std.ArrayList(ToolCallRecord) = .empty,
     tool_call_records_mutex: std.Io.Mutex = .init,
     web_search_progress_mutex: std.Io.Mutex = .init,
@@ -867,6 +875,7 @@ const AskContext = struct {
         self.assistant_output.deinit(self.alloc);
         self.final_output.deinit(self.alloc);
         self.final_source.deinit(self.alloc);
+        self.reasoning_output.deinit(self.alloc);
         for (self.pending_tool_progress.items) |progress| progress.deinit(self.alloc);
         self.pending_tool_progress.deinit(self.alloc);
         for (self.deferred_tool_progress.items) |progress| self.alloc.free(progress);
@@ -2178,6 +2187,11 @@ fn takePromptRunResult(ctx: *AskContext, alloc: Allocator) !PromptRunResult {
     else
         @constCast(&.{});
     errdefer if (final_source.len > 0) alloc.free(final_source);
+    const reasoning: []u8 = if (ctx.reasoning_output.items.len > 0)
+        try alloc.dupe(u8, ctx.reasoning_output.items)
+    else
+        @constCast(&.{});
+    errdefer if (reasoning.len > 0) alloc.free(reasoning);
     const model = try alloc.dupe(u8, ctx.model);
     errdefer alloc.free(model);
     const resolved_provider: []u8 = if (ctx.resolved_provider) |provider|
@@ -2201,6 +2215,7 @@ fn takePromptRunResult(ctx: *AskContext, alloc: Allocator) !PromptRunResult {
         .assistant_output = assistant_output,
         .final_output = final_output,
         .final_source = final_source,
+        .reasoning = reasoning,
         .interrupted = ctx.processInterruptRequested(),
         .output_write_failed = ctx.output_write_failed,
         .output_reader_gone = ctx.output_reader_gone,
@@ -2272,6 +2287,7 @@ fn agentRuntimeDeps(ctx: *AskContext) agent_runtime.AgentRuntimeDeps {
         .propagate_grant = propagateGrant,
         .push_event = pushEvent,
         .push_text = pushText,
+        .push_reasoning_delta = pushReasoningDelta,
         .push_tool_lifecycle = pushToolLifecycle,
         .push_diff_block = pushDiffBlock,
         .push_system_notice = pushSystemNotice,
@@ -3180,6 +3196,7 @@ fn propagateHistoryTurn(raw_ctx: *anyopaque, turn: HistoryTurn) !void {
     var prepared = try ctx.session.prepareHistoryEntry(ctx.alloc, turn);
     var prepared_owned = true;
     defer if (prepared_owned) types.freeHistoryTurn(ctx.alloc, prepared);
+    try attachReasoningToHistory(ctx, &prepared);
     ctx.session_write_mutex.lockUncancelable(io_mod.getIo());
     defer ctx.session_write_mutex.unlock(io_mod.getIo());
     if (ctx.v2) |v2| {
@@ -3197,6 +3214,28 @@ fn propagateHistoryTurn(raw_ctx: *anyopaque, turn: HistoryTurn) !void {
     // Unsaved (`--no-save`, or no store): the turn stays in memory.
     ctx.session.commitPreparedHistoryEntry(ctx.alloc, prepared);
     prepared_owned = false;
+}
+
+/// The run's reasoning joins the turn it belongs to. A saved session then
+/// shows it again on resume, in the Ctrl+O transcript only.
+fn attachReasoningToHistory(ctx: *AskContext, turn: *HistoryTurn) !void {
+    switch (turn.*) {
+        .assistant, .interrupted => {},
+        .compacted_summary => return,
+    }
+    if (ctx.reasoning_output.items.len == 0) return;
+    if (types.historyTurnReasoning(turn.*) != null) return;
+    var safe: std.ArrayList(u8) = .empty;
+    defer safe.deinit(ctx.alloc);
+    try text_utils.appendTerminalSafeText(ctx.alloc, &safe, ctx.reasoning_output.items);
+    const clipped = text_utils.utf8PrefixByBytes(safe.items, types.ReasoningRecord.max_text_bytes);
+    if (clipped.len == 0) return;
+    const record = types.ReasoningRecord{
+        .text = try ctx.alloc.dupe(u8, clipped),
+        .duration_ms = if (types.historyTurnSummary(turn.*)) |summary| summary.thinking_duration_ms else 0,
+        .tokens = @intCast(token_estimate.textTokens(clipped)),
+    };
+    types.setHistoryTurnReasoning(turn, record);
 }
 
 fn commitContextCompaction(
@@ -3287,6 +3326,12 @@ fn pushEvent(raw_ctx: *anyopaque, event: WorkerEvent) !void {
         },
         else => {},
     }
+}
+
+fn pushReasoningDelta(raw_ctx: *anyopaque, delta: []const u8) !void {
+    if (delta.len == 0) return;
+    const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
+    try ctx.reasoning_output.appendSlice(ctx.alloc, delta);
 }
 
 fn pushText(raw_ctx: *anyopaque, emission: agent_runtime.TextEmission) !void {
@@ -4205,6 +4250,12 @@ fn renderFinalJsonResult(alloc: Allocator, result: PromptRunResult) ![]u8 {
     }
     try out.writer.writeAll("],\"usage\":");
     try writeUsageJson(&out.writer, result.usage);
+    // Present only when the model thought and its provider streamed the text,
+    // so a run without reasoning prints the same JSON as before the field.
+    if (result.reasoning.len > 0) {
+        try out.writer.writeAll(",\"reasoning\":");
+        try std.json.Stringify.value(result.reasoning, .{}, &out.writer);
+    }
     // Present only when a subagent did work, so a run without one prints the
     // same JSON as before the field existed. `name` is null only for a child
     // saved with no name (see `usage_ledger.Entry`).
@@ -9397,6 +9448,85 @@ test "CLI final source keeps only the completed response with its Markdown" {
     try deps.push_event(deps.ctx, .{ .finish_prompt = displayed });
     try std.testing.expectEqualStrings(draft, ctx.final_source.items);
     try std.testing.expect(std.mem.startsWith(u8, ctx.final_output.items, "Earlier candidate."));
+}
+
+test "CLI captures the model's reasoning for JSON, and plain output stays silent" {
+    const alloc = std.testing.allocator;
+    var stdout_capture: TestCapture = .{};
+    defer stdout_capture.deinit(alloc);
+    var stderr_capture: TestCapture = .{};
+    defer stderr_capture.deinit(alloc);
+    var ctx = AskContext.init(
+        alloc,
+        testConfig(),
+        testPromptRunDeps(&stdout_capture, &stderr_capture, testPresentKeyStartup),
+        "/tmp/workspace",
+    );
+    defer ctx.deinit();
+    ctx.output_mode = .json;
+    const deps = agentRuntimeDeps(&ctx);
+
+    try deps.push_reasoning_delta.?(deps.ctx, "weigh ");
+    try deps.push_reasoning_delta.?(deps.ctx, "it");
+    try deps.push_text(deps.ctx, .assistant_started);
+    try deps.push_text(deps.ctx, .{ .assistant_source = "answer" });
+    try deps.push_event(deps.ctx, .{ .finish_prompt = try types.dupeFinishedPrompt(std.heap.c_allocator, .{
+        .turn = .{ .assistant = .{
+            .user = .{ .text = @constCast("prompt") },
+            .assistant = @constCast("answer"),
+        } },
+        .terminal_outcome = .completed,
+    }) });
+
+    const result = try takePromptRunResult(&ctx, alloc);
+    defer result.deinit(alloc);
+    try std.testing.expectEqualStrings("weigh it", result.reasoning);
+    try std.testing.expectEqualStrings("answer", result.assistant_output);
+    try std.testing.expectEqualStrings("", stderr_capture.bytes.items);
+
+    const rendered = try renderFinalJsonResult(alloc, result);
+    defer alloc.free(rendered);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, rendered, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("weigh it", parsed.value.object.get("reasoning").?.string);
+
+    // A run that never reasoned keeps the older JSON shape: no key at all.
+    const quiet = PromptRunResult{
+        .exit_code = 0,
+        .assistant_output = try alloc.dupe(u8, "ok"),
+    };
+    defer quiet.deinit(alloc);
+    const quiet_json = try renderFinalJsonResult(alloc, quiet);
+    defer alloc.free(quiet_json);
+    try std.testing.expect(std.mem.find(u8, quiet_json, "\"reasoning\"") == null);
+}
+
+test "CLI reasoning joins the saved history turn" {
+    const alloc = std.testing.allocator;
+    var stdout_capture: TestCapture = .{};
+    defer stdout_capture.deinit(alloc);
+    var stderr_capture: TestCapture = .{};
+    defer stderr_capture.deinit(alloc);
+    var ctx = AskContext.init(
+        alloc,
+        testConfig(),
+        testPromptRunDeps(&stdout_capture, &stderr_capture, testPresentKeyStartup),
+        "/tmp/workspace",
+    );
+    defer ctx.deinit();
+    const deps = agentRuntimeDeps(&ctx);
+
+    try deps.push_reasoning_delta.?(deps.ctx, "weigh \x1b[31mit");
+    try deps.propagate_history_turn(deps.ctx, .{ .assistant = .{
+        .user = .{ .text = @constCast("prompt") },
+        .assistant = @constCast("answer"),
+    } });
+    try std.testing.expectEqual(@as(usize, 1), ctx.session.agent.history.items.len);
+    const record = ctx.session.agent.history.items[0].assistant.execution.reasoning.?;
+    // Saved text is display text, so provider escape bytes are neutralized.
+    try std.testing.expect(std.mem.find(u8, record.text, "\x1b[31m") == null);
+    try std.testing.expect(std.mem.find(u8, record.text, "weigh") != null);
+    try std.testing.expect(record.tokens > 0);
 }
 
 test "CLI command output completion terminates only an open display line" {

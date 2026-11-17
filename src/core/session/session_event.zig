@@ -191,6 +191,14 @@ pub const ConversationCheckpoint = struct {
     summary: []const u8,
 };
 
+/// The model's own words while it thought, for the transcript only. Never
+/// replayed to a provider and never part of the model's context.
+pub const ConversationReasoning = struct {
+    text: []const u8,
+    duration_ms: u64 = 0,
+    tokens: u64 = 0,
+};
+
 pub const ConversationEvent = union(enum) {
     user: ConversationUser,
     assistant: ConversationAssistant,
@@ -211,6 +219,10 @@ pub const ConversationEvent = union(enum) {
     /// session saves one, as its `model_call` item, which an older fx leaves
     /// out (D17).
     model_call: types.ModelCallRecord,
+    /// A turn's reasoning, for Ctrl+O and never for the model. Only a v2
+    /// session saves one, as its `reasoning` item, which an older fx leaves
+    /// out.
+    reasoning: ConversationReasoning,
 };
 
 pub const ConversationEnvelope = struct {
@@ -294,6 +306,7 @@ pub fn validateConversationTransition(
         .context_note => return rejectInvalidConversationEvent("context-note-v1"),
         .runtime_context => return rejectInvalidConversationEvent("runtime-context-v1"),
         .model_call => return rejectInvalidConversationEvent("model-call-v1"),
+        .reasoning => return rejectInvalidConversationEvent("reasoning-v1"),
     }
 }
 
@@ -362,6 +375,12 @@ pub fn validateConversationEventShape(event: ConversationEvent, schema_version: 
             for (value.messages) |text| try validateConversationText(text);
         },
         .model_call => |value| try validateModelCallRecord(value),
+        .reasoning => |value| {
+            try validateConversationText(value.text);
+            if (value.text.len > types.ReasoningRecord.max_text_bytes) {
+                return rejectInvalidConversationEvent("reasoning-size");
+            }
+        },
         .tool_call => |call| {
             try validateConversationIdentity(call.call_id);
             try validateConversationIdentity(call.tool_name);
@@ -557,7 +576,8 @@ pub fn decodeConversationFrameLeaky(
         return error.InvalidConversationFrame;
     // Every caller reads a v1 log, which never holds a context note or
     // runtime context; only a v2 session saves them (D93, D94).
-    if (value.event == .context_note or value.event == .runtime_context or value.event == .model_call) return error.InvalidConversationFrame;
+    if (value.event == .context_note or value.event == .runtime_context or
+        value.event == .model_call or value.event == .reasoning) return error.InvalidConversationFrame;
     return value;
 }
 
@@ -579,6 +599,7 @@ pub fn appendHistoryTurnConversationEvents(
                 .work_id = entry.user.work_id,
             } });
             try appendExecutionConversationEvents(alloc, events, entry.execution);
+            try appendReasoningConversationEvent(alloc, events, entry.execution);
             const follows_standalone = entry.execution.tool_steps.len > 0 and
                 entry.execution.tool_steps[entry.execution.tool_steps.len - 1].tool_calls.len == 0;
             if (entry.assistant.len > 0 or entry.provider_replay != null or follows_standalone) {
@@ -596,6 +617,7 @@ pub fn appendHistoryTurnConversationEvents(
                 .work_id = entry.user.work_id,
             } });
             try appendExecutionConversationEvents(alloc, events, entry.execution);
+            try appendReasoningConversationEvent(alloc, events, entry.execution);
             if (entry.tool_call) |call| {
                 if (entry.execution.tool_steps.len > 0 and
                     entry.execution.tool_steps[entry.execution.tool_steps.len - 1].tool_calls.len == 0)
@@ -651,6 +673,21 @@ fn interruptedCommandReplayBytes(
         .available => |descriptor| @intCast(descriptor.framed_bytes),
         .unavailable => null,
     };
+}
+
+/// A turn's reasoning, once, before its answer. A turn that never thought
+/// saves none.
+fn appendReasoningConversationEvent(
+    alloc: Allocator,
+    events: *std.ArrayList(ConversationEvent),
+    execution: types.ExecutionMemory,
+) !void {
+    const record = execution.reasoning orelse return;
+    try events.append(alloc, .{ .reasoning = .{
+        .text = record.text,
+        .duration_ms = record.duration_ms,
+        .tokens = record.tokens,
+    } });
 }
 
 pub fn appendExecutionConversationEvents(
@@ -2208,6 +2245,38 @@ test "session event kind contract contains exactly ten stable variants" {
     try std.testing.expectEqualStrings("state_replacement_committed", @tagName(Kind.state_replacement_committed));
 }
 
+test "reasoning shape is bounded and v1 frames never carry it" {
+    const alloc = std.testing.allocator;
+    try validateConversationEventShape(.{ .reasoning = .{
+        .text = "weigh it",
+        .duration_ms = 900,
+        .tokens = 4,
+    } }, 1);
+    try std.testing.expectError(
+        error.InvalidConversationEvent,
+        validateConversationEventShape(.{ .reasoning = .{ .text = "" } }, 1),
+    );
+    const too_big = try alloc.alloc(u8, types.ReasoningRecord.max_text_bytes + 1);
+    defer alloc.free(too_big);
+    @memset(too_big, 'a');
+    try std.testing.expectError(
+        error.InvalidConversationEvent,
+        validateConversationEventShape(.{ .reasoning = .{ .text = too_big } }, 3),
+    );
+
+    // Only a v2 session saves one, so the v1 frame reader refuses it.
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    try std.testing.expectError(
+        error.InvalidConversationFrame,
+        decodeConversationFrameLeaky(
+            arena.allocator(),
+            "{\"schema_version\":1,\"seq\":1,\"timestamp_ms\":0,\"event\":{\"reasoning\":{\"text\":\"a\"}}}\n",
+            .alloc_always,
+        ),
+    );
+}
+
 test "event frame codec is deterministic and validates contiguous sequence and generation" {
     const alloc = std.testing.allocator;
     const generation = identifier(0x10);
@@ -3322,6 +3391,8 @@ test "conversation frame decoder stays bounded under fuzzed bytes" {
             "{}\n",
             "{\"schema_version\":1}\n",
             "{\"schema_version\":1,\"seq\":1,\"timestamp_ms\":0,\"event\":{\"assistant\":{\"text\":\"ok\"}}}\n",
+            // A turn's reasoning item, so mutations reach its shape checks.
+            "{\"schema_version\":2,\"seq\":1,\"timestamp_ms\":1,\"event\":{\"reasoning\":{\"text\":\"weigh it\",\"duration_ms\":900,\"tokens\":4}}}\n",
             // An edit's result with full-diff rows, so mutations reach their parsing.
             "{\"schema_version\":3,\"seq\":1,\"timestamp_ms\":1,\"event\":{\"tool_result\":{\"call_id\":\"call-edit\",\"tool_name\":\"edit_file\"," ++
                 "\"status\":\"success\",\"artifact_ref\":\"result.txt\",\"stored_bytes\":0,\"completeness\":\"complete\"," ++

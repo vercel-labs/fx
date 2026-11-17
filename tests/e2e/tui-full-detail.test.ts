@@ -36,6 +36,23 @@ function textReply(text: string, input: number, output: number, gen: string): Re
   return fakeGatewaySse([{ type: "text-delta", id: "answer_1", delta: text }, finish("stop", input, output, gen)]);
 }
 
+/// A reply that thinks first, then streams its answer.
+function thinkingReply(thought: string, text: string, gen: string): Response {
+  return fakeGatewaySse([
+    { type: "reasoning-start", id: "reasoning_1" },
+    { type: "reasoning-delta", id: "reasoning_1", delta: thought },
+    { type: "reasoning-end", id: "reasoning_1" },
+    { type: "text-start", id: "answer_1" },
+    { type: "text-delta", id: "answer_1", delta: text },
+    finish("stop", 41, 6, gen),
+  ]);
+}
+
+/// Rows or wrapped rows joined into one line for phrase checks.
+function oneLine(rows: string[]): string {
+  return rows.join(" ").replace(/\s+/g, " ");
+}
+
 function shellStep(text: string, id: string, command: string, input: number, output: number, gen: string): Response {
   return fakeGatewaySse([
     { type: "text-delta", id: "answer_1", delta: text },
@@ -235,6 +252,35 @@ describe("Ctrl+O full detail", () => {
       for (const [index, row] of resumedTimes.entries()) {
         expect(Math.abs(secondsOf(row) - secondsOf(liveTimes[index]!))).toBeLessThanOrEqual(2);
       }
+    } finally {
+      await session?.kill();
+      env.cleanup();
+    }
+  }, 120_000);
+
+  test.skipIf(!tmuxAvailable())("a reply's thought stays inline as its one-line summary and shows whole in the full transcript, live and after a resume", async () => {
+    const thought = "THOUGHT_BEFORE_ANSWER: two candidate files, the second matches.";
+    const env = setup([thinkingReply(thought, "Answer after thought.", genId(9))]);
+    let session: Session | undefined;
+    try {
+      session = await start(binary, env.workspace, env.env);
+      await ask(session, "Think before answering", "Answer after thought.");
+      const inlinePane = await session.capturePane();
+      expect(inlinePane).toMatch(/Thought for \d+s/);
+      expect(inlinePane).not.toContain("THOUGHT_BEFORE_ANSWER");
+
+      const live = await fullDetail(session);
+      expect(oneLine(live)).toContain(thought);
+      expect(live.join("\n")).not.toMatch(/Thought for \d+s/);
+      expectInOrder(live, [["Think before answering"], ["THOUGHT_BEFORE_ANSWER"], ["Answer after thought."]]);
+
+      await session.kill();
+      session = await start(`${binary} --resume ${onlySessionId(env.home)}`, env.workspace, env.env);
+      await session.waitForText("Answer after thought.", TIMEOUT);
+      const resumed = await fullDetail(session);
+      expect(oneLine(resumed)).toContain(thought);
+      expect(resumed.join("\n")).not.toMatch(/Thought for \d+s/);
+      expectInOrder(resumed, [["Think before answering"], ["THOUGHT_BEFORE_ANSWER"], ["Answer after thought."]]);
     } finally {
       await session?.kill();
       env.cleanup();

@@ -394,6 +394,57 @@ describe("fx ask presentation", () => {
     expect(result.stderr).toContain("Reading fixture.txt");
   }, TIMEOUT);
 
+  test("JSON carries the model's thinking and plain stdout does not", async () => {
+    const root = createRoot();
+    const thought = "THINKING_BEFORE_ANSWER: weighing the two options.";
+    const final = "Answered after thinking.";
+    const thinkingReply = () =>
+      fakeGatewaySse([
+        { type: "reasoning-start", id: "reasoning_1" },
+        { type: "reasoning-delta", id: "reasoning_1", delta: thought },
+        { type: "reasoning-end", id: "reasoning_1" },
+        { type: "text-delta", id: "answer_1", delta: final },
+        { type: "finish", finishReason: { unified: "stop", raw: "stop" } },
+      ]);
+
+    const jsonGateway = startFakeGateway([thinkingReply()]);
+    gateways.push(jsonGateway);
+    const json = await runFx(["ask", "--json", "--no-save", "Think it through."], {
+      cwd: root.workspace,
+      env: gatewayEnv(root.home, jsonGateway),
+      timeoutMs: TIMEOUT,
+    });
+    expect(json.code).toBe(0);
+    expect(json.stderr).toBe("");
+    const output = JSON.parse(json.stdout) as { final_output: string; reasoning?: string };
+    expect(output.final_output).toBe(final);
+    expect(output.reasoning).toBe(thought);
+
+    const plainGateway = startFakeGateway([thinkingReply()]);
+    gateways.push(plainGateway);
+    const plain = await runFx(["ask", "--no-save", "Think it through."], {
+      cwd: root.workspace,
+      env: gatewayEnv(root.home, plainGateway),
+      timeoutMs: TIMEOUT,
+    });
+    expect(plain.code).toBe(0);
+    expect(plain.stderr).toBe("");
+    expect(plain.stdout.trim()).toBe(final);
+    expect(plain.stdout).not.toContain(thought);
+
+    // A reply without thinking keeps the key out, so old JSON stays byte-exact.
+    const quietGateway = startFakeGateway([fakeGatewayFinalText("Plain answer.")]);
+    gateways.push(quietGateway);
+    const quiet = await runFx(["ask", "--json", "--no-save", "Answer plainly."], {
+      cwd: root.workspace,
+      env: gatewayEnv(root.home, quietGateway),
+      timeoutMs: TIMEOUT,
+    });
+    expect(quiet.code).toBe(0);
+    expect(JSON.parse(quiet.stdout)).not.toHaveProperty("reasoning");
+    expect(quiet.stdout).not.toContain('"reasoning"');
+  }, TIMEOUT);
+
   test("tool recovery keeps progress updates ordered before the final response", async () => {
     const root = createRoot();
     writeFileSync(join(root.workspace, "fallback.txt"), "fallback contents\n");

@@ -2137,6 +2137,28 @@ pub fn appendRawBytesEntryClassifiedAt(
     return entry_id;
 }
 
+/// Appends a raw entry that only the full transcript shows. It never enters
+/// the compact byte cache, so the inline transcript stays clear of it; Ctrl+O
+/// renders it from the entries. The entry owns `bytes`.
+pub fn appendHiddenRawBytesEntryClassifiedAt(
+    self: anytype,
+    alloc: Allocator,
+    bytes: []const u8,
+    class: RawEntryClass,
+    created_at_ms: i64,
+) !u32 {
+    const entry_id = self.notebook.next_entry_id;
+    self.notebook.next_entry_id +%= 1;
+    try self.notebook.entries.append(alloc, .{ .raw_bytes = .{
+        .id = entry_id,
+        .created_at_ms = created_at_ms,
+        .bytes = bytes,
+        .class = class,
+        .inline_hidden = true,
+    } });
+    return entry_id;
+}
+
 pub fn insertRawBytesEntryClassifiedAfter(
     self: anytype,
     alloc: Allocator,
@@ -2805,7 +2827,7 @@ fn finalizedPublicationEntry(self: anytype, next: anytype, entry: TranscriptEntr
     return switch (entry) {
         .raw_bytes => |raw| !raw.inline_hidden and !raw.lifecycle_pinned and switch (raw.class) {
             .tool_status, .command_output, .subagent_status, .welcome => false,
-            .turn_summary, .diff_block, .question_resolution, .turn_cancellation, .unknown_raw => true,
+            .turn_summary, .diff_block, .question_resolution, .turn_cancellation, .assistant_reasoning, .assistant_reasoning_summary, .unknown_raw => true,
         },
         .semantic_notice => |notice| !notice.inline_hidden and !notice.pending_replacement,
         .assistant_turn => |assistant| !assistant.inline_hidden and
@@ -3018,6 +3040,8 @@ fn themeOwnsRawEntry(class: RawEntryClass) bool {
         .question_resolution,
         .turn_cancellation,
         .subagent_status,
+        .assistant_reasoning,
+        .assistant_reasoning_summary,
         => true,
         .command_output, .unknown_raw => false,
     };

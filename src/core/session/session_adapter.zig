@@ -5269,6 +5269,7 @@ noinline fn replay(
                         .steering => |value| try builder.appendSteering(value.text),
                         .context_note => |value| try builder.appendContextNote(value.text, value.sources),
                         .runtime_context => |value| try builder.setRuntimeContext(value.messages),
+                        .reasoning => |value| try builder.appendReasoning(value),
                         .turn_completed => |value| try sink.turn(try presentStoredResults(src, alloc, try builder.finishAssistant(value)), lastStarted(entry)),
                         .interrupted => |value| {
                             interrupted_item = true;
@@ -5859,6 +5860,7 @@ fn itemType(kind: PieceKind) ?[]const u8 {
         .context_note => "context_note",
         .runtime_context => "runtime_context",
         .model_call => "model_call",
+        .reasoning => "reasoning",
     };
 }
 
@@ -5964,6 +5966,8 @@ test "v2 conversation pieces stay bounded under fuzzed bytes" {
             "{\"text\":\"n\",\"sources\":[{\"path\":\"\",\"stamp\":0}]}",
             "{\"messages\":[\"<fx-turn-context>\\ngit_branch: main\\n</fx-turn-context>\",\"Runtime context: permission mode is auto.\"]}",
             "{\"messages\":[]}",
+            // A turn's reasoning piece, as v2 writes it.
+            "{\"text\":\"weigh it\",\"duration_ms\":900,\"tokens\":4}",
             // Model call records: as fx writes one, one with a newer fx's
             // extra field, and ones whose provider text must be refused.
             "{\"at_ms\":1762300000000,\"elapsed_ms\":2140,\"purpose\":\"turn\",\"outcome\":\"completed\",\"provider\":\"gateway\",\"model\":\"anthropic/claude-opus-4.8\",\"served_by\":null,\"generation_id\":\"gen_01JC7P5XQ2M8VZ000000000001\",\"finish\":\"stop\",\"failure\":null,\"retry_after_s\":null,\"input_tokens\":1204,\"output_tokens\":188,\"after_tool_step_count\":0}",
@@ -6318,6 +6322,35 @@ test "a new session commits turns, and resume gives them back with its settings"
     var st = try r.handle.state(testing.allocator);
     defer st.deinit(testing.allocator);
     try testing.expectEqualStrings("\"first question\"", st.title.?);
+}
+
+test "a committed turn's reasoning comes back through a resume" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var model = "reasoning-model".*;
+    const s = try Session.create(testing.allocator, &t.store, "/w", .ask, testSeed(&model));
+    const reasoning = types.ReasoningRecord{
+        .text = @constCast("weigh the options\nand check"),
+        .duration_ms = 12_000,
+        .tokens = 21,
+    };
+    var turn = assistantTurn("first question", "first answer");
+    turn.assistant.execution.reasoning = reasoning;
+    try s.commitTurn(turn, types.ConversationLanguage.default());
+    const id = try testing.allocator.dupe(u8, s.id());
+    defer testing.allocator.free(id);
+    s.close();
+
+    const r = try Session.resumeSession(testing.allocator, &t.store, .{ .id = id }, "/w", .ask);
+    defer r.close();
+    var restored = try r.restore(testing.allocator);
+    defer restored.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 1), restored.history.len);
+    const record = restored.history[0].assistant.execution.reasoning.?;
+    try testing.expectEqualStrings("weigh the options\nand check", record.text);
+    try testing.expectEqual(@as(u64, 12_000), record.duration_ms);
+    try testing.expectEqual(@as(u64, 21), record.tokens);
 }
 
 test "a result the model saw whole comes back whole after a resume, or says its body is unavailable" {

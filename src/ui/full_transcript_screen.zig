@@ -5867,6 +5867,7 @@ const ProjectionComposeContext = struct {
     ) bool {
         const self = fromOpaque(context);
         self.entry_index = entry_index;
+        if (entry == .raw_bytes and entry.raw_bytes.class == .assistant_reasoning_summary) return true;
         if (self.entryAction(entry) == .hide) return true;
         if (self.source_index.renderableCommandBlockIndexForEntry(entry.id()) != null) return false;
         if (self.source_index.commandSourceOwned(entry.id())) return true;

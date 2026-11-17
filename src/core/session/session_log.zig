@@ -162,7 +162,7 @@ const ReplayState = struct {
             .interrupted => self.clearPendingToolCalls(),
             .user, .assistant, .steering, .turn_completed => {},
             // Only a v2 session saves a context note or runtime context (D93, D94).
-            .context_note, .runtime_context, .model_call => return error.InvalidConversationFrame,
+            .context_note, .runtime_context, .model_call, .reasoning => return error.InvalidConversationFrame,
         }
         self.last_seq = seq;
         self.turn_open = turn_open;
@@ -177,7 +177,7 @@ fn nextConversationTurnOpen(open: bool, event: session_event.ConversationEvent) 
         .context_checkpoint => open,
         // v1 logs never hold a context note or runtime context; only a v2
         // session saves them (D93, D94). Every v1 reader below refuses both.
-        .context_note, .runtime_context, .model_call => error.InvalidConversationFrame,
+        .context_note, .runtime_context, .model_call, .reasoning => error.InvalidConversationFrame,
     };
 }
 
@@ -887,7 +887,7 @@ fn replayConversationHistory(
             .tool_call => |value| try turn.appendToolCall(value),
             .tool_result => |value| try turn.appendToolResult(value),
             .steering => |value| try turn.appendSteering(value.text),
-            .context_note, .runtime_context, .model_call => return error.InvalidConversationFrame,
+            .context_note, .runtime_context, .model_call, .reasoning => return error.InvalidConversationFrame,
             .turn_completed => |value| {
                 const completed = try turn.finishAssistant(value);
                 checkpoint_turn_open = false;
@@ -979,7 +979,7 @@ const ConversationHistoryReader = struct {
                     try self.builder.appendSteering(value.text);
                     break :blk null;
                 },
-                .context_note, .runtime_context, .model_call => return error.InvalidConversationFrame,
+                .context_note, .runtime_context, .model_call, .reasoning => return error.InvalidConversationFrame,
                 .turn_completed => |value| try self.builder.finishAssistant(value),
                 .interrupted => |value| try self.builder.finishInterrupted(value),
                 .context_checkpoint => blk: {
@@ -1084,7 +1084,7 @@ fn load_conversation_archive_from_source(
                 try builder.appendSteering(value.text);
                 break :blk null;
             },
-            .context_note, .runtime_context, .model_call => return error.InvalidConversationFrame,
+            .context_note, .runtime_context, .model_call, .reasoning => return error.InvalidConversationFrame,
             .turn_completed => |value| try builder.finishAssistant(value),
             .interrupted => |value| try builder.finishInterrupted(value),
             .context_checkpoint => |value| blk: {
@@ -1159,7 +1159,7 @@ const ConversationReplayScan = struct {
                     .coverage = checkpoint.covers_through_seq,
                 };
             },
-            .context_note, .runtime_context, .model_call => return error.InvalidConversationFrame,
+            .context_note, .runtime_context, .model_call, .reasoning => return error.InvalidConversationFrame,
             else => {},
         }
     }
@@ -1226,6 +1226,8 @@ pub const ConversationTurnBuilder = struct {
     runtime_context: ?[][]u8 = null,
     model_calls: std.ArrayList(types.ModelCallRecord) = .empty,
     bridge_calls: std.ArrayList(types.BridgeCallRecord) = .empty,
+    /// The turn's reasoning, one piece per turn, for Ctrl+O only.
+    pending_reasoning: ?types.ReasoningRecord = null,
 
     pub fn init(alloc: Allocator) ConversationTurnBuilder {
         return .{ .alloc = alloc };
@@ -1258,7 +1260,22 @@ pub const ConversationTurnBuilder = struct {
         self.model_calls.deinit(self.alloc);
         for (self.bridge_calls.items) |record| types.freeBridgeCallRecordStrings(self.alloc, record);
         self.bridge_calls.deinit(self.alloc);
+        if (self.pending_reasoning) |record| types.freeReasoningRecord(self.alloc, record);
         self.* = undefined;
+    }
+
+    /// Keeps the turn's reasoning. One piece covers the whole turn, so a
+    /// second piece for the same turn is invalid.
+    pub fn appendReasoning(self: *ConversationTurnBuilder, value: session_event.ConversationReasoning) !void {
+        if (self.user == null or self.pending_reasoning != null or value.text.len == 0) {
+            return error.InvalidConversationFrame;
+        }
+        const text = try self.alloc.dupe(u8, value.text);
+        self.pending_reasoning = .{
+            .text = text,
+            .duration_ms = value.duration_ms,
+            .tokens = value.tokens,
+        };
     }
 
     /// Keeps a settled call's record with the turn. A record before the
@@ -1288,7 +1305,8 @@ pub const ConversationTurnBuilder = struct {
             self.steps.items.len == 0 and
             self.steering.items.len == 0 and
             self.context_notes.items.len == 0 and
-            self.runtime_context == null;
+            self.runtime_context == null and
+            self.pending_reasoning == null;
     }
 
     pub fn begin(
@@ -1606,6 +1624,8 @@ pub const ConversationTurnBuilder = struct {
         const bridge_calls = try self.bridge_calls.toOwnedSlice(self.alloc);
         const runtime_context = self.runtime_context;
         self.runtime_context = null;
+        const reasoning = self.pending_reasoning;
+        self.pending_reasoning = null;
         return .{
             .tool_steps = steps,
             .files = files,
@@ -1615,9 +1635,47 @@ pub const ConversationTurnBuilder = struct {
             .turn_summary = turn_summary,
             .model_calls = model_calls,
             .bridge_calls = bridge_calls,
+            .reasoning = reasoning,
         };
     }
 };
+
+test "a turn's reasoning joins its execution once and keeps its own copy" {
+    const alloc = std.testing.allocator;
+    var builder = ConversationTurnBuilder.init(alloc);
+    defer builder.deinit();
+    try builder.begin(.{ .text = "question" });
+    try builder.appendReasoning(.{ .text = "weigh it\n", .duration_ms = 900, .tokens = 4 });
+    try std.testing.expectError(
+        error.InvalidConversationFrame,
+        builder.appendReasoning(.{ .text = "second piece" }),
+    );
+    try builder.appendAssistant(.{ .text = "answer" });
+    const turn = try builder.finishAssistant(.{});
+    defer types.freeHistoryTurn(alloc, turn);
+    const reasoning = turn.assistant.execution.reasoning.?;
+    try std.testing.expectEqualStrings("weigh it\n", reasoning.text);
+    try std.testing.expectEqual(@as(u64, 900), reasoning.duration_ms);
+    try std.testing.expectEqual(@as(u64, 4), reasoning.tokens);
+
+    // A turn that never thought keeps the older execution: no reasoning.
+    var plain = ConversationTurnBuilder.init(alloc);
+    defer plain.deinit();
+    try plain.begin(.{ .text = "question" });
+    try plain.appendAssistant(.{ .text = "answer" });
+    const plain_turn = try plain.finishAssistant(.{});
+    defer types.freeHistoryTurn(alloc, plain_turn);
+    try std.testing.expect(plain_turn.assistant.execution.reasoning == null);
+
+    // The interrupted path carries it too.
+    var stopped = ConversationTurnBuilder.init(alloc);
+    defer stopped.deinit();
+    try stopped.begin(.{ .text = "question" });
+    try stopped.appendReasoning(.{ .text = "thinking", .duration_ms = 10, .tokens = 1 });
+    const stopped_turn = try stopped.finishInterrupted(.{ .reason = .cancelled });
+    defer types.freeHistoryTurn(alloc, stopped_turn);
+    try std.testing.expectEqualStrings("thinking", stopped_turn.interrupted.execution.reasoning.?.text);
+}
 
 test "conversation replay keeps reasoning-only assistant units before the final reply" {
     const alloc = std.testing.allocator;

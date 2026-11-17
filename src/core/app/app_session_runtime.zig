@@ -2136,13 +2136,31 @@ pub fn Runtime(comptime App: type) type {
             if (finished.summary) |summary| {
                 types.setHistoryTurnSummary(&turn, summary);
             }
-            _ = try appendHistoryTurnWithPendingPresentation(
+            // The turn keeps the reasoning its transcript showed, so a resume
+            // can show it again. The prepared entry copies it, and this turn's
+            // transcript forgets it only once the commit lands.
+            var reasoning: ?types.ReasoningRecord = null;
+            defer if (reasoning) |record| types.freeReasoningRecord(app.alloc, record);
+            if (types.historyTurnReasoning(turn) == null and
+                comptime @hasField(App, "shell") and
+                    @hasDecl(@TypeOf(app.shell), "peekTurnReasoning"))
+            {
+                reasoning = try app.shell.peekTurnReasoning(app.alloc);
+                types.setHistoryTurnReasoning(&turn, reasoning);
+            }
+            const outcome = try appendHistoryTurnWithPendingPresentation(
                 app,
                 agent,
                 turn,
                 .finished_prompt,
                 finished.snapshot_file_ownership,
             );
+            if (outcome == .committed and reasoning != null and
+                comptime @hasField(App, "shell") and
+                    @hasDecl(@TypeOf(app.shell), "clearTurnReasoning"))
+            {
+                app.shell.clearTurnReasoning(app.alloc);
+            }
             if (comptime agents.hasAgentField(App, "child_run")) {
                 @import("app_agents_runtime.zig").Runtime(App).commitChildTurn(app, agent, finished);
             }
@@ -2950,6 +2968,18 @@ pub fn Runtime(comptime App: type) type {
                     }
                 }
 
+                fn appendReasoning(self: *Self, record: types.ReasoningRecord) !void {
+                    if (comptime @hasField(SinkApp, "shell")) {
+                        if (comptime @hasDecl(@TypeOf(self.app.shell), "appendReasoningRecord")) {
+                            try self.app.shell.appendReasoningRecord(
+                                self.app.alloc,
+                                record,
+                                io_mod.milliTimestamp(),
+                            );
+                        }
+                    }
+                }
+
                 fn appendUserTurn(self: *Self, user: types.UserTurn, has_prior_turns: bool) !void {
                     try self.app.writeUserPromptCardWithSpacing(user, has_prior_turns);
                 }
@@ -3257,6 +3287,10 @@ pub fn Runtime(comptime App: type) type {
 
                 fn appendTurnSummary(self: *Self, summary: types.TurnSummary) !void {
                     try self.projection.appendTurnSummary(summary);
+                }
+
+                fn appendReasoning(self: *Self, record: types.ReasoningRecord) !void {
+                    try self.projection.appendReasoning(record);
                 }
 
                 fn appendUserTurn(self: *Self, user: types.UserTurn, _: bool) !void {
@@ -3950,6 +3984,9 @@ pub fn Runtime(comptime App: type) type {
                         try appendHistoryUserTurn(sink, entry.user, has_prior_turns.*);
                         has_prior_turns.* = true;
                         try writeExecutionHistoryToSink(app, agent, sink, entry.execution, labels);
+                        if (entry.execution.reasoning) |reasoning| {
+                            try sink.appendReasoning(reasoning);
+                        }
                         if (entry.execution.turn_summary) |summary| {
                             sink.setCreatedAtMs(summary.completed_at_ms);
                         }
@@ -3968,6 +4005,9 @@ pub fn Runtime(comptime App: type) type {
                         try appendHistoryUserTurn(sink, entry.user, has_prior_turns.*);
                         has_prior_turns.* = true;
                         try writeExecutionHistoryToSink(app, agent, sink, entry.execution, labels);
+                        if (entry.execution.reasoning) |reasoning| {
+                            try sink.appendReasoning(reasoning);
+                        }
                         if (entry.execution.turn_summary) |summary| {
                             sink.setCreatedAtMs(summary.completed_at_ms);
                         }

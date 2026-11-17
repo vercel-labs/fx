@@ -3477,7 +3477,7 @@ test "app direct ask delivers semantic presentation through the runtime sink" {
                 semantic_events[semantic_event_count] = .thematic_rule;
                 semantic_event_count += 1;
             },
-            .text, .attempt_start, .attempt_restart => {},
+            .text, .attempt_start, .attempt_restart, .reasoning_delta => {},
         },
         else => {},
     };
