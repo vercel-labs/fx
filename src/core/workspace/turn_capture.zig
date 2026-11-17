@@ -390,22 +390,12 @@ fn traceReachSkipped(context: Context, tool: []const u8, reason: []const u8) voi
 }
 
 /// Whether a repository at `root` is never captured, the session's own or
-/// one a tool reaches: the filesystem root, or a root that is one of `homes` or an ancestor of
-/// one, such as a home folder kept as a dotfiles repository. Each home is
-/// compared by its real path; an unset or unresolvable one is skipped.
+/// one a tool reaches, by the store's own rule (`capture_store.isPrivateRoot`).
+/// Out of memory counts as private, so the capture is skipped.
 fn isPrivateRoot(root: []const u8, homes: []const ?[]const u8) bool {
-    if (std.mem.eql(u8, std.mem.trimEnd(u8, root, "/"), "")) return true;
-    for (homes) |maybe| {
-        const home = maybe orelse continue;
-        if (home.len == 0) continue;
-        const real = io_mod.realpathAlloc(std.heap.c_allocator, home) catch |err| {
-            keepCancel(err);
-            continue;
-        };
-        defer std.heap.c_allocator.free(real);
-        if (capture_store.isWithin(root, real)) return true;
-    }
-    return false;
+    var arena_state = std.heap.ArenaAllocator.init(std.heap.c_allocator);
+    defer arena_state.deinit();
+    return capture_store.isPrivateRoot(arena_state.allocator(), root, homes) catch true;
 }
 
 /// The session ids whose captures one fork copies, source first.
@@ -648,20 +638,14 @@ fn runCapture(arena: Allocator, cancel: ?*const std.atomic.Value(bool), request_
 fn worktreeRoot(dir: []const u8) ?[]u8 {
     if (!std.Io.Dir.path.isAbsolute(dir)) return null;
     const found = (repo_root.find(std.heap.c_allocator, dir) catch |err| {
-        keepCancel(err);
+        capture_store.keepCancel(io_mod.getIo(), err);
         return null;
     }) orelse return null;
     defer std.heap.c_allocator.free(found.git_dir);
     return io_mod.realpathAlloc(std.heap.c_allocator, found.root) catch |err| {
-        keepCancel(err);
+        capture_store.keepCancel(io_mod.getIo(), err);
         return null;
     };
-}
-
-/// Hands a cancel a helper swallowed back to the calling task, so its next
-/// step sees it.
-fn keepCancel(err: anyerror) void {
-    if (err == error.Canceled) io_mod.getIo().recancel();
 }
 
 /// What `admitCapture` checks for one capture.
