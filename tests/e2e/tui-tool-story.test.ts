@@ -68,6 +68,55 @@ const REPEATS: StoryStep[] = [
   { at: 6, text: "The tests pass on the third run." },
 ];
 
+// Two shell requests the tool refuses before running anything, as a model
+// sends them, then the fixed request, which runs the same steps.
+const REFUSED_REQUESTS: StoryStep[] = [
+  {
+    at: 0,
+    calls: [{
+      name: "shell",
+      input: {
+        command: "ls -l . 2>/dev/null && printf ok | head -1",
+        profile: "clean",
+        tty: true,
+        shell: { kind: "executable", path: "/bin/sh", clean_start: true },
+      },
+    }],
+  },
+  {
+    at: 1,
+    calls: [{
+      name: "shell",
+      input: {
+        command: "ls -l .; printf ok | head -1",
+        shell: { kind: "executable", path: "/bin/sh", clean_start: true },
+      },
+    }],
+  },
+  { at: 2, calls: [sh("ls -l .; printf ok | head -1")] },
+  { at: 3, text: "The folder is listed." },
+];
+
+// A turn that ends on a request the shell refused, which the model never
+// fixed.
+const REFUSED_LAST: StoryStep[] = [
+  { at: 0, calls: [sh("printf done")] },
+  { at: 1, calls: [REFUSED_REQUESTS[0].calls![0]] },
+  { at: 2, text: "I could not list the folder." },
+];
+
+// A command whose here-document holds an apostrophe, which is no shell quote.
+const HERE_DOCUMENT: StoryStep[] = [
+  { at: 0, calls: [sh("cat > notes.md <<'EOF'\nThe model's notes\nEOF\nwc -l notes.md")] },
+  { at: 1, text: "The notes are saved." },
+];
+
+// A command that prints code naming an error, then fails on its own.
+const PRINTED_CODE_THEN_FAILED: StoryStep[] = [
+  { at: 0, calls: [sh("printf 'const error_code = 1;\\nroot.get(\"error\")\\n'; ls missing-file")] },
+  { at: 1, text: "The file is missing." },
+];
+
 const SUBAGENTS: StoryStep[] = [
   {
     at: 0,
@@ -285,6 +334,9 @@ test.skipIf(!tmuxAvailable())(
       expect(message).toBeGreaterThan(0);
       // The first read keeps its own row, without the later one.
       expect(lines.slice(0, message)).toContain("├ Read README.md");
+      // The failed edit names its file, also when the saved session is
+      // read back.
+      expect(lines.slice(0, message)).toContain("└ Couldn't edit README.md");
       expect(lines.some((line) => line.includes("· 2 parts"))).toBe(false);
       // The later read shows under the message that asked for it.
       expect(lines.slice(message + 1)).toContain("● Read README.md");
@@ -306,6 +358,113 @@ test.skipIf(!tmuxAvailable())(
     expectReadUnderMessage(paneLines(await resumed.waitForComposer(TIMEOUT)));
   },
   TIMEOUT * 3,
+);
+
+test.skipIf(!tmuxAvailable())(
+  "shell requests refused before they ran read as the model's mistake, also after resume",
+  async () => {
+    const { root, gateway, session, pane } = await runStory(REFUSED_REQUESTS, {
+      prompt: "list the folder",
+      finalText: "The folder is listed.",
+    });
+    const expectFixedRequest = (lines: string[]) => {
+      // The fixed request says which try it was. The refused ones never ran,
+      // so they get no row, no failure count, and no "run" of the command.
+      expect(lines).toContain("● Ran ls, printf · 3rd try ✓");
+      expect(lines.some((line) => /Failed|invalid field|Couldn't run|passed on|failed/.test(line))).toBe(false);
+    };
+    expectFixedRequest(paneLines(pane));
+
+    await session.kill();
+    sessions.splice(sessions.indexOf(session), 1);
+    const resumed = await TmuxSession.create({
+      cmd: `${FX_BIN} --resume last`,
+      cwd: root.workspace,
+      env: storyEnv(root, gateway),
+      width: 110,
+      height: 60,
+    });
+    sessions.push(resumed);
+    await resumed.waitForText("The folder is listed.", TIMEOUT);
+    expectFixedRequest(paneLines(await resumed.waitForComposer(TIMEOUT)));
+  },
+  TIMEOUT * 3,
+);
+
+test.skipIf(!tmuxAvailable())(
+  "a refused shell request the turn ended on says why, also after resume",
+  async () => {
+    const { root, gateway, session, pane } = await runStory(REFUSED_LAST, {
+      prompt: "list the folder",
+      finalText: "I could not list the folder.",
+    });
+    const expectReason = (lines: string[]) => {
+      // Like any failure a turn ends on, its row says why, as core counted
+      // it, but not the error the model got.
+      expect(lines).toContain("└ Couldn't run ls, printf · 2 invalid fields");
+      expect(lines.some((line) => /Choose either|Failed /.test(line))).toBe(false);
+    };
+    expectReason(paneLines(pane));
+
+    await session.kill();
+    sessions.splice(sessions.indexOf(session), 1);
+    const resumed = await TmuxSession.create({
+      cmd: `${FX_BIN} --resume last`,
+      cwd: root.workspace,
+      env: storyEnv(root, gateway),
+      width: 110,
+      height: 60,
+    });
+    sessions.push(resumed);
+    await resumed.waitForText("I could not list the folder.", TIMEOUT);
+    expectReason(paneLines(await resumed.waitForComposer(TIMEOUT)));
+  },
+  TIMEOUT * 3,
+);
+
+test.skipIf(!tmuxAvailable())(
+  "a command with a here-document shows its steps, also after resume",
+  async () => {
+    const { root, gateway, session, pane } = await runStory(HERE_DOCUMENT, {
+      prompt: "save the notes",
+      finalText: "The notes are saved.",
+    });
+    const expectSteps = (lines: string[]) => {
+      // The document's text is not shell words, so the row shows the steps.
+      expect(lines).toContain("● Ran cat, wc ✓");
+      expect(lines.some((line) => line.includes("model's") || line.includes("<<"))).toBe(false);
+    };
+    expectSteps(paneLines(pane));
+
+    await session.kill();
+    sessions.splice(sessions.indexOf(session), 1);
+    const resumed = await TmuxSession.create({
+      cmd: `${FX_BIN} --resume last`,
+      cwd: root.workspace,
+      env: storyEnv(root, gateway),
+      width: 110,
+      height: 60,
+    });
+    sessions.push(resumed);
+    await resumed.waitForText("The notes are saved.", TIMEOUT);
+    expectSteps(paneLines(await resumed.waitForComposer(TIMEOUT)));
+  },
+  TIMEOUT * 3,
+);
+
+test.skipIf(!tmuxAvailable())(
+  "a failed command says the error it reported, not code it printed",
+  async () => {
+    const { pane } = await runStory(PRINTED_CODE_THEN_FAILED, {
+      prompt: "check the file",
+      finalText: "The file is missing.",
+    });
+    const lines = paneLines(pane);
+    // The reason is ls's own message, not a printed line that names "error".
+    expect(lines.some((line) => /^● Exited \d+ printf, ls · ls: .*missing-file/.test(line))).toBe(true);
+    expect(lines.some((line) => line.includes("error_code") || line.includes('get("error")'))).toBe(false);
+  },
+  TIMEOUT * 2,
 );
 
 test.skipIf(!tmuxAvailable())(
@@ -376,9 +535,11 @@ test.skipIf(!tmuxAvailable())(
     });
     const lines = paneLines(pane);
     // Each file and pattern shows once, though other calls came between
-    // them, and the header names the kinds of work with no counts.
+    // them, where it was last read or searched, so window.ts, read again
+    // after main.ts, comes last. The header names the kinds of work with no
+    // counts.
     expect(treeRows(group(lines, "● Read files, searched, ran a command ✓"))).toEqual([
-      "├ Read window.ts, main.ts",
+      "├ Read main.ts, window.ts",
       "├ Searched createWindow, BrowserWindow",
       "└ Ran sh check.sh status",
     ]);

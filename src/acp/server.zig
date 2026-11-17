@@ -307,6 +307,9 @@ const ActivePrompt = struct {
     /// Mid-turn mode changes apply to the next prompt, never the running one.
     mode: []const u8,
     permission_mode: types.PermissionMode,
+    /// The usage of every turn the prompt ran, its own and each report turn
+    /// after it. The response reports it. Written by the prompt's own thread.
+    usage: types.Usage = .{},
     thread: if (host_target.is_wasm) void else std.Thread = if (host_target.is_wasm) {} else undefined,
     reapable: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 };
@@ -401,6 +404,12 @@ pub const ServerState = struct {
         // an active prompt waiting on one.
         self.terminal_client.closeOwnedTerminals();
         reapActivePrompt(self, true);
+        // A subagent inside a command uses `managed_executions` until it stops. Ended first, the runtime
+        // leaves that subagent waiting for ever on the ended runtime's mutex while `closeActiveSession` waits
+        // for it, or fails the assert that no operation is in flight. So the subagents stop first, as in
+        // `fx ask`. A prompt that is still running, or a `session/cancel` that left one at work, can leave a
+        // subagent inside a command here.
+        disableSubagentHost(self);
         self.managed_executions.deinit();
         self.terminal_client.deinit();
         closeActiveSession(self) catch |err| {
@@ -760,6 +769,96 @@ fn closeActiveSession(state: *ServerState) !void {
     destroyActiveSession(state);
 }
 
+/// The client leaves the active session for another, or closes it: its
+/// subagents stop as cancelled and owe no report, and nothing they posted for
+/// it stays for the session that follows (D41, D97; the app does the same in
+/// `stopSet`). The tree closes first, so no work the stop ends owes a report,
+/// and the host is joined before the queue is dropped, so nothing posts after
+/// it. A quit leaves reports owed and loses no queue it could keep, so it calls
+/// neither this nor `stopSubagentsForReopen`. A reload of the same session
+/// under the same `cwd` keeps what the session holds and opens nothing again,
+/// so it calls neither either. Call this before `releaseActiveSession` or
+/// `closeActiveSession`.
+pub fn stopSubagentsForSwitch(state: *ServerState) void {
+    const active = if (state.active_session) |*session| session else return;
+    if (state.subagent_host) |host| host.closeTree();
+    disableSubagentHost(state);
+    dropQueuedMail(state, active.session_id, .all, "session_switch");
+}
+
+/// The client loads the active session again under another `cwd`: the session
+/// is released and opened again from its log. It is the same session, so its
+/// subagents stop as a quit stops them, and what they owe stays owed. The
+/// open log hands each owed report out once, as a restart's does, so the
+/// reports the host queued, before the load or while it stopped, are dropped
+/// once the host is joined, and each runs once. A message or notice a child
+/// sent is in no log, so it stays queued, in its order, and runs as a turn of
+/// the reopened session. Call this before `releaseActiveSession`.
+pub fn stopSubagentsForReopen(state: *ServerState) void {
+    const active = if (state.active_session) |*session| session else return;
+    disableSubagentHost(state);
+    dropQueuedMail(state, active.session_id, .owed_reports, "session_reload");
+}
+
+/// What a drop takes of the mail `postAcpReport` queued.
+const DropScope = enum {
+    /// Every item: the session goes, and its mail with it.
+    all,
+    /// The reports the session's log still owes, those with a work id. A
+    /// message or notice, and a report with no work id, is in no log.
+    owed_reports,
+
+    fn takes(scope: DropScope, call: ?*const ReportCall) bool {
+        return switch (scope) {
+            .all => true,
+            .owed_reports => if (call) |value| value.outcome != null and value.work_id.len > 0 else false,
+        };
+    }
+};
+
+/// Drops the mail `postAcpReport` queued for `session_id` that no prompt took
+/// and `scope` names, and names each item in the trace with `reason`. A
+/// report that was owed stays owed in the session's log, which posts it again
+/// when the session opens. A message a child sent is in no log of the parent,
+/// so a drop of it leaves only the child's own log and the trace line.
+fn dropQueuedMail(state: *ServerState, session_id: []const u8, scope: DropScope, reason: []const u8) void {
+    const alloc = std.heap.c_allocator;
+    state.report_mutex.lockUncancelable(io_mod.getIo());
+    defer state.report_mutex.unlock(io_mod.getIo());
+    const Drop = struct {
+        state: *ServerState,
+        session_id: []const u8,
+        scope: DropScope,
+        reason: []const u8,
+
+        fn decide(self: *@This(), place: usize, queued: *const worker_runtime.QueuedPrompt) bool {
+            const call: ?*const ReportCall = if (place < self.state.report_calls.items.len) &self.state.report_calls.items[place] else null;
+            if (!self.scope.takes(call)) return false;
+            debug_trace.logf("acp", "event=subagent_mail_dropped session={s} kind={s} child={s} work={s} reason={s}", .{
+                self.session_id,
+                @tagName(queued.mail),
+                if (call) |value| value.child_id else "",
+                if (call) |value| value.work_id else "",
+                self.reason,
+            });
+            return true;
+        }
+    };
+    var drop: Drop = .{ .state = state, .session_id = session_id, .scope = scope, .reason = reason };
+    _ = state.worker.discardQueuedWhere(alloc, &drop, Drop.decide);
+    // The calls of the mail that stays keep their places, one for one.
+    var kept: usize = 0;
+    for (state.report_calls.items) |*call| {
+        if (scope.takes(call)) {
+            call.deinit(alloc);
+        } else {
+            state.report_calls.items[kept] = call.*;
+            kept += 1;
+        }
+    }
+    state.report_calls.shrinkRetainingCapacity(kept);
+}
+
 fn destroyActiveSession(state: *ServerState) void {
     const active = if (state.active_session) |*session| session else return;
     if (active.title_task) |task| {
@@ -921,7 +1020,7 @@ fn resolveSubagentAuthority(
     state.subagent_authority_mutex.lockUncancelable(io_mod.getIo());
     defer state.subagent_authority_mutex.unlock(io_mod.getIo());
     const integrations = if (active.mcp_host) |h|
-        h.catalog.snapshotToolNames(alloc, active.permission_rules)
+        h.catalog.snapshotToolNames(alloc)
     else
         alloc.alloc([]u8, 0);
     const owned_integrations = integrations catch return error.OutOfMemory;
@@ -930,7 +1029,7 @@ fn resolveSubagentAuthority(
         alloc.free(owned_integrations);
     }
     var mcp_view = if (active.mcp_host) |h|
-        try h.catalog.snapshotAccessView(alloc, root_id, root_id, active.permission_rules)
+        try h.catalog.snapshotAccessView(alloc, root_id, root_id)
     else
         null;
     defer if (mcp_view) |*view| view.deinit(alloc);
@@ -2519,6 +2618,7 @@ fn promptWorkerMain(active: *ActivePrompt) void {
         &active.msg,
         active.mode,
         active.permission_mode,
+        &active.usage,
     ) catch |err| .{
         .rpc_error = .{
             .code = ErrorCode.internal_error,
@@ -2613,14 +2713,10 @@ fn publishPromptOutcome(active: *ActivePrompt, outcome: prompt_handler.TerminalO
         .stop_reason => |stop_reason| {
             var response: std.Io.Writer.Allocating = .init(active.alloc);
             defer response.deinit();
-            const usage = if (active.state.active_session) |*session|
-                session.session_rt.agent.turn_usage
-            else
-                types.Usage{};
             try acp_types.writePromptResponseWithUsage(
                 &response.writer,
                 stop_reason,
-                usage,
+                active.usage,
             );
             try active.state.writer.writeResponse(active.alloc, active.msg.id, response.writer.buffered());
         },
@@ -3609,6 +3705,7 @@ fn handleCloseSession(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Messa
     }
 
     cancelAndReapActivePrompt(state);
+    stopSubagentsForSwitch(state);
     closeActiveSession(state) catch |err| {
         debug_trace.logf(
             "session",

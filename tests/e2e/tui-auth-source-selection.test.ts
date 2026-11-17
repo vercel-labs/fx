@@ -511,9 +511,14 @@ function startFakeOAuth(
     expireDeviceCode?: boolean;
     beforeRefreshResponse?: () => void | Promise<void>;
     teams?: Array<{ id: string; slug: string; name: string }>;
+    /** Each sign-in gets its own device code, and the token endpoint answers
+     * authorization_pending until this approves the code, as a person does
+     * in the browser. */
+    approveDeviceCode?: (code: string) => boolean;
   } = {},
 ) {
   const providerDetail = `provider rejected ${LOGIN_TOKEN}, ${ENV_TOKEN}, and seeded-refresh-token`;
+  let deviceCodes = 0;
   const requests: Array<{
     method: string;
     path: string;
@@ -558,13 +563,14 @@ function startFakeOAuth(
               error_description: providerDetail,
             }, { status: 400 });
           }
+          deviceCodes += 1;
           return Response.json({
-            device_code: "device-code",
+            device_code: options.approveDeviceCode ? `device-code-${deviceCodes}` : "device-code",
             user_code: "TEST-CODE",
             verification_uri: `${baseUrl}/verify`,
             verification_uri_complete: `${baseUrl}/verify?code=TEST-CODE`,
             expires_in: 60,
-            interval: 0,
+            interval: options.approveDeviceCode ? 1 : 0,
           });
         }
         case "/oauth/token": {
@@ -579,6 +585,13 @@ function startFakeOAuth(
           }
           if (options.expireDeviceCode && grantType === "urn:ietf:params:oauth:grant-type:device_code") {
             return Response.json({ error: "expired_token" }, { status: 400 });
+          }
+          if (
+            options.approveDeviceCode &&
+            grantType === "urn:ietf:params:oauth:grant-type:device_code" &&
+            !options.approveDeviceCode(String(form.get("device_code")))
+          ) {
+            return Response.json({ error: "authorization_pending" }, { status: 400 });
           }
           tokenResponseCount += 1;
           if (
@@ -1777,6 +1790,48 @@ tmuxTest("the TUI revokes kept sign-outs on a worker when it starts", async () =
   await waitForRemoval(pending);
   expect(await session.capturePane()).not.toContain("could not be confirmed");
   expect(readFileSync(stderrPath, "utf8")).toBe("");
+}, 60_000);
+
+tmuxTest("the TUI revokes kept MCP sign-outs at their servers when it starts", async () => {
+  home = mkdtempSync(join(tmpdir(), "fx-tui-kept-mcp-sign-out-retry-"));
+  stderrPath = join(home, "stderr.log");
+  writeFileSync(stderrPath, "");
+  gateway = startFakeGateway([]);
+  const forms: Array<{ form: Record<string, string>; authorization: string | null }> = [];
+  const authServer = Bun.serve({
+    hostname: "127.0.0.1",
+    port: 0,
+    async fetch(request) {
+      if (new URL(request.url).pathname !== "/revoke") return new Response(null, { status: 404 });
+      forms.push({ form: Object.fromEntries(new URLSearchParams(await request.text())), authorization: request.headers.get("authorization") });
+      return new Response(null, { status: 200 });
+    },
+  });
+  try {
+    const origin = `http://127.0.0.1:${authServer.port}`;
+    const pending = writeKeptSignOuts(home, "mcp-revocations.json", [{
+      saved_at_ms: Date.now() - 60_000,
+      refresh_token: "earlier-mcp-refresh",
+      token_type_hint: "refresh_token",
+      revocation_endpoint: `${origin}/revoke`,
+      client_id: "mcp-client",
+      client_secret: "mcp-secret",
+      client_auth: "client_secret_basic",
+      server_url: `${origin}/mcp`,
+    }]);
+    session = await startFx(home, stderrPath, gateway);
+    await session.waitForComposer(TIMEOUT);
+    await waitForRemoval(pending);
+    // Sent as the logout's own revocation was: the token and its kind in the
+    // form, and the client's id and secret in the header.
+    expect(forms).toEqual([{
+      form: { token: "earlier-mcp-refresh", token_type_hint: "refresh_token" },
+      authorization: `Basic ${Buffer.from("mcp-client:mcp-secret").toString("base64")}`,
+    }]);
+    expect(readFileSync(stderrPath, "utf8")).toBe("");
+  } finally {
+    authServer.stop(true);
+  }
 }, 60_000);
 
 tmuxTest("fx quits promptly while a Codex revocation still waits", async () => {
@@ -3192,6 +3247,76 @@ tmuxTest(
   60_000,
 );
 
+/** A gateway that refuses the seeded login, as it does once another fx process
+ * replaced it, and answers a request sent with a new sign-in. */
+function startSharedLoginGateway(answer: string) {
+  const respond = () => {
+    const sent = gateway!.requests.at(-1)?.headers.get("authorization");
+    if (sent === `Bearer ${ACQUIRED_LOGIN_TOKEN}`) return fakeGatewayFinalText(answer);
+    return new Response(JSON.stringify({ error: { message: "token expired" } }), {
+      status: 401,
+      headers: { "content-type": "application/json" },
+    });
+  };
+  return startFakeGateway(Array.from({ length: 20 }, () => respond));
+}
+
+tmuxTest(
+  "a sign-in finished in one session continues another session waiting for it",
+  async () => {
+    home = mkdtempSync(join(tmpdir(), "fx-tui-sign-in-shared-"));
+    stderrPath = join(home, "stderr.log");
+    writeFileSync(stderrPath, "");
+    const otherStderrPath = join(home, "other-stderr.log");
+    writeFileSync(otherStderrPath, "");
+    gateway = startSharedLoginGateway("SHARED_SIGN_IN_RESPONSE");
+    const approved = new Set<string>();
+    oauth = startFakeOAuth(ACQUIRED_LOGIN_TOKEN, undefined, 3600, Infinity, {
+      rejectRefreshGrant: true,
+      teams: [{ id: "team_123", slug: "vercel-labs", name: "Vercel Labs" }],
+      approveDeviceCode: (code) => approved.has(code),
+    });
+    writeSeededFxLogin(home, Date.now() + 60 * 60 * 1000, oauth.issuerUrl, "team_123");
+    session = await startFx(home, stderrPath, gateway, oauth.issuerUrl, undefined, {
+      AI_GATEWAY_API_KEY: undefined,
+    });
+    const other = await startFx(home, otherStderrPath, gateway, oauth.issuerUrl, undefined, {
+      AI_GATEWAY_API_KEY: undefined,
+    });
+    try {
+      await session.waitForComposer(TIMEOUT);
+      await other.waitForComposer(TIMEOUT);
+      // Both sessions' requests are refused and the login's refresh is
+      // refused, so each session waits and opens its own sign-in.
+      const signingIn = (pane: string) => pane.includes("Sign-in expired · waiting") && pane.includes("Sign in with Vercel");
+      await session.sendText("Answer in the first session.");
+      await session.waitForPane(signingIn, TIMEOUT);
+      await other.sendText("Answer in the second session.");
+      await other.waitForPane(signingIn, TIMEOUT);
+
+      // The user approves only the first session's code.
+      approved.add("device-code-1");
+      await session.waitForText("› Vercel Labs", TIMEOUT);
+      await session.sendKeys("Enter");
+      await session.waitForText("SHARED_SIGN_IN_RESPONSE", TIMEOUT);
+
+      // The second session takes that login within seconds, not at its next
+      // try minutes later, and closes its own sign-in.
+      const continued = await other.waitForPane((pane) => pane.includes("SHARED_SIGN_IN_RESPONSE"), 10_000);
+      expect(continued).not.toContain("Sign in with Vercel");
+      expect(await other.captureFullScrollback()).toContain("Signed in from another fx session. Continuing with that login.");
+      const otherRequests = gateway.requests.filter((request) => request.body.includes("Answer in the second session."));
+      expect(otherRequests.at(-1)?.headers.get("authorization")).toBe(`Bearer ${ACQUIRED_LOGIN_TOKEN}`);
+      expect(oauth.requests.filter((request) => request.path === "/oauth/device")).toHaveLength(2);
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+      expect(readFileSync(otherStderrPath, "utf8")).toBe("");
+    } finally {
+      await other.kill();
+    }
+  },
+  90_000,
+);
+
 tmuxTest(
   "a team picked during a sign-in wait sends the waiting request with that team",
   async () => {
@@ -3227,14 +3352,19 @@ tmuxTest(
     await session.sendText("Answer on the team I pick.");
     await session.waitForText("Choose a team to finish setup", TIMEOUT);
     await session.waitForText("› Vercel Labs", TIMEOUT);
+    // The sign-in saved its login before the team choice. While the choice
+    // takes its time, the request waits for it and is not sent on the old
+    // team with that login.
+    const waitingRequests = gateway.requests.length;
+    await Bun.sleep(2_500);
+    expect(gateway.requests).toHaveLength(waitingRequests);
     await session.sendLiteral("other");
     await session.waitForText("› Other Team", TIMEOUT);
     await session.sendKeys("Enter");
     await session.waitForText("Changed Vercel team to Other Team (other-team).", TIMEOUT);
     await session.waitForText("TEAM_CHANGE_RESPONSE", TIMEOUT);
-    // The waiting request was sent again with the team just picked.
-    const last = gateway.requests[gateway.requests.length - 1]!;
-    expect(last.headers.get("x-vercel-ai-gateway-team")).toBe("team_456");
+    // The waiting request was sent again only with the team just picked.
+    expect(gateway.requests.map((request) => request.headers.get("x-vercel-ai-gateway-team"))).toEqual(["team_123", "team_456"]);
     expect(readFileSync(stderrPath, "utf8")).toBe("");
   },
   90_000,

@@ -15,6 +15,7 @@ const image_attachments = @import("../images/image_attachments.zig");
 const io_mod = @import("../shared/io.zig");
 const types = @import("../shared/types.zig");
 const profile_paths = @import("../shared/profile_paths.zig");
+const text_utils = @import("../shared/text_utils.zig");
 const session_event = @import("session_event.zig");
 const session_codec = @import("session_codec.zig");
 const session_log = @import("session_log.zig");
@@ -44,8 +45,9 @@ pub const lock_wait_ms: u64 = 2000;
 /// Why a member could not be read, for the user: the file and the reason
 /// (D61), such as "events.jsonl line 812 is not valid JSON".
 pub const Problem = struct {
-    /// The longest reason kept, in bytes.
-    pub const capacity = 512;
+    /// The longest reason kept, in bytes: room for an unsafe folder's reason
+    /// without its entry name, which names an id of up to 255 bytes twice.
+    pub const capacity = 1024;
 
     buffer: [capacity]u8 = undefined,
     len: usize = 0,
@@ -57,8 +59,24 @@ pub const Problem = struct {
     /// Records the reason, cut at the buffer's size, and returns the error
     /// that carries it.
     pub fn set(problem: *Problem, comptime fmt: []const u8, args: anytype) error{InvalidSessionFormat} {
-        problem.len = if (std.mem.print(&problem.buffer, fmt, args)) |written| written.len else |_| problem.buffer.len;
+        problem.record(fmt, args);
         return error.InvalidSessionFormat;
+    }
+
+    /// Records the reason, cut at the buffer's size.
+    fn record(problem: *Problem, comptime fmt: []const u8, args: anytype) void {
+        if (!problem.tryRecord(fmt, args)) problem.len = problem.buffer.len;
+    }
+
+    /// Records the reason when it fits whole; false, recording nothing,
+    /// when it does not.
+    fn tryRecord(problem: *Problem, comptime fmt: []const u8, args: anytype) bool {
+        const written = std.mem.print(&problem.buffer, fmt, args) catch {
+            problem.len = 0;
+            return false;
+        };
+        problem.len = written.len;
+        return true;
     }
 };
 
@@ -90,12 +108,30 @@ pub fn kindOf(store: *session_store.Store, alloc: Allocator, id: []const u8) !Ki
     return if (try child_state.isDiscoveredManagedChildSession(store.*, alloc, id, marked)) .child else .root;
 }
 
+/// `kindOf`, recording in `problem` which part of a folder others can write
+/// and how to fix it when that refuses it (D61).
+pub fn kindOfRecorded(store: *session_store.Store, alloc: Allocator, id: []const u8, problem: *Problem) !Kind {
+    return kindOf(store, alloc, id) catch |err| switch (err) {
+        error.PrivateStatePermissionsUnsupported => {
+            recordUnsafe(store, id, .root, problem);
+            return err;
+        },
+        else => err,
+    };
+}
+
 /// Why v1 cannot tell the kind of its folder `id` (`kindOf` failed with
 /// `err`), for the user (D61): what is wrong with `session.json` when that
 /// is the cause, else the child marker `err` came from. Always
 /// `error.InvalidSessionFormat`, with `problem` set.
 pub fn kindProblem(store: *session_store.Store, alloc: Allocator, id: []const u8, err: anyerror, problem: *Problem) error{InvalidSessionFormat}!void {
-    var dir = (openMemberDir(store, id) catch |open_err| return problem.set("its folder can't be opened ({s})", .{@errorName(open_err)})) orelse
+    var dir = (openMemberDir(store, id) catch |open_err| return switch (open_err) {
+        error.PrivateStatePermissionsUnsupported => {
+            recordUnsafe(store, id, .root, problem);
+            return error.InvalidSessionFormat;
+        },
+        else => problem.set("its folder can't be opened ({s})", .{@errorName(open_err)}),
+    }) orelse
         return problem.set("its folder is gone", .{});
     defer dir.close();
     const metadata = readMetadata(alloc, &dir) catch |read_err| return problem.set("session.json can't be read ({s})", .{@errorName(read_err)});
@@ -283,10 +319,10 @@ pub fn rememberedId(alloc: Allocator, home: []const u8, workspace: []const u8) !
 /// v1's read-only detail of the root `id`, for `fx session {id}` (D61), or
 /// null when v1 holds no such root. It converts and writes nothing. Caller
 /// owns the result.
-pub fn readDetail(alloc: Allocator, home: []const u8, id: []const u8) !?session_store.ReadOnlyDetail {
+pub fn readDetail(alloc: Allocator, home: []const u8, id: []const u8, problem: *Problem) !?session_store.ReadOnlyDetail {
     var store = try session_store.Store.initReadOnlyFromHome(alloc, home, "/");
     defer store.deinit(alloc);
-    if (try kindOf(&store, alloc, id) != .root) return null;
+    if (try kindOfRecorded(&store, alloc, id, problem) != .root) return null;
     return try store.loadReadOnlyDetail(alloc, id, .{ .allow_large_legacy = true });
 }
 
@@ -339,11 +375,86 @@ pub fn hasUnreadable(alloc: Allocator, home: []const u8) !bool {
     return catalog.invalid_ids.items.len > 0;
 }
 
+/// v1's folder of `id`, or null when it has none. It is read whatever its
+/// read bits, as an old release left v1's folders readable by others, but
+/// refused with `error.PrivateStatePermissionsUnsupported` when others can
+/// write it or a file or folder directly in it, which may then not hold
+/// what fx saved (D61). `recordUnsafe` says which, and how to fix it.
 fn openMemberDir(store: *session_store.Store, id: []const u8) !?io_mod.VerifiedDir {
     const sessions = &(store.canonical_root.sessions orelse return null);
-    // Read whatever its mode: an old release left v1's folders readable by
-    // others (D61).
-    return io_mod.openRealDirIfPresent(sessions, id);
+    var dir = (try io_mod.openRealDirIfPresent(sessions, id)) orelse return null;
+    errdefer dir.close();
+    var name: WritableName = undefined;
+    if (try othersCanWriteIn(&dir, &name) != null) return error.PrivateStatePermissionsUnsupported;
+    return dir;
+}
+
+/// Holds what `othersCanWriteIn` names: `subagent/` and an entry's name.
+const WritableName = [subagent_dir.len + 1 + std.Io.Dir.max_name_bytes]u8;
+
+/// What others can write in the member folder `dir` (D61): "" for the
+/// folder itself, else a file or folder directly in it, or directly in its
+/// `subagent` folder as `subagent/<name>`, copied to `buffer`; null when
+/// nothing. The family's files (`children.json`, the relationship index,
+/// a child's markers) sit there, with no digest. Files deeper in side
+/// folders are not checked, which keeps a member's open to two folder
+/// reads; salvage checks a saved result against the digest its handle
+/// names (D74).
+fn othersCanWriteIn(dir: *io_mod.VerifiedDir, buffer: *WritableName) !?[]const u8 {
+    session_child_store.verifyOwnerWritableDirectory(dir.dir) catch |err| switch (err) {
+        error.PrivateStatePermissionsUnsupported => return "",
+        else => return err,
+    };
+    if (try writableEntry(dir.dir, "", buffer)) |name| return name;
+    var subagent = (try io_mod.openRealDirIfPresent(dir, subagent_dir)) orelse return null;
+    defer subagent.close();
+    return writableEntry(subagent.dir, subagent_dir ++ "/", buffer);
+}
+
+/// The first file or folder directly in `dir` that others can write, as
+/// `prefix` and its name in `buffer`, or null.
+fn writableEntry(dir: std.Io.Dir, comptime prefix: []const u8, buffer: *WritableName) !?[]const u8 {
+    const io = io_mod.getIo();
+    var it = dir.iterate();
+    while (try it.next(io)) |entry| {
+        if (entry.kind != .file and entry.kind != .directory) continue;
+        const stat = dir.statFile(io, entry.name, .{ .follow_symlinks = false }) catch |err| switch (err) {
+            error.FileNotFound => continue,
+            else => return err,
+        };
+        if (!io_mod.othersCanWrite(stat.permissions)) continue;
+        @memcpy(buffer[0..prefix.len], prefix);
+        @memcpy(buffer[prefix.len..][0..entry.name.len], entry.name);
+        return buffer[0 .. prefix.len + entry.name.len];
+    }
+    return null;
+}
+
+/// Which member of a family a refused folder is, for its reason.
+pub const MemberRole = enum { root, subagent };
+
+/// Records in `problem` that others can write `id`'s v1 folder or what is
+/// in it, and the command that makes it private (D61). The command names
+/// the folder as `~/.fx/sessions/<id>` (`"$FX_HOME"/sessions/<id>` when
+/// that is set): a session id holds only letters, digits, `.`, `-` and
+/// `_`, so it needs no quoting, and no home path makes it long. A name read from
+/// the folder is written terminal-safe, and left out when the reason would
+/// not fit whole.
+fn recordUnsafe(store: *session_store.Store, id: []const u8, role: MemberRole, problem: *Problem) void {
+    var name: WritableName = undefined;
+    const entry: []const u8 = found: {
+        const sessions = &(store.canonical_root.sessions orelse break :found "");
+        var dir = (io_mod.openRealDirIfPresent(sessions, id) catch break :found "") orelse break :found "";
+        defer dir.close();
+        break :found (othersCanWriteIn(&dir, &name) catch break :found "") orelse "";
+    };
+    const subagent: []const u8 = if (role == .subagent) "its subagent " else "";
+    const subagent_end: []const u8 = if (role == .subagent) ": " else "";
+    const shown_id = if (role == .subagent) id else "";
+    const folder: []const u8 = if (profile_paths.fxHomeActive()) "\"$FX_HOME\"" else "~/" ++ profile_paths.root_dir_name;
+    const fix = "so its files may not be the ones fx saved; make it private with `chmod -R go-w {s}/" ++ profile_paths.sessions_dir_name ++ "/{s}`";
+    if (entry.len > 0 and problem.tryRecord("{s}{s}{s}others can write {f} in its folder, " ++ fix, .{ subagent, shown_id, subagent_end, text_utils.terminalSafe(entry), folder, id })) return;
+    problem.record("{s}{s}{s}others can write {s}, " ++ fix, .{ subagent, shown_id, subagent_end, if (entry.len > 0) "something in its folder" else "its folder", folder, id });
 }
 
 /// Whether v1 has a folder named `id` in `home`'s profile. An error for
@@ -417,7 +528,7 @@ pub fn lockFamily(alloc: Allocator, store: *session_store.Store, root_id: []cons
     var family: Family = .{ .alloc = alloc, .registry = try child_state.Registry.init(alloc, root_id) };
     errdefer family.release();
     try family.members.ensureUnusedCapacity(alloc, 1);
-    family.members.appendAssumeCapacity((try lockMember(alloc, store, root_id, started, wait_ms)) orelse return error.SessionNotFound);
+    family.members.appendAssumeCapacity((try lockFamilyMember(alloc, store, root_id, .root, started, wait_ms, problem)) orelse return error.SessionNotFound);
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
     const a = arena.allocator();
@@ -430,7 +541,7 @@ pub fn lockFamily(alloc: Allocator, store: *session_store.Store, root_id: []cons
     for (child_ids.items) |child_id| {
         try family.members.ensureUnusedCapacity(alloc, 1);
         try family.absent.ensureUnusedCapacity(alloc, 1);
-        if (try lockMember(alloc, store, child_id, started, wait_ms)) |locked| {
+        if (try lockFamilyMember(alloc, store, child_id, .subagent, started, wait_ms, problem)) |locked| {
             family.members.appendAssumeCapacity(locked);
         } else family.absent.appendAssumeCapacity(try alloc.dupe(u8, child_id));
     }
@@ -483,6 +594,18 @@ fn indexedChildren(a: Allocator, root: *io_mod.VerifiedDir, ids: *std.ArrayList(
 
 const subagent_dir = "subagent";
 
+/// `lockMember` for `lockFamily`: a folder others can write sets `problem`
+/// to say which and how to fix it (D61).
+fn lockFamilyMember(alloc: Allocator, store: *session_store.Store, id: []const u8, role: MemberRole, started: i64, wait_ms: u64, problem: *Problem) !?Locked {
+    return lockMember(alloc, store, id, started, wait_ms) catch |err| switch (err) {
+        error.PrivateStatePermissionsUnsupported => {
+            recordUnsafe(store, id, role, problem);
+            return err;
+        },
+        else => err,
+    };
+}
+
 /// One member's lock within what is left of the family's wait; null when
 /// its folder is gone, including when another process converted it and
 /// removed the folder while this one waited for the lock (D61).
@@ -496,7 +619,9 @@ fn lockOpened(alloc: Allocator, store: *session_store.Store, id: []const u8, ope
     var dir = opened;
     errdefer dir.close();
     const spent: u64 = @intCast(@max(io_mod.milliTimestamp() - started, 0));
-    var lock = io_mod.acquireTimedAdvisoryLock(&dir, lock_file, wait_ms -| spent) catch |err| switch (err) {
+    // An old release left v1's lock files readable by others, as it left
+    // their folders (D61).
+    var lock = io_mod.acquireTimedAdvisoryLockOnOlderFile(&dir, lock_file, wait_ms -| spent) catch |err| switch (err) {
         error.LockBusy => return error.SessionBusy,
         // Gone since it was opened here, so its lock file is gone too.
         error.FileNotFound => {

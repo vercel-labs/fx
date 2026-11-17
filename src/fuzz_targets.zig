@@ -43,8 +43,10 @@ test {
     _ = @import("core/mcp_host/wire_tests.zig");
     _ = @import("core/session/session_adapter.zig");
     _ = @import("core/profiles/profiles.zig");
+    _ = @import("core/profiles/started_with.zig");
     _ = @import("core/session/session_codec.zig");
     _ = @import("core/session/session_event.zig");
+    _ = @import("core/shell_command/safe_git.zig");
     _ = @import("core/shared/display_width.zig");
     _ = @import("core/shared/fuzzy_match.zig");
     _ = @import("core/shared/types.zig");
@@ -61,6 +63,7 @@ test {
     _ = @import("core/terminal/shell_snapshot.zig");
     _ = @import("core/tooling/command_output_content.zig");
     _ = @import("core/tooling/file_mutation.zig");
+    _ = @import("core/workspace/capture_retention.zig");
     _ = @import("core/workspace/file_index.zig");
     _ = @import("core/workspace/tool_call_metrics.zig");
     _ = @import("gateway/chat_completions_protocol.zig");

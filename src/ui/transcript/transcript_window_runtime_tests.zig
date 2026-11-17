@@ -587,6 +587,33 @@ test "transcript window: when the held entries fill the newest page, the joined 
     try std.testing.expectEqual(@as(?u32, 1), runtime.transcript_archive_request);
 }
 
+test "transcript window: a joined cycle that cannot keep a clean newest page goes, and is not read again until it changes" {
+    const alloc = std.testing.allocator;
+    var runtime = testRuntime(alloc);
+    defer runtime.deinit(alloc);
+    try runtime.enableTranscriptWindow(alloc, true);
+    try rawEntries(alloc, &runtime, &.{"held\n"});
+    runtime.transcript_archive_available = true;
+    // A pinned entry stays through a drop, so trimming would leave a gap.
+    var archived = try numberedCycle(alloc, 300);
+    archived.notebook.entries.items[0].raw_bytes.lifecycle_pinned = true;
+    try runtime.installTranscriptArchive(alloc, 1, true, archived, false);
+    try std.testing.expect(runtime.transcript_archive == null);
+    // Reading it again would trim it the same way: the newest page waits
+    // for Ctrl+O to open.
+    try runtime.prewarmFullTranscriptPage(null, null);
+    try std.testing.expectEqual(@as(?u32, null), runtime.transcript_archive_request);
+    _ = runtime.requestFullTranscriptOpen();
+    try runtime.prewarmFullTranscriptPage(null, null);
+    try std.testing.expectEqual(@as(?u32, 1), runtime.transcript_archive_request);
+    runtime.closeFullTranscriptState();
+    // Once the cycle changes, the newest page reads it between turns again.
+    try runtime.transcriptWindowCompacted(alloc);
+    runtime.transcript_window.?.state.prev_first = null;
+    try runtime.prewarmFullTranscriptPage(null, null);
+    try std.testing.expectEqual(@as(?u32, 1), runtime.transcript_archive_request);
+}
+
 test "transcript window: a cycle read for a Ctrl+O that closed since stays only when the newest page joins it" {
     const alloc = std.testing.allocator;
     var runtime = testRuntime(alloc);

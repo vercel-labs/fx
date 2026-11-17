@@ -11,9 +11,10 @@ const ui_render = @import("../render.zig");
 const code_highlight = @import("../../core/agent/presentation/code_highlight.zig");
 const code_highlight_languages = @import("../../core/agent/presentation/code_highlight_languages.zig");
 const text_utils = @import("../../core/shared/text_utils.zig");
-const ascii_case = @import("../../core/shared/ascii_case.zig");
 const json_depth = @import("../../core/shared/json_depth.zig");
 const command_lex = @import("../../core/shell_command/command_lex.zig");
+const tooling_presentation = @import("../../core/tooling/tool_presentation.zig");
+const tool_result_errors = @import("../../core/tooling/tool_result_errors.zig");
 const vt_emulator = @import("../../core/terminal/engine.zig");
 
 const TranscriptEntry = transcript_blocks.TranscriptEntry;
@@ -380,6 +381,51 @@ fn normalizeCanonicalStatus(
         phrase = std.mem.trimEnd(u8, phrase[0 .. phrase.len - cancellation_follow_up.len], " \t");
     }
     return if (phrase.len == 0) null else phrase;
+}
+
+/// The cancellation notice of a cancelled shell command's status line `raw`,
+/// such as `▪ Cancelled touch .ready && sleep 60 · What can fx do
+/// differently?`, with no command: `▪ Cancelled · What can fx do
+/// differently?`, the notice a cancelled turn shows. The row above names the
+/// command by its short form and Ctrl+O by its full line, so the notice
+/// repeats neither. The line keeps its styles. Null when `raw` doesn't read
+/// `Cancelled …` after its mark.
+fn cancelledCommandNotice(scratch: std.mem.Allocator, raw: []const u8) !?[]const u8 {
+    var index: usize = 0;
+    while (skipSgrSequence(raw, &index)) {}
+    const marker = for (status_markers) |candidate| {
+        if (std.mem.startsWith(u8, raw[index..], candidate)) break candidate;
+    } else return null;
+    index += marker.len;
+    while (true) {
+        if (skipSgrSequence(raw, &index)) continue;
+        if (index < raw.len and raw[index] == ' ') {
+            index += 1;
+            continue;
+        }
+        break;
+    }
+    const label = "Cancelled";
+    if (!std.mem.startsWith(u8, raw[index..], label)) return null;
+    const kept_end = index + label.len;
+    // The command ends at the follow-up, or at the line's end on a line
+    // saved without one.
+    const tail_at = std.mem.findLast(u8, raw[kept_end..], cancellation_follow_up) orelse
+        std.mem.trimEnd(u8, raw[kept_end..], "\r\n").len;
+    var out: std.Io.Writer.Allocating = .init(scratch);
+    errdefer out.deinit();
+    try out.writer.writeAll(raw[0..kept_end]);
+    // The command's text goes, and its style codes stay, so every style the
+    // line opens still closes.
+    var cursor = kept_end;
+    while (cursor < kept_end + tail_at) {
+        const start = cursor;
+        if (skipSgrSequence(raw, &cursor)) {
+            try out.writer.writeAll(raw[start..cursor]);
+        } else cursor += 1;
+    }
+    try out.writer.writeAll(raw[kept_end + tail_at ..]);
+    return try out.toOwnedSlice();
 }
 
 // `■` is the cancelled marker older sessions recorded before `▪`.
@@ -969,6 +1015,16 @@ const StoryTally = struct {
         try list.append(scratch, value);
     }
 
+    /// Adds `value` once, as the newest: a value already there moves to the
+    /// end, so the list's order is the order of each value's latest call.
+    fn addLatest(list: *std.ArrayList([]const u8), scratch: std.mem.Allocator, value: []const u8) !void {
+        for (list.items, 0..) |existing, index| if (std.mem.eql(u8, existing, value)) {
+            _ = list.orderedRemove(index);
+            break;
+        };
+        try list.append(scratch, value);
+    }
+
     fn observe(
         self: *StoryTally,
         scratch: std.mem.Allocator,
@@ -1009,6 +1065,12 @@ const StoryTally = struct {
             .command => {
                 if (!isShellCommandCall(scratch, record)) {
                     if (record.outcome == .failed) self.other_failures += 1 else self.other_calls += 1;
+                    return;
+                }
+                // A request the shell refused ran no command, so it counts
+                // as another call that failed, not as a command.
+                if (shellCallNeverRan(scratch, record)) {
+                    self.other_failures += 1;
                     return;
                 }
                 const follow_up = isSessionFollowUp(scratch, record);
@@ -1594,7 +1656,9 @@ fn pendingCallRow(scratch: std.mem.Allocator, rows: []StoryRow, entry: Transcrip
     };
 }
 
-/// The steps of a `.commands` row's calls, each once, in the order they ran.
+/// The steps of a `.commands` row's calls, each once where it last ran, in
+/// that order. The newest few show and the older ones are counted before
+/// them, so the last step is the newest call's, which may still run.
 fn combinedCommandSteps(scratch: std.mem.Allocator, records: []const *const ToolDetailRecord) !ShortCommand {
     var all: std.ArrayList([]const u8) = .empty;
     for (records) |record| {
@@ -1602,14 +1666,14 @@ fn combinedCommandSteps(scratch: std.mem.Allocator, records: []const *const Tool
         var steps: std.ArrayList([]const u8) = .empty;
         var raw_steps: usize = 0;
         if (try collectShortSteps(scratch, source, &steps, &raw_steps, 0) and steps.items.len > 0) {
-            for (steps.items) |step| try StoryTally.addDistinct(&all, scratch, step);
+            for (steps.items) |step| try StoryTally.addLatest(&all, scratch, step);
         } else {
             const first = std.mem.trim(u8, source, " \t\r\n");
-            if (first.len > 0) try StoryTally.addDistinct(&all, scratch, first[0 .. std.mem.findAny(u8, first, " \t\r\n") orelse first.len]);
+            if (first.len > 0) try StoryTally.addLatest(&all, scratch, first[0 .. std.mem.findAny(u8, first, " \t\r\n") orelse first.len]);
         }
     }
     const kept = @min(all.items.len, short_command_max_steps);
-    return .{ .steps = all.items[0..kept], .more = all.items.len - kept };
+    return .{ .steps = all.items[all.items.len - kept ..], .more = 0, .earlier = all.items.len - kept };
 }
 
 const link_close = "\x1b]8;;\x1b\\";
@@ -1834,11 +1898,12 @@ fn writeFileName(writer: *std.Io.Writer, path: []const u8) !void {
     if (link) try writer.writeAll(link_close);
 }
 
-/// The text of a row that names several files or patterns: its past verb, the
-/// names that fit in `cols` after the row's two-column connector, then how
-/// many did not, such as "Read a.zig, b.zig +3 more". At least one name
-/// shows; the row clips it when even that one is too wide, and keeps the
-/// count. Ctrl+O shows every call.
+/// The text of a row that names several files or patterns: its past verb,
+/// how many older names do not fit, then the newest names that fit in `cols`
+/// after the row's two-column connector, oldest first, such as
+/// "Read +3, c.zig, d.zig". The last name is the newest call's, which may
+/// still run. At least one name shows; the row clips it when even that one
+/// is too wide. Ctrl+O shows every call.
 fn nameListRowText(scratch: std.mem.Allocator, row: *const StoryRow, cols: u16) !StoryRowText {
     const is_read = row.identity.kind == .read;
     const tool = if (is_read) "read_file" else storySearchTool(row.identity.key);
@@ -1847,31 +1912,35 @@ fn nameListRowText(scratch: std.mem.Allocator, row: *const StoryRow, cols: u16) 
     const verb = if (is_read) "Read" else if (std.mem.eql(u8, tool, "glob_files")) "Matched" else "Searched";
 
     const budget: usize = if (cols > 2) cols - 2 else 1;
+    const names = row.names.items;
+    const pieces = try scratch.alloc([]const u8, names.len);
+    for (names, pieces) |name, *piece| {
+        var text: std.Io.Writer.Allocating = .init(scratch);
+        if (is_read) try writeFileName(&text.writer, name) else try writeTerminalSafe(&text.writer, name);
+        piece.* = text.written();
+    }
+    // The most names, counted from the newest, whose row fits.
+    const head_width = verb.len + 1;
+    var shown: usize = 0;
+    var names_width: usize = 0;
+    while (shown < names.len) {
+        const piece_width = display_width.visibleWidthIgnoringAnsi(pieces[names.len - shown - 1]) + @as(usize, if (shown > 0) 2 else 0);
+        const left_out = names.len - shown - 1;
+        const count_width: usize = if (left_out == 0) 0 else display_width.visibleWidthIgnoringAnsi(try countNote(scratch, "+", left_out, ", "));
+        if (shown > 0 and head_width + count_width + names_width + piece_width > budget) break;
+        names_width += piece_width;
+        shown += 1;
+    }
+
     var body: std.Io.Writer.Allocating = .init(scratch);
     try body.writer.writeAll(verb);
     try body.writer.writeByte(' ');
-    const names = row.names.items;
-    var shown: usize = 0;
-    var width: usize = 0;
-    for (names) |name| {
-        var piece: std.Io.Writer.Allocating = .init(scratch);
-        if (shown > 0) try piece.writer.writeAll(", ");
-        if (is_read) try writeFileName(&piece.writer, name) else try writeTerminalSafe(&piece.writer, name);
-        if (shown == 0) width = display_width.visibleWidthIgnoringAnsi(body.written());
-        const piece_width = display_width.visibleWidthIgnoringAnsi(piece.written());
-        const rest = names.len - shown - 1;
-        const more_width: usize = if (rest == 0) 0 else display_width.visibleWidthIgnoringAnsi(try countNote(scratch, " +", rest, " more"));
-        if (shown > 0 and width + piece_width + more_width > budget) break;
-        try body.writer.writeAll(piece.written());
-        width += piece_width;
-        shown += 1;
+    if (shown < names.len) try writeCount(&body.writer, "+", names.len - shown, ", ");
+    for (pieces[names.len - shown ..], 0..) |piece, position| {
+        if (position > 0) try body.writer.writeAll(", ");
+        try body.writer.writeAll(piece);
     }
-    const suffix: []const u8 = if (shown < names.len) try countNote(scratch, " +", names.len - shown, " more") else "";
-    return .{
-        .display = try std.mem.concat(scratch, u8, &.{ body.written(), suffix }),
-        .body = body.written(),
-        .suffix = suffix,
-    };
+    return .{ .display = body.written(), .body = body.written(), .suffix = "" };
 }
 
 /// The key that joins searches for the same pattern with the same tool,
@@ -1888,7 +1957,7 @@ fn addSearchPath(scratch: std.mem.Allocator, row: *StoryRow, detail: ?*const Too
     const record = detail orelse return;
     const path = storyArgString(scratch, record, "path") orelse "";
     const trimmed = std.mem.trimEnd(u8, path, "/");
-    try StoryTally.addDistinct(&row.search_paths, scratch, if (trimmed.len == 0 and path.len > 0) "/" else trimmed);
+    try StoryTally.addLatest(&row.search_paths, scratch, if (trimmed.len == 0 and path.len > 0) "/" else trimmed);
 }
 
 /// How many leading parts two paths share, split at "/".
@@ -1923,24 +1992,72 @@ fn folderName(path: []const u8, shared: usize) []const u8 {
 }
 
 /// Names the folders of a search row by the part of each path that differs
-/// from the others, so "/w/reviews" and "/w/docs" are "reviews, docs". Up
-/// to three show, then "+N more". Every name is terminal-safe.
+/// from the others, so "/w/reviews" and "/w/docs" are "reviews, docs". The
+/// newest three show, after how many older ones do not, such as
+/// "+2, c, d, e". Every name is terminal-safe.
 fn searchFolderNames(scratch: std.mem.Allocator, paths: []const []const u8) ![]const u8 {
     var shared: usize = std.math.maxInt(usize);
     for (paths[1..]) |path| shared = @min(shared, sharedPathParts(paths[0], path));
     var out: std.Io.Writer.Allocating = .init(scratch);
     const shown = @min(paths.len, short_command_max_steps);
-    for (paths[0..shown], 0..) |path, position| {
+    if (paths.len > shown) try writeCount(&out.writer, "+", paths.len - shown, ", ");
+    for (paths[paths.len - shown ..], 0..) |path, position| {
         if (position > 0) try out.writer.writeAll(", ");
         try writeTerminalSafe(&out.writer, folderName(path, shared));
     }
-    if (paths.len > shown) try writeCount(&out.writer, " +", paths.len - shown, " more");
     return out.written();
 }
 
 noinline fn storyRowCallFailed(scratch: std.mem.Allocator, detail: ?*const ToolDetailRecord) bool {
     const record = detail orelse return false;
-    return isShellCommandCall(scratch, record) and storyCallFailed(detail);
+    return isShellCommandCall(scratch, record) and storyCallFailed(detail) and !shellCallNeverRan(scratch, record);
+}
+
+/// Whether a shell call failed before it ran its command because its request
+/// was wrong, such as one that set both a profile and a shell. That is the
+/// model's own mistake, not a command that failed, and it reads as one.
+fn shellCallNeverRan(scratch: std.mem.Allocator, record: *const ToolDetailRecord) bool {
+    if (record.outcome != .failed or !isShellCommandCall(scratch, record)) return false;
+    const result = record.result orelse return false;
+    const correction = tool_result_errors.inspectTerminalActionFieldCorrection(scratch, result) catch return false;
+    return correction != null;
+}
+
+/// Why a shell call never ran, as core's status says it, such as
+/// "2 invalid fields". Null when its result names no wrong field.
+fn neverRanReason(scratch: std.mem.Allocator, record: *const ToolDetailRecord) !?[]const u8 {
+    const result = record.result orelse return null;
+    const correction = tool_result_errors.inspectTerminalActionFieldCorrection(scratch, result) catch return null;
+    const count = (correction orelse return null).invalid_field_count;
+    if (count == 0) return null;
+    return try countNote(scratch, "", count, if (count == 1) " invalid field" else " invalid fields");
+}
+
+/// The key under which a shell call repeats one that never ran: the short
+/// form of its command, so a fixed request for the same steps counts as its
+/// retry even when the model also reworded the command.
+fn shellRetryKey(scratch: std.mem.Allocator, record: *const ToolDetailRecord) !?[]const u8 {
+    const command = storyArgString(scratch, record, "command") orelse record.command_display orelse return null;
+    if (std.mem.trim(u8, command, " \t\r\n").len == 0) return null;
+    const short = try shortCommand(scratch, command) orelse command;
+    return try std.mem.concat(scratch, u8, &.{ "shell\x00", short });
+}
+
+/// A running toolbox call's identity by the MCP tool its status names, such
+/// as "Running MCP mcp_x", while its arguments, which name the tool, have
+/// not arrived, so it joins that tool's row at once instead of showing on a
+/// row of its own that folds into it later.
+fn streamingToolboxIdentity(scratch: std.mem.Allocator, entry: TranscriptEntry, detail: ?*const ToolDetailRecord, identity: StoryIdentity) !StoryIdentity {
+    if (identity.kind != .mcp) return identity;
+    const record = detail orelse return identity;
+    if (record.outcome != null or !std.mem.eql(u8, record.tool_name, "toolbox")) return identity;
+    if (storyArgString(scratch, record, "run") != null) return identity;
+    const phrase = try entryStatus(scratch, entry) orelse return identity;
+    const prefix = tooling_presentation.mcp_running_label ++ " ";
+    if (!std.mem.startsWith(u8, phrase, prefix)) return identity;
+    const name = std.mem.trim(u8, phrase[prefix.len..], " \t\r\n");
+    if (name.len == 0) return identity;
+    return .{ .kind = .mcp, .key = name };
 }
 
 fn storyIdentity(scratch: std.mem.Allocator, detail: ?*const ToolDetailRecord) !StoryIdentity {
@@ -1955,6 +2072,7 @@ fn storyIdentity(scratch: std.mem.Allocator, detail: ?*const ToolDetailRecord) !
             // row instead of counting as a run of the same command. A failed
             // run still joins, so a row can say "passed on the 3rd run".
             if (record.outcome) |outcome| if (outcome == .denied or outcome == .cancelled) return .{};
+            if (shellCallNeverRan(scratch, record)) return .{};
             if (storyArgString(scratch, record, "session_id")) |id| return .{ .kind = .session, .key = id };
             if (record.result) |result| if (jsonField(scratch, result, "session_id")) |field| switch (field) {
                 .string => |id| if (id.len > 0) return .{ .kind = .session, .key = id },
@@ -2036,7 +2154,11 @@ fn collectStoryRetries(
         };
         // A call held for project instructions has no row.
         if (record.outcome == .deferred) continue;
-        const key = try retryKey(scratch, record) orelse {
+        // A shell call repeats by its steps, and only one that never ran
+        // starts a run of failures: a command that ran and failed stays, as
+        // "passed on the 3rd run".
+        const shell = isShellCommandCall(scratch, record);
+        const key = (if (shell) try shellRetryKey(scratch, record) else try retryKey(scratch, record)) orelse {
             failed_run.clearRetainingCapacity();
             continue;
         };
@@ -2046,10 +2168,10 @@ fn collectStoryRetries(
             continue;
         };
         switch (outcome) {
-            .failed => {
+            .failed => if (!shell or shellCallNeverRan(scratch, record)) {
                 try failed_run.append(scratch, entry_id);
                 run_key = key;
-            },
+            } else failed_run.clearRetainingCapacity(),
             .completed => if (failed_run.items.len > 0) {
                 for (failed_run.items) |id| try retries.fixed.put(scratch, id, {});
                 try retries.tries.put(scratch, entry_id, failed_run.items.len + 1);
@@ -2103,7 +2225,7 @@ fn collectStoryRows(
         // runs once they load shows instead, so the hold gets no row; Ctrl+O
         // still shows it.
         if (detail) |record| if (record.outcome == .deferred) continue;
-        const identity = try storyIdentity(scratch, detail);
+        const identity = try streamingToolboxIdentity(scratch, entry, detail, try storyIdentity(scratch, detail));
         // A call whose arguments have not arrived yet waits in the row it
         // will most likely join, and shows once they arrive.
         if (identity.kind == .single) if (detail) |record| if (record.outcome == null and (!storyHasArgs(record) or joinsByArgument(record))) {
@@ -2126,7 +2248,11 @@ fn collectStoryRows(
             // that still goes on, which is the one that started it.
             if (identity.kind == .session) if (sessionRunRow(rows.items, detail.?)) |run_row| {
                 // A row of several commands keeps naming their steps.
-                if (run_row.identity.kind == .commands) run_row.session = identity.key else run_row.identity = identity;
+                if (run_row.identity.kind == .commands) {
+                    run_row.session = identity.key;
+                    // The session's command is the newest step the row ran.
+                    try run_row.combined.append(scratch, detail.?);
+                } else run_row.identity = identity;
                 break :new run_row;
             };
             // A different command right after one with the same label joins
@@ -2159,7 +2285,7 @@ fn collectStoryRows(
         if (try commandStillRunning(scratch, entry)) target.background = detail;
         target.tries = retries.tries.get(entry_id) orelse 0;
         try addSearchPath(scratch, target, detail);
-        if (storyRowName(identity)) |name| try StoryTally.addDistinct(&target.names, scratch, name);
+        if (storyRowName(identity)) |name| try StoryTally.addLatest(&target.names, scratch, name);
         if (identity.kind == .edit) {
             const totals = diffTotalsOfPhrase(try entryStatus(scratch, entry) orelse "");
             target.diff.added +|= totals.added;
@@ -2223,8 +2349,16 @@ fn storyRowText(scratch: std.mem.Allocator, row: *const StoryRow, style: Summary
     if (rowListsNames(row)) return nameListRowText(scratch, row, cols);
     if (row.identity.kind == .commands) {
         const label = try commandRowLabel(scratch, row.entry, row.detail) orelse "Ran ";
-        const steps = try combinedCommandSteps(scratch, row.combined.items);
-        const display = try std.mem.concat(scratch, u8, &.{ label, try formatShortCommand(scratch, steps, style.text_style) });
+        var steps = try combinedCommandSteps(scratch, row.combined.items);
+        var display = try std.mem.concat(scratch, u8, &.{ label, try formatShortCommand(scratch, steps, style.text_style) });
+        // A narrow row leaves out its oldest steps first, so the newest stays
+        // in view. The budget leaves room for the connector and the mark.
+        const budget: usize = if (cols > 4) cols - 4 else 1;
+        while (steps.steps.len > 1 and display_width.visibleWidthIgnoringAnsi(display) > budget) {
+            steps.steps = steps.steps[1..];
+            steps.earlier += 1;
+            display = try std.mem.concat(scratch, u8, &.{ label, try formatShortCommand(scratch, steps, style.text_style) });
+        }
         return .{ .display = display, .body = display, .suffix = "" };
     }
     const merged_read = row.identity.kind == .read and row.count > 1;
@@ -2232,6 +2366,16 @@ fn storyRowText(scratch: std.mem.Allocator, row: *const StoryRow, style: Summary
         try std.mem.concat(scratch, u8, &.{ "Read ", try terminalSafeText(scratch, row.identity.key) })
     else
         try entryStatus(scratch, row.entry) orelse if (row.detail) |record| record.tool_name else "tool activity";
+    // A shell call that never ran says so by its command's steps, like any
+    // call the model got wrong, and leaves why to Ctrl+O, unless the turn
+    // ended on it, as for any failure a turn ends on.
+    if (row.detail) |record| if (shellCallNeverRan(scratch, record)) {
+        const command = storyArgString(scratch, record, "command") orelse record.command_display orelse record.tool_name;
+        const short = try shortCommand(scratch, command) orelse try terminalSafeText(scratch, command);
+        const phrase = try inFailureStyle(scratch, try std.mem.concat(scratch, u8, &.{ "Couldn't run ", short }), style);
+        const reason = if (row.ends_turn) try neverRanReason(scratch, record) orelse "" else "";
+        return .{ .display = phrase, .body = phrase, .suffix = "", .reason = reason };
+    };
     const split_failure = splitFailedPhrase(status_phrase, row.detail);
     const raw_phrase = if (split_failure) |split| split.row else status_phrase;
     const full_phrase = try reprojectTruncatedCommandPhrase(scratch, raw_phrase, row.detail) orelse raw_phrase;
@@ -2334,8 +2478,6 @@ fn ordinalEnding(number: usize, comptime word: []const u8) []const u8 {
     };
 }
 
-/// The line of command output that says what went wrong: the first line that
-/// mentions an error or a failure, else the last line.
 /// Command output kept in its escaped form, where text_utils.encodeTerminalSafe
 /// writes every control byte, line feeds included, as "\xNN", gets its escaped
 /// line feeds back as line breaks, so the reason line can pick one line of it.
@@ -2346,14 +2488,93 @@ fn storyOutputLines(scratch: std.mem.Allocator, text: []const u8) ![]const u8 {
     return std.mem.replaceOwned(u8, scratch, text, "\\x0a", "\n");
 }
 
-fn verdictLine(text: []const u8) ?[]const u8 {
+/// The line of command output that says what went wrong: the first line that
+/// reports an error or a failure, such as "Error: timed out" or
+/// "main.c:3: error: ...", else the last line where one of `programs`, the
+/// programs the command ran, or its shell reports, such as "sed: 1: ...",
+/// else the first line that names an error or a failure, else the last line.
+/// "error" or "fail" inside a longer name, such as "error_code", counts as
+/// neither, so a command that prints code does not read as its own error.
+fn verdictLine(text: []const u8, programs: []const []const u8) ?[]const u8 {
+    var named: ?[]const u8 = null;
+    var reported: ?[]const u8 = null;
     var lines = std.mem.splitScalar(u8, text, '\n');
     while (lines.next()) |line| {
         const trimmed = std.mem.trim(u8, line, " \t\r");
         if (trimmed.len == 0) continue;
-        if (ascii_case.containsIgnoreCase(trimmed, "error") or ascii_case.containsIgnoreCase(trimmed, "fail")) return trimmed;
+        switch (failureWord(trimmed)) {
+            .reports => return trimmed,
+            .names => if (named == null) {
+                named = trimmed;
+            },
+            .none => {},
+        }
+        if (programReports(trimmed, programs)) reported = trimmed;
     }
-    return lastNonEmptyLine(text);
+    return reported orelse named orelse lastNonEmptyLine(text);
+}
+
+const FailureWord = enum { none, names, reports };
+
+/// Whether `line` holds "error" or "fail" as a word of its own, such as
+/// "errors", "failed", or the end of "TypeError", and whether that word
+/// reports, starting the line or right before a colon.
+fn failureWord(line: []const u8) FailureWord {
+    var found: FailureWord = .none;
+    for ([_][]const u8{ "error", "fail" }) |stem| {
+        var start: usize = 0;
+        while (start + stem.len <= line.len) : (start += 1) {
+            if (!std.ascii.eqlIgnoreCase(line[start .. start + stem.len], stem)) continue;
+            var end = start + stem.len;
+            for ([_][]const u8{ "ures", "ure", "ing", "ed", "s" }) |ending| {
+                if (end + ending.len <= line.len and std.ascii.eqlIgnoreCase(line[end .. end + ending.len], ending)) {
+                    end += ending.len;
+                    break;
+                }
+            }
+            const before_ok = start == 0 or !isNameByte(line[start - 1]) or
+                (std.ascii.isUpper(line[start]) and (std.ascii.isLower(line[start - 1]) or std.ascii.isDigit(line[start - 1])));
+            const after_ok = end == line.len or (!isNameByte(line[end]) and
+                !(line[end] == '.' and end + 1 < line.len and std.ascii.isAlphanumeric(line[end + 1])));
+            if (!before_ok or !after_ok) continue;
+            if (start == 0 or (end < line.len and line[end] == ':')) return .reports;
+            found = .names;
+        }
+    }
+    return found;
+}
+
+fn isNameByte(byte: u8) bool {
+    return std.ascii.isAlphanumeric(byte) or byte == '_';
+}
+
+/// Whether `line` is a program speaking for itself, as in "sed: 1: ..." or
+/// "/bin/sh: line 1: ...": its first word before a colon names one of
+/// `programs` or a shell.
+fn programReports(line: []const u8, programs: []const []const u8) bool {
+    const colon = std.mem.findScalar(u8, line, ':') orelse return false;
+    if (colon == 0 or colon + 1 >= line.len) return false;
+    const speaker = line[0..colon];
+    if (std.mem.findAny(u8, speaker, " \t") != null) return false;
+    const name = std.Io.Dir.path.basenamePosix(speaker);
+    for ([_][]const u8{ "sh", "bash", "zsh", "dash", "ksh" }) |shell| if (std.mem.eql(u8, name, shell)) return true;
+    for (programs) |program| if (std.mem.eql(u8, name, program)) return true;
+    return false;
+}
+
+/// The programs a command runs, by name, such as "sed" and "git" for
+/// "sed -n 2p f && git status", so its output can tell their own messages.
+fn commandPrograms(scratch: std.mem.Allocator, record: *const ToolDetailRecord) ![]const []const u8 {
+    const command = storyArgString(scratch, record, "command") orelse record.command_display orelse return &.{};
+    var steps: std.ArrayList([]const u8) = .empty;
+    var raw_steps: usize = 0;
+    if (!try collectShortSteps(scratch, command, &steps, &raw_steps, 0)) return &.{};
+    var programs: std.ArrayList([]const u8) = .empty;
+    for (steps.items) |step| {
+        const word = step[0 .. std.mem.findScalar(u8, step, ' ') orelse step.len];
+        try programs.append(scratch, std.Io.Dir.path.basenamePosix(word));
+    }
+    return programs.items;
 }
 
 fn lastNonEmptyLine(text: []const u8) ?[]const u8 {
@@ -2411,12 +2632,13 @@ fn storyFailureReason(scratch: std.mem.Allocator, detail: ?*const ToolDetailReco
     const line: ?[]const u8 = if (record.result) |result| blk: {
         // Command details keep the plain output, where the line that names
         // the error says the most; other tools lead with their error.
-        const plain_line = if (is_command) verdictLine(try storyOutputLines(scratch, result)) else firstNonEmptyLine(result);
+        const programs = if (is_command) try commandPrograms(scratch, record) else &.{};
+        const plain_line = if (is_command) verdictLine(try storyOutputLines(scratch, result), programs) else firstNonEmptyLine(result);
         const fields = [_][]const u8{ "output_delta", "error", "message" };
         for (fields) |field_name| {
             const field = jsonObjectField(scratch, result, field_name) catch break :blk plain_line;
             if (field) |value| switch (value) {
-                .string => |text| break :blk if (std.mem.eql(u8, field_name, "output_delta")) verdictLine(text) else firstNonEmptyLine(text),
+                .string => |text| break :blk if (std.mem.eql(u8, field_name, "output_delta")) verdictLine(text, programs) else firstNonEmptyLine(text),
                 else => {},
             };
         }
@@ -2619,7 +2841,7 @@ fn writeGroupBlock(
     for (rows.items) |*row| {
         if (!storyCallFailed(row.detail)) continue;
         row.ends_turn = callEndsTurn(entries, row.status_index);
-        if (row.ends_turn and !isShellCommandCall(scratch, row.detail.?)) tally.turn_ending_failures += 1;
+        if (row.ends_turn and (!isShellCommandCall(scratch, row.detail.?) or shellCallNeverRan(scratch, row.detail.?))) tally.turn_ending_failures += 1;
     }
     var last_command_row: ?usize = null;
     for (rows.items, 0..) |*row, index| {
@@ -2681,7 +2903,12 @@ fn writeGroupBlock(
         const detail = detailForEntry(details, detail_indices, entry_id, null) orelse continue;
         if (detail.outcome != .cancelled) continue;
 
-        const terminal = try transcript_blocks.renderEntryToBlock(scratch, entry, cols, styles);
+        // A cancelled command's notice names no command; its row does.
+        var shown = entry;
+        if (isShellCommandCall(scratch, detail)) {
+            if (try cancelledCommandNotice(scratch, entry.raw_bytes.bytes)) |notice| shown.raw_bytes.bytes = notice;
+        }
+        const terminal = try transcript_blocks.renderEntryToBlock(scratch, shown, cols, styles);
         if (terminal.bytes.len > 0) {
             try lines.append(alloc, .block_separator);
             const count = std.mem.count(u8, std.mem.trimEnd(u8, terminal.bytes, "\n"), "\n") + 1;
@@ -3162,7 +3389,10 @@ fn gapHasNewline(command: []const u8, from: usize, to: usize) bool {
 /// A shell command's short form: the first steps it runs, and how many more.
 const ShortCommand = struct {
     steps: []const []const u8,
+    /// How many steps after `steps` the form leaves out.
     more: usize,
+    /// How many steps before `steps` the form leaves out.
+    earlier: usize = 0,
 };
 
 const short_command_max_steps = 3;
@@ -3180,6 +3410,7 @@ fn formatShortCommand(scratch: std.mem.Allocator, short: ShortCommand, base_styl
     const profile = if (base_style != null) code_highlight_languages.resolve("sh") else null;
     const variant: code_highlight.Theme = if (shared_theme.current().light) .light else .dark;
     var out: std.Io.Writer.Allocating = .init(scratch);
+    if (short.earlier > 0) try writeCount(&out.writer, "+", short.earlier, ", ");
     for (short.steps, 0..) |step, position| {
         if (position > 0) try out.writer.writeAll(", ");
         const safe = try terminalSafeText(scratch, step);
@@ -3226,7 +3457,11 @@ fn collectShortSteps(
     raw_steps: *usize,
     depth: usize,
 ) ShortStepError!bool {
-    const argv = command_lex.tokenize_argv(scratch, command) catch |err| switch (err) {
+    // A here-document's body is text for the program, not shell words, so
+    // an apostrophe in it does not stop the command from lexing.
+    const here_docs = try withoutHereDocBodies(scratch, command);
+    const source = here_docs.text;
+    const argv = command_lex.tokenize_argv(scratch, source) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return false,
     };
@@ -3241,12 +3476,12 @@ fn collectShortSteps(
         const token: ?command_lex.ArgvToken = if (at_end) null else tokens[index];
         // A comment runs to the end of its line.
         if (!at_end and !tokens[index].quoted and std.mem.startsWith(u8, tokens[index].raw, "#")) {
-            while (index + 1 < tokens.len and !gapHasNewline(command, tokens[index].end, tokens[index + 1].start)) index += 1;
+            while (index + 1 < tokens.len and !gapHasNewline(source, tokens[index].end, tokens[index + 1].start)) index += 1;
             continue;
         }
         // A command substitution, `$( ... )`, and an expansion such as
         // `{1..80}` or `${name}` belong to the word around them.
-        if (!at_end) if (expansionClose(command, tokens, index)) |close| {
+        if (!at_end) if (expansionClose(source, tokens, index)) |close| {
             var nesting: usize = 0;
             while (index < tokens.len) : (index += 1) {
                 const inner = tokens[index];
@@ -3269,29 +3504,34 @@ fn collectShortSteps(
         }
         const roles: WordRoles = if (token) |t| wordRoles(t.value) else .{};
         const operator = if (token) |t| !t.quoted and roles.command_operator else false;
-        const new_line = if (token) |t| index > 0 and gapHasNewline(command, tokens[index - 1].end, t.start) else false;
-        const heredoc_end = blk: {
-            const t = token orelse break :blk false;
-            if (t.quoted or !std.mem.startsWith(u8, t.value, "<<") or std.mem.eql(u8, t.value, "<<<")) break :blk false;
-            // A here-document: skip its delimiter and its body, which ends
-            // the step at the closing delimiter.
-            if (index + 1 >= tokens.len) {
-                index = tokens.len - 1;
-                break :blk true;
-            }
-            const delimiter = tokens[index + 1].value;
-            var end = index + 2;
-            while (end < tokens.len and !std.mem.eql(u8, tokens[end].value, delimiter)) : (end += 1) {}
-            index = @min(end, tokens.len - 1);
-            break :blk true;
-        };
-        if (at_end or operator or new_line or heredoc_end) {
+        const new_line = if (token) |t| index > 0 and gapHasNewline(source, tokens[index - 1].end, t.start) else false;
+        if (at_end or operator or new_line) {
             try finishShortStep(scratch, steps, raw_steps, step, depth, defined.items);
             step = .{ .after_pipe = operator and std.mem.eql(u8, token.?.value, "|") };
-            if (operator or heredoc_end or at_end) continue;
+            if (operator or at_end) continue;
         }
         const t = token.?;
         if (isRedirectionFd(tokens, index)) continue;
+        // A here-document's operator and delimiter, whose body and closing
+        // line `source` no longer has, are like a redirection: neither is a
+        // word of the step. A command whose lines core folded into one still
+        // has its body and closing delimiter on this line, and the step ends
+        // at that delimiter.
+        if (!t.quoted and std.mem.startsWith(u8, t.value, "<<") and !std.mem.eql(u8, t.value, "<<<")) {
+            const joined = t.value.len > 2;
+            if (!joined and index + 1 < tokens.len) index += 1;
+            const delimiter = std.mem.trimStart(u8, if (joined) t.value[2..] else tokens[index].value, "-");
+            var end = index + 1;
+            const closing: ?usize = if (!here_docs.open) null else while (end < tokens.len and !gapHasNewline(source, tokens[end - 1].end, tokens[end].start)) : (end += 1) {
+                if (delimiter.len > 0 and std.mem.eql(u8, tokens[end].value, delimiter)) break end;
+            } else null;
+            if (closing) |at| {
+                index = at;
+                try finishShortStep(scratch, steps, raw_steps, step, depth, defined.items);
+                step = .{};
+            }
+            continue;
+        }
         if (step.program.len == 0 and !t.quoted and std.mem.eql(u8, t.value, "function") and index + 1 < tokens.len) {
             try defined.append(scratch, tokens[index + 1].value);
             step.program = "function";
@@ -3308,6 +3548,128 @@ fn collectShortSteps(
         addShortToken(&step, t, roles);
     }
     return true;
+}
+
+/// A command's text without its here-document bodies.
+const HereDocText = struct {
+    text: []const u8,
+    /// Whether a here-document's body is still in `text`, as in a command
+    /// whose lines core folded into one.
+    open: bool = false,
+};
+
+/// `command` without the bodies of its here-documents and their closing
+/// lines, such as the lines after `cat > notes.md <<'EOF'` up to and with
+/// `EOF`, so the line that opened them ends their step. A command with no
+/// `<<` is returned as is; `<<<` and a shift inside `$(( ))` open no
+/// here-document. The text lives in `scratch`.
+fn withoutHereDocBodies(scratch: std.mem.Allocator, command: []const u8) std.mem.Allocator.Error!HereDocText {
+    if (std.mem.find(u8, command, "<<") == null) return .{ .text = command };
+    const HereDoc = struct { delimiter: []const u8, strip_tabs: bool };
+    var out: std.ArrayList(u8) = .empty;
+    var pending: std.ArrayList(HereDoc) = .empty;
+    var quote: u8 = 0;
+    var arithmetic: usize = 0;
+    var index: usize = 0;
+    while (index < command.len) {
+        const byte = command[index];
+        if (quote == '\'') {
+            if (byte == '\'') quote = 0;
+            try out.append(scratch, byte);
+            index += 1;
+            continue;
+        }
+        if (byte == '\\' and index + 1 < command.len) {
+            try out.appendSlice(scratch, command[index .. index + 2]);
+            index += 2;
+            continue;
+        }
+        if (quote == '"') {
+            if (byte == '"') quote = 0;
+            try out.append(scratch, byte);
+            index += 1;
+            continue;
+        }
+        if (byte == '\'' or byte == '"') {
+            quote = byte;
+            try out.append(scratch, byte);
+            index += 1;
+            continue;
+        }
+        // A comment runs to the end of its line.
+        if (byte == '#' and (index == 0 or std.mem.findScalar(u8, " \t\n;&|(", command[index - 1]) != null)) {
+            const line_end = std.mem.findScalarPos(u8, command, index, '\n') orelse command.len;
+            try out.appendSlice(scratch, command[index..line_end]);
+            index = line_end;
+            continue;
+        }
+        if (std.mem.startsWith(u8, command[index..], "$((")) {
+            arithmetic += 1;
+            try out.appendSlice(scratch, "$((");
+            index += 3;
+            continue;
+        }
+        if (arithmetic > 0 and std.mem.startsWith(u8, command[index..], "))")) {
+            arithmetic -= 1;
+            try out.appendSlice(scratch, "))");
+            index += 2;
+            continue;
+        }
+        // A here-string's `<<<` opens no here-document, at any of its bytes.
+        if (std.mem.startsWith(u8, command[index..], "<<<")) {
+            try out.appendSlice(scratch, "<<<");
+            index += 3;
+            continue;
+        }
+        if (arithmetic == 0 and std.mem.startsWith(u8, command[index..], "<<")) {
+            var scan = index + 2;
+            const strip_tabs = scan < command.len and command[scan] == '-';
+            if (strip_tabs) scan += 1;
+            while (scan < command.len and (command[scan] == ' ' or command[scan] == '\t')) scan += 1;
+            // The delimiter is one word, with its quotes and escapes taken out.
+            var delimiter: std.ArrayList(u8) = .empty;
+            var delimiter_quote: u8 = 0;
+            while (scan < command.len) : (scan += 1) {
+                const c = command[scan];
+                if (delimiter_quote != 0) {
+                    if (c == delimiter_quote) delimiter_quote = 0 else try delimiter.append(scratch, c);
+                    continue;
+                }
+                if (c == '\'' or c == '"') {
+                    delimiter_quote = c;
+                    continue;
+                }
+                if (c == '\\') continue;
+                if (std.ascii.isWhitespace(c) or std.mem.findScalar(u8, ";&|<>()", c) != null) break;
+                try delimiter.append(scratch, c);
+            }
+            if (delimiter.items.len > 0) try pending.append(scratch, .{ .delimiter = delimiter.items, .strip_tabs = strip_tabs });
+            try out.appendSlice(scratch, command[index..scan]);
+            index = scan;
+            continue;
+        }
+        try out.append(scratch, byte);
+        index += 1;
+        if (byte != '\n' or pending.items.len == 0) continue;
+        // The lines after the one that opened here-documents are their
+        // bodies, one after another, each up to its delimiter line.
+        for (pending.items, 0..) |here_doc, position| {
+            // The next body starts after the line that closed the last one.
+            if (position > 0 and index < command.len) index += 1;
+            while (index < command.len) {
+                const line_end = std.mem.findScalarPos(u8, command, index, '\n') orelse command.len;
+                var line = std.mem.trimEnd(u8, command[index..line_end], "\r");
+                if (here_doc.strip_tabs) line = std.mem.trimStart(u8, line, "\t");
+                index = line_end;
+                if (std.mem.eql(u8, line, here_doc.delimiter)) break;
+                if (index < command.len) index += 1;
+            }
+        }
+        pending.clearRetainingCapacity();
+        // The newline after the last closing line follows the opening line.
+        if (index < command.len) index += 1;
+    }
+    return .{ .text = out.items, .open = pending.items.len > 0 };
 }
 
 /// Replaces the command a command row ends with by its short form, so a long
@@ -5881,11 +6243,71 @@ test "a cancelled call is its group's header above the cancellation block" {
     defer projection.deinit(alloc);
 
     try std.testing.expect(projection.entry_actions.items[0] == .override);
+    // The row names the command; the notice under it doesn't.
     try std.testing.expectEqualStrings(
         "● Cancelled \x1b[38;5;252msleep\x1b[39m 30\n\n" ++
-            "▪ Cancelled sleep 30 · What can fx do differently?",
+            "▪ Cancelled · What can fx do differently?",
         projection.entry_actions.items[0].override.bytes,
     );
+
+    // The full transcript still names the command.
+    var expanded = try buildExpandedStyledInterruptible(alloc, &entries, &details, 120, null);
+    defer expanded.deinit(alloc);
+    try std.testing.expect(std.mem.find(u8, expanded.entry_actions.items[0].override.bytes, "sleep") != null);
+}
+
+test "a cancelled command's notice drops only the command and keeps the line's styles" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const warn = ui_render.warning_style;
+    const reset = ui_render.reset_style;
+    const hint = ui_render.hint_style;
+    const follow_up = " · What can fx do differently?\n";
+
+    // The line a cancelled terminal writes, and the turn's own notice.
+    try std.testing.expectEqualStrings(
+        try std.mem.concat(a, u8, &.{ warn, "▪", reset, " ", hint, "Cancelled", reset, follow_up }),
+        (try cancelledCommandNotice(a, try std.mem.concat(a, u8, &.{ warn, "▪", reset, " ", hint, "Cancelled touch .ready && sleep 60", reset, follow_up }))).?,
+    );
+    // A summary with styles of its own keeps them, with no text between.
+    try std.testing.expectEqualStrings(
+        try std.mem.concat(a, u8, &.{ warn, "▪", reset, hint, " Cancelled\x1b[0m\x1b[38;5;245m\x1b[0m", reset, follow_up }),
+        (try cancelledCommandNotice(a, try std.mem.concat(a, u8, &.{ warn, "▪", reset, hint, " Cancelled\x1b[0m \x1b[38;5;245msleep 30\x1b[0m", reset, follow_up }))).?,
+    );
+    // A line already without a command, and one an older fx saved with no
+    // follow-up.
+    try std.testing.expectEqualStrings("▪ Cancelled · What can fx do differently?", (try cancelledCommandNotice(a, "▪ Cancelled · What can fx do differently?")).?);
+    try std.testing.expectEqualStrings("■ Cancelled\n", (try cancelledCommandNotice(a, "■ Cancelled sleep 30\n")).?);
+    // A line that doesn't read `Cancelled …` after its mark stays as it is.
+    try std.testing.expect(try cancelledCommandNotice(a, "▪ Stopped sleep 30") == null);
+    try std.testing.expect(try cancelledCommandNotice(a, "cancelled") == null);
+}
+
+test "only a cancelled command's notice leaves out its text, in a group with an MCP call" {
+    const alloc = std.testing.allocator;
+    const command = "fx mcp call mcp_fixture_echo '{\\\"text\\\":\\\"hello\\\"}' > out.txt; wc -c < out.txt";
+    const entries = [_]TranscriptEntry{
+        .{ .raw_bytes = .{ .id = 1, .bytes = "▪ Cancelled fx mcp call mcp_fixture_echo '{\"text\":\"hello\"}' > out.txt; wc -c < out.txt · What can fx do differently?", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 2, .bytes = "▪ Cancelled mcp_fixture_echo · What can fx do differently?", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 3, .bytes = "▪ Cancelled sleep 30 · What can fx do differently?", .class = .tool_status } },
+    };
+    const details = [_]ToolDetailRecord{
+        .{ .entry_id = 1, .tool_name = @constCast("shell"), .activity_kind = .command, .arguments_json = @constCast("{\"command\":\"" ++ command ++ "\"}"), .outcome = .cancelled },
+        .{ .entry_id = 2, .tool_name = @constCast("mcp_fixture_echo"), .activity_kind = .mcp, .outcome = .cancelled },
+        .{ .entry_id = 3, .tool_name = @constCast("shell"), .activity_kind = .command, .arguments_json = @constCast("{\"command\":\"sleep 30\"}"), .outcome = .cancelled },
+    };
+    var projection = try buildStyled(alloc, &entries, &details, 160, .{}, .{});
+    defer projection.deinit(alloc);
+    const bytes = projection.entry_actions.items[0].override.bytes;
+
+    // Each command's notice names no command, and the MCP call's names its
+    // tool, as before.
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, bytes, "\n\n▪ Cancelled · What can fx do differently?"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, bytes, "\n\n▪ Cancelled mcp_fixture_echo · What can fx do differently?"));
+    try std.testing.expect(std.mem.find(u8, bytes, "> out.txt") == null);
+    try std.testing.expect(std.mem.find(u8, bytes, "Cancelled sleep 30 ·") == null);
 }
 
 test "a cancelled call clips its header to one row" {
@@ -6783,7 +7205,8 @@ test "commands one after the other share a row, and reads show the file by name"
         rows.next().?,
     );
     // The passing commands before the failure share one row, each step once.
-    try std.testing.expectEqualStrings("├ Ran \x1b[38;5;252mrg\x1b[39m, \x1b[38;5;252msed\x1b[39m", rows.next().?);
+    // rg ran again after sed, so it is the newest step.
+    try std.testing.expectEqualStrings("├ Ran \x1b[38;5;252msed\x1b[39m, \x1b[38;5;252mrg\x1b[39m", rows.next().?);
     // The failure keeps its own row and reason line, and the command after it
     // starts a new row.
     try std.testing.expect(std.mem.startsWith(u8, rows.next().?, "├ Exited 1 "));
@@ -6822,6 +7245,93 @@ fn storyCommandDetail(
         .outcome = .completed,
         .command_process_presentation = .{ .exit_code = exit_code },
     };
+}
+
+test "shell calls that never ran because their request was wrong read as the model's mistake" {
+    // The rows of a real session: two requests the shell refused before
+    // running anything, then the fixed request, which ran the same steps.
+    const alloc = std.testing.allocator;
+    const first = "ls -l zig-out/bin/fx 2>/dev/null && ./zig-out/bin/fx help 2>&1 | head -60";
+    const second = "ls -l zig-out/bin/fx 2>/dev/null; ./zig-out/bin/fx help 2>&1 | head -50";
+    const refused = "{\"error\":{\"code\":\"invalid_shell_request\",\"executed\":false,\"problems\":[\"Choose either profile or shell.\"]}}";
+    const refused_twice = "{\"error\":{\"code\":\"invalid_shell_request\",\"executed\":false,\"problems\":[\"Choose either profile or shell.\",\"Set tty with shell.\"]}}";
+    const entries = [_]TranscriptEntry{
+        .{ .raw_bytes = .{ .id = 1, .bytes = "● Failed " ++ first ++ " · 2 invalid fields\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 2, .bytes = "● Failed " ++ second ++ " · 1 invalid field\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 3, .bytes = "● Ran " ++ second ++ "\n", .class = .tool_status } },
+    };
+    var details = [_]ToolDetailRecord{
+        storyCommandDetail(1, "{\"command\":\"" ++ first ++ "\",\"profile\":\"clean\",\"tty\":true}", 0, refused_twice),
+        storyCommandDetail(2, "{\"command\":\"" ++ second ++ "\"}", 0, refused),
+        storyCommandDetail(3, "{\"action\":\"run\",\"command\":\"" ++ second ++ "\"}", 0, null),
+    };
+    details[0].outcome = .failed;
+    details[0].command_process_presentation = null;
+    details[0].command_display = @constCast(first);
+    details[1].outcome = .failed;
+    details[1].command_process_presentation = null;
+    details[1].command_display = @constCast(second);
+    details[2].command_display = @constCast(second);
+
+    // The fixed request says which try it was; the refused ones get no row,
+    // no count, and no "run" of their own.
+    const fixed = try groupTextForTest(alloc, &entries, &details);
+    defer alloc.free(fixed);
+    errdefer std.debug.print("fixed group:\n{s}\n", .{fixed});
+    try std.testing.expect(std.mem.find(u8, fixed, "Ran ls, fx help · 3rd try") != null);
+    try std.testing.expect(std.mem.find(u8, fixed, "Failed") == null);
+    try std.testing.expect(std.mem.find(u8, fixed, "invalid") == null);
+    try std.testing.expect(std.mem.find(u8, fixed, "failed") == null);
+    try std.testing.expect(std.mem.find(u8, fixed, "passed on") == null);
+
+    // A refused request the model did not fix reads as a call it got wrong,
+    // by its steps, without the whole command or the reason.
+    const alone = try groupTextForTest(alloc, entries[0..1], details[0..1]);
+    defer alloc.free(alone);
+    errdefer std.debug.print("alone group:\n{s}\n", .{alone});
+    try std.testing.expectEqualStrings("● Couldn't run ls, fx help", std.mem.trim(u8, alone, "\n"));
+
+    // Before another command, the header counts neither a command nor a
+    // failure for it, as for any call the model got wrong.
+    const other = [_]TranscriptEntry{
+        entries[0],
+        .{ .raw_bytes = .{ .id = 4, .bytes = "● Ran printf done\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 5, .bytes = "  2s", .class = .turn_summary } },
+    };
+    var other_details = [_]ToolDetailRecord{ details[0], storyCommandDetail(4, "{\"action\":\"run\",\"command\":\"printf done\"}", 0, null) };
+    other_details[1].command_display = @constCast("printf done");
+    const before_other = try groupTextForTest(alloc, &other, &other_details);
+    defer alloc.free(before_other);
+    errdefer std.debug.print("before another command:\n{s}\n", .{before_other});
+    try std.testing.expectEqualStrings("● Ran a command ✓", firstLineForTest(before_other));
+    try std.testing.expect(std.mem.find(u8, before_other, "├ Couldn't run ls, fx help") != null);
+    try std.testing.expect(std.mem.find(u8, before_other, "failed") == null);
+
+    // A refused request the turn ended on still shows under collapse, like
+    // any failure a turn ends on; expanded, its row says it.
+    const last = [_]TranscriptEntry{ other[1], entries[0], other[2] };
+    const last_details = [_]ToolDetailRecord{ other_details[1], details[0] };
+    {
+        var collapsed = try buildWithStyleAndStats(alloc, &last, &last_details, 120, null, true, .{}, .{}, .compact, null, null);
+        defer collapsed.deinit(alloc);
+        const header = collapsed.entry_actions.items[0].override.bytes;
+        errdefer std.debug.print("collapsed:\n{s}\n", .{header});
+        try std.testing.expect(std.mem.find(u8, header, "· 1 failed") != null);
+    }
+    const expanded = try groupTextForTest(alloc, &last, &last_details);
+    defer alloc.free(expanded);
+    errdefer std.debug.print("expanded:\n{s}\n", .{expanded});
+    try std.testing.expect(std.mem.find(u8, firstLineForTest(expanded), "failed") == null);
+    // The row the turn ended on says why, as core counted it.
+    try std.testing.expect(std.mem.find(u8, expanded, "└ Couldn't run ls, fx help · 2 invalid fields") != null);
+    try std.testing.expect(std.mem.find(u8, expanded, "Choose either") == null);
+
+    // A refused request the turn ended on, alone, says why on its one row.
+    const alone_last = [_]TranscriptEntry{ entries[1], other[2] };
+    const alone_last_text = try groupTextForTest(alloc, &alone_last, details[1..2]);
+    defer alloc.free(alone_last_text);
+    errdefer std.debug.print("alone, last:\n{s}\n", .{alone_last_text});
+    try std.testing.expectEqualStrings("● Couldn't run ls, fx help · 1 invalid field", firstLineForTest(alone_last_text));
 }
 
 test "repeated runs of one command share a row that keeps the earlier failures" {
@@ -6931,7 +7441,7 @@ test "search folder names stay terminal-safe and short" {
     try std.testing.expectEqualStrings("w, docs", try searchFolderNames(arena, &.{ "/w", "/w/docs" }));
     try std.testing.expectEqualStrings("., src", try searchFolderNames(arena, &.{ "", "src" }));
     try std.testing.expectEqualStrings("a/x, b/y", try searchFolderNames(arena, &.{ "/r/a/x", "/r/b/y" }));
-    try std.testing.expectEqualStrings("a, b, c +2 more", try searchFolderNames(arena, &.{ "/r/a", "/r/b", "/r/c", "/r/d", "/r/e" }));
+    try std.testing.expectEqualStrings("+2, c, d, e", try searchFolderNames(arena, &.{ "/r/a", "/r/b", "/r/c", "/r/d", "/r/e" }));
     // A path from the model never reaches the terminal as raw control bytes.
     const hostile = try searchFolderNames(arena, &.{ "/w/a\x1b]0;owned\x07", "/w/b" });
     try std.testing.expect(std.mem.findScalar(u8, hostile, 0x1b) == null);
@@ -6967,6 +7477,26 @@ test "input to a running session and its stop are not new commands" {
     const follow_bytes = follow_ups.entry_actions.items[0].override.bytes;
     try std.testing.expect(std.mem.startsWith(u8, follow_bytes, "● Stopped "));
     try std.testing.expect(std.mem.endsWith(u8, follow_bytes, " · 2 calls ✓") or std.mem.endsWith(u8, follow_bytes, " · 2 calls"));
+}
+
+test "a running toolbox run of an MCP tool joins that tool's row before its arguments arrive" {
+    // Its status names the tool first; its arguments, which name it too,
+    // come later, so it must not show on its own row and fold away.
+    const alloc = std.testing.allocator;
+    const run_args = "{\"run\":\"mcp_fixture_echo\",\"arguments\":{}}";
+    const entries = [_]TranscriptEntry{
+        .{ .raw_bytes = .{ .id = 1, .bytes = "● Ran MCP mcp_fixture_echo\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 2, .bytes = "● Ran MCP mcp_fixture_echo\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 3, .bytes = "● Running MCP mcp_fixture_echo\n", .class = .tool_status } },
+    };
+    const details = [_]ToolDetailRecord{
+        .{ .entry_id = 1, .tool_name = @constCast("toolbox"), .activity_kind = .mcp, .outcome = .completed, .arguments_json = @constCast(run_args) },
+        .{ .entry_id = 2, .tool_name = @constCast("toolbox"), .activity_kind = .mcp, .outcome = .completed, .arguments_json = @constCast(run_args) },
+        .{ .entry_id = 3, .tool_name = @constCast("toolbox"), .activity_kind = .mcp },
+    };
+    const text = try groupTextForTest(alloc, &entries, &details);
+    defer alloc.free(text);
+    try std.testing.expectEqualStrings("● Running MCP mcp_fixture_echo ×3", std.mem.trim(u8, text, "\n"));
 }
 
 test "toolbox lookups and wrapped arguments name what the group did" {
@@ -7249,7 +7779,8 @@ test "every read in a group shares one row, and so does each search tool" {
     try std.testing.expectEqualStrings("● Read files, searched, ran a command ✓", rows.next().?);
     // Each file shows once, though the model read a.zig twice with other
     // calls between, and each search tool keeps one row of its patterns.
-    try std.testing.expectEqualStrings("├ Read a.zig, b.zig, c.zig", rows.next().?);
+    // a.zig was read again after b.zig, so it comes after it.
+    try std.testing.expectEqualStrings("├ Read b.zig, a.zig, c.zig", rows.next().?);
     try std.testing.expectEqualStrings("├ Searched retry, backoff", rows.next().?);
     try std.testing.expectEqualStrings("├ Matched *.zig", rows.next().?);
     // A failed read keeps its own row.
@@ -7264,7 +7795,8 @@ test "every read in a group shares one row, and so does each search tool" {
     defer narrow.deinit(alloc);
     var narrow_rows = std.mem.splitScalar(u8, narrow.entry_actions.items[0].override.bytes, '\n');
     _ = narrow_rows.next();
-    try std.testing.expectEqualStrings("├ Read a.zig +2 more", narrow_rows.next().?);
+    // A narrow row keeps the newest name and counts the older ones first.
+    try std.testing.expectEqualStrings("├ Read +2, c.zig", narrow_rows.next().?);
 
     // A narrow header drops its last parts first and keeps the failure; the
     // mark goes with the commands it is for.
@@ -8043,6 +8575,48 @@ test "a command that ran after one still running keeps its own row and no check 
     try std.testing.expect(std.mem.find(u8, text, "✓") == null);
 }
 
+test "a row of commands shows its newest steps and counts the older ones first" {
+    // The newest step is the one that may still run, so it is never the one
+    // left out, also on a narrow row.
+    const alloc = std.testing.allocator;
+    const commands = [_][]const u8{ "echo a", "cat notes.md", "git status", "sed -n 1p notes.md", "python3 run.py" };
+    var entries: [commands.len]TranscriptEntry = undefined;
+    var details: [commands.len]ToolDetailRecord = undefined;
+    var json_bufs: [commands.len][64]u8 = undefined;
+    var status_bufs: [commands.len][64]u8 = undefined;
+    for (commands, 0..) |command, index| {
+        const running = index == commands.len - 1;
+        const status = try std.mem.print(&status_bufs[index], "● {s} {s}\n", .{ if (running) "Running" else "Ran", command });
+        entries[index] = .{ .raw_bytes = .{ .id = @intCast(index + 1), .bytes = status, .class = .tool_status } };
+        const json = try std.mem.print(&json_bufs[index], "{{\"command\":\"{s}\"}}", .{command});
+        details[index] = storyCommandDetail(@intCast(index + 1), json, 0, null);
+        details[index].command_display = @constCast(command);
+        if (running) {
+            details[index].outcome = null;
+            details[index].command_process_presentation = null;
+        }
+    }
+    const text = try groupTextForTest(alloc, &entries, &details);
+    defer alloc.free(text);
+    try std.testing.expectEqualStrings("● Running +2, git status, sed, python3 run.py", std.mem.trim(u8, text, "\n"));
+
+    var narrow = try build(alloc, &entries, &details, 30);
+    defer narrow.deinit(alloc);
+    var painted: std.ArrayList(u8) = .empty;
+    defer painted.deinit(alloc);
+    for (narrow.entry_actions.items) |action| switch (action) {
+        .override => |override| {
+            try painted.appendSlice(alloc, override.bytes);
+            try painted.append(alloc, '\n');
+        },
+        else => {},
+    };
+    errdefer std.debug.print("narrow group:\n{s}\n", .{painted.items});
+    const narrow_text = try visibleLinesForTest(alloc, painted.items, 30);
+    defer alloc.free(narrow_text);
+    try std.testing.expectEqualStrings("● Running +4, python3 run.py", std.mem.trim(u8, narrow_text, "\n"));
+}
+
 test "a session's input finds its run after a quick command joined the run's row" {
     const alloc = std.testing.allocator;
     var first = storyCommandDetail(1, "{\"action\":\"run\",\"command\":\"printf a\"}", 0, null);
@@ -8070,4 +8644,74 @@ test "a session's input finds its run after a quick command joined the run's row
     const trimmed = std.mem.trim(u8, text, "\n");
     try std.testing.expect(std.mem.findScalar(u8, trimmed, '\n') == null);
     try std.testing.expect(std.mem.startsWith(u8, trimmed, "● Observed printf, sh"));
+}
+
+test "a command with a here-document shows its steps, whatever the document says" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // The call that opened a PR: its body's apostrophes are not shell quotes.
+    const opened_pr =
+        \\cd "$(cat /tmp/work/dir)"; b=fix-notes; cat > /tmp/work/body.md <<'EOF'
+        \\## Summary
+        \\
+        \\- That row now says why, as core's status counts it: `Couldn't run ls, printf · 2 invalid fields`.
+        \\EOF
+        \\url=$(gh pr create --draft --head "$b" --title "Say why" --body-file /tmp/work/body.md 2>&1 | tail -1); echo "$url"; n=$(echo "$url" | grep -o '[0-9]*$'); echo $n > /tmp/work/pr; gh pr view $n --json isDraft -q '"draft=\(.isDraft)"'; gh pr view $n --json body -q .body | grep -c Summary || true
+    ;
+    try std.testing.expectEqualStrings("cat, echo, gh pr view", (try shortCommand(a, opened_pr)).?);
+    try std.testing.expectEqualStrings("cat, wc", (try shortCommand(a, "cat > notes.md <<'EOF'\nThe model's notes\nEOF\nwc -l notes.md")).?);
+    // Two documents on one line, one with its tabs taken out.
+    try std.testing.expectEqualStrings("cat, wc", (try shortCommand(a, "cat <<A <<-\"B\" > x\na's\nA\n\tb's\n\tB\nwc -l x")).?);
+    // A shift in arithmetic and a here-string open no document.
+    try std.testing.expectEqualStrings("echo, ls", (try shortCommand(a, "echo $((1 << 2))\nls -la")).?);
+    try std.testing.expectEqualStrings("grep, wc", (try shortCommand(a, "grep x <<< \"it's\" && wc -l y")).?);
+    // `<<` inside quotes or a comment opens no document either.
+    try std.testing.expectEqualStrings("echo, ls", (try shortCommand(a, "echo \"a << b\" # c << d\nls -la")).?);
+    // A here-string with an apostrophe, before another line.
+    try std.testing.expectEqualStrings("wc, ls", (try shortCommand(a, "wc -c <<< \"it's\"\nls >/dev/null")).?);
+    // A word on the opening line that matches the delimiter is no closing
+    // line, since the document's body was on the lines after it.
+    try std.testing.expectEqualStrings("cat, echo, ls", (try shortCommand(a, "cat <<EOF > f.txt; echo EOF\nbody it's\nEOF\nls >/dev/null")).?);
+    // Core folds a command's lines into one for its row; the document still
+    // ends its step at the delimiter.
+    try std.testing.expectEqualStrings("cat, sleep", (try shortCommand(a, "cat <<'EOF' launch marker line EOF sleep 300")).?);
+}
+
+test "a failed command's reason is the error it reports, not code it printed" {
+    // A command that printed code with "error" in it before sed failed.
+    const printed_code =
+        \\const terminal_action_field_error_code = "invalid_action_fields";
+        \\    const error_value = switch (root.get("error") orelse return null) {
+        \\        error.OutOfMemory => error.OutOfMemory,
+        \\....
+        \\sed: 1: ",12p
+        \\": invalid command code ,
+    ;
+    try std.testing.expectEqualStrings("sed: 1: \",12p", verdictLine(printed_code, &.{ "sed", "echo" }).?);
+    // The first line that reports wins, before a program's later summary.
+    try std.testing.expectEqualStrings("src/main.c:3: error: bad type", verdictLine("cc -c main.c\nsrc/main.c:3: error: bad type\nmake: *** [build] Error 2", &.{"make"}).?);
+    try std.testing.expectEqualStrings("FAIL  quits on click", verdictLine("running 4 tests\n FAIL  quits on click\nError: Test timed out.", &.{"sh"}).?);
+    try std.testing.expectEqualStrings("json.decoder.JSONDecodeError: Expecting value", verdictLine("Traceback (most recent call last):\n  File \"x.py\", line 1\njson.decoder.JSONDecodeError: Expecting value", &.{"python3"}).?);
+    // The shell speaks for a command it could not find.
+    try std.testing.expectEqualStrings("/bin/sh: line 1: nope: command not found", verdictLine("checking\n/bin/sh: line 1: nope: command not found", &.{"nope"}).?);
+    // A word that only names a failure counts when nothing reports one.
+    try std.testing.expectEqualStrings("2 tests failed", verdictLine("ran 5 tests\n2 tests failed\ndone in 3s", &.{"sh"}).?);
+    // A name that holds "error" names none, so the last line stands.
+    try std.testing.expectEqualStrings("done", verdictLine("error_code = 1\nErrorSet.read\ndone", &.{}).?);
+
+    // In a row, the reason comes from sed, not from the code it printed.
+    const alloc = std.testing.allocator;
+    const display = "sed -n 28,45p f; echo ....; sed -n \"$n,$((n+12))p\" p";
+    const entries = [_]TranscriptEntry{
+        .{ .raw_bytes = .{ .id = 1, .bytes = "● Exited 1 " ++ display ++ "\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 2, .bytes = "  2s", .class = .turn_summary } },
+    };
+    var details = [_]ToolDetailRecord{storyCommandDetail(1, "{\"action\":\"run\",\"command\":\"sed -n 28,45p f; echo ....; sed -n \\\"$n,$((n+12))p\\\" p\"}", 1, printed_code)};
+    details[0].command_display = @constCast(display);
+    const text = try groupTextForTest(alloc, &entries, &details);
+    defer alloc.free(text);
+    errdefer std.debug.print("group:\n{s}\n", .{text});
+    try std.testing.expect(std.mem.find(u8, text, "· sed: 1:") != null);
+    try std.testing.expect(std.mem.find(u8, text, "error_code") == null);
 }
