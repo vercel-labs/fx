@@ -97,6 +97,14 @@ const REFUSED_REQUESTS: StoryStep[] = [
   { at: 3, text: "The folder is listed." },
 ];
 
+// A turn that ends on a request the shell refused, which the model never
+// fixed.
+const REFUSED_LAST: StoryStep[] = [
+  { at: 0, calls: [sh("printf done")] },
+  { at: 1, calls: [REFUSED_REQUESTS[0].calls![0]] },
+  { at: 2, text: "I could not list the folder." },
+];
+
 const SUBAGENTS: StoryStep[] = [
   {
     at: 0,
@@ -367,6 +375,37 @@ test.skipIf(!tmuxAvailable())(
     sessions.push(resumed);
     await resumed.waitForText("The folder is listed.", TIMEOUT);
     expectFixedRequest(paneLines(await resumed.waitForComposer(TIMEOUT)));
+  },
+  TIMEOUT * 3,
+);
+
+test.skipIf(!tmuxAvailable())(
+  "a refused shell request the turn ended on says why, also after resume",
+  async () => {
+    const { root, gateway, session, pane } = await runStory(REFUSED_LAST, {
+      prompt: "list the folder",
+      finalText: "I could not list the folder.",
+    });
+    const expectReason = (lines: string[]) => {
+      // Like any failure a turn ends on, its row says why, as core counted
+      // it, but not the error the model got.
+      expect(lines).toContain("└ Couldn't run ls, printf · 2 invalid fields");
+      expect(lines.some((line) => /Choose either|Failed /.test(line))).toBe(false);
+    };
+    expectReason(paneLines(pane));
+
+    await session.kill();
+    sessions.splice(sessions.indexOf(session), 1);
+    const resumed = await TmuxSession.create({
+      cmd: `${FX_BIN} --resume last`,
+      cwd: root.workspace,
+      env: storyEnv(root, gateway),
+      width: 110,
+      height: 60,
+    });
+    sessions.push(resumed);
+    await resumed.waitForText("I could not list the folder.", TIMEOUT);
+    expectReason(paneLines(await resumed.waitForComposer(TIMEOUT)));
   },
   TIMEOUT * 3,
 );
