@@ -13,6 +13,7 @@ const io_mod = @import("../shared/io.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const end_test_controls = @import("end_test_controls.zig");
 const start_test_controls = @import("start_test_controls.zig");
+const publish_test_controls = @import("publish_test_controls.zig");
 const permission_request = @import("../permissions/permission_request.zig");
 const session_adapter = @import("../session/session_adapter.zig");
 const session_codec = @import("../session/session_codec.zig");
@@ -49,6 +50,11 @@ const Slot = struct {
     /// Set when the user closes the child from the agent list, so its
     /// report says the user closed it.
     closed_by_user: bool = false,
+    /// Set once the work's end is recorded, until the host chooses a next
+    /// work for the slot (`markNext`). A stop or close that finds it set has
+    /// no work to end, stopped or not: the slot has only not gone on yet
+    /// (`tests/tla/subagent/StopMessage.tla` GapStopHonest).
+    ended: bool = false,
     /// Set by the host once it has no next work for the slot, which then
     /// finishes. A start for the child waits for that.
     ending: bool = false,
@@ -135,7 +141,9 @@ pub const WorkEnd = struct {
 
 /// The host's hook for a work's end, called on the child's slot thread with
 /// no lock held. It returns true when it has installed the child's next
-/// work in the registry, which the same slot then runs.
+/// work in the registry, which the same slot then runs. Before it returns
+/// true it must call `markNext`, so the slot's stop flags are the next
+/// work's from then on.
 pub const EndHook = struct {
     context: *anyopaque,
     end_fn: *const fn (*anyopaque, WorkEnd) bool,
@@ -161,9 +169,10 @@ pub const Owner = struct {
     slots: std.ArrayList(*Slot) = .empty,
     feedback: std.ArrayList(*Feedback) = .empty,
     closed: bool = false,
-    /// `/close` closed this owner's tree: works that end from now on owe no
-    /// report, since nobody is left to take one. A quit leaves it false, so
-    /// its reports stay owed.
+    /// `/close`, or a switch to another session, closed this owner's tree:
+    /// works that end from now on owe no report, since nobody is left to take
+    /// one, and a teardown ends them cancelled. A quit leaves it false, so its
+    /// reports stay owed.
     tree_closed: bool = false,
     /// Set when fx starts to quit, so a work its quit cancels says so in
     /// its report.
@@ -465,6 +474,29 @@ pub const Owner = struct {
         return observation;
     }
 
+    /// The host chose a next work for the child's slot, which goes on to run
+    /// it: the ended work's stop is spent and its settled messages go, so a
+    /// stop or close from here on is for the next work, which the slot then
+    /// starts already stopped. The host calls it while it holds its
+    /// admission lock, as it calls `markEnding`, so the choice and what a
+    /// stop or close sees of it are in one order. The slot resets the live
+    /// metrics itself as it goes on, which keeps this method off them: the
+    /// term WebAssembly surface reaches the host's hook but never runs a
+    /// slot, and 64-bit atomics do not compile there.
+    pub fn markNext(self: *Owner, child_id: []const u8) void {
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        for (self.slots.items) |slot| {
+            if (!std.mem.eql(u8, slot.child_id, child_id) or slot.completion != .running) continue;
+            self.dropSettledFeedbackLocked(slot.child_id);
+            slot.cancel.store(false, .seq_cst);
+            slot.stopped_by_parent = false;
+            slot.stopped_by_user = false;
+            slot.closed_by_user = false;
+            slot.ended = false;
+        }
+    }
+
     /// The host has no next work for the child's slot, which is about to
     /// finish its last one.
     pub fn markEnding(self: *Owner, child_id: []const u8) void {
@@ -475,8 +507,9 @@ pub const Owner = struct {
         }
     }
 
-    /// Marks this owner's tree closed by `/close`: every work that ends
-    /// after this owes no report. Call before the tree's turns are cancelled.
+    /// Marks this owner's tree closed by `/close` or by a switch to another
+    /// session: every work that ends after this owes no report. Call before
+    /// the tree's turns are cancelled or the owner is torn down.
     pub fn closeTree(self: *Owner) void {
         self.mutex.lockUncancelable(io_mod.getIo());
         defer self.mutex.unlock(io_mod.getIo());
@@ -545,6 +578,8 @@ pub const Owner = struct {
         for (self.slots.items) |slot| {
             if (!std.mem.eql(u8, slot.child_id, child_id)) continue;
             if (slot.completion != .running) return false;
+            // The work ended and the slot has not gone on: no work to end.
+            if (slot.ended) return false;
             slot.stopped_by_user = true;
             slot.closed_by_user = true;
             slot.cancel.store(true, .seq_cst);
@@ -565,6 +600,9 @@ pub const Owner = struct {
         for (self.slots.items) |slot| {
             if (!std.mem.eql(u8, slot.child_id, child_id)) continue;
             if (slot.completion != .running) return null;
+            // The work ended and the slot has not gone on: no work to stop.
+            // Whatever waited for it is the host's to drop.
+            if (slot.ended) return null;
             // A second stop of a turn still ending: the first counted its
             // unread messages, which stay queued until the end drops them.
             const counted = slot.stopped_by_parent;
@@ -594,6 +632,44 @@ pub const Owner = struct {
 
     /// The parent drains tool callers before releasing its borrowed context.
     pub fn cancelAndJoin(self: *Owner, child_id: []const u8) void {
+        self.stopAndJoin(child_id, .cancelled);
+    }
+
+    /// Ends the running turn of each child that waits on an approval, as a
+    /// quit ends every turn: its work ends interrupted and owes its report,
+    /// and the wait ends. The other children keep running. Returns how many
+    /// turns it ended. A host whose approvals reach no one calls it, so a
+    /// turn that waits for one does not wait for ever.
+    pub fn interruptApprovalWaits(self: *Owner) usize {
+        var waiting: std.ArrayList([]u8) = .empty;
+        defer {
+            for (waiting.items) |child_id| self.alloc.free(child_id);
+            waiting.deinit(self.alloc);
+        }
+        {
+            self.mutex.lockUncancelable(io_mod.getIo());
+            defer self.mutex.unlock(io_mod.getIo());
+            for (self.slots.items) |slot| {
+                if (slot.completion != .running) continue;
+                // The worker's own flag, read under its lock: the registry's phase is saved only
+                // after the request is registered, so a turn still registering would read as running.
+                const worker = slot.worker orelse continue;
+                if (!worker.permissionWaiting()) continue;
+                const child_id = self.alloc.dupe(u8, slot.child_id) catch continue;
+                waiting.append(self.alloc, child_id) catch {
+                    self.alloc.free(child_id);
+                    continue;
+                };
+            }
+        }
+        for (waiting.items) |child_id| self.stopAndJoin(child_id, .interrupted);
+        return waiting.items.len;
+    }
+
+    /// Ends the running turn of `child_id` and joins its slot: the wait of
+    /// an approval ends too. `.cancelled` keeps an explicit cancellation as
+    /// one, and `.interrupted` ends the work as a quit would.
+    fn stopAndJoin(self: *Owner, child_id: []const u8, end: enum { cancelled, interrupted }) void {
         const slot = blk: {
             self.mutex.lockUncancelable(io_mod.getIo());
             defer self.mutex.unlock(io_mod.getIo());
@@ -601,6 +677,7 @@ pub const Owner = struct {
                 if (!std.mem.eql(u8, candidate.child_id, child_id)) continue;
                 if (candidate.completion == .running) {
                     candidate.cancel.store(true, .seq_cst);
+                    if (end == .interrupted) candidate.shutdown.store(true, .seq_cst);
                     // Stop approval waits without changing explicit cancellation to interruption.
                     stopTurn(candidate, .shutdown);
                 }
@@ -1092,6 +1169,7 @@ fn slotMain(slot: *Slot) void {
         else
             owner.cancelCause(outcome.outcome, slot.stopped_by_user) };
         const finished = owner.finish(slot.child_id, outcome.work_id, outcome.outcome, outcome.failure, slot.stopped_by_parent, end);
+        slot.ended = true;
         const closing = owner.closed or slot.shutdown.load(.seq_cst);
         // A stop drops the parent's messages, as do a quit and `/close`.
         if (slot.stopped_by_parent or slot.stopped_by_user or closing or owner.tree_closed or owner.quitting.load(.seq_cst)) {
@@ -1107,16 +1185,14 @@ fn slotMain(slot: *Slot) void {
             .end = end,
             .leftovers = slot.leftovers.items,
         }) else false;
+        publish_test_controls.holdPublish(slot.child_id);
         owner.mutex.lockUncancelable(io_mod.getIo());
         freeLeftovers(owner.alloc, slot);
         if (next and !closing and !owner.closed and !slot.shutdown.load(.seq_cst)) {
-            // The next work starts afresh: this one's stop is spent, and its
-            // messages' entries go, as Owner.start drops them.
-            owner.dropSettledFeedbackLocked(slot.child_id);
-            slot.cancel.store(false, .seq_cst);
-            slot.stopped_by_parent = false;
-            slot.stopped_by_user = false;
-            slot.closed_by_user = false;
+            // The host's choice of this work already spent the ended work's
+            // stop (`markNext`), so a stop since then is this work's and
+            // stays: it starts stopped.
+            std.debug.assert(!slot.ended);
             slot.metrics.reset();
             owner.mutex.unlock(io_mod.getIo());
             continue;
@@ -1226,7 +1302,7 @@ fn runOne(slot: *Slot) OneOutcome {
         admission,
         &slot.cancel,
     ) catch |err| {
-        const outcome: child_state.Outcome = if (slot.shutdown.load(.seq_cst))
+        const outcome: child_state.Outcome = if (interruptedByTeardown(slot))
             .interrupted
         else if (slot.cancel.load(.seq_cst) or err == error.Cancelled)
             .cancelled
@@ -1241,7 +1317,7 @@ fn runOne(slot: *Slot) OneOutcome {
                 null,
         };
     };
-    if (slot.shutdown.load(.seq_cst)) return .{
+    if (interruptedByTeardown(slot)) return .{
         .work_id = work_id,
         .outcome = .interrupted,
     };
@@ -1256,6 +1332,20 @@ fn runOne(slot: *Slot) OneOutcome {
             .awaiting_approval, .paused => .interrupted,
         },
     };
+}
+
+/// Whether the owner's teardown ended `slot`'s work as a quit does:
+/// interrupted, with its report left owed. After `closeTree` the teardown
+/// ends the work cancelled instead, which owes nothing. A finish that owes
+/// nothing is saved without data, and a reopen reads an interrupted finish
+/// without data as crash repair, which owes a report
+/// (`reports.PendingFold.step`), so only a cancelled one stays quiet.
+fn interruptedByTeardown(slot: *Slot) bool {
+    if (!slot.shutdown.load(.seq_cst)) return false;
+    const owner = slot.owner;
+    owner.mutex.lockUncancelable(io_mod.getIo());
+    defer owner.mutex.unlock(io_mod.getIo());
+    return !owner.tree_closed;
 }
 
 /// A child's saved preferences, read without opening its session. Caller
@@ -1640,16 +1730,22 @@ fn debugFailure(child_id: []const u8, stage: []const u8, err: anyerror) void {
 }
 
 test "managed owner cancellation join wakes pending permission" {
-    try testCancellationJoin(.pending);
+    try testCancellationJoin(.pending, .cancel);
 }
 
 test "managed owner cancellation join stops late permission registration" {
-    try testCancellationJoin(.before_permission);
+    try testCancellationJoin(.before_permission, .cancel);
 }
 
 test "managed owner cancellation join reaches worker attached after cancellation" {
-    try testCancellationJoin(.before_attachment);
+    try testCancellationJoin(.before_attachment, .cancel);
 }
+
+test "managed owner interrupts a turn that waits on an approval, which ends the work interrupted" {
+    try testCancellationJoin(.pending, .interrupt);
+}
+
+const JoinEnd = enum { cancel, interrupt };
 
 const CancellationJoinTest = struct {
     owner: *Owner,
@@ -1665,6 +1761,10 @@ const CancellationJoinTest = struct {
     decision: ?types.ToolPermissionDecision = null,
     effects: usize = 0,
     commits: usize = 0,
+    /// Which call ends the turn: the parent's cancel, or the interruption
+    /// of the turns that wait on an approval.
+    end: JoinEnd = .cancel,
+    interrupted: usize = 0,
 
     fn childMain(self: *@This()) void {
         self.start.waitUncancelable(io_mod.getIo());
@@ -1672,7 +1772,10 @@ const CancellationJoinTest = struct {
     }
 
     fn joinMain(self: *@This()) void {
-        self.owner.cancelAndJoin("child");
+        switch (self.end) {
+            .cancel => self.owner.cancelAndJoin("child"),
+            .interrupt => self.interrupted = self.owner.interruptApprovalWaits(),
+        }
     }
 
     fn capture(_: ?*anyopaque, alloc: Allocator, request: execution.CaptureRequest) execution.ServiceError!domain.AdmissionSnapshot {
@@ -1741,7 +1844,7 @@ const CancellationJoinTest = struct {
     }
 };
 
-fn testCancellationJoin(timing: enum { pending, before_permission, before_attachment }) !void {
+fn testCancellationJoin(timing: enum { pending, before_permission, before_attachment }, end: JoinEnd) !void {
     const alloc = std.testing.allocator;
     var parent: child_state.TestParent = undefined;
     try parent.init(alloc);
@@ -1771,7 +1874,7 @@ fn testCancellationJoin(timing: enum { pending, before_permission, before_attach
     const slot = try alloc.create(Slot);
     slot.* = .{ .owner = &owner, .child_id = try alloc.dupe(u8, "child") };
     try owner.slots.append(alloc, slot);
-    var fixture = CancellationJoinTest{ .owner = &owner, .slot = slot };
+    var fixture = CancellationJoinTest{ .owner = &owner, .slot = slot, .end = end };
     owner.services = .{ .context = &fixture, .capture_fn = CancellationJoinTest.capture, .run_fn = CancellationJoinTest.run };
     slot.thread = try std.Thread.spawn(.{}, CancellationJoinTest.childMain, .{&fixture});
     // Release every gate and stop the real worker even when an assertion fails.
@@ -1832,7 +1935,7 @@ fn testCancellationJoin(timing: enum { pending, before_permission, before_attach
             ));
         }
         try std.testing.expectEqual(@as(usize, 0), fixture.commits);
-        try std.testing.expect(!slot.shutdown.load(.seq_cst));
+        try std.testing.expectEqual(end == .interrupt, slot.shutdown.load(.seq_cst));
         fixture.finish.set(io_mod.getIo());
         // Detach invalidates the approval, but cannot release the worker while pinned.
         for (0..1000) |_| {
@@ -1848,7 +1951,8 @@ fn testCancellationJoin(timing: enum { pending, before_permission, before_attach
     try std.testing.expectEqual(@as(usize, 0), fixture.effects);
     try std.testing.expectEqual(@as(usize, 0), owner.slots.items.len);
     const observation = try owner.observe("child");
-    try std.testing.expectEqual(child_state.Outcome.cancelled, observation.outcome.?);
+    try std.testing.expectEqual(if (end == .interrupt) child_state.Outcome.interrupted else child_state.Outcome.cancelled, observation.outcome.?);
+    try std.testing.expectEqual(if (end == .interrupt) @as(usize, 1) else 0, fixture.interrupted);
     try std.testing.expect(observation.failure == null);
     var pending = try approvals.firstPendingRequest(alloc, "parent");
     defer if (pending) |*request| request.deinit(alloc);

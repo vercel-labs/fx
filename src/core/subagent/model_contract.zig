@@ -211,6 +211,8 @@ pub const Request = union(Action) {
 pub const ValidationError = error{
     OutOfMemory,
     InvalidAgent,
+    /// `stop` or `close` named "parent", which is no subagent of the caller's.
+    InvalidParentTarget,
     InvalidInstructions,
     InvalidMessage,
     InvalidReport,
@@ -274,11 +276,13 @@ pub fn validateRequest(
             break :blk .{ .status = .{ .agent = try dupeOptional(alloc, value.agent) } };
         },
         .stop => |value| blk: {
-            if (!domain.validAgentName(value.agent) or std.mem.eql(u8, value.agent, parent_agent)) return error.InvalidAgent;
+            if (!domain.validAgentName(value.agent)) return error.InvalidAgent;
+            if (std.mem.eql(u8, value.agent, parent_agent)) return error.InvalidParentTarget;
             break :blk .{ .stop = .{ .agent = try alloc.dupe(u8, value.agent) } };
         },
         .close => |value| blk: {
-            if (!domain.validAgentName(value.agent) or std.mem.eql(u8, value.agent, parent_agent)) return error.InvalidAgent;
+            if (!domain.validAgentName(value.agent)) return error.InvalidAgent;
+            if (std.mem.eql(u8, value.agent, parent_agent)) return error.InvalidParentTarget;
             break :blk .{ .close = .{ .agent = try alloc.dupe(u8, value.agent) } };
         },
     };
@@ -485,11 +489,11 @@ test "minimal request validation owns each action's intent" {
     var stop = try validateRequest(alloc, .{ .stop = .{ .agent = "reviewer" } });
     defer stop.deinit(alloc);
     try std.testing.expectEqualStrings("reviewer", stop.agentName().?);
-    try std.testing.expectError(error.InvalidAgent, validateRequest(alloc, .{ .stop = .{ .agent = "parent" } }));
+    try std.testing.expectError(error.InvalidParentTarget, validateRequest(alloc, .{ .stop = .{ .agent = "parent" } }));
     var close = try validateRequest(alloc, .{ .close = .{ .agent = "reviewer" } });
     defer close.deinit(alloc);
     try std.testing.expectEqualStrings("reviewer", close.agentName().?);
-    try std.testing.expectError(error.InvalidAgent, validateRequest(alloc, .{ .close = .{ .agent = "parent" } }));
+    try std.testing.expectError(error.InvalidParentTarget, validateRequest(alloc, .{ .close = .{ .agent = "parent" } }));
     try std.testing.expectError(error.InvalidAgent, validateRequest(alloc, .{ .status = .{ .agent = "Bad Name" } }));
 
     var message = try validateRequest(alloc, .{ .message = .{

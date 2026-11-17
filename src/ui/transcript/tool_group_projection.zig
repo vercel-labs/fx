@@ -11,7 +11,6 @@ const ui_render = @import("../render.zig");
 const code_highlight = @import("../../core/agent/presentation/code_highlight.zig");
 const code_highlight_languages = @import("../../core/agent/presentation/code_highlight_languages.zig");
 const text_utils = @import("../../core/shared/text_utils.zig");
-const ascii_case = @import("../../core/shared/ascii_case.zig");
 const json_depth = @import("../../core/shared/json_depth.zig");
 const command_lex = @import("../../core/shell_command/command_lex.zig");
 const tooling_presentation = @import("../../core/tooling/tool_presentation.zig");
@@ -382,6 +381,51 @@ fn normalizeCanonicalStatus(
         phrase = std.mem.trimEnd(u8, phrase[0 .. phrase.len - cancellation_follow_up.len], " \t");
     }
     return if (phrase.len == 0) null else phrase;
+}
+
+/// The cancellation notice of a cancelled shell command's status line `raw`,
+/// such as `▪ Cancelled touch .ready && sleep 60 · What can fx do
+/// differently?`, with no command: `▪ Cancelled · What can fx do
+/// differently?`, the notice a cancelled turn shows. The row above names the
+/// command by its short form and Ctrl+O by its full line, so the notice
+/// repeats neither. The line keeps its styles. Null when `raw` doesn't read
+/// `Cancelled …` after its mark.
+fn cancelledCommandNotice(scratch: std.mem.Allocator, raw: []const u8) !?[]const u8 {
+    var index: usize = 0;
+    while (skipSgrSequence(raw, &index)) {}
+    const marker = for (status_markers) |candidate| {
+        if (std.mem.startsWith(u8, raw[index..], candidate)) break candidate;
+    } else return null;
+    index += marker.len;
+    while (true) {
+        if (skipSgrSequence(raw, &index)) continue;
+        if (index < raw.len and raw[index] == ' ') {
+            index += 1;
+            continue;
+        }
+        break;
+    }
+    const label = "Cancelled";
+    if (!std.mem.startsWith(u8, raw[index..], label)) return null;
+    const kept_end = index + label.len;
+    // The command ends at the follow-up, or at the line's end on a line
+    // saved without one.
+    const tail_at = std.mem.findLast(u8, raw[kept_end..], cancellation_follow_up) orelse
+        std.mem.trimEnd(u8, raw[kept_end..], "\r\n").len;
+    var out: std.Io.Writer.Allocating = .init(scratch);
+    errdefer out.deinit();
+    try out.writer.writeAll(raw[0..kept_end]);
+    // The command's text goes, and its style codes stay, so every style the
+    // line opens still closes.
+    var cursor = kept_end;
+    while (cursor < kept_end + tail_at) {
+        const start = cursor;
+        if (skipSgrSequence(raw, &cursor)) {
+            try out.writer.writeAll(raw[start..cursor]);
+        } else cursor += 1;
+    }
+    try out.writer.writeAll(raw[kept_end + tail_at ..]);
+    return try out.toOwnedSlice();
 }
 
 // `■` is the cancelled marker older sessions recorded before `▪`.
@@ -2434,8 +2478,6 @@ fn ordinalEnding(number: usize, comptime word: []const u8) []const u8 {
     };
 }
 
-/// The line of command output that says what went wrong: the first line that
-/// mentions an error or a failure, else the last line.
 /// Command output kept in its escaped form, where text_utils.encodeTerminalSafe
 /// writes every control byte, line feeds included, as "\xNN", gets its escaped
 /// line feeds back as line breaks, so the reason line can pick one line of it.
@@ -2446,14 +2488,93 @@ fn storyOutputLines(scratch: std.mem.Allocator, text: []const u8) ![]const u8 {
     return std.mem.replaceOwned(u8, scratch, text, "\\x0a", "\n");
 }
 
-fn verdictLine(text: []const u8) ?[]const u8 {
+/// The line of command output that says what went wrong: the first line that
+/// reports an error or a failure, such as "Error: timed out" or
+/// "main.c:3: error: ...", else the last line where one of `programs`, the
+/// programs the command ran, or its shell reports, such as "sed: 1: ...",
+/// else the first line that names an error or a failure, else the last line.
+/// "error" or "fail" inside a longer name, such as "error_code", counts as
+/// neither, so a command that prints code does not read as its own error.
+fn verdictLine(text: []const u8, programs: []const []const u8) ?[]const u8 {
+    var named: ?[]const u8 = null;
+    var reported: ?[]const u8 = null;
     var lines = std.mem.splitScalar(u8, text, '\n');
     while (lines.next()) |line| {
         const trimmed = std.mem.trim(u8, line, " \t\r");
         if (trimmed.len == 0) continue;
-        if (ascii_case.containsIgnoreCase(trimmed, "error") or ascii_case.containsIgnoreCase(trimmed, "fail")) return trimmed;
+        switch (failureWord(trimmed)) {
+            .reports => return trimmed,
+            .names => if (named == null) {
+                named = trimmed;
+            },
+            .none => {},
+        }
+        if (programReports(trimmed, programs)) reported = trimmed;
     }
-    return lastNonEmptyLine(text);
+    return reported orelse named orelse lastNonEmptyLine(text);
+}
+
+const FailureWord = enum { none, names, reports };
+
+/// Whether `line` holds "error" or "fail" as a word of its own, such as
+/// "errors", "failed", or the end of "TypeError", and whether that word
+/// reports, starting the line or right before a colon.
+fn failureWord(line: []const u8) FailureWord {
+    var found: FailureWord = .none;
+    for ([_][]const u8{ "error", "fail" }) |stem| {
+        var start: usize = 0;
+        while (start + stem.len <= line.len) : (start += 1) {
+            if (!std.ascii.eqlIgnoreCase(line[start .. start + stem.len], stem)) continue;
+            var end = start + stem.len;
+            for ([_][]const u8{ "ures", "ure", "ing", "ed", "s" }) |ending| {
+                if (end + ending.len <= line.len and std.ascii.eqlIgnoreCase(line[end .. end + ending.len], ending)) {
+                    end += ending.len;
+                    break;
+                }
+            }
+            const before_ok = start == 0 or !isNameByte(line[start - 1]) or
+                (std.ascii.isUpper(line[start]) and (std.ascii.isLower(line[start - 1]) or std.ascii.isDigit(line[start - 1])));
+            const after_ok = end == line.len or (!isNameByte(line[end]) and
+                !(line[end] == '.' and end + 1 < line.len and std.ascii.isAlphanumeric(line[end + 1])));
+            if (!before_ok or !after_ok) continue;
+            if (start == 0 or (end < line.len and line[end] == ':')) return .reports;
+            found = .names;
+        }
+    }
+    return found;
+}
+
+fn isNameByte(byte: u8) bool {
+    return std.ascii.isAlphanumeric(byte) or byte == '_';
+}
+
+/// Whether `line` is a program speaking for itself, as in "sed: 1: ..." or
+/// "/bin/sh: line 1: ...": its first word before a colon names one of
+/// `programs` or a shell.
+fn programReports(line: []const u8, programs: []const []const u8) bool {
+    const colon = std.mem.findScalar(u8, line, ':') orelse return false;
+    if (colon == 0 or colon + 1 >= line.len) return false;
+    const speaker = line[0..colon];
+    if (std.mem.findAny(u8, speaker, " \t") != null) return false;
+    const name = std.Io.Dir.path.basenamePosix(speaker);
+    for ([_][]const u8{ "sh", "bash", "zsh", "dash", "ksh" }) |shell| if (std.mem.eql(u8, name, shell)) return true;
+    for (programs) |program| if (std.mem.eql(u8, name, program)) return true;
+    return false;
+}
+
+/// The programs a command runs, by name, such as "sed" and "git" for
+/// "sed -n 2p f && git status", so its output can tell their own messages.
+fn commandPrograms(scratch: std.mem.Allocator, record: *const ToolDetailRecord) ![]const []const u8 {
+    const command = storyArgString(scratch, record, "command") orelse record.command_display orelse return &.{};
+    var steps: std.ArrayList([]const u8) = .empty;
+    var raw_steps: usize = 0;
+    if (!try collectShortSteps(scratch, command, &steps, &raw_steps, 0)) return &.{};
+    var programs: std.ArrayList([]const u8) = .empty;
+    for (steps.items) |step| {
+        const word = step[0 .. std.mem.findScalar(u8, step, ' ') orelse step.len];
+        try programs.append(scratch, std.Io.Dir.path.basenamePosix(word));
+    }
+    return programs.items;
 }
 
 fn lastNonEmptyLine(text: []const u8) ?[]const u8 {
@@ -2511,12 +2632,13 @@ fn storyFailureReason(scratch: std.mem.Allocator, detail: ?*const ToolDetailReco
     const line: ?[]const u8 = if (record.result) |result| blk: {
         // Command details keep the plain output, where the line that names
         // the error says the most; other tools lead with their error.
-        const plain_line = if (is_command) verdictLine(try storyOutputLines(scratch, result)) else firstNonEmptyLine(result);
+        const programs = if (is_command) try commandPrograms(scratch, record) else &.{};
+        const plain_line = if (is_command) verdictLine(try storyOutputLines(scratch, result), programs) else firstNonEmptyLine(result);
         const fields = [_][]const u8{ "output_delta", "error", "message" };
         for (fields) |field_name| {
             const field = jsonObjectField(scratch, result, field_name) catch break :blk plain_line;
             if (field) |value| switch (value) {
-                .string => |text| break :blk if (std.mem.eql(u8, field_name, "output_delta")) verdictLine(text) else firstNonEmptyLine(text),
+                .string => |text| break :blk if (std.mem.eql(u8, field_name, "output_delta")) verdictLine(text, programs) else firstNonEmptyLine(text),
                 else => {},
             };
         }
@@ -2781,7 +2903,12 @@ fn writeGroupBlock(
         const detail = detailForEntry(details, detail_indices, entry_id, null) orelse continue;
         if (detail.outcome != .cancelled) continue;
 
-        const terminal = try transcript_blocks.renderEntryToBlock(scratch, entry, cols, styles);
+        // A cancelled command's notice names no command; its row does.
+        var shown = entry;
+        if (isShellCommandCall(scratch, detail)) {
+            if (try cancelledCommandNotice(scratch, entry.raw_bytes.bytes)) |notice| shown.raw_bytes.bytes = notice;
+        }
+        const terminal = try transcript_blocks.renderEntryToBlock(scratch, shown, cols, styles);
         if (terminal.bytes.len > 0) {
             try lines.append(alloc, .block_separator);
             const count = std.mem.count(u8, std.mem.trimEnd(u8, terminal.bytes, "\n"), "\n") + 1;
@@ -3330,7 +3457,11 @@ fn collectShortSteps(
     raw_steps: *usize,
     depth: usize,
 ) ShortStepError!bool {
-    const argv = command_lex.tokenize_argv(scratch, command) catch |err| switch (err) {
+    // A here-document's body is text for the program, not shell words, so
+    // an apostrophe in it does not stop the command from lexing.
+    const here_docs = try withoutHereDocBodies(scratch, command);
+    const source = here_docs.text;
+    const argv = command_lex.tokenize_argv(scratch, source) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return false,
     };
@@ -3345,12 +3476,12 @@ fn collectShortSteps(
         const token: ?command_lex.ArgvToken = if (at_end) null else tokens[index];
         // A comment runs to the end of its line.
         if (!at_end and !tokens[index].quoted and std.mem.startsWith(u8, tokens[index].raw, "#")) {
-            while (index + 1 < tokens.len and !gapHasNewline(command, tokens[index].end, tokens[index + 1].start)) index += 1;
+            while (index + 1 < tokens.len and !gapHasNewline(source, tokens[index].end, tokens[index + 1].start)) index += 1;
             continue;
         }
         // A command substitution, `$( ... )`, and an expansion such as
         // `{1..80}` or `${name}` belong to the word around them.
-        if (!at_end) if (expansionClose(command, tokens, index)) |close| {
+        if (!at_end) if (expansionClose(source, tokens, index)) |close| {
             var nesting: usize = 0;
             while (index < tokens.len) : (index += 1) {
                 const inner = tokens[index];
@@ -3373,29 +3504,34 @@ fn collectShortSteps(
         }
         const roles: WordRoles = if (token) |t| wordRoles(t.value) else .{};
         const operator = if (token) |t| !t.quoted and roles.command_operator else false;
-        const new_line = if (token) |t| index > 0 and gapHasNewline(command, tokens[index - 1].end, t.start) else false;
-        const heredoc_end = blk: {
-            const t = token orelse break :blk false;
-            if (t.quoted or !std.mem.startsWith(u8, t.value, "<<") or std.mem.eql(u8, t.value, "<<<")) break :blk false;
-            // A here-document: skip its delimiter and its body, which ends
-            // the step at the closing delimiter.
-            if (index + 1 >= tokens.len) {
-                index = tokens.len - 1;
-                break :blk true;
-            }
-            const delimiter = tokens[index + 1].value;
-            var end = index + 2;
-            while (end < tokens.len and !std.mem.eql(u8, tokens[end].value, delimiter)) : (end += 1) {}
-            index = @min(end, tokens.len - 1);
-            break :blk true;
-        };
-        if (at_end or operator or new_line or heredoc_end) {
+        const new_line = if (token) |t| index > 0 and gapHasNewline(source, tokens[index - 1].end, t.start) else false;
+        if (at_end or operator or new_line) {
             try finishShortStep(scratch, steps, raw_steps, step, depth, defined.items);
             step = .{ .after_pipe = operator and std.mem.eql(u8, token.?.value, "|") };
-            if (operator or heredoc_end or at_end) continue;
+            if (operator or at_end) continue;
         }
         const t = token.?;
         if (isRedirectionFd(tokens, index)) continue;
+        // A here-document's operator and delimiter, whose body and closing
+        // line `source` no longer has, are like a redirection: neither is a
+        // word of the step. A command whose lines core folded into one still
+        // has its body and closing delimiter on this line, and the step ends
+        // at that delimiter.
+        if (!t.quoted and std.mem.startsWith(u8, t.value, "<<") and !std.mem.eql(u8, t.value, "<<<")) {
+            const joined = t.value.len > 2;
+            if (!joined and index + 1 < tokens.len) index += 1;
+            const delimiter = std.mem.trimStart(u8, if (joined) t.value[2..] else tokens[index].value, "-");
+            var end = index + 1;
+            const closing: ?usize = if (!here_docs.open) null else while (end < tokens.len and !gapHasNewline(source, tokens[end - 1].end, tokens[end].start)) : (end += 1) {
+                if (delimiter.len > 0 and std.mem.eql(u8, tokens[end].value, delimiter)) break end;
+            } else null;
+            if (closing) |at| {
+                index = at;
+                try finishShortStep(scratch, steps, raw_steps, step, depth, defined.items);
+                step = .{};
+            }
+            continue;
+        }
         if (step.program.len == 0 and !t.quoted and std.mem.eql(u8, t.value, "function") and index + 1 < tokens.len) {
             try defined.append(scratch, tokens[index + 1].value);
             step.program = "function";
@@ -3412,6 +3548,128 @@ fn collectShortSteps(
         addShortToken(&step, t, roles);
     }
     return true;
+}
+
+/// A command's text without its here-document bodies.
+const HereDocText = struct {
+    text: []const u8,
+    /// Whether a here-document's body is still in `text`, as in a command
+    /// whose lines core folded into one.
+    open: bool = false,
+};
+
+/// `command` without the bodies of its here-documents and their closing
+/// lines, such as the lines after `cat > notes.md <<'EOF'` up to and with
+/// `EOF`, so the line that opened them ends their step. A command with no
+/// `<<` is returned as is; `<<<` and a shift inside `$(( ))` open no
+/// here-document. The text lives in `scratch`.
+fn withoutHereDocBodies(scratch: std.mem.Allocator, command: []const u8) std.mem.Allocator.Error!HereDocText {
+    if (std.mem.find(u8, command, "<<") == null) return .{ .text = command };
+    const HereDoc = struct { delimiter: []const u8, strip_tabs: bool };
+    var out: std.ArrayList(u8) = .empty;
+    var pending: std.ArrayList(HereDoc) = .empty;
+    var quote: u8 = 0;
+    var arithmetic: usize = 0;
+    var index: usize = 0;
+    while (index < command.len) {
+        const byte = command[index];
+        if (quote == '\'') {
+            if (byte == '\'') quote = 0;
+            try out.append(scratch, byte);
+            index += 1;
+            continue;
+        }
+        if (byte == '\\' and index + 1 < command.len) {
+            try out.appendSlice(scratch, command[index .. index + 2]);
+            index += 2;
+            continue;
+        }
+        if (quote == '"') {
+            if (byte == '"') quote = 0;
+            try out.append(scratch, byte);
+            index += 1;
+            continue;
+        }
+        if (byte == '\'' or byte == '"') {
+            quote = byte;
+            try out.append(scratch, byte);
+            index += 1;
+            continue;
+        }
+        // A comment runs to the end of its line.
+        if (byte == '#' and (index == 0 or std.mem.findScalar(u8, " \t\n;&|(", command[index - 1]) != null)) {
+            const line_end = std.mem.findScalarPos(u8, command, index, '\n') orelse command.len;
+            try out.appendSlice(scratch, command[index..line_end]);
+            index = line_end;
+            continue;
+        }
+        if (std.mem.startsWith(u8, command[index..], "$((")) {
+            arithmetic += 1;
+            try out.appendSlice(scratch, "$((");
+            index += 3;
+            continue;
+        }
+        if (arithmetic > 0 and std.mem.startsWith(u8, command[index..], "))")) {
+            arithmetic -= 1;
+            try out.appendSlice(scratch, "))");
+            index += 2;
+            continue;
+        }
+        // A here-string's `<<<` opens no here-document, at any of its bytes.
+        if (std.mem.startsWith(u8, command[index..], "<<<")) {
+            try out.appendSlice(scratch, "<<<");
+            index += 3;
+            continue;
+        }
+        if (arithmetic == 0 and std.mem.startsWith(u8, command[index..], "<<")) {
+            var scan = index + 2;
+            const strip_tabs = scan < command.len and command[scan] == '-';
+            if (strip_tabs) scan += 1;
+            while (scan < command.len and (command[scan] == ' ' or command[scan] == '\t')) scan += 1;
+            // The delimiter is one word, with its quotes and escapes taken out.
+            var delimiter: std.ArrayList(u8) = .empty;
+            var delimiter_quote: u8 = 0;
+            while (scan < command.len) : (scan += 1) {
+                const c = command[scan];
+                if (delimiter_quote != 0) {
+                    if (c == delimiter_quote) delimiter_quote = 0 else try delimiter.append(scratch, c);
+                    continue;
+                }
+                if (c == '\'' or c == '"') {
+                    delimiter_quote = c;
+                    continue;
+                }
+                if (c == '\\') continue;
+                if (std.ascii.isWhitespace(c) or std.mem.findScalar(u8, ";&|<>()", c) != null) break;
+                try delimiter.append(scratch, c);
+            }
+            if (delimiter.items.len > 0) try pending.append(scratch, .{ .delimiter = delimiter.items, .strip_tabs = strip_tabs });
+            try out.appendSlice(scratch, command[index..scan]);
+            index = scan;
+            continue;
+        }
+        try out.append(scratch, byte);
+        index += 1;
+        if (byte != '\n' or pending.items.len == 0) continue;
+        // The lines after the one that opened here-documents are their
+        // bodies, one after another, each up to its delimiter line.
+        for (pending.items, 0..) |here_doc, position| {
+            // The next body starts after the line that closed the last one.
+            if (position > 0 and index < command.len) index += 1;
+            while (index < command.len) {
+                const line_end = std.mem.findScalarPos(u8, command, index, '\n') orelse command.len;
+                var line = std.mem.trimEnd(u8, command[index..line_end], "\r");
+                if (here_doc.strip_tabs) line = std.mem.trimStart(u8, line, "\t");
+                index = line_end;
+                if (std.mem.eql(u8, line, here_doc.delimiter)) break;
+                if (index < command.len) index += 1;
+            }
+        }
+        pending.clearRetainingCapacity();
+        // The newline after the last closing line follows the opening line.
+        if (index < command.len) index += 1;
+    }
+    return .{ .text = out.items, .open = pending.items.len > 0 };
 }
 
 /// Replaces the command a command row ends with by its short form, so a long
@@ -5985,11 +6243,71 @@ test "a cancelled call is its group's header above the cancellation block" {
     defer projection.deinit(alloc);
 
     try std.testing.expect(projection.entry_actions.items[0] == .override);
+    // The row names the command; the notice under it doesn't.
     try std.testing.expectEqualStrings(
         "● Cancelled \x1b[38;5;252msleep\x1b[39m 30\n\n" ++
-            "▪ Cancelled sleep 30 · What can fx do differently?",
+            "▪ Cancelled · What can fx do differently?",
         projection.entry_actions.items[0].override.bytes,
     );
+
+    // The full transcript still names the command.
+    var expanded = try buildExpandedStyledInterruptible(alloc, &entries, &details, 120, null);
+    defer expanded.deinit(alloc);
+    try std.testing.expect(std.mem.find(u8, expanded.entry_actions.items[0].override.bytes, "sleep") != null);
+}
+
+test "a cancelled command's notice drops only the command and keeps the line's styles" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const warn = ui_render.warning_style;
+    const reset = ui_render.reset_style;
+    const hint = ui_render.hint_style;
+    const follow_up = " · What can fx do differently?\n";
+
+    // The line a cancelled terminal writes, and the turn's own notice.
+    try std.testing.expectEqualStrings(
+        try std.mem.concat(a, u8, &.{ warn, "▪", reset, " ", hint, "Cancelled", reset, follow_up }),
+        (try cancelledCommandNotice(a, try std.mem.concat(a, u8, &.{ warn, "▪", reset, " ", hint, "Cancelled touch .ready && sleep 60", reset, follow_up }))).?,
+    );
+    // A summary with styles of its own keeps them, with no text between.
+    try std.testing.expectEqualStrings(
+        try std.mem.concat(a, u8, &.{ warn, "▪", reset, hint, " Cancelled\x1b[0m\x1b[38;5;245m\x1b[0m", reset, follow_up }),
+        (try cancelledCommandNotice(a, try std.mem.concat(a, u8, &.{ warn, "▪", reset, hint, " Cancelled\x1b[0m \x1b[38;5;245msleep 30\x1b[0m", reset, follow_up }))).?,
+    );
+    // A line already without a command, and one an older fx saved with no
+    // follow-up.
+    try std.testing.expectEqualStrings("▪ Cancelled · What can fx do differently?", (try cancelledCommandNotice(a, "▪ Cancelled · What can fx do differently?")).?);
+    try std.testing.expectEqualStrings("■ Cancelled\n", (try cancelledCommandNotice(a, "■ Cancelled sleep 30\n")).?);
+    // A line that doesn't read `Cancelled …` after its mark stays as it is.
+    try std.testing.expect(try cancelledCommandNotice(a, "▪ Stopped sleep 30") == null);
+    try std.testing.expect(try cancelledCommandNotice(a, "cancelled") == null);
+}
+
+test "only a cancelled command's notice leaves out its text, in a group with an MCP call" {
+    const alloc = std.testing.allocator;
+    const command = "fx mcp call mcp_fixture_echo '{\\\"text\\\":\\\"hello\\\"}' > out.txt; wc -c < out.txt";
+    const entries = [_]TranscriptEntry{
+        .{ .raw_bytes = .{ .id = 1, .bytes = "▪ Cancelled fx mcp call mcp_fixture_echo '{\"text\":\"hello\"}' > out.txt; wc -c < out.txt · What can fx do differently?", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 2, .bytes = "▪ Cancelled mcp_fixture_echo · What can fx do differently?", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 3, .bytes = "▪ Cancelled sleep 30 · What can fx do differently?", .class = .tool_status } },
+    };
+    const details = [_]ToolDetailRecord{
+        .{ .entry_id = 1, .tool_name = @constCast("shell"), .activity_kind = .command, .arguments_json = @constCast("{\"command\":\"" ++ command ++ "\"}"), .outcome = .cancelled },
+        .{ .entry_id = 2, .tool_name = @constCast("mcp_fixture_echo"), .activity_kind = .mcp, .outcome = .cancelled },
+        .{ .entry_id = 3, .tool_name = @constCast("shell"), .activity_kind = .command, .arguments_json = @constCast("{\"command\":\"sleep 30\"}"), .outcome = .cancelled },
+    };
+    var projection = try buildStyled(alloc, &entries, &details, 160, .{}, .{});
+    defer projection.deinit(alloc);
+    const bytes = projection.entry_actions.items[0].override.bytes;
+
+    // Each command's notice names no command, and the MCP call's names its
+    // tool, as before.
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, bytes, "\n\n▪ Cancelled · What can fx do differently?"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, bytes, "\n\n▪ Cancelled mcp_fixture_echo · What can fx do differently?"));
+    try std.testing.expect(std.mem.find(u8, bytes, "> out.txt") == null);
+    try std.testing.expect(std.mem.find(u8, bytes, "Cancelled sleep 30 ·") == null);
 }
 
 test "a cancelled call clips its header to one row" {
@@ -8326,4 +8644,74 @@ test "a session's input finds its run after a quick command joined the run's row
     const trimmed = std.mem.trim(u8, text, "\n");
     try std.testing.expect(std.mem.findScalar(u8, trimmed, '\n') == null);
     try std.testing.expect(std.mem.startsWith(u8, trimmed, "● Observed printf, sh"));
+}
+
+test "a command with a here-document shows its steps, whatever the document says" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // The call that opened a PR: its body's apostrophes are not shell quotes.
+    const opened_pr =
+        \\cd "$(cat /tmp/work/dir)"; b=fix-notes; cat > /tmp/work/body.md <<'EOF'
+        \\## Summary
+        \\
+        \\- That row now says why, as core's status counts it: `Couldn't run ls, printf · 2 invalid fields`.
+        \\EOF
+        \\url=$(gh pr create --draft --head "$b" --title "Say why" --body-file /tmp/work/body.md 2>&1 | tail -1); echo "$url"; n=$(echo "$url" | grep -o '[0-9]*$'); echo $n > /tmp/work/pr; gh pr view $n --json isDraft -q '"draft=\(.isDraft)"'; gh pr view $n --json body -q .body | grep -c Summary || true
+    ;
+    try std.testing.expectEqualStrings("cat, echo, gh pr view", (try shortCommand(a, opened_pr)).?);
+    try std.testing.expectEqualStrings("cat, wc", (try shortCommand(a, "cat > notes.md <<'EOF'\nThe model's notes\nEOF\nwc -l notes.md")).?);
+    // Two documents on one line, one with its tabs taken out.
+    try std.testing.expectEqualStrings("cat, wc", (try shortCommand(a, "cat <<A <<-\"B\" > x\na's\nA\n\tb's\n\tB\nwc -l x")).?);
+    // A shift in arithmetic and a here-string open no document.
+    try std.testing.expectEqualStrings("echo, ls", (try shortCommand(a, "echo $((1 << 2))\nls -la")).?);
+    try std.testing.expectEqualStrings("grep, wc", (try shortCommand(a, "grep x <<< \"it's\" && wc -l y")).?);
+    // `<<` inside quotes or a comment opens no document either.
+    try std.testing.expectEqualStrings("echo, ls", (try shortCommand(a, "echo \"a << b\" # c << d\nls -la")).?);
+    // A here-string with an apostrophe, before another line.
+    try std.testing.expectEqualStrings("wc, ls", (try shortCommand(a, "wc -c <<< \"it's\"\nls >/dev/null")).?);
+    // A word on the opening line that matches the delimiter is no closing
+    // line, since the document's body was on the lines after it.
+    try std.testing.expectEqualStrings("cat, echo, ls", (try shortCommand(a, "cat <<EOF > f.txt; echo EOF\nbody it's\nEOF\nls >/dev/null")).?);
+    // Core folds a command's lines into one for its row; the document still
+    // ends its step at the delimiter.
+    try std.testing.expectEqualStrings("cat, sleep", (try shortCommand(a, "cat <<'EOF' launch marker line EOF sleep 300")).?);
+}
+
+test "a failed command's reason is the error it reports, not code it printed" {
+    // A command that printed code with "error" in it before sed failed.
+    const printed_code =
+        \\const terminal_action_field_error_code = "invalid_action_fields";
+        \\    const error_value = switch (root.get("error") orelse return null) {
+        \\        error.OutOfMemory => error.OutOfMemory,
+        \\....
+        \\sed: 1: ",12p
+        \\": invalid command code ,
+    ;
+    try std.testing.expectEqualStrings("sed: 1: \",12p", verdictLine(printed_code, &.{ "sed", "echo" }).?);
+    // The first line that reports wins, before a program's later summary.
+    try std.testing.expectEqualStrings("src/main.c:3: error: bad type", verdictLine("cc -c main.c\nsrc/main.c:3: error: bad type\nmake: *** [build] Error 2", &.{"make"}).?);
+    try std.testing.expectEqualStrings("FAIL  quits on click", verdictLine("running 4 tests\n FAIL  quits on click\nError: Test timed out.", &.{"sh"}).?);
+    try std.testing.expectEqualStrings("json.decoder.JSONDecodeError: Expecting value", verdictLine("Traceback (most recent call last):\n  File \"x.py\", line 1\njson.decoder.JSONDecodeError: Expecting value", &.{"python3"}).?);
+    // The shell speaks for a command it could not find.
+    try std.testing.expectEqualStrings("/bin/sh: line 1: nope: command not found", verdictLine("checking\n/bin/sh: line 1: nope: command not found", &.{"nope"}).?);
+    // A word that only names a failure counts when nothing reports one.
+    try std.testing.expectEqualStrings("2 tests failed", verdictLine("ran 5 tests\n2 tests failed\ndone in 3s", &.{"sh"}).?);
+    // A name that holds "error" names none, so the last line stands.
+    try std.testing.expectEqualStrings("done", verdictLine("error_code = 1\nErrorSet.read\ndone", &.{}).?);
+
+    // In a row, the reason comes from sed, not from the code it printed.
+    const alloc = std.testing.allocator;
+    const display = "sed -n 28,45p f; echo ....; sed -n \"$n,$((n+12))p\" p";
+    const entries = [_]TranscriptEntry{
+        .{ .raw_bytes = .{ .id = 1, .bytes = "● Exited 1 " ++ display ++ "\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 2, .bytes = "  2s", .class = .turn_summary } },
+    };
+    var details = [_]ToolDetailRecord{storyCommandDetail(1, "{\"action\":\"run\",\"command\":\"sed -n 28,45p f; echo ....; sed -n \\\"$n,$((n+12))p\\\" p\"}", 1, printed_code)};
+    details[0].command_display = @constCast(display);
+    const text = try groupTextForTest(alloc, &entries, &details);
+    defer alloc.free(text);
+    errdefer std.debug.print("group:\n{s}\n", .{text});
+    try std.testing.expect(std.mem.find(u8, text, "· sed: 1:") != null);
+    try std.testing.expect(std.mem.find(u8, text, "error_code") == null);
 }

@@ -395,6 +395,14 @@ async function runWalk(walk: Walk, dir: string): Promise<Result> {
       .filter((m) => ids.has(m[1]!)).at(-1);
     return last?.[2] === "true" ? "idle" : "plain";
   };
+  // Whether fx's trace says the close of `sub` was written: it says "closed"
+  // once the registry has dropped the child.
+  const closeWritten = (sub: string) => {
+    const log = join(root, "trace.log");
+    if (!existsSync(log)) return false;
+    const ids = childIds(sub);
+    return [...readFileSync(log, "utf8").matchAll(/event=closed child=(\S+)/g)].some((m) => ids.has(m[1]!));
+  };
   // The first held end of `sub` the walk has not released.
   const heldEnd = (sub: string): number | undefined => {
     const ids = childIds(sub);
@@ -510,11 +518,18 @@ async function runWalk(walk: Walk, dir: string): Promise<Result> {
     // A report, if the end owes one, is queued as the work finishes.
     await Bun.sleep(200);
     const note = reportsQueued(sub) > reportsBefore ? reportNote(sub) : "none";
-    const msgs = closing.has(sub) ? [] : [...waiting.get(sub)!];
+    const wasClosing = closing.has(sub);
+    const msgs = wasClosing ? [] : [...waiting.get(sub)!];
     ending.delete(sub);
     closing.delete(sub);
     waiting.get(sub)!.clear();
     push({ op: "end", sub, msgs: msgs.map(parseToken), note });
+    if (wasClosing) {
+      // The close is written once nothing of the work runs, and the child is
+      // closing until then; the walk goes on only after fx says it is gone.
+      if ((await poll(() => closeWritten(sub) || undefined, 15_000)) === undefined) throw new Error(`${walk.name}: ${sub}'s close was never written`);
+      push({ op: "write_close", sub });
+    }
     if (msgs.length === 0) return;
     starting.add(sub);
     await releaseStart(sub);
@@ -843,6 +858,9 @@ test("the trace check rejects planted changes to a walk", async () => {
   const early = base("message-while-starting");
   const at = early.findIndex((o) => o.op === "begin");
   planted["joined-before-begin"] = [...early.slice(0, at), early[at + 1]!, early[at]!, ...early.slice(at + 2)];
+  // A message started a new subagent before the close was written, which
+  // fx's mark forbids: the close's write is missing from the walk.
+  planted["started-before-close-written"] = base("close-working-then-message").filter((o) => o.op !== "write_close");
   for (const [name, observations] of Object.entries(planted)) {
     expect(`${name}: ${await checkTrace(observations, subs, join(dir, name))}`).toBe(`${name}: REJECTED`);
   }
