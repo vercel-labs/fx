@@ -2956,12 +2956,10 @@ pub fn retintEntriesForTheme(
     from: shared_theme.Theme,
     to: shared_theme.Theme,
 ) !void {
-    if (from.light == to.light) return;
-    try self.assertCanMutateTranscript();
-
     var token_buf: [theme_retint.max_tokens]theme_retint.Token = undefined;
     const tokens = theme_retint.tokens(from, to, &token_buf);
     if (tokens.len == 0) return;
+    try self.assertCanMutateTranscript();
 
     var shadow = try cloneMutationState(self, alloc);
     defer shadow.deinit(alloc);

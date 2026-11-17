@@ -9,17 +9,21 @@ const shared_theme = @import("../../shared/theme.zig");
 
 /// Renders heading content: emphasis is resolved normally, but bold tags are
 /// suppressed because the heading style already owns bold.
+/// `heading_open` is the heading's color, written again after each code span
+/// or link closes the foreground, so the rest of the heading keeps it.
 pub fn writeInlineNoBold(
     alloc: Allocator,
     text: []const u8,
     out: *std.ArrayList(u8),
     restore_underline_after_link: bool,
+    heading_open: []const u8,
     footnotes: ?*const payload.FootnoteSink,
     link_id: *u32,
 ) !void {
     try renderInline(alloc, text, out, .{
         .restore_underline_after_link = restore_underline_after_link,
         .suppress_bold = true,
+        .restore_after_close = heading_open,
     }, footnotes, link_id);
 }
 
@@ -39,6 +43,8 @@ pub fn writeInline(
 const InlineOptions = struct {
     restore_underline_after_link: bool = false,
     suppress_bold: bool = false,
+    /// Re-emitted after a code span or link resets the foreground.
+    restore_after_close: []const u8 = "",
 };
 
 /// Inline rendering runs in three passes over one line:
@@ -457,8 +463,12 @@ fn emitTokens(
                 try out.appendSlice(alloc, content);
             }
             try out.appendSlice(alloc, ansi.inline_code_close);
+            try out.appendSlice(alloc, options.restore_after_close);
         },
-        .link => |item| try emitInlineLink(alloc, out, item.link, options.restore_underline_after_link, item.visible_prefix, link_id),
+        .link => |item| {
+            try emitInlineLink(alloc, out, item.link, options.restore_underline_after_link, item.visible_prefix, link_id);
+            try out.appendSlice(alloc, options.restore_after_close);
+        },
         .footnote => |number| try writeFootnoteMarker(alloc, out, number),
         .delimiter => |delimiter| {
             var close = delimiter.close_head;

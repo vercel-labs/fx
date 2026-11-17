@@ -40,20 +40,30 @@ const light_to_dark_builtin = [_]Token{
     .{ .from = shared_theme.fx_light.link_style, .to = shared_theme.fx_dark.link_style },
 };
 
+/// True only for a builtin variant itself: its name and every escape slot
+/// match, so a loaded theme that kept a builtin's name still gets a map.
 fn isBuiltin(theme: Theme) bool {
-    return std.mem.eql(u8, theme.name, shared_theme.fx_dark.name) or std.mem.eql(u8, theme.name, shared_theme.fx_light.name);
+    const base = shared_theme.builtin(theme.light);
+    if (!std.mem.eql(u8, theme.name, base.name)) return false;
+    for (0..shared_theme.style_slot_count) |index| {
+        if (!std.mem.eql(u8, shared_theme.styleSlot(theme, index), shared_theme.styleSlot(base, index))) return false;
+    }
+    return true;
 }
 
 /// The escape rewrite map from `from` to `to`, built in `buf` or pinned for a
-/// builtin-to-builtin flip. Empty when both themes have the same variant. Any
-/// custom theme involved gets a map pairing each slot's old escape with its
-/// new one, the first slot winning when slots share an escape, longest first
-/// so combined forms match before their fg-only equivalents.
+/// builtin-to-builtin flip. Empty when both are the same builtin or no slot
+/// changes. Any custom theme involved gets a map pairing each slot's old
+/// escape with its new one, the first slot winning when slots share an
+/// escape, longest first so combined forms match before their fg-only
+/// equivalents.
 pub fn tokens(from: Theme, to: Theme, buf: *[max_tokens]Token) []const Token {
-    if (from.light == to.light) return &.{};
     if (isBuiltin(from) and isBuiltin(to)) {
+        if (from.light == to.light) return &.{};
         return if (to.light) dark_to_light_builtin[0..] else light_to_dark_builtin[0..];
     }
+    // Any other pair, same variant or not (a `/theme` switch between two dark
+    // themes included), maps slot by slot; identical slots map to nothing.
 
     var n: usize = 0;
     for (0..max_tokens) |index| {
@@ -203,4 +213,29 @@ test "a rewritten escape is not rewritten again in the same pass" {
     const out = (try rewrite(alloc, "\x1b[38;5;1mA\x1b[38;5;2mB", &map)).?;
     defer alloc.free(out);
     try std.testing.expectEqualStrings("\x1b[38;5;2mA\x1b[38;5;3mB", out);
+}
+
+test "switching between two themes of the same variant maps their colors" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const dotmatrix = try shared_theme.parse(alloc, shared_theme.namedTheme("dotmatrix").?.bytes(false), .{ .truecolor = true });
+    const breadbin = try shared_theme.parse(alloc, shared_theme.namedTheme("breadbin").?.bytes(false), .{ .truecolor = true });
+    var buf: [max_tokens]Token = undefined;
+    const map = tokens(dotmatrix, breadbin, &buf);
+    try std.testing.expectEqualStrings(breadbin.hint_style, mapped(dotmatrix.hint_style, map).?);
+    try std.testing.expectEqual(@as(usize, 0), tokens(dotmatrix, dotmatrix, &buf).len);
+    try std.testing.expectEqual(@as(usize, 0), tokens(shared_theme.fx_dark, shared_theme.fx_dark, &buf).len);
+}
+
+test "a loaded theme that kept a builtin name still retints on a flip" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    // No "name", so the parse keeps fx-dark's name.
+    const nameless = try shared_theme.parse(alloc, "{ \"colors\": { \"hint\": \"#00ff00\" } }", .{ .truecolor = true });
+    try std.testing.expectEqualStrings(shared_theme.fx_dark.name, nameless.name);
+    var buf: [max_tokens]Token = undefined;
+    const map = tokens(nameless, shared_theme.fx_light, &buf);
+    try std.testing.expectEqualStrings(shared_theme.fx_light.hint_style, mapped(nameless.hint_style, map).?);
 }

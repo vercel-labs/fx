@@ -483,13 +483,70 @@ pub fn Runtime(comptime App: type) type {
         }
 
         pub fn applyThemeUpdate(app: *App, light: bool, rgb: ?ui_render.TerminalRgb) !void {
+            ui_render.noteTerminalMode(light);
             if (!ui_render.themeNeedsUpdate(light, rgb)) return;
+            _ = try redrawInTheme(app, light, rgb);
+        }
 
+        /// Applies a `theme` setting value now, as `/theme` does: `light` or
+        /// `dark` pins fx's own theme, a name loads that theme for the
+        /// terminal's mode, and null follows the terminal. Returns whether a
+        /// named theme took effect; false for a name means it does not fit the
+        /// terminal's mode, so fx shows its own theme, as it would at startup.
+        pub fn applyThemeSetting(app: *App, value: ?[]const u8) !bool {
+            const rgb = ui_render.activeTerminalBackground();
+            const was_pinned = shared_theme.variantPinned();
+            const choice = if (value) |text| shared_theme.classifyValue(text) else null;
+            if (choice) |selected| switch (selected) {
+                .pin_light, .pin_dark => {
+                    shared_theme.setSource(null, true);
+                    _ = try redrawInTheme(app, selected == .pin_light, rgb);
+                    return false;
+                },
+                .custom => |name| {
+                    shared_theme.setSource(name, false);
+                    if (was_pinned) watchTerminalMode(app);
+                    return redrawInTheme(app, terminalLight(), rgb);
+                },
+            };
+            shared_theme.setSource(null, false);
+            if (was_pinned) watchTerminalMode(app);
+            _ = try redrawInTheme(app, terminalLight(), rgb);
+            return false;
+        }
+
+        /// The terminal's mode for resolving a theme: the last detected one,
+        /// or the applied theme's when fx never detected it (it started
+        /// pinned); `watchTerminalMode` then corrects it from the terminal.
+        fn terminalLight() bool {
+            return ui_render.terminalModeLight() orelse ui_render.is_light;
+        }
+
+        /// Leaving a light/dark pin, asks the terminal to report its mode, as
+        /// startup does when the theme is not pinned, so its changes apply.
+        fn watchTerminalMode(app: *App) void {
+            if (comptime !@hasField(App, "terminal") or !@hasField(App, "terminal_input_runtime")) return;
+            app.terminal.enableThemeNotifications() catch |err| {
+                debug_trace.logf("theme", "theme_notification_enable_failed err={s}", .{@errorName(err)});
+            };
+            app.terminal.requestThemeColorScheme() catch |err| {
+                debug_trace.logf("theme", "theme_color_scheme_query_failed err={s}", .{@errorName(err)});
+            };
+        }
+
+        /// Resolves the configured theme for a `light` or dark terminal and
+        /// redraws the transcript in it. Returns whether a named theme took
+        /// effect; false means fx's own theme for that mode is showing.
+        pub fn redrawInTheme(app: *App, light: bool, rgb: ?ui_render.TerminalRgb) !bool {
             // Resolve the target first so the retint rewrites the old theme's
             // escapes into the new theme's, custom pairs included.
             const prior_theme = shared_theme.current();
             var resolved_target: ?shared_theme.Theme = null;
-            if (shared_theme.sourceName() orelse ui_render.explicitThemeName()) |name| {
+            // A light/dark pin, such as `/theme dark`, shows fx's own theme
+            // even when FX_THEME names one.
+            const configured = shared_theme.sourceName() orelse
+                if (shared_theme.variantPinned()) null else ui_render.explicitThemeName();
+            if (configured) |name| {
                 // Custom themes re-resolve on live flips: sibling swap or
                 // builtin fallback, same rule as startup.
                 resolved_target = shared_theme.resolveNamed(app.alloc, name, light, .{ .truecolor = ui_render.truecolorIsEnabled() }) catch |err| blk: {
@@ -501,7 +558,7 @@ pub fn Runtime(comptime App: type) type {
 
             app.shell.retintEntriesForTheme(app.alloc, prior_theme, target) catch |err| {
                 debug_trace.logf("theme", "theme_transcript_retint_failed err={s}", .{@errorName(err)});
-                return;
+                return false;
             };
             app.pacer.retintForTheme(app.alloc, prior_theme, target) catch |err| {
                 debug_trace.logf("theme", "theme_pending_retint_failed err={s} kept=old_colors", .{@errorName(err)});
@@ -519,6 +576,7 @@ pub fn Runtime(comptime App: type) type {
             debug_trace.logf("theme", "event=theme_change_redraw dropped=terminal_screen_and_scrollback reason=transcript_redrawn_in_new_theme", .{});
             try app.shell.requestTerminalReset(&app.metrics);
             app.shell.render_requests.request(.transcript);
+            return resolved_target != null;
         }
 
         pub fn shellStyles() transcript_runtime.Styles {
