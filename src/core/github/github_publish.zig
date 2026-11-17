@@ -118,7 +118,7 @@ fn publishResultFromRunError(alloc: Allocator, err: anyerror) !PublishResult {
 fn publishResultFromProcess(alloc: Allocator, result: CompletedProcess) !PublishResult {
     defer alloc.free(result.stderr);
 
-    if (result.term.exited != 0) {
+    if (!result.term.success()) {
         defer alloc.free(result.stdout);
         const stderr_trimmed = std.mem.trim(u8, result.stderr, " \t\r\n");
         if (stderr_trimmed.len > 0) {
@@ -254,6 +254,21 @@ test "publish returns fallback for non-zero exit without stderr" {
 
     const result = try publishResultFromProcess(std.testing.allocator, .{
         .term = .{ .exited = 1 },
+        .stdout = stdout,
+        .stderr = stderr,
+    });
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expect(!result.ok);
+    try std.testing.expectEqualStrings("gh command failed", result.text);
+}
+
+test "publish reports a gh that a signal ended as a failure" {
+    const stdout = try std.testing.allocator.dupe(u8, "https://github.com/o/r/pull/1\n");
+    const stderr = try std.testing.allocator.dupe(u8, "");
+
+    const result = try publishResultFromProcess(std.testing.allocator, .{
+        .term = .{ .signal = .KILL },
         .stdout = stdout,
         .stderr = stderr,
     });

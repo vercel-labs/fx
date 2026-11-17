@@ -4,11 +4,10 @@
 //!
 //! Cancelling a task that is still running makes `std.Io.Threaded` signal the
 //! worker thread running it, and the signal can arrive after that thread has
-//! moved on to another task. A `connect` it interrupts is retried, and macOS
-//! then fails it with `EISCONN`: a panic in Debug builds and `error.Unexpected`
-//! otherwise. So the watch never needs a cancel on the operation's normal
-//! path: its owner calls `finish`, which stops the watch and takes its result,
-//! and the select is left with nothing to cancel.
+//! moved on to another task and interrupt that task's system call. So the
+//! watch never needs a cancel on the operation's normal path: its owner calls
+//! `finish`, which stops the watch and takes its result, and the select is
+//! left with nothing to cancel.
 
 const std = @import("std");
 const builtin = @import("builtin");

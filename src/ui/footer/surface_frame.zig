@@ -616,7 +616,12 @@ fn buildFooterSurfaceProjection(
                 shell.layout.rows,
             )
     else if (question_projection) |projection|
-        try question_ui.questionPanelRowsForLayout(alloc, projection, shell.layout.cols)
+        try question_ui.questionPanelRowsForLayout(
+            alloc,
+            projection,
+            shell.layout.cols,
+            question_ui.questionPanelRowBudget(shell.layout.rows, banner_rows),
+        )
     else if (compact_command_menu) |menu|
         compact_command_menu_presentation.footerRowCount(menu, shell.layout.cols, shell.layout.rows)
     else if (show_auth_picker)
@@ -1546,7 +1551,7 @@ test "surface footer frame snapshots manual compaction blink with an inactive st
     var frame = try prepareSurfaceFooterFrameWithReservation(alloc, &shell, &metrics, &force_redraw, null, ctx, .{}, FrameInvalidationSet.empty());
     defer frame.deinit(alloc);
     try std.testing.expectEqual(@as(?bool, false), frame.thinking_blink);
-    try std.testing.expect(std.mem.find(u8, frame.activity_label.items, "Compacting (0s)") != null);
+    try std.testing.expect(std.mem.find(u8, frame.activity_label.items, "Compacting 0% (0s)") != null);
     try std.testing.expect(!ctx.stream.active);
 }
 

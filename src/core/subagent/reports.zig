@@ -158,6 +158,9 @@ pub const Report = struct {
     /// Who started the work and why it was cancelled, so the parent
     /// needn't guess.
     end: child_state.EndFacts = .{},
+    /// Whether the child is idle once the report goes, so the report tells
+    /// the parent to send it related work or close it.
+    idle: bool = false,
 };
 
 const header = agent_frame.report_header;
@@ -228,9 +231,39 @@ pub fn message(alloc: Allocator, report: Report, max_output_bytes: usize) error{
         // the parent sent would, so only the user's turns are named.
         .started_by = if (report.end.started_by == .user) @as(?[]const u8, "user") else null,
         .cause = if (report.end.cause) |cause| @as(?[]const u8, @tagName(cause)) else null,
+        // A parent tends to start a new subagent for each task and leave
+        // the finished ones idle; this keeps the one it has in view, and
+        // asks for its judgment on it.
+        .next = if (report.idle) @as(?[]const u8, try idleNote(scratch.allocator(), report.agent)) else null,
     }, .{ .emit_null_optional_fields = false }, &out.writer) catch return error.OutOfMemory;
     out.writer.writeByte('\n') catch return error.OutOfMemory;
     return out.toOwnedSlice();
+}
+
+/// A report's `next` when its subagent is idle. Caller owns the result.
+fn idleNote(alloc: Allocator, agent: []const u8) error{OutOfMemory}![]const u8 {
+    return alloc.print("{s} is idle now and keeps this conversation. Keep it if related work may follow, close it if its work is done, or ask the user if you cannot tell.", .{agent});
+}
+
+test "a report says its subagent is idle only when it is" {
+    const alloc = std.testing.allocator;
+    const idle = try message(alloc, .{ .agent = "reviewer", .child_id = "c1", .work_id = "w1", .outcome = .failed, .output = "boom", .idle = true }, 4096);
+    defer alloc.free(idle);
+    try std.testing.expect(std.mem.endsWith(u8, idle, ",\"next\":\"reviewer is idle now and keeps this conversation. Keep it if related work may follow, close it if its work is done, or ask the user if you cannot tell.\"}\n"));
+    // Readers that take only the sender still read it.
+    const sender = (try agent_frame.reportSender(alloc, idle)).?;
+    defer sender.deinit();
+    try std.testing.expectEqualStrings("w1", sender.value.work_id);
+    // A screen shows the same row with or without the note.
+    var with_note = (try row(alloc, .{ .text = idle, .author = .child })).?;
+    defer with_note.deinit(alloc);
+    const busy = try message(alloc, .{ .agent = "reviewer", .child_id = "c1", .work_id = "w1", .outcome = .failed, .output = "boom" }, 4096);
+    defer alloc.free(busy);
+    try std.testing.expect(std.mem.find(u8, busy, "\"next\"") == null);
+    var without_note = (try row(alloc, .{ .text = busy, .author = .child })).?;
+    defer without_note.deinit(alloc);
+    try std.testing.expectEqualStrings(without_note.status, with_note.status);
+    try std.testing.expectEqualStrings(without_note.text, with_note.text);
 }
 
 /// Traces a report when the agent it was sent to takes it into its history:

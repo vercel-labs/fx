@@ -20,6 +20,9 @@ pub const ToolEvidence = enum {
     proven_unexecuted,
     /// The provider ran the tool and fx admitted its result.
     confirmed,
+    /// A provider-run tool may have run, but it only reads, so running it
+    /// again is safe, and no other call from the attempt ran.
+    repeatable,
     /// A tool may have run, and fx cannot prove whether it did.
     uncertain,
 };
@@ -28,6 +31,9 @@ pub const Strategy = enum {
     retry_request,
     regenerate_tool,
     continue_after_confirmed_tool,
+    /// The resent request keeps tools and says a read-only provider tool, a
+    /// search, may have run without a result.
+    repeat_read_only_tool,
     /// The resent request asks the model to reconcile the tool evidence, and
     /// fx sends it with `tool_choice = none` so no tool can run again.
     reconcile_tool,
@@ -38,6 +44,7 @@ pub fn select(delivery: Delivery, tool: ToolEvidence) Strategy {
     return switch (tool) {
         .proven_unexecuted => .regenerate_tool,
         .confirmed => .continue_after_confirmed_tool,
+        .repeatable => .repeat_read_only_tool,
         .uncertain => .reconcile_tool,
         .none => .retry_request,
     };
@@ -47,6 +54,8 @@ pub const regenerate_tool_prompt =
     "The previous response ended during an incomplete tool call. fx did not execute that call. Recreate it only if it is still needed.";
 pub const continue_after_confirmed_tool_prompt =
     "Continue from the confirmed tool result above without repeating the tool.";
+pub const repeat_read_only_tool_prompt =
+    "The previous response ended while a search was running at the provider, and fx did not run any other call from it. Use a search result shown above, or search again if you still need one.";
 pub const reconcile_tool_prompt =
     "Reconcile the available tool evidence above before continuing. Do not repeat the tool unless the evidence proves it is safe.";
 
@@ -56,6 +65,7 @@ pub fn prompt(strategy: Strategy) ?[]const u8 {
         .retry_request => null,
         .regenerate_tool => regenerate_tool_prompt,
         .continue_after_confirmed_tool => continue_after_confirmed_tool_prompt,
+        .repeat_read_only_tool => repeat_read_only_tool_prompt,
         .reconcile_tool => reconcile_tool_prompt,
     };
 }
@@ -69,6 +79,7 @@ test "an unsent request resends unchanged whatever the stream showed" {
 test "a possibly sent request follows the tool evidence" {
     try std.testing.expectEqual(Strategy.regenerate_tool, select(.possibly_sent, .proven_unexecuted));
     try std.testing.expectEqual(Strategy.continue_after_confirmed_tool, select(.possibly_sent, .confirmed));
+    try std.testing.expectEqual(Strategy.repeat_read_only_tool, select(.possibly_sent, .repeatable));
     try std.testing.expectEqual(Strategy.reconcile_tool, select(.possibly_sent, .uncertain));
     // A broken-off answer with no tool call is the same request again.
     try std.testing.expectEqual(Strategy.retry_request, select(.possibly_sent, .none));
@@ -76,7 +87,7 @@ test "a possibly sent request follows the tool evidence" {
 
 test "only strategies that change the request add a prompt" {
     try std.testing.expect(prompt(.retry_request) == null);
-    for ([_]Strategy{ .regenerate_tool, .continue_after_confirmed_tool, .reconcile_tool }) |strategy| {
+    for ([_]Strategy{ .regenerate_tool, .continue_after_confirmed_tool, .repeat_read_only_tool, .reconcile_tool }) |strategy| {
         try std.testing.expect(prompt(strategy).?.len > 0);
     }
 }

@@ -5,6 +5,7 @@ const image_attachments = @import("../images/image_attachments.zig");
 const tool_result_errors = @import("../tooling/tool_result_errors.zig");
 const types = @import("../shared/types.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
+const config_runtime = @import("../config/config_runtime.zig");
 const worker_runtime = @import("../agent/worker_runtime.zig");
 const compaction_activity = @import("../output/compaction_activity.zig");
 const compactor = @import("../compactor/compactor.zig");
@@ -36,7 +37,21 @@ pub fn Runtime(comptime App: type) type {
     return struct {
         const AppAgent = if (@hasField(App, "main_agent")) @FieldType(App, "main_agent") else struct {};
         pub fn startWorkerThread(app: *App, agent: *AppAgent) !void {
+            enableCommitGate(agent);
             agent.worker_thread = try std.Thread.spawn(.{}, workerThreadMain, .{app});
+        }
+
+        /// The main loop commits each finished turn of a threaded agent
+        /// (`app_session_runtime.zig` appendFinishedPrompt) and says so, so
+        /// the agent's next turn from mail waits for that commit
+        /// (`WorkerRuntime.enableCommitGate`). A cooperative host starts no
+        /// thread here and keeps the old order.
+        fn enableCommitGate(agent: anytype) void {
+            if (comptime @hasField(@TypeOf(agent.*), "worker") and
+                @hasDecl(@TypeOf(agent.worker), "enableCommitGate"))
+            {
+                agent.worker.enableCommitGate();
+            }
         }
 
         /// Starts `agent`'s own worker thread, which runs main's worker loop
@@ -44,6 +59,7 @@ pub fn Runtime(comptime App: type) type {
         /// threads, so it hosts only its first agent.
         pub fn startAgentWorkerThread(app: *App, agent: *agents.Agent) !void {
             if (comptime cooperativeHost(App)) return error.AgentThreadsUnavailable;
+            enableCommitGate(agent);
             agent.worker_thread = try std.Thread.spawn(.{}, agentWorkerThreadMain, .{ app, agent });
         }
 
@@ -149,6 +165,10 @@ pub fn Runtime(comptime App: type) type {
                 error.TlsInitializationFailed => return alloc.dupe(u8, "Couldn't make a secure connection."),
                 error.ModelImageCapabilityUnavailable => return alloc.dupe(u8, image_attachments.model_image_capability_unavailable_notice),
                 else => {},
+            }
+            if (try config_runtime.configuredProviderMessage(alloc, err)) |message| {
+                defer alloc.free(message);
+                return alloc.print("{s}: {s}", .{ context, message });
             }
             if (detailedErrorSummary(err)) |detail| {
                 return alloc.print("{s}: {s}", .{ context, detail });

@@ -18,6 +18,9 @@ const io_mod = @import("../shared/io.zig");
 const tool_contracts = @import("../agent/runtime/tool_contracts.zig");
 const result_commit = @import("result_commit.zig");
 const vision_executor = @import("../agent/runtime/vision_executor.zig");
+const image_provider = @import("../agent/runtime/image_provider.zig");
+const token_pass = @import("../gateway/token_pass.zig");
+const token_pass_team = @import("../gateway/token_pass_team.zig");
 const change_tracker = @import("../workspace/change_tracker.zig");
 const diff_mod = @import("../output/diff.zig");
 const file_mutation = @import("file_mutation.zig");
@@ -25,6 +28,7 @@ const file_mutation_contract = @import("file_mutation_contract.zig");
 const hooks = @import("../hooks/hooks.zig");
 const model_context_encoding = @import("../shared/model_context_encoding.zig");
 const permission_auto_classifier = @import("../permissions/auto_classifier.zig");
+const permissions = @import("../permissions/permissions.zig");
 const glob_pattern = @import("../workspace/glob_pattern.zig");
 const permission_prompter = @import("../permissions/permission_prompter.zig");
 const permission_request = @import("../permissions/permission_request.zig");
@@ -33,6 +37,7 @@ const pathing = @import("../workspace/pathing.zig");
 const execution_router = @import("../execution/router.zig");
 const skill_runtime = @import("../skills/skill_runtime.zig");
 const subagent_model_contract = @import("../subagent/model_contract.zig");
+const subagent_refusal = @import("../subagent/refusal.zig");
 const subagent_tool_host = @import("../subagent/tool_host.zig");
 const subagent_tool_provider = @import("../subagent/tool_provider.zig");
 const session_runtime = @import("../session/session.zig");
@@ -119,13 +124,21 @@ test {
     _ = tool_presentation;
 }
 
-/// Shows tool rows: a host's push of tool lifecycle events.
+/// Shows tool rows: a host's push of tool lifecycle events, and where it
+/// keeps the row of a call made through `fx mcp call`, so a resume shows it
+/// again. Null keeps none.
 pub const ToolLifecyclePublisher = struct {
     context: *anyopaque,
     push_fn: *const fn (*anyopaque, types.ToolLifecycleEvent) anyerror!void,
+    save_bridge_call_fn: ?*const fn (*anyopaque, types.BridgeCallRecord) anyerror!void = null,
 
     pub fn push(self: ToolLifecyclePublisher, event: types.ToolLifecycleEvent) anyerror!void {
         return self.push_fn(self.context, event);
+    }
+
+    pub fn saveBridgeCall(self: ToolLifecyclePublisher, record: types.BridgeCallRecord) anyerror!void {
+        const save = self.save_bridge_call_fn orelse return;
+        return save(self.context, record);
     }
 };
 
@@ -216,6 +229,7 @@ pub const Context = struct {
     tracker: ?*change_tracker.ChangeTracker = null,
     mcp_ctx: ?*anyopaque = null,
     mcp_has_tool: ?tool_mcp_runtime.HasToolFn = null,
+    mcp_access_changed: ?tool_mcp_runtime.AccessChangedFn = null,
     mcp_validate_tool: ?tool_mcp_runtime.ValidateToolFn = null,
     mcp_call_tool: ?tool_mcp_runtime.CallToolFn = null,
     mcp_search_tools: ?tool_mcp_runtime.SearchToolsFn = null,
@@ -465,6 +479,10 @@ pub fn executeToolCallAuthorized(
     execution_ctx.command_replay_unavailable = request.command_replay_unavailable;
 
     const started_at_ms = io_mod.milliTimestamp();
+    const call_dir = workspace_access.AccessScope.primaryDirectoryOf(
+        execution_ctx.access_scope,
+        execution_ctx.workspace_root,
+    );
     const uses_file_mutation_contract = if (registeredToolSpec(
         execution_ctx,
         request.call.name,
@@ -508,21 +526,69 @@ pub fn executeToolCallAuthorized(
             .outcome = classifyToolExecutionError(err),
             .started_at_ms = started_at_ms,
             .subagent_id = execution_ctx.lifecycle_scope.subagent_id orelse 0,
+            .call_id = request.call.id,
+            .dir = call_dir,
+            // The tool returned no result, so nothing shows that a command
+            // ran: a run cancelled or out of time before it started ends here,
+            // as does a shell that could not start.
+            .reads_startup_files = false,
         });
         return if (err == error.CancelledBeforeExecution) error.Cancelled else err;
     };
+    const outcome = classifyReturnedToolCallOutcome(result);
     diagnostics.recordToolCallResult(.{
         .name = request.call.name,
         .arguments_json = request.call.arguments_json,
         .model_output = result.model_output,
-        .outcome = classifyReturnedToolCallOutcome(result),
+        .outcome = outcome,
         .started_at_ms = started_at_ms,
         .subagent_id = execution_ctx.lifecycle_scope.subagent_id orelse 0,
+        .call_id = request.call.id,
+        .dir = call_dir,
+        // Only a command that ran leaves a command result, which makes the call
+        // `command_failed`; a call refused before its command started, and one
+        // that succeeded, are not resolved again.
+        .reads_startup_files = outcome == .command_failed and
+            callReadsStartupFiles(execution_ctx, request.call_allocator, request.call),
     });
     if (request.command_replay_capture) |continued| {
         replay_continuation_transferred = result.command_replay_capture == continued;
     }
     return result;
+}
+
+/// Whether `call` is a run whose command reads the startup files the shell
+/// snapshot holds: one that admission's `runCommandContext` resolves to the
+/// `user` environment, as its routine-command rule does, in the login shell
+/// the snapshot captures. `interact` and `stop` calls, a `clean` profile, a
+/// clean start, a tty run in another shell, and a call that does not resolve
+/// read none of them.
+fn callReadsStartupFiles(ctx: Context, alloc: Allocator, call: ToolCall) bool {
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const command = tool_admission.runCommandContext(ctx.admissionInput(), arena, call) catch return false;
+    const shell = switch (command.environment) {
+        .user => |path| path,
+        else => return false,
+    };
+    var login_shell_buffer: [4096]u8 = undefined;
+    const configured = shell_resolver.configuredLoginShellInto(&login_shell_buffer);
+    const login = switch (shell_resolver.environment(arena, configured, null) catch return false) {
+        .user => |path| path,
+        else => return false,
+    };
+    return sameShellPath(arena, shell, login);
+}
+
+/// Whether two shell paths name one file, as `/bin/bash` and `/usr/bin/bash`
+/// do where `/bin` links to `/usr/bin`. A path that does not resolve matches
+/// only itself.
+fn sameShellPath(arena: Allocator, a: []const u8, b: []const u8) bool {
+    if (std.mem.eql(u8, a, b)) return true;
+    const real_a = io_mod.realpathAlloc(arena, a) catch return false;
+    const real_b = io_mod.realpathAlloc(arena, b) catch return false;
+    return std.mem.eql(u8, real_a, real_b);
 }
 
 fn classifyToolExecutionError(err: anyerror) diagnostics.ToolCallOutcome {
@@ -756,13 +822,13 @@ fn executeWorkspaceToolCallInner(
         }
     }
     const spec = registeredToolSpec(ctx, call.name) orelse
-        return semanticFailure(try arena.print("Unsupported tool: {s}", .{call.name}));
+        return semanticFailure(try arena.print("Unsupported tool: {f}", .{model_context_encoding.scalar(call.name)}));
     if (ctx.tool_registry.tools.len != 1 or
         !std.mem.eql(u8, spec.name, "shell") or
         spec.executor_kind != .run_command or
         spec.runtime_provider != .run_command)
     {
-        return semanticFailure(try arena.print("Unsupported tool: {s}", .{call.name}));
+        return semanticFailure(try arena.print("Unsupported tool: {f}", .{model_context_encoding.scalar(call.name)}));
     }
 
     var command_backend = RunCommandBackendState{ .runtime = ctx };
@@ -1067,7 +1133,10 @@ fn describeToolboxTool(raw: *anyopaque, arena: Allocator, tool: []const u8) anye
     const spec = state.runtime.tool_registry.lookup(tool) orelse return switch (try lookupToolboxMcpTool(state.runtime, arena, tool)) {
         .found => |found| .{ .definition = .{ .json = found.tool.schema_json, .notice = found.notice } },
         .rejected => |why| .{ .unavailable = why },
-        .missing => null,
+        .missing => if (types.isMcpToolName(tool) and mcpAccessChanged(state.runtime))
+            .{ .unavailable = try staleViewRefusal(arena, tool) }
+        else
+            null,
     };
     if (!spec.model_visible) return null;
     return .{ .definition = .{ .json = try model_tool_schema.builtinFunctionSchemaJsonAlloc(arena, spec.model_schema) } };
@@ -1118,8 +1187,25 @@ fn explainToolboxRun(raw: *anyopaque, arena: Allocator, tool: []const u8) anyerr
     return switch (try lookupToolboxMcpTool(ctx, arena, tool)) {
         .rejected => |why| why,
         .found => arena.print("{f} is available now; run it again with toolbox.", .{model_context_encoding.scalar(tool)}),
-        .missing => arena.print("No tool named {f} is in the toolbox. Use toolbox search to find it.", .{model_context_encoding.scalar(tool)}),
+        .missing => if (mcpAccessChanged(ctx))
+            staleViewRefusal(arena, tool)
+        else
+            arena.print("No tool named {f} is in the toolbox. Use toolbox search to find it.", .{model_context_encoding.scalar(tool)}),
     };
+}
+
+/// What a subagent hears for an MCP tool its view of the session's servers no
+/// longer holds: the cause, not that the tool is missing.
+fn staleViewRefusal(arena: Allocator, tool: []const u8) Allocator.Error![]const u8 {
+    return arena.print("{f} is not available to this work: {s}", .{ model_context_encoding.scalar(tool), tool_mcp_runtime.servers_changed_reason });
+}
+
+/// Whether this run's MCP view is one the session's servers have changed
+/// under since it was given.
+fn mcpAccessChanged(ctx: Context) bool {
+    const changed = ctx.mcp_access_changed orelse return false;
+    const runtime_context = ctx.mcp_ctx orelse return false;
+    return changed(runtime_context, ctx.mcp_access);
 }
 
 /// The review schema a selected MCP tool would carry: its name,
@@ -1159,11 +1245,14 @@ fn runBridgeCall(
 
 /// The row a bridge call shows in its shell call's group: the row a direct
 /// call of the same MCP tool shows, `Running MCP` and then `Ran MCP`. Only a
-/// host that set `nested_tool_lifecycle` shows it, and a row it could not
-/// show is logged, never a reason to fail the call.
+/// host that set `nested_tool_lifecycle` shows it, and keeps its tool name
+/// and outcome for a resume when the call ends. A row it could not show or
+/// keep is logged, never a reason to fail the call.
 const BridgeCallRow = struct {
     publisher: ToolLifecyclePublisher,
     id: types.ToolLifecycleId,
+    /// The shell call whose command made the call.
+    shell_call_id: []const u8,
     tool: []const u8,
 
     /// Arguments larger than this stay out of the row's details.
@@ -1172,7 +1261,12 @@ const BridgeCallRow = struct {
     fn start(ctx: Context, arena: Allocator, request_id: []const u8, tool: []const u8, arguments_json: []const u8) ?BridgeCallRow {
         const publisher = ctx.nested_tool_lifecycle orelse return null;
         const parent = ctx.output_chunk_lifecycle_id orelse return null;
-        const row: BridgeCallRow = .{ .publisher = publisher, .id = .{ .turn_id = parent.turn_id, .call_id = request_id }, .tool = tool };
+        const row: BridgeCallRow = .{
+            .publisher = publisher,
+            .id = .{ .turn_id = parent.turn_id, .call_id = request_id },
+            .shell_call_id = parent.call_id,
+            .tool = tool,
+        };
         row.begin(ctx, arena, arguments_json) catch |err| {
             debug_trace.logf("mcp-call", "request={s} row not shown err={s}", .{ request_id, @errorName(err) });
             return null;
@@ -1195,16 +1289,21 @@ const BridgeCallRow = struct {
         } });
     }
 
-    fn finish(self: BridgeCallRow, arena: Allocator, kind: types.ToolOutcomeKind) void {
-        const label = switch (kind) {
-            .completed => tool_presentation.mcp_ran_label,
-            .cancelled => "Cancelled",
-            .failed, .denied, .deferred => "Failed",
-        };
-        const summary = tool_presentation.formatToolActionValue(arena, label, self.tool) catch label;
+    fn finish(self: BridgeCallRow, arena: Allocator, outcome: types.BridgeCallOutcome) void {
+        const kind = outcome.toolOutcome();
+        const summary = tool_presentation.bridgeCallRowSummary(arena, self.tool, outcome) catch
+            tool_presentation.bridgeCallRowLabel(outcome);
         self.publisher.push(.{ .terminal = .{ .id = self.id, .outcome = .{ .kind = kind, .summary = summary } } }) catch |err| {
             // The worker's turn end closes a row whose end was lost.
             debug_trace.logf("mcp-call", "request={s} row end not shown err={s}", .{ self.id.call_id, @errorName(err) });
+        };
+        self.publisher.saveBridgeCall(.{
+            .call_id = self.shell_call_id,
+            .request_id = self.id.call_id,
+            .tool = self.tool,
+            .outcome = outcome,
+        }) catch |err| {
+            debug_trace.logf("mcp-call", "request={s} row not saved err={s} dropped=saved_bridge_row", .{ self.id.call_id, @errorName(err) });
         };
     }
 };
@@ -1336,7 +1435,7 @@ fn lookupBridge(
                 request.validate() catch |err| {
                     return .{ .status = .failed, .bytes = try arena.print("fx can't search for that: {s}.", .{@errorName(err)}) };
                 };
-                const result = try search(runtime, arena, request, ctx.permission_rules, limits, ctx.mcp_access, cancel);
+                const result = try search(runtime, arena, request, mcpRulesOf(ctx), limits, ctx.mcp_access, cancel);
                 const page = mcp_tool_lookup.writeToolLines(arena, &out.writer, result.model_output) catch |err| switch (err) {
                     error.OutOfMemory, error.WriteFailed => return error.OutOfMemory,
                     error.InvalidSearchPage => return .{ .status = .failed, .bytes = "The MCP search returned a page fx could not read." },
@@ -1426,6 +1525,75 @@ test "bridge messages name a requested tool as visible escapes, not raw bytes" {
     const failed = try callBridgeTool(failing.context(), arena, "call-1", name, "{}", .{}, &cancel);
     try std.testing.expectEqual(mcp_call_capability.CallStatus.failed, failed.status);
     try expectBridgeNameQuoted(failed.bytes);
+}
+
+test "a bridge call's row ends, then keeps its shell call, tool, and outcome for a resume, and never its arguments" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const Rows = struct {
+        terminal: std.ArrayList(types.ToolOutcomeKind) = .empty,
+        saved: std.ArrayList(types.BridgeCallRecord) = .empty,
+        refuse_saves: bool = false,
+
+        fn push(raw: *anyopaque, event: types.ToolLifecycleEvent) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (event == .terminal) try self.terminal.append(std.testing.allocator, event.terminal.outcome.kind);
+        }
+
+        fn save(raw: *anyopaque, record: types.BridgeCallRecord) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.refuse_saves) return error.NoOpenTurn;
+            try self.saved.append(std.testing.allocator, record);
+        }
+    };
+    var rows: Rows = .{};
+    defer rows.terminal.deinit(std.testing.allocator);
+    defer rows.saved.deinit(std.testing.allocator);
+    var marker: u8 = 0;
+    var ok_runtime = TestRuntime{ .mcp_ctx = @ptrCast(&marker), .mcp_call_tool = McpFixture.callOk };
+    defer ok_runtime.deinit(std.testing.allocator);
+    var failing_runtime = TestRuntime{ .mcp_ctx = @ptrCast(&marker), .mcp_call_tool = McpFixture.callFailure };
+    defer failing_runtime.deinit(std.testing.allocator);
+    const publisher: ToolLifecyclePublisher = .{ .context = @ptrCast(&rows), .push_fn = Rows.push, .save_bridge_call_fn = Rows.save };
+    var cancel: std.atomic.Value(bool) = .init(false);
+    const secret_arguments = "{\"text\":\"SECRET_ARGUMENT\"}";
+
+    var ok_ctx = ok_runtime.context();
+    ok_ctx.nested_tool_lifecycle = publisher;
+    ok_ctx.output_chunk_lifecycle_id = .{ .turn_id = 4, .call_id = "shell-call-1" };
+    var ok_state = McpCallBridgeState{ .runtime = ok_ctx };
+    const ran = try runBridgeCall(@ptrCast(&ok_state), arena, "fx-mcp-call-7", "mcp_fs_read", secret_arguments, .{}, &cancel);
+    try std.testing.expectEqual(mcp_call_capability.CallStatus.ok, ran.status);
+
+    var failing_ctx = failing_runtime.context();
+    failing_ctx.nested_tool_lifecycle = publisher;
+    failing_ctx.output_chunk_lifecycle_id = .{ .turn_id = 4, .call_id = "shell-call-1" };
+    var failing_state = McpCallBridgeState{ .runtime = failing_ctx };
+    const failed = try runBridgeCall(@ptrCast(&failing_state), arena, "fx-mcp-call-8", "mcp_fs_read", secret_arguments, .{}, &cancel);
+    try std.testing.expectEqual(mcp_call_capability.CallStatus.failed, failed.status);
+
+    try std.testing.expectEqualSlices(types.ToolOutcomeKind, &.{ .completed, .failed }, rows.terminal.items);
+    try std.testing.expectEqual(@as(usize, 2), rows.saved.items.len);
+    for (rows.saved.items, [_][]const u8{ "fx-mcp-call-7", "fx-mcp-call-8" }, [_]types.BridgeCallOutcome{ .completed, .failed }) |record, request_id, outcome| {
+        try std.testing.expectEqualStrings("shell-call-1", record.call_id);
+        try std.testing.expectEqualStrings(request_id, record.request_id);
+        try std.testing.expectEqualStrings("mcp_fs_read", record.tool);
+        try std.testing.expectEqual(outcome, record.outcome);
+    }
+
+    // A record the session can't take is logged; the call still returns.
+    rows.refuse_saves = true;
+    const unsaved = try runBridgeCall(@ptrCast(&ok_state), arena, "fx-mcp-call-9", "mcp_fs_read", secret_arguments, .{}, &cancel);
+    try std.testing.expectEqual(mcp_call_capability.CallStatus.ok, unsaved.status);
+    try std.testing.expectEqual(@as(usize, 2), rows.saved.items.len);
+    try std.testing.expectEqual(@as(usize, 3), rows.terminal.items.len);
+
+    // A host that shows no rows keeps none.
+    rows.refuse_saves = false;
+    var rowless_state = McpCallBridgeState{ .runtime = ok_runtime.context() };
+    _ = try runBridgeCall(@ptrCast(&rowless_state), arena, "fx-mcp-call-10", "mcp_fs_read", secret_arguments, .{}, &cancel);
+    try std.testing.expectEqual(@as(usize, 2), rows.saved.items.len);
 }
 
 const RunCommandBackendState = struct {
@@ -1520,10 +1688,17 @@ fn toolExecutionResultFromDispatch(
     };
 }
 
+/// The permission rules an MCP path uses in this context: none in full access
+/// (`permissions.mcpRules`), so one function decides it for search, open, run,
+/// `fx mcp call`, the per-step refresh, and the dispatch context's field.
+fn mcpRulesOf(ctx: Context) types.PermissionRuleSet {
+    return permissions.mcpRules(ctx.permission_mode, ctx.permission_rules);
+}
+
 pub fn snapshotMcpDefinition(ctx: Context, arena: Allocator, name: []const u8, known: tool_mcp_runtime.Binding) !tool_mcp_runtime.DefinitionSnapshot {
     const runtime = ctx.mcp_ctx orelse return .unavailable;
     const snapshot = ctx.mcp_snapshot_tool orelse return .unavailable;
-    return snapshot(runtime, arena, name, known, ctx.permission_rules, ctx.context_limits, ctx.mcp_access);
+    return snapshot(runtime, arena, name, known, mcpRulesOf(ctx), ctx.context_limits, ctx.mcp_access);
 }
 
 /// Resolves the exact exposed name of a live MCP tool the model called
@@ -1536,7 +1711,7 @@ pub fn resolveUnselectedMcpTool(ctx: Context, arena: Allocator, name: []const u8
         runtime_context,
         arena,
         name,
-        ctx.permission_rules,
+        mcpRulesOf(ctx),
         ctx.context_limits,
         ctx.mcp_access,
         runtimeCancelFlag(ctx),
@@ -1574,7 +1749,7 @@ fn lookupToolboxMcpTool(ctx: Context, arena: Allocator, name: []const u8) !Toolb
         runtime_context,
         arena,
         name,
-        ctx.permission_rules,
+        mcpRulesOf(ctx),
         ctx.context_limits,
         ctx.mcp_access,
         runtimeCancelFlag(ctx),
@@ -1603,7 +1778,7 @@ fn refreshChangedMcpTool(ctx: Context, arena: Allocator, call: ToolCall) !ToolEx
         "MCP tool definition changed before execution and is no longer available. Search for current tools.";
     var notice: ?[]const u8 = null;
     if (ctx.mcp_ctx) |runtime_context| if (ctx.mcp_tool_schema) |schema_fn| {
-        const current = schema_fn(runtime_context, arena, name, ctx.permission_rules, ctx.context_limits, ctx.mcp_access, runtimeCancelFlag(ctx)) catch |err| switch (err) {
+        const current = schema_fn(runtime_context, arena, name, mcpRulesOf(ctx), ctx.context_limits, ctx.mcp_access, runtimeCancelFlag(ctx)) catch |err| switch (err) {
             error.OutOfMemory => return err,
             else => null,
         };
@@ -1678,6 +1853,32 @@ test "a toolbox run whose MCP definition changed before it ran says to open it a
     try std.testing.expectEqualStrings("mcp_fixture_echo's definition changed before it ran, and it is no longer available. Use toolbox search to find current tools.", gone.model_output);
 }
 
+fn accessAlwaysChanged(_: *anyopaque, _: tool_mcp_runtime.Access) bool {
+    return true;
+}
+
+test "a subagent whose MCP view the servers changed under hears why for toolbox open of a tool" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var host: u8 = 0;
+    var rt = TestRuntime{ .mcp_ctx = &host, .mcp_tool_schema = goneMcpSchema, .mcp_access_changed = accessAlwaysChanged };
+    defer rt.deinit(std.testing.allocator);
+
+    const refusal = "mcp_fixture_echo is not available to this work: " ++ tool_mcp_runtime.servers_changed_reason;
+    // `toolbox {open}` of an MCP tool says the servers changed, not that the toolbox has no such tool.
+    const opened = try executeToolCall(rt.context(), arena, .{ .id = "1", .name = "toolbox", .arguments_json = "{\"open\":\"mcp_fixture_echo\",\"kind\":\"tool\"}" });
+    try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.failure, opened.status);
+    try std.testing.expectEqualStrings(refusal, opened.model_output);
+    // A name that is no MCP tool of any view keeps its answer.
+    const typo = try executeToolCall(rt.context(), arena, .{ .id = "3", .name = "toolbox", .arguments_json = "{\"open\":\"nothing_here\",\"kind\":\"tool\"}" });
+    try expectContains(typo.model_output, "No tool named nothing_here is in the toolbox menu.");
+    // And a view the servers did not change under keeps it for an MCP tool too.
+    rt.mcp_access_changed = null;
+    const same = try executeToolCall(rt.context(), arena, .{ .id = "4", .name = "toolbox", .arguments_json = "{\"open\":\"mcp_fixture_echo\",\"kind\":\"tool\"}" });
+    try expectContains(same.model_output, "No tool named mcp_fixture_echo is in the toolbox menu.");
+}
+
 const ContextNoticeSinkState = struct {
     allocator: Allocator,
     notices: std.ArrayList([]const u8) = .empty,
@@ -1734,6 +1935,7 @@ fn typedDispatchContext(ctx: Context, arena: Allocator) tool_dispatch.DispatchCo
         },
         .lifecycle_allocator = ctx.session_allocator,
         .cancel_flag = runtimeCancelFlag(ctx),
+        .tool_yield_flag = &ctx.worker.tool_yield_requested,
         .output_chunk_lifecycle_id = ctx.output_chunk_lifecycle_id,
         .output_chunk_ctx = ctx.output_chunk_ctx,
         .on_output_chunk = ctx.on_output_chunk,
@@ -1755,11 +1957,9 @@ fn typedDispatchContext(ctx: Context, arena: Allocator) tool_dispatch.DispatchCo
         .mcp_search_tools = ctx.mcp_search_tools,
         .mcp_tool_schema = ctx.mcp_tool_schema,
         .mcp_access = ctx.mcp_access,
+        .mcp_access_changed = ctx.mcp_access_changed,
         .mcp_input_responder = ctx.mcp_input_responder,
-        .mcp_permission_rules = if (ctx.permission_mode == .yolo)
-            .{}
-        else
-            ctx.permission_rules,
+        .mcp_permission_rules = mcpRulesOf(ctx),
     };
 }
 
@@ -1769,7 +1969,20 @@ fn terminal_lease_cleanup_dispatch_context(
 ) tool_dispatch.DispatchContext {
     var dispatch = typedDispatchContext(ctx, arena);
     dispatch.cancel_flag = null;
+    dispatch.tool_yield_flag = null;
     return dispatch;
+}
+
+/// Stops the shell commands that steering moved to the background during
+/// turn `turn_id`, after the user cancelled that turn. The stop ignores the
+/// turn's cancel flag, which is set by then.
+pub fn stop_steering_detached_commands(ctx: Context, turn_id: u64) !void {
+    var arena_state = std.heap.ArenaAllocator.init(ctx.session_allocator);
+    defer arena_state.deinit();
+    return shell_impl.stopSteeringDetached(
+        terminal_lease_cleanup_dispatch_context(ctx, arena_state.allocator()),
+        turn_id,
+    );
 }
 
 pub fn release_agent_terminal_lease(ctx: Context, session_id: []const u8) !void {
@@ -1884,6 +2097,13 @@ fn executeVisionRequest(
         .cancel_flag = state.runtime.cancel_flag,
         .trace_ctx = .{},
         .output_limit = state.runtime.context_limits.image_adapter_output_bytes,
+        // A Token Pass session of a team with Token Pass reads images with a
+        // Token Pass model. A custom connection reads images with its own
+        // vision_model.
+        .model = if (state.runtime.provider == .gateway)
+            token_pass_team.modelForSideCall(.vision, state.runtime.model, image_provider.default_model)
+        else
+            state.runtime.provider_capabilities.vision_model orelse image_provider.default_model,
     };
     if (request.image_ids() != null) {
         if (authority != .ordinary) return error.InvalidVisionExecutionAuthority;
@@ -2694,15 +2914,11 @@ test "subagent session title is derived only from the current request identity" 
     }
 }
 
-fn subagentProviderFailure(
+fn subagentProviderRefusal(
     alloc: Allocator,
-    error_code: []const u8,
+    why: subagent_refusal.Refusal,
 ) Allocator.Error!subagent_tool_provider.Result {
-    const body = subagent_model_contract.encodeResultAlloc(alloc, .{
-        .ok = false,
-        .error_code = error_code,
-    }) catch return error.OutOfMemory;
-    return .{ .status = .failure, .body = body };
+    return .{ .status = .failure, .body = try why.body(alloc) };
 }
 
 fn executeSubagentProvider(
@@ -2714,9 +2930,9 @@ fn executeSubagentProvider(
     const state: *SubagentProviderState = @ptrCast(@alignCast(raw_context.?));
     const ctx = state.runtime;
     const host = ctx.subagent_host orelse
-        return subagentProviderFailure(arena, "host_unavailable");
+        return subagentProviderRefusal(arena, .host_unavailable);
     const caller_id = ctx.subagent_caller_id orelse
-        return subagentProviderFailure(arena, "caller_unavailable");
+        return subagentProviderRefusal(arena, .{ .caller_unavailable = .unidentified });
     const identity_epoch = host.issueOperationIdentity(invocation_id);
     var progress_bridge = SubagentProgressBridge.init(arena, ctx, state.call);
     const output = host.executeManaged(arena, request, .{
@@ -2746,7 +2962,8 @@ fn executeSubagentProvider(
     }) catch |err| {
         if (err == error.OutOfMemory) return error.OutOfMemory;
         if (err == error.Cancelled) return error.Cancelled;
-        return subagentProviderFailure(arena, "host_failure");
+        debug_trace.logf("subagent", "host failure err={s}", .{@errorName(err)});
+        return subagentProviderRefusal(arena, .{ .host_failure = .internal });
     };
     if (output.final_status) |status_value| {
         var status = status_value;
@@ -3030,6 +3247,7 @@ const TestRuntime = struct {
     mcp_call_tool: ?tool_mcp_runtime.CallToolFn = null,
     mcp_search_tools: ?tool_mcp_runtime.SearchToolsFn = null,
     mcp_tool_schema: ?tool_mcp_runtime.ToolSchemaFn = null,
+    mcp_access_changed: ?tool_mcp_runtime.AccessChangedFn = null,
     mcp_snapshot_tool: ?tool_mcp_runtime.SnapshotToolFn = null,
     mcp_input_responder: ?tool_mcp_runtime.InputResponder = null,
     advertised_dynamic_tool_names: []const []const u8 = &.{},
@@ -3103,6 +3321,7 @@ const TestRuntime = struct {
             .mcp_call_tool = self.mcp_call_tool,
             .mcp_search_tools = self.mcp_search_tools,
             .mcp_tool_schema = self.mcp_tool_schema,
+            .mcp_access_changed = self.mcp_access_changed,
             .mcp_snapshot_tool = self.mcp_snapshot_tool,
             .mcp_input_responder = self.mcp_input_responder,
             .advertised_dynamic_tool_names = self.advertised_dynamic_tool_names,
@@ -3648,6 +3867,50 @@ test "removed tool names are not callable" {
         const expected = try arena.print("Unsupported tool: {s}", .{name});
         try std.testing.expectEqualStrings(expected, result.model_output);
     }
+}
+
+test "a call of a tool fx does not know names it as visible text in the result the model reads" {
+    var rt = TestRuntime{};
+    defer rt.deinit(std.testing.allocator);
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const cases = [_]struct { name: []const u8, shown: []const u8 }{
+        .{ .name = "missing_tool", .shown = "Unsupported tool: missing_tool" },
+        .{ .name = "", .shown = "Unsupported tool: " },
+        .{ .name = "x\x1b]0;owned\x07y", .shown = "Unsupported tool: x&#x1b;]0;owned&#x07;y" },
+        .{ .name = "a\x00b\r\nc", .shown = "Unsupported tool: a&#x00;b&#x0d;&#x0a;c" },
+    };
+    for (cases) |case| {
+        const call: ToolCall = .{ .id = "odd-tool", .name = case.name, .arguments_json = "{}" };
+        // The same text through the way a native call is run and the way a
+        // wasi host runs a workspace call.
+        const executed = try executeToolCall(rt.context(), arena, call);
+        try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.failure, executed.status);
+        try std.testing.expectEqualStrings(case.shown, executed.model_output);
+        const workspace = try executeWorkspaceToolCallInner(rt.context(), arena, call, .ordinary, true);
+        try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.failure, workspace.status);
+        try std.testing.expectEqualStrings(case.shown, workspace.model_output);
+    }
+}
+
+test "a workspace call of a tool that is not the one shell tool answers as an unsupported tool" {
+    var rt = TestRuntime{};
+    defer rt.deinit(std.testing.allocator);
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // `read_file` is registered, but a workspace call runs only a registry
+    // of the shell tool alone.
+    const result = try executeWorkspaceToolCallInner(rt.context(), arena, .{
+        .id = "other-tool",
+        .name = "read_file",
+        .arguments_json = "{}",
+    }, .ordinary, true);
+    try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.failure, result.status);
+    try std.testing.expectEqualStrings("Unsupported tool: read_file", result.model_output);
 }
 
 fn registryOwnedWebFetchCall(
@@ -4329,6 +4592,102 @@ test "parent web_fetch tool-call metric omits URL and fetched result content" {
     try std.testing.expectEqual(@as(u32, 0), buf[0].args_total_bytes);
     try std.testing.expectEqual(@as(u32, 0), buf[0].result_total_bytes);
     try expectNotContains(buf[0].result(), "FETCHED_PAGE_SECRET_RAW");
+}
+
+test "a call reads the startup files only when admission resolves it to a user-profile run" {
+    const builtin_tools = @import("../../builtins/tools.zig");
+    var rt = TestRuntime{ .tool_registry = builtin_tools.registry };
+    defer rt.deinit(std.testing.allocator);
+    const cases = [_]struct { arguments_json: []const u8, reads: bool }{
+        .{ .arguments_json = "{\"action\":\"run\",\"command\":\"ls -d missing .\"}", .reads = true },
+        .{ .arguments_json = "{\"action\":\"run\",\"command\":\"ls -d missing .\",\"profile\":\"user\"}", .reads = true },
+        .{ .arguments_json = "{\"action\":\"run\",\"command\":\"ls -d missing .\",\"profile\":\"clean\"}", .reads = false },
+        // A clean start skips the startup files of any shell.
+        .{
+            .arguments_json = "{\"action\":\"run\",\"tty\":true,\"command\":\"ls\",\"shell\":{\"kind\":\"executable\",\"path\":\"/bin/sh\",\"clean_start\":true}}",
+            .reads = false,
+        },
+        // `interact` types into a session, here one that does not exist, and
+        // `stop` ends one; neither starts a command.
+        .{ .arguments_json = "{\"action\":\"interact\",\"session_id\":\"missing\",\"chars\":\"ls -d /missing; exit 3\\n\"}", .reads = false },
+        .{ .arguments_json = "{\"action\":\"stop\",\"session_id\":\"missing\",\"force\":true}", .reads = false },
+        // The orchestrator adds the action a call leaves out before the call
+        // is stored, so a stored call without one never ran.
+        .{ .arguments_json = "{\"command\":\"ls\"}", .reads = false },
+        .{ .arguments_json = "not json", .reads = false },
+    };
+    for (cases) |case| {
+        const call: ToolCall = .{ .id = "case", .name = "shell", .arguments_json = case.arguments_json };
+        std.testing.expectEqual(case.reads, callReadsStartupFiles(rt.context(), std.testing.allocator, call)) catch |err| {
+            std.debug.print("arguments: {s}\n", .{case.arguments_json});
+            return err;
+        };
+    }
+    const read: ToolCall = .{ .id = "read", .name = "read_file", .arguments_json = "{\"path\":\"missing.txt\"}" };
+    try std.testing.expect(!callReadsStartupFiles(rt.context(), std.testing.allocator, read));
+
+    // A tty run reads the snapshot's startup files only in the login shell
+    // the snapshot captured; another shell reads its own.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var login_buffer: [4096]u8 = undefined;
+    const login = switch (try shell_resolver.environment(arena, shell_resolver.configuredLoginShellInto(&login_buffer), null)) {
+        .user => |path| path,
+        else => return error.TestUnexpectedResult,
+    };
+    const other: []const u8 = if (std.mem.endsWith(u8, login, "/zsh")) "/bin/bash" else "/bin/zsh";
+    const tty_cases = [_]struct { shell: ?[]const u8, reads: bool }{
+        .{ .shell = null, .reads = true },
+        .{ .shell = login, .reads = true },
+        .{ .shell = other, .reads = false },
+    };
+    for (tty_cases) |case| {
+        const shell_field = if (case.shell) |path|
+            try arena.print(",\"shell\":{{\"kind\":\"executable\",\"path\":\"{s}\"}}", .{path})
+        else
+            "";
+        const arguments_json = try arena.print("{{\"action\":\"run\",\"tty\":true,\"command\":\"ls -d missing .\"{s}}}", .{shell_field});
+        const call: ToolCall = .{ .id = "tty", .name = "shell", .arguments_json = arguments_json };
+        std.testing.expectEqual(case.reads, callReadsStartupFiles(rt.context(), std.testing.allocator, call)) catch |err| {
+            std.debug.print("login {s}, arguments: {s}\n", .{ login, arguments_json });
+            return err;
+        };
+    }
+    // Two spellings of one file name one shell; a path that does not resolve
+    // matches only itself.
+    try std.testing.expect(sameShellPath(arena, "/bin/../bin/sh", "/bin/sh"));
+    try std.testing.expect(sameShellPath(arena, "/missing/zsh", "/missing/zsh"));
+    try std.testing.expect(!sameShellPath(arena, "/missing/zsh", "/missing/../missing/zsh"));
+}
+
+test "trace keeps a user-profile run cancelled before it starts as reading no startup files" {
+    diagnostics.resetForTest();
+    defer diagnostics.resetForTest();
+    // Set before the call, so the runner stops before it starts a shell.
+    var cancel = std.atomic.Value(bool).init(true);
+    const builtin_tools = @import("../../builtins/tools.zig");
+    var rt = TestRuntime{ .tool_registry = builtin_tools.registry, .cancel_flag = &cancel };
+    defer rt.deinit(std.testing.allocator);
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+
+    // The shell tool reports the cancel as a failed result with no command
+    // result; a cancel the runner raises instead ends as an error.
+    if (executeTestRunCommand(rt.context(), arena_state.allocator(), .{
+        .id = "cancelled_run",
+        .name = "shell",
+        .arguments_json = "{\"action\":\"run\",\"command\":\"ls -d missing .\"}",
+    })) |result| {
+        try std.testing.expect(result.cancelled);
+        try std.testing.expect(result.command_result_json == null);
+    } else |err| try std.testing.expectEqual(error.Cancelled, err);
+    var kept: [1]diagnostics.FailedToolCall = undefined;
+    try std.testing.expectEqual(@as(usize, 1), diagnostics.snapshotFailedToolCalls(&kept));
+    try std.testing.expectEqualStrings("cancelled_run", kept[0].callId());
+    try std.testing.expect(kept[0].outcome != .succeeded and kept[0].outcome != .command_failed);
+    // The trace writes `redefined` only for a call marked as reading them.
+    try std.testing.expect(!kept[0].reads_startup_files);
 }
 
 test "tool-call metrics retain caller identity across returned results" {
@@ -6881,6 +7240,8 @@ const McpFixture = struct {
 
     const PermissionContext = struct {
         search_rule_count: usize = 0,
+        schema_rule_count: usize = 0,
+        snapshot_rule_count: usize = 0,
     };
 
     const AuthorityContext = struct {
@@ -6946,6 +7307,18 @@ const McpFixture = struct {
         return .{ .selected = .{ .model_output = try arena.dupe(u8, "{\"type\":\"function\",\"name\":\"mcp_fs_read\",\"description\":\"Read <context_limit action='literal' />\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"context_limit_rejection\":{\"type\":\"string\"}}}}") } };
     }
 
+    fn schemaRecordingRules(raw_ctx: *anyopaque, arena: Allocator, name: []const u8, permission_rules: types.PermissionRuleSet, limits: context_limits.Values, access: tool_mcp_runtime.Access, cancel: ?*std.atomic.Value(bool)) anyerror!?tool_mcp_runtime.ToolSchemaResult {
+        const ctx: *PermissionContext = @ptrCast(@alignCast(raw_ctx));
+        ctx.schema_rule_count = permission_rules.rules.len;
+        return schema(raw_ctx, arena, name, permission_rules, limits, access, cancel);
+    }
+
+    fn snapshotRecordingRules(raw_ctx: *anyopaque, _: Allocator, _: []const u8, _: tool_mcp_runtime.Binding, permission_rules: types.PermissionRuleSet, _: context_limits.Values, _: tool_mcp_runtime.Access) anyerror!tool_mcp_runtime.DefinitionSnapshot {
+        const ctx: *PermissionContext = @ptrCast(@alignCast(raw_ctx));
+        ctx.snapshot_rule_count = permission_rules.rules.len;
+        return .current;
+    }
+
     fn searchRecordingRules(raw_ctx: *anyopaque, arena: Allocator, request: capability_retrieval.Request, permission_rules: types.PermissionRuleSet, limits: context_limits.Values, _: tool_mcp_runtime.Access, _: ?*std.atomic.Value(bool)) anyerror!tool_mcp_runtime.SearchResult {
         const ctx: *PermissionContext = @ptrCast(@alignCast(raw_ctx));
         ctx.search_rule_count = permission_rules.rules.len;
@@ -6986,6 +7359,67 @@ test "toolbox search forwards permission rules to MCP search" {
     });
 
     try std.testing.expectEqual(@as(usize, 0), permission_context.search_rule_count);
+}
+
+// Full access ignores deny rules on every MCP path, so each reader of the
+// rules takes them from `permissions.mcpRules` with the mode of its context
+// (tests/tla/mcp_host/McpRules.tla). The six readers are the dispatch field
+// (toolbox search reads it), the bridge's list and search (`lookupBridge`), a
+// toolbox run or the bridge (`resolveUnselectedMcpTool`), an open of a tool, the
+// refresh of a tool whose definition changed (`refreshChangedMcpTool`), and the
+// per-step snapshot (`snapshotMcpDefinition`). In ask and auto each reads the
+// host's rules.
+test "every MCP reader takes the host's rules outside full access and none in it" {
+    var permission_context = McpFixture.PermissionContext{};
+    var rules = [_]types.PermissionRule{
+        .{ .permission = @constCast("mcp_fs_read"), .pattern = @constCast("*"), .action = .deny },
+    };
+    var rt = TestRuntime{
+        .mcp_ctx = @ptrCast(&permission_context),
+        .mcp_tool_schema = McpFixture.schemaRecordingRules,
+        .mcp_search_tools = McpFixture.searchRecordingRules,
+        .mcp_snapshot_tool = McpFixture.snapshotRecordingRules,
+        .permission_rules = .{ .rules = &rules },
+    };
+    defer rt.deinit(std.testing.allocator);
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const binding: tool_mcp_runtime.Binding = .{ .runtime_generation = 1, .connection_generation = 1, .catalog_generation = 1, .auth_generation = 1 };
+    var cancel: std.atomic.Value(bool) = .init(false);
+
+    for ([_]struct { mode: types.PermissionMode, rules: usize }{
+        .{ .mode = .ask, .rules = 1 },
+        .{ .mode = .auto, .rules = 1 },
+        .{ .mode = .yolo, .rules = 0 },
+    }) |case| {
+        rt.permission_mode = case.mode;
+        const context = rt.context();
+
+        try std.testing.expectEqual(case.rules, typedDispatchContext(context, arena).mcp_permission_rules.rules.len);
+
+        permission_context.schema_rule_count = 99;
+        _ = try resolveUnselectedMcpTool(context, arena, "mcp_fs_read");
+        try std.testing.expectEqual(case.rules, permission_context.schema_rule_count);
+
+        permission_context.schema_rule_count = 99;
+        _ = try lookupToolboxMcpTool(context, arena, "mcp_fs_read");
+        try std.testing.expectEqual(case.rules, permission_context.schema_rule_count);
+
+        permission_context.schema_rule_count = 99;
+        _ = try refreshChangedMcpTool(context, arena, .{ .id = "refresh", .name = "mcp_fs_read", .arguments_json = "{}" });
+        try std.testing.expectEqual(case.rules, permission_context.schema_rule_count);
+
+        permission_context.snapshot_rule_count = 99;
+        _ = try snapshotMcpDefinition(context, arena, "mcp_fs_read", binding);
+        try std.testing.expectEqual(case.rules, permission_context.snapshot_rule_count);
+
+        permission_context.search_rule_count = 99;
+        var bridge = McpCallBridgeState{ .runtime = context };
+        _ = try lookupBridge(@ptrCast(&bridge), arena, .{ .search = "read" }, &cancel);
+        try std.testing.expectEqual(case.rules, permission_context.search_rule_count);
+    }
 }
 
 test "MCP dynamic tool cannot execute before it is advertised" {
@@ -8542,4 +8976,169 @@ test "vision cancellation stops later batches and does not surface the outage ti
         ),
     );
     try std.testing.expectEqual(@as(usize, 1), fixture.call_count);
+}
+
+/// The real shell tool, which registers its call with the bridge, in place of
+/// the double the other tests' registry uses.
+const bridge_test_registry = tool_dispatch.Registry{ .tools = &.{test_builtin_tools.shell} };
+
+/// A shell call run through `executeToolCallAuthorized` on its own thread. Its
+/// command publishes the bridge's socket and token and holds until the test
+/// is done, so the test can make the command's `fx mcp call` itself.
+const HeldShellCall = struct {
+    ctx: Context,
+    request: tool_contracts.ToolExecutionRequest,
+
+    fn run(self: *HeldShellCall) void {
+        // The result is in the call's arena, which the test frees.
+        _ = executeToolCallAuthorized(self.ctx, self.request) catch return;
+    }
+};
+
+/// What the bridge answers `tool`, called as a shell command's `fx mcp call` is,
+/// while a shell call runs under `rt` with `grants` in its request: the answer
+/// of the nested check that `executeToolCallAuthorized` set up from that
+/// request, and not what a `Context` holds.
+fn nestedBridgeStatus(rt: *TestRuntime, grants: []const PermissionGrant, tool: []const u8) !mcp_call_wire.Status {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "w");
+    const dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "w");
+    defer alloc.free(dir);
+    var test_arena = std.heap.ArenaAllocator.init(alloc);
+    defer test_arena.deinit();
+    const arena = test_arena.allocator();
+    // The shell call allocates on its own thread, so it gets its own arena.
+    var call_arena = std.heap.ArenaAllocator.init(alloc);
+    defer call_arena.deinit();
+    const env_file = try std.Io.Dir.path.join(arena, &.{ dir, "bridge.env" });
+    const done_file = try std.Io.Dir.path.join(arena, &.{ dir, "done" });
+    // The clean profile has no PATH of its own, and `sleep` is not a builtin.
+    const command = try arena.print(
+        "PATH=/usr/bin:/bin; printf '%s\\n%s\\n' \"$FX_MCP_CALL_SOCKET\" \"$FX_MCP_CALL_TOKEN\" > '{s}'; until [ -f '{s}' ]; do sleep 0.05; done",
+        .{ env_file, done_file },
+    );
+    var arguments: std.Io.Writer.Allocating = .init(arena);
+    // The command's own timeout ends the thread if the test cannot.
+    try arguments.writer.writeAll("{\"action\":\"run\",\"yield_time_ms\":30000,\"timeout_ms\":20000,\"command\":");
+    try std.json.Stringify.value(command, .{}, &arguments.writer);
+    try arguments.writer.writeAll("}");
+    const call: ToolCall = .{ .id = "hold", .name = "shell", .arguments_json = try arguments.toOwnedSlice() };
+    // The shell tool reaches the bridge only through the host's managed runtime.
+    var managed = managed_execution.Runtime.init(alloc);
+    defer managed.deinit();
+    var ctx = rt.context();
+    ctx.managed_executions = &managed;
+    const command_ctx = try tool_admission.runCommandContext(ctx.admissionInput(), arena, call);
+    var held = HeldShellCall{
+        .ctx = ctx,
+        .request = .{
+            .call_allocator = call_arena.allocator(),
+            .result_allocator = call_arena.allocator(),
+            .call = call,
+            .authority = .{ .run_command = .{ .shell_allowed = .{ .fingerprint = .init(command_ctx), .source = .configured_rule } } },
+            .session_grants = grants,
+            .advertised_dynamic_tool_names = ctx.advertised_dynamic_tool_names,
+            .max_tool_result_bytes = ctx.max_tool_result_bytes,
+        },
+    };
+    const thread = try std.Thread.spawn(.{}, HeldShellCall.run, .{&held});
+    defer thread.join();
+    defer writeTestFile(tmp.dir, "w/done", "") catch {};
+
+    // No event says the command has written the file, so this is a bounded
+    // poll, until the file holds the socket and a whole token.
+    var socket_path: []const u8 = "";
+    var token: ?mcp_call.Token = null;
+    var waited: usize = 0;
+    while (token == null) : (waited += 1) {
+        if (waited >= 400) return error.TestBridgeNeverPublished;
+        io_mod.sleep(25 * std.time.ns_per_ms);
+        if (!absolutePathExists(env_file)) continue;
+        const published = try readTraceFileForTest(arena, env_file);
+        var lines = std.mem.splitScalar(u8, published, '\n');
+        socket_path = lines.next() orelse continue;
+        token = mcp_call_wire.parseToken(lines.next() orelse continue);
+    }
+    const reply = try mcp_call_client.call(arena, std.testing.io, socket_path, token.?, .{ .call = .{ .tool = tool, .arguments_json = "{}" } });
+    return reply.header.status;
+}
+
+/// A tool definition the bridge's review accepts: a description and an input schema.
+fn echoMcpSchema(_: *anyopaque, arena: Allocator, _: []const u8, _: types.PermissionRuleSet, _: context_limits.Values, _: tool_mcp_runtime.Access, _: ?*std.atomic.Value(bool)) anyerror!?tool_mcp_runtime.ToolSchemaResult {
+    return .{ .selected = .{ .model_output = try arena.dupe(u8, "{\"description\":\"Echoes its text.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{}}}") } };
+}
+
+const mcp_call = @import("../mcp_host/mcp_call.zig");
+const mcp_call_client = @import("../mcp_host/mcp_call_client.zig");
+const mcp_call_wire = @import("../mcp_host/mcp_call_wire.zig");
+
+test "a command's fx mcp call is checked against the approvals its tool call began with" {
+    if (comptime !mcp_call_capability.supported) return error.SkipZigTest;
+    const echo = [_]PermissionGrant{.{ .tool_name = @constCast("mcp_fixture_echo"), .target_path = @constCast("mcp_fixture_echo") }};
+    const other = [_]PermissionGrant{.{ .tool_name = @constCast("mcp_fixture_other"), .target_path = @constCast("mcp_fixture_other") }};
+    var counting = McpFixture.CountingContext{};
+    var rt = TestRuntime{
+        .tool_registry = bridge_test_registry,
+        .permission_mode = .ask,
+        .interactive = false,
+        .mcp_ctx = &counting,
+        .mcp_has_tool = McpFixture.hasTrue,
+        .mcp_tool_schema = echoMcpSchema,
+        .mcp_call_tool = McpFixture.callCounting,
+    };
+    defer rt.deinit(std.testing.allocator);
+
+    // The approval the call began with lets the nested call run, with no prompt.
+    try std.testing.expect(try nestedBridgeStatus(&rt, &echo, "mcp_fixture_echo") != .denied);
+    try std.testing.expectEqual(@as(usize, 1), counting.calls);
+
+    // Without it the nested call is not allowed, and the tool does not run.
+    try std.testing.expectEqual(mcp_call_wire.Status.denied, try nestedBridgeStatus(&rt, &.{}, "mcp_fixture_echo"));
+    // An approval of another tool does not cover it.
+    try std.testing.expectEqual(mcp_call_wire.Status.denied, try nestedBridgeStatus(&rt, &other, "mcp_fixture_echo"));
+    try std.testing.expectEqual(@as(usize, 1), counting.calls);
+
+    // A deny rule still wins over the approval.
+    var deny_rules = [_]types.PermissionRule{
+        .{ .permission = @constCast("mcp_fixture_echo"), .pattern = @constCast("mcp_fixture_echo"), .action = .deny },
+    };
+    rt.permission_rules = .{ .rules = &deny_rules };
+    try std.testing.expectEqual(mcp_call_wire.Status.denied, try nestedBridgeStatus(&rt, &echo, "mcp_fixture_echo"));
+    rt.permission_rules = .{};
+
+    // A tool this agent is not offered stays unavailable, approval or not.
+    rt.mcp_tool_schema = goneMcpSchema;
+    try std.testing.expectEqual(mcp_call_wire.Status.denied, try nestedBridgeStatus(&rt, &echo, "mcp_fixture_echo"));
+    try std.testing.expectEqual(@as(usize, 1), counting.calls);
+}
+
+test "in auto mode a command's fx mcp call skips the safety check for the approved tool only" {
+    if (comptime !mcp_call_capability.supported) return error.SkipZigTest;
+    const echo = [_]PermissionGrant{.{ .tool_name = @constCast("mcp_fixture_echo"), .target_path = @constCast("mcp_fixture_echo") }};
+    var counting = McpFixture.CountingContext{};
+    var reviewer = TestAutoReview{};
+    var rt = TestRuntime{
+        .tool_registry = bridge_test_registry,
+        .permission_mode = .auto,
+        .interactive = false,
+        .auto_classifier = reviewer.classifier(),
+        .mcp_ctx = &counting,
+        .mcp_has_tool = McpFixture.hasTrue,
+        .mcp_tool_schema = echoMcpSchema,
+        .mcp_call_tool = McpFixture.callCounting,
+    };
+    defer rt.deinit(std.testing.allocator);
+
+    // The approved tool runs without a review.
+    try std.testing.expect(try nestedBridgeStatus(&rt, &echo, "mcp_fixture_echo") != .denied);
+    try std.testing.expectEqual(@as(usize, 0), reviewer.calls);
+    try std.testing.expectEqual(@as(usize, 1), counting.calls);
+
+    // Another tool, and the same tool without the approval, each get one.
+    try std.testing.expect(try nestedBridgeStatus(&rt, &echo, "mcp_fixture_other") != .denied);
+    try std.testing.expectEqual(@as(usize, 1), reviewer.calls);
+    try std.testing.expect(try nestedBridgeStatus(&rt, &.{}, "mcp_fixture_echo") != .denied);
+    try std.testing.expectEqual(@as(usize, 2), reviewer.calls);
 }

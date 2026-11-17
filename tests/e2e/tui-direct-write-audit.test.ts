@@ -107,8 +107,8 @@ describe("tui: direct-write audit", () => {
           }`,
       },
       {
-        name: "top-level help TTY capability probe",
-        path: "src/main.zig",
+        name: "stdout terminal probe for help and session lists",
+        path: "src/core/shared/terminal_env.zig",
         accepted: true,
         source: `const std = @import("std");
           fn stdoutIsTerminal() bool {

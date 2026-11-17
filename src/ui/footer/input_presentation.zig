@@ -181,19 +181,44 @@ test "steering rows visibly escape terminal control bytes" {
 }
 
 // Ordered widest-first; every fallback keeps the enter/esc controls so narrow
-// terminals never lose the submit and cancel instructions.
-const freeform_question_hints = [_][]const u8{
+// terminals never lose the submit and cancel instructions. Tab moves between
+// the questions of a batch, so a lone question's hints leave it out.
+const freeform_batch_hints = [_][]const u8{
+    "type answer    ↑↓←→ cursor    shift+↑↓ options    tab questions    enter answer    esc cancel",
     "↑↓ cursor · shift+↑↓ options · tab questions · enter answer · esc cancel",
     "shift+↑↓ options · tab questions · enter answer · esc cancel",
     "tab questions · enter answer · esc cancel",
     "enter answer · esc cancel",
 };
 
-const predefined_question_hints = [_][]const u8{
+const freeform_question_hints = [_][]const u8{
+    "type answer    ↑↓←→ cursor    shift+↑↓ options    enter answer    esc cancel",
+    "↑↓ cursor · shift+↑↓ options · enter answer · esc cancel",
+    "shift+↑↓ options · enter answer · esc cancel",
+    "enter answer · esc cancel",
+};
+
+// Each list follows its widest hint, which names the option count.
+const predefined_batch_hints = [_][]const u8{
     "↑↓ options · tab questions · enter answer · esc cancel",
     "tab questions · enter answer · esc cancel",
     "enter answer · esc cancel",
 };
+
+const predefined_question_hints = [_][]const u8{
+    "↑↓ options · enter answer · esc cancel",
+    "enter answer · esc cancel",
+};
+
+/// The widest hint that fits `width`, or null when none does. `widest` is
+/// the formatted hint that leads `variants`.
+fn widestQuestionHint(widest: []const u8, variants: []const []const u8, width: usize) ?[]const u8 {
+    if (widest.len > 0 and display_width.visibleWidth(widest) <= width) return widest;
+    for (variants) |variant| {
+        if (display_width.visibleWidth(variant) <= width) return variant;
+    }
+    return null;
+}
 
 fn questionInteractionHint(
     projection: question_prompt.Projection,
@@ -201,58 +226,66 @@ fn questionInteractionHint(
     out_buf: []u8,
 ) []const u8 {
     const option_count = if (projection.current_entry) |entry| entry.options.len else 0;
-    const variants: []const []const u8 = if (projection.isFreeformSelected())
-        &freeform_question_hints
+    const batch = projection.entry_count > 1;
+    const freeform = projection.isFreeformSelected();
+    const variants: []const []const u8 = if (freeform)
+        (if (batch) &freeform_batch_hints else &freeform_question_hints)
+    else if (batch)
+        &predefined_batch_hints
     else
         &predefined_question_hints;
 
-    var out: std.Io.Writer = .fixed(out_buf);
-    if (projection.isFreeformSelected()) {
-        out.writeAll(
-            "type answer    ↑↓←→ cursor    shift+↑↓ options    tab questions    enter answer    esc cancel",
-        ) catch return display_width.widestFitting(variants, width);
-    } else {
-        out.print(
-            "1–{d} choose now    ↑↓ options    tab questions    enter answer    esc cancel",
-            .{option_count},
-        ) catch return display_width.widestFitting(variants, width);
-    }
-    var base = out.buffered();
-    if (display_width.visibleWidth(base) > width) {
-        const variant = display_width.widestFitting(variants, width);
-        out = .fixed(out_buf);
-        out.writeAll(variant) catch return variant;
-        base = out.buffered();
-    }
+    var widest_buf: [128]u8 = undefined;
+    const widest = if (freeform)
+        ""
+    else
+        std.mem.print(&widest_buf, "1–{d} choose now    ↑↓ options    {s}enter answer    esc cancel", .{
+            option_count,
+            if (batch) "tab questions    " else "",
+        }) catch "";
 
     // Batch progress rides the hint row, right-aligned like the rest of the
     // footer chrome; a lone question needs no counter. A subagent's question
-    // on main's screen names the subagent there.
-    if (projection.entry_count > 1 or projection.asker.len > 0) {
-        var counter_buf: [96]u8 = undefined;
-        const counter = if (projection.asker.len > 0 and projection.entry_count > 1)
-            std.mem.print(&counter_buf, "{s} asks · Question {d} of {d}", .{
-                projection.asker,
-                projection.current_index + 1,
-                projection.entry_count,
-            }) catch ""
-        else if (projection.asker.len > 0)
-            std.mem.print(&counter_buf, "{s} asks", .{projection.asker}) catch ""
-        else
-            std.mem.print(
-                &counter_buf,
-                "Question {d} of {d}",
-                .{ projection.current_index + 1, projection.entry_count },
-            ) catch "";
-        const base_width = display_width.visibleWidth(base);
-        const counter_width = display_width.visibleWidth(counter);
-        if (counter.len > 0 and base_width + counter_width + 2 <= width) {
-            out.splatByteAll(' ', width - base_width - counter_width) catch return base;
-            out.writeAll(counter) catch return base;
-            return out.buffered();
-        }
+    // on main's screen names the subagent there. The hint gives up width
+    // before the counter does, and a narrow row shortens the counter.
+    var counter_bufs: [2][96]u8 = undefined;
+    var counters: [2][]const u8 = .{ "", "" };
+    if (projection.asker.len > 0 and batch) {
+        counters[0] = std.mem.print(&counter_bufs[0], "{s} asks · Question {d} of {d}", .{
+            projection.asker,
+            projection.current_index + 1,
+            projection.entry_count,
+        }) catch "";
+    } else if (projection.asker.len > 0) {
+        counters[0] = std.mem.print(&counter_bufs[0], "{s} asks", .{projection.asker}) catch "";
+    } else if (batch) {
+        counters[0] = std.mem.print(&counter_bufs[0], "Question {d} of {d}", .{
+            projection.current_index + 1,
+            projection.entry_count,
+        }) catch "";
     }
-    return base;
+    if (batch) {
+        counters[1] = std.mem.print(&counter_bufs[1], "{d}/{d}", .{
+            projection.current_index + 1,
+            projection.entry_count,
+        }) catch "";
+    }
+
+    var out: std.Io.Writer = .fixed(out_buf);
+    for (counters) |counter| {
+        if (counter.len == 0) continue;
+        const counter_width = display_width.visibleWidth(counter);
+        const hint = widestQuestionHint(widest, variants, @as(usize, width) -| (counter_width + 2)) orelse continue;
+        out.writeAll(hint) catch break;
+        out.splatByteAll(' ', width - display_width.visibleWidth(hint) - counter_width) catch break;
+        out.writeAll(counter) catch break;
+        return out.buffered();
+    }
+
+    const hint = widestQuestionHint(widest, variants, width) orelse variants[variants.len - 1];
+    out = .fixed(out_buf);
+    out.writeAll(hint) catch return variants[variants.len - 1];
+    return out.buffered();
 }
 
 pub fn slashInputPrefix(registry: command_specs.SlashRegistry, items: []const u8) []const u8 {
@@ -1930,11 +1963,12 @@ test "question hint row excludes model and upgrade status at supported widths" {
         freeform: bool,
         hint: []const u8,
     }{
-        .{ .width = 120, .freeform = false, .hint = "1–4 choose now    ↑↓ options    tab questions    enter answer    esc cancel" },
-        .{ .width = 88, .freeform = false, .hint = "1–4 choose now    ↑↓ options    tab questions    enter answer    esc cancel" },
-        .{ .width = 40, .freeform = false, .hint = predefined_question_hints[2] },
-        .{ .width = 120, .freeform = true, .hint = "type answer    ↑↓←→ cursor    shift+↑↓ options    tab questions    enter answer    esc cancel" },
-        .{ .width = 72, .freeform = true, .hint = freeform_question_hints[0] },
+        .{ .width = 120, .freeform = false, .hint = "1–4 choose now    ↑↓ options    enter answer    esc cancel" },
+        .{ .width = 60, .freeform = false, .hint = "1–4 choose now    ↑↓ options    enter answer    esc cancel" },
+        .{ .width = 40, .freeform = false, .hint = predefined_question_hints[0] },
+        .{ .width = 30, .freeform = false, .hint = predefined_question_hints[1] },
+        .{ .width = 120, .freeform = true, .hint = freeform_question_hints[0] },
+        .{ .width = 72, .freeform = true, .hint = freeform_question_hints[1] },
         .{ .width = 32, .freeform = true, .hint = freeform_question_hints[3] },
     };
 
@@ -1958,7 +1992,7 @@ test "question hint row excludes model and upgrade status at supported widths" {
     }
 }
 
-test "question hint row right-aligns batch progress and drops it when narrow" {
+test "question hint row keeps batch progress while the hint narrows" {
     var prompt = question_prompt.QuestionPrompt{};
     defer prompt.deinit(std.testing.allocator);
     const opts = [_]types.QuestionOption{
@@ -1975,19 +2009,40 @@ test "question hint row right-aligns batch progress and drops it when narrow" {
     var input = InputRuntime{};
     defer input.deinit(std.testing.allocator);
     var ctx = testRenderContext(&input);
-    ctx.question = prompt.projection();
 
-    var row = try composeHintRow(std.testing.allocator, false, ctx, 120);
-    defer row.deinit(std.testing.allocator);
-    try std.testing.expect(std.mem.find(u8, row.items, "  Question 1 of 3") != null);
-    try std.testing.expect(display_width.visibleWidthIgnoringAnsi(row.items) <= 120);
+    const cases = [_]struct {
+        width: u16,
+        freeform: bool,
+        hint: []const u8,
+        counter: []const u8,
+    }{
+        .{ .width = 120, .freeform = false, .hint = "1–3 choose now    ↑↓ options    tab questions    enter answer    esc cancel", .counter = "  Question 1 of 3" },
+        .{ .width = 72, .freeform = false, .hint = predefined_batch_hints[0], .counter = "  Question 1 of 3" },
+        .{ .width = 44, .freeform = false, .hint = predefined_batch_hints[2], .counter = "  Question 1 of 3" },
+        .{ .width = 32, .freeform = false, .hint = predefined_batch_hints[2], .counter = "  1/3" },
+        .{ .width = 26, .freeform = false, .hint = predefined_batch_hints[2], .counter = "" },
+        .{ .width = 120, .freeform = true, .hint = freeform_batch_hints[0], .counter = "  Question 1 of 3" },
+        .{ .width = 100, .freeform = true, .hint = freeform_batch_hints[1], .counter = "  Question 1 of 3" },
+        .{ .width = 32, .freeform = true, .hint = freeform_batch_hints[4], .counter = "  1/3" },
+    };
+    for (cases) |case| {
+        if (case.freeform) prompt.moveChoice(-1);
+        defer if (case.freeform) prompt.moveChoice(1);
+        ctx.question = prompt.projection();
 
-    var narrow = try composeHintRow(std.testing.allocator, false, ctx, 40);
-    defer narrow.deinit(std.testing.allocator);
-    try std.testing.expect(std.mem.find(u8, narrow.items, "Question 1 of 3") == null);
+        var row = try composeHintRow(std.testing.allocator, false, ctx, case.width);
+        defer row.deinit(std.testing.allocator);
+        try std.testing.expect(std.mem.find(u8, row.items, case.hint) != null);
+        if (case.counter.len > 0) {
+            try std.testing.expect(std.mem.find(u8, row.items, case.counter) != null);
+        } else {
+            try std.testing.expect(std.mem.find(u8, row.items, "1/3") == null);
+        }
+        try std.testing.expect(display_width.visibleWidthIgnoringAnsi(row.items) <= case.width);
+    }
 }
 
-test "question hint assigns tab to question pagination" {
+test "question hint names tab only for a batch of questions" {
     var prompt = question_prompt.QuestionPrompt{};
     defer prompt.deinit(std.testing.allocator);
     try syncHintTestQuestion(&prompt);
@@ -1999,7 +2054,21 @@ test "question hint assigns tab to question pagination" {
 
     var row = try composeHintRow(std.testing.allocator, false, ctx, 120);
     defer row.deinit(std.testing.allocator);
+    try std.testing.expect(std.mem.find(u8, row.items, "tab") == null);
 
-    try std.testing.expect(std.mem.find(u8, row.items, "tab questions") != null);
-    try std.testing.expect(std.mem.find(u8, row.items, "tab to choose") == null);
+    const opts = [_]types.QuestionOption{
+        .{ .label = "Yes", .description = null },
+        .{ .label = "No", .description = null },
+    };
+    const entries = [_]types.QuestionBatchEntry{
+        .{ .question = "First?", .options = &opts },
+        .{ .question = "Second?", .options = &opts },
+    };
+    try prompt.syncFrom(std.testing.allocator, &entries);
+    ctx.question = prompt.projection();
+
+    var batch_row = try composeHintRow(std.testing.allocator, false, ctx, 120);
+    defer batch_row.deinit(std.testing.allocator);
+    try std.testing.expect(std.mem.find(u8, batch_row.items, "tab questions") != null);
+    try std.testing.expect(std.mem.find(u8, batch_row.items, "tab to choose") == null);
 }

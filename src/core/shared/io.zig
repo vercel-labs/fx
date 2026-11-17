@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const darwin_process_spawn = @import("darwin_process_spawn.zig");
+const net_connect = @import("net_connect.zig");
 const profile_paths = @import("profile_paths.zig");
 
 pub const RawEnviron = [*:null]const ?[*:0]const u8;
@@ -21,7 +22,12 @@ var global_raw_environ: ?RawEnviron = null;
 var global_libc_environ: bool = false;
 
 pub fn setIo(zio: std.Io) void {
-    real_io = process_io_for(builtin.target.os.tag, zio);
+    real_io = processIo(zio);
+}
+
+/// `zio` with fx's process spawn on Darwin and fx's TCP connect.
+fn processIo(zio: std.Io) std.Io {
+    return net_connect.wrap(process_io_for(builtin.target.os.tag, zio));
 }
 
 /// Tests only: `getIo` returns `zio`, as given, until `restoreIoForTest`
@@ -52,8 +58,8 @@ pub noinline fn getIo() std.Io {
 }
 
 noinline fn fallbackIo() std.Io {
-    if (comptime builtin.is_test) return process_io_for(builtin.target.os.tag, std.testing.io);
-    return process_io_for(builtin.target.os.tag, fallback_threaded.io());
+    if (comptime builtin.is_test) return processIo(std.testing.io);
+    return processIo(fallback_threaded.io());
 }
 
 /// Opens an absolute directory path without following any path component.
@@ -138,6 +144,23 @@ test "getIo Darwin test fallback runs a child through the selected backend" {
     }
     try std.testing.expectEqualStrings("get-io-spawn-ok", result.stdout);
     try std.testing.expectEqualStrings("", result.stderr);
+}
+
+test "process I/O connects TCP through net_connect and keeps every other entry" {
+    const original = std.testing.io;
+    const selected = processIo(original);
+    const spawn_selected = process_io_for(builtin.target.os.tag, original);
+
+    try std.testing.expect(selected.userdata == original.userdata);
+    try std.testing.expect(selected.vtable == processIo(original).vtable);
+    inline for (@typeInfo(std.Io.VTable).@"struct".field_names) |field_name| {
+        if (comptime std.mem.eql(u8, field_name, "netConnectIp")) {
+            const replaced = builtin.target.os.tag == .macos or builtin.target.os.tag == .linux;
+            try std.testing.expectEqual(replaced, @field(selected.vtable, field_name) != @field(original.vtable, field_name));
+        } else {
+            try std.testing.expectEqual(@field(spawn_selected.vtable, field_name), @field(selected.vtable, field_name));
+        }
+    }
 }
 
 test "non-Darwin process I/O keeps the original vtable" {
@@ -899,7 +922,31 @@ pub fn durableReplaceVerifiedWithOps(
     ops.sync_dir(ops.ctx, dir.dir) catch return error.DurableReplacePostRenameFailed;
 }
 
-fn openOrCreatePrivateLockFile(dir: *VerifiedDir, name: []const u8) !std.Io.File {
+/// What an existing lock file's mode must be. A missing one is always
+/// created private.
+const LockFileMode = enum {
+    /// 0600, as fx makes every lock file.
+    private,
+    /// Writable by its owner only, readable by anyone: a lock an older fx
+    /// release left readable by others.
+    owner_writable,
+};
+
+/// Whether a group or other write bit is set: the one rule for state an
+/// older fx release left readable by others, which fx reads only while no
+/// one else can change it (D61 in `tests/tla/session_manager/system-design.md`).
+pub fn othersCanWrite(permissions: std.Io.File.Permissions) bool {
+    return permissions.toMode() & 0o022 != 0;
+}
+
+/// A regular file only its owner can write, though others may read it.
+fn verifyOwnerWritableRegularFile(file: std.Io.File) !void {
+    const stat = try file.stat(getIo());
+    if (stat.kind != .file or stat.nlink != 1) return error.DurablePathUnsafe;
+    if (othersCanWrite(stat.permissions)) return error.PrivateStatePermissionsUnsupported;
+}
+
+fn openOrCreatePrivateLockFile(dir: *VerifiedDir, name: []const u8, existing: LockFileMode) !std.Io.File {
     try validateRelativeLeaf(name);
     const zio = getIo();
 
@@ -939,7 +986,10 @@ fn openOrCreatePrivateLockFile(dir: *VerifiedDir, name: []const u8) !std.Io.File
         else => return err,
     };
     errdefer file.close(zio);
-    try verifyPrivateRegularFile(file);
+    switch (existing) {
+        .private => try verifyPrivateRegularFile(file),
+        .owner_writable => try verifyOwnerWritableRegularFile(file),
+    }
     return file;
 }
 
@@ -949,6 +999,18 @@ pub fn acquireTimedAdvisoryLock(
     deadline_ms: u64,
 ) !TimedAdvisoryLock {
     return acquireTimedAdvisoryLockControlled(dir, name, deadline_ms, null, .{});
+}
+
+/// `acquireTimedAdvisoryLock` on a lock file an older fx release made,
+/// which may be readable by others, as such a release left its session
+/// folders (D61 in `tests/tla/session_manager/system-design.md`). The file
+/// keeps its mode; one others can write is refused.
+pub fn acquireTimedAdvisoryLockOnOlderFile(
+    dir: *VerifiedDir,
+    name: []const u8,
+    deadline_ms: u64,
+) !TimedAdvisoryLock {
+    return acquireTimedAdvisoryLockFile(dir, name, deadline_ms, null, .{}, .owner_writable);
 }
 
 pub fn acquireTimedAdvisoryLockWithOps(
@@ -998,7 +1060,18 @@ fn acquireTimedAdvisoryLockControlled(
     cancel_flag: ?*const std.atomic.Value(bool),
     ops: LockOps,
 ) !TimedAdvisoryLock {
-    const file = try openOrCreatePrivateLockFile(dir, name);
+    return acquireTimedAdvisoryLockFile(dir, name, deadline_ms, cancel_flag, ops, .private);
+}
+
+fn acquireTimedAdvisoryLockFile(
+    dir: *VerifiedDir,
+    name: []const u8,
+    deadline_ms: u64,
+    cancel_flag: ?*const std.atomic.Value(bool),
+    ops: LockOps,
+    existing: LockFileMode,
+) !TimedAdvisoryLock {
+    const file = try openOrCreatePrivateLockFile(dir, name, existing);
     errdefer file.close(getIo());
 
     const started = ops.now_ms(ops.ctx);
@@ -1063,45 +1136,89 @@ pub fn sleep(ns: u64) void {
     getIo().sleep(.{ .nanoseconds = @intCast(ns) }, .real) catch {};
 }
 
-/// Reads terminal attributes. Linux issues the kernel ioctl directly because
-/// Zig 0.17 sizes `std.posix.termios` to the kernel struct, while
-/// `std.posix.tcgetattr` calls into libc, which writes its larger struct and
-/// overruns the caller's stack.
+/// Reads terminal attributes. Every errno is an error, including the EBADF
+/// that `std.posix.tcgetattr` treats as unreachable.
 pub fn tcgetattr(fd: std.posix.fd_t) std.posix.TermiosGetError!std.posix.termios {
-    if (builtin.target.os.tag != .linux) return std.posix.tcgetattr(fd);
     var term = std.mem.zeroes(std.posix.termios);
-    while (true) switch (std.os.linux.errno(std.os.linux.tcgetattr(fd, &term))) {
+    while (true) switch (tcgetattrErrno(fd, &term)) {
         .SUCCESS => return term,
         .INTR => continue,
-        .BADF => unreachable,
-        .NOTTY => return error.NotATerminal,
+        .BADF, .NOTTY => return error.NotATerminal,
         else => |err| return std.posix.unexpectedErrno(err),
     };
 }
 
-/// Sets terminal attributes. See `tcgetattr` for why Linux bypasses libc.
+/// Linux issues the kernel ioctl: libc there writes a larger termios than Zig's.
+fn tcgetattrErrno(fd: std.posix.fd_t, term: *std.posix.termios) std.posix.E {
+    if (builtin.target.os.tag == .linux) return std.os.linux.errno(std.os.linux.tcgetattr(fd, term));
+    return std.posix.errno(std.c.tcgetattr(fd, term));
+}
+
+/// Sets terminal attributes. Like `tcgetattr`, every failure is an error,
+/// including the EBADF and EINVAL that `std.posix` treats as unreachable.
 pub fn tcsetattr(
     fd: std.posix.fd_t,
     action: std.posix.TCSA,
     term: std.posix.termios,
 ) std.posix.TermiosSetError!void {
-    if (builtin.target.os.tag != .linux) return std.posix.tcsetattr(fd, action, term);
-    while (true) switch (std.os.linux.errno(std.os.linux.tcsetattr(fd, action, &term))) {
+    while (true) switch (tcsetattrErrno(fd, action, &term)) {
         .SUCCESS => return,
         .INTR => continue,
-        .BADF, .INVAL => unreachable,
-        .NOTTY => return error.NotATerminal,
+        .BADF, .NOTTY => return error.NotATerminal,
         .IO => return error.ProcessOrphaned,
+        .INVAL => return error.Unexpected,
         else => |err| return std.posix.unexpectedErrno(err),
     };
 }
 
-test "tcgetattr reports a regular file as not a terminal" {
+fn tcsetattrErrno(fd: std.posix.fd_t, action: std.posix.TCSA, term: *const std.posix.termios) std.posix.E {
+    if (builtin.target.os.tag == .linux) return std.os.linux.errno(std.os.linux.tcsetattr(fd, action, term));
+    return std.posix.errno(std.c.tcsetattr(fd, action, term));
+}
+
+test "terminal attributes of a regular file report not a terminal" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var file = try tmp.dir.createFile(std.testing.io, "plain", .{});
     defer file.close(std.testing.io);
     try std.testing.expectError(error.NotATerminal, tcgetattr(file.handle));
+    try std.testing.expectError(
+        error.NotATerminal,
+        tcsetattr(file.handle, .FLUSH, std.mem.zeroes(std.posix.termios)),
+    );
+}
+
+test "terminal attributes of a closed descriptor are an error, not a panic" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var file = try tmp.dir.createFile(std.testing.io, "plain", .{});
+    defer file.close(std.testing.io);
+    // Closed, near the top of the file limit where opens rarely land; dup() if F_DUPFD fails.
+    const floor: c_int = @intCast(@min((try std.posix.getrlimit(.NOFILE)).cur -| 1, 900));
+    var closed = std.c.fcntl(file.handle, std.posix.F.DUPFD, floor);
+    if (closed < 0) closed = std.c.dup(file.handle);
+    try std.testing.expect(closed >= 0);
+    try std.testing.expectEqual(@as(c_int, 0), std.c.close(closed));
+
+    try std.testing.expectError(error.NotATerminal, tcgetattr(closed));
+    try std.testing.expectError(
+        error.NotATerminal,
+        tcsetattr(closed, .FLUSH, std.mem.zeroes(std.posix.termios)),
+    );
+}
+
+test "terminal attributes with an invalid action are an error, not a panic" {
+    // macOS libc refuses the action with EINVAL before any ioctl. On Linux
+    // the action selects the ioctl itself, so there is no safe invalid one.
+    if (comptime !builtin.target.os.tag.isDarwin()) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var file = try tmp.dir.createFile(std.testing.io, "plain", .{});
+    defer file.close(std.testing.io);
+    try std.testing.expectError(
+        error.Unexpected,
+        tcsetattr(file.handle, @fromBackingInt(99), std.mem.zeroes(std.posix.termios)),
+    );
 }
 
 pub fn makeDirRecursive(path: []const u8) !void {
@@ -1820,6 +1937,36 @@ test "a folder that need not be private opens whatever its mode, but never throu
         return err;
     };
     try std.testing.expectError(error.DurablePathUnsafe, openRealDirIfPresent(&parent, "link"));
+}
+
+test "a lock on an older release's file takes one others can read, keeps its mode, and refuses one others can write" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dir = VerifiedDir{ .dir = try tmp.dir.openDir(getIo(), ".", .{ .iterate = true, .follow_symlinks = false }) };
+    defer dir.close();
+
+    try tmp.dir.writeFile(getIo(), .{ .sub_path = "readable.lock", .data = "" });
+    var readable = try tmp.dir.openFile(getIo(), "readable.lock", .{});
+    try readable.setPermissions(getIo(), .fromMode(0o644));
+    readable.close(getIo());
+    // The private lock refuses it, as before.
+    try std.testing.expectError(error.PrivateStatePermissionsUnsupported, acquireTimedAdvisoryLock(&dir, "readable.lock", 0));
+    var lock = try acquireTimedAdvisoryLockOnOlderFile(&dir, "readable.lock", 0);
+    lock.release();
+    const kept = try tmp.dir.statFile(getIo(), "readable.lock", .{ .follow_symlinks = false });
+    try std.testing.expectEqual(@as(u32, 0o644), @as(u32, @intCast(kept.permissions.toMode() & 0o777)));
+
+    try tmp.dir.writeFile(getIo(), .{ .sub_path = "shared.lock", .data = "" });
+    var shared = try tmp.dir.openFile(getIo(), "shared.lock", .{});
+    try shared.setPermissions(getIo(), .fromMode(0o666));
+    shared.close(getIo());
+    try std.testing.expectError(error.PrivateStatePermissionsUnsupported, acquireTimedAdvisoryLockOnOlderFile(&dir, "shared.lock", 0));
+
+    // A missing one is made private.
+    var made = try acquireTimedAdvisoryLockOnOlderFile(&dir, "new.lock", 0);
+    made.release();
+    const created = try tmp.dir.statFile(getIo(), "new.lock", .{ .follow_symlinks = false });
+    try std.testing.expectEqual(@as(u32, 0o600), @as(u32, @intCast(created.permissions.toMode() & 0o777)));
 }
 
 test "timed advisory lock returns busy after deadline" {
