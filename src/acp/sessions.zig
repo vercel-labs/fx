@@ -992,7 +992,7 @@ fn handleRestoreSession(
 }
 
 /// `session/load` or `session/resume` of a session open on this connection
-/// reuses it (Q108): its turn, mode, and MCP servers keep running, and load
+/// reuses it: its turn, mode, and MCP servers keep running, and load
 /// replays its saved history again. The open session keeps its workspace, so
 /// a request that names another one fails. A new system prompt applies at
 /// the next turn, so it fails while a turn runs.
@@ -1645,7 +1645,7 @@ fn sendActiveHistoryUpdates(
 
 /// Gives each replayed message of one turn its id, `turn-{n}-{k}`: the
 /// turn's number in the session log and the message's place in the turn's
-/// replay, so every load gives a saved message the same id (F6). A turn the
+/// replay, so every load gives a saved message the same id. A turn the
 /// log gave no number gets fx's random ids, as a live message does. An id is
 /// valid until the next `take`.
 const ReplayIds = struct {

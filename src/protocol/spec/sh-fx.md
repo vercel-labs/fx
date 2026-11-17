@@ -242,7 +242,7 @@ After the replay, fx answers:
 }
 ```
 
-`tests/tla/acp/AcpFollow.tla` models these rules, with the stable message ids of fix X21, and TLC checks that every connection that has the session open holds exactly its saved turns, with no gap and no repeat. Its `Today` configs show where fx breaks them now.
+`tests/tla/acp/AcpFollow.tla` models these rules, with stable message ids (a replayed message keeps the id it had when it was live), and TLC checks that every connection that has the session open holds exactly its saved turns, with no gap and no repeat. Its `Today` configs show where fx breaks them now.
 
 #### Prompts from other clients
 
@@ -408,7 +408,7 @@ fx supports ACP's unstable [`session/fork`](https://agentclientprotocol.com/rfds
 
 #### Fork before a prompt
 
-fx's `/fork` copies a session up to just before a prompt, and ACP's proposal leaves forking at a message for later. A client that lists `sh.fx/fork` sends `sh.fx/forkBefore` in the `_meta` of `session/fork`, with the `messageId` of a prompt, which the session's updates give and which stays the same on every load, as fix F6 makes it. The fork then holds only the turns before that prompt's turn. A `messageId` that names no prompt of the session gets `-32602`.
+fx's `/fork` copies a session up to just before a prompt, and ACP's proposal leaves forking at a message for later. A client that lists `sh.fx/fork` sends `sh.fx/forkBefore` in the `_meta` of `session/fork`, with the `messageId` of a prompt, which the session's updates give and which stays the same on every load, since a replayed message's id comes from its place in the session's log. The fork then holds only the turns before that prompt's turn. A `messageId` that names no prompt of the session gets `-32602`.
 
 ```json
 {

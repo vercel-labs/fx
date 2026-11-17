@@ -2,7 +2,7 @@
 (***************************************************************************)
 (* Following a session and catching up, as the sh.fx spec's "Following a  *)
 (* session" section defines them (src/protocol/spec/sh-fx.md), with the   *)
-(* stable message ids of fix X21. The rules have not landed in src/acp/   *)
+(* stable message ids. The rules have not landed in src/acp/              *)
 (* yet: `Rules` set to FALSE gives fx today, and the AcpFollowToday-*.cfg  *)
 (* configs show each rule failing there.                                   *)
 (*                                                                         *)
@@ -19,7 +19,7 @@
 (*    from before a compaction rewrote the log, gets the whole session,   *)
 (*    and the answer says which.                                           *)
 (*  - A replayed message gets an id made from its place in the log, so     *)
-(*    every load gives it the same id (X21, Q130). IdRules turns it on.    *)
+(*    every load gives it the same id. IdRules turns it on.                *)
 (*  - session/close closes the session on that connection only. While     *)
 (*    another connection has it open, a running turn goes on.             *)
 (*                                                                         *)
@@ -28,8 +28,8 @@
 (*                                                                         *)
 (* Today (Rules = FALSE): a session open on one connection is busy for    *)
 (* others; a load ignores the position and replays everything without     *)
-(* saying so, and no position is sent. Before fix F6 (IdRules = FALSE),    *)
-(* replayed messages got new ids on every load.                            *)
+(* saying so, and no position is sent. Before ids came from the log        *)
+(* (IdRules = FALSE), replayed messages got new ids on every load.         *)
 (*                                                                         *)
 (* A turn is a number; a compaction replaces the log with one summary     *)
 (* turn, 0, in a new generation.                                           *)
@@ -38,7 +38,7 @@ EXTENDS Integers, Sequences
 
 CONSTANTS
     Rules,      \* TRUE: the sh.fx rules; FALSE: fx today
-    IdRules,    \* TRUE: replayed message ids come from the log (F6); FALSE: before F6
+    IdRules,    \* TRUE: replayed ids come from the log; FALSE: new ids each load
     Conns,      \* the client connections
     Folders,    \* the folders a client may send as cwd
     MaxTurns,   \* turns the session may run
@@ -69,10 +69,9 @@ vars == <<saved, gen, running, turnsRun, compactions, folder, client, last>>
 OpenConns == {c \in Conns : client[c].open}
 OpenElsewhere(c) == OpenConns \ {c} # {}
 
-\* The messages of `turns` as a replay sends them. With fix F6 a replayed
-\* message's id is made from its place in the log, its turn; before it, each
-\* load gave a new one. A live message has fx's own id, which no rule checks
-\* (Q130).
+\* The messages of `turns` as a replay sends them. With IdRules a replayed
+\* message's id is made from its place in the log, its turn; without it, each
+\* load gives a new one. A live message has fx's own id, which no rule checks.
 Replayed(turns) == [k \in 1..Len(turns) |-> [turn |-> turns[k], id |-> IF IdRules THEN turns[k] ELSE -1, replayed |-> TRUE]]
 Live(t) == [turn |-> t, id |-> -1, replayed |-> FALSE]
 Turns(msgs) == [k \in 1..Len(msgs) |-> msgs[k].turn]
@@ -184,7 +183,7 @@ TypeOK ==
 InSync == \A c \in OpenConns : Turns(client[c].has) = saved
 
 \* A replayed message's id is made from its place in the log, so every load
-\* gives it the same id (X21, Q130). Live messages keep fx's own ids.
+\* gives it the same id. Live messages keep fx's own ids.
 StableIds == \A c \in Conns : \A k \in DOMAIN client[c].has :
                  client[c].has[k].replayed => client[c].has[k].id = client[c].has[k].turn
 

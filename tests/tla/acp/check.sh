@@ -41,7 +41,7 @@
 #   bun ../drivers/acp/prompt_delivery/check-spec.ts
 #   bun ../drivers/acp/prompt_delivery/driver.ts   # the sh.fx rules; --model today is fx acp before them
 #   bun ../drivers/acp/follow/check-spec.ts
-#   bun ../drivers/acp/follow/driver.ts   # one connection: replayed message ids (F6)
+#   bun ../drivers/acp/follow/driver.ts   # one connection: replayed message ids
 #   bun ../drivers/acp/config_turn/check-spec.ts
 #   bun ../drivers/acp/config_turn/driver.ts   # set_config_option during a turn
 #   bun ../drivers/acp/session_state/check-spec.ts
