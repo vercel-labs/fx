@@ -6499,6 +6499,22 @@ pub const TranscriptRuntime = struct {
         }
     }
 
+    /// Gives a resumed row of a call made through `fx mcp call` the detail
+    /// its live row had once the call ended: the MCP tool and how the call
+    /// ended. The session keeps neither its arguments nor its result, so
+    /// Ctrl+O shows the row alone.
+    pub fn attachHistoricalBridgeCall(
+        self: *TranscriptRuntime,
+        alloc: Allocator,
+        entry_id: u32,
+        tool: []const u8,
+        outcome: types.ToolOutcomeKind,
+    ) !void {
+        try self.upsertToolDetailStart(alloc, entry_id, null, tool, .mcp, null);
+        try self.updateToolDetailTerminal(alloc, entry_id, null, tool, .mcp, outcome, null, null, null, null);
+        if (self.toolDetailPtr(entry_id)) |detail| detail.origin = .recorded;
+    }
+
     pub fn attachHistoricalToolCallWithoutResult(
         self: *TranscriptRuntime,
         alloc: Allocator,

@@ -1778,10 +1778,10 @@ const App = struct {
         errdefer if (recovery_checkpoint_copy) |*checkpoint|
             checkpoint.deinit(std.heap.c_allocator);
 
-        const grants_copy = try types.dupePermissionGrantSlice(std.heap.c_allocator, if (child_run) |active_run|
-            active_run.admission.grants
+        const grants_copy = if (child_run) |active_run|
+            try types.dupePermissionGrantSlice(std.heap.c_allocator, active_run.admission.grants)
         else
-            app_permission_runtime.Runtime(App).grantsOf(self, agent));
+            try app_permission_runtime.Runtime(App).copyGrants(self, agent, std.heap.c_allocator);
         errdefer types.freePermissionGrantSlice(std.heap.c_allocator, grants_copy);
 
         var context_snapshot_copy = if (self.context_enabled)
@@ -2766,6 +2766,15 @@ const App = struct {
         call: types.ToolCall,
     ) !void {
         try self.shell.attachHistoricalToolCallWithoutResult(self.alloc, entry_id, call);
+    }
+
+    pub fn attachHistoricalBridgeCall(
+        self: *App,
+        entry_id: u32,
+        tool: []const u8,
+        outcome: types.ToolOutcomeKind,
+    ) !void {
+        try self.shell.attachHistoricalBridgeCall(self.alloc, entry_id, tool, outcome);
     }
 
     pub fn attachHistoricalCommandOutput(self: *App, entry_id: u32) void {
@@ -5517,6 +5526,7 @@ test {
     _ = @import("core/app/app_agents_runtime.zig");
     _ = @import("core/app/host_record.zig");
     _ = @import("core/profiles/profiles.zig");
+    _ = @import("core/profiles/started_with.zig");
     _ = @import("core/input/file_completion_state.zig");
     _ = @import("gateway/vercel_protocol.zig");
     _ = @import("core/gateway/provider_set.zig");
@@ -5741,6 +5751,22 @@ test "an upgrade sees the agents its restart would stop, but not the one on scre
     try std.testing.expectEqualStrings("main", runtime.busyAgentElsewhere(&app, &buf).?.name);
     app.main_agent.worker.worker_processing = false;
     reviewer.agent.worker.worker_processing = false;
+}
+
+/// How many session approvals `agent` has, read as a thread other than the
+/// resolver reads them: a copy taken under the authority lock.
+fn grantCount(app: *App, agent: *agents.Agent) usize {
+    const copy = app_permission_runtime.Runtime(App).copyGrants(app, agent, std.testing.allocator) catch return 0;
+    defer types.freePermissionGrantSlice(std.testing.allocator, copy);
+    return copy.len;
+}
+
+/// Whether a session approval of `agent` allows `tool_name` on `target_path`,
+/// read from a copy.
+fn grantAllowed(app: *App, agent: *agents.Agent, tool_name: []const u8, target_path: []const u8) bool {
+    const copy = app_permission_runtime.Runtime(App).copyGrants(app, agent, std.testing.allocator) catch return false;
+    defer types.freePermissionGrantSlice(std.testing.allocator, copy);
+    return permissions.sessionGrantAllowed(copy, tool_name, target_path);
 }
 
 fn addTestChildAgent(app: *App, id: []const u8) !*app_agents_runtime.ChildAgent {
@@ -6720,6 +6746,210 @@ test "an idle agent's waiting row counts a subagent until its finished turn is a
     try std.testing.expectEqual(@as(usize, 1), waitCountOwnedByMain(&app, &children));
 }
 
+/// Sends `bytes` to `app` one at a time, as the terminal does, so each goes
+/// through the decoder and the open list's key routing.
+fn sendTerminalBytes(app: *App, bytes: []const u8) !void {
+    for (bytes) |byte| try App.InputAppRuntime.handleTerminalByteWithLimits(app, byte, App.input_limits, max_prompt_history);
+}
+
+/// Sends `key`, a whole key's bytes, `count` times.
+fn sendTerminalKey(app: *App, key: []const u8, count: usize) !void {
+    for (0..count) |_| try sendTerminalBytes(app, key);
+}
+
+/// Fails, saying after which step, unless the list has armed a close for
+/// `expected`, or for nothing when it is null.
+fn expectArmedFor(app: *App, expected: ?*app_agents_runtime.ChildAgent, step: []const u8) !void {
+    const armed: ?*app_agents_runtime.ChildAgent = if (app.instances.agents_menu.close_armed) |listed| listed.agent else null;
+    if (armed == expected) return;
+    const alloc = std.testing.allocator;
+    const want = try alloc.print("after {s}: a close is armed for {s}", .{
+        step,
+        if (expected) |child| child.displayName() else "nothing",
+    });
+    defer alloc.free(want);
+    const got = try alloc.print("after {s}: a close is armed for {s}", .{
+        step,
+        if (armed) |child| child.displayName() else "nothing",
+    });
+    defer alloc.free(got);
+    try std.testing.expectEqualStrings(want, got);
+    return error.TestUnexpectedResult;
+}
+
+test "a run of Backspace presses that edited the agent list's search never arms a close, held or not, in any encoding, and another key ends the run" {
+    const alloc = std.testing.allocator;
+    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
+    defer sink.close(std.testing.io);
+    var app = App{ .alloc = alloc, .shell = .{ .stdout_file = sink } };
+    defer app.shell.deinit(alloc);
+    defer app.pacer.deinit(alloc);
+    defer app.input_runtime.deinit(alloc);
+    defer App.AgentsAppRuntime.deinitChildren(&app);
+    defer app.instances.agents_menu.deinit(alloc);
+    const runtime = App.AgentsAppRuntime;
+    const menu = &app.instances.agents_menu;
+    const edit = &app.input_runtime.edit_state;
+    const first = try addTestChildAgent(&app, "first");
+    const second = try addTestChildAgent(&app, "second");
+    first.name = try alloc.dupe(u8, "reviewer");
+    const backspace = "\x7f";
+    const down = "\x1b[B";
+
+    // The list opens on main; ↓ shows the reviewer, which Backspace can close.
+    try runtime.openMenu(&app);
+    _ = try runtime.moveMenu(&app, 1, 10);
+    try std.testing.expect(menu.highlight.agent == first);
+
+    // With nothing searched, the first Backspace arms the close and the second
+    // goes on to close it. This test app has no subagent host, so the close
+    // finds nothing to close and only disarms; what shows is the arming.
+    try sendTerminalKey(&app, backspace, 1);
+    try expectArmedFor(&app, first, "Backspace on a list nothing was searched in");
+    try sendTerminalKey(&app, backspace, 1);
+    try expectArmedFor(&app, null, "the second Backspace, which closes");
+
+    // Backspace as a key held past the search: "rev" takes three presses to
+    // empty, and none of the presses after arms anything.
+    try sendTerminalBytes(&app, "rev");
+    try std.testing.expectEqualStrings("rev", edit.input.items);
+    try std.testing.expect(menu.highlight.agent == first);
+    try sendTerminalKey(&app, backspace, 3);
+    try std.testing.expectEqualStrings("", edit.input.items);
+    try expectArmedFor(&app, null, "three Backspaces that emptied the search");
+    for (1..5) |extra| {
+        try sendTerminalKey(&app, backspace, 1);
+        var step: [48]u8 = undefined;
+        try expectArmedFor(&app, null, try std.mem.print(&step, "Backspace {d} past the emptied search", .{extra}));
+    }
+    try std.testing.expectEqualStrings("", edit.input.items);
+
+    // A sequence fx ignores is no key: the run goes on.
+    _ = try App.InputAppRuntime.handleTerminalInputIngressWithLimits(&app, .{ .event = .{ .action = .{ .action = .ignore } } }, App.input_limits, max_prompt_history);
+    try sendTerminalKey(&app, backspace, 1);
+    try expectArmedFor(&app, null, "Backspace after an ignored sequence");
+
+    // Another key, here ↓ to the next row, ends the run: two Backspaces arm
+    // and close that row, as on any list.
+    try sendTerminalKey(&app, down, 1);
+    try std.testing.expect(menu.highlight.agent == second);
+    try sendTerminalKey(&app, backspace, 1);
+    try expectArmedFor(&app, second, "Backspace after the run ended with a key");
+    try sendTerminalKey(&app, backspace, 1);
+    try expectArmedFor(&app, null, "the second Backspace, which closes");
+
+    // Typing ends a run too, and the next run is as good as the first: "rev"
+    // goes by Backspace, which then does nothing again.
+    try sendTerminalBytes(&app, "rev");
+    try sendTerminalKey(&app, backspace, 3 + 2);
+    try std.testing.expectEqualStrings("", edit.input.items);
+    try expectArmedFor(&app, null, "a second run of Backspaces");
+
+    // The same keys as Kitty sends them, which go through the router once as
+    // the key they stand for and again as the byte they are replayed as, and
+    // as a repeat of a held key: still one Backspace each.
+    try sendTerminalBytes(&app, "rev");
+    try sendTerminalKey(&app, "\x1b[127u", 1);
+    try sendTerminalKey(&app, "\x1b[127;1u", 1);
+    try sendTerminalKey(&app, "\x1b[127;1:2u", 1);
+    try std.testing.expectEqualStrings("", edit.input.items);
+    try expectArmedFor(&app, null, "three Kitty Backspaces that emptied the search");
+    for ([_][]const u8{ "\x1b[127u", "\x1b[127;1:2u", "\x08", "\x7f" }) |key| {
+        try sendTerminalKey(&app, key, 1);
+        try expectArmedFor(&app, null, key);
+    }
+
+    // The byte 8 is Backspace too, and arms once the run is over.
+    try sendTerminalKey(&app, down, 1);
+    try sendTerminalKey(&app, "\x08", 1);
+    try expectArmedFor(&app, second, "the byte 8 after the run ended with a key");
+}
+
+test "a run of forward Delete presses that edited the agent list's search never arms a close either, and Delete after a Backspace run arms as on any list" {
+    const alloc = std.testing.allocator;
+    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
+    defer sink.close(std.testing.io);
+    var app = App{ .alloc = alloc, .shell = .{ .stdout_file = sink } };
+    defer app.shell.deinit(alloc);
+    defer app.pacer.deinit(alloc);
+    defer app.input_runtime.deinit(alloc);
+    defer App.AgentsAppRuntime.deinitChildren(&app);
+    defer app.instances.agents_menu.deinit(alloc);
+    const runtime = App.AgentsAppRuntime;
+    const menu = &app.instances.agents_menu;
+    const edit = &app.input_runtime.edit_state;
+    const first = try addTestChildAgent(&app, "first");
+    const second = try addTestChildAgent(&app, "second");
+    first.name = try alloc.dupe(u8, "reviewer");
+    const backspace = "\x7f";
+    const delete = "\x1b[3~";
+    const left = "\x1b[D";
+    const down = "\x1b[B";
+
+    try runtime.openMenu(&app);
+    _ = try runtime.moveMenu(&app, 1, 10);
+    try std.testing.expect(menu.highlight.agent == first);
+
+    // Delete takes text away when the cursor is not at the end of the search,
+    // so it can empty the search as Backspace does.
+    try sendTerminalBytes(&app, "rev");
+    try sendTerminalKey(&app, left, 3);
+    try sendTerminalKey(&app, delete, 1);
+    try std.testing.expectEqualStrings("ev", edit.input.items);
+    try sendTerminalKey(&app, delete, 2);
+    try std.testing.expectEqualStrings("", edit.input.items);
+    try expectArmedFor(&app, null, "three Deletes that emptied the search");
+    for (1..5) |extra| {
+        try sendTerminalKey(&app, delete, 1);
+        var step: [48]u8 = undefined;
+        try expectArmedFor(&app, null, try std.mem.print(&step, "Delete {d} past the emptied search", .{extra}));
+    }
+
+    // A key other than Delete ends its run: Backspace is one, and arms.
+    try sendTerminalKey(&app, backspace, 1);
+    try expectArmedFor(&app, first, "Backspace after a Delete run");
+    try sendTerminalKey(&app, backspace, 1);
+    try expectArmedFor(&app, null, "the second Backspace, which closes");
+
+    // Delete after a Backspace run is another key: it arms, and the next
+    // Delete goes on to close, as on any list.
+    try sendTerminalBytes(&app, "rev");
+    try sendTerminalKey(&app, backspace, 3 + 2);
+    try std.testing.expectEqualStrings("", edit.input.items);
+    try expectArmedFor(&app, null, "a Backspace run");
+    try sendTerminalKey(&app, delete, 1);
+    try expectArmedFor(&app, first, "Delete after a Backspace run");
+    try sendTerminalKey(&app, delete, 1);
+    try expectArmedFor(&app, null, "the second Delete, which closes");
+
+    // And Backspace after a Delete run arms, since it is another key too.
+    try sendTerminalBytes(&app, "rev");
+    try sendTerminalKey(&app, left, 3);
+    try sendTerminalKey(&app, delete, 3);
+    try std.testing.expectEqualStrings("", edit.input.items);
+    try sendTerminalKey(&app, backspace, 1);
+    try expectArmedFor(&app, first, "Backspace after a Delete run");
+
+    // Any other key disarms.
+    try sendTerminalKey(&app, down, 1);
+    try expectArmedFor(&app, null, "a key that disarms");
+    try std.testing.expect(menu.highlight.agent == second);
+
+    // The list closing ends a run too, with no key to do it: a paste or
+    // another surface closes the list in the middle of one, and the list
+    // opened again arms on its first press.
+    try sendTerminalBytes(&app, "rev");
+    try sendTerminalKey(&app, backspace, 3);
+    try std.testing.expectEqualStrings("", edit.input.items);
+    try std.testing.expect(try runtime.backMenu(&app));
+    try std.testing.expect(!runtime.menuActive(&app));
+    try runtime.openMenu(&app);
+    _ = try runtime.moveMenu(&app, 1, 10);
+    try std.testing.expect(menu.highlight.agent == first);
+    try sendTerminalKey(&app, backspace, 1);
+    try expectArmedFor(&app, first, "Backspace on the list opened again");
+}
+
 test "the agent list's highlight stays on its agent as rows change, and moves to the agent on screen when its agent is dropped" {
     const alloc = std.testing.allocator;
     var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
@@ -6942,6 +7172,172 @@ test "the footer indicator names the agent on screen and the key that opens the 
     try std.testing.expectEqualStrings("main · ctrl+x", app.footerAgentLabel());
     try App.AgentsAppRuntime.show(&app, writer);
     try std.testing.expectEqualStrings("writer · done ↓", app.footerAgentLabel());
+}
+
+/// What the tests of a subagent's end build: an app that writes its tab title
+/// to /dev/null, and the cleanup its parts need, in the order they need it.
+/// Its children point at its `app`, so it stays where `init` built it.
+const EndsFixture = struct {
+    sink: std.Io.File,
+    app: App,
+
+    fn init(self: *EndsFixture) !void {
+        // A switch writes the tab title, so keep it off the test runner's stdout.
+        self.sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
+        self.app = .{ .alloc = std.testing.allocator, .shell = .{ .stdout_file = self.sink } };
+    }
+
+    fn deinit(self: *EndsFixture) void {
+        const alloc = std.testing.allocator;
+        self.app.instances.agents_menu.deinit(alloc);
+        App.AgentsAppRuntime.deinitChildren(&self.app);
+        self.app.input_runtime.deinit(alloc);
+        self.app.pacer.deinit(alloc);
+        self.app.shell.deinit(alloc);
+        self.sink.close(std.testing.io);
+    }
+};
+
+test "a subagent's footer says how its last turn ended until its next turn starts" {
+    const alloc = std.testing.allocator;
+    var fixture: EndsFixture = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    const app = &fixture.app;
+    const runtime = App.AgentsAppRuntime;
+    const writer = try addTestChildAgent(app, "writer-id");
+    writer.name = try alloc.dupe(u8, "writer");
+    try runtime.show(app, writer);
+    try std.testing.expectEqualStrings("writer · done ↓", app.footerAgentLabel());
+
+    // A turn that fails, and one that is stopped, each say so.
+    runtime.noteChildTurnFinished(app, &writer.agent, .{ .turn_id = 1, .outcome = .failed });
+    try std.testing.expectEqualStrings("writer · failed ↓", app.footerAgentLabel());
+    // The next turn starts over: the name stands alone while it goes.
+    writer.agent.worker.worker_processing = true;
+    try std.testing.expectEqualStrings("writer ↓", app.footerAgentLabel());
+    writer.agent.worker.worker_processing = false;
+    runtime.noteChildTurnFinished(app, &writer.agent, .{ .turn_id = 2, .outcome = .interrupted });
+    try std.testing.expectEqualStrings("writer · stopped ↓", app.footerAgentLabel());
+    // A turn that waits for the user was cancelled for its parent too.
+    runtime.noteChildTurnFinished(app, &writer.agent, .{ .turn_id = 3, .outcome = .paused });
+    try std.testing.expectEqualStrings("writer · stopped ↓", app.footerAgentLabel());
+
+    // A later turn that completes clears it.
+    runtime.noteChildTurnFinished(app, &writer.agent, .{ .turn_id = 4, .outcome = .completed });
+    try std.testing.expectEqualStrings("writer · done ↓", app.footerAgentLabel());
+
+    // A turn that handed off to the user's image or `$skill` is not a stop.
+    writer.agent.worker.handed_off_turn_id = 5;
+    runtime.noteChildTurnFinished(app, &writer.agent, .{ .turn_id = 5, .outcome = .interrupted });
+    try std.testing.expectEqualStrings("writer · done ↓", app.footerAgentLabel());
+    runtime.noteChildTurnFinished(app, &writer.agent, .{ .turn_id = 6, .outcome = .interrupted });
+    try std.testing.expectEqualStrings("writer · stopped ↓", app.footerAgentLabel());
+}
+
+test "the agent list says failed or stopped on a subagent row whose last turn ended so, and the row sorts as an idle one does" {
+    const alloc = std.testing.allocator;
+    var fixture: EndsFixture = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    const app = &fixture.app;
+    const runtime = App.AgentsAppRuntime;
+    const failing = try addTestChildAgent(app, "failing");
+    const stopping = try addTestChildAgent(app, "stopping");
+    const fine = try addTestChildAgent(app, "fine");
+    defer failing.agent.session.agent.history.deinit(alloc);
+    defer {
+        var left = failing.agent.worker.takeEvents();
+        for (left.items) |event| worker_runtime.freeWorkerEvent(alloc, event);
+        left.deinit(alloc);
+    }
+    var before: std.ArrayList(?*app_agents_runtime.ChildAgent) = .empty;
+    defer before.deinit(alloc);
+    try runtime.switchList(app, &before);
+
+    runtime.noteChildTurnFinished(app, &failing.agent, .{ .turn_id = 1, .outcome = .failed });
+    runtime.noteChildTurnFinished(app, &stopping.agent, .{ .turn_id = 1, .outcome = .interrupted });
+    runtime.noteChildTurnFinished(app, &fine.agent, .{ .turn_id = 1, .outcome = .completed });
+    try runtime.openMenu(app);
+    const ended = runtime.menuProjection(app);
+    try std.testing.expectEqualStrings("failed", try menuRowState(ended, "failing"));
+    try std.testing.expectEqualStrings("stopped", try menuRowState(ended, "stopping"));
+    try std.testing.expectEqualStrings("idle", try menuRowState(ended, "fine"));
+    try std.testing.expectEqualStrings("idle", try menuRowState(ended, "main"));
+
+    // They sort where the same rows sorted while they showed idle.
+    var after: std.ArrayList(?*app_agents_runtime.ChildAgent) = .empty;
+    defer after.deinit(alloc);
+    try runtime.switchList(app, &after);
+    try std.testing.expectEqualSlices(?*app_agents_runtime.ChildAgent, before.items, after.items);
+
+    // A turn that starts says working, and the next one that completes clears
+    // the failure.
+    failing.agent.worker.worker_processing = true;
+    try std.testing.expectEqualStrings("working", try menuRowState(runtime.menuProjection(app), "failing"));
+    failing.agent.worker.worker_processing = false;
+    try std.testing.expectEqualStrings("failed", try menuRowState(runtime.menuProjection(app), "failing"));
+    runtime.noteChildTurnFinished(app, &failing.agent, .{ .turn_id = 2, .outcome = .completed });
+    try std.testing.expectEqualStrings("idle", try menuRowState(runtime.menuProjection(app), "failing"));
+
+    // A turn that ended but is not applied yet is still working: the row
+    // says what its newest reply decides, as the sort does.
+    runtime.noteChildTurnFinished(app, &failing.agent, .{ .turn_id = 3, .outcome = .failed });
+    try failing.agent.worker.pushEvent(alloc, .{ .assistant_presentation = .{ .text = @constCast("queued") } });
+    try std.testing.expectEqualStrings("working", try menuRowState(runtime.menuProjection(app), "failing"));
+    var events = failing.agent.worker.takeEvents();
+    for (events.items) |event| worker_runtime.freeWorkerEvent(alloc, event);
+    events.deinit(alloc);
+    try std.testing.expectEqualStrings("failed", try menuRowState(runtime.menuProjection(app), "failing"));
+}
+
+test "a subagent's record in /trace says failed or stopped as its row does" {
+    const alloc = std.testing.allocator;
+    var fixture: EndsFixture = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    const app = &fixture.app;
+    const runtime = App.AgentsAppRuntime;
+    const failing = try addTestChildAgent(app, "failing");
+    const stopping = try addTestChildAgent(app, "stopping");
+    const fine = try addTestChildAgent(app, "fine");
+    runtime.noteChildTurnFinished(app, &failing.agent, .{ .turn_id = 1, .outcome = .failed });
+    runtime.noteChildTurnFinished(app, &stopping.agent, .{ .turn_id = 1, .outcome = .interrupted });
+    runtime.noteChildTurnFinished(app, &fine.agent, .{ .turn_id = 1, .outcome = .completed });
+    try runtime.openMenu(app);
+    const list = runtime.menuProjection(app);
+
+    var rows: std.ArrayList(app_agents_runtime.TraceRow) = .empty;
+    defer rows.deinit(alloc);
+    try runtime.traceRows(app, alloc, &rows);
+    defer for (rows.items) |row| if (row.status.len > 0) alloc.free(row.status);
+    try std.testing.expectEqual(@as(usize, 3), rows.items.len);
+    // The record and the list say the same of each subagent.
+    for (rows.items) |row| try std.testing.expectEqualStrings(try menuRowState(list, row.id), row.state);
+    try std.testing.expectEqualStrings("failed", rows.items[0].state);
+    try std.testing.expectEqualStrings("stopped", rows.items[1].state);
+    try std.testing.expectEqualStrings("idle", rows.items[2].state);
+}
+
+test "an instance's row keeps its states whatever its turns did" {
+    var fixture: EndsFixture = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    const app = &fixture.app;
+    const runtime = App.AgentsAppRuntime;
+    const second = try addTestChildAgent(app, "instance-2");
+    second.agent.role = .instance;
+    const LastEnd = @TypeOf(second.last_end);
+    // Its turns end as a subagent's do, but nothing is kept for an instance.
+    runtime.noteChildTurnFinished(app, &second.agent, .{ .turn_id = 1, .outcome = .failed });
+    runtime.noteChildTurnFinished(app, &app.main_agent, .{ .turn_id = 1, .outcome = .interrupted });
+    try std.testing.expectEqual(LastEnd.done, second.last_end);
+    // And what is kept for it is not read: an instance's row is its own.
+    second.last_end = .failed;
+    try runtime.openMenu(app);
+    const rows = runtime.menuProjection(app).rows;
+    try std.testing.expect(rows.len >= 2);
+    for (rows) |row| try std.testing.expectEqualStrings("idle", row.state);
 }
 
 test "while a subagent is on screen, the tick visits main and the other hidden agents" {
@@ -7442,6 +7838,63 @@ test "a subagent's run ends only once the turn carrying its work id is saved" {
     try App.AgentsAppRuntime.visit(&app, child, &completion, Check.run);
 }
 
+test "a turn's end gives a subagent's row and its parent's work one outcome, for every end and hand-off" {
+    const alloc = std.testing.allocator;
+    var fixture: EndsFixture = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    const app = &fixture.app;
+    const child = try addTestChildAgent(app, "child-1");
+    defer App.AgentsAppRuntime.shutdownChildren(app);
+    var resolver: @import("core/subagent/authority.zig").Resolver = undefined;
+
+    const Work = agents.ChildRunCompletion.Outcome;
+    const LastEnd = @TypeOf(child.last_end);
+    const Case = struct { ended: types.TurnPresentationOutcome, handed_off: bool, work: Work, mark: LastEnd };
+    // A hand-off turns only an interrupted turn into a finished one.
+    const cases = [_]Case{
+        .{ .ended = .completed, .handed_off = false, .work = .completed, .mark = .done },
+        .{ .ended = .completed, .handed_off = true, .work = .completed, .mark = .done },
+        .{ .ended = .failed, .handed_off = false, .work = .failed, .mark = .failed },
+        .{ .ended = .failed, .handed_off = true, .work = .failed, .mark = .failed },
+        .{ .ended = .interrupted, .handed_off = false, .work = .cancelled, .mark = .stopped },
+        .{ .ended = .interrupted, .handed_off = true, .work = .completed, .mark = .done },
+        .{ .ended = .paused, .handed_off = false, .work = .cancelled, .mark = .stopped },
+        .{ .ended = .paused, .handed_off = true, .work = .cancelled, .mark = .stopped },
+    };
+    const Ctx = struct { done: *agents.ChildRunCompletion, case: Case, turn_id: u64 };
+    const Check = struct {
+        fn run(ctx: Ctx, a: *App, agent: *agents.Agent) anyerror!void {
+            App.AgentsAppRuntime.noteChildTurnFinished(a, agent, .{ .turn_id = ctx.turn_id, .outcome = ctx.case.ended });
+            // The run's own flag is set whatever the end was, as a hand-off
+            // that the end did not use would leave it.
+            agent.child_run.?.handed_off = ctx.case.handed_off;
+            App.AgentsAppRuntime.commitChildTurn(a, agent, .{
+                .turn = .{ .assistant = .{
+                    .user = .{ .text = @constCast("task"), .work_id = @constCast("work-1") },
+                    .assistant = @constCast("answer"),
+                } },
+                .terminal_outcome = ctx.case.ended,
+            });
+            try std.testing.expect(!agent.child_run.?.inFlight());
+            try std.testing.expectEqual(ctx.case.work, ctx.done.outcome.?);
+        }
+    };
+    for (cases, 0..) |case, index| {
+        var completion: agents.ChildRunCompletion = .{};
+        var child_run = try testChildRun(alloc, &resolver, false, null);
+        child_run.work_id = try alloc.dupe(u8, "work-1");
+        child_run.completion = &completion;
+        App.AgentsAppRuntime.installChildRun(app, child, child_run);
+        child.last_end = .done;
+        const turn_id: u64 = 10 + index;
+        child.agent.worker.handed_off_turn_id = if (case.handed_off) turn_id else 0;
+        try App.AgentsAppRuntime.visit(app, child, Ctx{ .done = &completion, .case = case, .turn_id = turn_id }, Check.run);
+        // The row says what the work's outcome says.
+        try std.testing.expectEqual(case.mark, child.last_end);
+    }
+}
+
 test "each agent keeps its own fast mode across switches, and a run leaves the subagent's alone" {
     const alloc = std.testing.allocator;
     var app = App{ .alloc = alloc };
@@ -7540,25 +7993,240 @@ test "each instance keeps its own permission mode and session approvals" {
 
     // An approval belongs to the instance whose turn asked for it.
     try Permission.allowForSession(&app, &second.agent, "run_command", "/tmp/workspace::zig build");
-    const second_count = Permission.grantsOf(&app, &second.agent).len;
+    const second_count = grantCount(&app, &second.agent);
     try std.testing.expect(second_count > 0);
-    try std.testing.expectEqual(@as(usize, 0), Permission.grantsOf(&app, &app.main_agent).len);
+    try std.testing.expectEqual(@as(usize, 0), grantCount(&app, &app.main_agent));
 
     // A subagent's still go to the first instance, as before instances.
     try Permission.allowForSession(&app, &child.agent, "run_command", "/tmp/workspace::zig fmt");
-    try std.testing.expect(Permission.grantsOf(&app, &app.main_agent).len > 0);
-    try std.testing.expect(Permission.grantsOf(&app, &child.agent).ptr == Permission.grantsOf(&app, &app.main_agent).ptr);
-    try std.testing.expectEqual(second_count, Permission.grantsOf(&app, &second.agent).len);
+    try std.testing.expect(grantCount(&app, &app.main_agent) > 0);
+    try std.testing.expect(Permission.grantsLocked(&app, &child.agent).ptr == Permission.grantsLocked(&app, &app.main_agent).ptr);
+    try std.testing.expectEqual(second_count, grantCount(&app, &second.agent));
 
     // A session ending clears only that instance's approvals.
     Permission.clearSessionGrants(&app, &app.main_agent);
-    try std.testing.expectEqual(@as(usize, 0), Permission.grantsOf(&app, &app.main_agent).len);
-    try std.testing.expectEqual(second_count, Permission.grantsOf(&app, &second.agent).len);
+    try std.testing.expectEqual(@as(usize, 0), grantCount(&app, &app.main_agent));
+    try std.testing.expectEqual(second_count, grantCount(&app, &second.agent));
 
     // What the second instance's screen reports is its own.
     const view = Permission.viewOf(&app, &second.agent);
     try std.testing.expectEqual(types.PermissionMode.yolo, view.mode);
-    try std.testing.expectEqual(second_count, view.grants.items.len);
+    try std.testing.expectEqual(second_count, grantCount(&app, &second.agent));
+}
+
+/// An `App` for a test of session approvals. `deinit` stops the subagents the
+/// test added, frees the approvals, and tears the `App` down in the order it
+/// needs.
+const ApprovalsFixture = struct {
+    app: App,
+
+    fn deinit(self: *ApprovalsFixture) void {
+        App.AgentsAppRuntime.shutdownChildren(&self.app);
+        app_permission_runtime.Runtime(App).deinitSessionGrants(&self.app, &self.app.main_agent);
+        App.AgentsAppRuntime.deinitChildren(&self.app);
+        self.app.pacer.deinit(self.app.alloc);
+        self.app.shell.deinit(self.app.alloc);
+    }
+};
+
+test "a subagent's always approval reaches its instance's list at once, for main and its siblings only" {
+    const alloc = std.testing.allocator;
+    const Permission = app_permission_runtime.Runtime(App);
+    const Worker = app_worker_runtime.Runtime(App);
+    var fixture = ApprovalsFixture{ .app = .{ .alloc = alloc } };
+    defer fixture.deinit();
+    const app = &fixture.app;
+    const second = try addTestChildAgent(app, "instance-2");
+    second.agent.role = .instance;
+    const child = try addTestChildAgent(app, "child-1");
+    const sibling = try addTestChildAgent(app, "child-2");
+    const other = try addTestChildAgent(app, "child-of-instance-2");
+    other.agent.root_instance = &second.agent;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // The grants a file change's approval offers: the workspace tree.
+    const file_grants = try permissions.suggestedSessionGrants(arena, "/tmp/workspace", "write_file", "/tmp/workspace/app/page.tsx", .path_create_parent);
+    try std.testing.expect(file_grants.len > 0);
+
+    // They are in the list when the call returns, before the event that
+    // carries them reaches the main loop.
+    for (file_grants) |grant| try Worker.propagateGrant(app, &child.agent, grant.tool_name, grant.target_path);
+    for ([_]*agents.Agent{ &app.main_agent, &child.agent, &sibling.agent }) |agent| {
+        try std.testing.expect(grantAllowed(app, agent, "write_file", "/tmp/workspace/other/file.txt"));
+    }
+    try std.testing.expect(Permission.grantsLocked(app, &child.agent).ptr == Permission.grantsLocked(app, &app.main_agent).ptr);
+    const stored = grantCount(app, &app.main_agent);
+
+    // The same approval again leaves the list as it was.
+    for (file_grants) |grant| try Worker.propagateGrant(app, &child.agent, grant.tool_name, grant.target_path);
+    try std.testing.expectEqual(stored, grantCount(app, &app.main_agent));
+
+    // A second instance is another session: it keeps its own list, and its
+    // subagent's approval stays there.
+    try std.testing.expectEqual(@as(usize, 0), grantCount(app, &second.agent));
+    try std.testing.expect(!grantAllowed(app, &other.agent, "write_file", "/tmp/workspace/other/file.txt"));
+    try Worker.propagateGrant(app, &other.agent, "skill", "demo");
+    try std.testing.expect(grantAllowed(app, &second.agent, "skill", "demo"));
+    try std.testing.expect(!grantAllowed(app, &app.main_agent, "skill", "demo"));
+    try std.testing.expectEqual(stored, grantCount(app, &app.main_agent));
+
+    // Main's own answer is written at once too, so a subagent that is running
+    // reads it at its next call. The main loop's event for the same answer
+    // then adds no second row.
+    try Worker.propagateGrant(app, &app.main_agent, "skill", "main-only");
+    try std.testing.expectEqual(stored + 1, grantCount(app, &app.main_agent));
+    try std.testing.expect(grantAllowed(app, &child.agent, "skill", "main-only"));
+    try Permission.allowForSession(app, &app.main_agent, "skill", "main-only");
+    try std.testing.expectEqual(stored + 1, grantCount(app, &app.main_agent));
+}
+
+test "main's check reads the approvals its instance holds when it checks, and no other instance's" {
+    const alloc = std.testing.allocator;
+    const Worker = app_worker_runtime.Runtime(App);
+    var fixture = ApprovalsFixture{ .app = .{ .alloc = alloc } };
+    defer fixture.deinit();
+    const app = &fixture.app;
+    const second = try addTestChildAgent(app, "instance-2");
+    second.agent.role = .instance;
+    const child = try addTestChildAgent(app, "child-1");
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const Merge = App.AgentAppRuntime;
+
+    // The turn began, or the prompt was queued, before the approval, so its own
+    // list has none of it.
+    const own = [_]types.PermissionGrant{.{ .tool_name = @constCast("skill"), .target_path = @constCast("own") }};
+    try std.testing.expect(!permissions.sessionGrantAllowed(Merge.mergeLiveGrants(app, &app.main_agent, arena, &own), "skill", "granted"));
+    try Worker.propagateGrant(app, &child.agent, "skill", "granted");
+
+    // Main's check now reads it, and still reads the turn's own approval.
+    const main_grants = Merge.mergeLiveGrants(app, &app.main_agent, arena, &own);
+    try std.testing.expect(permissions.sessionGrantAllowed(main_grants, "skill", "granted"));
+    try std.testing.expect(permissions.sessionGrantAllowed(main_grants, "skill", "own"));
+    // The approval covers what it names, and nothing else.
+    try std.testing.expect(!permissions.sessionGrantAllowed(main_grants, "skill", "other"));
+
+    // Another instance is another session, whether its turn is running or its
+    // prompt is queued: its check does not read this instance's list.
+    const second_grants = Merge.mergeLiveGrants(app, &second.agent, arena, &own);
+    try std.testing.expectEqual(own.len, second_grants.len);
+    try std.testing.expect(!permissions.sessionGrantAllowed(second_grants, "skill", "granted"));
+}
+
+test "subagents' workers and main's worker add approvals while main's worker and main's thread read them" {
+    const alloc = std.testing.allocator;
+    const Permission = app_permission_runtime.Runtime(App);
+    const Worker = app_worker_runtime.Runtime(App);
+    // The process Io installs its wrapped vtable on first use, before threads
+    // start; touch it here so the threads below meet it ready.
+    _ = io_mod.getIo();
+    var fixture = ApprovalsFixture{ .app = .{ .alloc = alloc } };
+    defer fixture.deinit();
+    const app = &fixture.app;
+    const first = try addTestChildAgent(app, "child-1");
+    const second = try addTestChildAgent(app, "child-2");
+
+    const Race = struct {
+        app: *App,
+        writers_left: std.atomic.Value(u32) = .init(3),
+        torn: std.atomic.Value(u32) = .init(0),
+        const approvals = 200;
+
+        fn writing(self: *@This()) bool {
+            return self.writers_left.load(.acquire) > 0;
+        }
+
+        /// An agent's worker, a subagent's or main's: one approval after
+        /// another, each a new target, so the list grows and moves.
+        fn write(self: *@This(), child: *agents.Agent, prefix: []const u8) void {
+            defer _ = self.writers_left.fetchSub(1, .release);
+            for (0..approvals) |i| {
+                var buf: [24]u8 = undefined;
+                const target = std.mem.print(&buf, "{s}-{d}", .{ prefix, i }) catch {
+                    _ = self.torn.fetchAdd(1, .monotonic);
+                    return;
+                };
+                Worker.propagateGrant(self.app, child, "skill", target) catch {
+                    _ = self.torn.fetchAdd(1, .monotonic);
+                    return;
+                };
+            }
+        }
+
+        /// Every approval read has a whole name and target.
+        fn check(self: *@This(), grants: []const types.PermissionGrant) void {
+            for (grants) |grant| {
+                const whole = std.mem.eql(u8, grant.tool_name, "skill") and
+                    (std.mem.startsWith(u8, grant.target_path, "a-") or
+                        std.mem.startsWith(u8, grant.target_path, "b-") or
+                        std.mem.startsWith(u8, grant.target_path, "m-"));
+                if (!whole) _ = self.torn.fetchAdd(1, .monotonic);
+            }
+        }
+
+        /// Main's worker: a tool context at every call, and the approvals a
+        /// check or an execution reads, the turn's own and a copy of the
+        /// instance's, in an arena that ends with the call.
+        fn readAsWorker(self: *@This()) void {
+            var arena = std.heap.ArenaAllocator.init(std.heap.c_allocator);
+            defer arena.deinit();
+            while (self.writing()) {
+                _ = arena.reset(.retain_capacity);
+                const ctx = App.AgentAppRuntime.toolContext(self.app, &self.app.main_agent, &ignored_list_entries, max_list_entries, max_read_file_bytes, max_read_file_lines, max_read_file_line_len, max_command_output_bytes, builtin_gateway.retry_count, builtin_gateway.defaultChatUrl());
+                _ = ctx;
+                const own = [_]types.PermissionGrant{.{ .tool_name = @constCast("skill"), .target_path = @constCast("m-own") }};
+                self.check(App.AgentAppRuntime.mergeLiveGrants(self.app, &self.app.main_agent, arena.allocator(), &own));
+            }
+        }
+
+        /// Main's thread: the copy a turn takes as it starts.
+        fn readAsMainThread(self: *@This()) void {
+            while (self.writing()) {
+                const copy = Permission.copyGrants(self.app, &self.app.main_agent, std.heap.c_allocator) catch continue;
+                defer types.freePermissionGrantSlice(std.heap.c_allocator, copy);
+                self.check(copy);
+            }
+        }
+
+        /// What the status line and `/permissions` count and list.
+        fn readForDisplay(self: *@This()) void {
+            while (self.writing()) {
+                _ = Permission.liveGrantCount(self.app, &self.app.main_agent);
+                const shown = Permission.liveGrants(self.app, &self.app.main_agent, std.heap.c_allocator) catch continue;
+                defer types.freePermissionGrantSlice(std.heap.c_allocator, shown);
+                self.check(shown);
+            }
+        }
+    };
+    var race = Race{ .app = app };
+    const first_writer = try std.Thread.spawn(.{}, Race.write, .{ &race, &first.agent, "a" });
+    const second_writer = try std.Thread.spawn(.{}, Race.write, .{ &race, &second.agent, "b" });
+    // Main's worker writes its own answers, each at once. Main's thread writes
+    // the same answers below, as it does when it handles the events that carry
+    // them.
+    const main_writer = try std.Thread.spawn(.{}, Race.write, .{ &race, &app.main_agent, "m" });
+    const worker_reader = try std.Thread.spawn(.{}, Race.readAsWorker, .{&race});
+    const main_reader = try std.Thread.spawn(.{}, Race.readAsMainThread, .{&race});
+    const display_reader = try std.Thread.spawn(.{}, Race.readForDisplay, .{&race});
+    // Main's thread handles the events for main's own answers meanwhile: the
+    // same approvals its worker has written, which add no second row.
+    for (0..Race.approvals) |i| {
+        var buf: [16]u8 = undefined;
+        const target = try std.mem.print(&buf, "m-{d}", .{i});
+        try Permission.allowForSession(app, &app.main_agent, "skill", target);
+    }
+    first_writer.join();
+    second_writer.join();
+    main_writer.join();
+    worker_reader.join();
+    main_reader.join();
+    display_reader.join();
+
+    try std.testing.expectEqual(@as(u32, 0), race.torn.load(.monotonic));
+    try std.testing.expectEqual(@as(usize, 3 * Race.approvals), grantCount(app, &app.main_agent));
 }
 
 test "a subagent's turn is stamped with its run's model, permissions, credential, and root request" {
@@ -7621,6 +8289,148 @@ test "a report reaches the agent that owns its host as its subagent's message" {
     // A subagent's turn keeps its run's root request.
     try std.testing.expectEqualStrings("ROOT_REQUEST", queued.root_user_intent_context);
     try std.testing.expect(queued.delivery == .continuation);
+}
+
+/// A subagent that owns the host `reporter`, with a run installed so that a
+/// report for it can build its turn. Clear `session_persistence.subagent_host`
+/// before the app is torn down.
+fn addReportTarget(
+    app: *App,
+    id: []const u8,
+    reporter: *subagent_tool_host.Runtime,
+    resolver: *@import("core/subagent/authority.zig").Resolver,
+) !*app_agents_runtime.ChildAgent {
+    const child = try addTestChildAgent(app, id);
+    const credential = credentials.Credential{
+        .token = try app.alloc.dupe(u8, "CHILD_TOKEN"),
+        .source = .stored_key,
+    };
+    App.AgentsAppRuntime.installChildRun(app, child, try testChildRun(app.alloc, resolver, false, credential));
+    child.agent.session_persistence.subagent_host = reporter;
+    return child;
+}
+
+fn postTestReport(app: *App, reporter: *subagent_tool_host.Runtime, output: []const u8) !void {
+    try app_agents_runtime.postDelivery(&app.child_handoffs, reporter, .{ .report = .{
+        .agent = "worker",
+        .child_id = "c1",
+        .work_id = "w1",
+        .outcome = .completed,
+        .output = output,
+    } });
+}
+
+/// The lines of a saved session's log that hold `needle`.
+fn countLogLines(alloc: Allocator, tp: *@import("core/subagent/child_state.zig").TestParent, needle: []const u8) !usize {
+    const log_path = try std.Io.Dir.path.join(alloc, &.{ ".fx", "sessions", "v2", tp.parent.id(), "log.jsonl" });
+    defer alloc.free(log_path);
+    const bytes = try tp.tmp.dir.readFileAlloc(io_mod.getIo(), log_path, alloc, .limited(1 << 20));
+    defer alloc.free(bytes);
+    return std.mem.count(u8, bytes, needle);
+}
+
+/// Turn N, streamed to `tp.parent` the way an agent's worker writes it, has
+/// finished and the loop has not committed it. A report that missed the turn
+/// is then posted to the agent. `gated` is whether the agent's worker has
+/// the commit gate on, as the app's threads do. The loop commits turn N
+/// through the app's own path, which acknowledges it. `spawn_child` makes a
+/// subagent during turn N.
+fn runReportBetweenFinishAndCommit(
+    alloc: Allocator,
+    tp: *@import("core/subagent/child_state.zig").TestParent,
+    gated: bool,
+    spawn_child: bool,
+) !void {
+    const session = tp.parent;
+    var app = App{ .alloc = alloc };
+    defer app.shell.deinit(alloc);
+    defer app.pacer.deinit(alloc);
+    defer App.AgentsAppRuntime.deinitChildren(&app);
+    var reporter: subagent_tool_host.Runtime = undefined;
+    var resolver: @import("core/subagent/authority.zig").Resolver = undefined;
+    const child = try addReportTarget(&app, "child-1", &reporter, &resolver);
+    defer App.AgentsAppRuntime.shutdownChildren(&app);
+    defer child.agent.session_persistence.subagent_host = null;
+    child.agent.session_persistence.v2 = session;
+    defer child.agent.session_persistence.v2 = null;
+    if (gated) child.agent.worker.enableCommitGate();
+
+    const user_n: types.UserTurn = .{ .text = @constCast("turn N") };
+    const turn_n: types.HistoryTurn = .{ .assistant = .{ .user = user_n, .assistant = @constCast("answer N") } };
+    const user_report: types.UserTurn = .{ .text = @constCast("report turn") };
+    const turn_report: types.HistoryTurn = .{ .assistant = .{ .user = user_report, .assistant = @constCast("answer report") } };
+    const language = types.ConversationLanguage.default();
+
+    // The worker streamed turn N and finished it. Its finish waits for the loop.
+    try session.appendProgress(user_n, .{}, .{});
+    if (spawn_child) try session.appendChildLines(&.{.{ .spawned = .{ .child = "late", .work_id = "w-late", .data = "{\"kind\":\"persistent\"}" } }});
+    try child.agent.worker.pushEvent(std.heap.c_allocator, .{ .finish_prompt = .{ .turn = turn_n } });
+    try postTestReport(&app, &reporter, "SECOND_CHILD_REPORT");
+    App.AgentsAppRuntime.takePosts(&app);
+    try std.testing.expectEqual(@as(usize, 1), child.agent.worker.queuedPromptCount());
+
+    const early = try child.agent.worker.tryTakeNextWork(std.heap.c_allocator);
+    if (early) |work| {
+        // Without the gate the report's turn begins before the commit.
+        defer worker_runtime.freeWorkItem(std.heap.c_allocator, work);
+        try std.testing.expect(!gated);
+        try session.appendProgress(user_report, .{}, .{});
+        try session.commitTurn(turn_n, language);
+        try session.commitTurn(turn_report, language);
+        return;
+    }
+    try std.testing.expect(gated);
+    // The loop applies the finish: the app's own commit, which acknowledges it.
+    var events = child.agent.worker.takeEvents();
+    for (events.items) |event| worker_runtime.freeWorkerEvent(std.heap.c_allocator, event);
+    events.deinit(std.heap.c_allocator);
+    try std.testing.expect((try child.agent.worker.tryTakeNextWork(std.heap.c_allocator)) == null);
+    try App.SessionAppRuntime.appendFinishedPrompt(&app, &child.agent, .{ .turn = turn_n });
+    // The worker begins the report's turn and finishes it.
+    const work = (try child.agent.worker.tryTakeNextWork(std.heap.c_allocator)).?;
+    defer worker_runtime.freeWorkItem(std.heap.c_allocator, work);
+    try std.testing.expect(std.mem.find(u8, work.prompt.prompt, "SECOND_CHILD_REPORT") != null);
+    try session.appendProgress(user_report, .{}, .{});
+    try session.commitTurn(turn_report, language);
+}
+
+test "a report that missed a finished turn starts no turn until the loop commits it, and the log shows no superseded turn" {
+    const alloc = std.testing.allocator;
+    const child_state = @import("core/subagent/child_state.zig");
+    var tp: child_state.TestParent = undefined;
+    try tp.init(alloc);
+    defer tp.deinit();
+    // A subagent is made during turn N, as a prompt's own work makes one.
+    try runReportBetweenFinishAndCommit(alloc, &tp, true, true);
+    try std.testing.expectEqual(@as(usize, 0), try countLogLines(alloc, &tp, "\"superseded\""));
+    try std.testing.expectEqual(@as(usize, 0), try countLogLines(alloc, &tp, "turn_interrupted"));
+    // The setup's turn, turn N, and the report's turn, each committed once.
+    try std.testing.expectEqual(@as(usize, 3), try countLogLines(alloc, &tp, "turn_committed"));
+
+    // A fork before turn N's prompt offers none of the subagents that turn made.
+    // A superseded turn N is written again after them, so a fork before the
+    // rewritten prompt offers them as if they came first.
+    const session_adapter = @import("core/session/session_adapter.zig");
+    const points = try tp.parent.forkPoints(alloc);
+    defer session_adapter.Session.freeForkPoints(alloc, points);
+    var turn_n: ?u64 = null;
+    for (points) |point| if (std.mem.eql(u8, point.prompt, "turn N")) {
+        turn_n = point.turn;
+    };
+    const offered = try tp.parent.forkChildren(alloc, turn_n.?);
+    defer session_adapter.freeChildren(alloc, offered);
+    try std.testing.expectEqual(@as(usize, 0), offered.len);
+}
+
+test "the same turns written without the gate supersede each other, which the log shows" {
+    const alloc = std.testing.allocator;
+    const child_state = @import("core/subagent/child_state.zig");
+    var tp: child_state.TestParent = undefined;
+    try tp.init(alloc);
+    defer tp.deinit();
+    try runReportBetweenFinishAndCommit(alloc, &tp, false, false);
+    try std.testing.expect(try countLogLines(alloc, &tp, "\"superseded\"") > 0);
+    try std.testing.expect(try countLogLines(alloc, &tp, "turn_interrupted") > 0);
 }
 
 test "installing a subagent's run sets its effort, keeps ultrafast only when main has it, and frees the last run" {

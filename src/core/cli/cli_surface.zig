@@ -1943,7 +1943,7 @@ fn runNonInteractiveWithDeps(
             return runTopLevelMcp(alloc, rest, cfg, deps);
         },
         .models => |rest| {
-            const opts = parseLocalSurfaceArgs(rest) catch |err| {
+            const opts = parseLocalSurfaceArgs(modelsListArgs(rest)) catch |err| {
                 try writeUsageOrJsonError(alloc, cfg.command_catalog, deps, .models, "models", err, rest);
                 return usage_failure;
             };
@@ -2084,7 +2084,7 @@ fn runNonInteractiveWithDeps(
                 };
                 return runSessionConvert(alloc, deps, format);
             }
-            const opts = parseSessionListArgs(rest) catch |err| {
+            const opts = parseSessionListArgs(sessionListArgs(rest)) catch |err| {
                 try writeUsageOrJsonError(alloc, cfg.command_catalog, deps, .sessions, "sessions", err, rest);
                 return usage_failure;
             };
@@ -4324,6 +4324,11 @@ fn writeStderrLine(alloc: Allocator, deps: RunDeps, comptime format: []const u8,
     try writeStderr(deps, line);
 }
 
+fn modelsListArgs(rest: []const [:0]const u8) []const [:0]const u8 {
+    if (rest.len > 0 and std.mem.eql(u8, rest[0], "ls")) return rest[1..];
+    return rest;
+}
+
 fn parseLocalSurfaceArgs(args: []const [:0]const u8) !LocalSurfaceOptions {
     var options = LocalSurfaceOptions{};
     var parser: cli_flags.Parser = .init(&builtin_commands.json_only_options, args);
@@ -4793,6 +4798,13 @@ fn channelSavedLine(
 const SessionListFlag = enum { live, all, limit, cursor, json };
 const session_list_flag_ids = cli_flags.idTable(SessionListFlag, &builtin_commands.sessions_options);
 
+/// The `sessions` arguments that name the list action. `fx sessions` lists by
+/// default, and `fx sessions ls` names the same action.
+fn sessionListArgs(rest: []const [:0]const u8) []const [:0]const u8 {
+    if (rest.len > 0 and std.mem.eql(u8, rest[0], "ls")) return rest[1..];
+    return rest;
+}
+
 fn parseSessionListArgs(args: []const [:0]const u8) !SessionListOptions {
     var options = SessionListOptions{};
     var parser: cli_flags.Parser = .init(&builtin_commands.sessions_options, args);
@@ -4816,6 +4828,18 @@ fn parseSessionListArgs(args: []const [:0]const u8) !SessionListOptions {
         },
     };
     return options;
+}
+
+test "fx sessions ls names the default list action" {
+    try std.testing.expectEqual(@as(usize, 0), sessionListArgs(&.{"ls"}).len);
+    try std.testing.expectEqualStrings("--json", sessionListArgs(&.{ "ls", "--json" })[0]);
+    try std.testing.expectEqualStrings("--json", sessionListArgs(&.{"--json"})[0]);
+}
+
+test "fx models ls names the default list action" {
+    try std.testing.expectEqual(@as(usize, 0), modelsListArgs(&.{"ls"}).len);
+    try std.testing.expectEqualStrings("--json", modelsListArgs(&.{ "ls", "--json" })[0]);
+    try std.testing.expectEqualStrings("--json", modelsListArgs(&.{"--json"})[0]);
 }
 
 test "fx sessions --live reads through the shared parser and names the paging flag it refuses" {
@@ -5190,6 +5214,10 @@ test "parse recognizes every top-level command and preserves unknown commands" {
         .models => |rest| try std.testing.expectEqual(@as(usize, 1), rest.len),
         else => return error.TestExpectedEqual,
     }
+    switch (parse(command_catalog, &.{ @constCast("models"), @constCast("ls"), @constCast("--json") })) {
+        .models => |rest| try std.testing.expectEqual(@as(usize, 2), rest.len),
+        else => return error.TestExpectedEqual,
+    }
     switch (parse(command_catalog, &.{ @constCast("mcp"), @constCast("add"), @constCast("fixture"), @constCast("node") })) {
         .mcp => |rest| try std.testing.expectEqual(@as(usize, 3), rest.len),
         else => return error.TestExpectedEqual,
@@ -5212,6 +5240,10 @@ test "parse recognizes every top-level command and preserves unknown commands" {
     }
     switch (parse(command_catalog, &.{ @constCast("sessions"), @constCast("--json") })) {
         .sessions => |rest| try std.testing.expectEqual(@as(usize, 1), rest.len),
+        else => return error.TestExpectedEqual,
+    }
+    switch (parse(command_catalog, &.{ @constCast("sessions"), @constCast("ls"), @constCast("--json") })) {
+        .sessions => |rest| try std.testing.expectEqual(@as(usize, 2), rest.len),
         else => return error.TestExpectedEqual,
     }
     switch (parse(command_catalog, &.{ @constCast("resume"), @constCast("last") })) {
@@ -6983,6 +7015,30 @@ test "runIfRequested models passes startup team to fetch seam" {
     deps.load_startup_state = stubLoadStartupState;
 
     const result = try runIfRequestedWithDeps(std.testing.allocator, &.{ @constCast("models"), @constCast("--json") }, cfg, deps);
+    try std.testing.expectEqual(RunResult.handled_success, result);
+    try std.testing.expect(probe.called);
+    try std.testing.expectEqualStrings(
+        "{\"kind\":\"models\",\"count\":1,\"shown_count\":1,\"more_count\":0,\"private_models_hidden\":false,\"ids\":[\"private/blue-hornbill\"]}\n",
+        capture.stdout.written(),
+    );
+}
+
+test "runIfRequested models ls lists the same catalog as models" {
+    var capture = CaptureOutput.init(std.testing.allocator);
+    defer capture.deinit();
+    var probe = ModelFetchProbe{};
+    var cfg = testConfig();
+    cfg.provider_set.gateway.cli_model_catalog = probe.provider();
+
+    var deps = capture.deps();
+    deps.load_startup_state = stubLoadStartupState;
+
+    const result = try runIfRequestedWithDeps(
+        std.testing.allocator,
+        &.{ @constCast("models"), @constCast("ls"), @constCast("--json") },
+        cfg,
+        deps,
+    );
     try std.testing.expectEqual(RunResult.handled_success, result);
     try std.testing.expect(probe.called);
     try std.testing.expectEqualStrings(

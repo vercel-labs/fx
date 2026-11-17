@@ -28,6 +28,7 @@ const input_completion_runtime = @import("input_completion_runtime.zig");
 const image_attachments = @import("../images/image_attachments.zig");
 const core_input_runtime = @import("../input/runtime.zig");
 const io_mod = @import("../shared/io.zig");
+const app_worker_runtime = @import("app_worker_runtime.zig");
 const list_window = @import("../shared/list_window.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const session_runtime = @import("../session/session.zig");
@@ -70,6 +71,7 @@ const operation_control = @import("../mcp/operation_control.zig");
 const shell_runtime = @import("../../ui/shell_runtime.zig");
 const transcript_runtime = @import("../../ui/transcript/runtime.zig");
 const resume_projection = @import("../../ui/transcript/resume_projection.zig");
+const tool_group_projection = @import("../../ui/transcript/tool_group_projection.zig");
 const question_ui = @import("../../ui/footer/question_ui.zig");
 const render_input = @import("../../ui/footer/render_input.zig");
 const ui_input = @import("../../ui/input/runtime.zig");
@@ -1090,7 +1092,7 @@ pub fn Runtime(comptime App: type) type {
 
         fn beginLiveSessionCancellation(app: *App, agent: *AppAgent) void {
             agent.worker.requestCancel();
-            app.pacer.clear(app.alloc);
+            app_worker_runtime.Runtime(App).clearPacer(app, agent, "session_switch");
             if (comptime @hasDecl(App, "clearPendingSubmissionForSessionTransition")) {
                 App.clearPendingSubmissionForSessionTransition(app, agent);
             } else {
@@ -1615,6 +1617,16 @@ pub fn Runtime(comptime App: type) type {
             return v2.saveRecovery(record);
         }
 
+        /// Saves the row of a call a command made through `fx mcp call` in
+        /// the open turn, so a resume shows it in its shell call's group
+        /// (D99). A session that is not saved keeps nothing.
+        pub fn saveBridgeCall(agent: *AppAgent, record: types.BridgeCallRecord) !void {
+            agent.session_persistence.write_mutex.lockUncancelable(io_mod.getIo());
+            defer agent.session_persistence.write_mutex.unlock(io_mod.getIo());
+            const v2 = agent.session_persistence.v2 orelse return;
+            try v2.saveBridgeCall(record);
+        }
+
         /// Record whether restored history references shell execution handles
         /// this process does not own. Registry membership, not the resume
         /// itself, decides staleness (see session_runtime.detectStaleShellHandles).
@@ -2103,11 +2115,23 @@ pub fn Runtime(comptime App: type) type {
             _ = try appendHistoryTurnWithPendingPresentation(app, agent, turn, .strict, null);
         }
 
+        /// Tells the agent's worker that a finished turn is committed, or
+        /// failed to commit, so mail held for it may start the next turn
+        /// (`WorkerRuntime.acknowledgeFinishCommitted`).
+        fn acknowledgeFinishCommitted(agent: *AppAgent) void {
+            if (comptime @hasField(AppAgent, "worker") and
+                @hasDecl(@TypeOf(agent.worker), "acknowledgeFinishCommitted"))
+            {
+                agent.worker.acknowledgeFinishCommitted();
+            }
+        }
+
         pub fn appendFinishedPrompt(
             app: *App,
             agent: *AppAgent,
             finished: types.FinishedPrompt,
         ) !void {
+            defer acknowledgeFinishCommitted(agent);
             var turn = finished.turn;
             if (finished.summary) |summary| {
                 types.setHistoryTurnSummary(&turn, summary);
@@ -2143,13 +2167,17 @@ pub fn Runtime(comptime App: type) type {
             agent: *AppAgent,
             finished: types.FinishedPrompt,
         ) !HistoryAppendOutcome {
-            return appendHistoryTurnWithPendingPresentation(
+            const outcome = try appendHistoryTurnWithPendingPresentation(
                 app,
                 agent,
                 finished.turn,
                 .visual_epoch,
                 finished.snapshot_file_ownership,
             );
+            // An uncommitted turn stays with the pacer, which commits it later
+            // through `appendFinishedPrompt`.
+            if (outcome == .committed) acknowledgeFinishCommitted(agent);
+            return outcome;
         }
 
         const AppendHistoryMode = enum {
@@ -3025,6 +3053,17 @@ pub fn Runtime(comptime App: type) type {
                     }
                 }
 
+                fn attachHistoricalBridgeCall(
+                    self: *Self,
+                    entry_id: u32,
+                    tool: []const u8,
+                    outcome: types.ToolOutcomeKind,
+                ) !void {
+                    if (comptime @hasDecl(SinkApp, "attachHistoricalBridgeCall")) {
+                        try self.app.attachHistoricalBridgeCall(entry_id, tool, outcome);
+                    }
+                }
+
                 fn attachHistoricalCommandOutput(self: *Self, entry_id: u32) void {
                     if (comptime @hasDecl(SinkApp, "attachHistoricalCommandOutput")) {
                         self.app.attachHistoricalCommandOutput(entry_id);
@@ -3322,6 +3361,15 @@ pub fn Runtime(comptime App: type) type {
                     call: types.ToolCall,
                 ) !void {
                     try self.projection.attachHistoricalToolCallWithoutResult(entry_id, call);
+                }
+
+                fn attachHistoricalBridgeCall(
+                    self: *Self,
+                    entry_id: u32,
+                    tool: []const u8,
+                    outcome: types.ToolOutcomeKind,
+                ) !void {
+                    try self.projection.attachHistoricalBridgeCall(entry_id, tool, outcome);
                 }
 
                 fn attachHistoricalCommandOutput(self: *Self, entry_id: u32) void {
@@ -3932,6 +3980,9 @@ pub fn Runtime(comptime App: type) type {
                         if (entry.cancelled_command) |presentation| {
                             try writeCancelledCommandPresentation(app, agent, sink, entry.tool_call.?, presentation, labels);
                         }
+                        if (entry.tool_call) |call| {
+                            try writeBridgeCallRows(app, sink, entry.execution.bridge_calls, call.id);
+                        }
                         switch (entry.terminal_reason) {
                             .cancelled => if (entry.cancelled_command == null and entry.cancellation_origin == .turn) {
                                 try sink.appendTurnCancellation();
@@ -4042,9 +4093,11 @@ pub fn Runtime(comptime App: type) type {
                 for (step.tool_calls) |call| {
                     if (findPersistedToolResult(step.tool_results, call.id)) |result| {
                         try writeCompletedToolResult(app, agent, sink, call, result, labels);
+                        try writeBridgeCallRows(app, sink, execution.bridge_calls, call.id);
                         try writePermissionFeedback(sink, result.permission_feedback);
                     } else {
                         try writeUnreportedToolStatus(app, sink, call);
+                        try writeBridgeCallRows(app, sink, execution.bridge_calls, call.id);
                     }
                 }
 
@@ -4642,6 +4695,25 @@ pub fn Runtime(comptime App: type) type {
             return sink.appendToolStatus(kind, status);
         }
 
+        /// Writes the row of each call that the command of shell call
+        /// `call_id` made through `fx mcp call`, as its live row ended, right
+        /// after the shell call's row, so the two share a group again (D99).
+        fn writeBridgeCallRows(
+            app: *App,
+            sink: anytype,
+            records: []const types.BridgeCallRecord,
+            call_id: []const u8,
+        ) !void {
+            for (records) |record| {
+                if (!std.mem.eql(u8, record.call_id, call_id)) continue;
+                const status = try tooling_presentation.bridgeCallRowSummary(app.alloc, record.tool, record.outcome);
+                defer app.alloc.free(status);
+                const kind = record.outcome.toolOutcome();
+                const entry_id = try writeCompletedToolStatus(sink, kind, status);
+                try sink.attachHistoricalBridgeCall(entry_id, record.tool, kind);
+            }
+        }
+
         fn writeSavedCommandOutput(sink: anytype, output: []const u8) !bool {
             var wrote = false;
             wrote = try writeCommandEnvelope(sink, output, "<stdout>\n", "\n</stdout>", .stdout) or wrote;
@@ -5031,7 +5103,7 @@ pub fn Runtime(comptime App: type) type {
                 },
                 integrations,
                 if (comptime @hasField(App, "permission_engine")) app.permission_engine.rules else .{},
-                if (comptime @hasField(App, "permission_engine")) app_permission_runtime.Runtime(App).grantsOf(app, instance) else &.{},
+                if (comptime @hasField(App, "permission_engine")) app_permission_runtime.Runtime(App).grantsLocked(app, instance) else &.{},
                 permission_state,
                 if (mcp_view) |*view| view else null,
             );
@@ -5463,7 +5535,7 @@ test "session transition retires queued and running compaction only after worker
             worker: worker_runtime.WorkerRuntime = .{},
         } = .{},
         pacer: struct {
-            fn clear(_: *@This(), _: Allocator) void {}
+            pub fn clear(_: *@This(), _: Allocator) void {}
         } = .{},
 
         pub fn agent(self: anytype) @TypeOf(&self.main_agent) {
@@ -7038,6 +7110,126 @@ test "execution replay keeps an inline command preview when its stored output is
     try std.testing.expectEqualStrings("/workspace", app.command_stdout.items);
     try std.testing.expectEqualStrings("warning", app.command_stderr.items);
     try std.testing.expectEqual(@as(usize, 1), app.command_output_flush_count);
+}
+
+/// A step whose command made three calls through `fx mcp call`, two that
+/// worked and one that failed, then read a file, as a resume reads it.
+const BridgeReplayFixture = struct {
+    calls: [2]types.ToolCall = .{
+        .{ .id = "call_pages", .name = "run_command", .arguments_json = "{\"command\":\"sh pages.sh\"}" },
+        .{ .id = "call_read", .name = "read_file", .arguments_json = "{\"path\":\"notes.txt\"}" },
+    },
+    results: [2]types.PersistedToolResult = .{
+        .{
+            .tool_call_id = @constCast("call_pages"),
+            .tool_name = @constCast("run_command"),
+            .status = .success,
+            .output = @constCast("exit_code=0\n<stdout>\ncalls=3\n</stdout>\n"),
+            .output_bytes = 39,
+            .stored_output_bytes = 39,
+        },
+        .{
+            .tool_call_id = @constCast("call_read"),
+            .tool_name = @constCast("read_file"),
+            .status = .success,
+            .output = @constCast("notes"),
+            .output_bytes = 5,
+            .stored_output_bytes = 5,
+        },
+    },
+    bridge_calls: [4]types.BridgeCallRecord = .{
+        .{ .call_id = "call_pages", .request_id = "fx-mcp-call-1", .tool = "mcp_fixture_echo", .outcome = .completed },
+        .{ .call_id = "call_pages", .request_id = "fx-mcp-call-2", .tool = "mcp_fixture_echo", .outcome = .completed },
+        .{ .call_id = "call_pages", .request_id = "fx-mcp-call-3", .tool = "mcp_fixture_echo", .outcome = .failed },
+        // Its shell call is not in the turn, as after a compaction cut it.
+        .{ .call_id = "call_gone", .request_id = "fx-mcp-call-4", .tool = "mcp_fixture_echo", .outcome = .completed },
+    },
+    steps: [1]types.ToolExecutionStep = undefined,
+
+    fn execution(self: *BridgeReplayFixture) types.ExecutionMemory {
+        self.steps[0] = .{ .tool_calls = self.calls[0..], .tool_results = self.results[0..] };
+        return .{ .tool_steps = self.steps[0..], .bridge_calls = self.bridge_calls[0..] };
+    }
+};
+
+test "a resume shows each saved fx mcp call row right after its shell call's row, as it ended (D99)" {
+    const alloc = std.testing.allocator;
+    var app = try TestApp.init(alloc, "/workspace");
+    defer app.deinit();
+    var fixture: BridgeReplayFixture = .{};
+
+    try Runtime(TestApp).writeExecutionHistory(&app, (&app).agent(), fixture.execution());
+
+    const statuses = app.completed_tool_statuses.items;
+    errdefer for (statuses) |status| std.debug.print("row: {s}", .{status});
+    try std.testing.expectEqual(@as(usize, 5), statuses.len);
+    // The test app names every command row the same way.
+    try std.testing.expectEqualStrings("● Ran pwd\n", statuses[0]);
+    for (statuses[1..4], [_][]const u8{ "Ran MCP", "Ran MCP", "Failed" }) |status, label| {
+        const want = try tooling_presentation.formatToolActionValue(alloc, label, "mcp_fixture_echo");
+        defer alloc.free(want);
+        try std.testing.expectEqualStrings(want, std.mem.trimEnd(u8, status, "\n"));
+    }
+    try std.testing.expect(std.mem.startsWith(u8, statuses[4], "● Completed read_file"));
+    try std.testing.expectEqualSlices(
+        types.ToolOutcomeKind,
+        &.{ .completed, .completed, .completed, .failed, .completed },
+        app.completed_tool_outcomes.items,
+    );
+}
+
+test "a resumed fx mcp call row joins its shell call's group with no arguments or result (D99)" {
+    const alloc = std.testing.allocator;
+    var app = try TestApp.init(alloc, "/workspace");
+    defer app.deinit();
+    var source_runtime: transcript_runtime.TranscriptRuntime = .{};
+    defer source_runtime.deinit(alloc);
+    var projection = try resume_projection.ResumeProjection.initEmpty(alloc, &source_runtime, 0, 1);
+    defer projection.deinit();
+    var labels = Runtime(TestApp).HistoricalSessionLabels{ .workspace_root = app.workspace_root };
+    defer labels.deinit(app.alloc);
+    var sink = Runtime(TestApp).DetachedHistorySink(@TypeOf(projection)){
+        .app = &app,
+        .projection = &projection,
+        .labels = &labels,
+    };
+    var fixture: BridgeReplayFixture = .{};
+
+    try Runtime(TestApp).writeExecutionHistoryToSink(&app, (&app).agent(), &sink, fixture.execution(), &labels);
+
+    // Ctrl+O has the row alone: the tool and how it ended, nothing else.
+    var bridged: usize = 0;
+    for (projection.runtime.notebook.tool_details.items) |*detail| {
+        if (!std.mem.eql(u8, detail.tool_name, "mcp_fixture_echo")) continue;
+        bridged += 1;
+        try std.testing.expectEqual(@as(?types.ToolActivityKind, .mcp), detail.activity_kind);
+        try std.testing.expect(detail.arguments_json == null);
+        try std.testing.expect(detail.result == null);
+        try std.testing.expect(detail.origin == .recorded);
+        try std.testing.expect(detail.outcome == .completed or detail.outcome == .failed);
+    }
+    try std.testing.expectEqual(@as(usize, 3), bridged);
+
+    // The compact view counts the calls that worked on one row and gives
+    // the failed one its own, as the live session showed them.
+    var group = try tool_group_projection.buildStyled(
+        alloc,
+        projection.runtime.notebook.entries.items,
+        projection.runtime.notebook.tool_details.items,
+        120,
+        .{},
+        .{},
+    );
+    defer group.deinit(alloc);
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(alloc);
+    for (group.entry_actions.items) |action| switch (action) {
+        .override => |override| try text.appendSlice(alloc, override.bytes),
+        else => {},
+    };
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, text.items, "Ran MCP"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, text.items, "×2"));
+    try std.testing.expect(std.mem.find(u8, text.items, "Couldn't run") != null);
 }
 
 test "execution replay shows the user's steering and not fx's own recovery prompt" {
@@ -11338,4 +11530,62 @@ test "a failed history delivery is kept for shutdown, and later turns still save
     var restored = try reopenSaved(&app);
     defer restored.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 1), restored.history.len);
+}
+
+test "a live session switch drops the finishes it holds, so a later report is not held" {
+    const App = struct {
+        alloc: Allocator = std.heap.c_allocator,
+        main_agent: struct {
+            worker: worker_runtime.WorkerRuntime = .{},
+        } = .{},
+        pacer: @import("../../ui/assistant/pacer.zig").AssistantPacer = .{},
+
+        pub fn agent(self: anytype) @TypeOf(&self.main_agent) {
+            return &self.main_agent;
+        }
+    };
+    const alloc = std.testing.allocator;
+    var app: App = .{};
+    defer app.pacer.deinit(app.alloc);
+    defer app.agent().worker.deinit(alloc);
+    const worker = &app.agent().worker;
+    worker.enableCommitGate();
+
+    // Turn A's finish is in the pacer, and turn B's finish is still queued.
+    const turn: types.HistoryTurn = .{ .assistant = .{ .user = .{ .text = @constCast("prompt") }, .assistant = @constCast("answer") } };
+    try worker.pushEvent(alloc, .{ .finish_prompt = .{ .turn = turn } });
+    var taken = worker.takeEvents();
+    for (taken.items) |event| worker_runtime.freeWorkerEvent(alloc, event);
+    taken.deinit(alloc);
+    try app.pacer.enqueue(app.alloc, "still showing");
+    try std.testing.expect(try app.pacer.deferFinish(app.alloc, .{ .turn = turn }));
+    try worker.pushEvent(alloc, .{ .finish_prompt = .{ .turn = turn } });
+    try std.testing.expectEqual(@as(u32, 2), worker.unacknowledged_finishes);
+
+    // The switch cancels (and clears the pacer), then drops the queued events.
+    Runtime(App).beginLiveSessionCancellation(&app, (&app).agent());
+    try std.testing.expect(app.pacer.deferred_turn == null);
+    try std.testing.expectEqual(@as(u32, 1), worker.unacknowledged_finishes);
+    worker.discardEvents(alloc);
+    try std.testing.expectEqual(@as(u32, 0), worker.unacknowledged_finishes);
+
+    // The new session's first turn finishes and is committed, and a report missed it.
+    worker.worker_processing = true;
+    worker.active_turn_id = 9;
+    worker.direct_steering_closed = true;
+    try worker.pushEvent(alloc, .{ .finish_prompt = .{ .turn = turn } });
+    try worker.postMail(alloc, .{
+        .prompt = try alloc.dupe(u8, "a report"),
+        .images = &.{},
+        .model = try alloc.dupe(u8, "test-model"),
+        .api_key = try alloc.dupe(u8, "test-key"),
+        .permission_mode = .auto,
+        .history = try alloc.alloc(types.HistoryTurn, 0),
+        .grants = try alloc.alloc(types.PermissionGrant, 0),
+    });
+    worker.finishProcessing();
+    worker.acknowledgeFinishCommitted();
+    const work = (try worker.tryTakeNextWork(alloc)) orelse return error.TestExpectedReportToStart;
+    defer worker_runtime.freeWorkItem(alloc, work);
+    try std.testing.expectEqualStrings("a report", work.prompt.prompt);
 }
