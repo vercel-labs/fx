@@ -961,7 +961,7 @@ pub fn composeFooterFrame(
             .can_tab = skill_runtime.skillMenuHasOtherSource(ctx.skills_menu.items, ctx.skills_menu.source_filter),
         })
     else if (input.show_picker and input.picker_kind == .settings)
-        try input_presentation.composeSettingsMenuHintRow(alloc, shell.layout.cols, ctx.ctrl_c_pending)
+        try input_presentation.composeSettingsMenuHintRow(alloc, shell.layout.cols, ctx.ctrl_c_pending, ctx.settings_menu.filteredItemCount() > 0)
     else if (input.show_picker and input.picker_kind == .mcp and ctx.mcp_host_menu.active())
         try input_presentation.composeVariantHintRow(
             alloc,
@@ -970,9 +970,11 @@ pub fn composeFooterFrame(
             mcp_host_menu_presentation.hintVariants(ctx.mcp_host_menu),
         )
     else if (input.show_picker and input.picker_kind == .help)
-        try input_presentation.composeHelpMenuHintRow(alloc, shell.layout.cols, ctx.ctrl_c_pending)
+        try input_presentation.composeHelpMenuHintRow(alloc, shell.layout.cols, ctx.ctrl_c_pending, ctx.help_menu.filteredItemCount() > 0)
     else if (input.show_picker and input.picker_kind == .sessions)
-        try input_presentation.composeResumeMenuHintRow(alloc, shell.layout.cols, ctx.ctrl_c_pending)
+        try input_presentation.composeResumeMenuHintRow(alloc, shell.layout.cols, ctx.ctrl_c_pending, .{
+            .has_items = ctx.session_menu.load_state == .ready and ctx.session_menu.navigationItemCount() > 0,
+        })
     else if (input.show_picker and input.picker_kind == .fork and ctx.fork_menu.question != null)
         try input_presentation.composeVariantHintRow(alloc, shell.layout.cols, ctx.ctrl_c_pending, &fork_menu_presentation.question_hint_variants)
     else if (input.show_picker and input.picker_kind == .fork)

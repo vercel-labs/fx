@@ -287,7 +287,7 @@ describe.skipIf(SKIP)("tui: slash commands", () => {
       session = await launchAndWait();
       await session.sendText("/settings");
       const pane = await session.waitForText("←→ change", 5_000);
-      expect(pane).toContain("Settings");
+      expect(pane).toContain("settings   < All >");
       expect(pane).toContain("↑↓ navigate");
       expect(pane).not.toContain("[All]");
     },

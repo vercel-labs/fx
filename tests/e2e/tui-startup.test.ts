@@ -67,8 +67,7 @@ describe.skipIf(SKIP)("tui: startup and exit", () => {
       session = await TmuxSession.create();
       await session.waitForComposer(10_000);
       await session.sendText("/help");
-      const pane = await session.waitForText("Commands 40", 5_000);
-      expect(pane).toContain("[All]");
+      const pane = await session.waitForText("commands   < All >", 5_000);
       expect(pane).toContain("tab category");
       expect(pane).toContain("enter open");
       expect(pane).toContain("Run /help for commands");
@@ -165,7 +164,8 @@ describe.skipIf(SKIP_TMUX)("tui: fresh-session commands", () => {
         );
         expect(wideHelp).toBeDefined();
         const wideDescriptionColumn = wideHelp!.indexOf("show available slash commands");
-        expect(wideDescriptionColumn).toBe(18);
+        // Six cells after the widest command, at column 2.
+        expect(wideDescriptionColumn).toBe(20);
 
         await session.resizeWindow(60, 40);
         const narrow = await session.waitForPane(
@@ -178,7 +178,9 @@ describe.skipIf(SKIP_TMUX)("tui: fresh-session commands", () => {
           (line) => line.includes("/help") && line.includes("show available"),
         );
         expect(narrowHelp).toBeDefined();
-        expect(narrowHelp!.indexOf("show available")).toBe(wideDescriptionColumn);
+        // A narrow terminal may narrow the gap; the description never moves
+        // away from its command.
+        expect(narrowHelp!.indexOf("show available")).toBeLessThanOrEqual(wideDescriptionColumn);
         expect(readFileSync(stderrPath, "utf8")).toBe("");
       } finally {
         if (session) {
@@ -368,7 +370,7 @@ describe.skipIf(SKIP_TMUX)("tui: fresh-session commands", () => {
         const after = await session.captureFullScrollback();
         const priorNotice = after.slice(after.lastIndexOf("* allowlist:"), after.lastIndexOf(banner)).trimEnd();
         expect(priorNotice).toBe(lastNotice.split("\n┃")[0]?.trimEnd());
-        expect(priorNotice).not.toContain("Commands 1");
+        expect(priorNotice).not.toContain("commands   <");
         expect(priorNotice).not.toContain("run /login ·");
         expect(await session.capturePane()).not.toContain("* allowlist:");
         const replay = JSON.parse(execFileSync(FX_BIN, ["replay", tapePath, "--json"], { encoding: "utf8" }));
@@ -620,7 +622,7 @@ describe.skipIf(SKIP_TMUX)("tui: fresh-session commands", () => {
           lastIndex = index;
         }
         expect(oldNotice.replace(/\s+/g, "")).toBe(expectedNotice?.replace(/\s+/g, ""));
-        expect(oldNotice).not.toContain("Commands 1");
+        expect(oldNotice).not.toContain("commands   <");
         expect(oldNotice).not.toContain("run /login ·");
         expect(session.isAlive()).toBe(true);
         await session.sendText("/allowlist");

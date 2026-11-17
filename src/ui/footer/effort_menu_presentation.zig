@@ -1,61 +1,36 @@
-//! The `/effort` menu in the footer, laid out like the `/model` menu: an
-//! `Effort` title naming the model, then one row per reasoning effort level
-//! with the one in use marked `current`. When the levels do not all fit, the
-//! list scrolls with the highlight.
+//! The `/effort` menu in the footer, drawn with the shared menu frame: an
+//! `effort · <model>` title, then one row per reasoning effort level with the
+//! one in use marked `current`. When the levels do not all fit, the list
+//! scrolls with the highlight.
 
 const std = @import("std");
-const display_width = @import("../../core/shared/display_width.zig");
 const effort_menu = @import("../../core/input/effort_menu.zig");
-const list_window = @import("../../core/shared/list_window.zig");
+const menu_frame = @import("menu_frame.zig");
 const render_input = @import("render_input.zig");
-const row_text = @import("row_text.zig");
+const types = @import("../../core/shared/types.zig");
 const ui_render = @import("../render.zig");
+const vt_emulator = @import("../../core/terminal/engine.zig");
 
 const Allocator = std.mem.Allocator;
 const Projection = render_input.EffortMenuProjection;
 
-const header_rows: u16 = 1;
-const gap_rows: u16 = 1;
+/// The title and the blank row under it.
+const header_rows: u16 = 2;
 const current_label = "current";
-pub const max_inline_rows: u16 = header_rows + gap_rows + effort_menu.max_options;
-
-const Layout = struct {
-    show_header: bool = false,
-    first_item_row: u16 = 0,
-    visible_items: u16 = 0,
-
-    /// The title and the gap under it come first; a short footer drops the
-    /// gap, then the title, before it drops a level.
-    fn build(projection: Projection, row_budget: u16) Layout {
-        const count = projection.levels.len;
-        if (row_budget == 0 or count == 0) return .{};
-        if (row_budget == 1) return .{ .visible_items = 1 };
-        const first_item_row: u16 = if (row_budget >= 3) header_rows + gap_rows else header_rows;
-        return .{
-            .show_header = true,
-            .first_item_row = first_item_row,
-            .visible_items = @intCast(@min(count, row_budget - first_item_row)),
-        };
-    }
-
-    fn rowCount(self: Layout) u16 {
-        return self.first_item_row + self.visible_items;
-    }
-};
+pub const max_inline_rows: u16 = header_rows + effort_menu.max_options;
 
 pub fn menuRowCount(projection: Projection, row_budget: u16) u16 {
-    return Layout.build(projection, row_budget).rowCount();
+    return frameLayout(projection, row_budget).row_count;
 }
 
 pub fn visibleItems(projection: Projection, row_budget: u16) u16 {
-    return Layout.build(projection, row_budget).visible_items;
+    return frameLayout(projection, row_budget).visible_items;
 }
 
 /// The first level shown: `projection.window_start`, moved only as far as
 /// it takes to show the highlighted level.
 pub fn windowStart(projection: Projection, row_budget: u16) usize {
-    const visible = visibleItems(projection, row_budget);
-    return list_window.updateEdgeStart(projection.window_start, projection.levels.len, projection.selected, @max(visible, 1));
+    return frameLayout(projection, row_budget).window_start;
 }
 
 pub fn composeEffortMenuRow(
@@ -65,53 +40,66 @@ pub fn composeEffortMenuRow(
     width: u16,
     row_budget: u16,
 ) !std.ArrayList(u8) {
-    var row: std.ArrayList(u8) = .empty;
-    errdefer row.deinit(alloc);
-    const layout = Layout.build(projection, row_budget);
-    if (width == 0 or row_index >= layout.rowCount()) return row;
-    if (layout.show_header and row_index == 0) return composeHeaderRow(alloc, projection, width);
-    if (row_index < layout.first_item_row) return row;
-
-    const index = windowStart(projection, row_budget) + (row_index - layout.first_item_row);
-    if (index >= projection.levels.len) return row;
-    const selected = index == projection.selected;
-    const indent: usize = if (width <= 2) 0 else 2;
-    try row.appendNTimes(alloc, ' ', indent);
-    try row.appendSlice(alloc, if (selected) ui_render.selected_completion_style else ui_render.dim_style);
-    const label = projection.levels[index].displayLabel();
-    const marker_column = indent + labelColumnWidth(projection) + 2;
-    const show_marker = index == projection.current and marker_column + current_label.len <= width;
-    try row_text.appendSingleLineEllipsized(alloc, &row, label, @as(usize, width) -| indent);
-    try row.appendSlice(alloc, ui_render.reset_style);
-    if (show_marker) {
-        try row_text.appendSpacesToColumn(alloc, &row, marker_column);
-        try row.appendSlice(alloc, ui_render.dim_style);
-        try row.appendSlice(alloc, current_label);
-        try row.appendSlice(alloc, ui_render.reset_style);
-    }
-    return row;
+    var title_buf: [160]u8 = undefined;
+    const title = if (projection.model.len > 0)
+        std.mem.print(&title_buf, "effort · {s}", .{projection.model}) catch "effort"
+    else
+        "effort";
+    return menu_frame.composeRow(alloc, .{
+        .title = title,
+        .ctx = &projection,
+        .item_count = projection.levels.len,
+        .column_count = 2,
+        .cell = cell,
+        .selected = projection.selected,
+        .window_start = projection.window_start,
+        .list_cap = listCap(projection, row_budget),
+    }, row_index, width, row_budget);
 }
 
-fn composeHeaderRow(alloc: Allocator, projection: Projection, width: u16) !std.ArrayList(u8) {
-    var row: std.ArrayList(u8) = .empty;
-    errdefer row.deinit(alloc);
-    var title_buf: [32]u8 = undefined;
-    const title = std.mem.print(&title_buf, "Effort {d}", .{projection.levels.len}) catch "Effort";
-    try row.appendSlice(alloc, ui_render.selected_completion_style);
-    try row_text.appendClipped(alloc, &row, title, width);
-    try row.appendSlice(alloc, ui_render.reset_style);
-    const title_width = display_width.visibleWidth(title);
-    if (projection.model.len > 0 and title_width + 2 < width) {
-        try row.appendSlice(alloc, "  ");
-        try row.appendSlice(alloc, ui_render.dim_style);
-        try row_text.appendSingleLineMiddleEllipsized(alloc, &row, projection.model, width - title_width - 2);
-        try row.appendSlice(alloc, ui_render.reset_style);
-    }
-    return row;
+/// List rows within `row_budget`; a budget too short for the title gives
+/// every row to the list.
+fn listCap(projection: Projection, row_budget: u16) u16 {
+    const rows = if (row_budget > header_rows) row_budget - header_rows else row_budget;
+    return @min(@as(u16, @intCast(@max(projection.levels.len, 1))), rows);
 }
 
-fn labelColumnWidth(projection: Projection) usize {
-    var widest: usize = 0;
-    for (projection.levels) |*level| widest = @max(widest, display_width.visibleWidth(level.displayLabel()));
-    return widest;
+fn frameLayout(projection: Projection, row_budget: u16) menu_frame.Layout {
+    return menu_frame.listLayout(projection.levels.len, projection.selected, projection.window_start, listCap(projection, row_budget), row_budget);
+}
+
+fn cell(ctx: *const anyopaque, item: usize, column: usize, _: []u8) []const u8 {
+    const projection: *const Projection = @ptrCast(@alignCast(ctx));
+    if (item >= projection.levels.len) return "";
+    if (column == 0) return projection.levels[item].displayLabel();
+    return if (item == projection.current) current_label else "";
+}
+
+test "effort menu draws the shared frame with the model after the title" {
+    const alloc = std.testing.allocator;
+    const levels = [_]types.ReasoningEffort{ .auto, .literal("low"), .literal("high") };
+    const projection: Projection = .{ .model = "provider/model", .levels = &levels, .selected = 1, .current = 0 };
+    const rows = menuRowCount(projection, max_inline_rows);
+    try std.testing.expectEqual(@as(u16, 5), rows);
+
+    var grid = try vt_emulator.Grid.init(alloc, 60, rows);
+    defer grid.deinit();
+    var row_index: u16 = 0;
+    while (row_index < rows) : (row_index += 1) {
+        var row = try composeEffortMenuRow(alloc, projection, row_index, 60, max_inline_rows);
+        defer row.deinit(alloc);
+        if (row_index == 3) try std.testing.expect(std.mem.find(u8, row.items, ui_render.selected_completion_style) != null);
+        if (row_index == 2) try std.testing.expect(std.mem.find(u8, row.items, ui_render.selected_completion_style) == null);
+        var cursor_buf: [32]u8 = undefined;
+        try grid.feed(try std.mem.print(&cursor_buf, "\x1b[{d};1H", .{row_index + 1}));
+        try grid.feed(row.items);
+    }
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(alloc);
+    const expected = [_][]const u8{ "effort · provider/model", "", "  default      current", "  low", "  high" };
+    for (expected, 1..) |line, at| {
+        text.clearRetainingCapacity();
+        try grid.rowTextTrimmed(@intCast(at), &text);
+        try std.testing.expectEqualStrings(line, text.items);
+    }
 }

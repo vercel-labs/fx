@@ -672,8 +672,8 @@ pub fn composeModelsMenuHintRow(alloc: Allocator, width: u16, ctrl_c_pending: bo
     return composeCatalogMenuHintRow(alloc, width, ctrl_c_pending, .provider, state);
 }
 
-pub fn composeResumeMenuHintRow(alloc: Allocator, width: u16, ctrl_c_pending: bool) !std.ArrayList(u8) {
-    return composeCatalogMenuHintRow(alloc, width, ctrl_c_pending, .scope, .{});
+pub fn composeResumeMenuHintRow(alloc: Allocator, width: u16, ctrl_c_pending: bool, state: CatalogHintState) !std.ArrayList(u8) {
+    return composeCatalogMenuHintRow(alloc, width, ctrl_c_pending, .scope, state);
 }
 
 /// fx's hint line: the widest of `variants` that fits, or the warning that
@@ -708,8 +708,11 @@ const help_menu_hint_variants = [_][]const u8{
     "tab enter esc",
 };
 
-pub fn composeHelpMenuHintRow(alloc: Allocator, width: u16, ctrl_c_pending: bool) !std.ArrayList(u8) {
-    return composeVariantHintRow(alloc, width, ctrl_c_pending, &help_menu_hint_variants);
+const empty_category_hint_variants = [_][]const u8{ "tab category     esc close", "tab category  esc", "tab  esc" };
+
+/// With no command to open, the hint names only Tab and Esc.
+pub fn composeHelpMenuHintRow(alloc: Allocator, width: u16, ctrl_c_pending: bool, has_items: bool) !std.ArrayList(u8) {
+    return composeVariantHintRow(alloc, width, ctrl_c_pending, if (has_items) &help_menu_hint_variants else &empty_category_hint_variants);
 }
 
 const effort_menu_hint_variants = [_][]const u8{
@@ -744,12 +747,14 @@ const settings_menu_hint_variants = [_][]const u8{
     "tab ←→ esc",
 };
 
+/// With no setting to change, the hint names only Tab and Esc.
 pub fn composeSettingsMenuHintRow(
     alloc: Allocator,
     width: u16,
     ctrl_c_pending: bool,
+    has_items: bool,
 ) !std.ArrayList(u8) {
-    return composeVariantHintRow(alloc, width, ctrl_c_pending, &settings_menu_hint_variants);
+    return composeVariantHintRow(alloc, width, ctrl_c_pending, if (has_items) &settings_menu_hint_variants else &empty_category_hint_variants);
 }
 
 pub fn composeCompactCommandMenuHintRow(

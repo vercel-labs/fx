@@ -16,6 +16,7 @@ import { platform, tmpdir } from "node:os";
 import { join } from "node:path";
 import { FX_BIN } from "../evals/eval-helpers";
 import { logLines, rootSessionIds, savedSessionIds, sessionDir, storeRoot } from "./saved-sessions";
+import { catalogMenuItemCount } from "./tui-render-assertions";
 import {
   FAKE_GATEWAY_MODEL,
   fakeGatewayFinalText,
@@ -374,9 +375,24 @@ function installLargeCatalog(
   expect(real.history_len).toBeGreaterThan(0);
 }
 
+// The sessions the picker shows, from its rows and its `↓ N more` row.
 function menuCount(text: string): number {
-  const match = stripAnsi(text).match(/Sessions (\d+)/);
-  return match ? Number(match[1]) : 0;
+  return catalogMenuItemCount(stripAnsi(text).split("\n"), "sessions") ?? 0;
+}
+
+// The picker draws only its selected row bold; tmux reports the bold
+// apart from the color.
+const BOLD_SGR = "\x1b[1m";
+
+// The plain text of the picker's bright row in a capture with its escapes.
+// The welcome header above the menu is bright too, so the search starts at
+// the picker's title.
+function selectedRowText(escapes: string): string | undefined {
+  const rows = escapes.split("\n");
+  const title = rows.findIndex((row) => stripAnsi(row).startsWith("sessions   <"));
+  if (title < 0) return undefined;
+  const line = rows.slice(title + 1).find((row) => row.includes(BOLD_SGR));
+  return line === undefined ? undefined : stripAnsi(line).trim();
 }
 
 async function waitForMenu(
@@ -387,7 +403,7 @@ async function waitForMenu(
   const visibleMarker = marker.slice(-7);
   return session.waitForPane((pane) => {
     const plain = stripAnsi(pane);
-    return plain.includes(visibleMarker) && plain.includes(`[${scope}]`) && menuCount(plain) > 0;
+    return plain.includes(visibleMarker) && plain.includes(`sessions   < ${scope} >`) && menuCount(plain) > 0;
   }, TIMEOUT * 4);
 }
 
@@ -417,14 +433,33 @@ function processStats(pid: number): { rssKib: number; threads: number; fileDescr
   return { rssKib, threads, fileDescriptors };
 }
 
+// Walks down to the last loaded session, which loads the next page, and
+// waits for it. The list is freshly loaded with its window at the top, so its
+// rows and its `↓ N more` row count the loaded sessions. Once the screen
+// settles, the selection rests on a session only if the page came; without
+// it, the selection stops on the load-more row.
 async function loadNextPage(session: TmuxSession, metrics: Metrics): Promise<void> {
   const before = menuCount(await session.capturePane());
   await time(
     metrics.page,
-    () => session.sendKeys(
-      Array.from({ length: before + 1 }, () => "Down").join(" "),
-    ),
-    () => session.waitForPane((pane) => menuCount(pane) > before, TIMEOUT * 4),
+    () => session.sendKeys(Array.from({ length: before }, () => "Down").join(" ")),
+    async () => {
+      const deadline = Date.now() + TIMEOUT * 4;
+      let last = "";
+      let stableSince = Date.now();
+      while (Date.now() < deadline) {
+        const escapes = await session.capturePaneEscapes();
+        if (escapes !== last) {
+          last = escapes;
+          stableSince = Date.now();
+        } else if (Date.now() - stableSince >= 250) {
+          const selected = selectedRowText(escapes);
+          if (selected !== undefined && !selected.startsWith("↓ ")) return;
+        }
+        await Bun.sleep(25);
+      }
+      throw new Error("the next page of sessions never loaded");
+    },
   );
 }
 
@@ -469,7 +504,7 @@ async function thrash(
     await time(
       metrics.resize,
       () => session.resizeWindow(width, height),
-      () => session.waitForPane((pane) => stripAnsi(pane).includes("[Current workspace]"), TIMEOUT),
+      () => session.waitForPane((pane) => stripAnsi(pane).includes("< Current workspace >"), TIMEOUT),
     );
     await time(
       metrics.close,
@@ -477,8 +512,8 @@ async function thrash(
       () => session.waitForPane((pane) => {
         const plain = stripAnsi(pane);
         return hasEmptyComposer(plain) &&
-          !plain.includes("[Current workspace]") &&
-          !plain.includes("[All workspaces]");
+          !plain.includes("< Current workspace >") &&
+          !plain.includes("< All workspaces >");
       }, TIMEOUT),
     );
     expect(session.paneStatus().dead).toBe(false);
@@ -532,7 +567,7 @@ async function runStress(config: Config): Promise<Paths> {
     await session.sendKeys("Escape");
     await session.waitForPane((pane) => {
       const plain = stripAnsi(pane);
-      return hasEmptyComposer(plain) && !plain.includes("[Current workspace]");
+      return hasEmptyComposer(plain) && !plain.includes("< Current workspace >");
     }, TIMEOUT);
     await session.sendText("/quit");
     expect(await session.waitForSessionEnd(TIMEOUT * 2)).toBe(true);

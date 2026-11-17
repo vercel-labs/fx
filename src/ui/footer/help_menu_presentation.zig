@@ -1,46 +1,32 @@
 const std = @import("std");
-const display_width = @import("../../core/shared/display_width.zig");
 const command_specs = @import("../../core/slash_commands/command_specs.zig");
-const picker_presentation = @import("picker_presentation.zig");
+const display_width = @import("../../core/shared/display_width.zig");
+const list_window = @import("../../core/shared/list_window.zig");
+const menu_frame = @import("menu_frame.zig");
 const render_input = @import("render_input.zig");
-const row_text = @import("row_text.zig");
 const ui_render = @import("../render.zig");
 const vt_emulator = @import("../../core/terminal/engine.zig");
 
 const Allocator = std.mem.Allocator;
 const HelpMenuProjection = render_input.HelpMenuProjection;
 
-const roomy_header_rows: u16 = 2;
-pub const max_visible_items: u16 = 20;
-pub const max_inline_rows: u16 = roomy_header_rows + max_visible_items;
+/// The title and the blank row under it.
+const header_rows: u16 = 2;
+/// The help catalog lists as many rows as the other menus, so it stays lean
+/// and the composer doesn't move while a filter narrows it.
+const list_rows: u16 = list_window.default_max_picker_rows;
+pub const max_inline_rows: u16 = header_rows + list_rows;
 
-const BodyRow = union(enum) {
-    none,
-    item: struct {
-        spec: *const command_specs.SlashSpec,
-        selected: bool,
-    },
-};
-
-const Layout = struct {
-    match_count: usize = 0,
-    selected: usize = 0,
-    first_item: usize = 0,
-    visible_items: u16 = 0,
-    body_start_row: u16 = 0,
-    row_count: u16 = 0,
-};
-
-pub fn menuRowCount(projection: HelpMenuProjection, width: u16, max_rows: u16) u16 {
-    return buildLayout(projection, width, max_rows).row_count;
+pub fn menuRowCount(projection: HelpMenuProjection, _: u16, max_rows: u16) u16 {
+    return frameLayout(projection, max_rows).row_count;
 }
 
 pub fn visibleNavigationItemsForBudget(
     projection: HelpMenuProjection,
-    width: u16,
+    _: u16,
     row_budget: u16,
 ) u16 {
-    return @max(buildLayout(projection, width, row_budget).visible_items, 1);
+    return @max(frameLayout(projection, row_budget).visible_items, 1);
 }
 
 pub fn composeHelpMenuRow(
@@ -50,236 +36,45 @@ pub fn composeHelpMenuRow(
     width: u16,
     row_count: u16,
 ) !std.ArrayList(u8) {
-    const empty: std.ArrayList(u8) = .empty;
-    if (width == 0 or row_index >= row_count) return empty;
-
-    const layout = buildLayout(projection, width, row_count);
-    if (row_index < layout.body_start_row) {
-        if (row_index == 0) return composeHeaderRow(alloc, projection, width);
-        return empty;
-    }
-    if (layout.match_count == 0) return composeEmptyRow(alloc, width);
-
-    const description_col = descriptionColumn(projection, width);
-    return switch (bodyRowAt(projection, layout, row_index - layout.body_start_row)) {
-        .none => empty,
-        .item => |item| composeCommandRow(alloc, item.spec.*, item.selected, width, description_col),
-    };
+    return menu_frame.composeRow(alloc, frameSpec(&projection, row_count), row_index, width, row_count);
 }
 
-fn buildLayout(projection: HelpMenuProjection, width: u16, max_rows: u16) Layout {
-    if (max_rows == 0) return .{};
-    const match_count = projection.filteredItemCount();
-    const selected = if (match_count == 0) 0 else projection.selected_index % match_count;
-    const show_header = max_rows > 2;
-    const body_start_row: u16 = if (show_header) roomy_header_rows else 0;
-    if (match_count == 0) {
-        return .{
-            .body_start_row = body_start_row,
-            .row_count = @min(max_rows, body_start_row + 1),
-        };
-    }
+/// List rows within `row_budget`; a budget too short for the title gives
+/// every row to the list.
+fn listCap(row_budget: u16) u16 {
+    return @min(list_rows, if (row_budget > header_rows) row_budget - header_rows else row_budget);
+}
 
-    const body_budget = max_rows - body_start_row;
-    var first_item = @min(projection.window_start, match_count - 1);
-    if (selected < first_item) first_item = selected;
-    var body = measureBody(projection, width, first_item, body_budget);
-    while (selected >= first_item + body.visible_items and first_item < selected) {
-        first_item += 1;
-        body = measureBody(projection, width, first_item, body_budget);
-    }
-    if (body.visible_items == 0) {
-        first_item = selected;
-        body = measureBody(projection, width, first_item, body_budget);
-    }
+fn selectedIndex(projection: HelpMenuProjection, count: usize) usize {
+    return if (count > 0) projection.selected_index % count else 0;
+}
+
+fn frameLayout(projection: HelpMenuProjection, row_budget: u16) menu_frame.Layout {
+    const count = projection.filteredItemCount();
+    return menu_frame.listLayout(count, selectedIndex(projection, count), projection.window_start, listCap(row_budget), row_budget);
+}
+
+fn frameSpec(projection: *const HelpMenuProjection, row_budget: u16) menu_frame.Spec {
+    const count = projection.filteredItemCount();
     return .{
-        .match_count = match_count,
-        .selected = selected,
-        .first_item = first_item,
-        .visible_items = body.visible_items,
-        .body_start_row = body_start_row,
-        .row_count = body_start_row + body.rows,
+        .title = "commands",
+        .active_tab = if (projection.category) |category| category.label() else "All",
+        .ctx = projection,
+        .item_count = count,
+        .column_count = 2,
+        .cell = cell,
+        .selected = selectedIndex(projection.*, count),
+        .window_start = projection.window_start,
+        .list_cap = listCap(row_budget),
+        .empty_message = if (projection.query.len > 0) "no matching commands." else "no commands.",
+        .empty_hint = if (projection.category != null and projection.query.len == 0) "press tab to change the category." else "",
     };
 }
 
-const BodyMeasurement = struct {
-    visible_items: u16 = 0,
-    rows: u16 = 0,
-};
-
-fn measureBody(projection: HelpMenuProjection, width: u16, first_item: usize, row_budget: u16) BodyMeasurement {
-    var measurement: BodyMeasurement = .{};
-    _ = width;
-    var display_index = first_item;
-    while (projection.itemAt(display_index) != null) : (display_index += 1) {
-        const required: u16 = 1;
-        if (measurement.rows + required > row_budget) break;
-        measurement.rows += required;
-        measurement.visible_items += 1;
-        if (measurement.visible_items == max_visible_items) break;
-    }
-    return measurement;
-}
-
-fn bodyRowAt(projection: HelpMenuProjection, layout: Layout, target: u16) BodyRow {
-    var row: u16 = 0;
-    var offset: usize = 0;
-    while (offset < layout.visible_items) : (offset += 1) {
-        const display_index = layout.first_item + offset;
-        const spec = projection.itemAt(display_index) orelse return .none;
-        if (row == target) return .{ .item = .{
-            .spec = spec,
-            .selected = display_index == layout.selected,
-        } };
-        row += 1;
-    }
-    return .none;
-}
-
-fn composeHeaderRow(alloc: Allocator, projection: HelpMenuProjection, width: u16) !std.ArrayList(u8) {
-    var wide: std.ArrayList(u8) = .empty;
-    defer wide.deinit(alloc);
-    try appendHeaderTitle(alloc, &wide, projection.filteredItemCount());
-    try wide.appendSlice(alloc, "  ");
-    try appendCategoryTab(alloc, &wide, null, projection.category == null);
-    inline for (@typeInfo(command_specs.SlashPresentationCategory).@"enum".field_values) |field_value| {
-        const category: command_specs.SlashPresentationCategory = @fromBackingInt(@intCast(field_value));
-        try wide.appendSlice(alloc, "  ");
-        try appendCategoryTab(alloc, &wide, category, projection.category == category);
-    }
-    if (display_width.visibleWidthIgnoringAnsi(wide.items) <= width) {
-        return cloneClippedRow(alloc, wide.items, width);
-    }
-
-    const category_count = @typeInfo(command_specs.SlashPresentationCategory).@"enum".field_names.len + 1;
-    const active_index = helpCategoryIndex(projection.category);
-    var packed_row: std.ArrayList(u8) = .empty;
-    defer packed_row.deinit(alloc);
-    var prefix_count = category_count - 1;
-    while (prefix_count > 0) : (prefix_count -= 1) {
-        packed_row.clearRetainingCapacity();
-        try appendHeaderTitle(alloc, &packed_row, projection.filteredItemCount());
-        for (0..prefix_count) |index| {
-            const category = helpCategoryAt(index);
-            try packed_row.appendSlice(alloc, "  ");
-            try appendCategoryTab(alloc, &packed_row, category, active_index == index);
-        }
-        try packed_row.appendSlice(alloc, "  ");
-        try packed_row.appendSlice(alloc, ui_render.dim_style);
-        try packed_row.appendSlice(alloc, "…");
-        try packed_row.appendSlice(alloc, ui_render.reset_style);
-        if (active_index >= prefix_count) {
-            try packed_row.appendSlice(alloc, "  ");
-            try appendCategoryTab(alloc, &packed_row, projection.category, true);
-        }
-        if (display_width.visibleWidthIgnoringAnsi(packed_row.items) <= width) {
-            return cloneClippedRow(alloc, packed_row.items, width);
-        }
-    }
-
-    var compact: std.ArrayList(u8) = .empty;
-    defer compact.deinit(alloc);
-    try appendHeaderTitle(alloc, &compact, projection.filteredItemCount());
-    try compact.appendSlice(alloc, "  ");
-    try appendCategoryTab(alloc, &compact, projection.category, true);
-    if (display_width.visibleWidthIgnoringAnsi(compact.items) <= width) {
-        return cloneClippedRow(alloc, compact.items, width);
-    }
-
-    compact.clearRetainingCapacity();
-    try appendCategoryTab(alloc, &compact, projection.category, true);
-    return cloneClippedRow(alloc, compact.items, width);
-}
-
-fn helpCategoryAt(index: usize) ?command_specs.SlashPresentationCategory {
-    if (index == 0) return null;
-    return @fromBackingInt(@intCast(index - 1));
-}
-
-fn helpCategoryIndex(category: ?command_specs.SlashPresentationCategory) usize {
-    return if (category) |value| @backingInt(value) + 1 else 0;
-}
-
-fn appendHeaderTitle(alloc: Allocator, row: *std.ArrayList(u8), count: usize) !void {
-    try row.appendSlice(alloc, ui_render.selected_completion_style);
-    var buf: [48]u8 = undefined;
-    const title = std.mem.print(&buf, "Commands {d}", .{count}) catch "Commands";
-    try row.appendSlice(alloc, title);
-    try row.appendSlice(alloc, ui_render.reset_style);
-}
-
-fn appendCategoryTab(
-    alloc: Allocator,
-    row: *std.ArrayList(u8),
-    category: ?command_specs.SlashPresentationCategory,
-    active: bool,
-) !void {
-    try row.appendSlice(alloc, if (active) ui_render.selected_completion_style else ui_render.dim_style);
-    if (active) try row.append(alloc, '[');
-    try row.appendSlice(alloc, if (category) |value| value.label() else "All");
-    if (active) try row.append(alloc, ']');
-    try row.appendSlice(alloc, ui_render.reset_style);
-}
-
-fn composeCommandRow(
-    alloc: Allocator,
-    spec: command_specs.SlashSpec,
-    selected: bool,
-    width: u16,
-    description_col: usize,
-) !std.ArrayList(u8) {
-    var row: std.ArrayList(u8) = .empty;
-    errdefer row.deinit(alloc);
-    const indent: usize = if (width <= 2) 0 else 2;
-    const gutter: usize = if (description_col >= indent + picker_presentation.inline_picker_column_gap_width)
-        picker_presentation.inline_picker_column_gap_width
-    else
-        0;
-    if (indent > 0) try row.appendSlice(alloc, "  ");
-
-    try row.appendSlice(alloc, if (selected) ui_render.selected_completion_style else ui_render.dim_style);
-    try row_text.appendSingleLineEllipsized(alloc, &row, spec.command, description_col -| indent -| gutter);
-    try row.appendSlice(alloc, ui_render.reset_style);
-    try row_text.appendSpacesToColumn(alloc, &row, description_col);
-
-    try row.appendSlice(alloc, if (selected) ui_render.selected_completion_style else ui_render.dim_style);
-    try row_text.appendSingleLineEllipsized(
-        alloc,
-        &row,
-        spec.completion_description.?,
-        @as(usize, width) -| description_col,
-    );
-    try row.appendSlice(alloc, ui_render.reset_style);
-    return row;
-}
-
-fn descriptionColumn(projection: HelpMenuProjection, width: u16) usize {
-    const indent: usize = if (width <= 2) 0 else 2;
-    var widest_command_width: usize = 0;
-    var display_index: usize = 0;
-    while (projection.itemAt(display_index)) |spec| : (display_index += 1) {
-        widest_command_width = @max(
-            widest_command_width,
-            display_width.visibleWidth(spec.command),
-        );
-    }
-    return @min(indent + widest_command_width + picker_presentation.inline_picker_column_gap_width, width);
-}
-
-fn composeEmptyRow(alloc: Allocator, width: u16) !std.ArrayList(u8) {
-    var row: std.ArrayList(u8) = .empty;
-    errdefer row.deinit(alloc);
-    try row.appendSlice(alloc, ui_render.dim_style);
-    try row_text.appendSingleLineEllipsized(alloc, &row, "No commands found.", width);
-    try row.appendSlice(alloc, ui_render.reset_style);
-    return row;
-}
-
-fn cloneClippedRow(alloc: Allocator, text: []const u8, width: u16) !std.ArrayList(u8) {
-    var row: std.ArrayList(u8) = .empty;
-    errdefer row.deinit(alloc);
-    try row_text.appendClipped(alloc, &row, text, width);
-    return row;
+fn cell(ctx: *const anyopaque, item: usize, column: usize, _: []u8) []const u8 {
+    const projection: *const HelpMenuProjection = @ptrCast(@alignCast(ctx));
+    const spec = projection.itemAt(item) orelse return "";
+    return if (column == 0) spec.command else spec.completion_description orelse "";
 }
 
 const help_menu_test_specs = [_]command_specs.SlashSpec{
@@ -289,171 +84,95 @@ const help_menu_test_specs = [_]command_specs.SlashSpec{
 };
 const help_menu_test_registry = command_specs.SlashRegistry{ .commands = help_menu_test_specs[0..] };
 
-test "help menu places descriptions after the widest matching command" {
-    const alloc = std.testing.allocator;
-    const projection: render_input.HelpMenuProjection = .{
-        .active = true,
-        .registry = help_menu_test_registry,
-        .selected_index = 0,
-    };
-    const rows = menuRowCount(projection, 160, 20);
-
-    var header = try composeHelpMenuRow(alloc, projection, 0, 160, rows);
-    defer header.deinit(alloc);
-    try std.testing.expect(std.mem.find(u8, header.items, "Commands 3") != null);
-
-    var selected = try composeHelpMenuRow(alloc, projection, 2, 160, rows);
-    defer selected.deinit(alloc);
-    try std.testing.expect(std.mem.find(u8, selected.items, "/help") != null);
-    try std.testing.expect(std.mem.find(u8, selected.items, "●") == null);
-    try std.testing.expect(std.mem.find(u8, selected.items, "show available slash commands") != null);
-    try std.testing.expectEqual(@as(?usize, null), std.mem.findScalar(u8, selected.items, '\n'));
-    const description_start = std.mem.find(u8, selected.items, "show available slash commands").?;
-    const selected_style_start = description_start - ui_render.selected_completion_style.len;
-    try std.testing.expectEqualStrings(
-        ui_render.selected_completion_style,
-        selected.items[selected_style_start..description_start],
-    );
-    try std.testing.expectEqual(
-        @as(usize, 13),
-        display_width.visibleWidthIgnoringAnsi(selected.items[0..description_start]),
-    );
-
-    const narrow_rows = menuRowCount(projection, 22, 20);
-    try std.testing.expectEqual(rows, narrow_rows);
-    try std.testing.expectEqual(@as(usize, 13), descriptionColumn(projection, 22));
-    var narrow = try composeHelpMenuRow(alloc, projection, 2, 22, narrow_rows);
-    defer narrow.deinit(alloc);
-    try std.testing.expect(std.mem.find(u8, narrow.items, "/help") != null);
-    try std.testing.expect(display_width.visibleWidthIgnoringAnsi(narrow.items) <= 22);
-    try std.testing.expect(std.mem.findScalar(u8, narrow.items, '\n') == null);
-}
-
-test "help menu keeps a four column gutter after command names" {
-    const alloc = std.testing.allocator;
-    const long_specs = [_]command_specs.SlashSpec{
-        .{ .kind = .permissions, .command = "/permissions", .help_entry = "/permissions [ask|auto|remember|revoke|full-access|reset]", .completion_description = "choose permission behavior", .presentation_category = .security },
-    };
-    const projection: render_input.HelpMenuProjection = .{
-        .active = true,
-        .registry = .{ .commands = long_specs[0..] },
-    };
-    const rows = menuRowCount(projection, 160, 12);
-    var item = try composeHelpMenuRow(alloc, projection, 2, 160, rows);
-    defer item.deinit(alloc);
-
-    const description_start = std.mem.find(u8, item.items, "choose permission behavior").?;
-    const description_col = display_width.visibleWidthIgnoringAnsi(item.items[0..description_start]);
-    try std.testing.expectEqual(@as(usize, 18), description_col);
-    try std.testing.expect(std.mem.find(u8, item.items[0..description_start], "…") == null);
-    try std.testing.expect(std.mem.find(u8, item.items, "[ask") == null);
-}
-
-test "help menu search keeps headings non-selectable and reports empty results" {
-    const alloc = std.testing.allocator;
-    const projection: render_input.HelpMenuProjection = .{
-        .active = true,
-        .registry = help_menu_test_registry,
-        .query = "clipboard",
-    };
-    const rows = menuRowCount(projection, 80, 12);
-    try std.testing.expectEqual(@as(u16, 3), rows);
-
-    var item = try composeHelpMenuRow(alloc, projection, 2, 80, rows);
-    defer item.deinit(alloc);
-    try std.testing.expect(std.mem.find(u8, item.items, "/paste") != null);
-
-    const empty_projection: render_input.HelpMenuProjection = .{
-        .active = true,
-        .registry = help_menu_test_registry,
-        .query = "no command can match this query",
-    };
-    const empty_rows = menuRowCount(empty_projection, 80, 12);
-    var empty = try composeHelpMenuRow(alloc, empty_projection, empty_rows - 1, 80, empty_rows);
-    defer empty.deinit(alloc);
-    try std.testing.expect(std.mem.find(u8, empty.items, "No commands found.") != null);
-}
-
-test "help menu renders category tabs and flat commands through the VT" {
-    const alloc = std.testing.allocator;
-    const width: u16 = 120;
-    const projection: render_input.HelpMenuProjection = .{
-        .active = true,
-        .registry = help_menu_test_registry,
-    };
-    const rows = menuRowCount(projection, width, 8);
-
+/// Draws every menu row through the VT and returns the plain text, one line
+/// per row. The caller owns the returned text.
+fn renderPlain(alloc: Allocator, projection: HelpMenuProjection, width: u16, budget: u16) ![]u8 {
+    const rows = menuRowCount(projection, width, budget);
     var grid = try vt_emulator.Grid.init(alloc, width, rows);
     defer grid.deinit();
     var row_index: u16 = 0;
     while (row_index < rows) : (row_index += 1) {
         var row = try composeHelpMenuRow(alloc, projection, row_index, width, rows);
         defer row.deinit(alloc);
+        try std.testing.expect(display_width.visibleWidthIgnoringAnsi(row.items) <= width);
         var cursor_buf: [32]u8 = undefined;
-        const cursor = try std.mem.print(&cursor_buf, "\x1b[{d};1H", .{row_index + 1});
-        try grid.feed(cursor);
+        try grid.feed(try std.mem.print(&cursor_buf, "\x1b[{d};1H", .{row_index + 1}));
         try grid.feed(row.items);
     }
-
     var text: std.ArrayList(u8) = .empty;
-    defer text.deinit(alloc);
-    try grid.rowTextTrimmed(1, &text);
-    try std.testing.expect(std.mem.find(u8, text.items, "Commands 3") != null);
-    try std.testing.expect(std.mem.find(u8, text.items, "[All]") != null);
-    try std.testing.expect(std.mem.find(u8, text.items, "General") != null);
-    text.clearRetainingCapacity();
-    try grid.rowTextTrimmed(3, &text);
-    try std.testing.expect(std.mem.find(u8, text.items, "/help") != null);
-    try std.testing.expect(std.mem.find(u8, text.items, "General") == null);
+    errdefer text.deinit(alloc);
+    var line: std.ArrayList(u8) = .empty;
+    defer line.deinit(alloc);
+    row_index = 1;
+    while (row_index <= rows) : (row_index += 1) {
+        line.clearRetainingCapacity();
+        try grid.rowTextTrimmed(row_index, &line);
+        try text.appendSlice(alloc, line.items);
+        try text.append(alloc, '\n');
+    }
+    return text.toOwnedSlice(alloc);
 }
 
-test "help menu packs more filters while preserving a far active filter in the VT" {
+test "help menu draws the shared frame: gray title with its category, aligned columns, fixed height" {
     const alloc = std.testing.allocator;
-    const width: u16 = 100;
-    var specs: [37]command_specs.SlashSpec = undefined;
-    for (&specs) |*spec| {
-        spec.* = .{
-            .kind = .help,
-            .command = "/help",
-            .help_entry = "/help",
-            .completion_description = "show available slash commands",
-            .presentation_category = .general,
-        };
-    }
-    specs[specs.len - 1].presentation_category = .product;
-    const registry = command_specs.SlashRegistry{ .commands = &specs };
+    const projection: HelpMenuProjection = .{ .active = true, .registry = help_menu_test_registry };
+    const text = try renderPlain(alloc, projection, 100, 22);
+    defer alloc.free(text);
+    // The tall budget the footer offers still gives the lean height.
+    try std.testing.expectEqualStrings(
+        \\commands   < All >
+        \\
+        \\  /help        show available slash commands
+        \\  /status      show runtime configuration
+        \\  /paste       attach an image from the clipboard when supported
+        \\
+        \\
+        \\
+        \\
+    , text);
+    try std.testing.expectEqual(max_inline_rows, menuRowCount(projection, 100, 22));
 
-    const all_projection: render_input.HelpMenuProjection = .{
-        .active = true,
-        .registry = registry,
-    };
-    var all_row = try composeHelpMenuRow(alloc, all_projection, 0, width, 8);
-    defer all_row.deinit(alloc);
-    var all_grid = try vt_emulator.Grid.init(alloc, width, 1);
-    defer all_grid.deinit();
-    try all_grid.feed(all_row.items);
-    var text: std.ArrayList(u8) = .empty;
-    defer text.deinit(alloc);
-    try all_grid.rowTextTrimmed(1, &text);
-    try std.testing.expect(std.mem.find(u8, text.items, "[All]") != null);
-    try std.testing.expect(std.mem.find(u8, text.items, "General") != null);
-    try std.testing.expect(std.mem.find(u8, text.items, "Session") != null);
-    try std.testing.expect(std.mem.find(u8, text.items, "…") != null);
+    // Only the selected row is bright, from its command through its description.
+    var selected = try composeHelpMenuRow(alloc, projection, 2, 100, max_inline_rows);
+    defer selected.deinit(alloc);
+    try std.testing.expect(std.mem.startsWith(u8, selected.items, ui_render.selected_completion_style));
+    var other = try composeHelpMenuRow(alloc, projection, 3, 100, max_inline_rows);
+    defer other.deinit(alloc);
+    try std.testing.expect(std.mem.find(u8, other.items, ui_render.selected_completion_style) == null);
+}
 
-    const product_projection: render_input.HelpMenuProjection = .{
-        .active = true,
-        .category = .product,
-        .registry = registry,
-    };
-    var product_row = try composeHelpMenuRow(alloc, product_projection, 0, width, 8);
-    defer product_row.deinit(alloc);
-    var product_grid = try vt_emulator.Grid.init(alloc, width, 1);
-    defer product_grid.deinit();
-    try product_grid.feed(product_row.items);
-    text.clearRetainingCapacity();
-    try product_grid.rowTextTrimmed(1, &text);
-    try std.testing.expect(std.mem.find(u8, text.items, "All") != null);
-    try std.testing.expect(std.mem.find(u8, text.items, "General") != null);
-    try std.testing.expect(std.mem.find(u8, text.items, "…") != null);
-    try std.testing.expect(std.mem.find(u8, text.items, "[Product]") != null);
+test "help menu shows five commands and a more row when the catalog is long" {
+    const alloc = std.testing.allocator;
+    var specs: [12]command_specs.SlashSpec = undefined;
+    for (&specs) |*spec| spec.* = help_menu_test_specs[0];
+    const projection: HelpMenuProjection = .{ .active = true, .registry = .{ .commands = &specs } };
+    const text = try renderPlain(alloc, projection, 80, 22);
+    defer alloc.free(text);
+    try std.testing.expectEqual(@as(usize, 5), std.mem.count(u8, text, "/help "));
+    try std.testing.expect(std.mem.find(u8, text, "  ↓ 7 more\n") != null);
+    try std.testing.expectEqual(@as(u16, 5), visibleNavigationItemsForBudget(projection, 80, 22));
+}
+
+test "help menu names the active category and says why the list is empty" {
+    const alloc = std.testing.allocator;
+    const media: HelpMenuProjection = .{ .active = true, .registry = help_menu_test_registry, .category = .media };
+    const media_text = try renderPlain(alloc, media, 80, 22);
+    defer alloc.free(media_text);
+    try std.testing.expect(std.mem.startsWith(u8, media_text, "commands   < Media >\n\n  /paste"));
+    try std.testing.expect(std.mem.find(u8, media_text, "General") == null);
+
+    const missing: HelpMenuProjection = .{ .active = true, .registry = help_menu_test_registry, .query = "no command can match this query" };
+    const missing_text = try renderPlain(alloc, missing, 80, 22);
+    defer alloc.free(missing_text);
+    try std.testing.expect(std.mem.find(u8, missing_text, "  no matching commands.\n") != null);
+    try std.testing.expectEqual(max_inline_rows, menuRowCount(missing, 80, 22));
+}
+
+test "help menu clips descriptions on a narrow terminal and keeps every row inside it" {
+    const alloc = std.testing.allocator;
+    const projection: HelpMenuProjection = .{ .active = true, .registry = help_menu_test_registry };
+    const text = try renderPlain(alloc, projection, 30, 22);
+    defer alloc.free(text);
+    try std.testing.expect(std.mem.find(u8, text, "  /paste") != null);
+    try std.testing.expect(std.mem.find(u8, text, "…") != null);
 }

@@ -19,7 +19,7 @@ import {
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { envWithoutFxHome, FX_BIN, runFx } from "../evals/eval-helpers";
-import { findFooterBlocks } from "./tui-render-assertions";
+import { catalogMenuItemCount, findFooterBlocks } from "./tui-render-assertions";
 import {
   composerContains,
   FAKE_GATEWAY_MODEL,
@@ -410,11 +410,15 @@ async function waitForSessionPicker(session: TmuxSession): Promise<string> {
   return session.waitForPane(
     (pane) => {
       const plain = stripAnsi(pane);
-      return plain.includes("Sessions") &&
-        (plain.includes("[Current workspace]") || plain.includes("[All workspaces]"));
+      return plain.includes("sessions   < Current workspace >") || plain.includes("sessions   < All workspaces >");
     },
     TIMEOUT,
   );
+}
+
+// The sessions the picker lists, from its rows and its `↓ N more` row.
+function sessionCount(pane: string): number | null {
+  return catalogMenuItemCount(stripAnsi(pane).split("\n"), "sessions");
 }
 
 async function waitForSessionPickerClosed(session: TmuxSession): Promise<string> {
@@ -422,7 +426,7 @@ async function waitForSessionPickerClosed(session: TmuxSession): Promise<string>
     (pane) => {
       const plain = stripAnsi(pane);
       return hasEmptyComposer(plain) &&
-        !plain.includes("Sessions");
+        !plain.includes("sessions   <");
     },
     TIMEOUT,
   );
@@ -450,7 +454,7 @@ function visibleSessionPickerEntries(escapes: string): SessionPickerEntry[] {
     const trimmedTitle = title.trimStart();
     if (
       trimmedTitle.length === 0 ||
-      trimmedTitle.startsWith("Sessions") ||
+      trimmedTitle.startsWith("sessions") ||
       trimmedTitle.startsWith("Tab ")
     ) {
       continue;
@@ -2973,7 +2977,7 @@ test.skipIf(!tmuxAvailable())(
       );
       const refused = stripAnsi(await active.capturePane());
       expect(refused).toContain(draft);
-      expect(refused).not.toContain("Sessions");
+      expect(refused).not.toContain("sessions   <");
       expect(gateway.requests).toHaveLength(1);
 
       await active.sendKeys("C-u");
@@ -2983,7 +2987,7 @@ test.skipIf(!tmuxAvailable())(
       );
       await active.sendHexBytes(["1b", "5b", "31", "31", "34", "3b", "39", "75"]);
       await active.waitForPane(
-        (pane) => stripAnsi(pane).includes("Sessions"),
+        (pane) => stripAnsi(pane).includes("sessions   <"),
         TIMEOUT,
       );
       await active.sendKeys("Escape");
@@ -4900,7 +4904,7 @@ test.skipIf(!tmuxAvailable())(
       await contender.sendKeys("Enter");
       await contender.waitForPane(
         (pane) => stripAnsi(pane).includes(
-          "This session is open in another fx. Close it there, then press enter to retry.",
+          "this session is open in another fx · close it there, then press enter to retry.",
         ),
         1_000,
       );
@@ -4909,7 +4913,7 @@ test.skipIf(!tmuxAvailable())(
       const contendedPicker = stripAnsi(await contender.capturePane());
       expect(contendedPicker).toContain(savedTitle);
       expect(contendedPicker).toContain(
-        "This session is open in another fx. Close it there, then press enter to retry.",
+        "this session is open in another fx · close it there, then press enter to retry.",
       );
       expect(contendedPicker).not.toContain("SessionBusy");
       const contendedEntries = visibleSessionPickerEntries(
@@ -5504,7 +5508,7 @@ test.skipIf(!tmuxAvailable())(
       const picker = stripAnsi(
         await active.waitForPane(
           (pane) =>
-            pane.includes("Sessions 0") && pane.includes("No sessions found."),
+            sessionCount(pane) === 0 && pane.includes("no sessions."),
           TIMEOUT,
         ),
       );
@@ -5632,7 +5636,7 @@ async function resumeFromPicker(
     height: 32,
   });
   await active.waitForPane(
-    (pane) => pane.includes("Sessions 1") && pane.includes("enter resume"),
+    (pane) => sessionCount(pane) === 1 && pane.includes("enter resume"),
     TIMEOUT,
   );
   await active.sendKeys("Enter");
@@ -5798,7 +5802,7 @@ test.skipIf(!tmuxAvailable())(
       });
       const picker = await active.waitForPane(
         (pane) =>
-          pane.includes("Sessions 1") &&
+          sessionCount(pane) === 1 &&
           pane.includes("Save a turn for resume.") &&
           pane.includes("enter resume"),
         TIMEOUT,
@@ -7646,8 +7650,8 @@ test.skipIf(!tmuxAvailable())(
       await active.sendText("/resume");
       await waitForSessionPicker(active);
       const currentPicker = stripAnsi(await active.capturePane());
-      expect(currentPicker).toContain("Sessions 1");
-      expect(currentPicker).toContain("[Current workspace]");
+      expect(sessionCount(currentPicker)).toBe(1);
+      expect(currentPicker).toContain("sessions   < Current workspace >");
       expect(currentPicker).toContain("𝒇x");
       expect(currentPicker).toContain("Save the workspace A transcript.");
       expect(currentPicker).not.toContain("Save the workspace B transcript.");
@@ -7655,8 +7659,8 @@ test.skipIf(!tmuxAvailable())(
       await active.sendKeys("Tab");
       await active.waitForPane((pane) => {
         const plain = stripAnsi(pane);
-        return plain.includes("Sessions 2") &&
-          plain.includes("[All workspaces]") &&
+        return sessionCount(plain) === 2 &&
+          plain.includes("sessions   < All workspaces >") &&
           plain.includes("Save the workspace B transcript.");
       }, TIMEOUT);
       const allPicker = stripAnsi(await active.capturePane());
@@ -7667,7 +7671,7 @@ test.skipIf(!tmuxAvailable())(
       await active.sendLiteralText("workspace B");
       await active.waitForPane((pane) => {
         const plain = stripAnsi(pane);
-        return plain.includes("Sessions 1") &&
+        return sessionCount(plain) === 1 &&
           plain.includes("Save the workspace B transcript.") &&
           !plain.includes("Save the workspace A transcript.");
       }, TIMEOUT);
@@ -7754,8 +7758,12 @@ test.skipIf(!tmuxAvailable())(
       });
       await active.waitForComposer(TIMEOUT);
       await active.sendText("/resume");
-      const pane = stripAnsi(await waitForSessionPicker(active));
-      expect(pane).toContain("Sessions 3");
+      // At this width a row shows only its title, so the rows below count
+      // the sessions.
+      const pane = stripAnsi(await active.waitForPane((current) => {
+        const plain = stripAnsi(current);
+        return plain.includes("sessions   <") && ["alpha", "beta", "gamma"].every((suffix) => plain.includes(suffix));
+      }, TIMEOUT));
       for (const suffix of ["alpha", "beta", "gamma"]) {
         expect(pane).toContain(suffix);
       }
@@ -7873,8 +7881,10 @@ test.skipIf(!tmuxAvailable())(
       expect(reversedEntries.find((entry) => entry.selected)!.row).toBe(firstVisibleRow + visibleCount - 2);
 
       const atReversedSelection = (await active.capturePane()).split("\n");
-      const headerRow = atReversedSelection.findIndex((line) => line.includes("Sessions 10"));
-      const loadMoreRow = atReversedSelection.findIndex((line) => line.includes("↓ Load more"));
+      const headerRow = atReversedSelection.findIndex((line) => /^sessions\s/.test(line));
+      // Loaded sessions below the window show as `↓ N more`; the load-more
+      // action takes that row once the window reaches the last of them.
+      const loadMoreRow = atReversedSelection.findIndex((line) => /↓ (\d+ more|load more)/.test(line));
       const hintRow = atReversedSelection.findIndex((line) => line.includes("tab scope"));
       expect(headerRow).toBeGreaterThanOrEqual(0);
       expect(loadMoreRow).toBeGreaterThan(headerRow);
@@ -7886,11 +7896,12 @@ test.skipIf(!tmuxAvailable())(
       }
       await active.waitForPane((pane) => {
         const plain = stripAnsi(pane);
-        return /Sessions 1[12]\b/.test(plain) && !plain.includes("Load more");
+        // The next page has loaded once the load-more row is gone.
+        return /^sessions\s/m.test(plain) && !plain.includes("load more");
       }, TIMEOUT);
       const afterFurtherScroll = (await active.capturePane()).split("\n");
-      expect(afterFurtherScroll.findIndex((line) => /Sessions 1[12]\b/.test(line))).toBe(headerRow);
-      expect(afterFurtherScroll.findIndex((line) => line.includes("↓ Load more"))).toBe(-1);
+      expect(afterFurtherScroll.findIndex((line) => /^sessions\s/.test(line))).toBe(headerRow);
+      expect(afterFurtherScroll.findIndex((line) => line.includes("↓ load more"))).toBe(-1);
       expect(afterFurtherScroll.findIndex((line) => line.includes("tab scope"))).toBe(hintRow);
       expect(visibleSessionPickerEntries(await active.capturePaneEscapes())[0]!.row).toBe(firstEntryRow);
 
@@ -7970,44 +7981,43 @@ test.skipIf(!tmuxAvailable())(
       await waitForSessionPicker(active);
       await active.waitForPane((pane) => {
         const plain = stripAnsi(pane);
-        return plain.includes("Sessions 10") && plain.includes("Load more");
+        return /^sessions\s/m.test(plain) && /^ {2}↓ \d+ more$/m.test(plain);
       }, TIMEOUT);
       // A search that matches no saved session has nothing more to load.
       await active.sendLiteralText("NO_SAVED_SESSION_MATCHES");
       await active.waitForPane((pane) => {
         const plain = stripAnsi(pane);
-        return /Sessions 0\b/.test(plain) &&
-          plain.includes("No sessions found.") &&
-          !plain.includes("Load more");
+        return plain.includes("no matching sessions.") &&
+          !plain.includes("load more");
       }, TIMEOUT);
       // A search finds the oldest session before its page is loaded.
       await active.sendKeys("C-u");
       await active.sendLiteralText(savedMarkers[0]!);
       await active.waitForPane((pane) => {
         const plain = stripAnsi(pane);
-        return /Sessions 1\b/.test(plain) &&
+        return sessionCount(plain) === 1 &&
           plain.includes(`Save ${savedMarkers[0]!}.`) &&
-          !plain.includes("Load more");
+          !plain.includes("load more");
       }, TIMEOUT);
       await active.sendKeys("C-u");
       await active.waitForPane((pane) => {
         const plain = stripAnsi(pane);
-        return plain.includes("Sessions 10") && plain.includes("Load more");
+        return /^sessions\s/m.test(plain) && /^ {2}↓ \d+ more$/m.test(plain);
       }, TIMEOUT);
       for (let index = 0; index < 10; index += 1) {
         await active.sendKeys("Down");
       }
       await active.waitForPane((pane) => {
         const plain = stripAnsi(pane);
-        return plain.includes("Sessions 11") &&
-          plain.includes(`Save ${savedMarkers[0]}.`) &&
-          !plain.includes("Load more");
+        // Down past the loaded page loads the last one.
+        return plain.includes(`Save ${savedMarkers[0]}.`) &&
+          !plain.includes("load more");
       }, TIMEOUT);
       await active.sendLiteralText(savedMarkers[0]!);
       await active.waitForPane(
         (pane) => {
           const plain = stripAnsi(pane);
-          return plain.includes("Sessions 1") &&
+          return sessionCount(plain) === 1 &&
             plain.includes(`Save ${savedMarkers[0]!}.`);
         },
         TIMEOUT,
@@ -8034,7 +8044,7 @@ test.skipIf(!tmuxAvailable())(
       await active.waitForPane(
         (pane) => {
           const plain = stripAnsi(pane);
-          return plain.includes("Sessions 1") &&
+          return sessionCount(plain) === 1 &&
             plain.includes(`Save ${savedMarkers[10]!}.`);
         },
         TIMEOUT,
@@ -8583,7 +8593,7 @@ test.skipIf(!tmuxAvailable())(
         const stderrPath = join(root, `${flag}.stderr`);
         active = await TmuxSession.create({ cmd: `${shellQuote(FX_BIN)} ${flag}`, cwd: workspace, env, stderrPath, remainOnExit: true });
         if (flag === "-r") {
-          await active.waitForText("Sessions 1", TIMEOUT);
+          await active.waitForPane((pane) => sessionCount(pane) === 1, TIMEOUT);
           await active.sendKeys("Enter");
         }
         await active.waitForText("PUBLICATION_SAVED_HISTORY", TIMEOUT);
@@ -8937,7 +8947,7 @@ test.skipIf(!tmuxAvailable())("remembered continuation restores the selected con
     await active.sendText("/resume");
     await active.waitForText("enter resume", TIMEOUT);
     await active.sendLiteralText("Remember conversation B.");
-    await active.waitForText("Sessions 1", TIMEOUT);
+    await active.waitForPane((pane) => sessionCount(pane) === 1, TIMEOUT);
     await active.sendKeys("Enter");
     await active.waitForStableComposer(TIMEOUT);
     await close(active); active = null;

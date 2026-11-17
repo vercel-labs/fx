@@ -135,7 +135,9 @@ async function waitForHelpMenu(session: TmuxSession, count: number): Promise<str
   let latest: string[] = [];
   while (Date.now() < deadline) {
     latest = await session.capturePaneGrid();
-    if (latest.join("\n").includes(`Commands ${count}`)) return latest;
+    // The help catalog names its category; the slash menu's title doesn't.
+    const help = latest.some((line) => line.startsWith("commands   <"));
+    if (help && catalogMenuItemCount(latest, "commands") === count) return latest;
     await Bun.sleep(100);
   }
   throw new Error(`Timed out waiting for help menu.\nPane:\n${latest.join("\n")}`);
@@ -149,7 +151,7 @@ async function waitForSettingsMenu(session: TmuxSession): Promise<string[]> {
     const pane = latest.join("\n");
     if (
       pane.includes("←→ change") &&
-      (pane.includes("Settings") || pane.includes("Status line context"))
+      (pane.includes("settings   <") || pane.includes("Status line context"))
     ) return latest;
     await Bun.sleep(100);
   }
@@ -1867,7 +1869,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       await session.waitForText("/help", 5_000);
       await session.sendLiteralText("help");
       await session.sendKeys("Enter");
-      pane = await session.waitForText("Commands", 5_000);
+      pane = await session.waitForText("commands   <", 5_000);
       expect(pane).toContain("/help");
       expect(pane).toContain("enter open");
 
@@ -1886,7 +1888,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       );
       expect(pane).not.toContain("no matching slash commands");
       await session.sendKeys("Enter");
-      await session.waitForText("Sessions 0", 5_000);
+      await session.waitForText("sessions   <", 5_000);
 
       await session.sendKeys("Escape");
       await session.waitForPane(
@@ -1961,7 +1963,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       let pane = grid.join("\n");
       expect(pane).toContain("𝒇x");
       expect(pane).toContain("Run /help for commands");
-      expect(pane).toContain("[All]");
+      expect(pane).toContain("< All >");
       expect(pane).toContain("/help");
       expect(pane).not.toContain("● /help");
       expect(pane).toContain("show available slash commands");
@@ -1971,10 +1973,10 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
 
       await session.sendKeys("Tab");
       grid = await waitForHelpMenu(session, 5);
-      expect(grid.join("\n")).toContain("[General]");
+      expect(grid.join("\n")).toContain("< General >");
       await session.sendKeys("BTab");
       grid = await waitForHelpMenu(session, 40);
-      expect(grid.join("\n")).toContain("[All]");
+      expect(grid.join("\n")).toContain("< All >");
 
       await session.sendLiteralText("clipboard");
       grid = await waitForHelpMenu(session, 1);
@@ -1988,7 +1990,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       await session.sendKeys("Down");
       await session.sendKeys("Enter");
       pane = await session.waitForPane(
-        (current) => hasEmptyComposer(current) && !current.includes("Commands 40"),
+        (current) => hasEmptyComposer(current) && !current.includes("commands   <"),
         5_000,
       );
       expect(composerContains(pane, "/clear")).toBe(false);
@@ -2009,14 +2011,14 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
           current.includes("𝒇x"),
         5_000,
       );
-      expect(pane).not.toContain("Commands 1");
+      expect(pane).not.toContain("commands   <");
       expect(session.isAlive()).toBe(true);
 
       await session.sendKeys("C-u");
       await session.sendText("/help");
       await waitForHelpMenu(session, 40);
       await session.sendLiteralText("no command can match this query");
-      await session.waitForText("No commands found.", 5_000);
+      await session.waitForText("no matching commands.", 5_000);
       await session.sendKeys("Escape");
       await session.waitForPane(
         (current) => hasEmptyComposer(current) && current.includes("𝒇x") && !current.includes("enter open"),
@@ -2065,9 +2067,9 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       let pane = grid.join("\n");
       expect(pane).toContain("𝒇x");
       expect(pane).toContain("Run /help for commands");
-      expect(pane).toContain("Settings");
-      expect(pane).toContain("Interface");
-      expect(pane).toContain("[All]");
+      // The title shows only the active category; Tab moves through the rest.
+      expect(pane).toContain("settings   < All >");
+      expect(pane).not.toContain("Interface");
       expect(pane).toContain("↑↓ navigate");
       expect(pane).toContain("tab category");
       expect(pane).toContain("←→ change");
@@ -2078,10 +2080,10 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       expect(pane).not.toContain("Maxxing mode");
       await session.sendKeys("Tab");
       pane = (await waitForSettingsMenu(session)).join("\n");
-      expect(pane).toContain("[Interface]");
+      expect(pane).toContain("< Interface >");
       await session.sendKeys("BTab");
       pane = (await waitForSettingsMenu(session)).join("\n");
-      expect(pane).toContain("[All]");
+      expect(pane).toContain("< All >");
       for (let index = 0; index < 2; index += 1) await session.sendKeys("Down");
       await session.waitForText(/Status line workspace\s+off/, 5_000);
       await session.sendKeys("Right");
@@ -2611,7 +2613,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       );
 
       await session.sendText("/resume");
-      await session.waitForText("Sessions 0", 5_000);
+      await session.waitForText("sessions   <", 5_000);
       grid = await session.capturePaneGrid();
       expect(grid.join("\n")).toContain("Run /help for commands");
       expect(alternateCount("\x1b[?1049h")).toBe(entersBeforeSkills);

@@ -1302,7 +1302,7 @@ test.skipIf(!tmuxAvailable())("the picker lists v2 sessions, /rename sticks, and
 test.skipIf(!tmuxAvailable())("the picker shows a session open in another fx as busy at once, and opens it once the owner quits", async () => {
   const fixture = createFixture("fx-v2-app-picker-busy-");
   const gateway = replyToLatest([["Hold this session open.", "PICKER_BUSY_SAVED"]]);
-  const busy = "This session is open in another fx. Close it there, then press enter to retry.";
+  const busy = "this session is open in another fx · close it there, then press enter to retry.";
   let contender: TmuxSession | null = null;
   try {
     const owner = await startApp(fixture, gateway, []);

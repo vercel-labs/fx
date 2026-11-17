@@ -1,7 +1,7 @@
 const std = @import("std");
 const display_width = @import("../../core/shared/display_width.zig");
 const list_window = @import("../../core/shared/list_window.zig");
-const picker_presentation = @import("picker_presentation.zig");
+const menu_frame = @import("menu_frame.zig");
 const session_catalog = @import("../../core/session/session_catalog.zig");
 const session_store = @import("../../core/session/session_store.zig");
 const ui_render = @import("../render.zig");
@@ -15,7 +15,11 @@ const SessionMenuProjection = render_input.SessionMenuProjection;
 const header_rows: u16 = 1;
 const roomy_top_gap_rows: u16 = 1;
 const title_rows: u16 = 1;
-pub const max_visible_items: u16 = 20;
+/// The list holds as many rows as the other menus; more sessions than fit
+/// show a `↓ N more` row, or the `↓ load more` action when there are pages.
+pub const max_visible_items: u16 = list_window.default_max_picker_rows;
+/// The gap between a session's title and its workspace, age, and turns.
+const metadata_gap: usize = 6;
 pub const max_inline_rows: u16 = header_rows + roomy_top_gap_rows + max_visible_items;
 const minimum_title_column_width: usize = 12;
 // Each session is a single line now: the workspace, age, and turn count live
@@ -32,6 +36,8 @@ const SessionMenuLayout = struct {
     first_item_row: u16 = header_rows,
     item_stride: u16 = title_rows,
     load_more_row: ?u16 = null,
+    /// The `↓ N more` row under the sessions a list without pages shows.
+    more_row: ?u16 = null,
     feedback_row: ?u16 = null,
     feedback_inline: bool = false,
     show_header: bool = true,
@@ -49,7 +55,9 @@ const SessionMenuLayout = struct {
                 .navigation_count = navigation_count,
                 .selected = selected,
                 .show_header = row_budget > 1,
-                .row_count = @min(row_budget, header_rows + roomy_top_gap_rows + 1),
+                // The list keeps its height, so the composer doesn't move
+                // while sessions load or a search finds none.
+                .row_count = @min(row_budget, header_rows + roomy_top_gap_rows + max_visible_items),
             };
         }
         if (row_budget == 1) {
@@ -137,8 +145,8 @@ const SessionMenuLayout = struct {
 
         const first_item_row = header_rows + roomy_top_gap_rows;
         const item_stride = title_rows + path_rows + item_gap_rows;
-        const item_budget = (row_budget - first_item_row +| item_gap_rows) / item_stride;
-        const visible_items: u16 = @intCast(@min(session_count, @max(item_budget, 1), max_visible_items));
+        const list_rows: u16 = @intCast(@min(@max((row_budget - first_item_row +| item_gap_rows) / item_stride, 1), max_visible_items));
+        const visible_items = list_window.visibleRowsWithMore(session_count, list_rows);
         return .{
             .session_count = session_count,
             .navigation_count = navigation_count,
@@ -147,8 +155,9 @@ const SessionMenuLayout = struct {
             .visible_session_items = visible_items,
             .first_item_row = first_item_row,
             .item_stride = item_stride,
+            .more_row = if (visible_items < session_count) first_item_row + visible_items else null,
             .feedback_row = if (projection.selection_failure != null) 1 else null,
-            .row_count = first_item_row + visible_items * item_stride - item_gap_rows,
+            .row_count = first_item_row + list_rows * item_stride - item_gap_rows,
         };
     }
 
@@ -220,7 +229,21 @@ pub fn composeSessionMenuRow(
         if (row_index < layout.row_count -| 1) return row;
         return composeStateRow(alloc, projection, width);
     }
+    if (layout.more_row == row_index) {
+        const hidden = layout.session_count -| (sessionWindowStart(projection, layout) + layout.visible_session_items);
+        var buf: [40]u8 = undefined;
+        return menu_frame.composeMessageRow(alloc, std.mem.print(&buf, "↓ {d} more", .{hidden}) catch "↓ more", width);
+    }
     if (layout.load_more_row == row_index) {
+        // Loaded sessions below the window come first, as in every menu; the
+        // load-more action shows once the window reaches the last of them.
+        if (layout.visible_session_items > 0 and !projection.isLoadMoreIndex(layout.selected)) {
+            const hidden = layout.session_count -| (sessionWindowStart(projection, layout) + layout.visible_session_items);
+            if (hidden > 0) {
+                var buf: [40]u8 = undefined;
+                return menu_frame.composeMessageRow(alloc, std.mem.print(&buf, "↓ {d} more", .{hidden}) catch "↓ more", width);
+            }
+        }
         return composeLoadMoreRow(
             alloc,
             projection.isLoadMoreIndex(layout.selected),
@@ -267,43 +290,10 @@ fn sessionWindowStart(projection: SessionMenuProjection, layout: SessionMenuLayo
 }
 
 fn composeHeaderRow(alloc: Allocator, projection: SessionMenuProjection, width: u16) !std.ArrayList(u8) {
-    var wide: std.ArrayList(u8) = .empty;
-    defer wide.deinit(alloc);
-    try appendHeaderTitle(alloc, &wide, projection.filteredItemCount());
-    inline for (@typeInfo(session_catalog.Scope).@"enum".field_values) |field_value| {
-        const scope: session_catalog.Scope = @fromBackingInt(@intCast(field_value));
-        try wide.appendSlice(alloc, "  ");
-        try appendScopeTab(alloc, &wide, scope, scope == projection.scope);
-    }
-    if (display_width.visibleWidthIgnoringAnsi(wide.items) <= width) {
-        return cloneClippedRow(alloc, wide.items, width);
-    }
-
-    var compact: std.ArrayList(u8) = .empty;
-    defer compact.deinit(alloc);
-    try appendHeaderTitle(alloc, &compact, projection.filteredItemCount());
-    try compact.appendSlice(alloc, "  ");
-    try appendScopeTab(alloc, &compact, projection.scope, true);
-    return cloneClippedRow(alloc, compact.items, width);
-}
-
-fn appendHeaderTitle(alloc: Allocator, row: *std.ArrayList(u8), count: usize) !void {
-    try row.appendSlice(alloc, ui_render.selected_completion_style);
-    var buf: [48]u8 = undefined;
-    const title = std.mem.print(&buf, "Sessions {d}", .{count}) catch "Sessions";
-    try row.appendSlice(alloc, title);
-    try row.appendSlice(alloc, ui_render.reset_style);
-}
-
-fn appendScopeTab(alloc: Allocator, row: *std.ArrayList(u8), scope: session_catalog.Scope, active: bool) !void {
-    try row.appendSlice(alloc, if (active) ui_render.selected_completion_style else ui_render.dim_style);
-    if (active) try row.append(alloc, '[');
-    try row.appendSlice(alloc, switch (scope) {
+    return menu_frame.composeTitleRow(alloc, "sessions", switch (projection.scope) {
         .current_workspace => "Current workspace",
         .all_workspaces => "All workspaces",
-    });
-    if (active) try row.append(alloc, ']');
-    try row.appendSlice(alloc, ui_render.reset_style);
+    }, width);
 }
 
 // Measure every matching row so navigation never shifts a column.
@@ -374,7 +364,7 @@ fn composeTitleRow(
 
     const prefix_width = display_width.visibleWidthIgnoringAnsi(row.items);
     const content_width: usize = @as(usize, width) -| 1;
-    const metadata_overhead = prefix_width + picker_presentation.inline_picker_column_gap_width + metadata_width;
+    const metadata_overhead = prefix_width + metadata_gap + metadata_width;
     const available_title_width = content_width -| metadata_overhead;
     const show_metadata = metadata_width > 0 and available_title_width >= minimum_title_column_width;
     const measured_title_width = @max(columns.title, display_width.visibleWidth(session_catalog.displayTitle(summary)));
@@ -382,7 +372,7 @@ fn composeTitleRow(
         @min(measured_title_width, available_title_width)
     else
         @as(usize, width) -| prefix_width;
-    const metadata_start = prefix_width + title_col + picker_presentation.inline_picker_column_gap_width;
+    const metadata_start = prefix_width + title_col + metadata_gap;
     const title_budget = if (show_metadata)
         title_col
     else
@@ -428,7 +418,7 @@ fn composeLoadMoreRow(
     try row_text.appendSingleLineEllipsized(
         alloc,
         &row,
-        if (loading) "↓ Loading more…" else "↓ Load more",
+        if (loading) "↓ loading more…" else "↓ load more",
         @as(usize, width) -| indent_width,
     );
     try row.appendSlice(alloc, ui_render.reset_style);
@@ -437,9 +427,9 @@ fn composeLoadMoreRow(
 
 fn composeStateRow(alloc: Allocator, projection: SessionMenuProjection, width: u16) !std.ArrayList(u8) {
     const message = switch (projection.load_state) {
-        .loading => "Loading sessions…",
-        .failed => "Unable to load sessions.",
-        .ready => "No sessions found.",
+        .loading => "loading sessions…",
+        .failed => "unable to load sessions.",
+        .ready => if (projection.query.len > 0) "no matching sessions." else "no sessions.",
     };
     var row: std.ArrayList(u8) = .empty;
     errdefer row.deinit(alloc);
@@ -459,13 +449,13 @@ fn composeSelectionFailureRow(
     errdefer row.deinit(alloc);
     const indent_width: usize = if (width > 4) 2 else 0;
     if (indent_width > 0) try row.appendSlice(alloc, "  ");
-    try row.appendSlice(alloc, ui_render.red_style);
+    try row.appendSlice(alloc, ui_render.dim_style);
     const message = switch (failure) {
-        .open_elsewhere => "This session is open in another fx. Close it there, then press enter to retry.",
-        .being_updated => "This session is being updated. Wait a moment, then press enter to retry.",
-        .connection_changed => "This session's custom connection changed in settings. Change it back, or start a new session.",
-        .connection_removed => "This session's custom connection is no longer in settings. Add it back, or start a new session.",
-        .unavailable => "Unable to resume this session.",
+        .open_elsewhere => "this session is open in another fx · close it there, then press enter to retry.",
+        .being_updated => "this session is being updated · wait a moment, then press enter to retry.",
+        .connection_changed => "this session's custom connection changed in settings · change it back, or start a new session.",
+        .connection_removed => "this session's custom connection is no longer in settings · add it back, or start a new session.",
+        .unavailable => "unable to resume this session.",
     };
     try row_text.appendSingleLineEllipsized(
         alloc,
@@ -497,16 +487,9 @@ fn composeCompactFailureTitleRow(
         width -| suffix_width,
     );
     errdefer row.deinit(alloc);
-    try row.appendSlice(alloc, ui_render.red_style);
+    try row.appendSlice(alloc, ui_render.dim_style);
     try row_text.appendClipped(alloc, &row, retry_text, suffix_width);
     try row.appendSlice(alloc, ui_render.reset_style);
-    return row;
-}
-
-fn cloneClippedRow(alloc: Allocator, bytes: []const u8, width: u16) !std.ArrayList(u8) {
-    var row: std.ArrayList(u8) = .empty;
-    errdefer row.deinit(alloc);
-    try row_text.appendClipped(alloc, &row, bytes, width);
     return row;
 }
 
@@ -574,9 +557,10 @@ test "resume menu renders each session on one line with a right metadata cluster
 
     var header = try composeSessionMenuRow(alloc, projection, 0, 120, 4);
     defer header.deinit(alloc);
-    try std.testing.expect(std.mem.find(u8, header.items, "Sessions 1") != null);
-    try std.testing.expect(std.mem.find(u8, header.items, "[Current workspace]") != null);
-    try std.testing.expect(std.mem.find(u8, header.items, "All workspaces") != null);
+    try std.testing.expect(std.mem.find(u8, header.items, "sessions") != null);
+    try std.testing.expect(std.mem.find(u8, header.items, "< Current workspace >") != null);
+    // Only the active scope shows; Tab moves to the other one.
+    try std.testing.expect(std.mem.find(u8, header.items, "All workspaces") == null);
 
     var title = try composeSessionMenuRow(alloc, projection, 2, 120, 4);
     defer title.deinit(alloc);
@@ -591,9 +575,9 @@ test "resume menu renders each session on one line with a right metadata cluster
 test "resume menu renders loading empty and failure states" {
     const alloc = std.testing.allocator;
     const states = [_]struct { state: session_catalog.LoadState, text: []const u8 }{
-        .{ .state = .loading, .text = "Loading sessions…" },
-        .{ .state = .ready, .text = "No sessions found." },
-        .{ .state = .failed, .text = "Unable to load sessions." },
+        .{ .state = .loading, .text = "loading sessions…" },
+        .{ .state = .ready, .text = "no sessions." },
+        .{ .state = .failed, .text = "unable to load sessions." },
     };
     for (states) |state| {
         const projection: SessionMenuProjection = .{ .active = true, .load_state = state.state };
@@ -619,15 +603,15 @@ test "resume menu explains retryable selected session contention" {
     }{
         .{
             .failure = .open_elsewhere,
-            .message = "This session is open in another fx. Close it there, then press enter to retry.",
+            .message = "this session is open in another fx · close it there, then press enter to retry.",
         },
         .{
             .failure = .being_updated,
-            .message = "This session is being updated. Wait a moment, then press enter to retry.",
+            .message = "this session is being updated · wait a moment, then press enter to retry.",
         },
         .{
             .failure = .unavailable,
-            .message = "Unable to resume this session.",
+            .message = "unable to resume this session.",
         },
     };
 
@@ -714,7 +698,7 @@ test "resume menu keeps selected title and retry feedback in compact layouts" {
             row_budget,
         );
         defer load_more.deinit(alloc);
-        try std.testing.expect(std.mem.find(u8, load_more.items, "Load more") != null);
+        try std.testing.expect(std.mem.find(u8, load_more.items, "load more") != null);
     }
 }
 
@@ -827,7 +811,7 @@ test "resume menu metadata follows the widest matching title across windows" {
         return error.ExpectedSecondTurnCount;
 
     try std.testing.expectEqual(
-        @as(usize, 19),
+        @as(usize, 21),
         display_width.visibleWidthIgnoringAnsi(first.items[0..first_workspace]),
     );
     try std.testing.expectEqual(
@@ -879,7 +863,7 @@ test "resume menu prioritizes content within a one row budget" {
     var selected = try composeSessionMenuRow(alloc, selected_projection, 0, 80, 1);
     defer selected.deinit(alloc);
     try std.testing.expect(std.mem.find(u8, selected.items, "Selected session") != null);
-    try std.testing.expect(std.mem.find(u8, selected.items, "Sessions 1") == null);
+    try std.testing.expect(std.mem.find(u8, selected.items, "sessions   <") == null);
 
     const empty_projection: SessionMenuProjection = .{
         .active = true,
@@ -887,8 +871,8 @@ test "resume menu prioritizes content within a one row budget" {
     };
     var empty = try composeSessionMenuRow(alloc, empty_projection, 0, 80, 1);
     defer empty.deinit(alloc);
-    try std.testing.expect(std.mem.find(u8, empty.items, "No sessions found.") != null);
-    try std.testing.expect(std.mem.find(u8, empty.items, "Sessions 0") == null);
+    try std.testing.expect(std.mem.find(u8, empty.items, "no sessions.") != null);
+    try std.testing.expect(std.mem.find(u8, empty.items, "sessions   <") == null);
 }
 
 test "resume menu clips long titles before metadata across VT widths" {
@@ -967,11 +951,11 @@ test "resume menu renders a navigable load more action" {
     const row_count = menuRowCount(projection, 80, row_budget);
     var header = try composeSessionMenuRow(alloc, projection, 0, 80, row_budget);
     defer header.deinit(alloc);
-    try std.testing.expect(std.mem.find(u8, header.items, "Sessions 1") != null);
+    try std.testing.expect(std.mem.find(u8, header.items, "sessions") != null);
 
     var action = try composeSessionMenuRow(alloc, projection, row_count - 1, 80, row_budget);
     defer action.deinit(alloc);
-    try std.testing.expect(std.mem.find(u8, action.items, "↓ Load more") != null);
+    try std.testing.expect(std.mem.find(u8, action.items, "↓ load more") != null);
 
     var loading_projection = projection;
     loading_projection.loading_more = true;
@@ -983,7 +967,7 @@ test "resume menu renders a navigable load more action" {
         row_budget,
     );
     defer loading.deinit(alloc);
-    try std.testing.expect(std.mem.find(u8, loading.items, "↓ Loading more…") != null);
+    try std.testing.expect(std.mem.find(u8, loading.items, "↓ loading more…") != null);
 }
 
 test "resume menu keeps the selected paginated action visible in two rows" {
@@ -1007,10 +991,10 @@ test "resume menu keeps the selected paginated action visible in two rows" {
     var selected_session = try composeSessionMenuRow(alloc, projection, 1, 80, 2);
     defer selected_session.deinit(alloc);
     try std.testing.expect(std.mem.find(u8, selected_session.items, "Selected session") != null);
-    try std.testing.expect(std.mem.find(u8, selected_session.items, "Load more") == null);
+    try std.testing.expect(std.mem.find(u8, selected_session.items, "load more") == null);
 
     projection.selected_index = 1;
     var selected_load_more = try composeSessionMenuRow(alloc, projection, 1, 80, 2);
     defer selected_load_more.deinit(alloc);
-    try std.testing.expect(std.mem.find(u8, selected_load_more.items, "Load more") != null);
+    try std.testing.expect(std.mem.find(u8, selected_load_more.items, "load more") != null);
 }

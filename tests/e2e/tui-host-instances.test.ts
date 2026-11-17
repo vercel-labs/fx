@@ -11,6 +11,7 @@ import {
   TmuxSession,
   tmuxAvailable,
 } from "./tmux-helpers";
+import { catalogMenuItemCount } from "./tui-render-assertions";
 
 // One fx process hosting several identical fx instances: each has its own
 // session and conversation, the agent list switches between them, and every
@@ -482,14 +483,14 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
         // fx 2 closes, and the row above it, the first, comes back on screen.
         // The list stays open on it, and Delete no longer offers to close it:
         // that would end fx.
-        const closed = await session.waitForPane((pane) => !/\bfx 2\b/.test(pane) && pane.includes("esc back"), 15_000);
+        const closed = await session.waitForPane((pane) => !/\bfx 2\b/.test(pane) && pane.includes("esc close"), 15_000);
         expect(shownAnswers(await waitForAnswers(session, ["HOST_ANSWER_A"]))).toEqual(["HOST_ANSWER_A"]);
         expect(closed).not.toContain("delete close");
         await session.sendKeys("BSpace");
         await session.sendKeys("BSpace");
         // Keys are handled in order, so the list closing shows both Deletes ran.
         await session.sendKeys("Escape");
-        await session.waitForPane((pane) => !pane.includes("esc back"), 10_000);
+        await session.waitForPane((pane) => !pane.includes("esc close"), 10_000);
         await session.sendText("HOST_B still here");
         await session.waitForText("HOST_ANSWER_B", 30_000);
       });
@@ -511,14 +512,14 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
         await session.sendKeys("BSpace");
         await session.waitForText("press delete again to close this instance", 10_000);
         await session.sendKeys("BSpace");
-        const closed = await session.waitForPane((pane) => shownAnswers(pane).length === 0 && pane.includes("esc back"), 15_000);
+        const closed = await session.waitForPane((pane) => shownAnswers(pane).length === 0 && pane.includes("esc close"), 15_000);
         expect(closed).not.toContain("delete close");
         // The instance left is the one the list goes back to: its row is
         // selected and, as the only instance open, named main.
         expect(agentRows(await session.capturePaneEscapes())).toEqual([{ name: "main", selected: true }]);
         // Esc keeps the instance that took over, not the closed one the list opened on.
         await session.sendKeys("Escape");
-        const after = await session.waitForPane((pane) => !pane.includes("esc back"), 10_000);
+        const after = await session.waitForPane((pane) => !pane.includes("esc close"), 10_000);
         expect(shownAnswers(after)).toEqual([]);
         await session.sendText("HOST_B second");
         await session.waitForText("HOST_ANSWER_B", 30_000);
@@ -871,9 +872,9 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
 
         // The startup picker (`-r`): picking B brings back the whole group.
         await withHost(answerByLetter, { args: "-r", reuse: { home, workspace } }, async ({ session }) => {
-          await session.waitForPane((pane) => pane.includes("Sessions 3"), 30_000);
+          await session.waitForPane((pane) => catalogMenuItemCount(pane.split("\n"), "sessions") === 3, 30_000);
           await session.sendLiteralText("HOST_B");
-          await session.waitForPane((pane) => pane.includes("Sessions 1"), 15_000);
+          await session.waitForPane((pane) => catalogMenuItemCount(pane.split("\n"), "sessions") === 1, 15_000);
           await session.sendKeys("Enter");
           const first = await session.waitForPane((pane) => pane.includes("fx 1/3") && pane.includes("HOST_ANSWER_B"), 30_000);
           expect(shownAnswers(first)).toEqual(["HOST_ANSWER_B"]);
@@ -886,9 +887,9 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
         // else.
         await withHost(answerByLetter, { reuse: { home, workspace } }, async ({ session }) => {
           await session.sendText("/resume");
-          await session.waitForPane((pane) => /Sessions \d+/.test(pane), 15_000);
+          await session.waitForPane((pane) => /^sessions   </m.test(pane), 15_000);
           await session.sendLiteralText("HOST_C");
-          await session.waitForPane((pane) => pane.includes("Sessions 1"), 15_000);
+          await session.waitForPane((pane) => catalogMenuItemCount(pane.split("\n"), "sessions") === 1, 15_000);
           await session.sendKeys("Enter");
           const pane = await session.waitForPane((value) => value.includes("HOST_ANSWER_C"), 30_000);
           expect(pane).not.toMatch(/fx \d+\/\d+/);
@@ -1914,7 +1915,7 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
         await session.sendKeys("C-x");
         const list = await session.waitForPane((pane) => instanceRow(3).test(pane), 15_000);
         expect(list).not.toContain("Step limit");
-        expect(list).toContain("Agents 3");
+        expect(catalogMenuItemCount(list.split("\n"), "agents")).toBe(3);
         expect(list).toMatch(instanceRow(1));
         expect(list).toMatch(/^ {2}fx 2 {2,}new session {2,}idle {2,}\S+\s*$/m);
         expect(list).toMatch(/^ {2}fx 3 {2,}new session {2,}idle {2,}\S+\s*$/m);
@@ -2062,7 +2063,7 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
         await session.sendKeys("C-x");
         await waitForSelected(session, "fx 1");
         await session.sendLiteral("f 3");
-        await session.waitForPane((pane) => pane.includes("Agents 0") && composerContains(pane, "f 3"), 10_000);
+        await session.waitForPane((pane) => pane.includes("no matching agents.") && composerContains(pane, "f 3"), 10_000);
 
         // Left twice puts the cursor after the f, and an x there makes "fx 3",
         // whose one match the list shows at once. The cursor stays after the
@@ -2070,7 +2071,7 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
         await session.sendKeys("Left");
         await session.sendKeys("Left");
         await session.sendLiteral("x");
-        await session.waitForPane((pane) => pane.includes("Agents 1") && composerContains(pane, "fx 3") && shownAnswers(pane).length === 0, 10_000);
+        await session.waitForPane((pane) => catalogMenuItemCount(pane.split("\n"), "agents") === 1 && composerContains(pane, "fx 3") && shownAnswers(pane).length === 0, 10_000);
         await session.sendLiteral("Z");
         const typed = await session.waitForPane((pane) => composerContains(pane, "fxZ 3") || composerContains(pane, "fx 3Z"), 10_000);
         expect(composerContains(typed, "fxZ 3")).toBe(true);
@@ -2181,7 +2182,7 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
         await session.waitForPane((pane) => pane.includes("helper \u00b7 "), 15_000);
         await session.sendKeys("C-x");
         const list = await session.waitForPane((pane) => subagentRow("helper").test(pane) && pane.includes(LIST_HINT), 15_000);
-        expect(list).toContain("Agents 3");
+        expect(catalogMenuItemCount(list.split("\n"), "agents")).toBe(3);
         // The helper's branch ends at it: fx 1 has no other subagent.
         expect(list).toMatch(/^ {2}\u2514 helper {2,}/m);
         expect(agentRows(await session.capturePaneEscapes())).toEqual([
