@@ -8925,10 +8925,12 @@ tmuxTest(
     await session.sendText("/compact");
     await session.sendLiteral("PRESERVE_COMPACTION_DRAFT");
     await session.waitForText("PRESERVE_COMPACTION_DRAFT", 1_000);
-    // Wait for durable publication and the activity row to clear.
+    // Wait for durable publication, the activity row to clear, and the
+    // success line, which arrives as a queued notice just after the row clears.
     await session.waitForPane((pane) =>
       pane.includes("PRESERVE_COMPACTION_DRAFT") &&
       !/Compacting|Stopping compaction/.test(pane) &&
+      /Context compacted \((?:\d+h)?(?:\d+m)?\d+s\)/.test(pane) &&
       readFileSync(historyPath, "utf8").includes('"kind":"compacted"'),
     TIMEOUT);
     const scrollback = await session.captureFullScrollback();

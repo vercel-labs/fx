@@ -8800,7 +8800,11 @@ test.skipIf(!tmuxAvailable())(
       await active.sendText("/compact");
       // Publication, not the transcript line, gates resume.
       await waitForCondition(() => readFileSync(historyPath, "utf8").includes('"kind":"compacted"'), "durable context checkpoint");
-      await active.waitForPane((pane) => hasEmptyComposer(pane) && !/Compacting|Stopping compaction/.test(pane), TIMEOUT);
+      // The success line arrives as a queued notice just after the row clears.
+      await active.waitForPane((pane) =>
+        hasEmptyComposer(pane) &&
+        !/Compacting|Stopping compaction/.test(pane) &&
+        /Context compacted \((?:\d+h)?(?:\d+m)?\d+s\)/.test(pane), TIMEOUT);
       const compacted = readFileSync(historyPath, "utf8");
       expect(compacted.startsWith(before)).toBe(true);
       const records = compacted.trim().split("\n").map((line) => JSON.parse(line));
