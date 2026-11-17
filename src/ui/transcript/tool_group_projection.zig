@@ -3409,7 +3409,8 @@ fn collectShortSteps(
 ) ShortStepError!bool {
     // A here-document's body is text for the program, not shell words, so
     // an apostrophe in it does not stop the command from lexing.
-    const source = try withoutHereDocBodies(scratch, command);
+    const here_docs = try withoutHereDocBodies(scratch, command);
+    const source = here_docs.text;
     const argv = command_lex.tokenize_argv(scratch, source) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return false,
@@ -3471,7 +3472,7 @@ fn collectShortSteps(
             if (!joined and index + 1 < tokens.len) index += 1;
             const delimiter = std.mem.trimStart(u8, if (joined) t.value[2..] else tokens[index].value, "-");
             var end = index + 1;
-            const closing: ?usize = while (end < tokens.len and !gapHasNewline(source, tokens[end - 1].end, tokens[end].start)) : (end += 1) {
+            const closing: ?usize = if (!here_docs.open) null else while (end < tokens.len and !gapHasNewline(source, tokens[end - 1].end, tokens[end].start)) : (end += 1) {
                 if (delimiter.len > 0 and std.mem.eql(u8, tokens[end].value, delimiter)) break end;
             } else null;
             if (closing) |at| {
@@ -3499,13 +3500,21 @@ fn collectShortSteps(
     return true;
 }
 
+/// A command's text without its here-document bodies.
+const HereDocText = struct {
+    text: []const u8,
+    /// Whether a here-document's body is still in `text`, as in a command
+    /// whose lines core folded into one.
+    open: bool = false,
+};
+
 /// `command` without the bodies of its here-documents and their closing
 /// lines, such as the lines after `cat > notes.md <<'EOF'` up to and with
 /// `EOF`, so the line that opened them ends their step. A command with no
 /// `<<` is returned as is; `<<<` and a shift inside `$(( ))` open no
 /// here-document. The text lives in `scratch`.
-fn withoutHereDocBodies(scratch: std.mem.Allocator, command: []const u8) std.mem.Allocator.Error![]const u8 {
-    if (std.mem.find(u8, command, "<<") == null) return command;
+fn withoutHereDocBodies(scratch: std.mem.Allocator, command: []const u8) std.mem.Allocator.Error!HereDocText {
+    if (std.mem.find(u8, command, "<<") == null) return .{ .text = command };
     const HereDoc = struct { delimiter: []const u8, strip_tabs: bool };
     var out: std.ArrayList(u8) = .empty;
     var pending: std.ArrayList(HereDoc) = .empty;
@@ -3556,7 +3565,13 @@ fn withoutHereDocBodies(scratch: std.mem.Allocator, command: []const u8) std.mem
             index += 2;
             continue;
         }
-        if (arithmetic == 0 and std.mem.startsWith(u8, command[index..], "<<") and !std.mem.startsWith(u8, command[index..], "<<<")) {
+        // A here-string's `<<<` opens no here-document, at any of its bytes.
+        if (std.mem.startsWith(u8, command[index..], "<<<")) {
+            try out.appendSlice(scratch, "<<<");
+            index += 3;
+            continue;
+        }
+        if (arithmetic == 0 and std.mem.startsWith(u8, command[index..], "<<")) {
             var scan = index + 2;
             const strip_tabs = scan < command.len and command[scan] == '-';
             if (strip_tabs) scan += 1;
@@ -3604,7 +3619,7 @@ fn withoutHereDocBodies(scratch: std.mem.Allocator, command: []const u8) std.mem
         // The newline after the last closing line follows the opening line.
         if (index < command.len) index += 1;
     }
-    return out.items;
+    return .{ .text = out.items, .open = pending.items.len > 0 };
 }
 
 /// Replaces the command a command row ends with by its short form, so a long
@@ -8543,6 +8558,11 @@ test "a command with a here-document shows its steps, whatever the document says
     try std.testing.expectEqualStrings("grep, wc", (try shortCommand(a, "grep x <<< \"it's\" && wc -l y")).?);
     // `<<` inside quotes or a comment opens no document either.
     try std.testing.expectEqualStrings("echo, ls", (try shortCommand(a, "echo \"a << b\" # c << d\nls -la")).?);
+    // A here-string with an apostrophe, before another line.
+    try std.testing.expectEqualStrings("wc, ls", (try shortCommand(a, "wc -c <<< \"it's\"\nls >/dev/null")).?);
+    // A word on the opening line that matches the delimiter is no closing
+    // line, since the document's body was on the lines after it.
+    try std.testing.expectEqualStrings("cat, echo, ls", (try shortCommand(a, "cat <<EOF > f.txt; echo EOF\nbody it's\nEOF\nls >/dev/null")).?);
     // Core folds a command's lines into one for its row; the document still
     // ends its step at the delimiter.
     try std.testing.expectEqualStrings("cat, sleep", (try shortCommand(a, "cat <<'EOF' launch marker line EOF sleep 300")).?);
