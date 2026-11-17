@@ -15,28 +15,28 @@ type Mutant = { id: string; note: string; from: string; to: string; expect: stri
 const MUTANTS: Mutant[] = [
   {
     id: "no-interrupt",
-    note: "a steer that arrives while the model streams waits instead of cutting the reply short (X20)",
+    note: "a steer that arrives while the model streams waits instead of cutting the reply short",
     from: `[] Kind(m) = "steer" /\\ phase = "gen" /\\ Rules ->`,
     to: `[] Kind(m) = "steer" /\\ phase = "gen" /\\ FALSE ->`,
     expect: "NoSteerWaitsOnReply",
   },
   {
     id: "reply-end-ends",
-    note: "a reply that ends while steers wait ends the turn instead of going on (X22)",
+    note: "a reply that ends while steers wait ends the turn instead of going on",
     from: `    /\\ IF waiting # <<>>\n       THEN /\\ phase' = "gen"`,
     to: `    /\\ IF FALSE\n       THEN /\\ phase' = "gen"`,
     expect: "ReplyEndContinues",
   },
   {
     id: "finishing-steer-fails",
-    note: "a steer that arrives while the turn finishes fails with -32600, as today (X19)",
+    note: "a steer that arrives while the turn finishes fails with -32600, as today",
     from: `       THEN /\\ late' = late \\o waiting\n            /\\ UNCHANGED answers`,
     to: `       THEN /\\ answers' = [m \\in Msgs |-> IF m \\in Range(waiting) THEN Err(-32600) ELSE answers[m]]\n            /\\ UNCHANGED late`,
     expect: "NothingLost",
   },
   {
     id: "stop-forgets-waiting",
-    note: "a stop drops the steers that were waiting, with no answer (Q39)",
+    note: "a stop drops the steers that were waiting, with no answer",
     from: `       THEN LET handed == late \\o waiting IN`,
     to: `       THEN LET handed == late IN`,
     expect: "NothingLost",
@@ -57,7 +57,7 @@ const MUTANTS: Mutant[] = [
   },
   {
     id: "late-one-at-a-time",
-    note: "late steers run one turn each instead of together (Q40)",
+    note: "late steers run one turn each instead of together",
     from: `/\\ late' = IF Rules THEN <<>> ELSE Tail(late)`,
     to: `/\\ late' = Tail(late)`,
     expect: "LateRunTogether",
