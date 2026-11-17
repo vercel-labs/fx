@@ -45,6 +45,8 @@ pub const Refusal = enum {
     /// The caller's deadline passed before git's own checks finished
     /// (`prepareWithin`).
     timed_out,
+    /// The caller's cancel flag ended git's own checks (`prepareWithin`, `prepareStore`).
+    cancelled,
 };
 
 pub const Ready = struct {
@@ -52,6 +54,8 @@ pub const Ready = struct {
     executable: []const u8,
     /// Filter drivers defined by repository-scope config.
     filter_names: []const []const u8,
+    /// Hooks that config defines with `hook.<name>.command` (git 2.54), as git reads config in this repository: its own, global and system config and their includes. Each command turns them off.
+    hook_names: []const []const u8 = &.{},
     /// The git directory fx's discovery found for the directory, without
     /// running git; null when no repository holds it.
     git_dir: ?[]const u8 = null,
@@ -82,7 +86,7 @@ pub fn prepare(arena: Allocator, cwd: []const u8) Allocator.Error!Prepared {
 pub fn prepareWithin(arena: Allocator, cwd: []const u8, limits: Limits) Allocator.Error!Prepared {
     return prepareWith(arena, cwd, boundedChecks(&limits)) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
-        error.TimeoutExpired => return refuse(.timed_out, cwd),
+        error.TimeoutExpired => return refuse(stoppedBy(limits), cwd),
     };
 }
 
@@ -109,9 +113,8 @@ fn runCheckUnbounded(_: ?*const anyopaque, arena: Allocator, argv: []const []con
     return runCaptured(arena, argv, cwd, output_limit);
 }
 
-/// Checks that stop at `limits`' deadline, which ends them with
-/// `error.TimeoutExpired`, and at its cancel flag, which fails them.
-/// `limits` must outlive the runner.
+/// Checks that stop at `limits`' deadline and its cancel flag, both of which
+/// end them with `error.TimeoutExpired`. `limits` must outlive the runner.
 fn boundedChecks(limits: *const Limits) CheckRunner {
     return .{ .context = limits, .run = runCheckBounded };
 }
@@ -123,7 +126,10 @@ fn runCheckBounded(context: ?*const anyopaque, arena: Allocator, argv: []const [
     probe.max_stdout = output_limit;
     return switch (try runBounded(arena, argv, cwd, &env, null, null, probe)) {
         .ok => |stdout| stdout,
-        .failed => |failure| if (failure == .timeout) error.TimeoutExpired else null,
+        .failed => |failure| switch (failure) {
+            .timeout, .cancelled => error.TimeoutExpired,
+            else => null,
+        },
     };
 }
 
@@ -144,14 +150,28 @@ pub fn prepareWith(arena: Allocator, cwd: []const u8, checks: CheckRunner) Check
         .too_old => return refuse(.git_too_old, cwd),
         .unknown => return refuse(.git_version_unknown, cwd),
     }
-    const ready: Ready = .{ .executable = executable, .filter_names = filters.names, .git_dir = filters.git_dir };
+    var ready: Ready = .{ .executable = executable, .filter_names = filters.names, .git_dir = filters.git_dir };
     if (!try sameRepository(arena, ready, cwd, filters.git_dir, checks)) return refuse(.repository_mismatch, cwd);
+    // `core.hooksPath=/dev/null` does not reach hooks config defines, so list
+    // them as git reads config here and turn each one off.
+    const listing = try checks.run(checks.context, arena, &.{ executable, "--no-pager", "config", "-z", "--name-only", "--list" }, cwd, max_config_output) orelse return refuse(.hook_config_unavailable, cwd);
+    ready.hook_names = switch (try parseHookNames(arena, listing)) {
+        .names => |names| names,
+        .unsupported => return refuse(.unsupported_hook_name, cwd),
+    };
     return .{ .ready = ready };
 }
 
 fn refuse(reason: Refusal, cwd: []const u8) Prepared {
     debug_trace.logf("core", "safe git refused reason={s} cwd={s}", .{ @tagName(reason), cwd });
     return .{ .refused = reason };
+}
+
+/// The refusal for a check that `limits` ended: `cancelled` once its flag is
+/// set, else `timed_out`.
+fn stoppedBy(limits: Limits) Refusal {
+    if (limits.cancel) |flag| if (flag.load(.acquire)) return .cancelled;
+    return .timed_out;
 }
 
 /// Appends the trusted executable, the global options and `-c` overrides that
@@ -183,10 +203,6 @@ fn appendPrelude(arena: Allocator, argv: *std.ArrayList([]const u8), ready: Read
         "core.fsmonitor=false",
         "-c",
         "core.hooksPath=/dev/null",
-        // git before 2.45 ignores GIT_NO_LAZY_FETCH, and protocol.allow=never
-        // makes any fetch fail before it starts a transport.
-        "-c",
-        "protocol.allow=never",
         "-c",
         "log.showSignature=false",
     });
@@ -196,14 +212,28 @@ fn appendPrelude(arena: Allocator, argv: *std.ArrayList([]const u8), ready: Read
             try argv.append(arena, try arena.print("filter.{s}.{s}=", .{ name, program }));
         }
     }
+    try appendHooksOff(arena, argv, ready.hook_names);
+}
+
+/// `appendPrelude` for fx's own capture reads, which never fetch: a
+/// repository whose config names a promisor remote cannot make them start a
+/// transport. git before 2.45 ignores `GIT_NO_LAZY_FETCH` (`blockLazyFetch`),
+/// and `protocol.allow=never` makes any fetch fail before it starts one.
+fn appendCapturePrelude(arena: Allocator, argv: *std.ArrayList([]const u8), ready: Ready) Allocator.Error!void {
+    try appendPrelude(arena, argv, ready);
+    try argv.appendSlice(arena, &.{ "-c", "protocol.allow=never" });
+}
+
+/// Turns off lazy fetch in `base`, for fx's own capture reads and store
+/// commands.
+fn blockLazyFetch(base: *std.process.Environ.Map) Allocator.Error!void {
+    try base.put("GIT_NO_LAZY_FETCH", "1");
 }
 
 /// The child environment for every safe git call: a fixed PATH and locale, no
 /// prompts, pagers or optional locks, and only the variables that locate the
 /// user's own git config. Nothing else from fx's environment, such as
-/// `GIT_DIR` or `GIT_CONFIG_PARAMETERS`, reaches git. Lazy fetch is off, so a
-/// repository whose config names a promisor remote cannot make git start a
-/// fetch that runs the repository's transport programs.
+/// `GIT_DIR` or `GIT_CONFIG_PARAMETERS`, reaches git.
 pub fn environment(alloc: Allocator) Allocator.Error!std.process.Environ.Map {
     var map = std.process.Environ.Map.init(alloc);
     errdefer map.deinit();
@@ -214,7 +244,6 @@ pub fn environment(alloc: Allocator) Allocator.Error!std.process.Environ.Map {
     try map.put("GIT_TERMINAL_PROMPT", "0");
     try map.put("GIT_PAGER", "cat");
     try map.put("PAGER", "cat");
-    try map.put("GIT_NO_LAZY_FETCH", "1");
     for ([_][]const u8{ "HOME", "XDG_CONFIG_HOME", "GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM", "GIT_CONFIG_NOSYSTEM" }) |key| {
         if (io_mod.getenv(key)) |value| try map.put(key, value);
     }
@@ -270,10 +299,6 @@ fn versionCheckAtLeast(arena: Allocator, executable: []const u8, min_minor: u32,
     @memcpy(entry.output[0..entry.len], output[0..entry.len]);
     cached_version = entry;
     return classifyVersionAtLeast(output, min_minor);
-}
-
-fn classifyVersion(output: []const u8) VersionCheck {
-    return classifyVersionAtLeast(output, minimum_minor);
 }
 
 fn classifyVersionAtLeast(output: []const u8, min_minor: u32) VersionCheck {
@@ -384,6 +409,8 @@ pub const Failure = enum {
     terminated,
     /// git exited 0 but dropped a path it would not record.
     path_rejected,
+    /// Config defines a hook for the store that fx cannot turn off, or the store's hooks could not be listed.
+    hooks_refused,
 };
 
 pub const Outcome = union(enum) {
@@ -402,6 +429,67 @@ pub const StoreReady = struct {
     /// `hook.<name>.command`; each store command turns them off.
     hook_names: []const []const u8 = &.{},
 };
+
+/// Most bytes a `git config --name-only --list` reply may have.
+const max_config_output: usize = 1 << 20;
+
+/// Hook names that config defines with `hook.<name>.command`, read from
+/// `git config -z --name-only --list` output, each once; `unsupported` when
+/// a name holds `=`, which `-c` cannot turn off.
+const HookNames = union(enum) { names: []const []const u8, unsupported };
+
+fn parseHookNames(arena: Allocator, listing: []const u8) Allocator.Error!HookNames {
+    var names: std.ArrayList([]const u8) = .empty;
+    var keys = std.mem.splitScalar(u8, listing, 0);
+    while (keys.next()) |key| {
+        if (!std.mem.startsWith(u8, key, "hook.") or !std.mem.endsWith(u8, key, ".command")) continue;
+        // `hook.command` has no name.
+        if (key.len <= "hook.".len + ".command".len) continue;
+        const name = key["hook.".len .. key.len - ".command".len];
+        if (std.mem.findScalar(u8, name, '=') != null) return .unsupported;
+        for (names.items) |seen| {
+            if (std.mem.eql(u8, seen, name)) break;
+        } else try names.append(arena, name);
+    }
+    return .{ .names = names.items };
+}
+
+/// Appends `-c hook.<name>.enabled=false` for each of `names`.
+fn appendHooksOff(arena: Allocator, argv: *std.ArrayList([]const u8), names: []const []const u8) Allocator.Error!void {
+    for (names) |name| {
+        try argv.append(arena, "-c");
+        try argv.append(arena, try arena.print("hook.{s}.enabled=false", .{name}));
+    }
+}
+
+const StoreHooks = union(enum) { names: []const []const u8, failed: Failure };
+
+/// The hooks config defines for `store`, listed in the store's own context
+/// (`base` already names its GIT_DIR, index and worktree), so a global
+/// `includeIf "gitdir:"` that applies to the store applies here too; joined
+/// with `ready.hook_names`.
+fn storeHookNames(arena: Allocator, ready: StoreReady, store: Store, base: *std.process.Environ.Map, limits: Limits) Allocator.Error!StoreHooks {
+    const argv = [_][]const u8{ ready.executable, "--no-pager", "-c", "core.fsmonitor=false", "config", "-z", "--name-only", "--list" };
+    const listing = switch (try runBounded(arena, &argv, store.work_tree, base, null, null, limits)) {
+        .ok => |stdout| stdout,
+        .failed => |failure| return .{ .failed = switch (failure) {
+            .timeout, .cancelled => failure,
+            else => .hooks_refused,
+        } },
+    };
+    const found = switch (try parseHookNames(arena, listing)) {
+        .names => |names| names,
+        .unsupported => return .{ .failed = .hooks_refused },
+    };
+    var names: std.ArrayList([]const u8) = .empty;
+    try names.appendSlice(arena, ready.hook_names);
+    for (found) |name| {
+        for (names.items) |seen| {
+            if (std.mem.eql(u8, seen, name)) break;
+        } else try names.append(arena, name);
+    }
+    return .{ .names = names.items };
+}
 
 pub const PreparedStore = union(enum) {
     ready: StoreReady,
@@ -565,10 +653,11 @@ pub fn prepareStore(arena: Allocator, limits: Limits) Allocator.Error!PreparedSt
 }
 
 fn prepareStoreWith(arena: Allocator, limits: Limits, base: *std.process.Environ.Map) Allocator.Error!PreparedStore {
+    try blockLazyFetch(base);
     const executable = trustedExecutable() orelse return .{ .refused = refuse(.git_missing, "store").refused };
     const version = versionCheckAtLeast(arena, executable, store_minimum_minor, boundedChecks(&limits)) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
-        error.TimeoutExpired => return .{ .refused = refuse(.timed_out, "store").refused },
+        error.TimeoutExpired => return .{ .refused = refuse(stoppedBy(limits), "store").refused },
     };
     switch (version) {
         .supported => {},
@@ -579,31 +668,15 @@ fn prepareStoreWith(arena: Allocator, limits: Limits, base: *std.process.Environ
     // `core.hooksPath=/dev/null` does not turn off, so list them here and turn
     // each one off in every store command.
     var argv: std.ArrayList([]const u8) = .empty;
-    try argv.appendSlice(arena, &.{ executable, "--no-pager", "-c", "core.fsmonitor=false", "config", "--name-only", "--get-regexp", "^hook\\..*\\.command$" });
+    try argv.appendSlice(arena, &.{ executable, "--no-pager", "-c", "core.fsmonitor=false", "config", "-z", "--name-only", "--list" });
     const hook_names: []const []const u8 = switch (try runBounded(arena, argv.items, "/", base, null, null, limits)) {
-        .ok => |stdout| blk: {
-            var names: std.ArrayList([]const u8) = .empty;
-            var lines = std.mem.splitScalar(u8, stdout, '\n');
-            while (lines.next()) |line| {
-                if (line.len == 0) continue;
-                // `git config --name-only` prints `hook.<name>.command`.
-                if (!std.mem.startsWith(u8, line, "hook.") or !std.mem.endsWith(u8, line, ".command")) {
-                    return .{ .refused = refuse(.hook_config_unavailable, "store").refused };
-                }
-                if (line.len < "hook.".len + ".command".len) {
-                    return .{ .refused = refuse(.hook_config_unavailable, "store").refused };
-                }
-                const name = line["hook.".len .. line.len - ".command".len];
-                if (name.len == 0 or std.mem.findScalar(u8, name, '=') != null) {
-                    return .{ .refused = refuse(.unsupported_hook_name, "store").refused };
-                }
-                try names.append(arena, name);
-            }
-            break :blk names.items;
+        .ok => |stdout| switch (try parseHookNames(arena, stdout)) {
+            .names => |names| names,
+            .unsupported => return .{ .refused = refuse(.unsupported_hook_name, "store").refused },
         },
-        // git config exits 1 when no key matches, which means no hook is defined.
         .failed => |failure| switch (failure) {
-            .exited_nonzero => &.{},
+            .timeout => return .{ .refused = refuse(.timed_out, "store").refused },
+            .cancelled => return .{ .refused = refuse(.cancelled, "store").refused },
             else => return .{ .refused = refuse(.hook_config_unavailable, "store").refused },
         },
     };
@@ -625,6 +698,7 @@ fn initStoreWith(
     limits: Limits,
     base: *std.process.Environ.Map,
 ) StoreError!Outcome {
+    try blockLazyFetch(base);
     if (!std.Io.Dir.path.isAbsolute(git_dir)) return error.InvalidArgument;
     var argv: std.ArrayList([]const u8) = .empty;
     try appendStorePrelude(arena, &argv, ready, .{});
@@ -651,11 +725,19 @@ fn runStoreWith(
     base: *std.process.Environ.Map,
     route_path: []const u8,
 ) StoreError!Outcome {
+    try blockLazyFetch(base);
     for ([_][]const u8{ store.git_dir, store.index_file, store.work_tree, store.scratch_dir }) |dir| {
         if (!std.Io.Dir.path.isAbsolute(dir)) return error.InvalidArgument;
     }
+    if (comptime builtin.target.os.tag != .windows) try base.put("PATH", route_path);
+    try base.put("GIT_DIR", store.git_dir);
+    try base.put("GIT_INDEX_FILE", store.index_file);
+    try base.put("GIT_WORK_TREE", store.work_tree);
+    try base.put("GIT_AUTHOR_NAME", capture_identity_name);
+    try base.put("GIT_AUTHOR_EMAIL", capture_identity_email);
+    try base.put("GIT_COMMITTER_NAME", capture_identity_name);
+    try base.put("GIT_COMMITTER_EMAIL", capture_identity_email);
     var argv: std.ArrayList([]const u8) = .empty;
-    try appendStorePrelude(arena, &argv, ready, store.conversions);
     var input: std.ArrayList(u8) = .empty;
     var has_input = false;
     var reads_paths = false;
@@ -758,15 +840,17 @@ fn runStoreWith(
         },
         .list_refs => try argv.appendSlice(arena, &.{ "for-each-ref", "--format=%(refname) %(objectname) %(committerdate:unix)", capture_ref_prefix }),
     }
-    if (comptime builtin.target.os.tag != .windows) try base.put("PATH", route_path);
-    try base.put("GIT_DIR", store.git_dir);
-    try base.put("GIT_INDEX_FILE", store.index_file);
-    try base.put("GIT_WORK_TREE", store.work_tree);
-    try base.put("GIT_AUTHOR_NAME", capture_identity_name);
-    try base.put("GIT_AUTHOR_EMAIL", capture_identity_email);
-    try base.put("GIT_COMMITTER_NAME", capture_identity_name);
-    try base.put("GIT_COMMITTER_EMAIL", capture_identity_email);
-    const outcome = try runBoundedWithStderr(arena, argv.items, store.work_tree, base, if (has_input) input.items else null, store.scratch_dir, limits);
+    // Config can define hooks for this store alone, such as through a global
+    // `includeIf "gitdir:"`, so they are listed in the store's own context.
+    var store_ready = ready;
+    store_ready.hook_names = switch (try storeHookNames(arena, ready, store, base, limits)) {
+        .names => |names| names,
+        .failed => |failure| return .{ .failed = failure },
+    };
+    var full_argv: std.ArrayList([]const u8) = .empty;
+    try appendStorePrelude(arena, &full_argv, store_ready, store.conversions);
+    try full_argv.appendSlice(arena, argv.items);
+    const outcome = try runBoundedWithStderr(arena, full_argv.items, store.work_tree, base, if (has_input) input.items else null, store.scratch_dir, limits);
     // `update-index` reports a path it refuses (an HFS or NTFS spelling of
     // `.git`, for example) and still exits 0. A capture missing an admitted
     // path must not look complete.
@@ -799,8 +883,9 @@ fn listRepositoryWith(
     limits: Limits,
     base: *std.process.Environ.Map,
 ) Allocator.Error!Outcome {
+    try blockLazyFetch(base);
     var argv: std.ArrayList([]const u8) = .empty;
-    try appendPrelude(arena, &argv, ready);
+    try appendCapturePrelude(arena, &argv, ready);
     try argv.appendSlice(arena, switch (listing) {
         .tracked => &.{ "ls-files", "-z", "--full-name", "--stage", "-v", "--", ":/" },
         .untracked => &.{ "ls-files", "-z", "--full-name", "--others", "--exclude-standard", "--", ":/" },
@@ -903,16 +988,18 @@ fn factsFailure(failure: Failure, otherwise: FactsFailure) FactsResult {
         .spawn_failed => .spawn_failed,
         .timeout => .timeout,
         .cancelled => .cancelled,
-        .input_failed, .read_failed, .output_too_large, .exited_nonzero, .terminated, .path_rejected => otherwise,
+        .input_failed, .read_failed, .output_too_large, .exited_nonzero, .terminated, .path_rejected, .hooks_refused => otherwise,
     } };
 }
 
 fn repositoryFactsWith(arena: Allocator, ready: Ready, cwd: []const u8, limits: Limits, base: *std.process.Environ.Map) Allocator.Error!FactsResult {
+    try blockLazyFetch(base);
     const unexpected: FactsResult = .{ .failed = .unexpected_output };
     // One line per option, in order. `--git-common-dir` may be relative to
     // `cwd`; the other two are absolute.
     var paths_argv: std.ArrayList([]const u8) = .empty;
-    try appendCommand(arena, &paths_argv, ready, .rev_parse);
+    try appendCapturePrelude(arena, &paths_argv, ready);
+    try paths_argv.append(arena, "rev-parse");
     try paths_argv.appendSlice(arena, &.{ "--show-object-format", "--show-toplevel", "--absolute-git-dir", "--git-common-dir" });
     const paths_output = switch (try runBounded(arena, paths_argv.items, cwd, base, null, null, limits)) {
         .ok => |stdout| stdout,
@@ -936,7 +1023,8 @@ fn repositoryFactsWith(arena: Allocator, ready: Ready, cwd: []const u8, limits: 
     // when HEAD names a broken ref or an object that is not a commit, so a
     // failure counts as unborn only after `headIsUnborn` confirms it.
     var head_argv: std.ArrayList([]const u8) = .empty;
-    try appendCommand(arena, &head_argv, ready, .rev_parse);
+    try appendCapturePrelude(arena, &head_argv, ready);
+    try head_argv.append(arena, "rev-parse");
     try head_argv.appendSlice(arena, &.{ "--verify", "-q", "HEAD^{commit}" });
     const head: ?[]const u8 = switch (try runBounded(arena, head_argv.items, cwd, base, null, null, limits)) {
         .ok => |stdout| std.mem.trimEnd(u8, stdout, "\n"),
@@ -951,7 +1039,7 @@ fn repositoryFactsWith(arena: Allocator, ready: Ready, cwd: []const u8, limits: 
     if (head) |oid| validateOid(oid) catch return unexpected;
 
     var config_argv: std.ArrayList([]const u8) = .empty;
-    try appendPrelude(arena, &config_argv, ready);
+    try appendCapturePrelude(arena, &config_argv, ready);
     try config_argv.appendSlice(arena, &.{ "config", "-z", "--list" });
     const config = switch (try runBounded(arena, config_argv.items, cwd, base, null, null, limits)) {
         .ok => |stdout| stdout,
@@ -1012,7 +1100,7 @@ fn repositoryFactsWith(arena: Allocator, ready: Ready, cwd: []const u8, limits: 
 /// reports why git could not answer rather than an unreadable HEAD.
 fn headIsUnborn(arena: Allocator, ready: Ready, cwd: []const u8, limits: Limits, base: *std.process.Environ.Map) Allocator.Error!HeadCheck {
     var symbolic_argv: std.ArrayList([]const u8) = .empty;
-    try appendPrelude(arena, &symbolic_argv, ready);
+    try appendCapturePrelude(arena, &symbolic_argv, ready);
     try symbolic_argv.appendSlice(arena, &.{ "symbolic-ref", "-q", "HEAD" });
     const ref = switch (try runBounded(arena, symbolic_argv.items, cwd, base, null, null, limits)) {
         .ok => |stdout| std.mem.trimEnd(u8, stdout, "\n"),
@@ -1022,7 +1110,8 @@ fn headIsUnborn(arena: Allocator, ready: Ready, cwd: []const u8, limits: Limits,
     if (!std.mem.startsWith(u8, ref, "refs/heads/") or ref.len == "refs/heads/".len) return .born_or_broken;
     if (std.mem.findAny(u8, ref, "\n\r\x00") != null) return .born_or_broken;
     var verify_argv: std.ArrayList([]const u8) = .empty;
-    try appendCommand(arena, &verify_argv, ready, .rev_parse);
+    try appendCapturePrelude(arena, &verify_argv, ready);
+    try verify_argv.append(arena, "rev-parse");
     try verify_argv.appendSlice(arena, &.{ "--verify", "-q", ref });
     return switch (try runBounded(arena, verify_argv.items, cwd, base, null, null, limits)) {
         .ok => .born_or_broken,
@@ -1046,8 +1135,9 @@ fn appendStorePrelude(arena: Allocator, argv: *std.ArrayList([]const u8), ready:
         "core.fsmonitor=false",
         "-c",
         "core.hooksPath=/dev/null",
-        // git before 2.45 ignores GIT_NO_LAZY_FETCH, and protocol.allow=never
-        // makes any fetch fail before it starts a transport.
+        // Store commands never fetch: git before 2.45 ignores GIT_NO_LAZY_FETCH,
+        // and protocol.allow=never makes any fetch fail before it starts a
+        // transport.
         "-c",
         "protocol.allow=never",
         "-c",
@@ -1067,10 +1157,7 @@ fn appendStorePrelude(arena: Allocator, argv: *std.ArrayList([]const u8), ready:
         "-c",
         "log.showSignature=false",
     });
-    for (ready.hook_names) |name| {
-        try argv.append(arena, "-c");
-        try argv.append(arena, try arena.print("hook.{s}.enabled=false", .{name}));
-    }
+    try appendHooksOff(arena, argv, ready.hook_names);
     if (conversions.file_mode) |value| try argv.appendSlice(arena, &.{ "-c", if (value) "core.fileMode=true" else "core.fileMode=false" });
     if (conversions.symlinks) |value| try argv.appendSlice(arena, &.{ "-c", if (value) "core.symlinks=true" else "core.symlinks=false" });
     if (conversions.autocrlf) |value| try argv.appendSlice(arena, &.{ "-c", switch (value) {
@@ -1320,15 +1407,15 @@ test "safe git argv turns off repository programs for every subcommand" {
     var argv: std.ArrayList([]const u8) = .empty;
     try appendCommand(arena, &argv, ready, .diff);
     const expected = [_][]const u8{
-        "/usr/bin/git",             "--no-pager",              "--no-optional-locks",
-        "-c",                       "core.fsmonitor=false",    "-c",
-        "core.hooksPath=/dev/null", "-c",                      "protocol.allow=never",
-        "-c",                       "log.showSignature=false", "-c",
-        "filter.lfs.clean=",        "-c",                      "filter.lfs.smudge=",
-        "-c",                       "filter.lfs.process=",     "-c",
-        "filter.evil.x.clean=",     "-c",                      "filter.evil.x.smudge=",
-        "-c",                       "filter.evil.x.process=",  "diff",
-        "--no-ext-diff",            "--no-textconv",           "--ignore-submodules=all",
+        "/usr/bin/git",             "--no-pager",           "--no-optional-locks",
+        "-c",                       "core.fsmonitor=false", "-c",
+        "core.hooksPath=/dev/null", "-c",                   "log.showSignature=false",
+        "-c",                       "filter.lfs.clean=",    "-c",
+        "filter.lfs.smudge=",       "-c",                   "filter.lfs.process=",
+        "-c",                       "filter.evil.x.clean=", "-c",
+        "filter.evil.x.smudge=",    "-c",                   "filter.evil.x.process=",
+        "diff",                     "--no-ext-diff",        "--no-textconv",
+        "--ignore-submodules=all",
     };
     try std.testing.expectEqual(expected.len, argv.items.len);
     for (expected, argv.items) |want, have| try std.testing.expectEqualStrings(want, have);
@@ -1341,7 +1428,7 @@ test "safe git environment keeps only fixed values and user config locations" {
     try std.testing.expectEqualStrings("0", env.get("GIT_OPTIONAL_LOCKS").?);
     try std.testing.expectEqualStrings("0", env.get("GIT_TERMINAL_PROMPT").?);
     try std.testing.expectEqualStrings("cat", env.get("GIT_PAGER").?);
-    try std.testing.expectEqualStrings("1", env.get("GIT_NO_LAZY_FETCH").?);
+    try std.testing.expect(env.get("GIT_NO_LAZY_FETCH") == null);
     for ([_][]const u8{ "GIT_DIR", "GIT_WORK_TREE", "GIT_CONFIG_PARAMETERS", "GIT_CONFIG_COUNT", "GIT_EXEC_PATH" }) |key| {
         try std.testing.expect(env.get(key) == null);
     }
@@ -1968,6 +2055,101 @@ test "safe git store preparation refuses a config hook it cannot turn off" {
     try std.testing.expectEqual(Refusal.unsupported_hook_name, prepared.refused);
 }
 
+test "safe git turns off hooks that repository and global config define for the agent's git" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const repo = try SentinelRepo.init(arena_state.allocator(), tmp.dir);
+    try repo.plain(repo.repo, &.{ "config", "hook.evil.command", repo.sentinel });
+    try repo.plain(repo.repo, &.{ "config", "hook.evil.event", "post-index-change" });
+    try repo.write("home/.gitconfig", try repo.arena.print("[hook \"Global.Name\"]\n\tcommand = {s}\n\tevent = post-index-change\n", .{repo.sentinel}));
+    var env = try repo.childEnvironment(.{ .safe = null });
+    io_mod.setEnvironMap(&env);
+    defer io_mod.resetEnvironForTest();
+    const ready = try repo.ready(repo.repo);
+    try std.testing.expectEqual(@as(usize, 2), ready.hook_names.len);
+    var saw_evil = false;
+    var saw_global = false;
+    for (ready.hook_names) |name| {
+        if (std.mem.eql(u8, name, "evil")) saw_evil = true;
+        if (std.mem.eql(u8, name, "Global.Name")) saw_global = true;
+    }
+    try std.testing.expect(saw_evil);
+    try std.testing.expect(saw_global);
+    var argv: std.ArrayList([]const u8) = .empty;
+    try appendCommand(repo.arena, &argv, ready, .diff);
+    var saw_evil_off = false;
+    var saw_global_off = false;
+    for (argv.items) |arg| {
+        if (std.mem.eql(u8, arg, "hook.evil.enabled=false")) saw_evil_off = true;
+        if (std.mem.eql(u8, arg, "hook.Global.Name.enabled=false")) saw_global_off = true;
+    }
+    try std.testing.expect(saw_evil_off);
+    try std.testing.expect(saw_global_off);
+}
+
+test "safe git agent preparation refuses a hook name it cannot turn off" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const repo = try SentinelRepo.init(arena_state.allocator(), tmp.dir);
+    // `-c` splits a setting at its first `=`, so this hook name cannot be
+    // turned off in an agent command.
+    const existing = try readFixtureFile(repo, "repo/.git/config");
+    try repo.write("repo/.git/config", try repo.arena.print("{s}[hook \"a=b\"]\n\tcommand = /bin/true\n", .{existing}));
+    var env = try repo.childEnvironment(.{ .safe = null });
+    io_mod.setEnvironMap(&env);
+    defer io_mod.resetEnvironForTest();
+    const prepared = try prepare(repo.arena, repo.repo);
+    try std.testing.expectEqual(Refusal.unsupported_hook_name, prepared.refused);
+}
+
+test "safe git store commands turn off a hook a global include adds only for the store" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const repo = try SentinelRepo.init(arena_state.allocator(), tmp.dir);
+    const head = try repo.plainOutput(repo.repo, &.{ "rev-parse", "HEAD" });
+    const fixture = try StoreFixture.init(repo);
+    try repo.write("hooks.inc", try repo.arena.print("[hook \"inc\"]\n\tcommand = {s}\n\tevent = post-index-change\n\tevent = reference-transaction\n", .{repo.sentinel}));
+    try repo.write("home/.gitconfig", try repo.arena.print("[includeIf \"gitdir:{s}\"]\n\tpath = {s}\n", .{ fixture.store.git_dir, try repo.path("hooks.inc") }));
+
+    // Listing at `/` cannot see a hook scoped to the store's git dir.
+    var env = try repo.childEnvironment(.{ .safe = null });
+    const at_root = switch (try prepareStoreWith(repo.arena, .{}, &env)) {
+        .ready => |value| value,
+        .refused => return error.TestUnexpectedRefusal,
+    };
+    for (at_root.hook_names) |name| try std.testing.expect(!std.mem.eql(u8, name, "inc"));
+
+    // The store's own context sees it.
+    var base = try repo.childEnvironment(.{ .safe = null });
+    try base.put("GIT_DIR", fixture.store.git_dir);
+    try base.put("GIT_INDEX_FILE", fixture.store.index_file);
+    try base.put("GIT_WORK_TREE", fixture.store.work_tree);
+    const store_hooks = try storeHookNames(repo.arena, fixture.ready, fixture.store, &base, .{});
+    const names = switch (store_hooks) {
+        .names => |value| value,
+        .failed => return error.TestUnexpectedFailure,
+    };
+    var saw_inc = false;
+    for (names) |name| {
+        if (std.mem.eql(u8, name, "inc")) saw_inc = true;
+    }
+    try std.testing.expect(saw_inc);
+
+    _ = try fixture.ok(.{ .read_tree = head });
+    try repo.write("repo/a.txt", "ten\n");
+    _ = try fixture.ok(.{ .add_remove = &.{"a.txt"} });
+    const tree = try fixture.ok(.write_tree);
+    const commit = try fixture.ok(.{ .commit_tree = .{ .tree = tree, .parent = null, .message = "capture\n", .unix_seconds = 7 } });
+    _ = try fixture.ok(.{ .update_ref = .{ .ref = "refs/fx/sessions/s1/w", .new = commit, .old = null } });
+    try std.testing.expectEqual(@as(usize, 0), try repo.runs());
+}
+
 test "safe git capture store stops a slow trusted filter at its deadline" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
@@ -2351,9 +2533,10 @@ test "safe git capture store runs a real git-lfs installed where git is trusted"
     try repo.write("home/.gitconfig", "[filter \"lfs\"]\n\tclean = git-lfs clean -- %f\n\tsmudge = git-lfs smudge -- %f\n\tprocess = git-lfs filter-process\n\trequired = true\n");
     try repo.write("repo/.gitattributes", "*.bin filter=lfs diff=lfs merge=lfs -text\n");
     try repo.write("repo/big.bin", "large content\n");
-    _ = try fixture.ok(.{ .read_tree = head });
-    _ = try fixture.ok(.{ .add_remove = &.{ ".gitattributes", "big.bin" } });
-    const tree = try fixture.ok(.write_tree);
+    // A cold git-lfs start can pass the default 2 s on a loaded machine.
+    _ = try expectOk(try fixture.run(.{ .read_tree = head }, .{ .safe = null }, .{ .timeout_ms = 10_000 }));
+    _ = try expectOk(try fixture.run(.{ .add_remove = &.{ ".gitattributes", "big.bin" } }, .{ .safe = null }, .{ .timeout_ms = 10_000 }));
+    const tree = try expectOk(try fixture.run(.write_tree, .{ .safe = null }, .{ .timeout_ms = 10_000 }));
     const blob = try fixture.storeOutput(&.{ "cat-file", "-p", try repo.arena.print("{s}:big.bin", .{tree}) });
     try std.testing.expect(std.mem.startsWith(u8, blob, "version https://git-lfs.github.com/spec/v1"));
 }
@@ -2667,14 +2850,14 @@ test "safe git preparation within a passed deadline refuses instead of running o
     const io = std.testing.io;
     try std.testing.expect(try prepare(repo.arena, repo.repo) == .ready);
     const past: std.Io.Clock.Timestamp = .fromNow(io, .{ .clock = .awake, .raw = .fromMilliseconds(-1) });
-    try std.testing.expect(try prepareWithin(repo.arena, repo.repo, .{ .deadline = past }) == .refused);
+    try std.testing.expectEqual(Refusal.timed_out, (try prepareWithin(repo.arena, repo.repo, .{ .deadline = past })).refused);
     // The version check, too, when its answer is not cached yet.
     {
         version_lock.lockUncancelable(io);
         defer version_lock.unlock(io);
         cached_version = null;
     }
-    try std.testing.expect(try prepareWithin(repo.arena, repo.repo, .{ .deadline = past }) == .refused);
+    try std.testing.expectEqual(Refusal.timed_out, (try prepareWithin(repo.arena, repo.repo, .{ .deadline = past })).refused);
     // A version check cut off at the deadline leaves no answer to reuse.
     try std.testing.expect(cached_version == null);
 }
