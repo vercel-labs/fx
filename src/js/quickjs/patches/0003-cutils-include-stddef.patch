@@ -1,0 +1,12 @@
+diff --git a/cutils.h b/cutils.h
+index d441bba..3eedf26 100644
+--- a/cutils.h
++++ b/cutils.h
+@@ -26,6 +26,7 @@
+ #define CUTILS_H
+ 
+ #include <assert.h>
++#include <stddef.h>
+ #include <stdio.h>
+ #include <stdarg.h>
+ #include <time.h>

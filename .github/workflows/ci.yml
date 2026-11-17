@@ -66,6 +66,9 @@ jobs:
       - name: Check recovery boundary
         run: ./scripts/check-recovery-boundary.sh
 
+      - name: Check the JavaScript engine against its release
+        run: ./scripts/quickjs-fork.sh check
+
       - name: Model-check request recovery
         run: |
           set -euo pipefail
