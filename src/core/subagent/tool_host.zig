@@ -1078,8 +1078,9 @@ pub const Runtime = struct {
     /// Makes the parent's next message waiting for `child_id` the slot's
     /// next work, or else marks the child idle.
     fn nextOrIdleLocked(self: *Runtime, child_id: []const u8) bool {
-        if (self.startNextPendingLocked(child_id)) {
-            self.managed.markNext(child_id);
+        const messages = self.startNextPendingLocked(child_id);
+        if (messages > 0) {
+            self.managed.markNext(child_id, messages);
             return true;
         }
         self.clearBusyLocked(child_id);
@@ -1091,6 +1092,14 @@ pub const Runtime = struct {
     /// others waiting, so the child's next work takes them.
     fn queueLeftoversLocked(self: *Runtime, end: managed_owner.WorkEnd) void {
         if (end.leftovers.len == 0) return;
+        // A stop or close that came after the slot kept them counted them as
+        // dropped, so none may start a work.
+        if (!self.managed.handOverLeftovers(end.child_id)) {
+            for (end.leftovers) |work| {
+                debug_trace.eventf("mailbox", "dropped", .{}, "child={s} work_id={s} reason=stopped", .{ end.child_id, work.id });
+            }
+            return;
+        }
         var scratch = std.heap.ArenaAllocator.init(self.alloc);
         defer scratch.deinit();
         const name = self.childName(scratch.allocator(), end.child_id) catch end.child_id;
@@ -1140,11 +1149,11 @@ pub const Runtime = struct {
     /// and `from_queue` the subagent's own queue already dropped. The parent
     /// learns of the drop from the stopped work's report, or else a notice.
     pub fn userStopped(self: *Runtime, child_id: []const u8, from_queue: usize) void {
-        self.managed.noteUserStop(child_id);
         self.admission_mutex.lockUncancelable(io_mod.getIo());
         defer self.admission_mutex.unlock(io_mod.getIo());
+        self.managed.noteUserStop(child_id);
         if (self.findTurnWorkLocked(child_id)) |index| self.turn_works.items[index].stopped_by = .user;
-        const dropped = self.dropPendingLocked(child_id, "stopped_by_user") + from_queue;
+        const dropped = self.dropPendingLocked(child_id, "stopped_by_user") + from_queue + self.managed.takeDropped(child_id);
         debug_trace.eventf("mailbox", "stop", .{}, "target={s} by=user running={} dropped={d}", .{ child_id, self.isBusyLocked(child_id), dropped });
         self.noteUserDropLocked(child_id, dropped, false);
     }
@@ -1381,15 +1390,16 @@ pub const Runtime = struct {
     }
 
     /// Makes the next message waiting for `child_id` its next work, which
-    /// the child's slot runs at once. False when none waits or it could not
-    /// be started, which drops it.
-    fn startNextPendingLocked(self: *Runtime, child_id: []const u8) bool {
+    /// the child's slot runs at once. Returns how many of the parent's
+    /// messages the work carries, or 0 when none waits or it could not be
+    /// started, which drops it.
+    fn startNextPendingLocked(self: *Runtime, child_id: []const u8) usize {
         const index = for (self.pending.items, 0..) |item, i| {
             if (std.mem.eql(u8, item.child_id, child_id)) break i;
-        } else return false;
+        } else return 0;
         var item = self.pending.orderedRemove(index);
         defer item.deinit(self.alloc);
-        self.absorbPendingLocked(&item, index);
+        const messages = 1 + self.absorbPendingLocked(&item, index);
         var lock = self.managed.state_store.acquireLock();
         defer lock.release();
         var registry = self.managed.state_store.load(self.alloc) catch |err| return self.dropStart(item, err);
@@ -1397,16 +1407,17 @@ pub const Runtime = struct {
         _ = registry.startPersistentWork(self.alloc, item.agent, null, item.work) catch |err| return self.dropStart(item, err);
         self.managed.state_store.save(self.alloc, registry) catch |err| return self.dropStart(item, err);
         debug_trace.eventf("mailbox", "next_turn", .{}, "child={s} work_id={s}", .{ child_id, item.work.id });
-        return true;
+        return messages;
     }
 
     /// The messages waiting for `head`'s child behind it join the turn it
     /// starts, in order: one turn and one report.
     /// They arrive as one message, each in its own paragraph, with the
     /// newest root request for the reviewer. `from` is where the next of
-    /// the child's waiting messages can be.
-    fn absorbPendingLocked(self: *Runtime, head: *Pending, from: usize) void {
+    /// the child's waiting messages can be. Returns how many it joined.
+    fn absorbPendingLocked(self: *Runtime, head: *Pending, from: usize) usize {
         var index = from;
+        var joined_count: usize = 0;
         while (index < self.pending.items.len) {
             const next = &self.pending.items[index];
             if (!std.mem.eql(u8, next.child_id, head.child_id)) {
@@ -1415,7 +1426,7 @@ pub const Runtime = struct {
             }
             const joined = std.mem.concat(self.alloc, u8, &.{ head.work.message, "\n\n", next.work.message }) catch {
                 debug_trace.logf("mailbox", "absorb skipped child={s} work_id={s} reason=out_of_memory", .{ head.child_id, next.work.id });
-                return;
+                return joined_count;
             };
             self.alloc.free(head.work.message);
             head.work.message = joined;
@@ -1426,7 +1437,9 @@ pub const Runtime = struct {
             var absorbed = self.pending.orderedRemove(index);
             self.forgetCallLocked(absorbed.work.id);
             absorbed.deinit(self.alloc);
+            joined_count += 1;
         }
+        return joined_count;
     }
 
     fn inTurnWorkLocked(self: *const Runtime, child_id: []const u8) bool {
@@ -1609,8 +1622,9 @@ pub const Runtime = struct {
             self.clearBusyLocked(child_id);
             return;
         }
-        if (self.startNextPendingLocked(child_id)) {
-            _ = self.managed.start(child_id) catch |err| {
+        const messages = self.startNextPendingLocked(child_id);
+        if (messages > 0) {
+            _ = self.managed.start(child_id, messages) catch |err| {
                 debug_trace.eventf("mailbox", "start_failed", .{}, "child={s} error={s}", .{ child_id, @errorName(err) });
                 self.clearBusyLocked(child_id);
             };
@@ -1637,10 +1651,11 @@ pub const Runtime = struct {
         });
     }
 
-    fn dropStart(self: *Runtime, item: Pending, err: anyerror) bool {
+    /// Drops a message that could not be made a work: it carries no messages.
+    fn dropStart(self: *Runtime, item: Pending, err: anyerror) usize {
         debug_trace.eventf("mailbox", "dropped", .{}, "child={s} work_id={s} reason={s}", .{ item.child_id, item.work.id, @errorName(err) });
         self.forgetCallLocked(item.work.id);
-        return false;
+        return 0;
     }
 
     /// `wait`: blocks on the caller's own worker until a report or message
@@ -1991,9 +2006,12 @@ pub const Runtime = struct {
             defer self.admission_mutex.unlock(io_mod.getIo());
             const waiting = self.dropPendingLocked(child_id, "stopped");
             // The stopped turn's unread messages go with it, so they count
-            // too (`tests/tla/subagent/StopMessage.tla` NoSilentLoss).
-            if (self.managed.stop(child_id)) |unread| break :blk .{ waiting + unread, true };
-            break :blk .{ waiting, self.stopTurnWorkLocked(child_id) };
+            // too, and so do the messages its slot keeps or carries into the
+            // next work (`tests/tla/subagent/StopMessage.tla` NoSilentLoss).
+            const unread = self.managed.stop(child_id);
+            const held = self.managed.takeDropped(child_id);
+            if (unread) |count| break :blk .{ waiting + count + held, true };
+            break :blk .{ waiting + held, self.stopTurnWorkLocked(child_id) };
         };
         debug_trace.eventf("mailbox", "stop", .{}, "target={s} by=parent running={} dropped={d}", .{ child_id, stopped, dropped });
         const dropped_text = switch (dropped) {
@@ -2061,12 +2079,6 @@ pub const Runtime = struct {
             for (self.start_waits.items) |wait| {
                 if (std.mem.eql(u8, wait.child_id, child_id)) wait.closed = true;
             }
-            // A user's close tells the parent what it dropped, as a stop does,
-            // and keeps the name for main's status and its next message to it.
-            if (by == .user) {
-                self.noteUserDropLocked(child_id, dropped, true);
-                if (name) |value| self.noteUserClosedLocked(value);
-            }
             // The parent's close drops the closed turn's unread messages
             // and counts them, as its stop does.
             var unread: usize = 0;
@@ -2075,8 +2087,19 @@ pub const Runtime = struct {
                     unread = count;
                     break :ended true;
                 } else false,
-                .user => self.managed.closeByUser(child_id),
+                .user => if (self.managed.closeByUser(child_id)) |count| ended: {
+                    unread = count;
+                    break :ended true;
+                } else false,
             } or self.stopTurnWorkLocked(child_id);
+            // So do the messages its slot keeps or carries into the next work.
+            unread += self.managed.takeDropped(child_id);
+            // A user's close tells the parent what it dropped, as a stop does,
+            // and keeps the name for main's status and its next message to it.
+            if (by == .user) {
+                self.noteUserDropLocked(child_id, dropped + unread, true);
+                if (name) |value| self.noteUserClosedLocked(value);
+            }
             self.closing.appendAssumeCapacity(.{ .id = owned });
             self.closed_unseen.appendAssumeCapacity(unseen);
             self.closed_waiting.store(true, .release);
@@ -2503,7 +2526,7 @@ pub const Runtime = struct {
         if (admitted == .ready) {
             const child_id = admitted.ready.child_id;
             try self.markBusyLocked(child_id);
-            _ = self.managed.start(child_id) catch |err| {
+            _ = self.managed.start(child_id, 0) catch |err| {
                 debug_trace.eventf("mailbox", "start_failed", .{}, "child={s} work_id={s} error={s}", .{ child_id, operation_id, @errorName(err) });
                 self.clearBusyLocked(child_id);
                 return err;
@@ -4287,7 +4310,8 @@ fn expectStopStopsNextWork(hosted: bool) !void {
     defer ended.deinit();
 
     const answer = try callTool(ended.runtime, ended.arena_state.allocator(), .{ .stop = .{ .agent = "reviewer" } }, "call-3", null);
-    try std.testing.expect(std.mem.find(u8, answer, "Stopped reviewer: its turn ended.") != null);
+    // The stop drops the message the next work carries, and says so.
+    try std.testing.expect(std.mem.find(u8, answer, "Stopped reviewer: its turn ended, and the message waiting for it was dropped.") != null);
     PublishHold.release();
     try waitUntilQuiet(ended.runtime);
     // The second turn began stopped: its run saw the cancel at its start. It
