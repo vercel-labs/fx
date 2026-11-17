@@ -7457,6 +7457,129 @@ test "a close after a stop in the gap before the end hook counts nothing the sto
     try std.testing.expect(std.mem.find(u8, closed, "dropped") == null);
 }
 
+test "the user's stop that lands as the next work is installed counts nothing, and its work runs" {
+    PublishHold.arm();
+    defer PublishHold.clear();
+    var t: StopFixture = undefined;
+    try t.init(.{ .hold = true });
+    defer t.deinit();
+    const arena = t.arena();
+    const runtime = t.runtime;
+    const fixture = &t.fixture;
+    defer PublishHold.release();
+
+    try EndHooks.endFirstWorkHoldingNext(runtime, fixture, arena);
+    const child_id = try reviewerId(runtime, arena);
+    // The user's stop ends no work and cancels none (`Owner.noteUserStop`), so
+    // the work the host chose runs, and it must not report its message as
+    // dropped.
+    runtime.userStopped(child_id, 0);
+    PublishHold.release();
+    try waitForSlotEnd(runtime, child_id);
+    try std.testing.expectEqual(@as(usize, 2), fixture.begun.load(.seq_cst));
+    try std.testing.expectEqual(@as(usize, 2), fixture.reportCount());
+    try std.testing.expect(std.mem.endsWith(u8, fixture.reports.items[1], "DONE second"));
+    try std.testing.expectEqual(@as(usize, 0), runtime.user_dropped.items.len);
+}
+
+test "the user's stop that lands as the user's turn ends and the waiting message starts counts nothing, and its work runs" {
+    defer HeldStart.clear();
+    var t: StopFixture = undefined;
+    try t.init(.{});
+    defer t.deinit();
+    const alloc = std.testing.allocator;
+    const arena = t.arena();
+    const runtime = t.runtime;
+    const fixture = &t.fixture;
+
+    _ = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "working" } }, "call-1", null);
+    try waitUntilQuiet(runtime);
+    const child_id = try reviewerId(runtime, arena);
+    const work_id = runtime.beginUserWork(alloc, child_id, null).?;
+    defer alloc.free(work_id);
+    const queued = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "after the user" } }, "call-2", null);
+    try std.testing.expect(std.mem.find(u8, queued, "is busy") != null);
+    HeldStart.arm();
+    defer HeldStart.release();
+
+    runtime.endUserWork(child_id, work_id, .completed, "");
+    try HeldStart.waitHeld();
+    // The new slot has no worker yet; the user's stop cancels nothing there.
+    runtime.userStopped(child_id, 0);
+    HeldStart.release();
+    try waitUntilQuiet(runtime);
+    try std.testing.expectEqual(@as(usize, 2), fixture.begun.load(.seq_cst));
+    try std.testing.expectEqual(@as(usize, 2), fixture.reportCount());
+    try std.testing.expect(std.mem.endsWith(u8, fixture.reports.items[1], "DONE after the user"));
+    try std.testing.expectEqual(@as(usize, 0), runtime.user_dropped.items.len);
+}
+
+test "a stop of the next work after the user's stop counted nothing counts its message once" {
+    PublishHold.arm();
+    defer PublishHold.clear();
+    var t: StopFixture = undefined;
+    try t.init(.{ .hold = true });
+    defer t.deinit();
+    const arena = t.arena();
+    const runtime = t.runtime;
+    const fixture = &t.fixture;
+    defer PublishHold.release();
+
+    try EndHooks.endFirstWorkHoldingNext(runtime, fixture, arena);
+    const child_id = try reviewerId(runtime, arena);
+    runtime.userStopped(child_id, 0);
+    const stopped = try callTool(runtime, arena, .{ .stop = .{ .agent = "reviewer" } }, "call-3", null);
+    PublishHold.release();
+    try waitForSlotEnd(runtime, child_id);
+    // The parent's stop ends the work and counts its message, once, and the
+    // user's stop before it left nothing for the report to repeat.
+    try std.testing.expect(std.mem.find(u8, stopped, "Stopped reviewer: its turn ended, and the message waiting for it was dropped.") != null);
+    try std.testing.expectEqual(@as(usize, 1), fixture.begun.load(.seq_cst));
+    try std.testing.expectEqual(@as(usize, 1), fixture.reportCount());
+    try std.testing.expectEqual(@as(usize, 0), runtime.user_dropped.items.len);
+}
+
+/// A close of `child_id` that lands as the user's turn ends and the waiting
+/// message starts a new slot, held before its worker attaches.
+fn expectCloseWhereWaitingMessageStarts(by: Runtime.CloseBy) !void {
+    defer HeldStart.clear();
+    var t: StopFixture = undefined;
+    try t.init(.{});
+    defer t.deinit();
+    const alloc = std.testing.allocator;
+    const arena = t.arena();
+    const runtime = t.runtime;
+    const fixture = &t.fixture;
+
+    _ = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "working" } }, "call-1", null);
+    try waitUntilQuiet(runtime);
+    const child_id = try reviewerId(runtime, arena);
+    const work_id = runtime.beginUserWork(alloc, child_id, null).?;
+    defer alloc.free(work_id);
+    const queued = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "after the user" } }, "call-2", null);
+    try std.testing.expect(std.mem.find(u8, queued, "is busy") != null);
+    HeldStart.arm();
+    defer HeldStart.release();
+
+    runtime.endUserWork(child_id, work_id, .completed, "");
+    try HeldStart.waitHeld();
+    const closed = (try runtime.closeChild(child_id, by)).?;
+    HeldStart.release();
+    try waitUntilQuiet(runtime);
+    // The close ends that work, so the message it counted never runs.
+    try std.testing.expect(closed.stopped);
+    try std.testing.expectEqual(@as(usize, 1), closed.dropped);
+    try std.testing.expectEqual(@as(usize, 1), fixture.begun.load(.seq_cst));
+}
+
+test "the parent's close that lands as the waiting message starts drops it, and it never runs" {
+    try expectCloseWhereWaitingMessageStarts(.parent);
+}
+
+test "the user's close that lands as the waiting message starts drops it, and it never runs" {
+    try expectCloseWhereWaitingMessageStarts(.user);
+}
+
 test "a stop after the next work began does not count its message" {
     PublishHold.arm();
     defer PublishHold.clear();
