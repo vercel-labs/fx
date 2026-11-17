@@ -9619,6 +9619,31 @@ test "a hold that began long after the finish still ends at its limit, and says 
     try std.testing.expect(waited < WorkerRuntime.commit_gate_limit_ms + 1000);
 }
 
+test "text a user typed while a turn ran, which missed the turn, waits for its commit like mail" {
+    const alloc = std.testing.allocator;
+    var runtime = WorkerRuntime{};
+    defer runtime.deinit(alloc);
+    runtime.enableCommitGate();
+    runtime.worker_processing = true;
+    runtime.active_turn_id = 9;
+    try runtime.admitInteractivePrompt(alloc, try makePrompt(alloc, "typed while the turn ran", "model"));
+    try pushTestFinish(alloc, &runtime);
+    runtime.finishProcessing();
+
+    // The turn ended before it took the text in, so the text is a
+    // continuation of it, and the gate holds it as it holds mail.
+    try std.testing.expect(runtime.queued_prompts.items[0].delivery.isContinuation());
+    try std.testing.expectEqual(@as(u32, 1), runtime.unacknowledged_finishes);
+    try std.testing.expect(runtime.commitGateWaitsForCommit());
+    try std.testing.expect((try runtime.tryTakeNextWork(alloc)) == null);
+
+    runtime.acknowledgeFinishCommitted();
+    try std.testing.expect(!runtime.commitGateWaitsForCommit());
+    const work = (try runtime.tryTakeNextWork(alloc)).?;
+    defer freeWorkItem(alloc, work);
+    try std.testing.expectEqualStrings("typed while the turn ran", work.prompt.prompt);
+}
+
 test "the commit gate logs what it held, what released it, and the limit it gave up at" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});

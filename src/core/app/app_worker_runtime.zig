@@ -6114,6 +6114,26 @@ const FlushApp = struct {
         return .committed;
     }
 
+    /// The request of a report or of typed text, as the worker queues it.
+    fn queuedRequest(gpa: std.mem.Allocator, prompt: []const u8) !worker_runtime.QueuedPrompt {
+        return .{
+            .prompt = try gpa.dupe(u8, prompt),
+            .images = &.{},
+            .model = try gpa.dupe(u8, "test-model"),
+            .api_key = try gpa.dupe(u8, "test-key"),
+            .permission_mode = .auto,
+            .history = try gpa.alloc(types.HistoryTurn, 0),
+            .grants = try gpa.alloc(types.PermissionGrant, 0),
+        };
+    }
+
+    /// The pacer is still showing `shown` of a turn, and keeps that turn's
+    /// finish behind it, as an open prompt makes it.
+    fn pacerHoldsFinishedTurn(self: *FlushApp, shown: []const u8) !void {
+        try self.pacer.enqueue(self.alloc, shown);
+        try std.testing.expect(try Runtime(FlushApp).deferFinish(self, self.agent(), .{ .turn = finished_turn }));
+    }
+
     /// The worker finished a turn that a report missed, and the loop took the
     /// finish into its pacer, which a prompt keeps from showing it.
     fn finishedTurnWithMailBehindOpenPrompt(self: *FlushApp, shown: []const u8) !void {
@@ -6124,22 +6144,13 @@ const FlushApp = struct {
         worker.active_turn_id = 9;
         worker.direct_steering_closed = true;
         try worker.pushEvent(gpa, .{ .finish_prompt = .{ .turn = finished_turn } });
-        try worker.postMail(gpa, .{
-            .prompt = try gpa.dupe(u8, "a report"),
-            .images = &.{},
-            .model = try gpa.dupe(u8, "test-model"),
-            .api_key = try gpa.dupe(u8, "test-key"),
-            .permission_mode = .auto,
-            .history = try gpa.alloc(types.HistoryTurn, 0),
-            .grants = try gpa.alloc(types.PermissionGrant, 0),
-        });
+        try worker.postMail(gpa, try queuedRequest(gpa, "a report"));
         try std.testing.expect(worker.queued_prompts.items[0].delivery.isContinuation());
         worker.finishProcessing();
         var events = worker.takeEvents();
         for (events.items) |event| worker_runtime.freeWorkerEvent(gpa, event);
         events.deinit(gpa);
-        try self.pacer.enqueue(self.alloc, shown);
-        try std.testing.expect(try Runtime(FlushApp).deferFinish(self, self.agent(), .{ .turn = finished_turn }));
+        try self.pacerHoldsFinishedTurn(shown);
     }
 };
 
@@ -6190,8 +6201,7 @@ test "the loop leaves a pacer alone unless it holds a finished turn the worker h
         var app: FlushApp = .{ .alloc = std.testing.allocator };
         defer app.deinit();
         const agent = app.agent();
-        try app.pacer.enqueue(app.alloc, "still showing");
-        try std.testing.expect(try Runtime(FlushApp).deferFinish(&app, agent, .{ .turn = FlushApp.finished_turn }));
+        try app.pacerHoldsFinishedTurn("still showing");
         Runtime(FlushApp).flushPacerForHeldMail(&app, agent, 0);
         try std.testing.expectEqual(@as(usize, 0), app.emit_attempts);
         try std.testing.expect(app.pacer.deferred_turn != null);
@@ -6209,17 +6219,8 @@ test "the loop leaves a pacer alone unless it holds a finished turn the worker h
         const agent = app.agent();
         agent.worker.enableCommitGate();
         try agent.worker.pushEvent(gpa, .{ .finish_prompt = .{ .turn = FlushApp.finished_turn } });
-        try agent.worker.enqueuePrompt(gpa, .{
-            .prompt = try gpa.dupe(u8, "typed"),
-            .images = &.{},
-            .model = try gpa.dupe(u8, "test-model"),
-            .api_key = try gpa.dupe(u8, "test-key"),
-            .permission_mode = .auto,
-            .history = try gpa.alloc(types.HistoryTurn, 0),
-            .grants = try gpa.alloc(types.PermissionGrant, 0),
-        });
-        try app.pacer.enqueue(app.alloc, "still showing");
-        try std.testing.expect(try Runtime(FlushApp).deferFinish(&app, agent, .{ .turn = FlushApp.finished_turn }));
+        try agent.worker.enqueuePrompt(gpa, try FlushApp.queuedRequest(gpa, "typed"));
+        try app.pacerHoldsFinishedTurn("still showing");
         Runtime(FlushApp).flushPacerForHeldMail(&app, agent, 0);
         try std.testing.expectEqual(@as(usize, 0), app.emit_attempts);
         try std.testing.expect(app.pacer.deferred_turn != null);
@@ -6241,16 +6242,46 @@ test "a flush whose commit fails is not held against the next hold" {
     // The next finish holds the same mail again, and the loop flushes for it.
     app.fail_commit = false;
     app.pacer.clear(app.alloc);
-    try app.pacer.enqueue(app.alloc, "second");
     try agent.worker.pushEvent(std.heap.c_allocator, .{ .finish_prompt = .{ .turn = FlushApp.finished_turn } });
     var events = agent.worker.takeEvents();
     for (events.items) |event| worker_runtime.freeWorkerEvent(std.heap.c_allocator, event);
     events.deinit(std.heap.c_allocator);
-    try std.testing.expect(try Runtime(FlushApp).deferFinish(&app, agent, .{ .turn = FlushApp.finished_turn }));
+    try app.pacerHoldsFinishedTurn("second");
     try std.testing.expect(agent.worker.commitGateWaitsForCommit());
     Runtime(FlushApp).flushPacerForHeldMail(&app, agent, 0);
     try std.testing.expectEqual(@as(usize, 2), app.commits);
     try std.testing.expectEqual(@as(u32, 0), agent.worker.unacknowledged_finishes);
+}
+
+test "the loop flushes the pacer behind a prompt for text the user typed that missed the turn" {
+    var app: FlushApp = .{ .alloc = std.testing.allocator };
+    defer app.deinit();
+    const agent = app.agent();
+    const gpa = std.heap.c_allocator;
+    const worker = &agent.worker;
+    worker.enableCommitGate();
+    worker.worker_processing = true;
+    worker.active_turn_id = 9;
+    // Typed while the turn ran, and not taken in before it ended.
+    try worker.admitInteractivePrompt(gpa, try FlushApp.queuedRequest(gpa, "typed while the turn ran"));
+    try worker.pushEvent(gpa, .{ .finish_prompt = .{ .turn = FlushApp.finished_turn } });
+    worker.finishProcessing();
+    try std.testing.expect(worker.queued_prompts.items[0].delivery.isContinuation());
+    var events = worker.takeEvents();
+    for (events.items) |event| worker_runtime.freeWorkerEvent(gpa, event);
+    events.deinit(gpa);
+    try app.pacerHoldsFinishedTurn("still showing");
+    try std.testing.expect(worker.commitGateWaitsForCommit());
+
+    Runtime(FlushApp).flushPacerForHeldMail(&app, agent, 0);
+
+    // The finished turn is shown and committed, and the typed text may start.
+    try std.testing.expectEqualStrings("still showing", app.emitted.items);
+    try std.testing.expectEqual(@as(usize, 1), app.commits);
+    try std.testing.expectEqual(@as(u32, 0), worker.unacknowledged_finishes);
+    const work = (try worker.tryTakeNextWork(gpa)) orelse return error.TestExpectedTextToStart;
+    defer worker_runtime.freeWorkItem(gpa, work);
+    try std.testing.expectEqualStrings("typed while the turn ran", work.prompt.prompt);
 }
 
 test "a flush that fails is logged once, keeps the finished turn, and is not tried again until the hold is over" {
@@ -6283,12 +6314,11 @@ test "a flush that fails is logged once, keeps the finished turn, and is not tri
     try std.testing.expect(!agent.worker.commit_gate_flush_failed);
     app.fail_emit = false;
     app.pacer.clear(alloc);
-    try app.pacer.enqueue(alloc, "second");
     try agent.worker.pushEvent(std.heap.c_allocator, .{ .finish_prompt = .{ .turn = FlushApp.finished_turn } });
     var events = agent.worker.takeEvents();
     for (events.items) |event| worker_runtime.freeWorkerEvent(std.heap.c_allocator, event);
     events.deinit(std.heap.c_allocator);
-    try std.testing.expect(try Runtime(FlushApp).deferFinish(&app, agent, .{ .turn = FlushApp.finished_turn }));
+    try app.pacerHoldsFinishedTurn("second");
     Runtime(FlushApp).flushPacerForHeldMail(&app, agent, 0);
     try std.testing.expectEqual(@as(usize, 1), app.commits);
 
