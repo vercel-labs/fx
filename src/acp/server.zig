@@ -21,6 +21,8 @@ const auth_runtime = @import("../core/auth/auth_runtime.zig");
 const model_provider = @import("../core/config/model_provider.zig");
 const debug_trace = @import("../core/shared/debug_trace.zig");
 const gateway_provider = @import("../core/gateway/gateway_provider.zig");
+const token_pass = @import("../core/gateway/token_pass.zig");
+const token_pass_check = @import("../core/app/token_pass_check.zig");
 const model_catalog = @import("../core/gateway/model_catalog.zig");
 const model_capabilities = @import("../core/config/model_capabilities.zig");
 const hooks = @import("../core/hooks/hooks.zig");
@@ -305,6 +307,9 @@ const ActivePrompt = struct {
     /// Mid-turn mode changes apply to the next prompt, never the running one.
     mode: []const u8,
     permission_mode: types.PermissionMode,
+    /// The usage of every turn the prompt ran, its own and each report turn
+    /// after it. The response reports it. Written by the prompt's own thread.
+    usage: types.Usage = .{},
     thread: if (host_target.is_wasm) void else std.Thread = if (host_target.is_wasm) {} else undefined,
     reapable: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 };
@@ -335,6 +340,11 @@ pub const ServerState = struct {
     provider: model_provider.ProviderId = .gateway,
     configured_model: []u8 = &.{},
     process_model_override: bool = false,
+    /// Whether the credential's team has Token Pass: the check that asks.
+    token_pass_run: ?token_pass_check.Check = null,
+    /// The profile's speeds, kept while nothing chose the model, so new
+    /// sessions follow the team's start model (`token_pass.startModel`).
+    token_pass_start: ?struct { fast_mode: bool, ultrafast_mode: bool } = null,
     process_provider_override: bool = false,
     permission_mode: types.PermissionMode = .ask,
     permission_rules: types.PermissionRuleSet = .{},
@@ -389,10 +399,17 @@ pub const ServerState = struct {
     pending_legacy_urls: std.ArrayList(PendingLegacyUrl) = .empty,
 
     pub fn deinit(self: *ServerState) void {
+        if (self.token_pass_run) |*check| check.finish(self.alloc, "shutdown");
         // Terminals end with this process. Ending them first also releases
         // an active prompt waiting on one.
         self.terminal_client.closeOwnedTerminals();
         reapActivePrompt(self, true);
+        // A subagent inside a command uses `managed_executions` until it stops. Ended first, the runtime
+        // leaves that subagent waiting for ever on the ended runtime's mutex while `closeActiveSession` waits
+        // for it, or fails the assert that no operation is in flight. So the subagents stop first, as in
+        // `fx ask`. A prompt that is still running, or a `session/cancel` that left one at work, can leave a
+        // subagent inside a command here.
+        disableSubagentHost(self);
         self.managed_executions.deinit();
         self.terminal_client.deinit();
         closeActiveSession(self) catch |err| {
@@ -652,6 +669,7 @@ pub fn refreshModelCredential(
     source: types.CredentialSource,
     mode: auth_runtime.CredentialRefreshMode,
     expected_account_id: ?[]const u8,
+    rejected_token: ?[]const u8,
 ) !?[]u8 {
     const state: *ServerState = @ptrCast(@alignCast(raw));
     if (mode == .if_needed and auth_runtime.requestPathCredentialVerifiedRecently(source)) {
@@ -664,6 +682,7 @@ pub fn refreshModelCredential(
         source,
         mode,
         expected_account_id,
+        rejected_token,
     )) orelse return null;
     defer refreshed.deinit(state.alloc);
 
@@ -1482,6 +1501,7 @@ fn dispatchNotification(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Mes
 
 fn dispatch(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message) !void {
     reapActivePrompt(state, false);
+    pollTokenPass(state);
     const method = AcpMethod.parse(msg.method);
 
     if (method == .initialize) {
@@ -2508,6 +2528,7 @@ fn promptWorkerMain(active: *ActivePrompt) void {
         &active.msg,
         active.mode,
         active.permission_mode,
+        &active.usage,
     ) catch |err| .{
         .rpc_error = .{
             .code = ErrorCode.internal_error,
@@ -2602,14 +2623,10 @@ fn publishPromptOutcome(active: *ActivePrompt, outcome: prompt_handler.TerminalO
         .stop_reason => |stop_reason| {
             var response: std.Io.Writer.Allocating = .init(active.alloc);
             defer response.deinit();
-            const usage = if (active.state.active_session) |*session|
-                session.session_rt.agent.turn_usage
-            else
-                types.Usage{};
             try acp_types.writePromptResponseWithUsage(
                 &response.writer,
                 stop_reason,
-                usage,
+                active.usage,
             );
             try active.state.writer.writeResponse(active.alloc, active.msg.id, response.writer.buffered());
         },
@@ -2813,6 +2830,58 @@ test "ordinary ACP ignores private libfx capabilities" {
     try std.testing.expectEqual(@as(usize, 0), request.host_instructions.len);
 }
 
+/// Asks whether the credential's team has Token Pass. A team with Token Pass
+/// starts new sessions on the Token Pass default when nothing chose the
+/// model. The check waits here only when fx has no saved answer, and
+/// `pollTokenPass` takes a later answer.
+fn startTokenPassCheck(state: *ServerState, alloc: Allocator, model_source: config_runtime.ModelSource) void {
+    if (state.provider != .gateway) return;
+    const source = state.credential_source orelse return;
+    const api_key: ?[]const u8 = if (state.api_key.len > 0) state.api_key else null;
+    // A client that sends `initialize` again replaces the earlier check.
+    if (state.token_pass_run) |*earlier| earlier.finish(alloc, "initialize_retried");
+    state.token_pass_run = null;
+    state.token_pass_start = null;
+    const named = token_pass_check.name(alloc, source, api_key, state.account_id, state.gateway_team) orelse return;
+    state.token_pass_run = .{ .named = named, .home = state.cfg.home_override orelse io_mod.homeDir() };
+    state.token_pass_run.?.begin(
+        alloc,
+        state.cfg.provider_set.select(.gateway).credits orelse gateway_provider.unavailable_credits_provider,
+        .{ .credential = api_key, .credential_source = source, .tenant = state.gateway_team },
+        token_pass_check.first_prompt_wait_ms,
+    );
+    if (model_source != .compiled_default or state.process_model_override) return;
+    state.token_pass_start = .{ .fast_mode = state.fast_mode, .ultrafast_mode = state.ultrafast_mode };
+    applyTokenPassStartModel(state);
+}
+
+fn pollTokenPass(state: *ServerState) void {
+    const check = if (state.token_pass_run) |*value| value else return;
+    const before = check.has_pass;
+    if (check.lookup.task != null) check.poll(state.alloc);
+    _ = check.observeCatalog(state.alloc);
+    if (check.has_pass != before) applyTokenPassStartModel(state);
+}
+
+/// Puts new sessions on the team's start model, unless a client chose
+/// another model since. Token Pass credit pays only for standard speed.
+fn applyTokenPassStartModel(state: *ServerState) void {
+    const profile = state.token_pass_start orelse return;
+    const has_pass = if (state.token_pass_run) |check| check.has_pass else false;
+    const target = token_pass.startModelFor(state.selected_model, state.configured_model, has_pass) orelse return;
+    if (!std.mem.eql(u8, state.selected_model, target)) {
+        const owned = state.alloc.dupe(u8, target) catch |err| {
+            debug_trace.logf("token_pass", "start model not applied err={s}", .{@errorName(err)});
+            return;
+        };
+        if (state.selected_model.len > 0) state.alloc.free(state.selected_model);
+        state.selected_model = owned;
+        debug_trace.logf("token_pass", "start model={s}", .{target});
+    }
+    state.fast_mode = if (has_pass) false else profile.fast_mode;
+    state.ultrafast_mode = if (has_pass) false else profile.ultrafast_mode;
+}
+
 fn loadConfiguredStartupState(state: *const ServerState, alloc: Allocator) !app_lifecycle.StartupState {
     if (state.cfg.minimal_kernel) {
         var startup = try app_lifecycle.loadLibfxStartupState(
@@ -3014,6 +3083,9 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
     state.fast_mode = startup.fast_mode and
         (state.cfg.model_override == null or startup.fast_mode_source != .compiled_default);
     configureUltrafastStartup(state, &startup);
+    if (comptime !host_target.is_wasm) {
+        if (!state.cfg.minimal_kernel) startTokenPassCheck(state, alloc, startup.model_source);
+    }
     state.effort = startup.effort;
     state.first_call_tool_choice = startup.first_call_tool_choice;
     state.context_enabled = startup.context_enabled;
@@ -3037,6 +3109,9 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
                 .message = "Selected provider is unavailable in this host",
             });
         _ = try resolveSelectedModelCapabilities(state, startup_catalog);
+        // The catalog just loaded; its Token Pass marks can answer for the
+        // team when the credits check could not.
+        if (comptime !host_target.is_wasm) pollTokenPass(state);
     }
 
     if (state.cfg.effort_override) |raw| {

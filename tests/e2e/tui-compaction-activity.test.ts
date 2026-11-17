@@ -4,7 +4,8 @@ import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync,
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { traceReportNames, waitForNewTraceReport } from "./trace-report";
-import { onlySessionId, savedText, sessionDir } from "./saved-sessions";
+import { logLines, onlySessionId, savedText, sessionDir } from "./saved-sessions";
+import { bearer, rotateFxLogin, startFakeIssuer, writeFxLogin } from "./fx-login-fakes";
 
 // The shared tmux helper imports eval helpers; do not load repository dotenv files.
 process.env.FX_E2E_DISABLE_DOTENV = "1";
@@ -554,6 +555,17 @@ describe.skipIf(!tmuxAvailable())("tui: compaction activity", () => {
       expect(events.some((event) => String(event.detail ?? "").includes("[redacted]"))).toBe(true);
       expect(report.text).not.toContain("abcdef0123456789xyz");
       expect(report.problems("compaction").length).toBeGreaterThan(0);
+      // The failures are also kept apart from the event window, so later
+      // events never push them out of the trace or its problems.
+      const kept = report.all("failed_compaction_event");
+      expect(kept.length).toBeGreaterThan(0);
+      expect(compaction.kept_failures).toBe(kept.length);
+      expect(compaction.session_failures).toBeGreaterThanOrEqual(kept.length);
+      const keptNames = kept.map((event) => event.event);
+      expect(keptNames).toContain("summary_transport_failed");
+      expect(keptNames).toContain("transaction_failed");
+      expect(kept.every((event) => event.failed === true)).toBe(true);
+      expect(report.problems("compaction").map((problem) => problem.event)).toContain("transaction_failed");
       await f.close();
       passed = true;
     } finally { await f.cleanup(passed); }
@@ -665,7 +677,8 @@ describe.skipIf(!tmuxAvailable())("tui: compaction activity", () => {
       });
       await terminal.waitForStableComposer(15_000);
       await terminal.sendText(task);
-      await terminal.waitForText("STEER_WINDOW_8d4", 15_000);
+      // The command's row shows its steps in short form while it runs.
+      await terminal.waitForText("Running printf, sleep", 15_000);
       await terminal.sendText(steering);
       await until(() => summaryBodies.length === 1, "automatic compaction", 60_000);
       await terminal.waitForText("STEER_DONE_8d4", 20_000);
@@ -713,6 +726,174 @@ describe.skipIf(!tmuxAvailable())("tui: compaction activity", () => {
       }
       await terminal?.kill();
       gateway.stop();
+      if (passed) rmSync(root, { recursive: true, force: true });
+    }
+  }, 90_000);
+
+  test("manual: Ctrl+O after the turn across a compaction opens without reading the session log", async () => {
+    const root = mkdtempSync(join(tmpdir(), "fx-compaction-ctrlo-"));
+    const home = join(root, "home");
+    const workspace = join(root, "workspace");
+    const stderrPath = join(root, "stderr");
+    const tracePath = join(root, "trace.log");
+    mkdirSync(join(home, ".fx"), { recursive: true });
+    mkdirSync(workspace);
+    writeFileSync(join(home, ".fx/settings.json"), JSON.stringify({
+      model: FAKE_GATEWAY_MODEL, auto_upgrade: false, startup_scrollback: false,
+    }));
+    const answers = [
+      "CTRLO_OLDER_FIRST_5c1",
+      "CTRLO_OLDER_SECOND_5c1",
+      Array.from({ length: 40 }, (_, i) => `CTRLO_OLDER_ROW_${i + 1}_5c1`).join("\n\n"),
+      "CTRLO_AFTER_COMPACTION_5c1",
+    ];
+    let turns = 0;
+    const gateway = startDynamicFakeGateway((raw) => {
+      const request = JSON.parse(raw);
+      if (request.toolChoice?.type === "none" && request.tools?.length === 0) {
+        return fakeGatewayFinalText("Facts:\nF1: CTRLO_SUMMARY_5c1: earlier turns.");
+      }
+      turns += 1;
+      return fakeGatewayFinalText(answers[Math.min(turns, answers.length) - 1]!);
+    });
+    const env: Record<string, string> = {
+      PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: home, TMPDIR: root,
+      TERM: "xterm-256color", AI_GATEWAY_API_KEY: "fake-compaction-key",
+      FX_DISABLE_KEYCHAIN: "1", FX_TEST_SKIP_ONBOARDING: "1", FX_E2E_DISABLE_DOTENV: "1",
+      FX_SOUND: "0", FX_AUTO_UPGRADE: "0", NO_COLOR: "1",
+      FX_MODEL: FAKE_GATEWAY_MODEL, FX_GATEWAY_BASE_URL: gateway.baseUrl,
+      FX_GATEWAY_CHAT_URL: gateway.chatUrl, FX_TEST_GATEWAY_CHAT_URL: gateway.chatUrl,
+      FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+      FX_TRACE_LOG: tracePath, FX_TRACE_SCOPES: "full_transcript_cache",
+    };
+    const command = `/usr/bin/env -i ${Object.entries(env)
+      .map(([key, value]) => shellQuote(`${key}=${value}`)).join(" ")} ${shellQuote(binary)}`;
+    const trace = () => (existsSync(tracePath) ? readFileSync(tracePath, "utf8") : "");
+    let terminal: InstanceType<typeof TmuxSession> | undefined;
+    let passed = false;
+    try {
+      terminal = await TmuxSession.create({
+        cmd: command, cwd: workspace, env, isolated: true, remainOnExit: true,
+        stderrPath, width: 100, height: 32, startupWaitMs: 0,
+      });
+      await terminal.waitForStableComposer(15_000);
+      for (const [index, answer] of answers.slice(0, 3).entries()) {
+        await terminal.sendText(`Answer ${index + 1}.`);
+        await terminal.waitForText(answer.split("\n").at(-1)!, 15_000);
+        await terminal.waitForComposer(15_000);
+      }
+      const id = onlySessionId(home);
+      await terminal.sendText("/compact");
+      await until(() => logLines(home, id).some((line) => line.kind === "compacted"), "the compaction");
+      await terminal.waitForPane((pane) => !/Preparing compaction|Compacting/.test(pane) && hasEmptyComposer(pane), 15_000);
+      // The turn across the compaction ends, so the window lets the older
+      // cycle go and Ctrl+O's newest page joins it from the log.
+      await terminal.sendText("One more turn.");
+      await terminal.waitForText("CTRLO_AFTER_COMPACTION_5c1", 15_000);
+      await terminal.waitForComposer(15_000);
+      // Between turns the cycle is read in the background and kept.
+      await until(() => trace().includes("archive_loaded back=1"), "the background read of the joined cycle", 15_000);
+      const openAt = trace().length;
+      await terminal.sendKeys("C-o");
+      await terminal.waitForText("esc close", 15_000);
+      await terminal.waitForText("CTRLO_OLDER_ROW_40_5c1", 15_000);
+      const atOpen = trace().slice(openAt);
+      await terminal.sendKeys("Escape");
+      await terminal.waitForComposer(15_000);
+      // The open shows the older cycle without reading the log again.
+      expect(atOpen).not.toContain("archive_read_started");
+      expect(atOpen).not.toContain("archive_loaded");
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+      passed = true;
+    } finally {
+      if (!passed) {
+        writeFileSync(join(root, "failure.trace.log"), trace());
+        if (terminal) writeFileSync(join(root, "failure.scrollback.txt"), await terminal.captureFullScrollback());
+        console.error(`compaction Ctrl+O evidence retained: ${root}`);
+      }
+      await terminal?.kill();
+      gateway.stop();
+      if (passed) rmSync(root, { recursive: true, force: true });
+    }
+  }, 90_000);
+
+  test("manual: a summary the gateway rejects for a login another fx renewed is sent again with the renewed login", async () => {
+    const root = mkdtempSync(join(tmpdir(), "fx-compact-renewed-"));
+    const home = join(root, "home");
+    const workspace = join(root, "workspace");
+    mkdirSync(join(home, ".fx"), { recursive: true });
+    mkdirSync(workspace);
+    writeFileSync(join(workspace, "seed-notes.txt"), "seed notes\n");
+    writeFileSync(join(home, ".fx/settings.json"), JSON.stringify({
+      model: FAKE_GATEWAY_MODEL, auto_upgrade: false, startup_scrollback: false,
+    }));
+    const issuer = startFakeIssuer({ refresh: () => "unexpected-refresh" });
+    writeFxLogin(home, issuer.issuerUrl, "launch-token");
+    const summaryTokens: string[] = [];
+    // Older turns outside the kept suffix, so /compact has work to do.
+    const seedTurns = 3;
+    let seeded = 0;
+    const gateway = startDynamicFakeGateway((raw) => {
+      const request = JSON.parse(raw);
+      if (request.toolChoice?.type === "none" && request.tools?.length === 0) {
+        // The gateway records each request before it answers.
+        const token = bearer(gateway.requests.at(-1)!.headers);
+        summaryTokens.push(token);
+        if (token === "launch-token") {
+          // Another fx renewed the shared login after /compact read it.
+          rotateFxLogin(home, "rotated-token");
+          return Response.json({ error: { message: "token expired" } }, { status: 401 });
+        }
+        return fakeGatewayFinalText(HANDOFF);
+      }
+      if (seeded < seedTurns) {
+        const seedRead = `seed-read-${seeded + 1}`;
+        if (!raw.includes(`"${seedRead}"`)) return fakeGatewayToolCall(seedRead, "read_file", { path: "seed-notes.txt" });
+        seeded++;
+        const head = seeded === 1 ? HEAD : `HISTORY_MIDDLE_${seeded}`;
+        return fakeGatewayFinalText(`${head}\n${"history alpha beta gamma delta sample line\n".repeat(400)}SEED_DONE_${seeded}${seeded === seedTurns ? `\n${TAIL}` : ""}`);
+      }
+      return fakeGatewayFinalText(FOLLOWUP);
+    }, { models: [{ id: FAKE_GATEWAY_MODEL, type: "language", tags: ["tool-use"], context_window: 128000, max_tokens: 8192 }] });
+    let terminal: InstanceType<typeof TmuxSession> | undefined;
+    let passed = false;
+    try {
+      terminal = await TmuxSession.create({
+        cmd: binary,
+        cwd: workspace,
+        isolated: true,
+        env: {
+          HOME: home, TMPDIR: root, FX_DISABLE_KEYCHAIN: "1", FX_E2E_DISABLE_DOTENV: "1",
+          FX_TEST_SKIP_ONBOARDING: "1", FX_SOUND: "0", FX_AUTO_UPGRADE: "0", FX_MODEL: FAKE_GATEWAY_MODEL,
+          FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+          FX_TEST_GATEWAY_CHAT_URL: gateway.chatUrl,
+          FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+          FX_TEST_OAUTH_ISSUER_URL: issuer.issuerUrl, FX_OAUTH_CLIENT_ID: "test-client", FX_NO_OPEN_BROWSER: "1",
+        },
+      });
+      await terminal.waitForStableComposer(20_000);
+      for (let turn = 1; turn <= seedTurns; turn++) {
+        await terminal.sendText(`Read the seed notes, part ${turn}.`);
+        await terminal.waitForPane((pane) => pane.includes(`SEED_DONE_${turn}`) && hasEmptyComposer(pane), 20_000);
+      }
+      await terminal.sendText("/compact");
+      await until(() => summaryTokens.length >= 2, "the renewed summary request");
+      await terminal.waitForPane((pane) => !ACTIVITY.test(pane) && hasEmptyComposer(pane), 15_000);
+      // One refused summary request, then every request with the renewed login.
+      expect(summaryTokens[0]).toBe("launch-token");
+      expect(summaryTokens.slice(1).length).toBeGreaterThan(0);
+      expect(summaryTokens.slice(1).every((token) => token === "rotated-token")).toBe(true);
+      expect(issuer.refreshes).toHaveLength(0);
+      expect(await terminal.capturePane()).not.toContain("Compaction failed");
+      // The next request carries the compacted context.
+      await terminal.sendText("Follow the latest request.");
+      await terminal.waitForPane((pane) => pane.includes(FOLLOWUP) && hasEmptyComposer(pane), 15_000);
+      expect(gateway.requests.at(-1)!.body).toContain("INTERNAL_HANDOFF_4e12");
+      passed = true;
+    } finally {
+      await terminal?.kill();
+      gateway.stop();
+      issuer.stop();
       if (passed) rmSync(root, { recursive: true, force: true });
     }
   }, 90_000);

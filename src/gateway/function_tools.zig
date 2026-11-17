@@ -6,7 +6,7 @@ const stream_provider = @import("../core/agent/stream_provider.zig");
 const types = @import("../core/shared/types.zig");
 const model_tool_schema = @import("../core/tooling/model_tool_schema.zig");
 const tool_result_errors = @import("../core/tooling/tool_result_errors.zig");
-const json_depth = @import("json_depth.zig");
+const json_depth = @import("../core/shared/json_depth.zig");
 const Allocator = std.mem.Allocator;
 
 pub const Error = error{

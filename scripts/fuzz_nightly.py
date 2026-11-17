@@ -2,11 +2,12 @@
 
 `matrix` prints the job matrix from `tests/fuzz/targets.json`.
 
-`run` fuzzes one target in rounds of `zig build fuzz --fuzz=<iterations>`
-until its time budget is spent. Zig keeps the fuzzer's corpus in
-`.zig-cache/f/` between rounds, so each round continues where the last one
-stopped, and a round that outlives its timeout is a hang rather than an
-exhausted budget. When a round fails, `run` recovers the failing input,
+`run` builds one target's instrumented test binary with a single iteration,
+then fuzzes it in rounds of `zig build fuzz --fuzz=<iterations>` until its
+time budget is spent. Zig keeps the fuzzer's corpus in `.zig-cache/f/`
+between rounds, so each round continues where the last one stopped. The
+build has its own timeout, so a round that outlives its timeout is a hang
+rather than a slow build or an exhausted budget. When a round fails, `run` recovers the failing input,
 confirms it by replaying it as a saved input of the target, and writes it to
 the output folder with the log and `result.json`.
 
@@ -45,7 +46,9 @@ INPUT_HEADER = struct.Struct("<QIII")
 INPUT_FILE_NAME = re.compile(r"in[0-9a-f]+")
 
 DEFAULT_BUDGET_SECONDS = 20 * 60
-# The first round also compiles the instrumented test binary.
+# Compiling the instrumented test binary has taken up to about seven minutes
+# on a hosted runner, so it gets its own limit instead of a round's.
+DEFAULT_BUILD_TIMEOUT_SECONDS = 15 * 60
 DEFAULT_ROUND_TIMEOUT_SECONDS = 10 * 60
 DEFAULT_REPLAY_TIMEOUT_SECONDS = 10 * 60
 
@@ -237,28 +240,36 @@ def fuzz_target(
     out_dir: pathlib.Path,
     *,
     budget: float = DEFAULT_BUDGET_SECONDS,
+    build_timeout: float = DEFAULT_BUILD_TIMEOUT_SECONDS,
     round_timeout: float = DEFAULT_ROUND_TIMEOUT_SECONDS,
     replay_timeout: float = DEFAULT_REPLAY_TIMEOUT_SECONDS,
     runner: Runner = run_process,
     clock: Callable[[], float] = time.monotonic,
 ) -> dict:
-    """Fuzzes `target` until the budget is spent or a round does not end
-    cleanly, then writes `fuzz.log`, `result.json`, and any confirmed
-    reproducer to `out_dir`. Returns the result."""
+    """Builds `target`, then fuzzes it until the budget is spent or a round
+    does not end cleanly, then writes `fuzz.log`, `result.json`, and any
+    confirmed reproducer to `out_dir`. Returns the result."""
     out_dir.mkdir(parents=True, exist_ok=True)
     cache = root / ".zig-cache"
     clear_fuzzer_inputs(cache)
     deadline = clock() + budget
     log: list[str] = []
     rounds = 0
-    status = STATUS_OK
-    while True:
+    # One iteration compiles the binary that every round reuses. A build that
+    # runs out of time has not started fuzzing, so it is not a hang.
+    outcome = runner(fuzz_command(target.name, 1), root, build_timeout)
+    status = classify(outcome, target.test)
+    if status == STATUS_HANG:
+        status = STATUS_BUILD_ERROR
+    log.append(f"=== build: {status} ===\n{outcome.output}")
+    print(f"{target.name}: build: {status}", flush=True)
+    while status == STATUS_OK:
         outcome = runner(fuzz_command(target.name, target.iterations), root, round_timeout)
         rounds += 1
         status = classify(outcome, target.test)
         log.append(f"=== round {rounds}: {status} ===\n{outcome.output}")
         print(f"{target.name}: round {rounds}: {status}", flush=True)
-        if status != STATUS_OK or clock() >= deadline:
+        if clock() >= deadline:
             break
     (out_dir / "fuzz.log").write_text("\n".join(log))
 

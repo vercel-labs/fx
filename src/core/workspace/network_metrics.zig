@@ -2,9 +2,13 @@
 // to surface latency / error patterns without forcing a persistent trace
 // log. Process-wide and lock-protected: callers do not need to plumb the
 // buffer through their context.
+//
+// A second ring keeps only the calls that failed, so a failure stays in the
+// report however many calls succeed after it.
 
 const std = @import("std");
 const io_mod = @import("../shared/io.zig");
+const text_utils = @import("../shared/text_utils.zig");
 
 pub const max_model_len: usize = 64;
 pub const max_error_len: usize = 48;
@@ -14,6 +18,9 @@ pub const max_gateway_request_shape_len: usize = 512;
 /// The gateway's own words for a failed call, so a trace says why it failed.
 pub const max_gateway_error_message_len: usize = 200;
 pub const ring_capacity: usize = 32;
+/// Failed calls kept apart from the window, so later successful calls never
+/// push them out.
+pub const failure_ring_capacity: usize = 32;
 
 pub const NetworkCallKind = enum {
     gateway,
@@ -80,39 +87,27 @@ pub const NetworkCall = struct {
     }
 
     pub fn setModel(self: *NetworkCall, name: []const u8) void {
-        const n = @min(name.len, max_model_len);
-        @memcpy(self.model_buf[0..n], name[0..n]);
-        self.model_len = @intCast(n);
+        self.model_len = @intCast(keepPrefix(&self.model_buf, name));
     }
 
     pub fn setError(self: *NetworkCall, name: []const u8) void {
-        const n = @min(name.len, max_error_len);
-        @memcpy(self.error_buf[0..n], name[0..n]);
-        self.error_len = @intCast(n);
+        self.error_len = @intCast(keepPrefix(&self.error_buf, name));
     }
 
     pub fn setTerminalStopReason(self: *NetworkCall, reason: []const u8) void {
-        const n = @min(reason.len, max_stop_reason_len);
-        @memcpy(self.stop_reason_buf[0..n], reason[0..n]);
-        self.stop_reason_len = @intCast(n);
+        self.stop_reason_len = @intCast(keepPrefix(&self.stop_reason_buf, reason));
     }
 
     pub fn setProviderStopReason(self: *NetworkCall, reason: []const u8) void {
-        const n = @min(reason.len, max_stop_reason_len);
-        @memcpy(self.provider_stop_reason_buf[0..n], reason[0..n]);
-        self.provider_stop_reason_len = @intCast(n);
+        self.provider_stop_reason_len = @intCast(keepPrefix(&self.provider_stop_reason_buf, reason));
     }
 
     pub fn setGatewaySchemaDiagnostic(self: *NetworkCall, diagnostic: []const u8) void {
-        const n = @min(diagnostic.len, max_gateway_schema_diagnostic_len);
-        @memcpy(self.gateway_schema_diagnostic_buf[0..n], diagnostic[0..n]);
-        self.gateway_schema_diagnostic_len = @intCast(n);
+        self.gateway_schema_diagnostic_len = @intCast(keepPrefix(&self.gateway_schema_diagnostic_buf, diagnostic));
     }
 
     pub fn setGatewayRequestShape(self: *NetworkCall, shape: []const u8) void {
-        const n = @min(shape.len, max_gateway_request_shape_len);
-        @memcpy(self.gateway_request_shape_buf[0..n], shape[0..n]);
-        self.gateway_request_shape_len = @intCast(n);
+        self.gateway_request_shape_len = @intCast(keepPrefix(&self.gateway_request_shape_buf, shape));
     }
 
     /// Keeps `message` as one line the trace can quote: control bytes and
@@ -156,10 +151,22 @@ pub const NetworkCall = struct {
     }
 };
 
+/// Copies the longest prefix of `value` that fits `buf` and does not end
+/// inside a UTF-8 sequence, and returns its length.
+fn keepPrefix(buf: []u8, value: []const u8) usize {
+    const kept = text_utils.utf8PrefixByBytes(value, buf.len);
+    @memcpy(buf[0..kept.len], kept);
+    return kept.len;
+}
+
 var mutex: std.Io.Mutex = .init;
 var ring: [ring_capacity]NetworkCall = @splat(.{});
 var head: usize = 0;
 var stored: usize = 0;
+// All-zero so it lands in .bss; snapshots read only `failures_stored` slots.
+var failures: [failure_ring_capacity]NetworkCall = std.mem.zeroes([failure_ring_capacity]NetworkCall);
+var failures_head: usize = 0;
+var failures_stored: usize = 0;
 
 /// Session-wide totals, reset on session transitions via
 /// `diagnostics.resetSession()`. Unlike the ring, these never evict: the
@@ -199,6 +206,13 @@ pub fn record(call: NetworkCall) void {
     ring[head] = call;
     head = (head + 1) % ring_capacity;
     if (stored < ring_capacity) stored += 1;
+    // Under the same lock, so a snapshot never sees a failure in the window
+    // that the failure ring does not hold yet.
+    if (call.isError()) {
+        failures[failures_head] = call;
+        failures_head = (failures_head + 1) % failure_ring_capacity;
+        if (failures_stored < failure_ring_capacity) failures_stored += 1;
+    }
     recordLifetime(call);
 }
 
@@ -277,12 +291,29 @@ pub fn snapshot(out: []NetworkCall) usize {
     return n;
 }
 
+/// Copies the newest kept failed calls into `out`, oldest first. Later
+/// successful calls never remove them; only newer failures and `reset` do.
+pub fn snapshotFailures(out: []NetworkCall) usize {
+    const zio = io_mod.getIo();
+    mutex.lockUncancelable(zio);
+    defer mutex.unlock(zio);
+    const n = @min(failures_stored, out.len);
+    var i: usize = 0;
+    while (i < n) : (i += 1) {
+        const idx = (failures_head + failure_ring_capacity - n + i) % failure_ring_capacity;
+        out[i] = failures[idx];
+    }
+    return n;
+}
+
 pub fn reset() void {
     const zio = io_mod.getIo();
     mutex.lockUncancelable(zio);
     defer mutex.unlock(zio);
     head = 0;
     stored = 0;
+    failures_head = 0;
+    failures_stored = 0;
     lifetime = .{};
     turn_rollups = @as([turn_rollup_capacity]TurnRollup, @splat(.{}));
     turn_rollup_count = 0;
@@ -451,6 +482,250 @@ test "fuzzed gateway error messages stay one bounded line of UTF-8" {
             "\xff\xfe broken",
         }) ++ @import("fuzz_corpus").network_error_message.*),
     });
+}
+
+const TextField = struct {
+    set: *const fn (*NetworkCall, []const u8) void,
+    get: *const fn (*const NetworkCall) []const u8,
+    limit: usize,
+};
+
+/// The fields whose setters cut with `keepPrefix`.
+const text_fields = [_]TextField{
+    .{ .set = NetworkCall.setModel, .get = NetworkCall.model, .limit = max_model_len },
+    .{ .set = NetworkCall.setError, .get = NetworkCall.errorName, .limit = max_error_len },
+    .{ .set = NetworkCall.setTerminalStopReason, .get = NetworkCall.terminalStopReason, .limit = max_stop_reason_len },
+    .{ .set = NetworkCall.setProviderStopReason, .get = NetworkCall.providerStopReason, .limit = max_stop_reason_len },
+    .{ .set = NetworkCall.setGatewaySchemaDiagnostic, .get = NetworkCall.gatewaySchemaDiagnostic, .limit = max_gateway_schema_diagnostic_len },
+    .{ .set = NetworkCall.setGatewayRequestShape, .get = NetworkCall.gatewayRequestShape, .limit = max_gateway_request_shape_len },
+};
+
+test "network call text cuts end on a UTF-8 boundary" {
+    var call: NetworkCall = .{};
+    var value: [max_gateway_request_shape_len + 4]u8 = undefined;
+    const sequences = [_][]const u8{ "\xc3\xa9", "\xe2\x82\xac", "\xf0\x9f\x91\x8d" };
+    for (text_fields) |field| {
+        for (sequences) |sequence| {
+            // The cut falls after the first byte of `sequence`.
+            @memset(value[0 .. field.limit - 1], 'a');
+            @memcpy(value[field.limit - 1 ..][0..sequence.len], sequence);
+            field.set(&call, value[0 .. field.limit - 1 + sequence.len]);
+            try std.testing.expectEqual(field.limit - 1, field.get(&call).len);
+            try std.testing.expect(std.unicode.utf8ValidateSlice(field.get(&call)));
+        }
+        // A value that fits stays whole, and one byte more is cut there.
+        @memset(value[0 .. field.limit + 1], 'b');
+        field.set(&call, value[0..field.limit]);
+        try std.testing.expectEqual(field.limit, field.get(&call).len);
+        field.set(&call, value[0 .. field.limit + 1]);
+        try std.testing.expectEqual(field.limit, field.get(&call).len);
+    }
+}
+
+fn fuzzNetworkCallText(_: void, smith: *std.testing.Smith) !void {
+    var buffer: [max_gateway_request_shape_len + 64]u8 = undefined;
+    const len = smith.slice(&buffer);
+    const value = buffer[0..len];
+    const valid = std.unicode.utf8ValidateSlice(value);
+    var call: NetworkCall = .{};
+    for (text_fields) |field| {
+        field.set(&call, value);
+        const kept = field.get(&call);
+        try std.testing.expect(std.mem.startsWith(u8, value, kept));
+        try std.testing.expect(kept.len <= field.limit);
+        if (value.len <= field.limit) try std.testing.expectEqual(value.len, kept.len);
+        if (valid) {
+            try std.testing.expect(std.unicode.utf8ValidateSlice(kept));
+            // A cut on valid text gives up at most the three bytes before it.
+            try std.testing.expect(kept.len + 3 >= @min(value.len, field.limit));
+        }
+    }
+}
+
+test "fuzzed network call text stays a bounded prefix that keeps UTF-8 whole" {
+    try std.testing.fuzz({}, fuzzNetworkCallText, .{
+        .corpus = &(@import("fuzz_seed").slices(.{
+            "",
+            "openai/gpt-5",
+            "\xc3\xa9\xc3\xa9\xc3\xa9",
+            "\xf0\x9f\x91\x8d\xf0\x9f\x91\x8d",
+            "\x80\x80\xff\xc3",
+        }) ++ @import("fuzz_corpus").network_call_text.*),
+    });
+}
+
+/// Records one call whose `subagent_id` and `step_id` name it in tests.
+fn recordTestCall(status: u16, error_name: []const u8, subagent_id: u64, step_id: u64) void {
+    var call: NetworkCall = .{ .status = status, .subagent_id = subagent_id, .step_id = step_id, .duration_ms = 1 };
+    if (error_name.len > 0) call.setError(error_name);
+    record(call);
+}
+
+test "a failed call stays kept after later calls move it out of the window" {
+    resetForTest();
+    defer resetForTest();
+
+    recordTestCall(503, "", 0, 1);
+    var step: u64 = 2;
+    while (step <= ring_capacity) : (step += 1) recordTestCall(200, "", 0, step);
+    var window: [ring_capacity]NetworkCall = undefined;
+    // 31 later calls: the failure is still the window's oldest call.
+    try std.testing.expectEqual(ring_capacity, snapshot(&window));
+    try std.testing.expectEqual(@as(u64, 1), window[0].step_id);
+
+    recordTestCall(200, "", 0, step);
+    const n = snapshot(&window);
+    for (window[0..n]) |call| try std.testing.expect(!call.isError());
+    var kept: [failure_ring_capacity]NetworkCall = undefined;
+    try std.testing.expectEqual(@as(usize, 1), snapshotFailures(&kept));
+    try std.testing.expectEqual(@as(u16, 503), kept[0].status);
+    try std.testing.expectEqual(@as(u64, 1), kept[0].step_id);
+    try std.testing.expectEqual(@as(u64, 1), lifetimeStats().error_calls);
+}
+
+test "only calls that count as errors enter the failure ring" {
+    resetForTest();
+    defer resetForTest();
+
+    recordTestCall(399, "", 0, 1);
+    recordTestCall(400, "", 0, 2);
+    recordTestCall(200, "Timeout", 0, 3);
+    recordTestCall(0, "", 0, 4);
+    recordTestCall(0, "ConnectionRefused", 0, 5);
+    var kept: [failure_ring_capacity]NetworkCall = undefined;
+    const n = snapshotFailures(&kept);
+    try std.testing.expectEqual(@as(usize, 3), n);
+    try std.testing.expectEqual(@as(u64, 2), kept[0].step_id);
+    try std.testing.expectEqual(@as(u64, 3), kept[1].step_id);
+    try std.testing.expectEqual(@as(u64, 5), kept[2].step_id);
+    try std.testing.expectEqual(lifetimeStats().error_calls, n);
+}
+
+test "the failure ring keeps the newest failures in order and a reset clears it" {
+    resetForTest();
+    defer resetForTest();
+
+    var step: u64 = 0;
+    while (step < failure_ring_capacity + 1) : (step += 1) recordTestCall(500, "", 0, step);
+    var kept: [failure_ring_capacity]NetworkCall = undefined;
+    try std.testing.expectEqual(failure_ring_capacity, snapshotFailures(&kept));
+    try std.testing.expectEqual(@as(u64, 1), kept[0].step_id);
+    try std.testing.expectEqual(@as(u64, failure_ring_capacity), kept[failure_ring_capacity - 1].step_id);
+    var small: [2]NetworkCall = undefined;
+    try std.testing.expectEqual(@as(usize, 2), snapshotFailures(&small));
+    try std.testing.expectEqual(@as(u64, failure_ring_capacity - 1), small[0].step_id);
+    try std.testing.expectEqual(@as(usize, 0), snapshotFailures(&.{}));
+
+    reset();
+    try std.testing.expectEqual(@as(usize, 0), snapshotFailures(&kept));
+    try std.testing.expectEqual(@as(u64, 0), lifetimeStats().error_calls);
+}
+
+test "the network rings match a reference list on seeded random sequences" {
+    resetForTest();
+    defer resetForTest();
+
+    var calls: std.ArrayList(u64) = .empty;
+    defer calls.deinit(std.testing.allocator);
+    var failed: std.ArrayList(u64) = .empty;
+    defer failed.deinit(std.testing.allocator);
+    var window: [ring_capacity]NetworkCall = undefined;
+    var kept: [failure_ring_capacity]NetworkCall = undefined;
+
+    var seed: u64 = 0;
+    while (seed < 64) : (seed += 1) {
+        var prng = std.Random.DefaultPrng.init(seed);
+        const random = prng.random();
+        reset();
+        calls.clearRetainingCapacity();
+        failed.clearRetainingCapacity();
+        const steps = random.uintAtMost(u64, 300);
+        var step: u64 = 1;
+        while (step <= steps) : (step += 1) {
+            const roll = random.uintLessThan(u8, 100);
+            if (roll == 0) {
+                reset();
+                calls.clearRetainingCapacity();
+                failed.clearRetainingCapacity();
+                continue;
+            }
+            const status: u16 = if (roll < 30) 500 else if (roll < 40) 302 else 200;
+            const error_name: []const u8 = if (roll >= 95) "Timeout" else "";
+            recordTestCall(status, error_name, 0, step);
+            try calls.append(std.testing.allocator, step);
+            if (status >= 400 or error_name.len > 0) try failed.append(std.testing.allocator, step);
+        }
+
+        const window_n = snapshot(&window);
+        const want_window = calls.items[calls.items.len - @min(calls.items.len, ring_capacity) ..];
+        try std.testing.expectEqual(want_window.len, window_n);
+        for (want_window, window[0..window_n]) |want, got| try std.testing.expectEqual(want, got.step_id);
+
+        const kept_n = snapshotFailures(&kept);
+        const want_kept = failed.items[failed.items.len - @min(failed.items.len, failure_ring_capacity) ..];
+        try std.testing.expectEqual(want_kept.len, kept_n);
+        for (want_kept, kept[0..kept_n]) |want, got| try std.testing.expectEqual(want, got.step_id);
+        try std.testing.expectEqual(@as(u64, failed.items.len), lifetimeStats().error_calls);
+    }
+}
+
+test "records from many threads keep both network rings bounded and in order" {
+    resetForTest();
+    defer resetForTest();
+
+    const thread_count = 8;
+    const per_thread = 12_500;
+    const Worker = struct {
+        fn run(thread_index: usize) void {
+            var seq: u64 = 0;
+            while (seq < per_thread) : (seq += 1) {
+                // A third fail; `subagent_id` names the thread and `step_id` its order.
+                recordTestCall(if (seq % 3 == 0) 500 else 200, "", thread_index + 1, seq);
+            }
+        }
+    };
+    const Reader = struct {
+        fn run(done: *std.atomic.Value(bool), errors: *std.atomic.Value(u32)) void {
+            var window: [ring_capacity]NetworkCall = undefined;
+            var kept: [failure_ring_capacity]NetworkCall = undefined;
+            while (!done.load(.acquire)) {
+                const window_n = snapshot(&window);
+                if (!stepsAscendPerThread(window[0..window_n])) _ = errors.fetchAdd(1, .monotonic);
+                const kept_n = snapshotFailures(&kept);
+                if (!stepsAscendPerThread(kept[0..kept_n])) _ = errors.fetchAdd(1, .monotonic);
+                for (kept[0..kept_n]) |call| {
+                    if (!call.isError()) _ = errors.fetchAdd(1, .monotonic);
+                }
+            }
+        }
+    };
+
+    var done = std.atomic.Value(bool).init(false);
+    var errors = std.atomic.Value(u32).init(0);
+    const reader = try std.Thread.spawn(.{}, Reader.run, .{ &done, &errors });
+    var threads: [thread_count]std.Thread = undefined;
+    for (&threads, 0..) |*thread, index| thread.* = try std.Thread.spawn(.{}, Worker.run, .{index});
+    for (threads) |thread| thread.join();
+    done.store(true, .release);
+    reader.join();
+
+    try std.testing.expectEqual(@as(u32, 0), errors.load(.monotonic));
+    const stats = lifetimeStats();
+    try std.testing.expectEqual(@as(u64, thread_count * per_thread), stats.total_calls);
+    try std.testing.expectEqual(@as(u64, thread_count * ((per_thread + 2) / 3)), stats.error_calls);
+    var kept: [failure_ring_capacity]NetworkCall = undefined;
+    try std.testing.expectEqual(failure_ring_capacity, snapshotFailures(&kept));
+}
+
+/// Whether each thread's calls appear in the order it made them.
+fn stepsAscendPerThread(calls: []const NetworkCall) bool {
+    var last: [9]?u64 = @splat(null);
+    for (calls) |call| {
+        if (call.subagent_id >= last.len) return false;
+        if (last[call.subagent_id]) |previous| if (call.step_id <= previous) return false;
+        last[call.subagent_id] = call.step_id;
+    }
+    return true;
 }
 
 test "a gateway error message keeps its words on one line and cuts at a character" {
