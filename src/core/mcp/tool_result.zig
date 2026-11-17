@@ -242,15 +242,16 @@ pub fn invalidParamsCause(arena: Allocator, text: []const u8) Allocator.Error!?[
 }
 
 const data_label = "; data=";
-/// How `tool_result_limits.truncateText` starts the marker that ends a text it cut.
-const cut_marker_start = "\n... [tool result truncated for ";
 
 /// The message of the text `write_protocol_diagnostic` wrote, without the `; data=` and the data it
 /// adds when the server gave some. The data is JSON to the end of the text, or the start of JSON when
 /// the text was cut, so the first `; data=` whose rest is one JSON value, or a prefix of one, is the
 /// one it wrote. The data can never put a label before the real one: the message comes first. A
-/// message that says `; data=` itself stays whole while no JSON follows it. The marker that ends a
-/// text the result cap cut is not part of the data.
+/// message that says `; data=` itself stays whole while no JSON follows it. When the server's own
+/// message has a `; data=` that the start of JSON follows, such as `; data="`, the data can decide
+/// whether fx cuts there, so the cause can lose the fields after it. The cause still never holds a
+/// word of the data, because every cut is inside the message. The marker that ends a text the result
+/// cap cut is not part of the data.
 fn withoutData(arena: Allocator, text: []const u8) Allocator.Error![]const u8 {
     const body = withoutCutMarker(text);
     var from: usize = 0;
@@ -264,9 +265,9 @@ fn withoutData(arena: Allocator, text: []const u8) Allocator.Error![]const u8 {
 
 /// `text` without the one-line marker `truncateText` ends a cut text with.
 fn withoutCutMarker(text: []const u8) []const u8 {
-    const start = std.mem.findLast(u8, text, cut_marker_start) orelse return text;
+    const start = std.mem.findLast(u8, text, tool_result_limits.cut_marker_start) orelse return text;
     const marker = text[start..];
-    if (!std.mem.endsWith(u8, marker, " bytes]\n")) return text;
+    if (!std.mem.endsWith(u8, marker, tool_result_limits.cut_marker_end)) return text;
     if (std.mem.findScalar(u8, marker[1 .. marker.len - 1], '\n') != null) return text;
     return text[0..start];
 }
@@ -1039,7 +1040,7 @@ test "an invalid-params cause reads the same from a text the result cap cut, mar
         // Caps that cut inside the label's neighbourhood and deep in the data.
         for ([_]usize{ 200, 260, 400, 1000 }) |cap| {
             const output = try tool_result_limits.prepareModelOutput(arena, "mcp_srv_tool", text, cap);
-            try std.testing.expect(std.mem.find(u8, output, "\n... [tool result truncated for mcp_srv_tool: original ") != null);
+            try std.testing.expect(std.mem.find(u8, output, tool_result_limits.cut_marker_start ++ "mcp_srv_tool: original ") != null);
             try std.testing.expectEqualStrings(alone, (try invalidParamsCause(arena, output)).?);
         }
     }
@@ -1127,14 +1128,15 @@ fn fuzzInvalidParamsCause(_: void, smith: *std.testing.Smith) !void {
 }
 
 /// The data law: for a message `m` with no label in it and any data `d`, the cause of `m ++ "; data=" ++ d`
-/// is the cause of `m`, and so is the cause of every head of it that holds `m` and the label. The first
+/// is the cause of `m`, and so is the cause of every head of it that holds `m` and the label. A message
+/// with a label of its own is left out: there the data can decide the cut, as `withoutData` says. The first
 /// byte of `bytes` picks the data (its labels, its shape, and with the top two bits both set, one longer than 4 KiB) and the rest is
 /// the message, and, escaped, also part of the data.
 fn fuzzDataLaw(arena: Allocator, bytes: []const u8) !void {
     if (bytes.len == 0) return;
     const message = bytes[1..];
-    if (std.mem.find(u8, message, "; data=") != null) return;
-    if (std.mem.find(u8, message, "\n... [tool result truncated") != null) return;
+    if (std.mem.find(u8, message, data_label) != null) return;
+    if (std.mem.find(u8, message, tool_result_limits.cut_marker_start) != null) return;
     const selector = bytes[0];
     var hint: std.Io.Writer.Allocating = .init(arena);
     try hint.writer.writeAll(message);
