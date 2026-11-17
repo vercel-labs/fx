@@ -347,7 +347,7 @@ pub const SignInRuntime = struct {
     /// The SHA-256 of the access token the newest sign-in saved, so a request
     /// that waits for this sign-in can tell the login it saved, before its
     /// team is chosen, from one another fx process saved. Guarded by `mutex`.
-    saved_token_digest: ?[32]u8 = null,
+    saved_token_digest: ?[std.crypto.hash.sha2.Sha256.digest_length]u8 = null,
 
     /// Starts an fx login sign-in. On native hosts the issuer discovery and
     /// device-code request run on the sign-in worker, so the input loop never
@@ -771,8 +771,8 @@ fn saveSignIn(_: ?*anyopaque, alloc: Allocator, completion: SignInCompletion) !v
     try oauth_session.saveNewSession(alloc, session);
 }
 
-fn tokenDigest(token: []const u8) [32]u8 {
-    var digest: [32]u8 = undefined;
+fn tokenDigest(token: []const u8) [std.crypto.hash.sha2.Sha256.digest_length]u8 {
+    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(token, &digest, .{});
     return digest;
 }
