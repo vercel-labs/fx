@@ -697,7 +697,7 @@ pub fn call(
 ) tool_dispatch.DispatchError!tool_dispatch.ToolResult {
     const input = erased.as(OwnedInput).value;
     return switch (input.action) {
-        .run => callRun(ctx, input),
+        .run => callRun(ctx, runInputFor(ctx, input)),
         .interact => callInteract(ctx, input),
         .stop => callStop(ctx, input),
     };
@@ -885,6 +885,24 @@ fn noteSteeringYield(
 fn withoutSteeringYield(ctx: tool_dispatch.DispatchContext, yield_time_ms: u32) tool_dispatch.DispatchContext {
     var result = ctx;
     if (yield_time_ms == 0) result.tool_yield_flag = null;
+    return result;
+}
+
+/// The wait a `run` gets on this host. ACP steering does not end a running
+/// command's wait (it never raises `tool_yield_flag`), so on `fx acp` a
+/// run keeps the 30 s cap that bounds how long a steer waits behind it.
+/// The terminal ends the wait when the user steers, and `fx ask` has no
+/// steering, so both keep the longer wait.
+fn runYieldTimeFor(role: terminal_contracts.TransportRole, requested_ms: u32) u32 {
+    return switch (role) {
+        .acp => @min(requested_ms, managed_contract.max_yield_time_ms),
+        .interactive, .headless => requested_ms,
+    };
+}
+
+fn runInputFor(ctx: tool_dispatch.DispatchContext, input: Input) Input {
+    var result = input;
+    result.yield_time_ms = runYieldTimeFor(ctx.terminal_transport_role, input.yield_time_ms);
     return result;
 }
 
@@ -3183,6 +3201,14 @@ test "shell caps a wait over the action limit instead of refusing the call" {
             },
         }
     }
+}
+
+test "a run keeps the 30 s wait on fx acp and the longer wait elsewhere" {
+    try std.testing.expectEqual(@as(u32, 30_000), runYieldTimeFor(.acp, 120_000));
+    try std.testing.expectEqual(@as(u32, 20_000), runYieldTimeFor(.acp, 20_000));
+    try std.testing.expectEqual(@as(u32, 0), runYieldTimeFor(.acp, 0));
+    try std.testing.expectEqual(@as(u32, 120_000), runYieldTimeFor(.headless, 120_000));
+    try std.testing.expectEqual(@as(u32, 300_000), runYieldTimeFor(.interactive, 300_000));
 }
 
 test "shell decoder rejects removed handoff and legacy actions" {
