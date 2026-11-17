@@ -1943,7 +1943,7 @@ fn runNonInteractiveWithDeps(
             return runTopLevelMcp(alloc, rest, cfg, deps);
         },
         .models => |rest| {
-            const opts = parseLocalSurfaceArgs(rest) catch |err| {
+            const opts = parseLocalSurfaceArgs(modelsListArgs(rest)) catch |err| {
                 try writeUsageOrJsonError(alloc, cfg.command_catalog, deps, .models, "models", err, rest);
                 return usage_failure;
             };
@@ -3695,7 +3695,17 @@ fn runSessionRecovery(alloc: Allocator, deps: RunDeps, recovery: SessionRecovery
     };
     defer store.deinit(alloc);
     var recovered = session_adapter.recover(&store, alloc, recovery.session_id) catch |err| {
-        try writeLookupFailure(alloc, deps, "session", session_adapter.commandError(err), recovery.format);
+        const failure = session_adapter.commandError(err);
+        // A v1 folder others can write: the reason names it and its fix (D61).
+        if (failure == error.DurablePathUnsafe and store.problem.len > 0) {
+            const message = try alloc.print("session {s} can't be recovered safely: {s}", .{ recovery.session_id, store.problem.text() });
+            defer alloc.free(message);
+            if (recovery.format == .json) {
+                try writeJsonCommandFailure(alloc, deps, "session", failure, message);
+            } else try writeStderrLine(alloc, deps, "fx session: {s}\n", message);
+            return .handled_failure;
+        }
+        try writeLookupFailure(alloc, deps, "session", failure, recovery.format);
         return .handled_failure;
     };
     defer recovered.deinit(alloc);
@@ -3809,6 +3819,11 @@ fn writeSessionDetailFailure(
             "session {s} uses an unsupported session version",
             .{session_id},
         ),
+        // A v1 folder others can write: the reason names it and its fix (D61).
+        error.DurablePathUnsafe => if (reason.len > 0) try alloc.print(
+            "session {s} can't be read safely: {s}",
+            .{ session_id, reason },
+        ) else return writeLookupFailure(alloc, deps, "session", err, format),
         else => return writeLookupFailure(
             alloc,
             deps,
@@ -4324,6 +4339,11 @@ fn writeStderrLine(alloc: Allocator, deps: RunDeps, comptime format: []const u8,
     try writeStderr(deps, line);
 }
 
+fn modelsListArgs(rest: []const [:0]const u8) []const [:0]const u8 {
+    if (rest.len > 0 and std.mem.eql(u8, rest[0], "ls")) return rest[1..];
+    return rest;
+}
+
 fn parseLocalSurfaceArgs(args: []const [:0]const u8) !LocalSurfaceOptions {
     var options = LocalSurfaceOptions{};
     var parser: cli_flags.Parser = .init(&builtin_commands.json_only_options, args);
@@ -4831,6 +4851,12 @@ test "fx sessions ls names the default list action" {
     try std.testing.expectEqualStrings("--json", sessionListArgs(&.{"--json"})[0]);
 }
 
+test "fx models ls names the default list action" {
+    try std.testing.expectEqual(@as(usize, 0), modelsListArgs(&.{"ls"}).len);
+    try std.testing.expectEqualStrings("--json", modelsListArgs(&.{ "ls", "--json" })[0]);
+    try std.testing.expectEqualStrings("--json", modelsListArgs(&.{"--json"})[0]);
+}
+
 test "fx sessions --live reads through the shared parser and names the paging flag it refuses" {
     const live = try parseSessionListArgs(&.{ "--live", "--all", "--json" });
     try std.testing.expect(live.live);
@@ -5201,6 +5227,10 @@ test "parse recognizes every top-level command and preserves unknown commands" {
     }
     switch (parse(command_catalog, &.{ @constCast("models"), @constCast("--json") })) {
         .models => |rest| try std.testing.expectEqual(@as(usize, 1), rest.len),
+        else => return error.TestExpectedEqual,
+    }
+    switch (parse(command_catalog, &.{ @constCast("models"), @constCast("ls"), @constCast("--json") })) {
+        .models => |rest| try std.testing.expectEqual(@as(usize, 2), rest.len),
         else => return error.TestExpectedEqual,
     }
     switch (parse(command_catalog, &.{ @constCast("mcp"), @constCast("add"), @constCast("fixture"), @constCast("node") })) {
@@ -7000,6 +7030,30 @@ test "runIfRequested models passes startup team to fetch seam" {
     deps.load_startup_state = stubLoadStartupState;
 
     const result = try runIfRequestedWithDeps(std.testing.allocator, &.{ @constCast("models"), @constCast("--json") }, cfg, deps);
+    try std.testing.expectEqual(RunResult.handled_success, result);
+    try std.testing.expect(probe.called);
+    try std.testing.expectEqualStrings(
+        "{\"kind\":\"models\",\"count\":1,\"shown_count\":1,\"more_count\":0,\"private_models_hidden\":false,\"ids\":[\"private/blue-hornbill\"]}\n",
+        capture.stdout.written(),
+    );
+}
+
+test "runIfRequested models ls lists the same catalog as models" {
+    var capture = CaptureOutput.init(std.testing.allocator);
+    defer capture.deinit();
+    var probe = ModelFetchProbe{};
+    var cfg = testConfig();
+    cfg.provider_set.gateway.cli_model_catalog = probe.provider();
+
+    var deps = capture.deps();
+    deps.load_startup_state = stubLoadStartupState;
+
+    const result = try runIfRequestedWithDeps(
+        std.testing.allocator,
+        &.{ @constCast("models"), @constCast("ls"), @constCast("--json") },
+        cfg,
+        deps,
+    );
     try std.testing.expectEqual(RunResult.handled_success, result);
     try std.testing.expect(probe.called);
     try std.testing.expectEqualStrings(

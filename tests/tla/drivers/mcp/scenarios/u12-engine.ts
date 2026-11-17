@@ -181,6 +181,14 @@ export const scenarios: Scenario[] = [
     },
   }),
   engineScenario({
+    name: "u12-deep-reply",
+    description: "A reply nested 2,000 levels deep reaches the host whole: the engine's limit is far above the host's depth limit of 128 (tests/tla/mcp/WireDepth.tla), which the host applies where it reads the result",
+    servers: { b: { rules: legacy({ method: "tools/call", result: { content: [{ type: "text", text: "deep" }], structuredContent: JSON.parse(`${'{"a":'.repeat(2000)}1${"}".repeat(2000)}`) } }) } },
+    script: ["call b add", "expect b.called.1.result"],
+    machines: { b: [...BASE, "catalog"] },
+    check: (lines) => same(event(lines, "b.called.1")?.answer, '[{"type":"text","text":"deep"}]', "the deep reply's answer"),
+  }),
+  engineScenario({
     name: "u12-tools-stale",
     description: "The host hears when a server's tools may have changed, so it can list them again before its next call: once for a 2025 list_changed, once when a fresh list's TTL runs out, again after a failed re-list hands over the last list, never for a list that was never fresh, and never before the first list (CAT-05)",
     servers: {

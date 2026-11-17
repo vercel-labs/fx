@@ -29,7 +29,12 @@ python3 run.py mutate "$@"
 # Request.scoped.cfg (two normal requests and no more, for the scope of a refused line,
 # ScopedGrantsOnlyItsCall) is not here: catalog.json lists it under "also", so `run.py check` runs it
 # next to the smoke config, in CI too.
+#
+# WireDepth.findings.cfg models the code before the depth limit on a server's JSON (before this change)
+# and states that every writer can write whatever an entry point accepts, which fails while there is no
+# limit but the engine's.
 . ../lib/tlc.sh
 tlc_verdicts <<'EOF_FINDINGS'
 Request Request.findings SoonAfterRefusal
+WireDepth WireDepth.findings NoWriterOverflow
 EOF_FINDINGS
