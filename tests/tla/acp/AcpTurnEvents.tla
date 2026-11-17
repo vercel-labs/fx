@@ -25,8 +25,8 @@
 (*    sh.fx/commandResult, only for a client that lists it ("command").   *)
 (*    fx never adds a field at the root of a standard message.            *)
 (*                                                                         *)
-(* `Rules` set to FALSE gives fx acp before these rules (#2021 at         *)
-(* 76de31e82): the loop's progress, model calls, compactions, and finish  *)
+(* `Rules` set to FALSE gives fx acp before these rules:                  *)
+(* the loop's progress, model calls, compactions, and finish              *)
 (* reach fx acp's catch-all arm or no hook at all, and nothing is sent,   *)
 (* so only the response reaches the client. AcpTurnEventsToday.cfg shows  *)
 (* Complete failing.                                                      *)
@@ -48,7 +48,7 @@
 EXTENDS Naturals, Sequences, FiniteSets
 
 CONSTANTS
-    Rules,          \* TRUE: the S8d rules; FALSE: fx acp before them
+    Rules,          \* TRUE: the turn events rules; FALSE: fx acp before them
     CommandMeta,    \* TRUE: sh.fx/commandResult (S8g); FALSE: the root field
     Parts,          \* the parts the client lists
     Ks,             \* compaction ids, 1..n

@@ -9,9 +9,10 @@
 //   bun tests/tla/drivers/acp/tool_diffs/driver.ts --model today   # fx acp before tool diffs
 //
 // --model rules (the default) checks the tool diffs rules. --model today
-// checks the model of fx acp before them; a build of #2032, chosen with
-// FX_WORKTREE or FX_BIN, fails --model rules. --only takes a pattern of plan
-// names. No model calls: every reply comes from a fake Gateway.
+// checks the model of fx acp before them; a build from before tool diffs,
+// chosen with FX_WORKTREE or FX_BIN, fails --model rules. --only takes a
+// pattern of plan names. No model calls: every reply comes from a fake
+// Gateway.
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { binary, worktree } from "../../lib/context";

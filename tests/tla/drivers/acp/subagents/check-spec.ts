@@ -21,7 +21,7 @@ const MUTANTS: Mutant[] = [
   },
   {
     id: "work-under-parent",
-    note: "a child's work goes out under the parent's id, as today (X26)",
+    note: "a child's work goes out under the parent's id, as today",
     from: `Work(k) == IF Rules THEN Msg("work", k, 0) ELSE Msg("parent_work", k, 0)`,
     to: `Work(k) == Msg("parent_work", k, 0)`,
     expect: "ChildIdUsed",
