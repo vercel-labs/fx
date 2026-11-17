@@ -2111,7 +2111,9 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       await session.waitForComposer(10_000);
 
       await session.sendText("/help");
-      let pane = await session.waitForText("/help", 5_000);
+      // Only the catalog Enter opens has categories; the suggestions shown
+      // while /help is typed don't.
+      let pane = await session.waitForText("tab category", 5_000);
       expect(pane).toContain("/help");
       expect(pane).not.toContain("● /help");
       await session.sendKeys("Escape");
