@@ -3,9 +3,9 @@
 // that property catches that mistake. The rules have not landed in src/acp/
 // yet, and following needs a session open on two connections, which needs
 // the leader's socket, so driver.ts checks only what fx does now on one
-// connection: session/new, prompts, restarts and session/load, with the
-// message ids of fix F6. The model's Today configs, in tests/tla/acp/check.sh,
-// show fx now.
+// connection: session/new, prompts, restarts and session/load, with
+// replayed message ids that come from the log. The model's Today configs, in
+// tests/tla/acp/check.sh, show fx now.
 //
 //   bun tests/tla/drivers/acp/follow/check-spec.ts
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";

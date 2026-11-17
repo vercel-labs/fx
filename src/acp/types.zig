@@ -24,7 +24,7 @@ pub const ReplayMessageIdBuffer = [46]u8;
 
 /// The id of a replayed message: its turn's number in the session log and
 /// its place among that turn's replayed messages, so every load gives a
-/// saved message the same id (fix F6, X21).
+/// saved message the same id.
 pub fn writeReplayMessageId(storage: *ReplayMessageIdBuffer, turn: u64, index: usize) []const u8 {
     return std.fmt.bufPrint(storage, "turn-{d}-{d}", .{ turn, index }) catch unreachable;
 }

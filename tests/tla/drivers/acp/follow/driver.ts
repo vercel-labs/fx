@@ -6,9 +6,9 @@
 //   bun tests/tla/drivers/acp/follow/driver.ts               # after zig build
 //   bun tests/tla/drivers/acp/follow/driver.ts --model today
 //
-// --model rules (the default) checks fx with fix F6: a replayed message's id
+// --model rules (the default) checks fx now: a replayed message's id
 // comes from its place in the log, so every load gives it the same id.
-// --model today checks the model before F6, which no build of fx matches now,
+// --model today checks the model of older fx, which no build matches now,
 // so every plan must be rejected. No model calls: every reply comes from the
 // fake Gateway in tests/e2e/tmux-helpers.ts.
 import { existsSync, mkdirSync } from "node:fs";

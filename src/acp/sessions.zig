@@ -1641,7 +1641,7 @@ fn sendActiveHistoryUpdates(
 
 /// Gives each replayed message of one turn its id, `turn-{n}-{k}`: the
 /// turn's number in the session log and the message's place in the turn's
-/// replay, so every load gives a saved message the same id (F6). A turn the
+/// replay, so every load gives a saved message the same id. A turn the
 /// log gave no number gets fx's random ids, as a live message does. An id is
 /// valid until the next `take`.
 const ReplayIds = struct {
