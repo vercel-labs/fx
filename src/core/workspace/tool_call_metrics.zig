@@ -735,9 +735,17 @@ fn expectCutLaws(value: []const u8, budget: usize, valid_utf8: bool) !void {
     if (valid_utf8) {
         try std.testing.expect(std.unicode.utf8ValidateSlice(value[0..cut.head_len]));
         try std.testing.expect(std.unicode.utf8ValidateSlice(value[value.len - cut.tail_len ..]));
-        // A valid cut loses at most three bytes on each side.
-        try std.testing.expect(cut.head_len + 3 >= budget / 2);
-        try std.testing.expect(cut.head_len + cut.tail_len + 3 >= budget);
+        // A UTF-8 cut loses at most three bytes on each side. The kept head
+        // and tail stop short of it only to leave out a secret it splits
+        // (`text_utils.secretSafePrefixLen`, `text_utils.secretSafeSuffixStart`).
+        const utf8_head = utf8PrefixLen(value, budget / 2);
+        try std.testing.expect(utf8_head + 3 >= budget / 2);
+        try std.testing.expect(cut.head_len <= utf8_head);
+        // A short head leaves out at most the one word it would split.
+        for (value[cut.head_len..utf8_head]) |byte| try std.testing.expect(!std.ascii.isWhitespace(byte));
+        const utf8_tail = utf8SuffixLen(value, budget - cut.head_len);
+        try std.testing.expect(cut.head_len + utf8_tail + 3 >= budget);
+        try std.testing.expect(cut.tail_len <= utf8_tail);
     }
 }
 
