@@ -4618,11 +4618,14 @@ fn nudgeSet(worker: *worker_runtime.WorkerRuntime) bool {
     return worker.mail_nudged;
 }
 
-/// Whether `child_id` is still on the host's closing list.
-fn closingListed(runtime: *Runtime, child_id: []const u8) bool {
+/// Whether a thread is writing the close of `child_id`: the child is on the
+/// host's closing list with its `settling` mark, which `settleClose` sets
+/// before it takes the registry's lock for the write.
+fn closeSettling(runtime: *Runtime, child_id: []const u8) bool {
     runtime.admission_mutex.lockUncancelable(io_mod.getIo());
     defer runtime.admission_mutex.unlock(io_mod.getIo());
-    return runtime.closingIndexLocked(child_id) != null;
+    const index = runtime.closingIndexLocked(child_id) orelse return false;
+    return runtime.closing.items[index].settling;
 }
 
 test "a user's turn on a closing subagent writes the close before it nudges main's wait" {
@@ -4647,14 +4650,15 @@ test "a user's turn on a closing subagent writes the close before it nudges main
     };
     // The end has finished the work in the log and is held before it settles.
     try SettleGap.entered.waitTimeout(io_mod.getIo(), gap_wait_limit);
-    // Hold the registry: the close write cannot finish, and settleClose takes
-    // the child off the closing list before it waits for the registry.
+    // Hold the registry: the close write cannot finish. settleClose marks the
+    // child settling, and keeps it on the closing list, before it waits for
+    // the registry.
     var registry_lock = gap.runtime.managed.state_store.acquireLock();
     var registry_released = false;
     defer if (!registry_released) registry_lock.release();
     SettleGap.go.set(io_mod.getIo());
     for (0..5000) |_| {
-        if (!closingListed(gap.runtime, child_id)) break;
+        if (closeSettling(gap.runtime, child_id)) break;
         io_mod.sleep(std.time.ns_per_ms);
     } else return error.CloseWriteNeverStarted;
     // The close is next, and the nudge must not have come yet.
