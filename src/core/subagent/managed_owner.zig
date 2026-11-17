@@ -479,7 +479,10 @@ pub const Owner = struct {
     /// stop or close from here on is for the next work, which the slot then
     /// starts already stopped. The host calls it while it holds its
     /// admission lock, as it calls `markEnding`, so the choice and what a
-    /// stop or close sees of it are in one order.
+    /// stop or close sees of it are in one order. The slot resets the live
+    /// metrics itself as it goes on, which keeps this method off them: the
+    /// term WebAssembly surface reaches the host's hook but never runs a
+    /// slot, and 64-bit atomics do not compile there.
     pub fn markNext(self: *Owner, child_id: []const u8) void {
         self.mutex.lockUncancelable(io_mod.getIo());
         defer self.mutex.unlock(io_mod.getIo());
@@ -490,7 +493,6 @@ pub const Owner = struct {
             slot.stopped_by_parent = false;
             slot.stopped_by_user = false;
             slot.closed_by_user = false;
-            slot.metrics.reset();
             slot.ended = false;
         }
     }
@@ -1152,6 +1154,7 @@ fn slotMain(slot: *Slot) void {
             // stop (`markNext`), so a stop since then is this work's and
             // stays: it starts stopped.
             std.debug.assert(!slot.ended);
+            slot.metrics.reset();
             owner.mutex.unlock(io_mod.getIo());
             continue;
         }
