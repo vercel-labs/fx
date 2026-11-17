@@ -1072,8 +1072,14 @@ const TurnSignIn = struct {
     account_id: ?[]u8,
     gateway_team: ?[]u8,
 
-    /// The caller owns the result and frees it with `deinit`.
-    fn capture(alloc: Allocator, state: *const server.ServerState, session: *const server.ActiveSessionState) !TurnSignIn {
+    /// The caller owns the result and frees it with `deinit`. The three copies
+    /// are one step under `subagent_authority_mutex`, which a refresh that
+    /// publishes a credential holds while it replaces and frees the key, the
+    /// account and the team (`server.publishRefreshedCredential`), so the
+    /// result is one whole credential.
+    fn capture(alloc: Allocator, state: *server.ServerState, session: *const server.ActiveSessionState) !TurnSignIn {
+        state.subagent_authority_mutex.lockUncancelable(io_mod.getIo());
+        defer state.subagent_authority_mutex.unlock(io_mod.getIo());
         const api_key = try alloc.dupe(u8, session.api_key);
         errdefer secret.zeroAndFree(alloc, api_key);
         const account_id = if (session.account_id) |value| try alloc.dupe(u8, value) else null;
@@ -6173,6 +6179,85 @@ test "ACP turn sign-in outlives a refreshed credential the server publishes" {
     try std.testing.expectEqualStrings("refreshed-api-key", report_job.api_key);
     try std.testing.expectEqualStrings("team_after", report_job.gateway_team.?);
     try std.testing.expectEqual(types.CredentialSource.ai_gateway_api_key, report_job.credential_source.?);
+}
+
+/// A turn's sign-in copied beside a refresh that publishes a new credential:
+/// the publisher replaces and frees the key, account and team under
+/// `subagent_authority_mutex`, as `publishRefreshedCredential` does for a
+/// subagent's refresh, and every credential it publishes has one number in all
+/// three.
+const SignInRace = struct {
+    state: *server.ServerState,
+    publishes: u32,
+    publisher_done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    captures: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+    torn: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+
+    fn publish(state: *server.ServerState, number: u32) !void {
+        const alloc = state.alloc;
+        var credential: credentials.Credential = .{
+            .token = try alloc.print("key-{d}", .{number}),
+            .source = .ai_gateway_api_key,
+        };
+        defer credential.deinit(alloc);
+        credential.account_id = try alloc.print("account-{d}", .{number});
+        credential.team_id = try alloc.print("team-{d}", .{number});
+        state.subagent_authority_mutex.lockUncancelable(io_mod.getIo());
+        defer state.subagent_authority_mutex.unlock(io_mod.getIo());
+        server.adoptServerCredential(state, &credential);
+    }
+
+    fn runPublisher(self: *SignInRace) void {
+        defer self.publisher_done.store(true, .release);
+        var number: u32 = 1;
+        while (number <= self.publishes) : (number += 1) publish(self.state, number) catch return;
+    }
+
+    fn runCapturer(self: *SignInRace) void {
+        const alloc = std.testing.allocator;
+        while (!self.publisher_done.load(.acquire)) {
+            var sign_in = TurnSignIn.capture(alloc, self.state, &self.state.active_session.?) catch {
+                _ = self.torn.fetchAdd(1, .monotonic);
+                continue;
+            };
+            defer sign_in.deinit(alloc);
+            if (!isOneCredential(sign_in)) _ = self.torn.fetchAdd(1, .monotonic);
+            _ = self.captures.fetchAdd(1, .monotonic);
+        }
+    }
+
+    fn isOneCredential(sign_in: TurnSignIn) bool {
+        if (!std.mem.startsWith(u8, sign_in.api_key, "key-")) return false;
+        const number = sign_in.api_key["key-".len..];
+        const account = sign_in.account_id orelse return false;
+        const team = sign_in.gateway_team orelse return false;
+        return std.mem.startsWith(u8, account, "account-") and
+            std.mem.eql(u8, account["account-".len..], number) and
+            std.mem.startsWith(u8, team, "team-") and
+            std.mem.eql(u8, team["team-".len..], number);
+    }
+};
+
+test "ACP turn sign-in is one whole credential while a refresh publishes beside it" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace);
+
+    var state = try initTestAcpState(alloc, workspace, .auto);
+    defer state.deinit();
+    try SignInRace.publish(&state, 0);
+
+    var race: SignInRace = .{ .state = &state, .publishes = 4000 };
+    const publisher = try std.Thread.spawn(.{}, SignInRace.runPublisher, .{&race});
+    const capturer = try std.Thread.spawn(.{}, SignInRace.runCapturer, .{&race});
+    publisher.join();
+    capturer.join();
+
+    try std.testing.expect(race.captures.load(.monotonic) > 0);
+    try std.testing.expectEqual(@as(u32, 0), race.torn.load(.monotonic));
 }
 
 test "ACP prompt agent config carries request options from active session" {
