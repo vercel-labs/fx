@@ -234,7 +234,7 @@ After the replay, fx answers:
 }
 ```
 
-`tests/tla/acp/AcpFollow.tla` models these rules, with the stable message ids of fix X21, and TLC checks that every connection that has the session open holds exactly its saved turns, with no gap and no repeat. Its `Today` configs show where fx breaks them now.
+`tests/tla/acp/AcpFollow.tla` models these rules, with stable message ids (a replayed message keeps the id it had when it was live), and TLC checks that every connection that has the session open holds exactly its saved turns, with no gap and no repeat. Its `Today` configs show where fx breaks them now.
 
 ### Session status and list changes
 
