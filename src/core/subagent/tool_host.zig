@@ -288,7 +288,8 @@ pub const Runtime = struct {
         runtime.approvals = .{
             .alloc = alloc,
         };
-        runtime.profile_cache = .{ .alloc = alloc };
+        // The session's own workspace, not the process's: an ACP session can be bound to another.
+        runtime.profile_cache = .{ .alloc = alloc, .roots = .{ .home = io_mod.homeDir(), .workspace_root = children.workspace } };
         runtime.authority_resolver = .{
             .children = children,
             .root_id = runtime.root_id,
@@ -660,7 +661,7 @@ pub const Runtime = struct {
         // What the profile set, which a new child keeps (`child_state.Child`).
         var started_with: ?started_with_mod.StartedWith = null;
         if (model_override.profile) |name| {
-            const profile = switch (try loadChildProfile(profile_arena.allocator(), name)) {
+            const profile = switch (try loadChildProfile(profile_arena.allocator(), self.profile_cache.?.roots, name)) {
                 .rejected => |failure| return self.encodeManaged(alloc, failure),
                 .loaded => |value| value,
             };
@@ -2407,11 +2408,11 @@ pub const Runtime = struct {
     };
 
     /// Loads the profile a new child asks for, from the fx home and the
-    /// current directory, as `fx --profile` does. The result and any message
-    /// belong to `arena`.
-    fn loadChildProfile(arena: Allocator, name: []const u8) !ChildProfile {
-        const workspace_root = io_mod.realpathAlloc(arena, ".") catch null;
-        const roots = try profiles.Roots.init(arena, io_mod.homeDir(), workspace_root);
+    /// session's workspace root (`cache_roots`, the profile cache's), as
+    /// `fx --profile` does in the directory it runs in. The result and any
+    /// message belong to `arena`.
+    fn loadChildProfile(arena: Allocator, cache_roots: authority.ProfileCache.LoadRoots, name: []const u8) !ChildProfile {
+        const roots = try profiles.Roots.init(arena, cache_roots.home, cache_roots.workspace_root);
         var failure: ?[]const u8 = null;
         const profile = profiles.load(arena, roots, name, &failure) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
@@ -5699,6 +5700,41 @@ test "a new subagent starts in the main profile unless its message names one, an
     try std.testing.expectEqual(profiles.Source.builtin, registry.findPersistent("copier").?.started_with.?.source);
 }
 
+test "a subagent's profile loads from its session's workspace, not the directory the process runs in" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var parent: child_state.TestParent = undefined;
+    try parent.init(alloc);
+    defer parent.deinit();
+    // The session's workspace is the test parent's folder, and the profile is
+    // only there: the process runs in the repository checkout, which has none.
+    const io = io_mod.getIo();
+    try parent.tmp.dir.createDirPath(io, ".fx/agents/session-reviewer");
+    var settings = try parent.tmp.dir.createFile(io, ".fx/agents/session-reviewer/profile.json", .{});
+    defer settings.close(io);
+    try settings.writeStreamingAll(io, "{\"description\": \"Reads the session workspace\", \"tools\": [\"read_file\"]}");
+    var fixture = MailboxFixture{};
+    defer fixture.deinit();
+    const runtime = try mailboxRuntime(alloc, &fixture, &parent);
+    defer runtime.deinit();
+
+    const sent = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "look", .profile = "session-reviewer" } }, "call-1", null);
+    try std.testing.expect(std.mem.find(u8, sent, "profile_unavailable") == null);
+    try waitUntilQuiet(runtime);
+    var registry = try parent.stateStore().load(alloc);
+    defer registry.deinit(alloc);
+    const started = registry.findPersistent("reviewer").?.started_with.?;
+    try std.testing.expectEqual(profiles.Source.project, started.source);
+    try std.testing.expectEqual(@as(usize, 1), started.tools.?.len);
+    try std.testing.expectEqualStrings("read_file", started.tools.?[0]);
+
+    // A child saved with only its profile's name loads it from the same place.
+    const reloaded = try runtime.profile_cache.?.get("name-only-child", "session-reviewer", null);
+    try std.testing.expectEqualStrings("read_file", reloaded.tools.?[0]);
+}
+
 test "a new subagent saves what its profile set, unless that would not fit in a spawn line" {
     const alloc = std.testing.allocator;
     var parent: child_state.TestParent = undefined;
@@ -6952,6 +6988,7 @@ test "unknown and ambiguous model overrides reject before any child session" {
     try std.testing.expect(std.mem.find(u8, unknown_result.body, "\"error_code\":\"unknown_model\"") != null);
     try std.testing.expect(std.mem.find(u8, unknown_result.body, "skldjf") != null);
     try std.testing.expect(std.mem.find(u8, unknown_result.body, "omit model to inherit") != null);
+    try std.testing.expect(std.mem.find(u8, unknown_result.body, "fx models ls --json") != null);
 
     var ambiguous = try model_contract.validateRequest(alloc, .{ .message = .{ .agent = "probe", .message = "probe", .model = "terra" } });
     defer ambiguous.deinit(alloc);
@@ -6960,6 +6997,7 @@ test "unknown and ambiguous model overrides reject before any child session" {
     try std.testing.expect(std.mem.find(u8, ambiguous_result.body, "\"error_code\":\"ambiguous_model\"") != null);
     try std.testing.expect(std.mem.find(u8, ambiguous_result.body, "openai/gpt-5.6-terra") != null);
     try std.testing.expect(std.mem.find(u8, ambiguous_result.body, "openai/gpt-5.6-terra-fast") != null);
+    try std.testing.expect(std.mem.find(u8, ambiguous_result.body, "fx models ls --json") != null);
 
     // Rejections never created or ran a child.
     try std.testing.expectEqual(@as(usize, 0), fixture.runs);
@@ -7450,7 +7488,7 @@ fn modelOverrideFailureMessage(
                 if (index > 0) try writer.writeAll(", ");
                 try writer.writeAll(candidate);
             }
-            try writer.writeAll(". Retry with an exact catalog model ID.");
+            try writer.writeAll(". Retry with an exact catalog model ID from `fx models ls --json`.");
         },
         .unknown => {
             try writer.print("unknown model override '{s}'", .{raw_model});
@@ -7464,7 +7502,7 @@ fn modelOverrideFailureMessage(
             } else {
                 try writer.writeAll("; no catalog model names match it.");
             }
-            try writer.writeAll(" Use an exact catalog model ID, or omit model to inherit the parent's model.");
+            try writer.writeAll(" Run `fx models ls --json` to list the exact IDs, or omit model to inherit the parent's model.");
         },
     }
     return out.toOwnedSlice();

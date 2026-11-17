@@ -1233,11 +1233,11 @@ describe("MCP login", () => {
     expect(await statusOf(root)).not.toBe("signed_in");
   }, 30_000);
 
-  // ---- A server that refuses a login says so (the ClickState report) ----
+  // ---- A server that refuses a login says so ----
   //
-  // The server answers every request that carries fx's token with 401 invalid_token. fx
-  // used to print "Signed in" after the token exchange, and later show only "needs
-  // login" with no error, so the person signed in again and again.
+  // The server answers every request that carries fx's token with 401 invalid_token. The
+  // sign-in then ends with the server's own words and saves nothing, so the person can tell
+  // that the server refused the token, instead of finding only "needs login" later.
   const REFUSAL = { error: "invalid_token", description: "No authorization provided" };
   // The server's own words go in quotes inside fx's sentence, so they can't close it.
   const REFUSED_NEW = 'fixture refused the new login (invalid_token: "No authorization provided")';
