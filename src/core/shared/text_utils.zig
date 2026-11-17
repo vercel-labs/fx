@@ -766,9 +766,38 @@ pub fn secretSafeSuffixStart(value: []const u8, start: usize) usize {
     }
 }
 
+/// How far back `secretSafeSuffixStart` looks for an assignment whose value
+/// the start falls inside: longer than a private key or a service account's
+/// JSON. No line break falls inside a quoted value.
+const max_assignment_lookback = 16 * 1024;
+/// How many sensitive assignment keys before the start `secretSafeSuffixStart`
+/// checks, so a line of many keys costs little.
+const max_assignment_candidates = 16;
+
 /// `secretSafeSuffixStart`'s rules, applied once.
 fn suffixStartStep(value: []const u8, start: usize) usize {
     if (start == 0 or start >= value.len) return start;
+    // An assignment's quoted value runs to its closing quote or the end of
+    // its line, so it can start far before `start`. Only the sensitive keys
+    // of `=` signs on the same line need the matcher, and only the nearest
+    // `max_assignment_candidates` of them.
+    const window = start -| max_assignment_lookback;
+    const floor = if (std.mem.findScalarLast(u8, value[window..start], '\n')) |line_break| window + line_break + 1 else window;
+    var search_end = start;
+    var candidates: usize = 0;
+    while (candidates < max_assignment_candidates) {
+        const relative = std.mem.findScalarLast(u8, value[floor..search_end], '=') orelse break;
+        const equals = floor + relative;
+        search_end = equals;
+        var key_start = equals;
+        while (key_start > floor and isAssignmentKeyChar(value[key_start - 1])) key_start -= 1;
+        if (key_start == equals or !sensitiveAssignmentKey(value[key_start..equals])) continue;
+        candidates += 1;
+        if (findSecretSpan(value, key_start)) |span| {
+            const span_end = span.prefix_end + span.value_len;
+            if (span_end > start) return @min(span_end, value.len);
+        }
+    }
     // A start inside a secret `maskSecrets` finds in the whole value moves
     // past that secret: the tail alone lacks the start the mask matches on,
     // such as an assignment's key or a quoted value's opening quote.
@@ -1722,6 +1751,15 @@ test "secretSafeSuffixStart skips the rest of a split token or a URL credential"
         try std.testing.expect(std.mem.find(u8, masked, "topsecret") == null);
         try std.testing.expect(std.mem.find(u8, masked, "secretvalue") == null);
     }
+
+    // A quoted value can run far past the 1024 bytes a token needs: only the
+    // `=` on its line finds it.
+    const long_quoted = "run export GCP_SECRET='" ++ repeat("MIIEvQ key part ", 150) ++ "' && gcloud auth; exit 1";
+    var long_start: usize = 1100;
+    while (long_start < long_quoted.len) : (long_start += 97) {
+        const masked = try maskSecrets(arena, long_quoted[secretSafeSuffixStart(long_quoted, long_start)..]);
+        try std.testing.expect(std.mem.find(u8, masked, "MIIEvQ") == null);
+    }
 }
 
 test "secretSafeSuffixStart skips many adjacent secrets without a deep stack" {
@@ -1755,6 +1793,33 @@ test "secretSafeSuffixStart skips many adjacent secrets without a deep stack" {
     try std.testing.expect(std.mem.find(u8, masked, "a b") == null);
 }
 
+test "secretSafeSuffixStart stays cheap on a line of many equals signs" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // A wall of `=` signs: the matcher is asked about none of them.
+    const equals = try arena.alloc(u8, 16000 + " end".len);
+    @memset(equals[0..16000], '=');
+    @memcpy(equals[16000..], " end");
+    var back: usize = 1;
+    while (back <= 4) : (back += 1) {
+        try std.testing.expect(secretSafeSuffixStart(equals, 16000 - back) <= 16000);
+    }
+
+    // 3000 sensitive assignments: only the nearest `max_assignment_candidates`
+    // reach the matcher.
+    const assignment = "TOKEN=a ";
+    const repeated = try arena.alloc(u8, assignment.len * 3000 + "end".len);
+    var index: usize = 0;
+    while (index < 3000) : (index += 1) @memcpy(repeated[index * assignment.len ..][0..assignment.len], assignment);
+    @memcpy(repeated[assignment.len * 3000 ..], "end");
+    back = 1;
+    while (back <= 4) : (back += 1) {
+        _ = secretSafeSuffixStart(repeated, repeated.len - back);
+    }
+}
+
 test "secretSafePrefixLen and secretSafeSuffixStart leave no part of a planted secret" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
@@ -1777,6 +1842,10 @@ test "secretSafePrefixLen and secretSafeSuffixStart leave no part of a planted s
             .secret = "PASSWORD=\"hunter2 topsecretvalue\"",
             .probes = &[_][]const u8{ "hunter2", "topsecret" },
         },
+        .{
+            .secret = "GCP_SECRET='" ++ repeat("MIIEvQ key part ", 150) ++ "'",
+            .probes = &[_][]const u8{"MIIEvQ"},
+        },
     };
 
     const filler = [_][]const u8{ "alpha", "run", "42", "{", "\"", ":", ",", " ", "\u{4e2d}", "x" };
@@ -1784,7 +1853,7 @@ test "secretSafePrefixLen and secretSafeSuffixStart leave no part of a planted s
     var prng = std.Random.DefaultPrng.init(0x5eed);
     const random = prng.random();
 
-    var value_buf: [1024]u8 = undefined;
+    var value_buf: [4 * 1024]u8 = undefined;
     var round: usize = 0;
     while (round < 2000) : (round += 1) {
         var len: usize = 0;
