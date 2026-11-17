@@ -445,7 +445,8 @@ Options:
 The prompt may be passed as arguments or piped on stdin when no prompt args are given.
 TTY stdout uses the Minimal transcript presentation; redirected stdout emits raw assistant Markdown.
 Operational progress and diagnostics are written to stderr. JSON \`output\` keeps accumulated assistant Markdown; \`final_output\` contains only the completed final response, or an empty string when absent.
-JSON usage sums reported main-agent input_tokens and output_tokens, including with --no-save; unreported counts are null. cache_read_tokens and cache_write_tokens appear only when the provider reports them. Nested usage and dollar spend are excluded.
+JSON usage sums reported main-agent input_tokens and output_tokens, including with --no-save; unreported counts are null. cache_read_tokens and cache_write_tokens appear only when the provider reports them. Subagent usage and dollar spend are excluded.
+JSON subagents appears only when a subagent did work in this request. It lists each one in the order it first ran, with its name, id, and usage in the same shape, counted for this request alone. fx session <session_id>/<name> reads one and prints the same id.
 --system replaces only the built-in base prompt for this request; tool, skill, project, and runtime context still apply.
 With --prompt-permissions, JSON and quiet requests may prompt on stderr only when stdin is a TTY.
 `;
@@ -3282,6 +3283,45 @@ describe("cli: missing durable home", () => {
 });
 
 describe("cli: sessions", () => {
+  test(
+    "fx sessions ls lists the same sessions as fx sessions",
+    async () => {
+      const home = mkdtempSync(join(tmpdir(), "fx-e2e-sessions-ls-"));
+      try {
+        const bare = await runFx(["sessions", "--json"], { env: { HOME: home } });
+        const explicit = await runFx(["sessions", "ls", "--json"], {
+          env: { HOME: home },
+        });
+        expect(bare.code).toBe(0);
+        expect(explicit.code).toBe(0);
+        expect(explicit.stderr).toBe("");
+        const listed = JSON.parse(explicit.stdout);
+        expect(listed).toMatchObject({ kind: "sessions", count: 0, sessions: [] });
+        expect(listed).toEqual(JSON.parse(bare.stdout));
+      } finally {
+        rmSync(home, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "fx sessions --help lists ls and convert",
+    async () => {
+      const home = mkdtempSync(join(tmpdir(), "fx-e2e-sessions-help-"));
+      try {
+        const help = await runFx(["sessions", "--help"], { env: { HOME: home } });
+        expect(help.code).toBe(0);
+        expect(help.stdout).toContain("sessions [ls]");
+        expect(help.stdout).toContain("  ls");
+        expect(help.stdout).toContain("  convert");
+      } finally {
+        rmSync(home, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
   test(
     "fx sessions --json returns valid sessions JSON",
     async () => {
@@ -6702,6 +6742,7 @@ describe("cli: completion", () => {
     [["fx", "ask", "--permission-mode", ""], "ask auto full-access"],
     [["fx", "--model", "gpt-5", "ask", "--permission-m"], "--permission-mode"],
     [["fx", "mcp", ""], "list show add remove login logout approve reject call"],
+    [["fx", "sessions", ""], "ls convert"],
     [["fx", "mcp", "add", "--g"], "--global"],
     [["fx", "usage", "--period", ""], "today 7d month"],
     [["fx", "login", ""], "vercel codex grok"],

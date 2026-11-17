@@ -2307,7 +2307,7 @@ test "model menu leaves out a fast variant that Fast mode on a listed model runs
 test "model menu leads with the models the catalog marks as Token Pass, for a team with Token Pass" {
     const alloc = std.testing.allocator;
     const entries = [_]model_catalog.ModelCatalogEntry{
-        .{ .id = @constCast("openai/gpt-6"), .model_type = @constCast("language") },
+        .{ .id = @constCast("openai/gpt-6-sol"), .model_type = @constCast("language") },
         .{ .id = @constCast("acme/new-pass-model"), .model_type = @constCast("language"), .token_pass = true },
         .{ .id = @constCast("deepseek/deepseek-v4.1-flash"), .model_type = @constCast("language") },
         .{ .id = @constCast("zai/glm-5.3"), .model_type = @constCast("language"), .token_pass = true },
@@ -2317,7 +2317,7 @@ test "model menu leads with the models the catalog marks as Token Pass, for a te
 
     // The marks, not a list in fx, pick the models, in catalog order.
     try hydrateMenuSnapshot(alloc, &menu, &entries, true);
-    const led = [_][]const u8{ "acme/new-pass-model", "zai/glm-5.3", "openai/gpt-6", "deepseek/deepseek-v4.1-flash" };
+    const led = [_][]const u8{ "acme/new-pass-model", "zai/glm-5.3", "openai/gpt-6-sol", "deepseek/deepseek-v4.1-flash" };
     for (led, menu.items.items) |id, item| {
         try std.testing.expectEqualStrings(id, item.id);
         try std.testing.expectEqual(std.mem.eql(u8, id, "acme/new-pass-model") or std.mem.eql(u8, id, "zai/glm-5.3"), item.token_pass);
