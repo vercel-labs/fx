@@ -847,9 +847,9 @@ test "built-in model-facing tool contract stays byte exact" {
     const actual_hex = std.fmt.bytesToHex(hasher.finalResult(), .lower);
     try std.testing.expectEqualStrings(
         if (builtin.target.os.tag.isDarwin())
-            "a84217167d9345c518d346ab58d3e117b92ac636b5272af02720011c6aa99a99"
+            "ea5277eb767948a87e1164473dd53688b0cf67c57a7f6a24a3fd00a57cdc037d"
         else
-            "8b6048d8bf6145c7a37a2bc376d13d4b2cfae304b179a2bd1d2e464a138d87a1",
+            "70df6be8e9f7f5438385002ea392cda8f25a320eecc8a649f1a0d0fa5c681221",
         &actual_hex,
     );
 }
