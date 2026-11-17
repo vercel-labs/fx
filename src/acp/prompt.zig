@@ -262,8 +262,9 @@ const RouteView = struct {
 /// `session/set_config_option` sets the route under the same lock and frees
 /// what it held: the model, the key, the account, the team and the catalog.
 /// A turn that kept pointers into the session would read freed memory, so it
-/// reads this copy, which a later switch leaves as it was. The switch reaches
-/// the subagent's next turn.
+/// reads this copy, which a later switch leaves as it was. A switch does not
+/// move a subagent that exists: it keeps the provider and model it was
+/// created with, and a subagent created after the switch takes the new ones.
 const ModelRoute = struct {
     provider: model_provider.ProviderId,
     model: []u8,
