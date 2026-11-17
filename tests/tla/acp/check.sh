@@ -39,6 +39,7 @@
 #   bun ../drivers/acp/prompt_delivery/check-spec.ts
 #   bun ../drivers/acp/prompt_delivery/driver.ts   # the sh.fx rules; --model today is fx acp before them
 #   bun ../drivers/acp/follow/check-spec.ts
+#   bun ../drivers/acp/follow/driver.ts   # one connection: replayed message ids (F6)
 #   bun ../drivers/acp/session_state/check-spec.ts
 #   bun ../drivers/acp/session_state/driver.ts   # today's fx acp; --model rules fails until the rules land
 #   bun ../drivers/acp/shared_session/check-spec.ts
@@ -99,6 +100,7 @@ MCAcpPromptDelivery AcpPromptDeliveryToday-late LateRunTogether
 MCAcpFollow MCAcpFollow -
 MCAcpFollow AcpFollowToday-busy JoinWorks
 MCAcpFollow AcpFollowToday-ids StableIds
+MCAcpFollow AcpFollowIds -
 MCAcpFollow AcpFollowToday-position PositionCurrent
 MCAcpFollow AcpFollowToday-replay ReplaySaid
 MCAcpSessionState MCAcpSessionState -

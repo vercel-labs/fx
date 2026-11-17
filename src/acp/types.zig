@@ -19,6 +19,16 @@ pub fn generateMessageId(storage: *MessageIdBuffer) []const u8 {
     return storage;
 }
 
+/// Room for `turn-{turn}-{index}` with both numbers at their largest.
+pub const ReplayMessageIdBuffer = [46]u8;
+
+/// The id of a replayed message: its turn's number in the session log and
+/// its place among that turn's replayed messages, so every load gives a
+/// saved message the same id (fix F6, X21).
+pub fn writeReplayMessageId(storage: *ReplayMessageIdBuffer, turn: u64, index: usize) []const u8 {
+    return std.fmt.bufPrint(storage, "turn-{d}-{d}", .{ turn, index }) catch unreachable;
+}
+
 pub const protocol_version: u32 = 1;
 
 /// Returns the borrowed value at `_meta[key]` on an ACP object, where `key` is
@@ -657,6 +667,15 @@ pub fn writeSessionInfoUpdate(w: *std.Io.Writer, title: []const u8, updated_at: 
 
 pub fn writeUsageUpdate(w: *std.Io.Writer, used: u64, size: u64) !void {
     try w.print("{{\"sessionUpdate\":\"usage_update\",\"used\":{d},\"size\":{d}}}", .{ used, size });
+}
+
+test "writeReplayMessageId names a replayed message by its turn and place" {
+    var storage: ReplayMessageIdBuffer = undefined;
+    try std.testing.expectEqualStrings("turn-3-0", writeReplayMessageId(&storage, 3, 0));
+    var largest: ReplayMessageIdBuffer = undefined;
+    const id = writeReplayMessageId(&largest, std.math.maxInt(u64), std.math.maxInt(usize));
+    try std.testing.expectEqualStrings("turn-18446744073709551615-18446744073709551615", id);
+    try std.testing.expectEqual(@as(usize, 46), id.len);
 }
 
 test "writeAgentMessageChunk produces valid json" {

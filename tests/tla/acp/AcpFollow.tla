@@ -18,7 +18,8 @@
 (*    the turns saved after it. A position fx doesn't know, such as one   *)
 (*    from before a compaction rewrote the log, gets the whole session,   *)
 (*    and the answer says which.                                           *)
-(*  - A replayed message keeps the id it had when it was live (X21).       *)
+(*  - A replayed message gets an id made from its place in the log, so     *)
+(*    every load gives it the same id (X21, Q130). IdRules turns it on.    *)
 (*  - session/close closes the session on that connection only. While     *)
 (*    another connection has it open, a running turn goes on.             *)
 (*                                                                         *)
@@ -27,7 +28,8 @@
 (*                                                                         *)
 (* Today (Rules = FALSE): a session open on one connection is busy for    *)
 (* others; a load ignores the position and replays everything without     *)
-(* saying so, and no position is sent; and replayed messages get new ids. *)
+(* saying so, and no position is sent. Before fix F6 (IdRules = FALSE),    *)
+(* replayed messages got new ids on every load.                            *)
 (*                                                                         *)
 (* A turn is a number; a compaction replaces the log with one summary     *)
 (* turn, 0, in a new generation.                                           *)
@@ -36,12 +38,13 @@ EXTENDS Integers, Sequences
 
 CONSTANTS
     Rules,      \* TRUE: the sh.fx rules; FALSE: fx today
+    IdRules,    \* TRUE: replayed message ids come from the log (F6); FALSE: before F6
     Conns,      \* the client connections
     Folders,    \* the folders a client may send as cwd
     MaxTurns,   \* turns the session may run
     MaxCompactions
 
-ASSUME Rules \in BOOLEAN /\ MaxTurns \in Nat /\ MaxCompactions \in Nat
+ASSUME Rules \in BOOLEAN /\ IdRules \in BOOLEAN /\ MaxTurns \in Nat /\ MaxCompactions \in Nat
 
 NoPos == [gen |-> -1, n |-> -1]
 NoObs == [op |-> "none", conn |-> "none", ok |-> TRUE, replay |-> "none", cwd |-> "none"]
@@ -66,10 +69,12 @@ vars == <<saved, gen, running, turnsRun, compactions, folder, client, last>>
 OpenConns == {c \in Conns : client[c].open}
 OpenElsewhere(c) == OpenConns \ {c} # {}
 
-\* The messages of `turns` as a replay sends them. A replayed message keeps
-\* its live id under the rules; today it gets a new one.
-Replayed(turns) == [k \in 1..Len(turns) |-> [turn |-> turns[k], id |-> IF Rules THEN turns[k] ELSE -1]]
-Live(t) == [turn |-> t, id |-> t]
+\* The messages of `turns` as a replay sends them. With fix F6 a replayed
+\* message's id is made from its place in the log, its turn; before it, each
+\* load gave a new one. A live message has fx's own id, which no rule checks
+\* (Q130).
+Replayed(turns) == [k \in 1..Len(turns) |-> [turn |-> turns[k], id |-> IF IdRules THEN turns[k] ELSE -1, replayed |-> TRUE]]
+Live(t) == [turn |-> t, id |-> -1, replayed |-> FALSE]
 Turns(msgs) == [k \in 1..Len(msgs) |-> msgs[k].turn]
 
 Init ==
@@ -178,8 +183,10 @@ TypeOK ==
 \* order: no gap and no repeat.
 InSync == \A c \in OpenConns : Turns(client[c].has) = saved
 
-\* A replayed message has the id it had live (X21).
-StableIds == \A c \in Conns : \A k \in DOMAIN client[c].has : client[c].has[k].id = client[c].has[k].turn
+\* A replayed message's id is made from its place in the log, so every load
+\* gives it the same id (X21, Q130). Live messages keep fx's own ids.
+StableIds == \A c \in Conns : \A k \in DOMAIN client[c].has :
+                 client[c].has[k].replayed => client[c].has[k].id = client[c].has[k].turn
 
 \* A client can join a session that another connection has open.
 JoinWorks == [][(last'.op \in {"load", "resume"} /\ OpenElsewhere(last'.conn)) => last'.ok]_vars

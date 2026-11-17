@@ -10111,6 +10111,138 @@ describe("acp: model-independent", () => {
   );
 
   test(
+    "session/load gives each replayed message the same id on every load",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-load-ids-");
+      writeFileSync(join(root.workspace, "note.txt"), "LOAD_IDS_NOTE\n");
+      const gateway = startFakeGateway([
+        finalText("LOAD_IDS_ANSWER_ONE"),
+        fakeGatewaySse([
+          { type: "text-delta", id: "answer_1", delta: "LOAD_IDS_STEP_TEXT" },
+          {
+            type: "tool-call",
+            toolCallId: "load_ids_read_1",
+            toolName: "read_file",
+            input: { path: "note.txt" },
+          },
+          {
+            type: "finish",
+            finishReason: { unified: "tool-calls", raw: "tool-calls" },
+          },
+        ]),
+        finalText("LOAD_IDS_ANSWER_TWO"),
+      ]);
+      try {
+        client = await AcpClient.create({
+          cwd: root.workspace,
+          env: fakeGatewayEnv(root, gateway),
+        });
+        await client.request("initialize", { protocolVersion: 1 }, 1);
+        const newResponse = await client.request("session/new", { mcpServers: [] }, 2) as any;
+        await client.readLine();
+        const sessionId = newResponse.result.sessionId;
+        await client.request("session/set_mode", { modeId: "auto" }, 3);
+        const firstPrompt = await runPrompt(client, "LOAD_IDS_PROMPT_ONE", TIMEOUT);
+        expect(firstPrompt.promptResult.result.stopReason).toBe("end_turn");
+        const liveAgentChunks = firstPrompt.messages
+          .map((message: any) => message.params?.update)
+          .filter((update: any) => update?.sessionUpdate === "agent_message_chunk");
+        expect(liveAgentChunks.length).toBeGreaterThan(0);
+        for (const update of liveAgentChunks) {
+          expect(update.messageId).toMatch(/^[0-9a-f]{32}$/);
+        }
+        const secondPrompt = await runPrompt(client, "LOAD_IDS_PROMPT_TWO", TIMEOUT);
+        expect(secondPrompt.promptResult.result.stopReason).toBe("end_turn");
+        expect(client.stderr).toBe("");
+        await client.close();
+
+        client = await AcpClient.create({
+          cwd: root.workspace,
+          env: fakeGatewayEnv(root, gateway),
+        });
+        await client.request("initialize", { protocolVersion: 1 }, 4);
+        client.send({
+          jsonrpc: "2.0",
+          id: 5,
+          method: "session/load",
+          params: { sessionId, mcpServers: [] },
+        });
+        const firstLoadMessages: any[] = [];
+        let firstLoadResponse: any = null;
+        while (firstLoadResponse === null) {
+          const message = await client.readLine() as any;
+          if (message.id === 5) {
+            firstLoadResponse = message;
+          } else {
+            firstLoadMessages.push(message);
+          }
+        }
+        expect(firstLoadResponse.error).toBeUndefined();
+        expect(client.stderr).toBe("");
+        await client.close();
+
+        client = await AcpClient.create({
+          cwd: root.workspace,
+          env: fakeGatewayEnv(root, gateway),
+        });
+        await client.request("initialize", { protocolVersion: 1 }, 6);
+        client.send({
+          jsonrpc: "2.0",
+          id: 7,
+          method: "session/load",
+          params: { sessionId, mcpServers: [] },
+        });
+        const secondLoadMessages: any[] = [];
+        let secondLoadResponse: any = null;
+        while (secondLoadResponse === null) {
+          const message = await client.readLine() as any;
+          if (message.id === 7) {
+            secondLoadResponse = message;
+          } else {
+            secondLoadMessages.push(message);
+          }
+        }
+        expect(secondLoadResponse.error).toBeUndefined();
+        expect(client.stderr).toBe("");
+
+        const firstLoad = firstLoadMessages
+          .filter((message) =>
+            message.params?.update?.sessionUpdate === "user_message_chunk" ||
+            message.params?.update?.sessionUpdate === "agent_message_chunk"
+          )
+          .map((message) => ({
+            kind: message.params.update.sessionUpdate,
+            text: message.params.update.content?.text,
+            messageId: message.params.update.messageId,
+          }));
+        const secondLoad = secondLoadMessages
+          .filter((message) =>
+            message.params?.update?.sessionUpdate === "user_message_chunk" ||
+            message.params?.update?.sessionUpdate === "agent_message_chunk"
+          )
+          .map((message) => ({
+            kind: message.params.update.sessionUpdate,
+            text: message.params.update.content?.text,
+            messageId: message.params.update.messageId,
+          }));
+        expect(firstLoad).toEqual(secondLoad);
+        expect(firstLoad).toEqual([
+          { kind: "user_message_chunk", text: "LOAD_IDS_PROMPT_ONE", messageId: "turn-1-0" },
+          { kind: "agent_message_chunk", text: "LOAD_IDS_ANSWER_ONE", messageId: "turn-1-1" },
+          { kind: "user_message_chunk", text: "LOAD_IDS_PROMPT_TWO", messageId: "turn-2-0" },
+          { kind: "agent_message_chunk", text: "LOAD_IDS_STEP_TEXT", messageId: "turn-2-1" },
+          { kind: "agent_message_chunk", text: "LOAD_IDS_ANSWER_TWO", messageId: "turn-2-2" },
+        ]);
+      } finally {
+        await client?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
     "session load replays completed assistant execution before the final answer",
     async () => {
       const root = createIsolatedRoot("fx-acp-load-execution-");
