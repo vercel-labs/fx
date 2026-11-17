@@ -2654,13 +2654,15 @@ fn storyFailureReason(scratch: std.mem.Allocator, detail: ?*const ToolDetailReco
 }
 
 /// The text after the first "error" or "fatal" label in `line`, such as
-/// "error: ", "error[E0308]: " or "error TS2554: ", when text follows it.
+/// "error: ", "error[E0308]: " or "error TS2554: ", when text follows it. A
+/// label starts the line or follows ": " or " - ", as in compiler output,
+/// so "connection error: timeout" inside a message is no label.
 fn afterErrorLabel(line: []const u8) ?[]const u8 {
     for ([_][]const u8{ "error", "fatal" }) |label| {
         var start: usize = 0;
         while (start + label.len <= line.len) : (start += 1) {
             if (!std.ascii.eqlIgnoreCase(line[start .. start + label.len], label)) continue;
-            if (start > 0 and isNameByte(line[start - 1])) continue;
+            if (start > 0 and !std.mem.endsWith(u8, line[0..start], ": ") and !std.mem.endsWith(u8, line[0..start], " - ")) continue;
             var end = start + label.len;
             // A code after the label: "[E0308]" right after it, or one word
             // after a space, such as "TS2554".
@@ -2687,8 +2689,8 @@ const command_reason_max_cols = 40;
 /// file or directory" and "src/main.zig:3:5: error: expected type" is
 /// "expected type". The message starts after an "error" or "fatal" with its
 /// code, as in "src/main.ts:14:15 - error TS2554: Expected 1 arguments", and
-/// after each word with no space that ends in ": ". The line stays whole when
-/// nothing would be left.
+/// after each word with no space that ends in ": " while the text after it
+/// has a space. The line stays whole when nothing would be left.
 fn commandMessage(line: []const u8) []const u8 {
     var rest = std.mem.trim(u8, line, " \t");
     if (afterErrorLabel(rest)) |message| rest = message;
@@ -2696,7 +2698,9 @@ fn commandMessage(line: []const u8) []const u8 {
         const prefix = rest[0..colon];
         if (prefix.len == 0 or std.mem.findAny(u8, prefix, " \t") != null) break;
         const after = std.mem.trimStart(u8, rest[colon + 2 ..], " \t");
-        if (after.len == 0) break;
+        // A word before text with no space is the message's own, as in
+        // "undefined: foo" or "KeyError: 'key'", so it stays.
+        if (after.len == 0 or std.mem.findAny(u8, after, " \t") == null) break;
         rest = after;
     }
     return rest;
@@ -8765,9 +8769,8 @@ test "a failed command's reason is the error it reports, not code it printed" {
     const text = try groupTextForTest(alloc, &entries, &details);
     defer alloc.free(text);
     errdefer std.debug.print("group:\n{s}\n", .{text});
-    // sed's own error line, by its message: what is left of the script it
-    // could not read.
-    try std.testing.expect(std.mem.find(u8, text, "· \",12p") != null);
+    // sed's own error line, by its message, not code the command printed.
+    try std.testing.expect(std.mem.find(u8, text, "· 1: \",12p") != null);
     try std.testing.expect(std.mem.find(u8, text, "error_code") == null);
 }
 
@@ -8781,6 +8784,13 @@ test "a failed command's reason is its message alone, at most 40 columns" {
     try std.testing.expectEqualStrings("could not compile `app`", commandMessage("error: could not compile `app`"));
     // A name that holds "error" is no label.
     try std.testing.expectEqualStrings("1 = 1", commandMessage("terminal_error: 1 = 1"));
+    // A word before text with no space is part of the message.
+    try std.testing.expectEqualStrings("undefined: foo", commandMessage("./main.go:5:2: undefined: foo"));
+    try std.testing.expectEqualStrings("KeyError: 'missing_key'", commandMessage("KeyError: 'missing_key'"));
+    try std.testing.expectEqualStrings("文件不存在: 找不到", commandMessage("error: 文件不存在: 找不到"));
+    // "error" inside a message is no label.
+    try std.testing.expectEqualStrings("connection error: timeout", commandMessage("RuntimeError: connection error: timeout"));
+    try std.testing.expectEqualStrings("x; error: y", commandMessage("warning: x; error: y"));
     try std.testing.expectEqualStrings("Test timed out.", commandMessage("Error: Test timed out."));
     // A word with a space before ": " is part of the message.
     try std.testing.expectEqualStrings("not a git repository (or any of the parent directories): .git", commandMessage("fatal: not a git repository (or any of the parent directories): .git"));
