@@ -207,7 +207,8 @@ pub const AgentRuntimeDeps = struct {
     /// TUI and `fx ask`. The rules of each image's folder then reach the model
     /// the way a tool call's do: a note on the turn's own message, so the
     /// instructions stay as they were cached. Hosts whose images carry no
-    /// workspace path leave it false.
+    /// workspace path leave it false. Other attached files reach the model the
+    /// same way through the prompt's `attached_files`.
     image_folder_rules: bool = false,
     live_tool_authority: ?LiveToolAuthorityProvider = null,
     /// Samples host-owned root permission mode at an action boundary.
@@ -223,6 +224,17 @@ pub const AgentRuntimeDeps = struct {
         kind: worker_runtime.SteeringBoundaryKind,
     ) anyerror!worker_runtime.SteeringBoundaryResult = null,
     release_agent_terminal_lease: *const fn (ctx: *anyopaque, session_id: []const u8) anyerror!void = terminalLeaseCleanupUnavailable,
+    /// Whether turn `turn_id`, which ends interrupted, ends because the user
+    /// cancelled it rather than because steering ended it. Asked before the
+    /// turn is reported, since a prompt typed once it is reported can join
+    /// its ending as steering. Hosts without steering leave it unset.
+    turn_ends_by_explicit_cancel: ?*const fn (ctx: *anyopaque, turn_id: u64) bool = null,
+    /// Stops the commands that steering moved to the background during turn
+    /// `turn_id`, after the user cancelled it (`turn_ends_by_explicit_cancel`).
+    /// Called once the turn is reported, so a command that ignores SIGTERM
+    /// and takes seconds to stop does not hold the turn's end. Hosts without
+    /// steering leave it unset.
+    stop_steering_detached_commands: ?*const fn (ctx: *anyopaque, turn_id: u64) anyerror!void = null,
     append_runtime_context: *const fn (ctx: *anyopaque, arena: Allocator, messages: *std.ArrayList(ChatMessage)) anyerror!void,
     append_static_context: ?*const fn (ctx: *anyopaque, arena: Allocator, messages: *std.ArrayList(ChatMessage)) anyerror!void = null,
     validate_tool_call: ?*const fn (ctx: *anyopaque, arena: Allocator, call: ToolCall) anyerror!ToolCallValidationResult = null,
@@ -305,7 +317,9 @@ pub const AgentRuntimeDeps = struct {
     restore_failed_prompt: ?*const fn (ctx: *anyopaque, prompt: []const u8) anyerror!void = null,
     push_command_output_complete: *const fn (ctx: *anyopaque, lifecycle_id: ?types.ToolLifecycleId) anyerror!void,
     push_http_error: *const fn (ctx: *anyopaque, status: std.http.Status, detail: []const u8, credential_source: ?types.CredentialSource) anyerror!void,
-    refresh_gateway_credential: ?*const fn (ctx: *anyopaque, alloc: Allocator, source: types.CredentialSource, mode: CredentialRefreshMode, expected_account_id: ?[]const u8) anyerror!?RefreshedGatewayCredential = null,
+    /// `rejected_token` is the access token the provider just answered 401
+    /// for, with `.force`; see `auth_runtime.refreshCredentialForAccount`.
+    refresh_gateway_credential: ?*const fn (ctx: *anyopaque, alloc: Allocator, source: types.CredentialSource, mode: CredentialRefreshMode, expected_account_id: ?[]const u8, rejected_token: ?[]const u8) anyerror!?RefreshedGatewayCredential = null,
     /// Asks the user what to do when the account is out of credits, and
     /// blocks until they answer. Only the TUI sets it.
     ask_out_of_credits: ?*const fn (ctx: *anyopaque) anyerror!OutOfCreditsChoice = null,

@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const io_mod = @import("../shared/io.zig");
+const terminal_env = @import("../shared/terminal_env.zig");
 const app_lifecycle = @import("../app/app_lifecycle.zig");
 const auth_runtime = @import("../auth/auth_runtime.zig");
 const chatgpt_oauth = @import("../auth/chatgpt_oauth.zig");
@@ -40,6 +41,7 @@ const github_publish = @import("../github/github_publish.zig");
 const github_workflows = @import("../github/github_workflows.zig");
 const host = @import("../hosts/host.zig");
 const login_flow = @import("../auth/login_flow.zig");
+const pending_revocation = @import("../auth/pending_revocation.zig");
 const oauth = @import("../auth/oauth.zig");
 const oauth_transport = @import("../auth/oauth_transport.zig");
 const provider_catalog = @import("../auth/provider_catalog.zig");
@@ -1210,7 +1212,17 @@ fn activateProviderSelection(
     };
 }
 
+/// `FX_TRACE` and `FX_TRACE_LOG` keep a trace for the auth commands too, such
+/// as why a sign-in starts on the first team or whether a sign-out forgot the
+/// kept team. Without a working directory the command goes on without one.
+fn configureAuthCommandTrace(alloc: Allocator) void {
+    const workspace_root = io_mod.realpathAlloc(alloc, ".") catch return;
+    defer alloc.free(workspace_root);
+    debug_trace.configureFromEnv(alloc, workspace_root);
+}
+
 fn runProviderLogin(alloc: Allocator, cfg: Config, provider: model_provider.ProviderId) !void {
+    configureAuthCommandTrace(alloc);
     switch (provider) {
         .gateway => try login_flow.runLogin(alloc, cfg.gateway_provider.oauth_transport, cfg.url_opener),
         .codex => try chatgpt_oauth.runLogin(alloc, cfg.gateway_provider.oauth_transport, cfg.url_opener),
@@ -1642,6 +1654,7 @@ fn runNonInteractiveWithDeps(
                 .provider_login,
                 if (login_provider == .gateway) .fx_login else null,
             )) return .handled_failure;
+            retryKeptSignOuts(alloc, cfg, deps, login_provider);
             try writeStdout(deps, switch (login_provider) {
                 .gateway => "Signed in to Vercel.\nAI Gateway access may still require billing or API setup for the selected account.\n",
                 .codex => "Signed in with Codex.\n",
@@ -1659,6 +1672,7 @@ fn runNonInteractiveWithDeps(
                 try writeHostManagedAuthResult(deps);
                 return .handled_success;
             }
+            configureAuthCommandTrace(alloc);
             // Preserve the original `fx logout` behavior for scripts and users.
             const login_provider = maybe_login_provider orelse .gateway;
             if (login_provider == .codex) {
@@ -1668,7 +1682,12 @@ fn runNonInteractiveWithDeps(
                     return .handled_failure;
                 };
                 if (outcome.revocation_failed) {
-                    try writeStderr(deps, "fx logout: local Codex session removed, but remote revocation could not be confirmed\n");
+                    try writeStderr(deps, if (outcome.retry_kept)
+                        "fx logout: local Codex session removed, but remote revocation could not be confirmed; " ++ pending_revocation.retry_later ++ "\n"
+                    else
+                        "fx logout: local Codex session removed, but remote revocation could not be confirmed\n");
+                } else {
+                    retryKeptSignOuts(alloc, cfg, deps, .codex);
                 }
                 return switch (outcome.deletion) {
                     .deleted => result: {
@@ -1692,7 +1711,12 @@ fn runNonInteractiveWithDeps(
                     return .handled_failure;
                 };
                 if (outcome.revocation_failed) {
-                    try writeStderr(deps, "fx logout: local Grok session removed, but remote revocation could not be confirmed\n");
+                    try writeStderr(deps, if (outcome.retry_kept)
+                        "fx logout: local Grok session removed, but remote revocation could not be confirmed; " ++ pending_revocation.retry_later ++ "\n"
+                    else
+                        "fx logout: local Grok session removed, but remote revocation could not be confirmed\n");
+                } else {
+                    retryKeptSignOuts(alloc, cfg, deps, .grok);
                 }
                 return switch (outcome.deletion) {
                     .deleted => result: {
@@ -1744,8 +1768,10 @@ fn runNonInteractiveWithDeps(
                 );
             }
             if (result.remote_revocation_failed) {
-                try writeStderr(deps, login_flow.remote_revocation_warning);
+                try writeStderr(deps, if (result.retry_kept) login_flow.remote_revocation_retry_warning else login_flow.remote_revocation_warning);
                 try writeStderr(deps, "\n");
+            } else {
+                retryKeptSignOuts(alloc, cfg, deps, .gateway);
             }
             return if (result.local_durability_failed) .handled_failure else .handled_success;
         },
@@ -1758,6 +1784,7 @@ fn runNonInteractiveWithDeps(
                 try writeHostManagedAuthResult(deps);
                 return .handled_success;
             }
+            configureAuthCommandTrace(alloc);
             var validation_context = CliTeamValidationContext{ .alloc = alloc, .cfg = &cfg };
             login_flow.runTeams(
                 alloc,
@@ -2057,7 +2084,7 @@ fn runNonInteractiveWithDeps(
                 };
                 return runSessionConvert(alloc, deps, format);
             }
-            const opts = parseSessionListArgs(rest) catch |err| {
+            const opts = parseSessionListArgs(sessionListArgs(rest)) catch |err| {
                 try writeUsageOrJsonError(alloc, cfg.command_catalog, deps, .sessions, "sessions", err, rest);
                 return usage_failure;
             };
@@ -2836,6 +2863,7 @@ fn runMcpVerbs(alloc: Allocator, rest: []const [:0]const u8, cfg: Config, deps: 
     var out: DepsWriter = .init(deps, .stdout, &out_buffer);
     var err: DepsWriter = .init(deps, .stderr, &err_buffer);
     var hosts: CliMcpHosts = .{ .alloc = alloc, .cfg = cfg, .workspace_root = workspace_root };
+    const wait_line: LogoutWaitLine = .{ .deps = deps, .text = LogoutWaitLine.mcp_kept };
     const code = mcp_verbs.run(.{
         .gpa = alloc,
         .out = &out.interface,
@@ -2844,6 +2872,7 @@ fn runMcpVerbs(alloc: Allocator, rest: []const [:0]const u8, cfg: Config, deps: 
         .home = home,
         .workspace_root = workspace_root,
         .hosts = .{ .context = &hosts, .get = CliMcpHosts.get, .release = CliMcpHosts.release, .changed = CliMcpHosts.changed },
+        .kept_sign_outs = .{ .transport = cfg.gateway_provider.oauth_transport, .notice = wait_line.notice() },
     }, args);
     return switch (code) {
         0 => .handled_success,
@@ -3299,6 +3328,22 @@ fn writeJsonCommandFailureCode(
     try writeJsonLine(deps, json);
 }
 
+/// How `fx sessions` prints for a person: in color and fitted to the window
+/// when it writes to a terminal that takes color, with ages counted from
+/// now. A pipe, `NO_COLOR`, or `TERM=dumb` gets plain text with whole titles,
+/// and output a test captures is plain, so it reads the same everywhere.
+fn sessionListStyle(deps: RunDeps) output_contracts.ListStyle {
+    const styled = deps.write_stdout == &writeRealStdout and
+        terminal_env.stdoutIsTerminal() and
+        !terminal_env.colorDisabled();
+    return .{
+        .color = styled,
+        .columns = if (styled) terminal_env.stdoutColumns() else null,
+        .now_ms = io_mod.milliTimestamp(),
+        .home = io_mod.homeDir(),
+    };
+}
+
 fn writeSessionList(
     alloc: Allocator,
     deps: RunDeps,
@@ -3320,6 +3365,7 @@ fn writeSessionList(
         .next_cursor = next_cursor,
         .skipped_invalid = page.skipped_invalid,
         .all_workspaces = opts.scope == .all_workspaces,
+        .style = sessionListStyle(deps),
     }).render(alloc, opts.format);
     defer alloc.free(text);
     try writeFormattedOutput(deps, text, opts.format);
@@ -3408,6 +3454,7 @@ fn runLiveSessionList(alloc: Allocator, deps: RunDeps, opts: SessionListOptions)
     const text = try (output_contracts.LiveSessionListSnapshot{
         .sessions = list.sessions,
         .all_workspaces = opts.scope == .all_workspaces,
+        .style = sessionListStyle(deps),
     }).render(alloc, opts.format);
     defer alloc.free(text);
     try writeFormattedOutput(deps, text, opts.format);
@@ -4290,8 +4337,9 @@ fn parseLocalSurfaceArgs(args: []const [:0]const u8) !LocalSurfaceOptions {
 const DoctorOptions = struct {
     format: output_contracts.OutputFormat = .text,
     fix: bool = false,
+    deep: bool = false,
 };
-const DoctorFlag = enum { json, fix };
+const DoctorFlag = enum { json, fix, deep };
 const doctor_flag_ids = cli_flags.idTable(DoctorFlag, &builtin_commands.doctor_options);
 
 fn parseDoctorArgs(args: []const [:0]const u8) !DoctorOptions {
@@ -4302,6 +4350,7 @@ fn parseDoctorArgs(args: []const [:0]const u8) !DoctorOptions {
         .option => |match| switch (doctor_flag_ids[match.index].?) {
             .json => options.format = .json,
             .fix => options.fix = true,
+            .deep => options.deep = true,
         },
     };
     return options;
@@ -4391,8 +4440,8 @@ const DoctorProbes = struct {
 
     /// One line on a terminal's stderr while doctor waits on its network
     /// checks, so a slow one does not look like a hang.
-    fn writeWaitNotice(self: *const DoctorProbes, alloc: Allocator, deps: RunDeps, provider: model_provider.ProviderId, deadline_ms: i64) !void {
-        if (builtin.is_test or !stderrIsTerminal()) return;
+    fn writeWaitNotice(self: *const DoctorProbes, alloc: Allocator, progress: *DoctorProgress, provider: model_provider.ProviderId, deadline_ms: i64) !void {
+        if (!progress.enabled) return;
         var servers: usize = 0;
         for (self.processes.items[0..self.server_children]) |probe| {
             if (!probe.not_started and probe.spawn_error == null) servers += 1;
@@ -4404,7 +4453,7 @@ const DoctorProbes = struct {
             .gh = if (gh_started) .checking else .not_checked,
         }, deadline_ms) orelse return;
         defer alloc.free(notice);
-        try writeStderr(deps, notice);
+        progress.line(notice);
     }
 
     /// The probe check lines, and what doctor found for each MCP server.
@@ -4437,6 +4486,13 @@ const LogoutWaitLine = struct {
     /// (`login_flow.revokeLoggedOutSession`), each request with its own limit.
     const fx_login = std.fmt.comptimePrint("revoking the fx login at Vercel (up to {d} s)...\n", .{3 * request_s});
 
+    /// Before a retry of sign-outs that earlier logouts kept
+    /// (`pending_revocation.retry`), which sends one sign-out after another.
+    const codex_kept = std.fmt.comptimePrint("revoking earlier Codex sign-outs at OpenAI (up to {d} s each)...\n", .{request_s});
+    const grok_kept = std.fmt.comptimePrint("revoking earlier Grok sign-outs at xAI (up to {d} s each)...\n", .{request_s});
+    const fx_login_kept = std.fmt.comptimePrint("revoking earlier fx sign-outs at Vercel (up to {d} s each)...\n", .{3 * request_s});
+    const mcp_kept = std.fmt.comptimePrint("revoking earlier MCP sign-outs at their servers (up to {d} s each)...\n", .{request_s});
+
     fn notice(self: *const LogoutWaitLine) ?oauth.BeforeRevocation {
         if (builtin.is_test or !stderrIsTerminal()) return null;
         return .{ .context = self, .run = write };
@@ -4449,6 +4505,28 @@ const LogoutWaitLine = struct {
         };
     }
 };
+
+/// Revokes the provider's sign-outs that earlier logouts kept because it did
+/// not confirm them (`pending_revocation`). A refused retry keeps them for the
+/// next one and prints nothing: the logout that kept them already warned.
+fn retryKeptSignOuts(alloc: Allocator, cfg: Config, deps: RunDeps, provider: model_provider.ProviderId) void {
+    const transport = cfg.gateway_provider.oauth_transport;
+    switch (provider) {
+        .codex => {
+            const wait_line: LogoutWaitLine = .{ .deps = deps, .text = LogoutWaitLine.codex_kept };
+            _ = chatgpt_oauth.retryKeptSignOuts(alloc, transport, wait_line.notice());
+        },
+        .grok => {
+            const wait_line: LogoutWaitLine = .{ .deps = deps, .text = LogoutWaitLine.grok_kept };
+            _ = grok_oauth.retryKeptSignOuts(alloc, transport, wait_line.notice());
+        },
+        .gateway => {
+            const wait_line: LogoutWaitLine = .{ .deps = deps, .text = LogoutWaitLine.fx_login_kept };
+            _ = login_flow.retryKeptSignOuts(alloc, transport, wait_line.notice());
+        },
+        else => {},
+    }
+}
 
 /// Whether doctor's stderr is a terminal, for its wait notice.
 fn stderrIsTerminal() bool {
@@ -4488,6 +4566,15 @@ fn mergeDoctorChecks(
 fn runDoctor(alloc: Allocator, cfg: Config, deps: RunDeps, opts: DoctorOptions) !RunResult {
     const workspace_root = try io_mod.realpathAlloc(alloc, ".");
     defer alloc.free(workspace_root);
+    var progress: DoctorProgress = .{
+        .deps = deps,
+        .enabled = opts.format == .text and !builtin.is_test and stderrIsTerminal(),
+        .erase = !terminal_env.dumbTerminal(),
+    };
+    if (progress.enabled) progress.columns = terminal_env.stderrColumns();
+    // Never leaves a progress line above the report, or above an error.
+    defer progress.clear();
+    if (progress.erase) progress.line("checking fx setup...\n");
     var mcp_inspection = try cfg.inspect_mcp_local_config(alloc, workspace_root);
     defer mcp_inspection.deinit(alloc);
     var snapshot = try doctor_runtime.collect(
@@ -4498,23 +4585,43 @@ fn runDoctor(alloc: Allocator, cfg: Config, deps: RunDeps, opts: DoctorOptions) 
         mcp_inspection.profile_diagnostic,
         mcp_inspection.snapshot.configuration_issues,
         .{
-            .orphans = if (opts.fix) .remove else .count,
             .version = cfg.version,
             .channel = cfg.build_channel.label(),
             .skill_root_policy = cfg.skill_root_policy,
         },
     );
     defer snapshot.deinit(alloc);
+    progress.clear();
 
     const deadline_ms = doctor_probes.deadlineMs();
     var probes: DoctorProbes = .{ .deadline = io_mod.milliTimestamp() + deadline_ms, .limit_ms = deadline_ms };
     const started = probes.start(cfg, deps, &snapshot, workspace_root);
-    if (opts.format == .text) probes.writeWaitNotice(alloc, deps, snapshot.provider, deadline_ms) catch |err| {
+    probes.writeWaitNotice(alloc, &progress, snapshot.provider, deadline_ms) catch |err| {
         debug_trace.logf("doctor", "wait notice not written err={s}", .{@errorName(err)});
     };
+
+    var state_checks: std.ArrayList(doctor_runtime.Check) = .empty;
+    defer {
+        for (state_checks.items) |*entry| entry.deinit(alloc);
+        state_checks.deinit(alloc);
+    }
+    var stop: DoctorSessionStop = .{ .deadline = if (opts.deep) null else probes.deadline, .probes = if (opts.deep) null else &probes };
+    const state_options: doctor_runtime.StateOptions = .{
+        .orphans = if (opts.fix) .remove else .count,
+        .blobs = if (opts.deep) .hash else .exists,
+        .stop = .{ .context = &stop, .requested = DoctorSessionStop.requested },
+        .progress = .{ .context = &progress, .report = DoctorProgress.sessions },
+        .limit_ms = if (opts.deep) null else deadline_ms,
+    };
+    // Plain doctor checks the sessions while the network checks run, within
+    // their deadline. `--deep` has no limit, so it checks them after.
+    const state_result: anyerror!void = if (opts.deep) {} else doctor_runtime.appendStateChecks(&state_checks, alloc, state_options);
     // Runs on every path, so nothing doctor started outlives it.
     if (probes.wait()) |sig| doctor_probes.endBySignal(sig);
     try started;
+    try state_result;
+    if (opts.deep) try doctor_runtime.appendStateChecks(&state_checks, alloc, state_options);
+    progress.clear();
 
     var probe_checks: std.ArrayList(doctor_runtime.Check) = .empty;
     defer {
@@ -4525,11 +4632,15 @@ fn runDoctor(alloc: Allocator, cfg: Config, deps: RunDeps, opts: DoctorOptions) 
     defer server_results.deinit(alloc);
     try probes.checks(alloc, snapshot.provider, deadline_ms, &probe_checks, &server_results);
 
+    var local: std.ArrayList(doctor_runtime.Check) = .empty;
+    defer local.deinit(alloc);
+    try local.appendSlice(alloc, snapshot.checks);
+    try local.appendSlice(alloc, state_checks.items);
     var checks: std.ArrayList(doctor_runtime.Check) = .empty;
     defer checks.deinit(alloc);
     var unconfirmed: ?[]u8 = null;
     defer if (unconfirmed) |detail| alloc.free(detail);
-    try mergeDoctorChecks(alloc, snapshot.checks, probe_checks.items, probes.catalog != null, &checks, &unconfirmed);
+    try mergeDoctorChecks(alloc, local.items, probe_checks.items, probes.catalog != null, &checks, &unconfirmed);
 
     var failed = false;
     for (checks.items) |entry| failed = failed or entry.status == .fail;
@@ -4546,9 +4657,101 @@ fn runDoctor(alloc: Allocator, cfg: Config, deps: RunDeps, opts: DoctorOptions) 
     return if (failed) .handled_failure else .handled_success;
 }
 
+/// Stops doctor's session check at its deadline, or when an ending signal
+/// reached doctor while its handler was in place. Each time it is asked, it
+/// also starts the queued MCP server checks a free slot allows, as `wait`
+/// does, so the session check costs them none of the limit.
+const DoctorSessionStop = struct {
+    deadline: ?i64,
+    /// Null once `wait` has stopped the probes, as for `--deep`.
+    probes: ?*DoctorProbes,
+
+    fn requested(context: *anyopaque) bool {
+        const self: *DoctorSessionStop = @ptrCast(@alignCast(context));
+        if (self.probes) |probes| probes.servers.startMore(&probes.waiters, probes.deadline);
+        if (doctor_probes.stopRequested()) return true;
+        const deadline = self.deadline orelse return false;
+        return io_mod.milliTimestamp() >= deadline;
+    }
+};
+
+/// What doctor is doing, on a terminal's stderr while it works: whole lines,
+/// then one line it rewrites in place. `clear` erases them all, so the
+/// report starts on a clean screen. Each line is cut to fit one row, since
+/// `clear` erases one row per line. Pipes and unit tests get none of it, and
+/// a `TERM=dumb` terminal, which cannot move the cursor, gets only the whole
+/// lines, which stay.
+const DoctorProgress = struct {
+    deps: RunDeps,
+    enabled: bool,
+    erase: bool,
+    /// The terminal's width, when known. The lines are ASCII, so a byte is
+    /// a column.
+    columns: ?usize = null,
+    /// Whole lines written since the last `clear`.
+    lines: usize = 0,
+    /// Whether the cursor is at the end of a line `rewrite` wrote.
+    open_line: bool = false,
+
+    /// `text` ends with a newline.
+    fn line(self: *DoctorProgress, text: []const u8) void {
+        if (!self.enabled) return;
+        self.closeOpenLine();
+        self.write(self.fit(text[0 .. text.len - 1]));
+        self.write("\n");
+        self.lines += 1;
+    }
+
+    fn rewrite(self: *DoctorProgress, text: []const u8) void {
+        if (!self.enabled or !self.erase) return;
+        self.write(if (self.open_line) "\r\x1b[2K" else "");
+        self.write(self.fit(text));
+        self.open_line = true;
+    }
+
+    /// `text` cut short of the last column, so it never wraps.
+    fn fit(self: *const DoctorProgress, text: []const u8) []const u8 {
+        const columns = self.columns orelse return text;
+        return text[0..@min(text.len, columns -| 1)];
+    }
+
+    fn sessions(context: *anyopaque, done: usize, total: usize) void {
+        const self: *DoctorProgress = @ptrCast(@alignCast(context));
+        if (!self.enabled or total == 0) return;
+        var buf: [96]u8 = undefined;
+        const text = std.mem.print(&buf, "checking saved sessions ({d} of {d})...", .{ @min(done + 1, total), total }) catch return;
+        self.rewrite(text);
+    }
+
+    fn clear(self: *DoctorProgress) void {
+        if (!self.enabled or !self.erase) return;
+        if (self.open_line) self.write("\r\x1b[2K");
+        self.open_line = false;
+        while (self.lines > 0) : (self.lines -= 1) self.write("\x1b[1A\x1b[2K");
+    }
+
+    fn closeOpenLine(self: *DoctorProgress) void {
+        if (!self.open_line) return;
+        self.write("\n");
+        self.open_line = false;
+        self.lines += 1;
+    }
+
+    fn write(self: *const DoctorProgress, text: []const u8) void {
+        if (text.len == 0) return;
+        writeStderr(self.deps, text) catch |err| {
+            debug_trace.logf("doctor", "progress line not written err={s}", .{@errorName(err)});
+        };
+    }
+};
+
 fn writeDoctorReport(alloc: Allocator, deps: RunDeps, snapshot: output_contracts.DoctorSnapshot, format: output_contracts.OutputFormat) !void {
     if (format == .json) return writeDoctorJsonLine(alloc, deps, snapshot);
-    const text = try snapshot.render(alloc, format);
+    const terminal = !builtin.is_test and terminal_env.stdoutIsTerminal();
+    const text = try snapshot.renderTextStyled(alloc, .{
+        .color = terminal and !terminal_env.colorDisabled(),
+        .columns = if (terminal) terminal_env.stdoutColumns() else null,
+    });
     defer alloc.free(text);
     try writeFormattedOutput(deps, text, format);
 }
@@ -4590,6 +4793,13 @@ fn channelSavedLine(
 const SessionListFlag = enum { live, all, limit, cursor, json };
 const session_list_flag_ids = cli_flags.idTable(SessionListFlag, &builtin_commands.sessions_options);
 
+/// The `sessions` arguments that name the list action. `fx sessions` lists by
+/// default, and `fx sessions ls` names the same action.
+fn sessionListArgs(rest: []const [:0]const u8) []const [:0]const u8 {
+    if (rest.len > 0 and std.mem.eql(u8, rest[0], "ls")) return rest[1..];
+    return rest;
+}
+
 fn parseSessionListArgs(args: []const [:0]const u8) !SessionListOptions {
     var options = SessionListOptions{};
     var parser: cli_flags.Parser = .init(&builtin_commands.sessions_options, args);
@@ -4613,6 +4823,12 @@ fn parseSessionListArgs(args: []const [:0]const u8) !SessionListOptions {
         },
     };
     return options;
+}
+
+test "fx sessions ls names the default list action" {
+    try std.testing.expectEqual(@as(usize, 0), sessionListArgs(&.{"ls"}).len);
+    try std.testing.expectEqualStrings("--json", sessionListArgs(&.{ "ls", "--json" })[0]);
+    try std.testing.expectEqualStrings("--json", sessionListArgs(&.{"--json"})[0]);
 }
 
 test "fx sessions --live reads through the shared parser and names the paging flag it refuses" {
@@ -5009,6 +5225,10 @@ test "parse recognizes every top-level command and preserves unknown commands" {
     }
     switch (parse(command_catalog, &.{ @constCast("sessions"), @constCast("--json") })) {
         .sessions => |rest| try std.testing.expectEqual(@as(usize, 1), rest.len),
+        else => return error.TestExpectedEqual,
+    }
+    switch (parse(command_catalog, &.{ @constCast("sessions"), @constCast("ls"), @constCast("--json") })) {
+        .sessions => |rest| try std.testing.expectEqual(@as(usize, 2), rest.len),
         else => return error.TestExpectedEqual,
     }
     switch (parse(command_catalog, &.{ @constCast("resume"), @constCast("last") })) {

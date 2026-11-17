@@ -461,6 +461,9 @@ pub fn Runtime(comptime App: type) type {
                 app.adoptWorkspaceAccess(startup.takeWorkspaceAccess());
             }
             const credential_deferred = try beginDeferredCredential(app, &startup);
+            // Sign-outs a provider did not confirm are revoked on a worker, so
+            // the first frame does not wait for them (`pending_revocation`).
+            if (comptime @hasDecl(@TypeOf(app.auth), "beginKeptSignOutRetry")) app.auth.beginKeptSignOutRetry();
             if (startup.takeCredential()) |credential_value| {
                 var credential = credential_value;
                 defer credential.deinit(app.alloc);

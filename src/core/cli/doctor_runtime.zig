@@ -66,16 +66,14 @@ pub const Snapshot = struct {
 };
 
 const CollectOptions = struct {
-    /// Old side folders whose session is gone: counted, or removed with
-    /// `fx doctor --fix`.
-    orphans: session_adapter.OrphanSweep = .count,
     version: []const u8 = "",
     channel: []const u8 = "",
     skill_root_policy: skill_contract.RootPolicy = .{ .managed_root_source = null },
 };
 
-/// The checks that read only this machine. The network and process checks
-/// live in `doctor_probes.zig`.
+/// The checks that read only this machine, except the saved sessions, which
+/// `appendStateChecks` checks. The network and process checks live in
+/// `doctor_probes.zig`.
 pub fn collect(
     alloc: Allocator,
     secret_store: host.SecretStore,
@@ -125,7 +123,6 @@ pub fn collect(
         try appendMcpIssueChecks(&checks, alloc, mcp_issues);
         try appendAuthCheck(&checks, alloc, snapshot.auth, snapshot.provider);
         try appendConfigLoadFailureCheck(&checks, alloc, "startup", "failed to resolve startup settings", err);
-        try appendStateChecks(&checks, alloc, options.orphans);
         snapshot.in_git_repository = try appendGitCheck(&checks, alloc, snapshot.workspace_root);
         try appendSkillChecks(&checks, alloc, snapshot.workspace_root, options.skill_root_policy);
 
@@ -159,7 +156,6 @@ pub fn collect(
         .permission_mode = detailed.settings.permission_mode,
         .max_agent_steps = detailed.settings.max_agent_steps,
     }, default_agent_step_limit);
-    try appendStateChecks(&checks, alloc, options.orphans);
     snapshot.in_git_repository = try appendGitCheck(&checks, alloc, snapshot.workspace_root);
     try appendSkillChecks(&checks, alloc, snapshot.workspace_root, options.skill_root_policy);
 
@@ -396,16 +392,38 @@ fn formatConfigLoadFailure(alloc: Allocator, prefix: []const u8, err: anyerror) 
     return alloc.print("{s}: {s}", .{ prefix, @errorName(err) });
 }
 
+/// How `appendStateChecks` checks the saved sessions.
+pub const StateOptions = struct {
+    orphans: session_adapter.OrphanSweep = .count,
+    /// Plain `fx doctor` uses `exists`; `fx doctor --deep` reads and hashes
+    /// every blob.
+    blobs: @FieldType(session_adapter.DoctorOptions, "blobs") = .hash,
+    stop: @FieldType(session_adapter.DoctorOptions, "stop") = null,
+    progress: @FieldType(session_adapter.DoctorOptions, "progress") = null,
+    /// The limit `stop` enforces, in milliseconds, for the report; null when
+    /// there is none.
+    limit_ms: ?i64 = null,
+};
+
 /// Reports damaged sessions, and counts side folders whose session is gone
-/// or removes them, as `orphans` says (D36). Rebuilds nothing.
-fn appendStateChecks(checks: *std.ArrayList(Check), alloc: Allocator, orphans: session_adapter.OrphanSweep) !void {
+/// or removes them, as `options.orphans` says (D36). Rebuilds nothing.
+/// `collect` leaves these checks out, so `fx doctor` can run them while it
+/// waits on the network checks.
+pub fn appendStateChecks(checks: *std.ArrayList(Check), alloc: Allocator, options: StateOptions) !void {
     var store = session_adapter.Store.openFromEnv(alloc) catch |err| {
         const status: CheckStatus = if (err == error.HomeNotSet) .warn else .fail;
         try appendStateFailure(checks, alloc, status, err);
         return;
     };
     defer store.deinit(alloc);
-    var report = session_adapter.doctor(&store, alloc, default_session_diagnostics_limit, io_mod.milliTimestamp(), orphans) catch |err| {
+    var report = session_adapter.doctorWith(&store, alloc, .{
+        .limit = default_session_diagnostics_limit,
+        .now_ms = io_mod.milliTimestamp(),
+        .orphans = options.orphans,
+        .blobs = options.blobs,
+        .stop = options.stop,
+        .progress = options.progress,
+    }) catch |err| {
         try appendStateFailure(checks, alloc, .fail, err);
         return;
     };
@@ -420,8 +438,22 @@ fn appendStateChecks(checks: *std.ArrayList(Check), alloc: Allocator, orphans: s
         const detail = try alloc.print("session {s}, a subagent an older fx saved, is kept as it is: {s}", .{ kept.id, kept.reason });
         try appendCheckOwned(checks, alloc, "session", .ok, detail);
     }
+    if (report.unfinished > 0) {
+        const detail = if (options.limit_ms) |limit_ms|
+            try alloc.print("{d} of {d} session(s) were not checked to the end in doctor's {d} s limit; fx doctor --deep checks them all", .{ report.unfinished, report.checked + report.unfinished, @divCeil(limit_ms, 1000) })
+        else
+            try alloc.print("{d} session(s) were not checked to the end", .{report.unfinished});
+        try appendCheckOwned(checks, alloc, "sessions", .ok, detail);
+    }
+    if (report.v1_incomplete) {
+        const detail = if (options.limit_ms) |limit_ms|
+            try alloc.print("sessions saved by an older fx were not all read in doctor's {d} s limit; fx doctor --deep reads them all", .{@divCeil(limit_ms, 1000)})
+        else
+            try alloc.dupe(u8, "sessions saved by an older fx were not all read");
+        try appendCheckOwned(checks, alloc, "sessions", .ok, detail);
+    }
     // The limit covers v1's unconverted sessions too (D73).
-    if (report.checked < report.sessions + report.unconverted) try appendSessionDiagnosticsTruncatedCheck(checks, alloc, report.checked);
+    if (report.checked + report.unfinished < report.sessions + report.unconverted) try appendSessionDiagnosticsTruncatedCheck(checks, alloc, report.checked + report.unfinished);
     if (report.removable > 0) {
         const detail = try alloc.print("{d} old terminal or side folder(s) whose session is gone can be removed", .{report.removable});
         try appendCheckOwnedFix(checks, alloc, "session", .warn, detail, try alloc.dupe(u8, "fx doctor --fix"));
@@ -528,8 +560,9 @@ fn appendGitCheck(checks: *std.ArrayList(Check), alloc: Allocator, workspace_roo
                 .repo_config_unavailable => .{ "fx could not read this repository's git config", "git config --list --show-origin" },
                 .unsupported_filter_name => .{ "this repository's git config names a filter fx cannot turn off, so fx does not run git here", "rename that filter in the repository's git config so its name has no =" },
                 .repository_mismatch => .{ "git would use a different repository than the one fx read here", "check GIT_DIR and GIT_WORK_TREE" },
-                .hook_config_unavailable => .{ "fx could not list the hooks this user's git config defines", "git config --get-regexp '^hook\\..*\\.command$'" },
-                .unsupported_hook_name => .{ "this user's git config names a hook with an = in its name, which fx cannot turn off", "rename that hook so its name has no =" },
+                .hook_config_unavailable => .{ "fx could not list the hooks your git config defines", "git config --get-regexp '^hook\\..*\\.command$'" },
+                .unsupported_hook_name => .{ "your git config names a hook with = in its name, which fx cannot turn off", "rename that hook so its name has no =" },
+                .timed_out => .{ "git did not answer fx's checks in time", "run fx doctor again" },
             };
             try checks.append(alloc, .{ .name = "git", .status = .warn, .detail = text[0], .fix = text[1] });
         },

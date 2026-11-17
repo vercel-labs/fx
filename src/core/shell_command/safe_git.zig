@@ -42,6 +42,9 @@ pub const Refusal = enum {
     hook_config_unavailable,
     /// `-c` splits at the first `=`, so such a hook cannot be turned off.
     unsupported_hook_name,
+    /// The caller's deadline passed before git's own checks finished
+    /// (`prepareWithin`).
+    timed_out,
 };
 
 pub const Ready = struct {
@@ -66,12 +69,68 @@ pub const Subcommand = enum { status, diff, log, branch, rev_parse };
 /// process, and confirms git resolves the same repository fx read. All memory
 /// belongs to `arena`.
 pub fn prepare(arena: Allocator, cwd: []const u8) Allocator.Error!Prepared {
-    return prepareWithin(arena, cwd, null);
+    return prepareWith(arena, cwd, unbounded_checks) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        // `runCaptured` has no deadline.
+        error.TimeoutExpired => unreachable,
+    };
 }
 
 /// `prepare` whose own git runs, the version check and `rev-parse`, stop at
-/// `limits`' deadline, for a caller with one budget for all its work.
-pub fn prepareWithin(arena: Allocator, cwd: []const u8, limits: ?Limits) Allocator.Error!Prepared {
+/// `limits`' deadline and cancel flag, for a caller with one budget for all
+/// its work. A check the deadline ends refuses with `timed_out`.
+pub fn prepareWithin(arena: Allocator, cwd: []const u8, limits: Limits) Allocator.Error!Prepared {
+    return prepareWith(arena, cwd, boundedChecks(&limits)) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.TimeoutExpired => return refuse(.timed_out, cwd),
+    };
+}
+
+pub const CheckError = Allocator.Error || error{TimeoutExpired};
+
+/// Runs one of `prepare`'s own git checks, `argv` in `cwd`, in safe git's
+/// environment. Returns its standard output when it exited 0, or null when
+/// it could not start, failed, or printed more than `output_limit` bytes.
+/// Memory belongs to `arena`.
+pub const CheckRunner = struct {
+    context: ?*const anyopaque = null,
+    run: *const fn (
+        context: ?*const anyopaque,
+        arena: Allocator,
+        argv: []const []const u8,
+        cwd: []const u8,
+        output_limit: usize,
+    ) CheckError!?[]const u8,
+};
+
+const unbounded_checks: CheckRunner = .{ .run = runCheckUnbounded };
+
+fn runCheckUnbounded(_: ?*const anyopaque, arena: Allocator, argv: []const []const u8, cwd: []const u8, output_limit: usize) CheckError!?[]const u8 {
+    return runCaptured(arena, argv, cwd, output_limit);
+}
+
+/// Checks that stop at `limits`' deadline, which ends them with
+/// `error.TimeoutExpired`, and at its cancel flag, which fails them.
+/// `limits` must outlive the runner.
+fn boundedChecks(limits: *const Limits) CheckRunner {
+    return .{ .context = limits, .run = runCheckBounded };
+}
+
+fn runCheckBounded(context: ?*const anyopaque, arena: Allocator, argv: []const []const u8, cwd: []const u8, output_limit: usize) CheckError!?[]const u8 {
+    const limits: *const Limits = @ptrCast(@alignCast(context.?));
+    var env = try environment(arena);
+    var probe = limits.*;
+    probe.max_stdout = output_limit;
+    return switch (try runBounded(arena, argv, cwd, &env, null, null, probe)) {
+        .ok => |stdout| stdout,
+        .failed => |failure| if (failure == .timeout) error.TimeoutExpired else null,
+    };
+}
+
+/// `prepare` with `checks` running its git checks, so a caller can give them
+/// a deadline. A check that returns `error.TimeoutExpired` ends it with no
+/// decision, and git does not run; a timed-out version check is not cached.
+pub fn prepareWith(arena: Allocator, cwd: []const u8, checks: CheckRunner) CheckError!Prepared {
     const filters = indexer.repoFilters(arena, cwd) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.RepoConfigUnavailable => return refuse(.repo_config_unavailable, cwd),
@@ -80,13 +139,13 @@ pub fn prepareWithin(arena: Allocator, cwd: []const u8, limits: ?Limits) Allocat
         if (name.len == 0 or std.mem.findScalar(u8, name, '=') != null) return refuse(.unsupported_filter_name, cwd);
     }
     const executable = trustedExecutable() orelse return refuse(.git_missing, cwd);
-    switch (try versionCheckAtLeast(arena, executable, minimum_minor, limits)) {
+    switch (try versionCheck(arena, executable, checks)) {
         .supported => {},
         .too_old => return refuse(.git_too_old, cwd),
         .unknown => return refuse(.git_version_unknown, cwd),
     }
     const ready: Ready = .{ .executable = executable, .filter_names = filters.names, .git_dir = filters.git_dir };
-    if (!try sameRepository(arena, ready, cwd, filters.git_dir, limits)) return refuse(.repository_mismatch, cwd);
+    if (!try sameRepository(arena, ready, cwd, filters.git_dir, checks)) return refuse(.repository_mismatch, cwd);
     return .{ .ready = ready };
 }
 
@@ -193,18 +252,28 @@ var cached_version: ?struct { executable: []const u8, output: [64]u8, len: usize
 
 /// Runs `git --version` once per executable and process. A failed probe is not
 /// cached, so a transient spawn failure does not disable git for the session.
-fn versionCheckAtLeast(arena: Allocator, executable: []const u8, min_minor: u32, limits: ?Limits) Allocator.Error!VersionCheck {
+fn versionCheck(arena: Allocator, executable: []const u8, checks: CheckRunner) CheckError!VersionCheck {
+    return versionCheckAtLeast(arena, executable, minimum_minor, checks);
+}
+
+/// `versionCheck` against `min_minor`. The cache keeps git's own output, so
+/// routes with different minimums share one probe.
+fn versionCheckAtLeast(arena: Allocator, executable: []const u8, min_minor: u32, checks: CheckRunner) CheckError!VersionCheck {
     const io = io_mod.getIo();
     version_lock.lockUncancelable(io);
     defer version_lock.unlock(io);
     if (cached_version) |*cached| {
         if (std.mem.eql(u8, cached.executable, executable)) return classifyVersionAtLeast(cached.output[0..cached.len], min_minor);
     }
-    const output = try runCaptured(arena, &.{ executable, "--version" }, "/", limits) orelse return .unknown;
+    const output = try checks.run(checks.context, arena, &.{ executable, "--version" }, "/", max_probe_output) orelse return .unknown;
     var entry: @TypeOf(cached_version.?) = .{ .executable = executable, .output = undefined, .len = @min(output.len, 64) };
     @memcpy(entry.output[0..entry.len], output[0..entry.len]);
     cached_version = entry;
     return classifyVersionAtLeast(output, min_minor);
+}
+
+fn classifyVersion(output: []const u8) VersionCheck {
+    return classifyVersionAtLeast(output, minimum_minor);
 }
 
 fn classifyVersionAtLeast(output: []const u8, min_minor: u32) VersionCheck {
@@ -228,11 +297,11 @@ fn leadingNumber(text: []const u8) ?u32 {
 /// git directory used as the workspace, and fx's discovery does not, so
 /// without this check git could run with config fx never read. `rev-parse`
 /// reads config but runs none of the programs above.
-fn sameRepository(arena: Allocator, ready: Ready, cwd: []const u8, expected: ?[]const u8, limits: ?Limits) Allocator.Error!bool {
+fn sameRepository(arena: Allocator, ready: Ready, cwd: []const u8, expected: ?[]const u8, checks: CheckRunner) CheckError!bool {
     var argv: std.ArrayList([]const u8) = .empty;
     try appendCommand(arena, &argv, ready, .rev_parse);
     try argv.append(arena, "--absolute-git-dir");
-    const output = try runCaptured(arena, argv.items, cwd, limits);
+    const output = try checks.run(checks.context, arena, argv.items, cwd, max_probe_output);
     const expected_dir = expected orelse return output == null;
     const reported = std.mem.trimEnd(u8, output orelse return false, "\r\n");
     const expected_real = io_mod.realpathAlloc(arena, expected_dir) catch |err| switch (err) {
@@ -246,24 +315,16 @@ fn sameRepository(arena: Allocator, ready: Ready, cwd: []const u8, expected: ?[]
     return std.mem.eql(u8, expected_real, reported_real);
 }
 
-/// Standard output of a successful run, or null when git could not start,
-/// failed, or ran past `limits`' deadline. Memory belongs to `arena`.
-fn runCaptured(arena: Allocator, argv: []const []const u8, cwd: []const u8, limits: ?Limits) Allocator.Error!?[]const u8 {
+/// Standard output of a successful run, or null when git could not start or
+/// failed. Memory belongs to `arena`.
+fn runCaptured(arena: Allocator, argv: []const []const u8, cwd: []const u8, output_limit: usize) Allocator.Error!?[]const u8 {
     var env = try environment(arena);
-    if (limits) |bounded| {
-        var probe = bounded;
-        probe.max_stdout = max_probe_output;
-        return switch (try runBounded(arena, argv, cwd, &env, null, null, probe)) {
-            .ok => |stdout| stdout,
-            .failed => null,
-        };
-    }
     const result = std.process.run(arena, io_mod.getIo(), .{
         .argv = argv,
         .cwd = .{ .path = cwd },
         .environ_map = &env,
-        .stdout_limit = .limited(max_probe_output),
-        .stderr_limit = .limited(max_probe_output),
+        .stdout_limit = .limited(output_limit),
+        .stderr_limit = .limited(output_limit),
     }) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return null,
@@ -505,7 +566,11 @@ pub fn prepareStore(arena: Allocator, limits: Limits) Allocator.Error!PreparedSt
 
 fn prepareStoreWith(arena: Allocator, limits: Limits, base: *std.process.Environ.Map) Allocator.Error!PreparedStore {
     const executable = trustedExecutable() orelse return .{ .refused = refuse(.git_missing, "store").refused };
-    switch (try versionCheckAtLeast(arena, executable, store_minimum_minor, limits)) {
+    const version = versionCheckAtLeast(arena, executable, store_minimum_minor, boundedChecks(&limits)) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.TimeoutExpired => return .{ .refused = refuse(.timed_out, "store").refused },
+    };
+    switch (version) {
         .supported => {},
         .too_old => return .{ .refused = refuse(.git_too_old, "store").refused },
         .unknown => return .{ .refused = refuse(.git_version_unknown, "store").refused },
@@ -1245,6 +1310,40 @@ test "safe git environment keeps only fixed values and user config locations" {
     }
 }
 
+test "a git check that times out ends safe git's preparation with no decision" {
+    const TimedOut = struct {
+        var calls: usize = 0;
+        fn run(_: ?*const anyopaque, _: Allocator, _: []const []const u8, _: []const u8, _: usize) CheckError!?[]const u8 {
+            calls += 1;
+            return error.TimeoutExpired;
+        }
+    };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const cwd = try io_mod.dirRealpathAlloc(arena, tmp.dir, ".");
+    if (trustedExecutable() == null) return error.SkipZigTest;
+
+    const io = io_mod.getIo();
+    version_lock.lockUncancelable(io);
+    const saved = cached_version;
+    cached_version = null;
+    version_lock.unlock(io);
+    defer {
+        version_lock.lockUncancelable(io);
+        cached_version = saved;
+        version_lock.unlock(io);
+    }
+
+    TimedOut.calls = 0;
+    try std.testing.expectError(error.TimeoutExpired, prepareWith(arena, cwd, .{ .run = TimedOut.run }));
+    try std.testing.expectEqual(@as(usize, 1), TimedOut.calls);
+    // The version check that timed out is not remembered as unknown.
+    try std.testing.expect(cached_version == null);
+}
+
 /// A real repository with a sentinel program that appends to a log whenever
 /// git runs it. Setup and control runs use plain git; helper runs use the
 /// helper's environment. Both are isolated from the developer's git config.
@@ -1268,7 +1367,7 @@ const SentinelRepo = struct {
 
     fn init(arena: Allocator, dir: std.Io.Dir) !SentinelRepo {
         const git = trustedExecutable() orelse return error.SkipZigTest;
-        if (try versionCheckAtLeast(arena, git, minimum_minor, null) != .supported) return error.SkipZigTest;
+        if (try versionCheck(arena, git, unbounded_checks) != .supported) return error.SkipZigTest;
         const root = try io_mod.dirRealpathAlloc(arena, dir, ".");
         const self: SentinelRepo = .{
             .arena = arena,

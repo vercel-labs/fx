@@ -7,8 +7,13 @@
 test {
     _ = @import("acp/jsonrpc.zig");
     _ = @import("acp/mcp_servers.zig");
+    _ = @import("builtins/context.zig");
     _ = @import("core/agent/assistant_presentation.zig");
+    _ = @import("core/auth/credentials.zig");
+    _ = @import("core/auth/pending_revocation.zig");
+    _ = @import("core/auth/oauth_session.zig");
     _ = @import("core/agent/runtime/execution_memory.zig");
+    _ = @import("core/agent/runtime/orchestrator.zig");
     _ = @import("core/agent/runtime/parallel_execution.zig");
     _ = @import("core/agent/runtime/vision_contracts.zig");
     _ = @import("core/agent/worker_runtime.zig");
@@ -20,19 +25,23 @@ test {
     _ = @import("core/app/trace_report.zig");
     _ = @import("core/app/host_record.zig");
     _ = @import("core/config/tool_placement.zig");
+    _ = @import("core/gateway/token_pass_memory.zig");
     _ = @import("core/images/image_attachments.zig");
     _ = @import("core/images/image_data.zig");
     _ = @import("core/images/image_route.zig");
     _ = @import("core/mcp/elicitation.zig");
     _ = @import("core/mcp/features/tools.zig");
     _ = @import("core/tooling/toolbox.zig");
+    _ = @import("core/tooling/tool_mcp_registry.zig");
     _ = @import("core/mcp/tool_result.zig");
     _ = @import("core/mcp/tool_search.zig");
     _ = @import("core/output/diff.zig");
     _ = @import("core/mcp_host/credentials.zig");
+    _ = @import("core/mcp_host/mcp_call_client.zig");
     _ = @import("core/mcp_host/wire_tests.zig");
     _ = @import("core/session/session_adapter.zig");
     _ = @import("core/profiles/profiles.zig");
+    _ = @import("core/profiles/started_with.zig");
     _ = @import("core/session/session_codec.zig");
     _ = @import("core/session/session_event.zig");
     _ = @import("core/shell_command/safe_git.zig");
@@ -46,11 +55,14 @@ test {
     _ = @import("core/skills/skill_contract.zig");
     _ = @import("core/skills/skill_invocation.zig");
     _ = @import("core/subagent/child_state.zig");
+    _ = @import("core/subagent/live_metrics.zig");
     _ = @import("core/subagent/reports.zig");
     _ = @import("core/terminal/engine.zig");
+    _ = @import("core/terminal/shell_snapshot.zig");
     _ = @import("core/tooling/command_output_content.zig");
     _ = @import("core/tooling/file_mutation.zig");
     _ = @import("core/workspace/file_index.zig");
+    _ = @import("core/workspace/tool_call_metrics.zig");
     _ = @import("gateway/chat_completions_protocol.zig");
     _ = @import("gateway/client.zig");
     _ = @import("gateway/openai_codex.zig");
@@ -59,9 +71,11 @@ test {
     _ = @import("main.zig");
     _ = @import("tools/agent/ask_user_question.zig");
     _ = @import("tools/capabilities/toolbox.zig");
+    _ = @import("tools/session/read_tool_result.zig");
     _ = @import("tools/web/http_fetch.zig");
     _ = @import("tools/web/url_policy.zig");
     _ = @import("ui/resize_tests.zig");
     _ = @import("ui/transcript/frozen_prefix_tests.zig");
+    _ = @import("ui/transcript/tool_group_projection.zig");
     _ = @import("ui/transcript/transcript_window_fuzz.zig");
 }
