@@ -2,7 +2,7 @@
 (***************************************************************************)
 (* Following a session and catching up, as the sh.fx spec's "Following a  *)
 (* session" section defines them (src/protocol/spec/sh-fx.md), with the   *)
-(* stable message ids of fix X21. The rules have not landed in src/acp/   *)
+(* stable message ids. The rules have not landed in src/acp/              *)
 (* yet: `Rules` set to FALSE gives fx today, and the AcpFollowToday-*.cfg  *)
 (* configs show each rule failing there.                                   *)
 (*                                                                         *)
@@ -19,7 +19,7 @@
 (*    from before a compaction rewrote the log, gets the whole session,   *)
 (*    and the answer says which.                                           *)
 (*  - A replayed message gets an id made from its place in the log, so     *)
-(*    every load gives it the same id (X21, Q130). IdRules turns it on.    *)
+(*    every load gives it the same id. IdRules turns it on.                *)
 (*  - session/close closes the session on that connection only. While     *)
 (*    another connection has it open, a running turn goes on.             *)
 (*                                                                         *)
@@ -184,7 +184,7 @@ TypeOK ==
 InSync == \A c \in OpenConns : Turns(client[c].has) = saved
 
 \* A replayed message's id is made from its place in the log, so every load
-\* gives it the same id (X21, Q130). Live messages keep fx's own ids.
+\* gives it the same id. Live messages keep fx's own ids.
 StableIds == \A c \in Conns : \A k \in DOMAIN client[c].has :
                  client[c].has[k].replayed => client[c].has[k].id = client[c].has[k].turn
 

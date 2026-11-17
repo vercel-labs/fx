@@ -20,9 +20,10 @@ export type Observation =
 
 export type Parts = Array<"progress" | "calls" | "usage" | "compaction" | "command">;
 
-/// rules: the S8d and S8g rules. today: fx acp before S8d. root-field: fx acp
-/// with S8d's rules but before S8g, which put a shell call's command result
-/// at the root of its update.
+/// rules: the turn events rules, with a shell call's command result in
+/// sh.fx/commandResult. today: fx acp before turn events. root-field: fx acp
+/// with the turn events rules but a shell call's command result at the root
+/// of its update.
 export type Model = "rules" | "today" | "root-field";
 
 const MODELS: Record<Model, { rules: boolean; commandMeta: boolean }> = {

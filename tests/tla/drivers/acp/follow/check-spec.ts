@@ -45,7 +45,7 @@ const MUTANTS: Mutant[] = [
   },
   {
     id: "replay-new-ids",
-    note: "a replayed message gets a new id, as today (X21)",
+    note: "a replayed message gets a new id, as today",
     from: `id |-> IF IdRules THEN turns[k] ELSE -1`,
     to: `id |-> -1`,
     expect: "StableIds",
