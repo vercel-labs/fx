@@ -33,7 +33,7 @@ import {
 } from "./conditional-guidance-oracle";
 import { expectPermissionModeContext } from "./permission-mode-context";
 import { completion as configuredCompletion, createConfiguredProviderFixture } from "./fixtures/chat-completions";
-import { childLines, childWork, compactionRecordPath, copyV1Fixture, logLines, logLinesAfterCompaction, onlySessionId, rootSessionIds, savedSession, savedSessionIds, savedToolCallIds, savedText, savedToolResults, sessionDir, waitForRootTurnCommitted, withoutConversionNotice } from "./saved-sessions";
+import { childLines, childWork, committedRootTurns, compactionRecordPath, copyV1Fixture, logLines, logLinesAfterCompaction, onlySessionId, rootSessionIds, savedSession, savedSessionIds, savedToolCallIds, savedText, savedToolResults, sessionDir, waitForRootTurnCommitted, withoutConversionNotice } from "./saved-sessions";
 import { stdoutFrames } from "./render-lab/tape";
 import {
   fakeGatewayFinalText,
@@ -11606,7 +11606,28 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     const persistentInstructions = "Remember earlier turns and answer exactly as requested.";
     const firstMessage = "Reply exactly PERSISTED_FIRST.";
     const secondMessage = "Reply exactly PERSISTED_SECOND.";
-    const gateway = startDynamicFakeGateway((body) => {
+    // The child answers only once its run's parent has saved the turn that
+    // sent the message. A report that arrives while that turn still runs
+    // joins it (`postMail` in `src/core/agent/worker_runtime.zig`), and the
+    // receipt would get no request of its own.
+    let committedBefore = 0;
+    // A wait that fails is kept and answered with an error response, so fx
+    // sees a failed request and `runFx` ends it normally; the test throws the
+    // kept error after the run. Thrown out of the gateway's handler, it would
+    // fail the test at once and leave fx running.
+    let holdError: unknown;
+    const holdChild = async (): Promise<Response | undefined> => {
+      if (holdError === undefined) {
+        try {
+          await waitForRootTurnCommitted(root.home, committedBefore);
+          return undefined;
+        } catch (error) {
+          holdError = error;
+        }
+      }
+      return new Response("the parent's turn was not saved", { status: 500 });
+    };
+    const gateway = startDynamicFakeGateway(async (body) => {
       // Each run's report starts the parent's next turn.
       if (latestUserIsReport(body)) {
         if (latestUserText(body).includes("PERSISTED_SECOND")) return fakeGatewayFinalText("PARENT_SECOND_COMPLETE");
@@ -11627,6 +11648,8 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         expect(body).toContain("PERSISTED_FIRST");
         expect(body).toContain(persistentInstructions);
         expect(body).not.toContain('"name":"subagent"');
+        const refused = await holdChild();
+        if (refused) return refused;
         return fakeGatewayFinalText("PERSISTED_SECOND");
       }
       if (promptText(body).includes("RESUME_PERSISTENT_SECOND")) {
@@ -11647,6 +11670,8 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       if (promptText(body).includes(firstMessage)) {
         expect(body).toContain(persistentInstructions);
         expect(body).not.toContain('"name":"subagent"');
+        const refused = await holdChild();
+        if (refused) return refused;
         return fakeGatewayFinalText("PERSISTED_FIRST");
       }
       return fakeGatewayToolCall("persistent_resume_one", "subagent", {
@@ -11673,6 +11698,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
           timeoutMs: 15_000,
         },
       );
+      if (holdError) throw holdError;
       expect(first.code).toBe(0);
       const firstJson = parseAskJson(first.stdout);
       expect(firstJson.output).toContain("PARENT_FIRST_COMPLETE");
@@ -11680,6 +11706,9 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       const children = new Set(childLines(root.home, firstJson.session_id).filter((line) => line.kind === "child_spawned").map((line) => line.child));
       expect(children.size).toBe(1);
       const internalChildId = [...children][0]!;
+      // The resumed run's child waits for a turn past the ones the first run
+      // committed.
+      committedBefore = committedRootTurns(root.home);
 
       const second = await runFx(
         [
@@ -11696,6 +11725,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
           timeoutMs: 15_000,
         },
       );
+      if (holdError) throw holdError;
       if (second.code !== 0) throw new Error(`Resumed child failed: ${second.stderr}\n${second.stdout}`);
       const secondOutput = parseAskJson(second.stdout).output;
       if (!secondOutput.includes("PARENT_SECOND_COMPLETE")) {
