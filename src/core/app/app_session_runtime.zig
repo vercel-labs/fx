@@ -2122,7 +2122,6 @@ pub fn Runtime(comptime App: type) type {
         /// adds it to mail that was posted after the turn finished and before
         /// this commit (`WorkerRuntime.acknowledgeFinishCommittedTurn`).
         fn acknowledgeFinishCommitted(
-            app: *App,
             agent: *AppAgent,
             committed: ?types.HistoryTurn,
             ownership: ?types.SnapshotFileOwnership,
@@ -2149,7 +2148,7 @@ pub fn Runtime(comptime App: type) type {
             finished: types.FinishedPrompt,
         ) !void {
             var committed: ?types.HistoryTurn = null;
-            defer acknowledgeFinishCommitted(app, agent, committed, finished.snapshot_file_ownership);
+            defer acknowledgeFinishCommitted(agent, committed, finished.snapshot_file_ownership);
             var turn = finished.turn;
             if (finished.summary) |summary| {
                 types.setHistoryTurnSummary(&turn, summary);
@@ -2195,7 +2194,7 @@ pub fn Runtime(comptime App: type) type {
             // An uncommitted turn stays with the pacer, which commits it later
             // through `appendFinishedPrompt`.
             if (outcome == .committed) {
-                acknowledgeFinishCommitted(app, agent, finished.turn, finished.snapshot_file_ownership);
+                acknowledgeFinishCommitted(agent, finished.turn, finished.snapshot_file_ownership);
             }
             return outcome;
         }
