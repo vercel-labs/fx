@@ -25,6 +25,9 @@
 # names. The other configs must pass. AcpConfigTurn: session/set_config_option
 # while a turn runs: answered at once, and the running turn keeps its own
 # settings.
+# AcpDisconnect: a client that disconnects: a client that lists
+# sh.fx/keepTurnOnDisconnect keeps its turns, any other's running turn stops,
+# and fx never waits for the gone client.
 #
 # The planted bugs and the runs of the real `fx acp` binary are in
 # ../drivers/acp/:
@@ -44,6 +47,8 @@
 #   bun ../drivers/acp/follow/driver.ts   # one connection: replayed message ids (F6)
 #   bun ../drivers/acp/config_turn/check-spec.ts
 #   bun ../drivers/acp/config_turn/driver.ts   # set_config_option during a turn
+#   bun ../drivers/acp/disconnect/check-spec.ts
+#   bun ../drivers/acp/disconnect/driver.ts   # a client that disconnects
 #   bun ../drivers/acp/session_state/check-spec.ts
 #   bun ../drivers/acp/session_state/driver.ts   # today's fx acp; --model rules fails until the rules land
 #   bun ../drivers/acp/shared_session/check-spec.ts
@@ -127,6 +132,10 @@ MCAcpForkRewind AcpForkRewindToday-fork ForkAvailable
 MCAcpForkRewind AcpForkRewindToday-rewind RewindAvailable
 MCAcpConfigTurn MCAcpConfigTurn -
 MCAcpConfigTurn AcpConfigTurnToday AnswersDuringTurn
+MCAcpDisconnect MCAcpDisconnect -
+MCAcpDisconnect MCAcpDisconnectPlain -
+MCAcpDisconnect AcpDisconnectToday-keep KeptTurnsComplete
+MCAcpDisconnect AcpDisconnectToday-wait NeverWaitsForGoneClient
 EOF
 
 if [ "$ci" = true ]; then

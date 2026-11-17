@@ -909,6 +909,10 @@ test "host tool arguments are sent as the types the tool's schema names" {
     }
 }
 
+/// What a host tool call returns when the client that provides the tool can't
+/// answer, because its input or output has closed.
+const host_tool_gone_text = "The client that provides this tool has disconnected, so the tool can't run.";
+
 /// Asks the client to run one of the tools it listed in `sh.fx/hostTools`,
 /// as a `_sh.fx/tools/call` request, and waits for its result.
 fn callHostTool(
@@ -924,8 +928,11 @@ fn callHostTool(
     const state = session.server;
     if (cancel_flag) |flag| if (flag.load(.seq_cst)) return error.Cancelled;
     const outbound_id = (server.beginOutboundRequest(state, session, .host_tool) catch
-        return .{ .failure = try alloc.dupe(u8, "Host tool request failed") }) orelse
-        return .{ .failure = try alloc.dupe(u8, "Host tool request limit reached") };
+        return .{ .failure = try alloc.dupe(u8, "Host tool request failed") }) orelse {
+        if (!server.clientInputEnded(state)) return .{ .failure = try alloc.dupe(u8, "Host tool request limit reached") };
+        debug_trace.logf("acp", "event=host_tool_unavailable reason=client_input_ended tool={s}", .{name});
+        return .{ .failure = try alloc.dupe(u8, host_tool_gone_text) };
+    };
     var awaiting = true;
     errdefer if (awaiting) {
         server.cancelOutboundRequest(state, outbound_id);
@@ -951,13 +958,28 @@ fn callHostTool(
         .{ .integer = @intCast(outbound_id) },
         sh_fx.method.tools_call,
         params.written(),
-    ) catch return .{ .failure = try alloc.dupe(u8, "Host tool request failed") };
+    ) catch |err| {
+        // Returning a value skips the errdefer above, so the pending request is
+        // ended here on every failed write.
+        server.cancelOutboundRequest(state, outbound_id);
+        if (server.awaitOutboundResponse(state, outbound_id, .host_tool)) |owned| {
+            var abandoned = owned;
+            abandoned.deinit(state.alloc);
+        }
+        if (err != error.BrokenPipe) return .{ .failure = try alloc.dupe(u8, "Host tool request failed") };
+        debug_trace.logf("acp", "event=host_tool_unavailable reason=client_output_closed tool={s}", .{name});
+        return .{ .failure = try alloc.dupe(u8, host_tool_gone_text) };
+    };
 
     var response = server.awaitOutboundResponse(state, outbound_id, .host_tool) orelse
         return .{ .failure = try alloc.dupe(u8, "Host tool request failed") };
     awaiting = false;
     defer response.deinit(state.alloc);
     if (cancel_flag) |flag| if (flag.load(.seq_cst)) return error.Cancelled;
+    if (response.no_client) {
+        debug_trace.logf("acp", "event=host_tool_unavailable reason=client_input_ended tool={s}", .{name});
+        return .{ .failure = try alloc.dupe(u8, host_tool_gone_text) };
+    }
     if (response.cancelled) {
         if (cancel_flag) |flag| flag.store(true, .seq_cst);
         return error.Cancelled;
@@ -2702,7 +2724,11 @@ fn requestAcpPermission(
     try writeValidatedToolArguments(alloc, &validated_arguments.writer, call.arguments_json);
 
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
-    const request_id = server.beginPermissionRequest(ctx.state, ctx.session) orelse return error.PermissionRequestAlreadyPending;
+    const request_id = server.beginPermissionRequest(ctx.state, ctx.session) orelse {
+        if (!server.clientInputEnded(ctx.state)) return error.PermissionRequestAlreadyPending;
+        debug_trace.logf("acp", "event=permission_denied reason=client_input_ended tool={s}", .{call.name});
+        return permission_request.OwnedPermissionResponse.init(alloc, .deny, null);
+    };
     errdefer {
         server.cancelPermissionRequest(ctx.state, request_id);
         _ = server.awaitPermissionDecision(ctx.state, request_id);
@@ -2744,12 +2770,22 @@ fn requestAcpPermission(
     try writePermissionOption(&params.writer, "reject_once", "Reject", "reject_once");
     try params.writer.writeAll("]}");
 
-    try ctx.state.writer.writeRequest(
+    ctx.state.writer.writeRequest(
         alloc,
         .{ .integer = @intCast(request_id) },
         "session/request_permission",
         params.writer.buffered(),
-    );
+    ) catch |err| switch (err) {
+        error.BrokenPipe => {
+            // Returning a value skips the errdefer above, so the pending request
+            // is ended here: the client closed its output and can't answer.
+            server.cancelPermissionRequest(ctx.state, request_id);
+            _ = server.awaitPermissionDecision(ctx.state, request_id);
+            debug_trace.logf("acp", "event=permission_denied reason=client_output_closed tool={s}", .{call.name});
+            return permission_request.OwnedPermissionResponse.init(alloc, .deny, null);
+        },
+        else => return err,
+    };
     const decision = server.awaitPermissionDecision(ctx.state, request_id);
     return permission_request.OwnedPermissionResponse.init(alloc, decision, null);
 }
@@ -3956,8 +3992,12 @@ fn requestAcpElicitation(
     input_request: mcp_elicitation.Request,
 ) ![]u8 {
     const state = responder.acp.state;
-    const outbound_id = (try server.beginOutboundRequest(state, responder.acp.session, .elicitation)) orelse
+    const outbound_id = (try server.beginOutboundRequest(state, responder.acp.session, .elicitation)) orelse {
+        if (server.clientInputEnded(state)) {
+            debug_trace.logf("acp", "event=elicitation_unavailable reason=client_input_ended server={s}", .{origin.server_name});
+        }
         return error.McpInputRequired;
+    };
     var awaiting = true;
     errdefer if (awaiting) {
         server.cancelOutboundRequest(state, outbound_id);
@@ -4016,12 +4056,18 @@ fn requestAcpElicitation(
     var wait_outcome: observation.WaitOutcome = .failed;
     var wait_error: ?[]const u8 = null;
     defer if (!wait_finished) if (wait) |value| value.end(if (responder.operation_cancel_flag != null and responder.operation_cancel_flag.?.load(.seq_cst)) .cancelled else wait_outcome, &.{}, wait_error);
-    try state.writer.writeRequest(
+    state.writer.writeRequest(
         alloc,
         .{ .integer = @intCast(outbound_id) },
         "elicitation/create",
         params,
-    );
+    ) catch |err| {
+        // The errdefer above ends the pending request on this error.
+        if (err == error.BrokenPipe) {
+            debug_trace.logf("acp", "event=elicitation_unavailable reason=client_output_closed server={s}", .{origin.server_name});
+        }
+        return err;
+    };
 
     const maybe_response = awaitAcpElicitationResponse(
         state,
@@ -4044,6 +4090,10 @@ fn requestAcpElicitation(
     if (response.cancelled) {
         wait_outcome = .cancelled;
         return error.Cancelled;
+    }
+    if (response.no_client) {
+        debug_trace.logf("acp", "event=elicitation_unavailable reason=client_input_ended server={s}", .{origin.server_name});
+        return error.McpInputRequired;
     }
     if (response.error_json != null) return error.McpInputRequired;
     const response_json = response.result_json orelse return error.McpInputRequired;
@@ -4789,6 +4839,42 @@ test "mapToolKind maps surviving tools" {
     try std.testing.expectEqual(acp_types.ToolCallKind.read, mapToolKind("glob_files"));
     try std.testing.expectEqual(acp_types.ToolCallKind.other, mapToolKind("skill"));
     try std.testing.expectEqual(acp_types.ToolCallKind.other, mapToolKind("install_skill"));
+}
+
+test "ACP permission to a client whose input ended is denied without a request" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const alloc = arena_state.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var capture = try tmp.dir.createFile(io_mod.getIo(), "acp-permission.jsonl", .{ .read = true });
+    defer capture.close(io_mod.getIo());
+    var state: server.ServerState = undefined;
+    try initTestAcpState(&state, alloc, "/tmp/workspace", .ask);
+    defer state.deinit();
+    state.writer = .{ .stdout = capture };
+    state.input_ended = true;
+    var turn_settings = try TurnSettings.capture(alloc, server.firstSession(&state).?);
+    defer turn_settings.deinit(alloc);
+    var ctx = AcpContext{
+        .alloc = alloc,
+        .state = &state,
+        .session = server.firstSession(&state).?,
+        .turn = &turn_settings,
+        .session_id = "session_1",
+    };
+    defer ctx.deinitPublishedToolCalls();
+
+    const call = ToolCall{
+        .id = "provider_call_9",
+        .name = "shell",
+        .arguments_json = "{\"action\":\"run\",\"command\":\"ls\"}",
+    };
+    var response = try requestAcpPermission(&ctx, alloc, .{ .label = "Run ls" }, call, null, null);
+    defer response.deinit();
+    try std.testing.expect(response.decision == .deny);
+    try std.testing.expectEqual(@as(u64, 0), try capture.length(io_mod.getIo()));
 }
 
 test "ACP permission arguments are validated and reserialized before emission" {

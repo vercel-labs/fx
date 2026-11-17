@@ -12176,6 +12176,209 @@ describe("acp: model-independent", () => {
   );
 
   test(
+    "a client that lists sh.fx/keepTurnOnDisconnect keeps its running turn after it disconnects",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-keep-turn-");
+      const heldReply = deferred<Response>();
+      const gateway = startFakeGateway([() => heldReply.promise]);
+      const gatewayAfter = startFakeGateway([]);
+      let reloaded: AcpClient | undefined;
+      try {
+        client = await AcpClient.create({ cwd: root.workspace, env: fakeGatewayEnv(root, gateway) });
+        const sessionId = await startSessionListing(client, {
+          _meta: { ...Object.fromEntries(FX_EXTENSIONS.map((name) => [name, {}])), "sh.fx/keepTurnOnDisconnect": {} },
+        });
+        sendPrompt(client, 4, "KEPT_TURN_PROMPT");
+        await waitForCondition("the first Gateway request", () => gateway.requests.length === 1);
+        client.endStdin();
+        heldReply.resolve(finalText("KEPT_TURN_DONE"));
+        expect(await client.waitForExit(TIMEOUT)).toBe(0);
+        expect(client.stderr).toBe("");
+
+        reloaded = await AcpClient.create({ cwd: root.workspace, env: fakeGatewayEnv(root, gatewayAfter) });
+        await reloaded.request("initialize", { protocolVersion: 1 }, 1);
+        reloaded.send({
+          jsonrpc: "2.0",
+          id: 2,
+          method: "session/load",
+          params: { sessionId, cwd: root.workspace, mcpServers: [] },
+        });
+        const { responses, messages } = await readUntilResponses(reloaded, [2]);
+        expect(responses.get(2)?.error).toBeUndefined();
+        const replayed = messages
+          .map((message) => message.params?.update)
+          .filter((update) => update?.sessionUpdate === "agent_message_chunk")
+          .map((update) => update.content?.text ?? "")
+          .join("");
+        expect(replayed).toContain("KEPT_TURN_DONE");
+        for (const notice of ["cancelled", "failed", "fx stopped before this turn finished"]) {
+          expect(replayed).not.toContain(notice);
+        }
+      } finally {
+        await client?.close();
+        await reloaded?.close();
+        gateway.stop();
+        gatewayAfter.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "a kept turn denies a permission its gone client can't answer",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-kept-permission-");
+      const target = join(root.workspace, "kept.txt");
+      const heldReply = deferred<Response>();
+      const gateway = startFakeGateway([() => heldReply.promise, finalText("DENIED_THEN_DONE")]);
+      const gatewayAfter = startFakeGateway([]);
+      let reloaded: AcpClient | undefined;
+      try {
+        client = await AcpClient.create({ cwd: root.workspace, env: fakeGatewayEnv(root, gateway) });
+        const sessionId = await startSessionListing(client, {
+          _meta: { ...Object.fromEntries(FX_EXTENSIONS.map((name) => [name, {}])), "sh.fx/keepTurnOnDisconnect": {} },
+        });
+        // startSessionListing's set_mode has no sessionId, so ask mode is set here, with it.
+        const asked = await client.request(
+          "session/set_config_option",
+          { sessionId, configId: "mode", value: "ask" },
+          4,
+        ) as any;
+        expect(asked.error).toBeUndefined();
+        expect(asked.result.configOptions.find((option: any) => option.id === "mode").currentValue).toBe("ask");
+        sendPrompt(client, 5, "Write kept.txt and report.");
+        await waitForCondition("the first Gateway request", () => gateway.requests.length === 1);
+        client.endStdin();
+        heldReply.resolve(fileToolCall("kept_write_1", target, "kept\n"));
+        expect(await client.waitForExit(TIMEOUT)).toBe(0);
+        expect(existsSync(target)).toBe(false);
+        expect(gateway.requests.length).toBe(2);
+        expect(client.stderr).toBe("");
+
+        reloaded = await AcpClient.create({ cwd: root.workspace, env: fakeGatewayEnv(root, gatewayAfter) });
+        await reloaded.request("initialize", { protocolVersion: 1 }, 1);
+        reloaded.send({
+          jsonrpc: "2.0",
+          id: 2,
+          method: "session/load",
+          params: { sessionId, cwd: root.workspace, mcpServers: [] },
+        });
+        const { responses, messages } = await readUntilResponses(reloaded, [2]);
+        expect(responses.get(2)?.error).toBeUndefined();
+        const replayed = messages
+          .map((message) => message.params?.update)
+          .filter((update) => update?.sessionUpdate === "agent_message_chunk")
+          .map((update) => update.content?.text ?? "")
+          .join("");
+        expect(replayed).toContain("DENIED_THEN_DONE");
+        for (const notice of ["cancelled", "failed", "fx stopped before this turn finished"]) {
+          expect(replayed).not.toContain(notice);
+        }
+      } finally {
+        await client?.close();
+        await reloaded?.close();
+        gateway.stop();
+        gatewayAfter.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "a kept turn's queued prompt still runs after its client disconnects",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-kept-queue-");
+      const heldReply = deferred<Response>();
+      const gateway = startFakeGateway([() => heldReply.promise, finalText("QUEUED_KEPT_DONE")]);
+      const gatewayAfter = startFakeGateway([]);
+      let reloaded: AcpClient | undefined;
+      try {
+        client = await AcpClient.create({ cwd: root.workspace, env: fakeGatewayEnv(root, gateway) });
+        const sessionId = await startSessionListing(client, {
+          _meta: { ...Object.fromEntries(FX_EXTENSIONS.map((name) => [name, {}])), "sh.fx/keepTurnOnDisconnect": {} },
+        });
+        sendPrompt(client, 4, "FIRST_KEPT_PROMPT");
+        await waitForCondition("the first Gateway request", () => gateway.requests.length === 1);
+        sendQueuedPrompt(client, 5, "QUEUED_KEPT_PROMPT");
+        client.endStdin();
+        heldReply.resolve(finalText("FIRST_KEPT_DONE"));
+        expect(await client.waitForExit(TIMEOUT)).toBe(0);
+        expect(gateway.requests.length).toBe(2);
+        expect(client.stderr).toBe("");
+
+        reloaded = await AcpClient.create({ cwd: root.workspace, env: fakeGatewayEnv(root, gatewayAfter) });
+        await reloaded.request("initialize", { protocolVersion: 1 }, 1);
+        reloaded.send({
+          jsonrpc: "2.0",
+          id: 2,
+          method: "session/load",
+          params: { sessionId, cwd: root.workspace, mcpServers: [] },
+        });
+        const { responses, messages } = await readUntilResponses(reloaded, [2]);
+        expect(responses.get(2)?.error).toBeUndefined();
+        const replayed = messages
+          .map((message) => message.params?.update)
+          .filter((update) => update?.sessionUpdate === "agent_message_chunk")
+          .map((update) => update.content?.text ?? "")
+          .join("");
+        expect(replayed).toContain("FIRST_KEPT_DONE");
+        expect(replayed).toContain("QUEUED_KEPT_DONE");
+        for (const notice of ["cancelled", "failed", "fx stopped before this turn finished"]) {
+          expect(replayed).not.toContain(notice);
+        }
+      } finally {
+        await client?.close();
+        await reloaded?.close();
+        gateway.stop();
+        gatewayAfter.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "fx exits when a queued prompt asks a gone client for permission",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-queued-permission-");
+      const target = join(root.workspace, "queued.txt");
+      const heldReply = deferred<Response>();
+      const gateway = startFakeGateway([
+        () => heldReply.promise,
+        fileToolCall("queued_write_1", target, "queued\n"),
+        finalText("QUEUED_DONE"),
+      ]);
+      try {
+        client = await AcpClient.create({ cwd: root.workspace, env: fakeGatewayEnv(root, gateway) });
+        const sessionId = await startAutoSession(client);
+        // startAutoSession's set_mode has no sessionId, so ask mode is set here, with it.
+        const asked = await client.request(
+          "session/set_config_option",
+          { sessionId, configId: "mode", value: "ask" },
+          4,
+        ) as any;
+        expect(asked.error).toBeUndefined();
+        expect(asked.result.configOptions.find((option: any) => option.id === "mode").currentValue).toBe("ask");
+        sendPrompt(client, 5, "FIRST_PLAIN_PROMPT");
+        await waitForCondition("the first Gateway request", () => gateway.requests.length === 1);
+        sendQueuedPrompt(client, 6, "QUEUED_PLAIN_PROMPT");
+        client.endStdin();
+        heldReply.resolve(finalText("FIRST_DONE"));
+        expect(await client.waitForExit(TIMEOUT)).toBe(0);
+        expect(existsSync(target)).toBe(false);
+        expect(client.stderr).toBe("");
+      } finally {
+        await client?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
     "session modes are the CLI permission modes and start in the saved mode",
     async () => {
       for (const [saved, expected] of [[undefined, "auto"], ["ask", "ask"], ["auto", "auto"], ["yolo", "full-access"], ["full-access", "full-access"]] as const) {

@@ -38,6 +38,10 @@ pub const Extension = enum {
     usage,
     /// `sh.fx/commandResult` on the `tool_call_update` that ends a shell call.
     command_result,
+    /// `sh.fx/keepTurnOnDisconnect`: when this client's connection ends,
+    /// fx lets its sessions' running turns finish and saves them, instead of
+    /// cancelling them, and exits once they and the queued prompts are done.
+    keep_turn_on_disconnect,
 
     pub fn capabilityName(self: Extension) []const u8 {
         return switch (self) {
@@ -53,6 +57,7 @@ pub const Extension = enum {
             .model_calls => "sh.fx/modelCalls",
             .usage => "sh.fx/usage",
             .command_result => "sh.fx/commandResult",
+            .keep_turn_on_disconnect => "sh.fx/keepTurnOnDisconnect",
         };
     }
 };
@@ -124,4 +129,19 @@ test "clientList is empty for a client that lists no extension" {
     , .{});
     defer parsed.deinit();
     try std.testing.expectEqual(@as(usize, 0), clientList(parsed.value.object).count());
+}
+
+test "clientList takes keepTurnOnDisconnect only as an object" {
+    const alloc = std.testing.allocator;
+    const listed = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"_meta":{"sh.fx/keepTurnOnDisconnect":{}}}
+    , .{});
+    defer listed.deinit();
+    try std.testing.expect(clientList(listed.value.object).contains(.keep_turn_on_disconnect));
+
+    const not_object = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"_meta":{"sh.fx/keepTurnOnDisconnect":true}}
+    , .{});
+    defer not_object.deinit();
+    try std.testing.expect(!clientList(not_object.value.object).contains(.keep_turn_on_disconnect));
 }
