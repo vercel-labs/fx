@@ -8,10 +8,10 @@
 //   bun tests/tla/drivers/acp/turn_events/driver.ts --model today   # fx acp before turn events
 //
 // --model rules (the default) checks the turn events rules. --model today
-// checks the model of fx acp before them; a build of #2021, chosen with
-// FX_WORKTREE or FX_BIN, fails --model rules for every client that lists a
-// part. --only takes a pattern of plan names. No model calls: every reply
-// comes from a fake Gateway.
+// checks the model of fx acp before them; a build from before turn events,
+// chosen with FX_WORKTREE or FX_BIN, fails --model rules for every client
+// that lists a part. --only takes a pattern of plan names. No model calls:
+// every reply comes from a fake Gateway.
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { binary, worktree } from "../../lib/context";
