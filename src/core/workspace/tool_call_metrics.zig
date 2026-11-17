@@ -746,6 +746,10 @@ fn expectCutLaws(value: []const u8, budget: usize, valid_utf8: bool) !void {
         const utf8_tail = utf8SuffixLen(value, budget - cut.head_len);
         try std.testing.expect(cut.head_len + utf8_tail + 3 >= budget);
         try std.testing.expect(cut.tail_len <= utf8_tail);
+        // The kept tail starts where the secret-safe cut moves the UTF-8
+        // start, and no later: `text_utils.secretSafeSuffixStart` and its
+        // tests pin which secrets it steps past.
+        try std.testing.expectEqual(value.len - text_utils.secretSafeSuffixStart(value, value.len - utf8_tail), cut.tail_len);
     }
 }
 
