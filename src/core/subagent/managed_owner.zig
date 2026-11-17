@@ -1153,6 +1153,7 @@ fn slotMain(slot: *Slot) void {
     while (true) {
         const outcome = runOne(slot);
         defer outcome.deinit(owner.alloc);
+        if (end_test_controls.runArmed()) end_test_controls.holdAfterRun(slot.child_id, false);
         if (end_test_controls.armed()) {
             const stopped_by: ?[]const u8 = blk: {
                 owner.mutex.lockUncancelable(io_mod.getIo());
@@ -1176,6 +1177,7 @@ fn slotMain(slot: *Slot) void {
             dropLeftovers(owner.alloc, slot, "stopped");
         }
         owner.mutex.unlock(io_mod.getIo());
+        if (end_test_controls.runArmed()) end_test_controls.holdAfterRun(slot.child_id, true);
         const next = if (owner.on_end) |hook| hook.end_fn(hook.context, .{
             .child_id = slot.child_id,
             .work_id = outcome.work_id,
