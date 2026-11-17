@@ -16,6 +16,7 @@
     {"name": "pending_reports", "module": "fx", "test": "pending reports keep their laws on fuzzed report lines", "iterations": 500000},
     {"name": "subagent_purpose", "module": "fx", "test": "a purpose stays one short line of whole characters for fuzzed text", "iterations": 2000000},
     {"name": "profile_parse", "module": "fx", "test": "profile parsing stays bounded on fuzzed settings and prompts", "iterations": 1000000},
+    {"name": "subagent_started_with", "module": "fx", "test": "a saved profile block stays canonical for fuzzed spawn data", "iterations": 1000000},
     {"name": "image_dimensions", "module": "fx", "test": "image dimension parsing stays bounded on arbitrary bytes", "iterations": 5000000},
     {"name": "image_route", "module": "fx", "test": "the core keeps the model's laws on arbitrary event sequences", "iterations": 5000000},
     {"name": "earlier_image_notes", "module": "fx", "test": "earlier images withheld from a request always leave a note", "iterations": 100000},
@@ -85,6 +86,7 @@
     {"name": "gateway_team_display", "module": "fx", "test": "fuzzed team slugs and ids show only a valid team name", "iterations": 2000000},
     {"name": "kept_team_file", "module": "fx", "test": "a kept team file reads as valid team names or is refused on fuzzed bytes", "iterations": 2000000},
     {"name": "trace_cuts", "module": "fx", "test": "trace cuts stay bounded and keep UTF-8 whole on fuzzed bytes", "iterations": 3000000},
-    {"name": "snapshot_alias_lines", "module": "fx", "test": "alias line reading stays bounded on fuzzed bytes", "iterations": 3000000}
+    {"name": "snapshot_alias_lines", "module": "fx", "test": "alias line reading stays bounded on fuzzed bytes", "iterations": 3000000},
+    {"name": "mcp_request_grace", "module": "fx", "test": "a fuzzed run of requests, lines that name no request, replies, progress and timers ends each request once and ends only a silent request that has a grace as malformed", "iterations": 1000000}
   ]
 }

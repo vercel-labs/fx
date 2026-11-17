@@ -14,6 +14,8 @@ const text_utils = @import("../../core/shared/text_utils.zig");
 const ascii_case = @import("../../core/shared/ascii_case.zig");
 const json_depth = @import("../../core/shared/json_depth.zig");
 const command_lex = @import("../../core/shell_command/command_lex.zig");
+const tooling_presentation = @import("../../core/tooling/tool_presentation.zig");
+const tool_result_errors = @import("../../core/tooling/tool_result_errors.zig");
 const vt_emulator = @import("../../core/terminal/engine.zig");
 
 const TranscriptEntry = transcript_blocks.TranscriptEntry;
@@ -1021,6 +1023,12 @@ const StoryTally = struct {
                     if (record.outcome == .failed) self.other_failures += 1 else self.other_calls += 1;
                     return;
                 }
+                // A request the shell refused ran no command, so it counts
+                // as another call that failed, not as a command.
+                if (shellCallNeverRan(scratch, record)) {
+                    self.other_failures += 1;
+                    return;
+                }
                 const follow_up = isSessionFollowUp(scratch, record);
                 if (!follow_up) {
                     self.commands += 1;
@@ -1958,7 +1966,54 @@ fn searchFolderNames(scratch: std.mem.Allocator, paths: []const []const u8) ![]c
 
 noinline fn storyRowCallFailed(scratch: std.mem.Allocator, detail: ?*const ToolDetailRecord) bool {
     const record = detail orelse return false;
-    return isShellCommandCall(scratch, record) and storyCallFailed(detail);
+    return isShellCommandCall(scratch, record) and storyCallFailed(detail) and !shellCallNeverRan(scratch, record);
+}
+
+/// Whether a shell call failed before it ran its command because its request
+/// was wrong, such as one that set both a profile and a shell. That is the
+/// model's own mistake, not a command that failed, and it reads as one.
+fn shellCallNeverRan(scratch: std.mem.Allocator, record: *const ToolDetailRecord) bool {
+    if (record.outcome != .failed or !isShellCommandCall(scratch, record)) return false;
+    const result = record.result orelse return false;
+    const correction = tool_result_errors.inspectTerminalActionFieldCorrection(scratch, result) catch return false;
+    return correction != null;
+}
+
+/// Why a shell call never ran, as core's status says it, such as
+/// "2 invalid fields". Null when its result names no wrong field.
+fn neverRanReason(scratch: std.mem.Allocator, record: *const ToolDetailRecord) !?[]const u8 {
+    const result = record.result orelse return null;
+    const correction = tool_result_errors.inspectTerminalActionFieldCorrection(scratch, result) catch return null;
+    const count = (correction orelse return null).invalid_field_count;
+    if (count == 0) return null;
+    return try countNote(scratch, "", count, if (count == 1) " invalid field" else " invalid fields");
+}
+
+/// The key under which a shell call repeats one that never ran: the short
+/// form of its command, so a fixed request for the same steps counts as its
+/// retry even when the model also reworded the command.
+fn shellRetryKey(scratch: std.mem.Allocator, record: *const ToolDetailRecord) !?[]const u8 {
+    const command = storyArgString(scratch, record, "command") orelse record.command_display orelse return null;
+    if (std.mem.trim(u8, command, " \t\r\n").len == 0) return null;
+    const short = try shortCommand(scratch, command) orelse command;
+    return try std.mem.concat(scratch, u8, &.{ "shell\x00", short });
+}
+
+/// A running toolbox call's identity by the MCP tool its status names, such
+/// as "Running MCP mcp_x", while its arguments, which name the tool, have
+/// not arrived, so it joins that tool's row at once instead of showing on a
+/// row of its own that folds into it later.
+fn streamingToolboxIdentity(scratch: std.mem.Allocator, entry: TranscriptEntry, detail: ?*const ToolDetailRecord, identity: StoryIdentity) !StoryIdentity {
+    if (identity.kind != .mcp) return identity;
+    const record = detail orelse return identity;
+    if (record.outcome != null or !std.mem.eql(u8, record.tool_name, "toolbox")) return identity;
+    if (storyArgString(scratch, record, "run") != null) return identity;
+    const phrase = try entryStatus(scratch, entry) orelse return identity;
+    const prefix = tooling_presentation.mcp_running_label ++ " ";
+    if (!std.mem.startsWith(u8, phrase, prefix)) return identity;
+    const name = std.mem.trim(u8, phrase[prefix.len..], " \t\r\n");
+    if (name.len == 0) return identity;
+    return .{ .kind = .mcp, .key = name };
 }
 
 fn storyIdentity(scratch: std.mem.Allocator, detail: ?*const ToolDetailRecord) !StoryIdentity {
@@ -1973,6 +2028,7 @@ fn storyIdentity(scratch: std.mem.Allocator, detail: ?*const ToolDetailRecord) !
             // row instead of counting as a run of the same command. A failed
             // run still joins, so a row can say "passed on the 3rd run".
             if (record.outcome) |outcome| if (outcome == .denied or outcome == .cancelled) return .{};
+            if (shellCallNeverRan(scratch, record)) return .{};
             if (storyArgString(scratch, record, "session_id")) |id| return .{ .kind = .session, .key = id };
             if (record.result) |result| if (jsonField(scratch, result, "session_id")) |field| switch (field) {
                 .string => |id| if (id.len > 0) return .{ .kind = .session, .key = id },
@@ -2054,7 +2110,11 @@ fn collectStoryRetries(
         };
         // A call held for project instructions has no row.
         if (record.outcome == .deferred) continue;
-        const key = try retryKey(scratch, record) orelse {
+        // A shell call repeats by its steps, and only one that never ran
+        // starts a run of failures: a command that ran and failed stays, as
+        // "passed on the 3rd run".
+        const shell = isShellCommandCall(scratch, record);
+        const key = (if (shell) try shellRetryKey(scratch, record) else try retryKey(scratch, record)) orelse {
             failed_run.clearRetainingCapacity();
             continue;
         };
@@ -2064,10 +2124,10 @@ fn collectStoryRetries(
             continue;
         };
         switch (outcome) {
-            .failed => {
+            .failed => if (!shell or shellCallNeverRan(scratch, record)) {
                 try failed_run.append(scratch, entry_id);
                 run_key = key;
-            },
+            } else failed_run.clearRetainingCapacity(),
             .completed => if (failed_run.items.len > 0) {
                 for (failed_run.items) |id| try retries.fixed.put(scratch, id, {});
                 try retries.tries.put(scratch, entry_id, failed_run.items.len + 1);
@@ -2121,7 +2181,7 @@ fn collectStoryRows(
         // runs once they load shows instead, so the hold gets no row; Ctrl+O
         // still shows it.
         if (detail) |record| if (record.outcome == .deferred) continue;
-        const identity = try storyIdentity(scratch, detail);
+        const identity = try streamingToolboxIdentity(scratch, entry, detail, try storyIdentity(scratch, detail));
         // A call whose arguments have not arrived yet waits in the row it
         // will most likely join, and shows once they arrive.
         if (identity.kind == .single) if (detail) |record| if (record.outcome == null and (!storyHasArgs(record) or joinsByArgument(record))) {
@@ -2262,6 +2322,16 @@ fn storyRowText(scratch: std.mem.Allocator, row: *const StoryRow, style: Summary
         try std.mem.concat(scratch, u8, &.{ "Read ", try terminalSafeText(scratch, row.identity.key) })
     else
         try entryStatus(scratch, row.entry) orelse if (row.detail) |record| record.tool_name else "tool activity";
+    // A shell call that never ran says so by its command's steps, like any
+    // call the model got wrong, and leaves why to Ctrl+O, unless the turn
+    // ended on it, as for any failure a turn ends on.
+    if (row.detail) |record| if (shellCallNeverRan(scratch, record)) {
+        const command = storyArgString(scratch, record, "command") orelse record.command_display orelse record.tool_name;
+        const short = try shortCommand(scratch, command) orelse try terminalSafeText(scratch, command);
+        const phrase = try inFailureStyle(scratch, try std.mem.concat(scratch, u8, &.{ "Couldn't run ", short }), style);
+        const reason = if (row.ends_turn) try neverRanReason(scratch, record) orelse "" else "";
+        return .{ .display = phrase, .body = phrase, .suffix = "", .reason = reason };
+    };
     const split_failure = splitFailedPhrase(status_phrase, row.detail);
     const raw_phrase = if (split_failure) |split| split.row else status_phrase;
     const full_phrase = try reprojectTruncatedCommandPhrase(scratch, raw_phrase, row.detail) orelse raw_phrase;
@@ -2649,7 +2719,7 @@ fn writeGroupBlock(
     for (rows.items) |*row| {
         if (!storyCallFailed(row.detail)) continue;
         row.ends_turn = callEndsTurn(entries, row.status_index);
-        if (row.ends_turn and !isShellCommandCall(scratch, row.detail.?)) tally.turn_ending_failures += 1;
+        if (row.ends_turn and (!isShellCommandCall(scratch, row.detail.?) or shellCallNeverRan(scratch, row.detail.?))) tally.turn_ending_failures += 1;
     }
     var last_command_row: ?usize = null;
     for (rows.items, 0..) |*row, index| {
@@ -6859,6 +6929,93 @@ fn storyCommandDetail(
     };
 }
 
+test "shell calls that never ran because their request was wrong read as the model's mistake" {
+    // The rows of a real session: two requests the shell refused before
+    // running anything, then the fixed request, which ran the same steps.
+    const alloc = std.testing.allocator;
+    const first = "ls -l zig-out/bin/fx 2>/dev/null && ./zig-out/bin/fx help 2>&1 | head -60";
+    const second = "ls -l zig-out/bin/fx 2>/dev/null; ./zig-out/bin/fx help 2>&1 | head -50";
+    const refused = "{\"error\":{\"code\":\"invalid_shell_request\",\"executed\":false,\"problems\":[\"Choose either profile or shell.\"]}}";
+    const refused_twice = "{\"error\":{\"code\":\"invalid_shell_request\",\"executed\":false,\"problems\":[\"Choose either profile or shell.\",\"Set tty with shell.\"]}}";
+    const entries = [_]TranscriptEntry{
+        .{ .raw_bytes = .{ .id = 1, .bytes = "● Failed " ++ first ++ " · 2 invalid fields\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 2, .bytes = "● Failed " ++ second ++ " · 1 invalid field\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 3, .bytes = "● Ran " ++ second ++ "\n", .class = .tool_status } },
+    };
+    var details = [_]ToolDetailRecord{
+        storyCommandDetail(1, "{\"command\":\"" ++ first ++ "\",\"profile\":\"clean\",\"tty\":true}", 0, refused_twice),
+        storyCommandDetail(2, "{\"command\":\"" ++ second ++ "\"}", 0, refused),
+        storyCommandDetail(3, "{\"action\":\"run\",\"command\":\"" ++ second ++ "\"}", 0, null),
+    };
+    details[0].outcome = .failed;
+    details[0].command_process_presentation = null;
+    details[0].command_display = @constCast(first);
+    details[1].outcome = .failed;
+    details[1].command_process_presentation = null;
+    details[1].command_display = @constCast(second);
+    details[2].command_display = @constCast(second);
+
+    // The fixed request says which try it was; the refused ones get no row,
+    // no count, and no "run" of their own.
+    const fixed = try groupTextForTest(alloc, &entries, &details);
+    defer alloc.free(fixed);
+    errdefer std.debug.print("fixed group:\n{s}\n", .{fixed});
+    try std.testing.expect(std.mem.find(u8, fixed, "Ran ls, fx help · 3rd try") != null);
+    try std.testing.expect(std.mem.find(u8, fixed, "Failed") == null);
+    try std.testing.expect(std.mem.find(u8, fixed, "invalid") == null);
+    try std.testing.expect(std.mem.find(u8, fixed, "failed") == null);
+    try std.testing.expect(std.mem.find(u8, fixed, "passed on") == null);
+
+    // A refused request the model did not fix reads as a call it got wrong,
+    // by its steps, without the whole command or the reason.
+    const alone = try groupTextForTest(alloc, entries[0..1], details[0..1]);
+    defer alloc.free(alone);
+    errdefer std.debug.print("alone group:\n{s}\n", .{alone});
+    try std.testing.expectEqualStrings("● Couldn't run ls, fx help", std.mem.trim(u8, alone, "\n"));
+
+    // Before another command, the header counts neither a command nor a
+    // failure for it, as for any call the model got wrong.
+    const other = [_]TranscriptEntry{
+        entries[0],
+        .{ .raw_bytes = .{ .id = 4, .bytes = "● Ran printf done\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 5, .bytes = "  2s", .class = .turn_summary } },
+    };
+    var other_details = [_]ToolDetailRecord{ details[0], storyCommandDetail(4, "{\"action\":\"run\",\"command\":\"printf done\"}", 0, null) };
+    other_details[1].command_display = @constCast("printf done");
+    const before_other = try groupTextForTest(alloc, &other, &other_details);
+    defer alloc.free(before_other);
+    errdefer std.debug.print("before another command:\n{s}\n", .{before_other});
+    try std.testing.expectEqualStrings("● Ran a command ✓", firstLineForTest(before_other));
+    try std.testing.expect(std.mem.find(u8, before_other, "├ Couldn't run ls, fx help") != null);
+    try std.testing.expect(std.mem.find(u8, before_other, "failed") == null);
+
+    // A refused request the turn ended on still shows under collapse, like
+    // any failure a turn ends on; expanded, its row says it.
+    const last = [_]TranscriptEntry{ other[1], entries[0], other[2] };
+    const last_details = [_]ToolDetailRecord{ other_details[1], details[0] };
+    {
+        var collapsed = try buildWithStyleAndStats(alloc, &last, &last_details, 120, null, true, .{}, .{}, .compact, null, null);
+        defer collapsed.deinit(alloc);
+        const header = collapsed.entry_actions.items[0].override.bytes;
+        errdefer std.debug.print("collapsed:\n{s}\n", .{header});
+        try std.testing.expect(std.mem.find(u8, header, "· 1 failed") != null);
+    }
+    const expanded = try groupTextForTest(alloc, &last, &last_details);
+    defer alloc.free(expanded);
+    errdefer std.debug.print("expanded:\n{s}\n", .{expanded});
+    try std.testing.expect(std.mem.find(u8, firstLineForTest(expanded), "failed") == null);
+    // The row the turn ended on says why, as core counted it.
+    try std.testing.expect(std.mem.find(u8, expanded, "└ Couldn't run ls, fx help · 2 invalid fields") != null);
+    try std.testing.expect(std.mem.find(u8, expanded, "Choose either") == null);
+
+    // A refused request the turn ended on, alone, says why on its one row.
+    const alone_last = [_]TranscriptEntry{ entries[1], other[2] };
+    const alone_last_text = try groupTextForTest(alloc, &alone_last, details[1..2]);
+    defer alloc.free(alone_last_text);
+    errdefer std.debug.print("alone, last:\n{s}\n", .{alone_last_text});
+    try std.testing.expectEqualStrings("● Couldn't run ls, fx help · 1 invalid field", firstLineForTest(alone_last_text));
+}
+
 test "repeated runs of one command share a row that keeps the earlier failures" {
     const alloc = std.testing.allocator;
     const args = "{\"action\":\"run\",\"command\":\"sh test.sh\"}";
@@ -7002,6 +7159,26 @@ test "input to a running session and its stop are not new commands" {
     const follow_bytes = follow_ups.entry_actions.items[0].override.bytes;
     try std.testing.expect(std.mem.startsWith(u8, follow_bytes, "● Stopped "));
     try std.testing.expect(std.mem.endsWith(u8, follow_bytes, " · 2 calls ✓") or std.mem.endsWith(u8, follow_bytes, " · 2 calls"));
+}
+
+test "a running toolbox run of an MCP tool joins that tool's row before its arguments arrive" {
+    // Its status names the tool first; its arguments, which name it too,
+    // come later, so it must not show on its own row and fold away.
+    const alloc = std.testing.allocator;
+    const run_args = "{\"run\":\"mcp_fixture_echo\",\"arguments\":{}}";
+    const entries = [_]TranscriptEntry{
+        .{ .raw_bytes = .{ .id = 1, .bytes = "● Ran MCP mcp_fixture_echo\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 2, .bytes = "● Ran MCP mcp_fixture_echo\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 3, .bytes = "● Running MCP mcp_fixture_echo\n", .class = .tool_status } },
+    };
+    const details = [_]ToolDetailRecord{
+        .{ .entry_id = 1, .tool_name = @constCast("toolbox"), .activity_kind = .mcp, .outcome = .completed, .arguments_json = @constCast(run_args) },
+        .{ .entry_id = 2, .tool_name = @constCast("toolbox"), .activity_kind = .mcp, .outcome = .completed, .arguments_json = @constCast(run_args) },
+        .{ .entry_id = 3, .tool_name = @constCast("toolbox"), .activity_kind = .mcp },
+    };
+    const text = try groupTextForTest(alloc, &entries, &details);
+    defer alloc.free(text);
+    try std.testing.expectEqualStrings("● Running MCP mcp_fixture_echo ×3", std.mem.trim(u8, text, "\n"));
 }
 
 test "toolbox lookups and wrapped arguments name what the group did" {

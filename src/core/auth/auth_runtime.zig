@@ -9,6 +9,7 @@ const host = @import("../hosts/host.zig");
 const host_target = @import("../hosts/target.zig");
 const login_flow = @import("login_flow.zig");
 const pending_revocation = @import("pending_revocation.zig");
+const mcp_kept_sign_outs = @import("../mcp_host/kept_sign_outs.zig");
 const oauth_session = @import("oauth_session.zig");
 const oauth = @import("oauth.zig");
 const model_provider = @import("../config/model_provider.zig");
@@ -1091,12 +1092,15 @@ const KeptSignOutRetryTask = struct {
         const codex = chatgpt_oauth.retryKeptSignOuts(alloc, transport.provider(), null);
         const grok = grok_oauth.retryKeptSignOuts(alloc, transport.provider(), null);
         const fx_login = login_flow.retryKeptSignOuts(alloc, transport.provider(), null);
-        if (codex.revoked + grok.revoked + fx_login.revoked == 0 and !(codex.failed or grok.failed or fx_login.failed)) return;
-        debug_trace.logf("auth", "kept sign-outs retried at start codex={d} grok={d} fx_login={d} failed={}", .{
+        const mcp: pending_revocation.RetryOutcome = if (io_mod.homeDir()) |home| mcp_kept_sign_outs.retry(alloc, home, transport.provider(), null) else .{};
+        const failed = codex.failed or grok.failed or fx_login.failed or mcp.failed;
+        if (codex.revoked + grok.revoked + fx_login.revoked + mcp.revoked == 0 and !failed) return;
+        debug_trace.logf("auth", "kept sign-outs retried at start codex={d} grok={d} fx_login={d} mcp={d} failed={}", .{
             codex.revoked,
             grok.revoked,
             fx_login.revoked,
-            codex.failed or grok.failed or fx_login.failed,
+            mcp.revoked,
+            failed,
         });
     }
 
