@@ -12,7 +12,7 @@
 (*                                                                         *)
 (* Rules (Rules = TRUE):                                                   *)
 (*  - fx announces a child before any update of its work, and every       *)
-(*    update and request of the child carries the child's id (X26).       *)
+(*    update and request of the child carries the child's id.             *)
 (*  - session/cancel of a child stops only the child; the parent's turn   *)
 (*    goes on and gets the child's result. Stopping the parent stops its  *)
 (*    children. A stopped child's request is cancelled.                    *)
@@ -274,7 +274,7 @@ Spec == Init /\ [][Next]_vars
 \* The client reads a child's announcement before any of its work.
 AnnouncedFirst == "before_announce" \notin flags
 
-\* Every update and request of a child's work carries the child's id (X26).
+\* Every update and request of a child's work carries the child's id.
 ChildIdUsed == "under_parent" \notin flags
 
 \* A request the client shows is the child's waiting one, or its
