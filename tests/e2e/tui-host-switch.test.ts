@@ -413,10 +413,13 @@ async function withFx(
 // still open: the first turn is shown once above the prompt, saved, and the
 // worker's wait for that save ends without its time limit. The helper's reply
 // comes `reportDelayMs` after main's turn ended, so the report can come after the
-// time limit that counted from the turn's end.
-async function reportWhilePromptStaysOpen(prompt: "approval" | "question", reportDelayMs = 0) {
+// time limit that counted from the turn's end. With `secondReport`, a scout
+// replies `reportDelayMs` after the report's turn ended too, so a second hold
+// begins more than the limit after the first one did.
+async function reportWhilePromptStaysOpen(prompt: "approval" | "question", reportDelayMs = 0, secondReport = false) {
   const promptShown = held();
   const mainTurnEnded = held();
+  const reportTurnEnded = held();
   const reports: string[] = [];
   let writerCalls = 0;
   let tracePath = "";
@@ -440,10 +443,14 @@ async function reportWhilePromptStaysOpen(prompt: "approval" | "question", repor
     if (latest.includes("SWITCH_HELPER_TASK")) {
       return mainTurnEnded.promise.then(() => Bun.sleep(reportDelayMs)).then(() => text("helper_done", "SWITCH_HELPER_DONE"));
     }
+    if (latest.includes("SWITCH_SCOUT_TASK")) {
+      return reportTurnEnded.promise.then(() => Bun.sleep(reportDelayMs)).then(() => text("scout_done", "SWITCH_SCOUT_DONE"));
+    }
     if (!body.includes('"main_w"')) {
       return messageSteps([
         { id: "main_w", agent: "writer", message: "SWITCH_WRITE_TASK", ...(prompt === "approval" ? { profile: "writer" } : {}) },
         { id: "main_h", agent: "helper", message: "SWITCH_HELPER_TASK" },
+        ...(secondReport ? [{ id: "main_s", agent: "scout", message: "SWITCH_SCOUT_TASK" }] : []),
       ]);
     }
     return promptShown.promise.then(() => text("main_one", "SWITCH_MAIN_ONE"));
@@ -466,15 +473,36 @@ async function reportWhilePromptStaysOpen(prompt: "approval" | "question", repor
     // The report turn's answer waits behind the prompt.
     expect(open).not.toContain("SWITCH_MAIN_REPORT_1");
     expect((await session.captureFullScrollback()).split("SWITCH_MAIN_ONE").length - 1).toBe(1);
+
+    if (secondReport) {
+      // The report's turn ends with the prompt still open, and the scout
+      // reports more than the limit after the first hold began. The second
+      // hold has a limit of its own: the commit releases it, and the second
+      // report's request comes while the prompt is still open.
+      const mainWorker = /event=processing_finished turn_id=1 worker=(\w+)/.exec(trace())?.[1];
+      expect(mainWorker).toBeDefined();
+      await until("the report's turn to end", () =>
+        trace().split("\n").filter((line) => line.includes("event=processing_finished") && line.includes(`worker=${mainWorker} `)).length >= 2);
+      reportTurnEnded.release();
+      await until("main's request for the scout's report", () => reports.length >= 2);
+      expect(trace()).not.toContain("event=commit_gate_expired");
+      expect(trace().match(/event=commit_gate_released [^\n]*reason=committed/g)?.length).toBe(2);
+      const second = await session.waitForPane((pane) => pane.includes("SWITCH_MAIN_REPORT_1") && pane.includes(promptText), 15_000);
+      expect(second).not.toContain("SWITCH_MAIN_REPORT_2");
+      expect((await session.captureFullScrollback()).split("SWITCH_MAIN_REPORT_1").length - 1).toBe(1);
+    }
+
     await session.sendKeys("1");
+    const reportTurns = secondReport ? 3 : 2;
     await session.waitForText("SWITCH_MAIN_REPORT_1", 30_000);
-    await until("the writer's report turn", () => reports.length >= 2);
-    await session.waitForText("SWITCH_MAIN_REPORT_2", 30_000);
-    await until("main's three turns saved", () => mainSessionLog(home).filter((line) => line.kind === "turn_committed").length >= 3);
+    await until("the writer's report turn", () => reports.length >= reportTurns);
+    await session.waitForText(`SWITCH_MAIN_REPORT_${reportTurns}`, 30_000);
+    await until(`main's ${reportTurns + 1} turns saved`, () => mainSessionLog(home).filter((line) => line.kind === "turn_committed").length >= reportTurns + 1);
 
     // Nothing of a turn is shown twice.
     const after = await session.captureFullScrollback();
-    for (const marker of ["SWITCH_MAIN_ONE", "SWITCH_MAIN_REPORT_1", "SWITCH_MAIN_REPORT_2"]) {
+    const markers = ["SWITCH_MAIN_ONE", ...Array.from({ length: reportTurns }, (_, i) => `SWITCH_MAIN_REPORT_${i + 1}`)];
+    for (const marker of markers) {
       expect(after.split(marker).length - 1).toBe(1);
     }
 
@@ -4495,15 +4523,25 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
     );
   }
 
-  // A person leaves an approval open for longer than the gate's limit, and the
+  // A person leaves a prompt open for longer than the gate's limit, and the
   // subagent reports after that.
-  for (const seconds of [6, 10]) {
+  for (const [prompt, seconds] of [["approval", 6], ["approval", 10], ["question", 6]] as const) {
     test(
-      `a report ${seconds} s late for main starts its next turn while a subagent's approval stays open`,
+      `a report ${seconds} s late for main starts its next turn while a subagent's ${prompt} stays open`,
       async () => {
-        await reportWhilePromptStaysOpen("approval", seconds * 1000);
+        await reportWhilePromptStaysOpen(prompt, seconds * 1000);
       },
       TIMEOUT,
     );
   }
+
+  // The second report comes more than the limit after the first hold began, so
+  // a hold that kept the first one's time would give up at once.
+  test(
+    "a second report more than the limit after the first hold starts its turn while a subagent's approval stays open",
+    async () => {
+      await reportWhilePromptStaysOpen("approval", 6000, true);
+    },
+    TIMEOUT,
+  );
 });
