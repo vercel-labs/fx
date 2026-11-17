@@ -49,7 +49,7 @@ export function traceObs(records: TraceRecord[], constants: Record<string, Value
 const substitutions: Record<string, string[]> = {
   HostLifecycle: ["Servers", "Project", "Reachable", "NeedsAuth", "MaxReloads", "MaxLeases"],
   Credentials: ["Names", "Faults", "InitKinds", "InitEntries", "InitV1"],
-  SignIn: ["MaxLogins", "MaxHosts", "MaxLeases", "Bridge"],
+  SignIn: ["MaxLogins", "MaxHosts", "MaxLeases", "Bridge", "CheckFirst"],
   ElicitationRouting: ["Versions", "MaxQ", "Slots", "Guard"],
   UrlRetry: ["Urls", "Slots", "MaxCalls", "Guard"],
   MixedBuilds: ["RevokeOnReplay"],

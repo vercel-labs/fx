@@ -514,6 +514,53 @@ test "minimal request validation owns each action's intent" {
     );
 }
 
+test "an empty optional string is refused here, so only the decoder treats one as absent" {
+    const alloc = std.testing.allocator;
+    const plain: MessageInput = .{ .agent = "reviewer", .message = "review this" };
+    var instructions = plain;
+    instructions.instructions = "";
+    try std.testing.expectError(error.InvalidInstructions, validateRequest(alloc, .{ .message = instructions }));
+    var report = plain;
+    report.report = "";
+    try std.testing.expectError(error.InvalidReport, validateRequest(alloc, .{ .message = report }));
+    var model = plain;
+    model.model = "";
+    try std.testing.expectError(error.InvalidModel, validateRequest(alloc, .{ .message = model }));
+    var effort = plain;
+    effort.effort = "";
+    try std.testing.expectError(error.InvalidEffort, validateRequest(alloc, .{ .message = effort }));
+    var profile = plain;
+    profile.profile = "";
+    try std.testing.expectError(error.InvalidProfile, validateRequest(alloc, .{ .message = profile }));
+    // The same holds for an agent: status takes one but does not need it, and
+    // stop and close do need it, so none of the three accepts an empty one here.
+    try std.testing.expectError(error.InvalidAgent, validateRequest(alloc, .{ .status = .{ .agent = "" } }));
+    try std.testing.expectError(error.InvalidAgent, validateRequest(alloc, .{ .stop = .{ .agent = "" } }));
+    try std.testing.expectError(error.InvalidAgent, validateRequest(alloc, .{ .close = .{ .agent = "" } }));
+}
+
+test "a message with no optional fields is planned on every path, and a present one is not" {
+    const alloc = std.testing.allocator;
+    var plain = try validateRequest(alloc, .{ .message = .{ .agent = "reviewer", .message = "next" } });
+    defer plain.deinit(alloc);
+    try std.testing.expect(!plain.override().present());
+    try std.testing.expectEqual(Plan.create_persistent, plan(plain, null));
+    try std.testing.expectEqual(Plan.continue_persistent, plan(plain, .{ .kind = .persistent, .phase = .idle }));
+    try std.testing.expectEqual(Plan.continue_persistent, plan(plain, .{ .kind = .persistent, .phase = .interrupted }));
+    try std.testing.expectEqual(Plan.steer_persistent, plan(plain, .{ .kind = .persistent, .phase = .running }));
+    try std.testing.expectEqual(Plan.steer_persistent, plan(plain, .{ .kind = .persistent, .phase = .awaiting_approval }));
+
+    // What the decoder keeps out of a message that asked for nothing: a child
+    // at work refuses instructions, and an existing child refuses an override
+    // (`Runtime.admitManagedWork`).
+    var instructed = try validateRequest(alloc, .{ .message = .{ .agent = "reviewer", .message = "next", .instructions = "Review strictly." } });
+    defer instructed.deinit(alloc);
+    try std.testing.expectEqual(Plan{ .reject = .child_busy }, plan(instructed, .{ .kind = .persistent, .phase = .running }));
+    var routed = try validateRequest(alloc, .{ .message = .{ .agent = "reviewer", .message = "next", .model = "gpt-5.6-sol-fast" } });
+    defer routed.deinit(alloc);
+    try std.testing.expect(routed.override().present());
+}
+
 test "persistent instruction updates participate in operation identity" {
     const alloc = std.testing.allocator;
     var inherited = try validateRequest(alloc, .{ .message = .{

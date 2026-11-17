@@ -43,6 +43,15 @@ pub const sessions_options = [_]command_specs.OptionDoc{
 
 pub const sessions_convert_options = [_]command_specs.OptionDoc{json_option};
 
+const sessions_subcommands = [_]command_specs.SubcommandDoc{
+    .{ .usage = "ls", .description = "List saved sessions (default)", .options = &sessions_options },
+    .{ .usage = "convert", .description = "Convert every session saved in the previous format", .options = &sessions_convert_options },
+};
+
+const models_subcommands = [_]command_specs.SubcommandDoc{
+    .{ .usage = "ls", .description = "List available models (default)", .options = &.{json_option} },
+};
+
 pub const usage_options = [_]command_specs.OptionDoc{
     .{ .flag = "--period <today|7d|month>", .description = "Select the period, in UTC days (default: month)" },
     json_option,
@@ -53,6 +62,7 @@ pub const usage_options = [_]command_specs.OptionDoc{
 pub const doctor_options = [_]command_specs.OptionDoc{
     json_option,
     .{ .flag = "--fix", .description = "Remove old terminal and side folders whose session is gone" },
+    .{ .flag = "--deep", .description = "Read every saved file of each session checked, with no time limit; slower" },
 };
 
 pub const upgrade_options = [_]command_specs.OptionDoc{
@@ -248,7 +258,8 @@ pub const top_level_specs = [_]TopLevelSpec{
             "The prompt may be passed as arguments or piped on stdin when no prompt args are given.",
             "TTY stdout uses the Minimal transcript presentation; redirected stdout emits raw assistant Markdown.",
             "Operational progress and diagnostics are written to stderr. JSON `output` keeps accumulated assistant Markdown; `final_output` contains only the completed final response, or an empty string when absent.",
-            "JSON usage sums reported main-agent input_tokens and output_tokens, including with --no-save; unreported counts are null. cache_read_tokens and cache_write_tokens appear only when the provider reports them. Nested usage and dollar spend are excluded.",
+            "JSON usage sums reported main-agent input_tokens and output_tokens, including with --no-save; unreported counts are null. cache_read_tokens and cache_write_tokens appear only when the provider reports them. Subagent usage and dollar spend are excluded.",
+            "JSON subagents appears only when a subagent did work in this request. It lists each one in the order it first ran, with its name, id, and usage in the same shape, counted for this request alone. fx session <session_id>/<name> reads one and prints the same id.",
             "--system replaces only the built-in base prompt for this request; tool, skill, project, and runtime context still apply.",
             "With --prompt-permissions, JSON and quiet requests may prompt on stderr only when stdin is a TTY.",
         },
@@ -335,8 +346,9 @@ pub const top_level_specs = [_]TopLevelSpec{
     .{
         .kind = .models,
         .token = "models",
-        .usage = "models [--json]",
+        .usage = "models [ls] [--json]",
         .summary = "List available models",
+        .subcommands = &models_subcommands,
         .options = &.{json_option},
     },
     .{
@@ -348,7 +360,7 @@ pub const top_level_specs = [_]TopLevelSpec{
     .{
         .kind = .doctor,
         .token = "doctor",
-        .usage = "doctor [--json] [--fix]",
+        .usage = "doctor [--json] [--fix] [--deep]",
         .summary = "Check that fx can work here, with a fix for each problem",
         .options = &doctor_options,
     },
@@ -373,9 +385,9 @@ pub const top_level_specs = [_]TopLevelSpec{
     .{
         .kind = .sessions,
         .token = "sessions",
-        .usage = "sessions [--all] [--limit <1-100>] [--cursor <cursor>] [--json] | sessions --live [--all] [--json] | sessions convert [--json]",
+        .usage = "sessions [ls] [--all] [--limit <1-100>] [--cursor <cursor>] [--json] | sessions [ls] --live [--all] [--json] | sessions convert [--json]",
         .summary = "List saved sessions for the current workspace",
-        .subcommands = &.{.{ .usage = "convert", .description = "Convert every session saved in the previous format", .options = &sessions_convert_options }},
+        .subcommands = &sessions_subcommands,
         .options = &sessions_options,
         .details = &.{
             "--live shows each session's state (working, idle, or unknown) and the model saved with it, with its subagents in a tree below it; fx session <id>/<agent> reads one.",

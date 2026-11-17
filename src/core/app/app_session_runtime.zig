@@ -23,10 +23,12 @@ const app_lifecycle = @import("app_lifecycle.zig");
 const app_permission_runtime = @import("app_permission_runtime.zig");
 const provider_runtime = @import("provider_runtime.zig");
 const token_pass = @import("../gateway/token_pass.zig");
+const token_pass_team = @import("../gateway/token_pass_team.zig");
 const input_completion_runtime = @import("input_completion_runtime.zig");
 const image_attachments = @import("../images/image_attachments.zig");
 const core_input_runtime = @import("../input/runtime.zig");
 const io_mod = @import("../shared/io.zig");
+const app_worker_runtime = @import("app_worker_runtime.zig");
 const list_window = @import("../shared/list_window.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const session_runtime = @import("../session/session.zig");
@@ -69,6 +71,7 @@ const operation_control = @import("../mcp/operation_control.zig");
 const shell_runtime = @import("../../ui/shell_runtime.zig");
 const transcript_runtime = @import("../../ui/transcript/runtime.zig");
 const resume_projection = @import("../../ui/transcript/resume_projection.zig");
+const tool_group_projection = @import("../../ui/transcript/tool_group_projection.zig");
 const question_ui = @import("../../ui/footer/question_ui.zig");
 const render_input = @import("../../ui/footer/render_input.zig");
 const ui_input = @import("../../ui/input/runtime.zig");
@@ -871,7 +874,7 @@ pub fn Runtime(comptime App: type) type {
                 error.SessionScrollbackHandoffGeometryChanged => {
                     agent.session_persistence.pending_live_session_policy = null;
                     agent.session_persistence.pending_live_session_wait = null;
-                    app.shell.cancelSessionScrollbackHandoff();
+                    app.shell.cancelSessionScrollbackHandoff("geometry_changed");
                     releaseLiveSessionTransitionHold(app, agent);
                     debug_trace.logf("session", "event=live_session_transition_cancelled reason=scrollback_handoff_geometry_changed", .{});
                     if (comptime @hasDecl(App, "writeDomainNotice")) {
@@ -905,15 +908,36 @@ pub fn Runtime(comptime App: type) type {
             if (agent.session_persistence.pending_live_session_policy == null) return;
             agent.session_persistence.pending_live_session_policy = null;
             agent.session_persistence.pending_live_session_wait = null;
-            app.shell.cancelSessionScrollbackHandoff();
+            try giveUpScrollbackHandoff(app, reason);
             releaseLiveSessionTransitionHold(app, agent);
             debug_trace.logf("session", "event=live_session_transition_cancelled reason={s}", .{reason});
             try app.writeDomainNotice(.{ .topic = "session", .tone = .warning, .body = notice }, true);
         }
 
+        /// Gives up a scrollback handoff that still has rows to write. When
+        /// its frame already pushed some rows into scrollback, the terminal
+        /// is cleared and the transcript printed again, as after a resize, so
+        /// the switch's next handoff does not push those rows a second time.
+        fn giveUpScrollbackHandoff(app: *App, reason: []const u8) !void {
+            if (comptime !@hasField(@TypeOf(app.shell), "pending_session_scrollback_handoff") or !@hasField(App, "metrics")) return;
+            const pending = app.shell.pending_session_scrollback_handoff orelse return;
+            app.shell.cancelSessionScrollbackHandoff(reason);
+            if (pending.remaining_rows < pending.total_rows) {
+                try app.shell.requestTerminalReset(&app.metrics);
+                debug_trace.logf("session", "event=scrollback_handoff_reset reason={s} pushed_rows={d}", .{ reason, pending.total_rows - pending.remaining_rows });
+            }
+        }
+
         pub fn settlePendingLiveSessionTransition(app: *App, agent: *AppAgent) !void {
             if (agent.session_persistence.pending_live_session_policy == null) return;
             const processing = agent.worker.isProcessing();
+            // The handoff goes on only while the agent is idle, and no agent's
+            // transcript can be swapped in until it ends. A turn that starts
+            // meanwhile, such as one a subagent's report starts, would hold
+            // the handoff, and every hidden agent, until it ends, and that
+            // turn may wait on a hidden agent. So the handoff yields; the
+            // change hands the rows off again once the agent is idle.
+            if (processing) try giveUpScrollbackHandoff(app, "agent_busy");
             const now = operation_control.monotonicMillis(io_mod.getIo());
             var wait = agent.session_persistence.pending_live_session_wait orelse if (processing) LiveSessionWait{ .worker = now } else LiveSessionWait{ .geometry = now };
             if (wait == .worker and !processing) wait = .{ .geometry = now };
@@ -1068,7 +1092,7 @@ pub fn Runtime(comptime App: type) type {
 
         fn beginLiveSessionCancellation(app: *App, agent: *AppAgent) void {
             agent.worker.requestCancel();
-            app.pacer.clear(app.alloc);
+            app_worker_runtime.Runtime(App).clearPacer(app, agent, "session_switch");
             if (comptime @hasDecl(App, "clearPendingSubmissionForSessionTransition")) {
                 App.clearPendingSubmissionForSessionTransition(app, agent);
             } else {
@@ -1593,6 +1617,16 @@ pub fn Runtime(comptime App: type) type {
             return v2.saveRecovery(record);
         }
 
+        /// Saves the row of a call a command made through `fx mcp call` in
+        /// the open turn, so a resume shows it in its shell call's group
+        /// (D99). A session that is not saved keeps nothing.
+        pub fn saveBridgeCall(agent: *AppAgent, record: types.BridgeCallRecord) !void {
+            agent.session_persistence.write_mutex.lockUncancelable(io_mod.getIo());
+            defer agent.session_persistence.write_mutex.unlock(io_mod.getIo());
+            const v2 = agent.session_persistence.v2 orelse return;
+            try v2.saveBridgeCall(record);
+        }
+
         /// Record whether restored history references shell execution handles
         /// this process does not own. Registry membership, not the resume
         /// itself, decides staleness (see session_runtime.detectStaleShellHandles).
@@ -2081,11 +2115,23 @@ pub fn Runtime(comptime App: type) type {
             _ = try appendHistoryTurnWithPendingPresentation(app, agent, turn, .strict, null);
         }
 
+        /// Tells the agent's worker that a finished turn is committed, or
+        /// failed to commit, so mail held for it may start the next turn
+        /// (`WorkerRuntime.acknowledgeFinishCommitted`).
+        fn acknowledgeFinishCommitted(agent: *AppAgent) void {
+            if (comptime @hasField(AppAgent, "worker") and
+                @hasDecl(@TypeOf(agent.worker), "acknowledgeFinishCommitted"))
+            {
+                agent.worker.acknowledgeFinishCommitted();
+            }
+        }
+
         pub fn appendFinishedPrompt(
             app: *App,
             agent: *AppAgent,
             finished: types.FinishedPrompt,
         ) !void {
+            defer acknowledgeFinishCommitted(agent);
             var turn = finished.turn;
             if (finished.summary) |summary| {
                 types.setHistoryTurnSummary(&turn, summary);
@@ -2121,13 +2167,17 @@ pub fn Runtime(comptime App: type) type {
             agent: *AppAgent,
             finished: types.FinishedPrompt,
         ) !HistoryAppendOutcome {
-            return appendHistoryTurnWithPendingPresentation(
+            const outcome = try appendHistoryTurnWithPendingPresentation(
                 app,
                 agent,
                 finished.turn,
                 .visual_epoch,
                 finished.snapshot_file_ownership,
             );
+            // An uncommitted turn stays with the pacer, which commits it later
+            // through `appendFinishedPrompt`.
+            if (outcome == .committed) acknowledgeFinishCommitted(agent);
+            return outcome;
         }
 
         const AppendHistoryMode = enum {
@@ -2638,13 +2688,14 @@ pub fn Runtime(comptime App: type) type {
             agent.session_persistence.title_generation.start(task);
         }
 
-        /// The provider's title model, or a Token Pass model when the
-        /// agent's AI Gateway model is a Token Pass model.
+        /// The provider's title model, or a Token Pass model when the team
+        /// has Token Pass and the agent's AI Gateway model is a Token Pass
+        /// model.
         fn titleModelFor(app: *App, agent: *AppAgent, provider_title_model: ?[]const u8) ?[]const u8 {
             const default_model = provider_title_model orelse return null;
             if (comptime !provider_runtime.supported(App)) return default_model;
             if (provider_runtime.providerOf(app, agent) != .gateway) return default_model;
-            return token_pass.modelForSideCall(.title, provider_runtime.modelOf(app, agent), default_model);
+            return token_pass_team.modelForSideCall(.title, provider_runtime.modelOf(app, agent), default_model);
         }
 
         /// Applies a finished background title generation on the main loop.
@@ -3002,6 +3053,17 @@ pub fn Runtime(comptime App: type) type {
                     }
                 }
 
+                fn attachHistoricalBridgeCall(
+                    self: *Self,
+                    entry_id: u32,
+                    tool: []const u8,
+                    outcome: types.ToolOutcomeKind,
+                ) !void {
+                    if (comptime @hasDecl(SinkApp, "attachHistoricalBridgeCall")) {
+                        try self.app.attachHistoricalBridgeCall(entry_id, tool, outcome);
+                    }
+                }
+
                 fn attachHistoricalCommandOutput(self: *Self, entry_id: u32) void {
                     if (comptime @hasDecl(SinkApp, "attachHistoricalCommandOutput")) {
                         self.app.attachHistoricalCommandOutput(entry_id);
@@ -3301,6 +3363,15 @@ pub fn Runtime(comptime App: type) type {
                     try self.projection.attachHistoricalToolCallWithoutResult(entry_id, call);
                 }
 
+                fn attachHistoricalBridgeCall(
+                    self: *Self,
+                    entry_id: u32,
+                    tool: []const u8,
+                    outcome: types.ToolOutcomeKind,
+                ) !void {
+                    try self.projection.attachHistoricalBridgeCall(entry_id, tool, outcome);
+                }
+
                 fn attachHistoricalCommandOutput(self: *Self, entry_id: u32) void {
                     self.projection.attachHistoricalCommandOutput(entry_id);
                 }
@@ -3520,14 +3591,19 @@ pub fn Runtime(comptime App: type) type {
             gop.value_ptr.* = .{ .label = label, .reflow = reflow };
         }
 
-        /// Replays an older compaction cycle of `agent`, whose transcript is
-        /// on screen, from its session log into a detached transcript for
-        /// Ctrl+O: `back` cycles before the held entries, 1 being the newest.
-        /// Reads only that cycle, after finding its start by walking back
-        /// from the cycles already found.
+        /// Reads an older compaction cycle of `agent`, whose transcript is
+        /// on screen, from its session log for Ctrl+O: `back` cycles before
+        /// the held entries, 1 being the newest. Finds where the cycle
+        /// starts here, walking back from the cycles already found, and
+        /// reads only that cycle's turns, on a background thread;
+        /// `pollTranscriptArchive` replays them once they are read. A read of
+        /// the same cycle already running goes on.
         pub fn loadTranscriptArchive(app: *App, agent: *AppAgent, back: u32) !void {
             if (comptime !@hasField(App, "shell") or !@hasDecl(App, "beginResumeProjection")) return error.TranscriptArchiveUnavailable;
             if (back == 0) return error.TranscriptArchiveUnavailable;
+            const read = &agent.session_persistence.transcript_archive_read;
+            const generation = app.shell.transcript_archive_generation;
+            if (read.pendingFor(back, generation)) return;
             const v2 = agent.session_persistence.v2 orelse return error.SessionPersistenceUnavailable;
             const started_ns = io_mod.nanoTimestamp();
             const newest = (try v2.previousCompactionCursor(app.alloc, null)).cursor orelse return error.TranscriptArchiveUnavailable;
@@ -3540,64 +3616,146 @@ pub fn Runtime(comptime App: type) type {
                 cache.damaged_from = null;
                 cache.held_start = if (holds_previous) cache.startOf(1, try v2.previousCompactionCursor(app.alloc, newest)) else newest;
             }
-            // A read that stops at a damaged line still shows what it read.
-            var read_damaged = false;
-            while (true) {
-                while (cache.starts.items.len < back) {
-                    // Below `back`, a u32, so the cast holds.
-                    const next_back: u32 = @intCast(cache.starts.items.len + 1);
-                    const end = (if (next_back == 1) cache.held_start else cache.starts.items[next_back - 2]) orelse
-                        return if (cache.damages(next_back)) error.TranscriptArchiveDamaged else error.TranscriptArchiveUnavailable;
-                    try cache.starts.append(app.alloc, cache.startOf(next_back, try v2.previousCompactionCursor(app.alloc, end)));
-                }
-                const start = cache.starts.items[back - 1];
-
-                var projection = try resume_projection.ResumeProjection.initEmpty(app.alloc, &app.shell, 0, 1);
-                defer projection.deinit();
-                // Apart from the live ids: Ctrl+O joins this cycle to the held entries.
-                projection.runtime.notebook.next_entry_id = transcript_runtime.archiveEntryIdBase(back);
-                var labels = HistoricalSessionLabels{ .workspace_root = app.workspace_root };
-                defer labels.deinit(app.alloc);
-                var sink = DetachedHistorySink(@TypeOf(projection)){
-                    .app = app,
-                    .projection = &projection,
-                    .labels = &labels,
-                };
-                const Visitor = struct {
-                    app: *App,
-                    agent: *AppAgent,
-                    sink: *@TypeOf(sink),
-                    labels: *HistoricalSessionLabels,
-                    has_prior_turns: bool = false,
-
-                    pub fn append(self: *@This(), turn: types.HistoryTurn) !void {
-                        return replayHistoryToSinkIncremental(self.app, self.agent, self.sink, &.{turn}, &self.has_prior_turns, self.labels);
-                    }
-                };
-                var visitor = Visitor{ .app = app, .agent = agent, .sink = &sink, .labels = &labels };
-                if (try v2.visitHistoryCycle(app.alloc, start, &visitor)) read_damaged = true;
-                if (projection.runtime.notebook.entries.items.len == 0) if (start) |empty_start| {
-                    // Two compactions with no turn between leave an empty
-                    // cycle; it is not a page of its own, so the cycle before
-                    // it takes its place. Each skip moves to an older
-                    // compaction line, so this ends.
-                    cache.starts.items[back - 1] = cache.startOf(back, try v2.previousCompactionCursor(app.alloc, empty_start));
-                    cache.starts.shrinkRetainingCapacity(back);
-                    debug_trace.logf("full_transcript_cache", "archive_empty_cycle_skipped back={d}", .{back});
-                    continue;
-                };
-                const archived = try projection.intoArchivedRuntime();
-                const entries = archived.notebook.entries.items.len;
-                const damaged = read_damaged or cache.damages(back);
-                try app.shell.installTranscriptArchive(app.alloc, back, start != null, archived, damaged);
-                debug_trace.logf("full_transcript_cache", "archive_loaded back={d} entries={d} damaged={} us={d}", .{
-                    back,
-                    entries,
-                    damaged,
-                    @divTrunc(io_mod.nanoTimestamp() - started_ns, std.time.ns_per_us),
-                });
-                return;
+            while (cache.starts.items.len < back) {
+                // Below `back`, a u32, so the cast holds.
+                const next_back: u32 = @intCast(cache.starts.items.len + 1);
+                const end = (if (next_back == 1) cache.held_start else cache.starts.items[next_back - 2]) orelse
+                    return if (cache.damages(next_back)) error.TranscriptArchiveDamaged else error.TranscriptArchiveUnavailable;
+                try cache.starts.append(app.alloc, cache.startOf(next_back, try v2.previousCompactionCursor(app.alloc, end)));
             }
+            const start = cache.starts.items[back - 1];
+            const reader = try v2.cycleReader(std.heap.c_allocator);
+            try read.start(reader, .{ .back = back, .start = start, .generation = generation });
+            debug_trace.logf("full_transcript_cache", "archive_read_started back={d} generation={d} find_us={d}", .{
+                back,
+                generation,
+                @divTrunc(io_mod.nanoTimestamp() - started_ns, std.time.ns_per_us),
+            });
+        }
+
+        /// The detached transcript a finished read's turns replay into, a
+        /// few turns per loop turn (`pollTranscriptArchive`).
+        const ArchiveReplay = struct {
+            alloc: Allocator,
+            projection: resume_projection.ResumeProjection,
+            labels: HistoricalSessionLabels,
+            has_prior_turns: bool = false,
+            /// The next turn to replay.
+            next: usize = 0,
+            replay_ns: i128 = 0,
+            /// The longest loop turn spent replaying.
+            longest_slice_ns: i128 = 0,
+
+            fn create(app: *App, back: u32) !*ArchiveReplay {
+                const self = try app.alloc.create(ArchiveReplay);
+                errdefer app.alloc.destroy(self);
+                self.* = .{
+                    .alloc = app.alloc,
+                    .projection = try resume_projection.ResumeProjection.initEmpty(app.alloc, &app.shell, 0, 1),
+                    .labels = .{ .workspace_root = app.workspace_root },
+                };
+                // Apart from the live ids: Ctrl+O joins this cycle to the held entries.
+                self.projection.runtime.notebook.next_entry_id = transcript_runtime.archiveEntryIdBase(back);
+                return self;
+            }
+
+            fn destroy(context: *anyopaque) void {
+                const self: *ArchiveReplay = @ptrCast(@alignCast(context));
+                self.projection.deinit();
+                self.labels.deinit(self.alloc);
+                self.alloc.destroy(self);
+            }
+        };
+
+        /// How long one loop turn replays a read's turns before it lets
+        /// input and painting run; a turn always replays whole.
+        const archive_replay_slice_ns: i128 = 4 * std.time.ns_per_ms;
+
+        /// Replays the cycle a background read of `agent`'s session log
+        /// finished into a detached transcript, a few turns per call, and
+        /// installs it for Ctrl+O once every turn is in. A read that a
+        /// compaction, resume, or drop made stale is dropped. Returns whether
+        /// it installed one.
+        pub fn pollTranscriptArchive(app: *App, agent: *AppAgent) !bool {
+            if (comptime !@hasField(App, "shell") or !@hasDecl(App, "beginResumeProjection")) return false;
+            const read = &agent.session_persistence.transcript_archive_read;
+            if (read.dropIfStale(app.shell.transcript_archive_generation)) return false;
+            const task = read.completed() orelse return false;
+            const back = task.request.back;
+            const outcome = advanceTranscriptArchiveReplay(app, agent, task) catch |err| {
+                read.finish();
+                return err;
+            };
+            switch (outcome) {
+                .replaying => return false,
+                .installed => {
+                    read.finish();
+                    return true;
+                },
+                .empty_cycle_skipped => {
+                    // This read is done, so the next one is not taken for it.
+                    read.finish();
+                    try loadTranscriptArchive(app, agent, back);
+                    return false;
+                },
+            }
+        }
+
+        const ArchiveReplayOutcome = enum { replaying, installed, empty_cycle_skipped };
+
+        /// One loop turn of `pollTranscriptArchive`'s replay of `task`'s
+        /// turns, and the install once they are all in.
+        fn advanceTranscriptArchiveReplay(app: *App, agent: *AppAgent, task: *session_persistence.TranscriptArchiveRead.Task) !ArchiveReplayOutcome {
+            if (task.failure) |err| return err;
+            const back = task.request.back;
+            const cache = &agent.session_persistence.transcript_archive_boundaries;
+            const replay: *ArchiveReplay = if (task.replay) |held| @ptrCast(@alignCast(held.state)) else blk: {
+                const created = try ArchiveReplay.create(app, back);
+                task.replay = .{ .state = created, .deinit_fn = ArchiveReplay.destroy };
+                break :blk created;
+            };
+            var sink = DetachedHistorySink(resume_projection.ResumeProjection){
+                .app = app,
+                .projection = &replay.projection,
+                .labels = &replay.labels,
+            };
+            const slice_started_ns = io_mod.nanoTimestamp();
+            while (replay.next < task.turns.items.len) {
+                try replayHistoryToSinkIncremental(app, agent, &sink, task.turns.items[replay.next..][0..1], &replay.has_prior_turns, &replay.labels);
+                replay.next += 1;
+                if (io_mod.nanoTimestamp() - slice_started_ns >= archive_replay_slice_ns) break;
+            }
+            const slice_ns = io_mod.nanoTimestamp() - slice_started_ns;
+            replay.replay_ns += slice_ns;
+            replay.longest_slice_ns = @max(replay.longest_slice_ns, slice_ns);
+            if (replay.next < task.turns.items.len) return .replaying;
+            const projection = &replay.projection;
+            if (projection.runtime.notebook.entries.items.len == 0) if (task.request.start) |empty_start| {
+                // Two compactions with no turn between leave an empty cycle;
+                // it is not a page of its own, so the cycle before it takes
+                // its place. Each skip moves to an older compaction line, so
+                // this ends.
+                const v2 = agent.session_persistence.v2 orelse return error.SessionPersistenceUnavailable;
+                if (cache.starts.items.len < back) return error.TranscriptArchiveUnavailable;
+                cache.starts.items[back - 1] = cache.startOf(back, try v2.previousCompactionCursor(app.alloc, empty_start));
+                cache.starts.shrinkRetainingCapacity(back);
+                debug_trace.logf("full_transcript_cache", "archive_empty_cycle_skipped back={d}", .{back});
+                return .empty_cycle_skipped;
+            };
+            const archived = try projection.intoArchivedRuntime();
+            const entries = archived.notebook.entries.items.len;
+            // A read that stops at a damaged line still shows what it read.
+            const damaged = task.damaged or cache.damages(back);
+            try app.shell.installTranscriptArchive(app.alloc, back, task.request.start != null, archived, damaged);
+            debug_trace.logf("full_transcript_cache", "archive_loaded back={d} entries={d} damaged={} read_us={d} replay_us={d} longest_slice_us={d}", .{
+                back,
+                entries,
+                damaged,
+                @divTrunc(task.read_ns, std.time.ns_per_us),
+                @divTrunc(replay.replay_ns, std.time.ns_per_us),
+                @divTrunc(replay.longest_slice_ns, std.time.ns_per_us),
+            });
+            return .installed;
         }
 
         /// Whether `agent`'s transcript is the one on the screen's slot: the
@@ -3822,6 +3980,9 @@ pub fn Runtime(comptime App: type) type {
                         if (entry.cancelled_command) |presentation| {
                             try writeCancelledCommandPresentation(app, agent, sink, entry.tool_call.?, presentation, labels);
                         }
+                        if (entry.tool_call) |call| {
+                            try writeBridgeCallRows(app, sink, entry.execution.bridge_calls, call.id);
+                        }
                         switch (entry.terminal_reason) {
                             .cancelled => if (entry.cancelled_command == null and entry.cancellation_origin == .turn) {
                                 try sink.appendTurnCancellation();
@@ -3932,9 +4093,11 @@ pub fn Runtime(comptime App: type) type {
                 for (step.tool_calls) |call| {
                     if (findPersistedToolResult(step.tool_results, call.id)) |result| {
                         try writeCompletedToolResult(app, agent, sink, call, result, labels);
+                        try writeBridgeCallRows(app, sink, execution.bridge_calls, call.id);
                         try writePermissionFeedback(sink, result.permission_feedback);
                     } else {
                         try writeUnreportedToolStatus(app, sink, call);
+                        try writeBridgeCallRows(app, sink, execution.bridge_calls, call.id);
                     }
                 }
 
@@ -4532,6 +4695,25 @@ pub fn Runtime(comptime App: type) type {
             return sink.appendToolStatus(kind, status);
         }
 
+        /// Writes the row of each call that the command of shell call
+        /// `call_id` made through `fx mcp call`, as its live row ended, right
+        /// after the shell call's row, so the two share a group again (D99).
+        fn writeBridgeCallRows(
+            app: *App,
+            sink: anytype,
+            records: []const types.BridgeCallRecord,
+            call_id: []const u8,
+        ) !void {
+            for (records) |record| {
+                if (!std.mem.eql(u8, record.call_id, call_id)) continue;
+                const status = try tooling_presentation.bridgeCallRowSummary(app.alloc, record.tool, record.outcome);
+                defer app.alloc.free(status);
+                const kind = record.outcome.toolOutcome();
+                const entry_id = try writeCompletedToolStatus(sink, kind, status);
+                try sink.attachHistoricalBridgeCall(entry_id, record.tool, kind);
+            }
+        }
+
         fn writeSavedCommandOutput(sink: anytype, output: []const u8) !bool {
             var wrote = false;
             wrote = try writeCommandEnvelope(sink, output, "<stdout>\n", "\n</stdout>", .stdout) or wrote;
@@ -4926,7 +5108,7 @@ pub fn Runtime(comptime App: type) type {
                 },
                 integrations,
                 if (comptime @hasField(App, "permission_engine")) app.permission_engine.rules else .{},
-                if (comptime @hasField(App, "permission_engine")) app_permission_runtime.Runtime(App).grantsOf(app, instance) else &.{},
+                if (comptime @hasField(App, "permission_engine")) app_permission_runtime.Runtime(App).grantsLocked(app, instance) else &.{},
                 permission_state,
                 if (mcp_view) |*view| view else null,
             );
@@ -5358,7 +5540,7 @@ test "session transition retires queued and running compaction only after worker
             worker: worker_runtime.WorkerRuntime = .{},
         } = .{},
         pacer: struct {
-            fn clear(_: *@This(), _: Allocator) void {}
+            pub fn clear(_: *@This(), _: Allocator) void {}
         } = .{},
 
         pub fn agent(self: anytype) @TypeOf(&self.main_agent) {
@@ -6933,6 +7115,126 @@ test "execution replay keeps an inline command preview when its stored output is
     try std.testing.expectEqualStrings("/workspace", app.command_stdout.items);
     try std.testing.expectEqualStrings("warning", app.command_stderr.items);
     try std.testing.expectEqual(@as(usize, 1), app.command_output_flush_count);
+}
+
+/// A step whose command made three calls through `fx mcp call`, two that
+/// worked and one that failed, then read a file, as a resume reads it.
+const BridgeReplayFixture = struct {
+    calls: [2]types.ToolCall = .{
+        .{ .id = "call_pages", .name = "run_command", .arguments_json = "{\"command\":\"sh pages.sh\"}" },
+        .{ .id = "call_read", .name = "read_file", .arguments_json = "{\"path\":\"notes.txt\"}" },
+    },
+    results: [2]types.PersistedToolResult = .{
+        .{
+            .tool_call_id = @constCast("call_pages"),
+            .tool_name = @constCast("run_command"),
+            .status = .success,
+            .output = @constCast("exit_code=0\n<stdout>\ncalls=3\n</stdout>\n"),
+            .output_bytes = 39,
+            .stored_output_bytes = 39,
+        },
+        .{
+            .tool_call_id = @constCast("call_read"),
+            .tool_name = @constCast("read_file"),
+            .status = .success,
+            .output = @constCast("notes"),
+            .output_bytes = 5,
+            .stored_output_bytes = 5,
+        },
+    },
+    bridge_calls: [4]types.BridgeCallRecord = .{
+        .{ .call_id = "call_pages", .request_id = "fx-mcp-call-1", .tool = "mcp_fixture_echo", .outcome = .completed },
+        .{ .call_id = "call_pages", .request_id = "fx-mcp-call-2", .tool = "mcp_fixture_echo", .outcome = .completed },
+        .{ .call_id = "call_pages", .request_id = "fx-mcp-call-3", .tool = "mcp_fixture_echo", .outcome = .failed },
+        // Its shell call is not in the turn, as after a compaction cut it.
+        .{ .call_id = "call_gone", .request_id = "fx-mcp-call-4", .tool = "mcp_fixture_echo", .outcome = .completed },
+    },
+    steps: [1]types.ToolExecutionStep = undefined,
+
+    fn execution(self: *BridgeReplayFixture) types.ExecutionMemory {
+        self.steps[0] = .{ .tool_calls = self.calls[0..], .tool_results = self.results[0..] };
+        return .{ .tool_steps = self.steps[0..], .bridge_calls = self.bridge_calls[0..] };
+    }
+};
+
+test "a resume shows each saved fx mcp call row right after its shell call's row, as it ended (D99)" {
+    const alloc = std.testing.allocator;
+    var app = try TestApp.init(alloc, "/workspace");
+    defer app.deinit();
+    var fixture: BridgeReplayFixture = .{};
+
+    try Runtime(TestApp).writeExecutionHistory(&app, (&app).agent(), fixture.execution());
+
+    const statuses = app.completed_tool_statuses.items;
+    errdefer for (statuses) |status| std.debug.print("row: {s}", .{status});
+    try std.testing.expectEqual(@as(usize, 5), statuses.len);
+    // The test app names every command row the same way.
+    try std.testing.expectEqualStrings("● Ran pwd\n", statuses[0]);
+    for (statuses[1..4], [_][]const u8{ "Ran MCP", "Ran MCP", "Failed" }) |status, label| {
+        const want = try tooling_presentation.formatToolActionValue(alloc, label, "mcp_fixture_echo");
+        defer alloc.free(want);
+        try std.testing.expectEqualStrings(want, std.mem.trimEnd(u8, status, "\n"));
+    }
+    try std.testing.expect(std.mem.startsWith(u8, statuses[4], "● Completed read_file"));
+    try std.testing.expectEqualSlices(
+        types.ToolOutcomeKind,
+        &.{ .completed, .completed, .completed, .failed, .completed },
+        app.completed_tool_outcomes.items,
+    );
+}
+
+test "a resumed fx mcp call row joins its shell call's group with no arguments or result (D99)" {
+    const alloc = std.testing.allocator;
+    var app = try TestApp.init(alloc, "/workspace");
+    defer app.deinit();
+    var source_runtime: transcript_runtime.TranscriptRuntime = .{};
+    defer source_runtime.deinit(alloc);
+    var projection = try resume_projection.ResumeProjection.initEmpty(alloc, &source_runtime, 0, 1);
+    defer projection.deinit();
+    var labels = Runtime(TestApp).HistoricalSessionLabels{ .workspace_root = app.workspace_root };
+    defer labels.deinit(app.alloc);
+    var sink = Runtime(TestApp).DetachedHistorySink(@TypeOf(projection)){
+        .app = &app,
+        .projection = &projection,
+        .labels = &labels,
+    };
+    var fixture: BridgeReplayFixture = .{};
+
+    try Runtime(TestApp).writeExecutionHistoryToSink(&app, (&app).agent(), &sink, fixture.execution(), &labels);
+
+    // Ctrl+O has the row alone: the tool and how it ended, nothing else.
+    var bridged: usize = 0;
+    for (projection.runtime.notebook.tool_details.items) |*detail| {
+        if (!std.mem.eql(u8, detail.tool_name, "mcp_fixture_echo")) continue;
+        bridged += 1;
+        try std.testing.expectEqual(@as(?types.ToolActivityKind, .mcp), detail.activity_kind);
+        try std.testing.expect(detail.arguments_json == null);
+        try std.testing.expect(detail.result == null);
+        try std.testing.expect(detail.origin == .recorded);
+        try std.testing.expect(detail.outcome == .completed or detail.outcome == .failed);
+    }
+    try std.testing.expectEqual(@as(usize, 3), bridged);
+
+    // The compact view counts the calls that worked on one row and gives
+    // the failed one its own, as the live session showed them.
+    var group = try tool_group_projection.buildStyled(
+        alloc,
+        projection.runtime.notebook.entries.items,
+        projection.runtime.notebook.tool_details.items,
+        120,
+        .{},
+        .{},
+    );
+    defer group.deinit(alloc);
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(alloc);
+    for (group.entry_actions.items) |action| switch (action) {
+        .override => |override| try text.appendSlice(alloc, override.bytes),
+        else => {},
+    };
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, text.items, "Ran MCP"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, text.items, "×2"));
+    try std.testing.expect(std.mem.find(u8, text.items, "Couldn't run") != null);
 }
 
 test "execution replay shows the user's steering and not fx's own recovery prompt" {
@@ -11233,4 +11535,62 @@ test "a failed history delivery is kept for shutdown, and later turns still save
     var restored = try reopenSaved(&app);
     defer restored.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 1), restored.history.len);
+}
+
+test "a live session switch drops the finishes it holds, so a later report is not held" {
+    const App = struct {
+        alloc: Allocator = std.heap.c_allocator,
+        main_agent: struct {
+            worker: worker_runtime.WorkerRuntime = .{},
+        } = .{},
+        pacer: @import("../../ui/assistant/pacer.zig").AssistantPacer = .{},
+
+        pub fn agent(self: anytype) @TypeOf(&self.main_agent) {
+            return &self.main_agent;
+        }
+    };
+    const alloc = std.testing.allocator;
+    var app: App = .{};
+    defer app.pacer.deinit(app.alloc);
+    defer app.agent().worker.deinit(alloc);
+    const worker = &app.agent().worker;
+    worker.enableCommitGate();
+
+    // Turn A's finish is in the pacer, and turn B's finish is still queued.
+    const turn: types.HistoryTurn = .{ .assistant = .{ .user = .{ .text = @constCast("prompt") }, .assistant = @constCast("answer") } };
+    try worker.pushEvent(alloc, .{ .finish_prompt = .{ .turn = turn } });
+    var taken = worker.takeEvents();
+    for (taken.items) |event| worker_runtime.freeWorkerEvent(alloc, event);
+    taken.deinit(alloc);
+    try app.pacer.enqueue(app.alloc, "still showing");
+    try std.testing.expect(try app.pacer.deferFinish(app.alloc, .{ .turn = turn }));
+    try worker.pushEvent(alloc, .{ .finish_prompt = .{ .turn = turn } });
+    try std.testing.expectEqual(@as(u32, 2), worker.unacknowledged_finishes);
+
+    // The switch cancels (and clears the pacer), then drops the queued events.
+    Runtime(App).beginLiveSessionCancellation(&app, (&app).agent());
+    try std.testing.expect(app.pacer.deferred_turn == null);
+    try std.testing.expectEqual(@as(u32, 1), worker.unacknowledged_finishes);
+    worker.discardEvents(alloc);
+    try std.testing.expectEqual(@as(u32, 0), worker.unacknowledged_finishes);
+
+    // The new session's first turn finishes and is committed, and a report missed it.
+    worker.worker_processing = true;
+    worker.active_turn_id = 9;
+    worker.direct_steering_closed = true;
+    try worker.pushEvent(alloc, .{ .finish_prompt = .{ .turn = turn } });
+    try worker.postMail(alloc, .{
+        .prompt = try alloc.dupe(u8, "a report"),
+        .images = &.{},
+        .model = try alloc.dupe(u8, "test-model"),
+        .api_key = try alloc.dupe(u8, "test-key"),
+        .permission_mode = .auto,
+        .history = try alloc.alloc(types.HistoryTurn, 0),
+        .grants = try alloc.alloc(types.PermissionGrant, 0),
+    });
+    worker.finishProcessing();
+    worker.acknowledgeFinishCommitted();
+    const work = (try worker.tryTakeNextWork(alloc)) orelse return error.TestExpectedReportToStart;
+    defer worker_runtime.freeWorkItem(alloc, work);
+    try std.testing.expectEqualStrings("a report", work.prompt.prompt);
 }

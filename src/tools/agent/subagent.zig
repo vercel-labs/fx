@@ -161,18 +161,18 @@ fn parseRoot(value: std.json.Value, problem: *Problem) DecodeError!model_contrac
         try rejectOutsideAction(request, &message_fields, problem);
         return .{ .message = .{
             .agent = try requiredString(request, "agent", problem),
-            .instructions = try optionalString(request, "instructions", problem),
+            .instructions = try optionalFilledString(request, "instructions", problem),
             .message = try requiredString(request, "message", problem),
-            .report = try optionalString(request, "report", problem),
-            .model = try optionalString(request, "model", problem),
-            .effort = try optionalString(request, "effort", problem),
-            .profile = try optionalString(request, "profile", problem),
+            .report = try optionalFilledString(request, "report", problem),
+            .model = try optionalFilledString(request, "model", problem),
+            .effort = try optionalFilledString(request, "effort", problem),
+            .profile = try optionalFilledString(request, "profile", problem),
         } };
     }
     if (std.mem.eql(u8, action, "wait")) {
         problem.action = "wait";
         try rejectOutsideAction(request, &wait_fields, problem);
-        if (try optionalString(request, "agent", problem)) |agent| {
+        if (try optionalFilledString(request, "agent", problem)) |agent| {
             debug_trace.logf(
                 "subagent",
                 "wait ignored agent=\"{f}\": wait returns the next report from any subagent",
@@ -184,7 +184,7 @@ fn parseRoot(value: std.json.Value, problem: *Problem) DecodeError!model_contrac
     if (std.mem.eql(u8, action, "status")) {
         problem.action = "status";
         try rejectOutsideAction(request, &status_fields, problem);
-        return .{ .status = .{ .agent = try optionalString(request, "agent", problem) } };
+        return .{ .status = .{ .agent = try optionalFilledString(request, "agent", problem) } };
     }
     if (std.mem.eql(u8, action, "stop")) {
         problem.action = "stop";
@@ -225,6 +225,24 @@ fn optionalString(
     problem.field = key;
     const value = object.get(key) orelse return null;
     return try stringValue(value);
+}
+
+/// An optional string, except that one set to an empty string is absent: it
+/// asks for nothing, so it means the same as a missing key, as an empty field
+/// does on an action that does not take it (`rejectOutsideAction`). Use it for
+/// a field the action takes but does not need: the optional fields of
+/// `message`, and the `agent` of `status` and `wait`. Only zero bytes count, as
+/// in `tool_args.isEmptyArgumentValue`: a field of spaces is text, and
+/// `model_contract.validateRequest` still judges it. Validation and planning
+/// never see an empty optional string, so an empty field never decides what a
+/// message does on a new, idle, or working subagent.
+fn optionalFilledString(
+    object: std.json.ObjectMap,
+    key: []const u8,
+    problem: *Problem,
+) DecodeError!?[]const u8 {
+    const text = try optionalString(object, key, problem) orelse return null;
+    return if (tool_args.isEmptyArgumentValue(.{ .string = text })) null else text;
 }
 
 fn rejectUnknown(
@@ -466,6 +484,7 @@ test "decode ignores empty fields the action does not take" {
     try expectRequestTag("{\"action\":\"wait\",\"message\":\"\",\"instructions\":\"\",\"model\":\"\"}", .wait);
     try expectRequestTag("{\"action\":\"stop\",\"agent\":\"reviewer\",\"message\":\"\",\"report\":false}", .stop);
     try expectRequestTag("{\"action\":\"status\",\"profile\":\"\"}", .status);
+    try expectRequestTag("{\"action\":\"status\",\"agent\":\"\"}", .status);
     // Text, a true flag, or an unknown name still does not belong to the action.
     try expectCorrection("{\"action\":\"wait\",\"message\":\"x\"}", "unknown_field", "message does not apply to wait.");
     try expectCorrection("{\"action\":\"close\",\"agent\":\"reviewer\",\"report\":true}", "unknown_field", "report does not apply to close.");
@@ -474,8 +493,149 @@ test "decode ignores empty fields the action does not take" {
     try expectCorrection("{\"request\":{\"action\":\"wait\"},\"message\":\"\"}", "unknown_field", "message cannot sit beside request");
 }
 
+/// Decodes `args_json`, which must be a request for `action`, and runs `check`
+/// on the request while it is alive. A refusal fails the test with its body in
+/// the string diff, so a failing test shows the code the model would have got.
+fn withRequest(
+    args_json: []const u8,
+    action: model_contract.Action,
+    comptime check: fn (model_contract.Request) anyerror!void,
+) !void {
+    const alloc = std.testing.allocator;
+    const result = try decode(.{ .allocator = alloc }, args_json);
+    switch (result) {
+        .failure => |body| {
+            defer alloc.free(body);
+            try std.testing.expectEqualStrings("a request that decodes", body);
+            return error.TestUnexpectedResult;
+        },
+        .input => |input| {
+            defer input.deinit(alloc);
+            const request = input.as(Input).request;
+            try std.testing.expectEqual(action, request.action());
+            try check(request);
+        },
+    }
+}
+
+fn withMessage(args_json: []const u8, comptime check: fn (model_contract.Request) anyerror!void) !void {
+    return withRequest(args_json, .message, check);
+}
+
+fn checkNoAgent(request: model_contract.Request) anyerror!void {
+    try std.testing.expect(request.agentName() == null);
+}
+
+fn checkAgentIsReviewer(request: model_contract.Request) anyerror!void {
+    try std.testing.expectEqualStrings("reviewer", request.agentName().?);
+}
+
+test "an empty agent on status or wait means no agent, and a required agent is still refused" {
+    // `agent` is optional for status: with none it lists every subagent. An
+    // empty one asks for nothing more, so it is the same call.
+    try withRequest("{\"action\":\"status\"}", .status, checkNoAgent);
+    try withRequest("{\"action\":\"status\",\"agent\":\"\"}", .status, checkNoAgent);
+    try withRequest("{\"request\":{\"action\":\"status\",\"agent\":\"\"}}", .status, checkNoAgent);
+    try withRequest("{\"action\":\"status\",\"agent\":\"reviewer\"}", .status, checkAgentIsReviewer);
+    // `wait` does not check its agent: it ignores a string, whether empty, of
+    // spaces, or not a name. A value that is not a string is refused below.
+    try withRequest("{\"action\":\"wait\",\"agent\":\"\"}", .wait, checkNoAgent);
+    try withRequest("{\"action\":\"wait\",\"agent\":\"  \"}", .wait, checkNoAgent);
+    try withRequest("{\"action\":\"wait\",\"agent\":\"Not A Name\"}", .wait, checkNoAgent);
+    // Where the agent is checked, a field of spaces is not empty and is refused.
+    try expectDecodeFailure("{\"action\":\"status\",\"agent\":\"  \"}", "invalid_agent");
+    try expectDecodeFailure("{\"action\":\"status\",\"agent\":\"Not A Name\"}", "invalid_agent");
+    try expectDecodeFailure("{\"action\":\"message\",\"agent\":\"  \",\"message\":\"next\"}", "invalid_agent");
+    try expectDecodeFailure("{\"action\":\"stop\",\"agent\":\"  \"}", "invalid_agent");
+    try expectDecodeFailure("{\"action\":\"close\",\"agent\":\"  \"}", "invalid_agent");
+    // stop and close need an agent, so an empty one is a mistake.
+    try expectDecodeFailure("{\"action\":\"stop\",\"agent\":\"\"}", "invalid_agent");
+    try expectDecodeFailure("{\"action\":\"close\",\"agent\":\"\"}", "invalid_agent");
+    // A value that is not a string is still refused, as before.
+    try expectDecodeFailure("{\"action\":\"status\",\"agent\":null}", "invalid_field_type");
+    try expectDecodeFailure("{\"action\":\"wait\",\"agent\":7}", "invalid_field_type");
+}
+
+const optional_message_fields = [_][]const u8{ "instructions", "report", "model", "effort", "profile" };
+
+/// No optional field survived decoding, so the message plans as a plain one on
+/// every path: a new subagent, an idle or interrupted one, and one at work.
+/// A present `instructions` would be refused as `child_busy` for a subagent at
+/// work, and any override as `override_after_create` for an existing one
+/// (`Runtime.admitManagedWork`).
+fn checkNoOptionalFields(request: model_contract.Request) anyerror!void {
+    const sent = request.message;
+    try std.testing.expect(sent.instructions == null);
+    try std.testing.expect(sent.report == null);
+    try std.testing.expect(sent.model == null);
+    try std.testing.expect(sent.effort == null);
+    try std.testing.expect(sent.profile == null);
+    try std.testing.expect(!request.override().present());
+    const Plan = model_contract.Plan;
+    try std.testing.expectEqual(Plan.create_persistent, model_contract.plan(request, null));
+    try std.testing.expectEqual(Plan.continue_persistent, model_contract.plan(request, .{ .kind = .persistent, .phase = .idle }));
+    try std.testing.expectEqual(Plan.continue_persistent, model_contract.plan(request, .{ .kind = .persistent, .phase = .interrupted }));
+    try std.testing.expectEqual(Plan.steer_persistent, model_contract.plan(request, .{ .kind = .persistent, .phase = .running }));
+    try std.testing.expectEqual(Plan.steer_persistent, model_contract.plan(request, .{ .kind = .persistent, .phase = .awaiting_approval }));
+}
+
+test "an empty optional field on message means the field is absent, on every path" {
+    const alloc = std.testing.allocator;
+    for (optional_message_fields) |field| {
+        const flat = try alloc.print("{{\"action\":\"message\",\"agent\":\"reviewer\",\"message\":\"next\",\"{s}\":\"\"}}", .{field});
+        defer alloc.free(flat);
+        try withMessage(flat, checkNoOptionalFields);
+        const wrapped = try alloc.print("{{\"request\":{{\"action\":\"message\",\"agent\":\"reviewer\",\"message\":\"next\",\"{s}\":\"\"}}}}", .{field});
+        defer alloc.free(wrapped);
+        try withMessage(wrapped, checkNoOptionalFields);
+    }
+    // Every optional field set at once.
+    try withMessage("{\"action\":\"message\",\"agent\":\"reviewer\",\"instructions\":\"\",\"message\":\"next\",\"report\":\"\",\"model\":\"\",\"effort\":\"\",\"profile\":\"\"}", checkNoOptionalFields);
+}
+
+fn checkToParent(request: model_contract.Request) anyerror!void {
+    try std.testing.expect(request.toParent());
+    try std.testing.expectEqualStrings("done", request.message.message);
+    try std.testing.expect(!request.override().present());
+}
+
+test "a message to the parent with empty optional fields is still only the message" {
+    try withMessage("{\"action\":\"message\",\"agent\":\"parent\",\"message\":\"done\",\"instructions\":\"\",\"report\":\"\",\"model\":\"\",\"effort\":\"\",\"profile\":\"\"}", checkToParent);
+}
+
+fn checkInstructionsAreWhitespace(request: model_contract.Request) anyerror!void {
+    try std.testing.expectEqualStrings("  ", request.message.instructions.?);
+}
+
+fn checkModelIsWhitespace(request: model_contract.Request) anyerror!void {
+    try std.testing.expectEqualStrings("  ", request.message.model.?);
+    try std.testing.expect(request.override().present());
+}
+
+test "a message still refuses what an empty optional field does not excuse" {
+    // An empty or missing agent or message text is a mistake, not an optional field.
+    try expectDecodeFailure("{\"action\":\"message\",\"agent\":\"\",\"message\":\"next\",\"instructions\":\"\",\"model\":\"\"}", "invalid_agent");
+    try expectCorrection("{\"action\":\"message\",\"message\":\"next\",\"model\":\"\"}", "missing_field", "message needs agent and message.");
+    try expectDecodeFailure("{\"action\":\"message\",\"agent\":\"reviewer\",\"message\":\"\",\"model\":\"\"}", "invalid_message");
+    try expectCorrection("{\"action\":\"message\",\"agent\":\"reviewer\",\"effort\":\"\"}", "missing_field", "message needs agent and message.");
+    // A non-empty invalid value is refused beside empty ones, as before.
+    try expectDecodeFailure("{\"action\":\"message\",\"agent\":\"reviewer\",\"message\":\"next\",\"instructions\":\"\",\"report\":\"often\",\"model\":\"\"}", "invalid_report");
+    try expectDecodeFailure("{\"action\":\"message\",\"agent\":\"reviewer\",\"message\":\"next\",\"report\":\"\",\"effort\":\"not an effort!\"}", "invalid_effort");
+    try expectDecodeFailure("{\"action\":\"message\",\"agent\":\"reviewer\",\"message\":\"next\",\"profile\":\"\",\"model\":\"x\\u0000y\"}", "invalid_model");
+    try expectDecodeFailure("{\"action\":\"message\",\"agent\":\"reviewer\",\"message\":\"next\",\"model\":\"\",\"profile\":\"Not A Name\"}", "invalid_profile");
+    // Empty means no bytes. A field of spaces is text: where a present value is
+    // refused today it is still refused, and elsewhere it is still kept.
+    try expectDecodeFailure("{\"action\":\"message\",\"agent\":\"reviewer\",\"message\":\"next\",\"effort\":\"  \"}", "invalid_effort");
+    try expectDecodeFailure("{\"action\":\"message\",\"agent\":\"reviewer\",\"message\":\"next\",\"report\":\"  \"}", "invalid_report");
+    try expectDecodeFailure("{\"action\":\"message\",\"agent\":\"reviewer\",\"message\":\"next\",\"profile\":\"  \"}", "invalid_profile");
+    try withMessage("{\"action\":\"message\",\"agent\":\"reviewer\",\"message\":\"next\",\"instructions\":\"  \"}", checkInstructionsAreWhitespace);
+    try withMessage("{\"action\":\"message\",\"agent\":\"reviewer\",\"message\":\"next\",\"model\":\"  \"}", checkModelIsWhitespace);
+    // A message to the parent that carries a real field is still refused.
+    try expectDecodeFailure("{\"action\":\"message\",\"agent\":\"parent\",\"message\":\"done\",\"instructions\":\"\",\"effort\":\"high\"}", "invalid_parent_message");
+}
+
 test "decode rejects invalid creation overrides and report rules" {
-    try expectDecodeFailure("{\"request\":{\"action\":\"message\",\"agent\":\"reviewer\",\"message\":\"do it\",\"model\":\"\"}}", "invalid_model");
+    try expectDecodeFailure("{\"request\":{\"action\":\"message\",\"agent\":\"reviewer\",\"message\":\"do it\",\"model\":\"x\\u0000y\"}}", "invalid_model");
     try expectDecodeFailure("{\"request\":{\"action\":\"message\",\"agent\":\"reviewer\",\"message\":\"do it\",\"effort\":\"not an effort!\"}}", "invalid_effort");
     try expectDecodeFailure("{\"request\":{\"action\":\"message\",\"agent\":\"reviewer\",\"message\":\"next\",\"model\":7}}", "invalid_field_type");
     try expectDecodeFailure("{\"request\":{\"action\":\"message\",\"agent\":\"reviewer\",\"message\":\"do it\",\"provider\":\"gateway\"}}", "unknown_field");
