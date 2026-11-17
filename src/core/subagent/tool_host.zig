@@ -4265,39 +4265,36 @@ const FaultAllocator = struct {
 };
 
 /// A host whose allocations, and its owner's, fail at one index of the
-/// calling thread's: `arm` installs the failing allocator and `disarm` puts the
-/// host's own back. `deinit` disarms and frees the host, and may be called
-/// earlier to end it before a restart.
+/// calling thread's. `install` puts the fault allocator in place once, before
+/// any slot thread of the host runs and with no allocation set to fail, so no
+/// field the slot threads read is written again: `arm` and `disarm` only set
+/// `fail_at`, `count` and `fired`, which `FaultAllocator.alloc` reads only on
+/// the thread that made it. `deinit` frees the host, and may be called earlier
+/// to end it before a restart.
 const FaultedHost = struct {
     runtime: ?*Runtime,
     fault: FaultAllocator,
-    original: Allocator,
-    original_owner: Allocator,
 
-    fn init(runtime: *Runtime) FaultedHost {
-        return .{
+    fn install(self: *FaultedHost, runtime: *Runtime) void {
+        self.* = .{
             .runtime = runtime,
             .fault = .{ .backing = std.testing.allocator, .thread = std.Thread.getCurrentId() },
-            .original = runtime.alloc,
-            .original_owner = runtime.managed.alloc,
         };
-    }
-
-    fn arm(self: *FaultedHost, fail_at: usize) void {
-        const runtime = self.runtime.?;
-        self.fault.fail_at = fail_at;
         runtime.alloc = self.fault.allocator();
         runtime.managed.alloc = self.fault.allocator();
     }
 
+    fn arm(self: *FaultedHost, fail_at: usize) void {
+        self.fault.count = 0;
+        self.fault.fired = false;
+        self.fault.fail_at = fail_at;
+    }
+
     fn disarm(self: *FaultedHost) void {
-        const runtime = self.runtime orelse return;
-        runtime.alloc = self.original;
-        runtime.managed.alloc = self.original_owner;
+        self.fault.fail_at = std.math.maxInt(usize);
     }
 
     fn deinit(self: *FaultedHost) void {
-        self.disarm();
         if (self.runtime) |runtime| runtime.deinit();
         self.runtime = null;
     }
@@ -4673,7 +4670,8 @@ fn sweepStart(create: bool, fail_at: usize) !bool {
     var fixture = MailboxFixture{};
     defer fixture.deinit();
     const runtime = try mailboxRuntime(alloc, &fixture, &parent);
-    var faulted = FaultedHost.init(runtime);
+    var faulted: FaultedHost = undefined;
+    faulted.install(runtime);
     defer faulted.deinit();
     var reports_before: usize = 0;
     if (!create) {
@@ -4742,7 +4740,8 @@ fn sweepUnrecorded(fail_at: usize, stuck: *usize) !bool {
     var fixture = MailboxFixture{};
     defer fixture.deinit();
     const runtime = try mailboxRuntime(alloc, &fixture, &parent);
-    var faulted = FaultedHost.init(runtime);
+    var faulted: FaultedHost = undefined;
+    faulted.install(runtime);
     defer faulted.deinit();
 
     start_test_controls.test_fail_spawn = true;
@@ -4871,7 +4870,8 @@ fn sweepTurnWork(fail_at: usize) !bool {
     var fixture = MailboxFixture{};
     defer fixture.deinit();
     const runtime = try mailboxRuntime(alloc, &fixture, &parent);
-    var faulted = FaultedHost.init(runtime);
+    var faulted: FaultedHost = undefined;
+    faulted.install(runtime);
     defer faulted.deinit();
     _ = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "first" } }, "call-0", null);
     try waitUntilQuiet(runtime);
