@@ -4445,6 +4445,9 @@ test "a message that waited for the user's turn and could not start is reported 
     try expectBodyHas(line, "reviewer call-2 ");
     try expectBodyHas(line, " failed " ++ start_failed_report_text);
     try std.testing.expect(fixture.ends.items[1].started_by == .parent);
+    // The report was the call's last use: no call stays tied to a work that
+    // never began.
+    try std.testing.expectEqual(@as(usize, 0), runtime.work_calls.items.len);
     const state = try reviewerPhase(runtime, arena);
     try std.testing.expectEqual(child_state.Phase.idle, state.phase);
     try std.testing.expectEqual(@as(?child_state.Outcome, .failed), state.outcome);
@@ -4517,6 +4520,92 @@ test "each report of a waiting message that could not start says its subagent is
         try expectAt(if (idle) "a report whose idle flag is set" else "a report whose idle flag is clear", "does not say the subagent is idle", if (idle or std.mem.find(u8, line, "is idle") == null) "does not say the subagent is idle" else line);
         try expectBodyHas(line, start_failed_report_text);
     }
+}
+
+/// Where the test below sends a message: after a waiting message's failed
+/// start is ended, before its report is built.
+const WindowSend = struct {
+    var runtime: ?*Runtime = null;
+    var arena: ?Allocator = null;
+    var answer: []const u8 = "";
+    var calls: usize = 0;
+
+    fn hook(_: []const u8) void {
+        calls += 1;
+        if (calls != 1) return;
+        // The next waiting message may start now.
+        start_test_controls.test_fail_spawn = false;
+        answer = callTool(runtime.?, arena.?, .{ .message = .{ .agent = "reviewer", .message = "in the window" } }, "call-3", null) catch "";
+    }
+};
+
+test "a message sent after a waiting message's failed start was ended waits for the next start" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var parent: child_state.TestParent = undefined;
+    try parent.init(alloc);
+    defer parent.deinit();
+    var fixture = MailboxFixture{};
+    defer fixture.deinit();
+    const runtime = try mailboxRuntime(alloc, &fixture, &parent);
+    defer runtime.deinit();
+
+    _ = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "working" } }, "call-1", null);
+    try waitUntilQuiet(runtime);
+    const child_id = try reviewerId(runtime, arena);
+    const work_id = runtime.beginUserWork(alloc, child_id, null).?;
+    defer alloc.free(work_id);
+    const queued = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "after the user" } }, "call-2", null);
+    try expectBodyHas(queued, "is busy");
+
+    WindowSend.runtime = runtime;
+    WindowSend.arena = arena;
+    WindowSend.answer = "";
+    WindowSend.calls = 0;
+    start_test_controls.test_failed_start_ended = WindowSend.hook;
+    defer start_test_controls.test_failed_start_ended = null;
+    start_test_controls.test_fail_spawn = true;
+    defer start_test_controls.test_fail_spawn = false;
+    runtime.endUserWork(child_id, work_id, .completed, "");
+    try waitUntilQuiet(runtime);
+
+    // The child is still marked busy where the failed start's report is built,
+    // so the message waits behind it and then starts as the next work.
+    try expectBodyHas(WindowSend.answer, "is busy");
+    try std.testing.expectEqual(@as(usize, 3), fixture.reportCount());
+    try expectBodyHas(fixture.reports.items[1], "reviewer call-2 ");
+    try expectBodyHas(fixture.reports.items[1], " failed " ++ start_failed_report_text);
+    try expectBodyHas(fixture.reports.items[2], "reviewer call-3 ");
+    try expectBodyHas(fixture.reports.items[2], " completed DONE in the window");
+}
+
+test "a failed start is ended only for the work it was told of" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var parent: child_state.TestParent = undefined;
+    try parent.init(alloc);
+    defer parent.deinit();
+    var fixture = MailboxFixture{ .hold = true };
+    defer fixture.deinit();
+    const runtime = try mailboxRuntime(alloc, &fixture, &parent);
+    defer runtime.deinit();
+
+    _ = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "first" } }, "call-1", null);
+    try waitForRuns(&fixture, 1);
+    const child_id = try reviewerId(runtime, arena);
+    // The child runs a work the caller did not name, so nothing is ended.
+    try std.testing.expect(runtime.managed.endUnstarted(child_id, "a-work-it-does-not-run", error.ThreadSpawnFailed, false) == null);
+    const during = try reviewerPhase(runtime, arena);
+    try std.testing.expect(during.has_work);
+    try std.testing.expectEqual(child_state.Phase.running, during.phase);
+    fixture.release.set(io_mod.getIo());
+    try waitUntilQuiet(runtime);
+    try std.testing.expectEqual(@as(usize, 1), fixture.reportCount());
+    try expectBodyHas(fixture.reports.items[0], " completed DONE first");
 }
 
 fn expectCloseInReportWindow(by: Runtime.CloseBy) !void {
