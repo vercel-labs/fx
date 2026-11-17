@@ -117,6 +117,9 @@ const racy_ms: i64 = 2 * std.time.ms_per_s;
 const future_ms: i64 = std.time.ms_per_day;
 /// `usage` is no cache past this size.
 const max_usage_bytes = 1 << 20;
+/// A journal over this size is rotated to `evictions.jsonl.1` before the
+/// next line is appended, so it never grows without a bound.
+const max_journal_bytes: u64 = 1 << 20;
 /// Files count in whole blocks of this size.
 const block_bytes: u64 = 4096;
 /// Hex digits in a session or store key (`capture_store.sessionKey`).
@@ -204,8 +207,9 @@ pub const Admission = struct {
     maintained: bool = false,
     evicted: []const Eviction = &.{},
     /// From `check` only: `admit` should run, off the turn. Set over the
-    /// budget once maintenance is due, and when the measure ran out of
-    /// time, so `admit`'s longer deadline measures and saves it.
+    /// budget once maintenance is due, when the measure ran out of time, so
+    /// `admit`'s longer deadline measures and saves it, and when a store has
+    /// enough loose objects to pack.
     due: bool = false,
 };
 
@@ -224,9 +228,54 @@ pub fn check(arena: Allocator, config: Config) Allocator.Error!Admission {
 /// so it never runs on a turn: `check` first. Memory belongs to `arena`.
 pub fn admit(arena: Allocator, config: Config) Allocator.Error!Admission {
     return switch (try measureNow(arena, config)) {
-        .decided => |admission| admission,
+        .decided => |admission| if (admission.admit) packLooseStores(arena, io_mod.getIo(), config, admission) else admission,
         .due => |over| maintain(arena, io_mod.getIo(), config, over.captures, over.usage_path, over.usage),
     };
+}
+
+/// Packs every store with `config.repack_loose` loose objects or more
+/// while the space is under the budget, so a later `check` stays
+/// quick. Another process's maintenance leaves it to that process.
+/// Returns `admission` with the space measured after the packs.
+fn packLooseStores(arena: Allocator, io: std.Io, config: Config, admission: Admission) Allocator.Error!Admission {
+    const captures = try std.Io.Dir.path.join(arena, &.{ config.profile_root, "captures" });
+    if (!capture_store.exists(io, captures)) return admission;
+    const lock_path = try std.Io.Dir.path.join(arena, &.{ captures, "maintenance.lock" });
+    const lock = std.Io.Dir.createFileAbsolute(io, lock_path, .{ .truncate = false, .read = true }) catch |err| {
+        capture_store.keepCancel(io, err);
+        return admission;
+    };
+    defer lock.close(io);
+    if (!(lock.tryLock(io, .exclusive) catch |err| refused: {
+        capture_store.keepCancel(io, err);
+        break :refused false;
+    })) return admission;
+    removeStaleUsageTemps(io, captures, config.now_ms);
+    const ready = switch (try safe_git.prepareStore(arena, .{ .deadline = config.deadline })) {
+        .ready => |value| value,
+        .refused => return admission,
+    };
+    const pass: Pass = .{
+        .arena = arena,
+        .io = io,
+        .ready = ready,
+        .stores = try capture_store.listStoreDirs(arena, io, captures),
+        .journal = try std.Io.Dir.path.join(arena, &.{ captures, "evictions.jsonl" }),
+        .now_ms = config.now_ms,
+        .deadline = config.deadline,
+        .cancel = config.cancel,
+    };
+    if (!try pass.packLoose(config.deadline, config.repack_loose)) return admission;
+    const usage_path = try std.Io.Dir.path.join(arena, &.{ captures, "usage" });
+    const cached = try readUsage(arena, io, usage_path, config.now_ms);
+    const fresh = try refresh(arena, io, captures, cached, config.now_ms, config.deadline) orelse return admission;
+    var usage = fresh.usage;
+    usage.maintained_ms = if (cached) |value| value.maintained_ms else 0;
+    writeUsage(arena, io, usage_path, usage, config.now_ms);
+    var measured = admission;
+    measured.used = usage.total;
+    measured.due = false;
+    return measured;
 }
 
 /// What measuring decided: an admission, or the measure over the budget
@@ -250,7 +299,13 @@ fn measureNow(arena: Allocator, config: Config) Allocator.Error!Measured {
     var usage = fresh.usage;
     usage.maintained_ms = if (cached) |value| value.maintained_ms else 0;
     if (fresh.changed) writeUsage(arena, io, usage_path, usage, config.now_ms);
-    if (usage.total <= config.budget) return .{ .decided = .{ .admit = true, .used = usage.total } };
+    // A store with many loose objects makes every later measure walk
+    // them all, so it is packed off the turn even below the budget.
+    var pack_due = false;
+    for (fresh.walked) |store| {
+        if (try countLoose(arena, io, store, config.repack_loose) >= config.repack_loose) pack_due = true;
+    }
+    if (usage.total <= config.budget) return .{ .decided = .{ .admit = true, .used = usage.total, .due = pack_due } };
     // Maintenance that could not get under the budget is not retried until
     // the interval has passed.
     if (maintainedWithin(config.now_ms, usage.maintained_ms)) return .{ .decided = .{ .admit = false, .refusal = .over_budget, .used = usage.total } };
@@ -273,27 +328,20 @@ fn halted(io: std.Io, config: Config) ?Stop {
     return null;
 }
 
-/// Hands a cancel that a helper swallowed back to the task, so its next
-/// step, such as a git run, sees it too. Without this, a cancel that lands
-/// while maintenance reads a folder or a file is lost, and
-/// `turn_capture.finishMaintenance` waits for it to reach its deadline.
-fn keepCancel(io: std.Io, err: anyerror) void {
-    if (err == error.Canceled) io.recancel();
-}
-
 fn maintain(arena: Allocator, io: std.Io, config: Config, captures: []const u8, usage_path: []const u8, measured: Usage) Allocator.Error!Admission {
     // One maintenance per profile; another process's leaves this capture out.
     const lock_path = try std.Io.Dir.path.join(arena, &.{ captures, "maintenance.lock" });
     const lock = std.Io.Dir.createFileAbsolute(io, lock_path, .{ .truncate = false, .read = true }) catch |err| {
-        keepCancel(io, err);
+        capture_store.keepCancel(io, err);
         debug_trace.logf("workspace", "event=workspace_capture_maintenance_failed reason=lock_unavailable", .{});
         return .{ .admit = false, .refusal = .maintenance_failed, .used = measured.total };
     };
     defer lock.close(io);
     if (!(lock.tryLock(io, .exclusive) catch |err| refused: {
-        keepCancel(io, err);
+        capture_store.keepCancel(io, err);
         break :refused false;
     })) return .{ .admit = false, .refusal = .busy, .used = measured.total };
+    removeStaleUsageTemps(io, captures, config.now_ms);
     // The interval was decided on `usage` as read before the lock; another
     // process's maintenance may have finished since.
     if (try readUsage(arena, io, usage_path, config.now_ms)) |latest| {
@@ -327,6 +375,12 @@ fn maintain(arena: Allocator, io: std.Io, config: Config, captures: []const u8, 
     if (try pass.finishPrunes(partway(io, config.deadline, prune_share_percent))) {
         if (try refresh(arena, io, captures, usage, config.now_ms, config.deadline)) |fresh| usage = fresh.usage else stopped = .measure_failed;
     }
+    // A store that could not be pruned frees nothing until it is, so evicting
+    // more of its sessions would only lose captures.
+    var prune_pending: std.ArrayList(usize) = .empty;
+    for (pass.stores, 0..) |store, index| {
+        if (capture_store.exists(io, try markerPath(arena, store))) try prune_pending.append(arena, index);
+    }
     // A pack frees space without losing a capture, so it comes before any
     // eviction. Only the stores packed are walked again.
     if (stopped == null) stopped = halted(io, config);
@@ -349,7 +403,15 @@ fn maintain(arena: Allocator, io: std.Io, config: Config, captures: []const u8, 
                 stopped = why;
                 break;
             }
-            if (!candidate.orphan and config.sessions.busy(config.sessions.ctx, candidate.key)) continue;
+            var pending = false;
+            for (candidate.refs.items) |ref| {
+                if (std.mem.findScalar(usize, prune_pending.items, ref.store) != null) pending = true;
+            }
+            if (pending) {
+                debug_trace.logf("workspace", "event=workspace_capture_eviction_skipped session_key={s} reason=prune_pending", .{candidate.key});
+                continue;
+            }
+            if (config.sessions.busy(config.sessions.ctx, candidate.key)) continue;
             const result = try pass.evict(candidate);
             if (result.eviction) |eviction| try evicted.append(arena, eviction);
             stopped = result.stopped;
@@ -362,6 +424,12 @@ fn maintain(arena: Allocator, io: std.Io, config: Config, captures: []const u8, 
             }).usage;
         }
     }
+    // A lock wait the cancel flag ended says nothing about a prune or a
+    // measure, so maintenance that stopped while the flag was set counts as
+    // cancelled, and the next capture starts it again.
+    if (stopped != null) if (config.cancel) |flag| if (flag.load(.acquire)) {
+        stopped = .cancelled;
+    };
     if (stopped) |why| debug_trace.logf("workspace", "event=workspace_capture_maintenance_stopped reason={s} used={d}", .{ @tagName(why), usage.total });
     // The last measure that succeeded. A cancelled maintenance keeps the
     // time of the one before, so the next capture can start it again.
@@ -407,7 +475,7 @@ const Pass = struct {
         for (pass.stores) |store| {
             if (pass.cancelled()) break;
             if (!capture_store.exists(pass.io, try markerPath(pass.arena, store))) continue;
-            if (try collect(pass.arena, pass.io, pass.ready, store, deadline)) pruned = true;
+            if (try collect(pass.arena, pass.io, pass.ready, store, deadline, pass.cancel)) pruned = true;
         }
         return pruned;
     }
@@ -420,7 +488,7 @@ const Pass = struct {
             if (pass.cancelled() or capture_store.pastDeadline(pass.io, deadline)) break;
             if (try countLoose(pass.arena, pass.io, store, threshold) < threshold) continue;
             ran = true;
-            _ = try pack(pass.arena, pass.io, pass.ready, store, deadline);
+            _ = try pack(pass.arena, pass.io, pass.ready, store, deadline, pass.cancel);
         }
         return ran;
     }
@@ -457,7 +525,7 @@ const Pass = struct {
         // The intent is recorded before any ref goes; a failed record stops
         // maintenance.
         appendJournal(arena, pass.io, pass.journal, line) catch |err| {
-            keepCancel(pass.io, err);
+            capture_store.keepCancel(pass.io, err);
             return .{ .stopped = .journal_failed };
         };
         var deleted: usize = 0;
@@ -477,7 +545,7 @@ const Pass = struct {
         done.refs = deleted;
         done.kept = candidate.refs.items.len - deleted;
         const recorded = if (appendJournal(arena, pass.io, pass.journal, done)) true else |err| unrecorded: {
-            keepCancel(pass.io, err);
+            capture_store.keepCancel(pass.io, err);
             break :unrecorded false;
         };
         var result: Evicted = .{};
@@ -497,9 +565,9 @@ const Pass = struct {
             const store = pass.stores[index];
             if (std.mem.findScalar(usize, left.items, index) == null) {
                 if (std.mem.findScalar(usize, created.items, index) != null) {
-                    std.Io.Dir.deleteFileAbsolute(pass.io, try markerPath(arena, store)) catch |err| keepCancel(pass.io, err);
+                    std.Io.Dir.deleteFileAbsolute(pass.io, try markerPath(arena, store)) catch |err| capture_store.keepCancel(pass.io, err);
                 }
-            } else if (!try collect(arena, pass.io, pass.ready, store, pass.deadline)) {
+            } else if (!try collect(arena, pass.io, pass.ready, store, pass.deadline, pass.cancel)) {
                 result.stopped = .prune_failed;
                 return result;
             }
@@ -515,26 +583,26 @@ fn markerPath(arena: Allocator, store_dir: []const u8) Allocator.Error![]const u
 const Marked = enum { created, existed, failed };
 
 /// Writes the store's `prune_marker` and syncs it, and says whether this
-/// call created it.
+/// call created it. A symlink at the marker path is never followed.
 fn mark(arena: Allocator, io: std.Io, store_dir: []const u8) Allocator.Error!Marked {
     const path = try markerPath(arena, store_dir);
     var result: Marked = .created;
     const file = std.Io.Dir.createFileAbsolute(io, path, .{ .exclusive = true, .permissions = .fromMode(0o600) }) catch |err| switch (err) {
         error.PathAlreadyExists => existing: {
             result = .existed;
-            break :existing std.Io.Dir.createFileAbsolute(io, path, .{ .truncate = false, .permissions = .fromMode(0o600) }) catch |existing_err| {
-                keepCancel(io, existing_err);
+            break :existing io_mod.openExistingRegularFile(std.Io.Dir.cwd(), path, .read_only) catch |existing_err| {
+                capture_store.keepCancel(io, existing_err);
                 return .failed;
             };
         },
         else => {
-            keepCancel(io, err);
+            capture_store.keepCancel(io, err);
             return .failed;
         },
     };
     defer file.close(io);
     file.sync(io) catch |err| {
-        keepCancel(io, err);
+        capture_store.keepCancel(io, err);
         return .failed;
     };
     return result;
@@ -557,13 +625,16 @@ const Candidate = struct {
 };
 
 /// Every session with captures, but `current_key`'s, with its refs. A store
-/// whose refs cannot be listed offers none.
+/// whose refs cannot be listed offers none, and the trace names it.
 fn inventory(arena: Allocator, ready: safe_git.StoreReady, stores: []const []const u8, current_key: []const u8, limits: safe_git.Limits) Allocator.Error![]Candidate {
     var by_key: std.StringArrayHashMapUnmanaged(Candidate) = .empty;
     for (stores, 0..) |store, index| {
         const listing = switch (try capture_store.storeOutput(arena, ready, try capture_store.refStore(arena, store), .list_refs, limits)) {
             .ok => |stdout| stdout,
-            .failed => continue,
+            .failed => |failure| {
+                debug_trace.logf("workspace", "event=workspace_capture_inventory_skipped store={s} failure={s}", .{ store, @tagName(failure) });
+                continue;
+            },
         };
         var lines = std.mem.splitScalar(u8, listing, '\n');
         while (lines.next()) |line| {
@@ -614,10 +685,10 @@ fn isLowerHex(text: []const u8, len: usize) bool {
 /// Packs and prunes one store under all its capture locks, with the capture
 /// indexes deleted first, and removes its `prune_marker`. False when a lock
 /// stayed held or git failed; the store is then left unpruned.
-fn collect(arena: Allocator, io: std.Io, ready: safe_git.StoreReady, store_dir: []const u8, deadline: std.Io.Clock.Timestamp) Allocator.Error!bool {
+fn collect(arena: Allocator, io: std.Io, ready: safe_git.StoreReady, store_dir: []const u8, deadline: std.Io.Clock.Timestamp, cancel: ?*const std.atomic.Value(bool)) Allocator.Error!bool {
     var locks: std.ArrayList(std.Io.File) = .empty;
     defer for (locks.items) |file| file.close(io);
-    const names = try lockStore(arena, io, &locks, store_dir, deadline) orelse return false;
+    const names = try lockStore(arena, io, &locks, store_dir, deadline, cancel) orelse return false;
     // No capture writes an object from here until the locks go, so the
     // prune takes only objects older than this.
     const locked_unix_seconds = @divFloor(io_mod.milliTimestamp(), std.time.ms_per_s);
@@ -625,17 +696,18 @@ fn collect(arena: Allocator, io: std.Io, ready: safe_git.StoreReady, store_dir: 
     for (names) |name| {
         const index = try std.Io.Dir.path.join(arena, &.{ worktrees, name, capture_store.worktree_index_name });
         std.Io.Dir.deleteFileAbsolute(io, index) catch |err| switch (err) {
-            error.FileNotFound => {},
+            error.FileNotFound => continue,
             else => {
-                keepCancel(io, err);
+                capture_store.keepCancel(io, err);
                 return false;
             },
         };
+        debug_trace.logf("workspace", "event=workspace_capture_index_dropped store={s} worktree={s} reason=prune", .{ store_dir, name });
     }
-    switch (try capture_store.storeOutput(arena, ready, try capture_store.refStore(arena, store_dir), gcCommand(locked_unix_seconds), .{ .deadline = deadline })) {
+    switch (try capture_store.storeOutput(arena, ready, try capture_store.refStore(arena, store_dir), gcCommand(locked_unix_seconds), .{ .deadline = deadline, .cancel = cancel })) {
         .ok => {
             // A marker left behind only costs the next maintenance a prune.
-            std.Io.Dir.deleteFileAbsolute(io, try markerPath(arena, store_dir)) catch |err| keepCancel(io, err);
+            std.Io.Dir.deleteFileAbsolute(io, try markerPath(arena, store_dir)) catch |err| capture_store.keepCancel(io, err);
             return true;
         },
         .failed => |failure| {
@@ -656,11 +728,11 @@ fn gcCommand(locked_unix_seconds: i64) safe_git.StoreCommand {
 /// Packs one store's loose objects under all its capture locks; deletes no
 /// object a pack does not hold and prunes nothing. False when a lock stayed
 /// held or git failed.
-fn pack(arena: Allocator, io: std.Io, ready: safe_git.StoreReady, store_dir: []const u8, deadline: std.Io.Clock.Timestamp) Allocator.Error!bool {
+fn pack(arena: Allocator, io: std.Io, ready: safe_git.StoreReady, store_dir: []const u8, deadline: std.Io.Clock.Timestamp, cancel: ?*const std.atomic.Value(bool)) Allocator.Error!bool {
     var locks: std.ArrayList(std.Io.File) = .empty;
     defer for (locks.items) |file| file.close(io);
-    _ = try lockStore(arena, io, &locks, store_dir, deadline) orelse return false;
-    switch (try capture_store.storeOutput(arena, ready, try capture_store.refStore(arena, store_dir), .repack, .{ .deadline = deadline })) {
+    _ = try lockStore(arena, io, &locks, store_dir, deadline, cancel) orelse return false;
+    switch (try capture_store.storeOutput(arena, ready, try capture_store.refStore(arena, store_dir), .repack, .{ .deadline = deadline, .cancel = cancel })) {
         .ok => return true,
         .failed => |failure| {
             debug_trace.logf("workspace", "event=workspace_capture_repack_failed store={s} failure={s}", .{ store_dir, @tagName(failure) });
@@ -673,10 +745,10 @@ fn pack(arena: Allocator, io: std.Io, ready: safe_git.StoreReady, store_dir: []c
 /// `init.lock`, then each worktree's lock in name order. The files join
 /// `locks`, which the caller closes. The worktree names, or null when a lock
 /// stayed held.
-fn lockStore(arena: Allocator, io: std.Io, locks: *std.ArrayList(std.Io.File), store_dir: []const u8, deadline: std.Io.Clock.Timestamp) Allocator.Error!?[]const []const u8 {
+fn lockStore(arena: Allocator, io: std.Io, locks: *std.ArrayList(std.Io.File), store_dir: []const u8, deadline: std.Io.Clock.Timestamp, cancel: ?*const std.atomic.Value(bool)) Allocator.Error!?[]const []const u8 {
     // `init.lock` first: a capture that has not passed it has written
     // nothing, and the worktrees listed after it are all there are.
-    if (!try lockFile(arena, io, locks, try capture_store.initLockPath(arena, store_dir), store_dir, deadline)) return null;
+    if (!try lockFile(arena, io, locks, try capture_store.initLockPath(arena, store_dir), store_dir, deadline, cancel)) return null;
     const worktrees = try capture_store.worktreesDir(arena, store_dir);
     var names: std.ArrayList([]const u8) = .empty;
     if (std.Io.Dir.openDirAbsolute(io, worktrees, .{ .iterate = true })) |dir_value| {
@@ -684,16 +756,16 @@ fn lockStore(arena: Allocator, io: std.Io, locks: *std.ArrayList(std.Io.File), s
         defer dir.close(io);
         var entries = dir.iterate();
         while (entries.next(io) catch |err| listed: {
-            keepCancel(io, err);
+            capture_store.keepCancel(io, err);
             break :listed null;
         }) |entry| {
             if (entry.kind == .directory) try names.append(arena, try arena.dupe(u8, entry.name));
         }
-    } else |err| keepCancel(io, err);
+    } else |err| capture_store.keepCancel(io, err);
     // One order for every maintenance, so two never wait on each other.
     sort_utils.sort([]const u8, names.items, {}, lessThan);
     for (names.items) |name| {
-        if (!try lockFile(arena, io, locks, try std.Io.Dir.path.join(arena, &.{ worktrees, name, capture_store.worktree_lock_name }), store_dir, deadline)) return null;
+        if (!try lockFile(arena, io, locks, try std.Io.Dir.path.join(arena, &.{ worktrees, name, capture_store.worktree_lock_name }), store_dir, deadline, cancel)) return null;
     }
     return names.items;
 }
@@ -703,25 +775,25 @@ fn lockStore(arena: Allocator, io: std.Io, locks: *std.ArrayList(std.Io.File), s
 fn countLoose(arena: Allocator, io: std.Io, store_dir: []const u8, limit: usize) Allocator.Error!usize {
     const objects = try std.Io.Dir.path.join(arena, &.{ try capture_store.storeGitDir(arena, store_dir), "objects" });
     var dir = std.Io.Dir.openDirAbsolute(io, objects, .{ .iterate = true }) catch |err| {
-        keepCancel(io, err);
+        capture_store.keepCancel(io, err);
         return 0;
     };
     defer dir.close(io);
     var count: usize = 0;
     var entries = dir.iterate();
     while (entries.next(io) catch |err| {
-        keepCancel(io, err);
+        capture_store.keepCancel(io, err);
         return count;
     }) |entry| {
         if (entry.kind != .directory or !isLowerHex(entry.name, 2)) continue;
         var fan_out = dir.openDir(io, entry.name, .{ .iterate = true }) catch |err| {
-            keepCancel(io, err);
+            capture_store.keepCancel(io, err);
             continue;
         };
         defer fan_out.close(io);
         var files = fan_out.iterate();
         while (files.next(io) catch |err| listed: {
-            keepCancel(io, err);
+            capture_store.keepCancel(io, err);
             break :listed null;
         }) |file| {
             if (file.kind != .file) continue;
@@ -734,9 +806,9 @@ fn countLoose(arena: Allocator, io: std.Io, store_dir: []const u8, limit: usize)
 
 /// Takes an exclusive lock on `path`, waiting until `deadline`; the file
 /// joins `locks`, which the caller closes.
-fn lockFile(arena: Allocator, io: std.Io, locks: *std.ArrayList(std.Io.File), path: []const u8, store_dir: []const u8, deadline: std.Io.Clock.Timestamp) Allocator.Error!bool {
-    const lock = capture_store.acquireLock(io, path, deadline) catch |err| {
-        keepCancel(io, err);
+fn lockFile(arena: Allocator, io: std.Io, locks: *std.ArrayList(std.Io.File), path: []const u8, store_dir: []const u8, deadline: std.Io.Clock.Timestamp, cancel: ?*const std.atomic.Value(bool)) Allocator.Error!bool {
+    const lock = capture_store.acquireLock(io, path, deadline, cancel) catch |err| {
+        capture_store.keepCancel(io, err);
         if (err == error.Busy) debug_trace.logf("workspace", "event=workspace_capture_store_busy store={s}", .{store_dir});
         return false;
     };
@@ -776,6 +848,8 @@ const Refreshed = struct {
     usage: Usage,
     /// Whether `usage` differs from the cache it started from.
     changed: bool,
+    /// The paths of the stores this walk measured, rather than reused.
+    walked: []const []const u8,
 };
 
 /// The space the captures folder takes now. A store whose measure in
@@ -783,22 +857,23 @@ const Refreshed = struct {
 /// fails or the deadline passes. Memory belongs to `arena`.
 fn refresh(arena: Allocator, io: std.Io, captures: []const u8, cached: ?Usage, now_ms: i64, deadline: std.Io.Clock.Timestamp) Allocator.Error!?Refreshed {
     var dir = std.Io.Dir.openDirAbsolute(io, captures, .{ .iterate = true }) catch |err| {
-        keepCancel(io, err);
+        capture_store.keepCancel(io, err);
         return null;
     };
     defer dir.close(io);
     var stores: std.ArrayList(StoreUsage) = .empty;
     var beside: u64 = 0;
     var walked = false;
+    var walked_paths: std.ArrayList([]const u8) = .empty;
     var entries = dir.iterate();
     while (entries.next(io) catch |err| {
-        keepCancel(io, err);
+        capture_store.keepCancel(io, err);
         return null;
     }) |entry| {
         switch (entry.kind) {
             .file => {
                 const stat = dir.statFile(io, entry.name, .{ .follow_symlinks = false }) catch |err| {
-                    keepCancel(io, err);
+                    capture_store.keepCancel(io, err);
                     continue;
                 };
                 beside +|= std.mem.alignForward(u64, stat.size, block_bytes);
@@ -818,6 +893,7 @@ fn refresh(arena: Allocator, io: std.Io, captures: []const u8, cached: ?Usage, n
             continue;
         }
         walked = true;
+        try walked_paths.append(arena, path);
         try stores.append(arena, .{
             .name = try arena.dupe(u8, entry.name),
             .bytes = measure(arena, io, path, deadline) orelse return null,
@@ -829,7 +905,7 @@ fn refresh(arena: Allocator, io: std.Io, captures: []const u8, cached: ?Usage, n
     var total = beside;
     for (stores.items) |store| total +|= store.bytes;
     const changed = if (cached) |value| walked or value.stores.len != stores.items.len or value.total != total else true;
-    return .{ .usage = .{ .total = total, .stores = stores.items }, .changed = changed };
+    return .{ .usage = .{ .total = total, .stores = stores.items }, .changed = changed, .walked = walked_paths.items };
 }
 
 /// The store's measure in `cached` when its objects have not changed since
@@ -848,29 +924,32 @@ fn reusable(cached: ?Usage, name: []const u8, fingerprint: u64, now_ms: i64) ?St
 
 /// A hash of the times of the store's object folders: the objects folder
 /// and each folder in it. Zero when they cannot be read or one changed
-/// within `racy_ms`, so the store is walked next time too.
+/// within `racy_ms`, so the store is walked next time too. The capture
+/// indexes beside the store keep their measured size until
+/// `measure_interval_ms` passes, because every capture rewrites its index,
+/// and fingerprinting them would walk the store at every capture.
 fn fingerprintStore(arena: Allocator, io: std.Io, store_dir: []const u8) Allocator.Error!u64 {
     const objects = try std.Io.Dir.path.join(arena, &.{ try capture_store.storeGitDir(arena, store_dir), "objects" });
     // The clock first: a write after it shows as racy.
     const now_ns = io_mod.nanoTimestamp();
     var dir = std.Io.Dir.openDirAbsolute(io, objects, .{ .iterate = true }) catch |err| {
-        keepCancel(io, err);
+        capture_store.keepCancel(io, err);
         return 0;
     };
     defer dir.close(io);
     var newest: i128 = (dir.stat(io) catch |err| {
-        keepCancel(io, err);
+        capture_store.keepCancel(io, err);
         return 0;
     }).mtime.nanoseconds;
     var sum = folderHash("", newest);
     var entries = dir.iterate();
     while (entries.next(io) catch |err| {
-        keepCancel(io, err);
+        capture_store.keepCancel(io, err);
         return 0;
     }) |entry| {
         if (entry.kind != .directory) continue;
         const mtime: i128 = (dir.statFile(io, entry.name, .{}) catch |err| {
-            keepCancel(io, err);
+            capture_store.keepCancel(io, err);
             return 0;
         }).mtime.nanoseconds;
         sum +%= folderHash(entry.name, mtime);
@@ -891,7 +970,7 @@ fn folderHash(name: []const u8, mtime: i128) u64 {
 /// when the folder cannot be read or the deadline passes.
 fn measure(arena: Allocator, io: std.Io, root: []const u8, deadline: std.Io.Clock.Timestamp) ?u64 {
     var dir = std.Io.Dir.openDirAbsolute(io, root, .{ .iterate = true }) catch |err| {
-        keepCancel(io, err);
+        capture_store.keepCancel(io, err);
         return null;
     };
     defer dir.close(io);
@@ -900,14 +979,14 @@ fn measure(arena: Allocator, io: std.Io, root: []const u8, deadline: std.Io.Cloc
     var total: u64 = 0;
     var seen: usize = 0;
     while (walker.next(io) catch |err| {
-        keepCancel(io, err);
+        capture_store.keepCancel(io, err);
         return null;
     }) |entry| {
         seen += 1;
         if (seen % 1024 == 0 and capture_store.pastDeadline(io, deadline)) return null;
         if (entry.kind != .file) continue;
         const stat = entry.dir.statFile(io, entry.basename, .{ .follow_symlinks = false }) catch |err| {
-            keepCancel(io, err);
+            capture_store.keepCancel(io, err);
             continue;
         };
         total +|= std.mem.alignForward(u64, stat.size, block_bytes);
@@ -920,14 +999,14 @@ fn measure(arena: Allocator, io: std.Io, root: []const u8, deadline: std.Io.Cloc
 /// never read.
 fn readUsage(arena: Allocator, io: std.Io, path: []const u8, now_ms: i64) Allocator.Error!?Usage {
     var file = io_mod.openExistingReadOnlyRegularFile(std.Io.Dir.cwd(), path, .no_follow) catch |err| {
-        keepCancel(io, err);
+        capture_store.keepCancel(io, err);
         return null;
     };
     defer file.close(io);
     const text = io_mod.readFileToEnd(arena, &file, max_usage_bytes) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => {
-            keepCancel(io, err);
+            capture_store.keepCancel(io, err);
             return null;
         },
     };
@@ -990,16 +1069,49 @@ fn writeUsage(arena: Allocator, io: std.Io, path: []const u8, usage: Usage, now_
     const text = formatUsage(arena, latest) catch return;
     const temporary = arena.print("{s}.tmp-{d}", .{ path, io_mod.nanoTimestamp() }) catch return;
     std.Io.Dir.cwd().writeFile(io, .{ .sub_path = temporary, .data = text, .flags = .{ .permissions = .fromMode(0o600) } }) catch |err| {
-        keepCancel(io, err);
+        capture_store.keepCancel(io, err);
+        // Cleared even once cancelled; the cancel stays for the next step.
+        const protection = io.swapCancelProtection(.blocked);
+        defer _ = io.swapCancelProtection(protection);
+        std.Io.Dir.deleteFileAbsolute(io, temporary) catch {};
         return;
     };
     std.Io.Dir.renameAbsolute(temporary, path, io) catch |err| {
-        keepCancel(io, err);
+        capture_store.keepCancel(io, err);
         // Cleared even once cancelled; the cancel stays for the next step.
         const protection = io.swapCancelProtection(.blocked);
         defer _ = io.swapCancelProtection(protection);
         std.Io.Dir.deleteFileAbsolute(io, temporary) catch {};
     };
+}
+
+/// Deletes `usage.tmp-*` files in `captures` older than one minute; a
+/// younger one may still be another process's write in progress. A
+/// killed or failed write leaves only these behind, and nothing else
+/// removes them.
+fn removeStaleUsageTemps(io: std.Io, captures: []const u8, now_ms: i64) void {
+    var dir = std.Io.Dir.openDirAbsolute(io, captures, .{ .iterate = true }) catch |err| {
+        capture_store.keepCancel(io, err);
+        return;
+    };
+    defer dir.close(io);
+    var entries = dir.iterate();
+    while (entries.next(io) catch |err| {
+        capture_store.keepCancel(io, err);
+        return;
+    }) |entry| {
+        if (entry.kind != .file or !std.mem.startsWith(u8, entry.name, "usage.tmp-")) continue;
+        const stat = dir.statFile(io, entry.name, .{ .follow_symlinks = false }) catch |err| {
+            capture_store.keepCancel(io, err);
+            continue;
+        };
+        if (stat.mtime.toMilliseconds() > now_ms - std.time.ms_per_min) continue;
+        dir.deleteFile(io, entry.name) catch |err| {
+            capture_store.keepCancel(io, err);
+            continue;
+        };
+        debug_trace.logf("workspace", "event=workspace_capture_usage_temp_removed name={s}", .{entry.name});
+    }
 }
 
 /// One line of `evictions.jsonl`. The intent's `refs` are the refs found;
@@ -1013,16 +1125,45 @@ const JournalLine = struct {
     kept: usize = 0,
 };
 
-/// Appends one line to the journal and syncs it.
+/// Appends one line to the journal and syncs it. A symlink at `path` is
+/// never followed. A journal over `max_journal_bytes` is rotated first, so
+/// it never grows without a bound.
 fn appendJournal(arena: Allocator, io: std.Io, path: []const u8, entry: JournalLine) !void {
     const head = try arena.print("{{\"v\":1,\"phase\":\"{s}\",\"at_ms\":{d},\"session_key\":\"{s}\",\"reason\":\"{s}\",\"refs\":{d}", .{ @tagName(entry.phase), entry.at_ms, entry.key, @tagName(entry.reason), entry.refs });
     const line = switch (entry.phase) {
         .intent => try arena.print("{s}}}\n", .{head}),
         .done => try arena.print("{s},\"kept\":{d}}}\n", .{ head, entry.kept }),
     };
-    const file = try std.Io.Dir.createFileAbsolute(io, path, .{ .truncate = false, .read = true, .permissions = .fromMode(0o600) });
+    // An exclusive create never follows a symlink, so only a regular file
+    // with one link is opened for the append.
+    var file = std.Io.Dir.createFileAbsolute(io, path, .{ .exclusive = true, .read = true, .permissions = .fromMode(0o600) }) catch |err| switch (err) {
+        error.PathAlreadyExists => try io_mod.openExistingRegularFile(std.Io.Dir.cwd(), path, .read_write),
+        else => |other| return other,
+    };
+    var end = (try file.stat(io)).size;
+    if (end > max_journal_bytes) {
+        const rotated = try arena.print("{s}.1", .{path});
+        // A failed rename only means the journal keeps growing a while longer.
+        const renamed: bool = blk: {
+            std.Io.Dir.renameAbsolute(path, rotated, io) catch |err| {
+                capture_store.keepCancel(io, err);
+                break :blk false;
+            };
+            break :blk true;
+        };
+        if (renamed) {
+            debug_trace.logf("workspace", "event=workspace_capture_journal_rotated bytes={d}", .{end});
+            file.close(io);
+            file = std.Io.Dir.createFileAbsolute(io, path, .{ .exclusive = true, .read = true, .permissions = .fromMode(0o600) }) catch |err| switch (err) {
+                error.PathAlreadyExists => try io_mod.openExistingRegularFile(std.Io.Dir.cwd(), path, .read_write),
+                else => |other| return other,
+            };
+            // Zero for the file just created; another process that recreated
+            // the path meanwhile keeps its lines.
+            end = (try file.stat(io)).size;
+        }
+    }
     defer file.close(io);
-    const end = (try file.stat(io)).size;
     try file.writePositionalAll(io, line, end);
     try file.sync(io);
 }
@@ -1381,4 +1522,27 @@ fn fuzzParse(_: void, smith: *std.testing.Smith) anyerror!void {
         }
         try std.testing.expectEqualStrings(again, try formatUsage(arena, reparsed));
     }
+}
+
+test "capture retention rotates a journal over its limit" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var profile = try TestProfile.init(arena);
+    defer profile.deinit();
+    const io = std.testing.io;
+    const path = try std.Io.Dir.path.join(arena, &.{ profile.captures, "evictions.jsonl" });
+    const big = try arena.alloc(u8, @intCast(max_journal_bytes + 1));
+    @memset(big, 'x');
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = big });
+
+    try appendJournal(arena, io, path, .{ .phase = .intent, .at_ms = 1, .key = "00112233445566778899aabbccddeeff", .reason = .budget, .refs = 1 });
+
+    var file = try std.Io.Dir.openFileAbsolute(io, path, .{});
+    defer file.close(io);
+    const text = try io_mod.readFileToEnd(arena, &file, max_usage_bytes);
+    // The old journal is rotated aside and the new one holds only this line.
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, text, "\n"));
+    try std.testing.expect(std.mem.startsWith(u8, text, "{\"v\":1,"));
+    try std.testing.expect(capture_store.exists(io, try arena.print("{s}.1", .{path})));
 }

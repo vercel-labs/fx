@@ -115,6 +115,30 @@ pub const CaptureStatus = union(enum) {
     }
 };
 
+/// How a recording that could not start is reported. A storage fault the
+/// person can act on keeps its own name, so the startup message can say why;
+/// any other failure is `RecordingStartFailed`. `app_entry_runtime.zig` words
+/// each one.
+pub const StartFailure = error{
+    RecordingStartFailed,
+    RecordingDiskFull,
+    RecordingFileTooBig,
+    RecordingAccessDenied,
+    RecordingReadOnly,
+};
+
+pub fn startFailure(err: anyerror) StartFailure {
+    return switch (err) {
+        error.NoSpaceLeft => error.RecordingDiskFull,
+        error.FileTooBig => error.RecordingFileTooBig,
+        // EACCES, and EPERM: an immutable file, or a folder macOS keeps from
+        // the terminal's privacy settings.
+        error.AccessDenied, error.PermissionDenied => error.RecordingAccessDenied,
+        error.ReadOnlyFileSystem => error.RecordingReadOnly,
+        else => error.RecordingStartFailed,
+    };
+}
+
 pub fn configureFromEnv(
     alloc: Allocator,
     initial_cols: u16,
@@ -961,4 +985,53 @@ test "long versions keep the full written tail while declaring length 255" {
 
     const parser = try Parser.init(bytes);
     try testing.expectEqual(@as(usize, 255), parser.header.version.len);
+}
+
+test "a recording that cannot start keeps the storage fault behind it, and any other failure stays generic" {
+    try testing.expect(startFailure(error.NoSpaceLeft) == error.RecordingDiskFull);
+    try testing.expect(startFailure(error.FileTooBig) == error.RecordingFileTooBig);
+    try testing.expect(startFailure(error.AccessDenied) == error.RecordingAccessDenied);
+    // EPERM, which an immutable file or a folder without privacy access gives,
+    // is a separate error from EACCES.
+    try testing.expect(startFailure(error.PermissionDenied) == error.RecordingAccessDenied);
+    try testing.expect(startFailure(error.ReadOnlyFileSystem) == error.RecordingReadOnly);
+    try testing.expect(startFailure(error.PathAlreadyExists) == error.RecordingStartFailed);
+    try testing.expect(startFailure(error.FileNotFound) == error.RecordingStartFailed);
+}
+
+test "an unusable recording path stops a debug recording, and a plain one runs on without it" {
+    const alloc = testing.allocator;
+    io_mod.resetEnvironForTest();
+    defer io_mod.resetEnvironForTest();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // A file where the tape's folder belongs.
+    try tmp.dir.writeFile(io_mod.getIo(), .{ .sub_path = "blocker", .data = "x" });
+    const blocker = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "blocker");
+    defer alloc.free(blocker);
+    const path = try std.Io.Dir.path.join(alloc, &.{ blocker, "tape.fxtape" });
+    defer alloc.free(path);
+
+    var plain = std.process.Environ.Map.init(alloc);
+    defer plain.deinit();
+    try plain.put("FX_RECORD", path);
+    var debug = std.process.Environ.Map.init(alloc);
+    defer debug.deinit();
+    try debug.put("FX_RECORD", path);
+    try debug.put("FX_DEBUG_RECORD", "1");
+
+    shutdown();
+    defer shutdown();
+    io_mod.setEnvironMap(&plain);
+    try configureFromEnv(alloc, 80, 24, "vtest");
+    var status = try captureStatus(alloc);
+    defer status.deinit(alloc);
+    switch (status) {
+        .inactive => {},
+        else => return error.TestExpectedNoRecording,
+    }
+
+    io_mod.setEnvironMap(&debug);
+    try testing.expect(std.meta.isError(configureFromEnv(alloc, 80, 24, "vtest")));
 }

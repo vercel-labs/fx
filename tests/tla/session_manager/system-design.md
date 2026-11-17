@@ -307,7 +307,8 @@ manager:
   `data` comes from v1's piece codec (`encodeConversationFrame`,
   `src/core/session/session_event.zig` lines 439 to 482). The types are
   `user`, `assistant`, `tool_call`, `tool_result`, `steering`,
-  `context_note` (D93), `runtime_context` (D94), `model_call` (D96), `turn_end` (files and
+  `context_note` (D93), `runtime_context` (D94), `model_call` (D96),
+  `mcp_bridge_call` (D99), `turn_end` (files and
   turn summary), `interruption` (reason detail, partial text, command
   refs, origin), `recovery`, `workspace_capture` (D98) and `continues`.
 - **Recovery:** the agent loop's checkpoint becomes a small `recovery` item
@@ -1947,6 +1948,44 @@ as it was sent):
   fork would have to copy and join back; the end in a line of its own
   after the close; or captures kept across a failed commit, which then
   land in the next turn.
+- **D99 Decision:** each call a command makes through `fx mcp call` and
+  the TUI shows as a row is saved, when it ends, as an `mcp_bridge_call`
+  item in the open turn:
+  `{"call_id":…,"request_id":…,"tool":…,"outcome":…}`, the shell call
+  whose command made it, the bridge's request id, the MCP tool's name, and
+  `completed`, `failed` or `cancelled`. It never holds the call's
+  arguments or its result. A resume shows the row again right after its
+  shell call's row, so the compact view groups it as it did live, except
+  in a turn interrupted while the command ran (below).
+  - **Write:** the item goes out on its own write, outside the streamed
+    pieces, as `tool_running` (D28) and `recovery` do, and that write takes
+    the session's lock as every write does
+    (`tests/tla/session/SessionWrite.tla` NoStaleRemoval). The shell call
+    is still running, so its turn is open. With no turn open, or when the
+    write fails, the row is logged as dropped and the call goes on.
+  - **Who writes:** only the TUI, which is the only host that shows the
+    rows. A subagent, ACP and `fx ask` save none.
+  - **Reading:** a record is read with its unknown fields ignored, and one
+    whose strings aren't short, valid UTF-8 without control characters, or
+    whose outcome this fx doesn't know, is left out with a trace line. A
+    record whose shell call the turn no longer holds, such as after a
+    compaction, shows no row. A turn closed as superseded loses its
+    records with it.
+  - **Interrupted turn:** a resume draws a cancelled command's row only
+    from the output its turn saved, as it did before D99. When the user
+    cancels a turn while the command runs and the command saved no
+    output, such as one cancelled before it printed anything, the
+    resume shows the call's row alone, without the command's row that
+    shared its group live.
+  - **Older fx:** an fx from before D99 leaves the item out (D17).
+
+  **Why:** the rows existed only in the live screen, so a resumed session
+  showed the command without the calls it made. The name and the outcome
+  are what the row shows, so nothing more is kept.
+  **Alternative:** save the arguments too, which can be large or hold
+  secrets; or carry the records in the turn's execution and save them
+  with the shell call's result, which reaches the agent loop and every
+  host's saved state for rows only the TUI shows.
 
 ## Design Risks And Failure Behavior
 

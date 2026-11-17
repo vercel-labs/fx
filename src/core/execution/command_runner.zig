@@ -394,6 +394,8 @@ const ChildWaiter = struct {
     child: *std.process.Child,
     io: std.Io,
     ready: std.atomic.Value(bool) = .init(false),
+    /// Set with `ready`, so a loop that waits on it wakes when the child exits.
+    done: std.Io.Event = .unset,
     result: std.process.Child.WaitError!std.process.Child.Term = undefined,
     /// When the wait returned. Valid once `ready` is observed.
     completed_ms: i64 = 0,
@@ -418,6 +420,7 @@ const ChildWaiter = struct {
         self.result = self.child.wait(self.io);
         self.completed_ms = io_mod.milliTimestamp();
         self.ready.store(true, .release);
+        self.done.set(self.io);
     }
 
     fn isReady(self: *const ChildWaiter) bool {
@@ -446,6 +449,58 @@ const ChildWaiter = struct {
     }
 };
 
+/// The pace at which the foreground supervisor refreshes the target's process
+/// tree. On macOS a refresh lists the children of every tracked process, and
+/// each list scans the whole process table, so a refresh every millisecond
+/// costs a supervisor whose command only waits several percent of a core.
+///
+/// The pace stays at `foreground_refresh_fast_ns` while the tree can change
+/// quickly: for `foreground_refresh_fast_window_ms` after the command starts
+/// and after the tracked set grows, and while a stop is in progress. A quiet
+/// tree waits twice as long after each refresh, up to
+/// `foreground_refresh_slow_ns`, and never past the command's deadline. The
+/// target's exit wakes the supervisor at once, so the pace never delays a
+/// command's completion. A process that a short-lived parent starts in a
+/// quiet stretch is still found: on macOS the lineage scan matches its
+/// original parent or the inherited witness when the target exits or a stop
+/// begins, and on Linux the supervisor is its subreaper.
+const ForegroundRefreshPace = struct {
+    interval_ns: u64 = foreground_refresh_fast_ns,
+    fast_until_ms: i64,
+    tracked: usize = 0,
+
+    fn init(now_ms: i64) ForegroundRefreshPace {
+        return .{ .fast_until_ms = now_ms +| foreground_refresh_fast_window_ms };
+    }
+
+    /// The wait before the next refresh, after a refresh at `now_ms` that
+    /// tracked `tracked` descendants.
+    fn next(
+        self: *ForegroundRefreshPace,
+        now_ms: i64,
+        tracked: usize,
+        stopping: bool,
+        deadline_ms: ?i64,
+    ) u64 {
+        if (tracked != self.tracked) {
+            self.tracked = tracked;
+            self.fast_until_ms = now_ms +| foreground_refresh_fast_window_ms;
+        }
+        self.interval_ns = if (stopping or now_ms < self.fast_until_ms)
+            foreground_refresh_fast_ns
+        else
+            @min(self.interval_ns *| 2, foreground_refresh_slow_ns);
+        const deadline = deadline_ms orelse return self.interval_ns;
+        if (deadline <= now_ms) return foreground_refresh_fast_ns;
+        const left_ns = @as(u64, @intCast(deadline - now_ms)) *| std.time.ns_per_ms;
+        return @max(foreground_refresh_fast_ns, @min(self.interval_ns, left_ns));
+    }
+};
+
+const foreground_refresh_fast_ns: u64 = std.time.ns_per_ms;
+const foreground_refresh_slow_ns: u64 = 25 * std.time.ns_per_ms;
+const foreground_refresh_fast_window_ms: i64 = 100;
+
 fn waitForForegroundTarget(
     target: *std.process.Child,
     process_witness: ?*const process_tree.DarwinProcessWitness,
@@ -469,6 +524,7 @@ fn waitForForegroundTarget(
     var termination_started_ms: ?i64 = null;
     var forced = false;
     var owner_alive = true;
+    var pace = ForegroundRefreshPace.init(io_mod.milliTimestamp());
 
     while (true) {
         const now_ms = io_mod.milliTimestamp();
@@ -537,7 +593,16 @@ fn waitForForegroundTarget(
             }
             return term;
         }
-        io_mod.sleep(std.time.ns_per_ms);
+        const wait_ns = pace.next(
+            io_mod.milliTimestamp(),
+            descendants.processes.items.len,
+            request != .none or termination_started_ms != null,
+            deadline_ms,
+        );
+        waiter.done.waitTimeout(waiter.io, .{ .duration = .{
+            .raw = .fromNanoseconds(@intCast(wait_ns)),
+            .clock = .awake,
+        } }) catch {};
     }
 }
 
@@ -6792,6 +6857,78 @@ test "foreground supervisor fallback leaves the parent two termination polls" {
         @as(?i64, std.math.maxInt(i64)),
         foreground_supervisor_fallback_deadline_ms(std.math.maxInt(i64) - 100),
     );
+}
+
+/// Walks `pace` through a quiet tree from `now_ms` until it reaches the slow
+/// pace, and returns the time then.
+fn quietForegroundRefreshPaceForTest(pace: *ForegroundRefreshPace, now_ms: i64) i64 {
+    var now = now_ms;
+    while (true) {
+        const wait_ns = pace.next(now, pace.tracked, false, null);
+        if (wait_ns == foreground_refresh_slow_ns) return now;
+        now += @intCast(wait_ns / std.time.ns_per_ms);
+    }
+}
+
+test "foreground refresh pace stays fast while a command starts" {
+    var pace = ForegroundRefreshPace.init(1_000);
+    var now: i64 = 1_000;
+    while (now < 1_000 + foreground_refresh_fast_window_ms) : (now += 1) {
+        try std.testing.expectEqual(foreground_refresh_fast_ns, pace.next(now, 0, false, null));
+    }
+}
+
+test "foreground refresh pace backs off on a quiet tree" {
+    const ms = std.time.ns_per_ms;
+    var pace = ForegroundRefreshPace.init(0);
+    const quiet = foreground_refresh_fast_window_ms;
+    try std.testing.expectEqual(2 * ms, pace.next(quiet, 0, false, null));
+    try std.testing.expectEqual(4 * ms, pace.next(quiet + 2, 0, false, null));
+    try std.testing.expectEqual(8 * ms, pace.next(quiet + 6, 0, false, null));
+    try std.testing.expectEqual(16 * ms, pace.next(quiet + 14, 0, false, null));
+    try std.testing.expectEqual(foreground_refresh_slow_ns, pace.next(quiet + 30, 0, false, null));
+    try std.testing.expectEqual(foreground_refresh_slow_ns, pace.next(quiet + 55, 0, false, null));
+}
+
+test "foreground refresh pace turns fast again when the tree grows" {
+    var pace = ForegroundRefreshPace.init(0);
+    const now = quietForegroundRefreshPaceForTest(&pace, foreground_refresh_fast_window_ms);
+    try std.testing.expectEqual(foreground_refresh_fast_ns, pace.next(now, 1, false, null));
+    try std.testing.expectEqual(
+        foreground_refresh_fast_ns,
+        pace.next(now + foreground_refresh_fast_window_ms - 1, 1, false, null),
+    );
+    try std.testing.expectEqual(
+        2 * std.time.ns_per_ms,
+        pace.next(now + foreground_refresh_fast_window_ms, 1, false, null),
+    );
+}
+
+test "foreground refresh pace stays fast while a stop is in progress" {
+    var pace = ForegroundRefreshPace.init(0);
+    const now = quietForegroundRefreshPaceForTest(&pace, foreground_refresh_fast_window_ms);
+    try std.testing.expectEqual(foreground_refresh_fast_ns, pace.next(now, 0, true, null));
+    try std.testing.expectEqual(foreground_refresh_fast_ns, pace.next(now + 500, 0, true, null));
+}
+
+test "foreground refresh pace never waits past the command deadline" {
+    var pace = ForegroundRefreshPace.init(0);
+    const now = quietForegroundRefreshPaceForTest(&pace, foreground_refresh_fast_window_ms);
+    try std.testing.expectEqual(7 * std.time.ns_per_ms, pace.next(now, 0, false, now + 7));
+    try std.testing.expectEqual(foreground_refresh_fast_ns, pace.next(now, 0, false, now));
+    try std.testing.expectEqual(foreground_refresh_fast_ns, pace.next(now, 0, false, now - 5));
+}
+
+test "a quiet two-second command refreshes its tree a tenth as often as a fixed millisecond pace" {
+    var pace = ForegroundRefreshPace.init(0);
+    const two_seconds_ns: u64 = 2 * std.time.ns_per_s;
+    var now_ns: u64 = 0;
+    var refreshes: u64 = 0;
+    while (now_ns < two_seconds_ns) : (refreshes += 1) {
+        now_ns += pace.next(@intCast(now_ns / std.time.ns_per_ms), 0, false, null);
+    }
+    // A fixed one-millisecond pace refreshes 2,000 times.
+    try std.testing.expect(refreshes <= two_seconds_ns / std.time.ns_per_ms / 10);
 }
 
 test "cancel and timeout tie chooses cancellation" {
