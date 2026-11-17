@@ -643,23 +643,37 @@ pub const Owner = struct {
     /// that `stop` and `closeByUser` do not count and no earlier one did: the
     /// work the host chose or started that no turn has begun on, and the
     /// messages the ended turn never took, which the slot keeps for the host to
-    /// queue (`tests/tla/subagent/StopMessage.tla` NoSilentLoss). Counting the
-    /// kept ones also keeps the end hook from queuing them
-    /// (`handOverLeftovers`). Call with the host's admission lock held, as the
-    /// stop or close does, so the hook's question comes before or after it.
+    /// queue (`tests/tla/subagent/StopMessage.tla` NoSilentLoss). Only a stop
+    /// or close that ends the work calls this, as the parent's stop and close
+    /// and the user's close do: they set the slot's cancel, so the work the host
+    /// chose starts stopped and its messages never run. Call with the host's
+    /// admission lock held, as the stop or close does, so the hook's question
+    /// comes before or after it.
     pub fn takeDropped(self: *Owner, child_id: []const u8) usize {
         self.mutex.lockUncancelable(io_mod.getIo());
         defer self.mutex.unlock(io_mod.getIo());
         for (self.slots.items) |slot| {
             if (!std.mem.eql(u8, slot.child_id, child_id) or slot.completion != .running) continue;
-            const kept = slot.leftovers.items.len - slot.leftovers_counted;
-            const count = slot.unstarted + kept;
+            const count = slot.unstarted + takeKeptLocked(slot);
             slot.unstarted = 0;
-            if (kept > 0) {
-                slot.leftovers_counted = slot.leftovers.items.len;
-                slot.kept_dropped = true;
-            }
             return count;
+        }
+        return 0;
+    }
+
+    /// How many of the parent's messages the slot keeps from a turn that ended
+    /// without reading them, which a stop drops and counts for the first time,
+    /// for the user's stop (`Runtime.userStopped`). It takes no more than
+    /// that: the user's stop neither ends nor cancels the work the host chose
+    /// (`noteUserStop`), so that work's messages run and are not dropped.
+    /// Counting the kept ones keeps the end hook from queuing them
+    /// (`handOverLeftovers`). Call with the host's admission lock held.
+    pub fn takeKept(self: *Owner, child_id: []const u8) usize {
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        for (self.slots.items) |slot| {
+            if (!std.mem.eql(u8, slot.child_id, child_id) or slot.completion != .running) continue;
+            return takeKeptLocked(slot);
         }
         return 0;
     }
@@ -1604,6 +1618,17 @@ fn dropLeftovers(alloc: Allocator, slot: *Slot, reason: []const u8) void {
         debug_trace.eventf("mailbox", "dropped", .{}, "child={s} work_id={s} reason={s}", .{ slot.child_id, work.id, reason });
     }
     freeLeftovers(alloc, slot);
+}
+
+/// Counts the messages `slot` keeps that no stop or close has counted, and
+/// marks them dropped so the end hook queues none. Holds `Owner.mutex`.
+fn takeKeptLocked(slot: *Slot) usize {
+    const kept = slot.leftovers.items.len - slot.leftovers_counted;
+    if (kept > 0) {
+        slot.leftovers_counted = slot.leftovers.items.len;
+        slot.kept_dropped = true;
+    }
+    return kept;
 }
 
 fn freeLeftovers(alloc: Allocator, slot: *Slot) void {

@@ -1148,12 +1148,16 @@ pub const Runtime = struct {
     /// are dropped now, so none of them starts after it: those waiting here,
     /// and `from_queue` the subagent's own queue already dropped. The parent
     /// learns of the drop from the stopped work's report, or else a notice.
+    /// After the turn's end is recorded it also drops and counts the messages
+    /// the slot kept (`Owner.takeKept`). It counts nothing of the work the
+    /// host chose for the slot: it ends no work and cancels none
+    /// (`Owner.noteUserStop`), so that work runs.
     pub fn userStopped(self: *Runtime, child_id: []const u8, from_queue: usize) void {
         self.admission_mutex.lockUncancelable(io_mod.getIo());
         defer self.admission_mutex.unlock(io_mod.getIo());
         self.managed.noteUserStop(child_id);
         if (self.findTurnWorkLocked(child_id)) |index| self.turn_works.items[index].stopped_by = .user;
-        const dropped = self.dropPendingLocked(child_id, "stopped_by_user") + from_queue + self.managed.takeDropped(child_id);
+        const dropped = self.dropPendingLocked(child_id, "stopped_by_user") + from_queue + self.managed.takeKept(child_id);
         debug_trace.eventf("mailbox", "stop", .{}, "target={s} by=user running={} dropped={d}", .{ child_id, self.isBusyLocked(child_id), dropped });
         self.noteUserDropLocked(child_id, dropped, false);
     }
