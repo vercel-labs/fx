@@ -5570,7 +5570,7 @@ fn sweepUnrecorded(fail_at: usize, stuck: *usize) !bool {
     stuck.* += 1;
     try expectBodyHas(answer, "\"error_code\":\"start_failed\"");
     try expectBodyHas(answer, "reviewer did not start: ");
-    try expectBodyHas(answer, "Your message did not run, and fx could not reset reviewer: it refuses messages until fx restarts, and a close of it cannot be saved either.");
+    try expectBodyHas(answer, "Your message did not run, and fx could not reset reviewer: it refuses messages until fx restarts, and a close of it cannot be saved either. Send the work to a subagent with another name, and tell the user that reviewer needs an fx restart.");
     // What the answer says holds: the registry keeps the work, no message is
     // taken, and the close is not saved.
     const again = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "again" } }, "call-2", null);
@@ -5596,6 +5596,22 @@ fn sweepUnrecorded(fail_at: usize, stuck: *usize) !bool {
     try expectBodyHas(closed_again, "\"error_code\":\"close_not_saved\"");
     const after_close = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "after the close" } }, "call-3c", null);
     try expectBodyHas(after_close, "\"error_code\":\"state_unavailable\"");
+    // The answer tells main to send the work to a subagent with another name.
+    // That works with the stuck child present: the new subagent starts, runs
+    // and reports, and status lists both. What status calls `reviewer` is not
+    // checked here: `childStateLocked` reads a child that the registry holds
+    // as running, with no slot, as idle.
+    const other = try callTool(runtime, arena, .{ .message = .{ .agent = "helper", .message = "do it instead" } }, "call-3d", null);
+    try expectBodyHas(other, "Sent to helper");
+    try waitUntilQuiet(runtime);
+    var helper_reports: usize = 0;
+    for (fixture.reports.items) |line| {
+        if (std.mem.startsWith(u8, line, "helper ") and std.mem.find(u8, line, " completed ") != null) helper_reports += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), helper_reports);
+    const roster = try callTool(runtime, arena, .{ .status = .{} }, "call-3e", null);
+    try expectBodyHas(roster, "\"subagents\":[\"reviewer\",\"helper\"]");
+    try expectBodyHas(roster, "helper: idle, last work completed");
     // A restart clears it: the new host recovers the work as interrupted.
     faulted.deinit();
     const restarted = try mailboxRuntime(alloc, &fixture, &parent);
@@ -5616,6 +5632,39 @@ test "a message whose start failed and whose end was not recorded says the subag
     // them leave the end unrecorded: a sweep that found none proves nothing.
     try std.testing.expect(at > 8);
     try std.testing.expect(stuck > 0);
+}
+
+test "the answer for a start whose end was not recorded fits the longest name and cause, and its fallback is still true" {
+    var buf: [start_failed_result_bytes]u8 = undefined;
+    const name_bytes: [domain.max_agent_name_bytes]u8 = @splat('a');
+    const name: []const u8 = &name_bytes;
+    // The longest cause startCauseText gives for an error `Owner.start` can
+    // return (`managed_owner.StartError`): one of its three phrases, or the
+    // name of the fourth.
+    var longest: []const u8 = "";
+    for ([_]anyerror{ error.OutOfMemory, error.OwnerClosed, error.ChildUnavailable, error.ThreadSpawnFailed }) |err| {
+        const cause = startCauseText(err);
+        if (cause.len > longest.len) longest = cause;
+    }
+    const wanted_end = " needs an fx restart.";
+    const result = startFailedStuckResult(&buf, name, longest);
+    try std.testing.expect(std.mem.startsWith(u8, result, name));
+    try std.testing.expect(std.mem.endsWith(u8, result, wanted_end));
+    try std.testing.expect(std.mem.endsWith(u8, result[0 .. result.len - wanted_end.len], name));
+    try std.testing.expect(!std.mem.eql(u8, result, start_failed_stuck_fallback));
+    // Room is left over: a cause of 100 characters, more than any of them, fits too.
+    const cause_bytes: [100]u8 = @splat('c');
+    const roomy = startFailedStuckResult(&buf, name, &cause_bytes);
+    try std.testing.expect(std.mem.endsWith(u8, roomy, wanted_end));
+    try std.testing.expect(!std.mem.eql(u8, roomy, start_failed_stuck_fallback));
+    // A buffer too small for the names gives the fallback, which says the same
+    // things without them.
+    var small: [32]u8 = undefined;
+    const fallback = startFailedStuckResult(&small, "reviewer", "fx ran out of memory");
+    try std.testing.expectEqualStrings(start_failed_stuck_fallback, fallback);
+    try std.testing.expect(std.mem.find(u8, fallback, "refuses messages until fx restarts") != null);
+    try std.testing.expect(std.mem.find(u8, fallback, "a close of it cannot be saved either") != null);
+    try std.testing.expect(std.mem.find(u8, fallback, "Send the work to a subagent with another name, and tell the user that the subagent needs an fx restart.") != null);
 }
 
 /// One try of the sweep below: the user's turn begins on an idle child, and the
@@ -7735,12 +7784,17 @@ fn startFailedResult(buf: []u8, agent: []const u8, cause: []const u8) []const u8
     return std.mem.print(buf, "{s} did not start: {s}. Your message did not run. {s} is idle, so send the message again if it is still needed.", .{ agent, cause, agent }) catch "The subagent did not start, and your message did not run. It is idle, so send the message again if it is still needed.";
 }
 
+/// What `startFailedStuckResult` says when its buffer is too small for the
+/// names in it.
+const start_failed_stuck_fallback = "The subagent did not start, and your message did not run. It refuses messages until fx restarts, and a close of it cannot be saved either. Send the work to a subagent with another name, and tell the user that the subagent needs an fx restart.";
+
 /// `message`'s answer when the slot could not start the work and its end
 /// could not be recorded: the registry keeps the work running with no slot, so
 /// the subagent refuses messages until fx restarts, and a close of it cannot
-/// be saved either.
+/// be saved either. It names what main can do: the work goes to a subagent
+/// with another name, and only the user can restart fx.
 fn startFailedStuckResult(buf: []u8, agent: []const u8, cause: []const u8) []const u8 {
-    return std.mem.print(buf, "{s} did not start: {s}. Your message did not run, and fx could not reset {s}: it refuses messages until fx restarts, and a close of it cannot be saved either.", .{ agent, cause, agent }) catch "The subagent did not start, and your message did not run. It refuses messages until fx restarts, and a close of it cannot be saved either.";
+    return std.mem.print(buf, "{s} did not start: {s}. Your message did not run, and fx could not reset {s}: it refuses messages until fx restarts, and a close of it cannot be saved either. Send the work to a subagent with another name, and tell the user that {s} needs an fx restart.", .{ agent, cause, agent, agent }) catch start_failed_stuck_fallback;
 }
 
 /// A report's text for a work whose slot could not start: the message
