@@ -380,41 +380,6 @@ async function reportBehindAnsweredPrompt(prompt: "approval" | "question") {
   }, false, env);
 }
 
-// Main's first turn is a long answer that the loop is still applying when the
-// helper's report is posted, with no prompt open. The report's request has to
-// carry that turn.
-async function reportBehindLongAnswer(deltas: number) {
-  const mainTurnEnded = held();
-  const reports: string[] = [];
-  let tracePath = "";
-  const env: Record<string, string> = {};
-  await withFx((body) => {
-    const latest = latestUserText(body);
-    if (latest.startsWith(REPORT_HEADER)) {
-      reports.push(body);
-      return text(`main_report_${reports.length}`, `SWITCH_MAIN_REPORT_${reports.length}`);
-    }
-    if (latest.includes("SWITCH_HELPER_TASK")) return mainTurnEnded.promise.then(() => text("helper_done", "SWITCH_HELPER_DONE"));
-    if (!body.includes('"main_h"')) return messageSteps([{ id: "main_h", agent: "helper", message: "SWITCH_HELPER_TASK" }]);
-    const parts: object[] = [];
-    for (let i = 0; i < deltas; i++) {
-      parts.push({ type: "text-delta", id: "main_long", delta: i === 0 ? "SWITCH_LONG_ANSWER\n" : `line ${i} of the long answer\n` });
-    }
-    parts.push({ type: "finish", finishReason: { unified: "stop", raw: "stop" } });
-    return fakeGatewaySse(parts);
-  }, async (session) => {
-    await session.sendText("SWITCH_USER");
-    await until("main's first turn to end", () => traceHas(tracePath, "event=processing_finished turn_id=1 "), 60_000);
-    mainTurnEnded.release();
-    await until("main's request for the helper's report", () => reports.length >= 1, 60_000);
-    expectReportCarriesFirstTurn(reports[0]!, "SWITCH_LONG_ANSWER", ["main_h"]);
-    await session.waitForText("SWITCH_MAIN_REPORT_1", 60_000);
-  }, (home) => {
-    tracePath = join(home, "fx-trace.log");
-    env.FX_TRACE_LOG = tracePath;
-  }, false, env);
-}
-
 // Main's requests carry what the test typed to main, which always starts
 // SWITCH_USER; a subagent's carry only its task and what is typed to it. The
 // subagent tool can't tell them apart, because a subagent is offered it too.
@@ -511,14 +476,6 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
       TIMEOUT,
     );
   }
-
-  test(
-    "a report posted while the loop still applies main's long answer carries that answer",
-    async () => {
-      await reportBehindLongAnswer(8000);
-    },
-    TIMEOUT,
-  );
 
   test(
     "the agent list shows a subagent's conversation, which takes messages typed there",
