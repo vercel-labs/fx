@@ -1656,7 +1656,9 @@ fn pendingCallRow(scratch: std.mem.Allocator, rows: []StoryRow, entry: Transcrip
             index -= 1;
             const row = &rows[index];
             const row_record = row.detail orelse continue;
-            if (std.mem.eql(u8, row_record.tool_name, name) and !storyCallFailed(row.detail)) return row;
+            // A subagent call joins its agent's row even after a failed
+            // call there, such as a retry, so it waits there too.
+            if (std.mem.eql(u8, row_record.tool_name, name) and (!storyCallFailed(row.detail) or std.mem.eql(u8, name, "subagent"))) return row;
         }
         return null;
     }
@@ -8626,6 +8628,25 @@ test "a subagent call whose arguments are still coming waits in the latest subag
     // A second message to the same agent, whose agent has streamed in while
     // its message has not, joins that agent's row at once; one to a new
     // agent shows on its own row at the end.
+    // A retry after a failed message waits in the failed message's row from
+    // its first frame, so it never shows on a row of its own at the end.
+    for ([_][]const u8{ "● Managing\n", "● Managing reviewer\n" }) |status| {
+        const entries = [_]TranscriptEntry{
+            .{ .raw_bytes = .{ .id = 1, .bytes = "● reviewer busy; message not sent\n", .class = .tool_status } },
+            .{ .raw_bytes = .{ .id = 2, .bytes = "● Read /w/a.zig\n", .class = .tool_status } },
+            .{ .raw_bytes = .{ .id = 3, .bytes = status, .class = .tool_status } },
+        };
+        const details = [_]ToolDetailRecord{
+            .{ .entry_id = 1, .tool_name = @constCast("subagent"), .activity_kind = .subagent, .arguments_json = @constCast("{\"action\":\"message\",\"agent\":\"reviewer\",\"message\":\"review the change\"}"), .outcome = .failed },
+            .{ .entry_id = 2, .tool_name = @constCast("read_file"), .activity_kind = .read, .arguments_json = @constCast("{\"path\":\"/w/a.zig\"}"), .outcome = .completed },
+            .{ .entry_id = 3, .tool_name = @constCast("subagent"), .activity_kind = .subagent },
+        };
+        const text = try groupTextForTest(alloc, &entries, &details);
+        defer alloc.free(text);
+        errdefer std.debug.print("retry, {s}:\n{s}\n", .{ std.mem.trim(u8, status, "● \n"), text });
+        try std.testing.expect(std.mem.find(u8, text, "└ Read a.zig") != null);
+        try std.testing.expect(std.mem.find(u8, text, "└ Managing") == null);
+    }
     // The TUI's record of a streaming call has no arguments, only the
     // status that names the agent, so both shapes count.
     for ([_][]const u8{ "reviewer", "tester" }) |agent| for ([_]bool{ true, false }) |with_arguments| {
