@@ -1170,6 +1170,10 @@ fn writeLoadSessionResponse(
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
     {
+        // A running turn may pick or renew its credential; settings_mutex
+        // orders this read against those writes.
+        session.settings_mutex.lockUncancelable(io_mod.getIo());
+        defer session.settings_mutex.unlock(io_mod.getIo());
         server.lockCatalog(state);
         defer server.unlockCatalog(state);
         try server.refreshModelCatalogForOptionsLocked(state, session);
@@ -2146,16 +2150,19 @@ pub fn sendSessionInfoUpdate(state: *server.ServerState, active: *server.ActiveS
     try state.writer.writeNotification(alloc, "session/update", out.writer.buffered());
 }
 
-pub fn sendSessionUsageUpdate(state: *server.ServerState, active: *server.ActiveSessionState, alloc: Allocator) !void {
+/// The turn passes its own model and provider (TurnSettings), so a
+/// session/set_config_option during the turn doesn't change which context
+/// window the update reports.
+pub fn sendSessionUsageUpdate(state: *server.ServerState, active: *server.ActiveSessionState, model: []const u8, provider: model_provider.ProviderId, alloc: Allocator) !void {
     const used = active.context_used.load(.acquire);
     if (used == 0) return;
-    const provider_bundle = state.cfg.provider_set.select(active.provider);
+    const provider_bundle = state.cfg.provider_set.select(provider);
     const capabilities = capabilities: {
         server.lockCatalog(state);
         defer server.unlockCatalog(state);
         break :capabilities state.capability_resolver.available(
-            active.model,
-            provider_bundle.fallbackModelCapabilities(active.model),
+            model,
+            provider_bundle.fallbackModelCapabilities(model),
         );
     };
     const context_window = capabilities.context_window orelse return;

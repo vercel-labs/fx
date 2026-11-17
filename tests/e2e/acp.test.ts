@@ -9070,17 +9070,23 @@ describe("acp: model-independent", () => {
         expect(listed.error).toBeUndefined();
         expect(Array.isArray(listed.result.sessions)).toBe(true);
 
+        // set_config_option is answered during a turn; the turn keeps its own
+        // settings, so the change applies from the next turn.
         client.send({
           jsonrpc: "2.0",
           id: 98,
           method: "session/set_config_option",
-          params: { sessionId: runningId, configId: "provider", value: "codex" },
+          params: { sessionId: runningId, configId: "mode", value: "ask" },
         });
-        const providerChange = await readResponse(client, 98);
-        expect(providerChange.error).toEqual({
-          code: -32600,
-          message: "Prompt already in progress",
-        });
+        const modeChange = await readResponse(client, 98);
+        expect(modeChange.error).toBeUndefined();
+        expect(Array.isArray(modeChange.result.configOptions)).toBe(true);
+        expect(modeChange.result.configOptions.find((option: any) => option.id === "mode").currentValue).toBe("ask");
+
+        // The turn still holds the requests of its own session that wait for it.
+        client.send({ jsonrpc: "2.0", id: 101, method: "session/delete", params: { sessionId: runningId } });
+        const heldDelete = await readResponse(client, 101);
+        expect(heldDelete.error).toEqual({ code: -32600, message: "Prompt already in progress" });
 
         const other = await client.request("session/new", { cwd: root.workspace, mcpServers: [] }, 99) as any;
         expect(other.error).toBeUndefined();
@@ -9099,6 +9105,86 @@ describe("acp: model-independent", () => {
         expect(client.stderr).toBe("");
       } finally {
         heldResponse.resolve(finalText("held prompt cleanup"));
+        await client?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "a model change during a turn applies from the next turn",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-model-change-turn-");
+      writeFileSync(join(root.workspace, "note.txt"), "MODEL_CHANGE_NOTE\n");
+      const heldReply = deferred<Response>();
+      const gateway = startFakeGateway(
+        [
+          () => heldReply.promise,
+          finalText("CONFIG_TURN_ONE_DONE"),
+          finalText("CONFIG_TURN_TWO_DONE"),
+        ],
+        {
+          models: [
+            { id: FAKE_GATEWAY_MODEL, type: "language", tags: ["tool-use"] },
+            { id: "o4-mini", type: "language", tags: ["tool-use"] },
+          ],
+        },
+      );
+      try {
+        client = await AcpClient.create({
+          cwd: root.workspace,
+          env: fakeGatewayEnv(root, gateway),
+        });
+        const runningId = await startAutoSession(client);
+        sendPrompt(client, 4, "Read note.txt, then answer.");
+        await waitForCondition(
+          "the first Gateway request of the turn",
+          () => gateway.requests.length === 1,
+        );
+
+        // The model change is answered while the first request is still held.
+        client.send({
+          jsonrpc: "2.0",
+          id: 5,
+          method: "session/set_config_option",
+          params: { sessionId: runningId, configId: "model", value: "o4-mini" },
+        });
+        const modelChange = await readResponse(client, 5);
+        expect(modelChange.error).toBeUndefined();
+        expect(modelChange.result.configOptions.find((option: any) => option.id === "model").currentValue)
+          .toBe("o4-mini");
+
+        heldReply.resolve(fakeGatewaySse([
+          {
+            type: "tool-call",
+            toolCallId: "model_change_read_1",
+            toolName: "read_file",
+            input: { path: "note.txt" },
+          },
+          {
+            type: "finish",
+            finishReason: { unified: "tool-calls", raw: "tool-calls" },
+          },
+        ]));
+        await waitForCondition("the held prompt's answer", () => rawResponse(client!, 4) !== undefined, TIMEOUT);
+        const promptOne = rawResponse(client, 4);
+        expect(promptOne.error).toBeUndefined();
+        expect(promptOne.result.stopReason).toBe("end_turn");
+
+        sendPrompt(client, 6, "Answer again.");
+        const promptTwo = await readResponse(client, 6);
+        expect(promptTwo.error).toBeUndefined();
+        expect(promptTwo.result.stopReason).toBe("end_turn");
+
+        // The first turn's two requests keep the model it started with; the
+        // second turn starts on the changed model.
+        expect(gateway.requests.map((request) => request.headers.get("ai-language-model-id")))
+          .toEqual([FAKE_GATEWAY_MODEL, FAKE_GATEWAY_MODEL, "o4-mini"]);
+        expect(client.stderr).toBe("");
+      } finally {
+        heldReply.resolve(finalText("model change cleanup"));
         await client?.close();
         gateway.stop();
         rmSync(root.root, { recursive: true, force: true });
