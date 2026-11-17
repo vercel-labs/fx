@@ -521,7 +521,7 @@ fn buildFooterSurfaceProjection(
     else if (show_auth_picker)
         .auth
     else if (show_model_query)
-        .model_stage
+        if (ctx.copy_query_active) .copy_stage else .model_stage
     else if (show_provider_query)
         .provider_stage
     else if (show_file_query)
