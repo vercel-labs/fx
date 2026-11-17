@@ -1172,8 +1172,8 @@ test "featured deepseek slot prefers the pro variant at equal recency" {
 test "picker keeps its highlights first and every Token Pass mark" {
     const candidates = [_]ModelCatalogEntry{
         .{ .id = @constCast("anthropic/claude-fable-5"), .model_type = @constCast("language"), .released = 300, .has_tool_use = true },
-        .{ .id = @constCast("openai/gpt-6"), .model_type = @constCast("language"), .released = 290, .has_tool_use = true },
-        .{ .id = @constCast("deepseek/deepseek-v4.1-pro"), .model_type = @constCast("language"), .released = 260, .has_tool_use = true },
+        .{ .id = @constCast("openai/gpt-6-sol"), .model_type = @constCast("language"), .released = 290, .has_tool_use = true },
+        .{ .id = @constCast("deepseek/deepseek-v4-pro"), .model_type = @constCast("language"), .released = 260, .has_tool_use = true },
         .{ .id = @constCast("deepseek/deepseek-v4.1-flash"), .model_type = @constCast("language"), .released = 255, .has_tool_use = true, .token_pass = true },
         .{ .id = @constCast("zai/glm-5.3"), .model_type = @constCast("language"), .released = 250, .has_tool_use = true, .token_pass = true },
         .{ .id = @constCast("zai/glm-5.3-flash"), .model_type = @constCast("language"), .released = 240, .has_tool_use = true, .token_pass = true },
@@ -1187,7 +1187,7 @@ test "picker keeps its highlights first and every Token Pass mark" {
 
     // The catalog does not know the team, so Token Pass models keep their
     // usual places; the model menu moves them up for a team with Token Pass.
-    const highlights = [_][]const u8{ "anthropic/claude-fable-5", "openai/gpt-6", "zai/glm-5.3", "deepseek/deepseek-v4.1-pro" };
+    const highlights = [_][]const u8{ "anthropic/claude-fable-5", "openai/gpt-6-sol", "zai/glm-5.3", "deepseek/deepseek-v4-pro" };
     for (highlights, curated.items[0..highlights.len]) |id, entry| try std.testing.expectEqualStrings(id, entry.id);
     try std.testing.expectEqual(candidates.len, curated.items.len);
     for (candidates) |candidate| {

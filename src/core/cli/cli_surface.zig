@@ -2084,7 +2084,7 @@ fn runNonInteractiveWithDeps(
                 };
                 return runSessionConvert(alloc, deps, format);
             }
-            const opts = parseSessionListArgs(rest) catch |err| {
+            const opts = parseSessionListArgs(sessionListArgs(rest)) catch |err| {
                 try writeUsageOrJsonError(alloc, cfg.command_catalog, deps, .sessions, "sessions", err, rest);
                 return usage_failure;
             };
@@ -4793,6 +4793,13 @@ fn channelSavedLine(
 const SessionListFlag = enum { live, all, limit, cursor, json };
 const session_list_flag_ids = cli_flags.idTable(SessionListFlag, &builtin_commands.sessions_options);
 
+/// The `sessions` arguments that name the list action. `fx sessions` lists by
+/// default, and `fx sessions ls` names the same action.
+fn sessionListArgs(rest: []const [:0]const u8) []const [:0]const u8 {
+    if (rest.len > 0 and std.mem.eql(u8, rest[0], "ls")) return rest[1..];
+    return rest;
+}
+
 fn parseSessionListArgs(args: []const [:0]const u8) !SessionListOptions {
     var options = SessionListOptions{};
     var parser: cli_flags.Parser = .init(&builtin_commands.sessions_options, args);
@@ -4816,6 +4823,12 @@ fn parseSessionListArgs(args: []const [:0]const u8) !SessionListOptions {
         },
     };
     return options;
+}
+
+test "fx sessions ls names the default list action" {
+    try std.testing.expectEqual(@as(usize, 0), sessionListArgs(&.{"ls"}).len);
+    try std.testing.expectEqualStrings("--json", sessionListArgs(&.{ "ls", "--json" })[0]);
+    try std.testing.expectEqualStrings("--json", sessionListArgs(&.{"--json"})[0]);
 }
 
 test "fx sessions --live reads through the shared parser and names the paging flag it refuses" {
@@ -5212,6 +5225,10 @@ test "parse recognizes every top-level command and preserves unknown commands" {
     }
     switch (parse(command_catalog, &.{ @constCast("sessions"), @constCast("--json") })) {
         .sessions => |rest| try std.testing.expectEqual(@as(usize, 1), rest.len),
+        else => return error.TestExpectedEqual,
+    }
+    switch (parse(command_catalog, &.{ @constCast("sessions"), @constCast("ls"), @constCast("--json") })) {
+        .sessions => |rest| try std.testing.expectEqual(@as(usize, 2), rest.len),
         else => return error.TestExpectedEqual,
     }
     switch (parse(command_catalog, &.{ @constCast("resume"), @constCast("last") })) {
