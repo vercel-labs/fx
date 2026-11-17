@@ -1981,7 +1981,7 @@ pub const CopyError = Allocator.Error || error{InvalidRequest};
 /// `init.lock`, which pruning holds, so no commit is pruned between listing
 /// it and naming it. Memory belongs to `arena`.
 pub fn copySessionRefs(arena: Allocator, request: CopyRequest) CopyError!CopyResult {
-    if (!validSessionId(request.from_session_id) or !validSessionId(request.to_session_id) or
+    if (!session_adapter.validSessionId(request.from_session_id) or !session_adapter.validSessionId(request.to_session_id) or
         std.mem.eql(u8, request.from_session_id, request.to_session_id) or
         !std.Io.Dir.path.isAbsolute(request.profile_root)) return error.InvalidRequest;
     const io = io_mod.getIo();
