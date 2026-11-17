@@ -3,7 +3,7 @@ const testing_allocator = @import("../../shared/testing_allocator.zig");
 const json_number = @import("../json_number.zig");
 const mcp_contract = @import("../mcp_contract.zig");
 const mrtr = @import("../mrtr.zig");
-const json_depth = @import("../json_depth.zig");
+const server_json_depth = @import("../server_json_depth.zig");
 const mem_utils = @import("../../shared/mem_utils.zig");
 
 const Allocator = std.mem.Allocator;
@@ -140,7 +140,7 @@ pub fn parseCallOutcome(
     }
     const result = parsed.value.object.get("result") orelse return error.InvalidCallResult;
     if (result != .object) return error.InvalidCallResult;
-    try json_depth.require(result, .result);
+    try server_json_depth.require(result, .result);
     const result_type = result.object.get("resultType");
     if (result_type) |value| {
         if (value != .string) return error.InvalidCallResult;
@@ -352,7 +352,7 @@ fn parseTool(alloc: Allocator, value: std.json.Value, limits: Limits) Error!Tool
     if (value.object.get("outputSchema")) |output_schema| {
         try prepareSchema(output_schema, false);
     }
-    try json_depth.require(value, .tool);
+    try server_json_depth.require(value, .tool);
     if (value.object.get("icons")) |icons| try validateIcons(icons, limits);
     if (value.object.get("annotations")) |annotations| try validateToolAnnotations(annotations, limits);
     if (value.object.get("_meta")) |metadata| if (metadata != .object) return error.InvalidTool;
@@ -413,8 +413,8 @@ fn parseProtocolError(alloc: Allocator, value: std.json.Value, limits: Limits) E
     const owned_message = try alloc.dupe(u8, message.string);
     errdefer mem_utils.free(alloc, owned_message);
     const data_json = if (value.object.get("data")) |data| data_json: {
-        if (json_depth.within(data, json_depth.max_server_json_depth)) break :data_json try stringifyValueAlloc(alloc, data, limits.max_metadata_bytes);
-        json_depth.traceRefused(.data);
+        if (server_json_depth.within(data, server_json_depth.max_server_json_depth)) break :data_json try stringifyValueAlloc(alloc, data, limits.max_metadata_bytes);
+        server_json_depth.traceRefused(.data);
         break :data_json null;
     } else null;
     return .{ .code = parsed_code, .message = owned_message, .data_json = data_json };
@@ -1027,9 +1027,9 @@ test "MCP argument repair keeps its laws on fuzzed schemas and arguments" {
 }
 
 // A server's JSON is written again by `std.json.Stringify`, which holds 256 levels in a safe build, so a
-// result or a listed tool nested past 128 levels is refused (`src/core/mcp/json_depth.zig`).
+// result or a listed tool nested past 128 levels is refused (`src/core/mcp/server_json_depth.zig`).
 
-const depth_testing = @import("../json_depth_testing.zig");
+const depth_testing = @import("../server_json_depth_testing.zig");
 
 fn expectResultRefused(response: []const u8) !void {
     const alloc = std.testing.allocator;
@@ -1074,7 +1074,7 @@ test "a result nested one level past the limit is refused whatever its site and 
 
 test "a result nested 300 levels deep is refused and does not abort" {
     const alloc = std.testing.allocator;
-    // 257 levels or more abort `std.json.Stringify` in a safe build: this test dies there today.
+    // 257 levels or more abort `std.json.Stringify` in a safe build, so without the check this test aborts there.
     for (result_sites) |site| for ([_]usize{ 257, 300, 2000 }) |depth| {
         const response = try depth_testing.response(alloc, site, depth, .objects);
         defer alloc.free(response);
@@ -1102,7 +1102,7 @@ test "a listed tool nested one level past the limit is refused whatever its site
 
 test "a listed tool nested 300 levels deep is refused and does not abort" {
     const alloc = std.testing.allocator;
-    // 257 levels or more abort `std.json.Stringify` in a safe build: this test dies there today.
+    // 257 levels or more abort `std.json.Stringify` in a safe build, so without the check this test aborts there.
     for (tool_sites) |site| for ([_]usize{ 258, 300, 2000 }) |depth| {
         const json = try depth_testing.tool(alloc, site, depth, .objects);
         defer alloc.free(json);
@@ -1126,7 +1126,7 @@ test "an input schema nested past 64 levels is still refused as a schema, ahead 
     for ([_]usize{ 65, 129, 300 }) |depth| {
         const schema = try depth_testing.text(alloc, depth, .objects, true);
         defer alloc.free(schema);
-        const json = try std.fmt.allocPrint(alloc, "{{\"name\":\"deep\",\"inputSchema\":{{\"type\":\"object\",\"x\":{s}}}}}", .{schema});
+        const json = try alloc.print("{{\"name\":\"deep\",\"inputSchema\":{{\"type\":\"object\",\"x\":{s}}}}}", .{schema});
         defer alloc.free(json);
         try std.testing.expectError(error.SchemaLimitExceeded, parseToolJson(alloc, json, .{}));
     }
@@ -1137,8 +1137,7 @@ test "nesting inside a string is not nesting, and a wide shallow result is uncha
     const brackets = try alloc.alloc(u8, 5000);
     defer alloc.free(brackets);
     @memset(brackets, '[');
-    const in_string = try std.fmt.allocPrint(
-        alloc,
+    const in_string = try alloc.print(
         "{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"content\":[{{\"type\":\"text\",\"text\":\"ok {s}\"}}]}}}}",
         .{brackets},
     );
@@ -1148,8 +1147,7 @@ test "nesting inside a string is not nesting, and a wide shallow result is uncha
     const filler = try alloc.alloc(u8, 1024 * 1024 - 4096);
     defer alloc.free(filler);
     @memset(filler, 'w');
-    const wide = try std.fmt.allocPrint(
-        alloc,
+    const wide = try alloc.print(
         "{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"content\":[{{\"type\":\"text\",\"text\":\"ok {s}\"}}]}}}}",
         .{filler},
     );
@@ -1185,8 +1183,7 @@ test "many results at the limit and 1 MiB wide, and many refused ones, in a row 
     // The wide part sits in the text, and the nesting is the structured content: the result is at the limit.
     const nested = try depth_testing.text(alloc, 127, .objects, true);
     defer alloc.free(nested);
-    const wide = try std.fmt.allocPrint(
-        alloc,
+    const wide = try alloc.print(
         "{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"content\":[{{\"type\":\"text\",\"text\":\"ok {s}\"}}],\"structuredContent\":{s}}}}}",
         .{ filler, nested },
     );
@@ -1276,7 +1273,7 @@ test "an error's data nested past the limit is left out and the error is kept, w
 
 test "an error's data nested 300 levels deep is left out and does not abort" {
     const alloc = std.testing.allocator;
-    // 257 levels or more abort `std.json.Stringify` in a safe build: this test dies there today.
+    // 257 levels or more abort `std.json.Stringify` in a safe build, so without the check this test aborts there.
     for ([_]usize{ 2000, 300, 257 }) |depth| {
         const response = try depth_testing.errorResponse(alloc, depth, .objects);
         defer alloc.free(response);
@@ -1308,22 +1305,19 @@ test "a refused result, tool and error data each leave one trace line with the c
     const marker = "SERVER_TEXT_MARKER";
     const nested = try depth_testing.text(alloc, 200, .objects, true);
     defer alloc.free(nested);
-    const result = try std.fmt.allocPrint(
-        alloc,
+    const result = try alloc.print(
         "{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"content\":[{{\"type\":\"text\",\"text\":\"{s}\"}}],\"structuredContent\":{s}}}}}",
         .{ marker, nested },
     );
     defer alloc.free(result);
     try expectResultRefused(result);
-    const tool = try std.fmt.allocPrint(
-        alloc,
+    const tool = try alloc.print(
         "{{\"name\":\"{s}\",\"description\":\"{s}\",\"inputSchema\":{{\"type\":\"object\"}},\"_meta\":{s}}}",
         .{ marker, marker, nested },
     );
     defer alloc.free(tool);
     try expectToolRefused(tool);
-    const failure = try std.fmt.allocPrint(
-        alloc,
+    const failure = try alloc.print(
         "{{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{{\"code\":-32602,\"message\":\"{s}\",\"data\":{s}}}}}",
         .{ marker, nested },
     );

@@ -4090,7 +4090,7 @@ describe("MCP stdio servers", () => {
   }, 25_000);
 
   // A server's JSON is written again by `std.json.Stringify`, which holds 256 levels in a safe build, so fx
-  // refuses a result or a listed tool nested past 128 levels (`src/core/mcp/json_depth.zig`).
+  // refuses a result or a listed tool nested past 128 levels (`src/core/mcp/server_json_depth.zig`).
   const DEEP_WORDS = "the server's reply is nested deeper than fx accepts (128 levels)";
   // What the toolbox says of a tool it does not list, and what it shows of one it does (the deep tool's description).
   const NOT_LISTED = "Nothing named mcp_fixture_deep is in the toolbox menu";
@@ -4117,7 +4117,7 @@ describe("MCP stdio servers", () => {
         const root = deepRoot(`deep-${site}-${depth}`, site, depth);
         gateway = deepGateway(`DEEP_${depth}_DONE`, false);
         const result = await ask(root, "Use the stdio MCP echo tool.");
-        // Not a crash: a result 257 levels deep or more aborts fx today.
+        // Not a crash: without the limit, a result 257 levels deep or more aborts fx.
         expect({ depth, code: result.code, signal: result.signal }).toEqual({ depth, code: 0, signal: null });
         expect(result.stdout).toContain(`DEEP_${depth}_DONE`);
         expect(toolResultText(gateway.requests.at(-1)!.body, "call_mcp")).toContain(`MCP protocol failure: ${DEEP_WORDS}`);
@@ -4153,7 +4153,7 @@ describe("MCP stdio servers", () => {
         const root = deepRoot(`deep-${site}-${depth}`, site, depth);
         gateway = deepGateway(`DEEP_TOOL_${depth}_DONE`, true);
         const result = await ask(root, "Use the stdio MCP echo tool.");
-        // Not a crash at connect: a tool listing 258 levels deep or more aborts fx today.
+        // Not a crash at connect: without the limit, a tool listing 258 levels deep or more aborts fx.
         expect({ depth, code: result.code, signal: result.signal }).toEqual({ depth, code: 0, signal: null });
         expect(toolResultText(gateway.requests.at(-1)!.body, "select_deep")).toContain(NOT_LISTED);
         expect(toolResultText(gateway.requests.at(-1)!.body, "call_mcp")).toContain(LEGACY_RESULT);
@@ -4198,7 +4198,7 @@ describe("MCP stdio servers", () => {
     }
   }, 60_000);
 
-  test("a protocol error whose data is nested 2000 levels deep reaches the model as it does today", async () => {
+  test("a protocol error whose data is nested 2000 levels deep still reaches the model with its message", async () => {
     // The depth limit reads a result only: an error's data is never written again as it is.
     const root = deepRoot("deep-error-data", "error_data", 2000);
     gateway = deepGateway("DEEP_ERROR_DATA_DONE", false);

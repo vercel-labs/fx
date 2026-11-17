@@ -8,9 +8,10 @@
 // (refused), or fx aborted (crashed). All the runs are one trace, checked against
 // tests/tla/mcp/WireDepth.tla twice: with the limit of 128 it must be ACCEPTED, and the
 // model of the host before the limit (Limit = the engine's own) must REJECT it, so the
-// check can tell the two apart. The form entry point has no run here: a form reaches
-// it only through an ACP client (tests/e2e/acp.test.ts, and the Zig tests in
-// src/core/mcp/elicitation.zig).
+// check can tell the two apart. The form entry point has no run here: the MRTR reader
+// refuses a form deeper than 32 levels before the form check sees it
+// (src/core/mcp/mrtr.zig), so no run through fx reaches that check. Only the Zig tests in
+// src/core/mcp/elicitation.zig cover it.
 import { expect, test } from "bun:test";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";

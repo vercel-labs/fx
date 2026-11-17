@@ -1,24 +1,27 @@
 //! The depth limit on a server's JSON, where the host turns it into a value.
 //!
 //! The engine hands the host a message up to about 2,580 levels deep. Writers then write that value, or
-//! a part of it, again with `std.json.Stringify`, which keeps its nesting in a stack of 256 levels in a
-//! safe build (Debug and ReleaseSafe, `std/json/Stringify.zig` `nesting_stack`) and aborts past it. So
-//! each place that reads a server's JSON into a value checks it with `require` first: a tool call's
-//! result and an error's data (`features/tools.zig`), a listed tool (`features/tools.zig`) and an
-//! elicitation form (`elicitation.zig`). There is no per-writer limit.
+//! a part of it, again with `std.json.Stringify`, which keeps its nesting in a fixed stack of 256 levels
+//! in a safe build (Debug and ReleaseSafe) and aborts past it. So each place that reads a server's JSON
+//! into a value checks it with `require` first: a tool call's result and an error's data
+//! (`features/tools.zig`), a listed tool (`features/tools.zig`) and an elicitation form
+//! (`elicitation.zig`). There is no per-writer limit.
+//!
+//! This is not `../shared/json_depth.zig`, which limits the raw text of a provider's JSON to 64 levels
+//! before it is parsed. This file limits a parsed value from an MCP server to 128 levels.
 
 const std = @import("std");
 const debug_trace = @import("../shared/debug_trace.zig");
 
 /// The deepest value fx accepts from a server: 128 levels of arrays and objects, where `{}` is one level.
 /// `std.json.Stringify` holds 256 levels, and a writer wraps the value it writes in at most 4 more
-/// (headroom: none adds more than 2 today, `bridgeResultData`'s envelope), so 128 leaves room.
+/// (headroom: none adds more than 2, `bridgeResultData`'s envelope), so 128 leaves room.
 /// `tests/tla/mcp/WireDepth.tla` `NoWriterOverflow`: whatever an entry point accepts, every writer behind
 /// it can write. Change this limit only with that model's `Limit` and `Capacity`.
 pub const max_server_json_depth: usize = 128;
 
 /// Where a value too deep was met, as the trace names it.
-pub const Place = enum { result, tool, form, data };
+const Place = enum { result, tool, form, data };
 
 const Frame = union(enum) {
     array: struct { items: []const std.json.Value, next: usize },
@@ -78,22 +81,7 @@ pub fn require(value: std.json.Value, place: Place) error{NestingTooDeep}!void {
     return error.NestingTooDeep;
 }
 
-fn nested(arena: std.mem.Allocator, depth: usize, shape: enum { arrays, objects, mixed }) !std.json.Value {
-    var value: std.json.Value = .{ .integer = 1 };
-    for (0..depth) |level| {
-        const object = shape == .objects or (shape == .mixed and level % 2 == 0);
-        if (object) {
-            var map: std.json.ObjectMap = .empty;
-            try map.put(arena, "a", value);
-            value = .{ .object = map };
-        } else {
-            var array = std.json.Array.init(arena);
-            try array.append(value);
-            value = .{ .array = array };
-        }
-    }
-    return value;
-}
+const depth_testing = @import("server_json_depth_testing.zig");
 
 test "a scalar is no level, and an empty array or object is one" {
     var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
@@ -102,8 +90,8 @@ test "a scalar is no level, and an empty array or object is one" {
     try std.testing.expect(within(.{ .integer = 1 }, 0));
     try std.testing.expect(within(.null, 0));
     try std.testing.expect(within(.{ .string = "[[[[[[[[[[" }, 0));
-    try std.testing.expect(!within(try nested(arena, 1, .arrays), 0));
-    try std.testing.expect(within(try nested(arena, 1, .arrays), 1));
+    try std.testing.expect(!within(try depth_testing.value(arena, 1, .arrays), 0));
+    try std.testing.expect(within(try depth_testing.value(arena, 1, .arrays), 1));
     try std.testing.expect(within(.{ .object = .empty }, 1));
     try std.testing.expect(!within(.{ .object = .empty }, 0));
 }
@@ -114,23 +102,23 @@ test "a value at the limit is within it and one level more is not, whatever its 
     const arena = arena_state.allocator();
     inline for (.{ .arrays, .objects, .mixed }) |shape| {
         for ([_]usize{ 1, 2, 64, 127, 128 }) |depth| {
-            try std.testing.expect(within(try nested(arena, depth, shape), max_server_json_depth));
+            try std.testing.expect(within(try depth_testing.value(arena, depth, shape), max_server_json_depth));
         }
         for ([_]usize{ 129, 130, 256, 257, 1000 }) |depth| {
-            try std.testing.expect(!within(try nested(arena, depth, shape), max_server_json_depth));
+            try std.testing.expect(!within(try depth_testing.value(arena, depth, shape), max_server_json_depth));
         }
     }
     // A smaller max is honoured exactly.
-    try std.testing.expect(within(try nested(arena, 5, .objects), 5));
-    try std.testing.expect(!within(try nested(arena, 6, .objects), 5));
+    try std.testing.expect(within(try depth_testing.value(arena, 5, .objects), 5));
+    try std.testing.expect(!within(try depth_testing.value(arena, 6, .objects), 5));
 }
 
 test "a value a hundred thousand levels deep is refused without recursion or a long walk" {
     var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    try std.testing.expect(!within(try nested(arena, 100_000, .arrays), max_server_json_depth));
-    try std.testing.expect(!within(try nested(arena, 100_000, .mixed), max_server_json_depth));
+    try std.testing.expect(!within(try depth_testing.value(arena, 100_000, .arrays), max_server_json_depth));
+    try std.testing.expect(!within(try depth_testing.value(arena, 100_000, .mixed), max_server_json_depth));
 }
 
 test "a wide shallow value is within the limit however many items it has" {
@@ -142,24 +130,23 @@ test "a wide shallow value is within the limit however many items it has" {
     try std.testing.expect(within(.{ .array = array }, max_server_json_depth));
     // The depth is the deepest branch, not the sum of the branches.
     var wide = std.json.Array.init(arena);
-    for (0..1000) |_| try wide.append(try nested(arena, 100, .objects));
+    for (0..1000) |_| try wide.append(try depth_testing.value(arena, 100, .objects));
     try std.testing.expect(within(.{ .array = wide }, max_server_json_depth));
     var one_deep = std.json.Array.init(arena);
-    for (0..1000) |_| try one_deep.append(try nested(arena, 127, .objects));
-    try one_deep.append(try nested(arena, 128, .objects));
+    for (0..1000) |_| try one_deep.append(try depth_testing.value(arena, 127, .objects));
+    try one_deep.append(try depth_testing.value(arena, 128, .objects));
     try std.testing.expect(!within(.{ .array = one_deep }, max_server_json_depth));
 }
 
 test "require passes a value within the limit and refuses a deeper one with the trace line" {
     const alloc = std.testing.allocator;
-    const depth_testing = @import("json_depth_testing.zig");
     var capture = try depth_testing.TraceCapture.start(alloc);
     defer capture.stop();
     var arena_state: std.heap.ArenaAllocator = .init(alloc);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    try require(try nested(arena, 128, .objects), .result);
-    try std.testing.expectError(error.NestingTooDeep, require(try nested(arena, 129, .objects), .tool));
+    try require(try depth_testing.value(arena, 128, .objects), .result);
+    try std.testing.expectError(error.NestingTooDeep, require(try depth_testing.value(arena, 129, .objects), .tool));
     var lines = try capture.lines("JSON refused");
     defer {
         for (lines.items) |line| alloc.free(line);

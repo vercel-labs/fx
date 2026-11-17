@@ -2,24 +2,27 @@
 \* How deep a server's JSON may be when fx writes it again. The engine hands the host
 \* any message up to EngineLimit levels deep (src/mcp/protocol/wire.zig, scan_stack_bytes:
 \* 2,584 levels for a message, so 2,581 for a listed tool's own value, which sits three
-\* levels inside its message);
-\* a deeper one it drops, and the call waits (the sibling N6). The host turns a
-\* server's JSON into a value at three entry points: a tool call's result
-\* (parseCallOutcome), a listed tool (parseTool) and an elicitation form (parseRequest).
-\* Writers then write that value, or a part of it, again with std.json.Stringify,
-\* which keeps its nesting in a stack of Capacity levels in a safe build (Debug and
-\* ReleaseSafe; std/json/Stringify.zig), and aborts past it. A writer may add Wrap
-\* levels of its own around the value, such as an envelope.
+\* levels inside its message). A deeper message has no readable id, so the engine drops
+\* it, and the calls waiting on that connection end after the engine's grace for a line it
+\* cannot read, as "the server's answer was malformed". The host turns a server's JSON
+\* into a value at three entry points: a tool call's result (parseCallOutcome), a listed
+\* tool (parseTool) and an elicitation form (parseRequest). A form reaches parseRequest
+\* only after the MRTR reader has refused anything deeper than 32 levels
+\* (src/core/mcp/mrtr.zig), so no server reaches the form check: it is a second layer.
+\* Writers then write that value, or a part of it, again with std.json.Stringify, which
+\* keeps its nesting in a fixed stack of Capacity levels in a safe build (Debug and
+\* ReleaseSafe), and aborts past it. A writer may add Wrap levels of its own around the
+\* value, such as an envelope.
 \*
 \* An entry point accepts a message that is at most Limit levels deep and refuses a
-\* deeper one with a tool error (src/core/mcp/json_depth.zig, `within`). Skips names
+\* deeper one with a tool error (src/core/mcp/server_json_depth.zig, `within`). Skips names
 \* entry points that skip the check; none does in the code. NoWriterOverflow: whatever
 \* an entry point accepts, every writer behind it can write. The other properties
 \* keep the limit honest: a message within it is accepted, one past it is refused, and
 \* only a message past the engine's own limit is dropped.
 \*
-\* Today there is no limit but the engine's (WireDepth.findings.cfg), so a message
-\* between Capacity and EngineLimit levels deep is accepted and aborts a writer.
+\* Before this change there was no limit but the engine's (WireDepth.findings.cfg), so a
+\* message between Capacity and EngineLimit levels deep was accepted and aborted a writer.
 \* Not modelled: an error's data, which the host never writes as the server sent it
 \* (src/core/mcp_host/model.zig, render builds the error's envelope itself).
 EXTENDS Naturals

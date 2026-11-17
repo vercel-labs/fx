@@ -1,6 +1,6 @@
 const std = @import("std");
 const testing_allocator = @import("../shared/testing_allocator.zig");
-const json_depth = @import("json_depth.zig");
+const server_json_depth = @import("server_json_depth.zig");
 const json_number = @import("json_number.zig");
 const json_schema_pattern = @import("json_schema_pattern.zig");
 
@@ -624,7 +624,7 @@ pub fn parseRequest(
     };
     defer parsed.deinit();
     if (parsed.value != .object) return error.InvalidRequest;
-    json_depth.require(parsed.value, .form) catch return error.LimitExceeded;
+    server_json_depth.require(parsed.value, .form) catch return error.LimitExceeded;
 
     const mode_value = parsed.value.object.get("mode");
     const mode = parseMode(wire, mode_value);
@@ -2156,9 +2156,9 @@ test "elicitation request and response parsers stay bounded under fuzzed bytes" 
 }
 
 // A server's JSON is written again by `std.json.Stringify`, which holds 256 levels in a safe build, so a
-// form nested past 128 levels is refused (`src/core/mcp/json_depth.zig`).
+// form nested past 128 levels is refused (`src/core/mcp/server_json_depth.zig`).
 
-const depth_testing = @import("json_depth_testing.zig");
+const depth_testing = @import("server_json_depth_testing.zig");
 
 fn expectFormRefused(params: []const u8) !void {
     const alloc = std.testing.allocator;
@@ -2183,7 +2183,7 @@ test "a form nested one level past the limit through _meta is refused whatever i
 
 test "a form nested 300 levels deep through _meta is refused and never reaches the ACP projection" {
     const alloc = std.testing.allocator;
-    // The projection aborts on 257 levels or more: today this test fails at the first refusal it expects.
+    // The ACP projection would abort on 257 levels or more, so the check must refuse such a form first.
     for ([_]usize{ 257, 300, 2000 }) |depth| {
         const params = try depth_testing.elicitationMeta(alloc, depth, .objects);
         defer alloc.free(params);
@@ -2222,7 +2222,7 @@ test "a requested schema nested past the limit is refused as nested too deep" {
 
 test "a requested schema nested 300 levels deep is refused and does not abort" {
     const alloc = std.testing.allocator;
-    // Writing the schema again aborts when the schema is 257 levels deep or more: this test dies there today.
+    // Writing the schema again would abort at 257 levels or more, so the check must refuse such a schema first.
     for ([_]usize{ 2000, 300, 258 }) |depth| {
         const params = try depth_testing.elicitationSchema(alloc, depth, .objects);
         defer alloc.free(params);
@@ -2230,15 +2230,12 @@ test "a requested schema nested 300 levels deep is refused and does not abort" {
     }
 }
 
-test "a requested schema within the limit is judged by the schema rules and not by the depth limit" {
+test "a requested schema nested 4, 127 and 128 levels deep is read, as the depth limit leaves it alone" {
     const alloc = std.testing.allocator;
     for ([_]usize{ 4, 127, 128 }) |depth| {
         const params = try depth_testing.elicitationSchema(alloc, depth, .objects);
         defer alloc.free(params);
-        var request = parseRequest(alloc, .modern_mcp, params, .{}) catch |err| {
-            try std.testing.expect(!std.mem.eql(u8, @errorName(err), "LimitExceeded"));
-            continue;
-        };
+        var request = try parseRequest(alloc, .modern_mcp, params, .{});
         request.deinit(alloc);
     }
 }

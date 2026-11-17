@@ -5359,7 +5359,7 @@ describe("acp: model-independent", () => {
   );
 
   // A server's JSON is written again by `std.json.Stringify`, which holds 256 levels in a safe build, so fx
-  // refuses a result or a listed tool nested past 128 levels (`src/core/mcp/json_depth.zig`). The same
+  // refuses a result or a listed tool nested past 128 levels (`src/core/mcp/server_json_depth.zig`). The same
   // cases through `fx mcp` are in mcp-stdio.test.ts.
   for (const [site, depth, listsDeepTool] of [
     ["structured", 258, false],
@@ -5397,7 +5397,7 @@ describe("acp: model-independent", () => {
           await client.readLine();
           await client.request("session/set_mode", { modeId: "auto" }, 3);
           const prompt = await runPrompt(client, "Call the supplied MCP echo tool.", TIMEOUT);
-          // Not a panic: fx aborts on these today and the prompt never ends.
+          // Not a panic or a hang: without the limit fx aborts on these and the prompt never ends.
           expect(prompt.promptResult.result.stopReason).toBe("end_turn");
           expect(client.stderr).toBe("");
           expect(gateway.requests).toHaveLength(listsDeepTool ? 4 : 3);

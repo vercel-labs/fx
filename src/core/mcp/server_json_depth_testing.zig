@@ -1,7 +1,7 @@
 //! Nested JSON for the tests of the depth limit on a server's JSON
 //! (`tests/tla/mcp/WireDepth.tla`): a text with an exact depth, in the shape a test asks for,
 //! and a capture of the trace the limit writes. Only tests import this file: the tests of
-//! `features/tools.zig`, `elicitation.zig` and `json_depth.zig`, and the fuzz target.
+//! `features/tools.zig`, `elicitation.zig` and `server_json_depth.zig`, and the fuzz target.
 
 const std = @import("std");
 const debug_trace = @import("../shared/debug_trace.zig");
@@ -23,6 +23,26 @@ pub fn write(writer: *std.Io.Writer, depth: usize, shape: Shape, object_root: bo
         level -= 1;
         try writer.writeAll(if (isObject(level, shape, object_root)) "}" else "]");
     }
+}
+
+/// The same nesting as `text`, as a value with 1 at the bottom (an object holds it under `"a"`). A loop builds it, so
+/// it can be deeper than `std.json` parses.
+pub fn value(arena: std.mem.Allocator, depth: usize, shape: Shape) std.mem.Allocator.Error!std.json.Value {
+    var inner: std.json.Value = .{ .integer = 1 };
+    var level = depth;
+    while (level > 0) {
+        level -= 1;
+        if (isObject(level, shape, false)) {
+            var map: std.json.ObjectMap = .empty;
+            try map.put(arena, "a", inner);
+            inner = .{ .object = map };
+        } else {
+            var array = std.json.Array.init(arena);
+            try array.append(inner);
+            inner = .{ .array = array };
+        }
+    }
+    return inner;
 }
 
 pub fn text(alloc: std.mem.Allocator, depth: usize, shape: Shape, object_root: bool) std.mem.Allocator.Error![]u8 {

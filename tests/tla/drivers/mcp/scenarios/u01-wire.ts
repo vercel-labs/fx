@@ -102,7 +102,7 @@ const malformedCases: Case[] = [
   raw("unknown fields are ignored", '{"jsonrpc":"2.0","id":3,"extra":{"id":9},"result":{"resultType":"input_required"}}', response("3", "input_required")),
 ];
 
-// The host refuses a result, a tool or a form nested past 128 levels (src/core/mcp/json_depth.zig), because
+// The host refuses a result, a tool or a form nested past 128 levels (src/core/mcp/server_json_depth.zig), because
 // std.json.Stringify aborts past 256. The engine hands the host any message up to 2,584 levels deep
 // (scan_stack_bytes), which is why the host's limit is the one that counts (tests/tla/mcp/WireDepth.tla).
 // `deep(levels)` is a message `levels + 2` deep.
