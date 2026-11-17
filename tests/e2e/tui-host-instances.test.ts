@@ -476,16 +476,16 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
         await session.waitForText(LIST_HINT, 10_000);
         await session.sendKeys("Down");
         await waitForSelected(session, "fx 2");
-        expect(await waitForAnswers(session, [])).toContain("delete close");
+        expect(await waitForAnswers(session, [])).toContain("delete remove");
         await session.sendKeys("BSpace");
-        await session.waitForText("press delete again to close this instance", 10_000);
+        await session.waitForText("press delete again to remove this instance", 10_000);
         await session.sendKeys("BSpace");
         // fx 2 closes, and the row above it, the first, comes back on screen.
         // The list stays open on it, and Delete no longer offers to close it:
         // that would end fx.
         const closed = await session.waitForPane((pane) => !/\bfx 2\b/.test(pane) && pane.includes("esc close"), 15_000);
         expect(shownAnswers(await waitForAnswers(session, ["HOST_ANSWER_A"]))).toEqual(["HOST_ANSWER_A"]);
-        expect(closed).not.toContain("delete close");
+        expect(closed).not.toContain("delete remove");
         await session.sendKeys("BSpace");
         await session.sendKeys("BSpace");
         // Keys are handled in order, so the list closing shows both Deletes ran.
@@ -508,12 +508,12 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
 
         // The list opens on the first instance, the one on screen.
         await session.sendKeys("C-x");
-        await session.waitForText("delete close", 10_000);
+        await session.waitForText("delete remove", 10_000);
         await session.sendKeys("BSpace");
-        await session.waitForText("press delete again to close this instance", 10_000);
+        await session.waitForText("press delete again to remove this instance", 10_000);
         await session.sendKeys("BSpace");
         const closed = await session.waitForPane((pane) => shownAnswers(pane).length === 0 && pane.includes("esc close"), 15_000);
-        expect(closed).not.toContain("delete close");
+        expect(closed).not.toContain("delete remove");
         // The instance left is the one the list goes back to: its row is
         // selected and, as the only instance open, named main.
         expect(agentRows(await session.capturePaneEscapes())).toEqual([{ name: "main", selected: true }]);
@@ -2104,7 +2104,7 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
         await session.sendKeys("Down");
         await waitForSelected(session, "fx 4");
         await session.sendKeys("BSpace");
-        await session.waitForText("press delete again to close this instance", 10_000);
+        await session.waitForText("press delete again to remove this instance", 10_000);
         await session.sendKeys("BSpace");
         await session.waitForPane((pane) => !instanceRow(4).test(pane) && pane.includes(LIST_HINT), 15_000);
         await waitForSelected(session, "fx 3");
@@ -2112,7 +2112,7 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
 
         // Closing fx 3 then shows fx 2.
         await session.sendKeys("BSpace");
-        await session.waitForText("press delete again to close this instance", 10_000);
+        await session.waitForText("press delete again to remove this instance", 10_000);
         await session.sendKeys("BSpace");
         await session.waitForPane((pane) => !instanceRow(3).test(pane) && pane.includes(LIST_HINT), 15_000);
         await waitForSelected(session, "fx 2");

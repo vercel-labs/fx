@@ -304,9 +304,9 @@ const hint_variants = [_][]const u8{
 };
 
 const closable_hint_variants = [_][]const u8{
-    "↑↓ preview     enter switch     delete close     esc close",
-    "↑↓ preview  enter switch  delete close  esc close",
-    "↑↓ preview  enter  delete close  esc",
+    "↑↓ preview     enter switch     delete remove     esc close",
+    "↑↓ preview  enter switch  delete remove  esc close",
+    "↑↓ preview  enter  delete remove  esc",
     "enter switch  esc close",
 };
 
@@ -318,11 +318,11 @@ const search_hint_variants = [_][]const u8{
 };
 
 const armed_hint_variants = [_][]const u8{
-    "press delete again to close this subagent",
+    "press delete again to remove this subagent",
 };
 
 const armed_instance_hint_variants = [_][]const u8{
-    "press delete again to close this instance",
+    "press delete again to remove this instance",
 };
 
 /// Delete closes a subagent's or an instance's row after a second press
