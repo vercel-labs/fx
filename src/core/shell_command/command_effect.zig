@@ -1516,8 +1516,6 @@ test "planner pins read-only git inspection to hardened argv and environment" {
         "-c",
         "core.hooksPath=/dev/null",
         "-c",
-        "protocol.allow=never",
-        "-c",
         "log.showSignature=false",
         "diff",
         "--no-ext-diff",

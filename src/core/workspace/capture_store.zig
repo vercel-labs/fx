@@ -71,6 +71,7 @@ const indexer = @import("../indexer/indexer.zig");
 const policy = @import("workspace_capture.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const sort_utils = @import("../shared/sort_utils.zig");
+const session_adapter = @import("../session/session_adapter.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -191,7 +192,7 @@ const stale_lock_ms: i64 = 2 * std.time.ms_per_min;
 /// `Outcome`; only allocation failure is returned as an error. Memory belongs
 /// to `arena`.
 pub fn capture(arena: Allocator, request: Request) Allocator.Error!Outcome {
-    if (!validSessionId(request.session_id)) return .{ .status = .failed, .reason = .invalid_request };
+    if (!session_adapter.validSessionId(request.session_id)) return .{ .status = .failed, .reason = .invalid_request };
     for ([_][]const u8{ request.profile_root, request.path }) |path| {
         if (!std.Io.Dir.path.isAbsolute(path)) return .{ .status = .failed, .reason = .invalid_request };
     }
@@ -572,7 +573,10 @@ const Run = struct {
     fn headPaths(self: *Run, paths: []const []const u8) Allocator.Error!std.StringHashMapUnmanaged(void) {
         var set: std.StringHashMapUnmanaged(void) = .empty;
         const head = self.facts.head orelse return set;
-        const found = try safe_git.pathsInTree(self.arena, self.ready, self.canonical.work_tree, head, paths, self.limits()) orelse return set;
+        const found = try safe_git.pathsInTree(self.arena, self.ready, self.canonical.work_tree, head, paths, self.limits()) orelse {
+            debug_trace.logf("workspace", "event=workspace_capture_head_paths_failed paths={d} dropped=committed_sensitive_files", .{paths.len});
+            return set;
+        };
         for (found) |path| try set.put(self.arena, path, {});
         return set;
     }
@@ -861,27 +865,6 @@ fn ensurePrivateDir(io: std.Io, path: []const u8) !void {
     try dir.setPermissions(io, .fromMode(0o700));
 }
 
-/// fx's session id rule. It must stay equal to `validId` in
-/// `src/core/session_manager/schema.zig`, which fx cannot import here because
-/// the session manager exports `schema` only in its hook build.
-fn validSessionId(id: []const u8) bool {
-    if (id.len == 0 or id.len > 255 or id[0] == '.') return false;
-    if (std.mem.eql(u8, id, "index.jsonl") or std.mem.eql(u8, id, "index.lock")) return false;
-    for (id) |c| switch (c) {
-        'a'...'z', 'A'...'Z', '0'...'9', '.', '-', '_' => {},
-        else => return false,
-    };
-    return true;
-}
-
-test "capture store session ids follow the session manager's id rule" {
-    for ([_][]const u8{ "abc", "A.b-c_9" }) |id| try testing.expect(validSessionId(id));
-    const long: [256]u8 = @splat('a');
-    for ([_][]const u8{ "", ".hidden", "index.jsonl", "index.lock", "a/b", "a b", &long }) |id| {
-        try testing.expect(!validSessionId(id));
-    }
-}
-
 fn withFailure(base: Outcome, status: Status, reason: policy.Reason) Outcome {
     var outcome = base;
     outcome.status = status;
@@ -896,6 +879,8 @@ fn withGitFailure(base: Outcome, failure: safe_git.Failure) Outcome {
         .timeout => withFailure(base, .unavailable, .timeout),
         .cancelled => withFailure(base, .unavailable, .cancelled),
         .path_rejected => withFailure(base, .failed, .inconsistent),
+        // Config defines a hook for the store that fx cannot turn off.
+        .hooks_refused => withFailure(base, .unavailable, .git_refused),
         .spawn_failed, .input_failed, .read_failed, .output_too_large, .exited_nonzero, .terminated => withFailure(base, .failed, .io_error),
     };
 }
@@ -4618,7 +4603,7 @@ test "capture store: a store or capture index whose check fails fails the captur
     _ = try expectComplete(first);
     const ref = try repos.sessionRef(repo, "s");
     const store_dir = try storeDir(repos.arena, repos.profile, repo.common_dir);
-    const index = try std.Io.Dir.path.join(repos.arena, &.{ try worktreeDir(repos.arena, store_dir, try worktreeIdentity(repos.arena, repo)), worktree_index_name });
+    const index = try std.Io.Dir.path.join(repos.arena, &.{ try worktreeDir(repos.arena, store_dir, try worktreeIdentity(repos.arena, repo)), "index" });
     const index_before = try TestRepos.readAbsolute(repos.arena, index);
     try repos.append("repo/a.txt", "more\n");
 
