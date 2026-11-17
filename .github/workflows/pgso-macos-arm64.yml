@@ -157,6 +157,10 @@ jobs:
             --llvm-bin "${{ steps.setup.outputs.llvm-bin }}" \
             --bun "${{ steps.setup.outputs.bun-bin }}"
 
+      - name: Collect fx crash reports
+        if: always()
+        run: scripts/pgso/collect-crash-reports.sh "$RUNNER_TEMP/fx-pgso-training-${{ matrix.id }}/crash-reports"
+
       - name: Upload training evidence
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -168,6 +172,7 @@ jobs:
             ${{ runner.temp }}/fx-pgso-training-${{ matrix.id }}/failure.json
             ${{ runner.temp }}/fx-pgso-training-${{ matrix.id }}/profile.profdata
             ${{ runner.temp }}/fx-pgso-training-${{ matrix.id }}/logs
+            ${{ runner.temp }}/fx-pgso-training-${{ matrix.id }}/crash-reports
           if-no-files-found: error
           retention-days: 14
 
@@ -296,6 +301,10 @@ jobs:
             --scenarios "${{ matrix.scenarios }}" \
             --bun "${{ steps.setup.outputs.bun-bin }}"
 
+      - name: Collect fx crash reports
+        if: always()
+        run: scripts/pgso/collect-crash-reports.sh "$RUNNER_TEMP/fx-pgso-behavior-${{ matrix.id }}/crash-reports"
+
       - name: Upload behavior evidence
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -308,6 +317,7 @@ jobs:
             ${{ runner.temp }}/fx-pgso-behavior-${{ matrix.id }}/behavior/logs
             ${{ runner.temp }}/fx-pgso-behavior-${{ matrix.id }}/behavior/traces
             ${{ runner.temp }}/fx-pgso-behavior-${{ matrix.id }}/driver-logs
+            ${{ runner.temp }}/fx-pgso-behavior-${{ matrix.id }}/crash-reports
           if-no-files-found: error
           retention-days: 14
 

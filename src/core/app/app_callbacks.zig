@@ -392,6 +392,10 @@ pub fn Bindings(comptime App: type) type {
             if (comptime @hasDecl(App, "releaseAgentTerminalLease")) {
                 deps.release_agent_terminal_lease = agentReleaseTerminalLease;
             }
+            if (comptime @hasDecl(App, "stopSteeringDetachedCommands")) {
+                deps.turn_ends_by_explicit_cancel = agentTurnEndsByExplicitCancel;
+                deps.stop_steering_detached_commands = agentStopSteeringDetachedCommands;
+            }
             return deps;
         }
 
@@ -399,6 +403,19 @@ pub fn Bindings(comptime App: type) type {
             const agent: *AppAgent = @ptrCast(@alignCast(ctx));
             const app = appOf(agent);
             return app.releaseAgentTerminalLease(agent, session_id);
+        }
+
+        /// Main's and each subagent's turns end here. Only an explicit
+        /// cancel stops what steering detached; a turn steering ended keeps
+        /// its commands.
+        fn agentTurnEndsByExplicitCancel(ctx: *anyopaque, turn_id: u64) bool {
+            const agent: *AppAgent = @ptrCast(@alignCast(ctx));
+            return agent.worker.turnEndsByExplicitCancel(turn_id);
+        }
+
+        fn agentStopSteeringDetachedCommands(ctx: *anyopaque, turn_id: u64) !void {
+            const agent: *AppAgent = @ptrCast(@alignCast(ctx));
+            return appOf(agent).stopSteeringDetachedCommands(agent, turn_id);
         }
 
         fn refreshGatewayCredential(
@@ -425,6 +442,14 @@ pub fn Bindings(comptime App: type) type {
             )) orelse return null;
             var owns_refreshed = true;
             defer if (owns_refreshed) refreshed.deinit(std.heap.c_allocator);
+            // This session's own sign-in saved this login before its team is
+            // chosen; that sign-in continues the request with the team.
+            if (comptime @hasField(@TypeOf(app.auth), "sign_in_flow")) {
+                if (mode == .stored and app.auth.sign_in_flow.savedToken(refreshed.token)) {
+                    debug_trace.logf("auth", "stored login skipped source={t} reason=saved_by_this_session", .{source});
+                    return null;
+                }
+            }
             if (app.auth.preparedCredentialChange(refreshed) == .authority) {
                 return error.CredentialAuthorityChanged;
             }
@@ -756,6 +781,15 @@ pub fn Bindings(comptime App: type) type {
             try app_worker_runtime.Runtime(App).pushToolLifecycle(appOf(agent), agent, event);
         }
 
+        /// Keeps the row of a call made through `fx mcp call` in the
+        /// agent's session, so a resume shows it again
+        /// (`tool_runtime.ToolLifecyclePublisher`).
+        pub fn saveNestedBridgeCall(ctx: *anyopaque, record: types.BridgeCallRecord) !void {
+            if (comptime !agents.hasAgentField(App, "session_persistence")) return;
+            const agent: *AppAgent = @ptrCast(@alignCast(ctx));
+            try app_session_runtime.Runtime(App).saveBridgeCall(agent, record);
+        }
+
         fn renderSubagentStatusLine(ctx: *anyopaque, buf: []u8, status: types.SubagentStatus) []const u8 {
             const agent: *AppAgent = @ptrCast(@alignCast(ctx));
             const app = appOf(agent);
@@ -1037,6 +1071,7 @@ pub fn Bindings(comptime App: type) type {
                 .model_output = model_output,
                 .outcome = .rejected,
                 .started_at_ms = io_mod.milliTimestamp(),
+                .call_id = call.id,
             });
         }
 
@@ -1054,6 +1089,7 @@ pub fn Bindings(comptime App: type) type {
                 .model_output = model_output,
                 .outcome = .tool_failed,
                 .started_at_ms = io_mod.milliTimestamp(),
+                .call_id = call.id,
             });
         }
 
@@ -1601,7 +1637,7 @@ pub fn Bindings(comptime App: type) type {
         fn workerBridgeAppendHistoryTurn(ctx: *anyopaque, finished: types.FinishedPrompt) !app_worker_runtime.HistoryDelivery {
             const agent: *AppAgent = @ptrCast(@alignCast(ctx));
             const app = appOf(agent);
-            if (try app.pacer.deferFinish(app.alloc, finished)) return .retained;
+            if (try app_worker_runtime.Runtime(App).deferFinish(app, agent, finished)) return .retained;
             return .{ .settled = try appendHistoryTurn(app, agent, finished) };
         }
 
@@ -1762,7 +1798,7 @@ const FakePacer = struct {
         try self.text.appendSlice(alloc, text);
     }
 
-    fn deferFinish(self: *FakePacer, alloc: std.mem.Allocator, finished: types.FinishedPrompt) !bool {
+    pub fn deferFinish(self: *FakePacer, alloc: std.mem.Allocator, finished: types.FinishedPrompt) !bool {
         _ = alloc;
         _ = finished;
         return self.defer_history;

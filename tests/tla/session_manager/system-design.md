@@ -307,7 +307,8 @@ manager:
   `data` comes from v1's piece codec (`encodeConversationFrame`,
   `src/core/session/session_event.zig` lines 439 to 482). The types are
   `user`, `assistant`, `tool_call`, `tool_result`, `steering`,
-  `context_note` (D93), `runtime_context` (D94), `model_call` (D96), `turn_end` (files and
+  `context_note` (D93), `runtime_context` (D94), `model_call` (D96),
+  `mcp_bridge_call` (D99), `turn_end` (files and
   turn summary), `interruption` (reason detail, partial text, command
   refs, origin), `recovery` and `continues`.
 - **Recovery:** the agent loop's checkpoint becomes a small `recovery` item
@@ -1255,7 +1256,29 @@ Settled for the converter (2026-10-06):
   82% of a real profile) convert too, through v1's older reader; a slow
   one shows the slow notice. So do v1 folders an old release left
   world-readable (0755), which today's v1 refuses: others could only read
-  them, the v2 copy is private, and the readable v1 copy is deleted. `--resume last` picks the newest of the
+  them, the v2 copy is private, and the readable v1 copy is deleted. A
+  member folder others can write, or one with a file or folder directly
+  in it or directly in its `subagent` folder that others can write (its
+  `session.json`, `events.jsonl`, `permissions.json`, lock file,
+  `subagent` folder, `children.json`, relationship index and child
+  markers, and side folders), is not taken (2026-11-16): those files have
+  no digest, so fx could not tell a change from what it saved. Every
+  command gives the same reason: what others can write ("its folder" or
+  the entry's name, written terminal-safe), for a subagent's folder its
+  id, and the fix `chmod -R go-w ~/.fx/sessions/{id}` (`"$FX_HOME"` in
+  place of `~/.fx` when that is set), which needs no quoting since an id
+  holds only letters, digits, `.`, `-` and `_`. A name too long for the reason
+  is left out, not cut. `fx session {id}` and `fx session recover` refuse
+  it as unsafe storage (`DurablePathUnsafe`) with that reason; a
+  symlinked or FIFO folder too, without one. Conversion, `fx ask
+  --resume` and `fx doctor` report it unreadable with that reason, and
+  its v1 folder stays. The leftover v1 folder of a session v2 already
+  holds is kept, not reported. Files deeper in side folders are not
+  checked by mode, so opening a member reads two folders: salvage checks
+  a saved result against the digest its handle names (D74), and
+  conversion copies them as they are. Only mode bits are read, not access
+  control lists, as for all of fx's private state, and a group that holds
+  only the owner counts as others. `--resume last` picks the newest of the
   merged listing. `fx session {id}` shows an unconverted v1 session read
   only, without converting it. A converted session is a v2 session and
   behaves as one: nothing special for converted sessions. The slow notice
@@ -1843,6 +1866,44 @@ as it was sent):
     the copy may fall on either side. `trace/ForkLog.tla` accepts a
     child's copy that ends inside a turn only when its next line ends the
     turn as cancelled, and checks its lines against the fork point's time.
+- **D99 Decision:** each call a command makes through `fx mcp call` and
+  the TUI shows as a row is saved, when it ends, as an `mcp_bridge_call`
+  item in the open turn:
+  `{"call_id":…,"request_id":…,"tool":…,"outcome":…}`, the shell call
+  whose command made it, the bridge's request id, the MCP tool's name, and
+  `completed`, `failed` or `cancelled`. It never holds the call's
+  arguments or its result. A resume shows the row again right after its
+  shell call's row, so the compact view groups it as it did live, except
+  in a turn interrupted while the command ran (below).
+  - **Write:** the item goes out on its own write, outside the streamed
+    pieces, as `tool_running` (D28) and `recovery` do, and that write takes
+    the session's lock as every write does
+    (`tests/tla/session/SessionWrite.tla` NoStaleRemoval). The shell call
+    is still running, so its turn is open. With no turn open, or when the
+    write fails, the row is logged as dropped and the call goes on.
+  - **Who writes:** only the TUI, which is the only host that shows the
+    rows. A subagent, ACP and `fx ask` save none.
+  - **Reading:** a record is read with its unknown fields ignored, and one
+    whose strings aren't short, valid UTF-8 without control characters, or
+    whose outcome this fx doesn't know, is left out with a trace line. A
+    record whose shell call the turn no longer holds, such as after a
+    compaction, shows no row. A turn closed as superseded loses its
+    records with it.
+  - **Interrupted turn:** a resume draws a cancelled command's row only
+    from the output its turn saved, as it did before D99. When the user
+    cancels a turn while the command runs and the command saved no
+    output, such as one cancelled before it printed anything, the
+    resume shows the call's row alone, without the command's row that
+    shared its group live.
+  - **Older fx:** an fx from before D99 leaves the item out (D17).
+
+  **Why:** the rows existed only in the live screen, so a resumed session
+  showed the command without the calls it made. The name and the outcome
+  are what the row shows, so nothing more is kept.
+  **Alternative:** save the arguments too, which can be large or hold
+  secrets; or carry the records in the turn's execution and save them
+  with the shell call's result, which reaches the agent loop and every
+  host's saved state for rows only the TUI shows.
 
 ## Design Risks And Failure Behavior
 

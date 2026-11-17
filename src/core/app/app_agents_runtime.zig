@@ -24,6 +24,7 @@ const app_process_runtime = @import("app_process_runtime.zig");
 const provider_runtime = @import("provider_runtime.zig");
 const model_capabilities = @import("../config/model_capabilities.zig");
 const profiles = @import("../profiles/profiles.zig");
+const worker_status = @import("../output/worker_status.zig");
 const subagent_execution = @import("../subagent/execution.zig");
 const subagent_tool_host = @import("../subagent/tool_host.zig");
 const subagent_authority = @import("../subagent/authority.zig");
@@ -32,12 +33,13 @@ const subagent_child_state = @import("../subagent/child_state.zig");
 const worker_runtime = @import("../agent/worker_runtime.zig");
 const permission_request = @import("../permissions/permission_request.zig");
 const io_mod = @import("../shared/io.zig");
+const testing_event = @import("../shared/testing_event.zig");
 const activity_status = @import("../output/activity_status.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
+const shared_theme = @import("../shared/theme.zig");
 const sort_utils = @import("../shared/sort_utils.zig");
 const ascii_case = @import("../shared/ascii_case.zig");
 const types = @import("../shared/types.zig");
-const live_metrics = @import("../subagent/live_metrics.zig");
 const tool_presentation = @import("../tooling/tool_presentation.zig");
 
 const Allocator = std.mem.Allocator;
@@ -94,12 +96,20 @@ pub const ChildAgent = struct {
     /// The profile it runs in, from its host's list. Empty until the list is
     /// read. Owned.
     profile: []u8 = &.{},
+    /// What it is for, from its host's saved list: one line, set when its
+    /// parent started it, which the agent list shows while it has no title
+    /// and searches. Empty until the list syncs or its first run starts, and
+    /// for a one-off. Owned.
+    purpose: []u8 = &.{},
     /// Where its current approval and question come in the order its tree's
     /// prompts were asked (`App.prompt_order`), so the instance's screen
     /// shows the oldest first. Meaningful only while that prompt is active.
     /// Main loop only.
     approval_asked: u64 = 0,
     question_asked: u64 = 0,
+    /// How its last turn ended, which its row and its footer name once none
+    /// is going (`LastEnd`). Main loop only.
+    last_end: LastEnd = .done,
     /// Backs `footerLabel`.
     label_buf: [160]u8 = undefined,
 
@@ -108,12 +118,13 @@ pub const ChildAgent = struct {
         return if (self.name.len > 0) self.name else self.id;
     }
 
-    /// The footer's name for it on its own screen, marked done while none of
-    /// its turns is going. Valid until the next call; only the main
+    /// The footer's name for it on its own screen, marked with how its last
+    /// turn ended while none of its turns is going: done, failed, or
+    /// stopped, as its row says. Valid until the next call; only the main
     /// loop paints.
     fn footerLabel(self: *ChildAgent) []const u8 {
         if (self.workGoing()) return self.displayName();
-        return std.mem.print(&self.label_buf, "{s} · done", .{self.displayName()}) catch self.displayName();
+        return std.mem.print(&self.label_buf, "{s} · {s}", .{ self.displayName(), @tagName(self.last_end) }) catch self.displayName();
     }
 
     /// Whether a turn of its is running, waiting to run, or finished with
@@ -136,6 +147,62 @@ pub const ChildAgent = struct {
 /// An agent in the switch list, such as the row Delete closes or the row
 /// above a closed agent: a subagent, or an instance with null for the first.
 const ListedAgent = struct { agent: ?*ChildAgent };
+
+/// How a subagent's last turn ended, which its row and its footer name once
+/// no turn is going. The tag names are the footer's words. A turn the user
+/// typed on its screen counts, as it does in the report to its parent.
+const LastEnd = enum {
+    /// Its last turn completed, or it has not run.
+    done,
+    /// Its last turn failed, as the report to its parent says.
+    failed,
+    /// Its last turn was stopped or cancelled, by the user, by its parent,
+    /// or by fx quitting: the report says it was cancelled or interrupted.
+    stopped,
+
+    /// What the host's record of a finished work leaves here. The record
+    /// is what a restart keeps. A work that never reached the subagent,
+    /// which its parent's report says fx stopped, reads as stopped.
+    fn of(outcome: ?subagent_child_state.Outcome) LastEnd {
+        return switch (outcome orelse return .done) {
+            .completed => .done,
+            .failed => .failed,
+            .cancelled, .interrupted, .lost => .stopped,
+        };
+    }
+};
+
+/// How a turn that ended as `outcome` ends the work it ran for. This is the
+/// one mapping behind the row's mark (`LastEnd`), the host's record of a turn
+/// the user typed, and the outcome that ends a turn its parent started
+/// (`endRun`), which is also how the report to the parent words it.
+/// `handed_off` is whether the turn ended by handing off to the user's image
+/// or `$skill`: the work is then done, not cancelled.
+fn workOutcome(handed_off: bool, outcome: types.TurnPresentationOutcome) subagent_child_state.Outcome {
+    return switch (outcome) {
+        .completed => .completed,
+        .failed => .failed,
+        .interrupted => if (handed_off) .completed else .cancelled,
+        .paused => .cancelled,
+    };
+}
+
+/// What the slot thread of a run its parent started waits for, for a work
+/// that ended as `outcome`. The record has five outcomes and the slot thread
+/// three; `workOutcome` gives only the first three, so the last two arms stand
+/// for a work that did not finish.
+fn completionOf(outcome: subagent_child_state.Outcome) agents.ChildRunCompletion.Outcome {
+    return switch (outcome) {
+        .completed => .completed,
+        .failed => .failed,
+        .cancelled, .interrupted, .lost => .cancelled,
+    };
+}
+
+/// A key that arms, and then closes, the highlighted row of the agent list
+/// when the search is empty, and edits the search when it holds text:
+/// Backspace, in any encoding of it, or forward Delete.
+pub const CloseKey = enum { backspace, delete };
 
 /// The agent list ↓, Ctrl+X, and `/agents` open. Its rows are every open
 /// agent in switch order, built each time it is drawn so each shows what it
@@ -161,6 +228,12 @@ pub const AgentsMenu = struct {
     /// The agent whose close the first Delete armed, until the second
     /// closes it or another key disarms it. Compared by address only.
     close_armed: ?ListedAgent = null,
+    /// The close key whose presses have edited the search since a key other
+    /// than it was last pressed in the list. While it is set, that key does
+    /// nothing on an empty search, so one held down to clear a search never
+    /// goes on to arm and close an agent
+    /// (`tests/tla/agents_menu/spec/AgentsMenu.tla` RunNeverCloses).
+    edit_run: ?CloseKey = null,
     /// The draft of the agent on screen, set aside while the composer is
     /// the list's search box, and back in the composer once the list closes.
     draft: ?composer_stash.State = null,
@@ -168,8 +241,8 @@ pub const AgentsMenu = struct {
     rows: std.ArrayList(render_input.AgentsMenuRow) = .empty,
     /// Backs the instance names in `rows`, such as "fx 12". Owned.
     names: std.ArrayList(u8) = .empty,
-    /// Backs each subagent row's current call and its state with the call's
-    /// time, such as "working 12s". Owned.
+    /// Backs each subagent row's state with its current call's time, such
+    /// as "working 12s". Owned.
     activities: std.ArrayList(u8) = .empty,
 
     pub fn deinit(self: *AgentsMenu, alloc: Allocator) void {
@@ -193,9 +266,9 @@ pub const AgentsMenu = struct {
 
 /// Room for an instance's name in the agent list, such as "fx 12".
 const instance_name_bytes = 24;
-/// Room for a subagent row's current call, then its state with the call's
-/// time, such as "working 59m59s".
-const activity_bytes = live_metrics.max_label_bytes + 32;
+/// Room for a subagent row's state with its call's time, such as
+/// "working 59m59s".
+const activity_bytes = 32;
 
 /// What an instance is doing, as the instance list shows it, most urgent
 /// first.
@@ -207,6 +280,11 @@ const InstanceState = enum {
     working,
     finished,
     idle,
+    /// A subagent that is not busy, whose last turn failed or was stopped
+    /// (`LastEnd`). Listed after idle: it asks no more than idle does, so
+    /// it sorts where idle does and never outranks it.
+    failed,
+    stopped,
 
     pub fn label(self: InstanceState) []const u8 {
         return switch (self) {
@@ -216,6 +294,8 @@ const InstanceState = enum {
             .working => "working",
             .finished => "finished",
             .idle => "idle",
+            .failed => "failed",
+            .stopped => "stopped",
         };
     }
 
@@ -223,7 +303,7 @@ const InstanceState = enum {
         return switch (self) {
             .needs_approval, .has_question, .needs_you => .attention,
             .working => .working,
-            .finished, .idle => .idle,
+            .finished, .idle, .failed, .stopped => .idle,
         };
     }
 
@@ -232,7 +312,7 @@ const InstanceState = enum {
         return switch (self) {
             .needs_approval, .has_question, .needs_you => .needs_user,
             .working, .finished => .active,
-            .idle => .idle,
+            .idle, .failed, .stopped => .idle,
         };
     }
 };
@@ -258,6 +338,28 @@ pub const Busiest = enum { needs_approval, has_question, needs_you, working, idl
 /// is doing (`Runtime.busyAgentElsewhere`). `doing` is never `.idle`.
 pub const BusyAgent = struct { name: []const u8, doing: Busiest };
 
+/// One subagent as `/trace` shows it (`Runtime.traceRows`): what the agent
+/// list says of it, and its status row. Every string but `status` borrows
+/// from the app, so a row is read on the main loop before anything changes.
+pub const TraceRow = struct {
+    /// Its session ID, the name of its folder in the session store.
+    id: []const u8,
+    /// The name its parent gave it, or empty for a one-off.
+    name: []const u8,
+    profile: []const u8,
+    title: []const u8,
+    /// What it is doing, as the agent list says, such as `needs_you`.
+    state: []const u8,
+    model: []const u8,
+    effort: []const u8,
+    /// Its status row, such as a failed request that waits for the user, or
+    /// empty. Owned by the allocator `traceRows` was given.
+    status: []const u8,
+    /// The host that started it, whose registry holds its work, or null
+    /// before it is bound.
+    host: ?*subagent_tool_host.Runtime,
+};
+
 /// What an agent in `state` is doing for a state that stands for others,
 /// or null when it is idle. A finished turn counts as idle.
 fn busyAs(state: InstanceState) ?Busiest {
@@ -266,7 +368,7 @@ fn busyAs(state: InstanceState) ?Busiest {
         .has_question => .has_question,
         .needs_you => .needs_you,
         .working => .working,
-        .finished, .idle => null,
+        .finished, .idle, .failed, .stopped => null,
     };
 }
 
@@ -277,14 +379,19 @@ fn moreUrgent(a: InstanceState, b: InstanceState) InstanceState {
 }
 
 /// `request_waits` is whether the agent's status row shows a request that
-/// waits for the user.
-fn instanceState(agent: *agents.Agent, request_waits: bool) InstanceState {
+/// waits for the user. `last_end` is how a subagent's last turn ended, and
+/// `.done` for an instance, whose states it never changes.
+fn instanceState(agent: *agents.Agent, request_waits: bool, last_end: LastEnd) InstanceState {
     if (agent.approval_prompt.isActive()) return .needs_approval;
     if (agent.question_prompt.isActive()) return .has_question;
     if (request_waits) return .needs_you;
     if (turnInFlight(agent)) return .working;
     if (agent.finished_unseen) return .finished;
-    return .idle;
+    return switch (last_end) {
+        .done => .idle,
+        .failed => .failed,
+        .stopped => .stopped,
+    };
 }
 
 /// Whether one of `agent`'s turns is going or queued.
@@ -308,6 +415,105 @@ test "a subagent's parent may send again only a refused or a day-old request" {
     for ([_]@FieldType(types.RouteRecoveryStatus, "need"){ null, .sign_in, .quota, .content_filter, .too_long, .crash_loop }) |need| {
         try std.testing.expect(!parentMayResend(need));
     }
+}
+
+test "a subagent's last work reads as done, failed, or stopped, as its parent's report words it" {
+    const Outcome = subagent_child_state.Outcome;
+    try std.testing.expectEqual(LastEnd.done, LastEnd.of(null));
+    try std.testing.expectEqual(LastEnd.done, LastEnd.of(Outcome.completed));
+    try std.testing.expectEqual(LastEnd.failed, LastEnd.of(Outcome.failed));
+    // Stopped by the user, stopped by its parent, or cut short by fx quitting
+    // are cancelled; fx stopping mid-turn is interrupted; fx stopping before
+    // the message arrived is lost. Its parent's report says fx or the user
+    // stopped it each time.
+    for ([_]Outcome{ .cancelled, .interrupted, .lost }) |outcome| {
+        try std.testing.expectEqual(LastEnd.stopped, LastEnd.of(outcome));
+    }
+    // The footer's words are the tags.
+    try std.testing.expectEqualStrings("done", @tagName(LastEnd.done));
+    try std.testing.expectEqualStrings("failed", @tagName(LastEnd.failed));
+    try std.testing.expectEqualStrings("stopped", @tagName(LastEnd.stopped));
+}
+
+test "a turn's end becomes its work's outcome in one place, which the row and the parent's work both take" {
+    const Ended = types.TurnPresentationOutcome;
+    const Outcome = subagent_child_state.Outcome;
+    const Case = struct { ended: Ended, handed_off: bool, outcome: Outcome, mark: LastEnd };
+    // Every end, with and without a hand-off. A hand-off turns only an
+    // interrupted turn into a finished one.
+    const cases = [_]Case{
+        .{ .ended = .completed, .handed_off = false, .outcome = .completed, .mark = .done },
+        .{ .ended = .completed, .handed_off = true, .outcome = .completed, .mark = .done },
+        .{ .ended = .failed, .handed_off = false, .outcome = .failed, .mark = .failed },
+        .{ .ended = .failed, .handed_off = true, .outcome = .failed, .mark = .failed },
+        .{ .ended = .interrupted, .handed_off = false, .outcome = .cancelled, .mark = .stopped },
+        .{ .ended = .interrupted, .handed_off = true, .outcome = .completed, .mark = .done },
+        .{ .ended = .paused, .handed_off = false, .outcome = .cancelled, .mark = .stopped },
+        .{ .ended = .paused, .handed_off = true, .outcome = .cancelled, .mark = .stopped },
+    };
+    for (cases) |case| {
+        const outcome = workOutcome(case.handed_off, case.ended);
+        try std.testing.expectEqual(case.outcome, outcome);
+        // The row names the work's outcome.
+        try std.testing.expectEqual(case.mark, LastEnd.of(outcome));
+        // The parent's work ends as the record has it, by the same name.
+        try std.testing.expectEqualStrings(@tagName(outcome), @tagName(completionOf(outcome)));
+        // Only a failed turn fails its work, which is when `endRun` keeps the
+        // failure for the parent.
+        try std.testing.expectEqual(case.ended == .failed, outcome == .failed);
+    }
+    // Each end is in the table, so a new one must be added to it.
+    try std.testing.expectEqual(std.enums.values(Ended).len * 2, cases.len);
+    // Every outcome the record can hold converts, the two a turn never gives
+    // among them.
+    const Work = agents.ChildRunCompletion.Outcome;
+    try std.testing.expectEqual(Work.completed, completionOf(.completed));
+    try std.testing.expectEqual(Work.failed, completionOf(.failed));
+    for ([_]Outcome{ .cancelled, .interrupted, .lost }) |outcome| {
+        try std.testing.expectEqual(Work.cancelled, completionOf(outcome));
+    }
+}
+
+test "a failed or stopped row asks no more of the user than an idle one and sorts with it" {
+    try std.testing.expectEqualStrings("failed", InstanceState.failed.label());
+    try std.testing.expectEqualStrings("stopped", InstanceState.stopped.label());
+    for ([_]InstanceState{ .failed, .stopped }) |state| {
+        try std.testing.expectEqual(InstanceState.idle.urgency(), state.urgency());
+        try std.testing.expectEqual(InstanceState.idle.tone(), state.tone());
+        try std.testing.expect(busyAs(state) == null);
+        // Never more urgent than another state that is not busy, so it never
+        // stands for the busiest agent.
+        try std.testing.expectEqual(InstanceState.idle, moreUrgent(.idle, state));
+        try std.testing.expectEqual(InstanceState.working, moreUrgent(state, .working));
+    }
+}
+
+test "an agent's state says how its last turn ended only when nothing else claims the row" {
+    var agent: agents.Agent = .{};
+    try std.testing.expectEqual(InstanceState.idle, instanceState(&agent, false, .done));
+    try std.testing.expectEqual(InstanceState.failed, instanceState(&agent, false, .failed));
+    try std.testing.expectEqual(InstanceState.stopped, instanceState(&agent, false, .stopped));
+    // A request only the user can continue outranks it.
+    try std.testing.expectEqual(InstanceState.needs_you, instanceState(&agent, true, .failed));
+    // So does a turn going: the next turn starts over.
+    agent.worker.worker_processing = true;
+    try std.testing.expectEqual(InstanceState.working, instanceState(&agent, false, .failed));
+    try std.testing.expectEqual(InstanceState.working, instanceState(&agent, false, .stopped));
+    agent.worker.worker_processing = false;
+    try std.testing.expectEqual(InstanceState.failed, instanceState(&agent, false, .failed));
+}
+
+test "a subagent's footer name says how its last turn ended once no turn is going" {
+    var id = "writer-id".*;
+    var child: ChildAgent = .{ .id = &id };
+    try std.testing.expectEqualStrings("writer-id · done", child.footerLabel());
+    child.last_end = .failed;
+    try std.testing.expectEqualStrings("writer-id · failed", child.footerLabel());
+    child.last_end = .stopped;
+    try std.testing.expectEqualStrings("writer-id · stopped", child.footerLabel());
+    // While a turn goes, the name stands alone, whatever the last one did.
+    child.agent.worker.worker_processing = true;
+    try std.testing.expectEqualStrings("writer-id", child.footerLabel());
 }
 
 /// Slot threads and the main loop both use the hand-off list.
@@ -470,7 +676,8 @@ pub const Post = struct {
     message: []const u8 = "",
     state: std.atomic.Value(State) = .init(.posted),
     /// Set once the main loop holds the run back while a turn of its child's
-    /// is going. Only the main loop reads or writes it.
+    /// is going or a scrollback handoff is pending. Only the main loop reads
+    /// or writes it.
     held: bool = false,
 
     /// Set when the main loop settles the post, to wake the slot thread.
@@ -734,6 +941,22 @@ fn appendGroup(entries: []const OrderEntry, root: usize, out: []usize, next: *us
     }
 }
 
+/// What subagent `target` is for. It is empty for the first instance (null),
+/// for any other instance, and for a subagent that has none.
+fn purposeOf(target: ?*const ChildAgent) []const u8 {
+    const child = target orelse return "";
+    return if (child.agent.role == .subagent) child.purpose else "";
+}
+
+/// Whether an agent's `name`, `title`, or `purpose` has `search` in it, case
+/// aside. The list shows the purpose only where a title is missing, so a
+/// match on it can come from text the row does not show.
+fn matchesSearchText(name: []const u8, title: []const u8, purpose: []const u8, search: []const u8) bool {
+    return ascii_case.containsIgnoreCase(name, search) or
+        ascii_case.containsIgnoreCase(title, search) or
+        ascii_case.containsIgnoreCase(purpose, search);
+}
+
 pub fn Runtime(comptime App: type) type {
     return struct {
         const AppAgent = if (@hasField(App, "main_agent")) @FieldType(App, "main_agent") else struct {};
@@ -782,21 +1005,66 @@ pub fn Runtime(comptime App: type) type {
         /// own context, so it keeps working while another is on screen:
         /// main while a subagent is on screen, and every subagent but the one
         /// on screen. The agent on screen is handled in the loop's own context.
+        /// While a scrollback handoff is pending, the hidden agents' work
+        /// waits for a later pass: visiting swaps an agent's transcript onto
+        /// the screen, which the handoff's rows still own.
         pub fn tickChildren(
             app: *App,
             context: anytype,
             comptime body: fn (@TypeOf(context), *App, *agents.Agent) anyerror!void,
         ) !void {
+            const handoff_pending = app.shell.sessionScrollbackHandoffPending();
+            var deferred: usize = 0;
             if (app.agent_on_screen != null and
                 (app.main_agent.worker.hasPendingEvents() or app.main_screen.pacer.hasPending() or
                     approvalOutOfDate(&app.main_agent, false)))
             {
-                try visitScreen(app, &app.main_agent, &app.main_screen, context, body);
+                if (handoff_pending) deferred += 1 else try visitScreen(app, &app.main_agent, &app.main_screen, context, body);
             }
             for (app.child_agents.items) |child| {
                 if (child == app.agent_on_screen) continue;
                 if (!hasPendingWork(child) and !approvalOutOfDate(&child.agent, app.approval_lender == child)) continue;
+                if (handoff_pending) {
+                    deferred += 1;
+                    continue;
+                }
                 try visit(app, child, context, body);
+            }
+            if (deferred > 0) debug_trace.eventf("host", "hidden_tick_deferred", .{}, "reason=scrollback_handoff_pending agents={d}", .{deferred});
+        }
+
+        /// Rewrites every hidden agent's transcript and paced text from the
+        /// theme `from` to `to`, as the theme change does for the agent on
+        /// screen, so a hidden agent shows the new colors when it comes on
+        /// screen. An agent that fails keeps its old colors, and the others
+        /// still change. While a scrollback handoff is pending no transcript
+        /// may be swapped, so every hidden agent keeps its old colors.
+        pub fn retintHiddenScreens(app: *App, from: shared_theme.Theme, to: shared_theme.Theme) void {
+            if (app.shell.sessionScrollbackHandoffPending()) {
+                debug_trace.logf("theme", "hidden_retint_skipped reason=scrollback_handoff_pending kept=old_colors", .{});
+                return;
+            }
+            const Themes = struct {
+                from: shared_theme.Theme,
+                to: shared_theme.Theme,
+
+                fn retint(themes: @This(), visited: *App, agent: *agents.Agent) anyerror!void {
+                    _ = agent;
+                    try visited.shell.retintEntriesForTheme(visited.alloc, themes.from, themes.to);
+                    try visited.pacer.retintForTheme(visited.alloc, themes.from, themes.to);
+                }
+            };
+            const themes = Themes{ .from = from, .to = to };
+            if (app.agent_on_screen != null) {
+                visitScreen(app, &app.main_agent, &app.main_screen, themes, Themes.retint) catch |err| {
+                    debug_trace.logf("theme", "hidden_retint_failed agent=main err={s} kept=old_colors", .{@errorName(err)});
+                };
+            }
+            for (app.child_agents.items) |child| {
+                if (child == app.agent_on_screen) continue;
+                visit(app, child, themes, Themes.retint) catch |err| {
+                    debug_trace.logf("theme", "hidden_retint_failed agent={s} err={s} kept=old_colors", .{ child.id, @errorName(err) });
+                };
             }
         }
 
@@ -1118,6 +1386,9 @@ pub fn Runtime(comptime App: type) type {
                 for (listing) |entry| {
                     const child = findChild(app, entry.id) orelse restored: {
                         const restored_child = try addChild(app, entry.id);
+                        // How its last work ended, as the host saved it: a
+                        // restart, `/resume`, and a fork's copy keep it.
+                        restored_child.last_end = LastEnd.of(entry.last_outcome);
                         try showSavedTitle(app, host, restored_child);
                         const history = host.childHistory(app.alloc, entry.id) catch |err| {
                             debug_trace.logf("host", "saved reply time unavailable agent={s} err={s}", .{ entry.id, @errorName(err) });
@@ -1129,6 +1400,7 @@ pub fn Runtime(comptime App: type) type {
                     };
                     if (child.name.len == 0 and entry.name.len > 0) child.name = try app.alloc.dupe(u8, entry.name);
                     if (child.profile.len == 0) child.profile = try app.alloc.dupe(u8, entry.profile);
+                    if (child.purpose.len == 0 and entry.purpose.len > 0) child.purpose = try app.alloc.dupe(u8, entry.purpose);
                     if (child.parent_host == null) setParentHost(app, child, host);
                     try order.append(app.alloc, .{ .id = entry.id });
                 }
@@ -1233,11 +1505,11 @@ pub fn Runtime(comptime App: type) type {
             return .{ .agent = order.items[at - 1] };
         }
 
-        /// Whether agent `target`'s name or title has `search` in it, case aside.
+        /// Whether agent `target`'s name, title, or purpose has `search` in
+        /// it, case aside.
         fn matchesSearch(app: *App, target: ?*ChildAgent, search: []const u8) bool {
             var buf: [instance_name_bytes]u8 = undefined;
-            return ascii_case.containsIgnoreCase(noteName(app, target, &buf), search) or
-                ascii_case.containsIgnoreCase(targetAgent(app, target).session_title.items, search);
+            return matchesSearchText(noteName(app, target, &buf), targetAgent(app, target).session_title.items, purposeOf(target), search);
         }
 
         /// How the waiting note names agent `child`, null for the first
@@ -1525,6 +1797,7 @@ pub fn Runtime(comptime App: type) type {
             menu.highlight = .{ .agent = app.agent_on_screen };
             menu.origin = .{ .agent = app.agent_on_screen };
             menu.close_armed = null;
+            menu.edit_run = null;
             setDraftAside(app);
             menu.open = true;
             debug_trace.eventf("host", "agents_menu_opened", .{}, "agents={d} position={d} agent={s}", .{
@@ -1550,6 +1823,7 @@ pub fn Runtime(comptime App: type) type {
             menu.highlight = .on_screen;
             menu.origin = .on_screen;
             menu.close_armed = null;
+            menu.edit_run = null;
             putDraftBack(app);
             app.shell.render_requests.request(.footer);
         }
@@ -1699,19 +1973,19 @@ pub fn Runtime(comptime App: type) type {
                 const model = provider_runtime.modelOf(app, agent);
                 const state = stateOf(app, target);
                 const name = noteName(app, target, menu.names.addManyAsArrayAssumeCapacity(instance_name_bytes));
-                const activity = rowActivity(app, subagent, state, now_ms, menu.activities.addManyAsArrayAssumeCapacity(activity_bytes));
+                const activity_state = rowActivityState(app, subagent, state, now_ms, menu.activities.addManyAsArrayAssumeCapacity(activity_bytes));
                 menu.rows.appendAssumeCapacity(.{
                     .name = name,
                     .subagent = subagent != null,
                     // A search lists its matches flat, since their parents may not match.
                     .nested = if (subagent) |child| searchText(app).len == 0 and parentSubagent(app, child) != null else false,
                     .title = agent.session_title.items,
+                    .purpose = purposeOf(target),
                     // A subagent's own agent never loads its profile; its
                     // host's list says which one it runs in.
                     .profile = listedProfile(if (subagent) |child| child.profile else agent.profile.profile.name),
-                    .state = activity.state orelse state.label(),
+                    .state = activity_state orelse state.label(),
                     .state_tone = state.tone(),
-                    .activity = activity.call,
                     .model = model,
                     .effort = effortLabel(app, agent, model),
                 });
@@ -1736,12 +2010,38 @@ pub fn Runtime(comptime App: type) type {
             return if (std.mem.eql(u8, name, profiles.main_name)) "" else name;
         }
 
+        /// A key was pressed in the open list. A run of close key presses
+        /// that edited the search goes on only through that key, so a key
+        /// other than it ends the run; `pressed` is the close key it is, or
+        /// null for any other key.
+        pub fn noteKeyPress(app: *App, pressed: ?CloseKey) void {
+            if (comptime !@hasField(App, "instances")) return;
+            const menu = &app.instances.agents_menu;
+            const run = menu.edit_run orelse return;
+            if (pressed == run) return;
+            menu.edit_run = null;
+        }
+
+        /// Close key `key` was pressed while the composer, the list's search
+        /// box, holds text, so it edits the search: its run of presses starts
+        /// or goes on, and none of them arms a close, even once the search is
+        /// empty, until another key is pressed.
+        pub fn noteSearchEditKey(app: *App, key: CloseKey) void {
+            if (comptime !@hasField(App, "instances")) return;
+            app.instances.agents_menu.edit_run = key;
+        }
+
         /// Delete in the agent list: the first press on a row arms its close,
         /// and the second closes it: a subagent for good (`closeSubagent`), an
         /// instance as `/close` does (`closeInstanceFromMenu`). The last open
-        /// instance stays, since closing it would end fx.
-        pub fn pressCloseKey(app: *App) !bool {
+        /// instance stays, since closing it would end fx. A press of `key`
+        /// while its run is editing the search does nothing.
+        pub fn pressCloseKey(app: *App, key: CloseKey) !bool {
             if (!menuActive(app)) return false;
+            if (app.instances.agents_menu.edit_run == key) {
+                debug_trace.eventf("host", "agents_menu_close_ignored", .{}, "key={s} reason=search_run", .{@tagName(key)});
+                return true;
+            }
             var order: std.ArrayList(?*ChildAgent) = .empty;
             defer order.deinit(app.alloc);
             try switchList(app, &order);
@@ -1842,6 +2142,13 @@ pub fn Runtime(comptime App: type) type {
         /// it started (`closeBranch`). Cheap when none is. Returns whether it
         /// dropped any.
         pub fn dropClosedSubagents(app: *App) !bool {
+            // Dropping a branch swaps each agent's transcript in, and can put
+            // another agent on screen, which a pending scrollback handoff does
+            // not allow. The hosts keep the closed ones for a later pass.
+            if (app.shell.sessionScrollbackHandoffPending()) {
+                if (anyClosedWaiting(app)) debug_trace.eventf("host", "closed_drop_deferred", .{}, "reason=scrollback_handoff_pending", .{});
+                return false;
+            }
             var dropped = false;
             // Dropping a branch can free hosts, so each pass looks afresh.
             while (try takeAnyClosed(app)) |ids| {
@@ -1855,6 +2162,14 @@ pub fn Runtime(comptime App: type) type {
                 };
             }
             return dropped;
+        }
+
+        /// Whether some host closed a child since it was last asked.
+        fn anyClosedWaiting(app: *App) bool {
+            if (comptime !agents.hasAgentField(App, "session_persistence")) return false;
+            if (firstOpen(app)) if (app.main_agent.session_persistence.subagent_host) |host| if (host.hasClosed()) return true;
+            for (app.child_agents.items) |child| if (child.agent.session_persistence.subagent_host) |host| if (host.hasClosed()) return true;
+            return false;
         }
 
         /// The children some host closed since it was last asked, or null.
@@ -2203,32 +2518,70 @@ pub fn Runtime(comptime App: type) type {
             return child.workGoing() or pacerOf(app, child).hasPending();
         }
 
+        /// Why a run handed to `child` waits for a later pass, or null when
+        /// it can start now.
+        fn runHoldReason(app: *App, child: *ChildAgent) ?[]const u8 {
+            if (turnGoing(app, child)) return "turn_going";
+            if (app.shell.sessionScrollbackHandoffPending()) return "scrollback_handoff_pending";
+            return null;
+        }
+
         /// The pacer that holds `child`'s assistant text: the app's while the
         /// child is on screen, its own slot's otherwise.
         fn pacerOf(app: *App, child: *ChildAgent) *AssistantPacer {
             return if (app.agent_on_screen == child) &app.pacer else &child.screen.pacer;
         }
 
+        /// The app's subagents in the order they started, for `/trace`.
+        /// Main loop only. `alloc` owns each row's `status`.
+        pub fn traceRows(app: *App, alloc: Allocator, out: *std.ArrayList(TraceRow)) !void {
+            for (app.child_agents.items) |child| {
+                const agent = &child.agent;
+                if (agent.role != .subagent) continue;
+                const model = provider_runtime.modelOf(app, agent);
+                try out.append(alloc, .{
+                    .id = child.id,
+                    .name = child.name,
+                    .profile = if (child.profile.len > 0) child.profile else profiles.main_name,
+                    .title = agent.session_title.items,
+                    .state = @tagName(stateOf(app, child)),
+                    .model = model,
+                    .effort = effortLabel(app, agent, model),
+                    .status = try statusText(app, child, alloc),
+                    .host = child.parent_host,
+                });
+            }
+        }
+
+        /// A copy of the label on agent `target`'s status row, or empty.
+        fn statusText(app: *App, target: ?*ChildAgent, alloc: Allocator) ![]const u8 {
+            const state: *const worker_status.State = if (target == app.agent_on_screen) blk: {
+                if (comptime !@hasDecl(@TypeOf(app.shell), "worker_status_state")) return "";
+                break :blk app.shell.worker_status_state();
+            } else &screenOf(app, target).transcript.notebook.worker_status;
+            const projection = state.projection() orelse return "";
+            return switch (projection) {
+                .turn_thinking => |row| try alloc.dupe(u8, row.label),
+                .none, .tool_slot => "",
+            };
+        }
+
         fn screenOf(app: *App, child: ?*ChildAgent) *ScreenSlot {
             return if (child) |value| &value.screen else &app.main_screen;
         }
 
-        const RowActivity = struct { call: []const u8 = "", state: ?[]const u8 = null };
-
-        /// A working subagent's current call and its state with that call's
-        /// time, such as "working 12s", from its host, written into `buf`;
-        /// nothing for any other row.
-        fn rowActivity(app: *App, subagent: ?*ChildAgent, state: InstanceState, now_ms: i64, buf: *[activity_bytes]u8) RowActivity {
-            if (state != .working) return .{};
-            const child = subagent orelse return .{};
-            const host = hostOf(app, child) orelse return .{};
-            const call = host.childCall(child.id) orelse return .{};
-            const label = call.label();
-            @memcpy(buf[0..label.len], label);
-            var writer = std.Io.Writer.fixed(buf[label.len..]);
-            writer.print("{s} ", .{state.label()}) catch return .{ .call = buf[0..label.len] };
-            activity_status.writeElapsed(&writer, @intCast(call.runningMs(now_ms) / std.time.ms_per_s)) catch return .{ .call = buf[0..label.len] };
-            return .{ .call = buf[0..label.len], .state = writer.buffered() };
+        /// A working subagent's state with its current call's time, such as
+        /// "working 12s", from its host, written into `buf`; null for any
+        /// other row.
+        fn rowActivityState(app: *App, subagent: ?*ChildAgent, state: InstanceState, now_ms: i64, buf: *[activity_bytes]u8) ?[]const u8 {
+            if (state != .working) return null;
+            const child = subagent orelse return null;
+            const host = hostOf(app, child) orelse return null;
+            const call = host.childCall(child.id) orelse return null;
+            var writer = std.Io.Writer.fixed(buf);
+            writer.print("{s} ", .{state.label()}) catch return null;
+            activity_status.writeElapsed(&writer, @intCast(call.runningMs(now_ms) / std.time.ms_per_s)) catch return null;
+            return writer.buffered();
         }
 
         /// Whether the turn `child`'s worker has finished is still being
@@ -2245,17 +2598,20 @@ pub fn Runtime(comptime App: type) type {
         /// but is not applied yet is still working: the list places it by the
         /// newest reply in its history, so its state and its place change
         /// together, as `tests/tla/agents_menu/spec/RowOrder.tla`
-        /// PlaceChangesWithLabel requires.
+        /// PlaceChangesWithLabel requires. A subagent that is not busy
+        /// says how its last turn ended: failed or stopped, else idle, and
+        /// an instance stays idle (`LastEnd`).
         fn stateOf(app: *App, target: ?*ChildAgent) InstanceState {
             if (target) |child| {
                 if (app.approval_lender == child) return .needs_approval;
                 if (app.question_lender == child) return .has_question;
             }
-            const state = instanceState(targetAgent(app, target), requestWaitsForUser(app, target));
+            const last_end: LastEnd = if (target) |child| (if (child.agent.role == .subagent) child.last_end else .done) else .done;
+            const state = instanceState(targetAgent(app, target), requestWaitsForUser(app, target), last_end);
             const child = target orelse return state;
             if (child.agent.role != .subagent) return state;
             return switch (state) {
-                .idle, .finished => if (resultPending(app, child)) .working else state,
+                .idle, .finished, .failed, .stopped => if (resultPending(app, child)) .working else state,
                 .working, .needs_approval, .has_question, .needs_you => state,
             };
         }
@@ -2283,6 +2639,7 @@ pub fn Runtime(comptime App: type) type {
         /// subagent's own subagents before it.
         pub fn shutdownChildren(app: *App) void {
             noteQuitting(app);
+            releaseScreenForShutdown(app);
             attach(app, null);
             closeHandoffs(app);
             // A slot thread still reads its child's worker while it detaches,
@@ -2307,6 +2664,14 @@ pub fn Runtime(comptime App: type) type {
             }
         }
 
+        /// Gives up a scrollback handoff that still has rows to write, as
+        /// shutdown swaps each agent's transcript in to close it. A closed
+        /// terminal fails the handoff's write and then ends the loop, so the
+        /// handoff can still be pending here. Nothing is drawn after this.
+        fn releaseScreenForShutdown(app: *App) void {
+            app.shell.cancelSessionScrollbackHandoff("shutdown");
+        }
+
         /// Logs `child`, kept allocated because a slot thread still holds its
         /// worker after `release_timeout_ms`: its finished turns are saved and
         /// its session is closed, but its agent and worker are not freed.
@@ -2325,6 +2690,7 @@ pub fn Runtime(comptime App: type) type {
         /// run's turn context once the slot thread frees it.
         pub fn stopChildren(app: *App, comptime mode: enum { cooperative, force }) void {
             noteQuitting(app);
+            releaseScreenForShutdown(app);
             // Main's own shutdown writes to its transcript, so it goes back on
             // screen first.
             attach(app, null);
@@ -2470,13 +2836,15 @@ pub fn Runtime(comptime App: type) type {
             for (posts.items) |post| {
                 // A run waits while a turn of its child's is going: the run
                 // replaces the child's installed run, which that turn reads.
-                if (post.run != null) if (findChild(app, post.turn.child_id orelse "")) |child| if (turnGoing(app, child)) {
+                // It also waits while a scrollback handoff is pending, since
+                // starting it swaps the child's transcript onto the screen.
+                if (post.run != null) if (findChild(app, post.turn.child_id orelse "")) |child| if (runHoldReason(app, child)) |reason| {
                     held.append(handoff_alloc, post) catch {
                         debug_trace.eventf("host", "child_handoff_failed", .{}, "agent={s} kind=run reason=OutOfMemory", .{child.id});
                         post.settle(.failed);
                         continue;
                     };
-                    if (!post.held) debug_trace.eventf("host", "child_run_held", .{}, "agent={s} reason=turn_going", .{child.id});
+                    if (!post.held) debug_trace.eventf("host", "child_run_held", .{}, "agent={s} reason={s}", .{ child.id, reason });
                     post.held = true;
                     continue;
                 };
@@ -2556,6 +2924,9 @@ pub fn Runtime(comptime App: type) type {
             if (child.agent.child_run) |*run| if (run.inFlight()) return error.ChildBusy;
             if (child.name.len == 0) if (post.turn.child_name) |name| {
                 child.name = try app.alloc.dupe(u8, name);
+            };
+            if (child.purpose.len == 0) if (post.turn.child_purpose) |purpose| {
+                child.purpose = try app.alloc.dupe(u8, purpose);
             };
             installChildRun(app, child, post.run.?);
             post.run = null;
@@ -2833,6 +3204,7 @@ pub fn Runtime(comptime App: type) type {
             child.screen.deinit(app.alloc);
             if (child.name.len > 0) app.alloc.free(child.name);
             if (child.profile.len > 0) app.alloc.free(child.profile);
+            if (child.purpose.len > 0) app.alloc.free(child.purpose);
             app.alloc.free(child.id);
             app.alloc.destroy(child);
         }
@@ -2869,7 +3241,7 @@ pub fn Runtime(comptime App: type) type {
                     .interrupted => |value| value.assistant orelse "",
                     .compacted_summary => "",
                 };
-                endAndFollowUserWork(app.alloc, host, run, &agent.worker, userWorkOutcome(run, finished.terminal_outcome orelse .completed), reply);
+                endAndFollowUserWork(app.alloc, host, run, &agent.worker, workOutcome(run.handed_off, finished.terminal_outcome orelse .completed), reply);
                 return;
             }
             if (!run.inFlight()) return;
@@ -2916,6 +3288,7 @@ pub fn Runtime(comptime App: type) type {
         /// on its way, held by the pacer or not yet drained, so the run ends
         /// when it is saved, or in `settleChildRuns` once nothing is left.
         pub fn noteChildTurnFinished(app: *App, agent: *AppAgent, finished: types.TurnFinished) void {
+            noteLastEnd(app, agent, finished);
             const run = runInFlight(app, agent) orelse userWorkRun(app, agent) orelse return;
             run.ended_as = finished.outcome;
             if (finished.outcome == .interrupted and agent.worker.handedOff(finished.turn_id)) {
@@ -2935,7 +3308,7 @@ pub fn Runtime(comptime App: type) type {
                 if (hasPendingWork(child) or child.agent.worker.isProcessing()) continue;
                 if (run.turn_work_id.len > 0) {
                     const host = hostOf(app, child) orelse continue;
-                    endAndFollowUserWork(app.alloc, host, run, &child.agent.worker, userWorkOutcome(run, outcome), "");
+                    endAndFollowUserWork(app.alloc, host, run, &child.agent.worker, workOutcome(run.handed_off, outcome), "");
                     continue;
                 }
                 if (!run.inFlight()) continue;
@@ -2951,13 +3324,18 @@ pub fn Runtime(comptime App: type) type {
             return if (run.turn_work_id.len > 0) run else null;
         }
 
-        fn userWorkOutcome(run: *const agents.ChildRun, outcome: types.TurnPresentationOutcome) subagent_child_state.Outcome {
-            return switch (outcome) {
-                .completed => .completed,
-                .failed => .failed,
-                .interrupted => if (run.handed_off) .completed else .cancelled,
-                .paused => .cancelled,
-            };
+        /// Remembers how a subagent's turn ended, for its row and its
+        /// footer. Every turn of its counts, the parent's work, the user's
+        /// on its own screen, and a wake by its own child, and the newest
+        /// wins, so a later turn that completes clears a failure. The turn
+        /// is mapped by `workOutcome`, as `endRun` and a turn the user typed
+        /// map it, so the row and the report to the parent agree
+        /// (`tests/tla/agents_menu/spec/RowOrder.tla` EndIsOfAppliedTurn).
+        fn noteLastEnd(app: *App, agent: *AppAgent, finished: types.TurnFinished) void {
+            if (agent.role != .subagent) return;
+            const child = hostedOf(app, agent) orelse return;
+            const handed_off = finished.outcome == .interrupted and agent.worker.handedOff(finished.turn_id);
+            child.last_end = LastEnd.of(workOutcome(handed_off, finished.outcome));
         }
 
         /// Ends a user's turn's work. When the turn handed off to the user's
@@ -3056,20 +3434,15 @@ pub fn Runtime(comptime App: type) type {
         }
 
         fn endRun(run: *agents.ChildRun, outcome: types.TurnPresentationOutcome) void {
-            switch (outcome) {
-                .completed => finishRun(run, .completed),
-                .failed => {
-                    // Keeps the provider's own error when the worker set one.
-                    if (run.turn) |turn| if (turn.failureDiagnostic() == null) {
-                        turn.failure_diagnostic = run.failure orelse
-                            types.ModelFailureDiagnostic.init("agent_turn_failed");
-                    };
-                    finishRun(run, .failed);
-                },
-                // Handed off to the user's image or `$skill`: the work is done.
-                .interrupted => finishRun(run, if (run.handed_off) .completed else .cancelled),
-                .paused => finishRun(run, .cancelled),
+            const ended = workOutcome(run.handed_off, outcome);
+            if (ended == .failed) {
+                // Keeps the provider's own error when the worker set one.
+                if (run.turn) |turn| if (turn.failureDiagnostic() == null) {
+                    turn.failure_diagnostic = run.failure orelse
+                        types.ModelFailureDiagnostic.init("agent_turn_failed");
+                };
             }
+            finishRun(run, completionOf(ended));
         }
 
         /// Gives a child agent its next run, replacing the last one, and takes
@@ -3165,6 +3538,7 @@ pub fn Runtime(comptime App: type) type {
                 child.screen.deinit(app.alloc);
                 if (child.name.len > 0) app.alloc.free(child.name);
                 if (child.profile.len > 0) app.alloc.free(child.profile);
+                if (child.purpose.len > 0) app.alloc.free(child.purpose);
                 app.alloc.free(child.id);
                 app.alloc.destroy(child);
             }
@@ -3215,6 +3589,72 @@ test "a hand-off withdrawn on cancel, or posted after shutdown, never reaches th
     cancel.store(false, .seq_cst);
     try std.testing.expectError(error.Cancelled, postAndWait(&handoffs, &post, &cancel));
     try std.testing.expectEqual(@as(usize, 0), handoffs.posts.items.len);
+}
+
+test "the cancel a run's wait repeats ends the question that run waits on" {
+    const alloc = std.testing.allocator;
+    var worker = worker_runtime.WorkerRuntime{};
+    defer worker.deinit(alloc);
+    var completion: agents.ChildRunCompletion = .{};
+    var cancel = std.atomic.Value(bool).init(false);
+    const options = [_]types.QuestionOption{.{ .label = "Yes", .description = null }};
+    const entries = [_]types.QuestionBatchEntry{.{ .question = "Continue?", .options = &options }};
+
+    const Side = struct {
+        fn ask(
+            runtime: *worker_runtime.WorkerRuntime,
+            batch: []const types.QuestionBatchEntry,
+            answered: *std.atomic.Value(bool),
+            returned: *std.Io.Event,
+        ) void {
+            defer returned.set(io_mod.getIo());
+            const answers = (runtime.requestQuestionBatchAnswerBlocking(std.testing.allocator, batch) catch return) orelse return;
+            for (answers) |answer| std.testing.allocator.free(answer);
+            std.testing.allocator.free(answers);
+            answered.store(true, .release);
+        }
+
+        fn wait(
+            done: *agents.ChildRunCompletion,
+            flag: *std.atomic.Value(bool),
+            runtime: *worker_runtime.WorkerRuntime,
+            outcome: *agents.ChildRunCompletion.Outcome,
+        ) void {
+            outcome.* = waitForCompletion(done, flag, runtime);
+        }
+
+        /// Whether the question opens within a bounded time. Nothing signals it, so
+        /// it is polled; the end of the wait is waited for on an event.
+        fn questionOpens(runtime: *worker_runtime.WorkerRuntime) bool {
+            for (0..2000) |_| {
+                var snapshot = runtime.snapshotPendingQuestionBatch(std.testing.allocator) catch return false;
+                if (snapshot) |*batch| {
+                    batch.deinit(std.testing.allocator);
+                    return true;
+                }
+                io_mod.sleep(1 * std.time.ns_per_ms);
+            }
+            return false;
+        }
+    };
+
+    var answered = std.atomic.Value(bool).init(false);
+    var returned: std.Io.Event = .unset;
+    const asker = try std.Thread.spawn(.{}, Side.ask, .{ &worker, &entries, &answered, &returned });
+    var outcome: agents.ChildRunCompletion.Outcome = .completed;
+    const waiter = try std.Thread.spawn(.{}, Side.wait, .{ &completion, &cancel, &worker, &outcome });
+    const opened = Side.questionOpens(&worker);
+    cancel.store(true, .seq_cst);
+    const ended = opened and testing_event.setInTime(&returned);
+    // A question that stayed open is released, so the test fails instead of hanging.
+    if (!ended) worker.requestStop();
+    completion.finish(.cancelled);
+    waiter.join();
+    asker.join();
+    try std.testing.expect(opened);
+    try std.testing.expect(ended);
+    try std.testing.expect(!answered.load(.acquire));
+    try std.testing.expectEqual(agents.ChildRunCompletion.Outcome.cancelled, outcome);
 }
 
 test "the switch list follows the registry's start order, with an unlisted agent kept after it" {
@@ -3514,4 +3954,28 @@ test "the newest turn's end time never falls back to an older turn" {
     try std.testing.expectEqual(@as(i64, 0), newestTurnEndedAt(&.{ replied, untimed }));
     try std.testing.expectEqual(@as(i64, 0), newestTurnEndedAt(&.{compacted}));
     try std.testing.expectEqual(@as(i64, 0), newestTurnEndedAt(&.{}));
+}
+
+test "only a subagent has a purpose to show, and the list's search reads it with the name and the title" {
+    var id = "sub".*;
+    var purpose = "You audit the zebra crossing logic.".*;
+    var subagent: ChildAgent = .{ .id = &id, .agent = .{ .role = .subagent }, .purpose = &purpose };
+    var instance: ChildAgent = .{ .id = &id, .agent = .{ .role = .instance }, .purpose = &purpose };
+    try std.testing.expectEqualStrings(&purpose, purposeOf(&subagent));
+    // The first instance, an instance, and a subagent with none have no purpose.
+    try std.testing.expectEqualStrings("", purposeOf(null));
+    try std.testing.expectEqualStrings("", purposeOf(&instance));
+    subagent.purpose = &.{};
+    try std.testing.expectEqualStrings("", purposeOf(&subagent));
+
+    const text = "You audit the zebra crossing logic.";
+    // Only the purpose holds the word, in any case, whether or not there is a title.
+    try std.testing.expect(matchesSearchText("auditor", "", text, "zebra"));
+    try std.testing.expect(matchesSearchText("auditor", "", text, "ZEBRA"));
+    try std.testing.expect(matchesSearchText("auditor", "Review the parser", text, "zebra"));
+    // The name and the title still match, and a word none holds does not.
+    try std.testing.expect(matchesSearchText("auditor", "Review the parser", text, "AUDITOR"));
+    try std.testing.expect(matchesSearchText("auditor", "Review the parser", text, "parser"));
+    try std.testing.expect(!matchesSearchText("auditor", "Review the parser", text, "giraffe"));
+    try std.testing.expect(!matchesSearchText("auditor", "", "", "zebra"));
 }

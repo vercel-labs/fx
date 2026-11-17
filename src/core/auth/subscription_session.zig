@@ -268,7 +268,8 @@ pub fn Store(comptime spec: Spec, comptime invalid_session: anytype, comptime un
     };
 }
 
-fn openExistingPrivateFxDir(home_dir: *io_mod.VerifiedDir) !io_mod.VerifiedDir {
+/// Opens the existing profile folder in `home_dir` and makes it private.
+pub fn openExistingPrivateFxDir(home_dir: *io_mod.VerifiedDir) !io_mod.VerifiedDir {
     var dir = try home_dir.dir.openDir(io_mod.getIo(), profile_paths.rootName(), .{
         .iterate = true,
         .follow_symlinks = false,
