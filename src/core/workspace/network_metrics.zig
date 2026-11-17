@@ -112,15 +112,18 @@ pub const NetworkCall = struct {
 
     /// Keeps `message` as one line the trace can quote: control bytes and
     /// double quotes become spaces and single quotes, and a cut never splits
-    /// a UTF-8 sequence. Bytes that are not UTF-8 become `?`.
+    /// a UTF-8 sequence. Bytes that are not UTF-8 become `?`. The cut also
+    /// keeps no part of a secret it splits, since `/trace` masks the kept
+    /// text only when it finds a secret whole.
     pub fn setGatewayErrorMessage(self: *NetworkCall, message: []const u8) void {
+        const kept = message[0..text_utils.secretSafePrefixLen(message, max_gateway_error_message_len)];
         var out: usize = 0;
         var at: usize = 0;
-        while (at < message.len) {
-            const byte = message[at];
+        while (at < kept.len) {
+            const byte = kept[at];
             const width: usize = std.unicode.utf8ByteSequenceLength(byte) catch 0;
-            const valid = width > 0 and at + width <= message.len and
-                (width == 1 or std.unicode.utf8ValidateSlice(message[at .. at + width]));
+            const valid = width > 0 and at + width <= kept.len and
+                (width == 1 or std.unicode.utf8ValidateSlice(kept[at .. at + width]));
             if (!valid) {
                 if (out + 1 > max_gateway_error_message_len) break;
                 self.gateway_error_message_buf[out] = '?';
@@ -136,7 +139,7 @@ pub const NetworkCall = struct {
                     else => byte,
                 };
             } else {
-                @memcpy(self.gateway_error_message_buf[out .. out + width], message[at .. at + width]);
+                @memcpy(self.gateway_error_message_buf[out .. out + width], kept[at .. at + width]);
             }
             out += width;
             at += width;
@@ -741,4 +744,27 @@ test "a gateway error message keeps its words on one line and cuts at a characte
     try std.testing.expect(std.unicode.utf8ValidateSlice(call.gatewayErrorMessage()));
     call.setGatewayErrorMessage("");
     try std.testing.expectEqualStrings("", call.gatewayErrorMessage());
+}
+
+test "a stored gateway error message keeps no part of a secret its cut splits" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const token = "ghp_" ++ text_utils.repeat("A", 36);
+    var value_buf: [max_gateway_error_message_len + token.len + 32]u8 = undefined;
+    var call: NetworkCall = .{};
+
+    var shift: usize = 0;
+    while (shift < token.len) : (shift += 1) {
+        const token_start = max_gateway_error_message_len - token.len + shift;
+        for (value_buf[0..token_start], 0..) |*byte, index| byte.* = if (index % 2 == 0) 'x' else ' ';
+        @memcpy(value_buf[token_start..][0..token.len], token);
+        @memcpy(value_buf[token_start + token.len ..][0.." done".len], " done");
+        const value = value_buf[0 .. token_start + token.len + " done".len];
+
+        call.setGatewayErrorMessage(value);
+        const masked = try text_utils.maskSecrets(arena, call.gatewayErrorMessage());
+        try std.testing.expect(std.mem.find(u8, masked, "AAAAAA") == null);
+    }
 }
