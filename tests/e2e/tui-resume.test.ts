@@ -8555,6 +8555,17 @@ function compactToolRows(screen: string): string[] {
     .filter((line) => /^\s*[●├└▪] /.test(line));
 }
 
+/// The notice under a cancelled command, which names no command.
+const CANCELLED_COMMAND_NOTICE = "▪ Cancelled · What can fx do differently?";
+
+/// Checks that Ctrl+O shows `command` in full, then closes it.
+async function expectFullTranscriptShows(session: TmuxSession, command: string, timeout: number) {
+  await session.sendKeys("C-o");
+  expect(stripAnsi(await session.waitForText(command, timeout))).toContain(`Cancelled ${command}`);
+  await session.sendKeys("Escape");
+  await session.waitForComposer(timeout);
+}
+
 const cancelledRowCases = [
   {
     name: "a lone command cancelled before it printed anything",
@@ -8620,15 +8631,17 @@ for (const scenario of cancelledRowCases) {
           "the interrupted turn on disk",
           timeout,
         );
+        await expectFullTranscriptShows(active, scenario.command, timeout);
         await active.sendText("/quit");
         expect(await active.waitForSessionEnd()).toBe(true);
         await active.kill();
         active = null;
 
-        // The live row shows the command's short name, never the full line.
+        // The live row shows the command's short name, and the notice under
+        // it names no command, so no line holds the full one.
         expect(live).toContain(scenario.row);
-        const liveRows = live.filter((line) => !line.trimStart().startsWith("▪"));
-        expect(liveRows.join("\n")).not.toContain(scenario.command);
+        expect(live.filter((line) => line.startsWith("▪"))).toEqual([CANCELLED_COMMAND_NOTICE]);
+        expect(live.join("\n")).not.toContain(scenario.command);
 
         const items = savedItems(home, onlySessionId(home));
 
@@ -8642,6 +8655,9 @@ for (const scenario of cancelledRowCases) {
         await active.waitForComposer(TIMEOUT);
         const resumed = compactToolRows(await waitForScrollback(active, "What can fx do differently?", timeout));
         expect(resumed).toEqual(live);
+        expect(resumed.filter((line) => line.startsWith("▪"))).toEqual([CANCELLED_COMMAND_NOTICE]);
+        expect(resumed.join("\n")).not.toContain(scenario.command);
+        await expectFullTranscriptShows(active, scenario.command, timeout);
         expect(resumedGateway.requests).toHaveLength(0);
 
         // The saved turn named the command's output when it printed, and

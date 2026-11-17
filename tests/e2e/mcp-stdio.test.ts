@@ -4865,7 +4865,16 @@ describe("fx mcp call", () => {
       const live = compactRows(liveScreen);
       expect(live.some((line) => /^[├└] Cancelled /.test(line) && !line.includes(TOOL_NAME))).toBe(true);
       expect(live).toContain(`└ Cancelled ${TOOL_NAME}`);
-      expect(live.filter((line) => !line.startsWith("▪")).join("\n")).not.toContain("> out.txt");
+      // The command's notice names no command, so no row holds the command
+      // line, its fx path, or its arguments; the call's own notice names its
+      // tool, as before.
+      const cancelledNotices = [
+        "▪ Cancelled · What can fx do differently?",
+        `▪ Cancelled ${TOOL_NAME} · What can fx do differently?`,
+      ];
+      expect(live.filter((line) => line.startsWith("▪"))).toEqual(cancelledNotices);
+      expect(live.join("\n")).not.toContain("> out.txt");
+      expect(live.join("\n")).not.toContain(FX_BIN);
 
       // The session goes on.
       await tui.sendText("Go on.");
@@ -4894,7 +4903,10 @@ describe("fx mcp call", () => {
       // and the call's in one group.
       const followUp = resumed.indexOf("┃ Go on.");
       expect(followUp).toBeGreaterThan(0);
-      expect(compactRows(resumed.slice(0, followUp))).toEqual(live);
+      const resumedRows = compactRows(resumed.slice(0, followUp));
+      expect(resumedRows).toEqual(live);
+      expect(resumedRows.filter((line) => line.startsWith("▪"))).toEqual(cancelledNotices);
+      expect(resumedRows.join("\n")).not.toContain("> out.txt");
       expect(resumed).not.toContain("Running MCP");
       expect(toolCalls(root)).toHaveLength(1);
       await tui.sendText("/quit");
