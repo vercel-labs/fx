@@ -2704,6 +2704,69 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
   );
 
   test(
+    "a subagent call whose arguments are still coming shows no row of its own",
+    async () => {
+      const finalSentinel = "FX_SUBAGENT_PENDING_ROW_COMPLETE";
+      const encoder = new TextEncoder();
+      let timer: ReturnType<typeof setInterval> | undefined;
+      let sendRest: (() => void) | undefined;
+      const { stderrPath } = await launchRouteRecoveryTui("fx-tui-subagent-pending-row-", [
+        () => fakeGatewayToolCall("status_first", "subagent", { action: "status" }),
+        () =>
+          new Response(
+            new ReadableStream<Uint8Array>({
+              start(controller) {
+                const send = (event: object) =>
+                  controller.enqueue(encoder.encode(`data: ${JSON.stringify(event)}\n\n`));
+                send({ type: "tool-input-start", id: "status_second", toolName: "subagent" });
+                send({ type: "tool-input-delta", id: "status_second", delta: '{"act' });
+                timer = setInterval(() => controller.enqueue(encoder.encode(": hold-subagent-arguments\n\n")), 50);
+                sendRest = () => {
+                  clearInterval(timer);
+                  send({ type: "tool-input-delta", id: "status_second", delta: 'ion":"status"}' });
+                  send({ type: "tool-input-end", id: "status_second" });
+                  send({ type: "tool-call", toolCallId: "status_second", toolName: "subagent", input: { action: "status" } });
+                  send({ type: "finish", finishReason: { unified: "tool-calls", raw: "tool-calls" } });
+                  controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+                  controller.close();
+                };
+              },
+              cancel() {
+                clearInterval(timer);
+              },
+            }),
+            { headers: { "content-type": "text/event-stream" } },
+          ),
+        () => fakeGatewayFinalText(finalSentinel),
+      ]);
+      const treeRows = (pane: string) =>
+        pane.split("\n").map((line) => line.trim()).filter((line) => /^(●|├|└) /.test(line));
+      await session!.sendText("Check the subagents twice.");
+      // While the second call's action streams, it waits in the status row
+      // instead of showing a row of its own that later folds into it.
+      const frames: string[][] = [];
+      await waitForScrollback(session!, (value) => value.includes("Checked subagents"), "the first status row");
+      for (let i = 0; i < 15; i += 1) {
+        frames.push(treeRows(await session!.capturePane()));
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+      sendRest?.();
+      for (let i = 0; i < 200; i += 1) {
+        const pane = await session!.capturePane();
+        frames.push(treeRows(pane));
+        if (pane.includes(finalSentinel)) break;
+        await new Promise((resolve) => setTimeout(resolve, 30));
+      }
+      for (const frame of frames) expect(frame.some((row) => row.includes("Managing"))).toBe(false);
+      const last = frames[frames.length - 1];
+      expect(last).toHaveLength(1);
+      expect(last[0]).toStartWith("● Checked subagents");
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+    },
+    TIMEOUT * 2,
+  );
+
+  test(
     "follow-up input counter excludes retained context and provider input usage",
     async () => {
       const firstFinal = `FIRST_TURN_CONTEXT_COMPLETE ${"retained assistant context ".repeat(128)}`;

@@ -1603,10 +1603,10 @@ fn sameFilePath(a: []const u8, b: []const u8) bool {
 }
 
 /// Whether a call of this tool joins a row by one of its arguments, such as
-/// a read by its path, so a call whose row is its own was still waiting for
-/// that argument.
+/// a read by its path or a subagent call by its agent or its wait, so a call
+/// whose row is its own was still waiting for that argument.
 fn joinsByArgument(record: *const ToolDetailRecord) bool {
-    const names = [_][]const u8{ "read_file", "grep_files", "glob_files", "edit_file", "write_file" };
+    const names = [_][]const u8{ "read_file", "grep_files", "glob_files", "edit_file", "write_file", "subagent" };
     for (names) |name| if (std.mem.eql(u8, record.tool_name, name)) return true;
     return false;
 }
@@ -1616,16 +1616,22 @@ fn joinsByArgument(record: *const ToolDetailRecord) bool {
 /// row of its own that folds away when they arrive: the read row for a read,
 /// the row of searches with its tool for a search, the row of its file for
 /// an edit or write whose status names it, the latest row of its own tool
-/// for a read, search, edit, or write that names nothing yet, and the row
-/// right before it for a command that follows commands. When it ends up on
-/// another row, that row is new, so the group only grows. Null when it
-/// likely gets its own row.
+/// for a read, search, edit, or write that names nothing yet or a subagent
+/// call whose status is a bare verb, and the row right before it for a
+/// command that follows commands. When it ends up on another row, that row
+/// is new, so the group only grows. Null when it likely gets its own row.
 fn pendingCallRow(scratch: std.mem.Allocator, rows: []StoryRow, entry: TranscriptEntry, record: *const ToolDetailRecord) !?*StoryRow {
     const name = record.tool_name;
     if (std.mem.eql(u8, name, "read_file")) {
         for (rows) |*row| if (row.identity.kind == .read) return row;
     } else if (std.mem.eql(u8, name, "grep_files") or std.mem.eql(u8, name, "glob_files")) {
         for (rows) |*row| if (row.identity.kind == .search and std.mem.eql(u8, storySearchTool(row.identity.key), name)) return row;
+    } else if (std.mem.eql(u8, name, "subagent")) {
+        // Only a bare verb, such as "Managing", says the call's action or
+        // agent has not arrived. A status that says more, such as "Subagent
+        // working · inspect auth", is its own row's.
+        const phrase = std.mem.trim(u8, try entryStatus(scratch, entry) orelse "", " ");
+        if (std.mem.findScalar(u8, phrase, ' ') != null) return null;
     } else if (std.mem.eql(u8, name, "edit_file") or std.mem.eql(u8, name, "write_file")) {
         // A status that already names its file, such as "Editing main.zig",
         // waits only in that file's row, so it shows which file it changes.
@@ -8714,4 +8720,43 @@ test "a failed command's reason is the error it reports, not code it printed" {
     errdefer std.debug.print("group:\n{s}\n", .{text});
     try std.testing.expect(std.mem.find(u8, text, "· sed: 1:") != null);
     try std.testing.expect(std.mem.find(u8, text, "error_code") == null);
+}
+
+test "a subagent call whose arguments are still coming waits in the latest subagent row" {
+    const alloc = std.testing.allocator;
+    // After a status check, a call with no action yet shows no row of its own.
+    {
+        const entries = [_]TranscriptEntry{
+            .{ .raw_bytes = .{ .id = 1, .bytes = "● checked reviewer\n", .class = .tool_status } },
+            .{ .raw_bytes = .{ .id = 2, .bytes = "● Managing\n", .class = .tool_status } },
+        };
+        const details = [_]ToolDetailRecord{
+            .{ .entry_id = 1, .tool_name = @constCast("subagent"), .activity_kind = .subagent, .arguments_json = @constCast("{\"action\":\"status\"}"), .outcome = .completed },
+            .{ .entry_id = 2, .tool_name = @constCast("subagent"), .activity_kind = .subagent, .arguments_json = @constCast("{\"act") },
+        };
+        const text = try groupTextForTest(alloc, &entries, &details);
+        defer alloc.free(text);
+        errdefer std.debug.print("after status:\n{s}\n", .{text});
+        try std.testing.expect(std.mem.find(u8, text, "Managing") == null);
+        try std.testing.expect(std.mem.findScalar(u8, std.mem.trim(u8, text, "\n"), '\n') == null);
+    }
+    // After a message, with a read after it, the call waits in the message's
+    // row, not on a row of its own at the end.
+    {
+        const entries = [_]TranscriptEntry{
+            .{ .raw_bytes = .{ .id = 1, .bytes = "● sent to reviewer · review the change\n", .class = .tool_status } },
+            .{ .raw_bytes = .{ .id = 2, .bytes = "● Read /w/a.zig\n", .class = .tool_status } },
+            .{ .raw_bytes = .{ .id = 3, .bytes = "● Managing\n", .class = .tool_status } },
+        };
+        const details = [_]ToolDetailRecord{
+            .{ .entry_id = 1, .tool_name = @constCast("subagent"), .activity_kind = .subagent, .arguments_json = @constCast("{\"action\":\"message\",\"agent\":\"reviewer\",\"message\":\"review the change\"}"), .outcome = .completed },
+            .{ .entry_id = 2, .tool_name = @constCast("read_file"), .activity_kind = .read, .arguments_json = @constCast("{\"path\":\"/w/a.zig\"}"), .outcome = .completed },
+            .{ .entry_id = 3, .tool_name = @constCast("subagent"), .activity_kind = .subagent },
+        };
+        const text = try groupTextForTest(alloc, &entries, &details);
+        defer alloc.free(text);
+        errdefer std.debug.print("after message:\n{s}\n", .{text});
+        try std.testing.expect(std.mem.find(u8, text, "Managing") == null);
+        try std.testing.expect(std.mem.find(u8, text, "└ Read a.zig") != null);
+    }
 }
