@@ -279,6 +279,8 @@ async function harness() {
     // the stream is read until it does again, so the state comes from the
     // newer read.
     let lines = await streamLines();
+    const brief = (items) => items.map((line) => `${line.type}:e${line.epoch ?? 0}@${line.cursor}`).join(" ");
+    let shown = "same";
     for (let settles = 0; settles < 5; settles += 1) {
       for (let reads = 0; reads < 5; reads += 1) {
         const again = await streamLines();
@@ -292,7 +294,7 @@ async function harness() {
       const again = await streamLines(cursor);
       const grew = again.length > lines.filter((line) => line.cursor > cursor).length;
       const now = grew ? await streamLines() : lines;
-      const shown = reconnected(lines, cursor, again, now);
+      shown = reconnected(lines, cursor, again, now);
       if (shown === "grown") {
         lines = now;
         continue;
@@ -300,7 +302,6 @@ async function harness() {
       if (shown === null) {
         // Which worker wrote what, and what each still waits on, tells a
         // line written late from one a read missed.
-        const brief = (items) => items.map((line) => `${line.type}:e${line.epoch ?? 0}@${line.cursor}`).join(" ");
         const latest = await streamLines();
         assert.fail([
           `reconnecting from cursor ${cursor} shows different lines`,
@@ -311,6 +312,11 @@ async function harness() {
         ].join("\n"));
       }
       break;
+    }
+    // A stream that grew at every settle never gave a state to compare with
+    // the model, so the walk fails rather than go on with an old read.
+    if (shown === "grown") {
+      assert.fail(`the UI stream grew after each of 5 settles; last read: ${brief(lines)}`);
     }
     return {
       pc: Object.fromEntries(Workers.map((w) => [w, position(w, lines)])),
