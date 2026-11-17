@@ -68,6 +68,35 @@ const REPEATS: StoryStep[] = [
   { at: 6, text: "The tests pass on the third run." },
 ];
 
+// Two shell requests the tool refuses before running anything, as a model
+// sends them, then the fixed request, which runs the same steps.
+const REFUSED_REQUESTS: StoryStep[] = [
+  {
+    at: 0,
+    calls: [{
+      name: "shell",
+      input: {
+        command: "ls -l . 2>/dev/null && printf ok | head -1",
+        profile: "clean",
+        tty: true,
+        shell: { kind: "executable", path: "/bin/sh", clean_start: true },
+      },
+    }],
+  },
+  {
+    at: 1,
+    calls: [{
+      name: "shell",
+      input: {
+        command: "ls -l .; printf ok | head -1",
+        shell: { kind: "executable", path: "/bin/sh", clean_start: true },
+      },
+    }],
+  },
+  { at: 2, calls: [sh("ls -l .; printf ok | head -1")] },
+  { at: 3, text: "The folder is listed." },
+];
+
 const SUBAGENTS: StoryStep[] = [
   {
     at: 0,
@@ -307,6 +336,37 @@ test.skipIf(!tmuxAvailable())(
     sessions.push(resumed);
     await resumed.waitForText("The readme says hello.", TIMEOUT);
     expectReadUnderMessage(paneLines(await resumed.waitForComposer(TIMEOUT)));
+  },
+  TIMEOUT * 3,
+);
+
+test.skipIf(!tmuxAvailable())(
+  "shell requests refused before they ran read as the model's mistake, also after resume",
+  async () => {
+    const { root, gateway, session, pane } = await runStory(REFUSED_REQUESTS, {
+      prompt: "list the folder",
+      finalText: "The folder is listed.",
+    });
+    const expectFixedRequest = (lines: string[]) => {
+      // The fixed request says which try it was. The refused ones never ran,
+      // so they get no row, no failure count, and no "run" of the command.
+      expect(lines).toContain("● Ran ls, printf · 3rd try ✓");
+      expect(lines.some((line) => /Failed|invalid field|Couldn't run|passed on|failed/.test(line))).toBe(false);
+    };
+    expectFixedRequest(paneLines(pane));
+
+    await session.kill();
+    sessions.splice(sessions.indexOf(session), 1);
+    const resumed = await TmuxSession.create({
+      cmd: `${FX_BIN} --resume last`,
+      cwd: root.workspace,
+      env: storyEnv(root, gateway),
+      width: 110,
+      height: 60,
+    });
+    sessions.push(resumed);
+    await resumed.waitForText("The folder is listed.", TIMEOUT);
+    expectFixedRequest(paneLines(await resumed.waitForComposer(TIMEOUT)));
   },
   TIMEOUT * 3,
 );
