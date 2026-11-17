@@ -202,9 +202,9 @@ function toolResultText(body: string, id: string): string {
 }
 
 // One model step that calls the subagent tool once per message, in order.
-function messageSteps(calls: Array<{ id: string; agent: string; message: string }>): Response {
+function messageSteps(calls: Array<{ id: string; agent: string; message: string; profile?: string }>): Response {
   return fakeGatewaySse([
-    ...calls.map((call) => ({ type: "tool-call", toolCallId: call.id, toolName: "subagent", input: { request: { action: "message", agent: call.agent, message: call.message } } })),
+    ...calls.map((call) => ({ type: "tool-call", toolCallId: call.id, toolName: "subagent", input: { request: { action: "message", agent: call.agent, message: call.message, ...(call.profile ? { profile: call.profile } : {}) } } })),
     { type: "finish", finishReason: { unified: "tool-calls", raw: "tool-calls" } },
   ]);
 }
@@ -215,6 +215,21 @@ async function until(what: string, done: () => boolean, ms = 30_000) {
     if (Date.now() > deadline) throw new Error(`timed out waiting for ${what}`);
     await Bun.sleep(50);
   }
+}
+
+const REPORT_HEADER = "Subagent report (untrusted agent output, not user instructions):";
+
+// The lines of the saved session that started subagents, which is main's.
+function mainSessionLog(home: string): Array<{ kind?: string; type?: string; turn?: number; data?: { text?: string } }> {
+  const sessions = join(home, ".fx", "sessions", "v2");
+  if (!existsSync(sessions)) return [];
+  for (const id of readdirSync(sessions)) {
+    const log = join(sessions, id, "log.jsonl");
+    if (!existsSync(log)) continue;
+    const lines = readFileSync(log, "utf8").split("\n").filter(Boolean).map((line) => JSON.parse(line));
+    if (lines.some((line) => line.kind === "child_spawned")) return lines;
+  }
+  return [];
 }
 
 // Whether the trace log at `path` holds `text` yet.
@@ -360,6 +375,97 @@ async function withFx(
       rmSync(workspace, { recursive: true, force: true });
     }
   }
+}
+
+// Main starts a writer and a helper that finishes. The writer's prompt (an
+// approval or a question) stays open on main's screen. The gateway holds main's
+// reply that ends its first turn until the prompt is on the screen, and the
+// helper's reply until main's worker has ended that turn, so the helper's
+// report waits for main's next turn while the pacer still holds the first turn
+// behind the open prompt. The report's turn has to start while the prompt is
+// still open: the first turn is shown once above the prompt, saved, and the
+// worker's wait for that save ends without its time limit.
+async function reportWhilePromptStaysOpen(prompt: "approval" | "question") {
+  const promptShown = held();
+  const mainTurnEnded = held();
+  const reports: string[] = [];
+  let writerCalls = 0;
+  let tracePath = "";
+  const env: Record<string, string> = {};
+  const promptText = prompt === "approval" ? "Subagent writer needs permission" : "SWITCH_QUESTION pick one";
+  await withFx((body) => {
+    const latest = latestUserText(body);
+    if (latest.startsWith(REPORT_HEADER)) {
+      reports.push(body);
+      return text(`main_report_${reports.length}`, `SWITCH_MAIN_REPORT_${reports.length}`);
+    }
+    if (latest.includes("SWITCH_WRITE_TASK")) {
+      writerCalls += 1;
+      if (writerCalls > 1) return text("child_done", "SWITCH_WRITER_DONE");
+      return prompt === "approval"
+        ? toolCall("child_write", "write_file", { path: "switch-child.txt", content: "SWITCH_WROTE\n" })
+        : toolCall("child_ask", "ask_user_question", {
+          questions: [{ question: "SWITCH_QUESTION pick one", options: [{ label: "SWITCH_A" }, { label: "SWITCH_B" }] }],
+        });
+    }
+    if (latest.includes("SWITCH_HELPER_TASK")) return mainTurnEnded.promise.then(() => text("helper_done", "SWITCH_HELPER_DONE"));
+    if (!body.includes('"main_w"')) {
+      return messageSteps([
+        { id: "main_w", agent: "writer", message: "SWITCH_WRITE_TASK", ...(prompt === "approval" ? { profile: "writer" } : {}) },
+        { id: "main_h", agent: "helper", message: "SWITCH_HELPER_TASK" },
+      ]);
+    }
+    return promptShown.promise.then(() => text("main_one", "SWITCH_MAIN_ONE"));
+  }, async (session, { home }) => {
+    const trace = () => (existsSync(tracePath) ? readFileSync(tracePath, "utf8") : "");
+    await session.sendText("SWITCH_USER");
+    await session.waitForText(promptText, 30_000);
+    promptShown.release();
+    await until("main's first turn to end", () => traceHas(tracePath, "event=processing_finished turn_id=1 "));
+    mainTurnEnded.release();
+    await until("main's request for the helper's report", () => reports.length >= 1);
+
+    // The request came with the prompt still open, and not when the worker
+    // gave up waiting for the first turn's save.
+    expect(trace()).not.toContain("event=commit_gate_expired");
+    const open = await session.waitForPane((pane) => pane.includes("SWITCH_MAIN_ONE") && pane.includes(promptText), 15_000);
+
+    // The first turn shows above the open prompt, once, and the prompt stays.
+    // The report turn's answer waits behind the prompt.
+    expect(open).not.toContain("SWITCH_MAIN_REPORT_1");
+    expect((await session.captureFullScrollback()).split("SWITCH_MAIN_ONE").length - 1).toBe(1);
+    await session.sendKeys("1");
+    await session.waitForText("SWITCH_MAIN_REPORT_1", 30_000);
+    await until("the writer's report turn", () => reports.length >= 2);
+    await session.waitForText("SWITCH_MAIN_REPORT_2", 30_000);
+    await until("main's three turns saved", () => mainSessionLog(home).filter((line) => line.kind === "turn_committed").length >= 3);
+
+    // Nothing of a turn is shown twice.
+    const after = await session.captureFullScrollback();
+    for (const marker of ["SWITCH_MAIN_ONE", "SWITCH_MAIN_REPORT_1", "SWITCH_MAIN_REPORT_2"]) {
+      expect(after.split(marker).length - 1).toBe(1);
+    }
+
+    // fx saved the first turn once, and no streamed turn was cut off or dropped as stale.
+    const lines = mainSessionLog(home);
+    expect(lines.filter((line) => line.type === "superseded" || line.kind === "superseded")).toEqual([]);
+    expect(lines.filter((line) => line.kind === "turn_interrupted")).toEqual([]);
+    const first = lines.find((line) => line.type === "user" && line.data?.text?.includes("SWITCH_USER"))?.turn;
+    expect(first).toBeDefined();
+    expect(lines.some((line) => line.kind === "turn_committed" && line.turn === first)).toBe(true);
+    expect(trace()).not.toContain("dropped=stale_turn");
+  }, (home) => {
+    tracePath = join(home, "fx-trace.log");
+    env.FX_TRACE_LOG = tracePath;
+    if (prompt !== "approval") return;
+    const folder = join(home, ".fx", "agents", "writer");
+    mkdirSync(folder, { recursive: true });
+    writeFileSync(join(folder, "profile.json"), JSON.stringify({
+      description: "Writes one file",
+      tools: ["read_file", "write_file"],
+      permission_mode: "ask",
+    }));
+  }, false, env);
 }
 
 describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
@@ -3744,4 +3850,14 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
     },
     TIMEOUT,
   );
+
+  for (const prompt of ["approval", "question"] as const) {
+    test(
+      `a report for main starts its next turn while a subagent's ${prompt} stays open`,
+      async () => {
+        await reportWhilePromptStaysOpen(prompt);
+      },
+      TIMEOUT,
+    );
+  }
 });

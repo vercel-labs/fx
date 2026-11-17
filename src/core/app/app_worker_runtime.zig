@@ -529,6 +529,33 @@ pub fn Runtime(comptime App: type) type {
             return app.pacer.deferred_turn != null;
         }
 
+        /// Shows the finished turn that the pacer of `agent`, the agent in
+        /// context, keeps behind an open prompt, and commits it, when the
+        /// worker holds mail for that commit. The loop does not tick a pacer
+        /// under a prompt, so the commit waits for the prompt to close; and
+        /// the mail's turn, whose start flushes the pacer
+        /// (`workerBridgeDrainAssistantText`), waits for the commit. Without
+        /// this the worker's time limit is all that ends the hold, and the
+        /// mail's turn then starts before the commit and cuts the finished
+        /// turn off in the session. It runs on the loop's thread, which owns
+        /// the pacer. A flush that fails is logged and not tried again until
+        /// the hold is over: the finished turn stays in the pacer, and the
+        /// worker's time limit ends the hold as it did before.
+        pub fn flushPacerForHeldMail(app: *App, agent: *AppAgent, now_ns: i128) void {
+            if (comptime !(@hasField(AppAgent, "worker") and
+                @hasDecl(@TypeOf(agent.worker), "commitGateWaitsForCommit")))
+            {
+                return;
+            }
+            if (!pacerHoldsFinish(app)) return;
+            if (!agent.worker.commitGateWaitsForCommit()) return;
+            debug_trace.logf("worker", "commit gate flushes the pacer behind a prompt for held mail", .{});
+            app.pacer.flushPresentationAtBoundary(app.alloc, now_ns, app.pacerCallbacks()) catch |err| {
+                debug_trace.logf("worker", "commit gate flush failed err={s}; the time limit ends the hold dropped=none", .{@errorName(err)});
+                agent.worker.noteCommitGateFlushFailed();
+            };
+        }
+
         /// Clears the pacer of `agent`, the agent in context: the text it had
         /// not shown, and a finished turn it deferred, which is never saved
         /// then. A cancel and a session switch clear it. `reason` names which.
@@ -6033,4 +6060,213 @@ test "a finished turn the loop does not save after an earlier save failure is ac
     // The drain failed after a save failure, so it may not save what is left.
     Runtime(GateApp).preserveFinishedAfterDrainFailure(&app, agent, &batch, false);
     try std.testing.expectEqual(@as(u32, 0), agent.worker.unacknowledged_finishes);
+}
+
+/// An app whose pacer shows text into `emitted`, and whose finish callback
+/// acknowledges the commit the way `appendFinishedPrompt` does.
+const FlushApp = struct {
+    alloc: std.mem.Allocator,
+    pacer: assistant_pacer.AssistantPacer = .{},
+    main_agent: struct {
+        total_input_tokens: u64 = 0,
+        total_output_tokens: u64 = 0,
+        session: @import("../session/session.zig").SessionRuntime = .{ .max_history_turns = 8 },
+        session_persistence: app_session_runtime.Persistence = .{},
+        worker: worker_runtime.WorkerRuntime = .{},
+    } = .{},
+    emitted: std.ArrayList(u8) = .empty,
+    emit_attempts: usize = 0,
+    fail_emit: bool = false,
+    commits: usize = 0,
+
+    const finished_turn: types.HistoryTurn = .{ .assistant = .{ .user = .{ .text = @constCast("prompt") }, .assistant = @constCast("answer") } };
+
+    pub fn agent(self: anytype) @TypeOf(&self.main_agent) {
+        return &self.main_agent;
+    }
+
+    fn deinit(self: *FlushApp) void {
+        self.agent().session_persistence.deinit(self.alloc);
+        self.agent().session.deinit(self.alloc);
+        self.agent().worker.deinit(std.heap.c_allocator);
+        self.pacer.deinit(self.alloc);
+        self.emitted.deinit(self.alloc);
+    }
+
+    fn pacerCallbacks(self: *FlushApp) assistant_pacer.TickCallbacks {
+        return .{ .emit_ctx = self, .emit_fn = FlushApp.emit, .finish_ctx = self, .finish_fn = FlushApp.finish };
+    }
+
+    fn emit(ctx: *anyopaque, text: []const u8) anyerror!void {
+        const self: *FlushApp = @ptrCast(@alignCast(ctx));
+        self.emit_attempts += 1;
+        if (self.fail_emit) return error.BrokenPipe;
+        try self.emitted.appendSlice(self.alloc, text);
+    }
+
+    fn finish(ctx: *anyopaque, _: types.FinishedPrompt) anyerror!assistant_pacer.FinishResult {
+        const self: *FlushApp = @ptrCast(@alignCast(ctx));
+        self.commits += 1;
+        self.agent().worker.acknowledgeFinishCommitted();
+        return .committed;
+    }
+
+    /// The worker finished a turn that a report missed, and the loop took the
+    /// finish into its pacer, which a prompt keeps from showing it.
+    fn finishedTurnWithMailBehindOpenPrompt(self: *FlushApp, shown: []const u8) !void {
+        const gpa = std.heap.c_allocator;
+        const worker = &self.agent().worker;
+        worker.enableCommitGate();
+        worker.worker_processing = true;
+        worker.active_turn_id = 9;
+        worker.direct_steering_closed = true;
+        try worker.pushEvent(gpa, .{ .finish_prompt = .{ .turn = finished_turn } });
+        try worker.postMail(gpa, .{
+            .prompt = try gpa.dupe(u8, "a report"),
+            .images = &.{},
+            .model = try gpa.dupe(u8, "test-model"),
+            .api_key = try gpa.dupe(u8, "test-key"),
+            .permission_mode = .auto,
+            .history = try gpa.alloc(types.HistoryTurn, 0),
+            .grants = try gpa.alloc(types.PermissionGrant, 0),
+        });
+        try std.testing.expect(worker.queued_prompts.items[0].delivery.isContinuation());
+        worker.finishProcessing();
+        var events = worker.takeEvents();
+        for (events.items) |event| worker_runtime.freeWorkerEvent(gpa, event);
+        events.deinit(gpa);
+        try self.pacer.enqueue(self.alloc, shown);
+        try std.testing.expect(try Runtime(FlushApp).deferFinish(self, self.agent(), .{ .turn = finished_turn }));
+    }
+};
+
+test "the loop flushes the pacer behind a prompt for held mail, and the commit releases the gate" {
+    var app: FlushApp = .{ .alloc = std.testing.allocator };
+    defer app.deinit();
+    const agent = app.agent();
+    try app.finishedTurnWithMailBehindOpenPrompt("still showing");
+    try std.testing.expect(agent.worker.commitGateWaitsForCommit());
+    try std.testing.expect((try agent.worker.tryTakeNextWork(std.heap.c_allocator)) == null);
+
+    Runtime(FlushApp).flushPacerForHeldMail(&app, agent, 0);
+
+    // The turn is shown and committed, once, and the mail may start.
+    try std.testing.expectEqualStrings("still showing", app.emitted.items);
+    try std.testing.expectEqual(@as(usize, 1), app.commits);
+    try std.testing.expect(app.pacer.deferred_turn == null);
+    try std.testing.expectEqual(@as(u32, 0), agent.worker.unacknowledged_finishes);
+    try std.testing.expect(!agent.worker.commitGateWaitsForCommit());
+    const work = (try agent.worker.tryTakeNextWork(std.heap.c_allocator)) orelse return error.TestExpectedReportToStart;
+    defer worker_runtime.freeWorkItem(std.heap.c_allocator, work);
+    try std.testing.expectEqualStrings("a report", work.prompt.prompt);
+
+    // A later pass finds nothing to flush.
+    Runtime(FlushApp).flushPacerForHeldMail(&app, agent, 0);
+    try std.testing.expectEqual(@as(usize, 1), app.commits);
+}
+
+test "the loop leaves a pacer alone unless it holds a finished turn the worker holds mail for" {
+    const gpa = std.heap.c_allocator;
+
+    // Text still being shown, and no finished turn: nothing waits for a commit.
+    {
+        var app: FlushApp = .{ .alloc = std.testing.allocator };
+        defer app.deinit();
+        const agent = app.agent();
+        try app.finishedTurnWithMailBehindOpenPrompt("first turn");
+        app.pacer.clear(app.alloc);
+        try app.pacer.enqueue(app.alloc, "text of a running turn");
+        Runtime(FlushApp).flushPacerForHeldMail(&app, agent, 0);
+        try std.testing.expectEqual(@as(usize, 0), app.emit_attempts);
+        try std.testing.expect(app.pacer.hasPending());
+    }
+
+    // A finished turn in the pacer, and a worker that holds no mail for it: a
+    // host that did not opt in, or no mail at all.
+    {
+        var app: FlushApp = .{ .alloc = std.testing.allocator };
+        defer app.deinit();
+        const agent = app.agent();
+        try app.pacer.enqueue(app.alloc, "still showing");
+        try std.testing.expect(try Runtime(FlushApp).deferFinish(&app, agent, .{ .turn = FlushApp.finished_turn }));
+        Runtime(FlushApp).flushPacerForHeldMail(&app, agent, 0);
+        try std.testing.expectEqual(@as(usize, 0), app.emit_attempts);
+        try std.testing.expect(app.pacer.deferred_turn != null);
+
+        agent.worker.enableCommitGate();
+        try agent.worker.pushEvent(gpa, .{ .finish_prompt = .{ .turn = FlushApp.finished_turn } });
+        Runtime(FlushApp).flushPacerForHeldMail(&app, agent, 0);
+        try std.testing.expectEqual(@as(usize, 0), app.emit_attempts);
+    }
+
+    // A prompt the user typed heads the queue: the gate holds nothing.
+    {
+        var app: FlushApp = .{ .alloc = std.testing.allocator };
+        defer app.deinit();
+        const agent = app.agent();
+        agent.worker.enableCommitGate();
+        try agent.worker.pushEvent(gpa, .{ .finish_prompt = .{ .turn = FlushApp.finished_turn } });
+        try agent.worker.enqueuePrompt(gpa, .{
+            .prompt = try gpa.dupe(u8, "typed"),
+            .images = &.{},
+            .model = try gpa.dupe(u8, "test-model"),
+            .api_key = try gpa.dupe(u8, "test-key"),
+            .permission_mode = .auto,
+            .history = try gpa.alloc(types.HistoryTurn, 0),
+            .grants = try gpa.alloc(types.PermissionGrant, 0),
+        });
+        try app.pacer.enqueue(app.alloc, "still showing");
+        try std.testing.expect(try Runtime(FlushApp).deferFinish(&app, agent, .{ .turn = FlushApp.finished_turn }));
+        Runtime(FlushApp).flushPacerForHeldMail(&app, agent, 0);
+        try std.testing.expectEqual(@as(usize, 0), app.emit_attempts);
+        try std.testing.expect(app.pacer.deferred_turn != null);
+    }
+}
+
+test "a flush that fails is logged once, keeps the finished turn, and is not tried again until the hold is over" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(root);
+    const trace_path = try std.Io.Dir.path.join(alloc, &.{ root, "flush-trace.log" });
+    defer alloc.free(trace_path);
+    debug_trace.resetForTest();
+    defer debug_trace.resetForTest();
+    try debug_trace.configureForTestWithScopes(alloc, trace_path, "worker");
+
+    var app: FlushApp = .{ .alloc = alloc, .fail_emit = true };
+    defer app.deinit();
+    const agent = app.agent();
+    try app.finishedTurnWithMailBehindOpenPrompt("still showing");
+
+    for (0..5) |_| Runtime(FlushApp).flushPacerForHeldMail(&app, agent, 0);
+    try std.testing.expectEqual(@as(usize, 1), app.emit_attempts);
+    try std.testing.expectEqual(@as(usize, 0), app.commits);
+    // The turn stays in the pacer for the loop's own pass, and the gate keeps holding.
+    try std.testing.expect(app.pacer.deferred_turn != null);
+    try std.testing.expectEqual(@as(u32, 1), agent.worker.unacknowledged_finishes);
+    try std.testing.expect(agent.worker.commit_gate_flush_failed);
+
+    // The hold ends, and a later hold is tried again.
+    agent.worker.acknowledgeFinishDropped("cancel");
+    try std.testing.expect(!agent.worker.commit_gate_flush_failed);
+    app.fail_emit = false;
+    app.pacer.clear(alloc);
+    try app.pacer.enqueue(alloc, "second");
+    try agent.worker.pushEvent(std.heap.c_allocator, .{ .finish_prompt = .{ .turn = FlushApp.finished_turn } });
+    var events = agent.worker.takeEvents();
+    for (events.items) |event| worker_runtime.freeWorkerEvent(std.heap.c_allocator, event);
+    events.deinit(std.heap.c_allocator);
+    try std.testing.expect(try Runtime(FlushApp).deferFinish(&app, agent, .{ .turn = FlushApp.finished_turn }));
+    Runtime(FlushApp).flushPacerForHeldMail(&app, agent, 0);
+    try std.testing.expectEqual(@as(usize, 1), app.commits);
+
+    debug_trace.shutdown();
+    var file = try std.Io.Dir.openFileAbsolute(io_mod.getIo(), trace_path, .{});
+    defer file.close(io_mod.getIo());
+    const trace = try io_mod.readFileToEnd(alloc, &file, 1024 * 1024);
+    defer alloc.free(trace);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, trace, "commit gate flush failed err=BrokenPipe"));
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, trace, "commit gate flushes the pacer behind a prompt for held mail"));
 }

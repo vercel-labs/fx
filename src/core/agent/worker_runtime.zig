@@ -671,6 +671,10 @@ pub const WorkerRuntime = struct {
     commit_gate_since_ms: i64 = 0,
     /// Whether this spell of holding mail has been logged.
     commit_gate_logged: bool = false,
+    /// Set when the loop's flush of its pacer for the held mail failed
+    /// (`noteCommitGateFlushFailed`), so it does not try again, and log again,
+    /// on every pass. Guarded by `worker_mutex`; cleared with the count.
+    commit_gate_flush_failed: bool = false,
     /// Independent of a pending submission's turn-start hold; protects queued
     /// work until a fresh-session scrollback handoff succeeds or is cancelled.
     session_transition_held: bool = false,
@@ -1831,6 +1835,7 @@ pub const WorkerRuntime = struct {
         if (!self.commit_gate or self.unacknowledged_finishes == 0) return;
         self.unacknowledged_finishes -|= count;
         if (self.unacknowledged_finishes > 0) return;
+        self.commit_gate_flush_failed = false;
         if (self.commit_gate_logged) {
             debug_trace.eventf("worker", "commit_gate_released", .{ .turn_id = self.active_turn_id }, "worker={x} waited_ms={d} reason={s}", .{ @intFromPtr(self), self.commitGateWaitedMsLocked(), reason });
         }
@@ -1852,6 +1857,37 @@ pub const WorkerRuntime = struct {
         return @max(0, commitGateNowMs() - self.commit_gate_since_ms);
     }
 
+    /// The mail the gate holds while a finished turn's commit is
+    /// unacknowledged: the head of the queue when it is a continuation and no
+    /// compaction is queued. Null when the gate holds nothing.
+    fn commitGateHeldHeadLocked(self: *const WorkerRuntime) ?*const QueuedPrompt {
+        if (!self.commit_gate or self.unacknowledged_finishes == 0) return null;
+        if (self.queued_context_compaction != null or self.queued_prompts.items.len == 0) return null;
+        const head = &self.queued_prompts.items[0];
+        if (!head.delivery.isContinuation()) return null;
+        return head;
+    }
+
+    /// Whether the gate holds mail for a commit the loop has not made, and a
+    /// flush of the loop's pacer has not failed for it. The main loop asks
+    /// while a prompt keeps its pacer from showing the finished turn that
+    /// commit waits for, which the next turn's own start would show; that
+    /// start is the work the gate holds back.
+    pub fn commitGateWaitsForCommit(self: *WorkerRuntime) bool {
+        self.worker_mutex.lockUncancelable(io_mod.getIo());
+        defer self.worker_mutex.unlock(io_mod.getIo());
+        return self.commitGateHeldHeadLocked() != null and !self.commit_gate_flush_failed;
+    }
+
+    /// The main loop's note that its flush of the pacer for the held mail
+    /// failed. The gate's time limit still ends the hold; the loop does not
+    /// try again until the count has reached zero.
+    pub fn noteCommitGateFlushFailed(self: *WorkerRuntime) void {
+        self.worker_mutex.lockUncancelable(io_mod.getIo());
+        defer self.worker_mutex.unlock(io_mod.getIo());
+        self.commit_gate_flush_failed = true;
+    }
+
     /// Null when the gate lets the next work begin; otherwise how many
     /// milliseconds remain before it gives up. The gate holds only the mail
     /// that missed the turn that just finished (a continuation) while that
@@ -1869,15 +1905,13 @@ pub const WorkerRuntime = struct {
     /// `commit_gate_expired`, forgets the unacknowledged count, and lets the
     /// mail begin as it did before the gate.
     fn commitGateRemainingMsLocked(self: *WorkerRuntime) ?i64 {
-        if (!self.commit_gate or self.unacknowledged_finishes == 0) return null;
-        if (self.queued_context_compaction != null or self.queued_prompts.items.len == 0) return null;
-        const head = self.queued_prompts.items[0];
-        if (!head.delivery.isContinuation()) return null;
+        const head = self.commitGateHeldHeadLocked() orelse return null;
         const waited = self.commitGateWaitedMsLocked();
         if (waited >= commit_gate_limit_ms) {
             debug_trace.eventf("worker", "commit_gate_expired", .{ .turn_id = head.turn_id }, "worker={x} unacknowledged={d} waited_ms={d} mail={s} reason=timeout", .{ @intFromPtr(self), self.unacknowledged_finishes, waited, @tagName(head.mail) });
             self.unacknowledged_finishes = 0;
             self.commit_gate_logged = false;
+            self.commit_gate_flush_failed = false;
             return null;
         }
         if (!self.commit_gate_logged) {
@@ -9257,6 +9291,81 @@ test "the commit gate holds neither a prompt a user typed, nor compaction, nor a
     freeWorkItem(alloc, mail);
     plain.acknowledgeFinishCommitted();
     try std.testing.expectEqual(@as(u32, 0), plain.unacknowledged_finishes);
+}
+
+test "the worker says its gate waits for a commit only while it holds continuation mail for one" {
+    const alloc = std.testing.allocator;
+
+    var held = WorkerRuntime{};
+    defer held.deinit(alloc);
+    held.enableCommitGate();
+    // No finish, no mail: nothing waits.
+    try std.testing.expect(!held.commitGateWaitsForCommit());
+    try finishedTurnWithMissedMail(alloc, &held);
+    try std.testing.expect(held.commitGateWaitsForCommit());
+    // Asking is not a hold: it logs nothing and starts no spell.
+    try std.testing.expect(!held.commit_gate_logged);
+    held.acknowledgeFinishCommitted();
+    try std.testing.expect(!held.commitGateWaitsForCommit());
+
+    // A prompt a user typed heads the queue and is not held.
+    var typed = WorkerRuntime{};
+    defer typed.deinit(alloc);
+    typed.enableCommitGate();
+    try pushTestFinish(alloc, &typed);
+    try typed.enqueuePrompt(alloc, try makePrompt(alloc, "typed", "model"));
+    try typed.postMail(alloc, try makePrompt(alloc, "a report", "model"));
+    try std.testing.expect(!typed.commitGateWaitsForCommit());
+
+    // Compaction goes ahead of held mail.
+    var compacting = WorkerRuntime{};
+    defer compacting.deinit(alloc);
+    compacting.enableCommitGate();
+    try finishedTurnWithMissedMail(alloc, &compacting);
+    var no_bytes: [0]u8 = .{};
+    var no_history: [0]types.HistoryTurn = .{};
+    compacting.queued_context_compaction = .{ .turn_id = 4, .model = &no_bytes, .api_key = &no_bytes, .history = &no_history };
+    try std.testing.expect(!compacting.commitGateWaitsForCommit());
+    compacting.queued_context_compaction = null;
+
+    // A host that did not opt in counts no finish.
+    var plain = WorkerRuntime{};
+    defer plain.deinit(alloc);
+    try finishedTurnWithMissedMail(alloc, &plain);
+    try std.testing.expect(!plain.commitGateWaitsForCommit());
+}
+
+test "a failed flush stops the loop's asking until the hold is over, and the hold's end clears it" {
+    const alloc = std.testing.allocator;
+
+    // The count reaching zero clears the mark, so the next hold is tried.
+    var released = WorkerRuntime{};
+    defer released.deinit(alloc);
+    released.enableCommitGate();
+    try finishedTurnWithMissedMail(alloc, &released);
+    try pushTestFinish(alloc, &released);
+    try std.testing.expect(released.commitGateWaitsForCommit());
+    released.noteCommitGateFlushFailed();
+    try std.testing.expect(!released.commitGateWaitsForCommit());
+    // One of two finishes is acknowledged: the count is not zero, the mark stays.
+    released.acknowledgeFinishCommitted();
+    try std.testing.expectEqual(@as(u32, 1), released.unacknowledged_finishes);
+    try std.testing.expect(!released.commitGateWaitsForCommit());
+    released.acknowledgeFinishCommitted();
+    try std.testing.expect(!released.commit_gate_flush_failed);
+    try pushTestFinish(alloc, &released);
+    try std.testing.expect(released.commitGateWaitsForCommit());
+
+    // The limit ending the hold clears it too.
+    var expired = WorkerRuntime{};
+    defer expired.deinit(alloc);
+    expired.enableCommitGate();
+    try finishedTurnWithMissedMail(alloc, &expired);
+    expired.noteCommitGateFlushFailed();
+    expired.commit_gate_since_ms -= WorkerRuntime.commit_gate_limit_ms;
+    freeWorkItem(alloc, (try expired.tryTakeNextWork(alloc)).?);
+    try std.testing.expectEqual(@as(u32, 0), expired.unacknowledged_finishes);
+    try std.testing.expect(!expired.commit_gate_flush_failed);
 }
 
 test "the commit gate logs what it held, what released it, and the limit it gave up at" {

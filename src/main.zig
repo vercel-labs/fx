@@ -3652,6 +3652,7 @@ const App = struct {
             try self.pacer.tick(self.alloc, now_ns, self.pacerCallbacks());
         } else {
             self.pacer.pause(now_ns);
+            WorkerAppRuntime.flushPacerForHeldMail(self, agent, now_ns);
         }
     }
 
@@ -5907,6 +5908,76 @@ test "the tick leaves hidden agents' work for a later pass while a scrollback ha
     try std.testing.expect(!app.main_agent.worker.hasPendingEvents());
     try std.testing.expect(!hidden.agent.worker.hasPendingEvents());
     try std.testing.expect(app.screenAgent() == &on_screen.agent);
+}
+
+test "a hidden agent's pacer is flushed for held mail once a scrollback handoff ends, and not while it is pending" {
+    const alloc = std.testing.allocator;
+    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
+    defer sink.close(io_mod.getIo());
+    var app = App{ .alloc = alloc, .shell = .{ .stdout_file = sink } };
+    defer app.shell.deinit(alloc);
+    defer app.pacer.deinit(alloc);
+    defer app.input_runtime.deinit(alloc);
+    defer App.AgentsAppRuntime.deinitChildren(&app);
+    const on_screen = try addTestChildAgent(&app, "on-screen");
+    const hidden = try addTestChildAgent(&app, "hidden");
+    try App.AgentsAppRuntime.show(&app, on_screen);
+
+    // The hidden agent finished a turn that a report missed. Its own approval
+    // is open, so its pacer keeps the finished turn, and the worker holds the
+    // report for the commit.
+    const turn: types.HistoryTurn = .{ .assistant = .{ .user = .{ .text = @constCast("prompt") }, .assistant = @constCast("answer") } };
+    const worker = &hidden.agent.worker;
+    // `deinitChildren` leaves a worker to its owner, and the turn the flush
+    // commits lands in the agent's session and names its title.
+    defer worker.deinit(alloc);
+    defer hidden.agent.session_persistence.deinit(alloc);
+    defer hidden.agent.session.deinit(alloc);
+    defer hidden.agent.session_title.deinit(alloc);
+    worker.enableCommitGate();
+    worker.worker_processing = true;
+    worker.active_turn_id = 9;
+    worker.direct_steering_closed = true;
+    try worker.pushEvent(alloc, .{ .finish_prompt = .{ .turn = turn } });
+    try worker.postMail(alloc, .{
+        .prompt = try alloc.dupe(u8, "a report"),
+        .images = &.{},
+        .model = try alloc.dupe(u8, "test-model"),
+        .api_key = try alloc.dupe(u8, "test-key"),
+        .permission_mode = .auto,
+        .history = try alloc.alloc(types.HistoryTurn, 0),
+        .grants = try alloc.alloc(types.PermissionGrant, 0),
+    });
+    worker.finishProcessing();
+    var taken = worker.takeEvents();
+    for (taken.items) |event| worker_runtime.freeWorkerEvent(alloc, event);
+    taken.deinit(alloc);
+    try hidden.screen.pacer.enqueue(alloc, "still showing");
+    try std.testing.expect(try hidden.screen.pacer.deferFinish(alloc, .{ .turn = turn }));
+    try std.testing.expect(try hidden.agent.approval_prompt.syncRequest(alloc, .{ .label = "shell.run npm test" }));
+    defer hidden.agent.approval_prompt.clear(alloc);
+    try std.testing.expect(worker.commitGateWaitsForCommit());
+
+    // While the handoff is pending the tick skips the hidden agent: nothing is
+    // flushed, so no hidden transcript is swapped onto the screen.
+    app.shell.pending_session_scrollback_handoff = .{ .remaining_rows = 1, .total_rows = 2, .terminal_cols = 80, .terminal_rows = 24 };
+    for (0..3) |_| try App.AgentsAppRuntime.tickChildren(&app, {}, App.tickAgentInContext);
+    try std.testing.expect(hidden.screen.pacer.deferred_turn != null);
+    try std.testing.expectEqual(@as(u32, 1), worker.unacknowledged_finishes);
+    try std.testing.expect(worker.commitGateWaitsForCommit());
+    try std.testing.expect(app.screenAgent() == &on_screen.agent);
+
+    // Once the handoff ends, the agent's own tick flushes its pacer and the
+    // commit releases the held report.
+    app.shell.pending_session_scrollback_handoff = null;
+    try App.AgentsAppRuntime.tickChildren(&app, {}, App.tickAgentInContext);
+    try std.testing.expect(hidden.screen.pacer.deferred_turn == null);
+    try std.testing.expectEqual(@as(u32, 0), worker.unacknowledged_finishes);
+    try std.testing.expect(!worker.commitGateWaitsForCommit());
+    try std.testing.expect(app.screenAgent() == &on_screen.agent);
+    const work = (try worker.tryTakeNextWork(alloc)) orelse return error.TestExpectedReportToStart;
+    defer worker_runtime.freeWorkItem(alloc, work);
+    try std.testing.expectEqualStrings("a report", work.prompt.prompt);
 }
 
 test "a run handed to a hidden agent waits while a scrollback handoff is pending" {
