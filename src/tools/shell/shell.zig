@@ -27,6 +27,7 @@ const tool_result_errors = @import("../../core/tooling/tool_result_errors.zig");
 const text_utils = @import("../../core/shared/text_utils.zig");
 const result_commit = @import("../../core/tooling/result_commit.zig");
 const result_store = @import("../../core/session/result_store.zig");
+const session_child_store = @import("../../core/session/session_child_store.zig");
 const types = @import("../../core/shared/types.zig");
 const workspace_access = @import("../../core/workspace/workspace_access.zig");
 
@@ -893,42 +894,72 @@ fn withoutSteeringYield(ctx: tool_dispatch.DispatchContext, yield_time_ms: u32) 
 /// action does: gracefully first, then by force if the command still runs.
 /// Commands the model left in the background itself and those of other
 /// turns keep running. `ctx` must not carry the cancelled turn's cancel
-/// flag, or the stop itself would be cancelled. It runs after the turn is
-/// reported, and its last trace line says it is done.
+/// flag, or the stop itself would be cancelled.
 ///
-/// Up to `max_parallel_detached_stops` stops run at once, as tasks of one
-/// `std.Io.Group` that this call awaits, so the 2 s waits of stubborn tty
-/// commands overlap. Their graceful closes do not: the terminal client runs
-/// every write, resize, signal and close in one admission order, so each
-/// tty command that ignores SIGTERM still adds its 800 ms close, and each
-/// further group of `max_parallel_detached_stops` adds another 2 s wait.
-/// Two such commands take about 3.5 s, 12 about 14 s, and 20 about 23 s.
-/// A stop the busy terminal client refuses runs again
-/// (`max_busy_terminal_attempts`), which can add up to about 3.1 s for
-/// each command.
+/// The stops run in the background, as tasks of the command runtime's
+/// background group (`managed_execution.Runtime.startBackground`), so the
+/// call returns at once and the agent takes its next prompt while they run.
+/// The last task to finish writes the "stops done" trace line. Shutdown of
+/// the runtime awaits the tasks, so an agent or instance close still stops
+/// every command. Process exit also cancels them, since it closes every
+/// terminal next, and each stop it cuts short is logged as dropped. When a
+/// close already began, or no thread can take a task, the stops run on the
+/// caller, up to `max_parallel_detached_stops` at once, before it returns.
+///
+/// Up to `max_parallel_detached_stops` stops run at once, so the 2 s waits
+/// of stubborn tty commands overlap. Their graceful closes do not: the
+/// terminal client runs every write, resize, signal and close in one
+/// admission order, so each tty command that ignores SIGTERM still adds its
+/// 800 ms close, and each further group of `max_parallel_detached_stops`
+/// adds another 2 s wait. A stop the busy terminal client refuses runs
+/// again (`max_busy_terminal_attempts`), which can add up to about 3.1 s
+/// for each command; process exit ends those waits at once.
 pub fn stopSteeringDetached(
     ctx: tool_dispatch.DispatchContext,
     turn_id: u64,
 ) Allocator.Error!void {
     const runtime = ctx.managed_executions orelse return;
-    const ids = try runtime.takeSteeringDetached(ctx.allocator, turn_id);
-    defer {
-        for (ids) |id| ctx.allocator.free(id);
-        ctx.allocator.free(ids);
+    const job = try DetachedStopJob.create(ctx, runtime, turn_id);
+    if (job.ids.len == 0) {
+        job.finish();
+        return;
     }
-    var queue: DetachedStopQueue = .{ .ctx = ctx, .ids = ids, .turn_id = turn_id };
-    const io = io_mod.getIo();
-    var group: std.Io.Group = .init;
-    for (0..@min(ids.len, max_parallel_detached_stops)) |_| group.async(io, DetachedStopQueue.run, .{&queue});
-    group.await(io) catch |err| debug_trace.logf(
-        "shell",
-        "steering-detached command stops awaited after cancel turn_id={d} err={s}",
-        .{ turn_id, @errorName(err) },
-    );
+    const tasks = @min(job.ids.len, max_parallel_detached_stops);
+    job.tasks.store(tasks, .release);
+    var started: usize = 0;
+    const refused = while (started < tasks) : (started += 1) {
+        runtime.startBackground(DetachedStopJob.run, .{job}) catch |err| break err;
+    } else return;
+    // The tasks that started take every command left in the queue; the
+    // ones that did not start never run, so they give up their share.
     debug_trace.logf(
         "shell",
-        "steering-detached command stops done turn_id={d} count={d}",
-        .{ turn_id, ids.len },
+        "steering-detached command stops started turn_id={d} tasks={d} of={d} err={s}",
+        .{ turn_id, started, tasks, @errorName(refused) },
+    );
+    if (started > 0) {
+        if (job.tasks.fetchSub(tasks - started, .acq_rel) == tasks - started) job.finish();
+        return;
+    }
+    // No task started. Only process exit, which closes the terminals
+    // itself, drops the commands.
+    if (runtime.backgroundCancelled()) {
+        job.tasks.store(1, .release);
+        job.dropAll();
+        return;
+    }
+    // After an agent or instance close began, or when no thread can take a
+    // task, the stops still run, on the caller: the close does not end the
+    // commands. Up to `max_parallel_detached_stops` run at once, as tasks of
+    // a group this call awaits, so the close takes no longer than the stops
+    // of one group. The last task frees the job.
+    const io = io_mod.getIo();
+    var group: std.Io.Group = .init;
+    for (0..tasks) |_| group.async(io, DetachedStopJob.run, .{job});
+    group.await(io) catch |err| debug_trace.logf(
+        "shell",
+        "steering-detached command stops awaited on the caller turn_id={d} err={s}",
+        .{ turn_id, @errorName(err) },
     );
 }
 
@@ -937,36 +968,138 @@ pub fn stopSteeringDetached(
 /// rest, so one cancel uses at most this many and leaves room for the others.
 const max_parallel_detached_stops = 8;
 
-/// The commands of one `stopSteeringDetached`. Its tasks take them one by
-/// one, in list order, until none is left.
-const DetachedStopQueue = struct {
+/// The commands of one `stopSteeringDetached` and what their stops need
+/// after the call that took them returns. The call's context borrows the
+/// turn's state, so the job keeps its own copies: of the strings, and of
+/// the session's side-file capability. The command runtime and the terminal
+/// client outlive it, since the runtime's shutdown awaits its tasks before
+/// either is torn down. Its tasks take the commands one by one, in list
+/// order, and the last task to finish frees it.
+const DetachedStopJob = struct {
+    alloc: Allocator,
+    runtime: *managed_execution.Runtime,
+    /// The context of each stop, with `allocator` replaced per stop.
     ctx: tool_dispatch.DispatchContext,
-    ids: []const []const u8,
+    capability: ?session_child_store.SessionChildCapability,
+    ids: [][]u8,
     turn_id: u64,
     next: std.atomic.Value(usize) = .init(0),
+    /// Tasks that still run.
+    tasks: std.atomic.Value(usize) = .init(0),
 
-    /// Stops the next commands until none is left. Each stop gets its own
-    /// arena over `ctx.lifecycle_allocator`, which is thread-safe; the
-    /// caller's allocator may be an arena that only its own thread may use.
-    fn run(self: *DetachedStopQueue) void {
+    fn create(
+        source: tool_dispatch.DispatchContext,
+        runtime: *managed_execution.Runtime,
+        turn_id: u64,
+    ) Allocator.Error!*DetachedStopJob {
+        // Thread-safe, unlike the caller's allocator, which may be an arena
+        // that only its own thread may use.
+        const alloc = source.lifecycle_allocator;
+        const job = try alloc.create(DetachedStopJob);
+        errdefer alloc.destroy(job);
+        job.* = .{
+            .alloc = alloc,
+            .runtime = runtime,
+            .ctx = .{
+                .allocator = alloc,
+                .lifecycle_allocator = alloc,
+                .scratch_allocator = source.scratch_allocator,
+                .managed_executions = runtime,
+                .ephemeral_command_replay = runtime.replayStore(),
+                .terminal_client = source.terminal_client,
+                .terminal_transport_role = source.terminal_transport_role,
+                .max_command_output_bytes = source.max_command_output_bytes,
+                .max_tool_result_bytes = source.max_tool_result_bytes,
+                // Process exit sets it, which ends the stops' terminal
+                // requests.
+                .cancel_flag = runtime.backgroundCancelFlag(),
+            },
+            .capability = null,
+            .ids = &.{},
+            .turn_id = turn_id,
+        };
+        errdefer job.freeCopies();
+        job.ctx.workspace_root = try alloc.dupe(u8, source.workspace_root);
+        if (source.terminal_owner_session_id) |id| job.ctx.terminal_owner_session_id = try alloc.dupe(u8, id);
+        if (source.session_child_capability) |capability| {
+            job.capability = capability.duplicate(alloc) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                // Without it, a tty stop is refused and logged.
+                else => blk: {
+                    debug_trace.logf(
+                        "shell",
+                        "steering-detached command stops lost the session capability turn_id={d} err={s}",
+                        .{ turn_id, @errorName(err) },
+                    );
+                    break :blk null;
+                },
+            };
+            if (job.capability) |*owned| job.ctx.session_child_capability = owned;
+        }
+        job.ids = try runtime.takeSteeringDetached(alloc, turn_id);
+        return job;
+    }
+
+    fn freeCopies(self: *DetachedStopJob) void {
+        for (self.ids) |id| self.alloc.free(id);
+        self.alloc.free(self.ids);
+        if (self.capability) |*capability| capability.deinit();
+        if (self.ctx.terminal_owner_session_id) |id| self.alloc.free(@constCast(id));
+        self.alloc.free(@constCast(self.ctx.workspace_root));
+    }
+
+    /// Writes the done trace line and frees the job.
+    fn finish(self: *DetachedStopJob) void {
+        debug_trace.logf(
+            "shell",
+            "steering-detached command stops done turn_id={d} count={d}",
+            .{ self.turn_id, self.ids.len },
+        );
+        self.freeCopies();
+        self.alloc.destroy(self);
+    }
+
+    /// Stops the next commands until none is left, then leaves the job,
+    /// which the last task frees. Each stop gets its own arena. After
+    /// process exit begins, each command left is logged as dropped: exit
+    /// closes its terminal itself.
+    fn run(self: *DetachedStopJob) void {
         while (true) {
             const index = self.next.fetchAdd(1, .monotonic);
-            if (index >= self.ids.len) return;
+            if (index >= self.ids.len) break;
             const session_id = self.ids[index];
-            var arena = std.heap.ArenaAllocator.init(self.ctx.lifecycle_allocator);
+            if (self.runtime.backgroundCancelled()) {
+                logDroppedStop(session_id, self.turn_id, "runtime_stopping");
+                continue;
+            }
+            var arena = std.heap.ArenaAllocator.init(self.alloc);
             defer arena.deinit();
             var ctx = self.ctx;
             ctx.allocator = arena.allocator();
             stopOneSteeringDetached(ctx, session_id, self.turn_id) catch |err| {
-                debug_trace.logf(
-                    "shell",
-                    "steering-detached command stop failed session_id={s} turn_id={d} err={s} dropped=background_command_stop",
-                    .{ session_id, self.turn_id, @errorName(err) },
-                );
+                logDroppedStop(session_id, self.turn_id, @errorName(err));
             };
         }
+        if (self.tasks.fetchSub(1, .acq_rel) == 1) self.finish();
+    }
+
+    /// Logs every command as dropped and frees the job, for a process exit
+    /// that began before any task started.
+    fn dropAll(self: *DetachedStopJob) void {
+        for (self.ids) |session_id| logDroppedStop(session_id, self.turn_id, "runtime_stopping");
+        self.finish();
     }
 };
+
+/// The one trace line for a steered command's stop that fx drops, so log
+/// searches for `dropped=background_command_stop` find every case.
+fn logDroppedStop(session_id: []const u8, turn_id: u64, reason: []const u8) void {
+    debug_trace.logf(
+        "shell",
+        "steering-detached command stop failed session_id={s} turn_id={d} err={s} dropped=background_command_stop",
+        .{ session_id, turn_id, reason },
+    );
+}
 
 /// Stops `session_id`, a command steering moved to the background in turn
 /// `turn_id`: gracefully, then by force if it still runs.
@@ -990,22 +1123,24 @@ fn stopOneSteeringDetached(
         ),
         .refused => debug_trace.logf(
             "shell",
-            "graceful stop of steering-detached command never ran session_id={s} turn_id={d} reason=terminal_busy next=force",
-            .{ session_id, turn_id },
+            "graceful stop of steering-detached command never ran session_id={s} turn_id={d} reason={s} next=force",
+            .{ session_id, turn_id, cause.text() },
         ),
     }
     cause = .{};
+    // Process exit cancels the stop's terminal requests and its retry
+    // waits, and then closes the terminal itself.
     switch (try stopDetachedOnce(ctx, session_id, true, &cause)) {
         .ended => {},
-        .not_ended => debug_trace.logf(
+        .not_ended => if (exitBegan(ctx)) logDroppedStop(session_id, turn_id, "runtime_stopping") else debug_trace.logf(
             "shell",
             "steering-detached command stop failed session_id={s} turn_id={d} failure={s}",
             .{ session_id, turn_id, cause.text() },
         ),
-        .refused => debug_trace.logf(
+        .refused => if (exitBegan(ctx)) logDroppedStop(session_id, turn_id, "runtime_stopping") else debug_trace.logf(
             "shell",
-            "steering-detached command stop failed session_id={s} turn_id={d} reason=terminal_busy",
-            .{ session_id, turn_id },
+            "steering-detached command stop failed session_id={s} turn_id={d} reason={s}",
+            .{ session_id, turn_id, cause.text() },
         ),
     }
 }
@@ -1038,6 +1173,26 @@ const DetachedStopCause = struct {
 /// every time takes about 3.1 s.
 const max_busy_terminal_attempts = 6;
 const busy_terminal_first_backoff_ms = 50;
+
+/// Whether process exit began for the command runtime of `ctx`. Exit
+/// closes every terminal itself, so work for one is dropped then.
+fn exitBegan(ctx: tool_dispatch.DispatchContext) bool {
+    const runtime = ctx.managed_executions orelse return false;
+    return runtime.backgroundCancelled();
+}
+
+/// Waits `backoff_ms` before a request the busy terminal client refused
+/// runs again. Returns false, at once, when process exit begins before or
+/// during the wait, so exit never waits out a retry.
+fn waitBusyBackoff(ctx: tool_dispatch.DispatchContext, backoff_ms: u64) bool {
+    const deadline_ms = io_mod.milliTimestamp() + @as(i64, @intCast(backoff_ms));
+    while (true) {
+        if (exitBegan(ctx)) return false;
+        const left_ms = deadline_ms - io_mod.milliTimestamp();
+        if (left_ms <= 0) return true;
+        io_mod.sleep(@as(u64, @intCast(@min(left_ms, 10))) * std.time.ns_per_ms);
+    }
+}
 
 /// Runs the `stop` action on `session_id` and reports what it did. The
 /// terminal client runs at most 32 requests for all agents and refuses the
@@ -1085,6 +1240,7 @@ fn stopDetachedOnce(
                     "steering-detached command stop gave up session_id={s} force={s} attempts={d} reason=terminal_busy dropped=background_command_stop",
                     .{ session_id, force_name, attempt },
                 );
+                cause.set("terminal_busy");
                 return .refused;
             }
             debug_trace.logf(
@@ -1092,7 +1248,15 @@ fn stopDetachedOnce(
                 "steering-detached command stop refused session_id={s} force={s} attempt={d} reason=terminal_busy retry_in_ms={d}",
                 .{ session_id, force_name, attempt, backoff_ms },
             );
-            io_mod.sleep(backoff_ms * std.time.ns_per_ms);
+            if (!waitBusyBackoff(ctx, backoff_ms)) {
+                debug_trace.logf(
+                    "shell",
+                    "steering-detached command stop retry cut short session_id={s} force={s} attempt={d} reason=runtime_stopping",
+                    .{ session_id, force_name, attempt },
+                );
+                cause.set("runtime_stopping");
+                return .refused;
+            }
             backoff_ms *= 2;
             continue;
         }
@@ -1796,7 +1960,14 @@ pub fn releaseAgentWriteLease(
             "terminal lease release refused session_id={s} attempt={d} reason=terminal_busy retry_in_ms={d}",
             .{ session_id, attempt, backoff_ms },
         );
-        io_mod.sleep(backoff_ms * std.time.ns_per_ms);
+        if (!waitBusyBackoff(ctx, backoff_ms)) {
+            debug_trace.logf(
+                "shell",
+                "terminal lease release gave up session_id={s} attempts={d} reason=runtime_stopping dropped=agent_write_lease_release",
+                .{ session_id, attempt },
+            );
+            return error.TerminalLeaseCleanupFailed;
+        }
         backoff_ms *= 2;
     }
 }
@@ -1879,7 +2050,14 @@ fn closeTtyBestEffort(
             "unpublished TTY cleanup refused session_id={s} attempt={d} reason=terminal_busy retry_in_ms={d}",
             .{ session_id, attempt, backoff_ms },
         );
-        io_mod.sleep(backoff_ms * std.time.ns_per_ms);
+        if (!waitBusyBackoff(ctx, backoff_ms)) {
+            debug_trace.logf(
+                "shell",
+                "unpublished TTY cleanup gave up session_id={s} attempts={d} reason=runtime_stopping dropped=unpublished_tty_close",
+                .{ session_id, attempt },
+            );
+            return;
+        }
         backoff_ms *= 2;
     }
 }
@@ -4018,9 +4196,15 @@ const SteeringCancelTest = struct {
         return self.dispatch(command, arguments, turn_id);
     }
 
-    /// What an explicit cancel of turn `turn_id` does.
+    /// What an explicit cancel of turn `turn_id` does. Its stops may still
+    /// run when it returns. Their job uses the testing allocator, so a job
+    /// the runtime's shutdown does not free fails the test.
     fn cancelTurn(self: *SteeringCancelTest, turn_id: u64) !void {
-        try stopSteeringDetached(.{ .allocator = self.alloc, .managed_executions = &self.runtime }, turn_id);
+        try stopSteeringDetached(.{
+            .allocator = self.alloc,
+            .lifecycle_allocator = self.alloc,
+            .managed_executions = &self.runtime,
+        }, turn_id);
     }
 
     fn state(self: *SteeringCancelTest, started: Started) ?managed_execution.SnapshotState {
@@ -4062,12 +4246,7 @@ test "a turn cancel stops the command steering detached and keeps a background o
 
 test "a turn cancel stops more steered commands than run at once, also when no task can start" {
     if (comptime @import("builtin").target.os.tag == .wasi) return;
-    // `.nothing` runs every task of the group on the caller, as a
-    // single-threaded build does.
-    for ([_]std.Io.Limit{ std.testing.io_instance.async_limit, .nothing }) |limit| {
-        const previous_async_limit = std.testing.io_instance.async_limit;
-        std.testing.io_instance.setAsyncLimit(limit);
-        defer std.testing.io_instance.setAsyncLimit(previous_async_limit);
+    for ([_]bool{ false, true }) |no_task| {
         var t: SteeringCancelTest = undefined;
         try t.init(std.testing.allocator);
         defer t.deinit();
@@ -4081,6 +4260,18 @@ test "a turn cancel stops more steered commands than run at once, also when no t
             try std.testing.expect(command.notice);
         }
 
+        if (no_task) {
+            // No background task can start, as in a single-threaded build,
+            // so the stops run on the caller before the cancel returns. The
+            // limit holds only for the cancel: the commands' own waits
+            // start tasks too.
+            const previous_limit = std.testing.io_instance.concurrent_limit;
+            std.testing.io_instance.concurrent_limit = .nothing;
+            defer std.testing.io_instance.concurrent_limit = previous_limit;
+            try t.cancelTurn(5);
+            for (steered) |command| try std.testing.expect(t.state(command).? != .running);
+            continue;
+        }
         try t.cancelTurn(5);
         const deadline_ms = io_mod.milliTimestamp() + 10_000;
         for (steered) |command| while (t.state(command)) |state| {
@@ -4088,6 +4279,36 @@ test "a turn cancel stops more steered commands than run at once, also when no t
             if (io_mod.milliTimestamp() > deadline_ms) return error.TestUnexpectedResult;
             io_mod.sleep(20 * std.time.ns_per_ms);
         };
+    }
+}
+
+test "shutdown while a turn cancel's stops run ends every command and frees the stops" {
+    if (comptime @import("builtin").target.os.tag == .wasi) return;
+    // An agent or instance close lets the stops finish; process exit cuts
+    // them short and ends the commands itself.
+    for ([_]bool{ false, true }) |process_exit| {
+        var t: SteeringCancelTest = undefined;
+        try t.init(std.testing.allocator);
+        defer t.deinit();
+
+        // Commands that ignore SIGTERM, so each graceful stop waits.
+        const stubborn = "trap '' TERM; while :; do sleep 1; done";
+        var steered: [3]SteeringCancelTest.Started = undefined;
+        var started: usize = 0;
+        defer for (steered[0..started]) |command| t.alloc.free(command.id);
+        for (&steered) |*command| {
+            command.* = try t.run(stubborn, 30_000, 5);
+            started += 1;
+            try std.testing.expect(command.notice);
+        }
+
+        // The cancel returns while its stops still run, and shutdown awaits
+        // them. The job uses the testing allocator, so one left behind
+        // fails.
+        try t.cancelTurn(5);
+        if (process_exit) t.runtime.terminateForProcessExit() else t.runtime.shutdown();
+        try std.testing.expectEqual(process_exit, t.runtime.backgroundCancelled());
+        for (steered) |command| try std.testing.expect(t.state(command).? != .running);
     }
 }
 
@@ -4128,7 +4349,6 @@ const TtySteeringCancelTest = struct {
     const owner_session_id = "steered-stop-owner";
     const shell_path = "/bin/bash";
     const terminal_client = @import("../../core/terminal/client.zig");
-    const session_child_store = @import("../../core/session/session_child_store.zig");
 
     alloc: Allocator,
     tmp: std.testing.TmpDir,
@@ -4372,6 +4592,8 @@ test "a turn cancel stops a steered tty command while the terminal client is ful
         return error.SkipZigTest;
     };
     try stopSteeringDetached(t.context(), 5);
+    // The stops run in the background; a close's shutdown awaits them.
+    t.runtime.shutdown();
     releaser.await(io) catch {};
     // A stopped command is either marked stopped or already gone.
     if (t.runtime.stateFor(steered)) |state| try std.testing.expect(state != .running);
@@ -4477,6 +4699,9 @@ test "a turn cancel gives up a steered tty stop the full terminal client keeps r
     // runs. The waits between the runs add up to about 3.1 s.
     const started_ms = io_mod.milliTimestamp();
     try stopSteeringDetached(t.context(), 5);
+    // The stops run in the background; a close's shutdown awaits them, and
+    // does not cut the retries short.
+    t.runtime.shutdown();
     const took_ms = io_mod.milliTimestamp() - started_ms;
     try std.testing.expect(took_ms >= 2 * 1_550);
     try std.testing.expectEqual(managed_execution.SnapshotState.running, t.runtime.stateFor(steered).?);
@@ -4552,4 +4777,41 @@ test "an unpublished tty close runs again while the terminal client is full" {
             else => return error.TestUnexpectedResult,
         },
     }
+}
+
+test "process exit during a busy-client retry ends the steered stop at once and logs it dropped" {
+    if (comptime builtin.target.os.tag == .wasi or builtin.single_threaded) return;
+    var t: TtySteeringCancelTest = undefined;
+    try t.init();
+    defer t.deinit();
+    const trace_path = try std.Io.Dir.path.join(t.alloc, &.{ t.home, "trace.log" });
+    defer t.alloc.free(trace_path);
+    debug_trace.resetForTest();
+    defer debug_trace.resetForTest();
+    try debug_trace.configureForTestWithScopes(t.alloc, trace_path, "shell");
+
+    const steered = try t.run("sleep 30", 5);
+    defer t.alloc.free(steered);
+    var fillers: [64]terminal_contracts.CorrelationId = undefined;
+    const filled = try t.fill(steered, &fillers);
+    defer t.release(fillers[0..filled], 0);
+
+    // The stop runs in the background and waits between refused runs while
+    // the client stays full; left alone it gives up after about 3.1 s. Its
+    // first run is refused at once, so it waits by now.
+    try stopSteeringDetached(t.context(), 5);
+    io_mod.sleep(300 * std.time.ns_per_ms);
+
+    // Exit ends the waits at once, and the stop logs what it dropped.
+    const started_ms = io_mod.milliTimestamp();
+    t.runtime.terminateForProcessExit();
+    try std.testing.expect(io_mod.milliTimestamp() - started_ms < 1_000);
+    debug_trace.shutdown();
+    var trace_file = try std.Io.Dir.openFileAbsolute(io_mod.getIo(), trace_path, .{});
+    defer trace_file.close(io_mod.getIo());
+    const text = try io_mod.readFileToEnd(t.alloc, &trace_file, 1 << 20);
+    defer t.alloc.free(text);
+    try std.testing.expect(std.mem.find(u8, text, "steering-detached command stop refused") != null);
+    try std.testing.expect(std.mem.find(u8, text, "reason=runtime_stopping") != null);
+    try std.testing.expect(std.mem.find(u8, text, "err=runtime_stopping dropped=background_command_stop") != null);
 }

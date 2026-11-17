@@ -584,6 +584,16 @@ pub const Runtime = struct {
     shutting_down: bool = false,
     replay_store: command_replay_store.EphemeralStore,
     pending_admissions: usize = 0,
+    /// Work on this runtime's commands that runs after the call that starts
+    /// it returns, such as the stops of the commands steering moved to the
+    /// background in a cancelled turn. Tasks start only through
+    /// `startBackground`, and `stopAllAndJoin` awaits them; at process exit
+    /// it cancels them first.
+    background: std.Io.Group = .init,
+    /// Set when process exit begins (`terminateForProcessExit`). Background
+    /// tasks pass it as the cancel flag of their terminal requests and start
+    /// no new work after it is set.
+    background_cancel: std.atomic.Value(bool) = .init(false),
 
     pub fn init(alloc: Allocator) Runtime {
         return .{
@@ -1265,18 +1275,54 @@ pub const Runtime = struct {
         return self.cancelEntryDelivery(entry, reservation_id);
     }
 
+    /// Stops this runtime's commands and lets its background tasks finish,
+    /// as an agent or instance close needs: the close does not end tty
+    /// commands, so the stops of steered ones must run to their end.
     pub fn shutdown(self: *Runtime) void {
         self.stopAllAndJoin(.cooperative);
     }
 
     /// Process exit: force-kill every live command's process group instead of
     /// granting the cooperative termination grace, then wait only for each
-    /// worker thread to observe the kill so no command outlives fx.
+    /// worker thread to observe the kill so no command outlives fx. It also
+    /// cancels the background tasks' terminal requests, since the caller
+    /// closes every terminal next.
     pub fn terminateForProcessExit(self: *Runtime) void {
         self.stopAllAndJoin(.force);
     }
 
     const StopMode = enum { cooperative, force };
+
+    /// Runs `function` with `args` as a task of this runtime's background
+    /// group, on a thread of its own. Shutdown awaits the task, so the
+    /// runtime outlives it. Fails with `error.RuntimeStopping` once shutdown
+    /// began, and with `error.ConcurrencyUnavailable` when no thread can
+    /// take the task; then it never runs.
+    pub fn startBackground(
+        self: *Runtime,
+        function: anytype,
+        args: std.meta.ArgsTuple(@TypeOf(function)),
+    ) error{ RuntimeStopping, ConcurrencyUnavailable }!void {
+        const zio = io_mod.getIo();
+        // Held while the task starts, so shutdown never awaits the group
+        // while a task joins it.
+        self.mutex.lockUncancelable(zio);
+        defer self.mutex.unlock(zio);
+        if (self.shutting_down) return error.RuntimeStopping;
+        return self.background.concurrent(zio, function, args);
+    }
+
+    /// The flag background tasks pass as the cancel flag of their terminal
+    /// requests. It is set once process exit begins.
+    pub fn backgroundCancelFlag(self: *Runtime) *std.atomic.Value(bool) {
+        return &self.background_cancel;
+    }
+
+    /// Whether process exit began, so a background task must start no new
+    /// work.
+    pub fn backgroundCancelled(self: *const Runtime) bool {
+        return self.background_cancel.load(.acquire);
+    }
 
     fn stopAllAndJoin(self: *Runtime, mode: StopMode) void {
         const zio = io_mod.getIo();
@@ -1286,6 +1332,14 @@ pub const Runtime = struct {
             return;
         }
         self.shutting_down = true;
+        // No background task starts after this. A cooperative shutdown, as
+        // an agent or instance close does, lets the running tasks finish:
+        // the close does not end tty commands, and the app closes terminals
+        // only when it exits, so a stop cut short would leave its command
+        // running. Only process exit, which closes every terminal next,
+        // cancels the tasks' terminal requests, and they log the stops they
+        // drop.
+        if (mode == .force) self.background_cancel.store(true, .release);
         var live: [contract.max_live_entries]*Entry = undefined;
         var live_len: usize = 0;
         for (self.entries) |candidate| {
@@ -1301,6 +1355,14 @@ pub const Runtime = struct {
             entry.mutex.unlock(zio);
         }
         self.mutex.unlock(zio);
+        // After the commands are told to end, so a background stop that
+        // waits on one returns soon, and before the joins and the caller's
+        // teardown, which the tasks still use.
+        self.background.await(zio) catch |err| debug_trace.logf(
+            "shell",
+            "background command work awaited at shutdown err={s}",
+            .{@errorName(err)},
+        );
         for (live[0..live_len]) |entry| self.joinEntry(entry);
     }
 
@@ -2218,6 +2280,63 @@ test "a cancel takes only the running commands steering detached in its turn" {
     try std.testing.expectEqual(@as(usize, 1), moved_to.len);
     try std.testing.expectEqualStrings("steered-in-8", moved_to[0]);
     try std.testing.expectEqual(SnapshotState.running, runtime.stateFor("background").?);
+}
+
+test "a close awaits background work to its end and process exit cancels it" {
+    if (comptime builtin.single_threaded) return;
+    const Work = struct {
+        runtime: *Runtime,
+        wait_for_cancel: bool,
+        saw_cancel: std.atomic.Value(bool) = .init(false),
+        done: std.atomic.Value(bool) = .init(false),
+
+        fn run(self: *@This()) void {
+            if (self.wait_for_cancel) {
+                // Runs until process exit sets the cancel flag, as a stop
+                // waiting on a stubborn command does.
+                while (!self.runtime.backgroundCancelled()) io_mod.sleep(std.time.ns_per_ms);
+                self.saw_cancel.store(true, .release);
+            } else {
+                // A stop that ends its command on its own, after its wait.
+                io_mod.sleep(100 * std.time.ns_per_ms);
+                self.saw_cancel.store(self.runtime.backgroundCancelled(), .release);
+            }
+            self.done.store(true, .release);
+        }
+    };
+
+    // An agent or instance close lets the work finish uncancelled, since the
+    // close does not end tty commands.
+    {
+        var runtime = Runtime.init(std.testing.allocator);
+        defer runtime.deinit();
+        var work: Work = .{ .runtime = &runtime, .wait_for_cancel = false };
+        runtime.startBackground(Work.run, .{&work}) catch |err| switch (err) {
+            error.ConcurrencyUnavailable => return error.SkipZigTest,
+            else => return err,
+        };
+        try std.testing.expect(!work.done.load(.acquire));
+        runtime.shutdown();
+        try std.testing.expect(work.done.load(.acquire));
+        try std.testing.expect(!work.saw_cancel.load(.acquire));
+        try std.testing.expect(!runtime.backgroundCancelled());
+        try std.testing.expectError(error.RuntimeStopping, runtime.startBackground(Work.run, .{&work}));
+    }
+    // Process exit cancels the work, which then ends at once.
+    {
+        var runtime = Runtime.init(std.testing.allocator);
+        defer runtime.deinit();
+        var work: Work = .{ .runtime = &runtime, .wait_for_cancel = true };
+        runtime.startBackground(Work.run, .{&work}) catch |err| switch (err) {
+            error.ConcurrencyUnavailable => return error.SkipZigTest,
+            else => return err,
+        };
+        runtime.terminateForProcessExit();
+        try std.testing.expect(work.saw_cancel.load(.acquire));
+        try std.testing.expect(work.done.load(.acquire));
+        try std.testing.expect(runtime.backgroundCancelled());
+        try std.testing.expectError(error.RuntimeStopping, runtime.startBackground(Work.run, .{&work}));
+    }
 }
 
 test "steering yield waits out its grace time" {

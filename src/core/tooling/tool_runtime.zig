@@ -1921,7 +1921,8 @@ fn terminal_lease_cleanup_dispatch_context(
 
 /// Stops the shell commands that steering moved to the background during
 /// turn `turn_id`, after the user cancelled that turn. The stop ignores the
-/// turn's cancel flag, which is set by then.
+/// turn's cancel flag, which is set by then. It returns once the stops
+/// start; they keep their own copy of what they need from the context.
 pub fn stop_steering_detached_commands(ctx: Context, turn_id: u64) !void {
     var arena_state = std.heap.ArenaAllocator.init(ctx.session_allocator);
     defer arena_state.deinit();
