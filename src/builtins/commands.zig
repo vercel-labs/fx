@@ -48,6 +48,10 @@ const sessions_subcommands = [_]command_specs.SubcommandDoc{
     .{ .usage = "convert", .description = "Convert every session saved in the previous format", .options = &sessions_convert_options },
 };
 
+const models_subcommands = [_]command_specs.SubcommandDoc{
+    .{ .usage = "ls", .description = "List available models (default)", .options = &.{json_option} },
+};
+
 pub const usage_options = [_]command_specs.OptionDoc{
     .{ .flag = "--period <today|7d|month>", .description = "Select the period, in UTC days (default: month)" },
     json_option,
@@ -341,8 +345,9 @@ pub const top_level_specs = [_]TopLevelSpec{
     .{
         .kind = .models,
         .token = "models",
-        .usage = "models [--json]",
+        .usage = "models [ls] [--json]",
         .summary = "List available models",
+        .subcommands = &models_subcommands,
         .options = &.{json_option},
     },
     .{

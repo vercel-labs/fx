@@ -4113,7 +4113,7 @@ test "unknown and ambiguous model overrides reject before any child session" {
     try std.testing.expect(std.mem.find(u8, unknown_result.body, "\"error_code\":\"unknown_model\"") != null);
     try std.testing.expect(std.mem.find(u8, unknown_result.body, "skldjf") != null);
     try std.testing.expect(std.mem.find(u8, unknown_result.body, "omit model to inherit") != null);
-    try std.testing.expect(std.mem.find(u8, unknown_result.body, "fx models --json") != null);
+    try std.testing.expect(std.mem.find(u8, unknown_result.body, "fx models ls --json") != null);
 
     var ambiguous = try model_contract.validateRequest(alloc, .{ .message = .{ .agent = "probe", .message = "probe", .model = "terra" } });
     defer ambiguous.deinit(alloc);
@@ -4122,7 +4122,7 @@ test "unknown and ambiguous model overrides reject before any child session" {
     try std.testing.expect(std.mem.find(u8, ambiguous_result.body, "\"error_code\":\"ambiguous_model\"") != null);
     try std.testing.expect(std.mem.find(u8, ambiguous_result.body, "openai/gpt-5.6-terra") != null);
     try std.testing.expect(std.mem.find(u8, ambiguous_result.body, "openai/gpt-5.6-terra-fast") != null);
-    try std.testing.expect(std.mem.find(u8, ambiguous_result.body, "fx models --json") != null);
+    try std.testing.expect(std.mem.find(u8, ambiguous_result.body, "fx models ls --json") != null);
 
     // Rejections never created or ran a child.
     try std.testing.expectEqual(@as(usize, 0), fixture.runs);
@@ -4575,7 +4575,7 @@ fn modelOverrideFailureMessage(
                 if (index > 0) try writer.writeAll(", ");
                 try writer.writeAll(candidate);
             }
-            try writer.writeAll(". Retry with an exact catalog model ID from `fx models --json`.");
+            try writer.writeAll(". Retry with an exact catalog model ID from `fx models ls --json`.");
         },
         .unknown => {
             try writer.print("unknown model override '{s}'", .{raw_model});
@@ -4589,7 +4589,7 @@ fn modelOverrideFailureMessage(
             } else {
                 try writer.writeAll("; no catalog model names match it.");
             }
-            try writer.writeAll(" Run `fx models --json` to list the exact IDs, or omit model to inherit the parent's model.");
+            try writer.writeAll(" Run `fx models ls --json` to list the exact IDs, or omit model to inherit the parent's model.");
         },
     }
     return out.toOwnedSlice();
