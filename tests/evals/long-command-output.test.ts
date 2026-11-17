@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { chmodSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { cleanupWorkDir, createWorkDir, runEval } from "./eval-helpers";
+import { assertToolNotUsed, cleanupWorkDir, createWorkDir, runEval } from "./eval-helpers";
 
 const TIMEOUT = 240_000;
 const CLI_TIMEOUT = 180;
@@ -49,6 +49,9 @@ describe("eval: long command output", () => {
         call.name === "shell" && /build\.sh/.test(call.command_result?.command ?? "")
       );
       expect(builds.length, "expected exactly one shell run of ./build.sh").toBe(1);
+      // The last line must be in the first shell result, so the model must
+      // not need to read the full output again.
+      assertToolNotUsed(result, "read_tool_result");
       expect(result.json.output).toContain(FAILURE_DETAIL);
     },
     TIMEOUT,
