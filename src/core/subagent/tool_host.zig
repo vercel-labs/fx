@@ -5556,6 +5556,25 @@ fn sweepUnrecorded(fail_at: usize, stuck: *usize) !bool {
     try expectBodyHas(again, "\"error_code\":\"state_unavailable\"");
     const closed = try callTool(runtime, arena, .{ .close = .{ .agent = "reviewer" } }, "call-3", null);
     try expectBodyHas(closed, "\"error_code\":\"close_not_saved\"");
+    // The failed close write leaves nothing of the close behind: the child is
+    // not on the closing list (main keeps a closing child there until its close
+    // is written, and takes it off when the write fails), the app has nothing
+    // to drop, and the trace does not call it closing. Another close fails the
+    // same way, and a message is refused for the unavailable state, not for a
+    // close under way.
+    const child_id = try reviewerId(runtime, arena);
+    runtime.admission_mutex.lockUncancelable(io_mod.getIo());
+    const listed = runtime.closingIndexLocked(child_id) != null;
+    runtime.admission_mutex.unlock(io_mod.getIo());
+    try std.testing.expect(!listed);
+    try std.testing.expect(!runtime.hasClosed());
+    const traced = try runtime.traceChildren(arena);
+    try std.testing.expectEqual(@as(usize, 1), traced.len);
+    try std.testing.expect(!traced[0].closing);
+    const closed_again = try callTool(runtime, arena, .{ .close = .{ .agent = "reviewer" } }, "call-3b", null);
+    try expectBodyHas(closed_again, "\"error_code\":\"close_not_saved\"");
+    const after_close = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "after the close" } }, "call-3c", null);
+    try expectBodyHas(after_close, "\"error_code\":\"state_unavailable\"");
     // A restart clears it: the new host recovers the work as interrupted.
     faulted.deinit();
     const restarted = try mailboxRuntime(alloc, &fixture, &parent);
