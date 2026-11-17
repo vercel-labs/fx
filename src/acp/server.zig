@@ -825,7 +825,7 @@ pub fn firstSession(state: *const ServerState) ?*ActiveSessionState {
 }
 
 /// Whether the connection holds one session at a time, as the libfx kernel
-/// and the web core do (Q109): opening a session there closes the open one.
+/// and the web core do: opening a session there closes the open one.
 pub fn holdsOneSession(state: *const ServerState) bool {
     return host_target.is_wasm or state.cfg.minimal_kernel;
 }

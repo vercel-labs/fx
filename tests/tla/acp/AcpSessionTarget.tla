@@ -34,7 +34,7 @@
 (* error for closing one, and -32000 for an oversized frame. The          *)
 (* AcpSessionTargetBefore-*.cfg configs show each rule failing then, and   *)
 (* AcpSessionTargetBefore-many.cfg shows one open session at a time,      *)
-(* fx acp before many sessions (#1786 at 13bb8f7a4).                      *)
+(* fx acp before one connection held many sessions.                       *)
 (*                                                                         *)
 (* `last` is what the client observes for the latest step. A test client  *)
 (* creates at most two sessions, A and B, in that order; X names a        *)

@@ -25,7 +25,7 @@
 (* is an unknown method, which gets -32601, or -32600 while the session it *)
 (* names runs a turn. session/list answers during a turn: since fx acp     *)
 (* holds many sessions (AcpSessions.tla), a turn holds up only requests    *)
-(* for its own session. Before, list got -32600 while any turn ran (X24).  *)
+(* for its own session. Before, list got -32600 while any turn ran.        *)
 (***************************************************************************)
 EXTENDS Integers, Sequences, FiniteSets
 
@@ -192,7 +192,7 @@ Delete(s) ==
 \* current version of each folder it read.
 \* Whether session/list is refused: never, under the rules and since fx acp
 \* holds many sessions. Before, fx refused it while a turn ran on the
-\* connection (X24).
+\* connection.
 RefusesList(c) == FALSE
 
 List(c, f) ==
