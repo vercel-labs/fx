@@ -18,6 +18,9 @@
 (*   "finish"  its turn ended with nothing more to read;                  *)
 (*   "end"     its stopped or closed work ended, and its next turn read    *)
 (*             the waiting messages `msgs` (none when nothing waited).     *)
+(*   "write_close"                                                         *)
+(*             the close of subagent `sub`, whose work just ended, was     *)
+(*             written: fx's trace says "closed". Until then it is closing.*)
 (* A finish or end carries `note`, what fx told main of it: "none" when it *)
 (* queued no report, "idle" when its report said the subagent is idle,    *)
 (* "plain" otherwise. A send carries `named`, the idle subagents its       *)
@@ -77,6 +80,8 @@ Observable(o) ==
      /\ EndStopped(o.sub)
      /\ read' \ read = o.msgs
      /\ note' = o.note
+  \/ /\ o.op = "write_close"
+     /\ WriteClose(o.sub)
 
 ASSUME Len(Observed) >= 1
 
