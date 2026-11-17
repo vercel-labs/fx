@@ -443,9 +443,9 @@ fn parseHookNames(arena: Allocator, listing: []const u8) Allocator.Error!HookNam
     var keys = std.mem.splitScalar(u8, listing, 0);
     while (keys.next()) |key| {
         if (!std.mem.startsWith(u8, key, "hook.") or !std.mem.endsWith(u8, key, ".command")) continue;
-        // `hook.command` has no name.
-        if (key.len <= "hook.".len + ".command".len) continue;
-        const name = key["hook.".len .. key.len - ".command".len];
+        // `hook.command` (a `[hook]` section) and `hook..command` (`[hook ""]`)
+        // both define a hook whose name is empty, which git still runs.
+        const name = if (key.len < "hook.".len + ".command".len) "" else key["hook.".len .. key.len - ".command".len];
         if (std.mem.findScalar(u8, name, '=') != null) return .unsupported;
         for (names.items) |seen| {
             if (std.mem.eql(u8, seen, name)) break;
@@ -2016,6 +2016,45 @@ test "safe git store preparation refuses a config hook it cannot turn off" {
     var env = try repo.childEnvironment(.{ .safe = null });
     const prepared = try prepareStoreWith(repo.arena, .{}, &env);
     try std.testing.expectEqual(Refusal.unsupported_hook_name, prepared.refused);
+}
+
+test "safe git turns off a hook config defines with an empty name" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const parsed = try parseHookNames(arena, "hook.command\x00hook..command\x00hook.x.command\x00core.bare\x00");
+    try std.testing.expectEqual(@as(usize, 2), parsed.names.len);
+    try std.testing.expectEqualStrings("", parsed.names[0]);
+    try std.testing.expectEqualStrings("x", parsed.names[1]);
+    var argv: std.ArrayList([]const u8) = .empty;
+    try appendHooksOff(arena, &argv, parsed.names);
+    const expected = [_][]const u8{ "-c", "hook..enabled=false", "-c", "hook.x.enabled=false" };
+    try std.testing.expectEqual(expected.len, argv.items.len);
+    for (expected, argv.items) |want, have| try std.testing.expectEqualStrings(want, have);
+
+    // The same through the agent route: a `[hook]` section names a hook whose
+    // name is empty, which git runs but `core.hooksPath` never turns off.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const repo = try SentinelRepo.init(arena_state.allocator(), tmp.dir);
+    const existing = try readFixtureFile(repo, "repo/.git/config");
+    try repo.write("repo/.git/config", try repo.arena.print("{s}[hook]\n\tcommand = {s}\n\tevent = post-index-change\n", .{ existing, repo.sentinel }));
+    var env = try repo.childEnvironment(.{ .safe = null });
+    io_mod.setEnvironMap(&env);
+    defer io_mod.resetEnvironForTest();
+    const ready = try repo.ready(repo.repo);
+    var saw_empty = false;
+    for (ready.hook_names) |name| {
+        if (std.mem.eql(u8, name, "")) saw_empty = true;
+    }
+    try std.testing.expect(saw_empty);
+    var diff_argv: std.ArrayList([]const u8) = .empty;
+    try appendCommand(repo.arena, &diff_argv, ready, .diff);
+    var saw_empty_off = false;
+    for (diff_argv.items) |arg| {
+        if (std.mem.eql(u8, arg, "hook..enabled=false")) saw_empty_off = true;
+    }
+    try std.testing.expect(saw_empty_off);
 }
 
 test "safe git turns off hooks that repository and global config define for the agent's git" {
