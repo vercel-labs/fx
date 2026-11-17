@@ -334,7 +334,7 @@ NothingLost ==
 \* A steer's delivery is where it ran; no steer is dropped.
 DeliveryValues == \A m \in Msgs : answers[m].delivery \in {"", "none", "absorbed", "next_turn"}
 
-\* A stop fails no prompt: the steers it finds waiting run next (Q39).
+\* A stop fails no prompt: the steers it finds waiting run next.
 StopKeepsSteers ==
     [][cancels' > cancels => \A m \in Msgs : answers[m].kind = "none" => answers'[m].kind # "err"]_vars
 
