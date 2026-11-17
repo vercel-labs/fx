@@ -38,6 +38,10 @@ pub const Refusal = enum {
     unsupported_filter_name,
     /// git would use a different repository than the one whose config fx read.
     repository_mismatch,
+    /// git could not list the hooks that config defines.
+    hook_config_unavailable,
+    /// `-c` splits at the first `=`, so such a hook cannot be turned off.
+    unsupported_hook_name,
 };
 
 pub const Ready = struct {
@@ -120,6 +124,10 @@ fn appendPrelude(arena: Allocator, argv: *std.ArrayList([]const u8), ready: Read
         "core.fsmonitor=false",
         "-c",
         "core.hooksPath=/dev/null",
+        // git before 2.45 ignores GIT_NO_LAZY_FETCH, and protocol.allow=never
+        // makes any fetch fail before it starts a transport.
+        "-c",
+        "protocol.allow=never",
         "-c",
         "log.showSignature=false",
     });
@@ -134,7 +142,9 @@ fn appendPrelude(arena: Allocator, argv: *std.ArrayList([]const u8), ready: Read
 /// The child environment for every safe git call: a fixed PATH and locale, no
 /// prompts, pagers or optional locks, and only the variables that locate the
 /// user's own git config. Nothing else from fx's environment, such as
-/// `GIT_DIR` or `GIT_CONFIG_PARAMETERS`, reaches git.
+/// `GIT_DIR` or `GIT_CONFIG_PARAMETERS`, reaches git. Lazy fetch is off, so a
+/// repository whose config names a promisor remote cannot make git start a
+/// fetch that runs the repository's transport programs.
 pub fn environment(alloc: Allocator) Allocator.Error!std.process.Environ.Map {
     var map = std.process.Environ.Map.init(alloc);
     errdefer map.deinit();
@@ -145,6 +155,7 @@ pub fn environment(alloc: Allocator) Allocator.Error!std.process.Environ.Map {
     try map.put("GIT_TERMINAL_PROMPT", "0");
     try map.put("GIT_PAGER", "cat");
     try map.put("PAGER", "cat");
+    try map.put("GIT_NO_LAZY_FETCH", "1");
     for ([_][]const u8{ "HOME", "XDG_CONFIG_HOME", "GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM", "GIT_CONFIG_NOSYSTEM" }) |key| {
         if (io_mod.getenv(key)) |value| try map.put(key, value);
     }
@@ -323,7 +334,13 @@ pub const Outcome = union(enum) {
 /// The trusted git, checked without reading any repository. Distinct from
 /// `Ready` so a store handle cannot reach a route that must blank the
 /// repository's own filters.
-pub const StoreReady = struct { executable: []const u8 };
+pub const StoreReady = struct {
+    /// Static path from `trustedExecutable`.
+    executable: []const u8,
+    /// Names of hooks that global or system config defines with
+    /// `hook.<name>.command`; each store command turns them off.
+    hook_names: []const []const u8 = &.{},
+};
 
 pub const PreparedStore = union(enum) {
     ready: StoreReady,
@@ -482,12 +499,50 @@ const capture_path = "/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin:/opt/local/
 var input_counter: std.atomic.Value(u32) = .init(0);
 
 pub fn prepareStore(arena: Allocator, limits: Limits) Allocator.Error!PreparedStore {
+    var base = try environment(arena);
+    return prepareStoreWith(arena, limits, &base);
+}
+
+fn prepareStoreWith(arena: Allocator, limits: Limits, base: *std.process.Environ.Map) Allocator.Error!PreparedStore {
     const executable = trustedExecutable() orelse return .{ .refused = refuse(.git_missing, "store").refused };
-    return switch (try versionCheckAtLeast(arena, executable, store_minimum_minor, limits)) {
-        .supported => .{ .ready = .{ .executable = executable } },
-        .too_old => .{ .refused = refuse(.git_too_old, "store").refused },
-        .unknown => .{ .refused = refuse(.git_version_unknown, "store").refused },
+    switch (try versionCheckAtLeast(arena, executable, store_minimum_minor, limits)) {
+        .supported => {},
+        .too_old => return .{ .refused = refuse(.git_too_old, "store").refused },
+        .unknown => return .{ .refused = refuse(.git_version_unknown, "store").refused },
+    }
+    // git 2.54 lets config define hooks of its own, which
+    // `core.hooksPath=/dev/null` does not turn off, so list them here and turn
+    // each one off in every store command.
+    var argv: std.ArrayList([]const u8) = .empty;
+    try argv.appendSlice(arena, &.{ executable, "--no-pager", "-c", "core.fsmonitor=false", "config", "--name-only", "--get-regexp", "^hook\\..*\\.command$" });
+    const hook_names: []const []const u8 = switch (try runBounded(arena, argv.items, "/", base, null, null, limits)) {
+        .ok => |stdout| blk: {
+            var names: std.ArrayList([]const u8) = .empty;
+            var lines = std.mem.splitScalar(u8, stdout, '\n');
+            while (lines.next()) |line| {
+                if (line.len == 0) continue;
+                // `git config --name-only` prints `hook.<name>.command`.
+                if (!std.mem.startsWith(u8, line, "hook.") or !std.mem.endsWith(u8, line, ".command")) {
+                    return .{ .refused = refuse(.hook_config_unavailable, "store").refused };
+                }
+                if (line.len < "hook.".len + ".command".len) {
+                    return .{ .refused = refuse(.hook_config_unavailable, "store").refused };
+                }
+                const name = line["hook.".len .. line.len - ".command".len];
+                if (name.len == 0 or std.mem.findScalar(u8, name, '=') != null) {
+                    return .{ .refused = refuse(.unsupported_hook_name, "store").refused };
+                }
+                try names.append(arena, name);
+            }
+            break :blk names.items;
+        },
+        // git config exits 1 when no key matches, which means no hook is defined.
+        .failed => |failure| switch (failure) {
+            .exited_nonzero => &.{},
+            else => return .{ .refused = refuse(.hook_config_unavailable, "store").refused },
+        },
     };
+    return .{ .ready = .{ .executable = executable, .hook_names = hook_names } };
 }
 
 /// Creates the bare store without templates, so it has no hooks, in the
@@ -889,6 +944,10 @@ fn appendStorePrelude(arena: Allocator, argv: *std.ArrayList([]const u8), ready:
         "core.fsmonitor=false",
         "-c",
         "core.hooksPath=/dev/null",
+        // git before 2.45 ignores GIT_NO_LAZY_FETCH, and protocol.allow=never
+        // makes any fetch fail before it starts a transport.
+        "-c",
+        "protocol.allow=never",
         "-c",
         "core.logAllRefUpdates=false",
         "-c",
@@ -906,6 +965,10 @@ fn appendStorePrelude(arena: Allocator, argv: *std.ArrayList([]const u8), ready:
         "-c",
         "log.showSignature=false",
     });
+    for (ready.hook_names) |name| {
+        try argv.append(arena, "-c");
+        try argv.append(arena, try arena.print("hook.{s}.enabled=false", .{name}));
+    }
     if (conversions.file_mode) |value| try argv.appendSlice(arena, &.{ "-c", if (value) "core.fileMode=true" else "core.fileMode=false" });
     if (conversions.symlinks) |value| try argv.appendSlice(arena, &.{ "-c", if (value) "core.symlinks=true" else "core.symlinks=false" });
     if (conversions.autocrlf) |value| try argv.appendSlice(arena, &.{ "-c", switch (value) {
@@ -1155,15 +1218,15 @@ test "safe git argv turns off repository programs for every subcommand" {
     var argv: std.ArrayList([]const u8) = .empty;
     try appendCommand(arena, &argv, ready, .diff);
     const expected = [_][]const u8{
-        "/usr/bin/git",             "--no-pager",           "--no-optional-locks",
-        "-c",                       "core.fsmonitor=false", "-c",
-        "core.hooksPath=/dev/null", "-c",                   "log.showSignature=false",
-        "-c",                       "filter.lfs.clean=",    "-c",
-        "filter.lfs.smudge=",       "-c",                   "filter.lfs.process=",
-        "-c",                       "filter.evil.x.clean=", "-c",
-        "filter.evil.x.smudge=",    "-c",                   "filter.evil.x.process=",
-        "diff",                     "--no-ext-diff",        "--no-textconv",
-        "--ignore-submodules=all",
+        "/usr/bin/git",             "--no-pager",              "--no-optional-locks",
+        "-c",                       "core.fsmonitor=false",    "-c",
+        "core.hooksPath=/dev/null", "-c",                      "protocol.allow=never",
+        "-c",                       "log.showSignature=false", "-c",
+        "filter.lfs.clean=",        "-c",                      "filter.lfs.smudge=",
+        "-c",                       "filter.lfs.process=",     "-c",
+        "filter.evil.x.clean=",     "-c",                      "filter.evil.x.smudge=",
+        "-c",                       "filter.evil.x.process=",  "diff",
+        "--no-ext-diff",            "--no-textconv",           "--ignore-submodules=all",
     };
     try std.testing.expectEqual(expected.len, argv.items.len);
     for (expected, argv.items) |want, have| try std.testing.expectEqualStrings(want, have);
@@ -1176,6 +1239,7 @@ test "safe git environment keeps only fixed values and user config locations" {
     try std.testing.expectEqualStrings("0", env.get("GIT_OPTIONAL_LOCKS").?);
     try std.testing.expectEqualStrings("0", env.get("GIT_TERMINAL_PROMPT").?);
     try std.testing.expectEqualStrings("cat", env.get("GIT_PAGER").?);
+    try std.testing.expectEqualStrings("1", env.get("GIT_NO_LAZY_FETCH").?);
     for ([_][]const u8{ "GIT_DIR", "GIT_WORK_TREE", "GIT_CONFIG_PARAMETERS", "GIT_CONFIG_COUNT", "GIT_EXEC_PATH" }) |key| {
         try std.testing.expect(env.get(key) == null);
     }
@@ -1535,7 +1599,8 @@ const StoreFixture = struct {
     }
 
     fn initFormat(repo: SentinelRepo, format: ObjectFormat, work_tree: []const u8) !StoreFixture {
-        const ready = switch (try prepareStore(repo.arena, .{})) {
+        var env = try repo.childEnvironment(.{ .safe = null });
+        const ready = switch (try prepareStoreWith(repo.arena, .{}, &env)) {
             .ready => |value| value,
             .refused => return error.SkipZigTest,
         };
@@ -1546,7 +1611,6 @@ const StoreFixture = struct {
             .scratch_dir = try repo.path("scratch"),
         };
         try std.Io.Dir.cwd().createDirPath(std.testing.io, store.scratch_dir);
-        var env = try repo.childEnvironment(.{ .safe = null });
         _ = try expectOk(try initStoreWith(repo.arena, ready, store.git_dir, format, .{}, &env));
         try repo.write("store.git/objects/info/alternates", try repo.arena.print("{s}\n", .{try repo.path(try repo.arena.print("{s}/.git/objects", .{work_tree}))}));
         return .{ .repo = repo, .ready = ready, .store = store };
@@ -1597,11 +1661,13 @@ test "safe git store argv turns off programs, reflogs, signing and index extensi
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     var argv: std.ArrayList([]const u8) = .empty;
-    try appendStorePrelude(arena, &argv, .{ .executable = "/usr/bin/git" }, .{ .file_mode = false, .autocrlf = .input });
+    try appendStorePrelude(arena, &argv, .{ .executable = "/usr/bin/git", .hook_names = &.{"evil"} }, .{ .file_mode = false, .autocrlf = .input });
     try std.testing.expectEqualStrings("/usr/bin/git", argv.items[0]);
     for ([_][]const u8{
         "core.fsmonitor=false",
         "core.hooksPath=/dev/null",
+        "protocol.allow=never",
+        "hook.evil.enabled=false",
         "core.logAllRefUpdates=false",
         "core.splitIndex=false",
         "core.untrackedCache=false",
@@ -1724,14 +1790,21 @@ test "safe git capture store ignores hostile global identity, reflog, hook, fsmo
     defer tmp.cleanup();
     const repo = try SentinelRepo.init(arena_state.allocator(), tmp.dir);
     const head = try repo.plainOutput(repo.repo, &.{ "rev-parse", "HEAD" });
-    const fixture = try StoreFixture.init(repo);
+    var fixture = try StoreFixture.init(repo);
     const hooks = try repo.path("global-hooks");
     try std.Io.Dir.cwd().createDirPath(std.testing.io, hooks);
     try repo.writeExecutable(try repo.path("global-hooks/post-index-change"));
     try repo.write("home/.gitconfig", try repo.arena.print(
-        "[core]\n\tlogAllRefUpdates = always\n\thooksPath = {s}\n\tfsmonitor = {s}\n[commit]\n\tgpgSign = true\n[gpg]\n\tprogram = {s}\n[user]\n\tuseConfigOnly = true\n",
-        .{ hooks, repo.sentinel, repo.sentinel },
+        "[core]\n\tlogAllRefUpdates = always\n\thooksPath = {s}\n\tfsmonitor = {s}\n[commit]\n\tgpgSign = true\n[gpg]\n\tprogram = {s}\n[user]\n\tuseConfigOnly = true\n[hook \"evil\"]\n\tcommand = {s}\n\tevent = post-index-change\n\tevent = reference-transaction\n",
+        .{ hooks, repo.sentinel, repo.sentinel, repo.sentinel },
     ));
+    var env = try repo.childEnvironment(.{ .safe = null });
+    fixture.ready = switch (try prepareStoreWith(repo.arena, .{}, &env)) {
+        .ready => |value| value,
+        .refused => return error.TestUnexpectedRefusal,
+    };
+    try std.testing.expectEqual(@as(usize, 1), fixture.ready.hook_names.len);
+    try std.testing.expectEqualStrings("evil", fixture.ready.hook_names[0]);
     _ = try fixture.ok(.{ .read_tree = head });
     try repo.write("repo/a.txt", "ten\n");
     _ = try fixture.ok(.{ .add_remove = &.{"a.txt"} });
@@ -1743,6 +1816,20 @@ test "safe git capture store ignores hostile global identity, reflog, hook, fsmo
     const object = try fixture.storeOutput(&.{ "cat-file", "-p", commit });
     try std.testing.expect(std.mem.find(u8, object, "author fx capture <capture@fx.invalid> 7 +0000") != null);
     try std.testing.expect(std.mem.find(u8, object, "gpgsig") == null);
+}
+
+test "safe git store preparation refuses a config hook it cannot turn off" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const repo = try SentinelRepo.init(arena_state.allocator(), tmp.dir);
+    // `-c` splits a setting at its first `=`, so this hook name cannot be
+    // turned off in a store command.
+    try repo.write("home/.gitconfig", "[hook \"a=b\"]\n\tcommand = /bin/true\n\tevent = post-index-change\n");
+    var env = try repo.childEnvironment(.{ .safe = null });
+    const prepared = try prepareStoreWith(repo.arena, .{}, &env);
+    try std.testing.expectEqual(Refusal.unsupported_hook_name, prepared.refused);
 }
 
 test "safe git capture store stops a slow trusted filter at its deadline" {
@@ -2112,7 +2199,7 @@ test "safe git capture PATH covers the directories trusted for git itself" {
 
 test "safe git capture store runs a real git-lfs installed where git is trusted" {
     if (builtin.target.os.tag == .windows) return error.SkipZigTest;
-    const lfs_installed = for ([_][]const u8{ "/opt/homebrew/bin/git-lfs", "/usr/local/bin/git-lfs" }) |candidate| {
+    const lfs_installed = for ([_][]const u8{ "/usr/bin/git-lfs", "/bin/git-lfs", "/opt/homebrew/bin/git-lfs", "/usr/local/bin/git-lfs" }) |candidate| {
         _ = std.Io.Dir.cwd().statFile(std.testing.io, candidate, .{}) catch continue;
         break true;
     } else false;
@@ -2169,6 +2256,39 @@ test "safe git reads repository facts as data, without running its programs" {
     env = try repo.childEnvironment(.{ .safe = null });
     const empty = try expectFacts(try repositoryFactsWith(repo.arena, try repo.ready(unborn), unborn, .{}, &env));
     try std.testing.expect(empty.head == null);
+}
+
+test "safe git repository facts never start a lazy fetch from a repository's promisor remote" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const repo = try SentinelRepo.init(arena_state.allocator(), tmp.dir);
+    // A partially cloned repository names its own fetch program. The script
+    // exits 1, so a fetch that starts fails instead of hanging.
+    const fetch_program = try repo.path("fetch.sh");
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{
+        .sub_path = fetch_program,
+        .data = try repo.arena.print("#!/bin/sh\necho ran >> '{s}'\nexit 1\n", .{repo.log}),
+        .flags = .{ .permissions = .fromMode(0o755) },
+    });
+    try repo.plain(repo.repo, &.{ "config", "core.repositoryformatversion", "1" });
+    try repo.plain(repo.repo, &.{ "config", "extensions.partialClone", "origin" });
+    try repo.plain(repo.repo, &.{ "config", "remote.origin.url", try repo.arena.print("file://{s}", .{try repo.path("missing.git")}) });
+    try repo.plain(repo.repo, &.{ "config", "remote.origin.promisor", "true" });
+    try repo.plain(repo.repo, &.{ "config", "remote.origin.uploadpack", fetch_program });
+    // HEAD names a commit the repository lacks, which is the state a promisor
+    // remote exists to repair.
+    try repo.write("repo/.git/refs/heads/main", "1111111111111111111111111111111111111111\n");
+    _ = try repo.runs();
+    var env = try repo.childEnvironment(.{ .safe = null });
+    const result = try repositoryFactsWith(repo.arena, try repo.ready(repo.repo), repo.repo, .{}, &env);
+    try std.testing.expect(result == .failed);
+    try std.testing.expectEqual(@as(usize, 0), try repo.runs());
+
+    // Control: plain git in the same repository does start the fetch.
+    _ = try repo.run(repo.repo, try repo.plainArgv(&.{ "rev-parse", "--verify", "-q", "HEAD^{commit}" }), .plain);
+    try std.testing.expect(try repo.runs() > 0);
 }
 
 fn expectFacts(result: FactsResult) !RepositoryFacts {
