@@ -400,7 +400,7 @@ fx supports ACP's unstable [`session/fork`](https://agentclientprotocol.com/rfds
 
 #### Fork before a prompt
 
-fx's `/fork` copies a session up to just before a prompt, and ACP's proposal leaves forking at a message for later. A client that lists `sh.fx/fork` sends `sh.fx/forkBefore` in the `_meta` of `session/fork`, with the `messageId` of a prompt, which the session's updates give and which stays the same on every load, as fix F6 makes it. The fork then holds only the turns before that prompt's turn. A `messageId` that names no prompt of the session gets `-32602`.
+fx's `/fork` copies a session up to just before a prompt, and ACP's proposal leaves forking at a message for later. A client that lists `sh.fx/fork` sends `sh.fx/forkBefore` in the `_meta` of `session/fork`, with the `messageId` of a prompt, which the session's updates give and which stays the same on every load, since a replayed message's id comes from its place in the session's log. The fork then holds only the turns before that prompt's turn. A `messageId` that names no prompt of the session gets `-32602`.
 
 ```json
 {
