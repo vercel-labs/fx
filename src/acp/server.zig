@@ -1020,7 +1020,7 @@ fn resolveSubagentAuthority(
     state.subagent_authority_mutex.lockUncancelable(io_mod.getIo());
     defer state.subagent_authority_mutex.unlock(io_mod.getIo());
     const integrations = if (active.mcp_host) |h|
-        h.catalog.snapshotToolNames(alloc, active.permission_rules)
+        h.catalog.snapshotToolNames(alloc)
     else
         alloc.alloc([]u8, 0);
     const owned_integrations = integrations catch return error.OutOfMemory;
@@ -1029,7 +1029,7 @@ fn resolveSubagentAuthority(
         alloc.free(owned_integrations);
     }
     var mcp_view = if (active.mcp_host) |h|
-        try h.catalog.snapshotAccessView(alloc, root_id, root_id, active.permission_rules)
+        try h.catalog.snapshotAccessView(alloc, root_id, root_id)
     else
         null;
     defer if (mcp_view) |*view| view.deinit(alloc);
