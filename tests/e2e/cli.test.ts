@@ -842,7 +842,7 @@ describe("cli: status", () => {
           mcp_config_error: "McpConfigInvalidJson",
         });
         expect(doctorText.stdout).toContain(
-          "[fail] mcp_config: failed to load ~/.fx/mcp.json: McpConfigInvalidJson\n",
+          "MCP servers\n  \u2717 mcp_config failed to load ~/.fx/mcp.json: McpConfigInvalidJson\n",
         );
         const doctorJson = JSON.parse(doctorJsonResult.stdout);
         expect(doctorJson.fail_count).toBe(1);
@@ -1536,11 +1536,10 @@ describe("cli: status", () => {
         };
         expect(JSON.parse(statusJsonResult.stdout.trim())).toMatchObject(expectedAuth);
         expect(JSON.parse(doctorJsonResult.stdout.trim())).toMatchObject(expectedAuth);
-        for (const output of [statusText.stdout, doctorText.stdout]) {
-          expect(output).toContain("auth=fx login");
-          expect(output).toContain("auth_refreshable=true");
-          expect(output).toContain("team=vercel-labs");
-        }
+        expect(statusText.stdout).toContain("auth=fx login");
+        expect(statusText.stdout).toContain("auth_refreshable=true");
+        expect(statusText.stdout).toContain("team=vercel-labs");
+        expect(doctorText.stdout).toContain("  Auth         fx login \u00b7 team vercel-labs\n");
         for (const output of [
           statusText.stdout,
           statusJsonResult.stdout,
@@ -3283,6 +3282,45 @@ describe("cli: missing durable home", () => {
 });
 
 describe("cli: sessions", () => {
+  test(
+    "fx sessions ls lists the same sessions as fx sessions",
+    async () => {
+      const home = mkdtempSync(join(tmpdir(), "fx-e2e-sessions-ls-"));
+      try {
+        const bare = await runFx(["sessions", "--json"], { env: { HOME: home } });
+        const explicit = await runFx(["sessions", "ls", "--json"], {
+          env: { HOME: home },
+        });
+        expect(bare.code).toBe(0);
+        expect(explicit.code).toBe(0);
+        expect(explicit.stderr).toBe("");
+        const listed = JSON.parse(explicit.stdout);
+        expect(listed).toMatchObject({ kind: "sessions", count: 0, sessions: [] });
+        expect(listed).toEqual(JSON.parse(bare.stdout));
+      } finally {
+        rmSync(home, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "fx sessions --help lists ls and convert",
+    async () => {
+      const home = mkdtempSync(join(tmpdir(), "fx-e2e-sessions-help-"));
+      try {
+        const help = await runFx(["sessions", "--help"], { env: { HOME: home } });
+        expect(help.code).toBe(0);
+        expect(help.stdout).toContain("sessions [ls]");
+        expect(help.stdout).toContain("  ls");
+        expect(help.stdout).toContain("  convert");
+      } finally {
+        rmSync(home, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
   test(
     "fx sessions --json returns valid sessions JSON",
     async () => {
@@ -6703,6 +6741,7 @@ describe("cli: completion", () => {
     [["fx", "ask", "--permission-mode", ""], "ask auto full-access"],
     [["fx", "--model", "gpt-5", "ask", "--permission-m"], "--permission-mode"],
     [["fx", "mcp", ""], "list show add remove login logout approve reject call"],
+    [["fx", "sessions", ""], "ls convert"],
     [["fx", "mcp", "add", "--g"], "--global"],
     [["fx", "usage", "--period", ""], "today 7d month"],
     [["fx", "login", ""], "vercel codex grok"],

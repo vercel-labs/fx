@@ -401,6 +401,12 @@ pub const ServerState = struct {
         // an active prompt waiting on one.
         self.terminal_client.closeOwnedTerminals();
         reapActivePrompt(self, true);
+        // A subagent inside a command uses `managed_executions` until it stops. Ended first, the runtime
+        // leaves that subagent waiting for ever on the ended runtime's mutex while `closeActiveSession` waits
+        // for it, or fails the assert that no operation is in flight. So the subagents stop first, as in
+        // `fx ask`. A prompt that is still running, or a `session/cancel` that left one at work, can leave a
+        // subagent inside a command here.
+        disableSubagentHost(self);
         self.managed_executions.deinit();
         self.terminal_client.deinit();
         closeActiveSession(self) catch |err| {

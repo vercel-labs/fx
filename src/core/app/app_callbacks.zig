@@ -393,6 +393,7 @@ pub fn Bindings(comptime App: type) type {
                 deps.release_agent_terminal_lease = agentReleaseTerminalLease;
             }
             if (comptime @hasDecl(App, "stopSteeringDetachedCommands")) {
+                deps.turn_ends_by_explicit_cancel = agentTurnEndsByExplicitCancel;
                 deps.stop_steering_detached_commands = agentStopSteeringDetachedCommands;
             }
             return deps;
@@ -407,9 +408,13 @@ pub fn Bindings(comptime App: type) type {
         /// Main's and each subagent's turns end here. Only an explicit
         /// cancel stops what steering detached; a turn steering ended keeps
         /// its commands.
+        fn agentTurnEndsByExplicitCancel(ctx: *anyopaque, turn_id: u64) bool {
+            const agent: *AppAgent = @ptrCast(@alignCast(ctx));
+            return agent.worker.turnEndsByExplicitCancel(turn_id);
+        }
+
         fn agentStopSteeringDetachedCommands(ctx: *anyopaque, turn_id: u64) !void {
             const agent: *AppAgent = @ptrCast(@alignCast(ctx));
-            if (!agent.worker.turnEndsByExplicitCancel(turn_id)) return;
             return appOf(agent).stopSteeringDetachedCommands(agent, turn_id);
         }
 
@@ -766,6 +771,15 @@ pub fn Bindings(comptime App: type) type {
         pub fn pushNestedToolLifecycle(ctx: *anyopaque, event: types.ToolLifecycleEvent) !void {
             const agent: *AppAgent = @ptrCast(@alignCast(ctx));
             try app_worker_runtime.Runtime(App).pushToolLifecycle(appOf(agent), agent, event);
+        }
+
+        /// Keeps the row of a call made through `fx mcp call` in the
+        /// agent's session, so a resume shows it again
+        /// (`tool_runtime.ToolLifecyclePublisher`).
+        pub fn saveNestedBridgeCall(ctx: *anyopaque, record: types.BridgeCallRecord) !void {
+            if (comptime !agents.hasAgentField(App, "session_persistence")) return;
+            const agent: *AppAgent = @ptrCast(@alignCast(ctx));
+            try app_session_runtime.Runtime(App).saveBridgeCall(agent, record);
         }
 
         fn renderSubagentStatusLine(ctx: *anyopaque, buf: []u8, status: types.SubagentStatus) []const u8 {
@@ -1615,7 +1629,7 @@ pub fn Bindings(comptime App: type) type {
         fn workerBridgeAppendHistoryTurn(ctx: *anyopaque, finished: types.FinishedPrompt) !app_worker_runtime.HistoryDelivery {
             const agent: *AppAgent = @ptrCast(@alignCast(ctx));
             const app = appOf(agent);
-            if (try app.pacer.deferFinish(app.alloc, finished)) return .retained;
+            if (try app_worker_runtime.Runtime(App).deferFinish(app, agent, finished)) return .retained;
             return .{ .settled = try appendHistoryTurn(app, agent, finished) };
         }
 
@@ -1776,7 +1790,7 @@ const FakePacer = struct {
         try self.text.appendSlice(alloc, text);
     }
 
-    fn deferFinish(self: *FakePacer, alloc: std.mem.Allocator, finished: types.FinishedPrompt) !bool {
+    pub fn deferFinish(self: *FakePacer, alloc: std.mem.Allocator, finished: types.FinishedPrompt) !bool {
         _ = alloc;
         _ = finished;
         return self.defer_history;

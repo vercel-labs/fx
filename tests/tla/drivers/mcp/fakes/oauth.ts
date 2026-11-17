@@ -76,6 +76,19 @@ export interface AuthConfig {
   migrateAfterTokens?: number;
   /** Each access token is accepted this many times. */
   tokenUses?: number;
+  /**
+   * The MCP endpoint refuses every token, and every request with none, with a 401
+   * whose challenge and body name this error, as ClickState's does:
+   * `Bearer error="invalid_token", error_description="No authorization provided"`.
+   * The challenge still carries the resource metadata, so fx can sign in.
+   */
+  refuseTokens?: { error: string; description?: string };
+  /**
+   * How the MCP endpoint answers a request that carries a token this server
+   * issued: a 500, no answer at all, a connection dropped mid-answer, or a 401
+   * whose challenge is garbage.
+   */
+  tokenFault?: "500" | "hang" | "drop" | "garbage";
 }
 
 type Log = (entry: object) => void;
@@ -100,10 +113,14 @@ export function createAuth(config: AuthConfig, base: () => string, log: Log) {
   const serverUrl = (i: number) => `${base()}/as${i + 1}`;
   const issuerOf = (i: number) => config.servers[i].issuer ?? serverUrl(i);
 
-  function challenge(error?: string, scope?: string): string {
+  /** A quoted-string parameter value (RFC 9110 §5.6.4). */
+  const quoted = (text: string) => `"${text.replace(/[\\"]/g, (c) => `\\${c}`)}"`;
+
+  function challenge(error?: string, scope?: string, description?: string): string {
     const parts = ["Bearer"];
     const params: string[] = [];
-    if (error) params.push(`error="${error}"`);
+    if (error) params.push(`error=${quoted(error)}`);
+    if (description !== undefined) params.push(`error_description=${quoted(description)}`);
     if (scope) params.push(`scope="${scope}"`);
     const url = config.challengeUrl === "foreign" ? prmUrl().replace("127.0.0.1", "localhost") : (config.challengeUrl ?? prmUrl());
     if (config.inChallenge !== false) params.push(`resource_metadata="${url}"`);
@@ -128,11 +145,12 @@ export function createAuth(config: AuthConfig, base: () => string, log: Log) {
     };
   }
 
-  function issue(server: number, scopes: string[]) {
+  function issue(server: number, scopes: string[], grant: "authorization_code" | "refresh_token") {
     const s = config.servers[server];
     tokens += 1;
     const at = `at${tokens}${s.tokenSuffix ?? ""}`;
     access.set(at, { server, scopes, uses: 0 });
+    log({ dir: "issued", token: at, grant });
     const body: Record<string, unknown> = { access_token: at, token_type: s.tokenType ?? "Bearer", expires_in: s.expiresIn ?? 3600, scope: scopes.join(" ") };
     if (s.refresh !== false) {
       const rt = `rt${tokens}`;
@@ -205,7 +223,7 @@ export function createAuth(config: AuthConfig, base: () => string, log: Log) {
           }
           if (!c || c.server !== i || c.redirect !== form.redirect_uri || !form.resource || c.challenge !== (await sha256url(form.code_verifier ?? "")))
             return Response.json({ error: "invalid_grant" }, { status: 400 });
-          return Response.json(issue(i, s.grantOnly ? c.scopes.filter((x) => s.grantOnly!.includes(x)) : c.scopes));
+          return Response.json(issue(i, s.grantOnly ? c.scopes.filter((x) => s.grantOnly!.includes(x)) : c.scopes, "authorization_code"));
         }
         if (form.grant_type === "refresh_token") {
           if (s.refreshError) {
@@ -214,7 +232,7 @@ export function createAuth(config: AuthConfig, base: () => string, log: Log) {
           }
           const r = refresh.get(form.refresh_token);
           if (!r || r.server !== i || !form.resource) return Response.json({ error: "invalid_grant" }, { status: 400 });
-          const body = issue(i, r.scopes);
+          const body = issue(i, r.scopes, "refresh_token");
           if (s.rotate === false) {
             refresh.delete(body.refresh_token as string);
             delete body.refresh_token;
@@ -231,17 +249,45 @@ export function createAuth(config: AuthConfig, base: () => string, log: Log) {
     },
 
     /** The gate in front of the MCP endpoint: an answer for a request it refuses. */
-    check(req: Request, method: string | undefined): Response | null {
+    check(req: Request, method: string | undefined): Response | Promise<Response> | null {
       const header = req.headers.get("authorization") ?? "";
-      const t = header.startsWith("Bearer ") ? access.get(header.slice(7)) : undefined;
+      const token = header.startsWith("Bearer ") ? header.slice(7) : "";
+      const t = token ? access.get(token) : undefined;
+      // Every decision is logged with the token's name (these tokens are fake), so a
+      // driver can tell which request carried which login's token.
+      const decided = (status: number) => log({ dir: "gate", method, token: token || null, status });
+      if (t && config.tokenFault) {
+        switch (config.tokenFault) {
+          case "500":
+            decided(500);
+            return new Response("upstream failed", { status: 500 });
+          case "hang":
+            decided(0);
+            return new Promise<Response>(() => {});
+          case "drop":
+            decided(0);
+            return new Response(new ReadableStream({ start: (c) => c.error(new Error("dropped")) }), { status: 200 });
+          case "garbage":
+            decided(401);
+            return new Response("<html>nope</html>", { status: 401, headers: { "www-authenticate": 'Bearer ,,= error=\"x, error_description="unterminated, resource_metadata=' } });
+        }
+      }
+      if (config.refuseTokens) {
+        const { error, description } = config.refuseTokens;
+        decided(401);
+        return Response.json(description === undefined ? { error } : { error, error_description: description }, { status: 401, headers: { "www-authenticate": challenge(error, config.challengeScope, description) } });
+      }
       const limit = config.tokenUses ?? Infinity;
       if (!t || t.server !== active || t.uses >= limit) {
+        decided(401);
         return Response.json({ error: "invalid_token" }, { status: 401, headers: { "www-authenticate": challenge(undefined, config.challengeScope) } });
       }
       const needed = (method && config.requiredScopes?.[method]) ?? [];
       if (!needed.every((n) => t.scopes.includes(n))) {
+        decided(403);
         return Response.json({ error: "insufficient_scope" }, { status: 403, headers: { "www-authenticate": challenge("insufficient_scope", needed.join(" ")) } });
       }
+      decided(200);
       t.uses += 1;
       return null;
     },

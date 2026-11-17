@@ -1146,7 +1146,9 @@ describe.skipIf(!tmuxAvailable())("tui: file permissions", () => {
       const cases = [
         {
           name: "denied",
-          outcome: "1 denied",
+          // The group's only call is its header, which says it was denied
+          // and names the file it would have written.
+          outcome: "● Denied marker-denied.txt",
           resolve: async (session: TmuxSession) => {
             await decide(session, 3);
           },
@@ -1431,12 +1433,12 @@ describe.skipIf(!tmuxAvailable())("tui: file permissions", () => {
   );
 
   test.skipIf(!tmuxAvailable())(
-    "grouped edit rows keep diff counts when a long path is clipped",
+    "an edit row keeps its counts when a long file name is clipped",
     async () => {
       const width = 80;
       const root = createIsolatedRoot();
       const relativePath =
-        "packages/render-pipeline/transcript-projection/grouped-rows/edit-row-fixture.txt";
+        "packages/render-pipeline/transcript-projection/grouped-rows/edit-row-fixture-with-a-file-name-much-too-long-for-an-eighty-column-row.txt";
       const target = join(root.workspace, relativePath);
       mkdirSync(join(target, ".."), { recursive: true });
       writeFileSync(target, "one\ntwo\n");
@@ -1463,29 +1465,28 @@ describe.skipIf(!tmuxAvailable())("tui: file permissions", () => {
       });
 
       await session.sendText("Edit the long path fixture twice.");
+      // Both edits change one file, so they share one row, which is the
+      // group's line. It shows the file by name, not its path.
       await session.waitForPane(
-        (pane) =>
-          pane.includes("long path edits complete") &&
-          pane.includes("● 2 tool calls · 2 edit"),
+        (pane) => pane.includes("long path edits complete") && /^● Edited edit-row-fixture/m.test(pane),
         TIMEOUT,
       );
       expect(readFileSync(target, "utf8")).toBe("uno\ndos\n");
 
       const grid = await session.capturePaneGrid();
-      const rows = grid.filter((line) => line.includes("Edited packages/"));
-      expect(rows).toHaveLength(2);
-      for (const row of rows) {
-        expect([...row.trimEnd()].length).toBeLessThanOrEqual(width);
-        expect(row.trimEnd()).toMatch(/^[├└] Edited packages\/\S*… \+1 \/ -1$/);
-      }
+      const rows = grid.filter((line) => line.startsWith("● Edited edit-row-fixture"));
+      expect(rows).toHaveLength(1);
+      expect([...rows[0]!.trimEnd()].length).toBeLessThanOrEqual(width);
+      // The name clips; the added-up counts and the merge note stay.
+      expect(rows[0]!.trimEnd()).toMatch(/^● Edited edit-row-fixture\S*… \+2\/-2 · 2 edits$/);
+      expect(grid.some((line) => line.includes("packages/"))).toBe(false);
 
       const escapes = await session.capturePaneEscapes();
-      const styledRows = escapes.split("\n").filter((line) => line.includes("Edited packages/"));
-      expect(styledRows).toHaveLength(2);
-      for (const row of styledRows) {
-        expect(row).toContain("\x1b[38;5;71m+1");
-        expect(row).toContain("\x1b[38;5;167m-1");
-      }
+      // The counts keep their colors after the clipped name.
+      const styledRows = escapes.split("\n").filter((line) => line.includes("Edited ") && line.includes("edit-row-fixture"));
+      expect(styledRows).toHaveLength(1);
+      expect(styledRows[0]).toContain("\x1b[38;5;71m+2");
+      expect(styledRows[0]).toContain("\x1b[38;5;167m-2");
       expectCleanStderr(stderrPath);
       await session.kill();
       activeSession = null;
