@@ -4390,9 +4390,9 @@ test "every refusal the host returns tells the model what happened and what to d
     runtime.report_sink = sink;
 
     // A subagent that is being closed.
-    try runtime.closing.append(alloc, try alloc.dupe(u8, child_id));
+    try runtime.closing.append(alloc, .{ .id = try alloc.dupe(u8, child_id) });
     try checkRefusalSentence(&problems, "message to a closing subagent", "child_closing", try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "again" } }, "call-12", null));
-    alloc.free(runtime.closing.pop().?);
+    alloc.free(runtime.closing.pop().?.id);
 
     // A working subagent whose turn the message cannot reach.
     runtime.managed.closed = true;
