@@ -10169,7 +10169,10 @@ test "a gate that expires logs the turns its mail starts without, and a late com
     defer runtime.deinit(alloc);
     try reportBehindUncommittedFinishes(alloc, &runtime, 2);
     try std.testing.expectEqual(@as(u32, 2), runtime.queued_history_owed);
-    // The loop never commits: the finishes were pushed longer ago than the limit.
+    // The first take holds the mail and starts the limit, whether the limit
+    // counts from the push of the finish or from this first hold. The loop
+    // never commits, and the limit passes.
+    try std.testing.expect((try runtime.tryTakeNextWork(alloc)) == null);
     runtime.commit_gate_since_ms -= WorkerRuntime.commit_gate_limit_ms;
     const work = (try runtime.tryTakeNextWork(alloc)).?;
     defer freeWorkItem(alloc, work);
