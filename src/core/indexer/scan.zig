@@ -139,7 +139,7 @@ const Shared = struct {
     root_dir: std.Io.Dir,
     root_abs: []const u8,
     rules: *const Rules,
-    stop: ?*std.atomic.Value(bool),
+    stop: ?*const std.atomic.Value(bool),
     stop_at_ns: ?i64 = null,
     collect_limit: usize,
     scan_started_ns: i64,
@@ -221,7 +221,7 @@ const Shared = struct {
 
 /// Lists `root` (absolute). `alloc` must be safe to use from several threads;
 /// the result owns its memory.
-pub fn scan(alloc: Allocator, root: []const u8, options: Options, stop: ?*std.atomic.Value(bool)) Error!Result {
+pub fn scan(alloc: Allocator, root: []const u8, options: Options, stop: ?*const std.atomic.Value(bool)) Error!Result {
     // Taken before anything is read: a stamp is reusable only if its times
     // are older than this by the granularity margin.
     const scan_started_ns = tree_mod.nowNs();

@@ -113,6 +113,10 @@ pub const Request = struct {
     /// the capture is `cancelled`. It reaches git even when a `std.Io` cancel
     /// was already spent.
     cancel: ?*const std.atomic.Value(bool) = null,
+    /// The user's home folder as the host knows it. A repository whose
+    /// worktree root is the filesystem root, this folder or `HOME`, or
+    /// a folder above either, is never captured (`private_root`).
+    home: ?[]const u8 = null,
 };
 
 pub const Status = enum { complete, partial, failed, unavailable };
@@ -193,6 +197,7 @@ pub fn capture(arena: Allocator, request: Request) Allocator.Error!Outcome {
     }
     var run: Run = .{ .arena = arena, .io = io_mod.getIo(), .request = request, .deadline = request.deadline };
     if (try run.resolve()) |done| return done;
+    if (try run.checkPrivateRoot()) |done| return done;
     if (try run.findProfile()) |done| return done;
     if (try run.lockWorktree()) |done| return done;
     defer if (run.lock) |*lock| lock.close(run.io);
@@ -408,10 +413,15 @@ const Run = struct {
         const index_missing = !(isPresent(io, self.store.index_file) catch |err| return self.ioFail("index_check", self.store.index_file, err));
         const started: std.Io.Clock.Timestamp = .now(io, clock);
         const setup_deadline = setupDeadline(started, self.deadline, store_missing or index_missing);
-        // An existing store is only checked; its lock, which pruning also
-        // holds, waits on the capture's own deadline.
-        const store_deadline = if (store_missing) setup_deadline else self.deadline;
+        // An existing store is only checked. Its lock, which a prune or a
+        // pack also holds, is waited for only briefly, so a turn never waits
+        // for a maintenance repack.
+        const store_wait: std.Io.Clock.Timestamp = .fromNow(io, .{ .clock = clock, .raw = .fromMilliseconds(existing_store_wait_ms) });
+        const store_deadline = if (store_missing) setup_deadline else if (self.deadline.compare(.lte, store_wait)) self.deadline else store_wait;
         if (try ensureStore(arena, io, self.store_ready, self.store_dir, self.store.git_dir, self.canonical.common_dir, self.facts.object_format, .{ .deadline = store_deadline, .cancel = self.request.cancel }, store_deadline)) |failure| {
+            // Maintenance holds an existing store's lock for a whole repack;
+            // the capture is skipped rather than waiting for it.
+            if (!store_missing and failure == .timeout) return self.fail(.unavailable, .capture_locked);
             return self.gitFail(failure);
         }
         // Until the store holds a capture, a copy has nothing to leave out
@@ -480,6 +490,11 @@ const Run = struct {
         // Candidates with what the disk holds now.
         var candidates: std.ArrayList(policy.Candidate) = .empty;
         var disk: Disk = .{ .arena = arena, .io = io, .work_tree = self.canonical.work_tree };
+        // Sensitive names the user's index holds: one git run tells which of
+        // them HEAD's tree lacks, such as a staged new `.env`.
+        var sensitive: std.ArrayList([]const u8) = .empty;
+        for (self.tracked) |entry| if (policy.isSensitive(entry.path)) try sensitive.append(arena, entry.path);
+        const in_head = try self.headPaths(sensitive.items);
         for (self.tracked, 0..) |entry, i| {
             if (i % 1024 == 1023 and pastDeadline(io, self.deadline)) return self.fail(.unavailable, .timeout);
             const found = disk.lstat(entry.path) catch |err| switch (err) {
@@ -490,11 +505,13 @@ const Run = struct {
             // A tracked file replaced by a folder is gone, unless it is a
             // gitlink.
             const present = found.present and ((entry.mode == .gitlink) or found.kind != .gitlink);
+            const new_in_index = policy.isSensitive(entry.path) and !in_head.contains(entry.path);
             try candidates.append(arena, .{
                 .path = entry.path,
                 .tracked = true,
                 .present = present,
                 .skip_worktree = entry.skip_worktree,
+                .new_in_index = new_in_index,
                 .bytes = found.bytes,
                 .kind = if ((entry.mode == .gitlink)) .gitlink else found.kind,
             });
@@ -506,7 +523,11 @@ const Run = struct {
                 error.Unreadable => return self.fail(.failed, .io_error),
                 error.Canceled => return self.fail(.unavailable, .cancelled),
             };
-            try candidates.append(arena, .{ .path = path, .tracked = false, .present = found.present, .bytes = found.bytes, .kind = found.kind });
+            const holds_key = found.present and found.kind == .file and found.bytes <= self.request.limits.untracked_file_bytes and (disk.holdsPrivateKey(path) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.Canceled => return self.fail(.unavailable, .cancelled),
+            });
+            try candidates.append(arena, .{ .path = path, .tracked = false, .present = found.present, .bytes = found.bytes, .kind = found.kind, .holds_private_key = holds_key });
         }
         // A repository nested inside the worktree is recorded as left out,
         // never silently dropped.
@@ -533,6 +554,23 @@ const Run = struct {
     fn findProfile(self: *Run) Allocator.Error!?Outcome {
         self.profile = try profileWithin(self.arena, self.canonical.work_tree, self.request.profile_root);
         if (self.profile) |profile| if (profile.len == 0) return self.fail(.unavailable, .private_root);
+        return null;
+    }
+
+    /// The `paths` that HEAD's tree holds. With no HEAD, or when git cannot
+    /// answer, none: every sensitive tracked file then counts as new, so the
+    /// capture leaves it out.
+    fn headPaths(self: *Run, paths: []const []const u8) Allocator.Error!std.StringHashMapUnmanaged(void) {
+        var set: std.StringHashMapUnmanaged(void) = .empty;
+        const head = self.facts.head orelse return set;
+        const found = try safe_git.pathsInTree(self.arena, self.ready, self.canonical.work_tree, head, paths, self.limits()) orelse return set;
+        for (found) |path| try set.put(self.arena, path, {});
+        return set;
+    }
+
+    /// A worktree root that is private (`isPrivateRoot`) is never captured.
+    fn checkPrivateRoot(self: *Run) Allocator.Error!?Outcome {
+        if (try isPrivateRoot(self.arena, self.canonical.work_tree, &.{ io_mod.getenv("HOME"), self.request.home })) return self.fail(.unavailable, .private_root);
         return null;
     }
 
@@ -748,6 +786,21 @@ pub fn isWithin(root: []const u8, path: []const u8) bool {
     return path.len == root.len or root[root.len - 1] == '/' or path[root.len] == '/';
 }
 
+/// Whether a repository at `root` is never captured: the filesystem
+/// root, or a root that is one of `homes` or holds one, such as a home
+/// kept as a dotfiles repository. Each home is compared by its real
+/// path; an unset or unresolvable one is skipped.
+pub fn isPrivateRoot(arena: Allocator, root: []const u8, homes: []const ?[]const u8) Allocator.Error!bool {
+    if (std.mem.trimEnd(u8, root, "/").len == 0) return true;
+    for (homes) |maybe| {
+        const home = maybe orelse continue;
+        if (home.len == 0) continue;
+        const real = try resolvedPath(arena, home) orelse continue;
+        if (isWithin(root, real)) return true;
+    }
+    return false;
+}
+
 /// Where the profile folder `profile_root` lies in `work_tree`, relative to
 /// it and empty when it is the work tree itself; null when it lies outside
 /// or cannot be resolved.
@@ -799,14 +852,25 @@ fn ensurePrivateDir(io: std.Io, path: []const u8) !void {
     try dir.setPermissions(io, .fromMode(0o700));
 }
 
-/// fx's session id rule (`src/core/session_manager/schema.zig` `validId`).
+/// fx's session id rule. It must stay equal to `validId` in
+/// `src/core/session_manager/schema.zig`, which fx cannot import here because
+/// the session manager exports `schema` only in its hook build.
 fn validSessionId(id: []const u8) bool {
     if (id.len == 0 or id.len > 255 or id[0] == '.') return false;
+    if (std.mem.eql(u8, id, "index.jsonl") or std.mem.eql(u8, id, "index.lock")) return false;
     for (id) |c| switch (c) {
         'a'...'z', 'A'...'Z', '0'...'9', '.', '-', '_' => {},
         else => return false,
     };
     return true;
+}
+
+test "capture store session ids follow the session manager's id rule" {
+    for ([_][]const u8{ "abc", "A.b-c_9" }) |id| try testing.expect(validSessionId(id));
+    const long: [256]u8 = @splat('a');
+    for ([_][]const u8{ "", ".hidden", "index.jsonl", "index.lock", "a/b", "a b", &long }) |id| {
+        try testing.expect(!validSessionId(id));
+    }
 }
 
 fn withFailure(base: Outcome, status: Status, reason: policy.Reason) Outcome {
@@ -1378,10 +1442,10 @@ const Lock = struct {
 
 /// Takes the worktree's lock, waiting for another capture of the same
 /// worktree, such as a parallel subagent's, until `deadline`. A cancel
-/// request that ends the wait is `Unavailable`, and stays armed for the
-/// caller's next step.
-pub fn acquireLock(io: std.Io, path: []const u8, deadline: std.Io.Clock.Timestamp) error{ Busy, Unavailable }!Lock {
-    return .{ .file = lockUntil(io, path, deadline, null) catch |err| return switch (err) {
+/// request or a set `cancel` flag that ends the wait is `Unavailable`, and
+/// a cancel request stays armed for the caller's next step.
+pub fn acquireLock(io: std.Io, path: []const u8, deadline: std.Io.Clock.Timestamp, cancel: ?*const std.atomic.Value(bool)) error{ Busy, Unavailable }!Lock {
+    return .{ .file = lockUntil(io, path, deadline, cancel) catch |err| return switch (err) {
         error.Canceled => error.Unavailable,
         else => |other| other,
     } };
@@ -1389,6 +1453,11 @@ pub fn acquireLock(io: std.Io, path: []const u8, deadline: std.Io.Clock.Timestam
 
 /// How long a lock wait sleeps between tries.
 const lock_poll_ns: u64 = 10 * std.time.ns_per_ms;
+
+/// How long a capture waits for an existing store's `init.lock`.
+/// Another capture holds it for milliseconds; maintenance holds it
+/// for a whole repack, which the turn must not wait for.
+const existing_store_wait_ms: i64 = 250;
 
 /// Opens `path`, creating it, and takes an exclusive flock on it, trying
 /// again until `deadline`. The kernel releases flock when its holder dies,
@@ -1448,8 +1517,9 @@ pub fn exists(io: std.Io, path: []const u8) bool {
 
 /// Re-arms a `std.Io` cancel request that `err` consumed, so the next
 /// cancelation point, such as the next git run, still sees it. Call once for
-/// each `error.Canceled` a helper swallows instead of returning.
-fn keepCancel(io: std.Io, err: anyerror) void {
+/// each `error.Canceled` a helper swallows instead of returning, in the
+/// capture path and in maintenance alike.
+pub fn keepCancel(io: std.Io, err: anyerror) void {
     if (err == error.Canceled) io.recancel();
 }
 
@@ -1613,8 +1683,8 @@ const UntrackedListing = union(enum) {
 
 /// Untracked paths relative to the worktree root, outside `skip_folder`: the
 /// native indexer's listing, or git's when the indexer cannot list exactly
-/// what git would. Both stop at `limits`' deadline, and git at its cancel
-/// flag too. Records the source in `outcome.listing`.
+/// what git would. Both stop at `limits`' deadline and at its cancel flag.
+/// Records the source in `outcome.listing`.
 fn listUntracked(
     arena: Allocator,
     scan_allocator: Allocator,
@@ -1630,7 +1700,7 @@ fn listUntracked(
     if (pastDeadline(io, deadline)) return .stopped;
     // The indexer skips folders only outside a repository, so git lists
     // when a folder must be skipped; it never enters that folder.
-    if (skip_folder == null) if (try listWithIndexer(arena, scan_allocator, facts, deadline, tracked)) |listing| {
+    if (skip_folder == null) if (try listWithIndexer(arena, scan_allocator, facts, deadline, limits.cancel, tracked)) |listing| {
         if (listing == .listed) outcome.listing = .indexer;
         return listing;
     };
@@ -1649,6 +1719,7 @@ fn listWithIndexer(
     scan_allocator: Allocator,
     facts: safe_git.RepositoryFacts,
     deadline: std.Io.Clock.Timestamp,
+    cancel: ?*const std.atomic.Value(bool),
     tracked: *const std.StringHashMapUnmanaged(Staged),
 ) Allocator.Error!?UntrackedListing {
     const io = io_mod.getIo();
@@ -1664,9 +1735,12 @@ fn listWithIndexer(
     // every core, as it did on Linux.
     const remaining_ns = std.Io.Clock.Timestamp.now(io, deadline.clock).durationTo(deadline).raw.toNanoseconds();
     const stop_at_ns: i64 = @intCast(std.math.clamp(@as(i128, io_mod.nanoTimestamp()) + remaining_ns, std.math.minInt(i64), std.math.maxInt(i64)));
-    var result = indexer.scan(scan_allocator, facts.work_tree, .{ .candidate_cap = max_listed_paths, .stop_at_ns = stop_at_ns }, null) catch |err| switch (err) {
+    var result = indexer.scan(scan_allocator, facts.work_tree, .{ .candidate_cap = max_listed_paths, .stop_at_ns = stop_at_ns }, cancel) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
-        error.Canceled => return .stopped,
+        error.Canceled => {
+            if (cancel) |flag| if (flag.load(.acquire)) return .cancelled;
+            return .stopped;
+        },
         error.RootUnavailable => return null,
     };
     defer result.deinit();
@@ -1786,6 +1860,30 @@ const Disk = struct {
             // git records neither pipes, sockets nor devices.
             else => not_on_disk,
         };
+    }
+
+    /// Whether the regular file at `path` starts with a PEM private key:
+    /// "PRIVATE KEY-----" within its first 4096 bytes. A file that cannot
+    /// be opened or is no longer a regular file counts as not a key.
+    fn holdsPrivateKey(self: *Disk, path: []const u8) (Allocator.Error || error{Canceled})!bool {
+        const absolute = try std.Io.Dir.path.join(self.arena, &.{ self.work_tree, path });
+        var file = io_mod.openExistingReadOnlyRegularFile(std.Io.Dir.cwd(), absolute, .no_follow) catch |err| switch (err) {
+            error.Canceled => {
+                self.io.recancel();
+                return error.Canceled;
+            },
+            else => return false,
+        };
+        defer file.close(self.io);
+        var buf: [4096]u8 = undefined;
+        const n = file.readPositionalAll(self.io, &buf, 0) catch |err| switch (err) {
+            error.Canceled => {
+                self.io.recancel();
+                return error.Canceled;
+            },
+            else => return false,
+        };
+        return std.mem.find(u8, buf[0..n], "PRIVATE KEY-----") != null;
     }
 };
 
@@ -3398,6 +3496,52 @@ test "capture store: untracked limits and sensitive names make a partial capture
     try testing.expect(try repos.treeHas(repo, tree, "keep1.txt"));
 }
 
+test "capture store: a staged new .env and an untracked private key stay out of the store" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const repos = try TestRepos.init(arena_state.allocator(), tmp.dir);
+    defer repos.deinit();
+    try repos.initRepo("repo");
+    try repos.write("repo/readme.txt", "this file mentions PRIVATE KEY but holds none\n");
+    // Staged but never committed, which still puts its content in the index.
+    try repos.write("repo/.env", "SECRET=1\n");
+    _ = try repos.gitIn("repo", &.{ "add", ".env" });
+    try repos.write("repo/deploy.txt", "-----BEGIN OPENSSH PRIVATE KEY-----\nabc\n-----END OPENSSH PRIVATE KEY-----\n");
+    const repo = try repos.repository("repo");
+
+    const outcome = try repos.captureRepo(repo, "secrets");
+    const tree = try expectStored(outcome);
+    try testing.expectEqual(Status.partial, outcome.status);
+    try expectExcluded(outcome, ".env", .sensitive);
+    try expectExcluded(outcome, "deploy.txt", .sensitive);
+    try testing.expect(try repos.treeHas(repo, tree, "readme.txt"));
+    try testing.expect(!try repos.treeHas(repo, tree, ".env"));
+    try testing.expect(!try repos.treeHas(repo, tree, "deploy.txt"));
+}
+
+test "capture store: a committed file with a sensitive name is still captured" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const repos = try TestRepos.init(arena_state.allocator(), tmp.dir);
+    defer repos.deinit();
+    try repos.initRepo("repo");
+    try repos.write("repo/.env.example", "KEY=\n");
+    _ = try repos.gitIn("repo", &.{ "add", ".env.example" });
+    try repos.commitAll("repo", "base");
+    // Changed, but not staged, so only its content in the new commit differs.
+    try repos.write("repo/.env.example", "KEY=x\n");
+    const repo = try repos.repository("repo");
+
+    const outcome = try repos.captureRepo(repo, "committed");
+    const tree = try expectStored(outcome);
+    try testing.expect(try repos.treeHas(repo, tree, ".env.example"));
+    try testing.expect(exclusionReason(outcome, ".env.example") == null);
+}
+
 test "capture store: invalid session id writes nothing and is reported as an outcome" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
@@ -3545,6 +3689,47 @@ test "capture store: fx's profile folder inside the work tree is never listed an
     const own = try capture(repos.arena, request);
     try testing.expectEqual(Status.unavailable, own.status);
     try testing.expectEqual(policy.Reason.private_root, own.reason.?);
+}
+
+test "capture store: a worktree at the host's home or above it is private_root" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const repos = try TestRepos.init(arena_state.allocator(), tmp.dir);
+    defer repos.deinit();
+    try repos.makeShapes("repo");
+    const repo = try repos.repository("repo");
+    var request = repos.request(repo, "home", .{});
+
+    // The worktree root is the host's home, as for a home kept as a
+    // dotfiles repository.
+    request.home = repo.work_tree;
+    const at_home = try capture(repos.arena, request);
+    try testing.expectEqual(Status.unavailable, at_home.status);
+    try testing.expectEqual(policy.Reason.private_root, at_home.reason.?);
+
+    // The home lies above the worktree.
+    try repos.write("repo/inner/notes.txt", "notes\n");
+    request.home = try repos.path("repo/inner");
+    const above = try capture(repos.arena, request);
+    try testing.expectEqual(Status.unavailable, above.status);
+    try testing.expectEqual(policy.Reason.private_root, above.reason.?);
+
+    // A home elsewhere leaves the worktree capturable.
+    try repos.write("elsewhere/notes.txt", "notes\n");
+    request.home = try repos.path("elsewhere");
+    const elsewhere = try capture(repos.arena, request);
+    _ = try expectStored(elsewhere);
+    if (elsewhere.reason) |reason| try testing.expect(reason != .private_root);
+}
+
+test "capture store: the filesystem root is a private root" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    try testing.expect(try isPrivateRoot(arena, "/", &.{}));
+    try testing.expect(!try isPrivateRoot(arena, "/tmp", &.{null}));
 }
 
 test "capture store: an untracked nested repository is reported as left out, never dropped" {
@@ -3700,7 +3885,7 @@ test "capture store: a worktree lock held past the deadline reports capture_lock
     // The wait tries the lock before it looks at the clock, so a held lock
     // is `Busy` however late the wait starts, even past its deadline.
     for ([_]i64{ -1, 0, 50 }) |ms| {
-        try testing.expectError(error.Busy, acquireLock(testing.io, lock_path, .fromNow(testing.io, .{ .clock = .awake, .raw = .fromMilliseconds(ms) })));
+        try testing.expectError(error.Busy, acquireLock(testing.io, lock_path, .fromNow(testing.io, .{ .clock = .awake, .raw = .fromMilliseconds(ms) }), null));
     }
     // A whole capture: the deadline leaves `resolve`'s git runs ample time
     // to reach the wait, which then lasts until the deadline. A deadline
@@ -4248,6 +4433,35 @@ test "capture store: the untracked listing reports untracked_timeout at once whe
     // The record of such a capture is accepted as unavailable.
     const record = try encodeRecord(testing.allocator, .start, withFailure(outcome, .unavailable, .untracked_timeout));
     testing.allocator.free(record);
+}
+
+test "capture store: a cancel during the untracked listing reports cancelled, not untracked_timeout" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const repos = try TestRepos.init(arena_state.allocator(), tmp.dir);
+    defer repos.deinit();
+    try repos.initRepo("repo");
+    try repos.write("repo/new.txt", "new\n");
+    const repo = try repos.repository("repo");
+    const ready = switch (try safe_git.prepareWithin(repos.arena, repo.work_tree, .{})) {
+        .ready => |value| value,
+        .refused => return error.TestUnexpectedRefusal,
+    };
+    const facts = switch (try safe_git.repositoryFacts(repos.arena, ready, repo.work_tree, .{})) {
+        .ok => |value| value,
+        .failed => return error.TestExpectedFacts,
+    };
+    var tracked: std.StringHashMapUnmanaged(Staged) = .empty;
+    var outcome: Outcome = .{ .status = .complete };
+
+    // Time remains, but the cancel flag is already set, so the listing stops
+    // as cancelled rather than as a timeout.
+    var cancel: std.atomic.Value(bool) = .init(true);
+    const later: std.Io.Clock.Timestamp = .fromNow(testing.io, .{ .clock = .awake, .raw = .fromMilliseconds(test_deadline_ms) });
+    const listed = try listUntracked(repos.arena, testing.allocator, ready, facts, null, .{ .deadline = later, .cancel = &cancel }, &tracked, &outcome);
+    try testing.expect(listed == .cancelled);
 }
 
 test "capture store: a running untracked scan is ended at the deadline by its stop time" {
@@ -5782,4 +5996,239 @@ test "capture retention: a loose store that cannot be packed evicts only what th
     try testing.expect((try repos.storeRef(repo, try repos.sessionRef(repo, "old"))) != null);
     try testing.expect(try storeUnpacked(repos, loose));
     try testing.expect((try repos.storeRef(loose, try repos.sessionRef(loose, "current"))) != null);
+}
+
+test "capture retention: a store whose prune keeps failing loses no more sessions" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const repos = try TestRepos.init(arena_state.allocator(), tmp.dir);
+    defer repos.deinit();
+    try repos.initRepo("repo");
+    try repos.write("repo/a.txt", "a\n");
+    _ = try repos.gitIn("repo", &.{ "add", "-A" });
+    try repos.commitAll("repo", "first");
+    const repo = try repos.repository("repo");
+    _ = try captureAt(repos, repo, "oldest", test_unix_seconds - 200);
+    _ = try captureAt(repos, repo, "older", test_unix_seconds - 100);
+    _ = try captureAt(repos, repo, "current", test_unix_seconds);
+    var sessions: TestSessions = .{ .arena = repos.arena };
+    // A worktree lock stays held (any lasting prune failure acts the same).
+    const worktree_lock = try std.Io.Dir.path.join(repos.arena, &.{ try worktreeDir(repos.arena, try storeDir(repos.arena, repos.profile, repo.common_dir), repo.git_dir), "lock" });
+    const held = try std.Io.Dir.createFileAbsolute(testing.io, worktree_lock, .{ .truncate = false, .read = true });
+    defer held.close(testing.io);
+    try testing.expect(try held.tryLock(testing.io, .exclusive));
+
+    var first_config = try retentionConfig(repos, "current", &sessions, 1, 1);
+    first_config.deadline = .fromNow(testing.io, .{ .clock = .awake, .raw = .fromMilliseconds(1000) });
+    _ = try retention.admit(repos.arena, first_config);
+    try testing.expect((try repos.storeRef(repo, try repos.sessionRef(repo, "oldest"))) == null);
+    try testing.expect((try repos.storeRef(repo, try repos.sessionRef(repo, "older"))) != null);
+
+    // The next maintenance, one interval later.
+    try setUsageField(repos, "v2", 2, "0");
+    var second_config = try retentionConfig(repos, "current", &sessions, 1, 1);
+    second_config.deadline = .fromNow(testing.io, .{ .clock = .awake, .raw = .fromMilliseconds(1000) });
+    _ = try retention.admit(repos.arena, second_config);
+    const older_left = (try repos.storeRef(repo, try repos.sessionRef(repo, "older"))) != null;
+    // The space never dropped, so "older" must stay.
+    try testing.expect(older_left);
+}
+
+test "capture retention: a session open in another process is never evicted, even when the catalog lacks it" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const repos = try TestRepos.init(arena_state.allocator(), tmp.dir);
+    defer repos.deinit();
+    try repos.initRepo("repo");
+    try repos.write("repo/a.txt", "a\n");
+    _ = try repos.gitIn("repo", &.{ "add", "-A" });
+    try repos.commitAll("repo", "first");
+    const repo = try repos.repository("repo");
+    _ = try captureAt(repos, repo, "fresh-elsewhere", test_unix_seconds - 100);
+    _ = try captureAt(repos, repo, "current", test_unix_seconds);
+    // Another process has it open, and it is not (yet) in this process's catalog listing.
+    var sessions: TestSessions = .{ .arena = repos.arena, .missing = &.{"fresh-elsewhere"}, .busy_ids = &.{"fresh-elsewhere"} };
+    _ = try retention.admit(repos.arena, try retentionConfig(repos, "current", &sessions, 1, 1));
+    const kept = (try repos.storeRef(repo, try repos.sessionRef(repo, "fresh-elsewhere"))) != null;
+    try testing.expect(kept);
+}
+
+test "capture retention: a cancel ends a maintenance that waits on a store lock" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const repos = try TestRepos.init(arena_state.allocator(), tmp.dir);
+    defer repos.deinit();
+    try repos.initRepo("repo");
+    try repos.write("repo/a.txt", "a\n");
+    _ = try repos.gitIn("repo", &.{ "add", "-A" });
+    try repos.commitAll("repo", "first");
+    const repo = try repos.repository("repo");
+    _ = try captureAt(repos, repo, "old", test_unix_seconds - 100);
+    _ = try captureAt(repos, repo, "current", test_unix_seconds);
+    // A stopped maintenance left a marker, and a capture holds the worktree.
+    try TestRepos.writeAbsolute(try markerPath(repos, repo), "");
+    const worktree_lock = try std.Io.Dir.path.join(repos.arena, &.{ try worktreeDir(repos.arena, try storeDir(repos.arena, repos.profile, repo.common_dir), repo.git_dir), "lock" });
+    const held = try std.Io.Dir.createFileAbsolute(testing.io, worktree_lock, .{ .truncate = false, .read = true });
+    defer held.close(testing.io);
+    try testing.expect(try held.tryLock(testing.io, .exclusive));
+    var sessions: TestSessions = .{ .arena = repos.arena };
+    var flag = std.atomic.Value(bool).init(false);
+    var config = try retentionConfig(repos, "current", &sessions, 1, 1);
+    config.deadline = .fromNow(testing.io, .{ .clock = .awake, .raw = .fromMilliseconds(8000) });
+    config.cancel = &flag;
+    const setter = try std.Thread.spawn(.{}, struct {
+        fn run(f: *std.atomic.Value(bool)) void {
+            io_mod.sleep(200 * std.time.ns_per_ms);
+            f.store(true, .release);
+        }
+    }.run, .{&flag});
+    const start = io_mod.milliTimestamp();
+    _ = try retention.admit(repos.arena, config);
+    const elapsed = io_mod.milliTimestamp() - start;
+    setter.join();
+    try testing.expect(elapsed < 2000);
+}
+
+test "capture retention: symlinks and a planted usage never change the measure or reach a file outside the profile" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const repos = try TestRepos.init(arena_state.allocator(), tmp.dir);
+    defer repos.deinit();
+    try repos.initRepo("repo");
+    try repos.write("repo/a.txt", "a\n");
+    _ = try repos.gitIn("repo", &.{ "add", "-A" });
+    try repos.commitAll("repo", "first");
+    const repo = try repos.repository("repo");
+    _ = try captureAt(repos, repo, "old", test_unix_seconds - 100);
+    _ = try captureAt(repos, repo, "current", test_unix_seconds);
+    var sessions: TestSessions = .{ .arena = repos.arena };
+    const big = retention.budget_bytes;
+    const before = (try retention.admit(repos.arena, try retentionConfig(repos, "current", &sessions, big, big))).used.?;
+    // Outside data: an 8 MiB file in a folder outside the profile.
+    try repos.write("outside/huge.bin", try repos.randomBytes(8 * 1024 * 1024, 3));
+    const outside = try repos.path("outside");
+    const captures = try std.Io.Dir.path.join(repos.arena, &.{ repos.profile, "captures" });
+    // A symlinked store-like folder, a symlink inside the store, and usage as a symlink to a planted v2 file claiming 0.
+    try std.Io.Dir.cwd().symLink(testing.io, outside, try std.Io.Dir.path.join(repos.arena, &.{ captures, "0123456789abcdef0123456789abcdef" }), .{});
+    try std.Io.Dir.cwd().symLink(testing.io, outside, try std.Io.Dir.path.join(repos.arena, &.{ try storeDir(repos.arena, repos.profile, repo.common_dir), "planted" }), .{});
+    try repos.write("outside/usage", "v2 0 0\n");
+    std.Io.Dir.deleteFileAbsolute(testing.io, try usagePath(repos)) catch {};
+    try std.Io.Dir.cwd().symLink(testing.io, try repos.path("outside/usage"), try usagePath(repos), .{});
+    const after = (try retention.admit(repos.arena, try retentionConfig(repos, "current", &sessions, big, big))).used.?;
+    // A huge usage file (2 MiB of valid-looking lines) is no cache.
+    std.Io.Dir.deleteFileAbsolute(testing.io, try usagePath(repos)) catch {};
+    const line = "v2 0 0\n";
+    var huge: std.ArrayList(u8) = .empty;
+    try huge.appendSlice(repos.arena, line);
+    while (huge.items.len < 2 * 1024 * 1024) try huge.appendSlice(repos.arena, "#");
+    try TestRepos.writeAbsolute(try usagePath(repos), huge.items);
+    const huge_used = (try retention.admit(repos.arena, try retentionConfig(repos, "current", &sessions, big, big))).used.?;
+    // evictions.jsonl planted as a symlink to a file outside the profile.
+    try repos.write("outside/victim.txt", "victim\n");
+    try std.Io.Dir.cwd().symLink(testing.io, try repos.path("outside/victim.txt"), try std.Io.Dir.path.join(repos.arena, &.{ captures, "evictions.jsonl" }), .{});
+    std.Io.Dir.deleteFileAbsolute(testing.io, try usagePath(repos)) catch {};
+    _ = try retention.admit(repos.arena, try retentionConfig(repos, "current", &sessions, 1, 1));
+    const victim = try repos.read("outside/victim.txt");
+    try testing.expect(after < before + 1024 * 1024);
+    try testing.expect(huge_used > 0);
+    try testing.expectEqualStrings("victim\n", victim);
+}
+
+test "capture retention: a store with many loose objects is packed even under the budget" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const repos = try TestRepos.init(arena_state.allocator(), tmp.dir);
+    defer repos.deinit();
+    try repos.initRepo("repo");
+    try repos.write("repo/a.txt", "a\n");
+    _ = try repos.gitIn("repo", &.{ "add", "-A" });
+    try repos.commitAll("repo", "first");
+    // Untracked, so the capture writes objects into the store as loose ones.
+    try repos.write("repo/new.txt", "new\n");
+    const repo = try repos.repository("repo");
+    _ = try captureAt(repos, repo, "current", test_unix_seconds);
+    var sessions: TestSessions = .{ .arena = repos.arena };
+    var config = try retentionConfig(repos, "current", &sessions, retention.budget_bytes, retention.target_bytes);
+    config.repack_loose = 1;
+
+    // Under the budget, but the store's loose objects make it due.
+    const checked = try retention.check(repos.arena, config);
+    try testing.expect(checked.admit);
+    try testing.expect(checked.due);
+    const admitted = try retention.admit(repos.arena, config);
+    try testing.expect(admitted.admit);
+    const counted = try repos.storeGit(repo, &.{"count-objects"});
+    try testing.expect(std.mem.startsWith(u8, counted, "0 objects"));
+}
+
+test "capture store: a capture of an existing store skips at once when maintenance holds the store lock" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const repos = try TestRepos.init(arena_state.allocator(), tmp.dir);
+    defer repos.deinit();
+    try repos.makeShapes("repo");
+    const repo = try repos.repository("repo");
+    // One capture leaves a store that later captures only check.
+    _ = try expectStored(try repos.captureRepo(repo, "first"));
+    const store_dir = try storeDir(repos.arena, repos.profile, repo.common_dir);
+    const held = try std.Io.Dir.createFileAbsolute(testing.io, try std.Io.Dir.path.join(repos.arena, &.{ store_dir, "init.lock" }), .{ .truncate = false, .read = true });
+    defer held.close(testing.io);
+    try testing.expect(try held.tryLock(testing.io, .exclusive));
+
+    var request = repos.request(repo, "second", .{});
+    request.deadline = .fromNow(testing.io, .{ .clock = .awake, .raw = .fromMilliseconds(1500) });
+    const started = io_mod.milliTimestamp();
+    const outcome = try capture(repos.arena, request);
+    const took_ms = io_mod.milliTimestamp() - started;
+    try testing.expectEqual(Status.unavailable, outcome.status);
+    try testing.expectEqual(policy.Reason.capture_locked, outcome.reason.?);
+    try testing.expect(took_ms < 1000);
+}
+
+test "capture retention: a marker left before the intent costs only a prune, and stale usage temps are removed" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const repos = try TestRepos.init(arena_state.allocator(), tmp.dir);
+    defer repos.deinit();
+    try repos.initRepo("repo");
+    try repos.write("repo/a.txt", "a\n");
+    _ = try repos.gitIn("repo", &.{ "add", "-A" });
+    try repos.commitAll("repo", "first");
+    const repo = try repos.repository("repo");
+    _ = try captureAt(repos, repo, "old", test_unix_seconds - 100);
+    _ = try captureAt(repos, repo, "current", test_unix_seconds);
+    var sessions: TestSessions = .{ .arena = repos.arena };
+    // Killed after the marker, before the intent: nothing deleted, marker left.
+    try TestRepos.writeAbsolute(try markerPath(repos, repo), "");
+    // Killed writeUsage calls leave temp files that no process is writing now.
+    const captures = try std.Io.Dir.path.join(repos.arena, &.{ repos.profile, "captures" });
+    const past: std.Io.Timestamp = .{ .nanoseconds = @as(i96, test_unix_seconds) * std.time.ns_per_s };
+    for (0..3) |i| {
+        const temp = try repos.arena.print("{s}/usage.tmp-{d}", .{ captures, i });
+        try TestRepos.writeAbsolute(temp, try repos.randomBytes(256 * 1024, i));
+        try std.Io.Dir.cwd().setTimestamps(testing.io, temp, .{ .access_timestamp = .{ .new = past }, .modify_timestamp = .{ .new = past } });
+    }
+    const big = retention.budget_bytes;
+    _ = try retention.admit(repos.arena, try retentionConfig(repos, "current", &sessions, big, big));
+    const old_kept = (try repos.storeRef(repo, try repos.sessionRef(repo, "old"))) != null;
+    // Over the budget: the next maintenance prunes the marked store first and evicts once.
+    std.Io.Dir.deleteFileAbsolute(testing.io, try usagePath(repos)) catch {};
+    _ = try retention.admit(repos.arena, try retentionConfig(repos, "current", &sessions, 1, 1));
+    const tmp_left = try TestRepos.existsAbsolute(try repos.arena.print("{s}/usage.tmp-0", .{captures}));
+    try testing.expect(old_kept);
+    try testing.expect(!tmp_left);
 }

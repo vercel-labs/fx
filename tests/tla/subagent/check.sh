@@ -51,6 +51,21 @@
 # SteerQueueTrace.tla checks runs of the built fx binary against the model;
 # tests/tla/drivers/subagent/driver.ts runs it.
 #
+# The QuietRelay configs:
+#
+# QuietRelay models fx's note to a parent when its subagent's shell command
+# crosses the quiet limit (noteChildQuiet in tool_host.zig, raised by
+# agent_adapter.zig and app_worker_runtime.zig), and the parent's wait that
+# the note wakes. quiet-relay.cfg and quiet-relay-deep.cfg are the design and
+# must pass. Each quiet-relay-mutation-*.cfg plants one defect, and the rule it
+# names must catch it:
+#
+#   relay-late-notice  a later notice in the same spell is relayed     OnePerSpell
+#   relay-after-close  a note for a closed subagent is posted          NoRelayAfterClose
+#   silent-drop        a note the full mailbox refuses is not logged   EveryCrossingAccounted
+#   no-cap             a note is posted past the mailbox bound         MailboxBounded
+#   check-first        the wait checks the mailbox before it registers NoSleepOnMail
+#
 # Needs Java 11+ and tla2tools.jar, as ../README.md describes.
 #
 # Usage:
@@ -75,8 +90,20 @@
 #   lost-at-finish       a finished turn drops the mail left for it    NoneLost
 #   close-with-mail      a final boundary closes with mail unread      JoinsOpenTurn
 #
+# main-mail-commit.cfg is the design where the host commits a finished turn
+# in a step of its own, as the app's main loop does: mail that missed the
+# turn waits for the commit (the worker's commit gate) unless the gate
+# gives up, and the gate never waits for a commit that is not coming. Two
+# more planted defects, each caught by the rule named for it:
+#
+#   no-gate              the next turn starts before the commit              CommitBeforeNextTurn
+#   stuck-gate           a commit leaves the gate's count as it was          GateNeverStuck
+#   drop-unacknowledged  a finish the loop drops unsaved (a cancel, a            GateNeverStuck
+#                        session switch) leaves the count as it was
+#
 # tests/tla/drivers/subagent/main-mail.test.ts checks runs of the built fx
-# against it (MainMailTrace.tla).
+# against it (MainMailTrace.tla) where turns commit as they finish, as in
+# fx ask and ACP.
 
 set -eu
 
@@ -120,4 +147,15 @@ MainMail main-mail-today-acp WaitHonest
 MainMail main-mail-mutation-wait-always-follows WaitHonest
 MainMail main-mail-mutation-lost-at-finish NoneLost
 MainMail main-mail-mutation-close-with-mail JoinsOpenTurn
+MainMail main-mail-commit -
+MainMail main-mail-mutation-no-gate CommitBeforeNextTurn
+MainMail main-mail-mutation-stuck-gate GateNeverStuck
+MainMail main-mail-mutation-drop-unacknowledged GateNeverStuck
+QuietRelay quiet-relay -
+QuietRelay quiet-relay-deep -
+QuietRelay quiet-relay-mutation-relay-late-notice OnePerSpell
+QuietRelay quiet-relay-mutation-relay-after-close NoRelayAfterClose
+QuietRelay quiet-relay-mutation-silent-drop EveryCrossingAccounted
+QuietRelay quiet-relay-mutation-no-cap MailboxBounded
+QuietRelay quiet-relay-mutation-check-first NoSleepOnMail
 VERDICTS
