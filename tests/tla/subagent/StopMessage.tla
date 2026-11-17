@@ -59,6 +59,25 @@
 (* that the user stopped, owes main a report; a turn main stopped or      *)
 (* closed owes none.                                                       *)
 (*                                                                         *)
+(* A work's end is recorded first and the host's end hook runs after it    *)
+(* (`workEnded`). A turn that ends without reading what joined it, as a    *)
+(* failed or cancelled request ends it (`Fail`), leaves those messages     *)
+(* with its slot (`keepLeftovers`): the subagent is "ended" until the hook *)
+(* queues them ahead of the waiting ones as its next work (`Hook`,         *)
+(* `handOverLeftovers` in managed_owner.zig). A stop or close that lands   *)
+(* then counts and drops them, and the hook queues none; a message main    *)
+(* sends after that stop waits for the next work, as after any stop. The   *)
+(* work the host chooses carries its messages, unread until its turn       *)
+(* begins (`startq`, `Owner.markNext` and `unstarted`): a stop or close in *)
+(* the gap before the turn drops and counts them as well. The user's Esc   *)
+(* on a turn that ended counts and drops what a stop does. "leftover_gap"  *)
+(* is fx before this: a stop of an ended turn reached nothing, and the     *)
+(* hook queued the kept messages. "leftover_uncounted" drops them without  *)
+(* counting, "close_leaves_kept" leaves them with the closing subagent,    *)
+(* "user_ended_uncounted" is the user's Esc that counts none, and          *)
+(* "gap_uncounted" is a stop or close of the chosen work that counts none  *)
+(* of its messages.                                                        *)
+(*                                                                         *)
 (* Bug plants one defect; check.sh names the rule that must catch each.    *)
 (* "today" is fx before this design: a message to a work its parent        *)
 (* stopped is refused, one to a work the user stopped joins it and is lost *)
@@ -77,7 +96,10 @@ Bugs == {"none", "today", "refuse_ending", "no_order", "uncounted",
          "join_user_ending", "read_after_stop", "drop_waiting_at_end",
          "queue_closing", "unmark_early", "start_next_turn",
          "before_idle", "note_after_take", "names_busy", "gap_blind"}
-ASSUME Bug \in Bugs
+\* The defects of the kept and carried messages, beside `Bugs`.
+KeptBugs == {"leftover_gap", "leftover_uncounted", "close_leaves_kept",
+             "user_ended_uncounted", "gap_uncounted"}
+ASSUME Bug \in Bugs \cup KeptBugs
 
 \* What an end tells main: no report, a report that says its subagent is
 \* idle, or a plain report.
@@ -94,6 +116,10 @@ Answers == {"none", "started", "joined", "waits", "refused"}
 Ops == {"none", "step", "send", "stop", "close", "user_stop", "read",
         "finish", "end", "begin", "write_close", "publish"}
 
+\* The phases and ops of the kept messages, beside `Phases` and `Ops`.
+AllPhases == Phases \cup {"ended"}
+AllOps == Ops \cup {"fail", "hook"}
+
 Range(sq) == {sq[k] : k \in DOMAIN sq}
 RemoveAt(sq, i) == [k \in 1..(Len(sq) - 1) |-> IF k < i THEN sq[k] ELSE sq[k + 1]]
 
@@ -106,8 +132,11 @@ VARIABLES
     phase,        \* [Subs -> Phases]
     unread,       \* [Subs -> SUBSET Msgs]: joined the running turn, not read
     waitq,        \* [Subs -> Seq(Msgs)]: waiting for the next turn
+    startq,       \* [Subs -> SUBSET Msgs]: the chosen next work's own messages, unread until its turn begins
+    kept,         \* [Subs -> SUBSET Msgs]: unread by a turn that ended, kept by its slot for the end hook
     read,         \* messages a turn read
     dropped,      \* messages thrown away
+    stoppedQ,     \* messages queued, kept or unread when a stop, user stop or close of their subagent answered
     toldDropped,  \* messages a stop's, a user stop's, or a close's count included
     told,         \* [Msgs -> Answers]: what main heard when it sent each one
     sent,         \* messages main has written into a step
@@ -126,7 +155,10 @@ VARIABLES
 
 idleVars == <<note, named, noteWrong, namedWrong>>
 
-vars == <<phase, unread, waitq, read, dropped, toldDropped, told, sent,
+\* What most actions leave alone.
+heldVars == <<startq, stoppedQ, kept>>
+
+vars == <<phase, unread, waitq, startq, kept, read, dropped, stoppedQ, toldDropped, told, sent,
           stops, steps, step, covered, refusedOpen, coverBroken, lateStart, last,
           note, named, noteWrong, namedWrong>>
 
@@ -134,8 +166,11 @@ Init ==
     /\ phase = [s \in Subs |-> "absent"]
     /\ unread = [s \in Subs |-> {}]
     /\ waitq = [s \in Subs |-> <<>>]
+    /\ startq = [s \in Subs |-> {}]
+    /\ kept = [s \in Subs |-> {}]
     /\ read = {}
     /\ dropped = {}
+    /\ stoppedQ = {}
     /\ toldDropped = {}
     /\ told = [m \in Msgs |-> "none"]
     /\ sent = {}
@@ -187,6 +222,7 @@ NewStep ==
        \/ \E c1, c2 \in Choices : c1 # c2 /\ Write(<<c1, c2>>)
     /\ UNCHANGED <<phase, unread, waitq, read, dropped, toldDropped, told,
                    refusedOpen, coverBroken, lateStart>>
+    /\ UNCHANGED heldVars
     /\ UNCHANGED idleVars
 
 -----------------------------------------------------------------------------
@@ -277,6 +313,7 @@ DoSend(c) ==
     LET s == c.sub
         m == c.msg
     IN
+    /\ UNCHANGED heldVars
     /\ \/ /\ phase[s] \in {"absent", "idle"}
           /\ phase' = [phase EXCEPT ![s] = "starting"]
           /\ read' = read \cup {m}
@@ -296,7 +333,14 @@ DoSend(c) ==
 DoStop(c) ==
     LET s == c.sub
         waiting == Range(waitq[s])
-        counted == waiting \cup
+        held == startq[s]
+        \* fx before the kept messages counted: a stop of an ended turn reached
+        \* nothing, and the hook queued them.
+        keptGap == phase[s] = "ended" /\ Bug = "leftover_gap"
+        keptCounted == IF phase[s] = "ended" /\ Bug \notin {"leftover_gap", "leftover_uncounted"}
+                       THEN kept[s] ELSE {}
+        heldCounted == IF Bug = "gap_uncounted" THEN {} ELSE held
+        counted == waiting \cup heldCounted \cup keptCounted \cup
             (IF phase[s] = "running" /\ Bug \notin {"today", "uncounted"}
              THEN unread[s] ELSE {})
     IN
@@ -305,20 +349,26 @@ DoStop(c) ==
     \/ /\ Marked(s)
        /\ last' = Event("stop", s, NoMsg, "stopped", 0)
        /\ UNCHANGED <<phase, waitq, dropped, toldDropped, coverBroken>>
+       /\ UNCHANGED heldVars
     \/ /\ phase[s] = "absent"
        /\ last' = Event("stop", s, NoMsg, "unavailable", 0)
        /\ UNCHANGED <<phase, waitq, dropped, toldDropped, coverBroken>>
+       /\ UNCHANGED heldVars
     \* The work ended and none follows: nothing to stop (Owner.stop finds the
     \* slot ended). Only the planted defect answers as for a running turn.
     \/ /\ phase[s] = "gap_idle"
        /\ last' = Event("stop", s, NoMsg, IF Bug = "gap_blind" THEN "stopped" ELSE "idle", 0)
        /\ UNCHANGED <<phase, waitq, dropped, toldDropped, coverBroken>>
+       /\ UNCHANGED heldVars
     \/ /\ phase[s] \notin {"closing", "writing", "absent", "gap_idle"}
        /\ phase' = [phase EXCEPT ![s] = IF @ \in {"starting", "running"} \/ (@ = "gap_next" /\ Bug # "gap_blind")
                                          THEN "ending_parent" ELSE @]
        /\ waitq' = [waitq EXCEPT ![s] = <<>>]
-       /\ dropped' = dropped \cup waiting
+       /\ startq' = [startq EXCEPT ![s] = {}]
+       /\ kept' = [kept EXCEPT ![s] = IF keptGap THEN @ ELSE {}]
+       /\ dropped' = dropped \cup waiting \cup held \cup (IF keptGap THEN {} ELSE kept[s])
        /\ toldDropped' = toldDropped \cup counted
+       /\ stoppedQ' = stoppedQ \cup waiting \cup held \cup unread[s] \cup kept[s]
        /\ coverBroken' = (coverBroken \/
             \E m \in waiting \cup unread[s] : <<m, c.id>> \in covered)
        \* A work that is still ending still counts as stopped.
@@ -328,19 +378,25 @@ DoStop(c) ==
 
 DoClose(c) ==
     LET s == c.sub
-        lost == Range(waitq[s]) \cup unread[s]
+        lost == Range(waitq[s]) \cup unread[s] \cup startq[s] \cup kept[s]
         \* A turn a stop already ended had its unread messages counted by
         \* that stop; the close counts each message once, as a second stop
-        \* does.
-        counted == Range(waitq[s]) \cup (IF phase[s] = "running" THEN unread[s] ELSE {})
+        \* does. It counts the work it drops before its turn began, and the
+        \* messages the slot kept, as a stop does.
+        keptCounted == IF Bug = "leftover_uncounted" THEN {} ELSE kept[s]
+        heldCounted == IF Bug = "gap_uncounted" THEN {} ELSE startq[s]
+        counted == Range(waitq[s]) \cup heldCounted \cup keptCounted \cup
+            (IF phase[s] = "running" THEN unread[s] ELSE {})
     IN \/ /\ phase[s] = "absent"
           /\ last' = Event("close", s, NoMsg, "unavailable", 0)
           /\ UNCHANGED <<phase, waitq, unread, dropped, toldDropped>>
+          /\ UNCHANGED heldVars
        \* A second close while the first is ending: fx answers closed and
        \* drops nothing more (`closeChild` in tool_host.zig).
        \/ /\ Marked(s)
           /\ last' = Event("close", s, NoMsg, "closed", 0)
           /\ UNCHANGED <<phase, waitq, unread, dropped, toldDropped>>
+          /\ UNCHANGED heldVars
        \/ /\ phase[s] \notin {"closing", "writing", "absent"}
           \* A work that ended with none next closes as an idle one; the
           \* planted defect leaves the gap alone.
@@ -348,9 +404,12 @@ DoClose(c) ==
                 IF Bug = "gap_blind" /\ @ \in Gaps THEN @
                 ELSE IF @ \in {"idle", "gap_idle"} THEN "absent" ELSE "closing"]
           /\ waitq' = [waitq EXCEPT ![s] = <<>>]
+          /\ startq' = [startq EXCEPT ![s] = {}]
+          /\ kept' = [kept EXCEPT ![s] = IF Bug = "close_leaves_kept" THEN @ ELSE {}]
           /\ unread' = [unread EXCEPT ![s] = {}]
           /\ dropped' = dropped \cup lost
           /\ toldDropped' = toldDropped \cup counted
+          /\ stoppedQ' = stoppedQ \cup lost
           /\ last' = Event("close", s, NoMsg, "closed", Cardinality(counted))
 
 Exec ==
@@ -374,24 +433,32 @@ Exec ==
 \* The user stops the subagent's turn on its screen; fx drops main's
 \* messages in its queue and tells main how many (noteUserStop).
 UserStop(s) ==
-    /\ phase[s] = "running"
+    LET waiting == Range(waitq[s])
+        \* fx before the user's stop counted what the slot kept.
+        keptCounted == IF phase[s] = "ended" /\ Bug # "user_ended_uncounted" THEN kept[s] ELSE {}
+        counted == waiting \cup unread[s] \cup keptCounted
+    IN
+    /\ phase[s] \in {"running", "ended"}
     /\ stops < MaxStops
-    /\ phase' = [phase EXCEPT ![s] = "ending_user"]
+    /\ phase' = [phase EXCEPT ![s] = IF @ = "running" THEN "ending_user" ELSE @]
     /\ waitq' = [waitq EXCEPT ![s] = <<>>]
-    /\ dropped' = dropped \cup Range(waitq[s])
-    /\ toldDropped' = toldDropped \cup Range(waitq[s]) \cup unread[s]
+    /\ kept' = [kept EXCEPT ![s] = {}]
+    /\ dropped' = dropped \cup waiting \cup kept[s]
+    /\ toldDropped' = toldDropped \cup counted
+    /\ stoppedQ' = stoppedQ \cup waiting \cup unread[s] \cup kept[s]
     /\ stops' = stops + 1
-    /\ last' = Event("user_stop", s, NoMsg, "stopped",
-                     Cardinality(Range(waitq[s]) \cup unread[s]))
-    /\ UNCHANGED <<unread, read, told, sent, steps, step, covered, refusedOpen, coverBroken, lateStart>>
+    /\ last' = Event("user_stop", s, NoMsg, "stopped", Cardinality(counted))
+    /\ UNCHANGED <<unread, read, told, sent, steps, step, covered, refusedOpen, coverBroken, lateStart, startq>>
     /\ UNCHANGED idleVars
 
 \* A starting turn's worker begins: it takes messages from now on.
 Begin(s) ==
     /\ phase[s] = "starting"
     /\ phase' = [phase EXCEPT ![s] = "running"]
+    /\ read' = read \cup startq[s]
+    /\ startq' = [startq EXCEPT ![s] = {}]
     /\ last' = Event("begin", s, NoMsg, "none", 0)
-    /\ UNCHANGED <<unread, waitq, read, dropped, toldDropped, told, sent, stops, steps,
+    /\ UNCHANGED <<unread, waitq, kept, dropped, stoppedQ, toldDropped, told, sent, stops, steps,
                    step, covered, refusedOpen, coverBroken, lateStart>>
     /\ UNCHANGED idleVars
 
@@ -405,6 +472,7 @@ Read(s) ==
     /\ last' = Event("read", s, NoMsg, "none", Cardinality(unread[s]))
     /\ UNCHANGED <<phase, waitq, dropped, toldDropped, told, sent, stops, steps,
                    step, covered, refusedOpen, coverBroken, lateStart>>
+    /\ UNCHANGED heldVars
     /\ UNCHANGED idleVars
 
 \* What fx tells main when `s`'s work ends: no report when main stopped or
@@ -416,7 +484,7 @@ EndNote(s, reports) ==
       [] Bug = "before_idle" -> "plain"
       \* Decided after the next turn took the waiting messages.
       [] Bug = "note_after_take" -> "idle"
-      [] OTHER -> IF waitq[s] = <<>> THEN "idle" ELSE "plain"
+      [] OTHER -> IF waitq[s] = <<>> /\ kept[s] = {} THEN "idle" ELSE "plain"
 
 \* Sets the note of `s`'s end, which goes to `after`, and whether it was
 \* wrong: a report must say idle exactly when the end leaves `s` idle.
@@ -434,14 +502,14 @@ FinishWith(s, gap) ==
     /\ unread[s] = {}
     /\ IF waitq[s] = <<>>
        THEN /\ phase' = [phase EXCEPT ![s] = IF gap THEN "gap_idle" ELSE "idle"]
-            /\ UNCHANGED <<read, waitq>>
-       ELSE /\ read' = read \cup Range(waitq[s])
+            /\ UNCHANGED <<waitq, startq>>
+       ELSE /\ startq' = [startq EXCEPT ![s] = Range(waitq[s])]
             /\ waitq' = [waitq EXCEPT ![s] = <<>>]
             /\ phase' = [phase EXCEPT ![s] = IF gap THEN "gap_next" ELSE "starting"]
     /\ last' = Event("finish", s, NoMsg, "none", 0)
     \* A turn that ended on its own reports to main.
     /\ Noted(s, TRUE, Plain(phase'[s]))
-    /\ UNCHANGED <<unread, dropped, toldDropped, told, sent, stops, steps, step,
+    /\ UNCHANGED <<unread, kept, read, dropped, stoppedQ, toldDropped, told, sent, stops, steps, step,
                    covered, refusedOpen, coverBroken, lateStart>>
 
 Finish(s) == FinishWith(s, FALSE)
@@ -455,6 +523,7 @@ Publish(s) ==
     /\ last' = Event("publish", s, NoMsg, "none", 0)
     /\ UNCHANGED <<unread, waitq, read, dropped, toldDropped, told, sent, stops, steps,
                    step, covered, refusedOpen, coverBroken, lateStart>>
+    /\ UNCHANGED heldVars
     /\ UNCHANGED idleVars
 
 \* The stopped turn ends: its unread messages go, and the waiting ones start
@@ -468,28 +537,60 @@ EndStoppedWith(s, gap) ==
        THEN /\ dropped' = dropped \cup unread[s] \cup Range(waitq[s])
             /\ waitq' = [waitq EXCEPT ![s] = <<>>]
             /\ phase' = [phase EXCEPT ![s] = "idle"]
-            /\ UNCHANGED read
+            /\ UNCHANGED startq
        ELSE IF phase[s] = "closing"
        THEN /\ dropped' = dropped \cup unread[s] \cup Range(waitq[s])
             /\ waitq' = [waitq EXCEPT ![s] = <<>>]
             /\ phase' = [phase EXCEPT ![s] = "writing"]
-            /\ UNCHANGED read
+            /\ UNCHANGED startq
        ELSE /\ dropped' = dropped \cup unread[s]
             /\ IF waitq[s] = <<>>
                THEN /\ phase' = [phase EXCEPT ![s] = IF gap THEN "gap_idle" ELSE "idle"]
-                    /\ UNCHANGED <<read, waitq>>
-               ELSE /\ read' = read \cup Range(waitq[s])
+                    /\ UNCHANGED <<waitq, startq>>
+               ELSE /\ startq' = [startq EXCEPT ![s] = Range(waitq[s])]
                     /\ waitq' = [waitq EXCEPT ![s] = <<>>]
                     /\ phase' = [phase EXCEPT ![s] = IF gap THEN "gap_next" ELSE "starting"]
     /\ last' = Event("end", s, NoMsg, "none", Cardinality(Range(waitq[s])))
     \* Only a turn the user stopped reports; main's own stop or close
     \* already answered.
     /\ Noted(s, phase[s] = "ending_user", Plain(phase'[s]))
-    /\ UNCHANGED <<toldDropped, told, sent, stops, steps, step, covered,
+    /\ UNCHANGED <<toldDropped, stoppedQ, kept, read, told, sent, stops, steps, step, covered,
                    refusedOpen, coverBroken, lateStart>>
 
 EndStopped(s) == EndStoppedWith(s, FALSE)
 EndStoppedInGap(s) == EndStoppedWith(s, TRUE)
+
+\* The running turn ends without reading what joined it, as a failed or
+\* cancelled request ends it. Its slot keeps those messages (`keepLeftovers`)
+\* until the end hook queues them. A stop or close that lands now must count
+\* them and drop them: main has been told they joined a turn.
+Fail(s) ==
+    /\ phase[s] = "running"
+    /\ unread[s] # {}
+    /\ phase' = [phase EXCEPT ![s] = "ended"]
+    /\ kept' = [kept EXCEPT ![s] = unread[s]]
+    /\ unread' = [unread EXCEPT ![s] = {}]
+    /\ last' = Event("fail", s, NoMsg, "none", 0)
+    /\ UNCHANGED <<waitq, startq, stoppedQ, read, dropped, toldDropped, told, sent, stops, steps,
+                   step, covered, refusedOpen, coverBroken, lateStart>>
+    /\ UNCHANGED idleVars
+
+\* The end hook of an ended turn queues the kept messages ahead of the
+\* waiting ones as the next work (`queueLeftoversLocked`, once
+\* `handOverLeftovers` allowed it), and the host chooses it: the gap, where
+\* the slot has not begun its turn. The turn failed, so it reports. Nothing
+\* to queue leaves the subagent idle.
+Hook(s) ==
+    /\ phase[s] = "ended"
+    /\ LET queued == kept[s] \cup Range(waitq[s])
+       IN /\ startq' = [startq EXCEPT ![s] = queued]
+          /\ phase' = [phase EXCEPT ![s] = IF queued = {} THEN "gap_idle" ELSE "gap_next"]
+    /\ kept' = [kept EXCEPT ![s] = {}]
+    /\ waitq' = [waitq EXCEPT ![s] = <<>>]
+    /\ last' = Event("hook", s, NoMsg, "none", 0)
+    /\ Noted(s, TRUE, Plain(phase'[s]))
+    /\ UNCHANGED <<unread, read, dropped, stoppedQ, toldDropped, told, sent, stops, steps, step,
+                   covered, refusedOpen, coverBroken, lateStart>>
 
 \* A closed subagent's close is written once nothing of it runs: the registry
 \* drops it, and a new one may take the name (Runtime.settleClose).
@@ -499,6 +600,7 @@ WriteClose(s) ==
     /\ last' = Event("write_close", s, NoMsg, "none", 0)
     /\ UNCHANGED <<unread, waitq, read, dropped, toldDropped, told, sent, stops, steps,
                    step, covered, refusedOpen, coverBroken, lateStart>>
+    /\ UNCHANGED heldVars
     /\ UNCHANGED idleVars
 
 Next ==
@@ -506,6 +608,7 @@ Next ==
     \/ Exec
     \/ \E s \in Subs : UserStop(s) \/ Begin(s) \/ Read(s) \/ Finish(s) \/ EndStopped(s)
                        \/ WriteClose(s) \/ FinishInGap(s) \/ EndStoppedInGap(s) \/ Publish(s)
+    \/ \E s \in Subs : Fail(s) \/ Hook(s)
 
 Spec == Init /\ [][Next]_vars
 
@@ -513,9 +616,12 @@ Spec == Init /\ [][Next]_vars
 (* The rules.                                                               *)
 
 TypeOK ==
-    /\ phase \in [Subs -> Phases]
+    /\ phase \in [Subs -> AllPhases]
     /\ unread \in [Subs -> SUBSET Msgs]
     /\ \A s \in Subs : Range(waitq[s]) \subseteq Msgs
+    /\ startq \in [Subs -> SUBSET Msgs]
+    /\ kept \in [Subs -> SUBSET Msgs]
+    /\ stoppedQ \subseteq Msgs
     /\ read \subseteq Msgs
     /\ dropped \subseteq Msgs
     /\ toldDropped \subseteq Msgs
@@ -524,7 +630,7 @@ TypeOK ==
     /\ refusedOpen \subseteq Msgs
     /\ coverBroken \in BOOLEAN
     /\ lateStart \subseteq Msgs
-    /\ last.op \in Ops
+    /\ last.op \in AllOps
     /\ note \in Notes
     /\ named \subseteq Subs
     /\ noteWrong \in BOOLEAN
@@ -547,6 +653,17 @@ StopRunsFirst == ~coverBroken
 \* and with it the refusal, until the close is written.
 ClosingHoldsNothing ==
     \A s \in Subs : Marked(s) => waitq[s] = <<>> /\ unread[s] = {}
+
+\* A message queued, kept or unread when a stop or close of its subagent
+\* answered is never read: the stop holds across the end hook, which queues
+\* the kept messages, and across the choice of the next work.
+StopHoldsForQueued == stoppedQ \cap read = {}
+
+\* Nor does a subagent that is being closed hold a message its slot kept from a
+\* turn that ended without reading it, or one the next work carries: the close
+\* drops and counts them (`Owner.takeDropped`, `Owner.stop`).
+ClosingHoldsNoKept ==
+    \A s \in Subs : Marked(s) => startq[s] = {} /\ kept[s] = {}
 
 \* A stop or close that answers it ended the subagent's turn, or closed the
 \* subagent, leaves it ending, closing or gone: never running on in the gap
