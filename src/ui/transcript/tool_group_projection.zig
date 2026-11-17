@@ -384,6 +384,51 @@ fn normalizeCanonicalStatus(
     return if (phrase.len == 0) null else phrase;
 }
 
+/// The cancellation notice of a cancelled shell command's status line `raw`,
+/// such as `▪ Cancelled touch .ready && sleep 60 · What can fx do
+/// differently?`, with no command: `▪ Cancelled · What can fx do
+/// differently?`, the notice a cancelled turn shows. The row above names the
+/// command by its short form and Ctrl+O by its full line, so the notice
+/// repeats neither. The line keeps its styles. Null when `raw` doesn't read
+/// `Cancelled …` after its mark.
+fn cancelledCommandNotice(scratch: std.mem.Allocator, raw: []const u8) !?[]const u8 {
+    var index: usize = 0;
+    while (skipSgrSequence(raw, &index)) {}
+    const marker = for (status_markers) |candidate| {
+        if (std.mem.startsWith(u8, raw[index..], candidate)) break candidate;
+    } else return null;
+    index += marker.len;
+    while (true) {
+        if (skipSgrSequence(raw, &index)) continue;
+        if (index < raw.len and raw[index] == ' ') {
+            index += 1;
+            continue;
+        }
+        break;
+    }
+    const label = "Cancelled";
+    if (!std.mem.startsWith(u8, raw[index..], label)) return null;
+    const kept_end = index + label.len;
+    // The command ends at the follow-up, or at the line's end on a line
+    // saved without one.
+    const tail_at = std.mem.findLast(u8, raw[kept_end..], cancellation_follow_up) orelse
+        std.mem.trimEnd(u8, raw[kept_end..], "\r\n").len;
+    var out: std.Io.Writer.Allocating = .init(scratch);
+    errdefer out.deinit();
+    try out.writer.writeAll(raw[0..kept_end]);
+    // The command's text goes, and its style codes stay, so every style the
+    // line opens still closes.
+    var cursor = kept_end;
+    while (cursor < kept_end + tail_at) {
+        const start = cursor;
+        if (skipSgrSequence(raw, &cursor)) {
+            try out.writer.writeAll(raw[start..cursor]);
+        } else cursor += 1;
+    }
+    try out.writer.writeAll(raw[kept_end + tail_at ..]);
+    return try out.toOwnedSlice();
+}
+
 // `■` is the cancelled marker older sessions recorded before `▪`.
 const status_markers = [_][]const u8{ "●", "▪", "■", "⊘", "↻" };
 
@@ -2781,7 +2826,12 @@ fn writeGroupBlock(
         const detail = detailForEntry(details, detail_indices, entry_id, null) orelse continue;
         if (detail.outcome != .cancelled) continue;
 
-        const terminal = try transcript_blocks.renderEntryToBlock(scratch, entry, cols, styles);
+        // A cancelled command's notice names no command; its row does.
+        var shown = entry;
+        if (isShellCommandCall(scratch, detail)) {
+            if (try cancelledCommandNotice(scratch, entry.raw_bytes.bytes)) |notice| shown.raw_bytes.bytes = notice;
+        }
+        const terminal = try transcript_blocks.renderEntryToBlock(scratch, shown, cols, styles);
         if (terminal.bytes.len > 0) {
             try lines.append(alloc, .block_separator);
             const count = std.mem.count(u8, std.mem.trimEnd(u8, terminal.bytes, "\n"), "\n") + 1;
@@ -5985,11 +6035,71 @@ test "a cancelled call is its group's header above the cancellation block" {
     defer projection.deinit(alloc);
 
     try std.testing.expect(projection.entry_actions.items[0] == .override);
+    // The row names the command; the notice under it doesn't.
     try std.testing.expectEqualStrings(
         "● Cancelled \x1b[38;5;252msleep\x1b[39m 30\n\n" ++
-            "▪ Cancelled sleep 30 · What can fx do differently?",
+            "▪ Cancelled · What can fx do differently?",
         projection.entry_actions.items[0].override.bytes,
     );
+
+    // The full transcript still names the command.
+    var expanded = try buildExpandedStyledInterruptible(alloc, &entries, &details, 120, null);
+    defer expanded.deinit(alloc);
+    try std.testing.expect(std.mem.find(u8, expanded.entry_actions.items[0].override.bytes, "sleep") != null);
+}
+
+test "a cancelled command's notice drops only the command and keeps the line's styles" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const warn = ui_render.warning_style;
+    const reset = ui_render.reset_style;
+    const hint = ui_render.hint_style;
+    const follow_up = " · What can fx do differently?\n";
+
+    // The line a cancelled terminal writes, and the turn's own notice.
+    try std.testing.expectEqualStrings(
+        try std.mem.concat(a, u8, &.{ warn, "▪", reset, " ", hint, "Cancelled", reset, follow_up }),
+        (try cancelledCommandNotice(a, try std.mem.concat(a, u8, &.{ warn, "▪", reset, " ", hint, "Cancelled touch .ready && sleep 60", reset, follow_up }))).?,
+    );
+    // A summary with styles of its own keeps them, with no text between.
+    try std.testing.expectEqualStrings(
+        try std.mem.concat(a, u8, &.{ warn, "▪", reset, hint, " Cancelled\x1b[0m\x1b[38;5;245m\x1b[0m", reset, follow_up }),
+        (try cancelledCommandNotice(a, try std.mem.concat(a, u8, &.{ warn, "▪", reset, hint, " Cancelled\x1b[0m \x1b[38;5;245msleep 30\x1b[0m", reset, follow_up }))).?,
+    );
+    // A line already without a command, and one an older fx saved with no
+    // follow-up.
+    try std.testing.expectEqualStrings("▪ Cancelled · What can fx do differently?", (try cancelledCommandNotice(a, "▪ Cancelled · What can fx do differently?")).?);
+    try std.testing.expectEqualStrings("■ Cancelled\n", (try cancelledCommandNotice(a, "■ Cancelled sleep 30\n")).?);
+    // A line that doesn't read `Cancelled …` after its mark stays as it is.
+    try std.testing.expect(try cancelledCommandNotice(a, "▪ Stopped sleep 30") == null);
+    try std.testing.expect(try cancelledCommandNotice(a, "cancelled") == null);
+}
+
+test "only a cancelled command's notice leaves out its text, in a group with an MCP call" {
+    const alloc = std.testing.allocator;
+    const command = "fx mcp call mcp_fixture_echo '{\\\"text\\\":\\\"hello\\\"}' > out.txt; wc -c < out.txt";
+    const entries = [_]TranscriptEntry{
+        .{ .raw_bytes = .{ .id = 1, .bytes = "▪ Cancelled fx mcp call mcp_fixture_echo '{\"text\":\"hello\"}' > out.txt; wc -c < out.txt · What can fx do differently?", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 2, .bytes = "▪ Cancelled mcp_fixture_echo · What can fx do differently?", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 3, .bytes = "▪ Cancelled sleep 30 · What can fx do differently?", .class = .tool_status } },
+    };
+    const details = [_]ToolDetailRecord{
+        .{ .entry_id = 1, .tool_name = @constCast("shell"), .activity_kind = .command, .arguments_json = @constCast("{\"command\":\"" ++ command ++ "\"}"), .outcome = .cancelled },
+        .{ .entry_id = 2, .tool_name = @constCast("mcp_fixture_echo"), .activity_kind = .mcp, .outcome = .cancelled },
+        .{ .entry_id = 3, .tool_name = @constCast("shell"), .activity_kind = .command, .arguments_json = @constCast("{\"command\":\"sleep 30\"}"), .outcome = .cancelled },
+    };
+    var projection = try buildStyled(alloc, &entries, &details, 160, .{}, .{});
+    defer projection.deinit(alloc);
+    const bytes = projection.entry_actions.items[0].override.bytes;
+
+    // Each command's notice names no command, and the MCP call's names its
+    // tool, as before.
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, bytes, "\n\n▪ Cancelled · What can fx do differently?"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, bytes, "\n\n▪ Cancelled mcp_fixture_echo · What can fx do differently?"));
+    try std.testing.expect(std.mem.find(u8, bytes, "> out.txt") == null);
+    try std.testing.expect(std.mem.find(u8, bytes, "Cancelled sleep 30 ·") == null);
 }
 
 test "a cancelled call clips its header to one row" {
