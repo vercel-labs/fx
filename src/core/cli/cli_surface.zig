@@ -3693,7 +3693,17 @@ fn runSessionRecovery(alloc: Allocator, deps: RunDeps, recovery: SessionRecovery
     };
     defer store.deinit(alloc);
     var recovered = session_adapter.recover(&store, alloc, recovery.session_id) catch |err| {
-        try writeLookupFailure(alloc, deps, "session", session_adapter.commandError(err), recovery.format);
+        const failure = session_adapter.commandError(err);
+        // A v1 folder others can write: the reason names it and its fix (D61).
+        if (failure == error.DurablePathUnsafe and store.problem.len > 0) {
+            const message = try alloc.print("session {s} can't be recovered safely: {s}", .{ recovery.session_id, store.problem.text() });
+            defer alloc.free(message);
+            if (recovery.format == .json) {
+                try writeJsonCommandFailure(alloc, deps, "session", failure, message);
+            } else try writeStderrLine(alloc, deps, "fx session: {s}\n", message);
+            return .handled_failure;
+        }
+        try writeLookupFailure(alloc, deps, "session", failure, recovery.format);
         return .handled_failure;
     };
     defer recovered.deinit(alloc);
@@ -3807,6 +3817,11 @@ fn writeSessionDetailFailure(
             "session {s} uses an unsupported session version",
             .{session_id},
         ),
+        // A v1 folder others can write: the reason names it and its fix (D61).
+        error.DurablePathUnsafe => if (reason.len > 0) try alloc.print(
+            "session {s} can't be read safely: {s}",
+            .{ session_id, reason },
+        ) else return writeLookupFailure(alloc, deps, "session", err, format),
         else => return writeLookupFailure(
             alloc,
             deps,

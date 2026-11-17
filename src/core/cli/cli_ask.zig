@@ -995,6 +995,8 @@ const AskContext = struct {
                 if (store.conversionProblem()) |problem| {
                     self.writeStderr("fx ask: the session can't be converted: ") catch {};
                     self.writeLine(problem) catch {};
+                    // Said in full: the caller adds no second line for it.
+                    if (err == error.InvalidSessionFormat) return error.SessionConversionRefused;
                 }
                 return err;
             }
@@ -1389,6 +1391,14 @@ fn runWithDeps(alloc: Allocator, args: []const [:0]const u8, cfg: Config, deps: 
     }) catch |err| {
         if (interrupt_scope.requested()) return headless_interrupt.exitCode();
         if (err == error.OutOfMemory) return err;
+        // The reason is on stderr already; JSON keeps the code it always had.
+        if (err == error.SessionConversionRefused) {
+            if (!options.json_output) return 1;
+            const json = try renderErrorJsonResult(alloc, @errorName(error.InvalidSessionFormat), 1);
+            defer alloc.free(json);
+            try deps.write_stdout(deps.stdout_ctx, json);
+            return 1;
+        }
         if (err == error.OneOffSessionNotResumable and !options.json_output) {
             try deps.write_stderr(
                 deps.stderr_ctx,
