@@ -990,6 +990,37 @@ describe("MCP login", () => {
     expect(auth.authorizationRequests).toBe(0);
   }, 45_000);
 
+  // A deny rule names the tool, but the server's list is not loaded until the
+  // user signs in, so open answers why, in the same words in every mode: full
+  // access ignores the rule and the login text is not a rule's doing.
+  test("a tool of a server that needs a login says so in the same words in full access and in auto, with a deny rule on it", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    auth = startAuthFixture(upstream.url);
+    const root = createRoot(auth);
+    const settingsPath = join(root.home, ".fx", "settings.json");
+    const settings = JSON.parse(readFileSync(settingsPath, "utf8"));
+    writeFileSync(settingsPath, JSON.stringify({ ...settings, permission: { [TOOL_NAME]: "deny" } }));
+    const told: Record<string, string> = {};
+    for (const mode of ["--auto", "--full-access"]) {
+      gateway = startFakeGateway([
+        fakeGatewayToolCall("open_login", "toolbox", { open: TOOL_NAME }),
+        fakeGatewayFinalText("Sign in first."),
+      ], { models: [{ id: MODEL, type: "language", tags: ["tool-use"] }] });
+      const result = await runFx(["ask", "--json", mode, "--no-save", "Open the protected tool."], {
+        cwd: root.workspace,
+        env: { ...v2Env(root), FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl },
+        timeoutMs: 20_000,
+      });
+      expect(result.code).toBe(0);
+      told[mode] = toolResultText(gateway.requests[1]?.body ?? "", "open_login", "error-text");
+      gateway.stop();
+      gateway = null;
+    }
+    expect(told["--auto"]).toContain("needs a login");
+    expect(told["--full-access"]).toBe(told["--auto"]);
+    expect(auth.authorizationRequests).toBe(0);
+  }, 60_000);
+
   test.skipIf(!tmuxAvailable())("the shell tells the model the user signs in with /mcp login", async () => {
     upstream = startModernMcpHttpFixture("json");
     auth = startAuthFixture(upstream.url);
@@ -1233,11 +1264,11 @@ describe("MCP login", () => {
     expect(await statusOf(root)).not.toBe("signed_in");
   }, 30_000);
 
-  // ---- A server that refuses a login says so (the ClickState report) ----
+  // ---- A server that refuses a login says so ----
   //
-  // The server answers every request that carries fx's token with 401 invalid_token. fx
-  // used to print "Signed in" after the token exchange, and later show only "needs
-  // login" with no error, so the person signed in again and again.
+  // The server answers every request that carries fx's token with 401 invalid_token. The
+  // sign-in then ends with the server's own words and saves nothing, so the person can tell
+  // that the server refused the token, instead of finding only "needs login" later.
   const REFUSAL = { error: "invalid_token", description: "No authorization provided" };
   // The server's own words go in quotes inside fx's sentence, so they can't close it.
   const REFUSED_NEW = 'fixture refused the new login (invalid_token: "No authorization provided")';

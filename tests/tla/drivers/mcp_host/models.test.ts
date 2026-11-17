@@ -16,10 +16,10 @@ test("TLC: every model's smoke and stress pass, every planted bug is caught, sta
   save(join(artifacts, "gate-summary.json"), results.map(({ module, label, kind, verdict, expected, distinct, exit }) => ({ module, label, kind, verdict, expected, distinct, exit })));
   expect(results.filter((r) => r.verdict === "FAIL").map((r) => r.label)).toEqual([]);
   const count = (kind: string, verdict: string) => results.filter((r) => r.kind === kind && r.verdict === verdict).length;
-  // SharedLogins, SubagentAccess, UrlRetry, MixedBuilds, StoreLockBudget and
-  // RefreshLease joined the four.
-  expect(count("smoke", "PASS")).toBe(10);
-  expect(count("stress", "PASS")).toBe(10);
+  // SharedLogins, SubagentAccess, UrlRetry, MixedBuilds, StoreLockBudget,
+  // RefreshLease and McpRules joined the four.
+  expect(count("smoke", "PASS")).toBe(11);
+  expect(count("stress", "PASS")).toBe(11);
   expect(count("mutant", "CAUGHT")).toBe(results.filter((r) => r.kind === "mutant").length);
   // Credentials' two findings and its repair witness became the code.
   // HostLifecycle's OneProcessPerServer did too: it
@@ -30,12 +30,15 @@ test("TLC: every model's smoke and stress pass, every planted bug is caught, sta
   // IndicatorClears. UrlRetry's finding is the code before the held call:
   // it ended the call at the -32042 error. HostLifecycle's AtMostOneOwner
   // became the code once a reload kept its host: its smoke and stress
-  // configs check it. SignIn's five findings are fx before the check request
+  // configs check it. McpRules' three are the code before the fix (each MCP
+  // path picked its rule set on its own, so in full access toolbox search and the
+  // open of a small server ignored deny rules, and every other MCP path still
+  // applied them). SignIn's five findings are fx before the check request
   // (a login reported as signed in before the server took it, a refused login
   // saved, a refused login another fx takes), the branch for an unreadable
   // store answering a sign-in's check request first, and a failed refresh after a
   // 401 read as a check that couldn't be made; its repair witness is the code.
-  expect(count("finding", "FINDING")).toBe(7);
+  expect(count("finding", "FINDING")).toBe(10);
   expect(count("repair", "PASS")).toBe(2);
 }, 1_800_000);
 
@@ -134,6 +137,22 @@ const controls: { name: string; module: string; constants: Record<string, never>
       { event: "run", data: { cmd: "signin" } }, { event: "observe", data: { v2kind: "v2", v2: true, v3: false } },
     ],
     badAt: 2,
+  },
+  {
+    name: "MCP rules", module: "McpRules",
+    constants: { ObsTools: ["a", "b"], ObsOwnRules: [] },
+    good: [
+      { event: "init", data: { mode: "full", childMode: "full", denied: ["a"], view: ["a", "b"] } },
+      { event: "ask", data: { path: "run", agent: "main", tool: "a", answer: "shown" } },
+      { event: "mode", data: { mode: "auto" } },
+      { event: "ask", data: { path: "run", agent: "main", tool: "a", answer: "hidden" } },
+    ],
+    // A tool a rule names, hidden on one path in full access.
+    bad: [
+      { event: "init", data: { mode: "full", childMode: "full", denied: ["a"], view: ["a", "b"] } },
+      { event: "ask", data: { path: "open_tool", agent: "main", tool: "a", answer: "hidden" } },
+    ],
+    badAt: 1,
   },
 ];
 

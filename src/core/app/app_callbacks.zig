@@ -451,6 +451,14 @@ pub fn Bindings(comptime App: type) type {
             )) orelse return null;
             var owns_refreshed = true;
             defer if (owns_refreshed) refreshed.deinit(std.heap.c_allocator);
+            // This session's own sign-in saved this login before its team is
+            // chosen; that sign-in continues the request with the team.
+            if (comptime @hasField(@TypeOf(app.auth), "sign_in_flow")) {
+                if (mode == .stored and app.auth.sign_in_flow.savedToken(refreshed.token)) {
+                    debug_trace.logf("auth", "stored login skipped source={t} reason=saved_by_this_session", .{source});
+                    return null;
+                }
+            }
             if (app.auth.preparedCredentialChange(refreshed) == .authority) {
                 return error.CredentialAuthorityChanged;
             }
@@ -997,7 +1005,9 @@ pub fn Bindings(comptime App: type) type {
         fn agentSnapshotMcpDefinition(ctx: *anyopaque, arena: Allocator, name: []const u8, known: tool_mcp_runtime.Binding) !tool_mcp_runtime.DefinitionSnapshot {
             const agent: *AppAgent = @ptrCast(@alignCast(ctx));
             const app = appOf(agent);
-            if (comptime @hasDecl(App, "snapshotMcpDefinition")) return app.snapshotMcpDefinition(arena, name, known);
+            if (comptime @hasDecl(App, "snapshotMcpDefinition")) {
+                return app.snapshotMcpDefinition(arena, name, known, app_permission_runtime.Runtime(App).livePermissionSnapshot(app, agent).mode);
+            }
             return .unavailable;
         }
 
