@@ -103,7 +103,7 @@ test "token pass team: marks answer until AI Gateway does, and an answer from th
     var entries = [_]model_catalog.ModelCatalogEntry{
         .{ .id = @constCast("zai/glm-5.3"), .model_type = @constCast("language"), .token_pass = true },
         .{ .id = @constCast("acme/new-pass-model"), .model_type = @constCast("language"), .token_pass = true },
-        .{ .id = @constCast("openai/gpt-6"), .model_type = @constCast("language") },
+        .{ .id = @constCast("openai/gpt-6-sol"), .model_type = @constCast("language") },
     };
 
     // A saved "no pass" from an earlier run gives way to this run's marks.
@@ -112,7 +112,7 @@ test "token pass team: marks answer until AI Gateway does, and an answer from th
     try std.testing.expect(catalogAnswers());
     try std.testing.expect(paysFor("zai/glm-5.3"));
     try std.testing.expect(paysFor("acme/new-pass-model"));
-    try std.testing.expect(!paysFor("openai/gpt-6"));
+    try std.testing.expect(!paysFor("openai/gpt-6-sol"));
 
     // AI Gateway saying "no pass" in this run wins over the marks, which then
     // only name the models.

@@ -19,6 +19,7 @@ const session_codec = @import("../session/session_codec.zig");
 const session_store = @import("../session/session_store.zig");
 const worker_runtime = @import("../agent/worker_runtime.zig");
 const types = @import("../shared/types.zig");
+const text_utils = @import("../shared/text_utils.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -1146,6 +1147,7 @@ fn runOne(slot: *Slot) OneOutcome {
     turn.approval_registry = owner.approvals;
     turn.child_id = slot.child_id;
     turn.child_name = if (snapshot.name.len > 0) snapshot.name else null;
+    turn.child_purpose = if (snapshot.purpose.len > 0) snapshot.purpose else null;
     turn.active_work_id = snapshot.active.id;
     turn.phase_context = owner;
     turn.phase_fn = Owner.phaseTransition;
@@ -1182,7 +1184,7 @@ fn runOne(slot: *Slot) OneOutcome {
     }) catch |err| return if (err == error.Cancelled) .{
         .work_id = work_id,
         .outcome = .cancelled,
-    } else failedOutcome(work_id, "admission", err);
+    } else admissionFailure(owner, work_id, slot.child_id, err);
     @import("../shared/debug_trace.zig").logf(
         "subagent",
         "child turn admitted child_id={s} work_id={s} provider={s} model={s} effort={s}",
@@ -1463,11 +1465,14 @@ const RunSnapshot = struct {
     instructions: []u8,
     /// The name the parent gave a persistent child, or empty for a one-off.
     name: []u8,
+    /// What the child is for, or empty when it has none.
+    purpose: []u8,
 
     fn deinit(self: *RunSnapshot, alloc: Allocator) void {
         self.active.deinit(alloc);
         if (self.instructions.len > 0) alloc.free(self.instructions);
         if (self.name.len > 0) alloc.free(self.name);
+        if (self.purpose.len > 0) alloc.free(self.purpose);
         self.* = undefined;
     }
 };
@@ -1490,10 +1495,13 @@ fn loadRunSnapshot(owner: *Owner, child_id: []const u8) !RunSnapshot {
         try owner.alloc.dupe(u8, child.instructions());
     errdefer if (instructions.len > 0) owner.alloc.free(instructions);
     const name: []u8 = if (child.agentName()) |value| try owner.alloc.dupe(u8, value) else &.{};
+    errdefer if (name.len > 0) owner.alloc.free(name);
+    const purpose: []u8 = if (child.purpose) |value| try owner.alloc.dupe(u8, value) else &.{};
     return .{
         .active = owned_active,
         .instructions = instructions,
         .name = name,
+        .purpose = purpose,
     };
 }
 
@@ -1533,12 +1541,72 @@ fn fallbackOutcome(alloc: Allocator, work_id: []const u8, outcome: child_state.O
     };
 }
 
+/// The failure code of a child whose profile could not be loaded. Every later
+/// message to it fails the same way, so a report with this code leaves the
+/// child out of the idle note (`tool_host.zig` `IdleFacts`).
+pub const profile_unavailable_code = "profile_unavailable";
+
+/// What works for a child that cannot load its profile. A profile cannot be
+/// given to a child that exists, so a new one is the only other way. It has no
+/// final period: the report that carries the failure adds one.
+const profile_next_step = "Restore the profile, or close this subagent and start a new one, which loses its conversation";
+
+/// The outcome of a work whose admission could not be captured. When the child's
+/// profile could not be loaded, the failure says so, names the profile, and
+/// says what works; otherwise it names only the stage.
+fn admissionFailure(owner: *Owner, work_id: []u8, child_id: []const u8, err: anyerror) OneOutcome {
+    const found = owner.authority_resolver.profileFailure(owner.alloc, child_id) catch null;
+    const message = found orelse return failedOutcome(work_id, "admission", err);
+    defer owner.alloc.free(message);
+    return .{
+        .work_id = work_id,
+        .outcome = .failed,
+        .failure = profileUnavailableFailure(message),
+    };
+}
+
+/// `profile_unavailable: <reason>; <next step>`, within the bytes a failure
+/// holds. The reason is cut to leave room for the next step, which the parent
+/// needs more.
+fn profileUnavailableFailure(reason: []const u8) types.ModelFailureDiagnostic {
+    var buffer: [types.ModelFailureDiagnostic.max_bytes]u8 = undefined;
+    const room = buffer.len -| profile_unavailable_code.len -| 4 -| profile_next_step.len;
+    const cut = text_utils.utf8PrefixByBytes(reason, room);
+    const why = if (text_utils.isTerminalSafe(cut)) cut else "its profile could not be loaded";
+    const detail = std.mem.print(&buffer, "{s}; {s}", .{ why, profile_next_step }) catch profile_next_step;
+    return execution.failureDiagnosticValue(profile_unavailable_code, detail);
+}
+
 fn failedOutcome(work_id: []u8, stage: []const u8, err: anyerror) OneOutcome {
     return .{
         .work_id = work_id,
         .outcome = .failed,
         .failure = execution.failureDiagnosticValue(stage, @errorName(err)),
     };
+}
+
+test "an admission that failed for the child's profile names the profile, and any other names only its stage" {
+    const alloc = std.testing.allocator;
+    var cache: authority.ProfileCache = .{ .alloc = alloc, .roots = .{ .home = null, .workspace_root = null } };
+    defer cache.deinit();
+    try std.testing.expectError(error.HostAuthorityUnavailable, cache.get("kid", "reviewer", null));
+    var resolver: authority.Resolver = .{ .children = undefined, .host = undefined, .profiles = &cache };
+    var owner = Owner{ .alloc = alloc, .children = undefined, .state_store = undefined, .services = undefined, .authority_resolver = &resolver, .approvals = undefined };
+
+    const named = admissionFailure(&owner, try alloc.dupe(u8, "work-1"), "kid", error.AdmissionFailed);
+    defer named.deinit(alloc);
+    try std.testing.expectEqual(child_state.Outcome.failed, named.outcome);
+    // The reason, then what works, and no period of its own: the report that
+    // carries it adds one.
+    try std.testing.expectEqualStrings(
+        "profile_unavailable: no profile named 'reviewer'. Profiles: agent, main; Restore the profile, or close this subagent and start a new one, which loses its conversation",
+        named.failure.?.view(),
+    );
+    try std.testing.expect(!std.mem.endsWith(u8, named.failure.?.view(), "."));
+
+    const plain = admissionFailure(&owner, try alloc.dupe(u8, "work-2"), "other", error.AdmissionFailed);
+    defer plain.deinit(alloc);
+    try std.testing.expectEqualStrings("admission: AdmissionFailed", plain.failure.?.view());
 }
 
 fn debugFailure(child_id: []const u8, stage: []const u8, err: anyerror) void {
