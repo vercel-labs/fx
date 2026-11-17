@@ -144,7 +144,7 @@ type RootOptions = {
 
 /** A line fx refuses and cannot attach to a call, then what the server does (mcp-legacy-stdio.mjs says). */
 type RefusedCall = {
-  bad?: "utf8_last" | "deep_last" | "garbage" | "cut";
+  bad?: "utf8_last" | "deep_last" | "garbage" | "duplicate_escaped" | "cut";
   then?: "silent" | "exit";
   slowMs?: number;
   progressEveryMs?: number;
@@ -2516,6 +2516,9 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"`,
       ["bytes that are not UTF-8, the id after them", { bad: "utf8_last", then: "silent" }],
       ["JSON nested past the engine's limit, the id last", { bad: "deep_last", then: "silent" }],
       ["a line with no JSON in it", { bad: "garbage", then: "silent" }],
+      // `responseId` reads the line with the same decoder as the engine, which refuses a repeated name
+      // however it is written, so this line names no call.
+      ["a result written twice, the second time with an escape, the id first", { bad: "duplicate_escaped", then: "silent" }],
     ];
     // All of them at once, so the test takes as long as its slowest wait, not their sum.
     const [runs, progress, later] = await Promise.all([

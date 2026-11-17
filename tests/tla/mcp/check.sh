@@ -7,6 +7,17 @@
 #   ./check.sh --model Engine Request
 #   ./check.sh --unit U12
 #
+# A findings config states a rule the code was known to break. It must fail,
+# and the rule it names must be the one that fails. They run after the models
+# whatever the selection, and are listed at the end of this script:
+#
+#   FieldRead.findings          comparing a member's name as written reads a
+#                               name with an escape as absent, while std.json
+#                               reads it once                   AgreeOrRefused
+#   FieldRead.findings.isError  the same, seen as a tool result the server
+#                               marked isError, shown as a success
+#                                                              ReportedAsSaid
+#
 # The trace bridge and the scenarios that run the real code are in
 # ../drivers/mcp/:
 #   bun test ../drivers/mcp/bridge.test.ts
@@ -33,8 +44,11 @@ python3 run.py mutate "$@"
 # WireDepth.findings.cfg models the code before the depth limit on a server's JSON (before this change)
 # and states that every writer can write whatever an entry point accepts, which fails while there is no
 # limit but the engine's.
+# shellcheck source=../lib/tlc.sh
 . ../lib/tlc.sh
 tlc_verdicts <<'EOF_FINDINGS'
 Request Request.findings SoonAfterRefusal
 WireDepth WireDepth.findings NoWriterOverflow
+FieldRead FieldRead.findings AgreeOrRefused
+FieldRead FieldRead.findings.isError ReportedAsSaid
 EOF_FINDINGS
