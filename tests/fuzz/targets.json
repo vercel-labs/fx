@@ -79,6 +79,8 @@
     {"name": "subagent_task_line", "module": "fx", "test": "trace subagent records stay valid JSON lines and never show part of a planted secret for fuzzed text", "iterations": 1200},
     {"name": "session_records_listing", "module": "fx", "test": "fuzzed puts and writes list each compactor record once (D50)", "iterations": 2000},
     {"name": "subagent_parallel_groups", "module": "fx", "test": "fuzzed subagent calls never run two calls to one subagent at once", "iterations": 2000},
+    {"name": "capture_retention_parse", "module": "fx", "test": "capture retention reads back every ref line and usage it accepts on fuzzed bytes", "iterations": 3000000},
+    {"name": "safe_git_output", "module": "fx", "test": "safe git parses fuzzed index listings and version lines without inventing entries", "iterations": 1500000},
     {"name": "mcp_call_error_text", "module": "fx", "test": "a reply's text reaches stderr terminal-safe whatever bytes the server sends", "iterations": 150000},
     {"name": "unsupported_tool_name", "module": "fx", "test": "an unsupported tool's name stays one run of visible text whatever bytes the model sends", "iterations": 300000},
     {"name": "network_error_message", "module": "fx", "test": "fuzzed gateway error messages stay one bounded line of UTF-8", "iterations": 2000000},
