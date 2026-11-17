@@ -153,16 +153,21 @@ function responsesText(text: string): Response {
   );
 }
 
+/** "drop" leaves a held model request without an answer. */
+export type SharedHoldResult = void | "drop";
+
 /**
  * One shared login's world: the saved login in `home`, the issuer, and the
  * model endpoint. `hold(label, attempt)` is awaited before the model endpoint
  * answers request `attempt` (0 for the first) of the process named `label`.
+ * A hold that returns "drop" stands for an fx killed while it waited: the
+ * endpoint records no answer for that request.
  */
 export function startSharedLoginWorld(opts: {
   home: string;
   provider?: SharedProvider;
   issuer?: IssuerOptions;
-  hold?: (label: string, attempt: number) => Promise<void> | void;
+  hold?: (label: string, attempt: number) => Promise<SharedHoldResult> | SharedHoldResult;
 }) {
   const { home } = opts;
   const provider = opts.provider ?? "fx";
@@ -237,7 +242,12 @@ export function startSharedLoginWorld(opts: {
     const attempt = attempts.get(label) ?? 0;
     attempts.set(label, attempt + 1);
     events.push({ event: "send", data: { p: label, tok } });
-    await opts.hold?.(label, attempt);
+    if ((await opts.hold?.(label, attempt)) === "drop") {
+      // Its fx is gone, so nothing reads this response. Ending the request
+      // this way, not by throwing, leaves the server no error to report into
+      // whichever test is running.
+      return new Response(null, { status: 503 });
+    }
     const ok = accepts(tok);
     events.push({ event: "answer", data: { p: label, tok, ok } });
     if (ok) return provider === "fx" ? fakeGatewayFinalText(sharedAskAnswer(label)) : responsesText(sharedAskAnswer(label));

@@ -11,6 +11,7 @@ const chat_completions_protocol = @import("chat_completions_protocol.zig");
 const responses_protocol = @import("responses_protocol.zig");
 const sse_stream = @import("sse.zig");
 const model_tool_schema = @import("../core/tooling/model_tool_schema.zig");
+const provider_set = @import("../core/gateway/provider_set.zig");
 
 const Allocator = std.mem.Allocator;
 const endpoint = "https://chatgpt.com/backend-api/codex/responses";
@@ -47,6 +48,11 @@ fn validateModel(model: []const u8) !void {
         if (byte <= 0x20 or byte == 0x7f) return error.InvalidOpenAICodexModel;
     }
 }
+
+/// The capabilities every Codex provider bundle declares, in the CLI and in
+/// libfx. `buildRequest` never writes an output limit, so a resend that only
+/// raises the limit would repeat the request.
+pub const bundle_capabilities: provider_set.Bundle.Capabilities = .{ .sends_output_limit = false };
 
 pub fn buildRequest(
     alloc: Allocator,

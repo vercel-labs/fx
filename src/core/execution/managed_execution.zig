@@ -270,6 +270,10 @@ const Entry = struct {
     /// Serializes joins of `thread`; see `Runtime.joinEntry`.
     join_mutex: std.Io.Mutex = .init,
     published_running: bool = false,
+    /// The turn whose steering returned this command running, if one did.
+    /// An explicit cancel of that turn stops the command
+    /// (`Runtime.takeSteeringDetached`).
+    steering_detached_turn_id: ?u64 = null,
     tombstone_sequence: std.atomic.Value(u32) = .init(0),
     active_operations: usize = 0,
     pending_delete: bool = false,
@@ -1120,6 +1124,59 @@ pub const Runtime = struct {
                 .backend = entry.backend(),
                 .persistence = entry.persistence(),
             });
+        }
+        return result.toOwnedSlice(alloc);
+    }
+
+    /// Records that steering in turn `turn_id` returned the running command
+    /// `execution_id` to the model, so it now runs in the background. A
+    /// later mark replaces an earlier one. A missing or ended command is
+    /// left alone.
+    pub fn markSteeringDetached(
+        self: *Runtime,
+        execution_id: []const u8,
+        turn_id: u64,
+    ) void {
+        const entry = self.acquireEntry(execution_id) orelse return;
+        defer self.releaseEntry(entry);
+        const zio = io_mod.getIo();
+        entry.mutex.lockUncancelable(zio);
+        defer entry.mutex.unlock(zio);
+        if (entry.isTerminal()) return;
+        entry.steering_detached_turn_id = turn_id;
+    }
+
+    /// The ids of the commands steering detached in turn `turn_id` that
+    /// still run, for an explicit cancel of that turn to stop. Their marks
+    /// are cleared, so each id is returned once. Commands the model left in
+    /// the background itself, and those of other turns, are not returned.
+    /// The caller owns the slice and each id.
+    pub fn takeSteeringDetached(
+        self: *Runtime,
+        alloc: Allocator,
+        turn_id: u64,
+    ) Allocator.Error![][]u8 {
+        const zio = io_mod.getIo();
+        self.mutex.lockUncancelable(zio);
+        defer self.mutex.unlock(zio);
+        var result: std.ArrayList([]u8) = .empty;
+        errdefer {
+            for (result.items) |id| alloc.free(id);
+            result.deinit(alloc);
+        }
+        for (self.entries) |candidate| {
+            const entry = candidate orelse continue;
+            entry.mutex.lockUncancelable(zio);
+            defer entry.mutex.unlock(zio);
+            const marked = entry.steering_detached_turn_id orelse continue;
+            if (marked != turn_id) continue;
+            if (entry.isTerminal()) {
+                entry.steering_detached_turn_id = null;
+                continue;
+            }
+            try result.ensureUnusedCapacity(alloc, 1);
+            result.appendAssumeCapacity(try alloc.dupe(u8, entry.execution_id));
+            entry.steering_detached_turn_id = null;
         }
         return result.toOwnedSlice(alloc);
     }
@@ -2096,6 +2153,71 @@ test "a command that ends inside the steering grace returns its result" {
     }
     try std.testing.expect(std.mem.find(u8, started.snapshot.output_delta, "quick") != null);
     try runtime.commitDelivery(started.snapshot.execution_id, started.reservation_id);
+}
+
+test "a cancel takes only the running commands steering detached in its turn" {
+    if (comptime builtin.target.os.tag == .wasi) return;
+    const alloc = std.testing.allocator;
+    var runtime = Runtime.init(alloc);
+    defer runtime.deinit();
+    const ids = [_][]const u8{ "steered-in-7", "steered-in-8", "background", "ended" };
+    for (ids) |id| {
+        var input = StartCapturedInput{
+            .execution_id = id,
+            .command = if (std.mem.eql(u8, id, "ended")) "printf done" else "sleep 30",
+            .cwd = "/tmp",
+            .environment = .legacy,
+            .authority = undefined,
+            .max_output_bytes = 4096,
+            .timeout_ms = 60_000,
+            .command_artifact_dir = null,
+            .yield_time_ms = 0,
+        };
+        input.authority = testAuthority(input);
+        var started = try runtime.startCaptured(alloc, input);
+        defer started.deinit(alloc);
+        try runtime.commitDelivery(started.snapshot.execution_id, started.reservation_id);
+    }
+    var ended = try runtime.wait(alloc, "ended", 10_000, null);
+    defer ended.deinit(alloc);
+    try std.testing.expect(ended.snapshot.state != .running);
+    try runtime.commitDelivery(ended.snapshot.execution_id, ended.reservation_id);
+
+    runtime.markSteeringDetached("steered-in-7", 7);
+    runtime.markSteeringDetached("steered-in-8", 8);
+    // An ended command and an unknown id take no mark.
+    runtime.markSteeringDetached("ended", 7);
+    runtime.markSteeringDetached("missing", 7);
+
+    const taken = try runtime.takeSteeringDetached(alloc, 7);
+    defer {
+        for (taken) |id| alloc.free(id);
+        alloc.free(taken);
+    }
+    try std.testing.expectEqual(@as(usize, 1), taken.len);
+    try std.testing.expectEqualStrings("steered-in-7", taken[0]);
+
+    // Each id is taken once, and a turn with no steered command takes none.
+    const again = try runtime.takeSteeringDetached(alloc, 7);
+    defer alloc.free(again);
+    try std.testing.expectEqual(@as(usize, 0), again.len);
+    const unmarked = try runtime.takeSteeringDetached(alloc, 9);
+    defer alloc.free(unmarked);
+    try std.testing.expectEqual(@as(usize, 0), unmarked.len);
+
+    // A later steering mark moves the command to its own turn.
+    runtime.markSteeringDetached("steered-in-8", 9);
+    const moved_from = try runtime.takeSteeringDetached(alloc, 8);
+    defer alloc.free(moved_from);
+    try std.testing.expectEqual(@as(usize, 0), moved_from.len);
+    const moved_to = try runtime.takeSteeringDetached(alloc, 9);
+    defer {
+        for (moved_to) |id| alloc.free(id);
+        alloc.free(moved_to);
+    }
+    try std.testing.expectEqual(@as(usize, 1), moved_to.len);
+    try std.testing.expectEqualStrings("steered-in-8", moved_to[0]);
+    try std.testing.expectEqual(SnapshotState.running, runtime.stateFor("background").?);
 }
 
 test "steering yield waits out its grace time" {
