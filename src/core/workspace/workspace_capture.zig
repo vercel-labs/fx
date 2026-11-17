@@ -17,6 +17,12 @@ pub const Candidate = struct {
     tracked: bool,
     present: bool = true,
     skip_worktree: bool = false,
+    /// Tracked only: the index holds the path but HEAD's tree does
+    /// not, as for a staged new file. The caller sets it only for
+    /// sensitive names.
+    new_in_index: bool = false,
+    /// Untracked only: the file's start holds a PEM private key.
+    holds_private_key: bool = false,
     /// lstat size, never the size of a symlink's target.
     bytes: u64 = 0,
     kind: enum { file, symlink, gitlink } = .file,
@@ -78,6 +84,11 @@ pub fn select(alloc: Allocator, candidates: []const Candidate, previous: []const
 
     for (sorted) |entry| {
         if (entry.tracked) {
+            if (entry.new_in_index and isSensitive(entry.path)) {
+                try excluded.append(alloc, .{ .path = entry.path, .reason = .sensitive });
+                try remove.append(alloc, entry.path);
+                continue;
+            }
             if (entry.present) {
                 try read.append(alloc, entry.path);
                 if (entry.kind == .gitlink) try excluded.append(alloc, .{ .path = entry.path, .reason = .submodule });
@@ -90,7 +101,7 @@ pub fn select(alloc: Allocator, candidates: []const Candidate, previous: []const
         }
         const reason: ?@FieldType(Exclusion, "reason") = if (!entry.present)
             .missing
-        else if (isSensitive(entry.path))
+        else if (isSensitive(entry.path) or entry.holds_private_key)
             .sensitive
         else if (entry.kind == .gitlink)
             .submodule
@@ -163,27 +174,52 @@ fn validatePath(path: []const u8) error{InvalidPath}!void {
 }
 
 /// Names that usually hold credentials, compared without case: a disk that
-/// ignores case opens `.ENV` as `.env`, and `ID_RSA` is still a key.
-fn isSensitive(path: []const u8) bool {
+/// ignores case opens `.ENV` as `.env`, and `ID_RSA` is still a key. It also
+/// covers key folders, cloud and cluster credentials, Terraform variables and
+/// shell histories.
+pub fn isSensitive(path: []const u8) bool {
     const slash = std.mem.findScalarLast(u8, path, '/');
     const base = if (slash) |i| path[i + 1 ..] else path;
+    // A key folder, cloud config or cluster config above the file.
+    var folders = std.mem.splitScalar(u8, if (slash) |i| path[0..i] else "", '/');
+    var previous: ?[]const u8 = null;
+    while (folders.next()) |folder| {
+        if (std.ascii.eqlIgnoreCase(folder, ".ssh") or std.ascii.eqlIgnoreCase(folder, ".gnupg") or std.ascii.eqlIgnoreCase(folder, ".aws")) return true;
+        if (previous) |parent| {
+            if (std.ascii.eqlIgnoreCase(parent, ".config") and std.ascii.eqlIgnoreCase(folder, "gcloud")) return true;
+        }
+        previous = folder;
+    }
     const names = [_][]const u8{
-        ".env",    ".envrc",    ".netrc",      ".npmrc",           ".pgpass",
-        ".pypirc", "auth.json", "credentials", ".git-credentials", "hosts.yml",
+        ".env",         ".envrc",           ".netrc",       ".npmrc",           ".pgpass",
+        ".pypirc",      "auth.json",        "credentials",  ".git-credentials", "hosts.yml",
+        ".htpasswd",    "credentials.json", "secrets.yaml", "secrets.yml",      "secrets.json",
+        "secrets.toml", "secrets.env",
     };
     for (names) |name| if (std.ascii.eqlIgnoreCase(base, name)) return true;
     for ([_][]const u8{ ".env.", "id_rsa", "id_ed25519", "id_ecdsa", "id_dsa" }) |prefix| {
         if (std.ascii.startsWithIgnoreCase(base, prefix)) return true;
     }
-    for ([_][]const u8{ ".pem", ".key", ".p12", ".keystore", ".jks" }) |suffix| {
+    for ([_][]const u8{ ".pem", ".key", ".p12", ".keystore", ".jks", ".tfvars", ".tfvars.json" }) |suffix| {
         if (std.ascii.endsWithIgnoreCase(base, suffix)) return true;
     }
+    // Shells and tools keep command histories in dot files ending `_history`.
+    if (std.ascii.startsWithIgnoreCase(base, ".") and std.ascii.endsWithIgnoreCase(base, "_history")) return true;
+    // A service account key is a JSON file whose name says what it is.
+    if (std.ascii.startsWithIgnoreCase(base, "service-account") and std.ascii.endsWithIgnoreCase(base, ".json")) return true;
     // Docker keeps registry logins in `~/.docker/config.json`; any other
     // `config.json` is ordinary.
     if (std.ascii.eqlIgnoreCase(base, "config.json")) {
         const parent_path = path[0 .. slash orelse return false];
         const parent = if (std.mem.findScalarLast(u8, parent_path, '/')) |i| parent_path[i + 1 ..] else parent_path;
         return std.ascii.eqlIgnoreCase(parent, ".docker");
+    }
+    // kubectl keeps cluster credentials in `~/.kube/config`; any other
+    // `config` file is ordinary.
+    if (std.ascii.eqlIgnoreCase(base, "config")) {
+        const parent_path = path[0 .. slash orelse return false];
+        const parent = if (std.mem.findScalarLast(u8, parent_path, '/')) |i| parent_path[i + 1 ..] else parent_path;
+        return std.ascii.eqlIgnoreCase(parent, ".kube");
     }
     return false;
 }
@@ -228,6 +264,34 @@ test "capture selection includes tracked ignored and staged-new files without ap
     try std.testing.expectEqual(@as(usize, 0), result.excluded.len);
 }
 
+test "capture selection leaves out a staged new file with a sensitive name but keeps committed ones" {
+    const alloc = std.testing.allocator;
+    const entries = [_]Candidate{
+        .{ .path = ".env", .tracked = true, .new_in_index = true },
+        .{ .path = ".env.example", .tracked = true },
+        .{ .path = "new.txt", .tracked = true, .new_in_index = true },
+    };
+    const result = try select(alloc, &entries, &.{}, .{});
+    defer result.deinit(alloc);
+    try expectPaths(&.{ ".env.example", "new.txt" }, result.read);
+    try expectPaths(&.{".env"}, result.remove);
+    try std.testing.expectEqual(@as(usize, 1), result.excluded.len);
+    try std.testing.expectEqualStrings(".env", result.excluded[0].path);
+    try std.testing.expectEqual(.sensitive, result.excluded[0].reason);
+}
+
+test "capture selection leaves out an untracked file that holds a private key" {
+    const alloc = std.testing.allocator;
+    const entries = [_]Candidate{
+        .{ .path = "notes.txt", .tracked = false, .holds_private_key = true },
+    };
+    const result = try select(alloc, &entries, &.{}, .{});
+    defer result.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), result.read.len);
+    try std.testing.expectEqual(@as(usize, 1), result.excluded.len);
+    try std.testing.expectEqual(.sensitive, result.excluded[0].reason);
+}
+
 test "capture selection preserves only sparse paths absent from disk and removes actual deletions" {
     const alloc = std.testing.allocator;
     const entries = [_]Candidate{
@@ -265,17 +329,28 @@ test "capture selection excludes sensitive untracked names and respects exact si
 
 test "capture selection matches sensitive names without case and knows common credential files" {
     const sensitive = [_][]const u8{
-        ".ENV",                "ID_RSA",                   "Credentials",          ".aws/credentials",
-        ".docker/config.json", "home/.Docker/Config.JSON", ".config/gh/hosts.yml", "auth.json",
-        ".pgpass",             "id_ecdsa",                 "id_ecdsa.pub",         "id_dsa",
-        "release.keystore",    "app.JKS",                  ".git-credentials",     ".pypirc",
-        "Key.PEM",             ".Env.Local",
+        ".ENV",                      "ID_RSA",                   "Credentials",          ".aws/credentials",
+        ".docker/config.json",       "home/.Docker/Config.JSON", ".config/gh/hosts.yml", "auth.json",
+        ".pgpass",                   "id_ecdsa",                 "id_ecdsa.pub",         "id_dsa",
+        "release.keystore",          "app.JKS",                  ".git-credentials",     ".pypirc",
+        "Key.PEM",                   ".Env.Local",               ".ssh/deploy_key",      ".ssh/config",
+        "home/.SSH/known_hosts",     ".gnupg/pubring.kbx",       ".aws/config",          ".config/gcloud/application_default_credentials.json",
+        ".kube/config",              "home/.Kube/Config",        "terraform.tfvars",     "prod.TFVARS",
+        "vars.tfvars.json",          "secrets.yaml",             "Secrets.YML",          "service-account.json",
+        "Service-Account-prod.json", ".htpasswd",                "credentials.json",     ".zsh_history",
+        "home/.bash_history",
     };
     for (sensitive) |path| {
         if (!isSensitive(path)) std.debug.print("{s} should be sensitive\n", .{path});
         try std.testing.expect(isSensitive(path));
     }
-    for ([_][]const u8{ "config.json", "app/config.json", "docker/config.json", ".docker/other.json", "credentials.md", "environment", "keys/readme" }) |path| {
+    for ([_][]const u8{
+        "config.json",    "app/config.json", "docker/config.json", ".docker/other.json",
+        "credentials.md", "environment",     "keys/readme",        "docs/ssh.md",
+        "kube/config",    ".kube/cache/x",   "secrets.md",         "service-account.md",
+        "history",        "my_history.txt",  "gcloud/notes.txt",   ".config/other/x",
+        "ssh/notes",
+    }) |path| {
         if (isSensitive(path)) std.debug.print("{s} should not be sensitive\n", .{path});
         try std.testing.expect(!isSensitive(path));
     }

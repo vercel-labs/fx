@@ -20,6 +20,7 @@ const model_tool_schema = @import("../../../tooling/model_tool_schema.zig");
 const tool_specs = @import("../../../tooling/tool_specs.zig");
 const tool_result_errors = @import("../../../tooling/tool_result_errors.zig");
 const context_contract = @import("../../../workspace/context_contract.zig");
+const diagnostics = @import("../../../workspace/diagnostics.zig");
 const lifecycle_hooks = @import("../../../hooks/hooks.zig");
 const runtime_parallel_execution = @import("../parallel_execution.zig");
 const runtime_config = @import("../config.zig");
@@ -33,6 +34,7 @@ const runtime_tool_presentation = @import("../tool_presentation.zig");
 const runtime_telemetry = @import("../telemetry.zig");
 const command_admission = @import("../../../permissions/command_admission.zig");
 const permission_auto_classifier = @import("../../../permissions/auto_classifier.zig");
+const permissions = @import("../../../permissions/permissions.zig");
 const auto_classifier_context = @import("../../../permissions/auto_classifier_context.zig");
 
 const test_support = @import("support.zig");
@@ -2561,6 +2563,284 @@ fn expectReminderOnLastToolResult(alloc: std.mem.Allocator, body: []const u8, ru
     try std.testing.expect(std.mem.endsWith(u8, output, line));
 }
 
+test "a tool's notice raised by the first of two results keeps the second result in the saved turn" {
+    const alloc = std.testing.allocator;
+    const calls = [_]ToolCall{
+        toolCall("call_first", "read_file", "{\"path\":\"a\"}"),
+        toolCall("call_second", "read_file", "{\"path\":\"b\"}"),
+    };
+    const completions = [_]FakeCompletion{ .{ .tool_calls = &calls }, .{ .content = "Done" } };
+    const notice = "notice from the first call";
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    hooks.exec_plans = &.{
+        .{ .result = .{ .model_output = "first output", .system_notice = notice } },
+        .{ .result = .{ .model_output = "second output" } },
+    };
+    hooks.permission_feedback = &.{ "", "typed feedback" };
+    var fixture = PromptFixture{};
+    try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
+
+    // The request carries both results and the feedback before the notice.
+    try std.testing.expectEqual(@as(usize, 2), gateway.request_bodies.items.len);
+    try expectBodyContainsInOrder(&gateway, 1, &.{ "first output", "second output", "typed feedback", notice });
+
+    // The save keeps both results and the feedback, and the notice after them.
+    try std.testing.expectEqual(@as(usize, 1), hooks.history_turns.items.len);
+    const saved = hooks.history_turns.items[0].assistant.execution;
+    try std.testing.expectEqual(@as(usize, 1), saved.tool_steps.len);
+    try std.testing.expectEqual(@as(usize, 2), saved.tool_steps[0].tool_results.len);
+    try std.testing.expectEqual(@as(usize, 1), saved.steering.len);
+    try std.testing.expectEqual(@as(usize, 1), saved.steering[0].after_tool_step_count);
+
+    // The next turn's request opens with that whole request.
+    var next_gateway = FakeGateway.init(alloc, &.{.{ .content = "Second answer" }});
+    defer next_gateway.deinit();
+    var next_hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer next_hooks.deinit();
+    var next_job = fixture.job();
+    next_job.prompt = @constCast("second prompt");
+    next_job.history = hooks.history_turns.items;
+    try runFakePrompt(&next_gateway, &next_hooks, fixture.config(), next_job);
+    try test_support.expectPromptExtends(gateway.request_bodies.items[1], next_gateway.request_bodies.items[0]);
+}
+
+test "a tool's notice follows the rules its step delivered, and the next turn extends the request (D93)" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "workspace/nested");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "workspace/nested/AGENTS.md", .data = "NOTE_SCOPE_RULE" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "workspace/nested/a.txt", .data = "a" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "workspace/nested/b.txt", .data = "b" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "workspace/plain.txt", .data = "p" });
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace);
+    const registry = context_contract.Registry{ .default_provider = builtin_context.provider };
+
+    // A step's notes come before its steering at the boundary, so the notice
+    // comes after the rules whichever call raises which.
+    const Case = struct {
+        name: []const u8,
+        first_path: []const u8,
+        second_path: []const u8,
+        notice_on_second: bool,
+        feedback: []const []const u8 = &.{},
+    };
+    const cases = [_]Case{
+        .{ .name = "rules from the first call, notice from the second", .first_path = "nested/a.txt", .second_path = "plain.txt", .notice_on_second = true },
+        .{ .name = "notice from the first call, rules from the second", .first_path = "plain.txt", .second_path = "nested/b.txt", .notice_on_second = false },
+        .{ .name = "rules and notice from one call", .first_path = "nested/a.txt", .second_path = "plain.txt", .notice_on_second = false },
+        .{ .name = "with permission feedback on the second call", .first_path = "nested/a.txt", .second_path = "plain.txt", .notice_on_second = true, .feedback = &.{ "", "typed feedback" } },
+    };
+    for (cases) |case| {
+        errdefer std.debug.print("case: {s}\n", .{case.name});
+        var arena_state = std.heap.ArenaAllocator.init(alloc);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        const calls = [_]ToolCall{
+            toolCall("call_first", "read_file", try arena.print("{{\"path\":\"{s}\"}}", .{case.first_path})),
+            toolCall("call_second", "read_file", try arena.print("{{\"path\":\"{s}\"}}", .{case.second_path})),
+        };
+        const completions = [_]FakeCompletion{ .{ .tool_calls = &calls }, .{ .content = "Done" } };
+        const notice = "notice from a tool";
+        const plans = [_]test_support.FakeExecPlan{
+            .{ .result = .{ .model_output = "first output", .system_notice = if (!case.notice_on_second) notice else null } },
+            .{ .result = .{ .model_output = "second output", .system_notice = if (case.notice_on_second) notice else null } },
+        };
+        var fixture = PromptFixture{ .workspace_root = workspace };
+        var job = fixture.job();
+        job.model = @constCast("anthropic/claude-sonnet-5.5");
+        job.permission_mode = .auto;
+
+        var gateway = FakeGateway.init(alloc, &completions);
+        defer gateway.deinit();
+        var hooks = FakeAgentRuntimeDeps.init(alloc);
+        defer hooks.deinit();
+        hooks.context_enabled = true;
+        hooks.context_registry = registry;
+        hooks.exec_plans = &plans;
+        hooks.permission_feedback = case.feedback;
+        try runFakePrompt(&gateway, &hooks, fixture.config(), job);
+
+        // The request sends the results, the rules the step delivered, then
+        // the notice.
+        try std.testing.expectEqual(@as(usize, 2), gateway.request_bodies.items.len);
+        try expectBodyContainsInOrder(&gateway, 1, &.{ "first output", "second output", "NOTE_SCOPE_RULE", notice });
+        const saved = hooks.history_turns.items[0].assistant.execution;
+        try std.testing.expectEqual(@as(usize, 1), saved.context_notes.len);
+        try std.testing.expectEqual(@as(usize, 1), saved.steering.len);
+
+        // The next turn's request opens with that whole request.
+        var next_gateway = FakeGateway.init(alloc, &.{.{ .content = "Second answer" }});
+        defer next_gateway.deinit();
+        var next_hooks = FakeAgentRuntimeDeps.init(alloc);
+        defer next_hooks.deinit();
+        next_hooks.context_enabled = true;
+        next_hooks.context_registry = registry;
+        var next_job = fixture.job();
+        next_job.model = job.model;
+        next_job.permission_mode = .auto;
+        next_job.prompt = @constCast("second prompt");
+        next_job.history = hooks.history_turns.items;
+        try runFakePrompt(&next_gateway, &next_hooks, fixture.config(), next_job);
+        try test_support.expectPromptExtends(gateway.request_bodies.items[1], next_gateway.request_bodies.items[0]);
+    }
+}
+
+test "a step that ends on a repeated failure joins its notes and notice before the steering it takes, and the next turn extends the request (D93)" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "workspace/nested");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "workspace/nested/AGENTS.md", .data = "NOTE_SCOPE_RULE" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "workspace/nested/a.txt", .data = "a" });
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace);
+    const registry = context_contract.Registry{ .default_provider = builtin_context.provider };
+    const notice = "notice from a tool";
+
+    // The last step of each case reads a file in a folder with its own rules,
+    // which raises a notice, and ends the turn on a repeated failure unless
+    // the user steers it on. The steering is taken at the step's end, after
+    // the boundaries at the top of each step. Repeated malformed arguments
+    // is the third such end, but a step of only malformed calls reaches no
+    // folder and runs no tool, so it holds neither a note nor a notice.
+    const failing = [_]ToolCall{toolCall("shell_failing", "shell", "{\"command\":\"false\"}")};
+    const failing_and_read = [_]ToolCall{
+        toolCall("shell_failing_last", "shell", "{\"command\":\"false\"}"),
+        toolCall("read_nested", "read_file", "{\"path\":\"nested/a.txt\"}"),
+    };
+    const shell_completions = [_]FakeCompletion{
+        .{ .tool_calls = &failing },
+        .{ .tool_calls = &failing },
+        .{ .tool_calls = &failing_and_read },
+        .{ .content = "Done" },
+    };
+    const shell_plans = [_]test_support.FakeExecPlan{
+        .{ .result = .{ .model_output = "shell failed", .status = .failure } },
+        .{ .result = .{ .model_output = "shell failed", .status = .failure } },
+        .{ .result = .{ .model_output = "shell failed", .status = .failure } },
+        .{ .result = .{ .model_output = "read output", .system_notice = notice } },
+    };
+    const invalid_output = "{\"error\":{\"code\":\"invalid_shell_request\",\"executed\":false,\"problems\":[\"missing field\"]}}";
+    const invalid = [_]ToolCall{toolCall("shell_invalid", "shell", "{\"command\":\"\"}")};
+    const invalid_and_read = [_]ToolCall{
+        // Other arguments, so the result does not carry the note for a call
+        // that failed before, and the two results are the same text.
+        toolCall("shell_invalid_last", "shell", "{\"command\":\" \"}"),
+        toolCall("read_nested", "read_file", "{\"path\":\"nested/a.txt\"}"),
+    };
+    const validation_completions = [_]FakeCompletion{
+        .{ .tool_calls = &invalid },
+        .{ .tool_calls = &invalid_and_read },
+        .{ .content = "Done" },
+    };
+    // The shell calls fail the registered tool's own validation and never
+    // run, so only the read has a plan.
+    const validation_plans = [_]test_support.FakeExecPlan{
+        .{ .result = .{ .model_output = "read output", .system_notice = notice } },
+    };
+    const validation_results = [_]?[]const u8{ invalid_output, invalid_output };
+    const Case = struct {
+        name: []const u8,
+        completions: []const FakeCompletion,
+        plans: []const test_support.FakeExecPlan,
+        validation_results: []const ?[]const u8 = &.{},
+        steering_take_at: usize,
+    };
+    const cases = [_]Case{
+        .{ .name = "the same shell call fails in three steps", .completions = &shell_completions, .plans = &shell_plans, .steering_take_at = 4 },
+        .{ .name = "the same shell validation error comes twice", .completions = &validation_completions, .plans = &validation_plans, .validation_results = &validation_results, .steering_take_at = 3 },
+    };
+    for (cases) |case| {
+        errdefer std.debug.print("case: {s}\n", .{case.name});
+        var fixture = PromptFixture{ .workspace_root = workspace };
+        var job = fixture.job();
+        job.model = @constCast("anthropic/claude-sonnet-5.5");
+        job.permission_mode = .auto;
+
+        var gateway = FakeGateway.init(alloc, case.completions);
+        defer gateway.deinit();
+        var hooks = FakeAgentRuntimeDeps.init(alloc);
+        defer hooks.deinit();
+        hooks.context_enabled = true;
+        hooks.context_registry = registry;
+        hooks.exec_plans = case.plans;
+        hooks.validation_results = case.validation_results;
+        hooks.steering_messages = &.{"typed steering text"};
+        hooks.steering_take_at = case.steering_take_at;
+        try runFakePrompt(&gateway, &hooks, fixture.config(), job);
+
+        // The request after the last step sends its results, the rules its
+        // read reached, the notice, then the steering.
+        try std.testing.expectEqual(case.completions.len, gateway.request_bodies.items.len);
+        const last = gateway.request_bodies.items.len - 1;
+        try expectBodyContainsInOrder(&gateway, last, &.{ "read output", "NOTE_SCOPE_RULE", notice, "typed steering text" });
+
+        // The next turn's request opens with that whole request.
+        var next_gateway = FakeGateway.init(alloc, &.{.{ .content = "Second answer" }});
+        defer next_gateway.deinit();
+        var next_hooks = FakeAgentRuntimeDeps.init(alloc);
+        defer next_hooks.deinit();
+        next_hooks.context_enabled = true;
+        next_hooks.context_registry = registry;
+        var next_job = fixture.job();
+        next_job.model = job.model;
+        next_job.permission_mode = .auto;
+        next_job.prompt = @constCast("second prompt");
+        next_job.history = hooks.history_turns.items;
+        try runFakePrompt(&next_gateway, &next_hooks, fixture.config(), next_job);
+        try test_support.expectPromptExtends(gateway.request_bodies.items[last], next_gateway.request_bodies.items[0]);
+    }
+}
+
+test "a tool's notice stays in a turn cancelled once the step's last result is in" {
+    const alloc = std.testing.allocator;
+    const calls = [_]ToolCall{
+        toolCall("call_first", "read_file", "{\"path\":\"a\"}"),
+        toolCall("call_second", "read_file", "{\"path\":\"b\"}"),
+    };
+    const completions = [_]FakeCompletion{.{ .tool_calls = &calls }};
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+    // The last call answers normally and raises the cancel as it runs, so the
+    // cancel is seen with the step's notice still waiting for the next boundary.
+    hooks.exec_plans = &.{
+        .{ .result = .{ .model_output = "first output" } },
+        .{ .result = .{ .model_output = "second output", .system_notice = "notice from the last call" } },
+    };
+    hooks.cancel_on_execute = &fixture.cancel_flag;
+    hooks.cancel_on_execute_index = 1;
+
+    try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
+
+    try std.testing.expectEqual(@as(usize, 1), hooks.history_turns.items.len);
+    try std.testing.expect(hooks.history_turns.items[0] == .interrupted);
+    const follow_completions = [_]FakeCompletion{.{ .content = "Carrying on." }};
+    var follow_gateway = FakeGateway.init(alloc, &follow_completions);
+    defer follow_gateway.deinit();
+    var follow_hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer follow_hooks.deinit();
+    var follow_fixture = PromptFixture{};
+    var follow_job = follow_fixture.job();
+    follow_job.prompt = @constCast("go on");
+    follow_job.history = hooks.history_turns.items;
+    try runFakePrompt(&follow_gateway, &follow_hooks, follow_fixture.config(), follow_job);
+    try expectBodyContainsInOrder(&follow_gateway, 0, &.{
+        "first output",
+        "second output",
+        "notice from the last call",
+        "<turn_aborted>",
+        "go on",
+    });
+}
+
 test "rules a tool call reaches ride on the step's tool result and stay out of the instructions, for every model (D93)" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -4821,6 +5101,55 @@ test "exact caution is reused while the agent continues to a normal completion" 
     try std.testing.expectEqual(@as(usize, 0), evidence.entries.len);
 }
 
+test "a caution reused in the same turn is recorded for the trace each time" {
+    diagnostics.resetSession();
+    defer diagnostics.resetSession();
+    const alloc = std.testing.allocator;
+    const first = [_]ToolCall{toolCall("blocked-1", "run_command", "{\"command\":\"touch blocked\"}")};
+    const second = [_]ToolCall{toolCall("blocked-2", "run_command", "{\"command\":\"touch blocked\"}")};
+    const third = [_]ToolCall{toolCall("blocked-3", "run_command", "{\"command\":\"touch blocked\"}")};
+    const completions = [_]FakeCompletion{
+        .{ .tool_calls = &first },
+        .{ .tool_calls = &second },
+        .{ .tool_calls = &third },
+        .{ .content = "No further action is needed." },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    hooks.permission_decisions = &.{.deny};
+    hooks.permission_denial_reasons = &.{.review_caution};
+    hooks.permission_auto_review_results = &.{.{
+        .risk = .high,
+        .decision = .caution,
+        .rationale = "The requested action needs a safer alternative.",
+    }};
+    var fixture = PromptFixture{};
+    var config = fixture.config();
+    config.agent_step_limit = 4;
+    var job = fixture.job();
+    job.permission_mode = .auto;
+
+    try runFakePrompt(&gateway, &hooks, config, job);
+
+    // The first caution came from the scripted permission hook; the two
+    // retries reused it without a review.
+    var held: [diagnostics.auto_review_held_capacity]diagnostics.AutoReview = undefined;
+    const n = diagnostics.snapshotHeldAutoReviews(&held);
+    try std.testing.expectEqual(@as(usize, 2), n);
+    for (held[0..n], [_][]const u8{ "blocked-2", "blocked-3" }) |*review, id| {
+        try std.testing.expectEqualStrings(id, review.callId());
+        try std.testing.expect(review.reused);
+        try std.testing.expectEqual(diagnostics.AutoReviewOutcome.caution, review.outcome);
+        try std.testing.expectEqual(diagnostics.AutoReviewRisk.high, review.risk);
+        try std.testing.expectEqual(diagnostics.AutoReviewOrigin.root, review.origin);
+        try std.testing.expectEqualStrings("run_command", review.toolName());
+        try std.testing.expectEqualStrings("The requested action needs a safer alternative.", review.rationale());
+    }
+    try std.testing.expectEqual(diagnostics.AutoReviewCounts{ .reused = 2 }, diagnostics.autoReviewCounts());
+}
+
 test "three distinct review cautions preserve an exhausted positive step cap" {
     const alloc = std.testing.allocator;
     const first = [_]ToolCall{toolCall("blocked-1", "run_command", "{\"command\":\"touch one\"}")};
@@ -5053,6 +5382,53 @@ test "parallel automatic review reuses exact cautions" {
     for (execution.tool_steps) |step| {
         try std.testing.expectEqual(@as(usize, 2), step.tool_results.len);
         for (step.tool_results) |result| try std.testing.expect(result.review_feedback);
+    }
+}
+
+test "parallel cautions reused in the same turn are recorded for the trace" {
+    diagnostics.resetSession();
+    defer diagnostics.resetSession();
+    const alloc = std.testing.allocator;
+    const first_calls = [_]ToolCall{
+        toolCall("parallel_first_1", "web_fetch", "{\"url\":\"https://one.example\"}"),
+        toolCall("parallel_first_2", "web_fetch", "{\"url\":\"https://two.example\"}"),
+    };
+    const repeated_calls = [_]ToolCall{
+        toolCall("parallel_repeat_1", "web_fetch", first_calls[0].arguments_json),
+        toolCall("parallel_repeat_2", "web_fetch", first_calls[1].arguments_json),
+    };
+    const completions = [_]FakeCompletion{
+        .{ .tool_calls = &first_calls },
+        .{ .tool_calls = &repeated_calls },
+        .{ .content = "Final" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    hooks.tool_registry = .{ .tools = &.{builtin_tools.web_fetch} };
+    hooks.permission_decisions = &.{ .deny, .deny };
+    hooks.permission_denial_reasons = &.{ .review_caution, .review_caution };
+    hooks.permission_auto_review_results = &.{
+        .{ .risk = .high, .decision = .caution, .rationale = @constCast("Untrusted instruction.") },
+        .{ .risk = .high, .decision = .caution, .rationale = @constCast("Untrusted instruction.") },
+    };
+    var fixture = PromptFixture{};
+    var job = fixture.job();
+    job.permission_mode = .auto;
+
+    try runFakePrompt(&gateway, &hooks, fixture.config(), job);
+
+    var held: [diagnostics.auto_review_held_capacity]diagnostics.AutoReview = undefined;
+    const n = diagnostics.snapshotHeldAutoReviews(&held);
+    try std.testing.expectEqual(@as(usize, 2), n);
+    for (held[0..n], [_][]const u8{ "parallel_repeat_1", "parallel_repeat_2" }, first_calls) |*review, id, original| {
+        try std.testing.expectEqualStrings(id, review.callId());
+        try std.testing.expect(review.reused);
+        try std.testing.expectEqual(diagnostics.AutoReviewOutcome.caution, review.outcome);
+        try std.testing.expectEqualStrings("web_fetch", review.toolName());
+        try std.testing.expectEqualStrings(original.arguments_json, review.action());
+        try std.testing.expectEqualStrings("Untrusted instruction.", review.rationale());
     }
 }
 
@@ -7095,4 +7471,226 @@ test "child live authority allow to ask requires current approval before effect"
         @as(usize, 1),
         hooks.successful_effect_count.load(.seq_cst),
     );
+}
+
+/// A subagent's live authority over one tool. The tool is allowed and asks,
+/// as it does for a subagent in `ask` mode, so every call reaches approval.
+const AskingChildAuthority = struct {
+    tool: []const u8,
+
+    fn resolve(
+        raw: *anyopaque,
+        _: std.mem.Allocator,
+        _: ToolCall,
+        _: []const u8,
+        _: []const u8,
+        _: tool_dispatch.PermissionTargetKind,
+    ) !runtime_deps.ResolvedLiveToolAuthority {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        return .{
+            .authority = .{
+                .generation = 1,
+                .root_id = "root",
+                .tools = (&self.tool)[0..1],
+                .integrations = &.{},
+                .rules = .{ .rules = &.{} },
+                .grants = &.{},
+                .permission_mode = .auto,
+            },
+            .decision = .ask,
+        };
+    }
+};
+
+const ChildApprovalKind = enum { ordinary, file_change, command };
+
+/// What a subagent's approval of one call stored, as the turn reported it.
+const ChildApprovalGrants = struct {
+    executed: usize,
+    propagated: usize,
+    events: usize,
+    frozen_match: bool,
+};
+
+fn childApproval(kind: ChildApprovalKind, decision: types.ToolPermissionDecision, live: bool) !ChildApprovalGrants {
+    const alloc = std.testing.allocator;
+    const call = switch (kind) {
+        .ordinary => toolCall("child_call", "read_file", "{\"path\":\"notes.txt\"}"),
+        .file_change => toolCall("child_call", "write_file", "{\"path\":\"app/page.tsx\",\"content\":\"x\"}"),
+        .command => toolCall("child_call", "shell", "{\"command\":\"zig fmt\"}"),
+    };
+    const calls = [_]ToolCall{call};
+    const completions = [_]FakeCompletion{
+        .{ .tool_calls = &calls },
+        .{ .content = "done" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    hooks.permission_decisions = &.{decision};
+    hooks.permission_target = if (kind == .file_change) "/tmp/workspace/app/page.tsx" else "/tmp/workspace/file.txt";
+    var authority = AskingChildAuthority{ .tool = call.name };
+    if (live) hooks.live_tool_authority = .{ .context = &authority, .resolve_fn = AskingChildAuthority.resolve };
+    var fixture = PromptFixture{};
+    var job = fixture.job();
+    job.permission_mode = .ask;
+
+    try runFakePrompt(&gateway, &hooks, fixture.config(), job);
+
+    return .{
+        .executed = hooks.executed_names.items.len,
+        .propagated = hooks.propagated_grants.items.len,
+        .events = hooks.event_grants.items.len,
+        .frozen_match = kind != .file_change or (hooks.last_frozen_file_grants.items.len > 0 and
+            grantListsEqual(hooks.last_frozen_file_grants.items, hooks.propagated_grants.items)),
+    };
+}
+
+fn grantListsEqual(a: []const PermissionGrant, b: []const PermissionGrant) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |left, right| {
+        if (!std.mem.eql(u8, left.tool_name, right.tool_name)) return false;
+        if (!std.mem.eql(u8, left.target_path, right.target_path)) return false;
+    }
+    return true;
+}
+
+fn expectChildAlwaysStoresGrant(kind: ChildApprovalKind) !void {
+    const child = try childApproval(kind, .always, true);
+    try std.testing.expectEqual(@as(usize, 1), child.executed);
+    try std.testing.expect(child.propagated > 0);
+    try std.testing.expectEqual(child.propagated, child.events);
+    try std.testing.expect(child.frozen_match);
+
+    // The same call from a turn with no live authority, which main's is.
+    const main = try childApproval(kind, .always, false);
+    try std.testing.expectEqual(main.propagated, child.propagated);
+    try std.testing.expectEqual(main.events, child.events);
+}
+
+test "a subagent's always approval of an ordinary call stores the session grant" {
+    try expectChildAlwaysStoresGrant(.ordinary);
+}
+
+test "a subagent's always approval of a file change stores the session grant" {
+    try expectChildAlwaysStoresGrant(.file_change);
+}
+
+test "a subagent's always approval of a command stores the session grant" {
+    try expectChildAlwaysStoresGrant(.command);
+}
+
+/// What a subagent's approval of a call that reads an image kept, as the turn
+/// reported it. The call's authority is the one for image paths, which stores
+/// its grants in a branch of its own.
+const VisionApprovalGrants = struct {
+    executed: usize,
+    propagated: usize,
+    events: usize,
+    covers_image: bool,
+};
+
+fn visionApproval(decision: types.ToolPermissionDecision, live: bool) !VisionApprovalGrants {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io_mod.getIo(), .{
+        .sub_path = "photo.png",
+        .data = "\x89PNG\r\n\x1a\nimage bytes",
+    });
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(workspace);
+    const image_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "photo.png");
+    defer alloc.free(image_path);
+
+    const calls = [_]ToolCall{toolCall(
+        "child_call",
+        "vision",
+        "{\"paths\":[\"photo.png\"],\"focus\":\"read the image\"}",
+    )};
+    const completions = [_]FakeCompletion{
+        .{ .tool_calls = &calls },
+        .{ .content = "done" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    hooks.tool_registry = .{ .tools = test_support.vision_agent_test_tools[0..] };
+    hooks.permission_decisions = &.{decision};
+    var authority = AskingChildAuthority{ .tool = "vision" };
+    if (live) hooks.live_tool_authority = .{ .context = &authority, .resolve_fn = AskingChildAuthority.resolve };
+    var fixture = PromptFixture{ .workspace_root = workspace };
+    var job = fixture.job();
+    job.model = @constCast("zai/glm-5.2");
+    job.permission_mode = .ask;
+
+    try runFakePrompt(&gateway, &hooks, fixture.config(), job);
+
+    return .{
+        .executed = hooks.executed_names.items.len,
+        .propagated = hooks.propagated_grants.items.len,
+        .events = hooks.event_grants.items.len,
+        .covers_image = permissions.sessionGrantAllowed(hooks.propagated_grants.items, "vision", image_path),
+    };
+}
+
+test "a subagent's always approval of an image path stores the session grant" {
+    const child = try visionApproval(.always, true);
+    try std.testing.expectEqual(@as(usize, 1), child.executed);
+    try std.testing.expect(child.propagated > 0);
+    try std.testing.expectEqual(child.propagated, child.events);
+    try std.testing.expect(child.covers_image);
+
+    // The same call from a turn with no live authority, which main's is.
+    const main = try visionApproval(.always, false);
+    try std.testing.expectEqual(main.propagated, child.propagated);
+    try std.testing.expectEqual(main.events, child.events);
+    try std.testing.expect(main.covers_image);
+}
+
+test "a subagent's one-time approval of an image path stores no session grant" {
+    const child = try visionApproval(.once, true);
+    try std.testing.expectEqual(@as(usize, 1), child.executed);
+    try std.testing.expectEqual(@as(usize, 0), child.propagated);
+    try std.testing.expectEqual(@as(usize, 0), child.events);
+    try std.testing.expect(!child.covers_image);
+}
+
+test "a subagent's one-time approval stores no session grant" {
+    for (std.enums.values(ChildApprovalKind)) |kind| {
+        const child = try childApproval(kind, .once, true);
+        try std.testing.expectEqual(@as(usize, 1), child.executed);
+        try std.testing.expectEqual(@as(usize, 0), child.propagated);
+        try std.testing.expectEqual(@as(usize, 0), child.events);
+    }
+}
+
+test "a subagent's always approvals of two calls in one step store the session grants" {
+    const alloc = std.testing.allocator;
+    const calls = [_]ToolCall{
+        toolCall("child_a", "read_file", "{\"path\":\"a.txt\"}"),
+        toolCall("child_b", "read_file", "{\"path\":\"b.txt\"}"),
+    };
+    const completions = [_]FakeCompletion{
+        .{ .tool_calls = &calls },
+        .{ .content = "done" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    hooks.permission_decisions = &.{ .always, .always };
+    var authority = AskingChildAuthority{ .tool = "read_file" };
+    hooks.live_tool_authority = .{ .context = &authority, .resolve_fn = AskingChildAuthority.resolve };
+    var fixture = PromptFixture{};
+    var job = fixture.job();
+    job.permission_mode = .ask;
+
+    try runFakePrompt(&gateway, &hooks, fixture.config(), job);
+
+    try std.testing.expectEqual(@as(usize, 2), hooks.executed_names.items.len);
+    try std.testing.expect(hooks.propagated_grants.items.len > 0);
+    try std.testing.expectEqual(hooks.propagated_grants.items.len, hooks.event_grants.items.len);
 }

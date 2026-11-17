@@ -6,9 +6,12 @@
 
 const network_metrics = @import("network_metrics.zig");
 const tool_call_metrics = @import("tool_call_metrics.zig");
+const subagent_turn_metrics = @import("subagent_turn_metrics.zig");
 const render_metrics = @import("render_metrics.zig");
+const auto_review_metrics = @import("auto_review_metrics.zig");
 const compactor = @import("../compactor/compactor.zig");
 const model_catalog_metrics = @import("model_catalog_metrics.zig");
+const io_mod = @import("../shared/io.zig");
 
 pub const NetworkCall = network_metrics.NetworkCall;
 pub const NetworkCallKind = network_metrics.NetworkCallKind;
@@ -21,15 +24,42 @@ pub const ToolCallOutcome = tool_call_metrics.ToolCallOutcome;
 pub const ToolCallLifetimeStats = tool_call_metrics.LifetimeStats;
 pub const network_ring_capacity = network_metrics.ring_capacity;
 pub const tool_call_ring_capacity = tool_call_metrics.ring_capacity;
+pub const FailedToolCall = tool_call_metrics.FailedToolCall;
+pub const KeptText = tool_call_metrics.KeptText;
+pub const failed_tool_call_capacity = tool_call_metrics.failure_ring_capacity;
 pub const RenderEvent = render_metrics.Event;
 pub const render_ring_capacity = render_metrics.ring_capacity;
+pub const SubagentTurn = subagent_turn_metrics.Turn;
+pub const SubagentTurnStart = subagent_turn_metrics.Start;
+pub const subagent_turn_capacity = subagent_turn_metrics.ring_capacity;
 pub const CompactionEvent = compactor.TraceEvent;
 pub const compaction_ring_capacity = compactor.trace_ring_capacity;
 pub const ModelCatalogEvent = model_catalog_metrics.Event;
 pub const model_catalog_ring_capacity = model_catalog_metrics.ring_capacity;
+pub const AutoReview = auto_review_metrics.Review;
+pub const AutoReviewRecord = auto_review_metrics.Record;
+pub const AutoReviewCounts = auto_review_metrics.Counts;
+pub const AutoReviewOutcome = auto_review_metrics.Outcome;
+pub const AutoReviewRisk = auto_review_metrics.Risk;
+pub const AutoReviewOrigin = auto_review_metrics.Origin;
+pub const auto_review_recent_capacity = auto_review_metrics.recent_capacity;
+pub const auto_review_held_capacity = auto_review_metrics.held_capacity;
 
 pub fn snapshotCompactionEvents(out: []CompactionEvent) usize {
     return compactor.snapshotTrace(out);
+}
+
+pub const failed_compaction_event_capacity = compactor.trace_failure_capacity;
+
+/// Copies the kept failed compaction events, oldest first. Later events never
+/// remove them; only newer failures and a session reset do.
+pub fn snapshotFailedCompactionEvents(out: []CompactionEvent) usize {
+    return compactor.snapshotTraceFailures(out);
+}
+
+/// Failed compaction events this session, including any no longer kept.
+pub fn compactionFailureCount() u64 {
+    return compactor.traceFailureCount();
 }
 
 pub fn recordRenderEvent(kind: render_metrics.Kind, comptime fmt: []const u8, args: anytype) void {
@@ -48,12 +78,41 @@ pub fn snapshotNetworkCalls(out: []NetworkCall) usize {
     return network_metrics.snapshot(out);
 }
 
+pub const failed_network_call_capacity = network_metrics.failure_ring_capacity;
+
+/// Copies the kept failed network calls, oldest first. Later successful calls
+/// never remove them; only newer failures and a session reset do.
+pub fn snapshotFailedNetworkCalls(out: []NetworkCall) usize {
+    return network_metrics.snapshotFailures(out);
+}
+
 pub fn networkLifetimeStats() NetworkLifetimeStats {
     return network_metrics.lifetimeStats();
 }
 
 pub fn snapshotNetworkTurnRollups(out: []NetworkTurnRollup) usize {
     return network_metrics.snapshotTurnRollups(out);
+}
+
+/// Records an auto-mode safety review, or a hold reused from one, so
+/// `/trace` can say what the reviewer decided without FX_TRACE.
+pub fn recordAutoReview(review: AutoReviewRecord) void {
+    auto_review_metrics.record(review);
+}
+
+/// Copies the newest reviews, oldest first.
+pub fn snapshotAutoReviews(out: []AutoReview) usize {
+    return auto_review_metrics.snapshotRecent(out);
+}
+
+/// Copies the newest reviews that did not clear, oldest first. Cleared
+/// reviews never push them out.
+pub fn snapshotHeldAutoReviews(out: []AutoReview) usize {
+    return auto_review_metrics.snapshotHeld(out);
+}
+
+pub fn autoReviewCounts() AutoReviewCounts {
+    return auto_review_metrics.totals();
 }
 
 pub fn recordToolCall(call: ToolCallMetric) void {
@@ -70,6 +129,19 @@ pub fn snapshotModelCatalogEvents(out: []ModelCatalogEvent) usize {
     return model_catalog_metrics.snapshot(out);
 }
 
+pub const failed_model_catalog_event_capacity = model_catalog_metrics.failure_ring_capacity;
+
+/// Copies the kept failed model catalog events, oldest first. Later events
+/// never remove them; only newer failures and a session reset do.
+pub fn snapshotFailedModelCatalogEvents(out: []ModelCatalogEvent) usize {
+    return model_catalog_metrics.snapshotFailures(out);
+}
+
+/// Failed model catalog events this session, including any no longer kept.
+pub fn modelCatalogFailureCount() u64 {
+    return model_catalog_metrics.failureCount();
+}
+
 pub fn recordToolCallResult(input: ToolCallRecord) void {
     tool_call_metrics.recordResult(input);
 }
@@ -78,16 +150,45 @@ pub fn snapshotToolCalls(out: []ToolCallMetric) usize {
     return tool_call_metrics.snapshot(out);
 }
 
+/// Copies the kept failed tool calls, oldest first. Later successful calls
+/// never remove them; only newer failures and a session reset do.
+pub fn snapshotFailedToolCalls(out: []FailedToolCall) usize {
+    return tool_call_metrics.snapshotFailures(out);
+}
+
 pub fn toolCallLifetimeStats() ToolCallLifetimeStats {
     return tool_call_metrics.lifetimeStats();
+}
+
+/// Records a subagent turn as it starts, so `/trace` can say which subagent
+/// a `subagent_id` belongs to.
+pub fn recordSubagentTurnStart(start: SubagentTurnStart) void {
+    subagent_turn_metrics.recordStart(start);
+}
+
+/// Records how subagent turn `subagent_id` ended.
+pub fn recordSubagentTurnEnd(subagent_id: u64, outcome: []const u8) void {
+    subagent_turn_metrics.recordEnd(subagent_id, outcome, io_mod.milliTimestamp());
+}
+
+/// Copies the kept subagent turns, oldest first.
+pub fn snapshotSubagentTurns(out: []SubagentTurn) usize {
+    return subagent_turn_metrics.snapshot(out);
+}
+
+/// Subagent turns started this session, including ones no longer kept.
+pub fn subagentTurnTotal() u64 {
+    return subagent_turn_metrics.totalTurns();
 }
 
 pub fn resetSession() void {
     network_metrics.reset();
     tool_call_metrics.reset();
+    subagent_turn_metrics.reset();
     render_metrics.reset();
     compactor.resetTrace();
     model_catalog_metrics.reset();
+    auto_review_metrics.reset();
 }
 
 pub fn resetForTest() void {

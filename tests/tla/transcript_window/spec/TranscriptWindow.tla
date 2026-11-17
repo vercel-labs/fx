@@ -27,6 +27,7 @@ None == MaxSeq + 1
 
 VARIABLES
     cycle, cycleFirst, prevFirst, nextSeq, savedThrough, live, turnOpen,
+    prevWaits,   \* no turn has ended since the last compaction (D2)
     paintedThrough, reprinting,
     coOpen, coLo, coHi, coAtStart, pending, pendingDir, nextToken,
     out, act,
@@ -34,8 +35,8 @@ VARIABLES
     painted      \* blocks on the screen in this epoch, from the paint effects
 
 core == <<cycle, cycleFirst, prevFirst, nextSeq, savedThrough, live, turnOpen,
-          paintedThrough, reprinting, coOpen, coLo, coHi, coAtStart, pending,
-          pendingDir, nextToken>>
+          prevWaits, paintedThrough, reprinting, coOpen, coLo, coHi, coAtStart,
+          pending, pendingDir, nextToken>>
 vars == <<core, out, act, alive, cycleStarts, painted>>
 
 Min(a, b) == IF a < b THEN a ELSE b
@@ -47,7 +48,7 @@ Effects == Range(out)
 
 Init ==
     /\ cycle = 0 /\ cycleFirst = 0 /\ prevFirst = None /\ nextSeq = 0
-    /\ savedThrough = 0 /\ live = {} /\ turnOpen = FALSE
+    /\ savedThrough = 0 /\ live = {} /\ turnOpen = FALSE /\ prevWaits = FALSE
     /\ paintedThrough = 0 /\ reprinting = FALSE
     /\ coOpen = FALSE /\ coLo = 0 /\ coHi = 0 /\ coAtStart = FALSE
     /\ pending = 0 /\ pendingDir = "older" /\ nextToken = 1
@@ -55,7 +56,8 @@ Init ==
     /\ alive = TRUE /\ cycleStarts = {0}
     /\ painted = {}
 
-\* The drop that turn_ended and saved_through attempt (D2, D6).
+\* The drop that turn_ended and saved_through attempt (D2, D6). A save also
+\* waits for the first turn end after the compaction (`prevWaits`).
 CanDrop(po, cf, open, st) ==
     /\ po # None
     /\ ~open
@@ -74,12 +76,13 @@ TurnStarted ==
     /\ alive /\ ~turnOpen
     /\ turnOpen' = TRUE /\ out' = <<>> /\ act' = [name |-> "TurnStarted"]
     /\ UNCHANGED <<cycle, cycleFirst, prevFirst, nextSeq, savedThrough, live,
-                   paintedThrough, reprinting, coOpen, coLo, coHi, coAtStart,
-                   pending, pendingDir, nextToken, alive, cycleStarts>>
+                   prevWaits, paintedThrough, reprinting, coOpen, coLo, coHi,
+                   coAtStart, pending, pendingDir, nextToken, alive, cycleStarts>>
 
+\* The first turn end after a compaction ends the wait (D2).
 TurnEnded ==
     /\ alive /\ turnOpen /\ live = {}     \* A4
-    /\ turnOpen' = FALSE /\ act' = [name |-> "TurnEnded"]
+    /\ turnOpen' = FALSE /\ prevWaits' = FALSE /\ act' = [name |-> "TurnEnded"]
     /\ IF CanDrop(prevFirst, cycleFirst, FALSE, savedThrough)
           THEN /\ out' = DropEffect(prevFirst, cycleFirst)
                /\ prevFirst' = None
@@ -95,8 +98,8 @@ BlockOpened(id) ==
     /\ nextSeq + Cardinality(live) < MaxSeq
     /\ live' = live \cup {id} /\ out' = <<>> /\ act' = [name |-> "BlockOpened", id |-> id]
     /\ UNCHANGED <<cycle, cycleFirst, prevFirst, nextSeq, savedThrough, turnOpen,
-                   paintedThrough, reprinting, coOpen, coLo, coHi, coAtStart,
-                   pending, pendingDir, nextToken, alive, cycleStarts>>
+                   prevWaits, paintedThrough, reprinting, coOpen, coLo, coHi,
+                   coAtStart, pending, pendingDir, nextToken, alive, cycleStarts>>
 
 BlockChanged(id) ==
     /\ alive /\ id \in live
@@ -114,7 +117,7 @@ BlockFinished(id) ==
           ELSE /\ out' = <<[kind |-> "paint_final", seq |-> nextSeq]>>
                /\ paintedThrough' = nextSeq + 1
     /\ UNCHANGED <<cycle, cycleFirst, prevFirst, savedThrough, turnOpen,
-                   reprinting, coOpen, coLo, coHi, coAtStart, pending,
+                   prevWaits, reprinting, coOpen, coLo, coHi, coAtStart, pending,
                    pendingDir, nextToken, alive, cycleStarts>>
 
 \* The log confirms every block below `through` (A3). The shell never reports
@@ -123,41 +126,40 @@ SavedThrough(through) ==
     /\ alive /\ Saved
     /\ through > savedThrough /\ through <= nextSeq
     /\ savedThrough' = Min(through, nextSeq) /\ act' = [name |-> "SavedThrough", through |-> through]
-    /\ IF CanDrop(prevFirst, cycleFirst, turnOpen, Min(through, nextSeq))
+    /\ IF ~prevWaits /\ CanDrop(prevFirst, cycleFirst, turnOpen, Min(through, nextSeq))
           THEN /\ out' = DropEffect(prevFirst, cycleFirst)
                /\ prevFirst' = None
                /\ paintedThrough' = AfterDrop(paintedThrough, cycleFirst)
           ELSE /\ out' = <<>> /\ UNCHANGED <<prevFirst, paintedThrough>>
-    /\ UNCHANGED <<cycle, cycleFirst, nextSeq, live, turnOpen, reprinting,
-                   coOpen, coLo, coHi, coAtStart, pending, pendingDir, nextToken,
-                   alive, cycleStarts>>
+    /\ UNCHANGED <<cycle, cycleFirst, nextSeq, live, turnOpen, prevWaits,
+                   reprinting, coOpen, coLo, coHi, coAtStart, pending,
+                   pendingDir, nextToken, alive, cycleStarts>>
 
 \* The log commits the compaction record before the transcript hears of it
 \* (A2), so recovery finds it. Saves still arrive only as SavedThrough: a
 \* compaction never counts as proof that earlier blocks are in the log.
-\* Between turns (a manual compaction) nothing held can change, so the
-\* previous cycle drops as soon as the log holds it.
+\* A compaction drops nothing, even between turns (a manual compaction, or a
+\* resume whose newest compaction followed its last turn) with the log
+\* holding every block: the previous cycle waits for the next turn end
+\* (D2), so a resize before it still reprints that cycle.
 Compacted ==
     /\ alive /\ cycle < MaxCycles
     /\ LET po == IF prevFirst = None THEN cycleFirst ELSE prevFirst
        IN /\ cycle' = cycle + 1
           /\ cycleFirst' = nextSeq
           /\ cycleStarts' = cycleStarts \cup {nextSeq}
-          /\ IF CanDrop(po, nextSeq, turnOpen, savedThrough)
-                THEN /\ out' = DropEffect(po, nextSeq)
-                     /\ prevFirst' = None
-                     /\ paintedThrough' = AfterDrop(paintedThrough, nextSeq)
-                ELSE /\ out' = <<>> /\ prevFirst' = po /\ UNCHANGED paintedThrough
-    /\ act' = [name |-> "Compacted"]
-    /\ UNCHANGED <<nextSeq, savedThrough, live, turnOpen, reprinting, coOpen,
-                   coLo, coHi, coAtStart, pending, pendingDir, nextToken, alive>>
+          /\ prevFirst' = po /\ prevWaits' = TRUE
+    /\ out' = <<>> /\ act' = [name |-> "Compacted"]
+    /\ UNCHANGED <<nextSeq, savedThrough, live, turnOpen, paintedThrough,
+                   reprinting, coOpen, coLo, coHi, coAtStart, pending,
+                   pendingDir, nextToken, alive>>
 
 Resized ==
     /\ alive
     /\ reprinting' = TRUE /\ paintedThrough' = HeldFirst
     /\ out' = <<[kind |-> "reprint_begin"]>> /\ act' = [name |-> "Resized"]
     /\ UNCHANGED <<cycle, cycleFirst, prevFirst, nextSeq, savedThrough, live,
-                   turnOpen, coOpen, coLo, coHi, coAtStart, pending, pendingDir,
+                   turnOpen, prevWaits, coOpen, coLo, coHi, coAtStart, pending, pendingDir,
                    nextToken, alive, cycleStarts>>
 
 ReprintTick ==
@@ -171,7 +173,7 @@ ReprintTick ==
                /\ paintedThrough' = Min(paintedThrough + Slice, nextSeq)
                /\ UNCHANGED reprinting
     /\ UNCHANGED <<cycle, cycleFirst, prevFirst, nextSeq, savedThrough, live,
-                   turnOpen, coOpen, coLo, coHi, coAtStart, pending, pendingDir,
+                   turnOpen, prevWaits, coOpen, coLo, coHi, coAtStart, pending, pendingDir,
                    nextToken, alive, cycleStarts>>
 
 CtrlOOpened ==
@@ -185,7 +187,7 @@ CtrlOOpened ==
                  hi |-> nextSeq]>>
     /\ act' = [name |-> "CtrlOOpened"]
     /\ UNCHANGED <<cycle, cycleFirst, prevFirst, nextSeq, savedThrough, live,
-                   turnOpen, paintedThrough, reprinting, pendingDir, nextToken,
+                   turnOpen, prevWaits, paintedThrough, reprinting, pendingDir, nextToken,
                    alive, cycleStarts>>
 
 CtrlOScrolledOlder ==
@@ -210,7 +212,7 @@ CtrlOScrolledOlder ==
                     /\ out' = <<>>
                     /\ UNCHANGED <<coLo, coHi, pending, pendingDir, nextToken>>
     /\ UNCHANGED <<cycle, cycleFirst, prevFirst, nextSeq, savedThrough, live,
-                   turnOpen, paintedThrough, reprinting, coOpen, alive, cycleStarts>>
+                   turnOpen, prevWaits, paintedThrough, reprinting, coOpen, alive, cycleStarts>>
 
 CtrlOScrolledNewer ==
     /\ alive /\ coOpen /\ pending = 0 /\ coHi < nextSeq /\ ~OnlyOlder
@@ -234,13 +236,13 @@ CtrlOScrolledNewer ==
                             from |-> coHi, count |-> Step]>>
                /\ UNCHANGED <<coLo, coHi, coAtStart>>
     /\ UNCHANGED <<cycle, cycleFirst, prevFirst, nextSeq, savedThrough, live,
-                   turnOpen, paintedThrough, reprinting, coOpen, alive, cycleStarts>>
+                   turnOpen, prevWaits, paintedThrough, reprinting, coOpen, alive, cycleStarts>>
 
 CtrlOClosed ==
     /\ alive /\ coOpen /\ ~OnlyOlder
     /\ coOpen' = FALSE /\ pending' = 0 /\ out' = <<>> /\ act' = [name |-> "CtrlOClosed"]
     /\ UNCHANGED <<cycle, cycleFirst, prevFirst, nextSeq, savedThrough, live,
-                   turnOpen, paintedThrough, reprinting, coLo, coHi, coAtStart,
+                   turnOpen, prevWaits, paintedThrough, reprinting, coLo, coHi, coAtStart,
                    pendingDir, nextToken, alive, cycleStarts>>
 
 \* A reply for any token ever issued: the pending one, a stale one, or a
@@ -261,7 +263,7 @@ LogReadDone(token, count) ==
                   /\ out' = <<[kind |-> "ctrlo_show", lo |-> lo2, hi |-> hi2]>>
           ELSE /\ out' = <<>> /\ UNCHANGED <<coLo, coHi, coAtStart, pending>>
     /\ UNCHANGED <<cycle, cycleFirst, prevFirst, nextSeq, savedThrough, live,
-                   turnOpen, paintedThrough, reprinting, coOpen, pendingDir,
+                   turnOpen, prevWaits, paintedThrough, reprinting, coOpen, pendingDir,
                    nextToken, alive, cycleStarts>>
 
 \* A lost reply: the shell times the read out.
@@ -271,7 +273,7 @@ LogReadFailed(token) ==
     /\ IF coOpen /\ pending = token THEN pending' = 0 ELSE UNCHANGED pending
     /\ out' = <<>>
     /\ UNCHANGED <<cycle, cycleFirst, prevFirst, nextSeq, savedThrough, live,
-                   turnOpen, paintedThrough, reprinting, coOpen, coLo, coHi,
+                   turnOpen, prevWaits, paintedThrough, reprinting, coOpen, coLo, coHi,
                    coAtStart, pendingDir, nextToken, alive, cycleStarts>>
 
 \* A crash at any step loses memory; the log keeps what it held (D7). An
@@ -291,7 +293,7 @@ Resumed ==
        /\ alive' = TRUE
        /\ nextSeq' = savedThrough /\ cycleFirst' = last /\ prevFirst' = None
        /\ cycleStarts' = {c \in cycleStarts : c <= savedThrough}
-       /\ live' = {} /\ turnOpen' = FALSE
+       /\ live' = {} /\ turnOpen' = FALSE /\ prevWaits' = FALSE
        /\ reprinting' = TRUE /\ paintedThrough' = last
        /\ coOpen' = FALSE /\ coLo' = 0 /\ coHi' = 0 /\ coAtStart' = FALSE
        /\ pending' = 0
@@ -348,7 +350,7 @@ TypeOK ==
     /\ cycle \in 0..MaxCycles
     /\ cycleFirst \in 0..MaxSeq /\ nextSeq \in 0..MaxSeq /\ savedThrough \in 0..MaxSeq
     /\ prevFirst \in 0..MaxSeq \cup {None}
-    /\ live \subseteq Ids /\ turnOpen \in BOOLEAN
+    /\ live \subseteq Ids /\ turnOpen \in BOOLEAN /\ prevWaits \in BOOLEAN
     /\ paintedThrough \in 0..MaxSeq /\ reprinting \in BOOLEAN
     /\ coOpen \in BOOLEAN /\ coLo \in 0..MaxSeq /\ coHi \in 0..MaxSeq
     /\ pending \in 0..MaxTokens /\ nextToken \in 1..(MaxTokens + 1)
@@ -356,7 +358,7 @@ TypeOK ==
 
 \* L1
 HeldIsRecentCycles ==
-    (alive /\ ~turnOpen /\ (~Saved \/ savedThrough >= cycleFirst)) => prevFirst = None
+    (alive /\ ~turnOpen /\ ~prevWaits /\ (~Saved \/ savedThrough >= cycleFirst)) => prevFirst = None
 
 \* L2: drop ranges hold finished blocks only, which never include a live block.
 LiveNeverDropped ==
@@ -393,12 +395,16 @@ DropBetweenTurns == \A e \in Effects : e.kind = "drop" => ~turnOpen
 \* L19: outside a reprint, every held block is on the screen.
 ScreenHoldsHeld == (alive /\ ~reprinting) => (HeldFirst..(nextSeq - 1)) \subseteq painted
 
+\* L22: until the first turn end after a compaction, the previous cycle is held,
+\* so a resize before it reprints that cycle.
+PreviousWaitsForTurnEnd == (alive /\ prevWaits) => prevFirst # None
+
 \* L13
 RecoveredFromLog ==
     act.name = "Resumed" =>
         /\ nextSeq = savedThrough /\ cycleFirst \in cycleStarts
         \* Nothing of the earlier state survives.
-        /\ prevFirst = None /\ live = {} /\ ~turnOpen /\ ~coOpen /\ pending = 0
+        /\ prevFirst = None /\ ~prevWaits /\ live = {} /\ ~turnOpen /\ ~coOpen /\ pending = 0
 
 \* L4 (action property): a change to a live block touches nothing else.
 UpdateIsLocal ==
@@ -423,8 +429,12 @@ StaleReadIgnored ==
 \* L20 (action property): no step paints a block already on the screen.
 PaintedOnce == [][PaintedBy(out') \cap (IF act'.name \in {"Resized", "Resumed"} THEN {} ELSE painted) = {}]_vars
 
-\* L14
-PreviousCycleDropped == (alive /\ prevFirst # None) ~> (prevFirst = None \/ ~alive)
+\* L14: owed once a turn is open or has ended since the compaction. A
+\* compaction between turns starts a new wait for the user's next turn
+\* (L22), which no fairness forces.
+PreviousCycleDropped ==
+    (alive /\ prevFirst # None /\ (turnOpen \/ ~prevWaits))
+        ~> (prevFirst = None \/ ~alive \/ (prevWaits /\ ~turnOpen))
 
 \* L15: a reprint finishes unless another resize or resume starts over.
 ReprintFinishes == (alive /\ reprinting) ~> (~reprinting \/ ~alive \/ act.name \in {"Resized", "Resumed"})
