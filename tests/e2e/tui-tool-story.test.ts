@@ -473,6 +473,87 @@ test.skipIf(!tmuxAvailable())(
 );
 
 test.skipIf(!tmuxAvailable())(
+  "a second message to an agent joins its row while the message streams",
+  async () => {
+    const encoder = new TextEncoder();
+    let timer: ReturnType<typeof setInterval> | undefined;
+    let sendRest: (() => void) | undefined;
+    const message = `${CHILD_MARKER} Look at the window change too.`;
+    const held = () =>
+      new Response(
+        new ReadableStream<Uint8Array>({
+          start(controller) {
+            const send = (event: object) => controller.enqueue(encoder.encode(`data: ${JSON.stringify(event)}\n\n`));
+            send({ type: "tool-input-start", id: "second_message", toolName: "subagent" });
+            // The agent is whole; its message is not.
+            send({ type: "tool-input-delta", id: "second_message", delta: '{"action":"message","agent":"reviewer","message":"' });
+            timer = setInterval(() => controller.enqueue(encoder.encode(": hold-message\n\n")), 50);
+            sendRest = () => {
+              clearInterval(timer);
+              send({ type: "tool-input-delta", id: "second_message", delta: `${JSON.stringify(message).slice(1)}}` });
+              send({ type: "tool-input-end", id: "second_message" });
+              send({ type: "tool-call", toolCallId: "second_message", toolName: "subagent", input: { action: "message", agent: "reviewer", message } });
+              send({ type: "finish", finishReason: { unified: "tool-calls", raw: "tool-calls" } });
+              controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+              controller.close();
+            };
+          },
+          cancel() {
+            clearInterval(timer);
+          },
+        }),
+        { headers: { "content-type": "text/event-stream" } },
+      );
+    const steps: StoryStep[] = [
+      { at: 0, calls: [{ name: "subagent", input: { action: "message", agent: "reviewer", message: `${CHILD_MARKER} Review the createWindow change.` } }] },
+      { at: 1, calls: [{ name: "read_file", input: { path: "desktop/src/main.ts" } }] },
+      { at: 2, response: held },
+      { at: 3, text: "Asked the reviewer twice." },
+    ];
+    const root = createStoryRoot();
+    roots.push(root);
+    const gateway = startStoryGateway(steps, () => "Reviewed.");
+    gateways.push(gateway);
+    const session = await TmuxSession.create({ cwd: root.workspace, env: storyEnv(root, gateway), width: 110, height: 60 });
+    sessions.push(session);
+    await session.waitForComposer();
+    await session.sendText("ask the reviewer twice");
+    const rowsOf = (pane: string) => paneLines(pane).filter((line) => /^(●|├|└) /.test(line));
+    await session.waitForText("Read main.ts", TIMEOUT);
+    // While the second message streams, it joins the reviewer's row at once
+    // instead of showing a row of its own that folds into it later, so the
+    // group's rows never go down.
+    const frames: string[][] = [];
+    for (let i = 0; i < 15; i += 1) {
+      frames.push(rowsOf(await session.capturePane()));
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    sendRest?.();
+    for (let i = 0; i < 200; i += 1) {
+      const pane = await session.capturePane();
+      frames.push(rowsOf(pane));
+      if (pane.includes("Asked the reviewer twice.")) break;
+      await new Promise((resolve) => setTimeout(resolve, 30));
+    }
+    // The first group's tree rows, which sit right under its header.
+    const firstGroupRows = (frame: string[]) => {
+      const start = frame.findIndex((row) => row.startsWith("● "));
+      const rows: string[] = [];
+      for (const row of frame.slice(start + 1)) {
+        if (!/^(├|└) /.test(row)) break;
+        rows.push(row);
+      }
+      return rows;
+    };
+    for (let i = 1; i < frames.length; i += 1) {
+      expect(firstGroupRows(frames[i]).length).toBeGreaterThanOrEqual(firstGroupRows(frames[i - 1]).length);
+    }
+    expect(frames.every((frame) => frame.filter((row) => /^(├|└) .*reviewer/.test(row)).length <= 1)).toBe(true);
+  },
+  TIMEOUT * 2,
+);
+
+test.skipIf(!tmuxAvailable())(
   "the collapsed view keeps one line per group",
   async () => {
     const { pane } = await runStory(FAILING_BUILD, {
