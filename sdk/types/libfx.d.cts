@@ -424,6 +424,7 @@ export type FxHookEvent = FxHookEnvelope & (
   | { type: "mcp.start"; data: { operationId: number | string; callId: string | null; server: string | null; tool: string; transport: string | null } }
   | { type: "mcp.request"; data: { operationId: number | string; requestId: number | string; requestIdKind: "jsonrpc" | "engine" | "correlation" } }
   | { type: "mcp.end"; data: { operationId: number | string; status: "success" | "failure" | "cancelled" | "input_required" | "unavailable" | "unknown"; error: string | null } }
+  /** Work the subagent tool starts: its dispatch, outcome, and feedback. A session made by `createFxAgent()` or `createFxEngine()` isn't offered that tool and never emits this event; ACP sessions that set `_meta.fx.hooks` emit it when the model delegates work. */
   | { type: "delegation"; data: { callId: string; childSessionId: string; workId: string; operationId: string | null; phase: "dispatched" | "completed" | "replayed" | "failed" | "cancelled" | "feedback_queued" | "feedback_applied" | "feedback_not_applied" } }
   /** Emitted only after append resolves and its cursor validates. */
   | { type: "journal.commit"; data: { cursor: string; firstSeq: number | null; lastSeq: number | null; eventCount: number } }
