@@ -15,9 +15,11 @@ const live_metrics = @import("live_metrics.zig");
 const activity_status = @import("../output/activity_status.zig");
 const worker_runtime = @import("../agent/worker_runtime.zig");
 const model_contract = @import("model_contract.zig");
+const refusal = @import("refusal.zig");
 const start_test_controls = @import("start_test_controls.zig");
 const end_test_controls = @import("end_test_controls.zig");
 const close_test_controls = @import("close_test_controls.zig");
+const publish_test_controls = @import("publish_test_controls.zig");
 const model_capabilities = @import("../config/model_capabilities.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const execution_memory = @import("../agent/execution_memory.zig");
@@ -379,6 +381,16 @@ pub const Runtime = struct {
         return self.usage_ledger.snapshot(alloc);
     }
 
+    /// Ends the turns of the children that wait on an approval, as a quit
+    /// ends them: each work ends interrupted and owes its report, which the
+    /// sink posts. The other children go on. Returns how many turns it ended.
+    /// For a host whose approvals reach no one, so none waits for ever.
+    pub fn interruptApprovalWaits(self: *Runtime) usize {
+        const count = self.managed.interruptApprovalWaits();
+        debug_trace.eventf("mailbox", "approval_waits_interrupted", .{}, "owner={s} count={d}", .{ self.ownerName(), count });
+        return count;
+    }
+
     pub fn rebindHost(
         self: *Runtime,
         host_context: ?*anyopaque,
@@ -628,21 +640,21 @@ pub const Runtime = struct {
         switch (request.*) {
             .wait => return self.waitForMail(alloc, options),
             .status => {
-                if (!from_root) return self.encodeManaged(alloc, .{ .ok = false, .error_code = "caller_unavailable" });
+                if (!from_root) return self.refuse(alloc, .{ .caller_unavailable = .not_owner });
                 return self.statusOf(alloc, request.status.agent);
             },
             .stop => {
-                if (!from_root) return self.encodeManaged(alloc, .{ .ok = false, .error_code = "caller_unavailable" });
+                if (!from_root) return self.refuse(alloc, .{ .caller_unavailable = .not_owner });
                 return self.stopChild(alloc, request.stop.agent);
             },
             .close => {
-                if (!from_root) return self.encodeManaged(alloc, .{ .ok = false, .error_code = "caller_unavailable" });
+                if (!from_root) return self.refuse(alloc, .{ .caller_unavailable = .not_owner });
                 return self.closeNamed(alloc, request.close.agent);
             },
             .message => {},
         }
         if (request.toParent()) return self.messageParent(alloc, request.message.message, options, from_root);
-        if (!from_root) return self.encodeManaged(alloc, .{ .ok = false, .error_code = "caller_unavailable" });
+        if (!from_root) return self.refuse(alloc, .{ .caller_unavailable = .not_owner });
 
         // A new child's profile sets its model and effort unless the
         // request names them. Loading it here refuses an unknown profile, or
@@ -675,10 +687,10 @@ pub const Runtime = struct {
         if (options.cancel_flag) |cancel| if (cancel.load(.seq_cst)) return error.Cancelled;
         const fingerprint = model_contract.requestFingerprint(request.*);
         if (self.managed.feedbackReplay(operation_id, fingerprint)) |replay| {
-            return self.encodeManaged(alloc, switch (replay) {
-                .receipt => |delivery| model_contract.feedbackResult(delivery),
-                else => .{ .ok = false, .error_code = "operation_conflict" },
-            });
+            return switch (replay) {
+                .receipt => |delivery| self.encodeManaged(alloc, model_contract.feedbackResult(delivery)),
+                else => self.refuse(alloc, .operation_conflict),
+            };
         }
         // Remembered before admission, which can start the work and see it
         // end before returning. Only a started or waiting work keeps it.
@@ -707,7 +719,7 @@ pub const Runtime = struct {
                         // message as admission does
                         // (`tests/tla/subagent/StopMessage.tla`
                         // RefusedOnlyWhenClosing).
-                        if (self.closingIndexLocked(target.child_id) != null) return self.encodeManaged(alloc, .{ .ok = false, .error_code = "child_closing" });
+                        if (self.closingIndexLocked(target.child_id) != null) return self.refuse(alloc, .child_closing);
                         var turned_away = false;
                         if (!self.hasPendingLocked(target.child_id) and !self.inTurnWorkLocked(target.child_id)) {
                             var result = try self.managed.steer(target.child_id, target.work_id, operation_id, fingerprint, request.message.message);
@@ -737,7 +749,7 @@ pub const Runtime = struct {
                                     if (options.cancel_flag) |cancel| if (cancel.load(.seq_cst)) return error.Cancelled;
                                     // The child may have been closed, or a message may
                                     // have queued for it, while the lock was free.
-                                    if (start_wait.closed or self.closingIndexLocked(target.child_id) != null) return self.encodeManaged(alloc, .{ .ok = false, .error_code = "child_closing" });
+                                    if (start_wait.closed or self.closingIndexLocked(target.child_id) != null) return self.refuse(alloc, .child_closing);
                                     if (self.hasPendingLocked(target.child_id) or self.inTurnWorkLocked(target.child_id)) {
                                         result = .waiting;
                                         break;
@@ -756,15 +768,9 @@ pub const Runtime = struct {
                                     var buf: [sent_result_bytes]u8 = undefined;
                                     return self.encodeManaged(alloc, .{ .ok = false, .error_code = "feedback_capacity", .result = capacityResult(&buf, agent) });
                                 },
-                                .unavailable, .cancelled, .conflict => return self.encodeManaged(alloc, .{
-                                    .ok = false,
-                                    .error_code = switch (result) {
-                                        .unavailable => "state_unavailable",
-                                        .cancelled => "child_cancelled",
-                                        .conflict => "operation_conflict",
-                                        else => unreachable,
-                                    },
-                                }),
+                                .unavailable => return self.refuse(alloc, .state_unavailable),
+                                .cancelled => return self.refuse(alloc, .child_cancelled),
+                                .conflict => return self.refuse(alloc, .operation_conflict),
                             }
                         }
                         // The work ended while this message waited for the lock,
@@ -774,7 +780,7 @@ pub const Runtime = struct {
                         if (turned_away and pass == 0 and !self.isBusyLocked(target.child_id) and !self.inTurnWorkLocked(target.child_id)) continue :admit;
                         // It waits, and starts the child's next turn.
                         self.queuePendingLocked(target.child_id, agent, operation_id, fingerprint, request.*, profiled, resolved_model) catch |err| {
-                            if (err == error.QueueFull) return self.encodeManaged(alloc, .{ .ok = false, .error_code = "queue_full" });
+                            if (err == error.QueueFull) return self.refuse(alloc, .{ .queue_full = .subagent });
                             return err;
                         };
                         keep_call = true;
@@ -796,10 +802,7 @@ pub const Runtime = struct {
                     } });
                     return self.encodeManaged(alloc, model_contract.feedbackResult(delivery));
                 },
-                .rejected => |failure| return self.encodeManaged(alloc, .{
-                    .ok = false,
-                    .error_code = failure.code,
-                }),
+                .rejected => |failure| return self.refuse(alloc, failure.refusal),
                 .ready => |ready| {
                     keep_call = true;
                     if (options.observer) |observer| observer.emit(.{ .delegation = .{ .call_id = options.invocation_id, .child_id = ready.child_id, .work_id = operation_id, .phase = .dispatched } });
@@ -1075,7 +1078,10 @@ pub const Runtime = struct {
     /// Makes the parent's next message waiting for `child_id` the slot's
     /// next work, or else marks the child idle.
     fn nextOrIdleLocked(self: *Runtime, child_id: []const u8) bool {
-        if (self.startNextPendingLocked(child_id)) return true;
+        if (self.startNextPendingLocked(child_id)) {
+            self.managed.markNext(child_id);
+            return true;
+        }
         self.clearBusyLocked(child_id);
         self.managed.markEnding(child_id);
         return false;
@@ -1641,7 +1647,7 @@ pub const Runtime = struct {
     /// is queued for it, a child's work ends with nothing to post, or the
     /// caller is stopped. Returns at once when nothing can still arrive.
     fn waitForMail(self: *Runtime, alloc: Allocator, options: ExecuteOptions) !ManagedExecutionResult {
-        const worker = options.caller_worker orelse return self.encodeManaged(alloc, .{ .ok = false, .error_code = "wait_unavailable" });
+        const worker = options.caller_worker orelse return self.refuse(alloc, .wait_unavailable);
         // Registered first, so a child that ends before the wait starts
         // still ends it.
         self.setWaiter(worker);
@@ -1696,6 +1702,12 @@ pub const Runtime = struct {
         var lock = self.managed.state_store.acquireLock();
         defer lock.release();
         const registry = try self.managed.state_store.load(alloc);
+        return self.rosterOf(alloc, registry, working_only);
+    }
+
+    /// `roster` for a caller that holds the admission mutex and has loaded
+    /// `registry` under the registry lock.
+    fn rosterOf(self: *Runtime, alloc: Allocator, registry: child_state.Registry, working_only: bool) ![]const []const u8 {
         var names: std.ArrayList([]const u8) = .empty;
         for (registry.children) |child| {
             const name = child.agentName() orelse continue;
@@ -1710,6 +1722,16 @@ pub const Runtime = struct {
     /// the owner and returned for the rest of it; a `fresh` one is built for
     /// each request.
     const NoteKind = enum { kept, fresh };
+
+    /// The refusal for `stop`, `close`, or `status` naming `agent`, which no
+    /// open subagent bears: it names the open ones. Takes the locks itself, so
+    /// the caller holds neither.
+    fn refuseNotOpen(self: *Runtime, alloc: Allocator, agent: []const u8) !ManagedExecutionResult {
+        var scratch = std.heap.ArenaAllocator.init(alloc);
+        defer scratch.deinit();
+        const open = try self.roster(scratch.allocator(), false);
+        return self.refuse(alloc, .{ .child_unavailable = .{ .not_open = .{ .agent = agent, .open = open } } });
+    }
 
     /// What a subagent is doing, as `status` says it.
     const ChildState = enum {
@@ -1943,7 +1965,10 @@ pub const Runtime = struct {
             try out.writer.print("{s}: closed by the user; a message to it starts a new one with no history", .{name});
             listed += 1;
         }
-        if (agent != null and listed == 0) return self.encodeManaged(alloc, .{ .ok = false, .error_code = "child_unavailable" });
+        if (agent) |wanted| if (listed == 0) {
+            const open_now = try self.rosterOf(a, registry, false);
+            return self.refuse(alloc, .{ .child_unavailable = .{ .not_open = .{ .agent = wanted, .open = open_now } } });
+        };
         if (listed == 0) try out.writer.writeAll("No subagents yet.");
         return self.encodeManaged(alloc, .{ .ok = true, .result = out.written(), .subagents = if (agent == null) open.items else null });
     }
@@ -1958,9 +1983,9 @@ pub const Runtime = struct {
             var lock = self.managed.state_store.acquireLock();
             defer lock.release();
             var registry = try self.managed.state_store.load(a);
-            const child = registry.findPersistent(agent) orelse return self.encodeManaged(alloc, .{ .ok = false, .error_code = "child_unavailable" });
+            const child = registry.findPersistent(agent) orelse break :blk null;
             break :blk try a.dupe(u8, child.id);
-        };
+        } orelse return self.refuseNotOpen(alloc, agent);
         const dropped, const stopped = blk: {
             self.admission_mutex.lockUncancelable(io_mod.getIo());
             defer self.admission_mutex.unlock(io_mod.getIo());
@@ -2071,9 +2096,9 @@ pub const Runtime = struct {
             var lock = self.managed.state_store.acquireLock();
             defer lock.release();
             var registry = try self.managed.state_store.load(a);
-            const child = registry.findPersistent(agent) orelse return self.encodeManaged(alloc, .{ .ok = false, .error_code = "child_unavailable" });
+            const child = registry.findPersistent(agent) orelse break :blk null;
             break :blk try a.dupe(u8, child.id);
-        };
+        } orelse return self.refuseNotOpen(alloc, agent);
         const closed = (self.closeChild(child_id, .parent) catch |err| switch (err) {
             error.CloseNotSaved => return self.encodeManaged(alloc, .{
                 .ok = false,
@@ -2081,7 +2106,7 @@ pub const Runtime = struct {
                 .result = try a.print("The close of {s} couldn't be saved, so it is still open.", .{agent}),
             }),
             else => return err,
-        }) orelse return self.encodeManaged(alloc, .{ .ok = false, .error_code = "child_unavailable" });
+        }) orelse return self.refuseNotOpen(alloc, agent);
         const dropped_text = switch (closed.dropped) {
             0 => "",
             1 => " The message waiting for it was dropped.",
@@ -2222,8 +2247,8 @@ pub const Runtime = struct {
     /// host's owner, and the owner, when it is a subagent, writes to its
     /// own parent. The message arrives framed as the subagent's.
     fn messageParent(self: *Runtime, alloc: Allocator, text: []const u8, options: ExecuteOptions, from_root: bool) !ManagedExecutionResult {
-        const sink = self.report_sink orelse return self.encodeManaged(alloc, .{ .ok = false, .error_code = "no_parent" });
-        if (from_root and !self.owner_has_parent) return self.encodeManaged(alloc, .{ .ok = false, .error_code = "no_parent" });
+        if (from_root and !self.owner_has_parent) return self.refuse(alloc, .{ .no_parent = .none });
+        const sink = self.report_sink orelse return self.refuse(alloc, .{ .no_parent = .unreachable_now });
         var arena = std.heap.ArenaAllocator.init(alloc);
         defer arena.deinit();
         const agent = if (from_root) "" else self.childName(arena.allocator(), options.caller_id) catch options.caller_id;
@@ -2242,10 +2267,7 @@ pub const Runtime = struct {
             .child_id = options.caller_id,
             .text = text,
             .user_typed = typed,
-        } }) catch |err| return self.encodeManaged(alloc, .{
-            .ok = false,
-            .error_code = if (err == error.QueueFull) "queue_full" else "no_parent",
-        });
+        } }) catch |err| return self.refuse(alloc, if (err == error.QueueFull) .{ .queue_full = .parent } else .{ .no_parent = .unreachable_now });
         debug_trace.eventf("mailbox", "post", .{}, "from={s} to={s} typed={d}", .{ options.caller_id, if (from_root) "owners_parent" else self.ownerName(), typed.len });
         return self.encodeManaged(alloc, .{ .ok = true, .result = "Sent to your parent. It arrives as your message, never as the user's." });
     }
@@ -2443,7 +2465,7 @@ pub const Runtime = struct {
         },
         rejected: struct {
             child_id: ?[]u8 = null,
-            code: []const u8,
+            refusal: refusal.Refusal,
         },
 
         fn deinit(self: *ManagedAdmission, alloc: Allocator) void {
@@ -2526,7 +2548,7 @@ pub const Runtime = struct {
             ) orelse return managedAdmissionRejected(
                 alloc,
                 existing.id,
-                "operation_conflict",
+                .operation_conflict,
             );
             if (!std.mem.eql(u8, &observed, &fingerprint)) {
                 debug_trace.logf(
@@ -2537,7 +2559,7 @@ pub const Runtime = struct {
                 return managedAdmissionRejected(
                     alloc,
                     existing.id,
-                    "operation_conflict",
+                    .operation_conflict,
                 );
             }
             try self.ensureManagedChildSession(
@@ -2571,7 +2593,7 @@ pub const Runtime = struct {
             .message => |message| {
                 if (registry.findPersistent(message.agent)) |child| {
                     // Closing, it takes nothing; once gone, the name starts a new one.
-                    if (self.closingIndexLocked(child.id) != null) return managedAdmissionRejected(alloc, child.id, "child_closing");
+                    if (self.closingIndexLocked(child.id) != null) return managedAdmissionRejected(alloc, child.id, .child_closing);
                     if (request.override().present()) {
                         debug_trace.logf(
                             "subagent",
@@ -2581,7 +2603,7 @@ pub const Runtime = struct {
                         return managedAdmissionRejected(
                             alloc,
                             child.id,
-                            "override_after_create",
+                            .override_after_create,
                         );
                     }
                     // A child whose slot still runs works between turns too:
@@ -2601,7 +2623,7 @@ pub const Runtime = struct {
                             const work_id = if (child.active) |active_work| active_work.id else "";
                             return .{ .feedback = .{ .child_id = id, .work_id = try alloc.dupe(u8, work_id) } };
                         },
-                        .reject => |code| return managedAdmissionRejected(alloc, child.id, @tagName(code)),
+                        .reject => |code| return managedAdmissionRejected(alloc, child.id, refusal.fromReject(code)),
                         .continue_persistent => {},
                         .create_persistent => unreachable,
                     }
@@ -2619,13 +2641,19 @@ pub const Runtime = struct {
                 }
                 const child_id = try session_store.generateSessionId(alloc);
                 defer alloc.free(child_id);
-                try registry.appendPersistent(
+                registry.appendPersistent(
                     alloc,
                     child_id,
                     message.agent,
                     message.instructions orelse "",
                     active,
-                );
+                ) catch |err| switch (err) {
+                    error.CapacityExceeded => {
+                        debug_trace.logf("subagent", "create refused agent={s}: open subagents at the limit", .{message.agent});
+                        return managedAdmissionRejected(alloc, null, .{ .host_failure = .subagent_limit });
+                    },
+                    else => return err,
+                };
                 // Without one named it runs in fx's own main, which sets
                 // nothing, so it has what its parent has.
                 try registry.setProfile(alloc, child_id, request.override().profile orelse profiles.main_name);
@@ -2715,6 +2743,13 @@ pub const Runtime = struct {
             .body = try model_contract.encodeResultAlloc(alloc, result),
         };
     }
+
+    /// A refusal as the result the model reads: its code and what to try
+    /// next (`refusal.zig`).
+    fn refuse(self: *Runtime, alloc: Allocator, why: refusal.Refusal) !ManagedExecutionResult {
+        _ = self;
+        return .{ .success = false, .body = try why.body(alloc) };
+    }
 };
 
 fn operationIdAlloc(
@@ -2793,6 +2828,9 @@ const MailboxFixture = struct {
     hosted: ?*worker_runtime.WorkerRuntime = null,
     release: std.Io.Event = .unset,
     runs: std.atomic.Value(usize) = .init(0),
+    /// How many runs began with their cancel flag already set: a work that
+    /// was stopped before it started.
+    cancelled_at_start: std.atomic.Value(usize) = .init(0),
     mutex: std.Io.Mutex = .init,
     /// "agent work_id outcome output" per report, in arrival order. Owned.
     reports: std.ArrayList([]u8) = .empty,
@@ -2840,6 +2878,7 @@ const MailboxFixture = struct {
 
     fn run(raw: ?*anyopaque, turn: *execution.TurnContext, message: domain.QueuedMessage, _: domain.AdmissionSnapshot, cancel: *std.atomic.Value(bool)) execution.ServiceError!execution.RunOutcome {
         const self: *@This() = @ptrCast(@alignCast(raw.?));
+        if (cancel.load(.seq_cst)) _ = self.cancelled_at_start.fetchAdd(1, .seq_cst);
         const worker = turn.workerRuntime();
         // Counted once its turn has begun, so a test that waits for the run
         // can message it. A run that takes no steering is a turn past its
@@ -4065,6 +4104,251 @@ test "after the user closes a subagent, main's status and the message that start
     }
 }
 
+/// Holds a subagent's slot after its work ended and the host's end hook
+/// returned, until a test lets it go, so the test can send a stop or a close
+/// into the gap before the slot goes on (`publish_test_controls`).
+const PublishHold = struct {
+    var holds = std.atomic.Value(u32).init(0);
+    var reached: std.Io.Event = .unset;
+    var go: std.Io.Event = .unset;
+
+    fn arm() void {
+        holds.store(0, .seq_cst);
+        reached = .unset;
+        go = .unset;
+        publish_test_controls.test_hold = hold;
+    }
+
+    /// Lets a held slot go.
+    fn release() void {
+        go.set(io_mod.getIo());
+    }
+
+    /// Stops holding. Call it once no slot thread runs any more, since a
+    /// slot reads the hook when each of its works ends.
+    fn clear() void {
+        publish_test_controls.test_hold = null;
+    }
+
+    /// Holds the first end; a later one goes straight on.
+    fn hold(_: []const u8) void {
+        if (holds.fetchAdd(1, .seq_cst) != 0) return;
+        reached.set(io_mod.getIo());
+        while (!go.isSet()) io_mod.sleep(std.time.ns_per_ms);
+    }
+};
+
+/// A subagent `reviewer` whose first work has ended, with its slot held
+/// before it goes on. With `next_waits`, a second message waited for it, so
+/// the host chose that message's turn as the slot's next work; otherwise the
+/// child is idle. With `hosted`, the turns run on a child agent's own worker,
+/// as the app's do. Initialized in place, since the host points into it.
+const EndedSubagent = struct {
+    alloc: Allocator,
+    arena_state: std.heap.ArenaAllocator,
+    parent: child_state.TestParent,
+    hosted_worker: worker_runtime.WorkerRuntime,
+    fixture: MailboxFixture,
+    runtime: *Runtime,
+    child_id: []const u8,
+
+    fn init(self: *EndedSubagent, alloc: Allocator, next_waits: bool, hosted: bool) !void {
+        self.* = .{
+            .alloc = alloc,
+            .arena_state = .init(alloc),
+            .parent = undefined,
+            .hosted_worker = .{},
+            .fixture = .{ .hold = next_waits, .hosted = if (hosted) &self.hosted_worker else null },
+            .runtime = undefined,
+            .child_id = undefined,
+        };
+        errdefer self.arena_state.deinit();
+        errdefer self.hosted_worker.deinit(alloc);
+        try self.parent.init(alloc);
+        errdefer self.parent.deinit();
+        PublishHold.arm();
+        // Undone in reverse: the slot is let go, its threads end with the
+        // runtime, and only then is the hook cleared.
+        errdefer PublishHold.clear();
+        self.runtime = if (hosted)
+            try hostedMailboxRuntime(alloc, &self.fixture, &self.parent)
+        else
+            try mailboxRuntime(alloc, &self.fixture, &self.parent);
+        errdefer self.runtime.deinit();
+        errdefer PublishHold.release();
+        const arena = self.arena_state.allocator();
+        _ = try callTool(self.runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "first" } }, "call-1", null);
+        if (next_waits) {
+            try waitForRuns(&self.fixture, 1);
+            _ = try callTool(self.runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "second" } }, "call-2", null);
+            self.fixture.release.set(io_mod.getIo());
+        }
+        if (!testing_event.setInTime(&PublishHold.reached)) return error.Timeout;
+        self.child_id = try reviewerId(self.runtime, arena);
+        if (!next_waits) try waitUntilQuiet(self.runtime);
+    }
+
+    fn deinit(self: *EndedSubagent) void {
+        PublishHold.release();
+        self.runtime.deinit();
+        PublishHold.clear();
+        self.fixture.deinit();
+        self.hosted_worker.deinit(self.alloc);
+        self.parent.deinit();
+        self.arena_state.deinit();
+    }
+
+    fn registryHolds(self: *EndedSubagent) !bool {
+        var registry = try self.runtime.managed.state_store.load(self.alloc);
+        defer registry.deinit(self.alloc);
+        return registry.findById(self.child_id) != null;
+    }
+};
+
+test "a stop right after a subagent's work ended finds it not working" {
+    const alloc = std.testing.allocator;
+    var ended: EndedSubagent = undefined;
+    try ended.init(alloc, false, false);
+    defer ended.deinit();
+
+    const answer = try callTool(ended.runtime, ended.arena_state.allocator(), .{ .stop = .{ .agent = "reviewer" } }, "call-3", null);
+    try std.testing.expect(std.mem.find(u8, answer, "reviewer was not working.") != null);
+    try std.testing.expect(std.mem.find(u8, answer, "Stopped") == null);
+    // Nothing else changed: its report was posted once, and it is still open.
+    try std.testing.expectEqual(@as(usize, 1), ended.fixture.reportCount());
+    try std.testing.expect(try ended.registryHolds());
+}
+
+test "a close right after a subagent's work ended closes it as an idle one" {
+    const alloc = std.testing.allocator;
+    var ended: EndedSubagent = undefined;
+    try ended.init(alloc, false, false);
+    defer ended.deinit();
+
+    const answer = try callTool(ended.runtime, ended.arena_state.allocator(), .{ .close = .{ .agent = "reviewer" } }, "call-3", null);
+    try std.testing.expect(std.mem.find(u8, answer, "Closed reviewer. A later message to reviewer starts a new one.") != null);
+    try std.testing.expect(std.mem.find(u8, answer, "ending its turn") == null);
+    try std.testing.expect(!try ended.registryHolds());
+    try std.testing.expectEqual(@as(usize, 1), ended.fixture.reportCount());
+    const taken = try ended.runtime.takeClosed(alloc);
+    defer {
+        for (taken) |id| alloc.free(id);
+        alloc.free(taken);
+    }
+    try std.testing.expectEqual(@as(usize, 1), taken.len);
+}
+
+test "the user's close right after a subagent's work ended ends no turn" {
+    const alloc = std.testing.allocator;
+    var ended: EndedSubagent = undefined;
+    try ended.init(alloc, false, false);
+    defer ended.deinit();
+
+    const closed = (try ended.runtime.closeChild(ended.child_id, .user)).?;
+    try std.testing.expect(!closed.stopped);
+    try std.testing.expectEqual(@as(usize, 0), closed.dropped);
+    try std.testing.expect(!try ended.registryHolds());
+    try std.testing.expectEqual(@as(usize, 1), ended.fixture.reportCount());
+}
+
+test "a stop right after a subagent's work ended stops the turn the user began on its screen" {
+    const alloc = std.testing.allocator;
+    var ended: EndedSubagent = undefined;
+    try ended.init(alloc, false, false);
+    defer ended.deinit();
+
+    // The user's turn runs on the child's own worker.
+    var worker = worker_runtime.WorkerRuntime{};
+    defer worker.deinit(alloc);
+    try std.testing.expect(worker.beginDirectProcessing(5));
+    const work_id = ended.runtime.beginUserWork(alloc, ended.child_id, &worker).?;
+    defer alloc.free(work_id);
+
+    const answer = try callTool(ended.runtime, ended.arena_state.allocator(), .{ .stop = .{ .agent = "reviewer" } }, "call-3", null);
+    try std.testing.expect(std.mem.find(u8, answer, "Stopped reviewer: its turn ended") != null);
+    try std.testing.expect(worker.isCancelRequested());
+    ended.runtime.endUserWork(ended.child_id, work_id, .cancelled, "");
+    // The parent's own stop answers that turn, so it owes no report.
+    try std.testing.expectEqual(@as(usize, 1), ended.fixture.reportCount());
+}
+
+fn expectStopStopsNextWork(hosted: bool) !void {
+    const alloc = std.testing.allocator;
+    var ended: EndedSubagent = undefined;
+    try ended.init(alloc, true, hosted);
+    defer ended.deinit();
+
+    const answer = try callTool(ended.runtime, ended.arena_state.allocator(), .{ .stop = .{ .agent = "reviewer" } }, "call-3", null);
+    try std.testing.expect(std.mem.find(u8, answer, "Stopped reviewer: its turn ended.") != null);
+    PublishHold.release();
+    try waitUntilQuiet(ended.runtime);
+    // The second turn began stopped: its run saw the cancel at its start. It
+    // owes no report, and the log says it was cancelled.
+    try std.testing.expectEqual(@as(usize, 1), ended.fixture.cancelled_at_start.load(.seq_cst));
+    try std.testing.expectEqual(@as(usize, 1), ended.fixture.reportCount());
+    var registry = try ended.runtime.managed.state_store.load(alloc);
+    defer registry.deinit(alloc);
+    try std.testing.expectEqual(child_state.Outcome.cancelled, registry.findById(ended.child_id).?.last_outcome.?);
+}
+
+fn expectCloseEndsNextWork(hosted: bool) !void {
+    const alloc = std.testing.allocator;
+    var ended: EndedSubagent = undefined;
+    try ended.init(alloc, true, hosted);
+    defer ended.deinit();
+
+    const answer = try callTool(ended.runtime, ended.arena_state.allocator(), .{ .close = .{ .agent = "reviewer" } }, "call-3", null);
+    // Its next turn was already chosen, so the close ends that turn.
+    try std.testing.expect(std.mem.find(u8, answer, "Closed reviewer, ending its turn.") != null);
+    PublishHold.release();
+    try waitUntilQuiet(ended.runtime);
+    try waitUntilClosed(ended.runtime, ended.child_id);
+    try std.testing.expectEqual(@as(usize, 1), ended.fixture.cancelled_at_start.load(.seq_cst));
+    try std.testing.expectEqual(@as(usize, 1), ended.fixture.reportCount());
+    const taken = try ended.runtime.takeClosed(alloc);
+    defer {
+        for (taken) |id| alloc.free(id);
+        alloc.free(taken);
+    }
+    try std.testing.expectEqual(@as(usize, 1), taken.len);
+}
+
+test "a stop right after a subagent's work ended stops the turn its waiting message starts" {
+    try expectStopStopsNextWork(false);
+}
+
+test "a stop right after a subagent's work ended stops the turn its waiting message starts, on a hosted subagent" {
+    try expectStopStopsNextWork(true);
+}
+
+test "a close right after a subagent's work ended runs no turn for its waiting message and owes no report" {
+    try expectCloseEndsNextWork(false);
+}
+
+test "a close right after a subagent's work ended runs no turn for its waiting message, on a hosted subagent" {
+    try expectCloseEndsNextWork(true);
+}
+
+test "the user's close right after a subagent's work ended ends the turn its waiting message starts, and says so" {
+    const alloc = std.testing.allocator;
+    var ended: EndedSubagent = undefined;
+    try ended.init(alloc, true, false);
+    defer ended.deinit();
+
+    const closed = (try ended.runtime.closeChild(ended.child_id, .user)).?;
+    try std.testing.expect(closed.stopped);
+    PublishHold.release();
+    try waitUntilQuiet(ended.runtime);
+    try waitUntilClosed(ended.runtime, ended.child_id);
+    try std.testing.expectEqual(@as(usize, 1), ended.fixture.cancelled_at_start.load(.seq_cst));
+    // What a user's close of a working subagent reports, and nothing of the
+    // turn's own work.
+    try std.testing.expectEqual(@as(usize, 2), ended.fixture.reportCount());
+    try std.testing.expectEqual(child_state.EndFacts{ .cause = .user_close }, ended.fixture.ends.items[1]);
+    try std.testing.expect(std.mem.find(u8, ended.fixture.reports.items[1], "The user closed it before it finished.") != null);
+    try std.testing.expect(std.mem.find(u8, ended.fixture.reports.items[1], "DONE second") == null);
+}
+
 test "an idle subagent closes at once, and its name then starts a new one" {
     const alloc = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(alloc);
@@ -4702,6 +4986,285 @@ test "the root has no parent to message" {
     defer runtime.deinit();
     const body = try callTool(runtime, arena, .{ .message = .{ .agent = "parent", .message = "done" } }, "call-1", null);
     try std.testing.expect(std.mem.find(u8, body, "no_parent") != null);
+}
+
+/// One call of the subagent tool as `caller_id`, as its model would make it.
+fn callToolAs(runtime: *Runtime, arena: Allocator, caller_id: []const u8, input: model_contract.RequestInput, invocation_id: []const u8) ![]const u8 {
+    var request = try model_contract.validateRequest(std.testing.allocator, input);
+    defer request.deinit(std.testing.allocator);
+    const result = try runtime.executeManaged(arena, &request, .{
+        .caller_id = caller_id,
+        .invocation_id = invocation_id,
+        .defaults = .{ .provider = .gateway, .model = "test", .effort = .auto, .conversation_language = session.ConversationLanguage.literal("en") },
+        .max_result_bytes = 4096,
+        .timestamp_ms = 1,
+    });
+    return result.body;
+}
+
+/// Adds a line to `problems` unless `body` refuses with `code` and its
+/// `result` is one short sentence for the model.
+fn checkRefusalSentence(problems: *std.ArrayList(u8), scenario: []const u8, code: []const u8, body: []const u8) !void {
+    const alloc = std.testing.allocator;
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
+    defer parsed.deinit();
+    const object = parsed.value.object;
+    const sentence: ?[]const u8 = if (object.get("result")) |value| (if (value == .string) value.string else null) else null;
+    const ok = object.get("ok").?.bool;
+    const got_code = if (object.get("error_code").? == .string) object.get("error_code").?.string else "";
+    const fits = if (sentence) |text|
+        text.len > 0 and text.len <= 400 and text[text.len - 1] == '.' and std.mem.findScalar(u8, text, '\n') == null
+    else
+        false;
+    if (!ok and std.mem.eql(u8, got_code, code) and fits) return;
+    try problems.print(alloc, "{s}: expected a {s} refusal with a one-line sentence, got {s}\n", .{ scenario, code, body });
+}
+
+/// A sink whose agent is gone, for a message to a parent that cannot take it.
+fn postGone(_: ?*anyopaque, _: *Runtime, _: Delivery) PostReportError!void {
+    return error.AgentGone;
+}
+
+/// A sink whose queue is full.
+fn postFull(_: ?*anyopaque, _: *Runtime, _: Delivery) PostReportError!void {
+    return error.QueueFull;
+}
+
+/// A sink that posts into a real worker queue, as the app's, `fx ask`'s and
+/// ACP's do, so the cap on messages is that queue's own.
+fn postToWorker(raw: ?*anyopaque, _: *Runtime, delivery: Delivery) PostReportError!void {
+    const worker: *worker_runtime.WorkerRuntime = @ptrCast(@alignCast(raw.?));
+    const alloc = std.testing.allocator;
+    const text = try alloc.dupe(u8, delivery.message.text);
+    worker.postMail(alloc, .{
+        .prompt = text,
+        .images = &.{},
+        .model = &.{},
+        .api_key = &.{},
+        .permission_mode = .auto,
+        .history = &.{},
+        .grants = &.{},
+        .author = .child,
+        .mail = .message,
+    }) catch |err| {
+        alloc.free(text);
+        return switch (err) {
+            error.OutOfMemory => error.OutOfMemory,
+            error.QueueFull => error.QueueFull,
+            else => error.AgentGone,
+        };
+    };
+}
+
+test "every refusal the host returns tells the model what happened and what to do next" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var parent: child_state.TestParent = undefined;
+    try parent.init(alloc);
+    defer parent.deinit();
+    var fixture = MailboxFixture{ .hold = true };
+    defer fixture.deinit();
+    const runtime = try mailboxRuntime(alloc, &fixture, &parent);
+    defer runtime.deinit();
+    var problems: std.ArrayList(u8) = .empty;
+    defer problems.deinit(alloc);
+
+    // A subagent that is working until the test releases it.
+    _ = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "first" } }, "call-0", null);
+    try waitForRuns(&fixture, 1);
+    const child_id = try reviewerId(runtime, arena);
+
+    try checkRefusalSentence(&problems, "instructions for a working subagent", "child_busy", try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "again", .instructions = "New rules." } }, "call-1", null));
+    try checkRefusalSentence(&problems, "effort for an existing subagent", "override_after_create", try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "again", .effort = "high" } }, "call-2", null));
+    try checkRefusalSentence(&problems, "a call id reused with another message", "operation_conflict", try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "another" } }, "call-0", null));
+    try checkRefusalSentence(&problems, "stop of an unknown name", "child_unavailable", try callTool(runtime, arena, .{ .stop = .{ .agent = "ghost" } }, "call-3", null));
+    try checkRefusalSentence(&problems, "close of an unknown name", "child_unavailable", try callTool(runtime, arena, .{ .close = .{ .agent = "ghost" } }, "call-4", null));
+    try checkRefusalSentence(&problems, "status of an unknown name", "child_unavailable", try callTool(runtime, arena, .{ .status = .{ .agent = "ghost" } }, "call-5", null));
+    try checkRefusalSentence(&problems, "a subagent that manages subagents", "caller_unavailable", try callToolAs(runtime, arena, "some-child", .{ .status = .{} }, "call-6"));
+    try checkRefusalSentence(&problems, "wait without a worker", "wait_unavailable", try callTool(runtime, arena, .wait, "call-7", null));
+
+    // The root has no parent, and a parent that cannot take a message.
+    try checkRefusalSentence(&problems, "the root messages its parent", "no_parent", try callTool(runtime, arena, .{ .message = .{ .agent = "parent", .message = "done" } }, "call-8", null));
+    const sink = runtime.report_sink;
+    defer runtime.report_sink = sink;
+    runtime.report_sink = null;
+    try checkRefusalSentence(&problems, "no sink for the message", "no_parent", try callTool(runtime, arena, .{ .message = .{ .agent = "parent", .message = "done" } }, "call-9", null));
+    runtime.owner_has_parent = true;
+    defer runtime.owner_has_parent = false;
+    runtime.report_sink = .{ .context = null, .post_fn = postGone };
+    try checkRefusalSentence(&problems, "the parent is gone", "no_parent", try callTool(runtime, arena, .{ .message = .{ .agent = "parent", .message = "done" } }, "call-10", null));
+    runtime.report_sink = .{ .context = null, .post_fn = postFull };
+    try checkRefusalSentence(&problems, "the parent's queue is full", "queue_full", try callTool(runtime, arena, .{ .message = .{ .agent = "parent", .message = "done" } }, "call-11", null));
+    runtime.report_sink = sink;
+
+    // A subagent that is being closed.
+    try runtime.closing.append(alloc, .{ .id = try alloc.dupe(u8, child_id) });
+    try checkRefusalSentence(&problems, "message to a closing subagent", "child_closing", try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "again" } }, "call-12", null));
+    alloc.free(runtime.closing.pop().?.id);
+
+    // A working subagent whose turn the message cannot reach.
+    runtime.managed.closed = true;
+    try checkRefusalSentence(&problems, "the owner is closed", "state_unavailable", try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "again" } }, "call-13", null));
+    runtime.managed.closed = false;
+    runtime.managed.slots.items[0].shutdown.store(true, .seq_cst);
+    try checkRefusalSentence(&problems, "the turn is shutting down", "child_cancelled", try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "again" } }, "call-14", null));
+    runtime.managed.slots.items[0].shutdown.store(false, .seq_cst);
+
+    // A working subagent that already holds as many waiting messages as it takes.
+    for (0..Runtime.max_pending_per_child) |index| {
+        _ = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "more" } }, try arena.print("fill-{d}", .{index}), null);
+    }
+    try checkRefusalSentence(&problems, "the subagent's queue is full", "queue_full", try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "one too many" } }, "call-15", null));
+
+    _ = try callTool(runtime, arena, .{ .stop = .{ .agent = "reviewer" } }, "call-stop", null);
+    fixture.release.set(io_mod.getIo());
+    try waitUntilQuiet(runtime);
+    try std.testing.expectEqualStrings("", problems.items);
+}
+
+test "a refusal reaches the model as its code with the sentence that says what to do next" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var parent: child_state.TestParent = undefined;
+    try parent.init(alloc);
+    defer parent.deinit();
+    var fixture = MailboxFixture{ .hold = true };
+    defer fixture.deinit();
+    const runtime = try mailboxRuntime(alloc, &fixture, &parent);
+    defer runtime.deinit();
+
+    _ = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "first" } }, "call-0", null);
+    _ = try callTool(runtime, arena, .{ .message = .{ .agent = "fixer", .message = "second" } }, "call-1", null);
+    try waitForRuns(&fixture, 2);
+
+    // The working subagent keeps its instructions and its conversation.
+    try std.testing.expectEqualStrings(
+        "{\"ok\":false,\"result\":\"The subagent is busy, and instructions can only be set while it is idle. Send the message again without instructions, or wait for its report and then send it with them.\",\"error_code\":\"child_busy\"}",
+        try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "again", .instructions = "New rules." } }, "call-2", null),
+    );
+    try std.testing.expectEqualStrings(
+        "{\"ok\":false,\"result\":\"model, effort and profile are fixed when a subagent is created, so this one keeps its own: send the message again without them. To change them, close it and start a new one, which loses its conversation.\",\"error_code\":\"override_after_create\"}",
+        try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "again", .model = "other" } }, "call-3", null),
+    );
+    // A name no subagent bears gets the names that are open.
+    const ghost = "{\"ok\":false,\"result\":\"No open subagent is named \\\"ghost\\\". Open subagents: reviewer, fixer.\",\"error_code\":\"child_unavailable\"}";
+    try std.testing.expectEqualStrings(ghost, try callTool(runtime, arena, .{ .stop = .{ .agent = "ghost" } }, "call-4", null));
+    try std.testing.expectEqualStrings(ghost, try callTool(runtime, arena, .{ .close = .{ .agent = "ghost" } }, "call-5", null));
+    try std.testing.expectEqualStrings(ghost, try callTool(runtime, arena, .{ .status = .{ .agent = "ghost" } }, "call-6", null));
+    // The refusals changed nothing: both subagents still work.
+    try std.testing.expectEqual(@as(usize, 2), fixture.runs.load(.seq_cst));
+
+    // The two are closed so no thread outlives the test. Which of them the
+    // list still names depends on when each turn ends, so nothing reads it.
+    _ = try callTool(runtime, arena, .{ .close = .{ .agent = "reviewer" } }, "call-7", null);
+    _ = try callTool(runtime, arena, .{ .close = .{ .agent = "fixer" } }, "call-8", null);
+    try waitUntilQuiet(runtime);
+}
+
+test "a parent queue that one subagent filled refuses another that sent nothing, and the sentence says whose messages it counts" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var parent: child_state.TestParent = undefined;
+    try parent.init(alloc);
+    defer parent.deinit();
+    var fixture = MailboxFixture{};
+    defer fixture.deinit();
+    const runtime = try mailboxRuntime(alloc, &fixture, &parent);
+    defer runtime.deinit();
+    // The parent's turn runs, so what its subagents send waits in its queue.
+    var parent_worker = worker_runtime.WorkerRuntime{};
+    defer parent_worker.deinit(alloc);
+    parent_worker.worker_processing = true;
+    parent_worker.active_turn_id = 9;
+    runtime.report_sink = .{ .context = &parent_worker, .post_fn = postToWorker };
+
+    // alpha sends as many messages as the queue takes.
+    for (0..agent_frame.queue_cap) |index| {
+        const sent = try callToolAs(runtime, arena, "alpha-1", .{ .message = .{ .agent = "parent", .message = "a note" } }, try arena.print("alpha-{d}", .{index}));
+        try std.testing.expectStringStartsWith(sent, "{\"ok\":true");
+    }
+    const full =
+        "{\"ok\":false,\"result\":\"Your parent already has 64 messages from its subagents waiting, the most it holds. Put the rest in your final reply.\",\"error_code\":\"queue_full\"}";
+    // beta has sent none, and the queue is full for it all the same.
+    try std.testing.expectEqualStrings(full, try callToolAs(runtime, arena, "beta-1", .{ .message = .{ .agent = "parent", .message = "a note" } }, "beta-0"));
+    try std.testing.expectEqualStrings(full, try callToolAs(runtime, arena, "alpha-1", .{ .message = .{ .agent = "parent", .message = "a note" } }, "alpha-more"));
+}
+
+test "a name no subagent bears, with no subagent ever started, says there are none open" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var parent: child_state.TestParent = undefined;
+    try parent.init(alloc);
+    defer parent.deinit();
+    var fixture = MailboxFixture{};
+    defer fixture.deinit();
+    const runtime = try mailboxRuntime(alloc, &fixture, &parent);
+    defer runtime.deinit();
+
+    const none_open = "{\"ok\":false,\"result\":\"No open subagent is named \\\"ghost\\\". You have no open subagents.\",\"error_code\":\"child_unavailable\"}";
+    try std.testing.expectEqualStrings(none_open, try callTool(runtime, arena, .{ .stop = .{ .agent = "ghost" } }, "call-1", null));
+    try std.testing.expectEqualStrings(none_open, try callTool(runtime, arena, .{ .close = .{ .agent = "ghost" } }, "call-2", null));
+    try std.testing.expectEqualStrings(none_open, try callTool(runtime, arena, .{ .status = .{ .agent = "ghost" } }, "call-3", null));
+}
+
+test "a message that would start a subagent past the session's limit says what to close, and closing one lifts it" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var parent: child_state.TestParent = undefined;
+    try parent.init(alloc);
+    defer parent.deinit();
+    var fixture = MailboxFixture{};
+    defer fixture.deinit();
+    const runtime = try mailboxRuntime(alloc, &fixture, &parent);
+    defer runtime.deinit();
+
+    // One subagent that really ran, and so can be messaged.
+    const first = try callTool(runtime, arena, .{ .message = .{ .agent = "keeper", .message = "go" } }, "call-keeper", null);
+    try std.testing.expectStringStartsWith(first, "{\"ok\":true");
+    try waitUntilQuiet(runtime);
+    // The rest of the limit is taken by subagents that only the registry knows.
+    {
+        var lock = runtime.managed.state_store.acquireLock();
+        defer lock.release();
+        var registry = try runtime.managed.state_store.load(alloc);
+        defer registry.deinit(alloc);
+        while (registry.children.len < child_state.max_children) {
+            const id = try session_store.generateSessionId(alloc);
+            defer alloc.free(id);
+            try registry.appendPersistent(alloc, id, try arena.print("worker-{d}", .{registry.children.len}), "", .{
+                .id = @constCast("fill-work"),
+                .message = @constCast("go"),
+                .created_at_ms = 1,
+            });
+        }
+        try runtime.managed.state_store.save(alloc, registry);
+    }
+
+    try std.testing.expectEqualStrings(
+        "{\"ok\":false,\"result\":\"This session already has 256 open subagents, the most it holds. Close one you are done with, or send a message to one that exists.\",\"error_code\":\"host_failure\"}",
+        try callTool(runtime, arena, .{ .message = .{ .agent = "overflow", .message = "one too many" } }, "call-over", null),
+    );
+    // A message to one that exists still goes through.
+    const existing = try callTool(runtime, arena, .{ .message = .{ .agent = "keeper", .message = "again" } }, "call-existing", null);
+    try std.testing.expectStringStartsWith(existing, "{\"ok\":true");
+    try waitUntilQuiet(runtime);
+
+    // Closing one frees its place at once.
+    const closed = try callTool(runtime, arena, .{ .close = .{ .agent = "keeper" } }, "call-close", null);
+    try std.testing.expectStringStartsWith(closed, "{\"ok\":true");
+    const started = try callTool(runtime, arena, .{ .message = .{ .agent = "overflow", .message = "now it fits" } }, "call-fits", null);
+    try std.testing.expectStringStartsWith(started, "{\"ok\":true");
+    try waitUntilQuiet(runtime);
 }
 
 test "a quiet note for a child this host does not have posts nothing" {
@@ -5803,11 +6366,11 @@ fn managedAdmissionReady(
 fn managedAdmissionRejected(
     alloc: Allocator,
     child_id: ?[]const u8,
-    code: []const u8,
+    why: refusal.Refusal,
 ) !Runtime.ManagedAdmission {
     return .{ .rejected = .{
         .child_id = if (child_id) |value| try alloc.dupe(u8, value) else null,
-        .code = code,
+        .refusal = why,
     } };
 }
 

@@ -626,6 +626,13 @@ pub const WorkerRuntime = struct {
     worker_stop_requested: bool = false,
     finalization_failure: ?FinalizationFailure = null,
     worker_cancel_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    /// Set with `worker_cancel_requested` only by a cancel that stops the
+    /// turn: the user's, an approval turn's, a running compaction's, or a
+    /// failed finalization. A steer or a subagent's report that interrupts
+    /// the model, or an image or `$skill` handed off to run next, never sets
+    /// it, so a turn's workspace captures, which watch it, stop only when the
+    /// turn is cancelled (D98). Cleared as each turn starts.
+    turn_cancel_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     /// Set when the user answers a request that waits for them; the request's
     /// recovery reads and clears it (`RequestRecovery.continue_flag`).
     recovery_continue_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
@@ -902,6 +909,7 @@ pub const WorkerRuntime = struct {
     fn markExplicitCancellationLocked(self: *WorkerRuntime) void {
         self.steering_cancel_turn_id = null;
         self.clearHandoffLocked();
+        self.turn_cancel_requested.store(true, .seq_cst);
         self.worker_cancel_requested.store(true, .seq_cst);
         self.stopCompactionActivityLocked();
         self.worker_cond.broadcast(io_mod.getIo());
@@ -934,6 +942,7 @@ pub const WorkerRuntime = struct {
         });
         self.steering_cancel_turn_id = null;
         self.clearHandoffLocked();
+        self.turn_cancel_requested.store(true, .seq_cst);
         self.worker_cancel_requested.store(true, .seq_cst);
         self.stopCompactionActivityLocked();
         self.worker_cond.broadcast(io_mod.getIo());
@@ -945,6 +954,7 @@ pub const WorkerRuntime = struct {
 
         self.steering_cancel_turn_id = null;
         self.clearHandoffLocked();
+        self.turn_cancel_requested.store(true, .seq_cst);
         self.worker_cancel_requested.store(true, .seq_cst);
         self.stopCompactionActivityLocked();
         _ = self.resolvePendingPermissionLocked(
@@ -958,6 +968,12 @@ pub const WorkerRuntime = struct {
 
     pub fn isCancelRequested(self: *const WorkerRuntime) bool {
         return self.worker_cancel_requested.load(.seq_cst);
+    }
+
+    /// Whether a cancel that stops the turn was requested, as opposed to a
+    /// steer's interrupt of the model (`turn_cancel_requested`).
+    pub fn isTurnCancelRequested(self: *const WorkerRuntime) bool {
+        return self.turn_cancel_requested.load(.seq_cst);
     }
 
     /// The user answered a request that waits for them, for example with
@@ -1101,6 +1117,7 @@ pub const WorkerRuntime = struct {
         }
         self.worker_stop_requested = true;
         self.steering_cancel_turn_id = null;
+        self.turn_cancel_requested.store(true, .seq_cst);
         self.worker_cancel_requested.store(true, .seq_cst);
         self.stopCompactionActivityLocked();
         self.worker_cond.broadcast(io_mod.getIo());
@@ -1342,6 +1359,7 @@ pub const WorkerRuntime = struct {
             self.queued_history = &.{};
         }
         self.direct_steering_closed = false;
+        self.turn_cancel_requested.store(false, .seq_cst);
         self.worker_cancel_requested.store(false, .seq_cst);
         self.worker_processing = true;
         self.active_turn_id = turn_id;
@@ -1458,6 +1476,7 @@ pub const WorkerRuntime = struct {
             return true;
         }
         if (self.active_context_compaction) {
+            self.turn_cancel_requested.store(true, .seq_cst);
             self.worker_cancel_requested.store(true, .seq_cst);
             self.stopCompactionActivityLocked();
             self.worker_cond.broadcast(io_mod.getIo());
@@ -2256,6 +2275,7 @@ pub const WorkerRuntime = struct {
         if (self.worker_stop_requested) return null;
         if (self.queued_context_compaction) |task| {
             self.queued_context_compaction = null;
+            self.turn_cancel_requested.store(false, .seq_cst);
             self.worker_cancel_requested.store(false, .seq_cst);
             self.worker_processing = true;
             self.active_turn_id = task.turn_id;
@@ -2325,6 +2345,7 @@ pub const WorkerRuntime = struct {
         if (transfer_history) self.queued_history = &.{};
         job.history = job_history;
         self.steering_cancel_turn_id = null;
+        self.turn_cancel_requested.store(false, .seq_cst);
         self.worker_cancel_requested.store(false, .seq_cst);
         self.worker_processing = true;
         self.active_turn_id = job.turn_id;
@@ -2394,6 +2415,7 @@ pub const WorkerRuntime = struct {
         defer self.worker_mutex.unlock(io_mod.getIo());
         if (self.worker_processing or self.worker_stop_requested) return false;
         self.direct_steering_closed = false;
+        self.turn_cancel_requested.store(false, .seq_cst);
         self.worker_cancel_requested.store(false, .seq_cst);
         self.worker_processing = true;
         self.active_turn_id = turn_id;
@@ -3193,6 +3215,16 @@ pub const WorkerRuntime = struct {
         }
         self.pending_permission_review = null;
         return response;
+    }
+
+    /// Whether a turn of this worker waits for the answer to a permission
+    /// request, and has not been stopped. It reads under the lock a request
+    /// holds while its observer registers it, so a request that is being
+    /// registered counts once it is.
+    pub fn permissionWaiting(self: *WorkerRuntime) bool {
+        self.worker_mutex.lockUncancelable(io_mod.getIo());
+        defer self.worker_mutex.unlock(io_mod.getIo());
+        return self.permissionRequestAwaitedLocked();
     }
 
     pub fn submitPermissionResponse(
@@ -5374,6 +5406,36 @@ test "interactive prompt during in-turn compaction activity waits without cancel
         .publication = .committed,
     });
     runtime.finishProcessing();
+}
+
+test "a steer or a hand-off that interrupts the model is not a turn cancel; the user's and an approval's are" {
+    const alloc = std.testing.allocator;
+    const Cancel = enum { interactive, request, approval };
+    for ([_]Cancel{ .interactive, .request, .approval }) |cancel| {
+        var runtime = WorkerRuntime{};
+        defer runtime.deinit(alloc);
+        try std.testing.expect(runtime.beginDirectProcessing(41));
+        try runtime.admitInteractivePrompt(alloc, try makePrompt(alloc, "steer", "model"));
+        try std.testing.expect(runtime.isCancelRequested());
+        try std.testing.expect(!runtime.cancellationStopsTurn());
+        try std.testing.expect(!runtime.isTurnCancelRequested());
+        // An image ends the turn to run next, still without a cancel.
+        try runtime.admitInteractivePrompt(alloc, try makeImagePrompt(alloc, "look", "model"));
+        try std.testing.expectEqual(@as(u64, 41), runtime.handed_off_turn_id);
+        try std.testing.expect(!runtime.isTurnCancelRequested());
+        switch (cancel) {
+            .interactive => runtime.requestInteractiveCancel(),
+            .request => runtime.requestCancel(),
+            .approval => runtime.cancelApprovalTurn(),
+        }
+        try std.testing.expect(runtime.isTurnCancelRequested());
+        try std.testing.expect(runtime.cancellationStopsTurn());
+        runtime.finishProcessing();
+        // The next turn starts clear.
+        try std.testing.expect(runtime.beginDirectProcessing(42));
+        try std.testing.expect(!runtime.isTurnCancelRequested());
+        runtime.finishProcessing();
+    }
 }
 
 test "interactive prompt after in-turn compaction settled steers immediately" {

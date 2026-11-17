@@ -2018,12 +2018,13 @@ const App = struct {
         return app_commands.Handlers(App).addSlack(self);
     }
 
-    pub fn snapshotMcpDefinition(self: *App, alloc: Allocator, name: []const u8, known: tool_mcp_runtime.Binding) !tool_mcp_runtime.DefinitionSnapshot {
-        return self.mcp.snapshotToolDefinition(alloc, name, known, self.permission_engine.rules, self.context_limits, .unrestricted);
+    /// `mode` is the mode of the agent that refreshes the tool: its rules are none in full access.
+    pub fn snapshotMcpDefinition(self: *App, alloc: Allocator, name: []const u8, known: tool_mcp_runtime.Binding, mode: types.PermissionMode) !tool_mcp_runtime.DefinitionSnapshot {
+        return self.mcp.snapshotToolDefinition(alloc, name, known, permissions.mcpRules(mode, self.permission_engine.rules), self.context_limits, .unrestricted);
     }
 
     pub fn snapshotMcpToolNames(self: *App, alloc: Allocator) ![][]u8 {
-        return self.mcp.snapshotToolNames(alloc, self.permission_engine.rules);
+        return self.mcp.snapshotToolNames(alloc);
     }
 
     pub fn snapshotMcpAccessView(
@@ -2031,9 +2032,8 @@ const App = struct {
         alloc: Allocator,
         owner_id: []const u8,
         parent_id: []const u8,
-        permission_rules: types.PermissionRuleSet,
     ) !?mcp_access_policy.View {
-        return self.mcp.snapshotAccessView(alloc, owner_id, parent_id, permission_rules);
+        return self.mcp.snapshotAccessView(alloc, owner_id, parent_id);
     }
 
     pub fn snapshotModelToolProjection(
@@ -5523,6 +5523,12 @@ test {
     _ = @import("core/auth/pending_revocation.zig");
     _ = @import("core/mcp_host/kept_sign_outs.zig");
     _ = @import("core/workspace/file_index.zig");
+    _ = @import("core/workspace/workspace_capture.zig");
+    _ = @import("core/workspace/capture_store.zig");
+    _ = @import("core/agent/runtime/deps.zig");
+    _ = @import("core/workspace/capture_retention.zig");
+    _ = @import("core/workspace/turn_capture.zig");
+    _ = @import("core/shared/repo_path.zig");
     _ = @import("core/workspace/path_completion.zig");
     _ = @import("core/workspace/directory_completion_job.zig");
     _ = @import("core/indexer/indexer.zig");
@@ -5568,6 +5574,8 @@ test {
     _ = @import("core/output/session_list_text.zig");
     _ = @import("core/workspace/pathing.zig");
     _ = @import("core/workspace/current_branch.zig");
+    _ = @import("core/workspace/repo_root.zig");
+    _ = @import("core/workspace/statusline_identity.zig");
     _ = @import("core/permissions/permission_gate.zig");
     _ = @import("core/permissions/permissions.zig");
     _ = @import("core/execution/process_identity.zig");
@@ -5780,6 +5788,60 @@ fn addTestChildAgent(app: *App, id: []const u8) !*app_agents_runtime.ChildAgent 
     errdefer app.alloc.free(child.id);
     try app.child_agents.append(app.alloc, child);
     return child;
+}
+
+// The per-step refresh of a selected MCP tool reads the host's rules through the agent's own deps, in
+// the mode of the agent that runs it: none in full access, so a tool a deny rule names stays, and the
+// host's rules in ask (tests/tla/mcp_host/McpRules.tla `FullAccessIgnoresRules`, `DenyHoldsOutside`).
+test "the per-step refresh of an MCP tool takes the rules of the mode of the agent that runs it" {
+    const alloc = std.testing.allocator;
+    const Permission = app_permission_runtime.Runtime(App);
+    const Fixture = @import("core/mcp_host/fake_server.zig").Fixture;
+    const mcp_contract = @import("core/mcp/mcp_contract.zig");
+    const lexical_relevance = @import("core/shared/lexical_relevance.zig");
+
+    var f: Fixture = undefined;
+    try f.init();
+    defer f.deinit();
+    const configs = [_]mcp_contract.McpServerConfig{.{ .name = "fake", .command = f.server }};
+    const mcp = try mcp_host.Host.create(alloc, std.testing.io, &configs, &f.inherited, f.options(), .{});
+    defer mcp.destroy();
+
+    var app = App{ .alloc = alloc };
+    defer app.shell.deinit(alloc);
+    defer app.pacer.deinit(alloc);
+    defer App.AgentsAppRuntime.deinitChildren(&app);
+    defer Permission.deinitSessionGrants(&app, &app.main_agent);
+    const full_access = try addTestChildAgent(&app, "instance-2");
+    full_access.agent.role = .instance;
+    Permission.initMode(&app, &app.main_agent, .ask);
+    Permission.initMode(&app, &full_access.agent, .ask);
+    Permission.setMode(&app, &full_access.agent, .yolo);
+
+    var rules_buf = [_]types.PermissionRule{
+        .{ .permission = @constCast("mcp_fake_echo"), .pattern = @constCast("*"), .action = .deny },
+    };
+    app.permission_engine.rules = .{ .rules = rules_buf[0..] };
+    app.mcp.host = mcp;
+    defer app.mcp.host = null;
+
+    // The tool, found with no rules, and its binding as a selected tool carries it.
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const query = try lexical_relevance.prepare("echo");
+    const found = try mcp.catalog.searchTools(arena, .{ .query = &query, .kind = .mcp }, .{}, .{}, .unrestricted, null);
+    try std.testing.expectEqual(@as(usize, 1), found.selected_tools.len);
+    const binding = found.selected_tools[0].mcp_binding.?;
+
+    const Bindings = app_callbacks.Bindings(App);
+    const yolo_deps = Bindings.agentRuntimeDeps(&app, &full_access.agent);
+    const ask_deps = Bindings.agentRuntimeDeps(&app, &app.main_agent);
+    const yolo_refresh = try yolo_deps.snapshot_mcp_definition.?(yolo_deps.ctx, arena, "mcp_fake_echo", binding);
+    const ask_refresh = try ask_deps.snapshot_mcp_definition.?(ask_deps.ctx, arena, "mcp_fake_echo", binding);
+    // Full access keeps the tool the rule names; ask drops it.
+    try std.testing.expect(yolo_refresh == .current);
+    try std.testing.expect(ask_refresh == .unavailable);
 }
 
 test "visiting a child agent puts its context, transcript, and pacer on the screen until it returns" {

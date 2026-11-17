@@ -22,6 +22,8 @@
 #   queue-closing        a message to a closing subagent waits, and goes with it  NoSilentLoss
 #   unmark-early         a closed subagent whose work ended is unmarked until its
 #                        close is written, and takes a message that goes with it  ClosingHoldsNothing
+#   gap-blind            a stop or close after a work ended, before its slot goes
+#                        on, answers as for a running turn and acts on nothing   GapStopHonest
 #   start-next-turn      a message to a starting turn waits for the next one    JoinsStartingWork
 #   note-after-take      the idle note is decided after the next turn took the
 #                        waiting messages, so it says idle while a turn starts   IdleNoteHonest
@@ -152,6 +154,7 @@ StopMessage stop-message-mutation-read-after-stop CountedNeverRead
 StopMessage stop-message-mutation-drop-waiting-at-end NoSilentLoss
 StopMessage stop-message-mutation-queue-closing NoSilentLoss
 StopMessage stop-message-mutation-unmark-early ClosingHoldsNothing
+StopMessage stop-message-mutation-gap-blind GapStopHonest
 StopMessage stop-message-mutation-start-next-turn JoinsStartingWork
 StopMessage stop-message-before-idle IdleNoteHonest
 StopMessage stop-message-before-names NamesTheIdle
