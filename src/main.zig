@@ -5910,7 +5910,7 @@ test "the tick leaves hidden agents' work for a later pass while a scrollback ha
     try std.testing.expect(app.screenAgent() == &on_screen.agent);
 }
 
-test "a hidden agent's pacer is flushed for held mail once a scrollback handoff ends, and not while it is pending" {
+test "a hidden agent's pacer is flushed for held mail once a scrollback handoff ends, and not while it is pending, under the sign-in key entry" {
     const alloc = std.testing.allocator;
     var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
     defer sink.close(io_mod.getIo());
@@ -5923,9 +5923,11 @@ test "a hidden agent's pacer is flushed for held mail once a scrollback handoff 
     const hidden = try addTestChildAgent(&app, "hidden");
     try App.AgentsAppRuntime.show(&app, on_screen);
 
-    // The hidden agent finished a turn that a report missed. Its own approval
-    // is open, so its pacer keeps the finished turn, and the worker holds the
-    // report for the commit.
+    // The hidden agent finished a turn that a report missed. The sign-in key
+    // entry is open, so no pacer is ticked and the hidden agent's keeps the
+    // finished turn, and its worker holds the report for the commit. (A
+    // subagent's approval would not do: a visit clears an approval its worker
+    // does not wait on.)
     const turn: types.HistoryTurn = .{ .assistant = .{ .user = .{ .text = @constCast("prompt") }, .assistant = @constCast("answer") } };
     const worker = &hidden.agent.worker;
     // `deinitChildren` leaves a worker to its owner, and the turn the flush
@@ -5954,8 +5956,10 @@ test "a hidden agent's pacer is flushed for held mail once a scrollback handoff 
     taken.deinit(alloc);
     try hidden.screen.pacer.enqueue(alloc, "still showing");
     try std.testing.expect(try hidden.screen.pacer.deferFinish(alloc, .{ .turn = turn }));
-    try std.testing.expect(try hidden.agent.approval_prompt.syncRequest(alloc, .{ .label = "shell.run npm test" }));
-    defer hidden.agent.approval_prompt.clear(alloc);
+    app.auth.picker_active = true;
+    app.auth.picker_stage = .api_key;
+    defer app.auth.picker_active = false;
+    try std.testing.expect(app.auth.apiKeyEntryActive());
     try std.testing.expect(worker.commitGateWaitsForCommit());
 
     // While the handoff is pending the tick skips the hidden agent: nothing is
