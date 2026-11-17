@@ -61,7 +61,8 @@ function send(message) {
 // array of { bad, then, slowMs, progressEveryMs }. `bad` first writes a line fx refuses and cannot
 // attach to a call: "utf8_last" (bytes that are not UTF-8, the id after them), "deep_last" (JSON
 // nested past the engine's limit, the id last), "garbage" (a line with no JSON, as a notification
-// the server mangled would be) or "cut" (a reply cut in the middle). `then` is "silent" (nothing
+// the server mangled would be), "cut" (a reply cut in the middle) or "duplicate_escaped" (the id first,
+// then `result` twice, the second time written `r\u0065sult`, which JSON reads as the same name). `then` is "silent" (nothing
 // more), "exit" (the server exits), or by default the valid reply, `slowMs` later, with progress
 // for the call's own token every `progressEveryMs` until then.
 const refused = JSON.parse(process.env.FX_MCP_REFUSED ?? "{}");
@@ -83,6 +84,8 @@ function refusedLine(id, bad) {
       return [`{"jsonrpc":"2.0","result":{"content":[],"structuredContent":${'{"a":'.repeat(3000)}1${"}".repeat(3000)}},"id":${id}}\n`];
     case "garbage":
       return [`${"x".repeat(80)}\n`];
+    case "duplicate_escaped":
+      return [`{"jsonrpc":"2.0","id":${id},"result":{"content":[]},"r\\u0065sult":{"content":[]}}\n`];
     case "cut":
       return [`{"jsonrpc":"2.0","id":${id},"result":{"content":[{"type":"te\n`];
     default:
