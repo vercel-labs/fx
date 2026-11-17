@@ -411,8 +411,10 @@ async function withFx(
 // report waits for main's next turn while the pacer still holds the first turn
 // behind the open prompt. The report's turn has to start while the prompt is
 // still open: the first turn is shown once above the prompt, saved, and the
-// worker's wait for that save ends without its time limit.
-async function reportWhilePromptStaysOpen(prompt: "approval" | "question") {
+// worker's wait for that save ends without its time limit. The helper's reply
+// comes `reportDelayMs` after main's turn ended, so the report can come after the
+// time limit that counted from the turn's end.
+async function reportWhilePromptStaysOpen(prompt: "approval" | "question", reportDelayMs = 0) {
   const promptShown = held();
   const mainTurnEnded = held();
   const reports: string[] = [];
@@ -435,7 +437,9 @@ async function reportWhilePromptStaysOpen(prompt: "approval" | "question") {
           questions: [{ question: "SWITCH_QUESTION pick one", options: [{ label: "SWITCH_A" }, { label: "SWITCH_B" }] }],
         });
     }
-    if (latest.includes("SWITCH_HELPER_TASK")) return mainTurnEnded.promise.then(() => text("helper_done", "SWITCH_HELPER_DONE"));
+    if (latest.includes("SWITCH_HELPER_TASK")) {
+      return mainTurnEnded.promise.then(() => Bun.sleep(reportDelayMs)).then(() => text("helper_done", "SWITCH_HELPER_DONE"));
+    }
     if (!body.includes('"main_w"')) {
       return messageSteps([
         { id: "main_w", agent: "writer", message: "SWITCH_WRITE_TASK", ...(prompt === "approval" ? { profile: "writer" } : {}) },
@@ -453,8 +457,9 @@ async function reportWhilePromptStaysOpen(prompt: "approval" | "question") {
     await until("main's request for the helper's report", () => reports.length >= 1);
 
     // The request came with the prompt still open, and not when the worker
-    // gave up waiting for the first turn's save.
+    // gave up waiting for the first turn's save: the save released it.
     expect(trace()).not.toContain("event=commit_gate_expired");
+    expect(trace()).toMatch(/event=commit_gate_released [^\n]*reason=committed/);
     const open = await session.waitForPane((pane) => pane.includes("SWITCH_MAIN_ONE") && pane.includes(promptText), 15_000);
 
     // The first turn shows above the open prompt, once, and the prompt stays.
@@ -4485,6 +4490,18 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
       `a report for main starts its next turn while a subagent's ${prompt} stays open`,
       async () => {
         await reportWhilePromptStaysOpen(prompt);
+      },
+      TIMEOUT,
+    );
+  }
+
+  // A person leaves an approval open for longer than the gate's limit, and the
+  // subagent reports after that.
+  for (const seconds of [6, 10]) {
+    test(
+      `a report ${seconds} s late for main starts its next turn while a subagent's approval stays open`,
+      async () => {
+        await reportWhilePromptStaysOpen("approval", seconds * 1000);
       },
       TIMEOUT,
     );
