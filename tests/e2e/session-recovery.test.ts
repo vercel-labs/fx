@@ -45,6 +45,12 @@ function savedFileHashes(root: string): Record<string, string> {
   return hashes;
 }
 
+/// Why fx refuses v1 session `id` when others can write its folder, or
+/// `entry` in it, and the command that makes it private (D61).
+function othersCanWrite(id: string, entry = ""): string {
+  return `others can write ${entry ? `${entry} in its folder` : "its folder"}, so its files may not be the ones fx saved; make it private with \`chmod -R go-w ~/.fx/sessions/${id}\``;
+}
+
 function createFixture(prefix: string) {
   const root = mkdtempSync(join(tmpdir(), prefix));
   const home = join(root, "home");
@@ -558,6 +564,111 @@ describe("session recovery", () => {
       const sideRecover = await runFx(["session", "recover", side!, "--json"], { cwd: fixture.workspace, env, timeoutMs: TIMEOUT });
       expect(sideRecover.code).toBe(1);
       expect(JSON.parse(sideRecover.stdout).code).toBe("SessionRecoveryNotNeeded");
+    } finally {
+      gateway.stop();
+      rmSync(fixture.root, { recursive: true, force: true });
+    }
+  }, TIMEOUT * 2);
+
+  test("a v1 session folder others can write is refused as unsafe by show, recover, convert and resume, and stays", async () => {
+    const fixture = createFixture("fx-session-writable-v1-");
+    const gateway = startFakeGateway([fakeGatewayFinalText("WRITABLE_V1_CONTINUED")]);
+    try {
+      const [id] = copyV1Fixture(fixture.home, "side");
+      const source = join(fixture.home, ".fx", "sessions", id!);
+      chmodSync(source, 0o757);
+      const before = savedFileHashes(source);
+      const env = gatewayEnv(fixture, gateway);
+      const run = (args: string[]) => runFx(args, { cwd: fixture.workspace, env, timeoutMs: TIMEOUT });
+      // Show and recover give the reason, with the folder and the fix.
+      for (const [args, verb] of [[["session", id!], "read"], [["session", "recover", id!], "recovered"]] as const) {
+        const message = `session ${id} can't be ${verb} safely: ${othersCanWrite(id!)}`;
+        const text = await run([...args]);
+        expect(text.code).toBe(1);
+        expect(text.stdout).toBe("");
+        expect(text.stderr).toBe(`fx session: ${message}\n`);
+        const json = await run([...args, "--json"]);
+        expect(json.code).toBe(1);
+        expect(JSON.parse(json.stdout)).toMatchObject({ kind: "session", code: "DurablePathUnsafe", error: message });
+      }
+      // In text mode fx ask says why once.
+      const asked = await run(["ask", "--auto", "--resume", id!, "Continue after recovery."]);
+      expect(asked.code).toBe(1);
+      expect(withoutConversionNotice(asked.stderr)).toBe(`fx ask: the session can't be converted: ${othersCanWrite(id!)}\n`);
+      const converted = await run(["sessions", "convert"]);
+      expect(converted.code).toBe(1);
+      expect(converted.stdout).toContain(`${id}: unreadable: ${othersCanWrite(id!)}`);
+      const resumed = await continueSession(fixture, gateway, id!);
+      expect(resumed.code).not.toBe(0);
+      expect(resumed.stderr).toContain(othersCanWrite(id!));
+      expect(gateway.requests).toHaveLength(0);
+      // The v1 folder stays as it was, and nothing was copied.
+      expect(savedFileHashes(source)).toEqual(before);
+      expect(lstatSync(source).mode & 0o777).toBe(0o757);
+      expect(existsSync(storeRoot(fixture.home)) ? readdirSync(storeRoot(fixture.home)) : []).toEqual([]);
+
+      // Made readable by others only, it converts (D61).
+      chmodSync(source, 0o755);
+      const after = await continueSession(fixture, gateway, id!);
+      expect(after.code).toBe(0);
+      expect(JSON.parse(after.stdout)).toMatchObject({ session_id: id, output: "WRITABLE_V1_CONTINUED" });
+      expect(existsSync(source)).toBe(false);
+
+      // Its v1 copy comes back, writable by others: v2 holds the session,
+      // so convert keeps the copy and reports nothing, run after run.
+      copyV1Fixture(fixture.home, "side");
+      chmodSync(source, 0o757);
+      for (let run_ = 0; run_ < 2; run_ += 1) {
+        const again = await run(["sessions", "convert"]);
+        expect(again.code).toBe(0);
+        expect(again.stdout).toContain("converted 0, busy 0, unreadable 0");
+      }
+      expect(existsSync(source)).toBe(true);
+      expect((await run(["session", id!])).code).toBe(0);
+    } finally {
+      gateway.stop();
+      rmSync(fixture.root, { recursive: true, force: true });
+    }
+  }, TIMEOUT * 2);
+
+  test("a v1 subagent folder or session file others can write is refused with its path and the fix, and stays", async () => {
+    const fixture = createFixture("fx-session-writable-v1-parts-");
+    const gateway = startFakeGateway([]);
+    try {
+      const env = gatewayEnv(fixture, gateway);
+      const run = (args: string[]) => runFx(args, { cwd: fixture.workspace, env, timeoutMs: TIMEOUT });
+      const sessions = join(fixture.home, ".fx", "sessions");
+
+      // A family whose subagent's folder others can write.
+      const [root, child] = copyV1Fixture(fixture.home, "family", 3);
+      const childFolder = join(sessions, child!);
+      chmodSync(childFolder, 0o757);
+      const reason = `its subagent ${child}: ${othersCanWrite(child!)}`;
+      const converted = await run(["sessions", "convert"]);
+      expect(converted.code).toBe(1);
+      expect(converted.stdout).toContain(`${root}: unreadable: ${reason}`);
+      const resumed = await continueSession(fixture, gateway, root!);
+      expect(resumed.code).not.toBe(0);
+      expect(resumed.stderr).toContain(reason);
+      const recovered = await run(["session", "recover", root!, "--json"]);
+      expect(recovered.code).toBe(1);
+      expect(JSON.parse(recovered.stdout).code).toBe("DurablePathUnsafe");
+      expect(existsSync(join(sessions, root!))).toBe(true);
+      expect(existsSync(childFolder)).toBe(true);
+
+      // A session whose events file others can write.
+      const [side] = copyV1Fixture(fixture.home, "side");
+      const sideFolder = join(sessions, side!);
+      chmodSync(join(sideFolder, "events.jsonl"), 0o646);
+      for (const args of [["session", side!, "--json"], ["session", "recover", side!, "--json"]]) {
+        const result = await run(args);
+        expect(result.code).toBe(1);
+        expect(JSON.parse(result.stdout).code).toBe("DurablePathUnsafe");
+      }
+      expect((await run(["sessions", "convert"])).stdout).toContain(`${side}: unreadable: ${othersCanWrite(side!, "events.jsonl")}`);
+      expect(existsSync(sideFolder)).toBe(true);
+      expect(gateway.requests).toHaveLength(0);
+      expect(existsSync(storeRoot(fixture.home)) ? readdirSync(storeRoot(fixture.home)) : []).toEqual([]);
     } finally {
       gateway.stop();
       rmSync(fixture.root, { recursive: true, force: true });
