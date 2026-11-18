@@ -672,6 +672,10 @@ fn runtimeLoads(a: Allocator, file: File, text: []const u8, name: []const u8) !b
             defer io_mod.resetEnvironForTest();
             var loaded = builtin_mcp.loadNativeConfigs(a, workspace) catch return false;
             defer loaded.deinit(a);
+            // `loadHost` expands the variables of what was loaded, as it starts the host, and drops an entry whose variable isn't valid.
+            var inherited = try io_mod.cloneEnvironMap(a);
+            defer inherited.deinit();
+            try project_config.expandProfileConfigs(a, &loaded.configs, &loaded.diagnostics, &inherited);
             return loadedOrHeld(loaded.configs.items, loaded.diagnostics.items, name);
         },
         .project => {
@@ -720,13 +724,20 @@ fn fuzzAddReaderAgree(_: void, smith: *std.testing.Smith) !void {
     // would skip it (a refusal for a misspelled key says nothing of the entry).
     const refusal = try refusalOf(a, file, before, after, name);
     const loads = try runtimeLoads(a, file, after, name);
-    if (refusal) |why| {
-        if (why == .entry) try testing.expect(!loads);
-    } else {
-        try testing.expect(loads);
-        // No misspelled key is left for the next edit to find.
-        if (file == .profile) try testing.expect(try project_config.misspelledKey(a, after) == null);
+    const refused_entry = if (refusal) |why| why == .entry else false;
+    if ((refused_entry and loads) or (refusal == null and !loads)) {
+        std.debug.print("{s}: add {s} {s}, and fx's loader {s} it\nbefore: {?s}\nafter: {s}\n", .{
+            @tagName(file),
+            name,
+            if (refusal) |why| (if (why == .entry) @tagName(why.entry) else "was refused for a misspelled key") else "was accepted",
+            if (loads) "loads" else "skips",
+            before,
+            after,
+        });
+        return error.TestUnexpectedResult;
     }
+    // No misspelled key is left for the next edit to find.
+    if (refusal == null and file == .profile) try testing.expect(try project_config.misspelledKey(a, after) == null);
     // The load path's bounded scan never finds a misspelling the edit's complete scan misses.
     if (before) |text| {
         var bounded = project_config.parseProfileDocument(a, text) catch return;
