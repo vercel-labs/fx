@@ -682,6 +682,18 @@ fn planPrintf(
     };
     if (words.len - 2 != conversions) return .{ .approval_required = .unsupported_argument };
 
+    // A data argument that starts with a dash reaches the system printf as an
+    // operand. Some builds, such as earlier uutils coreutils, parse `--help`
+    // or `--version` there as their own option and print help or version text
+    // instead of the data, while the shell's own printf treats it as data. Run
+    // these forms through the reviewed shell path so both produce the same
+    // bytes. A lone dash stays data for every implementation.
+    for (words[2..]) |argument| {
+        if (argument.len > 1 and argument[0] == '-') {
+            return .{ .approval_required = .unsupported_argument };
+        }
+    }
+
     var argv: std.ArrayList([]const u8) = .empty;
     try argv.append(alloc, policy.executable);
     try argv.appendSlice(alloc, words[1..]);
@@ -1303,7 +1315,7 @@ test "planner admits the reviewed direct command matrix" {
         "printf 'hello\\n'",
         "printf x",
         "printf '%%'",
-        "printf '%s' '--help'",
+        "printf '%s' 'value'",
         "printf '%s%s' one two",
         "printf '$(touch x)'",
         "pwd",
@@ -1419,6 +1431,8 @@ test "planner returns stable reasons for approval-bearing forms" {
         .{ .command = "printf %% extra", .reason = .unsupported_argument },
         .{ .command = "printf '%s'", .reason = .unsupported_argument },
         .{ .command = "printf '%s%s' one", .reason = .unsupported_argument },
+        .{ .command = "printf '%s' '--help'", .reason = .unsupported_argument, .target_os = .linux },
+        .{ .command = "printf '%s' '-x'", .reason = .unsupported_argument },
         .{ .command = "printf x\\ y", .reason = .unsupported_shell },
         .{ .command = "printf x \\\n y", .reason = .unsupported_shell },
         .{ .command = "wc -c < first.txt < second.txt", .reason = .unsupported_input_redirect, .target_os = .linux },
@@ -1647,7 +1661,6 @@ test "planner implements the total portable printf grammar" {
         "printf 'hello\\n'",
         "printf '%%%%'",
         "printf '%s' ''",
-        "printf '%s' '-leading'",
         "printf '%s' '100%'",
         "printf '%s' '\\x41'",
         "printf '%s' 'caf\u{00e9}'",
@@ -1667,6 +1680,11 @@ test "planner implements the total portable printf grammar" {
         "printf x extra",
         "printf '%s' one two",
         "printf '%s%s' one",
+        "printf '%s' '-leading'",
+        "printf '%s' '--help'",
+        "printf '%s' '--version'",
+        "printf '%s' '--'",
+        "printf '%s%s' one '--help'",
         "printf '%b' x",
         "printf '%q' x",
         "printf '%d' 1",
@@ -1690,7 +1708,6 @@ test "planner generated printf grammar accepts only exact productions and data c
     const alloc = std.testing.allocator;
     const data_classes = [_][]const u8{
         "",
-        "-leading",
         "100%",
         "\\x41",
         "printable ASCII",
@@ -1749,6 +1766,20 @@ test "planner generated printf grammar accepts only exact productions and data c
         }
     }
 
+    // A data argument starting with a dash stays on the reviewed shell path,
+    // because the system printf may read it as its own option.
+    for ([_][]const u8{ "-leading", "--help", "--version", "--" }) |data| {
+        const single = try buildPrintfCommand(alloc, "%s", &.{data});
+        defer alloc.free(single);
+        try expectApproval(single, false, .macos, .unsupported_argument);
+        try expectApproval(single, false, .linux, .unsupported_argument);
+
+        const second = try buildPrintfCommand(alloc, "%s:%s", &.{ "value", data });
+        defer alloc.free(second);
+        try expectApproval(second, false, .macos, .unsupported_argument);
+        try expectApproval(second, false, .linux, .unsupported_argument);
+    }
+
     for ([_][]const u8{
         "",
         "-leading",
@@ -1773,13 +1804,13 @@ test "planner generated printf grammar accepts only exact productions and data c
 }
 
 test "planner preserves accepted printf argv exactly" {
-    var admission = try expectDirect("printf '%s%s' '-x' 'caf\u{00e9}'", .macos);
+    var admission = try expectDirect("printf '%s%s' 'one' 'caf\u{00e9}'", .macos);
     defer admission.deinit(std.testing.allocator);
     const argv = admission.direct_read_only.stages[0].argv;
     try std.testing.expectEqual(@as(usize, 4), argv.len);
     try std.testing.expectEqualStrings("/usr/bin/printf", argv[0]);
     try std.testing.expectEqualStrings("%s%s", argv[1]);
-    try std.testing.expectEqualStrings("-x", argv[2]);
+    try std.testing.expectEqualStrings("one", argv[2]);
     try std.testing.expectEqualStrings("caf\u{00e9}", argv[3]);
 }
 
@@ -1791,7 +1822,7 @@ test "planner native printf forms match shell-visible execution" {
         "printf x",
         "printf 'hello\\n'",
         "printf '%%'",
-        "printf '%s' '--help'",
+        "printf '%s' '-'",
         "printf '%s%s' one two",
         "printf '%s' 'caf\u{00e9}'",
     };
@@ -1807,7 +1838,6 @@ test "planner generated native printf matrix matches shell bytes status and stde
     const alloc = std.testing.allocator;
     const data_classes = [_][]const u8{
         "",
-        "-leading",
         "100%",
         "\\x41",
         "printable ASCII",
