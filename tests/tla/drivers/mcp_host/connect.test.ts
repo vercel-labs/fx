@@ -10,11 +10,14 @@
 // The events are the FX_TRACE "net" lines of fx's connect
 // (src/core/shared/net_connect.zig), on macOS and Linux alike:
 //   <ms> [net] connect fd=<n> event=start|intr|done [result=ok|refused|canceled|other]
+// `start` is written for each call of the kernel's connect(2). fx calls it once per socket, so a socket
+// whose `start` is followed by another `start` before its `done` is a second connect on a connecting socket,
+// std's retry: the reader below turns it into a `reissue` record, and then the run fails twice: TLC
+// does not accept the trace, and the run counts it.
 // A refused connect shows start and then done on both systems: macOS answers a
 // non-blocking connect with EINPROGRESS and reports the refusal through
 // SO_ERROR, Linux may report it from connect itself, and the model allows
-// the kernel's answer at any point after start. A test named "control:" holds
-// on any binary.
+// the kernel's answer at any point after start.
 //
 // FX_BIN is the binary under test. FX_BIN_RELEASE, when set, is a ReleaseSafe
 // binary that runs the same checks.
@@ -43,23 +46,29 @@ interface Seen { code: number; stderr: string; answer: string; traces: Map<strin
 
 /**
  * Reads the per-socket events of one run from the connect's trace lines. A socket's life starts at its `start`
- * event: the kernel gives a closed socket's descriptor number to a later connect, so one number can carry
- * several connects one after another.
+ * event and ends at its `done`: the kernel gives a closed socket's descriptor number to a later connect, so one
+ * number can carry several connects one after another. A `start` for a number whose socket has not finished is a
+ * second connect on that socket, and is read as a `reissue`.
  */
-export function eventsOf(trace: string): TraceRecord[][] {
+function eventsOf(trace: string): TraceRecord[][] {
   const sockets: TraceRecord[][] = [];
   const open = new Map<number, TraceRecord[]>();
   for (const line of trace.split("\n")) {
-    const m = /\[net\] connect fd=(\d+) event=(start|intr|reissue|done)(?: result=(\w+))?/.exec(line);
+    const m = /\[net\] connect fd=(\d+) event=(start|intr|done)(?: result=(\w+))?/.exec(line);
     if (!m) continue;
     const fd = Number(m[1]);
     let list = open.get(fd);
+    if (m[2] === "start" && list !== undefined) {
+      list.push({ event: "reissue", data: {} });
+      continue;
+    }
     if (m[2] === "start" || list === undefined) {
       list = [];
       open.set(fd, list);
       sockets.push(list);
     }
     list.push({ event: m[2]!, data: m[3] === undefined ? {} : { result: m[3] } });
+    if (m[2] === "done") open.delete(fd);
   }
   return sockets;
 }
@@ -176,18 +185,22 @@ for (const [suffix, bin] of binaries) {
   }, 600_000);
 }
 
-test("control: a trace with a second connect on a connecting socket VIOLATES, and a stray signal that only ends a wait is ACCEPTED", async () => {
-  const dir = join(artifacts, "connect-control");
-  const ok = [{ event: "start" }, { event: "intr" }, { event: "done", data: { result: "ok" } }] as TraceRecord[];
-  const bad = [{ event: "start" }, { event: "intr" }, { event: "reissue" }, { event: "done", data: { result: "unexpected" } }] as TraceRecord[];
-  const g = await checkTrace({ module: "Connect", records: ok, constants: { ObsStd: false }, dir: join(dir, "good") });
-  const b = await checkTrace({ module: "Connect", records: bad, constants: { ObsStd: true }, dir: join(dir, "bad") });
-  expect(g.verdict).toBe("ACCEPTED");
-  expect(b.verdict).toBe("VIOLATES");
-}, 300_000);
+const lines = (...events: string[]) => events.map((event, i) => `${i} [net] connect fd=7 event=${event}`).join("\n");
 
-// The startup path never connects, so it never reaches the trace line in net_connect.zig:
-// with the `net` scope on, `fx help` and `fx --version` leave no connect line.
+test("the trace reader: a second start on a socket that has not finished is a reissue, and a descriptor number used again after done is a new socket", () => {
+  expect(eventsOf(lines("start", "intr", "done result=ok")).map((r) => r.map((e) => e.event))).toEqual([["start", "intr", "done"]]);
+  // Two connect(2) calls before the socket's done: std's retry.
+  expect(eventsOf(lines("start", "intr", "start", "done result=ok")).map((r) => r.map((e) => e.event))).toEqual([["start", "intr", "reissue", "done"]]);
+  // The kernel gave descriptor 7 to a later connect.
+  expect(eventsOf(lines("start", "done result=ok", "start", "done result=refused")).map((r) => r.map((e) => e.event))).toEqual([
+    ["start", "done"],
+    ["start", "done"],
+  ]);
+});
+
+// The startup commands never connect: with the `net` scope on, `fx help` and `fx --version` leave no connect
+// line. This holds on any binary, one without the trace line included, so it shows that these commands do not
+// connect, and nothing about the line itself.
 for (const args of [["help"], ["--version"]]) {
   test(`fx ${args.join(" ")} writes no net connect trace line`, async () => {
     const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-connect-startup-")));

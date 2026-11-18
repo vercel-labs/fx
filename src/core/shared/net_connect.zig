@@ -90,7 +90,6 @@ fn connectWith(
 ) net.IpAddress.ConnectError!net.Socket {
     try io.checkCancel();
     const fd = try openSocket(Threaded.posixAddressFamily(address), options);
-    traceConnect(io, fd, "start", null);
     const socket = connectOpened(start, io, fd, address) catch |err| {
         // The line comes before the close: a closed descriptor's number can go to
         // another thread's connect, whose lines would then mix with these.
@@ -110,9 +109,11 @@ fn connectOpened(
     fd: posix.fd_t,
     address: *const net.IpAddress,
 ) net.IpAddress.ConnectError!net.Socket {
-    try setNonblocking(fd);
     var storage: Threaded.PosixAddress = undefined;
     const length = Threaded.addressToPosix(address, &storage);
+    // One `start` line for each call of the kernel's connect, so a second call on a socket
+    // shows as a second line before its `done`, and everything that can fail after it ends in a `done`.
+    traceConnect(io, fd, "start", null);
     switch (start(fd, &storage.any, length)) {
         .SUCCESS => {},
         // Interrupted or not, the connection goes on in the kernel.
@@ -198,7 +199,7 @@ fn connectError(err: posix.E) net.IpAddress.ConnectError {
     };
 }
 
-/// A socket like the one std's connect opens: close-on-exec, blocking.
+/// A socket like the one std's connect opens: close-on-exec. It is non-blocking while it connects.
 fn openSocket(family: posix.sa_family_t, options: net.IpAddress.ConnectOptions) net.IpAddress.ConnectError!posix.fd_t {
     const mode, const protocol = try Threaded.posixSocketModeProtocol(family, options.mode, options.protocol);
     const flags: u32 = mode | if (Threaded.socket_flags_unsupported) 0 else posix.SOCK.CLOEXEC;
@@ -209,6 +210,7 @@ fn openSocket(family: posix.sa_family_t, options: net.IpAddress.ConnectOptions) 
                 const fd: posix.fd_t = @intCast(rc);
                 errdefer Threaded.closeFd(fd);
                 if (Threaded.socket_flags_unsupported) try setCloexec(fd);
+                try setNonblocking(fd);
                 return fd;
             },
             .INTR => continue,
@@ -528,12 +530,6 @@ test "waiting for a connect ends promptly when its task is canceled" {
     try testing.expect(waited.raw.toMilliseconds() < 1000);
 }
 
-/// CPU time the process has used so far, user and system, in microseconds.
-fn cpuMicroseconds() i64 {
-    const usage = posix.getrusage(0);
-    return (@as(i64, usage.utime.sec) + usage.stime.sec) * std.time.us_per_s + usage.utime.usec + usage.stime.usec;
-}
-
 /// The descriptor of the socket the last stand-in start call was given.
 var started_fd: std.atomic.Value(posix.fd_t) = .init(-1);
 
@@ -607,6 +603,8 @@ fn holdConnect(io: std.Io, address: net.IpAddress) net.IpAddress.ConnectError!ne
 
 test "a cancel while a connect waits closes its socket and ends within 100 ms" {
     const io = testing.io;
+    // A cancel that landed before `holdStart` ran would otherwise check the descriptor of an earlier test.
+    started_fd.store(-1, .release);
     var task = try io.concurrent(holdConnect, .{ io, loopback(9) });
     try io.sleep(.fromMilliseconds(100), .awake);
     const started = std.Io.Clock.Timestamp.now(io, .awake);
@@ -653,8 +651,10 @@ test "a trace line does not swallow the cancel that a connect is waiting for" {
     gate_ready.store(false, .release);
     gate_open.store(false, .release);
     var task = try io.concurrent(traceWhileCancelRequested, .{io});
-    var opener = try io.concurrent(openGateSoon, .{io});
     while (!gate_ready.load(.acquire)) try io.sleep(.fromMilliseconds(1), .awake);
+    // The timer starts once the task is waiting: a task that took more than its 100 ms to start would find the gate
+    // open before the cancel was asked for, and end without one.
+    var opener = try io.concurrent(openGateSoon, .{io});
     // The cancel is requested while the task is still between Io calls: it is
     // delivered at the task's next cancelation point.
     const result = task.cancel(io);
@@ -695,6 +695,78 @@ test "a connect writes one start and one done line to the net trace, and no addr
     try testing.expect(std.mem.find(u8, text, "127.0.0.1") == null);
 }
 
+var start_calls: std.atomic.Value(u32) = .init(0);
+
+/// The real connect, counted. It reports EINTR, as a call that a signal interrupts does: the connection goes on in the kernel.
+fn interruptedStart(fd: posix.fd_t, address: *const posix.sockaddr, length: posix.socklen_t) posix.E {
+    _ = start_calls.fetchAdd(1, .monotonic);
+    return switch (startConnect(fd, address, length)) {
+        .SUCCESS, .INPROGRESS => .INTR,
+        else => |err| err,
+    };
+}
+
+/// The real connect, counted. It reports EINPROGRESS, as macOS does for a connect that is not done yet, and Linux does
+/// for a loopback connect only sometimes.
+fn inProgressStart(fd: posix.fd_t, address: *const posix.sockaddr, length: posix.socklen_t) posix.E {
+    _ = start_calls.fetchAdd(1, .monotonic);
+    return switch (startConnect(fd, address, length)) {
+        .SUCCESS, .INPROGRESS => .INPROGRESS,
+        else => |err| err,
+    };
+}
+
+/// A connect whose start call reports an interruption or that it is in progress still calls the kernel's connect
+/// once, and writes one `start` line. std calls it again after an EINTR, and the kernel answers EALREADY or EISCONN.
+fn expectStartedOnce(comptime start: anytype) !void {
+    const alloc = testing.allocator;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(root);
+    const path = try std.Io.Dir.path.join(alloc, &.{ root, "net.log" });
+    defer alloc.free(path);
+    debug_trace.resetForTest();
+    defer debug_trace.resetForTest();
+    try debug_trace.configureForTestWithScopes(alloc, path, "net");
+
+    var server = try loopback(0).listen(io, .{});
+    defer server.deinit(io);
+    start_calls.store(0, .release);
+    const socket = try connectWith(start, io, &server.socket.address, .{ .mode = .stream });
+    Threaded.closeFd(socket.handle);
+    const accepted = try server.accept(io);
+    accepted.close(io);
+
+    try testing.expectEqual(@as(u32, 1), start_calls.load(.acquire));
+    var file = try std.Io.Dir.openFileAbsolute(io_mod.getIo(), path, .{});
+    defer file.close(io_mod.getIo());
+    const text = try io_mod.readFileToEnd(alloc, &file, 8192);
+    defer alloc.free(text);
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, text, "event=start"));
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, text, "event=done result=ok"));
+}
+
+test "an interrupted connect is not started again, and writes one start line" {
+    try expectStartedOnce(interruptedStart);
+}
+
+test "a connect that is in progress is not started again, and writes one start line" {
+    try expectStartedOnce(inProgressStart);
+}
+
+/// The CPU time, in microseconds, that the thread of `awaitMeasured` used while it waited.
+var wait_cpu_us: std.atomic.Value(i64) = .init(-1);
+
+/// `awaitConnected`, and how much CPU its own thread used: other threads of the test process, and a loaded machine, do
+/// not change it.
+fn awaitMeasured(io: std.Io, fd: posix.fd_t) net.IpAddress.ConnectError!void {
+    const before = std.Io.Clock.Timestamp.now(io, .cpu_thread);
+    defer wait_cpu_us.store(@intCast(@divTrunc(before.untilNow(io).raw.toNanoseconds(), std.time.ns_per_us)), .release);
+    try awaitConnected(io, fd);
+}
+
 test "waiting for a connect uses no CPU while it waits" {
     // A slice of 20 ms wakes the waiting thread 50 times a second; a loop that
     // spun would use the whole interval.
@@ -702,10 +774,11 @@ test "waiting for a connect uses no CPU while it waits" {
     const pair = try StalledPair.open();
     defer pair.close();
 
-    var task = try io.concurrent(awaitConnected, .{ io, pair.fds[0] });
-    const cpu_start = cpuMicroseconds();
+    wait_cpu_us.store(-1, .release);
+    var task = try io.concurrent(awaitMeasured, .{ io, pair.fds[0] });
     try io.sleep(.fromMilliseconds(1500), .awake);
-    const cpu_ms = @divTrunc(cpuMicroseconds() - cpu_start, std.time.us_per_ms);
     try testing.expectError(error.Canceled, task.cancel(io));
-    try testing.expect(cpu_ms < 150);
+    const cpu_us = wait_cpu_us.load(.acquire);
+    try testing.expect(cpu_us >= 0);
+    try testing.expect(cpu_us < 150 * std.time.us_per_ms);
 }
