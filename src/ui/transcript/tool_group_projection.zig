@@ -1611,6 +1611,15 @@ fn joinsByArgument(record: *const ToolDetailRecord) bool {
     return false;
 }
 
+/// Whether a running call's row would say nothing yet: its arguments have
+/// not arrived, and its status is a bare verb, such as "Reading" or
+/// "Searching", with no target after it.
+fn saysNothingYet(scratch: std.mem.Allocator, entry: TranscriptEntry, record: *const ToolDetailRecord) !bool {
+    if (record.outcome != null or storyHasArgs(record)) return false;
+    const phrase = std.mem.trim(u8, try entryStatus(scratch, entry) orelse return false, " ");
+    return phrase.len > 0 and std.mem.findScalar(u8, phrase, ' ') == null;
+}
+
 /// The row a running call that does not have the arguments its row depends
 /// on yet will most likely join, so it waits there instead of showing on a
 /// row of its own that folds away when they arrive: the read row for a read,
@@ -2246,6 +2255,7 @@ fn collectStoryRows(
     detail_indices: *const std.AutoHashMapUnmanaged(u32, usize),
     focused_entry_id: ?u32,
     retries: *const StoryRetries,
+    unshown: *std.AutoHashMapUnmanaged(u32, void),
 ) !std.ArrayList(StoryRow) {
     var rows: std.ArrayList(StoryRow) = .empty;
     calls: for (status_indices) |status_index| {
@@ -2264,6 +2274,13 @@ fn collectStoryRows(
         // will most likely join, and shows once they arrive.
         if (identity.kind == .single) if (detail) |record| if (record.outcome == null and (!storyHasArgs(record) or joinsByArgument(record))) {
             if (try pendingCallRow(scratch, rows.items, entry, record) != null) continue :calls;
+            // With no row to wait in, a call that names nothing yet, a bare
+            // verb such as "Reading", has nothing to show: its row shows once
+            // its target or the call itself arrives.
+            if (try saysNothingYet(scratch, entry, record)) {
+                try unshown.put(scratch, entry_id, {});
+                continue :calls;
+            }
         };
 
         // A repeated command joins only the row right before it; the other
@@ -2914,6 +2931,10 @@ fn writeGroupBlock(
     styles: transcript_blocks.Styles,
 ) ![]const u8 {
     const retries = try collectStoryRetries(scratch, entries, status_indices, details, detail_indices);
+    var unshown: std.AutoHashMapUnmanaged(u32, void) = .empty;
+    const rows = try collectStoryRows(scratch, entries, status_indices, details, detail_indices, focused_entry_id, &retries, &unshown);
+    // A group whose only calls name nothing yet shows nothing until they do.
+    if (rows.items.len == 0 and unshown.count() > 0) return "";
     var tally: StoryTally = .{};
     var focused_in_group = false;
     for (status_indices) |status_index| {
@@ -2922,11 +2943,11 @@ fn writeGroupBlock(
         const detail = detailForEntry(details, detail_indices, entry_id, null);
         if (statusNamesAsk(entry, detail)) continue;
         if (focused_entry_id == entry_id) focused_in_group = true;
-        // A failure the model fixed at once is not counted as a failure.
-        if (retries.fixed.contains(entry_id)) continue;
+        // A failure the model fixed at once is not counted as a failure, and
+        // a call with no row yet is not counted at all.
+        if (retries.fixed.contains(entry_id) or unshown.contains(entry_id)) continue;
         try tally.observe(scratch, entry, detail);
     }
-    const rows = try collectStoryRows(scratch, entries, status_indices, details, detail_indices, focused_entry_id, &retries);
     for (rows.items) |*row| {
         if (!storyCallFailed(row.detail)) continue;
         row.ends_turn = callEndsTurn(entries, row.status_index);
@@ -4411,7 +4432,11 @@ fn fillProjection(
                 style,
                 styles,
             );
-            try projection.setOwnedGroup(alloc, index, bytes);
+            if (bytes.bytes.len == 0) {
+                // Its calls name nothing yet, so the group shows nothing.
+                alloc.free(bytes.bytes);
+                alloc.free(bytes.lines);
+            } else try projection.setOwnedGroup(alloc, index, bytes);
             index += 1;
             continue;
         }
@@ -4459,7 +4484,10 @@ fn fillProjection(
             style,
             styles,
         );
-        try projection.setOwnedGroup(alloc, first_index, bytes);
+        if (bytes.bytes.len == 0) {
+            alloc.free(bytes.bytes);
+            alloc.free(bytes.lines);
+        } else try projection.setOwnedGroup(alloc, first_index, bytes);
     }
 
     try recapTurnSummaries(alloc, projection, entries, details, detail_indices, cols, checkpoint);
@@ -8642,6 +8670,63 @@ test "a running search or edit without the argument its row needs waits in its t
         errdefer std.debug.print("same file:\n{s}\n", .{same_text});
         try std.testing.expect(std.mem.find(u8, same_text, "├ Editing") == null);
         try std.testing.expect(std.mem.find(u8, same_text, "└ Editing") == null);
+    }
+}
+
+test "a running call that names nothing yet shows no row until it does" {
+    const alloc = std.testing.allocator;
+    // A streaming call's record has no arguments yet, only its status. A
+    // lone read that names no file yet shows nothing, not a bare verb.
+    {
+        const entries = [_]TranscriptEntry{
+            .{ .raw_bytes = .{ .id = 1, .bytes = "● Reading\n", .class = .tool_status } },
+        };
+        const details = [_]ToolDetailRecord{
+            .{ .entry_id = 1, .tool_name = @constCast("read_file"), .activity_kind = .read },
+        };
+        var projection = try build(alloc, &entries, &details, 120);
+        defer projection.deinit(alloc);
+        errdefer switch (projection.entry_actions.items[0]) {
+            .override => |override| std.debug.print("lone read override: {s}\n", .{override.bytes}),
+            else => |action| std.debug.print("lone read action: {s}\n", .{@tagName(action)}),
+        };
+        try std.testing.expect(projection.entry_actions.items[0] == .hide);
+    }
+    // Once its status names the file, its row shows.
+    {
+        const entries = [_]TranscriptEntry{
+            .{ .raw_bytes = .{ .id = 1, .bytes = "● Reading a.md\n", .class = .tool_status } },
+        };
+        const details = [_]ToolDetailRecord{
+            .{ .entry_id = 1, .tool_name = @constCast("read_file"), .activity_kind = .read },
+        };
+        const text = try groupTextForTest(alloc, &entries, &details);
+        defer alloc.free(text);
+        errdefer std.debug.print("named:\n{s}\n", .{text});
+        try std.testing.expect(std.mem.find(u8, text, "Reading a.md") != null);
+    }
+    // After a read, a search and a command that name nothing yet add no row
+    // and nothing to the header.
+    {
+        const entries = [_]TranscriptEntry{
+            .{ .raw_bytes = .{ .id = 1, .bytes = "● Read /w/a.zig\n", .class = .tool_status } },
+            .{ .raw_bytes = .{ .id = 2, .bytes = "● Searching\n", .class = .tool_status } },
+            .{ .raw_bytes = .{ .id = 3, .bytes = "● Running\n", .class = .tool_status } },
+        };
+        const details = [_]ToolDetailRecord{
+            .{ .entry_id = 1, .tool_name = @constCast("read_file"), .activity_kind = .read, .arguments_json = @constCast("{\"path\":\"/w/a.zig\"}"), .outcome = .completed },
+            .{ .entry_id = 2, .tool_name = @constCast("grep_files"), .activity_kind = .read },
+            .{ .entry_id = 3, .tool_name = @constCast("shell"), .activity_kind = .command },
+        };
+        const text = try groupTextForTest(alloc, &entries, &details);
+        defer alloc.free(text);
+        errdefer std.debug.print("after a read:\n{s}\n", .{text});
+        try std.testing.expect(std.mem.find(u8, text, "Searching") == null);
+        try std.testing.expect(std.mem.find(u8, text, "Running") == null);
+        try std.testing.expect(std.mem.find(u8, text, "earch") == null);
+        try std.testing.expect(std.mem.find(u8, text, "command") == null);
+        try std.testing.expect(std.mem.find(u8, text, "Read a.zig") != null);
+        try std.testing.expect(std.mem.findScalar(u8, std.mem.trim(u8, text, "\n"), '\n') == null);
     }
 }
 
