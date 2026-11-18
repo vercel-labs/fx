@@ -310,8 +310,10 @@ test("fault: twenty fx processes adding at once each keep their entry, and the e
   save(join(s.f.base, "parallel.json"), mixed.map((r) => ({ code: r.code, ms: r.ms })));
 }, 240_000);
 
-// How many of the 40 adds a kill must end for the test to say anything about a kill mid-add.
+// How many adds a kill must end for the test to say anything about a kill mid-add, and how many adds it may make
+// to get there.
 const KILLS_AT_LEAST = 5;
+const ADDS_AT_MOST = 120;
 
 test("crash: a kill at any moment of an add leaves the profile as it was or as the add made it, and the next fx takes the lock", async () => {
   const s = new Scenario("config-edit-crash", { st: "ok", ent: { a: "ok" } }, NONE);
@@ -321,10 +323,22 @@ test("crash: a kill at any moment of an add leaves the profile as it was or as t
   const log: { i: number; cls: string; delayMs: number; exited: number | null }[] = [];
   let kills = 0;
   // An add takes a few milliseconds, so the delays scale with how long one takes here: a delay is up to one and a half times an add.
-  const probe = await s.run(["mcp", "add", "--no-login", "probe", OK_URL]);
-  expect(probe.code).toBe(0);
-  const spanMs = Math.max(probe.ms, 4) * 1.5;
-  for (let i = 0; i < 40; i++) {
+  // The first add of a run is slow (a cold binary, a busy runner), so one add warms up and the fastest of five more sets the span.
+  const warm = await s.run(["mcp", "add", "--no-login", "warm", OK_URL]);
+  expect(warm.code).toBe(0);
+  const probes: number[] = [];
+  for (let p = 0; p < 5; p++) {
+    const probe = await s.run(["mcp", "add", "--no-login", `probe${p}`, OK_URL]);
+    expect(probe.code).toBe(0);
+    probes.push(probe.ms);
+  }
+  const probeMs = Math.min(...probes);
+  const spanMs = Math.max(probeMs, 4) * 1.5;
+  // A busy runner can still end many adds before their kill lands, so after 40 adds the test goes on until a kill
+  // has ended KILLS_AT_LEAST of them, up to ADDS_AT_MOST adds.
+  let adds = 0;
+  for (let i = 0; i < ADDS_AT_MOST && (i < 40 || kills < KILLS_AT_LEAST); i++) {
+    adds = i + 1;
     const cls: Cls = i % 2 === 0 ? "ok" : "bad";
     const before = readFileSync(s.paths.profile, "utf8");
     const child = Bun.spawn([binary, "mcp", "add", "--no-login", `k${i}`, ...argsOf(cls)], { cwd: s.f.workspace, env: fxEnv(s.f), stdin: "ignore", stdout: "ignore", stderr: "ignore" });
@@ -343,8 +357,8 @@ test("crash: a kill at any moment of an add leaves the profile as it was or as t
     // An entry the reader skips is never there, killed or not.
     expect(names.filter((n) => n.startsWith("k") && Number(n.slice(1)) % 2 === 1)).toEqual([]);
   }
-  save(join(s.f.base, "kills.json"), { seed: 20261110, kills, log });
-  console.log(`CRASH adds=40 killed_by_sigkill=${kills} span_ms=${spanMs} probe_ms=${probe.ms}`);
+  save(join(s.f.base, "kills.json"), { seed: 20261110, adds, kills, probes, log });
+  console.log(`CRASH adds=${adds} killed_by_sigkill=${kills} span_ms=${spanMs} probe_ms=${probeMs} probes=${probes.join(",")}`);
   // The seeded delays must end a good share of the adds in the middle of their work.
   expect(kills).toBeGreaterThanOrEqual(KILLS_AT_LEAST);
   const next1 = await s.run(["mcp", "add", "--no-login", "after", OK_URL]);
