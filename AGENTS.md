@@ -2,6 +2,10 @@
 
 Instructions for AI coding agents working with this codebase.
 
+## Rules
+
+Read `RULES.md` before any change, and cite its IDs. It wins over this file. Do not edit it unless @fazxes asks.
+
 ## Declaring Work Ready
 
 Do not say the work is "ready", "done", "good to go", "complete", or similar until you have personally run the binary and exercised the change on its happy path. A passing test suite is necessary, not sufficient — tests in this repo do not always construct the full runtime, attach a TTY, or spawn background threads, so they will not catch startup crashes, render regressions, or thread-lifetime bugs.
@@ -181,6 +185,8 @@ Do not bypass the permission system for new tools.
 
 ## Zig-Specific Patterns
 
+Use the `zig` skill (`.fx/skills/zig/SKILL.md`) when you write, review, or upgrade Zig code. It covers what Zig 0.17.x removed, deprecated, or changed without a compile error, including the 0.17.0 to 0.17.1 changes, and Zig ownership, error, I/O, concurrency, and testing practice. Where the skill and this file differ, this file takes precedence.
+
 ### Memory and Errors
 
 * Allocators are passed explicitly. Never use a global allocator.
@@ -327,7 +333,7 @@ Do not run the complete deterministic test suite locally as the default developm
 
 After the focused checks pass, create a clean checkpoint commit, push the non-`main` feature branch, and open a draft PR immediately. Linux is the gate for every change because most fx behavior is identical on every platform:
 
-* `.github/workflows/ci.yml` runs on Linux x86_64. It checks formatting, the PGSO corpus, the public surface, and the agents, compactor, indexer, and recovery boundaries, model-checks request recovery and the empty-reply nudge, runs the ReleaseSafe unit tests, runs the E2E files in four weighted shards plus the MCP conformance baseline, and qualifies the SDK packages. A failed E2E file is retried once. A file that passes only on retry gets a warning annotation; investigate it as a possible race. `Build & Test` fails when any SDK job fails.
+* `.github/workflows/ci.yml` runs on Linux x86_64. It checks formatting, the PGSO corpus, the public surface, and the agents, compactor, indexer, and recovery boundaries, model-checks request recovery, the empty-reply nudge, and the malformed tool call feedback, runs the ReleaseSafe unit tests, runs the E2E files in four weighted shards plus the MCP conformance baseline, and qualifies the SDK packages. A failed E2E file is retried once. A file that passes only on retry gets a warning annotation; investigate it as a possible race. `Build & Test` fails when any SDK job fails.
 * `.github/workflows/binary-size.yml` builds each release target on its native runner, reports the size change, and smoke-tests every target's binary. See **Binary Size Observability**.
 * `.github/workflows/bench.yml` enforces the startup latency budget. See **Benchmarks**.
 
@@ -337,13 +343,15 @@ macOS runs only when `scripts/detect-macos-need.sh` finds a change that can beha
 
 The durable-session model check in the `SDK (Bun + N-API/WASM)` job takes about 40 minutes, so a pull request runs it only when `scripts/detect-ci-need.sh` finds a change to code libfx owns: `sdk/`, `tests/tla/sdk/`, the drivers in `tests/tla/drivers/*.mjs`, the Node-API and WebAssembly core entry points, `src/acp/`, `src/core/hosts/`, `src/core/session_manager/`, `build.zig`, `build.zig.zon`, or `.github/workflows/ci.yml`. Every push to `main` runs it, which catches a durable-session regression in shared code such as the agent loop after it merges. To run it for any other change, run `gh workflow run ci.yml --ref <branch>`. If the detector cannot read the change, `Build & Test` fails instead of passing.
 
-The `TLA+ MCP models and drivers` job takes about 20 minutes, so a pull request runs its model checks and drivers only when the same detector finds a change to `src/mcp/`, `src/core/mcp_host/`, `src/core/mcp/`, `src/core/shared/net_connect.zig`, the models in `tests/tla/mcp/` and `tests/tla/mcp_host/`, their drivers in `tests/tla/drivers/mcp/`, `tests/tla/drivers/mcp_host/`, and `tests/tla/drivers/lib/`, the `tests/e2e/fixtures/mcp-*` servers, the helpers those drivers load (`tests/e2e/tmux-helpers.ts`, `tests/evals/eval-helpers.ts`, and `tests/e2e/render-lab/tape.ts`), `build.zig`, `build.zig.zon`, or `.github/workflows/ci.yml`. Every push to `main` runs them, and the same `gh workflow run ci.yml --ref <branch>` runs them for any other change.
+The `TLA+ MCP engine models and driver` and `TLA+ MCP host models and drivers` jobs run in parallel and take about 20 minutes each, so a pull request runs their model checks and drivers only when the same detector finds a change to `src/mcp/`, `src/core/mcp_host/`, `src/core/mcp/`, `src/core/shared/net_connect.zig`, the models in `tests/tla/mcp/` and `tests/tla/mcp_host/`, their drivers in `tests/tla/drivers/mcp/`, `tests/tla/drivers/mcp_host/`, and `tests/tla/drivers/lib/`, the `tests/e2e/fixtures/mcp-*` servers, the helpers those drivers load (`tests/e2e/tmux-helpers.ts`, `tests/evals/eval-helpers.ts`, and `tests/e2e/render-lab/tape.ts`), `build.zig`, `build.zig.zon`, or `.github/workflows/ci.yml`. Every push to `main` runs them, and the same `gh workflow run ci.yml --ref <branch>` runs them for any other change.
 
 The `TLA+ transcript window model` job takes about 4 minutes, so a pull request runs it only when the same detector finds a change to `src/ui/transcript/transcript_window*`, the model in `tests/tla/transcript_window/`, its drivers in `tests/tla/drivers/transcript_window/`, the driver code they share (`tests/tla/drivers/lib/` and `tests/tla/drivers/graph.mjs`), `build.zig`, `build.zig.zon`, or `.github/workflows/ci.yml`. It runs `tests/tla/transcript_window/check.sh --ci`, which leaves out the planted bugs and the run of a built fx along the model; run `tests/tla/transcript_window/check.sh` without `--ci` before you change the window.
 
 The `TLA+ subagent and session-write models` job takes a few minutes, so a pull request runs it only when the same detector finds a change to `src/core/subagent/`, `src/core/session/`, `src/core/agent/worker_runtime.zig`, `src/core/agent/runtime/parallel_execution.zig`, the models in `tests/tla/subagent/` and the session-write and live sessions models in `tests/tla/session/`, their drivers in `tests/tla/drivers/subagent/`, `tests/tla/drivers/session/write.test.ts`, and `tests/tla/drivers/session/live.test.ts`, the shared code in `tests/tla/lib/` and `tests/tla/drivers/lib/`, the helpers those drivers load (`tests/e2e/tmux-helpers.ts` and `tests/evals/eval-helpers.ts`), `build.zig`, `build.zig.zon`, or `.github/workflows/ci.yml`. It checks the models' design configs and drives a built fx along them, and leaves out the planted bugs and fx's old defects; run `tests/tla/subagent/check.sh` and `tests/tla/session/check.sh` with no arguments before you change that code.
 
 The `fx mcp call` model check, `.github/workflows/tla-mcp-call.yml`, runs `tests/tla/mcp_call/check.sh`: TLC on the bridge model, the core's tests, both drivers against the real core, and every planted bug. Every push to `main` runs it. A pull request runs it only with the `ci:tla-mcp-call` label, and `gh workflow run tla-mcp-call.yml --ref <branch>` runs it on any branch. Like `ci:macos`, the label needs triage access.
+
+The custom model connection model check, `.github/workflows/tla-configured-provider.yml`, runs `tests/tla/configured_provider/check.sh` and `bun tests/tla/drivers/configured_provider/driver.ts --self-check`: TLC on every config and planted mutation, the built fx against local fake servers along the models, and the deadline module through its lab. It runs only on request, never on a push: on a pull request with the `ci:tla-configured-provider` label, or with `gh workflow run tla-configured-provider.yml --ref <branch>`. Run it when you change `src/core/config/configured_provider.zig` or the custom connection adapters in `src/gateway/`.
 
 The macOS arm64 PGSO workflow runs on a pull request only when the PGSO pipeline changes: `scripts/pgso/` other than `corpus.json`, the `setup-pgso` action, or `.github/workflows/pgso-macos-arm64.yml`. To qualify any other change, run `gh workflow run pgso-macos-arm64.yml --ref <branch>`. The stable release always runs it.
 
@@ -431,7 +439,7 @@ Each platform check is informational. An increase of at least 52,429 bytes
 investigation, but does not reject the pull request. Investigate notable
 unexplained growth before changing the threshold. The full macOS arm64, Linux
 arm64, and Linux x86_64 PGSO release qualifications remain authoritative for the
-production ceilings (6.500 MiB for macOS arm64, 6.750 MiB for Linux arm64, and
+production ceilings (6.750 MiB for macOS arm64, 7.000 MiB for Linux arm64, and
 8.750 MiB for Linux x86_64) and performance gates.
 
 ## Documentation

@@ -49,13 +49,16 @@ export function traceObs(records: TraceRecord[], constants: Record<string, Value
 const substitutions: Record<string, string[]> = {
   HostLifecycle: ["Servers", "Project", "Reachable", "NeedsAuth", "MaxReloads", "MaxLeases"],
   Credentials: ["Names", "Faults", "InitKinds", "InitEntries", "InitV1"],
-  SignIn: ["MaxLogins", "MaxHosts", "MaxLeases", "Bridge"],
+  SignIn: ["MaxLogins", "MaxHosts", "MaxLeases", "Bridge", "CheckFirst"],
   ElicitationRouting: ["Versions", "MaxQ", "Slots", "Guard"],
   UrlRetry: ["Urls", "Slots", "MaxCalls", "Guard"],
   MixedBuilds: ["RevokeOnReplay"],
   StoreLockBudget: ["Budget", "Slack", "Tolerance"],
   RefreshLease: ["RefreshMax", "Budget", "Slack", "Tolerance"],
   Connect: ["Std"],
+  ConfigEdit: ["Names", "Classes", "Checked", "KeyScan", "GuardRemove", "Atomic"],
+  McpRules: ["Tools", "OwnRules"],
+  WireDepth: ["Limit", "Capacity", "EngineLimit", "MaxDepth"],
 };
 
 function wrapperCfg(module: string, invariant: string): string {
@@ -65,8 +68,8 @@ function wrapperCfg(module: string, invariant: string): string {
 }
 
 /** `constants` holds Obs<Name> for each wrapper constant. */
-export async function checkTrace(opts: { module: string; records: TraceRecord[]; constants: Record<string, Value>; dir: string }): Promise<Verdict> {
-  const { module, records, constants, dir } = opts;
+export async function checkTrace(opts: { module: string; records: TraceRecord[]; constants: Record<string, Value>; dir: string; specDir?: string }): Promise<Verdict> {
+  const { module, records, constants, dir, specDir } = opts;
   mkdirSync(dir, { recursive: true, mode: 0o700 });
   const text = JSON.stringify(records, null, 2);
   writeFileSync(join(dir, "trace.json"), text);
@@ -81,7 +84,7 @@ export async function checkTrace(opts: { module: string; records: TraceRecord[];
   const run = async (label: string, recs: TraceRecord[], invariant: string) => {
     const r = await runTlc({
       outDir: dir, label, module: `${module}Trace`, cfgText: wrapperCfg(module, invariant),
-      files: { "TraceObs.tla": traceObs(recs, constants) }, extraArgs: ["-deadlock"], workers: 2, timeoutMs: 300_000,
+      files: { "TraceObs.tla": traceObs(recs, constants) }, extraArgs: ["-deadlock"], workers: 2, timeoutMs: 300_000, specDir,
     });
     verdict.runs.push({ label, exit: r.exit, violated: r.violated, log: r.log, distinct: r.distinct });
     return r;

@@ -74,12 +74,16 @@ const allowlist: AllowRule[] = [
   rule("src/core/slack/install.zig", "run", /stdio_acquisition_write/, "noninteractive_output", "Slack CLI installation authorization prompt"),
   rule("src/core/shared/debug_trace.zig", "(?:writeLine|writeNoninteractiveStderr)", /debug_print/, "noninteractive_output", "opt-in tracing"),
   rule("src/main.zig", "(?:writeStdoutFast|writeStderrFast)", /(?:stdio_acquisition_write|fixed_fd_write|raw_fd_write)/, "noninteractive_output", "top-level help and CLI validation output"),
-  rule("src/main.zig", "(?:stdoutIsTerminal|stdoutTerminalColumns)", /fixed_descriptor/, "terminal_probe", "top-level help terminal capability probe"),
+  rule("src/core/shared/terminal_env.zig", "(?:stdoutIsTerminal|stdoutColumns|stderrColumns|terminalColumns)", /fixed_descriptor/, "terminal_probe", "stdout and stderr terminal probes for top-level help, session lists, and doctor progress"),
   rule("src/core/shell_command/command_effect.zig", "(?:expectDirect|expectNativePrintfEquivalent)", /debug_print/, "tests", "test diagnostics"),
   rule("src/core/app/app_render_runtime.zig", "checkRewritePublicationRetry", /debug_print/, "tests", "test diagnostics"),
   rule("src/core/indexer/scan.zig", "expectEntries", /debug_print/, "tests", "test diagnostics"),
   rule("src/core/indexer/wildmatch.zig", "expectCases", /debug_print/, "tests", "test diagnostics"),
-  rule("src/core/shell_command/safe_git.zig", "(?:plainOutput|ready)", /debug_print/, "tests", "test diagnostics"),
+  rule("src/core/shell_command/safe_git.zig", "(?:plainOutput|ready|expectOk|expectFacts)", /debug_print/, "tests", "test diagnostics"),
+  rule("src/core/workspace/capture_store.zig", "(?:gitEnv|expectRestores|printOutcome|expectExcluded)", /debug_print/, "tests", "test diagnostics"),
+  rule("src/core/session/session_adapter.zig", "expectLines", /debug_print/, "tests", "test diagnostics"),
+  rule("src/core/workspace/turn_capture.zig", "runGit", /debug_print/, "tests", "test diagnostics"),
+  rule("src/core/app/trace_report.zig", "(?:parse|nth|fieldProblem|expectStartsWith|expectEndsWith|expectNotIn)", /debug_print/, "tests", "test diagnostics"),
 ];
 
 function rule(

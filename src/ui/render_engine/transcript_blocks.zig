@@ -69,10 +69,17 @@ pub const ToolDetailRecord = struct {
     command_output_replay: ?types.CommandOutputReplay = null,
     command_process_presentation: ?types.CommandProcessPresentation = null,
     outcome: ?types.ToolOutcomeKind = null,
+    /// Whether the call's arguments still stream in, before the call
+    /// itself starts.
+    streaming: bool = false,
     fallback_disposition: ?ToolFallbackDisposition = null,
     lifecycle_id: ?types.ToolLifecycleId = null,
     presentation_group_id: ?types.ToolPresentationGroupId = null,
     command_output_entry_id: ?u32 = null,
+    /// Whether the row shows a subagent's report or message to main
+    /// (src/core/subagent/reports.zig, Row), not a call main made. Its call
+    /// has no id, so only this mark tells the two apart.
+    subagent_report: bool = false,
 
     pub fn isCapturedCommand(self: ToolDetailRecord) bool {
         // Hand-built details and restored records may predate the explicit
@@ -343,6 +350,7 @@ pub const TranscriptEntry = union(enum) {
         tone: types.NoticeTone,
         body: []const u8,
         visibility: types.NoticeVisibility,
+        detail: []const u8 = "",
         // The producer will replace this entry in place; its bytes are not
         // final and must not be released into terminal history.
         pending_replacement: bool = false,
@@ -421,6 +429,7 @@ pub const TranscriptEntry = union(enum) {
             .semantic_notice => |e| {
                 alloc.free(e.topic);
                 alloc.free(e.body);
+                alloc.free(e.detail);
             },
             .user_turn => |*e| {
                 types.freeUserTurn(alloc, e.turn);
@@ -1883,6 +1892,14 @@ pub fn renderSemanticNotice(
         if (notice.topic.len > 0) try logical.append(alloc, ' ');
         try logical.appendSlice(alloc, body);
     }
+    // The detail starts on its own row; rows from here on render dim.
+    const detail = std.mem.trim(u8, notice.detail, "\r\n");
+    const detail_start = if (detail.len > 0) blk: {
+        try logical.append(alloc, '\n');
+        const start = logical.items.len;
+        try logical.appendSlice(alloc, detail);
+        break :blk start;
+    } else logical.items.len;
 
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(alloc);
@@ -1894,6 +1911,8 @@ pub fn renderSemanticNotice(
         const indent: usize = if (row > 0) noticeContinuationIndent(logical.items, cursor, cols) else 0;
         const available: usize = @max(@as(usize, cols) -| indent, 1);
         const line = scanNoticeLine(logical.items, cursor, available);
+        var row_styles = styles;
+        if (cursor >= detail_start) row_styles.system_notice_text_style = styles.dim_style;
         try appendNoticeRow(
             &out,
             alloc,
@@ -1902,7 +1921,7 @@ pub fn renderSemanticNotice(
             cursor,
             line.end,
             indent,
-            styles,
+            row_styles,
             notice.tone,
             &active_hyperlink,
         );
@@ -1981,6 +2000,7 @@ fn renderEntryToBlockForPresentationInterruptible(
                     .tone = e.tone,
                     .body = e.body,
                     .visibility = e.visibility,
+                    .detail = e.detail,
                 },
                 styles,
                 cols,
@@ -3269,6 +3289,7 @@ fn appendSemanticNoticeTestEntry(
         .tone = owned.tone,
         .body = owned.body,
         .visibility = owned.visibility,
+        .detail = owned.detail,
     } });
 }
 
@@ -3383,6 +3404,35 @@ test "semantic notice glyph grid regression locks tone markers and lowercase top
         try std.testing.expectEqual(case.label_fg, fg_index(grid.cellAt(1, colon_col).?));
         try std.testing.expectEqual(@as(u8, 7), fg_index(grid.cellAt(1, colon_col + 2).?));
     }
+}
+
+test "semantic notice detail renders dim on its own indented rows" {
+    const alloc = std.testing.allocator;
+    const styles: Styles = .{
+        .system_notice_text_style = "<T>",
+        .dim_style = "<D>",
+        .reset_style = "<R>",
+    };
+    const rendered = try renderSemanticNotice(alloc, .{
+        .topic = "",
+        .tone = .neutral,
+        .body = "Using Vercel team Acme (acme).",
+        .detail = "Get more tokens with a pass",
+    }, styles, 20);
+    defer alloc.free(rendered);
+    try std.testing.expectEqualStrings(
+        "<T>* <R><T>Using Vercel team<R>\n  <T>Acme (acme).<R>\n  <D>Get more tokens<R>\n  <D>with a pass<R>",
+        rendered,
+    );
+
+    const plain = try renderSemanticNotice(alloc, .{
+        .topic = "",
+        .tone = .neutral,
+        .body = "Using Vercel team Acme (acme).",
+    }, styles, 80);
+    defer alloc.free(plain);
+    try std.testing.expect(std.mem.find(u8, plain, "<D>") == null);
+    try std.testing.expect(std.mem.find(u8, plain, "\n") == null);
 }
 
 test "semantic notice topics never render the tool-activity bullet or forced capitalization" {

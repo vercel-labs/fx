@@ -3,6 +3,9 @@
 // every subagent turn until the walk finishes it, holds the start of every
 // turn through FX_TEST_SUBAGENT_START_HELD and the end of every stopped or
 // closed work through FX_TEST_SUBAGENT_END_HELD until the walk lets it go,
+// holds the slot of a work whose end the host has handled through
+// FX_TEST_SUBAGENT_PUBLISH_HELD, where an `install` action keeps it for a stop
+// or close of the walk to land before the next work's turn begins,
 // and has TLC check that what fx answered is a behavior of the model
 // (StopMessageTrace.tla). The driver acts for a subagent only after main's
 // step has run and every answer is in, so each walk is one ordered sequence
@@ -10,9 +13,15 @@
 // starting: fx holds main's call until the turn begins, so the driver lets
 // the start go once fx says the message waits for it.
 //
+// Each finish and end also carries what fx told main about it: no report,
+// a report that says the subagent is idle, or a plain one (the idle= of
+// fx's report_queued trace line); and each message carries the idle
+// subagents its answer named when it started a new one.
+//
 //   bun test ./tests/tla/drivers/subagent/stop-message.test.ts
 //   FX_TLA_STOP_RANDOM=20 FX_TLA_STOP_SEED=7   adds 20 random walks
-//   FX_TLA_STOP_STRESS=40                       adds walks that stop and message 40 subagents in one step, and that message 40 starting ones
+//   FX_TLA_STOP_STRESS=40                       adds walks that stop and message 40 subagents in one step, that message 40 starting ones,
+//                                               and that start one more beside 40 idle ones
 //   FX_TLA_REPEAT=3                             runs each walk 3 times
 //   FX_BIN=<binary>                             drives another build
 import { expect, test } from "bun:test";
@@ -28,7 +37,7 @@ type Op = "send" | "stop" | "close";
 type Msg = [string, number];
 type Call = { op: Op; sub: string; msg: Msg | null; id: string };
 type Planned = { op: Op; sub: string };
-type Action = { main: Planned[] } | { finish: string } | { end: string } | { begin: string };
+type Action = { main: Planned[] } | { finish: string } | { end: string } | { begin: string } | { install: string };
 // holdStarts keeps a new turn's start held until a message reaches it, a
 // begin action, or the end of the walk; otherwise each start is let go as
 // soon as main's step has answered.
@@ -41,6 +50,12 @@ type Obs = {
   count: number;
   calls: Array<{ op: Op; sub: string; msg: Msg | null }>;
   msgs: Msg[];
+  // A finish's or end's report: "none", "idle", or "plain".
+  note: string;
+  // The idle subagents a message's answer named, and how many more it
+  // counted past them.
+  named: string[];
+  more: number;
 };
 type Verdict = "ACCEPTED" | "REJECTED" | "TOOL_ERROR";
 type Result = {
@@ -62,6 +77,10 @@ const main = (...calls: Planned[]): Action => ({ main: calls });
 const finish = (sub: string): Action => ({ finish: sub });
 const end = (sub: string): Action => ({ end: sub });
 const begin = (sub: string): Action => ({ begin: sub });
+// The stopped work ends and the host chooses the waiting messages as its next
+// work, which the slot is held at, so the next call lands before its turn
+// begins.
+const install = (sub: string): Action => ({ install: sub });
 
 // The named edge cases.
 const WALKS: Walk[] = [
@@ -88,6 +107,23 @@ const WALKS: Walk[] = [
   { name: "close-while-starting", subs: ["s1"], holdStarts: true, actions: [main(send("s1")), main(close("s1")), end("s1")] },
   { name: "stop-and-message-while-starting", subs: ["s1"], holdStarts: true, actions: [main(send("s1")), main(stop("s1"), send("s1")), end("s1"), finish("s1")] },
   { name: "message-then-stop-while-starting", subs: ["s1"], holdStarts: true, actions: [main(send("s1")), main(send("s1"), stop("s1")), end("s1")] },
+  // The host chooses the waiting messages as the next work; a stop or close that
+  // lands before its turn begins drops that work with its messages, and says so.
+  { name: "stop-between-works", subs: ["s1"], actions: [main(send("s1")), main(stop("s1")), main(send("s1")), install("s1"), main(stop("s1")), end("s1")] },
+  { name: "stop-between-works-two-messages", subs: ["s1"], actions: [main(send("s1")), main(stop("s1")), main(send("s1"), send("s1")), install("s1"), main(stop("s1")), end("s1")] },
+  { name: "close-between-works", subs: ["s1"], actions: [main(send("s1")), main(stop("s1")), main(send("s1")), install("s1"), main(close("s1")), end("s1")] },
+  // A new subagent's start names the idle ones, and only those.
+  { name: "start-beside-idle", subs: ["s1", "s2"], actions: [main(send("s1")), finish("s1"), main(send("s2")), finish("s2")] },
+  { name: "start-beside-working", subs: ["s1", "s2"], actions: [main(send("s1")), main(send("s2")), finish("s1"), finish("s2")] },
+  {
+    name: "start-beside-idle-and-working",
+    subs: ["s1", "s2", "s3"],
+    actions: [main(send("s1")), finish("s1"), main(send("s2")), main(send("s3")), finish("s2"), finish("s3")],
+  },
+  { name: "start-beside-stopped", subs: ["s1", "s2"], actions: [main(send("s1")), main(stop("s1")), main(send("s2")), end("s1"), finish("s2")] },
+  { name: "start-beside-closed", subs: ["s1", "s2"], actions: [main(send("s1")), finish("s1"), main(close("s1")), main(send("s2")), finish("s2")] },
+  // A message to a subagent that exists names none.
+  { name: "message-idle-names-none", subs: ["s1", "s2"], actions: [main(send("s1")), main(send("s2")), finish("s1"), finish("s2"), main(send("s1")), finish("s1")] },
 ];
 
 function rng(seed: number): () => number {
@@ -134,6 +170,14 @@ function stressWalk(count: number): Walk {
   };
 }
 
+// `count` subagents start and finish, then one more starts beside them all
+// idle: its answer names the first 8 and counts the rest.
+function stressNamesWalk(count: number): Walk {
+  const idle = Array.from({ length: count }, (_, i) => `s${i + 1}`);
+  const last = `s${count + 1}`;
+  return { name: `stress-names-${count}`, subs: [...idle, last], actions: [main(...idle.map(send)), ...idle.map(finish), main(send(last)), finish(last)] };
+}
+
 // Every subagent is started and held, then messaged while it starts.
 function stressStartWalk(count: number): Walk {
   const subs = Array.from({ length: count }, (_, i) => `s${i + 1}`);
@@ -174,6 +218,26 @@ function sendAnswer(text: string): string {
   if (text.includes("so the message waits and starts its next turn")) return "waits";
   if (text.includes("\"ok\":false")) return "refused";
   return `other: ${text.slice(0, 160)}`;
+}
+
+// The idle subagents a message's answer named when it started a new one,
+// and how many more it counted past them.
+// The answer lists them one to a line, "- <name>" or "- <name>: <purpose>",
+// and "- and N more" last; a name never holds a colon.
+function idleNames(raw: string): { named: string[]; more: number } {
+  // The answer is read from the tool result's JSON text, where each line
+  // break is still escaped.
+  const text = raw.replace(/\\n/g, "\n");
+  const at = text.indexOf("Idle subagents, each with its own context:");
+  if (at < 0) return { named: [], more: 0 };
+  const named: string[] = [];
+  for (const line of text.slice(at).split("\n").slice(1)) {
+    if (!line.startsWith("- ")) break;
+    const more = /^- and (\d+) more$/.exec(line);
+    if (more) return { named, more: Number(more[1]) };
+    named.push(line.slice(2).split(":")[0]!);
+  }
+  return { named, more: 0 };
 }
 
 function dropCount(text: string): number {
@@ -253,6 +317,13 @@ async function runWalk(walk: Walk, dir: string): Promise<Result> {
   const startMarker = join(root, "start-held");
   const startRelease = join(root, "start-release");
   const startReleased = new Set<number>();
+  const publishMarker = join(root, "publish-held");
+  const publishRelease = join(root, "publish-release");
+  const publishReleased = new Set<number>();
+  // Subagents whose slot is held with its next work chosen, by the hold.
+  const installed = new Map<string, number>();
+  // A walk without an install lets every end go through the publish hold at once.
+  if (!walk.actions.some((a) => "install" in a)) writeFileSync(publishRelease, "");
   // Set while main's step runs; a background release stops once it is false.
   let stepRunning = false;
   mkdirSync(join(home, ".fx"), { recursive: true });
@@ -333,6 +404,24 @@ async function runWalk(walk: Walk, dir: string): Promise<Result> {
     const ids = childIds(sub);
     return [...readFileSync(log, "utf8").matchAll(/event=report_queued to=main from=(\S+)/g)].filter((m) => ids.has(m[1]!)).length;
   };
+  // What the newest report of `sub`'s works told main: whether it said the
+  // subagent is idle (the idle= of fx's report_queued trace line).
+  const reportNote = (sub: string): string => {
+    const log = join(root, "trace.log");
+    if (!existsSync(log)) return "plain";
+    const ids = childIds(sub);
+    const last = [...readFileSync(log, "utf8").matchAll(/event=report_queued to=main from=(\S+) [^\n]*?idle=(true|false)/g)]
+      .filter((m) => ids.has(m[1]!)).at(-1);
+    return last?.[2] === "true" ? "idle" : "plain";
+  };
+  // Whether fx's trace says the close of `sub` was written: it says "closed"
+  // once the registry has dropped the child.
+  const closeWritten = (sub: string) => {
+    const log = join(root, "trace.log");
+    if (!existsSync(log)) return false;
+    const ids = childIds(sub);
+    return [...readFileSync(log, "utf8").matchAll(/event=closed child=(\S+)/g)].some((m) => ids.has(m[1]!));
+  };
   // The first held end of `sub` the walk has not released.
   const heldEnd = (sub: string): number | undefined => {
     const ids = childIds(sub);
@@ -364,6 +453,28 @@ async function runWalk(walk: Walk, dir: string): Promise<Result> {
     const ids = childIds(sub);
     return [...readFileSync(log, "utf8").matchAll(/event=message_waits_start child=(\S+)/g)].filter((m) => ids.has(m[1]!)).length;
   };
+  // The first held publish of `sub`'s end the walk has not released: its end hook
+  // has chosen what follows.
+  const heldPublish = (sub: string): number | undefined => {
+    const ids = childIds(sub);
+    const held: number[] = [];
+    for (const name of readdirSync(root)) {
+      const match = /^publish-held\.(\d+)$/.exec(name);
+      if (!match || publishReleased.has(Number(match[1]))) continue;
+      const child = /child=(\S+)/.exec(readFileSync(join(root, name), "utf8"))?.[1];
+      if (child && ids.has(child)) held.push(Number(match[1]));
+    }
+    return held.sort((a, b) => a - b)[0];
+  };
+  // The held slot goes on, and so does every later end.
+  const releasePublish = (sub: string) => {
+    const n = installed.get(sub);
+    if (n === undefined) return;
+    installed.delete(sub);
+    publishReleased.add(n);
+    writeFileSync(`${publishRelease}.${n}`, "");
+    writeFileSync(publishRelease, "");
+  };
   const releaseStart = async (sub: string) => {
     const n = await poll(() => heldStart(sub), 15_000);
     if (n === undefined) throw new Error(`${walk.name}: ${sub}'s turn never reached its start`);
@@ -372,7 +483,7 @@ async function runWalk(walk: Walk, dir: string): Promise<Result> {
     starting.delete(sub);
   };
   const row = (o: Partial<Obs> & { op: string }): Obs => ({
-    sub: "none", msg: null, answer: "none", count: 0, calls: [], msgs: [], ...o,
+    sub: "none", msg: null, answer: "none", count: 0, calls: [], msgs: [], note: "none", named: [], more: 0, ...o,
   });
   const push = (o: Partial<Obs> & { op: string }) => observations.push(row(o));
   // A first request takes every message that joined its turn before it was
@@ -436,24 +547,44 @@ async function runWalk(walk: Walk, dir: string): Promise<Result> {
   };
   // The stopped or closed work of `sub` ends; the messages waiting for it
   // start its next turn, which starts held like any other.
-  const endAction = async (sub: string) => {
+  // `keep` leaves the slot held where its end hook has chosen the next work, for a
+  // stop or close of the walk to land before the turn begins.
+  const endAction = async (sub: string, keep = false) => {
     if (!ending.has(sub)) return;
     const before = finishedCount(sub);
+    const reportsBefore = reportsQueued(sub);
     const n = await poll(() => heldEnd(sub), 15_000);
     if (n === undefined) throw new Error(`${walk.name}: ${sub}'s stopped work never reached its end`);
     released.add(n);
     writeFileSync(`${release}.${n}`, "");
     if ((await poll(() => finishedCount(sub) > before, 15_000)) === undefined) throw new Error(`${walk.name}: ${sub}'s stopped work never finished`);
-    const msgs = closing.has(sub) ? [] : [...waiting.get(sub)!];
+    // A report, if the end owes one, is queued as the work finishes.
+    await Bun.sleep(200);
+    const note = reportsQueued(sub) > reportsBefore ? reportNote(sub) : "none";
+    const wasClosing = closing.has(sub);
+    const msgs = wasClosing ? [] : [...waiting.get(sub)!];
     ending.delete(sub);
     closing.delete(sub);
     waiting.get(sub)!.clear();
-    push({ op: "end", sub, msgs: msgs.map(parseToken) });
+    push({ op: keep ? "end_gap" : "end", sub, note });
+    if (wasClosing) {
+      // The close is written once nothing of the work runs, and the child is
+      // closing until then; the walk goes on only after fx says it is gone.
+      if ((await poll(() => closeWritten(sub) || undefined, 15_000)) === undefined) throw new Error(`${walk.name}: ${sub}'s close was never written`);
+      push({ op: "write_close", sub });
+    }
+    if (keep) {
+      if (msgs.length === 0 || wasClosing) throw new Error(`${walk.name}: ${sub}'s end chose no next work to hold`);
+      const held = await poll(() => heldPublish(sub), 15_000);
+      if (held === undefined) throw new Error(`${walk.name}: ${sub}'s slot never reached the publish hold`);
+      installed.set(sub, held);
+      return;
+    }
     if (msgs.length === 0) return;
     starting.add(sub);
     await releaseStart(sub);
     running.add(sub);
-    push({ op: "begin", sub });
+    push({ op: "begin", sub, msgs: msgs.map(parseToken) });
     const tokens = await nextArrival(sub);
     for (const t of msgs) {
       if (!tokens.includes(t)) throw new Error(`${walk.name}: ${sub}'s next turn did not take ${t}`);
@@ -484,7 +615,7 @@ async function runWalk(walk: Walk, dir: string): Promise<Result> {
     // The work publishes its end just after queuing the report.
     await Bun.sleep(200);
     running.delete(sub);
-    push({ op: "finish", sub });
+    push({ op: "finish", sub, note: reportNote(sub) });
   };
   const takeAnswers = async (body: string, calls: Call[]) => {
     stepRunning = false;
@@ -494,7 +625,7 @@ async function runWalk(walk: Walk, dir: string): Promise<Result> {
       const s = call.sub;
       if (call.op === "send") {
         const answer = sendAnswer(text);
-        push({ op: "send", sub: s, msg: call.msg, answer });
+        push({ op: "send", sub: s, msg: call.msg, answer, ...idleNames(text) });
         const t = token(call.msg!);
         if (answer === "started") {
           startTokens.add(t);
@@ -526,6 +657,9 @@ async function runWalk(walk: Walk, dir: string): Promise<Result> {
         }
         unread.get(s)!.clear();
         waiting.get(s)!.clear();
+        // The slot held with its next work chosen goes on and finds the work
+        // stopped: no turn begins.
+        releasePublish(s);
       }
     }
     // A turn the step started begins now unless the walk holds starts. A
@@ -547,6 +681,7 @@ async function runWalk(walk: Walk, dir: string): Promise<Result> {
   const releaseAll = () => {
     writeFileSync(release, "");
     writeFileSync(startRelease, "");
+    writeFileSync(publishRelease, "");
     for (const [s, resolve] of held) {
       held.delete(s);
       resolve(final(`WALKDONE ${s}`));
@@ -593,7 +728,8 @@ async function runWalk(walk: Walk, dir: string): Promise<Result> {
         else if ("begin" in action) {
           await beginAction(action.begin);
           await readFirst(action.begin);
-        } else await endAction(action.end);
+        } else if ("install" in action) await endAction(action.install, true);
+        else await endAction(action.end);
       }
       await settle();
     } catch (caught) {
@@ -638,6 +774,8 @@ async function runWalk(walk: Walk, dir: string): Promise<Result> {
       FX_TEST_SUBAGENT_END_RELEASE: release,
       FX_TEST_SUBAGENT_START_HELD: startMarker,
       FX_TEST_SUBAGENT_START_RELEASE: startRelease,
+      FX_TEST_SUBAGENT_PUBLISH_HELD: publishMarker,
+      FX_TEST_SUBAGENT_PUBLISH_RELEASE: publishRelease,
     }),
     stdin: "ignore",
     stdout: "pipe",
@@ -673,7 +811,8 @@ function observedModule(observations: Obs[]): string {
   const rows = observations.map((o) => {
     const calls = `<<${o.calls.map((c) => `[op |-> ${str(c.op)}, sub |-> ${str(c.sub)}, msg |-> ${tlaMsg(c.msg)}]`).join(", ")}>>`;
     const msgs = `{${o.msgs.map(tlaMsg).join(", ")}}`;
-    return `[op |-> ${str(o.op)}, sub |-> ${str(o.sub)}, msg |-> ${tlaMsg(o.msg)}, answer |-> ${str(o.answer)}, count |-> ${o.count}, calls |-> ${calls}, msgs |-> ${msgs}]`;
+    const named = `{${o.named.map(str).join(", ")}}`;
+    return `[op |-> ${str(o.op)}, sub |-> ${str(o.sub)}, msg |-> ${tlaMsg(o.msg)}, answer |-> ${str(o.answer)}, count |-> ${o.count}, calls |-> ${calls}, msgs |-> ${msgs}, note |-> ${str(o.note)}, named |-> ${named}, more |-> ${o.more}]`;
   });
   return ["---- MODULE StopMessageObserved ----", "EXTENDS Sequences", `Observed == <<${rows.join(",\n  ")}>>`, "====", ""].join("\n");
 }
@@ -737,7 +876,7 @@ const stress = Number(process.env.FX_TLA_STOP_STRESS ?? "0");
 const walks = [
   ...WALKS,
   ...Array.from({ length: random }, (_, i) => randomWalk(seed + i)),
-  ...(stress > 0 ? [stressWalk(stress), stressStartWalk(stress)] : []),
+  ...(stress > 0 ? [stressWalk(stress), stressStartWalk(stress), stressNamesWalk(stress)] : []),
 ];
 
 for (const walk of walks) {
@@ -755,7 +894,7 @@ test("the trace check rejects planted changes to a walk", async () => {
   const base = (name: string) => {
     const result = recorded.get(name);
     if (!result) throw new Error(`${name} has not run`);
-    return result.observations.map((o) => ({ ...o, calls: [...o.calls], msgs: [...o.msgs] }));
+    return result.observations.map((o) => ({ ...o, calls: [...o.calls], msgs: [...o.msgs], named: [...o.named] }));
   };
   const subs = ["s1"];
   expect(await checkTrace(base("stop-then-message"), subs, join(dir, "kept"))).toBe("ACCEPTED");
@@ -768,7 +907,7 @@ test("the trace check rejects planted changes to a walk", async () => {
   // The stop left the unread message out of its count.
   planted.uncounted = base("message-then-stop-one-step").map((o) => o.op === "stop" ? { ...o, count: 0 } : o);
   // The stopped turn's end dropped the waiting message.
-  planted["lost-at-end"] = base("stop-then-message").map((o) => o.op === "end" ? { ...o, msgs: [] } : o);
+  planted["lost-at-end"] = base("stop-then-message").map((o) => o.op === "begin" ? { ...o, msgs: [] } : o);
   // A message to a starting turn waited for the next one, as fx did before.
   planted["start-next-turn"] = base("message-while-starting").map((o) =>
     o.op === "send" && o.answer === "joined" ? { ...o, answer: "waits" } : o);
@@ -776,7 +915,28 @@ test("the trace check rejects planted changes to a walk", async () => {
   const early = base("message-while-starting");
   const at = early.findIndex((o) => o.op === "begin");
   planted["joined-before-begin"] = [...early.slice(0, at), early[at + 1]!, early[at]!, ...early.slice(at + 2)];
+  // A message started a new subagent before the close was written, which
+  // fx's mark forbids: the close's write is missing from the walk.
+  planted["started-before-close-written"] = base("close-working-then-message").filter((o) => o.op !== "write_close");
+  // The stop of the next work the host chose left its messages out of the count.
+  expect(await checkTrace(base("stop-between-works"), subs, join(dir, "kept-between"))).toBe("ACCEPTED");
+  planted["between-uncounted"] = base("stop-between-works").map((o) => o.op === "stop" && o.count > 0 ? { ...o, count: 0 } : o);
+  planted["between-close-uncounted"] = base("close-between-works").map((o) => o.op === "close" && o.count > 0 ? { ...o, count: 0 } : o);
   for (const [name, observations] of Object.entries(planted)) {
     expect(`${name}: ${await checkTrace(observations, subs, join(dir, name))}`).toBe(`${name}: REJECTED`);
+  }
+  const pair = ["s1", "s2"];
+  expect(await checkTrace(base("start-beside-idle"), pair, join(dir, "kept-idle"))).toBe("ACCEPTED");
+  const idle: Record<string, Obs[]> = {};
+  // A finished turn's report did not say its subagent is idle, as fx did before.
+  idle["plain-when-idle"] = base("start-beside-idle").map((o) => o.op === "finish" ? { ...o, note: "plain" } : o);
+  // A new subagent's start named no idle subagent, as fx did before.
+  idle["names-missing"] = base("start-beside-idle").map((o) => o.op === "send" && o.named.length > 0 ? { ...o, named: [] } : o);
+  // A new subagent's start named one that was still working.
+  idle["names-working"] = base("start-beside-working").map((o) => o.op === "send" && o.sub === "s2" ? { ...o, named: ["s1"] } : o);
+  // A main stop's end sent a report.
+  idle["report-after-stop"] = base("start-beside-stopped").map((o) => o.op === "end" ? { ...o, note: "idle" } : o);
+  for (const [name, observations] of Object.entries(idle)) {
+    expect(`${name}: ${await checkTrace(observations, pair, join(dir, name))}`).toBe(`${name}: REJECTED`);
   }
 }, 300_000);

@@ -240,8 +240,13 @@ fn initFailure(deps: RunDeps, launch: *cli_surface.InteractiveLaunch, alloc: All
             writeStderr(deps, "fx needs at least 5 terminal rows.\n");
             return .returned;
         },
-        error.RecordingStartFailed => {
-            writeStderr(deps, "fx: unable to start terminal recording.\n");
+        error.RecordingStartFailed,
+        error.RecordingDiskFull,
+        error.RecordingFileTooBig,
+        error.RecordingAccessDenied,
+        error.RecordingReadOnly,
+        => {
+            writeStderr(deps, recordingStartMessage(err));
             return .{ .exit = 1 };
         },
         error.NoRememberedSession => {
@@ -355,13 +360,19 @@ fn runInteractiveWithDeps(comptime App: type, comptime cooperative: bool, app: *
     }
 
     app.run() catch |err| {
+        // The terminal hung up: its input closed, or a frame write failed
+        // because it hung up (`error.TerminalHungUp` from the frame sink).
+        const hung_up = err == error.TerminalInputClosed or err == error.TerminalHungUp;
+        if (err == error.TerminalHungUp) {
+            debug_trace.logf("core", "interactive run ended: the terminal hung up during a frame write", .{});
+        }
         // Before the terminal is released, which puts back SIGHUP's default
         // action: a closed window with a turn running ends fx here.
         if (comptime !cooperative and @hasDecl(App, "closeOnHangup")) {
-            if (err == error.TerminalInputClosed) app.closeOnHangup();
+            if (hung_up) app.closeOnHangup();
         }
         app.releaseTerminal();
-        if (err == error.TerminalInputClosed) {
+        if (hung_up) {
             app_needs_deinit = false;
             if (comptime cooperative) {
                 app.deinit();
@@ -549,6 +560,11 @@ fn formatResumeHandoff(buffer: []u8, session_id: []const u8) ![]const u8 {
 /// An error that ended the interactive session, in plain words
 /// (`types.plainErrorText`) unless fx has a message of its own for it.
 fn formatUnexpectedError(buffer: []u8, err: anyerror) ![]const u8 {
+    const alloc = std.heap.c_allocator;
+    if (config_runtime.configuredProviderMessage(alloc, err) catch null) |message| {
+        defer alloc.free(message);
+        return std.mem.print(buffer, "fx: {s}\n", .{message});
+    }
     var words: [128]u8 = undefined;
     const message = config_runtime.modelNotSelectedMessage(err) orelse
         mcp_verbs.profileConfigNotice(err) orelse
@@ -568,10 +584,22 @@ fn v2StorageFaultMessage(err: anyerror) ?[]const u8 {
     };
 }
 
+/// Why a terminal recording asked for with FX_DEBUG_RECORD could not start,
+/// by the failure `record_tape.startFailure` named.
+fn recordingStartMessage(err: anyerror) []const u8 {
+    return switch (err) {
+        error.RecordingDiskFull => "fx: unable to start terminal recording: the disk is full. Free some space, or unset FX_DEBUG_RECORD.\n",
+        error.RecordingFileTooBig => "fx: unable to start terminal recording: a file-size limit was reached.\n",
+        error.RecordingAccessDenied => "fx: unable to start terminal recording: permission denied.\n",
+        error.RecordingReadOnly => "fx: unable to start terminal recording: the disk is read-only.\n",
+        else => "fx: unable to start terminal recording.\n",
+    };
+}
+
 /// The raw error name goes only to the trace.
 fn reportUnexpectedInteractiveError(deps: RunDeps, err: anyerror) void {
     debug_trace.logf("core", "interactive error err={s}", .{@errorName(err)});
-    var buffer: [256]u8 = undefined;
+    var buffer: [1024]u8 = undefined;
     const message = deps.format_unexpected_error(&buffer, err) catch return;
     deps.write_stderr(deps.stderr_ctx, message) catch {};
 }
@@ -599,6 +627,14 @@ fn commandFailure(deps: RunDeps, err: anyerror) BeforeInteractiveResult {
 /// (`types.plainErrorText`). The raw name goes only to the trace.
 fn tryWriteErrorMessage(deps: RunDeps, err: anyerror) void {
     debug_trace.logf("core", "command error err={s}", .{@errorName(err)});
+    const alloc = std.heap.c_allocator;
+    if (config_runtime.configuredProviderMessage(alloc, err) catch null) |message| {
+        defer alloc.free(message);
+        writeStderr(deps, "fx: ");
+        writeStderr(deps, message);
+        writeStderr(deps, "\n");
+        return;
+    }
     var words: [128]u8 = undefined;
     writeStderr(deps, "fx: ");
     writeStderr(deps, config_runtime.modelNotSelectedMessage(err) orelse types.plainErrorText(@errorName(err), &words));
@@ -1388,6 +1424,34 @@ test "app entry treats terminal input closure as abnormal cleanup without stderr
     });
 }
 
+test "app entry closes as a hang-up when a frame write finds the terminal hung up" {
+    const alloc = std.testing.allocator;
+    var capture = TestCapture.init(.{ .interactive = .{} });
+    defer capture.deinit();
+    capture.run_error = error.TerminalHungUp;
+    capture.record_stderr_event = true;
+
+    const outcome = try runWithDeps(TestApp, alloc, &.{}, testConfig(), capture.deps());
+
+    try std.testing.expectEqual(RunOutcome.returned, outcome);
+    try std.testing.expectEqualStrings("", capture.stderr.written());
+    try std.testing.expectEqual(@as(usize, 0), capture.stderr_calls);
+    try std.testing.expectEqual(@as(usize, 0), capture.stdout_calls);
+    try expectEvents(&.{ "init:none", "rebind-after-init", "auto-upgrade", "file-index", "worker-thread", "model-cache", "run", "hangup-close", "terminal-release", "deinit" });
+}
+
+test "app entry still reports a frame write that fails another way" {
+    const alloc = std.testing.allocator;
+    var capture = TestCapture.init(.{ .interactive = .{} });
+    defer capture.deinit();
+    capture.run_error = error.TerminalSyncRecoveryFailed;
+    capture.record_stderr_event = true;
+
+    try std.testing.expectError(error.TerminalSyncRecoveryFailed, runWithDeps(TestApp, alloc, &.{}, testConfig(), capture.deps()));
+    try std.testing.expectEqualStrings("fx: terminal sync recovery failed\n", capture.stderr.written());
+    try expectEvents(&.{ "init:none", "rebind-after-init", "auto-upgrade", "file-index", "worker-thread", "model-cache", "run", "terminal-release", "stderr-attempt", "deinit" });
+}
+
 test "app entry preserves run errors when fatal formatting fails" {
     const alloc = std.testing.allocator;
     var capture = TestCapture.init(.{ .interactive = .{} });
@@ -1539,6 +1603,32 @@ test "app entry names a v2 storage fault at startup, and v1 keeps the bare error
 
         try std.testing.expectEqual(@as(u8, 1), outcome.exit);
         try std.testing.expectEqualStrings(case.message, capture.stderr.written());
+    }
+}
+
+test "app entry says why a terminal recording could not start" {
+    const alloc = std.testing.allocator;
+    const cases = [_]struct {
+        init_error: anyerror,
+        message: []const u8,
+    }{
+        .{ .init_error = error.RecordingStartFailed, .message = "fx: unable to start terminal recording.\n" },
+        .{ .init_error = error.RecordingDiskFull, .message = "fx: unable to start terminal recording: the disk is full. Free some space, or unset FX_DEBUG_RECORD.\n" },
+        .{ .init_error = error.RecordingFileTooBig, .message = "fx: unable to start terminal recording: a file-size limit was reached.\n" },
+        .{ .init_error = error.RecordingAccessDenied, .message = "fx: unable to start terminal recording: permission denied.\n" },
+        .{ .init_error = error.RecordingReadOnly, .message = "fx: unable to start terminal recording: the disk is read-only.\n" },
+    };
+    for (cases) |case| {
+        var capture = TestCapture.init(.{ .interactive = .{} });
+        defer capture.deinit();
+        capture.init_error = case.init_error;
+        capture.fail_unexpected_format = true;
+
+        const outcome = try runWithDeps(TestApp, alloc, &.{}, testConfig(), capture.deps());
+
+        try std.testing.expectEqual(@as(u8, 1), outcome.exit);
+        try std.testing.expectEqualStrings(case.message, capture.stderr.written());
+        try std.testing.expectEqual(@as(usize, 1), capture.stderr_calls);
     }
 }
 

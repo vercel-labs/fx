@@ -1,5 +1,6 @@
 const std = @import("std");
 const testing_allocator = @import("../shared/testing_allocator.zig");
+const json_depth = @import("../shared/json_depth.zig");
 
 pub fn parseToolArgsObject(alloc: std.mem.Allocator, args_json: []const u8) !std.json.ObjectMap {
     const parsed = try std.json.parseFromSlice(std.json.Value, alloc, args_json, .{});
@@ -11,7 +12,8 @@ pub fn parseToolArgsObject(alloc: std.mem.Allocator, args_json: []const u8) !std
 
 /// Some models send an object argument as JSON text. This reads the text back
 /// into the object it names, allocated in `alloc`, and leaves any other value
-/// as it is. Text that is not an object is error.InvalidCompositeArgument.
+/// as it is. Text that is not an object, or that nests deeper than tool input
+/// may (`json_depth.max_depth`), is error.InvalidCompositeArgument.
 pub fn normalizeCompositeObjectValue(
     alloc: std.mem.Allocator,
     value: *std.json.Value,
@@ -33,6 +35,10 @@ fn normalizeCompositeValue(
     kind: std.meta.Tag(std.json.Value),
 ) !void {
     if (value.* != .string) return;
+    // The gateway's depth check doesn't count brackets inside a string, and
+    // std.json.Stringify stops at 256 levels, so text that nests deeper than
+    // `json_depth.max_depth` is refused before it is read.
+    if (json_depth.exceeds(value.string)) return error.InvalidCompositeArgument;
     const decoded = try std.json.parseFromSliceLeaky(
         std.json.Value,
         alloc,
@@ -41,6 +47,22 @@ fn normalizeCompositeValue(
     );
     if (std.meta.activeTag(decoded) != kind) return error.InvalidCompositeArgument;
     value.* = decoded;
+}
+
+/// The arguments a call asks with: its `request` wrapper, read from JSON text
+/// when the model wrote it as text, or else the arguments themselves. Null
+/// when `request` is neither an object nor JSON text of one. Text read from
+/// JSON is allocated in `alloc`.
+pub fn unwrapRequest(alloc: std.mem.Allocator, args: std.json.ObjectMap) std.mem.Allocator.Error!?std.json.ObjectMap {
+    var request = args.get("request") orelse return args;
+    normalizeCompositeObjectValue(alloc, &request) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return null,
+    };
+    return switch (request) {
+        .object => |object| object,
+        else => null,
+    };
 }
 
 pub fn requiredStringArg(args: std.json.ObjectMap, key: []const u8) ![]const u8 {
@@ -289,6 +311,65 @@ test "composite array normalization preserves arrays and decodes JSON strings" {
         error.SyntaxError,
         normalizeCompositeArrayValue(arena, &not_json),
     );
+}
+
+fn nestedText(arena: std.mem.Allocator, opener: []const u8, inner: []const u8, closer: []const u8, levels: usize) ![]const u8 {
+    var out: std.Io.Writer.Allocating = .init(arena);
+    for (0..levels) |_| try out.writer.writeAll(opener);
+    try out.writer.writeAll(inner);
+    for (0..levels) |_| try out.writer.writeAll(closer);
+    return out.written();
+}
+
+test "a request wrapper is read as an object or as JSON text of one" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const read = struct {
+        fn wrapper(alloc: std.mem.Allocator, args_json: []const u8) !?std.json.ObjectMap {
+            const args = try std.json.parseFromSliceLeaky(std.json.Value, alloc, args_json, .{});
+            return unwrapRequest(alloc, args.object);
+        }
+    }.wrapper;
+
+    const flat = (try read(arena, "{\"action\":\"run\"}")).?;
+    try std.testing.expectEqualStrings("run", flat.get("action").?.string);
+    const object = (try read(arena, "{\"request\":{\"action\":\"run\"}}")).?;
+    try std.testing.expectEqualStrings("run", object.get("action").?.string);
+    const text = (try read(arena, "{\"request\":\"{\\\"action\\\":\\\"run\\\"}\"}")).?;
+    try std.testing.expectEqualStrings("run", text.get("action").?.string);
+
+    // Anything else names no arguments, including an object encoded twice and
+    // text nested deeper than tool input may be.
+    const twice = try std.json.Stringify.valueAlloc(arena, "{\"action\":\"run\"}", .{});
+    const deep = try nestedText(arena, "{\"a\":", "1", "}", json_depth.max_depth + 1);
+    for ([_][]const u8{ "[1]", "x", "null", "", twice, deep }) |request_text| {
+        const args_json = try std.json.Stringify.valueAlloc(arena, .{ .request = request_text }, .{});
+        try std.testing.expect(try read(arena, args_json) == null);
+    }
+    try std.testing.expect(try read(arena, "{\"request\":[1]}") == null);
+    try std.testing.expect(try read(arena, "{\"request\":null}") == null);
+}
+
+test "composite normalization refuses text nested deeper than tool input may be" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var deepest_object = std.json.Value{ .string = try nestedText(arena, "{\"a\":", "1", "}", json_depth.max_depth) };
+    try normalizeCompositeObjectValue(arena, &deepest_object);
+    try std.testing.expect(deepest_object == .object);
+    var deepest_array = std.json.Value{ .string = try nestedText(arena, "[", "1", "]", json_depth.max_depth) };
+    try normalizeCompositeArrayValue(arena, &deepest_array);
+    try std.testing.expect(deepest_array == .array);
+
+    // std.json.Stringify stops at 256 levels, so a deeper value must never be read.
+    for ([_]usize{ json_depth.max_depth + 1, 300 }) |levels| {
+        var object = std.json.Value{ .string = try nestedText(arena, "{\"a\":", "1", "}", levels) };
+        try std.testing.expectError(error.InvalidCompositeArgument, normalizeCompositeObjectValue(arena, &object));
+        var array = std.json.Value{ .string = try nestedText(arena, "[", "1", "]", levels) };
+        try std.testing.expectError(error.InvalidCompositeArgument, normalizeCompositeArrayValue(arena, &array));
+    }
 }
 
 fn expectDecoderFailure(expected: []const u8, comptime read: fn (*ArgsDecoder, std.json.ObjectMap) ArgsDecoder.Error!void, args_json: []const u8) !void {

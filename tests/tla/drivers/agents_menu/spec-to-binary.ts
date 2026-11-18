@@ -1,13 +1,17 @@
 // Spec to code: walks the built fx along the state graph TLC writes for
 // tests/tla/agents_menu/spec/agents-menu-drive.cfg (two instances, and the
-// first's subagents alpha and beta, with only the person's steps), and after
-// every step requires the binary to show a state the model reaches by that
-// step.
+// first's subagents alpha and beta, with only the person's steps and no
+// search: open, Up, Down, Enter, Esc, a paste, Delete twice, and /close), and
+// after every step requires the binary to show a state the model reaches by
+// that step.
 //
 // Each walk starts a fresh fx (lib.ts World) and takes up to `--steps` steps.
 // Each step is one the model allows from where the walk stands, chosen at
-// random among the steps that cross an edge no walk has crossed yet, when
-// there are any. The binary's state comes from lib.ts `observe`: the list's
+// random among the steps that cross an edge no walk has crossed yet and lead
+// somewhere a walk can go on from, then among any that go on, and only then
+// among new ones that end it: /close of the first instance leaves one agent,
+// which ends the walk, so a walk takes such a step first only at its last
+// step. The binary's state comes from lib.ts `observe`: the list's
 // rows and highlight from the pane, an armed close from the hint row, and the
 // agent on screen from the trace log. A step the binary takes to a state the
 // model does not reach prints the walk and fails.
@@ -61,7 +65,10 @@ function loadDot(path: string): Graph {
   return { states, next, init };
 }
 
-const view = (s: State) => JSON.stringify({ order: s.order, onScreen: s.onScreen, open: s.open, sel: s.sel, armed: s.armed });
+const view = (s: State) => JSON.stringify({
+  order: s.order, onScreen: s.onScreen, open: s.open, sel: s.sel, armed: s.armed,
+  origin: s.origin, searching: s.searching, hidden: [...s.hidden].sort(),
+});
 
 console.log(`output: ${artifacts}`);
 const dir = join(artifacts, "graph");
@@ -88,16 +95,27 @@ for (let walk = 1; walk <= walks && !process.exitCode; walk += 1) {
     }
     let current = new Set([graph.init]);
     for (let step = 1; step <= maxSteps; step += 1) {
-      const options = new Map<string, boolean>();
+      const options = new Map<string, { fresh: boolean; onward: boolean; freshOnward: boolean }>();
       for (const from of current) {
         for (const to of successors(from)) {
           const act = graph.states.get(to)!.act;
-          options.set(act, (options.get(act) ?? false) || !covered.has(`${from}>${to}`));
+          const seen = options.get(act) ?? { fresh: false, onward: false, freshOnward: false };
+          const fresh = !covered.has(`${from}>${to}`);
+          const onward = successors(to).length > 0;
+          options.set(act, {
+            fresh: seen.fresh || fresh,
+            onward: seen.onward || onward,
+            freshOnward: seen.freshOnward || (fresh && onward),
+          });
         }
       }
       if (options.size === 0) break;
-      const fresh = [...options].filter(([, isFresh]) => isFresh).map(([act]) => act);
-      const pool = fresh.length > 0 ? fresh : [...options.keys()];
+      const acts = (keep: (option: { fresh: boolean; onward: boolean; freshOnward: boolean }) => boolean) =>
+        [...options].filter(([, option]) => keep(option)).map(([act]) => act);
+      const tiers = step === maxSteps
+        ? [acts((o) => o.fresh), acts(() => true)]
+        : [acts((o) => o.freshOnward), acts((o) => o.onward), acts((o) => o.fresh), acts(() => true)];
+      const pool = tiers.find((tier) => tier.length > 0)!;
       const act = pool[Math.floor(random() * pool.length)]!;
       path.push(act);
       const shown = await perform(world, act, random);

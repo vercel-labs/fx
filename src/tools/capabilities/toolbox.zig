@@ -16,6 +16,7 @@ const core_types = @import("../../core/shared/types.zig");
 const tool_dispatch = @import("../../core/tooling/tool_dispatch.zig");
 const mcp_call_capability = @import("../../core/tooling/mcp_call_capability.zig");
 const capability_retrieval = @import("../../core/tooling/capability_retrieval.zig");
+const tool_mcp_runtime = @import("../../core/tooling/tool_mcp_runtime.zig");
 const lexical_relevance = @import("../../core/shared/lexical_relevance.zig");
 const capability_search_impl = @import("capability_search.zig");
 const skill_impl = @import("../skills/skill.zig");
@@ -106,10 +107,12 @@ pub fn decode(ctx: tool_dispatch.DispatchContext, args_json: []const u8) tool_di
         if (chosen != .open) return failure(ctx.allocator, "toolbox offset goes with open");
         if (value != .integer or value.integer < 0) return failure(ctx.allocator, "toolbox offset must be a non-negative integer");
     }
-    const arguments_value = args.get("arguments");
+    var arguments_value = args.get("arguments");
     if (arguments_value) |value| {
         if (chosen != .run) return failure(ctx.allocator, "toolbox arguments go with run");
-        if (value != .object) return failure(ctx.allocator, "toolbox arguments must be an object");
+        // The same reading as toolbox_core.carriedCall, which carries the run.
+        arguments_value = (try toolbox_core.runArguments(parsed.arena.allocator(), value)) orelse
+            return failure(ctx.allocator, "toolbox arguments must be an object");
     }
     var kind: ?toolbox_core.Kind = null;
     if (args.get("kind")) |value| {
@@ -215,7 +218,7 @@ fn open(ctx: tool_dispatch.DispatchContext, input: *const Input) tool_dispatch.D
     if (input.kind) |kind| return switch (kind) {
         .skill => openSkillOrNothing(ctx, input),
         .tool => (try openTool(ctx, input)) orelse nothingNamed(ctx, "tool", input.target),
-        .mcp_server => (try openServer(ctx, input)) orelse nothingNamed(ctx, "MCP server", input.target),
+        .mcp_server => (try openServer(ctx, input)) orelse (try changedServer(ctx, input.target)) orelse nothingNamed(ctx, "MCP server", input.target),
     };
     if (hasSkill(ctx, input.target)) {
         if (alsoListedAs(ctx, input.target)) |other| return .{ .failure = try ctx.allocator.print(
@@ -226,6 +229,7 @@ fn open(ctx: tool_dispatch.DispatchContext, input: *const Input) tool_dispatch.D
     }
     if (try openTool(ctx, input)) |result| return result;
     if (try openServer(ctx, input)) |result| return result;
+    if (try changedServer(ctx, input.target)) |result| return result;
     // A skill installed since the turn started isn't in the catalog yet;
     // reading it by name finds it.
     return openSkillOrNothing(ctx, input);
@@ -238,6 +242,21 @@ fn alsoListedAs(ctx: tool_dispatch.DispatchContext, name: []const u8) ?toolbox_c
     for (ctx.toolbox_mcp_servers) |server| if (std.mem.eql(u8, server, name)) return .mcp_server;
     for (ctx.toolbox_behind) |tool| if (std.mem.eql(u8, tool, name)) return .tool;
     return null;
+}
+
+/// What `toolbox {open}` says of a server its menu lists when a subagent's
+/// view of the session's servers has changed under it: that, and not that no
+/// such server is in the menu. Null for any other name, or any other view.
+fn changedServer(ctx: tool_dispatch.DispatchContext, name: []const u8) Allocator.Error!?tool_dispatch.ToolResult {
+    if (!tool_dispatch.mcpViewChanged(ctx)) return null;
+    const listed = for (ctx.toolbox_mcp_servers) |server| {
+        if (std.mem.eql(u8, server, name)) break true;
+    } else false;
+    if (!listed) return null;
+    return .{ .failure = try ctx.allocator.print(
+        "MCP server {f} is not available to this work: {s}",
+        .{ model_context_encoding.scalar(name), tool_mcp_runtime.servers_changed_reason },
+    ) };
 }
 
 fn nothingNamed(ctx: tool_dispatch.DispatchContext, noun: []const u8, name: []const u8) Allocator.Error!tool_dispatch.ToolResult {
@@ -601,6 +620,10 @@ test "toolbox takes exactly one of open, run, or search" {
         .{ .args = "{\"run\":3}", .reason = "toolbox open, run, and search take a string" },
         .{ .args = "{\"open\":\"a\",\"arguments\":{}}", .reason = "toolbox arguments go with run" },
         .{ .args = "{\"run\":\"a\",\"arguments\":[]}", .reason = "toolbox arguments must be an object" },
+        .{ .args = "{\"run\":\"a\",\"arguments\":\"text\"}", .reason = "toolbox arguments must be an object" },
+        .{ .args = "{\"run\":\"a\",\"arguments\":\"[1]\"}", .reason = "toolbox arguments must be an object" },
+        .{ .args = "{\"run\":\"a\",\"arguments\":\"\\\"{}\\\"\"}", .reason = "toolbox arguments must be an object" },
+        .{ .args = "{\"open\":\"a\",\"arguments\":\"{}\"}", .reason = "toolbox arguments go with run" },
         .{ .args = "{\"run\":\"a\",\"resource\":\"x.md\"}", .reason = "toolbox resource goes with open" },
         .{ .args = "[1]", .reason = "toolbox arguments must be an object" },
         .{ .args = "{", .reason = "toolbox arguments must be valid JSON" },
@@ -620,6 +643,26 @@ test "toolbox takes exactly one of open, run, or search" {
     }
 }
 
+test "toolbox refuses a run's arguments written as JSON text nested too deep" {
+    var json: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer json.deinit();
+    try json.writer.writeAll("{\"run\":\"mcp_fixture_echo\",\"arguments\":\"");
+    for (0..300) |_| try json.writer.writeAll("{\\\"a\\\":");
+    try json.writer.writeAll("1");
+    for (0..300) |_| try json.writer.writeAll("}");
+    try json.writer.writeAll("\"}");
+    switch (try decodeForTest(json.written())) {
+        .input => |input| {
+            input.deinit(std.testing.allocator);
+            return error.TestExpectedFailure;
+        },
+        .failure => |reason| {
+            defer std.testing.allocator.free(reason);
+            try std.testing.expectEqualStrings("toolbox arguments must be an object", reason);
+        },
+    }
+}
+
 test "toolbox keeps a run's arguments as JSON and defaults them to an empty object" {
     const decoded = try decodeForTest("{\"run\":\"mcp_fixture_echo\",\"arguments\":{\"text\":\"hello\"}}");
     const input = switch (decoded) {
@@ -635,6 +678,18 @@ test "toolbox keeps a run's arguments as JSON and defaults them to an empty obje
     try std.testing.expectEqualStrings("mcp_fixture_echo", typed.target);
     try std.testing.expectEqualStrings("{\"text\":\"hello\"}", typed.arguments_json);
 
+    // Some models write the arguments as JSON text; the run gets the object.
+    const text = try decodeForTest("{\"run\":\"mcp_fixture_echo\",\"arguments\":\"{\\\"text\\\":\\\"hello\\\"}\"}");
+    const text_input = switch (text) {
+        .input => |value| value,
+        .failure => |reason| {
+            std.testing.allocator.free(reason);
+            return error.TestUnexpectedFailure;
+        },
+    };
+    defer text_input.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("{\"text\":\"hello\"}", text_input.as(Input).arguments_json);
+
     const bare = try decodeForTest("{\"open\":\"fixture\"}");
     const open_input = switch (bare) {
         .input => |value| value,
@@ -648,7 +703,7 @@ test "toolbox keeps a run's arguments as JSON and defaults them to an empty obje
 }
 
 const fuzz_keys = [_][]const u8{ "open", "run", "search", "resource", "server", "offset", "kind", "limit", "cursor", "arguments", "note" };
-const fuzz_values = [_][]const u8{ "\"mcp_fixture_echo\"", "\"\"", "\"  \"", "3", "-1", "{}", "{\"text\":\"hi\"}", "[1]", "null", "true", "\"tool\"", "\"a\\u0000b\"" };
+const fuzz_values = [_][]const u8{ "\"mcp_fixture_echo\"", "\"\"", "\"  \"", "3", "-1", "{}", "{\"text\":\"hi\"}", "[1]", "null", "true", "\"tool\"", "\"a\\u0000b\"", "\"{\\\"text\\\":\\\"hi\\\"}\"", "\"{}\"", "\"[1]\"" };
 
 /// Byte pairs pick an arguments object's keys and values; a first byte of
 /// 0xff takes the rest as the arguments' text.
@@ -693,6 +748,7 @@ test "a toolbox call is carried as a run exactly when its decode reads a run" {
             "\x00\x00\x01\x00",
             "\x01\x00\x09\x06\x0a\x03",
             "\xff{\"run\":\"mcp_fixture_echo\",\"arguments\":\"text\"}",
+            "\xff{\"run\":\"mcp_fixture_echo\",\"arguments\":\"{\\\"text\\\":\\\"hi\\\"}\"}",
         }) ++ @import("fuzz_corpus").toolbox_run_shape.*),
     });
 }

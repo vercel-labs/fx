@@ -16,7 +16,8 @@ const types = @import("../core/shared/types.zig");
 const atomic_value = @import("../core/mcp/atomic_value.zig");
 const json_comparison = @import("../core/shared/json_comparison.zig");
 const sse = @import("sse.zig");
-const json_depth = @import("json_depth.zig");
+const request_deadlines = @import("request_deadlines.zig");
+const json_depth = @import("../core/shared/json_depth.zig");
 const host_stream_provider = @import("host_stream_provider.zig");
 const open_job = @import("open_job.zig");
 const text_utils = @import("../core/shared/text_utils.zig");
@@ -89,7 +90,9 @@ fn isUnreadableReply(err: anyerror) bool {
     return err == error.MalformedGatewaySseEvent or
         err == error.MalformedOpenAICodexSseEvent or
         err == error.MalformedXaiGrokSseEvent or
-        err == error.MalformedChatCompletionsChunk;
+        err == error.MalformedChatCompletionsChunk or
+        err == error.MalformedResponsesEvent or
+        err == error.MalformedMessagesEvent;
 }
 
 fn connectedIoFailure(
@@ -1156,9 +1159,24 @@ const ConnectedRequestWatch = struct {
         if (self.phase.load(.seq_cst) != .streaming) return false;
         const last = self.last_progress_ms.load(.seq_cst);
         if (last == 0) return false;
-        const now_ms: i64 = @intCast(@divFloor(now.raw.toNanoseconds(), std.time.ns_per_ms));
-        const elapsed = now_ms - last;
-        return elapsed >= self.timing.stall_timeout_ms;
+        const since: u64 = @intCast(@max(last, 0));
+        const deadlines: request_deadlines.Deadlines = .{
+            .bounds = .{ .stall_ms = boundMs(self.timing.stall_timeout_ms) },
+            .wait = .streaming,
+            .wait_started_ms = since,
+            .last_bytes_ms = since,
+        };
+        return deadlines.expired(awakeMs(now)) != null;
+    }
+
+    /// A timing value as a bound: the largest value means no bound.
+    fn boundMs(timeout_ms: i64) u64 {
+        if (timeout_ms == std.math.maxInt(i64)) return request_deadlines.never;
+        return @intCast(@max(timeout_ms, 0));
+    }
+
+    fn awakeMs(now: std.Io.Clock.Timestamp) u64 {
+        return @intCast(@max(@divFloor(now.raw.toNanoseconds(), std.time.ns_per_ms), 0));
     }
 
     fn win_stall_timeout(self: *ConnectedRequestWatch) bool {
@@ -1182,11 +1200,16 @@ const ConnectedRequestWatch = struct {
             return false;
         }
         if (self.phase.load(.seq_cst) != .awaiting_head) return false;
-        return !std.Io.Clock.Timestamp.compare(
-            now,
-            .lt,
-            self.response_head_deadline,
-        );
+        // The wait began `timeout_ms` before its deadline.
+        const bound_ms = boundMs(self.timing.timeout_ms);
+        const armed_ms = awakeMs(self.response_head_deadline) -| bound_ms;
+        const deadlines: request_deadlines.Deadlines = .{
+            .bounds = .{ .first_response_ms = bound_ms },
+            .wait = .awaiting_head,
+            .wait_started_ms = armed_ms,
+            .last_bytes_ms = armed_ms,
+        };
+        return deadlines.expired(awakeMs(now)) != null;
     }
 
     fn is_active(phase: Phase) bool {
@@ -10918,7 +10941,10 @@ test "delivery certainty stays definitely unsent when request setup fails" {
 }
 
 test "delivery certainty becomes possibly sent before response head" {
-    var fixture = try LoopbackGatewayFixture.init(.response_head_stall, 500);
+    // The server holds the response head well past the deadline, and the
+    // deadline leaves a slow runner time to connect and send the request
+    // first; a deadline that ends before the send finds it definitely unsent.
+    var fixture = try LoopbackGatewayFixture.init(.response_head_stall, 1000);
     defer fixture.deinit();
     try fixture.start();
     try std.testing.expect(fixture.waitForAcceptStart(5000));
@@ -10942,7 +10968,7 @@ test "delivery certainty becomes possibly sent before response head" {
                 .payload = "{}",
                 .delivery = &delivery,
             },
-            testAwakeDeadlineAfter(20),
+            testAwakeDeadlineAfter(250),
             &cancel_flag,
         ),
     );
@@ -11468,6 +11494,8 @@ test "an unreadable stream event from any provider is an unreadable reply" {
         error.MalformedOpenAICodexSseEvent,
         error.MalformedXaiGrokSseEvent,
         error.MalformedChatCompletionsChunk,
+        error.MalformedResponsesEvent,
+        error.MalformedMessagesEvent,
     }) |err| {
         const evidence = networkFailureEvidence(err, .possibly_sent) orelse return error.TestExpectedNetworkFailureEvidence;
         try std.testing.expectEqual(agent_stream_provider.NetworkFailureCause.unreadable_reply, evidence.cause);
@@ -11820,7 +11848,9 @@ const UnpooledOpenFixture = struct {
         const zio = io_mod.getIo();
         var listener = [_]std.posix.pollfd{.{ .fd = self.server.socket.handle, .events = std.posix.POLL.IN, .revents = 0 }};
         if (try std.posix.poll(&listener, appear_ms) == 0) return .none;
-        var stream = try self.server.accept(zio);
+        // A connection that is gone before the accept still arrived, and is
+        // no longer open.
+        var stream = (try testing_listener.acceptIfWaiting(&self.server, zio)) orelse return .closed;
         defer stream.close(zio);
         // The close fx already made can reach this end a moment after the
         // accept; a connection fx left open never reads end of stream.
@@ -11834,6 +11864,14 @@ const UnpooledOpenFixture = struct {
             error.ReadFailed => return .closed,
         };
         return if (read == 0) .closed else error.TestConnectionLeftOpen;
+    }
+
+    /// Checks that an open walked away from during its lookup left no
+    /// connection open. Its job still calls `client.request` after the
+    /// cancel, and a connect to loopback can finish before the cancel stops
+    /// it, so a connection fx already closed counts the same as none.
+    fn expectNoneLeftOpen(self: *UnpooledOpenFixture) !void {
+        _ = try self.lateConnection(50);
     }
 };
 
@@ -11878,9 +11916,9 @@ test "Esc walks away from an unpooled open stuck in its lookup, and its job stop
     try stuck.waitCancelled();
     stuck.release.store(true, .seq_cst);
     try waitForOwnClientOpenJobs();
-    // The open ended once its lookup returned, without connecting; the
-    // testing allocator checks the job freed its client and itself.
-    try std.testing.expectEqual(UnpooledOpenFixture.Late.none, try fixture.lateConnection(50));
+    // The open ended once its lookup returned, with no connection left open;
+    // the testing allocator checks the job freed its client and itself.
+    try fixture.expectNoneLeftOpen();
 }
 
 test "an unpooled open that connects after the request walked away is closed with its client" {
@@ -11914,7 +11952,7 @@ test "the setup deadline walks away from an unpooled open stuck in its lookup" {
     try stuck.waitCancelled();
     stuck.release.store(true, .seq_cst);
     try waitForOwnClientOpenJobs();
-    try std.testing.expectEqual(UnpooledOpenFixture.Late.none, try fixture.lateConnection(50));
+    try fixture.expectNoneLeftOpen();
 }
 
 test "an unpooled open hands over a request on its job's own client with the caller's URI and headers" {
@@ -11985,7 +12023,7 @@ test "Esc during a stuck lookup ends an unpooled gateway request at once" {
     try stuck.waitCancelled();
     stuck.release.store(true, .seq_cst);
     try waitForOwnClientOpenJobs();
-    try std.testing.expectEqual(UnpooledOpenFixture.Late.none, try fixture.lateConnection(50));
+    try fixture.expectNoneLeftOpen();
 }
 
 test "a bounded request's deadline walks away from an unpooled open stuck in its lookup" {
@@ -12027,7 +12065,7 @@ test "a bounded request's deadline walks away from an unpooled open stuck in its
     try stuck.waitCancelled();
     stuck.release.store(true, .seq_cst);
     try waitForOwnClientOpenJobs();
-    try std.testing.expectEqual(UnpooledOpenFixture.Late.none, try fixture.lateConnection(50));
+    try fixture.expectNoneLeftOpen();
 }
 
 test "Esc walks away from a provider POST stuck in its lookup" {
@@ -12052,7 +12090,7 @@ test "Esc walks away from a provider POST stuck in its lookup" {
     try stuck.waitCancelled();
     stuck.release.store(true, .seq_cst);
     try waitForOwnClientOpenJobs();
-    try std.testing.expectEqual(UnpooledOpenFixture.Late.none, try fixture.lateConnection(50));
+    try fixture.expectNoneLeftOpen();
 }
 
 test "the connect deadline walks away from a provider POST stuck in its lookup as a timeout" {
@@ -12074,7 +12112,7 @@ test "the connect deadline walks away from a provider POST stuck in its lookup a
     try stuck.waitCancelled();
     stuck.release.store(true, .seq_cst);
     try waitForOwnClientOpenJobs();
-    try std.testing.expectEqual(UnpooledOpenFixture.Late.none, try fixture.lateConnection(50));
+    try fixture.expectNoneLeftOpen();
 }
 
 test "a provider POST hands over its request with the provider's headers on its own client" {
