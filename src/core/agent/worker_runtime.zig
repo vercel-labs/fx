@@ -682,6 +682,19 @@ pub const WorkerRuntime = struct {
     /// Whether this spell of holding mail has begun and been logged
     /// (`commit_gate_since_ms` is set).
     commit_gate_logged: bool = false,
+    /// How many of the finished turns that `unacknowledged_finishes` counts are
+    /// missing from `queued_history`. A queue that was empty took the history
+    /// its first prompt was posted with (`enqueuePromptLocked`), which the
+    /// loop took before it committed those turns. Each acknowledgement lowers
+    /// it, and a commit that carries its turn adds the turn to the queue
+    /// (`acknowledgeFinishCommittedTurn`). Guarded by `worker_mutex`.
+    ///
+    /// The post that adopts a base sets it, and it means something only while
+    /// the queue holds that base. A call that empties the queue frees the base
+    /// and leaves the count as it was: the next post sets it again, and a
+    /// commit with no queued prompt adds nothing, so nothing reads a stale
+    /// count.
+    queued_history_owed: u32 = 0,
     /// Set when the loop's flush of its pacer for the held mail failed
     /// (`noteCommitGateFlushFailed`), so it does not try again, and log again,
     /// on every pass. Guarded by `worker_mutex`; cleared with the count.
@@ -1616,6 +1629,9 @@ pub const WorkerRuntime = struct {
         if (self.queued_prompts.items.len == 0) {
             std.debug.assert(self.queued_history.len == 0);
             self.queued_history = supplied_history;
+            // Mail that waits for a commit was posted after the worker finished
+            // that turn, so the history it brought lacks the turn.
+            self.queued_history_owed = if (queued.delivery.isContinuation()) self.unacknowledged_finishes else 0;
         } else {
             types.freeHistoryTurnSlice(alloc, supplied_history);
         }
@@ -1892,6 +1908,33 @@ pub const WorkerRuntime = struct {
         self.releaseFinishesLocked(1, "committed");
     }
 
+    /// As `acknowledgeFinishCommitted`, for a turn the loop added to the
+    /// history it snapshots mail from. Mail that was queued after the worker
+    /// finished the turn, and before this commit, took its history without the
+    /// turn (`queued_history_owed`). The turn goes into the queue's history
+    /// now, and into what each queued prompt keeps from it, as it does for mail
+    /// that was queued when the turn finished (`propagateHistoryTurn`), so the
+    /// mail's turn starts with it. `ownership` is the turn's snapshot files,
+    /// which the loop has handed to history; each queued prompt keeps them
+    /// until it ends. A turn that does not go in is logged, and the mail runs
+    /// without it as it did before.
+    pub fn acknowledgeFinishCommittedTurn(
+        self: *WorkerRuntime,
+        alloc: std.mem.Allocator,
+        turn: types.HistoryTurn,
+        ownership: ?types.SnapshotFileOwnership,
+        max_history_turns: usize,
+    ) void {
+        self.worker_mutex.lockUncancelable(io_mod.getIo());
+        defer self.worker_mutex.unlock(io_mod.getIo());
+        if (self.commit_gate and self.unacknowledged_finishes > 0 and self.queued_history_owed > 0) {
+            self.propagateHistoryTurnToQueue(alloc, turn, max_history_turns, null, .{ .given = ownership }) catch |err| {
+                debug_trace.logf("worker", "queued mail misses a committed turn err={s} dropped=turn_in_queued_history", .{@errorName(err)});
+            };
+        }
+        self.releaseFinishesLocked(1, "committed");
+    }
+
     /// The main loop's note that it dropped a finished turn without
     /// committing it, as a cancel or a session switch drops the one the pacer
     /// held. Nothing of that turn is open and no commit is coming, so the
@@ -1908,6 +1951,7 @@ pub const WorkerRuntime = struct {
     fn releaseFinishesLocked(self: *WorkerRuntime, count: u32, reason: []const u8) void {
         if (!self.commit_gate or self.unacknowledged_finishes == 0) return;
         self.unacknowledged_finishes -|= count;
+        self.queued_history_owed -|= count;
         if (self.unacknowledged_finishes > 0) return;
         self.commit_gate_flush_failed = false;
         if (self.commit_gate_logged) {
@@ -1998,7 +2042,11 @@ pub const WorkerRuntime = struct {
         const waited = self.commitGateWaitedMsLocked();
         if (waited >= commit_gate_limit_ms) {
             debug_trace.eventf("worker", "commit_gate_expired", .{ .turn_id = head.turn_id }, "worker={x} unacknowledged={d} waited_ms={d} mail={s} reason=timeout", .{ @intFromPtr(self), self.unacknowledged_finishes, waited, @tagName(head.mail) });
+            if (self.queued_history_owed > 0) {
+                debug_trace.logf("worker", "queued mail starts without finished turns turns={d} reason=gate_expired dropped=turns_in_queued_history", .{self.queued_history_owed});
+            }
             self.unacknowledged_finishes = 0;
+            self.queued_history_owed = 0;
             self.commit_gate_logged = false;
             self.commit_gate_flush_failed = false;
             return null;
@@ -2747,6 +2795,7 @@ pub const WorkerRuntime = struct {
         self.queued_prompts.clearRetainingCapacity();
         types.freeHistoryTurnSlice(alloc, self.queued_history);
         self.queued_history = &.{};
+        self.queued_history_owed = 0;
         if (self.queued_context_compaction) |task| {
             if (task.operation_id) |id| self.compaction_presentation.settle(id, .{ .outcome = .cancelled }, io_mod.milliTimestamp());
             freeContextCompactionTask(alloc, task);
@@ -2969,7 +3018,7 @@ pub const WorkerRuntime = struct {
         max_history_turns: usize,
         publication: ?HistoryPublication,
     ) !void {
-        self.propagateHistoryTurnToQueue(alloc, turn, max_history_turns, publication) catch |err| {
+        self.propagateHistoryTurnToQueue(alloc, turn, max_history_turns, publication, .active) catch |err| {
             if (err == error.SessionPersistenceUncertain) {
                 if (self.active_prompt_snapshot_ownership) |ownership| {
                     _ = ownership.preserve();
@@ -2979,21 +3028,33 @@ pub const WorkerRuntime = struct {
         };
     }
 
+    /// Where the snapshot files that each queued prompt keeps for the turn come
+    /// from: the turn the worker is running, or, for a turn the loop commits
+    /// after the worker finished it, the ownership the finished turn carries.
+    const PropagatedOwnership = union(enum) {
+        active,
+        given: ?types.SnapshotFileOwnership,
+    };
+
     fn propagateHistoryTurnToQueue(
         self: *WorkerRuntime,
         alloc: std.mem.Allocator,
         turn: types.HistoryTurn,
         max_history_turns: usize,
         publication: ?HistoryPublication,
+        source: PropagatedOwnership,
     ) !void {
         if (self.queued_prompts.items.len == 0) {
             if (publication) |value| try value.commit();
             return;
         }
-        const active_ownership = if (self.active_prompt_snapshot_ownership) |ownership|
-            try ownership.ensureSharedOwnership(alloc)
-        else
-            null;
+        const active_ownership = switch (source) {
+            .active => if (self.active_prompt_snapshot_ownership) |ownership|
+                try ownership.ensureSharedOwnership(alloc)
+            else
+                null,
+            .given => |ownership| ownership,
+        };
         const cut = if (publication) |value| value.retained_from else null;
         const next_history = if (cut) |retained_from| try session_runtime.prepareCompactedHistory(alloc, self.queued_history, turn.compacted_summary, retained_from) else try appendHistoryTurnProjection(
             alloc,
@@ -9829,6 +9890,428 @@ test "text a user typed while a turn ran, which missed the turn, waits for its c
     const work = (try runtime.tryTakeNextWork(alloc)).?;
     defer freeWorkItem(alloc, work);
     try std.testing.expectEqualStrings("typed while the turn ran", work.prompt.prompt);
+}
+
+/// The history the loop had when it posted mail: one earlier, committed turn.
+fn earlierTurns(alloc: std.mem.Allocator) ![]types.HistoryTurn {
+    const turns = try alloc.alloc(types.HistoryTurn, 1);
+    errdefer alloc.free(turns);
+    turns[0] = .{ .assistant = .{
+        .user = .{ .text = try alloc.dupe(u8, "earlier prompt") },
+        .assistant = try alloc.dupe(u8, "earlier answer"),
+    } };
+    return turns;
+}
+
+/// A turn the worker finished and the loop commits later.
+fn finishedTurn(answer: []const u8) types.HistoryTurn {
+    return .{ .assistant = .{
+        .user = .{ .text = @constCast("the finished prompt") },
+        .assistant = @constCast(answer),
+    } };
+}
+
+/// Mail posted after the worker finished a turn that the loop has not committed:
+/// the history it brings is the one the loop had then, without that turn.
+fn postMailWithEarlierHistory(alloc: std.mem.Allocator, runtime: *WorkerRuntime, text: []const u8, mail: agent_frame.MailKind) !void {
+    var prompt = try makePrompt(alloc, text, "model");
+    types.freeHistoryTurnSlice(alloc, prompt.history);
+    prompt.history = try earlierTurns(alloc);
+    prompt.mail = mail;
+    try runtime.postMail(alloc, prompt);
+}
+
+/// The answers of the turns in `runtime`'s queue history, in order.
+fn expectQueuedAnswers(runtime: *const WorkerRuntime, expected: []const []const u8) !void {
+    try std.testing.expectEqual(expected.len, runtime.queued_history.len);
+    for (expected, runtime.queued_history) |answer, turn| {
+        const actual: []const u8 = switch (turn) {
+            .assistant => |entry| entry.assistant,
+            .interrupted => |entry| entry.assistant orelse "",
+            .compacted_summary => |entry| entry.summary,
+        };
+        try std.testing.expectEqualStrings(answer, actual);
+    }
+}
+
+test "mail posted behind a turn the pacer holds gets that turn when the loop commits it" {
+    const alloc = std.testing.allocator;
+    var runtime = WorkerRuntime{};
+    defer runtime.deinit(alloc);
+    runtime.enableCommitGate();
+    runtime.worker_processing = true;
+    runtime.active_turn_id = 9;
+    runtime.direct_steering_closed = true;
+    try pushTestFinish(alloc, &runtime);
+    // The loop took the finish into its pacer, which an open prompt keeps.
+    var events = runtime.takeEvents();
+    for (events.items) |event| freeWorkerEvent(alloc, event);
+    events.deinit(alloc);
+    try postMailWithEarlierHistory(alloc, &runtime, "a report", .report);
+    runtime.finishProcessing();
+    try std.testing.expectEqual(@as(u32, 1), runtime.queued_history_owed);
+    try expectQueuedAnswers(&runtime, &.{"earlier answer"});
+
+    runtime.acknowledgeFinishCommittedTurn(alloc, finishedTurn("the finished answer"), null, 8);
+    try std.testing.expectEqual(@as(u32, 0), runtime.queued_history_owed);
+    try std.testing.expectEqual(@as(u32, 0), runtime.unacknowledged_finishes);
+    // Once, and in order. What the prompt derives from the turn follows it.
+    try expectQueuedAnswers(&runtime, &.{ "earlier answer", "the finished answer" });
+    try std.testing.expect(std.mem.find(u8, runtime.queued_prompts.items[0].root_user_intent_context, "the finished prompt") != null);
+
+    const work = (try runtime.tryTakeNextWork(alloc)).?;
+    defer freeWorkItem(alloc, work);
+    try std.testing.expectEqualStrings("a report", work.prompt.prompt);
+    try std.testing.expectEqual(@as(usize, 2), work.prompt.history.len);
+    try std.testing.expectEqualStrings("the finished answer", work.prompt.history[1].assistant.assistant);
+}
+
+test "mail posted behind a finish the loop has not applied yet gets that turn when the loop commits it" {
+    const alloc = std.testing.allocator;
+    var runtime = WorkerRuntime{};
+    defer runtime.deinit(alloc);
+    runtime.enableCommitGate();
+    runtime.worker_processing = true;
+    runtime.active_turn_id = 9;
+    runtime.direct_steering_closed = true;
+    try pushTestFinish(alloc, &runtime);
+    try postMailWithEarlierHistory(alloc, &runtime, "a report", .report);
+    runtime.finishProcessing();
+    // The finish still waits in the worker's events: the count has it already.
+    try std.testing.expect(runtime.hasPendingEvents());
+    try std.testing.expectEqual(@as(u32, 1), runtime.queued_history_owed);
+    var events = runtime.takeEvents();
+    for (events.items) |event| freeWorkerEvent(alloc, event);
+    events.deinit(alloc);
+
+    runtime.acknowledgeFinishCommittedTurn(alloc, finishedTurn("the finished answer"), null, 8);
+    try expectQueuedAnswers(&runtime, &.{ "earlier answer", "the finished answer" });
+}
+
+test "a message posted behind a finished turn gets that turn like a report" {
+    const alloc = std.testing.allocator;
+    var runtime = WorkerRuntime{};
+    defer runtime.deinit(alloc);
+    runtime.enableCommitGate();
+    runtime.worker_processing = true;
+    runtime.active_turn_id = 9;
+    runtime.direct_steering_closed = true;
+    try pushTestFinish(alloc, &runtime);
+    try postMailWithEarlierHistory(alloc, &runtime, "a message", .message);
+    runtime.finishProcessing();
+    try std.testing.expectEqual(@as(u32, 1), runtime.queued_history_owed);
+
+    runtime.acknowledgeFinishCommittedTurn(alloc, finishedTurn("the finished answer"), null, 8);
+    try expectQueuedAnswers(&runtime, &.{ "earlier answer", "the finished answer" });
+}
+
+test "two reports behind a finished turn share one history that has the turn once" {
+    const alloc = std.testing.allocator;
+    var runtime = WorkerRuntime{};
+    defer runtime.deinit(alloc);
+    runtime.enableCommitGate();
+    runtime.worker_processing = true;
+    runtime.active_turn_id = 9;
+    runtime.direct_steering_closed = true;
+    try pushTestFinish(alloc, &runtime);
+    try postMailWithEarlierHistory(alloc, &runtime, "first report", .report);
+    // The second report finds the queue not empty: its own history is freed and
+    // it shares the first's.
+    try postMailWithEarlierHistory(alloc, &runtime, "second report", .report);
+    runtime.finishProcessing();
+    try std.testing.expectEqual(@as(u32, 1), runtime.queued_history_owed);
+
+    runtime.acknowledgeFinishCommittedTurn(alloc, finishedTurn("the finished answer"), null, 8);
+    try expectQueuedAnswers(&runtime, &.{ "earlier answer", "the finished answer" });
+    for (runtime.queued_prompts.items) |prompt| {
+        try std.testing.expect(std.mem.find(u8, prompt.root_user_intent_context, "the finished prompt") != null);
+    }
+
+    // A report posted after the commit finds the base as it is.
+    try postMailWithEarlierHistory(alloc, &runtime, "third report", .report);
+    try std.testing.expectEqual(@as(u32, 0), runtime.queued_history_owed);
+    try expectQueuedAnswers(&runtime, &.{ "earlier answer", "the finished answer" });
+}
+
+/// A worker with one report waiting behind `count` finishes the loop has not committed.
+fn reportBehindUncommittedFinishes(alloc: std.mem.Allocator, runtime: *WorkerRuntime, count: usize) !void {
+    runtime.enableCommitGate();
+    runtime.worker_processing = true;
+    runtime.active_turn_id = 9;
+    runtime.direct_steering_closed = true;
+    for (0..count) |_| try pushTestFinish(alloc, runtime);
+    try postMailWithEarlierHistory(alloc, runtime, "a report", .report);
+    runtime.finishProcessing();
+}
+
+fn reportBehindUncommittedFinish(alloc: std.mem.Allocator, runtime: *WorkerRuntime) !void {
+    try reportBehindUncommittedFinishes(alloc, runtime, 1);
+}
+
+test "a turn the loop drops unsaved never reaches mail queued behind it, whichever reason drops it" {
+    const alloc = std.testing.allocator;
+    // `acknowledgeDroppedFinish` names the reason; the worker counts them alike.
+    const reasons = [_][]const u8{ "cancel", "cancel_approval", "cancel_question", "cancel_compaction", "session_switch", "pacer_replaced", "not_persisted" };
+    for (reasons) |reason| {
+        var runtime = WorkerRuntime{};
+        defer runtime.deinit(alloc);
+        try reportBehindUncommittedFinish(alloc, &runtime);
+        try std.testing.expectEqual(@as(u32, 1), runtime.queued_history_owed);
+        runtime.acknowledgeFinishDropped(reason);
+        try std.testing.expectEqual(@as(u32, 0), runtime.queued_history_owed);
+        try std.testing.expectEqual(@as(u32, 0), runtime.unacknowledged_finishes);
+        try expectQueuedAnswers(&runtime, &.{"earlier answer"});
+        // The mail starts, without a turn that was never saved.
+        const work = (try runtime.tryTakeNextWork(alloc)).?;
+        defer freeWorkItem(alloc, work);
+        try std.testing.expectEqual(@as(usize, 1), work.prompt.history.len);
+    }
+
+    // A live session switch drops the events still queued.
+    var discarded = WorkerRuntime{};
+    defer discarded.deinit(alloc);
+    try reportBehindUncommittedFinish(alloc, &discarded);
+    discarded.discardEvents(alloc);
+    try std.testing.expectEqual(@as(u32, 0), discarded.queued_history_owed);
+    try expectQueuedAnswers(&discarded, &.{"earlier answer"});
+}
+
+fn dropEveryPrompt(_: void, _: usize, _: *const QueuedPrompt) bool {
+    return true;
+}
+
+/// A worker whose turn 9 finished, with one message posted behind it, which
+/// took the loop's history without that turn: the queue owes it a turn.
+fn messageQueuedBehindUncommittedFinish(alloc: std.mem.Allocator, runtime: *WorkerRuntime) !void {
+    runtime.enableCommitGate();
+    runtime.worker_processing = true;
+    runtime.active_turn_id = 9;
+    runtime.direct_steering_closed = true;
+    try pushTestFinish(alloc, runtime);
+    var events = runtime.takeEvents();
+    for (events.items) |event| freeWorkerEvent(alloc, event);
+    events.deinit(alloc);
+    try postMailWithEarlierHistory(alloc, runtime, "first message", .message);
+    runtime.finishProcessing();
+    try std.testing.expectEqual(@as(u32, 1), runtime.queued_history_owed);
+}
+
+const QueueEmptiedBy = enum { discard, take, remove, drop_messages, clear };
+
+test "a queue emptied while a turn is owed gives the next mail the turn once, whichever call emptied it" {
+    const alloc = std.testing.allocator;
+    for (std.enums.values(QueueEmptiedBy)) |how| {
+        for ([_]bool{ false, true }) |commit_before_next_post| {
+            var runtime = WorkerRuntime{};
+            defer runtime.deinit(alloc);
+            try messageQueuedBehindUncommittedFinish(alloc, &runtime);
+
+            switch (how) {
+                .discard => try std.testing.expectEqual(@as(usize, 1), runtime.discardQueuedWhere(alloc, {}, dropEveryPrompt)),
+                .take => freeQueuedPrompt(alloc, runtime.takeQueuedPrompt(alloc).?),
+                .remove => try std.testing.expect(runtime.removeQueuedPrompt(alloc, runtime.queued_prompts.items[0].turn_id, &.{})),
+                .drop_messages => try std.testing.expectEqual(@as(usize, 1), runtime.dropAgentMessages(alloc).total),
+                .clear => runtime.clearQueuedPrompts(alloc, &.{}),
+            }
+            try std.testing.expectEqual(@as(usize, 0), runtime.queuedPromptCount());
+            try std.testing.expectEqual(@as(usize, 0), runtime.queued_history.len);
+
+            if (commit_before_next_post) {
+                // The loop commits the turn before the next message is posted,
+                // so the history that message brings already has it.
+                runtime.acknowledgeFinishCommittedTurn(alloc, finishedTurn("the finished answer"), null, 8);
+                try std.testing.expectEqual(@as(u32, 0), runtime.unacknowledged_finishes);
+                var prompt = try makePrompt(alloc, "second message", "model");
+                types.freeHistoryTurnSlice(alloc, prompt.history);
+                prompt.history = try alloc.alloc(types.HistoryTurn, 2);
+                prompt.history[0] = .{ .assistant = .{
+                    .user = .{ .text = try alloc.dupe(u8, "earlier prompt") },
+                    .assistant = try alloc.dupe(u8, "earlier answer"),
+                } };
+                prompt.history[1] = .{ .assistant = .{
+                    .user = .{ .text = try alloc.dupe(u8, "the finished prompt") },
+                    .assistant = try alloc.dupe(u8, "the finished answer"),
+                } };
+                prompt.mail = .message;
+                try runtime.postMail(alloc, prompt);
+                try std.testing.expectEqual(@as(u32, 0), runtime.queued_history_owed);
+            } else {
+                // The loop has not committed it: the next message owes it too,
+                // and gets it at the commit, once.
+                try postMailWithEarlierHistory(alloc, &runtime, "second message", .message);
+                try std.testing.expectEqual(@as(u32, 1), runtime.queued_history_owed);
+                try expectQueuedAnswers(&runtime, &.{"earlier answer"});
+                runtime.acknowledgeFinishCommittedTurn(alloc, finishedTurn("the finished answer"), null, 8);
+                try std.testing.expectEqual(@as(u32, 0), runtime.queued_history_owed);
+            }
+            try expectQueuedAnswers(&runtime, &.{ "earlier answer", "the finished answer" });
+        }
+    }
+}
+
+test "a session switch retires the queue and what it was owed" {
+    const alloc = std.testing.allocator;
+    var runtime = WorkerRuntime{};
+    defer runtime.deinit(alloc);
+    try reportBehindUncommittedFinish(alloc, &runtime);
+    runtime.clearQueuedPrompts(alloc, &.{});
+    try std.testing.expectEqual(@as(u32, 0), runtime.queued_history_owed);
+    // The late commit of the old session's turn finds an empty queue.
+    runtime.acknowledgeFinishCommittedTurn(alloc, finishedTurn("the finished answer"), null, 8);
+    try std.testing.expectEqual(@as(usize, 0), runtime.queued_history.len);
+    try std.testing.expectEqual(@as(u32, 0), runtime.unacknowledged_finishes);
+}
+
+test "a cancelled turn's commit reaches mail queued behind it like any turn" {
+    const alloc = std.testing.allocator;
+    var runtime = WorkerRuntime{};
+    defer runtime.deinit(alloc);
+    try reportBehindUncommittedFinish(alloc, &runtime);
+    const interrupted: types.HistoryTurn = .{ .interrupted = .{
+        .user = .{ .text = @constCast("the finished prompt") },
+        .assistant = @constCast("what it said before the cancel"),
+    } };
+    runtime.acknowledgeFinishCommittedTurn(alloc, interrupted, null, 8);
+    try expectQueuedAnswers(&runtime, &.{ "earlier answer", "what it said before the cancel" });
+}
+
+test "a commit that failed leaves mail queued behind it with the history it has" {
+    const alloc = std.testing.allocator;
+    var runtime = WorkerRuntime{};
+    defer runtime.deinit(alloc);
+    try reportBehindUncommittedFinish(alloc, &runtime);
+    // `appendFinishedPrompt` still acknowledges, with no turn, when the append failed.
+    runtime.acknowledgeFinishCommitted();
+    try std.testing.expectEqual(@as(u32, 0), runtime.queued_history_owed);
+    try expectQueuedAnswers(&runtime, &.{"earlier answer"});
+    const work = (try runtime.tryTakeNextWork(alloc)).?;
+    defer freeWorkItem(alloc, work);
+    try std.testing.expectEqual(@as(usize, 1), work.prompt.history.len);
+}
+
+test "a gate that expires logs the turns its mail starts without, and a late commit adds nothing" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(root);
+    const trace_path = try std.Io.Dir.path.join(alloc, &.{ root, "owed.log" });
+    defer alloc.free(trace_path);
+    debug_trace.resetForTest();
+    defer debug_trace.resetForTest();
+    try debug_trace.configureForTestWithScopes(alloc, trace_path, "worker");
+
+    var runtime = WorkerRuntime{};
+    defer runtime.deinit(alloc);
+    try reportBehindUncommittedFinishes(alloc, &runtime, 2);
+    try std.testing.expectEqual(@as(u32, 2), runtime.queued_history_owed);
+    // The first take holds the mail and starts the limit, whether the limit
+    // counts from the push of the finish or from this first hold. The loop
+    // never commits, and the limit passes.
+    try std.testing.expect((try runtime.tryTakeNextWork(alloc)) == null);
+    runtime.commit_gate_since_ms -= WorkerRuntime.commit_gate_limit_ms;
+    const work = (try runtime.tryTakeNextWork(alloc)).?;
+    defer freeWorkItem(alloc, work);
+    try std.testing.expectEqual(@as(usize, 1), work.prompt.history.len);
+    try std.testing.expectEqual(@as(u32, 0), runtime.queued_history_owed);
+
+    // The commit that comes after the mail started adds nothing.
+    runtime.acknowledgeFinishCommittedTurn(alloc, finishedTurn("the finished answer"), null, 8);
+    try std.testing.expectEqual(@as(usize, 0), runtime.queued_history.len);
+
+    debug_trace.shutdown();
+    var file = try std.Io.Dir.openFileAbsolute(io_mod.getIo(), trace_path, .{});
+    defer file.close(io_mod.getIo());
+    const trace = try io_mod.readFileToEnd(alloc, &file, 1024 * 1024);
+    defer alloc.free(trace);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, trace, "queued mail starts without finished turns turns=2 reason=gate_expired"));
+}
+
+test "a turn added at its end to a queue that was not empty is not added again at its commit" {
+    const alloc = std.testing.allocator;
+    var runtime = WorkerRuntime{};
+    defer runtime.deinit(alloc);
+    runtime.enableCommitGate();
+    runtime.worker_processing = true;
+    runtime.active_turn_id = 9;
+    runtime.direct_steering_closed = true;
+    // The report was posted while the turn ran: it joins, and owes nothing,
+    // because no finish was counted yet.
+    try postMailWithEarlierHistory(alloc, &runtime, "a report", .report);
+    try std.testing.expectEqual(@as(u32, 0), runtime.queued_history_owed);
+    // The turn ends: the worker adds it to the queue, then pushes the finish.
+    try runtime.propagateHistoryTurn(alloc, finishedTurn("the finished answer"), 8);
+    try pushTestFinish(alloc, &runtime);
+    runtime.finishProcessing();
+    try expectQueuedAnswers(&runtime, &.{ "earlier answer", "the finished answer" });
+
+    runtime.acknowledgeFinishCommittedTurn(alloc, finishedTurn("the finished answer"), null, 8);
+    try expectQueuedAnswers(&runtime, &.{ "earlier answer", "the finished answer" });
+}
+
+test "turns the loop commits one after the other reach the mail in the order it commits them" {
+    const alloc = std.testing.allocator;
+    var runtime = WorkerRuntime{};
+    defer runtime.deinit(alloc);
+    try reportBehindUncommittedFinishes(alloc, &runtime, 2);
+    try std.testing.expectEqual(@as(u32, 2), runtime.queued_history_owed);
+    runtime.acknowledgeFinishCommittedTurn(alloc, finishedTurn("first finished answer"), null, 8);
+    try std.testing.expectEqual(@as(u32, 1), runtime.queued_history_owed);
+    runtime.acknowledgeFinishCommittedTurn(alloc, finishedTurn("second finished answer"), null, 8);
+    try expectQueuedAnswers(&runtime, &.{ "earlier answer", "first finished answer", "second finished answer" });
+
+    // The first was dropped unsaved: only the second goes in.
+    var dropped = WorkerRuntime{};
+    defer dropped.deinit(alloc);
+    try reportBehindUncommittedFinishes(alloc, &dropped, 2);
+    dropped.acknowledgeFinishDropped("pacer_replaced");
+    dropped.acknowledgeFinishCommittedTurn(alloc, finishedTurn("second finished answer"), null, 8);
+    try expectQueuedAnswers(&dropped, &.{ "earlier answer", "second finished answer" });
+}
+
+test "a prompt a user typed owes nothing: its history is the one it was typed with" {
+    const alloc = std.testing.allocator;
+    var runtime = WorkerRuntime{};
+    defer runtime.deinit(alloc);
+    runtime.enableCommitGate();
+    try pushTestFinish(alloc, &runtime);
+    var typed = try makePrompt(alloc, "typed", "model");
+    types.freeHistoryTurnSlice(alloc, typed.history);
+    typed.history = try earlierTurns(alloc);
+    try runtime.enqueuePrompt(alloc, typed);
+    try std.testing.expectEqual(@as(u32, 0), runtime.queued_history_owed);
+    runtime.acknowledgeFinishCommittedTurn(alloc, finishedTurn("the finished answer"), null, 8);
+    try expectQueuedAnswers(&runtime, &.{"earlier answer"});
+}
+
+test "a committed turn's snapshot files stay with the mail queued behind it" {
+    const alloc = std.testing.allocator;
+    var runtime = WorkerRuntime{};
+    defer runtime.deinit(alloc);
+    try reportBehindUncommittedFinish(alloc, &runtime);
+
+    var images = [_]types.ImageAttachment{.{
+        .id = 3,
+        .path = @constCast("/tmp/finished.png"),
+        .media_type = @constCast("image/png"),
+    }};
+    const state = try SnapshotFileOwnershipState.create(alloc, &images);
+    const ownership = state.handle();
+    // The loop has handed the files to history, so none is deleted.
+    ownership.transfer();
+    const turn: types.HistoryTurn = .{ .assistant = .{
+        .user = .{ .text = @constCast("the finished prompt"), .images = &images },
+        .assistant = @constCast("the finished answer"),
+    } };
+    runtime.acknowledgeFinishCommittedTurn(alloc, turn, ownership, 8);
+
+    const prompt = runtime.queued_prompts.items[0];
+    try std.testing.expectEqual(@as(usize, 1), prompt.snapshot_file_ownerships.len);
+    try std.testing.expectEqual(@as(usize, 1), prompt.authorized_image_catalog.len);
+    try std.testing.expectEqual(@as(usize, 2), state.references.load(.seq_cst));
+    // The loop's own reference goes, and the prompt's is the last.
+    ownership.release();
+    try std.testing.expectEqual(@as(usize, 1), state.references.load(.seq_cst));
 }
 
 test "the commit gate logs what it held, what released it, and the limit it gave up at" {

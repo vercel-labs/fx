@@ -2126,11 +2126,27 @@ pub fn Runtime(comptime App: type) type {
 
         /// Tells the agent's worker that a finished turn is committed, or
         /// failed to commit, so mail held for it may start the next turn
-        /// (`WorkerRuntime.acknowledgeFinishCommitted`).
-        fn acknowledgeFinishCommitted(agent: *AppAgent) void {
+        /// (`WorkerRuntime.acknowledgeFinishCommitted`). `committed` is the turn
+        /// added to the agent's history, null when there was none: the worker
+        /// adds it to mail that was posted after the turn finished and before
+        /// this commit (`WorkerRuntime.acknowledgeFinishCommittedTurn`).
+        fn acknowledgeFinishCommitted(
+            agent: *AppAgent,
+            committed: ?types.HistoryTurn,
+            ownership: ?types.SnapshotFileOwnership,
+        ) void {
             if (comptime @hasField(AppAgent, "worker") and
                 @hasDecl(@TypeOf(agent.worker), "acknowledgeFinishCommitted"))
             {
+                if (comptime @hasDecl(@TypeOf(agent.worker), "acknowledgeFinishCommittedTurn")) {
+                    if (committed) |turn| {
+                        // The worker's queue is allocated with `c_allocator`, by
+                        // `postAgentMessage` and by the worker threads, so the
+                        // turn is added with the same allocator.
+                        agent.worker.acknowledgeFinishCommittedTurn(std.heap.c_allocator, turn, ownership, agent.session.max_history_turns);
+                        return;
+                    }
+                }
                 agent.worker.acknowledgeFinishCommitted();
             }
         }
@@ -2140,19 +2156,20 @@ pub fn Runtime(comptime App: type) type {
             agent: *AppAgent,
             finished: types.FinishedPrompt,
         ) !void {
-            defer acknowledgeFinishCommitted(agent);
+            var committed: ?types.HistoryTurn = null;
+            defer acknowledgeFinishCommitted(agent, committed, finished.snapshot_file_ownership);
             var turn = finished.turn;
             if (finished.summary) |summary| {
                 types.setHistoryTurnSummary(&turn, summary);
             }
-            _ = try appendHistoryTurnWithPendingPresentation(
+            if (try appendHistoryTurnWithPendingPresentation(
                 app,
                 agent,
                 turn,
                 .finished_prompt,
                 finished.snapshot_file_ownership,
                 finished.capture_turn,
-            );
+            ) == .committed) committed = turn;
             if (comptime agents.hasAgentField(App, "child_run")) {
                 @import("app_agents_runtime.zig").Runtime(App).commitChildTurn(app, agent, finished);
             }
@@ -2188,7 +2205,9 @@ pub fn Runtime(comptime App: type) type {
             );
             // An uncommitted turn stays with the pacer, which commits it later
             // through `appendFinishedPrompt`.
-            if (outcome == .committed) acknowledgeFinishCommitted(agent);
+            if (outcome == .committed) {
+                acknowledgeFinishCommitted(agent, finished.turn, finished.snapshot_file_ownership);
+            }
             return outcome;
         }
 
@@ -5734,10 +5753,36 @@ const FakeWorker = struct {
     fast_mode: bool = false,
     ultrafast_mode: bool = false,
     cancel_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    /// What the loop told the worker about the commit of a finished turn.
+    acknowledgements_without_turn: usize = 0,
+    acknowledgements_with_turn: usize = 0,
+    acknowledged_answer: ?[]const u8 = null,
+    acknowledged_ownership: bool = false,
+    acknowledged_history_limit: usize = 0,
 
     fn deinit(self: *FakeWorker, alloc: Allocator) void {
         self.model.deinit(alloc);
         self.* = .{};
+    }
+
+    pub fn acknowledgeFinishCommitted(self: *FakeWorker) void {
+        self.acknowledgements_without_turn += 1;
+    }
+
+    pub fn acknowledgeFinishCommittedTurn(
+        self: *FakeWorker,
+        _: Allocator,
+        turn: types.HistoryTurn,
+        ownership: ?types.SnapshotFileOwnership,
+        max_history_turns: usize,
+    ) void {
+        self.acknowledgements_with_turn += 1;
+        self.acknowledged_answer = switch (turn) {
+            .assistant => |entry| entry.assistant,
+            else => null,
+        };
+        self.acknowledged_ownership = ownership != null;
+        self.acknowledged_history_limit = max_history_turns;
     }
 
     pub fn isCancelRequested(self: *const FakeWorker) bool {
@@ -10160,6 +10205,76 @@ test "appendFinishedPrompt transfers snapshot ownership after history acceptance
         types.historyTurnSummary(app.agent().session.agent.history.items[0]),
     );
     try std.testing.expectEqual(@as(usize, 1), probe.transfers);
+}
+
+test "appendFinishedPrompt gives the worker the turn it committed, with its snapshot files and the history limit" {
+    const alloc = std.testing.allocator;
+    var app = try TestApp.init(alloc, "/tmp/workspace");
+    defer app.deinit();
+    var probe = SnapshotOwnershipProbe{};
+
+    try Runtime(TestApp).appendFinishedPrompt(&app, (&app).agent(), .{
+        .turn = .{ .assistant = .{
+            .user = .{ .text = @constCast("inspect") },
+            .assistant = @constCast("done"),
+        } },
+        .snapshot_file_ownership = probe.handle(),
+    });
+
+    const worker = &app.agent().worker;
+    try std.testing.expectEqual(@as(usize, 1), worker.acknowledgements_with_turn);
+    try std.testing.expectEqual(@as(usize, 0), worker.acknowledgements_without_turn);
+    try std.testing.expectEqualStrings("done", worker.acknowledged_answer.?);
+    try std.testing.expect(worker.acknowledged_ownership);
+    try std.testing.expectEqual(@as(usize, 8), worker.acknowledged_history_limit);
+}
+
+test "appendFinishedPrompt acknowledges a turn it could not commit without the turn" {
+    const alloc = testing_allocator.no_resize;
+    var app = try TestApp.init(alloc, "/tmp/workspace");
+    defer app.deinit();
+    var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
+    app.alloc = failing.allocator();
+    defer app.alloc = alloc;
+
+    try std.testing.expectError(
+        error.OutOfMemory,
+        Runtime(TestApp).appendFinishedPrompt(&app, (&app).agent(), .{
+            .turn = .{ .assistant = .{
+                .user = .{ .text = @constCast("inspect") },
+                .assistant = @constCast("done"),
+            } },
+        }),
+    );
+
+    // Nothing was added to history, so the worker is not told of a turn, and
+    // the mail it holds for the commit still goes on.
+    const worker = &app.agent().worker;
+    try std.testing.expectEqual(@as(usize, 0), worker.acknowledgements_with_turn);
+    try std.testing.expectEqual(@as(usize, 1), worker.acknowledgements_without_turn);
+}
+
+test "a visual epoch commit acknowledges with its turn, and one that did not commit acknowledges nothing" {
+    const alloc = testing_allocator.no_resize;
+    var app = try TestApp.init(alloc, "/tmp/workspace");
+    defer app.deinit();
+    const finished: types.FinishedPrompt = .{ .turn = .{ .assistant = .{
+        .user = .{ .text = @constCast("inspect") },
+        .assistant = @constCast("done"),
+    } } };
+
+    try std.testing.expectEqual(HistoryAppendOutcome.committed, try Runtime(TestApp).appendFinishedPromptForVisualEpoch(&app, (&app).agent(), finished));
+    const worker = &app.agent().worker;
+    try std.testing.expectEqual(@as(usize, 1), worker.acknowledgements_with_turn);
+    try std.testing.expectEqualStrings("done", worker.acknowledged_answer.?);
+
+    // The pacer keeps a turn that did not commit, and commits it later.
+    var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
+    app.alloc = failing.allocator();
+    defer app.alloc = alloc;
+    try std.testing.expectEqual(HistoryAppendOutcome.uncommitted, try Runtime(TestApp).appendFinishedPromptForVisualEpoch(&app, (&app).agent(), finished));
+    try std.testing.expectEqual(@as(usize, 1), worker.acknowledgements_with_turn);
+    try std.testing.expectEqual(@as(usize, 0), worker.acknowledgements_without_turn);
 }
 
 test "appendFinishedPrompt does not transfer snapshot ownership when history insertion fails" {
