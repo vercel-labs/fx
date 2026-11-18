@@ -4288,6 +4288,16 @@ const FaultedHost = struct {
         runtime.managed.alloc = self.fault.allocator();
     }
 
+    /// The same, in the allocator of the child registry, where the seed of a
+    /// child is kept, which `install` leaves alone.
+    fn installChildren(self: *FaultedHost, runtime: *Runtime) void {
+        self.* = .{
+            .runtime = runtime,
+            .fault = .{ .backing = std.testing.allocator, .thread = std.Thread.getCurrentId() },
+        };
+        runtime.children.alloc = self.fault.allocator();
+    }
+
     fn arm(self: *FaultedHost, fail_at: usize) void {
         self.fault.count = 0;
         self.fault.fired = false;
@@ -4842,7 +4852,7 @@ test "a subagent whose waiting message could not start after the user's turn tak
 /// One try of the sweep below: `mode` is a message that makes the child or one
 /// to a child that already exists, and the `fail_at`-th allocation the
 /// call's thread makes fails. Returns whether it failed.
-fn sweepStart(create: bool, fail_at: usize) !bool {
+fn sweepStart(create: bool, seed: bool, fail_at: usize) !bool {
     const alloc = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(alloc);
     defer arena_state.deinit();
@@ -4854,7 +4864,7 @@ fn sweepStart(create: bool, fail_at: usize) !bool {
     defer fixture.deinit();
     const runtime = try mailboxRuntime(alloc, &fixture, &parent);
     var faulted: FaultedHost = undefined;
-    faulted.install(runtime);
+    if (seed) faulted.installChildren(runtime) else faulted.install(runtime);
     defer faulted.deinit();
     var reports_before: usize = 0;
     if (!create) {
@@ -4864,7 +4874,7 @@ fn sweepStart(create: bool, fail_at: usize) !bool {
     }
 
     faulted.arm(fail_at);
-    var call_arena = std.heap.ArenaAllocator.init(faulted.fault.allocator());
+    var call_arena = std.heap.ArenaAllocator.init(if (seed) alloc else faulted.fault.allocator());
     const call_result = callTool(runtime, call_arena.allocator(), .{ .message = .{ .agent = "reviewer", .message = "second" } }, "call-1", null);
     faulted.disarm();
     const copy = if (call_result) |body| try arena.dupe(u8, body) else |_| "";
@@ -4900,10 +4910,18 @@ fn sweepStart(create: bool, fail_at: usize) !bool {
 test "a message whose start fails at any allocation leaves its subagent idle or working, then takes the next" {
     inline for (.{ true, false }) |create| {
         var at: usize = 0;
-        while (try sweepStart(create, at)) : (at += 1) {}
+        while (try sweepStart(create, false, at)) : (at += 1) {}
         // The call allocates in more places than the few that matter; a
         // sweep that ended at once would prove nothing.
         try std.testing.expect(at > 8);
+    }
+}
+
+test "a message whose child's seed cannot be kept leaves its subagent idle or working, then takes the next" {
+    inline for (.{ true, false }) |create| {
+        var at: usize = 0;
+        while (try sweepStart(create, true, at)) : (at += 1) {}
+        try std.testing.expect(at > 0);
     }
 }
 
