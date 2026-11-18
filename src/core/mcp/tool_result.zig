@@ -230,7 +230,7 @@ const max_cause_bytes = 240;
 /// arguments when an MCP server refuses a call's parameters")
 pub fn invalidParamsCause(arena: Allocator, text: []const u8) Allocator.Error!?[]const u8 {
     if (!std.mem.startsWith(u8, text, invalid_params_prefix)) return null;
-    const message = try withoutData(arena, text[invalid_params_prefix.len..]);
+    const message = (try protocolErrorWithoutData(arena, text))[invalid_params_prefix.len..];
     var line: std.Io.Writer.Allocating = .init(arena);
     const named = (writeGoRejections(&line.writer, message) catch return error.OutOfMemory) or
         try writeZodRejections(arena, &line.writer, message);
@@ -242,6 +242,25 @@ pub fn invalidParamsCause(arena: Allocator, text: []const u8) Allocator.Error!?[
 }
 
 const data_label = "; data=";
+
+/// `text` without the data of a protocol error: the words of `write_protocol_diagnostic`, `MCP protocol error
+/// <code>: ` and the server's message, for any code, and none of the `; data=` and the data after it (see
+/// `withoutData`). Text that does not start with those words comes back as it is. A line that shows what the
+/// server said, and not what it sent for the model, reads this.
+/// (`tests/e2e/mcp-stdio.test.ts` "an error's data never reaches a trace, a log line, the trace report or the cause line")
+pub fn protocolErrorWithoutData(arena: Allocator, text: []const u8) Allocator.Error![]const u8 {
+    const words = "MCP protocol error ";
+    if (!std.mem.startsWith(u8, text, words)) return text;
+    const code_start = words.len;
+    var at = code_start;
+    if (at < text.len and text[at] == '-') at += 1;
+    const digits_start = at;
+    while (at < text.len and std.ascii.isDigit(text[at])) at += 1;
+    if (at == digits_start or !std.mem.startsWith(u8, text[at..], ": ")) return text;
+    const message_start = at + ": ".len;
+    const message = try withoutData(arena, text[message_start..]);
+    return text[0 .. message_start + message.len];
+}
 
 /// The message of the text `write_protocol_diagnostic` wrote, without the `; data=` and the data it
 /// adds when the server gave some. The data is JSON to the end of the text, or the start of JSON when
@@ -956,6 +975,50 @@ test "an invalid-params cause reads the server's message only, not the data writ
     // A message that says `; data=` itself keeps what follows it, since nothing JSON ends the text.
     const says = (try invalidParamsCause(arena, "MCP protocol error -32602: validating /properties/limit: type: \"1\" has type \"string\", want \"number\"; data=none")).?;
     try std.testing.expect(std.mem.find(u8, says, "limit") != null);
+}
+
+test "a protocol error without its data keeps the code and the message, for any code, and nothing of the data" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    // Data that has a zod-like list of its own and eight labels.
+    const data = "{\"errors\":[{\"expected\":\"string\",\"path\":[\"forged\"]}],\"hint\":\"; data=; data=; data=; data=; data=; data=; data=; data=x\"}";
+    for ([_]i32{ -32603, -32000, -32042, -32602, 7 }) |code| {
+        const message = try arena.print("MCP protocol error {d}: Internal error", .{code});
+        const text = try arena.print("{s}; data={s}", .{ message, data });
+        // The whole text, and every head of it from the label on (the trace report reads one, and the result cap cuts one).
+        const first = message.len + "; data=".len;
+        for (first..text.len + 1) |end| try std.testing.expectEqualStrings(message, try protocolErrorWithoutData(arena, text[0..end]));
+        // A head that ends inside the label holds no data yet.
+        for (message.len..first) |end| {
+            const head = try protocolErrorWithoutData(arena, text[0..end]);
+            try std.testing.expectEqualStrings(text[0..end], head);
+        }
+        // A text the result cap cut, with its marker.
+        const cut = try arena.print("{s}{s}mcp_srv_tool: original 3299 bytes; cap is 2000{s}", .{ text[0 .. first + 20], tool_result_limits.cut_marker_start, tool_result_limits.cut_marker_end });
+        try std.testing.expectEqualStrings(message, try protocolErrorWithoutData(arena, cut));
+    }
+    // Without data, and without the words of a protocol error, the text comes back as it is.
+    for ([_][]const u8{
+        "MCP protocol error -32603: Internal error",
+        "MCP protocol error -32603: ",
+        "something else; data={\"a\":1}",
+        "MCP protocol error x: Internal error; data={\"a\":1}",
+        "MCP protocol error -: Internal error; data={\"a\":1}",
+        "MCP protocol error -32603 Internal error; data={\"a\":1}",
+        "MCP protocol error ",
+        "",
+    }) |text| {
+        const same = try protocolErrorWithoutData(arena, text);
+        try std.testing.expectEqual(text.ptr, same.ptr);
+        try std.testing.expectEqual(text.len, same.len);
+    }
+    // A message that says `; data=` itself stays whole while no JSON follows it; the data is what follows the one
+    // that does.
+    try std.testing.expectEqualStrings(
+        "MCP protocol error -32603: tried; data=none",
+        try protocolErrorWithoutData(arena, "MCP protocol error -32603: tried; data=none; data={\"a\":1}"),
+    );
 }
 
 /// `message` and then `data` as `write_protocol_diagnostic` writes them for a -32602.

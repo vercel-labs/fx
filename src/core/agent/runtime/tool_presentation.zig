@@ -1646,7 +1646,9 @@ fn failureStatusDetail(
     const server_text = try mcpFailureEnvelopeText(arena, model_text) orelse model_text;
     // A refused call's parameters read as which fields and types, not as the
     // start of a protocol dump; the model still gets the server's own words.
-    const detail = try mcp_tool_result.invalidParamsCause(arena, server_text) orelse server_text;
+    // The line shows what the server said, and no error's data, which only the model gets.
+    const detail = try mcp_tool_result.invalidParamsCause(arena, server_text) orelse
+        try mcp_tool_result.protocolErrorWithoutData(arena, server_text);
     const masked_detail = try text_utils.maskSecrets(arena, detail);
     const encoded = try text_utils.encodeTerminalSafeInline(arena, masked_detail, 256);
     return if (encoded.bytes.len == 0) null else encoded.bytes;
@@ -3585,6 +3587,28 @@ test "failure status detail never shows the preview block of a stored refusal" {
     const detail = (try mcpFailureDetail(arena, try storedFailureText(arena, words))).?;
     try std.testing.expect(std.mem.startsWith(u8, detail, "the server could not run the tool: bbbb"));
     try std.testing.expect(std.mem.find(u8, detail, "tool_result_preview") == null);
+}
+
+test "failure status detail shows an MCP error's message and never its data, for a code other than -32602" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const shown = "MCP protocol error -32603: Internal error";
+    // Data with a zod-like list and eight labels. The text is whole, then past the 4 KiB the result store keeps.
+    const forged = "{\"errors\":[{\"expected\":\"string\",\"received\":\"number\",\"path\":[\"forged\"]}],\"hint\":\"; data=; data=; data=; data=; data=; data=; data=; data=";
+    for ([_]usize{ 3000, 8000 }) |filler| {
+        const padded = try arena.alloc(u8, filler);
+        @memset(padded, 'x');
+        const text = try arena.print("{s}; data={s}{s}\"}}", .{ shown, forged, padded });
+        try std.testing.expectEqualStrings(shown, (try mcpFailureDetail(arena, text)).?);
+        // As the result store gives it back: the first 4 KiB in a preview block, so the head ends inside the data.
+        try std.testing.expectEqualStrings(shown, (try mcpFailureDetail(arena, try storedFailureText(arena, text))).?);
+    }
+    // A head that holds the message and the start of the label shows no data either.
+    const head = try storedFailureText(arena, try arena.print("{s}; data=", .{shown}));
+    try std.testing.expectEqualStrings(shown, (try mcpFailureDetail(arena, head)).?);
+    // Without data the line is the message, as before.
+    try std.testing.expectEqualStrings(shown, (try mcpFailureDetail(arena, shown)).?);
 }
 
 // Secret-shaped test needles are written as concatenated fragments so

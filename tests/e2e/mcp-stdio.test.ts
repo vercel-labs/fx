@@ -2895,9 +2895,16 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"`,
         ["zod", `Invalid arguments: ${JSON.stringify([{ expected: "number", received: "string", path: ["limit"] }])}`, "arguments rejected: limit is a string, the schema wants a number"],
         // A plain message has no cause of its own. The data's list used to give it one.
         ["plain", "Invalid params", "the server rejected the call's parameters (-32602)"],
+        // Any other code has no cause line: the line is the server's message, as it is without data, and no data.
+        ["other-code", "Internal error", null],
       ] as const;
       for (const [kind, message, cause] of cases) {
-        const logged = await refusedCall(`tui-invalid-params-log-${kind}`, { protocolErrorMessage: message, protocolErrorData: data }, `Log ${kind} complete.`, true);
+        const logged = await refusedCall(
+          `tui-invalid-params-log-${kind}`,
+          { protocolErrorMessage: message, protocolErrorData: data, ...(cause === null ? { protocolErrorCode: -32603 } : {}) },
+          `Log ${kind} complete.`,
+          true,
+        );
         const text = logged.text();
         expect(text.length).toBeGreaterThan(8 * 1024);
         expect(text).toContain(`; data=${JSON.stringify(data)}`);
@@ -2906,7 +2913,8 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"`,
         // no other field of it: the cause is the server's message's and nothing of the data.
         expect({ kind, found: logged.logs.includes(marker) }).toEqual({ kind, found: false });
         expect({ kind, found: logged.screen.includes(marker) }).toEqual({ kind, found: false });
-        expect(logged.screen).toContain(`Couldn't run ${TOOL_NAME} · ${cause}`);
+        expect(logged.screen).toContain(`Couldn't run ${TOOL_NAME} · ${cause ?? `MCP protocol error -32603: ${message}`}`);
+        expect({ kind, shown: logged.screen.includes("data=") }).toEqual({ kind, shown: false });
         const reportFields: string[] = [];
         const walk = (value: unknown, path: string) => {
           if (typeof value === "string") {
@@ -2917,7 +2925,7 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"`,
         for (const record of logged.traced!.records) walk(record, String(record.type));
         expect(reportFields.length).toBeGreaterThan(0);
         expect(reportFields.every((field) => field === "tool_call.result" || field === "failed_tool_call.result")).toBe(true);
-        expect({ kind, causes: logged.traced!.calls.filter((call) => call.cause === cause).length }).toEqual({ kind, causes: 1 });
+        expect({ kind, causes: logged.traced!.calls.filter((call) => (cause === null ? call.cause !== undefined : call.cause === cause)).length }).toEqual({ kind, causes: cause === null ? 0 : 1 });
       }
     },
     120_000,
@@ -2940,6 +2948,8 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"`,
         ["plain", { protocolErrorMessage: "Invalid params", protocolErrorData: data }, "the server rejected the call's parameters (-32602)"],
         // The message alone is over the cap, with no data: the same gap was in the code before data was kept.
         ["long-message", { protocolErrorMessage: `Invalid arguments: ${JSON.stringify([{ ...issue, message: "y".repeat(2600) }])}` }, "arguments rejected: limit is a string, the schema wants a number"],
+        // Any other code shows the server's message, and none of the data the stored text holds.
+        ["other-code", { protocolErrorMessage: "Internal error", protocolErrorCode: -32603, protocolErrorData: data }, "MCP protocol error -32603: Internal error"],
       ] as const;
       for (const [kind, options, cause] of cases) {
         const call = await refusedCall(`tui-invalid-params-cap-${kind}`, { ...options, resultCapBytes: 2000 }, `Cap ${kind} complete.`);
@@ -2947,6 +2957,7 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"`,
         expect({ kind, stored: call.body?.includes("<tool_result_preview handle=") }).toEqual({ kind, stored: true });
         expect(call.screen).toContain(`Couldn't run ${TOOL_NAME} · ${cause}`);
         expect({ kind, shown: call.screen.includes("tool_result_preview") }).toEqual({ kind, shown: false });
+        expect({ kind, shown: call.screen.includes("data=") }).toEqual({ kind, shown: false });
         expect({ kind, found: call.screen.includes(marker) || call.logs.includes(marker) }).toEqual({ kind, found: false });
       }
     },
