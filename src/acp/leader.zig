@@ -499,6 +499,8 @@ test "a leader answers initialize with its pid and sessions, refuses another met
         .context = null,
         .copy_ids = TestIds.copy,
     });
+    var stopped = false;
+    defer if (!stopped) leader.stop(io);
     const pid: i64 = @intCast(std.c.getpid());
     const socket_copy = try alloc.dupe(u8, leader.socket_path);
     defer alloc.free(socket_copy);
@@ -507,6 +509,8 @@ test "a leader answers initialize with its pid and sessions, refuses another met
 
     const address = try std.Io.net.UnixAddress.init(socket_copy);
     const client = try address.connect(io);
+    var client_closed = false;
+    defer if (!client_closed) client.close(io);
     try sendLine(io, client, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":1}}\n");
     var buffer: [16 * 1024]u8 = undefined;
     const reply = try readReplyLine(client.socket.handle, &buffer);
@@ -520,23 +524,30 @@ test "a leader answers initialize with its pid and sessions, refuses another met
     try testing.expect(std.mem.indexOf(u8, refused, "\"error\":{\"code\":-32601,\"message\":\"This socket answers only initialize\"}") != null);
 
     client.close(io);
+    client_closed = true;
     leader.stop(io);
+    stopped = true;
     try testing.expect(pathGone(io, socket_copy));
     try testing.expect(pathGone(io, folder_copy));
 }
 
 const initialize_line = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":1}}\n";
-/// The most lines the stall test sends. The test fails if the client's buffer
-/// never fills within this many lines; then this number must go up.
+/// The most lines the stall test sends. The test fails if the client never
+/// stops sending within this many lines; then this number must go up.
 const never_read_lines = 5000;
 
-/// Sends one whole line without waiting. Returns false when the socket buffer
-/// has no room, which is where a client that never reads leaves its connection.
+/// Sends one whole line without waiting. Returns false when the client can send
+/// no more: its buffer is full (AGAIN, or NOBUFS on macOS), or the leader has
+/// dropped the connection at its write deadline (PIPE, CONNRESET). Any other
+/// errno is an error, and the test output names it.
 fn sendLineNoWait(fd: posix.socket_t, line: []const u8) !bool {
     const rc = std.c.send(fd, line.ptr, line.len, posix.MSG.NOSIGNAL | posix.MSG.DONTWAIT);
     if (rc < 0) switch (posix.errno(rc)) {
-        .AGAIN => return false,
-        else => return error.SendFailed,
+        .AGAIN, .NOBUFS, .PIPE, .CONNRESET => return false,
+        else => |err| {
+            std.debug.print("sendLineNoWait: send failed with errno {t}\n", .{err});
+            return error.SendFailed;
+        },
     };
     return @as(usize, @intCast(rc)) == line.len;
 }
@@ -548,6 +559,8 @@ test "a client that never reads cannot hold up stop: it returns within 3 s and r
         .context = null,
         .copy_ids = TestIds.copy,
     });
+    var stopped = false;
+    defer if (!stopped) leader.stop(io);
     const socket_copy = try alloc.dupe(u8, leader.socket_path);
     defer alloc.free(socket_copy);
     const folder_copy = try alloc.dupe(u8, leader.folder_path);
@@ -555,21 +568,26 @@ test "a client that never reads cannot hold up stop: it returns within 3 s and r
 
     const address = try std.Io.net.UnixAddress.init(socket_copy);
     const client = try address.connect(io);
+    var client_closed = false;
+    defer if (!client_closed) client.close(io);
     // The client sends and never reads. The leader's answers fill the
-    // connection, so its writes block; the client stops at its own full buffer.
-    var buffer_full = false;
+    // connection, so its writes block. The client stops when it can send no
+    // more, because its buffer is full or the leader has dropped it.
+    var send_refused = false;
     for (0..never_read_lines) |_| {
         if (!try sendLineNoWait(client.socket.handle, initialize_line)) {
-            buffer_full = true;
+            send_refused = true;
             break;
         }
     }
-    try testing.expect(buffer_full);
+    try testing.expect(send_refused);
 
     const started = io_mod.milliTimestamp();
     leader.stop(io);
+    stopped = true;
     const elapsed_ms = io_mod.milliTimestamp() - started;
     client.close(io);
+    client_closed = true;
     try testing.expect(elapsed_ms < 3000);
     try testing.expect(pathGone(io, socket_copy));
     try testing.expect(pathGone(io, folder_copy));
