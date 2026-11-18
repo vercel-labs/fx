@@ -4453,6 +4453,96 @@ test "a message that waited for the user's turn and could not start is reported 
     try std.testing.expectEqual(@as(?child_state.Outcome, .failed), state.outcome);
 }
 
+/// `count` messages wait for the user's turn and start as one work when it ends,
+/// which fails to start: its one report says how many messages it carried.
+fn expectJoinedMessagesReportedTogether(count: usize) !void {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var parent: child_state.TestParent = undefined;
+    try parent.init(alloc);
+    defer parent.deinit();
+    var fixture = MailboxFixture{};
+    defer fixture.deinit();
+    const runtime = try mailboxRuntime(alloc, &fixture, &parent);
+    defer runtime.deinit();
+
+    _ = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "working" } }, "call-1", null);
+    try waitUntilQuiet(runtime);
+    const child_id = try reviewerId(runtime, arena);
+    const work_id = runtime.beginUserWork(alloc, child_id, null).?;
+    defer alloc.free(work_id);
+    const texts = [_][]const u8{ "first waiting", "second waiting", "third waiting" };
+    const calls = [_][]const u8{ "call-2", "call-3", "call-4" };
+    for (texts[0..count], calls[0..count]) |text, call| {
+        const queued = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = text } }, call, null);
+        try expectBodyHas(queued, "is busy");
+    }
+    start_test_controls.test_fail_spawn = true;
+    runtime.endUserWork(child_id, work_id, .completed, "");
+    start_test_controls.test_fail_spawn = false;
+    try waitUntilQuiet(runtime);
+    // One report for the one work, which carried all of them.
+    try std.testing.expectEqual(@as(usize, 2), fixture.reportCount());
+    const want = try alloc.print("The subagent could not start the work your {d} messages made: fx could not start a thread for it. They never ran. Send them again if they are still needed.", .{count});
+    defer alloc.free(want);
+    try expectBodyHas(fixture.reports.items[1], "reviewer call-2 ");
+    try expectBodyHas(fixture.reports.items[1], " failed ");
+    try expectBodyHas(fixture.reports.items[1], want);
+}
+
+test "two waiting messages joined into a work that could not start are reported as two" {
+    try expectJoinedMessagesReportedTogether(2);
+}
+
+test "three waiting messages joined into a work that could not start are reported as three" {
+    try expectJoinedMessagesReportedTogether(3);
+}
+
+test "a stop or close after a failed start of a work of joined messages counts none of them" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var parent: child_state.TestParent = undefined;
+    try parent.init(alloc);
+    defer parent.deinit();
+    var fixture = MailboxFixture{};
+    defer fixture.deinit();
+    const runtime = try mailboxRuntime(alloc, &fixture, &parent);
+    defer runtime.deinit();
+
+    _ = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "working" } }, "call-1", null);
+    try waitUntilQuiet(runtime);
+    const child_id = try reviewerId(runtime, arena);
+    const work_id = runtime.beginUserWork(alloc, child_id, null).?;
+    defer alloc.free(work_id);
+    for ([_][]const u8{ "first waiting", "second waiting" }, [_][]const u8{ "call-2", "call-3" }) |text, call| {
+        const queued = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = text } }, call, null);
+        try expectBodyHas(queued, "is busy");
+    }
+    start_test_controls.test_fail_spawn = true;
+    runtime.endUserWork(child_id, work_id, .completed, "");
+    start_test_controls.test_fail_spawn = false;
+    try waitUntilQuiet(runtime);
+    // The failed start left no slot, so nothing is counted again: not by the
+    // parent's stop, not by the user's close, and the next message starts a
+    // work that is its own.
+    const stopped = try callTool(runtime, arena, .{ .stop = .{ .agent = "reviewer" } }, "call-4", null);
+    try expectBodyHas(stopped, "reviewer was not working.");
+    try std.testing.expect(std.mem.find(u8, stopped, "dropped") == null);
+    const again = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "again" } }, "call-5", null);
+    try expectBodyHas(again, "Sent to reviewer");
+    try waitUntilQuiet(runtime);
+    const closed = (try runtime.closeChild(child_id, .user)).?;
+    try std.testing.expect(!closed.stopped);
+    try std.testing.expectEqual(@as(usize, 0), closed.dropped);
+    try std.testing.expectEqual(@as(usize, 0), runtime.user_dropped.items.len);
+    try std.testing.expectEqual(@as(usize, 3), fixture.reportCount());
+    try expectBodyHas(fixture.reports.items[2], " completed DONE again");
+}
+
 /// Where the close tests below land a close: after a waiting message's failed
 /// start is ended, before its report is built.
 const WindowClose = struct {
