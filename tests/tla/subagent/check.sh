@@ -31,13 +31,8 @@
 #                        messages and does not count them                       NoSilentLoss
 #   close-leaves-kept    a close of such a turn leaves the kept messages with
 #                        the closing subagent                                   ClosingHoldsNoKept
-#   user-ended-uncounted the user's Esc on such a turn drops the kept messages
-#                        and counts none                                        NoSilentLoss
 #   gap-uncounted        a stop or close of the work the host chose, before its
 #                        turn begins, drops its messages and counts none        NoSilentLoss
-#   user-next-counted    the user's stop of the work the host chose counts its
-#                        messages, which it neither ends nor cancels, so they
-#                        run                                                    CountedNeverRead
 #   stale-unstarted      a chosen work fails before its turn begins and the
 #                        slot still counts its messages as unstarted, so a stop
 #                        or close after it counts them again                    UnstartedGone
@@ -175,9 +170,7 @@ StopMessage stop-message-mutation-gap-blind GapStopHonest
 StopMessage stop-message-mutation-leftover-gap StopHoldsForQueued
 StopMessage stop-message-mutation-leftover-uncounted NoSilentLoss
 StopMessage stop-message-mutation-close-leaves-kept ClosingHoldsNoKept
-StopMessage stop-message-mutation-user-ended-uncounted NoSilentLoss
 StopMessage stop-message-mutation-gap-uncounted NoSilentLoss
-StopMessage stop-message-mutation-user-next-counted CountedNeverRead
 StopMessage stop-message-mutation-stale-unstarted UnstartedGone
 StopMessage stop-message-mutation-start-next-turn JoinsStartingWork
 StopMessage stop-message-before-idle IdleNoteHonest

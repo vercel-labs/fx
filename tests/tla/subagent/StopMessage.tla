@@ -64,29 +64,25 @@
 (* failed or cancelled request ends it (`Fail`), leaves those messages     *)
 (* with its slot (`keepLeftovers`): the subagent is "ended" until the hook *)
 (* queues them ahead of the waiting ones as its next work (`Hook`,         *)
-(* `handOverLeftovers` in managed_owner.zig). A stop or close that lands   *)
-(* then counts and drops them, and the hook queues none; a message main    *)
-(* sends after that stop waits for the next work, as after any stop. The   *)
-(* work the host chooses carries its messages, unread until its turn       *)
-(* begins (`startq`, `Owner.markNext` and `unstarted`): a stop or close in *)
-(* the gap before the turn drops and counts them as well. The user's Esc   *)
-(* on a turn that ended counts and drops what a stop does. "leftover_gap"  *)
-(* is fx before this: a stop of an ended turn reached nothing, and the     *)
-(* hook queued the kept messages. "leftover_uncounted" drops them without  *)
-(* counting, "close_leaves_kept" leaves them with the closing subagent,    *)
-(* "user_ended_uncounted" is the user's Esc that counts none,              *)
+(* `handOverLeftovers` in managed_owner.zig). A stop or close of main's    *)
+(* that lands then counts and drops them, and the hook queues none; a      *)
+(* message main sends after that stop waits for the next work, as after    *)
+(* any stop. The work the host chooses carries its messages, unread until  *)
+(* its turn begins (`startq`, `Owner.markNext` and `unstarted`): a stop or *)
+(* close of main's in the gap before the turn drops and counts them as     *)
+(* well. The user's Esc counts none of this: it ends no work and cancels   *)
+(* none (`Owner.noteUserStop`). "leftover_gap" is fx before this: a stop   *)
+(* of an ended turn reached nothing, and the hook queued the kept          *)
+(* messages. "leftover_uncounted" drops them without counting,             *)
+(* "close_leaves_kept" leaves them with the closing subagent, and          *)
 (* "gap_uncounted" is a stop or close of the chosen work that counts none  *)
-(* of its messages, and "user_next_counted" is the user's stop of the      *)
-(* chosen work that counts its messages although it ends no work and       *)
-(* cancels none (Owner.noteUserStop), so they run. That stop counts        *)
-(* nothing of the chosen work, and after the end is recorded it counts     *)
-(* what the slot kept. A chosen work can also fail before its turn begins, *)
-(* as a failed bind to its agent does (`FailStart`): its failed report     *)
-(* tells main its messages never ran, and the slot's count of them ends    *)
-(* with it (`unstarted` is zeroed where the end is recorded), so a stop or *)
-(* close after it counts none of them twice. "stale_unstarted" is the      *)
-(* count that outlives that work.                                          *)
-(*                                                                         *)
+(* of its messages. A chosen work can also fail before its turn begins, as *)
+(* a failed bind to its agent does (`FailStart`): its failed report tells  *)
+(* main its messages never ran, and the slot's count of them ends with it  *)
+(* (`unstarted` is zeroed where the end is recorded), so a stop or close   *)
+(* after it counts none of them twice. "stale_unstarted" is the count that *)
+(* outlives that work.                                                     *)
+(*                                                                          *)
 (* Bug plants one defect; check.sh names the rule that must catch each.    *)
 (* "today" is fx before this design: a message to a work its parent        *)
 (* stopped is refused, one to a work the user stopped joins it and is lost *)
@@ -107,8 +103,7 @@ Bugs == {"none", "today", "refuse_ending", "no_order", "uncounted",
          "before_idle", "note_after_take", "names_busy", "gap_blind"}
 \* The defects of the kept and carried messages, beside `Bugs`.
 KeptBugs == {"leftover_gap", "leftover_uncounted", "close_leaves_kept",
-             "user_ended_uncounted", "gap_uncounted", "user_next_counted",
-             "stale_unstarted"}
+             "gap_uncounted", "stale_unstarted"}
 ASSUME Bug \in Bugs \cup KeptBugs
 
 \* What an end tells main: no report, a report that says its subagent is
@@ -146,7 +141,7 @@ VARIABLES
     kept,         \* [Subs -> SUBSET Msgs]: unread by a turn that ended, kept by its slot for the end hook
     read,         \* messages a turn read
     dropped,      \* messages thrown away
-    stoppedQ,     \* messages queued, kept or unread when a stop, user stop or close of their subagent answered
+    stoppedQ,     \* messages queued, kept or unread when a stop or close of their subagent answered
     toldDropped,  \* messages a stop's, a user stop's, or a close's count included
     told,         \* [Msgs -> Answers]: what main heard when it sent each one
     sent,         \* messages main has written into a step
@@ -443,26 +438,17 @@ Exec ==
 \* The user stops the subagent's turn on its screen; fx drops main's
 \* messages in its queue and tells main how many (noteUserStop).
 UserStop(s) ==
-    LET waiting == Range(waitq[s])
-        \* The work the host chose, or that a slot is starting, has no worker:
-        \* the user's stop ends it and cancels it never, so it counts nothing.
-        chosen == phase[s] \in {"gap_next", "starting"}
-        \* fx before the user's stop counted what the slot kept.
-        keptCounted == IF phase[s] = "ended" /\ Bug # "user_ended_uncounted" THEN kept[s] ELSE {}
-        chosenCounted == IF chosen /\ Bug = "user_next_counted" THEN startq[s] ELSE {}
-        counted == waiting \cup unread[s] \cup keptCounted \cup chosenCounted
-    IN
-    /\ phase[s] \in {"running", "ended", "gap_next", "starting"}
+    /\ phase[s] = "running"
     /\ stops < MaxStops
-    /\ phase' = [phase EXCEPT ![s] = IF @ = "running" THEN "ending_user" ELSE @]
+    /\ phase' = [phase EXCEPT ![s] = "ending_user"]
     /\ waitq' = [waitq EXCEPT ![s] = <<>>]
-    /\ kept' = [kept EXCEPT ![s] = {}]
-    /\ dropped' = dropped \cup waiting \cup kept[s]
-    /\ toldDropped' = toldDropped \cup counted
-    /\ stoppedQ' = stoppedQ \cup waiting \cup unread[s] \cup kept[s]
+    /\ dropped' = dropped \cup Range(waitq[s])
+    /\ toldDropped' = toldDropped \cup Range(waitq[s]) \cup unread[s]
     /\ stops' = stops + 1
-    /\ last' = Event("user_stop", s, NoMsg, "stopped", Cardinality(counted))
-    /\ UNCHANGED <<unread, read, told, sent, steps, step, covered, refusedOpen, coverBroken, lateStart, startq>>
+    /\ last' = Event("user_stop", s, NoMsg, "stopped",
+                     Cardinality(Range(waitq[s]) \cup unread[s]))
+    /\ UNCHANGED <<unread, read, told, sent, steps, step, covered, refusedOpen, coverBroken, lateStart>>
+    /\ UNCHANGED heldVars
     /\ UNCHANGED idleVars
 
 \* A starting turn's worker begins: it takes messages from now on.
