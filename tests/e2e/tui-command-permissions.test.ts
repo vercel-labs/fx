@@ -1285,6 +1285,70 @@ describe("effect-aware command permissions", () => {
   );
 
   test.skipIf(!tmuxAvailable())(
+    "TUI and the model see the last line of command output past the output limit",
+    async () => {
+      const root = createIsolatedRoot();
+      const stderrPath = join(root.root, "long-output-stderr.log");
+      writeFileSync(stderrPath, "");
+      const marker = "FINAL_STEP_FAILED_MARKER";
+      // About 100 KB of steps, past the 64 KiB a running command keeps, then
+      // the line that says which step stopped the build.
+      const script = join(root.workspace, "long-build.sh");
+      writeFileSync(
+        script,
+        "#!/bin/sh\ni=0\nwhile [ $i -lt 1000 ]; do\n" +
+          `  printf 'step %04d compiled module %s\\n' "$i" "${"x".repeat(72)}"\n` +
+          "  i=$((i+1))\ndone\n" +
+          `printf '${marker}\\n'\nexit 1\n`,
+      );
+      chmodSync(script, 0o755);
+      let shellResult = "";
+      const gateway = startFakeGateway([
+        toolCall("./long-build.sh", {}, "long_build"),
+        (body) => {
+          // A command that exits nonzero comes back as error text.
+          const request = JSON.parse(body) as {
+            prompt?: Array<{ content?: string | Array<Record<string, unknown>> }>;
+          };
+          const part = (request.prompt ?? [])
+            .flatMap((message) => Array.isArray(message.content) ? message.content : [])
+            .find((item) => item.type === "tool-result" && item.toolCallId === "long_build");
+          const output = part?.output as { type?: string; value?: unknown } | undefined;
+          expect(output?.type).toBe("error-text");
+          shellResult = String(output?.value ?? "");
+          return finalText("LONG_BUILD_REPORTED");
+        },
+      ]);
+
+      activeSession = await TmuxSession.create({
+        cmd: FX_BIN,
+        cwd: root.workspace,
+        env: gatewayEnv(root, gateway, { FX_PERMISSION_MODE: "auto" }),
+        stderrPath,
+        width: 120,
+        height: 36,
+      });
+      await activeSession.waitForComposer(TIMEOUT);
+      await activeSession.sendText("Run the long build.");
+      await activeSession.waitForText("LONG_BUILD_REPORTED", TIMEOUT);
+
+      const result = JSON.parse(shellResult) as {
+        exit_code?: number;
+        output_truncated?: boolean;
+        output_delta: string;
+      };
+      expect(result.exit_code).toBe(1);
+      expect(result.output_truncated).toBe(true);
+      expect(result.output_delta).toContain("step 0000 compiled module");
+      expect(result.output_delta.trimEnd().endsWith(marker)).toBe(true);
+      const scrollback = await activeSession.captureFullScrollback();
+      expect(scrollback).toMatch(new RegExp(`Exited 1 .* · ${marker}`));
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+    },
+    60_000,
+  );
+
+  test.skipIf(!tmuxAvailable())(
     "TUI reprojects completed command summaries after widening",
     async () => {
       const root = createIsolatedRoot();

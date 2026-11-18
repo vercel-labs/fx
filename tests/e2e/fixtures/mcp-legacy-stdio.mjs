@@ -13,6 +13,8 @@ const discoveryMethodNotFound = process.env.FX_MCP_LEGACY_DISCOVERY_METHOD_NOT_F
 const discoveryInvalidParams = process.env.FX_MCP_LEGACY_DISCOVERY_INVALID_PARAMS === "1";
 const rejectNewerInitialize = process.env.FX_MCP_LEGACY_REJECT_NEWER_INITIALIZE === "1";
 const draft7Pattern = process.env.FX_MCP_DRAFT7_PATTERN;
+const rawFormSchema = process.env.FX_MCP_RAW_FORM_SCHEMA;
+const rawFormSchemaMark = "raw-form-schema-mark";
 const elicitationUrl = process.env.FX_MCP_ELICITATION_URL ?? "https://example.test/authorize";
 const urlRequiredOperation = process.env.FX_MCP_URL_REQUIRED_OPERATION ?? "tools";
 let buffer = Buffer.alloc(0);
@@ -42,15 +44,30 @@ if (startupFailure) {
   else setTimeout(fail, 400);
 }
 
+// FX_MCP_ESCAPE_KEYS=mode,url: write each of these keys with one \uXXXX escape (mode becomes m\u006fde) in every
+// message this server sends. The bytes still mean the same key to any JSON reader that decodes keys.
+const escapedKeys = (process.env.FX_MCP_ESCAPE_KEYS ?? "").split(",").filter(Boolean);
+function writeEscapedKeys(line) {
+  for (const key of escapedKeys) {
+    const escaped = `${key[0]}\\u${key.charCodeAt(1).toString(16).padStart(4, "0")}${key.slice(2)}`;
+    line = line.replaceAll(`"${key}":`, `"${escaped}":`);
+  }
+  return line;
+}
+
 function send(message) {
-  process.stdout.write(`${JSON.stringify(message)}\n`);
+  let line = writeEscapedKeys(JSON.stringify(message));
+  // A form schema given as raw JSON text goes out as written, with its escapes.
+  if (rawFormSchema !== undefined) line = line.replace(`"${rawFormSchemaMark}"`, () => rawFormSchema);
+  process.stdout.write(`${line}\n`);
 }
 
 // FX_MCP_MODE=refused_reply: each tools/call follows its entry in FX_MCP_REFUSED's `calls`, a JSON
 // array of { bad, then, slowMs, progressEveryMs }. `bad` first writes a line fx refuses and cannot
 // attach to a call: "utf8_last" (bytes that are not UTF-8, the id after them), "deep_last" (JSON
 // nested past the engine's limit, the id last), "garbage" (a line with no JSON, as a notification
-// the server mangled would be) or "cut" (a reply cut in the middle). `then` is "silent" (nothing
+// the server mangled would be), "cut" (a reply cut in the middle) or "duplicate_escaped" (the id first,
+// then `result` twice, the second time written `r\u0065sult`, which JSON reads as the same name). `then` is "silent" (nothing
 // more), "exit" (the server exits), or by default the valid reply, `slowMs` later, with progress
 // for the call's own token every `progressEveryMs` until then.
 const refused = JSON.parse(process.env.FX_MCP_REFUSED ?? "{}");
@@ -72,6 +89,8 @@ function refusedLine(id, bad) {
       return [`{"jsonrpc":"2.0","result":{"content":[],"structuredContent":${'{"a":'.repeat(3000)}1${"}".repeat(3000)}},"id":${id}}\n`];
     case "garbage":
       return [`${"x".repeat(80)}\n`];
+    case "duplicate_escaped":
+      return [`{"jsonrpc":"2.0","id":${id},"result":{"content":[]},"r\\u0065sult":{"content":[]}}\n`];
     case "cut":
       return [`{"jsonrpc":"2.0","id":${id},"result":{"content":[{"type":"te\n`];
     default:
@@ -233,10 +252,13 @@ function handle(message) {
   log(message);
 
   if (pendingToolCall && message.id === "legacy-elicitation") {
-    if (message.jsonrpc !== "2.0" || message.result?.action !== "accept") process.exit(8);
-    const answer = message.result?.content?.choice;
-    if (legacyVersion === "2025-06-18" && answer !== "legacy-alpha-choice") process.exit(9);
-    if (legacyVersion === "2025-11-25" && answer !== "legacyvalid") process.exit(10);
+    // With a raw form schema the answer is whatever the test gave: the wire log has it.
+    if (rawFormSchema === undefined) {
+      if (message.jsonrpc !== "2.0" || message.result?.action !== "accept") process.exit(8);
+      const answer = message.result?.content?.choice;
+      if (legacyVersion === "2025-06-18" && answer !== "legacy-alpha-choice") process.exit(9);
+      if (legacyVersion === "2025-11-25" && answer !== "legacyvalid") process.exit(10);
+    }
     const call = pendingToolCall;
     pendingToolCall = null;
     send({
@@ -324,8 +346,12 @@ function handle(message) {
       // own version and never asks for one.
       const asksForUrl = (mode === "url_required_error" || mode === "url_required_multiple") &&
         legacyVersion === "2025-11-25";
+      // FX_MCP_ALLOW_FORM_ONLY=1 lets a client that declares forms and no URLs connect, to see what fx
+      // does with a URL question it cannot take.
+      const formOnly = process.env.FX_MCP_ALLOW_FORM_ONLY === "1" && capability?.form != null;
       if (
         (mode === "direct_form" || asksForUrl) &&
+        !formOnly &&
         (capability?.form == null || capability?.url == null)
       ) process.exit(7);
     }
@@ -538,7 +564,9 @@ function handle(message) {
         jsonrpc: "2.0",
         id: "legacy-elicitation",
         method: "elicitation/create",
-        params: legacyVersion === "2025-06-18"
+        params: rawFormSchema !== undefined
+          ? { mode: "form", message: "Fill in the form", requestedSchema: rawFormSchemaMark }
+          : legacyVersion === "2025-06-18"
           ? {
               message: "Choose a legacy value",
               requestedSchema: {

@@ -18,6 +18,18 @@
 (*   running  joins the running turn, unread until the turn reads it;     *)
 (*   ending   waits, and the next turn takes it with every other waiting  *)
 (*            message as soon as the stopped turn has ended;               *)
+(*   gap      is a subagent whose work has ended while its slot has not   *)
+(*            gone on: the host has chosen the slot's next work (gap_next *)
+(*            when a message waited) or none (gap_idle), but the slot has *)
+(*            not yet started that work or published its end              *)
+(*            (publish_test_controls.zig holds it there). A stop or close *)
+(*            in the gap sees the work as ended: with none next, a stop   *)
+(*            finds the subagent not working and a close closes it as an  *)
+(*            idle one; with a next work chosen, they act on that work,   *)
+(*            which then starts stopped, so no turn runs after a stop or  *)
+(*            close and no stop is lost (Owner.markNext, Owner.stop and   *)
+(*            Owner.closeByUser). A call that sends a message waits for   *)
+(*            the gap to pass, as one to a starting turn waits.           *)
 (*   closing  is refused, and main hears it: a close is under way, and a  *)
 (*            message after the closed work ends starts a new subagent.   *)
 (*   writing  is refused too: the closed work has ended and its close is  *)
@@ -54,6 +66,8 @@
 (* counts only the waiting messages, and a message to a starting turn     *)
 (* waits for the turn after it. "before_idle" is fx before the idle note:  *)
 (* no report says its subagent is idle and no start names any.             *)
+(* "gap_blind" is fx with the gap: a stop or close in it answers as for a    *)
+(* running turn but acts on nothing, so the next turn runs on.             *)
 (***************************************************************************)
 EXTENDS Naturals, Sequences, FiniteSets
 
@@ -62,7 +76,7 @@ CONSTANTS Subs, MsgsPer, MaxSteps, MaxStops, Bug
 Bugs == {"none", "today", "refuse_ending", "no_order", "uncounted",
          "join_user_ending", "read_after_stop", "drop_waiting_at_end",
          "queue_closing", "unmark_early", "start_next_turn",
-         "before_idle", "note_after_take", "names_busy"}
+         "before_idle", "note_after_take", "names_busy", "gap_blind"}
 ASSUME Bug \in Bugs
 
 \* What an end tells main: no report, a report that says its subagent is
@@ -72,11 +86,13 @@ Notes == {"none", "idle", "plain"}
 Msgs == Subs \X (1..MsgsPer)
 NoMsg == <<"none", 0>>
 SubOf(m) == m[1]
-Phases == {"absent", "idle", "starting", "running", "ending_parent", "ending_user", "closing", "writing"}
+Phases == {"absent", "idle", "starting", "running", "ending_parent", "ending_user", "closing", "writing",
+           "gap_idle", "gap_next"}
+Gaps == {"gap_idle", "gap_next"}
 Endings == {"ending_parent", "ending_user"}
 Answers == {"none", "started", "joined", "waits", "refused"}
 Ops == {"none", "step", "send", "stop", "close", "user_stop", "read",
-        "finish", "end", "begin", "write_close"}
+        "finish", "end", "begin", "write_close", "publish"}
 
 Range(sq) == {sq[k] : k \in DOMAIN sq}
 RemoveAt(sq, i) == [k \in 1..(Len(sq) - 1) |-> IF k < i THEN sq[k] ELSE sq[k + 1]]
@@ -191,6 +207,9 @@ JoinsEnding(s) ==
 \* written yet.
 Marked(s) == phase[s] \in {"closing", "writing"}
 
+\* A phase without the gap: the state the host's choice leaves to the world.
+Plain(p) == IF p = "gap_idle" THEN "idle" ELSE IF p = "gap_next" THEN "starting" ELSE p
+
 \* A message to it is queued, and goes with the close. fx never does: a
 \* closing subagent refuses it. unmark_early is fx before settleClose kept
 \* the mark until the write returned: a subagent whose work had ended was
@@ -204,11 +223,11 @@ StartNextTurn(s) ==
     phase[s] = "starting" /\ Bug \in {"today", "start_next_turn"}
 
 \* A call that waits for its subagent's turn to begin can't run yet.
-SendRuns(c) == phase[c.sub] # "starting" \/ StartNextTurn(c.sub)
+SendRuns(c) == phase[c.sub] \notin Gaps /\ (phase[c.sub] # "starting" \/ StartNextTurn(c.sub))
 
 \* The subagents other than `s` that are idle: what a start of a new `s`
 \* must name.
-IdleOthers(s) == {t \in Subs \ {s} : phase[t] = "idle"}
+IdleOthers(s) == {t \in Subs \ {s} : phase[t] \in {"idle", "gap_idle"}}
 
 \* What fx names when a message starts a new subagent `s`.
 NamedAtStart(s) ==
@@ -289,8 +308,14 @@ DoStop(c) ==
     \/ /\ phase[s] = "absent"
        /\ last' = Event("stop", s, NoMsg, "unavailable", 0)
        /\ UNCHANGED <<phase, waitq, dropped, toldDropped, coverBroken>>
-    \/ /\ phase[s] \notin {"closing", "writing", "absent"}
-       /\ phase' = [phase EXCEPT ![s] = IF @ \in {"starting", "running"} THEN "ending_parent" ELSE @]
+    \* The work ended and none follows: nothing to stop (Owner.stop finds the
+    \* slot ended). Only the planted defect answers as for a running turn.
+    \/ /\ phase[s] = "gap_idle"
+       /\ last' = Event("stop", s, NoMsg, IF Bug = "gap_blind" THEN "stopped" ELSE "idle", 0)
+       /\ UNCHANGED <<phase, waitq, dropped, toldDropped, coverBroken>>
+    \/ /\ phase[s] \notin {"closing", "writing", "absent", "gap_idle"}
+       /\ phase' = [phase EXCEPT ![s] = IF @ \in {"starting", "running"} \/ (@ = "gap_next" /\ Bug # "gap_blind")
+                                         THEN "ending_parent" ELSE @]
        /\ waitq' = [waitq EXCEPT ![s] = <<>>]
        /\ dropped' = dropped \cup waiting
        /\ toldDropped' = toldDropped \cup counted
@@ -298,7 +323,7 @@ DoStop(c) ==
             \E m \in waiting \cup unread[s] : <<m, c.id>> \in covered)
        \* A work that is still ending still counts as stopped.
        /\ last' = Event("stop", s, NoMsg,
-                        IF phase[s] \in {"starting", "running"} \cup Endings THEN "stopped" ELSE "idle",
+                        IF phase[s] \in {"starting", "running", "gap_next"} \cup Endings THEN "stopped" ELSE "idle",
                         Cardinality(counted))
 
 DoClose(c) ==
@@ -317,7 +342,11 @@ DoClose(c) ==
           /\ last' = Event("close", s, NoMsg, "closed", 0)
           /\ UNCHANGED <<phase, waitq, unread, dropped, toldDropped>>
        \/ /\ phase[s] \notin {"closing", "writing", "absent"}
-          /\ phase' = [phase EXCEPT ![s] = IF @ = "idle" THEN "absent" ELSE "closing"]
+          \* A work that ended with none next closes as an idle one; the
+          \* planted defect leaves the gap alone.
+          /\ phase' = [phase EXCEPT ![s] =
+                IF Bug = "gap_blind" /\ @ \in Gaps THEN @
+                ELSE IF @ \in {"idle", "gap_idle"} THEN "absent" ELSE "closing"]
           /\ waitq' = [waitq EXCEPT ![s] = <<>>]
           /\ unread' = [unread EXCEPT ![s] = {}]
           /\ dropped' = dropped \cup lost
@@ -397,27 +426,43 @@ Noted(s, reports, after) ==
          IF reports THEN (note' = "idle") # (after = "idle") ELSE note' # "none")
     /\ UNCHANGED <<named, namedWrong>>
 
-\* The running turn ends on its own; waiting messages start the next one.
-Finish(s) ==
+\* The running turn ends on its own; waiting messages start the next one. With
+\* `gap`, the slot has not gone on yet: the host has chosen, but the next turn
+\* has not started and the end is not published (Publish).
+FinishWith(s, gap) ==
     /\ phase[s] = "running"
     /\ unread[s] = {}
     /\ IF waitq[s] = <<>>
-       THEN /\ phase' = [phase EXCEPT ![s] = "idle"]
+       THEN /\ phase' = [phase EXCEPT ![s] = IF gap THEN "gap_idle" ELSE "idle"]
             /\ UNCHANGED <<read, waitq>>
        ELSE /\ read' = read \cup Range(waitq[s])
             /\ waitq' = [waitq EXCEPT ![s] = <<>>]
-            /\ phase' = [phase EXCEPT ![s] = "starting"]
+            /\ phase' = [phase EXCEPT ![s] = IF gap THEN "gap_next" ELSE "starting"]
     /\ last' = Event("finish", s, NoMsg, "none", 0)
     \* A turn that ended on its own reports to main.
-    /\ Noted(s, TRUE, phase'[s])
+    /\ Noted(s, TRUE, Plain(phase'[s]))
     /\ UNCHANGED <<unread, dropped, toldDropped, told, sent, stops, steps, step,
                    covered, refusedOpen, coverBroken, lateStart>>
+
+Finish(s) == FinishWith(s, FALSE)
+FinishInGap(s) == FinishWith(s, TRUE)
+
+\* The slot goes on: it starts the chosen next turn, or publishes that the
+\* work is done.
+Publish(s) ==
+    /\ phase[s] \in Gaps
+    /\ phase' = [phase EXCEPT ![s] = IF @ = "gap_idle" THEN "idle" ELSE "starting"]
+    /\ last' = Event("publish", s, NoMsg, "none", 0)
+    /\ UNCHANGED <<unread, waitq, read, dropped, toldDropped, told, sent, stops, steps,
+                   step, covered, refusedOpen, coverBroken, lateStart>>
+    /\ UNCHANGED idleVars
 
 \* The stopped turn ends: its unread messages go, and the waiting ones start
 \* the next turn. A closed subagent's work ends, and its close is written
 \* next (WriteClose); it is closing until then.
-EndStopped(s) ==
+EndStoppedWith(s, gap) ==
     /\ phase[s] \in Endings \cup {"closing"}
+    /\ gap => (phase[s] \in Endings /\ Bug # "drop_waiting_at_end")
     /\ unread' = [unread EXCEPT ![s] = {}]
     /\ IF Bug = "drop_waiting_at_end"
        THEN /\ dropped' = dropped \cup unread[s] \cup Range(waitq[s])
@@ -431,17 +476,20 @@ EndStopped(s) ==
             /\ UNCHANGED read
        ELSE /\ dropped' = dropped \cup unread[s]
             /\ IF waitq[s] = <<>>
-               THEN /\ phase' = [phase EXCEPT ![s] = "idle"]
+               THEN /\ phase' = [phase EXCEPT ![s] = IF gap THEN "gap_idle" ELSE "idle"]
                     /\ UNCHANGED <<read, waitq>>
                ELSE /\ read' = read \cup Range(waitq[s])
                     /\ waitq' = [waitq EXCEPT ![s] = <<>>]
-                    /\ phase' = [phase EXCEPT ![s] = "starting"]
+                    /\ phase' = [phase EXCEPT ![s] = IF gap THEN "gap_next" ELSE "starting"]
     /\ last' = Event("end", s, NoMsg, "none", Cardinality(Range(waitq[s])))
     \* Only a turn the user stopped reports; main's own stop or close
     \* already answered.
-    /\ Noted(s, phase[s] = "ending_user", phase'[s])
+    /\ Noted(s, phase[s] = "ending_user", Plain(phase'[s]))
     /\ UNCHANGED <<toldDropped, told, sent, stops, steps, step, covered,
                    refusedOpen, coverBroken, lateStart>>
+
+EndStopped(s) == EndStoppedWith(s, FALSE)
+EndStoppedInGap(s) == EndStoppedWith(s, TRUE)
 
 \* A closed subagent's close is written once nothing of it runs: the registry
 \* drops it, and a new one may take the name (Runtime.settleClose).
@@ -457,7 +505,7 @@ Next ==
     \/ NewStep
     \/ Exec
     \/ \E s \in Subs : UserStop(s) \/ Begin(s) \/ Read(s) \/ Finish(s) \/ EndStopped(s)
-                       \/ WriteClose(s)
+                       \/ WriteClose(s) \/ FinishInGap(s) \/ EndStoppedInGap(s) \/ Publish(s)
 
 Spec == Init /\ [][Next]_vars
 
@@ -499,6 +547,17 @@ StopRunsFirst == ~coverBroken
 \* and with it the refusal, until the close is written.
 ClosingHoldsNothing ==
     \A s \in Subs : Marked(s) => waitq[s] = <<>> /\ unread[s] = {}
+
+\* A stop or close that answers it ended the subagent's turn, or closed the
+\* subagent, leaves it ending, closing or gone: never running on in the gap
+\* after its work ended. So a stop in the gap finds nothing to stop or stops
+\* the turn that follows, and a close leaves no extra turn
+\* (Owner.markNext, Owner.stop, Owner.closeByUser).
+GapStopHonest ==
+    /\ (last.op = "stop" /\ last.answer = "stopped") =>
+           phase[last.sub] \in Endings \cup {"closing", "writing"}
+    /\ (last.op = "close" /\ last.answer = "closed") =>
+           phase[last.sub] \in {"closing", "writing", "absent"}
 
 \* A message main sends to a turn that is still starting joins that turn:
 \* fx never holds it for a later one (Owner.steer's .starting).

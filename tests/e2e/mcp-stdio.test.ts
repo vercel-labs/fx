@@ -152,7 +152,7 @@ type RootOptions = {
 
 /** A line fx refuses and cannot attach to a call, then what the server does (mcp-legacy-stdio.mjs says). */
 type RefusedCall = {
-  bad?: "utf8_last" | "deep_last" | "garbage" | "cut";
+  bad?: "utf8_last" | "deep_last" | "garbage" | "duplicate_escaped" | "cut";
   then?: "silent" | "exit";
   slowMs?: number;
   progressEveryMs?: number;
@@ -2530,6 +2530,9 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"`,
       ["bytes that are not UTF-8, the id after them", { bad: "utf8_last", then: "silent" }],
       ["JSON nested past the engine's limit, the id last", { bad: "deep_last", then: "silent" }],
       ["a line with no JSON in it", { bad: "garbage", then: "silent" }],
+      // `responseId` reads the line with the same decoder as the engine, which refuses a repeated name
+      // however it is written, so this line names no call.
+      ["a result written twice, the second time with an escape, the id first", { bad: "duplicate_escaped", then: "silent" }],
     ];
     // All of them at once, so the test takes as long as its slowest wait, not their sum.
     const [runs, progress, later] = await Promise.all([
@@ -4781,6 +4784,37 @@ describe("fx mcp call", () => {
     expect(seen).toContain("did not run");
     expect(toolCalls(root)).toHaveLength(0);
   }, 60_000);
+
+  test("an auto-mode call too large to review in full runs nothing, and the command learns why", async () => {
+    const root = bridgeRoot("bridge-unreviewable");
+    // Larger than the 64 KiB of one action field the safety review can see.
+    writeFileSync(join(root.workspace, "args.json"), JSON.stringify({ text: "x".repeat(70 * 1024) }));
+    const bigCall = `"${FX_BIN}" mcp call ${TOOL_NAME} "$(cat args.json)" > out.txt 2> err.txt; echo "exit=$?"; cat err.txt`;
+    let seen = "";
+    gateway = startFakeGateway([
+      fakeGatewayToolCall("run_call", "shell", { action: "run", command: bigCall }),
+      (body: string) => {
+        seen = toolResultText(body, "run_call");
+        return fakeGatewayFinalText("BRIDGE_UNREVIEWABLE");
+      },
+    ], {
+      models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
+    });
+    const result = await runFx(["ask", "--json", "--auto", "--no-save", "Echo the text."], {
+      cwd: root.workspace,
+      env: fixtureEnv(root, gateway),
+      timeoutMs: 60_000,
+    });
+    expect(result.code).toBe(0);
+    expect(seen).toContain("exit=5");
+    expect(seen).toContain("Safety review evidence incomplete; action held");
+    expect(seen).toContain("Do not retry unchanged; reduce the action");
+    expect(seen).not.toContain("was not granted");
+    expect(toolCalls(root)).toHaveLength(0);
+    // Only the shell command was reviewed; the oversized call never reached
+    // the reviewer.
+    expect(gateway.classifierRequests).toHaveLength(1);
+  }, 90_000);
 
   // Runs one shell command through the built binary and returns what the
   // model saw of it.

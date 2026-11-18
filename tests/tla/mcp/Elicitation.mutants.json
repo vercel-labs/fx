@@ -31,8 +31,8 @@
   },
   {
     "description": "Content that fails the schema is sent (ELIC-05)",
-    "old": "IF a = \"accept\" /\\ mode[r] = \"form\" /\\ ~valid\n         THEN UNCHANGED vars",
-    "new": "IF FALSE\n         THEN UNCHANGED vars",
+    "old": "IF a = \"accept\" /\\ mode[r] = \"form\" /\\ ~valid\n         THEN /\\ refusedFit'",
+    "new": "IF FALSE\n         THEN /\\ refusedFit'",
     "invariant": "ValidOnly"
   },
   {
@@ -85,8 +85,20 @@
   },
   {
     "description": "An early completion is told before the host accepts",
-    "old": "           /\\ early' = [early EXCEPT ![r] = TRUE]\n           /\\ UNCHANGED <<phase, origin, mode, eid, sent, declared, sends, shownEver, decided, withdrawn, told, invalidSent>>",
-    "new": "           /\\ early' = [early EXCEPT ![r] = TRUE]\n           /\\ told' = [told EXCEPT ![r] = @ + 1]\n           /\\ UNCHANGED <<phase, origin, mode, eid, sent, declared, sends, shownEver, decided, withdrawn, invalidSent>>",
+    "old": "           /\\ early' = [early EXCEPT ![r] = TRUE]\n           /\\ UNCHANGED <<phase, origin, mode, eid, sent, declared, sends, shownEver, decided, withdrawn, told, invalidSent, spell, refusedFit>>",
+    "new": "           /\\ early' = [early EXCEPT ![r] = TRUE]\n           /\\ told' = [told EXCEPT ![r] = @ + 1]\n           /\\ UNCHANGED <<phase, origin, mode, eid, sent, declared, sends, shownEver, decided, withdrawn, invalidSent, spell, refusedFit>>",
     "invariant": "CompleteOnlyAccepted"
+  },
+  {
+    "description": "The engine compares names and choices byte for byte again, so an escaped spelling of a fitting answer is refused (ELIC-05)",
+    "old": "LET valid == fits /\\ (Compare = \"decoded\" \\/ spell[r] = \"plain\")",
+    "new": "LET valid == fits /\\ spell[r] = \"plain\"",
+    "invariant": "FitAccepted"
+  },
+  {
+    "description": "A name or choice written with an escape is taken without being matched, so content that fails the form is sent (ELIC-05)",
+    "old": "LET valid == fits /\\ (Compare = \"decoded\" \\/ spell[r] = \"plain\")",
+    "new": "LET valid == fits \\/ spell[r] = \"escaped\"",
+    "invariant": "ValidOnly"
   }
 ]

@@ -13,6 +13,7 @@ const types = @import("../shared/types.zig");
 const command_replay_store = @import("../session/command_replay_store.zig");
 const quiet_notice = @import("quiet_notice.zig");
 const session_child_store = @import("../session/session_child_store.zig");
+const text_utils = @import("../shared/text_utils.zig");
 
 const Allocator = std.mem.Allocator;
 const max_entries = contract.max_live_entries + contract.max_tombstones;
@@ -241,7 +242,12 @@ const Entry = struct {
     state: contract.State = .starting,
     barrier: contract.CompletionBarrier = .{},
     backend_state: BackendState,
+    /// Output not yet delivered (`appendBoundedOutput`). Once some was
+    /// dropped, `output.items[0..output_gap_at]` is its start, the rest its
+    /// newest bytes, and `output_dropped` bytes between them were left out.
     output: std.ArrayList(u8) = .empty,
+    output_gap_at: usize = 0,
+    output_dropped: u64 = 0,
     replay_capture: ?*command_replay_store.Capture = null,
     replay_capability: ?*session_child_store.SessionChildCapability = null,
     output_chunk_lifecycle_id: ?types.ToolLifecycleId = null,
@@ -389,12 +395,6 @@ const Entry = struct {
         if (raw_output.len != 0) {
             replay_capture.appendAccepted(owned, .stdout, raw_output);
         }
-        var output: std.ArrayList(u8) = .empty;
-        errdefer output.deinit(runtime.alloc);
-        try output.appendSlice(runtime.alloc, input.output[0..@min(
-            input.output.len,
-            input.max_output_bytes,
-        )]);
         const error_name = if (input.error_name) |value|
             try owned.dupe(u8, value)
         else
@@ -416,15 +416,15 @@ const Entry = struct {
                 .session_id = execution_id,
                 .cursor = input.next_cursor orelse .{},
             } },
-            .output = output,
             .replay_capture = replay_capture,
             .replay_capability = replay_capability,
             .published_running = input.published_running,
-            .output_truncated = input.output.len > input.max_output_bytes,
             .output_incomplete = input.output_incomplete,
             .stdout_bytes = raw_output.len,
             .error_name = error_name,
         };
+        errdefer entry.output.deinit(runtime.alloc);
+        try entry.appendBoundedOutput(input.output);
         if (entry.isTerminal()) entry.finalizeReplayLocked();
         return entry;
     }
@@ -477,13 +477,97 @@ const Entry = struct {
         return self.persistence_kind;
     }
 
+    /// Keeps at most `max_output_bytes` of the output not yet delivered:
+    /// all of it while it fits, then its first half as a head and its newest
+    /// bytes as a rolling tail, so a long command's end stays in view
+    /// (`command_runner.StreamPreview` splits the same way).
     fn appendBoundedOutput(self: *Entry, chunk: []const u8) !void {
-        const available = self.max_output_bytes -| self.output.items.len;
-        const retained = @min(available, chunk.len);
-        if (retained != 0) {
-            try self.output.appendSlice(self.runtime.alloc, chunk[0..retained]);
+        if (chunk.len == 0) return;
+        const alloc = self.runtime.alloc;
+        if (self.output_dropped == 0 and
+            chunk.len <= self.max_output_bytes -| self.output.items.len)
+        {
+            return self.output.appendSlice(alloc, chunk);
         }
-        if (retained != chunk.len) self.output_truncated = true;
+        // The output never grows past the limit from here.
+        try self.output.ensureTotalCapacity(alloc, self.max_output_bytes);
+        var rest = chunk;
+        if (self.output_dropped == 0) {
+            const head_limit = (self.max_output_bytes + 1) / 2;
+            if (self.output.items.len < head_limit) {
+                const take = head_limit - self.output.items.len;
+                self.output.appendSliceAssumeCapacity(rest[0..take]);
+                rest = rest[take..];
+            }
+            self.output_gap_at = head_limit;
+        }
+        const tail_limit = self.max_output_bytes - self.output_gap_at;
+        const tail_len = self.output.items.len - self.output_gap_at;
+        if (rest.len >= tail_limit) {
+            self.output_dropped += tail_len + (rest.len - tail_limit);
+            self.output.items.len = self.output_gap_at;
+            self.output.appendSliceAssumeCapacity(rest[rest.len - tail_limit ..]);
+        } else {
+            const drop = (tail_len + rest.len) -| tail_limit;
+            if (drop != 0) {
+                const tail = self.output.items[self.output_gap_at..];
+                @memmove(tail[0 .. tail.len - drop], tail[drop..]);
+                self.output.items.len -= drop;
+                self.output_dropped += drop;
+            }
+            self.output.appendSliceAssumeCapacity(rest);
+        }
+        self.output_truncated = true;
+    }
+
+    /// The output not yet delivered, counted as the command printed it,
+    /// dropped bytes included: the unit of `delivery`'s ranges.
+    fn pendingOutputBytes(self: *const Entry) u64 {
+        return @as(u64, self.output.items.len) + self.output_dropped;
+    }
+
+    /// Removes the first `delivered` bytes of the output not yet delivered,
+    /// counted as `pendingOutputBytes` counts them. What stays is exactly
+    /// the output after them, with the bytes of it that were dropped still
+    /// counted in `output_dropped`.
+    fn removeDeliveredOutput(self: *Entry, delivered: u64) error{InvalidOutputRange}!void {
+        if (delivered > self.pendingOutputBytes()) return error.InvalidOutputRange;
+        const len = self.output.items.len;
+        const gap_at: u64 = if (self.output_dropped == 0) len else self.output_gap_at;
+        const gap_end = gap_at + self.output_dropped;
+        // How many kept bytes go.
+        var removed: usize = undefined;
+        if (delivered <= gap_at) {
+            // Delivered ends in the head.
+            removed = @intCast(delivered);
+            self.output_gap_at = @intCast(gap_at - delivered);
+        } else if (delivered >= gap_end) {
+            // Delivered ends in the tail; nothing ahead was dropped.
+            removed = @intCast(delivered - self.output_dropped);
+            self.output_gap_at = 0;
+            self.output_dropped = 0;
+        } else {
+            // Delivered ends in the gap; what stays starts with dropped bytes.
+            removed = @intCast(gap_at);
+            self.output_gap_at = 0;
+            self.output_dropped = gap_end - delivered;
+        }
+        @memmove(self.output.items[0 .. len - removed], self.output.items[removed..]);
+        self.output.items.len -= removed;
+    }
+
+    /// The output not yet delivered as a snapshot shows it: whole, or its
+    /// head, a line that counts the bytes left out, and its tail, both cut
+    /// on UTF-8 boundaries. Caller owns the returned bytes.
+    fn outputDeltaAlloc(self: *const Entry, alloc: Allocator) ![]u8 {
+        if (self.output_dropped == 0) return alloc.dupe(u8, self.output.items);
+        const kept_head = self.output.items[0..self.output_gap_at];
+        const head = withoutCutSequence(kept_head);
+        const kept_tail = self.output.items[self.output_gap_at..];
+        const tail = kept_tail[text_utils.utf8ForwardBoundary(kept_tail, 0)..];
+        const omitted = self.output_dropped + (kept_head.len - head.len) + (kept_tail.len - tail.len);
+        const line_break = if (head.len == 0 or std.mem.endsWith(u8, head, "\n")) "" else "\n";
+        return alloc.print("{s}{s}[... {d} bytes truncated ...]\n{s}", .{ head, line_break, omitted, tail });
     }
 
     fn appendOutput(raw: *anyopaque, _: ?@import("../shared/types.zig").ToolLifecycleId, stream: command_contract.CommandOutputStream, chunk: []const u8) !void {
@@ -1203,20 +1287,12 @@ pub const Runtime = struct {
             return error.UnknownReservation;
         };
         const next = try entry.delivery.commit(reservation_id);
-        const delivered: usize = @intCast(reservation.range.end - reservation.range.start);
-        if (delivered > entry.output.items.len) {
+        entry.removeDeliveredOutput(reservation.range.end - reservation.range.start) catch |err| {
             entry.mutex.unlock(zio);
-            return error.InvalidOutputRange;
-        }
-        if (delivered != 0) {
-            @memmove(
-                entry.output.items[0 .. entry.output.items.len - delivered],
-                entry.output.items[delivered..],
-            );
-            entry.output.items.len -= delivered;
-        }
+            return err;
+        };
         entry.delivery = next;
-        entry.output_truncated = false;
+        entry.output_truncated = entry.output_dropped != 0;
         const terminal = entry.isTerminal();
         const should_remove = terminal and !entry.published_running;
         if (terminal and entry.published_running) self.clearAuthorityLocked(entry);
@@ -1366,7 +1442,7 @@ pub const Runtime = struct {
         defer entry.mutex.unlock(zio);
         entry.delivery = try entry.delivery.prepare(
             reservation_id,
-            entry.delivery.committed + entry.output.items.len,
+            entry.delivery.committed + entry.pendingOutputBytes(),
         );
         errdefer entry.delivery = entry.delivery.cancel(reservation_id) catch entry.delivery;
         const metadata = if (entry.result) |result|
@@ -1379,7 +1455,7 @@ pub const Runtime = struct {
         errdefer alloc.free(command);
         const cwd = try alloc.dupe(u8, entry.cwd);
         errdefer alloc.free(cwd);
-        const output_delta = try alloc.dupe(u8, entry.output.items);
+        const output_delta = try entry.outputDeltaAlloc(alloc);
         errdefer alloc.free(output_delta);
         const output_file = if (entry.output_handle) |handle|
             try alloc.dupe(u8, handle)
@@ -1670,6 +1746,18 @@ fn applyTtyUpdateLocked(entry: *Entry, input: TtyUpdate) !void {
         entry.error_name = try entry.arena.allocator().dupe(u8, error_name);
     }
     if (entry.isTerminal()) entry.finalizeReplayLocked();
+}
+
+/// `text` without the UTF-8 sequence its end cuts short, if it ends in one.
+fn withoutCutSequence(text: []const u8) []const u8 {
+    var start = text.len;
+    while (start > 0 and text.len - start < 4) {
+        start -= 1;
+        if (text[start] & 0b1100_0000 == 0b1000_0000) continue;
+        const sequence_len = std.unicode.utf8ByteSequenceLength(text[start]) catch return text;
+        return if (text.len - start < sequence_len) text[0..start] else text;
+    }
+    return text;
 }
 
 fn optionalStringEql(left: ?[]const u8, right: ?[]const u8) bool {
@@ -2542,4 +2630,219 @@ test "TTY cursor advances monotonically and delivers each delta once" {
         .max_output_bytes = 64,
         .published_running = true,
     }));
+}
+
+/// An entry with only what the output buffer uses.
+fn testOutputEntry(runtime: *Runtime, max_output_bytes: usize) Entry {
+    return .{
+        .runtime = runtime,
+        .arena = undefined,
+        .execution_id = "output-test",
+        .command = "true",
+        .cwd = "/tmp",
+        .environment = .legacy,
+        .max_output_bytes = max_output_bytes,
+        .timeout_ms = null,
+        .command_artifact_dir = null,
+        .backend_kind = .captured,
+        .persistence_kind = .process,
+        .backend_state = .tombstone,
+    };
+}
+
+fn expectOutputDelta(entry: *const Entry, expected: []const u8) !void {
+    const delta = try entry.outputDeltaAlloc(std.testing.allocator);
+    defer std.testing.allocator.free(delta);
+    try std.testing.expectEqualStrings(expected, delta);
+}
+
+const TestDeltaParts = struct { head: []const u8, omitted: ?u64, tail: []const u8 };
+
+/// Splits a delta of output with no line breaks at its marker.
+fn splitTestDelta(delta: []const u8) !TestDeltaParts {
+    const open = "[... ";
+    const close = " bytes truncated ...]\n";
+    const at = std.mem.find(u8, delta, open) orelse return .{ .head = delta, .omitted = null, .tail = "" };
+    const count_end = std.mem.findPos(u8, delta, at, close) orelse return error.TestUnexpectedDelta;
+    var head = delta[0..at];
+    if (std.mem.endsWith(u8, head, "\n")) head = head[0 .. head.len - 1];
+    return .{
+        .head = head,
+        .omitted = try std.fmt.parseInt(u64, delta[at + open.len .. count_end], 10),
+        .tail = delta[count_end + close.len ..],
+    };
+}
+
+test "command output under the limit is kept whole" {
+    var runtime = Runtime.init(std.testing.allocator);
+    defer runtime.deinit();
+    var entry = testOutputEntry(&runtime, 16);
+    defer entry.output.deinit(std.testing.allocator);
+    try entry.appendBoundedOutput("abc");
+    try entry.appendBoundedOutput("");
+    try entry.appendBoundedOutput("defghijklmnop");
+    try std.testing.expect(!entry.output_truncated);
+    try std.testing.expectEqual(@as(u64, 16), entry.pendingOutputBytes());
+    try expectOutputDelta(&entry, "abcdefghijklmnop");
+}
+
+test "command output over the limit keeps its head and newest tail for any chunk size" {
+    const stream = "0123456789ABCDEF";
+    for (1..stream.len + 1) |chunk_len| {
+        var runtime = Runtime.init(std.testing.allocator);
+        defer runtime.deinit();
+        var entry = testOutputEntry(&runtime, 10);
+        defer entry.output.deinit(std.testing.allocator);
+        var start: usize = 0;
+        while (start < stream.len) : (start += chunk_len) {
+            try entry.appendBoundedOutput(stream[start..@min(stream.len, start + chunk_len)]);
+        }
+        try std.testing.expect(entry.output_truncated);
+        try std.testing.expectEqual(@as(usize, 10), entry.output.items.len);
+        try std.testing.expectEqual(@as(u64, stream.len), entry.pendingOutputBytes());
+        try expectOutputDelta(&entry, "01234\n[... 6 bytes truncated ...]\nBCDEF");
+    }
+}
+
+test "command output head and tail are cut on UTF-8 boundaries" {
+    var runtime = Runtime.init(std.testing.allocator);
+    defer runtime.deinit();
+    var entry = testOutputEntry(&runtime, 10);
+    defer entry.output.deinit(std.testing.allocator);
+    // The head's fifth byte starts "é", and the tail's first two bytes end "€".
+    try entry.appendBoundedOutput("abcd\xc3\xa9XYZ\xe2\x82\xaclmn");
+    const delta = try entry.outputDeltaAlloc(std.testing.allocator);
+    defer std.testing.allocator.free(delta);
+    try std.testing.expectEqualStrings("abcd\n[... 8 bytes truncated ...]\nlmn", delta);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(delta));
+}
+
+test "a delivery that ends in the head, the gap, or the tail keeps exactly the later output" {
+    const alloc = std.testing.allocator;
+    var runtime = Runtime.init(alloc);
+    defer runtime.deinit();
+
+    // Ends in the head: the output overflows while the delivery is pending.
+    var head = testOutputEntry(&runtime, 10);
+    defer head.output.deinit(alloc);
+    try head.appendBoundedOutput("abc");
+    const head_delivered = head.pendingOutputBytes();
+    try head.appendBoundedOutput("defghijklmnop");
+    try head.removeDeliveredOutput(head_delivered);
+    try std.testing.expectEqual(@as(u64, 13), head.pendingOutputBytes());
+    try expectOutputDelta(&head, "de\n[... 6 bytes truncated ...]\nlmnop");
+
+    // Ends in the gap: more bytes were dropped than the tail held.
+    var gap = testOutputEntry(&runtime, 10);
+    defer gap.output.deinit(alloc);
+    try gap.appendBoundedOutput("0123456789ABCDEF");
+    const gap_delivered = gap.pendingOutputBytes();
+    try gap.appendBoundedOutput("ghijklm");
+    try gap.removeDeliveredOutput(gap_delivered);
+    try std.testing.expectEqual(@as(u64, 7), gap.pendingOutputBytes());
+    try expectOutputDelta(&gap, "[... 2 bytes truncated ...]\nijklm");
+
+    // Ends in the tail: nothing after the delivery was dropped.
+    var tail = testOutputEntry(&runtime, 10);
+    defer tail.output.deinit(alloc);
+    try tail.appendBoundedOutput("0123456789ABCDEF");
+    const tail_delivered = tail.pendingOutputBytes();
+    try tail.appendBoundedOutput("gh");
+    try tail.removeDeliveredOutput(tail_delivered);
+    try std.testing.expectEqual(@as(u64, 2), tail.pendingOutputBytes());
+    try std.testing.expectEqual(@as(u64, 0), tail.output_dropped);
+    try expectOutputDelta(&tail, "gh");
+
+    try std.testing.expectError(error.InvalidOutputRange, tail.removeDeliveredOutput(3));
+}
+
+test "command output deliveries neither repeat nor skip bytes when output, delivery, and cancel interleave" {
+    const alloc = std.testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0x5eed_0f_0a7);
+    const random = prng.random();
+    for ([_]usize{ 1, 2, 7, 10, 33 }) |max| {
+        var runtime = Runtime.init(alloc);
+        defer runtime.deinit();
+        var entry = testOutputEntry(&runtime, max);
+        defer entry.output.deinit(alloc);
+        var stream: std.ArrayList(u8) = .empty;
+        defer stream.deinit(alloc);
+        var committed: u64 = 0;
+        var pending: ?u64 = null;
+        for (0..2000) |_| {
+            switch (random.uintLessThan(u8, 4)) {
+                0, 1 => {
+                    var chunk: [80]u8 = undefined;
+                    const chunk_len = random.uintAtMost(usize, @min(chunk.len, 3 * max));
+                    for (chunk[0..chunk_len]) |*byte| byte.* = 'a' + random.uintLessThan(u8, 26);
+                    try stream.appendSlice(alloc, chunk[0..chunk_len]);
+                    try entry.appendBoundedOutput(chunk[0..chunk_len]);
+                },
+                2 => if (pending) |end| {
+                    try entry.removeDeliveredOutput(end - committed);
+                    committed = end;
+                    pending = null;
+                } else {
+                    const end = committed + entry.pendingOutputBytes();
+                    const delta = try entry.outputDeltaAlloc(alloc);
+                    defer alloc.free(delta);
+                    const delivered = stream.items[@intCast(committed)..@intCast(end)];
+                    const parts = try splitTestDelta(delta);
+                    if (parts.omitted) |omitted| {
+                        try std.testing.expectEqual(@as(u64, delivered.len), parts.head.len + omitted + parts.tail.len);
+                        try std.testing.expectEqualStrings(delivered[0..parts.head.len], parts.head);
+                        try std.testing.expectEqualStrings(delivered[delivered.len - parts.tail.len ..], parts.tail);
+                        try std.testing.expect(parts.head.len <= (max + 1) / 2);
+                        try std.testing.expect(parts.head.len + parts.tail.len <= max);
+                    } else {
+                        try std.testing.expectEqualStrings(delivered, delta);
+                    }
+                    pending = end;
+                },
+                // A delivery the caller drops is shown again with the next one.
+                else => pending = null,
+            }
+            try std.testing.expect(entry.output.items.len <= max);
+            try std.testing.expectEqual(@as(u64, stream.items.len) - committed, entry.pendingOutputBytes());
+        }
+    }
+}
+
+test "terminal output keeps its head and tail through restore, refresh, and delivery" {
+    const alloc = std.testing.allocator;
+    var runtime = Runtime.init(alloc);
+    defer runtime.deinit();
+    var restored = try runtime.registerTty(alloc, .{
+        .execution_id = "tty-head-tail",
+        .command = "interactive",
+        .state = .running,
+        .output = "0123456789ABCDEF",
+        .max_output_bytes = 10,
+        .published_running = true,
+    });
+    defer restored.deinit(alloc);
+    try std.testing.expect(restored.snapshot.output_truncated);
+    try std.testing.expectEqualStrings("01234\n[... 6 bytes truncated ...]\nBCDEF", restored.snapshot.output_delta);
+
+    // Output that arrives before the delivery commits comes in the next one.
+    try runtime.refreshTty(.{
+        .execution_id = "tty-head-tail",
+        .command = "interactive",
+        .state = .running,
+        .output = "gh",
+        .max_output_bytes = 10,
+        .published_running = true,
+    });
+    try runtime.commitDelivery(restored.snapshot.execution_id, restored.reservation_id);
+    var next = try runtime.updateTty(alloc, .{
+        .execution_id = "tty-head-tail",
+        .command = "interactive",
+        .state = .running,
+        .max_output_bytes = 10,
+        .published_running = true,
+    });
+    defer next.deinit(alloc);
+    try std.testing.expectEqualStrings("gh", next.snapshot.output_delta);
+    try std.testing.expect(!next.snapshot.output_truncated);
+    try runtime.commitDelivery(next.snapshot.execution_id, next.reservation_id);
 }

@@ -14,6 +14,8 @@ export type StoryStep = {
   at: number;
   text?: string;
   calls?: StoryCall[];
+  /** A reply of its own, such as a stream that holds partway, in place of text and calls. */
+  response?: () => Response;
 };
 
 export const CHILD_MARKER = "[story-child]";
@@ -78,7 +80,7 @@ export function startStoryGateway(steps: StoryStep[], childReply?: (task: string
     if (!step) {
       return new Response(`no scripted step after ${shape.toolResults} tool results`, { status: 500 });
     }
-    return storyReply(step);
+    return step.response ? step.response() : storyReply(step);
   });
 }
 
