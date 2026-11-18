@@ -260,14 +260,14 @@ describe.skipIf(SKIP)("tui: interrupt recovery", () => {
       await session.waitForComposer(TIMEOUT);
       await session.sendText("Hold this response.");
       await waitForCondition(() => held.started, "first request start");
-      await session.waitForText("Thinking", TIMEOUT);
+      await session.waitForText("thinking", TIMEOUT);
 
       session.sendKeysImmediate(["C-c", "o", "k", "Enter"]);
       await waitForCondition(() => followUp.started, "follow-up request after tool completion");
-      await session.waitForText("Thinking", TIMEOUT);
+      await session.waitForText("thinking", TIMEOUT);
       const activeGrid = await session.capturePaneGrid();
-      expect(activeGrid.join("\n")).toContain("Read probe.txt");
-      expect(activeGrid.join("\n")).toContain("Thinking");
+      expect(activeGrid.join("\n")).toContain("read probe.txt");
+      expect(activeGrid.join("\n")).toContain("thinking");
       expect(gateway.requests[1]!.body).toContain("<turn_aborted>");
       expect(gateway.requests[1]!.body).not.toContain("<user_steering>");
       expect(countOccurrences(readTrace(tracePath), "event=worker_begin")).toBe(2);
@@ -275,7 +275,7 @@ describe.skipIf(SKIP)("tui: interrupt recovery", () => {
       await session.sendKeys("C-o");
       await session.waitForText("esc close · pgup/pgdn scroll", TIMEOUT);
       await session.sendKeys("C-o");
-      await session.waitForText("Thinking", TIMEOUT);
+      await session.waitForText("thinking", TIMEOUT);
       await session.sendKeys("C-c");
       await waitForCondition(() => followUp.cancelled, "follow-up cancellation");
       await waitForCondition(
@@ -289,9 +289,9 @@ describe.skipIf(SKIP)("tui: interrupt recovery", () => {
         "final prompt completion",
       );
       const scrollback = await session.captureFullScrollback();
-      expect(scrollback).toContain("Read probe.txt");
+      expect(scrollback).toContain("read probe.txt");
       expect(countOccurrences(scrollback, "What can fx do differently?")).toBe(2);
-      expect((await session.capturePaneGrid()).join("\n")).not.toContain("Thinking");
+      expect((await session.capturePaneGrid()).join("\n")).not.toContain("thinking");
       expect(gateway.requests).toHaveLength(4);
       expect(held.cancelCount).toBe(1);
       expect(followUp.cancelCount).toBe(1);
@@ -300,7 +300,7 @@ describe.skipIf(SKIP)("tui: interrupt recovery", () => {
       const replay = Bun.spawnSync([join(import.meta.dir, "../../zig-out/bin/fx"), "replay", tapePath]);
       expect(replay.exitCode).toBe(0);
       expect(replay.stdout.toString()).toContain("CANCEL_NEXT_PROMPT_COMPLETE");
-      expect(replay.stdout.toString()).not.toContain("Thinking");
+      expect(replay.stdout.toString()).not.toContain("thinking");
     },
     TIMEOUT * 2,
   );
@@ -914,7 +914,7 @@ while :; do sleep 1; done
       await session.waitForComposer(TIMEOUT);
 
       await session.sendText("Search the prepared corpus.");
-      await session.waitForText(`Searching ${pattern}`, TIMEOUT);
+      await session.waitForText(`searching ${pattern}`, TIMEOUT);
       expect(readTrace(tracePath)).not.toContain(
         `event=after_tool_execution call_id=${callId}`,
       );
@@ -945,9 +945,9 @@ while :; do sleep 1; done
       const cancelIndex = traceLines.findIndex((line) => line.includes("event=cancel_requested"));
       expect(cancelIndex).toBeGreaterThanOrEqual(0);
       expect(cancelIndex).toBeLessThan(completedToolIndex);
-      await session.waitForText(`Searched ${pattern}`, TIMEOUT);
+      await session.waitForText(`searched ${pattern}`, TIMEOUT);
       const scrollback = await session.captureFullScrollback();
-      expect(scrollback).toContain(`Searched ${pattern}`);
+      expect(scrollback).toContain(`searched ${pattern}`);
       expect(countOccurrences(scrollback, "What can fx do differently?")).toBe(1);
       expect(scrollback).not.toContain("system: cancelled");
       expect(scrollback).not.toContain("Cancelling");

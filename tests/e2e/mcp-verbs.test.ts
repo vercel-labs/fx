@@ -107,7 +107,7 @@ describe("fx mcp", () => {
     const before = readFileSync(root.profilePath, "utf8");
     const taken = await mcp(root, "add", "web", "https://b/mcp");
     expect(taken.code).toBe(1);
-    expect(taken.stderr).toBe("Couldn't add web to ~/.fx/mcp.json: that name is already in the file; remove it first.\n");
+    expect(taken.stderr).toBe("couldn't add web to ~/.fx/mcp.json: that name is already in the file; remove it first.\n");
     expect(readFileSync(root.profilePath, "utf8")).toBe(before);
 
     writeFileSync(root.profilePath, '{"mcpServers":{},"mcpServers":{}}');
@@ -137,10 +137,10 @@ describe("fx mcp", () => {
     const why = `it's a link to ${target}, and fx edits only a plain file; edit ${target} by hand.\n`;
     const added = await mcp(root, "add", "--project", "two", "--", "true");
     expect(added.code).toBe(1);
-    expect(added.stderr).toBe(`Couldn't add two to .mcp.json: ${why}`);
+    expect(added.stderr).toBe(`couldn't add two to .mcp.json: ${why}`);
     const removed = await mcp(root, "remove", "--project", "one");
     expect(removed.code).toBe(1);
-    expect(removed.stderr).toBe(`Couldn't remove one from .mcp.json: ${why}`);
+    expect(removed.stderr).toBe(`couldn't remove one from .mcp.json: ${why}`);
     expect(lstatSync(root.projectPath).isSymbolicLink()).toBe(true);
     expect(readFileSync(target, "utf8")).toBe(text);
 
@@ -149,7 +149,7 @@ describe("fx mcp", () => {
     linkSync(target, root.projectPath);
     const hard = await mcp(root, "add", "--project", "two", "--", "true");
     expect(hard.code).toBe(1);
-    expect(hard.stderr).toBe("Couldn't add two to .mcp.json: it has another hard link, and fx edits only a plain file; edit it by hand.\n");
+    expect(hard.stderr).toBe("couldn't add two to .mcp.json: it has another hard link, and fx edits only a plain file; edit it by hand.\n");
     expect(readFileSync(target, "utf8")).toBe(text);
 
     // The profile's own replace refuses a link too, and says so the same way.
@@ -158,7 +158,7 @@ describe("fx mcp", () => {
     symlinkSync(profileTarget, root.profilePath);
     const profile = await mcp(root, "add", "three", "--", "true");
     expect(profile.code).toBe(1);
-    expect(profile.stderr).toBe(`Couldn't add three to ~/.fx/mcp.json: it's a link to ${profileTarget}, and fx edits only a plain file; edit ${profileTarget} by hand.\n`);
+    expect(profile.stderr).toBe(`couldn't add three to ~/.fx/mcp.json: it's a link to ${profileTarget}, and fx edits only a plain file; edit ${profileTarget} by hand.\n`);
     expect(lstatSync(root.profilePath).isSymbolicLink()).toBe(true);
     expect(readFileSync(profileTarget, "utf8")).toBe("{}");
   });

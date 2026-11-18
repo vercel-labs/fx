@@ -649,11 +649,11 @@ describe.skipIf(!tmuxAvailable())("tui: file permissions", () => {
       await session.sendHexBytes(completeWheel);
       const completeSgrApproval = (await session.capturePaneGrid()).join("\n");
       expect(completeSgrApproval).not.toBe(approval);
-      expect(completeSgrApproval).not.toContain("Cancelled file");
+      expect(completeSgrApproval).not.toContain("cancelled file");
 
       await session.sendFragmentedHexBytes(fragmentedWheel, fragmentedWheelDelayMs, injectionLogPath);
       const fragmentedScrollback = await session.captureFullScrollbackEscapes();
-      expect(fragmentedScrollback).not.toContain("Cancelled file");
+      expect(fragmentedScrollback).not.toContain("cancelled file");
       expect(fragmentedScrollback).not.toContain("4;79;12M");
       expect(readFileSync(injectionLogPath, "utf8")).toBe(
         fragmentedWheel.map((byte, index) =>
@@ -998,7 +998,7 @@ describe.skipIf(!tmuxAvailable())("tui: file permissions", () => {
       expect(fileHash(target)).toBe(externalHash);
       expect(gateway.requests[1]!.body).toContain("file changed after preview");
       expect(gateway.requests[1]!.body).not.toContain("edited stale.txt");
-      expect(settled).not.toContain("Edited stale.txt");
+      expect(settled).not.toContain("edited stale.txt");
       expectCleanStderr(stderrPath);
     },
     TIMEOUT,
@@ -1413,7 +1413,7 @@ describe.skipIf(!tmuxAvailable())("tui: file permissions", () => {
         expect(readFileSync(target, "utf8")).toBe("after\n");
         const scrollback = await session.captureFullScrollbackEscapes();
         const row = scrollback.split("\n").find((line) =>
-          line.includes("Edited marker.txt") && line.includes("+1") && line.includes("-1")
+          line.includes("edited marker.txt") && line.includes("+1") && line.includes("-1")
         );
         expect(row).toBeDefined();
         if (selection === "default") {
@@ -1467,7 +1467,7 @@ describe.skipIf(!tmuxAvailable())("tui: file permissions", () => {
       // Both edits change one file, so they share one row, which is the
       // group's line. It shows the file by name, not its path.
       await session.waitForPane(
-        (pane) => pane.includes("long path edits complete") && /^● Edited edit-row-fixture/m.test(pane),
+        (pane) => pane.includes("long path edits complete") && /^● edited edit-row-fixture/m.test(pane),
         TIMEOUT,
       );
       expect(readFileSync(target, "utf8")).toBe("uno\ndos\n");
@@ -1477,12 +1477,12 @@ describe.skipIf(!tmuxAvailable())("tui: file permissions", () => {
       expect(rows).toHaveLength(1);
       expect([...rows[0]!.trimEnd()].length).toBeLessThanOrEqual(width);
       // The name clips; the added-up counts and the merge note stay.
-      expect(rows[0]!.trimEnd()).toMatch(/^● Edited edit-row-fixture\S*… \+2\/-2 · 2 edits$/);
+      expect(rows[0]!.trimEnd()).toMatch(/^● edited edit-row-fixture\S*… \+2\/-2 · 2 edits$/);
       expect(grid.some((line) => line.includes("packages/"))).toBe(false);
 
       const escapes = await session.capturePaneEscapes();
       // The counts keep their colors after the clipped name.
-      const styledRows = escapes.split("\n").filter((line) => line.includes("Edited ") && line.includes("edit-row-fixture"));
+      const styledRows = escapes.split("\n").filter((line) => line.includes("edited ") && line.includes("edit-row-fixture"));
       expect(styledRows).toHaveLength(1);
       expect(styledRows[0]).toContain("\x1b[38;5;71m+2");
       expect(styledRows[0]).toContain("\x1b[38;5;167m-2");
@@ -1601,8 +1601,8 @@ describe.skipIf(!tmuxAvailable())("tui: file permissions", () => {
 
       const compactGrid = await session.capturePaneGrid();
       const compactScrollback = await session.captureFullScrollback();
-      expect(compactScrollback).toContain("Wrote first.txt +120");
-      expect(compactScrollback).toContain("Wrote second.txt +60");
+      expect(compactScrollback).toContain("wrote first.txt +120");
+      expect(compactScrollback).toContain("wrote second.txt +60");
       expect(compactScrollback).not.toContain("CTRL_O_FIRST_060");
 
       await session.sendKeys("C-o");

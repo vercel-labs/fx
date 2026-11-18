@@ -149,7 +149,7 @@ scenario("a session grant an approval adds while the panel is open shows when th
   const states = painted.map((index) => {
     const grid = grids.get(index)!;
     const panel = infoPanel(grid, "Permissions");
-    const wrote = grid.some((row) => row.includes("Wrote note.txt"));
+    const wrote = grid.some((row) => row.includes("wrote note.txt"));
     return { index, approval: approvalShown(grid), wrote, grants: panel?.fields["Session grants"], items: panel?.items["Session grants"] };
   });
   const lastApproval = states.findLastIndex((state) => state.approval);

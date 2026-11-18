@@ -205,8 +205,8 @@ describe.skipIf(process.env.FX_WEB_FETCH_LIVE !== "1")("live web_fetch public UR
           expect(fetches[0].web_fetch?.status).toBe(200);
           expect(fetches[0].web_fetch?.bytes).toBeGreaterThan(0);
           expect(json.tool_calls.every((call) => call.name === "web_fetch")).toBe(true);
-          expect(result.stderr).toContain("Fetching ");
-          expect(result.stderr).toContain("Converting ");
+          expect(result.stderr).toContain("fetching ");
+          expect(result.stderr).toContain("converting ");
           expect(result.stderr).not.toContain("Extracting ");
           expect(result.stderr).not.toContain("panic");
           expect(result.stderr).not.toContain("abort");
@@ -276,8 +276,8 @@ describe.skipIf(process.env.FX_WEB_FETCH_LIVE !== "1")("live web_fetch public UR
         expect(fetches[1].status).toBe("success");
         expect(fetches[1].web_fetch?.cache_hit).toBe(true);
         expect(fetches[1].web_fetch?.artifact).toBe("none");
-        expect(result.stderr).toContain("Fetching ");
-        expect(result.stderr).toContain("Converting ");
+        expect(result.stderr).toContain("fetching ");
+        expect(result.stderr).toContain("converting ");
         expect(result.stderr).not.toContain("Extracting ");
         expect(gateway.requests).toHaveLength(3);
         expect(gateway.requests[2].body).toContain("<cache_hit>true</cache_hit>");
@@ -366,8 +366,8 @@ describe.skipIf(process.env.FX_WEB_FETCH_LIVE !== "1")("live web_fetch public UR
         expect(detail.stdout).not.toContain("%PDF-");
         expect(detail.stdout).not.toContain(artifactBase64Prefix);
         expect(detail.stdout).not.toContain("Store the file and summarize safe metadata only.");
-        expect(result.stderr).toContain("Fetching ");
-        expect(result.stderr).toContain("Converting ");
+        expect(result.stderr).toContain("fetching ");
+        expect(result.stderr).toContain("converting ");
         expect(result.stderr).not.toContain("Extracting ");
         expect(gateway.requests).toHaveLength(2);
 

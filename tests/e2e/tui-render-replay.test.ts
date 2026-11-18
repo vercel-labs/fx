@@ -315,7 +315,7 @@ describe("tui: render record/replay", () => {
 
       const gridText = readFileSync(goldenPath, "utf8");
       expect(gridText).toContain("run some tools - read only tool for testing");
-      expect(gridText).toContain("Listed .");
+      expect(gridText).toContain("listed .");
       assertSingleFooter(gridText.replace(/\n$/, "").split("\n"), failures, "read-only tools replay grid");
       expect(failures).toEqual([]);
     },

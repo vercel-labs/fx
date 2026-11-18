@@ -336,7 +336,7 @@ describe.skipIf(!tmuxAvailable())("tui: active session transitions", () => {
 
         await session.sendText("start an active turn");
         await session.waitForPane(
-          (pane) => pane.includes("Thinking") && gateway.requests.length === 1,
+          (pane) => pane.includes("thinking") && gateway.requests.length === 1,
           10_000,
         );
         await session.sendText("/clear");

@@ -340,7 +340,7 @@ describe("Ctrl+O full detail", () => {
       await session.sendKeys("Escape");
       await session.waitForText("esc again to interrupt", TIMEOUT);
       await session.sendKeys("Escape");
-      await session.waitForText("Cancelled", TIMEOUT);
+      await session.waitForText("cancelled", TIMEOUT);
       const order = [["┃ Start and stop"], ["PARTIAL_ANSWER_BEFORE_ESC"], [MODEL, "cancelled"]];
       expectInOrder(await fullDetail(session), order);
       await session.kill();
@@ -384,7 +384,7 @@ describe("Ctrl+O full detail", () => {
       await ask(session, "List the folder", "Done: two lines.");
       const rows = await fullDetail(session);
       const first = rows.findIndex((row) => row.startsWith("┃ List the folder"));
-      const last = rows.findIndex((row) => row.startsWith("  Turn · "));
+      const last = rows.findIndex((row) => row.startsWith("  turn · "));
       expect(first, rows.join("\n")).toBeGreaterThanOrEqual(0);
       expect(last, rows.join("\n")).toBeGreaterThan(first);
       // Below the turn's totals only blank rows, then the hint.

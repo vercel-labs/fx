@@ -167,7 +167,7 @@ async function waitForCompletedTurn(active: TmuxSession, count: number): Promise
       pane.includes(`edit contract complete ${count}`) &&
       hasEmptyComposer(pane) &&
       !pane.includes("esc interrupt") &&
-      !pane.includes("Thinking"),
+      !pane.includes("thinking"),
     TIMEOUT,
   );
 }
@@ -971,7 +971,7 @@ tmuxTest(
       (pane) =>
         pane.includes("edit contract complete") &&
         pane.includes("┃") &&
-        !pane.includes("Thinking"),
+        !pane.includes("thinking"),
       TIMEOUT,
     );
 
@@ -1002,7 +1002,7 @@ tmuxTest(
       (pane) =>
         pane.includes("edit contract complete") &&
         pane.includes("┃") &&
-        !pane.includes("Thinking"),
+        !pane.includes("thinking"),
       TIMEOUT,
     );
 
@@ -1067,7 +1067,7 @@ for (
         (pane) =>
           pane.includes("edit contract complete") &&
           pane.includes("┃") &&
-          !pane.includes("Thinking"),
+          !pane.includes("thinking"),
         TIMEOUT,
       );
 
@@ -1107,7 +1107,7 @@ tmuxTest(
       (pane) =>
         pane.includes("edit contract complete") &&
         pane.includes("┃") &&
-        !pane.includes("Thinking"),
+        !pane.includes("thinking"),
       TIMEOUT,
     );
 

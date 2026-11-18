@@ -1251,7 +1251,7 @@ describe.skipIf(SKIP)("tui: decision prompt input isolation", () => {
       );
       expect(pane).toContain("I need to inspect one file before continuing.");
       expect(pane).not.toContain(MALFORMED_LABEL_SENTINEL);
-      expect(pane).not.toContain("● Reading");
+      expect(pane).not.toContain("● reading");
       expect(pane).not.toContain(APPROVAL_PROMPT);
       expect(pane).not.toContain(QUESTION_PROMPT);
       expect(pane).not.toContain("SyntaxError");
@@ -1586,7 +1586,7 @@ describe.skipIf(SKIP)("tui: decision prompt input isolation", () => {
       const completePane = await ctx.session.capturePane();
       expect(completePane).not.toBe(initialPane);
       expect(completePane).not.toContain(`${COMMAND_SCROLL_LINE_PREFIX}001`);
-      expect(completePane).not.toContain("Cancelled");
+      expect(completePane).not.toContain("cancelled");
 
       await ctx.session.sendHexBytes(fragmentedWheel.slice(0, 6));
       await ctx.session.sendHexBytes(fragmentedWheel.slice(6));
@@ -1598,9 +1598,9 @@ describe.skipIf(SKIP)("tui: decision prompt input isolation", () => {
           hasApprovalSelection(pane, 1, COMMAND_YES_CHOICE),
         TIMEOUT,
       );
-      expect(fragmentedPane).not.toContain("Cancelled");
+      expect(fragmentedPane).not.toContain("cancelled");
       const fragmentedScrollback = await ctx.session.captureFullScrollbackEscapes();
-      expect(fragmentedScrollback).not.toContain("Cancelled");
+      expect(fragmentedScrollback).not.toContain("cancelled");
       expect(fragmentedScrollback).not.toContain("4;79;12M");
       const approvalFrames = Buffer.concat(stdoutFrames(tapePath).map((frame) => frame.payload));
       expect(approvalFrames.includes(Buffer.from("\x1b[?1000h\x1b[?1006h"))).toBe(true);
@@ -2292,7 +2292,7 @@ describe.skipIf(SKIP)("tui: decision prompt input isolation", () => {
       await ctx.session.waitForText("approval amendment paste handled", TIMEOUT);
       const finalPane = await ctx.session.capturePane();
       expect(finalPane).toContain(expected);
-      expect(finalPane).toContain("Ran touch generic-preview-accepted.txt");
+      expect(finalPane).toContain("ran touch generic-preview-accepted.txt");
       expect(ctx.gateway.requests).toHaveLength(2);
       expect(requestContainsExactString(ctx.gateway.requests[1]!.body, expected)).toBe(true);
       await assertProcessAliveAndClean(ctx);

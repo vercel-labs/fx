@@ -193,8 +193,8 @@ function expectWebFetchSchema(request: GatewayRequest) {
 }
 
 function expectNoFetchProgress(text: string) {
-  expect(text).not.toContain("Fetching ");
-  expect(text).not.toContain("Converting ");
+  expect(text).not.toContain("fetching ");
+  expect(text).not.toContain("converting ");
   expect(text).not.toContain("Extracting ");
 }
 
@@ -606,8 +606,8 @@ describe("web_fetch Gateway fixture", () => {
 
         expect(gateway.requests).toHaveLength(2);
         expect(gateway.requests[1].body).toContain("policy_denied");
-        expect(updates).not.toContain("Fetching ");
-        expect(updates).not.toContain("Converting ");
+        expect(updates).not.toContain("fetching ");
+        expect(updates).not.toContain("converting ");
         expect(updates).not.toContain("Extracting ");
       } finally {
         await client.close();

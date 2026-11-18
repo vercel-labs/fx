@@ -425,7 +425,7 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
         // A profile that won't load says why and opens nothing.
         await session.sendText("/launch nosuch");
         const refused = await session.waitForPane((pane) => pane.includes("no profile named 'nosuch'"), 15_000);
-        expect(refused).toContain("Couldn't start another fx instance: no profile named 'nosuch'. Profiles:");
+        expect(refused).toContain("couldn't start another fx instance: no profile named 'nosuch'. Profiles:");
         expect(refused).not.toContain("ProfileNotFound");
         expect(refused).toContain("fx 2/2");
       });
@@ -743,7 +743,7 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
         await withHost(answerByLetter, { args: `--resume ${saved}`, reuse: { home, workspace } }, async ({ session }) => {
           const pane = await session.waitForPane((value) => value.includes("HOST_ANSWER_A"), 30_000);
           expect(pane).not.toMatch(/fx \d+\/\d+/);
-          expect(pane).not.toContain("Couldn't bring back");
+          expect(pane).not.toContain("couldn't bring back");
         });
       } finally {
         cleanupIsolatedTestHome(home);
@@ -902,7 +902,7 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
         rmSync(join(home, ".fx", "sessions", "v2", a), { recursive: true, force: true });
         await withHost(answerByLetter, { args: `--resume ${b}`, reuse: { home, workspace } }, async ({ session }) => {
           const pane = await session.waitForPane((value) => value.includes("fx 1/2") && value.includes("HOST_ANSWER_B"), 30_000);
-          expect(pane).not.toContain("Couldn't bring back");
+          expect(pane).not.toContain("couldn't bring back");
           await switchAgent(session, "next");
           await session.waitForPane((value) => value.includes("fx 2/2") && value.includes("HOST_ANSWER_C"), 15_000);
           await session.waitForPane(() => hostRecords(home).some((ids) => ids.length === 2 && !ids.includes(a!)), 15_000);

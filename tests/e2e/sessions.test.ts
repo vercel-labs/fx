@@ -3708,10 +3708,10 @@ test.skipIf(!tmuxAvailable())("fx sessions fits a terminal in color, and NO_COLO
       remainOnExit: true,
     });
     panes.push(pane);
-    await pane.waitForText("Running now", TIMEOUT);
+    await pane.waitForText("running now", TIMEOUT);
     // Only the list, through its last line, and not what tmux shows after fx exits.
     const lines = (await pane.capturePaneEscapes()).split("\n");
-    return lines.slice(0, lines.findIndex((line) => line.replace(sgr, "").startsWith("Running now")) + 1).join("\n");
+    return lines.slice(0, lines.findIndex((line) => line.replace(sgr, "").startsWith("running now")) + 1).join("\n");
   };
   try {
     const id = JSON.parse((await ask(fixture, gateway, [prompt])).stdout).session_id;

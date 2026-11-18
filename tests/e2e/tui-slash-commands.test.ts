@@ -245,7 +245,7 @@ describe.skipIf(TMUX_SKIP)("tui: no-key slash commands", () => {
       const { stderrPath } = await launchShortTerminal("answer");
 
       await session!.sendText("slow question");
-      await session!.waitForText("Thinking", 10_000);
+      await session!.waitForText("thinking", 10_000);
       await session!.sendText("/status");
       await waitForStatusPanel(session!, 5_000, (shown) => shown.labels[0] === "Session");
       held.release("FIRST_ANSWER_LINE\n\nSECOND_ANSWER_LINE\n\nTHIRD_ANSWER_LINE");

@@ -374,7 +374,7 @@ test("the user talks to the parent while its subagent works, and a stop ends the
     const results = logLines(root.home, parent()).filter((line: any) =>
       line.kind === "item" && line.type === "tool_result" && JSON.stringify(line).includes("steering-stop"));
     expect(results).toHaveLength(1);
-    expect(JSON.stringify(results[0])).toContain("Stopped worker: its turn ended.");
+    expect(JSON.stringify(results[0])).toContain("stopped worker: its turn ended.");
     const trace = readFileSync(join(root.root, "trace.log"), "utf8");
     expect(trace).toMatch(/event=child_end .*outcome=cancelled report=false/);
   } finally {
@@ -2115,7 +2115,7 @@ describe("gateway stream lifecycle", () => {
         );
 
         expect(result.code).toBe(0);
-        expect(result.stderr).toBe(`Reading ${probePath}\n`);
+        expect(result.stderr).toBe(`reading ${probePath}\n`);
         expect(gateway.requests).toHaveLength(2);
         for (const request of gateway.requests) {
           expectPermissionModeContext(request.body, mode);
@@ -2950,7 +2950,7 @@ describe("gateway stream lifecycle", () => {
         gateway.requests[1]!.body,
         installCallId,
       );
-      expect(installOutput).toContain("Installed 1 skill(s) into fx.");
+      expect(installOutput).toContain("installed 1 skill(s) into fx.");
       expect(installOutput).toContain(`- ${skillName}\n`);
       expect(installOutput).not.toContain(bodySentinel);
       expect(installOutput).not.toContain(companionSentinel);
@@ -3392,12 +3392,12 @@ describe("gateway stream lifecycle", () => {
       await tui.sendText("Read the workflow and its supporting rules.");
       await tui.waitForPane((pane) => pane.includes("SKILL_LABEL_CHECK_COMPLETE") && hasEmptyComposer(pane), 15_000);
       const scrollback = await tui.captureFullScrollback();
-      expect(scrollback).toContain(`Opened ${skillName}`);
-      expect(scrollback).toContain("Read skill resource references/rules.md");
+      expect(scrollback).toContain(`opened ${skillName}`);
+      expect(scrollback).toContain("read skill resource references/rules.md");
       expect(scrollback).not.toContain("Loaded skill skill");
       expect(scrollback).not.toContain("Loaded skill different-directory");
-      for (const name of additionalSkills) expect(scrollback).toContain(`Opened ${name}`);
-      expect(scrollback).not.toContain("Failed");
+      for (const name of additionalSkills) expect(scrollback).toContain(`opened ${name}`);
+      expect(scrollback).not.toContain("failed");
       await tui.sendText("/quit");
       expect(await tui.waitForSessionEnd(10_000)).toBe(true);
       tui = null;
@@ -3418,8 +3418,8 @@ describe("gateway stream lifecycle", () => {
       await tui.waitForComposer(15_000);
       await tui.waitForText("SKILL_LABEL_CHECK_COMPLETE", 15_000);
       const restored = await tui.captureFullScrollback();
-      expect(restored).toContain(`Opened ${skillName}`);
-      expect(restored).toContain("Read skill resource references/rules.md");
+      expect(restored).toContain(`opened ${skillName}`);
+      expect(restored).toContain("read skill resource references/rules.md");
       expect(restored).not.toContain("Loaded skill skill");
       expect(gateway.requestCount()).toBe(2);
       await tui.sendText("/quit");
@@ -3540,7 +3540,7 @@ describe("gateway stream lifecycle", () => {
             ? `$${skillName} read its supporting resource.`
             : "Load streamed-workflow and read its supporting resource.");
           // Before its arguments arrive, a toolbox call may open, run, or search.
-          await tui.waitForPane((pane) => stream !== undefined && pane.includes("Using"), 15_000);
+          await tui.waitForPane((pane) => stream !== undefined && pane.includes("using"), 15_000);
           expect(gateway.requestCount()).toBe(heldRequestCount);
 
           // Keep streamed input location-first even when final argument keys are reversed.
@@ -3550,7 +3550,7 @@ describe("gateway stream lifecycle", () => {
             type: "tool-call", toolCallId: resourceCallId, toolName: "toolbox",
             input: scenario.resourceFirst ? { resource, open: location } : { open: location, resource },
           });
-          await tui.waitForPane((pane) => pane.includes(`Reading skill resource ${resource}`), 10_000);
+          await tui.waitForPane((pane) => pane.includes(`reading skill resource ${resource}`), 10_000);
           // Observe a held interval, not just the first render, without releasing finish.
           const heldUntil = Date.now() + 250;
           while (Date.now() < heldUntil) {
@@ -3561,8 +3561,8 @@ describe("gateway stream lifecycle", () => {
           const held = await tui.captureFullScrollback();
           // A row names the skill, never an opaque skill location.
           expect(held).not.toMatch(/skill:[0-9a-f]{16}:/);
-          expect(held).toContain(`Reading skill resource ${resource}`);
-          expect(held).not.toContain(`Read skill resource ${resource}`);
+          expect(held).toContain(`reading skill resource ${resource}`);
+          expect(held).not.toContain(`read skill resource ${resource}`);
           expect(finishReleased).toBe(false);
           expect(gateway.requestCount()).toBe(heldRequestCount);
 
@@ -3579,9 +3579,9 @@ describe("gateway stream lifecycle", () => {
             await tui.waitForText("HELD_SKILL_RESOURCE_COMPLETE", 15_000);
             await tui.waitForStableComposer(10_000);
             const completed = await tui.captureFullScrollback();
-            expect(completed).toContain(`Read skill resource ${resource}`);
+            expect(completed).toContain(`read skill resource ${resource}`);
             expect(completed).not.toMatch(/skill:[0-9a-f]{16}:/);
-            if (!attached) expect(completed).toContain(`Opened ${skillName}`);
+            if (!attached) expect(completed).toContain(`opened ${skillName}`);
             expect(gateway.requestCount()).toBe(heldRequestCount + 1);
           }
           await tui.sendText("Confirm later input still works.");
@@ -3591,7 +3591,7 @@ describe("gateway stream lifecycle", () => {
           const scrollback = await tui.captureFullScrollback();
           expect(scrollback).not.toMatch(/skill:[0-9a-f]{16}:/);
           if (scenario.cancel) {
-            expect(scrollback).not.toContain(`Read skill resource ${resource}`);
+            expect(scrollback).not.toContain(`read skill resource ${resource}`);
             expect(scrollback).not.toContain("HELD_SKILL_RESOURCE_COMPLETE");
           }
           await tui.sendText("/quit");
@@ -3955,7 +3955,7 @@ describe("gateway stream lifecycle", () => {
       expect(firstJson.tool_calls.filter((call) => call.name === "subagent")).toEqual([{ name: "subagent", status: "error" }]);
       expect(readFileSync(join(root.workspace, "valid.txt"), "utf8")).toBe("written once\n");
       expect(readFileSync(tracePath, "utf8")).toContain("failure=non_object_json");
-      expect(first.stderr).not.toContain("Reading");
+      expect(first.stderr).not.toContain("reading");
       expect(gateway.requests).toHaveLength(2);
 
       const resumed = await runFx(["ask", "--json", "--auto", "--resume", firstJson.session_id, "Continue."], {
@@ -4382,7 +4382,7 @@ describe("gateway stream lifecycle", () => {
       const output = contentText(resultPart?.output);
 
       expect(result.code).toBe(0);
-      expect(result.stderr).toContain("Matching *");
+      expect(result.stderr).toContain("matching *");
       expect(json.error).toBeUndefined();
       expect(gateway.requestCount()).toBe(3);
       expect(output).toContain("tool_execution_failed");
@@ -4441,7 +4441,7 @@ describe("gateway stream lifecycle", () => {
         },
       );
       expect(first.code).toBe(0);
-      expect(first.stderr).toBe("Reading replay.txt\n");
+      expect(first.stderr).toBe("reading replay.txt\n");
       const firstJson = parseAskJson(first.stdout) as ReturnType<typeof parseAskJson> & {
         model: string;
         session_id: string;
@@ -5157,7 +5157,7 @@ describe("gateway stream lifecycle", () => {
             });
             const result = parseAskJson(first.stdout);
             expect(first.code).toBe(0);
-            expect(first.stderr).toContain("Reading notes.txt");
+            expect(first.stderr).toContain("reading notes.txt");
             expect(result.final_output).toBe("The notes were read.");
             expect(result.tool_calls.filter((call) => call.name === "read_file")).toEqual([{ name: "read_file", status: "success" }]);
             expect(gateway.requestCount()).toBe(2);
@@ -5821,11 +5821,11 @@ describe("gateway stream lifecycle", () => {
       await tui.sendText("Run the fixture and recover from its rejected input.");
       await tui.waitForPane((pane) => pane.includes("REJECTION_RECOVERED") && hasEmptyComposer(pane), 15_000);
       const recovered = await tui.captureFullScrollback();
-      expect(recovered.match(/Failed shell request: invalid JSON arguments/g)).toHaveLength(1);
+      expect(recovered.match(/failed shell request: invalid JSON arguments/g)).toHaveLength(1);
       expect(recovered).not.toContain("MUST_NOT_EXECUTE");
       await tui.sendText("Run the next fixture command once.");
       await tui.waitForPane((pane) => pane.includes("LATER_TURN_COMPLETE") && hasEmptyComposer(pane), 15_000);
-      expect((await tui.captureFullScrollback()).match(/Failed shell request: invalid JSON arguments/g)).toHaveLength(1);
+      expect((await tui.captureFullScrollback()).match(/failed shell request: invalid JSON arguments/g)).toHaveLength(1);
       await tui.sendText("/trace");
       await tui.waitForText("Trace saved at", 10_000);
       const report = readTraceReport(latestTraceReportPath(root.root));
@@ -7700,7 +7700,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
           };
           expect(result.code).toBe(0);
           if (turn === 1) {
-            expect(result.stderr).toContain("Reading typed-first.txt");
+            expect(result.stderr).toContain("reading typed-first.txt");
           } else {
             expect(result.stderr).toBe("");
           }
@@ -8315,7 +8315,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
           expect(resumed.code).toBe(0);
           // Compaction folded the command into T1, so the read has no call
           // left to name.
-          expect(resumed.stderr).toBe("Reading more command output\n");
+          expect(resumed.stderr).toBe("reading more command output\n");
           expect(JSON.parse(resumed.stdout).final_output).toBe("RETRIEVAL_RESTART_COMPLETE");
           expect(gateway.requests).toHaveLength(8);
           expect(readFileSync(join(root.workspace, "effects.txt"), "utf8")).toBe("once\n");
@@ -8635,12 +8635,12 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
           // dozen tokens of the running turn, and the turn starts with main's
           // list of subagents, which rides with its step. Then the read is
           // compacted along with the cancelled turn, and the summary has it.
-          if (trigger === "automatic" && compactions > 0 && latest.includes("Read the follow-up file") && !hasToolResult(body, "cancelled-history-wait")) {
+          if (trigger === "automatic" && compactions > 0 && latest.includes("read the follow-up file") && !hasToolResult(body, "cancelled-history-wait")) {
             expect(summarizedFollowUp).toBe(true);
             readCompacted = true;
             return fakeGatewayFinalText("CANCEL_FOLLOWUP_COMPLETE");
           }
-          if (latest.includes("Read the follow-up file")) {
+          if (latest.includes("read the follow-up file")) {
             expect(toolResultOutput(body, "cancelled-history-wait")).toBe("aborted by user");
             return fakeGatewaySse([
               { type: "tool-call", toolCallId: "cancel-follow-up-read", toolName: "read_file", input: { path: "follow-up.txt" } },
@@ -8964,7 +8964,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         expect(after).toContain('complete="true"');
         expect(before).not.toContain("tool_result_handle");
         expect(after).not.toContain("tool_result_handle");
-        expect(compactionRequest).toContain("Read the explicit skill before compaction.");
+        expect(compactionRequest).toContain("read the explicit skill before compaction.");
         expect(compactionRequest).toContain(bodySentinel);
         expect(compactionRequest).toContain(tailSentinel);
         expect(compactionRequest).toContain("<skill_content");
@@ -9754,7 +9754,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
 
       expect(result.code).toBe(0);
       // The call is answered at once; the child's answer arrives as its report.
-      expect(parentResult).toContain("Sent to echoer");
+      expect(parentResult).toContain("sent to echoer");
       expect(parentResult).not.toContain("child_id");
       expect(report).toContain("Child MCP execution complete.");
       expect(json.output).toContain("Parent sent the MCP task.");
@@ -9829,7 +9829,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       );
       expect(result.code).toBe(0);
       expect(parentResult).not.toContain("AdmissionFailed");
-      expect(parentResult).toContain("Sent to summarizer");
+      expect(parentResult).toContain("sent to summarizer");
       expect(report).toContain("Child with large MCP catalog complete.");
       expect(childRequested).toBe(true);
       expect(parseAskJson(result.stdout).tool_calls).toEqual([
@@ -10629,7 +10629,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       }
       const answer = (id: string) => String(JSON.parse(results[id]!).result);
       // The first subagent starts with no other: its answer is as before.
-      expect(answer("idle_first")).toBe("Sent to first, which works on it now. Its report arrives on its own when the work ends; keep working or end your turn.");
+      expect(answer("idle_first")).toBe("sent to first, which works on it now. Its report arrives on its own when the work ends; keep working or end your turn.");
       // A new subagent's start names the idle one.
       expect(answer("idle_second")).toContain("second is new and starts with no history.");
       expect(answer("idle_second")).toContain(`Idle subagents, each with its own context:\n- first: ${tasks.first}\n`);
@@ -10638,7 +10638,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       expect(answer("idle_third")).toContain(`Idle subagents, each with its own context:\n- first: ${tasks.first}\nGive related work`);
       expect(answer("idle_third")).not.toContain("- second");
       // A message to a subagent that exists starts its turn and names none.
-      expect(answer("idle_again")).toBe("Sent to first, which works on it now. Its report arrives on its own when the work ends; keep working or end your turn.");
+      expect(answer("idle_again")).toBe("sent to first, which works on it now. Its report arrives on its own when the work ends; keep working or end your turn.");
       // Every report of a finished work says its subagent is idle now.
       expect(reports.map((report) => report.agent).sort()).toEqual(["first", "first", "second", "third"]);
       for (const report of reports) {
@@ -11461,7 +11461,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         const pid = Number.parseInt(readFileSync(mcp.pidPath, "utf8"), 10);
 
         expect(result.code).toBe(0);
-        expect(result.stderr).toContain(`Opening ${DYNAMIC_MCP_TOOL_NAME}\n`);
+        expect(result.stderr).toContain(`opening ${DYNAMIC_MCP_TOOL_NAME}\n`);
         expect(json.output).toContain("MCP argument handling complete.");
         // The open, then the run. A run whose arguments don't parse never
         // reaches the tool, so it stays toolbox's; one the server refuses is
@@ -12850,7 +12850,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       );
       expect(result.code).toBe(0);
       expect(result.signal).toBeNull();
-      expect(result.stderr).toBe("Reading fixture.txt\nReading fixture.txt\n");
+      expect(result.stderr).toBe("reading fixture.txt\nReading fixture.txt\n");
       const json = parseAskJson(result.stdout);
       expect(json.output).toContain("Finished reading the fixture.");
       expect(json.tool_calls).toEqual([
@@ -13796,7 +13796,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       // fx never ran the first call, so the resend may call the tool again,
       // and the new call runs once.
       expect(result.code).toBe(0);
-      expect(json.output).toContain("Wrote the fixture file once.");
+      expect(json.output).toContain("wrote the fixture file once.");
       expect(json.tool_calls).toEqual([{ name: "write_file", status: "success" }]);
       expect(gateway.requestCount()).toBe(3);
       expect(gateway.requests[1]!.body).toContain("fx did not execute that call");
@@ -13848,7 +13848,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       const trace = readFileSync(tracePath, "utf8");
 
       expect(result.code).toBe(0);
-      expect(json.output).toContain("Read the notes after the malformed call.");
+      expect(json.output).toContain("read the notes after the malformed call.");
       expect(json.tool_calls).toEqual([{ name: "read_file", status: "success" }]);
       expect(json.recovery?.message ?? "").not.toContain("Tool state needs review");
       expect(gateway.requestCount()).toBe(3);
@@ -13859,7 +13859,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         '"toolChoice":{"type":"none"}',
       );
       expect(result.stderr).not.toContain("next try in");
-      expect(`${result.stdout}\n${result.stderr}`).toContain("Asking it to try again.");
+      expect(`${result.stdout}\n${result.stderr}`).toContain("asking it to try again.");
       expect(toolResultOutput(gateway.requests[2]!.body, "read_resent")).toContain(
         "malformed call fixture",
       );

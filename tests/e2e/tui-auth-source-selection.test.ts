@@ -2008,7 +2008,7 @@ tmuxTest(
             await session.sendKeys("Enter");
           }
           await session.waitForText(`${label}: Saved credential storage is unavailable`, 10_000);
-          expect(await session.captureFullScrollback()).not.toContain("Waiting for authorization");
+          expect(await session.captureFullScrollback()).not.toContain("waiting for authorization");
         }
         expect(oauth.requests).toHaveLength(0);
         expect(chatgptOauth.requests).toHaveLength(0);
@@ -2484,7 +2484,7 @@ tmuxTest(
     await session.sendKeys("Enter");
     await session.waitForText("KEPT_TEAM_RESPONSE", TIMEOUT);
     const signedIn = await session.captureFullScrollback();
-    expect(signedIn).toContain("Using Vercel team Other Team (other-team).");
+    expect(signedIn).toContain("using Vercel team Other Team (other-team).");
     expect(gateway.requests[gateway.requests.length - 1]!.headers.get("x-vercel-ai-gateway-team")).toBe("team_456");
     expect(readFileSync(stderrPath, "utf8")).toBe("");
   },
@@ -3018,7 +3018,7 @@ tmuxTest(
     await session.waitForText("SIGNED_IN_RECOVERY_RESPONSE", TIMEOUT);
     // The login was already on this team, so nothing changed.
     const signedIn = await session.captureFullScrollback();
-    expect(signedIn).toContain("Using Vercel team Vercel Labs (vercel-labs).");
+    expect(signedIn).toContain("using Vercel team Vercel Labs (vercel-labs).");
     expect(signedIn).not.toContain("auth: Using Vercel team");
     expect(signedIn).toContain("Get $150 of tokens for $30 with Vercel Token Pass.");
     // The link sits behind the name, so the address never shows.
@@ -3413,7 +3413,7 @@ tmuxTest(
     await session.sendKeys("Enter");
     await session.waitForText("SLUG_TEAM_RECOVERY_RESPONSE", TIMEOUT);
     const signedIn = await session.captureFullScrollback();
-    expect(signedIn).toContain("Using Vercel team Vercel Labs (vercel-labs).");
+    expect(signedIn).toContain("using Vercel team Vercel Labs (vercel-labs).");
     expect(signedIn).not.toContain("Changed Vercel team");
     expect(readFileSync(stderrPath, "utf8")).toBe("");
   },
@@ -3450,7 +3450,7 @@ tmuxTest(
         if (Date.now() >= refreshDueAt) throw new Error("the first turn did not start before the refresh came due");
         await Bun.sleep(25);
       }
-      await session.waitForPane((pane) => pane.includes("Thinking"), TIMEOUT);
+      await session.waitForPane((pane) => pane.includes("thinking"), TIMEOUT);
       await Bun.sleep(Math.max(0, refreshDueAt - Date.now()) + 250);
 
       const queued = "QUEUED_WHILE_REFRESH_DUE";
@@ -3652,7 +3652,7 @@ tmuxTest(
         pane.includes("Sign in with Vercel") &&
         pane.includes("TEST-CODE") &&
         pane.includes("Authorize with Vercel") &&
-        pane.includes("Waiting for authorization") &&
+        pane.includes("waiting for authorization") &&
         pane.includes("enter reopens browser · esc cancels"),
       TIMEOUT,
     );
@@ -3701,7 +3701,7 @@ tmuxTest(
       (pane) =>
         pane.includes("Sign in with Codex") &&
         pane.includes("Authorize with Codex") &&
-        pane.includes("Waiting for authorization") &&
+        pane.includes("waiting for authorization") &&
         pane.includes("enter reopens browser · esc cancels"),
       TIMEOUT,
     );
@@ -6978,7 +6978,7 @@ for (const scenario of ["replace", "conflict", "invalid-index"] as const) {
         if (conflict) expect(resultJson.error).toBe(scenario === "invalid-index" ? (provider === "codex" ? "InvalidOpenAICodexSseEvent" : "InvalidXaiGrokSseEvent") : "ResponsesToolCallConflict");
         else {
           expect(resultJson.output).toBe("FINAL_RECORD_OK");
-          expect(result.stderr).toBe("Writing final.txt\n");
+          expect(result.stderr).toBe("writing final.txt\n");
         }
         const detail = await runFx(["session", "--json", "--id", resultJson.session_id], { cwd: profile, env });
         expect(detail.code).toBe(0);
@@ -7052,7 +7052,7 @@ test("native assistant messages keep their boundaries and phases through tools a
       expect(direct.bodies).toHaveLength(2);
       const resumed = await runFx(["ask", "--json", "--auto", "--resume", result.session_id, "What was the value?"], { cwd: profile, env, timeoutMs: TIMEOUT });
       expect(resumed.code, resumed.stdout + resumed.stderr).toBe(0);
-      expect(JSON.parse(resumed.stdout).output).toBe("Still 42.");
+      expect(JSON.parse(resumed.stdout).output).toBe("still 42.");
       expect(direct.bodies).toHaveLength(3);
       for (const [index, body] of direct.bodies.slice(1).entries()) {
         const input = JSON.parse(body).input;
@@ -7199,7 +7199,7 @@ test("native final snapshots preserve completed items and reject conflicting kin
         expect(trace).not.toContain("after_tool_execution");
         expect(result.output).not.toContain("CONFLICTING_TEXT");
       } else {
-        expect(result.output).toBe("Inspecting.\n\nSNAPSHOT_OK");
+        expect(result.output).toBe("inspecting.\n\nSNAPSHOT_OK");
         expect(result.tool_calls).toEqual([{ name: "read_file", status: "success" }]);
         expect(trace).toContain("after_tool_execution");
       }
@@ -7223,7 +7223,7 @@ test("native final snapshots preserve completed items and reject conflicting kin
         if (!conflict) {
           expect(outputs[0].output).toContain("SNAPSHOT_READ_RESULT");
           expect(input.filter((item: { type?: string }) => item.type === "reasoning")).toEqual([reasoning]);
-          expect(input.find((item: { phase?: string }) => item.phase === "commentary").content[0].text).toBe("Inspecting.");
+          expect(input.find((item: { phase?: string }) => item.phase === "commentary").content[0].text).toBe("inspecting.");
         }
       }
       expect(gateway.requests).toHaveLength(0);
@@ -8988,7 +8988,7 @@ tmuxTest(
     await session.sendKeys("C-u");
     await session.sendKeys("C-k");
     await session.waitForPane(
-      (pane) => pane.includes("fx login sign-in expired.") && !pane.includes("Thinking"),
+      (pane) => pane.includes("fx login sign-in expired.") && !pane.includes("thinking"),
       TIMEOUT,
     );
     expect(oauth.requests.filter((request) => request.grantType === "refresh_token")).toHaveLength(1);
@@ -9003,7 +9003,7 @@ tmuxTest(
     const firstOutput = frames.slice(enter + 1).find((frame) => frame.kind === 1);
     expect(firstOutput).toBeDefined();
     expect(firstOutput!.payload.includes(prompt)).toBe(true);
-    expect(firstOutput!.payload.includes("Thinking")).toBe(true);
+    expect(firstOutput!.payload.includes("thinking")).toBe(true);
 
     const replay = await runFx(["replay", tapePath, "--frames-dir", replayPath]);
     expect(replay.code).toBe(0);
@@ -9011,7 +9011,7 @@ tmuxTest(
       .filter((name) => name.endsWith(".grid.txt"))
       .sort()
       .map((name) => readFileSync(join(replayPath, "frames", name), "utf8"));
-    const thinkingGrids = grids.filter((grid) => grid.includes("Thinking"));
+    const thinkingGrids = grids.filter((grid) => grid.includes("thinking"));
     expect(thinkingGrids.length).toBeGreaterThan(0);
     for (const grid of thinkingGrids) {
       const rows = grid.split("\n");
@@ -9021,7 +9021,7 @@ tmuxTest(
     }
 
     await session.sendKeys("Enter");
-    await session.waitForText("Waiting for authorization", TIMEOUT);
+    await session.waitForText("waiting for authorization", TIMEOUT);
     expect(oauth.requests.filter((request) => request.grantType === "refresh_token")).toHaveLength(1);
 
     await session.waitForText("Team Harness", TIMEOUT);
@@ -9059,7 +9059,7 @@ tmuxTest(
     expect(oauth.requests.filter((request) => request.grantType === "refresh_token")).toHaveLength(1);
 
     await session.sendKeys("Enter");
-    await session.waitForText("Waiting for authorization", TIMEOUT);
+    await session.waitForText("waiting for authorization", TIMEOUT);
     expect(oauth.requests.filter((request) => request.path === "/oauth/device")).toHaveLength(1);
     await session.sendKeys("Escape");
     await session.waitForPane(
@@ -9079,7 +9079,7 @@ tmuxTest(
       TIMEOUT,
     );
     await session.sendKeys("Enter");
-    await session.waitForText("Waiting for authorization", TIMEOUT);
+    await session.waitForText("waiting for authorization", TIMEOUT);
 
     expect(oauth.requests.filter((request) => request.path === "/oauth/device")).toHaveLength(2);
     expect(oauth.requests.filter((request) => request.grantType === "refresh_token")).toHaveLength(1);
@@ -9130,7 +9130,7 @@ tmuxTest(
       TIMEOUT,
     );
     await session.sendKeys("Enter");
-    await session.waitForText("Waiting for authorization", TIMEOUT);
+    await session.waitForText("waiting for authorization", TIMEOUT);
 
     expect(oauth.requests.filter((request) => request.grantType === "refresh_token")).toHaveLength(1);
     expect(oauth.requests.filter((request) => request.path === "/oauth/device")).toHaveLength(1);
@@ -9168,13 +9168,13 @@ tmuxTest(
       TIMEOUT,
     );
     await session.sendKeys("Enter");
-    await session.waitForText("Waiting for authorization", TIMEOUT);
+    await session.waitForText("waiting for authorization", TIMEOUT);
 
     expect(oauth.requests.filter((request) => request.grantType === "refresh_token")).toHaveLength(1);
     expect(oauth.requests.filter((request) => request.path === "/oauth/device")).toHaveLength(1);
     await session.sendKeys("Escape");
     await session.waitForPane(
-      (pane) => !pane.includes("Waiting for authorization"),
+      (pane) => !pane.includes("waiting for authorization"),
       TIMEOUT,
     );
     await session.sendKeys("C-u");
@@ -9189,7 +9189,7 @@ tmuxTest(
       TIMEOUT,
     );
     await session.sendKeys("Enter");
-    await session.waitForText("Waiting for authorization", TIMEOUT);
+    await session.waitForText("waiting for authorization", TIMEOUT);
 
     expect(oauth.requests.filter((request) => request.grantType === "refresh_token")).toHaveLength(1);
     expect(oauth.requests.filter((request) => request.path === "/oauth/device")).toHaveLength(2);
@@ -9842,11 +9842,11 @@ tmuxTest(
     const pane = await session.waitForPane(
       (text) =>
         text.includes(FAKE_GATEWAY_MODEL) &&
-        text.includes("Using the public model catalog; sign in or use an API key for team-private models."),
+        text.includes("using the public model catalog; sign in or use an API key for team-private models."),
       TIMEOUT,
     );
     expect(pane).toContain(FAKE_GATEWAY_MODEL);
-    expect(pane).toContain("Using the public model catalog; sign in or use an API key for team-private models.");
+    expect(pane).toContain("using the public model catalog; sign in or use an API key for team-private models.");
 
     expect(gateway.requests).toHaveLength(0);
     expect(gateway.modelRequests).toHaveLength(1);

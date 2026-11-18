@@ -386,7 +386,7 @@ test.skipIf(!tmuxAvailable())("a level chosen during a turn applies to the next 
   });
   const { session, gateway } = current;
   await session.sendText("first question");
-  await session.waitForText("Thinking", 10_000);
+  await session.waitForText("thinking", 10_000);
   await session.sendText("/effort");
   await waitForEffortMenu(current);
   await press(session, "Up");
@@ -408,7 +408,7 @@ test.skipIf(!tmuxAvailable())("a level chosen during a turn applies to the next 
   expect(bodies[second]?.reasoning).toBe("xhigh");
   // The menu opened over the running turn, above its activity row.
   const views = menuViews(current, "turn");
-  expect(views[0]?.grid.some((row) => row.includes("Thinking"))).toBe(true);
+  expect(views[0]?.grid.some((row) => row.includes("thinking"))).toBe(true);
 }, TIMEOUT);
 
 test.skipIf(!tmuxAvailable())("a short terminal shows one level at a time, ↓ scrolls to the last, and the transcript stays in view", async () => {

@@ -1234,7 +1234,7 @@ describe("modern MCP Streamable HTTP", () => {
       ).toBe(true);
 
       await tui.sendInterruptEscapePair(10_000);
-      await tui.waitForText(`Cancelled ${TOOL_NAME}`, 10_000);
+      await tui.waitForText(`cancelled ${TOOL_NAME}`, 10_000);
       const cancelDeadline = Date.now() + 5_000;
       while (fixture.cancelledCalls === 0 && Date.now() < cancelDeadline) {
         await Bun.sleep(25);

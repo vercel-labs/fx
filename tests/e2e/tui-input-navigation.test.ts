@@ -250,7 +250,7 @@ async function setupMultilinePromptHistory(active: TmuxSession): Promise<void> {
     (pane) =>
       gateway?.requests.length === 2 &&
       pane.includes("┃") &&
-      !pane.includes("Thinking"),
+      !pane.includes("thinking"),
     READY_TIMEOUT,
   );
 }

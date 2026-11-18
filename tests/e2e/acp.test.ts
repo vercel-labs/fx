@@ -1209,7 +1209,7 @@ test("ACP finishes tool calls that a cancel stopped before they ran", async () =
     expect(slowFinals.map((update: any) => update.status)).toEqual(["failed"]);
     const skipped = updates("call_skipped");
     expect(skipped.map((update: any) => update.status)).toEqual(["pending", "failed"]);
-    expect(acpContentText(skipped[1].content)).toBe("Cancelled");
+    expect(acpContentText(skipped[1].content)).toBe("cancelled");
     expect(client.stderr).toBe("");
   } finally {
     await client?.close();

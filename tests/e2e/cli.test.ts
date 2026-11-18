@@ -5514,7 +5514,7 @@ describe("cli: ask success", () => {
           expect(result.stdout).toBe(answer);
         }
         if (toolLoop) {
-          expect(result.stderr).toContain("Reading fixture.txt");
+          expect(result.stderr).toContain("reading fixture.txt");
           expect(gateway.requests[1]!.body).toContain("usage fixture contents");
         } else {
           expect(result.stderr).toBe("");

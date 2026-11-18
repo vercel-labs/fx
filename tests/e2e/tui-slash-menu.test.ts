@@ -1360,7 +1360,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       await session.sendText("Print the deterministic slash footer transcript fixture.");
       await session.waitForText("SLASH_FOOTER_E2E_082", 30_000);
       await session.waitForPane(
-        (pane) => !pane.includes("esc interrupt") && !pane.includes("Thinking"),
+        (pane) => !pane.includes("esc interrupt") && !pane.includes("thinking"),
         5_000,
       );
       await Bun.sleep(300);
@@ -3340,7 +3340,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
         });
         await session.waitForComposer(10_000);
         await session.sendText("Keep this model turn active.");
-        await session.waitForText("Thinking", 10_000);
+        await session.waitForText("thinking", 10_000);
 
         await session.sendLiteralText("/model");
         await session.sendKeys("Tab");
@@ -4382,7 +4382,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       await session.waitForComposer(10_000);
 
       await session.sendText("Request the catalog approval fixture.");
-      await session.waitForText("Thinking", 10_000);
+      await session.waitForText("thinking", 10_000);
       await session.sendLiteralText("$");
       await waitForSkillsMenu(session, 4);
 

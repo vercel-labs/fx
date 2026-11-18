@@ -1248,7 +1248,7 @@ describe("filesystem path handling", () => {
             expect(classifiedJson.tool_calls).toEqual([
               { name: "write_file", status: "success" },
             ]);
-            expect(classified.stderr.match(/^Writing /gm)).toHaveLength(1);
+            expect(classified.stderr.match(/^writing /gm)).toHaveLength(1);
             expect(classified.stderr).not.toContain("Auto agent approved this request");
             expect(readFileSync(scenario.target, "utf8")).toBe("CLASSIFIED_CONTENT");
           } finally {

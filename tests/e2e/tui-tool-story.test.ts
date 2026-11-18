@@ -195,7 +195,7 @@ test.skipIf(!tmuxAvailable())(
     });
     const lines = paneLines(pane);
 
-    const checks = group(lines, "● Ran commands ✗");
+    const checks = group(lines, "● ran commands ✗");
     // The two passing checks share a row by their step; the failure keeps
     // its own, with the error's line after it.
     expect(treeRows(checks)).toEqual([
@@ -205,15 +205,15 @@ test.skipIf(!tmuxAvailable())(
     expect(checks.some((line) => line.includes("✗ exit"))).toBe(false);
 
     // Edits come first; the other kinds tie, and the fourth is "more".
-    const fix = group(lines, "● Edited a file, ran a command, read a file, and more ✓");
+    const fix = group(lines, "● edited a file, ran a command, read a file, and more ✓");
     const fixRows = treeRows(fix);
     expect(fixRows).toHaveLength(4);
-    expect(fixRows[0]).toStartWith("├ Searched");
+    expect(fixRows[0]).toStartWith("├ searched");
     // A read shows the file by name.
-    expect(fixRows[1]).toBe("├ Read window.ts");
+    expect(fixRows[1]).toBe("├ read window.ts");
     // An edit shows the file by name, with its counts.
-    expect(fixRows[2]).toBe("├ Edited main.ts +1/-1");
-    expect(fixRows[3]).toBe("└ Ran sh build.sh");
+    expect(fixRows[2]).toBe("├ edited main.ts +1/-1");
+    expect(fixRows[3]).toBe("└ ran sh build.sh");
     expect(lines.some((line) => /^ {2}1 file changed \+1 -1 · ran 4 commands · /.test(line))).toBe(true);
     expect(lines.some((line) => / tool calls? · /.test(line))).toBe(false);
 
@@ -230,8 +230,8 @@ test.skipIf(!tmuxAvailable())(
     sessions.push(resumed);
     await resumed.waitForText("Fixed the build.", TIMEOUT);
     const resumedLines = paneLines(await resumed.waitForComposer(TIMEOUT));
-    expect(group(resumedLines, "● Ran commands ✗")).toEqual(checks);
-    expect(group(resumedLines, "● Edited a file, ran a command, read a file, and more ✓")).toEqual(fix);
+    expect(group(resumedLines, "● ran commands ✗")).toEqual(checks);
+    expect(group(resumedLines, "● edited a file, ran a command, read a file, and more ✓")).toEqual(fix);
   },
   TIMEOUT * 3,
 );
@@ -281,13 +281,13 @@ test.skipIf(!tmuxAvailable())(
     await session.waitForText("The readme says hello.", TIMEOUT);
 
     const expectReadUnderMessage = (lines: string[]) => {
-      const message = lines.findIndex((line) => line.includes("Read it again."));
+      const message = lines.findIndex((line) => line.includes("read it again."));
       expect(message).toBeGreaterThan(0);
       // The first read keeps its own row, without the later one.
-      expect(lines.slice(0, message)).toContain("├ Read README.md");
+      expect(lines.slice(0, message)).toContain("├ read README.md");
       expect(lines.some((line) => line.includes("· 2 parts"))).toBe(false);
       // The later read shows under the message that asked for it.
-      expect(lines.slice(message + 1)).toContain("● Read README.md");
+      expect(lines.slice(message + 1)).toContain("● read README.md");
     };
     expectReadUnderMessage(paneLines(await session.waitForComposer(TIMEOUT)));
 
@@ -317,9 +317,9 @@ test.skipIf(!tmuxAvailable())(
       settings: { collapse_tool_calls: true },
     });
     const lines = paneLines(pane);
-    expect(lines).toContain("● Ran commands ✗");
+    expect(lines).toContain("● ran commands ✗");
     // With no rows to show them, the header keeps the edit's counts.
-    expect(lines).toContain("● Edited a file +1 -1, ran a command, read a file, and more ✓");
+    expect(lines).toContain("● edited a file +1 -1, ran a command, read a file, and more ✓");
     expect(lines.filter((line) => line.startsWith("├ ") || line.startsWith("└ "))).toEqual([]);
   },
   TIMEOUT * 2,
@@ -334,14 +334,14 @@ test.skipIf(!tmuxAvailable())(
       height: 100,
     });
     const lines = paneLines(pane);
-    expect(lines).toContain("● Ran sh test.sh ×3 · passed on the 3rd run ✓");
-    expect(lines).toContain("● Read main.ts · 3 parts");
+    expect(lines).toContain("● ran sh test.sh ×3 · passed on the 3rd run ✓");
+    expect(lines).toContain("● read main.ts · 3 parts");
     expect(lines.filter((line) => line.includes("sh test.sh"))).toHaveLength(1);
 
     await session.sendKeys("C-o");
     const full = await session.waitForText("esc close", TIMEOUT);
     expect(full.split("sh test.sh").length - 1).toBeGreaterThanOrEqual(3);
-    expect(full.split("Read desktop/src/main.ts").length - 1).toBeGreaterThanOrEqual(3);
+    expect(full.split("read desktop/src/main.ts").length - 1).toBeGreaterThanOrEqual(3);
   },
   TIMEOUT * 2,
 );
@@ -355,14 +355,14 @@ test.skipIf(!tmuxAvailable())(
     });
     const lines = paneLines(pane);
     // The row names both folders the pattern was searched in.
-    expect(treeRows(group(lines, "● Searched"))).toEqual([
+    expect(treeRows(group(lines, "● searched"))).toEqual([
       "├ Searched createWindow in src, desktop",
       "└ Matched *.ts",
     ]);
 
     await session.sendKeys("C-o");
     const full = await session.waitForText("esc close", TIMEOUT);
-    expect(full.split("Searched createWindow").length - 1).toBeGreaterThanOrEqual(2);
+    expect(full.split("searched createWindow").length - 1).toBeGreaterThanOrEqual(2);
   },
   TIMEOUT * 2,
 );
@@ -379,7 +379,7 @@ test.skipIf(!tmuxAvailable())(
     // them, where it was last read or searched, so window.ts, read again
     // after main.ts, comes last. The header names the kinds of work with no
     // counts.
-    expect(treeRows(group(lines, "● Read files, searched, ran a command ✓"))).toEqual([
+    expect(treeRows(group(lines, "● read files, searched, ran a command ✓"))).toEqual([
       "├ Read main.ts, window.ts",
       "├ Searched createWindow, BrowserWindow",
       "└ Ran sh check.sh status",
@@ -403,7 +403,7 @@ test.skipIf(!tmuxAvailable())(
     });
     const lines = paneLines(pane);
     // The two waits share one row; the status keeps its own.
-    const rows = treeRows(group(lines, "● Started subagents"));
+    const rows = treeRows(group(lines, "● started subagents"));
     expect(rows).toHaveLength(4);
     // Each row names the action and the subagent, with no message; Ctrl+O
     // shows the message.

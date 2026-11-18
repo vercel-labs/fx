@@ -1268,8 +1268,8 @@ describe("MCP login", () => {
     // The server refuses the new login now.
     auth.validTokens.delete(ACCESS_REFRESHED);
     writeFileSync(release, "go");
-    await tui.waitForText(`Couldn't sign in to fixture: ${REFUSED_NEW}.`, 20_000);
-    expect(await tui.captureFullScrollback()).not.toContain("Signed in to fixture");
+    await tui.waitForText(`couldn't sign in to fixture: ${REFUSED_NEW}.`, 20_000);
+    expect(await tui.captureFullScrollback()).not.toContain("signed in to fixture");
     expect(readFileSync(storePath, "utf8")).toBe(before);
   }, 120_000);
 
@@ -1569,7 +1569,7 @@ describe("MCP login", () => {
     await tui.sendText("/mcp list");
     await tui.waitForText("TRANSPORT  STATUS", 15_000);
     writeFileSync(release, "go");
-    await tui.waitForText("Signed in to fixture.", 20_000);
+    await tui.waitForText("signed in to fixture.", 20_000);
     // The server was never asked with the other login: the new one was kept, then saved.
     expect(auth.requests.some((r) => r.authorization === `Bearer ${other}`)).toBe(false);
     expect(auth.requests.some((r) => r.authorization === `Bearer ${ACCESS_REFRESHED}`)).toBe(true);
@@ -1597,11 +1597,11 @@ describe("MCP login", () => {
     await tui.sendText("/mcp login fixture");
     expect(await waitForFile(started, 20_000)).toBe(true);
     await tui.sendText("/mcp logout fixture");
-    await tui.waitForText("Couldn't sign in to fixture: signed out before the server answered.", 15_000);
+    await tui.waitForText("couldn't sign in to fixture: signed out before the server answered.", 15_000);
     // The server answers the held request now, to a login that is gone.
     writeFileSync(release, "go");
     await Bun.sleep(2_000);
-    expect(await tui.captureFullScrollback()).not.toContain("Signed in to fixture");
+    expect(await tui.captureFullScrollback()).not.toContain("signed in to fixture");
     const storePath = join(root.home, ".fx", "mcp-credentials", "credentials-v3.json");
     expect(existsSync(storePath) ? readFileSync(storePath, "utf8") : "").not.toContain(ACCESS_REFRESHED);
     await tui.waitForComposer(10_000);
@@ -1633,8 +1633,8 @@ describe("MCP login", () => {
     options.rotateAuthorizationToken = true;
     await tui.waitForComposer(10_000);
     await tui.sendText("/mcp login fixture");
-    await tui.waitForText(`Couldn't sign in to fixture: ${REFUSED_NEW}.`, 20_000);
-    expect(await tui.captureFullScrollback()).not.toContain("Signed in to fixture");
+    await tui.waitForText(`couldn't sign in to fixture: ${REFUSED_NEW}.`, 20_000);
+    expect(await tui.captureFullScrollback()).not.toContain("signed in to fixture");
     // The server comes back up on the saved login that worked. No sign-in happened, so neither the
     // footer nor the transcript says the person signed in.
     await tui.waitForComposer(10_000);
@@ -1642,10 +1642,10 @@ describe("MCP login", () => {
     await tui.waitForText(/status +ready/, 20_000);
     const quiet = Date.now() + 2_500;
     while (Date.now() < quiet) {
-      expect(await tui.capturePane()).not.toContain("Signed in to fixture");
+      expect(await tui.capturePane()).not.toContain("signed in to fixture");
       await Bun.sleep(250);
     }
-    expect(await tui.captureFullScrollback()).not.toContain("Signed in to fixture");
+    expect(await tui.captureFullScrollback()).not.toContain("signed in to fixture");
     // The login the store holds is still the one that worked.
     const show = await runFx(["mcp", "show", "fixture"], { cwd: root.workspace, env, timeoutMs: 30_000 });
     expect(show.code).toBe(0);
@@ -1668,7 +1668,7 @@ describe("MCP login", () => {
     });
     await tui.waitForComposer(15_000);
     await tui.sendText("/mcp login fixture");
-    await tui.waitForText(`Couldn't sign in to fixture: ${REFUSED_NEW}.`, 20_000);
+    await tui.waitForText(`couldn't sign in to fixture: ${REFUSED_NEW}.`, 20_000);
     await tui.waitForComposer(10_000);
     // Long after, another fx saves a login the server takes.
     await Bun.sleep(35_000);
@@ -1676,7 +1676,7 @@ describe("MCP login", () => {
     seedV2Credential(root, auth, { refresh: null });
     // `/mcp list` reads the saved logins again before it shows the servers (`pickUpLogins`).
     await tui.sendText("/mcp list");
-    await tui.waitForText("Signed in to fixture.", 20_000);
+    await tui.waitForText("signed in to fixture.", 20_000);
   }, 120_000);
 
   test("fx mcp login --no-browser takes the address pasted back", async () => {
@@ -1974,7 +1974,7 @@ describe("MCP login", () => {
     await tui.sendText("/mcp login fixture");
     await tui.waitForText("Sign in to fixture in your browser.", 10_000);
     // The fake browser approves on its own; the shell says so without a keypress.
-    await tui.waitForText("Signed in to fixture.", 15_000);
+    await tui.waitForText("signed in to fixture.", 15_000);
     expect(auth.tokenExchanges).toBe(1);
     await tui.sendText("/mcp list");
     // The sign-in ended when the server answered a request with the new login, so it is up.
@@ -2068,7 +2068,7 @@ describe("MCP login", () => {
     const back = approved.headers.get("location")!;
     expect(new URL(back).hostname).toBe("127.0.0.1");
     await fetch(back);
-    await tui.waitForText("Signed in to fixture.", 15_000);
+    await tui.waitForText("signed in to fixture.", 15_000);
     expect(auth.tokenExchanges).toBe(1);
     // In the transcript, not only on the status line.
     expect((await transcript()).join("\n")).toContain("Signed in to fixture.");
@@ -2126,8 +2126,8 @@ describe("MCP login", () => {
     // The news waits on the status line for a few seconds, then goes. It was
     // never printed in the transcript, and with nothing wrong the status line
     // says nothing about MCP.
-    await tui.waitForText("Signed in to fixture.", 3_000);
-    await tui.waitForPane((pane) => !pane.includes("Signed in to fixture."), 10_000);
+    await tui.waitForText("signed in to fixture.", 3_000);
+    await tui.waitForPane((pane) => !pane.includes("signed in to fixture."), 10_000);
     expect(await tui.capturePane()).not.toMatch(/mcp \d+\/\d+/);
     const ready = await captureTrace();
     const server = ready.one("mcp_server");
@@ -2155,7 +2155,7 @@ describe("MCP login", () => {
     // No browser opens, so the sign-in waits, and the screen says what for in
     // one line, like the transcript: its label links the address.
     await tui.sendKeys("Enter");
-    await tui.waitForText("Waiting for the browser. Didn't open? Open the sign-in page.", 10_000);
+    await tui.waitForText("waiting for the browser. Didn't open? Open the sign-in page.", 10_000);
     const pane = await tui.capturePane();
     expect(pane).not.toContain("/authorize?");
     expect(pane).not.toContain("its tools show here once you log in.");
@@ -2183,10 +2183,10 @@ describe("MCP login", () => {
     await tui.waitForText("  Log in        /mcp login fixture", 15_000);
     await tui.sendKeys("Enter");
     await tui.waitForText("Signing in…", 1_500);
-    expect(await tui.capturePane()).not.toContain("Waiting for the browser");
+    expect(await tui.capturePane()).not.toContain("waiting for the browser");
     // Pressed again while the sign-in server is slow, then once its address shows.
     await tui.sendKeys("Enter");
-    await tui.waitForText("Waiting for the browser. Didn't open? Open the sign-in page.", 15_000);
+    await tui.waitForText("waiting for the browser. Didn't open? Open the sign-in page.", 15_000);
     await tui.sendKeys("Enter");
     await Bun.sleep(500);
 
@@ -2228,11 +2228,11 @@ describe("MCP login", () => {
     await tui.waitForText("Added web to ~/.fx/mcp.json.", 10_000);
     await Bun.sleep(1_000);
     expect(await tui.capturePane()).toContain("Signing in to fixture");
-    expect(await tui.captureFullScrollback()).not.toContain("Couldn't sign in to fixture");
+    expect(await tui.captureFullScrollback()).not.toContain("couldn't sign in to fixture");
 
     // Removing the server it signs in to ends it.
     await tui.sendText("/mcp remove fixture");
-    await tui.waitForText("Couldn't sign in to fixture: the MCP config changed before the browser came back.", 10_000);
+    await tui.waitForText("couldn't sign in to fixture: the MCP config changed before the browser came back.", 10_000);
     // The status line catches up within its 250 ms refresh.
     const clearBy = Date.now() + 2_000;
     while ((await tui.capturePane()).includes("Signing in to fixture") && Date.now() < clearBy) await Bun.sleep(50);
@@ -3029,7 +3029,7 @@ describe("MCP login", () => {
     chmodSync(storePath, 0o400);
     const done = await runFx(["mcp", "logout", "fixture"], { cwd: root.workspace, env: v2Env(root), timeoutMs: 20_000 });
     expect(done.stdout).toBe("");
-    expect(done.stderr).toBe("Couldn't sign out of fixture: ~/.fx/mcp-credentials/credentials-v3.json couldn't be written: fx isn't allowed to write it. Try again once that's fixed.\n");
+    expect(done.stderr).toBe("couldn't sign out of fixture: ~/.fx/mcp-credentials/credentials-v3.json couldn't be written: fx isn't allowed to write it. Try again once that's fixed.\n");
     expect(done.code).toBe(1);
     expect(readFileSync(storePath, "utf8")).toContain(ACCESS_INITIAL);
   }, 60_000);
@@ -3064,7 +3064,7 @@ describe("MCP login", () => {
     const done = await runFx(["mcp", "logout", "fixture"], { cwd: root.workspace, env: v2Env(root), timeoutMs: 20_000 });
     holder.kill();
     expect(done.stdout).toBe("");
-    expect(done.stderr).toBe("Couldn't sign out of fixture: ~/.fx/mcp-credentials/credentials-v3.json couldn't be written: another fx kept it busy. Try again once that's fixed.\n");
+    expect(done.stderr).toBe("couldn't sign out of fixture: ~/.fx/mcp-credentials/credentials-v3.json couldn't be written: another fx kept it busy. Try again once that's fixed.\n");
     expect(done.code).toBe(1);
     expect(readFileSync(storePath, "utf8")).toContain(ACCESS_INITIAL);
   }, 60_000);
@@ -3558,7 +3558,7 @@ describe("MCP login", () => {
     const renewalStarted = Date.now();
 
     await tui.sendInterruptEscapePair(10_000);
-    await tui.waitForText(`Cancelled ${TOOL_NAME}`, 10_000);
+    await tui.waitForText(`cancelled ${TOOL_NAME}`, 10_000);
     expect(auth.protectedToolCalls).toBe(0);
     expect(upstream.requests.some((entry) => entry.message.method === "tools/call")).toBe(false);
     expect(readFileSync(store, "utf8")).toContain(ACCESS_INITIAL);

@@ -202,7 +202,7 @@ describe("poisoned repository", () => {
       );
       expect(result.code, result.stderr).toBe(0);
       // `fx ask` reports each tool's activity on stderr.
-      expect(result.stderr).toContain("Running git status --short");
+      expect(result.stderr).toContain("running git status --short");
       expect(result.stderr).not.toMatch(/panic|error/i);
       expect(sentinelRuns(fixture)).toEqual([]);
       expect(gateway.classifierRequests).toHaveLength(0);

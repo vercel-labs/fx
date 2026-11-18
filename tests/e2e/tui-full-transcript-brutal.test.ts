@@ -994,7 +994,7 @@ async function runStress(config: StressConfig): Promise<StressRoot> {
     expect(readFileSync(paths.stderrPath, "utf8")).toBe("");
 
     await session.sendText("Run the prepared live command while I inspect the transcript.");
-    await session.waitForText("Running ./ctrl-o-live.sh", TIMEOUT);
+    await session.waitForText("running ./ctrl-o-live.sh", TIMEOUT);
     await session.sendLiteralText(DRAFT);
     await waitForMode(session, "main", DRAFT);
     const pid = fxProcessId(session);

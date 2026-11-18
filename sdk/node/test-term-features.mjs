@@ -202,7 +202,7 @@ async function runUltrafastTerminal(scenario) {
   async function prompt(text) {
     const count = posts.length + 1;
     runtime.write(`${text}\r`);
-    await waitFor(() => grid().includes(`ultra answer ${count}`) && !grid().includes("Thinking"), "completed reply");
+    await waitFor(() => grid().includes(`ultra answer ${count}`) && !grid().includes("thinking"), "completed reply");
     assert.equal(posts.length, count);
     return posts.at(-1);
   }
@@ -228,7 +228,7 @@ async function runUltrafastTerminal(scenario) {
       await waitFor(() => gets === 1, "pending catalog request");
       assert.equal(posts.length, 0);
       runtime.write("\x03");
-      await waitFor(() => grid().includes("Cancelled") || grid().includes("cancelled"), "cancelled turn");
+      await waitFor(() => grid().includes("cancelled") || grid().includes("cancelled"), "cancelled turn");
       assert.equal(catalogAborted, 1);
       assert.equal(posts.length, 0);
       runtime.write("/ultrafast off\r");
@@ -390,7 +390,7 @@ async function runFastTerminal(scenario, sessionStore = createFastSessionStore()
   async function prompt(text) {
     const count = posts.length + 1;
     runtime.write(`${text}\r`);
-    await waitFor(() => posts.length === count && grid().includes(`${scenario} fast answer ${count}`) && !grid().includes("Thinking"), "completed reply");
+    await waitFor(() => posts.length === count && grid().includes(`${scenario} fast answer ${count}`) && !grid().includes("thinking"), "completed reply");
     assert.equal(posts.length, count);
     assert.ok(JSON.stringify(posts.at(-1).prompt).includes(text), "the reply must belong to the submitted prompt");
     return posts.at(-1);
@@ -416,7 +416,7 @@ async function runFastTerminal(scenario, sessionStore = createFastSessionStore()
       await waitFor(() => gets === 1, "pending catalog request");
       assert.equal(posts.length, 0);
       runtime.write("\x03");
-      await waitFor(() => catalogSignal.aborted && (grid().includes("Cancelled") || grid().includes("cancelled")), "cancelled turn");
+      await waitFor(() => catalogSignal.aborted && (grid().includes("cancelled") || grid().includes("cancelled")), "cancelled turn");
       assert.equal(catalogAborted, 1);
       assert.equal(posts.length, 0, "cancelled metadata resolution must not send a model request");
       await toggle(false);

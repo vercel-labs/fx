@@ -1478,7 +1478,7 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
           }
           return text("child_answer", "SWITCH_CHILD_FIRST");
         }
-        if (body.includes("Stopped reviewer: its turn ended")) return text("main_stopped", "SWITCH_MAIN_STOPPED");
+        if (body.includes("stopped reviewer: its turn ended")) return text("main_stopped", "SWITCH_MAIN_STOPPED");
         if (body.includes("reviewer was not working")) return text("main_not", "SWITCH_MAIN_NOT_STOPPED");
         if (latestUserText(body).includes("SWITCH_USER_STOP")) {
           return toolCall("main_stop", "subagent", { request: { action: "stop", agent: "reviewer" } });
@@ -2776,16 +2776,16 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         }, async (session) => {
           await session.sendText("SWITCH_USER start the reviewer and the builder");
           // The name has arrived and the rest of the call has not.
-          await session.waitForText("Managing reviewer", 15_000);
+          await session.waitForText("managing reviewer", 15_000);
           nameSent.release();
           await session.waitForText("Messaged reviewer", 15_000);
           // Both are working when main checks on them and then waits.
           await session.waitForText("Checked reviewer, builder", 15_000);
-          await session.waitForText("Waiting for reviewer, builder", 15_000);
+          await session.waitForText("waiting for reviewer, builder", 15_000);
           children.reviewer.release();
           children.builder.release();
           const done = await session.waitForPane((pane) => pane.includes("Waited for reviewer, builder"), 30_000);
-          expect(done).not.toContain("Waiting for subagents");
+          expect(done).not.toContain("waiting for subagents");
           expect(await session.captureFullScrollback()).not.toContain("Checked subagents");
         });
       } finally {
@@ -3207,7 +3207,7 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         const list = await session.waitForPane((pane) =>
           /^ {2}[\u251c\u2514] worker .*working \d+s\b/m.test(pane), 15_000);
         const workerRow = list.split("\n").find((line) => /^ {2}[\u251c\u2514] worker /.test(line)) ?? "";
-        expect(workerRow).not.toContain("Waiting for");
+        expect(workerRow).not.toContain("waiting for");
         expect(workerRow).not.toContain("TUI-QUIET-READY");
         await session.sendKeys("Escape");
         await session.waitForPane((pane) => !pane.includes(LIST_HINT), 10_000);

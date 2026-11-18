@@ -28,8 +28,8 @@ async function runWithoutGatewayAuth(args: string[]) {
 }
 
 function expectNoFetchProgress(stderr: string) {
-  expect(stderr).not.toContain("Fetching ");
-  expect(stderr).not.toContain("Converting ");
+  expect(stderr).not.toContain("fetching ");
+  expect(stderr).not.toContain("converting ");
   expect(stderr).not.toContain("Extracting ");
 }
 

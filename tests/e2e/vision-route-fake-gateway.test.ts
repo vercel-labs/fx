@@ -856,7 +856,7 @@ describe("Vision route fake Gateway", () => {
         expect(JSON.stringify(retryPrompt.at(-1))).toContain(
           "Continue from the preceding tool result.",
         );
-        expect(result.stderr).toBe("Inspecting images\n");
+        expect(result.stderr).toBe("inspecting images\n");
       } finally {
         gateway.stop();
         rmSync(root.root, { recursive: true, force: true });
@@ -1602,7 +1602,7 @@ describe("Vision route fake Gateway", () => {
         expect(firstJson.session_id.length).toBeGreaterThan(0);
         expect(firstJson.output).toContain("Gemini recovered after rejected Vision");
         expect(firstJson.tool_calls).toContainEqual({ name: "vision", status: "error" });
-        expect(first.stderr).not.toContain("Inspecting images");
+        expect(first.stderr).not.toContain("inspecting images");
         expect(first.stderr).not.toContain("Vision is unavailable right now");
         expect(gateway.chatRequests).toHaveLength(2);
         expect(gateway.chatRequests[0].body).not.toContain('"name":"vision"');
@@ -1825,7 +1825,7 @@ describe("Vision route fake Gateway", () => {
         const json = parseFxJson(result);
         expect(json.output).toContain("bounded Vision answer");
         expect(json.tool_calls).toContainEqual({ name: "vision", status: "error" });
-        expect(result.stderr).toBe("Inspecting images\n");
+        expect(result.stderr).toBe("inspecting images\n");
         expect(gateway.chatRequests).toHaveLength(3);
         expect(gateway.chatRequests[1].headers.get("ai-language-model-id")).toBe(GEMINI_MODEL);
         const resultText = toolResultText(gateway.chatRequests[2].body, "vision_bound");
@@ -2261,7 +2261,7 @@ describe("Vision route fake Gateway", () => {
         const json = parseFxJson(result);
         expect(json.output).toContain("Vision unavailable final answer");
         expect(json.tool_calls).toContainEqual({ name: "vision", status: "error" });
-        expect(result.stderr).toContain("Inspecting images\n");
+        expect(result.stderr).toContain("inspecting images\n");
         expect(result.stderr).toContain(
           "Tip: This model doesn’t support OCR, and Vision is unavailable right now. Try switching to a vision-capable model.",
         );
@@ -2708,7 +2708,7 @@ describe("Vision route fake Gateway", () => {
         const json = parseFxJson(result);
         expect(json.output).toContain("recovered after invalid Vision result");
         expect(json.tool_calls).toContainEqual({ name: "vision", status: "error" });
-        expect(result.stderr).toBe("Inspecting images\n");
+        expect(result.stderr).toBe("inspecting images\n");
         expect(gateway.chatRequests).toHaveLength(4);
         expect(gateway.chatRequests[1].headers.get("ai-language-model-id")).toBe(GEMINI_MODEL);
         expect(gateway.chatRequests[2].headers.get("ai-language-model-id")).toBe(GEMINI_MODEL);
@@ -2817,7 +2817,7 @@ describe("Vision route fake Gateway", () => {
         const json = parseFxJson(result);
         expect(json.output).toContain("recovered without re-uploading the image");
         expect(json.tool_calls).toContainEqual({ name: "vision", status: "success" });
-        expect(result.stderr).toBe("Inspecting images\n");
+        expect(result.stderr).toBe("inspecting images\n");
         expect(gateway.chatRequests).toHaveLength(4);
         expect(gateway.chatRequests[1].headers.get("ai-language-model-id")).toBe(GEMINI_MODEL);
         expect(gateway.chatRequests[2].headers.get("ai-language-model-id")).toBe(GEMINI_MODEL);
@@ -3701,7 +3701,7 @@ describe("Vision route fake Gateway", () => {
           "Would you like to allow this action?",
           TIMEOUT,
         );
-        expect(firstApproval).toContain("Inspecting images");
+        expect(firstApproval).toContain("inspecting images");
         writeFileSync(firstImagePath, readFileSync(firstMutatedPath));
         await session.sendKeys("1");
         await session.sendKeys("Enter");
@@ -3714,15 +3714,15 @@ describe("Vision route fake Gateway", () => {
           "Would you like to allow this action?",
           TIMEOUT,
         );
-        expect(secondApproval).toContain("Inspecting images");
+        expect(secondApproval).toContain("inspecting images");
         await session.sendKeys("1");
         await session.sendKeys("Enter");
         await session.waitForText("tmux outage continued", TIMEOUT);
 
         const scrollback = await session.captureFullScrollback();
-        expect(scrollback).toContain("Inspected images");
+        expect(scrollback).toContain("inspected images");
         // The failed call is its group's line, with its reason after it.
-        expect(scrollback).toContain("● Couldn't inspect images · Vision is unavailable right now");
+        expect(scrollback).toContain("● couldn't inspect images · Vision is unavailable right now");
         expect(scrollback).toContain(
           "Tip: This model doesn’t support OCR, and Vision is unavailable right now. Try switching to a vision-capable model.",
         );

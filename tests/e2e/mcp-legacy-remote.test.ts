@@ -767,7 +767,7 @@ describe("version-scoped legacy MCP remote transports", () => {
         ).toBe(true);
 
         await tui.sendInterruptEscapePair(10_000);
-        await tui.waitForText(`Cancelled ${TOOL_NAME}`, 10_000);
+        await tui.waitForText(`cancelled ${TOOL_NAME}`, 10_000);
         const cancelDeadline = Date.now() + 5_000;
         while (
           (streamable.cancellationNotifications === 0 ||

@@ -305,7 +305,7 @@ describe.skipIf(!tmuxAvailable())("tui: compaction activity", () => {
           expect(f.counts().summaries).toBe(2);
         } else {
           await until(() => f.counts().ordinary === f.seedTurns + (trigger === "overflow" ? 2 : 1), "ordinary request after compaction");
-          const pane = await terminal.waitForText(/Thinking \(/, 10_000);
+          const pane = await terminal.waitForText(/thinking \(/, 10_000);
           expect(pane).not.toMatch(ACTIVITY);
           expect(f.lastRequest()).toContain("INTERNAL_HANDOFF_4e12");
           f.ordinaryHold.release("CURRENT_TURN_OK_f713");
@@ -468,7 +468,7 @@ describe.skipIf(!tmuxAvailable())("tui: compaction activity", () => {
         const terminal = await f.launch();
         await terminal.sendText("Cancel this held response.");
         await until(() => trigger === "auto" ? f.counts().summaries === 1 : f.counts().ordinary === 2, "held cancellation boundary");
-        await terminal.waitForText(trigger === "auto" ? ACTIVITY : /Thinking \(/, 10_000);
+        await terminal.waitForText(trigger === "auto" ? ACTIVITY : /thinking \(/, 10_000);
         await terminal.sendInterruptEscapePair(10_000);
         if (trigger === "auto") {
           await terminal.waitForText("Compaction cancelled.", 10_000);
@@ -477,7 +477,7 @@ describe.skipIf(!tmuxAvailable())("tui: compaction activity", () => {
           // so the slash in /quit cannot become part of a Meta key sequence.
           terminal.sendKeysImmediate(["Escape"]);
         } else {
-          await terminal.waitForText("Cancelled", 10_000);
+          await terminal.waitForText("cancelled", 10_000);
         }
         await terminal.waitForPane((pane) => hasEmptyComposer(pane) &&
           !/Compaction cancelled|Compacting|Thinking/.test(pane), 5000);
@@ -503,7 +503,7 @@ describe.skipIf(!tmuxAvailable())("tui: compaction activity", () => {
         await reopened.sendKeys("End");
         const full = await reopened.waitForPane((pane) => pane.includes("Cancel this held response."), 5000);
         writeFileSync(join(f.root, "cancellation-reopened.txt"), full);
-        expect(full.includes("Cancelled")).toBe(trigger === "ordinary");
+        expect(full.includes("cancelled")).toBe(trigger === "ordinary");
         expect(withoutCompactionCallLines(full)).not.toMatch(COMPACTION_OUTPUT);
         await reopened.sendKeys("C-o");
         await reopened.waitForComposer(5000);
@@ -613,7 +613,7 @@ describe.skipIf(!tmuxAvailable())("tui: compaction activity", () => {
       const terminal = await f.launch();
       await terminal.sendText("Ordinary control request.");
       await until(() => f.counts().ordinary === 2, "ordinary held request");
-      await terminal.waitForText(/Thinking \(/, 5000);
+      await terminal.waitForText(/thinking \(/, 5000);
       expect(f.counts().summaries).toBe(0);
       expect(f.durable()).toBe(0);
       f.ordinaryHold.release("ORDINARY_CONTROL_OK_727a");
@@ -678,7 +678,7 @@ describe.skipIf(!tmuxAvailable())("tui: compaction activity", () => {
       await terminal.waitForStableComposer(15_000);
       await terminal.sendText(task);
       // The command's row shows its steps in short form while it runs.
-      await terminal.waitForText("Running printf, sleep", 15_000);
+      await terminal.waitForText("running printf, sleep", 15_000);
       await terminal.sendText(steering);
       await until(() => summaryBodies.length === 1, "automatic compaction", 60_000);
       await terminal.waitForText("STEER_DONE_8d4", 20_000);

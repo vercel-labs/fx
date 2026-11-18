@@ -28,8 +28,8 @@ async function runWithoutGatewayAuth(args: string[]) {
 }
 
 function expectNoSearchProgress(stderr: string) {
-  expect(stderr).not.toContain("Searching ");
-  expect(stderr).not.toContain("Found ");
+  expect(stderr).not.toContain("searching ");
+  expect(stderr).not.toContain("found ");
 }
 
 describe("web_search permission progress", () => {
