@@ -750,6 +750,18 @@ fn expectCutLaws(value: []const u8, budget: usize, valid_utf8: bool) !void {
         // start, and no later: `text_utils.secretSafeSuffixStart` and its
         // tests pin which secrets it steps past.
         try std.testing.expectEqual(value.len - text_utils.secretSafeSuffixStart(value, value.len - utf8_tail), cut.tail_len);
+        // In a value with no secret `maskSecrets` finds, no URL, and no
+        // `Bearer ` token, the tail loses at most the rest of the one word its
+        // UTF-8 cut splits.
+        const lost = value[value.len - utf8_tail .. value.len - cut.tail_len];
+        if (std.mem.findAny(u8, lost, " \t\n\r\x0b\x0c") != null) {
+            var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+            defer arena_state.deinit();
+            const masked = try text_utils.maskSecrets(arena_state.allocator(), value);
+            try std.testing.expect(!std.mem.eql(u8, masked, value) or
+                std.mem.find(u8, value, "://") != null or
+                std.mem.find(u8, value, "Bearer ") != null);
+        }
     }
 }
 
