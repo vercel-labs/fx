@@ -2745,10 +2745,11 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
                     controller.enqueue(encoder.encode(`data: ${JSON.stringify(event)}\n\n`));
                   send({ type: "tool-input-start", id: "toolbox_run", toolName: "toolbox" });
                   send({ type: "tool-input-delta", id: "toolbox_run", delta: '{"run":"glob_files",' });
+                  send({ type: "tool-input-delta", id: "toolbox_run", delta: '"arguments":{"pattern":"*.md"' });
                   timer = setInterval(() => controller.enqueue(encoder.encode(": hold-toolbox-arguments\n\n")), 50);
                   sendRest = () => {
                     clearInterval(timer);
-                    send({ type: "tool-input-delta", id: "toolbox_run", delta: '"arguments":{"pattern":"*.md"}}' });
+                    send({ type: "tool-input-delta", id: "toolbox_run", delta: "}}" });
                     send({ type: "tool-input-end", id: "toolbox_run" });
                     send({
                       type: "tool-call",
@@ -2772,12 +2773,12 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       );
 
       await session!.sendText("Find the markdown files.");
-      // The tool's whole name is in and the rest of the arguments are not,
-      // so the row reads as a direct glob_files call does instead of a bare
-      // "Using".
+      // The tool's name and its pattern are in and the rest of the
+      // arguments are not, so the row reads as a direct glob_files call
+      // does instead of a bare "Using".
       const streaming = await waitForScrollback(
         session!,
-        (value) => /(^|\s)Matching\s*$/m.test(value),
+        (value) => value.includes("● Matching *.md"),
         "the toolbox row reading as its tool while its arguments stream in",
       );
       expect(streaming).not.toContain("Running glob_files");
@@ -2801,6 +2802,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       const query = "zig release notes";
       const encoder = new TextEncoder();
       let timer: ReturnType<typeof setInterval> | undefined;
+      let sendTarget: (() => void) | undefined;
       let sendRest: (() => void) | undefined;
       const { queuedGateway, stderrPath } = await launchRouteRecoveryTui(
         "fx-tui-toolbox-run-verbs-",
@@ -2814,9 +2816,12 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
                   send({ type: "tool-input-start", id: "toolbox_fetch", toolName: "toolbox" });
                   send({ type: "tool-input-delta", id: "toolbox_fetch", delta: '{"run":"web_fetch",' });
                   timer = setInterval(() => controller.enqueue(encoder.encode(": hold-toolbox-arguments\n\n")), 50);
+                  sendTarget = () => {
+                    send({ type: "tool-input-delta", id: "toolbox_fetch", delta: `"arguments":{"url":"${url}"` });
+                  };
                   sendRest = () => {
                     clearInterval(timer);
-                    send({ type: "tool-input-delta", id: "toolbox_fetch", delta: `"arguments":{"url":"${url}"}}` });
+                    send({ type: "tool-input-delta", id: "toolbox_fetch", delta: "}}" });
                     send({ type: "tool-input-end", id: "toolbox_fetch" });
                     send({
                       type: "tool-call",
@@ -2835,7 +2840,15 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
               }),
               { headers: { "content-type": "text/event-stream" } },
             ),
-          fakeGatewayToolCall("toolbox_search", "toolbox", { run: "web_search", arguments: { query } }),
+          // Its arguments stream in, so its failure settles its streamed row.
+          fakeGatewaySse([
+            { type: "tool-input-start", id: "toolbox_search", toolName: "toolbox" },
+            { type: "tool-input-delta", id: "toolbox_search", delta: '{"run":"web_search",' },
+            { type: "tool-input-delta", id: "toolbox_search", delta: `"arguments":{"query":"${query}"}}` },
+            { type: "tool-input-end", id: "toolbox_search" },
+            { type: "tool-call", toolCallId: "toolbox_search", toolName: "toolbox", input: { run: "web_search", arguments: { query } } },
+            { type: "finish", finishReason: { unified: "tool-calls", raw: "tool-calls" } },
+          ]),
           fakeGatewayToolCall("toolbox_read", "toolbox", { run: "read_file", arguments: { path: "notes.txt" } }),
           () => fakeGatewayFinalText(finalSentinel),
         ],
@@ -2843,14 +2856,25 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       writeFileSync(join(root!, "workspace", "notes.txt"), "toolbox run notes\n");
 
       await session!.sendText("Fetch the page, search the web, and read the notes.");
-      // Only the run's tool is in, so the row reads as a direct web_fetch
-      // call does while its arguments stream in.
-      const streaming = await waitForScrollback(
+      // Only the run's tool is in, and a direct web_fetch call names no
+      // target yet, so the row stays hidden instead of reading as a bare
+      // verb or as toolbox's own.
+      const unnamed = await waitForScrollback(
         session!,
-        (value) => /(^|\s)Fetching\s*$/m.test(value),
-        "the toolbox run's row reading as web_fetch while its arguments stream in",
+        (value) => /• Running \((?:[1-9]\d*s|\d+m\d+s)\)/.test(value),
+        "the turn running for a second while the run names only its tool",
       );
-      expect(streaming).not.toContain("Running web_fetch");
+      expect(unnamed).not.toContain("Running web_fetch");
+      expect(unnamed).not.toContain("Fetching");
+      // Its url is in and the rest of its arguments are not, so the row
+      // reads as a direct web_fetch call does.
+      sendTarget?.();
+      const named = await waitForScrollback(
+        session!,
+        (value) => value.includes(`● Fetching ${url}`),
+        "the toolbox run's row naming web_fetch's url while its arguments stream in",
+      );
+      expect(named).not.toContain("Running web_fetch");
       expect(queuedGateway.requests).toHaveLength(1);
 
       sendRest?.();
