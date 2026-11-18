@@ -228,6 +228,9 @@ const Run = struct {
     /// The repository's folder under the profile (`storeDir`).
     store_dir: []const u8 = undefined,
     store: safe_git.Store = undefined,
+    /// Beside the capture index while it catches up (`addPaths`): how many
+    /// of the paths, in order, later captures may skip in their batches.
+    progress_file: []const u8 = undefined,
     /// The worktree's lock, held from `lockWorktree` to the end.
     lock: ?Lock = null,
     /// What the user's git tracks, and what the capture index held before.
@@ -363,11 +366,12 @@ const Run = struct {
         } };
         self.store = .{
             .git_dir = try storeGitDir(arena, store_dir),
-            .index_file = try std.Io.Dir.path.join(arena, &.{ worktree_dir, "index" }),
+            .index_file = try std.Io.Dir.path.join(arena, &.{ worktree_dir, worktree_index_name }),
             .work_tree = self.canonical.work_tree,
             .scratch_dir = scratch_dir,
             .conversions = self.facts.conversions,
         };
+        self.progress_file = try std.Io.Dir.path.join(arena, &.{ worktree_dir, worktree_progress_name });
         return null;
     }
 
@@ -449,6 +453,9 @@ const Run = struct {
         const first_deadline = setupDeadline(started, self.deadline, first);
         self.outcome.index = .persisted;
         if (index_missing) {
+            // Progress describes the index that is gone, such as one
+            // retention dropped, so the new index starts without it.
+            self.endCatchUp();
             const user_index = try std.Io.Dir.path.join(arena, &.{ self.canonical.git_dir, "index" });
             if (self.facts.split_index or try hasSharedIndex(io, self.canonical.git_dir) or !copyableIndex(io, user_index)) {
                 if (try runStore(arena, self.store_ready, self.store, .{ .read_tree = self.facts.head }, .{ .deadline = first_deadline, .cancel = self.request.cancel })) |failure| return self.gitFail(failure);
@@ -637,10 +644,96 @@ const Run = struct {
         if (selection.remove.len > 0) {
             if (try runStore(arena, self.store_ready, self.store, .{ .force_remove = selection.remove }, self.limits())) |failure| return self.gitFail(failure);
         }
-        if (selection.read.len > 0) {
-            if (try runStore(arena, self.store_ready, self.store, .{ .add_remove = selection.read }, self.limits())) |failure| return self.gitFail(failure);
+        return self.addPaths(selection.read);
+    }
+
+    /// Adds `paths`, sorted, to the capture index in one `update-index`
+    /// run. git hashes again every file whose stat data differs from the
+    /// index's and keeps none of that work when the deadline stops it, so
+    /// after a branch switch or a formatter touched many files, that run
+    /// could time out on every later capture and none would land. When it
+    /// times out, the capture index starts catching up: `progress_file`
+    /// counts the paths it already holds, and each later capture first adds
+    /// the rest in batches of `index_batch_paths`, counting each batch that
+    /// finishes, then makes the one run over every path. That run always
+    /// comes last, so a count that is wrong costs time, never a wrong tree.
+    fn addPaths(self: *Run, paths: []const []const u8) Allocator.Error!?Outcome {
+        if (builtin.is_test) test_hooks.index_batched_paths = 0;
+        var batches: usize = 0;
+        if (self.catchUpProgress()) |done| {
+            const batch = @max(1, if (builtin.is_test) test_hooks.index_batch_paths orelse index_batch_paths else index_batch_paths);
+            var start = @min(done, paths.len);
+            debug_trace.logf("workspace", "event=workspace_capture_index_catch_up from={d} paths={d}", .{ start, paths.len });
+            while (start < paths.len) : (batches += 1) {
+                if (builtin.is_test) if (test_hooks.index_batches_before_timeout) |limit| if (batches == limit) return self.gitFail(.timeout);
+                const end = @min(paths.len, start + batch);
+                if (try runStore(self.arena, self.store_ready, self.store, .{ .add_remove = paths[start..end] }, self.limits())) |failure| return self.gitFail(failure);
+                if (builtin.is_test) test_hooks.index_batched_paths += end - start;
+                start = end;
+                self.recordCatchUp(start);
+            }
         }
+        if (paths.len > 0) {
+            const forced = builtin.is_test and test_hooks.index_pass_timeouts > 0;
+            if (forced) test_hooks.index_pass_timeouts -= 1;
+            const failure: ?safe_git.Failure = if (forced) .timeout else try runStore(self.arena, self.store_ready, self.store, .{ .add_remove = paths }, self.limits());
+            if (failure) |value| {
+                // After batches, the run may only have lacked time: the next
+                // capture makes it first, with its whole budget. A run that
+                // followed no batches found stale files, which may be among
+                // the paths counted earlier, so the batches start over;
+                // files still fresh cost git no hashing.
+                if (value == .timeout and batches == 0) {
+                    self.recordCatchUp(0);
+                    debug_trace.logf("workspace", "event=workspace_capture_index_catch_up_started paths={d}", .{paths.len});
+                }
+                return self.gitFail(value);
+            }
+        }
+        self.endCatchUp();
         return null;
+    }
+
+    /// The paths a catching-up capture index already holds, or null when it
+    /// is not catching up. A progress file that cannot be read counts none.
+    fn catchUpProgress(self: *Run) ?usize {
+        var file = io_mod.openExistingReadOnlyRegularFile(std.Io.Dir.cwd(), self.progress_file, .no_follow) catch |err| switch (err) {
+            error.FileNotFound => return null,
+            else => {
+                keepCancel(self.io, err);
+                return 0;
+            },
+        };
+        defer file.close(self.io);
+        var buf: [32]u8 = undefined;
+        const n = file.readPositionalAll(self.io, &buf, 0) catch |err| {
+            keepCancel(self.io, err);
+            return 0;
+        };
+        return std.fmt.parseInt(usize, std.mem.trimEnd(u8, buf[0..n], "\n"), 10) catch 0;
+    }
+
+    /// Records that the capture index holds the first `done` paths. A
+    /// progress file that cannot be written only makes a later capture
+    /// add more paths in batches.
+    fn recordCatchUp(self: *Run, done: usize) void {
+        var buf: [32]u8 = undefined;
+        const text = std.mem.print(&buf, "{d}\n", .{done}) catch unreachable;
+        std.Io.Dir.cwd().writeFile(self.io, .{ .sub_path = self.progress_file, .data = text, .flags = .{ .permissions = .fromMode(0o600) } }) catch |err| {
+            keepCancel(self.io, err);
+            debug_trace.logf("workspace", "event=workspace_capture_index_progress_unsaved err={s}", .{@errorName(err)});
+        };
+    }
+
+    /// Ends catching up: the capture index holds every path.
+    fn endCatchUp(self: *Run) void {
+        std.Io.Dir.deleteFileAbsolute(self.io, self.progress_file) catch |err| switch (err) {
+            error.FileNotFound => {},
+            else => {
+                keepCancel(self.io, err);
+                debug_trace.logf("workspace", "event=workspace_capture_index_progress_kept err={s}", .{@errorName(err)});
+            },
+        };
     }
 
     /// Writes the tree and the commit, and moves the session ref to it.
@@ -919,6 +1012,12 @@ const max_copy_exclusions = 16;
 /// repacks them into one.
 const copy_batch_objects: usize = 20_000;
 
+/// Paths in one `update-index` run while a capture index catches up
+/// (`Run.addPaths`). git keeps each run's work once it exits, so a capture
+/// that runs out of time loses at most one batch, and the next capture goes
+/// on from there.
+const index_batch_paths: usize = 4096;
+
 /// Seams for tests. Production code reads and writes them only under
 /// `builtin.is_test`, so a release build has none.
 const test_hooks = struct {
@@ -926,6 +1025,16 @@ const test_hooks = struct {
     var copy_batch_objects: ?usize = null;
     /// The packs a copy writes before it stops as if its deadline passed.
     var copy_packs_before_timeout: ?usize = null;
+    /// Replaces `index_batch_paths`.
+    var index_batch_paths: ?usize = null;
+    /// The batches a catching-up capture runs before it stops as if its
+    /// deadline passed.
+    var index_batches_before_timeout: ?usize = null;
+    /// The next passes over every path that stop as if their deadline
+    /// passed, without running git.
+    var index_pass_timeouts: usize = 0;
+    /// The paths the last capture added in batches.
+    var index_batched_paths: usize = 0;
     /// A path suffix whose presence check fails as if access were denied.
     var access_denied_suffix: ?[]const u8 = null;
     /// Whether the last capture's setup chose the first-capture budget.
@@ -2107,6 +2216,8 @@ pub fn worktreesDir(arena: Allocator, store_dir: []const u8) Allocator.Error![]c
 /// The file names of a worktree directory's capture lock and capture index.
 pub const worktree_lock_name = "lock";
 pub const worktree_index_name = "index";
+/// The progress file of a capture index that is catching up (`Run.addPaths`).
+const worktree_progress_name = "index.progress";
 
 // ---- Tests below this line ----
 
@@ -4799,6 +4910,146 @@ test "capture store: a copy that runs out of time keeps its packs, so the next c
     try repos.append("repo/d0/f0.txt", "more\n");
     _ = try expectComplete(try repos.captureRepo(repo, "s"));
     try testing.expectEqual(@as(?bool, false), test_hooks.first_budget);
+}
+
+/// The paths a catching-up capture index of `repo` holds, or null when it is
+/// not catching up.
+fn catchUpCount(repos: TestRepos, repo: Repository) !?usize {
+    const dir = try worktreeDir(repos.arena, try storeDir(repos.arena, repos.profile, repo.common_dir), try worktreeIdentity(repos.arena, repo));
+    const path = try std.Io.Dir.path.join(repos.arena, &.{ dir, worktree_progress_name });
+    if (!try TestRepos.existsAbsolute(path)) return null;
+    const text = try std.Io.Dir.cwd().readFileAlloc(testing.io, path, repos.arena, .limited(64));
+    return try std.fmt.parseInt(usize, std.mem.trimEnd(u8, text, "\n"), 10);
+}
+
+fn resetIndexHooks() void {
+    test_hooks.index_batch_paths = null;
+    test_hooks.index_batches_before_timeout = null;
+    test_hooks.index_pass_timeouts = 0;
+}
+
+test "capture store: an index pass that runs out of time catches up in batches that keep their work, so a later capture lands" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const repos = try TestRepos.init(arena_state.allocator(), tmp.dir);
+    defer repos.deinit();
+    defer resetIndexHooks();
+    try repos.initRepo("repo");
+    var file: usize = 0;
+    while (file < 40) : (file += 1) {
+        try repos.write(try repos.arena.print("repo/f{d:0>2}.txt", .{file}), try repos.arena.print("file {d}\n", .{file}));
+    }
+    _ = try repos.gitIn("repo", &.{ "add", "-A" });
+    try repos.commit("repo", "base");
+    const repo = try repos.repository("repo");
+    const ref = try repos.sessionRef(repo, "s");
+    const first = try repos.captureRepo(repo, "s");
+    _ = try expectComplete(first);
+    try testing.expect((try catchUpCount(repos, repo)) == null);
+
+    // Every file changes, as after a branch switch. The pass over every
+    // path runs out of time once; each later capture's budget then fits 3
+    // batches of 4 paths.
+    file = 0;
+    while (file < 40) : (file += 1) try repos.append(try repos.arena.print("repo/f{d:0>2}.txt", .{file}), "changed\n");
+    test_hooks.index_pass_timeouts = 1;
+    test_hooks.index_batch_paths = 4;
+    test_hooks.index_batches_before_timeout = 3;
+
+    const one = try repos.captureRepo(repo, "s");
+    try expectNotStored(one);
+    try testing.expectEqual(policy.Reason.timeout, one.reason.?);
+    try testing.expectEqual(@as(?usize, 0), try catchUpCount(repos, repo));
+    try testing.expectEqualStrings(first.commit.?, (try repos.storeRef(repo, ref)).?);
+
+    // Each capture goes on where the last stopped.
+    for ([_]usize{ 12, 24, 36 }) |expected| {
+        const outcome = try repos.captureRepo(repo, "s");
+        try expectNotStored(outcome);
+        try testing.expectEqual(policy.Reason.timeout, outcome.reason.?);
+        try testing.expectEqual(@as(usize, 12), test_hooks.index_batched_paths);
+        try testing.expectEqual(@as(?usize, expected), try catchUpCount(repos, repo));
+    }
+
+    // The last batch and the pass over every path fit: the capture lands
+    // the tree the user's git records, and catching up ends.
+    const landed = try repos.captureRepo(repo, "s");
+    const tree = try expectComplete(landed);
+    try testing.expectEqual(@as(usize, 4), test_hooks.index_batched_paths);
+    try testing.expectEqualStrings(try repos.expectedTree(repo, &.{}), tree);
+    try testing.expectEqualStrings(landed.commit.?, (try repos.storeRef(repo, ref)).?);
+    try testing.expect((try catchUpCount(repos, repo)) == null);
+
+    // Later captures make one pass again.
+    try repos.append("repo/f00.txt", "more\n");
+    _ = try expectComplete(try repos.captureRepo(repo, "s"));
+    try testing.expectEqual(@as(usize, 0), test_hooks.index_batched_paths);
+}
+
+test "capture store: a catching-up index keeps its progress when only the pass after its batches runs out of time" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const repos = try TestRepos.init(arena_state.allocator(), tmp.dir);
+    defer repos.deinit();
+    defer resetIndexHooks();
+    try repos.initRepo("repo");
+    var file: usize = 0;
+    while (file < 8) : (file += 1) {
+        try repos.write(try repos.arena.print("repo/f{d}.txt", .{file}), try repos.arena.print("file {d}\n", .{file}));
+    }
+    _ = try repos.gitIn("repo", &.{ "add", "-A" });
+    try repos.commit("repo", "base");
+    const repo = try repos.repository("repo");
+    _ = try expectComplete(try repos.captureRepo(repo, "s"));
+    try repos.append("repo/f0.txt", "changed\n");
+    test_hooks.index_batch_paths = 4;
+
+    // The pass times out with no batches before it: catching up starts.
+    test_hooks.index_pass_timeouts = 1;
+    try expectNotStored(try repos.captureRepo(repo, "s"));
+    try testing.expectEqual(@as(?usize, 0), try catchUpCount(repos, repo));
+    // The batches all finish but the pass after them runs out of time: the
+    // count stays at the end, so the next capture runs no batches and gives
+    // the pass its whole budget.
+    test_hooks.index_pass_timeouts = 1;
+    try expectNotStored(try repos.captureRepo(repo, "s"));
+    try testing.expectEqual(@as(usize, 8), test_hooks.index_batched_paths);
+    try testing.expectEqual(@as(?usize, 8), try catchUpCount(repos, repo));
+    // That pass, with no batches before it, runs out of time too: files went
+    // stale again, so the batches start over.
+    test_hooks.index_pass_timeouts = 1;
+    try expectNotStored(try repos.captureRepo(repo, "s"));
+    try testing.expectEqual(@as(usize, 0), test_hooks.index_batched_paths);
+    try testing.expectEqual(@as(?usize, 0), try catchUpCount(repos, repo));
+    const tree = try expectComplete(try repos.captureRepo(repo, "s"));
+    try testing.expectEqualStrings(try repos.expectedTree(repo, &.{}), tree);
+    try testing.expect((try catchUpCount(repos, repo)) == null);
+}
+
+test "capture store: a capture index that is gone drops the progress of the one it replaces" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const repos = try TestRepos.init(arena_state.allocator(), tmp.dir);
+    defer repos.deinit();
+    defer resetIndexHooks();
+    try repos.makeShapes("repo");
+    const repo = try repos.repository("repo");
+    _ = try expectComplete(try repos.captureRepo(repo, "s"));
+    test_hooks.index_pass_timeouts = 1;
+    try expectNotStored(try repos.captureRepo(repo, "s"));
+    try testing.expectEqual(@as(?usize, 0), try catchUpCount(repos, repo));
+    // Retention drops capture indexes before it prunes a store.
+    const index = try std.Io.Dir.path.join(repos.arena, &.{ try worktreeDir(repos.arena, try storeDir(repos.arena, repos.profile, repo.common_dir), try worktreeIdentity(repos.arena, repo)), worktree_index_name });
+    try std.Io.Dir.deleteFileAbsolute(testing.io, index);
+    _ = try expectComplete(try repos.captureRepo(repo, "s"));
+    try testing.expectEqual(@as(usize, 0), test_hooks.index_batched_paths);
+    try testing.expect((try catchUpCount(repos, repo)) == null);
 }
 
 test "capture store: the temporary files of a pack a killed git left are removed once stale" {
