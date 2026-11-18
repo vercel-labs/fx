@@ -2856,6 +2856,9 @@ const MailboxFixture = struct {
     /// The worker of the child agent that runs each turn, as the app's does:
     /// set, the runs are hosted (`bind`), and a hosted run saves nothing.
     hosted: ?*worker_runtime.WorkerRuntime = null,
+    /// While set, a hosted run fails to bind to its agent (`bind`), so its work
+    /// ends before its worker attaches.
+    bind_fails: std.atomic.Value(bool) = .init(false),
     release: std.Io.Event = .unset,
     runs: std.atomic.Value(usize) = .init(0),
     /// How many runs began with their cancel flag already set: a work that
@@ -2884,6 +2887,7 @@ const MailboxFixture = struct {
 
     fn bind(raw: ?*anyopaque, turn: *execution.TurnContext, _: *std.atomic.Value(bool)) execution.ServiceError!void {
         const self: *@This() = @ptrCast(@alignCast(raw.?));
+        if (self.bind_fails.load(.seq_cst)) return error.ProviderFailed;
         turn.hosted_worker = self.hosted orelse return error.ProviderFailed;
     }
 
@@ -7582,6 +7586,83 @@ test "the parent's close that lands as the waiting message starts drops it, and 
 
 test "the user's close that lands as the waiting message starts drops it, and it never runs" {
     try expectCloseWhereWaitingMessageStarts(.user);
+}
+
+const AfterFailedBind = enum { parent_stop, parent_close, user_close };
+
+/// The slot's first work ends and the host chooses the message that waited as
+/// its second, which then fails to bind to its agent before its worker
+/// attaches. A stop or close lands where that failed work's end is recorded
+/// and the host's end hook has not run: its message is accounted for by its
+/// failed report, so the stop or close counts none of it.
+fn expectNothingCountedAfterFailedBind(action: AfterFailedBind) !void {
+    const alloc = std.testing.allocator;
+    HeldRecordedTwice.arm();
+    defer HeldRecordedTwice.clear();
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var parent: child_state.TestParent = undefined;
+    try parent.init(alloc);
+    defer parent.deinit();
+    var hosted_worker = worker_runtime.WorkerRuntime{};
+    defer hosted_worker.deinit(alloc);
+    var fixture = MailboxFixture{ .hold = true, .hosted = &hosted_worker };
+    defer fixture.deinit();
+    const runtime = try hostedMailboxRuntime(alloc, &fixture, &parent);
+    defer runtime.deinit();
+    defer HeldRecordedTwice.releaseAll();
+
+    _ = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "first" } }, "call-1", null);
+    try waitForRuns(&fixture, 1);
+    const queued = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "second" } }, "call-2", null);
+    try std.testing.expect(std.mem.find(u8, queued, "is busy") != null);
+    fixture.bind_fails.store(true, .seq_cst);
+    fixture.release.set(io_mod.getIo());
+    // The first work's end is recorded; the hook installs the waiting message
+    // as the next work, which fails to bind and ends at once.
+    try HeldRecordedTwice.first.waitHeld();
+    HeldRecordedTwice.first.release();
+    try HeldRecordedTwice.second.waitHeld();
+    const child_id = try reviewerId(runtime, arena);
+    switch (action) {
+        .parent_stop => {
+            const stopped = try callTool(runtime, arena, .{ .stop = .{ .agent = "reviewer" } }, "call-3", null);
+            try std.testing.expect(std.mem.find(u8, stopped, "reviewer was not working.") != null);
+            try std.testing.expect(std.mem.find(u8, stopped, "dropped") == null);
+        },
+        .parent_close => {
+            const closed = try callTool(runtime, arena, .{ .close = .{ .agent = "reviewer" } }, "call-3", null);
+            try std.testing.expect(std.mem.find(u8, closed, "Closed reviewer.") != null);
+            try std.testing.expect(std.mem.find(u8, closed, "dropped") == null);
+        },
+        .user_close => {
+            const closed = (try runtime.closeChild(child_id, .user)).?;
+            try std.testing.expect(!closed.stopped);
+            try std.testing.expectEqual(@as(usize, 0), closed.dropped);
+        },
+    }
+    HeldRecordedTwice.releaseAll();
+    try waitForSlotEnd(runtime, child_id);
+    // The failed work's report is what main reads of its message, with no count.
+    try std.testing.expectEqual(@as(usize, 0), runtime.user_dropped.items.len);
+    if (action == .parent_stop) {
+        try std.testing.expectEqual(@as(usize, 2), fixture.reportCount());
+        try std.testing.expect(std.mem.find(u8, fixture.reports.items[1], " failed ") != null);
+        try std.testing.expect(std.mem.find(u8, fixture.reports.items[1], " dropped=") == null);
+    }
+}
+
+test "a stop after a work that failed to bind ended counts none of its messages" {
+    try expectNothingCountedAfterFailedBind(.parent_stop);
+}
+
+test "a close by the parent after a work that failed to bind ended counts none of its messages" {
+    try expectNothingCountedAfterFailedBind(.parent_close);
+}
+
+test "a close by the user after a work that failed to bind ended counts none of its messages" {
+    try expectNothingCountedAfterFailedBind(.user_close);
 }
 
 test "a stop after the next work began does not count its message" {
