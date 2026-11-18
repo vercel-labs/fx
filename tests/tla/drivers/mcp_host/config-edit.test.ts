@@ -310,6 +310,9 @@ test("fault: twenty fx processes adding at once each keep their entry, and the e
   save(join(s.f.base, "parallel.json"), mixed.map((r) => ({ code: r.code, ms: r.ms })));
 }, 240_000);
 
+// How many of the 40 adds a kill must end for the test to say anything about a kill mid-add.
+const KILLS_AT_LEAST = 5;
+
 test("crash: a kill at any moment of an add leaves the profile as it was or as the add made it, and the next fx takes the lock", async () => {
   const s = new Scenario("config-edit-crash", { st: "ok", ent: { a: "ok" } }, NONE);
   // Seeded, so a failure replays: the kill delays come from this generator.
@@ -317,15 +320,20 @@ test("crash: a kill at any moment of an add leaves the profile as it was or as t
   const next = () => ((state = (Math.imul(state, 1664525) + 1013904223) >>> 0) / 2 ** 32);
   const log: { i: number; cls: string; delayMs: number; exited: number | null }[] = [];
   let kills = 0;
+  // An add takes a few milliseconds, so the delays scale with how long one takes here: a delay is up to one and a half times an add.
+  const probe = await s.run(["mcp", "add", "--no-login", "probe", OK_URL]);
+  expect(probe.code).toBe(0);
+  const spanMs = Math.max(probe.ms, 4) * 1.5;
   for (let i = 0; i < 40; i++) {
     const cls: Cls = i % 2 === 0 ? "ok" : "bad";
     const before = readFileSync(s.paths.profile, "utf8");
     const child = Bun.spawn([binary, "mcp", "add", "--no-login", `k${i}`, ...argsOf(cls)], { cwd: s.f.workspace, env: fxEnv(s.f), stdin: "ignore", stdout: "ignore", stderr: "ignore" });
-    const delayMs = Math.floor(next() * 120);
+    const delayMs = Math.floor(next() * spanMs);
     await Bun.sleep(delayMs);
     child.kill("SIGKILL");
     const code = await child.exited;
-    if (code !== 0) kills += 1;
+    // A kill that lands after the add has finished ends nothing, and a refused add exits 1 by itself: only the SIGKILL counts.
+    if (child.signalCode === "SIGKILL") kills += 1;
     log.push({ i, cls, delayMs, exited: code });
     const text = readFileSync(s.paths.profile, "utf8");
     const doc = JSON.parse(text) as { mcpServers: Record<string, unknown> };
@@ -336,6 +344,9 @@ test("crash: a kill at any moment of an add leaves the profile as it was or as t
     expect(names.filter((n) => n.startsWith("k") && Number(n.slice(1)) % 2 === 1)).toEqual([]);
   }
   save(join(s.f.base, "kills.json"), { seed: 20261110, kills, log });
+  console.log(`CRASH adds=40 killed_by_sigkill=${kills} span_ms=${spanMs} probe_ms=${probe.ms}`);
+  // The seeded delays must end a good share of the adds in the middle of their work.
+  expect(kills).toBeGreaterThanOrEqual(KILLS_AT_LEAST);
   const next1 = await s.run(["mcp", "add", "--no-login", "after", OK_URL]);
   expect(next1.code).toBe(0);
   expect(Object.keys(JSON.parse(readFileSync(s.paths.profile, "utf8")).mcpServers)).toContain("after");
@@ -352,6 +363,7 @@ test("stress: add and remove on a profile with 1,000 servers stay fast, and the 
   expect(add.code).toBe(0);
   const refused = await s.run(["mcp", "add", "--no-login", "bad", BAD_URL]);
   timings.refused_add_ms = refused.ms;
+  expect(refused.code).toBe(1);
   const remove = await s.run(["mcp", "remove", "--global", "s500"]);
   timings.remove_ms = remove.ms;
   expect(remove.code).toBe(0);
