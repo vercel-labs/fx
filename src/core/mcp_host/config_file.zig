@@ -110,7 +110,7 @@ pub const Refusal = union(enum) {
 /// is refused: the profile's servers key looks misspelled, or the reader would
 /// skip the new entry. Null for a file the reader loads the entry from. It runs
 /// the reader on the text as it will be written, so the rules stay the reader's.
-pub fn refusalOf(alloc: Allocator, file: File, before: ?[]const u8, after: []const u8, name: []const u8) Allocator.Error!?Refusal {
+fn refusalOf(alloc: Allocator, file: File, before: ?[]const u8, after: []const u8, name: []const u8) Allocator.Error!?Refusal {
     if (file == .profile) {
         if (try misspelledIn(alloc, file, before)) |key| return .{ .misspelled = key };
     }
@@ -471,6 +471,31 @@ const bad_entry: Entry = .{ .http = .{ .url = "http://example.com/mcp" } };
 const good_entry: Entry = .{ .http = .{ .url = "https://mcp.example/mcp" } };
 const authorized: Entry = .{ .http = .{ .url = "https://mcp.example/mcp", .headers = &.{.{ .key = "authorization", .value = "Bearer x" }} } };
 
+/// The entry problem an `update` refused with, or a failed test: an edit that wasn't refused,
+/// or was refused for a key, reads as a failure the test names, not a crash.
+fn refusedEntry(updated: Updated) !project_config.EntryProblem {
+    switch (updated) {
+        .refused => |refusal| switch (refusal) {
+            .entry => |problem| return problem,
+            .misspelled => {},
+        },
+        else => {},
+    }
+    return error.TestUnexpectedResult;
+}
+
+/// The misspelled key an `update` refused with, or a failed test.
+fn refusedKey(updated: Updated) !project_config.MisspelledKey {
+    switch (updated) {
+        .refused => |refusal| switch (refusal) {
+            .misspelled => |key| return key,
+            .entry => {},
+        },
+        else => {},
+    }
+    return error.TestUnexpectedResult;
+}
+
 test "update writes what the reader loads, and a refused change writes nothing" {
     const alloc = testing.allocator;
     var tmp = testing.tmpDir(.{});
@@ -484,7 +509,7 @@ test "update writes what the reader loads, and a refused change writes nothing" 
 
     // A missing profile stays missing when the first add is refused.
     const refused = try update(alloc, profile, .profile, profile, .{ .add = .{ .name = "web", .entry = bad_entry } });
-    try testing.expectEqual(project_config.EntryProblem.url_insecure, refused.refused.entry);
+    try testing.expectEqual(project_config.EntryProblem.url_insecure, try refusedEntry(refused));
     try testing.expect(try read(alloc, profile) == null);
 
     const added = try update(alloc, profile, .profile, profile, .{ .add = .{ .name = "web", .entry = good_entry } });
@@ -494,7 +519,7 @@ test "update writes what the reader loads, and a refused change writes nothing" 
 
     // An Authorization header is the profile's to refuse and .mcp.json's to take.
     const auth = try update(alloc, profile, .profile, profile, .{ .add = .{ .name = "authd", .entry = authorized } });
-    try testing.expectEqual(project_config.EntryProblem.authorization, auth.refused.entry);
+    try testing.expectEqual(project_config.EntryProblem.authorization, try refusedEntry(auth));
     try testing.expect(try update(alloc, profile, .project, project, .{ .add = .{ .name = "authd", .entry = authorized } }) == .added);
     const after = (try read(alloc, profile)).?;
     defer alloc.free(after);
@@ -519,10 +544,10 @@ test "update never rewrites a profile whose servers key looks misspelled, and re
     try write(alloc, .profile, profile, text.items);
 
     const add_refused = try update(alloc, profile, .profile, profile, .{ .add = .{ .name = "web", .entry = good_entry } });
-    try testing.expectEqualStrings("mcp_servers", add_refused.refused.misspelled.key());
-    try testing.expectEqualStrings("mcpServers", add_refused.refused.misspelled.real());
+    try testing.expectEqualStrings("mcp_servers", (try refusedKey(add_refused)).key());
+    try testing.expectEqualStrings("mcpServers", (try refusedKey(add_refused)).real());
     const remove_refused = try update(alloc, profile, .profile, profile, .{ .remove = "a" });
-    try testing.expectEqualStrings("mcp_servers", remove_refused.refused.misspelled.key());
+    try testing.expectEqualStrings("mcp_servers", (try refusedKey(remove_refused)).key());
     const same = (try read(alloc, profile)).?;
     defer alloc.free(same);
     try testing.expectEqualStrings(text.items, same);
@@ -534,8 +559,8 @@ test "update never rewrites a profile whose servers key looks misspelled, and re
     const old = "{\"mcp\":{\"a\":{\"command\":\"x\"}},\"MCP-Servers\":{\"b\":{\"command\":\"y\"}}}";
     try write(alloc, .profile, profile, old);
     const named = try update(alloc, profile, .profile, profile, .{ .add = .{ .name = "web", .entry = good_entry } });
-    try testing.expectEqualStrings("MCP-Servers", named.refused.misspelled.key());
-    try testing.expectEqualStrings("mcp", named.refused.misspelled.real());
+    try testing.expectEqualStrings("MCP-Servers", (try refusedKey(named)).key());
+    try testing.expectEqualStrings("mcp", (try refusedKey(named)).real());
 
     // .mcp.json has no such check.
     const project = try std.Io.Dir.path.join(alloc, &.{ home, ".mcp.json" });
@@ -616,27 +641,50 @@ fn fuzzEntry(a: Allocator, smith: *std.testing.Smith) Allocator.Error!Entry {
     return .{ .stdio = .{ .command = fuzz_commands[smith.index(fuzz_commands.len)], .args = args, .env = env } };
 }
 
-/// Whether the reader's own entry points load `name` from `text`, as they do
-/// when fx starts. A server held back only for a variable that isn't set counts
-/// as loaded: the reader says why in a note, and `add` saves such a server.
-fn readerLoads(a: Allocator, file: File, text: []const u8, name: []const u8) !bool {
-    var environment = std.process.Environ.Map.init(a);
+/// Writes `text` into `tmp` at `sub_path`, with the folders above it. A test's own
+/// write: no sync, so a fuzzed run stays quick.
+fn writeTempFile(tmp: *testing.TmpDir, sub_path: []const u8, text: []const u8) !void {
+    if (std.Io.Dir.path.dirname(sub_path)) |parent| try tmp.dir.createDirPath(io_mod.getIo(), parent);
+    var f = try tmp.dir.createFile(io_mod.getIo(), sub_path, .{ .truncate = true });
+    defer f.close(io_mod.getIo());
+    try f.writeStreamingAll(io_mod.getIo(), text);
+}
+
+/// Whether fx's own loaders load `name` from `text`, written where they read it: the
+/// profile through `loadNativeConfigs`, which fx runs at start (with a folder of its
+/// own as HOME), and a project's `.mcp.json` through `workspace_config.load`, with
+/// the server approved. A server held back only for a variable that isn't set counts
+/// as loaded: the loader says why in a note, and `add` saves such a server.
+fn runtimeLoads(a: Allocator, file: File, text: []const u8, name: []const u8) !bool {
+    const builtin_mcp = @import("../../builtins/mcp.zig");
+    const workspace_config = @import("../mcp/workspace_config.zig");
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try io_mod.dirRealpathAlloc(a, tmp.dir, ".");
     switch (file) {
         .profile => {
-            var diagnostics: std.ArrayList(project_config.WorkspaceDiagnostic) = .empty;
-            var configs = project_config.parseProfileServers(a, text, &diagnostics) catch return false;
-            try project_config.expandProfileConfigs(a, &configs, &diagnostics, &environment);
-            return loadedOrHeld(configs.items, diagnostics.items, name);
+            try writeTempFile(&tmp, ".fx/mcp.json", text);
+            try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+            const workspace = try std.Io.Dir.path.join(a, &.{ root, "workspace" });
+            var environment = std.process.Environ.Map.init(a);
+            try environment.put("HOME", root);
+            io_mod.setEnvironMap(&environment);
+            defer io_mod.resetEnvironForTest();
+            var loaded = builtin_mcp.loadNativeConfigs(a, workspace) catch return false;
+            defer loaded.deinit(a);
+            return loadedOrHeld(loaded.configs.items, loaded.diagnostics.items, name);
         },
         .project => {
+            try writeTempFile(&tmp, ".mcp.json", text);
             var approved = [_][]u8{@constCast(name)};
-            const result = try project_config.parseWorkspaceJsonWithEnvironment(a, text, .workspace, .{ .approved = &approved }, &environment);
+            var result = workspace_config.load(a, root, .workspace, .{ .approved = &approved }) catch return false;
+            defer result.deinit(a);
             return loadedOrHeld(result.configs.items, result.diagnostics.items, name);
         },
     }
 }
 
-/// `configs` are the reader's servers and `diagnostics` its notes.
+/// `configs` are the loader's servers and `diagnostics` its notes.
 fn loadedOrHeld(configs: anytype, diagnostics: []const project_config.WorkspaceDiagnostic, name: []const u8) bool {
     for (configs) |c| if (std.mem.eql(u8, c.name, name)) return true;
     for (diagnostics) |d| {
@@ -668,10 +716,14 @@ fn fuzzAddReaderAgree(_: void, smith: *std.testing.Smith) !void {
         while (keys.next()) |key| try testing.expect(written.object.contains(key.key_ptr.*));
     }
 
-    // The reader's check: a text it accepts is loaded by the reader's own entry points.
+    // The reader's check against fx's own loaders: it refuses an entry exactly when they
+    // would skip it (a refusal for a misspelled key says nothing of the entry).
     const refusal = try refusalOf(a, file, before, after, name);
-    if (refusal == null) {
-        try testing.expect(try readerLoads(a, file, after, name));
+    const loads = try runtimeLoads(a, file, after, name);
+    if (refusal) |why| {
+        if (why == .entry) try testing.expect(!loads);
+    } else {
+        try testing.expect(loads);
         // No misspelled key is left for the next edit to find.
         if (file == .profile) try testing.expect(try project_config.misspelledKey(a, after) == null);
     }
