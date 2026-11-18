@@ -2917,7 +2917,12 @@ const MailboxFixture = struct {
 
     fn run(raw: ?*anyopaque, turn: *execution.TurnContext, message: domain.QueuedMessage, _: domain.AdmissionSnapshot, cancel: *std.atomic.Value(bool)) execution.ServiceError!execution.RunOutcome {
         const self: *@This() = @ptrCast(@alignCast(raw.?));
+        if (fixture_run_hook) |hook| hook();
         if (cancel.load(.seq_cst)) _ = self.cancelled_at_start.fetchAdd(1, .seq_cst);
+        // The app hands a hosted turn to the child's agent through `postAndWait`
+        // (`src/core/app/app_agents_runtime.zig`), which withdraws a post whose
+        // cancel is set before the main loop takes it, so no turn begins.
+        if (turn.isHosted() and cancel.load(.seq_cst)) return error.Cancelled;
         const worker = turn.workerRuntime();
         // Counted once its turn has begun, so a test that waits for the run
         // can message it. A run that takes no steering is a turn past its
@@ -7670,6 +7675,9 @@ const Actor = enum { parent_stop, parent_close, user_close, user_stop };
 /// One action, or two in a row, at one window.
 const Plan = struct { first: Actor, second: ?Actor = null };
 
+/// The pairs that end in a user's stop are not run: the app calls
+/// `Runtime.userStopped` only while a turn runs, and no turn runs after a stop
+/// or close.
 const table_plans = [_]Plan{
     .{ .first = .parent_stop },
     .{ .first = .parent_close },
@@ -7681,6 +7689,12 @@ const table_plans = [_]Plan{
     .{ .first = .parent_close, .second = .parent_stop },
     .{ .first = .parent_stop, .second = .parent_stop },
     .{ .first = .user_stop, .second = .parent_stop },
+    .{ .first = .user_close, .second = .parent_close },
+    .{ .first = .parent_close, .second = .user_close },
+    .{ .first = .user_stop, .second = .parent_close },
+    .{ .first = .parent_close, .second = .parent_close },
+    .{ .first = .user_close, .second = .user_close },
+    .{ .first = .user_stop, .second = .user_close },
 };
 
 const Scenario = enum {
@@ -7721,6 +7735,15 @@ const Scenario = enum {
     /// Two works in a row, each ending with a message unread, the first one's
     /// dropped by a stop before the second began.
     two_works_unread,
+    /// The first work fails with a message kept: its end is recorded and the
+    /// host's hook has not run.
+    recorded_kept_failed_first,
+    /// The first work fails with a message waiting, and the hook has chosen it.
+    gap_next_failed_first,
+    /// The first work's worker attached, and its turn has not begun.
+    attached_not_begun,
+    /// The same for the work the host chose from a waiting message.
+    next_attached_not_begun,
 
     /// A hosted run binds to the child agent's own worker, as the app's do;
     /// the cells that make a work fail or cancel before it attaches need it.
@@ -7745,14 +7768,14 @@ const Scenario = enum {
     /// Whether the first work's run waits for a release.
     fn holdsFirstWork(self: Scenario) bool {
         return switch (self) {
-            .returned_clean, .recorded_clean, .gap_idle, .starting_one, .starting_two => false,
+            .returned_clean, .recorded_clean, .gap_idle, .starting_one, .starting_two, .attached_not_begun => false,
             else => true,
         };
     }
 
     fn steerable(self: Scenario) bool {
         return switch (self) {
-            .running_unread, .returned_kept, .recorded_kept, .two_works_unread => true,
+            .running_unread, .returned_kept, .recorded_kept, .two_works_unread, .recorded_kept_failed_first => true,
             else => false,
         };
     }
@@ -7760,8 +7783,8 @@ const Scenario = enum {
     /// The groups of messages that share one fate, and the call of the first.
     fn units(self: Scenario) []const AccountUnit {
         return switch (self) {
-            .returned_clean, .recorded_clean, .gap_idle => &.{unit_first},
-            .running_unread, .returned_kept, .recorded_kept => &.{ unit_first, unit_unread },
+            .returned_clean, .recorded_clean, .gap_idle, .attached_not_begun => &.{unit_first},
+            .running_unread, .returned_kept, .recorded_kept, .recorded_kept_failed_first => &.{ unit_first, unit_unread },
             .next_two, .next_two_failed, .next_two_cancelled, .starting_two => &.{ unit_first, unit_joined },
             .two_works_unread => &.{ unit_first, unit_unread, unit_later, unit_again },
             else => &.{ unit_first, unit_second },
@@ -7813,6 +7836,34 @@ fn HeldRunTwice(comptime recorded: bool) type {
 const RunHeld = HeldRunTwice(false);
 const RecordedHeld = HeldRunTwice(true);
 
+/// The hold at the top of the fixture's `run`: a work's worker has attached
+/// and its turn has not begun. It holds the run with the index `armed_for`:
+/// 0 is the first work, 1 the one the host chooses next.
+const AttachedHold = struct {
+    var first = TestHold{};
+    var calls = std.atomic.Value(u32).init(0);
+    var armed_for: u32 = 0;
+
+    fn at() void {
+        if (calls.fetchAdd(1, .seq_cst) == armed_for) first.once();
+    }
+
+    fn arm(run_index: u32) void {
+        first.reset();
+        calls.store(0, .seq_cst);
+        armed_for = run_index;
+        fixture_run_hook = at;
+    }
+
+    fn release() void {
+        first.release();
+    }
+};
+
+/// Test builds run it at the top of `MailboxFixture.run`, before the run looks at
+/// its cancel; null unless a cell holds the attached work.
+var fixture_run_hook: ?*const fn () void = null;
+
 const PublishHeldTwice = struct {
     var first = TestHold{};
     var second = TestHold{};
@@ -7854,9 +7905,9 @@ const AccountCell = struct {
     /// What each stop's and close's answer said, in order.
     answers: std.ArrayList([]const u8) = .empty,
 
-    fn init(self: *AccountCell, scenario: Scenario) !void {
+    fn init(self: *AccountCell, scenario: Scenario, hosted_path: bool) !void {
         const alloc = std.testing.allocator;
-        const hosted = scenario.hosted();
+        const hosted = scenario.hosted() or hosted_path;
         self.* = .{
             .alloc = alloc,
             .arena_state = .init(alloc),
@@ -7867,6 +7918,7 @@ const AccountCell = struct {
                 .steerable = scenario.steerable(),
                 .hosted = if (hosted) &self.hosted_worker else null,
                 .bind_honors_cancel = hosted,
+                .fail_first = scenario == .recorded_kept_failed_first or scenario == .gap_next_failed_first,
             },
             .runtime = undefined,
             .scenario = scenario,
@@ -7920,6 +7972,10 @@ const AccountCell = struct {
             // Armed once the first work has ended, so the hold meets the slot
             // the waiting message starts and not the first one.
             .starting_one, .starting_two => {},
+            .recorded_kept_failed_first => RecordedHeld.arm(),
+            .gap_next_failed_first => PublishHeldTwice.arm(),
+            .attached_not_begun => AttachedHold.arm(0),
+            .next_attached_not_begun => AttachedHold.arm(1),
         }
     }
 
@@ -7928,6 +7984,7 @@ const AccountCell = struct {
         RecordedHeld.release();
         PublishHeldTwice.release();
         HeldStart.release();
+        AttachedHold.release();
     }
 
     fn arena(self: *AccountCell) Allocator {
@@ -8094,6 +8151,24 @@ const AccountCell = struct {
                 fixture.release.set(io_mod.getIo());
                 try RecordedHeld.second.waitHeld();
             },
+            .recorded_kept_failed_first => {
+                try Leftovers.endFirstWorkUnread(self.runtime, fixture, self.arena());
+                try RecordedHeld.first.waitHeld();
+            },
+            .gap_next_failed_first => {
+                try self.firstWorkWithWaiting(false);
+                fixture.release.set(io_mod.getIo());
+                try PublishHeldTwice.first.waitHeld();
+            },
+            .attached_not_begun => {
+                _ = try self.say("first", "call-1");
+                try AttachedHold.first.waitHeld();
+            },
+            .next_attached_not_begun => {
+                try self.firstWorkWithWaiting(false);
+                fixture.release.set(io_mod.getIo());
+                try AttachedHold.first.waitHeld();
+            },
         }
     }
 
@@ -8181,6 +8256,7 @@ const AccountCell = struct {
 };
 
 fn clearAccountHooks() void {
+    fixture_run_hook = null;
     start_test_controls.test_wait_limit_ms = null;
     end_test_controls.test_hold_run = null;
     publish_test_controls.test_hold = null;
@@ -8243,26 +8319,43 @@ fn accountAnswerDropped(answer: []const u8) usize {
     return std.fmt.parseInt(usize, answer[start..at], 10) catch 0;
 }
 
-/// Cells where the user's close or stop drops a message that no count names, as
-/// on `main` (a user's close of a turn with a message unread or kept, and the
-/// user's stop before the end is recorded with one kept): a change that counts
-/// them takes this list as its failing tests. Every other cell holds R2.
-fn accountAsOnMain(plan: Plan, scenario: Scenario) bool {
-    // The parent's stop that follows counts what the user's left.
-    if (plan.second != null) return false;
+/// Cells that break R2 as `main` does: no count names a message that was dropped.
+/// A user's close of a turn with a message unread or kept, and the user's stop
+/// before the end is recorded with one kept, drop it silently; so do a second
+/// close, the parent's or the user's, after them, and the user's close after a
+/// user's stop that left a message. A parent's stop that follows counts what
+/// the user's left. On the hosted path, a parent's stop or close after the
+/// work's worker attached and before its turn begins withdraws the turn (the
+/// app's `postAndWait`) and counts nothing: `Slot.unstarted` is zeroed at the
+/// attach. A change that counts these takes this list as its failing tests.
+/// Every other cell holds R2.
+fn accountAsOnMain(plan: Plan, scenario: Scenario, hosted_path: bool) bool {
+    const attached = scenario == .attached_not_begun or scenario == .next_attached_not_begun;
+    if (attached and (hosted_path or scenario.hosted())) {
+        // The parent's stop owes no report, and nor does its close, unless the
+        // user's close came first: its report stays and accounts.
+        const parent_first = plan.first == .parent_stop or plan.first == .parent_close;
+        return parent_first or plan.second == .parent_stop or (plan.second == .parent_close and plan.first != .user_close);
+    }
+    const user_close_silent = switch (scenario) {
+        .running_unread, .returned_kept, .recorded_kept, .two_works_unread, .recorded_kept_failed_first => true,
+        else => false,
+    };
     return switch (plan.first) {
-        .user_close => switch (scenario) {
-            .running_unread, .returned_kept, .recorded_kept, .two_works_unread => true,
+        .user_close => user_close_silent and (plan.second == null or plan.second == .parent_close or plan.second == .user_close),
+        .user_stop => if (plan.second) |second| switch (second) {
+            // The app's Esc on a running turn counts the unread message.
+            .user_close => user_close_silent and scenario != .running_unread,
             else => false,
-        },
-        .user_stop => scenario == .returned_kept,
+        } else scenario == .returned_kept,
         else => false,
     };
 }
 
-fn accountCellName(buf: []u8, scenario: Scenario, plan: Plan, as_on_main: bool) []const u8 {
-    return std.mem.print(buf, "{s} / {s}{s}{s}{s}", .{
+fn accountCellName(buf: []u8, scenario: Scenario, hosted_path: bool, plan: Plan, as_on_main: bool) []const u8 {
+    return std.mem.print(buf, "{s}{s} / {s}{s}{s}{s}", .{
         @tagName(scenario),
+        if (hosted_path and !scenario.hosted()) " (hosted)" else "",
         @tagName(plan.first),
         if (plan.second != null) " then " else "",
         if (plan.second) |second| @tagName(second) else "",
@@ -8271,20 +8364,20 @@ fn accountCellName(buf: []u8, scenario: Scenario, plan: Plan, as_on_main: bool) 
 }
 
 /// Runs one cell. False when it breaks a rule, after printing what main reads.
-fn runAccountCell(scenario: Scenario, plan: Plan) !bool {
+fn runAccountCell(scenario: Scenario, hosted_path: bool, plan: Plan) !bool {
     var cell: AccountCell = undefined;
-    try cell.init(scenario);
+    try cell.init(scenario, hosted_path);
     defer cell.deinit();
     try cell.reach();
     try cell.act(plan.first, 1);
     if (plan.second) |second| try cell.act(second, 2);
     try cell.finish();
-    const as_on_main = accountAsOnMain(plan, scenario);
+    const as_on_main = accountAsOnMain(plan, scenario, hosted_path);
     const ledger = cell.tally();
     const verdict = accountVerdict(ledger, as_on_main);
     if (verdict == .ok) return true;
     var buf: [160]u8 = undefined;
-    cell.print(accountCellName(&buf, scenario, plan, as_on_main), ledger, verdict);
+    cell.print(accountCellName(&buf, scenario, hosted_path, plan, as_on_main), ledger, verdict);
     return false;
 }
 
@@ -8292,15 +8385,22 @@ test "every message main sends has one account in every window of a subagent's s
     var broken: usize = 0;
     var cells: usize = 0;
     for (std.enums.values(Scenario)) |scenario| {
-        for (table_plans) |plan| {
-            cells += 1;
-            const held = runAccountCell(scenario, plan) catch |err| {
-                var buf: [160]u8 = undefined;
-                std.debug.print("\nTABLE {s}: the cell could not be driven ({s}); the rest of its window is skipped\n", .{ accountCellName(&buf, scenario, plan, false), @errorName(err) });
-                broken += 1;
-                break;
-            };
-            if (!held) broken += 1;
+        // A window runs on the plain path, where the fixture's run saves a
+        // reply, and on the hosted path, where the child's agent runs the turn
+        // as the app's children do; a window that needs the hosted path only
+        // runs there.
+        const paths: []const bool = if (scenario.hosted()) &.{true} else &.{ false, true };
+        for (paths) |hosted_path| {
+            for (table_plans) |plan| {
+                cells += 1;
+                const held = runAccountCell(scenario, hosted_path, plan) catch |err| {
+                    var buf: [160]u8 = undefined;
+                    std.debug.print("\nTABLE {s}: the cell could not be driven ({s}); the rest of its window is skipped\n", .{ accountCellName(&buf, scenario, hosted_path, plan, false), @errorName(err) });
+                    broken += 1;
+                    break;
+                };
+                if (!held) broken += 1;
+            }
         }
     }
     if (broken > 0) std.debug.print("\nTABLE {d} of {d} cells break the rule or could not be driven\n", .{ broken, cells });
