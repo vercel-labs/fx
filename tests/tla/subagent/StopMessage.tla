@@ -80,7 +80,12 @@
 (* chosen work that counts its messages although it ends no work and       *)
 (* cancels none (Owner.noteUserStop), so they run. That stop counts        *)
 (* nothing of the chosen work, and after the end is recorded it counts     *)
-(* what the slot kept.                                                     *)
+(* what the slot kept. A chosen work can also fail before its turn begins, *)
+(* as a failed bind to its agent does (`FailStart`): its failed report     *)
+(* tells main its messages never ran, and the slot's count of them ends    *)
+(* with it (`unstarted` is zeroed where the end is recorded), so a stop or *)
+(* close after it counts none of them twice. "stale_unstarted" is the      *)
+(* count that outlives that work.                                          *)
 (*                                                                         *)
 (* Bug plants one defect; check.sh names the rule that must catch each.    *)
 (* "today" is fx before this design: a message to a work its parent        *)
@@ -102,7 +107,8 @@ Bugs == {"none", "today", "refuse_ending", "no_order", "uncounted",
          "before_idle", "note_after_take", "names_busy", "gap_blind"}
 \* The defects of the kept and carried messages, beside `Bugs`.
 KeptBugs == {"leftover_gap", "leftover_uncounted", "close_leaves_kept",
-             "user_ended_uncounted", "gap_uncounted", "user_next_counted"}
+             "user_ended_uncounted", "gap_uncounted", "user_next_counted",
+             "stale_unstarted"}
 ASSUME Bug \in Bugs \cup KeptBugs
 
 \* What an end tells main: no report, a report that says its subagent is
@@ -122,7 +128,7 @@ Ops == {"none", "step", "send", "stop", "close", "user_stop", "read",
 
 \* The phases and ops of the kept messages, beside `Phases` and `Ops`.
 AllPhases == Phases \cup {"ended"}
-AllOps == Ops \cup {"fail", "hook"}
+AllOps == Ops \cup {"fail", "hook", "fail_start"}
 
 Range(sq) == {sq[k] : k \in DOMAIN sq}
 RemoveAt(sq, i) == [k \in 1..(Len(sq) - 1) |-> IF k < i THEN sq[k] ELSE sq[k + 1]]
@@ -583,6 +589,23 @@ Fail(s) ==
                    step, covered, refusedOpen, coverBroken, lateStart>>
     /\ UNCHANGED idleVars
 
+\* The work the host chose for the slot fails before its worker begins, as a
+\* failed bind to its agent does. Its failed report tells main that its
+\* messages never ran, so no stop or close counts them again, and the slot's
+\* count of them ends with it (`slotMain` zeroes `unstarted` where it records
+\* the end); the end hook then runs as after any turn.
+FailStart(s) ==
+    /\ phase[s] = "starting"
+    /\ startq[s] # {}
+    /\ phase' = [phase EXCEPT ![s] = "ended"]
+    /\ startq' = [startq EXCEPT ![s] = IF Bug = "stale_unstarted" THEN @ ELSE {}]
+    /\ dropped' = dropped \cup startq[s]
+    /\ toldDropped' = toldDropped \cup startq[s]
+    /\ last' = Event("fail_start", s, NoMsg, "none", 0)
+    /\ UNCHANGED <<unread, waitq, kept, stoppedQ, read, told, sent, stops, steps,
+                   step, covered, refusedOpen, coverBroken, lateStart>>
+    /\ UNCHANGED idleVars
+
 \* The end hook of an ended turn queues the kept messages ahead of the
 \* waiting ones as the next work (`queueLeftoversLocked`, once
 \* `handOverLeftovers` allowed it), and the host chooses it: the gap, where
@@ -616,7 +639,7 @@ Next ==
     \/ Exec
     \/ \E s \in Subs : UserStop(s) \/ Begin(s) \/ Read(s) \/ Finish(s) \/ EndStopped(s)
                        \/ WriteClose(s) \/ FinishInGap(s) \/ EndStoppedInGap(s) \/ Publish(s)
-    \/ \E s \in Subs : Fail(s) \/ Hook(s)
+    \/ \E s \in Subs : Fail(s) \/ Hook(s) \/ FailStart(s)
 
 Spec == Init /\ [][Next]_vars
 
@@ -672,6 +695,12 @@ StopHoldsForQueued == stoppedQ \cap read = {}
 \* drops and counts them (`Owner.takeDropped`, `Owner.stop`).
 ClosingHoldsNoKept ==
     \A s \in Subs : Marked(s) => startq[s] = {} /\ kept[s] = {}
+
+\* A work's messages are accounted for by its end: once the end is recorded the
+\* slot counts none of them as unstarted any more, so a stop or close in the
+\* gap after it does not count them again (`slot.unstarted = 0` where
+\* `slotMain` records the end).
+UnstartedGone == \A s \in Subs : phase[s] = "ended" => startq[s] = {}
 
 \* A stop or close that answers it ended the subagent's turn, or closed the
 \* subagent, leaves it ending, closing or gone: never running on in the gap
