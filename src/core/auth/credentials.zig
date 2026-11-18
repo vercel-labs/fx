@@ -255,7 +255,7 @@ pub fn catalogAccessForCredentialAndAccount(
 
 /// Current native product copy. Store mechanics and availability come from the
 /// injected host port; Core retains the stable user-facing source name.
-pub const stored_key_backend_label = if (builtin.target.os.tag == .macos) "macOS Keychain" else "profile file";
+pub const stored_key_backend_label = if (builtin.target.os.tag == .macos) "macOS keychain" else "profile file";
 
 /// Both modes resolve the same source set; the mode selects only whether an expired
 /// fx login session is refreshed first.
@@ -272,14 +272,14 @@ const FxLoginRefreshMode = union(enum) {
     replace_rejected: []const u8,
 };
 
-pub const missing_credential_message = "fx needs access to Vercel AI Gateway. Run fx login to sign in, fx login vercel --api-key to use an API key, or set AI_GATEWAY_API_KEY.";
-pub const missing_interactive_credential_message = "fx needs access to Vercel AI Gateway. Run /login to sign in, /provider to use an API key, or set AI_GATEWAY_API_KEY.";
-pub const missing_chatgpt_credential_message = "fx needs a Codex subscription login for this model. Run fx login codex.";
-pub const missing_chatgpt_interactive_credential_message = "Codex needs a subscription login. Run /login, open Connections, then choose Codex subscription.";
-pub const missing_grok_credential_message = "fx needs a Grok subscription login for this model. Run fx login grok.";
-pub const missing_grok_interactive_credential_message = "Grok needs a subscription login. Run /login, open Connections, then choose Grok subscription.";
-pub const unreadable_store_message = "fx could not read the stored API key from " ++ stored_key_backend_label ++ ". A key may be saved but unreadable. Set FX_TRACE_LOG for the failing step, or set AI_GATEWAY_API_KEY.";
-pub const host_managed_auth_message = "Authentication is managed by the host.";
+pub const missing_credential_message = "fx needs access to vercel AI gateway. run fx login to sign in, fx login vercel --api-key to use an API key, or set AI_GATEWAY_API_KEY.";
+pub const missing_interactive_credential_message = "fx needs access to vercel AI gateway. run /login to sign in, /provider to use an API key, or set AI_GATEWAY_API_KEY.";
+pub const missing_chatgpt_credential_message = "fx needs a codex subscription login for this model. run fx login codex.";
+pub const missing_chatgpt_interactive_credential_message = "codex needs a subscription login. run /login, open connections, then choose codex subscription.";
+pub const missing_grok_credential_message = "fx needs a grok subscription login for this model. run fx login grok.";
+pub const missing_grok_interactive_credential_message = "grok needs a subscription login. run /login, open connections, then choose grok subscription.";
+pub const unreadable_store_message = "fx could not read the stored API key from " ++ stored_key_backend_label ++ ". a key may be saved but unreadable. set FX_TRACE_LOG for the failing step, or set AI_GATEWAY_API_KEY.";
+pub const host_managed_auth_message = "authentication is managed by the host.";
 
 test "public credential guidance spells fx lowercase" {
     try std.testing.expect(std.mem.startsWith(u8, missing_credential_message, "fx needs"));
@@ -1002,8 +1002,8 @@ pub fn sourceLabel(source: Source) []const u8 {
         .ai_gateway_api_key => "AI_GATEWAY_API_KEY",
         .fx_login => "fx login",
         .stored_key => "stored API key (" ++ stored_key_backend_label ++ ")",
-        .chatgpt_subscription => "Codex subscription",
-        .grok_subscription => "Grok subscription",
+        .chatgpt_subscription => "codex subscription",
+        .grok_subscription => "grok subscription",
         .host_managed => "host managed",
         .configured => "configured provider",
     };

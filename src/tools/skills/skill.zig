@@ -103,8 +103,8 @@ pub fn presentation(args: std.json.ObjectMap) ?tool_dispatch.CallPresentation {
     if (offset == 0 and std.mem.eql(u8, resource, "SKILL.md")) return null;
     return .{
         .activity_kind = .read,
-        .action_label = "Reading skill resource",
-        .completed_action_label = "Read skill resource",
+        .action_label = "reading skill resource",
+        .completed_action_label = "read skill resource",
         .label_arg_kind = if (std.mem.eql(u8, resource, "SKILL.md")) .none else .resource,
         .label_arg_default = "SKILL.md",
     };
@@ -373,18 +373,18 @@ test "skill presentation distinguishes the initial document from resource reads"
         .{ .args = "{\"location\":\"/installed/workflow\",\"resource\":\"\"}", .expected = null },
         .{ .args = "{\"name\":\"workflow\",\"resource\":\"SKILL.md\",\"offset\":0}", .expected = null },
         .{ .args = "{\"name\":\"workflow\",\"resource\":\"references/contract-design.md\"}", .expected = .{
-            .active = "Reading skill resource",
-            .completed = "Read skill resource",
+            .active = "reading skill resource",
+            .completed = "read skill resource",
             .value = "references/contract-design.md",
         } },
         .{ .args = "{\"name\":\"workflow\",\"offset\":128}", .expected = .{
-            .active = "Reading skill resource",
-            .completed = "Read skill resource",
+            .active = "reading skill resource",
+            .completed = "read skill resource",
             .value = "SKILL.md",
         } },
         .{ .args = "{\"name\":\"workflow\",\"resource\":\"\",\"offset\":128}", .expected = .{
-            .active = "Reading skill resource",
-            .completed = "Read skill resource",
+            .active = "reading skill resource",
+            .completed = "read skill resource",
             .value = "SKILL.md",
         } },
     };

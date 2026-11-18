@@ -865,7 +865,7 @@ pub fn Commands(comptime App: type) type {
                     try app.writeDomainNotice(.{
                         .topic = "fast",
                         .tone = .neutral,
-                        .body = "This model does not come with a fast mode.",
+                        .body = "this model does not come with a fast mode.",
                     }, true);
                 }
                 app.shell.render_requests.request(.footer);
@@ -936,7 +936,7 @@ pub fn Commands(comptime App: type) type {
                     try app.writeDomainNotice(.{
                         .topic = "ultrafast",
                         .tone = .warning,
-                        .body = "Ultrafast mode is unavailable for this model and may increase cost.",
+                        .body = "ultrafast mode is unavailable for this model and may increase cost.",
                     }, true);
                 }
                 app.shell.render_requests.request(.footer);
@@ -1024,7 +1024,7 @@ pub fn Commands(comptime App: type) type {
         /// switched to. A running turn keeps the effort it started with.
         fn announceEffortSelection(app: *App, agent: *AppAgent) !void {
             const active_response = if (comptime agents.hasAgentField(App, "stream")) agent.stream.active else false;
-            const prefix: []const u8 = if (active_response) "Next turn will use reasoning effort " else "Reasoning effort set to ";
+            const prefix: []const u8 = if (active_response) "next turn will use reasoning effort " else "reasoning effort set to ";
             const line = try app.alloc.print("{s}{s} for {s}", .{ prefix, agent.effort.displayLabel(), provider_runtime.modelOf(app, agent) });
             defer app.alloc.free(line);
             try app.writeDomainNotice(.{ .topic = "", .tone = .neutral, .body = line }, true);
@@ -1358,7 +1358,7 @@ pub fn Commands(comptime App: type) type {
         }
 
         fn writeSettingsLoadError(app: *App, err: anyerror) !void {
-            const msg = try app.alloc.print("Failed to load settings: {s}", .{@errorName(err)});
+            const msg = try app.alloc.print("failed to load settings: {s}", .{@errorName(err)});
             defer app.alloc.free(msg);
             try app.writeDomainNotice(.{ .topic = "settings", .tone = .@"error", .body = msg }, true);
         }
@@ -1519,7 +1519,7 @@ pub fn Commands(comptime App: type) type {
         fn announceModelSelection(app: *App, agent: *AppAgent) !void {
             const selected = provider_runtime.modelOf(app, agent);
             const active_response = if (comptime agents.hasAgentField(App, "stream")) agent.stream.active else false;
-            const prefix: []const u8 = if (active_response) "Next turn will use " else "Switched to ";
+            const prefix: []const u8 = if (active_response) "next turn will use " else "switched to ";
             const speed: []const u8 = if (agent.worker.agent_turn_settings.ultrafast_mode)
                 "ultrafast"
             else if (app.fast_mode or model_capabilities.resolveForApp(App, app, selected).intrinsic_fast)
@@ -1560,7 +1560,7 @@ pub fn Commands(comptime App: type) type {
             try app.writeDomainNotice(.{
                 .topic = "",
                 .tone = .warning,
-                .body = "Fast mode bills AI Gateway credits, not Token Pass. Run /fast off to use Token Pass credit.",
+                .body = "fast mode bills AI gateway credits, not token pass. run /fast off to use token pass credit.",
             }, true);
         }
 
@@ -2396,11 +2396,11 @@ test "session_commands status snapshot builds the panel rows and writes no trans
 
     var snapshot = try Commands(FakeApp).openStatusSnapshot(&app, (&app).agent());
     defer snapshot.deinit();
-    try expectStatusRow(snapshot, "Model", "anthropic/test-model");
-    try expectStatusRow(snapshot, "Auth", "missing");
-    try expectStatusRow(snapshot, "Permissions", "auto");
-    try expectStatusRow(snapshot, "Turns", "7");
-    try expectStatusRow(snapshot, "Step limit", "24");
+    try expectStatusRow(snapshot, "model", "anthropic/test-model");
+    try expectStatusRow(snapshot, "auth", "missing");
+    try expectStatusRow(snapshot, "permissions", "auto");
+    try expectStatusRow(snapshot, "turns", "7");
+    try expectStatusRow(snapshot, "step limit", "24");
     try std.testing.expectEqual(@as(usize, 0), app.transcript.items.len);
     try std.testing.expect(try Commands(FakeApp).refreshedStatusSnapshot(&app, (&app).agent(), &snapshot) == null);
 
@@ -2408,8 +2408,8 @@ test "session_commands status snapshot builds the panel rows and writes no trans
     app.agent().session.history_len = 8;
     var refreshed = (try Commands(FakeApp).refreshedStatusSnapshot(&app, (&app).agent(), &snapshot)).?;
     defer refreshed.deinit();
-    try expectStatusRow(refreshed, "Permissions", "full access");
-    try expectStatusRow(refreshed, "Turns", "8");
+    try expectStatusRow(refreshed, "permissions", "full access");
+    try expectStatusRow(refreshed, "turns", "8");
 }
 
 fn expectStatusRow(snapshot: info_panel.Snapshot, label: []const u8, value: []const u8) !void {
@@ -2678,7 +2678,7 @@ test "session_commands handleModel resolves fuzzy cached model and syncs queued 
         "fx v" ++ build_options.app_version ++ " | workspace",
         app.terminalTitleLabelText(),
     );
-    try expectTranscriptContains(&app, "* Switched to anthropic/claude-sonnet-4-20250514");
+    try expectTranscriptContains(&app, "* switched to anthropic/claude-sonnet-4-20250514");
 }
 
 test "session_commands handleModel picks the model the Models menu lists first" {
@@ -2769,15 +2769,15 @@ test "session_commands permissions snapshot shows the mode and grants and change
 
     var snapshot = try Commands(FakeApp).openPermissionsSnapshot(&app, (&app).agent());
     defer snapshot.deinit();
-    try expectStatusRow(snapshot, "Mode", "auto");
-    try expectStatusRow(snapshot, "Configured rules", "none");
-    try expectStatusRow(snapshot, "Session grants", "1");
+    try expectStatusRow(snapshot, "mode", "auto");
+    try expectStatusRow(snapshot, "configured rules", "none");
+    try expectStatusRow(snapshot, "session grants", "1");
     const grants_at = for (snapshot.rows, 0..) |row, at| {
-        if (std.mem.eql(u8, row.label, "Session grants")) break at;
+        if (std.mem.eql(u8, row.label, "session grants")) break at;
     } else return error.TestExpectedEqual;
     try std.testing.expect(snapshot.rows[grants_at + 1].item);
     try std.testing.expectEqualStrings("bash → git *", snapshot.rows[grants_at + 1].value);
-    try expectStatusRow(snapshot, "Change mode", "/permissions ask, auto, full-access, or reset");
+    try expectStatusRow(snapshot, "change mode", "/permissions ask, auto, full-access, or reset");
     try std.testing.expect(try Commands(FakeApp).refreshedPermissionsSnapshot(&app, (&app).agent(), &snapshot) == null);
 
     try std.testing.expectEqual(@as(usize, 0), app.semantic_write_count);
@@ -2790,7 +2790,7 @@ test "session_commands permissions snapshot shows the mode and grants and change
     try app.permission_engine.allow(alloc, "read_file", "src/**");
     var refreshed = (try Commands(FakeApp).refreshedPermissionsSnapshot(&app, (&app).agent(), &snapshot)).?;
     defer refreshed.deinit();
-    try expectStatusRow(refreshed, "Session grants", "2");
+    try expectStatusRow(refreshed, "session grants", "2");
 }
 
 test "session_commands handlePermissions reports usage and invalid action before touching settings" {
@@ -3021,7 +3021,7 @@ test "session_commands allowlist view reports unsafe settings without returning 
     defer app.deinit();
 
     try Commands(FakeApp).handleAllowlist(&app, (&app).agent(), "view");
-    try expectTranscriptContains(&app, "Failed to load settings: DurablePathUnsafe");
+    try expectTranscriptContains(&app, "failed to load settings: DurablePathUnsafe");
 }
 
 test "web_fetch allowlist add remove view and reset persist exact canonical domains" {
@@ -3204,7 +3204,7 @@ test "session_commands toggleFast reports unsupported model and redraws footer" 
     try std.testing.expect(app.shell.render_requests.hasReason(.footer));
     try std.testing.expect(app.agent().worker.synced_fast_mode == null);
     try std.testing.expectEqual(@as(usize, 0), app.agent().worker.fast_sync_count);
-    try expectTranscriptContains(&app, "* fast: This model does not come with a fast mode.");
+    try expectTranscriptContains(&app, "* fast: this model does not come with a fast mode.");
 }
 
 test "session_commands toggleFast disables stale fast mode for unsupported model" {
@@ -3462,9 +3462,9 @@ test "model switch notice reports the final chosen effort and Ultrafast speed" {
     app.setGatewayControls("openai/gpt-6-astra", &efforts, true);
     app.gateway_metadata.supports_ultrafast_mode = true;
     try Commands(FakeApp).selectModelFromPicker(&app, (&app).agent(), "openai/gpt-6-astra", types.ReasoningEffort.literal("xhigh"), false, true);
-    try expectTranscriptContains(&app, "Switched to openai/gpt-6-astra (effort: xhigh, speed: ultrafast)");
+    try expectTranscriptContains(&app, "switched to openai/gpt-6-astra (effort: xhigh, speed: ultrafast)");
     try std.testing.expect(std.mem.find(u8, app.text(), "effort: default") == null);
-    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, app.text(), "Switched to "));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, app.text(), "switched to "));
     try std.testing.expectEqual(@as(usize, 1), app.preference_commit_count);
 }
 
@@ -3475,7 +3475,7 @@ test "plain model switch notice does not report the previous model's speed" {
     app.agent().worker.agent_turn_settings.ultrafast_mode = true;
     app.fail_fetch = true;
     try Commands(FakeApp).handleModel(&app, (&app).agent(), "openai/gpt-6-astra");
-    try expectTranscriptContains(&app, "Switched to openai/gpt-6-astra (effort: default, speed: normal)");
+    try expectTranscriptContains(&app, "switched to openai/gpt-6-astra (effort: default, speed: normal)");
     try std.testing.expect(!app.agent().worker.agent_turn_settings.ultrafast_mode);
 }
 

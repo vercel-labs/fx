@@ -127,19 +127,19 @@ fn emptyText(projection: SkillsMenuProjection, buf: []u8) EmptyText {
 
 fn skillSourceScopeLabel(source: skill_runtime.SkillSource) []const u8 {
     return switch (source) {
-        .global_fx => "fx · Global",
-        .workspace_fx => "fx · Workspace",
-        .workspace_shared => "fx · Workspace",
-        .workspace_opencode => "OpenCode · Workspace",
-        .global_opencode => "OpenCode · Global",
-        .workspace_codex => "Codex · Workspace",
-        .global_codex => "Codex · Global",
-        .workspace_claude => "Claude · Workspace",
-        .global_claude => "Claude · Global",
-        .workspace_agents => "Agents · Workspace",
-        .global_agents => "Agents · Global",
-        .workspace_claw => "Claw · Workspace",
-        .global_claw => "Claw · Global",
+        .global_fx => "fx · global",
+        .workspace_fx => "fx · workspace",
+        .workspace_shared => "fx · workspace",
+        .workspace_opencode => "OpenCode · workspace",
+        .global_opencode => "OpenCode · global",
+        .workspace_codex => "codex · workspace",
+        .global_codex => "codex · global",
+        .workspace_claude => "claude · workspace",
+        .global_claude => "claude · global",
+        .workspace_agents => "agents · workspace",
+        .global_agents => "agents · global",
+        .workspace_claw => "claw · workspace",
+        .global_claw => "claw · global",
     };
 }
 
@@ -148,7 +148,7 @@ fn testSkill(name: []const u8, source: skill_runtime.SkillSource) skill_runtime.
 }
 
 test "skills menu labels native workspace skills with lowercase product name" {
-    try std.testing.expectEqualStrings("fx · Workspace", skillSourceScopeLabel(.workspace_fx));
+    try std.testing.expectEqualStrings("fx · workspace", skillSourceScopeLabel(.workspace_fx));
 }
 
 test "skills menu shows a plain title, only the active source, and single-line rows" {
@@ -166,7 +166,7 @@ test "skills menu shows a plain title, only the active source, and single-line r
     var title = try composeSkillsMenuRow(alloc, prepared, 0, 120);
     defer title.deinit(alloc);
     try std.testing.expect(std.mem.find(u8, title.items, "skills") != null);
-    try std.testing.expect(std.mem.find(u8, title.items, "< All >") != null);
+    try std.testing.expect(std.mem.find(u8, title.items, "< all >") != null);
     try std.testing.expect(std.mem.find(u8, title.items, "skills 2") == null);
     try std.testing.expect(std.mem.find(u8, title.items, "Skills") == null);
     try std.testing.expect(std.mem.find(u8, title.items, "OpenCode") == null);
@@ -179,7 +179,7 @@ test "skills menu shows a plain title, only the active source, and single-line r
     defer selected.deinit(alloc);
     try std.testing.expect(std.mem.startsWith(u8, selected.items, ui_render.selected_completion_style));
     try std.testing.expect(std.mem.find(u8, selected.items, "workspace") != null);
-    try std.testing.expect(std.mem.find(u8, selected.items, "Codex · Workspace") != null);
+    try std.testing.expect(std.mem.find(u8, selected.items, "codex · workspace") != null);
     try std.testing.expect(std.mem.find(u8, selected.items, "description") == null);
     try std.testing.expect(std.mem.find(u8, selected.items, "›") == null);
 
@@ -308,8 +308,8 @@ test "skills menu source column stays fixed across scroll windows" {
     var second_row = try composeSkillsMenuRow(alloc, second_window, 2, 80);
     defer second_row.deinit(alloc);
 
-    const first_scope = std.mem.find(u8, first_row.items, "OpenCode · Global") orelse return error.MissingFirstScope;
-    const second_scope = std.mem.find(u8, second_row.items, "OpenCode · Global") orelse return error.MissingSecondScope;
+    const first_scope = std.mem.find(u8, first_row.items, "OpenCode · global") orelse return error.MissingFirstScope;
+    const second_scope = std.mem.find(u8, second_row.items, "OpenCode · global") orelse return error.MissingSecondScope;
     // Two-cell indent, the widest name, and the six-cell gap.
     try std.testing.expectEqual(@as(usize, 26), display_width.visibleWidthIgnoringAnsi(first_row.items[0..first_scope]));
     try std.testing.expectEqual(@as(usize, 26), display_width.visibleWidthIgnoringAnsi(second_row.items[0..second_scope]));

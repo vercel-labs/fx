@@ -597,9 +597,9 @@ pub fn waitNotice(alloc: Allocator, waiting: Waiting, deadline_ms: i64) Allocato
 
 fn providerLabel(provider: model_provider.ProviderId) []const u8 {
     return switch (provider) {
-        .gateway => "AI Gateway",
+        .gateway => "AI gateway",
         .codex => "ChatGPT",
-        .grok => "Grok",
+        .grok => "grok",
         .configured => "the configured provider",
     };
 }
@@ -952,7 +952,7 @@ test "a catalog request still out at the deadline is cancelled and joined before
     var checks: std.ArrayList(Check) = .empty;
     defer freeChecks(alloc, &checks);
     try catalogChecks(&checks, alloc, &probe, .gateway, 50);
-    try std.testing.expectEqualStrings("could not reach AI Gateway in 1 s", checks.items[0].detail);
+    try std.testing.expectEqualStrings("could not reach AI gateway in 1 s", checks.items[0].detail);
 }
 
 test "a child still running at the deadline is killed with its group and its waiter joined" {
@@ -1397,9 +1397,9 @@ test "the wait notice names each network check doctor started and the limit" {
     const alloc = std.testing.allocator;
     const Case = struct { waiting: Waiting, want: ?[]const u8 };
     for ([_]Case{
-        .{ .waiting = .{ .provider = .gateway, .mcp_servers = 3, .gh = .checking }, .want = "checking AI Gateway, 3 MCP servers, and gh (up to 5 s)...\n" },
+        .{ .waiting = .{ .provider = .gateway, .mcp_servers = 3, .gh = .checking }, .want = "checking AI gateway, 3 MCP servers, and gh (up to 5 s)...\n" },
         .{ .waiting = .{ .mcp_servers = 1 }, .want = "checking 1 MCP server (up to 5 s)...\n" },
-        .{ .waiting = .{ .provider = .grok, .gh = .checking }, .want = "checking Grok and gh (up to 5 s)...\n" },
+        .{ .waiting = .{ .provider = .grok, .gh = .checking }, .want = "checking grok and gh (up to 5 s)...\n" },
         .{ .waiting = .{}, .want = null },
     }) |case| {
         const notice = try waitNotice(alloc, case.waiting, 5_000);

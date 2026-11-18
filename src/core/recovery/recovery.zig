@@ -598,16 +598,16 @@ fn elapsedMs(state: *const State, now_ms: u64) u64 {
 // Wording.
 
 fn reasonText(state: *const State) []const u8 {
-    const cause = state.cause orelse return "Retrying";
+    const cause = state.cause orelse return "retrying";
     return switch (cause) {
-        .offline => "Offline",
-        .dropped => "Connection lost",
-        .unreadable => "Unreadable reply",
-        .server => "Gateway error",
-        .refused => "Gateway refused the login",
-        .rate_limited => "Rate limited",
-        .too_long => "Conversation too long",
-        .rejected, .sign_in, .quota, .content_filter => "Retrying",
+        .offline => "offline",
+        .dropped => "connection lost",
+        .unreadable => "unreadable reply",
+        .server => "gateway error",
+        .refused => "gateway refused the login",
+        .rate_limited => "rate limited",
+        .too_long => "conversation too long",
+        .rejected, .sign_in, .quota, .content_filter => "retrying",
     };
 }
 
@@ -615,7 +615,7 @@ fn waitingStatus(state: *const State, now_ms: u64) Status {
     const remaining_ms = state.wait_until_ms -| now_ms;
     const next = Clock.of(@max(1, (remaining_ms +| 999) / 1000));
     const text = if (state.cause == .offline)
-        textOf("Offline · next try in {s}", .{next.slice()})
+        textOf("offline · next try in {s}", .{next.slice()})
     else
         textOf("{s} · next try in {s} · attempt {d}", .{ reasonText(state), next.slice(), state.attempt });
     return .{ .kind = .waiting, .text = text };
@@ -623,12 +623,12 @@ fn waitingStatus(state: *const State, now_ms: u64) Status {
 
 fn retryingStatus(state: *const State) Status {
     const text = switch (state.retry_label) {
-        .compacting => constText("Conversation too long · compacting, then retrying"),
-        .resuming => textOf("Resuming the interrupted request · attempt {d}", .{state.attempt}),
-        .after_sign_in => textOf("Signed in · retrying · attempt {d}", .{state.attempt}),
-        .after_user => textOf("Retrying · attempt {d}", .{state.attempt}),
+        .compacting => constText("conversation too long · compacting, then retrying"),
+        .resuming => textOf("resuming the interrupted request · attempt {d}", .{state.attempt}),
+        .after_sign_in => textOf("signed in · retrying · attempt {d}", .{state.attempt}),
+        .after_user => textOf("retrying · attempt {d}", .{state.attempt}),
         .after_failure => if (state.cause == .server and state.flags.no_fast)
-            textOf("Gateway error · retrying without Fast · attempt {d}", .{state.attempt})
+            textOf("gateway error · retrying without fast · attempt {d}", .{state.attempt})
         else
             textOf("{s} · retrying · attempt {d}", .{ reasonText(state), state.attempt }),
     };
@@ -657,27 +657,27 @@ fn needStatus(need: Status.Need) Status {
     return switch (need) {
         // askUser routes a sign-in to signInStatus, which counts the wait.
         .sign_in => needOf(need, "Sign-in expired", ""),
-        .quota => needOf(need, "Out of credits", ""),
+        .quota => needOf(need, "out of credits", ""),
         .content_filter => needOf(
             need,
-            "Blocked by the content filter · press Esc and rephrase",
-            "Blocked by content filter · Esc, then rephrase",
+            "blocked by the content filter · press esc and rephrase",
+            "blocked by content filter · esc, then rephrase",
         ),
-        .rejected => needOf(need, "The provider rejected this request · press Esc", ""),
+        .rejected => needOf(need, "the provider rejected this request · press esc", ""),
         .too_long => needOf(
             need,
-            "Still too long after compacting · press Esc and shorten your message",
-            "Still too long · Esc, then shorten it",
+            "still too long after compacting · press esc and shorten your message",
+            "still too long · esc, then shorten it",
         ),
         .crash_loop => needOf(
             need,
-            "This request crashed fx twice · Enter to retry, Esc to cancel",
-            "Crashed fx twice · Enter retries, Esc cancels",
+            "this request crashed fx twice · enter to retry, esc to cancel",
+            "crashed fx twice · enter retries, esc cancels",
         ),
         .stale => needOf(
             need,
-            "Interrupted more than a day ago · Enter to resume, Esc to cancel",
-            "Over a day old · Enter resumes, Esc cancels",
+            "interrupted more than a day ago · enter to resume, esc to cancel",
+            "over a day old · enter resumes, esc cancels",
         ),
     };
 }
@@ -698,7 +698,7 @@ fn constText(comptime value: []const u8) Text {
 /// attempt or duration, so the fallback exists only to keep `step` total.
 fn textOf(comptime format: []const u8, args: anytype) Text {
     var text: Text = .{};
-    const written = std.mem.print(&text.bytes, format, args) catch return constText("Recovering");
+    const written = std.mem.print(&text.bytes, format, args) catch return constText("recovering");
     text.len = @intCast(written.len);
     return text;
 }
@@ -867,9 +867,9 @@ test "an unreadable reply waits and resends as a dropped connection does, under 
     _ = startNew(&state, 10_000, false);
     const failed = fail(&state, .unreadable, 19_000);
     try testing.expect(failed.send == null);
-    try testing.expectEqualStrings("Unreadable reply · next try in 1s · attempt 1", failed.status.?.text.slice());
+    try testing.expectEqualStrings("unreadable reply · next try in 1s · attempt 1", failed.status.?.text.slice());
     const retry = tickUntilSend(&state, 19_000);
-    try testing.expectEqualStrings("Unreadable reply · retrying · attempt 2", retry.plan.status.?.text.slice());
+    try testing.expectEqualStrings("unreadable reply · retrying · attempt 2", retry.plan.status.?.text.slice());
     // A relaunch reads the cause back from the record.
     const restored = decode(encode(&state, retry.at_ms)) orelse return error.TestExpectedRecord;
     try testing.expectEqual(@as(?Failure.Kind, .unreadable), restored.cause);
@@ -886,12 +886,12 @@ test "a dropped connection waits, retries, and clears at the first byte" {
     try testing.expect(failed.save != null);
     try testing.expect(failed.send == null);
     try testing.expectEqual(Status.Kind.waiting, failed.status.?.kind);
-    try testing.expectEqualStrings("Connection lost · next try in 1s · attempt 1", failed.status.?.text.slice());
+    try testing.expectEqualStrings("connection lost · next try in 1s · attempt 1", failed.status.?.text.slice());
 
     const retry = tickUntilSend(&state, 19_000);
     try testing.expect(retry.plan.save != null);
     try testing.expectEqual(Send{}, retry.plan.send.?);
-    try testing.expectEqualStrings("Connection lost · retrying · attempt 2", retry.plan.status.?.text.slice());
+    try testing.expectEqualStrings("connection lost · retrying · attempt 2", retry.plan.status.?.text.slice());
 
     const flowing = step(&state, .responding, retry.at_ms + 300);
     try testing.expectEqual(Status.Kind.clear, flowing.status.?.kind);
@@ -907,11 +907,11 @@ test "the countdown updates once a second while waiting" {
     var state: State = .{};
     _ = startNew(&state, 0, false);
     const failed = step(&state, .{ .failed = .{ .kind = .rate_limited, .retry_after_ms = 5_000 } }, 1_000);
-    try testing.expectEqualStrings("Rate limited · next try in 5s · attempt 1", failed.status.?.text.slice());
+    try testing.expectEqualStrings("rate limited · next try in 5s · attempt 1", failed.status.?.text.slice());
     // The same second shows the same text, so there is nothing to redraw.
     try testing.expectEqual(Plan{}, step(&state, .tick, 1_000));
     const later = step(&state, .tick, 2_000);
-    try testing.expectEqualStrings("Rate limited · next try in 4s · attempt 1", later.status.?.text.slice());
+    try testing.expectEqualStrings("rate limited · next try in 4s · attempt 1", later.status.?.text.slice());
 }
 
 test "a resend hands the line back to the thinking row after two seconds" {
@@ -940,7 +940,7 @@ test "a quick refusal goes from the retry status straight to its countdown" {
     try testing.expectEqual(Plan{}, step(&state, .tick, retry.at_ms + 1_000));
     const refused = step(&state, .{ .failed = .{ .kind = .rate_limited, .retry_after_ms = 2_000 } }, retry.at_ms + 1_500);
     try testing.expectEqual(Status.Kind.waiting, refused.status.?.kind);
-    try testing.expectEqualStrings("Rate limited · next try in 2s · attempt 2", refused.status.?.text.slice());
+    try testing.expectEqualStrings("rate limited · next try in 2s · attempt 2", refused.status.?.text.slice());
 }
 
 test "a resend that fails after the hand-off shows its countdown again" {
@@ -952,7 +952,7 @@ test "a resend that fails after the hand-off shows its countdown again" {
     // The dead-peer probes fail a silent connection after 45 seconds.
     const failed = fail(&state, .dropped, retry.at_ms + 45_000);
     try testing.expectEqual(Status.Kind.waiting, failed.status.?.kind);
-    try testing.expect(startsWith(failed.status.?.text.slice(), "Connection lost · next try in "));
+    try testing.expect(startsWith(failed.status.?.text.slice(), "connection lost · next try in "));
     try testing.expect(std.mem.endsWith(u8, failed.status.?.text.slice(), " · attempt 2"));
 }
 
@@ -1013,7 +1013,7 @@ test "offline retries every few seconds and never escalates" {
     for (expected) |wait_ms| {
         const plan = fail(&state, .offline, now_ms);
         try testing.expectEqual(now_ms + wait_ms, state.wait_until_ms);
-        try testing.expect(startsWith(plan.status.?.text.slice(), "Offline · next try in "));
+        try testing.expect(startsWith(plan.status.?.text.slice(), "offline · next try in "));
         now_ms = tickUntilSend(&state, now_ms).at_ms;
     }
     try testing.expectEqual(Flags{}, state.flags);
@@ -1032,7 +1032,7 @@ test "repeated drops keep retrying the same way" {
         now_ms = retry.at_ms;
     }
     try testing.expectEqual(Send{}, last.send.?);
-    try testing.expect(startsWith(last.status.?.text.slice(), "Connection lost · retrying · attempt 6"));
+    try testing.expect(startsWith(last.status.?.text.slice(), "connection lost · retrying · attempt 6"));
 }
 
 test "a server's Retry-After sets the wait, capped at the ceiling" {
@@ -1060,9 +1060,9 @@ test "three gateway errors drop Fast only when Fast is on" {
         try testing.expectEqual(fast, last.send.?.no_fast);
         const text = last.status.?.text.slice();
         if (fast) {
-            try testing.expect(startsWith(text, "Gateway error · retrying without Fast · attempt 4"));
+            try testing.expect(startsWith(text, "gateway error · retrying without fast · attempt 4"));
         } else {
-            try testing.expect(startsWith(text, "Gateway error · retrying · attempt 4"));
+            try testing.expect(startsWith(text, "gateway error · retrying · attempt 4"));
         }
     }
 }
@@ -1073,12 +1073,12 @@ test "too long compacts once at once, then waits for the user" {
     const compact = fail(&state, .too_long, 1_000);
     try testing.expect(compact.save != null);
     try testing.expectEqual(Send{ .compact_first = true }, compact.send.?);
-    try testing.expectEqualStrings("Conversation too long · compacting, then retrying", compact.status.?.text.slice());
+    try testing.expectEqualStrings("conversation too long · compacting, then retrying", compact.status.?.text.slice());
 
     const ask = fail(&state, .too_long, 2_000);
     try testing.expect(ask.send == null);
     try testing.expectEqual(Status.Need.too_long, ask.status.?.need.?);
-    try testing.expectEqualStrings("Still too long · Esc, then shorten it", ask.status.?.short.slice());
+    try testing.expectEqualStrings("still too long · esc, then shorten it", ask.status.?.short.slice());
 }
 
 test "out of credits waits for the user and continues after Enter" {
@@ -1086,13 +1086,13 @@ test "out of credits waits for the user and continues after Enter" {
     _ = startNew(&state, 0, false);
     const ask = fail(&state, .quota, 3_000);
     try testing.expectEqual(Status.Need.quota, ask.status.?.need.?);
-    try testing.expectEqualStrings("Out of credits", ask.status.?.text.slice());
+    try testing.expectEqualStrings("out of credits", ask.status.?.text.slice());
     try testing.expectEqual(Plan{}, step(&state, .tick, 60_000));
 
     const resumed = step(&state, .user_continue, 64_000);
     try testing.expect(resumed.save != null);
     try testing.expectEqual(Send{}, resumed.send.?);
-    try testing.expectEqualStrings("Retrying · attempt 2", resumed.status.?.text.slice());
+    try testing.expectEqualStrings("retrying · attempt 2", resumed.status.?.text.slice());
 }
 
 test "sign-in waits, then names the retry" {
@@ -1104,7 +1104,7 @@ test "sign-in waits, then names the retry" {
     try testing.expectEqualStrings("Sign-in expired · waiting 0s · next try in 3m 00s", ask.status.?.text.slice());
     try testing.expectEqualStrings("Sign-in expired · waiting 0s", ask.status.?.short.slice());
     const resumed = step(&state, .user_continue, 64_000);
-    try testing.expectEqualStrings("Signed in · retrying · attempt 2", resumed.status.?.text.slice());
+    try testing.expectEqualStrings("signed in · retrying · attempt 2", resumed.status.?.text.slice());
 }
 
 test "a wait for a sign-in resends on its own after three minutes and keeps the sign-in status" {
@@ -1166,7 +1166,7 @@ test "a sign-in that finishes during a resend sends again at once when the resen
     try testing.expect(early.send == null and early.status == null);
     const resent = fail(&state, .sign_in, 182_000);
     try testing.expectEqual(Send{}, resent.send.?);
-    try testing.expectEqualStrings("Signed in · retrying · attempt 3", resent.status.?.text.slice());
+    try testing.expectEqualStrings("signed in · retrying · attempt 3", resent.status.?.text.slice());
     // Without a continue, the same failure waits.
     var other: State = .{};
     _ = startNew(&other, 0, false);
@@ -1262,11 +1262,11 @@ test "a refused login waits and resends like a gateway error, and keeps Fast" {
         const plan = fail(&state, .refused, now_ms);
         try testing.expect(plan.send == null);
         try testing.expectEqual(Status.Kind.waiting, plan.status.?.kind);
-        try testing.expect(startsWith(plan.status.?.text.slice(), "Gateway refused the login · next try in "));
+        try testing.expect(startsWith(plan.status.?.text.slice(), "gateway refused the login · next try in "));
         if (i == 0) try testing.expect(state.wait_until_ms - now_ms >= 800 and state.wait_until_ms - now_ms <= 1_000);
         const retry = tickUntilSend(&state, now_ms);
         try testing.expect(!retry.plan.send.?.no_fast);
-        try testing.expect(startsWith(retry.plan.status.?.text.slice(), "Gateway refused the login · retrying · attempt "));
+        try testing.expect(startsWith(retry.plan.status.?.text.slice(), "gateway refused the login · retrying · attempt "));
         now_ms = retry.at_ms;
     }
     try testing.expect(!state.flags.no_fast);
@@ -1350,7 +1350,7 @@ test "a closed window resumes without a question" {
         state = .{};
         const resumed = step(&state, .{ .start = .{ .resume_from = record } }, 100);
         try testing.expect(resumed.send != null);
-        try testing.expect(startsWith(resumed.status.?.text.slice(), "Resuming the interrupted request · attempt "));
+        try testing.expect(startsWith(resumed.status.?.text.slice(), "resuming the interrupted request · attempt "));
         try testing.expectEqual(@as(u8, 0), state.abrupt_deaths);
     }
 }
@@ -1363,7 +1363,7 @@ test "a record more than a day old asks before resending" {
     try testing.expect(asked.send == null);
     try testing.expectEqual(Status.Need.stale, asked.status.?.need.?);
     try testing.expectEqualStrings(
-        "Interrupted more than a day ago · Enter to resume, Esc to cancel",
+        "interrupted more than a day ago · enter to resume, esc to cancel",
         asked.status.?.text.slice(),
     );
 
@@ -1375,7 +1375,7 @@ test "a record more than a day old asks before resending" {
 
     const resumed = step(&state, .user_continue, 70);
     try testing.expect(resumed.send != null);
-    try testing.expect(startsWith(resumed.status.?.text.slice(), "Resuming the interrupted request · attempt "));
+    try testing.expect(startsWith(resumed.status.?.text.slice(), "resuming the interrupted request · attempt "));
 }
 
 test "a day-old resume with no record asks too" {
@@ -1411,7 +1411,7 @@ test "two abrupt deaths with a send in flight ask once" {
     const second = step(&state, .{ .start = .{ .resume_from = record } }, 50);
     try testing.expect(second.send == null);
     try testing.expectEqual(Status.Need.crash_loop, second.status.?.need.?);
-    try testing.expectEqualStrings("Crashed fx twice · Enter retries, Esc cancels", second.status.?.short.slice());
+    try testing.expectEqualStrings("crashed fx twice · enter retries, esc cancels", second.status.?.short.slice());
 
     const resumed = step(&state, .user_continue, 900);
     try testing.expect(resumed.send != null);

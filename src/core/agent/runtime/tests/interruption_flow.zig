@@ -703,7 +703,7 @@ test "processQueuedPrompt retains cancelled command replay in interrupted histor
     try std.testing.expectEqual(@as(usize, 3), hooks.lifecycle_events.items.len);
     const terminal = hooks.lifecycle_events.items[2].terminal;
     try std.testing.expectEqual(types.ToolOutcomeKind.cancelled, terminal.outcome.kind);
-    try std.testing.expectEqualStrings("Cancelled terminal", terminal.outcome.summary);
+    try std.testing.expectEqualStrings("cancelled terminal", terminal.outcome.summary);
     try std.testing.expectEqualStrings(
         artifact_handle,
         terminal.command_artifact_handle orelse return error.TestExpectedArtifactHandle,
@@ -747,7 +747,7 @@ test "processQueuedPrompt retains cancelled command replay in interrupted histor
         .{terminal.id.turn_id},
     );
     defer alloc.free(complete_log);
-    const terminal_index = logIndex(&hooks, "status:finished:Cancelled terminal") orelse return error.TestMissingCancelledTerminal;
+    const terminal_index = logIndex(&hooks, "status:finished:cancelled terminal") orelse return error.TestMissingCancelledTerminal;
     const complete_index = logIndex(&hooks, complete_log) orelse return error.TestMissingCommandCompletion;
     const history_index = logIndex(&hooks, "history:interrupted") orelse return error.TestMissingInterruptedHistory;
     const finalized_index = logIndex(&hooks, "event:turn_finished") orelse return error.TestMissingTurnFinalization;
@@ -839,7 +839,7 @@ test "processQueuedPrompt cancellation during permission persists active tool ca
         hooks.lifecycle_events.items[2].terminal.outcome.kind,
     );
     try std.testing.expectEqualStrings(
-        "Cancelled write_file",
+        "cancelled write_file",
         hooks.lifecycle_events.items[2].terminal.outcome.summary,
     );
     try std.testing.expectEqual(@as(usize, 1), hooks.interrupted_history_count);

@@ -94,21 +94,21 @@ pub const UsageSnapshot = struct {
         defer out.deinit();
 
         // The period stays in UTC days, the days AI Gateway reports by.
-        try out.writer.print("Usage ({s}, UTC) from AI Gateway", .{v.period.label()});
+        try out.writer.print("usage ({s}, UTC) from AI gateway", .{v.period.label()});
         if (v.fetched_at_ms) |ms| try writeLocalClock(&out.writer, ", updated ", ms);
         try out.writer.writeByte('\n');
         switch (s.status) {
             .ready, .fetching => {},
-            .failed => |f| try writeUsageFailure(&out.writer, f, "AI Gateway"),
+            .failed => |f| try writeUsageFailure(&out.writer, f, "AI gateway"),
             .unavailable => |u| try out.writer.print("{s}\n", .{switch (u) {
-                .no_gateway_sign_in => "Usage needs an AI Gateway sign-in: run fx login or set an API key.",
-                .no_team => "Usage needs a team: run fx login and pick one.",
-                .unsupported_provider => "Usage isn't shown for this provider yet; it reads AI Gateway.",
-                .refresh_needed => "The sign-in needs a refresh: send a message in fx, then run fx usage again.",
+                .no_gateway_sign_in => "usage needs an AI gateway sign-in: run fx login or set an API key.",
+                .no_team => "usage needs a team: run fx login and pick one.",
+                .unsupported_provider => "usage isn't shown for this provider yet; it reads AI gateway.",
+                .refresh_needed => "the sign-in needs a refresh: send a message in fx, then run fx usage again.",
             }}),
         }
         if (v.budget) |b| {
-            try out.writer.print("Budget        ${d:.2} of ${d:.2}{s}\n", .{ b.spent, b.limit, switch (b.period) {
+            try out.writer.print("budget        ${d:.2} of ${d:.2}{s}\n", .{ b.spent, b.limit, switch (b.period) {
                 .daily => " today",
                 .weekly => " this week",
                 .monthly => " this month",
@@ -116,13 +116,13 @@ pub const UsageSnapshot = struct {
             } });
         }
         const t = v.totals;
-        try out.writer.print("Spend         ${d:.4}\nRequests      {d}\n", .{ t.total_cost, t.request_count });
+        try out.writer.print("spend         ${d:.4}\nrequests      {d}\n", .{ t.total_cost, t.request_count });
         try out.writer.print(
-            "Tokens        {d} (input {d} · output {d} · cache read {d} · cache write {d} · reasoning {d})\n",
+            "tokens        {d} (input {d} · output {d} · cache read {d} · cache write {d} · reasoning {d})\n",
             .{ t.totalTokens(), t.input_tokens, t.output_tokens, t.cache_read_tokens, t.cache_write_tokens, t.reasoning_tokens },
         );
         if (v.models.len > 0) {
-            try out.writer.writeAll("\nBy model\n");
+            try out.writer.writeAll("\nby model\n");
             for (v.models) |model| {
                 try out.writer.writeAll("- ");
                 try writeTerminalSafe(&out.writer, alloc, model.model);
@@ -143,7 +143,7 @@ pub const UsageSnapshot = struct {
         defer out.deinit();
 
         const profile: ?usage.codex.Profile = if (s.codex_usage) |u| u.profile else null;
-        try out.writer.writeAll("Codex usage from ChatGPT");
+        try out.writer.writeAll("codex usage from ChatGPT");
         if (profile) |p| if (p.name) |name| {
             try out.writer.writeAll(" for ");
             try writeTerminalSafe(&out.writer, alloc, name);
@@ -152,16 +152,16 @@ pub const UsageSnapshot = struct {
         try out.writer.writeByte('\n');
         switch (s.status) {
             .ready => {},
-            .fetching => if (s.codex_usage == null) try out.writer.writeAll("Fetching usage from ChatGPT.\n"),
+            .fetching => if (s.codex_usage == null) try out.writer.writeAll("fetching usage from ChatGPT.\n"),
             .failed => |f| try writeUsageFailure(&out.writer, f, "ChatGPT"),
             .unavailable => {},
         }
         const u = s.codex_usage orelse return try out.toOwnedSlice();
         if (profile) |p| try writeCodexProfileText(&out.writer, alloc, s, p);
         if (s.codexBreakdown() != null) try writeCodexSharesText(&out.writer, alloc, s, self.period);
-        try out.writer.writeAll("Plan          ");
+        try out.writer.writeAll("plan          ");
         try writeTerminalSafe(&out.writer, alloc, u.plan);
-        try out.writer.writeAll("\nCredits       ");
+        try out.writer.writeAll("\ncredits       ");
         if (u.credits) |c| {
             if (c.unlimited) {
                 try out.writer.writeAll("unlimited");
@@ -171,12 +171,12 @@ pub const UsageSnapshot = struct {
                 try out.writer.writeAll(if (c.has_credits) "yes" else "none");
             }
         } else try out.writer.writeAll("-");
-        try out.writer.print("\nSpend limit   {s}\n", .{if (u.spend_limit_reached) "reached" else "not reached"});
+        try out.writer.print("\nspend limit   {s}\n", .{if (u.spend_limit_reached) "reached" else "not reached"});
         if (!u.hasWindows()) {
-            try out.writer.writeAll("Limits        none on this plan\n");
+            try out.writer.writeAll("limits        none on this plan\n");
             return try out.toOwnedSlice();
         }
-        try out.writer.writeAll("\nLimits\n");
+        try out.writer.writeAll("\nlimits\n");
         for (u.limits) |limit| {
             for ([_]?usage.codex.Window{ limit.primary, limit.secondary }) |maybe| {
                 const w = maybe orelse continue;
@@ -196,30 +196,30 @@ pub const UsageSnapshot = struct {
         var out: std.Io.Writer.Allocating = .init(alloc);
         defer out.deinit();
 
-        try out.writer.writeAll("Grok usage from xAI");
+        try out.writer.writeAll("grok usage from xAI");
         if (s.fetchedAtMs()) |ms| try writeLocalClock(&out.writer, ", updated ", ms);
         try out.writer.writeByte('\n');
         switch (s.status) {
             .ready => {},
-            .fetching => if (s.grok_usage == null) try out.writer.writeAll("Fetching usage from Grok.\n"),
-            .failed => |f| try writeUsageFailure(&out.writer, f, "Grok"),
+            .fetching => if (s.grok_usage == null) try out.writer.writeAll("fetching usage from grok.\n"),
+            .failed => |f| try writeUsageFailure(&out.writer, f, "grok"),
             .unavailable => {},
         }
         const u = s.grok_usage orelse return try out.toOwnedSlice();
-        try out.writer.writeAll("Plan          ");
+        try out.writer.writeAll("plan          ");
         if (u.plan()) |plan| try writeTerminalSafe(&out.writer, alloc, plan) else try out.writer.writeAll("-");
         try out.writer.writeByte('\n');
         if (u.settings) |settings| if (settings.usage_url) |url| {
-            try out.writer.writeAll("Usage page    ");
+            try out.writer.writeAll("usage page    ");
             try writeTerminalSafe(&out.writer, alloc, url);
             try out.writer.writeAll(" (managed by your team)\n");
         };
         if (!u.hasBilling()) {
-            try out.writer.writeAll("Billing       none reported for this plan\n");
+            try out.writer.writeAll("billing       none reported for this plan\n");
             return try out.toOwnedSlice();
         }
         if (u.used_percent) |used| {
-            try out.writer.print("Used          {d:.0}% of the {s} allowance", .{ @floor(used), if (u.period) |p| @tagName(p) else "plan's" });
+            try out.writer.print("used          {d:.0}% of the {s} allowance", .{ @floor(used), if (u.period) |p| @tagName(p) else "plan's" });
             if (u.resets_at_ms) |at| {
                 try out.writer.writeAll(", resets ");
                 if (local_time.local(at)) |reading| {
@@ -231,14 +231,14 @@ pub const UsageSnapshot = struct {
             try out.writer.writeByte('\n');
         }
         for (u.products, 0..) |product, i| {
-            try out.writer.writeAll(if (i == 0) "By product    " else ", ");
+            try out.writer.writeAll(if (i == 0) "by product    " else ", ");
             try writeTerminalSafe(&out.writer, alloc, product.name);
             try out.writer.print(" {d:.1}%", .{product.used_percent});
         }
         if (u.products.len > 0) try out.writer.writeByte('\n');
-        try out.writer.writeAll("Credits       ");
+        try out.writer.writeAll("credits       ");
         if ((u.prepaid_cents orelse 1) == 0) try out.writer.writeAll("none") else try writeOptionalCents(&out.writer, u.prepaid_cents);
-        try out.writer.writeAll("\nPay as you go ");
+        try out.writer.writeAll("\npay as you go ");
         const turned_off = if (u.settings) |settings| (if (settings.on_demand_enabled) |on| !on else false) else false;
         if (turned_off or (u.on_demand_cap_cents orelse 0) == 0) {
             try out.writer.writeAll("off");
@@ -303,7 +303,7 @@ pub const UsageSnapshot = struct {
 /// Tokens by period, then records, habits and the most used plugins and
 /// skills. Missing numbers read `-`.
 fn writeCodexProfileText(writer: *std.Io.Writer, alloc: Allocator, s: *const usage.Snapshot, p: usage.codex.Profile) !void {
-    try writer.writeAll("Tokens        ");
+    try writer.writeAll("tokens        ");
     const periods = [_]struct { value: ?u64, label: []const u8 }{
         .{ .value = s.codexTokens(.today), .label = "today" },
         .{ .value = s.codexTokens(.days_7), .label = "7d" },
@@ -315,7 +315,7 @@ fn writeCodexProfileText(writer: *std.Io.Writer, alloc: Allocator, s: *const usa
         try writeOptionalCount(writer, period.value);
         try writer.print(" {s}", .{period.label});
     }
-    try writer.writeAll("\nRecord        peak day ");
+    try writer.writeAll("\nrecord        peak day ");
     try writeOptionalCount(writer, p.peak_day_tokens);
     try writer.writeAll(" tokens, longest chat ");
     if (p.longest_turn_seconds) |sec| try writer.print("{d}h {d}m", .{ sec / 3600, sec % 3600 / 60 }) else try writer.writeAll("-");
@@ -325,7 +325,7 @@ fn writeCodexProfileText(writer: *std.Io.Writer, alloc: Allocator, s: *const usa
     try writeOptionalCount(writer, p.best_streak_days);
     try writer.writeAll("), ");
     try writeOptionalCount(writer, p.chats);
-    try writer.writeAll(" chats\nHabits        fast mode ");
+    try writer.writeAll(" chats\nhabits        fast mode ");
     if (p.fast_mode_percent) |pct| try writer.print("{d:.0}%", .{pct}) else try writer.writeAll("-");
     try writer.writeAll(", reasoning ");
     if (p.reasoning) |r| try writeTerminalSafe(writer, alloc, r) else try writer.writeAll("-");
@@ -338,7 +338,7 @@ fn writeCodexSharesText(writer: *std.Io.Writer, alloc: Allocator, s: *const usag
     var buf: [usage.codex.max_shares]usage.codex.Share = undefined;
     inline for (.{ "model", "surface" }) |what| {
         const shares = if (comptime std.mem.eql(u8, what, "model")) s.codexModelShares(period, &buf) else s.codexSurfaceShares(period, &buf);
-        try writer.print("Share by {s} ({s}): ", .{ what, period.label() });
+        try writer.print("share by {s} ({s}): ", .{ what, period.label() });
         if (shares.len == 0) try writer.writeAll("none");
         for (shares, 0..) |share, i| {
             if (i > 0) try writer.writeAll(", ");
@@ -372,14 +372,14 @@ fn writeClock(writer: *std.Io.Writer, reading: *const local_time.Reading) !void 
 
 /// `Oct 11, 2026`.
 fn formatDate(buf: *[24]u8, reading: *const local_time.Reading) []const u8 {
-    const months = [_][]const u8{ "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" };
+    const months = [_][]const u8{ "jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec" };
     const month = months[reading.month.numeric() - 1];
-    return std.mem.print(buf, "{s} {d}, {d}", .{ month, reading.day, reading.year }) catch "Unknown";
+    return std.mem.print(buf, "{s} {d}, {d}", .{ month, reading.day, reading.year }) catch "unknown";
 }
 
 /// `Refresh failed: <why>.`, naming the service the numbers come from.
 fn writeUsageFailure(writer: *std.Io.Writer, failure: usage.Failure, service: []const u8) !void {
-    try writer.writeAll("Refresh failed: ");
+    try writer.writeAll("refresh failed: ");
     switch (failure) {
         .network => try writer.print("couldn't reach {s}", .{service}),
         .refused => try writer.print("{s} refused this sign-in", .{service}),
@@ -763,17 +763,17 @@ fn grokProviderConnected(auth: auth_runtime.StatusSnapshot) bool {
 fn writeConnectedProvidersText(writer: *std.Io.Writer, auth: auth_runtime.StatusSnapshot) !void {
     var wrote_provider = false;
     if (gatewayProviderConnected(auth)) {
-        try writer.writeAll("Vercel AI Gateway");
+        try writer.writeAll("vercel AI gateway");
         wrote_provider = true;
     }
     if (chatGptProviderConnected(auth)) {
-        if (wrote_provider) try writer.writeAll(", Codex");
-        if (!wrote_provider) try writer.writeAll("Codex");
+        if (wrote_provider) try writer.writeAll(", codex");
+        if (!wrote_provider) try writer.writeAll("codex");
         wrote_provider = true;
     }
     if (grokProviderConnected(auth)) {
-        if (wrote_provider) try writer.writeAll(", Grok");
-        if (!wrote_provider) try writer.writeAll("Grok");
+        if (wrote_provider) try writer.writeAll(", grok");
+        if (!wrote_provider) try writer.writeAll("grok");
         wrote_provider = true;
     }
     if (!wrote_provider) try writer.writeAll("none");
@@ -922,50 +922,50 @@ pub const StatusSnapshot = struct {
     /// is allocated with `alloc`, which should be an arena.
     pub fn panelRows(self: StatusSnapshot, alloc: Allocator) ![]PanelRow {
         var rows: std.ArrayList(PanelRow) = .empty;
-        if (self.session) |session| try rows.append(alloc, .{ .label = "Session", .value = switch (session) {
+        if (self.session) |session| try rows.append(alloc, .{ .label = "session", .value = switch (session) {
             .unavailable => "none · this shell can't save sessions",
             .open => |open| try alloc.print("{s} · {s}", .{
                 try safeText(alloc, open.id),
                 if (open.saved) "saved" else "not saved yet",
             }),
         } });
-        try rows.append(alloc, .{ .label = "Model", .value = try safeText(alloc, self.model) });
+        try rows.append(alloc, .{ .label = "model", .value = try safeText(alloc, self.model) });
         if (self.provider != .gateway) {
             // A configured provider's name lives in `self.provider`, this
             // call's copy, so it is copied out with the rest.
-            try rows.append(alloc, .{ .label = "Provider", .value = try safeText(alloc, providerDisplayName(&self.provider)) });
+            try rows.append(alloc, .{ .label = "provider", .value = try safeText(alloc, providerDisplayName(&self.provider)) });
         }
         if (self.provider_endpoint) |endpoint| {
-            try rows.append(alloc, .{ .label = "Endpoint", .value = try safeText(alloc, endpoint) });
+            try rows.append(alloc, .{ .label = "endpoint", .value = try safeText(alloc, endpoint) });
         }
         if (self.provider != .gateway) {
             var connections: std.Io.Writer.Allocating = .init(alloc);
             try self.writeConnections(&connections.writer);
-            try rows.append(alloc, .{ .label = "Connected", .value = try safeText(alloc, connections.written()) });
+            try rows.append(alloc, .{ .label = "connected", .value = try safeText(alloc, connections.written()) });
         }
         if (self.settings_error) |error_name| {
-            try rows.append(alloc, .{ .label = "Settings", .value = try alloc.print("couldn't be read: {s}", .{error_name}) });
+            try rows.append(alloc, .{ .label = "settings", .value = try alloc.print("couldn't be read: {s}", .{error_name}) });
         } else {
             var auth: std.Io.Writer.Allocating = .init(alloc);
             try writeTerminalSafe(&auth.writer, alloc, self.auth.activeSourceLabel());
             if (self.auth.expired) try auth.writer.writeAll(" · expired");
             if (self.auth.refreshable()) try auth.writer.writeAll(" · refreshable");
-            try rows.append(alloc, .{ .label = "Auth", .value = auth.written() });
-            if (self.auth_help) |help| try rows.append(alloc, .{ .label = "Auth help", .value = try safeText(alloc, help) });
-            if (self.auth.team) |team| try rows.append(alloc, .{ .label = "Team", .value = try safeText(alloc, team) });
+            try rows.append(alloc, .{ .label = "auth", .value = auth.written() });
+            if (self.auth_help) |help| try rows.append(alloc, .{ .label = "auth help", .value = try safeText(alloc, help) });
+            if (self.auth.team) |team| try rows.append(alloc, .{ .label = "team", .value = try safeText(alloc, team) });
         }
-        try rows.append(alloc, .{ .label = "Permissions", .value = permissions.permissionModeDisplayLabel(self.permission_mode) });
-        try rows.append(alloc, .{ .label = "Workspace", .value = try safeText(alloc, self.workspace_root) });
-        try rows.append(alloc, .{ .label = "Turns", .value = try alloc.print("{d}", .{self.history_turns}) });
-        try rows.append(alloc, .{ .label = "Session grants", .value = try alloc.print("{d}", .{self.session_permission_grants}) });
+        try rows.append(alloc, .{ .label = "permissions", .value = permissions.permissionModeDisplayLabel(self.permission_mode) });
+        try rows.append(alloc, .{ .label = "workspace", .value = try safeText(alloc, self.workspace_root) });
+        try rows.append(alloc, .{ .label = "turns", .value = try alloc.print("{d}", .{self.history_turns}) });
+        try rows.append(alloc, .{ .label = "session grants", .value = try alloc.print("{d}", .{self.session_permission_grants}) });
         try rows.append(alloc, .{
-            .label = "Step limit",
+            .label = "step limit",
             .value = if (self.agent_step_limit == 0) "unlimited" else try alloc.print("{d}", .{self.agent_step_limit}),
         });
-        try rows.append(alloc, .{ .label = "Ultrafast", .value = if (self.ultrafast_requested) "requested" else "not requested" });
-        try rows.append(alloc, .{ .label = "Updates", .value = try safeText(alloc, self.update_channel) });
+        try rows.append(alloc, .{ .label = "ultrafast", .value = if (self.ultrafast_requested) "requested" else "not requested" });
+        try rows.append(alloc, .{ .label = "updates", .value = try safeText(alloc, self.update_channel) });
         try rows.append(alloc, .{
-            .label = "Build",
+            .label = "build",
             .value = if (self.build_revision.len > 0)
                 try alloc.print("{s} · {s}", .{ try safeText(alloc, self.build_channel), try safeText(alloc, self.build_revision) })
             else
@@ -1232,27 +1232,27 @@ pub const PermissionsSnapshot = struct {
     /// allocated with `alloc`, which should be an arena.
     pub fn panelRows(self: PermissionsSnapshot, alloc: Allocator) ![]PanelRow {
         var rows: std.ArrayList(PanelRow) = .empty;
-        try rows.append(alloc, .{ .label = "Mode", .value = permissions.permissionModeDisplayLabel(self.mode) });
-        try rows.append(alloc, .{ .label = "Configured rules", .value = try countText(alloc, self.rules.rules.len) });
+        try rows.append(alloc, .{ .label = "mode", .value = permissions.permissionModeDisplayLabel(self.mode) });
+        try rows.append(alloc, .{ .label = "configured rules", .value = try countText(alloc, self.rules.rules.len) });
         for (self.rules.rules) |rule| try rows.append(alloc, .{ .label = "", .item = true, .value = try safeText(alloc, try alloc.print(
             "{s} {s} → {s}",
             .{ @tagName(rule.action), rule.permission, rule.pattern },
         )) });
-        try rows.append(alloc, .{ .label = "Session grants", .value = try countText(alloc, self.grants.len) });
+        try rows.append(alloc, .{ .label = "session grants", .value = try countText(alloc, self.grants.len) });
         for (self.grants) |grant| try rows.append(alloc, .{ .label = "", .item = true, .value = try safeText(alloc, try alloc.print(
             "{s} → {s}",
             .{ grant.tool_name, try displayGrantTarget(alloc, self.workspace_root, grant) },
         )) });
         if (self.saved_rules) |saved| {
-            try rows.append(alloc, .{ .label = "Saved rules", .value = try countText(alloc, saved.len) });
+            try rows.append(alloc, .{ .label = "saved rules", .value = try countText(alloc, saved.len) });
             for (saved) |rule| try rows.append(alloc, .{ .label = "", .item = true, .value = try safeText(alloc, try alloc.print(
                 "{d} {s} {s}",
                 .{ rule.id, rule.decision, rule.identity },
             )) });
         }
-        try rows.append(alloc, .{ .label = "Change mode", .value = "/permissions ask, auto, full-access, or reset" });
-        try rows.append(alloc, .{ .label = "Remember", .value = "/permissions remember allow|deny <tool-name> <arguments-json>" });
-        try rows.append(alloc, .{ .label = "Revoke", .value = "/permissions revoke <rule-id>" });
+        try rows.append(alloc, .{ .label = "change mode", .value = "/permissions ask, auto, full-access, or reset" });
+        try rows.append(alloc, .{ .label = "remember", .value = "/permissions remember allow|deny <tool-name> <arguments-json>" });
+        try rows.append(alloc, .{ .label = "revoke", .value = "/permissions revoke <rule-id>" });
         return rows.toOwnedSlice(alloc);
     }
 
@@ -1428,18 +1428,18 @@ pub const ModelListSnapshot = struct {
     }
 
     fn catalogExplanation(self: ModelListSnapshot) ?[]const u8 {
-        if (self.provider == .configured) return "Models from settings and, with fetch_models, the server; explicit model IDs need no catalog.";
+        if (self.provider == .configured) return "models from settings and, with fetch_models, the server; explicit model IDs need no catalog.";
         if (!self.private_models_hidden) return null;
-        const reason = self.public_only_reason orelse return "Using the public model catalog.";
+        const reason = self.public_only_reason orelse return "using the public model catalog.";
         return switch (reason) {
-            .no_credential => "Using the public model catalog; sign in with Vercel or use an AI Gateway API key for team-private models.",
-            .fx_login_team_required => "Choose a Vercel team to load its private models.",
-            .fx_login_refresh_required => "Vercel sign-in must refresh before team-private models can load.",
-            .credential_refresh_required => "The selected sign-in must refresh before authenticated models can load.",
-            .credential_refresh_failed => "Vercel sign-in refresh failed; using the public model catalog.",
-            .authenticated_credential_rejected => "Your Gateway credential was rejected; using the public model catalog.",
-            .chatgpt_subscription => "Codex models require an authenticated Codex catalog.",
-            .grok_subscription => "Grok models require an authenticated Grok catalog.",
+            .no_credential => "using the public model catalog; sign in with vercel or use an AI gateway API key for team-private models.",
+            .fx_login_team_required => "choose a vercel team to load its private models.",
+            .fx_login_refresh_required => "vercel sign-in must refresh before team-private models can load.",
+            .credential_refresh_required => "the selected sign-in must refresh before authenticated models can load.",
+            .credential_refresh_failed => "vercel sign-in refresh failed; using the public model catalog.",
+            .authenticated_credential_rejected => "your gateway credential was rejected; using the public model catalog.",
+            .chatgpt_subscription => "codex models require an authenticated codex catalog.",
+            .grok_subscription => "grok models require an authenticated grok catalog.",
         };
     }
 };
@@ -1826,7 +1826,7 @@ test "a live listing prints each subagent under the one that started it, and esc
     }};
     const text = try (LiveSessionListSnapshot{ .sessions = &sessions, .all_workspaces = true }).renderText(std.testing.allocator);
     defer std.testing.allocator.free(text);
-    try std.testing.expect(std.mem.startsWith(u8, text, "1 live session in all workspaces  ·  1 working\nModel openai/gpt-5\n\n"));
+    try std.testing.expect(std.mem.startsWith(u8, text, "1 live session in all workspaces  ·  1 working\nmodel openai/gpt-5\n\n"));
     try std.testing.expect(std.mem.findScalar(u8, text, 0x1b) == null);
     try std.testing.expect(std.mem.find(u8, text, "\nFix \\x1b[31mred  working  just now  abc         /Users/example/w\n") != null);
     try std.testing.expect(std.mem.find(u8, text, "\n└─ lead          idle\n   └─ helper     working\n") != null);
@@ -2134,21 +2134,21 @@ pub const DoctorSnapshot = struct {
         }
         try w.writeAll("\n\n");
 
-        try writeDoctorField(w, alloc, "Workspace", self.workspace_root, style.columns);
+        try writeDoctorField(w, alloc, "workspace", self.workspace_root, style.columns);
         // Each value is built whole first, so it wraps as one.
         var value: std.Io.Writer.Allocating = .init(alloc);
         defer value.deinit();
         const v = &value.writer;
         try v.writeAll(self.model);
         if (self.provider != .gateway) try v.print(" via {s}", .{providerDisplayName(&self.provider)});
-        try writeDoctorField(w, alloc, "Model", value.written(), style.columns);
+        try writeDoctorField(w, alloc, "model", value.written(), style.columns);
         value.clearRetainingCapacity();
         try v.writeAll(self.auth.activeSourceLabel());
         if (self.auth.team) |team| try v.print(" \u{00b7} team {s}", .{team});
         if (self.auth.expired) try v.writeAll(" \u{00b7} expired");
-        try writeDoctorField(w, alloc, "Auth", value.written(), style.columns);
-        try writeDoctorField(w, alloc, "Permissions", permissions.permissionModeDisplayLabel(self.permission_mode), style.columns);
-        try writeDoctorFieldLabel(w, "Step limit");
+        try writeDoctorField(w, alloc, "auth", value.written(), style.columns);
+        try writeDoctorField(w, alloc, "permissions", permissions.permissionModeDisplayLabel(self.permission_mode), style.columns);
+        try writeDoctorFieldLabel(w, "step limit");
         if (self.agent_step_limit == 0) try w.writeAll("none\n") else try w.print("{d}\n", .{self.agent_step_limit});
         if (self.mcp) |mcp| {
             value.clearRetainingCapacity();
@@ -2652,13 +2652,13 @@ const DoctorGroup = enum {
 
     fn title(group: DoctorGroup) []const u8 {
         return switch (group) {
-            .install => "Install",
-            .config => "Config",
-            .auth => "Auth and model",
-            .sessions => "Sessions",
+            .install => "install",
+            .config => "config",
+            .auth => "auth and model",
+            .sessions => "sessions",
             .mcp => "MCP servers",
-            .tools => "Tools",
-            .other => "Other",
+            .tools => "tools",
+            .other => "other",
         };
     }
 };
@@ -3001,12 +3001,12 @@ test "status distinguishes the selected model route from connected providers" {
     };
     const text = try snapshot.renderText(std.testing.allocator);
     defer std.testing.allocator.free(text);
-    try std.testing.expect(std.mem.find(u8, text, "model_source=Codex subscription") != null);
-    try std.testing.expect(std.mem.find(u8, text, "connected_providers=Vercel AI Gateway, Codex") != null);
+    try std.testing.expect(std.mem.find(u8, text, "model_source=codex subscription") != null);
+    try std.testing.expect(std.mem.find(u8, text, "connected_providers=vercel AI gateway, codex") != null);
 
     const json = try snapshot.renderJson(std.testing.allocator);
     defer std.testing.allocator.free(json);
-    try std.testing.expect(std.mem.find(u8, json, "\"model_source\":\"Codex subscription\"") != null);
+    try std.testing.expect(std.mem.find(u8, json, "\"model_source\":\"codex subscription\"") != null);
     try std.testing.expect(std.mem.find(u8, json, "\"connected_providers\":[\"vercel-ai-gateway\",\"codex\"]") != null);
     try std.testing.expect(std.mem.find(u8, json, "model_origin") == null);
 }
@@ -3302,28 +3302,28 @@ test "model list explains public-only and rejected-credential catalogs" {
     }{
         .{
             .snapshot = .{ .ids = &ids, .private_models_hidden = true, .public_only_reason = .no_credential },
-            .text = "[models] 1 available\n - alpha\n[models] Using the public model catalog; sign in with Vercel or use an AI Gateway API key for team-private models.\n",
-            .body = "1 available\n - alpha\nUsing the public model catalog; sign in with Vercel or use an AI Gateway API key for team-private models.",
+            .text = "[models] 1 available\n - alpha\n[models] using the public model catalog; sign in with vercel or use an AI gateway API key for team-private models.\n",
+            .body = "1 available\n - alpha\nusing the public model catalog; sign in with vercel or use an AI gateway API key for team-private models.",
         },
         .{
             .snapshot = rejected,
-            .text = "[models] 1 available\n - alpha\n[models] Your Gateway credential was rejected; using the public model catalog.\n",
-            .body = "1 available\n - alpha\nYour Gateway credential was rejected; using the public model catalog.",
+            .text = "[models] 1 available\n - alpha\n[models] your gateway credential was rejected; using the public model catalog.\n",
+            .body = "1 available\n - alpha\nyour gateway credential was rejected; using the public model catalog.",
         },
         .{
             .snapshot = .{ .ids = &.{}, .private_models_hidden = true, .public_only_reason = .no_credential },
-            .text = "[models] no models returned by gateway\n[models] Using the public model catalog; sign in with Vercel or use an AI Gateway API key for team-private models.\n",
-            .body = "no models returned by gateway\nUsing the public model catalog; sign in with Vercel or use an AI Gateway API key for team-private models.",
+            .text = "[models] no models returned by gateway\n[models] using the public model catalog; sign in with vercel or use an AI gateway API key for team-private models.\n",
+            .body = "no models returned by gateway\nusing the public model catalog; sign in with vercel or use an AI gateway API key for team-private models.",
         },
         .{
             .snapshot = .{ .ids = &.{}, .private_models_hidden = true, .public_only_reason = .authenticated_credential_rejected },
-            .text = "[models] no models returned by gateway\n[models] Your Gateway credential was rejected; using the public model catalog.\n",
-            .body = "no models returned by gateway\nYour Gateway credential was rejected; using the public model catalog.",
+            .text = "[models] no models returned by gateway\n[models] your gateway credential was rejected; using the public model catalog.\n",
+            .body = "no models returned by gateway\nyour gateway credential was rejected; using the public model catalog.",
         },
         .{
             .snapshot = .{ .ids = &.{}, .provider = .codex },
-            .text = "[models] no models returned by Codex subscription\n",
-            .body = "no models returned by Codex subscription",
+            .text = "[models] no models returned by codex subscription\n",
+            .body = "no models returned by codex subscription",
         },
     };
 
@@ -3418,8 +3418,8 @@ test "core session list snapshot text and json stay stable" {
             .id = @constCast("abc"),
             .workspace_root = @constCast("/tmp/workspace"),
             .origin_workspace_root = @constCast("/tmp/origin"),
-            .title = @constCast("Session title"),
-            .preview = @constCast("Session title\npreview line"),
+            .title = @constCast("session title"),
+            .preview = @constCast("session title\npreview line"),
             .display_metadata_present = true,
             .created_at_ms = 1,
             .updated_at_ms = 2,
@@ -3433,16 +3433,16 @@ test "core session list snapshot text and json stay stable" {
     try std.testing.expectEqualStrings(
         "1 saved session in this workspace, newest first\n\n" ++
             "TITLE          TURNS  UPDATED   SESSION ID\n" ++
-            "Session title      3  just now  abc\n\n" ++
-            "Read a session    fx session <session id> --tail 5\n" ++
-            "Running now       fx sessions --live\n",
+            "session title      3  just now  abc\n\n" ++
+            "read a session    fx session <session id> --tail 5\n" ++
+            "running now       fx sessions --live\n",
         text,
     );
 
     const json = try (SessionListSnapshot{ .sessions = &sessions }).renderJson(std.testing.allocator);
     defer std.testing.allocator.free(json);
     try std.testing.expectEqualStrings(
-        "{\"kind\":\"sessions\",\"count\":1,\"sessions\":[{\"id\":\"abc\",\"title\":\"Session title\",\"preview\":\"Session title\\npreview line\",\"workspace_root\":\"/tmp/workspace\",\"origin_workspace_root\":\"/tmp/origin\",\"created_at_ms\":1,\"updated_at_ms\":2,\"history_len\":3,\"conversation_language\":\"es\"}]}",
+        "{\"kind\":\"sessions\",\"count\":1,\"sessions\":[{\"id\":\"abc\",\"title\":\"session title\",\"preview\":\"session title\\npreview line\",\"workspace_root\":\"/tmp/workspace\",\"origin_workspace_root\":\"/tmp/origin\",\"created_at_ms\":1,\"updated_at_ms\":2,\"history_len\":3,\"conversation_language\":\"es\"}]}",
         json,
     );
 
@@ -3453,12 +3453,12 @@ test "core session list snapshot text and json stay stable" {
     }).renderText(std.testing.allocator);
     defer std.testing.allocator.free(paged_text);
     try std.testing.expectEqualStrings(
-        "Newest 1 saved session in this workspace\n\n" ++
+        "newest 1 saved session in this workspace\n\n" ++
             "TITLE          TURNS  UPDATED   SESSION ID\n" ++
-            "Session title      3  just now  abc\n\n" ++
-            "More              fx sessions --cursor v1:2:abc\n" ++
-            "Read a session    fx session <session id> --tail 5\n" ++
-            "Running now       fx sessions --live\n",
+            "session title      3  just now  abc\n\n" ++
+            "more              fx sessions --cursor v1:2:abc\n" ++
+            "read a session    fx session <session id> --tail 5\n" ++
+            "running now       fx sessions --live\n",
         paged_text,
     );
 
@@ -3469,7 +3469,7 @@ test "core session list snapshot text and json stay stable" {
     }).renderJson(std.testing.allocator);
     defer std.testing.allocator.free(paged_json);
     try std.testing.expectEqualStrings(
-        "{\"kind\":\"sessions\",\"count\":1,\"has_more\":true,\"next_cursor\":\"v1:2:abc\",\"sessions\":[{\"id\":\"abc\",\"title\":\"Session title\",\"preview\":\"Session title\\npreview line\",\"workspace_root\":\"/tmp/workspace\",\"origin_workspace_root\":\"/tmp/origin\",\"created_at_ms\":1,\"updated_at_ms\":2,\"history_len\":3,\"conversation_language\":\"es\"}]}",
+        "{\"kind\":\"sessions\",\"count\":1,\"has_more\":true,\"next_cursor\":\"v1:2:abc\",\"sessions\":[{\"id\":\"abc\",\"title\":\"session title\",\"preview\":\"session title\\npreview line\",\"workspace_root\":\"/tmp/workspace\",\"origin_workspace_root\":\"/tmp/origin\",\"created_at_ms\":1,\"updated_at_ms\":2,\"history_len\":3,\"conversation_language\":\"es\"}]}",
         paged_json,
     );
 
@@ -3484,7 +3484,7 @@ test "core session list snapshot text and json stay stable" {
     };
     const fallback_text = try (SessionListSnapshot{ .sessions = &fallback_sessions }).renderText(std.testing.allocator);
     defer std.testing.allocator.free(fallback_text);
-    try std.testing.expect(std.mem.find(u8, fallback_text, "\nUntitled session      0  just now  legacy\n") != null);
+    try std.testing.expect(std.mem.find(u8, fallback_text, "\nuntitled session      0  just now  legacy\n") != null);
 
     var script_session = fallback_sessions[0];
     script_session.conversation_language = types.ConversationLanguage.literal("und-Latn");
@@ -3492,8 +3492,8 @@ test "core session list snapshot text and json stay stable" {
     const script_text = try (SessionListSnapshot{ .sessions = @as(*const [1]session_store.SessionSummary, &script_session) }).renderText(std.testing.allocator);
     defer std.testing.allocator.free(script_text);
     // The language is in JSON only.
-    try std.testing.expect(std.mem.find(u8, script_text, "\nUntitled session      1  just now  legacy\n") != null);
-    try std.testing.expect(std.mem.find(u8, script_text, "Latin") == null);
+    try std.testing.expect(std.mem.find(u8, script_text, "\nuntitled session      1  just now  legacy\n") != null);
+    try std.testing.expect(std.mem.find(u8, script_text, "latin") == null);
 
     const long_title = text_utils.repeat("a", session_display_metadata.max_title_bytes);
     var long_session = sessions[0];
@@ -3508,7 +3508,7 @@ test "core session list snapshot text and json stay stable" {
         .skipped_invalid = 2,
     }).renderText(std.testing.allocator);
     defer std.testing.allocator.free(warning_text);
-    try std.testing.expect(std.mem.endsWith(u8, warning_text, "\nSkipped 2 unreadable saved sessions; run `fx doctor` for recovery guidance\n"));
+    try std.testing.expect(std.mem.endsWith(u8, warning_text, "\nskipped 2 unreadable saved sessions; run `fx doctor` for recovery guidance\n"));
 
     const warning_json = try (SessionListSnapshot{
         .sessions = &.{},
@@ -3536,7 +3536,7 @@ test "core session list text reads updated times in the local zone" {
     const text = try (SessionListSnapshot{ .sessions = &sessions, .style = .{ .now_ms = 1_800_000_000_000 } }).renderText(std.testing.allocator);
     defer std.testing.allocator.free(text);
     // 2023-11-14 22:13:20 UTC is already the 15th in IST.
-    try std.testing.expect(std.mem.find(u8, text, "\nUntitled session      0  2023-11-15  local\n") != null);
+    try std.testing.expect(std.mem.find(u8, text, "\nuntitled session      0  2023-11-15  local\n") != null);
 }
 
 test "core session list text visibly escapes terminal controls in titles" {
@@ -3572,7 +3572,7 @@ test "core session list text leaves out the language, so a hostile tag never pri
     defer std.testing.allocator.free(text);
     try std.testing.expect(std.mem.findScalar(u8, text, 0x1b) == null);
     try std.testing.expect(std.mem.find(u8, text, "2J") == null);
-    try std.testing.expect(std.mem.find(u8, text, "\nUntitled session      0  just now  hostile-language\n") != null);
+    try std.testing.expect(std.mem.find(u8, text, "\nuntitled session      0  just now  hostile-language\n") != null);
 }
 
 test "core session summary snapshot text and json stay stable" {
@@ -3925,16 +3925,16 @@ test "core doctor snapshot text and json stay stable" {
     try std.testing.expectEqualStrings(
         "fx doctor  fx 0.0.16\n" ++
             "\n" ++
-            "  Workspace    /tmp/fx\n" ++
-            "  Model        alpha\n" ++
-            "  Auth         AI_GATEWAY_API_KEY\n" ++
-            "  Permissions  ask\n" ++
-            "  Step limit   24\n" ++
+            "  workspace    /tmp/fx\n" ++
+            "  model        alpha\n" ++
+            "  auth         AI_GATEWAY_API_KEY\n" ++
+            "  permissions  ask\n" ++
+            "  step limit   24\n" ++
             "\n" ++
-            "Auth and model\n" ++
+            "auth and model\n" ++
             "  \u{2713} auth       AI_GATEWAY_API_KEY is configured\n" ++
             "\n" ++
-            "Tools\n" ++
+            "tools\n" ++
             "  ! gh         GitHub CLI not found in PATH\n" ++
             "               fix: install gh from https://cli.github.com\n" ++
             "\n" ++
@@ -3974,7 +3974,7 @@ test "doctor text wraps long values, details, and fixes under their own columns 
     defer std.testing.allocator.free(text);
     // The path has no space, so it breaks at the edge.
     const workspace =
-        "  Workspace    /Users/example/Developer/a-very-lon\n" ++
+        "  workspace    /Users/example/Developer/a-very-lon\n" ++
         "               g-folder-name-for-wrapping\n";
     const check =
         "  ! install    another fx at /usr/local/bin/fx is\n" ++
@@ -4013,9 +4013,9 @@ test "doctor text wraps every header value, and breaks a long word between whole
     };
     const text = try snapshot.renderTextStyled(std.testing.allocator, .{ .columns = 50 });
     defer std.testing.allocator.free(text);
-    try std.testing.expect(std.mem.find(u8, text, "  Model        example/a-model-with-a-long-name\n" ++
+    try std.testing.expect(std.mem.find(u8, text, "  model        example/a-model-with-a-long-name\n" ++
         "               and-more-words-after-it\n") != null);
-    try std.testing.expect(std.mem.find(u8, text, "  Auth         AI_GATEWAY_API_KEY \u{00b7} team\n" ++
+    try std.testing.expect(std.mem.find(u8, text, "  auth         AI_GATEWAY_API_KEY \u{00b7} team\n" ++
         "               a-team-with-a-long-name-too\n") != null);
     // 17 emoji fill 34 columns; the 18th would cross the edge.
     try std.testing.expect(std.mem.find(u8, text, "  ! skills     " ++ text_utils.repeat(smile, 17) ++ "\n               " ++ smile ++ "\n") != null);
@@ -4413,7 +4413,7 @@ test "usage text and JSON render the same AI Gateway facts" {
 
     const text = try contract.render(alloc, .text);
     defer alloc.free(text);
-    try std.testing.expect(std.mem.startsWith(u8, text, "Usage (7d, UTC) from AI Gateway, updated 08:14 UTC\nRefresh failed: rate limited, try again shortly.\nBudget        $25.00 of $100.00 this month\n"));
+    try std.testing.expect(std.mem.startsWith(u8, text, "usage (7d, UTC) from AI gateway, updated 08:14 UTC\nrefresh failed: rate limited, try again shortly.\nbudget        $25.00 of $100.00 this month\n"));
     try std.testing.expect(std.mem.find(u8, text, "- anthropic/claude-opus-5.5  $1.5000  3 requests  15 tokens") != null);
 
     const json = try contract.render(alloc, .json);
@@ -4471,12 +4471,12 @@ test "usage text and JSON render a Grok plan's allowance and credits" {
     const text = try (UsageSnapshot{ .snapshot = &snapshot }).render(alloc, .text);
     defer alloc.free(text);
     try std.testing.expectEqualStrings(
-        "Grok usage from xAI, updated 08:14 UTC\n" ++
-            "Plan          SuperGrok\n" ++
-            "Used          42% of the weekly allowance, resets Oct 15, 2026 00:00 UTC\n" ++
-            "By product    grok build 61.2%\n" ++
-            "Credits       none\n" ++
-            "Pay as you go $3.00 of $100.00 this month\n",
+        "grok usage from xAI, updated 08:14 UTC\n" ++
+            "plan          SuperGrok\n" ++
+            "used          42% of the weekly allowance, resets oct 15, 2026 00:00 UTC\n" ++
+            "by product    grok build 61.2%\n" ++
+            "credits       none\n" ++
+            "pay as you go $3.00 of $100.00 this month\n",
         text,
     );
 
@@ -4486,15 +4486,15 @@ test "usage text and JSON render a Grok plan's allowance and credits" {
         defer local_time.test_zone = .utc;
         const local_text = try (UsageSnapshot{ .snapshot = &snapshot }).render(alloc, .text);
         defer alloc.free(local_text);
-        try std.testing.expect(std.mem.startsWith(u8, local_text, "Grok usage from xAI, updated 03:14 EST\n"));
-        try std.testing.expect(std.mem.find(u8, local_text, ", resets Oct 14, 2026 19:00 EST\n") != null);
+        try std.testing.expect(std.mem.startsWith(u8, local_text, "grok usage from xAI, updated 03:14 EST\n"));
+        try std.testing.expect(std.mem.find(u8, local_text, ", resets oct 14, 2026 19:00 EST\n") != null);
     }
 
     var failed = snapshot;
     failed.status = .{ .failed = .network };
     const failed_text = try (UsageSnapshot{ .snapshot = &failed }).render(alloc, .text);
     defer alloc.free(failed_text);
-    try std.testing.expect(std.mem.find(u8, failed_text, "Refresh failed: couldn't reach Grok.\n") != null);
+    try std.testing.expect(std.mem.find(u8, failed_text, "refresh failed: couldn't reach grok.\n") != null);
 
     const json = try (UsageSnapshot{ .snapshot = &snapshot }).render(alloc, .json);
     defer alloc.free(json);
@@ -4569,20 +4569,20 @@ test "usage text and JSON render a Codex plan's limits" {
     const profile_text = try (UsageSnapshot{ .snapshot = &with_profile }).render(alloc, .text);
     defer alloc.free(profile_text);
     try std.testing.expectEqualStrings(
-        "Codex usage from ChatGPT for samdoe, updated 08:14 UTC\n" ++
-            "Tokens        39877412 today, 92170838 7d, 92170838 month, 315686778511 lifetime\n" ++
-            "Record        peak day 11594630891 tokens, longest chat 30h 41m, streak 132 days (best 132), 11374 chats\n" ++
-            "Habits        fast mode 67%, reasoning xhigh (85%)\n" ++
-            "Share by model (month): gpt-6.1-sol fast 75.0%, gpt-6.1-sol standard 25.0%\n" ++
-            "Share by surface (month): desktop app 100.0%\n" ++
-            "Plan          plus\nCredits       none\nSpend limit   not reached\n\nLimits\n- codex (5h window): 42% used, resets 10:14 UTC\n",
+        "codex usage from ChatGPT for samdoe, updated 08:14 UTC\n" ++
+            "tokens        39877412 today, 92170838 7d, 92170838 month, 315686778511 lifetime\n" ++
+            "record        peak day 11594630891 tokens, longest chat 30h 41m, streak 132 days (best 132), 11374 chats\n" ++
+            "habits        fast mode 67%, reasoning xhigh (85%)\n" ++
+            "share by model (month): gpt-6.1-sol fast 75.0%, gpt-6.1-sol standard 25.0%\n" ++
+            "share by surface (month): desktop app 100.0%\n" ++
+            "plan          plus\ncredits       none\nspend limit   not reached\n\nlimits\n- codex (5h window): 42% used, resets 10:14 UTC\n",
         profile_text,
     );
 
     const text = try contract.render(alloc, .text);
     defer alloc.free(text);
     try std.testing.expectEqualStrings(
-        "Codex usage from ChatGPT, updated 08:14 UTC\nPlan          plus\nCredits       none\nSpend limit   not reached\n\nLimits\n- codex (5h window): 42% used, resets 10:14 UTC\n",
+        "codex usage from ChatGPT, updated 08:14 UTC\nplan          plus\ncredits       none\nspend limit   not reached\n\nlimits\n- codex (5h window): 42% used, resets 10:14 UTC\n",
         text,
     );
 
@@ -4592,7 +4592,7 @@ test "usage text and JSON render a Codex plan's limits" {
         const local_text = try contract.render(alloc, .text);
         defer alloc.free(local_text);
         try std.testing.expectEqualStrings(
-            "Codex usage from ChatGPT, updated 13:44 IST\nPlan          plus\nCredits       none\nSpend limit   not reached\n\nLimits\n- codex (5h window): 42% used, resets 15:44 IST\n",
+            "codex usage from ChatGPT, updated 13:44 IST\nplan          plus\ncredits       none\nspend limit   not reached\n\nlimits\n- codex (5h window): 42% used, resets 15:44 IST\n",
             local_text,
         );
     }
@@ -4624,22 +4624,22 @@ pub const SlackSnapshot = struct {
         if (format == .json) {
             try std.json.Stringify.value(self, .{}, &out.writer);
         } else if (!self.installed) {
-            try out.writer.writeAll("No local Slack bot installation. Run fx slack install.\n");
+            try out.writer.writeAll("no local slack bot installation. run fx slack install.\n");
         } else {
             try out.writer.writeAll(if (std.mem.eql(u8, self.action, "install"))
-                "fx is now installed in your Slack workspace.\n"
+                "fx is now installed in your slack workspace.\n"
             else
-                "Your fx Slack bot credentials are saved on this computer.\n");
+                "your fx slack bot credentials are saved on this computer.\n");
             if (self.expires_at_ms) |expiry| {
                 if (local_time.local(expiry)) |reading| {
                     var date_buf: [24]u8 = undefined;
-                    try out.writer.print("Access expires on {s} at ", .{formatDate(&date_buf, &reading)});
+                    try out.writer.print("access expires on {s} at ", .{formatDate(&date_buf, &reading)});
                     try writeClock(&out.writer, &reading);
                     try out.writer.writeAll(".\n");
                 } else {
-                    try out.writer.writeAll("Access expiration time is unavailable.\n");
+                    try out.writer.writeAll("access expiration time is unavailable.\n");
                 }
-                try out.writer.writeAll("Run fx slack refresh to renew locally.\n");
+                try out.writer.writeAll("run fx slack refresh to renew locally.\n");
             }
         }
         return out.toOwnedSlice();
@@ -4660,16 +4660,16 @@ test "slack text reads the access expiry in the local zone" {
     };
     const utc_text = try snapshot.render(alloc, .text);
     defer alloc.free(utc_text);
-    try std.testing.expect(std.mem.find(u8, utc_text, "Access expires on Oct 15, 2026 at 00:00 UTC.\n") != null);
+    try std.testing.expect(std.mem.find(u8, utc_text, "access expires on oct 15, 2026 at 00:00 UTC.\n") != null);
 
     local_time.test_zone = .{ .offset_s = -7 * std.time.s_per_hour, .name = "PDT" };
     defer local_time.test_zone = .utc;
     const local_text = try snapshot.render(alloc, .text);
     defer alloc.free(local_text);
-    try std.testing.expect(std.mem.find(u8, local_text, "Access expires on Oct 14, 2026 at 17:00 PDT.\n") != null);
+    try std.testing.expect(std.mem.find(u8, local_text, "access expires on oct 14, 2026 at 17:00 PDT.\n") != null);
 
     snapshot.expires_at_ms = -1;
     const unknown_text = try snapshot.render(alloc, .text);
     defer alloc.free(unknown_text);
-    try std.testing.expect(std.mem.find(u8, unknown_text, "Access expiration time is unavailable.\n") != null);
+    try std.testing.expect(std.mem.find(u8, unknown_text, "access expiration time is unavailable.\n") != null);
 }

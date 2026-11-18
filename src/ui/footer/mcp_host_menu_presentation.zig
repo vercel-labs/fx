@@ -133,7 +133,7 @@ fn headingLinks(url: []const u8, width: u16) bool {
 /// long one never fills the screen. Narrow screens drop the lead first; the
 /// bare label always fits, as `headingLinks` checked.
 fn signInLinkRow(alloc: Allocator, url: []const u8, width: u16) !Row {
-    const leads = [_][]const u8{ "Waiting for the browser. Didn't open? ", "Didn't open? ", "" };
+    const leads = [_][]const u8{ "waiting for the browser. didn't open? ", "didn't open? ", "" };
     const lead = for (leads) |candidate| {
         if (sign_in_link_width + candidate.len <= width) break candidate;
     } else "";
@@ -229,7 +229,7 @@ fn listRow(alloc: Allocator, arena: Allocator, p: Projection, index: u16, width:
         const heading = headingLines(view);
         if (line >= first and line < first + heading) {
             if (line + 1 < first + heading) return .empty;
-            return listHeading(alloc, "Needs attention", width);
+            return listHeading(alloc, "needs attention", width);
         }
         const i = if (line > first) line - heading else line;
         return serverListRow(alloc, arena, rows[i], i == selected, width);
@@ -327,7 +327,7 @@ fn serverLine(alloc: Allocator, arena: Allocator, p: Projection, r: menu.Row, l:
     if (after == 1) {
         if (p.waitingAddress(r)) |url| {
             if (headingLinks(url, width)) return signInLinkRow(alloc, url, width);
-            return menu_frame.composeMessageRow(alloc, "Waiting for the browser. Didn't open? Go to:", width);
+            return menu_frame.composeMessageRow(alloc, "waiting for the browser. didn't open? go to:", width);
         }
     }
     if (after >= 2 and after < 2 + l.waiting) {
@@ -352,7 +352,7 @@ fn serverLine(alloc: Allocator, arena: Allocator, p: Projection, r: menu.Row, l:
     }
     // From Log in until the address comes, the requests before it can take seconds.
     if (after == 1 and r.status.signing_in and menu.toolsFor(r, p.tools) != .ready)
-        return menu_frame.composeMessageRow(alloc, "Signing in…", width);
+        return menu_frame.composeMessageRow(alloc, "signing in…", width);
     if (after == 1) {
         const message: []const u8 = switch (menu.toolsFor(r, p.tools)) {
             .loading => "loading tools…",
@@ -364,7 +364,7 @@ fn serverLine(alloc: Allocator, arena: Allocator, p: Projection, r: menu.Row, l:
             else if (l.tools == 0)
                 "no matching tools."
             else
-                return listHeading(alloc, "Tools", width),
+                return listHeading(alloc, "tools", width),
         };
         return menu_frame.composeMessageRow(alloc, message, width);
     }
@@ -437,16 +437,16 @@ fn confirmLines(p: Projection, r: menu.Row, width: u16, out: *Confirm) []const C
     n += 1;
     const name = r.status.name;
     const q = switch (c) {
-        .remove => std.mem.print(&out.question, "Remove {s} from {s}?", .{ name, p.fileOf(r) }),
-        .approve => std.mem.print(&out.question, "Approve {s} for this project? It {s}:", .{ name, if (r.status.transport == .stdio) "runs" else "connects to" }),
-        .reject => std.mem.print(&out.question, "Reject {s}? fx won't start it in this project.", .{name}),
+        .remove => std.mem.print(&out.question, "remove {s} from {s}?", .{ name, p.fileOf(r) }),
+        .approve => std.mem.print(&out.question, "approve {s} for this project? it {s}:", .{ name, if (r.status.transport == .stdio) "runs" else "connects to" }),
+        .reject => std.mem.print(&out.question, "reject {s}? fx won't start it in this project.", .{name}),
         .login, .logout => std.mem.print(&out.question, "{s} {s}?", .{ c.label(), name }),
-    } catch "Are you sure?";
+    } catch "are you sure?";
     out.lines[n] = .{ .text = q, .style = .question };
     n += 1;
     switch (c) {
         .remove => if (r.status.signed_in) {
-            out.lines[n] = .{ .text = "Its saved login is deleted too.", .style = .detail };
+            out.lines[n] = .{ .text = "its saved login is deleted too.", .style = .detail };
             n += 1;
         },
         .approve => {
@@ -524,10 +524,10 @@ fn question(arena: Allocator, p: Projection, r: menu.Row, c: menu.Choice) ![]con
     const name = r.status.name;
     return switch (c) {
         .remove => if (r.status.signed_in)
-            arena.print("Remove {s} and its login from {s}?", .{ name, p.fileOf(r) })
+            arena.print("remove {s} and its login from {s}?", .{ name, p.fileOf(r) })
         else
-            arena.print("Remove {s} from {s}?", .{ name, p.fileOf(r) }),
-        else => arena.print("Reject {s}? fx won't start it in this project.", .{name}),
+            arena.print("remove {s} from {s}?", .{ name, p.fileOf(r) }),
+        else => arena.print("reject {s}? fx won't start it in this project.", .{name}),
     };
 }
 
@@ -596,7 +596,7 @@ test "the list is fx's picker: a title, rows with status and source, and a filte
         \\
         \\  context7                ready, 2 tools          profile
         \\
-        \\  Needs attention
+        \\  needs attention
         \\  docs                    waiting for approval    project
         \\  linear                  needs login             profile
         \\
@@ -608,7 +608,7 @@ test "the list is fx's picker: a title, rows with status and source, and a filte
     try testing.expectEqualStrings(
         \\MCP servers
         \\
-        \\  Needs attention
+        \\  needs attention
         \\  linear                  needs login             profile
         \\
         \\
@@ -625,7 +625,7 @@ test "the list is fx's picker: a title, rows with status and source, and a filte
         \\
         \\  context7      ready, 2 tools
         \\
-        \\  Needs attention
+        \\  needs attention
         \\  docs          waiting for approval
         \\  linear        needs login
         \\  1 config note: /mcp list shows it
@@ -650,7 +650,7 @@ test "a long list scrolls to a selection below the attention heading" {
     try testing.expectEqual(max_inline_rows, menuRowCount(p, 88, max_inline_rows));
     const text = try render(p, 88);
     defer testing.allocator.free(text);
-    try testing.expect(std.mem.find(u8, text, "  Needs attention\n") != null);
+    try testing.expect(std.mem.find(u8, text, "  needs attention\n") != null);
     try testing.expect(std.mem.endsWith(u8, text, "  srv13                   needs login             profile\n"));
 }
 
@@ -683,7 +683,7 @@ test "a server's screen: facts, choices with their commands, then tools" {
     gh.tools = 2;
     gh.version = "2025-11-25";
     const rows = [_]menu.Row{.{ .status = gh, .target = "https://api.githubcopilot.com/mcp/" }};
-    const tools = [_]menu.Tool{ .{ .name = "create_issue", .description = "Create a new issue." }, .{ .name = "search_code", .description = "Search for code." } };
+    const tools = [_]menu.Tool{ .{ .name = "create_issue", .description = "create a new issue." }, .{ .name = "search_code", .description = "search for code." } };
     var p: Projection = .{ .rows = &rows, .tools = .{ .ready = &tools } };
     menu.open(&p.state);
     _ = menu.press(&p.state, .{ .rows = &rows }, .enter);
@@ -697,12 +697,12 @@ test "a server's screen: facts, choices with their commands, then tools" {
         \\  status    ready
         \\  protocol  2025-11-25
         \\
-        \\  Log out       /mcp logout github
-        \\  Remove        /mcp remove github
+        \\  log out       /mcp logout github
+        \\  remove        /mcp remove github
         \\
-        \\  Tools
-        \\  create_issue          Create a new issue.
-        \\  search_code           Search for code.
+        \\  tools
+        \\  create_issue          create a new issue.
+        \\  search_code           search for code.
         \\
     , text);
     // On a tool, Enter does nothing, so the hint doesn't offer it.
@@ -746,7 +746,7 @@ test "a confirmation names its target, and an approval shows everything it trust
     try testing.expectEqualStrings(
         \\docs · waiting for approval
         \\
-        \\  Approve docs for this project? It runs:
+        \\  approve docs for this project? it runs:
         \\    node ./scripts/docs-server.js --root .
         \\    --port 4100 --watch
         \\
@@ -771,8 +771,8 @@ test "Remove asks on its own row, at the same size" {
     // the server screen's.
     const text = try render(p, 88);
     defer testing.allocator.free(text);
-    try testing.expect(std.mem.find(u8, text, "  Remove github and its login from ~/.fx/mcp.json?   yes  no\n") != null);
-    try testing.expect(std.mem.find(u8, text, "  Log out       /mcp logout github\n") != null);
+    try testing.expect(std.mem.find(u8, text, "  remove github and its login from ~/.fx/mcp.json?   yes  no\n") != null);
+    try testing.expect(std.mem.find(u8, text, "  log out       /mcp logout github\n") != null);
     try testing.expectEqualStrings("↑↓ navigate     enter run     esc back", hintVariants(p)[0]);
     var asked = try composeRow(testing.allocator, p, 7, 88, menuRowCount(p, 88, 40));
     defer asked.deinit(testing.allocator);
@@ -788,7 +788,7 @@ test "Remove asks on its own row, at the same size" {
     _ = menu.press(&odd.state, .{ .rows = &odd_rows, .open = odd_rows[0], .layout = odd.layout(odd_rows[0]) }, .enter);
     var row = try composeRow(testing.allocator, odd, 6, 88, menuRowCount(odd, 88, 40));
     defer row.deinit(testing.allocator);
-    try testing.expect(std.mem.find(u8, row.items, "Remove x") != null);
+    try testing.expect(std.mem.find(u8, row.items, "remove x") != null);
     try testing.expect(std.mem.find(u8, row.items, "\x1b[2J") == null);
 }
 
@@ -802,7 +802,7 @@ test "a sign-in that waits links its address in one line, like the transcript" {
     _ = menu.press(&p.state, .{ .rows = &rows }, .enter);
     const text = try render(p, 80);
     defer testing.allocator.free(text);
-    try testing.expect(std.mem.find(u8, text, "  Waiting for the browser. Didn't open? Open the sign-in page.\n") != null);
+    try testing.expect(std.mem.find(u8, text, "  waiting for the browser. didn't open? open the sign-in page.\n") != null);
     try testing.expect(std.mem.find(u8, text, "its tools show here once you log in.") == null);
     try testing.expect(std.mem.find(u8, text, "https://linear.app/oauth") == null);
     // Title and its blank, three facts and a blank, two choices, a blank and
@@ -817,7 +817,7 @@ test "a sign-in that waits links its address in one line, like the transcript" {
         const count = menuRowCount(p, width, 40);
         var row = try composeRow(testing.allocator, p, count - 1, width, count);
         defer row.deinit(testing.allocator);
-        try testing.expect(std.mem.find(u8, row.items, "\x1b]8;id=fx-mcp-sign-in;" ++ url ++ "\x1b\\\x1b[4mOpen the sign-in page\x1b[24m\x1b]8;;\x1b\\") != null);
+        try testing.expect(std.mem.find(u8, row.items, "\x1b]8;id=fx-mcp-sign-in;" ++ url ++ "\x1b\\\x1b[4mopen the sign-in page\x1b[24m\x1b]8;;\x1b\\") != null);
         try testing.expect(display_width.visibleWidthIgnoringAnsi(row.items) <= width);
     }
 }
@@ -834,7 +834,7 @@ test "too narrow for the label, the waiting address is one link on every row it 
     const count = menuRowCount(p, 22, 40);
     var heading = try composeRow(testing.allocator, p, count - 6, 22, count);
     defer heading.deinit(testing.allocator);
-    try testing.expect(std.mem.find(u8, heading.items, "Waiting for the") != null);
+    try testing.expect(std.mem.find(u8, heading.items, "waiting for the") != null);
     for (0..5) |i| {
         var row = try composeRow(testing.allocator, p, count - 5 + @as(u16, @intCast(i)), 22, count);
         defer row.deinit(testing.allocator);
@@ -926,18 +926,18 @@ test "a login under way says so until its address comes" {
         \\  file      ~/.fx/mcp.json
         \\  status    needs login
         \\
-        \\  Log in        /mcp login linear
-        \\  Remove        /mcp remove linear
+        \\  log in        /mcp login linear
+        \\  remove        /mcp remove linear
         \\
-        \\  Signing in…
+        \\  signing in…
         \\
     , text);
     // Its address takes that line's place.
     p.sign_in_url = "https://linear.app/oauth/authorize?state=1";
     const waiting = try render(p, 80);
     defer testing.allocator.free(waiting);
-    try testing.expect(std.mem.find(u8, waiting, "Signing in…") == null);
-    try testing.expect(std.mem.find(u8, waiting, "Waiting for the browser. Didn't open? Open the sign-in page.") != null);
+    try testing.expect(std.mem.find(u8, waiting, "signing in…") == null);
+    try testing.expect(std.mem.find(u8, waiting, "waiting for the browser. didn't open? open the sign-in page.") != null);
     // A server already signed in keeps its tools while it signs in again.
     var github = testStatus("github", .ready);
     github.signed_in = true;
@@ -949,7 +949,7 @@ test "a login under way says so until its address comes" {
     const ready = try render(gh, 80);
     defer testing.allocator.free(ready);
     try testing.expect(std.mem.find(u8, ready, "it has no tools.") != null);
-    try testing.expect(std.mem.find(u8, ready, "Signing in…") == null);
+    try testing.expect(std.mem.find(u8, ready, "signing in…") == null);
 }
 
 test "names and errors from config and servers stay inert" {
@@ -1000,8 +1000,8 @@ test "a server that needs a login says so, once" {
         \\  file      ~/.fx/mcp.json
         \\  status    needs login
         \\
-        \\  Log in        /mcp login linear
-        \\  Remove        /mcp remove linear
+        \\  log in        /mcp login linear
+        \\  remove        /mcp remove linear
         \\
         \\  its tools show here once you log in.
         \\

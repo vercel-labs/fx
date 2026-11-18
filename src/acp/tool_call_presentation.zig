@@ -223,12 +223,12 @@ test "read titles say what they read while other tools keep their verb" {
         .arguments_json = "{\"request\":{\"handle\":\"fx-command-replay-0123.bin\",\"query\":\"error:\"}}",
         .resolved_display_target = "zig build test output for \"error:\"",
     };
-    try std.testing.expectEqualStrings("Searching zig build test output for \"error:\"", describeToolCall(registry, arena, read, null).title);
+    try std.testing.expectEqualStrings("searching zig build test output for \"error:\"", describeToolCall(registry, arena, read, null).title);
     var unresolved = read;
     unresolved.resolved_display_target = null;
-    try std.testing.expectEqualStrings("Searching command output", describeToolCall(registry, arena, unresolved, null).title);
+    try std.testing.expectEqualStrings("searching command output", describeToolCall(registry, arena, unresolved, null).title);
     const file: ToolCall = .{ .id = "file", .name = "read_file", .arguments_json = "{\"path\":\"a.txt\"}" };
-    try std.testing.expectEqualStrings("Reading", describeToolCall(registry, arena, file, null).title);
+    try std.testing.expectEqualStrings("reading", describeToolCall(registry, arena, file, null).title);
 }
 
 test "toolUpdateContentText clips long output and guards unsafe bytes" {

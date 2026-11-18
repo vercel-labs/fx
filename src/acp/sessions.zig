@@ -2739,7 +2739,7 @@ test "execution replay titles reads with the call whose saved output they read" 
     const replay_sources: ReplaySources = .{ .alloc = alloc, .workspace_root = "/workspace", .sources = &sources };
     const frames = try planExecutionReplay(arena, registry, null, null, replay_sources, .{ .tool_steps = steps[0..] });
     try std.testing.expectEqual(@as(usize, 2), frames.len);
-    try std.testing.expectEqualStrings("Searching zig build test output for \"error:\"", frames[1].tool_call.title);
+    try std.testing.expectEqualStrings("searching zig build test output for \"error:\"", frames[1].tool_call.title);
 
     // A later turn replayed with the same sources still names the command.
     var later_calls = [_]types.ToolCall{
@@ -2747,7 +2747,7 @@ test "execution replay titles reads with the call whose saved output they read" 
     };
     var later_steps = [_]types.ToolExecutionStep{.{ .tool_calls = later_calls[0..] }};
     const later = try planExecutionReplay(arena, registry, null, null, replay_sources, .{ .tool_steps = later_steps[0..] });
-    try std.testing.expectEqualStrings("Reading more output from zig build test", later[0].tool_call.title);
+    try std.testing.expectEqualStrings("reading more output from zig build test", later[0].tool_call.title);
 }
 
 test "ACP load titles a read with the call from an earlier turn" {
@@ -2798,7 +2798,7 @@ test "ACP load titles a read with the call from an earlier turn" {
 
     const captured = try readCaptured(&capture, alloc);
     defer alloc.free(captured);
-    try std.testing.expect(std.mem.find(u8, captured, "Searching zig build test output for \\\"error:\\\"") != null);
+    try std.testing.expect(std.mem.find(u8, captured, "searching zig build test output for \\\"error:\\\"") != null);
 }
 
 test "ACP load maps one-off child denial to invalid params" {

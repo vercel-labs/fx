@@ -504,7 +504,7 @@ pub fn Runtime(comptime App: type) type {
                     debug_trace.logf("host", "host_restore_skipped session={s} err={s}", .{ member.id, @errorName(err) });
                     if (err == error.SessionNotFound) continue;
                     var prefix_buf: [192]u8 = undefined;
-                    const prefix = std.mem.print(&prefix_buf, "Couldn't bring back session {s} with this one", .{member.id}) catch "Couldn't bring back a session with this one";
+                    const prefix = std.mem.print(&prefix_buf, "couldn't bring back session {s} with this one", .{member.id}) catch "couldn't bring back a session with this one";
                     writeFailure(app, .neutral, prefix, member.profile, err);
                     continue;
                 };
@@ -516,7 +516,7 @@ pub fn Runtime(comptime App: type) type {
         pub fn launchAndShow(app: *App, profile_name: ?[]const u8) !void {
             const child = launch(app, profile_name) catch |err| {
                 debug_trace.logf("host", "instance launch failed profile={s} err={s}", .{ profile_name orelse "default", @errorName(err) });
-                writeFailure(app, .@"error", "Couldn't start another fx instance", profile_name, err);
+                writeFailure(app, .@"error", "couldn't start another fx instance", profile_name, err);
                 return;
             };
             try AgentsRuntime.show(app, child);
@@ -535,10 +535,10 @@ pub fn Runtime(comptime App: type) type {
                 _ = launch(app, null) catch |err| {
                     debug_trace.logf("host", "startup instance launch failed index={d} err={s}", .{ app.instances.launched, @errorName(err) });
                     var prefix_buf: [128]u8 = undefined;
-                    const prefix = std.mem.print(&prefix_buf, "Started {d} of {d} fx instances", .{
+                    const prefix = std.mem.print(&prefix_buf, "started {d} of {d} fx instances", .{
                         AgentsRuntime.openInstanceCount(app),
                         app.instances.startup_count + 1,
-                    }) catch "Couldn't start every fx instance";
+                    }) catch "couldn't start every fx instance";
                     writeFailure(app, .@"error", prefix, null, err);
                     return;
                 };
@@ -552,7 +552,7 @@ pub fn Runtime(comptime App: type) type {
         /// instance ends the host, as `/exit` does.
         pub fn closeOnScreen(app: *App) !void {
             if (app.agent_on_screen) |child| if (child.agent.role == .subagent) {
-                try app.writeDomainNotice(.{ .topic = "instances", .tone = .neutral, .body = "/close closes an fx instance. This screen is a subagent's." }, true);
+                try app.writeDomainNotice(.{ .topic = "instances", .tone = .neutral, .body = "/close closes an fx instance. this screen is a subagent's." }, true);
                 return;
             };
             if (AgentsRuntime.openInstanceCount(app) <= 1) {
@@ -592,9 +592,9 @@ pub fn Runtime(comptime App: type) type {
                 const reason = app_profile_runtime.failureReason(app.alloc, name) catch null;
                 defer if (reason) |text| app.alloc.free(text);
                 const body = if (reason) |text|
-                    app.alloc.print("Couldn't use profile '{s}', which this session ran in: {s}", .{ name, text }) catch return
+                    app.alloc.print("couldn't use profile '{s}', which this session ran in: {s}", .{ name, text }) catch return
                 else
-                    app.alloc.print("Couldn't use profile '{s}', which this session ran in: {s}.", .{ name, failureText(err) }) catch return;
+                    app.alloc.print("couldn't use profile '{s}', which this session ran in: {s}.", .{ name, failureText(err) }) catch return;
                 defer app.alloc.free(body);
                 app.writeDomainNotice(.{ .topic = "instances", .tone = .@"error", .body = body }, true) catch {};
             };

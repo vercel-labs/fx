@@ -16,7 +16,7 @@ pub const SlashPresentationCategory = command_specs.SlashPresentationCategory;
 pub const SlashSpec = command_specs.SlashSpec;
 pub const SlashRegistry = command_specs.SlashRegistry;
 
-const json_option = command_specs.OptionDoc{ .flag = "--json", .description = "Emit machine-readable JSON instead of text" };
+const json_option = command_specs.OptionDoc{ .flag = "--json", .description = "emit machine-readable JSON instead of text" };
 
 /// Options for `fx ask`. `cli_ask` parses against this list and its help is
 /// rendered from it, so the two can't disagree.
@@ -24,27 +24,27 @@ const json_option = command_specs.OptionDoc{ .flag = "--json", .description = "E
 pub const json_only_options = [_]command_specs.OptionDoc{json_option};
 
 const login_providers = [_]command_specs.SubcommandDoc{
-    .{ .usage = "vercel", .description = "Vercel AI Gateway (the default)", .options = &login_options },
+    .{ .usage = "vercel", .description = "vercel AI gateway (the default)", .options = &login_options },
     .{ .usage = "codex", .description = "ChatGPT subscription" },
-    .{ .usage = "grok", .description = "Grok subscription" },
+    .{ .usage = "grok", .description = "grok subscription" },
 };
 
 pub const login_options = [_]command_specs.OptionDoc{
-    .{ .flag = "--api-key", .description = "Paste a Vercel AI Gateway API key instead of signing in through the browser" },
+    .{ .flag = "--api-key", .description = "paste a vercel AI gateway API key instead of signing in through the browser" },
 };
 
 pub const sessions_options = [_]command_specs.OptionDoc{
-    .{ .flag = "--live", .description = "List only the sessions an fx process has open now, with their subagents" },
-    .{ .flag = "--all", .description = "List saved sessions across every workspace in this profile" },
-    .{ .flag = "--limit <1-100>", .description = "Set the maximum sessions returned per page" },
-    .{ .flag = "--cursor <cursor>", .description = "Continue from a prior sessions result" },
+    .{ .flag = "--live", .description = "list only the sessions an fx process has open now, with their subagents" },
+    .{ .flag = "--all", .description = "list saved sessions across every workspace in this profile" },
+    .{ .flag = "--limit <1-100>", .description = "set the maximum sessions returned per page" },
+    .{ .flag = "--cursor <cursor>", .description = "continue from a prior sessions result" },
     json_option,
 };
 
 pub const sessions_convert_options = [_]command_specs.OptionDoc{json_option};
 
 pub const usage_options = [_]command_specs.OptionDoc{
-    .{ .flag = "--period <today|7d|month>", .description = "Select the period, in UTC days (default: month)" },
+    .{ .flag = "--period <today|7d|month>", .description = "select the period, in UTC days (default: month)" },
     json_option,
 };
 
@@ -52,101 +52,101 @@ pub const usage_options = [_]command_specs.OptionDoc{
 /// reads this list, so help and parsing can't disagree.
 pub const doctor_options = [_]command_specs.OptionDoc{
     json_option,
-    .{ .flag = "--fix", .description = "Remove old terminal and side folders whose session is gone" },
-    .{ .flag = "--deep", .description = "Read every saved file of each session checked, with no time limit; slower" },
+    .{ .flag = "--fix", .description = "remove old terminal and side folders whose session is gone" },
+    .{ .flag = "--deep", .description = "read every saved file of each session checked, with no time limit; slower" },
 };
 
 pub const upgrade_options = [_]command_specs.OptionDoc{
-    .{ .flag = "--channel <stable|dev>", .description = "Select and remember the release channel" },
+    .{ .flag = "--channel <stable|dev>", .description = "select and remember the release channel" },
     json_option,
 };
 
 pub const workspace_options = [_]command_specs.OptionDoc{json_option};
 
 const workspace_subcommands = [_]command_specs.SubcommandDoc{
-    .{ .usage = "list", .description = "List the primary and additional directories (default)" },
-    .{ .usage = "add PATH", .description = "Persist an existing additional directory" },
-    .{ .usage = "remove PATH", .description = "Remove an additional directory" },
-    .{ .usage = "clear", .description = "Remove all additional directories" },
+    .{ .usage = "list", .description = "list the primary and additional directories (default)" },
+    .{ .usage = "add PATH", .description = "persist an existing additional directory" },
+    .{ .usage = "remove PATH", .description = "remove an additional directory" },
+    .{ .usage = "clear", .description = "remove all additional directories" },
 };
 
 const config_subcommands = [_]command_specs.SubcommandDoc{
-    .{ .usage = "list", .description = "List the values set in each settings file (default)", .options = &config_options },
-    .{ .usage = "get <key>", .description = "Print the value fx uses for a setting", .options = &config_options },
-    .{ .usage = "set <key> <value>", .description = "Save a preference in ~/.fx/settings.json", .settable_key = true },
-    .{ .usage = "unset <key>", .description = "Remove a preference from ~/.fx/settings.json", .settable_key = true },
-    .{ .usage = "schema", .description = "Print the JSON Schema for ~/.fx/settings.json", .options = &config_schema_options },
+    .{ .usage = "list", .description = "list the values set in each settings file (default)", .options = &config_options },
+    .{ .usage = "get <key>", .description = "print the value fx uses for a setting", .options = &config_options },
+    .{ .usage = "set <key> <value>", .description = "save a preference in ~/.fx/settings.json", .settable_key = true },
+    .{ .usage = "unset <key>", .description = "remove a preference from ~/.fx/settings.json", .settable_key = true },
+    .{ .usage = "schema", .description = "print the JSON schema for ~/.fx/settings.json", .options = &config_schema_options },
 };
 
 const config_schema_options = [_]command_specs.OptionDoc{
-    .{ .flag = "--project", .description = "Print the schema for a project .fx.json instead" },
+    .{ .flag = "--project", .description = "print the schema for a project .fx.json instead" },
 };
 
 /// Every flag `fx config` parses: its own and `schema --project`.
 pub const config_parse_options = config_options ++ config_schema_options;
 
 const config_options = [_]command_specs.OptionDoc{
-    .{ .flag = "--global", .description = "Only the profile's own settings" },
-    .{ .flag = "--workspace", .description = "Only this workspace's override in the profile (list and get)" },
-    .{ .flag = "--show-origin", .description = "Start each line with where the value is set" },
+    .{ .flag = "--global", .description = "only the profile's own settings" },
+    .{ .flag = "--workspace", .description = "only this workspace's override in the profile (list and get)" },
+    .{ .flag = "--show-origin", .description = "start each line with where the value is set" },
     json_option,
 };
 
 const session_subcommands = [_]command_specs.SubcommandDoc{
-    .{ .usage = "last", .description = "Inspect the current workspace session" },
-    .{ .usage = "resume [last|<id>]", .description = "Resume the latest workspace session or a session by id" },
-    .{ .usage = "recover <id>", .description = "Copy a recoverable corrupt session into a new session" },
+    .{ .usage = "last", .description = "inspect the current workspace session" },
+    .{ .usage = "resume [last|<id>]", .description = "resume the latest workspace session or a session by id" },
+    .{ .usage = "recover <id>", .description = "copy a recoverable corrupt session into a new session" },
 };
 
 pub const session_options = [_]command_specs.OptionDoc{
-    .{ .flag = "--id <id>", .description = "Inspect a saved session by exact id" },
-    .{ .flag = "--tail <1-1000>", .description = "Show only the last turns, each under its own number" },
+    .{ .flag = "--id <id>", .description = "inspect a saved session by exact id" },
+    .{ .flag = "--tail <1-1000>", .description = "show only the last turns, each under its own number" },
     json_option,
 };
 
 pub const acp_options = agentRunOptions("sessions this server starts", .without_provider_order) ++ [_]command_specs.OptionDoc{
-    .{ .flag = "--log-file <path>", .description = "Write ACP logs to a file" },
+    .{ .flag = "--log-file <path>", .description = "write ACP logs to a file" },
 };
 
 pub const acp_usage = "acp " ++ agent_run_usage_base ++ " [--log-file <path>]";
 
 pub const pr_options = agentRunOptions("this request", .with_provider_order) ++ [_]command_specs.OptionDoc{
-    .{ .flag = "--create", .description = "Publish the drafted pull request via the GitHub CLI" },
+    .{ .flag = "--create", .description = "publish the drafted pull request via the GitHub CLI" },
 };
 
 const issue_options = agentRunOptions("this request", .with_provider_order) ++ [_]command_specs.OptionDoc{
-    .{ .flag = "--create", .description = "Publish the drafted issue via the GitHub CLI" },
+    .{ .flag = "--create", .description = "publish the drafted issue via the GitHub CLI" },
 };
 
 pub const replay_options = [_]command_specs.OptionDoc{
-    .{ .flag = "--frames", .description = "Render each captured frame" },
-    .{ .flag = "--golden <path>", .description = "Write the final rendered grid to a file" },
-    .{ .flag = "--frames-dir <path>", .description = "Write rendered frames to a directory" },
+    .{ .flag = "--frames", .description = "render each captured frame" },
+    .{ .flag = "--golden <path>", .description = "write the final rendered grid to a file" },
+    .{ .flag = "--frames-dir <path>", .description = "write rendered frames to a directory" },
     json_option,
 };
 
 /// `fx mcp list` options; `fx mcp --help` shows them in its usage line.
 const mcp_subcommands = [_]command_specs.SubcommandDoc{
-    .{ .usage = "list", .description = "List configured servers; never connects", .options = &mcp_list_options },
-    .{ .usage = "show NAME", .description = "Connect to a server: status, version, and tools", .options = &mcp_show_options },
+    .{ .usage = "list", .description = "list configured servers; never connects", .options = &mcp_list_options },
+    .{ .usage = "show NAME", .description = "connect to a server: status, version, and tools", .options = &mcp_show_options },
     .{
         .usage = "add NAME URL",
-        .description = "Add an HTTP server, or a command after --",
-        .subcommands = &.{.{ .usage = "slack", .description = "Add Slack's server" }},
+        .description = "add an HTTP server, or a command after --",
+        .subcommands = &.{.{ .usage = "slack", .description = "add slack's server" }},
         .options = &mcp_add_options,
     },
-    .{ .usage = "remove NAME", .description = "Remove a server and its login", .options = &mcp_scope_options },
-    .{ .usage = "login NAME", .description = "Sign in to an HTTP server", .options = &mcp_login_options },
-    .{ .usage = "logout NAME", .description = "Sign out and delete the login" },
-    .{ .usage = "approve NAME", .description = "Approve a project server from .mcp.json", .options = &mcp_approve_options },
-    .{ .usage = "reject NAME", .description = "Reject a project server" },
+    .{ .usage = "remove NAME", .description = "remove a server and its login", .options = &mcp_scope_options },
+    .{ .usage = "login NAME", .description = "sign in to an HTTP server", .options = &mcp_login_options },
+    .{ .usage = "logout NAME", .description = "sign out and delete the login" },
+    .{ .usage = "approve NAME", .description = "approve a project server from .mcp.json", .options = &mcp_approve_options },
+    .{ .usage = "reject NAME", .description = "reject a project server" },
     .{
         .usage = "call TOOL [JSON | -]",
-        .description = "Run an MCP tool from a command fx's shell tool runs",
+        .description = "run an MCP tool from a command fx's shell tool runs",
         .subcommands = &.{
-            .{ .usage = "list SERVER", .description = "List a server's tools" },
-            .{ .usage = "search QUERY...", .description = "Find the tools that match QUERY" },
-            .{ .usage = "help TOOL", .description = "Show a tool's arguments" },
+            .{ .usage = "list SERVER", .description = "list a server's tools" },
+            .{ .usage = "search QUERY...", .description = "find the tools that match QUERY" },
+            .{ .usage = "help TOOL", .description = "show a tool's arguments" },
         },
     },
 };
@@ -157,26 +157,26 @@ const mcp_subcommands = [_]command_specs.SubcommandDoc{
 /// `--global` names ~/.fx/mcp.json, the default, and `--project` the
 /// project's .mcp.json. `--profile` is the older name for `--global`.
 pub const mcp_scope_options = [_]command_specs.OptionDoc{
-    .{ .flag = "--global", .description = "Use ~/.fx/mcp.json, the default" },
-    .{ .flag = "--profile", .description = "Older name for --global", .hidden = true },
-    .{ .flag = "--project", .description = "Use the project's .mcp.json" },
+    .{ .flag = "--global", .description = "use ~/.fx/mcp.json, the default" },
+    .{ .flag = "--profile", .description = "older name for --global", .hidden = true },
+    .{ .flag = "--project", .description = "use the project's .mcp.json" },
 };
 pub const mcp_add_options = mcp_scope_options ++ [_]command_specs.OptionDoc{
-    .{ .flag = "--env <KEY=VALUE>", .description = "Set an environment variable for a command server" },
-    .{ .flag = "--header <KEY=VALUE>", .description = "Send a header to an HTTP server" },
-    .{ .flag = "--no-login", .description = "Don't sign in to an HTTP server that needs a login" },
+    .{ .flag = "--env <KEY=VALUE>", .description = "set an environment variable for a command server" },
+    .{ .flag = "--header <KEY=VALUE>", .description = "send a header to an HTTP server" },
+    .{ .flag = "--no-login", .description = "don't sign in to an HTTP server that needs a login" },
 };
 /// `list --connect` moved to `show NAME`; it is read to say so.
-const mcp_connect_option: command_specs.OptionDoc = .{ .flag = "--connect", .description = "Moved to show NAME", .hidden = true };
+const mcp_connect_option: command_specs.OptionDoc = .{ .flag = "--connect", .description = "moved to show NAME", .hidden = true };
 pub const mcp_list_options = [_]command_specs.OptionDoc{ json_option, mcp_connect_option };
 /// `/mcp list` in a session prints no JSON.
 pub const mcp_list_shell_options = [_]command_specs.OptionDoc{mcp_connect_option};
 pub const mcp_show_options = [_]command_specs.OptionDoc{json_option};
 pub const mcp_login_options = [_]command_specs.OptionDoc{
-    .{ .flag = "--no-browser", .description = "Print the sign-in address instead of opening it" },
+    .{ .flag = "--no-browser", .description = "print the sign-in address instead of opening it" },
 };
 pub const mcp_approve_options = [_]command_specs.OptionDoc{
-    .{ .flag = "--all", .description = "Approve every project server" },
+    .{ .flag = "--all", .description = "approve every project server" },
 };
 
 const permission_modes = [_][]const u8{ "ask", "auto", "full-access" };
@@ -193,21 +193,21 @@ const ProviderOrder = enum { with_provider_order, without_provider_order };
 /// don't apply gateway provider routing.
 fn agentRunOptions(comptime scope: []const u8, comptime provider_order: ProviderOrder) [if (provider_order == .with_provider_order) 15 else 12]command_specs.OptionDoc {
     const all = [_]command_specs.OptionDoc{
-        .{ .flag = "--permission-mode <mode>", .description = "Set the permission mode for " ++ scope ++ ": ask, auto, or full-access", .values = &permission_modes },
-        .{ .flag = "--ask", .description = "Ask before each action that needs permission" },
-        .{ .flag = "--auto", .description = "Automatically review unresolved permission requests" },
-        .{ .flag = "--full-access", .description = "Disable fx permission checks" },
-        .{ .flag = "--yolo", .description = "Alias for --full-access" },
-        .{ .flag = "--provider <name>", .description = "Override the model provider for " ++ scope ++ " (gateway, codex, grok, or a configured name)", .values = &builtin_providers },
-        .{ .flag = "--model <id>", .description = "Override the model for " ++ scope },
-        .{ .flag = "--effort <level>", .description = "Override the reasoning effort for " ++ scope },
-        .{ .flag = "--fast", .description = "Enable Fast mode for " ++ scope ++ " when the model supports it" },
-        .{ .flag = "--no-fast", .description = "Disable Fast mode for " ++ scope },
-        .{ .flag = "--ultrafast", .description = "Request Ultrafast mode for " ++ scope ++ " when the model supports it" },
-        .{ .flag = "--no-ultrafast", .description = "Disable Ultrafast mode for " ++ scope },
-        .{ .flag = "--provider-order <a,b,...>", .description = "Prefer these gateway providers in order for " ++ scope },
-        .{ .flag = "--provider-strict", .description = "Restrict " ++ scope ++ " to only the providers in --provider-order" },
-        .{ .flag = "--no-provider-strict", .description = "Clear the provider restriction for " ++ scope },
+        .{ .flag = "--permission-mode <mode>", .description = "set the permission mode for " ++ scope ++ ": ask, auto, or full-access", .values = &permission_modes },
+        .{ .flag = "--ask", .description = "ask before each action that needs permission" },
+        .{ .flag = "--auto", .description = "automatically review unresolved permission requests" },
+        .{ .flag = "--full-access", .description = "disable fx permission checks" },
+        .{ .flag = "--yolo", .description = "alias for --full-access" },
+        .{ .flag = "--provider <name>", .description = "override the model provider for " ++ scope ++ " (gateway, codex, grok, or a configured name)", .values = &builtin_providers },
+        .{ .flag = "--model <id>", .description = "override the model for " ++ scope },
+        .{ .flag = "--effort <level>", .description = "override the reasoning effort for " ++ scope },
+        .{ .flag = "--fast", .description = "enable fast mode for " ++ scope ++ " when the model supports it" },
+        .{ .flag = "--no-fast", .description = "disable fast mode for " ++ scope },
+        .{ .flag = "--ultrafast", .description = "request ultrafast mode for " ++ scope ++ " when the model supports it" },
+        .{ .flag = "--no-ultrafast", .description = "disable ultrafast mode for " ++ scope },
+        .{ .flag = "--provider-order <a,b,...>", .description = "prefer these gateway providers in order for " ++ scope },
+        .{ .flag = "--provider-strict", .description = "restrict " ++ scope ++ " to only the providers in --provider-order" },
+        .{ .flag = "--no-provider-strict", .description = "clear the provider restriction for " ++ scope },
     };
     return if (provider_order == .with_provider_order) all else all[0..12].*;
 }
@@ -217,18 +217,18 @@ const agent_run_usage_base = "[--permission-mode <mode>|--ask|--auto|--full-acce
 const agent_run_usage = agent_run_usage_base ++ " [--provider-order <a,b,...>] [--provider-strict|--no-provider-strict]";
 
 pub const ask_options = agentRunOptions("this request", .with_provider_order) ++ [_]command_specs.OptionDoc{
-    .{ .flag = "--image PATH", .description = "Attach an image file; repeat for multiple images" },
-    .{ .flag = "--system TEXT", .description = "Replace the built-in system prompt for this request" },
+    .{ .flag = "--image PATH", .description = "attach an image file; repeat for multiple images" },
+    .{ .flag = "--system TEXT", .description = "replace the built-in system prompt for this request" },
     json_option,
-    .{ .flag = "--quiet", .description = "Suppress assistant output" },
-    .{ .flag = "--prompt-permissions", .description = "Prompt for Y/N permission approval when stdin is a TTY" },
-    .{ .flag = "--timeout <seconds>", .description = "Time limit for each shell command the agent runs" },
-    .{ .flag = "--config <key=value>", .description = "Override a setting for this request, with the keys fx config set takes; repeatable" },
-    .{ .flag = "--no-save", .description = "Do not save the session; incompatible with --resume" },
-    .{ .flag = "--no-color", .description = "Render TTY output without colors or hyperlinks; NO_COLOR or TERM=dumb also turns color off" },
-    .{ .flag = "--resume <last|<id>>", .description = "Continue the last session or a session by id" },
-    .{ .flag = "--resume-id <id>", .description = "Continue a session by exact id", .replacement = "use --resume <id>" },
-    .{ .flag = "--", .description = "Treat every following argument as prompt text" },
+    .{ .flag = "--quiet", .description = "suppress assistant output" },
+    .{ .flag = "--prompt-permissions", .description = "prompt for Y/N permission approval when stdin is a TTY" },
+    .{ .flag = "--timeout <seconds>", .description = "time limit for each shell command the agent runs" },
+    .{ .flag = "--config <key=value>", .description = "override a setting for this request, with the keys fx config set takes; repeatable" },
+    .{ .flag = "--no-save", .description = "do not save the session; incompatible with --resume" },
+    .{ .flag = "--no-color", .description = "render TTY output without colors or hyperlinks; NO_COLOR or TERM=dumb also turns color off" },
+    .{ .flag = "--resume <last|<id>>", .description = "continue the last session or a session by id" },
+    .{ .flag = "--resume-id <id>", .description = "continue a session by exact id", .replacement = "use --resume <id>" },
+    .{ .flag = "--", .description = "treat every following argument as prompt text" },
 };
 
 pub const top_level_specs = [_]TopLevelSpec{
@@ -237,52 +237,52 @@ pub const top_level_specs = [_]TopLevelSpec{
         .token = "help",
         .aliases = &.{ "--help", "-h" },
         .usage = "help",
-        .summary = "Show this help",
+        .summary = "show this help",
     },
     .{
         .kind = .ask,
         .token = "ask",
         .usage = "ask " ++ agent_run_usage ++ " [--image PATH] [--system TEXT] [--json] [--quiet] [--prompt-permissions] [--timeout <seconds>] [--config <key=value>] [--no-save] [--no-color] [--resume <last|<id>>] [--] <prompt>",
-        .summary = "Run one noninteractive request",
+        .summary = "run one noninteractive request",
         .options = &ask_options,
         .details = &.{
-            "The prompt may be passed as arguments or piped on stdin when no prompt args are given.",
-            "TTY stdout uses the Minimal transcript presentation; redirected stdout emits raw assistant Markdown.",
-            "Operational progress and diagnostics are written to stderr. JSON `output` keeps accumulated assistant Markdown; `final_output` contains only the completed final response, or an empty string when absent.",
-            "JSON usage sums reported main-agent input_tokens and output_tokens, including with --no-save; unreported counts are null. cache_read_tokens and cache_write_tokens appear only when the provider reports them. Nested usage and dollar spend are excluded.",
+            "the prompt may be passed as arguments or piped on stdin when no prompt args are given.",
+            "TTY stdout uses the minimal transcript presentation; redirected stdout emits raw assistant markdown.",
+            "operational progress and diagnostics are written to stderr. JSON `output` keeps accumulated assistant markdown; `final_output` contains only the completed final response, or an empty string when absent.",
+            "JSON usage sums reported main-agent input_tokens and output_tokens, including with --no-save; unreported counts are null. cache_read_tokens and cache_write_tokens appear only when the provider reports them. nested usage and dollar spend are excluded.",
             "--system replaces only the built-in base prompt for this request; tool, skill, project, and runtime context still apply.",
-            "With --prompt-permissions, JSON and quiet requests may prompt on stderr only when stdin is a TTY.",
+            "with --prompt-permissions, JSON and quiet requests may prompt on stderr only when stdin is a TTY.",
         },
     },
     .{
         .kind = .acp,
         .token = "acp",
         .usage = acp_usage,
-        .summary = "Start an ACP server over stdio",
+        .summary = "start an ACP server over stdio",
         .options = &acp_options,
     },
     .{
         .kind = .pr,
         .token = "pr",
         .usage = "pr " ++ agent_run_usage ++ " [--create] [--] [context]",
-        .summary = "Draft or publish a pull request",
+        .summary = "draft or publish a pull request",
         .options = &pr_options,
         .details = &.{
-            "Must run inside a git repository. Without --create, the drafted PR is printed only.",
+            "must run inside a git repository. without --create, the drafted PR is printed only.",
         },
     },
     .{
         .kind = .issue,
         .token = "issue",
         .usage = "issue " ++ agent_run_usage ++ " [--create] [--] [context]",
-        .summary = "Draft or publish a GitHub issue",
+        .summary = "draft or publish a GitHub issue",
         .options = &issue_options,
     },
     .{
         .kind = .login,
         .token = "login",
         .usage = "login [vercel|codex|grok] [--api-key]",
-        .summary = "Sign in to Vercel or a selected provider",
+        .summary = "sign in to vercel or a selected provider",
         .subcommands = &login_providers,
         .options = &login_options,
     },
@@ -290,7 +290,7 @@ pub const top_level_specs = [_]TopLevelSpec{
         .kind = .logout,
         .token = "logout",
         .usage = "logout [vercel|codex|grok]",
-        .summary = "Sign out of Vercel or a selected provider session",
+        .summary = "sign out of vercel or a selected provider session",
         .subcommands = &login_providers,
     },
     .{
@@ -300,28 +300,28 @@ pub const top_level_specs = [_]TopLevelSpec{
         .hidden_from_top_level_help = true,
         .replaced_by = "fx login vercel --api-key",
         .usage = "setup",
-        .summary = "Paste an AI Gateway API key (deprecated: use fx login vercel --api-key)",
+        .summary = "paste an AI gateway API key (deprecated: use fx login vercel --api-key)",
     },
     .{
         .kind = .status,
         .token = "status",
         .usage = "status [--json]",
-        .summary = "Show configuration and runtime information",
+        .summary = "show configuration and runtime information",
         .options = &.{json_option},
     },
     .{
         .kind = .permissions,
         .token = "permissions",
         .usage = "permissions [--json]",
-        .summary = "Show the permission mode and rules",
+        .summary = "show the permission mode and rules",
         .options = &.{json_option},
         .details = &.{
-            "Modes:",
-            "  ask          Prompt before sensitive tool calls",
-            "  auto         Apply rules, then review unresolved sensitive tool calls (default)",
-            "  full-access  Disable fx permission checks",
+            "modes:",
+            "  ask          prompt before sensitive tool calls",
+            "  auto         apply rules, then review unresolved sensitive tool calls (default)",
+            "  full-access  disable fx permission checks",
             "",
-            "Change the mode from the interactive shell with `/permissions [ask|auto|full-access|reset]`,",
+            "change the mode from the interactive shell with `/permissions [ask|auto|full-access|reset]`,",
             "and manage persistent allow rules with `/allowlist`.",
         },
     },
@@ -330,53 +330,53 @@ pub const top_level_specs = [_]TopLevelSpec{
         .token = "mcp",
         .usage = "mcp <command> ...",
         // `fx mcp -h` is the verbs' own help (`mcp_host/verbs.zig` writeUsage).
-        .summary = "Manage MCP servers without opening the interactive shell",
+        .summary = "manage MCP servers without opening the interactive shell",
         .subcommands = &mcp_subcommands,
     },
     .{
         .kind = .models,
         .token = "models",
         .usage = "models [--json]",
-        .summary = "List available models",
+        .summary = "list available models",
         .options = &.{json_option},
     },
     .{
         .kind = .provider,
         .token = "provider",
         .usage = "provider <name>",
-        .summary = "Choose the model provider used by fx",
+        .summary = "choose the model provider used by fx",
     },
     .{
         .kind = .doctor,
         .token = "doctor",
         .usage = "doctor [--json] [--fix] [--deep]",
-        .summary = "Check that fx can work here, with a fix for each problem",
+        .summary = "check that fx can work here, with a fix for each problem",
         .options = &doctor_options,
     },
     .{
         .kind = .teams,
         .token = "teams",
         .usage = "teams",
-        .summary = "Choose the Vercel team used by AI Gateway",
+        .summary = "choose the vercel team used by AI gateway",
     },
     .{
         .kind = .session,
         .token = "session",
         .usage = "session <last|id|id/agent>|--id <id> [--tail <1-1000>] [--json] | session resume [last|<id>] | session recover <id>|--id <id> [--json]",
-        .summary = "Inspect, resume, or recover saved sessions",
+        .summary = "inspect, resume, or recover saved sessions",
         .subcommands = &session_subcommands,
         .options = &session_options,
         .details = &.{
             "<id>/<agent> reads a subagent by the name its parent gave it, and <id>/<agent>/<agent> that subagent's own; fx sessions --live lists them.",
-            "Reading takes no lock, so it works while another fx has the session open. --tail shows finished turns; the one in progress is not saved yet.",
+            "reading takes no lock, so it works while another fx has the session open. --tail shows finished turns; the one in progress is not saved yet.",
         },
     },
     .{
         .kind = .sessions,
         .token = "sessions",
         .usage = "sessions [--all] [--limit <1-100>] [--cursor <cursor>] [--json] | sessions --live [--all] [--json] | sessions convert [--json]",
-        .summary = "List saved sessions for the current workspace",
-        .subcommands = &.{.{ .usage = "convert", .description = "Convert every session saved in the previous format", .options = &sessions_convert_options }},
+        .summary = "list saved sessions for the current workspace",
+        .subcommands = &.{.{ .usage = "convert", .description = "convert every session saved in the previous format", .options = &sessions_convert_options }},
         .options = &sessions_options,
         .details = &.{
             "--live shows each session's state (working, idle, or unknown) and the model saved with it, with its subagents in a tree below it; fx session <id>/<agent> reads one.",
@@ -389,11 +389,11 @@ pub const top_level_specs = [_]TopLevelSpec{
         .help_title = "--resume",
         .hidden_from_top_level_help = true,
         .usage = "session resume [last|<id>] | -r, --resume [last|<id>] | --continue | -c",
-        .summary = "Continue a saved interactive session",
+        .summary = "continue a saved interactive session",
         .options = &.{
-            .{ .flag = "-r", .description = "Short for --resume; with no value, choose a session from a picker" },
-            .{ .flag = "last", .description = "Resume the most recent session" },
-            .{ .flag = "<id>", .description = "Resume a session by id" },
+            .{ .flag = "-r", .description = "short for --resume; with no value, choose a session from a picker" },
+            .{ .flag = "last", .description = "resume the most recent session" },
+            .{ .flag = "<id>", .description = "resume a session by id" },
         },
     },
     .{
@@ -401,19 +401,19 @@ pub const top_level_specs = [_]TopLevelSpec{
         .token = "credits",
         .aliases = &.{"balance"},
         .usage = "credits [--json]",
-        .summary = "Show the AI Gateway credit balance",
+        .summary = "show the AI gateway credit balance",
         .options = &.{json_option},
     },
     .{
         .kind = .usage,
         .token = "usage",
         .usage = "usage [--period <today|7d|month>] [--json]",
-        .summary = "Show your provider's usage and spend",
+        .summary = "show your provider's usage and spend",
         .options = &usage_options,
         .details = &.{
-            "With AI Gateway, reads its usage reports: with fx login, your spend on the team and your budget; with an API key, that key's spend.",
-            "With Codex, reads your ChatGPT plan's limits and activity; with Grok, your plan's allowance and credits.",
-            "Finished days are cached under ~/.fx and fetched at most once a day.",
+            "with AI gateway, reads its usage reports: with fx login, your spend on the team and your budget; with an API key, that key's spend.",
+            "with codex, reads your ChatGPT plan's limits and activity; with grok, your plan's allowance and credits.",
+            "finished days are cached under ~/.fx and fetched at most once a day.",
         },
     },
     .{
@@ -421,58 +421,58 @@ pub const top_level_specs = [_]TopLevelSpec{
         .token = "upgrade",
         .aliases = &.{"update"},
         .usage = "upgrade [--channel <stable|dev>] [--json]",
-        .summary = "Upgrade 𝒇x on the selected release channel",
+        .summary = "upgrade 𝒇x on the selected release channel",
         .options = &upgrade_options,
     },
     .{
         .kind = .replay,
         .token = "replay",
         .usage = "replay <tape> [--frames] [--json] [--golden <path>] [--frames-dir <path>]",
-        .summary = "Replay a recorded terminal session",
+        .summary = "replay a recorded terminal session",
         .hidden_from_top_level_help = true,
         .options = &replay_options,
         .details = &.{
-            "Developer tool for reproducing terminal rendering bugs from FX_RECORD and FX_DEBUG_RECORD tapes. It is not listed in `fx help`.",
+            "developer tool for reproducing terminal rendering bugs from FX_RECORD and FX_DEBUG_RECORD tapes. it is not listed in `fx help`.",
         },
     },
     .{
         .kind = .workspace,
         .token = "workspace",
         .usage = "workspace [list|add PATH|remove PATH|clear] [--json]",
-        .summary = "Manage additional workspace directories",
+        .summary = "manage additional workspace directories",
         .subcommands = &workspace_subcommands,
         .options = &workspace_options,
         .details = &.{
-            "Additional directories are stored for the current primary workspace.",
+            "additional directories are stored for the current primary workspace.",
         },
     },
     .{
         .kind = .completion,
         .token = "completion",
         .usage = "completion bash|zsh|fish",
-        .summary = "Print a shell completion script",
+        .summary = "print a shell completion script",
         .subcommands = &.{
-            .{ .usage = "bash", .description = "Load it with: eval \"$(fx completion bash)\"" },
-            .{ .usage = "zsh", .description = "Load it after compinit with: source <(fx completion zsh)" },
-            .{ .usage = "fish", .description = "Load it with: fx completion fish | source" },
+            .{ .usage = "bash", .description = "load it with: eval \"$(fx completion bash)\"" },
+            .{ .usage = "zsh", .description = "load it after compinit with: source <(fx completion zsh)" },
+            .{ .usage = "fish", .description = "load it with: fx completion fish | source" },
         },
         .details = &.{
-            "Add the load line to ~/.bashrc, ~/.zshrc, or ~/.config/fish/config.fish to keep it in new shells.",
-            "Tab completes commands, flags, setting keys after fx config get, set, and unset, and fixed flag values.",
+            "add the load line to ~/.bashrc, ~/.zshrc, or ~/.config/fish/config.fish to keep it in new shells.",
+            "tab completes commands, flags, setting keys after fx config get, set, and unset, and fixed flag values.",
         },
     },
     .{
         .kind = .config,
         .token = "config",
         .usage = "config [list|get <key>|set <key> <value>|unset <key>|schema [--project]] [--global|--workspace] [--show-origin] [--json]",
-        .summary = "Show and change fx settings",
+        .summary = "show and change fx settings",
         .subcommands = &config_subcommands,
         .options = &config_options,
         .details = &.{
-            "Values come from .fx.json, ~/.fx/settings.json, and this workspace's override in it. When a key repeats, the last line is the one fx uses.",
-            "Keys are dotted, such as status_line.context. A flag or an FX_* variable can override a value for one run; fx status shows what a run uses.",
-            "set and unset change plain preferences for every workspace, such as fast_mode, effort, theme, and status_line.context. Switches take true or false. Permission, model, provider, and account settings keep their own commands.",
-            "schema prints a JSON Schema that editors use to complete and check ~/.fx/settings.json, and --project prints the one for .fx.json. A file whose \"$schema\" names https://fx.sh/schemas/settings.json or https://fx.sh/schemas/fx.json gets the same check.",
+            "values come from .fx.json, ~/.fx/settings.json, and this workspace's override in it. when a key repeats, the last line is the one fx uses.",
+            "keys are dotted, such as status_line.context. a flag or an FX_* variable can override a value for one run; fx status shows what a run uses.",
+            "set and unset change plain preferences for every workspace, such as fast_mode, effort, theme, and status_line.context. switches take true or false. permission, model, provider, and account settings keep their own commands.",
+            "schema prints a JSON schema that editors use to complete and check ~/.fx/settings.json, and --project prints the one for .fx.json. a file whose \"$schema\" names https://fx.sh/schemas/settings.json or https://fx.sh/schemas/fx.json gets the same check.",
         },
     },
     command_specs.slack_install_spec,
@@ -492,21 +492,21 @@ pub const top_level_help_groups = [_]TopLevelHelpGroup{
     .{ .entries = &.{
         .{ .kind = .sessions, .usage = "sessions" },
         .{ .kind = .session, .usage = "session <last|id>" },
-        .{ .usage = "session resume [last|id]", .summary = "Resume the latest workspace session or a session by id" },
-        .{ .usage = "session recover <id>", .summary = "Copy a recoverable corrupt session" },
+        .{ .usage = "session resume [last|id]", .summary = "resume the latest workspace session or a session by id" },
+        .{ .usage = "session recover <id>", .summary = "copy a recoverable corrupt session" },
     } },
     .{ .entries = &.{
-        .{ .kind = .login, .usage = "login [vercel|codex|grok] [--api-key]", .summary = "Sign in to a model provider" },
-        .{ .kind = .logout, .usage = "logout [vercel|codex|grok]", .summary = "Sign out of a model provider" },
-        .{ .kind = .provider, .usage = "provider <name>", .summary = "Choose the active model provider" },
+        .{ .kind = .login, .usage = "login [vercel|codex|grok] [--api-key]", .summary = "sign in to a model provider" },
+        .{ .kind = .logout, .usage = "logout [vercel|codex|grok]", .summary = "sign out of a model provider" },
+        .{ .kind = .provider, .usage = "provider <name>", .summary = "choose the active model provider" },
         .{ .kind = .models, .usage = "models" },
     } },
     .{ .entries = &.{
-        .{ .kind = .teams, .usage = "teams", .summary = "Choose a Vercel AI Gateway team" },
-        .{ .kind = .credits, .usage = "credits|balance", .summary = "Show Vercel AI Gateway credits" },
+        .{ .kind = .teams, .usage = "teams", .summary = "choose a vercel AI gateway team" },
+        .{ .kind = .credits, .usage = "credits|balance", .summary = "show vercel AI gateway credits" },
     } },
     .{ .entries = &.{
-        .{ .kind = .usage, .usage = "usage [--period <today|7d|month>]", .summary = "Show your provider's usage and spend" },
+        .{ .kind = .usage, .usage = "usage [--period <today|7d|month>]", .summary = "show your provider's usage and spend" },
     } },
     .{ .entries = &.{
         .{ .kind = .status, .usage = "status" },
@@ -516,7 +516,7 @@ pub const top_level_help_groups = [_]TopLevelHelpGroup{
         .{ .kind = .permissions, .usage = "permissions" },
         .{ .kind = .workspace, .usage = "workspace" },
         .{ .kind = .config, .usage = "config" },
-        .{ .kind = .upgrade, .usage = "upgrade|update", .summary = "Upgrade fx on the selected release channel" },
+        .{ .kind = .upgrade, .usage = "upgrade|update", .summary = "upgrade fx on the selected release channel" },
         .{ .kind = .acp, .usage = "acp" },
         .{ .kind = .completion, .usage = "completion <shell>" },
         .{ .kind = .help, .usage = "help" },
@@ -579,104 +579,104 @@ pub const launch_usage: []const u8 = blk: {
 pub const top_level_flags = [_]TopLevelFlag{
     .{
         .usage = "--context-limit <spec>",
-        .description = "Set name=bytes|off; repeatable",
+        .description = "set name=bytes|off; repeatable",
     },
     .{
         .usage = "--add-dir <path>",
-        .description = "Add a workspace directory; repeatable",
+        .description = "add a workspace directory; repeatable",
     },
     .{
         .usage = "--no-additional-dirs",
-        .description = "Ignore saved additional directories",
+        .description = "ignore saved additional directories",
     },
     .{
         .usage = "--tool-placement <spec>",
-        .description = "Move a built-in tool: tool=toolbox or tool=direct; repeatable",
+        .description = "move a built-in tool: tool=toolbox or tool=direct; repeatable",
     },
     .{
         .usage = "--provider <name>",
-        .description = "Override the model provider for an interactive session (gateway, codex, grok, or a configured name)",
+        .description = "override the model provider for an interactive session (gateway, codex, grok, or a configured name)",
     },
     .{
         .usage = "--provider-order <a,b,...>",
-        .description = "Prefer these gateway providers in order for an interactive session",
+        .description = "prefer these gateway providers in order for an interactive session",
     },
     .{
         .usage = "--provider-strict, --no-provider-strict",
-        .description = "Restrict an interactive session to the providers in --provider-order, or clear the restriction",
+        .description = "restrict an interactive session to the providers in --provider-order, or clear the restriction",
     },
     .{
         .usage = "--model <id>",
-        .description = "Override the model for an interactive session",
+        .description = "override the model for an interactive session",
     },
     .{
         .usage = "--effort <level>",
-        .description = "Override the reasoning effort for an interactive session",
+        .description = "override the reasoning effort for an interactive session",
     },
     .{
         .usage = "--profile <name>",
-        .description = "Run an interactive session in an agent profile from ~/.fx/agents or the repository's .fx/agents",
+        .description = "run an interactive session in an agent profile from ~/.fx/agents or the repository's .fx/agents",
     },
     .{
         .usage = "--instances <n>",
-        .description = "Start n fx instances in one interactive session, each with its own conversation; Down on an empty composer, Ctrl+X, or /agents lists them to switch",
+        .description = "start n fx instances in one interactive session, each with its own conversation; down on an empty composer, ctrl+x, or /agents lists them to switch",
     },
     .{
         .usage = "--fast, --no-fast",
-        .description = "Turn Fast mode on or off for an interactive session",
+        .description = "turn fast mode on or off for an interactive session",
     },
     .{
         .usage = "--ultrafast, --no-ultrafast",
-        .description = "Request Ultrafast mode on or off for an interactive session",
+        .description = "request ultrafast mode on or off for an interactive session",
     },
     .{
         .usage = "--permission-mode <mode>",
-        .description = "Set the permission mode for an interactive session: ask, auto, or full-access",
+        .description = "set the permission mode for an interactive session: ask, auto, or full-access",
     },
     .{
         .usage = "--ask, --auto, --full-access",
-        .description = "Shortcuts for each permission mode; --yolo means --full-access",
+        .description = "shortcuts for each permission mode; --yolo means --full-access",
     },
     .{
         .usage = "-c, --continue",
-        .description = "Resume the remembered workspace session",
+        .description = "resume the remembered workspace session",
     },
     .{
         .usage = "-r, --resume [last|<id>]",
-        .description = "Pick a saved session, or resume the latest or an exact ID",
+        .description = "pick a saved session, or resume the latest or an exact ID",
     },
     .{
         .usage = "-h, --help",
-        .description = "Display this help and exit",
+        .description = "display this help and exit",
     },
     .{
         .usage = "-v, --version",
-        .description = "Print the fx version and exit",
+        .description = "print the fx version and exit",
     },
 };
 
 pub const top_level_examples = [_]TopLevelExample{
-    .{ .command = "fx", .description = "Start a fresh interactive session" },
-    .{ .command = "fx \"Fix the failing login test\"", .description = "Start a session with a first prompt" },
-    .{ .command = "fx ask \"Explain the changes in this repository\"", .description = "Run one request and exit" },
-    .{ .command = "fx session resume last", .description = "Continue the latest session for this workspace" },
-    .{ .command = "fx status --json", .description = "Inspect the current configuration as JSON" },
+    .{ .command = "fx", .description = "start a fresh interactive session" },
+    .{ .command = "fx \"Fix the failing login test\"", .description = "start a session with a first prompt" },
+    .{ .command = "fx ask \"Explain the changes in this repository\"", .description = "run one request and exit" },
+    .{ .command = "fx session resume last", .description = "continue the latest session for this workspace" },
+    .{ .command = "fx status --json", .description = "inspect the current configuration as JSON" },
 };
 
 pub const top_level_notes = [_][]const u8{
-    "Run `fx <command> --help` for command-specific usage and options.",
-    "Run `/help` inside an interactive session for slash commands.",
+    "run `fx <command> --help` for command-specific usage and options.",
+    "run `/help` inside an interactive session for slash commands.",
 };
 
 pub const top_level_resources = [_]TopLevelResource{
-    .{ .label = "Learn more about fx:", .value = "https://fx.sh/docs", .link = true },
-    .{ .label = "Report a problem:", .value = "run `/feedback` inside fx" },
+    .{ .label = "learn more about fx:", .value = "https://fx.sh/docs", .link = true },
+    .{ .label = "report a problem:", .value = "run `/feedback` inside fx" },
 };
 
 pub const top_level_registry = TopLevelRegistry{
     .specs = top_level_specs[0..],
-    .description = "Fast, native coding agent for the terminal.",
-    .interactive_hint = "fx starts an interactive session by default. Use `fx ask` to run one noninteractive request.",
+    .description = "fast, native coding agent for the terminal.",
+    .interactive_hint = "fx starts an interactive session by default. use `fx ask` to run one noninteractive request.",
     .help_groups = top_level_help_groups[0..],
     .flags = top_level_flags[0..],
     .examples = top_level_examples[0..],
@@ -742,8 +742,8 @@ pub const slash_specs = [_]SlashSpec{
     .{ .kind = .settings, .command = "/settings", .help_entry = "/settings [startup-scrollback [on|off]]", .completion_description = "browse and update settings", .presentation_category = .appearance, .has_args = true, .accepts_payload = true },
     .{ .kind = .credits, .command = "/credits", .aliases = &.{"/balance"}, .help_entry = "/credits (/balance)", .completion_description = "show gateway credits balance", .presentation_category = .account, .requires_prompt_credential = true },
     .{ .kind = .paste, .command = "/paste", .help_entry = "/paste", .completion_description = "attach an image from the clipboard when supported", .presentation_category = .media },
-    .{ .kind = .fast, .command = "/fast", .help_entry = "/fast [on|off]", .completion_description = "toggle Fast mode when supported", .presentation_category = .model, .has_args = true, .accepts_payload = true },
-    .{ .kind = .ultrafast, .command = "/ultrafast", .help_entry = "/ultrafast [on|off|status]", .completion_description = "request Ultrafast mode when supported", .presentation_category = .model, .has_args = true, .accepts_payload = true },
+    .{ .kind = .fast, .command = "/fast", .help_entry = "/fast [on|off]", .completion_description = "toggle fast mode when supported", .presentation_category = .model, .has_args = true, .accepts_payload = true },
+    .{ .kind = .ultrafast, .command = "/ultrafast", .help_entry = "/ultrafast [on|off|status]", .completion_description = "request ultrafast mode when supported", .presentation_category = .model, .has_args = true, .accepts_payload = true },
     .{ .kind = .statusline, .command = "/statusline", .help_entry = "/statusline [context|session|workspace]", .completion_description = "toggle status line segments", .presentation_category = .appearance, .has_args = true, .accepts_payload = true },
     .{ .kind = .notifications, .command = "/sound", .help_entry = "/sound [on|off|max]", .completion_description = "toggle sounds and terminal bells", .presentation_category = .appearance, .has_args = true, .accepts_payload = true },
     .{ .kind = .workspace, .command = "/workspace", .help_entry = "/workspace [list|add PATH|remove PATH|clear]", .completion_description = "manage additional workspace directories", .presentation_category = .workspace, .show_in_welcome = true, .has_args = true, .accepts_payload = true },

@@ -92,17 +92,17 @@ pub const Key = struct {
 
 const sound_children = [_][]const u8{ "attention_required", "max", "turn_end" };
 const sound_child_descriptions = [_][]const u8{
-    "Play a sound when fx needs your attention",
-    "Play extra interaction sounds when sound is on",
-    "Play a sound when a turn finishes",
+    "play a sound when fx needs your attention",
+    "play extra interaction sounds when sound is on",
+    "play a sound when a turn finishes",
 };
 const status_line_children = [_][]const u8{ "context", "session", "workspace" };
 const status_line_child_descriptions = [_][]const u8{
-    "Show context usage in the footer",
-    "Show the session title in the footer",
-    "Show the workspace path and Git branch in the footer",
+    "show context usage in the footer",
+    "show the session title in the footer",
+    "show the workspace path and git branch in the footer",
 };
-const retired_description = "No longer used; fx ignores it";
+const retired_description = "no longer used; fx ignores it";
 
 pub const keys = [_]Key{
     .{ .name = "$schema", .where = .editor, .kind = .string, .top_level_only = true, .description = "The JSON Schema editors use to check this file" },

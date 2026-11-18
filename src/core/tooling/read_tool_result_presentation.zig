@@ -304,11 +304,11 @@ pub fn presentation(args: std.json.ObjectMap) ?tool_dispatch.CallPresentation {
     var handle_buffer: [max_escaped_handle_bytes]u8 = undefined;
     const request = presentedRequest(args, &handle_buffer) orelse return null;
     return switch (request.kind) {
-        .range => readPresentation("Reading", "Read", outputNoun(request.handle, "more command output", "more output")),
-        .query => readPresentation("Searching", "Searched", outputNoun(request.handle, "command output", "saved output")),
+        .range => readPresentation("reading", "read", outputNoun(request.handle, "more command output", "more output")),
+        .query => readPresentation("searching", "searched", outputNoun(request.handle, "command output", "saved output")),
         .images => readPresentation("Reloading", "Reloaded", "saved images"),
-        .record => readPresentation("Opening", "Opened", "earlier conversation"),
-        .history_search => readPresentation("Searching", "Searched", "earlier conversation"),
+        .record => readPresentation("opening", "opened", "earlier conversation"),
+        .history_search => readPresentation("searching", "searched", "earlier conversation"),
     };
 }
 
@@ -386,15 +386,15 @@ fn expectDisplayTarget(arguments_json: []const u8, source: ?[]const u8, expected
 
 test "read_tool_result rows name what each request reads" {
     const replay = "fx-command-replay-0123.bin";
-    try expectPresentation("{\"request\":{\"handle\":\"" ++ replay ++ "\"}}", "Reading", "Read", "more command output");
-    try expectPresentation("{\"handle\":\"result-x.txt\",\"start_byte\":9}", "Reading", "Read", "more output");
-    try expectPresentation("{\"request\":{\"handle\":\"" ++ replay ++ "\",\"query\":\"error:\"}}", "Searching", "Searched", "command output");
-    try expectPresentation("{\"handle\":\"result-x\",\"query\":\"error:\"}", "Searching", "Searched", "saved output");
+    try expectPresentation("{\"request\":{\"handle\":\"" ++ replay ++ "\"}}", "reading", "read", "more command output");
+    try expectPresentation("{\"handle\":\"result-x.txt\",\"start_byte\":9}", "reading", "read", "more output");
+    try expectPresentation("{\"request\":{\"handle\":\"" ++ replay ++ "\",\"query\":\"error:\"}}", "searching", "searched", "command output");
+    try expectPresentation("{\"handle\":\"result-x\",\"query\":\"error:\"}", "searching", "searched", "saved output");
     // An empty query reads a range, as `decode` treats it.
-    try expectPresentation("{\"handle\":\"result-x\",\"query\":\"\"}", "Reading", "Read", "more output");
+    try expectPresentation("{\"handle\":\"result-x\",\"query\":\"\"}", "reading", "read", "more output");
     try expectPresentation("{\"request\":{\"handle\":\"image-result-abc\"}}", "Reloading", "Reloaded", "saved images");
-    try expectPresentation("{\"request\":{\"handle\":\" t5 \"}}", "Opening", "Opened", "earlier conversation");
-    try expectPresentation("{\"request\":{\"search\":[\"retry budget\"]}}", "Searching", "Searched", "earlier conversation");
+    try expectPresentation("{\"request\":{\"handle\":\" t5 \"}}", "opening", "opened", "earlier conversation");
+    try expectPresentation("{\"request\":{\"search\":[\"retry budget\"]}}", "searching", "searched", "earlier conversation");
 
     var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, "{\"request\":\"handle\"}", .{});
     defer parsed.deinit();
@@ -424,10 +424,10 @@ test "read_tool_result rows read a request sent as JSON text as they read an obj
     const alloc = std.testing.allocator;
     const replay = "fx-command-replay-0123.bin";
     const query_text = "{\"request\":\"{\\\"handle\\\":\\\"" ++ replay ++ "\\\",\\\"query\\\":\\\"error:\\\"}\"}";
-    try expectPresentation(query_text, "Searching", "Searched", "command output");
-    try expectPresentation("{\"request\":\"{\\\"handle\\\":\\\"result-x\\\"}\"}", "Reading", "Read", "more output");
-    try expectPresentation("{\"request\":\"{\\\"handle\\\":\\\" t5 \\\"}\"}", "Opening", "Opened", "earlier conversation");
-    try expectPresentation("{\"request\":\"{\\\"search\\\":[\\\"retry budget\\\"]}\"}", "Searching", "Searched", "earlier conversation");
+    try expectPresentation(query_text, "searching", "searched", "command output");
+    try expectPresentation("{\"request\":\"{\\\"handle\\\":\\\"result-x\\\"}\"}", "reading", "read", "more output");
+    try expectPresentation("{\"request\":\"{\\\"handle\\\":\\\" t5 \\\"}\"}", "opening", "opened", "earlier conversation");
+    try expectPresentation("{\"request\":\"{\\\"search\\\":[\\\"retry budget\\\"]}\"}", "searching", "searched", "earlier conversation");
     try expectDisplayTarget(query_text, "zig build test", "zig build test output for \"error:\"");
     try expectDisplayTarget("{\"request\":\"{\\\"handle\\\":\\\"t5\\\"}\"}", null, "earlier tool call T5");
     const restored = (try requestedHandle(alloc, "{\"request\":\"{\\\"handle\\\":\\\" result-shell-abc \\\"}\"}")).?;
@@ -496,26 +496,26 @@ test "read_tool_result rows name what a request text longer than 4 KiB reads" {
         const cases = [_]struct { request: []const u8, action: []const u8, completed: []const u8, noun: []const u8 }{
             .{
                 .request = try std.json.Stringify.valueAlloc(arena, .{ .handle = "fx-command-replay-0123.bin", .query = padding }, .{}),
-                .action = "Searching",
-                .completed = "Searched",
+                .action = "searching",
+                .completed = "searched",
                 .noun = "command output",
             },
             .{
                 .request = try std.json.Stringify.valueAlloc(arena, .{ .handle = "result-x", .query = padding }, .{}),
-                .action = "Searching",
-                .completed = "Searched",
+                .action = "searching",
+                .completed = "searched",
                 .noun = "saved output",
             },
             .{
                 .request = try std.json.Stringify.valueAlloc(arena, .{ .handle = "result-x", .start_byte = 9, .note = padding }, .{}),
-                .action = "Reading",
-                .completed = "Read",
+                .action = "reading",
+                .completed = "read",
                 .noun = "more output",
             },
             .{
                 .request = try std.json.Stringify.valueAlloc(arena, .{ .handle = "t5", .note = padding }, .{}),
-                .action = "Opening",
-                .completed = "Opened",
+                .action = "opening",
+                .completed = "opened",
                 .noun = "earlier conversation",
             },
             .{
@@ -526,8 +526,8 @@ test "read_tool_result rows name what a request text longer than 4 KiB reads" {
             },
             .{
                 .request = try std.json.Stringify.valueAlloc(arena, .{ .search = [_][]const u8{ "retry budget", padding } }, .{}),
-                .action = "Searching",
-                .completed = "Searched",
+                .action = "searching",
+                .completed = "searched",
                 .noun = "earlier conversation",
             },
         };
@@ -632,7 +632,7 @@ test "read_tool_result rows read a request text as the full parse reads it" {
 
     // Some of those, read to the end, name what they read.
     const query_args = try std.json.Stringify.valueAlloc(arena, .{ .request = try arena.print("{{\"pad\":\"{s}\",\"handle\":\"result-x\",\"query\":\"e\"}}", .{padding}) }, .{});
-    try expectPresentation(query_args, "Searching", "Searched", "saved output");
+    try expectPresentation(query_args, "searching", "searched", "saved output");
     // A query counts when it holds any byte, written with an escape or not, and not when it is empty.
     for ([_]struct { query: []const u8, searching: bool }{
         .{ .query = "\"\"", .searching = false },
@@ -643,13 +643,13 @@ test "read_tool_result rows read a request text as the full parse reads it" {
         const request = try arena.print("{{\"handle\":\"result-x\",\"query\":{s}}}", .{case.query});
         const arguments_json = try std.json.Stringify.valueAlloc(arena, .{ .request = request }, .{});
         if (case.searching) {
-            try expectPresentation(arguments_json, "Searching", "Searched", "saved output");
+            try expectPresentation(arguments_json, "searching", "searched", "saved output");
         } else {
-            try expectPresentation(arguments_json, "Reading", "Read", "more output");
+            try expectPresentation(arguments_json, "reading", "read", "more output");
         }
     }
     const deep_args = try std.json.Stringify.valueAlloc(arena, .{ .request = "{\"handle\":\"result-x\",\"deep\":" ++ bracket_levels_63 ++ "}" }, .{});
-    try expectPresentation(deep_args, "Reading", "Read", "more output");
+    try expectPresentation(deep_args, "reading", "read", "more output");
     const too_deep_args = try std.json.Stringify.valueAlloc(arena, .{ .request = "{\"handle\":\"result-x\",\"deep\":" ++ bracket_levels_64 ++ "}" }, .{});
     var too_deep = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, too_deep_args, .{});
     defer too_deep.deinit();
@@ -668,7 +668,7 @@ test "read_tool_result rows name a text that repeats a field they do not read" {
         "{\"handle\":\"t5\",\"x\":{\"a\":1,\"a\":2}}",
     }) |text| {
         const arguments_json = try std.json.Stringify.valueAlloc(arena, .{ .request = text }, .{});
-        try expectPresentation(arguments_json, "Opening", "Opened", "earlier conversation");
+        try expectPresentation(arguments_json, "opening", "opened", "earlier conversation");
         const args = (try std.json.parseFromSliceLeaky(std.json.Value, arena, arguments_json, .{})).object;
         try std.testing.expect(try tool_args.unwrapRequest(arena, args) == null);
     }
@@ -684,7 +684,7 @@ test "read_tool_result rows keep the default label for a handle with escapes pas
         const text = try arena.print("{{\"handle\":\"result-{s}\"}}", .{try repeated(arena, "\\u0078", length - prefix_len)});
         const arguments_json = try std.json.Stringify.valueAlloc(arena, .{ .request = text }, .{});
         if (length <= max_escaped_handle_bytes) {
-            try expectPresentation(arguments_json, "Reading", "Read", "more output");
+            try expectPresentation(arguments_json, "reading", "read", "more output");
         } else {
             const args = (try std.json.parseFromSliceLeaky(std.json.Value, arena, arguments_json, .{})).object;
             try std.testing.expect(presentation(args) == null);
@@ -692,7 +692,7 @@ test "read_tool_result rows keep the default label for a handle with escapes pas
     }
     // A handle without escapes is read in the text, however long it is.
     const plain = try arena.print("{{\"handle\":\"result-{s}\"}}", .{try filled(arena, 8 * max_escaped_handle_bytes)});
-    try expectPresentation(try std.json.Stringify.valueAlloc(arena, .{ .request = plain }, .{}), "Reading", "Read", "more output");
+    try expectPresentation(try std.json.Stringify.valueAlloc(arena, .{ .request = plain }, .{}), "reading", "read", "more output");
 }
 
 test "read_tool_result display targets keep search text terminal-safe and short" {

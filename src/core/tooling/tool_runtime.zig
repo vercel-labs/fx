@@ -1253,8 +1253,8 @@ const BridgeCallRow = struct {
     fn finish(self: BridgeCallRow, arena: Allocator, kind: types.ToolOutcomeKind) void {
         const label = switch (kind) {
             .completed => tool_presentation.mcp_ran_label,
-            .cancelled => "Cancelled",
-            .failed, .denied, .deferred => "Failed",
+            .cancelled => "cancelled",
+            .failed, .denied, .deferred => "failed",
         };
         const summary = tool_presentation.formatToolActionValue(arena, label, self.tool) catch label;
         self.publisher.push(.{ .terminal = .{ .id = self.id, .outcome = .{ .kind = kind, .summary = summary } } }) catch |err| {

@@ -229,9 +229,9 @@ pub inline fn composeModelMenuRow(
     const item_row: u16, const display_index: usize = if (layout.token_pass_rows) |token_pass_rows| blk: {
         const line = groupedFirstLine(window_start, token_pass_rows, layout.match_count, layout.body_rows) + body_offset;
         switch (groupedLine(line, token_pass_rows)) {
-            .token_pass_heading => return composeGroupHeading(alloc, "Token Pass", width),
+            .token_pass_heading => return composeGroupHeading(alloc, "token pass", width),
             .gap => return row,
-            .others_heading => return composeGroupHeading(alloc, "All Models", width),
+            .others_heading => return composeGroupHeading(alloc, "all models", width),
             .item => |index| break :blk .{ 0, index },
         }
     } else .{ body_offset % layout.item_stride, window_start + body_offset / layout.item_stride };
@@ -286,12 +286,12 @@ const ProviderTabs = struct {
 fn providerTabLabel(index: usize) []const u8 {
     const filter: model_cache_runtime.ModelProviderFilter = @fromBackingInt(@intCast(index));
     return switch (filter) {
-        .all => "All",
-        .anthropic => "Anthropic",
+        .all => "all",
+        .anthropic => "anthropic",
         .openai => "OpenAI",
         .xai => "xAI",
         .zai => "Z.AI",
-        .others => "Others",
+        .others => "others",
     };
 }
 
@@ -512,11 +512,11 @@ fn composeTitleRow(
 
 // A `-fast` model always runs fast, so it reads "Fast". "Fast mode" and "Ultrafast mode"
 // name speed options the model offers, so they are not mistaken for a fast model.
-const fast_fact = "Fast";
-const fast_mode_fact = "Fast mode";
-const ultrafast_mode_fact = "Ultrafast mode";
+const fast_fact = "fast";
+const fast_mode_fact = "fast mode";
+const ultrafast_mode_fact = "ultrafast mode";
 // Listed first, so a narrow row cuts the other facts and keeps this one.
-const token_pass_fact = "Token Pass";
+const token_pass_fact = "token pass";
 
 fn composeStateRow(alloc: Allocator, projection: ModelMenuProjection, width: u16) !std.ArrayList(u8) {
     const text = switch (projection.load_state) {
@@ -529,31 +529,31 @@ fn composeStateRow(alloc: Allocator, projection: ModelMenuProjection, width: u16
 
 fn loadedCatalogStatusText(state: model_cache_runtime.ModelMenuCatalogState) ?[]const u8 {
     if (retryableFailureText(state.failure)) |text| return text;
-    if (state.from_profile_settings) return "Models from settings and, with fetch_models, the server; explicit model IDs need no catalog.";
+    if (state.from_profile_settings) return "models from settings and, with fetch_models, the server; explicit model IDs need no catalog.";
     if (state.private_models_hidden) {
-        const reason = state.public_only_reason orelse return "Using the public model catalog.";
+        const reason = state.public_only_reason orelse return "using the public model catalog.";
         return switch (reason) {
-            .no_credential => "Using the public model catalog; sign in or use an API key for team-private models.",
-            .fx_login_team_required => "Choose a Vercel team to load its private models.",
-            .fx_login_refresh_required => "Vercel sign-in must refresh before team-private models can load.",
-            .credential_refresh_required => "The selected sign-in must refresh before authenticated models can load.",
-            .credential_refresh_failed => "Vercel sign-in refresh failed; using the public model catalog.",
-            .authenticated_credential_rejected => "Your Gateway credential was rejected; using the public model catalog.",
-            .chatgpt_subscription => "Codex models require an authenticated Codex catalog.",
-            .grok_subscription => "Grok models require an authenticated Grok catalog.",
+            .no_credential => "using the public model catalog; sign in or use an API key for team-private models.",
+            .fx_login_team_required => "choose a vercel team to load its private models.",
+            .fx_login_refresh_required => "vercel sign-in must refresh before team-private models can load.",
+            .credential_refresh_required => "the selected sign-in must refresh before authenticated models can load.",
+            .credential_refresh_failed => "vercel sign-in refresh failed; using the public model catalog.",
+            .authenticated_credential_rejected => "your gateway credential was rejected; using the public model catalog.",
+            .chatgpt_subscription => "codex models require an authenticated codex catalog.",
+            .grok_subscription => "grok models require an authenticated grok catalog.",
         };
     }
     if (state.access_level == .authenticated) {
-        const source = state.source orelse return "Using an authenticated AI Gateway catalog.";
+        const source = state.source orelse return "using an authenticated AI gateway catalog.";
         return switch (source) {
-            .fx_login => "Gateway catalog: authenticated with fx login.",
-            .ai_gateway_api_key => "Note: Gateway catalog is authenticated with an API key",
-            .vercel_oidc_token => "Gateway catalog: authenticated with the Vercel session.",
-            .stored_key => "Gateway catalog: authenticated with the stored API key.",
-            .chatgpt_subscription => "Codex catalog: authenticated with a subscription.",
-            .grok_subscription => "Grok catalog: authenticated with a subscription.",
-            .host_managed => "Provider catalog: authentication is managed by the host.",
-            .configured => "Provider catalog: models from profile settings.",
+            .fx_login => "gateway catalog: authenticated with fx login.",
+            .ai_gateway_api_key => "note: gateway catalog is authenticated with an API key",
+            .vercel_oidc_token => "gateway catalog: authenticated with the vercel session.",
+            .stored_key => "gateway catalog: authenticated with the stored API key.",
+            .chatgpt_subscription => "codex catalog: authenticated with a subscription.",
+            .grok_subscription => "grok catalog: authenticated with a subscription.",
+            .host_managed => "provider catalog: authentication is managed by the host.",
+            .configured => "provider catalog: models from profile settings.",
         };
     }
     return null;
@@ -563,9 +563,9 @@ fn retryableFailureText(failure: ?model_cache_runtime.ModelMenuCatalogState.Fail
     const value = failure orelse return null;
     if (!value.retryable) return null;
     return switch (value.category) {
-        .rate_limited => "AI Gateway rate limited model discovery; fx retries automatically.",
-        .transport, .gateway_unavailable => "Could not reach AI Gateway; fx retries automatically.",
-        else => "Could not refresh model catalog; fx retries automatically.",
+        .rate_limited => "AI gateway rate limited model discovery; fx retries automatically.",
+        .transport, .gateway_unavailable => "could not reach AI gateway; fx retries automatically.",
+        else => "could not refresh model catalog; fx retries automatically.",
     };
 }
 
@@ -609,7 +609,7 @@ test "model menu renders provider tabs and compact model facts" {
         },
         .{
             .id = @constCast("openai/gpt-5"),
-            .provider = "openai",
+            .provider = "OpenAI",
             .capabilities = .{},
         },
     };
@@ -624,23 +624,24 @@ test "model menu renders provider tabs and compact model facts" {
     var header = try composeModelMenuRow(alloc, projection, 0, 120, rows);
     defer header.deinit(alloc);
     try std.testing.expect(std.mem.find(u8, header.items, "models") != null);
-    try std.testing.expect(std.mem.find(u8, header.items, "Models 2") == null);
-    try std.testing.expect(std.mem.find(u8, header.items, "< All >") != null);
-    try std.testing.expect(std.mem.find(u8, header.items, "Anthropic") == null);
+    try std.testing.expect(std.mem.find(u8, header.items, "models 2") == null);
+    try std.testing.expect(std.mem.find(u8, header.items, "< all >") != null);
+    try std.testing.expect(std.mem.find(u8, header.items, "anthropic") == null);
 
     var title = try composeModelMenuRow(alloc, projection, 2, 120, rows);
     defer title.deinit(alloc);
     try std.testing.expect(std.mem.find(u8, title.items, "anthropic/claude-opus-4.8") != null);
     try std.testing.expect(std.mem.find(u8, title.items, "●") == null);
     try std.testing.expect(std.mem.find(u8, title.items, "○") == null);
-    try std.testing.expect(std.mem.find(u8, title.items, "1M context   128K output   Fast mode, Ultrafast mode") != null);
-    try std.testing.expect(std.mem.find(u8, title.items, "Anthropic") == null);
-    try std.testing.expect(std.mem.find(u8, title.items, "Current") == null);
-    try std.testing.expect(std.mem.find(u8, title.items, "Reasoning") == null);
-    try std.testing.expect(std.mem.find(u8, title.items, "Vision") == null);
-    try std.testing.expect(std.mem.find(u8, title.items, "Tools") == null);
-    try std.testing.expect(std.mem.find(u8, title.items, "Files") == null);
-    try std.testing.expect(std.mem.find(u8, title.items, "Web") == null);
+    try std.testing.expect(std.mem.find(u8, title.items, "1M context   128K output   fast mode, ultrafast mode") != null);
+    // The provider shows only inside the model ID, never as a fact.
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, title.items, "anthropic"));
+    try std.testing.expect(std.mem.find(u8, title.items, "current") == null);
+    try std.testing.expect(std.mem.find(u8, title.items, "reasoning") == null);
+    try std.testing.expect(std.mem.find(u8, title.items, "vision") == null);
+    try std.testing.expect(std.mem.find(u8, title.items, "tools") == null);
+    try std.testing.expect(std.mem.find(u8, title.items, "files") == null);
+    try std.testing.expect(std.mem.find(u8, title.items, "web") == null);
 }
 
 test "model menu keeps active provider visible and omits unknown metadata" {
@@ -651,7 +652,7 @@ test "model menu keeps active provider visible and omits unknown metadata" {
             .provider = "private-team-provider",
             .capabilities = .{},
         },
-        .{ .id = @constCast("openai/gpt"), .provider = "openai", .capabilities = .{} },
+        .{ .id = @constCast("openai/gpt"), .provider = "OpenAI", .capabilities = .{} },
         .{ .id = @constCast("xai/grok"), .provider = "xai", .capabilities = .{} },
     };
     const projection: ModelMenuProjection = .{
@@ -664,7 +665,7 @@ test "model menu keeps active provider visible and omits unknown metadata" {
     const rows = menuRowCount(projection, 42, 5);
     var header = try composeModelMenuRow(alloc, projection, 0, 42, rows);
     defer header.deinit(alloc);
-    try std.testing.expect(std.mem.find(u8, header.items, "< Others >") != null);
+    try std.testing.expect(std.mem.find(u8, header.items, "< others >") != null);
     try std.testing.expect(display_width.visibleWidthIgnoringAnsi(header.items) <= 42);
 
     var title = try composeModelMenuRow(alloc, projection, 2, 24, rows);
@@ -673,7 +674,7 @@ test "model menu keeps active provider visible and omits unknown metadata" {
     try std.testing.expect(display_width.visibleWidthIgnoringAnsi(title.items) <= 24);
 }
 
-test "model menu keeps shared-prefix model ids distinguishable when narrow" {
+test "model menu keeps shared-prefix model IDs distinguishable when narrow" {
     const alloc = std.testing.allocator;
     const alpha: model_cache_runtime.ModelMenuItem = .{
         .id = @constCast("provider/very-long-shared-family-production-reasoning-alpha"),
@@ -716,7 +717,7 @@ test "model menu states and navigation budget stay bounded" {
     const failed: ModelMenuProjection = .{ .active = true, .load_state = .failed, .catalog_state = .{ .failure = .{ .category = .transport, .retryable = true } } };
     var failed_state = try composeModelMenuRow(alloc, failed, 2, 80, menuRowCount(failed, 80, 10));
     defer failed_state.deinit(alloc);
-    try std.testing.expect(std.mem.find(u8, failed_state.items, "Could not reach AI Gateway; fx retries automatically.") != null);
+    try std.testing.expect(std.mem.find(u8, failed_state.items, "could not reach AI gateway; fx retries automatically.") != null);
 
     const items = [_]model_cache_runtime.ModelMenuItem{
         .{ .id = @constCast("a/one"), .provider = "a", .capabilities = .{} },
@@ -751,7 +752,7 @@ test "empty model menu keeps catalog provenance below the empty state" {
 
     var status = try composeModelMenuRow(alloc, projection, 4, 80, rows);
     defer status.deinit(alloc);
-    try std.testing.expect(std.mem.find(u8, status.items, "Using the public model catalog") != null);
+    try std.testing.expect(std.mem.find(u8, status.items, "using the public model catalog") != null);
 }
 
 test "model menu caps inline browse at twenty and prioritizes tiny selection" {
@@ -813,7 +814,7 @@ test "model menu places catalog note after an item gap and preserves the heading
 
     var status = try composeModelMenuRow(alloc, projection, 5, 120, rows);
     defer status.deinit(alloc);
-    try std.testing.expect(std.mem.find(u8, status.items, "Note: Gateway catalog is authenticated with an API key") != null);
+    try std.testing.expect(std.mem.find(u8, status.items, "note: gateway catalog is authenticated with an API key") != null);
 }
 
 test "configured model menu identifies profile settings without Gateway sign-in" {
@@ -837,14 +838,14 @@ test "configured model menu identifies profile settings without Gateway sign-in"
 
     var status = try composeModelMenuRow(alloc, projection, rows - 1, 120, rows);
     defer status.deinit(alloc);
-    try std.testing.expect(std.mem.find(u8, status.items, "Models from settings and, with fetch_models, the server; explicit model IDs need no catalog.") != null);
+    try std.testing.expect(std.mem.find(u8, status.items, "models from settings and, with fetch_models, the server; explicit model IDs need no catalog.") != null);
     try std.testing.expect(std.mem.find(u8, status.items, "public model catalog") == null);
     try std.testing.expect(std.mem.find(u8, status.items, "sign in") == null);
 }
 
 test "model menu status follows provenance and retryable failure precedence" {
     try std.testing.expectEqualStrings(
-        "Gateway catalog: authenticated with fx login.",
+        "gateway catalog: authenticated with fx login.",
         loadedCatalogStatusText(.{ .access_level = .authenticated, .source = .fx_login }).?,
     );
 
@@ -852,17 +853,17 @@ test "model menu status follows provenance and retryable failure precedence" {
         state: model_cache_runtime.ModelMenuCatalogState,
         expected: []const u8,
     }{
-        .{ .state = .{ .public_only_reason = .no_credential, .private_models_hidden = true }, .expected = "Using the public model catalog; sign in or use an API key for team-private models." },
-        .{ .state = .{ .public_only_reason = .fx_login_team_required, .private_models_hidden = true }, .expected = "Choose a Vercel team to load its private models." },
-        .{ .state = .{ .public_only_reason = .fx_login_refresh_required, .private_models_hidden = true }, .expected = "Vercel sign-in must refresh before team-private models can load." },
-        .{ .state = .{ .public_only_reason = .credential_refresh_failed, .private_models_hidden = true }, .expected = "Vercel sign-in refresh failed; using the public model catalog." },
-        .{ .state = .{ .public_only_reason = .authenticated_credential_rejected, .private_models_hidden = true }, .expected = "Your Gateway credential was rejected; using the public model catalog." },
-        .{ .state = .{ .public_only_reason = .chatgpt_subscription, .private_models_hidden = true }, .expected = "Codex models require an authenticated Codex catalog." },
-        .{ .state = .{ .public_only_reason = .grok_subscription, .private_models_hidden = true }, .expected = "Grok models require an authenticated Grok catalog." },
-        .{ .state = .{ .failure = .{ .category = .transport, .retryable = true } }, .expected = "Could not reach AI Gateway; fx retries automatically." },
-        .{ .state = .{ .access_level = .public_only, .public_only_reason = .no_credential, .private_models_hidden = true, .failure = .{ .category = .rate_limited, .retryable = true } }, .expected = "AI Gateway rate limited model discovery; fx retries automatically." },
-        .{ .state = .{ .access_level = .authenticated, .failure = .{ .category = .rate_limited, .retryable = true } }, .expected = "AI Gateway rate limited model discovery; fx retries automatically." },
-        .{ .state = .{ .access_level = .authenticated, .failure = .{ .category = .runtime, .retryable = true } }, .expected = "Could not refresh model catalog; fx retries automatically." },
+        .{ .state = .{ .public_only_reason = .no_credential, .private_models_hidden = true }, .expected = "using the public model catalog; sign in or use an API key for team-private models." },
+        .{ .state = .{ .public_only_reason = .fx_login_team_required, .private_models_hidden = true }, .expected = "choose a vercel team to load its private models." },
+        .{ .state = .{ .public_only_reason = .fx_login_refresh_required, .private_models_hidden = true }, .expected = "vercel sign-in must refresh before team-private models can load." },
+        .{ .state = .{ .public_only_reason = .credential_refresh_failed, .private_models_hidden = true }, .expected = "vercel sign-in refresh failed; using the public model catalog." },
+        .{ .state = .{ .public_only_reason = .authenticated_credential_rejected, .private_models_hidden = true }, .expected = "your gateway credential was rejected; using the public model catalog." },
+        .{ .state = .{ .public_only_reason = .chatgpt_subscription, .private_models_hidden = true }, .expected = "codex models require an authenticated codex catalog." },
+        .{ .state = .{ .public_only_reason = .grok_subscription, .private_models_hidden = true }, .expected = "grok models require an authenticated grok catalog." },
+        .{ .state = .{ .failure = .{ .category = .transport, .retryable = true } }, .expected = "could not reach AI gateway; fx retries automatically." },
+        .{ .state = .{ .access_level = .public_only, .public_only_reason = .no_credential, .private_models_hidden = true, .failure = .{ .category = .rate_limited, .retryable = true } }, .expected = "AI gateway rate limited model discovery; fx retries automatically." },
+        .{ .state = .{ .access_level = .authenticated, .failure = .{ .category = .rate_limited, .retryable = true } }, .expected = "AI gateway rate limited model discovery; fx retries automatically." },
+        .{ .state = .{ .access_level = .authenticated, .failure = .{ .category = .runtime, .retryable = true } }, .expected = "could not refresh model catalog; fx retries automatically." },
     };
 
     for (cases) |case| {
@@ -874,7 +875,7 @@ test "model menu header shows only the active vendor filter" {
     const alloc = std.testing.allocator;
     const items = [_]model_cache_runtime.ModelMenuItem{
         .{ .id = @constCast("anthropic/claude"), .provider = "anthropic", .capabilities = .{} },
-        .{ .id = @constCast("openai/gpt"), .provider = "openai", .capabilities = .{} },
+        .{ .id = @constCast("openai/gpt"), .provider = "OpenAI", .capabilities = .{} },
         .{ .id = @constCast("deepseek/v3"), .provider = "deepseek", .capabilities = .{} },
     };
     const projection: ModelMenuProjection = .{
@@ -885,10 +886,10 @@ test "model menu header shows only the active vendor filter" {
 
     var header = try composeModelMenuRow(alloc, projection, 0, 60, 3);
     defer header.deinit(alloc);
-    try std.testing.expect(std.mem.find(u8, header.items, "< All >") != null);
-    try std.testing.expect(std.mem.find(u8, header.items, "Anthropic") == null);
+    try std.testing.expect(std.mem.find(u8, header.items, "< all >") != null);
+    try std.testing.expect(std.mem.find(u8, header.items, "anthropic") == null);
     try std.testing.expect(std.mem.find(u8, header.items, "OpenAI") == null);
-    try std.testing.expect(std.mem.find(u8, header.items, "Others") == null);
+    try std.testing.expect(std.mem.find(u8, header.items, "others") == null);
     try std.testing.expect(std.mem.find(u8, header.items, "xAI") == null);
     try std.testing.expect(std.mem.find(u8, header.items, "Z.AI") == null);
     try std.testing.expect(std.mem.find(u8, header.items, "…") == null);
@@ -910,12 +911,12 @@ test "model menu header hides redundant vendor filters for a single-vendor catal
 
     var header = try composeModelMenuRow(alloc, projection, 0, 120, 3);
     defer header.deinit(alloc);
-    try std.testing.expect(std.mem.find(u8, header.items, "< All >") != null);
-    try std.testing.expect(std.mem.find(u8, header.items, "Anthropic") == null);
+    try std.testing.expect(std.mem.find(u8, header.items, "< all >") != null);
+    try std.testing.expect(std.mem.find(u8, header.items, "anthropic") == null);
     try std.testing.expect(std.mem.find(u8, header.items, "OpenAI") == null);
     try std.testing.expect(std.mem.find(u8, header.items, "xAI") == null);
     try std.testing.expect(std.mem.find(u8, header.items, "Z.AI") == null);
-    try std.testing.expect(std.mem.find(u8, header.items, "Others") == null);
+    try std.testing.expect(std.mem.find(u8, header.items, "others") == null);
 }
 
 test "model menu facts share a left-aligned column" {
@@ -1010,15 +1011,16 @@ test "model menu keeps only compact facts beside the model" {
     var title = try composeModelMenuRow(alloc, projection, 2, 100, rows);
     defer title.deinit(alloc);
     try std.testing.expect(std.mem.find(u8, title.items, "anthropic/claude-opus-4.8") != null);
-    try std.testing.expect(std.mem.find(u8, title.items, "1M context   128K output   Fast mode") != null);
-    try std.testing.expect(std.mem.find(u8, title.items, "Anthropic") == null);
-    try std.testing.expect(std.mem.find(u8, title.items, "Current") == null);
-    try std.testing.expect(std.mem.find(u8, title.items, "Reasoning") == null);
-    try std.testing.expect(std.mem.find(u8, title.items, "Vision") == null);
-    try std.testing.expect(std.mem.find(u8, title.items, "Tools") == null);
+    try std.testing.expect(std.mem.find(u8, title.items, "1M context   128K output   fast mode") != null);
+    // The provider shows only inside the model ID, never as a fact.
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, title.items, "anthropic"));
+    try std.testing.expect(std.mem.find(u8, title.items, "current") == null);
+    try std.testing.expect(std.mem.find(u8, title.items, "reasoning") == null);
+    try std.testing.expect(std.mem.find(u8, title.items, "vision") == null);
+    try std.testing.expect(std.mem.find(u8, title.items, "tools") == null);
 }
 
-test "model menu labels -fast models Fast and models that offer Fast mode as Fast mode" {
+test "model menu labels -fast models fast and models that offer fast mode as fast mode" {
     const alloc = std.testing.allocator;
     const items = [_]model_cache_runtime.ModelMenuItem{
         .{
@@ -1055,21 +1057,21 @@ test "model menu labels -fast models Fast and models that offer Fast mode as Fas
 
     var regular = try composeModelMenuRow(alloc, projection, 2, 100, rows);
     defer regular.deinit(alloc);
-    try std.testing.expect(std.mem.find(u8, regular.items, "1M context   Fast mode") != null);
+    try std.testing.expect(std.mem.find(u8, regular.items, "1M context   fast mode") != null);
 
     var always_fast = try composeModelMenuRow(alloc, projection, 3, 100, rows);
     defer always_fast.deinit(alloc);
     try std.testing.expect(std.mem.find(u8, always_fast.items, "anthropic/claude-opus-4.8-fast") != null);
-    try std.testing.expect(std.mem.find(u8, always_fast.items, "1M context   Fast") != null);
-    try std.testing.expect(std.mem.find(u8, always_fast.items, "Fast mode") == null);
+    try std.testing.expect(std.mem.find(u8, always_fast.items, "1M context   fast") != null);
+    try std.testing.expect(std.mem.find(u8, always_fast.items, "fast mode") == null);
 
     var fast_with_option = try composeModelMenuRow(alloc, projection, 4, 100, rows);
     defer fast_with_option.deinit(alloc);
     try std.testing.expect(std.mem.find(u8, fast_with_option.items, "xai/grok-4.7-fast") != null);
-    try std.testing.expect(std.mem.find(u8, fast_with_option.items, "1M context   Fast, Fast mode") != null);
+    try std.testing.expect(std.mem.find(u8, fast_with_option.items, "1M context   fast, fast mode") != null);
 }
 
-test "model menu tags Token Pass models for a team with Token Pass and leaves their Fast mode out" {
+test "model menu tags token pass models for a team with token pass and leaves their fast mode out" {
     const alloc = std.testing.allocator;
     const items = [_]model_cache_runtime.ModelMenuItem{
         .{
@@ -1099,13 +1101,13 @@ test "model menu tags Token Pass models for a team with Token Pass and leaves th
     defer featured.deinit(alloc);
     try std.testing.expect(std.mem.find(u8, featured.items, "zai/glm-5.3") != null);
     try std.testing.expect(std.mem.find(u8, featured.items, "200K context") != null);
-    try std.testing.expect(std.mem.find(u8, featured.items, "Fast mode") == null);
-    try std.testing.expect(std.mem.find(u8, featured.items, "Token Pass") == null);
+    try std.testing.expect(std.mem.find(u8, featured.items, "fast mode") == null);
+    try std.testing.expect(std.mem.find(u8, featured.items, "token pass") == null);
 
     var other = try composeModelMenuRow(alloc, projection, 6, 100, rows);
     defer other.deinit(alloc);
     try std.testing.expect(std.mem.find(u8, other.items, "zai/glm-5.3-fast") != null);
-    try std.testing.expect(std.mem.find(u8, other.items, "Token Pass") == null);
+    try std.testing.expect(std.mem.find(u8, other.items, "token pass") == null);
 
     // A search has no headings, so the tag gets its own column, and the
     // other model's facts still line up after the empty tag cell.
@@ -1114,12 +1116,12 @@ test "model menu tags Token Pass models for a team with Token Pass and leaves th
     const searched_rows = menuRowCount(searched, 100, 20);
     var tagged = try composeModelMenuRow(alloc, searched, 2, 100, searched_rows);
     defer tagged.deinit(alloc);
-    try std.testing.expect(std.mem.find(u8, tagged.items, "Token Pass   200K context") != null);
-    try std.testing.expect(std.mem.find(u8, tagged.items, "Fast mode") == null);
+    try std.testing.expect(std.mem.find(u8, tagged.items, "token pass   200K context") != null);
+    try std.testing.expect(std.mem.find(u8, tagged.items, "fast mode") == null);
     var untagged = try composeModelMenuRow(alloc, searched, 3, 100, searched_rows);
     defer untagged.deinit(alloc);
     try std.testing.expect(std.mem.find(u8, untagged.items, "zai/glm-5.3-fast") != null);
-    try std.testing.expect(std.mem.find(u8, untagged.items, "Token Pass") == null);
+    try std.testing.expect(std.mem.find(u8, untagged.items, "token pass") == null);
     try std.testing.expectEqual(
         display_width.visibleWidthIgnoringAnsi(tagged.items[0..std.mem.find(u8, tagged.items, "200K context").?]),
         display_width.visibleWidthIgnoringAnsi(untagged.items[0..std.mem.find(u8, untagged.items, "200K context").?]),
@@ -1155,7 +1157,7 @@ fn gridColumnOf(alloc: Allocator, grid: *vt_emulator.Grid, row: u16, needle: []c
 const column_test_items = [_]model_cache_runtime.ModelMenuItem{
     .{ .id = @constCast("moonshotai/kimi-k3"), .provider = "moonshotai", .capabilities = .{ .context_window = 1_000_000, .max_output_tokens = 131_072, .supports_fast_mode = true }, .token_pass = true },
     .{ .id = @constCast("zai/glm-5.3-flash"), .provider = "zai", .capabilities = .{ .context_window = 1_000_000, .max_output_tokens = 131_000 }, .token_pass = true },
-    .{ .id = @constCast("openai/gpt-6.1-terra"), .provider = "openai", .capabilities = .{ .context_window = 1_050_000, .max_output_tokens = 128_000, .supports_fast_mode = true } },
+    .{ .id = @constCast("openai/gpt-6.1-terra"), .provider = "OpenAI", .capabilities = .{ .context_window = 1_050_000, .max_output_tokens = 128_000, .supports_fast_mode = true } },
     .{ .id = @constCast("amazon/nova-pro"), .provider = "amazon", .capabilities = .{ .context_window = 300_000, .max_output_tokens = 8_192 } },
     .{ .id = @constCast("anthropic/claude-opus-5.5-fast"), .provider = "anthropic", .capabilities = .{ .context_window = 1_000_000, .max_output_tokens = 128_000, .intrinsic_fast = true } },
 };
@@ -1177,8 +1179,8 @@ test "model menu facts line up in columns through the VT and drop whole columns 
     for (cases) |case| {
         var grid = try renderMenuGrid(alloc, projection, case.width, 20);
         defer grid.deinit();
-        try std.testing.expectEqual(@as(?usize, 2), try gridColumnOf(alloc, &grid, 3, "Token Pass"));
-        try std.testing.expectEqual(@as(?usize, 2), try gridColumnOf(alloc, &grid, 7, "All Models"));
+        try std.testing.expectEqual(@as(?usize, 2), try gridColumnOf(alloc, &grid, 3, "token pass"));
+        try std.testing.expectEqual(@as(?usize, 2), try gridColumnOf(alloc, &grid, 7, "all models"));
 
         // Every label sits in one column down the list, whatever the number
         // before it, and a dropped column leaves no trace.
@@ -1199,12 +1201,12 @@ test "model menu facts line up in columns through the VT and drop whole columns 
             }
         }
         try std.testing.expectEqual(case.output, output_column != null);
-        try std.testing.expectEqual(case.speed, (try gridColumnOf(alloc, &grid, 8, "Fast mode")) != null);
+        try std.testing.expectEqual(case.speed, (try gridColumnOf(alloc, &grid, 8, "fast mode")) != null);
         if (case.speed) {
-            try std.testing.expectEqual(try gridColumnOf(alloc, &grid, 8, "Fast mode"), try gridColumnOf(alloc, &grid, 10, "Fast"));
+            try std.testing.expectEqual(try gridColumnOf(alloc, &grid, 8, "   fast mode"), try gridColumnOf(alloc, &grid, 10, "   fast"));
         }
         // The Token Pass model that offers Fast mode leaves it out.
-        try std.testing.expect((try gridColumnOf(alloc, &grid, 4, "Fast")) == null);
+        try std.testing.expect((try gridColumnOf(alloc, &grid, 4, "   fast")) == null);
     }
 
     // At 120 columns the cells read as the design shows them.
@@ -1215,9 +1217,9 @@ test "model menu facts line up in columns through the VT and drop whole columns 
     const expected = [_]struct { row: u16, text: []const u8 }{
         .{ .row = 4, .text = "moonshotai/kimi-k3                  1M context   128K output" },
         .{ .row = 5, .text = "zai/glm-5.3-flash                   1M context   131K output" },
-        .{ .row = 8, .text = "openai/gpt-6.1-terra             1.05M context   128K output   Fast mode" },
+        .{ .row = 8, .text = "openai/gpt-6.1-terra             1.05M context   128K output   fast mode" },
         .{ .row = 9, .text = "amazon/nova-pro                   300K context     8K output" },
-        .{ .row = 10, .text = "anthropic/claude-opus-5.5-fast      1M context   128K output   Fast" },
+        .{ .row = 10, .text = "anthropic/claude-opus-5.5-fast      1M context   128K output   fast" },
     };
     for (expected) |line| {
         text.clearRetainingCapacity();
@@ -1226,7 +1228,7 @@ test "model menu facts line up in columns through the VT and drop whole columns 
     }
 }
 
-test "model menu fits a short terminal and keeps the Token Pass tag when a search narrows the row" {
+test "model menu fits a short terminal and keeps the token pass tag when a search narrows the row" {
     const alloc = std.testing.allocator;
     var projection: ModelMenuProjection = .{ .active = true, .load_state = .ready, .items = &column_test_items, .token_pass = true };
 
@@ -1244,7 +1246,7 @@ test "model menu fits a short terminal and keeps the Token Pass tag when a searc
             // The tag column can leave the id too little room, so match the
             // end of the id, which its middle ellipsis keeps.
             if ((try gridColumnOf(alloc, &grid, row, "5.5-fast")) != null) found = true;
-            try std.testing.expect((try gridColumnOf(alloc, &grid, row, "All Models")) == null);
+            try std.testing.expect((try gridColumnOf(alloc, &grid, row, "all models")) == null);
         }
         try std.testing.expect(found);
     }
@@ -1258,11 +1260,11 @@ test "model menu fits a short terminal and keeps the Token Pass tag when a searc
     const kimi_row: u16 = for (3..8) |row| {
         if ((try gridColumnOf(alloc, &narrow, @intCast(row), "kimi-k3")) != null) break @intCast(row);
     } else return error.TestUnexpectedResult;
-    try std.testing.expect((try gridColumnOf(alloc, &narrow, kimi_row, "Token Pass")) != null);
+    try std.testing.expect((try gridColumnOf(alloc, &narrow, kimi_row, "token pass")) != null);
     try std.testing.expect((try gridColumnOf(alloc, &narrow, kimi_row, " context")) == null);
 }
 
-test "model menu groups Token Pass models under their own heading until a search ranks the list" {
+test "model menu groups token pass models under their own heading until a search ranks the list" {
     const alloc = std.testing.allocator;
     var items: [13]model_cache_runtime.ModelMenuItem = undefined;
     var ids: [10][16]u8 = undefined;
@@ -1280,7 +1282,7 @@ test "model menu groups Token Pass models under their own heading until a search
     // Header, gap, then the Token Pass group, a gap, and every other model.
     const all_rows = menuRowCount(projection, 100, 40);
     try std.testing.expectEqual(@as(u16, 2 + 13 + group_heading_rows), all_rows);
-    const expected = [_]?[]const u8{ null, null, "Token Pass", "moonshotai/kimi-k3", "zai/glm-5.3", "zai/glm-5.3-flash", null, "All Models", "acme/model-00" };
+    const expected = [_]?[]const u8{ null, null, "token pass", "moonshotai/kimi-k3", "zai/glm-5.3", "zai/glm-5.3-flash", null, "all models", "acme/model-00" };
     for (expected, 0..) |text, index| {
         var row = try composeModelMenuRow(alloc, projection, @intCast(index), 100, all_rows);
         defer row.deinit(alloc);
@@ -1293,8 +1295,8 @@ test "model menu groups Token Pass models under their own heading until a search
     }
     // Headings are bold and bright at the rows' indent, with no count.
     for ([_]struct { row: u16, name: []const u8 }{
-        .{ .row = 2, .name = "Token Pass" },
-        .{ .row = 7, .name = "All Models" },
+        .{ .row = 2, .name = "token pass" },
+        .{ .row = 7, .name = "all models" },
     }) |heading| {
         var row = try composeModelMenuRow(alloc, projection, heading.row, 100, all_rows);
         defer row.deinit(alloc);
@@ -1327,7 +1329,7 @@ test "model menu groups Token Pass models under their own heading until a search
     try std.testing.expect(std.mem.find(u8, first.items, "/") != null);
 }
 
-test "model menu for a team without Token Pass shows no Token Pass heading or tag and keeps Fast mode" {
+test "model menu for a team without token pass shows no token pass heading or tag and keeps fast mode" {
     const alloc = std.testing.allocator;
     var projection: ModelMenuProjection = .{ .active = true, .load_state = .ready, .items = &column_test_items };
 
@@ -1338,15 +1340,15 @@ test "model menu for a team without Token Pass shows no Token Pass heading or ta
     defer grid.deinit();
     var row: u16 = 1;
     while (row <= rows) : (row += 1) {
-        try std.testing.expect((try gridColumnOf(alloc, &grid, row, "Token Pass")) == null);
-        try std.testing.expect((try gridColumnOf(alloc, &grid, row, "All Models")) == null);
+        try std.testing.expect((try gridColumnOf(alloc, &grid, row, "token pass")) == null);
+        try std.testing.expect((try gridColumnOf(alloc, &grid, row, "all models")) == null);
     }
     // Grid rows: 1 header, 2 gap, 3 the first model.
     var text: std.ArrayList(u8) = .empty;
     defer text.deinit(alloc);
     try grid.rowTextTrimmed(3, &text);
     try std.testing.expectEqualStrings(
-        "moonshotai/kimi-k3                  1M context   128K output   Fast mode",
+        "moonshotai/kimi-k3                  1M context   128K output   fast mode",
         std.mem.trimStart(u8, text.items, " "),
     );
 
@@ -1357,6 +1359,6 @@ test "model menu for a team without Token Pass shows no Token Pass heading or ta
     text.clearRetainingCapacity();
     try searched.rowTextTrimmed(3, &text);
     try std.testing.expect(std.mem.find(u8, text.items, "kimi-k3") != null);
-    try std.testing.expect(std.mem.find(u8, text.items, "Token Pass") == null);
-    try std.testing.expect(std.mem.find(u8, text.items, "1M context   128K output   Fast mode") != null);
+    try std.testing.expect(std.mem.find(u8, text.items, "token pass") == null);
+    try std.testing.expect(std.mem.find(u8, text.items, "1M context   128K output   fast mode") != null);
 }

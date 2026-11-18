@@ -741,7 +741,7 @@ pub fn frameOwnedActivityProjection(
     if (approval != null or ctx.question != null) return .none;
     const compaction = activity_status.compactionProjection(buf, ctx.compaction, ctx.stream, ctx.now_ms);
     if (compaction == .none and !ctx.stream.active and ctx.pending_prompt_activity) {
-        return .{ .turn_thinking = .{ .label = "• Thinking" } };
+        return .{ .turn_thinking = .{ .label = "• thinking" } };
     }
     switch (ctx.activity) {
         .tool_slot => {},
@@ -829,7 +829,7 @@ fn turnActivityProjection(
         return .{ .turn_thinking = .{ .label = label } };
     }
     return .{ .turn_thinking = .{
-        .label = "• Thinking",
+        .label = "• thinking",
     } };
 }
 
@@ -1025,7 +1025,7 @@ test "frame-owned thinking activity projects the thinking label" {
 
     var dot_buf: [128]u8 = undefined;
     switch (frameOwnedActivityProjection(&dot_buf, &shell, ctx, null)) {
-        .turn_thinking => |thinking| try std.testing.expectEqualStrings("• Thinking", thinking.label),
+        .turn_thinking => |thinking| try std.testing.expectEqualStrings("• thinking", thinking.label),
         .none, .tool_slot => return error.TestUnexpectedResult,
     }
 }
@@ -1047,11 +1047,11 @@ test "frame compaction overrides idle and tool activity but not blocking feedbac
         .input = &input,
     };
     var buf: [256]u8 = undefined;
-    try std.testing.expectEqualStrings("• Compacting (1s)", frameOwnedActivityProjection(&buf, &shell, ctx, null).turn_thinking.label);
+    try std.testing.expectEqualStrings("• compacting (1s)", frameOwnedActivityProjection(&buf, &shell, ctx, null).turn_thinking.label);
     try std.testing.expectEqual(@as(?bool, false), frameActivityBlink(ctx));
     try std.testing.expect(!ctx.stream.active);
     ctx.activity = .{ .tool_slot = .{ .entry_id = 1, .fallback_label = "reading", .active = true, .kind = .read } };
-    try std.testing.expectEqualStrings("• Compacting (1s)", frameOwnedActivityProjection(&buf, &shell, ctx, null).turn_thinking.label);
+    try std.testing.expectEqualStrings("• compacting (1s)", frameOwnedActivityProjection(&buf, &shell, ctx, null).turn_thinking.label);
     ctx.activity = .{ .turn_thinking = .{ .label = "Blocking status", .tone = .danger } };
     try std.testing.expectEqualStrings("Blocking status", frameOwnedActivityProjection(&buf, &shell, ctx, null).turn_thinking.label);
     ctx.question = .{ .current_entry = null, .current_index = 0, .entry_count = 0 };
@@ -1102,7 +1102,7 @@ test "an idle agent waiting on its subagents shows a live row that a turn or que
     ctx.subagent_wait_since_ms = 0;
 
     ctx.pending_prompt_activity = true;
-    try std.testing.expectEqualStrings("• Thinking", frameOwnedActivityProjection(&buf, &shell, ctx, null).turn_thinking.label);
+    try std.testing.expectEqualStrings("• thinking", frameOwnedActivityProjection(&buf, &shell, ctx, null).turn_thinking.label);
     ctx.pending_prompt_activity = false;
 
     ctx.question = .{ .current_entry = null, .current_index = 0, .entry_count = 0 };
@@ -1124,7 +1124,7 @@ test "pending prompt projects thinking before the worker stream starts" {
 
     var label_buf: [128]u8 = undefined;
     switch (frameOwnedActivityProjection(&label_buf, &shell, ctx, null)) {
-        .turn_thinking => |thinking| try std.testing.expectEqualStrings("• Thinking", thinking.label),
+        .turn_thinking => |thinking| try std.testing.expectEqualStrings("• thinking", thinking.label),
         .none, .tool_slot => return error.TestUnexpectedResult,
     }
 
@@ -1134,7 +1134,7 @@ test "pending prompt projects thinking before the worker stream starts" {
         .tone = .danger,
     } };
     switch (frameOwnedActivityProjection(&label_buf, &shell, retry_ctx, null)) {
-        .turn_thinking => |thinking| try std.testing.expectEqualStrings("• Thinking", thinking.label),
+        .turn_thinking => |thinking| try std.testing.expectEqualStrings("• thinking", thinking.label),
         .none, .tool_slot => return error.TestUnexpectedResult,
     }
 }
@@ -1155,7 +1155,7 @@ test "frame-owned activity renders the thinking elapsed counter from the frame c
 
     var counter_buf: [128]u8 = undefined;
     switch (frameOwnedActivityProjection(&counter_buf, &shell, ctx, null)) {
-        .turn_thinking => |thinking| try std.testing.expectEqualStrings("• Thinking (3s)", thinking.label),
+        .turn_thinking => |thinking| try std.testing.expectEqualStrings("• thinking (3s)", thinking.label),
         .none, .tool_slot => return error.TestUnexpectedResult,
     }
 }
@@ -1185,7 +1185,7 @@ test "frame-owned activity keeps active tools out of the turn status row" {
     switch (frameOwnedActivityProjection(&active_buf, &shell, ctx, null)) {
         .turn_thinking => |thinking| {
             try std.testing.expectEqual(ActivityProjection.Tone.thinking, thinking.tone);
-            try std.testing.expectEqualStrings("• Thinking", thinking.label);
+            try std.testing.expectEqualStrings("• thinking", thinking.label);
         },
         .none, .tool_slot => return error.TestUnexpectedResult,
     }
@@ -1215,7 +1215,7 @@ test "current frame-owned activity leaves the focused tool in the transcript" {
         .model = "test-model",
         .activity = .{ .tool_slot = .{
             .entry_id = 123,
-            .fallback_label = "● Running\x1b[0m \x1b[38;5;245mzig build test\x1b[0m\n",
+            .fallback_label = "● running\x1b[0m \x1b[38;5;245mzig build test\x1b[0m\n",
             .active = true,
             .kind = .command,
         } },
@@ -1227,7 +1227,7 @@ test "current frame-owned activity leaves the focused tool in the transcript" {
     const projection = frameOwnedActivityProjection(&active_buf, &shell, ctx, null);
     switch (projection) {
         .turn_thinking => |thinking| try std.testing.expectEqualStrings(
-            "• Running (12s) (↑50k ↓1.2k)",
+            "• running (12s) (↑50k ↓1.2k)",
             thinking.label,
         ),
         .none, .tool_slot => return error.TestUnexpectedResult,
@@ -1239,7 +1239,7 @@ test "current frame-owned activity leaves the focused tool in the transcript" {
     streaming_ctx.writing_response = true;
     switch (frameOwnedActivityProjection(&streaming_buf, &shell, streaming_ctx, null)) {
         .turn_thinking => |thinking| try std.testing.expectEqualStrings(
-            "• Generating (12s) (↑50k ↓1.2k)",
+            "• generating (12s) (↑50k ↓1.2k)",
             thinking.label,
         ),
         .none, .tool_slot => return error.TestUnexpectedResult,
@@ -1251,7 +1251,7 @@ test "minimal connected tool label clips with an ellipsis" {
     const projection: ActivityProjection = .{ .tool_slot = .{
         .entry_id = 123,
         .fallback_label = "● Running\x1b[0m \x1b[38;5;245mzig build test with a deliberately long target\x1b[0m\n",
-        .thinking_label = "• Thinking",
+        .thinking_label = "• thinking",
         .active = true,
         .kind = .command,
     } };
@@ -1355,7 +1355,7 @@ test "frame-owned activity shows live streaming token progress" {
     var active_buf: [256]u8 = undefined;
     switch (frameOwnedActivityProjection(&active_buf, &shell, ctx, null)) {
         .turn_thinking => |thinking| {
-            try std.testing.expectEqualStrings("• Generating (12s) (↑50k ↓1.2k)", thinking.label);
+            try std.testing.expectEqualStrings("• generating (12s) (↑50k ↓1.2k)", thinking.label);
             try std.testing.expectEqual(ActivityProjection.Tone.thinking, thinking.tone);
         },
         .none, .tool_slot => return error.TestUnexpectedResult,
@@ -1368,7 +1368,7 @@ test "frame-owned activity shows live streaming token progress" {
     var drained_buf: [256]u8 = undefined;
     switch (frameOwnedActivityProjection(&drained_buf, &shell, drained_ctx, null)) {
         .turn_thinking => |thinking| {
-            try std.testing.expectEqualStrings("• Generating (12s) (↑50k ↓1.2k)", thinking.label);
+            try std.testing.expectEqualStrings("• generating (12s) (↑50k ↓1.2k)", thinking.label);
             try std.testing.expectEqual(ActivityProjection.Tone.thinking, thinking.tone);
         },
         .none, .tool_slot => return error.TestUnexpectedResult,
@@ -1383,7 +1383,7 @@ test "frame-owned activity shows live streaming token progress" {
     var stalled_buf: [256]u8 = undefined;
     switch (frameOwnedActivityProjection(&stalled_buf, &shell, composing_ctx, null)) {
         .turn_thinking => |thinking| {
-            try std.testing.expectEqualStrings("• Running (12s) (↑50k ↓1.2k)", thinking.label);
+            try std.testing.expectEqualStrings("• running (12s) (↑50k ↓1.2k)", thinking.label);
             try std.testing.expectEqual(ActivityProjection.Tone.thinking, thinking.tone);
         },
         .none, .tool_slot => return error.TestUnexpectedResult,
@@ -1459,7 +1459,7 @@ test "frame-owned activity uses clipped command activity label" {
     switch (frameOwnedActivityProjection(&active_buf, &shell, ctx, null)) {
         .turn_thinking => |thinking| {
             try std.testing.expectEqual(ActivityProjection.Tone.thinking, thinking.tone);
-            try std.testing.expectEqualStrings("• Thinking (↑10 ↓20)", thinking.label);
+            try std.testing.expectEqualStrings("• thinking (↑10 ↓20)", thinking.label);
         },
         .none, .tool_slot => return error.TestUnexpectedResult,
     }

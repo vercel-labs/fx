@@ -2164,7 +2164,7 @@ test "vision failure uses the generic failed terminal lifecycle" {
         hooks.lifecycle_events.items[2].terminal.outcome.kind,
     );
     try std.testing.expectEqualStrings(
-        "Failed vision: provider response stayed invalid after one retry",
+        "failed vision: provider response stayed invalid after one retry",
         hooks.lifecycle_events.items[2].terminal.outcome.summary,
     );
     const persisted = hooks.history_turns.items[0].assistant.execution.tool_steps[0].tool_results[0];
@@ -3703,7 +3703,7 @@ test "modern mixed batch materializes unsupported terminal before admission" {
         .failed,
     );
     try std.testing.expectEqualStrings(
-        "Failed missing_tool",
+        "failed missing_tool",
         hooks.lifecycle_events.items[5].terminal.outcome.summary,
     );
 
@@ -4014,7 +4014,7 @@ test "modern later selector errors escape atomically and settle changed provisio
         try std.testing.expect(hooks.lifecycle_events.items[2] == .terminal);
         const terminal = hooks.lifecycle_events.items[2].terminal;
         try std.testing.expectEqual(types.ToolOutcomeKind.failed, terminal.outcome.kind);
-        try std.testing.expectEqualStrings("Failed read_file", terminal.outcome.summary);
+        try std.testing.expectEqualStrings("failed read_file", terminal.outcome.summary);
 
         try std.testing.expectEqual(@as(usize, 0), hooks.history_propagation_count);
         try std.testing.expectEqual(@as(usize, 0), hooks.history_turns.items.len);
@@ -4092,7 +4092,7 @@ test "modern preparation errors settle changed provisional identity before selec
     try std.testing.expect(hooks.lifecycle_events.items[2] == .terminal);
     const terminal = hooks.lifecycle_events.items[2].terminal;
     try std.testing.expectEqual(types.ToolOutcomeKind.failed, terminal.outcome.kind);
-    try std.testing.expectEqualStrings("Failed read_file", terminal.outcome.summary);
+    try std.testing.expectEqualStrings("failed read_file", terminal.outcome.summary);
 
     try std.testing.expectEqual(@as(usize, 0), hooks.history_propagation_count);
     try std.testing.expectEqual(@as(usize, 0), hooks.history_turns.items.len);
@@ -4176,7 +4176,7 @@ test "modern post-selection context commit OOM settles changed provisional ident
             try std.testing.expect(hooks.lifecycle_events.items[2] == .terminal);
             const terminal = hooks.lifecycle_events.items[2].terminal;
             try std.testing.expectEqual(types.ToolOutcomeKind.failed, terminal.outcome.kind);
-            try std.testing.expectEqualStrings("Failed read_file", terminal.outcome.summary);
+            try std.testing.expectEqualStrings("failed read_file", terminal.outcome.summary);
         }
         try std.testing.expectEqual(@as(usize, 0), hooks.history_propagation_count);
         try std.testing.expectEqual(@as(usize, 0), hooks.history_turns.items.len);
@@ -4955,7 +4955,7 @@ test "processQueuedPrompt denied normal permission appends structured denial wit
     try std.testing.expectEqual(@as(usize, 0), hooks.executed_names.items.len);
     try std.testing.expectEqual(@as(usize, 3), hooks.lifecycle_events.items.len);
     try std.testing.expectEqualStrings(
-        "Denied write_file",
+        "denied write_file",
         hooks.lifecycle_events.items[2].terminal.outcome.summary,
     );
     try std.testing.expectEqual(
@@ -5036,7 +5036,7 @@ test "processQueuedPrompt legacy auto denial retains lifecycle source" {
     try std.testing.expectEqual(@as(usize, 0), hooks.executed_names.items.len);
     try std.testing.expectEqual(@as(usize, 3), hooks.lifecycle_events.items.len);
     try std.testing.expectEqualStrings(
-        "Denied by auto agent write_file",
+        "denied by auto agent write_file",
         hooks.lifecycle_events.items[2].terminal.outcome.summary,
     );
     try std.testing.expectEqual(
@@ -5893,12 +5893,12 @@ test "processQueuedPrompt command output completion fires on command success and
     try std.testing.expectEqual(@as(usize, 1), error_hooks.command_complete_count);
     try expectLogOrder(
         &error_hooks,
-        "status:finished:Failed terminal",
+        "status:finished:failed terminal",
         "command_output_complete:",
     );
     try expectBodyContains(&error_gateway, 1, "Tool terminal failed: AccessDenied");
     try std.testing.expectEqualStrings(
-        "Failed terminal",
+        "failed terminal",
         error_hooks.lifecycle_events.items[2].terminal.outcome.summary,
     );
     try std.testing.expectEqual(
@@ -5944,7 +5944,7 @@ test "processQueuedPrompt includes structured failure detail in tool status" {
     try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
 
     try std.testing.expectEqualStrings(
-        "Failed browser_snapshot: Browser/CDP cdp failed during discover_targets: Browser is not reachable",
+        "failed browser_snapshot: Browser/CDP cdp failed during discover_targets: Browser is not reachable",
         hooks.lifecycle_events.items[2].terminal.outcome.summary,
     );
     try std.testing.expectEqual(
@@ -6099,7 +6099,7 @@ test "parallel permission preflight failure terminalizes its started lifecycle" 
     const terminal = hooks.lifecycle_events.items[9].terminal;
     try std.testing.expectEqual(types.ToolOutcomeKind.failed, terminal.outcome.kind);
     try std.testing.expectEqualStrings(
-        "Failed read_file: permission preflight failed",
+        "failed read_file: permission preflight failed",
         terminal.outcome.summary,
     );
 }

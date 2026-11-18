@@ -30,7 +30,7 @@ pub const max_column_options = @max(max_team_options, @max(max_provider_options,
 /// The API key column shows a cursor bar and one bullet per typed byte, or a
 /// placeholder while the field is empty.
 pub const key_field_prefix = "\u{2503} ";
-pub const key_field_placeholder = "Paste or type a key";
+pub const key_field_placeholder = "paste or type a key";
 const key_field_bullet = "\u{2022}";
 pub const max_key_mask_glyphs: usize = 32;
 pub const max_key_field_bytes =

@@ -77,7 +77,7 @@ pub fn subagentAction(
         const target = try text_utils.encodeTerminalSafe(scratch, raw_target, if (roster != null) 96 else 64);
         const label = switch (state) {
             .active, .pending => try alloc.print("{s} {s}", .{ words.doing, target.bytes }),
-            .stopped => |reason| if (std.mem.eql(u8, reason, "Failed"))
+            .stopped => |reason| if (std.mem.eql(u8, reason, "failed"))
                 try alloc.print("couldn't {s} {s}", .{ words.verb, target.bytes })
             else
                 try alloc.print("{s} {s}", .{ reason, target.bytes }),
@@ -104,11 +104,11 @@ pub fn subagentAction(
             .applied => "applied",
             .not_applied => "not applied",
         } }),
-        .stopped => |reason| if (std.mem.eql(u8, reason, "Failed"))
+        .stopped => |reason| if (std.mem.eql(u8, reason, "failed"))
             try alloc.print("{s} failed", .{name.bytes})
-        else if (std.mem.eql(u8, reason, "Busy"))
+        else if (std.mem.eql(u8, reason, "busy"))
             try alloc.print("{s} busy; message not sent", .{name.bytes})
-        else if (std.mem.eql(u8, reason, "Cancelled") or std.mem.eql(u8, reason, "Interrupted"))
+        else if (std.mem.eql(u8, reason, "cancelled") or std.mem.eql(u8, reason, "interrupted"))
             try alloc.print("{s} interrupted", .{name.bytes})
         else
             try alloc.print("{s} {s}", .{ reason, name.bytes }),
@@ -457,21 +457,21 @@ fn resultRoster(alloc: Allocator, result: std.json.ObjectMap) Allocator.Error!?[
 
 /// Only structured child terminal failures change the failure label.
 pub fn subagentFailureLabel(alloc: Allocator, call: ToolCall, output: []const u8) Allocator.Error![]const u8 {
-    if (!std.mem.eql(u8, call.name, "subagent")) return "Failed";
+    if (!std.mem.eql(u8, call.name, "subagent")) return "failed";
     var parsed = std.json.parseFromSlice(std.json.Value, alloc, output, .{}) catch |err| return switch (err) {
         error.OutOfMemory => error.OutOfMemory,
-        else => "Failed",
+        else => "failed",
     };
     defer parsed.deinit();
-    if (parsed.value != .object) return "Failed";
-    const ok = parsed.value.object.get("ok") orelse return "Failed";
-    if (ok != .bool or ok.bool) return "Failed";
-    const code = tool_args.optionalStringArg(parsed.value.object, "error_code") orelse return "Failed";
-    if (std.mem.eql(u8, code, "child_busy")) return "Busy";
+    if (parsed.value != .object) return "failed";
+    const ok = parsed.value.object.get("ok") orelse return "failed";
+    if (ok != .bool or ok.bool) return "failed";
+    const code = tool_args.optionalStringArg(parsed.value.object, "error_code") orelse return "failed";
+    if (std.mem.eql(u8, code, "child_busy")) return "busy";
     for ([_][]const u8{ "feedback_capacity", "operation_conflict", "override_after_create" }) |rejection| {
-        if (std.mem.eql(u8, code, rejection)) return "Message not sent to";
+        if (std.mem.eql(u8, code, rejection)) return "message not sent to";
     }
-    return if (std.mem.eql(u8, code, "child_cancelled") or std.mem.eql(u8, code, "child_interrupted") or std.mem.eql(u8, code, "child_lost")) "Interrupted" else "Failed";
+    return if (std.mem.eql(u8, code, "child_cancelled") or std.mem.eql(u8, code, "child_interrupted") or std.mem.eql(u8, code, "child_lost")) "interrupted" else "failed";
 }
 
 test "subagent pending result does not claim completion" {
@@ -489,21 +489,21 @@ test "subagent rows project request identity state and bounded safe previews" {
         .{ .args = "{\"request\":{\"action\":\"message\",\"agent\":\"reviewer\",\"message\":\" Check\\n cancellation\\tcleanup \"}}", .state = .active, .label = "reviewer working", .detail = "· Check cancellation cleanup" },
         .{ .args = "{\"request\":{\"action\":\"message\",\"agent\":\"reviewer\",\"message\":\"Check replay\",\"instructions\":\"Never display this\"}}", .state = .completed, .label = "sent to reviewer", .detail = "· Check replay" },
         .{ .args = "{\"request\":\"{\\\"action\\\":\\\"message\\\",\\\"agent\\\":\\\"reviewer\\\",\\\"message\\\":\\\"Check text\\\"}\"}", .state = .active, .label = "reviewer working", .detail = "· Check text" },
-        .{ .args = "{\"action\":\"message\",\"agent\":\"reviewer\",\"message\":\"Check again\"}", .state = .{ .stopped = "Failed" }, .label = "reviewer failed", .detail = "· Check again" },
-        .{ .args = "{\"action\":\"message\",\"agent\":\"reviewer\",\"message\":\"Check again\"}", .state = .{ .stopped = "Cancelled" }, .label = "reviewer interrupted", .detail = "· Check again" },
-        .{ .args = "{\"action\":\"message\",\"agent\":\"reviewer\",\"message\":\"Check again\"}", .state = .{ .stopped = "Denied" }, .label = "Denied reviewer", .detail = "· Check again" },
+        .{ .args = "{\"action\":\"message\",\"agent\":\"reviewer\",\"message\":\"Check again\"}", .state = .{ .stopped = "failed" }, .label = "reviewer failed", .detail = "· Check again" },
+        .{ .args = "{\"action\":\"message\",\"agent\":\"reviewer\",\"message\":\"Check again\"}", .state = .{ .stopped = "cancelled" }, .label = "reviewer interrupted", .detail = "· Check again" },
+        .{ .args = "{\"action\":\"message\",\"agent\":\"reviewer\",\"message\":\"Check again\"}", .state = .{ .stopped = "denied" }, .label = "denied reviewer", .detail = "· Check again" },
         .{ .args = "{\"action\":\"close\",\"agent\":\"tester\"}", .state = .completed, .label = "closed tester", .detail = "" },
         .{ .args = "{\"action\":\"close\",\"agent\":\"tester\"}", .state = .active, .label = "closing tester", .detail = "" },
-        .{ .args = "{\"action\":\"close\",\"agent\":\"tester\"}", .state = .{ .stopped = "Failed" }, .label = "couldn't close tester", .detail = "" },
+        .{ .args = "{\"action\":\"close\",\"agent\":\"tester\"}", .state = .{ .stopped = "failed" }, .label = "couldn't close tester", .detail = "" },
         .{ .args = "{\"action\":\"stop\",\"agent\":\"tester\"}", .state = .active, .label = "stopping tester", .detail = "" },
         .{ .args = "{\"action\":\"stop\",\"agent\":\"tester\"}", .state = .completed, .label = "stopped tester", .detail = "" },
         .{ .args = "{\"action\":\"wait\"}", .state = .active, .label = "waiting for subagents", .detail = "" },
         .{ .args = "{\"action\":\"wait\"}", .state = .completed, .label = "waited for subagents", .detail = "" },
-        .{ .args = "{\"action\":\"wait\"}", .state = .{ .stopped = "Cancelled" }, .label = "Cancelled subagents", .detail = "" },
+        .{ .args = "{\"action\":\"wait\"}", .state = .{ .stopped = "cancelled" }, .label = "cancelled subagents", .detail = "" },
         .{ .args = "{\"action\":\"wait\",\"agent\":\"tester\"}", .state = .active, .label = "waiting for subagents", .detail = "" },
-        .{ .args = "{\"action\":\"close\",\"agent\":\"tester\"}", .state = .{ .stopped = "Denied" }, .label = "Denied tester", .detail = "" },
+        .{ .args = "{\"action\":\"close\",\"agent\":\"tester\"}", .state = .{ .stopped = "denied" }, .label = "denied tester", .detail = "" },
         .{ .args = "{\"action\":\"status\"}", .state = .completed, .label = "checked subagents", .detail = "" },
-        .{ .args = "{\"action\":\"status\",\"agent\":\"tester\"}", .state = .{ .stopped = "Failed" }, .label = "couldn't check tester", .detail = "" },
+        .{ .args = "{\"action\":\"status\",\"agent\":\"tester\"}", .state = .{ .stopped = "failed" }, .label = "couldn't check tester", .detail = "" },
     };
     for (cases) |case| {
         const action = (try subagentAction(alloc, .{ .id = "child", .name = "subagent", .arguments_json = case.args }, case.state)).?;
@@ -529,11 +529,11 @@ test "subagent rows project request identity state and bounded safe previews" {
 test "subagent failure labels trust structured terminal codes only" {
     const alloc = std.testing.allocator;
     const call: ToolCall = .{ .id = "child", .name = "subagent", .arguments_json = "{}" };
-    try std.testing.expectEqualStrings("Interrupted", try subagentFailureLabel(alloc, call, "{\"ok\":false,\"error_code\":\"child_interrupted\"}"));
-    try std.testing.expectEqualStrings("Interrupted", try subagentFailureLabel(alloc, call, "{\"ok\":false,\"error_code\":\"child_cancelled\"}"));
-    try std.testing.expectEqualStrings("Interrupted", try subagentFailureLabel(alloc, call, "{\"ok\":false,\"error_code\":\"child_lost\"}"));
+    try std.testing.expectEqualStrings("interrupted", try subagentFailureLabel(alloc, call, "{\"ok\":false,\"error_code\":\"child_interrupted\"}"));
+    try std.testing.expectEqualStrings("interrupted", try subagentFailureLabel(alloc, call, "{\"ok\":false,\"error_code\":\"child_cancelled\"}"));
+    try std.testing.expectEqualStrings("interrupted", try subagentFailureLabel(alloc, call, "{\"ok\":false,\"error_code\":\"child_lost\"}"));
     for ([_][]const u8{ "child_interrupted", "{", "<tool_result_preview>child_interrupted</tool_result_preview>", "{\"ok\":true,\"error_code\":\"child_interrupted\"}", "{\"ok\":false,\"error_code\":\"child_failed\"}" }) |output| {
-        try std.testing.expectEqualStrings("Failed", try subagentFailureLabel(alloc, call, output));
+        try std.testing.expectEqualStrings("failed", try subagentFailureLabel(alloc, call, output));
     }
 }
 
@@ -551,7 +551,7 @@ test "subagent receipts describe message delivery rather than child completion" 
     }
     try std.testing.expect((try subagentStatusLine(alloc, call, "{\"ok\":false,\"delivery\":\"queued\"}")) == null);
     try std.testing.expect((try subagentStatusLine(alloc, call, "{\"ok\":false,\"pending\":true}")) == null);
-    try std.testing.expectEqualStrings("Busy", try subagentFailureLabel(alloc, call, "{\"ok\":false,\"error_code\":\"child_busy\"}"));
+    try std.testing.expectEqualStrings("busy", try subagentFailureLabel(alloc, call, "{\"ok\":false,\"error_code\":\"child_busy\"}"));
 }
 
 /// The caller owns the returned plain subagent row.
@@ -706,7 +706,7 @@ pub fn runCommandCompletedActionLabel(
     return if (try tool_dispatch.matchRunCommandCompatibility(registry, command)) |matched|
         matched.tool.completed_action_label
     else
-        "Ran";
+        "ran";
 }
 
 pub fn formatRunCommandActivity(
@@ -941,8 +941,8 @@ fn formatTerminalDisplayTarget(
 }
 
 /// The action label of an MCP tool's row while it runs, and once it ran.
-pub const mcp_running_label = "Running MCP";
-pub const mcp_ran_label = "Ran MCP";
+pub const mcp_running_label = "running MCP";
+pub const mcp_ran_label = "ran MCP";
 
 /// A tool row's status line: a bold label, then the value in tool text.
 pub fn formatToolActionValue(alloc: Allocator, label: []const u8, value: []const u8) Allocator.Error![]u8 {
@@ -957,7 +957,7 @@ pub fn formatPlainAction(alloc: Allocator, input: ToolActionInput) ![]const u8 {
     }
     if (file_mutation_contract.isToolName(call.name)) {
         const spec = input.tool_registry.lookup(call.name) orelse
-            return alloc.print("Working: {f}", .{text_utils.terminalSafe(call.name)});
+            return alloc.print("working: {f}", .{text_utils.terminalSafe(call.name)});
         return alloc.print(
             "{s} {f}",
             .{ spec.action_label, text_utils.terminalSafe(input.display_target orelse spec.label_arg_default) },
@@ -966,7 +966,7 @@ pub fn formatPlainAction(alloc: Allocator, input: ToolActionInput) ![]const u8 {
 
     if (try formatRunCommandActivity(alloc, input.tool_registry, input.workspace_root, call)) |activity| {
         defer alloc.free(activity.detail);
-        const action_label = if (activity.compatibility_tool) |tool| tool.action_label else "Running";
+        const action_label = if (activity.compatibility_tool) |tool| tool.action_label else "running";
         return alloc.print("{s} {f}", .{ action_label, text_utils.terminalSafe(activity.detail) });
     }
 
@@ -977,15 +977,15 @@ pub fn formatPlainAction(alloc: Allocator, input: ToolActionInput) ![]const u8 {
     const spec = input.tool_registry.lookup(call.name) orelse {
         if (isProviderSearchAlias(call.name)) {
             const args = tool_args.parseToolArgsObject(scratch, call.arguments_json) catch {
-                return alloc.print("Searching web", .{});
+                return alloc.print("searching web", .{});
             };
-            return alloc.print("Searching {f}", .{text_utils.terminalSafe(try formatWebSearchActionDetail(scratch, args))});
+            return alloc.print("searching {f}", .{text_utils.terminalSafe(try formatWebSearchActionDetail(scratch, args))});
         }
         if (input.is_available_dynamic_mcp_tool) return alloc.print("MCP: {f}", .{text_utils.terminalSafe(call.name)});
-        return alloc.print("Working: {f}", .{text_utils.terminalSafe(call.name)});
+        return alloc.print("working: {f}", .{text_utils.terminalSafe(call.name)});
     };
     const args = tool_args.parseToolArgsObject(scratch, call.arguments_json) catch {
-        return alloc.print("Working: {f}", .{text_utils.terminalSafe(call.name)});
+        return alloc.print("working: {f}", .{text_utils.terminalSafe(call.name)});
     };
 
     const presentation = tool_dispatch.presentationForArgs(spec.*, args);
@@ -1095,11 +1095,11 @@ pub fn formatWebSearchProgressPlain(alloc: Allocator, progress: types.WebSearchP
     var query_buf: [160]u8 = undefined;
     return switch (progress) {
         .query_started => |query| alloc.print(
-            "Searching {s}",
+            "searching {s}",
             .{text_utils.clippedLabel(&query_buf, query, 120)},
         ),
         .results_received => |entry| alloc.print(
-            "Found {d} result{s} for {s}",
+            "found {d} result{s} for {s}",
             .{ entry.result_count, if (entry.result_count == 1) "" else "s", text_utils.clippedLabel(&query_buf, entry.query, 120) },
         ),
     };
@@ -1109,8 +1109,8 @@ pub fn formatWebSearchProgressPlain(alloc: Allocator, progress: types.WebSearchP
 pub fn formatWebFetchProgressPlain(alloc: Allocator, progress: types.WebFetchProgress) ![]u8 {
     var url_buf: [types.WebFetchCompletion.max_url_len]u8 = undefined;
     return switch (progress) {
-        .fetching => |url| alloc.print("Fetching {s}", .{text_utils.clippedLabel(&url_buf, url, 96)}),
-        .converting => |url| alloc.print("Converting {s}", .{text_utils.clippedLabel(&url_buf, url, 96)}),
+        .fetching => |url| alloc.print("fetching {s}", .{text_utils.clippedLabel(&url_buf, url, 96)}),
+        .converting => |url| alloc.print("converting {s}", .{text_utils.clippedLabel(&url_buf, url, 96)}),
     };
 }
 
@@ -1208,8 +1208,8 @@ const test_install_skill = blk: {
     tool.executor_kind = .install_skill;
     tool.activity_kind = .write;
     tool.requires_approval = true;
-    tool.action_label = "Installing skill";
-    tool.completed_action_label = "Installed skill";
+    tool.action_label = "installing skill";
+    tool.completed_action_label = "installed skill";
     tool.label_arg_kind = .source;
     tool.label_arg_default = "skill";
     tool.run_command_compatibility = .{
@@ -1224,8 +1224,8 @@ const test_web_search = blk: {
     tool.name = "web_search";
     tool.model_schema.name = "web_search";
     tool.executor_kind = .web_search;
-    tool.action_label = "Searching";
-    tool.completed_action_label = "Searched";
+    tool.action_label = "searching";
+    tool.completed_action_label = "searched";
     tool.label_arg_kind = .query;
     tool.label_arg_default = "web";
     break :blk tool;
@@ -1244,7 +1244,7 @@ const test_tool_registry = tool_dispatch.Registry{ .tools = test_tools[0..] };
 const custom_presentation_tool = blk: {
     var tool = test_builtin_tools.read_file;
     tool.name = "custom_presentation";
-    tool.action_label = "Inspecting";
+    tool.action_label = "inspecting";
     tool.label_arg_kind = .name;
     tool.label_arg_default = "custom fallback";
     break :blk tool;
@@ -1269,7 +1269,7 @@ test "tool presentation formats dynamic MCP availability distinctly" {
 
     const unavailable = try formatPlainAction(alloc, .{ .tool_registry = test_tool_registry, .call = call });
     defer alloc.free(unavailable);
-    try std.testing.expectEqualStrings("Working: mcp_lookup", unavailable);
+    try std.testing.expectEqualStrings("working: mcp_lookup", unavailable);
 }
 
 test "tool presentation reads labels from the supplied registry" {
@@ -1284,7 +1284,7 @@ test "tool presentation reads labels from the supplied registry" {
     });
     defer alloc.free(label);
 
-    try std.testing.expectEqualStrings("Inspecting registry metadata", label);
+    try std.testing.expectEqualStrings("inspecting registry metadata", label);
 }
 
 test "tool presentation formats plain web progress variants" {
@@ -1296,10 +1296,10 @@ test "tool presentation formats plain web progress variants" {
             fetch: types.WebFetchProgress,
         },
     }{
-        .{ .text = "Searching current Zig release", .progress = .{ .search = .{ .query_started = "current Zig release" } } },
-        .{ .text = "Found 1 result for current Zig release", .progress = .{ .search = .{ .results_received = .{ .query = "current Zig release", .result_count = 1 } } } },
-        .{ .text = "Fetching https://ziglang.org", .progress = .{ .fetch = .{ .fetching = "https://ziglang.org" } } },
-        .{ .text = "Converting https://ziglang.org", .progress = .{ .fetch = .{ .converting = "https://ziglang.org" } } },
+        .{ .text = "searching current Zig release", .progress = .{ .search = .{ .query_started = "current Zig release" } } },
+        .{ .text = "found 1 result for current Zig release", .progress = .{ .search = .{ .results_received = .{ .query = "current Zig release", .result_count = 1 } } } },
+        .{ .text = "fetching https://ziglang.org", .progress = .{ .fetch = .{ .fetching = "https://ziglang.org" } } },
+        .{ .text = "converting https://ziglang.org", .progress = .{ .fetch = .{ .converting = "https://ziglang.org" } } },
     };
 
     for (cases) |case| {
@@ -1328,7 +1328,7 @@ test "run command presentation resolves registered compatibility" {
 
     const action = try formatPlainAction(alloc, .{ .tool_registry = test_tool_registry, .call = call });
     defer alloc.free(action);
-    try std.testing.expectEqualStrings("Installing skill npx skills add vercel-labs/agent-skills -g -y", action);
+    try std.testing.expectEqualStrings("installing skill npx skills add vercel-labs/agent-skills -g -y", action);
 
     const permission = try formatPermissionLabel(alloc, test_tool_registry, call);
     defer alloc.free(permission);
@@ -1529,7 +1529,7 @@ test "tool presentation formats bounded web search action detail" {
         },
     });
     defer alloc.free(label);
-    try std.testing.expectEqualStrings("Searching current Zig release | blocked: spam.example, ads.example", label);
+    try std.testing.expectEqualStrings("searching current Zig release | blocked: spam.example, ads.example", label);
 }
 
 test "tool presentation bounds a large multiline run command activity" {
@@ -1590,11 +1590,11 @@ test "tool presentation preserves plain action fallbacks" {
         call: ToolCall,
         expected: []const u8,
     }{
-        .{ .call = .{ .id = "read", .name = "read_file", .arguments_json = "{\"path\":\"src/main.zig\"}" }, .expected = "Reading src/main.zig" },
-        .{ .call = .{ .id = "command", .name = "run_command", .arguments_json = "{\"command\":\"zig build\"}" }, .expected = "Running zig build" },
-        .{ .call = .{ .id = "ask", .name = "ask_user_question", .arguments_json = "{}" }, .expected = "Asking " },
-        .{ .call = .{ .id = "install", .name = "install_skill", .arguments_json = "{\"source\":\"vercel-labs/agent-skills\",\"skill\":\"workflow\"}" }, .expected = "Installing skill vercel-labs/agent-skills" },
-        .{ .call = .{ .id = "unknown", .name = "unknown_tool", .arguments_json = "{}" }, .expected = "Working: unknown_tool" },
+        .{ .call = .{ .id = "read", .name = "read_file", .arguments_json = "{\"path\":\"src/main.zig\"}" }, .expected = "reading src/main.zig" },
+        .{ .call = .{ .id = "command", .name = "run_command", .arguments_json = "{\"command\":\"zig build\"}" }, .expected = "running zig build" },
+        .{ .call = .{ .id = "ask", .name = "ask_user_question", .arguments_json = "{}" }, .expected = "asking " },
+        .{ .call = .{ .id = "install", .name = "install_skill", .arguments_json = "{\"source\":\"vercel-labs/agent-skills\",\"skill\":\"workflow\"}" }, .expected = "installing skill vercel-labs/agent-skills" },
+        .{ .call = .{ .id = "unknown", .name = "unknown_tool", .arguments_json = "{}" }, .expected = "working: unknown_tool" },
     };
 
     for (cases) |case| {
@@ -1646,7 +1646,7 @@ test "captured display target uses retained command without consuming output" {
         .display_target = target,
     });
     defer alloc.free(label);
-    try std.testing.expectEqualStrings("Waiting for printf LABEL", label);
+    try std.testing.expectEqualStrings("waiting for printf LABEL", label);
 
     var completed = try executions.wait(alloc, "shell-label", 2_000, null);
     defer completed.deinit(alloc);
@@ -1699,7 +1699,7 @@ test "terminal session completed action label matches the interact and stop pres
         .arguments_json = "{\"action\":\"interact\",\"session_id\":\"shell-1\"}",
     };
     try std.testing.expectEqualStrings(
-        "Observed",
+        "observed",
         (try terminalSessionCompletedActionLabel(alloc, test_tool_registry, observe)).?,
     );
 
@@ -1709,7 +1709,7 @@ test "terminal session completed action label matches the interact and stop pres
         .arguments_json = "{\"action\":\"interact\",\"session_id\":\"shell-1\",\"chars\":\"ls\\n\"}",
     };
     try std.testing.expectEqualStrings(
-        "Sent input to",
+        "sent input to",
         (try terminalSessionCompletedActionLabel(alloc, test_tool_registry, send)).?,
     );
 
@@ -1719,7 +1719,7 @@ test "terminal session completed action label matches the interact and stop pres
         .arguments_json = "{\"action\":\"stop\",\"session_id\":\"shell-1\"}",
     };
     try std.testing.expectEqualStrings(
-        "Stopped",
+        "stopped",
         (try terminalSessionCompletedActionLabel(alloc, test_tool_registry, stop)).?,
     );
 
@@ -1817,7 +1817,7 @@ test "tool presentation frees all formatted output with a normal allocator" {
         },
     });
     defer alloc.free(search);
-    try std.testing.expectEqualStrings("Searching current Zig release | allowed: ziglang.org", search);
+    try std.testing.expectEqualStrings("searching current Zig release | allowed: ziglang.org", search);
 
     const provider_search = try formatPlainAction(alloc, .{
         .tool_registry = test_tool_registry,
@@ -1829,7 +1829,7 @@ test "tool presentation frees all formatted output with a normal allocator" {
         },
     });
     defer alloc.free(provider_search);
-    try std.testing.expectEqualStrings("Searching web", provider_search);
+    try std.testing.expectEqualStrings("searching web", provider_search);
 
     const command = try formatPermissionLabel(alloc, test_tool_registry, .{
         .id = "command",
@@ -1860,13 +1860,13 @@ test "read_tool_result rows use the resolved source and the request kind" {
     };
     const generic = try formatPlainAction(alloc, .{ .tool_registry = registry, .call = page });
     defer alloc.free(generic);
-    try std.testing.expectEqualStrings("Reading more command output", generic);
+    try std.testing.expectEqualStrings("reading more command output", generic);
 
     var resolved = page;
     resolved.resolved_display_target = "more output from zig build test";
     const named = try formatPlainAction(alloc, .{ .tool_registry = registry, .call = resolved });
     defer alloc.free(named);
-    try std.testing.expectEqualStrings("Reading more output from zig build test", named);
+    try std.testing.expectEqualStrings("reading more output from zig build test", named);
 }
 
 test "saved output sources name commands, paths, URLs, and MCP tools" {

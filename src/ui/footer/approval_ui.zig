@@ -626,10 +626,10 @@ fn decimalDigits(value: usize) usize {
 fn fileApprovalAction(
     request: permission_request.FileApprovalRequest,
 ) []const u8 {
-    if (request.intent == .equality_disclosure) return "Check";
+    if (request.intent == .equality_disclosure) return "check";
     return switch (request.kind) {
-        .write => "Write",
-        .edit => "Edit",
+        .write => "write",
+        .edit => "edit",
     };
 }
 
@@ -637,18 +637,18 @@ fn fileApprovalVerb(
     request: permission_request.FileApprovalRequest,
 ) []const u8 {
     return if (request.intent == .equality_disclosure)
-        "Reveal"
+        "reveal"
     else
-        "Apply";
+        "apply";
 }
 
 fn fileApprovalQuestion(
     request: permission_request.FileApprovalRequest,
 ) []const u8 {
     return if (request.intent == .equality_disclosure)
-        "Reveal that this file already matches?"
+        "reveal that this file already matches?"
     else
-        "Apply this change?";
+        "apply this change?";
 }
 
 fn projectFileApprovalHeader(
@@ -751,9 +751,9 @@ fn fileApprovalChoiceLabelWidth(
         1 => verb_width + " + allow ".len +
             fileApprovalScopeSuffixWidth(request.scope),
         2 => if (request.intent == .equality_disclosure)
-            "Don't reveal".len
+            "don't reveal".len
         else
-            "Don't apply".len,
+            "don't apply".len,
         else => 0,
     };
 }
@@ -832,9 +832,9 @@ fn composeFileApprovalHeaderRow(
     var row: std.ArrayList(u8) = .empty;
     errdefer row.deinit(alloc);
     const active_title = if (request.intent == .equality_disclosure)
-        "Permission needed · Review file"
+        "permission needed · review file"
     else
-        "Permission needed · Review change";
+        "permission needed · review change";
     var title = try approvalTitle(alloc, origin, active_title);
     defer title.deinit(alloc);
     const title_width = display_width.visibleWidth(title.text);
@@ -1216,9 +1216,9 @@ fn appendFileApprovalChoiceLabel(
         2 => try out.appendSlice(
             alloc,
             if (request.intent == .equality_disclosure)
-                "Don't reveal"
+                "don't reveal"
             else
-                "Don't apply",
+                "don't apply",
         ),
         else => {},
     }
@@ -1277,7 +1277,7 @@ fn appendFileApprovalDenialLabel(
 ) !void {
     try out.appendSlice(
         alloc,
-        if (request.intent == .equality_disclosure) "Don't reveal" else "Don't apply",
+        if (request.intent == .equality_disclosure) "don't reveal" else "don't apply",
     );
 }
 
@@ -1511,9 +1511,9 @@ fn buildApprovalPanelLineWithLabel(
 
     if (row_count >= interaction_state.approval_panel_rows_spacious) {
         return switch (row_index) {
-            0 => "  Permission needed · Choose one",
+            0 => "  permission needed · choose one",
             1 => "",
-            2 => std.mem.print(buf, "  {s}{s}{s}", .{ b, approvalQuestion(label, dynamic_mcp), r }) catch "  Permission request",
+            2 => std.mem.print(buf, "  {s}{s}{s}", .{ b, approvalQuestion(label, dynamic_mcp), r }) catch "  permission request",
             3 => approvalReasonLine(buf, label, target, explanation, dynamic_mcp),
             4 => approvalActionLine(buf, label, target),
             5 => "",
@@ -1527,8 +1527,8 @@ fn buildApprovalPanelLineWithLabel(
     }
 
     return switch (row_index) {
-        0 => "  Permission needed · Choose one",
-        1 => std.mem.print(buf, "  {s}{s}{s}", .{ b, approvalQuestion(label, dynamic_mcp), r }) catch "  Permission request",
+        0 => "  permission needed · choose one",
+        1 => std.mem.print(buf, "  {s}{s}{s}", .{ b, approvalQuestion(label, dynamic_mcp), r }) catch "  permission request",
         2 => approvalReasonLine(buf, label, target, explanation, dynamic_mcp),
         3 => approvalActionLine(buf, label, target),
         4 => approvalChoiceLine(buf, approval.choice_index == 0, approvalChoiceLabel(approval, 0)),
@@ -1687,16 +1687,16 @@ fn writeApprovalPlaceholder(writer: *std.Io.Writer, placeholder: []const u8) !vo
 
 fn approvalChoiceLabel(approval: ApprovalProjection, choice: u8) []const u8 {
     if (approval.request.confirmation_only) return switch (choice) {
-        0 => "1. Confirm",
-        1 => "2. Cancel",
+        0 => "1. confirm",
+        1 => "2. cancel",
         else => "",
     };
     if (approval.amendmentChoice() == choice) return approvalAmendmentLabel(choice);
     if (approval.request.tool_arguments_preview != null) {
         return switch (choice) {
-            0 => "1. Allow once",
+            0 => "1. allow once",
             1 => approvalAlwaysChoice(approval, approval.request.label),
-            2 => "3. Deny",
+            2 => "3. deny",
             else => "",
         };
     }
@@ -1710,8 +1710,8 @@ fn approvalChoiceLabel(approval: ApprovalProjection, choice: u8) []const u8 {
 
 fn approvalAmendmentLabel(choice: u8) []const u8 {
     return switch (choice) {
-        0 => "1. Yes, and tell fx what to do next",
-        2 => "3. No, and tell fx what to do differently",
+        0 => "1. yes, and tell fx what to do next",
+        2 => "3. no, and tell fx what to do differently",
         else => "",
     };
 }
@@ -1726,8 +1726,8 @@ fn approvalAmendmentPlaceholder(choice: u8) []const u8 {
 
 fn approvalChoicePrefix(choice: u8) []const u8 {
     return switch (choice) {
-        0 => "1. Yes, ",
-        2 => "3. No, ",
+        0 => "1. yes, ",
+        2 => "3. no, ",
         else => "",
     };
 }
@@ -1776,7 +1776,7 @@ fn composeApprovalHeaderRow(
     var title = try approvalTitle(
         alloc,
         approval.request.origin,
-        "Permission needed · Choose one",
+        "permission needed · choose one",
     );
     defer title.deinit(alloc);
     const kind = approvalKind(
@@ -1830,7 +1830,7 @@ fn approvalTitle(
             );
             defer encoded.deinit(alloc);
             const owned = try alloc.print(
-                "Subagent {s} needs permission",
+                "subagent {s} needs permission",
                 .{encoded.bytes},
             );
             break :blk .{ .text = owned, .owned = owned };
@@ -1842,31 +1842,31 @@ fn approvalKind(label: []const u8, dynamic_mcp: bool) []const u8 {
     if (std.mem.startsWith(u8, label, "Remember ") or
         std.mem.startsWith(u8, label, "Revoke saved-session")) return "Permission rule";
     if (dynamic_mcp) return "MCP tool";
-    if (commandLabelPrefix(label) != null) return "Command";
+    if (commandLabelPrefix(label) != null) return "command";
     if (std.mem.startsWith(u8, label, "write_file ")) return "Write file";
     if (std.mem.startsWith(u8, label, "edit_file ")) return "Edit file";
     if (std.mem.startsWith(u8, label, "task ")) return "Subagent";
     if (std.mem.startsWith(u8, label, "skill ")) return "Skill";
-    return "Tool";
+    return "tool";
 }
 
 fn approvalQuestion(label: []const u8, dynamic_mcp: bool) []const u8 {
     if (std.mem.eql(u8, label, "Remember allow for this saved session")) {
-        return "Remember allow for this saved session?";
+        return "remember allow for this saved session?";
     }
     if (std.mem.eql(u8, label, "Remember deny for this saved session")) {
-        return "Remember deny for this saved session?";
+        return "remember deny for this saved session?";
     }
     if (std.mem.eql(u8, label, "Revoke saved-session permission rule")) {
-        return "Revoke this saved-session permission rule?";
+        return "revoke this saved-session permission rule?";
     }
-    if (dynamic_mcp) return "Allow this MCP tool call?";
-    if (commandLabelPrefix(label) != null) return "Would you like to run the following command?";
+    if (dynamic_mcp) return "allow this MCP tool call?";
+    if (commandLabelPrefix(label) != null) return "would you like to run the following command?";
     if (std.mem.startsWith(u8, label, "write_file ")) return "Would you like to create or update this file?";
     if (std.mem.startsWith(u8, label, "edit_file ")) return "Would you like to edit this file?";
     if (std.mem.startsWith(u8, label, "task ")) return "Would you like to start this subagent task?";
-    if (std.mem.startsWith(u8, label, "skill ")) return "Would you like to run this skill?";
-    return "Would you like to allow this action?";
+    if (std.mem.startsWith(u8, label, "skill ")) return "would you like to run this skill?";
+    return "would you like to allow this action?";
 }
 
 fn approvalTarget(label: []const u8) []const u8 {
@@ -1893,30 +1893,30 @@ fn approvalReasonLine(
     const dim = ui_render.dim_style;
     const r = ui_render.reset_style;
     if (explanation) |text| {
-        return std.mem.print(buf, "  {s}{s}{s}", .{ dim, text, r }) catch "  Auto agent couldn’t approve because this request needs your review.";
+        return std.mem.print(buf, "  {s}{s}{s}", .{ dim, text, r }) catch "  auto agent couldn’t approve because this request needs your review.";
     }
     if (approvalAnnotation(target)) |annotation| {
-        return std.mem.print(buf, "  {s}Reason:{s} {s}", .{ dim, r, annotation }) catch "  Reason: permission required";
+        return std.mem.print(buf, "  {s}reason:{s} {s}", .{ dim, r, annotation }) catch "  reason: permission required";
     }
     if (dynamic_mcp) {
         return std.mem.print(
             buf,
-            "  {s}Reason:{s} This MCP tool needs approval before fx can send the request.",
+            "  {s}reason:{s} this MCP tool needs approval before fx can send the request.",
             .{ dim, r },
-        ) catch "  Reason: MCP tool approval required";
+        ) catch "  reason: MCP tool approval required";
     }
     if (commandLabelPrefix(label) != null) {
         if (firstUrlHost(target)) |host| {
-            return std.mem.print(buf, "  {s}Reason:{s} This command may make a network request to {s}.", .{ dim, r, host }) catch "  Reason: shell command requires approval";
+            return std.mem.print(buf, "  {s}reason:{s} this command may make a network request to {s}.", .{ dim, r, host }) catch "  reason: shell command requires approval";
         }
         return "";
     }
     if (std.mem.startsWith(u8, label, "write_file ") or
         std.mem.startsWith(u8, label, "edit_file "))
     {
-        return std.mem.print(buf, "  {s}Reason:{s} This action changes files in your workspace.", .{ dim, r }) catch "  Reason: file change requires approval";
+        return std.mem.print(buf, "  {s}reason:{s} this action changes files in your workspace.", .{ dim, r }) catch "  reason: file change requires approval";
     }
-    return std.mem.print(buf, "  {s}Reason:{s} This action needs approval before fx can continue.", .{ dim, r }) catch "  Reason: permission required";
+    return std.mem.print(buf, "  {s}reason:{s} this action needs approval before fx can continue.", .{ dim, r }) catch "  reason: permission required";
 }
 
 fn approvalActionLine(buf: []u8, label: []const u8, target: []const u8) []const u8 {
@@ -1939,12 +1939,12 @@ fn writeApprovalActionLine(
         return;
     }
     if (tool_arguments_preview) |preview| {
-        const verbose_prefix_bytes = 2 + target.len + " · Arguments for this request: ".len;
+        const verbose_prefix_bytes = 2 + target.len + " · arguments for this request: ".len;
         if (width < verbose_prefix_bytes + 16) {
             try writer.print("  {s} · {s}", .{ target, preview });
         } else {
             try writer.print(
-                "  {s} · Arguments for this request: {s}",
+                "  {s} · arguments for this request: {s}",
                 .{ target, preview },
             );
         }
@@ -1964,10 +1964,10 @@ pub fn commandTargetForApproval(label: []const u8, command: ?[]const u8) ?[]cons
 
 fn approvalAlwaysChoice(approval: ApprovalProjection, label: []const u8) []const u8 {
     if (approval.request.tool_arguments_preview != null) {
-        return "2. Allow this MCP tool for this session";
+        return "2. allow this MCP tool for this session";
     }
-    if (commandLabelPrefix(label) != null) return "2. Yes, and don't ask again for this exact command";
-    return "2. Yes, and don't ask again for this request";
+    if (commandLabelPrefix(label) != null) return "2. yes, and don't ask again for this exact command";
+    return "2. yes, and don't ask again for this request";
 }
 
 fn commandLabelPrefix(label: []const u8) ?[]const u8 {
@@ -2081,8 +2081,8 @@ test "file approval typed copy covers write equality and external scopes" {
     defer header.text.deinit(alloc);
     var choice = try composeFileApprovalScreenRow(alloc, request, .active_session, 0, 100, .{ .choice = 1 }, true, false, null);
     defer choice.text.deinit(alloc);
-    try std.testing.expect(std.mem.find(u8, header.text.items, "Check") != null);
-    try std.testing.expect(std.mem.find(u8, choice.text.items, "Reveal + allow") != null);
+    try std.testing.expect(std.mem.find(u8, header.text.items, "check") != null);
+    try std.testing.expect(std.mem.find(u8, choice.text.items, "reveal + allow") != null);
 }
 
 test "file approval keeps the amendment tail and cursor visible" {
@@ -2244,17 +2244,17 @@ test "approval panel shows bounded terminal-safe tool arguments with ellipsis" {
     try std.testing.expect(std.mem.find(
         u8,
         wide.items,
-        "Arguments for this request: {\"text\":\"\\x1b\\x0a\\xff sentinel\"}",
+        "arguments for this request: {\"text\":\"\\x1b\\x0a\\xff sentinel\"}",
     ) != null);
 
     const projection = prompt.projection().?;
     inline for ([_]struct { row: u16, expected: []const u8 }{
         .{ .row = 0, .expected = "MCP tool" },
-        .{ .row = 2, .expected = "Allow this MCP tool call?" },
-        .{ .row = 3, .expected = "This MCP tool needs approval" },
-        .{ .row = 6, .expected = "Allow once" },
-        .{ .row = 7, .expected = "Allow this MCP tool for this session" },
-        .{ .row = 8, .expected = "Deny" },
+        .{ .row = 2, .expected = "allow this MCP tool call?" },
+        .{ .row = 3, .expected = "this MCP tool needs approval" },
+        .{ .row = 6, .expected = "allow once" },
+        .{ .row = 7, .expected = "allow this MCP tool for this session" },
+        .{ .row = 8, .expected = "deny" },
     }) |expectation| {
         var row = try composeApprovalPanelRow(
             alloc,
@@ -2624,7 +2624,7 @@ test "approval panel renders typed amendment in the selected choice row" {
         interaction_state.approval_panel_rows_spacious,
     );
     defer row.deinit(std.testing.allocator);
-    try std.testing.expect(std.mem.find(u8, row.items, "1. Yes, summarize it") != null);
+    try std.testing.expect(std.mem.find(u8, row.items, "1. yes, summarize it") != null);
     try std.testing.expect(display_width.visibleWidthIgnoringAnsi(row.items) <= 120);
 }
 
@@ -2803,9 +2803,9 @@ test "generic approval uses compact permission header and pointer marker" {
     try std.testing.expect(std.mem.find(
         u8,
         header.items,
-        "Permission needed · Choose one",
+        "permission needed · choose one",
     ) != null);
-    try std.testing.expect(std.mem.find(u8, header.items, "Command") != null);
+    try std.testing.expect(std.mem.find(u8, header.items, "command") != null);
 
     var choice = try composeApprovalPanelRow(
         alloc,
@@ -2816,7 +2816,7 @@ test "generic approval uses compact permission header and pointer marker" {
     );
     defer choice.deinit(alloc);
     try std.testing.expect(std.mem.find(u8, choice.items, "❯ ") != null);
-    try std.testing.expect(std.mem.find(u8, choice.items, "1. Yes") != null);
+    try std.testing.expect(std.mem.find(u8, choice.items, "1. yes") != null);
     try std.testing.expect(std.mem.find(u8, choice.items, "›") == null);
 }
 
@@ -2840,9 +2840,9 @@ test "subagent approval header identifies requester and preserves command kind" 
     try std.testing.expect(std.mem.find(
         u8,
         header.items,
-        "Subagent approval-child needs permission",
+        "subagent approval-child needs permission",
     ) != null);
-    try std.testing.expect(std.mem.find(u8, header.items, "Command") != null);
+    try std.testing.expect(std.mem.find(u8, header.items, "command") != null);
 
     var target = try composeApprovalPanelRow(
         alloc,
@@ -2893,9 +2893,9 @@ test "file approval uses compact review header path question and pointer marker"
     try std.testing.expect(std.mem.find(
         u8,
         header.text.items,
-        "Permission needed · Review change",
+        "permission needed · review change",
     ) != null);
-    try std.testing.expect(std.mem.find(u8, header.text.items, "Edit") != null);
+    try std.testing.expect(std.mem.find(u8, header.text.items, "edit") != null);
     try std.testing.expect(std.mem.find(u8, header.text.items, "+1") != null);
     try std.testing.expect(std.mem.find(u8, header.text.items, "-1") != null);
 
@@ -2914,10 +2914,10 @@ test "file approval uses compact review header path question and pointer marker"
     try std.testing.expect(std.mem.find(
         u8,
         child_header.text.items,
-        "Subagent approval-child needs permission",
+        "subagent approval-child needs permission",
     ) != null);
     try std.testing.expect(
-        std.mem.find(u8, child_header.text.items, "Edit") != null,
+        std.mem.find(u8, child_header.text.items, "edit") != null,
     );
 
     var question = try composeFileApprovalScreenRow(
@@ -2940,7 +2940,7 @@ test "file approval uses compact review header path question and pointer marker"
     try std.testing.expect(std.mem.find(
         u8,
         question.text.items,
-        "Apply this change?",
+        "apply this change?",
     ) != null);
 
     var choice = try composeFileApprovalScreenRow(
@@ -2959,7 +2959,7 @@ test "file approval uses compact review header path question and pointer marker"
     try std.testing.expect(std.mem.find(
         u8,
         choice.text.items,
-        "1  Apply once",
+        "1  apply once",
     ) != null);
     try std.testing.expect(std.mem.find(u8, choice.text.items, "›") == null);
 }

@@ -31,7 +31,7 @@ fn oauthAuthEnabled(comptime App: type) bool {
 const ProviderSwitchDecision = auth_transition.ProviderSwitchDecision;
 const ProviderSwitchIntent = auth_transition.ProviderSwitchIntent;
 const decideProviderSwitch = auth_transition.decideProviderSwitch;
-const provider_busy_message = "Provider switching is unavailable until active and queued work finishes.";
+const provider_busy_message = "provider switching is unavailable until active and queued work finishes.";
 
 fn providerFailureMessage(
     intent: ProviderSwitchIntent,
@@ -110,7 +110,7 @@ pub fn Runtime(comptime App: type) type {
                     try writeAuthNotice(app, .{
                         .topic = "auth",
                         .tone = .@"error",
-                        .body = "Repair profile settings and restart fx before sending a message.",
+                        .body = "repair profile settings and restart fx before sending a message.",
                     });
                     return false;
                 }
@@ -128,7 +128,7 @@ pub fn Runtime(comptime App: type) type {
                         try writeAuthNotice(app, .{
                             .topic = "auth",
                             .tone = .@"error",
-                            .body = "Could not load authentication settings. Check user settings, then press enter to retry.",
+                            .body = "could not load authentication settings. check user settings, then press enter to retry.",
                         });
                         return false;
                     };
@@ -171,7 +171,7 @@ pub fn Runtime(comptime App: type) type {
                 try app.writeDomainNotice(.{
                     .topic = "auth",
                     .tone = .@"error",
-                    .body = "Could not load authentication settings for the resumed session. Check user settings and retry.",
+                    .body = "could not load authentication settings for the resumed session. check user settings and retry.",
                 }, true);
                 app.shell.render_requests.request(.footer);
                 return;
@@ -186,7 +186,7 @@ pub fn Runtime(comptime App: type) type {
                         .gateway => credentials.missing_interactive_credential_message,
                         .codex => credentials.missing_chatgpt_interactive_credential_message,
                         .grok => credentials.missing_grok_interactive_credential_message,
-                        .configured => "Configured provider authentication is unavailable. Check settings.json and its environment variable.",
+                        .configured => "configured provider authentication is unavailable. check settings.json and its environment variable.",
                     },
                 }, true),
                 .failed => |failure| {
@@ -194,7 +194,7 @@ pub fn Runtime(comptime App: type) type {
                     const message = if (auth_runtime.preparationError(classified)) |err|
                         auth_runtime.preparationFailureNotice(err).?
                     else
-                        "Authentication is unavailable. Run /provider to repair this source.";
+                        "authentication is unavailable. run /provider to repair this source.";
                     debug_trace.logf("auth", "resumed credential unavailable source={t} err={s}", .{ failure.source, @errorName(failure.err) });
                     const body = try app.alloc.print("{s}: {s}", .{ credentials.sourceLabel(failure.source), message });
                     defer app.alloc.free(body);
@@ -211,7 +211,7 @@ pub fn Runtime(comptime App: type) type {
                     .topic = "auth",
                     .tone = .warning,
                     .body = if (provider == .configured)
-                        "Configured provider authentication is unavailable. Check settings.json and its environment variable."
+                        "configured provider authentication is unavailable. check settings.json and its environment variable."
                     else if (provider == .grok)
                         credentials.missing_grok_interactive_credential_message
                     else
@@ -246,7 +246,7 @@ pub fn Runtime(comptime App: type) type {
                 try app.writeDomainNotice(.{
                     .topic = "auth",
                     .tone = .warning,
-                    .body = "Set FX_API_KEY through createFxTerminal() to authenticate this WASM session.",
+                    .body = "set FX_API_KEY through createFxTerminal() to authenticate this WASM session.",
                 }, true);
                 return;
             }
@@ -268,7 +268,7 @@ pub fn Runtime(comptime App: type) type {
                 try app.writeDomainNotice(.{
                     .topic = "auth",
                     .tone = .warning,
-                    .body = "Authentication is owned by the embedding SDK for this WASM session.",
+                    .body = "authentication is owned by the embedding SDK for this WASM session.",
                 }, true);
                 return;
             }
@@ -303,7 +303,7 @@ pub fn Runtime(comptime App: type) type {
                 try writeAuthNotice(app, .{
                     .topic = "auth",
                     .tone = .warning,
-                    .body = "Sign out is unavailable until active and queued work finishes.",
+                    .body = "sign out is unavailable until active and queued work finishes.",
                 });
                 return;
             }
@@ -320,7 +320,7 @@ pub fn Runtime(comptime App: type) type {
                 try writeAuthNotice(app, .{
                     .topic = "auth",
                     .tone = .@"error",
-                    .body = "Could not durably sign out of Codex. The current source is unchanged.",
+                    .body = "could not durably sign out of codex. the current source is unchanged.",
                 });
                 return;
             };
@@ -333,9 +333,9 @@ pub fn Runtime(comptime App: type) type {
                 false;
             applyCredentialChange(app, changed);
             try writeAuthNotice(app, switch (outcome.deletion) {
-                .deleted => .{ .topic = "auth", .tone = .neutral, .body = "Signed out of Codex." },
-                .missing => .{ .topic = "auth", .tone = .neutral, .body = "No Codex login session found." },
-                .deleted_not_durable => .{ .topic = "auth", .tone = .warning, .body = "Signed out of Codex, but could not confirm the profile directory update." },
+                .deleted => .{ .topic = "auth", .tone = .neutral, .body = "signed out of codex." },
+                .missing => .{ .topic = "auth", .tone = .neutral, .body = "no codex login session found." },
+                .deleted_not_durable => .{ .topic = "auth", .tone = .warning, .body = "signed out of codex, but could not confirm the profile directory update." },
             });
             if (outcome.revocation_failed) {
                 try writeRemoteRevocationWarning(app, .chatgpt_subscription, false);
@@ -351,7 +351,7 @@ pub fn Runtime(comptime App: type) type {
                 try writeAuthNotice(app, .{
                     .topic = "auth",
                     .tone = .@"error",
-                    .body = "Could not durably sign out of Grok. The current source is unchanged.",
+                    .body = "could not durably sign out of grok. the current source is unchanged.",
                 });
                 return;
             };
@@ -364,9 +364,9 @@ pub fn Runtime(comptime App: type) type {
                 false;
             applyCredentialChange(app, changed);
             try writeAuthNotice(app, switch (outcome.deletion) {
-                .deleted => .{ .topic = "auth", .tone = .neutral, .body = "Signed out of Grok." },
-                .missing => .{ .topic = "auth", .tone = .neutral, .body = "No Grok login session found." },
-                .deleted_not_durable => .{ .topic = "auth", .tone = .warning, .body = "Signed out of Grok, but could not confirm the profile directory update." },
+                .deleted => .{ .topic = "auth", .tone = .neutral, .body = "signed out of grok." },
+                .missing => .{ .topic = "auth", .tone = .neutral, .body = "no grok login session found." },
+                .deleted_not_durable => .{ .topic = "auth", .tone = .warning, .body = "signed out of grok, but could not confirm the profile directory update." },
             });
             if (outcome.revocation_failed) {
                 try writeRemoteRevocationWarning(app, .grok_subscription, false);
@@ -383,7 +383,7 @@ pub fn Runtime(comptime App: type) type {
                     try writeAuthNotice(app, .{
                         .topic = "auth",
                         .tone = .@"error",
-                        .body = "Could not complete fx logout. The current source is unchanged.",
+                        .body = "could not complete fx logout. the current source is unchanged.",
                     });
                     return;
                 },
@@ -426,8 +426,8 @@ pub fn Runtime(comptime App: type) type {
         /// `retry_kept` says whether the tokens are kept, so fx revokes them
         /// later (`pending_revocation`).
         fn writeRemoteRevocationWarning(app: *App, source: credentials.Source, retry_kept: bool) !void {
-            const grok = "The local Grok session was removed, but remote revocation could not be confirmed.";
-            const codex = "The local Codex session was removed, but remote revocation could not be confirmed.";
+            const grok = "the local grok session was removed, but remote revocation could not be confirmed.";
+            const codex = "the local codex session was removed, but remote revocation could not be confirmed.";
             const retry_later = " " ++ pending_revocation.retry_later ++ ".";
             try writeAuthNotice(app, .{
                 .topic = "auth",
@@ -456,7 +456,7 @@ pub fn Runtime(comptime App: type) type {
             try app.writeDomainNotice(.{
                 .topic = "provider",
                 .tone = .warning,
-                .body = "No connected provider is available. Use /provider to sign in.",
+                .body = "no connected provider is available. use /provider to sign in.",
             }, true);
         }
 
@@ -492,12 +492,12 @@ pub fn Runtime(comptime App: type) type {
                 .busy => try writeAuthNotice(app, .{
                     .topic = "auth",
                     .tone = .warning,
-                    .body = "Authentication inventory refresh is already in progress.",
+                    .body = "authentication inventory refresh is already in progress.",
                 }),
                 .failed => try writeAuthNotice(app, .{
                     .topic = "auth",
                     .tone = .@"error",
-                    .body = "Authentication sources could not be checked. The picker remains closed.",
+                    .body = "authentication sources could not be checked. the picker remains closed.",
                 }),
             }
         }
@@ -541,12 +541,12 @@ pub fn Runtime(comptime App: type) type {
                 .busy => try writeAuthNotice(app, .{
                     .topic = "auth",
                     .tone = .warning,
-                    .body = "Authentication inventory refresh is already in progress.",
+                    .body = "authentication inventory refresh is already in progress.",
                 }),
                 .failed => try writeAuthNotice(app, .{
                     .topic = "auth",
                     .tone = .@"error",
-                    .body = "Authentication sources could not be checked. The picker remains closed.",
+                    .body = "authentication sources could not be checked. the picker remains closed.",
                 }),
             }
         }
@@ -661,7 +661,7 @@ pub fn Runtime(comptime App: type) type {
                     var unavailable = app.auth.pickerView().unavailable_sources.iterator();
                     while (unavailable.next()) |source| {
                         const body = try app.alloc.print(
-                            "{s} is unavailable. Check the saved credential or choose another option.",
+                            "{s} is unavailable. check the saved credential or choose another option.",
                             .{credentials.sourceLabel(source)},
                         );
                         defer app.alloc.free(body);
@@ -684,7 +684,7 @@ pub fn Runtime(comptime App: type) type {
                     try writeAuthNotice(app, .{
                         .topic = "auth",
                         .tone = .@"error",
-                        .body = "Authentication sources could not be checked. The picker was not opened with stale data.",
+                        .body = "authentication sources could not be checked. the picker was not opened with stale data.",
                     });
                 },
             }
@@ -702,19 +702,19 @@ pub fn Runtime(comptime App: type) type {
                 .{
                     .topic = "auth",
                     .tone = .warning,
-                    .body = "Could not confirm durable fx logout. The active source was recalculated.",
+                    .body = "could not confirm durable fx logout. the active source was recalculated.",
                 }
             else if (result.session_deleted)
                 .{
                     .topic = "auth",
                     .tone = .neutral,
-                    .body = "Signed out of fx.",
+                    .body = "signed out of fx.",
                 }
             else
                 .{
                     .topic = "auth",
                     .tone = .neutral,
-                    .body = "No fx login session found.",
+                    .body = "no fx login session found.",
                 });
             if (result.remote_revocation_failed) {
                 try writeAuthNotice(app, .{
@@ -731,7 +731,7 @@ pub fn Runtime(comptime App: type) type {
                 try app.writeDomainNotice(.{
                     .topic = "auth",
                     .tone = .warning,
-                    .body = "Browser authentication is supplied by the embedding SDK.",
+                    .body = "browser authentication is supplied by the embedding SDK.",
                 }, true);
                 return;
             }
@@ -867,7 +867,7 @@ pub fn Runtime(comptime App: type) type {
                                 try writeAuthNotice(app, .{
                                     .topic = "auth",
                                     .tone = .@"error",
-                                    .body = "Signed in to Vercel, but no Vercel teams could be loaded. The current credential is unchanged.",
+                                    .body = "signed in to vercel, but no vercel teams could be loaded. the current credential is unchanged.",
                                 });
                                 cancelPromptRetryAfterAuth(app, agent);
                                 return;
@@ -877,7 +877,7 @@ pub fn Runtime(comptime App: type) type {
                             try writeAuthNotice(app, .{
                                 .topic = "auth",
                                 .tone = .neutral,
-                                .body = "Signed in to Vercel. Choose a team to finish setup.",
+                                .body = "signed in to vercel. choose a team to finish setup.",
                             });
                         },
                         .chatgpt => {
@@ -918,9 +918,9 @@ pub fn Runtime(comptime App: type) type {
                             .topic = "auth",
                             .tone = .@"error",
                             .body = if (provider == .codex)
-                                "Signed in, but the Codex subscription credential could not be loaded."
+                                "signed in, but the codex subscription credential could not be loaded."
                             else
-                                "Signed in, but the Grok subscription credential could not be loaded.",
+                                "signed in, but the grok subscription credential could not be loaded.",
                         });
                         return;
                     }
@@ -929,9 +929,9 @@ pub fn Runtime(comptime App: type) type {
                         .topic = "auth",
                         .tone = .neutral,
                         .body = if (provider == .codex)
-                            "Signed in with Codex."
+                            "signed in with codex."
                         else
-                            "Signed in with Grok.",
+                            "signed in with grok.",
                     });
                     try resumePromptAfterAuth(app, agent);
                 },
@@ -952,7 +952,7 @@ pub fn Runtime(comptime App: type) type {
                 .busy => try app.writeDomainNotice(.{
                     .topic = "auth",
                     .tone = .warning,
-                    .body = "Still saving the previous API key. Nothing was stored for this one; try again in a moment.",
+                    .body = "still saving the previous API key. nothing was stored for this one; try again in a moment.",
                 }, true),
             }
         }
@@ -974,7 +974,7 @@ pub fn Runtime(comptime App: type) type {
                     applyCredentialChange(app, changed);
                     rememberCredentialSource(app, .stored_key);
                     const body = try app.alloc.print(
-                        "Saved the API key to {s} and made it active.",
+                        "saved the API key to {s} and made it active.",
                         .{credentials.stored_key_backend_label},
                     );
                     defer app.alloc.free(body);
@@ -998,16 +998,16 @@ pub fn Runtime(comptime App: type) type {
                 .gateway_refused => try app.writeDomainNotice(.{
                     .topic = "auth",
                     .tone = .@"error",
-                    .body = "The AI Gateway refused that API key. Nothing was stored.",
+                    .body = "the AI gateway refused that API key. nothing was stored.",
                 }, true),
                 .gateway_unavailable => try app.writeDomainNotice(.{
                     .topic = "auth",
                     .tone = .@"error",
-                    .body = "Could not verify that API key with AI Gateway. Nothing was stored.",
+                    .body = "could not verify that API key with AI gateway. nothing was stored.",
                 }, true),
                 .store_failed => {
                     const body = try app.alloc.print(
-                        "Could not save the API key to {s}. Nothing was stored.",
+                        "could not save the API key to {s}. nothing was stored.",
                         .{credentials.stored_key_backend_label},
                     );
                     defer app.alloc.free(body);
@@ -1019,7 +1019,7 @@ pub fn Runtime(comptime App: type) type {
                 },
                 .reload_failed => {
                     const body = try app.alloc.print(
-                        "Saved the API key to {s}, but could not make it active.",
+                        "saved the API key to {s}, but could not make it active.",
                         .{credentials.stored_key_backend_label},
                     );
                     defer app.alloc.free(body);
@@ -1041,7 +1041,7 @@ pub fn Runtime(comptime App: type) type {
             try app.writeDomainNotice(.{
                 .topic = "auth",
                 .tone = .neutral,
-                .body = "Using automatic credential precedence again.",
+                .body = "using automatic credential precedence again.",
             }, true);
             try resumePromptAfterAuth(app, agent);
         }
@@ -1068,7 +1068,7 @@ pub fn Runtime(comptime App: type) type {
         pub fn applySourceChoice(app: *App, agent: *AppAgent, source: credentials.Source) !bool {
             if (try rejectPendingPreparation(app)) return false;
             const body = try app.alloc.print(
-                "Switched credential to {s}.",
+                "switched credential to {s}.",
                 .{credentials.sourceLabel(source)},
             );
             defer app.alloc.free(body);
@@ -1077,7 +1077,7 @@ pub fn Runtime(comptime App: type) type {
                 try app.writeDomainNotice(.{
                     .topic = "auth",
                     .tone = .warning,
-                    .body = "That credential is no longer available. The current source is unchanged.",
+                    .body = "that credential is no longer available. the current source is unchanged.",
                 }, true);
                 return false;
             }
@@ -1134,7 +1134,7 @@ pub fn Runtime(comptime App: type) type {
                         try app.writeDomainNotice(.{
                             .topic = "auth",
                             .tone = .warning,
-                            .body = "Codex sign-in is unavailable until active and queued work finishes.",
+                            .body = "codex sign-in is unavailable until active and queued work finishes.",
                         }, true);
                         return;
                     }
@@ -1168,7 +1168,7 @@ pub fn Runtime(comptime App: type) type {
                         try app.writeDomainNotice(.{
                             .topic = "auth",
                             .tone = .warning,
-                            .body = "Grok sign-in is unavailable until active and queued work finishes.",
+                            .body = "grok sign-in is unavailable until active and queued work finishes.",
                         }, true);
                         return;
                     }
@@ -1238,7 +1238,7 @@ pub fn Runtime(comptime App: type) type {
                 try app.writeDomainNotice(.{
                     .topic = "provider",
                     .tone = .warning,
-                    .body = "Provider switching is unavailable in this host.",
+                    .body = "provider switching is unavailable in this host.",
                 }, true);
                 return;
             }
@@ -1253,7 +1253,7 @@ pub fn Runtime(comptime App: type) type {
             })) {
                 .prepare => {},
                 .no_change => {
-                    const body = try app.alloc.print("Already using {s}.", .{provider_catalog.label(target)});
+                    const body = try app.alloc.print("already using {s}.", .{provider_catalog.label(target)});
                     defer app.alloc.free(body);
                     try app.writeDomainNotice(.{
                         .topic = "provider",
@@ -1266,7 +1266,7 @@ pub fn Runtime(comptime App: type) type {
                     try app.writeDomainNotice(.{
                         .topic = "provider",
                         .tone = .warning,
-                        .body = providerFailureMessage(intent, provider_busy_message, "Subscription sign-in completed, but provider activation is unavailable until active and queued work finishes. The current provider is unchanged."),
+                        .body = providerFailureMessage(intent, provider_busy_message, "subscription sign-in completed, but provider activation is unavailable until active and queued work finishes. the current provider is unchanged."),
                     }, true);
                     return;
                 },
@@ -1276,7 +1276,7 @@ pub fn Runtime(comptime App: type) type {
                 try app.writeDomainNotice(.{
                     .topic = "provider",
                     .tone = .@"error",
-                    .body = "Could not load the saved provider selection. The current provider is unchanged.",
+                    .body = "could not load the saved provider selection. the current provider is unchanged.",
                 }, true);
                 return;
             };
@@ -1285,7 +1285,7 @@ pub fn Runtime(comptime App: type) type {
                 try app.writeDomainNotice(.{
                     .topic = "provider",
                     .tone = .@"error",
-                    .body = "The target provider catalog is unavailable. The current provider is unchanged.",
+                    .body = "the target provider catalog is unavailable. the current provider is unchanged.",
                 }, true);
                 return;
             };
@@ -1317,7 +1317,7 @@ pub fn Runtime(comptime App: type) type {
             try app.writeDomainNotice(.{
                 .topic = "provider",
                 .tone = .neutral,
-                .body = "Provider preparation is still in progress. ctrl+c cancels.",
+                .body = "provider preparation is still in progress. ctrl+c cancels.",
             }, true);
             return true;
         }
@@ -1331,7 +1331,7 @@ pub fn Runtime(comptime App: type) type {
             try app.writeDomainNotice(.{
                 .topic = "auth",
                 .tone = .neutral,
-                .body = "A sign-in refresh is still finishing. Try again in a moment.",
+                .body = "a sign-in refresh is still finishing. try again in a moment.",
             }, true);
             return true;
         }
@@ -1342,7 +1342,7 @@ pub fn Runtime(comptime App: type) type {
                 try app.writeDomainNotice(.{
                     .topic = "provider",
                     .tone = .@"error",
-                    .body = "Could not start provider preparation. The current provider is unchanged.",
+                    .body = "could not start provider preparation. the current provider is unchanged.",
                 }, true);
                 return;
             };
@@ -1358,7 +1358,7 @@ pub fn Runtime(comptime App: type) type {
                 try app.writeDomainNotice(.{
                     .topic = "provider",
                     .tone = .neutral,
-                    .body = "Provider preparation cancelled. The current provider is unchanged.",
+                    .body = "provider preparation cancelled. the current provider is unchanged.",
                 }, true);
                 return;
             }
@@ -1415,7 +1415,7 @@ pub fn Runtime(comptime App: type) type {
                     try app.writeDomainNotice(.{
                         .topic = "provider",
                         .tone = .@"error",
-                        .body = providerFailureMessage(intent, "Could not load the target provider catalog. The current provider is unchanged.", "Subscription sign-in completed, but its model catalog could not be loaded. The current provider is unchanged."),
+                        .body = providerFailureMessage(intent, "could not load the target provider catalog. the current provider is unchanged.", "subscription sign-in completed, but its model catalog could not be loaded. the current provider is unchanged."),
                     }, true);
                 }
                 return false;
@@ -1432,7 +1432,7 @@ pub fn Runtime(comptime App: type) type {
                     try app.writeDomainNotice(.{
                         .topic = "provider",
                         .tone = .warning,
-                        .body = if (intent == .post_oauth) "Subscription sign-in completed, but its saved credential is unavailable. The current provider is unchanged." else if (target == .codex) "Run fx login codex, then try switching again." else if (target == .grok) "Run fx login grok, then try switching again." else credentials.missing_interactive_credential_message,
+                        .body = if (intent == .post_oauth) "subscription sign-in completed, but its saved credential is unavailable. the current provider is unchanged." else if (target == .codex) "run fx login codex, then try switching again." else if (target == .grok) "run fx login grok, then try switching again." else credentials.missing_interactive_credential_message,
                     }, true);
                 }
                 return false;
@@ -1445,8 +1445,8 @@ pub fn Runtime(comptime App: type) type {
                     debug_trace.logf("provider", "catalog rejected provider={t} category={t}", .{ target, failure.category });
                     // A connection fx could not make is named as one.
                     const unreachable_body = if (failure.category == .transport)
-                        try app.alloc.print("{s}fx couldn't connect to {s} to load {s}. Check your network connection or firewall. The current provider is unchanged.", .{
-                            if (intent == .post_oauth) "Subscription sign-in completed, but " else "",
+                        try app.alloc.print("{s}fx couldn't connect to {s} to load {s}. check your network connection or firewall. the current provider is unchanged.", .{
+                            if (intent == .post_oauth) "subscription sign-in completed, but " else "",
                             model_catalog.serviceName(target),
                             if (intent == .post_oauth) "its model catalog" else "the target provider catalog",
                         })
@@ -1456,7 +1456,7 @@ pub fn Runtime(comptime App: type) type {
                     try app.writeDomainNotice(.{
                         .topic = "provider",
                         .tone = .@"error",
-                        .body = unreachable_body orelse if (failure.category == .cancellation) "Provider switching was cancelled. The current provider is unchanged." else providerFailureMessage(intent, "The target provider catalog could not be validated. The current provider is unchanged.", "Subscription sign-in completed, but its model catalog could not be validated. The current provider is unchanged."),
+                        .body = unreachable_body orelse if (failure.category == .cancellation) "provider switching was cancelled. the current provider is unchanged." else providerFailureMessage(intent, "the target provider catalog could not be validated. the current provider is unchanged.", "subscription sign-in completed, but its model catalog could not be validated. the current provider is unchanged."),
                     }, true);
                     return false;
                 },
@@ -1466,7 +1466,7 @@ pub fn Runtime(comptime App: type) type {
                 try app.writeDomainNotice(.{
                     .topic = "provider",
                     .tone = .@"error",
-                    .body = providerFailureMessage(intent, "The target provider returned no supported models. The current provider is unchanged.", "Subscription sign-in completed, but its model catalog returned no supported models. The current provider is unchanged."),
+                    .body = providerFailureMessage(intent, "the target provider returned no supported models. the current provider is unchanged.", "subscription sign-in completed, but its model catalog returned no supported models. the current provider is unchanged."),
                 }, true);
                 return false;
             };
@@ -1485,7 +1485,7 @@ pub fn Runtime(comptime App: type) type {
                     .body = providerFailureMessage(
                         intent,
                         provider_busy_message,
-                        "Subscription sign-in completed, but provider activation is unavailable until active and queued work finishes. The current provider is unchanged.",
+                        "subscription sign-in completed, but provider activation is unavailable until active and queued work finishes. the current provider is unchanged.",
                     ),
                 }, true);
                 return false;
@@ -1496,7 +1496,7 @@ pub fn Runtime(comptime App: type) type {
             if (credential) |*value| _ = app.auth.adoptCredential(app.alloc, value);
 
             const body = try app.alloc.print(
-                "Switched to {s} with {s}.",
+                "switched to {s} with {s}.",
                 .{ provider_catalog.label(target), provider_runtime.modelOf(app, agent) },
             );
             defer app.alloc.free(body);
@@ -1518,7 +1518,7 @@ pub fn Runtime(comptime App: type) type {
                     try app.writeDomainNotice(.{
                         .topic = "provider",
                         .tone = .warning,
-                        .body = "Provider switched for this run, but the selection could not be saved.",
+                        .body = "provider switched for this run, but the selection could not be saved.",
                     }, true);
                 } else {
                     try app.writeDomainNotice(.{
@@ -1543,7 +1543,7 @@ pub fn Runtime(comptime App: type) type {
                         try app.writeDomainNotice(.{
                             .topic = "provider",
                             .tone = .warning,
-                            .body = "Provider switched for this run, but the selection could not be saved.",
+                            .body = "provider switched for this run, but the selection could not be saved.",
                         }, true);
                     },
                 }
@@ -1612,8 +1612,8 @@ pub fn Runtime(comptime App: type) type {
                     .topic = "auth",
                     .tone = if (err == error.NoTeams) .neutral else .@"error",
                     .body = switch (err) {
-                        error.NoTeams => "No Vercel teams are available for this account.",
-                        else => "Could not reach Vercel to list teams. The current team is unchanged.",
+                        error.NoTeams => "no vercel teams are available for this account.",
+                        else => "could not reach vercel to list teams. the current team is unchanged.",
                     },
                 }, true);
                 return .unavailable;
@@ -1623,7 +1623,7 @@ pub fn Runtime(comptime App: type) type {
                 try app.writeDomainNotice(.{
                     .topic = "auth",
                     .tone = .neutral,
-                    .body = "No Vercel teams are available for this account.",
+                    .body = "no vercel teams are available for this account.",
                 }, true);
                 return .unavailable;
             }
@@ -1665,9 +1665,9 @@ pub fn Runtime(comptime App: type) type {
                     .topic = "auth",
                     .tone = .@"error",
                     .body = switch (err) {
-                        error.NoSession => "The fx login session is no longer available. Sign in to change teams.",
-                        error.NoTeams => "No Vercel teams are available for this account.",
-                        else => "Could not load Vercel teams. The current team is unchanged.",
+                        error.NoSession => "the fx login session is no longer available. sign in to change teams.",
+                        error.NoTeams => "no vercel teams are available for this account.",
+                        else => "could not load vercel teams. the current team is unchanged.",
                     },
                 }, true);
                 return;
@@ -1695,7 +1695,7 @@ pub fn Runtime(comptime App: type) type {
                 try app.writeDomainNotice(.{
                     .topic = "auth",
                     .tone = .@"error",
-                    .body = "The selected Vercel team could not be validated. The current team is unchanged.",
+                    .body = "the selected vercel team could not be validated. the current team is unchanged.",
                 }, true);
                 return false;
             };
@@ -1704,7 +1704,7 @@ pub fn Runtime(comptime App: type) type {
                 const catalog_provider = app.providerCatalog(.gateway) orelse return false;
                 var settings = config_runtime.loadMergedSettings(app.alloc, app.workspace_root) catch |err| {
                     debug_trace.logf("auth", "team preparation settings failed err={s}", .{@errorName(err)});
-                    try app.writeDomainNotice(.{ .topic = "auth", .tone = .@"error", .body = "Could not load provider preferences. The current team is unchanged." }, true);
+                    try app.writeDomainNotice(.{ .topic = "auth", .tone = .@"error", .body = "could not load provider preferences. the current team is unchanged." }, true);
                     return false;
                 };
                 defer settings.deinit(app.alloc);
@@ -1749,9 +1749,9 @@ pub fn Runtime(comptime App: type) type {
             const team = selection.teams.items[index];
             // Read before the choice reloads the credential.
             const body = if (teamInUse(app, team))
-                try app.alloc.print("Using Vercel team {s} ({s}).", .{ team.name, team.slug })
+                try app.alloc.print("using vercel team {s} ({s}).", .{ team.name, team.slug })
             else
-                try app.alloc.print("Changed Vercel team to {s} ({s}).", .{ team.name, team.slug });
+                try app.alloc.print("changed vercel team to {s} ({s}).", .{ team.name, team.slug });
             defer app.alloc.free(body);
             if (validation == .rejected or validation == .catalog_unreachable) {
                 cancelPromptRetryAfterAuth(app, agent);
@@ -1760,9 +1760,9 @@ pub fn Runtime(comptime App: type) type {
                     .topic = "auth",
                     .tone = .@"error",
                     .body = if (validation == .catalog_unreachable)
-                        "fx couldn't connect to AI Gateway to validate the selected Vercel team. Check your network connection or firewall. The current team is unchanged."
+                        "fx couldn't connect to AI gateway to validate the selected vercel team. check your network connection or firewall. the current team is unchanged."
                     else
-                        "The selected Vercel team could not be validated for AI Gateway. The current team is unchanged.",
+                        "the selected vercel team could not be validated for AI gateway. the current team is unchanged.",
                 }, true);
                 return false;
             }
@@ -1775,8 +1775,8 @@ pub fn Runtime(comptime App: type) type {
                     .topic = "auth",
                     .tone = .@"error",
                     .body = switch (err) {
-                        error.SessionChanged, error.NoSession => "The fx login session changed before the team could be saved.",
-                        else => "Could not change the Vercel team. The current team is unchanged.",
+                        error.SessionChanged, error.NoSession => "the fx login session changed before the team could be saved.",
+                        else => "could not change the vercel team. the current team is unchanged.",
                     },
                 }, true);
                 return false;
@@ -1825,7 +1825,7 @@ pub fn Runtime(comptime App: type) type {
                 try app.writeDomainNotice(.{
                     .topic = "auth",
                     .tone = .@"error",
-                    .body = "Changed the Vercel team, but the fx login credential could not be loaded.",
+                    .body = "changed the vercel team, but the fx login credential could not be loaded.",
                 }, true);
                 return false;
             }
@@ -1834,7 +1834,7 @@ pub fn Runtime(comptime App: type) type {
             try app.writeDomainNotice(if (model_persistence_failed) .{
                 .topic = "auth",
                 .tone = .warning,
-                .body = "The Vercel team changed and a valid model was selected for this run, but the model preference could not be saved.",
+                .body = "the vercel team changed and a valid model was selected for this run, but the model preference could not be saved.",
             } else .{
                 .topic = "",
                 .tone = .neutral,
@@ -2008,7 +2008,7 @@ pub fn Runtime(comptime App: type) type {
                 try app.writeDomainNotice(.{
                     .topic = "auth",
                     .tone = .warning,
-                    .body = "Missing FX_API_KEY. Supply it through createFxTerminal().",
+                    .body = "missing FX_API_KEY. supply it through createFxTerminal().",
                 }, true);
                 return false;
             }
@@ -2278,23 +2278,23 @@ pub fn Runtime(comptime App: type) type {
             const source_label = credentials.sourceLabel(failure.source);
             return switch (failure.reason) {
                 .invalid_credential => alloc.print(
-                    "{s} sign-in expired.\npress enter to sign in again. Your prompt is saved.",
+                    "{s} sign-in expired.\npress enter to sign in again. your prompt is saved.",
                     .{source_label},
                 ),
                 .invalid_storage => alloc.print(
-                    "{s}: Saved credential storage is unavailable.\nCheck credential storage, then press enter to retry. Your prompt is saved.",
+                    "{s}: saved credential storage is unavailable.\ncheck credential storage, then press enter to retry. your prompt is saved.",
                     .{source_label},
                 ),
                 .persistence_uncertain => alloc.print(
-                    "{s} refresh could not be saved.\npress enter to sign in again. Your prompt is saved.",
+                    "{s} refresh could not be saved.\npress enter to sign in again. your prompt is saved.",
                     .{source_label},
                 ),
                 .authority_changed => alloc.print(
-                    "{s} account or team changed during refresh.\nReview authentication before retrying. Your prompt is saved.",
+                    "{s} account or team changed during refresh.\nreview authentication before retrying. your prompt is saved.",
                     .{source_label},
                 ),
                 .temporary_unavailable => alloc.print(
-                    "{s} credential refresh failed.\npress enter to retry. Your prompt is saved.",
+                    "{s} credential refresh failed.\npress enter to retry. your prompt is saved.",
                     .{source_label},
                 ),
             };
@@ -2316,15 +2316,15 @@ pub fn Runtime(comptime App: type) type {
         fn expiredWhileWaitingNotice(source: credentials.Source, err: anyerror) ?[]const u8 {
             return switch (source) {
                 .chatgpt_subscription => switch (err) {
-                    error.ChatGptLoginTimedOut, error.LoginTimedOut => "Codex sign-in expired. Your current login is unchanged, and fx keeps trying it every few minutes. Press Enter to retry with your current login, or run /login to sign in again.",
+                    error.ChatGptLoginTimedOut, error.LoginTimedOut => "codex sign-in expired. your current login is unchanged, and fx keeps trying it every few minutes. press enter to retry with your current login, or run /login to sign in again.",
                     else => null,
                 },
                 .grok_subscription => switch (err) {
-                    error.GrokLoginTimedOut, error.LoginTimedOut => "Grok sign-in expired. Your current login is unchanged, and fx keeps trying it every few minutes. Press Enter to retry with your current login, or run /login to sign in again.",
+                    error.GrokLoginTimedOut, error.LoginTimedOut => "grok sign-in expired. your current login is unchanged, and fx keeps trying it every few minutes. press enter to retry with your current login, or run /login to sign in again.",
                     else => null,
                 },
                 else => switch (err) {
-                    error.ExpiredToken, error.LoginTimedOut => "The Vercel sign-in code expired. Your current login is unchanged, and fx keeps trying it every few minutes. Press Enter to retry with your current login, or run /login to sign in again.",
+                    error.ExpiredToken, error.LoginTimedOut => "the vercel sign-in code expired. your current login is unchanged, and fx keeps trying it every few minutes. press enter to retry with your current login, or run /login to sign in again.",
                     else => null,
                 },
             };
@@ -2341,21 +2341,21 @@ pub fn Runtime(comptime App: type) type {
             }
             const notice: types.SemanticNotice = if (source == .chatgpt_subscription)
                 switch (err) {
-                    error.ChatGptAuthorizationFailed => .{ .topic = "auth", .tone = .@"error", .body = "Codex sign-in was denied. The current credential is unchanged." },
-                    error.ChatGptLoginTimedOut, error.LoginTimedOut => .{ .topic = "auth", .tone = .warning, .body = "Codex sign-in expired. The current credential is unchanged; run /login to try again." },
-                    else => .{ .topic = "auth", .tone = .@"error", .body = "Codex sign-in failed. The current credential is unchanged." },
+                    error.ChatGptAuthorizationFailed => .{ .topic = "auth", .tone = .@"error", .body = "codex sign-in was denied. the current credential is unchanged." },
+                    error.ChatGptLoginTimedOut, error.LoginTimedOut => .{ .topic = "auth", .tone = .warning, .body = "codex sign-in expired. the current credential is unchanged; run /login to try again." },
+                    else => .{ .topic = "auth", .tone = .@"error", .body = "codex sign-in failed. the current credential is unchanged." },
                 }
             else if (source == .grok_subscription)
                 switch (err) {
-                    error.GrokAuthorizationFailed => .{ .topic = "auth", .tone = .@"error", .body = "Grok sign-in was denied. The current credential is unchanged." },
-                    error.GrokLoginTimedOut, error.LoginTimedOut => .{ .topic = "auth", .tone = .warning, .body = "Grok sign-in expired. The current credential is unchanged; run /login to try again." },
-                    else => .{ .topic = "auth", .tone = .@"error", .body = "Grok sign-in failed. The current credential is unchanged." },
+                    error.GrokAuthorizationFailed => .{ .topic = "auth", .tone = .@"error", .body = "grok sign-in was denied. the current credential is unchanged." },
+                    error.GrokLoginTimedOut, error.LoginTimedOut => .{ .topic = "auth", .tone = .warning, .body = "grok sign-in expired. the current credential is unchanged; run /login to try again." },
+                    else => .{ .topic = "auth", .tone = .@"error", .body = "grok sign-in failed. the current credential is unchanged." },
                 }
             else switch (err) {
-                error.ClientIdMissing => .{ .topic = "auth", .tone = .@"error", .body = "fx login is not configured yet. The current credential is unchanged." },
-                error.AccessDenied => .{ .topic = "auth", .tone = .@"error", .body = "Vercel sign-in was denied. The current credential is unchanged." },
-                error.ExpiredToken, error.LoginTimedOut => .{ .topic = "auth", .tone = .warning, .body = "The Vercel sign-in code expired. The current credential is unchanged; run /login to try again." },
-                else => .{ .topic = "auth", .tone = .@"error", .body = "Vercel sign-in failed. The current credential is unchanged." },
+                error.ClientIdMissing => .{ .topic = "auth", .tone = .@"error", .body = "fx login is not configured yet. the current credential is unchanged." },
+                error.AccessDenied => .{ .topic = "auth", .tone = .@"error", .body = "vercel sign-in was denied. the current credential is unchanged." },
+                error.ExpiredToken, error.LoginTimedOut => .{ .topic = "auth", .tone = .warning, .body = "the vercel sign-in code expired. the current credential is unchanged; run /login to try again." },
+                else => .{ .topic = "auth", .tone = .@"error", .body = "vercel sign-in failed. the current credential is unchanged." },
             };
             try writeAuthNotice(app, notice);
         }
@@ -3404,7 +3404,7 @@ test "VT-4 unavailable picker source preserves active source and reports unavail
     try std.testing.expectEqual(credentials.Source.ai_gateway_api_key, app.auth.active_source.?);
     try std.testing.expectEqual(@as(usize, 1), app.notice_write_count);
     try std.testing.expectEqualStrings(
-        "That credential is no longer available. The current source is unchanged.\n",
+        "that credential is no longer available. the current source is unchanged.\n",
         app.transcript.items,
     );
 }
@@ -3421,7 +3421,7 @@ test "completed credential switch emits exactly one transcript line" {
     try std.testing.expectEqual(credentials.Source.stored_key, app.last_preference_source.?);
     try std.testing.expectEqual(@as(usize, 1), app.notice_write_count);
     const expected = try app.alloc.print(
-        "Switched credential to {s}.\n",
+        "switched credential to {s}.\n",
         .{credentials.sourceLabel(.stored_key)},
     );
     defer app.alloc.free(expected);
@@ -3445,7 +3445,7 @@ test "team change from an environment source activates and remembers fx login" {
     try std.testing.expectEqual(@as(usize, 1), app.model_cache_warmup_count);
     try std.testing.expectEqual(@as(usize, 1), app.notice_write_count);
     try std.testing.expectEqualStrings(
-        "Changed Vercel team to Vercel Labs (vercel-labs).\n",
+        "changed vercel team to Vercel Labs (vercel-labs).\n",
         app.transcript.items,
     );
 }
@@ -3474,7 +3474,7 @@ test "teamless direct login does not activate or persist an unvalidated authorit
     try std.testing.expectEqual(@as(usize, 0), app.preference_write_count);
     try std.testing.expectEqual(@as(?credentials.Source, null), app.last_preference_source);
     try std.testing.expectEqual(@as(usize, 1), app.notice_write_count);
-    try std.testing.expect(std.mem.find(u8, app.transcript.items, "no Vercel teams") != null);
+    try std.testing.expect(std.mem.find(u8, app.transcript.items, "no vercel teams") != null);
 }
 
 test "failed preference persistence keeps a validated team credential active" {
@@ -3610,7 +3610,7 @@ test "logout result reconciles live auth and renders only sanitized notices" {
     try std.testing.expectEqual(@as(usize, 1), app.auth.logout_reconcile_count);
     try std.testing.expectEqual(@as(usize, 1), app.model_cache.reset_count);
     try std.testing.expectEqual(@as(usize, 1), app.model_cache_warmup_count);
-    try std.testing.expect(std.mem.find(u8, app.transcript.items, "Signed out of fx.") != null);
+    try std.testing.expect(std.mem.find(u8, app.transcript.items, "signed out of fx.") != null);
     try std.testing.expect(std.mem.find(u8, app.transcript.items, login_flow.remote_revocation_warning) != null);
     for ([_][]const u8{ "access-secret", "refresh-secret", "RemoteRevokeFailed", "https://issuer.example" }) |detail| {
         try std.testing.expect(std.mem.find(u8, app.transcript.items, detail) == null);
@@ -3630,7 +3630,7 @@ test "logout durability failure still reconciles live auth" {
 
     try std.testing.expectEqual(@as(usize, 1), app.auth.logout_reconcile_count);
     try std.testing.expectEqual(@as(usize, 1), app.model_cache.reset_count);
-    try std.testing.expect(std.mem.find(u8, app.transcript.items, "Could not confirm durable fx logout.") != null);
+    try std.testing.expect(std.mem.find(u8, app.transcript.items, "could not confirm durable fx logout.") != null);
     try std.testing.expect(std.mem.find(u8, app.transcript.items, login_flow.remote_revocation_warning) != null);
     try std.testing.expect(std.mem.find(u8, app.transcript.items, "current source is unchanged") == null);
 }
@@ -3643,8 +3643,8 @@ test "prompt credential refresh failure is recoverable and detail-free" {
     try std.testing.expect(!try Runtime(TestApp).preparePromptCredential(&app, (&app).agent()));
     try std.testing.expect(std.mem.find(u8, app.transcript.items, "fx login credential refresh failed.") != null);
     try std.testing.expect(std.mem.find(u8, app.transcript.items, "press enter to retry.") != null);
-    try std.testing.expect(std.mem.find(u8, app.transcript.items, "Your prompt is saved.") != null);
-    try std.testing.expect(std.mem.find(u8, app.transcript.items, "Choose another source") == null);
+    try std.testing.expect(std.mem.find(u8, app.transcript.items, "your prompt is saved.") != null);
+    try std.testing.expect(std.mem.find(u8, app.transcript.items, "choose another source") == null);
     try std.testing.expect(std.mem.find(u8, app.transcript.items, "OAuthRequestFailed") == null);
     try std.testing.expect(app.shell.render_requests.footer_requested);
     try std.testing.expectEqual(@as(usize, 0), app.auth.source_inventory_refresh_count);
@@ -3673,7 +3673,7 @@ test "permanent prompt credential failure is one repair episode" {
         @as(usize, 1),
         std.mem.count(u8, app.transcript.items, "fx login sign-in expired."),
     );
-    try std.testing.expect(std.mem.find(u8, app.transcript.items, "Your prompt is saved.") != null);
+    try std.testing.expect(std.mem.find(u8, app.transcript.items, "your prompt is saved.") != null);
 }
 
 test "prompt credential admission retries a crossed readiness deadline" {
@@ -3697,7 +3697,7 @@ test "prompt credential admission rejects a credential that remains unavailable"
     try std.testing.expectEqual(@as(usize, 2), app.auth.refresh_count);
     try std.testing.expect(std.mem.find(u8, app.transcript.items, "fx login sign-in expired.") != null);
     try std.testing.expect(std.mem.find(u8, app.transcript.items, "press enter to sign in again.") != null);
-    try std.testing.expect(std.mem.find(u8, app.transcript.items, "Your prompt is saved.") != null);
+    try std.testing.expect(std.mem.find(u8, app.transcript.items, "your prompt is saved.") != null);
     try std.testing.expect(!app.auth.picker_opened);
 }
 
@@ -3747,7 +3747,7 @@ test "queued prompt admission rejects a missing credential without refreshing" {
     try std.testing.expect(!try Runtime(TestApp).admitQueuedPromptCredential(&app, (&app).agent()));
     try std.testing.expectEqual(@as(usize, 0), app.auth.refresh_count);
     try std.testing.expect(std.mem.find(u8, app.transcript.items, "fx login sign-in expired.") != null);
-    try std.testing.expect(std.mem.find(u8, app.transcript.items, "Your prompt is saved.") != null);
+    try std.testing.expect(std.mem.find(u8, app.transcript.items, "your prompt is saved.") != null);
 }
 
 test "manual compaction missing credentials leave transcript feedback to its owner" {
@@ -3859,7 +3859,7 @@ test "compaction credential failure preserves the first ordinary recovery notice
     try std.testing.expect(!try runtime.recoverCredentialFailure(&app, (&app).agent(), .fx_login, error.OAuthRequestFailed));
     try std.testing.expectEqual(@as(usize, 1), app.notice_write_count);
     try std.testing.expectEqualStrings(
-        "fx login credential refresh failed.\npress enter to retry. Your prompt is saved.",
+        "fx login credential refresh failed.\npress enter to retry. your prompt is saved.",
         app.transcript.items,
     );
     try std.testing.expectEqualStrings("keep this ordinary prompt", app.agent().submission.pending.?.draft.prompt);
@@ -3890,7 +3890,7 @@ test "prompt credential refresh reports a task that cannot start instead of refr
     try std.testing.expectEqual(@as(usize, 0), app.auth.refresh_count);
     try std.testing.expectEqual(@as(usize, 2), app.auth.prompt_refresh_start_count);
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, app.transcript.items, "press enter to retry."));
-    try std.testing.expect(std.mem.find(u8, app.transcript.items, "Your prompt is saved.") != null);
+    try std.testing.expect(std.mem.find(u8, app.transcript.items, "your prompt is saved.") != null);
 }
 
 test "retrying a refreshable source after a non-retryable failure refreshes in the background" {

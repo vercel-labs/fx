@@ -14,8 +14,8 @@ pub const Kind = enum {
 
     pub fn title(self: Kind) []const u8 {
         return switch (self) {
-            .status => "Status",
-            .permissions => "Permissions",
+            .status => "status",
+            .permissions => "permissions",
         };
     }
 };

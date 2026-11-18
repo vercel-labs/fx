@@ -12,11 +12,11 @@ pub const Category = enum {
 
     pub fn label(self: Category) []const u8 {
         return switch (self) {
-            .all => "All",
-            .interface => "Interface",
-            .agent => "Agent",
-            .notifications => "Notifications",
-            .advanced => "Advanced",
+            .all => "all",
+            .interface => "interface",
+            .agent => "agent",
+            .notifications => "notifications",
+            .advanced => "advanced",
         };
     }
 };
@@ -118,18 +118,18 @@ pub const StatuslineChoice = struct {
 
 const statusline_choices = [_]StatuslineChoice{
     .{
-        .label = "Context",
-        .description = "Show context-window usage",
+        .label = "context",
+        .description = "show context-window usage",
         .setting = .statusline_context,
     },
     .{
-        .label = "Session",
-        .description = "Show the current session title",
+        .label = "session",
+        .description = "show the current session title",
         .setting = .statusline_session,
     },
     .{
-        .label = "Workspace",
-        .description = "Show the workspace path and Git branch",
+        .label = "workspace",
+        .description = "show the workspace path and git branch",
         .setting = .statusline_workspace,
     },
 };

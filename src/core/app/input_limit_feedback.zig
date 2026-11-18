@@ -36,8 +36,8 @@ pub fn report(
         .topic = "input",
         .tone = .@"error",
         .body = switch (owner) {
-            .composer => "That edit exceeds the local prompt safety limit and was not applied.",
-            .question_freeform, .approval_amendment => "That edit exceeds the input limit and was not applied.",
+            .composer => "that edit exceeds the local prompt safety limit and was not applied.",
+            .question_freeform, .approval_amendment => "that edit exceeds the input limit and was not applied.",
         },
     }, true);
 }

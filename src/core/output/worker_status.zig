@@ -212,7 +212,7 @@ test "worker status keeps fx's wording for terminal outcomes" {
         .attempt = 3,
         .cause = .response_interrupted,
     });
-    try expectLabel(&state, "⚠ Response ended early · stopped after 3 attempts", null, .danger);
+    try expectLabel(&state, "⚠ response ended early · stopped after 3 attempts", null, .danger);
 }
 
 test "worker status API state is sticky until explicitly cleared" {

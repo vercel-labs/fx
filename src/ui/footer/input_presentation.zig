@@ -251,7 +251,7 @@ fn questionInteractionHint(
     var counter_bufs: [2][96]u8 = undefined;
     var counters: [2][]const u8 = .{ "", "" };
     if (projection.asker.len > 0 and batch) {
-        counters[0] = std.mem.print(&counter_bufs[0], "{s} asks · Question {d} of {d}", .{
+        counters[0] = std.mem.print(&counter_bufs[0], "{s} asks · question {d} of {d}", .{
             projection.asker,
             projection.current_index + 1,
             projection.entry_count,
@@ -259,7 +259,7 @@ fn questionInteractionHint(
     } else if (projection.asker.len > 0) {
         counters[0] = std.mem.print(&counter_bufs[0], "{s} asks", .{projection.asker}) catch "";
     } else if (batch) {
-        counters[0] = std.mem.print(&counter_bufs[0], "Question {d} of {d}", .{
+        counters[0] = std.mem.print(&counter_bufs[0], "question {d} of {d}", .{
             projection.current_index + 1,
             projection.entry_count,
         }) catch "";
@@ -1855,12 +1855,12 @@ test "compose hint row yields the yolo warning to a pending ctrl+c quit hint" {
 
 fn syncHintTestQuestion(prompt: *question_prompt.QuestionPrompt) !void {
     const opts = [_]types.QuestionOption{
-        .{ .label = "Yes", .description = "go ahead" },
-        .{ .label = "No", .description = null },
-        .{ .label = "Maybe", .description = "decide later" },
+        .{ .label = "yes", .description = "go ahead" },
+        .{ .label = "no", .description = null },
+        .{ .label = "maybe", .description = "decide later" },
     };
     const entries = [_]types.QuestionBatchEntry{
-        .{ .question = "Should we proceed?", .options = &opts },
+        .{ .question = "should we proceed?", .options = &opts },
     };
     try prompt.syncFrom(std.testing.allocator, &entries);
 }
@@ -1908,13 +1908,13 @@ test "question hint row keeps batch progress while the hint narrows" {
     var prompt = question_prompt.QuestionPrompt{};
     defer prompt.deinit(std.testing.allocator);
     const opts = [_]types.QuestionOption{
-        .{ .label = "Yes", .description = null },
-        .{ .label = "No", .description = null },
+        .{ .label = "yes", .description = null },
+        .{ .label = "no", .description = null },
     };
     const entries = [_]types.QuestionBatchEntry{
-        .{ .question = "First?", .options = &opts },
-        .{ .question = "Second?", .options = &opts },
-        .{ .question = "Third?", .options = &opts },
+        .{ .question = "first?", .options = &opts },
+        .{ .question = "second?", .options = &opts },
+        .{ .question = "third?", .options = &opts },
     };
     try prompt.syncFrom(std.testing.allocator, &entries);
 
@@ -1928,13 +1928,13 @@ test "question hint row keeps batch progress while the hint narrows" {
         hint: []const u8,
         counter: []const u8,
     }{
-        .{ .width = 120, .freeform = false, .hint = "1–3 choose now    ↑↓ options    tab questions    enter answer    esc cancel", .counter = "  Question 1 of 3" },
-        .{ .width = 72, .freeform = false, .hint = predefined_batch_hints[0], .counter = "  Question 1 of 3" },
-        .{ .width = 44, .freeform = false, .hint = predefined_batch_hints[2], .counter = "  Question 1 of 3" },
+        .{ .width = 120, .freeform = false, .hint = "1–3 choose now    ↑↓ options    tab questions    enter answer    esc cancel", .counter = "  question 1 of 3" },
+        .{ .width = 72, .freeform = false, .hint = predefined_batch_hints[0], .counter = "  question 1 of 3" },
+        .{ .width = 44, .freeform = false, .hint = predefined_batch_hints[2], .counter = "  question 1 of 3" },
         .{ .width = 32, .freeform = false, .hint = predefined_batch_hints[2], .counter = "  1/3" },
         .{ .width = 26, .freeform = false, .hint = predefined_batch_hints[2], .counter = "" },
-        .{ .width = 120, .freeform = true, .hint = freeform_batch_hints[0], .counter = "  Question 1 of 3" },
-        .{ .width = 100, .freeform = true, .hint = freeform_batch_hints[1], .counter = "  Question 1 of 3" },
+        .{ .width = 120, .freeform = true, .hint = freeform_batch_hints[0], .counter = "  question 1 of 3" },
+        .{ .width = 100, .freeform = true, .hint = freeform_batch_hints[1], .counter = "  question 1 of 3" },
         .{ .width = 32, .freeform = true, .hint = freeform_batch_hints[4], .counter = "  1/3" },
     };
     for (cases) |case| {

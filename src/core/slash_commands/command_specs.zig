@@ -202,17 +202,17 @@ pub const SlashPresentationCategory = enum {
 
     pub fn label(self: SlashPresentationCategory) []const u8 {
         return switch (self) {
-            .general => "General",
-            .session => "Session",
-            .account => "Account",
-            .model => "Model",
-            .appearance => "Appearance",
-            .security => "Security",
-            .workspace => "Workspace",
-            .media => "Media",
-            .agents => "Agents",
-            .extensions => "Extensions",
-            .product => "Product",
+            .general => "general",
+            .session => "session",
+            .account => "account",
+            .model => "model",
+            .appearance => "appearance",
+            .security => "security",
+            .workspace => "workspace",
+            .media => "media",
+            .agents => "agents",
+            .extensions => "extensions",
+            .product => "product",
         };
     }
 };
@@ -372,12 +372,12 @@ pub fn renderTopLevelHelpWithStyle(alloc: Allocator, registry: TopLevelRegistry,
     try out.writer.writeByte('\n');
     try writeWrappedStyledLine(&out.writer, "", "", registry.interactive_hint, width, style, .muted);
 
-    try writeSectionHeading(&out.writer, style, "Usage:");
+    try writeSectionHeading(&out.writer, style, "usage:");
     try writeWrappedStyledLine(&out.writer, "  ", "  ", "fx [flags]", width, style, .syntax);
     try writeWrappedStyledLine(&out.writer, "  ", "  ", "fx [flags] \"<prompt>\"", width, style, .syntax);
     try writeWrappedStyledLine(&out.writer, "  ", "  ", "fx <command> [...flags] [...args]", width, style, .syntax);
 
-    try writeSectionHeading(&out.writer, style, "Commands:");
+    try writeSectionHeading(&out.writer, style, "commands:");
     for (registry.help_groups, 0..) |group, group_index| {
         if (group_index > 0) try out.writer.writeByte('\n');
         for (group.entries) |entry| {
@@ -385,13 +385,13 @@ pub fn renderTopLevelHelpWithStyle(alloc: Allocator, registry: TopLevelRegistry,
         }
     }
 
-    try writeSectionHeading(&out.writer, style, "Flags:");
+    try writeSectionHeading(&out.writer, style, "flags:");
     for (registry.flags) |flag| {
         try writeTopLevelFlag(&out.writer, flag, flag_usage_width, width, style);
     }
     try out.writer.writeByte('\n');
 
-    try writeStyled(&out.writer, style, .heading, "Examples:");
+    try writeStyled(&out.writer, style, .heading, "examples:");
     try out.writer.writeByte('\n');
     for (registry.examples) |example| {
         try writeTopLevelExample(&out.writer, example, width, style);
@@ -418,13 +418,13 @@ pub fn renderTopLevelCommandHelp(alloc: Allocator, registry: TopLevelRegistry, k
     try out.writer.writeAll(spec.help_title orelse spec.token);
     try out.writer.writeAll("\n\n");
     try out.writer.writeAll(spec.summary);
-    try out.writer.writeAll("\n\nUsage:\n");
+    try out.writer.writeAll("\n\nusage:\n");
     try out.writer.writeAll("  fx ");
     try out.writer.writeAll(spec.usage);
     try out.writer.writeByte('\n');
 
     if (spec.subcommands.len > 0) {
-        try out.writer.writeAll("\nCommands:\n");
+        try out.writer.writeAll("\ncommands:\n");
         try writeSubcommandRows(&out.writer, spec.subcommands, "", subcommandUsageWidth(spec.subcommands, 0));
     }
 
@@ -434,7 +434,7 @@ pub fn renderTopLevelCommandHelp(alloc: Allocator, registry: TopLevelRegistry, k
             if (opt.replacement == null and !opt.hidden) flag_width = @max(flag_width, opt.flag.len);
         }
 
-        try out.writer.writeAll("\nOptions:\n");
+        try out.writer.writeAll("\noptions:\n");
         for (spec.options) |opt| {
             if (opt.replacement != null or opt.hidden) continue;
             try out.writer.writeAll("  ");
@@ -1723,28 +1723,28 @@ test "rendered top-level help is a complete CLI navigation page" {
     const text = try testTopLevelHelpText(std.testing.allocator);
     defer std.testing.allocator.free(text);
 
-    try std.testing.expect(std.mem.startsWith(u8, text, "𝒇x v9.8.7\nFast, native coding agent for the terminal."));
+    try std.testing.expect(std.mem.startsWith(u8, text, "𝒇x v9.8.7\nfast, native coding agent for the terminal."));
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, text, "𝒇x"));
     try std.testing.expect(std.mem.find(u8, text, "fx starts an interactive session by default.") != null);
     try std.testing.expect(std.mem.find(u8, text, "fx <command> [...flags] [...args]") != null);
-    try std.testing.expect(std.mem.find(u8, text, "Commands:") != null);
+    try std.testing.expect(std.mem.find(u8, text, "commands:") != null);
     try std.testing.expect(std.mem.find(u8, text, "ask <prompt>") != null);
-    try std.testing.expect(std.mem.find(u8, text, "Run one noninteractive request") != null);
-    try std.testing.expect(std.mem.find(u8, text, "Draft or publish a GitHub issue") != null);
+    try std.testing.expect(std.mem.find(u8, text, "run one noninteractive request") != null);
+    try std.testing.expect(std.mem.find(u8, text, "draft or publish a GitHub issue") != null);
     try std.testing.expect(std.mem.find(u8, text, "credits|balance") != null);
     try std.testing.expect(std.mem.find(u8, text, "upgrade|update") != null);
-    try std.testing.expect(std.mem.find(u8, text, "Sign in to a model provider") != null);
-    try std.testing.expect(std.mem.find(u8, text, "Sign out of a model provider") != null);
-    try std.testing.expect(std.mem.find(u8, text, "Choose the active model provider") != null);
+    try std.testing.expect(std.mem.find(u8, text, "sign in to a model provider") != null);
+    try std.testing.expect(std.mem.find(u8, text, "sign out of a model provider") != null);
+    try std.testing.expect(std.mem.find(u8, text, "choose the active model provider") != null);
     // `fx setup` is deprecated and hidden; `fx login --api-key` replaces it.
-    try std.testing.expect(std.mem.find(u8, text, "Configure a Vercel AI Gateway API key") == null);
+    try std.testing.expect(std.mem.find(u8, text, "configure a Vercel AI gateway API key") == null);
     try std.testing.expect(std.mem.find(u8, text, "login [vercel|codex|grok] [--api-key]") != null);
-    try std.testing.expect(std.mem.find(u8, text, "Choose a Vercel AI Gateway team") != null);
-    try std.testing.expect(std.mem.find(u8, text, "Show Vercel AI Gateway credits") != null);
-    try std.testing.expect(std.mem.find(u8, text, "Sign in to Vercel or a selected provider") == null);
-    try std.testing.expect(std.mem.find(u8, text, "Flags:") != null);
+    try std.testing.expect(std.mem.find(u8, text, "choose a vercel AI gateway team") != null);
+    try std.testing.expect(std.mem.find(u8, text, "show vercel AI gateway credits") != null);
+    try std.testing.expect(std.mem.find(u8, text, "sign in to vercel or a selected provider") == null);
+    try std.testing.expect(std.mem.find(u8, text, "flags:") != null);
     try std.testing.expect(std.mem.find(u8, text, "--context-limit <spec>") != null);
-    try std.testing.expect(std.mem.find(u8, text, "Set name=bytes|off; repeatable") != null);
+    try std.testing.expect(std.mem.find(u8, text, "set name=bytes|off; repeatable") != null);
     try std.testing.expect(std.mem.find(u8, text, "--add-dir <path>") != null);
     try std.testing.expect(std.mem.find(u8, text, "-c, --continue") != null);
     try std.testing.expect(std.mem.find(u8, text, "-r") != null);
@@ -1756,16 +1756,16 @@ test "rendered top-level help is a complete CLI navigation page" {
     try std.testing.expect(std.mem.find(u8, text, "skill_description_bytes, skill_catalog_bytes") == null);
     try std.testing.expect(std.mem.find(u8, text, "FX_EXPERIMENTAL_WORKSPACE_ACCESS=1") == null);
     try std.testing.expect(std.mem.find(u8, text, "Supported for interactive, resume, ask, ACP, PR, and issue launches") == null);
-    try std.testing.expect(std.mem.find(u8, text, "Examples:") != null);
+    try std.testing.expect(std.mem.find(u8, text, "examples:") != null);
     try std.testing.expect(std.mem.find(u8, text, "fx ask \"Explain the changes in this repository\"") != null);
     try std.testing.expect(std.mem.find(u8, text, "fx session resume last") != null);
     try std.testing.expect(std.mem.find(u8, text, "session resume [last|id]") != null);
     try std.testing.expect(std.mem.find(u8, text, "fx status --json") != null);
-    try std.testing.expect(std.mem.find(u8, text, "Run `fx <command> --help` for command-specific usage and options.") != null);
+    try std.testing.expect(std.mem.find(u8, text, "run `fx <command> --help` for command-specific usage and options.") != null);
     try std.testing.expect(std.mem.find(u8, text, "command-specific options and examples") == null);
-    try std.testing.expect(std.mem.find(u8, text, "Run `/help` inside an interactive session for slash commands.") != null);
-    try std.testing.expect(std.mem.find(u8, text, "Learn more about fx:  https://fx.sh/docs") != null);
-    try std.testing.expect(std.mem.find(u8, text, "\nReport a problem:     run `/feedback` inside fx\n") != null);
+    try std.testing.expect(std.mem.find(u8, text, "run `/help` inside an interactive session for slash commands.") != null);
+    try std.testing.expect(std.mem.find(u8, text, "learn more about fx:  https://fx.sh/docs") != null);
+    try std.testing.expect(std.mem.find(u8, text, "\nreport a problem:     run `/feedback` inside fx\n") != null);
     try std.testing.expect(std.mem.find(u8, text, "\n\n\nRun `fx <command> --help`") == null);
     try std.testing.expect(std.mem.find(u8, text, "Start:") == null);
     try std.testing.expect(std.mem.find(u8, text, "  Work      ") == null);
@@ -1778,8 +1778,8 @@ test "top-level help summary overrides do not change command-specific help" {
     const login = try renderTopLevelCommandHelp(std.testing.allocator, testTopLevelRegistry(), .login);
     defer std.testing.allocator.free(login);
 
-    try std.testing.expect(std.mem.find(u8, login, "Sign in to Vercel or a selected provider") != null);
-    try std.testing.expect(std.mem.find(u8, login, "Sign in to a model provider") == null);
+    try std.testing.expect(std.mem.find(u8, login, "sign in to vercel or a selected provider") != null);
+    try std.testing.expect(std.mem.find(u8, login, "sign in to a model provider") == null);
 }
 
 test "terminal top-level help adds styling without changing visible content" {
@@ -1792,9 +1792,9 @@ test "terminal top-level help adds styling without changing visible content" {
 
     try std.testing.expect(std.mem.find(u8, plain, "\x1b[") == null);
     try std.testing.expect(std.mem.startsWith(u8, terminal, "\x1b[1m𝒇x\x1b[0m"));
-    try std.testing.expect(std.mem.find(u8, terminal, "\x1b[1mUsage:\x1b[0m") != null);
+    try std.testing.expect(std.mem.find(u8, terminal, "\x1b[1musage:\x1b[0m") != null);
     try std.testing.expect(std.mem.find(u8, terminal, "\x1b[39mask <prompt>\x1b[0m") != null);
-    try std.testing.expect(std.mem.find(u8, terminal, "\x1b[38;5;243mFast, native coding agent") != null);
+    try std.testing.expect(std.mem.find(u8, terminal, "\x1b[38;5;243mfast, native coding agent") != null);
     try std.testing.expect(std.mem.find(u8, terminal, "\x1b[4mhttps://fx.sh/docs\x1b[0m") != null);
     try std.testing.expect(std.mem.find(u8, terminal, "\x1b[39mrun `/feedback` inside fx\x1b[0m") != null);
     try std.testing.expect(std.mem.find(u8, terminal, "\x1b[38;5;252m") == null);
@@ -1808,13 +1808,13 @@ test "top-level help renders flags as compact aligned rows" {
     const narrow = try renderTopLevelHelp(std.testing.allocator, testTopLevelRegistry(), 60, "9.8.7");
     defer std.testing.allocator.free(narrow);
 
-    try std.testing.expect(lineContainsBoth(wide, "--context-limit <spec>", "Set name=bytes|off; repeatable"));
-    try std.testing.expect(lineContainsBoth(wide, "--add-dir <path>", "Add a workspace directory; repeatable"));
-    try std.testing.expect(lineContainsBoth(wide, "-c, --continue", "Resume the remembered workspace session"));
-    try std.testing.expect(lineContainsBoth(wide, "-r, --resume [last|<id>]", "Pick a saved session, or resume the latest or an exact ID"));
-    try std.testing.expect(std.mem.find(u8, wide, "Print the fx version and exit\n\nExamples:") != null);
-    try std.testing.expect(std.mem.find(u8, wide, "List available models\n\n  teams") != null);
-    try std.testing.expect(std.mem.find(u8, wide, "Show Vercel AI Gateway credits\n\n  usage") != null);
+    try std.testing.expect(lineContainsBoth(wide, "--context-limit <spec>", "set name=bytes|off; repeatable"));
+    try std.testing.expect(lineContainsBoth(wide, "--add-dir <path>", "add a workspace directory; repeatable"));
+    try std.testing.expect(lineContainsBoth(wide, "-c, --continue", "resume the remembered workspace session"));
+    try std.testing.expect(lineContainsBoth(wide, "-r, --resume [last|<id>]", "pick a saved session, or resume the latest or an exact ID"));
+    try std.testing.expect(std.mem.find(u8, wide, "print the fx version and exit\n\nexamples:") != null);
+    try std.testing.expect(std.mem.find(u8, wide, "list available models\n\n  teams") != null);
+    try std.testing.expect(std.mem.find(u8, wide, "show vercel AI gateway credits\n\n  usage") != null);
     try expectAllLinesFit(narrow, 60);
 }
 
@@ -1827,7 +1827,7 @@ test "command help lists subcommands under Commands, nested words with their par
         .subcommands = &.{
             .{ .usage = "list", .description = "List servers" },
             .{ .usage = "trust", .description = "", .subcommands = &.{
-                .{ .usage = "approve NAME", .description = "Approve a server" },
+                .{ .usage = "approve NAME", .description = "approve a server" },
                 .{ .usage = "reset", .description = "Forget approvals" },
             } },
         },
@@ -1836,9 +1836,9 @@ test "command help lists subcommands under Commands, nested words with their par
     const text = try renderTopLevelCommandHelp(std.testing.allocator, registry, .mcp);
     defer std.testing.allocator.free(text);
     try std.testing.expect(std.mem.find(u8, text,
-        \\Commands:
+        \\commands:
         \\  list                List servers
-        \\  trust approve NAME  Approve a server
+        \\  trust approve NAME  approve a server
         \\  trust reset         Forget approvals
         \\
     ) != null);
@@ -1874,18 +1874,18 @@ test "per-command help renders header usage options and details" {
     defer std.testing.allocator.free(text);
 
     try std.testing.expect(std.mem.find(u8, text, "fx permissions\n") != null);
-    try std.testing.expect(std.mem.find(u8, text, "Usage:\n  fx permissions [--json]") != null);
-    try std.testing.expect(std.mem.find(u8, text, "Options:") != null);
+    try std.testing.expect(std.mem.find(u8, text, "usage:\n  fx permissions [--json]") != null);
+    try std.testing.expect(std.mem.find(u8, text, "options:") != null);
     try std.testing.expect(std.mem.find(u8, text, "--json") != null);
-    try std.testing.expect(std.mem.find(u8, text, "Modes:") != null);
+    try std.testing.expect(std.mem.find(u8, text, "modes:") != null);
 }
 
 test "per-command help preserves long resume usage without debug recording" {
     const text = try renderTopLevelCommandHelp(std.testing.allocator, testTopLevelRegistry(), .@"resume");
     defer std.testing.allocator.free(text);
 
-    try std.testing.expect(std.mem.find(u8, text, "Usage:\n  fx session resume [last|<id>] | -r, --resume [last|<id>] | --continue | -c") != null);
-    try std.testing.expect(std.mem.find(u8, text, "Options:") != null);
+    try std.testing.expect(std.mem.find(u8, text, "usage:\n  fx session resume [last|<id>] | -r, --resume [last|<id>] | --continue | -c") != null);
+    try std.testing.expect(std.mem.find(u8, text, "options:") != null);
     try std.testing.expect(std.mem.find(u8, text, "--record") == null);
 }
 
@@ -1894,7 +1894,7 @@ test "ACP help documents accepted options" {
     defer std.testing.allocator.free(text);
 
     try std.testing.expect(std.mem.find(u8, text, "fx acp\n") != null);
-    try std.testing.expect(std.mem.find(u8, text, "Usage:\n  fx acp [--permission-mode <mode>|--ask|--auto|--full-access] [--provider <name>] [--model <id>] [--effort <level>] [--fast|--no-fast] [--ultrafast|--no-ultrafast] [--log-file <path>]") != null);
+    try std.testing.expect(std.mem.find(u8, text, "usage:\n  fx acp [--permission-mode <mode>|--ask|--auto|--full-access] [--provider <name>] [--model <id>] [--effort <level>] [--fast|--no-fast] [--ultrafast|--no-ultrafast] [--log-file <path>]") != null);
     try std.testing.expect(std.mem.find(u8, text, "--model <id>") != null);
     try std.testing.expect(std.mem.find(u8, text, "--effort <level>") != null);
     try std.testing.expect(std.mem.find(u8, text, "--log-file <path>") != null);
@@ -1968,7 +1968,7 @@ test "slash completion categories follow canonical entries" {
     const registry = testSlashRegistry();
     try std.testing.expectEqual(SlashPresentationCategory.general, nthSlashCompletionCategory(registry, "/he", 0).?);
     try std.testing.expectEqual(SlashPresentationCategory.account, nthSlashCompletionCategory(registry, "/us", 0).?);
-    try std.testing.expectEqualStrings("General", SlashPresentationCategory.general.label());
+    try std.testing.expectEqualStrings("general", SlashPresentationCategory.general.label());
     try std.testing.expect(nthSlashCompletionCategory(registry, "/permissions ", 0) == null);
 }
 
@@ -2301,7 +2301,7 @@ test "slash completion descriptions follow completion matches" {
     try std.testing.expectEqualStrings("open the fx feedback form", nthSlashCompletionDescription(testSlashRegistry(), "/fee", 0).?);
     try std.testing.expectEqualStrings("copy a private diagnostic trace as JSONL", nthSlashCompletionDescription(testSlashRegistry(), "/tr", 0).?);
     try std.testing.expectEqualStrings("summarize context into a fresh window", nthSlashCompletionDescription(testSlashRegistry(), "/comp", 0).?);
-    try std.testing.expectEqualStrings("toggle Fast mode when supported", nthSlashCompletionDescription(testSlashRegistry(), "/fa", 0).?);
+    try std.testing.expectEqualStrings("toggle fast mode when supported", nthSlashCompletionDescription(testSlashRegistry(), "/fa", 0).?);
 }
 
 test "slash completion aliases participate in ranked order" {
@@ -2353,25 +2353,25 @@ test "top-level help lines fit representative terminal widths" {
     }
 }
 
-pub const slack_options = [_]OptionDoc{.{ .flag = "--json", .description = "Emit installation metadata without credentials" }};
+pub const slack_options = [_]OptionDoc{.{ .flag = "--json", .description = "emit installation metadata without credentials" }};
 
 pub const slack_install_spec: TopLevelSpec = .{
     .kind = .slack,
     .token = "slack",
     .usage = "slack <install|status|refresh> [--json]",
-    .summary = "Install and manage the workspace Slack bot locally",
+    .summary = "install and manage the workspace slack bot locally",
     .subcommands = &.{
-        .{ .usage = "install", .description = "Authorize the bot through fx.sh and save its credentials", .options = &slack_options },
-        .{ .usage = "status", .description = "Show the local installation", .options = &slack_options },
-        .{ .usage = "refresh", .description = "Renew the bot's tokens without the browser", .options = &slack_options },
+        .{ .usage = "install", .description = "authorize the bot through fx.sh and save its credentials", .options = &slack_options },
+        .{ .usage = "status", .description = "show the local installation", .options = &slack_options },
+        .{ .usage = "refresh", .description = "renew the bot's tokens without the browser", .options = &slack_options },
     },
     .options = &slack_options,
     .details = &.{
-        "install opens Slack authorization through fx.sh and saves the bot credentials on this computer.",
+        "install opens slack authorization through fx.sh and saves the bot credentials on this computer.",
         "status shows local installation metadata; refresh renews tokens without browser authorization.",
-        "This is a workspace bot installer. Employee MCP login remains fx mcp login NAME.",
-        "Credentials are saved in ~/.fx/slack/installation.json with owner-only permissions.",
-        "Refresh runs only when requested; no background service is installed.",
+        "this is a workspace bot installer. employee MCP login remains fx mcp login NAME.",
+        "credentials are saved in ~/.fx/slack/installation.json with owner-only permissions.",
+        "refresh runs only when requested; no background service is installed.",
     },
 };
 

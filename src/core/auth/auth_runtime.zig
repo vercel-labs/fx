@@ -499,10 +499,10 @@ pub fn preparationError(failure: CredentialFailure) ?CredentialPreparationError 
 
 pub fn preparationFailureNotice(err: anyerror) ?[]const u8 {
     return switch (err) {
-        error.CredentialStorageUnavailable => "Saved credential storage is unavailable. Check the saved credential, then retry.",
-        error.CredentialTemporarilyUnavailable => "Credential refresh is temporarily unavailable. Retry shortly.",
-        error.CredentialRefreshPersistenceUncertain => "Credential could not be saved. Check authentication storage before signing in again.",
-        error.CredentialAuthorityChanged => "The credential account or team changed. Review authentication before retrying.",
+        error.CredentialStorageUnavailable => "saved credential storage is unavailable. check the saved credential, then retry.",
+        error.CredentialTemporarilyUnavailable => "credential refresh is temporarily unavailable. retry shortly.",
+        error.CredentialRefreshPersistenceUncertain => "credential could not be saved. check authentication storage before signing in again.",
+        error.CredentialAuthorityChanged => "the credential account or team changed. review authentication before retrying.",
         error.ConfiguredProviderChanged, error.ConfiguredProviderRemoved => config_runtime.sessionConnectionNotice(err),
         else => null,
     };
@@ -1797,15 +1797,15 @@ pub const PickerView = struct {
             .provider => |provider| provider_catalog.label(provider),
             .source => |source| credentials.sourceLabel(source),
             .action => |action| switch (action) {
-                .connections => "Connections",
-                .login => "Sign in with Vercel",
-                .chatgpt_login => "Sign in with Codex",
-                .grok_login => "Sign in with Grok",
-                .setup => if (self.include_skip) "Add an API key" else "API key",
-                .change_team => "Change team",
-                .switch_credential => "Switch credential",
-                .switch_provider => "Switch provider",
-                .automatic => "Automatic",
+                .connections => "connections",
+                .login => "sign in with vercel",
+                .chatgpt_login => "sign in with codex",
+                .grok_login => "sign in with grok",
+                .setup => if (self.include_skip) "add an API key" else "API key",
+                .change_team => "change team",
+                .switch_credential => "switch credential",
+                .switch_provider => "switch provider",
+                .automatic => "automatic",
             },
             .team => |index| if (index < self.teams.len) self.teams[index].name else "",
         };
@@ -1939,8 +1939,8 @@ pub const StatusSnapshot = struct {
         if (self.active_source != null) return null;
         if (self.stored_key_status == .unavailable) {
             if (self.required_source == .stored_key) return switch (surface) {
-                .cli => "The selected stored API key could not be read from " ++ credentials.stored_key_backend_label ++ ". Start fx and open /provider to choose an available credential; no other credential was selected.",
-                .interactive => "The selected stored API key could not be read from " ++ credentials.stored_key_backend_label ++ ". Run /provider to choose an available credential; no other credential was selected.",
+                .cli => "the selected stored API key could not be read from " ++ credentials.stored_key_backend_label ++ ". start fx and open /provider to choose an available credential; no other credential was selected.",
+                .interactive => "the selected stored API key could not be read from " ++ credentials.stored_key_backend_label ++ ". run /provider to choose an available credential; no other credential was selected.",
             };
             return credentials.unreadable_store_message;
         }
@@ -1953,21 +1953,21 @@ pub const StatusSnapshot = struct {
         };
         const required_source = self.required_source orelse return automatic_help;
         return switch (required_source) {
-            .vercel_oidc_token => "VERCEL_OIDC_TOKEN is selected but unavailable. Set VERCEL_OIDC_TOKEN before starting fx; no other credential was selected.",
-            .ai_gateway_api_key => "AI_GATEWAY_API_KEY is selected but unavailable. Set AI_GATEWAY_API_KEY before starting fx; no other credential was selected.",
+            .vercel_oidc_token => "VERCEL_OIDC_TOKEN is selected but unavailable. set VERCEL_OIDC_TOKEN before starting fx; no other credential was selected.",
+            .ai_gateway_api_key => "AI_GATEWAY_API_KEY is selected but unavailable. set AI_GATEWAY_API_KEY before starting fx; no other credential was selected.",
             .stored_key => switch (surface) {
-                .cli => "A stored API key is selected but unavailable. Start fx and open /provider to choose an available credential; no other credential was selected.",
-                .interactive => "A stored API key is selected but unavailable. Run /provider to choose an available credential; no other credential was selected.",
+                .cli => "a stored API key is selected but unavailable. start fx and open /provider to choose an available credential; no other credential was selected.",
+                .interactive => "a stored API key is selected but unavailable. run /provider to choose an available credential; no other credential was selected.",
             },
             .fx_login => switch (surface) {
                 .cli => if (self.fx_login_status == .unavailable)
-                    "The saved fx login could not be loaded. Run fx login to repair this source; no other credential was selected."
+                    "the saved fx login could not be loaded. run fx login to repair this source; no other credential was selected."
                 else
-                    "fx login is selected but unavailable. Run fx login to reconnect; no other credential was selected.",
+                    "fx login is selected but unavailable. run fx login to reconnect; no other credential was selected.",
                 .interactive => if (self.fx_login_status == .unavailable)
-                    "The saved fx login could not be loaded. Run /login to repair this source; no other credential was selected."
+                    "the saved fx login could not be loaded. run /login to repair this source; no other credential was selected."
                 else
-                    "fx login is selected but unavailable. Run /login to reconnect; no other credential was selected.",
+                    "fx login is selected but unavailable. run /login to reconnect; no other credential was selected.",
             },
             .chatgpt_subscription => switch (surface) {
                 .cli => credentials.missing_chatgpt_credential_message,
@@ -1978,7 +1978,7 @@ pub const StatusSnapshot = struct {
                 .interactive => credentials.missing_grok_interactive_credential_message,
             },
             .host_managed => automatic_help,
-            .configured => "The configured provider credential is unavailable. Check its auth environment variable in settings.json; no other provider was selected.",
+            .configured => "the configured provider credential is unavailable. check its auth environment variable in settings.json; no other provider was selected.",
         };
     }
 
@@ -4716,9 +4716,9 @@ test "auth status names each explicit key source and its recovery" {
         cli_recovery: []const u8,
         interactive_recovery: []const u8,
     }{
-        .{ .source = .vercel_oidc_token, .label = "VERCEL_OIDC_TOKEN", .cli_recovery = "Set VERCEL_OIDC_TOKEN before starting fx", .interactive_recovery = "Set VERCEL_OIDC_TOKEN before starting fx" },
-        .{ .source = .ai_gateway_api_key, .label = "AI_GATEWAY_API_KEY", .cli_recovery = "Set AI_GATEWAY_API_KEY before starting fx", .interactive_recovery = "Set AI_GATEWAY_API_KEY before starting fx" },
-        .{ .source = .stored_key, .label = "stored API key", .cli_recovery = "Start fx and open /provider", .interactive_recovery = "Run /provider" },
+        .{ .source = .vercel_oidc_token, .label = "VERCEL_OIDC_TOKEN", .cli_recovery = "set VERCEL_OIDC_TOKEN before starting fx", .interactive_recovery = "set VERCEL_OIDC_TOKEN before starting fx" },
+        .{ .source = .ai_gateway_api_key, .label = "AI_GATEWAY_API_KEY", .cli_recovery = "set AI_GATEWAY_API_KEY before starting fx", .interactive_recovery = "set AI_GATEWAY_API_KEY before starting fx" },
+        .{ .source = .stored_key, .label = "stored API key", .cli_recovery = "start fx and open /provider", .interactive_recovery = "run /provider" },
     };
     for (cases) |case| {
         const status = StatusSnapshot{ .required_source = case.source };
@@ -4758,10 +4758,10 @@ test "auth status keeps an unavailable explicit fx login distinct from automatic
             .fx_login_status = read_status,
         };
         const help = status.missingHelp(.cli).?;
-        try std.testing.expect(std.mem.find(u8, help, "Run fx login") != null);
+        try std.testing.expect(std.mem.find(u8, help, "run fx login") != null);
         try std.testing.expect(std.mem.find(u8, help, "no other credential was selected") != null);
         const interactive = status.missingHelp(.interactive).?;
-        try std.testing.expect(std.mem.find(u8, interactive, "Run /login") != null);
+        try std.testing.expect(std.mem.find(u8, interactive, "run /login") != null);
         try std.testing.expect(std.mem.find(u8, interactive, "no other credential was selected") != null);
     }
 }
@@ -5252,7 +5252,7 @@ test "auth picker navigation wraps across the four setup sections" {
     runtime.openPicker(alloc);
 
     try std.testing.expect(runtime.movePicker(1));
-    try std.testing.expectEqualStrings("Switch provider", runtime.pickerView().choiceLabel(runtime.pickerView().selected_choice.?));
+    try std.testing.expectEqualStrings("switch provider", runtime.pickerView().choiceLabel(runtime.pickerView().selected_choice.?));
     try std.testing.expect(runtime.movePicker(1));
     try std.testing.expect((Choice{ .action = .change_team }).eql(runtime.pickerView().selected_choice.?));
     try std.testing.expect(runtime.movePicker(1));
@@ -5353,7 +5353,7 @@ test "auth onboarding picker exposes the setup paths" {
     try std.testing.expect((Choice{ .action = .chatgpt_login }).eql(picker.choiceAt(1).?));
     try std.testing.expect((Choice{ .action = .grok_login }).eql(picker.choiceAt(2).?));
     try std.testing.expect((Choice{ .action = .setup }).eql(picker.choiceAt(3).?));
-    try std.testing.expectEqualStrings("Add an API key", picker.choiceLabel(picker.choiceAt(3).?));
+    try std.testing.expectEqualStrings("add an API key", picker.choiceLabel(picker.choiceAt(3).?));
     try std.testing.expect(picker.choiceAt(4) == null);
 }
 
@@ -5422,7 +5422,7 @@ test "provider stage pops to its setup root action" {
     const root_view = runtime.pickerView();
     try std.testing.expect(root_view.active);
     try std.testing.expectEqual(PickerStage.root, root_view.stage);
-    try std.testing.expectEqualStrings("Switch provider", root_view.choiceLabel(root_view.selected_choice.?));
+    try std.testing.expectEqualStrings("switch provider", root_view.choiceLabel(root_view.selected_choice.?));
 }
 
 test "change team stage owns fetched rows and releases them when popped" {

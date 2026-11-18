@@ -131,7 +131,7 @@ test "a call's label masks secrets, also ones a cut would split" {
     // first, the 15 bytes of it that would show, "Bearer qrelayfi", are too
     // short to be found as a token.
     const pad: [133]u8 = @splat('x');
-    const late = out[0..storeLabel(&out, "Running " ++ pad ++ " Bearer qrelayfixturetoken")];
+    const late = out[0..storeLabel(&out, "running " ++ pad ++ " Bearer qrelayfixturetoken")];
     try std.testing.expect(std.mem.find(u8, late, "qrelay") == null);
     try std.testing.expect(std.mem.endsWith(u8, late, "[redacted]"));
 }
@@ -148,7 +148,7 @@ test "a call's label stays one line, terminal-safe, and bounded" {
     try std.testing.expect(std.mem.findScalar(u8, escape, 0x1b) == null);
 
     const xs: [4000]u8 = @splat('x');
-    const long = "Running " ++ xs;
+    const long = "running " ++ xs;
     const cut = out[0..storeLabel(&out, long)];
     try std.testing.expect(cut.len <= max_label_bytes);
     try std.testing.expect(std.mem.endsWith(u8, cut, ellipsis));

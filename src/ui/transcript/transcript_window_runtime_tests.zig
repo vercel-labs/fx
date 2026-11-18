@@ -255,14 +255,14 @@ test "a transcript window drop never removes a pinned tool line" {
     const alloc = std.testing.allocator;
     var runtime = testRuntime(alloc);
     defer runtime.deinit(alloc);
-    const done = try runtime.appendRawTranscriptEntryClassified(alloc, "● Read done.txt\n", .tool_status);
-    const pinned = try runtime.appendRawTranscriptEntryClassified(alloc, "● Running\n", .tool_status);
+    const done = try runtime.appendRawTranscriptEntryClassified(alloc, "● read done.txt\n", .tool_status);
+    const pinned = try runtime.appendRawTranscriptEntryClassified(alloc, "● running\n", .tool_status);
     for (runtime.notebook.entries.items) |*entry| {
         if (entry.id() == pinned) entry.raw_bytes.lifecycle_pinned = true;
     }
     try std.testing.expect(try transcript_store.dropEntriesAtomic(&runtime, alloc, &.{ done, pinned }));
     try std.testing.expect(!holds(&runtime, "done.txt"));
-    try std.testing.expect(holds(&runtime, "Running"));
+    try std.testing.expect(holds(&runtime, "running"));
 }
 
 test "the transcript window releases its held drops when the screen is cleared for a replay" {

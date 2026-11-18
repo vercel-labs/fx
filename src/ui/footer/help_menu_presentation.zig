@@ -58,7 +58,7 @@ fn frameSpec(projection: *const HelpMenuProjection, row_budget: u16) menu_frame.
     const count = projection.filteredItemCount();
     return .{
         .title = "commands",
-        .active_tab = if (projection.category) |category| category.label() else "All",
+        .active_tab = if (projection.category) |category| category.label() else "all",
         .ctx = projection,
         .item_count = count,
         .column_count = 2,
@@ -120,7 +120,7 @@ test "help menu draws the shared frame: gray title with its category, aligned co
     defer alloc.free(text);
     // The tall budget the footer offers still gives the lean height.
     try std.testing.expectEqualStrings(
-        \\commands   < All >
+        \\commands   < all >
         \\
         \\  /help        show available slash commands
         \\  /status      show runtime configuration
@@ -158,7 +158,7 @@ test "help menu names the active category and says why the list is empty" {
     const media: HelpMenuProjection = .{ .active = true, .registry = help_menu_test_registry, .category = .media };
     const media_text = try renderPlain(alloc, media, 80, 22);
     defer alloc.free(media_text);
-    try std.testing.expect(std.mem.startsWith(u8, media_text, "commands   < Media >\n\n  /paste"));
+    try std.testing.expect(std.mem.startsWith(u8, media_text, "commands   < media >\n\n  /paste"));
     try std.testing.expect(std.mem.find(u8, media_text, "General") == null);
 
     const missing: HelpMenuProjection = .{ .active = true, .registry = help_menu_test_registry, .query = "no command can match this query" };

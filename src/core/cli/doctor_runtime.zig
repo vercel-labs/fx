@@ -972,7 +972,7 @@ test "doctor startup check fails when the provider has no model to run" {
     try std.testing.expectEqualStrings("", snapshot.model);
     try std.testing.expectEqual(@as(usize, 7), snapshot.agent_step_limit);
     try std.testing.expectEqual(CheckStatus.fail, checks.items[0].status);
-    try std.testing.expect(std.mem.startsWith(u8, checks.items[0].detail, "no Codex model is selected;"));
+    try std.testing.expect(std.mem.startsWith(u8, checks.items[0].detail, "no codex model is selected;"));
 
     try appendResolvedStartupCheck(&snapshot, &checks, alloc, .{ .provider = .codex, .model = "gpt-saved" }, .{}, 25);
     defer if (snapshot.owned_model) |model| alloc.free(model);

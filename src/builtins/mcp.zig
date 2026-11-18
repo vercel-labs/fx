@@ -838,7 +838,7 @@ test "fx mcp approve saves the approval of a project server" {
         .hosts = .{ .context = &hosts, .get = Hosts.get, .release = Hosts.release, .changed = Hosts.changed },
     }, &.{ "approve", "fixture" });
     try std.testing.expectEqualStrings("", err.written());
-    try std.testing.expectEqualStrings("Approved fixture, which runs: fixture-server\n", out.written());
+    try std.testing.expectEqualStrings("approved fixture, which runs: fixture-server\n", out.written());
     try std.testing.expectEqual(@as(u8, 0), code);
 
     var choices = try config_runtime.loadProjectMcpChoices(alloc, workspace_root);

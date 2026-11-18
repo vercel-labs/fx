@@ -45,6 +45,14 @@ const relative_age_limit_ms = 7 * std.time.ms_per_day;
 
 const Paint = enum { plain, bold, dim, green, yellow };
 
+/// A session's title as the list shows it. One with no title reads
+/// "untitled session"; the saved fallback keeps its capital, which older
+/// sessions recorded and `session_adapter` matches.
+fn shownTitle(title: ?[]const u8) []const u8 {
+    const shown = title orelse session_display_metadata.fallback_title;
+    return if (std.mem.eql(u8, shown, session_display_metadata.fallback_title)) "untitled session" else shown;
+}
+
 fn ansi(paint: Paint) []const u8 {
     return switch (paint) {
         .plain => "",
@@ -240,7 +248,7 @@ fn commonModel(sessions: []const session_store.LiveSession, order: []const usize
 /// `fx sessions --live`.
 pub fn writeLive(writer: *std.Io.Writer, alloc: Allocator, sessions: []const session_store.LiveSession, all_workspaces: bool, style: Style) !void {
     if (sessions.len == 0) {
-        return writer.writeAll(if (all_workspaces) "No live sessions.\n" else "No live sessions in this workspace.\n");
+        return writer.writeAll(if (all_workspaces) "no live sessions.\n" else "no live sessions in this workspace.\n");
     }
     var arena_state = std.heap.ArenaAllocator.init(alloc);
     defer arena_state.deinit();
@@ -272,7 +280,7 @@ pub fn writeLive(writer: *std.Io.Writer, alloc: Allocator, sessions: []const ses
     try writer.writeByte('\n');
     if (common) |model| {
         try writePainted(writer, style.color, .dim, &.{
-            "Model ",
+            "model ",
             try safe(arena, model),
             if (other_models) ", unless the MODEL column names another" else "",
         });
@@ -291,7 +299,7 @@ pub fn writeLive(writer: *std.Io.Writer, alloc: Allocator, sessions: []const ses
         const entry = sessions[index];
         const cells = try arena.alloc(Cell, columns.items.len);
         @memset(cells, .{});
-        cells[0] = .{ .text = try safe(arena, entry.summary.title orelse session_display_metadata.fallback_title) };
+        cells[0] = .{ .text = try safe(arena, shownTitle(entry.summary.title)) };
         cells[1] = stateCell(entry.state);
         cells[2] = .{ .text = try age(arena, entry.summary.updated_at_ms, style.now_ms), .paint = .dim };
         cells[3] = .{ .text = try safe(arena, entry.summary.id) };
@@ -311,9 +319,9 @@ pub fn writeLive(writer: *std.Io.Writer, alloc: Allocator, sessions: []const ses
     try writeTable(writer, arena, style, columns.items, rows.items);
 
     try writer.writeByte('\n');
-    try writeHint(writer, arena, style.color, "Read a session", "fx session <session id> --tail 5");
-    try writeHint(writer, arena, style.color, "Read a subagent", "fx session <session id>/<name> --tail 5");
-    try writeHint(writer, arena, style.color, "Every field", if (all_workspaces) "fx sessions --live --all --json" else "fx sessions --live --json");
+    try writeHint(writer, arena, style.color, "read a session", "fx session <session id> --tail 5");
+    try writeHint(writer, arena, style.color, "read a subagent", "fx session <session id>/<name> --tail 5");
+    try writeHint(writer, arena, style.color, "every field", if (all_workspaces) "fx sessions --live --all --json" else "fx sessions --live --json");
 }
 
 /// One row per subagent below its parent's, its branches drawn from
@@ -342,13 +350,13 @@ pub fn writeSaved(writer: *std.Io.Writer, alloc: Allocator, list: Saved, style: 
     const where = if (list.all_workspaces) "in all workspaces" else "in this workspace";
 
     if (list.sessions.len == 0) {
-        try writer.print("No {s}saved sessions {s}.\n", .{ if (list.skipped_invalid > 0) "readable " else "", where });
+        try writer.print("no {s}saved sessions {s}.\n", .{ if (list.skipped_invalid > 0) "readable " else "", where });
         return writeSkipped(writer, arena, style.color, list.skipped_invalid);
     }
 
     const count = try arena.print("{d} saved session{s} {s}", .{ list.sessions.len, plural(list.sessions.len), where });
     if (list.has_more) {
-        try writePainted(writer, style.color, .bold, &.{ "Newest ", count });
+        try writePainted(writer, style.color, .bold, &.{ "newest ", count });
     } else {
         try writePainted(writer, style.color, .bold, &.{count});
         try writePainted(writer, style.color, .dim, &.{", newest first"});
@@ -362,7 +370,7 @@ pub fn writeSaved(writer: *std.Io.Writer, alloc: Allocator, list: Saved, style: 
     const rows = try arena.alloc(Row, list.sessions.len);
     for (list.sessions, rows) |entry, *row| {
         const cells = try arena.alloc(Cell, columns.items.len);
-        cells[0] = .{ .text = try safe(arena, entry.title orelse session_display_metadata.fallback_title) };
+        cells[0] = .{ .text = try safe(arena, shownTitle(entry.title)) };
         cells[1] = .{ .text = try arena.print("{d}", .{entry.history_len}) };
         cells[2] = .{ .text = try age(arena, entry.updated_at_ms, style.now_ms), .paint = .dim };
         cells[3] = .{ .text = try safe(arena, entry.id) };
@@ -373,17 +381,17 @@ pub fn writeSaved(writer: *std.Io.Writer, alloc: Allocator, list: Saved, style: 
 
     try writer.writeByte('\n');
     if (list.has_more) if (list.next_cursor) |cursor| {
-        try writeHint(writer, arena, style.color, "More", try arena.print("fx sessions {s}--cursor {s}", .{ if (list.all_workspaces) "--all " else "", cursor }));
+        try writeHint(writer, arena, style.color, "more", try arena.print("fx sessions {s}--cursor {s}", .{ if (list.all_workspaces) "--all " else "", cursor }));
     };
-    try writeHint(writer, arena, style.color, "Read a session", "fx session <session id> --tail 5");
-    try writeHint(writer, arena, style.color, "Running now", "fx sessions --live");
+    try writeHint(writer, arena, style.color, "read a session", "fx session <session id> --tail 5");
+    try writeHint(writer, arena, style.color, "running now", "fx sessions --live");
     try writeSkipped(writer, arena, style.color, list.skipped_invalid);
 }
 
 fn writeSkipped(writer: *std.Io.Writer, arena: Allocator, color: bool, skipped: usize) !void {
     if (skipped == 0) return;
     try writePainted(writer, color, .yellow, &.{try arena.print(
-        "Skipped {d} unreadable saved session{s}; run `fx doctor` for recovery guidance",
+        "skipped {d} unreadable saved session{s}; run `fx doctor` for recovery guidance",
         .{ skipped, plural(skipped) },
     )});
     try writer.writeByte('\n');
@@ -428,27 +436,27 @@ test "a live list puts working sessions first, each subagent in a tree, and each
     const scout: session_store.LiveAgent = .{ .name = "scout", .address = "abc/scout", .id = "s1", .state = .idle, .agents = &.{} };
     const sessions = [_]session_store.LiveSession{
         .{ .summary = summaryAt("idle0000aaaa", "An idle one", 30), .saved_model = "openai/gpt-5", .state = .idle, .agents = &.{} },
-        .{ .summary = summaryAt("abc000000000", "Fix the login bug", 5), .saved_model = "openai/gpt-5", .state = .working, .agents = &.{ lead, scout } },
+        .{ .summary = summaryAt("abc000000000", "fix the login bug", 5), .saved_model = "openai/gpt-5", .state = .working, .agents = &.{ lead, scout } },
         .{ .summary = summaryAt("newer0000000", null, 0), .saved_model = "example/other-model", .state = .working, .agents = &.{} },
     };
     const text = try renderLive(&sessions, false, .{ .now_ms = test_now_ms });
     defer testing.allocator.free(text);
     try testing.expectEqualStrings(
         "3 live sessions  ·  2 working  ·  1 idle\n" ++
-            "Model openai/gpt-5, unless the MODEL column names another\n" ++
+            "model openai/gpt-5, unless the MODEL column names another\n" ++
             "\n" ++
             "TITLE              STATUS   UPDATED   SESSION ID    MODEL\n" ++
-            "Untitled session   working  just now  newer0000000  example/other-model\n" ++
-            "Fix the login bug  working  5m ago    abc000000000\n" ++
+            "untitled session   working  just now  newer0000000  example/other-model\n" ++
+            "fix the login bug  working  5m ago    abc000000000\n" ++
             "├─ lead            idle\n" ++
             "│  └─ helper       working\n" ++
             "└─ scout           idle\n" ++
             "\n" ++
             "An idle one        idle     30m ago   idle0000aaaa\n" ++
             "\n" ++
-            "Read a session    fx session <session id> --tail 5\n" ++
-            "Read a subagent   fx session <session id>/<name> --tail 5\n" ++
-            "Every field       fx sessions --live --json\n",
+            "read a session    fx session <session id> --tail 5\n" ++
+            "read a subagent   fx session <session id>/<name> --tail 5\n" ++
+            "every field       fx sessions --live --json\n",
         text,
     );
 }
@@ -464,16 +472,16 @@ test "a live list adds the workspace with --all, leaves out MODEL when every ses
     };
     const text = try renderLive(&sessions, true, .{ .now_ms = test_now_ms, .home = "/Users/example" });
     defer testing.allocator.free(text);
-    try testing.expect(std.mem.startsWith(u8, text, "2 live sessions in all workspaces  ·  1 idle  ·  1 unknown\nModel openai/gpt-5\n\n"));
+    try testing.expect(std.mem.startsWith(u8, text, "2 live sessions in all workspaces  ·  1 idle  ·  1 unknown\nmodel openai/gpt-5\n\n"));
     try testing.expect(std.mem.find(u8, text, "MODEL\n") == null);
     try testing.expect(std.mem.find(u8, text, "Elsewhere    unknown  3m ago   def000000000  /srv/w\n") != null);
     try testing.expect(std.mem.find(u8, text, "In a folder  idle     2m ago   abc000000000  ~/code/fx\n") != null);
-    try testing.expect(std.mem.endsWith(u8, text, "Every field       fx sessions --live --all --json\n"));
+    try testing.expect(std.mem.endsWith(u8, text, "every field       fx sessions --live --all --json\n"));
 
     for ([_]bool{ false, true }) |all| {
         const empty = try renderLive(&.{}, all, .{ .now_ms = test_now_ms });
         defer testing.allocator.free(empty);
-        try testing.expectEqualStrings(if (all) "No live sessions.\n" else "No live sessions in this workspace.\n", empty);
+        try testing.expectEqualStrings(if (all) "no live sessions.\n" else "no live sessions in this workspace.\n", empty);
     }
 }
 
@@ -551,40 +559,40 @@ test "an age reads as the resume picker says it for a week, then as a local date
 
 test "a saved list shows title, turns, age, and id in columns, and says how to page on" {
     const sessions = [_]session_store.SessionSummary{
-        summaryAt("abc000000000", "Fix the login bug", 4),
+        summaryAt("abc000000000", "fix the login bug", 4),
         summaryAt("old000000000", null, 30 * 24 * 60),
     };
     const text = try renderSaved(.{ .sessions = &sessions, .has_more = true, .next_cursor = "v1:2:old000000000", .skipped_invalid = 1 }, .{ .now_ms = test_now_ms });
     defer testing.allocator.free(text);
     try testing.expectEqualStrings(
-        "Newest 2 saved sessions in this workspace\n" ++
+        "newest 2 saved sessions in this workspace\n" ++
             "\n" ++
             "TITLE              TURNS  UPDATED     SESSION ID\n" ++
-            "Fix the login bug      3  4m ago      abc000000000\n" ++
-            "Untitled session       3  2026-12-16  old000000000\n" ++
+            "fix the login bug      3  4m ago      abc000000000\n" ++
+            "untitled session       3  2026-12-16  old000000000\n" ++
             "\n" ++
-            "More              fx sessions --cursor v1:2:old000000000\n" ++
-            "Read a session    fx session <session id> --tail 5\n" ++
-            "Running now       fx sessions --live\n" ++
-            "Skipped 1 unreadable saved session; run `fx doctor` for recovery guidance\n",
+            "more              fx sessions --cursor v1:2:old000000000\n" ++
+            "read a session    fx session <session id> --tail 5\n" ++
+            "running now       fx sessions --live\n" ++
+            "skipped 1 unreadable saved session; run `fx doctor` for recovery guidance\n",
         text,
     );
 
     const one = try renderSaved(.{ .sessions = sessions[0..1], .all_workspaces = true }, .{ .now_ms = test_now_ms, .home = "/Users/example" });
     defer testing.allocator.free(one);
     try testing.expect(std.mem.startsWith(u8, one, "1 saved session in all workspaces, newest first\n\nTITLE              TURNS  UPDATED  SESSION ID    WORKSPACE\n"));
-    try testing.expect(std.mem.find(u8, one, "Fix the login bug      3  4m ago   abc000000000  ~/w\n") != null);
+    try testing.expect(std.mem.find(u8, one, "fix the login bug      3  4m ago   abc000000000  ~/w\n") != null);
 }
 
 test "an empty saved list says so, and names unreadable sessions" {
     const none = try renderSaved(.{ .sessions = &.{} }, .{ .now_ms = test_now_ms });
     defer testing.allocator.free(none);
-    try testing.expectEqualStrings("No saved sessions in this workspace.\n", none);
+    try testing.expectEqualStrings("no saved sessions in this workspace.\n", none);
     const unreadable = try renderSaved(.{ .sessions = &.{}, .skipped_invalid = 2, .all_workspaces = true }, .{ .now_ms = test_now_ms });
     defer testing.allocator.free(unreadable);
     try testing.expectEqualStrings(
-        "No readable saved sessions in all workspaces.\n" ++
-            "Skipped 2 unreadable saved sessions; run `fx doctor` for recovery guidance\n",
+        "no readable saved sessions in all workspaces.\n" ++
+            "skipped 2 unreadable saved sessions; run `fx doctor` for recovery guidance\n",
         unreadable,
     );
 }

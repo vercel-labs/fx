@@ -12563,7 +12563,7 @@ test "current compact projection groups tool rows without mutating entries" {
     } });
     _ = try runtime.applyToolLifecycle(alloc, .{ .terminal = .{
         .id = read_id,
-        .outcome = .{ .kind = .completed, .summary = "Read file" },
+        .outcome = .{ .kind = .completed, .summary = "read file" },
     } });
 
     const edit_id = lifecycleId(1, "edit");
@@ -12586,8 +12586,8 @@ test "current compact projection groups tool rows without mutating entries" {
     try std.testing.expect(std.mem.find(
         u8,
         compact.bytes,
-        "\x1b[38;5;255m●\x1b[0m \x1b[38;5;245mRead a file\x1b[0m\n" ++
-            "\x1b[38;5;245m├ Read file\x1b[0m\n" ++
+        "\x1b[38;5;255m●\x1b[0m \x1b[38;5;245mread a file\x1b[0m\n" ++
+            "\x1b[38;5;245m├ read file\x1b[0m\n" ++
             "\x1b[38;5;245m└ \x1b[38;5;245mEdit failed\x1b[0m\x1b[38;5;245m\x1b[0m",
     ) != null);
     try std.testing.expectEqual(entry_count, runtime.notebook.entries.items.len);
@@ -12603,10 +12603,10 @@ test "current compact projection finalizes tool groups from turn finished fallba
         fallback_disposition: ?transcript_blocks.ToolFallbackDisposition,
         summary_text: []const u8,
     }{
-        .{ .call_id = "unreported", .provisional = false, .turn_outcome = .completed, .detail_outcome = .completed, .fallback_disposition = .completion_unreported, .summary_text = "Tool completion was not reported" },
-        .{ .call_id = "not-executed", .provisional = true, .turn_outcome = .completed, .detail_outcome = .completed, .fallback_disposition = .not_executed, .summary_text = "Tool was not executed" },
-        .{ .call_id = "interrupted", .provisional = false, .turn_outcome = .interrupted, .detail_outcome = .cancelled, .fallback_disposition = null, .summary_text = "Tool cancelled" },
-        .{ .call_id = "failed", .provisional = false, .turn_outcome = .failed, .detail_outcome = .failed, .fallback_disposition = null, .summary_text = "Tool failed" },
+        .{ .call_id = "unreported", .provisional = false, .turn_outcome = .completed, .detail_outcome = .completed, .fallback_disposition = .completion_unreported, .summary_text = "tool completion was not reported" },
+        .{ .call_id = "not-executed", .provisional = true, .turn_outcome = .completed, .detail_outcome = .completed, .fallback_disposition = .not_executed, .summary_text = "tool was not executed" },
+        .{ .call_id = "interrupted", .provisional = false, .turn_outcome = .interrupted, .detail_outcome = .cancelled, .fallback_disposition = null, .summary_text = "tool cancelled" },
+        .{ .call_id = "failed", .provisional = false, .turn_outcome = .failed, .detail_outcome = .failed, .fallback_disposition = null, .summary_text = "tool failed" },
     };
 
     for (cases) |case| {
@@ -12816,12 +12816,12 @@ test "preserving batch lifecycle rewrite keeps a capped canonical anchor" {
     try std.testing.expect(std.mem.find(
         u8,
         runtime.toolStatusEntryLabel(first_entry_id).?,
-        "Tool cancelled",
+        "tool cancelled",
     ) != null);
     try std.testing.expect(std.mem.find(
         u8,
         runtime.toolStatusEntryLabel(second_entry_id).?,
-        "Tool cancelled",
+        "tool cancelled",
     ) != null);
 }
 
@@ -13802,7 +13802,7 @@ test "transcript lifecycle terminal and finalization transitions stay batch safe
         const expected_line = if (case.kind == .cancelled)
             try std.mem.print(
                 &expected,
-                "{s}{s}{s} {s}{s}{s} · What can fx do differently?\n",
+                "{s}{s}{s} {s}{s}{s} · what can fx do differently?\n",
                 .{
                     case.marker_style,
                     case.marker,
@@ -13835,7 +13835,7 @@ test "transcript lifecycle terminal and finalization transitions stay batch safe
         .{ .turn_finished = .{ .turn_id = 2, .outcome = .interrupted } },
         .{ .turn_finished = .{ .turn_id = 1, .outcome = .failed } },
     }) |event| _ = try runtime.applyToolLifecycle(alloc, event);
-    try expectRawEntryBytes(&runtime, old_entry_id, "● Tool was not executed\n");
+    try expectRawEntryBytes(&runtime, old_entry_id, "● tool was not executed\n");
 
     _ = try runtime.applyToolLifecycle(alloc, .{ .terminal = .{
         .id = lifecycleId(2, "old"),
@@ -13903,13 +13903,13 @@ test "transcript lifecycle terminal markers preserve ANSI summaries and normaliz
         .id = lifecycleId(1, "styled"),
         .outcome = .{
             .kind = .completed,
-            .summary = "● Ran command\x1b[0m",
+            .summary = "● ran command\x1b[0m",
         },
     } });
     var styled_expected: [128]u8 = undefined;
     try expectRawEntryBytes(&runtime, styled_entry_id, try std.mem.print(
         &styled_expected,
-        "{s}●{s} Ran command\x1b[0m\n",
+        "{s}●{s} ran command\x1b[0m\n",
         .{ ui_render.system_notice_text_style, ui_render.reset_style },
     ));
 
@@ -13918,14 +13918,14 @@ test "transcript lifecycle terminal markers preserve ANSI summaries and normaliz
         .id = lifecycleId(1, "styled-cancelled"),
         .outcome = .{
             .kind = .cancelled,
-            .summary = "● Cancelled\x1b[0m \x1b[38;5;245msleep 30\x1b[0m",
+            .summary = "● cancelled\x1b[0m \x1b[38;5;245msleep 30\x1b[0m",
         },
     } });
     var styled_cancelled_expected: [256]u8 = undefined;
     try expectRawEntryBytes(&runtime, styled_cancelled_entry_id, try std.mem.print(
         &styled_cancelled_expected,
-        "{s}▪{s}{s} Cancelled\x1b[0m \x1b[38;5;245msleep 30\x1b[0m{s}" ++
-            " · What can fx do differently?\n",
+        "{s}▪{s}{s} cancelled\x1b[0m \x1b[38;5;245msleep 30\x1b[0m{s}" ++
+            " · what can fx do differently?\n",
         .{
             ui_render.warning_style,
             ui_render.reset_style,
@@ -13957,7 +13957,7 @@ test "transcript lifecycle terminal markers preserve ANSI summaries and normaliz
     var cancelled_expected: [128]u8 = undefined;
     try expectRawEntryBytes(&runtime, cancelled_entry_id, try std.mem.print(
         &cancelled_expected,
-        "{s}▪{s} {s}Tool cancelled{s} · What can fx do differently?\n",
+        "{s}▪{s} {s}tool cancelled{s} · what can fx do differently?\n",
         .{
             ui_render.warning_style,
             ui_render.reset_style,
@@ -13974,7 +13974,7 @@ test "transcript lifecycle terminal markers preserve ANSI summaries and normaliz
     var failed_expected: [128]u8 = undefined;
     try expectRawEntryBytes(&runtime, failed_entry_id, try std.mem.print(
         &failed_expected,
-        "{s}●{s} Tool failed\n",
+        "{s}●{s} tool failed\n",
         .{ ui_render.red_style, ui_render.reset_style },
     ));
 }
@@ -14004,14 +14004,14 @@ test "active tool cancellation is presented immediately without closing lifecycl
     defer rendered.deinit(alloc);
     try std.testing.expectEqual(
         @as(usize, 2),
-        std.mem.count(u8, rendered.bytes, "What can fx do differently?"),
+        std.mem.count(u8, rendered.bytes, "what can fx do differently?"),
     );
-    try std.testing.expect(std.mem.find(u8, rendered.bytes, "System:") == null);
-    try std.testing.expect(std.mem.find(u8, rendered.bytes, "Cancelling") == null);
+    try std.testing.expect(std.mem.find(u8, rendered.bytes, "system:") == null);
+    try std.testing.expect(std.mem.find(u8, rendered.bytes, "cancelling") == null);
 
     _ = try runtime.applyToolLifecycle(alloc, .{ .terminal = .{
         .id = ids[1],
-        .outcome = .{ .kind = .cancelled, .summary = "Cancelled sleep 30" },
+        .outcome = .{ .kind = .cancelled, .summary = "cancelled sleep 30" },
     } });
     try std.testing.expectEqual(@as(usize, 1), runtime.activeToolActivityCount());
 }
@@ -14039,7 +14039,7 @@ test "late successful settlement preserves its result and one turn cancellation"
         }
         _ = try runtime.applyToolLifecycle(alloc, .{ .terminal = .{
             .id = id,
-            .outcome = .{ .kind = .completed, .summary = "Read the file" },
+            .outcome = .{ .kind = .completed, .summary = "read the file" },
             .result = "late result",
         } });
         if (!finish_before_terminal) {
@@ -14053,11 +14053,11 @@ test "late successful settlement preserves its result and one turn cancellation"
         defer rendered.deinit(alloc);
         try std.testing.expectEqual(
             @as(usize, 1),
-            std.mem.count(u8, rendered.bytes, "What can fx do differently?"),
+            std.mem.count(u8, rendered.bytes, "what can fx do differently?"),
         );
         try std.testing.expectEqual(
             @as(usize, 1),
-            std.mem.count(u8, rendered.bytes, "Read the file"),
+            std.mem.count(u8, rendered.bytes, "read the file"),
         );
         try std.testing.expectEqual(
             RawEntryClass.turn_cancellation,
@@ -14085,7 +14085,7 @@ test "post-cancel sibling settlement preserves one turn cancellation" {
         try std.testing.expect(try runtime.presentActiveToolCancellation(alloc));
         _ = try runtime.applyToolLifecycle(alloc, .{ .terminal = .{
             .id = first,
-            .outcome = .{ .kind = .completed, .summary = "Read first" },
+            .outcome = .{ .kind = .completed, .summary = "read first" },
         } });
 
         const sibling = lifecycleId(1, "sibling");
@@ -14098,7 +14098,7 @@ test "post-cancel sibling settlement preserves one turn cancellation" {
         if (sibling_reports_terminal) {
             _ = try runtime.applyToolLifecycle(alloc, .{ .terminal = .{
                 .id = sibling,
-                .outcome = .{ .kind = .cancelled, .summary = "Search cancelled" },
+                .outcome = .{ .kind = .cancelled, .summary = "search cancelled" },
             } });
         }
         _ = try runtime.applyToolLifecycle(alloc, .{ .turn_finished = .{
@@ -14110,11 +14110,11 @@ test "post-cancel sibling settlement preserves one turn cancellation" {
         defer rendered.deinit(alloc);
         try std.testing.expectEqual(
             @as(usize, 1),
-            std.mem.count(u8, rendered.bytes, "What can fx do differently?"),
+            std.mem.count(u8, rendered.bytes, "what can fx do differently?"),
         );
         try std.testing.expectEqual(
             @as(usize, 1),
-            std.mem.count(u8, rendered.bytes, "Read first"),
+            std.mem.count(u8, rendered.bytes, "read first"),
         );
     }
 }
@@ -14142,7 +14142,7 @@ test "late zero-output command settlement reserves distinct presentation entries
         }
         _ = try runtime.applyToolLifecycle(alloc, .{ .terminal = .{
             .id = id,
-            .outcome = .{ .kind = .completed, .summary = "Ran true" },
+            .outcome = .{ .kind = .completed, .summary = "ran true" },
             .result = "exit_code=0\n",
             .result_memory = .{
                 .command_process_presentation = .{ .exit_code = 0 },
@@ -14159,11 +14159,11 @@ test "late zero-output command settlement reserves distinct presentation entries
         defer rendered.deinit(alloc);
         try std.testing.expectEqual(
             @as(usize, 1),
-            std.mem.count(u8, rendered.bytes, "What can fx do differently?"),
+            std.mem.count(u8, rendered.bytes, "what can fx do differently?"),
         );
         try std.testing.expectEqual(
             @as(usize, 1),
-            std.mem.count(u8, rendered.bytes, "Ran \x1b[38;5;245m\x1b[38;5;252mtrue\x1b[39m"),
+            std.mem.count(u8, rendered.bytes, "ran \x1b[38;5;245m\x1b[38;5;252mtrue\x1b[39m"),
         );
         const detail = runtime.toolDetailForEntry(runtime.toolActivityRecord(id).?.entry_id).?;
         try std.testing.expectEqual(types.ToolOutcomeKind.completed, detail.outcome.?);
@@ -14219,7 +14219,7 @@ fn checkLateZeroOutputCommandCancellationAllocationFailuresImpl(alloc: Allocator
     defer rendered.deinit(alloc);
     try std.testing.expectEqual(
         @as(usize, 1),
-        std.mem.count(u8, rendered.bytes, "What can fx do differently?"),
+        std.mem.count(u8, rendered.bytes, "what can fx do differently?"),
     );
 }
 
@@ -14490,7 +14490,7 @@ fn checkLateTerminalFallbackAllocationFailuresImpl(alloc: Allocator) !void {
         .outcome = .{ .kind = .completed, .summary = "Late completion" },
         .result = "late result",
     } }) catch |err| {
-        try expectRawEntryBytes(&runtime, entry_id, "● Tool was not executed\n");
+        try expectRawEntryBytes(&runtime, entry_id, "● tool was not executed\n");
         const detail = runtime.toolDetailForEntry(entry_id).?;
         try std.testing.expect(detail.result == null);
         try std.testing.expectEqual(
@@ -14499,7 +14499,7 @@ fn checkLateTerminalFallbackAllocationFailuresImpl(alloc: Allocator) !void {
         );
         var compact = try runtime.prepareTranscriptSource(std.testing.allocator, null);
         defer compact.deinit(std.testing.allocator);
-        try std.testing.expect(std.mem.find(u8, compact.bytes, "Tool was not executed") != null);
+        try std.testing.expect(std.mem.find(u8, compact.bytes, "tool was not executed") != null);
         return err;
     };
 
@@ -14514,7 +14514,7 @@ fn checkLateTerminalFallbackAllocationFailuresImpl(alloc: Allocator) !void {
     try std.testing.expect(detail.fallback_disposition == null);
     var compact = try runtime.prepareTranscriptSource(std.testing.allocator, null);
     defer compact.deinit(std.testing.allocator);
-    try std.testing.expect(std.mem.find(u8, compact.bytes, "Tool was not executed") == null);
+    try std.testing.expect(std.mem.find(u8, compact.bytes, "tool was not executed") == null);
     try std.testing.expect(std.mem.find(u8, compact.bytes, "Late completion") != null);
 }
 
@@ -16332,7 +16332,7 @@ fn applyCompletedReadForFinalityTest(
     } });
     _ = try runtime.applyToolLifecycle(alloc, .{ .terminal = .{
         .id = id,
-        .outcome = .{ .kind = .completed, .summary = "Read finality fixture" },
+        .outcome = .{ .kind = .completed, .summary = "read finality fixture" },
     } });
 }
 
@@ -16358,12 +16358,12 @@ test "finality candidates anchor a fully grouped turn at its newest rendered gro
     try std.testing.expect(source.finality.mutation_pin_start == null);
 
     const group_a_header = try alloc.print(
-        "{s}●\x1b[0m {s}Read files\x1b[0m",
+        "{s}●\x1b[0m {s}read files\x1b[0m",
         .{ user_message_card.promptMarkerStyle(), ui_render.statusline_style },
     );
     defer alloc.free(group_a_header);
     const group_b_header = try alloc.print(
-        "{s}●\x1b[0m {s}Read finality fixture\x1b[0m",
+        "{s}●\x1b[0m {s}read finality fixture\x1b[0m",
         .{ user_message_card.promptMarkerStyle(), ui_render.statusline_style },
     );
     defer alloc.free(group_b_header);
@@ -16399,7 +16399,7 @@ test "finality candidates keep a mixed legacy turn at its earliest rendered tool
     try std.testing.expect(source.finality.mutation_pin_start == null);
 
     const group_a_header = try alloc.print(
-        "{s}●\x1b[0m {s}Read finality fixture\x1b[0m",
+        "{s}●\x1b[0m {s}read finality fixture\x1b[0m",
         .{ user_message_card.promptMarkerStyle(), ui_render.statusline_style },
     );
     defer alloc.free(group_a_header);
@@ -16445,7 +16445,7 @@ test "grouped completed command rows shell-highlight quoted strings over the row
         .tool_name = "shell",
         .activity_kind = .command,
     } });
-    try runtime.setToolCommandMetadata(alloc, id, "printf 'hello world'", "Ran");
+    try runtime.setToolCommandMetadata(alloc, id, "printf 'hello world'", "ran");
     _ = try runtime.applyToolLifecycle(alloc, .{ .terminal = .{
         .id = id,
         .outcome = .{ .kind = .completed, .summary = "Ran printf 'hello world'" },

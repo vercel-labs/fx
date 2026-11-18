@@ -233,10 +233,12 @@ fn composeItemRow(
     const indent: usize = if (width <= 2) 0 else 2;
     if (indent > 0) try row.appendSlice(alloc, "  ");
     try row.appendSlice(alloc, if (selected) ui_render.selected_completion_style else ui_render.dim_style);
+    const label = try menu_frame.uiCase(alloc, item.label);
+    defer alloc.free(label);
     try row_text.appendSingleLineEllipsized(
         alloc,
         &row,
-        item.label,
+        label,
         value_col -| indent,
     );
     try row.appendSlice(alloc, ui_render.reset_style);
@@ -372,13 +374,13 @@ test "settings menu draws the shared title, five settings, and a more row at a f
     const text = try renderPlain(alloc, projection, 100, 40);
     defer alloc.free(text);
     try std.testing.expectEqualStrings(
-        \\settings   < All >
+        \\settings   < all >
         \\
-        \\  Status line context        off  on
-        \\  Status line session        off  on
-        \\  Status line workspace      off  on
-        \\  Slash menu categories      off  on
-        \\  Collapse tool calls        off  on
+        \\  status line context        off  on
+        \\  status line session        off  on
+        \\  status line workspace      off  on
+        \\  slash menu categories      off  on
+        \\  collapse tool calls        off  on
         \\  ↓ 9 more
         \\
     , text);
@@ -397,11 +399,11 @@ test "settings menu values line up after the widest label, with a gap that narro
     const text = try renderPlain(alloc, projection, 100, max_inline_rows);
     defer alloc.free(text);
     // The model's value starts in the same column as every other value.
-    try std.testing.expect(std.mem.find(u8, text, "  Model                      zai/glm-5.2\n") != null);
+    try std.testing.expect(std.mem.find(u8, text, "  model                      zai/glm-5.2\n") != null);
 
     const narrow = try renderPlain(alloc, projection, 40, max_inline_rows);
     defer alloc.free(narrow);
-    try std.testing.expect(std.mem.find(u8, narrow, "  Model                  zai/glm-5.2\n") != null);
+    try std.testing.expect(std.mem.find(u8, narrow, "  model                  zai/glm-5.2\n") != null);
 }
 
 test "settings menu keeps its height and says when a search finds nothing" {
@@ -410,7 +412,7 @@ test "settings menu keeps its height and says when a search finds nothing" {
     try std.testing.expectEqual(max_inline_rows, menuRowCount(projection, 80, 40));
     const text = try renderPlain(alloc, projection, 80, 40);
     defer alloc.free(text);
-    try std.testing.expect(std.mem.startsWith(u8, text, "settings   < All >\n\n  no matching settings.\n"));
+    try std.testing.expect(std.mem.startsWith(u8, text, "settings   < all >\n\n  no matching settings.\n"));
 }
 
 test "settings model choices remain visible within the inline row budget" {
@@ -429,7 +431,7 @@ test "settings model choices remain visible within the inline row budget" {
     };
     const text = try renderPlain(alloc, projection, 100, max_inline_rows);
     defer alloc.free(text);
-    try std.testing.expect(std.mem.find(u8, text, "  Model ") != null);
+    try std.testing.expect(std.mem.find(u8, text, "  model ") != null);
     try std.testing.expect(std.mem.find(u8, text, "provider/one") != null);
     try std.testing.expect(std.mem.find(u8, text, "provider/three") != null);
 }

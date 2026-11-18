@@ -18,7 +18,7 @@ pub const State = struct {
 };
 
 pub const yolo_warning_text = permissions.yolo_warning_text;
-pub const yolo_warning_compact_text = "Full access";
+pub const yolo_warning_compact_text = "full access";
 const yolo_warning_visible_ms: i64 = 4000;
 
 pub fn monotonicMillis() i64 {

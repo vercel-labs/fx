@@ -3020,7 +3020,7 @@ fn settleFailedContextGate(
             settlement_arena,
             turn_id,
             call,
-            "Failed",
+            "failed",
             advertised_dynamic_tool_names,
         ) catch |settlement_error| {
             debug_trace.logf(
@@ -3646,7 +3646,7 @@ fn finishPendingParallelCancelled(
             call,
             started,
             null,
-            "Cancelled",
+            "cancelled",
             advertised_dynamic_tool_names,
         );
     }
@@ -3762,7 +3762,7 @@ fn finishPendingCancelledCalls(
             call,
             false,
             null,
-            "Cancelled",
+            "cancelled",
             advertised_dynamic_tool_names,
         );
     }
@@ -5474,8 +5474,8 @@ test "deferred tool cleanup preserves interruption and cancellation outcomes" {
     const deps = fake.deps();
     var stream_ctx = runtime_assistant_stream.StreamChunkContext{ .hooks = &deps, .turn_id = 71, .alloc = alloc };
     defer stream_ctx.deinit();
-    try stream_ctx.provisional_statuses.publish(&deps, alloc, 71, "local", "read_file", .read, "Reading", "fixture.txt", null);
-    try stream_ctx.provisional_statuses.publish(&deps, alloc, 71, "remote", "exa_search", .read, "Searching", null, null);
+    try stream_ctx.provisional_statuses.publish(&deps, alloc, 71, "local", "read_file", .read, "reading", "fixture.txt", null);
+    try stream_ctx.provisional_statuses.publish(&deps, alloc, 71, "remote", "exa_search", .read, "searching", null, null);
     var cancelled = std.atomic.Value(bool).init(false);
     settle_deferred_tool_starts(&deps, &stream_ctx, arena_state.allocator(), 71, &cancelled);
     try std.testing.expect(stream_ctx.provisional_statuses.visibleId(.{ .id = "local", .name = "read_file", .arguments_json = "{}" }) == null);
@@ -5520,7 +5520,7 @@ test "deferred tool cleanup contains publication failure and preserves tracking"
     var sink = Sink{};
     var stream_ctx = runtime_assistant_stream.StreamChunkContext{ .hooks = &deps, .turn_id = 73, .alloc = alloc };
     defer stream_ctx.deinit();
-    try stream_ctx.provisional_statuses.publish(&deps, alloc, 73, "local", "read_file", .read, "Reading", "fixture.txt", null);
+    try stream_ctx.provisional_statuses.publish(&deps, alloc, 73, "local", "read_file", .read, "reading", "fixture.txt", null);
     deps.ctx = &sink;
     deps.push_tool_lifecycle = Sink.push;
     var cancelled = std.atomic.Value(bool).init(false);
@@ -12164,7 +12164,7 @@ fn processQueuedPromptLoop(
                     execution_call,
                     status_started,
                     tool_display_target,
-                    "Cancelled",
+                    "cancelled",
                     advertised_dynamic_tool_names,
                 );
                 try finishPendingCancelledCalls(
@@ -12261,7 +12261,7 @@ fn processQueuedPromptLoop(
                         execution_call,
                         status_started,
                         tool_display_target,
-                        "Cancelled",
+                        "cancelled",
                         advertised_dynamic_tool_names,
                     );
                     try runtime_tool_batch.drainPendingUserSuffix(arena, &step_batch, &within_turn_suffix);
@@ -12546,7 +12546,7 @@ fn processQueuedPromptLoop(
                     execution_call,
                     status_started,
                     tool_display_target,
-                    "Cancelled",
+                    "cancelled",
                     advertised_dynamic_tool_names,
                 );
                 try finishPendingCancelledCalls(

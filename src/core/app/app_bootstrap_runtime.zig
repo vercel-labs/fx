@@ -663,8 +663,8 @@ pub fn Runtime(comptime App: type) type {
                         welcome_message.len,
                         ui_render.welcome_message_reserved_rows,
                         if (std.mem.find(u8, welcome_message, " v") != null) "true" else "false",
-                        if (std.mem.find(u8, welcome_message, "Run /help") != null) "true" else "false",
-                        if (std.mem.find(u8, welcome_message, "Feedback?") != null) "true" else "false",
+                        if (std.mem.find(u8, welcome_message, "run /help") != null) "true" else "false",
+                        if (std.mem.find(u8, welcome_message, "feedback?") != null) "true" else "false",
                         welcome_preview,
                     },
                 );

@@ -2420,19 +2420,19 @@ pub fn presentation(args: std.json.ObjectMap) ?tool_dispatch.CallPresentation {
     return switch (action) {
         .run => .{
             .activity_kind = .command,
-            .action_label = "Running",
-            .completed_action_label = "Ran",
+            .action_label = "running",
+            .completed_action_label = "ran",
             .label_arg_kind = .command,
             .label_arg_default = "command",
         },
         .interact => if (tool_args.optionalStringArg(args, "chars")) |chars|
             if (chars.len == 0)
-                sessionPresentation("Waiting for", "Observed")
+                sessionPresentation("waiting for", "observed")
             else
-                sessionPresentation("Sending input to", "Sent input to")
+                sessionPresentation("Sending input to", "sent input to")
         else
-            sessionPresentation("Waiting for", "Observed"),
-        .stop => sessionPresentation("Stopping", "Stopped"),
+            sessionPresentation("waiting for", "observed"),
+        .stop => sessionPresentation("stopping", "stopped"),
     };
 }
 

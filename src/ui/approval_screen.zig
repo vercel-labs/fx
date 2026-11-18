@@ -762,7 +762,7 @@ const FileReviewSource = union(enum) {
                 const lines = try alloc.alloc(diff_mod.ReviewLine, count);
                 if (value.lines.len == 0) {
                     if (count == 1) {
-                        lines[0] = .{ .op = .notice, .text = "No content changes" };
+                        lines[0] = .{ .op = .notice, .text = "no content changes" };
                     }
                 } else {
                     for (value.lines[start..][0..count], lines) |source, *line| {
@@ -1661,8 +1661,8 @@ test "command approval screen includes compact permission header" {
     var rendered = try paintTest(alloc, approval.projection().?, &screen_state, &.{}, .{}, testLayout(16, 80), true);
     defer rendered.deinit(alloc);
 
-    try std.testing.expect(std.mem.find(u8, rendered.bytes, "Permission needed · Choose one") != null);
-    try std.testing.expect(std.mem.find(u8, rendered.bytes, "Command") != null);
+    try std.testing.expect(std.mem.find(u8, rendered.bytes, "permission needed · choose one") != null);
+    try std.testing.expect(std.mem.find(u8, rendered.bytes, "command") != null);
 
     var grid = try vt_emulator.Grid.init(alloc, 80, 16);
     defer grid.deinit();
@@ -1676,7 +1676,7 @@ test "command approval screen includes compact permission header" {
     while (row <= 16) : (row += 1) {
         row_text.clearRetainingCapacity();
         try grid.rowTextTrimmed(row, &row_text);
-        if (std.mem.find(u8, row_text.items, "3. No") != null) choice_three_row = row;
+        if (std.mem.find(u8, row_text.items, "3. no") != null) choice_three_row = row;
         if (std.mem.find(u8, row_text.items, "1–3 choose") != null) hint_row = row;
     }
 
@@ -1786,7 +1786,7 @@ test "subagent file approval renders its bounded preview without a live review" 
     try std.testing.expect(std.mem.find(
         u8,
         rendered.bytes,
-        "Subagent approval-child needs permission",
+        "subagent approval-child needs permission",
     ) != null);
     try std.testing.expect(std.mem.find(u8, rendered.bytes, "note.txt") != null);
     try std.testing.expect(std.mem.find(u8, rendered.bytes, "changed") != null);
@@ -2174,7 +2174,7 @@ test "file approval top-aligns a fitting welcome document and clears below" {
     var row: std.ArrayList(u8) = .empty;
     defer row.deinit(alloc);
     try grid.rowTextTrimmed(1, &row);
-    try std.testing.expect(std.mem.find(u8, row.items, "Run /help for commands") != null);
+    try std.testing.expect(std.mem.find(u8, row.items, "run /help for commands") != null);
 
     const transcript_divider = grid.cellAt(4, 1) orelse return error.TestMissingTranscriptDivider;
     try std.testing.expectEqual(@as(u21, 0x2500), transcript_divider.codepoint);
@@ -2406,9 +2406,9 @@ test "file approval renders controls ready after inspecting a changed row" {
         row.clearRetainingCapacity();
         try grid.rowTextTrimmed(@intCast(row_number), &row);
         ready_choice_visible = ready_choice_visible or
-            std.mem.find(u8, row.items, "❯ 1  Apply once") != null;
+            std.mem.find(u8, row.items, "❯ 1  apply once") != null;
         blocked_choice_visible = blocked_choice_visible or
-            std.mem.find(u8, row.items, "❯ ! 1  Apply once") != null;
+            std.mem.find(u8, row.items, "❯ ! 1  apply once") != null;
     }
     try std.testing.expect(ready_choice_visible);
     try std.testing.expect(!blocked_choice_visible);

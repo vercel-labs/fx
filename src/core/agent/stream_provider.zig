@@ -912,11 +912,11 @@ test "event sink callback adapters emit the matching events" {
     try std.testing.expectEqualStrings("{\"a\"", capture.last.?.tool_input_delta);
 
     const on_tool_start: ToolStartCallback = EventSink.onToolStart;
-    on_tool_start(&sink, "call_1", "read_file", "Read", "{}");
+    on_tool_start(&sink, "call_1", "read_file", "read", "{}");
     const started = capture.last.?.tool_started;
     try std.testing.expectEqualStrings("call_1", started.id);
     try std.testing.expectEqualStrings("read_file", started.name);
-    try std.testing.expectEqualStrings("Read", started.label.?);
+    try std.testing.expectEqualStrings("read", started.label.?);
     try std.testing.expectEqualStrings("{}", started.arguments_json.?);
 
     on_tool_start(&sink, "call_2", "glob_files", null, null);

@@ -291,8 +291,8 @@ fn sessionWindowStart(projection: SessionMenuProjection, layout: SessionMenuLayo
 
 fn composeHeaderRow(alloc: Allocator, projection: SessionMenuProjection, width: u16) !std.ArrayList(u8) {
     return menu_frame.composeTitleRow(alloc, "sessions", switch (projection.scope) {
-        .current_workspace => "Current workspace",
-        .all_workspaces => "All workspaces",
+        .current_workspace => "current workspace",
+        .all_workspaces => "all workspaces",
     }, width);
 }
 
@@ -558,9 +558,9 @@ test "resume menu renders each session on one line with a right metadata cluster
     var header = try composeSessionMenuRow(alloc, projection, 0, 120, 4);
     defer header.deinit(alloc);
     try std.testing.expect(std.mem.find(u8, header.items, "sessions") != null);
-    try std.testing.expect(std.mem.find(u8, header.items, "< Current workspace >") != null);
+    try std.testing.expect(std.mem.find(u8, header.items, "< current workspace >") != null);
     // Only the active scope shows; Tab moves to the other one.
-    try std.testing.expect(std.mem.find(u8, header.items, "All workspaces") == null);
+    try std.testing.expect(std.mem.find(u8, header.items, "all workspaces") == null);
 
     var title = try composeSessionMenuRow(alloc, projection, 2, 120, 4);
     defer title.deinit(alloc);

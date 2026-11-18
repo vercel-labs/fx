@@ -359,10 +359,10 @@ pub fn runLogin(
     const authorization_url = (try runtime.browserUrlAlloc(alloc)) orelse
         return error.GrokAuthorizationUrlMissing;
     defer alloc.free(authorization_url);
-    try writeStdout("Open this URL to sign in with Grok:\n");
+    try writeStdout("open this URL to sign in with grok:\n");
     try writeStdout(authorization_url);
-    try writeStdout("\n\nWaiting for browser authorization...\n");
-    try writeStdout("Paste the code shown by xAI and press enter if the browser doesn't return.\n");
+    try writeStdout("\n\nwaiting for browser authorization...\n");
+    try writeStdout("paste the code shown by xAI and press enter if the browser doesn't return.\n");
     if (io_mod.getenv("FX_NO_OPEN_BROWSER") == null) {
         _ = url_opener.open(alloc, authorization_url) catch false;
     }

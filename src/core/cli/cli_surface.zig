@@ -1241,7 +1241,7 @@ fn writeProviderLoginFailure(alloc: Allocator, deps: RunDeps, provider: model_pr
         return;
     }
     try writeProviderActivationError(alloc, deps, caller, switch (err) {
-        error.ClientIdMissing => "missing FX_OAUTH_CLIENT_ID; configure the fx Vercel App client id first",
+        error.ClientIdMissing => "missing FX_OAUTH_CLIENT_ID; configure the fx vercel app client id first",
         error.AccessDenied, error.ChatGptAuthorizationFailed, error.GrokAuthorizationFailed => "authorization denied",
         error.ExpiredToken, error.LoginTimedOut, error.ChatGptLoginTimedOut, error.GrokLoginTimedOut => "authorization expired; run fx login again",
         else => "failed to sign in",
@@ -1292,7 +1292,7 @@ fn activateProviderSelectionFallible(
             },
             .outcome => {},
         }
-        const message = try alloc.print("Provider set to {s}.\n", .{bound.label()});
+        const message = try alloc.print("provider set to {s}.\n", .{bound.label()});
         defer alloc.free(message);
         if (caller == .provider_command) try writeStdout(deps, message);
         return true;
@@ -1318,10 +1318,10 @@ fn activateProviderSelectionFallible(
         (cfg.auth_mode == .host_managed or prepared_credential != null))
     {
         try writeStdout(deps, switch (target) {
-            .gateway => "Gateway is already selected.\n",
-            .codex => "Codex is already selected.\n",
-            .grok => "Grok is already selected.\n",
-            .configured => "Configured provider is already selected.\n",
+            .gateway => "gateway is already selected.\n",
+            .codex => "codex is already selected.\n",
+            .grok => "grok is already selected.\n",
+            .configured => "configured provider is already selected.\n",
         });
         return true;
     }
@@ -1352,9 +1352,9 @@ fn activateProviderSelectionFallible(
             deps,
             caller,
             switch (target) {
-                .codex => "Codex credential is unavailable",
-                .grok => "Grok credential is unavailable",
-                .gateway => "configure a Gateway credential first",
+                .codex => "codex credential is unavailable",
+                .grok => "grok credential is unavailable",
+                .gateway => "configure a gateway credential first",
                 .configured => "configure the provider auth environment variable first",
             },
         );
@@ -1362,10 +1362,10 @@ fn activateProviderSelectionFallible(
     };
     const catalog_provider = cfg.provider_set.select(target).model_catalog orelse {
         try writeProviderActivationError(alloc, deps, caller, switch (target) {
-            .codex => "Codex model catalog is unavailable",
-            .grok => "Grok model catalog is unavailable",
-            .gateway => "Gateway model catalog is unavailable",
-            .configured => "Configured model catalog is unavailable",
+            .codex => "codex model catalog is unavailable",
+            .grok => "grok model catalog is unavailable",
+            .gateway => "gateway model catalog is unavailable",
+            .configured => "configured model catalog is unavailable",
         });
         return false;
     };
@@ -1435,16 +1435,16 @@ fn activateProviderSelectionFallible(
         .outcome => {},
     }
     if (performed_login) |provider| switch (provider) {
-        .codex => try writeStdout(deps, "Signed in with Codex.\n"),
-        .grok => try writeStdout(deps, "Signed in with Grok.\n"),
+        .codex => try writeStdout(deps, "signed in with codex.\n"),
+        .grok => try writeStdout(deps, "signed in with grok.\n"),
         .gateway, .configured => unreachable,
     };
     if (caller == .provider_command) {
         try writeStdout(deps, switch (target) {
-            .gateway => "Provider set to Gateway.\n",
-            .codex => "Provider set to Codex.\n",
-            .grok => "Provider set to Grok.\n",
-            .configured => "Provider set to configured connection.\n",
+            .gateway => "provider set to gateway.\n",
+            .codex => "provider set to codex.\n",
+            .grok => "provider set to grok.\n",
+            .configured => "provider set to configured connection.\n",
         });
     }
     return true;
@@ -1656,10 +1656,10 @@ fn runNonInteractiveWithDeps(
             )) return .handled_failure;
             retryKeptSignOuts(alloc, cfg, deps, login_provider);
             try writeStdout(deps, switch (login_provider) {
-                .gateway => "Signed in to Vercel.\nAI Gateway access may still require billing or API setup for the selected account.\n",
-                .codex => "Signed in with Codex.\n",
-                .grok => "Signed in with Grok.\n",
-                .configured => "Configured providers use settings.json authentication.\n",
+                .gateway => "signed in to vercel.\nAI gateway access may still require billing or API setup for the selected account.\n",
+                .codex => "signed in with codex.\n",
+                .grok => "signed in with grok.\n",
+                .configured => "configured providers use settings.json authentication.\n",
             });
             return .handled_success;
         },
@@ -1678,28 +1678,28 @@ fn runNonInteractiveWithDeps(
             if (login_provider == .codex) {
                 const wait_line: LogoutWaitLine = .{ .deps = deps, .text = LogoutWaitLine.codex };
                 const outcome = chatgpt_oauth.logout(alloc, cfg.gateway_provider.oauth_transport, wait_line.notice()) catch {
-                    try writeStderr(deps, "fx logout: failed to durably remove saved Codex login\n");
+                    try writeStderr(deps, "fx logout: failed to durably remove saved codex login\n");
                     return .handled_failure;
                 };
                 if (outcome.revocation_failed) {
                     try writeStderr(deps, if (outcome.retry_kept)
-                        "fx logout: local Codex session removed, but remote revocation could not be confirmed; " ++ pending_revocation.retry_later ++ "\n"
+                        "fx logout: local codex session removed, but remote revocation could not be confirmed; " ++ pending_revocation.retry_later ++ "\n"
                     else
-                        "fx logout: local Codex session removed, but remote revocation could not be confirmed\n");
+                        "fx logout: local codex session removed, but remote revocation could not be confirmed\n");
                 } else {
                     retryKeptSignOuts(alloc, cfg, deps, .codex);
                 }
                 return switch (outcome.deletion) {
                     .deleted => result: {
-                        try writeStdout(deps, "Signed out of Codex.\n");
+                        try writeStdout(deps, "signed out of codex.\n");
                         break :result .handled_success;
                     },
                     .missing => result: {
-                        try writeStdout(deps, "No Codex login session found.\n");
+                        try writeStdout(deps, "no codex login session found.\n");
                         break :result .handled_success;
                     },
                     .deleted_not_durable => result: {
-                        try writeStderr(deps, "fx logout: failed to durably remove saved Codex login\n");
+                        try writeStderr(deps, "fx logout: failed to durably remove saved codex login\n");
                         break :result .handled_failure;
                     },
                 };
@@ -1707,28 +1707,28 @@ fn runNonInteractiveWithDeps(
             if (login_provider == .grok) {
                 const wait_line: LogoutWaitLine = .{ .deps = deps, .text = LogoutWaitLine.grok };
                 const outcome = grok_oauth.logout(alloc, cfg.gateway_provider.oauth_transport, wait_line.notice()) catch {
-                    try writeStderr(deps, "fx logout: failed to durably remove saved Grok login\n");
+                    try writeStderr(deps, "fx logout: failed to durably remove saved grok login\n");
                     return .handled_failure;
                 };
                 if (outcome.revocation_failed) {
                     try writeStderr(deps, if (outcome.retry_kept)
-                        "fx logout: local Grok session removed, but remote revocation could not be confirmed; " ++ pending_revocation.retry_later ++ "\n"
+                        "fx logout: local grok session removed, but remote revocation could not be confirmed; " ++ pending_revocation.retry_later ++ "\n"
                     else
-                        "fx logout: local Grok session removed, but remote revocation could not be confirmed\n");
+                        "fx logout: local grok session removed, but remote revocation could not be confirmed\n");
                 } else {
                     retryKeptSignOuts(alloc, cfg, deps, .grok);
                 }
                 return switch (outcome.deletion) {
                     .deleted => result: {
-                        try writeStdout(deps, "Signed out of Grok.\n");
+                        try writeStdout(deps, "signed out of grok.\n");
                         break :result .handled_success;
                     },
                     .missing => result: {
-                        try writeStdout(deps, "No Grok login session found.\n");
+                        try writeStdout(deps, "no grok login session found.\n");
                         break :result .handled_success;
                     },
                     .deleted_not_durable => result: {
-                        try writeStderr(deps, "fx logout: failed to durably remove saved Grok login\n");
+                        try writeStderr(deps, "fx logout: failed to durably remove saved grok login\n");
                         break :result .handled_failure;
                     },
                 };
@@ -1764,7 +1764,7 @@ fn runNonInteractiveWithDeps(
             } else {
                 try writeStdout(
                     deps,
-                    if (result.session_deleted) "Signed out of fx.\n" else "No fx login session found.\n",
+                    if (result.session_deleted) "signed out of fx.\n" else "no fx login session found.\n",
                 );
             }
             if (result.remote_revocation_failed) {
@@ -1797,10 +1797,10 @@ fn runNonInteractiveWithDeps(
                 const message = switch (err) {
                     error.NoSession => "fx teams: run fx login first\n",
                     error.SessionChanged => "fx teams: authentication changed; try again\n",
-                    error.TeamRequestFailed => "fx teams: failed to list Vercel teams\n",
+                    error.TeamRequestFailed => "fx teams: failed to list vercel teams\n",
                     error.InvalidTeamSelection => "fx teams: no team selected\n",
                     error.AccessDenied => "fx teams: authorization denied\n",
-                    error.TeamValidationFailed => "fx teams: selected team could not access AI Gateway\n",
+                    error.TeamValidationFailed => "fx teams: selected team could not access AI gateway\n",
                     else => "fx teams: failed to switch team\n",
                 };
                 try writeStderr(deps, message);
@@ -1974,10 +1974,10 @@ fn runNonInteractiveWithDeps(
             available_providers.definitions = startup.configured_providers.definitions;
             const catalog_provider = available_providers.select(startup.provider).cli_model_catalog orelse {
                 try writeStderr(deps, switch (startup.provider) {
-                    .gateway => "fx models: Gateway model catalog is unavailable\n",
-                    .codex => "fx models: Codex model catalog is unavailable\n",
-                    .grok => "fx models: Grok model catalog is unavailable\n",
-                    .configured => "fx models: Configured model catalog is unavailable\n",
+                    .gateway => "fx models: gateway model catalog is unavailable\n",
+                    .codex => "fx models: codex model catalog is unavailable\n",
+                    .grok => "fx models: grok model catalog is unavailable\n",
+                    .configured => "fx models: configured model catalog is unavailable\n",
                 });
                 return .handled_failure;
             };
@@ -2510,7 +2510,7 @@ fn runPasteSetup(
         return false;
     }
 
-    try writeStderr(deps, "Paste AI Gateway API key (input hidden): ");
+    try writeStderr(deps, "paste AI gateway API key (input hidden): ");
     const stored_interactively = secret_store.storeInteractive() catch {
         try writeStderr(deps, "\n");
         try writePasteFailure(alloc, deps, command, "API key was not saved");
@@ -2536,7 +2536,7 @@ fn runPasteSetup(
     }
 
     const message = try alloc.print(
-        "Saved API key to {s}.\n",
+        "saved API key to {s}.\n",
         .{secret_store.backend_label},
     );
     defer alloc.free(message);
@@ -2947,9 +2947,9 @@ fn openTopLevelMcpUrl(
     const presentation: *const McpCliAuthorization = @ptrCast(@alignCast(raw.?));
     var encoded_url = try text_utils.encodeTerminalSafe(alloc, url, std.math.maxInt(usize));
     defer encoded_url.deinit(alloc);
-    try writeStdout(presentation.deps, "Open this URL to authenticate the MCP server:\n");
+    try writeStdout(presentation.deps, "open this URL to authenticate the MCP server:\n");
     try writeStdout(presentation.deps, encoded_url.bytes);
-    try writeStdout(presentation.deps, "\n\nWaiting for browser authorization...\n");
+    try writeStdout(presentation.deps, "\n\nwaiting for browser authorization...\n");
     if (io_mod.getenv("FX_NO_OPEN_BROWSER") == null) {
         _ = try presentation.opener.open(alloc, url);
     }
@@ -3278,7 +3278,7 @@ fn catalogFailureDetail(failure: model_catalog.Failure) []const u8 {
         .cancellation => "the request was cancelled",
         .malformed_response => "MalformedResponse",
         .resource_exhausted => "OutOfMemory",
-        .rate_limited, .gateway_unavailable, .transport, .http_status, .runtime => "Unavailable",
+        .rate_limited, .gateway_unavailable, .transport, .http_status, .runtime => "unavailable",
     };
 }
 
@@ -4478,17 +4478,17 @@ const LogoutWaitLine = struct {
     text: []const u8,
 
     const request_s = oauth_transport.default_request_timeout_ms / std.time.ms_per_s;
-    const codex = std.fmt.comptimePrint("revoking the Codex login at OpenAI (up to {d} s)...\n", .{request_s});
-    const grok = std.fmt.comptimePrint("revoking the Grok login at xAI (up to {d} s)...\n", .{request_s});
+    const codex = std.fmt.comptimePrint("revoking the codex login at OpenAI (up to {d} s)...\n", .{request_s});
+    const grok = std.fmt.comptimePrint("revoking the grok login at xAI (up to {d} s)...\n", .{request_s});
     /// The fx login asks for its issuer's endpoints, then revokes two tokens
     /// (`login_flow.revokeLoggedOutSession`), each request with its own limit.
-    const fx_login = std.fmt.comptimePrint("revoking the fx login at Vercel (up to {d} s)...\n", .{3 * request_s});
+    const fx_login = std.fmt.comptimePrint("revoking the fx login at vercel (up to {d} s)...\n", .{3 * request_s});
 
     /// Before a retry of sign-outs that earlier logouts kept
     /// (`pending_revocation.retry`), which sends one sign-out after another.
-    const codex_kept = std.fmt.comptimePrint("revoking earlier Codex sign-outs at OpenAI (up to {d} s each)...\n", .{request_s});
-    const grok_kept = std.fmt.comptimePrint("revoking earlier Grok sign-outs at xAI (up to {d} s each)...\n", .{request_s});
-    const fx_login_kept = std.fmt.comptimePrint("revoking earlier fx sign-outs at Vercel (up to {d} s each)...\n", .{3 * request_s});
+    const codex_kept = std.fmt.comptimePrint("revoking earlier codex sign-outs at OpenAI (up to {d} s each)...\n", .{request_s});
+    const grok_kept = std.fmt.comptimePrint("revoking earlier grok sign-outs at xAI (up to {d} s each)...\n", .{request_s});
+    const fx_login_kept = std.fmt.comptimePrint("revoking earlier fx sign-outs at vercel (up to {d} s each)...\n", .{3 * request_s});
 
     fn notice(self: *const LogoutWaitLine) ?oauth.BeforeRevocation {
         if (builtin.is_test or !stderrIsTerminal()) return null;
@@ -4782,8 +4782,8 @@ fn channelSavedLine(
     outcome: config_runtime.CommitOutcome,
 ) ![]u8 {
     return switch (outcome) {
-        .unchanged => alloc.print("Release channel is already {s}.\n", .{channel.label()}),
-        .committed => alloc.print("Release channel set to {s} in {s}/settings.json.\n", .{ channel.label(), profile_paths.displayRoot() }),
+        .unchanged => alloc.print("release channel is already {s}.\n", .{channel.label()}),
+        .committed => alloc.print("release channel set to {s} in {s}/settings.json.\n", .{ channel.label(), profile_paths.displayRoot() }),
     };
 }
 
@@ -5688,11 +5688,11 @@ test "upgrade channel saved line says whether the file changed" {
     const alloc = std.testing.allocator;
     const set = try channelSavedLine(alloc, .dev, .{ .committed = .{ .scope = .user } });
     defer alloc.free(set);
-    try std.testing.expectEqualStrings("Release channel set to dev in ~/.fx/settings.json.\n", set);
+    try std.testing.expectEqualStrings("release channel set to dev in ~/.fx/settings.json.\n", set);
 
     const same = try channelSavedLine(alloc, .stable, .unchanged);
     defer alloc.free(same);
-    try std.testing.expectEqualStrings("Release channel is already stable.\n", same);
+    try std.testing.expectEqualStrings("release channel is already stable.\n", same);
 }
 
 test "runIfRequested names an upgrade channel that does not exist" {
@@ -6106,7 +6106,7 @@ test "runIfRequested help writes top-level help" {
 
     const result = try runIfRequestedWithDeps(std.testing.allocator, &.{@constCast("help")}, testConfig(), capture.deps());
     try std.testing.expectEqual(RunResult.handled_success, result);
-    try std.testing.expect(std.mem.startsWith(u8, capture.stdout.written(), "𝒇x v0.0.0\nFast, native coding agent for the terminal."));
+    try std.testing.expect(std.mem.startsWith(u8, capture.stdout.written(), "𝒇x v0.0.0\nfast, native coding agent for the terminal."));
     try std.testing.expect(std.mem.find(u8, capture.stdout.written(), testConfig().version) != null);
     try std.testing.expectEqualStrings("", capture.stderr.written());
 }
@@ -6140,7 +6140,7 @@ test "top-level MCP approve runs without interactive startup" {
     // The test config loads no host, so there is no project server to approve.
     try std.testing.expectEqual(RunResult.handled_failure, result);
     try std.testing.expectEqualStrings("", capture.stdout.written());
-    try std.testing.expectEqualStrings("No project server named fixture in .mcp.json.\n", capture.stderr.written());
+    try std.testing.expectEqualStrings("no project server named fixture in .mcp.json.\n", capture.stderr.written());
 }
 
 test "top-level MCP and usage treat a relative HOME as unset" {
@@ -6281,8 +6281,8 @@ test "setup is a paste-only stored-key adapter" {
     try std.testing.expectEqual(@as(usize, 1), capture.setup_store_calls);
     try std.testing.expectEqual(@as(usize, 1), capture.setup_read_calls);
     try std.testing.expect(capture.setup_value_matched);
-    try std.testing.expect(std.mem.find(u8, capture.stderr.written(), "Paste AI Gateway API key") != null);
-    try std.testing.expect(std.mem.find(u8, capture.stderr.written(), "Vercel CLI") == null);
+    try std.testing.expect(std.mem.find(u8, capture.stderr.written(), "paste AI gateway API key") != null);
+    try std.testing.expect(std.mem.find(u8, capture.stderr.written(), "vercel CLI") == null);
     try std.testing.expect(std.mem.find(u8, capture.stdout.written(), cfg.secret_store.backend_label) != null);
 }
 
@@ -6473,7 +6473,7 @@ test "runNoConfigIfRequested handles help without config" {
         testCommandCatalog(),
         capture.deps(),
     ));
-    try std.testing.expect(std.mem.startsWith(u8, capture.stdout.written(), "𝒇x v0.0.0\nFast, native coding agent for the terminal."));
+    try std.testing.expect(std.mem.startsWith(u8, capture.stdout.written(), "𝒇x v0.0.0\nfast, native coding agent for the terminal."));
     try std.testing.expectEqualStrings("", capture.stderr.written());
 
     try std.testing.expect(!try runNoConfigIfRequestedWithDeps(
@@ -6922,7 +6922,7 @@ test "runIfRequested model fetch failure is handled" {
     const result = try runIfRequestedWithDeps(std.testing.allocator, &.{@constCast("models")}, cfg, deps);
     try std.testing.expectEqual(RunResult.handled_failure, result);
     try std.testing.expectEqualStrings(
-        "fx models: could not list models: Unavailable\n",
+        "fx models: could not list models: unavailable\n",
         capture.stderr.written(),
     );
 }
@@ -6945,7 +6945,7 @@ test "runIfRequested model fetch failure preserves json output" {
     );
     try std.testing.expectEqual(RunResult.handled_failure, result);
     try std.testing.expectEqualStrings(
-        "{\"kind\":\"models\",\"error\":\"could not list models: Unavailable\",\"code\":\"Unavailable\"}\n",
+        "{\"kind\":\"models\",\"error\":\"could not list models: unavailable\",\"code\":\"Unavailable\"}\n",
         capture.stdout.written(),
     );
     try std.testing.expectEqualStrings("", capture.stderr.written());
@@ -7002,7 +7002,7 @@ test "runIfRequested models json describes each model from its catalog entry" {
     try std.testing.expectEqual(RunResult.handled_success, result);
     try std.testing.expectEqualStrings(
         "{\"kind\":\"models\",\"count\":1,\"shown_count\":1,\"more_count\":0,\"private_models_hidden\":false," ++
-            "\"ids\":[\"private/blue-hornbill\"],\"models\":[{\"id\":\"private/blue-hornbill\",\"name\":\"Blue Hornbill\"," ++
+            "\"ids\":[\"private/blue-hornbill\"],\"models\":[{\"id\":\"private/blue-hornbill\",\"name\":\"blue hornbill\"," ++
             "\"efforts\":[\"low\",\"high\"],\"fast\":true,\"ultrafast\":true}]}\n",
         capture.stdout.written(),
     );
@@ -7119,7 +7119,7 @@ test "runIfRequested local json success appends exactly one newline" {
     const result = try runIfRequestedWithDeps(std.testing.allocator, &.{ @constCast("status"), @constCast("--json") }, testConfig(), deps);
     try std.testing.expectEqual(RunResult.handled_success, result);
     try std.testing.expectEqualStrings(
-        "{\"kind\":\"status\",\"model\":\"test-model\",\"model_origin\":\"default\",\"effort\":\"auto\",\"update_channel\":\"stable\",\"build_channel\":\"stable\",\"build_revision\":\"\",\"auth\":\"missing\",\"auth_refreshable\":false,\"auth_help\":\"fx needs access to Vercel AI Gateway. Run fx login to sign in, fx login vercel --api-key to use an API key, or set AI_GATEWAY_API_KEY.\",\"permission_mode\":\"auto\",\"workspace\":\"/tmp/fx\",\"history_turns\":0,\"session_permission_grants\":0,\"agent_step_limit\":42,\"ultrafast_requested\":false,\"mcp\":{\"connection_check\":\"not_checked\",\"servers\":[],\"configuration_issues\":[],\"inspection_error\":null}}\n",
+        "{\"kind\":\"status\",\"model\":\"test-model\",\"model_origin\":\"default\",\"effort\":\"auto\",\"update_channel\":\"stable\",\"build_channel\":\"stable\",\"build_revision\":\"\",\"auth\":\"missing\",\"auth_refreshable\":false,\"auth_help\":\"fx needs access to vercel AI gateway. run fx login to sign in, fx login vercel --api-key to use an API key, or set AI_GATEWAY_API_KEY.\",\"permission_mode\":\"auto\",\"workspace\":\"/tmp/fx\",\"history_turns\":0,\"session_permission_grants\":0,\"agent_step_limit\":42,\"ultrafast_requested\":false,\"mcp\":{\"connection_check\":\"not_checked\",\"servers\":[],\"configuration_issues\":[],\"inspection_error\":null}}\n",
         capture.stdout.written(),
     );
     try std.testing.expect(!std.mem.endsWith(u8, capture.stdout.written(), "\n\n"));
@@ -7209,7 +7209,7 @@ test "writeRenderedJsonLine falls back to heap and appends exactly one newline" 
     );
 
     try std.testing.expectEqualStrings(
-        "{\"kind\":\"status\",\"model\":\"test-model\",\"model_origin\":\"default\",\"effort\":\"auto\",\"update_channel\":\"stable\",\"build_channel\":\"stable\",\"build_revision\":\"\",\"auth\":\"missing\",\"auth_refreshable\":false,\"auth_help\":\"fx needs access to Vercel AI Gateway. Run fx login to sign in, fx login vercel --api-key to use an API key, or set AI_GATEWAY_API_KEY.\",\"permission_mode\":\"ask\",\"workspace\":\"/tmp/fx\",\"history_turns\":0,\"session_permission_grants\":0,\"agent_step_limit\":42,\"ultrafast_requested\":true}\n",
+        "{\"kind\":\"status\",\"model\":\"test-model\",\"model_origin\":\"default\",\"effort\":\"auto\",\"update_channel\":\"stable\",\"build_channel\":\"stable\",\"build_revision\":\"\",\"auth\":\"missing\",\"auth_refreshable\":false,\"auth_help\":\"fx needs access to vercel AI gateway. run fx login to sign in, fx login vercel --api-key to use an API key, or set AI_GATEWAY_API_KEY.\",\"permission_mode\":\"ask\",\"workspace\":\"/tmp/fx\",\"history_turns\":0,\"session_permission_grants\":0,\"agent_step_limit\":42,\"ultrafast_requested\":true}\n",
         capture.stdout.written(),
     );
 }
@@ -7509,7 +7509,7 @@ const ModelFetchProbe = struct {
     fn describedEntry(alloc: Allocator) !model_catalog.ModelCatalogEntry {
         const id = try alloc.dupe(u8, "private/blue-hornbill");
         errdefer alloc.free(id);
-        const name = try alloc.dupe(u8, "Blue Hornbill");
+        const name = try alloc.dupe(u8, "blue hornbill");
         errdefer alloc.free(name);
         const model_type = try alloc.dupe(u8, "language");
         errdefer alloc.free(model_type);

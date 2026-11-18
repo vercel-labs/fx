@@ -193,7 +193,7 @@ pub fn PasteEditRuntime(comptime App: type) type {
                 try app.writeDomainNotice(.{
                     .topic = "input",
                     .tone = .warning,
-                    .body = "Input that arrived right after the paste was ignored.",
+                    .body = "input that arrived right after the paste was ignored.",
                 }, true);
             }
             return true;
@@ -217,7 +217,7 @@ pub fn PasteEditRuntime(comptime App: type) type {
                     try app.writeDomainNotice(.{
                         .topic = "auth",
                         .tone = .@"error",
-                        .body = "The authorization code is too long.",
+                        .body = "the authorization code is too long.",
                     }, true);
                     return;
                 }
@@ -262,7 +262,7 @@ pub fn PasteEditRuntime(comptime App: type) type {
                 try app.writeDomainNotice(.{
                     .topic = "input",
                     .tone = .@"error",
-                    .body = "Pasted text contains unsupported bytes and was not added to the draft.",
+                    .body = "pasted text contains unsupported bytes and was not added to the draft.",
                 }, true);
                 return;
             }
@@ -347,7 +347,7 @@ pub fn PasteEditRuntime(comptime App: type) type {
                             try app.writeDomainNotice(.{
                                 .topic = "auth",
                                 .tone = .@"error",
-                                .body = "The authorization code is invalid.",
+                                .body = "the authorization code is invalid.",
                             }, true);
                             return;
                         }

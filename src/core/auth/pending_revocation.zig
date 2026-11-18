@@ -44,8 +44,8 @@ pub const Source = enum {
 
     fn files(self: Source) Files {
         return switch (self) {
-            .codex => .{ .record = "chatgpt-revocations.json", .lock = "chatgpt-revocations.lock", .label = "Codex kept sign-outs" },
-            .grok => .{ .record = "grok-revocations.json", .lock = "grok-revocations.lock", .label = "Grok kept sign-outs" },
+            .codex => .{ .record = "chatgpt-revocations.json", .lock = "chatgpt-revocations.lock", .label = "codex kept sign-outs" },
+            .grok => .{ .record = "grok-revocations.json", .lock = "grok-revocations.lock", .label = "grok kept sign-outs" },
             .fx_login => .{ .record = "auth-revocations.json", .lock = "auth-revocations.lock", .label = "fx login kept sign-outs" },
         };
     }

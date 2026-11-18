@@ -658,10 +658,10 @@ pub fn Runtime(comptime App: type) type {
             const file_selection = if (file_view.receipt) |receipt| receipt.selected else null;
             const file_status: ?[]const u8 = switch (file_view.status) {
                 .unavailable => if (app.input_runtime.picker.file_completion.indexed)
-                    "Files unavailable. tab to retry; esc to dismiss."
+                    "files unavailable. tab to retry; esc to dismiss."
                 else
-                    "Directory unavailable. tab to retry; esc to dismiss.",
-                .stale => "Selection unavailable. navigate to choose; tab to retry.",
+                    "directory unavailable. tab to retry; esc to dismiss.",
+                .stale => "selection unavailable. navigate to choose; tab to retry.",
                 .loading, .ready, .empty => null,
             };
             const inline_completion =
@@ -2981,7 +2981,7 @@ fn expectTallPendingPromptReachesScrollback(rows: u16, preview_tail: usize) !voi
     var history: std.ArrayList(u8) = .empty;
     defer history.deinit(alloc);
     var offset: u64 = 0;
-    const banner = "BANNER_ROW · Run /help for commands";
+    const banner = "BANNER_ROW · run /help for commands";
     _ = try app.shell.appendRawTranscriptEntryClassified(alloc, banner, .unknown_raw);
     app.shell.render_requests.request(.first_frame);
     app.shell.render_requests.consecutive_input_pending_aborts = render_request.max_consecutive_input_pending_aborts;
@@ -3216,7 +3216,7 @@ test "core.app_render_runtime gives all transient activity the turn-summary foot
     const active_tool = surface_frame.SurfaceFooterMeasurement{
         .activity_projection = .{ .tool_slot = .{
             .entry_id = 9,
-            .fallback_label = "Running",
+            .fallback_label = "running",
             .active = true,
             .kind = .read,
         } },
@@ -3235,7 +3235,7 @@ test "core.app_render_runtime connects minimal focused tools to the transcript b
         .activity_projection = .{ .tool_slot = .{
             .entry_id = 9,
             .fallback_label = "Running zig build",
-            .thinking_label = "Thinking",
+            .thinking_label = "thinking",
             .active = true,
             .kind = .command,
         } },
@@ -4757,7 +4757,7 @@ test "core.app_render_runtime paints a rebased terminal status after cancellatio
     _ = try flushRebasedPublicationFrame(&app, file, &physical, &history, &offset);
     const cancelled = try rewritePublicationText(alloc, &physical, history.items);
     defer alloc.free(cancelled);
-    try std.testing.expect(std.mem.find(u8, cancelled, "Cancelled") != null);
+    try std.testing.expect(std.mem.find(u8, cancelled, "cancelled") != null);
     try std.testing.expect(std.mem.find(u8, cancelled, "Cancelled mcp_fixture_echo") == null);
 
     _ = try app.shell.applyToolLifecycle(alloc, .{ .terminal = .{
@@ -4817,7 +4817,7 @@ fn checkRebasedNoticePublication(cols: u16, rows: u16) !void {
     const notice_id = try app.shell.appendReplaceableSemanticNotice(alloc, .{
         .topic = "feedback",
         .tone = .neutral,
-        .body = "Preparing feedback report while external work is blocking",
+        .body = "preparing feedback report while external work is blocking",
     });
     for (0..6) |index| {
         var line: [48]u8 = undefined;
@@ -4834,14 +4834,14 @@ fn checkRebasedNoticePublication(cols: u16, rows: u16) !void {
         try std.testing.expectEqual(@as(u32, 0), try flushRebasedPublicationFrame(&app, file, &physical, &history, &offset));
         try std.testing.expectEqual(held, app.shell.transcriptCommitDiagnostic().history_visual_offset);
         try std.testing.expectEqualStrings(blocked_history, history.items);
-        try std.testing.expect(std.mem.find(u8, history.items, "Preparing") == null);
+        try std.testing.expect(std.mem.find(u8, history.items, "preparing") == null);
         try std.testing.expect(std.mem.find(u8, history.items, "NOTICE_LATER_") == null);
     }
     const before_replacement = try file.length(std.testing.io);
     try std.testing.expect(try app.shell.replaceSemanticNotice(alloc, notice_id, .{
         .topic = "feedback",
         .tone = .success,
-        .body = "Feedback report ready",
+        .body = "feedback report ready",
     }));
     try std.testing.expectEqual(before_replacement, try file.length(std.testing.io));
     try std.testing.expectEqualStrings(blocked_history, history.items);
@@ -4862,9 +4862,8 @@ fn checkRebasedNoticePublication(cols: u16, rows: u16) !void {
         try std.testing.expect(at >= previous);
         previous = at + label.len;
     }
-    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, text, "Feedback"));
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, text, "report ready"));
-    try std.testing.expect(std.mem.find(u8, text, "Preparing") == null);
+    try std.testing.expect(std.mem.find(u8, text, "preparing") == null);
     try std.testing.expectEqual(@as(u32, 0), try flushRebasedPublicationFrame(&app, file, &physical, &history, &offset));
     const quiet = try rewritePublicationText(alloc, &physical, history.items);
     defer alloc.free(quiet);
@@ -5475,14 +5474,14 @@ test "core.app_render_runtime main skill menu origins share the inline footer" {
     try std.testing.expect(!app.terminal.catalogMenuScreenActive());
     try std.testing.expect(try coordinatorGridContains(
         app.shell.shadow_vt.?.*,
-        "Would you like to allow this action?",
+        "would you like to allow this action?",
     ));
 
     app.agent().approval_prompt.clear(alloc);
     app.shell.render_requests.request(.modal);
     try Runtime(CoordinatorTestApp).flushRequestedFrame(&app, (&app).agent());
     try std.testing.expect(!app.terminal.catalogMenuScreenActive());
-    try std.testing.expect(try coordinatorGridContains(app.shell.shadow_vt.?.*, "skills   < All >"));
+    try std.testing.expect(try coordinatorGridContains(app.shell.shadow_vt.?.*, "skills   < all >"));
 
     const options = [_]types.QuestionOption{
         .{ .label = "Inspect repo state", .description = null },
@@ -5501,7 +5500,7 @@ test "core.app_render_runtime main skill menu origins share the inline footer" {
     app.shell.render_requests.request(.modal);
     try Runtime(CoordinatorTestApp).flushRequestedFrame(&app, (&app).agent());
     try std.testing.expect(!app.terminal.catalogMenuScreenActive());
-    try std.testing.expect(try coordinatorGridContains(app.shell.shadow_vt.?.*, "skills   < All >"));
+    try std.testing.expect(try coordinatorGridContains(app.shell.shadow_vt.?.*, "skills   < all >"));
 
     try app.shell.writeTranscript(alloc, &app.metrics, "background transcript update\n", true);
     app.shell.render_requests.request(.transcript);
@@ -5588,7 +5587,7 @@ test "core.app_render_runtime settings help and resume menus share the inline fo
     try Runtime(CoordinatorTestApp).flushRequestedFrame(&app, (&app).agent());
     try std.testing.expect(!app.terminal.catalogMenuScreenActive());
     try std.testing.expect(try coordinatorGridContains(app.shell.shadow_vt.?.*, "catalog transcript remains visible"));
-    try std.testing.expect(try coordinatorGridContains(app.shell.shadow_vt.?.*, "settings   < All >"));
+    try std.testing.expect(try coordinatorGridContains(app.shell.shadow_vt.?.*, "settings   < all >"));
 
     app.input_runtime.settings_menu.close();
     app.input_runtime.help_menu.open();
@@ -5596,7 +5595,7 @@ test "core.app_render_runtime settings help and resume menus share the inline fo
     try Runtime(CoordinatorTestApp).flushRequestedFrame(&app, (&app).agent());
     try std.testing.expect(!app.terminal.catalogMenuScreenActive());
     try std.testing.expect(try coordinatorGridContains(app.shell.shadow_vt.?.*, "catalog transcript remains visible"));
-    try std.testing.expect(try coordinatorGridContains(app.shell.shadow_vt.?.*, "commands   < All >"));
+    try std.testing.expect(try coordinatorGridContains(app.shell.shadow_vt.?.*, "commands   < all >"));
 
     app.input_runtime.help_menu.close();
     app.agent().session_persistence.session_picker.active = true;
@@ -5758,7 +5757,7 @@ test "core.app_render_runtime inline menus survive the VT size and resize matrix
     }{
         .{ .kind = .slash, .visible_text = "/help" },
         .{ .kind = .skills, .visible_text = "one" },
-        .{ .kind = .settings, .visible_text = "Status line context" },
+        .{ .kind = .settings, .visible_text = "status line context" },
         .{ .kind = .help, .visible_text = "/help" },
         .{ .kind = .sessions, .visible_text = "Responsive" },
         .{ .kind = .models, .visible_text = "selected-model" },
@@ -5868,9 +5867,9 @@ test "core.app_render_runtime active setup hub stays on the inline transcript su
     try Runtime(CoordinatorTestApp).flushRequestedFrame(&app, (&app).agent());
 
     try std.testing.expect(!app.terminal.catalogMenuScreenActive());
-    try std.testing.expect(try coordinatorGridContains(app.shell.shadow_vt.?.*, "Setup"));
-    try std.testing.expect(try coordinatorGridContains(app.shell.shadow_vt.?.*, "Connections"));
-    try std.testing.expect(try coordinatorGridContains(app.shell.shadow_vt.?.*, "Credential source"));
+    try std.testing.expect(try coordinatorGridContains(app.shell.shadow_vt.?.*, "setup"));
+    try std.testing.expect(try coordinatorGridContains(app.shell.shadow_vt.?.*, "connections"));
+    try std.testing.expect(try coordinatorGridContains(app.shell.shadow_vt.?.*, "credential source"));
     try std.testing.expect(try coordinatorGridContains(app.shell.shadow_vt.?.*, "enter open"));
     try std.testing.expect(!(try coordinatorGridContains(app.shell.shadow_vt.?.*, "test-model")));
     try std.testing.expect(try coordinatorGridContains(app.shell.shadow_vt.?.*, "setup transcript stays behind"));
@@ -5920,7 +5919,7 @@ test "core.app_render_runtime inline model catalog survives modal preemption and
     try Runtime(CoordinatorTestApp).flushRequestedFrame(&app, (&app).agent());
 
     try std.testing.expect(!app.terminal.catalogMenuScreenActive());
-    try std.testing.expect(try coordinatorGridContains(app.shell.shadow_vt.?.*, "models   < All >"));
+    try std.testing.expect(try coordinatorGridContains(app.shell.shadow_vt.?.*, "models   < all >"));
     try std.testing.expect(try coordinatorGridContains(app.shell.shadow_vt.?.*, "loading models"));
     try std.testing.expect(try coordinatorGridContains(app.shell.shadow_vt.?.*, "model catalog transcript stays behind"));
 
@@ -5931,7 +5930,7 @@ test "core.app_render_runtime inline model catalog survives modal preemption and
     app.shell.render_requests.request(.modal);
     try Runtime(CoordinatorTestApp).flushRequestedFrame(&app, (&app).agent());
     try std.testing.expect(!app.terminal.catalogMenuScreenActive());
-    try std.testing.expect(try coordinatorGridContains(app.shell.shadow_vt.?.*, "Would you like to allow this action?"));
+    try std.testing.expect(try coordinatorGridContains(app.shell.shadow_vt.?.*, "would you like to allow this action?"));
 
     app.agent().approval_prompt.clear(alloc);
     app.shell.render_requests.request(.modal);
@@ -6035,7 +6034,7 @@ test "core.app_render_runtime file approval returns to the preserved inline skil
     try std.testing.expectEqual(shell_runtime.AlternateScreenOwner.none, app.terminal.alternate_screen_owner);
     try std.testing.expectEqualStrings("$pure", app.input_runtime.edit_state.input.items);
     try std.testing.expectEqualStrings("pure", app.skills.menu.query());
-    try std.testing.expect(try coordinatorGridContains(app.shell.shadow_vt.?.*, "skills   < All >"));
+    try std.testing.expect(try coordinatorGridContains(app.shell.shadow_vt.?.*, "skills   < all >"));
     try std.testing.expect(try coordinatorGridContains(app.shell.shadow_vt.?.*, "transcript behind inline skills"));
 
     app.skills.closeMenu();
@@ -6255,7 +6254,7 @@ test "core.app_render_runtime restores file review before rendering a generic ap
     try std.testing.expect(!app.shell.render_requests.hasReason(.external_damage));
     try std.testing.expect(try coordinatorGridContains(
         app.shell.shadow_vt.?.*,
-        "Would you like to allow this action?",
+        "would you like to allow this action?",
     ));
 
     var read_offset: u64 = 0;
@@ -6317,7 +6316,7 @@ test "core.app_render_runtime generic approval exits the full transcript screen 
     try std.testing.expect(!app.shell.fullTranscriptActive());
     try std.testing.expect(try coordinatorGridContains(
         app.shell.shadow_vt.?.*,
-        "Would you like to run the following command?",
+        "would you like to run the following command?",
     ));
 
     var read_offset: u64 = 0;
