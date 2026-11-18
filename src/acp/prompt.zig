@@ -11,6 +11,7 @@ const model_provider = @import("../core/config/model_provider.zig");
 const host = @import("../core/hosts/host.zig");
 const host_target = @import("../core/hosts/target.zig");
 const session_title_generation = @import("../core/session/session_title_generation.zig");
+const session_display_metadata = @import("../core/session/session_display_metadata.zig");
 const js_host_tools = if (host_target.is_wasm)
     @import("../core/hosts/js_host_tools.zig")
 else
@@ -1146,7 +1147,7 @@ pub fn handlePrompt(
         .custom_tool_guidance = tool_projection.custom_guidance,
     }, current_prompt_is_root_authority);
     agent_config.session_child_capability = sessionChildCapability(session);
-    maybeStartAcpTitleTask(state, session, owned_prompt, recovery_checkpoint != null, ctx.observer, ctx.observationSink());
+    maybeStartAcpTitleTask(state, session, .{ .text = @constCast(owned_prompt), .context_provenance = job.context_provenance }, recovery_checkpoint != null, ctx.observer, ctx.observationSink());
     defer if (session.title_task != null) completeAcpTitleTask(state, session, alloc);
     agent_runtime.processAgentPrompt(&session.session_rt.agent, &deps, null, .{
         .view = state.lifecycle_view,
@@ -1203,7 +1204,7 @@ pub fn handlePrompt(
 fn maybeStartAcpTitleTask(
     state: *server.ServerState,
     session: *server.ActiveSessionState,
-    prompt_text: []const u8,
+    user: types.UserTurn,
     recovery: bool,
     observer: ?*observation.Observer,
     observation_sink: observations.Sink,
@@ -1219,7 +1220,9 @@ fn maybeStartAcpTitleTask(
     const bundle = state.cfg.provider_set.select(session.provider);
     const title_model = bundle.title_model orelse return;
     const agent_stream = bundle.agent_stream orelse return;
-    const excerpt = session_title_generation.promptExcerpt(prompt_text) orelse return;
+    const display_prompt = (session_display_metadata.userTextForDisplay(state.alloc, user) catch return) orelse return;
+    defer state.alloc.free(display_prompt);
+    const excerpt = session_title_generation.promptExcerpt(display_prompt) orelse return;
     if (session.credential_source != .host_managed and session.api_key.len == 0) return;
     const task = session_title_generation.Task.create(.{
         .observer = observer,

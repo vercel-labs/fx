@@ -38,11 +38,12 @@ pub fn missingFallback(alloc: Allocator) !DisplayMetadata {
 }
 
 pub fn deriveFromHistory(alloc: Allocator, history: []const session.HistoryTurn) !DisplayMetadata {
-    const candidate = firstPromptCandidate(history) orelse {
+    const candidate = try firstPromptCandidate(alloc, history) orelse {
         return if (history.len == 0) missingFallback(alloc) else missingFallbackPresent(alloc);
     };
     switch (candidate) {
         .text => |prompt| {
+            defer alloc.free(prompt);
             if (!std.unicode.utf8ValidateSlice(prompt)) return missingFallbackPresent(alloc);
 
             const first_line = firstNonEmptyLine(prompt) orelse return missingFallbackPresent(alloc);
@@ -72,25 +73,43 @@ fn missingFallbackPresent(alloc: Allocator) !DisplayMetadata {
 }
 
 const PromptCandidate = union(enum) {
-    text: []const u8,
+    text: []u8,
     image_only,
 };
 
-fn firstPromptCandidate(history: []const session.HistoryTurn) ?PromptCandidate {
+fn firstPromptCandidate(alloc: Allocator, history: []const session.HistoryTurn) !?PromptCandidate {
     for (history) |turn| {
         switch (turn) {
-            .assistant => |entry| if (promptCandidateFromUser(entry.user)) |candidate| return candidate,
-            .interrupted => |entry| if (promptCandidateFromUser(entry.user)) |candidate| return candidate,
+            .assistant => |entry| if (try promptCandidateFromUser(alloc, entry.user)) |candidate| return candidate,
+            .interrupted => |entry| if (try promptCandidateFromUser(alloc, entry.user)) |candidate| return candidate,
             .compacted_summary => {},
         }
     }
     return null;
 }
 
-fn promptCandidateFromUser(user: session.UserTurn) ?PromptCandidate {
-    const trimmed = std.mem.trim(u8, user.text, " \t\r\n");
-    if (isCanonicalImageOnlyText(user.text, user.images)) return .image_only;
-    if (trimmed.len > 0 and !isSlashCommandOnly(trimmed)) return .{ .text = user.text };
+/// Returns owned display text, excluding host context when provenance is present.
+pub fn userTextForDisplay(alloc: Allocator, user: session.UserTurn) !?[]u8 {
+    if (user.context_provenance.data == null) return try alloc.dupe(u8, user.text);
+    if (!user.context_provenance.matches(user.text)) return null;
+    var projected: std.ArrayList(u8) = .empty;
+    errdefer projected.deinit(alloc);
+    for (user.context_provenance.spans()) |span| {
+        if (span.category != .current_user) continue;
+        if (projected.items.len > 0) try projected.append(alloc, '\n');
+        try projected.appendSlice(alloc, user.text[span.start..span.end]);
+    }
+    return try projected.toOwnedSlice(alloc);
+}
+
+fn promptCandidateFromUser(alloc: Allocator, user: session.UserTurn) !?PromptCandidate {
+    const prompt = try userTextForDisplay(alloc, user) orelse return null;
+    errdefer alloc.free(prompt);
+    const trimmed = std.mem.trim(u8, prompt, " \t\r\n");
+    if (!isCanonicalImageOnlyText(prompt, user.images) and trimmed.len > 0 and !isSlashCommandOnly(trimmed)) {
+        return .{ .text = prompt };
+    }
+    alloc.free(prompt);
     if (user.images.len > 0) return .image_only;
     return null;
 }
