@@ -255,6 +255,18 @@ fn statusNamesAsk(entry: TranscriptEntry, detail: ?*const ToolDetailRecord) bool
     };
 }
 
+/// Whether a row shows a subagent's report or message: a subagent call with
+/// empty arguments (src/core/subagent/reports.zig, Row.call). Live, main's
+/// calls have a presentation group and this row has none, so it never joins
+/// their group. Resumed rows have no presentation group, so a run of rows
+/// splits where such rows start and end instead.
+fn isSubagentUpdateRow(detail: ?*const ToolDetailRecord) bool {
+    const record = detail orelse return false;
+    if (record.activity_kind != .subagent or !std.mem.eql(u8, record.tool_name, "subagent")) return false;
+    const arguments = record.arguments_json orelse return false;
+    return std.mem.eql(u8, arguments, "{}");
+}
+
 fn isAttachedEntry(entry: TranscriptEntry) bool {
     return switch (entry) {
         .raw_bytes => |raw| raw.class == .command_output or raw.class == .diff_block,
@@ -4423,6 +4435,7 @@ fn fillProjection(
         }
 
         const first_index = index;
+        const updates_run = isSubagentUpdateRow(detail);
         var status_indices: std.ArrayList(usize) = .empty;
         defer status_indices.deinit(alloc);
         var summary: Summary = .{};
@@ -4434,6 +4447,7 @@ fn fillProjection(
             if (toolStatusEntryId(entries[index])) |group_entry_id| {
                 const group_detail = detailForEntry(details, detail_indices, group_entry_id, stats);
                 if (statusNamesAsk(entries[index], group_detail)) break;
+                if (isSubagentUpdateRow(group_detail) != updates_run) break;
                 observeTool(&summary, group_detail);
                 try status_indices.append(alloc, index);
                 projection.entry_actions.items[index] = .hide;
@@ -7832,6 +7846,55 @@ test "a message the user sends mid-turn starts a new group for the calls after i
     defer projection.deinit(alloc);
     try std.testing.expect(projection.entry_actions.items[1] == .keep);
     try std.testing.expect(projection.entry_actions.items[2] != .hide);
+}
+
+test "a resumed subagent report keeps its own line after main's calls" {
+    // Live, main's calls share a presentation group and a report's row has
+    // none, so the report shows on a line of its own. Resumed rows have no
+    // presentation group, so they must split at the reports the same way:
+    // reports in a row still share a group, as they do live, and main's
+    // calls after them start their own.
+    const alloc = std.testing.allocator;
+    const entries = [_]TranscriptEntry{
+        .{ .raw_bytes = .{ .id = 1, .bytes = "● sent to reviewer · review the change\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 2, .bytes = "● Read desktop/src/main.ts\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 3, .bytes = "● reviewer completed · Reviewed.\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 4, .bytes = "● tester completed · 24 tests passed.\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 5, .bytes = "● Read desktop/src/window.ts\n", .class = .tool_status } },
+    };
+    const report: ToolDetailRecord = .{
+        .entry_id = 3,
+        .tool_name = @constCast("subagent"),
+        .activity_kind = .subagent,
+        .arguments_json = @constCast("{}"),
+        .outcome = .completed,
+    };
+    var details = [_]ToolDetailRecord{
+        .{
+            .entry_id = 1,
+            .tool_name = @constCast("subagent"),
+            .activity_kind = .subagent,
+            .arguments_json = @constCast("{\"action\":\"message\",\"agent\":\"reviewer\",\"message\":\"review the change\"}"),
+            .outcome = .completed,
+        },
+        storyReadDetailForTest(2, "desktop/src/main.ts"),
+        report,
+        report,
+        storyReadDetailForTest(5, "desktop/src/window.ts"),
+    };
+    details[3].entry_id = 4;
+    const text = try groupTextForTest(alloc, &entries, &details);
+    defer alloc.free(text);
+    try std.testing.expectEqualStrings(
+        "● Started a subagent, read a file\n" ++
+            "├ Messaged reviewer\n" ++
+            "└ Read main.ts\n" ++
+            "● Got subagent updates\n" ++
+            "├ reviewer finished\n" ++
+            "└ tester finished\n" ++
+            "● Read window.ts",
+        std.mem.trim(u8, text, "\n"),
+    );
 }
 
 test "every read in a group shares one row, and so does each search tool" {

@@ -3,7 +3,7 @@
 // repeat one task, a reason line under a failed call, and a recap on the turn
 // summary.
 import { afterEach, expect, test } from "bun:test";
-import { rmSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { FX_BIN } from "../evals/eval-helpers";
 import {
@@ -198,7 +198,7 @@ async function runStory(
     width?: number;
     height?: number;
     settings?: Record<string, unknown>;
-    childReply?: (task: string) => string;
+    childReply?: (task: string) => string | Promise<string>;
   },
 ) {
   const root = createStoryRoot(options.settings);
@@ -551,6 +551,85 @@ test.skipIf(!tmuxAvailable())(
     expect(frames.every((frame) => frame.filter((row) => /^(├|└) .*reviewer/.test(row)).length <= 1)).toBe(true);
   },
   TIMEOUT * 2,
+);
+
+test.skipIf(!tmuxAvailable())(
+  "a report that joins a turn after its calls keeps a line of its own, also after resume",
+  async () => {
+    const encoder = new TextEncoder();
+    let timer: ReturnType<typeof setInterval> | undefined;
+    let sendRead: (() => void) | undefined;
+    let readHeld = () => {};
+    const readStarted = new Promise<void>((resolve) => (readHeld = resolve));
+    // The read's reply waits until the reviewer's report has joined the
+    // open turn, so the turn takes the report right after the read.
+    const heldRead = () =>
+      new Response(
+        new ReadableStream<Uint8Array>({
+          start(controller) {
+            const send = (event: object) => controller.enqueue(encoder.encode(`data: ${JSON.stringify(event)}\n\n`));
+            timer = setInterval(() => controller.enqueue(encoder.encode(": hold-read\n\n")), 50);
+            sendRead = () => {
+              clearInterval(timer);
+              send({ type: "tool-call", toolCallId: "held_read", toolName: "read_file", input: { path: "desktop/src/main.ts" } });
+              send({ type: "finish", finishReason: { unified: "tool-calls", raw: "tool-calls" } });
+              controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+              controller.close();
+            };
+            readHeld();
+          },
+          cancel() {
+            clearInterval(timer);
+          },
+        }),
+        { headers: { "content-type": "text/event-stream" } },
+      );
+    const steps: StoryStep[] = [
+      { at: 0, calls: [{ name: "subagent", input: { action: "message", agent: "reviewer", message: `${CHILD_MARKER} Review the createWindow change.` } }] },
+      { at: 1, response: heldRead },
+      { at: 2, text: "The reviewer is done." },
+    ];
+    const root = createStoryRoot();
+    roots.push(root);
+    // The reviewer answers once main's read is open, so its report cannot
+    // come before the read.
+    const gateway = startStoryGateway(steps, () => readStarted.then(() => "Reviewed."));
+    gateways.push(gateway);
+    const tracePath = join(root.root, "trace.log");
+    const trace = () => existsSync(tracePath) ? readFileSync(tracePath, "utf8") : "";
+    const env = { ...storyEnv(root, gateway), FX_TRACE_LOG: tracePath, FX_TRACE_SCOPES: "worker" };
+    const session = await TmuxSession.create({ cwd: root.workspace, env, width: 110, height: 60 });
+    sessions.push(session);
+    await session.waitForComposer();
+    await session.sendText("ask the reviewer");
+    await session.waitForPane(() => /event=mail_posted .*mail=report delivery=joined/.test(trace()), TIMEOUT);
+    sendRead!();
+    await session.waitForText("The reviewer is done.", TIMEOUT);
+
+    const expectOwnLine = (lines: string[]) => {
+      // Main's calls share a group; the report is a line of its own after
+      // it, not a row of that group.
+      const calls = treeRows(group(lines, /^● /));
+      expect(calls).toEqual(["├ Messaged reviewer", "└ Read main.ts"]);
+      expect(lines.filter((line) => /^● reviewer finished\b/.test(line))).toHaveLength(1);
+      expect(lines.some((line) => /^(├|└) reviewer finished\b/.test(line))).toBe(false);
+    };
+    expectOwnLine(paneLines(await session.waitForComposer(TIMEOUT)));
+
+    await session.kill();
+    sessions.splice(sessions.indexOf(session), 1);
+    const resumed = await TmuxSession.create({
+      cmd: `${FX_BIN} --resume last`,
+      cwd: root.workspace,
+      env: storyEnv(root, gateway),
+      width: 110,
+      height: 60,
+    });
+    sessions.push(resumed);
+    await resumed.waitForText("The reviewer is done.", TIMEOUT);
+    expectOwnLine(paneLines(await resumed.waitForComposer(TIMEOUT)));
+  },
+  TIMEOUT * 3,
 );
 
 test.skipIf(!tmuxAvailable())(
