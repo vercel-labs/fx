@@ -973,6 +973,7 @@ const ReviewTrace = struct {
     /// Why no decision came, or the error's name.
     reason: []const u8 = "",
     rationale: []const u8 = "",
+    attempts: []const diagnostics.AutoReviewAttempt = &.{},
 };
 
 fn reviewTraceOf(review: permission_auto_classifier.ParseOutcome) ReviewTrace {
@@ -1038,6 +1039,7 @@ fn recordAutoReview(
         .action = if (action) |value| reviewedActionText(value) else call.arguments_json,
         .reason = trace.reason,
         .rationale = trace.rationale,
+        .attempts = trace.attempts,
         .at_ms = started_ms,
     });
 }
@@ -1146,7 +1148,7 @@ fn automaticReviewOutcome(
         return reviewerUnavailableOutcome(input, call, .turn_review_budget_exhausted);
     }
 
-    const request = reviewRequestForCall(
+    var request = reviewRequestForCall(
         input,
         arena,
         call,
@@ -1159,6 +1161,8 @@ fn automaticReviewOutcome(
         error.ShellInputSessionEnded => return .{ .tool_failure = try shellInputSessionEndedText(arena, call) },
         else => return err,
     };
+    var attempt_log: permission_auto_classifier.AttemptLog = .{};
+    request.attempt_log = &attempt_log;
     const review = try runAutomaticReview(input, arena, call, request);
     if (nonAllowAutoReviewOutcome(review)) |blocked| return blocked;
     var outcome = if (file_authorization) |authorization|
@@ -1180,6 +1184,25 @@ fn automaticReviewOutcome(
     return outcome;
 }
 
+/// The sends `request`'s review made, for `/trace`. The arena owns the slice.
+fn traceAttempts(arena: Allocator, request: permission_auto_classifier.ReviewRequest) []const diagnostics.AutoReviewAttempt {
+    const log = request.attempt_log orelse return &.{};
+    const out = arena.alloc(diagnostics.AutoReviewAttempt, log.slice().len) catch return &.{};
+    for (log.slice(), out) |attempt, *slot| slot.* = .{
+        .result = switch (attempt.result) {
+            .answered => .answered,
+            .malformed => .malformed,
+            .timed_out => .timed_out,
+            .transient_failure => .transient_failure,
+            .permanent_failure => .permanent_failure,
+            .call_failed => .call_failed,
+            .cancelled => .cancelled,
+        },
+        .elapsed_ms = attempt.elapsed_ms,
+    };
+    return out;
+}
+
 fn runAutomaticReview(
     input: Input,
     arena: Allocator,
@@ -1198,10 +1221,12 @@ fn runAutomaticReview(
             "event=auto_review_result tool_name={s} decision=cancelled_or_error fallback_reason={s} elapsed_ms={d} execution_started=false call_id={s}",
             .{ call.name, @errorName(err), io_mod.milliTimestamp() - started_ms, call.id },
         );
-        recordAutoReview(call, request.review_turn, request.action, .{ .outcome = .@"error", .reason = @errorName(err) }, started_ms, io_mod.milliTimestamp());
+        recordAutoReview(call, request.review_turn, request.action, .{ .outcome = .@"error", .reason = @errorName(err), .attempts = traceAttempts(arena, request) }, started_ms, io_mod.milliTimestamp());
         return err;
     };
-    recordAutoReview(call, request.review_turn, request.action, reviewTraceOf(review), started_ms, io_mod.milliTimestamp());
+    var trace = reviewTraceOf(review);
+    trace.attempts = traceAttempts(arena, request);
+    recordAutoReview(call, request.review_turn, request.action, trace, started_ms, io_mod.milliTimestamp());
     switch (review) {
         .valid => |result| debug_trace.logf(
             "permission",
