@@ -7218,6 +7218,36 @@ test "the user's stop that lands after the slot finished its work and before its
     try std.testing.expectEqual(@as(usize, 0), runtime.user_dropped.items.len);
 }
 
+test "a stop after the run of a turn the user stopped returned counts the message that turn never took" {
+    HeldAfterRun.arm();
+    defer HeldAfterRun.clear();
+    var t: StopFixture = undefined;
+    try t.init(.{ .hold = true, .steerable = true });
+    defer t.deinit();
+    const arena = t.arena();
+    const runtime = t.runtime;
+    const fixture = &t.fixture;
+    defer HeldAfterRun.release();
+
+    _ = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "first" } }, "call-1", null);
+    try waitForRuns(fixture, 1);
+    const joined = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "also this" } }, "call-2", null);
+    try std.testing.expect(std.mem.find(u8, joined, "Sent into the subagent's running turn") != null);
+    const child_id = try reviewerId(runtime, arena);
+    // The user's stop of the running turn counts nothing, as on `main`: it
+    // ends no work and sets no cancel. The turn ends with the message unread,
+    // and the parent's stop that follows counts it, since nothing has.
+    runtime.userStopped(child_id, 0);
+    fixture.release.set(io_mod.getIo());
+    try HeldAfterRun.waitHeld();
+    const stopped = try callTool(runtime, arena, .{ .stop = .{ .agent = "reviewer" } }, "call-3", null);
+    HeldAfterRun.release();
+    try waitForSlotEnd(runtime, child_id);
+    try std.testing.expect(std.mem.find(u8, stopped, Leftovers.dropped_stop) != null);
+    try std.testing.expectEqual(@as(usize, 1), fixture.runs.load(.seq_cst));
+    try std.testing.expectEqual(@as(usize, 0), runtime.user_dropped.items.len);
+}
+
 test "a message counted by the parent's stop is not counted again by the user's close of the same turn" {
     var t: StopFixture = undefined;
     try t.init(.{ .hold = true, .steerable = true, .linger = true });
