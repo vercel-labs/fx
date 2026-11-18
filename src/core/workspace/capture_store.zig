@@ -656,8 +656,9 @@ const Run = struct {
     /// counts the paths it already holds, and each later capture first adds
     /// the rest in batches, counting each batch that finishes, then makes
     /// the one run over every path. That run always comes last, so a count
-    /// that is wrong costs time, never a wrong tree. A run the deadline
-    /// stopped before git started changes no progress.
+    /// that is wrong costs time, never a wrong tree. A run that started with
+    /// less than `min_judged_run_ms` left, or not at all, proves nothing
+    /// about the index and changes no progress.
     fn addPaths(self: *Run, paths: []const []const u8) Allocator.Error!?Outcome {
         if (builtin.is_test) test_hooks.index_batched_paths = 0;
         var batches: usize = 0;
@@ -666,15 +667,16 @@ const Run = struct {
             var start = @min(progress.done, paths.len);
             debug_trace.logf("workspace", "event=workspace_capture_index_catch_up from={d} paths={d} batch={d}", .{ start, paths.len, progress.batch });
             while (start < paths.len) : (batches += 1) {
-                if (pastDeadline(self.io, self.deadline)) return self.fail(.unavailable, .timeout);
-                const end = @min(paths.len, start + progress.batch);
+                const left_ms = self.timeLeftMs();
+                if (left_ms <= 0) return self.fail(.unavailable, .timeout);
+                const end = @min(paths.len, start +| progress.batch);
                 const forced = builtin.is_test and test_hooks.index_batches_before_timeout != null and batches == test_hooks.index_batches_before_timeout.?;
                 const failure: ?safe_git.Failure = if (forced) .timeout else try runStore(self.arena, self.store_ready, self.store, .{ .add_remove = paths[start..end] }, self.limits());
                 if (failure) |value| {
-                    // A batch that ran out of time with none before it in
-                    // this capture would do so again: later captures try
-                    // half as many paths.
-                    if (value == .timeout and batches == 0 and progress.batch > 1) {
+                    // A batch that had a fair share of the budget and ran
+                    // out of time with none before it in this capture would
+                    // do so again: later captures try half as many paths.
+                    if (value == .timeout and batches == 0 and left_ms >= min_judged_run_ms and progress.batch > 1) {
                         self.recordCatchUp(.{ .done = start, .batch = progress.batch / 2 });
                         debug_trace.logf("workspace", "event=workspace_capture_index_batch_halved batch={d}", .{progress.batch / 2});
                     }
@@ -686,17 +688,19 @@ const Run = struct {
             }
         }
         if (paths.len > 0) {
-            if (pastDeadline(self.io, self.deadline)) return self.fail(.unavailable, .timeout);
+            const left_ms = self.timeLeftMs();
+            if (left_ms <= 0) return self.fail(.unavailable, .timeout);
             const forced = builtin.is_test and test_hooks.index_pass_timeouts > 0;
             if (forced) test_hooks.index_pass_timeouts -= 1;
             const failure: ?safe_git.Failure = if (forced) .timeout else try runStore(self.arena, self.store_ready, self.store, .{ .add_remove = paths }, self.limits());
             if (failure) |value| {
-                // After batches, the run may only have lacked time: the next
-                // capture makes it first, with its whole budget. A run that
-                // followed no batches found stale files, which may be among
-                // the paths counted earlier, so the batches start over;
-                // files still fresh cost git no hashing.
-                if (value == .timeout and batches == 0) {
+                // After batches, or with little of the budget left, the run
+                // may only have lacked time: the next capture makes it with
+                // more. A run that had a fair share and followed no batches
+                // found stale files, which may be among the paths counted
+                // earlier, so the batches start over; files still fresh cost
+                // git no hashing.
+                if (value == .timeout and batches == 0 and left_ms >= min_judged_run_ms) {
                     const batch = if (catching_up) |progress| progress.batch else CatchUp.firstBatch();
                     self.recordCatchUp(.{ .done = 0, .batch = batch });
                     debug_trace.logf("workspace", "event=workspace_capture_index_catch_up_started paths={d}", .{paths.len});
@@ -706,6 +710,12 @@ const Run = struct {
         }
         self.endCatchUp();
         return null;
+    }
+
+    /// Milliseconds until the capture's deadline; zero or less once it passed.
+    fn timeLeftMs(self: *const Run) i64 {
+        if (builtin.is_test) if (test_hooks.index_time_left_ms) |left| return left;
+        return std.Io.Clock.Timestamp.now(self.io, self.deadline.clock).durationTo(self.deadline).raw.toMilliseconds();
     }
 
     /// How far a catching-up capture index got, or null when it is not
@@ -1035,6 +1045,11 @@ const copy_batch_objects: usize = 20_000;
 /// on from there.
 const index_batch_paths: usize = 4096;
 
+/// The time an index run needs left when it starts for its timeout to say
+/// the index is stale or a batch too large, rather than that earlier steps
+/// spent the budget (`Run.addPaths`).
+const min_judged_run_ms: i64 = 500;
+
 /// How far a catching-up capture index got: it holds the first `done` paths,
 /// and later captures add the rest `batch` at a time.
 const CatchUp = struct {
@@ -1046,12 +1061,13 @@ const CatchUp = struct {
     }
 
     /// The text `Run.recordCatchUp` writes. Text that cannot be parsed
-    /// counts no paths; a missing or zero batch is the usual size.
+    /// counts no paths; a batch that is missing, zero, or larger than the
+    /// usual size is the usual size.
     fn parse(text: []const u8) CatchUp {
         var fields = std.mem.tokenizeAny(u8, text, " \n");
         const done = std.fmt.parseInt(usize, fields.next() orelse "", 10) catch return .{ .done = 0, .batch = firstBatch() };
         const batch = std.fmt.parseInt(usize, fields.next() orelse "", 10) catch firstBatch();
-        return .{ .done = done, .batch = if (batch == 0) firstBatch() else batch };
+        return .{ .done = done, .batch = if (batch == 0 or batch > firstBatch()) firstBatch() else batch };
     }
 };
 
@@ -1072,6 +1088,8 @@ const test_hooks = struct {
     var index_pass_timeouts: usize = 0;
     /// The paths the last capture added in batches.
     var index_batched_paths: usize = 0;
+    /// Replaces the time an index run has left when it starts.
+    var index_time_left_ms: ?i64 = null;
     /// A path suffix whose presence check fails as if access were denied.
     var access_denied_suffix: ?[]const u8 = null;
     /// Whether the last capture's setup chose the first-capture budget.
@@ -4969,6 +4987,7 @@ fn catchUpCount(repos: TestRepos, repo: Repository) !?usize {
 }
 
 fn resetIndexHooks() void {
+    test_hooks.index_time_left_ms = null;
     test_hooks.index_batch_paths = null;
     test_hooks.index_batches_before_timeout = null;
     test_hooks.index_pass_timeouts = 0;
@@ -5114,6 +5133,65 @@ test "capture store: a batch that runs out of time before any other in its captu
     try testing.expectEqual(@as(usize, 8), test_hooks.index_batched_paths);
     try testing.expectEqualStrings(try repos.expectedTree(repo, &.{}), tree);
     try testing.expect((try catchUpOf(repos, repo)) == null);
+}
+
+test "capture store: an index run that starts with little or none of the budget left changes no progress" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const repos = try TestRepos.init(arena_state.allocator(), tmp.dir);
+    defer repos.deinit();
+    defer resetIndexHooks();
+    try repos.initRepo("repo");
+    var file: usize = 0;
+    while (file < 8) : (file += 1) {
+        try repos.write(try repos.arena.print("repo/f{d}.txt", .{file}), try repos.arena.print("file {d}\n", .{file}));
+    }
+    _ = try repos.gitIn("repo", &.{ "add", "-A" });
+    try repos.commit("repo", "base");
+    const repo = try repos.repository("repo");
+    _ = try expectComplete(try repos.captureRepo(repo, "s"));
+    try repos.append("repo/f0.txt", "changed\n");
+    test_hooks.index_batch_paths = 4;
+
+    // A pass that runs out of time with earlier steps having spent most of
+    // the budget does not start catching up.
+    test_hooks.index_time_left_ms = min_judged_run_ms - 1;
+    test_hooks.index_pass_timeouts = 1;
+    try expectNotStored(try repos.captureRepo(repo, "s"));
+    try testing.expect((try catchUpOf(repos, repo)) == null);
+    // With a fair share it does.
+    test_hooks.index_time_left_ms = min_judged_run_ms;
+    test_hooks.index_pass_timeouts = 1;
+    try expectNotStored(try repos.captureRepo(repo, "s"));
+    try testing.expectEqual(CatchUp{ .done = 0, .batch = 4 }, (try catchUpOf(repos, repo)).?);
+    // A first batch that runs out of time with little left keeps its size.
+    test_hooks.index_time_left_ms = min_judged_run_ms - 1;
+    test_hooks.index_batches_before_timeout = 0;
+    try expectNotStored(try repos.captureRepo(repo, "s"));
+    try testing.expectEqual(CatchUp{ .done = 0, .batch = 4 }, (try catchUpOf(repos, repo)).?);
+    // Past the deadline, no run starts and nothing changes.
+    test_hooks.index_time_left_ms = 0;
+    test_hooks.index_batches_before_timeout = null;
+    const late = try repos.captureRepo(repo, "s");
+    try expectNotStored(late);
+    try testing.expectEqual(policy.Reason.timeout, late.reason.?);
+    try testing.expectEqual(@as(usize, 0), test_hooks.index_batched_paths);
+    try testing.expectEqual(CatchUp{ .done = 0, .batch = 4 }, (try catchUpOf(repos, repo)).?);
+    // With time again, the capture catches up and lands.
+    test_hooks.index_time_left_ms = null;
+    const tree = try expectComplete(try repos.captureRepo(repo, "s"));
+    try testing.expectEqualStrings(try repos.expectedTree(repo, &.{}), tree);
+    try testing.expect((try catchUpOf(repos, repo)) == null);
+}
+
+test "capture store: a progress file batch larger than the usual size is read as the usual size" {
+    try testing.expectEqual(CatchUp{ .done = 5, .batch = index_batch_paths }, CatchUp.parse("5 18446744073709551615\n"));
+    try testing.expectEqual(CatchUp{ .done = 5, .batch = index_batch_paths }, CatchUp.parse("5 0\n"));
+    try testing.expectEqual(CatchUp{ .done = 5, .batch = index_batch_paths }, CatchUp.parse("5\n"));
+    try testing.expectEqual(CatchUp{ .done = 0, .batch = index_batch_paths }, CatchUp.parse("not a count"));
+    try testing.expectEqual(CatchUp{ .done = 7, .batch = 64 }, CatchUp.parse("7 64\n"));
 }
 
 test "capture store: a progress file that cannot be read leaves the capture to its single index run" {
