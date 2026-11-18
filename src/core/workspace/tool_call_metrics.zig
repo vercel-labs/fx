@@ -735,13 +735,14 @@ fn expectCutLaws(value: []const u8, budget: usize, valid_utf8: bool) !void {
     if (valid_utf8) {
         try std.testing.expect(std.unicode.utf8ValidateSlice(value[0..cut.head_len]));
         try std.testing.expect(std.unicode.utf8ValidateSlice(value[value.len - cut.tail_len ..]));
-        // A UTF-8 cut loses at most three bytes on each side. The kept head
-        // and tail stop short of it only to leave out a secret it splits
+        // A UTF-8 cut loses at most three bytes on each side, and the
+        // secret-safe cut keeps no more than it
         // (`text_utils.secretSafePrefixLen`, `text_utils.secretSafeSuffixStart`).
         const utf8_head = utf8PrefixLen(value, budget / 2);
         try std.testing.expect(utf8_head + 3 >= budget / 2);
         try std.testing.expect(cut.head_len <= utf8_head);
-        // A short head leaves out at most the one word it would split.
+        // What a short head leaves out holds no whitespace:
+        // it lies inside one word.
         for (value[cut.head_len..utf8_head]) |byte| try std.testing.expect(!std.ascii.isWhitespace(byte));
         const utf8_tail = utf8SuffixLen(value, budget - cut.head_len);
         try std.testing.expect(cut.head_len + utf8_tail + 3 >= budget);
@@ -751,8 +752,8 @@ fn expectCutLaws(value: []const u8, budget: usize, valid_utf8: bool) !void {
         // tests pin which secrets it steps past.
         try std.testing.expectEqual(value.len - text_utils.secretSafeSuffixStart(value, value.len - utf8_tail), cut.tail_len);
         // In a value with no secret `maskSecrets` finds, no URL, and no
-        // `Bearer ` token, the tail loses at most the rest of the one word its
-        // UTF-8 cut splits.
+        // `Bearer ` token, what the tail loses holds no whitespace: it lies
+        // inside one word.
         const lost = value[value.len - utf8_tail .. value.len - cut.tail_len];
         if (std.mem.findAny(u8, lost, " \t\n\r\x0b\x0c") != null) {
             var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
