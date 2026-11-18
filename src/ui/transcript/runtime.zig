@@ -7119,14 +7119,18 @@ pub const TranscriptRuntime = struct {
         var line_buf: [128]u8 = undefined;
         const line = formatTurnSummaryLine(&line_buf, summary);
         const entry = try alloc.print("{s}{s}{s}\n", .{ ui_render.dim_style, line, ui_render.reset_style });
-        errdefer alloc.free(entry);
-        const entry_id = try transcript_store.appendRawBytesEntryClassifiedAt(
+        // The notebook owns `entry` once the append succeeds, so only a failed
+        // append frees it.
+        const entry_id = transcript_store.appendRawBytesEntryClassifiedAt(
             self,
             alloc,
             entry,
             .turn_summary,
             if (summary.completed_at_ms > 0) summary.completed_at_ms else io_mod.milliTimestamp(),
-        );
+        ) catch |err| {
+            alloc.free(entry);
+            return err;
+        };
         self.markTranscriptContentDirtyFrom(entry_id);
         try self.syncTranscriptWindow(alloc);
         return entry_id;

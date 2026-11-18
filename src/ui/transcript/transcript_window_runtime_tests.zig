@@ -9,6 +9,7 @@ const source_preparation = @import("source_preparation.zig");
 const frozen_prefix = @import("frozen_prefix.zig");
 const types = @import("../../core/shared/types.zig");
 const render_engine = @import("../render_engine.zig");
+const testing_allocator = @import("../../core/shared/testing_allocator.zig");
 
 const TranscriptRuntime = runtime_mod.TranscriptRuntime;
 const Allocator = std.mem.Allocator;
@@ -472,6 +473,67 @@ test "a turn that ends before its frame commits keeps the turn whole for its sum
     defer after.deinit(alloc);
     try std.testing.expect(std.mem.find(u8, after.bytes, "Explored 5 files") != null);
     try expectWindowMatchesEntries(&runtime);
+}
+
+/// The window holds every entry it has reported (`seen_through`), once each,
+/// in `finished` or `pending_drops`. Entries after `seen_through` are not
+/// reported yet, so they are not counted.
+fn expectReportedEntriesHeld(runtime: *const TranscriptRuntime) !void {
+    const window = &runtime.transcript_window.?;
+    var reported: usize = 0;
+    for (runtime.notebook.entries.items) |entry| {
+        if (entry.id() <= window.seen_through) reported += 1;
+    }
+    try std.testing.expectEqual(reported, window.finished.items.len + window.pending_drops.items.len);
+}
+
+test "a failed allocation when a turn summary is added frees its bytes once" {
+    // A failed allocation at any point of appendTurnSummaryEntry must free the
+    // summary's bytes once. std.testing's allocator panics on a double free and
+    // reports leaks, so the sweep fails if either happens.
+    const backing = testing_allocator.no_resize;
+    var induced_failures: usize = 0;
+    var fail_after: usize = 0;
+    while (true) : (fail_after += 1) {
+        var failing = std.testing.FailingAllocator.init(backing, .{});
+        const alloc = failing.allocator();
+        var runtime = testRuntime(alloc);
+        defer runtime.deinit(alloc);
+        var metrics: types.Metrics = .{};
+        try runtime.enableTranscriptWindow(alloc, true);
+
+        // A turn that is split by a compaction and ends before any frame
+        // commits, so the commit state is invalid when its summary is appended.
+        const prompt = try alloc.dupe(u8, "OOM_PROMPT");
+        defer alloc.free(prompt);
+        _ = try runtime.writeUserPromptCard(alloc, &metrics, .{ .text = prompt }, false, &.{});
+        try readFiles(alloc, &runtime, &metrics, &.{ "a.txt", "b.txt" });
+        try runtime.transcriptWindowCompacted(alloc);
+        try readFiles(alloc, &runtime, &metrics, &.{ "d.txt", "e.txt" });
+        _ = try runtime.appendAssistantTurnEntry(alloc);
+        _ = try runtime.streamAssistantChunk(alloc, &metrics, "OOM_ANSWER\n");
+        // The window reports the turn's entries before the summary is appended.
+        try runtime.syncTranscriptWindow(alloc);
+        try expectReportedEntriesHeld(&runtime);
+        try std.testing.expect(runtime.transcript_commit_state == .invalid);
+
+        failing.fail_index = failing.alloc_index + fail_after;
+        const result = runtime.appendTurnSummaryEntry(alloc, .{ .turn_duration_ms = 1200 });
+        const induced = failing.has_induced_failure;
+        failing.fail_index = std.math.maxInt(usize);
+        if (induced) {
+            induced_failures += 1;
+        }
+        if (result) |_| {
+            if (!induced) {
+                try expectWindowMatchesEntries(&runtime);
+                break;
+            }
+        } else |err| {
+            if (!induced) return err;
+        }
+    }
+    try std.testing.expect(induced_failures > 0);
 }
 
 test "a cleared transcript starts the transcript window over" {
