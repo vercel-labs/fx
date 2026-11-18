@@ -992,6 +992,11 @@ const StoryTally = struct {
     /// command, whose result the mark already shows. A command that passed on
     /// a retry shares one row with its failures and does not count.
     earlier_command_failures: usize = 0,
+    /// Whether the group's last command row failed after it ran: the one
+    /// failure `earlier_command_failures` leaves out. A row still running or
+    /// refused before it ran is not one, even when the command before it
+    /// failed.
+    last_command_row_failed: bool = false,
     /// toolbox calls that open a tool or search for one, which read no file.
     tool_opens: usize = 0,
     toolbox_searches: usize = 0,
@@ -1388,8 +1393,10 @@ fn formatStoryHeader(scratch: std.mem.Allocator, tally: StoryTally, summary: Sum
     // header counts the failures its turn ended on.
     const turn_ending: usize = if (collapsed) tally.turn_ending_failures else 0;
     const failed = if (lead_says_failed) 0 else tally.earlier_command_failures + turn_ending;
-    const last_failed: usize = if (tally.last_command_failed orelse false) 1 else 0;
-    const states = try formatHeaderStates(scratch, failed, summary);
+    const last_failed: usize = if (tally.last_command_row_failed) 1 else 0;
+    // A count that shows counts the last command's failure too, so it
+    // matches the failed rows; a last failure alone shows only as the mark.
+    const states = try formatHeaderStates(scratch, if (failed > 0) failed + last_failed else 0, summary);
     const states_without_mark = try formatHeaderStates(scratch, failed + last_failed, summary);
     return .{
         .lead = lead.written(),
@@ -2940,6 +2947,10 @@ fn writeGroupBlock(
     }
     for (rows.items, 0..) |*row, index| {
         if (index != last_command_row and storyRowCallFailed(scratch, row.detail)) tally.earlier_command_failures += 1;
+    }
+    if (last_command_row) |index| {
+        const row = &rows.items[index];
+        tally.last_command_row_failed = storyRowCallFailed(scratch, row.detail) and !shellCallNeverRan(scratch, row.detail.?);
     }
 
     // A group left with one row needs no summary above it: the row is the
@@ -7645,6 +7656,70 @@ test "a command that failed before the last one still counts in the header" {
     var last = try build(alloc, &entries, &last_failed, 120);
     defer last.deinit(alloc);
     try std.testing.expect(std.mem.startsWith(u8, last.entry_actions.items[0].override.bytes, "● Ran commands ✗\n"));
+
+    // When an earlier command failed too, the count takes in the last one,
+    // so it matches the rows that failed.
+    const both_failed = [_]ToolDetailRecord{
+        storyCommandDetail(1, "{\"command\":\"sh fast.sh\"}", 0, null),
+        storyCommandDetail(2, "{\"command\":\"sh failed.sh\"}", 1, null),
+        storyCommandDetail(3, "{\"command\":\"sh last.sh\"}", 1, null),
+    };
+    var both = try build(alloc, &entries, &both_failed, 120);
+    defer both.deinit(alloc);
+    errdefer std.debug.print("both failed:\n{s}\n", .{both.entry_actions.items[0].override.bytes});
+    try std.testing.expect(std.mem.startsWith(u8, both.entry_actions.items[0].override.bytes, "● Ran commands ✗ · 2 failed\n"));
+}
+
+test "a header counts each failed command once while a later command runs or was refused" {
+    const alloc = std.testing.allocator;
+    const header = struct {
+        fn of(projection: *const Projection) []const u8 {
+            const bytes = projection.entry_actions.items[0].override.bytes;
+            return bytes[0 .. std.mem.findScalar(u8, bytes, '\n') orelse bytes.len];
+        }
+    };
+    // A command failed and the next one still runs: one failure.
+    {
+        const entries = [_]TranscriptEntry{
+            .{ .raw_bytes = .{ .id = 1, .bytes = "● Exited 1 sh a.sh\n", .class = .tool_status } },
+            .{ .raw_bytes = .{ .id = 2, .bytes = "● Running sh b.sh\n", .class = .tool_status } },
+        };
+        var details = [_]ToolDetailRecord{
+            storyCommandDetail(1, "{\"command\":\"sh a.sh\"}", 1, null),
+            storyCommandDetail(2, "{\"command\":\"sh b.sh\"}", 0, null),
+        };
+        details[1].outcome = null;
+        details[1].command_process_presentation = null;
+        for ([_]bool{ false, true }) |collapsed| {
+            var projection = try buildWithStyleAndStats(alloc, &entries, &details, 120, null, collapsed, .{}, .{}, .compact, null, null);
+            defer projection.deinit(alloc);
+            errdefer std.debug.print("running, collapsed={}: {s}\n", .{ collapsed, header.of(&projection) });
+            try std.testing.expect(std.mem.endsWith(u8, header.of(&projection), " · 1 failed"));
+        }
+    }
+    // A command failed, then a request the shell refused ended the turn: the
+    // expanded header counts the command, and the collapsed one both.
+    {
+        const refused = "{\"error\":{\"code\":\"invalid_shell_request\",\"executed\":false,\"problems\":[\"Choose either profile or shell.\"]}}";
+        const entries = [_]TranscriptEntry{
+            .{ .raw_bytes = .{ .id = 1, .bytes = "● Exited 1 sh a.sh\n", .class = .tool_status } },
+            .{ .raw_bytes = .{ .id = 2, .bytes = "● Failed sh b.sh · 1 invalid field\n", .class = .tool_status } },
+            .{ .raw_bytes = .{ .id = 3, .bytes = "Worked for 2s\n", .class = .turn_summary } },
+        };
+        var details = [_]ToolDetailRecord{
+            storyCommandDetail(1, "{\"command\":\"sh a.sh\"}", 1, null),
+            storyCommandDetail(2, "{\"command\":\"sh b.sh\",\"profile\":\"clean\"}", 0, refused),
+        };
+        details[1].outcome = .failed;
+        details[1].command_process_presentation = null;
+        details[1].command_display = @constCast("sh b.sh");
+        for ([_]bool{ false, true }) |collapsed| {
+            var projection = try buildWithStyleAndStats(alloc, &entries, &details, 120, null, collapsed, .{}, .{}, .compact, null, null);
+            defer projection.deinit(alloc);
+            errdefer std.debug.print("refused, collapsed={}: {s}\n", .{ collapsed, header.of(&projection) });
+            try std.testing.expect(std.mem.endsWith(u8, header.of(&projection), if (collapsed) " · 2 failed" else " · 1 failed"));
+        }
+    }
 }
 
 test "a long shell command shows its steps in short form" {
