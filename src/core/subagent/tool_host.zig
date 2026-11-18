@@ -8245,8 +8245,8 @@ fn accountAnswerDropped(answer: []const u8) usize {
 
 /// Cells where the user's close or stop drops a message that no count names, as
 /// on `main` (a user's close of a turn with a message unread or kept, and the
-/// user's stop before the end is recorded with one kept): W92 builds the count
-/// and takes this list as its failing tests. Every other cell holds R2.
+/// user's stop before the end is recorded with one kept): a change that counts
+/// them takes this list as its failing tests. Every other cell holds R2.
 fn accountAsOnMain(plan: Plan, scenario: Scenario) bool {
     // The parent's stop that follows counts what the user's left.
     if (plan.second != null) return false;
