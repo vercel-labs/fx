@@ -825,6 +825,11 @@ fn shellInputReceiver(
     const snapshot = terminal_managed_observer.inspectInput(context, session_id) catch |err| {
         if (err == error.OutOfMemory or err == error.Cancelled) return err;
         debug_trace.logf("permission", "event=shell_input_review_receiver_unavailable call_id={s} session_id={s} reason={s}", .{ call.id, session_id, @errorName(err) });
+        // A session that has exited, closed, or gone missing can no longer
+        // take input. Closing it revokes its authority, so that error means
+        // the same. Any other failure keeps the review hold.
+        if (err == error.TerminalSessionEnded or err == error.TerminalSessionNotFound or
+            err == error.TerminalSessionLost or err == error.AuthorityRevoked) return error.ShellInputSessionEnded;
         return null;
     };
     // The request borrows these owned slices for the admission arena's lifetime.
@@ -834,6 +839,17 @@ fn shellInputReceiver(
         .cwd = snapshot.cwd,
         .screen = snapshot.screen,
     };
+}
+
+/// Tells the agent that its input went nowhere because the target session has
+/// ended, and what to do instead.
+fn shellInputSessionEndedText(arena: Allocator, call: ToolCall) ![]const u8 {
+    const args = try tool_args.parseToolArgsObject(arena, call.arguments_json);
+    const session_id = try tool_args.requiredStringArg(args, "session_id");
+    return arena.print(
+        "Session {f} is no longer running, so it can't take input. Nothing was sent. Start a new session, or read the old session's final output with an interact call that sends no input.",
+        .{text_utils.terminalSafe(session_id)},
+    );
 }
 
 fn provenBindingsForAction(
@@ -1130,14 +1146,19 @@ fn automaticReviewOutcome(
         return reviewerUnavailableOutcome(input, call, .turn_review_budget_exhausted);
     }
 
-    const request = try reviewRequestForCall(
+    const request = reviewRequestForCall(
         input,
         arena,
         call,
         targets,
         is_dynamic_tool,
         file_authorization,
-    );
+    ) catch |err| switch (err) {
+        // Input cannot reach a session that has ended, so nothing would run
+        // and there is nothing to review.
+        error.ShellInputSessionEnded => return .{ .tool_failure = try shellInputSessionEndedText(arena, call) },
+        else => return err,
+    };
     const review = try runAutomaticReview(input, arena, call, request);
     if (nonAllowAutoReviewOutcome(review)) |blocked| return blocked;
     var outcome = if (file_authorization) |authorization|
