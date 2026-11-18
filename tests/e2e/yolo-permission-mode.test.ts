@@ -327,9 +327,14 @@ describe.skipIf(!tmuxAvailable())("yolo interactive mode", () => {
       expect(warningPane).toContain("full access ·");
 
       await session.sendText("/settings");
-      const settingsPane = await session.waitForText("←→ change", TIMEOUT);
-      expect(settingsPane).toContain("Permission mode");
-      expect(settingsPane).not.toContain("Command sandbox");
+      await session.waitForText("←→ change", TIMEOUT);
+      // The list shows five settings at a time, so the search finds each.
+      await session.sendLiteralText("permission");
+      expect(await session.waitForText("Permission mode", TIMEOUT)).toContain("Permission mode");
+      await session.sendKeys("C-u");
+      await session.sendLiteralText("sandbox");
+      expect(await session.waitForText("no matching settings.", TIMEOUT)).not.toContain("Command sandbox");
+      await session.sendKeys("C-u");
       await Bun.sleep(4_300);
       expect(await session.capturePane()).toContain("←→ change");
 
