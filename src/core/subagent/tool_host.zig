@@ -2943,7 +2943,7 @@ const MailboxFixture = struct {
         const run_number = self.runs.fetchAdd(1, .seq_cst) + 1;
         self.ask(worker, message.content);
         while (self.hold and !self.release.isSet() and !cancel.load(.seq_cst)) io_mod.sleep(std.time.ns_per_ms);
-        while (self.linger and cancel.load(.seq_cst) and !self.release.isSet()) io_mod.sleep(std.time.ns_per_ms);
+        if (self.linger and cancel.load(.seq_cst)) self.release.waitUncancelable(io_mod.getIo());
         if (cancel.load(.seq_cst)) return error.Cancelled;
         if (self.fail_first and run_number == 1) return error.ProviderFailed;
         if (turn.isHosted()) return .completed;
