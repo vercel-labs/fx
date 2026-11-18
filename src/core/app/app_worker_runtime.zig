@@ -2423,13 +2423,13 @@ test "core.app_worker_runtime program status follows decision prompts to the tur
 
     // An approval prompt that opens outside a turn does not bring the
     // reported error back once it closes.
-    app.agent().worker.pending_permission_request = .{ .label = "Remember allow for this saved session" };
+    app.agent().worker.pending_permission_request = .{ .label = "remember allow for this saved session" };
     try tickNoop(&app);
     app.agent().worker.pending_permission_request = null;
     try tickNoop(&app);
     try expectProgramStatusReports(
         &app,
-        "\x1b]7501;state=blocked:kind=permission:app=fx:msg=UmVtZW1iZXIgYWxsb3cgZm9yIHRoaXMgc2F2ZWQgc2Vzc2lvbg==\x1b\\" ++
+        "\x1b]7501;state=blocked:kind=permission:app=fx:msg=cmVtZW1iZXIgYWxsb3cgZm9yIHRoaXMgc2F2ZWQgc2Vzc2lvbg==\x1b\\" ++
             "\x1b]7501;state=idle:app=fx\x1b\\",
     );
 }

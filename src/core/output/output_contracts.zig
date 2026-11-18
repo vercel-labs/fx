@@ -383,7 +383,7 @@ fn writeUsageFailure(writer: *std.Io.Writer, failure: usage.Failure, service: []
     switch (failure) {
         .network => try writer.print("couldn't reach {s}", .{service}),
         .refused => try writer.print("{s} refused this sign-in", .{service}),
-        .not_available => try writer.writeAll(if (std.mem.eql(u8, service, "AI Gateway"))
+        .not_available => try writer.writeAll(if (std.mem.eql(u8, service, "AI gateway"))
             "usage reports aren't available for this team"
         else
             "usage isn't available for this plan"),

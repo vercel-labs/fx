@@ -1839,32 +1839,32 @@ fn approvalTitle(
 }
 
 fn approvalKind(label: []const u8, dynamic_mcp: bool) []const u8 {
-    if (std.mem.startsWith(u8, label, "Remember ") or
-        std.mem.startsWith(u8, label, "Revoke saved-session")) return "Permission rule";
+    if (std.mem.startsWith(u8, label, "remember ") or
+        std.mem.startsWith(u8, label, "revoke saved-session")) return "permission rule";
     if (dynamic_mcp) return "MCP tool";
     if (commandLabelPrefix(label) != null) return "command";
-    if (std.mem.startsWith(u8, label, "write_file ")) return "Write file";
-    if (std.mem.startsWith(u8, label, "edit_file ")) return "Edit file";
-    if (std.mem.startsWith(u8, label, "task ")) return "Subagent";
-    if (std.mem.startsWith(u8, label, "skill ")) return "Skill";
+    if (std.mem.startsWith(u8, label, "write_file ")) return "write file";
+    if (std.mem.startsWith(u8, label, "edit_file ")) return "edit file";
+    if (std.mem.startsWith(u8, label, "task ")) return "subagent";
+    if (std.mem.startsWith(u8, label, "skill ")) return "skill";
     return "tool";
 }
 
 fn approvalQuestion(label: []const u8, dynamic_mcp: bool) []const u8 {
-    if (std.mem.eql(u8, label, "Remember allow for this saved session")) {
+    if (std.mem.eql(u8, label, "remember allow for this saved session")) {
         return "remember allow for this saved session?";
     }
-    if (std.mem.eql(u8, label, "Remember deny for this saved session")) {
+    if (std.mem.eql(u8, label, "remember deny for this saved session")) {
         return "remember deny for this saved session?";
     }
-    if (std.mem.eql(u8, label, "Revoke saved-session permission rule")) {
+    if (std.mem.eql(u8, label, "revoke saved-session permission rule")) {
         return "revoke this saved-session permission rule?";
     }
     if (dynamic_mcp) return "allow this MCP tool call?";
     if (commandLabelPrefix(label) != null) return "would you like to run the following command?";
-    if (std.mem.startsWith(u8, label, "write_file ")) return "Would you like to create or update this file?";
-    if (std.mem.startsWith(u8, label, "edit_file ")) return "Would you like to edit this file?";
-    if (std.mem.startsWith(u8, label, "task ")) return "Would you like to start this subagent task?";
+    if (std.mem.startsWith(u8, label, "write_file ")) return "would you like to create or update this file?";
+    if (std.mem.startsWith(u8, label, "edit_file ")) return "would you like to edit this file?";
+    if (std.mem.startsWith(u8, label, "task ")) return "would you like to start this subagent task?";
     if (std.mem.startsWith(u8, label, "skill ")) return "would you like to run this skill?";
     return "would you like to allow this action?";
 }
