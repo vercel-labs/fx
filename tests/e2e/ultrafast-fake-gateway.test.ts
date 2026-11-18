@@ -896,7 +896,9 @@ describe("ultrafast fake Gateway", () => {
       try {
         const result = await runFx(
           ["ask", "--full-access", "--json", "--ultrafast", "Delegate one task."],
-          { cwd: root.workspace, env: fakeGatewayEnv(root, gateway), timeoutMs: TIMEOUT },
+          // Below the test's limit, so a failed hold ends fx here and the kept
+          // error is thrown, instead of Bun ending the test with fx still running.
+          { cwd: root.workspace, env: fakeGatewayEnv(root, gateway), timeoutMs: TIMEOUT - 5_000 },
         );
         hold.check();
         expect(result.code, result.stderr).toBe(0);
@@ -965,7 +967,8 @@ describe("ultrafast fake Gateway", () => {
               ...(round === 3 ? ["--no-ultrafast"] : []),
               `Ask the named reviewer for round ${round}.`,
             ],
-            { cwd: root.workspace, env, timeoutMs: TIMEOUT },
+            // Below the test's limit, as above.
+            { cwd: root.workspace, env, timeoutMs: TIMEOUT - 5_000 },
           );
           hold.check();
           expect(result.code, result.stderr).toBe(0);
