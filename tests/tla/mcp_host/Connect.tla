@@ -9,6 +9,11 @@
 \* the signal can land after that thread has started another connect. Such a
 \* signal is a stray: it is not a cancel of the connect it interrupts.
 \*
+\* The model sits in tests/tla/mcp_host/, and not in a folder named after
+\* src/core/shared/, because only the MCP CI jobs run the models of this folder,
+\* and the driver that runs fx's MCP HTTP connects against it
+\* (tests/tla/drivers/mcp_host/connect.test.ts) is here.
+\*
 \* `Std` is std's loop: a blocking `connect`; on EINTR that is not a cancel,
 \* `connect` is called again on the same socket. The second call answers
 \* EALREADY (std: error.ConnectionPending) or ISCONN (std treats it as a bug:
