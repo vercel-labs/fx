@@ -153,6 +153,9 @@ pub const WorkEnd = struct {
     /// Why the work never began, for one that failed because its slot could
     /// not start: its report says the message never ran. A static string.
     start_failure: ?[]const u8 = null,
+    /// How many of the parent's messages that work carried, for the report of
+    /// one that failed because its slot could not start.
+    start_messages: usize = 1,
 };
 
 /// The host's hook for a work's end, called on the child's slot thread with

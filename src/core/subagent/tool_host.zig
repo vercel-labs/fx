@@ -1353,7 +1353,7 @@ pub const Runtime = struct {
     /// ended, with any text it had written.
     fn reportOutput(self: *Runtime, a: Allocator, end: managed_owner.WorkEnd) ![]const u8 {
         // A work that never began has no reply, and nothing it changed.
-        if (end.start_failure) |cause| return startFailedReport(a, cause);
+        if (end.start_failure) |cause| return startFailedReport(a, cause, end.start_messages);
         const saved = if (end.reply) |reply|
             reply
         else
@@ -1637,6 +1637,7 @@ pub const Runtime = struct {
                 .report_owed = failed.report_owed,
                 .end = failed.end,
                 .start_failure = startCauseText(failed.err),
+                .start_messages = failed.messages,
             });
             self.admission_mutex.lockUncancelable(io_mod.getIo());
             defer self.admission_mutex.unlock(io_mod.getIo());
@@ -1651,6 +1652,9 @@ pub const Runtime = struct {
         report_owed: bool,
         end: child_state.EndFacts,
         err: anyerror,
+        /// How many of the parent's messages the work carried: the count the
+        /// slot was started with.
+        messages: usize,
 
         fn deinit(self: FailedStart, alloc: Allocator) void {
             alloc.free(self.work_id);
@@ -1689,7 +1693,7 @@ pub const Runtime = struct {
                 return null;
             };
             // Busy stays set: the next waiting message, if any, starts now.
-            return .{ .work_id = ended.work_id, .report_owed = ended.report_owed, .end = ended.end, .err = err };
+            return .{ .work_id = ended.work_id, .report_owed = ended.report_owed, .end = ended.end, .err = err, .messages = messages };
         };
         return null;
     }
@@ -7191,11 +7195,12 @@ fn startFailedStuckResult(buf: []u8, agent: []const u8, cause: []const u8) []con
     return std.mem.print(buf, "{s} did not start: {s}. Your message did not run, and fx could not reset {s}: it refuses messages until fx restarts, and a close of it cannot be saved either. Send the work to a subagent with another name, and tell the user that {s} needs an fx restart.", .{ agent, cause, agent, agent }) catch start_failed_stuck_fallback;
 }
 
-/// A report's text for a work whose slot could not start: the message
-/// never ran. It does not say whether the subagent is idle, which the host
-/// reads after it builds this text, and the report's `next` says when it is.
-/// Allocated in `a`.
-fn startFailedReport(a: Allocator, cause: []const u8) ![]const u8 {
+/// A report's text for a work whose slot could not start: its messages never
+/// ran, one or the `messages` that joined it. It does not say whether the
+/// subagent is idle, which the host reads after it builds this text, and the
+/// report's `next` says when it is. Allocated in `a`.
+fn startFailedReport(a: Allocator, cause: []const u8, messages: usize) ![]const u8 {
+    if (messages > 1) return a.print("The subagent could not start the work your {d} messages made: {s}. They never ran. Send them again if they are still needed.", .{ messages, cause });
     return a.print("The subagent could not start the work your message made: {s}. It never ran. Send the message again if it is still needed.", .{cause});
 }
 
