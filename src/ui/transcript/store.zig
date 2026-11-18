@@ -1999,6 +1999,7 @@ pub fn cloneToolDetailForSnapshot(alloc: Allocator, source: ToolDetailRecord) !T
         .command_output_replay = command_output_replay,
         .command_process_presentation = source.command_process_presentation,
         .outcome = source.outcome,
+        .streaming = source.streaming,
         .fallback_disposition = source.fallback_disposition,
         .origin = source.origin,
         .lifecycle_id = lifecycle_id,
