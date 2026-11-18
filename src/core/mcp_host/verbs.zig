@@ -183,15 +183,19 @@ pub fn parse(arena: Allocator, surface: Surface, args: []const []const u8) Alloc
                 if (pair_flag == .header) return usage(arena, verb, "--header is for HTTP servers; use --env for a command.", .{});
                 return .{ .command = .{ .add = .{ .name = name, .file = file, .entry = .{ .stdio = .{ .command = command[0], .args = command[1..], .env = pairs.items } }, .old_profile = old_profile } } };
             }
-            // fx knows Slack's address, as `add slack` did before.
-            const url = if (n.len == 1 and std.mem.eql(u8, name, "slack")) slack.server_url else url: {
+            const anysearch = n.len == 1 and std.mem.eql(u8, name, "anysearch");
+            const url = if (anysearch)
+                "https://api.anysearch.com/mcp"
+            else if (n.len == 1 and std.mem.eql(u8, name, "slack"))
+                slack.server_url
+            else url: {
                 if (n.len != 2) return usage(arena, verb, "{s} add needs a URL, or -- and a command.", .{p});
                 break :url n[1];
             };
             if (!std.mem.startsWith(u8, url, "https://") and !std.mem.startsWith(u8, url, "http://"))
                 return usage(arena, verb, "'{s}' isn't a URL. A stdio server's command goes after --.", .{url});
             if (pair_flag == .env) return usage(arena, verb, "--env is for stdio servers; use --header for HTTP.", .{});
-            return .{ .command = .{ .add = .{ .name = name, .file = file, .entry = .{ .http = .{ .url = url, .headers = pairs.items } }, .login = !no_login, .old_profile = old_profile } } };
+            return .{ .command = .{ .add = .{ .name = name, .file = file, .entry = .{ .http = .{ .url = url, .headers = pairs.items } }, .login = !no_login and !anysearch, .old_profile = old_profile } } };
         },
         .call => {
             if (surface == .shell) return usage(arena, verb, "/mcp call runs only in a command that fx's shell tool runs: fx mcp call TOOL [JSON].", .{});
@@ -295,6 +299,7 @@ const overview = [_][2][]const u8{
     .{ "add NAME URL", "add an HTTP server" },
     .{ "add NAME -- CMD [ARGS...]", "add a stdio server" },
     .{ "add slack", "add Slack's server" },
+    .{ "add anysearch", "add AnySearch anonymously" },
     .{ "remove NAME", "remove a server and its login" },
     .{ "login NAME", "sign in to an HTTP server" },
     .{ "logout NAME", "sign out and delete the login" },
@@ -324,11 +329,12 @@ pub fn writeUsage(w: *Writer, surface: Surface, verb: ?Verb) Writer.Error!void {
             \\usage: {s} add [--global | --project] [--no-login] [--header K=V]... NAME URL
             \\       {s} add [--global | --project] [--env K=V]... NAME -- COMMAND [ARGS...]
             \\       {s} add [--global | --project] [--no-login] slack
+            \\       {s} add [--global | --project] anysearch
             \\  --global    write ~/.fx/mcp.json, the default
             \\  --project   write ./.mcp.json
             \\  --no-login  don't sign in to an HTTP server that needs a login
             \\
-        , .{ p, p, p }),
+        , .{ p, p, p, p }),
         .remove => try w.print("usage: {s} remove [--global | --project] NAME\n", .{p}),
         .login => try w.print("usage: {s} login [--no-browser] NAME\n  --no-browser  print the address instead of opening it\n", .{p}),
         .logout => try w.print("usage: {s} logout NAME\n", .{p}),
@@ -1277,7 +1283,7 @@ test "parse reads every verb, with flags before --" {
     try testing.expect(!(try parseCli(a, &.{ "add", "--no-login", "web", "https://w/mcp" })).command.add.login);
     try testing.expect(!(try parse(a, .shell, &.{ "add", "slack", "--no-login" })).command.add.login);
 
-    // Slack needs no URL; any other server does.
+    // Built-in servers can use their default URL.
     try testing.expectEqualStrings("https://mcp.slack.com/mcp", (try parseCli(a, &.{ "add", "slack" })).command.add.entry.http.url);
     try testing.expectEqualStrings("https://slack.example/mcp", (try parseCli(a, &.{ "add", "slack", "https://slack.example/mcp" })).command.add.entry.http.url);
 
@@ -1310,6 +1316,22 @@ test "parse reads every verb, with flags before --" {
     // A search's words join into one query.
     try testing.expectEqualStrings("open issues", (try parseCli(a, &.{ "call", "search", "open", "issues" })).command.call.search);
     try testing.expectEqual(@as(?Verb, .call), (try parseCli(a, &.{ "call", "-h" })).command.help);
+}
+
+test "AnySearch can be added anonymously from either command surface" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    for ([_]Surface{ .cli, .shell }) |surface| {
+        const preset = (try parse(a, surface, &.{ "add", "anysearch" })).command.add;
+        try testing.expectEqualStrings("anysearch", preset.name);
+        try testing.expectEqualStrings("https://api.anysearch.com/mcp", preset.entry.http.url);
+        try testing.expect(!preset.login);
+    }
+    const explicit = (try parseCli(a, &.{ "add", "anysearch", "https://example.test/mcp" })).command.add;
+    try testing.expectEqualStrings("https://example.test/mcp", explicit.entry.http.url);
+    try testing.expect(explicit.login);
 }
 
 test "parse turns fx mcp call mistakes into usage" {
