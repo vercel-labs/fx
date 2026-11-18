@@ -58,3 +58,7 @@ benchmarks/baseline.json
 .vibe/
 .windsurf/
 .zencoder/
+
+# Nix build output
+result
+result-*
