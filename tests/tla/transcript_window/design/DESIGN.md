@@ -48,18 +48,18 @@ current code.
   live block, a summary or cancellation ends the turn, anything else arrives
   final. A turn summary confirms the save: the app commits the turn to the
   log before it appends the summary.
-- fx runs `drop` through `dropEntriesAtomic`, the commit and rebase the
-  byte cap used before the window replaced it; it never removes a pinned
-  entry. An entry with a row still on screen is held
-  (`applyTranscriptWindowDrops`) until it scrolls into terminal history or a
-  resize clears the screen, because the painter repaints the live area from
-  the entries. A turn summary on screen holds its whole turn back to the
-  prompt, because its recap counts the turn's tool calls. A resumed
-  transcript holds every entry until a frame has repainted it from the
-  entries: its first paint is the prepared resume flow, so the reset before
-  that paint keeps them, and the paint leaves no commit anchor to tell which
-  rows are on screen. A transcript that another agent's replaces on the
-  screen after that first paint stops holding them.
+- fx runs `drop` through `dropEntriesAtomic`, the commit and rebase the byte
+  cap used before the window replaced it; it never removes a pinned entry.
+  An entry with a row still on screen is held (`applyTranscriptWindowDrops`)
+  until it scrolls into terminal history or a resize clears the screen,
+  because the painter repaints the live area from the entries. An entry of a
+  turn whose summary stays is held too, back to the turn's prompt, also when
+  a resize clears the screen, because the summary's recap counts the turn's
+  tool calls. A resumed transcript holds every entry until a frame has
+  repainted it from the entries: its first paint is the prepared resume
+  flow, so the reset before that paint keeps them, and the paint leaves no
+  commit anchor to tell which rows are on screen. A transcript that another
+  agent's replaces on the screen after that first paint stops holding them.
   Nothing trims the transcript by bytes any more, so command output is
   bounded per command (`command_output_block_cap`, 1 MiB).
 - Resume replays the log from the newest compaction line, or from the start
