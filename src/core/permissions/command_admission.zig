@@ -16,6 +16,10 @@ pub const CommandContext = struct {
     target_os: std.Target.Os.Tag,
     environment: command_environment.Environment = .legacy,
     execution_mode: CommandExecutionMode = .captured,
+    /// Where the command runs. Settings decide it before admission.
+    placement: command_environment.Placement = .local,
+    /// For `.isolated`, the profile that runs it. Null means the profile named `default`.
+    placement_profile: ?[]const u8 = null,
 };
 
 pub const AdmissionFingerprint = struct {
@@ -24,6 +28,8 @@ pub const AdmissionFingerprint = struct {
     target_os: std.Target.Os.Tag,
     environment: command_environment.Environment = .legacy,
     execution_mode: CommandExecutionMode = .captured,
+    placement: command_environment.Placement = .local,
+    placement_profile: ?[]const u8 = null,
 
     pub fn init(ctx: CommandContext) AdmissionFingerprint {
         return .{
@@ -32,6 +38,8 @@ pub const AdmissionFingerprint = struct {
             .target_os = ctx.target_os,
             .environment = ctx.environment,
             .execution_mode = ctx.execution_mode,
+            .placement = ctx.placement,
+            .placement_profile = ctx.placement_profile,
         };
     }
 
@@ -40,7 +48,9 @@ pub const AdmissionFingerprint = struct {
             std.mem.eql(u8, self.resolved_cwd, ctx.resolved_cwd) and
             self.target_os == ctx.target_os and
             self.environment.eql(ctx.environment) and
-            self.execution_mode == ctx.execution_mode;
+            self.execution_mode == ctx.execution_mode and
+            self.placement == ctx.placement and
+            sameProfile(self.placement_profile, ctx.placement_profile);
     }
 
     pub fn eql(self: AdmissionFingerprint, other: AdmissionFingerprint) bool {
@@ -50,9 +60,16 @@ pub const AdmissionFingerprint = struct {
             .target_os = other.target_os,
             .environment = other.environment,
             .execution_mode = other.execution_mode,
+            .placement = other.placement,
+            .placement_profile = other.placement_profile,
         });
     }
 };
+
+/// A null profile is the profile named `default`, so the two match.
+fn sameProfile(a: ?[]const u8, b: ?[]const u8) bool {
+    return std.mem.eql(u8, a orelse "default", b orelse "default");
+}
 
 pub const ShellAuthorizationSource = enum {
     configured_rule,
@@ -212,4 +229,31 @@ test "explicit clean environment is direct only in automatic mode" {
         command_effect.ApprovalReason.filesystem_write,
         defaultForRunCommand(std.testing.allocator, write_ctx, .auto).approval_required,
     );
+}
+
+test "admission fingerprint binds the placement" {
+    const local: CommandContext = .{ .command = "zig build test", .resolved_cwd = "/repo", .target_os = .linux };
+    var workspace = local;
+    workspace.placement = .workspace;
+    var isolated = local;
+    isolated.placement = .isolated;
+
+    const fingerprint = AdmissionFingerprint.init(local);
+    try std.testing.expect(fingerprint.matches(local));
+    try std.testing.expect(!fingerprint.matches(workspace));
+    try std.testing.expect(!fingerprint.matches(isolated));
+    try std.testing.expect(!AdmissionFingerprint.init(workspace).eql(AdmissionFingerprint.init(isolated)));
+
+    var media = isolated;
+    media.placement_profile = "media";
+    var open = isolated;
+    open.placement_profile = "open";
+    var named_default = isolated;
+    named_default.placement_profile = "default";
+
+    const media_fingerprint = AdmissionFingerprint.init(media);
+    try std.testing.expect(media_fingerprint.matches(media));
+    try std.testing.expect(!media_fingerprint.matches(open));
+    try std.testing.expect(!AdmissionFingerprint.init(isolated).matches(media));
+    try std.testing.expect(AdmissionFingerprint.init(isolated).matches(named_default));
 }

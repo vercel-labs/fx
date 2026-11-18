@@ -17,6 +17,8 @@ const model_provider = @import("../config/model_provider.zig");
 const host = @import("../hosts/host.zig");
 const host_target = @import("../hosts/target.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
+const io_mod = @import("../shared/io.zig");
+const runtime_system = @import("../sandbox/runtime_system.zig");
 const record_tape = @import("../workspace/record_tape.zig");
 const statusline_identity = @import("../workspace/statusline_identity.zig");
 const shared_io = @import("../shared/io.zig");
@@ -597,6 +599,15 @@ pub fn Runtime(comptime App: type) type {
             agent.worker.agent_turn_settings.effort = startup.effort;
             if (comptime agents.hasAgentField(App, "session_persistence")) {
                 agent.session_persistence.workspace_capture = startup.workspace_capture;
+            }
+            if (comptime @hasField(App, "sandbox_runtime")) {
+                // One runtime per process: a later agent keeps the first.
+                if (startup.sandbox_execution and app.sandbox_runtime == null) {
+                    app.sandbox_runtime = runtime_system.createForApp(app.alloc, io_mod.homeDir() orelse "") catch |err| blk: {
+                        debug_trace.logf("sandbox", "the sandbox runtime was not made, so no command is placed in a sandbox: {s}", .{@errorName(err)});
+                        break :blk null;
+                    };
+                }
             }
             // Worker-owned memory uses the C allocator, matching worker deinit.
             try agent.worker.setProviderRouting(std.heap.c_allocator, startup.provider_order, startup.provider_strict);

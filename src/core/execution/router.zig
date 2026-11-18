@@ -26,6 +26,15 @@ pub fn prepareAuthorizedRoute(
     command_ctx: command_admission.CommandContext,
     authority: command_admission.CommandExecutionAuthority,
 ) !PreparedCommandRoute {
+    // A sandbox-placed command never runs here. It goes to the sandbox executor, and fails when there is none.
+    if (command_ctx.placement != .local) {
+        const fingerprint: command_admission.AdmissionFingerprint = switch (authority) {
+            .direct_only => |direct| direct,
+            .shell_allowed => |shell| shell.fingerprint,
+        };
+        if (!fingerprint.matches(command_ctx)) return error.CommandAuthorityContextMismatch;
+        return .{ .sandboxed = .{ .command_ctx = command_ctx } };
+    }
     if (command_ctx.target_os != builtin.target.os.tag) return error.CommandTargetMismatch;
     return switch (authority) {
         .direct_only => |fingerprint| blk: {
@@ -104,7 +113,21 @@ pub fn executePreparedRoute(
     alloc: std.mem.Allocator,
     route: PreparedCommandRoute,
 ) !RoutedCommandResult {
-    return local_executor.executePreparedCommand(cfg, alloc, route);
+    switch (route) {
+        .sandboxed => |sandboxed| {
+            const executor = cfg.sandbox_executor orelse return error.SandboxUnavailable;
+            return .{
+                .route = .sandboxed,
+                .result = try executor.execute(executor.context, cfg, alloc, .{
+                    .command = sandboxed.command_ctx.command,
+                    .cwd = sandboxed.command_ctx.resolved_cwd,
+                    .placement = sandboxed.command_ctx.placement,
+                    .profile = sandboxed.command_ctx.placement_profile,
+                }),
+            };
+        },
+        else => return local_executor.executePreparedCommand(cfg, alloc, route),
+    }
 }
 
 pub fn executePlannedCommand(
@@ -123,6 +146,8 @@ pub fn validateConfigContext(
     command_ctx: command_admission.CommandContext,
 ) !void {
     _ = cfg;
+    // A sandbox's OS is not this machine's, so only local commands check it.
+    if (command_ctx.placement != .local) return;
     if (command_ctx.target_os != builtin.target.os.tag) return error.CommandTargetMismatch;
 }
 
@@ -265,6 +290,116 @@ test "router rejects shell fingerprint and target mismatches" {
             changed_environment,
             shellAuthority(ctx, .interactive_once),
         ),
+    );
+}
+
+/// Records what the sandbox executor was asked to run.
+const FakeSandbox = struct {
+    calls: usize = 0,
+    seen: ?command_runner.SandboxCommand = null,
+    saw_cancel_flag: ?*std.atomic.Value(bool) = null,
+
+    fn execute(
+        opaque_context: *anyopaque,
+        cfg: command_runner.Config,
+        alloc: std.mem.Allocator,
+        command: command_runner.SandboxCommand,
+    ) anyerror!command_runner.CommandExecutionResult {
+        _ = alloc;
+        const self: *FakeSandbox = @ptrCast(@alignCast(opaque_context));
+        self.calls += 1;
+        self.seen = command;
+        self.saw_cancel_flag = cfg.cancel_flag;
+        return .{ .output = "sandbox-ran" };
+    }
+};
+
+test "a sandbox-placed command routes only to the sandbox executor" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const other_os: std.Target.Os.Tag = if (builtin.target.os.tag == .macos) .linux else .macos;
+    const placed = [_]struct {
+        placement: command_environment.Placement,
+        profile: ?[]const u8,
+    }{
+        .{ .placement = .workspace, .profile = null },
+        .{ .placement = .isolated, .profile = "media" },
+    };
+
+    for (placed) |item| {
+        var ctx = context("ls", false);
+        ctx.placement = item.placement;
+        ctx.placement_profile = item.profile;
+
+        // Both authorities route the command to the sandbox, not to this machine.
+        var direct_route = try prepareAuthorizedRoute(std.testing.allocator, ctx, directAuthority(ctx));
+        defer direct_route.deinit(std.testing.allocator);
+        try std.testing.expect(direct_route == .sandboxed);
+        var shell_route = try prepareAuthorizedRoute(std.testing.allocator, ctx, shellAuthority(ctx, .auto_mode));
+        defer shell_route.deinit(std.testing.allocator);
+        try std.testing.expect(shell_route == .sandboxed);
+
+        // The sandbox's OS does not have to match this machine's.
+        var other = ctx;
+        other.target_os = other_os;
+        var other_route = try prepareAuthorizedRoute(std.testing.allocator, other, directAuthority(other));
+        defer other_route.deinit(std.testing.allocator);
+        try std.testing.expect(other_route == .sandboxed);
+        try validateConfigContext(.{ .max_command_output_bytes = 1024 }, other);
+
+        // Without an executor, the route fails and nothing runs here.
+        try std.testing.expectError(
+            error.SandboxUnavailable,
+            executePreparedRoute(.{ .max_command_output_bytes = 1024 }, arena, direct_route),
+        );
+
+        // With an executor, it is called once with the command, folder, placement, and profile.
+        var cancel = std.atomic.Value(bool).init(false);
+        var fake: FakeSandbox = .{};
+        const routed = try executePreparedRoute(.{
+            .max_command_output_bytes = 1024,
+            .cancel_flag = &cancel,
+            .sandbox_executor = .{ .context = &fake, .execute = FakeSandbox.execute },
+        }, arena, direct_route);
+        try std.testing.expectEqual(@as(usize, 1), fake.calls);
+        try std.testing.expectEqual(RouteKind.sandboxed, routed.route);
+        try std.testing.expectEqualStrings("sandbox-ran", routed.result.output);
+        try std.testing.expect(fake.saw_cancel_flag == &cancel);
+        const seen = fake.seen.?;
+        try std.testing.expectEqualStrings("ls", seen.command);
+        try std.testing.expectEqualStrings("/tmp", seen.cwd);
+        try std.testing.expectEqual(item.placement, seen.placement);
+        if (item.profile) |profile| {
+            try std.testing.expectEqualStrings(profile, seen.profile orelse return error.TestUnexpectedResult);
+        } else {
+            try std.testing.expect(seen.profile == null);
+        }
+    }
+}
+
+test "a sandbox route checks its authority" {
+    const local = context("ls", false);
+    var workspace = local;
+    workspace.placement = .workspace;
+    try std.testing.expectError(
+        error.CommandAuthorityContextMismatch,
+        prepareAuthorizedRoute(std.testing.allocator, workspace, directAuthority(local)),
+    );
+    try std.testing.expectError(
+        error.CommandAuthorityContextMismatch,
+        prepareAuthorizedRoute(std.testing.allocator, workspace, shellAuthority(local, .auto_mode)),
+    );
+
+    // A grant for one isolated profile never approves another.
+    var media = local;
+    media.placement = .isolated;
+    media.placement_profile = "media";
+    var open = media;
+    open.placement_profile = "open";
+    try std.testing.expectError(
+        error.CommandAuthorityContextMismatch,
+        prepareAuthorizedRoute(std.testing.allocator, open, directAuthority(media)),
     );
 }
 

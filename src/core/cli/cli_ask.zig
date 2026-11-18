@@ -102,6 +102,9 @@ const tool_runtime = @import("../tooling/tool_runtime.zig");
 const tool_set_contract = @import("../tooling/tool_set.zig");
 const tool_specs = @import("../tooling/tool_specs.zig");
 const web_fetch_runtime = @import("../tooling/web_fetch_runtime.zig");
+const runtime_system = @import("../sandbox/runtime_system.zig");
+const sandbox_executor = @import("../sandbox/sandbox_executor.zig");
+const sandbox_runtime = @import("../sandbox/runtime.zig");
 const web_search_runtime = @import("../tooling/web_search_runtime.zig");
 const types = @import("../shared/types.zig");
 const history_range = @import("../shared/history_range.zig");
@@ -717,6 +720,8 @@ const AskContext = struct {
     /// kept here (`takeTurnUsage`).
     usage_total: types.Usage = .{},
     web_fetch_runtime: web_fetch_runtime.Runtime = web_fetch_runtime.Runtime.init(.{}),
+    /// The sandbox runtime while `experimental.sandbox_execution` is on.
+    sandbox_runtime: ?*sandbox_runtime.Runtime = null,
     web_search_runtime: web_search_runtime.Runtime,
     capability_resolver: gateway_provider.CapabilityResolver = .{},
     lifecycle_runtime: hooks.Runtime,
@@ -852,6 +857,7 @@ const AskContext = struct {
         // `fx ask` is the whole process: retention's maintenance ends here.
         if (comptime turn_capture.supported) turn_capture.finishMaintenance();
         self.web_fetch_runtime.deinit(self.alloc);
+        if (self.sandbox_runtime) |rt| rt.destroy();
         self.web_search_runtime.deinit();
         if (self.refreshed_credential) |*credential| credential.deinit(self.alloc);
         self.capability_resolver.deinit(self.alloc);
@@ -1204,6 +1210,12 @@ const AskContext = struct {
             .lifecycle_view = self.lifecycle_view,
             .lifecycle_scope = self.lifecycleContext().scope,
         };
+        if (self.sandbox_runtime) |rt| {
+            // Out of memory leaves the closed policy, so no command runs here.
+            tc.command_placement = rt.policyFor(self.workspace_root) catch sandbox_runtime.fail_closed;
+            tc.sandbox_executor = sandbox_executor.executor(rt);
+            tc.sandbox_reader = sandbox_executor.reader(rt);
+        }
         if (self.mcp_host) |h| h.catalog.wire(&tc);
         // On a terminal, a server's question is put to the user.
         if (self.mcp_host != null and self.mcp_elicitation_capabilities.any()) {
@@ -1759,6 +1771,17 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
         startup.notification_attention_required,
     );
     ctx.workspace_capture = startup.workspace_capture;
+    if (startup.sandbox_execution and ctx.sandbox_runtime == null) {
+        ctx.sandbox_runtime = runtime_system.createForApp(ctx.alloc, io_mod.homeDir() orelse "") catch |err| blk: {
+            debug_trace.logf("sandbox", "the sandbox runtime was not made, so no command is placed in a sandbox: {s}", .{@errorName(err)});
+            break :blk null;
+        };
+        if (ctx.sandbox_runtime) |rt| {
+            if (ctx.managed_executions.sandbox_executor == null) {
+                ctx.managed_executions.sandbox_executor = sandbox_executor.executor(rt);
+            }
+        }
+    }
     ctx.session.setConversationLanguageFromUserMessage(owned_prompt);
     if (options.save_session) {
         try ctx.checkCancellation();

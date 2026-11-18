@@ -88,6 +88,8 @@ const tool_presentation = @import("../core/tooling/tool_presentation.zig");
 const tool_call_presentation = @import("tool_call_presentation.zig");
 const tool_result_errors = @import("../core/tooling/tool_result_errors.zig");
 const tool_runtime = @import("../core/tooling/tool_runtime.zig");
+const sandbox_executor = @import("../core/sandbox/sandbox_executor.zig");
+const sandbox_runtime = @import("../core/sandbox/runtime.zig");
 const command_output_content = @import("../core/tooling/command_output_content.zig");
 const builtin_tools = @import("../builtins/tools.zig");
 const test_builtin_gateway = if (std_builtin.is_test)
@@ -713,6 +715,12 @@ const AcpContext = struct {
                 .session_id = session.session_id,
             },
         };
+        if (self.state.sandbox_runtime) |rt| {
+            // Out of memory leaves the closed policy, so no command runs here.
+            tc.command_placement = rt.policyFor(self.state.workspace_root) catch sandbox_runtime.fail_closed;
+            tc.sandbox_executor = sandbox_executor.executor(rt);
+            tc.sandbox_reader = sandbox_executor.reader(rt);
+        }
         if (comptime !host_target.is_wasm) {
             if (self.mcpHost()) |h| h.catalog.wire(&tc);
         }

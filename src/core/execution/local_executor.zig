@@ -8,6 +8,7 @@ const command_effect = @import("../shell_command/command_effect.zig");
 pub const RouteKind = enum {
     direct_read_only,
     approved_shell,
+    sandboxed,
 };
 
 /// An admitted foreground command prepared for local execution.
@@ -21,11 +22,13 @@ pub const PreparedCommand = union(enum) {
         source: command_admission.ShellAuthorizationSource,
         grant_epoch: ?u64 = null,
     },
+    /// Placed in a sandbox by settings. It never runs on this machine.
+    sandboxed: struct { command_ctx: command_admission.CommandContext },
 
     pub fn deinit(self: *PreparedCommand, alloc: std.mem.Allocator) void {
         switch (self.*) {
             .direct_read_only => |*plan| plan.deinit(alloc),
-            .approved_shell => {},
+            .approved_shell, .sandboxed => {},
         }
         self.* = undefined;
     }
@@ -45,7 +48,7 @@ pub fn foregroundResultComparisonLimit(
 ) usize {
     return switch (command) {
         .direct_read_only => direct_command.direct_output_limit_bytes,
-        .approved_shell => approved_shell_limit,
+        .approved_shell, .sandboxed => approved_shell_limit,
     };
 }
 
@@ -76,6 +79,7 @@ pub fn executePreparedCommand(
                 shell.command_ctx.environment,
             ),
         },
+        .sandboxed => return error.SandboxUnavailable,
     };
 }
 
@@ -133,4 +137,20 @@ test "local executor runs an approved shell command with its admitted context" {
     try std.testing.expectEqualStrings(command.approved_shell.command_ctx.command, foreground.command);
     try std.testing.expectEqualStrings(command.approved_shell.command_ctx.resolved_cwd, foreground.cwd);
     try std.testing.expectEqual(@as(?i64, 0), foreground.exit_code);
+}
+
+test "the local executor refuses a sandboxed command" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const command = PreparedCommand{ .sandboxed = .{ .command_ctx = .{
+        .command = "printf must-not-run-here",
+        .resolved_cwd = "/tmp",
+        .target_os = @import("builtin").target.os.tag,
+        .placement = .workspace,
+    } } };
+    try std.testing.expectError(error.SandboxUnavailable, executePreparedCommand(.{
+        .max_command_output_bytes = 1024,
+    }, arena, command));
 }

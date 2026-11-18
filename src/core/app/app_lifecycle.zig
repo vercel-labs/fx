@@ -265,6 +265,8 @@ pub const StartupState = struct {
     /// `experimental.workspace_capture`: capture the repository at each
     /// turn's start and end.
     workspace_capture: bool = false,
+    /// `experimental.sandbox_execution`: run commands in a Vercel Sandbox as the user's rules say.
+    sandbox_execution: bool = false,
     notification_attention_required: bool = false,
     notification_max: bool = false,
     theme_monitor_enabled: bool = false,
@@ -948,6 +950,7 @@ pub fn resolveSettings(alloc: Allocator, state: *StartupState, detailed: *const 
     const max_override: ?bool = if (sound_override) |level| level == .max else null;
     state.notification_turn_end = sound_on_override orelse settings.notification_turn_end orelse notification_sound.default_enabled;
     state.workspace_capture = settings.experimental_workspace_capture orelse false;
+    state.sandbox_execution = settings.experimental_sandbox_execution orelse false;
     state.notification_attention_required = sound_on_override orelse settings.notification_attention_required orelse notification_sound.default_enabled;
     state.notification_max = max_override orelse settings.notification_max orelse false;
 }

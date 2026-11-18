@@ -132,6 +132,7 @@ const tool_set_contract = @import("core/tooling/tool_set.zig");
 const tool_mcp_runtime = @import("core/tooling/tool_mcp_runtime.zig");
 const tool_runtime = @import("core/tooling/tool_runtime.zig");
 const web_fetch_runtime = @import("core/tooling/web_fetch_runtime.zig");
+const sandbox_runtime = @import("core/sandbox/runtime.zig");
 const web_search_runtime = @import("core/tooling/web_search_runtime.zig");
 const worker_runtime = @import("core/agent/worker_runtime.zig");
 const question_prompt = @import("core/agent/question_prompt.zig");
@@ -568,6 +569,8 @@ const App = struct {
     permission_state: app_permission_runtime.State = .{},
     agent_step_limit: usize = default_max_agent_steps,
     web_fetch_runtime: web_fetch_runtime.Runtime = web_fetch_runtime.Runtime.init(.{}),
+    /// The sandbox runtime while `experimental.sandbox_execution` is on.
+    sandbox_runtime: ?*sandbox_runtime.Runtime = null,
     web_search_runtime: web_search_runtime.Runtime = web_search_runtime.Runtime.init(.{
         .provider = if (host_profile.web_search) builtin_providers.native.gateway.fx_search else null,
     }),
@@ -1112,6 +1115,9 @@ const App = struct {
         self.terminal_input_runtime.deinit(self.alloc);
         self.shell.deinit(self.alloc);
         AgentsAppRuntime.deinitChildren(self);
+        // Last: every agent's command runs and the children's executors are done,
+        // so nothing can reach the sandbox runtime after it is freed.
+        if (self.sandbox_runtime) |rt| rt.destroy();
         self.instances.deinit(self.alloc);
         self.pacer.deinit(self.alloc);
         main_agent.session_title.deinit(self.alloc);
@@ -5562,6 +5568,25 @@ test {
     _ = @import("core/shell_command/command_effect.zig");
     _ = @import("core/shell_command/safe_git.zig");
     _ = @import("core/execution/router.zig");
+    _ = @import("core/execution/placement.zig");
+    _ = @import("core/sandbox/config.zig");
+    _ = @import("core/sandbox/credentials.zig");
+    _ = @import("core/sandbox/api.zig");
+    _ = @import("core/sandbox/client.zig");
+    _ = @import("core/sandbox/http_transport.zig");
+    _ = @import("core/sandbox/executor.zig");
+    _ = @import("core/sandbox/sync_plan.zig");
+    _ = @import("core/sandbox/local_git.zig");
+    _ = @import("core/sandbox/archive.zig");
+    _ = @import("core/sandbox/workspace.zig");
+    _ = @import("core/sandbox/test_sandbox.zig");
+    _ = @import("core/sandbox/isolated.zig");
+    _ = @import("core/sandbox/snapshots.zig");
+    _ = @import("core/sandbox/runtime.zig");
+    _ = @import("core/sandbox/report_text.zig");
+    _ = @import("core/sandbox/result.zig");
+    _ = @import("core/sandbox/sandbox_executor.zig");
+    _ = @import("core/sandbox/runtime_system.zig");
     _ = @import("core/execution/command_runner.zig");
     _ = @import("core/permissions/direct_command.zig");
     _ = @import("core/permissions/auto_classifier.zig");
@@ -5622,6 +5647,7 @@ test {
     _ = @import("core/app/input_approval_runtime.zig");
     _ = @import("acp/sessions.zig");
     _ = @import("core/shared/text_utils.zig");
+    _ = @import("core/shared/wildcard.zig");
     _ = @import("core/shared/testing_listener.zig");
     _ = @import("core/tooling/tool_projection.zig");
     _ = @import("core/tooling/tool_dispatch.zig");

@@ -84,6 +84,14 @@ pub const WebSearchBackendFn = *const fn (
     web_search_contract.Request,
 ) anyerror!web_search_contract.ExecutionOutput;
 
+/// Reads a file that exists only in a workspace sandbox.
+pub const SandboxReader = struct {
+    context: *anyopaque,
+    /// The file's bytes when a workspace sandbox of this process holds
+    /// `path` (absolute), or null. At most `max_bytes` are returned.
+    read: *const fn (context: *anyopaque, arena: std.mem.Allocator, path: []const u8, max_bytes: usize) anyerror!?[]const u8,
+};
+
 pub const WebSearchBackend = struct {
     ctx: *anyopaque,
     execute_fn: WebSearchBackendFn,
@@ -299,6 +307,8 @@ pub const DispatchContext = struct {
     web_fetch_runtime: ?*web_fetch_runtime.Runtime = null,
     web_fetch_artifact_store: ?*web_fetch_artifacts.Store = null,
     web_fetch_artifact_error: ?anyerror = null,
+    /// Reads a file that only a workspace sandbox of this process holds.
+    sandbox_reader: ?SandboxReader = null,
     web_search_backend: ?WebSearchBackend = null,
     tool_call_id: []const u8 = "",
     tool_call_name: []const u8 = "",

@@ -1269,6 +1269,9 @@ fn callTtyRun(
         configured,
         shell,
     ) catch |err| return runtimeFailure(ctx, err);
+    if (sandboxTtyRefusal(ctx)) |refusal| {
+        return .{ .failure = try ctx.allocator.dupe(u8, refusal) };
+    }
     requireTtyShellAuthority(ctx, .{
         .command = command,
         .resolved_cwd = cwd,
@@ -1575,10 +1578,11 @@ fn ttyShell(
     );
 }
 
-fn requireTtyShellAuthority(
+/// The shell fingerprint admission recorded for this call. A call without
+/// shell authority fails here, so every TTY check reads it the same way.
+fn admittedShellFingerprint(
     ctx: tool_dispatch.DispatchContext,
-    command_ctx: command_admission.CommandContext,
-) !void {
+) !command_admission.AdmissionFingerprint {
     const execution_authority = ctx.execution_authority orelse
         return error.CommandAuthorityContextMismatch;
     const command_authority = switch (execution_authority) {
@@ -1589,9 +1593,28 @@ fn requireTtyShellAuthority(
         .shell_allowed => |value| value,
         .direct_only => return error.CommandAdmissionChanged,
     };
-    if (!shell_allowed.fingerprint.matches(command_ctx)) {
+    return shell_allowed.fingerprint;
+}
+
+fn requireTtyShellAuthority(
+    ctx: tool_dispatch.DispatchContext,
+    command_ctx: command_admission.CommandContext,
+) !void {
+    const fingerprint = try admittedShellFingerprint(ctx);
+    if (!fingerprint.matches(command_ctx)) {
         return error.CommandAuthorityContextMismatch;
     }
+}
+
+const tty_sandbox_refusal = "This command is set to run in a sandbox, but tty=true commands run only on this machine, so it did not run. Run it without tty=true, or change its rule in ~/.fx/sandbox/config.json.";
+
+/// The refusal for a `tty=true` command that admission placed in a sandbox,
+/// or null when it may run here. A call without shell authority gets null,
+/// and requireTtyShellAuthority refuses it as before.
+fn sandboxTtyRefusal(ctx: tool_dispatch.DispatchContext) ?[]const u8 {
+    const fingerprint = admittedShellFingerprint(ctx) catch return null;
+    if (fingerprint.placement == .local) return null;
+    return tty_sandbox_refusal;
 }
 
 fn executeTerminal(
@@ -2935,6 +2958,41 @@ test "TTY execution requires matching shell authority" {
                 .source = .auto_classifier,
             } } },
         }, changed),
+    );
+}
+
+test "a tty command placed in a sandbox is refused before it starts" {
+    const sandboxed = command_admission.CommandContext{
+        .command = "pwd",
+        .resolved_cwd = "/workspace",
+        .target_os = builtin.target.os.tag,
+        .environment = .{ .clean = "/bin/bash" },
+        .execution_mode = .tty,
+        .placement = .workspace,
+    };
+    const sandboxed_ctx: tool_dispatch.DispatchContext = .{
+        .allocator = std.testing.allocator,
+        .execution_authority = .{ .run_command = .{ .shell_allowed = .{
+            .fingerprint = .init(sandboxed),
+            .source = .auto_classifier,
+        } } },
+    };
+    try std.testing.expectEqualStrings(tty_sandbox_refusal, sandboxTtyRefusal(sandboxed_ctx).?);
+
+    var local = sandboxed;
+    local.placement = .local;
+    const local_ctx: tool_dispatch.DispatchContext = .{
+        .allocator = std.testing.allocator,
+        .execution_authority = .{ .run_command = .{ .shell_allowed = .{
+            .fingerprint = .init(local),
+            .source = .auto_classifier,
+        } } },
+    };
+    try std.testing.expectEqual(@as(?[]const u8, null), sandboxTtyRefusal(local_ctx));
+    // With no shell authority, the refusal is left to requireTtyShellAuthority.
+    try std.testing.expectEqual(
+        @as(?[]const u8, null),
+        sandboxTtyRefusal(.{ .allocator = std.testing.allocator }),
     );
 }
 

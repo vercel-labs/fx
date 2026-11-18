@@ -35,6 +35,8 @@ const permission_request = @import("../permissions/permission_request.zig");
 const command_admission = @import("../permissions/command_admission.zig");
 const pathing = @import("../workspace/pathing.zig");
 const execution_router = @import("../execution/router.zig");
+const command_runner = @import("../execution/command_runner.zig");
+const placement = @import("../execution/placement.zig");
 const skill_runtime = @import("../skills/skill_runtime.zig");
 const subagent_model_contract = @import("../subagent/model_contract.zig");
 const subagent_refusal = @import("../subagent/refusal.zig");
@@ -267,6 +269,12 @@ pub const Context = struct {
     on_web_fetch_progress: ?tool_dispatch.WebFetchProgressFn = null,
     workspace_executor: ?js_host_workspace.Executor = null,
     host_sandbox_default: tool_admission.HostSandboxDefault = .none,
+    /// Where settings place each shell command.
+    command_placement: placement.Policy = .{},
+    /// Runs sandbox-placed commands. Null when the sandbox feature is off.
+    sandbox_executor: ?command_runner.SandboxExecutor = null,
+    /// Reads files that only a workspace sandbox holds. Null when the sandbox feature is off.
+    sandbox_reader: ?tool_dispatch.SandboxReader = null,
     model_capability_resolver: ?model_capabilities.Resolver = null,
     model_override_resolver: ?subagent_tool_host.ModelOverrideResolver = null,
     /// False when running outside an interactive TUI (e.g. ACP). Tools
@@ -306,6 +314,8 @@ pub const Context = struct {
             .auto_classifier = self.admissionAutoClassifier(),
             .terminal_review_context = self.terminalReviewContext(),
             .host_sandbox_default = self.host_sandbox_default,
+            .command_placement = self.command_placement,
+            .sandbox_read_fallback = self.sandbox_reader != null,
         };
         if (self.permission_state_override != null) {
             input.session_permission_state_provider = null;
@@ -1945,6 +1955,7 @@ fn typedDispatchContext(ctx: Context, arena: Allocator) tool_dispatch.DispatchCo
         .web_fetch_runtime = ctx.web_fetch_runtime,
         .web_fetch_artifact_store = ctx.web_fetch_artifact_store,
         .web_fetch_artifact_error = ctx.web_fetch_artifact_error,
+        .sandbox_reader = ctx.sandbox_reader,
         .tool_capabilities = capabilities,
         .web_search_backend = ctx.web_search_backend,
         .web_search_progress_ctx = ctx.web_search_progress_ctx,
@@ -2351,6 +2362,7 @@ fn toolRunCommand(
 
     try execution_router.validateConfigContext(.{
         .max_command_output_bytes = ctx.max_command_output_bytes,
+        .sandbox_executor = ctx.sandbox_executor,
     }, command_ctx);
     var route = try execution_router.prepareAuthorizedRoute(arena, command_ctx, authority);
     defer route.deinit(arena);
@@ -2457,6 +2469,7 @@ fn toolRunCommand(
 
     const routed = execution_router.executePreparedRoute(.{
         .max_command_output_bytes = ctx.max_command_output_bytes,
+        .sandbox_executor = ctx.sandbox_executor,
         .cancel_flag = runtimeCancelFlag(ctx),
         .output_chunk_lifecycle_id = ctx.output_chunk_lifecycle_id,
         .output_chunk_ctx = ctx.output_chunk_ctx,
@@ -3263,6 +3276,9 @@ const TestRuntime = struct {
     on_web_fetch_progress: ?tool_dispatch.WebFetchProgressFn = null,
     workspace_executor: ?js_host_workspace.Executor = null,
     host_sandbox_default: tool_admission.HostSandboxDefault = .none,
+    command_placement: placement.Policy = .{},
+    sandbox_executor: ?command_runner.SandboxExecutor = null,
+    sandbox_reader: ?tool_dispatch.SandboxReader = null,
 
     fn deinit(self: *TestRuntime, alloc: Allocator) void {
         self.worker.deinit(alloc);
@@ -3338,6 +3354,9 @@ const TestRuntime = struct {
             .on_web_fetch_progress = self.on_web_fetch_progress,
             .workspace_executor = self.workspace_executor,
             .host_sandbox_default = self.host_sandbox_default,
+            .command_placement = self.command_placement,
+            .sandbox_executor = self.sandbox_executor,
+            .sandbox_reader = self.sandbox_reader,
             .interactive = self.interactive,
         };
     }

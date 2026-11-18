@@ -46,6 +46,9 @@ const types = @import("../core/shared/types.zig");
 const context_contract = @import("../core/workspace/context_contract.zig");
 const workspace_access = @import("../core/workspace/workspace_access.zig");
 const web_fetch_runtime = @import("../core/tooling/web_fetch_runtime.zig");
+const runtime_system = @import("../core/sandbox/runtime_system.zig");
+const sandbox_executor = @import("../core/sandbox/sandbox_executor.zig");
+const sandbox_runtime = @import("../core/sandbox/runtime.zig");
 const web_search_runtime = @import("../core/tooling/web_search_runtime.zig");
 const elicitation = @import("../core/mcp/elicitation.zig");
 const tool_mcp_runtime = @import("../core/tooling/tool_mcp_runtime.zig");
@@ -400,6 +403,8 @@ pub const ServerState = struct {
     capability_resolver: gateway_provider.CapabilityResolver = .{},
     terminate_connection: bool = false,
     web_fetch_runtime: web_fetch_runtime.Runtime = web_fetch_runtime.Runtime.init(.{}),
+    /// The sandbox runtime while `experimental.sandbox_execution` is on.
+    sandbox_runtime: ?*sandbox_runtime.Runtime = null,
     web_search_runtime: web_search_runtime.Runtime = web_search_runtime.Runtime.init(.{}),
     lifecycle_runtime: hooks.Runtime = hooks.Runtime.init(std.heap.c_allocator),
     lifecycle_view: hooks.RuntimeView = hooks.RuntimeView.empty(),
@@ -453,6 +458,7 @@ pub const ServerState = struct {
         for (self.report_calls.items) |*call| call.deinit(std.heap.c_allocator);
         self.report_calls.deinit(std.heap.c_allocator);
         self.web_fetch_runtime.deinit(self.alloc);
+        if (self.sandbox_runtime) |rt| rt.destroy();
         self.web_search_runtime.deinit();
         self.lifecycle_runtime.deinit();
         self.host_tools.deinit();
@@ -3241,6 +3247,17 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
     state.session_titles = startup.session_title_generation;
     state.cache_warming = startup.cache_warming;
     state.workspace_capture = startup.workspace_capture;
+    if (startup.sandbox_execution and state.sandbox_runtime == null) {
+        state.sandbox_runtime = runtime_system.createForApp(state.alloc, io_mod.homeDir() orelse "") catch |err| blk: {
+            debug_trace.logf("sandbox", "the sandbox runtime was not made, so no command is placed in a sandbox: {s}", .{@errorName(err)});
+            break :blk null;
+        };
+        if (state.sandbox_runtime) |rt| {
+            if (state.managed_executions.sandbox_executor == null) {
+                state.managed_executions.sandbox_executor = sandbox_executor.executor(rt);
+            }
+        }
+    }
 
     if (comptime !host_target.is_wasm) {
         if (!state.cfg.minimal_kernel) {

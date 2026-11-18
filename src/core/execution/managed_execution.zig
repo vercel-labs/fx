@@ -306,12 +306,19 @@ const Entry = struct {
             try owned.dupe(u8, path)
         else
             null;
-        const command_ctx = command_admission.CommandContext{
+        var command_ctx = command_admission.CommandContext{
             .command = command,
             .resolved_cwd = cwd,
             .target_os = builtin.target.os.tag,
             .environment = environment,
         };
+        // The admitted placement travels in the authority. Rebuilding the context without it would move a sandbox-placed command to this machine.
+        const admitted = admittedFingerprint(input.authority);
+        command_ctx.placement = admitted.placement;
+        command_ctx.placement_profile = if (admitted.placement_profile) |profile|
+            try owned.dupe(u8, profile)
+        else
+            null;
         const authority = rebindAuthority(input.authority, command_ctx);
         var route = try execution_router.prepareAuthorizedRoute(
             owned,
@@ -608,6 +615,7 @@ const Entry = struct {
             .timeout_started_ms = started_ms,
             .command_artifact_dir = self.command_artifact_dir,
             .extra_environment = self.extra_environment,
+            .sandbox_executor = self.runtime.sandbox_executor,
         }, self.arena.allocator(), captured.route) catch |err| {
             const zio = io_mod.getIo();
             self.mutex.lockUncancelable(zio);
@@ -668,6 +676,8 @@ pub const Runtime = struct {
     shutting_down: bool = false,
     replay_store: command_replay_store.EphemeralStore,
     pending_admissions: usize = 0,
+    /// Runs sandbox-placed commands. The app sets it when the sandbox feature is on.
+    sandbox_executor: ?command_runner.SandboxExecutor = null,
 
     pub fn init(alloc: Allocator) Runtime {
         return .{
@@ -1814,6 +1824,16 @@ fn rebindAuthority(
     };
 }
 
+/// The fingerprint that holds the admitted context, whichever authority kind admitted it.
+fn admittedFingerprint(
+    authority: command_admission.CommandExecutionAuthority,
+) command_admission.AdmissionFingerprint {
+    return switch (authority) {
+        .direct_only => |fingerprint| fingerprint,
+        .shell_allowed => |shell| shell.fingerprint,
+    };
+}
+
 fn statusFromResult(
     execution_id: []const u8,
     result: command_contract.RunCommandResult,
@@ -1942,6 +1962,183 @@ test "captured managed execution yields one handle and delivers ordered output o
     defer alloc.free(retained_command);
     try std.testing.expectEqualStrings(input.command, retained_command);
     try std.testing.expect(runtime.isTombstone(input.execution_id));
+}
+
+/// Stands in for the sandbox executor. It records what it was asked to run
+/// and returns a fixed result, so a test can tell the sandbox ran it.
+const FakeSandbox = struct {
+    calls: usize = 0,
+    seen: ?command_runner.SandboxCommand = null,
+
+    fn execute(
+        opaque_context: *anyopaque,
+        cfg: command_runner.Config,
+        alloc: Allocator,
+        command: command_runner.SandboxCommand,
+    ) anyerror!command_runner.CommandExecutionResult {
+        _ = cfg;
+        _ = alloc;
+        const self: *FakeSandbox = @ptrCast(@alignCast(opaque_context));
+        self.calls += 1;
+        self.seen = command;
+        return .{
+            .output = "ran remotely",
+            .command_result = .{
+                .command = command.command,
+                .cwd = command.cwd,
+                .exit_code = 0,
+            },
+        };
+    }
+};
+
+/// An authority that admitted `input` under `placement` and `profile`.
+fn placedAuthority(
+    input: StartCapturedInput,
+    placement: command_environment.Placement,
+    profile: ?[]const u8,
+) command_admission.CommandExecutionAuthority {
+    const ctx = command_admission.CommandContext{
+        .command = input.command,
+        .resolved_cwd = input.cwd,
+        .target_os = builtin.target.os.tag,
+        .environment = input.environment,
+        .placement = placement,
+        .placement_profile = profile,
+    };
+    return .{ .shell_allowed = .{
+        .fingerprint = .init(ctx),
+        .source = .yolo,
+    } };
+}
+
+/// The entry for `execution_id`, while the runtime still holds it.
+fn entryFor(runtime: *Runtime, execution_id: []const u8) ?*Entry {
+    for (runtime.entries) |slot| {
+        const entry = slot orelse continue;
+        if (std.mem.eql(u8, entry.execution_id, execution_id)) return entry;
+    }
+    return null;
+}
+
+test "a sandbox-placed captured command runs only in the sandbox executor" {
+    if (comptime builtin.target.os.tag == .wasi) return;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(dir_path);
+    const marker_path = try alloc.print("{s}/marker", .{dir_path});
+    defer alloc.free(marker_path);
+    const command = try alloc.print("touch {s}", .{marker_path});
+    defer alloc.free(command);
+
+    var runtime = Runtime.init(alloc);
+    defer runtime.deinit();
+    var fake: FakeSandbox = .{};
+    runtime.sandbox_executor = .{ .context = &fake, .execute = FakeSandbox.execute };
+    var input = StartCapturedInput{
+        .execution_id = "sandbox-remote-only",
+        .command = command,
+        .cwd = dir_path,
+        .environment = .legacy,
+        .authority = undefined,
+        .max_output_bytes = 4096,
+        .timeout_ms = 2_000,
+        .command_artifact_dir = null,
+        .yield_time_ms = 0,
+    };
+    input.authority = placedAuthority(input, .workspace, null);
+    var started = try runtime.startCaptured(alloc, input);
+    defer started.deinit(alloc);
+    try runtime.commitDelivery(started.snapshot.execution_id, started.reservation_id);
+
+    var completed = try runtime.wait(alloc, input.execution_id, 2_000, null);
+    defer completed.deinit(alloc);
+    try std.testing.expect(completed.snapshot.state == .completed);
+    try std.testing.expectEqual(@as(usize, 1), fake.calls);
+    const seen = fake.seen orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(command_environment.Placement.workspace, seen.placement);
+    try std.testing.expectEqualStrings(command, seen.command);
+    try std.testing.expectEqualStrings(dir_path, seen.cwd);
+    const entry = entryFor(&runtime, input.execution_id) orelse return error.TestUnexpectedResult;
+    const result = entry.result orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("ran remotely", result.output);
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.accessAbsolute(io_mod.getIo(), marker_path, .{}));
+    try runtime.commitDelivery(completed.snapshot.execution_id, completed.reservation_id);
+}
+
+test "a sandbox-placed command without an executor does not run here" {
+    if (comptime builtin.target.os.tag == .wasi) return;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(dir_path);
+    const marker_path = try alloc.print("{s}/marker", .{dir_path});
+    defer alloc.free(marker_path);
+    const command = try alloc.print("touch {s}", .{marker_path});
+    defer alloc.free(command);
+
+    var runtime = Runtime.init(alloc);
+    defer runtime.deinit();
+    var input = StartCapturedInput{
+        .execution_id = "sandbox-no-executor",
+        .command = command,
+        .cwd = dir_path,
+        .environment = .legacy,
+        .authority = undefined,
+        .max_output_bytes = 4096,
+        .timeout_ms = 2_000,
+        .command_artifact_dir = null,
+        .yield_time_ms = 0,
+    };
+    input.authority = placedAuthority(input, .workspace, null);
+    var started = try runtime.startCaptured(alloc, input);
+    defer started.deinit(alloc);
+    try runtime.commitDelivery(started.snapshot.execution_id, started.reservation_id);
+
+    var completed = try runtime.wait(alloc, input.execution_id, 2_000, null);
+    defer completed.deinit(alloc);
+    try std.testing.expectEqual(SnapshotState.lost, completed.snapshot.state);
+    const entry = entryFor(&runtime, input.execution_id) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("SandboxUnavailable", entry.error_name orelse return error.TestUnexpectedResult);
+    try std.testing.expect(entry.result == null);
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.accessAbsolute(io_mod.getIo(), marker_path, .{}));
+    try runtime.commitDelivery(completed.snapshot.execution_id, completed.reservation_id);
+}
+
+test "an isolated profile survives the rebuilt context" {
+    if (comptime builtin.target.os.tag == .wasi) return;
+    const alloc = std.testing.allocator;
+    var runtime = Runtime.init(alloc);
+    defer runtime.deinit();
+    var fake: FakeSandbox = .{};
+    runtime.sandbox_executor = .{ .context = &fake, .execute = FakeSandbox.execute };
+    var input = StartCapturedInput{
+        .execution_id = "sandbox-isolated-profile",
+        .command = "true",
+        .cwd = "/tmp",
+        .environment = .legacy,
+        .authority = undefined,
+        .max_output_bytes = 4096,
+        .timeout_ms = 2_000,
+        .command_artifact_dir = null,
+        .yield_time_ms = 0,
+    };
+    input.authority = placedAuthority(input, .isolated, "media");
+    var started = try runtime.startCaptured(alloc, input);
+    defer started.deinit(alloc);
+    try runtime.commitDelivery(started.snapshot.execution_id, started.reservation_id);
+
+    var completed = try runtime.wait(alloc, input.execution_id, 2_000, null);
+    defer completed.deinit(alloc);
+    try std.testing.expect(completed.snapshot.state == .completed);
+    try std.testing.expectEqual(@as(usize, 1), fake.calls);
+    const seen = fake.seen orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(command_environment.Placement.isolated, seen.placement);
+    try std.testing.expectEqualStrings("media", seen.profile orelse return error.TestUnexpectedResult);
+    try runtime.commitDelivery(completed.snapshot.execution_id, completed.reservation_id);
 }
 
 test "process-exit termination joins a command a cancelled foreground wait is already joining" {

@@ -62,6 +62,8 @@ else
     struct {};
 const tool_presentation = @import("../tooling/tool_presentation.zig");
 const tool_runtime = @import("../tooling/tool_runtime.zig");
+const sandbox_executor = @import("../sandbox/sandbox_executor.zig");
+const sandbox_runtime = @import("../sandbox/runtime.zig");
 const skill_invocation = @import("../skills/skill_invocation.zig");
 const web_fetch_runtime = @import("../tooling/web_fetch_runtime.zig");
 const web_search_runtime = @import("../tooling/web_search_runtime.zig");
@@ -498,6 +500,21 @@ pub fn Runtime(comptime App: type) type {
                 .lifecycle_view = app.lifecycle_view,
                 .lifecycle_scope = lifecycleContext(app, agent).scope,
             };
+            if (comptime @hasField(App, "sandbox_runtime")) {
+                if (app.sandbox_runtime) |rt| {
+                    // Out of memory leaves the closed policy, so no command runs here.
+                    ctx.command_placement = rt.policyFor(workspace.root) catch sandbox_runtime.fail_closed;
+                    ctx.sandbox_executor = sandbox_executor.executor(rt);
+                    ctx.sandbox_reader = sandbox_executor.reader(rt);
+                    // Every agent's managed commands use the same executor. An agent keeps
+                    // the one it has, so a command from an earlier turn never changes.
+                    if (comptime agents.hasAgentField(App, "managed_executions")) {
+                        if (agent.managed_executions.sandbox_executor == null) {
+                            agent.managed_executions.sandbox_executor = ctx.sandbox_executor;
+                        }
+                    }
+                }
+            }
             if (comptime @hasField(App, "web_fetch_runtime")) {
                 ctx.web_fetch_runtime = &app.web_fetch_runtime;
                 ctx.web_fetch_artifact_store = agent.session.webFetchArtifactStore();

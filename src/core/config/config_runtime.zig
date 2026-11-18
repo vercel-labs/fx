@@ -86,6 +86,8 @@ pub const Settings = struct {
     notification_max: ?bool = null,
     /// `experimental.workspace_capture`, profile-only.
     experimental_workspace_capture: ?bool = null,
+    /// `experimental.sandbox_execution`, profile-only.
+    experimental_sandbox_execution: ?bool = null,
     permission_rules: types.PermissionRuleSet = .{},
     has_permission_rules: bool = false,
     /// Owned absolute directories whose contents symlinked skills may resolve
@@ -2037,9 +2039,15 @@ fn parseProfileOnlyFields(
     if (root.object.get("experimental")) |experimental_value| {
         if (experimental_value != .object) {
             debug_trace.logf("config", "ignoring experimental: not an object", .{});
-        } else if (experimental_value.object.get("workspace_capture")) |value| {
-            if (value != .bool) return error.InvalidExperimentalWorkspaceCaptureType;
-            settings.experimental_workspace_capture = value.bool;
+        } else {
+            if (experimental_value.object.get("workspace_capture")) |value| {
+                if (value != .bool) return error.InvalidExperimentalWorkspaceCaptureType;
+                settings.experimental_workspace_capture = value.bool;
+            }
+            if (experimental_value.object.get("sandbox_execution")) |value| {
+                if (value != .bool) return error.InvalidExperimentalSandboxExecutionType;
+                settings.experimental_sandbox_execution = value.bool;
+            }
         }
     }
 
@@ -2206,6 +2214,7 @@ fn mergeSettings(target: *Settings, incoming: *Settings, alloc: Allocator) !void
     if (incoming.notification_attention_required) |value| target.notification_attention_required = value;
     if (incoming.notification_max) |value| target.notification_max = value;
     if (incoming.experimental_workspace_capture) |value| target.experimental_workspace_capture = value;
+    if (incoming.experimental_sandbox_execution) |value| target.experimental_sandbox_execution = value;
 
     if (incoming.has_permission_rules) {
         target.permission_rules.deinit(alloc);
@@ -5130,4 +5139,20 @@ test "experimental.workspace_capture is read from the profile only and stays off
     try std.testing.expectEqual(@as(?bool, null), project.experimental_workspace_capture);
     // A value of another type is refused, as for every other switch.
     try std.testing.expectError(error.InvalidExperimentalWorkspaceCaptureType, parseSettingsJson(alloc, "{\"experimental\":{\"workspace_capture\":\"yes\"}}"));
+}
+
+test "experimental.sandbox_execution is read from the profile only and stays off by default" {
+    const alloc = std.testing.allocator;
+    var absent = try parseSettingsJson(alloc, "{}");
+    defer absent.deinit(alloc);
+    try std.testing.expectEqual(@as(?bool, null), absent.experimental_sandbox_execution);
+    var on = try parseSettingsJson(alloc, "{\"experimental\":{\"sandbox_execution\":true}}");
+    defer on.deinit(alloc);
+    try std.testing.expect(on.experimental_sandbox_execution.?);
+    // A repository's committed .fx.json can never turn it on.
+    var project = try parseSettingsJsonForLayer(alloc, "{\"experimental\":{\"sandbox_execution\":true}}", .project);
+    defer project.deinit(alloc);
+    try std.testing.expectEqual(@as(?bool, null), project.experimental_sandbox_execution);
+    // A value of another type is refused, as for every other switch.
+    try std.testing.expectError(error.InvalidExperimentalSandboxExecutionType, parseSettingsJson(alloc, "{\"experimental\":{\"sandbox_execution\":\"yes\"}}"));
 }

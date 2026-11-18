@@ -8,6 +8,7 @@ const png_downscale = @import("../../core/images/png_downscale.zig");
 const core_types = @import("../../core/shared/types.zig");
 const tool_dispatch = @import("../../core/tooling/tool_dispatch.zig");
 const tool_args = @import("../../core/tooling/tool_args.zig");
+const debug_trace = @import("../../core/shared/debug_trace.zig");
 const tool_result_errors = @import("../../core/tooling/tool_result_errors.zig");
 
 const Allocator = std.mem.Allocator;
@@ -116,11 +117,18 @@ pub fn call(ctx: tool_dispatch.DispatchContext, erased: tool_dispatch.ToolInput)
 
     const target = pathing.resolveWorkspaceOrExternalPath(arena, ctx.workspace_root, input.path) catch |err| {
         if (err == error.OutOfMemory) return error.OutOfMemory;
+        // A file that is not on this machine may be in a workspace sandbox.
+        if (err == error.FileNotFound) {
+            if (try readSandboxCopy(ctx, arena, input, try lexicalPath(arena, ctx.workspace_root, input.path))) |result| return result;
+        }
         return readFileFailure(ctx.allocator, err, input.path);
     };
 
     const zio = io_mod.getIo();
     var file = io_mod.openExistingReadOnlyRegularFile(std.Io.Dir.cwd(), target, .no_follow) catch |err| {
+        if (err == error.FileNotFound) {
+            if (try readSandboxCopy(ctx, arena, input, target)) |result| return result;
+        }
         return readFileFailure(
             ctx.allocator,
             if (err == error.DurablePathUnsafe) error.NotRegularFile else err,
@@ -142,16 +150,29 @@ pub fn call(ctx: tool_dispatch.DispatchContext, erased: tool_dispatch.ToolInput)
     };
     const text = content[0..actual_len];
     const rel = pathing.workspaceRelativePath(arena, ctx.workspace_root, target) catch target;
+    return formatRead(ctx, arena, input, rel, text, stat.size, truncated_by_size or actual_len != stat.size, .{ .local = .{ .path = target, .stat = stat } });
+}
 
+/// Formats one read the same way for a local file and a sandbox copy. `truncated`
+/// says `text` holds less than the whole file. A sandbox copy is never tracked,
+/// and it reports nothing as covering a local file.
+fn formatRead(
+    ctx: tool_dispatch.DispatchContext,
+    arena: Allocator,
+    input: *const Input,
+    rel: []const u8,
+    text: []const u8,
+    file_size: u64,
+    truncated: bool,
+    origin: Origin,
+) tool_dispatch.DispatchError!tool_dispatch.ToolResult {
     if (!text_utils.isModelSafeText(text)) {
-        if (try imageToolResult(ctx, rel, text, stat.size, truncated_by_size or actual_len != stat.size)) |result| return result;
-        tool_dispatch.reportToolResultMemory(ctx, .{
-            .model_view_covers_full_file = false,
-        });
-        return .{ .success = try ctx.allocator.print(
+        if (try imageToolResult(ctx, rel, text, file_size, truncated, origin)) |result| return result;
+        reportMemory(ctx, origin, .{ .model_view_covers_full_file = false });
+        return .{ .success = try withOrigin(ctx.allocator, origin, try ctx.allocator.print(
             "<path>{s}</path>\n<content>binary or non-utf8 file omitted ({d} bytes)</content>",
-            .{ rel, stat.size },
-        ) };
+            .{ rel, file_size },
+        )) };
     }
 
     var selected = input.*;
@@ -160,14 +181,69 @@ pub fn call(ctx: tool_dispatch.DispatchContext, erased: tool_dispatch.ToolInput)
     var records: std.ArrayList(LineRecord) = .empty;
     defer freeLineRecords(arena, &records);
     const scan = try selectLinesFromContent(arena, text, &selected, ctx.max_read_file_line_len, &records);
-    const snapshot_covers_full_file = !truncated_by_size and actual_len == stat.size;
+    const snapshot_covers_full_file = !truncated;
     const model_view_covers_full_file = snapshot_covers_full_file and modelViewCoversFullFile(&selected, scan, records.items.len);
-    try recordSuccessfulRead(ctx, target, stat, scan.content_hash, model_view_covers_full_file, snapshot_covers_full_file);
-    tool_dispatch.reportToolResultMemory(ctx, .{
-        .model_view_covers_full_file = model_view_covers_full_file,
-    });
+    switch (origin) {
+        .local => |local| try recordSuccessfulRead(ctx, local.path, local.stat, scan.content_hash, model_view_covers_full_file, snapshot_covers_full_file),
+        .sandbox => {},
+    }
+    reportMemory(ctx, origin, .{ .model_view_covers_full_file = model_view_covers_full_file });
 
-    return .{ .success = try formatReadOutput(ctx.allocator, rel, &selected, records.items, scan, snapshot_covers_full_file) };
+    return .{ .success = try withOrigin(ctx.allocator, origin, try formatReadOutput(ctx.allocator, rel, &selected, records.items, scan, snapshot_covers_full_file)) };
+}
+
+/// Where the bytes of one read came from. A sandbox copy is not a local file,
+/// so it is never tracked, and nothing reports it as covering one.
+const Origin = union(enum) {
+    local: struct { path: []const u8, stat: std.Io.File.Stat },
+    sandbox,
+};
+
+/// The first line of a read whose content came from the workspace sandbox.
+const sandbox_note = "fx: This file exists only in the workspace sandbox, so fx read the sandbox's copy.\n";
+
+/// Puts the sandbox note before a sandbox read's text. A local read's text is returned as it is.
+fn withOrigin(alloc: Allocator, origin: Origin, body: []u8) tool_dispatch.DispatchError![]u8 {
+    switch (origin) {
+        .local => return body,
+        .sandbox => {
+            defer alloc.free(body);
+            return alloc.print("{s}{s}", .{ sandbox_note, body });
+        },
+    }
+}
+
+/// Reports what the model saw of a local file. A sandbox copy reports nothing.
+fn reportMemory(ctx: tool_dispatch.DispatchContext, origin: Origin, memory: core_types.ToolResultMemory) void {
+    switch (origin) {
+        .local => tool_dispatch.reportToolResultMemory(ctx, memory),
+        .sandbox => {},
+    }
+}
+
+/// Reads `target` from a workspace sandbox this process holds, when the file is
+/// not on this machine. Null means no sandbox has it, so the caller keeps the
+/// usual not-found failure.
+fn readSandboxCopy(ctx: tool_dispatch.DispatchContext, arena: Allocator, input: *const Input, target: []const u8) tool_dispatch.DispatchError!?tool_dispatch.ToolResult {
+    const reader = ctx.sandbox_reader orelse return null;
+    const read = reader.read(reader.context, arena, target, max_snapshot_file_bytes) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => {
+            debug_trace.logf("read_file", "sandbox read of {s} failed: {s}", .{ target, @errorName(err) });
+            return null;
+        },
+    };
+    const bytes = read orelse return null;
+    const rel = pathing.workspaceRelativePath(arena, ctx.workspace_root, target) catch target;
+    // A copy that reaches the size cap may be cut short, so it counts as capped.
+    return try formatRead(ctx, arena, input, rel, bytes, bytes.len, bytes.len >= max_snapshot_file_bytes, .sandbox);
+}
+
+/// The absolute path `input_path` names, without following links. A sandbox copy
+/// is looked up at this path, because the file is not on this machine to resolve.
+fn lexicalPath(arena: Allocator, workspace_root: []const u8, input_path: []const u8) tool_dispatch.DispatchError![]const u8 {
+    if (std.Io.Dir.path.isAbsolute(input_path)) return std.Io.Dir.path.resolveAlloc(arena, &.{input_path});
+    return std.Io.Dir.path.resolveAlloc(arena, &.{ workspace_root, input_path });
 }
 
 fn readFileFailure(alloc: Allocator, err: anyerror, path: []const u8) tool_dispatch.DispatchError!tool_dispatch.ToolResult {
@@ -223,6 +299,7 @@ fn imageToolResult(
     bytes: []const u8,
     file_size: u64,
     incomplete_read: bool,
+    origin: Origin,
 ) tool_dispatch.DispatchError!?tool_dispatch.ToolResult {
     const mime_type = image_data.detectMediaTypeFromBytes(bytes) orelse return null;
     const dimensions = image_data.imageDimensions(bytes);
@@ -230,7 +307,7 @@ fn imageToolResult(
     if (incomplete_read or dimensions == null or encoded_len > image_data.max_encoded_image_bytes or
         dimensions.?.exceeds(image_data.max_single_image_dimension))
     {
-        tool_dispatch.reportToolResultMemory(ctx, .{ .model_view_covers_full_file = false });
+        reportMemory(ctx, origin, .{ .model_view_covers_full_file = false });
         const reason = if (incomplete_read)
             "the file exceeds read_file's 10 MiB read limit"
         else if (dimensions == null)
@@ -239,10 +316,10 @@ fn imageToolResult(
             "the image exceeds the 5 MiB encoded attach limit"
         else
             "the image exceeds 8000 pixels per side";
-        return .{ .success = try ctx.allocator.print(
+        return .{ .success = try withOrigin(ctx.allocator, origin, try ctx.allocator.print(
             "<path>{s}</path>\n<content>image not attached: {s} ({d} bytes); {s}. Use an available image tool to save a smaller copy to a new file, then read_file the copy. If no image tool is available, ask the user before installing one.</content>",
             .{ rel, mime_type, file_size, reason },
-        ) };
+        )) };
     }
     var text: std.Io.Writer.Allocating = .init(ctx.allocator);
     errdefer text.deinit();
@@ -255,11 +332,9 @@ fn imageToolResult(
     const images = try ctx.allocator.alloc(core_types.ToolImage, 1);
     errdefer ctx.allocator.free(images);
     images[0] = .{ .data = encoded, .mime_type = owned_mime };
-    tool_dispatch.reportToolResultMemory(ctx, .{
-        .model_view_covers_full_file = true,
-    });
+    reportMemory(ctx, origin, .{ .model_view_covers_full_file = true });
     return .{ .rich = .{
-        .text = try text.toOwnedSlice(),
+        .text = try withOrigin(ctx.allocator, origin, try text.toOwnedSlice()),
         .images = images,
         .is_error = false,
     } };
@@ -972,6 +1047,123 @@ test "read_file materializes ENOENT like active tool error output" {
     try std.testing.expect(std.mem.find(u8, result.body, "\"type\":\"tool_execution_failed\"") != null);
     try std.testing.expect(std.mem.find(u8, result.body, "\"tool_name\":\"read_file\"") != null);
     try std.testing.expect(std.mem.find(u8, result.body, "\"error\":\"FileNotFound\"") != null);
+}
+
+/// A sandbox reader for the tests. It answers every path with `bytes` and counts its calls.
+const FakeSandboxReader = struct {
+    bytes: ?[]const u8,
+    calls: usize = 0,
+
+    fn reader(self: *FakeSandboxReader) tool_dispatch.SandboxReader {
+        return .{ .context = self, .read = read };
+    }
+
+    fn read(context: *anyopaque, arena: std.mem.Allocator, path: []const u8, max_bytes: usize) anyerror!?[]const u8 {
+        _ = arena;
+        _ = path;
+        _ = max_bytes;
+        const self: *FakeSandboxReader = @ptrCast(@alignCast(context));
+        self.calls += 1;
+        return self.bytes;
+    }
+};
+
+fn dispatchReadFileWithSandbox(
+    alloc: Allocator,
+    workspace_root: []const u8,
+    args_json: []const u8,
+    reader: tool_dispatch.SandboxReader,
+    tracker: *read_tracker.ReadTracker,
+) !tool_dispatch.DispatchResult {
+    const registry = tool_dispatch.Registry{ .tools = &.{read_file_dispatch_tool} };
+    return tool_dispatch.dispatchToolCall(.{
+        .allocator = alloc,
+        .permission_mode = .auto,
+        .workspace_root = workspace_root,
+        .read_tracker = tracker,
+        .sandbox_reader = reader,
+    }, registry, .{
+        .id = "call_1",
+        .name = "read_file",
+        .arguments_json = args_json,
+    });
+}
+
+test "read_file reads a file only the workspace sandbox has, and says so" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try workspaceRoot(alloc, tmp);
+    defer alloc.free(root);
+    // `out` does not exist on this machine, so the path is missing here.
+    const path = try alloc.print("{s}/out/log.txt", .{root});
+    defer alloc.free(path);
+    const args = try alloc.print("{{\"path\":\"{s}\"}}", .{path});
+    defer alloc.free(args);
+    var fake: FakeSandboxReader = .{ .bytes = "built\n" };
+    var tracker = read_tracker.ReadTracker.init(alloc);
+    defer tracker.deinit();
+
+    const result = try dispatchReadFileWithSandbox(alloc, root, args, fake.reader(), &tracker);
+    defer result.deinit(alloc);
+
+    try std.testing.expectEqual(.success, result.status);
+    try std.testing.expect(std.mem.startsWith(u8, result.body, sandbox_note));
+    try std.testing.expect(std.mem.find(u8, result.body, "1\tbuilt") != null);
+    try std.testing.expectEqual(@as(usize, 1), fake.calls);
+    // A sandbox copy is not a local read, so the tracker has no record of it.
+    try std.testing.expect(tracker.lookup(path) == null);
+}
+
+test "read_file keeps the not-found failure when no sandbox has the file" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try workspaceRoot(alloc, tmp);
+    defer alloc.free(root);
+    const path = try alloc.print("{s}/out/log.txt", .{root});
+    defer alloc.free(path);
+    const args = try alloc.print("{{\"path\":\"{s}\"}}", .{path});
+    defer alloc.free(args);
+    var fake: FakeSandboxReader = .{ .bytes = null };
+    var tracker = read_tracker.ReadTracker.init(alloc);
+    defer tracker.deinit();
+
+    const result = try dispatchReadFileWithSandbox(alloc, root, args, fake.reader(), &tracker);
+    defer result.deinit(alloc);
+
+    try std.testing.expectEqual(.failure, result.status);
+    try std.testing.expect(std.mem.find(u8, result.body, "\"error\":\"FileNotFound\"") != null);
+    try std.testing.expect(std.mem.find(u8, result.body, sandbox_note) == null);
+    try std.testing.expectEqual(@as(usize, 1), fake.calls);
+}
+
+test "read_file reads a local file before it asks any sandbox" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    {
+        var file = try tmp.dir.createFile(std.testing.io, "here.txt", .{});
+        defer file.close(io_mod.getIo());
+        try file.writeStreamingAll(io_mod.getIo(), "local\n");
+    }
+    const root = try workspaceRoot(alloc, tmp);
+    defer alloc.free(root);
+    const path = try alloc.print("{s}/here.txt", .{root});
+    defer alloc.free(path);
+    const args = try alloc.print("{{\"path\":\"{s}\"}}", .{path});
+    defer alloc.free(args);
+    var fake: FakeSandboxReader = .{ .bytes = "sandbox\n" };
+    var tracker = read_tracker.ReadTracker.init(alloc);
+    defer tracker.deinit();
+
+    const result = try dispatchReadFileWithSandbox(alloc, root, args, fake.reader(), &tracker);
+    defer result.deinit(alloc);
+
+    try std.testing.expectEqual(.success, result.status);
+    try std.testing.expect(std.mem.find(u8, result.body, "1\tlocal") != null);
+    try std.testing.expect(std.mem.find(u8, result.body, sandbox_note) == null);
+    try std.testing.expectEqual(@as(usize, 0), fake.calls);
 }
 
 test "read_file classifiers are read-only and reversible" {

@@ -43,6 +43,28 @@ pub const Config = struct {
     /// Variables added to the command's environment after `AI_AGENT`,
     /// such as the `fx mcp call` bridge's address. Borrowed for the run.
     extra_environment: []const EnvironmentVariable = &.{},
+    /// Runs commands that settings placed in a sandbox. Null when that feature is off.
+    sandbox_executor: ?SandboxExecutor = null,
+};
+
+/// A command that settings placed in a sandbox, as the sandbox executor gets it.
+pub const SandboxCommand = struct {
+    command: []const u8,
+    /// The command's folder on this machine.
+    cwd: []const u8,
+    placement: command_environment.Placement,
+    profile: ?[]const u8 = null,
+};
+
+/// Runs sandbox-placed commands. The sandbox runtime provides it.
+pub const SandboxExecutor = struct {
+    context: *anyopaque,
+    execute: *const fn (
+        context: *anyopaque,
+        cfg: Config,
+        alloc: std.mem.Allocator,
+        command: SandboxCommand,
+    ) anyerror!CommandExecutionResult,
 };
 
 pub const EnvironmentVariable = struct {

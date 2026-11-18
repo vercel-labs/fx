@@ -6,6 +6,7 @@ const vision_contracts = @import("../agent/runtime/vision_contracts.zig");
 const command_admission = @import("../permissions/command_admission.zig");
 const shell_snapshot = @import("../terminal/shell_snapshot.zig");
 const command_environment = @import("../execution/command_environment.zig");
+const placement = @import("../execution/placement.zig");
 const command_effect = @import("../shell_command/command_effect.zig");
 const command_lex = @import("../shell_command/command_lex.zig");
 const file_mutation = @import("file_mutation.zig");
@@ -86,6 +87,10 @@ pub const Input = struct {
     auto_classifier: permission_auto_classifier.Classifier = .disabled(),
     terminal_review_context: ?terminal_managed_observer.Context = null,
     host_sandbox_default: HostSandboxDefault = .none,
+    /// Where settings place each shell command. Empty means every command runs on this machine.
+    command_placement: placement.Policy = .{},
+    /// True when a workspace sandbox can answer a read of a file that is not on this machine.
+    sandbox_read_fallback: bool = false,
 };
 
 fn registeredTool(input: Input, name: []const u8) ?*const tool_dispatch.Tool {
@@ -2286,12 +2291,20 @@ pub fn runCommandContext(
         .workspace_clean => .workspace_clean,
         .native => try nativeCommandEnvironment(arena, args, execution_mode),
     };
+    // Settings place each command here, the one place admission builds its
+    // context. The JS host always runs on this machine.
+    const decision: placement.Decision = switch (tool.captured_command_host) {
+        .workspace_clean => .{},
+        .native => placement.decide(input.command_placement, command),
+    };
     return .{
         .command = command,
         .resolved_cwd = cwd,
         .target_os = builtin.target.os.tag,
         .environment = environment_value,
         .execution_mode = execution_mode,
+        .placement = decision.placement,
+        .placement_profile = decision.profile,
     };
 }
 
@@ -2336,6 +2349,30 @@ fn explicitTtyShell(
     } };
 }
 
+/// The command identity in a session permission key. A local command keeps
+/// the key it had before placements existed, so saved session rules still
+/// match it. The placement is the outermost prefix.
+fn commandStateIdentity(
+    arena: Allocator,
+    command: command_admission.CommandContext,
+) ![]const u8 {
+    const identity = switch (command.execution_mode) {
+        .captured => command.command,
+        .tty => try command_environment.ttyPermissionCommandIdentity(
+            arena,
+            command.environment,
+            command.command,
+        ),
+    };
+    if (command.placement == .local) return identity;
+    return command_environment.placementPermissionCommandIdentity(
+        arena,
+        command.placement,
+        command.placement_profile,
+        identity,
+    );
+}
+
 pub fn permissionStateKeyForCall(
     input: Input,
     arena: Allocator,
@@ -2346,14 +2383,7 @@ pub fn permissionStateKeyForCall(
     }
     if (try isRunCommandCall(input, arena, call)) {
         const command = try runCommandContext(input, arena, call);
-        const command_identity = switch (command.execution_mode) {
-            .captured => command.command,
-            .tty => try command_environment.ttyPermissionCommandIdentity(
-                arena,
-                command.environment,
-                command.command,
-            ),
-        };
+        const command_identity = try commandStateIdentity(arena, command);
         return session_permission_state.commandKeyV2(
             arena,
             command_identity,
@@ -2385,18 +2415,27 @@ fn commandPermissionIdentityForContext(
     arena: Allocator,
     command: command_admission.CommandContext,
 ) ![]const u8 {
-    return switch (command.execution_mode) {
-        .captured => command_environment.permissionCommandIdentity(
+    const identity = switch (command.execution_mode) {
+        .captured => try command_environment.permissionCommandIdentity(
             arena,
             command.environment,
             command.command,
         ),
-        .tty => command_environment.ttyPermissionCommandIdentity(
+        .tty => try command_environment.ttyPermissionCommandIdentity(
             arena,
             command.environment,
             command.command,
         ),
     };
+    // The placement is the outermost prefix, so
+    // `commandFromPermissionIdentity` strips it first.
+    if (command.placement == .local) return identity;
+    return command_environment.placementPermissionCommandIdentity(
+        arena,
+        command.placement,
+        command.placement_profile,
+        identity,
+    );
 }
 
 pub const PreparedPermissionStateAction = struct {
@@ -2712,7 +2751,21 @@ fn permissionTargetsForCall(input: Input, arena: Allocator, call: ToolCall) !per
         accessScope(input),
         permission_call,
         tool.permission_target_kind,
-    );
+    ) catch |err| {
+        // A sandbox read names a file that exists only in the workspace sandbox,
+        // so its target is the path inside the access scope. Every other failure,
+        // and every other tool, keeps its error.
+        if (err != error.FileNotFound or !input.sandbox_read_fallback) return err;
+        if (!std.mem.eql(u8, call.name, "read_file")) return err;
+        const found = permissions.missingReadTargetInScope(arena, accessScope(input), call) catch |fallback_err| switch (fallback_err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return err,
+        };
+        const target = found orelse return err;
+        const items = try arena.alloc(permissions.PermissionCallTarget, 1);
+        items[0] = .{ .role = "target", .path = try arena.dupe(u8, target) };
+        return .{ .items = items };
+    };
 }
 
 fn commandPermissionTarget(
@@ -2817,6 +2870,93 @@ test "permission target resolution reports a missing home" {
     )).?;
     try std.testing.expect(std.mem.find(u8, failure, "HomeNotSet") != null);
     try std.testing.expect(std.mem.find(u8, failure, "~/missing") != null);
+}
+
+test "read_file of a missing path keeps its admission failure without a sandbox" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace);
+
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var worker: WorkerRuntime = .{};
+    defer worker.deinit(alloc);
+    var input = testInputWithClassifier(&worker, permission_auto_classifier.Classifier.disabled());
+    input.workspace_root = workspace;
+    input.tool_registry = .{ .tools = &.{test_builtin_tools.read_file} };
+    const call: ToolCall = .{
+        .id = "missing-read-no-sandbox",
+        .name = "read_file",
+        .arguments_json = "{\"path\":\"out/log.txt\"}",
+    };
+
+    const err = if (permissionTargetsForCall(input, arena, call)) |_| return error.TestExpectedPathResolutionFailure else |err| err;
+    try std.testing.expectEqual(error.FileNotFound, err);
+    const failure = (try permissionTargetResolutionFailureMessage(arena, call, err)).?;
+    try std.testing.expectEqualStrings("Path not found: out/log.txt", failure);
+}
+
+test "read_file of a missing path is admitted when a sandbox can answer it" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace);
+    const expected = try std.Io.Dir.path.join(alloc, &.{ workspace, "out/log.txt" });
+    defer alloc.free(expected);
+
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    var worker: WorkerRuntime = .{};
+    defer worker.deinit(alloc);
+    var input = testInputWithClassifier(&worker, permission_auto_classifier.Classifier.disabled());
+    input.workspace_root = workspace;
+    input.tool_registry = .{ .tools = &.{test_builtin_tools.read_file} };
+    input.sandbox_read_fallback = true;
+    const call: ToolCall = .{
+        .id = "missing-read-sandbox",
+        .name = "read_file",
+        .arguments_json = "{\"path\":\"out/log.txt\"}",
+    };
+
+    const targets = try permissionTargetsForCall(input, arena_state.allocator(), call);
+    try std.testing.expectEqual(@as(usize, 1), targets.items.len);
+    try std.testing.expectEqualStrings(expected, targets.items[0].path);
+}
+
+test "the sandbox read fallback never admits a path outside the workspace rules" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace);
+
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var worker: WorkerRuntime = .{};
+    defer worker.deinit(alloc);
+    var input = testInputWithClassifier(&worker, permission_auto_classifier.Classifier.disabled());
+    input.workspace_root = workspace;
+    input.tool_registry = .{ .tools = &.{test_builtin_tools.read_file} };
+    input.sandbox_read_fallback = true;
+    const call: ToolCall = .{
+        .id = "outside-missing-read",
+        .name = "read_file",
+        .arguments_json = "{\"path\":\"../outside/x\"}",
+    };
+
+    // The path is outside the access scope, so it keeps the failure a missing outside path gets today.
+    const err = if (permissionTargetsForCall(input, arena, call)) |_| return error.TestExpectedPathResolutionFailure else |err| err;
+    try std.testing.expectEqual(error.FileNotFound, err);
+    const failure = (try permissionTargetResolutionFailureMessage(arena, call, err)).?;
+    try std.testing.expectEqualStrings("Path not found: ../outside/x", failure);
 }
 
 test "permission target failures name the unresolved path without hiding runtime errors" {
@@ -5837,6 +5977,56 @@ test "automatic clean TTY command requires reviewed shell authority" {
     }
 }
 
+test "settings place shell commands at admission" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var worker: WorkerRuntime = .{};
+    defer worker.deinit(std.testing.allocator);
+    var input = testInputWithClassifier(
+        &worker,
+        permission_auto_classifier.Classifier.disabled(),
+    );
+    const rules = [_]placement.Rule{
+        .{ .pattern = "zig build*", .decision = .{ .placement = .workspace } },
+        .{ .pattern = "convert *", .decision = .{ .placement = .isolated, .profile = "media" } },
+    };
+    input.command_placement = .{ .rules = &rules };
+    const arena = arena_state.allocator();
+
+    const build = runCommandContext(input, arena, .{
+        .id = "placed-build",
+        .name = "shell",
+        .arguments_json = "{\"action\":\"run\",\"command\":\"zig build test\",\"profile\":\"clean\"}",
+    }) catch |err| switch (err) {
+        error.MissingLoginShell, error.UnsupportedShell => return error.SkipZigTest,
+        else => return err,
+    };
+    try std.testing.expectEqual(command_environment.Placement.workspace, build.placement);
+    try std.testing.expectEqual(@as(?[]const u8, null), build.placement_profile);
+
+    const convert = runCommandContext(input, arena, .{
+        .id = "placed-convert",
+        .name = "shell",
+        .arguments_json = "{\"action\":\"run\",\"command\":\"convert a b\",\"profile\":\"clean\"}",
+    }) catch |err| switch (err) {
+        error.MissingLoginShell, error.UnsupportedShell => return error.SkipZigTest,
+        else => return err,
+    };
+    try std.testing.expectEqual(command_environment.Placement.isolated, convert.placement);
+    try std.testing.expectEqualStrings("media", convert.placement_profile.?);
+
+    const local = runCommandContext(input, arena, .{
+        .id = "placed-ls",
+        .name = "shell",
+        .arguments_json = "{\"action\":\"run\",\"command\":\"ls\",\"profile\":\"clean\"}",
+    }) catch |err| switch (err) {
+        error.MissingLoginShell, error.UnsupportedShell => return error.SkipZigTest,
+        else => return err,
+    };
+    try std.testing.expectEqual(command_environment.Placement.local, local.placement);
+    try std.testing.expectEqual(@as(?[]const u8, null), local.placement_profile);
+}
+
 test "TTY admission fingerprints route and explicit shell startup" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
@@ -6829,4 +7019,62 @@ test "automatic trusted-root overwrite preserves configured read disclosure revi
 
     try std.testing.expectEqual(@as(usize, 1), fake.calls);
     try std.testing.expectEqual(ToolPermissionDecision.once, outcome.decision);
+}
+
+test "command grant identity wraps the placement outermost" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const local: command_admission.CommandContext = .{ .command = "zig build test", .resolved_cwd = "/repo", .target_os = .linux };
+    try std.testing.expectEqualStrings("zig build test", try commandPermissionIdentityForContext(arena, local));
+
+    var workspace = local;
+    workspace.placement = .workspace;
+    const workspace_identity = try commandPermissionIdentityForContext(arena, workspace);
+    try std.testing.expect(std.mem.startsWith(u8, workspace_identity, "@fx-placement:workspace:"));
+    try std.testing.expectEqualStrings("zig build test", command_environment.commandFromPermissionIdentity(workspace_identity));
+
+    var tty_isolated = local;
+    tty_isolated.execution_mode = .tty;
+    tty_isolated.placement = .isolated;
+    tty_isolated.placement_profile = "media";
+    const tty_identity = try commandPermissionIdentityForContext(arena, tty_isolated);
+    try std.testing.expect(std.mem.startsWith(u8, tty_identity, "@fx-placement:isolated/media:@fx-shell-mode:tty:"));
+    try std.testing.expectEqualStrings("zig build test", command_environment.commandFromPermissionIdentity(tty_identity));
+}
+
+test "session command keys keep local keys and bind sandbox placements" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const local: command_admission.CommandContext = .{ .command = "zig build test", .resolved_cwd = "/repo", .target_os = .linux };
+    try std.testing.expectEqualStrings("zig build test", try commandStateIdentity(arena, local));
+
+    var local_tty = local;
+    local_tty.execution_mode = .tty;
+    local_tty.environment = .{ .clean = "/bin/zsh" };
+    try std.testing.expectEqualStrings(
+        try command_environment.ttyPermissionCommandIdentity(arena, local_tty.environment, local_tty.command),
+        try commandStateIdentity(arena, local_tty),
+    );
+
+    var workspace = local;
+    workspace.placement = .workspace;
+    try std.testing.expectEqualStrings("@fx-placement:workspace:zig build test", try commandStateIdentity(arena, workspace));
+
+    var isolated_tty = local_tty;
+    isolated_tty.placement = .isolated;
+    isolated_tty.placement_profile = "media";
+    try std.testing.expect(std.mem.startsWith(
+        u8,
+        try commandStateIdentity(arena, isolated_tty),
+        "@fx-placement:isolated/media:@fx-shell-mode:tty:",
+    ));
+
+    var isolated_captured = local;
+    isolated_captured.placement = .isolated;
+    isolated_captured.placement_profile = "media";
+    try std.testing.expectEqualStrings("@fx-placement:isolated/media:zig build test", try commandStateIdentity(arena, isolated_captured));
 }
