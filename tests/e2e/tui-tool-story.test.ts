@@ -105,6 +105,12 @@ const REFUSED_LAST: StoryStep[] = [
   { at: 2, text: "I could not list the folder." },
 ];
 
+// Two commands fail, the last of them too.
+const LAST_TWO_FAILED: StoryStep[] = [
+  { at: 0, calls: [sh("printf ok"), sh("ls missing-one"), sh("cat missing-two")] },
+  { at: 3, text: "Both files are missing." },
+];
+
 // A command whose here-document holds an apostrophe, which is no shell quote.
 const HERE_DOCUMENT: StoryStep[] = [
   { at: 0, calls: [sh("cat > notes.md <<'EOF'\nThe model's notes\nEOF\nwc -l notes.md")] },
@@ -387,6 +393,38 @@ test.skipIf(!tmuxAvailable())(
     sessions.push(resumed);
     await resumed.waitForText("The folder is listed.", TIMEOUT);
     expectFixedRequest(paneLines(await resumed.waitForComposer(TIMEOUT)));
+  },
+  TIMEOUT * 3,
+);
+
+test.skipIf(!tmuxAvailable())(
+  "a header's failure count takes in the last command, also after resume",
+  async () => {
+    const { root, gateway, session, pane } = await runStory(LAST_TWO_FAILED, {
+      prompt: "read both files",
+      finalText: "Both files are missing.",
+    });
+    const expectCount = (lines: string[]) => {
+      // The mark is the last command's; the count is every failed row.
+      const header = lines.find((line) => line.startsWith("● ") && line.includes("✗"));
+      expect(header).toBeDefined();
+      expect(header!).toEndWith("✗ · 2 failed");
+      expect(lines.filter((line) => /^[├└] (Exited|Couldn't)/.test(line))).toHaveLength(2);
+    };
+    expectCount(paneLines(pane));
+
+    await session.kill();
+    sessions.splice(sessions.indexOf(session), 1);
+    const resumed = await TmuxSession.create({
+      cmd: `${FX_BIN} --resume last`,
+      cwd: root.workspace,
+      env: storyEnv(root, gateway),
+      width: 110,
+      height: 60,
+    });
+    sessions.push(resumed);
+    await resumed.waitForText("Both files are missing.", TIMEOUT);
+    expectCount(paneLines(await resumed.waitForComposer(TIMEOUT)));
   },
   TIMEOUT * 3,
 );

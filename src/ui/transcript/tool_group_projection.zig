@@ -1389,7 +1389,9 @@ fn formatStoryHeader(scratch: std.mem.Allocator, tally: StoryTally, summary: Sum
     const turn_ending: usize = if (collapsed) tally.turn_ending_failures else 0;
     const failed = if (lead_says_failed) 0 else tally.earlier_command_failures + turn_ending;
     const last_failed: usize = if (tally.last_command_failed orelse false) 1 else 0;
-    const states = try formatHeaderStates(scratch, failed, summary);
+    // A count that shows counts the last command's failure too, so it
+    // matches the failed rows; a last failure alone shows only as the mark.
+    const states = try formatHeaderStates(scratch, if (failed > 0) failed + last_failed else 0, summary);
     const states_without_mark = try formatHeaderStates(scratch, failed + last_failed, summary);
     return .{
         .lead = lead.written(),
@@ -7645,6 +7647,18 @@ test "a command that failed before the last one still counts in the header" {
     var last = try build(alloc, &entries, &last_failed, 120);
     defer last.deinit(alloc);
     try std.testing.expect(std.mem.startsWith(u8, last.entry_actions.items[0].override.bytes, "● Ran commands ✗\n"));
+
+    // When an earlier command failed too, the count takes in the last one,
+    // so it matches the rows that failed.
+    const both_failed = [_]ToolDetailRecord{
+        storyCommandDetail(1, "{\"command\":\"sh fast.sh\"}", 0, null),
+        storyCommandDetail(2, "{\"command\":\"sh failed.sh\"}", 1, null),
+        storyCommandDetail(3, "{\"command\":\"sh last.sh\"}", 1, null),
+    };
+    var both = try build(alloc, &entries, &both_failed, 120);
+    defer both.deinit(alloc);
+    errdefer std.debug.print("both failed:\n{s}\n", .{both.entry_actions.items[0].override.bytes});
+    try std.testing.expect(std.mem.startsWith(u8, both.entry_actions.items[0].override.bytes, "● Ran commands ✗ · 2 failed\n"));
 }
 
 test "a long shell command shows its steps in short form" {
