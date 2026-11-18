@@ -1875,7 +1875,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
 
       await session.sendKeys("Escape");
       await session.waitForPane(
-        (current) => hasEmptyComposer(current) && current.includes("𝒇x") && !current.includes("Commands"),
+        (current) => hasEmptyComposer(current) && current.includes("𝒇x") && !current.includes("commands   <"),
         5_000,
       );
       await session.sendLiteralText("/resume ");
