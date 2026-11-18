@@ -631,13 +631,12 @@ const quickjs_flags = [_][]const u8{
     "-fno-sanitize-coverage=inline-8bit-counters,trace-cmp",
 };
 
-/// A release build compiles the engine's C for size, gives each function and
-/// object its own section so the linker can drop the ones fx never reaches,
-/// and leaves out unwind tables, as fx's own modules do.
+/// A release build compiles the engine's C for size and gives each function
+/// and object its own section, so the linker can drop the ones fx never
+/// reaches. Zig already leaves out the C's unwind tables in fx, whose module
+/// has none.
 const quickjs_release_flags = [_][]const u8{
     "-Os",
-    "-fno-asynchronous-unwind-tables",
-    "-fno-unwind-tables",
     "-ffunction-sections",
     "-fdata-sections",
 };
