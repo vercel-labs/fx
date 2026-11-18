@@ -33,7 +33,7 @@ import {
 } from "./conditional-guidance-oracle";
 import { expectPermissionModeContext } from "./permission-mode-context";
 import { completion as configuredCompletion, createConfiguredProviderFixture } from "./fixtures/chat-completions";
-import { childLines, childWork, committedRootTurns, compactionRecordPath, copyV1Fixture, logLines, logLinesAfterCompaction, onlySessionId, rootSessionIds, savedSession, savedSessionIds, savedToolCallIds, savedText, savedToolResults, sessionDir, waitForRootTurnCommitted, withoutConversionNotice } from "./saved-sessions";
+import { childLines, childWork, committedRootTurns, compactionRecordPath, copyV1Fixture, holdChildAnswer, logLines, logLinesAfterCompaction, onlySessionId, rootSessionIds, savedSession, savedSessionIds, savedToolCallIds, savedText, savedToolResults, sessionDir, waitForRootTurnCommitted, withoutConversionNotice } from "./saved-sessions";
 import { stdoutFrames } from "./render-lab/tape";
 import {
   fakeGatewayFinalText,
@@ -10734,7 +10734,10 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     let parentId = "";
     let childBlobs = "";
     let failureObserved = false;
-    const scripted = startDynamicFakeGateway((body) => {
+    // Each child answers only once the parent has saved the turn that sent its
+    // message, so its report starts the next turn instead of joining that one.
+    const hold = holdChildAnswer(root.home);
+    const scripted = startDynamicFakeGateway(async (body) => {
       if (["delegate", "followup"].some((id) => hasCurrentToolResult(body, id))) return fakeGatewayFinalText("SUBAGENT_SENT");
       // Each report starts the parent's next turn.
       if (latestUserIsReport(body) && latestUserText(body).includes("CHILD_RECOVERED")) {
@@ -10754,6 +10757,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         expect(JSON.stringify(childLines(root.home, parentId).at(-1).data)).toContain(fault.cause);
         failureObserved = true;
         fault.restore(childBlobs);
+        hold.mark();
         return fakeGatewayToolCall("followup", "subagent", {
           request: { action: "message", agent: "reporter", message: nextTask },
         });
@@ -10763,9 +10767,15 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
           request: { action: "message", agent: "reporter", message: childTask },
         });
       }
-      if (body.includes(nextTask)) return fakeGatewayFinalText("CHILD_RECOVERED");
+      if (body.includes(nextTask)) {
+        const refused = await hold.wait();
+        if (refused) return refused;
+        return fakeGatewayFinalText("CHILD_RECOVERED");
+      }
       if (body.includes(childTask)) {
         childRequests++;
+        const refused = await hold.wait();
+        if (refused) return refused;
         if (hasCurrentToolResult(body, "child_effect")) {
           expect(readFileSync(marker, "utf8")).toBe("EFFECT_ONCE\n");
           // Breaking the child's blobs folder makes its turn fail after its
@@ -10785,6 +10795,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         env: { ...fixtureEnv(root, scripted, ""), FX_TRACE_LOG: undefined, FX_TRACE: undefined, FX_TRACE_SCOPES: undefined },
         timeoutMs: 15_000,
       });
+      hold.check();
       expect(result.code).toBe(0);
       expect(failureObserved).toBe(true);
       expect(parseAskJson(result.stdout).output).toContain("SUBAGENT_FAILURE_REPORTED");
@@ -10822,7 +10833,10 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     let failedCause = "";
     let childRequests = 0;
     let markerAtFailure: string | null = null;
-    const gateway = startDynamicFakeGateway((body) => {
+    // Each child answers only once the parent has saved the turn that sent its
+    // message, so its report starts the next turn instead of joining that one.
+    const hold = holdChildAnswer(root.home);
+    const gateway = startDynamicFakeGateway(async (body) => {
       if (["http_delegate", "http_followup"].some((id) => hasCurrentToolResult(body, id))) return fakeGatewayFinalText("SUBAGENT_HTTP_SENT");
       if (latestUserIsReport(body) && latestUserText(body).includes("CHILD_RECOVERED")) {
         recovered = latestUserText(body);
@@ -10833,6 +10847,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         parentId = rootSessionIds(root.home)[0]!;
         failedWork = childWork(root.home, parentId);
         failedCause = JSON.stringify(childLines(root.home, parentId).at(-1).data);
+        hold.mark();
         return withEffect
           ? fakeGatewayToolCall("http_followup", "subagent", { request: { action: "message", agent: "reporter", message: followupTask } })
           : fakeGatewayFinalText("SUBAGENT_HTTP_OBSERVED");
@@ -10844,10 +10859,14 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       }
       if (body.includes(followupTask)) {
         childRequests++;
+        const refused = await hold.wait();
+        if (refused) return refused;
         return fakeGatewayFinalText("CHILD_RECOVERED");
       }
       if (body.includes(task)) {
         childRequests++;
+        const refused = await hold.wait();
+        if (refused) return refused;
         if (withEffect && childRequests === 1) return fakeShellRun("http_effect", "printf 'EFFECT_ONCE\\n' >> effect.txt");
         markerAtFailure = existsSync(marker) ? readFileSync(marker, "utf8") : null;
         return new Response(JSON.stringify({ error: { message: "Fixture access rejected" } }), {
@@ -10862,6 +10881,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         env: { ...fixtureEnv(root, gateway, ""), FX_TRACE_LOG: undefined, FX_TRACE: undefined, FX_TRACE_SCOPES: undefined },
         timeoutMs: 15_000,
       });
+      hold.check();
       expect(run.code).toBe(0);
       expect(run.timedOut).toBe(false);
       // The failure arrives as the child's report, with its cause.
@@ -10906,7 +10926,10 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     const reports: Record<keyof typeof tasks, string[]> = { ok: [], failed: [] };
     let delegation: keyof typeof tasks = "ok";
     let childRequests = 0;
-    const gateway = startDynamicFakeGateway((body) => {
+    // Each child answers only once its run's parent has saved its turn, so the
+    // report starts the next turn and the receipt gets a request of its own.
+    const hold = holdChildAnswer(root.home);
+    const gateway = startDynamicFakeGateway(async (body) => {
       if (latestUserIsReport(body)) {
         reports[delegation].push(latestUserText(body));
         return fakeGatewayFinalText("REPLAY_REPORT_SEEN");
@@ -10923,10 +10946,14 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       const asked = withoutContextUpdates(contentText(prompt[lastUser]?.content));
       if (asked.includes(tasks.ok)) {
         childRequests++;
+        const refused = await hold.wait();
+        if (refused) return refused;
         return fakeGatewayFinalText("REPLAY_CHILD_DONE");
       }
       if (asked.includes(tasks.failed)) {
         childRequests++;
+        const refused = await hold.wait();
+        if (refused) return refused;
         return new Response(JSON.stringify({ error: { message: "Fixture access rejected" } }), {
           status: 401, headers: { "content-type": "application/json" },
         });
@@ -10939,7 +10966,9 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       // resumed session is answered without another worker or report.
       for (const outcome of ["ok", "failed"] as const) {
         delegation = outcome;
+        hold.mark();
         const first = await runFx(["ask", "--json", "--auto", `Run the ${outcome} delegation.`], { cwd: root.workspace, env, timeoutMs: 10_000 });
+        hold.check();
         expect(first.code).toBe(0);
         const sessionId = parseAskJson(first.stdout).session_id;
         const repeat = await runFx(["ask", "--json", "--auto", "--resume", sessionId, "Observe that same delegation again."], { cwd: root.workspace, env, timeoutMs: 10_000 });
