@@ -745,7 +745,7 @@ const Run = struct {
     /// written only makes a later capture add more paths in batches.
     fn recordCatchUp(self: *Run, progress: CatchUp) void {
         var buf: [64]u8 = undefined;
-        const text = std.mem.print(&buf, "{d} {d}\n", .{ progress.done, progress.batch }) catch unreachable;
+        const text = std.mem.print(&buf, "{d} {d}\n", .{ progress.done, progress.batch }) catch return;
         std.Io.Dir.cwd().writeFile(self.io, .{ .sub_path = self.progress_file, .data = text, .flags = .{ .permissions = .fromMode(0o600) } }) catch |err| {
             keepCancel(self.io, err);
             debug_trace.logf("workspace", "event=workspace_capture_index_progress_unsaved err={s}", .{@errorName(err)});
