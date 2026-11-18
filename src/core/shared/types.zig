@@ -503,13 +503,15 @@ pub const RouteRecoveryStatus = struct {
         retrying,
         need_user,
         /// The request succeeded after the module showed a status. It
-        /// carries only the attempt that succeeded. Hosts that report a
-        /// result show it; the TUI clears its status line.
+        /// carries the attempt that succeeded and the last failure fx
+        /// retried. Hosts that report a result show it; the TUI clears its
+        /// status line.
         recovered,
         /// The request ended on an error after the module showed a status,
-        /// with no terminal status of fx's own. It carries only the last
-        /// attempt; the error reaches the host its usual way. Hosts that
-        /// report a result show it; the TUI clears its status line.
+        /// with no terminal status of fx's own. It carries the last attempt
+        /// and the last failure fx retried; the error reaches the host its
+        /// usual way. Hosts that report a result show it; the TUI clears its
+        /// status line.
         failed,
         // Terminal outcomes fx reports itself.
         terminal_provider_error,
@@ -528,6 +530,12 @@ pub const RouteRecoveryStatus = struct {
     short: recovery.Text = .{},
     /// Sends of the request so far, including the first.
     attempt: usize = 0,
+    /// The kind of the last failure the recovery module handled for this
+    /// request: why it waits, resends, or needs the user. `recovered` and
+    /// `failed` keep it; the error that ends a failed request reaches the
+    /// host its usual way. Null when no send failed. Reported as `cause`;
+    /// not the same as `cause` below, the checkpoint's `ModelRecoveryCause`.
+    failure: ?recovery.Failure.Kind = null,
     cause: ?ModelRecoveryCause = null,
     diagnostic: ?ModelFailureDiagnostic = null,
 
@@ -569,15 +577,21 @@ pub const RouteRecoveryStatus = struct {
     pub const Report = struct {
         state: ReportedState,
         attempt: usize,
+        /// The status's `failure`, by its tag name.
+        cause: ?recovery.Failure.Kind = null,
         need: ?recovery.Status.Need = null,
         /// Omitted when the status has no wording: `recovered` and
-        /// `failed` report only the attempt.
+        /// `failed` report only the attempt and the cause.
         message: ?[]const u8 = null,
 
         pub fn writeJson(self: Report, writer: *std.Io.Writer) !void {
             try writer.writeAll("{\"state\":");
             try std.json.Stringify.value(@tagName(self.state), .{}, writer);
             try writer.print(",\"attempt\":{d}", .{self.attempt});
+            if (self.cause) |cause| {
+                try writer.writeAll(",\"cause\":");
+                try std.json.Stringify.value(@tagName(cause), .{}, writer);
+            }
             if (self.need) |need| {
                 try writer.writeAll(",\"need\":");
                 try std.json.Stringify.value(@tagName(need), .{}, writer);
@@ -596,6 +610,7 @@ pub const RouteRecoveryStatus = struct {
         return .{
             .state = self.reportedState(),
             .attempt = self.attempt,
+            .cause = self.failure,
             .need = self.need,
             .message = if (message.len == 0) null else message,
         };
@@ -800,6 +815,10 @@ test "recovery reports write the shape fx ask and ACP share" {
             .json = "{\"state\":\"need_user\",\"attempt\":2,\"need\":\"content_filter\",\"message\":\"Blocked by the content filter · press Esc and rephrase\"}",
         },
         .{ .status = .{ .kind = .recovered, .attempt = 3 }, .json = "{\"state\":\"recovered\",\"attempt\":3}" },
+        .{
+            .status = .{ .kind = .recovered, .attempt = 3, .failure = .rate_limited },
+            .json = "{\"state\":\"recovered\",\"attempt\":3,\"cause\":\"rate_limited\"}",
+        },
         .{ .status = .{ .kind = .failed, .attempt = 2 }, .json = "{\"state\":\"failed\",\"attempt\":2}" },
         .{
             .status = .{ .kind = .unsafe_tool_start, .attempt = 1 },

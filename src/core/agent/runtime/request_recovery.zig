@@ -124,6 +124,8 @@ pub const RequestRecovery = struct {
     responded: bool = false,
     /// The host's status line holds a module status right now.
     host_showing: bool = false,
+    /// The kind of this request's last failed send (`failed`), reported with every status after it.
+    last_failure: ?Failure.Kind = null,
     ticker: ?std.Thread = null,
     ticker_stop: bool = false,
     ticker_wake: std.Io.Condition = .init,
@@ -336,7 +338,7 @@ pub const RequestRecovery = struct {
 
     /// The response arrived complete. After a request that showed a status,
     /// hosts that report a result get a `recovered` status, which carries
-    /// only the attempt that succeeded.
+    /// the attempt that succeeded and the last failure.
     pub fn succeeded(self: *RequestRecovery) !void {
         const io = io_mod.getIo();
         self.mutex.lockUncancelable(io);
@@ -348,6 +350,7 @@ pub const RequestRecovery = struct {
         try self.deps.push_route_recovery_status(self.deps.ctx, .{
             .kind = .recovered,
             .attempt = self.attempts,
+            .failure = self.last_failure,
         });
     }
 
@@ -365,7 +368,9 @@ pub const RequestRecovery = struct {
         defer self.mutex.unlock(io);
         self.host_showing = false;
         self.recovery_shown = false;
-        try self.deps.push_route_recovery_status(self.deps.ctx, status);
+        var shown = status;
+        if (shown.failure == null) shown.failure = self.last_failure;
+        try self.deps.push_route_recovery_status(self.deps.ctx, shown);
     }
 
     /// The request ended on an error with no success, cancel, or terminal
@@ -383,6 +388,7 @@ pub const RequestRecovery = struct {
         self.deps.push_route_recovery_status(self.deps.ctx, .{
             .kind = .failed,
             .attempt = self.attempts,
+            .failure = self.last_failure,
         }) catch |err| {
             debug_trace.logf("recovery", "failed status publication failed err={s}", .{@errorName(err)});
         };
@@ -534,6 +540,10 @@ pub const RequestRecovery = struct {
     /// Steps the module and carries out its plan in field order. Returns
     /// the plan's send, which the caller carries out.
     fn stepLocked(self: *RequestRecovery, value: recovery.Event) !?Send {
+        switch (value) {
+            .failed => |failure| self.last_failure = failure.kind,
+            else => {},
+        }
         // fx is exiting with the clean record saved; nothing replaces it.
         if (self.closed) return null;
         const now_ms = self.nowMs();
@@ -594,7 +604,9 @@ pub const RequestRecovery = struct {
     }
 
     fn showLocked(self: *RequestRecovery, status: recovery.Status) !void {
-        if (types.RouteRecoveryStatus.fromRecovery(status, self.attempts)) |shown| {
+        if (types.RouteRecoveryStatus.fromRecovery(status, self.attempts)) |converted| {
+            var shown = converted;
+            shown.failure = self.last_failure;
             self.recovery_shown = true;
             self.host_showing = true;
             try self.deps.push_route_recovery_status(self.deps.ctx, shown);
@@ -732,6 +744,39 @@ test "the first output clears the status and success reports the recovery" {
     try std.testing.expectEqual(@as(usize, 2), recovered.attempt);
     // `recovered` reports the attempt only.
     try std.testing.expectEqual(@as(usize, 0), recovered.text.len);
+}
+
+test "the recovered status names the failure its last send had, and a healthy request names none" {
+    var fake = support.FakeAgentRuntimeDeps.init(std.testing.allocator);
+    defer fake.deinit();
+    const deps = fake.deps();
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    var request = RequestRecovery.init(&deps, &cancel_flag, .{});
+    defer request.deinit();
+
+    _ = try request.start(false, null);
+    _ = try request.failed(.{ .kind = .rate_limited });
+    const waiting = fake.route_recovery_statuses.items[0];
+    try std.testing.expectEqual(@as(?Failure.Kind, .rate_limited), waiting.failure);
+    _ = (try request.waitForSend()).?;
+    request.responding();
+    try request.succeeded();
+    const recovered = fake.route_recovery_statuses.items[fake.route_recovery_statuses.items.len - 1];
+    try std.testing.expectEqual(types.RouteRecoveryStatus.Kind.recovered, recovered.kind);
+    try std.testing.expectEqual(@as(?Failure.Kind, .rate_limited), recovered.failure);
+
+    // A request that never failed pushes no status, so none names a failure.
+    const pushed = fake.route_recovery_statuses.items.len;
+    var healthy_cancel = std.atomic.Value(bool).init(false);
+    var healthy = RequestRecovery.init(&deps, &healthy_cancel, .{});
+    defer healthy.deinit();
+    _ = try healthy.start(true, null);
+    healthy.responding();
+    try healthy.succeeded();
+    try std.testing.expectEqual(pushed, fake.route_recovery_statuses.items.len);
+    for (fake.route_recovery_statuses.items[pushed..]) |status| {
+        try std.testing.expectEqual(@as(?Failure.Kind, null), status.failure);
+    }
 }
 
 test "responding from two threads at once delivers one responding" {
