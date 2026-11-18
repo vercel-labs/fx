@@ -65,7 +65,7 @@ const NO_SETTING_ENV = Object.fromEntries(
   ].map((name) => [name, undefined]),
 );
 const MISSING_AUTH_MESSAGE =
-  "fx needs access to Vercel AI Gateway. Run fx login to sign in, fx login vercel --api-key to use an API key, or set AI_GATEWAY_API_KEY.";
+  "fx needs access to vercel AI gateway. run fx login to sign in, fx login vercel --api-key to use an API key, or set AI_GATEWAY_API_KEY.";
 const MODERN_MCP_FIXTURE = join(
   import.meta.dirname,
   "fixtures",
@@ -356,46 +356,46 @@ describe("cli: help", () => {
       expect(stdout).not.toContain("\x1b[");
       expect(stdout).not.toContain("\x1b]2;");
       expect(stdout).toStartWith(
-        `𝒇x v${sourceVersion()}\nFast, native coding agent for the terminal.\n`,
+        `𝒇x v${sourceVersion()}\nfast, native coding agent for the terminal.\n`,
       );
       expect(stdout.match(/𝒇x/g) ?? []).toHaveLength(1);
       expect(stdout).toContain("fx starts an interactive session by default.");
-      expect(stdout).toContain("Commands:\n");
-      expect(stdout).toContain("Run one noninteractive request");
-      expect(stdout).toContain("Sign in to a model provider");
-      expect(stdout).toContain("Sign out of a model provider");
-      expect(stdout).toContain("Choose the active model provider");
+      expect(stdout).toContain("commands:\n");
+      expect(stdout).toContain("run one noninteractive request");
+      expect(stdout).toContain("sign in to a model provider");
+      expect(stdout).toContain("sign out of a model provider");
+      expect(stdout).toContain("choose the active model provider");
       // `fx setup` is deprecated and hidden; `fx login --api-key` replaces it.
-      expect(stdout).not.toContain("Configure a Vercel AI Gateway API key");
+      expect(stdout).not.toContain("configure a vercel AI gateway API key");
       expect(stdout).toContain("login [vercel|codex|grok] [--api-key]");
-      expect(stdout).toContain("Choose a Vercel AI Gateway team");
-      expect(stdout).toContain("Show Vercel AI Gateway credits");
-      expect(stdout).not.toContain("Sign in to Vercel or a selected provider");
+      expect(stdout).toContain("choose a vercel AI gateway team");
+      expect(stdout).toContain("show vercel AI gateway credits");
+      expect(stdout).not.toContain("sign in to vercel or a selected provider");
       expect(stdout).toContain("credits|balance");
-      expect(stdout).toContain("Flags:\n");
+      expect(stdout).toContain("flags:\n");
       expect(stdout).toContain("--context-limit <spec>");
-      expect(stdout).toContain("Set name=bytes|off; repeatable");
+      expect(stdout).toContain("set name=bytes|off; repeatable");
       expect(stdout).toContain("--add-dir <path>");
       expect(stdout).toContain("-c, --continue");
       expect(stdout).toContain("-r, --resume [last|<id>]");
-      expect(stdout).toContain("Pick a saved session, or resume");
+      expect(stdout).toContain("pick a saved session, or resume");
       expect(stdout).not.toContain("-c, -r, --continue");
       expect(stdout).toContain('fx [flags] "<prompt>"');
       expect(stdout).not.toContain("--resume-last");
       expect(stdout).not.toContain("--resume-<id>");
       expect(stdout).toContain("session resume [last|id]");
       expect(stdout).toContain("-v, --version");
-      expect(stdout).toContain("Print the fx version and exit");
-      expect(stdout).not.toContain("Must appear before the command");
-      expect(stdout).toContain("Examples:\n");
+      expect(stdout).toContain("print the fx version and exit");
+      expect(stdout).not.toContain("must appear before the command");
+      expect(stdout).toContain("examples:\n");
       expect(stdout).toContain("https://fx.sh/docs");
       expect(stdout).toContain("run `/feedback` inside fx");
       expect(stdout).toContain(
-        "Run `fx <command> --help` for command-specific usage and options.",
+        "run `fx <command> --help` for command-specific usage and options.",
       );
       expect(stdout).not.toContain("command-specific options and examples");
-      expect(stdout).not.toContain("  Work      ");
-      expect(stdout).not.toContain("\n\n\nRun `fx <command> --help`");
+      expect(stdout).not.toContain("  work      ");
+      expect(stdout).not.toContain("\n\n\nrun `fx <command> --help`");
     },
     TIMEOUT,
   );
@@ -409,45 +409,45 @@ describe("cli: help", () => {
       };
       const expected = `fx ask
 
-Run one noninteractive request
+run one noninteractive request
 
-Usage:
+usage:
   fx ask [--permission-mode <mode>|--ask|--auto|--full-access] [--provider <name>] [--model <id>] [--effort <level>] [--fast|--no-fast] [--ultrafast|--no-ultrafast] [--provider-order <a,b,...>] [--provider-strict|--no-provider-strict] [--image PATH] [--system TEXT] [--json] [--quiet] [--prompt-permissions] [--timeout <seconds>] [--config <key=value>] [--no-save] [--no-color] [--resume <last|<id>>] [--] <prompt>
 
-Options:
-  --permission-mode <mode>    Set the permission mode for this request: ask, auto, or full-access
-  --ask                       Ask before each action that needs permission
-  --auto                      Automatically review unresolved permission requests
-  --full-access               Disable fx permission checks
-  --yolo                      Alias for --full-access
-  --provider <name>           Override the model provider for this request (gateway, codex, grok, or a configured name)
-  --model <id>                Override the model for this request
-  --effort <level>            Override the reasoning effort for this request
-  --fast                      Enable Fast mode for this request when the model supports it
-  --no-fast                   Disable Fast mode for this request
-  --ultrafast                 Request Ultrafast mode for this request when the model supports it
-  --no-ultrafast              Disable Ultrafast mode for this request
-  --provider-order <a,b,...>  Prefer these gateway providers in order for this request
-  --provider-strict           Restrict this request to only the providers in --provider-order
-  --no-provider-strict        Clear the provider restriction for this request
-  --image PATH                Attach an image file; repeat for multiple images
-  --system TEXT               Replace the built-in system prompt for this request
-  --json                      Emit machine-readable JSON instead of text
-  --quiet                     Suppress assistant output
-  --prompt-permissions        Prompt for Y/N permission approval when stdin is a TTY
-  --timeout <seconds>         Time limit for each shell command the agent runs
-  --config <key=value>        Override a setting for this request, with the keys fx config set takes; repeatable
-  --no-save                   Do not save the session; incompatible with --resume
-  --no-color                  Render TTY output without colors or hyperlinks; NO_COLOR or TERM=dumb also turns color off
-  --resume <last|<id>>        Continue the last session or a session by id
-  --                          Treat every following argument as prompt text
+options:
+  --permission-mode <mode>    set the permission mode for this request: ask, auto, or full-access
+  --ask                       ask before each action that needs permission
+  --auto                      automatically review unresolved permission requests
+  --full-access               disable fx permission checks
+  --yolo                      alias for --full-access
+  --provider <name>           override the model provider for this request (gateway, codex, grok, or a configured name)
+  --model <id>                override the model for this request
+  --effort <level>            override the reasoning effort for this request
+  --fast                      enable fast mode for this request when the model supports it
+  --no-fast                   disable fast mode for this request
+  --ultrafast                 request ultrafast mode for this request when the model supports it
+  --no-ultrafast              disable ultrafast mode for this request
+  --provider-order <a,b,...>  prefer these gateway providers in order for this request
+  --provider-strict           restrict this request to only the providers in --provider-order
+  --no-provider-strict        clear the provider restriction for this request
+  --image PATH                attach an image file; repeat for multiple images
+  --system TEXT               replace the built-in system prompt for this request
+  --json                      emit machine-readable JSON instead of text
+  --quiet                     suppress assistant output
+  --prompt-permissions        prompt for Y/N permission approval when stdin is a TTY
+  --timeout <seconds>         time limit for each shell command the agent runs
+  --config <key=value>        override a setting for this request, with the keys fx config set takes; repeatable
+  --no-save                   do not save the session; incompatible with --resume
+  --no-color                  render TTY output without colors or hyperlinks; NO_COLOR or TERM=dumb also turns color off
+  --resume <last|<id>>        continue the last session or a session by id
+  --                          treat every following argument as prompt text
 
-The prompt may be passed as arguments or piped on stdin when no prompt args are given.
-TTY stdout uses the Minimal transcript presentation; redirected stdout emits raw assistant Markdown.
-Operational progress and diagnostics are written to stderr. JSON \`output\` keeps accumulated assistant Markdown; \`final_output\` contains only the completed final response, or an empty string when absent.
-JSON usage sums reported main-agent input_tokens and output_tokens, including with --no-save; unreported counts are null. cache_read_tokens and cache_write_tokens appear only when the provider reports them. Nested usage and dollar spend are excluded.
+the prompt may be passed as arguments or piped on stdin when no prompt args are given.
+TTY stdout uses the minimal transcript presentation; redirected stdout emits raw assistant markdown.
+operational progress and diagnostics are written to stderr. JSON \`output\` keeps accumulated assistant markdown; \`final_output\` contains only the completed final response, or an empty string when absent.
+JSON usage sums reported main-agent input_tokens and output_tokens, including with --no-save; unreported counts are null. cache_read_tokens and cache_write_tokens appear only when the provider reports them. nested usage and dollar spend are excluded.
 --system replaces only the built-in base prompt for this request; tool, skill, project, and runtime context still apply.
-With --prompt-permissions, JSON and quiet requests may prompt on stderr only when stdin is a TTY.
+with --prompt-permissions, JSON and quiet requests may prompt on stderr only when stdin is a TTY.
 `;
 
       for (const alias of ["--help", "-h"]) {
@@ -470,7 +470,7 @@ With --prompt-permissions, JSON and quiet requests may prompt on stderr only whe
         const r = await runFx(args);
         expect(r.code).toBe(0);
         expect(r.stderr).toBe("");
-        expect(r.stdout).toContain("Inspect, resume, or recover saved sessions");
+        expect(r.stdout).toContain("inspect, resume, or recover saved sessions");
         expect(r.stdout).toContain("session <last|id|id/agent>|--id <id> [--tail <1-1000>]");
         expect(r.stdout).toContain("session resume [last|<id>]");
         expect(r.stdout).toContain("session recover <id>|--id <id>");
@@ -490,7 +490,7 @@ With --prompt-permissions, JSON and quiet requests may prompt on stderr only whe
         expect(r.code).toBe(0);
         expect(r.stderr).toBe("");
         expect(r.stdout).toContain(
-          "Usage:\n  fx acp [--permission-mode <mode>|--ask|--auto|--full-access] [--provider <name>] [--model <id>] [--effort <level>] [--fast|--no-fast] [--ultrafast|--no-ultrafast] [--log-file <path>]",
+          "usage:\n  fx acp [--permission-mode <mode>|--ask|--auto|--full-access] [--provider <name>] [--model <id>] [--effort <level>] [--fast|--no-fast] [--ultrafast|--no-ultrafast] [--log-file <path>]",
         );
         expect(r.stdout).toContain("--model <id>");
         expect(r.stdout).toContain("--ultrafast");
@@ -508,9 +508,9 @@ With --prompt-permissions, JSON and quiet requests may prompt on stderr only whe
       expect(r.code).toBe(0);
       expect(r.stderr).toBe("");
       expect(r.stdout).toContain("--golden <path>");
-      expect(r.stdout).toContain("Write the final rendered grid to a file");
-      expect(r.stdout).toContain("Developer tool for reproducing terminal rendering bugs");
-      expect(r.stdout).not.toContain("Compare output against a golden file");
+      expect(r.stdout).toContain("write the final rendered grid to a file");
+      expect(r.stdout).toContain("developer tool for reproducing terminal rendering bugs");
+      expect(r.stdout).not.toContain("compare output against a golden file");
     },
     TIMEOUT,
   );
@@ -548,7 +548,7 @@ With --prompt-permissions, JSON and quiet requests may prompt on stderr only whe
         const r = await runFx([alias], { env: { COLUMNS: "60" } });
         expect(r.code).toBe(0);
         expect(r.stderr).toBe("");
-        expect(r.stdout).toContain("Commands:");
+        expect(r.stdout).toContain("commands:");
         expect(r.stdout).toContain("ask");
         expect(r.stdout).toContain("login");
         expect(r.stdout).toContain("status");
@@ -1247,12 +1247,12 @@ describe("cli: status", () => {
     { name: "automatic Gateway", provider: "gateway", source: undefined, help: MISSING_AUTH_MESSAGE },
     { name: "Gateway with a stale Codex preference", provider: "gateway", source: "chatgpt_subscription", help: MISSING_AUTH_MESSAGE },
     { name: "Gateway with a stale Grok preference", provider: "gateway", source: "grok_subscription", help: MISSING_AUTH_MESSAGE },
-    { name: "an exact Gateway login", provider: "gateway", source: "fx_login", help: "fx login is selected but unavailable. Run fx login to reconnect; no other credential was selected." },
-    { name: "an exact OIDC token", provider: "gateway", source: "vercel_oidc_token", help: "VERCEL_OIDC_TOKEN is selected but unavailable. Set VERCEL_OIDC_TOKEN before starting fx; no other credential was selected." },
-    { name: "an exact environment key", provider: "gateway", source: "ai_gateway_api_key", help: "AI_GATEWAY_API_KEY is selected but unavailable. Set AI_GATEWAY_API_KEY before starting fx; no other credential was selected." },
-    { name: "an exact stored key", provider: "gateway", source: "stored_key", help: "A stored API key is selected but unavailable. Start fx and open /provider to choose an available credential; no other credential was selected." },
-    { name: "Codex", provider: "codex", source: undefined, help: "fx needs a Codex subscription login for this model. Run fx login codex.", fix: "fx login codex" },
-    { name: "Grok", provider: "grok", source: undefined, help: "fx needs a Grok subscription login for this model. Run fx login grok.", fix: "fx login grok" },
+    { name: "an exact Gateway login", provider: "gateway", source: "fx_login", help: "fx login is selected but unavailable. run fx login to reconnect; no other credential was selected." },
+    { name: "an exact OIDC token", provider: "gateway", source: "vercel_oidc_token", help: "VERCEL_OIDC_TOKEN is selected but unavailable. set VERCEL_OIDC_TOKEN before starting fx; no other credential was selected." },
+    { name: "an exact environment key", provider: "gateway", source: "ai_gateway_api_key", help: "AI_GATEWAY_API_KEY is selected but unavailable. set AI_GATEWAY_API_KEY before starting fx; no other credential was selected." },
+    { name: "an exact stored key", provider: "gateway", source: "stored_key", help: "a stored API key is selected but unavailable. start fx and open /provider to choose an available credential; no other credential was selected." },
+    { name: "Codex", provider: "codex", source: undefined, help: "fx needs a codex subscription login for this model. run fx login codex.", fix: "fx login codex" },
+    { name: "Grok", provider: "grok", source: undefined, help: "fx needs a grok subscription login for this model. run fx login grok.", fix: "fx login grok" },
   ] as Array<{ name: string; provider: string; source: string | undefined; help: string; fix?: string }>) {
     test(
       `status and doctor respect ${scenario.name} when credentials are missing`,
@@ -1428,7 +1428,7 @@ describe("cli: status", () => {
       expect(JSON.parse(statusWithFxHome.stdout).fx_home).toBe(fxHome);
       const added = await runFx(["mcp", "add", "probe", "--", "/bin/echo", "hi"], relativeWithFxHome);
       expect(added.code).toBe(0);
-      expect(added.stdout).toBe("Added probe to $FX_HOME/mcp.json.\n");
+      expect(added.stdout).toBe("added probe to $FX_HOME/mcp.json.\n");
       expect(existsSync(join(workspace, "relative"))).toBe(false);
     } finally {
       gateway.stop();
@@ -1539,7 +1539,7 @@ describe("cli: status", () => {
         expect(statusText.stdout).toContain("auth=fx login");
         expect(statusText.stdout).toContain("auth_refreshable=true");
         expect(statusText.stdout).toContain("team=vercel-labs");
-        expect(doctorText.stdout).toContain("  Auth         fx login \u00b7 team vercel-labs\n");
+        expect(doctorText.stdout).toContain("  auth         fx login \u00b7 team vercel-labs\n");
         for (const output of [
           statusText.stdout,
           statusJsonResult.stdout,
@@ -1737,7 +1737,7 @@ describe("cli: status", () => {
       const result = await runFx(["upgrade", "--help"]);
       expect(result.code).toBe(0);
       expect(result.stdout).toContain("--channel <stable|dev>");
-      expect(result.stdout).toContain("Select and remember the release channel");
+      expect(result.stdout).toContain("select and remember the release channel");
     },
     TIMEOUT,
   );
@@ -2057,7 +2057,7 @@ describe("cli: usage", () => {
       try {
         const text = await runFx(["usage"], { env: fixture.env });
         expect(text.code).toBe(1);
-        expect(text.stdout).toContain("Usage needs an AI Gateway sign-in: run fx login or set an API key.");
+        expect(text.stdout).toContain("usage needs an AI gateway sign-in: run fx login or set an API key.");
         const json = await runFx(["usage", "--json"], { env: fixture.env });
         expect(json.code).toBe(1);
         expect(JSON.parse(json.stdout)).toMatchObject({
@@ -2111,8 +2111,8 @@ describe("cli: usage", () => {
         const week = await runFx(["usage", "--period", "7d"], { env });
         expect(week.code).toBe(0);
         expect(week.stderr).toBe("");
-        expect(week.stdout).toContain("Usage (7d, UTC) from AI Gateway");
-        expect(week.stdout).toContain("Requests      3");
+        expect(week.stdout).toContain("usage (7d, UTC) from AI gateway");
+        expect(week.stdout).toContain("requests      3");
         expect(week.stdout).toContain("- provider/a  $0.7500  3 requests  20 tokens");
         expect(fixture.fake.reportRanges().slice(3)).toEqual([`${today}..${today}`]);
 
@@ -2165,7 +2165,7 @@ describe("cli: usage", () => {
 
         const text = await runFx(["usage"], { env });
         expect(text.code).toBe(0);
-        expect(text.stdout).toContain("Budget        $12.00 of $50.00 this month");
+        expect(text.stdout).toContain("budget        $12.00 of $50.00 this month");
         expect(text.stdout).not.toContain(SEEDED_GATEWAY_TOKEN);
       } finally {
         fixture.stop();
@@ -2212,8 +2212,8 @@ describe("cli: usage", () => {
         expect(report).toMatchObject({ status: "failed", reason: "refused" });
         expect(report.totals.request_count).toBe(7);
         const text = await runFx(["usage"], { env });
-        expect(text.stdout).toContain("Refresh failed: AI Gateway refused this sign-in.");
-        expect(text.stdout).toContain("Requests      7");
+        expect(text.stdout).toContain("refresh failed: AI gateway refused this sign-in.");
+        expect(text.stdout).toContain("requests      7");
       } finally {
         fixture.stop();
       }
@@ -2238,11 +2238,11 @@ describe("cli: usage", () => {
         const text = await runFx(["usage", "--period", "today"], { env });
         expect(text.code).toBe(0);
         expect(text.stderr).toBe("");
-        expect(text.stdout).toContain("Codex usage from ChatGPT for samdoe, updated 21:00 IST");
-        expect(text.stdout).toContain("Tokens        40000 today, 100000 7d, 100000 month, 9000000 lifetime");
-        expect(text.stdout).toContain("Share by model (today): gpt-e2e-large fast 70.0%, gpt-e2e-small standard 30.0%");
-        expect(text.stdout).toContain("Plan          pro");
-        expect(text.stdout).toContain("Credits       12.40");
+        expect(text.stdout).toContain("codex usage from ChatGPT for samdoe, updated 21:00 IST");
+        expect(text.stdout).toContain("tokens        40000 today, 100000 7d, 100000 month, 9000000 lifetime");
+        expect(text.stdout).toContain("share by model (today): gpt-e2e-large fast 70.0%, gpt-e2e-small standard 30.0%");
+        expect(text.stdout).toContain("plan          pro");
+        expect(text.stdout).toContain("credits       12.40");
         expect(text.stdout).toContain("- codex (5h window): 42% used, resets 23:00 IST");
         expect(text.stdout).toContain("- codex (168h window): 18% used");
         const paths = fixture.fake.requests.map((request) => request.path).sort();
@@ -2283,11 +2283,11 @@ describe("cli: usage", () => {
         const text = await runFx(["usage"], { env });
         expect(text.code).toBe(0);
         expect(text.stderr).toBe("");
-        expect(text.stdout).toContain("Grok usage from xAI, updated 21:00 IST");
-        expect(text.stdout).toContain("Plan          SuperGrok Heavy");
-        expect(text.stdout).toContain("Used          63% of the weekly allowance, resets Oct 15, 2026 02:00 IST");
-        expect(text.stdout).toContain("Credits       $12.50");
-        expect(text.stdout).toContain("Pay as you go $3.00 of $100.00 this month");
+        expect(text.stdout).toContain("grok usage from xAI, updated 21:00 IST");
+        expect(text.stdout).toContain("plan          SuperGrok Heavy");
+        expect(text.stdout).toContain("used          63% of the weekly allowance, resets oct 15, 2026 02:00 IST");
+        expect(text.stdout).toContain("credits       $12.50");
+        expect(text.stdout).toContain("pay as you go $3.00 of $100.00 this month");
         expect(fixture.fake.requests.map((request) => request.path).sort()).toEqual(["/billing", "/settings"]);
         for (const request of fixture.fake.requests) {
           expect(request.grokUser).toBe("acct_grok_e2e");
@@ -2492,7 +2492,7 @@ describe("cli: logout", () => {
         });
 
         expect(logout.code).toBe(0);
-        expect(logout.stdout).toBe("Signed out of fx.\n");
+        expect(logout.stdout).toBe("signed out of fx.\n");
         expect(logout.stderr).toBe("");
         expect(existsSync(authPath)).toBe(false);
         expect(issuer.requests).toEqual([
@@ -2546,9 +2546,9 @@ describe("cli: logout", () => {
         });
 
         expect(logout.code).toBe(0);
-        expect(logout.stdout).toBe("Signed out of fx.\n");
+        expect(logout.stdout).toBe("signed out of fx.\n");
         expect(logout.stderr).toBe(
-          "Warning: signed out locally, but the remote session could not be revoked.\n",
+          "warning: signed out locally, but the remote session could not be revoked.\n",
         );
         expect(existsSync(authPath)).toBe(false);
         // No retry could revoke it there, so nothing is kept.
@@ -2583,10 +2583,10 @@ describe("cli: logout", () => {
         });
 
         expect(logout.code).toBe(0);
-        expect(logout.stdout).toBe("Signed out of fx.\n");
+        expect(logout.stdout).toBe("signed out of fx.\n");
         expect(catcher.requests).toEqual([]);
         expect(logout.stderr).toBe(
-          "Warning: signed out locally, but the remote session could not be revoked.\n",
+          "warning: signed out locally, but the remote session could not be revoked.\n",
         );
         expect(existsSync(authPath)).toBe(false);
         // No retry could revoke it there, so nothing is kept.
@@ -2622,9 +2622,9 @@ describe("cli: logout", () => {
         });
 
         expect(logout.code).toBe(0);
-        expect(logout.stdout).toBe("Signed out of fx.\n");
+        expect(logout.stdout).toBe("signed out of fx.\n");
         expect(logout.stderr).toBe(
-          "Warning: signed out locally, but the remote session could not be revoked.\n",
+          "warning: signed out locally, but the remote session could not be revoked.\n",
         );
         expect(existsSync(authPath)).toBe(false);
         expect(issuer.requests).toEqual([]);
@@ -2699,10 +2699,10 @@ describe("cli: logout", () => {
 
         const logout = await runFx(["logout"], { env });
         expect(logout.code).toBe(0);
-        expect(logout.stdout).toBe("Signed out of fx.\n");
+        expect(logout.stdout).toBe("signed out of fx.\n");
         // The 500 may pass, so fx keeps the tokens to revoke them later.
         expect(logout.stderr).toBe(
-          "Warning: signed out locally, but the remote session could not be revoked. fx will try again later.\n",
+          "warning: signed out locally, but the remote session could not be revoked. fx will try again later.\n",
         );
         expect(existsSync(join(home, ".fx", "auth.json"))).toBe(false);
         expect(issuer.requests).toEqual([
@@ -2784,7 +2784,7 @@ describe("cli: logout", () => {
         const status = await runFx(["status", "--json"], { env });
 
         expect(logout.code).toBe(0);
-        expect(logout.stdout).toBe("No fx login session found.\n");
+        expect(logout.stdout).toBe("no fx login session found.\n");
         expect(logout.stderr).toBe("");
         expect(JSON.parse(status.stdout)).toMatchObject({
           auth: "AI_GATEWAY_API_KEY",
@@ -3338,7 +3338,7 @@ describe("cli: sessions", () => {
         expect(first.stderr).toBe("");
         expect(first.stdout).toMatch(/^TITLE +TURNS +UPDATED +SESSION ID$/m);
         expect(first.stdout).toMatch(/^Investigate cache misses +2 +1970-01-01 +named-session$/m);
-        expect(first.stdout).toMatch(/^Untitled session +0 +1970-01-01 +unnamed-session$/m);
+        expect(first.stdout).toMatch(/^untitled session +0 +1970-01-01 +unnamed-session$/m);
         // 2023-11-14 22:13:20 UTC is already the 15th in that zone.
         expect(first.stdout).toMatch(/^Review landing page +1 +2023-11-15 +script-only-session$/m);
         expect(first.stdout).not.toContain("updated_at_ms");
@@ -3999,13 +3999,13 @@ describe("cli: models", () => {
       name: "an ordinary public empty catalog",
       authenticated: false,
       expected:
-        "[models] no models returned by gateway\n[models] Using the public model catalog; sign in with Vercel or use an AI Gateway API key for team-private models.\n",
+        "[models] no models returned by gateway\n[models] using the public model catalog; sign in with vercel or use an AI gateway API key for team-private models.\n",
     },
     {
       name: "a rejected credential empty fallback catalog",
       authenticated: true,
       expected:
-        "[models] no models returned by gateway\n[models] Your Gateway credential was rejected; using the public model catalog.\n",
+        "[models] no models returned by gateway\n[models] your gateway credential was rejected; using the public model catalog.\n",
     },
   ]) {
     test(
@@ -4169,7 +4169,7 @@ describe("cli: models", () => {
         expect(result.stderr).toBe("");
         expect(JSON.parse(result.stdout.trim()).code).toBe("GatewayUnavailable");
         // The catalog answered, so the message does not blame the connection.
-        expect(JSON.parse(result.stdout.trim()).error).toBe("could not list models: Unavailable");
+        expect(JSON.parse(result.stdout.trim()).error).toBe("could not list models: unavailable");
         expect(gateway.modelRequests).toHaveLength(1);
       } finally {
         gateway.stop();
@@ -6532,7 +6532,7 @@ describe("cli: MCP profile", () => {
       );
       expect(refused.code).toBe(1);
       expect(refused.stderr).toBe(
-          "Couldn't add gamma to ~/.fx/mcp.json: the file has both \"mcp\" and \"mcpServers\"; merge them into one.\n",
+          "couldn't add gamma to ~/.fx/mcp.json: the file has both \"mcp\" and \"mcpServers\"; merge them into one.\n",
       );
       expect(readFileSync(profilePath, "utf8")).toBe(both);
     } finally {
@@ -6560,7 +6560,7 @@ describe("cli: MCP profile", () => {
       const add = await runFx(["mcp", "add", "probe", "--", "/bin/echo", "hi"], { cwd: root, env });
       expect(add.code).toBe(1);
       expect(add.stderr).toBe(
-        "Couldn't add probe to ~/.fx/mcp.json: it isn't a plain file; replace it with one.\n",
+        "couldn't add probe to ~/.fx/mcp.json: it isn't a plain file; replace it with one.\n",
       );
       expect(lstatSync(profilePath).isFIFO()).toBe(true);
     } finally {
@@ -6576,7 +6576,7 @@ describe("cli: MCP profile", () => {
         label: "link loop",
         make: (path: string) => symlinkSync("mcp.json", path),
         list: `fx mcp: ${linkLoop}\n`,
-        add: "Couldn't add probe to ~/.fx/mcp.json: it is a link that loops or passes through too many links; replace it with a plain file.\n",
+        add: "couldn't add probe to ~/.fx/mcp.json: it is a link that loops or passes through too many links; replace it with a plain file.\n",
         ask: `fx ask: ${linkLoop}\n`,
       },
       {
@@ -6584,7 +6584,7 @@ describe("cli: MCP profile", () => {
         make: (path: string) =>
           writeFileSync(path, JSON.stringify({ mcpServers: {}, pad: "x".repeat(1024 * 1024) }), { mode: 0o600 }),
         list: `fx mcp: ${tooLarge}\n`,
-        add: "Couldn't add probe to ~/.fx/mcp.json: it is over 1 MB, the most fx reads; make it smaller.\n",
+        add: "couldn't add probe to ~/.fx/mcp.json: it is over 1 MB, the most fx reads; make it smaller.\n",
         ask: `fx ask: ${tooLarge}\n`,
       },
       {
@@ -6734,7 +6734,7 @@ describe("cli: completion", () => {
       expect(none.stderr).toBe("usage: fx completion bash|zsh|fish\n");
       const help = await runFx(["completion", "--help"], { env: { HOME: home } });
       expect(help.code).toBe(0);
-      expect(help.stdout).toContain('Commands:\n  bash  Load it with: eval "$(fx completion bash)"\n');
+      expect(help.stdout).toContain('commands:\n  bash  load it with: eval "$(fx completion bash)"\n');
     } finally {
       rmSync(home, { recursive: true, force: true });
     }
