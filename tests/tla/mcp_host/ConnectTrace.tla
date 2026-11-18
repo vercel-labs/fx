@@ -22,20 +22,21 @@ Viol ==
     (IF CancelWins THEN {} ELSE {"CancelWins"}) \cup
     (IF NoReissue THEN {} ELSE {"NoReissue"}) \cup
     (IF CanceledNeedsCancel THEN {} ELSE {"CanceledNeedsCancel"}) \cup
-    (IF ReturnsBlocking THEN {} ELSE {"ReturnsBlocking"})
+    (IF ReturnsBlocking THEN {} ELSE {"ReturnsBlocking"}) \cup
+    (IF KernelAnswerWins THEN {} ELSE {"KernelAnswerWins"})
 
 Finished(result) ==
     \/ /\ result = "ok"
        /\ \/ StdReturn
-          \/ FixedPass
+          \/ ReadReady
        /\ res' = "ok"
     \/ /\ result = "canceled"
        /\ \/ StdCancelled
-          \/ FixedPass
+          \/ SliceCanceled
        /\ res' = "canceled"
     \/ /\ result \in {"refused", "other"}
        /\ \/ StdReturn
-          \/ FixedPass
+          \/ ReadReady
        /\ res' = "fail"
     \* std's error.Unexpected comes right after the reissue: nothing changes.
     \/ /\ result = "unexpected"
@@ -51,8 +52,9 @@ Step(rec) ==
       [] rec.event = "done" -> Finished(rec.data.result)
       [] OTHER -> FALSE
 
-\* What fx cannot see.
-Hidden == KernelDone \/ Cancel
+\* What fx cannot see: the kernel finishing, a cancel request, and the steps of a pass
+\* that end in another pass (a poll, and a slice that polls again).
+Hidden == KernelDone \/ Cancel \/ Poll \/ SliceAgain
 
 TraceInit == Init /\ i = 0 /\ bad = Viol
 
