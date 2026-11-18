@@ -69,6 +69,9 @@ pub const ToolDetailRecord = struct {
     command_output_replay: ?types.CommandOutputReplay = null,
     command_process_presentation: ?types.CommandProcessPresentation = null,
     outcome: ?types.ToolOutcomeKind = null,
+    /// Whether the call's arguments still stream in, before the call
+    /// itself starts.
+    streaming: bool = false,
     fallback_disposition: ?ToolFallbackDisposition = null,
     lifecycle_id: ?types.ToolLifecycleId = null,
     presentation_group_id: ?types.ToolPresentationGroupId = null,

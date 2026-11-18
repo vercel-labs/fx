@@ -1611,11 +1611,12 @@ fn joinsByArgument(record: *const ToolDetailRecord) bool {
     return false;
 }
 
-/// Whether a running call's row would say nothing yet: its arguments have
-/// not arrived, and its status is a bare verb, such as "Reading" or
-/// "Searching", with no target after it.
+/// Whether a streaming call's row would say nothing yet: its arguments
+/// still stream in, and its status is a bare verb, such as "Reading" or
+/// "Searching", with no target after it. A call that has started keeps its
+/// row, whatever its status says.
 fn saysNothingYet(scratch: std.mem.Allocator, entry: TranscriptEntry, record: *const ToolDetailRecord) !bool {
-    if (record.outcome != null or storyHasArgs(record)) return false;
+    if (!record.streaming or record.outcome != null or storyHasArgs(record)) return false;
     const phrase = std.mem.trim(u8, try entryStatus(scratch, entry) orelse return false, " ");
     return phrase.len > 0 and std.mem.findScalar(u8, phrase, ' ') == null;
 }
@@ -8682,7 +8683,7 @@ test "a running call that names nothing yet shows no row until it does" {
             .{ .raw_bytes = .{ .id = 1, .bytes = "● Reading\n", .class = .tool_status } },
         };
         const details = [_]ToolDetailRecord{
-            .{ .entry_id = 1, .tool_name = @constCast("read_file"), .activity_kind = .read },
+            .{ .entry_id = 1, .tool_name = @constCast("read_file"), .activity_kind = .read, .streaming = true },
         };
         var projection = try build(alloc, &entries, &details, 120);
         defer projection.deinit(alloc);
@@ -8698,12 +8699,25 @@ test "a running call that names nothing yet shows no row until it does" {
             .{ .raw_bytes = .{ .id = 1, .bytes = "● Reading a.md\n", .class = .tool_status } },
         };
         const details = [_]ToolDetailRecord{
-            .{ .entry_id = 1, .tool_name = @constCast("read_file"), .activity_kind = .read },
+            .{ .entry_id = 1, .tool_name = @constCast("read_file"), .activity_kind = .read, .streaming = true },
         };
         const text = try groupTextForTest(alloc, &entries, &details);
         defer alloc.free(text);
         errdefer std.debug.print("named:\n{s}\n", .{text});
         try std.testing.expect(std.mem.find(u8, text, "Reading a.md") != null);
+    }
+    // A call that has started keeps its row, even with a bare status.
+    {
+        const entries = [_]TranscriptEntry{
+            .{ .raw_bytes = .{ .id = 1, .bytes = "● Writing\n", .class = .tool_status } },
+        };
+        const details = [_]ToolDetailRecord{
+            .{ .entry_id = 1, .tool_name = @constCast("write_file"), .activity_kind = .write },
+        };
+        const text = try groupTextForTest(alloc, &entries, &details);
+        defer alloc.free(text);
+        errdefer std.debug.print("started:\n{s}\n", .{text});
+        try std.testing.expect(std.mem.find(u8, text, "Writing") != null);
     }
     // After a read, a search and a command that name nothing yet add no row
     // and nothing to the header.
@@ -8715,8 +8729,8 @@ test "a running call that names nothing yet shows no row until it does" {
         };
         const details = [_]ToolDetailRecord{
             .{ .entry_id = 1, .tool_name = @constCast("read_file"), .activity_kind = .read, .arguments_json = @constCast("{\"path\":\"/w/a.zig\"}"), .outcome = .completed },
-            .{ .entry_id = 2, .tool_name = @constCast("grep_files"), .activity_kind = .read },
-            .{ .entry_id = 3, .tool_name = @constCast("shell"), .activity_kind = .command },
+            .{ .entry_id = 2, .tool_name = @constCast("grep_files"), .activity_kind = .read, .streaming = true },
+            .{ .entry_id = 3, .tool_name = @constCast("shell"), .activity_kind = .command, .streaming = true },
         };
         const text = try groupTextForTest(alloc, &entries, &details);
         defer alloc.free(text);

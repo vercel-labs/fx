@@ -4470,6 +4470,9 @@ const PendingToolDetailStart = struct {
     arguments_json: ?[]u8 = null,
     lifecycle_id: ?types.ToolLifecycleId = null,
     replace_lifecycle: bool = false,
+    /// Set for a provisional start, whose arguments still stream in. Every
+    /// other start clears it.
+    streaming: bool = false,
 
     fn deinit(self: *PendingToolDetailStart, alloc: Allocator) void {
         const tool_name = self.tool_name;
@@ -5804,6 +5807,7 @@ pub const TranscriptRuntime = struct {
                 null,
             );
             defer detail_start.deinit(alloc);
+            detail_start.streaming = true;
             const owned_name = try alloc.dupe(u8, name);
             errdefer alloc.free(owned_name);
             const line = try lifecycleStartLine(alloc, name);
@@ -5834,6 +5838,7 @@ pub const TranscriptRuntime = struct {
             null,
         );
         defer detail_start.deinit(alloc);
+        detail_start.streaming = true;
         const entry_id = try self.createToolActivity(
             alloc,
             id,
@@ -6632,6 +6637,7 @@ pub const TranscriptRuntime = struct {
             pending.tool_name = null;
             if (pending.captured_command) |value| detail.captured_command = value;
             if (pending.activity_kind) |kind| detail.activity_kind = kind;
+            detail.streaming = pending.streaming;
             if (pending.arguments_json) |arguments_json| {
                 if (detail.arguments_json) |old| alloc.free(old);
                 detail.arguments_json = arguments_json;
@@ -6653,6 +6659,7 @@ pub const TranscriptRuntime = struct {
             .activity_kind = pending.activity_kind,
             .arguments_json = pending.arguments_json,
             .lifecycle_id = pending.lifecycle_id,
+            .streaming = pending.streaming,
         };
         if (search.index == self.notebook.tool_details.items.len) {
             self.notebook.tool_details.appendAssumeCapacity(detail);
