@@ -3106,6 +3106,35 @@ test "historical tool detail attaches to the exact replayed status entry" {
     try std.testing.expectEqual(@as(i64, 123), detail.created_at_ms);
 }
 
+test "only a subagent report's detail carries the report mark" {
+    const alloc = std.testing.allocator;
+    var runtime = TranscriptRuntime{};
+    defer runtime.deinit(alloc);
+
+    var metrics: Metrics = .{};
+    // The call a report row shows as, and main's own call with the same
+    // empty arguments.
+    const call: types.ToolCall = .{ .id = "", .name = "subagent", .arguments_json = "{}" };
+    const result: types.PersistedToolResult = .{
+        .tool_call_id = @constCast(""),
+        .tool_name = @constCast("subagent"),
+        .status = .success,
+        .output = @constCast("Reviewed."),
+        .output_bytes = 9,
+        .stored_output_bytes = 9,
+    };
+    const report_id = try runtime.writeCompletedToolStatusReturningEntryId(alloc, &metrics, .completed, "reviewer completed · Reviewed.", true);
+    try runtime.attachSubagentReportDetail(alloc, report_id, call, result);
+    const call_id = try runtime.writeCompletedToolStatusReturningEntryId(alloc, &metrics, .failed, "Failed subagent", true);
+    try runtime.attachHistoricalToolDetail(alloc, call_id, call, .subagent, result);
+
+    const report = runtime.toolDetailForEntry(report_id).?;
+    try std.testing.expect(report.subagent_report);
+    try std.testing.expectEqual(types.ToolActivityKind.subagent, report.activity_kind.?);
+    try std.testing.expectEqualStrings("Reviewed.", report.result.?);
+    try std.testing.expect(!runtime.toolDetailForEntry(call_id).?.subagent_report);
+}
+
 test "historical context-withheld tool detail keeps the call without result evidence" {
     const alloc = std.testing.allocator;
     var runtime = TranscriptRuntime{};
@@ -6362,6 +6391,22 @@ pub const TranscriptRuntime = struct {
             null,
             null,
         );
+    }
+
+    /// Attaches the detail of a row that shows a subagent's report or
+    /// message to main (src/core/subagent/reports.zig, Row), marked so the
+    /// compact projection never takes it for a call main made.
+    pub fn attachSubagentReportDetail(
+        self: *TranscriptRuntime,
+        alloc: Allocator,
+        entry_id: u32,
+        call: types.ToolCall,
+        result: types.PersistedToolResult,
+    ) !void {
+        try self.attachHistoricalToolDetail(alloc, entry_id, call, .subagent, result);
+        const detail = self.toolDetailPtr(entry_id) orelse return;
+        detail.subagent_report = true;
+        self.markTranscriptContentDirtyFrom(entry_id);
     }
 
     pub fn attachHistoricalToolDetailWithLifecycle(

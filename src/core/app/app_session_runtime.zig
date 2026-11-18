@@ -3374,7 +3374,7 @@ pub fn Runtime(comptime App: type) type {
                     if (try subagent_reports.row(self.projection.alloc, user)) |shown| {
                         defer shown.deinit(self.projection.alloc);
                         const entry_id = try self.projection.appendToolStatus(shown.outcome, shown.status);
-                        try self.projection.attachHistoricalToolDetail(entry_id, subagent_reports.Row.call, .subagent, shown.result(self.projection.created_at_ms));
+                        try self.projection.attachSubagentReportDetail(entry_id, subagent_reports.Row.call, shown.result(self.projection.created_at_ms));
                         return;
                     }
                     _ = try self.projection.appendUserTurn(user);

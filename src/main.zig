@@ -1479,7 +1479,7 @@ const App = struct {
         if (try subagent_reports.row(self.alloc, user)) |shown| {
             defer shown.deinit(self.alloc);
             const entry_id = try self.writeCompletedToolStatusReturningEntryId(shown.outcome, shown.status, true);
-            try self.shell.attachHistoricalToolDetail(self.alloc, entry_id, subagent_reports.Row.call, .subagent, shown.result(io_mod.milliTimestamp()));
+            try self.shell.attachSubagentReportDetail(self.alloc, entry_id, subagent_reports.Row.call, shown.result(io_mod.milliTimestamp()));
             return;
         }
         _ = try self.shell.writeUserPromptCard(

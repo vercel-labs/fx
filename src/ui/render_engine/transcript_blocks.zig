@@ -73,6 +73,10 @@ pub const ToolDetailRecord = struct {
     lifecycle_id: ?types.ToolLifecycleId = null,
     presentation_group_id: ?types.ToolPresentationGroupId = null,
     command_output_entry_id: ?u32 = null,
+    /// Whether the row shows a subagent's report or message to main
+    /// (src/core/subagent/reports.zig, Row), not a call main made. Its call
+    /// has no id, so only this mark tells the two apart.
+    subagent_report: bool = false,
 
     pub fn isCapturedCommand(self: ToolDetailRecord) bool {
         // Hand-built details and restored records may predate the explicit

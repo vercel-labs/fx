@@ -2004,7 +2004,23 @@ pub fn cloneToolDetailForSnapshot(alloc: Allocator, source: ToolDetailRecord) !T
         .lifecycle_id = lifecycle_id,
         .presentation_group_id = source.presentation_group_id,
         .command_output_entry_id = source.command_output_entry_id,
+        .subagent_report = source.subagent_report,
     };
+}
+
+test "a snapshot copy of a tool detail keeps its subagent report mark" {
+    const alloc = std.testing.allocator;
+    for ([_]bool{ true, false }) |marked| {
+        var copy = try cloneToolDetailForSnapshot(alloc, .{
+            .entry_id = 3,
+            .tool_name = @constCast("subagent"),
+            .activity_kind = .subagent,
+            .arguments_json = @constCast("{}"),
+            .subagent_report = marked,
+        });
+        defer copy.deinit(alloc);
+        try std.testing.expectEqual(marked, copy.subagent_report);
+    }
 }
 
 fn cloneCommandLines(
