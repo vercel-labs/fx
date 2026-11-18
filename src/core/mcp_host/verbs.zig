@@ -536,18 +536,14 @@ fn whyNot(arena: Allocator, err: anyerror, path: []const u8) ![]const u8 {
 
 /// Why an edit isn't made, ending a sentence like "Couldn't add NAME to FILE: ...".
 /// The reader's own words for an entry it would skip; for a misspelled key, the
-/// key and the fix, so a person or an agent can follow it. The key is the
-/// file's text, so it is made terminal-safe.
+/// words of the skip note, with the command to run again, so a person or an
+/// agent can follow it.
 fn refusalWords(arena: Allocator, refusal: config_file.Refusal) ![]const u8 {
     switch (refusal) {
         .entry => |problem| return project_config.entryProblemWords(problem),
         .misspelled => |misspelled| {
-            const key = try safe(arena, misspelled.key());
-            const real = misspelled.real();
-            return arena.print(
-                "the key \"{s}\" looks like a misspelling of \"{s}\". Move its servers into \"{s}\", delete \"{s}\", then run the command again",
-                .{ key, real, real, key },
-            );
+            const words = try project_config.misspelledWords(arena, misspelled);
+            return arena.print("{s}, and run the command again", .{words});
         },
     }
 }
@@ -1496,6 +1492,28 @@ test "list lines up its columns and keeps hostile names inert" {
         \\{"servers":[{"name":"context7","source":"profile","file":"/h/.fx/mcp.json","transport":"http","status":"ready","error":null,"tools":2}]}
         \\
     , json.written());
+}
+
+test "a refused add names a misspelled key by how it starts when it is too long to show whole, in words that end by saying to run the command again" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var text: std.ArrayList(u8) = .empty;
+    try text.appendSlice(arena, "{\"mcp_servers");
+    for (0..70) |_| try text.appendSlice(arena, "\u{e9}");
+    try text.appendSlice(arena, "\":{\"a\":{\"command\":\"x\"}}}");
+    const key = (try project_config.misspelledKey(arena, text.items)).?;
+    const words = try refusalWords(arena, .{ .misspelled = key });
+    try std.testing.expect(std.unicode.utf8ValidateSlice(words));
+    try std.testing.expect(std.mem.startsWith(u8, words, "the key that starts with \"mcp_servers"));
+    try std.testing.expect(std.mem.endsWith(u8, words, "then delete that key, and run the command again"));
+    try std.testing.expect(std.mem.find(u8, words, "the key \"mcp_servers") == null);
+    // A key that fits is named whole, in the skip note's words.
+    const small = (try project_config.misspelledKey(arena, "{\"mcp_servers\":{\"a\":{\"command\":\"x\"}}}")).?;
+    try std.testing.expectEqualStrings(
+        "the key \"mcp_servers\" looks like a misspelling of \"mcpServers\", so fx doesn't read it. Move its servers into \"mcpServers\", then delete \"mcp_servers\", and run the command again",
+        try refusalWords(arena, .{ .misspelled = small }),
+    );
 }
 
 test "an MCP file fx can't read gets fx's words, and only mcp.json's own errors name it" {

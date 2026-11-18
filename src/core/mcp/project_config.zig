@@ -234,12 +234,9 @@ pub fn renderWorkspaceDiagnostic(
     );
     if (diagnostic.cause == .misspelled_key) {
         const misspelled = diagnostic.misspelled orelse return alloc.dupe(u8, "the profile has a key that looks like a misspelling of its servers key.");
-        var encoded_key = try text_utils.encodeTerminalSafe(alloc, misspelled.key(), 160);
-        defer encoded_key.deinit(alloc);
-        return alloc.print(
-            "{s}: the key \"{s}\" looks like a misspelling of \"{s}\", so fx doesn't read it. Move its servers into \"{s}\", then delete \"{s}\".",
-            .{ diagnosticFile(diagnostic), encoded_key.bytes, misspelled.real(), misspelled.real(), encoded_key.bytes },
-        );
+        const words = try misspelledWords(alloc, misspelled);
+        defer alloc.free(words);
+        return alloc.print("{s}: {s}.", .{ diagnosticFile(diagnostic), words });
     }
     // Every reason is a constant, so this is the one `print` there is.
     const why: []const u8 = if (diagnostic.cause == .invalid_entry) entryProblemWords(diagnostic.problem orelse .other) else if (diagnostic.cause == .ignored_alias)
@@ -328,18 +325,30 @@ const max_profile_root_scan_entries: usize = 64;
 const max_profile_child_scan_entries: usize = 64;
 const max_profile_key_bytes: usize = mcp_contract.max_profile_config_warning_key_bytes;
 
+/// The most of a misspelled key's encoded text that a note or a refusal shows.
+const max_misspelled_key_words_bytes: usize = 160;
+
 /// A profile key that looks like a misspelling of the servers key, with the key
 /// fx reads in that file. The key's text is bounded, and untrusted: print it
-/// terminal-safe.
+/// terminal-safe. A key longer than the bound is kept only up to the last whole
+/// character that fits, and `cut` says so: the words name such a key by how it
+/// starts (`misspelledWords`).
 pub const MisspelledKey = struct {
     key_bytes: [max_profile_key_bytes]u8 = undefined,
     key_len: u8 = 0,
     /// The profile has "mcp", which fx reads; else the key it writes and reads is "mcpServers".
     real_is_mcp: bool = false,
+    /// The file's key is longer than `key()`.
+    cut: bool = false,
 
     fn init(key_text: []const u8, real_is_mcp: bool) MisspelledKey {
         var result: MisspelledKey = .{ .real_is_mcp = real_is_mcp };
-        const len = @min(key_text.len, max_profile_key_bytes);
+        var len = @min(key_text.len, max_profile_key_bytes);
+        // A cut inside a character would leave a key that is not in the file.
+        if (len < key_text.len) {
+            result.cut = true;
+            while (len > 0 and (key_text[len] & 0xC0) == 0x80) len -= 1;
+        }
         @memcpy(result.key_bytes[0..len], key_text[0..len]);
         result.key_len = @intCast(len);
         return result;
@@ -353,6 +362,26 @@ pub const MisspelledKey = struct {
         return if (self.real_is_mcp) "mcp" else "mcpServers";
     }
 };
+
+/// Names a misspelled key and says how to fix it, with no full stop at the end:
+/// the one text of the skip note and of the refusal of `fx mcp add` and `remove`.
+/// The key is the file's text, so it is made terminal-safe. A key that is not
+/// shown whole, because it is longer than `MisspelledKey` keeps or its encoding
+/// is cut, is named as "the key that starts with ...", and never as a key the
+/// file does not hold.
+pub fn misspelledWords(alloc: Allocator, misspelled: MisspelledKey) Allocator.Error![]u8 {
+    var encoded = try text_utils.encodeTerminalSafe(alloc, misspelled.key(), max_misspelled_key_words_bytes);
+    defer encoded.deinit(alloc);
+    const real = misspelled.real();
+    if (misspelled.cut or encoded.truncated) return alloc.print(
+        "the key that starts with \"{s}\" looks like a misspelling of \"{s}\", so fx doesn't read it. Move its servers into \"{s}\", then delete that key",
+        .{ encoded.bytes, real, real },
+    );
+    return alloc.print(
+        "the key \"{s}\" looks like a misspelling of \"{s}\", so fx doesn't read it. Move its servers into \"{s}\", then delete \"{s}\"",
+        .{ encoded.bytes, real, real, encoded.bytes },
+    );
+}
 
 const SuspiciousKeyScan = union(enum) {
     clear,
@@ -591,20 +620,10 @@ fn serverEntryShape(value: std.json.Value) bool {
     return false;
 }
 
+/// Whether `raw`, of any length, is a servers key written differently: its letters
+/// and digits, in lower case, are one of the names `isServersKeyName` knows. No
+/// such name is longer than the buffer, so a key with more letters and digits is not one.
 fn isSuspiciousNormalizedKey(raw: []const u8) bool {
-    var normalized: [max_profile_key_bytes]u8 = undefined;
-    var len: usize = 0;
-    for (raw) |byte| {
-        if (!std.ascii.isAlphanumeric(byte)) continue;
-        normalized[len] = std.ascii.toLower(byte);
-        len += 1;
-    }
-    return isServersKeyName(normalized[0..len]);
-}
-
-/// `isSuspiciousNormalizedKey` for a key of any length: no name it looks for is
-/// longer than the buffer, so a longer one is not a misspelling.
-fn looksLikeServersKey(raw: []const u8) bool {
     var normalized: [32]u8 = undefined;
     var len: usize = 0;
     for (raw) |byte| {
@@ -650,7 +669,7 @@ pub fn misspelledKey(alloc: Allocator, text: []const u8) Allocator.Error!?Misspe
     while (it.next()) |entry| {
         const key = entry.key_ptr.*;
         if (std.mem.eql(u8, key, "mcp") or std.mem.eql(u8, key, "mcpServers")) continue;
-        if (!looksLikeServersKey(key) or !holdsServers(entry.value_ptr.*)) continue;
+        if (!isSuspiciousNormalizedKey(key) or !holdsServers(entry.value_ptr.*)) continue;
         return MisspelledKey.init(key, object.contains("mcp"));
     }
     return null;
@@ -1250,7 +1269,7 @@ test "misspelledKey reads every key and entry, and the load scan gives the same 
     try long.appendSlice(alloc, "{\"mcp\":{},\"mcp");
     for (0..150) |_| try long.append(alloc, '_');
     try long.appendSlice(alloc, "servers\":{\"b\":{\"command\":\"y\"}}}");
-    const found = (try misspelledKey(alloc, long.items)).?;
+    const found = try foundKey(alloc, long.items);
     try std.testing.expectEqual(@as(usize, mcp_contract.max_profile_config_warning_key_bytes), found.key().len);
     try std.testing.expectEqualStrings("mcp", found.real());
 
@@ -1260,7 +1279,7 @@ test "misspelledKey reads every key and entry, and the load scan gives the same 
     try wide.appendSlice(alloc, "{\"servers\":{");
     for (0..64) |i| try wide.print(alloc, "\"n{d}\":{d},", .{ i, i });
     try wide.appendSlice(alloc, "\"real\":{\"command\":\"y\"}}}");
-    try std.testing.expectEqualStrings("servers", (try misspelledKey(alloc, wide.items)).?.key());
+    try std.testing.expectEqualStrings("servers", (try foundKey(alloc, wide.items)).key());
     var scanned = try parseProfileDocument(alloc, wide.items);
     defer scanned.deinit(alloc);
     try std.testing.expectEqual(ProfileDiagnosticCause.suspicious_key_scan_indeterminate, scanned.diagnostic.?.cause);
@@ -1270,6 +1289,9 @@ test "misspelledKey reads every key and entry, and the load scan gives the same 
     try std.testing.expect(try misspelledKey(alloc, "{\"servers\":{\"note\":1},\"mcp\":{}}") == null);
     try std.testing.expect(try misspelledKey(alloc, "[1]") == null);
     try std.testing.expect(try misspelledKey(alloc, "{ nope") == null);
+    // A key with more letters and digits than any servers name has is not one, whatever it holds.
+    try std.testing.expect(try misspelledKey(alloc, "{\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\":{\"b\":{\"command\":\"y\"}}}") == null);
+    try std.testing.expect(try misspelledKey(alloc, "{\"mcpservers-and-more-letters-than-a-name-has\":{\"b\":{\"command\":\"y\"}}}") == null);
 
     // The note at load, which only a caller that asks for notes gets.
     const typo = "{\"mcpServers\":{\"a\":{\"command\":\"x\"}},\"mcp_servers\":{\"b\":{\"command\":\"y\"}}}";
@@ -1291,6 +1313,70 @@ test "misspelledKey reads every key and entry, and the load scan gives the same 
     var strict = try parseProfileDocument(alloc, typo);
     defer strict.deinit(alloc);
     try std.testing.expect(!strict.mutation_allowed);
+}
+
+/// The misspelled key of `text`, or a failed test when the scan finds none, so a scan
+/// that misses reads as a failure the test names, not a crash.
+fn foundKey(alloc: Allocator, text: []const u8) !MisspelledKey {
+    return (try misspelledKey(alloc, text)) orelse error.TestUnexpectedResult;
+}
+
+/// The text between `starts with "` and the next `" looks` of a note, or null.
+fn startsWithQuoted(note: []const u8) ?[]const u8 {
+    const open = "starts with \"";
+    const at = std.mem.find(u8, note, open) orelse return null;
+    const rest = note[at + open.len ..];
+    const end = std.mem.find(u8, rest, "\" looks like") orelse return null;
+    return rest[0..end];
+}
+
+test "a misspelled key too long to show whole is named by how it starts, cut at a character, and never as a key the file lacks" {
+    const alloc = std.testing.allocator;
+    // The key's text, the servers key it is read as, and whether the note must name it by how it starts.
+    var wide: std.ArrayList(u8) = .empty;
+    defer wide.deinit(alloc);
+    try wide.appendSlice(alloc, "mcp_servers");
+    for (0..70) |_| try wide.appendSlice(alloc, "\u{e9}"); // 11 + 140 bytes: a cut at 128 lands inside a character
+    var underscores: std.ArrayList(u8) = .empty;
+    defer underscores.deinit(alloc);
+    try underscores.appendSlice(alloc, "mcp_servers");
+    for (0..139) |_| try underscores.append(alloc, '_'); // 150 bytes of ASCII
+    var controls: std.ArrayList(u8) = .empty;
+    defer controls.deinit(alloc);
+    try controls.appendSlice(alloc, "mcp_servers");
+    for (0..100) |_| try controls.append(alloc, 0x01); // 111 bytes, but each shows as four: the note's text is cut
+    const keys = [_][]const u8{ wide.items, underscores.items, controls.items };
+    for (keys) |key| {
+        var text: std.ArrayList(u8) = .empty;
+        defer text.deinit(alloc);
+        try text.appendSlice(alloc, "{\"");
+        for (key) |byte| switch (byte) {
+            0x01 => try text.appendSlice(alloc, "\\u0001"),
+            else => try text.append(alloc, byte),
+        };
+        try text.appendSlice(alloc, "\":{\"a\":{\"command\":\"x\"}}}");
+        const found = try foundKey(alloc, text.items);
+        // What is kept is whole characters of the file's key.
+        try std.testing.expect(std.unicode.utf8ValidateSlice(found.key()));
+        try std.testing.expect(std.mem.startsWith(u8, key, found.key()));
+        const note = try renderWorkspaceDiagnostic(alloc, .{ .profile = true, .cause = .misspelled_key, .misspelled = found });
+        defer alloc.free(note);
+        try std.testing.expect(std.unicode.utf8ValidateSlice(note));
+        // It says the key starts so, and names no key that is not in the file.
+        try std.testing.expect(std.mem.find(u8, note, "the key that starts with \"mcp_servers") != null);
+        try std.testing.expect(std.mem.find(u8, note, "the key \"mcp_servers") == null);
+        try std.testing.expect(std.mem.endsWith(u8, note, "then delete that key."));
+        // The quoted start is a start of the key, as the terminal-safe text shows it.
+        const quoted = startsWithQuoted(note).?;
+        try std.testing.expect(std.mem.startsWith(u8, quoted, "mcp_servers"));
+        try std.testing.expect(std.mem.startsWith(u8, key, std.mem.trimEnd(u8, quoted, ".")) or std.mem.find(u8, quoted, "\\x01") != null);
+    }
+    // A key that fits is named whole, as before.
+    const whole = try foundKey(alloc, "{\"mcp_servers\":{\"a\":{\"command\":\"x\"}}}");
+    const said = try renderWorkspaceDiagnostic(alloc, .{ .profile = true, .cause = .misspelled_key, .misspelled = whole });
+    defer alloc.free(said);
+    try std.testing.expect(std.mem.find(u8, said, "the key \"mcp_servers\" looks like") != null);
+    try std.testing.expect(std.mem.find(u8, said, "starts with") == null);
 }
 
 test "project config failures preserve exact error types and identities" {

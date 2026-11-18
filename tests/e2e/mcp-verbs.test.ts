@@ -1052,7 +1052,7 @@ describe("fx mcp add and remove refuse what fx would skip", () => {
   const NEEDS_PORT = "a plain http address needs a port, such as http://localhost:8080/mcp";
   const AUTHORIZATION = 'fx won\'t send its Authorization header; put the token in "bearer_token_env", or sign in with login';
   const fixFor = (key: string, real: string) =>
-    `the key "${key}" looks like a misspelling of "${real}". Move its servers into "${real}", delete "${key}", then run the command again`;
+    `the key "${key}" looks like a misspelling of "${real}", so fx doesn't read it. Move its servers into "${real}", then delete "${key}", and run the command again`;
 
   // createRoot keeps one folder to clean; a test with several roots would leak the earlier ones.
   const earlier: string[] = [];
@@ -1248,10 +1248,47 @@ describe("fx mcp add and remove refuse what fx would skip", () => {
     const deep = fresh({ mcpServers: { a: { command: "x" } }, servers: wide });
     await refused(deep, ["--no-login", "web", "https://x.example/mcp"], fixFor("servers", "mcpServers"));
 
+    // 64 entries that aren't servers come first, so a scan that stops at 64 entries misses the 70 servers after them.
     const many: Record<string, unknown> = {};
+    for (let i = 0; i < 64; i++) many[`n${i}`] = i;
     for (let i = 0; i < 70; i++) many[`s${i}`] = { command: "y" };
     const crowd = fresh({ mcpServers: { a: { command: "x" } }, mcp_servers: many });
     await refused(crowd, ["--no-login", "web", "https://x.example/mcp"], fixFor("mcp_servers", "mcpServers"));
+  }, 120_000);
+
+  test("a misspelled key too long to show whole is named by how it starts, cut at a character, and the file is left as it was", async () => {
+    // 11 + 140 bytes: a cut at 128 bytes lands inside a character.
+    const wide = "mcp_servers" + "\u00e9".repeat(70);
+    const root = fresh({ mcpServers: { a: { command: "x" } }, [wide]: { b: { command: "y" } } });
+    const before = bytesOf(root.profilePath);
+    const ran = await mcp(root, "add", "--no-login", "web", "https://x.example/mcp");
+    expect(ran.code).toBe(1);
+    expect(ran.stdout).toBe("");
+    // The words are valid UTF-8 with no cut character, and name no key that the file lacks.
+    const words = ran.stderr;
+    expect(words).not.toContain("\ufffd");
+    expect(words).not.toContain("\\xc3");
+    expect(words).toContain(`Couldn't add web to ~/.fx/mcp.json: the key that starts with "mcp_servers\u00e9`);
+    expect(words).not.toContain('the key "mcp_servers');
+    expect(words).toContain(`" looks like a misspelling of "mcpServers", so fx doesn't read it. Move its servers into "mcpServers", then delete that key, and run the command again.\n`);
+    const quoted = words.slice(words.indexOf('starts with "') + 'starts with "'.length, words.indexOf('" looks like'));
+    expect(wide.startsWith(quoted)).toBe(true);
+    expect(bytesOf(root.profilePath)).toBe(before);
+  }, 120_000);
+
+  test("a misspelled key whose terminal-safe text is cut is named by how it starts, in the skip note and in the refusal", async () => {
+    // 111 bytes, so the load scan reads it, but each control character shows as four, and the words show only the start.
+    const key = "mcp_servers" + "\u0001".repeat(100);
+    const root = fresh({ mcpServers: { a: { command: "x" } }, [key]: { b: { command: "y" } } });
+    const list = await mcp(root, "list");
+    const start = String.raw`the key that starts with "mcp_servers(\\x01)+\.\.\."`;
+    const tail = String.raw` looks like a misspelling of "mcpServers", so fx doesn't read it\. Move its servers into "mcpServers", then delete that key`;
+    expect(list.stderr).toMatch(new RegExp(String.raw`^note: ~/\.fx/mcp\.json: ${start}${tail}\.\n$`));
+    const before = bytesOf(root.profilePath);
+    const ran = await mcp(root, "add", "--no-login", "web", "https://x.example/mcp");
+    expect(ran.code).toBe(1);
+    expect(ran.stderr).toMatch(new RegExp(String.raw`^Couldn't add web to ~/\.fx/mcp\.json: ${start}${tail}, and run the command again\.\n$`));
+    expect(bytesOf(root.profilePath)).toBe(before);
   }, 120_000);
 
   test("guard: a profile with 65 or more top-level keys and no misspelled key still takes add and remove", async () => {
