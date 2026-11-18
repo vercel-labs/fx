@@ -4387,7 +4387,7 @@ describe("gateway stream lifecycle", () => {
     }
   });
 
-  test("OS filesystem access denial reaches the next gateway request", async () => {
+  test.skipIf(ignoresFileModes())("OS filesystem access denial reaches the next gateway request", async () => {
     const root = createFixtureRoot("os-filesystem-access-denial");
     const tracePath = join(root.root, "trace.log");
     const blockedPath = join(root.root, "blocked");
