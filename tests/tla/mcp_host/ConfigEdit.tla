@@ -27,7 +27,8 @@
 \* are that code. The code before it ran no reader check (Checked = FALSE) and
 \* never read the profile's keys (KeyScan = "none"). "bounded" is the load
 \* scan used for an edit, and Atomic = FALSE a dry run before `update`, which
-\* reads the file outside the lock; both are designs the person ruled out.
+\* reads the file outside the lock. fx uses neither design: the load scan gives up
+\* on a big file, and a dry run misses a key that another fx adds before the write.
 EXTENDS Naturals, FiniteSets
 
 CONSTANTS
