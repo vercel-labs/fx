@@ -2859,6 +2859,9 @@ const MailboxFixture = struct {
     /// While set, a hosted run fails to bind to its agent (`bind`), so its work
     /// ends before its worker attaches.
     bind_fails: std.atomic.Value(bool) = .init(false),
+    /// While set, a hosted run's bind returns `error.Cancelled` when its cancel
+    /// is already set, as the app's does, before it looks at `bind_fails`.
+    bind_honors_cancel: bool = false,
     release: std.Io.Event = .unset,
     runs: std.atomic.Value(usize) = .init(0),
     /// How many runs began with their cancel flag already set: a work that
@@ -2868,6 +2871,8 @@ const MailboxFixture = struct {
     /// is counted in `runs` and not here.
     begun: std.atomic.Value(usize) = .init(0),
     mutex: std.Io.Mutex = .init,
+    /// The text each run's turn began on, in order. Owned.
+    began_contents: std.ArrayList([]u8) = .empty,
     /// "agent work_id outcome output" per report, in arrival order. Owned.
     reports: std.ArrayList([]u8) = .empty,
     /// Each report's facts, in the same order.
@@ -2876,6 +2881,8 @@ const MailboxFixture = struct {
     worker: ?*worker_runtime.WorkerRuntime = null,
 
     fn deinit(self: *MailboxFixture) void {
+        for (self.began_contents.items) |content| std.testing.allocator.free(content);
+        self.began_contents.deinit(std.testing.allocator);
         for (self.reports.items) |line| std.testing.allocator.free(line);
         self.reports.deinit(std.testing.allocator);
         self.ends.deinit(std.testing.allocator);
@@ -2885,8 +2892,9 @@ const MailboxFixture = struct {
         return authority.HostAuthority.capture(alloc, &.{}, &.{}, .{}, &.{});
     }
 
-    fn bind(raw: ?*anyopaque, turn: *execution.TurnContext, _: *std.atomic.Value(bool)) execution.ServiceError!void {
+    fn bind(raw: ?*anyopaque, turn: *execution.TurnContext, cancel: *std.atomic.Value(bool)) execution.ServiceError!void {
         const self: *@This() = @ptrCast(@alignCast(raw.?));
+        if (self.bind_honors_cancel and cancel.load(.seq_cst)) return error.Cancelled;
         if (self.bind_fails.load(.seq_cst)) return error.ProviderFailed;
         turn.hosted_worker = self.hosted orelse return error.ProviderFailed;
     }
@@ -2924,7 +2932,10 @@ const MailboxFixture = struct {
         const turn_id = self.runs.load(.seq_cst) + 1;
         const processing = worker.beginDirectProcessing(turn_id);
         defer if (processing) worker.finishProcessing();
-        if (processing) _ = self.begun.fetchAdd(1, .seq_cst);
+        if (processing) {
+            _ = self.begun.fetchAdd(1, .seq_cst);
+            self.noteBegan(message.content);
+        }
         if (processing and !self.steerable) {
             var boundary = std.heap.ArenaAllocator.init(std.testing.allocator);
             defer boundary.deinit();
@@ -2947,6 +2958,13 @@ const MailboxFixture = struct {
             .assistant = reply,
         } }) catch return error.ProviderFailed;
         return .completed;
+    }
+
+    fn noteBegan(self: *MailboxFixture, content: []const u8) void {
+        const copy = std.testing.allocator.dupe(u8, content) catch return;
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        self.began_contents.append(std.testing.allocator, copy) catch std.testing.allocator.free(copy);
     }
 
     fn post(raw: ?*anyopaque, _: *Runtime, delivery: Delivery) PostReportError!void {
@@ -7687,4 +7705,654 @@ test "a stop after the next work began does not count its message" {
     try std.testing.expect(std.mem.find(u8, stopped, "dropped") == null);
     try waitUntilQuiet(runtime);
     try std.testing.expectEqual(@as(usize, 1), fixture.reportCount());
+}
+
+// ---------------------------------------------------------------------------
+// The accounting table.
+//
+// The rule, for each message `m` that main sent to a subagent
+// (`tests/tla/subagent/StopMessage.tla` NoSilentLoss and CountedNeverRead).
+// An account of `m` is one of: (i) `m`'s turn began; (ii) a count includes `m`,
+// the N of a stop's or close's answer or of a user's note; (iii) the report of
+// `m`'s own work says the work failed or was cancelled.
+//
+//   R1, never false: if (ii) or (iii) holds for `m`, its turn never begins.
+//   R2, never silent: if `m`'s turn never begins, (ii) or (iii) holds.
+//   R3, once: `m` has exactly one account. A count beside the report of a work
+//   that failed for another cause is two; so are two counts.
+//
+// Every cell below puts one subagent in one window of its slot, has one actor
+// or two in a row act there, lets everything finish, and checks the three
+// rules from what main reads and what ran. The cells that no key press or
+// production caller reaches stay in the table as the host's contracts: the
+// user's stop in any slot window (`Runtime.userStopped` is called only while
+// the child's run is in flight or the user's own turn runs, and both have
+// ended before the slot goes on), and a work cancelled before it attaches on
+// its own (`Owner.cancel` has no production caller).
+
+const Actor = enum { parent_stop, parent_close, user_close, user_stop };
+
+/// One action, or two in a row, at one window.
+const Plan = struct { first: Actor, second: ?Actor = null };
+
+const table_plans = [_]Plan{
+    .{ .first = .parent_stop },
+    .{ .first = .parent_close },
+    .{ .first = .user_close },
+    .{ .first = .user_stop },
+    .{ .first = .parent_stop, .second = .user_close },
+    .{ .first = .user_close, .second = .parent_stop },
+    .{ .first = .parent_stop, .second = .parent_close },
+    .{ .first = .parent_close, .second = .parent_stop },
+    .{ .first = .parent_stop, .second = .parent_stop },
+    .{ .first = .user_stop, .second = .parent_stop },
+};
+
+const Scenario = enum {
+    /// A turn is running and one message of the parent's joined it unread.
+    running_unread,
+    /// The first work's turn returned and its end is not recorded yet: nothing
+    /// else waits (`_clean`), or a message joined its turn and is kept.
+    returned_clean,
+    returned_kept,
+    /// The second work, chosen from a waiting message, ended before its worker
+    /// attached, and its end is not recorded yet: its bind failed, or it was
+    /// cancelled before it attached.
+    returned_failed,
+    returned_cancelled,
+    /// The same, with the end recorded and the host's end hook not run yet; a
+    /// message waits, which the hook installs as the next work.
+    recorded_clean,
+    recorded_kept,
+    recorded_waiting,
+    recorded_failed,
+    recorded_cancelled,
+    /// The hook returned and the slot has not gone on: nothing is next.
+    gap_idle,
+    gap_after_failed,
+    gap_after_cancelled,
+    /// The hook chose a next work of one message, or of two joined, which has
+    /// no worker yet. It would run, its bind would fail, or it was cancelled.
+    next_one,
+    next_two,
+    next_one_failed,
+    next_two_failed,
+    next_one_cancelled,
+    next_two_cancelled,
+    /// The user's turn ended and the waiting message, or two, started a new
+    /// slot that has bound and not attached its worker.
+    starting_one,
+    starting_two,
+    /// Two works in a row, each ending with a message unread, the first one's
+    /// dropped by a stop before the second began.
+    two_works_unread,
+
+    /// A hosted run binds to the child agent's own worker, as the app's do;
+    /// the cells that make a work fail or cancel before it attaches need it.
+    fn hosted(self: Scenario) bool {
+        return switch (self) {
+            .running_unread,
+            .returned_failed,
+            .returned_cancelled,
+            .recorded_failed,
+            .recorded_cancelled,
+            .gap_after_failed,
+            .gap_after_cancelled,
+            .next_one_failed,
+            .next_two_failed,
+            .next_one_cancelled,
+            .next_two_cancelled,
+            => true,
+            else => false,
+        };
+    }
+
+    /// Whether the first work's run waits for a release.
+    fn holdsFirstWork(self: Scenario) bool {
+        return switch (self) {
+            .returned_clean, .recorded_clean, .gap_idle, .starting_one, .starting_two => false,
+            else => true,
+        };
+    }
+
+    fn steerable(self: Scenario) bool {
+        return switch (self) {
+            .running_unread, .returned_kept, .recorded_kept, .two_works_unread => true,
+            else => false,
+        };
+    }
+
+    /// The groups of messages that share one fate, and the call of the first.
+    fn units(self: Scenario) []const AccountUnit {
+        return switch (self) {
+            .returned_clean, .recorded_clean, .gap_idle => &.{unit_first},
+            .running_unread, .returned_kept, .recorded_kept => &.{ unit_first, unit_unread },
+            .next_two, .next_two_failed, .next_two_cancelled, .starting_two => &.{ unit_first, unit_joined },
+            .two_works_unread => &.{ unit_first, unit_unread, unit_later, unit_again },
+            else => &.{ unit_first, unit_second },
+        };
+    }
+};
+
+/// Messages that share one fate: they ran in one turn, or one work carried them.
+const AccountUnit = struct { tokens: []const []const u8, call: []const u8 };
+const unit_first = AccountUnit{ .tokens = &.{"first"}, .call = "call-1" };
+const unit_second = AccountUnit{ .tokens = &.{"second"}, .call = "call-2" };
+const unit_joined = AccountUnit{ .tokens = &.{ "second", "third" }, .call = "call-2" };
+const unit_unread = AccountUnit{ .tokens = &.{"also this"}, .call = "call-2" };
+const unit_later = AccountUnit{ .tokens = &.{"later"}, .call = "call-4" };
+const unit_again = AccountUnit{ .tokens = &.{"again"}, .call = "call-5" };
+
+/// The first and the second hold of each kind a cell uses: after a work's turn
+/// returned (`recorded` false) or after its end is recorded (true), and after
+/// the host's end hook returned.
+fn HeldRunTwice(comptime recorded: bool) type {
+    return struct {
+        var first = TestHold{};
+        var second = TestHold{};
+        var calls = std.atomic.Value(u32).init(0);
+
+        fn at(_: []const u8, now_recorded: bool) void {
+            if (now_recorded != recorded) return;
+            switch (calls.fetchAdd(1, .seq_cst)) {
+                0 => first.once(),
+                1 => second.once(),
+                else => {},
+            }
+        }
+
+        fn arm() void {
+            first.reset();
+            second.reset();
+            calls.store(0, .seq_cst);
+            end_test_controls.test_hold_run = at;
+        }
+
+        fn release() void {
+            first.release();
+            second.release();
+        }
+    };
+}
+
+const RunHeld = HeldRunTwice(false);
+const RecordedHeld = HeldRunTwice(true);
+
+const PublishHeldTwice = struct {
+    var first = TestHold{};
+    var second = TestHold{};
+    var calls = std.atomic.Value(u32).init(0);
+
+    fn at(_: []const u8) void {
+        switch (calls.fetchAdd(1, .seq_cst)) {
+            0 => first.once(),
+            1 => second.once(),
+            else => {},
+        }
+    }
+
+    fn arm() void {
+        first.reset();
+        second.reset();
+        calls.store(0, .seq_cst);
+        publish_test_controls.test_hold = at;
+    }
+
+    fn release() void {
+        first.release();
+        second.release();
+    }
+};
+
+/// One cell's subagent: a parent log, a fixture that runs its children, and
+/// the host, which point at each other, so it stays where `init` built it.
+const AccountCell = struct {
+    alloc: Allocator,
+    arena_state: std.heap.ArenaAllocator,
+    parent: child_state.TestParent,
+    hosted_worker: worker_runtime.WorkerRuntime,
+    fixture: MailboxFixture,
+    runtime: *Runtime,
+    scenario: Scenario,
+    child_id: []const u8 = "",
+    user_work: ?[]u8 = null,
+    /// What each stop's and close's answer said, in order.
+    answers: std.ArrayList([]const u8) = .empty,
+
+    fn init(self: *AccountCell, scenario: Scenario) !void {
+        const alloc = std.testing.allocator;
+        const hosted = scenario.hosted();
+        self.* = .{
+            .alloc = alloc,
+            .arena_state = .init(alloc),
+            .parent = undefined,
+            .hosted_worker = .{},
+            .fixture = .{
+                .hold = scenario.holdsFirstWork(),
+                .steerable = scenario.steerable(),
+                .hosted = if (hosted) &self.hosted_worker else null,
+                .bind_honors_cancel = hosted,
+            },
+            .runtime = undefined,
+            .scenario = scenario,
+        };
+        errdefer self.arena_state.deinit();
+        errdefer self.hosted_worker.deinit(alloc);
+        try self.parent.init(alloc);
+        errdefer self.parent.deinit();
+        errdefer self.fixture.deinit();
+        self.armHolds();
+        errdefer clearAccountHooks();
+        self.runtime = if (hosted)
+            try hostedMailboxRuntime(alloc, &self.fixture, &self.parent)
+        else
+            try mailboxRuntime(alloc, &self.fixture, &self.parent);
+    }
+
+    /// Undone in reverse: every hold is let go, the slot's thread ends with the
+    /// runtime, and only then are the hooks cleared.
+    fn deinit(self: *AccountCell) void {
+        self.releaseHolds();
+        self.runtime.deinit();
+        clearAccountHooks();
+        if (self.user_work) |id| self.alloc.free(id);
+        self.answers.deinit(self.alloc);
+        self.fixture.deinit();
+        self.hosted_worker.deinit(self.alloc);
+        self.parent.deinit();
+        self.arena_state.deinit();
+    }
+
+    fn armHolds(self: *AccountCell) void {
+        switch (self.scenario) {
+            .running_unread => {},
+            .returned_clean, .returned_kept, .returned_failed => RunHeld.arm(),
+            .returned_cancelled => {
+                RunHeld.arm();
+                PublishHeldTwice.arm();
+            },
+            .recorded_clean, .recorded_kept, .recorded_waiting, .recorded_failed, .two_works_unread => RecordedHeld.arm(),
+            .recorded_cancelled => {
+                RecordedHeld.arm();
+                PublishHeldTwice.arm();
+            },
+            .gap_idle, .gap_after_failed, .gap_after_cancelled, .next_one, .next_two, .next_one_failed, .next_two_failed, .next_one_cancelled, .next_two_cancelled => PublishHeldTwice.arm(),
+            // Armed once the first work has ended, so the hold meets the slot
+            // the waiting message starts and not the first one.
+            .starting_one, .starting_two => {},
+        }
+    }
+
+    fn releaseHolds(_: *AccountCell) void {
+        RunHeld.release();
+        RecordedHeld.release();
+        PublishHeldTwice.release();
+        HeldStart.release();
+    }
+
+    fn arena(self: *AccountCell) Allocator {
+        return self.arena_state.allocator();
+    }
+
+    fn say(self: *AccountCell, text: []const u8, call: []const u8) ![]const u8 {
+        return callTool(self.runtime, self.arena(), .{ .message = .{ .agent = "reviewer", .message = text } }, call, null);
+    }
+
+    /// A message the subagent has to hold: it is busy.
+    fn sayWaiting(self: *AccountCell, text: []const u8, call: []const u8) !void {
+        const answer = try self.say(text, call);
+        try std.testing.expect(std.mem.find(u8, answer, "is busy") != null);
+    }
+
+    fn childId(self: *AccountCell) ![]const u8 {
+        if (self.child_id.len == 0) self.child_id = try reviewerId(self.runtime, self.arena());
+        return self.child_id;
+    }
+
+    /// The first work runs, and one message, or two, wait for it.
+    fn firstWorkWithWaiting(self: *AccountCell, joined: bool) !void {
+        _ = try self.say("first", "call-1");
+        try waitForRuns(&self.fixture, 1);
+        try self.sayWaiting("second", "call-2");
+        if (joined) try self.sayWaiting("third", "call-3");
+    }
+
+    /// Brings the slot to its window.
+    fn reach(self: *AccountCell) !void {
+        const fixture = &self.fixture;
+        switch (self.scenario) {
+            .running_unread => {
+                _ = try self.say("first", "call-1");
+                try waitForRuns(fixture, 1);
+                const joined = try self.say("also this", "call-2");
+                try std.testing.expect(std.mem.find(u8, joined, "Sent into the subagent's running turn") != null);
+            },
+            .returned_clean => {
+                _ = try self.say("first", "call-1");
+                try RunHeld.first.waitHeld();
+            },
+            .returned_kept => {
+                try Leftovers.endFirstWorkUnread(self.runtime, fixture, self.arena());
+                try RunHeld.first.waitHeld();
+            },
+            .returned_failed => {
+                try self.firstWorkWithWaiting(false);
+                fixture.bind_fails.store(true, .seq_cst);
+                fixture.release.set(io_mod.getIo());
+                try RunHeld.first.waitHeld();
+                RunHeld.first.release();
+                try RunHeld.second.waitHeld();
+            },
+            .returned_cancelled => {
+                try self.firstWorkWithWaiting(false);
+                fixture.release.set(io_mod.getIo());
+                try RunHeld.first.waitHeld();
+                RunHeld.first.release();
+                try PublishHeldTwice.first.waitHeld();
+                try self.runtime.managed.cancel(try self.childId());
+                PublishHeldTwice.first.release();
+                try RunHeld.second.waitHeld();
+            },
+            .recorded_clean => {
+                _ = try self.say("first", "call-1");
+                try RecordedHeld.first.waitHeld();
+            },
+            .recorded_kept => {
+                try Leftovers.endFirstWorkUnread(self.runtime, fixture, self.arena());
+                try RecordedHeld.first.waitHeld();
+            },
+            .recorded_waiting => {
+                try self.firstWorkWithWaiting(false);
+                fixture.release.set(io_mod.getIo());
+                try RecordedHeld.first.waitHeld();
+            },
+            .recorded_failed => {
+                try self.firstWorkWithWaiting(false);
+                fixture.bind_fails.store(true, .seq_cst);
+                fixture.release.set(io_mod.getIo());
+                try RecordedHeld.first.waitHeld();
+                RecordedHeld.first.release();
+                try RecordedHeld.second.waitHeld();
+            },
+            .recorded_cancelled => {
+                try self.firstWorkWithWaiting(false);
+                fixture.release.set(io_mod.getIo());
+                try RecordedHeld.first.waitHeld();
+                RecordedHeld.first.release();
+                try PublishHeldTwice.first.waitHeld();
+                try self.runtime.managed.cancel(try self.childId());
+                PublishHeldTwice.first.release();
+                try RecordedHeld.second.waitHeld();
+            },
+            .gap_idle => {
+                _ = try self.say("first", "call-1");
+                try PublishHeldTwice.first.waitHeld();
+            },
+            .gap_after_failed => {
+                try self.firstWorkWithWaiting(false);
+                fixture.bind_fails.store(true, .seq_cst);
+                fixture.release.set(io_mod.getIo());
+                try PublishHeldTwice.first.waitHeld();
+                PublishHeldTwice.first.release();
+                try PublishHeldTwice.second.waitHeld();
+            },
+            .gap_after_cancelled => {
+                try self.firstWorkWithWaiting(false);
+                fixture.release.set(io_mod.getIo());
+                try PublishHeldTwice.first.waitHeld();
+                try self.runtime.managed.cancel(try self.childId());
+                PublishHeldTwice.first.release();
+                try PublishHeldTwice.second.waitHeld();
+            },
+            .next_one, .next_two => {
+                try self.firstWorkWithWaiting(self.scenario == .next_two);
+                fixture.release.set(io_mod.getIo());
+                try PublishHeldTwice.first.waitHeld();
+            },
+            .next_one_failed, .next_two_failed => {
+                try self.firstWorkWithWaiting(self.scenario == .next_two_failed);
+                fixture.bind_fails.store(true, .seq_cst);
+                fixture.release.set(io_mod.getIo());
+                try PublishHeldTwice.first.waitHeld();
+            },
+            .next_one_cancelled, .next_two_cancelled => {
+                try self.firstWorkWithWaiting(self.scenario == .next_two_cancelled);
+                fixture.release.set(io_mod.getIo());
+                try PublishHeldTwice.first.waitHeld();
+                try self.runtime.managed.cancel(try self.childId());
+            },
+            .starting_one, .starting_two => {
+                _ = try self.say("first", "call-1");
+                try waitUntilQuiet(self.runtime);
+                const child_id = try self.childId();
+                const work_id = self.runtime.beginUserWork(self.alloc, child_id, null).?;
+                self.user_work = work_id;
+                try self.sayWaiting("second", "call-2");
+                if (self.scenario == .starting_two) try self.sayWaiting("third", "call-3");
+                HeldStart.arm();
+                self.runtime.endUserWork(child_id, work_id, .completed, "");
+                try HeldStart.waitHeld();
+            },
+            .two_works_unread => {
+                _ = try self.say("first", "call-1");
+                try waitForRuns(fixture, 1);
+                const joined = try self.say("also this", "call-2");
+                try std.testing.expect(std.mem.find(u8, joined, "Sent into the subagent's running turn") != null);
+                fixture.release.set(io_mod.getIo());
+                try RecordedHeld.first.waitHeld();
+                // The first work's end is recorded with a message kept: a stop
+                // drops it before the hook runs, and the next message starts
+                // the second work, which a message joins and which ends with
+                // that one unread.
+                try self.answers.append(self.alloc, try callTool(self.runtime, self.arena(), .{ .stop = .{ .agent = "reviewer" } }, "call-3", null));
+                try self.sayWaiting("later", "call-4");
+                fixture.release = .unset;
+                RecordedHeld.first.release();
+                try waitForRuns(fixture, 2);
+                const again = try self.say("again", "call-5");
+                try std.testing.expect(std.mem.find(u8, again, "Sent into the subagent's running turn") != null);
+                fixture.release.set(io_mod.getIo());
+                try RecordedHeld.second.waitHeld();
+            },
+        }
+    }
+
+    fn act(self: *AccountCell, actor: Actor, step: usize) !void {
+        const child_id = try self.childId();
+        const call = try self.arena().print("call-act-{d}", .{step});
+        switch (actor) {
+            .parent_stop => try self.answers.append(self.alloc, try callTool(self.runtime, self.arena(), .{ .stop = .{ .agent = "reviewer" } }, call, null)),
+            .parent_close => try self.answers.append(self.alloc, try callTool(self.runtime, self.arena(), .{ .close = .{ .agent = "reviewer" } }, call, null)),
+            .user_close => {
+                _ = try self.runtime.closeChild(child_id, .user);
+            },
+            .user_stop => {
+                // The app's Esc drops the turn's queued messages and passes how
+                // many were the parent's, then ends the turn on the child's own
+                // worker (`AppAgentsRuntime.noteUserStop`).
+                if (self.scenario == .running_unread) {
+                    const drop = self.hosted_worker.dropAgentMessages(self.alloc);
+                    self.runtime.userStopped(child_id, drop.from_parent);
+                    try self.runtime.managed.cancel(child_id);
+                } else {
+                    self.runtime.userStopped(child_id, 0);
+                }
+            },
+        }
+    }
+
+    /// Lets everything go and waits until the slot has ended its last work.
+    fn finish(self: *AccountCell) !void {
+        self.releaseHolds();
+        try waitForSlotEnd(self.runtime, try self.childId());
+        try waitUntilQuiet(self.runtime);
+    }
+
+    /// What each message of the cell came to, from what ran and what main read.
+    fn tally(self: *AccountCell) AccountLedger {
+        var ledger = AccountLedger{};
+        const fixture = &self.fixture;
+        fixture.mutex.lockUncancelable(io_mod.getIo());
+        defer fixture.mutex.unlock(io_mod.getIo());
+        for (self.scenario.units()) |unit| {
+            const began = for (fixture.began_contents.items) |content| {
+                const hit = for (unit.tokens) |token| {
+                    if (std.mem.find(u8, content, token) != null) break true;
+                } else false;
+                if (hit) break true;
+            } else false;
+            if (began) {
+                ledger.ran += unit.tokens.len;
+                continue;
+            }
+            ledger.never_began += unit.tokens.len;
+            for (fixture.reports.items) |line| {
+                const fields = accountReportFields(line);
+                if (!std.mem.eql(u8, fields.call, unit.call)) continue;
+                const dropped = accountReportDropped(line);
+                if (std.mem.eql(u8, fields.outcome, "failed")) {
+                    ledger.by_report += unit.tokens.len;
+                    if (dropped > 0) ledger.count_beside_failed_report = true;
+                    break;
+                }
+                // A cancelled work's report says so; with a count of its own it
+                // is the count that accounts for the messages, once.
+                if (std.mem.eql(u8, fields.outcome, "cancelled") and dropped == 0) {
+                    ledger.by_report += unit.tokens.len;
+                    break;
+                }
+            }
+        }
+        for (self.answers.items) |answer| ledger.counted += accountAnswerDropped(answer);
+        for (fixture.reports.items) |line| ledger.counted += accountReportDropped(line);
+        for (self.runtime.user_dropped.items) |drop| ledger.counted += drop.count;
+        return ledger;
+    }
+
+    fn print(self: *AccountCell, name: []const u8, ledger: AccountLedger, verdict: AccountVerdict) void {
+        std.debug.print("\nTABLE {s}: {s}. Messages whose turn never began {d}; accounted by their own work's failed or cancelled report {d}; counted dropped {d}.\n", .{ name, @tagName(verdict), ledger.never_began, ledger.by_report, ledger.counted });
+        for (self.answers.items, 0..) |answer, i| std.debug.print("TABLE   answer[{d}]: {s}\n", .{ i, answer });
+        self.fixture.mutex.lockUncancelable(io_mod.getIo());
+        defer self.fixture.mutex.unlock(io_mod.getIo());
+        for (self.fixture.reports.items, 0..) |line, i| std.debug.print("TABLE   report[{d}]: {s}\n", .{ i, line });
+        for (self.fixture.began_contents.items) |content| std.debug.print("TABLE   turn began on: {s}\n", .{content});
+        for (self.runtime.user_dropped.items) |drop| std.debug.print("TABLE   user note still held: count={d}\n", .{drop.count});
+    }
+};
+
+fn clearAccountHooks() void {
+    end_test_controls.test_hold_run = null;
+    publish_test_controls.test_hold = null;
+    start_test_controls.test_hold = null;
+}
+
+const AccountLedger = struct {
+    ran: usize = 0,
+    never_began: usize = 0,
+    by_report: usize = 0,
+    counted: usize = 0,
+    count_beside_failed_report: bool = false,
+};
+
+const AccountVerdict = enum {
+    ok,
+    /// R2: a message whose turn never began has no account.
+    silent,
+    /// R1 or R3: more accounts than messages that never ran.
+    over_counted,
+    /// R3: a count beside the report of a work that failed.
+    count_beside_failed_report,
+    /// The case says it breaks R2 as `main` does, and it does not.
+    wrongly_marked,
+};
+
+fn accountVerdict(ledger: AccountLedger, as_on_main: bool) AccountVerdict {
+    if (ledger.count_beside_failed_report) return .count_beside_failed_report;
+    const accounted = ledger.by_report + ledger.counted;
+    if (accounted > ledger.never_began) return .over_counted;
+    if (accounted < ledger.never_began) return if (as_on_main) .ok else .silent;
+    return if (as_on_main) .wrongly_marked else .ok;
+}
+
+const AccountReportFields = struct { call: []const u8, outcome: []const u8 };
+
+/// A fixture report is "agent call_id work_id outcome output[ dropped=N]".
+fn accountReportFields(line: []const u8) AccountReportFields {
+    var parts = std.mem.splitScalar(u8, line, ' ');
+    _ = parts.next();
+    const call = parts.next() orelse "";
+    _ = parts.next();
+    const outcome = parts.next() orelse "";
+    return .{ .call = call, .outcome = outcome };
+}
+
+fn accountReportDropped(line: []const u8) usize {
+    const marker = " dropped=";
+    const at = std.mem.findLast(u8, line, marker) orelse return 0;
+    return std.fmt.parseInt(usize, line[at + marker.len ..], 10) catch 0;
+}
+
+/// How many messages a stop's or close's answer says it dropped.
+fn accountAnswerDropped(answer: []const u8) usize {
+    if (std.mem.find(u8, answer, "message waiting for it was dropped") != null) return 1;
+    const tail = " messages waiting for it were dropped";
+    const at = std.mem.find(u8, answer, tail) orelse return 0;
+    var start = at;
+    while (start > 0 and std.ascii.isDigit(answer[start - 1])) start -= 1;
+    return std.fmt.parseInt(usize, answer[start..at], 10) catch 0;
+}
+
+/// Cells where a message is dropped by the user's close or stop and no count
+/// names it, as on `main` (W92 builds the count; this table is its failing list).
+fn accountAsOnMain(plan: Plan, scenario: Scenario) bool {
+    _ = plan;
+    _ = scenario;
+    return false;
+}
+
+fn accountCellName(buf: []u8, scenario: Scenario, plan: Plan, as_on_main: bool) []const u8 {
+    return std.mem.print(buf, "{s} / {s}{s}{s}{s}", .{
+        @tagName(scenario),
+        @tagName(plan.first),
+        if (plan.second != null) " then " else "",
+        if (plan.second) |second| @tagName(second) else "",
+        if (as_on_main) " (as on main: R2)" else "",
+    }) catch "?";
+}
+
+/// Runs one cell. False when it breaks a rule, after printing what main reads.
+fn runAccountCell(scenario: Scenario, plan: Plan) !bool {
+    var cell: AccountCell = undefined;
+    try cell.init(scenario);
+    defer cell.deinit();
+    try cell.reach();
+    try cell.act(plan.first, 1);
+    if (plan.second) |second| try cell.act(second, 2);
+    try cell.finish();
+    const as_on_main = accountAsOnMain(plan, scenario);
+    const ledger = cell.tally();
+    const verdict = accountVerdict(ledger, as_on_main);
+    if (verdict == .ok) return true;
+    var buf: [160]u8 = undefined;
+    cell.print(accountCellName(&buf, scenario, plan, as_on_main), ledger, verdict);
+    return false;
+}
+
+test "every message main sends has one account in every window of a subagent's slot, for each stop and close" {
+    var broken: usize = 0;
+    var cells: usize = 0;
+    for (std.enums.values(Scenario)) |scenario| {
+        for (table_plans) |plan| {
+            cells += 1;
+            const held = runAccountCell(scenario, plan) catch |err| {
+                var buf: [160]u8 = undefined;
+                std.debug.print("\nTABLE {s}: the cell could not be driven ({s}); the rest of its window is skipped\n", .{ accountCellName(&buf, scenario, plan, false), @errorName(err) });
+                broken += 1;
+                break;
+            };
+            if (!held) broken += 1;
+        }
+    }
+    if (broken > 0) std.debug.print("\nTABLE {d} of {d} cells break the rule or could not be driven\n", .{ broken, cells });
+    try std.testing.expectEqual(@as(usize, 0), broken);
 }
