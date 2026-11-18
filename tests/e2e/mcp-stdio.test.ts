@@ -121,6 +121,8 @@ type RootOptions = {
   protocolErrorDataBytes?: number;
   /** The code the invalid_params fixture sends. */
   protocolErrorCode?: number;
+  /** Sets `max_tool_result_bytes` in the workspace's `.fx.json`, the cap on the text a tool result gives the model. */
+  resultCapBytes?: number;
   /** How the invalid_params fixture breaks its reply: "pieces" or "cut". */
   protocolErrorFault?: "pieces" | "cut";
   /** Nests JSON `depth` levels deep at `site` in the legacy fixture's reply or tool list (see the fixture). */
@@ -182,6 +184,9 @@ function createRoot(
     : [process.execPath, scriptPath];
   mkdirSync(join(home, ".fx"), { recursive: true });
   mkdirSync(workspace, { recursive: true });
+  if (options.resultCapBytes !== undefined) {
+    writeFileSync(join(workspace, ".fx.json"), JSON.stringify({ max_tool_result_bytes: options.resultCapBytes }));
+  }
   writeFileSync(
     join(home, ".fx", "settings.json"),
     JSON.stringify({}),
@@ -2913,6 +2918,36 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"`,
         expect(reportFields.length).toBeGreaterThan(0);
         expect(reportFields.every((field) => field === "tool_call.result" || field === "failed_tool_call.result")).toBe(true);
         expect({ kind, causes: logged.traced!.calls.filter((call) => call.cause === cause).length }).toEqual({ kind, causes: 1 });
+      }
+    },
+    120_000,
+  );
+
+  test.skipIf(!tmuxAvailable())(
+    "a project that sets max_tool_result_bytes below a refused call's error text still sees the cause",
+    async () => {
+      // The error text is over the cap, so the result store keeps it outside the session, and the model gets
+      // the first 4 KiB of it in a preview block. The cause on the TUI line comes from that head.
+      const marker = "cap-marker-4d2e18b0";
+      const issue = { code: "invalid_type", expected: "number", received: "string", path: ["limit"] };
+      const data = {
+        errors: [{ expected: "string", received: "number", path: [marker] }],
+        hint: `${"; data=".repeat(8)}${marker}`,
+        filler: "x".repeat(3000),
+      };
+      const cases = [
+        ["zod", { protocolErrorMessage: `Invalid arguments: ${JSON.stringify([issue])}`, protocolErrorData: data }, "arguments rejected: limit is a string, the schema wants a number"],
+        ["plain", { protocolErrorMessage: "Invalid params", protocolErrorData: data }, "the server rejected the call's parameters (-32602)"],
+        // The message alone is over the cap, with no data: the same gap was in the code before data was kept.
+        ["long-message", { protocolErrorMessage: `Invalid arguments: ${JSON.stringify([{ ...issue, message: "y".repeat(2600) }])}` }, "arguments rejected: limit is a string, the schema wants a number"],
+      ] as const;
+      for (const [kind, options, cause] of cases) {
+        const call = await refusedCall(`tui-invalid-params-cap-${kind}`, { ...options, resultCapBytes: 2000 }, `Cap ${kind} complete.`);
+        // The cap stored the text, so the case is not passing for want of the block.
+        expect({ kind, stored: call.body?.includes("<tool_result_preview handle=") }).toEqual({ kind, stored: true });
+        expect(call.screen).toContain(`Couldn't run ${TOOL_NAME} · ${cause}`);
+        expect({ kind, shown: call.screen.includes("tool_result_preview") }).toEqual({ kind, shown: false });
+        expect({ kind, found: call.screen.includes(marker) || call.logs.includes(marker) }).toEqual({ kind, found: false });
       }
     },
     120_000,
