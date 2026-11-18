@@ -25,6 +25,7 @@ import {
   TmuxSession,
   tmuxAvailable,
 } from "./tmux-helpers";
+import { ignoresFileModes } from "./file-modes";
 import { copyV1Fixture, savedSession, savedSessionIds, savedText, savedToolResults, sessionDir, storeRoot, withoutConversionNotice } from "./saved-sessions";
 
 const TIMEOUT = 30_000;
@@ -1385,7 +1386,7 @@ describe("session recovery", () => {
     }, TIMEOUT);
   }
 
-  test.each(["malformed", "oversized", "unreadable"])("committed-history corruption (%s) fails closed without rewriting JSONL and points at doctor", async (fault) => {
+  const failsClosedOnCorruptHistory = async (fault: "malformed" | "oversized" | "unreadable") => {
     const fixture = createFixture("fx-session-middle-corruption-");
     const gateway = startFakeGateway([]);
     try {
@@ -1426,5 +1427,11 @@ describe("session recovery", () => {
       gateway.stop();
       rmSync(fixture.root, { recursive: true, force: true });
     }
-  }, TIMEOUT);
+  };
+
+  const corruptHistoryTitle = "committed-history corruption (%s) fails closed without rewriting JSONL and points at doctor";
+  test.each(["malformed", "oversized"] as const)(corruptHistoryTitle, failsClosedOnCorruptHistory, TIMEOUT);
+  // A mode that removes every permission does not stop root, or a user that
+  // holds CAP_DAC_OVERRIDE, from reading the file, so the case skips for them.
+  test.skipIf(ignoresFileModes()).each(["unreadable"] as const)(corruptHistoryTitle, failsClosedOnCorruptHistory, TIMEOUT);
 });
