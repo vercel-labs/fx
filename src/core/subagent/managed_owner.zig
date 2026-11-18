@@ -1229,9 +1229,9 @@ fn slotMain(slot: *Slot) void {
         const finished = owner.finish(slot.child_id, outcome.work_id, outcome.outcome, outcome.failure, slot.stopped_by_parent, end);
         slot.ended = true;
         // The end accounts for the work's messages: it ran them, or its report
-        // tells main it failed. A work that ended before its worker attached
-        // (a failed bind, `Owner.cancel`) still holds the count `markNext` set,
-        // which a stop or close in the gap must not count again.
+        // tells main it failed or was cancelled. A work that ended before its
+        // worker attached (a failed bind, `Owner.cancel`) still holds the count
+        // `markNext` set, which a stop or close in the gap must not count again.
         slot.unstarted = 0;
         const closing = owner.closed or slot.shutdown.load(.seq_cst);
         // A stop drops the parent's messages, as do a quit and `/close`.
