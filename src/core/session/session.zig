@@ -150,7 +150,7 @@ pub fn resumedRequestNote(history: []const HistoryTurn) []const u8 {
 pub const resumed_request_notice: core_types.SemanticNotice = .{
     .topic = "session",
     .tone = .neutral,
-    .body = "Resuming the interrupted request",
+    .body = "resuming the interrupted request",
 };
 
 pub fn projectSnapshotLocator(buffer: []u8, path: []const u8) ![]const u8 {

@@ -2592,11 +2592,11 @@ fn requestAcpPermission(
     try params.writer.writeAll(",\"status\":\"pending\",\"rawInput\":");
     try params.writer.writeAll(validated_arguments.written());
     try params.writer.writeAll("},\"options\":[");
-    try writePermissionOption(&params.writer, "allow_once", "Allow once", "allow_once");
+    try writePermissionOption(&params.writer, "allow_once", "allow once", "allow_once");
     try params.writer.writeByte(',');
-    try writePermissionOption(&params.writer, "allow_always", "Allow for this session", "allow_always");
+    try writePermissionOption(&params.writer, "allow_always", "allow for this session", "allow_always");
     try params.writer.writeByte(',');
-    try writePermissionOption(&params.writer, "reject_once", "Reject", "reject_once");
+    try writePermissionOption(&params.writer, "reject_once", "reject", "reject_once");
     try params.writer.writeAll("]}");
 
     try ctx.state.writer.writeRequest(
