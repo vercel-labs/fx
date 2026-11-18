@@ -261,7 +261,10 @@
 //!   never in the trace.
 //! - `renderer_state`: `layout`, `cursor`, `transcript`, `projection`,
 //!   `replaceable`, and `shadow_grid` with `visible_rows`, a list of {`row`,
-//!   `text` (masked)}; `shadow_grid` is left out when fx has none.
+//!   `text` (masked, with the pieces of a secret that a wrap splits also
+//!   masked; all `[redacted]` past 1024 distinct secrets, and from the first
+//!   row that finds the piece compare budget spent onward)}; `shadow_grid` is
+//!   left out when fx has none.
 //! - `renderer_events`: `retained`, `capacity`, `overwritten_before`; then a
 //!   `renderer_event` per event: `at`, `sequence`, `kind`, `detail` (masked),
 //!   `truncated`. These are internal rendering decisions, not what the
@@ -270,7 +273,12 @@
 //!   `transcript_entry` per entry that has text: `at`, `kind` (`raw`, `user`,
 //!   `assistant`, `assistant_table`, `assistant_code_block`,
 //!   `assistant_thematic_rule`, or `semantic_notice`), and `text` (masked),
-//!   with ANSI escapes, blank lines, and banner lines removed.
+//!   with ANSI escapes, blank lines, and banner lines removed. A command output
+//!   entry's rows are masked with the values of the output lines that fx keeps
+//!   for it, so a piece of a secret that a wrap split is masked. They read
+//!   `[redacted]` when fx no longer keeps the line, when it holds more than 1024
+//!   distinct secrets, or when the piece compare budget is spent while they are
+//!   masked.
 //! - `trace_log`, only when a debug trace log is set and not empty: `path`
 //!   (masked), `bytes` read from its end (at most 6 KiB), `older_lines_cut`,
 //!   `lines`; then a `trace_log_line` per line, at most 80: `text` (masked).
@@ -522,9 +530,17 @@ pub fn build(app: anytype) ![]u8 {
     try writeSkills(r, app);
     try writeRuntimeContext(r, app);
     try writeShell(r, shell_view, shell_resolver.configuredLoginShellInto(try arena.alloc(u8, std.Io.Dir.max_path_bytes)));
-    try writeRendererState(r, app);
+    // Prepared first: masking the transcript collects the secrets the visible rows need.
+    const notebook = &app.shell.notebook;
+    const command_lines = try commandLines(arena, notebook);
+    var secrets: text_utils.SecretValues = .{};
+    // One budget and one set of drop logs for the whole trace, shared by the
+    // transcript and the visible rows.
+    var masking: PieceMasking = .{};
+    const transcript = try prepareTranscript(r, notebook.entries.items, &command_lines, &secrets, &masking);
+    try writeRendererState(r, app, &secrets, &masking);
     try writeRendererEvents(r);
-    try writeTranscript(r, app.shell.notebook.entries.items);
+    try writeTranscript(r, transcript);
     if (debug_trace.activeLogPath() orelse io_mod.getenv("FX_TRACE_LOG")) |path| {
         try writeTraceLog(r, path);
     }
@@ -2154,7 +2170,12 @@ fn invocationBeforeCommand(arena: std.mem.Allocator, invocation: shell_resolver.
     return out.toOwnedSlice();
 }
 
-noinline fn writeRendererState(r: *Records, app: anytype) !void {
+noinline fn writeRendererState(
+    r: *Records,
+    app: anytype,
+    secrets: *const text_utils.SecretValues,
+    masking: *PieceMasking,
+) !void {
     const shell = &app.shell;
     const commit = shell.transcriptCommitDiagnostic();
     try r.begin("renderer_state");
@@ -2205,8 +2226,14 @@ noinline fn writeRendererState(r: *Records, app: anytype) !void {
         try r.number("cursor_col", grid.cursor_col);
         try r.boolean("cursor_visible", grid.cursor_visible);
         try r.boolean("sync_active", grid.sync_active);
+        // The secrets on screen are whole in the transcript, so their values
+        // mask the pieces that a wrap leaves in a row.
+        if (secrets.overflow) {
+            masking.log(.visible_rows_overflow, "visible rows redacted: more than {d} secret values, so every row is [redacted]", .{text_utils.SecretValues.max_values});
+        }
         try r.beginArray("visible_rows");
         var row: u16 = 1;
+        var budget_spent = false;
         while (row <= grid.rows) : (row += 1) {
             // rowTextTrimmed appends with the grid's own allocator.
             var row_text: std.ArrayList(u8) = .empty;
@@ -2216,13 +2243,37 @@ noinline fn writeRendererState(r: *Records, app: anytype) !void {
             if (trimmed.len == 0) continue;
             try r.beginItem();
             try r.number("row", row);
-            try r.masked("text", trimmed);
+            if (secrets.overflow or budget_spent) {
+                try r.text("text", "[redacted]");
+            } else if (try maskVisibleRow(r.arena, trimmed, secrets.values.items, masking, row)) |masked| {
+                try r.masked("text", masked);
+            } else {
+                budget_spent = true;
+                try r.text("text", "[redacted]");
+            }
             try r.endItem();
         }
         try r.endArray();
         try r.endObject();
     }
     try r.end();
+}
+
+/// Masks the pieces of one visible row with the trace's shared budget. Null when
+/// the budget is spent, so the row, and every row after it, reads `[redacted]`.
+fn maskVisibleRow(
+    arena: std.mem.Allocator,
+    text: []const u8,
+    values: []const []const u8,
+    masking: *PieceMasking,
+    row: u16,
+) !?[]const u8 {
+    const masked = text_utils.maskSecretPieces(arena, text, values, &masking.budget) catch |err| {
+        if (err != error.SecretPieceBudgetSpent) return err;
+        masking.log(.budget_spent, "secret piece compare budget spent at visible row {d}: it and the rows after it read [redacted]", .{row});
+        return null;
+    };
+    return masked;
 }
 
 noinline fn writeRendererEvents(r: *Records) !void {
@@ -2244,19 +2295,93 @@ noinline fn writeRendererEvents(r: *Records) !void {
     }
 }
 
-/// Writes the `transcript` record and a `transcript_entry` per entry that
-/// has text after filtering.
-noinline fn writeTranscript(r: *Records, entries: anytype) !void {
-    const later = try Buffer.create(r.arena);
-    for (entries) |entry| try writeTranscriptEntry(&later.records, entry);
-    try r.begin("transcript");
-    try r.number("entries", entries.len);
-    try r.number("emitted", later.records.count);
-    try r.end();
-    try r.appendBuffer(later);
+/// The `transcript_entry` records of a transcript, built before the
+/// `transcript` record that counts them is written. See `prepareTranscript`.
+const PreparedTranscript = struct { entries: usize, later: *Buffer };
+
+/// What one /trace drops while it masks secret pieces, and the compare budget
+/// that all of its pieces share. A drop is logged once per /trace and reason, at
+/// the first entry or row that hits it, so the log says what was lost without a
+/// line for every row.
+const PieceMasking = struct {
+    /// The bytes that `maskSecretPieces` may still compare across this trace.
+    budget: usize = text_utils.max_piece_compare_bytes,
+    logged: std.EnumSet(Drop) = .empty,
+
+    const Drop = enum { no_line, own_values_overflow, budget_spent, visible_rows_overflow };
+
+    /// Writes `detail` to the trace log the first time `reason` happens.
+    fn log(self: *PieceMasking, reason: Drop, comptime detail: []const u8, args: anytype) void {
+        if (self.logged.contains(reason)) return;
+        self.logged.insert(reason);
+        debug_trace.logf("trace", detail, args);
+    }
+};
+
+/// The command output lines of each entry id, in the order fx shows them. See
+/// `commandLines`.
+const CommandLines = std.array_hash_map.Auto(u32, std.ArrayList([]const u8));
+
+/// The command output lines of the shown and folded blocks, by entry id. A
+/// command output entry holds only the rows fx wrapped its line into, so a
+/// secret that a wrap split is whole only in its line, and masking reads the
+/// lines from here. An entry can show more than one line.
+fn commandLines(arena: std.mem.Allocator, notebook: anytype) !CommandLines {
+    var lines: CommandLines = .empty;
+    for (notebook.command_output_blocks.items) |block| try addCommandLines(arena, &lines, block.lines.items);
+    for (notebook.folded_command_blocks.items) |block| try addCommandLines(arena, &lines, block.lines.items);
+    return lines;
 }
 
-fn writeTranscriptEntry(r: *Records, entry: anytype) !void {
+/// Adds the lines that have an entry id to `lines`.
+fn addCommandLines(arena: std.mem.Allocator, lines: *CommandLines, block_lines: anytype) !void {
+    for (block_lines) |line| {
+        const id = line.entry_id orelse continue;
+        try putCommandLine(arena, lines, id, line.text);
+    }
+}
+
+/// Appends `text` to the lines of entry `id`.
+fn putCommandLine(arena: std.mem.Allocator, lines: *CommandLines, id: u32, text: []const u8) !void {
+    const slot = try lines.getOrPut(arena, id);
+    if (!slot.found_existing) slot.value_ptr.* = .empty;
+    try slot.value_ptr.append(arena, text);
+}
+
+/// Builds the `transcript_entry` records of `entries` into a buffer. Building
+/// them before `renderer_state` is written lets the walk that masks their text
+/// also collect the secret values that the visible rows need.
+noinline fn prepareTranscript(
+    r: *Records,
+    entries: anytype,
+    command_lines: *const CommandLines,
+    secrets: *text_utils.SecretValues,
+    masking: *PieceMasking,
+) !PreparedTranscript {
+    const later = try Buffer.create(r.arena);
+    for (entries) |entry| try writeTranscriptEntry(&later.records, entry, command_lines, secrets, masking);
+    return .{ .entries = entries.len, .later = later };
+}
+
+/// Writes the `transcript` record, then the entries that `prepareTranscript`
+/// built.
+noinline fn writeTranscript(r: *Records, transcript: PreparedTranscript) !void {
+    try r.begin("transcript");
+    try r.number("entries", transcript.entries);
+    try r.number("emitted", transcript.later.records.count);
+    try r.end();
+    try r.appendBuffer(transcript.later);
+}
+
+/// Writes the `transcript_entry` record of `entry`, when its text has any
+/// after filtering. The secret values that its text masks go in `secrets`.
+fn writeTranscriptEntry(
+    r: *Records,
+    entry: anytype,
+    command_lines: *const CommandLines,
+    secrets: *text_utils.SecretValues,
+    masking: *PieceMasking,
+) !void {
     const arena = r.arena;
     const kind: []const u8 = switch (entry) {
         .raw_bytes => "raw",
@@ -2267,7 +2392,29 @@ fn writeTranscriptEntry(r: *Records, entry: anytype) !void {
         .assistant_thematic_rule => "assistant_thematic_rule",
         .semantic_notice => "semantic_notice",
     };
-    const text: []const u8 = switch (entry) {
+    const text = try entryText(arena, entry);
+    if (text.len == 0) return;
+
+    const body = switch (entry) {
+        .assistant_thematic_rule => try thematicRuleText(arena, text),
+        .raw_bytes => |e| if (e.class == .command_output)
+            try commandOutputBody(arena, e.id, text, command_lines, secrets, masking)
+        else
+            try timelineText(arena, text, secrets, null),
+        else => try timelineText(arena, text, secrets, null),
+    };
+    if (body.len == 0) return;
+
+    try r.begin("transcript_entry");
+    try r.time("at", entry.createdAtMs());
+    try r.text("kind", kind);
+    try r.text("text", body);
+    try r.end();
+}
+
+/// The text one transcript entry holds, before it is masked.
+fn entryText(arena: std.mem.Allocator, entry: anytype) ![]const u8 {
+    return switch (entry) {
         .raw_bytes => |e| e.bytes,
         .user_turn => |e| e.turn.text,
         .assistant_turn => |e| e.segments.text.items,
@@ -2299,24 +2446,68 @@ fn writeTranscriptEntry(r: *Records, entry: anytype) !void {
             std.math.maxInt(u16),
         ),
     };
-    if (text.len == 0) return;
-
-    const body = switch (entry) {
-        .assistant_thematic_rule => try thematicRuleText(arena, text),
-        else => try timelineText(arena, text),
-    };
-    if (body.len == 0) return;
-
-    try r.begin("transcript_entry");
-    try r.time("at", entry.createdAtMs());
-    try r.text("kind", kind);
-    try r.text("text", body);
-    try r.end();
 }
 
+/// The body of a command output entry, whose `rows` are the lines fx wrapped
+/// its output line into. The entry's own lines give the values that mask its
+/// rows, because a wrap can split a secret across rows and a line is the one
+/// place it is whole. Those lines also go into `secrets`, since the visible rows
+/// need every value. The entry reads `[redacted]` when fx no longer keeps its
+/// line, when the line holds more than `max_values` distinct secrets, or when
+/// the compare budget runs out while its rows are masked: its rows could hold a
+/// piece that no mask recognizes.
+fn commandOutputBody(
+    arena: std.mem.Allocator,
+    id: u32,
+    rows: []const u8,
+    command_lines: *const CommandLines,
+    secrets: *text_utils.SecretValues,
+    masking: *PieceMasking,
+) ![]const u8 {
+    const lines = command_lines.get(id) orelse {
+        masking.log(.no_line, "command output entry {d} written as [redacted]: no shown or folded block keeps its line", .{id});
+        return "[redacted]";
+    };
+    var own: text_utils.SecretValues = .{};
+    for (lines.items) |line| {
+        // Escape codes go first: a key right after one has a token byte before it, so findSecretSpan would not match it.
+        const stripped = try stripAnsiEscapes(arena, line);
+        try own.collect(arena, stripped);
+        try secrets.collect(arena, stripped);
+    }
+    if (own.overflow) {
+        masking.log(.own_values_overflow, "command output entry {d} written as [redacted]: its line holds more than {d} distinct secret values", .{ id, text_utils.SecretValues.max_values });
+        return "[redacted]";
+    }
+    const body = timelineText(arena, rows, secrets, .{ .values = own.values.items, .masking = masking }) catch |err| {
+        if (err != error.SecretPieceBudgetSpent) return err;
+        masking.log(.budget_spent, "secret piece compare budget spent at command output entry {d}: it and the entries after it read [redacted] where their pieces need comparing", .{id});
+        return "[redacted]";
+    };
+    return body;
+}
+
+/// The values that mask the pieces of a command output entry's rows, and the
+/// budget and drop logs they are charged to.
+const RowPieces = struct {
+    values: []const []const u8,
+    masking: *PieceMasking,
+};
+
 /// The entry's lines without ANSI escapes, blank lines, or banner lines,
-/// with obvious secrets masked, joined by line breaks.
-fn timelineText(arena: std.mem.Allocator, text: []const u8) ![]const u8 {
+/// with obvious secrets masked, joined by line breaks. The secret values that
+/// are masked are collected in `secrets`. When `pieces` is given, which is only
+/// for the rows of a command output entry, the pieces of its values are masked
+/// first: a wrap splits a secret, so only those rows can hold a piece of one.
+/// The pieces go first so that no `[redacted]` marker is ever split by a piece
+/// match. A piece mask that runs out of budget returns
+/// `error.SecretPieceBudgetSpent`.
+fn timelineText(
+    arena: std.mem.Allocator,
+    text: []const u8,
+    secrets: *text_utils.SecretValues,
+    pieces: ?RowPieces,
+) ![]const u8 {
     const stripped = try stripAnsiEscapes(arena, text);
     var out: std.ArrayList(u8) = .empty;
     var it = std.mem.splitScalar(u8, stripped, '\n');
@@ -2325,7 +2516,11 @@ fn timelineText(arena: std.mem.Allocator, text: []const u8) ![]const u8 {
         if (trimmed.len == 0) continue;
         if (isBannerNoiseLine(trimmed)) continue;
         if (out.items.len > 0) try out.append(arena, '\n');
-        try out.appendSlice(arena, try text_utils.maskSecretsCutShort(arena, trimmed));
+        const piece_masked = if (pieces) |p|
+            try text_utils.maskSecretPieces(arena, trimmed, p.values, &p.masking.budget)
+        else
+            trimmed;
+        try out.appendSlice(arena, try text_utils.maskSecretsCutShortCollect(arena, piece_masked, secrets));
     }
     return out.items;
 }
@@ -2782,7 +2977,10 @@ test "trace transcript keeps semantic table, code block, and thematic rule conte
 
     const w = try TestWriter.create();
     defer w.destroy();
-    try writeTranscript(&w.records, entries.items);
+    var command_lines: CommandLines = .empty;
+    var secrets: text_utils.SecretValues = .{};
+    var masking: PieceMasking = .{};
+    try writeTranscript(&w.records, try prepareTranscript(&w.records, entries.items, &command_lines, &secrets, &masking));
     var trace = try w.trace();
     defer trace.deinit();
     const summary = try trace.one("transcript");
@@ -2808,7 +3006,10 @@ test "trace transcript strips escapes, drops banner lines, masks secrets, and co
     };
     const w = try TestWriter.create();
     defer w.destroy();
-    try writeTranscript(&w.records, &entries);
+    var command_lines: CommandLines = .empty;
+    var secrets: text_utils.SecretValues = .{};
+    var masking: PieceMasking = .{};
+    try writeTranscript(&w.records, try prepareTranscript(&w.records, &entries, &command_lines, &secrets, &masking));
     var trace = try w.trace();
     defer trace.deinit();
     const summary = try trace.one("transcript");
@@ -2818,6 +3019,300 @@ test "trace transcript strips escapes, drops banner lines, masks secrets, and co
     try std.testing.expectEqualStrings("raw", try testString(entry, "kind"));
     try std.testing.expectEqualStrings("2023-11-14T22:13:20.000Z", try testString(entry, "at"));
     try std.testing.expectEqualStrings("bold line\nexport AI_GATEWAY_API_KEY=[redacted]", try testString(entry, "text"));
+}
+
+test "trace command output entry keeps its rows and masks the pieces of a wrapped secret" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const token = "ghp_" ++ text_utils.repeat("A", 40);
+    var command_lines: CommandLines = .empty;
+    try putCommandLine(arena_state.allocator(), &command_lines, 5, token);
+    // The entry holds only the rows that fx wrapped the line into.
+    var entries = [_]TestTranscriptEntry{.{ .raw_bytes = .{
+        .id = 5,
+        .created_at_ms = 1_700_000_000_000,
+        .bytes = "│ ghp_" ++ text_utils.repeat("A", 30) ++ "\n│ " ++ text_utils.repeat("A", 10) ++ " done",
+        .class = .command_output,
+    } }};
+    const w = try TestWriter.create();
+    defer w.destroy();
+    var secrets: text_utils.SecretValues = .{};
+    var masking: PieceMasking = .{};
+    try writeTranscript(&w.records, try prepareTranscript(&w.records, &entries, &command_lines, &secrets, &masking));
+    var trace = try w.trace();
+    defer trace.deinit();
+    const entry = try trace.one("transcript_entry");
+    try std.testing.expectEqualStrings("│ [redacted]\n│ [redacted] done", try testString(entry, "text"));
+    try std.testing.expectEqual(@as(usize, 1), secrets.values.items.len);
+    try std.testing.expectEqualStrings(token, secrets.values.items[0]);
+}
+
+test "trace command output entry with rows and no kept line is written as redacted" {
+    var command_lines: CommandLines = .empty;
+    // The rows may hold a piece of a secret, and no block keeps the whole line.
+    var entries = [_]TestTranscriptEntry{.{ .raw_bytes = .{
+        .id = 6,
+        .created_at_ms = 1_700_000_000_000,
+        .bytes = "│ ghp_" ++ text_utils.repeat("A", 30) ++ "\n│ " ++ text_utils.repeat("A", 10),
+        .class = .command_output,
+    } }};
+    const w = try TestWriter.create();
+    defer w.destroy();
+    var secrets: text_utils.SecretValues = .{};
+    var masking: PieceMasking = .{};
+    try writeTranscript(&w.records, try prepareTranscript(&w.records, &entries, &command_lines, &secrets, &masking));
+    var trace = try w.trace();
+    defer trace.deinit();
+    try std.testing.expectEqualStrings("[redacted]", try testString(try trace.one("transcript_entry"), "text"));
+}
+
+test "trace command output entry with empty bytes writes no record and collects nothing" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const token = "ghp_" ++ text_utils.repeat("A", 40);
+    var command_lines: CommandLines = .empty;
+    try putCommandLine(arena_state.allocator(), &command_lines, 10, token);
+    // fx shows nothing for this entry, so its line is not output and not read.
+    var entries = [_]TestTranscriptEntry{.{ .raw_bytes = .{
+        .id = 10,
+        .created_at_ms = 1_700_000_000_000,
+        .bytes = "",
+        .class = .command_output,
+    } }};
+    const w = try TestWriter.create();
+    defer w.destroy();
+    var secrets: text_utils.SecretValues = .{};
+    var masking: PieceMasking = .{};
+    try writeTranscript(&w.records, try prepareTranscript(&w.records, &entries, &command_lines, &secrets, &masking));
+    var trace = try w.trace();
+    defer trace.deinit();
+    try std.testing.expectEqual(@as(usize, 0), trace.count("transcript_entry"));
+    try std.testing.expectEqual(@as(usize, 0), secrets.values.items.len);
+}
+
+/// `count` lines, each a fake `ghp_` token with its own digits, to fill a secret
+/// set past a limit.
+fn fakeTokenLines(arena: std.mem.Allocator, count: usize) ![]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    for (0..count) |index| {
+        try out.appendSlice(arena, try arena.print("ghp_{s}{d:0>4}\n", .{ text_utils.repeat("A", 32), index }));
+    }
+    return out.items;
+}
+
+test "trace command output entry keeps masking its rows when the shared secret values overflow" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var secrets: text_utils.SecretValues = .{};
+    // Fill the shared set to its limit, so this entry's token overflows it. Only
+    // the entry's own overflow redacts it: its own line still masks its rows.
+    try secrets.collect(arena, try fakeTokenLines(arena, text_utils.SecretValues.max_values));
+    const token = "ghp_" ++ text_utils.repeat("A", 40);
+    var command_lines: CommandLines = .empty;
+    try putCommandLine(arena, &command_lines, 11, token);
+    var entries = [_]TestTranscriptEntry{.{ .raw_bytes = .{
+        .id = 11,
+        .created_at_ms = 1_700_000_000_000,
+        .bytes = "│ ghp_" ++ text_utils.repeat("A", 30) ++ "\n│ " ++ text_utils.repeat("A", 10) ++ " done",
+        .class = .command_output,
+    } }};
+    const w = try TestWriter.create();
+    defer w.destroy();
+    var masking: PieceMasking = .{};
+    try writeTranscript(&w.records, try prepareTranscript(&w.records, &entries, &command_lines, &secrets, &masking));
+    var trace = try w.trace();
+    defer trace.deinit();
+    try std.testing.expectEqualStrings("│ [redacted]\n│ [redacted] done", try testString(try trace.one("transcript_entry"), "text"));
+    try std.testing.expect(secrets.overflow);
+    try std.testing.expect(!masking.logged.contains(.own_values_overflow));
+}
+
+test "trace command output entry is written as redacted when its own line holds too many secrets" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var command_lines: CommandLines = .empty;
+    try putCommandLine(arena, &command_lines, 14, try fakeTokenLines(arena, text_utils.SecretValues.max_values + 1));
+    var entries = [_]TestTranscriptEntry{.{ .raw_bytes = .{
+        .id = 14,
+        .created_at_ms = 1_700_000_000_000,
+        .bytes = "│ ghp_" ++ text_utils.repeat("A", 30) ++ "\n│ " ++ text_utils.repeat("A", 10) ++ " done",
+        .class = .command_output,
+    } }};
+    const w = try TestWriter.create();
+    defer w.destroy();
+    var secrets: text_utils.SecretValues = .{};
+    var masking: PieceMasking = .{};
+    try writeTranscript(&w.records, try prepareTranscript(&w.records, &entries, &command_lines, &secrets, &masking));
+    var trace = try w.trace();
+    defer trace.deinit();
+    try std.testing.expectEqualStrings("[redacted]", try testString(try trace.one("transcript_entry"), "text"));
+    try std.testing.expect(masking.logged.contains(.own_values_overflow));
+}
+
+test "trace command output entry is written as redacted once the piece compare budget is spent" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const token = "ghp_" ++ text_utils.repeat("A", 40);
+    var command_lines: CommandLines = .empty;
+    try putCommandLine(arena, &command_lines, 15, token);
+    var entries = [_]TestTranscriptEntry{.{ .raw_bytes = .{
+        .id = 15,
+        .created_at_ms = 1_700_000_000_000,
+        .bytes = "│ ghp_" ++ text_utils.repeat("A", 30) ++ "\n│ " ++ text_utils.repeat("A", 10) ++ " done",
+        .class = .command_output,
+    } }};
+    const w = try TestWriter.create();
+    defer w.destroy();
+    var secrets: text_utils.SecretValues = .{};
+    // A budget of one byte cannot pay for the first row's comparisons.
+    var masking: PieceMasking = .{ .budget = 1 };
+    try writeTranscript(&w.records, try prepareTranscript(&w.records, &entries, &command_lines, &secrets, &masking));
+    var trace = try w.trace();
+    defer trace.deinit();
+    try std.testing.expectEqualStrings("[redacted]", try testString(try trace.one("transcript_entry"), "text"));
+    try std.testing.expectEqual(@as(usize, 0), masking.budget);
+    try std.testing.expect(masking.logged.contains(.budget_spent));
+}
+
+test "trace command output entry masks its rows with the values of every line it shows" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const token = "ghp_" ++ text_utils.repeat("A", 40);
+    const key = "sk-" ++ text_utils.repeat("B", 30);
+    var command_lines: CommandLines = .empty;
+    try putCommandLine(arena, &command_lines, 16, token);
+    try putCommandLine(arena, &command_lines, 16, key);
+    // The token's rows come from its line, the key's from the second line.
+    var entries = [_]TestTranscriptEntry{.{ .raw_bytes = .{
+        .id = 16,
+        .created_at_ms = 1_700_000_000_000,
+        .bytes = "│ ghp_" ++ text_utils.repeat("A", 30) ++ "\n│ " ++ text_utils.repeat("A", 10) ++ " │\n│ " ++ text_utils.repeat("B", 25) ++ " │",
+        .class = .command_output,
+    } }};
+    const w = try TestWriter.create();
+    defer w.destroy();
+    var secrets: text_utils.SecretValues = .{};
+    var masking: PieceMasking = .{};
+    try writeTranscript(&w.records, try prepareTranscript(&w.records, &entries, &command_lines, &secrets, &masking));
+    var trace = try w.trace();
+    defer trace.deinit();
+    try std.testing.expectEqualStrings(
+        "│ [redacted]\n│ [redacted] │\n│ [redacted] │",
+        try testString(try trace.one("transcript_entry"), "text"),
+    );
+    try std.testing.expectEqual(@as(usize, 2), secrets.values.items.len);
+}
+
+test "trace raw entry of another class keeps its own bytes" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var command_lines: CommandLines = .empty;
+    // A line with the same id must not replace the bytes of an entry of another class.
+    try putCommandLine(arena_state.allocator(), &command_lines, 8, "other line");
+    var entries = [_]TestTranscriptEntry{.{ .raw_bytes = .{
+        .id = 8,
+        .created_at_ms = 1_700_000_000_000,
+        .bytes = "plain status line",
+        .class = .tool_status,
+    } }};
+    const w = try TestWriter.create();
+    defer w.destroy();
+    var secrets: text_utils.SecretValues = .{};
+    var masking: PieceMasking = .{};
+    try writeTranscript(&w.records, try prepareTranscript(&w.records, &entries, &command_lines, &secrets, &masking));
+    var trace = try w.trace();
+    defer trace.deinit();
+    try std.testing.expectEqualStrings("plain status line", try testString(try trace.one("transcript_entry"), "text"));
+}
+
+test "trace command lines keep every line of an entry in order and skip lines without one" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    // A fake notebook: `commandLines` takes any value with these fields.
+    const Line = struct { text: []const u8, entry_id: ?u32 };
+    const Block = struct { lines: struct { items: []const Line } };
+    const Blocks = struct { items: []const Block };
+    const Notebook = struct { command_output_blocks: Blocks, folded_command_blocks: Blocks };
+    const shown = [_]Line{
+        .{ .text = "first", .entry_id = 7 },
+        .{ .text = "no entry", .entry_id = null },
+        .{ .text = "second", .entry_id = 7 },
+    };
+    const folded = [_]Line{.{ .text = "folded", .entry_id = 9 }};
+    const shown_blocks = [_]Block{.{ .lines = .{ .items = &shown } }};
+    const folded_blocks = [_]Block{.{ .lines = .{ .items = &folded } }};
+    const notebook: Notebook = .{
+        .command_output_blocks = .{ .items = &shown_blocks },
+        .folded_command_blocks = .{ .items = &folded_blocks },
+    };
+    const lines = try commandLines(arena_state.allocator(), notebook);
+    try std.testing.expectEqual(@as(usize, 2), lines.count());
+    const shown_lines = lines.get(7).?.items;
+    try std.testing.expectEqual(@as(usize, 2), shown_lines.len);
+    try std.testing.expectEqualStrings("first", shown_lines[0]);
+    try std.testing.expectEqualStrings("second", shown_lines[1]);
+    try std.testing.expectEqualStrings("folded", lines.get(9).?.items[0]);
+}
+
+test "trace command output rows mask a secret whose line has escape codes around it" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const value = "Bearer " ++ text_utils.repeat("B", 30);
+    var command_lines: CommandLines = .empty;
+    try putCommandLine(arena_state.allocator(), &command_lines, 13, "\x1b[1m" ++ value ++ "\x1b[0m");
+    // The rows hold the wrapped pieces of the value: its first word, then its tail.
+    var entries = [_]TestTranscriptEntry{.{ .raw_bytes = .{
+        .id = 13,
+        .created_at_ms = 1_700_000_000_000,
+        .bytes = "│ Bearer\n│ " ++ text_utils.repeat("B", 30),
+        .class = .command_output,
+    } }};
+    const w = try TestWriter.create();
+    defer w.destroy();
+    var secrets: text_utils.SecretValues = .{};
+    var masking: PieceMasking = .{};
+    try writeTranscript(&w.records, try prepareTranscript(&w.records, &entries, &command_lines, &secrets, &masking));
+    var trace = try w.trace();
+    defer trace.deinit();
+    // `Bearer` is a public prefix, so its row keeps it; the token's row is masked.
+    try std.testing.expectEqualStrings("│ Bearer\n│ [redacted]", try testString(try trace.one("transcript_entry"), "text"));
+    try std.testing.expectEqual(@as(usize, 2), secrets.values.items.len);
+    try std.testing.expectEqualStrings(value, secrets.values.items[0]);
+    try std.testing.expectEqualStrings(text_utils.repeat("B", 30), secrets.values.items[1]);
+}
+
+test "trace command output rows keep every redaction marker whole when a value starts like one" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    // The value is collected from the whole line, as an assignment.
+    const value = "ed" ++ text_utils.repeat("C", 30);
+    var command_lines: CommandLines = .empty;
+    try putCommandLine(arena_state.allocator(), &command_lines, 12, "API_KEY=" ++ value);
+    var entries = [_]TestTranscriptEntry{.{ .raw_bytes = .{
+        .id = 12,
+        .created_at_ms = 1_700_000_000_000,
+        .bytes = "│ x ghp_" ++ text_utils.repeat("A", 40) ++ " ed" ++ "CCCC\n│ ghp_" ++ text_utils.repeat("A", 40),
+        .class = .command_output,
+    } }};
+    const w = try TestWriter.create();
+    defer w.destroy();
+    var secrets: text_utils.SecretValues = .{};
+    var masking: PieceMasking = .{};
+    try writeTranscript(&w.records, try prepareTranscript(&w.records, &entries, &command_lines, &secrets, &masking));
+    var trace = try w.trace();
+    defer trace.deinit();
+    const text = try testString(try trace.one("transcript_entry"), "text");
+    try std.testing.expect(std.mem.find(u8, text, "[redact[") == null);
+    try std.testing.expectEqualStrings("│ x [redacted] [redacted]\n│ [redacted]", text);
+}
+
+// A narrow table cell shows only the column minimum of a token per row, so the piece rule must reach that size.
+test "trace cell piece length reaches the narrowest table column" {
+    try std.testing.expect(text_utils.min_secret_cell_piece_bytes <= transcript_blocks.table_min_column_width);
 }
 
 test "trace compaction records events without file tracing" {
@@ -5555,7 +6050,10 @@ test "trace stays well formed with every ring full and a long transcript" {
     try writeModelCatalog(&w.records, &struct {}{});
     try writeToolCalls(&w.records, &.{}, null);
     try writeRendererEvents(&w.records);
-    try writeTranscript(&w.records, entries);
+    var command_lines: CommandLines = .empty;
+    var secrets: text_utils.SecretValues = .{};
+    var masking: PieceMasking = .{};
+    try writeTranscript(&w.records, try prepareTranscript(&w.records, entries, &command_lines, &secrets, &masking));
     try writeEnd(&w.records);
 
     var trace = try w.trace();
