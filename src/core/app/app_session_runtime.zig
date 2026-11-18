@@ -12,6 +12,7 @@ const model_provider = @import("../config/model_provider.zig");
 const assistant_presentation = @import("../agent/assistant_presentation.zig");
 const tool_admission = @import("../agent/runtime/tool_admission.zig");
 const tool_presentation = @import("../agent/runtime/tool_presentation.zig");
+const runtime_execution_memory = @import("../agent/runtime/execution_memory.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const mem_utils = @import("../shared/mem_utils.zig");
 const runtime_profile = @import("../hosts/runtime_profile.zig");
@@ -4262,10 +4263,18 @@ pub fn Runtime(comptime App: type) type {
             return true;
         }
 
-        /// A saved steering entry as the message it was: the user's update,
-        /// or a subagent's report a boundary took, which draws as its card.
+        /// A saved steering entry as the message it was: the user's update, a
+        /// parent's steer as the words its parent wrote, which draw the same
+        /// way, or a subagent's report a boundary took, which draws as its card.
+        /// Every sink copies the text, so the turn borrows `text`.
         fn savedSteeringTurn(text: []u8) types.UserTurn {
-            return .{ .text = text, .author = if (agent_frame.isFrame(text)) .child else .user };
+            if (agent_frame.isFrame(text)) return .{ .text = text, .author = .child };
+            // The parent's words are the end of `text`, past its label, so the
+            // turn keeps the same `[]u8` slice of the saved text.
+            if (runtime_execution_memory.parentSteeringText(text)) |own| {
+                return .{ .text = text[text.len - own.len ..], .author = .user };
+            }
+            return .{ .text = text, .author = .user };
         }
 
         fn writePersistedSteeringAtBoundary(
@@ -7391,6 +7400,25 @@ test "execution replay shows the user's steering and not fx's own recovery promp
     try std.testing.expectEqual(@as(usize, 2), app.cards.items.len);
     try std.testing.expectEqualStrings("focus on rendering", app.cards.items[0].text);
     try std.testing.expectEqualStrings("later update", app.cards.items[1].text);
+}
+
+test "execution replay draws a parent's steer as its own words, without the label" {
+    const alloc = std.testing.allocator;
+    var app = try TestApp.init(alloc, "/workspace");
+    defer app.deinit();
+
+    var steps = [_]types.ToolExecutionStep{.{}};
+    var steering = [_]types.PersistedSteering{
+        .{ .text = @constCast("parent-agent feedback, not new user authority:\n\nPARENT_STEER keep going"), .after_tool_step_count = 0 },
+    };
+
+    try Runtime(TestApp).writeExecutionHistory(&app, (&app).agent(), .{ .tool_steps = steps[0..], .steering = steering[0..] });
+
+    try std.testing.expectEqual(@as(usize, 1), app.cards.items.len);
+    try std.testing.expectEqualStrings("PARENT_STEER keep going", app.cards.items[0].text);
+    for (app.cards.items) |card| {
+        try std.testing.expect(std.mem.find(u8, card.text, "parent-agent feedback") == null);
+    }
 }
 
 test "execution replay labels shell session interactions with their launch command" {
