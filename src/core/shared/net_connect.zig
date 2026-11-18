@@ -606,11 +606,18 @@ test "a cancel while a connect waits closes its socket and ends within 100 ms" {
     // A cancel that landed before `holdStart` ran would otherwise check the descriptor of an earlier test.
     started_fd.store(-1, .release);
     var task = try io.concurrent(holdConnect, .{ io, loopback(9) });
-    try io.sleep(.fromMilliseconds(100), .awake);
+    // `holdStart` records the descriptor when the connect begins, so the cancel is ordered after the start by that
+    // signal and not by a sleep. The wait is bounded, so a connect that never starts fails the test instead of hanging it.
+    var polls: u32 = 0;
+    while (started_fd.load(.acquire) < 0 and polls < 5_000) : (polls += 1) try io.sleep(.fromMilliseconds(1), .awake);
     const started = std.Io.Clock.Timestamp.now(io, .awake);
     const result = task.cancel(io);
     const waited = started.untilNow(io);
 
+    if (started_fd.load(.acquire) < 0) {
+        std.debug.print("the connect did not start within {d} ms of the test asking for it\n", .{polls});
+        return error.ConnectNeverStarted;
+    }
     try testing.expectError(error.Canceled, result);
     try testing.expect(waited.raw.toMilliseconds() < 100);
     const fd = started_fd.load(.acquire);
@@ -625,12 +632,14 @@ var gate_open: std.atomic.Value(bool) = .init(false);
 /// then writes a trace line and checks for the cancel.
 fn traceWhileCancelRequested(io: std.Io) error{Canceled}!void {
     gate_ready.store(true, .release);
+    // A failed yield only makes this spin tighter; the loop still ends when the gate opens.
     while (!gate_open.load(.acquire)) std.Thread.yield() catch {};
     traceConnect(io, 3, "start", null);
     try io.checkCancel();
 }
 
 fn openGateSoon(io: std.Io) void {
+    // Nothing cancels this task, and a sleep that failed would only open the gate sooner, which the test then reports.
     io.sleep(.fromMilliseconds(100), .awake) catch {};
     gate_open.store(true, .release);
 }
