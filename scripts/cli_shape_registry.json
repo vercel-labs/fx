@@ -281,11 +281,35 @@
       "job": "test",
       "stability": "internal"
     },
+    "FX_TEST_SUBAGENT_CLOSE_HELD": {
+      "job": "test",
+      "stability": "internal"
+    },
+    "FX_TEST_SUBAGENT_CLOSE_RELEASE": {
+      "job": "test",
+      "stability": "internal"
+    },
     "FX_TEST_SUBAGENT_END_HELD": {
       "job": "test",
       "stability": "internal"
     },
     "FX_TEST_SUBAGENT_END_RELEASE": {
+      "job": "test",
+      "stability": "internal"
+    },
+    "FX_TEST_SUBAGENT_PUBLISH_HELD": {
+      "job": "test",
+      "stability": "internal"
+    },
+    "FX_TEST_SUBAGENT_PUBLISH_RELEASE": {
+      "job": "test",
+      "stability": "internal"
+    },
+    "FX_TEST_SUBAGENT_SETTLE_HELD": {
+      "job": "test",
+      "stability": "internal"
+    },
+    "FX_TEST_SUBAGENT_SETTLE_RELEASE": {
       "job": "test",
       "stability": "internal"
     },

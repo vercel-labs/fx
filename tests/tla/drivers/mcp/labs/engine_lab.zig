@@ -138,7 +138,11 @@ const Lab = struct {
                     .failure => |f| try lab.arena.print("error {d} {s}", .{ f.code, f.message }),
                     else => @tagName(a),
                 } else null;
-                try lab.print("event", .{ .tag = t, .maybe_ran = c.maybe_ran, .timed_out = c.timed_out, .answer = answer });
+                const is_error: ?bool = if (c.answer) |a| switch (a) {
+                    .result => |r| r.is_error,
+                    else => null,
+                } else null;
+                try lab.print("event", .{ .tag = t, .maybe_ran = c.maybe_ran, .timed_out = c.timed_out, .answer = answer, .is_error = is_error });
             },
             .input => |q| try lab.print("event", .{ .tag = t, .requests = q.requests.len }),
             .progress => |p| try lab.print("event", .{ .tag = t, .progress = p.progress, .total = p.total, .message = p.message }),

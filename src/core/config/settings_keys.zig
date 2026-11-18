@@ -102,6 +102,10 @@ const status_line_child_descriptions = [_][]const u8{
     "Show the session title in the footer",
     "Show the workspace path and Git branch in the footer",
 };
+const experimental_children = [_][]const u8{"workspace_capture"};
+const experimental_child_descriptions = [_][]const u8{
+    "Record the repository's state at each turn's start and end in the session, for evals",
+};
 const retired_description = "No longer used; fx ignores it";
 
 pub const keys = [_]Key{
@@ -119,6 +123,7 @@ pub const keys = [_]Key{
     .{ .name = "effort", .where = .profile, .kind = .string_or_null, .description = "Reasoning effort: auto or a name the model supports; null means auto" },
     .{ .name = "enableAllProjectMcpServers", .where = .profile, .kind = .boolean, .workspace_only = true, .description = "Approve every server in this workspace's .mcp.json; manage it with fx mcp approve and reject" },
     .{ .name = "enabledMcpjsonServers", .where = .profile, .kind = .strings, .workspace_only = true, .description = "Project MCP servers approved in this workspace; manage them with fx mcp approve and reject" },
+    .{ .name = "experimental", .where = .profile, .kind = .switches, .children = &experimental_children, .child_descriptions = &experimental_child_descriptions, .description = "Unfinished features, off by default" },
     .{ .name = "fast_mode", .where = .profile, .kind = .boolean, .description = "Use faster inference when the model supports it" },
     .{ .name = "fast_mode_model_bound", .where = .profile, .kind = .boolean, .description = "Managed by fx alongside fast_mode" },
     .{ .name = "first_call_tool_choice", .where = .profile, .kind = .string, .values = &.{ "auto", "none" }, .description = "Tool choice for the first request of a turn" },

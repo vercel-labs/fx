@@ -304,9 +304,10 @@ pub const StreamState = struct {
     /// When the turn started; 0 hides the elapsed counter and activity blink.
     /// Monotonic for the whole turn: phase and tool boundaries never reset it.
     turn_started_ms: i64 = 0,
-    /// When fx started waiting on user input (approval or question); 0 means
-    /// not waiting. While set, the turn clock freezes at this instant;
-    /// on resume the wait is excluded by shifting turn_started_ms forward.
+    /// When the turn started waiting, on user input (approval or question)
+    /// or on a compaction; 0 means not waiting. While set, the turn clock
+    /// freezes at this instant; on resume the wait is excluded by shifting
+    /// turn_started_ms forward.
     waiting_since_ms: i64 = 0,
 };
 
@@ -2864,6 +2865,10 @@ pub const FinishedPrompt = struct {
     terminal_projection: FinishedPromptProjection = .history_default,
     terminal_outcome: ?TurnPresentationOutcome = null,
     snapshot_file_ownership: ?SnapshotFileOwnership = null,
+    /// The workspace capture token of this turn (D98), set by the app as
+    /// the turn's end capture is taken, so the commit writes only this
+    /// turn's captures however late it runs; 0 when it has none.
+    capture_turn: u64 = 0,
 };
 
 pub const PermissionMode = enum {
@@ -3261,6 +3266,7 @@ pub fn dupeFinishedPrompt(alloc: std.mem.Allocator, finished: FinishedPrompt) !F
         .terminal_projection = finished.terminal_projection,
         .terminal_outcome = finished.terminal_outcome,
         .snapshot_file_ownership = finished.snapshot_file_ownership,
+        .capture_turn = finished.capture_turn,
     };
 }
 

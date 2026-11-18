@@ -1228,6 +1228,9 @@ pub const ConversationTurnBuilder = struct {
     bridge_calls: std.ArrayList(types.BridgeCallRecord) = .empty,
     /// The turn's reasoning, one piece per turn, for Ctrl+O only.
     pending_reasoning: ?types.ReasoningRecord = null,
+    /// The call a `cancelled_command` item names: the turn's command that
+    /// was cancelled with no saved output (D100). Owned.
+    cancelled_command_call_id: ?[]u8 = null,
 
     pub fn init(alloc: Allocator) ConversationTurnBuilder {
         return .{ .alloc = alloc };
@@ -1261,6 +1264,7 @@ pub const ConversationTurnBuilder = struct {
         for (self.bridge_calls.items) |record| types.freeBridgeCallRecordStrings(self.alloc, record);
         self.bridge_calls.deinit(self.alloc);
         if (self.pending_reasoning) |record| types.freeReasoningRecord(self.alloc, record);
+        if (self.cancelled_command_call_id) |id| self.alloc.free(id);
         self.* = undefined;
     }
 
@@ -1276,6 +1280,23 @@ pub const ConversationTurnBuilder = struct {
             .duration_ms = value.duration_ms,
             .tokens = value.tokens,
         };
+    }
+
+    /// Notes that the turn's command `call_id` was cancelled with no saved
+    /// output, so its interruption keeps the command's row (D100). Like a
+    /// model call record, one before the turn's user message is left out.
+    pub fn noteCancelledCommand(self: *ConversationTurnBuilder, call_id: []const u8) !void {
+        if (self.user == null) return;
+        const owned = try self.alloc.dupe(u8, call_id);
+        if (self.cancelled_command_call_id) |previous| self.alloc.free(previous);
+        self.cancelled_command_call_id = owned;
+    }
+
+    /// Takes the noted cancelled command's call id; the caller owns it.
+    fn takeCancelledCommandNote(self: *ConversationTurnBuilder) ?[]u8 {
+        const noted = self.cancelled_command_call_id;
+        self.cancelled_command_call_id = null;
+        return noted;
     }
 
     /// Keeps a settled call's record with the turn. A record before the
@@ -1519,6 +1540,8 @@ pub const ConversationTurnBuilder = struct {
             text
         else
             try self.alloc.dupe(u8, "");
+        // Only an interrupted turn keeps a cancelled command's row.
+        if (self.takeCancelledCommandNote()) |id| self.alloc.free(id);
         const execution = try self.takeExecution(
             completed.files,
             completed.turn_summary,
@@ -1582,13 +1605,19 @@ pub const ConversationTurnBuilder = struct {
         else
             null;
         errdefer if (command_artifact) |handle| mem_utils.free(self.alloc, handle);
-        const cancelled_command = if (replay != null or command_artifact != null)
-            types.CancelledCommandPresentation{
+        const noted = self.takeCancelledCommandNote();
+        defer if (noted) |id| self.alloc.free(id);
+        const cancelled_command: ?types.CancelledCommandPresentation = if (replay != null or command_artifact != null)
+            .{
                 .output_replay = replay,
                 .command_artifact_handle = command_artifact,
             }
-        else
-            null;
+        else if (noted) |id| blk: {
+            // The command saved no output, so only its note says it ran.
+            if (tool_call) |call| if (std.mem.eql(u8, call.id, id)) break :blk .{};
+            debug_trace.logf("session", "cancelled command note unmatched call_id={s} dropped=cancelled_command_row", .{id});
+            break :blk null;
+        } else null;
         const execution = try self.takeExecution(
             value.files,
             value.turn_summary,
@@ -1690,6 +1719,58 @@ test "conversation replay keeps reasoning-only assistant units before the final 
     try std.testing.expectEqualStrings("answer", turn.assistant.assistant);
     try std.testing.expectEqual(@as(usize, 1), turn.assistant.execution.tool_steps.len);
     try std.testing.expectEqualStrings(replay.parts_json, turn.assistant.execution.tool_steps[0].provider_replay.?.parts_json);
+}
+
+test "a cancelled command note keeps the row only for the interrupted turn's own call (D100)" {
+    const alloc = std.testing.allocator;
+    var builder = ConversationTurnBuilder.init(alloc);
+    defer builder.deinit();
+    const call: session_event.ConversationToolCall = .{
+        .call_id = "call-silent",
+        .tool_name = "shell",
+        .arguments_json = "{\"command\":\"sleep 30\"}",
+    };
+    // A note before the turn's user message is left out.
+    try builder.noteCancelledCommand("call-silent");
+    try std.testing.expect(builder.cancelled_command_call_id == null);
+
+    // The note of the turn's own call gives a presentation with no output.
+    try builder.begin(.{ .text = "run it" });
+    try builder.appendToolCall(call);
+    try builder.noteCancelledCommand("call-silent");
+    const kept = try builder.finishInterrupted(.{ .reason = .cancelled });
+    defer types.freeHistoryTurn(alloc, kept);
+    const presentation = kept.interrupted.cancelled_command orelse return error.TestExpectedPresentation;
+    try std.testing.expect(presentation.output_replay == null);
+    try std.testing.expect(presentation.command_artifact_handle == null);
+
+    // A note of another call is dropped.
+    try builder.begin(.{ .text = "run it again" });
+    try builder.appendToolCall(call);
+    try builder.noteCancelledCommand("call-other");
+    const unmatched = try builder.finishInterrupted(.{ .reason = .cancelled });
+    defer types.freeHistoryTurn(alloc, unmatched);
+    try std.testing.expect(unmatched.interrupted.cancelled_command == null);
+
+    // A turn that finished keeps no note for the next one.
+    try builder.begin(.{ .text = "finish" });
+    try builder.noteCancelledCommand("call-silent");
+    try builder.appendAssistant(.{ .text = "done" });
+    const finished = try builder.finishAssistant(.{});
+    defer types.freeHistoryTurn(alloc, finished);
+    try std.testing.expect(builder.cancelled_command_call_id == null);
+    try builder.begin(.{ .text = "then stop" });
+    try builder.appendToolCall(call);
+    const plain = try builder.finishInterrupted(.{ .reason = .cancelled });
+    defer types.freeHistoryTurn(alloc, plain);
+    try std.testing.expect(plain.interrupted.cancelled_command == null);
+
+    // The saved output's own refs still rebuild it, with no note.
+    try builder.begin(.{ .text = "with output" });
+    try builder.appendToolCall(call);
+    const with_output = try builder.finishInterrupted(.{ .reason = .cancelled, .command_artifact_ref = "fx-command-out.log" });
+    defer types.freeHistoryTurn(alloc, with_output);
+    try std.testing.expectEqualStrings("fx-command-out.log", with_output.interrupted.cancelled_command.?.command_artifact_handle.?);
 }
 
 test "review rows attach once, only to a turn's edit with no full-diff source" {

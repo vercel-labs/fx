@@ -1285,6 +1285,70 @@ describe("effect-aware command permissions", () => {
   );
 
   test.skipIf(!tmuxAvailable())(
+    "TUI and the model see the last line of command output past the output limit",
+    async () => {
+      const root = createIsolatedRoot();
+      const stderrPath = join(root.root, "long-output-stderr.log");
+      writeFileSync(stderrPath, "");
+      const marker = "FINAL_STEP_FAILED_MARKER";
+      // About 100 KB of steps, past the 64 KiB a running command keeps, then
+      // the line that says which step stopped the build.
+      const script = join(root.workspace, "long-build.sh");
+      writeFileSync(
+        script,
+        "#!/bin/sh\ni=0\nwhile [ $i -lt 1000 ]; do\n" +
+          `  printf 'step %04d compiled module %s\\n' "$i" "${"x".repeat(72)}"\n` +
+          "  i=$((i+1))\ndone\n" +
+          `printf '${marker}\\n'\nexit 1\n`,
+      );
+      chmodSync(script, 0o755);
+      let shellResult = "";
+      const gateway = startFakeGateway([
+        toolCall("./long-build.sh", {}, "long_build"),
+        (body) => {
+          // A command that exits nonzero comes back as error text.
+          const request = JSON.parse(body) as {
+            prompt?: Array<{ content?: string | Array<Record<string, unknown>> }>;
+          };
+          const part = (request.prompt ?? [])
+            .flatMap((message) => Array.isArray(message.content) ? message.content : [])
+            .find((item) => item.type === "tool-result" && item.toolCallId === "long_build");
+          const output = part?.output as { type?: string; value?: unknown } | undefined;
+          expect(output?.type).toBe("error-text");
+          shellResult = String(output?.value ?? "");
+          return finalText("LONG_BUILD_REPORTED");
+        },
+      ]);
+
+      activeSession = await TmuxSession.create({
+        cmd: FX_BIN,
+        cwd: root.workspace,
+        env: gatewayEnv(root, gateway, { FX_PERMISSION_MODE: "auto" }),
+        stderrPath,
+        width: 120,
+        height: 36,
+      });
+      await activeSession.waitForComposer(TIMEOUT);
+      await activeSession.sendText("Run the long build.");
+      await activeSession.waitForText("LONG_BUILD_REPORTED", TIMEOUT);
+
+      const result = JSON.parse(shellResult) as {
+        exit_code?: number;
+        output_truncated?: boolean;
+        output_delta: string;
+      };
+      expect(result.exit_code).toBe(1);
+      expect(result.output_truncated).toBe(true);
+      expect(result.output_delta).toContain("step 0000 compiled module");
+      expect(result.output_delta.trimEnd().endsWith(marker)).toBe(true);
+      const scrollback = await activeSession.captureFullScrollback();
+      expect(scrollback).toMatch(new RegExp(`Exited 1 .* · ${marker}`));
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+    },
+    60_000,
+  );
+
+  test.skipIf(!tmuxAvailable())(
     "TUI reprojects completed command summaries after widening",
     async () => {
       const root = createIsolatedRoot();
@@ -2124,6 +2188,95 @@ describe("effect-aware command permissions", () => {
       const shell = report.one("shell");
       expect(shell).toMatchObject({ login_shell: configuredShell, start: "snapshot_replay", snapshot: { state: "ready" } });
       expect(shell.redefined).toContainEqual({ name: "ls", kind: "alias", alias_of: "fx-eza-fixture" });
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+
+      await activeSession.sendText("/quit");
+      expect(await activeSession.waitForSessionEnd()).toBe(true);
+      await activeSession.kill();
+      activeSession = null;
+    },
+    180_000,
+  );
+
+  test.skipIf(!tmuxAvailable())(
+    "TUI trace keeps no part of a secret that a cut splits",
+    async () => {
+      const root = createIsolatedRoot();
+      const stderrPath = join(root.root, "stderr.log");
+      writeFileSync(stderrPath, "");
+      installClipboardFixture(root, "#!/bin/sh\nexit 1\n");
+      // A fake token, and the only place the trace can hold six A's in a row.
+      const token = "ghp_" + "A".repeat(36);
+      // 250 tokens in a row, so every cut falls inside one. Each command is
+      // about 10 KB, past the failed ring's 8 KiB field and the window's
+      // 1200-byte argument cut, and each prints about 10 KB, past the
+      // 2000-byte result cut. The 20-byte shift moves the second call's cuts
+      // to a different place in the token's 41-byte period.
+      const words = Array(250).fill(token).join(" ");
+      const first = `echo ${words}; exit 1`;
+      const second = `echo ${"s".repeat(20)} ${words}; exit 1`;
+      const rootPrompt = "Run the secret cut fixture.";
+      const gateway = startDynamicFakeGateway(async (body) => {
+        if (!body.includes(rootPrompt)) return finalText("unexpected request");
+        if (!body.includes('"toolCallId":"trace_cut_first"')) {
+          return toolCall(first, {}, "trace_cut_first");
+        }
+        if (!body.includes('"toolCallId":"trace_cut_second"')) {
+          return toolCall(second, {}, "trace_cut_second");
+        }
+        return finalText("cuts done");
+      });
+
+      activeSession = await TmuxSession.create({
+        cmd: FX_BIN,
+        cwd: root.workspace,
+        env: gatewayEnv(root, gateway, {
+          PATH: hostilePath(root),
+          TMPDIR: root.root,
+          FX_PERMISSION_MODE: "yolo",
+          FX_TRACE: "0",
+          FX_TRACE_LOG: undefined,
+          FX_TRACE_STDERR: "0",
+        }),
+        stderrPath,
+        width: 120,
+        height: 40,
+      });
+      await activeSession.waitForComposer(TIMEOUT);
+      await activeSession.sendText(rootPrompt);
+      await activeSession.waitForText("cuts done", 120_000);
+
+      await activeSession.sendText("/trace");
+      await activeSession.waitForText(
+        process.platform === "darwin" ? "Clipboard copy failed" : "Trace saved at",
+        TIMEOUT,
+      );
+      const records = readFileSync(latestTraceReportPath(root.root), "utf8")
+        .split("\n")
+        .filter(Boolean)
+        .map((line) => JSON.parse(line) as { type: string; [field: string]: unknown });
+
+      // Screen rows wrap at the terminal's width, and each row is masked on
+      // its own, so a token that wraps across two rows is not covered here.
+      for (const record of records) {
+        if (record.type === "renderer_state") continue;
+        expect(JSON.stringify(record)).not.toContain("AAAAAA");
+      }
+
+      // Both cuts happened, and the whole tokens they left are masked.
+      const failed = records.filter((record) => record.type === "failed_tool_call");
+      expect(failed.map((record) => record.call_id)).toEqual(["trace_cut_first", "trace_cut_second"]);
+      for (const record of failed) {
+        expect(record.args_omitted_bytes as number).toBeGreaterThan(0);
+        expect(record.result_omitted_bytes as number).toBeGreaterThan(0);
+        expect(JSON.stringify(record)).toContain("[redacted]");
+      }
+      const window = records.filter((record) => record.type === "tool_call");
+      for (const id of ["trace_cut_first", "trace_cut_second"]) {
+        const call = window.find((record) => record.call_id === id);
+        if (call) expect(call.args_bytes as number).toBeGreaterThan(1200);
+      }
+
       expect(readFileSync(stderrPath, "utf8")).toBe("");
 
       await activeSession.sendText("/quit");

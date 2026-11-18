@@ -20,6 +20,10 @@
 #   read-after-stop      a stopped turn still reads messages                    CountedNeverRead
 #   drop-waiting-at-end  the stopped turn's end drops the waiting messages      NoSilentLoss
 #   queue-closing        a message to a closing subagent waits, and goes with it  NoSilentLoss
+#   unmark-early         a closed subagent whose work ended is unmarked until its
+#                        close is written, and takes a message that goes with it  ClosingHoldsNothing
+#   gap-blind            a stop or close after a work ended, before its slot goes
+#                        on, answers as for a running turn and acts on nothing   GapStopHonest
 #   start-next-turn      a message to a starting turn waits for the next one    JoinsStartingWork
 #   note-after-take      the idle note is decided after the next turn took the
 #                        waiting messages, so it says idle while a turn starts   IdleNoteHonest
@@ -104,6 +108,20 @@
 # tests/tla/drivers/subagent/main-mail.test.ts checks runs of the built fx
 # against it (MainMailTrace.tla) where turns commit as they finish, as in
 # fx ask and ACP.
+#
+# The WaitNudge configs:
+#
+# WaitNudge models main's wait against subagent works that end with nothing
+# to post (Runtime.waitForMail, workEnded, nudgeWaiter in tool_host.zig, and
+# WorkerRuntime.waitForPostOrNudge): wait always returns, so TLC never reaches
+# a blocked wait that nothing can wake (a deadlock). wait-nudge.cfg is the
+# design and must pass. wait-nudge-today.cfg is fx before it: the end nudged
+# before it cleared the busy flag, so a wait that began in between blocked for
+# good. wait-nudge-mutation-check-first.cfg plants one defect, a wait that
+# reads the busy flags before it registers. Both must reach a deadlock. No
+# trace driver runs fx along it: the inline tests in tool_host.zig and
+# "a wait that starts as a subagent's work ends with nothing to report still
+# returns" in tests/e2e/gateway-stream-lifecycle.test.ts hold fx in the gap.
 
 set -eu
 
@@ -135,6 +153,8 @@ StopMessage stop-message-mutation-join-user-ending NoSilentLoss
 StopMessage stop-message-mutation-read-after-stop CountedNeverRead
 StopMessage stop-message-mutation-drop-waiting-at-end NoSilentLoss
 StopMessage stop-message-mutation-queue-closing NoSilentLoss
+StopMessage stop-message-mutation-unmark-early ClosingHoldsNothing
+StopMessage stop-message-mutation-gap-blind GapStopHonest
 StopMessage stop-message-mutation-start-next-turn JoinsStartingWork
 StopMessage stop-message-before-idle IdleNoteHonest
 StopMessage stop-message-before-names NamesTheIdle
@@ -158,4 +178,7 @@ QuietRelay quiet-relay-mutation-relay-after-close NoRelayAfterClose
 QuietRelay quiet-relay-mutation-silent-drop EveryCrossingAccounted
 QuietRelay quiet-relay-mutation-no-cap MailboxBounded
 QuietRelay quiet-relay-mutation-check-first NoSleepOnMail
+WaitNudge wait-nudge -
+WaitNudge wait-nudge-today deadlock
+WaitNudge wait-nudge-mutation-check-first deadlock
 VERDICTS
