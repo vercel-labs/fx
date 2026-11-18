@@ -7943,6 +7943,11 @@ const AccountCell = struct {
         errdefer self.fixture.deinit();
         self.armHolds();
         errdefer clearAccountHooks();
+        // A message to a work that has not taken steering yet waits for its
+        // turn, 5 ms at a time, for up to 10 s (`message_waits_start`), which
+        // is about half a second a cell. The cells only need it to wait for
+        // the next turn, so they shorten the limit.
+        start_test_controls.test_wait_limit_ms = 2;
         self.runtime = if (hosted)
             try hostedMailboxRuntime(alloc, &self.fixture, &self.parent)
         else
@@ -8241,6 +8246,7 @@ const AccountCell = struct {
 };
 
 fn clearAccountHooks() void {
+    start_test_controls.test_wait_limit_ms = null;
     end_test_controls.test_hold_run = null;
     publish_test_controls.test_hold = null;
     start_test_controls.test_hold = null;
