@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { processAlive } from "./process-alive";
 import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -1437,7 +1438,7 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         process.kill(pid, "SIGKILL");
         const gone = Date.now() + 10_000;
         while (Date.now() < gone) {
-          try { process.kill(pid, 0); } catch { break; }
+          if (!processAlive(pid)) break;
           await Bun.sleep(25);
         }
         await session.kill();
@@ -1589,7 +1590,7 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
           process.kill(pid, "SIGKILL");
           const deadline = Date.now() + 10_000;
           while (Date.now() < deadline) {
-            try { process.kill(pid, 0); } catch { break; }
+            if (!processAlive(pid)) break;
             await Bun.sleep(25);
           }
           await session.kill();
