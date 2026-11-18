@@ -1022,8 +1022,8 @@ describe("MCP login", () => {
     const login = await runFx(["mcp", "login", "fixture"], { cwd: root.workspace, env, timeoutMs: 20_000 });
     expect(login.stderr).toBe("");
     expectExit0(login);
-    expect(login.stdout).toContain("Approve in your browser.");
-    expect(login.stdout).toContain("Signed in to fixture.");
+    expect(login.stdout).toContain("approve in your browser.");
+    expect(login.stdout).toContain("signed in to fixture.");
     const opened = new URL(readFileSync(root.openLog, "utf8").trim());
     expect(opened.pathname).toBe("/authorize");
     expect(new URL(opened.searchParams.get("redirect_uri")!).hostname).toBe("127.0.0.1");
@@ -1041,7 +1041,7 @@ describe("MCP login", () => {
     const logout = await runFx(["mcp", "logout", "fixture"], { cwd: root.workspace, env, timeoutMs: 20_000 });
     const logoutMs = Date.now() - logoutStart;
     expect(logout.code).toBe(0);
-    expect(logout.stdout).toBe("Signed out of fixture.\n");
+    expect(logout.stdout).toBe("signed out of fixture.\n");
     // The refresh token is revoked, and fx waits for the answer before it
     // exits: hanging up loses the revocation on a real network.
     expect(auth.revocations).toBe(1);
@@ -1061,7 +1061,7 @@ describe("MCP login", () => {
     expect(await statusOf(root)).toBe("signed_in");
 
     const logout = await runFx(["mcp", "logout", "fixture"], { cwd: root.workspace, env, timeoutMs: 20_000 });
-    expect(logout.stdout).toBe("Signed out of fixture here, but the login wasn't revoked at its server, so its tokens stay valid until they expire.\n");
+    expect(logout.stdout).toBe("signed out of fixture here, but the login wasn't revoked at its server, so its tokens stay valid until they expire.\n");
     expect(logout.stderr).toBe("");
     expect(logout.code).toBe(0);
     expect(auth.revocations).toBe(0);
@@ -1080,7 +1080,7 @@ describe("MCP login", () => {
       const root = createRoot(auth);
       seedV2Credential(root, auth);
       const logout = await runFx(["mcp", "logout", "fixture"], { cwd: root.workspace, env: v2Env(root), timeoutMs: 20_000 });
-      expect(logout.stdout).toBe("Signed out of fixture here, but its server didn't confirm the revocation, so its tokens may stay valid until they expire.\n");
+      expect(logout.stdout).toBe("signed out of fixture here, but its server didn't confirm the revocation, so its tokens may stay valid until they expire.\n");
       expect(logout.stderr).toBe("");
       expect(logout.code).toBe(0);
       expect(auth.revocations).toBe(1);
@@ -1098,7 +1098,7 @@ describe("MCP login", () => {
     closed.stop(true);
     seedV2Credential(root, auth, { revocation_endpoint: revokeUrl });
     const logout = await runFx(["mcp", "logout", "fixture"], { cwd: root.workspace, env: v2Env(root), timeoutMs: 20_000 });
-    expect(logout.stdout).toBe("Signed out of fixture here, but its server didn't confirm the revocation, so its tokens may stay valid until they expire.\n");
+    expect(logout.stdout).toBe("signed out of fixture here, but its server didn't confirm the revocation, so its tokens may stay valid until they expire.\n");
     expect(logout.stderr).toBe("");
     expect(logout.code).toBe(0);
     expect(auth.revocations).toBe(0);
@@ -1112,7 +1112,7 @@ describe("MCP login", () => {
     const login = await runFx(["mcp", "login", "fixture"], { cwd: root.workspace, env: v2Env(root), timeoutMs: 20_000 });
     expect(login.code).toBe(1);
     // The token endpoint's own error, not the stage's name.
-    expect(login.stderr).toBe("Couldn't sign in to fixture: it didn't accept the sign-in (invalid_grant).\n");
+    expect(login.stderr).toBe("couldn't sign in to fixture: it didn't accept the sign-in (invalid_grant).\n");
     // The one exchange, refused.
     expect(auth.tokenExchanges).toBe(1);
     expect(await statusOf(root)).not.toBe("signed_in");
@@ -1138,13 +1138,13 @@ describe("MCP login", () => {
     auth.validTokens.clear();
     const root = createRoot(auth);
     const login = await runFx(["mcp", "login", "fixture"], { cwd: root.workspace, env: v2Env(root), timeoutMs: 30_000 });
-    expect(login.stdout).not.toContain("Signed in");
-    expect(login.stderr).toBe(`Couldn't sign in to fixture: ${REFUSED_NEW}.\n`);
+    expect(login.stdout).not.toContain("signed in");
+    expect(login.stderr).toBe(`couldn't sign in to fixture: ${REFUSED_NEW}.\n`);
     expect(login.code).toBe(1);
     expect(auth.tokenExchanges).toBe(1);
     // Forgetting the refused token is not a logout: nothing is revoked, and nothing says "Signed out".
     expect(auth.revocations).toBe(0);
-    expect(login.stdout + login.stderr).not.toContain("Signed out");
+    expect(login.stdout + login.stderr).not.toContain("signed out");
     // The server was asked once with the new token, and the refused token was never saved.
     expect(auth.requests.filter((r) => r.authorization === `Bearer ${ACCESS_INITIAL}`).length).toBeGreaterThan(0);
     expect(await statusOf(root)).toBe("not_started");
@@ -1170,7 +1170,7 @@ describe("MCP login", () => {
       // The store holds nothing: the refused token was never written.
       expect(existsSync(store)).toBe(false);
       expect(await statusOf(root)).toBe("not_started");
-      expect(login.stderr).toBe(`Couldn't sign in to fixture: ${REFUSED_NEW}.\n`);
+      expect(login.stderr).toBe(`couldn't sign in to fixture: ${REFUSED_NEW}.\n`);
       // The 401 did start a refresh, and it was the one that failed.
       expect(auth.refreshes).toBe(1);
       expect(auth.revocations).toBe(0);
@@ -1198,8 +1198,8 @@ describe("MCP login", () => {
     const seconds = (Date.now() - began) / 1000;
     writeFileSync(release, "go");
     expect(existsSync(started)).toBe(true);
-    expect(login.stdout).not.toContain("Signed in");
-    expect(login.stderr).toBe(`Couldn't sign in to fixture: ${REFUSED_NEW}.\n`);
+    expect(login.stdout).not.toContain("signed in");
+    expect(login.stderr).toBe(`couldn't sign in to fixture: ${REFUSED_NEW}.\n`);
     expect(login.code).toBe(1);
     // The wait ended it, not the engine: the request with the refreshed token was still held.
     expect(seconds).toBeGreaterThan(40);
@@ -1262,7 +1262,7 @@ describe("MCP login", () => {
     writeFileSync(storePath, JSON.stringify({ ...JSON.parse(readFileSync(storePath, "utf8")), version: 3 }));
     const before = readFileSync(storePath, "utf8");
     await tui.sendText(`/mcp add --no-login web ${auth.url}`);
-    await tui.waitForText("Added web to ~/.fx/mcp.json.", 10_000);
+    await tui.waitForText("added web to ~/.fx/mcp.json.", 10_000);
     await tui.sendText("/mcp show web");
     await tui.waitForText("couldn't be read: a newer fx saved it, or it's damaged", 10_000);
     // The server refuses the new login now.
@@ -1460,8 +1460,8 @@ describe("MCP login", () => {
     const refused = createRoot(auth);
     const login = await runFx(["mcp", "login", "fixture"], { cwd: refused.workspace, env: v2Env(refused), timeoutMs: 30_000 });
     expect(login.code).toBe(1);
-    expect(login.stderr).toBe(`Couldn't sign in to fixture: fixture refused the new login (invalid_token: "${FORGED}").\n`);
-    expect(login.stdout).not.toContain("Signed in");
+    expect(login.stderr).toBe(`couldn't sign in to fixture: fixture refused the new login (invalid_token: "${FORGED}").\n`);
+    expect(login.stdout).not.toContain("signed in");
 
     const root = await refusedSavedLogin({ error: "invalid_token", description: FORGED });
     gateway = searchNeedingLogin();
@@ -1708,7 +1708,7 @@ describe("MCP login", () => {
     expect(await child.exited).toBe(0);
     expect(await new Response(child.stderr).text()).toBe("");
     expect(stdout).toContain("paste the address");
-    expect(stdout).toContain("Signed in to fixture.");
+    expect(stdout).toContain("signed in to fixture.");
     expect(existsSync(root.openLog)).toBe(false);
     expect(auth.tokenExchanges).toBe(1);
   }, 40_000);
@@ -1748,7 +1748,7 @@ describe("MCP login", () => {
       }
       expect(await child.exited).toBe(0);
       expect(await new Response(child.stderr).text()).toBe("");
-      expect(stdout).toContain("Signed in to fixture.");
+      expect(stdout).toContain("signed in to fixture.");
       // Only the sign-in's own code was redeemed.
       expect(auth.tokenExchanges).toBe(1);
     } finally {
@@ -1803,7 +1803,7 @@ describe("MCP login", () => {
       expect(auth.authorizationRequests).toBe(0);
       expect(existsSync(root.openLog)).toBe(false);
       expect(result.code).not.toBe(0);
-      expect(result.stderr).toContain("Couldn't sign in to fixture: its sign-in server points at an internal address fx won't contact.");
+      expect(result.stderr).toContain("couldn't sign in to fixture: its sign-in server points at an internal address fx won't contact.");
     } finally {
       internal.stop();
     }
@@ -1841,7 +1841,7 @@ describe("MCP login", () => {
     }
     const login = await runFx(["mcp", "login", "fixture"], { cwd: root.workspace, env, timeoutMs: 20_000 });
     expectExit0(login);
-    expect(login.stdout).toContain("Signed in to fixture.");
+    expect(login.stdout).toContain("signed in to fixture.");
     const status = async (cwd: string) =>
       JSON.parse((await runFx(["mcp", "show", "fixture", "--json"], { cwd, env, timeoutMs: 20_000 })).stdout).status;
     expect(await status(root.workspace)).toBe("ready");
@@ -1895,7 +1895,7 @@ describe("MCP login", () => {
       if (done) break;
     }
     expect(await child.exited).toBe(1);
-    expect(await new Response(child.stderr).text()).toBe("Couldn't sign in to fixture: the sign-in page returned an error (access_denied).\n");
+    expect(await new Response(child.stderr).text()).toBe("couldn't sign in to fixture: the sign-in page returned an error (access_denied).\n");
     expect(auth.tokenExchanges).toBe(0);
   }, 40_000);
 
@@ -1918,7 +1918,7 @@ describe("MCP login", () => {
     const message = await endOf(readLoginAddress(child, child.stdout.getReader(), root.trace));
     expect(message).toContain("fx mcp login printed no sign-in address");
     expect(message).toContain("it exited with code 1");
-    expect(message).toContain('stderr: "No MCP server named nosuchserver.');
+    expect(message).toContain('stderr: "no MCP server named nosuchserver.');
   }, 20_000);
 
   test("a login that is killed before it prints its address is reported with the signal and what both streams held", async () => {
@@ -1972,7 +1972,7 @@ describe("MCP login", () => {
     });
     await tui.waitForComposer(15_000);
     await tui.sendText("/mcp login fixture");
-    await tui.waitForText("Sign in to fixture in your browser.", 10_000);
+    await tui.waitForText("sign in to fixture in your browser.", 10_000);
     // The fake browser approves on its own; the shell says so without a keypress.
     await tui.waitForText("signed in to fixture.", 15_000);
     expect(auth.tokenExchanges).toBe(1);
@@ -1993,8 +1993,8 @@ describe("MCP login", () => {
     const added = await runFx(["mcp", "add", "web", auth.url], { cwd: root.workspace, env, timeoutMs: 30_000 });
     expect(added.stderr).toBe("");
     expectExit0(added);
-    expect(added.stdout).toStartWith("Added web to ~/.fx/mcp.json.\nweb needs a login.\nApprove in your browser.");
-    expect(added.stdout).toEndWith("Signed in to web.\n");
+    expect(added.stdout).toStartWith("added web to ~/.fx/mcp.json.\nweb needs a login.\napprove in your browser.");
+    expect(added.stdout).toEndWith("signed in to web.\n");
     expect(added.stdout).not.toContain(ACCESS_INITIAL);
     expect(new URL(readFileSync(root.openLog, "utf8").trim()).pathname).toBe("/authorize");
     expect(auth.registrations).toBe(1);
@@ -2002,11 +2002,11 @@ describe("MCP login", () => {
 
     const skipped = await runFx(["mcp", "add", "--no-login", "quiet", auth.url], { cwd: root.workspace, env, timeoutMs: 30_000 });
     expectExit0(skipped);
-    expect(skipped.stdout).toBe("Added quiet to ~/.fx/mcp.json.\n");
+    expect(skipped.stdout).toBe("added quiet to ~/.fx/mcp.json.\n");
     // Without a browser, taking the address pasted back is `fx mcp login`'s.
     const headless = await runFx(["mcp", "add", "later", auth.url], { cwd: root.workspace, env: { ...env, FX_NO_OPEN_BROWSER: "1" }, timeoutMs: 30_000 });
     expectExit0(headless);
-    expect(headless.stdout).toBe("Added later to ~/.fx/mcp.json.\nlater needs a login. Sign in with: fx mcp login later\n");
+    expect(headless.stdout).toBe("added later to ~/.fx/mcp.json.\nlater needs a login. sign in with: fx mcp login later\n");
     expect(auth.tokenExchanges).toBe(1);
   }, 90_000);
 
@@ -2022,13 +2022,13 @@ describe("MCP login", () => {
     });
     await tui.waitForComposer(15_000);
     await tui.sendText(`/mcp add web ${auth.url}`);
-    await tui.waitForText("Added web to ~/.fx/mcp.json.", 10_000);
+    await tui.waitForText("added web to ~/.fx/mcp.json.", 10_000);
     // The shell loads it, sees it needs a login, and signs in as a typed /mcp login would.
-    await tui.waitForText("Sign in to web in your browser.", 15_000);
-    await tui.waitForText("Signed in to web.", 15_000);
+    await tui.waitForText("sign in to web in your browser.", 15_000);
+    await tui.waitForText("signed in to web.", 15_000);
     expect(auth.tokenExchanges).toBe(1);
     await tui.sendText(`/mcp add --no-login quiet ${auth.url}`);
-    await tui.waitForText("Added quiet to ~/.fx/mcp.json.", 10_000);
+    await tui.waitForText("added quiet to ~/.fx/mcp.json.", 10_000);
     await tui.waitForText("quiet needs login · /mcp", 15_000);
     expect(auth.tokenExchanges).toBe(1);
   }, 60_000);
@@ -2052,10 +2052,10 @@ describe("MCP login", () => {
       const composer = lines.findLastIndex(isComposerLine);
       return composer < 0 ? lines : lines.slice(0, composer);
     };
-    await tui.waitForText("Sign in to fixture in your browser.", 10_000);
+    await tui.waitForText("sign in to fixture in your browser.", 10_000);
     // A few words stand for the address, which only their link carries.
     const shown = (await transcript()).join("\n");
-    expect(shown).toContain("Didn't open? Open the sign-in page.");
+    expect(shown).toContain("didn't open? open the sign-in page.");
     expect(shown).not.toContain("/authorize?");
     const written = Buffer.concat(stdoutFrames(tapePath).map((frame) => frame.payload)).toString("utf8");
     const link = /\x1b\]8;id=fx-mcp-sign-in;([^\x1b]+)\x1b\\/.exec(written);
@@ -2071,7 +2071,7 @@ describe("MCP login", () => {
     await tui.waitForText("signed in to fixture.", 15_000);
     expect(auth.tokenExchanges).toBe(1);
     // In the transcript, not only on the status line.
-    expect((await transcript()).join("\n")).toContain("Signed in to fixture.");
+    expect((await transcript()).join("\n")).toContain("signed in to fixture.");
   }, 60_000);
 
   test.skipIf(!tmuxAvailable())("the /mcp menu's Log in signs in, and the server's tools follow", async () => {
@@ -2100,7 +2100,7 @@ describe("MCP login", () => {
     // Opening it shows the login as the next step.
     await tui.sendKeys("Enter");
     await tui.waitForText("its tools show here once you log in.", 15_000);
-    await tui.waitForText("  Log in        /mcp login fixture", 5_000);
+    await tui.waitForText("  log in        /mcp login fixture", 5_000);
 
     // /trace reports the MCP servers, and the one that waits for a login.
     await tui.sendKeys("C-c");
@@ -2113,11 +2113,11 @@ describe("MCP login", () => {
     await tui.sendText("/mcp");
     await tui.waitForPane((pane) => catalogMenuItemCount(pane.split("\n"), "MCP servers") === 1, 10_000);
     await tui.sendKeys("Enter");
-    await tui.waitForText("  Log in        /mcp login fixture", 15_000);
+    await tui.waitForText("  log in        /mcp login fixture", 15_000);
     await tui.sendKeys("Enter");
     // Signed in, the screen loads the tools it couldn't before.
     await tui.waitForText("Echo text through the modern HTTP fixture", 15_000);
-    await tui.waitForText("  Log out       /mcp logout fixture", 5_000);
+    await tui.waitForText("  log out       /mcp logout fixture", 5_000);
     // Up and signed in, the failure that asked for the login is gone.
     expect(await tui.capturePane()).not.toContain("it needs a login");
     expect(auth.tokenExchanges).toBe(1);
@@ -2151,11 +2151,11 @@ describe("MCP login", () => {
     await tui.sendText("/mcp");
     await tui.waitForPane((pane) => catalogMenuItemCount(pane.split("\n"), "MCP servers") === 1, 10_000);
     await tui.sendKeys("Enter");
-    await tui.waitForText("  Log in        /mcp login fixture", 15_000);
+    await tui.waitForText("  log in        /mcp login fixture", 15_000);
     // No browser opens, so the sign-in waits, and the screen says what for in
     // one line, like the transcript: its label links the address.
     await tui.sendKeys("Enter");
-    await tui.waitForText("waiting for the browser. Didn't open? Open the sign-in page.", 10_000);
+    await tui.waitForText("waiting for the browser. didn't open? open the sign-in page.", 10_000);
     const pane = await tui.capturePane();
     expect(pane).not.toContain("/authorize?");
     expect(pane).not.toContain("its tools show here once you log in.");
@@ -2180,20 +2180,20 @@ describe("MCP login", () => {
     await tui.sendText("/mcp");
     await tui.waitForPane((pane) => catalogMenuItemCount(pane.split("\n"), "MCP servers") === 1, 10_000);
     await tui.sendKeys("Enter");
-    await tui.waitForText("  Log in        /mcp login fixture", 15_000);
+    await tui.waitForText("  log in        /mcp login fixture", 15_000);
     await tui.sendKeys("Enter");
-    await tui.waitForText("Signing in…", 1_500);
+    await tui.waitForText("signing in…", 1_500);
     expect(await tui.capturePane()).not.toContain("waiting for the browser");
     // Pressed again while the sign-in server is slow, then once its address shows.
     await tui.sendKeys("Enter");
-    await tui.waitForText("waiting for the browser. Didn't open? Open the sign-in page.", 15_000);
+    await tui.waitForText("waiting for the browser. didn't open? open the sign-in page.", 15_000);
     await tui.sendKeys("Enter");
     await Bun.sleep(500);
 
     // The label is one link to the whole address, which the screen doesn't spell out.
     expect(await tui.capturePane()).not.toContain("/authorize?");
     const written = Buffer.concat(stdoutFrames(tapePath).map((frame) => frame.payload)).toString("utf8");
-    const link = /\x1b\]8;id=fx-mcp-sign-in;([^\x1b]+)\x1b\\Open the sign-in page/.exec(written);
+    const link = /\x1b\]8;id=fx-mcp-sign-in;([^\x1b]+)\x1b\\open the sign-in page/.exec(written);
     expect(link).not.toBeNull();
     const address = link![1];
     expect(address).toContain("/authorize?");
@@ -2203,7 +2203,7 @@ describe("MCP login", () => {
     const back = await fetch(redirect.headers.get("location")!, { signal: AbortSignal.timeout(10_000) });
     expect(back.status).toBe(200);
     // Signed in, the screen offers Log out.
-    await tui.waitForText("Log out       /mcp logout fixture", 15_000);
+    await tui.waitForText("log out       /mcp logout fixture", 15_000);
     expect(auth.tokenExchanges).toBe(1);
     expect(auth.requests.filter((r) => r.path === "/.well-known/oauth-authorization-server").length).toBe(1);
   }, 90_000);
@@ -2220,14 +2220,14 @@ describe("MCP login", () => {
     await tui.waitForComposer(15_000);
     // No browser opens, so the sign-in waits.
     await tui.sendText("/mcp login fixture");
-    await tui.waitForText("Sign in to fixture in your browser.", 10_000);
-    await tui.waitForText("Signing in to fixture", 10_000);
+    await tui.waitForText("sign in to fixture in your browser.", 10_000);
+    await tui.waitForText("signing in to fixture", 10_000);
 
     // Another server's change leaves this sign-in waiting for its browser.
     await tui.sendText("/mcp add web https://w.example/mcp");
-    await tui.waitForText("Added web to ~/.fx/mcp.json.", 10_000);
+    await tui.waitForText("added web to ~/.fx/mcp.json.", 10_000);
     await Bun.sleep(1_000);
-    expect(await tui.capturePane()).toContain("Signing in to fixture");
+    expect(await tui.capturePane()).toContain("signing in to fixture");
     expect(await tui.captureFullScrollback()).not.toContain("couldn't sign in to fixture");
 
     // Removing the server it signs in to ends it.
@@ -2235,8 +2235,8 @@ describe("MCP login", () => {
     await tui.waitForText("couldn't sign in to fixture: the MCP config changed before the browser came back.", 10_000);
     // The status line catches up within its 250 ms refresh.
     const clearBy = Date.now() + 2_000;
-    while ((await tui.capturePane()).includes("Signing in to fixture") && Date.now() < clearBy) await Bun.sleep(50);
-    expect(await tui.capturePane()).not.toContain("Signing in to fixture");
+    while ((await tui.capturePane()).includes("signing in to fixture") && Date.now() < clearBy) await Bun.sleep(50);
+    expect(await tui.capturePane()).not.toContain("signing in to fixture");
     expect(auth.tokenExchanges).toBe(0);
   }, 60_000);
 
@@ -2381,7 +2381,7 @@ describe("MCP login", () => {
     const login = await runFx(["mcp", "login", "fixture"], { cwd: root.workspace, env, timeoutMs: 20_000 });
     expect(login.stderr).toBe("");
     expectExit0(login);
-    expect(login.stdout).toContain("Signed in to fixture.");
+    expect(login.stdout).toContain("signed in to fixture.");
     // The browser goes to Slack's own page; nothing asks fx.sh.
     const opened = new URL(readFileSync(root.openLog, "utf8").trim());
     expect(opened.origin).toBe(standIn);
@@ -2424,7 +2424,7 @@ describe("MCP login", () => {
       writeFileSync(profilePath, JSON.stringify(profile));
       const login = await runFx(["mcp", "login", "fixture"], { cwd: root.workspace, env: v2Env(root), timeoutMs: 20_000 });
       expect(login.code).toBe(1);
-      expect(login.stderr).toBe(`Couldn't sign in to fixture: port ${taken.port} is in use, maybe by another app signing in. Try again once it's free.\n`);
+      expect(login.stderr).toBe(`couldn't sign in to fixture: port ${taken.port} is in use, maybe by another app signing in. try again once it's free.\n`);
       expect(existsSync(root.openLog)).toBe(false);
       expect(auth.tokenExchanges).toBe(0);
     } finally {
@@ -2460,7 +2460,7 @@ describe("MCP login", () => {
       expect(new URLSearchParams(token!.body).get("redirect_uri")).toBe(opened.searchParams.get("redirect_uri"));
       expect(login.stderr).toBe("");
       expectExit0(login);
-      expect(login.stdout).toContain("Signed in to fixture.");
+      expect(login.stdout).toContain("signed in to fixture.");
       expect(auth.tokenExchanges).toBe(1);
     } finally {
       bridge.stop(true);
@@ -2475,7 +2475,7 @@ describe("MCP login", () => {
     const login = await runFx(["mcp", "login", "fixture"], { cwd: root.workspace, env, timeoutMs: 20_000 });
     expect(login.signal).toBeNull();
     expect(login.code).toBe(1);
-    expect(login.stderr).toBe("Couldn't sign in to fixture: it didn't accept the sign-in (its token has characters OAuth doesn't allow).\n");
+    expect(login.stderr).toBe("couldn't sign in to fixture: it didn't accept the sign-in (its token has characters OAuth doesn't allow).\n");
     expect(auth.tokenExchanges).toBe(1);
     expect(await statusOf(root)).not.toBe("signed_in");
     const show = await runFx(["mcp", "show", "fixture", "--json"], { cwd: root.workspace, env, timeoutMs: 20_000 });
@@ -2514,14 +2514,14 @@ describe("MCP login", () => {
     const storePath = join(root.home, ".fx", "mcp-credentials", "credentials-v3.json");
     writeFileSync(storePath, JSON.stringify({ ...JSON.parse(readFileSync(storePath, "utf8")), version: 3 }));
     const before = readFileSync(storePath, "utf8");
-    const unreadable = "fx can't read the saved MCP sign-ins in ~/.fx/mcp-credentials/credentials-v3.json. A newer fx saved them, or they're damaged; fix or delete them, then try again.\n";
+    const unreadable = "fx can't read the saved MCP sign-ins in ~/.fx/mcp-credentials/credentials-v3.json. a newer fx saved them, or they're damaged; fix or delete them, then try again.\n";
 
     expect((await runFx(["mcp", "list", "--json"], { cwd: root.workspace, env })).code).toBe(0);
     const logout = await runFx(["mcp", "logout", "fixture"], { cwd: root.workspace, env, timeoutMs: 20_000 });
-    expect(logout.stderr).toBe(`Can't sign out of fixture: ${unreadable}`);
+    expect(logout.stderr).toBe(`can't sign out of fixture: ${unreadable}`);
     expect(logout.code).toBe(1);
     const login = await runFx(["mcp", "login", "--no-browser", "fixture"], { cwd: root.workspace, env, timeoutMs: 20_000 });
-    expect(login.stderr).toBe(`Can't sign in to fixture: ${unreadable}`);
+    expect(login.stderr).toBe(`can't sign in to fixture: ${unreadable}`);
     expect(login.code).toBe(1);
     expect(readFileSync(storePath, "utf8")).toBe(before);
     expect(auth.tokenExchanges).toBe(1);
@@ -2567,7 +2567,7 @@ describe("MCP login", () => {
     const storePath = join(root.home, ".fx", "mcp-credentials", "credentials-v3.json");
     writeFileSync(storePath, JSON.stringify({ ...JSON.parse(readFileSync(storePath, "utf8")), version: 3 }));
     await tui.sendText(`/mcp add --no-login web ${auth.url}`);
-    await tui.waitForText("Added web to ~/.fx/mcp.json.", 10_000);
+    await tui.waitForText("added web to ~/.fx/mcp.json.", 10_000);
     await tui.waitForText("web failed · /mcp", 15_000);
     expect(await tui.capturePane()).not.toContain("web needs login");
     expect(auth.authorizationRequests).toBe(0);
@@ -2591,7 +2591,7 @@ describe("MCP login", () => {
     await tui.sendText("/mcp show fixture");
     const pane = await tui.waitForText(/status +ready/, 15_000);
     // The shell took that login and never signed in itself.
-    expect(pane).toContain("Signed in to fixture.");
+    expect(pane).toContain("signed in to fixture.");
     expect(auth.tokenExchanges).toBe(1);
   }, 60_000);
 
@@ -2609,7 +2609,7 @@ describe("MCP login", () => {
     await tui.waitForComposer(5_000);
     await tui.sendText("/mcp show fixture");
     const pane = await tui.waitForText(/status +needs login[\s\S]*status +needs login/, 15_000);
-    expect(pane).not.toContain("Signed in to fixture.");
+    expect(pane).not.toContain("signed in to fixture.");
     expect(auth.tokenExchanges).toBe(0);
   }, 60_000);
 
@@ -2786,11 +2786,11 @@ describe("MCP login", () => {
     await tui.sendText("/mcp");
     await tui.waitForPane((pane) => catalogMenuItemCount(pane.split("\n"), "MCP servers") === 1, 10_000);
     await tui.sendKeys("Enter");
-    await tui.waitForText("  Log in        /mcp login fixture", 15_000);
+    await tui.waitForText("  log in        /mcp login fixture", 15_000);
     const screen = await tui.capturePane();
     expect(screen).toMatch(/ status +needs login/);
     expect(screen).not.toContain("signed in");
-    expect(screen).not.toContain("Log out");
+    expect(screen).not.toContain("log out");
   }, 90_000);
 
   // Every fx holding a login refreshes it from memory. Where a refresh
@@ -2979,7 +2979,7 @@ describe("MCP login", () => {
     writeFileSync(release, "go");
     const done = await login;
     holder.kill();
-    expect(done.stderr).toBe("Signed in to fixture, but couldn't save the login: ~/.fx/mcp-credentials/credentials-v3.json couldn't be written: another fx kept it busy. Sign in again once that's fixed.\n");
+    expect(done.stderr).toBe("signed in to fixture, but couldn't save the login: ~/.fx/mcp-credentials/credentials-v3.json couldn't be written: another fx kept it busy. sign in again once that's fixed.\n");
     expect(done.code).toBe(1);
     expect(auth.tokenExchanges).toBe(1);
     expect(existsSync(join(root.home, ".fx", "mcp-credentials", "credentials-v3.json"))).toBe(false);
@@ -2996,7 +2996,7 @@ describe("MCP login", () => {
     chmodSync(storePath, 0o400);
     const done = await runFx(["mcp", "logout", "fixture"], { cwd: root.workspace, env: v2Env(root), timeoutMs: 20_000 });
     expect(done.stdout).toBe("");
-    expect(done.stderr).toBe("Signed out of fixture here, but couldn't remove its saved login: ~/.fx/mcp-credentials/credentials-v3.json couldn't be written: fx isn't allowed to write it. Sign out again once that's fixed.\n");
+    expect(done.stderr).toBe("signed out of fixture here, but couldn't remove its saved login: ~/.fx/mcp-credentials/credentials-v3.json couldn't be written: fx isn't allowed to write it. sign out again once that's fixed.\n");
     expect(done.code).toBe(1);
     expect(readFileSync(storePath, "utf8")).toContain(ACCESS_INITIAL);
   }, 60_000);
@@ -3009,7 +3009,7 @@ describe("MCP login", () => {
     chmodSync(storePath, 0o400);
     const done = await runFx(["mcp", "remove", "fixture"], { cwd: root.workspace, env: v2Env(root), timeoutMs: 20_000 });
     expect(done.stdout).toBe("");
-    expect(done.stderr).toBe("Removed fixture from ~/.fx/mcp.json, but couldn't delete its saved login: ~/.fx/mcp-credentials/credentials-v3.json couldn't be written: fx isn't allowed to write it. Once that's fixed, add it back and run fx mcp logout fixture to delete it.\n");
+    expect(done.stderr).toBe("removed fixture from ~/.fx/mcp.json, but couldn't delete its saved login: ~/.fx/mcp-credentials/credentials-v3.json couldn't be written: fx isn't allowed to write it. once that's fixed, add it back and run fx mcp logout fixture to delete it.\n");
     expect(done.code).toBe(1);
     expect(readFileSync(join(root.home, ".fx", "mcp.json"), "utf8")).not.toContain("fixture");
     expect(readFileSync(storePath, "utf8")).toContain(ACCESS_INITIAL);
@@ -3029,7 +3029,7 @@ describe("MCP login", () => {
     chmodSync(storePath, 0o400);
     const done = await runFx(["mcp", "logout", "fixture"], { cwd: root.workspace, env: v2Env(root), timeoutMs: 20_000 });
     expect(done.stdout).toBe("");
-    expect(done.stderr).toBe("couldn't sign out of fixture: ~/.fx/mcp-credentials/credentials-v3.json couldn't be written: fx isn't allowed to write it. Try again once that's fixed.\n");
+    expect(done.stderr).toBe("couldn't sign out of fixture: ~/.fx/mcp-credentials/credentials-v3.json couldn't be written: fx isn't allowed to write it. try again once that's fixed.\n");
     expect(done.code).toBe(1);
     expect(readFileSync(storePath, "utf8")).toContain(ACCESS_INITIAL);
   }, 60_000);
@@ -3046,7 +3046,7 @@ describe("MCP login", () => {
     doc.servers[0].workspace = root.workspace;
     writeFileSync(storePath, JSON.stringify(doc));
     const done = await runFx(["mcp", "logout", "fixture"], { cwd: root.workspace, env: v2Env(root), timeoutMs: 20_000 });
-    expect(done.stdout).toBe("Signed out of fixture here, but the login wasn't revoked at its server, so its tokens stay valid until they expire.\n");
+    expect(done.stdout).toBe("signed out of fixture here, but the login wasn't revoked at its server, so its tokens stay valid until they expire.\n");
     expect(done.stderr).toBe("");
     expect(done.code).toBe(0);
     expect(auth.revocations).toBe(0);
@@ -3064,7 +3064,7 @@ describe("MCP login", () => {
     const done = await runFx(["mcp", "logout", "fixture"], { cwd: root.workspace, env: v2Env(root), timeoutMs: 20_000 });
     holder.kill();
     expect(done.stdout).toBe("");
-    expect(done.stderr).toBe("couldn't sign out of fixture: ~/.fx/mcp-credentials/credentials-v3.json couldn't be written: another fx kept it busy. Try again once that's fixed.\n");
+    expect(done.stderr).toBe("couldn't sign out of fixture: ~/.fx/mcp-credentials/credentials-v3.json couldn't be written: another fx kept it busy. try again once that's fixed.\n");
     expect(done.code).toBe(1);
     expect(readFileSync(storePath, "utf8")).toContain(ACCESS_INITIAL);
   }, 60_000);
@@ -3101,7 +3101,7 @@ describe("MCP login", () => {
     try {
       await tui.waitForComposer(5_000);
       await tui.sendText("Call it again.");
-      await tui.waitForText("Couldn't save fixture's new login", 20_000);
+      await tui.waitForText("couldn't save fixture's new login", 20_000);
       await tui.waitForText("Second call done.", 20_000);
     } finally {
       holder.kill();
@@ -3321,7 +3321,7 @@ describe("MCP login", () => {
     const env = v2Env(root);
     const unknown = await runFx(["mcp", "login", "nope"], { cwd: root.workspace, env });
     expect(unknown.code).toBe(1);
-    expect(unknown.stderr).toBe("No MCP server named nope. fx mcp list shows them.\n");
+    expect(unknown.stderr).toBe("no MCP server named nope. fx mcp list shows them.\n");
     moveAuthFixtureToWorkspace(root);
     const waiting = await runFx(["mcp", "login", "fixture"], { cwd: root.workspace, env });
     expect(waiting.code).toBe(1);
@@ -3399,7 +3399,7 @@ describe("MCP login", () => {
     expectExit0(await runFx(["mcp", "login", "fixture"], { cwd: root.workspace, env: v2Env(root), timeoutMs: 20_000 }));
     expect(auth.revocations).toBe(0);
     await tui.sendText("/mcp logout fixture");
-    await tui.waitForText("Signed out of fixture.", 15_000);
+    await tui.waitForText("signed out of fixture.", 15_000);
     const revoked = auth.requests.filter((request) => request.path === "/revoke").map((request) => new URLSearchParams(request.body).get("token"));
     expect(revoked).toEqual([REFRESH_INITIAL]);
     expect(readFileSync(join(root.home, ".fx", "mcp-credentials", "credentials-v3.json"), "utf8")).not.toContain("\"name\":\"fixture\"");
@@ -3508,7 +3508,7 @@ describe("MCP login", () => {
       const env = v2Env(root);
       const login = await runFx(["mcp", "login", "fixture"], { cwd: root.workspace, env, timeoutMs: 20_000 });
       expectExit0(login);
-      expect(login.stdout).toContain("Signed in to fixture.");
+      expect(login.stdout).toContain("signed in to fixture.");
       const show = await runFx(["mcp", "show", "fixture", "--json"], { cwd: root.workspace, env, timeoutMs: 20_000 });
       expectExit0(show);
       expect(show.stderr).toBe("");
@@ -3612,7 +3612,7 @@ describe("MCP login", () => {
       expect((await fetch(callback!)).status).toBe(200);
       const done = await login;
       expect({ attempt, code: done.code, stderr: done.stderr }).toEqual({ attempt, code: 0, stderr: "" });
-      expect(done.stdout).toContain("Signed in to fixture.");
+      expect(done.stdout).toContain("signed in to fixture.");
       const logout = await runFx(["mcp", "logout", "fixture"], { cwd: root.workspace, env, timeoutMs: 20_000 });
       expect({ attempt, code: logout.code, stderr: logout.stderr }).toEqual({ attempt, code: 0, stderr: "" });
     }
