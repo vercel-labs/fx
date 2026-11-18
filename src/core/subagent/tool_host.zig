@@ -1148,16 +1148,12 @@ pub const Runtime = struct {
     /// are dropped now, so none of them starts after it: those waiting here,
     /// and `from_queue` the subagent's own queue already dropped. The parent
     /// learns of the drop from the stopped work's report, or else a notice.
-    /// After the turn's end is recorded it also drops and counts the messages
-    /// the slot kept (`Owner.takeKept`). It counts nothing of the work the
-    /// host chose for the slot: it ends no work and cancels none
-    /// (`Owner.noteUserStop`), so that work runs.
     pub fn userStopped(self: *Runtime, child_id: []const u8, from_queue: usize) void {
+        self.managed.noteUserStop(child_id);
         self.admission_mutex.lockUncancelable(io_mod.getIo());
         defer self.admission_mutex.unlock(io_mod.getIo());
-        self.managed.noteUserStop(child_id);
         if (self.findTurnWorkLocked(child_id)) |index| self.turn_works.items[index].stopped_by = .user;
-        const dropped = self.dropPendingLocked(child_id, "stopped_by_user") + from_queue + self.managed.takeKept(child_id);
+        const dropped = self.dropPendingLocked(child_id, "stopped_by_user") + from_queue;
         debug_trace.eventf("mailbox", "stop", .{}, "target={s} by=user running={} dropped={d}", .{ child_id, self.isBusyLocked(child_id), dropped });
         self.noteUserDropLocked(child_id, dropped, false);
     }
@@ -2083,6 +2079,12 @@ pub const Runtime = struct {
             for (self.start_waits.items) |wait| {
                 if (std.mem.eql(u8, wait.child_id, child_id)) wait.closed = true;
             }
+            // A user's close tells the parent what it dropped, as a stop does,
+            // and keeps the name for main's status and its next message to it.
+            if (by == .user) {
+                self.noteUserDropLocked(child_id, dropped, true);
+                if (name) |value| self.noteUserClosedLocked(value);
+            }
             // The parent's close drops the closed turn's unread messages
             // and counts them, as its stop does.
             var unread: usize = 0;
@@ -2091,19 +2093,11 @@ pub const Runtime = struct {
                     unread = count;
                     break :ended true;
                 } else false,
-                .user => if (self.managed.closeByUser(child_id)) |count| ended: {
-                    unread = count;
-                    break :ended true;
-                } else false,
+                .user => self.managed.closeByUser(child_id),
             } or self.stopTurnWorkLocked(child_id);
             // So do the messages its slot keeps or carries into the next work.
-            unread += self.managed.takeDropped(child_id);
-            // A user's close tells the parent what it dropped, as a stop does,
-            // and keeps the name for main's status and its next message to it.
-            if (by == .user) {
-                self.noteUserDropLocked(child_id, dropped + unread, true);
-                if (name) |value| self.noteUserClosedLocked(value);
-            }
+            // The user's close counts none of them.
+            if (by == .parent) unread += self.managed.takeDropped(child_id);
             self.closing.appendAssumeCapacity(.{ .id = owned });
             self.closed_unseen.appendAssumeCapacity(unseen);
             self.closed_waiting.store(true, .release);
@@ -7106,30 +7100,7 @@ test "the parent's close that lands before the end hook runs counts the message 
     try std.testing.expect(registry.findById(child_id) == null);
 }
 
-test "the user's close of a working subagent counts the message its turn had not read" {
-    var t: StopFixture = undefined;
-    try t.init(.{ .hold = true, .steerable = true });
-    defer t.deinit();
-    const arena = t.arena();
-    const runtime = t.runtime;
-    const fixture = &t.fixture;
-
-    _ = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "first" } }, "call-1", null);
-    try waitForRuns(fixture, 1);
-    const joined = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "also this" } }, "call-2", null);
-    try std.testing.expect(std.mem.find(u8, joined, "Sent into the subagent's running turn") != null);
-    const child_id = try reviewerId(runtime, arena);
-    // The message is on the attached worker's queue, not yet read.
-    const closed = (try runtime.closeChild(child_id, .user)).?;
-    try waitForSlotEnd(runtime, child_id);
-    try std.testing.expect(closed.stopped);
-    try std.testing.expectEqual(@as(usize, 1), closed.dropped);
-    try std.testing.expectEqual(@as(usize, 1), fixture.runs.load(.seq_cst));
-    try std.testing.expectEqual(@as(usize, 1), fixture.reportCount());
-    try std.testing.expect(std.mem.endsWith(u8, fixture.reports.items[0], " dropped=1"));
-}
-
-test "the user's close that lands as the next work is installed drops it, and its report says so" {
+test "the user's close that lands as the next work is installed ends it, and its report says the user closed it" {
     PublishHold.arm();
     defer PublishHold.clear();
     var t: StopFixture = undefined;
@@ -7145,67 +7116,16 @@ test "the user's close that lands as the next work is installed drops it, and it
     const closed = (try runtime.closeChild(child_id, .user)).?;
     PublishHold.release();
     try waitForSlotEnd(runtime, child_id);
+    // The close ends the chosen work, so its message never runs. It counts
+    // nothing of it, as before: the work's own report says the user closed it.
     try std.testing.expectEqual(@as(usize, 1), fixture.begun.load(.seq_cst));
     try std.testing.expect(closed.stopped);
-    try std.testing.expectEqual(@as(usize, 1), closed.dropped);
-    // The first work's report, then the user's close of the next one, with
-    // what it dropped.
+    try std.testing.expectEqual(@as(usize, 0), closed.dropped);
     try std.testing.expectEqual(@as(usize, 2), fixture.reportCount());
     try std.testing.expect(std.mem.endsWith(u8, fixture.reports.items[0], "DONE first"));
     try std.testing.expect(std.mem.find(u8, fixture.reports.items[1], "The user closed it before it finished.") != null);
-    try std.testing.expect(std.mem.endsWith(u8, fixture.reports.items[1], " dropped=1"));
+    try std.testing.expect(std.mem.find(u8, fixture.reports.items[1], " dropped=") == null);
     try std.testing.expectEqual(child_state.EndFacts{ .cause = .user_close }, fixture.ends.items[1]);
-    try std.testing.expectEqual(@as(usize, 0), runtime.user_dropped.items.len);
-}
-
-test "the user's close that lands between a turn's end and the slot finishing its work counts the message the turn never took" {
-    HeldAfterRun.arm();
-    defer HeldAfterRun.clear();
-    var t: StopFixture = undefined;
-    try t.init(.{ .hold = true, .steerable = true });
-    defer t.deinit();
-    const arena = t.arena();
-    const runtime = t.runtime;
-    const fixture = &t.fixture;
-    defer HeldAfterRun.release();
-
-    try Leftovers.endFirstWorkUnread(runtime, fixture, arena);
-    try HeldAfterRun.waitHeld();
-    const child_id = try reviewerId(runtime, arena);
-    const closed = (try runtime.closeChild(child_id, .user)).?;
-    HeldAfterRun.release();
-    try waitForSlotEnd(runtime, child_id);
-    try std.testing.expectEqual(@as(usize, 1), closed.dropped);
-    try std.testing.expectEqual(@as(usize, 1), fixture.runs.load(.seq_cst));
-    // The work's own report carries the notice of what the close dropped.
-    try std.testing.expectEqual(@as(usize, 1), fixture.reportCount());
-    try std.testing.expect(std.mem.endsWith(u8, fixture.reports.items[0], " dropped=1"));
-    try std.testing.expectEqual(@as(usize, 0), runtime.user_dropped.items.len);
-}
-
-test "the user's stop that lands between a turn's end and the slot finishing its work counts the message the turn never took" {
-    HeldAfterRun.arm();
-    defer HeldAfterRun.clear();
-    var t: StopFixture = undefined;
-    try t.init(.{ .hold = true, .steerable = true });
-    defer t.deinit();
-    const arena = t.arena();
-    const runtime = t.runtime;
-    const fixture = &t.fixture;
-    defer HeldAfterRun.release();
-
-    try Leftovers.endFirstWorkUnread(runtime, fixture, arena);
-    try HeldAfterRun.waitHeld();
-    const child_id = try reviewerId(runtime, arena);
-    // The user's Esc on a turn main did not start, while main's slot is between
-    // two works: no turn of main's is running for the app to cancel.
-    runtime.userStopped(child_id, 0);
-    HeldAfterRun.release();
-    try waitForSlotEnd(runtime, child_id);
-    try std.testing.expectEqual(@as(usize, 1), fixture.runs.load(.seq_cst));
-    // The work's report carries the notice of the message the stop dropped.
-    try std.testing.expectEqual(@as(usize, 1), fixture.reportCount());
-    try std.testing.expect(std.mem.endsWith(u8, fixture.reports.items[0], " dropped=1"));
     try std.testing.expectEqual(@as(usize, 0), runtime.user_dropped.items.len);
 }
 
@@ -7271,7 +7191,7 @@ test "a stop that lands after the slot finished its work and before its end hook
     try std.testing.expect(std.mem.find(u8, again, "dropped") == null);
 }
 
-test "the user's stop that lands after the slot finished its work and before its end hook runs counts the message the turn never took" {
+test "the user's stop that lands after the slot finished its work and before its end hook runs leaves the message the turn never took to start the next work" {
     HeldRecorded.arm();
     defer HeldRecorded.clear();
     var t: StopFixture = undefined;
@@ -7285,14 +7205,16 @@ test "the user's stop that lands after the slot finished its work and before its
     try Leftovers.endFirstWorkUnread(runtime, fixture, arena);
     try HeldRecorded.waitHeld();
     const child_id = try reviewerId(runtime, arena);
+    // The user's stop ends no work and counts nothing of the kept message, as
+    // before: the hook queues it, and it starts the next work.
     runtime.userStopped(child_id, 0);
-    // A second stop of the same end counts nothing more.
     runtime.userStopped(child_id, 0);
     HeldRecorded.release();
+    try waitUntilQuiet(runtime);
     try waitForSlotEnd(runtime, child_id);
-    try std.testing.expectEqual(@as(usize, 1), fixture.runs.load(.seq_cst));
-    try std.testing.expectEqual(@as(usize, 1), fixture.reportCount());
-    try std.testing.expect(std.mem.endsWith(u8, fixture.reports.items[0], " dropped=1"));
+    try std.testing.expectEqual(@as(usize, 2), fixture.runs.load(.seq_cst));
+    try std.testing.expectEqual(@as(usize, 2), fixture.reportCount());
+    try std.testing.expect(std.mem.endsWith(u8, fixture.reports.items[1], " completed DONE also this"));
     try std.testing.expectEqual(@as(usize, 0), runtime.user_dropped.items.len);
 }
 
@@ -7319,24 +7241,6 @@ test "a message counted by the parent's stop is not counted again by the user's 
     fixture.release.set(io_mod.getIo());
     try waitForSlotEnd(runtime, child_id);
     try std.testing.expectEqual(@as(usize, 1), fixture.runs.load(.seq_cst));
-}
-
-test "the user's close of a turn that has a message unread counts it" {
-    var t: StopFixture = undefined;
-    try t.init(.{ .hold = true, .steerable = true });
-    defer t.deinit();
-    const arena = t.arena();
-    const runtime = t.runtime;
-    const fixture = &t.fixture;
-
-    _ = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "first" } }, "call-1", null);
-    try waitForRuns(fixture, 1);
-    _ = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "also this" } }, "call-2", null);
-    const child_id = try reviewerId(runtime, arena);
-    const closed = (try runtime.closeChild(child_id, .user)).?;
-    try waitForSlotEnd(runtime, child_id);
-    try std.testing.expect(closed.stopped);
-    try std.testing.expectEqual(@as(usize, 1), closed.dropped);
 }
 
 /// A hold after each of the first two works recorded its end, before the host's
@@ -7592,9 +7496,10 @@ fn expectCloseWhereWaitingMessageStarts(by: Runtime.CloseBy) !void {
     const closed = (try runtime.closeChild(child_id, by)).?;
     HeldStart.release();
     try waitUntilQuiet(runtime);
-    // The close ends that work, so the message it counted never runs.
+    // The close ends that work, so its message never runs. The parent's close
+    // counts it; the user's counts nothing, and the work's report says so.
     try std.testing.expect(closed.stopped);
-    try std.testing.expectEqual(@as(usize, 1), closed.dropped);
+    try std.testing.expectEqual(@as(usize, if (by == .parent) 1 else 0), closed.dropped);
     try std.testing.expectEqual(@as(usize, 1), fixture.begun.load(.seq_cst));
 }
 
@@ -7602,7 +7507,7 @@ test "the parent's close that lands as the waiting message starts drops it, and 
     try expectCloseWhereWaitingMessageStarts(.parent);
 }
 
-test "the user's close that lands as the waiting message starts drops it, and it never runs" {
+test "the user's close that lands as the waiting message starts ends it, and it never runs" {
     try expectCloseWhereWaitingMessageStarts(.user);
 }
 
@@ -8308,12 +8213,21 @@ fn accountAnswerDropped(answer: []const u8) usize {
     return std.fmt.parseInt(usize, answer[start..at], 10) catch 0;
 }
 
-/// Cells where a message is dropped by the user's close or stop and no count
-/// names it, as on `main` (W92 builds the count; this table is its failing list).
+/// Cells where the user's close or stop drops a message that no count names, as
+/// on `main` (a user's close of a turn with a message unread or kept, and the
+/// user's stop before the end is recorded with one kept): W92 builds the count
+/// and takes this list as its failing tests. Every other cell holds R2.
 fn accountAsOnMain(plan: Plan, scenario: Scenario) bool {
-    _ = plan;
-    _ = scenario;
-    return false;
+    // The parent's stop that follows counts what the user's left.
+    if (plan.second != null) return false;
+    return switch (plan.first) {
+        .user_close => switch (scenario) {
+            .running_unread, .returned_kept, .recorded_kept, .two_works_unread => true,
+            else => false,
+        },
+        .user_stop => scenario == .returned_kept,
+        else => false,
+    };
 }
 
 fn accountCellName(buf: []u8, scenario: Scenario, plan: Plan, as_on_main: bool) []const u8 {
