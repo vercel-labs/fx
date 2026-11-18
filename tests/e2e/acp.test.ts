@@ -4472,7 +4472,7 @@ describe("acp: model-independent", () => {
     finalText("MCP call finished"),
   ];
 
-  test("ACP ends an MCP call that its server never answers, or answers with a line fx cannot read, at the operation timeout, in the words fx ask gives", async () => {
+  test("ACP gives the model the same words as fx ask, to the byte, when an MCP server never answers a call, a tool list or initialize or sends a reply fx cannot read, and ends at the server's timeout", async () => {
     const scenarios = [
       { name: "a call the server never answers", mode: "stall_operation", words: "did not answer within its operation timeout" },
       { name: "a reply fx cannot read", mode: "unreadable_operation", words: "did not answer within its operation timeout" },
@@ -4501,7 +4501,8 @@ describe("acp: model-independent", () => {
           const prompt = await runPrompt(acp, "Call the fixture's echo tool.", TIMEOUT);
           return {
             stop: prompt.promptResult.result.stopReason,
-            text: acpToolResultText(gateway.requests[2]!.body, "call"),
+            // A turn that made fewer than three model requests ends with no words, which the checks below report.
+            text: gateway.requests.length >= 3 ? acpToolResultText(gateway.requests[2]!.body, "call") : "",
             seconds: (Date.now() - started) / 1000,
           };
         } finally {
