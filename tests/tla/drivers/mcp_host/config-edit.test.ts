@@ -250,7 +250,7 @@ test("fault: add and remove fail cleanly when the project folder is read-only, o
   chmodSync(s.f.workspace, 0o500);
   try {
     const add = await s.run(["mcp", "add", "--no-login", "--project", "web", OK_URL]);
-    expect(add.code).toBe(1);
+    expect(add.code, `${add.stdout}${add.stderr}`).toBe(1);
     expect(add.stderr).toStartWith("Couldn't add web to .mcp.json: ");
     const remove = await s.run(["mcp", "remove", "--project", "a"]);
     expect(remove.code).toBe(1);
