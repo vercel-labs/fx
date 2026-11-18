@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const testing_allocator = @import("../core/shared/testing_allocator.zig");
 const managed_execution = @import("../core/execution/managed_execution.zig");
 const acp_runner = @import("../core/cli/acp_runner.zig");
@@ -8,6 +9,7 @@ const host_target = @import("../core/hosts/target.zig");
 const jsonrpc = @import("jsonrpc.zig");
 const acp_types = @import("types.zig");
 const sessions = @import("sessions.zig");
+const leader_mod = @import("leader.zig");
 const prompt_handler = @import("prompt.zig");
 const prompt_test_controls = @import("prompt_test_controls.zig");
 const app_lifecycle = @import("../core/app/app_lifecycle.zig");
@@ -467,6 +469,9 @@ pub const ServerState = struct {
     /// Open for the whole connection on native hosts; the wasm host keeps
     /// its sessions in the JS host's snapshot store (D63).
     sessions_v2: ?session_adapter.Store = null,
+    /// The leader socket this process serves while it runs, on a native `fx acp`
+    /// (see `startLeader`). Null on every other path, and when it did not start.
+    leader: ?*leader_mod.Leader = null,
     capability_resolver: gateway_provider.CapabilityResolver = .{},
     /// Held around every use of `capability_resolver`, which the reader
     /// thread and the turns of every session share, and which must not be
@@ -505,6 +510,15 @@ pub const ServerState = struct {
         self.managed_executions.deinit();
         self.terminal_client.deinit();
         closeAllSessions(self);
+        // The leader stops here: after every session has closed, so each lock
+        // has lost its record first, and before the store is freed below,
+        // because the leader's session list reads the store's manager.
+        if (comptime leader_supported) {
+            if (self.leader) |leader| {
+                leader.stop(io_mod.getIo());
+                self.leader = null;
+            }
+        }
         // A host `session/load` replaced may still be stopping its servers;
         // they end before this process does.
         if (comptime !host_target.is_wasm) mcp_host.waitRetired();
@@ -1180,8 +1194,21 @@ pub fn disableSubagentHost(session: *ActiveSessionState) void {
     }
 }
 
+/// What one run does beyond its transport. Only `run`, the stdio entry, sets
+/// `lead`. `runWithTransport` (the SDK's in-process transport) never does.
+const RunOptions = struct {
+    /// Serve the leader socket and record it in each session lock, so another
+    /// process can find this one. Native hosts only (see `leader_supported`).
+    lead: bool = false,
+};
+
+/// Whether this build can serve a leader socket: native hosts with Unix
+/// sockets, the same macOS and Linux set as `host.zig`'s terminal support.
+/// WASM has no sockets, so its `run` caller gets no leader from this gate.
+const leader_supported = !host_target.is_wasm and (builtin.os.tag == .macos or builtin.os.tag == .linux);
+
 pub fn run(alloc: Allocator, cfg: Config) !void {
-    return runWithTransport(alloc, cfg, jsonrpc.Reader.init(), jsonrpc.Writer.init());
+    return runServer(alloc, cfg, jsonrpc.Reader.init(), jsonrpc.Writer.init(), .{ .lead = true });
 }
 
 pub fn runWithTransport(
@@ -1189,6 +1216,16 @@ pub fn runWithTransport(
     cfg: Config,
     reader_value: jsonrpc.Reader,
     writer_value: jsonrpc.Writer,
+) !void {
+    return runServer(alloc, cfg, reader_value, writer_value, .{});
+}
+
+fn runServer(
+    alloc: Allocator,
+    cfg: Config,
+    reader_value: jsonrpc.Reader,
+    writer_value: jsonrpc.Writer,
+    options: RunOptions,
 ) !void {
     if (cfg.log_file) |path| {
         try debug_trace.configure(.{ .file_path = path });
@@ -1217,6 +1254,10 @@ pub fn runWithTransport(
             debug_trace.logf("acp", "event=sessions_v2_store_unavailable err={s}", .{@errorName(err)});
             break :blk null;
         };
+    }
+
+    if (comptime leader_supported) {
+        if (options.lead) startLeader(&state);
     }
 
     var reader = reader_value;
@@ -1276,6 +1317,35 @@ pub fn runWithTransport(
         for (state.sessions.items) |session| handleCancel(&state, session, false);
     }
     endClientInput(&state);
+}
+
+/// Starts this process's leader socket and records it in every session lock
+/// this process holds. If the leader cannot start, or cannot record itself,
+/// fx acp runs without one, and the reason is traced.
+fn startLeader(state: *ServerState) void {
+    if (state.sessions_v2 == null) return;
+    const store = &state.sessions_v2.?;
+    const io = io_mod.getIo();
+    const leader = leader_mod.Leader.start(state.alloc, io, io_mod.getenv("TMPDIR"), agentCapabilities(state), .{
+        .context = store,
+        .copy_ids = copyLeadingIds,
+    }) catch |err| {
+        debug_trace.logf("acp", "event=leader_not_started err={s}", .{@errorName(err)});
+        return;
+    };
+    store.manager.setLeaderRecord(leader.record) catch |err| {
+        debug_trace.logf("acp", "event=leader_not_started err={s}", .{@errorName(err)});
+        leader.stop(io);
+        return;
+    };
+    state.leader = leader;
+}
+
+/// The leader's session list: the ids the store's manager leads, copied under
+/// the manager's own short lock. The caller frees each id and the slice.
+fn copyLeadingIds(context: ?*anyopaque, alloc: Allocator) error{OutOfMemory}![][]u8 {
+    const store: *session_adapter.Store = @ptrCast(@alignCast(context.?));
+    return store.manager.leadingIds(alloc);
 }
 
 fn shouldRespondToMessage(msg: *const jsonrpc.Message) bool {
@@ -3684,18 +3754,25 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
 
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
-    try acp_types.writeInitializeResponse(&out.writer, .{
+    try acp_types.writeInitializeResponse(&out.writer, agentCapabilities(state));
+    try state.writer.writeResponse(alloc, msg.id, out.writer.buffered());
+}
+
+/// The capabilities fx answers `initialize` with. The leader socket answers
+/// `initialize` with this same value, so the two always agree. It reads only
+/// `cfg`, never the client's request.
+fn agentCapabilities(state: *const ServerState) acp_types.AgentCapabilities {
+    return .{
         .image_prompts = !host_target.is_wasm,
         .mcp_servers = state.cfg.allow_acp_mcp,
-        .extensions = agent_extensions,
+        .extensions = agentExtensions(state.cfg.minimal_kernel),
         .session_delete = host_target.is_wasm,
         .system_prompt = !host_target.is_wasm and !state.cfg.minimal_kernel,
         // fx takes only what ACP v1 defines and fx's MCP engine speaks: stdio and
         // HTTP.
         .mcp_over_acp = false,
         .mcp_sse = false,
-    });
-    try state.writer.writeResponse(alloc, msg.id, out.writer.buffered());
+    };
 }
 
 /// The extensions fx lists at `initialize`. `fx acp` steers through

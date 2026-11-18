@@ -166,6 +166,10 @@ pub const Manager = struct {
     gpa: std.mem.Allocator,
     root_path: []u8,
     env: session_mod.Env,
+    /// The sessions this manager leads, listed while its env has a record.
+    leading: session_mod.Leading = .{},
+    /// The owned copy of the record `setLeaderRecord` stored in the env.
+    leader_record: ?[]u8 = null,
     root_mutex: std.Io.Mutex = .init,
     root_open: bool = false,
     index_lock: catalog_mod.IndexLock = .{},
@@ -192,6 +196,7 @@ pub const Manager = struct {
                 .diagnostics = options.diagnostics,
             },
         };
+        m.env.leading = &m.leading;
         return m;
     }
 
@@ -199,8 +204,28 @@ pub const Manager = struct {
     pub fn deinit(m: *Manager) void {
         m.index_lock.close(m.env.s);
         if (m.root_open) m.env.s.closeDir(m.env.root);
+        m.leading.deinit(m.gpa);
+        if (m.leader_record) |bytes| m.gpa.free(bytes);
         m.gpa.free(m.root_path);
         m.gpa.destroy(m);
+    }
+
+    /// Sets the leader record that each session this manager makes live writes
+    /// into its lock, so another process can find the holder. The bytes are
+    /// copied, and the copy lives until `deinit`. A session that became live
+    /// before this call gets no record. Call it before any session opens.
+    pub fn setLeaderRecord(m: *Manager, bytes: []const u8) error{OutOfMemory}!void {
+        std.debug.assert(bytes.len > 0);
+        const owned = try m.gpa.dupe(u8, bytes);
+        if (m.leader_record) |old| m.gpa.free(old);
+        m.leader_record = owned;
+        m.env.options.leader_record = owned;
+    }
+
+    /// The ids of the sessions this manager leads, copied under the lock. The
+    /// caller frees each id and the slice.
+    pub fn leadingIds(m: *Manager, alloc: std.mem.Allocator) error{OutOfMemory}![][]u8 {
+        return m.leading.copyIds(alloc, m.env.s.io);
     }
 
     /// Test and driver builds only: report internal steps to a tracer, and
@@ -1067,6 +1092,162 @@ const api_tests = struct {
         const verified = try m.verify(id);
         try testing.expectEqual(@as(?u64, null), verified.damaged_at);
         try testing.expectEqual(@as(u64, 0), verified.bad_snapshots);
+    }
+
+    const leader_record_a = "{\"socket\":\"/tmp/fx-leader/a/s\",\"pid\":1}\n";
+    const leader_record_b = "{\"socket\":\"/tmp/fx-leader/b/s\",\"pid\":2}\n";
+
+    /// The bytes in a session's lock file, read through the storage layer.
+    fn lockRecord(m: *api.Manager, id: []const u8, buf: []u8) ![]u8 {
+        const s = m.env.s;
+        const dir = try s.openDir(m.env.root, id);
+        defer s.closeDir(dir);
+        const file = try s.openFile(dir, "lock", .read_only);
+        defer s.closeFile(file);
+        const n = try s.readAt(file, buf, 0);
+        return buf[0..n];
+    }
+
+    fn freeLeadingIds(ids: [][]u8) void {
+        for (ids) |id| gpa.free(id);
+        gpa.free(ids);
+    }
+
+    test "a published session's lock holds its manager's leader record, and leadingIds lists it" {
+        var f: Fixture = undefined;
+        try f.init();
+        defer f.deinit();
+        const m = f.manager;
+        try m.setLeaderRecord(leader_record_a);
+        const s = try m.openNew(.{ .workspace = "/w", .host = .app });
+        _ = try s.append(&.{ .turn_started, piece });
+        const id = try gpa.dupe(u8, s.id());
+        defer gpa.free(id);
+
+        const ids = try m.leadingIds(gpa);
+        defer freeLeadingIds(ids);
+        try testing.expectEqual(@as(usize, 1), ids.len);
+        try testing.expectEqualStrings(id, ids[0]);
+        var buf: [256]u8 = undefined;
+        try testing.expectEqualStrings(leader_record_a, try lockRecord(m, id, &buf));
+        s.release();
+    }
+
+    test "a closed session's lock is empty, and leadingIds no longer lists it" {
+        var f: Fixture = undefined;
+        try f.init();
+        defer f.deinit();
+        const m = f.manager;
+        try m.setLeaderRecord(leader_record_a);
+        const s = try m.openNew(.{ .workspace = "/w", .host = .app });
+        _ = try s.append(&.{ .turn_started, piece });
+        const id = try gpa.dupe(u8, s.id());
+        defer gpa.free(id);
+        s.release();
+
+        var buf: [256]u8 = undefined;
+        try testing.expectEqualStrings("", try lockRecord(m, id, &buf));
+        const ids = try m.leadingIds(gpa);
+        defer freeLeadingIds(ids);
+        try testing.expectEqual(@as(usize, 0), ids.len);
+    }
+
+    test "a resumed session gets its manager's leader record, and a manager without one leaves its lock empty" {
+        var f: Fixture = undefined;
+        try f.init();
+        defer f.deinit();
+        const m = f.manager;
+        try m.setLeaderRecord(leader_record_a);
+        const s = try m.openNew(.{ .workspace = "/w", .host = .app });
+        _ = try s.append(&.{ .turn_started, piece });
+        const id = try gpa.dupe(u8, s.id());
+        defer gpa.free(id);
+        s.release();
+
+        var buf: [256]u8 = undefined;
+        const r = try m.openResume(.{ .target = .{ .id = id }, .workspace = "/w", .host = .ask });
+        try testing.expectEqualStrings(leader_record_a, try lockRecord(m, id, &buf));
+        r.release();
+        try testing.expectEqualStrings("", try lockRecord(m, id, &buf));
+
+        const plain = try api.Manager.init(gpa, io, .{ .root = f.root, .lock_wait_ms = 50 });
+        defer plain.deinit();
+        const p = try plain.openResume(.{ .target = .{ .id = id }, .workspace = "/w", .host = .ask });
+        try testing.expectEqualStrings("", try lockRecord(plain, id, &buf));
+        const none = try plain.leadingIds(gpa);
+        defer freeLeadingIds(none);
+        try testing.expectEqual(@as(usize, 0), none.len);
+        p.release();
+    }
+
+    const dead_holder_record = "{\"socket\":\"/tmp/fx-leader/dead-holder/s\",\"pid\":999999}\n";
+
+    /// Writes bytes into a session's lock file through the storage layer, as a
+    /// holder that died left them.
+    fn writeLock(m: *api.Manager, id: []const u8, bytes: []const u8) !void {
+        const s = m.env.s;
+        const dir = try s.openDir(m.env.root, id);
+        defer s.closeDir(dir);
+        const file = try s.openFile(dir, "lock", .read_write);
+        defer s.closeFile(file);
+        try s.writeAt(file, bytes, 0);
+        try s.setLength(file, @as(u64, bytes.len));
+    }
+
+    test "a lock a dead holder left a record in is emptied by a manager without one, and replaced by one with one" {
+        var f: Fixture = undefined;
+        try f.init();
+        defer f.deinit();
+        const m = f.manager;
+        const s = try m.openNew(.{ .workspace = "/w", .host = .app });
+        _ = try s.append(&.{ .turn_started, piece });
+        const id = try gpa.dupe(u8, s.id());
+        defer gpa.free(id);
+        s.release();
+
+        var buf: [256]u8 = undefined;
+        try writeLock(m, id, dead_holder_record);
+        const plain = try m.openResume(.{ .target = .{ .id = id }, .workspace = "/w", .host = .ask });
+        try testing.expectEqualStrings("", try lockRecord(m, id, &buf));
+        const unled = try m.leadingIds(gpa);
+        defer freeLeadingIds(unled);
+        try testing.expectEqual(@as(usize, 0), unled.len);
+        plain.release();
+
+        try writeLock(m, id, dead_holder_record);
+        try m.setLeaderRecord(leader_record_a);
+        const led = try m.openResume(.{ .target = .{ .id = id }, .workspace = "/w", .host = .ask });
+        try testing.expectEqualStrings(leader_record_a, try lockRecord(m, id, &buf));
+        const listed = try m.leadingIds(gpa);
+        defer freeLeadingIds(listed);
+        try testing.expectEqual(@as(usize, 1), listed.len);
+        led.release();
+        try testing.expectEqual(@as(usize, 0), f.recorder.count(.leader_record_not_cleared));
+        try testing.expectEqual(@as(usize, 0), f.recorder.count(.leader_record_not_written));
+    }
+
+    test "a second manager with another leader record cannot open a led session, and the first record stays" {
+        var f: Fixture = undefined;
+        try f.init();
+        defer f.deinit();
+        const m = f.manager;
+        try m.setLeaderRecord(leader_record_a);
+        const s = try m.openNew(.{ .workspace = "/w", .host = .app });
+        _ = try s.append(&.{ .turn_started, piece });
+        const id = try gpa.dupe(u8, s.id());
+        defer gpa.free(id);
+
+        const other = try api.Manager.init(gpa, io, .{ .root = f.root, .lock_wait_ms = 50 });
+        defer other.deinit();
+        try other.setLeaderRecord(leader_record_b);
+        try testing.expectError(error.Busy, other.openResume(.{ .target = .{ .id = id }, .workspace = "/w", .host = .ask }));
+
+        var buf: [256]u8 = undefined;
+        try testing.expectEqualStrings(leader_record_a, try lockRecord(m, id, &buf));
+        const none = try other.leadingIds(gpa);
+        defer freeLeadingIds(none);
+        try testing.expectEqual(@as(usize, 0), none.len);
+        s.release();
     }
 
     test "sessions tied on their update time resolve as the list sorts them (D11)" {

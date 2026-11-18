@@ -24,6 +24,14 @@ pub const Kind = enum {
     /// The folded state did not fit in one line, so no snapshot was written;
     /// resume folds from the previous one. `count`: the encoded state bytes.
     snapshot_skipped,
+    /// A session became live but its lock did not get the env's leader record,
+    /// so other processes can't find its holder; the session stays open and
+    /// unlisted.
+    leader_record_not_written,
+    /// A leader record could not be cleared from a session's lock, before the
+    /// lock was released or when the session became live; the record stays
+    /// until the next holder replaces it.
+    leader_record_not_cleared,
 };
 
 pub const Event = struct {

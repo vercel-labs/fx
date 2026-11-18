@@ -361,6 +361,13 @@ pub fn writeToolCallUpdateWithDiff(
     try w.writeAll("}");
 }
 
+/// The leader socket's answer, written as `_meta["sh.fx/leader"]`: this
+/// process's pid and the sessions it leads.
+pub const LeaderMeta = struct {
+    pid: i64,
+    sessions: []const []const u8,
+};
+
 pub const AgentCapabilities = struct {
     image_prompts: bool,
     /// Accepts client `mcpServers` on session setup.
@@ -375,6 +382,9 @@ pub const AgentCapabilities = struct {
     mcp_over_acp: bool = false,
     /// Speaks MCP's HTTP+SSE transport (2024-11-05), which fx's MCP engine doesn't.
     mcp_sse: bool = true,
+    /// Set only by the leader socket, so it can answer with its pid and the
+    /// sessions it leads. Stdio leaves it null, and its answer is unchanged.
+    leader: ?LeaderMeta = null,
 };
 
 pub fn writeInitializeResponse(w: *std.Io.Writer, capabilities: AgentCapabilities) !void {
@@ -397,7 +407,20 @@ pub fn writeInitializeResponse(w: *std.Io.Writer, capabilities: AgentCapabilitie
     try w.writeAll("},\"agentInfo\":{\"name\":\"fx\",\"title\":\"fx\",\"version\":");
     try writeJsonStr(build_options.app_version, w);
     try w.writeAll("},");
-    try w.writeAll("\"authMethods\":[]}");
+    try w.writeAll("\"authMethods\":[]");
+    if (capabilities.leader) |leader| try writeLeaderMeta(w, leader);
+    try w.writeByte('}');
+}
+
+/// Writes the leader socket's `_meta` at the result's top level, after
+/// `authMethods`, so a client finds it beside the capabilities it reads.
+fn writeLeaderMeta(w: *std.Io.Writer, leader: LeaderMeta) !void {
+    try w.print(",\"_meta\":{{\"sh.fx/leader\":{{\"pid\":{d},\"sessions\":[", .{leader.pid});
+    for (leader.sessions, 0..) |session_id, index| {
+        if (index > 0) try w.writeByte(',');
+        try writeJsonStr(session_id, w);
+    }
+    try w.writeAll("]}}");
 }
 
 /// Writes fx's extensions as `agentCapabilities._meta`, or nothing when fx
