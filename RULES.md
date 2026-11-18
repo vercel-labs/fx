@@ -16,6 +16,7 @@ Every change to fx keeps these rules. They win over `AGENTS.md`. Cite the IDs in
 - **R1.5** Retry, wait, and recovery decisions live in a pure module: no I/O, no clock, no allocation. It returns a plan, like `src/core/recovery/`.
 - **R1.6** One owner holds the alternate screen at a time, and it restores every terminal mode when it closes.
 - **R1.7** Modules talk to each other only through the owner's public API. A new module gets its own folder and a front door file with the same name.
+- **R1.8** Each piece of state has one owner. Each rule, list, or limit is defined in one place, and code reads it from there. Code that only looks alike may stay separate. Do not merge it across a module boundary.
 
 ## 2. Responsiveness
 
@@ -61,6 +62,7 @@ Every change to fx keeps these rules. They win over `AGENTS.md`. Cite the IDs in
 - **R6.1** One static binary with no third-party code dependencies. An exception needs approval first.
 - **R6.2** A change that grows the binary must buy a clear feature or fix. Stay inside the release ceilings in `AGENTS.md`.
 - **R6.3** Do the smallest change that solves the problem. No daemon, setting, layer, or helper for a need that does not exist yet. Name limits and durations as constants with their unit.
+- **R6.4** Code explains itself through names and types. A comment says only what the code cannot show: why a rule holds, who owns returned memory, why a `catch {}` is safe, or which test or model pins the behavior.
 
 ## 7. Tests
 
