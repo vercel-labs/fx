@@ -8,6 +8,7 @@ const text_utils = @import("../shared/text_utils.zig");
 const shared_theme = @import("../shared/theme.zig");
 const tool_args = @import("tool_args.zig");
 const tool_dispatch = @import("tool_dispatch.zig");
+const toolbox = @import("toolbox.zig");
 const terminal_contracts = @import("../terminal/contracts.zig");
 const terminal_client_runtime = @import("../terminal/client.zig");
 const terminal_ui_projection = @import("../terminal/ui_projection.zig");
@@ -1046,7 +1047,10 @@ pub fn bridgeCallRowSummary(alloc: Allocator, tool: []const u8, outcome: types.B
 
 /// The caller owns the returned allocation and must free it with `alloc`.
 pub fn formatPlainAction(alloc: Allocator, input: ToolActionInput) ![]const u8 {
-    const call = input.call;
+    var shown_state = std.heap.ArenaAllocator.init(alloc);
+    defer shown_state.deinit();
+    // A toolbox run of a built-in tool reads as a direct call of that tool.
+    const call = try toolbox.shownBuiltinRun(shown_state.allocator(), input.tool_registry, input.call) orelse input.call;
     if (input.tool_registry.lookup(call.name) != null) {
         if (try formatSubagentPlainAction(alloc, call, .active)) |line| return line;
     }
@@ -1694,6 +1698,24 @@ test "tool presentation preserves plain action fallbacks" {
 
     for (cases) |case| {
         const label = try formatPlainAction(alloc, .{ .tool_registry = test_tool_registry, .call = case.call });
+        defer alloc.free(label);
+        try std.testing.expectEqualStrings(case.expected, label);
+    }
+}
+
+test "a plain action of a toolbox run of a built-in tool reads as a direct call of it" {
+    const alloc = std.testing.allocator;
+    const registry = test_builtin_tools.registry;
+    const cases = [_]struct { arguments_json: []const u8, expected: []const u8 }{
+        .{ .arguments_json = "{\"run\":\"web_fetch\",\"arguments\":{\"url\":\"https://example.com/page\"}}", .expected = "Fetching https://example.com/page" },
+        .{ .arguments_json = "{\"run\":\"web_search\",\"arguments\":{\"query\":\"zig release notes\"}}", .expected = "Searching zig release notes" },
+        .{ .arguments_json = "{\"run\":\"read_file\",\"arguments\":{\"path\":\"notes.txt\"}}", .expected = "Reading notes.txt" },
+        // An MCP tool's run, and a name fx doesn't hold, keep toolbox's row.
+        .{ .arguments_json = "{\"run\":\"mcp_fixture_echo\",\"arguments\":{}}", .expected = "Running MCP mcp_fixture_echo" },
+        .{ .arguments_json = "{\"run\":\"no_such_tool\",\"arguments\":{}}", .expected = "Running no_such_tool" },
+    };
+    for (cases) |case| {
+        const label = try formatPlainAction(alloc, .{ .tool_registry = registry, .call = .{ .id = "run", .name = "toolbox", .arguments_json = case.arguments_json } });
         defer alloc.free(label);
         try std.testing.expectEqualStrings(case.expected, label);
     }

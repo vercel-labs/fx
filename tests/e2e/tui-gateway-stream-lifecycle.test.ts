@@ -2688,17 +2688,138 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
 
       await session!.sendText("Find the markdown files.");
       // The tool's whole name is in and the rest of the arguments are not,
-      // so the row names the tool instead of a bare "Using".
-      await waitForScrollback(
+      // so the row reads as a direct glob_files call does instead of a bare
+      // "Using".
+      const streaming = await waitForScrollback(
         session!,
-        (value) => value.includes("Running glob_files"),
-        "the toolbox row naming its tool while its arguments stream in",
+        (value) => /(^|\s)Matching\s*$/m.test(value),
+        "the toolbox row reading as its tool while its arguments stream in",
       );
+      expect(streaming).not.toContain("Running glob_files");
+      expect(streaming).not.toContain("Using");
       expect(queuedGateway.requests).toHaveLength(1);
 
       sendRest?.();
       await session!.waitForText(finalSentinel, TIMEOUT);
       expect(readFileSync(stderrPath, "utf8")).toBe("");
+    },
+    TIMEOUT * 2,
+  );
+
+  test(
+    "a toolbox run of a built-in tool reads as a direct call of it, live and after resume",
+    async () => {
+      const finalSentinel = "FX_TOOLBOX_RUN_VERBS_COMPLETE";
+      // web_fetch refuses this address, and web_search has no provider in
+      // this profile, so both runs fail; read_file completes.
+      const url = "http://127.0.0.1/page";
+      const query = "zig release notes";
+      const encoder = new TextEncoder();
+      let timer: ReturnType<typeof setInterval> | undefined;
+      let sendRest: (() => void) | undefined;
+      const { queuedGateway, stderrPath } = await launchRouteRecoveryTui(
+        "fx-tui-toolbox-run-verbs-",
+        [
+          () =>
+            new Response(
+              new ReadableStream<Uint8Array>({
+                start(controller) {
+                  const send = (event: object) =>
+                    controller.enqueue(encoder.encode(`data: ${JSON.stringify(event)}\n\n`));
+                  send({ type: "tool-input-start", id: "toolbox_fetch", toolName: "toolbox" });
+                  send({ type: "tool-input-delta", id: "toolbox_fetch", delta: '{"run":"web_fetch",' });
+                  timer = setInterval(() => controller.enqueue(encoder.encode(": hold-toolbox-arguments\n\n")), 50);
+                  sendRest = () => {
+                    clearInterval(timer);
+                    send({ type: "tool-input-delta", id: "toolbox_fetch", delta: `"arguments":{"url":"${url}"}}` });
+                    send({ type: "tool-input-end", id: "toolbox_fetch" });
+                    send({
+                      type: "tool-call",
+                      toolCallId: "toolbox_fetch",
+                      toolName: "toolbox",
+                      input: { run: "web_fetch", arguments: { url } },
+                    });
+                    send({ type: "finish", finishReason: { unified: "tool-calls", raw: "tool-calls" } });
+                    controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+                    controller.close();
+                  };
+                },
+                cancel() {
+                  clearInterval(timer);
+                },
+              }),
+              { headers: { "content-type": "text/event-stream" } },
+            ),
+          fakeGatewayToolCall("toolbox_search", "toolbox", { run: "web_search", arguments: { query } }),
+          fakeGatewayToolCall("toolbox_read", "toolbox", { run: "read_file", arguments: { path: "notes.txt" } }),
+          () => fakeGatewayFinalText(finalSentinel),
+        ],
+      );
+      writeFileSync(join(root!, "workspace", "notes.txt"), "toolbox run notes\n");
+
+      await session!.sendText("Fetch the page, search the web, and read the notes.");
+      // Only the run's tool is in, so the row reads as a direct web_fetch
+      // call does while its arguments stream in.
+      const streaming = await waitForScrollback(
+        session!,
+        (value) => /(^|\s)Fetching\s*$/m.test(value),
+        "the toolbox run's row reading as web_fetch while its arguments stream in",
+      );
+      expect(streaming).not.toContain("Running web_fetch");
+      expect(queuedGateway.requests).toHaveLength(1);
+
+      sendRest?.();
+      await session!.waitForText(finalSentinel, TIMEOUT);
+      await session!.waitForStableComposer(TIMEOUT);
+      // The group counts the runs as the reads they are.
+      const expectDirectRows = (scrollback: string) => {
+        expect(scrollback).toContain("● Read a file");
+        expect(scrollback).toContain(`Couldn't fetch ${url}`);
+        expect(scrollback).toContain(`Couldn't search ${query}`);
+        expect(scrollback).toContain("Read notes.txt");
+        expect(scrollback).toContain("Explored 1 file");
+        for (const toolboxWords of ["Couldn't use", "Couldn't run", "Running web", "Ran read_file", "Used toolbox", "Wrote a file", "file changed"]) {
+          expect(scrollback).not.toContain(toolboxWords);
+        }
+      };
+      expectDirectRows(await session!.captureFullScrollback());
+      expect(queuedGateway.requests).toHaveLength(4);
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+
+      await session!.sendText("/quit");
+      expect(await session!.waitForSessionEnd(TIMEOUT)).toBe(true);
+      session = null;
+      const resumedStderr = join(root!, "resumed-stderr.log");
+      session = await TmuxSession.create({
+        cmd: `${FX_BIN} --resume last`,
+        cwd: join(root!, "workspace"),
+        width: 72,
+        height: 24,
+        minimumHistoryLines: 200,
+        stderrPath: resumedStderr,
+        env: {
+          HOME: join(root!, "home"),
+          AI_GATEWAY_API_KEY: "fake-route-recovery-key",
+          VERCEL_OIDC_TOKEN: undefined,
+          FX_AUTO_UPGRADE: "0",
+          FX_PERMISSION_MODE: "auto",
+          FX_GATEWAY_BASE_URL: queuedGateway.baseUrl,
+          FX_GATEWAY_CHAT_URL: queuedGateway.chatUrl,
+          FX_TEST_GATEWAY_CHAT_URL: queuedGateway.chatUrl,
+          FX_TEST_GATEWAY_MODELS_URL: `${queuedGateway.baseUrl}/coding-agent/v1/models`,
+          FX_MODEL: MODEL,
+        },
+      });
+      await session.waitForComposer(TIMEOUT);
+      // The saved rows read as the live ones did.
+      const resumed = await waitForScrollback(
+        session,
+        (value) => value.includes(finalSentinel),
+        "the resumed session's saved rows",
+      );
+      expectDirectRows(resumed);
+      expect(queuedGateway.requests).toHaveLength(4);
+      expect(readFileSync(resumedStderr, "utf8")).toBe("");
     },
     TIMEOUT * 2,
   );
