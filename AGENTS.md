@@ -2,6 +2,10 @@
 
 Instructions for AI coding agents working with this codebase.
 
+## Rules
+
+Read `RULES.md` before any change, and cite its IDs. It wins over this file. Do not edit it unless @fazxes asks.
+
 ## Declaring Work Ready
 
 Do not say the work is "ready", "done", "good to go", "complete", or similar until you have personally run the binary and exercised the change on its happy path. A passing test suite is necessary, not sufficient — tests in this repo do not always construct the full runtime, attach a TTY, or spawn background threads, so they will not catch startup crashes, render regressions, or thread-lifetime bugs.
