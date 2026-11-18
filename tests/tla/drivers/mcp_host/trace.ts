@@ -56,6 +56,7 @@ const substitutions: Record<string, string[]> = {
   StoreLockBudget: ["Budget", "Slack", "Tolerance"],
   RefreshLease: ["RefreshMax", "Budget", "Slack", "Tolerance"],
   ErrorData: ["Cap", "MaxSize", "MaxChar", "Carry"],
+  ConfigEdit: ["Names", "Classes", "Checked", "KeyScan", "GuardRemove", "Atomic"],
   McpRules: ["Tools", "OwnRules"],
   WireDepth: ["Limit", "Capacity", "EngineLimit", "MaxDepth"],
 };

@@ -17,9 +17,9 @@ test("TLC: every model's smoke and stress pass, every planted bug is caught, sta
   expect(results.filter((r) => r.verdict === "FAIL").map((r) => r.label)).toEqual([]);
   const count = (kind: string, verdict: string) => results.filter((r) => r.kind === kind && r.verdict === verdict).length;
   // SharedLogins, SubagentAccess, UrlRetry, MixedBuilds, StoreLockBudget,
-  // RefreshLease, ErrorData and McpRules joined the four.
-  expect(count("smoke", "PASS")).toBe(12);
-  expect(count("stress", "PASS")).toBe(12);
+  // RefreshLease, ErrorData, ConfigEdit and McpRules joined the four.
+  expect(count("smoke", "PASS")).toBe(13);
+  expect(count("stress", "PASS")).toBe(13);
   expect(count("mutant", "CAUGHT")).toBe(results.filter((r) => r.kind === "mutant").length);
   // Credentials' two findings and its repair witness became the code.
   // HostLifecycle's OneProcessPerServer did too: it
@@ -39,7 +39,11 @@ test("TLC: every model's smoke and stress pass, every planted bug is caught, sta
   // saved, a refused login another fx takes), the branch for an unreadable
   // store answering a sign-in's check request first, and a failed refresh after a
   // 401 read as a check that couldn't be made; its repair witness is the code.
-  expect(count("finding", "FINDING")).toBe(11);
+  // ConfigEdit's four are the code before the reader check (a save the reader
+  // skips, a profile rewritten under a misspelled key) and the two designs fx
+  // does not use for the check: its bounded load scan gives up on a big file,
+  // and a dry run outside the lock does not see a change another fx makes.
+  expect(count("finding", "FINDING")).toBe(15);
   expect(count("repair", "PASS")).toBe(2);
 }, 1_800_000);
 
@@ -154,6 +158,22 @@ const controls: { name: string; module: string; constants: Record<string, never>
       { event: "run", data: { cmd: "signin" } }, { event: "observe", data: { v2kind: "v2", v2: true, v3: false } },
     ],
     badAt: 2,
+  },
+  {
+    name: "config edit", module: "ConfigEdit",
+    constants: { ObsNames: ["a"], ObsClasses: ["ok", "bad", "auth"], ObsChecked: true, ObsKeyScan: "complete", ObsGuardRemove: true, ObsAtomic: true },
+    good: [
+      { event: "init", data: { profile: { st: "ok", typo: false, both: false, big: false, ent: { a: "none" } }, project: { st: "absent", typo: false, both: false, big: false, ent: { a: "none" } } } },
+      { event: "add", data: { file: "profile", name: "a", class: "bad", outcome: "refused", same: true } },
+      { event: "add", data: { file: "profile", name: "a", class: "ok", outcome: "added", same: false } },
+      { event: "list", data: { file: "profile", loaded: ["a"] } },
+    ],
+    // An add of an entry the reader skips that says "Added": the model refuses it.
+    bad: [
+      { event: "init", data: { profile: { st: "ok", typo: false, both: false, big: false, ent: { a: "none" } }, project: { st: "absent", typo: false, both: false, big: false, ent: { a: "none" } } } },
+      { event: "add", data: { file: "profile", name: "a", class: "bad", outcome: "added", same: false } },
+    ],
+    badAt: 1,
   },
   {
     name: "MCP rules", module: "McpRules",

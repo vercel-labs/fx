@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { afterEach, describe, expect, test } from "bun:test";
+import { processAlive } from "./process-alive";
 import { createConfiguredProviderFixture, completion as configuredCompletion, toolCompletion as configuredToolCompletion } from "./fixtures/chat-completions";
 import { spawn as nodeSpawn, type ChildProcess } from "node:child_process";
 import {
@@ -31,6 +32,7 @@ import { expectPermissionModeContext } from "./permission-mode-context";
 import { paddedPng, pngPixelSize, solidPng } from "./fixtures/image-encoding";
 import { childLines, childWork, copyV1Fixture, logLines, savedSessionIds, savedText, sessionDir } from "./saved-sessions";
 import { bearer, rotateFxLogin, startFakeIssuer, storedFxLoginToken, unauthorized, writeFxLogin } from "./fx-login-fakes";
+import { ignoresFileModes } from "./file-modes";
 import {
   canonicalSubagentIdForStore,
   FAKE_GATEWAY_MODEL,
@@ -136,15 +138,6 @@ async function expectHttpCallCancelled(
     () => fixture.cancelledCalls === 1,
     5_000,
   );
-}
-
-function processAlive(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch {
-    return false;
-  }
 }
 
 async function expectMcpProcessExited(pidPath: string): Promise<void> {
@@ -10885,10 +10878,9 @@ describe("acp: model-independent", () => {
     TIMEOUT,
   );
 
-  test(
+  test.skipIf(ignoresFileModes())(
     "an attached folder whose rule file cannot be read is reported in the note, not in the instructions",
     async () => {
-      if (process.getuid?.() === 0) return; // A file mode does not stop root.
       const root = createIsolatedRoot("fx-acp-attached-unreadable-");
       const docs = join(root.workspace, "docs");
       mkdirSync(docs, { recursive: true });

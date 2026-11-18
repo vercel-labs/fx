@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
+import { processAlive as isProcessAlive } from "./process-alive";
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
@@ -1292,15 +1293,6 @@ function hasBareRunningRow(value: string): boolean {
 
 function readTrimmed(path: string): string {
   return readFileSync(path, "utf8").trim();
-}
-
-function isProcessAlive(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch {
-    return false;
-  }
 }
 
 async function waitForOnlyChildPid(
@@ -2641,6 +2633,91 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
     },
     TIMEOUT * 2,
   );
+
+  for (const scenario of [
+    {
+      name: "a streaming read shows its file as soon as the path arrives",
+      tool: "read_file",
+      held: '{"path":"a.md"',
+      rest: "}",
+      input: { path: "a.md" },
+      whileHeld: "● Reading a.md",
+      done: "● Read a.md",
+    },
+    {
+      name: "a streaming search shows no row until its pattern arrives",
+      tool: "grep_files",
+      held: '{"pat',
+      rest: 'tern":"alpha"}',
+      input: { pattern: "alpha" },
+      whileHeld: null,
+      done: "● Searched alpha",
+    },
+  ]) {
+    test(
+      scenario.name,
+      async () => {
+        const finalSentinel = "FX_NAMED_ROW_DONE";
+        const encoder = new TextEncoder();
+        let timer: ReturnType<typeof setInterval> | undefined;
+        let sendRest: (() => void) | undefined;
+        await launchRouteRecoveryTui("fx-named-row-", [
+          () =>
+            new Response(
+              new ReadableStream<Uint8Array>({
+                start(controller) {
+                  const send = (event: object) => controller.enqueue(encoder.encode(`data: ${JSON.stringify(event)}\n\n`));
+                  send({ type: "tool-input-start", id: "call_named", toolName: scenario.tool });
+                  send({ type: "tool-input-delta", id: "call_named", delta: scenario.held });
+                  // The stream holds here, as a slow model's would.
+                  timer = setInterval(() => controller.enqueue(encoder.encode(": hold\n\n")), 50);
+                  sendRest = () => {
+                    clearInterval(timer);
+                    send({ type: "tool-input-delta", id: "call_named", delta: scenario.rest });
+                    send({ type: "tool-input-end", id: "call_named" });
+                    send({ type: "tool-call", toolCallId: "call_named", toolName: scenario.tool, input: scenario.input });
+                    send({ type: "finish", finishReason: { unified: "tool-calls", raw: "tool-calls" } });
+                    controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+                    controller.close();
+                  };
+                },
+                cancel() {
+                  clearInterval(timer);
+                },
+              }),
+              { headers: { "content-type": "text/event-stream" } },
+            ),
+          () => fakeGatewayFinalText(finalSentinel),
+        ]);
+        writeFileSync(join(root!, "workspace", "a.md"), "alpha\n");
+        await session!.sendText("Do the step.");
+        const toolRows = (pane: string) =>
+          pane
+            .split("\n")
+            .map((line) => line.trim())
+            .filter((line) => /^(●|├|└) /.test(line));
+        // No frame shows a row that names nothing, such as a bare
+        // "● Searching".
+        const bare = /^(●|├|└) [A-Z][a-z]+$/;
+        const held: string[][] = [];
+        if (scenario.whileHeld) await session!.waitForText(scenario.whileHeld, TIMEOUT);
+        for (let frame = 0; frame < 20; frame += 1) {
+          held.push(toolRows(await session!.capturePane()));
+          await new Promise((resolve) => setTimeout(resolve, 50));
+        }
+        for (const rows of held) {
+          expect(rows.filter((row) => bare.test(row))).toEqual([]);
+          expect(rows).toEqual(scenario.whileHeld ? [scenario.whileHeld] : []);
+        }
+        sendRest?.();
+        await session!.waitForText(finalSentinel, TIMEOUT);
+        const after = toolRows(await session!.capturePane());
+        expect(after.filter((row) => bare.test(row))).toEqual([]);
+        expect(after.some((row) => row.startsWith(scenario.done))).toBe(true);
+      },
+      TIMEOUT * 2,
+    );
+  }
 
   test(
     "a streaming toolbox call's row names what it runs before its arguments end",
