@@ -36,6 +36,8 @@
 #   stale-unstarted      a chosen work fails before its turn begins and the
 #                        slot still counts its messages as unstarted, so a stop
 #                        or close after it counts them again                    UnstartedGone
+#   recount              a stop or close of a turn that is already ending counts
+#                        again the unread messages the stop before it counted   CountedOnce
 #   start-next-turn      a message to a starting turn waits for the next one    JoinsStartingWork
 #   note-after-take      the idle note is decided after the next turn took the
 #                        waiting messages, so it says idle while a turn starts   IdleNoteHonest
@@ -172,6 +174,7 @@ StopMessage stop-message-mutation-leftover-uncounted NoSilentLoss
 StopMessage stop-message-mutation-close-leaves-kept ClosingHoldsNoKept
 StopMessage stop-message-mutation-gap-uncounted NoSilentLoss
 StopMessage stop-message-mutation-stale-unstarted UnstartedGone
+StopMessage stop-message-mutation-recount CountedOnce
 StopMessage stop-message-mutation-start-next-turn JoinsStartingWork
 StopMessage stop-message-before-idle IdleNoteHonest
 StopMessage stop-message-before-names NamesTheIdle

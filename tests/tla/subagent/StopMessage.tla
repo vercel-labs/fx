@@ -82,6 +82,10 @@
 (* (`unstarted` is zeroed where the end is recorded), so a stop or close   *)
 (* after it counts none of them twice. "stale_unstarted" is the count that *)
 (* outlives that work.                                                     *)
+(* Main is told of each message once: a stop or close counts only what no  *)
+(* earlier stop, close or user's stop counted (`CountedOnce`), and         *)
+(* "recount" is a stop or close that counts again what the one before it   *)
+(* counted.                                                                *)
 (*                                                                          *)
 (* Bug plants one defect; check.sh names the rule that must catch each.    *)
 (* "today" is fx before this design: a message to a work its parent        *)
@@ -103,7 +107,7 @@ Bugs == {"none", "today", "refuse_ending", "no_order", "uncounted",
          "before_idle", "note_after_take", "names_busy", "gap_blind"}
 \* The defects of the kept and carried messages, beside `Bugs`.
 KeptBugs == {"leftover_gap", "leftover_uncounted", "close_leaves_kept",
-             "gap_uncounted", "stale_unstarted"}
+             "gap_uncounted", "stale_unstarted", "recount"}
 ASSUME Bug \in Bugs \cup KeptBugs
 
 \* What an end tells main: no report, a report that says its subagent is
@@ -346,7 +350,8 @@ DoStop(c) ==
                        THEN kept[s] ELSE {}
         heldCounted == IF Bug = "gap_uncounted" THEN {} ELSE held
         counted == waiting \cup heldCounted \cup keptCounted \cup
-            (IF phase[s] = "running" /\ Bug \notin {"today", "uncounted"}
+            (IF (phase[s] = "running" \/ (phase[s] \in Endings /\ Bug = "recount"))
+                /\ Bug \notin {"today", "uncounted"}
              THEN unread[s] ELSE {})
     IN
     \* The close already ended the turn and dropped what waited: fx answers
@@ -391,7 +396,8 @@ DoClose(c) ==
         keptCounted == IF Bug = "leftover_uncounted" THEN {} ELSE kept[s]
         heldCounted == IF Bug = "gap_uncounted" THEN {} ELSE startq[s]
         counted == Range(waitq[s]) \cup heldCounted \cup keptCounted \cup
-            (IF phase[s] = "running" THEN unread[s] ELSE {})
+            (IF phase[s] = "running" \/ (phase[s] \in Endings /\ Bug = "recount")
+             THEN unread[s] ELSE {})
     IN \/ /\ phase[s] = "absent"
           /\ last' = Event("close", s, NoMsg, "unavailable", 0)
           /\ UNCHANGED <<phase, waitq, unread, dropped, toldDropped>>
@@ -658,6 +664,15 @@ NoSilentLoss == dropped \subseteq toldDropped
 
 \* A count never includes a message the subagent read.
 CountedNeverRead == toldDropped \cap read = {}
+
+\* Main is told of a message once: the count a stop's or close's answer gives is
+\* the number of messages it newly adds to those main has been told of, so none
+\* is counted by two answers, or by a user's stop and an answer. A step rule,
+\* checked on every transition (`Owner.takeDropped` clears what it counts, and
+\* `Owner.stop` counts the unread messages of a turn only when it ends it).
+CountedOnce ==
+    [][last'.op \in {"stop", "close"} =>
+        last'.count = Cardinality(toldDropped' \ toldDropped)]_vars
 
 \* A message is refused only while its subagent is being closed.
 RefusedOnlyWhenClosing == refusedOpen = {}
