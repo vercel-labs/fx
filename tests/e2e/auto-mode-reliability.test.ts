@@ -2903,7 +2903,58 @@ describe("lean auto mode reliability", () => {
         action: command,
       });
       expect(held!.reason).toMatch(/^transport_[a-z_]+$/);
+      // A 400 is a permanent failure, so the one send is not retried.
+      expect(held!.attempts).toEqual([{ result: "permanent_failure", elapsed_ms: expect.any(Number) }]);
       expect(held!.risk).toBeUndefined();
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+
+      await activeSession.sendText("/quit");
+      expect(await activeSession.waitForSessionEnd()).toBe(true);
+      await activeSession.kill();
+      activeSession = null;
+    },
+    TIMEOUT * 2,
+  );
+
+  test.skipIf(!tmuxAvailable())(
+    "TUI trace lists each send when a failed review is retried",
+    async () => {
+      const root = createIsolatedRoot();
+      const stderrPath = join(root.root, "stderr.log");
+      writeFileSync(stderrPath, "");
+      const marker = join(root.workspace, "trace-review-retried-ran");
+      const command = `touch ${JSON.stringify(marker)}`;
+      const reviewerBusy = () => new Response(
+        JSON.stringify({ error: { message: "reviewer busy" } }),
+        { status: 503, headers: { "content-type": "application/json" } },
+      );
+      const gateway = startGateway(
+        [
+          commandCall(command, "trace_review_retried"),
+          fakeGatewayFinalText("retried review traced"),
+        ],
+        [reviewerBusy, fakeGatewayPermissionDecision("clear", "retried_clear")],
+      );
+      activeSession = await TmuxSession.create({
+        cmd: FX_BIN,
+        cwd: root.workspace,
+        env: { ...gatewayEnv(root, gateway), PATH: failingClipboardPath(root), TMPDIR: root.root },
+        stderrPath,
+        width: 120,
+        height: 40,
+      });
+      await activeSession.waitForComposer(TIMEOUT);
+      await activeSession.sendText("Run the marker command.");
+      await activeSession.waitForText("retried review traced", TIMEOUT);
+      expect(existsSync(marker)).toBe(true);
+
+      const report = await runTrace(activeSession, root.root);
+      const review = report.all("auto_review").find((entry) => entry.call_id === "trace_review_retried");
+      expect(review).toMatchObject({ outcome: "clear", call_id: "trace_review_retried" });
+      expect(review!.attempts).toEqual([
+        { result: "transient_failure", elapsed_ms: expect.any(Number) },
+        { result: "answered", elapsed_ms: expect.any(Number) },
+      ]);
       expect(readFileSync(stderrPath, "utf8")).toBe("");
 
       await activeSession.sendText("/quit");

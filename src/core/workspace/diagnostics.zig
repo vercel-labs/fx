@@ -42,6 +42,8 @@ pub const AutoReviewCounts = auto_review_metrics.Counts;
 pub const AutoReviewOutcome = auto_review_metrics.Outcome;
 pub const AutoReviewRisk = auto_review_metrics.Risk;
 pub const AutoReviewOrigin = auto_review_metrics.Origin;
+pub const AutoReviewAttempt = auto_review_metrics.Attempt;
+pub const AutoReviewAttemptResult = auto_review_metrics.AttemptResult;
 pub const auto_review_recent_capacity = auto_review_metrics.recent_capacity;
 pub const auto_review_held_capacity = auto_review_metrics.held_capacity;
 
