@@ -11,7 +11,7 @@ export type Line = { k: string; who: string; why: string; r: number; e: number }
 export function parseStatus(pane: string): Line | null {
   const tail = pane.split("\n").filter((l) => l.trim()).slice(-4).join("\n");
   let m: RegExpExecArray | null;
-  if ((m = /Signing in to (\S+) · \/mcp/.exec(tail))) return { k: "signing", who: m[1]!, why: "", r: 0, e: 0 };
+  if ((m = /signing in to (\S+) · \/mcp/.exec(tail))) return { k: "signing", who: m[1]!, why: "", r: 0, e: 0 };
   if ((m = /(\S+) is waiting for approval · \/mcp/.exec(tail))) return { k: "attn", who: m[1]!, why: "waiting", r: 0, e: 0 };
   if ((m = /(\S+) needs login · \/mcp/.exec(tail))) return { k: "attn", who: m[1]!, why: "login", r: 0, e: 0 };
   if ((m = /(\S+) failed · \/mcp/.exec(tail))) return { k: "attn", who: m[1]!, why: "failed", r: 0, e: 0 };

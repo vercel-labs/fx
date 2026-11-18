@@ -221,19 +221,19 @@ await waitFor(
 if (openedUrls[0] !== verificationUrlComplete) throw new Error("openUrl did not receive the complete verification URL");
 if (!first.capture.transcript().includes(verificationUrl)) throw new Error("terminal did not show the verification URL");
 await waitFor(
-  () => first.capture.transcript().includes("Signed in to Vercel."),
+  () => first.capture.transcript().includes("signed in to vercel."),
   "cooperative OAuth completion",
   () => `polls=${tokenPolls}, output=${JSON.stringify(first.capture.transcript().slice(-1500))}`,
 );
 await waitFor(
-  () => first.capture.transcript().includes("Vercel team · Search:"),
+  () => first.capture.transcript().includes("vercel team · search:"),
   "team selection",
   () => JSON.stringify(first.capture.transcript().slice(-1500)),
 );
 first.runtime.write("\r");
 await waitFor(
-  () => first.capture.transcript().includes("Changed Vercel team to Example Team") ||
-    first.capture.transcript().includes("The Vercel team changed and a valid model was selected for this run"),
+  () => first.capture.transcript().includes("changed vercel team to Example Team") ||
+    first.capture.transcript().includes("the vercel team changed and a valid model was selected for this run"),
   "validated team activation",
   () => JSON.stringify(first.capture.transcript().slice(-1500)),
 );
@@ -281,7 +281,7 @@ if (gatewayRequests[1]?.authorization !== `Bearer ${accessToken}`) {
 
 second.runtime.write("/logout\r");
 await waitFor(
-  () => second.capture.transcript().includes("Signed out of fx."),
+  () => second.capture.transcript().includes("signed out of fx."),
   "OAuth logout",
   () => JSON.stringify(second.capture.transcript().slice(-1500)),
 );

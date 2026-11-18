@@ -106,7 +106,7 @@ async function runScenario(name) {
   const seedTurns = automatic ? 1 : 3;
   const seedRule = "Always keep the history markers.";
   const seedReply = (turn) => `${turn === 1 ? head : `HOST_HISTORY_MIDDLE_${turn}`}\n${"history alpha beta gamma delta sample line\n".repeat(automatic ? 18_000 : 1_800)}HOST_SEED_DONE_${turn}${turn === seedTurns ? `\n${tail}` : ""}`;
-  const activity = /Compacting \((?:\d+h)?(?:\d+m)?\d+s\)/;
+  const activity = /compacting \((?:\d+h)?(?:\d+m)?\d+s\)/;
   const forbidden = /Compacting|compaction|Context compacted|No context to compact|HOST_INTERNAL_HANDOFF_268a/i;
   // Ctrl+O gives each compaction's model call its own line, as for every call;
   // nothing else there may speak of compaction.
@@ -272,7 +272,7 @@ async function runScenario(name) {
     } else {
       active.runtime.write("\x03");
       await waitFor(() => hold.aborted, "Ctrl+C reaches summary AbortSignal");
-      await waitFor(() => !activity.test(grid(active.terminal)) && grid(active.terminal).includes("Compaction cancelled.") && emptyComposer(grid(active.terminal)), "scoped cancellation feedback");
+      await waitFor(() => !activity.test(grid(active.terminal)) && grid(active.terminal).includes("compaction cancelled.") && emptyComposer(grid(active.terminal)), "scoped cancellation feedback");
       if (automatic) {
         await waitFor(() => commits === beforeCommits + 1, "automatic interruption persisted");
         const saved = new TextDecoder().decode(records.get(sessionId).bytes);

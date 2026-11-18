@@ -12,10 +12,10 @@ import type {
 } from "./types";
 
 // The scenario's command row shows its steps in short form.
-export const ACTIVE_TOOL_MARKER = "Running sleep, printf, sleep";
-export const TERMINAL_TOOL_MARKER = "Ran sleep, printf, sleep";
+export const ACTIVE_TOOL_MARKER = "running sleep, printf, sleep";
+export const TERMINAL_TOOL_MARKER = "ran sleep, printf, sleep";
 // Ctrl+O shows the scenario's command in full.
-export const EXPANDED_TERMINAL_TOOL_MARKER = "Ran sleep 1; i=1";
+export const EXPANDED_TERMINAL_TOOL_MARKER = "ran sleep 1; i=1";
 const ACTIVE_TOOL_FINAL_MARKER = "RENDER_LAB_LOCAL_GATEWAY_OK";
 const OBSERVABILITY_PERMISSION_PROMPT = "Would you like to run the following command?";
 const OBSERVABILITY_PERMISSION_REVIEW = "Permission needed";

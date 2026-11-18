@@ -76,7 +76,7 @@ test("an older build beside this one: its login isn't taken, its writes never re
     const redirect = await fetch(url, { redirect: "manual" });
     await fetch(redirect.headers.get("location")!);
     expect(await login.done()).toBe(0);
-    expect(login.out()).toContain("Signed in to web.");
+    expect(login.out()).toContain("signed in to web.");
     expect(look()).toEqual({ v2kind: "v1", v2: true, v3: true });
     expect(bytes(olderStorePath(f))).toBe(olderText);
     const signedIn = bytes(storePath(f));

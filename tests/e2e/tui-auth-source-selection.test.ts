@@ -8798,7 +8798,7 @@ tmuxTest(
     // Success is silent; wait for durable publication and the activity row to clear.
     await session.waitForPane((pane) =>
       pane.includes("PRESERVE_COMPACTION_DRAFT") &&
-      !/Preparing compaction|Compacting|Stopping compaction/.test(pane) &&
+      !/preparing compaction|compacting|stopping compaction/.test(pane) &&
       readFileSync(historyPath, "utf8").includes('"kind":"compacted"'),
     TIMEOUT);
     const scrollback = await session.captureFullScrollback();
@@ -8976,7 +8976,7 @@ tmuxTest(
     await session.sendText(prompt);
     await waitForTrace(tracePath, "event=pending_prompt_frame_committed", 1_000);
     await session.waitForPane(
-      (pane) => pane.includes(prompt) && pane.includes("Thinking"),
+      (pane) => pane.includes(prompt) && pane.includes("thinking"),
       1_000,
     );
     const responsiveDraft = "TERMINAL_RESPONSIVE_DURING_CREDENTIAL_REFRESH";
@@ -9017,7 +9017,7 @@ tmuxTest(
       const rows = grid.split("\n");
       const promptRow = rows.findIndex((row) => row.includes(prompt));
       expect(promptRow).toBeGreaterThanOrEqual(0);
-      expect(rows.findIndex((row) => row.includes("Thinking"))).toBe(promptRow + 2);
+      expect(rows.findIndex((row) => row.includes("thinking"))).toBe(promptRow + 2);
     }
 
     await session.sendKeys("Enter");

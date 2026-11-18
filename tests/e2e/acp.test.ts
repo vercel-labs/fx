@@ -12066,7 +12066,7 @@ test.skipIf(!tmuxAvailable())(
       // Success is silent: the committed checkpoint, not a transcript notice,
       // establishes that compaction finished before testing ACP replay.
       await waitForCondition("persisted compaction checkpoint", () => checkpointFrames().length === 1, TIMEOUT);
-      await tui.waitForPane((pane) => hasEmptyComposer(pane) && !/Compacting|Thinking|Preparing compaction/.test(pane), TIMEOUT);
+      await tui.waitForPane((pane) => hasEmptyComposer(pane) && !/compacting|thinking|preparing compaction/.test(pane), TIMEOUT);
       expect(checkpointFrames()).toHaveLength(1);
       expect(savedText(root.home, ids[0]!)).toContain("ACP_INTERNAL_HANDOFF");
       expect(readFileSync(eventsPath).subarray(0, beforeCompaction.length)).toEqual(beforeCompaction);
@@ -12074,7 +12074,7 @@ test.skipIf(!tmuxAvailable())(
       expect(inline).toContain("ACP_EARLIER_VISIBLE_RESPONSE");
       expect(inline).toContain("ACP_MIDDLE_VISIBLE_RESPONSE");
       expect(inline).toContain("ACP_LATEST_VISIBLE_RESPONSE");
-      expect(inline).not.toMatch(/Context compacted|Compacting|ACP_INTERNAL_HANDOFF/);
+      expect(inline).not.toMatch(/Context compacted|compacting|ACP_INTERNAL_HANDOFF/);
       await tui.sendText("/quit");
       expect(await tui.waitForSessionEnd(TIMEOUT)).toBe(true);
       await tui.kill();

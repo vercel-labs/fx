@@ -986,7 +986,7 @@ function expectNoRawToolReplay(scrollback: string): void {
 
 function normalizeVolatileStatusRows(grid: string[]): string[] {
   return grid.map((line) =>
-    /^• (?:Thinking|Generating|Running)(?: \(\d+s\))?$/.test(line) ||
+    /^• (?:thinking|Generating|Running)(?: \(\d+s\))?$/.test(line) ||
       /^• Streaming \([^)]*\)$/.test(line) ||
       isVolatileTokenStatusRow(line)
       ? "<status>"
@@ -5611,7 +5611,7 @@ async function saveSessionEndingInCompaction(
       "the saved compaction",
     );
     await active.waitForPane(
-      (pane) => !/Preparing compaction|Compacting/.test(pane) && hasEmptyComposer(pane),
+      (pane) => !/preparing compaction|compacting/.test(pane) && hasEmptyComposer(pane),
       TIMEOUT,
     );
     await active.sendText("/quit");
@@ -8663,7 +8663,7 @@ test.skipIf(!tmuxAvailable())(
       await active.sendText("/compact");
       // Success is silent; publication, not a transcript notice, gates resume.
       await waitForCondition(() => readFileSync(historyPath, "utf8").includes('"kind":"compacted"'), "durable context checkpoint");
-      await active.waitForPane((pane) => hasEmptyComposer(pane) && !/Preparing compaction|Compacting|Stopping compaction/.test(pane), TIMEOUT);
+      await active.waitForPane((pane) => hasEmptyComposer(pane) && !/preparing compaction|compacting|stopping compaction/.test(pane), TIMEOUT);
       const compacted = readFileSync(historyPath, "utf8");
       expect(compacted.startsWith(before)).toBe(true);
       const records = compacted.trim().split("\n").map((line) => JSON.parse(line));

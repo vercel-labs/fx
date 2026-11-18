@@ -2621,7 +2621,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       const nextStepPane = await waitForScrollback(
         session!,
         (value) =>
-          /• Thinking \(\d+(?:h\d+m\d+s|m\d+s|s)\) \(↑\d+(?:\.\d)?k? ↓\d+(?:\.\d)?k?\)/.test(
+          /• thinking \(\d+(?:h\d+m\d+s|m\d+s|s)\) \(↑\d+(?:\.\d)?k? ↓\d+(?:\.\d)?k?\)/.test(
             value,
           ) && !value.includes(finalSentinel),
         "thinking activity during the next admitted model step",
@@ -4680,7 +4680,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       expect(cutoffPane).not.toContain(
         `┋ ${SPLIT_NEW_USER_PROMPT}`,
       );
-      expect(cutoffPane).toMatch(/Thinking|Generating/);
+      expect(cutoffPane).toMatch(/thinking|Generating/);
       const tapeFrames = readTapeFrames(tapePath);
       const enterIndex = findEnterAfterSubmittedPrompt(tapeFrames, SPLIT_NEW_USER_PROMPT);
       const firstOutput = tapeFrames.slice(enterIndex + 1).find((frame) => frame.kind === 1)!;
@@ -4693,7 +4693,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       );
       const firstRows = firstGrid.split(/\r?\n/);
       const submittedRow = firstRows.findIndex((row) => row.includes(SPLIT_NEW_USER_PROMPT));
-      const activityRow = firstRows.findIndex((row) => /Thinking|Generating/.test(row));
+      const activityRow = firstRows.findIndex((row) => /thinking|Generating/.test(row));
       expect(submittedRow).toBeGreaterThanOrEqual(0);
       expect(firstRows[submittedRow]).toContain("┃");
       expect(submittedRow).toBeLessThan(activityRow);
@@ -4709,7 +4709,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         session,
         (candidate) => {
           const promptIndex = candidate.lastIndexOf(SPLIT_NEW_USER_PROMPT);
-          return promptIndex >= 0 && candidate.lastIndexOf("Thinking") > promptIndex;
+          return promptIndex >= 0 && candidate.lastIndexOf("thinking") > promptIndex;
         },
         "thinking activity after the steering user row",
         3_000,
@@ -7125,7 +7125,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       const introIndex = scrollback.indexOf(intro);
       const firstTableIndex = scrollback.indexOf(tableMarkers[0]!);
       expect(scrollback.slice(introIndex, firstTableIndex)).not.toMatch(
-        /(?:Thinking \(|\(↑\d)/,
+        /(?:thinking \(|\(↑\d)/,
       );
       expect(escapedScrollback).toContain(prefillMarkers[0]!);
       expect(escapedScrollback).toContain(tableMarkers.at(-1)!);

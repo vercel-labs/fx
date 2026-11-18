@@ -57,7 +57,7 @@ test("approve reloads in place: the project server starts and the unchanged serv
     await waitFor("a and b listed", () => listed(shell.f, "a").length && listed(shell.f, "b").length, 20_000);
     await shell.status({ k: "attn", who: "p", why: "waiting" });
     await shell.type("/mcp approve p", { event: "reload", data: { server: "p", change: "approved" } });
-    await shell.tui.waitForText("Approved p", 10_000);
+    await shell.tui.waitForText("approved p", 10_000);
     await waitFor("p listed", () => listed(shell.f, "p").length, 20_000);
     expect(await shell.status({ k: "none" })).toEqual({ k: "none", who: "", why: "", r: 0, e: 0 });
     // By the servers' own log: one process each of a and b, never stopped.
@@ -79,7 +79,7 @@ test("reject and remove reload in place: the project server never starts, the re
     await waitFor("a and b listed", () => listed(shell.f, "a").length && listed(shell.f, "b").length, 20_000);
     await shell.status({ k: "attn", who: "p", why: "waiting" });
     await shell.type("/mcp reject p", { event: "reload", data: { server: "p", change: "rejected" } });
-    await shell.tui.waitForText("Rejected p", 10_000);
+    await shell.tui.waitForText("rejected p", 10_000);
     expect(await shell.status({ k: "none" })).toEqual({ k: "none", who: "", why: "", r: 0, e: 0 });
     await shell.type("/mcp remove b", { event: "reload", data: { server: "b", change: "removed" } });
     await shell.tui.waitForText("Removed b", 10_000);
@@ -105,7 +105,7 @@ test("a reload while `/mcp show` waits on a server keeps that server's process, 
     await shell.type("/mcp show s", { event: "lease" });
     await Bun.sleep(500);
     await shell.type("/mcp approve p", { event: "reload", data: { server: "p", change: "approved" } });
-    await shell.tui.waitForText("Approved p", 10_000);
+    await shell.tui.waitForText("approved p", 10_000);
     const [p] = await waitFor("p started", () => { const x = started(shell.f, "p"); return x.length ? x : null; }, 10_000);
     // The show prints once s answers, from the process it was waiting on.
     await shell.tui.waitForText("status     ready", 20_000);

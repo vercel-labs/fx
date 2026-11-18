@@ -23,7 +23,7 @@ const TAIL = "HISTORY_TAIL_16d3";
 const HANDOFF = `Facts:\nF1: INTERNAL_HANDOFF_4e12: preserve ${HEAD} and ${TAIL}; follow the latest user request.`;
 const FOLLOWUP = "FOLLOWUP_OK_732c";
 const REOPEN = "REOPEN_OK_492a";
-const ACTIVITY = /Compacting \((?:\d+h)?(?:\d+m)?\d+s\)/;
+const ACTIVITY = /compacting \((?:\d+h)?(?:\d+m)?\d+s\)/;
 const COMPACTION_OUTPUT = /Compacting|compaction|Context compacted|No context to compact|Synthetic summary rejection|INTERNAL_HANDOFF_4e12/i;
 // Ctrl+O gives each compaction's model call its own line, as for every call;
 // nothing else there may speak of compaction.
@@ -269,7 +269,7 @@ async function assertLive(terminal: InstanceType<typeof TmuxSession>) {
     markers.add(rows[0].includes("•"));
     return markers.size === 2 && !rows[0].includes(clock);
   }, 5000);
-  expect(later.match(/Compacting/g)).toHaveLength(1);
+  expect(later.match(/compacting/g)).toHaveLength(1);
 }
 
 describe.skipIf(!tmuxAvailable())("tui: compaction activity", () => {
@@ -480,7 +480,7 @@ describe.skipIf(!tmuxAvailable())("tui: compaction activity", () => {
           await terminal.waitForText("cancelled", 10_000);
         }
         await terminal.waitForPane((pane) => hasEmptyComposer(pane) &&
-          !/Compaction cancelled|Compacting|Thinking/.test(pane), 5000);
+          !/Compaction cancelled|compacting|thinking/.test(pane), 5000);
         const interruptions = () => f.savedEvents().trim().split("\n")
           .map((line) => JSON.parse(line)).filter((line) => line.kind === "item" && line.type === "interruption");
         await until(() => interruptions().length === 1, "durable cancellation", 5000);
@@ -785,7 +785,7 @@ describe.skipIf(!tmuxAvailable())("tui: compaction activity", () => {
       const id = onlySessionId(home);
       await terminal.sendText("/compact");
       await until(() => logLines(home, id).some((line) => line.kind === "compacted"), "the compaction");
-      await terminal.waitForPane((pane) => !/Preparing compaction|Compacting/.test(pane) && hasEmptyComposer(pane), 15_000);
+      await terminal.waitForPane((pane) => !/preparing compaction|compacting/.test(pane) && hasEmptyComposer(pane), 15_000);
       // The turn across the compaction ends, so the window lets the older
       // cycle go and Ctrl+O's newest page joins it from the log.
       await terminal.sendText("One more turn.");

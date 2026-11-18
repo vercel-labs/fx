@@ -95,7 +95,7 @@ async function signInScenario(name: string, tamper: boolean, opts: { gate?: Reco
 test("control: a sign-in redeems the code of the callback whose state matches, then its listener closes (trace ACCEPTED)", async () => {
   const r = await signInScenario("signin-ok", false);
   expect(r.code).toBe(0);
-  expect(r.out).toContain("Signed in to web.");
+  expect(r.out).toContain("signed in to web.");
   expect(r.tokens.length).toBe(1);
   expect(r.after.result).toBe("closed");
   expect(readFileSync(join(r.f.home, ".fx", "mcp-credentials", "credentials-v3.json"), "utf8")).toContain("\"name\":\"web\"");
@@ -105,13 +105,13 @@ test("control: a sign-in redeems the code of the callback whose state matches, t
 }, 120_000);
 
 // Fixed. Before the fix a return with a state fx never made ended the
-// sign-in ("Couldn't sign in to web"), so anything that could reach the port
+// sign-in ("couldn't sign in to web"), so anything that could reach the port
 // could cancel it. It fails that way on the code before.
 test("contract: a return whose state isn't the live sign-in's gets a 404 and the sign-in goes on; its own return still signs in (trace ACCEPTED)", async () => {
   const r = await signInScenario("signin-wrong-state", true);
   expect(r.stray).toEqual({ status: 404, open: "open" });
   expect(r.code).toBe(0);
-  expect(r.out).toContain("Signed in to web.");
+  expect(r.out).toContain("signed in to web.");
   // Only the sign-in's own code is redeemed.
   expect(r.tokens.length).toBe(1);
   expect(r.after.result).toBe("closed");
@@ -137,7 +137,7 @@ test("contract: a return naming another issuer redeems nothing, and fx says the 
     save(join(f.base, "login-output.json"), { code, stdout: login.out(), stderr: login.err() });
     save(join(f.base, "http-fake-entries.json"), fake.entries());
     expect(code).toBe(1);
-    expect(login.err()).toContain("Couldn't sign in to web");
+    expect(login.err()).toContain("couldn't sign in to web");
     expect(login.err()).toContain("the answer that came back wasn't for this sign-in");
     expect(login.err()).not.toContain("the sign-in page returned an error");
     expect(redemptions(fake.entries())).toEqual([]);
@@ -163,7 +163,7 @@ test("contract: a pasted return with a state fx never made redeems nothing, and 
     save(join(f.base, "login-output.json"), { pasted: wrong.toString(), code, stdout: login.out(), stderr: login.err() });
     save(join(f.base, "http-fake-entries.json"), fake.entries());
     expect(code).toBe(1);
-    expect(login.err()).toContain("Couldn't sign in to web");
+    expect(login.err()).toContain("couldn't sign in to web");
     expect(login.err()).toContain("the answer that came back wasn't for this sign-in");
     expect(login.err()).not.toContain("the sign-in page returned an error");
     expect(redemptions(fake.entries())).toEqual([]);
@@ -187,7 +187,7 @@ test("contract: a login asked for again while one waits is that login: the same 
   const addresses = async (n: number) => {
     const deadline = Date.now() + 20_000;
     for (;;) {
-      const shown = (await shell.tui.captureFullScrollback()).match(/Didn't open\? Open the sign-in page\./g)?.length ?? 0;
+      const shown = (await shell.tui.captureFullScrollback()).match(/didn't open\? open the sign-in page\./g)?.length ?? 0;
       if (shown > n) {
         const written = Buffer.concat(stdoutFrames(tapePath).map((frame: { payload: Uint8Array }) => frame.payload)).toString("utf8");
         return [...new Set([...written.matchAll(/\x1b\]8;id=fx-mcp-sign-in;([^\x1b]+)\x1b\\/g)].map((m) => m[1]!))];
@@ -222,7 +222,7 @@ test("contract: a login asked for again while one waits is that login: the same 
     records.push({ event: "callback", data: { login: 1, state: 1, kind: "get" }, at: Date.now() });
     const back = await fetch(location.toString(), { signal: AbortSignal.timeout(10_000) }).catch((e) => ({ status: 0, text: async () => String(e) }));
     save(join(f.base, "callback.json"), { location: location.toString(), status: back.status, body: (await back.text()).slice(0, 400) });
-    await shell.tui.waitForText("Signed in to web.", 20_000);
+    await shell.tui.waitForText("signed in to web.", 20_000);
     const ended = Date.now();
     const tokens = redemptions(fake.entries());
     for (const t of tokens) records.push({ event: "redeem", data: { login: 1 }, at: Math.min(t.t, ended - 2) });
@@ -263,7 +263,7 @@ test("contract: a reload that leaves a server alone keeps its sign-in going, and
     await shell.start();
     records.push({ event: "login", at: Date.now() });
     await shell.tui.sendText("/mcp login web");
-    await shell.tui.waitForText("Sign in to web in your browser", 20_000);
+    await shell.tui.waitForText("sign in to web in your browser", 20_000);
     records.push({ event: "authorize", data: { login: 1 }, at: Date.now() });
     const signing = await shell.status({ k: "signing" }, 10_000);
     expect(signing?.k).toBe("signing");
@@ -299,7 +299,7 @@ test("contract: a reload that leaves a server alone keeps its sign-in going, and
     expect(going?.k).toBe("signing");
     expect(after.result).toBe("closed");
     expect(still?.k).not.toBe("signing");
-    expect(await shell.tui.captureFullScrollback()).toContain("Couldn't sign in to web: the MCP config changed before the browser came back.");
+    expect(await shell.tui.captureFullScrollback()).toContain("couldn't sign in to web: the MCP config changed before the browser came back.");
     expect(verdict.verdict).toBe("ACCEPTED");
     await shell.quit();
   } finally {
@@ -320,8 +320,8 @@ const REFUSE = { refuseTokens: { error: "invalid_token", description: "No author
 test("contract: a server that refuses the new login ends the sign-in with its error, exit 1, and the login is never saved (trace ACCEPTED)", async () => {
   const r = await signInScenario("signin-refused", false, { gate: REFUSE });
   expect(r.checks.map((c) => c.result)).toEqual(["refuse"]);
-  expect(r.out).not.toContain("Signed in");
-  expect(r.err).toContain("Couldn't sign in to web: web refused the new login (invalid_token: \"No authorization provided\").");
+  expect(r.out).not.toContain("signed in");
+  expect(r.err).toContain("couldn't sign in to web: web refused the new login (invalid_token: \"No authorization provided\").");
   expect(r.code).toBe(1);
   // A refused token is never written, so no other fx process can take it (NeverTakeRefused).
   expect(r.saved).toBe(false);
@@ -335,8 +335,8 @@ test("contract: a server that refuses the new login ends the sign-in with its er
 test("contract: a server that refuses the new login, whose refresh then answers 500, still ends the sign-in with its error, exit 1, and the login is never saved (trace ACCEPTED)", async () => {
   const r = await signInScenario("signin-refused-unrenewed", false, { gate: REFUSE, server: { refreshError: "server_error", refreshStatus: 500 }, unrenewed: true });
   expect(r.checks.map((c) => c.result)).toEqual(["refuse"]);
-  expect(r.out).not.toContain("Signed in");
-  expect(r.err).toContain("Couldn't sign in to web: web refused the new login (invalid_token: \"No authorization provided\").");
+  expect(r.out).not.toContain("signed in");
+  expect(r.err).toContain("couldn't sign in to web: web refused the new login (invalid_token: \"No authorization provided\").");
   expect(r.code).toBe(1);
   expect(r.saved).toBe(false);
   expect(r.tokens.length).toBe(1);
@@ -346,8 +346,8 @@ test("contract: a server that refuses the new login, whose refresh then answers 
 test("contract: a challenge that names no error still ends the sign-in as a refusal, in words that hold no server text", async () => {
   const r = await signInScenario("signin-refused-garbage", false, { gate: { tokenFault: "garbage" } });
   expect(r.checks.map((c) => c.result)).toEqual(["refuse"]);
-  expect(r.out).not.toContain("Signed in");
-  expect(r.err).toContain("Couldn't sign in to web: web refused the new login.");
+  expect(r.out).not.toContain("signed in");
+  expect(r.err).toContain("couldn't sign in to web: web refused the new login.");
   expect(r.code).toBe(1);
   expect(r.saved).toBe(false);
   expect(r.verdict.verdict).toBe("ACCEPTED");
@@ -357,7 +357,7 @@ for (const fault of ["500", "drop"] as const) {
   test(`contract: a check request that fails (${fault}) keeps the login and says it couldn't check, exit 0 (trace ACCEPTED)`, async () => {
     const r = await signInScenario(`signin-check-${fault}`, false, { gate: { tokenFault: fault } });
     expect(r.checks.map((c) => c.result)).toEqual(["fail"]);
-    expect(r.out).toContain("Signed in to web, but fx couldn't check the login with it.");
+    expect(r.out).toContain("signed in to web, but fx couldn't check the login with it.");
     expect(r.code).toBe(0);
     expect(r.saved).toBe(true);
     expect(r.verdict.verdict).toBe("ACCEPTED");
@@ -368,7 +368,7 @@ test("contract: a check request that gets no answer ends at the server's timeout
   // operation_timeout_ms and startup_timeout_ms accept 1 ms and up, so the real timeout path runs in seconds.
   const r = await signInScenario("signin-check-hang", false, { gate: { tokenFault: "hang" }, web: { startup_timeout_ms: 1500, operation_timeout_ms: 1500 } });
   expect(r.checks.map((c) => c.result)).toEqual(["fail"]);
-  expect(r.out).toContain("Signed in to web, but fx couldn't check the login with it.");
+  expect(r.out).toContain("signed in to web, but fx couldn't check the login with it.");
   expect(r.code).toBe(0);
   expect(r.saved).toBe(true);
   expect(r.verdict.verdict).toBe("ACCEPTED");
@@ -392,7 +392,7 @@ test("crash recovery: fx killed while the check request is in flight leaves no s
     await login.child.exited;
     save(join(f.base, "http-fake-entries.json"), fake.entries());
     expect(storeHoldsLogin(f)).toBe(false);
-    expect(login.out()).not.toContain("Signed in");
+    expect(login.out()).not.toContain("signed in");
     const show = Bun.spawnSync([binary, "mcp", "show", "web", "--json"], { cwd: f.workspace, env: { ...fxEnv(f) }, stdout: "pipe", stderr: "pipe" });
     const shown = JSON.parse(new TextDecoder().decode(show.stdout));
     expect(shown.status).toBe("needs_login");
@@ -414,7 +414,7 @@ test("stress: repeated sign-ins to a server that refuses every login never repor
       const redirect = await fetch(url, { redirect: "manual" });
       await (await fetch(new URL(redirect.headers.get("location")!).toString())).text();
       const code = await login.done();
-      expect({ n, code, out: login.out().includes("Signed in"), err: login.err().includes('web refused the new login (invalid_token: "No authorization provided").') }).toEqual({ n, code: 1, out: false, err: true });
+      expect({ n, code, out: login.out().includes("signed in"), err: login.err().includes('web refused the new login (invalid_token: "No authorization provided").') }).toEqual({ n, code: 1, out: false, err: true });
       expect(storeHoldsLogin(f)).toBe(false);
     }
     expect(redemptions(fake.entries()).length).toBe(rounds);

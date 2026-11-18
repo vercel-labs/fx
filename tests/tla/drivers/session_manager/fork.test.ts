@@ -207,7 +207,7 @@ scenario("/fork while a turn runs waits for it and forks nothing", async f => {
   f.script(body => body.includes("A slow prompt.") ? held.response : fakeGatewayFinalText("UNSCRIPTED"));
   const app = await f.app();
   await app.session.sendText("A slow prompt.");
-  await app.session.waitForText("Thinking", TIMEOUT);
+  await app.session.waitForText("thinking", TIMEOUT);
   await app.session.sendText("/fork");
   await app.session.waitForText("/fork is available once the current turn finishes", TIMEOUT);
   held.release("SLOW_DONE");

@@ -473,12 +473,12 @@ async function setupScenario(
       ]);
       checkpoint = "running";
       activityKind = "tool_slot";
-      contains = "Running sleep 5";
+      contains = "running sleep 5";
       trigger = async () => gate.release();
       expected = (record) =>
         hasActivityKind(record, "tool_slot") &&
-        recordContains(record, "Running sleep 5") &&
-        recordContains(record, "Thinking");
+        recordContains(record, "running sleep 5") &&
+        recordContains(record, "thinking");
       break;
     }
     case "thinking-final": {
@@ -500,7 +500,7 @@ async function setupScenario(
       trigger = async () => gate.release();
       expected = (record) =>
         hasActivityKind(record, "none") &&
-        recordContains(record, "Ran printf OBSERVER_THINKING_TOOL_FINAL") &&
+        recordContains(record, "ran printf OBSERVER_THINKING_TOOL_FINAL") &&
         recordContains(record, "OBSERVER_THINKING_FINAL_RESPONSE") &&
         recordContains(record, "(↑") &&
         recordContains(record, " ↓") &&
@@ -570,7 +570,7 @@ async function setupScenario(
       expected = (record) =>
         hasActivityKind(record, "none") &&
         recordContains(record, "⊘") &&
-        recordContains(record, "Denied");
+        recordContains(record, "denied");
       break;
     }
     case "tool-cancelled": {
@@ -595,7 +595,7 @@ async function setupScenario(
       expected = (record) =>
         hasActivityKind(record, "none") &&
         recordContains(record, "▪") &&
-        recordContains(record, "Cancelled");
+        recordContains(record, "cancelled");
       break;
     }
   }
