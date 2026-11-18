@@ -2309,6 +2309,7 @@ fn agentRuntimeDeps(ctx: *AskContext) agent_runtime.AgentRuntimeDeps {
         .propagate_history_turn = propagateHistoryTurn,
         .commit_context_compaction = .{ .commit = commitContextCompaction },
         .append_turn_piece = if (ctx.v2 != null) appendTurnPiece else null,
+        .save_route_recovery_status = if (ctx.v2 != null) saveRouteRecoveryStatus else null,
         .record_usage = if (ctx.v2 != null) recordUsage else null,
         .save_prompt_images = if (ctx.v2 != null) savePromptImages else null,
         .start_workspace_capture = if (ctx.workspaceCaptureContext() != null) startWorkspaceCapture else null,
@@ -3293,6 +3294,16 @@ fn recordUsage(raw_ctx: *anyopaque, usage: types.Usage) !void {
     defer ctx.session_write_mutex.unlock(io_mod.getIo());
     const v2 = ctx.v2 orelse return;
     try v2.recordUsage(usage);
+}
+
+/// `AgentRuntimeDeps.save_route_recovery_status` on v2: a recovery status
+/// reaches the session log as a `model_recovery` item.
+fn saveRouteRecoveryStatus(raw_ctx: *anyopaque, status: types.RouteRecoveryStatus) !void {
+    const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
+    ctx.session_write_mutex.lockUncancelable(io_mod.getIo());
+    defer ctx.session_write_mutex.unlock(io_mod.getIo());
+    const v2 = ctx.v2 orelse return;
+    try v2.saveModelRecovery(status);
 }
 
 /// The prompt's images become the session's blobs before its first request

@@ -1634,6 +1634,15 @@ pub fn Runtime(comptime App: type) type {
             try v2.saveBridgeCall(record);
         }
 
+        /// Saves a model request's recovery status in the open turn as a
+        /// `model_recovery` item. A session that is not saved keeps nothing.
+        pub fn saveModelRecovery(agent: *AppAgent, status: types.RouteRecoveryStatus) !void {
+            agent.session_persistence.write_mutex.lockUncancelable(io_mod.getIo());
+            defer agent.session_persistence.write_mutex.unlock(io_mod.getIo());
+            const v2 = agent.session_persistence.v2 orelse return;
+            try v2.saveModelRecovery(status);
+        }
+
         /// Record whether restored history references shell execution handles
         /// this process does not own. Registry membership, not the resume
         /// itself, decides staleness (see session_runtime.detectStaleShellHandles).

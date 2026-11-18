@@ -2774,6 +2774,22 @@ pub const Session = struct {
         _ = try self.write(&.{.{ .item = .{ .type = bridge_call_type, .data = try encodeBridgeCall(a, record) } }});
     }
 
+    /// Saves `status` in the open turn as a `model_recovery` item. With no
+    /// turn open, nothing is written and the caller logs the status as
+    /// dropped.
+    pub fn saveModelRecovery(self: *Session, status: types.RouteRecoveryStatus) !void {
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        if (!self.turn_open) return error.NoOpenTurn;
+        var arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var label_buf: [types.RouteRecoveryStatus.label_max_bytes]u8 = undefined;
+        var out: std.Io.Writer.Allocating = .init(a);
+        try status.report(&label_buf).writeJson(&out.writer);
+        _ = try self.write(&.{.{ .item = .{ .type = model_recovery_type, .data = out.written() } }});
+    }
+
     fn recoveryItem(self: *Session, a: Allocator, record: types.RecoveryRecordWrite) !?sm.Piece {
         const bytes: []u8 = switch (record) {
             .keep => return null,
@@ -5589,6 +5605,8 @@ noinline fn replay(
                     if (std.mem.eql(u8, piece.type, recovery_type)) continue;
                     // A workspace capture, evidence beside the conversation (D98).
                     if (std.mem.eql(u8, piece.type, workspace_capture_type)) continue;
+                    // A model request's recovery status, for reading the log.
+                    if (std.mem.eql(u8, piece.type, model_recovery_type)) continue;
                     const ta = turn_arena.allocator();
                     if (std.mem.eql(u8, piece.type, running_type)) {
                         // Kept for the whole turn: copies, not views of the page.
@@ -6059,6 +6077,12 @@ const running_assistant_type = "assistant_running";
 /// the newest one (`interruptedRequest`). Older builds drop the piece as an
 /// unknown item.
 const recovery_type = "recovery";
+/// A model request's recovery status, as `fx ask --json` reports it
+/// (`types.RouteRecoveryStatus.Report`), saved when the status's kind or
+/// attempt changes and for its outcome, so the log shows when a request
+/// failed, why, how long fx waited, and how it ended. No reader of the
+/// conversation reads it. Older builds drop the piece as an unknown item.
+const model_recovery_type = "model_recovery";
 /// The bytes of a `recovery` piece's record; null for a cleared one or one
 /// that does not parse, which the recovery module treats as no record.
 fn parseRecoveryRecord(data: []const u8) ?[32]u8 {
@@ -10130,6 +10154,74 @@ test "the calls a command made through fx mcp call come back on resume with thei
         try testing.expectEqual(want.outcome, got.outcome);
     }
     try testing.expectEqual(@as(usize, 1), restored.history[0].assistant.execution.tool_steps.len);
+}
+
+test "a model recovery status is saved in the open turn as the report's JSON" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var model = "m".*;
+    const s = try Session.create(testing.allocator, &t.store, "/w", .ask, testSeed(&model));
+    const user: types.UserTurn = .{ .text = @constCast("page through the list") };
+    try s.appendProgress(user, .{}, .{});
+    try s.saveModelRecovery(.{ .kind = .waiting, .attempt = 1, .failure = .rate_limited, .text = types.testRecoveryText("Rate limited, next try in 1s") });
+    try s.saveModelRecovery(.{ .kind = .recovered, .attempt = 2, .failure = .rate_limited });
+    try testing.expectEqual(@as(usize, 2), try countItems(t.store.manager, s.id(), model_recovery_type));
+    const id = try testing.allocator.dupe(u8, s.id());
+    defer testing.allocator.free(id);
+    s.close();
+
+    const io = io_mod.getIo();
+    const log_path = try std.Io.Dir.path.join(testing.allocator, &.{ ".fx", "sessions", "v2", id, "log.jsonl" });
+    defer testing.allocator.free(log_path);
+    const bytes = try t.tmp.dir.readFileAlloc(io, log_path, testing.allocator, .limited(1 << 20));
+    defer testing.allocator.free(bytes);
+    try testing.expect(std.mem.find(u8, bytes, "\"data\":{\"state\":\"waiting\",\"attempt\":1,\"cause\":\"rate_limited\",\"message\":\"Rate limited, next try in 1s\"}") != null);
+    try testing.expect(std.mem.find(u8, bytes, "\"data\":{\"state\":\"recovered\",\"attempt\":2,\"cause\":\"rate_limited\"}") != null);
+}
+
+test "a model recovery status with no open turn is not saved" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var model = "m".*;
+    const s = try Session.create(testing.allocator, &t.store, "/w", .ask, testSeed(&model));
+    const user: types.UserTurn = .{ .text = @constCast("asked") };
+    // No turn is open before the first write, so there is nothing to save into.
+    try testing.expectError(error.NoOpenTurn, s.saveModelRecovery(.{ .kind = .waiting, .attempt = 1, .failure = .rate_limited }));
+    try s.appendProgress(user, .{}, .{});
+    try s.commitTurn(.{ .assistant = .{ .user = user, .assistant = @constCast("answered") } }, types.ConversationLanguage.default());
+    // The turn is committed, so a status after it finds none open.
+    try testing.expectError(error.NoOpenTurn, s.saveModelRecovery(.{ .kind = .recovered, .attempt = 2, .failure = .rate_limited }));
+    try testing.expectEqual(@as(usize, 0), try countItems(t.store.manager, s.id(), model_recovery_type));
+    s.close();
+}
+
+test "a loaded session leaves model recovery items out of the conversation" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var model = "m".*;
+    const s = try Session.create(testing.allocator, &t.store, "/w", .ask, testSeed(&model));
+    const user: types.UserTurn = .{ .text = @constCast("asked") };
+    try s.appendProgress(user, .{}, .{});
+    try s.saveModelRecovery(.{ .kind = .waiting, .attempt = 1, .failure = .rate_limited, .text = types.testRecoveryText("Rate limited, next try in 1s") });
+    try s.saveModelRecovery(.{ .kind = .recovered, .attempt = 2, .failure = .rate_limited });
+    try s.commitTurn(.{ .assistant = .{ .user = user, .assistant = @constCast("answered") } }, types.ConversationLanguage.default());
+    try testing.expectEqual(@as(usize, 2), try countItems(t.store.manager, s.id(), model_recovery_type));
+    const id = try testing.allocator.dupe(u8, s.id());
+    defer testing.allocator.free(id);
+    s.close();
+
+    const r = try Session.resumeSession(testing.allocator, &t.store, .{ .id = id }, "/w", .ask);
+    defer r.close();
+    var restored = try r.restore(testing.allocator);
+    defer restored.deinit(testing.allocator);
+    // The same turn a session with no recovery items restores.
+    try testing.expectEqual(@as(usize, 1), restored.history.len);
+    try testing.expectEqualStrings("asked", restored.history[0].assistant.user.text);
+    try testing.expectEqualStrings("answered", restored.history[0].assistant.assistant);
+    try testing.expectEqual(@as(usize, 0), restored.history[0].assistant.execution.tool_steps.len);
 }
 
 test "a command cancelled before it printed anything keeps its row on resume (D100)" {
