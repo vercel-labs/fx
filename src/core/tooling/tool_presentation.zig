@@ -182,6 +182,20 @@ pub fn subagentStreamedAgent(json: []const u8) ?[]const u8 {
     return streamedStringField(json, "agent", 1, 2);
 }
 
+/// The value a builtin call's row names, read from its arguments while they
+/// still stream in: the top-level string its label kind names, such as a
+/// read's `path` or a web search's `query`. Null until that value is a
+/// complete string, for one with an escape in it, and for the kinds whose
+/// value is not such a string: a shell call's `action` and `command`, and
+/// what `toolbox` and `subagent` calls name, which have their own readers.
+/// The result is a slice of `json`.
+pub fn streamedLabelValue(kind: tool_dispatch.LabelArgKind, json: []const u8) ?[]const u8 {
+    return switch (kind) {
+        .none, .action, .command, .session_id, .open, .run, .search => null,
+        .name, .path, .pattern, .url, .description, .source, .resource, .query, .server, .selector => streamedStringField(json, @tagName(kind), 1, 1),
+    };
+}
+
 /// What a `toolbox` call does, read from its arguments while they still
 /// stream in: the first of its own `run`, `search`, and `open` keys whose
 /// value is a whole string, with no escape in it, as a JSON object with that

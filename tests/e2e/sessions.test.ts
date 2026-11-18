@@ -38,6 +38,7 @@ import {
   TmuxSession,
   tmuxAvailable,
 } from "./tmux-helpers";
+import { ignoresFileModes } from "./file-modes";
 import { childLines, childWork, committedRootTurns, compactionRecordPath, type LogLine, logLines, onlySessionId, rootSessionIds, savedSessionIds, sessionDir, storeRoot, waitForRootTurnCommitted } from "./saved-sessions";
 
 // The session store: every `fx ask` entry and exit, the files it writes, and the faults a real disk and a real
@@ -45,6 +46,11 @@ import { childLines, childWork, committedRootTurns, compactionRecordPath, type L
 // byte, a second process, a read-only folder and a full disk.
 
 const TIMEOUT = 30_000;
+
+// A user that file modes do not hold back, such as root or one that holds
+// CAP_DAC_OVERRIDE, writes into a read-only folder, so the tests that need a
+// refused write skip for them.
+const fileModesIgnored = ignoresFileModes();
 
 type Fixture = { root: string; home: string; workspace: string };
 
@@ -1430,7 +1436,7 @@ test("a second process on an open session is refused and writes nothing", async 
   }
 }, TIMEOUT * 3);
 
-test("a read-only session folder fails cleanly and resumes once writable", async () => {
+test.skipIf(fileModesIgnored)("a read-only session folder fails cleanly and resumes once writable", async () => {
   const fixture = createFixture("fx-v2-readonly-");
   const gateway = startFakeGateway([
     fakeGatewayFinalText("BEFORE_READ_ONLY"),
@@ -5779,7 +5785,7 @@ test("ACP killed between prompts loads with its last turn whole", async () => {
   }
 }, TIMEOUT * 3);
 
-test.skipIf(!tmuxAvailable())("the app refuses a damaged session, a busy one and a read-only one, and says which", async () => {
+test.skipIf(!tmuxAvailable() || fileModesIgnored)("the app refuses a damaged session, a busy one and a read-only one, and says which", async () => {
   const fixture = createFixture("fx-v2-app-faults-");
   const gateway = startDynamicFakeGateway(() => fakeGatewayFinalText("FAULT_ANSWER"));
   try {
@@ -5822,7 +5828,7 @@ test.skipIf(!tmuxAvailable())("the app refuses a damaged session, a busy one and
   }
 }, TIMEOUT * 5);
 
-test("ACP refuses a damaged or read-only session and leaves its log as it was", async () => {
+test.skipIf(fileModesIgnored)("ACP refuses a damaged or read-only session and leaves its log as it was", async () => {
   const fixture = createFixture("fx-v2-acp-faults-");
   const gateway = startDynamicFakeGateway(() => fakeGatewayFinalText("FAULT_ANSWER"));
   let client: AcpRpc | undefined;
@@ -6853,13 +6859,13 @@ async function gridNewRow(entry: GridEntry) {
 }
 
 for (const entry of ["ask-new", "app-new", "acp-new"] as const) {
-  const define = gridHost(entry) === "app" ? test.skipIf(!tmuxAvailable()) : test;
+  const define = gridHost(entry) === "app" ? test.skipIf(!tmuxAvailable() || fileModesIgnored) : test.skipIf(fileModesIgnored);
   define(`fault grid: a new session by ${entry.slice(0, -4)}, with nothing wrong, a read-only folder and a full disk`, () => gridNewRow(entry), TIMEOUT * 6);
 }
 
 for (const exit of GRID_EXITS) {
   for (const entry of GRID_ENTRIES) {
-    const define = gridHost(entry) === "app" ? test.skipIf(!tmuxAvailable()) : test;
+    const define = gridHost(entry) === "app" ? test.skipIf(!tmuxAvailable() || fileModesIgnored) : test.skipIf(fileModesIgnored);
     define(`fault grid: a session ${exit}, entered by ${entry}, under every fault`, () => gridRow(exit, entry), TIMEOUT * 10);
   }
 }

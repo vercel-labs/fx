@@ -194,8 +194,18 @@ pub const ProvisionalToolStatuses = struct {
         if (is_subagent) {
             observed_label = tooling_presentation.subagentStreamedAgent(arguments_json orelse "") orelse self.trackedLabel(tool_id);
         }
+        // Any other builtin call's row names its target, such as the file a
+        // read opens, once that value streams in.
+        const builtin = hooks.tool_registry.lookup(tool_name);
+        const streamed_value = if (builtin) |spec| if (!is_toolbox and !is_subagent and observed_label == null)
+            tooling_presentation.streamedLabelValue(spec.label_arg_kind, arguments_json orelse "")
+        else
+            null else null;
+        if (streamed_value) |value| observed_label = value;
         const shown_label = if (is_subagent and observed_label != null)
             (try text_utils.encodeTerminalSafe(scratch.allocator(), observed_label.?, 64)).bytes
+        else if (streamed_value) |value|
+            (try text_utils.encodeTerminalSafe(scratch.allocator(), value, 240)).bytes
         else
             observed_label;
         const label = argument_label orelse try formatProvisionalProgressLabel(&buf, action_label, shown_label);
@@ -256,7 +266,10 @@ pub const ProvisionalToolStatuses = struct {
         } else if (std.mem.eql(u8, status.tool_name, toolbox.tool_name)) {
             const action = try tooling_presentation.toolboxStreamedAction(alloc, arguments) orelse return;
             alloc.free(action);
-        } else return;
+        } else {
+            const spec = hooks.tool_registry.lookup(status.tool_name) orelse return;
+            if (tooling_presentation.streamedLabelValue(spec.label_arg_kind, arguments) == null) return;
+        }
         const metadata = switch (preflight(hooks.tool_registry, status.tool_name) orelse return) {
             .ineligible => return,
             .eligible => |metadata| metadata,
@@ -2330,6 +2343,49 @@ test "a streaming toolbox run of a built-in tool shows a row only when a direct 
         }
         try std.testing.expectEqual(@as(usize, 0), capture.events.items.len);
         try std.testing.expectEqual(@as(usize, 0), statuses.tracked.items.len);
+    }
+}
+
+test "a streaming builtin call's row names its target once that value arrives, and keeps it" {
+    const alloc = std.testing.allocator;
+    const cases = [_]struct {
+        tool: []const u8,
+        partial: []const u8,
+        named: ?[]const u8,
+        value: []const u8 = "",
+    }{
+        .{ .tool = "read_file", .partial = "{\"pa", .named = "{\"path\":\"src/main.zig\",\"off", .value = "src/main.zig" },
+        .{ .tool = "glob_files", .partial = "{\"pattern\":\"*.m", .named = "{\"pattern\":\"*.md\"", .value = "*.md" },
+        // A value with an escape in it would read wrongly, so the row waits
+        // for the call.
+        .{ .tool = "read_file", .partial = "{\"path\":\"a\\\"b", .named = null },
+    };
+    for (cases) |case| {
+        var capture = ProvisionalStatusTestCapture{ .alloc = alloc };
+        defer capture.deinit();
+        const hooks = capture.hooks();
+        var statuses = ProvisionalToolStatuses{};
+        defer statuses.deinit(alloc);
+        errdefer std.debug.print("tool: {s}\n", .{case.tool});
+        const action = eligibleActionLabel(case.tool);
+        try statuses.publish(&hooks, alloc, 7, "call_1", case.tool, activityKind(hooks.tool_registry, case.tool), action, null, null);
+        try std.testing.expectEqual(@as(usize, 2), capture.events.items.len);
+        var bare_buf: [512]u8 = undefined;
+        try std.testing.expectEqualStrings(try formatProvisionalProgressLabel(&bare_buf, action, null), capture.events.items[1].progress.text);
+        // Part of the value is not yet a value.
+        try statuses.observeArguments(&hooks, alloc, 7, "call_1", case.partial);
+        try std.testing.expectEqual(@as(usize, 2), capture.events.items.len);
+        const named = case.named orelse continue;
+        try statuses.observeArguments(&hooks, alloc, 7, "call_1", named);
+        try std.testing.expectEqual(@as(usize, 4), capture.events.items.len);
+        try std.testing.expectEqualStrings("call_1", capture.events.items[2].provisional.id.call_id);
+        var named_buf: [512]u8 = undefined;
+        try std.testing.expectEqualStrings(try formatProvisionalProgressLabel(&named_buf, action, case.value), capture.events.items[3].progress.text);
+        // The rest of the arguments stream in without another publication.
+        const more = try std.mem.concat(alloc, u8, &.{ named, "\"" });
+        defer alloc.free(more);
+        try statuses.observeArguments(&hooks, alloc, 7, "call_1", more);
+        try std.testing.expectEqual(@as(usize, 4), capture.events.items.len);
     }
 }
 

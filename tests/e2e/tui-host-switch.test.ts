@@ -4363,12 +4363,38 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
             return messageSteps(steers);
           }
           return toolCall("main_start", "subagent", { request: { action: "message", agent: "lane", message: "LANE_TASK keep working" } });
-        }, async (session) => {
+        }, async (session, { home, launch }) => {
           await session.sendText("SWITCH_USER steer the lane");
           await session.waitForText("MAIN_DONE", 120_000);
           console.log(`STEER_LAST_RESULT: ${lastResult}`);
           // None of the 64 was waiting any more, so the limit doesn't apply.
           expect(lastResult).toContain("Sent into the subagent's running turn");
+          // The lane took each steer into its running turn, so its own screen
+          // shows every one of them, once.
+          await session.waitForComposer(15_000);
+          await showAgent(session, "lane");
+          await session.waitForText("STEER_064 note", 30_000);
+          const lane = await session.captureFullScrollback();
+          expect(lane.split("STEER_001 note").length - 1).toBe(1);
+          expect(lane.split("STEER_064 note").length - 1).toBe(1);
+          // The lane's answer comes once it has taken the steers, so its
+          // turn is saved with them. Then main ends and starts again on the
+          // same session, and the lane's restored screen shows the steers.
+          await session.waitForText("LANE_DONE", 30_000);
+          await showAgent(session, "main");
+          await session.waitForComposer(15_000);
+          await session.sendText("/quit");
+          expect(await session.waitForSessionEnd(15_000)).toBe(true);
+          // Main's session holds the message the user typed, so it is the one to resume.
+          const parents = sessionsHolding(home, "SWITCH_USER steer the lane");
+          expect(parents).toHaveLength(1);
+          const resumed = await launch(`--resume ${parents[0]}`);
+          await showAgent(resumed, "lane");
+          await resumed.waitForText("STEER_064 note", 30_000);
+          const restored = await resumed.captureFullScrollback();
+          expect(restored.split("STEER_001 note").length - 1).toBe(1);
+          expect(restored.split("STEER_064 note").length - 1).toBe(1);
+          expect(restored).not.toContain("parent-agent feedback");
         }, () => {}, false, env);
       } finally {
         // A failed run must not leave gateway handlers waiting.
