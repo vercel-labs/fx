@@ -1497,7 +1497,7 @@ for (const provider of ["codex", "grok"] as const) {
         await Bun.sleep(20);
       }
       await session.sendKeys("C-c");
-      await session.waitForText("What can fx do differently?", TIMEOUT);
+      await session.waitForText("what can fx do differently?", TIMEOUT);
       release();
       await openProviderPicker(session);
       await session.sendKeys("Down");
@@ -1837,7 +1837,7 @@ tmuxTest("provider recovery refuses active logout before deleting a busy subscri
   expect(outcome).toContain("Sign out is unavailable until active and queued work finishes.");
   expect(existsSync(authPath)).toBe(true);
   await session.sendKeys("C-c");
-  await session.waitForText("What can fx do differently?", TIMEOUT);
+  await session.waitForText("what can fx do differently?", TIMEOUT);
   expect(readFileSync(stderrPath, "utf8")).toBe("");
 }, 60_000);
 
@@ -1865,7 +1865,7 @@ tmuxTest("provider recovery validates a Gateway team after a cancelled turn", as
       await Bun.sleep(20);
     }
     await session.sendKeys("C-c");
-    await session.waitForText("What can fx do differently?", TIMEOUT);
+    await session.waitForText("what can fx do differently?", TIMEOUT);
     release();
     await selectFxLoginCredential(session);
     expect(gateway.modelRequests.some((request) =>
@@ -2101,7 +2101,7 @@ for (const scenario of [
       session = await startFx(home, stderrPath, gateway);
       await session.waitForComposer(TIMEOUT);
       await session.sendText("Keep the response active while I inspect provider settings.");
-      await session.waitForText("Generating", TIMEOUT);
+      await session.waitForText("generating", TIMEOUT);
 
       await session.sendText(scenario.command);
       const notice = "Provider switching is unavailable until active and queued work finishes.";
@@ -2113,7 +2113,7 @@ for (const scenario of [
 
       await session.sendKeys("C-u");
       await session.sendInterruptEscapePair(TIMEOUT);
-      await session.waitForText("What can fx do differently?", TIMEOUT);
+      await session.waitForText("what can fx do differently?", TIMEOUT);
       await session.sendText(scenario.command.trim());
       await session.waitForPane(
         (pane) => pane.includes("vercel") && pane.includes("codex") && pane.includes("grok"),
@@ -4000,7 +4000,7 @@ tmuxTest(
           .some((line) => line.includes("openai/gpt-5.6-sol")),
       TIMEOUT,
     );
-    expect(codexCatalog).toContain("< All >");
+    expect(codexCatalog).toContain("< all >");
     for (const vendor of ["Anthropic", "OpenAI", "xAI", "Z.AI", "Others"]) {
       expect(codexCatalog).not.toContain(vendor);
     }
@@ -4146,14 +4146,14 @@ tmuxTest(
     const cancelStarted = Date.now();
     await session.sendKeys("C-c");
     const cancelledPane = await session.waitForText(
-      "What can fx do differently?",
+      "what can fx do differently?",
       TIMEOUT,
     );
     await session.waitForComposer(TIMEOUT);
     expect(Date.now() - cancelStarted).toBeLessThan(500);
-    expect(cancelledPane).toContain("▪ Cancelled");
+    expect(cancelledPane).toContain("▪ cancelled");
     expect(cancelledPane).not.toContain("system: cancelled");
-    expect(cancelledPane).not.toContain("Cancelling");
+    expect(cancelledPane).not.toContain("cancelling");
     expect(session.isAlive()).toBe(true);
     expect(readFileSync(stderrPath, "utf8")).toBe("");
   },
@@ -6685,7 +6685,7 @@ tmuxTest(
         (pane) => /^models\s/m.test(pane) && pane.includes("grok-4.20"),
         TIMEOUT,
       );
-      expect(grokCatalog).toContain("< All >");
+      expect(grokCatalog).toContain("< all >");
       for (const vendor of ["Anthropic", "OpenAI", "xAI", "Z.AI", "Others"]) {
         expect(grokCatalog).not.toContain(vendor);
       }
@@ -7381,7 +7381,7 @@ test("native terminal outcomes preserve recovery and incomplete warnings", async
         expect(output.output).toBe(limited ? "LIMITED_ANSWER" : "RECOVERED_OK");
         if (limited) expect(result.stderr).toContain("response hit provider length limit");
         // A retry shows the recovery module's wording, never the provider's detail.
-        else expect(result.stderr).toMatch(/^\[notice\] Gateway error · next try in 1s · attempt 1$/m);
+        else expect(result.stderr).toMatch(/^\[notice\] gateway error · next try in 1s · attempt 1$/m);
         const detail = await runFx(["session", "--json", "--id", output.session_id], { cwd: profile, env });
         expect(detail.code).toBe(0);
         const history = JSON.parse(detail.stdout).history;

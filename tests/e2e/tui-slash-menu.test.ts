@@ -1963,7 +1963,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       let pane = grid.join("\n");
       expect(pane).toContain("𝒇x");
       expect(pane).toContain("run /help for commands");
-      expect(pane).toContain("< All >");
+      expect(pane).toContain("< all >");
       expect(pane).toContain("/help");
       expect(pane).not.toContain("● /help");
       expect(pane).toContain("show available slash commands");
@@ -1976,7 +1976,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       expect(grid.join("\n")).toContain("< General >");
       await session.sendKeys("BTab");
       grid = await waitForHelpMenu(session, 40);
-      expect(grid.join("\n")).toContain("< All >");
+      expect(grid.join("\n")).toContain("< all >");
 
       await session.sendLiteralText("clipboard");
       grid = await waitForHelpMenu(session, 1);
@@ -2068,7 +2068,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       expect(pane).toContain("𝒇x");
       expect(pane).toContain("run /help for commands");
       // The title shows only the active category; Tab moves through the rest.
-      expect(pane).toContain("settings   < All >");
+      expect(pane).toContain("settings   < all >");
       expect(pane).not.toContain("Interface");
       expect(pane).toContain("↑↓ navigate");
       expect(pane).toContain("tab category");
@@ -2083,7 +2083,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       expect(pane).toContain("< Interface >");
       await session.sendKeys("BTab");
       pane = (await waitForSettingsMenu(session)).join("\n");
-      expect(pane).toContain("< All >");
+      expect(pane).toContain("< all >");
       for (let index = 0; index < 2; index += 1) await session.sendKeys("Down");
       await session.waitForText(/Status line workspace\s+off/, 5_000);
       await session.sendKeys("Right");
@@ -2364,7 +2364,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       expect(alternateCount("\x1b[?1049h")).toBe(entersBeforeSkills);
       expect(alternateCount("\x1b[?1049l")).toBe(leavesBeforeSkills);
       // The title shows only the active source; Tab moves through the rest.
-      expect(pane).toContain("skills   < All >");
+      expect(pane).toContain("skills   < all >");
       expect(pane).not.toContain("Claude");
       expect(pane).toContain("managed-menu");
       expect(pane).toContain("fx · Global");
@@ -2560,7 +2560,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       await session.sendKeys("Tab");
       await session.waitForText("< fx >", 5_000);
       await session.sendKeys("BTab");
-      await session.waitForText("< All >", 5_000);
+      await session.waitForText("< all >", 5_000);
       await session.sendLiteralText("workspace");
       await waitForSkillsMenu(session, 1);
       await session.sendKeys("Enter");
@@ -2806,7 +2806,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       expect(alternateCount("\x1b[?1049h")).toBe(entersBeforeModelMenu);
       expect(alternateCount("\x1b[?1049l")).toBe(leavesBeforeModelMenu);
       // The title shows only the active provider; Tab cycles the rest.
-      expect(pane).toContain("models   < All >");
+      expect(pane).toContain("models   < all >");
       expect(pane).not.toContain("OpenAI");
       expect(pane).not.toContain("Others");
       expect(pane).not.toContain("xAI");
@@ -2950,7 +2950,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       await session.sendKeys("C-p");
       let grid = await waitForModelsMenu(session, 2);
       let pane = grid.join("\n");
-      expect(pane).toContain("< All >");
+      expect(pane).toContain("< all >");
       // Both models come from one provider, so Tab has nothing to switch to
       // and the hint leaves it out.
       expect(pane).not.toContain("tab provider");
@@ -4270,13 +4270,13 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
 
       await session.sendText("Keep this response active.");
       await waitForHeldSkillStream(stream);
-      await session.waitForText("Generating", 10_000);
+      await session.waitForText("generating", 10_000);
       await session.sendLiteralText("$");
       await waitForSkillsMenu(session, 4);
 
       await session.sendKeys("C-[");
       await session.waitForPane(
-        (pane) => pane.includes("Generating") && !pane.includes("↑↓ navigate"),
+        (pane) => pane.includes("generating") && !pane.includes("↑↓ navigate"),
         5_000,
       );
       expect(stream.cancelled).toBe(false);
@@ -4319,14 +4319,14 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
 
       await session.sendText("Keep this slash response active.");
       await waitForHeldSkillStream(stream);
-      await session.waitForText("Generating", 10_000);
+      await session.waitForText("generating", 10_000);
       await session.sendLiteralText("/he");
       await session.waitForText("esc close", 10_000);
 
       await session.sendKeys("Escape");
       await session.waitForPane(
         (pane) =>
-          pane.includes("Generating") &&
+          pane.includes("generating") &&
           pane.includes("/he") &&
           !pane.includes("esc close"),
         5_000,

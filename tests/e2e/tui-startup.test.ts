@@ -67,7 +67,7 @@ describe.skipIf(SKIP)("tui: startup and exit", () => {
       session = await TmuxSession.create();
       await session.waitForComposer(10_000);
       await session.sendText("/help");
-      const pane = await session.waitForText("commands   < All >", 5_000);
+      const pane = await session.waitForText("commands   < all >", 5_000);
       expect(pane).toContain("tab category");
       expect(pane).toContain("enter open");
       expect(pane).toContain("run /help for commands");

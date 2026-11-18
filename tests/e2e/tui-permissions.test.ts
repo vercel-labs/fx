@@ -1147,7 +1147,7 @@ describe.skipIf(!tmuxAvailable())("tui: file permissions", () => {
         {
           name: "denied",
           // The group's only call is its header, which says it was denied.
-          outcome: "● Denied file",
+          outcome: "● denied file",
           resolve: async (session: TmuxSession) => {
             await decide(session, 3);
           },
@@ -1161,7 +1161,7 @@ describe.skipIf(!tmuxAvailable())("tui: file permissions", () => {
         },
         {
           name: "cancelled",
-          outcome: "▪ Cancelled",
+          outcome: "▪ cancelled",
           resolve: async (session: TmuxSession) => {
             await session.sendKeys("Escape");
           },
@@ -1473,7 +1473,7 @@ describe.skipIf(!tmuxAvailable())("tui: file permissions", () => {
       expect(readFileSync(target, "utf8")).toBe("uno\ndos\n");
 
       const grid = await session.capturePaneGrid();
-      const rows = grid.filter((line) => line.startsWith("● Edited edit-row-fixture"));
+      const rows = grid.filter((line) => line.startsWith("● edited edit-row-fixture"));
       expect(rows).toHaveLength(1);
       expect([...rows[0]!.trimEnd()].length).toBeLessThanOrEqual(width);
       // The name clips; the added-up counts and the merge note stay.

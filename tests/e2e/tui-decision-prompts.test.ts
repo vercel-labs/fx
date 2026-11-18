@@ -34,7 +34,7 @@ import { stdoutFrames } from "./render-lab/tape";
 const SKIP = !tmuxAvailable();
 const TIMEOUT = 30_000;
 const OUTER_MODEL = "openai/gpt-5";
-const APPROVAL_PROMPT = "Would you like to run the following command?";
+const APPROVAL_PROMPT = "would you like to run the following command?";
 const DEFAULT_COMMAND_APPROVAL_REASON =
   "Reason: fx needs your approval before running this shell command.";
 const COMMAND_ALWAYS_CHOICE = "Yes, and don't ask again for this exact command";
@@ -1683,7 +1683,7 @@ describe.skipIf(SKIP)("tui: decision prompt input isolation", () => {
       await ctx.session.waitForText("Permission needed", TIMEOUT);
 
       await ctx.session.sendKeys("Escape");
-      const cancelled = await ctx.session.waitForText("▪ Cancelled", TIMEOUT);
+      const cancelled = await ctx.session.waitForText("▪ cancelled", TIMEOUT);
       expect(cancelled).not.toContain(APPROVAL_PROMPT);
 
       await ctx.session.resizeWindow(72, 20);
@@ -1783,7 +1783,7 @@ describe.skipIf(SKIP)("tui: decision prompt input isolation", () => {
 
       await ctx.session.sendText("Create the generic approval acceptance fixture.");
       const pane = await ctx.session.waitForText(
-        "Would you like to run the following command?",
+        "would you like to run the following command?",
         TIMEOUT,
       );
       expect(pane).toContain("# shell.run profile=user shell=");
@@ -2926,13 +2926,13 @@ describe.skipIf(SKIP)("tui: decision prompt input isolation", () => {
       const ctx = await openQuestionPrompt("raw question cancellation completed");
 
       await ctx.session.sendKeys("Escape");
-      const cancelled = await ctx.session.waitForText("▪ Cancelled", TIMEOUT);
-      expect(countOccurrences(cancelled, "▪ Cancelled")).toBe(1);
+      const cancelled = await ctx.session.waitForText("▪ cancelled", TIMEOUT);
+      expect(countOccurrences(cancelled, "▪ cancelled")).toBe(1);
       expect(cancelled).not.toContain(QUESTION_PROMPT);
       expect(cancelled).not.toContain("raw question cancellation completed");
       const cancelledGrid = await ctx.session.capturePaneGrid();
       const footer = findFooterBlocks(cancelledGrid).at(-1);
-      const cancelledRow = cancelledGrid.findIndex((row) => row.includes("▪ Cancelled"));
+      const cancelledRow = cancelledGrid.findIndex((row) => row.includes("▪ cancelled"));
       expect(footer).toBeDefined();
       expect(cancelledRow).toBeGreaterThanOrEqual(0);
       expect(cancelledRow).toBeLessThan(footer!.topDivider);
@@ -2990,18 +2990,18 @@ describe.skipIf(SKIP)("tui: decision prompt input isolation", () => {
         ctx.session,
         "tall question cancellation",
         (grid) =>
-          grid.some((row) => row.includes("▪ Cancelled")) &&
+          grid.some((row) => row.includes("▪ cancelled")) &&
           findFooterBlocks(grid).length > 0,
       );
       expect(cancelledGrid.findIndex((row) => row.trim() === anchorText)).toBe(anchorRow);
-      const cancelledRow = cancelledGrid.findIndex((row) => row.includes("▪ Cancelled"));
+      const cancelledRow = cancelledGrid.findIndex((row) => row.includes("▪ cancelled"));
       const footer = findFooterBlocks(cancelledGrid).at(-1)!;
       expect(footer.topDivider).toBe(cancelledRow + 2);
       expect(cancelledGrid[cancelledRow + 1]!.trim()).toBe("");
       expect(cancelledGrid.at(-1)!.trim()).toBe("");
 
       const history = (await ctx.session.captureFullScrollback()).split("\n");
-      expect(longestBlankRunBetween(history, fillLine(1), "▪ Cancelled")).toBe(1);
+      expect(longestBlankRunBetween(history, fillLine(1), "▪ cancelled")).toBe(1);
       expect(countOccurrences(history.join("\n"), anchorText)).toBe(1);
       expect(ctx.gateway.requests).toHaveLength(2);
       await assertProcessAliveAndClean(ctx);
@@ -3041,11 +3041,11 @@ describe.skipIf(SKIP)("tui: decision prompt input isolation", () => {
         ctx.session,
         "in-place question cancellation",
         (grid) =>
-          grid.some((row) => row.includes("▪ Cancelled")) &&
+          grid.some((row) => row.includes("▪ cancelled")) &&
           findFooterBlocks(grid).length > 0,
       );
       const cancelledFooter = findFooterBlocks(cancelledGrid).at(-1);
-      const cancelledRow = cancelledGrid.findIndex((row) => row.includes("▪ Cancelled"));
+      const cancelledRow = cancelledGrid.findIndex((row) => row.includes("▪ cancelled"));
       expect(cancelledFooter).toBeDefined();
       // The transcript stays at the top and the rows the question freed go
       // below the footer, not above the transcript.
@@ -3063,7 +3063,7 @@ describe.skipIf(SKIP)("tui: decision prompt input isolation", () => {
       const editedFooter = findFooterBlocks(editedGrid).at(-1);
       expect(editedFooter).toEqual(cancelledFooter);
       expect(editedGrid.slice(0, cancelledRow + 1)).toEqual(cancelledGrid.slice(0, cancelledRow + 1));
-      expect(countOccurrences(editedGrid.join("\n"), "▪ Cancelled")).toBe(1);
+      expect(countOccurrences(editedGrid.join("\n"), "▪ cancelled")).toBe(1);
       expect(editedGrid.join("\n")).not.toContain(QUESTION_PROMPT);
       expect(ctx.gateway.requests).toHaveLength(2);
       await assertProcessAliveAndClean(ctx);
@@ -3078,8 +3078,8 @@ describe.skipIf(SKIP)("tui: decision prompt input isolation", () => {
       const ctx = await openQuestionPrompt("kitty question cancellation completed");
 
       await ctx.session.sendHexBytes(CSI_U_ESCAPE);
-      const cancelled = await ctx.session.waitForText("▪ Cancelled", TIMEOUT);
-      expect(countOccurrences(cancelled, "▪ Cancelled")).toBe(1);
+      const cancelled = await ctx.session.waitForText("▪ cancelled", TIMEOUT);
+      expect(countOccurrences(cancelled, "▪ cancelled")).toBe(1);
       expect(cancelled).not.toContain(QUESTION_PROMPT);
       expect(cancelled).not.toContain("kitty question cancellation completed");
 
@@ -3391,7 +3391,7 @@ describe.skipIf(SKIP)("tui: decision prompt input isolation", () => {
       expect(await ctx.session.paneTitle()).not.toContain("MARKDOWN_TITLE");
 
       await ctx.session.sendKeys("Escape");
-      await ctx.session.waitForText("▪ Cancelled", TIMEOUT);
+      await ctx.session.waitForText("▪ cancelled", TIMEOUT);
       await assertProcessAliveAndClean(ctx);
     },
     TIMEOUT,

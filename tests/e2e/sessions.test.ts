@@ -5007,7 +5007,7 @@ test.skipIf(!tmuxAvailable())("an app whose disk fills keeps running, and the se
     await resumed.session.waitForText("LONG_UNSAVED_END", TIMEOUT);
     await resumed.session.waitForComposer(TIMEOUT);
     // The long answer scrolls the resume line out of view.
-    expect(await scrollbackContains(resumed.session, "Resuming the interrupted request")).toContain("Resuming the interrupted request");
+    expect(await scrollbackContains(resumed.session, "resuming the interrupted request")).toContain("resuming the interrupted request");
     expect(gateway.requests.length).toBe(asked + 2);
     await resumed.session.sendText("After the full disk.");
     await resumed.session.waitForText("AFTER_APP_FULL_DISK", TIMEOUT);

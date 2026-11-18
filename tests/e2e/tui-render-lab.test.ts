@@ -483,7 +483,7 @@ test("render-lab analyzer rejects expanded command marker corruption", () => {
 
 test("render-lab analyzer rejects duplicate permission UI", () => {
   outDir = mkdtempSync(join(tmpdir(), "fx-render-lab-analyzer-test-"));
-  const prompt = "Would you like to run the following command?";
+  const prompt = "would you like to run the following command?";
   for (const [name, prompts, rejected] of [
     ["single", [prompt], false],
     ["duplicate", [prompt, prompt], true],

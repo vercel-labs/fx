@@ -31,7 +31,7 @@ import {
 
 const TIMEOUT = 30_000;
 const MODEL = "openai/gpt-5";
-const COMMAND_APPROVAL_PROMPT = "Would you like to run the following command?";
+const COMMAND_APPROVAL_PROMPT = "would you like to run the following command?";
 
 type IsolatedRoot = {
   root: string;

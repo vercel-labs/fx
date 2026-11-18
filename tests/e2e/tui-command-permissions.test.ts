@@ -38,7 +38,7 @@ import {
 
 const TIMEOUT = 30_000;
 const MODEL = "openai/gpt-5";
-const COMMAND_APPROVAL_PROMPT = "Would you like to run the following command?";
+const COMMAND_APPROVAL_PROMPT = "would you like to run the following command?";
 const MANAGE_SUBAGENT_PROGRESS = "Managing subagent\n";
 
 type GatewayRequest = {
@@ -846,7 +846,7 @@ describe("effect-aware command permissions", () => {
       const scrollback = await activeSession.captureFullScrollback();
       // The two commands share one row by their steps, which is the group's
       // line, and the feedback comes after it.
-      const commandsRow = scrollback.indexOf("● Ran touch, printf");
+      const commandsRow = scrollback.indexOf("● ran touch, printf");
       expect(commandsRow).toBeGreaterThanOrEqual(0);
       expect(scrollback.indexOf(feedback)).toBeGreaterThan(commandsRow);
       const rawAnsiScrollback = await activeSession.captureFullScrollbackEscapes();
@@ -1093,7 +1093,7 @@ describe("effect-aware command permissions", () => {
 
       const scrollback = await activeSession.captureFullScrollback();
       // The group's only call is its header.
-      const completedIndex = scrollback.indexOf("● Ran pwd");
+      const completedIndex = scrollback.indexOf("● ran pwd");
       const streamTextIndex = scrollback.indexOf(streamText);
       expect(completedIndex).toBeGreaterThanOrEqual(0);
       expect(streamTextIndex).toBeGreaterThanOrEqual(0);
@@ -1212,7 +1212,7 @@ describe("effect-aware command permissions", () => {
       await activeSession.sendText("Run the prepared command matrix.");
       // The running command joins the row of the command that ran before it,
       // so no row of its own shows first and then folds away.
-      const joinedRow = /Running \S*fxc110-fast\.sh, \S*fxc110-stream\.sh/;
+      const joinedRow = /running \S*fxc110-fast\.sh, \S*fxc110-stream\.sh/;
       await activeSession.waitForText(joinedRow, TIMEOUT);
       await Bun.sleep(250);
       const running = await activeSession.captureFullScrollback();
@@ -1223,7 +1223,7 @@ describe("effect-aware command permissions", () => {
       // The last command failed, so the group ends in ✗, and its row shows
       // one line of the error after the command while the full output stays
       // in Ctrl-O.
-      const header = "● Ran commands ✗";
+      const header = "● ran commands ✗";
       await activeSession.waitForText(header, TIMEOUT);
       const completed = await activeSession.captureFullScrollback();
       expect(completed).toMatch(/exited 7 .* · FXC110_FAILED_STDERR/);

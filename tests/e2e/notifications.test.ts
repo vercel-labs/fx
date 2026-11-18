@@ -22,7 +22,7 @@ import {
 } from "./tmux-helpers";
 
 const TIMEOUT = 30_000;
-const COMMAND_APPROVAL_PROMPT = "Would you like to run the following command?";
+const COMMAND_APPROVAL_PROMPT = "would you like to run the following command?";
 
 function createNotificationRoot(
   notifications = { turn_end: true, attention_required: true },

@@ -768,7 +768,7 @@ test.skipIf(!tmuxAvailable())(
     // The main view shows the launch command's steps in short form. The
     // run, the session's input, and its stop share one row, whose note stays.
     const mainRows = (await session.capturePaneGrid()).map((line) => line.trimEnd());
-    const mainSession = mainRows.find((line) => line.startsWith("● Stopped "));
+    const mainSession = mainRows.find((line) => line.startsWith("● stopped "));
     expect(mainSession).toBe("● stopped echo, sleep · 3 calls ✓");
     expect(mainRows.join("\n")).not.toContain("FULL_LAUNCH_TAIL");
 

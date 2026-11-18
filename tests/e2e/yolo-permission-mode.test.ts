@@ -25,7 +25,7 @@ import { expectPermissionModeContext } from "./permission-mode-context";
 const WARNING = "Full access enabled: fx permission checks disabled";
 const COMPACT_WARNING = "Full access";
 const QUIT_HINT = "press ctrl+c again to exit";
-const COMMAND_APPROVAL_PROMPT = "Would you like to run the following command?";
+const COMMAND_APPROVAL_PROMPT = "would you like to run the following command?";
 const TIMEOUT = 30_000;
 const CONFIGURED_SANDBOX = process.platform === "darwin" ? "os" : "none";
 

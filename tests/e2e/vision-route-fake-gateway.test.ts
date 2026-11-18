@@ -521,7 +521,7 @@ async function expectChangedCanonicalVisionPathFailure(
     });
     await session.waitForPane(hasEmptyComposer, TIMEOUT);
     await session.sendText("Inspect the approved image path.");
-    await session.waitForText("Would you like to allow this action?", TIMEOUT);
+    await session.waitForText("would you like to allow this action?", TIMEOUT);
     await session.waitForText(targetPath, TIMEOUT);
 
     replaceTarget(targetPath);
@@ -3167,7 +3167,7 @@ describe("Vision route fake Gateway", () => {
         await session.sendLiteral(" look at this image");
         await session.sendKeys("Enter");
 
-        await session.waitForText("Would you like to allow this action?", TIMEOUT);
+        await session.waitForText("would you like to allow this action?", TIMEOUT);
         await session.sendKeys("1");
         await session.sendKeys("Enter");
         await session.waitForText("@ home image flow complete", TIMEOUT);
@@ -3281,7 +3281,7 @@ describe("Vision route fake Gateway", () => {
         });
         await session.waitForPane(hasEmptyComposer, TIMEOUT);
         await session.sendText("Inspect the requested Desktop image.");
-        await session.waitForText("Would you like to allow this action?", TIMEOUT);
+        await session.waitForText("would you like to allow this action?", TIMEOUT);
         await session.waitForText(imagePath, TIMEOUT);
         await session.sendKeys("1");
         await session.sendKeys("Enter");
@@ -3350,7 +3350,7 @@ describe("Vision route fake Gateway", () => {
         });
         await session.waitForPane(hasEmptyComposer, TIMEOUT);
         await session.sendText("Inspect the hard-linked image path.");
-        await session.waitForText("Would you like to allow this action?", TIMEOUT);
+        await session.waitForText("would you like to allow this action?", TIMEOUT);
         await session.waitForText(approvedPath, TIMEOUT);
         await session.sendKeys("1");
         await session.sendKeys("Enter");
@@ -3421,7 +3421,7 @@ describe("Vision route fake Gateway", () => {
         });
         await session.waitForPane(hasEmptyComposer, TIMEOUT);
         await session.sendText("Inspect the approved image path.");
-        await session.waitForText("Would you like to allow this action?", TIMEOUT);
+        await session.waitForText("would you like to allow this action?", TIMEOUT);
         await session.waitForText(targetA, TIMEOUT);
 
         rmSync(approvedPath);
@@ -3621,7 +3621,7 @@ describe("Vision route fake Gateway", () => {
         await session.sendText(`/image ${imagePath}`);
         await session.waitForText("attached image: feedback.png", TIMEOUT);
         await session.sendText(rootRequest);
-        await session.waitForText("Would you like to allow this action?", TIMEOUT);
+        await session.waitForText("would you like to allow this action?", TIMEOUT);
         await session.sendKeys("Tab");
         await session.waitForText("Yes, and tell fx what to do next", TIMEOUT);
         await session.sendLiteralText(feedback);
@@ -3698,7 +3698,7 @@ describe("Vision route fake Gateway", () => {
         await session.waitForText("attached image: first.png", TIMEOUT);
         await session.sendText("Inspect the first attached image.");
         const firstApproval = await session.waitForText(
-          "Would you like to allow this action?",
+          "would you like to allow this action?",
           TIMEOUT,
         );
         expect(firstApproval).toContain("inspecting images");
@@ -3711,7 +3711,7 @@ describe("Vision route fake Gateway", () => {
         await session.waitForText("attached image: second.png", TIMEOUT);
         await session.sendText("Inspect the second attached image.");
         const secondApproval = await session.waitForText(
-          "Would you like to allow this action?",
+          "would you like to allow this action?",
           TIMEOUT,
         );
         expect(secondApproval).toContain("inspecting images");

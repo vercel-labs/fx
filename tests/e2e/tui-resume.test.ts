@@ -410,7 +410,7 @@ async function waitForSessionPicker(session: TmuxSession): Promise<string> {
   return session.waitForPane(
     (pane) => {
       const plain = stripAnsi(pane);
-      return plain.includes("sessions   < Current workspace >") || plain.includes("sessions   < All workspaces >");
+      return plain.includes("sessions   < current workspace >") || plain.includes("sessions   < all workspaces >");
     },
     TIMEOUT,
   );
@@ -986,7 +986,7 @@ function expectNoRawToolReplay(scrollback: string): void {
 
 function normalizeVolatileStatusRows(grid: string[]): string[] {
   return grid.map((line) =>
-    /^• (?:thinking|Generating|Running)(?: \(\d+s\))?$/.test(line) ||
+    /^• (?:thinking|generating|Running)(?: \(\d+s\))?$/.test(line) ||
       /^• Streaming \([^)]*\)$/.test(line) ||
       isVolatileTokenStatusRow(line)
       ? "<status>"
@@ -2680,7 +2680,7 @@ test.skipIf(!tmuxAvailable())(
     const prompt =
       "Use the shell tool to run exactly pwd and no other commands. Then reply with the completion marker.";
     // The group's only call is its header, marked with the result.
-    const statusLine = "● Ran pwd ✓";
+    const statusLine = "● ran pwd ✓";
     const outputLine = workspace;
     const reviewOutputPrefix = workspace.slice(0, 56);
     const visibleLinearText = (text: string): string =>
@@ -4026,7 +4026,7 @@ test.skipIf(!tmuxAvailable())(
       });
       await active.waitForComposer(TIMEOUT);
       await active.sendText("Run the prepared folded output command.");
-      await active.waitForText("Would you like to run the following command?", TIMEOUT);
+      await active.waitForText("would you like to run the following command?", TIMEOUT);
       await active.sendKeys("1");
       await active.sendKeys("Enter");
       const beforeHandoff = await waitForScrollback(active, priorSummary);
@@ -4041,7 +4041,7 @@ test.skipIf(!tmuxAvailable())(
       }
 
       await active.sendText("Run the prepared command and then write the file.");
-      await active.waitForText("Would you like to run the following command?", TIMEOUT);
+      await active.waitForText("would you like to run the following command?", TIMEOUT);
       await active.sendKeys("1");
       await active.sendKeys("Enter");
       await active.waitForText("running", TIMEOUT);
@@ -4130,14 +4130,14 @@ test.skipIf(!tmuxAvailable())(
       await active.waitForComposer(TIMEOUT);
       await active.sendText("Run the prepared shell command.");
       await active.sendKeys("C-o");
-      await active.waitForText("Would you like to run the following command?", TIMEOUT);
+      await active.waitForText("would you like to run the following command?", TIMEOUT);
 
       await active.sendKeys("1");
       await active.sendKeys("Enter");
       await active.waitForText("CTRL_O_SHELL_APPROVAL_DONE", TIMEOUT);
       const inline = await active.capturePane();
       expect(inline).toContain("CTRL_O_SHELL_APPROVAL_DONE");
-      expect(inline).not.toContain("Would you like to run the following command?");
+      expect(inline).not.toContain("would you like to run the following command?");
       expect(readFileSync(stderrPath, "utf8")).not.toContain("AnsiBandOverflow");
     } finally {
       if (active) {
@@ -4283,7 +4283,7 @@ test.skipIf(!tmuxAvailable())(
       await active.waitForText(bulletMarker, transcriptTimeout);
 
       await active.sendText("Run the prepared two commands.");
-      await active.waitForText("Would you like to run the following command?", actionTimeout);
+      await active.waitForText("would you like to run the following command?", actionTimeout);
       await active.sendKeys("1");
       await active.sendKeys("Enter");
       // The first command's row appears when it starts, with the steps of its
@@ -4295,7 +4295,7 @@ test.skipIf(!tmuxAvailable())(
 
       await active.sendKeys("C-o");
       await Bun.sleep(150);
-      await active.waitForText("Would you like to run the following command?", actionTimeout);
+      await active.waitForText("would you like to run the following command?", actionTimeout);
       await active.sendKeys("1");
       await active.sendKeys("Enter");
       await waitForScrollback(active, "CTRL_O_HANDOFF_SCROLLBACK_DONE");
@@ -4464,7 +4464,7 @@ test.skipIf(!tmuxAvailable())(
       await active.waitForComposer(TIMEOUT);
 
       await active.sendText("Build the prepared pressure history.");
-      await active.waitForText("Would you like to run the following command?", TIMEOUT);
+      await active.waitForText("would you like to run the following command?", TIMEOUT);
       await active.sendKeys("1");
       await active.sendKeys("Enter");
       const setupScrollback = await waitForScrollbackMarkers(active, [
@@ -4479,7 +4479,7 @@ test.skipIf(!tmuxAvailable())(
       expect(setupScrollback).not.toContain("lines more (ctrl+o to view)");
 
       await active.sendText("Run the prepared streaming command and file review.");
-      await active.waitForText("Would you like to run the following command?", TIMEOUT);
+      await active.waitForText("would you like to run the following command?", TIMEOUT);
       await active.sendKeys("1");
       await active.sendKeys("Enter");
       await active.waitForPane(
@@ -7508,7 +7508,7 @@ printf '${stdoutTail2}\\n'
       });
       await active.waitForComposer(TIMEOUT);
       await active.sendText("Run the long command for resume.");
-      await active.waitForText("Would you like to run the following command?", TIMEOUT);
+      await active.waitForText("would you like to run the following command?", TIMEOUT);
       await active.sendKeys("Enter");
       await active.waitForText(completion, TIMEOUT);
       await active.waitForPane((pane) => pane.includes("ran ./resume-command-output.sh"), TIMEOUT);
@@ -7651,7 +7651,7 @@ test.skipIf(!tmuxAvailable())(
       await waitForSessionPicker(active);
       const currentPicker = stripAnsi(await active.capturePane());
       expect(sessionCount(currentPicker)).toBe(1);
-      expect(currentPicker).toContain("sessions   < Current workspace >");
+      expect(currentPicker).toContain("sessions   < current workspace >");
       expect(currentPicker).toContain("𝒇x");
       expect(currentPicker).toContain("Save the workspace A transcript.");
       expect(currentPicker).not.toContain("Save the workspace B transcript.");
@@ -7660,7 +7660,7 @@ test.skipIf(!tmuxAvailable())(
       await active.waitForPane((pane) => {
         const plain = stripAnsi(pane);
         return sessionCount(plain) === 2 &&
-          plain.includes("sessions   < All workspaces >") &&
+          plain.includes("sessions   < all workspaces >") &&
           plain.includes("Save the workspace B transcript.");
       }, TIMEOUT);
       const allPicker = stripAnsi(await active.capturePane());
@@ -8202,7 +8202,7 @@ test.skipIf(!tmuxAvailable())(
       await active.waitForComposer(TIMEOUT);
       await active.sendText("Keep this response active.");
       await waitForCondition(() => hold.started, "held gateway response");
-      await active.waitForText("Generating", TIMEOUT);
+      await active.waitForText("generating", TIMEOUT);
 
       await active.sendText("/resume");
       await active.waitForText("resume is unavailable until the response finishes", TIMEOUT);
@@ -8229,10 +8229,10 @@ test.skipIf(!tmuxAvailable())(
         height: 40,
       });
       await active.waitForComposer(TIMEOUT);
-      await active.waitForText("What can fx do differently?", TIMEOUT);
+      await active.waitForText("what can fx do differently?", TIMEOUT);
       const resumedGrid = await active.capturePaneGrid();
       const footer = findFooterBlocks(resumedGrid).at(-1);
-      const cancelledRow = resumedGrid.findIndex((row) => row.includes("▪ Cancelled"));
+      const cancelledRow = resumedGrid.findIndex((row) => row.includes("▪ cancelled"));
       expect(footer).toBeDefined();
       expect(cancelledRow).toBeGreaterThanOrEqual(0);
       expect(cancelledRow).toBeLessThan(footer!.topDivider);
@@ -8506,15 +8506,15 @@ test.skipIf(!tmuxAvailable())(
       await active.waitForComposer(TIMEOUT);
       const resumed = stripAnsi(await waitForScrollback(
         active,
-        "What can fx do differently?",
+        "what can fx do differently?",
         timeout,
       ));
       const cancelledIndex = resumed.indexOf("Cancelled");
       expect(cancelledIndex).toBeGreaterThanOrEqual(0);
-      expect(resumed).toContain("▪ Cancelled");
-      expect(countOccurrences(resumed, "What can fx do differently?")).toBe(1);
+      expect(resumed).toContain("▪ cancelled");
+      expect(countOccurrences(resumed, "what can fx do differently?")).toBe(1);
       expect(resumed).not.toContain("system: cancelled");
-      expect(resumed).not.toContain("Cancelling");
+      expect(resumed).not.toContain("cancelling");
       expect(resumed).not.toContain("Interrupted by user after completing");
       expect(resumed).not.toContain("<turn_aborted>");
       const restoredPresentation = resumed.slice(cancelledIndex);
@@ -9188,7 +9188,7 @@ test.skipIf(!tmuxAvailable())(
       const second = await launchFx(fixture, gateway, "-c", "second");
       active = second.session;
       const pane = await active.waitForText("RESUMED_ANSWER_7310", TIMEOUT);
-      expect(pane).toContain("Resuming the interrupted request");
+      expect(pane).toContain("resuming the interrupted request");
       // The killed turn reads as stopped, not as a failure.
       expect(pane).toContain("system: fx stopped before this turn finished");
       expect(pane).not.toContain("system: failed");
@@ -9255,7 +9255,7 @@ test.skipIf(!tmuxAvailable())(
       await plain.session.waitForText(hint, TIMEOUT);
       await Bun.sleep(500);
       expect(held()).toBe(1);
-      expect(await plain.session.capturePane()).not.toContain("Resuming the interrupted request");
+      expect(await plain.session.capturePane()).not.toContain("resuming the interrupted request");
       expect(readFileSync(plain.stderrPath, "utf8")).toBe("");
       await plain.session.kill();
 
@@ -9343,9 +9343,9 @@ test.skipIf(!tmuxAvailable())(
       await Bun.sleep(1_000);
       expect(held()).toBe(2);
       const replayed = await active.captureFullScrollback();
-      expect(replayed).not.toContain("Resuming the interrupted request · attempt");
+      expect(replayed).not.toContain("resuming the interrupted request · attempt");
       // The earlier resumes replay as their line, never as fx's note.
-      expect(replayed).toContain("Resuming the interrupted request");
+      expect(replayed).toContain("resuming the interrupted request");
       expect(replayed).not.toContain(RESUME_NOTE);
       expect(readFileSync(last.stderrPath, "utf8")).toBe("");
     } finally {
@@ -9727,7 +9727,7 @@ test.skipIf(!tmuxAvailable())(
       await active.waitForText("ANSWERED_ONCE_5521", TIMEOUT);
       await Bun.sleep(1_500);
       const pane = await active.capturePane();
-      expect(pane).not.toContain("Resuming the interrupted request");
+      expect(pane).not.toContain("resuming the interrupted request");
       expect(gateway.requests.slice(before).some((request) => request.body.includes(RESUME_NOTE))).toBe(false);
     } finally {
       await active?.kill();

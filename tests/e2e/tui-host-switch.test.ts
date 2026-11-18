@@ -563,7 +563,7 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         await session.waitForText("esc again to interrupt", 10_000);
         await session.sendKeys("Escape");
         // The stop shows before the next key, which must not join the Esc.
-        await session.waitForText("What can fx do differently?", 15_000);
+        await session.waitForText("what can fx do differently?", 15_000);
         await showAgent(session, "main");
         // Main hears of the dropped message from the stopped work's report.
         await session.waitForText("SWITCH_MAIN_SAW_DROP", 30_000);
@@ -677,7 +677,7 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         await session.sendKeys("Escape");
         await session.waitForText("esc again to interrupt", 10_000);
         await session.sendKeys("Escape");
-        await session.waitForText("What can fx do differently?", 15_000);
+        await session.waitForText("what can fx do differently?", 15_000);
         await showAgent(session, "main");
         await session.waitForText("STOP_MAIN_SAW", 30_000);
         held_turn.release();
@@ -735,7 +735,7 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
           await session.sendKeys("Escape");
           await session.waitForText("esc again to interrupt", 10_000);
           await session.sendKeys("Escape");
-          await session.waitForText("What can fx do differently?", 15_000);
+          await session.waitForText("what can fx do differently?", 15_000);
           // The stopped turn is ending, held before its end is handled.
           await until("the stopped turn's held end", () => existsSync(`${endHeld}.1`), 15_000);
           expect(readFileSync(`${endHeld}.1`, "utf8")).toContain("by=user");
@@ -798,7 +798,7 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
           await session.sendKeys("Escape");
           await session.waitForText("esc again to interrupt", 10_000);
           await session.sendKeys("Escape");
-          await session.waitForText("What can fx do differently?", 15_000);
+          await session.waitForText("what can fx do differently?", 15_000);
           await session.sendText("SWITCH_AFTER_ESC");
           await session.waitForText("SWITCH_MAIN_NEXT", 15_000);
           // Main's turn ended with the stop, not when the 30 s wait ran out.

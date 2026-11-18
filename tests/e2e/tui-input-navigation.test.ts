@@ -323,7 +323,7 @@ tmuxTest(
     await waitForExactComposerRow(active, "┃ /");
 
     await active.sendKeys("Enter");
-    await active.waitForText("commands   < All >", READY_TIMEOUT);
+    await active.waitForText("commands   < all >", READY_TIMEOUT);
     await active.sendKeys("Escape");
     await active.waitForPane(
       (pane) => hasEmptyComposer(pane) && !pane.includes("enter open"),
@@ -1904,7 +1904,7 @@ tmuxTest(
       READY_TIMEOUT,
     );
     await active.resizeWindow(80, 24, 300);
-    await active.waitForText("commands   < All >", READY_TIMEOUT);
+    await active.waitForText("commands   < all >", READY_TIMEOUT);
     expect(gateway?.requests).toHaveLength(0);
     expectCleanStderr();
   },

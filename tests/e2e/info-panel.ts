@@ -294,7 +294,7 @@ export function panelSession(panel: InfoPanel): { id: string | null; saved: bool
 
 /// The transcript `grid` shows: the rows above the composer, its bottom-most
 /// `┃` row, without trailing blank rows, and with a running turn's live
-/// activity row, such as `• Thinking (1s) (↑2 ↓0)`, as one placeholder: its
+/// activity row, such as `• thinking (1s) (↑2 ↓0)`, as one placeholder: its
 /// glyph blinks and its counters tick. The footer is left out, since its
 /// status line may change on its own, as a timed warning ends.
 function transcriptRows(grid: string[]): string[] {

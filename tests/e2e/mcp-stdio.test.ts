@@ -394,10 +394,10 @@ describe("modern MCP stdio compatibility", () => {
         "Call the MCP fixture only after I approve its exact arguments.",
       );
       const approval = await tui.waitForText(
-        `Arguments for this request: ${expectedArguments}`,
+        `arguments for this request: ${expectedArguments}`,
         20_000,
       );
-      expect(approval).toContain("Allow this MCP tool call?");
+      expect(approval).toContain("allow this MCP tool call?");
       expect(approval).toContain(TOOL_NAME);
       expect(approval).toContain(
         "This MCP tool needs approval before fx can send the request.",
@@ -3716,7 +3716,7 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"`,
 
       await tui.sendInterruptEscapePair(10_000);
       await tui.waitForText("cancelled mcp_fixture_echo", 10_000);
-      await tui.waitForText("▪ Cancelled", 5_000);
+      await tui.waitForText("▪ cancelled", 5_000);
       const cancel_deadline = Date.now() + 5_000;
       while (Date.now() < cancel_deadline) {
         if (
@@ -4168,11 +4168,11 @@ describe("fx mcp call", () => {
       await tui.waitForComposer(15_000);
       await tui.sendText("Save the list to a file.");
       // The shell command asks first, as any command does in ask mode.
-      await tui.waitForText("Would you like to run the following command?", 20_000);
+      await tui.waitForText("would you like to run the following command?", 20_000);
       await tui.sendKeys("1");
       // Then its `fx mcp call` asks while the command waits, and nothing
       // reaches the server before the answer.
-      const approval = await tui.waitForText("Allow this MCP tool call?", 20_000);
+      const approval = await tui.waitForText("allow this MCP tool call?", 20_000);
       expect(approval).toContain(TOOL_NAME);
       expect(toolCalls(root)).toHaveLength(0);
       await tui.sendKeys("1");

@@ -287,7 +287,7 @@ describe.skipIf(SKIP)("tui: slash commands", () => {
       session = await launchAndWait();
       await session.sendText("/settings");
       const pane = await session.waitForText("←→ change", 5_000);
-      expect(pane).toContain("settings   < All >");
+      expect(pane).toContain("settings   < all >");
       expect(pane).toContain("↑↓ navigate");
       expect(pane).not.toContain("[All]");
     },
@@ -325,12 +325,12 @@ describe.skipIf(SKIP)("tui: slash commands", () => {
         let scrollback = "";
         while (Date.now() < deadline) {
           scrollback = await session.captureFullScrollback();
-          const actualCount = scrollback.split("Unknown command. Try /help.").length - 1;
+          const actualCount = scrollback.split("unknown command. try /help.").length - 1;
           if (actualCount >= expectedCount) break;
           await Bun.sleep(50);
         }
         expect(
-          scrollback.split("Unknown command. Try /help.").length - 1,
+          scrollback.split("unknown command. try /help.").length - 1,
         ).toBe(expectedCount);
       }
     },

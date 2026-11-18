@@ -406,7 +406,7 @@ describe("Ctrl+O full detail", () => {
         "  Checking the folder.",
         `  <time> · gpt-5 · <secs> · in 120 · out 18 · ${genId(1)}`,
         "",
-        "● Ran printf 'alpha\\nbeta\\n'",
+        "● ran printf 'alpha\\nbeta\\n'",
         "    action: run",
         "    yield_time_ms: 30000",
         "    <time>",

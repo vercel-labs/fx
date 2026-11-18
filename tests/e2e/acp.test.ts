@@ -10608,9 +10608,9 @@ describe("acp: model-independent", () => {
           content: "first\n",
         });
         expect(permission.params.options).toEqual([
-          { optionId: "allow_once", name: "Allow once", kind: "allow_once" },
-          { optionId: "allow_always", name: "Allow for this session", kind: "allow_always" },
-          { optionId: "reject_once", name: "Reject", kind: "reject_once" },
+          { optionId: "allow_once", name: "allow once", kind: "allow_once" },
+          { optionId: "allow_always", name: "allow for this session", kind: "allow_always" },
+          { optionId: "reject_once", name: "reject", kind: "reject_once" },
         ]);
         const pendingIndex = first.messages.findIndex(
           (message: any) =>

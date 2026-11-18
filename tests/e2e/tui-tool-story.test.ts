@@ -199,7 +199,7 @@ test.skipIf(!tmuxAvailable())(
     // The two passing checks share a row by their step; the failure keeps
     // its own, with the error's line after it.
     expect(treeRows(checks)).toEqual([
-      "├ Ran sh check.sh",
+      "├ ran sh check.sh",
       expect.stringMatching(/^└ .*sh build\.sh · src\/main\.ts:14:15 - error TS2554: Expected 1 arguments, but got 3\.$/),
     ]);
     expect(checks.some((line) => line.includes("✗ exit"))).toBe(false);
@@ -356,8 +356,8 @@ test.skipIf(!tmuxAvailable())(
     const lines = paneLines(pane);
     // The row names both folders the pattern was searched in.
     expect(treeRows(group(lines, "● searched"))).toEqual([
-      "├ Searched createWindow in src, desktop",
-      "└ Matched *.ts",
+      "├ searched createWindow in src, desktop",
+      "└ matched *.ts",
     ]);
 
     await session.sendKeys("C-o");
@@ -380,9 +380,9 @@ test.skipIf(!tmuxAvailable())(
     // after main.ts, comes last. The header names the kinds of work with no
     // counts.
     expect(treeRows(group(lines, "● read files, searched, ran a command ✓"))).toEqual([
-      "├ Read main.ts, window.ts",
-      "├ Searched createWindow, BrowserWindow",
-      "└ Ran sh check.sh status",
+      "├ read main.ts, window.ts",
+      "├ searched createWindow, BrowserWindow",
+      "└ ran sh check.sh status",
     ]);
 
     // Ctrl+O still shows each call.
@@ -407,8 +407,8 @@ test.skipIf(!tmuxAvailable())(
     expect(rows).toHaveLength(4);
     // Each row names the action and the subagent, with no message; Ctrl+O
     // shows the message.
-    expect(rows[0]).toBe("├ Messaged reviewer");
-    expect(rows[1]).toBe("├ Messaged tester");
+    expect(rows[0]).toBe("├ messaged reviewer");
+    expect(rows[1]).toBe("├ messaged tester");
     expect(lines.join("\n")).not.toContain("Review the createWindow change");
     expect(rows.filter((row) => row.includes("Waited for"))).toHaveLength(1);
     expect(rows[3]).toContain("Checked");

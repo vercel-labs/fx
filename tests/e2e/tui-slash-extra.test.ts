@@ -545,7 +545,7 @@ describe.skipIf(SKIP)("tui: extra slash commands", () => {
     async () => {
       session = await launchAndWait();
       await session.sendText("/skills");
-      const pane = await session.waitForText(/^skills   < All >/m, 5_000);
+      const pane = await session.waitForText(/^skills   < all >/m, 5_000);
       expect(pane).not.toContain("Visible skills (");
     },
     TIMEOUT,

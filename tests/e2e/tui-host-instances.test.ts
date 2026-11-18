@@ -246,7 +246,7 @@ function writeProfile(home: string, name: string, profile: object) {
   writeFileSync(join(dir, "profile.json"), JSON.stringify(profile));
 }
 
-const COMMAND_APPROVAL_PROMPT = "Would you like to run the following command?";
+const COMMAND_APPROVAL_PROMPT = "would you like to run the following command?";
 
 // The saved session in `sessions/v2/<id>` whose files hold `marker`, by id.
 function sessionHolding(home: string, marker: string): string | null {
@@ -2241,7 +2241,7 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
         await session.waitForComposer(15_000);
         await session.sendText("HOST_R refused");
         // The provider refuses it, so it waits on fx 2's screen for Esc.
-        await session.waitForText("The provider rejected this request · press Esc", 30_000);
+        await session.waitForText("the provider rejected this request · press esc", 30_000);
         await switchAgent(session, "previous");
         await session.waitForPane((pane) => pane.includes("fx 1/2") && pane.includes("fx 2 needs you · fx 1/2 \u2193"), 15_000);
         await session.sendText("/agents");
@@ -2252,7 +2252,7 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
         await switchAgent(session, "next");
         await session.waitForPane((pane) => pane.includes("fx 2/2") && pane.includes("press Esc"), 15_000);
         await session.sendKeys("Escape");
-        await session.waitForPane((pane) => !pane.includes("The provider rejected this request"), 15_000);
+        await session.waitForPane((pane) => !pane.includes("the provider rejected this request"), 15_000);
         await switchAgent(session, "previous");
         await session.waitForPane((pane) => pane.includes("fx 1/2"), 15_000);
         await Bun.sleep(300);

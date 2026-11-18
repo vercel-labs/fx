@@ -460,7 +460,7 @@ test.skipIf(!tmuxAvailable())(
       await session.waitForComposer(TIMEOUT);
       await session.sendText("/skills");
       await session.waitForText("↓ 284 more", TIMEOUT);
-      await closeSurface(session, "skills   < All >");
+      await closeSurface(session, "skills   < all >");
 
       const newest = writeGenerationSkill(fixture.generationSkillPath, 999);
       sendOverlappingSkillCommands(session, newest);
@@ -551,7 +551,7 @@ test.skipIf(!tmuxAvailable())(
       await active.waitForComposer(TIMEOUT);
       await active.sendText("/skills");
       await active.waitForText("↓ 284 more", TIMEOUT);
-      await closeSurface(active, "skills   < All >");
+      await closeSurface(active, "skills   < all >");
 
       writeFileSync(
         join(candidate, "SKILL.md"),
@@ -614,7 +614,7 @@ test.skipIf(!tmuxAvailable())(
       await active.waitForComposer(TIMEOUT);
       active.sendLiteralImmediate("$global");
       await active.waitForText("global-skill", TIMEOUT);
-      await closeSurface(active, "skills   < All >");
+      await closeSurface(active, "skills   < all >");
 
       sendOverlappingSkillCommands(active, "global-skill");
       await active.waitForText("global-skill", 5_000);
@@ -896,7 +896,7 @@ test.skipIf(!ENABLED || !tmuxAvailable())(
           () => session!.waitForText("↓ 139 more", TIMEOUT),
           "↓ 139 more",
         );
-        await closeSurface(session, "skills   < All >");
+        await closeSurface(session, "skills   < all >");
         if (cycle >= WARMUPS) {
           appendMeasured(samples.dollarOpen, dollarOpen);
           appendMeasured(samples.dollarQuery, dollarQuery);
