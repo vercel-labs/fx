@@ -425,7 +425,7 @@ async function runActiveToolPlacement(
     markers: {
       shell: [],
       submitted: ["exercise one active command placement"],
-      history: ["Run /help for commands"],
+      history: ["run /help for commands"],
     },
     frames: [],
     failures: [],
@@ -669,7 +669,7 @@ async function runUserCardResizeReplayScrollback(
     markers: {
       shell: [],
       submitted: [promptHead, promptTail],
-      history: ["Run /help for commands"],
+      history: ["run /help for commands"],
     },
     frames: [],
     failures: [],
@@ -808,7 +808,7 @@ async function runTuiObservabilityGauntlet(
       clearedShell: [shellMarker],
       submitted: [promptHead, promptTail],
       history: [
-        "Run /help for commands",
+        "run /help for commands",
         OBSERVABILITY_TRANSCRIPT_HEAD,
         OBSERVABILITY_TRANSCRIPT_TAIL,
         "OBSERVABILITY_TOOL_OUTPUT",
@@ -1073,7 +1073,7 @@ async function runStartupScrollbackOverflow(
         `SHELL_OVERFLOW_END_${markerSuffix}`,
       ],
       submitted: [promptTail],
-      history: [promptHead, "Run /help for commands"],
+      history: [promptHead, "run /help for commands"],
     },
     frames: [],
     failures: [],
@@ -1638,7 +1638,7 @@ async function launchFx(
     `${environmentPrefix}FX_RECORD=${shQuote(context.manifest.tapePath)} FX_RECORD_INPUT=1 ${shQuote(FX_BIN)}${stderrRedirect}`,
   );
   await capture(context, session, `${label}-fx-launch-requested`);
-  await session.waitForPane((pane) => pane.includes("Run /help for commands"), 25_000);
+  await session.waitForPane((pane) => pane.includes("run /help for commands"), 25_000);
   await capture(context, session, `${label}-fx-prompt-visible`);
 }
 

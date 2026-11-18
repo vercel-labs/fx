@@ -370,7 +370,7 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
           const pane = await session.waitForPane((value) => value.includes(`HOST_ANSWER_${letter}`), 30_000);
           // Each instance opens with fx's welcome, on the model the launch
           // chose, and shows only its own turn.
-          expect(pane).toContain("Run /help for commands");
+          expect(pane).toContain("run /help for commands");
           expect(pane).toContain("auto · gpt-5");
           expect(pane).toContain(`fx ${index + 1}/3 \u2193`);
           expect(shownAnswers(pane)).toEqual([`HOST_ANSWER_${letter}`]);
@@ -405,7 +405,7 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
 
         await session.sendText("/launch");
         const launched = await session.waitForPane((pane) => pane.includes("fx 3/3"), 15_000);
-        expect(launched).toContain("Run /help for commands");
+        expect(launched).toContain("run /help for commands");
         expect(shownAnswers(launched)).toEqual([]);
         await session.waitForComposer(15_000);
         await session.sendText("HOST_D launched");
@@ -758,7 +758,7 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
     async () => {
       await withHost(answerByLetter, { instances: 2, remainOnExit: true }, async ({ home, session }) => {
         await session.sendText("/close");
-        await session.waitForPane((pane) => !/fx \d+\/\d+/.test(pane) && pane.includes("Run /help for commands"), 15_000);
+        await session.waitForPane((pane) => !/fx \d+\/\d+/.test(pane) && pane.includes("run /help for commands"), 15_000);
         await session.waitForComposer(15_000);
         await session.sendText("HOST_B last one");
         await session.waitForText("HOST_ANSWER_B", 30_000);

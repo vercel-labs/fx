@@ -127,7 +127,7 @@ await Promise.race([
   new Promise((_, reject) => setTimeout(() => reject(new Error("timed out waiting for fx-term to become interactive")), 5000)),
 ]);
 const startupDeadline = performance.now() + 5000;
-while (!streamedText.includes("Run /help for commands")) {
+while (!streamedText.includes("run /help for commands")) {
   if (performance.now() >= startupDeadline) throw new Error("timed out waiting for startup output");
   await new Promise((resolve) => setTimeout(resolve, 10));
 }
@@ -175,7 +175,7 @@ const text = new TextDecoder().decode(Buffer.concat(output.map((chunk) => Buffer
 
 if (exitCode !== 0) throw new Error(`fx-term exited with code ${exitCode}`);
 if (!text.includes("𝒇x")) throw new Error("shared fx welcome frame was not observed");
-if (!text.includes("Run /help for commands")) throw new Error("shared fx welcome guidance was not observed");
+if (!text.includes("run /help for commands")) throw new Error("shared fx welcome guidance was not observed");
 if (requestedModel !== "sdk/term-model") throw new Error(`terminal prompt did not use the host-restored model: ${requestedModel}`);
 if (!(streamStartedAt < secondRequestAt)) throw new Error("terminal started steering before the active response");
 if (!(draftVisibleAt < steeringSubmittedAt)) throw new Error("terminal did not render the steering draft before submission");

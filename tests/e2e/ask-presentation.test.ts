@@ -855,15 +855,15 @@ describe("fx ask presentation", () => {
         while (Date.now() < headerDeadline) {
           initialScrollback = await session.captureFullScrollback();
           if (
-            initialScrollback.includes("Run /help for commands") &&
+            initialScrollback.includes("run /help for commands") &&
             initialScrollback.includes("Stream every answer line.")
           ) break;
           await Bun.sleep(25);
         }
-        expect(initialScrollback).toContain("Run /help for commands");
+        expect(initialScrollback).toContain("run /help for commands");
         expect(initialScrollback).toContain("Stream every answer line.");
         expect(initialScrollback).not.toContain(answerLines[0]!);
-        expect(initialScrollback.indexOf("Run /help for commands")).toBeLessThan(
+        expect(initialScrollback.indexOf("run /help for commands")).toBeLessThan(
           initialScrollback.indexOf("Stream every answer line."),
         );
 
@@ -883,7 +883,7 @@ describe("fx ask presentation", () => {
 
       await session.waitForText("__FX_EXIT_0__", TIMEOUT);
       const finalScrollback = await session.captureFullScrollback();
-      expect(finalScrollback.split("Run /help for commands")).toHaveLength(2);
+      expect(finalScrollback.split("run /help for commands")).toHaveLength(2);
       for (const line of answerLines) {
         expect(finalScrollback.split(line)).toHaveLength(2);
       }

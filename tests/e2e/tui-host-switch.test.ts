@@ -396,7 +396,7 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
           pane.includes("SWITCH_CHILD_ANSWER") && pane.includes("reviewer \u00b7 "), 15_000);
         expect(subagent).toContain("SWITCH_TASK look for nothing");
         // A new subagent opens with fx's welcome, as a fresh fx does.
-        expect(subagent).toContain("Run /help for commands");
+        expect(subagent).toContain("run /help for commands");
         expect(subagent).not.toContain("SWITCH_MAIN_FINAL");
         expect(await session.captureFullScrollback()).not.toContain("SWITCH_USER");
 
@@ -1780,7 +1780,7 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
           pane.includes("SWITCH_SAVED_ANSWER") && pane.includes("reviewer \u00b7 done"), 15_000);
         expect(subagent).toContain("SWITCH_SAVED_TASK");
         // One with a saved conversation shows it instead, as a resumed fx does.
-        expect(subagent).not.toContain("Run /help for commands");
+        expect(subagent).not.toContain("run /help for commands");
         await showAgent(resumed, "main");
         await resumed.waitForPane((pane) => pane.includes("SWITCH_MAIN_FINAL"), 15_000);
       });

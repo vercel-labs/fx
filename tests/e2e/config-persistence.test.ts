@@ -412,7 +412,7 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
           env: catalogEnv,
           stderrPath: stderrAPath,
         });
-        await session.waitForText("Run /help", TIMEOUT);
+        await session.waitForText("run /help", TIMEOUT);
         await session.sendKeys("BTab");
         await session.waitForText("auto ·", TIMEOUT);
         await session.pasteText("/model anthropic/claude-opus-4.7 auto normal");
@@ -502,7 +502,7 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
         await session.sendText("/settings");
         await session.waitForText("←→ change", TIMEOUT);
         // The list shows five settings at a time, so the search finds each.
-        for (const [query, shown] of [["model", "anthropic/claude-opus-4.7"], ["startup", "Startup scrollback"], ["prompt history", "Prompt history"]]) {
+        for (const [query, shown] of [["model", "anthropic/claude-opus-4.7"], ["startup", "startup scrollback"], ["prompt history", "prompt history"]]) {
           await session.sendLiteralText(query);
           await session.waitForText(shown, TIMEOUT);
           await session.sendKeys("C-u");
@@ -585,7 +585,7 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
           env: { ...NO_AUTH, HOME: home },
           stderrPath: stderrAPath,
         });
-        await session.waitForText("Run /help", TIMEOUT);
+        await session.waitForText("run /help", TIMEOUT);
         await session.sendText('/allowlist add command "local-a *"');
         await session.waitForText("(scope=workspace)", TIMEOUT);
         await session.sendText('/allowlist global add command "user *"');
@@ -608,7 +608,7 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
           env: { ...NO_AUTH, HOME: home },
           stderrPath: stderrBPath,
         });
-        await session.waitForText("Run /help", TIMEOUT);
+        await session.waitForText("run /help", TIMEOUT);
         await session.sendText("/allowlist view workspace");
         await session.waitForText(
           "* allowlist: workspace persistent allow rules: (none)",
@@ -711,7 +711,7 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
           env: { ...NO_AUTH, HOME: home },
           stderrPath,
         });
-        await session.waitForText("Run /help", TIMEOUT);
+        await session.waitForText("run /help", TIMEOUT);
         await session.sendText("/output quiet");
         await session.waitForText("fx needs access to Vercel AI Gateway", TIMEOUT);
         expect(composerContains(await session.capturePane(), "/output quiet")).toBe(
@@ -784,7 +784,7 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
           },
           stderrPath,
         });
-        await session.waitForText("Run /help", TIMEOUT);
+        await session.waitForText("run /help", TIMEOUT);
         await session.sendLiteral("/model");
         await session.sendKeys("Tab");
         await session.waitForText("xai/grok-build-1", TIMEOUT);
@@ -968,7 +968,7 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
           },
           stderrPath,
         });
-        await session.waitForText("Run /help", TIMEOUT);
+        await session.waitForText("run /help", TIMEOUT);
         await session.sendText("/fast");
         const pane = await session.waitForText(
           "This model does not come with a fast mode.",
@@ -1025,7 +1025,7 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
           },
           stderrPath,
         });
-        await session.waitForText("Run /help", TIMEOUT);
+        await session.waitForText("run /help", TIMEOUT);
         await session.sendText("/settings");
         await session.waitForText("←→ change", TIMEOUT);
         await session.sendLiteral("reason");
@@ -1140,7 +1140,7 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
           env: gatewayEnv,
           stderrPath,
         });
-        await session.waitForText("Run /help", TIMEOUT);
+        await session.waitForText("run /help", TIMEOUT);
         await session.sendLiteral("/model openai");
         await session.waitForText("openai/gpt-5", TIMEOUT);
         await session.sendKeys("C-u");
@@ -1297,7 +1297,7 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
           env: gatewayEnv,
           stderrPath,
         });
-        await session.waitForText("Run /help", TIMEOUT);
+        await session.waitForText("run /help", TIMEOUT);
         await session.sendLiteral("/model sol");
         await session.waitForText("openai/gpt-5.6-sol", TIMEOUT);
         await session.sendKeys("Enter");
@@ -1382,7 +1382,7 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
           },
           stderrPath,
         });
-        await session.waitForText("Run /help", TIMEOUT);
+        await session.waitForText("run /help", TIMEOUT);
         await session.sendLiteral("/model fable");
         await session.waitForText("anthropic/claude-fable-5", TIMEOUT);
         await session.sendKeys("Enter");
@@ -1530,7 +1530,7 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
           },
           stderrPath,
         });
-        await session.waitForText("Run /help", TIMEOUT);
+        await session.waitForText("run /help", TIMEOUT);
         await session.sendText("/statusline context");
         await session.waitForText("* statusline: context: on", TIMEOUT);
         await session.sendLiteral("/model new-reasoning");
@@ -1642,7 +1642,7 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
           },
           stderrPath,
         });
-        await session.waitForText("Run /help", TIMEOUT);
+        await session.waitForText("run /help", TIMEOUT);
         await session.sendText("/settings startup-scrollback off");
         await session.waitForText("startup_scrollback: off", TIMEOUT);
         await session.sendText("/quit");
@@ -1694,7 +1694,7 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
           env: { ...NO_AUTH, HOME: home },
           stderrPath,
         });
-        await session.waitForText("Run /help", TIMEOUT);
+        await session.waitForText("run /help", TIMEOUT);
         expect(await session.capturePane()).not.toContain("workspace-write-failure-visible");
 
         rmSync(settingsPath);
@@ -1777,7 +1777,7 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
         cwd: workspaceRoot,
         env: { ...NO_AUTH, HOME: home },
       });
-      await session.waitForText("Run /help", TIMEOUT);
+      await session.waitForText("run /help", TIMEOUT);
       expect(await session.capturePane()).not.toContain(
         "legacy_workspace_preferences",
       );
@@ -1850,8 +1850,8 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
           TmuxSession.create({ cwd: workspaceRoot, env }),
         ]);
         await Promise.all([
-          session.waitForText("Run /help", TIMEOUT),
-          secondSession.waitForText("Run /help", TIMEOUT),
+          session.waitForText("run /help", TIMEOUT),
+          secondSession.waitForText("run /help", TIMEOUT),
         ]);
         await Promise.all([
           session.sendText("/settings startup-scrollback off"),
@@ -1946,8 +1946,8 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
           }),
         ]);
         await Promise.all([
-          session.waitForText("Run /help", TIMEOUT),
-          secondSession.waitForText("Run /help", TIMEOUT),
+          session.waitForText("run /help", TIMEOUT),
+          secondSession.waitForText("run /help", TIMEOUT),
         ]);
 
         await session.sendText(`/workspace remove ${savedRoots[0]}`);
@@ -2028,7 +2028,7 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
           },
           stderrPath,
         });
-        await session.waitForText("Run /help", TIMEOUT);
+        await session.waitForText("run /help", TIMEOUT);
         await session.sendText(`/workspace add ${addedRoot}`);
         await session.waitForText(
           "Workspace settings were not changed: additional directory limit reached",
@@ -2081,7 +2081,7 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
           },
           stderrPath,
         });
-        await session.waitForText("Run /help", TIMEOUT);
+        await session.waitForText("run /help", TIMEOUT);
         rmSync(savedLink);
         await session.sendText(`/workspace remove ${savedLink}`);
         await session.waitForText("additional directories: (none)", TIMEOUT);
@@ -2138,7 +2138,7 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
           },
           stderrPath,
         });
-        await session.waitForText("Run /help", TIMEOUT);
+        await session.waitForText("run /help", TIMEOUT);
         rmSync(savedLink);
         symlinkSync(second, savedLink, "dir");
         await session.sendText(`/workspace remove ${firstRoot}`);
@@ -2200,7 +2200,7 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
           },
           stderrPath,
         });
-        await session.waitForText("Run /help", TIMEOUT);
+        await session.waitForText("run /help", TIMEOUT);
         writeFileSync(
           settingsPath,
           JSON.stringify({
@@ -2302,7 +2302,7 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
           env,
           stderrPath: stderrAPath,
         });
-        await session.waitForText("Run /help", TIMEOUT);
+        await session.waitForText("run /help", TIMEOUT);
         writeFileSync(
           settingsPath,
           JSON.stringify({
@@ -2345,7 +2345,7 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
           env,
           stderrPath: stderrBPath,
         });
-        await secondSession.waitForText("Run /help", TIMEOUT);
+        await secondSession.waitForText("run /help", TIMEOUT);
         await secondSession.sendText("/workspace list");
         await secondSession.waitForText(unseenBeforeRoot, TIMEOUT);
         await secondSession.waitForText(survivorRoot, TIMEOUT);
@@ -2403,7 +2403,7 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
           },
           stderrPath,
         });
-        await session.waitForText("Run /help", TIMEOUT);
+        await session.waitForText("run /help", TIMEOUT);
 
         symlinkSync(first, unseenLink, "dir");
         writeFileSync(
@@ -2483,7 +2483,7 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
           env,
           stderrPath: stderrAPath,
         });
-        await session.waitForText("Run /help", TIMEOUT);
+        await session.waitForText("run /help", TIMEOUT);
         rmSync(savedLink);
         symlinkSync(second, savedLink, "dir");
         await session.sendText(`/workspace add ${addedRoot}`);
@@ -2504,7 +2504,7 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
           env,
           stderrPath: stderrBPath,
         });
-        await secondSession.waitForText("Run /help", TIMEOUT);
+        await secondSession.waitForText("run /help", TIMEOUT);
         await secondSession.sendText("/workspace list");
         await secondSession.waitForText(firstRoot, TIMEOUT);
         await secondSession.waitForText(addedRoot, TIMEOUT);
@@ -2548,7 +2548,7 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
           env,
           stderrPath: stderrAPath,
         });
-        await session.waitForText("Run /help", TIMEOUT);
+        await session.waitForText("run /help", TIMEOUT);
         await session.sendText(`/workspace add ${sharedRoot}`);
         await session.waitForPane(
           (pane) =>
@@ -2573,7 +2573,7 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
           env,
           stderrPath: stderrBPath,
         });
-        await secondSession.waitForText("Run /help", TIMEOUT);
+        await secondSession.waitForText("run /help", TIMEOUT);
         await secondSession.sendText("/workspace list");
         await secondSession.waitForText(sharedRoot, TIMEOUT);
         await secondSession.waitForPane(
@@ -2623,7 +2623,7 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
           env,
           stderrPath,
         });
-        await session.waitForText("Run /help", TIMEOUT);
+        await session.waitForText("run /help", TIMEOUT);
         await session.sendText(`/workspace add ${sharedRoot}`);
         await session.waitForPane(
           (pane) =>
@@ -2713,7 +2713,7 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
             },
             stderrPath,
           });
-          await session.waitForText("Run /help", TIMEOUT);
+          await session.waitForText("run /help", TIMEOUT);
 
           symlinkSync(realParent, parentLink, "dir");
           await session.sendText("/workspace list");
@@ -2779,7 +2779,7 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
           env,
           stderrPath,
         });
-        await session.waitForText("Run /help", TIMEOUT);
+        await session.waitForText("run /help", TIMEOUT);
         await session.sendText(`/workspace remove ${unknownRoot}`);
         await session.waitForText(
           "Workspace update rejected: directory is not configured as an additional workspace",

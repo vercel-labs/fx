@@ -214,7 +214,7 @@ async function runUltrafastTerminal(scenario) {
   }
   try {
     await runtime.interactive;
-    await waitFor(() => grid().includes("Run /help for commands"), "startup frame");
+    await waitFor(() => grid().includes("run /help for commands"), "startup frame");
     assert.equal(gets, 0, "Ultrafast must not add synchronous catalog I/O to startup");
     if (scenario === "unsupported") {
       runtime.write("unsupported ultra request\r");
@@ -407,7 +407,7 @@ async function runFastTerminal(scenario, sessionStore = createFastSessionStore()
   }
   try {
     await runtime.interactive;
-    await waitFor(() => grid().includes(resumed ? "session resumed" : "Run /help for commands"), "startup frame");
+    await waitFor(() => grid().includes(resumed ? "session resumed" : "run /help for commands"), "startup frame");
     assert.equal(gets, 0, "Fast must not add synchronous catalog I/O to startup");
     assert.equal(posts.length, 0);
     assert.deepEqual(configReads, ["model", "mode"]);

@@ -66,7 +66,7 @@ function selectedSlashRowIndex(escapes: string): number {
 }
 
 test("slash menu selection index ignores the welcome header help hint", () => {
-  const header = `${SELECTED_COMPLETION_SGR}𝒇x\x1b[0m${DIM_SGR} v0.3.27 · Run /help for commands`;
+  const header = `${SELECTED_COMPLETION_SGR}𝒇x\x1b[0m${DIM_SGR} v0.3.27 · run /help for commands`;
   const unselected = "\x1b[38;5;245m/help show available slash commands";
   const selected = `${SELECTED_COMPLETION_SGR}  /clear\x1b[38;5;245m start a fresh session and keep background processes`;
 
@@ -1962,7 +1962,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       let grid = await waitForHelpMenu(session, 40);
       let pane = grid.join("\n");
       expect(pane).toContain("𝒇x");
-      expect(pane).toContain("Run /help for commands");
+      expect(pane).toContain("run /help for commands");
       expect(pane).toContain("< All >");
       expect(pane).toContain("/help");
       expect(pane).not.toContain("● /help");
@@ -2066,7 +2066,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       const grid = await waitForSettingsMenu(session);
       let pane = grid.join("\n");
       expect(pane).toContain("𝒇x");
-      expect(pane).toContain("Run /help for commands");
+      expect(pane).toContain("run /help for commands");
       // The title shows only the active category; Tab moves through the rest.
       expect(pane).toContain("settings   < All >");
       expect(pane).not.toContain("Interface");
@@ -2360,7 +2360,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       grid = await waitForSkillsMenu(session, 4);
       const pane = grid.join("\n");
       expect(pane).toContain("𝒇x");
-      expect(pane).toContain("Run /help for commands");
+      expect(pane).toContain("run /help for commands");
       expect(alternateCount("\x1b[?1049h")).toBe(entersBeforeSkills);
       expect(alternateCount("\x1b[?1049l")).toBe(leavesBeforeSkills);
       // The title shows only the active source; Tab moves through the rest.
@@ -2592,7 +2592,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
 
       await session.sendText("/help");
       grid = await waitForHelpMenu(session, 40);
-      expect(grid.join("\n")).toContain("Run /help for commands");
+      expect(grid.join("\n")).toContain("run /help for commands");
       expect(alternateCount("\x1b[?1049h")).toBe(entersBeforeSkills);
       expect(alternateCount("\x1b[?1049l")).toBe(leavesBeforeSkills);
       await session.sendKeys("Escape");
@@ -2603,7 +2603,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
 
       await session.sendText("/settings");
       grid = await waitForSettingsMenu(session);
-      expect(grid.join("\n")).toContain("Run /help for commands");
+      expect(grid.join("\n")).toContain("run /help for commands");
       expect(alternateCount("\x1b[?1049h")).toBe(entersBeforeSkills);
       expect(alternateCount("\x1b[?1049l")).toBe(leavesBeforeSkills);
       await session.sendKeys("Escape");
@@ -2615,7 +2615,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       await session.sendText("/resume");
       await session.waitForText("sessions   <", 5_000);
       grid = await session.capturePaneGrid();
-      expect(grid.join("\n")).toContain("Run /help for commands");
+      expect(grid.join("\n")).toContain("run /help for commands");
       expect(alternateCount("\x1b[?1049h")).toBe(entersBeforeSkills);
       expect(alternateCount("\x1b[?1049l")).toBe(leavesBeforeSkills);
       await session.sendKeys("Escape");
@@ -2802,7 +2802,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       let grid = await waitForModelsMenu(session, 4);
       let pane = grid.join("\n");
       expect(pane).toContain("𝒇x");
-      expect(pane).toContain("Run /help for commands");
+      expect(pane).toContain("run /help for commands");
       expect(alternateCount("\x1b[?1049h")).toBe(entersBeforeModelMenu);
       expect(alternateCount("\x1b[?1049l")).toBe(leavesBeforeModelMenu);
       // The title shows only the active provider; Tab cycles the rest.

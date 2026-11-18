@@ -188,7 +188,7 @@ async function start(env = {}) {
     stderr: capture.stderr,
   });
   await waitFor(
-    () => capture.transcript().includes("Run /help for commands"),
+    () => capture.transcript().includes("run /help for commands"),
     "fx-term startup",
     () => JSON.stringify(capture.transcript().slice(-1000)),
   );

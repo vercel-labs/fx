@@ -193,7 +193,7 @@ async function runScenario(name) {
       stderr(bytes) { state.stderr += new TextDecoder().decode(bytes); },
       onEvent(event) { state.events.push(event); },
     });
-    await waitFor(() => grid(terminal).includes(args.length ? "session resumed" : "Run /help for commands") && emptyComposer(grid(terminal)), "terminal startup");
+    await waitFor(() => grid(terminal).includes(args.length ? "session resumed" : "run /help for commands") && emptyComposer(grid(terminal)), "terminal startup");
     return state;
   }
   async function stop() {

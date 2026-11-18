@@ -6359,7 +6359,7 @@ test.skipIf(!tmuxAvailable())(
     copyFileSync(FX_BIN, installedFx);
     chmodSync(installedFx, 0o755);
 
-    const welcome = "Run /help for commands";
+    const welcome = "run /help for commands";
     let active: TmuxSession | null = null;
     const gateway = startFakeGateway([]);
     const release = startUpgradeServer(root, argvLogPath);
@@ -6663,8 +6663,8 @@ for (const startupScrollback of [undefined, false] as const) {
         reply: null,
         startupScrollback,
       });
-      expectGapKeepsScreen(screens, "Run /help for commands");
-      expect(countOccurrences(screens.redrawn, "Run /help for commands")).toBe(1);
+      expectGapKeepsScreen(screens, "run /help for commands");
+      expect(countOccurrences(screens.redrawn, "run /help for commands")).toBe(1);
     },
     UPGRADE_TIMEOUT * 2,
   );

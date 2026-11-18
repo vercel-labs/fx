@@ -191,8 +191,15 @@ export function submittedFrames(tapePath: string, command: string): { typed: num
 /// value the tests read holds one.
 /// `width` is the terminal's; by default the widest row's, since `fx replay`
 /// writes every row at the terminal's full width.
+/// A panel title or row label as fx draws it: lowercase, except words with
+/// no lowercase letter, such as "MCP" or "ID". The panel's `labels` and
+/// `fields` keep the names this file lists.
+export function uiCase(text: string): string {
+  return text.split(" ").map((word) => (/^[A-Z][a-z]+$/.test(word) ? word.toLowerCase() : word)).join(" ");
+}
+
 export function infoPanel(grid: string[], title: PanelTitle, width = Math.max(...grid.map((row) => [...row].length))): InfoPanel | null {
-  const top = grid.findIndex((row, at) => row.trimEnd() === title && /^(?: *| {2,}\S.*)$/.test(grid[at + 1] ?? ""));
+  const top = grid.findIndex((row, at) => row.trimEnd() === uiCase(title) && /^(?: *| {2,}\S.*)$/.test(grid[at + 1] ?? ""));
   if (top < 0) return null;
   const known = [...PANELS[title].labels].sort((a, b) => b.length - a.length);
   const rows: string[] = [];
@@ -207,7 +214,7 @@ export function infoPanel(grid: string[], title: PanelTitle, width = Math.max(..
   const first = (grid[top + 1] ?? "").trim() === "" ? top + 2 : top + 1;
   for (let row = first; row < grid.length; row++) {
     const text = grid[row]!.trimEnd();
-    const named = known.find((candidate) => new RegExp(`^ {2}${candidate} {2,}\\S`).test(text));
+    const named = known.find((candidate) => new RegExp(`^ {2}${uiCase(candidate)} {2,}\\S`).test(text));
     let value: string;
     if (!label && !named && /^ {3,}\S/.test(text)) {
       // Scrolled: the line continues a row whose label is above the panel.
@@ -260,7 +267,7 @@ export function permissionsPanel(grid: string[], width?: number): InfoPanel | nu
 /// Whether `grid` shows any piece of the panel titled `title`: the panel,
 /// or a line only it draws.
 export function showsPanel(grid: string[], title: PanelTitle): boolean {
-  const own = title === "Status" ? /^ {2}Session grants {2,}\S/ : /^ {2}Change mode {2,}\S/;
+  const own = title === "Status" ? /^ {2}session grants {2,}\S/ : /^ {2}change mode {2,}\S/;
   return infoPanel(grid, title) !== null || grid.some((row) => own.test(row));
 }
 

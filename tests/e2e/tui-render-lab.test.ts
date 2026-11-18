@@ -180,7 +180,7 @@ test("render-lab analyzer treats thinking token counters as activity rows", () =
 test("render-lab analyzer recognizes the real fx prompt glyph", () => {
   outDir = mkdtempSync(join(tmpdir(), "fx-render-lab-analyzer-test-"));
   const manifest = writeAnalyzerFixture(outDir, [
-    "Run /help for commands",
+    "run /help for commands",
     "────────────────",
     "❯",
     "────────────────",
@@ -196,7 +196,7 @@ test("render-lab analyzer recognizes the real fx prompt glyph", () => {
 test("render-lab analyzer recognizes tint footer chrome", () => {
   outDir = mkdtempSync(join(tmpdir(), "fx-render-lab-analyzer-test-"));
   const manifest = writeAnalyzerFixture(outDir, [
-    "Run /help for commands",
+    "run /help for commands",
     "❯",
     "────────────────",
     "model",
@@ -211,7 +211,7 @@ test("render-lab analyzer recognizes tint footer chrome", () => {
 test("render-lab analyzer flags missing footer and input chrome", () => {
   outDir = mkdtempSync(join(tmpdir(), "fx-render-lab-analyzer-test-"));
   const manifest = writeAnalyzerFixture(outDir, [
-    "Run /help for commands",
+    "run /help for commands",
     "permission_mode",
     "model",
   ]);
@@ -225,7 +225,7 @@ test("render-lab analyzer flags missing footer and input chrome", () => {
 test("render-lab analyzer rejects damaged multiline footer with real hint and cursor", () => {
   outDir = mkdtempSync(join(tmpdir(), "fx-render-lab-analyzer-test-"));
   const manifest = writeAnalyzerFixture(outDir, [
-    "Run /help for commands",
+    "run /help for commands",
     "────────────────",
     "  transcript row one",
     "  transcript row two",
@@ -242,7 +242,7 @@ test("render-lab analyzer rejects damaged multiline footer with real hint and cu
 test("render-lab analyzer recognizes clipped multiline input continuation rows", () => {
   outDir = mkdtempSync(join(tmpdir(), "fx-render-lab-analyzer-test-"));
   const manifest = writeAnalyzerFixture(outDir, [
-    "Run /help for commands",
+    "run /help for commands",
     "────────────────",
     "  wrapped input continuation",
     "  clipped input tail",
@@ -259,7 +259,7 @@ test("render-lab analyzer recognizes clipped multiline input continuation rows",
 test("render-lab analyzer recognizes compact multiline footer status", () => {
   outDir = mkdtempSync(join(tmpdir(), "fx-render-lab-analyzer-test-"));
   const manifest = writeAnalyzerFixture(outDir, [
-    "Run /help for commands",
+    "run /help for commands",
     "────────────────",
     "  wrapped input continuation",
     "  clipped input tail",
@@ -276,7 +276,7 @@ test("render-lab analyzer recognizes compact multiline footer status", () => {
 test("render-lab analyzer rejects a blank multiline footer status row", () => {
   outDir = mkdtempSync(join(tmpdir(), "fx-render-lab-analyzer-test-"));
   const manifest = writeAnalyzerFixture(outDir, [
-    "Run /help for commands",
+    "run /help for commands",
     "────────────────",
     "  wrapped input continuation",
     "  clipped input tail",
@@ -329,7 +329,7 @@ test("render-lab analyzer enforces active-tool placement and uniqueness", () => 
   const cases = [
     {
       event: "active-tool-visible",
-      grid: ["Run /help for commands", "", "● Running sleep, printf, sleep", "", "▲ Thinking", "", "────────────────", "❯", "────────────────", "test"],
+      grid: ["run /help for commands", "", "● Running sleep, printf, sleep", "", "▲ Thinking", "", "────────────────", "❯", "────────────────", "test"],
       rejected: false,
     },
     {
@@ -344,7 +344,7 @@ test("render-lab analyzer enforces active-tool placement and uniqueness", () => 
     },
     {
       event: "active-tool-visible",
-      grid: ["Run /help for commands", "● Running sleep, printf, sleep", "● Running sleep, printf, sleep", "", "────────────────", "❯", "────────────────", "test"],
+      grid: ["run /help for commands", "● Running sleep, printf, sleep", "● Running sleep, printf, sleep", "", "────────────────", "❯", "────────────────", "test"],
       rejected: true,
     },
   ];
@@ -392,7 +392,7 @@ test("render-lab analyzer rejects activity marker corruption", () => {
   ];
   for (const entry of cases) {
     const grid = [
-      "Run /help for commands",
+      "run /help for commands",
       "",
       group,
       activity,
@@ -560,7 +560,7 @@ test("render-lab analyzer rejects reordered observability scrollback", () => {
 test("render-lab analyzer reports trace counters and rejects quiescent work", () => {
   outDir = mkdtempSync(join(tmpdir(), "fx-render-lab-analyzer-test-"));
   const manifest = writeAnalyzerFixture(outDir, [
-    "Run /help for commands",
+    "run /help for commands",
     "────────────────",
     "❯",
     "────────────────",

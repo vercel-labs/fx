@@ -828,7 +828,7 @@ describe.skipIf(!tmuxAvailable())("tui: file permissions", () => {
       });
       expect(approval).not.toContain("wheel scroll");
       const grid = await session.capturePaneGrid();
-      expect(grid[0]).toContain("Run /help for commands");
+      expect(grid[0]).toContain("run /help for commands");
       const bottomDividerRow = grid.findLastIndex((row) =>
         /^─+$/.test(row.trim()),
       );

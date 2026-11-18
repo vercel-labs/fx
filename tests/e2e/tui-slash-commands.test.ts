@@ -82,7 +82,7 @@ async function launchNoKeyAndWait(record = false): Promise<{
       VERCEL_OIDC_TOKEN: undefined,
     },
   });
-  await terminal.waitForText("Run /help for commands", 10_000);
+  await terminal.waitForText("run /help for commands", 10_000);
   await terminal.waitForStableComposer(10_000);
   return { terminal, stderrPath, root };
 }
@@ -99,7 +99,7 @@ describe.skipIf(TMUX_SKIP)("tui: no-key slash commands", () => {
         await session.waitForPane((pane) => !pane.includes("No context to compact."), 5_000);
         await session.waitForComposer(5_000);
         const scrollback = await session.captureFullScrollbackEscapes();
-        expect(scrollback).toContain("Run /help for commands");
+        expect(scrollback).toContain("run /help for commands");
         expect(scrollback).not.toMatch(/No context to compact|Context:|Compacting/);
         await session.sendKeys("C-o");
         const transcript = await session.waitForText("esc close · pgup/pgdn scroll", 5_000);
@@ -202,7 +202,7 @@ describe.skipIf(TMUX_SKIP)("tui: no-key slash commands", () => {
     async () => {
       gateway = startFakeGateway([]);
       const { stderrPath, tapePath } = await launchShortTerminal("compact");
-      expect((await session!.captureFullScrollback()).split("Run /help for commands")).toHaveLength(2);
+      expect((await session!.captureFullScrollback()).split("run /help for commands")).toHaveLength(2);
 
       // Twelve rows leave the panel room for one line at a time. It scrolls
       // instead of covering the transcript, so the transcript's last row
@@ -217,7 +217,7 @@ describe.skipIf(TMUX_SKIP)("tui: no-key slash commands", () => {
       await closeStatusPanel(session!, 5_000);
       await session!.waitForComposer(5_000);
       const scrollback = await session!.captureFullScrollback();
-      expect(scrollback.split("Run /help for commands")).toHaveLength(2);
+      expect(scrollback.split("run /help for commands")).toHaveLength(2);
       expect(panelLinesIn(scrollback)).toEqual([]);
       expect(session!.paneStatus()).toEqual({ dead: false, status: null });
       expect(readFileSync(stderrPath, "utf8")).toBe("");
@@ -256,7 +256,7 @@ describe.skipIf(TMUX_SKIP)("tui: no-key slash commands", () => {
       await session!.waitForComposer(5_000);
 
       const scrollback = await session!.captureFullScrollback();
-      for (const row of ["Run /help for commands", "┃ slow question", "FIRST_ANSWER_LINE", "SECOND_ANSWER_LINE", "THIRD_ANSWER_LINE"]) {
+      for (const row of ["run /help for commands", "┃ slow question", "FIRST_ANSWER_LINE", "SECOND_ANSWER_LINE", "THIRD_ANSWER_LINE"]) {
         expect({ row, count: scrollback.split(row).length - 1 }).toEqual({ row, count: 1 });
       }
       expect(panelLinesIn(scrollback)).toEqual([]);

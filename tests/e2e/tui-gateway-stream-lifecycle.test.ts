@@ -4504,7 +4504,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         10_000,
       );
       const rows = scrollback.split("\n").map((row) => row.trimEnd());
-      let previous = rows.findIndex((row) => row.includes("Run /help for commands"));
+      let previous = rows.findIndex((row) => row.includes("run /help for commands"));
       expect(previous).toBeGreaterThanOrEqual(0);
       for (const line of promptLines) {
         const matches = rows.flatMap((row, index) => (row.endsWith(line) ? [index] : []));
@@ -4590,7 +4590,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         10_000,
       );
       const rows = scrollback.split("\n").map((row) => row.trimEnd());
-      let previous = rows.findIndex((row) => row.includes("Run /help for commands"));
+      let previous = rows.findIndex((row) => row.includes("run /help for commands"));
       expect(previous).toBeGreaterThanOrEqual(0);
       for (const line of [firstPrompt, ...steeringLines]) {
         const matches = rows.flatMap((row, index) => (row.endsWith(line) ? [index] : []));

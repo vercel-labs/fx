@@ -369,7 +369,7 @@ export function findLogoRows(grid: string[]): number[] {
   const rows: number[] = [];
   for (let i = 0; i < grid.length; i += 1) {
     const row = grid[i] ?? "";
-    if (row.includes("Run /help for commands") || hasLogoGlyphs(row)) {
+    if (row.includes("run /help for commands") || hasLogoGlyphs(row)) {
       rows.push(i);
     }
   }
@@ -1021,7 +1021,7 @@ function isTranscriptContentRow(line: string): boolean {
   const text = semanticText(line).trim();
   if (text.length === 0) return false;
   if (isDividerRow(text)) return false;
-  if (text.includes("Run /help for commands") || hasLogoGlyphs(text)) return false;
+  if (text.includes("run /help for commands") || hasLogoGlyphs(text)) return false;
   return true;
 }
 
@@ -1072,7 +1072,7 @@ function countLogoBlocks(grid: string[], logoRows: number[]): number {
     if (row > previous + 1) blocks += 1;
     previous = row;
   }
-  if (blocks === 0 && grid.some((row) => row.includes("Run /help for commands"))) return 1;
+  if (blocks === 0 && grid.some((row) => row.includes("run /help for commands"))) return 1;
   return blocks;
 }
 

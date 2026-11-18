@@ -49,7 +49,7 @@ const grid = () => {
   return lines.join("\n");
 };
 const deadline = performance.now() + 5000;
-while (!grid().includes("Run /help for commands")) {
+while (!grid().includes("run /help for commands")) {
   await flush();
   if (performance.now() >= deadline) throw new Error(`timed out waiting for startup:\n${grid()}`);
   await new Promise((resolveDelay) => setTimeout(resolveDelay, 10));

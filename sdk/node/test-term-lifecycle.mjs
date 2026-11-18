@@ -437,7 +437,7 @@ async function runActiveTransitionChild(scenario, command) {
   };
 
   await childRuntime.interactive;
-  await waitForChild(() => childOutput.includes("Run /help for commands"), "child startup");
+  await waitForChild(() => childOutput.includes("run /help for commands"), "child startup");
   process.stdout.write("runtime_interactive\n");
   childRuntime.write("first prompt\r");
   await waitForChild(() => fetchCount === 1, "first fetch");

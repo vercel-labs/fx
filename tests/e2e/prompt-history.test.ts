@@ -113,7 +113,7 @@ describe.skipIf(!tmuxAvailable())("prompt history", () => {
           cwd: workspaceRoot,
           env: rejectedGatewayEnv(home, gateway),
         });
-        await session.waitForText("Run /help", TIMEOUT);
+        await session.waitForText("run /help", TIMEOUT);
         await session.sendText("PLAN10_PROMPT_HISTORY_SENTINEL");
         await session.waitForText("HTTP 401", TIMEOUT);
         await session.sendText("/help");
@@ -134,7 +134,7 @@ describe.skipIf(!tmuxAvailable())("prompt history", () => {
           cwd: workspaceRoot,
           env: rejectedGatewayEnv(home, gateway),
         });
-        await session.waitForText("Run /help", TIMEOUT);
+        await session.waitForText("run /help", TIMEOUT);
 
         await session.sendLiteral("/");
         await session.waitForPane((current) => slashMenuRows(current).length > 0, TIMEOUT);
@@ -210,7 +210,7 @@ describe.skipIf(!tmuxAvailable())("prompt history", () => {
               HOME: realpathSync(home),
             },
           });
-          await session.waitForText("Run /help", TIMEOUT);
+          await session.waitForText("run /help", TIMEOUT);
           expect(existsSync(join(home, ".fx"))).toBe(false);
         } finally {
           chmodSync(home, 0o700);
@@ -248,7 +248,7 @@ describe.skipIf(!tmuxAvailable())("prompt history", () => {
             cwd: realpathSync(workspace),
             env: rejectedGatewayEnv(home, gateway),
           });
-          await session.waitForText("Run /help", TIMEOUT);
+          await session.waitForText("run /help", TIMEOUT);
           await session.sendText(prompt);
           await session.waitForText("HTTP 401", TIMEOUT);
           await session.sendText("/quit");
@@ -268,7 +268,7 @@ describe.skipIf(!tmuxAvailable())("prompt history", () => {
           cwd: realpathSync(workspaceA),
           env: rejectedGatewayEnv(home, gateway),
         });
-        await session.waitForText("Run /help", TIMEOUT);
+        await session.waitForText("run /help", TIMEOUT);
         await disablePromptHistory(session, join(home, ".fx", "settings.json"));
         await session.sendText("PLAN10_HISTORY_DISABLED");
         await session.waitForText("HTTP 401", TIMEOUT);
@@ -384,7 +384,7 @@ describe.skipIf(!tmuxAvailable())("prompt history", () => {
             HOME: home,
           },
         });
-        await session.waitForText("Run /help", TIMEOUT);
+        await session.waitForText("run /help", TIMEOUT);
         await session.sendKeys("Up");
         const pane = await session.waitForText("PLAN10_HISTORY_KEPT_099", TIMEOUT);
         expect(pane).toContain("PLAN10_HISTORY_KEPT_099");

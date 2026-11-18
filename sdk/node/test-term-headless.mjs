@@ -97,7 +97,7 @@ const exitCode = await Promise.race([
 
 if (exitCode !== 0) throw new Error(`fx-term exited with code ${exitCode}`);
 if (!grid.includes("𝒇x")) throw new Error(`shared fx welcome frame was not visible in xterm grid:\n${grid}`);
-if (!grid.includes("Run /help for commands")) throw new Error(`shared fx welcome guidance was not visible in xterm grid:\n${grid}`);
+if (!grid.includes("run /help for commands")) throw new Error(`shared fx welcome guidance was not visible in xterm grid:\n${grid}`);
 if (terminal.buffer.active.baseY !== 0 || terminal.buffer.active.viewportY !== 0) {
   throw new Error(`fresh xterm startup created blank scrollback: baseY=${terminal.buffer.active.baseY}, viewportY=${terminal.buffer.active.viewportY}`);
 }

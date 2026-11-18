@@ -47,7 +47,7 @@ async function verifyStartup(label, configStore, expectedEvent, trigger, expecte
 
   const flush = () => new Promise((resolveFlush) => terminal.write("", resolveFlush));
   const deadline = performance.now() + 5000;
-  while (!terminalGrid(terminal).includes("Run /help for commands")) {
+  while (!terminalGrid(terminal).includes("run /help for commands")) {
     await flush();
     if (exited !== undefined) throw new Error(`${label} exited during startup with code ${exited}`);
     if (performance.now() >= deadline) throw new Error(`timed out waiting for ${label} startup:\n${terminalGrid(terminal)}`);

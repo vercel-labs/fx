@@ -330,10 +330,10 @@ describe.skipIf(!tmuxAvailable())("yolo interactive mode", () => {
       await session.waitForText("←→ change", TIMEOUT);
       // The list shows five settings at a time, so the search finds each.
       await session.sendLiteralText("permission");
-      expect(await session.waitForText("Permission mode", TIMEOUT)).toContain("Permission mode");
+      expect(await session.waitForText("permission mode", TIMEOUT)).toContain("permission mode");
       await session.sendKeys("C-u");
       await session.sendLiteralText("sandbox");
-      expect(await session.waitForText("no matching settings.", TIMEOUT)).not.toContain("Command sandbox");
+      expect(await session.waitForText("no matching settings.", TIMEOUT)).not.toContain("command sandbox");
       await session.sendKeys("C-u");
       await Bun.sleep(4_300);
       expect(await session.capturePane()).toContain("←→ change");

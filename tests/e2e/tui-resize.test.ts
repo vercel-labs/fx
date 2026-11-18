@@ -292,7 +292,7 @@ function selectedSlashRow(escapes: string): string | null {
 }
 
 test("selected slash row ignores the welcome header help hint", () => {
-  const header = `${SELECTED_COMPLETION_SGR}𝒇x\x1b[0m\x1b[38;5;245m v0.3.27 · Run /help for commands`;
+  const header = `${SELECTED_COMPLETION_SGR}𝒇x\x1b[0m\x1b[38;5;245m v0.3.27 · run /help for commands`;
   const command = `${SELECTED_COMPLETION_SGR}  /clear\x1b[38;5;245m start a fresh session and keep background processes`;
 
   expect(selectedSlashRow(`${header}\n${command}`)).toBe(command);
@@ -2536,7 +2536,7 @@ describe.skipIf(SKIP)("tui: resize", () => {
 
       const transcriptCopyCounts = (scrollback: string) => ({
         startup: scrollback.match(/𝒇x v\d+\.\d+\.\d+\b/g)?.length ?? 0,
-        help: countOccurrences(scrollback, "Run /help for commands"),
+        help: countOccurrences(scrollback, "run /help for commands"),
         recording: countOccurrences(
           scrollback,
           "! recording: visual terminal capture:",
