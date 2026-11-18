@@ -255,16 +255,14 @@ fn statusNamesAsk(entry: TranscriptEntry, detail: ?*const ToolDetailRecord) bool
     };
 }
 
-/// Whether a row shows a subagent's report or message: a subagent call with
-/// empty arguments (src/core/subagent/reports.zig, Row.call). Live, main's
-/// calls have a presentation group and this row has none, so it never joins
-/// their group. Resumed rows have no presentation group, so a run of rows
-/// splits where such rows start and end instead.
+/// Whether a row shows a subagent's report or message to main, which its
+/// detail marks (src/core/subagent/reports.zig, Row). Live, main's calls
+/// have a presentation group and this row has none, so it never joins their
+/// group. Resumed rows have no presentation group, so a run of rows splits
+/// where such rows start and end instead.
 fn isSubagentUpdateRow(detail: ?*const ToolDetailRecord) bool {
     const record = detail orelse return false;
-    if (record.activity_kind != .subagent or !std.mem.eql(u8, record.tool_name, "subagent")) return false;
-    const arguments = record.arguments_json orelse return false;
-    return std.mem.eql(u8, arguments, "{}");
+    return record.subagent_report;
 }
 
 fn isAttachedEntry(entry: TranscriptEntry) bool {
@@ -1013,7 +1011,7 @@ const StoryTally = struct {
     /// status names a subagent without starting it.
     subagents_messaged: std.ArrayList([]const u8) = .empty,
     /// Reports and messages from subagents, which show as subagent calls
-    /// with empty arguments (src/core/subagent/reports.zig, Row.call).
+    /// that their details mark (src/core/subagent/reports.zig, Row).
     subagent_updates: usize = 0,
     subagent_waits: usize = 0,
     mcp_calls: usize = 0,
@@ -1122,6 +1120,10 @@ const StoryTally = struct {
             },
             .subagent => {
                 self.subagent_calls += 1;
+                if (record.subagent_report) {
+                    self.subagent_updates += 1;
+                    return;
+                }
                 // Old records keep no arguments, so they say nothing more.
                 if (!storyHasArgs(record)) return;
                 if (storyArgString(scratch, record, "agent")) |agent| {
@@ -1130,8 +1132,6 @@ const StoryTally = struct {
                     if (std.mem.eql(u8, action, "message")) try addDistinct(&self.subagents_messaged, scratch, agent);
                 } else if (storyArgString(scratch, record, "action")) |action| {
                     if (std.mem.eql(u8, action, "wait") or std.mem.eql(u8, action, "status")) self.subagent_waits += 1;
-                } else {
-                    self.subagent_updates += 1;
                 }
             },
             .mcp => self.mcp_calls += 1,
@@ -7868,6 +7868,7 @@ test "a resumed subagent report keeps its own line after main's calls" {
         .activity_kind = .subagent,
         .arguments_json = @constCast("{}"),
         .outcome = .completed,
+        .subagent_report = true,
     };
     var details = [_]ToolDetailRecord{
         .{
@@ -7893,6 +7894,43 @@ test "a resumed subagent report keeps its own line after main's calls" {
             "├ reviewer finished\n" ++
             "└ tester finished\n" ++
             "● Read window.ts",
+        std.mem.trim(u8, text, "\n"),
+    );
+}
+
+test "a resumed subagent call main sent with empty arguments stays in its group" {
+    // The call failed, as one with no action does. Its arguments match a
+    // report's, but its detail has no report mark, so it stays between the
+    // reads, as it does live.
+    const alloc = std.testing.allocator;
+    const entries = [_]TranscriptEntry{
+        .{ .raw_bytes = .{ .id = 1, .bytes = "● Read desktop/src/a.ts\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 2, .bytes = "● Failed subagent\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 3, .bytes = "● Read desktop/src/b.ts\n", .class = .tool_status } },
+    };
+    const details = [_]ToolDetailRecord{
+        storyReadDetailForTest(1, "desktop/src/a.ts"),
+        .{
+            .entry_id = 2,
+            .tool_name = @constCast("subagent"),
+            .activity_kind = .subagent,
+            .arguments_json = @constCast("{}"),
+            .result = @constCast("action is required"),
+            .outcome = .failed,
+        },
+        storyReadDetailForTest(3, "desktop/src/b.ts"),
+    };
+    var projection = try build(alloc, &entries, &details, 120);
+    defer projection.deinit(alloc);
+    try std.testing.expect(projection.entry_actions.items[0] == .override);
+    try std.testing.expect(projection.entry_actions.items[1] == .hide);
+    try std.testing.expect(projection.entry_actions.items[2] == .hide);
+    const text = try groupTextForTest(alloc, &entries, &details);
+    defer alloc.free(text);
+    try std.testing.expectEqualStrings(
+        "● Read files\n" ++
+            "├ Read a.ts, b.ts\n" ++
+            "└ Failed subagent · action is required",
         std.mem.trim(u8, text, "\n"),
     );
 }
