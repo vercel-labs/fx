@@ -20,7 +20,7 @@ const encoded = new TextEncoder();
 const supportedModel = "openai/gpt-6-astra";
 const unsupportedModel = "openai/gpt-6-plain";
 const solModel = "openai/gpt-5.6-sol";
-const defaultModel = "spacexai/grok-4.7";
+const defaultModel = "openai/gpt-6.1-sol";
 const catalog = {
   object: "list",
   data: [
@@ -59,7 +59,7 @@ const catalog = {
         },
       },
     },
-    { id: defaultModel, type: "language", owned_by: "spacexai" },
+    { id: defaultModel, type: "language", owned_by: "openai" },
   ],
 };
 

@@ -1235,7 +1235,7 @@ for (const [index, mimeType] of mediaTypes.entries()) {
 }
 
 // A host tool's image reaches a model the catalog lists with vision but not
-// file-input, as it lists the default spacexai/grok-4.7: file-input covers
+// file-input, as it lists spacexai/grok-4.7: file-input covers
 // documents such as PDFs, and image input needs only vision.
 {
   const model = "sdk/vision-only-model";
