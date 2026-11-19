@@ -7,7 +7,9 @@
 //! starts, beside the prompt's images, then the host saves the user's
 //! prompt, then `start` takes the start capture on its own thread, beside
 //! the turn's first request, and `settle` waits for it before the turn's
-//! first tool acts. `end` runs on the turn's thread before the turn's commit and
+//! first tool acts and again as the turn returns; `reach`, `end`, a fresh
+//! `begin`, and `deinit` settle first too, so the thread never outlives its
+//! turn or the session it writes to. `end` runs on the turn's thread before the turn's commit and
 //! returns the token that commit uses; a host that commits on that thread
 //! may ask `token` instead. A failed commit keeps both the token and the end capture,
 //! so a retry of the same turn writes each once; `committed` ends the turn

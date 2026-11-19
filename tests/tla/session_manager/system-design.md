@@ -1975,7 +1975,9 @@ as it was sent):
     capture on its own thread, beside the turn's first request, and waits
     for it to be saved before any tool acts (`AgentRuntimeDeps.executeToolCall`
     sends `.settle`), before a reached repository's start, before the end
-    capture, and before the next turn begins. The prompt's write opens the
+    capture, before the turn returns however it ends, failed or paused
+    included, and before the next turn begins or the host closes the
+    session. The prompt's write opens the
     turn for the token, so the start capture is written in it as soon as it
     is taken, possibly after the first streamed pieces, and a process killed
     during the capture, which can take seconds, keeps the prompt. A cancel

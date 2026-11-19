@@ -299,7 +299,8 @@ pub const AgentRuntimeDeps = struct {
     /// `append_turn_piece`, so a kill during the capture keeps it,
     /// `.capture` starts the start capture, which runs beside the turn's
     /// first request; and `.settle`, which `executeToolCall` sends before
-    /// every tool, waits until it is saved. `fresh` is false for a steering
+    /// every tool and the turn sends as it returns, however it ends, waits
+    /// until it is saved. `fresh` is false for a steering
     /// message inside the turn, which keeps the turn's capture. It never
     /// fails the turn.
     start_workspace_capture: ?*const fn (ctx: *anyopaque, fresh: bool, step: WorkspaceCaptureStep) void = null,
