@@ -15452,6 +15452,25 @@ test "a target between the on-screen history offset and the logical offset is no
 
     try std.testing.expect(!runtime.paintedStableTargetWouldRewind(target, anchor, facts, false));
 
+    // The boundaries: a target at the on-screen history offset stays where the
+    // screen is, and a target at the logical offset is the projection itself.
+    // Neither moves back.
+    var on_history = target;
+    on_history.visual_offset = 27;
+    on_history.history_visual_offset = 27;
+    on_history.source_endpoint_visual_offset = 27;
+    var on_history_facts = facts;
+    on_history_facts.target_visual_offset = 27;
+    try std.testing.expect(!runtime.paintedStableTargetWouldRewind(on_history, anchor, on_history_facts, false));
+
+    var on_logical = target;
+    on_logical.visual_offset = 30;
+    on_logical.history_visual_offset = 30;
+    on_logical.source_endpoint_visual_offset = 30;
+    var on_logical_facts = facts;
+    on_logical_facts.target_visual_offset = 30;
+    try std.testing.expect(!runtime.paintedStableTargetWouldRewind(on_logical, anchor, on_logical_facts, false));
+
     // A target behind the on-screen offset is still a rewind. Its history
     // offset matches its visual offset, as TransitionTarget.init sets them.
     var behind = target;
