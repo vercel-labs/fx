@@ -80,7 +80,19 @@ pub fn select(alloc: Allocator, candidates: []const Candidate, previous: []const
     defer remove.deinit(alloc);
     var excluded: std.ArrayList(Exclusion) = .empty;
     defer excluded.deinit(alloc);
-    var untracked_count: usize = 0;
+    // When the limit binds, untracked files outside dependency and build
+    // folders take the places first, in path order, and files inside such
+    // folders get what is left. Otherwise a fresh `node_modules` or `.venv`,
+    // which sorts before most source paths, could take every place and leave
+    // out every file the user wrote.
+    var outside_eligible: usize = 0;
+    for (sorted) |entry| {
+        if (!entry.tracked and untrackedReason(entry, limits) == null and !inGeneratedFolder(entry.path)) outside_eligible += 1;
+    }
+    const outside_places = @min(outside_eligible, limits.untracked_count);
+    const generated_places = limits.untracked_count - outside_places;
+    var outside_admitted: usize = 0;
+    var generated_admitted: usize = 0;
 
     for (sorted) |entry| {
         if (entry.tracked) {
@@ -99,24 +111,18 @@ pub fn select(alloc: Allocator, candidates: []const Candidate, previous: []const
             }
             continue;
         }
-        const reason: ?@FieldType(Exclusion, "reason") = if (!entry.present)
-            .missing
-        else if (isSensitive(entry.path) or entry.holds_private_key)
-            .sensitive
-        else if (entry.kind == .gitlink)
-            .submodule
-        else if (entry.bytes > limits.untracked_file_bytes)
-            .too_large
-        else if (untracked_count >= limits.untracked_count)
-            .file_limit
-        else
-            null;
-        if (reason) |value| {
-            try excluded.append(alloc, .{ .path = entry.path, .reason = value });
-        } else {
-            try read.append(alloc, entry.path);
-            untracked_count += 1;
+        if (untrackedReason(entry, limits)) |reason| {
+            try excluded.append(alloc, .{ .path = entry.path, .reason = reason });
+            continue;
         }
+        const generated = inGeneratedFolder(entry.path);
+        const admitted = if (generated) &generated_admitted else &outside_admitted;
+        if (admitted.* >= (if (generated) generated_places else outside_places)) {
+            try excluded.append(alloc, .{ .path = entry.path, .reason = .file_limit });
+            continue;
+        }
+        try read.append(alloc, entry.path);
+        admitted.* += 1;
     }
     // read and keep are sorted subsequences of sorted candidates. Previous
     // paths no longer admitted must leave the persistent capture index.
@@ -168,6 +174,36 @@ pub const Reason = enum {
     /// The caller passed a malformed session id or repository path.
     invalid_request,
 };
+
+/// Why an untracked candidate is left out whatever the count limit: gone,
+/// sensitive, a nested repository, or too large. Null when it may be admitted.
+fn untrackedReason(entry: Candidate, limits: Limits) ?@FieldType(Exclusion, "reason") {
+    if (!entry.present) return .missing;
+    if (isSensitive(entry.path) or entry.holds_private_key) return .sensitive;
+    if (entry.kind == .gitlink) return .submodule;
+    if (entry.bytes > limits.untracked_file_bytes) return .too_large;
+    return null;
+}
+
+/// Whether a folder above `path` has a name that package managers, virtual
+/// environments, and build tools use for files they write, compared without
+/// case. Such files only lose their turn under the count limit.
+fn inGeneratedFolder(path: []const u8) bool {
+    const names = [_][]const u8{
+        "node_modules",  "bower_components", ".venv",       "venv",          "__pycache__",
+        ".tox",          ".nox",             ".mypy_cache", ".pytest_cache", ".ruff_cache",
+        ".gradle",       ".next",            ".nuxt",       ".svelte-kit",   ".turbo",
+        ".parcel-cache", ".cache",           ".dart_tool",  "Pods",          ".terraform",
+        ".zig-cache",    "zig-out",          "target",      "dist",          "build",
+        "coverage",
+    };
+    const slash = std.mem.findScalarLast(u8, path, '/') orelse return false;
+    var folders = std.mem.splitScalar(u8, path[0..slash], '/');
+    while (folders.next()) |folder| {
+        for (names) |name| if (std.ascii.eqlIgnoreCase(folder, name)) return true;
+    }
+    return false;
+}
 
 fn validatePath(path: []const u8) error{InvalidPath}!void {
     if (!repo_path.isValid(path)) return error.InvalidPath;
@@ -369,6 +405,60 @@ test "capture selection has deterministic untracked count admission and does not
     try expectPaths(&.{ "a", "tracked" }, result.read);
     try std.testing.expectEqual(@as(usize, 2), result.excluded.len);
     try std.testing.expectEqual(.file_limit, result.excluded[1].reason);
+}
+
+test "capture selection gives untracked places to files outside dependency and build folders first" {
+    const alloc = std.testing.allocator;
+    // A fresh virtual environment and package folder sort before the
+    // user's own files.
+    const entries = [_]Candidate{
+        .{ .path = ".venv/lib/a.py", .tracked = false },
+        .{ .path = ".venv/lib/b.py", .tracked = false },
+        .{ .path = "node_modules/x/index.js", .tracked = false },
+        .{ .path = "main.py", .tracked = false },
+        .{ .path = "src/app.py", .tracked = false },
+        .{ .path = "tracked.txt", .tracked = true },
+    };
+    const result = try select(alloc, &entries, &.{}, .{ .untracked_count = 3 });
+    defer result.deinit(alloc);
+    // The user's files are in; the one place left goes to the first
+    // generated file in path order, and the result stays sorted.
+    try expectPaths(&.{ ".venv/lib/a.py", "main.py", "src/app.py", "tracked.txt" }, result.read);
+    try std.testing.expectEqual(@as(usize, 2), result.excluded.len);
+    try std.testing.expectEqualStrings(".venv/lib/b.py", result.excluded[0].path);
+    try std.testing.expectEqualStrings("node_modules/x/index.js", result.excluded[1].path);
+    for (result.excluded) |exclusion| try std.testing.expectEqual(.file_limit, exclusion.reason);
+}
+
+test "capture selection admits files outside generated folders in path order when they alone pass the limit" {
+    const alloc = std.testing.allocator;
+    const entries = [_]Candidate{
+        .{ .path = "c.txt", .tracked = false },
+        .{ .path = "a.txt", .tracked = false },
+        .{ .path = "b.txt", .tracked = false },
+        .{ .path = "build/out.o", .tracked = false },
+        .{ .path = "big.bin", .tracked = false, .bytes = 11 },
+    };
+    const result = try select(alloc, &entries, &.{}, .{ .untracked_count = 2, .untracked_file_bytes = 10 });
+    defer result.deinit(alloc);
+    try expectPaths(&.{ "a.txt", "b.txt" }, result.read);
+    // A file left out for its size takes no place.
+    try std.testing.expectEqual(@as(usize, 3), result.excluded.len);
+    try std.testing.expectEqual(.too_large, result.excluded[0].reason);
+    try std.testing.expectEqualStrings("big.bin", result.excluded[0].path);
+    try std.testing.expectEqualStrings("build/out.o", result.excluded[1].path);
+    try std.testing.expectEqualStrings("c.txt", result.excluded[2].path);
+}
+
+test "capture selection knows generated folders at any depth by folder name only" {
+    for ([_][]const u8{ "node_modules/a.js", "web/node_modules/p/a.js", ".VENV/lib/x.py", "pkg/__pycache__/m.pyc", "target/debug/app", "Pods/x.m" }) |path| {
+        if (!inGeneratedFolder(path)) std.debug.print("{s} should be generated\n", .{path});
+        try std.testing.expect(inGeneratedFolder(path));
+    }
+    for ([_][]const u8{ "build", "dist.txt", "src/build.zig", "node_modules", "docs/targets/x.md", "my_venv/x.py" }) |path| {
+        if (inGeneratedFolder(path)) std.debug.print("{s} should not be generated\n", .{path});
+        try std.testing.expect(!inGeneratedFolder(path));
+    }
 }
 
 test "capture selection refreshes present gitlinks and removes deleted submodules" {
