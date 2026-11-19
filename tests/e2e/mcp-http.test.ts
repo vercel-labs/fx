@@ -387,7 +387,7 @@ describe("modern MCP Streamable HTTP", () => {
       },
     );
     expect(added.code).toBe(0);
-    expect(added.stdout).toBe("Added fixture to ~/.fx/mcp.json.\n");
+    expect(added.stdout).toBe("added fixture to ~/.fx/mcp.json.\n");
     const methods = (from: number) => fixture!.requests.slice(from).map((entry) => entry.message.method).filter((method) => method !== "subscriptions/listen");
     // add connects once to see whether the server needs a login; this one doesn't.
     expect(methods(0)).toEqual(["server/discover", "tools/list"]);
@@ -1234,7 +1234,7 @@ describe("modern MCP Streamable HTTP", () => {
       ).toBe(true);
 
       await tui.sendInterruptEscapePair(10_000);
-      await tui.waitForText(`Cancelled ${TOOL_NAME}`, 10_000);
+      await tui.waitForText(`cancelled ${TOOL_NAME}`, 10_000);
       const cancelDeadline = Date.now() + 5_000;
       while (fixture.cancelledCalls === 0 && Date.now() < cancelDeadline) {
         await Bun.sleep(25);

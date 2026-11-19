@@ -757,10 +757,10 @@ pub fn SubmitRuntime(comptime App: type) type {
                         .topic = "subagent",
                         .tone = .@"error",
                         .body = if (err == error.OneOffChild)
-                            std.mem.print(&body_buf, "This subagent ran a single task and can't take messages. Press {s} and pick {s} to go back.", .{ home.key, home.name }) catch
-                                "This subagent ran a single task and can't take messages."
+                            std.mem.print(&body_buf, "this subagent ran a single task and can't take messages. press {s} and pick {s} to go back.", .{ home.key, home.name }) catch
+                                "this subagent ran a single task and can't take messages."
                         else
-                            "This subagent can't take a message right now, so your message wasn't sent.",
+                            "this subagent can't take a message right now, so your message wasn't sent.",
                     }, true);
                     return;
                 }
@@ -946,8 +946,8 @@ pub fn SubmitRuntime(comptime App: type) type {
             var name_buf: [32]u8 = undefined;
             var body_buf: [192]u8 = undefined;
             const home = homeHint(app, &name_buf);
-            const body = std.mem.print(&body_buf, "{s} works on {s}'s screen. Press {s} and pick {s} to go back.", .{ command.command, home.name, home.key, home.name }) catch
-                "This command works on an fx instance's screen, not a subagent's.";
+            const body = std.mem.print(&body_buf, "{s} works on {s}'s screen. press {s} and pick {s} to go back.", .{ command.command, home.name, home.key, home.name }) catch
+                "this command works on an fx instance's screen, not a subagent's.";
             try app.writeDomainNotice(.{ .topic = "subagent", .tone = .neutral, .body = body }, true);
             app.input_runtime.inputResetState().clearCurrent(app.alloc);
             app.shell.render_requests.request(.footer);

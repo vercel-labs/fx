@@ -1162,7 +1162,7 @@ describe("ultrafast fake Gateway", () => {
             TIMEOUT,
           );
           expect(catalog).toContain(ULTRA_MODEL);
-          expect(catalog).toContain("Ultra");
+          expect(catalog).toContain("ultra");
           await session.sendKeys("Enter");
           await session.waitForPane(
             (pane) => composerContains(pane, `/model ${ULTRA_MODEL}`) && pane.includes("xhigh"),

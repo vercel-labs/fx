@@ -112,7 +112,7 @@ pub const ProvisionalToolStatuses = struct {
     pub fn preflight(registry: tool_dispatch.Registry, tool_name: []const u8) ?StartPreflight {
         if (tooling_presentation.isProviderSearchAlias(tool_name)) {
             return .{ .eligible = .{
-                .action_label = "Searching",
+                .action_label = "searching",
                 .activity_kind = .read,
             } };
         }
@@ -165,7 +165,7 @@ pub const ProvisionalToolStatuses = struct {
             const json = arguments_json orelse break :resource null;
             // While the arguments stream in they do not parse yet, but the
             // action and the whole name after it already say what the call
-            // does, so its row does not read as a bare "Using" until they end.
+            // does, so its row does not read as a bare "using" until they end.
             const args = tool_args.parseToolArgsObject(scratch.allocator(), json) catch streamed: {
                 const action = tooling_presentation.toolboxStreamedAction(scratch.allocator(), json) catch break :resource null;
                 break :streamed tool_args.parseToolArgsObject(scratch.allocator(), action orelse break :resource null) catch break :resource null;
@@ -325,7 +325,7 @@ pub const ProvisionalToolStatuses = struct {
                 call,
                 true,
                 null,
-                "Failed",
+                "failed",
                 advertised_dynamic_tool_names,
             );
         }
@@ -546,7 +546,7 @@ pub const ProvisionalToolStatuses = struct {
                 detail,
                 diff.max_encoded_label_bytes,
             );
-            const summary = try arena.print("Cancelled {s}", .{encoded.bytes});
+            const summary = try arena.print("cancelled {s}", .{encoded.bytes});
             try hooks.push_tool_lifecycle(hooks.ctx, .{ .terminal = .{
                 .id = .{ .turn_id = turn_id, .call_id = status.id },
                 .outcome = .{ .kind = .cancelled, .summary = summary },
@@ -1157,9 +1157,9 @@ fn finishDeniedToolStatusInternal(
         .terminal = .{
             .id = .{ .turn_id = turn_id, .call_id = call.id },
             .outcome = .{
-                .kind = if (std.mem.eql(u8, label, "Cancelled"))
+                .kind = if (std.mem.eql(u8, label, "cancelled"))
                     .cancelled
-                else if (std.mem.eql(u8, label, "Failed"))
+                else if (std.mem.eql(u8, label, "failed"))
                     .failed
                 else
                     .denied,
@@ -1184,9 +1184,9 @@ pub fn finishCancelledToolStatus(
 ) !void {
     if (!status_started) return;
     const label = if (try isShellWaitCall(arena, call))
-        "Stopped waiting for"
+        "stopped waiting for"
     else
-        "Cancelled";
+        "cancelled";
     const line = try hooks.describe_tool_action_denied(
         hooks.ctx,
         arena,
@@ -1487,28 +1487,28 @@ pub fn commandOutcomeDecision(
     const value = presentation orelse return null;
     return switch (value) {
         .exit_code => |code| if (code == 0)
-            .{ .outcome = .completed, .label = "Ran" }
+            .{ .outcome = .completed, .label = "ran" }
         else
             .{
                 .outcome = .failed,
-                .label = try arena.print("Exited {d}", .{code}),
+                .label = try arena.print("exited {d}", .{code}),
             },
         .signal => |signal| .{
             .outcome = .failed,
             .label = try arena.print("Signaled {d}", .{signal}),
         },
-        .timed_out => .{ .outcome = .failed, .label = "Timed out" },
+        .timed_out => .{ .outcome = .failed, .label = "timed out" },
         .output_capture_failed => .{
             .outcome = .failed,
-            .label = "Output capture failed",
+            .label = "output capture failed",
         },
     };
 }
 
 /// The label of a shell `run` whose command was still running when the call
 /// returned, such as when steering moved it to the background or its
-/// `yield_time_ms` ran out. It has no exit status, so it must not read "Ran".
-pub const still_running_label = "Still running";
+/// `yield_time_ms` ran out. It has no exit status, so it must not read "ran".
+pub const still_running_label = "still running";
 
 /// The outcome of a shell `run` call whose result `output` reports
 /// `"state":"running"`, or null for any other call or result.
@@ -1520,7 +1520,7 @@ pub fn runningCommandDecision(
     if (!std.mem.eql(u8, call.name, "shell")) return null;
     if (std.mem.find(u8, output, "\"running\"") == null) return null;
     // Only text that is not JSON gives no decision; running out of memory is
-    // reported, so the row does not read "Ran" for a command that still runs.
+    // reported, so the row does not read "ran" for a command that still runs.
     const args = tool_args.parseToolArgsObject(arena, call.arguments_json) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return null,
@@ -1583,25 +1583,25 @@ pub fn terminalActionOutcomeDecision(
     const value = presentation orelse return null;
     return switch (value) {
         .returned => |returned| switch (returned) {
-            .started => .{ .outcome = .completed, .label = "Started" },
-            .condition_met => .{ .outcome = .completed, .label = "Condition met for" },
-            .safety_ceiling => .{ .outcome = .completed, .label = "Wait limit reached for" },
-            .cancelled => .{ .outcome = .cancelled, .label = "Cancelled" },
+            .started => .{ .outcome = .completed, .label = "started" },
+            .condition_met => .{ .outcome = .completed, .label = "condition met for" },
+            .safety_ceiling => .{ .outcome = .completed, .label = "wait limit reached for" },
+            .cancelled => .{ .outcome = .cancelled, .label = "cancelled" },
             .exited => |code| .{
                 .outcome = if (code == 0) .completed else .failed,
-                .label = try arena.print("Exited {d}", .{code}),
+                .label = try arena.print("exited {d}", .{code}),
             },
             .signal => |signal| .{
                 .outcome = .failed,
-                .label = try arena.print("Terminated by signal {d}", .{signal}),
+                .label = try arena.print("terminated by signal {d}", .{signal}),
             },
         },
         .failed => |failed| if (failed == .cancelled)
-            .{ .outcome = .cancelled, .label = "Cancelled" }
+            .{ .outcome = .cancelled, .label = "cancelled" }
         else
             .{
                 .outcome = .failed,
-                .label = "Failed",
+                .label = "failed",
                 .detail = failed.detail(),
             },
     };
@@ -1987,14 +1987,14 @@ test "provisional lifecycle preflight distinguishes unknown eligible and ineligi
 
     const preflight = ProvisionalToolStatuses.preflight(test_tool_registry, "read_file") orelse return error.TestExpectedEqual;
     switch (preflight) {
-        .eligible => |metadata| try std.testing.expectEqualStrings("Reading", metadata.action_label),
+        .eligible => |metadata| try std.testing.expectEqualStrings("reading", metadata.action_label),
         .ineligible => return error.TestExpectedEqual,
     }
 
     for ([_][]const u8{ "exa_search", "perplexity_search", "parallel_search" }) |name| {
         const provider_preflight = ProvisionalToolStatuses.preflight(test_tool_registry, name) orelse return error.TestExpectedEqual;
         switch (provider_preflight) {
-            .eligible => |metadata| try std.testing.expectEqualStrings("Searching", metadata.action_label),
+            .eligible => |metadata| try std.testing.expectEqualStrings("searching", metadata.action_label),
             .ineligible => return error.TestExpectedEqual,
         }
     }
@@ -2168,7 +2168,7 @@ test "provisional lifecycle formats labeled and unlabeled eligible tools" {
     }
     switch (capture.events.items[1]) {
         .progress => |event| try std.testing.expectEqualStrings(
-            "● Reading\x1b[0m \x1b[38;5;245msrc/main.zig\x1b[0m",
+            "● reading\x1b[0m \x1b[38;5;245msrc/main.zig\x1b[0m",
             event.text,
         ),
         else => return error.TestExpectedEqual,
@@ -2178,7 +2178,7 @@ test "provisional lifecycle formats labeled and unlabeled eligible tools" {
         else => return error.TestExpectedEqual,
     }
     switch (capture.events.items[3]) {
-        .progress => |event| try std.testing.expectEqualStrings("● Matching\x1b[0m", event.text),
+        .progress => |event| try std.testing.expectEqualStrings("● matching\x1b[0m", event.text),
         else => return error.TestExpectedEqual,
     }
 }
@@ -2188,22 +2188,22 @@ test "provisional toolbox labels read as what the call opens, runs, or searches"
     // what a run runs or what a search looks for, so it never labels the row.
     // The action and its whole value label it as soon as they stream in.
     const cases = [_]struct { arguments_json: ?[]const u8, label: []const u8, value: ?[]const u8 = null }{
-        .{ .arguments_json = null, .label = "Using" },
-        .{ .arguments_json = "{\"run\":\"glob", .label = "Using" },
-        .{ .arguments_json = "{}", .label = "Using" },
-        .{ .arguments_json = "{\"run\":\"glob_files\",\"argu", .label = "Running", .value = "glob_files" },
+        .{ .arguments_json = null, .label = "using" },
+        .{ .arguments_json = "{\"run\":\"glob", .label = "using" },
+        .{ .arguments_json = "{}", .label = "using" },
+        .{ .arguments_json = "{\"run\":\"glob_files\",\"argu", .label = "running", .value = "glob_files" },
         .{ .arguments_json = "{\"run\":\"mcp_fixture_echo\",\"arguments\":{\"te", .label = tooling_presentation.mcp_running_label, .value = "mcp_fixture_echo" },
-        .{ .arguments_json = "{\"search\":\"list files\"", .label = "Searching toolbox", .value = "list files" },
-        .{ .arguments_json = "{\"open\":\"fixture\",\"res", .label = "Opening", .value = "fixture" },
+        .{ .arguments_json = "{\"search\":\"list files\"", .label = "searching toolbox", .value = "list files" },
+        .{ .arguments_json = "{\"open\":\"fixture\",\"res", .label = "opening", .value = "fixture" },
         // A streamed skill location reads as the skill's name, never the
         // opaque location.
-        .{ .arguments_json = "{\"open\":\"skill:0123456789abcdef:6/ste-english\",\"res", .label = "Opening", .value = "ste-english" },
-        .{ .arguments_json = "{\"run\":\"glob_files\",\"arguments\":{\"pattern\":\"*.md\"}}", .label = "Running", .value = "glob_files" },
+        .{ .arguments_json = "{\"open\":\"skill:0123456789abcdef:6/ste-english\",\"res", .label = "opening", .value = "ste-english" },
+        .{ .arguments_json = "{\"run\":\"glob_files\",\"arguments\":{\"pattern\":\"*.md\"}}", .label = "running", .value = "glob_files" },
         .{ .arguments_json = "{\"run\":\"mcp_fixture_echo\",\"arguments\":{}}", .label = tooling_presentation.mcp_running_label, .value = "mcp_fixture_echo" },
-        .{ .arguments_json = "{\"search\":\"list files\"}", .label = "Searching toolbox", .value = "list files" },
-        .{ .arguments_json = "{\"open\":\"fixture\"}", .label = "Opening", .value = "fixture" },
+        .{ .arguments_json = "{\"search\":\"list files\"}", .label = "searching toolbox", .value = "list files" },
+        .{ .arguments_json = "{\"open\":\"fixture\"}", .label = "opening", .value = "fixture" },
         // A skill's file reads as that file.
-        .{ .arguments_json = "{\"open\":\"skill:opaque/location\",\"resource\":\"references/types.md\"}", .label = "Reading skill resource", .value = "references/types.md" },
+        .{ .arguments_json = "{\"open\":\"skill:opaque/location\",\"resource\":\"references/types.md\"}", .label = "reading skill resource", .value = "references/types.md" },
     };
     const alloc = std.testing.allocator;
     for (cases) |case| {
@@ -2214,7 +2214,7 @@ test "provisional toolbox labels read as what the call opens, runs, or searches"
         defer statuses.deinit(alloc);
         try statuses.publish(&hooks, alloc, 7, "toolbox_1", toolbox.tool_name, .read, eligibleActionLabel(toolbox.tool_name), "glob_files", case.arguments_json);
         // A call that names nothing yet shows no row, so no bare "Using".
-        if (std.mem.eql(u8, case.label, "Using")) {
+        if (std.mem.eql(u8, case.label, "using")) {
             try std.testing.expectEqual(@as(usize, 0), capture.events.items.len);
             try std.testing.expect(!statuses.has("toolbox_1"));
             continue;
@@ -2284,7 +2284,7 @@ test "a streaming toolbox call's row names what it runs once that name arrives, 
     const kind = activityKind(hooks.tool_registry, toolbox.tool_name);
     const action = eligibleActionLabel(toolbox.tool_name);
     var named_buf: [512]u8 = undefined;
-    const named = try formatProvisionalProgressLabel(&named_buf, "Running", "glob_files");
+    const named = try formatProvisionalProgressLabel(&named_buf, "running", "glob_files");
 
     // The call shows no row until its arguments name what it does.
     try statuses.publish(&hooks, alloc, 7, "toolbox_1", toolbox.tool_name, kind, action, null, null);
@@ -2323,7 +2323,7 @@ test "a streaming subagent call's row names its subagent once the name arrives, 
 
     try statuses.publish(&hooks, alloc, 7, "sub_1", "subagent", kind, action, null, null);
     try std.testing.expectEqual(@as(usize, 2), capture.events.items.len);
-    try std.testing.expectEqualStrings("● Managing\x1b[0m", capture.events.items[1].progress.text);
+    try std.testing.expectEqualStrings("● managing\x1b[0m", capture.events.items[1].progress.text);
     // Part of the name is not yet a name.
     try statuses.observeArguments(&hooks, alloc, 7, "sub_1", "{\"request\":{\"action\":\"message\",\"agent\":\"revi");
     try std.testing.expectEqual(@as(usize, 2), capture.events.items.len);
@@ -2332,10 +2332,10 @@ test "a streaming subagent call's row names its subagent once the name arrives, 
     try std.testing.expectEqualStrings("sub_1", capture.events.items[2].provisional.id.call_id);
     try std.testing.expectEqualStrings(named, capture.events.items[3].progress.text);
     // The rest of the call streams in without another publication.
-    try statuses.observeArguments(&hooks, alloc, 7, "sub_1", "{\"request\":{\"action\":\"message\",\"agent\":\"reviewer\",\"message\":\"Review");
+    try statuses.observeArguments(&hooks, alloc, 7, "sub_1", "{\"request\":{\"action\":\"message\",\"agent\":\"reviewer\",\"message\":\"review");
     try std.testing.expectEqual(@as(usize, 4), capture.events.items.len);
     // The stream's final start keeps the name.
-    try statuses.publish(&hooks, alloc, 7, "sub_1", "subagent", kind, action, null, "{\"request\":{\"action\":\"message\",\"agent\":\"reviewer\",\"message\":\"Review it\"}}");
+    try statuses.publish(&hooks, alloc, 7, "sub_1", "subagent", kind, action, null, "{\"request\":{\"action\":\"message\",\"agent\":\"reviewer\",\"message\":\"review it\"}}");
     try std.testing.expectEqualStrings(named, capture.events.items[5].progress.text);
 
     // A call without `request` starts with its action, which the stream's
@@ -2365,7 +2365,7 @@ test "provisional toolbox labels decode escaped UTF-8 and encode terminal contro
         try statuses.publish(&hooks, alloc, 7, "toolbox_1", toolbox.tool_name, .read, eligibleActionLabel(toolbox.tool_name), "skill:opaque/location", json);
     }
     try std.testing.expectEqualStrings(
-        "● Reading skill resource\x1b[0m \x1b[38;5;245mr/é中\"\\x1b[31m\\x0a\\x0d\\x09\\x00\\u{0080}.md\x1b[0m",
+        "● reading skill resource\x1b[0m \x1b[38;5;245mr/é中\"\\x1b[31m\\x0a\\x0d\\x09\\x00\\u{0080}.md\x1b[0m",
         capture.events.items[1].progress.text,
     );
     try std.testing.expectEqualStrings("r/é中\"\x1b[31m\n\r\t\x00\u{0080}.md", statuses.tracked.items[0].label_value.?);
@@ -2373,7 +2373,7 @@ test "provisional toolbox labels decode escaped UTF-8 and encode terminal contro
 
 test "provisional toolbox labels wait for the call when an encoded resource exceeds the progress buffer" {
     const alloc = std.testing.allocator;
-    const max_detail = 512 - "● Reading skill resource\x1b[0m \x1b[38;5;245m\x1b[0m".len;
+    const max_detail = 512 - "● reading skill resource\x1b[0m \x1b[38;5;245m\x1b[0m".len;
     for ([_]usize{ max_detail, max_detail + 1, 512, 513, 4096 }) |len| {
         var capture = ProvisionalStatusTestCapture{ .alloc = alloc };
         defer capture.deinit();
@@ -2409,7 +2409,7 @@ test "provisional non-skill labels retain hints regardless of completed argument
         var statuses = ProvisionalToolStatuses{};
         defer statuses.deinit(alloc);
         try statuses.publish(&hooks, alloc, 7, "read_1", "read_file", .read, eligibleActionLabel("read_file"), "original.txt", json);
-        try std.testing.expectEqualStrings("● Reading\x1b[0m \x1b[38;5;245moriginal.txt\x1b[0m", capture.events.items[1].progress.text);
+        try std.testing.expectEqualStrings("● reading\x1b[0m \x1b[38;5;245moriginal.txt\x1b[0m", capture.events.items[1].progress.text);
         try std.testing.expectEqualStrings("original.txt", statuses.tracked.items[0].label_value.?);
     }
 }
@@ -2425,13 +2425,13 @@ test "tracked provisional cancellation retains labels without exposing registere
     var statuses = ProvisionalToolStatuses{};
     defer statuses.deinit(alloc);
 
-    try statuses.publish(&hooks, alloc, 9, "read_1", "read_file", .read, "Reading", null, null);
-    try statuses.publish(&hooks, alloc, 9, "read_1", "read_file", .read, "Reading", "src/main.zig", null);
-    try statuses.publish(&hooks, alloc, 9, "command_1", "run_command", .command, "Running", null, null);
-    try statuses.publish(&hooks, alloc, 9, "mcp_1", "mcp_custom", .read, "Running", null, null);
-    try statuses.publish(&hooks, alloc, 9, "search_1", "exa_search", .read, "Searching", null, null);
-    try statuses.publish(&hooks, alloc, 9, "search_2", "perplexity_search", .read, "Searching", null, null);
-    try statuses.publish(&hooks, alloc, 9, "search_3", "exa_search", .read, "Searching", "cmux theme docs", null);
+    try statuses.publish(&hooks, alloc, 9, "read_1", "read_file", .read, "reading", null, null);
+    try statuses.publish(&hooks, alloc, 9, "read_1", "read_file", .read, "reading", "src/main.zig", null);
+    try statuses.publish(&hooks, alloc, 9, "command_1", "run_command", .command, "running", null, null);
+    try statuses.publish(&hooks, alloc, 9, "mcp_1", "mcp_custom", .read, "running", null, null);
+    try statuses.publish(&hooks, alloc, 9, "search_1", "exa_search", .read, "searching", null, null);
+    try statuses.publish(&hooks, alloc, 9, "search_2", "perplexity_search", .read, "searching", null, null);
+    try statuses.publish(&hooks, alloc, 9, "search_3", "exa_search", .read, "searching", "cmux theme docs", null);
     try statuses.finishTrackedCancelled(&hooks, alloc, arena, 9);
 
     var terminal_count: usize = 0;
@@ -2440,17 +2440,17 @@ test "tracked provisional cancellation retains labels without exposing registere
         terminal_count += 1;
         try std.testing.expectEqual(types.ToolOutcomeKind.cancelled, event.terminal.outcome.kind);
         if (std.mem.eql(u8, event.terminal.id.call_id, "read_1")) {
-            try std.testing.expectEqualStrings("Cancelled src/main.zig", event.terminal.outcome.summary);
+            try std.testing.expectEqualStrings("cancelled src/main.zig", event.terminal.outcome.summary);
         } else if (std.mem.eql(u8, event.terminal.id.call_id, "command_1")) {
-            try std.testing.expectEqualStrings("Cancelled tool call", event.terminal.outcome.summary);
+            try std.testing.expectEqualStrings("cancelled tool call", event.terminal.outcome.summary);
         } else if (std.mem.eql(u8, event.terminal.id.call_id, "mcp_1")) {
-            try std.testing.expectEqualStrings("Cancelled mcp_custom", event.terminal.outcome.summary);
+            try std.testing.expectEqualStrings("cancelled mcp_custom", event.terminal.outcome.summary);
         } else if (std.mem.eql(u8, event.terminal.id.call_id, "search_1")) {
-            try std.testing.expectEqualStrings("Cancelled web search", event.terminal.outcome.summary);
+            try std.testing.expectEqualStrings("cancelled web search", event.terminal.outcome.summary);
         } else if (std.mem.eql(u8, event.terminal.id.call_id, "search_2")) {
-            try std.testing.expectEqualStrings("Cancelled web search", event.terminal.outcome.summary);
+            try std.testing.expectEqualStrings("cancelled web search", event.terminal.outcome.summary);
         } else if (std.mem.eql(u8, event.terminal.id.call_id, "search_3")) {
-            try std.testing.expectEqualStrings("Cancelled cmux theme docs", event.terminal.outcome.summary);
+            try std.testing.expectEqualStrings("cancelled cmux theme docs", event.terminal.outcome.summary);
         } else {
             return error.TestUnexpectedToolCallId;
         }
@@ -2474,8 +2474,8 @@ test "unmatched recovery starts hide registered names but retain unknown identit
     var statuses = ProvisionalToolStatuses{};
     defer statuses.deinit(alloc);
 
-    try statuses.publish(&hooks, alloc, 9, "command_1", "run_command", .command, "Running", null, null);
-    try statuses.publish(&hooks, alloc, 9, "mcp_1", "mcp_custom", .read, "Running", null, null);
+    try statuses.publish(&hooks, alloc, 9, "command_1", "run_command", .command, "running", null, null);
+    try statuses.publish(&hooks, alloc, 9, "mcp_1", "mcp_custom", .read, "running", null, null);
     try statuses.finishUnmatchedRecoveryStarts(&hooks, alloc, arena, 9, &.{});
 
     var terminal_count: usize = 0;
@@ -2795,7 +2795,7 @@ test "malformed final settlement retains diagnostics and consumes identity once"
                 terminal_count += 1;
                 try std.testing.expectEqualStrings(if (streamed) "streamed_id" else "final_id", terminal.id.call_id);
                 try std.testing.expectEqual(types.ToolOutcomeKind.failed, terminal.outcome.kind);
-                try std.testing.expectEqualStrings("Failed shell: invalid JSON arguments", terminal.outcome.summary);
+                try std.testing.expectEqualStrings("failed shell: invalid JSON arguments", terminal.outcome.summary);
                 try std.testing.expectEqualStrings(result.model_output, terminal.result.?);
                 try std.testing.expectEqual(@as(usize, 15), terminal.result_memory.?.output_bytes);
             },
@@ -2821,7 +2821,7 @@ test "failed admitted settlement keeps identity when terminal publication fails"
     const call = testToolCall("read_1", "read_file");
     try std.testing.expectError(
         error.TestTerminalPublicationFailure,
-        statuses.settleAdmittedCall(&hooks, alloc, arena, 1, call, "Failed", &.{}),
+        statuses.settleAdmittedCall(&hooks, alloc, arena, 1, call, "failed", &.{}),
     );
     try std.testing.expect(statuses.has("read_1"));
 }
@@ -2862,7 +2862,7 @@ test "provisional lifecycle cleans up every copied-id allocation failure" {
 }
 
 test "native web_search completion status includes searches and duration" {
-    const line = try formatWebSearchCompletion(std.testing.allocator, "Searched current news", .{
+    const line = try formatWebSearchCompletion(std.testing.allocator, "searched current news", .{
         .searches = 2,
         .duration_ms = 17,
     });
@@ -3042,7 +3042,7 @@ test "file edit preflight failure reports the exact mismatch" {
     const terminal = capture.events.items[0].terminal;
     try std.testing.expectEqual(types.ToolOutcomeKind.failed, terminal.outcome.kind);
     try std.testing.expectEqualStrings(
-        "Failed edit_file: old_string not found in file",
+        "failed edit_file: old_string not found in file",
         terminal.outcome.summary,
     );
 }
@@ -3083,7 +3083,7 @@ test "permission target preflight failure reports the actionable reason" {
     const terminal = capture.events.items[0].terminal;
     try std.testing.expectEqual(types.ToolOutcomeKind.failed, terminal.outcome.kind);
     try std.testing.expectEqualStrings(
-        "Failed grep_files: Path not found: /tmp/missing",
+        "failed grep_files: Path not found: /tmp/missing",
         terminal.outcome.summary,
     );
 }
@@ -3122,7 +3122,7 @@ test "dynamic MCP failure flattens a multi-line detail into a terminal-safe summ
     const terminal = capture.events.items[0].terminal;
     try std.testing.expectEqual(types.ToolOutcomeKind.failed, terminal.outcome.kind);
     try std.testing.expectEqualStrings(
-        "Failed mcp_plain_getThreads: Invalid input:\\x1b[31m labels require at least one item retry rejected",
+        "failed mcp_plain_getThreads: Invalid input:\\x1b[31m labels require at least one item retry rejected",
         terminal.outcome.summary,
     );
     try std.testing.expect(std.mem.findScalar(u8, terminal.outcome.summary, 0x1b) == null);
@@ -3163,7 +3163,7 @@ test "dynamic MCP failure flattens a pretty-printed JSON error body" {
     const terminal = capture.events.items[0].terminal;
     try std.testing.expectEqual(types.ToolOutcomeKind.failed, terminal.outcome.kind);
     try std.testing.expectEqualStrings(
-        "Failed mcp_vercel_web_fetch_vercel_url: { \"success\": false, \"info\": \"Unable to create share\" }",
+        "failed mcp_vercel_web_fetch_vercel_url: { \"success\": false, \"info\": \"Unable to create share\" }",
         terminal.outcome.summary,
     );
 }
@@ -3216,7 +3216,7 @@ test "terminal path scope failure appends the exact status detail" {
     const terminal = capture.events.items[0].terminal;
     try std.testing.expectEqual(types.ToolOutcomeKind.failed, terminal.outcome.kind);
     try std.testing.expectEqualStrings(
-        "Failed start: path is outside the workspace",
+        "failed start: path is outside the workspace",
         terminal.outcome.summary,
     );
 }
@@ -3299,7 +3299,7 @@ test "command process failures name the typed cause without changing model failu
         .{
             .id = "command_nonzero",
             .presentation = .{ .exit_code = 7 },
-            .expected_summary = "Exited 7 run_command",
+            .expected_summary = "exited 7 run_command",
         },
         .{
             .id = "command_signal",
@@ -3387,11 +3387,11 @@ test "command timeout and output capture failure name their actual cause" {
 
     try std.testing.expectEqual(@as(usize, 2), capture.events.items.len);
     try std.testing.expectEqualStrings(
-        "Timed out run_command",
+        "timed out run_command",
         capture.events.items[0].terminal.outcome.summary,
     );
     try std.testing.expectEqualStrings(
-        "Output capture failed run_command",
+        "output capture failed run_command",
         capture.events.items[1].terminal.outcome.summary,
     );
     for (capture.events.items) |event| {
@@ -3413,48 +3413,48 @@ test "terminal action outcomes map to one typed visible decision" {
         .{
             .presentation = .{ .returned = .started },
             .outcome = .completed,
-            .label = "Started",
+            .label = "started",
         },
         .{
             .presentation = .{ .returned = .condition_met },
             .outcome = .completed,
-            .label = "Condition met for",
+            .label = "condition met for",
         },
         .{
             .presentation = .{ .returned = .safety_ceiling },
             .outcome = .completed,
-            .label = "Wait limit reached for",
+            .label = "wait limit reached for",
         },
         .{
             .presentation = .{ .returned = .cancelled },
             .outcome = .cancelled,
-            .label = "Cancelled",
+            .label = "cancelled",
         },
         .{
             .presentation = .{ .returned = .{ .exited = 0 } },
             .outcome = .completed,
-            .label = "Exited 0",
+            .label = "exited 0",
         },
         .{
             .presentation = .{ .returned = .{ .exited = 7 } },
             .outcome = .failed,
-            .label = "Exited 7",
+            .label = "exited 7",
         },
         .{
             .presentation = .{ .returned = .{ .signal = 9 } },
             .outcome = .failed,
-            .label = "Terminated by signal 9",
+            .label = "terminated by signal 9",
         },
         .{
             .presentation = .{ .failed = .session_not_found },
             .outcome = .failed,
-            .label = "Failed",
+            .label = "failed",
             .detail = "terminal session not found",
         },
         .{
             .presentation = .{ .failed = .cancelled },
             .outcome = .cancelled,
-            .label = "Cancelled",
+            .label = "cancelled",
         },
     };
 
@@ -3557,7 +3557,7 @@ test "cancelled shell wait names the observation instead of the process" {
     try std.testing.expect(std.mem.find(
         u8,
         terminal.outcome.summary,
-        "Stopped waiting for",
+        "stopped waiting for",
     ) != null);
 }
 

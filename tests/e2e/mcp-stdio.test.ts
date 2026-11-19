@@ -522,15 +522,15 @@ describe("modern MCP stdio compatibility", () => {
         "Call the MCP fixture only after I approve its exact arguments.",
       );
       const approval = await tui.waitForText(
-        `Arguments for this request: ${expectedArguments}`,
+        `arguments for this request: ${expectedArguments}`,
         20_000,
       );
-      expect(approval).toContain("Allow this MCP tool call?");
+      expect(approval).toContain("allow this MCP tool call?");
       expect(approval).toContain(TOOL_NAME);
       expect(approval).toContain(
-        "This MCP tool needs approval before fx can send the request.",
+        "this MCP tool needs approval before fx can send the request.",
       );
-      expect(approval).toContain("3. Deny");
+      expect(approval).toContain("3. deny");
       expect(
         readWire(root.wireLogPath).some(
           (entry) => entry.message.method === "tools/call",
@@ -680,7 +680,7 @@ describe("modern MCP stdio compatibility", () => {
     );
     expect(trusted.code).toBe(0);
     // It says what the approved server runs, as the file writes it.
-    expect(trusted.stdout).toBe("Approved fixture, which runs: '${WORKSPACE_MCP_COMMAND}' '${WORKSPACE_MCP_FIXTURE}'\n");
+    expect(trusted.stdout).toBe("approved fixture, which runs: '${WORKSPACE_MCP_COMMAND}' '${WORKSPACE_MCP_FIXTURE}'\n");
     settings = readFileSync(join(root.home, ".fx", "settings.json"), "utf8");
     expect(settings).toContain("enabledMcpjsonServers");
 
@@ -953,7 +953,7 @@ describe("modern MCP stdio compatibility", () => {
       { cwd: root.workspace, env },
     );
     expect(added.code).toBe(0);
-    expect(added.stdout).toContain("Added fixture to ~/.fx/mcp.json.");
+    expect(added.stdout).toContain("added fixture to ~/.fx/mcp.json.");
     expect(existsSync(root.wireLogPath)).toBe(false);
 
     const result = await runFx(
@@ -1008,7 +1008,7 @@ describe("modern MCP stdio compatibility", () => {
         await tui.sendLiteral(`/mcp add ${envFlags} literal -- ${process.execPath} ${LEGACY_FIXTURE} ${packageArg}`);
         if (matchingPath) await tui.sendKeys("Tab");
         await tui.sendKeys("Enter");
-        await tui.waitForText("Added literal to ~/.fx/mcp.json.", 5_000);
+        await tui.waitForText("added literal to ~/.fx/mcp.json.", 5_000);
         // Saved as .mcp.json writes it: the program, then its arguments as typed.
         const saved = JSON.parse(readFileSync(configPath, "utf8")).mcp.literal;
         expect({ command: saved.command, args: saved.args })
@@ -1117,7 +1117,7 @@ describe("modern MCP stdio compatibility", () => {
       expect(existsSync(root.launchLogPath)).toBe(false);
 
       await tui.sendText("/mcp approve fixture");
-      await tui.waitForText("Approved fixture", 10_000);
+      await tui.waitForText("approved fixture", 10_000);
       await tui.sendText("/mcp");
       await tui.waitForText(/fixture +ready, 1 tool/, 15_000);
       expect(readAttemptedPids(root.launchLogPath).length).toBeGreaterThanOrEqual(1);
@@ -1125,7 +1125,7 @@ describe("modern MCP stdio compatibility", () => {
       await tui.waitForPane((pane) => !pane.includes("MCP servers"), 5_000);
 
       await tui.sendText("/mcp reject fixture");
-      await tui.waitForText("Rejected fixture", 10_000);
+      await tui.waitForText("rejected fixture", 10_000);
       expect(gateway.requests).toHaveLength(0);
 
       await tui.kill();
@@ -1252,7 +1252,7 @@ describe("modern MCP stdio compatibility", () => {
       // Each turn's tool group names its MCP call as MCP work, never as a
       // command.
       const scrollback = await tui.captureFullScrollback();
-      expect(scrollback).toContain("● Used an MCP tool");
+      expect(scrollback).toContain("● used an MCP tool");
       expect(scrollback).not.toMatch(/\b\d+ commands?\b|\b[Rr]an (a )?commands?\b/);
       expect(scrollback).not.toContain("not selected");
       expect(readFileSync(stderrPath, "utf8")).toBe("");
@@ -2592,7 +2592,7 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"`,
       await tui.waitForText("Modern MCP TUI complete.", 20_000);
 
       const scrollback = await tui.captureFullScrollback();
-      expect(scrollback).toContain(`Ran MCP ${TOOL_NAME}`);
+      expect(scrollback).toContain(`ran MCP ${TOOL_NAME}`);
       expect(activeGateway.requests).toHaveLength(3);
       expect(activeGateway.requests[2]?.body).toContain(`${MODERN_RESULT}:hello`);
       expect(readFileSync(stderrPath, "utf8")).toBe("");
@@ -2645,7 +2645,7 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"`,
       await tui.waitForText("MCP failure detail complete.", 20_000);
 
       const scrollback = await tui.captureFullScrollback();
-      expect(scrollback).toContain(`└ Couldn't run ${TOOL_NAME} · Invalid input: labels require at least one item retry rejected`);
+      expect(scrollback).toContain(`└ couldn't run ${TOOL_NAME} · Invalid input: labels require at least one item retry rejected`);
       expect(scrollback).not.toContain("\\x0a");
       expect(activeGateway.requests.at(-1)?.body).toContain(
         "Invalid input: labels require at least one item",
@@ -2692,7 +2692,7 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"`,
       // The row names the failed call, and the cause follows it on its line.
       await tui.waitForText(cause, 20_000);
       await tui.waitForText("Rejected arguments complete.", 20_000);
-      expect(await tui.captureFullScrollback()).toContain(`Couldn't run ${TOOL_NAME} · ${cause}`);
+      expect(await tui.captureFullScrollback()).toContain(`couldn't run ${TOOL_NAME} · ${cause}`);
       // The model still gets the server's own words, which say how to fix the call.
       expect(activeGateway.requests.at(-1)?.body).toContain("validating /properties/limit");
 
@@ -3909,8 +3909,8 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"`,
       ).toBe(true);
 
       await tui.sendInterruptEscapePair(10_000);
-      await tui.waitForText("Cancelled mcp_fixture_echo", 10_000);
-      await tui.waitForText("▪ Cancelled", 5_000);
+      await tui.waitForText("cancelled mcp_fixture_echo", 10_000);
+      await tui.waitForText("▪ cancelled", 5_000);
       const cancel_deadline = Date.now() + 5_000;
       while (Date.now() < cancel_deadline) {
         if (
@@ -3989,7 +3989,7 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"`,
 
       const cancelStarted = Date.now();
       await tui.sendInterruptEscapePair(5_000);
-      await tui.waitForText("Cancelled mcp_fixture_echo", 5_000);
+      await tui.waitForText("cancelled mcp_fixture_echo", 5_000);
       expect(Date.now() - cancelStarted).toBeLessThan(5_000);
 
       await tui.kill();
@@ -4526,11 +4526,11 @@ describe("fx mcp call", () => {
       await tui.waitForComposer(15_000);
       await tui.sendText("Save the list to a file.");
       // The shell command asks first, as any command does in ask mode.
-      await tui.waitForText("Would you like to run the following command?", 20_000);
+      await tui.waitForText("would you like to run the following command?", 20_000);
       await tui.sendKeys("1");
       // Then its `fx mcp call` asks while the command waits, and nothing
       // reaches the server before the answer.
-      const approval = await tui.waitForText("Allow this MCP tool call?", 20_000);
+      const approval = await tui.waitForText("allow this MCP tool call?", 20_000);
       expect(approval).toContain(TOOL_NAME);
       expect(toolCalls(root)).toHaveLength(0);
       await tui.sendKeys("1");
@@ -4958,13 +4958,13 @@ describe("fx mcp call", () => {
       const scrollback = await tui.captureFullScrollback();
       // The calls of one tool share a row that counts them, in the
       // command's group.
-      expect(scrollback).toContain("● Used MCP tools, ran a command ✓");
-      expect(scrollback.split(`Ran MCP ${TOOL_NAME}`)).toHaveLength(2);
-      expect(scrollback).toContain(`└ Ran MCP ${TOOL_NAME} ×3`);
-      expect(scrollback).not.toContain("Running MCP");
+      expect(scrollback).toContain("● used MCP tools, ran a command ✓");
+      expect(scrollback.split(`ran MCP ${TOOL_NAME}`)).toHaveLength(2);
+      expect(scrollback).toContain(`└ ran MCP ${TOOL_NAME} ×3`);
+      expect(scrollback).not.toContain("running MCP");
       expect(seen).toContain("calls=3 items=9");
       // The model sees the command's output, not the rows.
-      expect(seen).not.toContain("Ran MCP");
+      expect(seen).not.toContain("ran MCP");
       expect(readFileSync(stderrPath, "utf8")).toBe("");
     },
     60_000,
@@ -5055,10 +5055,10 @@ describe("fx mcp call", () => {
 
       await tui.waitForComposer(15_000);
       await tui.sendText("Save the list to a file.");
-      await tui.waitForText(`Running MCP ${TOOL_NAME}`, 20_000);
+      await tui.waitForText(`running MCP ${TOOL_NAME}`, 20_000);
       expect(toolCalls(root)).toHaveLength(1);
       await tui.sendInterruptEscapePair(10_000);
-      await tui.waitForText(`Cancelled ${TOOL_NAME}`, 10_000);
+      await tui.waitForText(`cancelled ${TOOL_NAME}`, 10_000);
       await tui.waitForStableComposer(10_000);
       const liveScreen = await tui.captureFullScrollback();
       expect(liveScreen).not.toContain("Running MCP");

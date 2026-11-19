@@ -1734,7 +1734,7 @@ pub fn Runtime(comptime App: type) type {
                     try app.writeDomainNotice(.{
                         .topic = "session",
                         .tone = .@"error",
-                        .body = config_runtime.sessionConnectionNotice(err) orelse "Unable to resume selected session.",
+                        .body = config_runtime.sessionConnectionNotice(err) orelse "unable to resume selected session.",
                     }, true);
                 }
                 app.shell.render_requests.request(.footer);
@@ -1914,7 +1914,7 @@ pub fn Runtime(comptime App: type) type {
                 try app.writeDomainNotice(.{
                     .topic = "session",
                     .tone = .@"error",
-                    .body = "Unable to fork the session.",
+                    .body = "unable to fork the session.",
                 }, true);
                 app.shell.render_requests.request(.footer);
                 return true;
@@ -2664,7 +2664,7 @@ pub fn Runtime(comptime App: type) type {
                 try app.writeDomainNotice(.{
                     .topic = "auth",
                     .tone = .@"error",
-                    .body = "Could not load that credential. The current source is unchanged.",
+                    .body = "could not load that credential. the current source is unchanged.",
                 }, true);
                 app.shell.render_requests.request(.footer);
                 return true;
@@ -5508,7 +5508,7 @@ test "app_input_runtime Enter reports a skill binding rejected by the input limi
     try std.testing.expectEqualStrings("$r suffix", app.input_runtime.edit_state.input.items);
     try std.testing.expectEqual(@as(usize, 0), app.input_runtime.entities.skill_tokens.items.len);
     try std.testing.expectEqualStrings(
-        "That edit exceeds the local prompt safety limit and was not applied.",
+        "that edit exceeds the local prompt safety limit and was not applied.",
         app.notice_body.items,
     );
 }
@@ -5856,7 +5856,7 @@ test "app_input_runtime inline skill acceptance preserves input on limit rejecti
     try std.testing.expectEqualStrings("explain $man", app.input_runtime.edit_state.input.items);
     try std.testing.expectEqual(@as(usize, 0), app.input_runtime.entities.skill_tokens.items.len);
     try std.testing.expectEqualStrings(
-        "That edit exceeds the local prompt safety limit and was not applied.",
+        "that edit exceeds the local prompt safety limit and was not applied.",
         app.notice_body.items,
     );
 }
@@ -6319,7 +6319,7 @@ test "app_input_runtime reports resume failure after picker transition" {
 
     try std.testing.expect(!picker.active);
     try std.testing.expectEqual(@as(usize, 1), app.notice_write_count);
-    try std.testing.expectEqualStrings("Unable to resume selected session.", app.notice_body.items);
+    try std.testing.expectEqualStrings("unable to resume selected session.", app.notice_body.items);
     try std.testing.expect(std.mem.find(u8, app.transcript.items, "SessionCommitBoundaryUnavailable") == null);
 }
 
@@ -6682,7 +6682,7 @@ test "model picker enter commits normal speed from the speed stage" {
     try std.testing.expectEqual(false, app.last_preference_fast_mode.?);
     try std.testing.expectEqualStrings("", app.input_runtime.edit_state.input.items);
     try std.testing.expectEqualStrings(
-        "Switched to anthropic/claude-opus-4.7 (effort: default, speed: normal)",
+        "switched to anthropic/claude-opus-4.7 (effort: default, speed: normal)",
         app.notice_body.items,
     );
     try std.testing.expect(std.mem.find(u8, app.transcript.items, "Invalid /model selection") == null);
@@ -6719,7 +6719,7 @@ test "active stream Enter commits a complete model choice for the next turn" {
     try std.testing.expectEqualStrings("", app.input_runtime.edit_state.input.items);
     try std.testing.expectEqual(@as(usize, 0), app.submitted_prompt_count);
     try std.testing.expectEqualStrings(
-        "Next turn will use " ++ model ++ " (effort: default, speed: normal)",
+        "next turn will use " ++ model ++ " (effort: default, speed: normal)",
         app.notice_body.items,
     );
 }
@@ -6741,7 +6741,7 @@ test "active stream Enter selects the visible model choice" {
     try std.testing.expectEqualStrings(model, app.selected_model.items);
     try std.testing.expectEqualStrings("", app.input_runtime.edit_state.input.items);
     try std.testing.expectEqualStrings(
-        "Next turn will use " ++ model ++ " (effort: default, speed: normal)",
+        "next turn will use " ++ model ++ " (effort: default, speed: normal)",
         app.notice_body.items,
     );
     try std.testing.expectEqual(@as(usize, 0), app.submitted_prompt_count);
@@ -6966,7 +6966,7 @@ test "app_input_runtime fast-only model opens the Fast stage while streaming" {
     try std.testing.expectEqualStrings(model, app.selected_model.items);
     try std.testing.expect(app.fast_mode);
     try std.testing.expectEqual(@as(usize, 1), app.preference_commit_count);
-    try std.testing.expectEqualStrings("Next turn will use " ++ model ++ " (effort: default, speed: fast)", app.notice_body.items);
+    try std.testing.expectEqualStrings("next turn will use " ++ model ++ " (effort: default, speed: fast)", app.notice_body.items);
 }
 
 test "app_input_runtime Enter submits a dismissed slash skill query as text" {
@@ -8808,11 +8808,11 @@ fn activateRoutingDecision(app: *RoutingFakeApp, kind: RoutingDecisionKind) !voi
     switch (kind) {
         .question => {
             const options = [_]types.QuestionOption{
-                .{ .label = "Alpha", .description = null },
-                .{ .label = "Beta", .description = null },
+                .{ .label = "alpha", .description = null },
+                .{ .label = "beta", .description = null },
             };
             const entries = [_]types.QuestionBatchEntry{
-                .{ .question = "Continue?", .options = &options },
+                .{ .question = "continue?", .options = &options },
             };
             try agents.screenAgentOf(app).question_prompt.syncFrom(app.alloc, &entries);
         },
@@ -11474,10 +11474,10 @@ test "app_input_runtime active Ctrl-C cancels stream and arms exit window" {
     try std.testing.expect(app.agent().worker.cancel_requested);
     var rendered = try app.shell.prepareTranscriptSource(alloc, null);
     defer rendered.deinit(alloc);
-    try std.testing.expect(std.mem.find(u8, rendered.bytes, "Cancelled") != null);
-    try std.testing.expect(std.mem.find(u8, rendered.bytes, "What can fx do differently?") != null);
-    try std.testing.expect(std.mem.find(u8, rendered.bytes, "System:") == null);
-    try std.testing.expect(std.mem.find(u8, rendered.bytes, "Cancelling") == null);
+    try std.testing.expect(std.mem.find(u8, rendered.bytes, "cancelled") != null);
+    try std.testing.expect(std.mem.find(u8, rendered.bytes, "what can fx do differently?") != null);
+    try std.testing.expect(std.mem.find(u8, rendered.bytes, "system:") == null);
+    try std.testing.expect(std.mem.find(u8, rendered.bytes, "cancelling") == null);
     try std.testing.expectEqual(@as(usize, 0), app.notice_write_count);
     try std.testing.expect(app.input_runtime.gestures.ctrlCExitArmed());
     try std.testing.expect(app.input_runtime.gestures.ctrlCExitArmedAt() != null);
@@ -11500,7 +11500,7 @@ test "automatic compaction cancellation is silent only while compaction is activ
         try std.testing.expect(app.agent().worker.cancel_requested);
         var rendered = try app.shell.prepareTranscriptSource(alloc, null);
         defer rendered.deinit(alloc);
-        try std.testing.expectEqual(settled, std.mem.find(u8, rendered.bytes, "What can fx do differently?") != null);
+        try std.testing.expectEqual(settled, std.mem.find(u8, rendered.bytes, "what can fx do differently?") != null);
         try std.testing.expectEqualStrings("", app.notice_body.items);
     }
 }
@@ -11531,10 +11531,10 @@ test "app_input_runtime active tool Escape presents final cancellation immediate
     try std.testing.expect(app.agent().worker.cancel_requested);
     var rendered = try app.shell.prepareTranscriptSource(alloc, null);
     defer rendered.deinit(alloc);
-    try std.testing.expect(std.mem.find(u8, rendered.bytes, "Cancelled") != null);
-    try std.testing.expect(std.mem.find(u8, rendered.bytes, "What can fx do differently?") != null);
-    try std.testing.expect(std.mem.find(u8, rendered.bytes, "System:") == null);
-    try std.testing.expect(std.mem.find(u8, rendered.bytes, "Cancelling") == null);
+    try std.testing.expect(std.mem.find(u8, rendered.bytes, "cancelled") != null);
+    try std.testing.expect(std.mem.find(u8, rendered.bytes, "what can fx do differently?") != null);
+    try std.testing.expect(std.mem.find(u8, rendered.bytes, "system:") == null);
+    try std.testing.expect(std.mem.find(u8, rendered.bytes, "cancelling") == null);
     try std.testing.expectEqual(@as(usize, 1), app.shell.activeToolActivityCount());
     try std.testing.expectEqualStrings("", app.notice_topic.items);
     try std.testing.expectEqualStrings("", app.notice_body.items);
@@ -11555,9 +11555,9 @@ test "app_input_runtime second Ctrl-C after active cancellation exits without du
     defer rendered.deinit(alloc);
     try std.testing.expectEqual(
         @as(usize, 1),
-        std.mem.count(u8, rendered.bytes, "What can fx do differently?"),
+        std.mem.count(u8, rendered.bytes, "what can fx do differently?"),
     );
-    try std.testing.expect(std.mem.find(u8, rendered.bytes, "System:") == null);
+    try std.testing.expect(std.mem.find(u8, rendered.bytes, "system:") == null);
 }
 
 test "app_input_runtime pending Ctrl-C exits before repeating active cancellation" {
@@ -14060,7 +14060,7 @@ test "app_input_runtime submit rejects oversized registered paste backing" {
     try std.testing.expectEqual(@as(?[]u8, null), app.last_prompt);
     try std.testing.expectEqual(@as(usize, 0), app.preflight_count);
     try std.testing.expectEqualStrings(
-        "That edit exceeds the local prompt safety limit and was not applied.",
+        "that edit exceeds the local prompt safety limit and was not applied.",
         app.notice_body.items,
     );
     try std.testing.expectEqualStrings(placeholder, app.input_runtime.edit_state.input.items);
@@ -15754,7 +15754,7 @@ test "app_input_runtime image path paste rejects the complete edit without chang
     try std.testing.expectEqualStrings("/tmp/original.png", app.agent().pending_images.items[0].path);
     try std.testing.expectEqual(@as(usize, 7), app.next_image_id_counter);
     try std.testing.expectEqualStrings(
-        "That edit exceeds the local prompt safety limit and was not applied.",
+        "that edit exceeds the local prompt safety limit and was not applied.",
         app.notice_body.items,
     );
 }

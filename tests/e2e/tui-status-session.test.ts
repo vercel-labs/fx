@@ -38,7 +38,7 @@ function expectReport(report: StatusReport, id: string | null, saved: boolean) {
   expect(report.labels[0]).toBe("Session");
   // A panel too tall for its terminal shows the rest a ↓ at a time.
   const labels = new Set(report.views.flatMap((view) => view.labels));
-  for (const label of ["Model", "Auth", "Permissions", "Workspace", "Turns"]) expect(labels).toContain(label);
+  for (const label of ["Model", "Auth", "permissions", "workspace", "Turns"]) expect(labels).toContain(label);
   expect(showsStatusPanel(report.closed)).toBe(false);
   if (!closedAsBefore(report)) {
     throw new Error(`the /status panel at tape frame ${report.frame} changed the shell:\n--- before\n${report.before.join("\n")}\n--- closed\n${report.closed.join("\n")}`);
@@ -230,7 +230,7 @@ scenario("the panel wraps long values in a narrow terminal and keeps the session
   for (const report of [unsaved!, saved!]) {
     expect(report.grid.every((row) => [...row].length <= 40)).toBe(true);
     // The workspace wraps between its folders and still reads back whole.
-    const at = report.rows.findIndex((row) => row.startsWith("  Workspace "));
+    const at = report.rows.findIndex((row) => row.startsWith("  workspace "));
     expect(report.rows[at]!.trimEnd().endsWith("/")).toBe(true);
     expect(report.rows[at + 1]!).toMatch(/^ {3,}\S/);
     expect(report.fields.Workspace).toBe(profile.workspace);

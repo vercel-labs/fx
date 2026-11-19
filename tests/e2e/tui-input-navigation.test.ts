@@ -194,7 +194,7 @@ function rowHasBackgroundSgr(row: string): boolean {
 }
 
 test("selected slash row ignores the welcome header help hint", () => {
-  const header = `${SELECTED_COMPLETION_SGR}𝒇x\x1b[0m\x1b[38;5;245m v0.3.27 · Run /help for commands`;
+  const header = `${SELECTED_COMPLETION_SGR}𝒇x\x1b[0m\x1b[38;5;245m v0.3.27 · run /help for commands`;
   const composer = `${SELECTED_COMPLETION_SGR}┃ /\x1b[39m`;
   const selected = `${SELECTED_COMPLETION_SGR}  /clear\x1b[38;5;245m Clear the conversation`;
 
@@ -250,7 +250,7 @@ async function setupMultilinePromptHistory(active: TmuxSession): Promise<void> {
     (pane) =>
       gateway?.requests.length === 2 &&
       pane.includes("┃") &&
-      !pane.includes("Thinking"),
+      !pane.includes("thinking"),
     READY_TIMEOUT,
   );
 }
@@ -323,7 +323,7 @@ tmuxTest(
     await waitForExactComposerRow(active, "┃ /");
 
     await active.sendKeys("Enter");
-    await active.waitForText("commands   < All >", READY_TIMEOUT);
+    await active.waitForText("commands   < all >", READY_TIMEOUT);
     await active.sendKeys("Escape");
     await active.waitForPane(
       (pane) => hasEmptyComposer(pane) && !pane.includes("enter open"),
@@ -344,7 +344,7 @@ tmuxTest(
       (pane) =>
         pane.includes("/help") &&
         pane.includes("/quit") &&
-        pane.includes("Run /help for commands"),
+        pane.includes("run /help for commands"),
       READY_TIMEOUT,
     );
 
@@ -352,7 +352,7 @@ tmuxTest(
     const afterUnknown = await active.capturePane();
     expect(afterUnknown).toContain("/help");
     expect(afterUnknown).toContain("/quit");
-    expect(afterUnknown).toContain("Run /help for commands");
+    expect(afterUnknown).toContain("run /help for commands");
 
     await active.sendKeys("Escape");
     await active.waitForPane(
@@ -1904,7 +1904,7 @@ tmuxTest(
       READY_TIMEOUT,
     );
     await active.resizeWindow(80, 24, 300);
-    await active.waitForText("commands   < All >", READY_TIMEOUT);
+    await active.waitForText("commands   < all >", READY_TIMEOUT);
     expect(gateway?.requests).toHaveLength(0);
     expectCleanStderr();
   },

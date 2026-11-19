@@ -15,8 +15,8 @@ const output_contracts = @import("../output/output_contracts.zig");
 
 pub const Start = enum { started, busy };
 
-const renewal_failed_message = "Could not renew the sign-in to check credits. Try again.";
-const renewal_sign_in_message = "Your sign-in has expired. Run /login, then check credits again.";
+const renewal_failed_message = "could not renew the sign-in to check credits. try again.";
+const renewal_sign_in_message = "your sign-in has expired. run /login, then check credits again.";
 
 /// Renews a refreshable credential that is past its refresh deadline before
 /// the lookup asks for credits.

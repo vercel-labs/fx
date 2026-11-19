@@ -173,8 +173,8 @@ describe("fx ask presentation", () => {
     );
 
     expect(result.code).toBe(0);
-    expect(result.stderr).toContain("Running printf no-final-newline\n");
-    expect(result.stderr).toContain("Running printf 'next-output\\n'\n");
+    expect(result.stderr).toContain("running printf no-final-newline\n");
+    expect(result.stderr).toContain("running printf 'next-output\\n'\n");
     expect(JSON.parse(result.stdout).output).toBe("Commands complete.\n");
   }, TIMEOUT);
 
@@ -391,7 +391,7 @@ describe("fx ask presentation", () => {
       { name: "read_file", status: "success" },
     ]);
     expect(gateway.requests).toHaveLength(2);
-    expect(result.stderr).toContain("Reading fixture.txt");
+    expect(result.stderr).toContain("reading fixture.txt");
   }, TIMEOUT);
 
   test("tool recovery keeps progress updates ordered before the final response", async () => {
@@ -463,8 +463,8 @@ describe("fx ask presentation", () => {
     ]);
     expect(gateway.requests[1]!.body).toContain("Path not found: missing.txt");
     expect(gateway.requests[2]!.body).toContain(recovery);
-    expect(result.stderr).toContain("Reading missing.txt");
-    expect(result.stderr).toContain("Reading fallback.txt");
+    expect(result.stderr).toContain("reading missing.txt");
+    expect(result.stderr).toContain("reading fallback.txt");
   }, TIMEOUT);
 
   test.skipIf(!tmuxAvailable())(
@@ -516,9 +516,9 @@ describe("fx ask presentation", () => {
       const escaped = await session.captureFullScrollbackEscapes();
       expect(scrollback).toContain("Inspect fixture.txt and render the response.");
       // Each group's only call is its header, and the failed read is marked.
-      expect(pane).toContain("● Reading fixture.txt");
+      expect(pane).toContain("● reading fixture.txt");
       expect(pane).toContain("Between groups.");
-      expect(pane).toContain("● Failed: Reading missing.txt: Path not found: missing.txt");
+      expect(pane).toContain("● failed: reading missing.txt: Path not found: missing.txt");
       expect(pane).toContain("Ask presentation");
       expect(pane).toContain("bold and docs");
       expect(pane).toContain("first item");
@@ -855,15 +855,15 @@ describe("fx ask presentation", () => {
         while (Date.now() < headerDeadline) {
           initialScrollback = await session.captureFullScrollback();
           if (
-            initialScrollback.includes("Run /help for commands") &&
+            initialScrollback.includes("run /help for commands") &&
             initialScrollback.includes("Stream every answer line.")
           ) break;
           await Bun.sleep(25);
         }
-        expect(initialScrollback).toContain("Run /help for commands");
+        expect(initialScrollback).toContain("run /help for commands");
         expect(initialScrollback).toContain("Stream every answer line.");
         expect(initialScrollback).not.toContain(answerLines[0]!);
-        expect(initialScrollback.indexOf("Run /help for commands")).toBeLessThan(
+        expect(initialScrollback.indexOf("run /help for commands")).toBeLessThan(
           initialScrollback.indexOf("Stream every answer line."),
         );
 
@@ -883,7 +883,7 @@ describe("fx ask presentation", () => {
 
       await session.waitForText("__FX_EXIT_0__", TIMEOUT);
       const finalScrollback = await session.captureFullScrollback();
-      expect(finalScrollback.split("Run /help for commands")).toHaveLength(2);
+      expect(finalScrollback.split("run /help for commands")).toHaveLength(2);
       for (const line of answerLines) {
         expect(finalScrollback.split(line)).toHaveLength(2);
       }
@@ -979,7 +979,7 @@ describe("fx ask presentation", () => {
       const scrollback = await session.captureFullScrollback();
       expect(scrollback).toContain("Run the notice filtering fixture.");
       expect(scrollback).toContain("Notice filtering complete.");
-      expect(scrollback).toContain("● Running printf notice-test > ask-notice.txt");
+      expect(scrollback).toContain("● running printf notice-test > ask-notice.txt");
       expect(scrollback).not.toContain("project instructions");
       expect(scrollback).not.toContain("Auto agent approved this request");
       expect(scrollback).not.toMatch(/[*✓!✗⊘i] system:/);
@@ -1202,7 +1202,7 @@ describe("fx ask shell startup files", () => {
         await session.sendText("Check the secret.");
         await session.waitForText("SECRET_CHECK_DONE", TIMEOUT);
         await session.sendText("/trace");
-        await session.waitForText("Trace saved at", TIMEOUT);
+        await session.waitForText("trace saved at", TIMEOUT);
       } finally {
         await session.kill();
       }

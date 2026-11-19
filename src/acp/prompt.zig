@@ -2595,10 +2595,10 @@ fn finalizeTurn(raw_ctx: *anyopaque, turn_id: u64, outcome: types.TurnPresentati
 /// It matches the terminal transcript's wording for the same outcome. A
 /// requested cancel reads as one even when the turn ends as failed.
 fn unfinishedToolCallText(outcome: types.TurnPresentationOutcome, cancel_requested: bool) []const u8 {
-    if (cancel_requested) return "Cancelled";
+    if (cancel_requested) return "cancelled";
     return switch (outcome) {
         .completed => "Tool completion was not reported",
-        .interrupted => "Cancelled",
+        .interrupted => "cancelled",
         .failed => "Tool failed",
         .paused => "Tool state preserved for recovery",
     };
@@ -2606,10 +2606,10 @@ fn unfinishedToolCallText(outcome: types.TurnPresentationOutcome, cancel_request
 
 test "a tool call a finished turn left open reads as the turn's outcome" {
     try std.testing.expectEqualStrings("Tool completion was not reported", unfinishedToolCallText(.completed, false));
-    try std.testing.expectEqualStrings("Cancelled", unfinishedToolCallText(.interrupted, false));
+    try std.testing.expectEqualStrings("cancelled", unfinishedToolCallText(.interrupted, false));
     try std.testing.expectEqualStrings("Tool failed", unfinishedToolCallText(.failed, false));
     try std.testing.expectEqualStrings("Tool state preserved for recovery", unfinishedToolCallText(.paused, false));
-    try std.testing.expectEqualStrings("Cancelled", unfinishedToolCallText(.failed, true));
+    try std.testing.expectEqualStrings("cancelled", unfinishedToolCallText(.failed, true));
 }
 
 fn appendRuntimeContext(raw_ctx: *anyopaque, arena: Allocator, messages: *std.ArrayList(ChatMessage)) !void {
@@ -2773,11 +2773,11 @@ fn requestAcpPermission(
     try params.writer.writeAll(",\"status\":\"pending\",\"rawInput\":");
     try params.writer.writeAll(validated_arguments.written());
     try params.writer.writeAll("},\"options\":[");
-    try writePermissionOption(&params.writer, "allow_once", "Allow once", "allow_once");
+    try writePermissionOption(&params.writer, "allow_once", "allow once", "allow_once");
     try params.writer.writeByte(',');
-    try writePermissionOption(&params.writer, "allow_always", "Allow for this session", "allow_always");
+    try writePermissionOption(&params.writer, "allow_always", "allow for this session", "allow_always");
     try params.writer.writeByte(',');
-    try writePermissionOption(&params.writer, "reject_once", "Reject", "reject_once");
+    try writePermissionOption(&params.writer, "reject_once", "reject", "reject_once");
     try params.writer.writeAll("]}");
 
     try ctx.state.writer.writeRequest(
@@ -4227,7 +4227,7 @@ test "ACP subagent titles and terminal descriptions share request projection" {
     const completed = (try tool_presentation.formatSubagentPlainAction(alloc, call, .completed)).?;
     defer alloc.free(completed);
     try std.testing.expectEqualStrings("sent to reviewer · Check replay", completed);
-    const interrupted = (try tool_presentation.formatSubagentPlainAction(alloc, call, .{ .stopped = "Interrupted" })).?;
+    const interrupted = (try tool_presentation.formatSubagentPlainAction(alloc, call, .{ .stopped = "interrupted" })).?;
     defer alloc.free(interrupted);
     try std.testing.expectEqualStrings("reviewer interrupted · Check replay", interrupted);
 }
@@ -4240,7 +4240,7 @@ test "ACP shell title uses the call-aware action label" {
         .arguments_json = "{\"action\":\"stop\",\"session_id\":\"terminal-a\"}",
     });
     defer alloc.free(title);
-    try std.testing.expectEqualStrings("Stopping", title);
+    try std.testing.expectEqualStrings("stopping", title);
 }
 
 test "ACP lifecycle action preserves dynamic MCP availability boundaries" {
@@ -4267,7 +4267,7 @@ test "ACP lifecycle action preserves dynamic MCP availability boundaries" {
         .is_available_dynamic_mcp_tool = missing,
     });
     defer alloc.free(missing_label);
-    try std.testing.expectEqualStrings("Working: mcp_lookup", missing_label);
+    try std.testing.expectEqualStrings("working: mcp_lookup", missing_label);
 
     const builtin = dynamicMcpToolAvailable(builtin_tools.registry, "terminal", &.{"shell"}, @ptrCast(&fixture), Fixture.hasTool, .unrestricted);
     try std.testing.expect(!builtin);
@@ -4742,7 +4742,7 @@ test "acp exposes web_search progress updates" {
 
     try std.testing.expect(std.mem.find(u8, out.written(), "\"toolCallId\":\"call_search\"") != null);
     try std.testing.expect(std.mem.find(u8, out.written(), "\"status\":\"in_progress\"") != null);
-    try std.testing.expect(std.mem.find(u8, out.written(), "Found 4 results for current news") != null);
+    try std.testing.expect(std.mem.find(u8, out.written(), "found 4 results for current news") != null);
     try std.testing.expectEqual(acp_types.ToolCallKind.search, mapToolKind("web_search"));
 }
 
@@ -5364,7 +5364,7 @@ test "ACP provider search lifecycle publishes only public terminal updates" {
             if (std.mem.eql(u8, session_update, "tool_call")) {
                 provider_pending += 1;
                 try std.testing.expectEqualStrings("web_search", update.get("name").?.string);
-                try std.testing.expectEqualStrings("Searching web", update.get("title").?.string);
+                try std.testing.expectEqualStrings("searching web", update.get("title").?.string);
                 try std.testing.expectEqualStrings("search", update.get("kind").?.string);
                 try std.testing.expectEqual(@as(usize, 0), update.get("rawInput").?.object.count());
             } else if (std.mem.eql(u8, session_update, "tool_call_update")) {
@@ -5489,8 +5489,8 @@ test "ACP finishes each open tool-call card once when a turn is cancelled" {
         } });
     }
     try ctx.sendToolCallCompletedWithCommandResult("ran", "read", null);
-    ctx.finishOpenToolCalls("Cancelled");
-    ctx.finishOpenToolCalls("Cancelled");
+    ctx.finishOpenToolCalls("cancelled");
+    ctx.finishOpenToolCalls("cancelled");
     try capture.sync(io_mod.getIo());
 
     var captured_file = try tmp.dir.openFile(io_mod.getIo(), "acp-cancelled-cards.jsonl", .{});
@@ -5510,7 +5510,7 @@ test "ACP finishes each open tool-call card once when a turn is cancelled" {
         } else {
             try std.testing.expectEqualStrings("failed", status);
             try std.testing.expectEqualStrings(
-                "Cancelled",
+                "cancelled",
                 update.get("content").?.array.items[0].object.get("content").?.object.get("text").?.string,
             );
             finals[1] += 1;

@@ -315,7 +315,7 @@ describe("tui: render record/replay", () => {
 
       const gridText = readFileSync(goldenPath, "utf8");
       expect(gridText).toContain("run some tools - read only tool for testing");
-      expect(gridText).toContain("Listed .");
+      expect(gridText).toContain("listed .");
       assertSingleFooter(gridText.replace(/\n$/, "").split("\n"), failures, "read-only tools replay grid");
       expect(failures).toEqual([]);
     },
@@ -329,7 +329,7 @@ describe("tui: render record/replay", () => {
         { length: 33 },
         (_, index) => `captured input line ${index + 1}: ${"x".repeat(32)}`,
       ).join("\n");
-      const authNotice = "auth: fx needs access to Vercel AI Gateway. Run /login to sign in, /provider to use an API key, or set AI_GATEWAY_API_KEY.";
+      const authNotice = "auth: fx needs access to vercel AI gateway. run /login to sign in, /provider to use an API key, or set AI_GATEWAY_API_KEY.";
       const launched = await launch({ recordInput: true });
       session = launched.session;
 
@@ -371,7 +371,7 @@ describe("tui: render record/replay", () => {
       session = launched.session;
 
       await session.sendText(marker);
-      await session.waitForText("fx needs access to Vercel AI Gateway", 5_000);
+      await session.waitForText("fx needs access to vercel AI gateway", 5_000);
       await session.sendKeys("C-u");
       await session.sendText("/allowlist");
       await session.waitForText("* allowlist: effective", 5_000);
@@ -428,7 +428,7 @@ describe("tui: render record/replay", () => {
         "visual terminal capture:",
       );
       await session.sendText(marker);
-      await session.waitForText("fx needs access to Vercel AI Gateway", 5_000);
+      await session.waitForText("fx needs access to vercel AI gateway", 5_000);
       await session.sendKeys(`-l '${inputTail}'`);
       await session.waitForText(inputTail, 5_000);
       await session.resizeWindow(120, 28);
@@ -478,7 +478,7 @@ describe("tui: render record/replay", () => {
       );
 
       await session.sendText(marker);
-      await session.waitForText("fx needs access to Vercel AI Gateway", 5_000);
+      await session.waitForText("fx needs access to vercel AI gateway", 5_000);
       execFileSync(FX_BIN, [
         "replay",
         launched.tapePath,
@@ -512,7 +512,7 @@ describe("tui: render record/replay", () => {
       session = launched.session;
 
       await session.sendText(forbiddenPrompt);
-      await session.waitForText("fx needs access to Vercel AI Gateway", 5_000);
+      await session.waitForText("fx needs access to vercel AI gateway", 5_000);
       await session.resizeWindow(72, 24);
       await session.sendKeys("C-u");
       await session.sendText("/allowlist");

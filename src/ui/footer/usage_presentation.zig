@@ -120,8 +120,8 @@ pub fn isPlan(p: Projection) bool {
 /// The service the numbers come from, for messages.
 fn serviceName(p: Projection) []const u8 {
     if (isCodex(p)) return "ChatGPT";
-    if (isGrok(p)) return "Grok";
-    return "AI Gateway";
+    if (isGrok(p)) return "grok";
+    return "AI gateway";
 }
 
 /// Whether there are tables to move around in; otherwise only Esc applies.
@@ -418,9 +418,9 @@ fn composeHeading(alloc: Allocator, p: Projection, limit: usize) !std.ArrayList(
 
 /// Whose numbers these are, or on a detail screen which model.
 fn headingLeft(buf: []u8, p: Projection) []const u8 {
-    const s = p.snapshot orelse return "AI Gateway";
+    const s = p.snapshot orelse return "AI gateway";
     if (s.status == .unavailable) return switch (s.status.unavailable) {
-        .no_gateway_sign_in => "not signed in to AI Gateway",
+        .no_gateway_sign_in => "not signed in to AI gateway",
         .no_team => "fx login has no team",
         .unsupported_provider => "this provider's usage isn't shown yet",
         .refresh_needed => "the sign-in needs a refresh",
@@ -433,7 +433,7 @@ fn headingLeft(buf: []u8, p: Projection) []const u8 {
             return std.mem.print(buf, "{s}, model {d} of {d}", .{ name, p.selected_model + 1, models.len }) catch name;
         }
     }
-    if (s.label.len == 0) return "AI Gateway";
+    if (s.label.len == 0) return "AI gateway";
     if (codexProfile(p)) |profile| if (profile.name) |name| {
         var label_buf: [128]u8 = undefined;
         var name_buf: [64]u8 = undefined;
@@ -487,12 +487,12 @@ fn failureText(buf: []u8, p: Projection, failure: usage.Failure) []const u8 {
 fn composeMessage(alloc: Allocator, p: Projection, limit: usize) !std.ArrayList(u8) {
     var fetching_buf: [48]u8 = undefined;
     const text: []const u8 = blk: {
-        const s = p.snapshot orelse break :blk "fetching usage from AI Gateway";
+        const s = p.snapshot orelse break :blk "fetching usage from AI gateway";
         break :blk switch (s.status) {
             .unavailable => |u| switch (u) {
                 .no_gateway_sign_in => "(use /login, or set AI_GATEWAY_API_KEY)",
                 .no_team => "(use /login to pick a team)",
-                .unsupported_provider => "(use /provider and pick AI Gateway to see AI Gateway usage)",
+                .unsupported_provider => "(use /provider and pick AI gateway to see AI gateway usage)",
                 .refresh_needed => "(send a message to renew it, then reopen /usage)",
             },
             .fetching => std.mem.print(&fetching_buf, "fetching usage from {s}", .{serviceName(p)}) catch "fetching usage",
@@ -1369,9 +1369,9 @@ fn composeCodexModelMore(alloc: Allocator, p: Projection, shares: []const Share,
 fn codexEmptyText(period: Period) []const u8 {
     return switch (period) {
         // ChatGPT reports days late, so an empty period may still fill in.
-        .today => "no Codex usage reported today",
-        .days_7 => "no Codex usage reported in the last 7 days",
-        .month => "no Codex usage reported this month",
+        .today => "no codex usage reported today",
+        .days_7 => "no codex usage reported in the last 7 days",
+        .month => "no codex usage reported this month",
     };
 }
 
@@ -1904,7 +1904,7 @@ test "states without numbers say so in one line" {
     defer unavailable.deinit();
     var screen = try draw(.{ .active = true, .snapshot = &unavailable }, 80, 40);
     defer screen.deinit();
-    try testing.expectEqualStrings("usage: not signed in to AI Gateway", screen.row(0));
+    try testing.expectEqualStrings("usage: not signed in to AI gateway", screen.row(0));
     try testing.expectEqualStrings("  (use /login, or set AI_GATEWAY_API_KEY)", screen.row(2));
 
     var other = try testSnapshot(.{ .unavailable = .unsupported_provider }, false, &.{});
@@ -1912,7 +1912,7 @@ test "states without numbers say so in one line" {
     var other_screen = try draw(.{ .active = true, .snapshot = &other }, 80, 40);
     defer other_screen.deinit();
     try testing.expectEqualStrings("usage: this provider's usage isn't shown yet", other_screen.row(0));
-    try testing.expectEqualStrings("  (use /provider and pick AI Gateway to see AI Gateway usage)", other_screen.row(2));
+    try testing.expectEqualStrings("  (use /provider and pick AI gateway to see AI gateway usage)", other_screen.row(2));
 
     var fetching = try testSnapshot(.fetching, false, &.{});
     defer fetching.deinit();
@@ -2250,7 +2250,7 @@ test "a Codex period without usage says so and keeps its rows" {
     defer screen.deinit();
     try testing.expectEqual(month.count, screen.count);
     try testing.expect(std.mem.startsWith(u8, screen.row(8), "model (today)"));
-    try testing.expectEqualStrings("  no Codex usage reported today", screen.row(9));
+    try testing.expectEqualStrings("  no codex usage reported today", screen.row(9));
     for (10..16) |i| try testing.expectEqualStrings("", screen.row(i));
     const where = screen.find("where (").?;
     try testing.expectEqual(month.find("where (").?, where);
@@ -2321,7 +2321,7 @@ const test_grok: usage.grok.Usage = .{
     .prepaid_cents = 1250,
     .on_demand_used_cents = 300,
     .on_demand_cap_cents = 10000,
-    .settings = .{ .plan = "SuperGrok Heavy", .on_demand_enabled = true },
+    .settings = .{ .plan = "SuperGrok heavy", .on_demand_enabled = true },
 };
 
 test "a Grok plan shows its period's use, products, credits and pay-as-you-go" {
@@ -2353,7 +2353,7 @@ test "a Grok plan shows its period's use, products, credits and pay-as-you-go" {
 
         const plan = screen.row(9);
         try testing.expect(std.mem.startsWith(u8, plan, "plan"));
-        try testing.expect(std.mem.startsWith(u8, screen.row(10), "SuperGrok Heavy"));
+        try testing.expect(std.mem.startsWith(u8, screen.row(10), "SuperGrok heavy"));
         try testing.expectEqual(endColumn(plan, "credits").?, endColumn(screen.row(10), "$12.50").?);
         // Pay-as-you-go needs 47 columns here; narrower drops header and
         // value together.
@@ -2405,7 +2405,7 @@ test "a short Grok terminal drops the products, never the plan" {
     defer screen.deinit();
     try testing.expect(screen.find("product") == null);
     try testing.expect(std.mem.startsWith(u8, screen.row(3), "grok"));
-    try testing.expect(std.mem.startsWith(u8, screen.row(6), "SuperGrok Heavy"));
+    try testing.expect(std.mem.startsWith(u8, screen.row(6), "SuperGrok heavy"));
 }
 
 test "Grok states name Grok" {
@@ -2413,13 +2413,13 @@ test "Grok states name Grok" {
     defer fetching.deinit();
     var first = try draw(.{ .active = true, .snapshot = &fetching }, 80, 40);
     defer first.deinit();
-    try testing.expectEqualStrings("  fetching usage from Grok", first.row(2));
+    try testing.expectEqualStrings("  fetching usage from grok", first.row(2));
 
     var offline = try grokSnapshot(.{ .failed = .network }, test_grok);
     defer offline.deinit();
     var screen = try draw(.{ .active = true, .snapshot = &offline }, 100, 40);
     defer screen.deinit();
-    try testing.expect(std.mem.endsWith(u8, screen.row(0), "couldn't reach Grok, last updated 2m ago"));
+    try testing.expect(std.mem.endsWith(u8, screen.row(0), "couldn't reach grok, last updated 2m ago"));
 
     var refused = try grokSnapshot(.{ .failed = .not_available }, test_grok);
     defer refused.deinit();

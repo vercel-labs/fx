@@ -82,7 +82,7 @@ async function launchNoKeyAndWait(record = false): Promise<{
       VERCEL_OIDC_TOKEN: undefined,
     },
   });
-  await terminal.waitForText("Run /help for commands", 10_000);
+  await terminal.waitForText("run /help for commands", 10_000);
   await terminal.waitForStableComposer(10_000);
   return { terminal, stderrPath, root };
 }
@@ -95,15 +95,15 @@ describe.skipIf(TMUX_SKIP)("tui: no-key slash commands", () => {
       session = launched.terminal;
       try {
         await session.sendText("/compact");
-        await session.waitForText("No context to compact.", 5_000);
-        await session.waitForPane((pane) => !pane.includes("No context to compact."), 5_000);
+        await session.waitForText("no context to compact.", 5_000);
+        await session.waitForPane((pane) => !pane.includes("no context to compact."), 5_000);
         await session.waitForComposer(5_000);
         const scrollback = await session.captureFullScrollbackEscapes();
-        expect(scrollback).toContain("Run /help for commands");
-        expect(scrollback).not.toMatch(/No context to compact|Context:|Compacting/);
+        expect(scrollback).toContain("run /help for commands");
+        expect(scrollback).not.toMatch(/no context to compact|Context:|compacting/);
         await session.sendKeys("C-o");
         const transcript = await session.waitForText("esc close · pgup/pgdn scroll", 5_000);
-        expect(transcript).not.toMatch(/No context to compact|Context:|Compacting/);
+        expect(transcript).not.toMatch(/no context to compact|Context:|compacting/);
         await session.sendKeys("C-o");
         await session.waitForComposer(5_000);
         await session.sendLiteral("composer-after-noop");
@@ -125,8 +125,8 @@ describe.skipIf(TMUX_SKIP)("tui: no-key slash commands", () => {
     async () => {
       session = await launchAndWait();
       await session.sendText("/undo");
-      const pane = await session.waitForText("Nothing to undo.", 5_000);
-      expect(pane).toContain("Nothing to undo.");
+      const pane = await session.waitForText("nothing to undo.", 5_000);
+      expect(pane).toContain("nothing to undo.");
     },
     TIMEOUT,
   );
@@ -194,7 +194,7 @@ describe.skipIf(TMUX_SKIP)("tui: no-key slash commands", () => {
   /// Rows of `scrollback` that hold a labeled line of the `/status` panel.
   function panelLinesIn(scrollback: string): string[] {
     return scrollback.split("\n").filter((row) =>
-      ["Session", "Permissions", "Session grants"].some((label) => new RegExp(`^ {2}${label} {2,}\\S`).test(row)));
+      ["Session", "permissions", "session grants"].some((label) => new RegExp(`^ {2}${label} {2,}\\S`).test(row)));
   }
 
   test(
@@ -202,7 +202,7 @@ describe.skipIf(TMUX_SKIP)("tui: no-key slash commands", () => {
     async () => {
       gateway = startFakeGateway([]);
       const { stderrPath, tapePath } = await launchShortTerminal("compact");
-      expect((await session!.captureFullScrollback()).split("Run /help for commands")).toHaveLength(2);
+      expect((await session!.captureFullScrollback()).split("run /help for commands")).toHaveLength(2);
 
       // Twelve rows leave the panel room for one line at a time. It scrolls
       // instead of covering the transcript, so the transcript's last row
@@ -217,7 +217,7 @@ describe.skipIf(TMUX_SKIP)("tui: no-key slash commands", () => {
       await closeStatusPanel(session!, 5_000);
       await session!.waitForComposer(5_000);
       const scrollback = await session!.captureFullScrollback();
-      expect(scrollback.split("Run /help for commands")).toHaveLength(2);
+      expect(scrollback.split("run /help for commands")).toHaveLength(2);
       expect(panelLinesIn(scrollback)).toEqual([]);
       expect(session!.paneStatus()).toEqual({ dead: false, status: null });
       expect(readFileSync(stderrPath, "utf8")).toBe("");
@@ -245,7 +245,7 @@ describe.skipIf(TMUX_SKIP)("tui: no-key slash commands", () => {
       const { stderrPath } = await launchShortTerminal("answer");
 
       await session!.sendText("slow question");
-      await session!.waitForText("Thinking", 10_000);
+      await session!.waitForText("thinking", 10_000);
       await session!.sendText("/status");
       await waitForStatusPanel(session!, 5_000, (shown) => shown.labels[0] === "Session");
       held.release("FIRST_ANSWER_LINE\n\nSECOND_ANSWER_LINE\n\nTHIRD_ANSWER_LINE");
@@ -256,7 +256,7 @@ describe.skipIf(TMUX_SKIP)("tui: no-key slash commands", () => {
       await session!.waitForComposer(5_000);
 
       const scrollback = await session!.captureFullScrollback();
-      for (const row of ["Run /help for commands", "┃ slow question", "FIRST_ANSWER_LINE", "SECOND_ANSWER_LINE", "THIRD_ANSWER_LINE"]) {
+      for (const row of ["run /help for commands", "┃ slow question", "FIRST_ANSWER_LINE", "SECOND_ANSWER_LINE", "THIRD_ANSWER_LINE"]) {
         expect({ row, count: scrollback.split(row).length - 1 }).toEqual({ row, count: 1 });
       }
       expect(panelLinesIn(scrollback)).toEqual([]);
@@ -287,7 +287,7 @@ describe.skipIf(SKIP)("tui: slash commands", () => {
       session = await launchAndWait();
       await session.sendText("/settings");
       const pane = await session.waitForText("←→ change", 5_000);
-      expect(pane).toContain("settings   < All >");
+      expect(pane).toContain("settings   < all >");
       expect(pane).toContain("↑↓ navigate");
       expect(pane).not.toContain("[All]");
     },
@@ -325,12 +325,12 @@ describe.skipIf(SKIP)("tui: slash commands", () => {
         let scrollback = "";
         while (Date.now() < deadline) {
           scrollback = await session.captureFullScrollback();
-          const actualCount = scrollback.split("Unknown command. Try /help.").length - 1;
+          const actualCount = scrollback.split("unknown command. try /help.").length - 1;
           if (actualCount >= expectedCount) break;
           await Bun.sleep(50);
         }
         expect(
-          scrollback.split("Unknown command. Try /help.").length - 1,
+          scrollback.split("unknown command. try /help.").length - 1,
         ).toBe(expectedCount);
       }
     },

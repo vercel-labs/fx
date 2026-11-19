@@ -1551,7 +1551,7 @@ test "surface footer frame snapshots manual compaction blink with an inactive st
     var frame = try prepareSurfaceFooterFrameWithReservation(alloc, &shell, &metrics, &force_redraw, null, ctx, .{}, FrameInvalidationSet.empty());
     defer frame.deinit(alloc);
     try std.testing.expectEqual(@as(?bool, false), frame.thinking_blink);
-    try std.testing.expect(std.mem.find(u8, frame.activity_label.items, "Compacting 0% (0s)") != null);
+    try std.testing.expect(std.mem.find(u8, frame.activity_label.items, "compacting 0% (0s)") != null);
     try std.testing.expect(!ctx.stream.active);
 }
 
@@ -1667,7 +1667,7 @@ test "surface footer measurement preserves the narrow tool activity projection" 
     switch (measurement.activity_projection) {
         .turn_thinking => |thinking| {
             try std.testing.expectEqual(ActivityProjection.Tone.thinking, thinking.tone);
-            try std.testing.expectEqualStrings("• Thinking", thinking.label);
+            try std.testing.expectEqualStrings("• thinking", thinking.label);
         },
         .none, .tool_slot => return error.TestUnexpectedResult,
     }
@@ -1765,7 +1765,7 @@ test "surface footer measurement keeps clipped command status transcript-owned" 
     switch (measurement.activity_projection) {
         .turn_thinking => |thinking| {
             try std.testing.expectEqual(ActivityProjection.Tone.thinking, thinking.tone);
-            try std.testing.expectEqualStrings("• Thinking (↑10 ↓20)", thinking.label);
+            try std.testing.expectEqualStrings("• thinking (↑10 ↓20)", thinking.label);
         },
         .none, .tool_slot => return error.TestUnexpectedResult,
     }
@@ -2034,7 +2034,7 @@ test "surface footer places the cursor after the Vercel team query" {
     try std.testing.expect(frame.composed.cursor_visible);
 }
 
-test "surface footer keeps the Vercel team query and cursor visible at minimum height" {
+test "surface footer keeps the vercel team query and cursor visible at minimum height" {
     const auth_runtime = @import("../../core/auth/auth_runtime.zig");
     const alloc = std.testing.allocator;
     var approval = ApprovalPrompt{};
@@ -2084,7 +2084,7 @@ test "surface footer keeps the Vercel team query and cursor visible at minimum h
     var query_visible = false;
     for (frame.composed.rows.items) |row| {
         if (row.row == frame.paint.footer.picker_start) {
-            query_visible = std.mem.find(u8, row.text.items, "Search: play") != null;
+            query_visible = std.mem.find(u8, row.text.items, "search: play") != null;
             break;
         }
     }

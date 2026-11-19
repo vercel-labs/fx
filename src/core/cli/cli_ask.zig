@@ -2680,7 +2680,7 @@ fn finishCliPermissionOutcome(
         @ptrCast(ctx),
         arena,
         call,
-        "Permission required",
+        "permission required",
         null,
     );
     return failPermissionOutcome(error.NonInteractivePermissionRequired);
@@ -3716,7 +3716,7 @@ fn reportUnapprovedMcpServers(ctx: *AskContext, h: *mcp_host.Host) !void {
         try ctx.writeStderr(s.name);
         listed = true;
     }
-    if (listed) try ctx.writeStderr(". Approve with fx mcp approve <name> before retrying.\n");
+    if (listed) try ctx.writeStderr(". approve with fx mcp approve <name> before retrying.\n");
 }
 
 fn respondToAskMcpInput(
@@ -3765,9 +3765,9 @@ fn askTerminalMcpQuestion(
             try ctx.writeStderr("\n");
         }
         if (entry.options.len > 0) {
-            try ctx.writeStderr("Choose a number or enter a value: ");
+            try ctx.writeStderr("choose a number or enter a value: ");
         } else {
-            try ctx.writeStderr("Enter a value: ");
+            try ctx.writeStderr("enter a value: ");
         }
         ctx.dispatchAttentionRequired(.question);
         const line = try readAskTerminalLine(
@@ -4418,7 +4418,7 @@ fn promptRealPermissionApproval(
 
     try write_stderr(stderr_ctx, "fx wants to run:\n  ");
     try write_stderr(stderr_ctx, label);
-    try write_stderr(stderr_ctx, "\n\nApprove? [y/N] ");
+    try write_stderr(stderr_ctx, "\n\napprove? [y/N] ");
     notify_attention(attention_ctx);
 
     var read_buf: [256]u8 = undefined;
@@ -4489,7 +4489,7 @@ const TestPermissionPrompt = struct {
         if (self.result != .unavailable) {
             try write_stderr(stderr_ctx, "fx wants to run:\n  ");
             try write_stderr(stderr_ctx, label);
-            try write_stderr(stderr_ctx, "\n\nApprove? [y/N] ");
+            try write_stderr(stderr_ctx, "\n\napprove? [y/N] ");
             notify_attention(attention_ctx);
         }
         return self.result;
@@ -4653,9 +4653,9 @@ fn testProcessQueuedPromptRecoveryLifecycle(_: *agent_runtime.Agent, deps: *cons
     try std.testing.expect(semantic_presentation == null);
     try std.testing.expectEqual(hooks.ScopeKind.ask, lifecycle.scope.kind);
     // One-second refreshes of the same kind print once.
-    try deps.push_route_recovery_status(deps.ctx, .{ .kind = .waiting, .text = testRecoveryText("Offline · next try in 2s · 0s"), .attempt = 1 });
-    try deps.push_route_recovery_status(deps.ctx, .{ .kind = .waiting, .text = testRecoveryText("Offline · next try in 1s · 1s"), .attempt = 1 });
-    try deps.push_route_recovery_status(deps.ctx, .{ .kind = .retrying, .text = testRecoveryText("Offline · retrying · attempt 2 · 2s"), .attempt = 2 });
+    try deps.push_route_recovery_status(deps.ctx, .{ .kind = .waiting, .text = testRecoveryText("offline · next try in 2s · 0s"), .attempt = 1 });
+    try deps.push_route_recovery_status(deps.ctx, .{ .kind = .waiting, .text = testRecoveryText("offline · next try in 1s · 1s"), .attempt = 1 });
+    try deps.push_route_recovery_status(deps.ctx, .{ .kind = .retrying, .text = testRecoveryText("offline · retrying · attempt 2 · 2s"), .attempt = 2 });
     try deps.push_event(deps.ctx, .clear_route_recovery_status);
     try deps.push_route_recovery_status(deps.ctx, .{ .kind = .recovered, .attempt = 2 });
     try testPushAssistantText(deps, "assistant text");
@@ -4668,7 +4668,7 @@ fn testProcessQueuedPromptRecoveredThenFailed(_: *agent_runtime.Agent, deps: *co
     const begin = deps.begin_route_recovery_request.?;
     // The first step's request recovers from a 503.
     begin(deps.ctx);
-    try deps.push_route_recovery_status(deps.ctx, .{ .kind = .waiting, .text = testRecoveryText("Gateway error · next try in 1s · attempt 1 · 0s"), .attempt = 1 });
+    try deps.push_route_recovery_status(deps.ctx, .{ .kind = .waiting, .text = testRecoveryText("gateway error · next try in 1s · attempt 1 · 0s"), .attempt = 1 });
     try deps.push_event(deps.ctx, .clear_route_recovery_status);
     try deps.push_route_recovery_status(deps.ctx, .{ .kind = .recovered, .attempt = 2 });
     // The second step's request fails with HTTP 400 on its first try.
@@ -4681,7 +4681,7 @@ fn testProcessQueuedPromptRetryAdmissionFailure(_: *agent_runtime.Agent, deps: *
     try std.testing.expect(semantic_presentation == null);
     try deps.push_route_recovery_status(deps.ctx, .{
         .kind = .waiting,
-        .text = testRecoveryText("Gateway error · next try in 4s · attempt 1 · 0s"),
+        .text = testRecoveryText("gateway error · next try in 4s · attempt 1 · 0s"),
         .attempt = 1,
     });
     try deps.push_route_recovery_status(deps.ctx, .{
@@ -5170,7 +5170,7 @@ test "CLI lifecycle action preserves dynamic MCP availability boundaries" {
         .is_available_dynamic_mcp_tool = missing,
     });
     defer alloc.free(missing_label);
-    try std.testing.expectEqualStrings("Working: mcp_lookup", missing_label);
+    try std.testing.expectEqualStrings("working: mcp_lookup", missing_label);
 
     const builtin = dynamicMcpToolAvailable(builtin_tools.registry, "terminal", &.{"shell"}, @ptrCast(&fixture), Fixture.hasTool, .unrestricted);
     try std.testing.expect(!builtin);
@@ -6830,7 +6830,7 @@ test "fx ask terminal permission prompt approves and denies run_command" {
         ),
     }
     try std.testing.expectEqual(@as(usize, 1), prompt.calls);
-    try std.testing.expect(std.mem.find(u8, stderr_capture.bytes.items, "Approve? [y/N]") != null);
+    try std.testing.expect(std.mem.find(u8, stderr_capture.bytes.items, "approve? [y/N]") != null);
     try std.testing.expect(prompt.label != null);
 
     stdout_capture.bytes.clearRetainingCapacity();
@@ -6846,7 +6846,7 @@ test "fx ask terminal permission prompt approves and denies run_command" {
     try std.testing.expectEqual(types.ToolPermissionDenialReason.user_denied, denied.denial_reason.?);
     try std.testing.expect(denied.execution_authority == null);
     try std.testing.expectEqual(@as(usize, 2), prompt.calls);
-    try std.testing.expect(std.mem.find(u8, stderr_capture.bytes.items, "Approve? [y/N]") != null);
+    try std.testing.expect(std.mem.find(u8, stderr_capture.bytes.items, "approve? [y/N]") != null);
     try std.testing.expectEqualStrings("", stdout_capture.bytes.items);
 }
 
@@ -7040,7 +7040,7 @@ test "fx ask captured permission prompt opt in uses the existing prompter" {
     }, .ask, &.{}, &.{});
     try std.testing.expectEqual(ToolPermissionDecision.once, approved.decision);
     try std.testing.expectEqual(@as(usize, 1), prompt.calls);
-    try std.testing.expect(std.mem.find(u8, stderr_capture.bytes.items, "Approve? [y/N]") != null);
+    try std.testing.expect(std.mem.find(u8, stderr_capture.bytes.items, "approve? [y/N]") != null);
     try std.testing.expectEqualStrings("", stdout_capture.bytes.items);
 
     prompt.result = .deny;
@@ -7143,7 +7143,7 @@ test "fx ask prepared file mutation callback preserves terminal permission promp
     const runtime_deps = agentRuntimeDeps(&ctx);
     const callback = runtime_deps.request_prepared_file_mutation_permission orelse
         return error.TestExpectedPreparedFileMutationCallback;
-    var review_turn = TestReviewTurn.init("Approve this prepared mutation.", call);
+    var review_turn = TestReviewTurn.init("approve this prepared mutation.", call);
     const accepted = try callback(
         runtime_deps.ctx,
         arena,
@@ -7163,7 +7163,7 @@ test "fx ask prepared file mutation callback preserves terminal permission promp
         else => return error.TestExpectedEqual,
     };
     try std.testing.expectEqualStrings(target_path, authorization.input.path());
-    try std.testing.expect(std.mem.find(u8, stderr_capture.bytes.items, "Approve? [y/N]") != null);
+    try std.testing.expect(std.mem.find(u8, stderr_capture.bytes.items, "approve? [y/N]") != null);
     try std.testing.expectEqualStrings("", stdout_capture.bytes.items);
 }
 
@@ -8205,7 +8205,7 @@ test "render final JSON includes the latest terminal recovery diagnostic" {
     const recovery = parsed.value.object.get("recovery").?.object;
     try std.testing.expectEqualStrings("failed", recovery.get("state").?.string);
     try std.testing.expectEqualStrings(
-        "⚠ Provider unavailable · HTTP 503 · no_available_providers: No providers are currently available · stopped after 2 attempts",
+        "⚠ provider unavailable · HTTP 503 · no_available_providers: No providers are currently available · stopped after 2 attempts",
         recovery.get("message").?.string,
     );
 }
@@ -9119,7 +9119,7 @@ test "fx ask JSON recovery keeps stdout structured and reports progress on stder
     try std.testing.expect(recovery.get("message") == null);
     // A host that cannot redraw prints a status only when its kind changes.
     try std.testing.expectEqualStrings(
-        "[notice] Offline · next try in 2s · 0s\n[notice] Offline · retrying · attempt 2 · 2s\n",
+        "[notice] offline · next try in 2s · 0s\n[notice] offline · retrying · attempt 2 · 2s\n",
         stderr_capture.bytes.items,
     );
 }
@@ -9614,7 +9614,7 @@ test "CLI nonterminal progress preserves distinct not-run labels without duplica
     } });
     try deps.push_tool_lifecycle(deps.ctx, .{ .progress = .{
         .id = .{ .turn_id = 5, .call_id = "invalid_fetch" },
-        .text = "Fetching",
+        .text = "fetching",
     } });
     try std.testing.expectEqualStrings(
         "Writing file\nWriting build/pkg/proof.txt\n",

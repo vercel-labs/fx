@@ -61,11 +61,11 @@ describe("TUI custom connection errors", () => {
   // first frame; a changed or removed one stops fx with what to do.
   test.skipIf(!tmuxAvailable()).each([
     ["changed its protocol", (f: ReturnType<typeof fixture>) => { f.settings.providers.local.protocol = "anthropic-messages"; },
-      "fx: This session's custom connection changed in ~/.fx/settings.json after the session was saved: its protocol, base_url, or auth. Change it back, or start a new session."],
+      "fx: this session's custom connection changed in ~/.fx/settings.json after the session was saved: its protocol, base_url, or auth. change it back, or start a new session."],
     ["was removed", (f: ReturnType<typeof fixture>) => {
       delete (f.settings.providers as Record<string, unknown>).local;
       (f.settings as Record<string, unknown>).provider = "remote";
-    }, "fx: This session's custom connection is no longer in ~/.fx/settings.json. Add it back, or start a new session."],
+    }, "fx: this session's custom connection is no longer in ~/.fx/settings.json. add it back, or start a new session."],
   ] as const)("resume: a session whose connection %s says so before the first frame", async (_name, edit, message) => {
     const f = fixture();
     let tui: TmuxSession | null = null;
@@ -98,7 +98,7 @@ describe("TUI custom connection errors", () => {
       await tui.sendText("/resume");
       // The only saved session is selected, so Enter opens it.
       await tui.sendKeys("Enter");
-      await tui.waitForText("This session's custom connection changed in ~/.fx/settings.json after the session was saved", 15000);
+      await tui.waitForText("this session's custom connection changed in ~/.fx/settings.json after the session was saved", 15000);
       expect(f.requests).toHaveLength(1);
     } finally {
       await tui?.kill();
@@ -119,7 +119,7 @@ describe("TUI custom connection errors", () => {
       f.save();
       await tui.sendText("second turn");
       await tui.sendKeys("Enter");
-      const screen = await tui.waitForText("This session's custom connection changed in ~/.fx/settings.json after the session was saved", 15000);
+      const screen = await tui.waitForText("this session's custom connection changed in ~/.fx/settings.json after the session was saved", 15000);
       expect(screen).not.toContain("press enter to retry");
       expect(f.requests).toHaveLength(1);
     } finally {

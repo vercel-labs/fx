@@ -294,7 +294,7 @@ fn initFailure(deps: RunDeps, launch: *cli_surface.InteractiveLaunch, alloc: All
                 const message = alloc.print("fx: this session can't be converted (InvalidSessionFormat): {s}\n", .{reason}) catch null;
                 defer if (message) |text| alloc.free(text);
                 writeStderr(deps, message orelse "fx: this session can't be converted (InvalidSessionFormat)\n");
-            } else writeStderr(deps, "fx: saved session is unreadable. Run `fx doctor`; if it is recoverable, use `fx session recover <id>`.\n");
+            } else writeStderr(deps, "fx: saved session is unreadable. run `fx doctor`; if it is recoverable, use `fx session recover <id>`.\n");
             return .{ .exit = 1 };
         },
         error.UnsupportedSessionSchema => {
@@ -439,7 +439,7 @@ fn runInteractiveWithDeps(comptime App: type, comptime cooperative: bool, app: *
         } else {
             writeStderr(
                 deps,
-                "fx: upgrade installed, but no validated resume handoff was available. Your conversation remains on disk; run `fx doctor`.\n",
+                "fx: upgrade installed, but no validated resume handoff was available. your conversation remains on disk; run `fx doctor`.\n",
             );
         }
         return .{ .exit = 1 };
@@ -483,7 +483,7 @@ fn writeUpgradeRelaunchFailure(
     var words: [128]u8 = undefined;
     const message = std.mem.print(
         &buffer,
-        "fx: upgrade installed, but relaunch failed: {s}\nResume this session with:\nfx --resume {s}\n",
+        "fx: upgrade installed, but relaunch failed: {s}\nresume this session with:\nfx --resume {s}\n",
         .{ types.plainErrorText(@errorName(err), &words), session_id },
     ) catch "fx: upgrade installed, but relaunch failed; run `fx doctor`.\n";
     writeStderr(deps, message);
@@ -554,7 +554,7 @@ fn writeRealStdout(_: ?*anyopaque, text: []const u8) !void {
 }
 
 fn formatResumeHandoff(buffer: []u8, session_id: []const u8) ![]const u8 {
-    return std.mem.print(buffer, "Resume this session with:\nfx --resume {s}\n", .{session_id});
+    return std.mem.print(buffer, "resume this session with:\nfx --resume {s}\n", .{session_id});
 }
 
 /// An error that ended the interactive session, in plain words
@@ -576,9 +576,9 @@ fn formatUnexpectedError(buffer: []u8, err: anyerror) ![]const u8 {
 /// for any other error.
 fn v2StorageFaultMessage(err: anyerror) ?[]const u8 {
     return switch (err) {
-        error.AccessDenied => profile_paths.displayText("fx: this session cannot be opened for writing: permission denied. Check the permissions under ~/.fx/sessions/v2, then resume again.\n"),
+        error.AccessDenied => profile_paths.displayText("fx: this session cannot be opened for writing: permission denied. check the permissions under ~/.fx/sessions/v2, then resume again.\n"),
         error.ReadOnlyFileSystem => "fx: this session cannot be opened for writing: the disk is read-only.\n",
-        error.NoSpaceLeft => "fx: this session cannot be saved: the disk is full. Free some space, then resume again.\n",
+        error.NoSpaceLeft => "fx: this session cannot be saved: the disk is full. free some space, then resume again.\n",
         error.FileTooBig => "fx: this session cannot be saved: a file-size limit was reached.\n",
         else => null,
     };
@@ -588,7 +588,7 @@ fn v2StorageFaultMessage(err: anyerror) ?[]const u8 {
 /// by the failure `record_tape.startFailure` named.
 fn recordingStartMessage(err: anyerror) []const u8 {
     return switch (err) {
-        error.RecordingDiskFull => "fx: unable to start terminal recording: the disk is full. Free some space, or unset FX_DEBUG_RECORD.\n",
+        error.RecordingDiskFull => "fx: unable to start terminal recording: the disk is full. free some space, or unset FX_DEBUG_RECORD.\n",
         error.RecordingFileTooBig => "fx: unable to start terminal recording: a file-size limit was reached.\n",
         error.RecordingAccessDenied => "fx: unable to start terminal recording: permission denied.\n",
         error.RecordingReadOnly => "fx: unable to start terminal recording: the disk is read-only.\n",
@@ -1095,7 +1095,7 @@ test "app entry writes exact resume handoff after interactive teardown" {
 
     try std.testing.expectEqual(RunOutcome.returned, outcome);
     try std.testing.expectEqualStrings(
-        "Resume this session with:\nfx --resume session-123\n",
+        "resume this session with:\nfx --resume session-123\n",
         capture.stdout.written(),
     );
     try std.testing.expectEqual(@as(usize, 1), capture.stdout_calls);
@@ -1135,7 +1135,7 @@ test "app entry bounds graceful-exit SIGINT suppression to handoff lifetime" {
 
     try std.testing.expectEqual(RunOutcome.returned, outcome);
     try std.testing.expectEqualStrings(
-        "Resume this session with:\nfx --resume session-123\n",
+        "resume this session with:\nfx --resume session-123\n",
         capture.stdout.written(),
     );
     try std.testing.expectEqual(@as(usize, 0), test_sigint_count.load(.seq_cst));
@@ -1175,7 +1175,7 @@ test "app entry relaunches only after teardown with the validated handoff" {
     try std.testing.expect(std.mem.find(
         u8,
         capture.stderr.written(),
-        "relaunch failed: invalid exe\nResume this session with:\nfx --resume session-123\n",
+        "relaunch failed: invalid exe\nresume this session with:\nfx --resume session-123\n",
     ) != null);
     try expectEvents(&.{
         "init:none",
@@ -1588,9 +1588,9 @@ test "app entry names a v2 storage fault at startup, and v1 keeps the bare error
         init_error: anyerror,
         message: []const u8,
     }{
-        .{ .init_error = error.AccessDenied, .message = "fx: this session cannot be opened for writing: permission denied. Check the permissions under ~/.fx/sessions/v2, then resume again.\n" },
+        .{ .init_error = error.AccessDenied, .message = "fx: this session cannot be opened for writing: permission denied. check the permissions under ~/.fx/sessions/v2, then resume again.\n" },
         .{ .init_error = error.ReadOnlyFileSystem, .message = "fx: this session cannot be opened for writing: the disk is read-only.\n" },
-        .{ .init_error = error.NoSpaceLeft, .message = "fx: this session cannot be saved: the disk is full. Free some space, then resume again.\n" },
+        .{ .init_error = error.NoSpaceLeft, .message = "fx: this session cannot be saved: the disk is full. free some space, then resume again.\n" },
         .{ .init_error = error.FileTooBig, .message = "fx: this session cannot be saved: a file-size limit was reached.\n" },
     };
     for (cases) |case| {
@@ -1613,7 +1613,7 @@ test "app entry says why a terminal recording could not start" {
         message: []const u8,
     }{
         .{ .init_error = error.RecordingStartFailed, .message = "fx: unable to start terminal recording.\n" },
-        .{ .init_error = error.RecordingDiskFull, .message = "fx: unable to start terminal recording: the disk is full. Free some space, or unset FX_DEBUG_RECORD.\n" },
+        .{ .init_error = error.RecordingDiskFull, .message = "fx: unable to start terminal recording: the disk is full. free some space, or unset FX_DEBUG_RECORD.\n" },
         .{ .init_error = error.RecordingFileTooBig, .message = "fx: unable to start terminal recording: a file-size limit was reached.\n" },
         .{ .init_error = error.RecordingAccessDenied, .message = "fx: unable to start terminal recording: permission denied.\n" },
         .{ .init_error = error.RecordingReadOnly, .message = "fx: unable to start terminal recording: the disk is read-only.\n" },

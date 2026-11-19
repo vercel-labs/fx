@@ -189,6 +189,42 @@ pub fn composeMessageRow(alloc: Allocator, text: []const u8, width: u16) !std.Ar
     return row;
 }
 
+/// `text` as fx's interface writes it: lowercase, except words with no
+/// lowercase letter, such as acronyms like "MCP" and "AI". "OpenAI" reads
+/// "openai" and "AI Gateway" reads "AI gateway". The caller owns the result.
+pub fn uiCase(alloc: Allocator, text: []const u8) Allocator.Error![]u8 {
+    const out = try alloc.dupe(u8, text);
+    var start: usize = 0;
+    while (start < out.len) {
+        const end = std.mem.findScalarPos(u8, out, start, ' ') orelse out.len;
+        const word = out[start..end];
+        for (word) |c| {
+            if (std.ascii.isLower(c)) {
+                for (word) |*w| w.* = std.ascii.toLower(w.*);
+                break;
+            }
+        }
+        start = end + 1;
+    }
+    return out;
+}
+
+test "uiCase lowers words and keeps acronyms" {
+    const alloc = std.testing.allocator;
+    for ([_][2][]const u8{
+        .{ "All", "all" },
+        .{ "Current workspace", "current workspace" },
+        .{ "OpenAI", "openai" },
+        .{ "AI Gateway", "AI gateway" },
+        .{ "MCP servers", "MCP servers" },
+        .{ "", "" },
+    }) |case| {
+        const got = try uiCase(alloc, case[0]);
+        defer alloc.free(got);
+        try std.testing.expectEqualStrings(case[1], got);
+    }
+}
+
 fn appendTitleText(alloc: Allocator, row: *std.ArrayList(u8), title: []const u8, active_tab: ?[]const u8, width: u16) !void {
     const budget = contentWidth(width);
     try row.appendSlice(alloc, ui_render.dim_style);
@@ -203,7 +239,9 @@ fn appendTitleText(alloc: Allocator, row: *std.ArrayList(u8), title: []const u8,
     try row.appendSlice(alloc, tab_gap);
     try row.appendSlice(alloc, ui_render.selected_completion_style);
     try row.appendSlice(alloc, "< ");
-    try row_text.appendTerminalSafeSingleLine(alloc, row, tab, budget - used - decoration);
+    const shown = try uiCase(alloc, tab);
+    defer alloc.free(shown);
+    try row_text.appendTerminalSafeSingleLine(alloc, row, shown, budget - used - decoration);
     try row.appendSlice(alloc, " >");
     try row.appendSlice(alloc, ui_render.reset_style);
 }

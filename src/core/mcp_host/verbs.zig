@@ -174,7 +174,7 @@ pub fn parse(arena: Allocator, surface: Surface, args: []const []const u8) Alloc
             const name = n[0];
             if (!isValidServerName(name))
                 return usage(arena, verb, "'{s}' can't be a server name: use letters, digits, '-' and '_'.", .{name});
-            if (project and profile) return usage(arena, verb, "Use --project or --global, not both.", .{});
+            if (project and profile) return usage(arena, verb, "use --project or --global, not both.", .{});
             const file: config_file.File = if (project) .project else .profile;
             if (dash < rest.len) {
                 if (n.len > 1) return usage(arena, verb, "{s} add takes a URL or a command after --, not both.", .{p});
@@ -189,7 +189,7 @@ pub fn parse(arena: Allocator, surface: Surface, args: []const []const u8) Alloc
                 break :url n[1];
             };
             if (!std.mem.startsWith(u8, url, "https://") and !std.mem.startsWith(u8, url, "http://"))
-                return usage(arena, verb, "'{s}' isn't a URL. A stdio server's command goes after --.", .{url});
+                return usage(arena, verb, "'{s}' isn't a URL. a stdio server's command goes after --.", .{url});
             if (pair_flag == .env) return usage(arena, verb, "--env is for stdio servers; use --header for HTTP.", .{});
             return .{ .command = .{ .add = .{ .name = name, .file = file, .entry = .{ .http = .{ .url = url, .headers = pairs.items } }, .login = !no_login, .old_profile = old_profile } } };
         },
@@ -223,7 +223,7 @@ pub fn parse(arena: Allocator, surface: Surface, args: []const []const u8) Alloc
     return .{ .command = switch (verb) {
         .show => .{ .show = .{ .name = name, .json = json } },
         .remove => blk: {
-            if (project and profile) return usage(arena, verb, "Use --project or --global, not both.", .{});
+            if (project and profile) return usage(arena, verb, "use --project or --global, not both.", .{});
             break :blk .{ .remove = .{ .name = name, .file = if (project) .project else if (profile) .profile else null, .old_profile = old_profile } };
         },
         .login => .{ .login = .{ .name = name, .browser = !no_browser } },
@@ -294,7 +294,7 @@ const overview = [_][2][]const u8{
     .{ "show NAME", "connect to NAME: status, version, tools" },
     .{ "add NAME URL", "add an HTTP server" },
     .{ "add NAME -- CMD [ARGS...]", "add a stdio server" },
-    .{ "add slack", "add Slack's server" },
+    .{ "add slack", "add slack's server" },
     .{ "remove NAME", "remove a server and its login" },
     .{ "login NAME", "sign in to an HTTP server" },
     .{ "logout NAME", "sign out and delete the login" },
@@ -315,7 +315,7 @@ pub fn writeUsage(w: *Writer, surface: Surface, verb: ?Verb) Writer.Error!void {
             const left = if (k < 2) std.mem.print(&buffer, "{s}{s}", .{ row[0], json }) catch row[0] else row[0];
             try w.print("  {s:<28}{s}\n", .{ left, row[1] });
         }
-        return w.print("\nRun '{s} COMMAND -h' for a command's flags.\n", .{p});
+        return w.print("\nrun '{s} COMMAND -h' for a command's flags.\n", .{p});
     };
     switch (v) {
         .list => try w.print("usage: {s} list{s}\n", .{ p, json }),
@@ -622,7 +622,7 @@ fn list(c: Context, arena: Allocator, json: bool) !u8 {
         return 0;
     }
     if (statuses.len == 0) {
-        try c.out.print("No MCP servers configured. Add one with: {s} add NAME URL\n", .{c.surface.prog()});
+        try c.out.print("no MCP servers configured. add one with: {s} add NAME URL\n", .{c.surface.prog()});
         return 0;
     }
     try writeList(c.out, arena, statuses);
@@ -823,7 +823,7 @@ fn show(c: Context, arena: Allocator, name: []const u8, json: bool) !u8 {
 }
 
 fn missing(c: Context, arena: Allocator, name: []const u8) !u8 {
-    try c.err.print("No MCP server named {s}. {s} list shows them.\n", .{ try safe(arena, name), c.surface.prog() });
+    try c.err.print("no MCP server named {s}. {s} list shows them.\n", .{ try safe(arena, name), c.surface.prog() });
     return 1;
 }
 
@@ -846,19 +846,19 @@ fn add(c: Context, arena: Allocator, name: []const u8, file: config_file.File, e
     const p = try paths(c, arena);
     const path = if (file == .project) p.project else p.profile;
     const updated = config_file.update(c.gpa, p.profile, file, path, .{ .add = .{ .name = name, .entry = entry } }) catch |err| {
-        try c.err.print("Couldn't add {s} to {s}: {s}.\n", .{ name, fileLabel(file), try whyNot(arena, err, path) });
+        try c.err.print("couldn't add {s} to {s}: {s}.\n", .{ name, fileLabel(file), try whyNot(arena, err, path) });
         return 1;
     };
     switch (updated) {
         .refused => |refusal| {
             debug_trace.logf("mcp", "MCP add refused server={s} file={s} why={s}", .{ name, @tagName(file), refusalToken(refusal) });
-            try c.err.print("Couldn't add {s} to {s}: {s}.\n", .{ name, fileLabel(file), try refusalWords(arena, refusal) });
+            try c.err.print("couldn't add {s} to {s}: {s}.\n", .{ name, fileLabel(file), try refusalWords(arena, refusal) });
             return 1;
         },
         .added, .removed, .missing => {},
     }
     c.hosts.changed(c.hosts.context);
-    try c.out.print("Added {s} to {s}.\n", .{ name, fileLabel(file) });
+    try c.out.print("added {s} to {s}.\n", .{ name, fileLabel(file) });
     const other: config_file.File = if (file == .project) .profile else .project;
     if (try defines(c, arena, other, if (other == .project) p.project else p.profile, name)) {
         try c.out.print("{s} is also in {s}; the one in {s}/mcp.json is used.\n", .{ name, fileLabel(other), profile_paths.displayRoot() });
@@ -871,7 +871,7 @@ fn add(c: Context, arena: Allocator, name: []const u8, file: config_file.File, e
         }
         signInAfterAdd(c, arena, name) catch |err| {
             debug_trace.logf("mcp", "MCP sign-in after add failed server={s} err={s}", .{ name, @errorName(err) });
-            try c.err.print("Couldn't check whether {s} needs a login: {s}. {s} login {s} signs in.\n", .{ name, describe(err), c.surface.prog(), name });
+            try c.err.print("couldn't check whether {s} needs a login: {s}. {s} login {s} signs in.\n", .{ name, describe(err), c.surface.prog(), name });
         };
     }
     return 0;
@@ -897,13 +897,13 @@ fn signInAfterAdd(c: Context, arena: Allocator, name: []const u8) !void {
     };
     if (listed != .needs_login) return;
     if (!canOpenBrowser()) {
-        try c.out.print("{s} needs a login. Sign in with: {s} login {s}\n", .{ name, c.surface.prog(), name });
+        try c.out.print("{s} needs a login. sign in with: {s} login {s}\n", .{ name, c.surface.prog(), name });
         return;
     }
     try c.out.print("{s} needs a login.\n", .{name});
     try c.out.flush();
     const code = (try beginLogin(c, arena, host, server, name, true)) orelse try waitForLogin(c, arena, host, &waiter, true);
-    if (code != 0) try c.err.print("{s} is added. Sign in later with: {s} login {s}\n", .{ name, c.surface.prog(), name });
+    if (code != 0) try c.err.print("{s} is added. sign in later with: {s} login {s}\n", .{ name, c.surface.prog(), name });
 }
 
 fn defines(c: Context, arena: Allocator, file: config_file.File, path: []const u8, name: []const u8) !bool {
@@ -917,25 +917,25 @@ fn remove(c: Context, arena: Allocator, name: []const u8, only: ?config_file.Fil
     const in_profile = (only == null or only == .profile) and try defines(c, arena, .profile, p.profile, name);
     const in_project = (only == null or only == .project) and try defines(c, arena, .project, p.project, name);
     if (in_profile and in_project) {
-        try c.err.print("{s} is in both {s}/mcp.json and .mcp.json. Add --global or --project.\n", .{ try safe(arena, name), profile_paths.displayRoot() });
+        try c.err.print("{s} is in both {s}/mcp.json and .mcp.json. add --global or --project.\n", .{ try safe(arena, name), profile_paths.displayRoot() });
         return 2;
     }
     if (!in_profile and !in_project) {
         const where = if (only) |f| fileLabel(f) else profile_paths.displayText("~/.fx/mcp.json or .mcp.json");
-        try c.err.print("No MCP server named {s} in {s}.\n", .{ try safe(arena, name), where });
+        try c.err.print("no MCP server named {s} in {s}.\n", .{ try safe(arena, name), where });
         return 1;
     }
     const file: config_file.File = if (in_profile) .profile else .project;
     const path = if (file == .project) p.project else p.profile;
     const updated = config_file.update(c.gpa, p.profile, file, path, .{ .remove = name }) catch |err| {
-        try c.err.print("Couldn't remove {s} from {s}: {s}.\n", .{ try safe(arena, name), fileLabel(file), try whyNot(arena, err, path) });
+        try c.err.print("couldn't remove {s} from {s}: {s}.\n", .{ try safe(arena, name), fileLabel(file), try whyNot(arena, err, path) });
         return 1;
     };
     const url = switch (updated) {
         .removed => |u| u,
         .refused => |refusal| {
             debug_trace.logf("mcp", "MCP remove refused server={s} file={s} why={s}", .{ try safe(arena, name), @tagName(file), refusalToken(refusal) });
-            try c.err.print("Couldn't remove {s} from {s}: {s}.\n", .{ try safe(arena, name), fileLabel(file), try refusalWords(arena, refusal) });
+            try c.err.print("couldn't remove {s} from {s}: {s}.\n", .{ try safe(arena, name), fileLabel(file), try refusalWords(arena, refusal) });
             return 1;
         },
         .added, .missing => null,
@@ -962,12 +962,12 @@ fn remove(c: Context, arena: Allocator, name: []const u8, only: ?config_file.Fil
     if (kept) |k| {
         var buffer: [320]u8 = undefined;
         const shown = try safe(arena, name);
-        try c.err.print("Removed {s} from {s}, but couldn't delete its saved login: {s}. Once that's fixed, add it back and run {s} logout {s} to delete it.\n", .{
+        try c.err.print("removed {s} from {s}, but couldn't delete its saved login: {s}. once that's fixed, add it back and run {s} logout {s} to delete it.\n", .{
             shown, fileLabel(file), k.store.writeFailure(&buffer, k.err), c.surface.prog(), shown,
         });
         return 1;
     }
-    try c.out.print("Removed {s} from {s}{s}.\n", .{ name, fileLabel(file), if (forgot) ", and deleted its login" else "" });
+    try c.out.print("removed {s} from {s}{s}.\n", .{ name, fileLabel(file), if (forgot) ", and deleted its login" else "" });
     return 0;
 }
 
@@ -987,8 +987,8 @@ fn trust(c: Context, arena: Allocator, action: project_config.ProjectMcpAction) 
     }
     if (targets.items.len == 0) {
         switch (action) {
-            .approve, .reject => |name| try c.err.print("No project server named {s} in .mcp.json.\n", .{try safe(arena, name)}),
-            else => try c.err.print("No project servers are waiting for approval.\n", .{}),
+            .approve, .reject => |name| try c.err.print("no project server named {s} in .mcp.json.\n", .{try safe(arena, name)}),
+            else => try c.err.print("no project servers are waiting for approval.\n", .{}),
         }
         return 1;
     }
@@ -1000,7 +1000,7 @@ fn trust(c: Context, arena: Allocator, action: project_config.ProjectMcpAction) 
         defer attempt.deinit(arena);
         switch (attempt) {
             .failure => |f| {
-                try c.err.print("Couldn't save that choice: {s}.\n", .{describe(f.err)});
+                try c.err.print("couldn't save that choice: {s}.\n", .{describe(f.err)});
                 return 1;
             },
             .outcome => {},
@@ -1008,7 +1008,7 @@ fn trust(c: Context, arena: Allocator, action: project_config.ProjectMcpAction) 
     }
     c.hosts.changed(c.hosts.context);
     for (targets.items) |s| {
-        const verb = if (action == .reject) "Rejected" else "Approved";
+        const verb = if (action == .reject) "rejected" else "approved";
         const target = s.command orelse s.url orelse "";
         const how = if (s.command != null) "runs" else "connects to";
         if (action == .reject) {
@@ -1023,7 +1023,7 @@ fn trust(c: Context, arena: Allocator, action: project_config.ProjectMcpAction) 
 /// A sign-in or sign-out that changed nothing, since the saved sign-ins can't
 /// be read.
 fn unreadableLogins(c: Context, arena: Allocator, doing: []const u8, name: []const u8) !u8 {
-    try c.err.print("Can't {s} {s}: fx can't read the saved MCP sign-ins in {s}. A newer fx saved them, or they're damaged; fix or delete them, then try again.\n", .{
+    try c.err.print("can't {s} {s}: fx can't read the saved MCP sign-ins in {s}. a newer fx saved them, or they're damaged; fix or delete them, then try again.\n", .{
         doing, try safe(arena, name), credentials.Store.detect(arena, c.home).place(),
     });
     return 1;
@@ -1032,7 +1032,7 @@ fn unreadableLogins(c: Context, arena: Allocator, doing: []const u8, name: []con
 /// A sign-out that changed nothing, since the saved sign-ins couldn't be changed.
 fn notSignedOut(c: Context, arena: Allocator, name: []const u8, store: credentials.Store, err: anyerror) !u8 {
     var buffer: [320]u8 = undefined;
-    try c.err.print("Couldn't sign out of {s}: {s}. Try again once that's fixed.\n", .{ try safe(arena, name), store.writeFailure(&buffer, err) });
+    try c.err.print("couldn't sign out of {s}: {s}. try again once that's fixed.\n", .{ try safe(arena, name), store.writeFailure(&buffer, err) });
     return 1;
 }
 
@@ -1070,7 +1070,7 @@ fn logout(c: Context, arena: Allocator, name: []const u8) !u8 {
     if (done.kept) |err| {
         if (saved == null and !was.signed_in) return notSignedOut(c, arena, name, store, err);
         var buffer: [320]u8 = undefined;
-        try c.err.print("Signed out of {s} here, but couldn't remove its saved login: {s}. Sign out again once that's fixed.\n", .{
+        try c.err.print("signed out of {s} here, but couldn't remove its saved login: {s}. sign out again once that's fixed.\n", .{
             try safe(arena, name), store.writeFailure(&buffer, err),
         });
         return 1;
@@ -1078,14 +1078,14 @@ fn logout(c: Context, arena: Allocator, name: []const u8) !u8 {
     if (saved != null or was.signed_in) {
         const shown = try safe(arena, name);
         switch (done.revocation) {
-            .confirmed => try c.out.print("Signed out of {s}.\n", .{shown}),
+            .confirmed => try c.out.print("signed out of {s}.\n", .{shown}),
             // The server never hears of a logout it wasn't sent: a copy of
             // the tokens keeps working there.
-            .none => try c.out.print("Signed out of {s} here, but the login wasn't revoked at its server, so its tokens stay valid until they expire.\n", .{shown}),
+            .none => try c.out.print("signed out of {s} here, but the login wasn't revoked at its server, so its tokens stay valid until they expire.\n", .{shown}),
             .unconfirmed => if (done.retry_later)
-                try c.out.print("Signed out of {s} here, but its server didn't confirm the revocation, so its tokens may stay valid for now. " ++ pending_revocation.retry_later ++ ".\n", .{shown})
+                try c.out.print("signed out of {s} here, but its server didn't confirm the revocation, so its tokens may stay valid for now. " ++ pending_revocation.retry_later ++ ".\n", .{shown})
             else
-                try c.out.print("Signed out of {s} here, but its server didn't confirm the revocation, so its tokens may stay valid until they expire.\n", .{shown}),
+                try c.out.print("signed out of {s} here, but its server didn't confirm the revocation, so its tokens may stay valid until they expire.\n", .{shown}),
         }
     } else {
         try c.out.print("{s} wasn't signed in.\n", .{try safe(arena, name)});
@@ -1186,7 +1186,7 @@ fn beginLogin(c: Context, arena: Allocator, host: *Host, server: @import("config
         },
         error.CredentialStoreUnreadable => return try unreadableLogins(c, arena, "sign in to", name),
         error.CallbackPortInUse => {
-            try c.err.print("Couldn't sign in to {s}: port {d} is in use, maybe by another app signing in. Try again once it's free.\n", .{ try safe(arena, name), server.callback_port.? });
+            try c.err.print("couldn't sign in to {s}: port {d} is in use, maybe by another app signing in. try again once it's free.\n", .{ try safe(arena, name), server.callback_port.? });
             return 1;
         },
         else => return err,
@@ -1217,27 +1217,27 @@ fn waitForLogin(c: Context, arena: Allocator, host: *Host, waiter: *Waiter, open
         if (url) |u| {
             const shown = try safeUrl(arena, u);
             if (open) {
-                try c.out.print("Approve in your browser. If it didn't open, go to:\n  {s}\n", .{shown});
+                try c.out.print("approve in your browser. if it didn't open, go to:\n  {s}\n", .{shown});
             } else {
-                try c.out.print("Open this address in a browser and approve:\n  {s}\nThen paste the address the browser ends on here, or wait if it comes back on its own.\n", .{shown});
+                try c.out.print("open this address in a browser and approve:\n  {s}\nthen paste the address the browser ends on here, or wait if it comes back on its own.\n", .{shown});
             }
             try c.out.flush();
         }
         if (done) |ok| {
             // The login was saved first, so a failed save is known by now.
             if (ok) if (not_saved) |why| {
-                try c.err.print("Signed in to {s}, but couldn't save the login: {s}. Sign in again once that's fixed.\n", .{ try safe(arena, name), try safe(arena, why) });
+                try c.err.print("signed in to {s}, but couldn't save the login: {s}. sign in again once that's fixed.\n", .{ try safe(arena, name), try safe(arena, why) });
                 return 1;
             };
             if (ok) {
                 if (unchecked) {
-                    try c.out.print("Signed in to {s}, but fx couldn't check the login with it.\n", .{try safe(arena, name)});
-                } else try c.out.print("Signed in to {s}.\n", .{try safe(arena, name)});
+                    try c.out.print("signed in to {s}, but fx couldn't check the login with it.\n", .{try safe(arena, name)});
+                } else try c.out.print("signed in to {s}.\n", .{try safe(arena, name)});
                 try c.out.flush();
                 KeptSignOutRetry.run(c.kept_sign_outs, c.gpa, c.home);
                 return 0;
             }
-            try c.err.print("Couldn't sign in to {s}: {s}.\n", .{ try safe(arena, name), try safeLong(arena, waiter.reason orelse "the server refused") });
+            try c.err.print("couldn't sign in to {s}: {s}.\n", .{ try safe(arena, name), try safeLong(arena, waiter.reason orelse "the server refused") });
             return 1;
         }
         if (!open and waiter.shown) {
@@ -1392,14 +1392,14 @@ test "parse turns mistakes into usage, and old verbs into pointers" {
         .{ .args = &.{"show"}, .message = "fx mcp show needs one server NAME." },
         .{ .args = &.{ "show", "a", "b" }, .message = "fx mcp show needs one server NAME." },
         .{ .args = &.{ "add", "bad name", "https://w" }, .message = "'bad name' can't be a server name: use letters, digits, '-' and '_'." },
-        .{ .args = &.{ "add", "web", "w.example" }, .message = "'w.example' isn't a URL. A stdio server's command goes after --." },
+        .{ .args = &.{ "add", "web", "w.example" }, .message = "'w.example' isn't a URL. a stdio server's command goes after --." },
         .{ .args = &.{ "add", "web" }, .message = "fx mcp add needs a URL, or -- and a command." },
         .{ .args = &.{ "add", "web", "--" }, .message = "fx mcp add needs a command after --." },
         .{ .args = &.{ "add", "--env", "A=1", "web", "https://w" }, .message = "--env is for stdio servers; use --header for HTTP." },
         .{ .args = &.{ "add", "--header", "A=1", "web", "--", "node" }, .message = "--header is for HTTP servers; use --env for a command." },
         .{ .args = &.{ "add", "--env", "noequals", "web", "--", "node" }, .message = "--env needs KEY=VALUE." },
-        .{ .args = &.{ "remove", "--project", "--profile", "x" }, .message = "Use --project or --global, not both." },
-        .{ .args = &.{ "add", "--global", "--project", "web", "https://w/mcp" }, .message = "Use --project or --global, not both." },
+        .{ .args = &.{ "remove", "--project", "--profile", "x" }, .message = "use --project or --global, not both." },
+        .{ .args = &.{ "add", "--global", "--project", "web", "https://w/mcp" }, .message = "use --project or --global, not both." },
         .{ .args = &.{ "approve", "--all", "x" }, .message = "fx mcp approve takes a NAME or --all, not both." },
         .{ .args = &.{ "logout", "--json", "x" }, .message = "fx mcp logout: unknown flag --json" },
         .{ .args = &.{ "show", "x", "--", "y" }, .message = "fx mcp show takes no command after --." },

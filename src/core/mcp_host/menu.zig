@@ -22,11 +22,11 @@ pub const Choice = enum {
 
     pub fn label(c: Choice) []const u8 {
         return switch (c) {
-            .login => "Log in",
-            .logout => "Log out",
-            .approve => "Approve",
-            .reject => "Reject",
-            .remove => "Remove",
+            .login => "log in",
+            .logout => "log out",
+            .approve => "approve",
+            .reject => "reject",
+            .remove => "remove",
         };
     }
 
@@ -448,7 +448,7 @@ pub const news_ms: i64 = 5000;
 
 /// The link a waiting sign-in offers when the browser didn't open, in the
 /// transcript and on the server's screen alike.
-pub const sign_in_link_label = "Open the sign-in page";
+pub const sign_in_link_label = "open the sign-in page";
 
 /// The longest the status line waits for servers to finish starting.
 pub const startup_quiet_ms: i64 = 10_000;
@@ -525,7 +525,7 @@ pub fn statusLine(buf: []u8, statuses: []const runtime.Status, signing_in: ?[]co
         return whole(w.buffered());
     }
     if (signing_in) |name| {
-        w.writeAll("Signing in to ") catch {};
+        w.writeAll("signing in to ") catch {};
         writeSafe(&w, name);
         w.writeAll(" · /mcp") catch {};
         return whole(w.buffered());
@@ -596,8 +596,8 @@ test "the status line puts news first, then what needs the user, and is quiet wh
     const ready: runtime.Status = .{ .name = "linear", .source = .profile, .transport = .http, .state = .ready };
     const off: runtime.Status = .{ .name = "old", .source = .profile, .transport = .stdio, .state = .disabled };
     const proj: runtime.Status = .{ .name = "proj", .source = .workspace, .transport = .stdio, .state = .waiting_for_approval };
-    try testing.expectEqualStrings("Signed in to plain", statusLine(&buf, &.{ plain, ready }, null, "Signed in to plain", 0));
-    try testing.expectEqualStrings("Signing in to plain · /mcp", statusLine(&buf, &.{ plain, ready }, "plain", null, 0));
+    try testing.expectEqualStrings("signed in to plain", statusLine(&buf, &.{ plain, ready }, null, "signed in to plain", 0));
+    try testing.expectEqualStrings("signing in to plain · /mcp", statusLine(&buf, &.{ plain, ready }, "plain", null, 0));
     try testing.expectEqualStrings("plain needs login · /mcp", statusLine(&buf, &.{ plain, ready, off }, null, null, 0));
     try testing.expectEqualStrings("2 MCP need attention · /mcp", statusLine(&buf, &.{ plain, proj, ready }, null, null, 3));
     try testing.expectEqualStrings("MCP config has 2 problems · /mcp list", statusLine(&buf, &.{ready}, null, null, 2));

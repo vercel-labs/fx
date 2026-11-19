@@ -5598,12 +5598,12 @@ test "explicit skill loads publish one interactive summary without extra tool ca
     job.prompt = @constCast("Use $requested-workflow.");
     try runFakePrompt(&gateway, &hooks, config, job);
     try std.testing.expectEqual(@as(usize, 1), hooks.interactive_notices.items.len);
-    try std.testing.expectEqualStrings("1 requested skill loaded\n└ Loaded skill requested-workflow", hooks.interactive_notices.items[0].body);
+    try std.testing.expectEqualStrings("1 requested skill loaded\n└ loaded skill requested-workflow", hooks.interactive_notices.items[0].body);
     try std.testing.expectEqual(@as(usize, 1), gateway.request_bodies.items.len);
     try expectBodyContains(&gateway, 0, "REQUESTED_SKILL_CONTENT");
     try expectBodyNotContains(&gateway, 0, "1 requested skill loaded");
     try std.testing.expectEqual(@as(usize, 0), hooks.executed_names.items.len);
-    const notice_index = logIndex(&hooks, "interactive_notice::1 requested skill loaded\n└ Loaded skill requested-workflow") orelse return error.TestExpectedEqual;
+    const notice_index = logIndex(&hooks, "interactive_notice::1 requested skill loaded\n└ loaded skill requested-workflow") orelse return error.TestExpectedEqual;
     const reply_index = reply: {
         for (hooks.log.items, 0..) |entry, index| {
             if (std.mem.startsWith(u8, entry, "text:") and std.mem.find(u8, entry, "Finished") != null) break :reply index;
@@ -5693,8 +5693,8 @@ test "processQueuedPrompt waits out a 503 Retry-After, capped at 30 seconds" {
 
     // The server's own wait replaces the backoff, but never beyond 30s.
     try std.testing.expectEqual(@as(usize, 3), gateway.request_models.items.len);
-    try expectModuleStatus(&hooks, 0, .waiting, "Gateway error · next try in 4s · attempt 1");
-    try expectAnyModuleStatus(&hooks, .waiting, "Gateway error · next try in 30s · attempt 2");
+    try expectModuleStatus(&hooks, 0, .waiting, "gateway error · next try in 4s · attempt 1");
+    try expectAnyModuleStatus(&hooks, .waiting, "gateway error · next try in 30s · attempt 2");
     for (hooks.route_recovery_statuses.items) |status| {
         try std.testing.expect(std.mem.find(u8, status.text.slice(), "next try in 10m") == null);
     }
@@ -6405,8 +6405,8 @@ test "processQueuedPrompt regenerates a local tool call that a provider error le
     try std.testing.expectEqual(@as(usize, 1), hooks.history_turns.items.len);
     try expectBodyContains(&gateway, 1, "fx did not execute that call");
     try expectBodyNotContains(&gateway, 1, "\"toolChoice\":{\"type\":\"none\"}");
-    try expectModuleStatus(&hooks, 0, .waiting, "Gateway error · next try in ");
-    try expectAnyModuleStatus(&hooks, .retrying, "Gateway error · retrying · attempt 2");
+    try expectModuleStatus(&hooks, 0, .waiting, "gateway error · next try in ");
+    try expectAnyModuleStatus(&hooks, .retrying, "gateway error · retrying · attempt 2");
     try expectRecovered(&hooks, 2);
 }
 
@@ -6596,7 +6596,7 @@ test "processQueuedPrompt keeps tools after ReadFailed cut off a provider search
             .streamed_tool_starts = &starts,
             .stream_error_after_tool_starts = error.ReadFailed,
         },
-        .{ .content = "Searched again" },
+        .{ .content = "searched again" },
     };
     var gateway = FakeGateway.init(alloc, &completions);
     defer gateway.deinit();
@@ -6610,7 +6610,7 @@ test "processQueuedPrompt keeps tools after ReadFailed cut off a provider search
 
     // A search only reads, so a second one is safe: the resend keeps tools.
     try std.testing.expectEqual(@as(usize, 2), gateway.request_models.items.len);
-    try expectModuleStatus(&hooks, 0, .waiting, "Connection lost · next try in ");
+    try expectModuleStatus(&hooks, 0, .waiting, "connection lost · next try in ");
     try expectBodyNotContains(&gateway, 1, "\"toolChoice\":{\"type\":\"none\"}");
     try expectBodyContains(&gateway, 1, "search again if you still need one");
     try std.testing.expectEqual(types.TurnPresentationOutcome.completed, hooks.finalized_outcome.?);
@@ -6976,7 +6976,7 @@ test "processQueuedPrompt Esc while a resend after an unexecuted tool call waits
     try std.testing.expectEqual(@as(usize, 0), hooks.executed_names.items.len);
     try std.testing.expectEqual(types.TurnPresentationOutcome.interrupted, hooks.finalized_outcome.?);
     try std.testing.expectEqual(@as(usize, 1), hooks.route_recovery_statuses.items.len);
-    try expectModuleStatus(&hooks, 0, .waiting, "Gateway error · next try in ");
+    try expectModuleStatus(&hooks, 0, .waiting, "gateway error · next try in ");
     try std.testing.expectEqual(@as(usize, 1), hooks.route_recovery_clear_count);
     const checkpoint = hooks.recovery_checkpoints.items[hooks.recovery_checkpoints.items.len - 1];
     try std.testing.expectEqual(session_codec.RecoveryToolState.proven_unexecuted, checkpoint.tool_state);
@@ -7071,9 +7071,9 @@ test "processQueuedPrompt retries replay-safe provider errors before success" {
     try std.testing.expectEqual(@as(usize, 0), hooks.system_notices.items.len);
     // Provider errors wait with the module's wording, which never carries the
     // raw provider detail, and resend until one succeeds.
-    try expectModuleStatus(&hooks, 0, .waiting, "Gateway error · next try in 1s · attempt 1");
-    try expectAnyModuleStatus(&hooks, .waiting, "Gateway error · next try in 2s · attempt 2");
-    try expectAnyModuleStatus(&hooks, .retrying, "Gateway error · retrying · attempt 3");
+    try expectModuleStatus(&hooks, 0, .waiting, "gateway error · next try in 1s · attempt 1");
+    try expectAnyModuleStatus(&hooks, .waiting, "gateway error · next try in 2s · attempt 2");
+    try expectAnyModuleStatus(&hooks, .retrying, "gateway error · retrying · attempt 3");
     try expectRecovered(&hooks, 3);
 }
 
@@ -7106,8 +7106,8 @@ test "processQueuedPrompt retries a gateway stream timeout as a dropped connecti
     try std.testing.expectEqual(@as(usize, 3), gateway.request_models.items.len);
     try std.testing.expectEqual(types.TurnPresentationOutcome.completed, hooks.finalized_outcome.?);
     try std.testing.expectEqualStrings("Recovered after timeout", hooks.history_assistant_text.?);
-    try expectModuleStatus(&hooks, 0, .waiting, "Connection lost · next try in 1s · attempt 1");
-    try expectAnyModuleStatus(&hooks, .waiting, "Connection lost · next try in 2s · attempt 2");
+    try expectModuleStatus(&hooks, 0, .waiting, "connection lost · next try in 1s · attempt 1");
+    try expectAnyModuleStatus(&hooks, .waiting, "connection lost · next try in 2s · attempt 2");
     try expectRecovered(&hooks, 3);
 }
 
@@ -7368,7 +7368,7 @@ test "processQueuedPrompt drops provider option fast after three provider errors
     }
     try expectRootFieldAbsent(&gateway, 0, "fast");
     try expectBodyContains(&gateway, 3, "\"providerOptions\":{\"gateway\":{\"caching\":\"auto\"}}");
-    try expectAnyModuleStatus(&hooks, .retrying, "Gateway error · retrying without Fast · attempt 4");
+    try expectAnyModuleStatus(&hooks, .retrying, "gateway error · retrying without fast · attempt 4");
     try expectRecovered(&hooks, 4);
     try std.testing.expectEqual(types.TurnPresentationOutcome.completed, hooks.finalized_outcome.?);
 }
@@ -7483,7 +7483,7 @@ test "processQueuedPrompt preserves fast mode after a streamed rate limit" {
 
     try std.testing.expectEqual(@as(usize, 2), gateway.request_models.items.len);
     for (0..2) |index| try expectBodyContains(&gateway, index, "\"speed\":\"fast\"");
-    try expectModuleStatus(&hooks, 0, .waiting, "Rate limited · next try in ");
+    try expectModuleStatus(&hooks, 0, .waiting, "rate limited · next try in ");
 }
 
 test "processQueuedPrompt keeps provider option fast after one HTTP failure" {
@@ -7512,7 +7512,7 @@ test "processQueuedPrompt keeps provider option fast after one HTTP failure" {
     for (0..2) |index| {
         try expectBodyContains(&gateway, index, "\"providerOptions\":{\"gateway\":{\"speed\":\"fast\",\"caching\":\"auto\"}}");
     }
-    try expectModuleStatus(&hooks, 0, .waiting, "Gateway error · next try in ");
+    try expectModuleStatus(&hooks, 0, .waiting, "gateway error · next try in ");
     try expectRecovered(&hooks, 2);
 }
 
@@ -7574,10 +7574,10 @@ test "processQueuedPrompt retries replay-safe ReadFailed before success" {
     defer debug_trace.resetForTest();
     try debug_trace.configureForTestWithScopes(alloc, trace_path, "gateway");
 
-    const final_chunks = [_][]const u8{"Recovered"};
+    const final_chunks = [_][]const u8{"recovered"};
     const completions = [_]FakeCompletion{
         .{ .stream_error = error.ReadFailed },
-        .{ .chunks = &final_chunks, .content = "Recovered" },
+        .{ .chunks = &final_chunks, .content = "recovered" },
     };
     var gateway = FakeGateway.init(alloc, &completions);
     defer gateway.deinit();
@@ -7592,13 +7592,13 @@ test "processQueuedPrompt retries replay-safe ReadFailed before success" {
 
     try std.testing.expectEqual(@as(usize, 2), gateway.request_models.items.len);
     try std.testing.expectEqual(@as(usize, 0), hooks.executed_names.items.len);
-    try std.testing.expectEqual(@as(usize, 1), countText(&hooks, "Recovered"));
+    try std.testing.expectEqual(@as(usize, 1), countText(&hooks, "recovered"));
     try std.testing.expectEqual(@as(usize, 0), hooks.system_notices.items.len);
     // The wait shows the module's countdown, the resend its retrying line,
     // and the first output clears it.
     try std.testing.expectEqual(@as(usize, 3), hooks.route_recovery_statuses.items.len);
-    try expectModuleStatus(&hooks, 0, .waiting, "Connection lost · next try in 1s · attempt 1");
-    try expectModuleStatus(&hooks, 1, .retrying, "Connection lost · retrying · attempt 2");
+    try expectModuleStatus(&hooks, 0, .waiting, "connection lost · next try in 1s · attempt 1");
+    try expectModuleStatus(&hooks, 1, .retrying, "connection lost · retrying · attempt 2");
     try expectRecovered(&hooks, 2);
     try std.testing.expectEqual(@as(usize, 1), hooks.route_recovery_clear_count);
 
@@ -7638,8 +7638,8 @@ test "processQueuedPrompt counts and retries a definitely unsent native setup fa
     // The last checkpoint saves the finished reply.
     const final = hooks.recovery_checkpoints.items[hooks.recovery_checkpoints.items.len - 1];
     try std.testing.expectEqual(types.ModelRecoveryAction.delivering_response, final.action);
-    try expectModuleStatus(&hooks, 0, .waiting, "Connection lost · next try in ");
-    try expectModuleStatus(&hooks, 1, .retrying, "Connection lost · retrying · attempt 2");
+    try expectModuleStatus(&hooks, 0, .waiting, "connection lost · next try in ");
+    try expectModuleStatus(&hooks, 1, .retrying, "connection lost · retrying · attempt 2");
     try expectRecovered(&hooks, 2);
 }
 
@@ -7651,10 +7651,10 @@ test "processQueuedPrompt routes native network failure classes through one hear
     const Case = struct {
         err: anyerror,
         stage: Stage,
-        waiting: []const u8 = "Connection lost · next try in 1s · attempt 1",
-        retrying: []const u8 = "Connection lost · retrying · attempt 2",
+        waiting: []const u8 = "connection lost · next try in 1s · attempt 1",
+        retrying: []const u8 = "connection lost · retrying · attempt 2",
     };
-    const offline: Case = .{ .err = error.UnknownHostName, .stage = .before_send, .waiting = "Offline · next try in 1s", .retrying = "Offline · retrying · attempt 2" };
+    const offline: Case = .{ .err = error.UnknownHostName, .stage = .before_send, .waiting = "offline · next try in 1s", .retrying = "offline · retrying · attempt 2" };
     const cases = [_]Case{
         .{ .err = error.TlsInitializationFailed, .stage = .before_send },
         offline,
@@ -7730,7 +7730,7 @@ test "processQueuedPrompt retries a server error event" {
 
     try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
     try std.testing.expectEqual(@as(usize, 2), gateway.request_models.items.len);
-    try expectModuleStatus(&hooks, 0, .waiting, "Gateway error · next try in ");
+    try expectModuleStatus(&hooks, 0, .waiting, "gateway error · next try in ");
     try expectRecovered(&hooks, 2);
 }
 
@@ -7788,7 +7788,7 @@ test "processQueuedPrompt keeps retrying an error event without a code" {
     // Five sends end the same unclear way; only Esc would stop the request.
     try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
     try std.testing.expectEqual(@as(usize, 6), gateway.request_models.items.len);
-    try expectModuleStatus(&hooks, 0, .waiting, "Gateway error · next try in ");
+    try expectModuleStatus(&hooks, 0, .waiting, "gateway error · next try in ");
     try expectRecovered(&hooks, 6);
     try std.testing.expectEqual(types.TurnPresentationOutcome.completed, hooks.finalized_outcome.?);
 }
@@ -7893,7 +7893,7 @@ test "processQueuedPrompt reports failed when an HTTP error ends a request that 
     // The retrying status never outlives the request: hosts that report a
     // result get `failed`, and the TUI clears its status line on it.
     const statuses = hooks.route_recovery_statuses.items;
-    try expectModuleStatus(&hooks, 0, .waiting, "Gateway error · next try in ");
+    try expectModuleStatus(&hooks, 0, .waiting, "gateway error · next try in ");
     try std.testing.expectEqual(types.RouteRecoveryStatus.Kind.failed, statuses[statuses.len - 1].kind);
     try std.testing.expectEqual(@as(usize, 2), statuses[statuses.len - 1].attempt);
     try std.testing.expectEqual(types.TurnPresentationOutcome.failed, hooks.finalized_outcome.?);
@@ -7961,10 +7961,10 @@ test "processQueuedPrompt a network failure after server errors waits as a dropp
     // A zero Retry-After carries no information, so the server errors back
     // off. The network failure that follows is named for what it is.
     try std.testing.expectEqual(@as(usize, 6), gateway.request_models.items.len);
-    try expectAnyModuleStatus(&hooks, .waiting, "Gateway error · next try in 2s · attempt 2");
+    try expectAnyModuleStatus(&hooks, .waiting, "gateway error · next try in 2s · attempt 2");
     const network_status = hooks.route_recovery_statuses.items[hooks.route_recovery_statuses.items.len - 1];
     try std.testing.expectEqual(types.RouteRecoveryStatus.Kind.waiting, network_status.kind);
-    try std.testing.expect(std.mem.startsWith(u8, network_status.text.slice(), "Connection lost · next try in "));
+    try std.testing.expect(std.mem.startsWith(u8, network_status.text.slice(), "connection lost · next try in "));
     try std.testing.expectEqual(@as(usize, 6), network_status.attempt);
     try std.testing.expectEqual(types.TurnPresentationOutcome.interrupted, hooks.finalized_outcome.?);
 }
@@ -8249,7 +8249,7 @@ test "processQueuedPrompt counts only failed provider attempts across tool follo
     try std.testing.expectEqual(types.ModelRecoveryCause.provider_unavailable, checkpoint.cause);
     const last = hooks.route_recovery_statuses.items[hooks.route_recovery_statuses.items.len - 1];
     try std.testing.expectEqual(types.RouteRecoveryStatus.Kind.waiting, last.kind);
-    try std.testing.expect(std.mem.startsWith(u8, last.text.slice(), "Gateway error · next try in "));
+    try std.testing.expect(std.mem.startsWith(u8, last.text.slice(), "gateway error · next try in "));
     try std.testing.expectEqual(@as(usize, 2), last.attempt);
 
     // Continue is a new user action: the Esc that ended the first run is spent.
@@ -8455,8 +8455,8 @@ test "processQueuedPrompt clears scheduled retry when the next reservation fails
     try std.testing.expectEqual(@as(usize, 1), gateway.admitted_requests);
     try std.testing.expectEqual(@as(usize, 1), gateway.request_models.items.len);
     try std.testing.expectEqual(@as(usize, 3), hooks.route_recovery_statuses.items.len);
-    try expectModuleStatus(&hooks, 0, .waiting, "Connection lost · next try in ");
-    try expectModuleStatus(&hooks, 1, .retrying, "Connection lost · retrying · attempt 2");
+    try expectModuleStatus(&hooks, 0, .waiting, "connection lost · next try in ");
+    try expectModuleStatus(&hooks, 1, .retrying, "connection lost · retrying · attempt 2");
     try std.testing.expectEqual(types.RouteRecoveryStatus.Kind.failed, hooks.route_recovery_statuses.items[2].kind);
     try std.testing.expectEqual(@as(usize, 2), hooks.route_recovery_statuses.items[2].attempt);
     try std.testing.expectEqual(@as(usize, 0), hooks.route_recovery_clear_count);
@@ -8489,13 +8489,13 @@ test "processQueuedPrompt replaces scheduled retry after provider pre-admission 
     try std.testing.expectEqual(@as(usize, 1), gateway.admitted_requests);
     try std.testing.expectEqual(@as(usize, 2), gateway.request_models.items.len);
     try std.testing.expectEqual(@as(usize, 3), hooks.route_recovery_statuses.items.len);
-    try expectModuleStatus(&hooks, 0, .waiting, "Connection lost · next try in ");
-    try expectModuleStatus(&hooks, 1, .retrying, "Connection lost · retrying · attempt 2");
+    try expectModuleStatus(&hooks, 0, .waiting, "connection lost · next try in ");
+    try expectModuleStatus(&hooks, 1, .retrying, "connection lost · retrying · attempt 2");
     try expectRouteStatus(
         &hooks,
         2,
         .terminal_provider_error,
-        "⚠ Network interrupted · test provider serialization failed · stopped after 1 attempt",
+        "⚠ network interrupted · test provider serialization failed · stopped after 1 attempt",
     );
     try std.testing.expectEqual(@as(usize, 0), hooks.route_recovery_clear_count);
 }
@@ -8524,7 +8524,7 @@ test "processQueuedPrompt clears the waiting status when the retrying status can
     try std.testing.expectEqual(@as(usize, 1), gateway.admitted_requests);
     try std.testing.expectEqual(@as(usize, 1), gateway.request_models.items.len);
     try std.testing.expectEqual(@as(usize, 2), hooks.route_recovery_statuses.items.len);
-    try expectModuleStatus(&hooks, 0, .waiting, "Connection lost · next try in ");
+    try expectModuleStatus(&hooks, 0, .waiting, "connection lost · next try in ");
     try std.testing.expectEqual(types.RouteRecoveryStatus.Kind.failed, hooks.route_recovery_statuses.items[1].kind);
     try std.testing.expectEqual(@as(usize, 0), hooks.route_recovery_clear_count);
 }
@@ -8555,8 +8555,8 @@ test "processQueuedPrompt keeps retrying identical ReadFailed failures until one
     try std.testing.expectEqual(@as(usize, 0), hooks.executed_names.items.len);
     try std.testing.expectEqual(@as(usize, 0), hooks.system_notices.items.len);
     try std.testing.expectEqual(types.TurnPresentationOutcome.completed, hooks.finalized_outcome.?);
-    try expectModuleStatus(&hooks, 0, .waiting, "Connection lost · next try in 1s · attempt 1");
-    try expectAnyModuleStatus(&hooks, .waiting, "Connection lost · next try in 4s · attempt 3");
+    try expectModuleStatus(&hooks, 0, .waiting, "connection lost · next try in 1s · attempt 1");
+    try expectAnyModuleStatus(&hooks, .waiting, "connection lost · next try in 4s · attempt 3");
     try expectRecovered(&hooks, 4);
     try std.testing.expectEqual(@as(usize, 0), hooks.recovery_checkpoint_clears);
 }
@@ -8581,9 +8581,9 @@ test "processQueuedPrompt names a reset and a read failure the same dropped conn
 
     try std.testing.expectEqual(@as(usize, 4), gateway.request_models.items.len);
     for (hooks.route_recovery_statuses.items[0 .. hooks.route_recovery_statuses.items.len - 1]) |status| {
-        try std.testing.expect(std.mem.startsWith(u8, status.text.slice(), "Connection lost · "));
+        try std.testing.expect(std.mem.startsWith(u8, status.text.slice(), "connection lost · "));
     }
-    try expectAnyModuleStatus(&hooks, .waiting, "Connection lost · next try in 4s · attempt 3");
+    try expectAnyModuleStatus(&hooks, .waiting, "connection lost · next try in 4s · attempt 3");
     try expectRecovered(&hooks, 4);
 }
 
@@ -8605,8 +8605,8 @@ test "processQueuedPrompt clears retry status when a replay is cancelled" {
 
     try std.testing.expectEqual(@as(usize, 2), gateway.request_models.items.len);
     try std.testing.expectEqual(@as(usize, 2), hooks.route_recovery_statuses.items.len);
-    try expectModuleStatus(&hooks, 0, .waiting, "Connection lost · next try in ");
-    try expectModuleStatus(&hooks, 1, .retrying, "Connection lost · retrying · attempt 2");
+    try expectModuleStatus(&hooks, 0, .waiting, "connection lost · next try in ");
+    try expectModuleStatus(&hooks, 1, .retrying, "connection lost · retrying · attempt 2");
     try std.testing.expectEqual(@as(usize, 1), hooks.route_recovery_clear_count);
     try std.testing.expectEqual(types.TurnPresentationOutcome.interrupted, hooks.finalized_outcome.?);
 }
@@ -8631,8 +8631,8 @@ test "processQueuedPrompt replaces retry status when replay finish is missing" {
 
     // A stream that ends without its finish is a dropped connection too.
     try std.testing.expectEqual(@as(usize, 4), gateway.request_models.items.len);
-    try expectModuleStatus(&hooks, 0, .waiting, "Connection lost · next try in 1s · attempt 1");
-    try expectAnyModuleStatus(&hooks, .waiting, "Connection lost · next try in 4s · attempt 3");
+    try expectModuleStatus(&hooks, 0, .waiting, "connection lost · next try in 1s · attempt 1");
+    try expectAnyModuleStatus(&hooks, .waiting, "connection lost · next try in 4s · attempt 3");
     try expectRecovered(&hooks, 4);
     try std.testing.expectEqual(types.TurnPresentationOutcome.completed, hooks.finalized_outcome.?);
 }
@@ -8658,9 +8658,9 @@ test "processQueuedPrompt replaces retry status after an invalid replay completi
 
     try std.testing.expectEqual(@as(usize, 2), gateway.request_models.items.len);
     try std.testing.expectEqual(@as(usize, 3), hooks.route_recovery_statuses.items.len);
-    try expectModuleStatus(&hooks, 0, .waiting, "Connection lost · next try in ");
-    try expectModuleStatus(&hooks, 1, .retrying, "Connection lost · retrying · attempt 2");
-    try expectRouteStatus(&hooks, 2, .terminal_provider_error, "⚠ Provider unavailable · invalid provider completion · stopped after 2 attempts");
+    try expectModuleStatus(&hooks, 0, .waiting, "connection lost · next try in ");
+    try expectModuleStatus(&hooks, 1, .retrying, "connection lost · retrying · attempt 2");
+    try expectRouteStatus(&hooks, 2, .terminal_provider_error, "⚠ provider unavailable · invalid provider completion · stopped after 2 attempts");
 }
 
 test "processQueuedPrompt restarts an interrupted response until one completes" {
@@ -8735,9 +8735,9 @@ test "processQueuedPrompt Esc while restarting a whitespace-only response ends t
     // next wait clears the waiting line.
     try std.testing.expectEqual(@as(usize, 2), gateway.request_models.items.len);
     try std.testing.expectEqual(@as(usize, 0), hooks.executed_names.items.len);
-    try expectModuleStatus(&hooks, 0, .waiting, "Connection lost · next try in 1s · attempt 1");
-    try expectModuleStatus(&hooks, 1, .retrying, "Connection lost · retrying · attempt 2");
-    try expectModuleStatus(&hooks, 2, .waiting, "Connection lost · next try in 2s · attempt 2");
+    try expectModuleStatus(&hooks, 0, .waiting, "connection lost · next try in 1s · attempt 1");
+    try expectModuleStatus(&hooks, 1, .retrying, "connection lost · retrying · attempt 2");
+    try expectModuleStatus(&hooks, 2, .waiting, "connection lost · next try in 2s · attempt 2");
     try std.testing.expectEqual(@as(usize, 2), hooks.route_recovery_clear_count);
     try std.testing.expectEqual(types.TurnPresentationOutcome.interrupted, hooks.finalized_outcome.?);
 }
@@ -8878,8 +8878,8 @@ test "processQueuedPrompt regenerates and executes a local tool once after ReadF
     try std.testing.expectEqualStrings("read_file", hooks.executed_names.items[0]);
     try std.testing.expectEqualStrings("call_read_recovered", hooks.executed_call_ids.items[0]);
     try std.testing.expectEqual(@as(usize, 3), hooks.route_recovery_statuses.items.len);
-    try expectModuleStatus(&hooks, 0, .waiting, "Connection lost · next try in ");
-    try expectModuleStatus(&hooks, 1, .retrying, "Connection lost · retrying · attempt 2");
+    try expectModuleStatus(&hooks, 0, .waiting, "connection lost · next try in ");
+    try expectModuleStatus(&hooks, 1, .retrying, "connection lost · retrying · attempt 2");
     try expectRecovered(&hooks, 2);
     try expectBodyContains(&gateway, 1, "fx did not execute that call");
     try expectBodyContains(&gateway, 2, "call_read_recovered");
@@ -8917,7 +8917,7 @@ test "processQueuedPrompt settles an interrupted local tool after a different st
     // The unexecuted tool stays unexecuted while the turn retries.
     try std.testing.expectEqual(@as(usize, 4), gateway.request_models.items.len);
     try std.testing.expectEqual(@as(usize, 0), hooks.executed_names.items.len);
-    try expectModuleStatus(&hooks, 0, .waiting, "Connection lost · next try in 1s · attempt 1");
+    try expectModuleStatus(&hooks, 0, .waiting, "connection lost · next try in 1s · attempt 1");
     try expectRecovered(&hooks, 4);
     try expectFailedLifecycleContains(
         hooks.lifecycle_events.items,
@@ -9068,8 +9068,8 @@ test "processQueuedPrompt reconciles ReadFailed after provider-executed tool sta
     try std.testing.expectEqual(@as(usize, 2), gateway.request_models.items.len);
     try std.testing.expectEqual(@as(usize, 0), hooks.executed_names.items.len);
     try std.testing.expectEqual(@as(usize, 3), hooks.route_recovery_statuses.items.len);
-    try expectModuleStatus(&hooks, 0, .waiting, "Connection lost · next try in ");
-    try expectModuleStatus(&hooks, 1, .retrying, "Connection lost · retrying · attempt 2");
+    try expectModuleStatus(&hooks, 0, .waiting, "connection lost · next try in ");
+    try expectModuleStatus(&hooks, 1, .retrying, "connection lost · retrying · attempt 2");
     try expectRecovered(&hooks, 2);
     // Reconciling an uncertain provider-executed tool never offers tools.
     try expectBodyContains(&gateway, 1, "\"toolChoice\":{\"type\":\"none\"}");
@@ -9105,8 +9105,8 @@ test "processQueuedPrompt restarts failed response without committing its partia
     try std.testing.expectEqual(@as(usize, 1), countText(&hooks, "DISCARDED_PREVIEW software"));
     try std.testing.expectEqual(@as(usize, 0), hooks.system_notices.items.len);
     try std.testing.expectEqual(@as(usize, 3), hooks.route_recovery_statuses.items.len);
-    try expectModuleStatus(&hooks, 0, .waiting, "Gateway error · next try in ");
-    try expectModuleStatus(&hooks, 1, .retrying, "Gateway error · retrying · attempt 2");
+    try expectModuleStatus(&hooks, 0, .waiting, "gateway error · next try in ");
+    try expectModuleStatus(&hooks, 1, .retrying, "gateway error · retrying · attempt 2");
     try expectRecovered(&hooks, 2);
     try std.testing.expectEqualStrings("A complete replacement response.", hooks.history_turns.items[0].assistant.assistant);
 }
@@ -9136,8 +9136,8 @@ test "processQueuedPrompt recovers provider error after streamed tool start" {
     try std.testing.expectEqual(@as(usize, 0), hooks.executed_names.items.len);
     try std.testing.expectEqual(@as(usize, 0), hooks.system_notices.items.len);
     try std.testing.expectEqual(@as(usize, 3), hooks.route_recovery_statuses.items.len);
-    try expectModuleStatus(&hooks, 0, .waiting, "Gateway error · next try in ");
-    try expectModuleStatus(&hooks, 1, .retrying, "Gateway error · retrying · attempt 2");
+    try expectModuleStatus(&hooks, 0, .waiting, "gateway error · next try in ");
+    try expectModuleStatus(&hooks, 1, .retrying, "gateway error · retrying · attempt 2");
     try expectRecovered(&hooks, 2);
     try expectBodyContains(&gateway, 1, "fx did not execute that call");
 }
@@ -9211,7 +9211,7 @@ test "processQueuedPrompt waits for the user after a content filter and resends 
     try runFakePrompt(&gateway, &hooks, config, fixture.job());
 
     try std.testing.expectEqual(@as(usize, 2), gateway.request_models.items.len);
-    try std.testing.expectEqualStrings("Blocked by the content filter · press Esc and rephrase", needUserText(&hooks).?);
+    try std.testing.expectEqualStrings("blocked by the content filter · press esc and rephrase", needUserText(&hooks).?);
     try std.testing.expectEqual(types.TurnPresentationOutcome.completed, hooks.finalized_outcome.?);
 }
 
@@ -9234,7 +9234,7 @@ test "processQueuedPrompt waits for the user after a rejected request and resend
     try runFakePrompt(&gateway, &hooks, config, fixture.job());
 
     try std.testing.expectEqual(@as(usize, 2), gateway.request_models.items.len);
-    try std.testing.expectEqualStrings("The provider rejected this request · press Esc", needUserText(&hooks).?);
+    try std.testing.expectEqualStrings("the provider rejected this request · press esc", needUserText(&hooks).?);
     try expectWaitingReason(&hooks, "unsupported parameter");
     try std.testing.expectEqual(types.TurnPresentationOutcome.completed, hooks.finalized_outcome.?);
 }
@@ -9258,7 +9258,7 @@ test "processQueuedPrompt ends a rejected request on Esc like any other interrup
     try runFakePrompt(&gateway, &hooks, config, fixture.job());
 
     try std.testing.expectEqual(@as(usize, 1), gateway.request_models.items.len);
-    try std.testing.expectEqualStrings("The provider rejected this request · press Esc", needUserText(&hooks).?);
+    try std.testing.expectEqualStrings("the provider rejected this request · press esc", needUserText(&hooks).?);
     try expectWaitingReason(&hooks, "unsupported parameter");
     try std.testing.expectEqual(types.TurnPresentationOutcome.interrupted, hooks.finalized_outcome.?);
 }
@@ -9307,7 +9307,7 @@ test "processQueuedPrompt waits for a sign-in after an expired login and resends
     try runFakePrompt(&gateway, &hooks, config, job);
 
     try std.testing.expectEqual(@as(usize, 2), gateway.request_models.items.len);
-    try std.testing.expectEqualStrings("Sign-in expired · waiting 0s · next try in 3m 00s", needUserText(&hooks).?);
+    try std.testing.expectEqualStrings("sign-in expired · waiting 0s · next try in 3m 00s", needUserText(&hooks).?);
     const modes = hooks.credential_refresh_modes.items;
     try std.testing.expectEqualSlices(runtime_deps.CredentialRefreshMode, &.{ .if_needed, .reload, .force, .reload }, modes);
     // Only the forced refresh names a rejected token: the one the 401 refused.
@@ -9362,7 +9362,7 @@ test "processQueuedPrompt resends a login the gateway refuses after a refresh th
     for (gateway.request_api_keys.items[1..]) |key| try std.testing.expectEqualStrings("token-after", key);
     // No sign-in: the login just refreshed is good.
     try std.testing.expect(needUserText(&hooks) == null);
-    try std.testing.expect(waitingTextStarting(&hooks, "Gateway refused the login · next try in "));
+    try std.testing.expect(waitingTextStarting(&hooks, "gateway refused the login · next try in "));
     // Each resend reads the stored login again, and its 401 reads it once
     // more and forces a refresh of its own while the store still holds the
     // refused token, so the login is checked again on every resend.
@@ -9652,7 +9652,7 @@ test "processQueuedPrompt waiting for a sign-in resends with the login another f
     try runFakePrompt(&gateway, &hooks, config, job);
 
     try std.testing.expectEqual(@as(usize, 2), gateway.request_models.items.len);
-    try std.testing.expect(std.mem.startsWith(u8, needUserText(&hooks).?, "Sign-in expired · waiting "));
+    try std.testing.expect(std.mem.startsWith(u8, needUserText(&hooks).?, "sign-in expired · waiting "));
     try std.testing.expect(hooks.credential_stored_reads >= 1);
     try std.testing.expectEqualStrings("token-before", gateway.request_api_keys.items[0]);
     try std.testing.expectEqualStrings("token-after", gateway.request_api_keys.items[1]);
@@ -9688,9 +9688,9 @@ test "processQueuedPrompt waits for a sign-in when a refused login's refresh sto
     try runFakePrompt(&gateway, &hooks, config, job);
 
     try std.testing.expectEqual(@as(usize, 4), gateway.request_models.items.len);
-    try std.testing.expect(waitingTextStarting(&hooks, "Gateway refused the login · next try in "));
+    try std.testing.expect(waitingTextStarting(&hooks, "gateway refused the login · next try in "));
     const asked = needUserText(&hooks) orelse return error.TestExpectedSignInWait;
-    try std.testing.expect(std.mem.startsWith(u8, asked, "Sign-in expired · waiting "));
+    try std.testing.expect(std.mem.startsWith(u8, asked, "sign-in expired · waiting "));
     try std.testing.expectEqual(@as(usize, 2), std.mem.count(runtime_deps.CredentialRefreshMode, hooks.credential_refresh_modes.items, &.{.force}));
     try std.testing.expectEqual(types.TurnPresentationOutcome.completed, hooks.finalized_outcome.?);
 }
@@ -9726,7 +9726,7 @@ test "processQueuedPrompt waits for a sign-in on a subscription 401 after a refr
         try std.testing.expect(!waitingTextStarting(&hooks, "Gateway refused the login"));
         try std.testing.expectEqual(@as(usize, 0), hooks.system_notices.items.len);
         const asked = needUserText(&hooks) orelse return error.TestExpectedSignInWait;
-        try std.testing.expect(std.mem.startsWith(u8, asked, "Sign-in expired · waiting "));
+        try std.testing.expect(std.mem.startsWith(u8, asked, "sign-in expired · waiting "));
         try std.testing.expectEqual(types.TurnPresentationOutcome.completed, hooks.finalized_outcome.?);
     }
 }
@@ -9808,7 +9808,7 @@ test "processQueuedPrompt waiting for a sign-in resends on its own and finishes 
     try runFakePrompt(&gateway, &hooks, config, job);
 
     try std.testing.expectEqual(@as(usize, 3), gateway.request_models.items.len);
-    try std.testing.expect(std.mem.startsWith(u8, needUserText(&hooks).?, "Sign-in expired · waiting "));
+    try std.testing.expect(std.mem.startsWith(u8, needUserText(&hooks).?, "sign-in expired · waiting "));
     // The timed resends kept the sign-in status: no retry status between them.
     for (hooks.route_recovery_statuses.items) |*status| {
         try std.testing.expect(status.kind != .retrying);
@@ -9867,7 +9867,7 @@ test "processQueuedPrompt asks the out-of-credits picker and resends after credi
 
     try std.testing.expectEqual(@as(usize, 1), hooks.out_of_credits_count);
     try std.testing.expectEqual(@as(usize, 2), gateway.request_models.items.len);
-    try std.testing.expectEqualStrings("Out of credits", needUserText(&hooks).?);
+    try std.testing.expectEqualStrings("out of credits", needUserText(&hooks).?);
     try std.testing.expectEqual(types.TurnPresentationOutcome.completed, hooks.finalized_outcome.?);
 }
 
@@ -9952,7 +9952,7 @@ test "processQueuedPrompt waits for the user when a request is still too long af
     // fx compacts once on its own and sends no extra request before asking.
     try std.testing.expectEqual(@as(usize, 3), gateway.request_bodies.items.len);
     try std.testing.expectEqualStrings(
-        "Still too long after compacting · press Esc and shorten your message",
+        "still too long after compacting · press esc and shorten your message",
         needUserText(&hooks).?,
     );
     try std.testing.expectEqual(types.TurnPresentationOutcome.interrupted, hooks.finalized_outcome.?);
@@ -10004,7 +10004,7 @@ test "processQueuedPrompt dropping Fast retries the same exact model" {
     try std.testing.expectEqualStrings("zai/glm-5.2", hooks.capability_queries.items[0]);
     try std.testing.expectEqual(@as(usize, 1), countText(&hooks, "Recovered without Fast"));
     try std.testing.expectEqual(@as(usize, 0), hooks.system_notices.items.len);
-    try expectAnyModuleStatus(&hooks, .retrying, "Gateway error · retrying without Fast · attempt 4");
+    try expectAnyModuleStatus(&hooks, .retrying, "gateway error · retrying without fast · attempt 4");
     try expectRecovered(&hooks, 4);
 }
 
@@ -10031,7 +10031,7 @@ test "processQueuedPrompt keeps retrying past the old budget without invoking ro
     try std.testing.expectEqual(@as(usize, 2), gateway.request_models.items.len);
     try std.testing.expectEqual(@as(usize, 0), hooks.system_notices.items.len);
     try std.testing.expect(hooks.route_recovery_statuses.items.len >= 1);
-    try expectModuleStatus(&hooks, 0, .waiting, "Gateway error · next try in ");
+    try expectModuleStatus(&hooks, 0, .waiting, "gateway error · next try in ");
     try std.testing.expectEqual(types.TurnPresentationOutcome.interrupted, hooks.finalized_outcome.?);
 }
 

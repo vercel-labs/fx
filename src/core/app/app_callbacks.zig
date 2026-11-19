@@ -1476,12 +1476,12 @@ pub fn Bindings(comptime App: type) type {
                     .{
                         message,
                         switch (failure.source) {
-                            .fx_login => "Run /login to repair this source.",
-                            .chatgpt_subscription => "Reconnect Codex through /login to repair this source.",
-                            .grok_subscription => "Reconnect Grok through /login to repair this source.",
-                            .vercel_oidc_token, .ai_gateway_api_key, .stored_key => "Run /provider to repair this source.",
+                            .fx_login => "run /login to repair this source.",
+                            .chatgpt_subscription => "reconnect codex through /login to repair this source.",
+                            .grok_subscription => "reconnect grok through /login to repair this source.",
+                            .vercel_oidc_token, .ai_gateway_api_key, .stored_key => "run /provider to repair this source.",
                             .host_managed => credentials.host_managed_auth_message,
-                            .configured => "Check the configured provider auth environment variable.",
+                            .configured => "check the configured provider auth environment variable.",
                         },
                     },
                 )
@@ -1496,12 +1496,12 @@ pub fn Bindings(comptime App: type) type {
         fn agentAskOutOfCredits(ctx: *anyopaque) !agent_runtime.OutOfCreditsChoice {
             const agent: *AppAgent = @ptrCast(@alignCast(ctx));
             const options = [_]types.QuestionOption{
-                .{ .label = "I added credits, retry", .description = "Send the request again." },
-                .{ .label = "Switch to another model", .description = "Open the model picker with your message back in the composer." },
-                .{ .label = "Cancel this turn", .description = "Stop this request." },
+                .{ .label = "I added credits, retry", .description = "send the request again." },
+                .{ .label = "switch to another model", .description = "open the model picker with your message back in the composer." },
+                .{ .label = "cancel this turn", .description = "stop this request." },
             };
             const entry = types.QuestionBatchEntry{
-                .question = "Out of credits. What should fx do?",
+                .question = "out of credits. what should fx do?",
                 .options = &options,
             };
             const answers = try agent.worker.requestRouteRecoveryAnswerBlocking(std.heap.c_allocator, &.{entry});
@@ -2803,7 +2803,7 @@ test "web progress callback keeps typed lifecycle facts during cancellation" {
     try std.testing.expect(std.mem.find(
         u8,
         lifecycle.progress.text,
-        "Found 3 results",
+        "found 3 results",
     ) != null);
 
     app.agent().worker.active_turn_id = 0;

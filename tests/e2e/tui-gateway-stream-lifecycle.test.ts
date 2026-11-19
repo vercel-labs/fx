@@ -232,7 +232,7 @@ for (const variant of ["joined", "stopped", "late"] as const) test.skipIf(!tmuxA
       session = await TmuxSession.create({ ...options, cmd: `${JSON.stringify(FX_BIN)} --resume ${parentId}`, stderrPath: resumedStderr });
       await session.waitForStableComposer(TIMEOUT);
       const resumed = await session.captureFullScrollback();
-      expect(resumed).toContain("Sent feedback to reviewer");
+      expect(resumed).toContain("sent feedback to reviewer");
       // A report turn comes back as its subagent row, never as the user's prompt.
       expect(resumed).toContain("reviewer finished");
       expect(resumed).not.toContain("Subagent report (untrusted");
@@ -354,7 +354,7 @@ const CANONICAL_PRE_TOOL_TEXT =
 const CANONICAL_FINAL_TEXT = "FX_FINAL_RESPONSE_SENTINEL completed.";
 const CANONICAL_READ_PATH = "alpha-FX_PATH_SENTINEL.txt";
 const CANONICAL_GREP_PATTERN = "FX_PATTERN_SENTINEL";
-const APPROVAL_PROMPT = "Would you like to allow this action?";
+const APPROVAL_PROMPT = "would you like to allow this action?";
 const SPLIT_NEW_USER_PROMPT = "SPLIT_NEW_USER_PROMPT";
 const SPLIT_OLD_SENTINELS = [
   "SPLIT_OLD_HEAD",
@@ -643,7 +643,7 @@ type ToolPayloadHoldState = HoldState & {
 
 function streamingOutputTokens(scrollback: string): number | null {
   const matches = [...scrollback.matchAll(
-    /^• Generating \(\d+(?:h\d+m\d+s|m\d+s|s)\) \(↑\d+(?:\.\d)?k? ↓(\d+(?:\.\d)?k?)\)$/gm,
+    /^• generating \(\d+(?:h\d+m\d+s|m\d+s|s)\) \(↑\d+(?:\.\d)?k? ↓(\d+(?:\.\d)?k?)\)$/gm,
   )];
   const value = matches.at(-1)?.[1];
   if (!value) return null;
@@ -654,7 +654,7 @@ function streamingOutputTokens(scrollback: string): number | null {
 
 function quietToolPayloadOutputTokens(scrollback: string): number | null {
   const matches = [...scrollback.matchAll(
-    /^• Running \(\d+(?:h\d+m\d+s|m\d+s|s)\) \(↑\d+(?:\.\d)?k? ↓(\d+(?:\.\d)?k?)\)$/gm,
+    /^• running \(\d+(?:h\d+m\d+s|m\d+s|s)\) \(↑\d+(?:\.\d)?k? ↓(\d+(?:\.\d)?k?)\)$/gm,
   )];
   const value = matches.at(-1)?.[1];
   if (!value) return null;
@@ -1204,7 +1204,7 @@ function assertThinkingFramesShowSubmittedPrompt(
   for (const frameName of frameNames) {
     const frame = readFileSync(join(frameDir, frameName), "utf8");
     const rows = frame.split(/\r?\n/);
-    const thinkingRow = rows.findIndex((row) => row.includes("Thinking"));
+    const thinkingRow = rows.findIndex((row) => row.includes("thinking"));
     if (thinkingRow < 0) continue;
     thinkingFrameCount += 1;
 
@@ -1272,7 +1272,7 @@ function assertSubmittedPromptRowStaysStableAfterEnter(
   const thinkingGrid = frameNames
     .filter((name) => Number.parseInt(name, 10) > firstOutput!.index)
     .map((name) => readFileSync(join(gridDir, name), "utf8"))
-    .find((grid) => grid.includes("Thinking"));
+    .find((grid) => grid.includes("thinking"));
   expect(thinkingGrid).toBeDefined();
 
   const promptRow = (grid: string) => {
@@ -1539,7 +1539,7 @@ async function runCanonicalLifecycleFixture(
     reachedFinal = settled.matched;
     if (reachedFinal) {
       await session.sendText("/help");
-      const help = await waitForPaneOrDone(session, "commands   < All >", donePath);
+      const help = await waitForPaneOrDone(session, "commands   < all >", donePath);
       helpVisible = help.matched;
       requestCountAfterHelp = queuedGateway.requests.length;
       if (helpVisible) {
@@ -2383,7 +2383,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       const reasoningPane = await waitForScrollback(
         session!,
         (value) =>
-          /Thinking \(\d+s\) \(↑8 ↓[1-9]\d*(?:\.\d)?k?\)/.test(
+          /thinking \(\d+s\) \(↑8 ↓[1-9]\d*(?:\.\d)?k?\)/.test(
             value,
           ),
         "reasoning token progress",
@@ -2613,7 +2613,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       const nextStepPane = await waitForScrollback(
         session!,
         (value) =>
-          /• Thinking \(\d+(?:h\d+m\d+s|m\d+s|s)\) \(↑\d+(?:\.\d)?k? ↓\d+(?:\.\d)?k?\)/.test(
+          /• thinking \(\d+(?:h\d+m\d+s|m\d+s|s)\) \(↑\d+(?:\.\d)?k? ↓\d+(?:\.\d)?k?\)/.test(
             value,
           ) && !value.includes(finalSentinel),
         "thinking activity during the next admitted model step",
@@ -2768,7 +2768,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       // so the row names the tool instead of a bare "Using".
       await waitForScrollback(
         session!,
-        (value) => value.includes("Running glob_files"),
+        (value) => value.includes("running glob_files"),
         "the toolbox row naming its tool while its arguments stream in",
       );
       expect(queuedGateway.requests).toHaveLength(1);
@@ -2934,10 +2934,10 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       await session!.sendText("Trigger restricted provider.");
       // The reason goes to the transcript; the status line says what to do.
       await session!.waitForText("API access denied · HTTP 403 · Provider: wafer", TIMEOUT);
-      await session!.waitForText("The provider rejected this request · press Esc", TIMEOUT);
+      await session!.waitForText("the provider rejected this request · press esc", TIMEOUT);
       await session!.sendKeys("Escape");
       await session!.waitForPane(
-        (pane) => !pane.includes("The provider rejected this request"),
+        (pane) => !pane.includes("the provider rejected this request"),
         TIMEOUT,
       );
       const scrollback = await session!.captureFullScrollback();
@@ -3112,7 +3112,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       await session.waitForComposer(TIMEOUT);
       await session.sendText("Recover from provider route failure.");
       // The module's own countdown, refreshed once a second.
-      await session.waitForText("⚠ Gateway error · next try in 4s · attempt 1", TIMEOUT);
+      await session.waitForText("⚠ gateway error · next try in 4s · attempt 1", TIMEOUT);
       await session.waitForText("next try in 3s · attempt 1", TIMEOUT);
       await session.waitForText("next try in 2s · attempt 1", TIMEOUT);
       await session.waitForText("next try in 1s · attempt 1", TIMEOUT);
@@ -3122,24 +3122,24 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       );
       // The resend shows its retry status briefly. Its bullet blinks, so match
       // the text alone.
-      await session.waitForText("Gateway error · retrying · attempt 2", TIMEOUT);
+      await session.waitForText("gateway error · retrying · attempt 2", TIMEOUT);
       // The gateway sends no headers while a model thinks, so the response
       // stays silent. The thinking row takes the line back instead of
       // leaving "retrying" over a healthy connection.
       await session.waitForPane(
-        (pane) => pane.includes("Thinking") && !pane.includes("retrying"),
+        (pane) => pane.includes("thinking") && !pane.includes("retrying"),
         TIMEOUT,
       );
       expect(queuedGateway.requests.length).toBe(2);
 
       const inFlightPane = await session.capturePane();
-      expect(inFlightPane).not.toContain("Gateway error");
+      expect(inFlightPane).not.toContain("gateway error");
       expect(inFlightPane).not.toContain("next try in");
       expect(inFlightPane).not.toContain("attempt 2/");
 
       await session.resizeWindow(32, 24);
       const narrowPane = await session.capturePane();
-      expect(narrowPane).toContain("Thinking");
+      expect(narrowPane).toContain("thinking");
       expect(narrowPane).not.toContain("retrying");
       expect(narrowPane).not.toContain("▲");
 
@@ -3155,7 +3155,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       expect(scrollback).not.toContain("System");
       expect(scrollback).not.toContain("Attempt 1 failed. Retrying route.");
       // The status row never becomes transcript.
-      expect(scrollback).not.toContain("Gateway error ·");
+      expect(scrollback).not.toContain("gateway error ·");
       expect(scrollback).toMatch(TURN_SUMMARY_WITH_TOKENS);
       expect(scrollback).toContain(finalText);
       expect(readFileSync(stderrPath, "utf8")).toBe("");
@@ -3172,11 +3172,11 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       );
 
       await session!.sendText("Trigger content filter.");
-      await session!.waitForText("Blocked by the content filter", TIMEOUT);
+      await session!.waitForText("blocked by the content filter", TIMEOUT);
       // A request that waits for the user ends on one Esc, not two.
       await session!.sendKeys("Escape");
       await session!.waitForPane(
-        (pane) => !pane.includes("Blocked by the content filter"),
+        (pane) => !pane.includes("blocked by the content filter"),
         TIMEOUT,
       );
       await session!.waitForComposer(TIMEOUT);
@@ -3206,7 +3206,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       );
 
       await session!.sendText("Send a request the provider rejects once.");
-      await session!.waitForText("The provider rejected this request · press Esc", TIMEOUT);
+      await session!.waitForText("the provider rejected this request · press esc", TIMEOUT);
       expect(queuedGateway.requests).toHaveLength(1);
       await session!.sendKeys("Enter");
       const scrollback = await waitForScrollback(
@@ -3240,8 +3240,8 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
 
       await session!.sendText("Answer once credits are back.");
       const pane = await session!.waitForText("I added credits, retry", TIMEOUT);
-      expect(pane).toContain("Switch to another model");
-      expect(pane).toContain("Cancel this turn");
+      expect(pane).toContain("switch to another model");
+      expect(pane).toContain("cancel this turn");
       await session!.sendKeys("Enter");
       const scrollback = await waitForScrollback(
         session!,
@@ -3283,8 +3283,8 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       // The resend shows its retry status, then the thinking row takes the
       // line back while the held response stays silent. The bullet blinks,
       // so match the text alone.
-      await session!.waitForText("Gateway error · retrying · attempt 11", TIMEOUT);
-      await session!.waitForPane((pane) => pane.includes("Thinking") && !pane.includes("retrying"), TIMEOUT);
+      await session!.waitForText("gateway error · retrying · attempt 11", TIMEOUT);
+      await session!.waitForPane((pane) => pane.includes("thinking") && !pane.includes("retrying"), TIMEOUT);
       continued.release?.();
       try {
         await session!.waitForText(finalText, TIMEOUT);
@@ -3333,10 +3333,10 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       await session!.sendText("/continue");
       const unknown = await waitForScrollback(
         session!,
-        (value) => value.includes("Unknown command"),
+        (value) => value.includes("unknown command"),
         "slash continue unknown-command notice",
       );
-      expect(unknown).toContain("Unknown command. Try /help.");
+      expect(unknown).toContain("unknown command. try /help.");
       expect(queuedGateway.requests).toHaveLength(1);
 
       hold.release?.();
@@ -3397,11 +3397,11 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         // The closed window left the turn open. Reopening sends the request
         // again on its own (`tests/tla/recovery/Resume.tla` AutoResumes).
         await waitForCondition(() => resumed.started, "admitted resumed response");
-        await session.waitForText("Resuming the interrupted request", TIMEOUT);
+        await session.waitForText("resuming the interrupted request", TIMEOUT);
         // Right after the send, the status row says which attempt is
         // resuming the request; then the thinking row takes the line back.
-        await session.waitForText("Resuming the interrupted request · attempt", TIMEOUT);
-        await session.waitForPane((pane) => pane.includes("Thinking") && !pane.includes("· attempt"), TIMEOUT);
+        await session.waitForText("resuming the interrupted request · attempt", TIMEOUT);
+        await session.waitForPane((pane) => pane.includes("thinking") && !pane.includes("· attempt"), TIMEOUT);
         expect(queuedGateway.requests).toHaveLength(3);
 
         if (outcome === "finish") {
@@ -3409,14 +3409,14 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
           await session.waitForText(finalText, TIMEOUT);
         } else {
           await session.sendInterruptEscapePair(TIMEOUT);
-          await session.waitForText("What can fx do differently?", TIMEOUT);
+          await session.waitForText("what can fx do differently?", TIMEOUT);
         }
-        await session.waitForPane((pane) => !pane.includes("Resuming the interrupted request · attempt") && hasEmptyComposer(pane), TIMEOUT);
+        await session.waitForPane((pane) => !pane.includes("resuming the interrupted request · attempt") && hasEmptyComposer(pane), TIMEOUT);
         const scrollback = await session.captureFullScrollback();
         // The prompt shows once in the history; the resume line above it
         // names the session by the same text.
         expect(scrollback.split(`┃ ${prompt}`).length - 1).toBe(1);
-        expect(scrollback.split("● Read before.txt").length - 1).toBe(1);
+        expect(scrollback.split("● read before.txt").length - 1).toBe(1);
         expect(scrollback.split(finalText).length - 1).toBe(outcome === "finish" ? 1 : 0);
         expect(queuedGateway.requests).toHaveLength(3);
         expect(session.isAlive()).toBe(true);
@@ -3482,15 +3482,15 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       // The hang-up left the turn open, so reopening sends the request again
       // on its own (`tests/tla/recovery/Resume.tla` Close and AutoResumes).
       await waitForCondition(() => resumed.started, "resumed request after the hang-up");
-      await session.waitForText("Resuming the interrupted request", TIMEOUT);
+      await session.waitForText("resuming the interrupted request", TIMEOUT);
       resumed.release?.();
       await session.waitForText(finalText, TIMEOUT);
       await session.waitForPane((pane) => hasEmptyComposer(pane), TIMEOUT);
       const scrollback = await session.captureFullScrollback();
 
-      expect(scrollback).not.toContain("Cancelled");
+      expect(scrollback).not.toContain("cancelled");
       expect(scrollback.split(`┃ ${prompt}`).length - 1).toBe(1);
-      expect(scrollback.split("● Read before.txt").length - 1).toBe(1);
+      expect(scrollback.split("● read before.txt").length - 1).toBe(1);
       expect(scrollback.split(finalText).length - 1).toBe(1);
       expect(queuedGateway.requests).toHaveLength(3);
       expect(readFileSync(stderrPath, "utf8")).toBe("");
@@ -3625,13 +3625,13 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       // The close saved the request, so reopening sends it again on its own
       // (`tests/tla/recovery/Resume.tla` Close and AutoResumes).
       await waitForCondition(() => resumed.started, "resumed request after the window closed");
-      await session.waitForText("Resuming the interrupted request", TIMEOUT);
+      await session.waitForText("resuming the interrupted request", TIMEOUT);
       resumed.release?.();
       await session.waitForText(finalText, TIMEOUT);
       await session.waitForPane((pane) => hasEmptyComposer(pane), TIMEOUT);
       const scrollback = await session.captureFullScrollback();
 
-      expect(scrollback).not.toContain("Cancelled");
+      expect(scrollback).not.toContain("cancelled");
       expect(scrollback.split(`┃ ${prompt}`).length - 1).toBe(1);
       expect(scrollback.split(finalText).length - 1).toBe(1);
       expect(queuedGateway.requests).toHaveLength(2);
@@ -3670,7 +3670,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       expect(queuedGateway.requests).toHaveLength(13);
       // Both reads render inside one uninterrupted tool group now that the
       // turn no longer pauses between them, and their one row is its line.
-      expect(scrollback).toContain("● Read before.txt, after.txt");
+      expect(scrollback).toContain("● read before.txt, after.txt");
       expect(scrollback).toContain(finalText);
       expect(readFileSync(stderrPath, "utf8")).toBe("");
     },
@@ -3752,7 +3752,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
 
       await session!.sendText("Keep the canonical fallback through restart.");
       await session!.waitForText(
-        "⚠ Gateway error · next try in",
+        "⚠ gateway error · next try in",
         TIMEOUT,
       );
       expect(queuedGateway.requests).toHaveLength(1);
@@ -3831,18 +3831,18 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
 
       await session!.sendText("Cancel during provider recovery backoff.");
       await session!.waitForText(
-        /⚠ Gateway error · next try in \ds · attempt 3/,
+        /⚠ gateway error · next try in \ds · attempt 3/,
         TIMEOUT,
       );
       await session!.sendInterruptEscapePair(TIMEOUT);
-      await session!.waitForText("What can fx do differently?", TIMEOUT);
+      await session!.waitForText("what can fx do differently?", TIMEOUT);
       await session!.waitForComposer(TIMEOUT);
       const scrollback = await session!.captureFullScrollback();
 
       expect(queuedGateway.requests).toHaveLength(3);
-      expect(scrollback).toContain("What can fx do differently?");
+      expect(scrollback).toContain("what can fx do differently?");
       expect(scrollback).not.toContain("system: cancelled");
-      expect(scrollback).not.toContain("Cancelling");
+      expect(scrollback).not.toContain("cancelling");
       expect(scrollback).not.toContain("request failed: ModelError");
       expect(scrollback).not.toContain("must not send");
       expect(readFileSync(stderrPath, "utf8")).toBe("");
@@ -4183,7 +4183,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       expect(scrollback).toContain(finalText);
       expect(scrollback).toMatch(TURN_SUMMARY_WITH_TOKENS);
       // The status row never becomes transcript.
-      expect(scrollback).not.toContain("Gateway error ·");
+      expect(scrollback).not.toContain("gateway error ·");
       expect(scrollback).not.toContain("What should fx do?");
       expect(scrollback).not.toContain("request failed: ModelError");
       expect(readFileSync(stderrPath, "utf8")).toBe("");
@@ -4333,7 +4333,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       const savedSession = readSavedSession();
 
       expect(pane).toContain(finalText);
-      expect(scrollback).toContain("Couldn't read more output");
+      expect(scrollback).toContain("couldn't read more output");
       expect(continuation).toContain(expectedFailure);
       expect(savedSession).toContain('"status":"failure"');
       expect(savedSession).toContain(expectedFailure);
@@ -4382,7 +4382,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       await session.waitForComposer(TIMEOUT);
       await session.sendText("Start the streamed response.");
       await waitForCondition(() => stream.started, "stream start");
-      await session.waitForText("Thinking", TIMEOUT);
+      await session.waitForText("thinking", TIMEOUT);
       await session.sendLiteral(draft);
       const pane = await session.waitForText(draft, TIMEOUT);
 
@@ -4394,7 +4394,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
           .map((match) => match[1]!),
       );
 
-      expect(pane).toContain("Thinking");
+      expect(pane).toContain("thinking");
       expect(draftFrames).not.toHaveLength(0);
       expect(cursorVisibility.at(-1)).toBe("h");
       expect(readFileSync(stderrPath, "utf8")).toBe("");
@@ -4461,7 +4461,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         () => heldGateway.requests.length === 1 && hold.started,
         "held idle submitted prompt stream",
       );
-      await session.waitForText("Thinking", TIMEOUT);
+      await session.waitForText("thinking", TIMEOUT);
       await Bun.sleep(250);
       const thinkingGrid = await session.capturePaneGrid();
       const rowContaining = (grid: string[], needle: string) => {
@@ -4478,7 +4478,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       expect(hold.cancelled).toBe(false);
       await session.sendKeys("C-c");
       const cancelledPane = await session.waitForText(
-        "What can fx do differently?",
+        "what can fx do differently?",
         TIMEOUT,
       );
 
@@ -4565,10 +4565,10 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         () => queuedGateway.requests.length === 2 && hold.started,
         "held multi-turn submitted prompt stream",
       );
-      await session.waitForText("Thinking", TIMEOUT);
+      await session.waitForText("thinking", TIMEOUT);
       await Bun.sleep(250);
       await session.sendKeys("C-c");
-      await session.waitForText("What can fx do differently?", TIMEOUT);
+      await session.waitForText("what can fx do differently?", TIMEOUT);
 
       execFileSync(FX_BIN, ["replay", tapePath, "--frames-dir", framesRoot], {
         encoding: "utf8",
@@ -4635,7 +4635,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         () => heldGateway.requests.length === 1 && hold.started,
         "held tall idle prompt stream",
       );
-      await session.waitForText("Thinking", TIMEOUT);
+      await session.waitForText("thinking", TIMEOUT);
       // The preview already shows the tail, so wait for the head too.
       const scrollback = await waitForScrollback(
         session,
@@ -4644,7 +4644,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         10_000,
       );
       const rows = scrollback.split("\n").map((row) => row.trimEnd());
-      let previous = rows.findIndex((row) => row.includes("Run /help for commands"));
+      let previous = rows.findIndex((row) => row.includes("run /help for commands"));
       expect(previous).toBeGreaterThanOrEqual(0);
       for (const line of promptLines) {
         const matches = rows.flatMap((row, index) => (row.endsWith(line) ? [index] : []));
@@ -4654,7 +4654,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       }
 
       await session.sendKeys("C-c");
-      await session.waitForText("What can fx do differently?", TIMEOUT);
+      await session.waitForText("what can fx do differently?", TIMEOUT);
       expect(hold.cancelled).toBe(true);
       expect(readFileSync(stderrPath, "utf8")).toBe("");
       expect(session.isAlive()).toBe(true);
@@ -4715,7 +4715,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         () => heldGateway.requests.length === 1 && hold.started,
         "held turn before tall steering",
       );
-      await session.waitForText("Thinking", TIMEOUT);
+      await session.waitForText("thinking", TIMEOUT);
       await session.pasteText(steeringLines.join("\n"));
       await session.sendKeys("Enter");
       await waitForCondition(
@@ -4730,7 +4730,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         10_000,
       );
       const rows = scrollback.split("\n").map((row) => row.trimEnd());
-      let previous = rows.findIndex((row) => row.includes("Run /help for commands"));
+      let previous = rows.findIndex((row) => row.includes("run /help for commands"));
       expect(previous).toBeGreaterThanOrEqual(0);
       for (const line of [firstPrompt, ...steeringLines]) {
         const matches = rows.flatMap((row, index) => (row.endsWith(line) ? [index] : []));
@@ -4740,7 +4740,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       }
 
       await session.sendKeys("C-c");
-      await session.waitForText("What can fx do differently?", TIMEOUT);
+      await session.waitForText("what can fx do differently?", TIMEOUT);
       expect(continued.cancelled).toBe(true);
       expect(heldGateway.requests).toHaveLength(2);
       expect(readFileSync(stderrPath, "utf8")).toBe("");
@@ -4820,7 +4820,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       expect(cutoffPane).not.toContain(
         `┋ ${SPLIT_NEW_USER_PROMPT}`,
       );
-      expect(cutoffPane).toMatch(/Thinking|Generating/);
+      expect(cutoffPane).toMatch(/thinking|generating/);
       const tapeFrames = readTapeFrames(tapePath);
       const enterIndex = findEnterAfterSubmittedPrompt(tapeFrames, SPLIT_NEW_USER_PROMPT);
       const firstOutput = tapeFrames.slice(enterIndex + 1).find((frame) => frame.kind === 1)!;
@@ -4833,7 +4833,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       );
       const firstRows = firstGrid.split(/\r?\n/);
       const submittedRow = firstRows.findIndex((row) => row.includes(SPLIT_NEW_USER_PROMPT));
-      const activityRow = firstRows.findIndex((row) => /Thinking|Generating/.test(row));
+      const activityRow = firstRows.findIndex((row) => /thinking|generating/.test(row));
       expect(submittedRow).toBeGreaterThanOrEqual(0);
       expect(firstRows[submittedRow]).toContain("┃");
       expect(submittedRow).toBeLessThan(activityRow);
@@ -4849,12 +4849,12 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         session,
         (candidate) => {
           const promptIndex = candidate.lastIndexOf(SPLIT_NEW_USER_PROMPT);
-          return promptIndex >= 0 && candidate.lastIndexOf("Thinking") > promptIndex;
+          return promptIndex >= 0 && candidate.lastIndexOf("thinking") > promptIndex;
         },
         "thinking activity after the steering user row",
         3_000,
       );
-      expect(handoffScrollback.lastIndexOf("Thinking")).toBeGreaterThan(
+      expect(handoffScrollback.lastIndexOf("thinking")).toBeGreaterThan(
         handoffScrollback.lastIndexOf(SPLIT_NEW_USER_PROMPT),
       );
 
@@ -5213,7 +5213,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         () => handoffGateway.requests.length === 1 && toolHandoff.started,
         "held tool handoff response",
       );
-      await session.waitForText("Generating", TIMEOUT);
+      await session.waitForText("generating", TIMEOUT);
 
       await session.sendText(steering);
       await Bun.sleep(150);
@@ -5236,7 +5236,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         continuedBody.indexOf(toolOutput),
       );
       expect(continuedBody).toContain("<user_steering>");
-      expect(await session.captureFullScrollback()).not.toContain("Cancelled");
+      expect(await session.captureFullScrollback()).not.toContain("cancelled");
       expect(readFileSync(tracePath, "utf8")).toContain(
         "event=prompt_steering_consumed",
       );
@@ -5244,7 +5244,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         encoding: "utf8",
       });
       expect(replay).toContain(finalText);
-      expect(replay).not.toContain("Cancelled");
+      expect(replay).not.toContain("cancelled");
       expect(readFileSync(stderrPath, "utf8")).toBe("");
     },
     TIMEOUT * 2,
@@ -5306,7 +5306,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
 
       await session.waitForComposer(TIMEOUT);
       await session.sendText("Run the cooperative steering fixture.");
-      await session.waitForText("Running sleep, printf", TIMEOUT);
+      await session.waitForText("running sleep, printf", TIMEOUT);
       await session.pasteText(firstSteering);
       await session.sendKeys("Enter");
       await session.sendText(secondSteering);
@@ -5333,7 +5333,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       );
       expect(pendingComposer - pendingSteering).toBe(2);
       expect(pendingLines[pendingSteering + 1]!.trim()).toBe("");
-      expect(pendingPane).not.toContain("Waiting for tool");
+      expect(pendingPane).not.toContain("waiting for tool");
       expect(pendingPane).not.toContain("pending message");
       expect(pendingPane).not.toContain("queued 1");
       expect(steeringGateway.requests).toHaveLength(1);
@@ -5455,7 +5455,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
 
       await session.waitForComposer(TIMEOUT);
       await session.sendText("Run the rich steering tool fixture.");
-      await session.waitForText("Running sleep, printf", TIMEOUT);
+      await session.waitForText("running sleep, printf", TIMEOUT);
       await session.sendText(`/image ${imagePath}`);
       await session.waitForText("attached image: steering-image.png", TIMEOUT);
       await session.sendText(steering);
@@ -5557,7 +5557,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
 
       await session.waitForComposer(TIMEOUT);
       await session.sendText("Run the failed steering tool fixture.");
-      await session.waitForText("Running sleep, printf", TIMEOUT);
+      await session.waitForText("running sleep, printf", TIMEOUT);
       await session.sendText(steering);
       await session.waitForText(`┋ ${steering}`, TIMEOUT);
       expect(steeringGateway.requests).toHaveLength(1);
@@ -5640,7 +5640,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       try {
         await session.waitForComposer(TIMEOUT);
         await session.sendText("Run the background steering fixture.");
-        await session.waitForText("Running sleep, printf", TIMEOUT);
+        await session.waitForText("running sleep, printf", TIMEOUT);
         await session.sendText(steering);
 
         // The turn takes the steering while the command still waits for its
@@ -5653,8 +5653,8 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         expect(existsSync(finishedPath)).toBe(false);
         // The command has no exit status yet, so its row must not read "Ran".
         const backgroundScrollback = await session.captureFullScrollback();
-        expect(backgroundScrollback).toContain("Still running sleep, printf");
-        expect(backgroundScrollback).not.toContain("Ran sleep, printf");
+        expect(backgroundScrollback).toContain("still running sleep, printf");
+        expect(backgroundScrollback).not.toContain("ran sleep, printf");
         const continuedBody = steeringGateway.requests[1]!.body;
         expect(continuedBody).toContain("<user_steering>");
         expect(continuedBody).toContain(steering);
@@ -5750,7 +5750,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       try {
         await session.waitForComposer(TIMEOUT);
         await session.sendText("Run the steered escape fixture.");
-        await session.waitForText("Running printf", TIMEOUT);
+        await session.waitForText("running printf", TIMEOUT);
         await waitForCondition(
           () => existsSync(pidPath) && readTrimmed(pidPath) !== "",
           "steered escape command pid",
@@ -5871,7 +5871,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
 
         await session.sendInterruptEscapePair(TIMEOUT);
         const escaped = Date.now();
-        await session.waitForText("Cancelled · What can fx do differently?", TIMEOUT);
+        await session.waitForText("cancelled · what can fx do differently?", TIMEOUT);
         // The next prompt starts once the stops are done.
         await session.sendText("Send the next request.");
         await waitForCondition(() => steeringGateway.requests.length === 3, "next request after Escape", TIMEOUT);
@@ -6174,7 +6174,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
 
       await session.waitForComposer(TIMEOUT);
       await session.sendText("Run the immediate steering fixture.");
-      await session.waitForText("Running printf", TIMEOUT);
+      await session.waitForText("running printf", TIMEOUT);
       await waitForCondition(
         () => existsSync(pidPath) && readTrimmed(pidPath) !== "",
         "immediate steering command pid",
@@ -6260,7 +6260,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
 
       await session.waitForComposer(TIMEOUT);
       await session.sendText("Run the tty escape fixture.");
-      await session.waitForText("Running printf", TIMEOUT);
+      await session.waitForText("running printf", TIMEOUT);
       await waitForCondition(
         () => existsSync(pidPath) && readTrimmed(pidPath) !== "",
         "tty escape command pid",
@@ -6376,7 +6376,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         () => steeringGateway.requests.length === 1 && hold.started,
         "held active Gateway request",
       );
-      await session.waitForText("Generating", TIMEOUT);
+      await session.waitForText("generating", TIMEOUT);
 
       await session.sendText(`/image ${image}`);
       await session.waitForText("attached image: steering-snapshot.png", TIMEOUT);
@@ -6475,7 +6475,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       const stderrPath = join(artifacts, "stderr.log");
       const readFilename = "ACTIVE_PERMISSION_READ_SENTINEL.txt";
       // The group's only call is its header.
-      const toolHeader = `● Read ${readFilename}`;
+      const toolHeader = `● read ${readFilename}`;
       const activeBefore = "ACTIVE_PERMISSION_BEFORE_SENTINEL\n";
       const activeAfter = "ACTIVE_PERMISSION_AFTER_SENTINEL\n";
       const followupPrompt = "ACTIVE_PERMISSION_FOLLOWUP_PROMPT_SENTINEL";
@@ -6532,7 +6532,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
           return heldGateway.requests.length === 2 &&
             hold.started &&
             visible.includes(toolHeader) &&
-            visible.includes("Generating");
+            visible.includes("generating");
         },
         "the permissions panel during held post-tool continuation",
       );
@@ -6545,7 +6545,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         (pane) =>
           pane.includes(activeBefore.trim()) &&
           pane.includes(activeAfter.trim()) &&
-          !pane.includes("Generating"),
+          !pane.includes("generating"),
         TIMEOUT,
       );
       expect(heldGateway.requests).toHaveLength(2);
@@ -6557,7 +6557,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       );
       await session.waitForText(followupResponse, TIMEOUT);
       await session.waitForPane(
-        (pane) => pane.includes(followupResponse) && !pane.includes("Generating"),
+        (pane) => pane.includes(followupResponse) && !pane.includes("generating"),
         TIMEOUT,
       );
 
@@ -6624,22 +6624,22 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         () => heldGateway.requests.length === 1 && hold.started,
         "held active stream",
       );
-      await session.waitForText("Thinking", TIMEOUT);
+      await session.waitForText("thinking", TIMEOUT);
 
       await session.sendKeys("C-c");
       const afterFirst = await session.waitForText(
-        "What can fx do differently?",
+        "what can fx do differently?",
         TIMEOUT,
       );
       await waitForCondition(() => hold.cancelled, "stream cancellation");
-      expect(afterFirst).toContain("▪ Cancelled");
+      expect(afterFirst).toContain("▪ cancelled");
       expect(afterFirst).not.toContain("system: cancelled");
-      expect(afterFirst).not.toContain("Cancelling");
+      expect(afterFirst).not.toContain("cancelling");
       expect(session.isPaneAlive()).toBe(true);
 
       const scrollbackAfterFirst = await session.captureFullScrollbackEscapes();
       expect(
-        countOccurrences(scrollbackAfterFirst, "What can fx do differently?"),
+        countOccurrences(scrollbackAfterFirst, "what can fx do differently?"),
       ).toBe(1);
 
       await session.sendKeys("C-c");
@@ -6651,12 +6651,12 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
 
       const scrollback = await session.captureFullScrollback();
       const trace = readFileSync(tracePath, "utf8");
-      expect(scrollback).toContain("What can fx do differently?");
+      expect(scrollback).toContain("what can fx do differently?");
       expect(
-        countOccurrences(scrollback, "What can fx do differently?"),
+        countOccurrences(scrollback, "what can fx do differently?"),
       ).toBe(1);
       expect(scrollback).not.toContain("system: cancelled");
-      expect(scrollback).not.toContain("Cancelling");
+      expect(scrollback).not.toContain("cancelling");
       expect(countOccurrences(trace, "source=input_active_stream")).toBe(1);
       expect(readFileSync(stderrPath, "utf8")).toBe("");
       expect(existsSync(tapePath)).toBe(true);
@@ -6819,8 +6819,8 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         expect(observed.requestCount).toBe(1);
         expect(countTraceEvent(observed.trace, "before_tool_execution")).toBe(0);
         expect(observed.trace).toContain("LifecycleReconciliationCollision");
-        expect(observed.pane).toContain("● Reading");
-        expect(observed.pane).toContain(`Searching ${CANONICAL_GREP_PATTERN}`);
+        expect(observed.pane).toContain("● reading");
+        expect(observed.pane).toContain(`searching ${CANONICAL_GREP_PATTERN}`);
         expect(normalizedPane).not.toContain(CANONICAL_PRE_TOOL_TEXT);
         expect(observed.stderr).toBe(
           stage === "baseline-silent"
@@ -6849,12 +6849,12 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         );
       }
       expect(
-        countOccurrences(normalizedPane, `├ Read ${CANONICAL_READ_PATH}`),
+        countOccurrences(normalizedPane, `├ read ${CANONICAL_READ_PATH}`),
       ).toBe(1);
       expect(
         countOccurrences(
           normalizedPane,
-          `└ Searched ${CANONICAL_GREP_PATTERN}`,
+          `└ searched ${CANONICAL_GREP_PATTERN}`,
         ),
       ).toBe(1);
       expect(countOccurrences(normalizedPane, CANONICAL_FINAL_TEXT)).toBe(1);
@@ -6984,7 +6984,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       }
       // Both reads share one row that names each file, which is the group's
       // line.
-      expect(scrollback).toContain("● Read one.txt, two.txt");
+      expect(scrollback).toContain("● read one.txt, two.txt");
       expect(readFileSync(stderrPath, "utf8")).toBe("");
     },
     TIMEOUT,
@@ -7079,8 +7079,8 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
 
       // Both reads ran as one parallel group and still name their source.
       expect(readFileSync(tracePath, "utf8")).toMatch(/parallel_tool_group_start[^\n]*count=2/);
-      expect(scrollback).toContain("Searched cat source.txt output for \"PARALLEL_READ_MATCH\"");
-      expect(scrollback).toContain("Read more output from cat source.txt");
+      expect(scrollback).toContain("searched cat source.txt output for \"PARALLEL_READ_MATCH\"");
+      expect(scrollback).toContain("read more output from cat source.txt");
       expect(readFileSync(stderrPath, "utf8")).toBe("");
       await session.sendText("/quit");
       expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
@@ -7265,7 +7265,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       const introIndex = scrollback.indexOf(intro);
       const firstTableIndex = scrollback.indexOf(tableMarkers[0]!);
       expect(scrollback.slice(introIndex, firstTableIndex)).not.toMatch(
-        /(?:Thinking \(|\(↑\d)/,
+        /(?:thinking \(|\(↑\d)/,
       );
       expect(escapedScrollback).toContain(prefillMarkers[0]!);
       expect(escapedScrollback).toContain(tableMarkers.at(-1)!);
@@ -7360,14 +7360,14 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
           await session.waitForComposer(TIMEOUT);
           await session.sendText("Run the MCP fixture with the exact sentinel.");
           const approval = await session.waitForText(
-            "Allow this MCP tool call?",
+            "allow this MCP tool call?",
             TIMEOUT,
           );
           expect(approval).toContain("MCP tool");
-          expect(approval).toContain("Arguments for this request");
-          expect(approval).toContain("Allow once");
-          expect(approval).toContain("Allow this MCP tool for this session");
-          expect(approval).toContain("Deny");
+          expect(approval).toContain("arguments for this request");
+          expect(approval).toContain("allow once");
+          expect(approval).toContain("allow this MCP tool for this session");
+          expect(approval).toContain("deny");
           expect(approval).toContain(dynamicToolName);
           expect(approval).toContain(`{"text":"${argumentSentinel}"}`);
           expect(existsSync(fixture.callStartedPath)).toBe(false);
@@ -7467,7 +7467,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       await session.waitForComposer(TIMEOUT);
       await session.sendText("Run the MCP fixture with overlong arguments.");
       const approval = await session.waitForText(
-        "Allow this MCP tool call?",
+        "allow this MCP tool call?",
         TIMEOUT,
       );
       expect(approval).toContain(dynamicToolName);
@@ -7504,7 +7504,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       // The deferred call did not run, so the group ran one command.
       // The hold for project instructions gets no row, so the command that
       // ran is the group's only row and its header.
-      const header = "● Ran cat, printf ✓";
+      const header = "● ran cat, printf ✓";
       mkdirSync(join(home, ".fx"), { recursive: true });
       mkdirSync(nested, { recursive: true });
       writeFileSync(join(home, ".fx", "settings.json"), "{}");
@@ -7696,32 +7696,32 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       // The failed call is not a command, so the header keeps the command's
       // mark. The turn went on after it, so its row says only that it
       // failed, and the header does not count it.
-      const header = "● Ran a command ✓";
-      const failedRow = `├ Couldn't run ${unsupportedToolName}`;
-      const completedRow = `└ Ran ${supportedCommand}`;
+      const header = "● ran a command ✓";
+      const failedRow = `├ couldn't run ${unsupportedToolName}`;
+      const completedRow = `└ ran ${supportedCommand}`;
       const compact = await session.captureFullScrollback();
       expect(compact).toContain(`${header}\n${failedRow}\n${completedRow}`);
-      expect(countOccurrences(compact, `Couldn't run ${unsupportedToolName}`)).toBe(1);
+      expect(countOccurrences(compact, `couldn't run ${unsupportedToolName}`)).toBe(1);
       expect(compact).not.toContain(`Unsupported tool: ${unsupportedToolName}`);
-      expect(compact).not.toContain(`Failed ${unsupportedToolName}`);
-      expect(countOccurrences(compact, `Ran ${supportedCommand}`)).toBe(1);
-      expect(compact).not.toContain(`Running ${unsupportedToolName}`);
+      expect(compact).not.toContain(`failed ${unsupportedToolName}`);
+      expect(countOccurrences(compact, `ran ${supportedCommand}`)).toBe(1);
+      expect(compact).not.toContain(`running ${unsupportedToolName}`);
 
       await session.resizeWindow(72, 24);
       const resized = await session.waitForText(header, TIMEOUT);
-      expect(resized).toContain(`Couldn't run ${unsupportedToolName}`);
-      expect(resized).toContain(`Ran ${supportedCommand}`);
+      expect(resized).toContain(`couldn't run ${unsupportedToolName}`);
+      expect(resized).toContain(`ran ${supportedCommand}`);
 
       await session.sendKeys("C-o");
       // Ctrl+O gives each call its own line with its mark, without the tree marks.
       const full = await session.waitForText(
-        `● Failed ${unsupportedToolName}`,
+        `● failed ${unsupportedToolName}`,
         TIMEOUT,
       );
-      expect(full).toContain(`● Failed ${unsupportedToolName}`);
-      expect(full).toContain(`● Ran ${supportedCommand}`);
-      expect(countOccurrences(full, `Failed ${unsupportedToolName}`)).toBe(1);
-      expect(countOccurrences(full, `Ran ${supportedCommand}`)).toBe(1);
+      expect(full).toContain(`● failed ${unsupportedToolName}`);
+      expect(full).toContain(`● ran ${supportedCommand}`);
+      expect(countOccurrences(full, `failed ${unsupportedToolName}`)).toBe(1);
+      expect(countOccurrences(full, `ran ${supportedCommand}`)).toBe(1);
       await session.sendKeys("C-o");
       await session.waitForText(header, TIMEOUT);
       expect(unsupportedGateway.requests).toHaveLength(2);
@@ -7766,8 +7766,8 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       await session.waitForText(finalText, TIMEOUT);
       const resumed = await session.capturePane();
       expect(resumed).toContain(`${header}\n${failedRow}\n${completedRow}`);
-      expect(countOccurrences(resumed, `Couldn't run ${unsupportedToolName}`)).toBe(1);
-      expect(countOccurrences(resumed, `Ran ${supportedCommand}`)).toBe(1);
+      expect(countOccurrences(resumed, `couldn't run ${unsupportedToolName}`)).toBe(1);
+      expect(countOccurrences(resumed, `ran ${supportedCommand}`)).toBe(1);
       expect(unsupportedGateway.requests).toHaveLength(2);
       expect(readFileSync(resumedStderrPath, "utf8")).toBe("");
     },
@@ -7950,7 +7950,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         }
         expect(work().spawns).toBe(4);
         const scrollback = await session.captureFullScrollback();
-        expect(scrollback).toContain("Messaged reviewer");
+        expect(scrollback).toContain("messaged reviewer");
         expect(scrollback).toContain("reviewer finished");
         expect(scrollback).not.toContain("child_busy");
         expect(readFileSync(stderrPath, "utf8")).toBe("");
@@ -8049,8 +8049,8 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         await waitForCondition(() => started.size === 2, "both sibling subagents started");
         // Both messages are sent at once, and the parent's turn ends.
         // Each row names its subagent; Ctrl+O shows the task.
-        await session.waitForText("Messaged first", TIMEOUT);
-        await session.waitForText("Messaged second", TIMEOUT);
+        await session.waitForText("messaged first", TIMEOUT);
+        await session.waitForText("messaged second", TIMEOUT);
         await session.waitForText("PARALLEL_SUBAGENTS_SENT", TIMEOUT);
 
         releaseFirst(fakeGatewayFinalText("PARALLEL_FIRST_DONE"));
@@ -8147,7 +8147,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         // Every message is sent at once, while the children still work.
         await session.waitForText(finalText, TIMEOUT);
         // A row names the action and the subagent; the task is in Ctrl+O.
-        const rowSent = (index: number) => `Messaged ${rowAgents[index]}`;
+        const rowSent = (index: number) => `messaged ${rowAgents[index]}`;
         await session.waitForPane((pane) => tasks.every((_, index) => pane.includes(rowSent(index))), TIMEOUT);
         const sentRows = await session.captureFullScrollback();
         for (let index = 0; index < tasks.length; index += 1) {
@@ -8159,20 +8159,20 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
           await session.waitForText(`ROW_REPORT_READ_${index + 1}`, TIMEOUT);
         }
         const compact = await session.captureFullScrollback();
-        expect(compact).toContain("● Started subagents, read a file");
-        expect(compact).toContain("Couldn't message Invalid Agent");
-        expect(compact).not.toContain("Messaged Invalid Agent");
+        expect(compact).toContain("● started subagents, read a file");
+        expect(compact).toContain("couldn't message Invalid Agent");
+        expect(compact).not.toContain("messaged Invalid Agent");
         expect(compact).not.toContain("Check failure visibility");
         for (let index = 0; index < tasks.length; index += 1) {
           expect(countOccurrences(compact, rowSent(index))).toBe(1);
           expect(countOccurrences(compact, `${rowAgents[index]} finished`)).toBe(1);
           expect(compact).not.toContain(tasks[index]);
         }
-        expect(compact).not.toContain("Managed subagent");
+        expect(compact).not.toContain("managed subagent");
         await session.resizeWindow(45, 30);
         await session.waitForText("ROW_REPORT_READ_3", TIMEOUT);
         const narrow = await session.captureFullScrollback();
-        expect(narrow).toContain("Messaged checker");
+        expect(narrow).toContain("messaged checker");
         await session.resizeWindow(110, 35);
         await session.sendKeys("C-o");
         await session.waitForText("esc close · pgup/pgdn scroll", TIMEOUT);
@@ -8195,10 +8195,10 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         session = await TmuxSession.create({ cmd: `${FX_BIN} --resume last`, cwd: workspace, env, width: 110, height: 35, stderrPath: join(root, "resumed-stderr.log") });
         await session.waitForText("ROW_REPORT_READ_3", TIMEOUT);
         const resumed = await session.captureFullScrollback();
-        expect(resumed).toContain("● Started subagents, read a file");
-        expect(resumed).toContain("Couldn't message Invalid Agent");
-        expect(resumed).toContain("Messaged helper");
-        expect(resumed).toContain("Messaged checker");
+        expect(resumed).toContain("● started subagents, read a file");
+        expect(resumed).toContain("couldn't message Invalid Agent");
+        expect(resumed).toContain("messaged helper");
+        expect(resumed).toContain("messaged checker");
         for (const agent of rowAgents) {
           expect(countOccurrences(resumed, `${agent} finished`)).toBe(1);
         }
@@ -8245,7 +8245,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
           // begins. The gate opens as main receives its wait call, so a fast
           // build could finish the child before that wait starts. The reply
           // waits until main's row shows the wait on the working child.
-          await session?.waitForText("Waiting for helper", TIMEOUT);
+          await session?.waitForText("waiting for helper", TIMEOUT);
           return fakeGatewayFinalText("JOINED_CHILD_REPLY");
         }
         // The report joined main's running turn after its wait.
@@ -8287,9 +8287,9 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         expect(live).not.toContain("REPORT_NEVER_JOINED");
         // Main's waits say what they did, not the tool's name, and name the
         // subagent that was working when the wait began.
-        expect(live).toContain("Waited for helper");
+        expect(live).toContain("waited for helper");
         expect(live).not.toContain("Waited for subagents");
-        expect(live).not.toContain("Managed subagent");
+        expect(live).not.toContain("managed subagent");
         expect(readFileSync(stderrPath, "utf8")).toBe("");
         await session.sendText("/quit");
         expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
@@ -8302,7 +8302,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         expect(countOccurrences(resumed, row)).toBe(1);
         expect(resumed).not.toContain(header);
         // The saved result names the subagent, so the resumed row does too.
-        expect(resumed).toContain("Waited for helper");
+        expect(resumed).toContain("waited for helper");
         expect(resumed).not.toContain("Waited for subagents");
         // The saved turn kept the report, in its own frame.
         await session.sendText("AFTER_RESUME_PROMPT");
@@ -8425,39 +8425,39 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       // The three commands share one row by their steps, which is the
       // group's line; printf ran again after pwd, so it comes last. Ctrl+O
       // shows each.
-      expect(compact).toContain("● Ran pwd, printf ✓\n");
+      expect(compact).toContain("● ran pwd, printf ✓\n");
       expect(withoutWorkspaceStatusline(compact)).not.toContain(workspace);
-      expect(compact).not.toContain(`Ran ${firstCommand}`);
+      expect(compact).not.toContain(`ran ${firstCommand}`);
 
       await session.resizeWindow(80, 24);
-      await session.waitForText("● Ran pwd, printf ✓", TIMEOUT);
+      await session.waitForText("● ran pwd, printf ✓", TIMEOUT);
       await session.sendKeys("C-o");
       const fullAtTail = await session.waitForText(finalText, TIMEOUT);
       let fullAtNested = fullAtTail;
       for (let page = 0; page < 10 && !fullAtNested.includes(
-        "● Ran cd ./vercel/packages/cli/test/fixtures/unit/commands/git/connect/unlink",
+        "● ran cd ./vercel/packages/cli/test/fixtures/unit/commands/git/connect/unlink",
       ); page += 1) {
         await session.sendKeys("PPage");
         fullAtNested = await session.capturePane();
       }
       expect(fullAtNested).toContain(
-        "● Ran cd ./vercel/packages/cli/test/fixtures/unit/commands/git/connect/unlink",
+        "● ran cd ./vercel/packages/cli/test/fixtures/unit/commands/git/connect/unlink",
       );
-      expect(fullAtTail).toContain(`● Ran ${thirdCommand}`);
+      expect(fullAtTail).toContain(`● ran ${thirdCommand}`);
       expect(withoutWorkspaceStatusline(fullAtTail)).not.toContain(workspace);
 
       let fullAtFirst = await session.capturePane();
       for (
         let page = 0;
-        page < 20 && !fullAtFirst.includes(`● Ran ${firstDisplayCommand}`);
+        page < 20 && !fullAtFirst.includes(`● ran ${firstDisplayCommand}`);
         page += 1
       ) {
         await session.sendKeys("PPage");
         await Bun.sleep(50);
         fullAtFirst = await session.capturePane();
       }
-      expect(fullAtFirst).toContain(`● Ran ${firstDisplayCommand}`);
-      expect(fullAtFirst).not.toContain(`Ran ${firstCommand}`);
+      expect(fullAtFirst).toContain(`● ran ${firstDisplayCommand}`);
+      expect(fullAtFirst).not.toContain(`ran ${firstCommand}`);
       expect(withoutWorkspaceStatusline(fullAtFirst)).not.toContain(workspace);
 
       const trace = readFileSync(tracePath, "utf8");
@@ -8477,7 +8477,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       expect(readFileSync(stderrPath, "utf8")).toBe("");
 
       await session.sendKeys("C-o");
-      await session.waitForText("● Ran pwd, printf ✓", TIMEOUT);
+      await session.waitForText("● ran pwd, printf ✓", TIMEOUT);
       await session.sendText("/quit");
       expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
       await session.kill();
@@ -8493,8 +8493,8 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       });
       await session.waitForText(finalText, TIMEOUT);
       const resumed = await session.captureFullScrollback();
-      expect(resumed).toContain("● Ran pwd, printf ✓\n");
-      expect(resumed).not.toContain(`Ran ${firstCommand}`);
+      expect(resumed).toContain("● ran pwd, printf ✓\n");
+      expect(resumed).not.toContain(`ran ${firstCommand}`);
       expect(withoutWorkspaceStatusline(resumed)).not.toContain(workspace);
       expect(summaryGateway.requests).toHaveLength(2);
       expect(readFileSync(resumedStderrPath, "utf8")).toBe("");
@@ -8587,16 +8587,16 @@ test.skipIf(!tmuxAvailable())("long command rows show their steps while running 
 
     // While the command runs, the active row shows its steps in short form
     // instead of the frozen compact-bound marker.
-    await session.waitForPane((pane) => pane.includes("Running printf"), TIMEOUT);
+    await session.waitForPane((pane) => pane.includes("running printf"), TIMEOUT);
     const runningRow = stripSgr(await session.capturePane()).split("\n")
-      .find((line) => line.includes("Running printf"));
-    expect(runningRow).toBe("● Running printf, sleep, printf");
+      .find((line) => line.includes("running printf"));
+    expect(runningRow).toBe("● running printf, sleep, printf");
 
     // After settling, the completed row keeps the short form too.
     await session.waitForPane((pane) => pane.includes("RECLIP_LIVE_DONE"), TIMEOUT);
     const ranRow = stripSgr(await session.captureFullScrollback()).split("\n")
-      .find((line) => line.includes("Ran printf"));
-    expect(ranRow).toBe("● Ran printf, sleep, printf ✓");
+      .find((line) => line.includes("ran printf"));
+    expect(ranRow).toBe("● ran printf, sleep, printf ✓");
     expect(stripSgr(await session.captureFullScrollback())).not.toContain(tail);
 
     await session.sendText("/quit");

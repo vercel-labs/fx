@@ -1078,7 +1078,7 @@ pub fn CompletionRuntime(comptime App: type) type {
             const result = try applyFilePickerSelection(app, agent, selection, max_input_len, .select);
             debug_trace.logf(
                 "input",
-                "file picker Enter consumed selected={s} limit_exceeded={s}",
+                "file picker enter consumed selected={s} limit_exceeded={s}",
                 .{
                     if (result == .inserted) "true" else "false",
                     if (result == .limit_exceeded) "true" else "false",

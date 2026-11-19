@@ -28,8 +28,8 @@ async function runWithoutGatewayAuth(args: string[]) {
 }
 
 function expectNoFetchProgress(stderr: string) {
-  expect(stderr).not.toContain("Fetching ");
-  expect(stderr).not.toContain("Converting ");
+  expect(stderr).not.toContain("fetching ");
+  expect(stderr).not.toContain("converting ");
   expect(stderr).not.toContain("Extracting ");
 }
 
@@ -44,7 +44,7 @@ describe("web_fetch permission progress", () => {
       ]);
 
       expect(result.code).toBe(1);
-      expect(result.stderr).toContain("fx needs access to Vercel AI Gateway. Run fx login to sign in, fx login vercel --api-key to use an API key, or set AI_GATEWAY_API_KEY.");
+      expect(result.stderr).toContain("fx needs access to vercel AI gateway. run fx login to sign in, fx login vercel --api-key to use an API key, or set AI_GATEWAY_API_KEY.");
       expectNoFetchProgress(result.stderr);
     },
     TIMEOUT,

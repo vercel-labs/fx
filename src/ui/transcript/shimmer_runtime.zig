@@ -295,15 +295,15 @@ fn writeThinkingBlinkText(out: []u8, label: []const u8, marker_visible: bool) []
 
 test "thinking blink keeps the counter bright and dims only the token suffix" {
     var out: [256]u8 = undefined;
-    const result = writeThinkingBlinkText(&out, "• Thinking (5s) (↑10 ↓20)", true);
+    const result = writeThinkingBlinkText(&out, "• thinking (5s) (↑10 ↓20)", true);
 
-    const label_idx = std.mem.find(u8, result, "Thinking (5s)") orelse return error.TestUnexpectedResult;
+    const label_idx = std.mem.find(u8, result, "thinking (5s)") orelse return error.TestUnexpectedResult;
     const dim_idx = std.mem.find(u8, result, ui_render.dim_style) orelse return error.TestUnexpectedResult;
     const tokens_idx = std.mem.find(u8, result, "(↑10 ↓20)") orelse return error.TestUnexpectedResult;
     try std.testing.expect(label_idx < dim_idx);
     try std.testing.expect(dim_idx < tokens_idx);
 
-    const plain = writeThinkingBlinkText(&out, "• Thinking (5s)", true);
+    const plain = writeThinkingBlinkText(&out, "• thinking (5s)", true);
     try std.testing.expect(std.mem.find(u8, plain, ui_render.dim_style) == null);
 }
 
@@ -629,7 +629,7 @@ test "activity surface painter falls back to the tool label when the stack canno
     defer fixtures.shadow.deinit();
 
     _ = try paintActivityIntoSurface(&fixtures.surface, .{
-        .label = "• Thinking",
+        .label = "• thinking",
         .tool_label = "● Running read_file",
         .shimmer_pos = 0,
     });
@@ -640,7 +640,7 @@ test "activity surface painter falls back to the tool label when the stack canno
     defer target.deinit();
     try target.rowText(4, &row);
     try std.testing.expect(std.mem.find(u8, row.items, "Running read_file") != null);
-    try std.testing.expect(std.mem.find(u8, row.items, "Thinking") == null);
+    try std.testing.expect(std.mem.find(u8, row.items, "thinking") == null);
 }
 
 test "activity surface painter uses width-fitting omission markers" {
@@ -783,12 +783,12 @@ test "activity surface painter honors the thinking blink override" {
     defer visible.shadow.deinit();
 
     _ = try paintActivityIntoSurface(&hidden.surface, .{
-        .label = "• Thinking (1s)",
+        .label = "• thinking (1s)",
         .shimmer_pos = -render_request.animation_padding,
         .thinking_blink = false,
     });
     _ = try paintActivityIntoSurface(&visible.surface, .{
-        .label = "• Thinking (1s)",
+        .label = "• thinking (1s)",
         .shimmer_pos = 4,
         .thinking_blink = true,
     });

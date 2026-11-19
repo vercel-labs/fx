@@ -57,8 +57,8 @@ pub const question_hint_variants = [_][]const u8{
 
 /// The question after a prompt is chosen where the session had subagents.
 fn questionText(buf: []u8, count: usize) []const u8 {
-    if (count == 1) return "Bring 1 subagent into the fork?";
-    return std.mem.print(buf, "Bring {d} subagents into the fork?", .{count}) catch "Bring the subagents into the fork?";
+    if (count == 1) return "bring 1 subagent into the fork?";
+    return std.mem.print(buf, "bring {d} subagents into the fork?", .{count}) catch "bring the subagents into the fork?";
 }
 
 /// Row `row_index` of the question: the chosen prompt, dim, then the
@@ -206,7 +206,7 @@ test "fork menu asks once about the subagents under the chosen prompt" {
     try std.testing.expect(!prompt.selected);
     const question = try testRow(projection, 1, 40, max_inline_rows);
     defer std.testing.allocator.free(question.text);
-    try std.testing.expectEqualStrings("  Bring 2 subagents into the fork?", question.text);
+    try std.testing.expectEqualStrings("  bring 2 subagents into the fork?", question.text);
     try std.testing.expect(question.selected);
 
     // One row shows only the question; one subagent reads in the singular.
@@ -214,7 +214,7 @@ test "fork menu asks once about the subagents under the chosen prompt" {
     try std.testing.expectEqual(@as(u16, 1), menuRowCount(projection, 40, 1));
     const only = try testRow(projection, 0, 40, 1);
     defer std.testing.allocator.free(only.text);
-    try std.testing.expectEqualStrings("  Bring 1 subagent into the fork?", only.text);
+    try std.testing.expectEqualStrings("  bring 1 subagent into the fork?", only.text);
 }
 
 test "the fork question's hint keeps its keys at every width (D97)" {

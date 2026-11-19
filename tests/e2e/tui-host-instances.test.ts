@@ -251,7 +251,7 @@ function writeProfile(home: string, name: string, profile: object) {
   writeFileSync(join(dir, "profile.json"), JSON.stringify(profile));
 }
 
-const COMMAND_APPROVAL_PROMPT = "Would you like to run the following command?";
+const COMMAND_APPROVAL_PROMPT = "would you like to run the following command?";
 
 // The saved session in `sessions/v2/<id>` whose files hold `marker`, by id.
 function sessionHolding(home: string, marker: string): string | null {
@@ -697,7 +697,7 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
           const pane = await session.waitForPane((value) => value.includes(`HOST_ANSWER_${letter}`), 30_000);
           // Each instance opens with fx's welcome, on the model the launch
           // chose, and shows only its own turn.
-          expect(pane).toContain("Run /help for commands");
+          expect(pane).toContain("run /help for commands");
           expect(pane).toContain("auto · gpt-5");
           expect(pane).toContain(`fx ${index + 1}/3 \u2193`);
           expect(shownAnswers(pane)).toEqual([`HOST_ANSWER_${letter}`]);
@@ -732,7 +732,7 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
 
         await session.sendText("/launch");
         const launched = await session.waitForPane((pane) => pane.includes("fx 3/3"), 15_000);
-        expect(launched).toContain("Run /help for commands");
+        expect(launched).toContain("run /help for commands");
         expect(shownAnswers(launched)).toEqual([]);
         await session.waitForComposer(15_000);
         await session.sendText("HOST_D launched");
@@ -752,7 +752,7 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
         // A profile that won't load says why and opens nothing.
         await session.sendText("/launch nosuch");
         const refused = await session.waitForPane((pane) => pane.includes("no profile named 'nosuch'"), 15_000);
-        expect(refused).toContain("Couldn't start another fx instance: no profile named 'nosuch'. Profiles:");
+        expect(refused).toContain("couldn't start another fx instance: no profile named 'nosuch'. Profiles:");
         expect(refused).not.toContain("ProfileNotFound");
         expect(refused).toContain("fx 2/2");
       });
@@ -1611,7 +1611,7 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
         const printed = await quitWith(session, "/exit");
         const second = sessionHolding(home, "HOST_ANSWER_B");
         expect(second).not.toBeNull();
-        expect(printed).toContain(`Resume this session with:\nfx --resume ${second}\n`);
+        expect(printed).toContain(`resume this session with:\nfx --resume ${second}\n`);
         expect(printed).not.toContain(`fx --resume ${sessionHolding(home, "HOST_ANSWER_A")}`);
       });
     },
@@ -1639,12 +1639,12 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
         });
         const saved = sessionHolding(home, "HOST_ANSWER_A");
         expect(saved).not.toBeNull();
-        expect(printed).toContain(`Resume this session with:\nfx --resume ${saved}\n`);
+        expect(printed).toContain(`resume this session with:\nfx --resume ${saved}\n`);
         // Resuming it brings back fx 1 alone, with no notice about the others.
         await withHost(answerByLetter, { args: `--resume ${saved}`, reuse: { home, workspace } }, async ({ session }) => {
           const pane = await session.waitForPane((value) => value.includes("HOST_ANSWER_A"), 30_000);
           expect(pane).not.toMatch(/fx \d+\/\d+/);
-          expect(pane).not.toContain("Couldn't bring back");
+          expect(pane).not.toContain("couldn't bring back");
         });
       } finally {
         cleanupIsolatedTestHome(home);
@@ -1659,14 +1659,14 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
     async () => {
       await withHost(answerByLetter, { instances: 2, remainOnExit: true }, async ({ home, session }) => {
         await session.sendText("/close");
-        await session.waitForPane((pane) => !/fx \d+\/\d+/.test(pane) && pane.includes("Run /help for commands"), 15_000);
+        await session.waitForPane((pane) => !/fx \d+\/\d+/.test(pane) && pane.includes("run /help for commands"), 15_000);
         await session.waitForComposer(15_000);
         await session.sendText("HOST_B last one");
         await session.waitForText("HOST_ANSWER_B", 30_000);
         const printed = await quitWith(session, "/close");
         const last = sessionHolding(home, "HOST_ANSWER_B");
         expect(last).not.toBeNull();
-        expect(printed).toContain(`Resume this session with:\nfx --resume ${last}\n`);
+        expect(printed).toContain(`resume this session with:\nfx --resume ${last}\n`);
       });
     },
     TIMEOUT,
@@ -1803,7 +1803,7 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
         rmSync(join(home, ".fx", "sessions", "v2", a), { recursive: true, force: true });
         await withHost(answerByLetter, { args: `--resume ${b}`, reuse: { home, workspace } }, async ({ session }) => {
           const pane = await session.waitForPane((value) => value.includes("fx 1/2") && value.includes("HOST_ANSWER_B"), 30_000);
-          expect(pane).not.toContain("Couldn't bring back");
+          expect(pane).not.toContain("couldn't bring back");
           await switchAgent(session, "next");
           await session.waitForPane((value) => value.includes("fx 2/2") && value.includes("HOST_ANSWER_C"), 15_000);
           await session.waitForPane(() => hostRecords(home).some((ids) => ids.length === 2 && !ids.includes(a!)), 15_000);
@@ -2328,7 +2328,7 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
         await session.waitForPane((pane) => pane.includes("fx 2/2"), 15_000);
         await session.waitForComposer(15_000);
         await session.sendText("/effort low");
-        await session.waitForText("Reasoning effort set to", 15_000);
+        await session.waitForText("reasoning effort set to", 15_000);
         await session.waitForComposer(15_000);
         await promptMarker(session, "EFFORT_SECOND");
         await switchAgent(session, "previous");
@@ -2532,7 +2532,7 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
           await session.waitForPane((pane) => pane.includes("fx 2/2"), 15_000);
           await session.waitForComposer(15_000);
           await session.sendText("/effort low");
-          await session.waitForText("Reasoning effort set to", 15_000);
+          await session.waitForText("reasoning effort set to", 15_000);
           await session.waitForComposer(15_000);
           await promptMarker(session, "SAVED_TURN");
           await quitWith(session, "/exit");
@@ -2812,10 +2812,10 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
         // Ctrl+X opens the list in place of an open panel, which holds
         // typed keys.
         await session.sendText("/status");
-        await session.waitForPane((pane) => pane.includes("Step limit"), 15_000);
+        await session.waitForPane((pane) => pane.includes("step limit"), 15_000);
         await session.sendKeys("C-x");
         const list = await session.waitForPane((pane) => instanceRow(3).test(pane), 15_000);
-        expect(list).not.toContain("Step limit");
+        expect(list).not.toContain("step limit");
         expect(catalogMenuItemCount(list.split("\n"), "agents")).toBe(3);
         expect(list).toMatch(instanceRow(1));
         expect(list).toMatch(/^ {2}fx 2 {2,}new session {2,}idle {2,}\S+\s*$/m);
@@ -3142,7 +3142,7 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
         await session.waitForComposer(15_000);
         await session.sendText("HOST_R refused");
         // The provider refuses it, so it waits on fx 2's screen for Esc.
-        await session.waitForText("The provider rejected this request · press Esc", 30_000);
+        await session.waitForText("the provider rejected this request · press esc", 30_000);
         await switchAgent(session, "previous");
         await session.waitForPane((pane) => pane.includes("fx 1/2") && pane.includes("fx 2 needs you · fx 1/2 \u2193"), 15_000);
         await session.sendText("/agents");
@@ -3151,9 +3151,9 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
         await session.sendKeys("Escape");
         // Esc on its own screen ends the request, and the note goes.
         await switchAgent(session, "next");
-        await session.waitForPane((pane) => pane.includes("fx 2/2") && pane.includes("press Esc"), 15_000);
+        await session.waitForPane((pane) => pane.includes("fx 2/2") && pane.includes("press esc"), 15_000);
         await session.sendKeys("Escape");
-        await session.waitForPane((pane) => !pane.includes("The provider rejected this request"), 15_000);
+        await session.waitForPane((pane) => !pane.includes("the provider rejected this request"), 15_000);
         await switchAgent(session, "previous");
         await session.waitForPane((pane) => pane.includes("fx 1/2"), 15_000);
         await Bun.sleep(300);

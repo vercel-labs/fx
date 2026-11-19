@@ -1,4 +1,5 @@
 const std = @import("std");
+const menu_frame = @import("menu_frame.zig");
 const settings_catalog = @import("../../core/config/settings_catalog.zig");
 const display_width = @import("../../core/shared/display_width.zig");
 const text_utils = @import("../../core/shared/text_utils.zig");
@@ -87,7 +88,7 @@ fn composeSettingsRow(
         );
     }
     if (row_index == 0) {
-        return composeStyledRow(alloc, "Status line", width, ui_render.selected_completion_style);
+        return composeStyledRow(alloc, "status line", width, ui_render.selected_completion_style);
     }
     const first_choice_row: u16 = if (visible_rows == 2) 1 else settings_row_offset;
     if (row_index < first_choice_row) return empty;
@@ -128,7 +129,7 @@ fn composeWorkspaceRow(
     if (visible_rows < workspace_pinned_rows + 1) {
         const header_rows: u16 = @intFromBool(visible_rows > 1);
         if (header_rows == 1 and row_index == 0) {
-            return composeStyledRow(alloc, "Workspace", width, ui_render.selected_completion_style);
+            return composeStyledRow(alloc, "workspace", width, ui_render.selected_completion_style);
         }
         if (row_index < header_rows) return empty;
         return composeWorkspaceChoiceRow(
@@ -140,7 +141,7 @@ fn composeWorkspaceRow(
         );
     }
     return switch (row_index) {
-        0 => composeStyledRow(alloc, "Workspace", width, ui_render.selected_completion_style),
+        0 => composeStyledRow(alloc, "workspace", width, ui_render.selected_completion_style),
         1 => empty,
         2 => blk: {
             var safe_path = try text_utils.encodeTerminalSafe(
@@ -151,7 +152,7 @@ fn composeWorkspaceRow(
             defer safe_path.deinit(alloc);
             break :blk try composeLabelValueRow(
                 alloc,
-                "Primary",
+                "primary",
                 safe_path.bytes,
                 workspaceSummaryValueColumn(width),
                 width,
@@ -162,18 +163,18 @@ fn composeWorkspaceRow(
             const count = if (projection.saved_suppressed)
                 std.mem.print(
                     &count_buf,
-                    "{d} / {d} · Saved roots suppressed",
+                    "{d} / {d} · saved roots suppressed",
                     .{ projection.entries.len, workspace_access.max_additional_directories },
-                ) catch "Unavailable"
+                ) catch "unavailable"
             else
                 std.mem.print(
                     &count_buf,
                     "{d} / {d}",
                     .{ projection.entries.len, workspace_access.max_additional_directories },
-                ) catch "Unavailable";
+                ) catch "unavailable";
             break :blk try composeLabelValueRow(
                 alloc,
-                "Additional directories",
+                "additional directories",
                 count,
                 workspaceSummaryValueColumn(width),
                 width,
@@ -212,8 +213,8 @@ fn composeWorkspaceChoiceRow(
     if (choice_index == 0) {
         return composeWorkspaceActionRow(
             alloc,
-            "Add directory…",
-            "Grant access to another directory",
+            "add directory…",
+            "grant access to another directory",
             choice_index == selected,
             info_column,
             width,
@@ -240,8 +241,8 @@ fn composeWorkspaceChoiceRow(
     }
     return composeWorkspaceActionRow(
         alloc,
-        "Clear saved directories",
-        "Remove every saved additional directory",
+        "clear saved directories",
+        "remove every saved additional directory",
         choice_index == selected,
         info_column,
         width,
@@ -253,19 +254,19 @@ fn formatWorkspaceEntryStatus(
     entry: workspace_access.Entry,
 ) []const u8 {
     const availability = if (!entry.available)
-        "Unavailable"
+        "unavailable"
     else if (entry.active)
-        "Active"
+        "active"
     else
-        "Inactive";
+        "inactive";
     const source = if (entry.saved and entry.command_line)
-        "Saved + launch"
+        "saved + launch"
     else if (entry.saved)
-        "Saved"
+        "saved"
     else if (entry.command_line)
-        "Launch only"
+        "launch only"
     else
-        "Session";
+        "session";
     return std.mem.print(buf, "{s} · {s}", .{ availability, source }) catch availability;
 }
 
@@ -323,12 +324,12 @@ fn workspaceActionInfoColumn(
     const indent: usize = if (width <= 2) 0 else 2;
     const content_width: usize = width;
     var longest_label = @max(
-        display_width.visibleWidth("Add directory…"),
-        display_width.visibleWidth("Clear saved directories"),
+        display_width.visibleWidth("add directory…"),
+        display_width.visibleWidth("clear saved directories"),
     );
     var widest_info = @max(
-        display_width.visibleWidth("Grant access to another directory"),
-        display_width.visibleWidth("Remove every saved additional directory"),
+        display_width.visibleWidth("grant access to another directory"),
+        display_width.visibleWidth("remove every saved additional directory"),
     );
     for (projection.entries) |entry| {
         longest_label = @max(longest_label, text_utils.terminalSafeVisibleWidth(entry.path));
@@ -344,7 +345,7 @@ fn workspaceActionInfoColumn(
 
 fn workspaceSummaryValueColumn(width: u16) usize {
     const indent: usize = if (width <= 2) 0 else 2;
-    const longest_label = display_width.visibleWidth("Additional directories");
+    const longest_label = display_width.visibleWidth("additional directories");
     return @min(indent + longest_label + column_gap, width);
 }
 
@@ -409,7 +410,9 @@ fn composeChoiceRow(
     if (indent > 0) try row.appendSlice(alloc, "  ");
     try row.appendSlice(alloc, if (choice.selected) ui_render.selected_completion_style else ui_render.dim_style);
     const description_col = value_col;
-    try row_text.appendSingleLineEllipsized(alloc, &row, choice.label, description_col -| indent -| 2);
+    const label = try menu_frame.uiCase(alloc, choice.label);
+    defer alloc.free(label);
+    try row_text.appendSingleLineEllipsized(alloc, &row, label, description_col -| indent -| 2);
     try row.appendSlice(alloc, ui_render.reset_style);
     try row_text.appendSpacesToColumn(alloc, &row, value_col);
 
@@ -446,12 +449,12 @@ fn formatDuration(buf: anytype, duration_ms: u64) []const u8 {
     const minutes = (total_seconds % 3600) / 60;
     const seconds = total_seconds % 60;
     if (hours > 0) {
-        return std.mem.print(buf, "{d}h {d}m {d}s", .{ hours, minutes, seconds }) catch "Unavailable";
+        return std.mem.print(buf, "{d}h {d}m {d}s", .{ hours, minutes, seconds }) catch "unavailable";
     }
     if (minutes > 0) {
-        return std.mem.print(buf, "{d}m {d}s", .{ minutes, seconds }) catch "Unavailable";
+        return std.mem.print(buf, "{d}m {d}s", .{ minutes, seconds }) catch "unavailable";
     }
-    return std.mem.print(buf, "{d}s", .{seconds}) catch "Unavailable";
+    return std.mem.print(buf, "{d}s", .{seconds}) catch "unavailable";
 }
 
 test "compact status line menu renders toggled items without choose copy" {
@@ -474,22 +477,22 @@ test "compact status line menu renders toggled items without choose copy" {
 
     var header = try composeCompactCommandMenuRow(std.testing.allocator, projection, 0, rows, 80);
     defer header.deinit(std.testing.allocator);
-    try std.testing.expect(std.mem.find(u8, header.items, "Status line") != null);
-    try std.testing.expect(std.mem.find(u8, header.items, "Choose") == null);
+    try std.testing.expect(std.mem.find(u8, header.items, "status line") != null);
+    try std.testing.expect(std.mem.find(u8, header.items, "choose") == null);
 
     var workspace = try composeCompactCommandMenuRow(std.testing.allocator, projection, 4, rows, 80);
     defer workspace.deinit(std.testing.allocator);
-    try std.testing.expect(std.mem.find(u8, workspace.items, "Workspace") != null);
+    try std.testing.expect(std.mem.find(u8, workspace.items, "workspace") != null);
     try std.testing.expect(std.mem.find(u8, workspace.items, "off") != null);
 
     var context = try composeCompactCommandMenuRow(std.testing.allocator, projection, 2, rows, 80);
     defer context.deinit(std.testing.allocator);
-    try std.testing.expect(std.mem.find(u8, context.items, "Context") != null);
+    try std.testing.expect(std.mem.find(u8, context.items, "context") != null);
     try std.testing.expect(std.mem.find(u8, context.items, "off") != null);
 
     var session = try composeCompactCommandMenuRow(std.testing.allocator, projection, 3, rows, 80);
     defer session.deinit(std.testing.allocator);
-    try std.testing.expect(std.mem.find(u8, session.items, "Session") != null);
+    try std.testing.expect(std.mem.find(u8, session.items, "session") != null);
     try std.testing.expect(std.mem.find(u8, session.items, "on") != null);
 }
 
@@ -506,8 +509,8 @@ test "compact status line menu anchors options and prioritizes the selected tiny
 
     var tiny = try composeCompactCommandMenuRow(std.testing.allocator, projection, 0, 1, 80);
     defer tiny.deinit(std.testing.allocator);
-    try std.testing.expect(std.mem.find(u8, tiny.items, "Workspace") != null);
-    try std.testing.expect(std.mem.find(u8, tiny.items, "Status line") == null);
+    try std.testing.expect(std.mem.find(u8, tiny.items, "workspace") != null);
+    try std.testing.expect(std.mem.find(u8, tiny.items, "status line") == null);
 
     var medium = try composeCompactCommandMenuRow(std.testing.allocator, projection, 2, 5, 80);
     defer medium.deinit(std.testing.allocator);
@@ -515,7 +518,7 @@ test "compact status line menu anchors options and prioritizes the selected tiny
     defer wide.deinit(std.testing.allocator);
     const medium_option = std.mem.find(u8, medium.items, "off") orelse return error.TestExpectedOption;
     const wide_option = std.mem.find(u8, wide.items, "off") orelse return error.TestExpectedOption;
-    const expected_column = 2 + display_width.visibleWidth("Workspace") + 4;
+    const expected_column = 2 + display_width.visibleWidth("workspace") + 4;
     try std.testing.expectEqual(expected_column, display_width.visibleWidthIgnoringAnsi(medium.items[0..medium_option]));
     try std.testing.expectEqual(expected_column, display_width.visibleWidthIgnoringAnsi(wide.items[0..wide_option]));
 }
@@ -538,14 +541,14 @@ test "workspace menu keeps paths and status on the same width-safe row" {
     try std.testing.expectEqual(@as(u16, 8), desiredRowCount(projection, 80));
     var primary = try composeCompactCommandMenuRow(std.testing.allocator, projection, 2, 8, 120);
     defer primary.deinit(std.testing.allocator);
-    try std.testing.expect(std.mem.find(u8, primary.items, "Primary") != null);
+    try std.testing.expect(std.mem.find(u8, primary.items, "primary") != null);
     try std.testing.expect(std.mem.find(u8, primary.items, "/Users/example/Developer/Fx") != null);
 
     var entry = try composeCompactCommandMenuRow(std.testing.allocator, projection, 6, 8, 120);
     defer entry.deinit(std.testing.allocator);
     try std.testing.expect(std.mem.findScalar(u8, entry.items, '\n') == null);
     try std.testing.expect(std.mem.find(u8, entry.items, "/Users/example/Developer/Fx/docs") != null);
-    try std.testing.expect(std.mem.find(u8, entry.items, "Active · Saved") != null);
+    try std.testing.expect(std.mem.find(u8, entry.items, "active · saved") != null);
     try std.testing.expect(display_width.visibleWidthIgnoringAnsi(entry.items) <= 120);
 }
 
@@ -575,8 +578,8 @@ test "workspace menu anchors metadata and prioritizes the selected tiny action" 
 
     var header = try composeCompactCommandMenuRow(std.testing.allocator, projection, 0, 9, 80);
     defer header.deinit(std.testing.allocator);
-    try std.testing.expect(std.mem.find(u8, header.items, "Workspace") != null);
-    try std.testing.expect(std.mem.find(u8, header.items, "Workspace:") == null);
+    try std.testing.expect(std.mem.find(u8, header.items, "workspace") != null);
+    try std.testing.expect(std.mem.find(u8, header.items, "workspace:") == null);
 
     var tiny = try composeCompactCommandMenuRow(std.testing.allocator, projection, 0, 1, 100);
     defer tiny.deinit(std.testing.allocator);
@@ -586,8 +589,8 @@ test "workspace menu anchors metadata and prioritizes the selected tiny action" 
     defer medium.deinit(std.testing.allocator);
     var wide = try composeCompactCommandMenuRow(std.testing.allocator, projection, 6, 9, 180);
     defer wide.deinit(std.testing.allocator);
-    const medium_status = std.mem.find(u8, medium.items, "Active · Saved") orelse return error.TestExpectedStatus;
-    const wide_status = std.mem.find(u8, wide.items, "Active · Saved") orelse return error.TestExpectedStatus;
+    const medium_status = std.mem.find(u8, medium.items, "active · saved") orelse return error.TestExpectedStatus;
+    const wide_status = std.mem.find(u8, wide.items, "active · saved") orelse return error.TestExpectedStatus;
     const expected_column = 2 + display_width.visibleWidth("/this/is/a/much-longer-path") + 4;
     try std.testing.expectEqual(expected_column, display_width.visibleWidthIgnoringAnsi(medium.items[0..medium_status]));
     try std.testing.expectEqual(expected_column, display_width.visibleWidthIgnoringAnsi(wide.items[0..wide_status]));
@@ -620,7 +623,7 @@ test "workspace menu keeps launch-only roots visible but not selectable" {
     try std.testing.expectEqual(@as(u16, 9), desiredRowCount(projection, 80));
     var launch_only = try composeCompactCommandMenuRow(std.testing.allocator, projection, 6, 9, 80);
     defer launch_only.deinit(std.testing.allocator);
-    try std.testing.expect(std.mem.find(u8, launch_only.items, "Launch only") != null);
+    try std.testing.expect(std.mem.find(u8, launch_only.items, "launch only") != null);
     try std.testing.expect(std.mem.find(u8, launch_only.items, "❯") == null);
 
     var saved = try composeCompactCommandMenuRow(std.testing.allocator, projection, 7, 9, 80);

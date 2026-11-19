@@ -112,10 +112,10 @@ await waitFor(() => grid().includes("esc close · pgup/pgdn scroll"), "full tran
 runtime.write("\x0f");
 await waitFor(() => terminal.buffer.active.type === "normal", "full transcript close");
 
-await command("/login", "Vercel sign-in failed. The current credential is unchanged.");
-await command("/resume", "Session resume is owned by the embedding SDK");
+await command("/login", "vercel sign-in failed. the current credential is unchanged.");
+await command("/resume", "session resume is owned by the embedding SDK");
 await command("/mcp list", "MCP servers are unavailable in this host");
-await command("/skills list", "Skills are unavailable in this host");
+await command("/skills list", "skills are unavailable in this host");
 
 runtime.write("/model\r");
 await waitFor(() => grid().includes("feature-model") && grid().includes("other-model"), "model catalog menu");
@@ -202,7 +202,7 @@ async function runUltrafastTerminal(scenario) {
   async function prompt(text) {
     const count = posts.length + 1;
     runtime.write(`${text}\r`);
-    await waitFor(() => grid().includes(`ultra answer ${count}`) && !grid().includes("Thinking"), "completed reply");
+    await waitFor(() => grid().includes(`ultra answer ${count}`) && !grid().includes("thinking"), "completed reply");
     assert.equal(posts.length, count);
     return posts.at(-1);
   }
@@ -214,7 +214,7 @@ async function runUltrafastTerminal(scenario) {
   }
   try {
     await runtime.interactive;
-    await waitFor(() => grid().includes("Run /help for commands"), "startup frame");
+    await waitFor(() => grid().includes("run /help for commands"), "startup frame");
     assert.equal(gets, 0, "Ultrafast must not add synchronous catalog I/O to startup");
     if (scenario === "unsupported") {
       runtime.write("unsupported ultra request\r");
@@ -228,7 +228,7 @@ async function runUltrafastTerminal(scenario) {
       await waitFor(() => gets === 1, "pending catalog request");
       assert.equal(posts.length, 0);
       runtime.write("\x03");
-      await waitFor(() => grid().includes("Cancelled") || grid().includes("cancelled"), "cancelled turn");
+      await waitFor(() => grid().includes("cancelled") || grid().includes("cancelled"), "cancelled turn");
       assert.equal(catalogAborted, 1);
       assert.equal(posts.length, 0);
       runtime.write("/ultrafast off\r");
@@ -390,7 +390,7 @@ async function runFastTerminal(scenario, sessionStore = createFastSessionStore()
   async function prompt(text) {
     const count = posts.length + 1;
     runtime.write(`${text}\r`);
-    await waitFor(() => posts.length === count && grid().includes(`${scenario} fast answer ${count}`) && !grid().includes("Thinking"), "completed reply");
+    await waitFor(() => posts.length === count && grid().includes(`${scenario} fast answer ${count}`) && !grid().includes("thinking"), "completed reply");
     assert.equal(posts.length, count);
     assert.ok(JSON.stringify(posts.at(-1).prompt).includes(text), "the reply must belong to the submitted prompt");
     return posts.at(-1);
@@ -407,7 +407,7 @@ async function runFastTerminal(scenario, sessionStore = createFastSessionStore()
   }
   try {
     await runtime.interactive;
-    await waitFor(() => grid().includes(resumed ? "session resumed" : "Run /help for commands"), "startup frame");
+    await waitFor(() => grid().includes(resumed ? "session resumed" : "run /help for commands"), "startup frame");
     assert.equal(gets, 0, "Fast must not add synchronous catalog I/O to startup");
     assert.equal(posts.length, 0);
     assert.deepEqual(configReads, ["model", "mode"]);
@@ -416,7 +416,7 @@ async function runFastTerminal(scenario, sessionStore = createFastSessionStore()
       await waitFor(() => gets === 1, "pending catalog request");
       assert.equal(posts.length, 0);
       runtime.write("\x03");
-      await waitFor(() => catalogSignal.aborted && (grid().includes("Cancelled") || grid().includes("cancelled")), "cancelled turn");
+      await waitFor(() => catalogSignal.aborted && (grid().includes("cancelled") || grid().includes("cancelled")), "cancelled turn");
       assert.equal(catalogAborted, 1);
       assert.equal(posts.length, 0, "cancelled metadata resolution must not send a model request");
       await toggle(false);

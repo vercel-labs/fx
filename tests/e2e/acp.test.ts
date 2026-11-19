@@ -1249,7 +1249,7 @@ test("ACP finishes tool calls that a cancel stopped before they ran", async () =
     expect(slowFinals.map((update: any) => update.status)).toEqual(["failed"]);
     const skipped = updates("call_skipped");
     expect(skipped.map((update: any) => update.status)).toEqual(["pending", "failed"]);
-    expect(acpContentText(skipped[1].content)).toBe("Cancelled");
+    expect(acpContentText(skipped[1].content)).toBe("cancelled");
     expect(client.stderr).toBe("");
   } finally {
     await client?.close();
@@ -1286,7 +1286,7 @@ test("ACP finishes a provider search the turn ended before it finished", async (
       .filter((message: any) => message.method === "session/update" && message.params?.update?.toolCallId === "search_open")
       .map((message: any) => message.params.update);
     expect(search.map((update: any) => update.status)).toEqual(["pending", "failed"]);
-    expect(acpContentText(search[1].content)).toBe("Tool completion was not reported");
+    expect(acpContentText(search[1].content)).toBe("tool completion was not reported");
     expect(client.stderr).toBe("");
   } finally {
     await client?.close();
@@ -2253,7 +2253,7 @@ describe("acp: model-independent", () => {
         // The module's status shape, then a `recovered` that carries only the
         // attempt that succeeded.
         expect(allUpdates).toMatch(
-          /"modelResponseRecovery":\{"state":"waiting","attempt":1,"message":"Connection lost · next try in 1s · attempt 1"\}/,
+          /"modelResponseRecovery":\{"state":"waiting","attempt":1,"message":"connection lost · next try in 1s · attempt 1"\}/,
         );
         expect(allUpdates).toContain(
           '"modelResponseRecovery":{"state":"recovered","attempt":4}',
@@ -8325,7 +8325,7 @@ describe("acp: model-independent", () => {
         client = await AcpClient.create({ cwd: root.workspace, env });
         const refused = await client.request("initialize", { protocolVersion: 1 }, 1) as any;
         expect(refused.error?.message).toBe(
-          "no Codex model is selected; run `fx provider codex` to choose one, or set a model for this run with --model or FX_MODEL",
+          "no codex model is selected; run `fx provider codex` to choose one, or set a model for this run with --model or FX_MODEL",
         );
         await client.close();
 
@@ -11168,9 +11168,9 @@ describe("acp: model-independent", () => {
           content: "first\n",
         });
         expect(permission.params.options).toEqual([
-          { optionId: "allow_once", name: "Allow once", kind: "allow_once" },
-          { optionId: "allow_always", name: "Allow for this session", kind: "allow_always" },
-          { optionId: "reject_once", name: "Reject", kind: "reject_once" },
+          { optionId: "allow_once", name: "allow once", kind: "allow_once" },
+          { optionId: "allow_always", name: "allow for this session", kind: "allow_always" },
+          { optionId: "reject_once", name: "reject", kind: "reject_once" },
         ]);
         const pendingIndex = first.messages.findIndex(
           (message: any) =>
@@ -13453,7 +13453,7 @@ describe("acp: model-independent", () => {
           [6, "session/set_mode", { modeId: "yolo" }],
         ] as const) {
           const response = await client.request(method, params, id) as any;
-          expect(response.error).toMatchObject({ code: -32602, message: "Unknown mode" });
+          expect(response.error).toMatchObject({ code: -32602, message: "unknown mode" });
         }
         expect(savedMode()).toBe("ask");
 

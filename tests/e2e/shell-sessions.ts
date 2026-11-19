@@ -266,7 +266,7 @@ export class Shell {
     await settled(this.session);
     await this.session.sendKeys("C-u");
     this.panelsShown[title]++;
-    const own = title === "Status" ? /^ {2}Session grants {2,}\S/ : /^ {2}Change mode {2,}\S/;
+    const own = title === "Status" ? /^ {2}session grants {2,}\S/ : /^ {2}change mode {2,}\S/;
     const left = lines(await this.session.captureFullScrollback()).filter((line) => own.test(line));
     if (left.length > 0) throw new Error(`the ${title} panel left its text in the terminal: ${left.join(" | ")}`);
     return opened;

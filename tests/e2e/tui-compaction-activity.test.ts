@@ -245,7 +245,7 @@ async function fixture(trigger: Trigger, outcome: Outcome = "success", longResum
   }
   try {
     for (let turn = 1; turn <= seedTurns; turn++) {
-      const reply = await cli(["ask", "--json", "--auto", ...(sessionId ? ["--resume", sessionId] : []), `Seed ordinary historical turn ${turn}.`], "Reading seed-notes.txt\n");
+      const reply = await cli(["ask", "--json", "--auto", ...(sessionId ? ["--resume", sessionId] : []), `Seed ordinary historical turn ${turn}.`], "reading seed-notes.txt\n");
       if (sessionId) expect(reply.session_id).toBe(sessionId);
       else sessionId = reply.session_id;
       expect(sessionId).toBeTruthy();
@@ -304,7 +304,7 @@ async function assertLive(terminal: InstanceType<typeof TmuxSession>) {
     markers.add(rows[0].includes("•"));
     return markers.size === 2 && !rows[0].includes(clock);
   }, 5000);
-  expect(later.match(/Compacting/g)).toHaveLength(1);
+  expect(later.match(/compacting/g)).toHaveLength(1);
 }
 
 describe.skipIf(!tmuxAvailable())("tui: compaction activity", () => {
@@ -340,7 +340,7 @@ describe.skipIf(!tmuxAvailable())("tui: compaction activity", () => {
           expect(f.counts().summaries).toBe(2);
         } else {
           await until(() => f.counts().ordinary === f.seedTurns + (trigger === "overflow" ? 2 : 1), "ordinary request after compaction");
-          const pane = await terminal.waitForText(/Thinking \(/, 10_000);
+          const pane = await terminal.waitForText(/thinking \(/, 10_000);
           expect(pane).not.toMatch(ACTIVITY);
           expect(f.lastRequest()).toContain("INTERNAL_HANDOFF_4e12");
           f.ordinaryHold.release("CURRENT_TURN_OK_f713");
@@ -583,8 +583,8 @@ describe.skipIf(!tmuxAvailable())("tui: compaction activity", () => {
           } else f.summaryHold.release("");
         }
         const feedback = outcome === "cancel"
-          ? "Compaction cancelled. Try /compact again when ready."
-          : "Compaction failed. Try /compact again.";
+          ? "compaction cancelled. try /compact again when ready."
+          : "compaction failed. try /compact again.";
         await terminal.waitForPane((pane) => !ACTIVITY.test(pane) && pane.includes(feedback) && hasEmptyComposer(pane), 15_000);
         expect(f.durable()).toBe(0);
         expect(f.counts().ordinary).toBe(f.seedTurns);
@@ -628,19 +628,19 @@ describe.skipIf(!tmuxAvailable())("tui: compaction activity", () => {
         const terminal = await f.launch();
         await terminal.sendText("Cancel this held response.");
         await until(() => trigger === "auto" ? f.counts().summaries === 1 : f.counts().ordinary === 2, "held cancellation boundary");
-        await terminal.waitForText(trigger === "auto" ? ACTIVITY : /Thinking \(/, 10_000);
+        await terminal.waitForText(trigger === "auto" ? ACTIVITY : /thinking \(/, 10_000);
         await terminal.sendInterruptEscapePair(10_000);
         if (trigger === "auto") {
-          await terminal.waitForText("Compaction cancelled.", 10_000);
+          await terminal.waitForText("compaction cancelled.", 10_000);
           // An empty composer already exists while feedback is visible. Wait
           // for Escape's visible acknowledgement, not a fixed sendKeys delay,
           // so the slash in /quit cannot become part of a Meta key sequence.
           terminal.sendKeysImmediate(["Escape"]);
         } else {
-          await terminal.waitForText("Cancelled", 10_000);
+          await terminal.waitForText("cancelled", 10_000);
         }
         await terminal.waitForPane((pane) => hasEmptyComposer(pane) &&
-          !/Compaction cancelled|Compacting|Thinking/.test(pane), 5000);
+          !/Compaction cancelled|compacting|thinking/.test(pane), 5000);
         const interruptions = () => f.savedEvents().trim().split("\n")
           .map((line) => JSON.parse(line)).filter((line) => line.kind === "item" && line.type === "interruption");
         await until(() => interruptions().length === 1, "durable cancellation", 5000);
@@ -663,7 +663,7 @@ describe.skipIf(!tmuxAvailable())("tui: compaction activity", () => {
         await reopened.sendKeys("End");
         const full = await reopened.waitForPane((pane) => pane.includes("Cancel this held response."), 5000);
         writeFileSync(join(f.root, "cancellation-reopened.txt"), full);
-        expect(full.includes("Cancelled")).toBe(trigger === "ordinary");
+        expect(full.includes("cancelled")).toBe(trigger === "ordinary");
         expect(withoutCompactionCallLines(full)).not.toMatch(COMPACTION_OUTPUT);
         await reopened.sendKeys("C-o");
         await reopened.waitForComposer(5000);
@@ -689,7 +689,7 @@ describe.skipIf(!tmuxAvailable())("tui: compaction activity", () => {
     try {
       const terminal = await f.launch(false, false);
       await terminal.sendText("/compact");
-      await terminal.waitForText("Compaction failed. Try /compact again.", 15_000);
+      await terminal.waitForText("compaction failed. try /compact again.", 15_000);
       expect(f.durable()).toBe(0);
       f.phase("followup");
       await terminal.sendText("/compact");
@@ -736,7 +736,7 @@ describe.skipIf(!tmuxAvailable())("tui: compaction activity", () => {
     let passed = false;
     try {
       const terminal = await f.launch(true);
-      const authMessage = "fx needs access to Vercel AI Gateway";
+      const authMessage = "fx needs access to vercel AI gateway";
       async function authNotices(label: string) {
         await terminal.sendKeys("C-o");
         await terminal.waitForText("esc close · pgup/pgdn scroll", 5000);
@@ -750,7 +750,7 @@ describe.skipIf(!tmuxAvailable())("tui: compaction activity", () => {
       const initialNotices = await authNotices("auth-before");
       expect(initialNotices).toBeGreaterThan(0);
       await terminal.sendText("/compact");
-      await terminal.waitForText("Compaction was not started.", 5000);
+      await terminal.waitForText("compaction was not started.", 5000);
       expect(f.counts().summaries).toBe(0);
       expect(f.counts().ordinary).toBe(f.seedTurns);
       expect(f.durable()).toBe(0);
@@ -773,7 +773,7 @@ describe.skipIf(!tmuxAvailable())("tui: compaction activity", () => {
       const terminal = await f.launch();
       await terminal.sendText("Ordinary control request.");
       await until(() => f.counts().ordinary === 2, "ordinary held request");
-      await terminal.waitForText(/Thinking \(/, 5000);
+      await terminal.waitForText(/thinking \(/, 5000);
       expect(f.counts().summaries).toBe(0);
       expect(f.durable()).toBe(0);
       f.ordinaryHold.release("ORDINARY_CONTROL_OK_727a");
@@ -838,7 +838,7 @@ describe.skipIf(!tmuxAvailable())("tui: compaction activity", () => {
       await terminal.waitForStableComposer(15_000);
       await terminal.sendText(task);
       // The command's row shows its steps in short form while it runs.
-      await terminal.waitForText("Running printf, sleep", 15_000);
+      await terminal.waitForText("running printf, sleep", 15_000);
       await terminal.sendText(steering);
       await until(() => summaryBodies.length === 1, "automatic compaction", 60_000);
       await terminal.waitForText("STEER_DONE_8d4", 20_000);
@@ -945,7 +945,7 @@ describe.skipIf(!tmuxAvailable())("tui: compaction activity", () => {
       const id = onlySessionId(home);
       await terminal.sendText("/compact");
       await until(() => logLines(home, id).some((line) => line.kind === "compacted"), "the compaction");
-      await terminal.waitForPane((pane) => !/Preparing compaction|Compacting/.test(pane) && hasEmptyComposer(pane), 15_000);
+      await terminal.waitForPane((pane) => !/preparing compaction|compacting/.test(pane) && hasEmptyComposer(pane), 15_000);
       // The turn across the compaction ends, so the window lets the older
       // cycle go and Ctrl+O's newest page joins it from the log.
       await terminal.sendText("One more turn.");
@@ -1044,7 +1044,7 @@ describe.skipIf(!tmuxAvailable())("tui: compaction activity", () => {
       expect(summaryTokens.slice(1).length).toBeGreaterThan(0);
       expect(summaryTokens.slice(1).every((token) => token === "rotated-token")).toBe(true);
       expect(issuer.refreshes).toHaveLength(0);
-      expect(await terminal.capturePane()).not.toContain("Compaction failed");
+      expect(await terminal.capturePane()).not.toContain("compaction failed");
       // The next request carries the compacted context.
       await terminal.sendText("Follow the latest request.");
       await terminal.waitForPane((pane) => pane.includes(FOLLOWUP) && hasEmptyComposer(pane), 15_000);

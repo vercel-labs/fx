@@ -31,7 +31,7 @@ import {
 
 const TIMEOUT = 30_000;
 const MODEL = "openai/gpt-5";
-const COMMAND_APPROVAL_PROMPT = "Would you like to run the following command?";
+const COMMAND_APPROVAL_PROMPT = "would you like to run the following command?";
 
 type IsolatedRoot = {
   root: string;
@@ -190,7 +190,7 @@ function startGateway(
 async function runTrace(session: TmuxSession, tmp: string): Promise<TraceReport> {
   const before = new Set(traceReportNames(tmp));
   await session.sendText("/trace");
-  await waitForEither(session, ["Clipboard copy failed", "Trace saved at"], TIMEOUT);
+  await waitForEither(session, ["clipboard copy failed", "trace saved at"], TIMEOUT);
   return waitForNewTraceReport(tmp, before);
 }
 

@@ -393,7 +393,7 @@ test "installed projection retains saved output and fallback after source dispos
     const entries = [_]transcript_blocks.TranscriptEntry{.{ .raw_bytes = .{
         .id = 1,
         .created_at_ms = 0,
-        .bytes = @constCast("Read fixture.txt\n"),
+        .bytes = @constCast("read fixture.txt\n"),
         .class = .tool_status,
     } }};
     var projection = try full_transcript_screen.buildProjection(
@@ -423,7 +423,7 @@ test "installed projection retains saved output and fallback after source dispos
     defer alloc.free(rendered);
     try std.testing.expect(std.mem.find(u8, rendered, "SAVED_HEAD") != null);
     try std.testing.expect(std.mem.find(u8, rendered, "SAVED_TAIL") != null);
-    try std.testing.expect(std.mem.find(u8, rendered, "Full saved result unavailable.") == null);
+    try std.testing.expect(std.mem.find(u8, rendered, "full saved result unavailable.") == null);
 
     // A newly built view must still have a readable preview if the file disappears.
     try result_store.deleteManaged(&installed.capability.?, installed.details.items[0].result_handle.?);
@@ -448,7 +448,7 @@ test "installed projection retains saved output and fallback after source dispos
     );
     defer alloc.free(fallback);
     try std.testing.expect(std.mem.find(u8, fallback, "retained preview") != null);
-    try std.testing.expect(std.mem.find(u8, fallback, "Full saved result unavailable.") != null);
+    try std.testing.expect(std.mem.find(u8, fallback, "full saved result unavailable.") != null);
 }
 
 pub const Load = struct {

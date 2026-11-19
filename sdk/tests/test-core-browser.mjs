@@ -320,7 +320,7 @@ try {
     );
     expect(result.state === "completed", result.error || `unexpected terminal state ${result.state}`);
     expect(result.code === 0, `unexpected terminal exit code ${result.code}`);
-    expect(result.output.includes("Run /help for commands"), "browser terminal startup output missing");
+    expect(result.output.includes("run /help for commands"), "browser terminal startup output missing");
     expect(result.inputTaskRanDuringStream, "browser terminal input task was blocked until the buffered stream finished");
     expect(result.draftRenderedDuringStream, "browser terminal input rendered only after the stream source closed");
     expect(result.activeClearFetchAborted, "active /clear did not abort the browser fetch");

@@ -379,7 +379,7 @@ pub const FileReview = struct {
 
         if (self.additions == 0 and self.deletions == 0) {
             if (count == 1) {
-                lines[0] = .{ .op = .notice, .text = "No content changes" };
+                lines[0] = .{ .op = .notice, .text = "no content changes" };
             }
             return .{ .lines = lines, .total_rows = total_rows };
         }
@@ -1071,7 +1071,7 @@ pub fn captureReviewLines(
     var capture = ReviewCapture{ .alloc = alloc, .max_text_bytes = max_text_bytes };
     errdefer capture.deinit();
     if (review.additions == 0 and review.deletions == 0) {
-        capture.append(.{ .op = .notice, .text = "No content changes" });
+        capture.append(.{ .op = .notice, .text = "no content changes" });
     } else switch (review.mode) {
         .computed => |source| visitComputedReviewRows(source, &capture),
         .fallback => |fallback| {
@@ -1573,7 +1573,7 @@ fn selectComputedLines(
     selected: *[max_preview_lines]SelectedLine,
 ) ComputedSelection {
     if (total_changed == 0) {
-        selected[0] = .{ .op = .notice, .text = "No changes" };
+        selected[0] = .{ .op = .notice, .text = "no changes" };
         return .{ .output_count = 1, .truncated = false };
     }
     if (total_changed > max_lines) {
@@ -1874,7 +1874,7 @@ fn initializeSelection(
     plan: SelectionPlan,
 ) void {
     if (plan.output_count == 1 and plan.head_count == 0 and !plan.truncated) {
-        selected[0] = .{ .op = .notice, .text = "No changes" };
+        selected[0] = .{ .op = .notice, .text = "no changes" };
     } else if (plan.truncated) {
         selected[plan.head_count] = .{ .op = .elision, .text = "" };
     }

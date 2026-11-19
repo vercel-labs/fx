@@ -602,7 +602,7 @@ pub fn Runtime(comptime App: type) type {
             if (err != error.InvalidSessionFormat) return;
             const problem = store.conversionProblem() orelse return;
             var buffer: [640]u8 = undefined;
-            const body = std.mem.print(&buffer, "This session can't be converted (InvalidSessionFormat): {s}", .{problem}) catch problem;
+            const body = std.mem.print(&buffer, "this session can't be converted (InvalidSessionFormat): {s}", .{problem}) catch problem;
             app.writeDomainNotice(.{ .topic = "session", .tone = .@"error", .body = body }, true) catch |write_err|
                 debug_trace.logf("convert", "action=NoticeDropped err={s}", .{@errorName(write_err)});
         }
@@ -879,7 +879,7 @@ pub fn Runtime(comptime App: type) type {
                         app.writeDomainNotice(.{
                             .topic = "session",
                             .tone = .warning,
-                            .body = "Session change cancelled after a terminal resize. The old session was kept; an active turn may have been cancelled. Retry the command.",
+                            .body = "session change cancelled after a terminal resize. the old session was kept; an active turn may have been cancelled. retry the command.",
                         }, true) catch |notice_err| {
                             debug_trace.logf("session", "event=transition_cancel_notice_dropped err={s}", .{@errorName(notice_err)});
                         };
@@ -891,15 +891,15 @@ pub fn Runtime(comptime App: type) type {
         }
 
         pub fn cancelPendingLiveSessionForInputLimit(app: *App, agent: *AppAgent) !void {
-            try cancelPendingLiveSessionForInput(app, agent, "deferred_input_limit", "Session change cancelled because input arrived faster than it could finish. Your input is still being delivered to the old session; retry the command.");
+            try cancelPendingLiveSessionForInput(app, agent, "deferred_input_limit", "session change cancelled because input arrived faster than it could finish. your input is still being delivered to the old session; retry the command.");
         }
 
         pub fn cancelPendingLiveSessionForTimeout(app: *App, agent: *AppAgent) !void {
-            try cancelPendingLiveSessionForInput(app, agent, "resize_timeout", "Session change cancelled because the terminal resize did not settle. Continuing in the old session; retry the command.");
+            try cancelPendingLiveSessionForInput(app, agent, "resize_timeout", "session change cancelled because the terminal resize did not settle. continuing in the old session; retry the command.");
         }
 
         fn cancelPendingLiveSessionForWorkerTimeout(app: *App, agent: *AppAgent) !void {
-            try cancelPendingLiveSessionForInput(app, agent, "worker_timeout", "Session change cancelled because the active turn did not stop. Continuing in the old session; retry the command.");
+            try cancelPendingLiveSessionForInput(app, agent, "worker_timeout", "session change cancelled because the active turn did not stop. continuing in the old session; retry the command.");
         }
 
         fn cancelPendingLiveSessionForInput(app: *App, agent: *AppAgent, reason: []const u8, notice: []const u8) !void {
@@ -1220,7 +1220,7 @@ pub fn Runtime(comptime App: type) type {
             app.writeDomainNotice(.{
                 .topic = "session",
                 .tone = .neutral,
-                .body = "Interrupted turn · /resume to continue",
+                .body = "interrupted turn · /resume to continue",
             }, true) catch |err| {
                 debug_trace.logf("session", "event=interrupted_turn_hint_failed err={s}", .{@errorName(err)});
             };
@@ -2440,7 +2440,7 @@ pub fn Runtime(comptime App: type) type {
                     if (comptime @hasDecl(App, "writeDomainNotice")) {
                         var plain_buf: [96]u8 = undefined;
                         const body = try app.alloc.print(
-                            "Couldn't save this turn: {s}. It may be missing when you reopen this session.",
+                            "couldn't save this turn: {s}. it may be missing when you reopen this session.",
                             .{types.plainErrorText(@errorName(failure), &plain_buf)},
                         );
                         defer app.alloc.free(body);
@@ -3071,7 +3071,7 @@ pub fn Runtime(comptime App: type) type {
                     const line = try transcript_runtime.formatHistoricalToolStatusLine(
                         self.app.alloc,
                         .cancelled,
-                        "Cancelled",
+                        "cancelled",
                     );
                     defer self.app.alloc.free(line);
                     try self.app.writeTranscriptClassified(
@@ -3388,7 +3388,7 @@ pub fn Runtime(comptime App: type) type {
                     const line = try transcript_runtime.formatHistoricalToolStatusLine(
                         self.projection.alloc,
                         .cancelled,
-                        "Cancelled",
+                        "cancelled",
                     );
                     defer self.projection.alloc.free(line);
                     _ = try self.projection.appendRawClassified(
@@ -4012,7 +4012,7 @@ pub fn Runtime(comptime App: type) type {
                     // selecting that line copies only the command. The blank
                     // line keeps a row between it and the input box while it
                     // is the newest entry.
-                    const lines = try app.alloc.print("Resume the original session with:\nfx --resume {s}\n\n", .{source_id});
+                    const lines = try app.alloc.print("resume the original session with:\nfx --resume {s}\n\n", .{source_id});
                     defer app.alloc.free(lines);
                     try sink.appendRaw(lines);
                 },
@@ -4153,7 +4153,7 @@ pub fn Runtime(comptime App: type) type {
                 action_arena.allocator(),
                 call,
                 historicalSessionTarget(action_arena.allocator(), labels, call),
-                "Cancelled",
+                "cancelled",
                 &.{},
             );
             const entry_id = try writeCompletedToolStatus(sink, .cancelled, action);
@@ -4378,7 +4378,7 @@ pub fn Runtime(comptime App: type) type {
             else
                 null;
             // A shell run that returned its command running, captured or tty,
-            // has no exit status and reads "Still running", as it did live.
+            // has no exit status and reads "still running", as it did live.
             const outcome_decision = command_decision orelse terminal_action_decision orelse
                 try tool_presentation.runningCommandDecision(action_arena.allocator(), call, result.output);
             const formatted_action_base = if (deferred)
@@ -4782,7 +4782,7 @@ pub fn Runtime(comptime App: type) type {
             call: types.ToolCall,
         ) !void {
             const status = try app.alloc.print(
-                "● Tool completion was not reported: {s}",
+                "● tool completion was not reported: {s}",
                 .{call.name},
             );
             defer app.alloc.free(status);
@@ -6188,12 +6188,12 @@ const TestApp = struct {
             _ = try arena.dupe(u8, "temporary parsed arguments");
         }
         if (std.mem.eql(u8, call.name, "run_command")) {
-            return arena.dupe(u8, "● Ran pwd");
+            return arena.dupe(u8, "● ran pwd");
         }
         if (display_target) |target| {
-            return arena.print("● Completed {s} {s}", .{ call.name, target });
+            return arena.print("● completed {s} {s}", .{ call.name, target });
         }
-        return arena.print("● Completed {s}", .{call.name});
+        return arena.print("● completed {s}", .{call.name});
     }
 
     fn describeToolActionDeniedWithAdvertised(self: *TestApp, _: anytype, arena: Allocator, call: types.ToolCall, _: ?[]const u8, label: []const u8, _: []const []const u8) ![]const u8 {
@@ -6484,7 +6484,7 @@ test "js-host resume store failures and missing records fall back to fresh sessi
         try std.testing.expect(!std.mem.eql(u8, "unusable-session", owner.state.id));
         try std.testing.expectEqual(@as(usize, 0), owner.state.history.len);
         try std.testing.expect(owner.revision == null);
-        try std.testing.expect(std.mem.find(u8, app.transcript.items, "Run /help for commands") != null);
+        try std.testing.expect(std.mem.find(u8, app.transcript.items, "run /help for commands") != null);
     }
 }
 
@@ -7252,7 +7252,7 @@ test "execution replay keeps an inline command preview when its stored output is
 
     try std.testing.expectEqual(@as(usize, 0), app.notices.items.len);
     try std.testing.expectEqual(@as(usize, 1), app.completed_tool_statuses.items.len);
-    try std.testing.expectEqualStrings("● Ran pwd\n", app.completed_tool_statuses.items[0]);
+    try std.testing.expectEqualStrings("● ran pwd\n", app.completed_tool_statuses.items[0]);
     try std.testing.expectEqualStrings("/workspace", app.command_stdout.items);
     try std.testing.expectEqualStrings("warning", app.command_stderr.items);
     try std.testing.expectEqual(@as(usize, 1), app.command_output_flush_count);
@@ -7310,13 +7310,13 @@ test "a resume shows each saved fx mcp call row right after its shell call's row
     errdefer for (statuses) |status| std.debug.print("row: {s}", .{status});
     try std.testing.expectEqual(@as(usize, 5), statuses.len);
     // The test app names every command row the same way.
-    try std.testing.expectEqualStrings("● Ran pwd\n", statuses[0]);
-    for (statuses[1..4], [_][]const u8{ "Ran MCP", "Ran MCP", "Failed" }) |status, label| {
+    try std.testing.expectEqualStrings("● ran pwd\n", statuses[0]);
+    for (statuses[1..4], [_][]const u8{ "ran MCP", "ran MCP", "failed" }) |status, label| {
         const want = try tooling_presentation.formatToolActionValue(alloc, label, "mcp_fixture_echo");
         defer alloc.free(want);
         try std.testing.expectEqualStrings(want, std.mem.trimEnd(u8, status, "\n"));
     }
-    try std.testing.expect(std.mem.startsWith(u8, statuses[4], "● Completed read_file"));
+    try std.testing.expect(std.mem.startsWith(u8, statuses[4], "● completed read_file"));
     try std.testing.expectEqualSlices(
         types.ToolOutcomeKind,
         &.{ .completed, .completed, .completed, .failed, .completed },
@@ -7373,9 +7373,9 @@ test "a resumed fx mcp call row joins its shell call's group with no arguments o
         .override => |override| try text.appendSlice(alloc, override.bytes),
         else => {},
     };
-    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, text.items, "Ran MCP"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, text.items, "ran MCP"));
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, text.items, "×2"));
-    try std.testing.expect(std.mem.find(u8, text.items, "Couldn't run") != null);
+    try std.testing.expect(std.mem.find(u8, text.items, "couldn't run") != null);
 }
 
 test "execution replay shows the user's steering and not fx's own recovery prompt" {
@@ -7479,12 +7479,12 @@ test "execution replay labels shell session interactions with their launch comma
 
     try std.testing.expectEqual(@as(usize, 3), app.completed_tool_statuses.items.len);
     try std.testing.expectEqualStrings(
-        "● Completed shell python3 -u - <<'PY' import time PY\n",
+        "● completed shell python3 -u - <<'PY' import time PY\n",
         app.completed_tool_statuses.items[1],
     );
     // A session with no recorded launch command keeps the raw-id presentation.
     try std.testing.expectEqualStrings(
-        "● Completed shell\n",
+        "● completed shell\n",
         app.completed_tool_statuses.items[2],
     );
 }
@@ -7530,7 +7530,7 @@ test "execution replay recovers session labels from truncated status previews" {
 
     try std.testing.expectEqual(@as(usize, 2), app.completed_tool_statuses.items.len);
     try std.testing.expectEqualStrings(
-        "● Completed shell sleep 60\n",
+        "● completed shell sleep 60\n",
         app.completed_tool_statuses.items[1],
     );
 }
@@ -7592,7 +7592,7 @@ test "history replay carries shell session labels across turns" {
 
     try std.testing.expectEqual(@as(usize, 2), app.completed_tool_statuses.items.len);
     try std.testing.expectEqualStrings(
-        "● Completed shell tail -f app.log\n",
+        "● completed shell tail -f app.log\n",
         app.completed_tool_statuses.items[1],
     );
 }
@@ -7656,7 +7656,7 @@ test "execution replay records session labels for tty-launched sessions" {
     // renders the launch command instead of the raw session id.
     try std.testing.expectEqual(@as(usize, 2), app.completed_tool_statuses.items.len);
     try std.testing.expectEqualStrings(
-        "● Completed shell npm run dev\n",
+        "● completed shell npm run dev\n",
         app.completed_tool_statuses.items[1],
     );
 }
@@ -7735,10 +7735,10 @@ test "execution replay names the call whose saved output a later read opens" {
 
     const statuses = app.completed_tool_statuses.items;
     try std.testing.expectEqual(@as(usize, 6), statuses.len);
-    try std.testing.expectEqualStrings("● Completed read_tool_result more output from zig build test\n", statuses[2]);
-    try std.testing.expectEqualStrings("● Completed read_tool_result zig build test output for \"error:\"\n", statuses[3]);
-    try std.testing.expectEqualStrings("● Completed read_tool_result more output from src/main.zig\n", statuses[4]);
-    try std.testing.expectEqualStrings("● Completed read_tool_result\n", statuses[5]);
+    try std.testing.expectEqualStrings("● completed read_tool_result more output from zig build test\n", statuses[2]);
+    try std.testing.expectEqualStrings("● completed read_tool_result zig build test output for \"error:\"\n", statuses[3]);
+    try std.testing.expectEqualStrings("● completed read_tool_result more output from src/main.zig\n", statuses[4]);
+    try std.testing.expectEqualStrings("● completed read_tool_result\n", statuses[5]);
 }
 
 test "resume projection stores reflow metadata for session action rows" {
@@ -7819,7 +7819,7 @@ test "resume projection stores reflow metadata for session action rows" {
     var observed_metadata = false;
     for (projection.runtime.notebook.tool_details.items) |*detail| {
         const action = detail.command_action_label orelse continue;
-        if (std.mem.eql(u8, action, "Observed")) {
+        if (std.mem.eql(u8, action, "observed")) {
             try std.testing.expectEqualStrings(command, detail.command_display.?);
             observed_metadata = true;
         }
@@ -7898,7 +7898,7 @@ test "resume projection restores session action rows with labels seeded from the
     var observed_metadata = false;
     for (projection.runtime.notebook.tool_details.items) |*detail| {
         const action = detail.command_action_label orelse continue;
-        if (std.mem.eql(u8, action, "Observed")) {
+        if (std.mem.eql(u8, action, "observed")) {
             const display = detail.command_display.?;
             try std.testing.expect(std.mem.startsWith(u8, display, "cd ./packages/cli && "));
             try std.testing.expect(display.len > 120);
@@ -7954,7 +7954,7 @@ test "resume projection stores reflow metadata after the session moved workspace
     var stored = false;
     for (projection.runtime.notebook.tool_details.items) |*detail| {
         const display = detail.command_display orelse continue;
-        if (std.mem.eql(u8, detail.command_action_label orelse "", "Ran")) {
+        if (std.mem.eql(u8, detail.command_action_label orelse "", "ran")) {
             // Abbreviated against the live root, full length, never the
             // compact-bound frozen form.
             try std.testing.expect(std.mem.startsWith(u8, display, "cd ./packages/cli && "));
@@ -7993,7 +7993,7 @@ test "execution replay renders persisted permission feedback after its tool resu
     try Runtime(TestApp).writeExecutionHistory(&app, (&app).agent(), .{ .tool_steps = steps[0..] });
 
     try std.testing.expectEqual(@as(usize, 1), app.completed_tool_statuses.items.len);
-    try std.testing.expectEqualStrings("● Completed write_file\n", app.completed_tool_statuses.items[0]);
+    try std.testing.expectEqualStrings("● completed write_file\n", app.completed_tool_statuses.items[0]);
     try std.testing.expectEqual(@as(usize, 1), app.cards.items.len);
     try std.testing.expectEqualStrings("Then read the file and report its exact contents.", app.cards.items[0].text);
     try std.testing.expect(app.cards.items[0].has_prior_turns);
@@ -8070,13 +8070,13 @@ test "execution replay preserves permission denial reasons" {
         app.completed_tool_outcomes.items,
     );
     try std.testing.expectEqual(@as(usize, 7), app.completed_tool_statuses.items.len);
-    try std.testing.expectEqualStrings("● Denied run_command\n", app.completed_tool_statuses.items[0]);
-    try std.testing.expectEqualStrings("● Denied by auto agent run_command\n", app.completed_tool_statuses.items[1]);
-    try std.testing.expectEqualStrings("● Denied run_command\n", app.completed_tool_statuses.items[2]);
-    try std.testing.expectEqualStrings("● Permission required run_command\n", app.completed_tool_statuses.items[3]);
-    try std.testing.expectEqualStrings("● Safety caution run_command\n", app.completed_tool_statuses.items[4]);
-    try std.testing.expectEqualStrings("● Review evidence incomplete run_command\n", app.completed_tool_statuses.items[5]);
-    try std.testing.expectEqualStrings("● Review unavailable run_command\n", app.completed_tool_statuses.items[6]);
+    try std.testing.expectEqualStrings("● denied run_command\n", app.completed_tool_statuses.items[0]);
+    try std.testing.expectEqualStrings("● denied by auto agent run_command\n", app.completed_tool_statuses.items[1]);
+    try std.testing.expectEqualStrings("● denied run_command\n", app.completed_tool_statuses.items[2]);
+    try std.testing.expectEqualStrings("● permission required run_command\n", app.completed_tool_statuses.items[3]);
+    try std.testing.expectEqualStrings("● safety caution run_command\n", app.completed_tool_statuses.items[4]);
+    try std.testing.expectEqualStrings("● review evidence incomplete run_command\n", app.completed_tool_statuses.items[5]);
+    try std.testing.expectEqualStrings("● review unavailable run_command\n", app.completed_tool_statuses.items[6]);
     try std.testing.expectEqual(@as(usize, 0), app.transcript.items.len);
 }
 
@@ -8334,7 +8334,7 @@ test "historical command replay prefers tagged frames and preserves exit outcome
 
     try Runtime(TestApp).writeExecutionHistory(&app, (&app).agent(), .{ .tool_steps = steps[0..] });
 
-    try std.testing.expectEqualStrings("● Exited 7 run_command\n", app.completed_tool_statuses.items[0]);
+    try std.testing.expectEqualStrings("● exited 7 run_command\n", app.completed_tool_statuses.items[0]);
     try std.testing.expectEqual(@as(usize, 3), app.command_output_writes.items.len);
     try std.testing.expectEqual(.stdout, app.command_output_writes.items[0].stream);
     try std.testing.expectEqualStrings("first", app.command_output_writes.items[0].text);
@@ -8388,7 +8388,7 @@ test "historical command timeout preserves its typed outcome" {
     try Runtime(TestApp).writeExecutionHistory(&app, (&app).agent(), .{ .tool_steps = steps[0..] });
 
     try std.testing.expectEqualStrings(
-        "● Timed out run_command\n",
+        "● timed out run_command\n",
         app.completed_tool_statuses.items[0],
     );
     try std.testing.expectEqualSlices(
@@ -8458,15 +8458,15 @@ test "historical terminal actions preserve typed return and failure causes" {
 
     try std.testing.expectEqual(@as(usize, 3), app.completed_tool_statuses.items.len);
     try std.testing.expectEqualStrings(
-        "● Exited 0 terminal\n",
+        "● exited 0 terminal\n",
         app.completed_tool_statuses.items[0],
     );
     try std.testing.expectEqualStrings(
-        "● Wait limit reached for terminal\n",
+        "● wait limit reached for terminal\n",
         app.completed_tool_statuses.items[1],
     );
     try std.testing.expectEqualStrings(
-        "● Failed terminal: terminal session not found\n",
+        "● failed terminal: terminal session not found\n",
         app.completed_tool_statuses.items[2],
     );
     try std.testing.expectEqualSlices(
@@ -8502,7 +8502,7 @@ test "execution replay releases action-formatting scratch allocations" {
 
     try Runtime(TestApp).writeExecutionHistory(&app, (&app).agent(), .{ .tool_steps = steps[0..] });
 
-    try std.testing.expectEqualStrings("● Completed read_file\n", app.completed_tool_statuses.items[0]);
+    try std.testing.expectEqualStrings("● completed read_file\n", app.completed_tool_statuses.items[0]);
     try std.testing.expectEqualSlices(
         types.ToolOutcomeKind,
         &.{.completed},
@@ -8762,7 +8762,7 @@ test "execution replay keeps failed and unpaired persisted results visible witho
 
     try std.testing.expectEqual(@as(usize, 0), app.notices.items.len);
     try std.testing.expectEqual(@as(usize, 3), app.completed_tool_statuses.items.len);
-    try std.testing.expectEqualStrings("● Failed run_command\n", app.completed_tool_statuses.items[0]);
+    try std.testing.expectEqualStrings("● failed run_command\n", app.completed_tool_statuses.items[0]);
     try std.testing.expectEqualStrings("● success tool result: read_file\n", app.completed_tool_statuses.items[1]);
     try std.testing.expectEqualStrings("● failure tool result: read_file\n", app.completed_tool_statuses.items[2]);
     try std.testing.expectEqualSlices(
@@ -8898,8 +8898,8 @@ test "upgrade resume restores active session with the installed version notice" 
         app.notices.items[0],
     );
     try std.testing.expectEqual(@as(usize, 2), app.completed_tool_statuses.items.len);
-    try std.testing.expectEqualStrings("● Completed read_file\n", app.completed_tool_statuses.items[0]);
-    try std.testing.expectEqualStrings("● Completed read_file\n", app.completed_tool_statuses.items[1]);
+    try std.testing.expectEqualStrings("● completed read_file\n", app.completed_tool_statuses.items[0]);
+    try std.testing.expectEqualStrings("● completed read_file\n", app.completed_tool_statuses.items[1]);
     try std.testing.expectEqual(@as(usize, 3), app.cards.items.len);
     try std.testing.expect(!app.cards.items[0].has_prior_turns);
     try std.testing.expect(app.cards.items[1].has_prior_turns);
@@ -9253,7 +9253,7 @@ test "resumeRequestedSession replays persisted model Markdown without parsing ge
         .{ .assistant = .{
             .user = .{ .text = @constCast("background model turn") },
             .assistant = @constCast(
-                "| Name | Value |\n" ++
+                "| name | value |\n" ++
                     "| --- | --- |\n" ++
                     "| BACKGROUND_TABLE_MARKER | 42 |\n",
             ),
@@ -9307,10 +9307,10 @@ test "resumeRequestedSession replays persisted model Markdown without parsing ge
         app.assistant_code_blocks.items[0].code,
     );
     try std.testing.expectEqual(@as(usize, 1), app.assistant_thematic_rule_count);
-    try std.testing.expect(std.mem.find(u8, app.transcript.items, "Cancelled") != null);
-    try std.testing.expect(std.mem.find(u8, app.transcript.items, "What can fx do differently?") != null);
-    try std.testing.expect(std.mem.find(u8, app.transcript.items, "System:") == null);
-    try std.testing.expect(std.mem.find(u8, app.transcript.items, "Cancelling") == null);
+    try std.testing.expect(std.mem.find(u8, app.transcript.items, "cancelled") != null);
+    try std.testing.expect(std.mem.find(u8, app.transcript.items, "what can fx do differently?") != null);
+    try std.testing.expect(std.mem.find(u8, app.transcript.items, "system:") == null);
+    try std.testing.expect(std.mem.find(u8, app.transcript.items, "cancelling") == null);
     try std.testing.expectEqual(
         transcript_runtime.RawEntryClass.turn_cancellation,
         app.raw_transcript_classes.last().?,
@@ -9426,10 +9426,10 @@ test "resumeRequestedSession replays active-tool interruption with live cancella
 
     try std.testing.expectEqual(@as(usize, 1), app.cards.items.len);
     try std.testing.expectEqualStrings("inspect the browser", app.cards.items[0].text);
-    try std.testing.expect(std.mem.find(u8, app.transcript.items, "Cancelled") != null);
-    try std.testing.expect(std.mem.find(u8, app.transcript.items, "What can fx do differently?") != null);
-    try std.testing.expect(std.mem.find(u8, app.transcript.items, "System:") == null);
-    try std.testing.expect(std.mem.find(u8, app.transcript.items, "Cancelling") == null);
+    try std.testing.expect(std.mem.find(u8, app.transcript.items, "cancelled") != null);
+    try std.testing.expect(std.mem.find(u8, app.transcript.items, "what can fx do differently?") != null);
+    try std.testing.expect(std.mem.find(u8, app.transcript.items, "system:") == null);
+    try std.testing.expect(std.mem.find(u8, app.transcript.items, "cancelling") == null);
     try std.testing.expectEqual(@as(usize, 1), app.notices.items.len);
     try std.testing.expectEqualStrings("* session resumed: inspect the browser", app.notices.items[0]);
     try std.testing.expect(std.mem.find(u8, app.transcript.items, "localhost") == null);
@@ -9582,7 +9582,7 @@ test "cancelled command metadata allocation failure preserves core presentation"
         (&app).agent(),
         .{ .terminal = .{
             .id = lifecycle_id,
-            .outcome = .{ .kind = .cancelled, .summary = "Cancelled" },
+            .outcome = .{ .kind = .cancelled, .summary = "cancelled" },
         } },
         true,
     );
@@ -9655,7 +9655,7 @@ fn expectCancelledHistoryKeepsAuthoritativeReplay() !void {
         (&app).agent(),
         .{ .terminal = .{
             .id = lifecycle_id,
-            .outcome = .{ .kind = .cancelled, .summary = "Cancelled" },
+            .outcome = .{ .kind = .cancelled, .summary = "cancelled" },
             .command_artifact_handle = "fx-command-cancelled.log",
         } },
         true,
@@ -9717,7 +9717,7 @@ test "cancelled command metadata does not create output replay" {
         (&app).agent(),
         .{ .terminal = .{
             .id = lifecycle_id,
-            .outcome = .{ .kind = .cancelled, .summary = "Cancelled" },
+            .outcome = .{ .kind = .cancelled, .summary = "cancelled" },
         } },
         true,
     );
@@ -9955,7 +9955,7 @@ test "a resumed cancelled command row has the live row's command metadata, for i
         if (outcome != .cancelled) continue;
         cancelled_rows += 1;
         try std.testing.expectEqualStrings("touch .ready && sleep 30", detail.command_display.?);
-        try std.testing.expectEqualStrings("Ran", detail.command_action_label.?);
+        try std.testing.expectEqualStrings("ran", detail.command_action_label.?);
     }
     try std.testing.expectEqual(@as(usize, 1), cancelled_rows);
 }
@@ -10375,7 +10375,7 @@ test "appendFinishedPrompt keeps the session alive when the turn cannot be saved
     );
     // The user sees a warning instead of a disappearing process.
     try std.testing.expectEqual(@as(usize, 1), app.notices.items.len);
-    try std.testing.expect(std.mem.find(u8, app.notices.items[0], "Couldn't save this turn") != null);
+    try std.testing.expect(std.mem.find(u8, app.notices.items[0], "couldn't save this turn") != null);
 
     // A later clean turn still persists; the writer is not latched shut.
     const clean = try session_runtime.makeAssistantTurn(alloc, "next", "fine");
@@ -11563,7 +11563,7 @@ const TitleGenerationFakeApp = struct {
     session_title_generation: bool = true,
     auth: TitleTestAuth = .{},
     selected_model: std.ArrayList(u8) = .empty,
-    stream_content: []const u8 = "Refactor the renderer loop",
+    stream_content: []const u8 = "refactor the renderer loop",
     stream_error: ?anyerror = null,
 
     const TitleTestAuth = struct {
@@ -11665,14 +11665,14 @@ test "session title generation installs the model title for a fresh session" {
     try awaitTitleTask(&app);
 
     try std.testing.expectEqualStrings(
-        "Refactor the renderer loop",
+        "refactor the renderer loop",
         Runtime(TitleGenerationFakeApp).cachedSessionTitle((&app).agent()).?,
     );
     const session_id = try alloc.dupe(u8, app.agent().session_persistence.v2.?.id());
     defer alloc.free(session_id);
     var saved = try reopenSaved(&app);
     defer saved.deinit(alloc);
-    try std.testing.expectEqualStrings("Refactor the renderer loop", saved.title.?);
+    try std.testing.expectEqualStrings("refactor the renderer loop", saved.title.?);
 
     const last = &app.agent().session_persistence.title_generation.last;
     try std.testing.expectEqual(.installed, last.status);

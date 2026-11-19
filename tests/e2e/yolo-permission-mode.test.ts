@@ -25,7 +25,7 @@ import { expectPermissionModeContext } from "./permission-mode-context";
 const WARNING = "Full access enabled: fx permission checks disabled";
 const COMPACT_WARNING = "Full access";
 const QUIT_HINT = "press ctrl+c again to exit";
-const COMMAND_APPROVAL_PROMPT = "Would you like to run the following command?";
+const COMMAND_APPROVAL_PROMPT = "would you like to run the following command?";
 const TIMEOUT = 30_000;
 const CONFIGURED_SANDBOX = process.platform === "darwin" ? "os" : "none";
 
@@ -330,10 +330,10 @@ describe.skipIf(!tmuxAvailable())("yolo interactive mode", () => {
       await session.waitForText("←→ change", TIMEOUT);
       // The list shows five settings at a time, so the search finds each.
       await session.sendLiteralText("permission");
-      expect(await session.waitForText("Permission mode", TIMEOUT)).toContain("Permission mode");
+      expect(await session.waitForText("permission mode", TIMEOUT)).toContain("permission mode");
       await session.sendKeys("C-u");
       await session.sendLiteralText("sandbox");
-      expect(await session.waitForText("no matching settings.", TIMEOUT)).not.toContain("Command sandbox");
+      expect(await session.waitForText("no matching settings.", TIMEOUT)).not.toContain("command sandbox");
       await session.sendKeys("C-u");
       await Bun.sleep(4_300);
       expect(await session.capturePane()).toContain("←→ change");

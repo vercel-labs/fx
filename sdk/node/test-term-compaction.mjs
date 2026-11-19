@@ -197,7 +197,7 @@ async function runScenario(name) {
       stderr(bytes) { state.stderr += new TextDecoder().decode(bytes); },
       onEvent(event) { state.events.push(event); },
     });
-    await waitFor(() => grid(terminal).includes(args.length ? "session resumed" : "Run /help for commands") && emptyComposer(grid(terminal)), "terminal startup");
+    await waitFor(() => grid(terminal).includes(args.length ? "session resumed" : "run /help for commands") && emptyComposer(grid(terminal)), "terminal startup");
     return state;
   }
   async function stop() {
@@ -281,7 +281,7 @@ async function runScenario(name) {
     } else {
       active.runtime.write("\x03");
       await waitFor(() => hold.aborted, "Ctrl+C reaches summary AbortSignal");
-      await waitFor(() => !activity.test(grid(active.terminal)) && grid(active.terminal).includes("Compaction cancelled.") && emptyComposer(grid(active.terminal)), "scoped cancellation feedback");
+      await waitFor(() => !activity.test(grid(active.terminal)) && grid(active.terminal).includes("compaction cancelled.") && emptyComposer(grid(active.terminal)), "scoped cancellation feedback");
       if (automatic) {
         await waitFor(() => commits === beforeCommits + 1, "automatic interruption persisted");
         const saved = new TextDecoder().decode(records.get(sessionId).bytes);

@@ -1771,11 +1771,11 @@ fn formatWebSearchProgress(alloc: std.mem.Allocator, progress: types.WebSearchPr
     var query_buf: [160]u8 = undefined;
     return switch (progress) {
         .query_started => |query| alloc.print(
-            "● Searching\x1b[0m {s}{s}\x1b[0m",
+            "● searching\x1b[0m {s}{s}\x1b[0m",
             .{ shared_theme.current().tool_stdout_style, text_utils.clippedLabel(&query_buf, query, 120) },
         ),
         .results_received => |entry| alloc.print(
-            "● Found {d} result{s}\x1b[0m {s}{s}\x1b[0m",
+            "● found {d} result{s}\x1b[0m {s}{s}\x1b[0m",
             .{ entry.result_count, if (entry.result_count == 1) "" else "s", shared_theme.current().tool_stdout_style, text_utils.clippedLabel(&query_buf, entry.query, 120) },
         ),
     };
@@ -1785,11 +1785,11 @@ fn formatWebFetchProgress(alloc: std.mem.Allocator, progress: types.WebFetchProg
     var url_buf: [types.WebFetchCompletion.max_url_len]u8 = undefined;
     return switch (progress) {
         .fetching => |url| alloc.print(
-            "● Fetching\x1b[0m {s}{s}\x1b[0m",
+            "● fetching\x1b[0m {s}{s}\x1b[0m",
             .{ shared_theme.current().tool_stdout_style, text_utils.clippedLabel(&url_buf, url, 120) },
         ),
         .converting => |url| alloc.print(
-            "● Converting\x1b[0m {s}{s}\x1b[0m",
+            "● converting\x1b[0m {s}{s}\x1b[0m",
             .{ shared_theme.current().tool_stdout_style, text_utils.clippedLabel(&url_buf, url, 120) },
         ),
     };
@@ -1819,19 +1819,19 @@ test "core.app_worker_runtime web progress labels keep the non-bold status style
         try std.testing.expect(std.mem.find(u8, label, "\x1b[1m") == null);
     }
     try std.testing.expectEqualStrings(
-        "● Searching\x1b[0m \x1b[38;5;245mzig terminal\x1b[0m",
+        "● searching\x1b[0m \x1b[38;5;245mzig terminal\x1b[0m",
         cases[0],
     );
     try std.testing.expectEqualStrings(
-        "● Found 2 results\x1b[0m \x1b[38;5;245mzig terminal\x1b[0m",
+        "● found 2 results\x1b[0m \x1b[38;5;245mzig terminal\x1b[0m",
         cases[1],
     );
     try std.testing.expectEqualStrings(
-        "● Fetching\x1b[0m \x1b[38;5;245mhttps://example.com\x1b[0m",
+        "● fetching\x1b[0m \x1b[38;5;245mhttps://example.com\x1b[0m",
         cases[2],
     );
     try std.testing.expectEqualStrings(
-        "● Converting\x1b[0m \x1b[38;5;245mhttps://example.com\x1b[0m",
+        "● converting\x1b[0m \x1b[38;5;245mhttps://example.com\x1b[0m",
         cases[3],
     );
 }
@@ -2524,13 +2524,13 @@ test "core.app_worker_runtime program status follows decision prompts to the tur
 
     // An approval prompt that opens outside a turn does not bring the
     // reported error back once it closes.
-    app.agent().worker.pending_permission_request = .{ .label = "Remember allow for this saved session" };
+    app.agent().worker.pending_permission_request = .{ .label = "remember allow for this saved session" };
     try tickNoop(&app);
     app.agent().worker.pending_permission_request = null;
     try tickNoop(&app);
     try expectProgramStatusReports(
         &app,
-        "\x1b]7501;state=blocked:kind=permission:app=fx:msg=UmVtZW1iZXIgYWxsb3cgZm9yIHRoaXMgc2F2ZWQgc2Vzc2lvbg==\x1b\\" ++
+        "\x1b]7501;state=blocked:kind=permission:app=fx:msg=cmVtZW1iZXIgYWxsb3cgZm9yIHRoaXMgc2F2ZWQgc2Vzc2lvbg==\x1b\\" ++
             "\x1b]7501;state=idle:app=fx\x1b\\",
     );
 }
@@ -2767,7 +2767,7 @@ const testRecoveryText = types.testRecoveryText;
 fn testWaitingStatus(attempt: usize) types.RouteRecoveryStatus {
     return .{
         .kind = .waiting,
-        .text = testRecoveryText("Connection lost · next try in 4s · attempt 1 · 3s"),
+        .text = testRecoveryText("connection lost · next try in 4s · attempt 1 · 3s"),
         .attempt = attempt,
     };
 }
@@ -3191,7 +3191,7 @@ test "core.app_worker_runtime projects route recovery status activity and clears
     switch (app.shell.activityProjection()) {
         .turn_thinking => |thinking| {
             try std.testing.expectEqual(activity_runtime.ActivityProjection.Tone.warning, thinking.tone);
-            try std.testing.expectEqualStrings("⚠ Connection lost · next try in 4s · attempt 1 · 3s", thinking.label);
+            try std.testing.expectEqualStrings("⚠ connection lost · next try in 4s · attempt 1 · 3s", thinking.label);
         },
         .none, .tool_slot => return error.TestUnexpectedResult,
     }
@@ -3231,7 +3231,7 @@ test "core.app_worker_runtime clears route recovery activity on clear event but 
     } });
     try tickNoop(&app);
     switch (app.shell.activityProjection()) {
-        .turn_thinking => |thinking| try std.testing.expectEqualStrings("⚠ Provider unavailable · stopped after 3 attempts", thinking.label),
+        .turn_thinking => |thinking| try std.testing.expectEqualStrings("⚠ provider unavailable · stopped after 3 attempts", thinking.label),
         .none, .tool_slot => return error.TestUnexpectedResult,
     }
 }
@@ -3255,7 +3255,7 @@ test "core.app_worker_runtime replaces a waiting status with its terminal attemp
 
     switch (app.shell.activityProjection()) {
         .turn_thinking => |thinking| try std.testing.expectEqualStrings(
-            "⚠ Provider unavailable · test provider serialization failed · stopped after 1 attempt",
+            "⚠ provider unavailable · test provider serialization failed · stopped after 1 attempt",
             thinking.label,
         ),
         .none, .tool_slot => return error.TestUnexpectedResult,
@@ -4488,9 +4488,9 @@ test "core.app_worker_runtime lifecycle updates and turn finalization do not dra
 
     try queueLifecycle(&app, .{ .progress = .{
         .id = .{ .turn_id = 1, .call_id = "call" },
-        .text = "Reading",
+        .text = "reading",
     } });
-    try queueToolTerminal(&app, 1, "call", .completed, "Read");
+    try queueToolTerminal(&app, 1, "call", .completed, "read");
     try queueTurnFinished(&app, 1, .completed);
 
     try Runtime(FakeApp).tick(&app, (&app).agent(), handlers);
@@ -4787,7 +4787,7 @@ test "core.app_worker_runtime split batches finalize lifecycle before history" {
     app.agent().worker.processing = true;
 
     try queueToolStart(&app, 1, "split", "read_file");
-    try queueToolTerminal(&app, 1, "split", .completed, "Read");
+    try queueToolTerminal(&app, 1, "split", .completed, "read");
     try queueTurnFinished(&app, 1, .completed);
     try tickNoop(&app);
 
@@ -4838,7 +4838,7 @@ test "core.app_worker_runtime reset before drain fences interrupted prefix and k
     try app.agent().worker.pushEvent(std.heap.c_allocator, .{ .assistant_presentation = .{
         .text = @constCast("late turn one"),
     } });
-    try queueToolTerminal(&app, 1, "cancelled", .cancelled, "Cancelled");
+    try queueToolTerminal(&app, 1, "cancelled", .cancelled, "cancelled");
     try queueTurnFinished(&app, 1, .interrupted);
     try app.agent().worker.pushEvent(std.heap.c_allocator, .{ .begin_prompt = try types.dupeUserTurn(
         std.heap.c_allocator,
@@ -4888,9 +4888,9 @@ test "core.app_worker_runtime reducer error settles batch and skips suffix" {
     try queueToolStart(&app, 1, "call", "read_file");
     try queueLifecycle(&app, .{ .progress = .{
         .id = .{ .turn_id = 1, .call_id = "call" },
-        .text = "Reading",
+        .text = "reading",
     } });
-    try queueToolTerminal(&app, 1, "call", .completed, "Read");
+    try queueToolTerminal(&app, 1, "call", .completed, "read");
     app.shell.fail_next_update = true;
 
     try std.testing.expectError(
@@ -4910,7 +4910,7 @@ test "core.app_worker_runtime cancellation leaves an earlier completed segment d
     app.agent().worker.active_turn_id = 2;
     app.agent().worker.worker_cancel_requested.store(true, .seq_cst);
     try queueToolStart(&app, 1, "completed-call", "read_file");
-    try queueToolTerminal(&app, 1, "completed-call", .completed, "Read");
+    try queueToolTerminal(&app, 1, "completed-call", .completed, "read");
     try app.agent().worker.pushEvent(std.heap.c_allocator, .{ .assistant_presentation = .{ .text = @constCast("earlier completed answer") } });
     try queueTurnFinished(&app, 1, .completed);
     try app.agent().worker.pushEvent(std.heap.c_allocator, .{ .begin_prompt = .{ .text = @constCast("later request") } });
@@ -4939,7 +4939,7 @@ test "core.app_worker_runtime reducer failure preserves a completed turn in the 
     try queueToolStart(&app, 1, "call", "read_file");
     try queueLifecycle(&app, .{ .progress = .{
         .id = .{ .turn_id = 1, .call_id = "call" },
-        .text = "Reading",
+        .text = "reading",
     } });
     try app.agent().worker.pushEvent(std.heap.c_allocator, .{ .finish_prompt = .{ .turn = .{ .assistant = .{
         .user = .{ .text = @constCast("accepted request") },
@@ -4960,7 +4960,7 @@ test "core.app_worker_runtime failed turn terminalizes tool lifecycle before err
     try queueToolStart(&app, 1, "call_1", "read_file");
     try queueLifecycle(&app, .{ .progress = .{
         .id = .{ .turn_id = 1, .call_id = "call_1" },
-        .text = "● Reading",
+        .text = "● reading",
     } });
 
     try tickNoop(&app);
@@ -4985,7 +4985,7 @@ test "core.app_worker_runtime failed turn terminalizes tool lifecycle before err
     try std.testing.expectEqualStrings(
         try std.mem.print(
             &failed_status_expected,
-            "{s}●{s} Tool failed",
+            "{s}●{s} tool failed",
             .{ ui_render.red_style, reset_style },
         ),
         app.shell.toolStatusEntryLabel(entry_id).?,

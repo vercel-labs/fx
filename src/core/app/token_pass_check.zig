@@ -426,7 +426,7 @@ pub fn Runtime(comptime App: type) type {
             state.fx_moved_to_default = has_pass;
             if (!has_pass and state.default_noted) {
                 // The transcript said Token Pass is active; say what changed.
-                const body = try app.alloc.print("Token Pass is not active, so fx uses {s}. Change it with /model.", .{target});
+                const body = try app.alloc.print("token pass is not active, so fx uses {s}. change it with /model.", .{target});
                 defer app.alloc.free(body);
                 try app.writeDomainNotice(.{ .topic = "", .tone = .neutral, .body = body }, true);
                 state.default_noted = false;

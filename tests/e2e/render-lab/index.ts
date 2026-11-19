@@ -128,8 +128,8 @@ const LOCAL_GATEWAY_COMPLETION = "RENDER_LAB_LOCAL_GATEWAY_OK";
 const OBSERVABILITY_TRANSCRIPT_HEAD = "OBSERVABILITY_TRANSCRIPT_HEAD";
 const OBSERVABILITY_TRANSCRIPT_TAIL = "OBSERVABILITY_TRANSCRIPT_TAIL";
 const OBSERVABILITY_FINAL_MARKER = "OBSERVABILITY_FINAL_RESPONSE";
-const OBSERVABILITY_PERMISSION_PROMPT = "Would you like to run the following command?";
-const OBSERVABILITY_PERMISSION_REVIEW = "Permission needed";
+const OBSERVABILITY_PERMISSION_PROMPT = "would you like to run the following command?";
+const OBSERVABILITY_PERMISSION_REVIEW = "permission needed";
 const OBSERVABILITY_TOOL_COMMAND = "touch render-lab-observability-approved.txt";
 const LOCAL_GATEWAY_CHAT_PATH = "/v4/ai/language-model";
 const LOCAL_GATEWAY_MODELS_PATH = "/coding-agent/v1/models";
@@ -425,7 +425,7 @@ async function runActiveToolPlacement(
     markers: {
       shell: [],
       submitted: ["exercise one active command placement"],
-      history: ["Run /help for commands"],
+      history: ["run /help for commands"],
     },
     frames: [],
     failures: [],
@@ -669,7 +669,7 @@ async function runUserCardResizeReplayScrollback(
     markers: {
       shell: [],
       submitted: [promptHead, promptTail],
-      history: ["Run /help for commands"],
+      history: ["run /help for commands"],
     },
     frames: [],
     failures: [],
@@ -808,7 +808,7 @@ async function runTuiObservabilityGauntlet(
       clearedShell: [shellMarker],
       submitted: [promptHead, promptTail],
       history: [
-        "Run /help for commands",
+        "run /help for commands",
         OBSERVABILITY_TRANSCRIPT_HEAD,
         OBSERVABILITY_TRANSCRIPT_TAIL,
         "OBSERVABILITY_TOOL_OUTPUT",
@@ -1073,7 +1073,7 @@ async function runStartupScrollbackOverflow(
         `SHELL_OVERFLOW_END_${markerSuffix}`,
       ],
       submitted: [promptTail],
-      history: [promptHead, "Run /help for commands"],
+      history: [promptHead, "run /help for commands"],
     },
     frames: [],
     failures: [],
@@ -1638,7 +1638,7 @@ async function launchFx(
     `${environmentPrefix}FX_RECORD=${shQuote(context.manifest.tapePath)} FX_RECORD_INPUT=1 ${shQuote(FX_BIN)}${stderrRedirect}`,
   );
   await capture(context, session, `${label}-fx-launch-requested`);
-  await session.waitForPane((pane) => pane.includes("Run /help for commands"), 25_000);
+  await session.waitForPane((pane) => pane.includes("run /help for commands"), 25_000);
   await capture(context, session, `${label}-fx-prompt-visible`);
 }
 

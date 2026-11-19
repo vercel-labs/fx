@@ -34,9 +34,9 @@ pub fn compactionProjection(
     const op = snapshot.operation orelse return .none;
     if (!op.visible(now_ms)) return .none;
     const label: []const u8, const percent: ?u8 = switch (op.phase) {
-        .preparing => .{ "• Compacting", compactionPercent(op, .preparation) },
-        .running => |stage| .{ "• Compacting", compactionPercent(op, stage) },
-        .stopping => .{ "• Stopping compaction", null },
+        .preparing => .{ "• compacting", compactionPercent(op, .preparation) },
+        .running => |stage| .{ "• compacting", compactionPercent(op, stage) },
+        .stopping => .{ "• stopping compaction", null },
         .terminal => |feedback| return .{ .turn_thinking = .{
             .label = compactionFeedbackLabel(feedback),
             .tone = switch (feedback.outcome) {
@@ -64,7 +64,7 @@ pub fn compactionDoneNotice(buf: []u8, op: compaction_activity.Operation) ?[]con
     if (feedback.outcome != .succeeded) return null;
     const seconds = turn_clock.seconds(turn_clock.compactionMarks(op), op.settled_at_ms) orelse return null;
     var out: std.Io.Writer = .fixed(buf);
-    out.writeAll("Context compacted (") catch return null;
+    out.writeAll("context compacted (") catch return null;
     writeElapsed(&out, seconds) catch return null;
     out.writeByte(')') catch return null;
     return out.buffered();
@@ -72,41 +72,41 @@ pub fn compactionDoneNotice(buf: []u8, op: compaction_activity.Operation) ?[]con
 
 fn compactionFeedbackLabel(feedback: compaction_activity.Feedback) []const u8 {
     if (feedback.publication == .uncertain)
-        return "Compaction could not confirm saved context. Reopen the session before retrying.";
+        return "compaction could not confirm saved context. reopen the session before retrying.";
     if (feedback.publication == .committed)
-        return "Compaction saved context, but could not finish. Reopen the session before retrying.";
+        return "compaction saved context, but could not finish. reopen the session before retrying.";
     if (feedback.outcome == .failed) {
         if (feedback.err) |err| {
             switch (err) {
-                error.CompactionAuthenticationRejected => return "Compaction was not started. Check authentication and try /compact again.",
-                error.ContextCapacityExceeded => return "Context is too large to compact. Choose a model with a larger context window.",
+                error.CompactionAuthenticationRejected => return "compaction was not started. check authentication and try /compact again.",
+                error.ContextCapacityExceeded => return "context is too large to compact. choose a model with a larger context window.",
                 else => {},
             }
         }
     }
     return switch (feedback.outcome) {
         .succeeded => "",
-        .no_op => "No context to compact.",
-        .busy => "Wait for the active work to finish before compacting context.",
-        .cancelled => "Compaction cancelled. Try /compact again when ready.",
+        .no_op => "no context to compact.",
+        .busy => "wait for the active work to finish before compacting context.",
+        .cancelled => "compaction cancelled. try /compact again when ready.",
         .failed => if (feedback.stage == .preparation)
-            "Compaction was not started. Try /compact again."
+            "compaction was not started. try /compact again."
         else
-            "Compaction failed. Try /compact again.",
+            "compaction failed. try /compact again.",
     };
 }
 
 test "compaction feedback distinguishes authentication and capacity from other setup failures" {
     try std.testing.expectEqualStrings(
-        "Compaction was not started. Check authentication and try /compact again.",
+        "compaction was not started. check authentication and try /compact again.",
         compactionFeedbackLabel(compaction_activity.failure(error.CompactionAuthenticationRejected, .preparation, false)),
     );
     try std.testing.expectEqualStrings(
-        "Context is too large to compact. Choose a model with a larger context window.",
+        "context is too large to compact. choose a model with a larger context window.",
         compactionFeedbackLabel(compaction_activity.failure(error.ContextCapacityExceeded, .preparation, false)),
     );
     try std.testing.expectEqualStrings(
-        "Compaction was not started. Try /compact again.",
+        "compaction was not started. try /compact again.",
         compactionFeedbackLabel(compaction_activity.failure(error.OutOfMemory, .preparation, false)),
     );
 }
@@ -134,9 +134,9 @@ fn streamStatusVerb(stream: StreamState) []const u8 {
 
 fn markedTurnPhaseLabel(phase: types.TurnPhase) []const u8 {
     return switch (phase) {
-        .thinking => "• Thinking",
-        .generating => "• Generating",
-        .running, .waiting_for_subagent => "• Running",
+        .thinking => "• thinking",
+        .generating => "• generating",
+        .running, .waiting_for_subagent => "• running",
     };
 }
 
@@ -312,21 +312,21 @@ test "every compaction counts its own time from zero and shows how much of the s
     var buf: [256]u8 = undefined;
     for ([_]compaction_activity.Origin{ .manual, .automatic, .provider_overflow }) |origin| {
         const id = state.begin(origin, 1, 3_500);
-        try std.testing.expectEqualStrings("• Compacting 0% (0s)", compactionProjection(&buf, state.snapshot, 3_500).turn_thinking.label);
+        try std.testing.expectEqualStrings("• compacting 0% (0s)", compactionProjection(&buf, state.snapshot, 3_500).turn_thinking.label);
         // A count that arrives before the summary starts is kept for it.
         state.running(id, .summary);
-        try std.testing.expectEqualStrings("• Compacting 0% (0s)", compactionProjection(&buf, state.snapshot, 4_000).turn_thinking.label);
+        try std.testing.expectEqualStrings("• compacting 0% (0s)", compactionProjection(&buf, state.snapshot, 4_000).turn_thinking.label);
         state.written(id, 66);
-        try std.testing.expectEqualStrings("• Compacting 66% (1m2s)", compactionProjection(&buf, state.snapshot, 65_500).turn_thinking.label);
+        try std.testing.expectEqualStrings("• compacting 66% (1m2s)", compactionProjection(&buf, state.snapshot, 65_500).turn_thinking.label);
         // A lower count, from a fallback model or a follow-up, changes nothing.
         state.written(id, 40);
-        try std.testing.expectEqualStrings("• Compacting 66% (1h0m0s)", compactionProjection(&buf, state.snapshot, 3_603_500).turn_thinking.label);
+        try std.testing.expectEqualStrings("• compacting 66% (1h0m0s)", compactionProjection(&buf, state.snapshot, 3_603_500).turn_thinking.label);
         try std.testing.expectEqual(@as(?bool, false), activityBlinkVisible(compactionClock(state.snapshot.operation.?), 4_000));
         try std.testing.expectEqual(@as(?bool, true), activityBlinkVisible(compactionClock(state.snapshot.operation.?), 4_500));
         state.running(id, .publication);
-        try std.testing.expectEqualStrings("• Compacting 100% (2s)", compactionProjection(&buf, state.snapshot, 5_500).turn_thinking.label);
+        try std.testing.expectEqualStrings("• compacting 100% (2s)", compactionProjection(&buf, state.snapshot, 5_500).turn_thinking.label);
         state.stopping(id);
-        try std.testing.expectEqualStrings("• Stopping compaction (2s)", compactionProjection(&buf, state.snapshot, 5_500).turn_thinking.label);
+        try std.testing.expectEqualStrings("• stopping compaction (2s)", compactionProjection(&buf, state.snapshot, 5_500).turn_thinking.label);
         state.settle(id, .{ .outcome = .succeeded }, 5_500);
         try std.testing.expect(compactionProjection(&buf, state.snapshot, 5_500) == .none);
     }
@@ -346,11 +346,11 @@ test "the turn row goes on after a compaction from the time it showed before" {
     const id = state.begin(.automatic, 1, began);
     syncWaitingClock(&stream, turn_clock.waits(false, state.snapshot), began);
     state.running(id, .summary);
-    try std.testing.expectEqualStrings("• Compacting 0% (40s)", compactionProjection(&buf, state.snapshot, began + 40_000).turn_thinking.label);
+    try std.testing.expectEqualStrings("• compacting 0% (40s)", compactionProjection(&buf, state.snapshot, began + 40_000).turn_thinking.label);
     state.settle(id, .{ .outcome = .succeeded, .publication = .committed }, began + 40_000);
     syncWaitingClock(&stream, turn_clock.waits(false, state.snapshot), began + 40_000);
-    try std.testing.expectEqualStrings("• Running (10m15s) (↑100 ↓20)", buildTurnLabel(&buf, stream, began + 40_000).?);
-    try std.testing.expectEqualStrings("• Running (10m20s) (↑100 ↓20)", buildTurnLabel(&buf, stream, began + 45_000).?);
+    try std.testing.expectEqualStrings("• running (10m15s) (↑100 ↓20)", buildTurnLabel(&buf, stream, began + 40_000).?);
+    try std.testing.expectEqualStrings("• running (10m20s) (↑100 ↓20)", buildTurnLabel(&buf, stream, began + 45_000).?);
     try std.testing.expectEqual(@as(u64, 100), stream.token_progress.input_tokens);
 }
 
@@ -362,10 +362,10 @@ test "a finished compaction leaves a line with its own time, only when it succee
     state.running(id, .summary);
     try std.testing.expect(compactionDoneNotice(&buf, state.snapshot.operation.?) == null);
     state.settle(id, .{ .outcome = .succeeded, .stage = .publication, .publication = .committed }, 131_400);
-    try std.testing.expectEqualStrings("Context compacted (2m10s)", compactionDoneNotice(&buf, state.snapshot.operation.?).?);
+    try std.testing.expectEqualStrings("context compacted (2m10s)", compactionDoneNotice(&buf, state.snapshot.operation.?).?);
     const quick = state.begin(.manual, null, 5_000);
     state.settle(quick, .{ .outcome = .succeeded, .publication = .committed }, 5_400);
-    try std.testing.expectEqualStrings("Context compacted (0s)", compactionDoneNotice(&buf, state.snapshot.operation.?).?);
+    try std.testing.expectEqualStrings("context compacted (0s)", compactionDoneNotice(&buf, state.snapshot.operation.?).?);
     for ([_]compaction_activity.Feedback{
         .{ .outcome = .no_op },
         .{ .outcome = .busy },
@@ -388,11 +388,11 @@ test "compaction terminal feedback is static scoped and publication honest" {
     var state: compaction_activity.State = .{};
     var buf: [256]u8 = undefined;
     const id = state.begin(.manual, null, 1_000);
-    try std.testing.expectEqualStrings("• Compacting 0% (0s)", compactionProjection(&buf, state.snapshot, 1_000).turn_thinking.label);
+    try std.testing.expectEqualStrings("• compacting 0% (0s)", compactionProjection(&buf, state.snapshot, 1_000).turn_thinking.label);
     state.settle(id, .{ .outcome = .failed, .stage = .publication, .publication = .uncertain }, 1_500);
     const failed = compactionProjection(&buf, state.snapshot, 9_000).turn_thinking;
     try std.testing.expectEqual(ActivityProjection.Tone.danger, failed.tone);
-    try std.testing.expectEqualStrings("Compaction could not confirm saved context. Reopen the session before retrying.", failed.label);
+    try std.testing.expectEqualStrings("compaction could not confirm saved context. reopen the session before retrying.", failed.label);
     try std.testing.expect(state.dismiss(id, state.snapshot.revision));
     try std.testing.expect(compactionProjection(&buf, state.snapshot, 9_000) == .none);
     const next = state.begin(.manual, null, 10_000);
@@ -409,16 +409,16 @@ test "subagent wait label preserves turn time and token accounting" {
         .turn_started_ms = 1_000,
         .token_progress = .{ .input_tokens = 32, .output_tokens = 253 },
     };
-    try std.testing.expectEqualStrings("• Running (30s) (↑32 ↓253)", buildTurnLabel(&buf, stream, 31_000).?);
+    try std.testing.expectEqualStrings("• running (30s) (↑32 ↓253)", buildTurnLabel(&buf, stream, 31_000).?);
     var resumed = stream;
     resumed.phase = .generating;
-    try std.testing.expectEqualStrings("• Generating (31s) (↑32 ↓253)", buildTurnLabel(&buf, resumed, 32_000).?);
+    try std.testing.expectEqualStrings("• generating (31s) (↑32 ↓253)", buildTurnLabel(&buf, resumed, 32_000).?);
 }
 
 test "buildTurnLabel returns thinking when no tool activity" {
     var buf: [32]u8 = undefined;
     const label = buildTurnLabel(&buf, .{ .active = true }, 0);
-    try std.testing.expectEqualStrings("• Thinking", label.?);
+    try std.testing.expectEqualStrings("• thinking", label.?);
 }
 
 test "buildTurnLabel renders turn token suffix with input only" {
@@ -427,7 +427,7 @@ test "buildTurnLabel renders turn token suffix with input only" {
         .active = true,
         .token_progress = .{ .input_tokens = 10 },
     }, 0);
-    try std.testing.expectEqualStrings("• Thinking (↑10 ↓0)", label.?);
+    try std.testing.expectEqualStrings("• thinking (↑10 ↓0)", label.?);
 }
 
 test "buildTurnLabel renders turn token suffix with input and output" {
@@ -436,7 +436,7 @@ test "buildTurnLabel renders turn token suffix with input and output" {
         .active = true,
         .token_progress = .{ .input_tokens = 10, .output_tokens = 20 },
     }, 0);
-    try std.testing.expectEqualStrings("• Thinking (↑10 ↓20)", label.?);
+    try std.testing.expectEqualStrings("• thinking (↑10 ↓20)", label.?);
 }
 
 test "buildTurnLabel renders elapsed seconds for the running turn" {
@@ -445,7 +445,7 @@ test "buildTurnLabel renders elapsed seconds for the running turn" {
         .active = true,
         .turn_started_ms = 1_000,
     }, 6_500);
-    try std.testing.expectEqualStrings("• Thinking (5s)", label.?);
+    try std.testing.expectEqualStrings("• thinking (5s)", label.?);
 }
 
 test "buildTurnLabel renders elapsed minutes and seconds for long turns" {
@@ -455,7 +455,7 @@ test "buildTurnLabel renders elapsed minutes and seconds for long turns" {
         .active = true,
         .turn_started_ms = 1_000,
     }, 1_000 + 1_080 * 1_000);
-    try std.testing.expectEqualStrings("• Thinking (18m0s)", label.?);
+    try std.testing.expectEqualStrings("• thinking (18m0s)", label.?);
 }
 
 test "buildTurnLabel renders elapsed hours for very long turns" {
@@ -465,7 +465,7 @@ test "buildTurnLabel renders elapsed hours for very long turns" {
         .active = true,
         .turn_started_ms = 1_000,
     }, 1_000 + 3_663 * 1_000);
-    try std.testing.expectEqualStrings("• Thinking (1h1m3s)", label.?);
+    try std.testing.expectEqualStrings("• thinking (1h1m3s)", label.?);
 }
 
 test "buildTurnLabel renders elapsed seconds before the token suffix" {
@@ -475,7 +475,7 @@ test "buildTurnLabel renders elapsed seconds before the token suffix" {
         .turn_started_ms = 1_000,
         .token_progress = .{ .input_tokens = 10, .output_tokens = 20 },
     }, 13_000);
-    try std.testing.expectEqualStrings("• Thinking (12s) (↑10 ↓20)", label.?);
+    try std.testing.expectEqualStrings("• thinking (12s) (↑10 ↓20)", label.?);
 }
 
 test "activity blink relights exactly when the seconds digit advances" {
@@ -488,7 +488,7 @@ test "activity blink relights exactly when the seconds digit advances" {
 
     var label_buf: [64]u8 = undefined;
     const at_relight = buildTurnLabel(&label_buf, stream, 2_000).?;
-    try std.testing.expectEqualStrings("• Thinking (1s)", at_relight);
+    try std.testing.expectEqualStrings("• thinking (1s)", at_relight);
 }
 
 test "activity blink has no clock without a running turn" {
@@ -506,13 +506,13 @@ test "turn clock freezes while waiting on user input and excludes the wait" {
     syncWaitingClock(&stream, true, 5_000);
     try std.testing.expectEqual(@as(i64, 5_000), stream.waiting_since_ms);
 
-    try std.testing.expectEqualStrings("• Thinking (4s)", buildTurnLabel(&buf, stream, 900_000).?);
+    try std.testing.expectEqualStrings("• thinking (4s)", buildTurnLabel(&buf, stream, 900_000).?);
     try std.testing.expectEqual(@as(?bool, true), activityBlinkVisible(stream, 900_000));
 
     syncWaitingClock(&stream, false, 900_000);
     try std.testing.expectEqual(@as(i64, 0), stream.waiting_since_ms);
-    try std.testing.expectEqualStrings("• Thinking (4s)", buildTurnLabel(&buf, stream, 900_000).?);
-    try std.testing.expectEqualStrings("• Thinking (7s)", buildTurnLabel(&buf, stream, 903_000).?);
+    try std.testing.expectEqualStrings("• thinking (4s)", buildTurnLabel(&buf, stream, 900_000).?);
+    try std.testing.expectEqualStrings("• thinking (7s)", buildTurnLabel(&buf, stream, 903_000).?);
 }
 
 test "waiting clock accumulates across repeated prompts in one turn" {
@@ -528,7 +528,7 @@ test "waiting clock accumulates across repeated prompts in one turn" {
     syncWaitingClock(&stream, true, 11_000);
     syncWaitingClock(&stream, false, 20_000);
     var buf: [64]u8 = undefined;
-    try std.testing.expectEqualStrings("• Thinking (2s)", buildTurnLabel(&buf, stream, 20_000).?);
+    try std.testing.expectEqualStrings("• thinking (2s)", buildTurnLabel(&buf, stream, 20_000).?);
 }
 
 test "waiting clock does not start without an active stream" {
@@ -543,7 +543,7 @@ test "buildTurnLabel hides elapsed seconds when the clock runs behind the mark" 
         .active = true,
         .turn_started_ms = 2_000,
     }, 1_000);
-    try std.testing.expectEqualStrings("• Thinking", label.?);
+    try std.testing.expectEqualStrings("• thinking", label.?);
 }
 
 test "buildCompletedTurnLabel renders token progress without approximation markers" {

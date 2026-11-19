@@ -202,7 +202,7 @@ pub const State = struct {
         self.reloadHost(alloc, workspace_root, registry) catch |err| {
             debug_trace.logf("mcp", "MCP reload failed err={s}", .{@errorName(err)});
             const sink = self.host_sink orelse return true;
-            sink.push(std.heap.c_allocator.print("The MCP config changed, but fx couldn't load it: {s}. Your current servers are still active.", .{mcp_verbs.describe(err)}) catch return true, true);
+            sink.push(std.heap.c_allocator.print("the MCP config changed, but fx couldn't load it: {s}. your current servers are still active.", .{mcp_verbs.describe(err)}) catch return true, true);
         };
         return true;
     }
@@ -446,23 +446,23 @@ pub const State = struct {
                 },
                 .signed_in => |server| {
                     sink.endSignIn(server);
-                    sink.report(server, a.print("Signed in to {s}.", .{safeText(aa, server, 160)}) catch return, false);
+                    sink.report(server, a.print("signed in to {s}.", .{safeText(aa, server, 160)}) catch return, false);
                 },
                 // The login is kept, but the request that checks it got no answer about the token.
                 .signed_in_unchecked => |server| {
                     sink.endSignIn(server);
-                    sink.report(server, a.print("Signed in to {s}, but fx couldn't check the login with it.", .{safeText(aa, server, 160)}) catch return, false);
+                    sink.report(server, a.print("signed in to {s}, but fx couldn't check the login with it.", .{safeText(aa, server, 160)}) catch return, false);
                 },
                 // A refusal carries the server's own error, which can run past 240.
                 .sign_in_failed => |n| {
                     sink.endSignIn(n.server);
-                    sink.report(n.server, a.print("Couldn't sign in to {s}: {s}.", .{ safeText(aa, n.server, 160), safeText(aa, n.reason, login_words.max_failure_bytes) }) catch return, true);
+                    sink.report(n.server, a.print("couldn't sign in to {s}: {s}.", .{ safeText(aa, n.server, 160), safeText(aa, n.reason, login_words.max_failure_bytes) }) catch return, true);
                 },
                 // The status line says so for as long as it's true.
                 .needs_login => {},
                 .not_saved => |n| {
                     const server = safeText(aa, n.server, 160);
-                    const text = a.print("Couldn't save {s}'s new login: {s}. It keeps working here, but after a restart {s} needs a login again.", .{ server, safeText(aa, n.reason, 240), server }) catch return;
+                    const text = a.print("couldn't save {s}'s new login: {s}. it keeps working here, but after a restart {s} needs a login again.", .{ server, safeText(aa, n.reason, 240), server }) catch return;
                     sink.pushLocked(text, true);
                 },
             }
@@ -555,8 +555,8 @@ pub const State = struct {
         fn signInText(alloc: Allocator, arena: Allocator, server: []const u8, url: []const u8) ![]u8 {
             const name = safeText(arena, server, 160);
             if (text_utils.isLinkTarget(url))
-                return alloc.print("Sign in to {s} in your browser. Didn't open? \x1b]8;id=fx-mcp-sign-in;{s}\x1b\\" ++ mcp_menu.sign_in_link_label ++ "\x1b]8;;\x1b\\.", .{ name, url });
-            return alloc.print("Sign in to {s} in your browser. If it didn't open, go to:\n  {s}", .{ name, safeText(arena, url, 16 * 1024) });
+                return alloc.print("sign in to {s} in your browser. didn't open? \x1b]8;id=fx-mcp-sign-in;{s}\x1b\\" ++ mcp_menu.sign_in_link_label ++ "\x1b]8;;\x1b\\.", .{ name, url });
+            return alloc.print("sign in to {s} in your browser. if it didn't open, go to:\n  {s}", .{ name, safeText(arena, url, 16 * 1024) });
         }
     };
 
@@ -799,7 +799,7 @@ pub const State = struct {
             sink.mutex.lockUncancelable(io_mod.getIo());
             _ = sink.untype(name);
             sink.mutex.unlock(io_mod.getIo());
-            sink.push(std.heap.c_allocator.print("Couldn't start signing in to {s}. Try /mcp login {s}.", .{ name, name }) catch return, true);
+            sink.push(std.heap.c_allocator.print("couldn't start signing in to {s}. try /mcp login {s}.", .{ name, name }) catch return, true);
         };
     }
 
@@ -1222,7 +1222,7 @@ test "a typed sign-in prints an address that can't be a link, to copy" {
     notify.notice(notify.context, .{ .authorize = .{ .server = "docs", .url = "https://a.example/a b\x1b[2J" } });
     try std.testing.expectEqual(@as(usize, 1), sink.notices.items.len);
     const text = sink.notices.items[0].text;
-    try std.testing.expect(std.mem.startsWith(u8, text, "Sign in to docs in your browser. If it didn't open, go to:\n  https://a.example/a b"));
+    try std.testing.expect(std.mem.startsWith(u8, text, "sign in to docs in your browser. if it didn't open, go to:\n  https://a.example/a b"));
     try std.testing.expect(std.mem.findScalar(u8, text, 0x1b) == null);
 }
 
@@ -1236,17 +1236,17 @@ test "a typed sign-in reports in the transcript, any other on the status line" {
     try std.testing.expectEqual(@as(usize, 2), sink.notices.items.len);
     // The address is a link under a few words, not printed out.
     try std.testing.expectEqualStrings(
-        "Sign in to docs in your browser. Didn't open? \x1b]8;id=fx-mcp-sign-in;https://a.example/authorize\x1b\\Open the sign-in page\x1b]8;;\x1b\\.",
+        "sign in to docs in your browser. didn't open? \x1b]8;id=fx-mcp-sign-in;https://a.example/authorize\x1b\\open the sign-in page\x1b]8;;\x1b\\.",
         sink.notices.items[0].text,
     );
-    try std.testing.expectEqualStrings("Signed in to docs.", sink.notices.items[1].text);
+    try std.testing.expectEqualStrings("signed in to docs.", sink.notices.items[1].text);
     try std.testing.expect(sink.news == null);
     // Once reported, the next sign-in to it isn't typed.
     notify.notice(notify.context, .{ .authorize = .{ .server = "docs", .url = "https://a.example/authorize" } });
     try std.testing.expect(sink.sign_in != null);
     notify.notice(notify.context, .{ .sign_in_failed = .{ .server = "docs", .reason = "it said no" } });
     try std.testing.expectEqual(@as(usize, 2), sink.notices.items.len);
-    try std.testing.expectEqualStrings("Couldn't sign in to docs: it said no.", sink.news.?);
+    try std.testing.expectEqualStrings("couldn't sign in to docs: it said no.", sink.news.?);
     try std.testing.expect(sink.sign_in == null);
     // Needing a login is the status line's to say.
     notify.notice(notify.context, .{ .needs_login = "docs" });
@@ -1366,5 +1366,5 @@ test "the host loads again when its config files change outside the session, onc
     }
     try std.testing.expectEqual(@as(usize, 1), notices.len);
     try std.testing.expect(notices[0].warning);
-    try std.testing.expectEqualStrings("The MCP config changed, but fx couldn't load it: ~/.fx/mcp.json isn't valid JSON. Your current servers are still active.", notices[0].text);
+    try std.testing.expectEqualStrings("the MCP config changed, but fx couldn't load it: ~/.fx/mcp.json isn't valid JSON. your current servers are still active.", notices[0].text);
 }

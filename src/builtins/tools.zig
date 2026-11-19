@@ -150,8 +150,8 @@ pub const toolbox = ToolSpec{
     .activity_kind = .read,
     .requires_approval = false,
     // Before its arguments arrive, a toolbox call may open, run, or search.
-    .action_label = "Using",
-    .completed_action_label = "Used",
+    .action_label = "using",
+    .completed_action_label = "used",
     .label_arg_kind = .none,
     .label_arg_default = "toolbox",
     .presentation_fn = toolbox_impl.presentation,
@@ -225,8 +225,8 @@ pub const glob_files = ToolSpec{
     .executor_kind = .glob_files,
     .activity_kind = .list,
     .requires_approval = false,
-    .action_label = "Matching",
-    .completed_action_label = "Matched",
+    .action_label = "matching",
+    .completed_action_label = "matched",
     .label_arg_kind = .pattern,
     .label_arg_default = "pattern",
     .permission_target_kind = .path_optional_existing,
@@ -260,8 +260,8 @@ pub const grep_files = ToolSpec{
     .executor_kind = .grep_files,
     .activity_kind = .read,
     .requires_approval = false,
-    .action_label = "Searching",
-    .completed_action_label = "Searched",
+    .action_label = "searching",
+    .completed_action_label = "searched",
     .label_arg_kind = .pattern,
     .label_arg_default = "pattern",
     .permission_target_kind = .path_optional_existing,
@@ -290,8 +290,8 @@ pub const read_file = ToolSpec{
     .executor_kind = .read_file,
     .activity_kind = .read,
     .requires_approval = false,
-    .action_label = "Reading",
-    .completed_action_label = "Read",
+    .action_label = "reading",
+    .completed_action_label = "read",
     .label_arg_kind = .path,
     .label_arg_default = "file",
     .permission_target_kind = .path_existing,
@@ -319,8 +319,8 @@ pub const write_file = ToolSpec{
     .executor_kind = .write_file,
     .activity_kind = .write,
     .requires_approval = true,
-    .action_label = "Writing",
-    .completed_action_label = "Wrote",
+    .action_label = "writing",
+    .completed_action_label = "wrote",
     .label_arg_kind = .path,
     .label_arg_default = "file",
     .permission_target_kind = .path_create_parent,
@@ -350,8 +350,8 @@ pub const edit_file = ToolSpec{
     .executor_kind = .edit_file,
     .activity_kind = .edit,
     .requires_approval = true,
-    .action_label = "Editing",
-    .completed_action_label = "Edited",
+    .action_label = "editing",
+    .completed_action_label = "edited",
     .label_arg_kind = .path,
     .label_arg_default = "file",
     .permission_target_kind = .path_existing_parent,
@@ -380,8 +380,8 @@ pub const web_fetch = ToolSpec{
     .executor_kind = .web_fetch,
     .activity_kind = .read,
     .requires_approval = false,
-    .action_label = "Fetching",
-    .completed_action_label = "Fetched",
+    .action_label = "fetching",
+    .completed_action_label = "fetched",
     .label_arg_kind = .url,
     .label_arg_default = "url",
     .permission_target_kind = .none,
@@ -431,8 +431,8 @@ pub const web_search = ToolSpec{
     .executor_kind = .web_search,
     .activity_kind = .read,
     .requires_approval = false,
-    .action_label = "Searching",
-    .completed_action_label = "Searched",
+    .action_label = "searching",
+    .completed_action_label = "searched",
     .label_arg_kind = .query,
     .label_arg_default = "web",
     .permission_target_kind = .none,
@@ -458,8 +458,8 @@ pub const shell = ToolSpec{
     .executor_kind = .terminal,
     .activity_kind = .command,
     .requires_approval = true,
-    .action_label = "Running",
-    .completed_action_label = "Ran",
+    .action_label = "running",
+    .completed_action_label = "ran",
     .label_arg_kind = .action,
     .label_arg_default = "shell request",
     .presentation_fn = shell_impl.presentation,
@@ -512,8 +512,8 @@ pub const install_skill = ToolSpec{
     .executor_kind = .install_skill,
     .activity_kind = .write,
     .requires_approval = true,
-    .action_label = "Installing skill",
-    .completed_action_label = "Installed skill",
+    .action_label = "installing skill",
+    .completed_action_label = "installed skill",
     .label_arg_kind = .source,
     .label_arg_default = "skill",
     .permission_target_kind = .none,
@@ -543,8 +543,8 @@ pub const subagent = ToolSpec{
     .executor_kind = .subagent,
     .activity_kind = .subagent,
     .requires_approval = false,
-    .action_label = "Managing",
-    .completed_action_label = "Managed",
+    .action_label = "managing",
+    .completed_action_label = "managed",
     .label_arg_kind = .none,
     .label_arg_default = "subagent",
     .permission_target_kind = .none,
@@ -572,8 +572,8 @@ pub const ask_user_question = ToolSpec{
     .executor_kind = .ask_user_question,
     .activity_kind = .ask,
     .requires_approval = false,
-    .action_label = "Asking",
-    .completed_action_label = "Asked",
+    .action_label = "asking",
+    .completed_action_label = "asked",
     .label_arg_kind = .none,
     .label_arg_default = "",
     .permission_target_kind = .none,
@@ -618,8 +618,8 @@ pub const vision = ToolSpec{
     .activity_kind = .read,
     .requires_approval = true,
     .approval_policy = .ask_only,
-    .action_label = "Inspecting",
-    .completed_action_label = "Inspected",
+    .action_label = "inspecting",
+    .completed_action_label = "inspected",
     .label_arg_kind = .none,
     .label_arg_default = "images",
     .permission_target_kind = .none,
@@ -660,8 +660,8 @@ pub const read_tool_result = ToolSpec{
     .executor_kind = .read_tool_result,
     .activity_kind = .read,
     .requires_approval = false,
-    .action_label = "Reading",
-    .completed_action_label = "Read",
+    .action_label = "reading",
+    .completed_action_label = "read",
     .label_arg_default = "saved output",
     .presentation_fn = read_tool_result_impl.presentation,
     .permission_target_kind = .none,
@@ -1067,8 +1067,8 @@ test "built-in glob_files owns product metadata schema and callbacks" {
     try std.testing.expectEqual(tool_dispatch.LabelArgKind.pattern, glob_files.label_arg_kind);
     try std.testing.expectEqualStrings("pattern", glob_files.label_arg_default);
     try std.testing.expectEqual(tool_dispatch.PermissionTargetKind.path_optional_existing, glob_files.permission_target_kind);
-    try std.testing.expectEqualStrings("Matching", glob_files.action_label);
-    try std.testing.expectEqualStrings("Matched", glob_files.completed_action_label);
+    try std.testing.expectEqualStrings("matching", glob_files.action_label);
+    try std.testing.expectEqualStrings("matched", glob_files.completed_action_label);
     try std.testing.expect(glob_files.decode == glob_files_impl.decode);
     try std.testing.expect(glob_files.validate.? == glob_files_impl.validate);
     try std.testing.expect(glob_files.call == glob_files_impl.call);
@@ -1099,8 +1099,8 @@ test "built-in grep_files owns product metadata schema and callbacks" {
     try std.testing.expectEqual(tool_dispatch.LabelArgKind.pattern, grep_files.label_arg_kind);
     try std.testing.expectEqualStrings("pattern", grep_files.label_arg_default);
     try std.testing.expectEqual(tool_dispatch.PermissionTargetKind.path_optional_existing, grep_files.permission_target_kind);
-    try std.testing.expectEqualStrings("Searching", grep_files.action_label);
-    try std.testing.expectEqualStrings("Searched", grep_files.completed_action_label);
+    try std.testing.expectEqualStrings("searching", grep_files.action_label);
+    try std.testing.expectEqualStrings("searched", grep_files.completed_action_label);
     try std.testing.expect(grep_files.decode == grep_files_impl.decode);
     try std.testing.expect(grep_files.validate.? == grep_files_impl.validate);
     try std.testing.expect(grep_files.call == grep_files_impl.call);
@@ -1125,8 +1125,8 @@ test "built-in read_file owns product metadata schema and callbacks" {
     try std.testing.expectEqual(tool_dispatch.LabelArgKind.path, read_file.label_arg_kind);
     try std.testing.expectEqualStrings("file", read_file.label_arg_default);
     try std.testing.expectEqual(tool_dispatch.PermissionTargetKind.path_existing, read_file.permission_target_kind);
-    try std.testing.expectEqualStrings("Reading", read_file.action_label);
-    try std.testing.expectEqualStrings("Read", read_file.completed_action_label);
+    try std.testing.expectEqualStrings("reading", read_file.action_label);
+    try std.testing.expectEqualStrings("read", read_file.completed_action_label);
     try std.testing.expect(read_file.decode == read_file_impl.decode);
     try std.testing.expect(read_file.validate.? == read_file_impl.validate);
     try std.testing.expect(read_file.call == read_file_impl.call);
@@ -1150,8 +1150,8 @@ test "built-in write_file owns product metadata schema and callbacks" {
     try std.testing.expectEqual(tool_dispatch.LabelArgKind.path, write_file.label_arg_kind);
     try std.testing.expectEqualStrings("file", write_file.label_arg_default);
     try std.testing.expectEqual(tool_dispatch.PermissionTargetKind.path_create_parent, write_file.permission_target_kind);
-    try std.testing.expectEqualStrings("Writing", write_file.action_label);
-    try std.testing.expectEqualStrings("Wrote", write_file.completed_action_label);
+    try std.testing.expectEqualStrings("writing", write_file.action_label);
+    try std.testing.expectEqualStrings("wrote", write_file.completed_action_label);
     try std.testing.expect(write_file.decode == write_file_impl.decode);
     try std.testing.expect(write_file.validate.? == write_file_impl.validate);
     try std.testing.expect(write_file.call == write_file_impl.call);
@@ -1175,8 +1175,8 @@ test "built-in edit_file owns product metadata schema and callbacks" {
     try std.testing.expectEqual(tool_dispatch.LabelArgKind.path, edit_file.label_arg_kind);
     try std.testing.expectEqualStrings("file", edit_file.label_arg_default);
     try std.testing.expectEqual(tool_dispatch.PermissionTargetKind.path_existing_parent, edit_file.permission_target_kind);
-    try std.testing.expectEqualStrings("Editing", edit_file.action_label);
-    try std.testing.expectEqualStrings("Edited", edit_file.completed_action_label);
+    try std.testing.expectEqualStrings("editing", edit_file.action_label);
+    try std.testing.expectEqualStrings("edited", edit_file.completed_action_label);
     try std.testing.expect(edit_file.decode == edit_file_impl.decode);
     try std.testing.expect(edit_file.validate.? == edit_file_impl.validate);
     try std.testing.expect(edit_file.call == edit_file_impl.call);
@@ -1205,8 +1205,8 @@ test "built-in web_fetch owns product metadata and schema" {
     try std.testing.expect(!web_fetch.requires_approval);
     try std.testing.expectEqual(tool_dispatch.LabelArgKind.url, web_fetch.label_arg_kind);
     try std.testing.expectEqual(tool_dispatch.PermissionTargetKind.none, web_fetch.permission_target_kind);
-    try std.testing.expectEqualStrings("Fetching", web_fetch.action_label);
-    try std.testing.expectEqualStrings("Fetched", web_fetch.completed_action_label);
+    try std.testing.expectEqualStrings("fetching", web_fetch.action_label);
+    try std.testing.expectEqualStrings("fetched", web_fetch.completed_action_label);
 }
 
 test "built-in web_search is registered in default production tools" {
@@ -1252,8 +1252,8 @@ test "built-in web_search owns product metadata and schema" {
     try std.testing.expect(!web_search.requires_approval);
     try std.testing.expectEqual(tool_dispatch.LabelArgKind.query, web_search.label_arg_kind);
     try std.testing.expectEqual(tool_dispatch.PermissionTargetKind.none, web_search.permission_target_kind);
-    try std.testing.expectEqualStrings("Searching", web_search.action_label);
-    try std.testing.expectEqualStrings("Searched", web_search.completed_action_label);
+    try std.testing.expectEqualStrings("searching", web_search.action_label);
+    try std.testing.expectEqualStrings("searched", web_search.completed_action_label);
 }
 
 test "built-in provider advertisements declare provider execution" {
@@ -1302,8 +1302,8 @@ test "built-in subagent owns product metadata schema and callbacks" {
     try std.testing.expect(!subagent.requires_approval);
     try std.testing.expectEqual(tool_dispatch.LabelArgKind.none, subagent.label_arg_kind);
     try std.testing.expectEqual(tool_dispatch.PermissionTargetKind.none, subagent.permission_target_kind);
-    try std.testing.expectEqualStrings("Managing", subagent.action_label);
-    try std.testing.expectEqualStrings("Managed", subagent.completed_action_label);
+    try std.testing.expectEqualStrings("managing", subagent.action_label);
+    try std.testing.expectEqualStrings("managed", subagent.completed_action_label);
     try std.testing.expect(subagent.decode == subagent_impl.decode);
     try std.testing.expect(subagent.validate.? == subagent_impl.validate);
     try std.testing.expect(subagent.call == subagent_impl.call);
@@ -1371,8 +1371,8 @@ test "built-in install_skill owns product metadata and schema" {
     try std.testing.expect(install_skill.requires_approval);
     try std.testing.expectEqual(tool_dispatch.LabelArgKind.source, install_skill.label_arg_kind);
     try std.testing.expectEqual(tool_dispatch.PermissionTargetKind.none, install_skill.permission_target_kind);
-    try std.testing.expectEqualStrings("Installing skill", install_skill.action_label);
-    try std.testing.expectEqualStrings("Installed skill", install_skill.completed_action_label);
+    try std.testing.expectEqualStrings("installing skill", install_skill.action_label);
+    try std.testing.expectEqualStrings("installed skill", install_skill.completed_action_label);
 }
 
 test "built-in ask_user_question owns product metadata schema and callbacks" {
@@ -1399,8 +1399,8 @@ test "built-in ask_user_question owns product metadata schema and callbacks" {
     try std.testing.expectEqual(tool_dispatch.LabelArgKind.none, ask_user_question.label_arg_kind);
     try std.testing.expectEqualStrings("", ask_user_question.label_arg_default);
     try std.testing.expectEqual(tool_dispatch.PermissionTargetKind.none, ask_user_question.permission_target_kind);
-    try std.testing.expectEqualStrings("Asking", ask_user_question.action_label);
-    try std.testing.expectEqualStrings("Asked", ask_user_question.completed_action_label);
+    try std.testing.expectEqualStrings("asking", ask_user_question.action_label);
+    try std.testing.expectEqualStrings("asked", ask_user_question.completed_action_label);
     try std.testing.expect(ask_user_question.decode == ask_user_question_impl.decode);
     try std.testing.expect(ask_user_question.validate.? == ask_user_question_impl.validate);
     try std.testing.expect(ask_user_question.call == ask_user_question_impl.call);
@@ -1473,8 +1473,8 @@ test "built-in vision owns product metadata schema and callbacks" {
     try std.testing.expectEqual(types.ToolActivityKind.read, vision.activity_kind);
     try std.testing.expect(vision.requires_approval);
     try std.testing.expectEqual(tool_dispatch.ApprovalPolicy.ask_only, vision.approval_policy);
-    try std.testing.expectEqualStrings("Inspecting", vision.action_label);
-    try std.testing.expectEqualStrings("Inspected", vision.completed_action_label);
+    try std.testing.expectEqualStrings("inspecting", vision.action_label);
+    try std.testing.expectEqualStrings("inspected", vision.completed_action_label);
     try std.testing.expectEqual(tool_dispatch.LabelArgKind.none, vision.label_arg_kind);
     try std.testing.expectEqualStrings("images", vision.label_arg_default);
     try std.testing.expectEqual(tool_dispatch.PermissionTargetKind.none, vision.permission_target_kind);
@@ -1554,8 +1554,8 @@ test "built-in read_tool_result owns product metadata schema and callbacks" {
     try std.testing.expectEqual(tool_dispatch.ExecutorKind.read_tool_result, read_tool_result.executor_kind);
     try std.testing.expectEqual(types.ToolActivityKind.read, read_tool_result.activity_kind);
     try std.testing.expect(!read_tool_result.requires_approval);
-    try std.testing.expectEqualStrings("Reading", read_tool_result.action_label);
-    try std.testing.expectEqualStrings("Read", read_tool_result.completed_action_label);
+    try std.testing.expectEqualStrings("reading", read_tool_result.action_label);
+    try std.testing.expectEqualStrings("read", read_tool_result.completed_action_label);
     try std.testing.expectEqual(tool_dispatch.LabelArgKind.none, read_tool_result.label_arg_kind);
     try std.testing.expectEqualStrings("saved output", read_tool_result.label_arg_default);
     try std.testing.expect(read_tool_result.presentation_fn.? == read_tool_result_impl.presentation);

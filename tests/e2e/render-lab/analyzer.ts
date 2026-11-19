@@ -12,13 +12,13 @@ import type {
 } from "./types";
 
 // The scenario's command row shows its steps in short form.
-export const ACTIVE_TOOL_MARKER = "Running sleep, printf, sleep";
-export const TERMINAL_TOOL_MARKER = "Ran sleep, printf, sleep";
+export const ACTIVE_TOOL_MARKER = "running sleep, printf, sleep";
+export const TERMINAL_TOOL_MARKER = "ran sleep, printf, sleep";
 // Ctrl+O shows the scenario's command in full.
-export const EXPANDED_TERMINAL_TOOL_MARKER = "Ran sleep 1; i=1";
+export const EXPANDED_TERMINAL_TOOL_MARKER = "ran sleep 1; i=1";
 const ACTIVE_TOOL_FINAL_MARKER = "RENDER_LAB_LOCAL_GATEWAY_OK";
-const OBSERVABILITY_PERMISSION_PROMPT = "Would you like to run the following command?";
-const OBSERVABILITY_PERMISSION_REVIEW = "Permission needed";
+const OBSERVABILITY_PERMISSION_PROMPT = "would you like to run the following command?";
+const OBSERVABILITY_PERMISSION_REVIEW = "permission needed";
 
 export function commandMoreCount(text: string): number | null {
   const match = text.match(/│ … (\d+) (?:(?:line|lines) more \(ctrl(?:\+| )o to view\)|more \(ctrl(?:\+| )o\)|more)/);
@@ -369,7 +369,7 @@ export function findLogoRows(grid: string[]): number[] {
   const rows: number[] = [];
   for (let i = 0; i < grid.length; i += 1) {
     const row = grid[i] ?? "";
-    if (row.includes("Run /help for commands") || hasLogoGlyphs(row)) {
+    if (row.includes("run /help for commands") || hasLogoGlyphs(row)) {
       rows.push(i);
     }
   }
@@ -1021,7 +1021,7 @@ function isTranscriptContentRow(line: string): boolean {
   const text = semanticText(line).trim();
   if (text.length === 0) return false;
   if (isDividerRow(text)) return false;
-  if (text.includes("Run /help for commands") || hasLogoGlyphs(text)) return false;
+  if (text.includes("run /help for commands") || hasLogoGlyphs(text)) return false;
   return true;
 }
 
@@ -1072,7 +1072,7 @@ function countLogoBlocks(grid: string[], logoRows: number[]): number {
     if (row > previous + 1) blocks += 1;
     previous = row;
   }
-  if (blocks === 0 && grid.some((row) => row.includes("Run /help for commands"))) return 1;
+  if (blocks === 0 && grid.some((row) => row.includes("run /help for commands"))) return 1;
   return blocks;
 }
 

@@ -1004,7 +1004,7 @@ test "full projection shows a terminal session launch command in full" {
         "s = led.read_text() old = \"Fixed in draft (b226cd28e,\" assert old in s LAUNCH_COMMAND_TAIL";
     var entries = [_]transcript_blocks.TranscriptEntry{.{ .raw_bytes = .{
         .id = 1,
-        .bytes = try alloc.dupe(u8, "● Observed " ++ launch[0..109] ++ "...\n"),
+        .bytes = try alloc.dupe(u8, "● observed " ++ launch[0..109] ++ "...\n"),
         .class = .tool_status,
     } }};
     defer entries[0].deinit(alloc);
@@ -1014,7 +1014,7 @@ test "full projection shows a terminal session launch command in full" {
         .activity_kind = .command,
         .arguments_json = try alloc.dupe(u8, "{\"action\":\"interact\",\"session_id\":\"shell-922\"}"),
         .command_display = try alloc.dupe(u8, launch),
-        .command_action_label = try alloc.dupe(u8, "Observed"),
+        .command_action_label = try alloc.dupe(u8, "observed"),
         .outcome = .completed,
     }};
     defer details[0].deinit(alloc);
@@ -1033,10 +1033,10 @@ test "full projection shows a terminal session launch command in full" {
     defer alloc.free(painted);
     const compact = try compactPaintedTextForTest(alloc, painted);
     defer alloc.free(compact);
-    const expected = try compactPaintedTextForTest(alloc, "Observed " ++ launch);
+    const expected = try compactPaintedTextForTest(alloc, "observed " ++ launch);
     defer alloc.free(expected);
 
-    try std.testing.expect(std.mem.find(u8, painted, "● Observed cd . && python3") != null);
+    try std.testing.expect(std.mem.find(u8, painted, "● observed cd . && python3") != null);
     try std.testing.expect(std.mem.find(u8, compact, expected) != null);
     try std.testing.expect(std.mem.find(u8, painted, "…") == null);
     try std.testing.expect(std.mem.find(u8, painted, "...") == null);
@@ -1103,7 +1103,7 @@ test "full projection keeps short session input that a long heading contains by 
         .activity_kind = .command,
         .arguments_json = try alloc.dupe(u8, "{\"action\":\"interact\",\"session_id\":\"shell-922\",\"chars\":\"y\"}"),
         .command_display = try alloc.dupe(u8, launch),
-        .command_action_label = try alloc.dupe(u8, "Sent input to"),
+        .command_action_label = try alloc.dupe(u8, "sent input to"),
         .outcome = .completed,
     }};
     defer details[0].deinit(alloc);
@@ -1596,10 +1596,10 @@ test "viewport selector sees the degraded measurement when a stored segment is u
     try std.testing.expectEqual(post_degrade.total_rows, recorder.measurement.?.total_rows);
     try std.testing.expectEqual(@as(?u16, 8), recorder.visible_rows);
     try std.testing.expect(std.mem.find(u8, selected, "preview-line") != null);
-    try std.testing.expect(std.mem.find(u8, selected, "Full saved result unavailable.") != null);
+    try std.testing.expect(std.mem.find(u8, selected, "full saved result unavailable.") != null);
     try std.testing.expect(std.mem.find(u8, selected, "│") == null);
     try std.testing.expect(std.mem.find(u8, selected, dim ++ "    preview-line" ++ reset) != null);
-    try std.testing.expect(std.mem.find(u8, selected, dim ++ "    Full saved result unavailable." ++ reset) != null);
+    try std.testing.expect(std.mem.find(u8, selected, dim ++ "    full saved result unavailable." ++ reset) != null);
 }
 
 test "a window walk degrade re-selects the offset in the same frame" {
@@ -1673,7 +1673,7 @@ test "a window walk degrade re-selects the offset in the same frame" {
     const post_degrade = try measureProjection(alloc, &projection, &capability, 80);
     try std.testing.expectEqual(post_degrade.total_rows, saboteur.last_total_rows.?);
     try std.testing.expect(std.mem.find(u8, selected, "stored-preview") != null);
-    try std.testing.expect(std.mem.find(u8, selected, "Full saved result unavailable.") != null);
+    try std.testing.expect(std.mem.find(u8, selected, "full saved result unavailable.") != null);
 }
 
 test "full projection prefers a persisted command artifact over the compact tool sidecar" {
@@ -1755,7 +1755,7 @@ test "full projection prefers a persisted command artifact over the compact tool
     try std.testing.expect(std.mem.find(u8, source, "<stdout>") != null);
     try std.testing.expect(std.mem.find(u8, source, "LITERAL_ARTIFACT_ENVELOPE") != null);
     try std.testing.expect(std.mem.find(u8, source, "RETAINED_COMMAND_DUPLICATE") == null);
-    try std.testing.expect(std.mem.find(u8, source, "Full saved result unavailable.") == null);
+    try std.testing.expect(std.mem.find(u8, source, "full saved result unavailable.") == null);
 
     const degraded_measurement = try measureProjection(alloc, &projection, null, 80);
     const degraded = try renderProjectionViewportSource(
@@ -1768,7 +1768,7 @@ test "full projection prefers a persisted command artifact over the compact tool
     );
     defer alloc.free(degraded);
     try std.testing.expect(std.mem.find(u8, degraded, "RETAINED_COMMAND_DUPLICATE") != null);
-    try std.testing.expect(std.mem.find(u8, degraded, "Full saved result unavailable.") != null);
+    try std.testing.expect(std.mem.find(u8, degraded, "full saved result unavailable.") != null);
 }
 
 test "stored command artifact appends records beyond the callback count once" {
@@ -3212,7 +3212,7 @@ test "missing stored result renders the retained preview and partial notice" {
     const source = try renderProjectionViewportSource(alloc, &projection, null, 80, 3, 0);
     defer alloc.free(source);
     try std.testing.expect(std.mem.find(u8, source, "retained preview") != null);
-    try std.testing.expect(std.mem.find(u8, source, "Full saved result unavailable.") != null);
+    try std.testing.expect(std.mem.find(u8, source, "full saved result unavailable.") != null);
 }
 
 test "missing command artifact uses the retained tool result sidecar" {
@@ -3268,7 +3268,7 @@ test "missing command artifact uses the retained tool result sidecar" {
     defer alloc.free(source);
     try std.testing.expect(std.mem.find(u8, source, "RETAINED_COMMAND_FALLBACK") != null);
     try std.testing.expect(std.mem.find(u8, source, "<stdout>") == null);
-    try std.testing.expect(std.mem.find(u8, source, "Full saved result unavailable.") == null);
+    try std.testing.expect(std.mem.find(u8, source, "full saved result unavailable.") == null);
 }
 
 test "paged command result removes an envelope split across source pages" {
@@ -5434,7 +5434,7 @@ fn storedResultFallbackBytes(
         &out.writer,
         styles,
         stored.line_prefix,
-        "Full saved result unavailable.",
+        "full saved result unavailable.",
     );
     return out.toOwnedSlice();
 }
@@ -5957,7 +5957,7 @@ const ProjectionComposeContext = struct {
         var head: std.Io.Writer.Allocating = .init(self.alloc);
         defer head.deinit();
         try head.writer.writeAll("  ");
-        if (notice.tone == .@"error") try head.writer.writeAll("Error · ");
+        if (notice.tone == .@"error") try head.writer.writeAll("error · ");
         var clock_buf: [32]u8 = undefined;
         if (full_transcript_metadata.formatLineTime(&clock_buf, notice.created_at_ms, self.previousTimeMs())) |clock| {
             try head.writer.print("{s} · ", .{clock});
@@ -5991,7 +5991,7 @@ const ProjectionComposeContext = struct {
         try writeWithoutSgr(&summary.writer, raw.bytes);
         var line: std.Io.Writer.Allocating = .init(self.alloc);
         defer line.deinit();
-        try line.writer.writeAll("  Turn · ");
+        try line.writer.writeAll("  turn · ");
         var clock_buf: [32]u8 = undefined;
         if (full_transcript_metadata.formatLineTime(&clock_buf, raw.created_at_ms, self.previousTimeMs())) |clock| {
             try line.writer.print("{s} · ", .{clock});
@@ -7113,14 +7113,14 @@ fn appendTerminalSafeIndented(writer: *std.Io.Writer, alloc: Allocator, raw: []c
 }
 
 test "containsIgnoringSgr matches arguments inside styled tool headings" {
-    const styled = "● Ran\x1b[0m \x1b[38;5;245mprintf \x1b[38;5;250m'hello world'\x1b[39m\x1b[38;5;245m\x1b[0m";
+    const styled = "● ran\x1b[0m \x1b[38;5;245mprintf \x1b[38;5;250m'hello world'\x1b[39m\x1b[38;5;245m\x1b[0m";
     try std.testing.expect(containsIgnoringSgr(styled, "printf 'hello world'"));
-    try std.testing.expect(containsIgnoringSgr(styled, "Ran"));
+    try std.testing.expect(containsIgnoringSgr(styled, "ran"));
     try std.testing.expect(!containsIgnoringSgr(styled, "missing"));
     try std.testing.expect(containsIgnoringSgr("plain row", "plain"));
     try std.testing.expect(containsIgnoringSgr("\x1b[38;5;245m", "x") == false);
     // A value inside a longer word is a coincidence, not the value shown.
-    try std.testing.expect(!containsIgnoringSgr("Sent input to python3", "y"));
-    try std.testing.expect(containsIgnoringSgr("Read src/foo.zig:1-10", "src/foo.zig"));
-    try std.testing.expect(containsIgnoringSgr("Sent y then python3", "y"));
+    try std.testing.expect(!containsIgnoringSgr("sent input to python3", "y"));
+    try std.testing.expect(containsIgnoringSgr("read src/foo.zig:1-10", "src/foo.zig"));
+    try std.testing.expect(containsIgnoringSgr("sent y then python3", "y"));
 }

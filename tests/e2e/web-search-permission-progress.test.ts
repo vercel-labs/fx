@@ -28,8 +28,8 @@ async function runWithoutGatewayAuth(args: string[]) {
 }
 
 function expectNoSearchProgress(stderr: string) {
-  expect(stderr).not.toContain("Searching ");
-  expect(stderr).not.toContain("Found ");
+  expect(stderr).not.toContain("searching ");
+  expect(stderr).not.toContain("found ");
 }
 
 describe("web_search permission progress", () => {
@@ -43,7 +43,7 @@ describe("web_search permission progress", () => {
       ]);
 
       expect(result.code).toBe(1);
-      expect(result.stderr).toContain("fx needs access to Vercel AI Gateway. Run fx login to sign in, fx login vercel --api-key to use an API key, or set AI_GATEWAY_API_KEY.");
+      expect(result.stderr).toContain("fx needs access to vercel AI gateway. run fx login to sign in, fx login vercel --api-key to use an API key, or set AI_GATEWAY_API_KEY.");
       expectNoSearchProgress(result.stderr);
     },
     TIMEOUT,

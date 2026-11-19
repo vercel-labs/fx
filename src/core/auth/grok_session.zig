@@ -7,7 +7,7 @@ const subscription_session = @import("subscription_session.zig");
 const store = subscription_session.Store(.{
     .auth_file_name = profile_paths.grok_auth_file_name,
     .mutation_lock_file_name = "grok-auth.lock",
-    .trace_label = "Grok",
+    .trace_label = "grok",
 }, error.InvalidGrokAuthSession, error.GrokOAuthUnavailable);
 
 pub const Session = store.Session;

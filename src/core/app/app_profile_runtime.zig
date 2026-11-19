@@ -135,9 +135,9 @@ pub const LaunchCompletion = struct {
         if (!has_default) out[0] = .{
             .full = try arena.print("/launch {s}", .{defaults.profile_name}),
             .description = if (listing.limited)
-                "Not in listing; list limited, type /launch <name>"
+                "not in listing; list limited, type /launch <name>"
             else
-                "Not in listing; launch validates this profile",
+                "not in listing; launch validates this profile",
             .select_description = true,
         };
         for (listed, rows, out[offset..], offset..) |entry, row, *completion, index| {
@@ -146,9 +146,9 @@ pub const LaunchCompletion = struct {
                 .full = try arena.print("/launch {s}", .{entry.name}),
                 .description = if (listing.limited and index == 0)
                     if (description) |text|
-                        try arena.print("{s}  List limited; type /launch <name>", .{text})
+                        try arena.print("{s}  list limited; type /launch <name>", .{text})
                     else
-                        "List limited; type /launch <name>"
+                        "list limited; type /launch <name>"
                 else
                     description,
                 .select_description = true,
@@ -452,7 +452,7 @@ test "a limited launch listing keeps the default profile first" {
     defer completion.deinit();
     try std.testing.expect(completion.refresh(std.testing.allocator, "/launch ", home, null, .{ .profile_name = "reviewer" }));
     try std.testing.expectEqualStrings("/launch reviewer", completion.entries[0].full);
-    try std.testing.expect(std.mem.find(u8, completion.entries[0].description.?, "Not in listing") != null);
+    try std.testing.expect(std.mem.find(u8, completion.entries[0].description.?, "not in listing") != null);
     try std.testing.expect(std.mem.find(u8, completion.entries[0].description.?, "list limited") != null);
     // Builtins remain usable even when no folder entries can be read.
     try std.testing.expectEqual(@as(usize, 3), completion.entries.len);

@@ -99,7 +99,7 @@ describe.skipIf(SKIP)("tui: render stress", () => {
 
         const firstPrompt = `visible_user_prompt_${run}`;
         await session.sendText(firstPrompt);
-        await session.waitForText("fx needs access to Vercel AI Gateway", 5_000);
+        await session.waitForText("fx needs access to vercel AI gateway", 5_000);
 
         const tailToken = `tail_${run}_visibl`;
         await session.sendKeys(`-l '${longInput(run)}'`);
@@ -114,7 +114,7 @@ describe.skipIf(SKIP)("tui: render stress", () => {
 
         await session.sendKeys("C-u");
         await session.sendText("/help");
-        await session.waitForText("commands   < All >", 5_000);
+        await session.waitForText("commands   < all >", 5_000);
         await session.sendKeys("Escape");
         await session.waitForPane((pane) => !pane.includes("enter open"), 5_000);
         await session.sendText("/allowlist");

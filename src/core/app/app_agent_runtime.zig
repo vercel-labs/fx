@@ -1779,8 +1779,8 @@ fn formatToolAction(
         const label = if (activity.compatibility_tool) |compatibility_tool|
             specLabel(compatibility_tool, state, denied_label)
         else switch (state) {
-            .active => "Running",
-            .completed => "Ran",
+            .active => "running",
+            .completed => "ran",
             .denied => denied_label.?,
         };
         return formatCommandActionValue(
@@ -1839,8 +1839,8 @@ fn formatWebSearchAction(arena: Allocator, call: ToolCall, state: ToolActionStat
         return formatInvalidArgsToolAction(arena, state, denied_label);
     };
     const label = switch (state) {
-        .active => "Searching",
-        .completed => "Searched",
+        .active => "searching",
+        .completed => "searched",
         .denied => denied_label.?,
     };
     return formatToolActionValue(arena, label, try tool_presentation.formatWebSearchActionDetail(arena, args));
@@ -1848,8 +1848,8 @@ fn formatWebSearchAction(arena: Allocator, call: ToolCall, state: ToolActionStat
 
 fn formatMissingSpecToolAction(arena: Allocator, state: ToolActionState, denied_label: ?[]const u8, name: []const u8) ![]const u8 {
     return switch (state) {
-        .active => formatToolActionValue(arena, "Working", name),
-        .completed => formatToolActionValue(arena, "Completed", name),
+        .active => formatToolActionValue(arena, "working", name),
+        .completed => formatToolActionValue(arena, "completed", name),
         .denied => formatToolActionValue(arena, denied_label.?, name),
     };
 }
@@ -1857,7 +1857,7 @@ fn formatMissingSpecToolAction(arena: Allocator, state: ToolActionState, denied_
 fn formatInvalidArgsToolAction(arena: Allocator, state: ToolActionState, denied_label: ?[]const u8) ![]const u8 {
     return switch (state) {
         .active => arena.print("● Working…\x1b[0m", .{}),
-        .completed => formatToolActionValue(arena, "Completed", "tool call"),
+        .completed => formatToolActionValue(arena, "completed", "tool call"),
         .denied => formatToolActionValue(arena, denied_label.?, "tool call"),
     };
 }
@@ -1932,13 +1932,13 @@ const test_tools = [_]tool_dispatch.Tool{
 const test_tool_registry = tool_dispatch.Registry{ .tools = test_tools[0..] };
 const custom_label_tool = tool_dispatch.Tool{
     .name = "custom_registered_tool",
-    .description = "Custom registered test tool.",
+    .description = "custom registered test tool.",
     .model_schema = .{
         .name = "custom_registered_tool",
-        .description = "Custom registered test tool.",
+        .description = "custom registered test tool.",
     },
-    .action_label = "Custom running",
-    .completed_action_label = "Custom ran",
+    .action_label = "custom running",
+    .completed_action_label = "custom ran",
     .label_arg_kind = .name,
     .label_arg_default = "custom fallback",
     .decode = test_builtin_tools.read_file.decode,
@@ -2336,7 +2336,7 @@ const FakeApp = struct {
 
     pub fn formatToolExecutionErrorForAgent(self: *FakeApp, arena: Allocator, tool_name: []const u8, err: anyerror) ![]const u8 {
         _ = self;
-        return arena.print("Tool {s} failed: {s}", .{ tool_name, @errorName(err) });
+        return arena.print("tool {s} failed: {s}", .{ tool_name, @errorName(err) });
     }
 
     pub fn agent(self: anytype) @TypeOf(&self.main_agent) {
@@ -2865,7 +2865,7 @@ test "app agent runtime formats active completed denied and MCP tool actions" {
     try std.testing.expect(std.mem.find(u8, active, "•") == null);
     try std.testing.expect(std.mem.find(u8, active, "⏺") == null);
     try std.testing.expect(std.mem.find(u8, active, "▸") == null);
-    try std.testing.expect(std.mem.find(u8, active, "Running") != null);
+    try std.testing.expect(std.mem.find(u8, active, "running") != null);
     try std.testing.expect(std.mem.find(u8, active, "\x1b[38;5;252mzig\x1b[39m") != null);
     try std.testing.expect(std.mem.find(u8, active, " build") != null);
 
@@ -2874,12 +2874,12 @@ test "app agent runtime formats active completed denied and MCP tool actions" {
     try std.testing.expect(std.mem.find(u8, completed, "•") == null);
     try std.testing.expect(std.mem.find(u8, completed, "⏺") == null);
     try std.testing.expect(std.mem.find(u8, completed, "▸") == null);
-    try std.testing.expect(std.mem.find(u8, completed, "Ran") != null);
+    try std.testing.expect(std.mem.find(u8, completed, "ran") != null);
     try std.testing.expect(std.mem.find(u8, completed, "\x1b[38;5;252mzig\x1b[39m") != null);
     try std.testing.expect(std.mem.find(u8, completed, " build") != null);
 
-    const denied = try app.describeToolActionDenied(app.agent(), arena, run_call, "Denied");
-    try std.testing.expect(std.mem.find(u8, denied, "Denied") != null);
+    const denied = try app.describeToolActionDenied(app.agent(), arena, run_call, "denied");
+    try std.testing.expect(std.mem.find(u8, denied, "denied") != null);
     try std.testing.expect(std.mem.find(u8, denied, "\x1b[38;5;252mzig\x1b[39m") != null);
     try std.testing.expect(std.mem.find(u8, denied, " build") != null);
 
@@ -2890,12 +2890,12 @@ test "app agent runtime formats active completed denied and MCP tool actions" {
     };
     const malformed_completed = try app.describeToolActionCompleted(app.agent(), arena, malformed_registered);
     try std.testing.expectEqualStrings(
-        "● Completed\x1b[0m \x1b[38;5;245mtool call\x1b[0m",
+        "● completed\x1b[0m \x1b[38;5;245mtool call\x1b[0m",
         malformed_completed,
     );
-    const malformed_denied = try app.describeToolActionDenied(app.agent(), arena, malformed_registered, "Denied");
+    const malformed_denied = try app.describeToolActionDenied(app.agent(), arena, malformed_registered, "denied");
     try std.testing.expectEqualStrings(
-        "● Denied\x1b[0m \x1b[38;5;245mtool call\x1b[0m",
+        "● denied\x1b[0m \x1b[38;5;245mtool call\x1b[0m",
         malformed_denied,
     );
 
@@ -2917,25 +2917,25 @@ test "app agent runtime formats active completed denied and MCP tool actions" {
 
     const mcp_call: ToolCall = .{ .id = "mcp", .name = "mcp_lookup", .arguments_json = "{}" };
     const mcp_action = try app.describeToolActionCompleted(app.agent(), arena, mcp_call);
-    try std.testing.expect(std.mem.find(u8, mcp_action, "Completed") != null);
+    try std.testing.expect(std.mem.find(u8, mcp_action, "completed") != null);
     try std.testing.expect(std.mem.find(u8, mcp_action, "MCP") == null);
     try std.testing.expect(std.mem.find(u8, mcp_action, "mcp_lookup") != null);
 
     const advertised = [_][]const u8{"mcp_lookup"};
     const advertised_mcp_active = try Runtime(FakeApp).describeToolAction(&app, (&app).agent(), arena, mcp_call, null, &advertised, &test_ignored_list_entries, 100, 1024, 40, 120, 2048, 2, test_gateway_chat_url);
     try std.testing.expectEqualStrings(
-        "● Running MCP\x1b[0m \x1b[38;5;245mmcp_lookup\x1b[0m",
+        "● running MCP\x1b[0m \x1b[38;5;245mmcp_lookup\x1b[0m",
         advertised_mcp_active,
     );
     const advertised_mcp_action = try Runtime(FakeApp).describeToolActionCompleted(&app, (&app).agent(), arena, mcp_call, null, &advertised, &test_ignored_list_entries, 100, 1024, 40, 120, 2048, 2, test_gateway_chat_url);
     try std.testing.expectEqualStrings(
-        "● Ran MCP\x1b[0m \x1b[38;5;245mmcp_lookup\x1b[0m",
+        "● ran MCP\x1b[0m \x1b[38;5;245mmcp_lookup\x1b[0m",
         advertised_mcp_action,
     );
     app.mcp_has_tool_calls = 0;
-    const advertised_mcp_denied = try Runtime(FakeApp).describeToolActionDenied(&app, (&app).agent(), arena, mcp_call, null, "Denied", &advertised, &test_ignored_list_entries, 100, 1024, 40, 120, 2048, 2, test_gateway_chat_url);
+    const advertised_mcp_denied = try Runtime(FakeApp).describeToolActionDenied(&app, (&app).agent(), arena, mcp_call, null, "denied", &advertised, &test_ignored_list_entries, 100, 1024, 40, 120, 2048, 2, test_gateway_chat_url);
     try std.testing.expectEqualStrings(
-        "● Denied\x1b[0m \x1b[38;5;245mmcp_lookup\x1b[0m",
+        "● denied\x1b[0m \x1b[38;5;245mmcp_lookup\x1b[0m",
         advertised_mcp_denied,
     );
     try std.testing.expectEqual(@as(usize, 0), app.mcp_has_tool_calls);
@@ -2968,11 +2968,11 @@ test "app agent runtime formats registered tool labels from context registry" {
         .arguments_json = "{\"name\":\"registry value\"}",
     };
     const active = try app.describeToolAction(app.agent(), arena, call);
-    try std.testing.expect(std.mem.find(u8, active, "Custom running") != null);
+    try std.testing.expect(std.mem.find(u8, active, "custom running") != null);
     try std.testing.expect(std.mem.find(u8, active, "registry value") != null);
 
     const completed = try app.describeToolActionCompleted(app.agent(), arena, call);
-    try std.testing.expect(std.mem.find(u8, completed, "Custom ran") != null);
+    try std.testing.expect(std.mem.find(u8, completed, "custom ran") != null);
     try std.testing.expect(std.mem.find(u8, completed, "registry value") != null);
 }
 
@@ -3012,12 +3012,12 @@ test "native web_search labels preserve bounded query and domain filters" {
         .arguments_json = "{\"query\":\"current Zig release\",\"allowed_domains\":[\"ziglang.org\",\"github.com\"]}",
     };
     const active = try app.describeToolAction(app.agent(), arena, call);
-    try std.testing.expect(std.mem.find(u8, active, "Searching") != null);
+    try std.testing.expect(std.mem.find(u8, active, "searching") != null);
     try std.testing.expect(std.mem.find(u8, active, "current Zig release") != null);
     try std.testing.expect(std.mem.find(u8, active, "allowed: ziglang.org, github.com") != null);
 
     const completed = try app.describeToolActionCompleted(app.agent(), arena, call);
-    try std.testing.expect(std.mem.find(u8, completed, "Searched") != null);
+    try std.testing.expect(std.mem.find(u8, completed, "searched") != null);
     try std.testing.expect(std.mem.find(u8, completed, "current Zig release") != null);
 }
 
@@ -3037,11 +3037,11 @@ test "provider search labels use search wording and generic fallback" {
         .provenance = .provider_executed,
     };
     const active = try app.describeToolAction(app.agent(), arena, call);
-    try std.testing.expect(std.mem.find(u8, active, "Searching") != null);
+    try std.testing.expect(std.mem.find(u8, active, "searching") != null);
     try std.testing.expect(std.mem.find(u8, active, "web") != null);
 
     const completed = try app.describeToolActionCompleted(app.agent(), arena, call);
-    try std.testing.expect(std.mem.find(u8, completed, "Searched") != null);
+    try std.testing.expect(std.mem.find(u8, completed, "searched") != null);
     try std.testing.expect(std.mem.find(u8, completed, "web") != null);
 }
 
@@ -3371,7 +3371,7 @@ test "manual compaction worker call commits a checkpoint without a continuation"
     const done = events.items[1].semantic_notice;
     try std.testing.expectEqualStrings("", done.topic);
     try std.testing.expectEqual(types.NoticeTone.success, done.tone);
-    try std.testing.expect(std.mem.startsWith(u8, done.body, "Context compacted ("));
+    try std.testing.expect(std.mem.startsWith(u8, done.body, "context compacted ("));
     try std.testing.expect(std.mem.endsWith(u8, done.body, "s)"));
 
     const completed_activity = app.agent().worker.compactionActivitySnapshot();
@@ -3823,7 +3823,7 @@ test "app agent runtime highlights shell command rows over the tool text base" {
     // The label and untokenized command text keep the muted tool-text base,
     // while the command verb and quoted string pick up syntax palette colors
     // and return to the base after their closes.
-    try std.testing.expect(std.mem.startsWith(u8, completed, "● Ran\x1b[0m \x1b[38;5;245m"));
+    try std.testing.expect(std.mem.startsWith(u8, completed, "● ran\x1b[0m \x1b[38;5;245m"));
     try std.testing.expect(std.mem.find(
         u8,
         completed,

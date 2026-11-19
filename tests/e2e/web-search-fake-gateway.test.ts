@@ -589,7 +589,7 @@ describe("web_search Gateway fixture", () => {
         expect(gateway.requests[0].body).not.toContain("google/gemini-3-flash");
         expect(gateway.requests[1].headers.get("ai-language-model-id")).toBe(OUTER_MODEL);
         expect(gateway.requests[1].body).toContain(SOURCE_URL);
-        expect(result.stderr).toContain("Searching web");
+        expect(result.stderr).toContain("searching web");
         const initial = parseGatewayRequest(gateway.requests[0]!.body);
         const continuing = parseGatewayRequest(gateway.requests[1]!.body);
         expect(serializedToolNames(initial)).toEqual(
@@ -1081,8 +1081,8 @@ describe("web_search Gateway fixture", () => {
         expect(json.output).toContain("zero search handled");
         expect(json.tool_calls).toHaveLength(0);
         expect(gateway.requests).toHaveLength(2);
-        expect(result.stderr).toContain("Searching web");
-        expect(result.stderr).not.toContain("Found ");
+        expect(result.stderr).toContain("searching web");
+        expect(result.stderr).not.toContain("found ");
       } finally {
         gateway.stop();
         rmSync(root.root, { recursive: true, force: true });
@@ -1162,8 +1162,8 @@ describe("web_search Gateway fixture", () => {
         expect(toolShapesWithoutDescriptions(continuing)).toEqual(
           toolShapesWithoutDescriptions(initial),
         );
-        expect(updates).not.toContain("Searching latest Zig release");
-        expect(updates).not.toContain("Found 1 result for latest Zig release");
+        expect(updates).not.toContain("searching latest Zig release");
+        expect(updates).not.toContain("found 1 result for latest Zig release");
         expect(toolUpdates).toHaveLength(2);
         expect(toolUpdates[0]).toEqual({
           sessionUpdate: "tool_call",

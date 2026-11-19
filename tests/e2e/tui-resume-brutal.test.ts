@@ -504,7 +504,7 @@ async function thrash(
     await time(
       metrics.resize,
       () => session.resizeWindow(width, height),
-      () => session.waitForPane((pane) => stripAnsi(pane).includes("< Current workspace >"), TIMEOUT),
+      () => session.waitForPane((pane) => stripAnsi(pane).includes("< current workspace >"), TIMEOUT),
     );
     await time(
       metrics.close,
@@ -512,8 +512,8 @@ async function thrash(
       () => session.waitForPane((pane) => {
         const plain = stripAnsi(pane);
         return hasEmptyComposer(plain) &&
-          !plain.includes("< Current workspace >") &&
-          !plain.includes("< All workspaces >");
+          !plain.includes("< current workspace >") &&
+          !plain.includes("< all workspaces >");
       }, TIMEOUT),
     );
     expect(session.paneStatus().dead).toBe(false);
@@ -567,7 +567,7 @@ async function runStress(config: Config): Promise<Paths> {
     await session.sendKeys("Escape");
     await session.waitForPane((pane) => {
       const plain = stripAnsi(pane);
-      return hasEmptyComposer(plain) && !plain.includes("< Current workspace >");
+      return hasEmptyComposer(plain) && !plain.includes("< current workspace >");
     }, TIMEOUT);
     await session.sendText("/quit");
     expect(await session.waitForSessionEnd(TIMEOUT * 2)).toBe(true);

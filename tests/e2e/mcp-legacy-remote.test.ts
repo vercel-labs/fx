@@ -252,7 +252,7 @@ describe("version-scoped legacy MCP remote transports", () => {
       const root = createRoot(`ask-${version}`, "http", streamable.url);
       gateway = startToolGateway(`${version} complete.`);
 
-      const result = await runAsk(root, gateway, `Call the ${version} fixture.`);
+      const result = await runAsk(root, gateway, `call the ${version} fixture.`);
 
       expect(result.code).toBe(0);
       expect(JSON.parse(result.stdout).output).toContain(`${version} complete.`);
@@ -297,7 +297,7 @@ describe("version-scoped legacy MCP remote transports", () => {
       const root = createRoot(`resume-${version}`, "http", streamable.url);
       gateway = startToolGateway(`${version} resumed.`);
 
-      const result = await runAsk(root, gateway, `Resume the ${version} fixture.`);
+      const result = await runAsk(root, gateway, `resume the ${version} fixture.`);
 
       expect(result.code).toBe(0);
       expect(gateway.requests[2]?.body).toContain(
@@ -882,7 +882,7 @@ describe("version-scoped legacy MCP remote transports", () => {
         ).toBe(true);
 
         await tui.sendInterruptEscapePair(10_000);
-        await tui.waitForText(`Cancelled ${TOOL_NAME}`, 10_000);
+        await tui.waitForText(`cancelled ${TOOL_NAME}`, 10_000);
         const cancelDeadline = Date.now() + 5_000;
         while (
           (streamable.cancellationNotifications === 0 ||
@@ -962,7 +962,7 @@ describe("version-scoped legacy MCP remote transports", () => {
       // fx is still running: the next command answers.
       await tui.waitForComposer(10_000);
       await tui.sendText("/mcp list");
-      await tui.waitForText("No MCP servers configured.", 10_000);
+      await tui.waitForText("no MCP servers configured.", 10_000);
     },
     40_000,
   );

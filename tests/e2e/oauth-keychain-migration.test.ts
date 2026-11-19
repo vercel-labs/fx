@@ -216,7 +216,7 @@ keychainTest(
       });
       expect(result.timedOut).toBe(false);
       expect(result.code).toBe(1);
-      expect(result.stderr).toContain("Saved credential storage is unavailable");
+      expect(result.stderr).toContain("saved credential storage is unavailable");
       expect(issuer.requests).toHaveLength(0);
       expect(readFileSync(path, "utf8")).toBe(original);
     } finally {
@@ -291,7 +291,7 @@ keychainTest(
 
       const logout = await runFx(["logout"], { env, timeoutMs: TIMEOUT });
       expect(logout.code, `stdout: ${logout.stdout}\nstderr: ${logout.stderr}`).toBe(0);
-      expect(logout.stdout).toBe("Signed out of fx.\n");
+      expect(logout.stdout).toBe("signed out of fx.\n");
       expect(loadKeychainItem(account, home)).toBeNull();
       expect(issuer.requests.filter((request) => request.path === "/oauth/revoke")).toHaveLength(2);
     } finally {

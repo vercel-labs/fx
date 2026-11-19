@@ -521,7 +521,7 @@ async function expectChangedCanonicalVisionPathFailure(
     });
     await session.waitForPane(hasEmptyComposer, TIMEOUT);
     await session.sendText("Inspect the approved image path.");
-    await session.waitForText("Would you like to allow this action?", TIMEOUT);
+    await session.waitForText("would you like to allow this action?", TIMEOUT);
     await session.waitForText(targetPath, TIMEOUT);
 
     replaceTarget(targetPath);
@@ -856,7 +856,7 @@ describe("Vision route fake Gateway", () => {
         expect(JSON.stringify(retryPrompt.at(-1))).toContain(
           "Continue from the preceding tool result.",
         );
-        expect(result.stderr).toBe("Inspecting images\n");
+        expect(result.stderr).toBe("inspecting images\n");
       } finally {
         gateway.stop();
         rmSync(root.root, { recursive: true, force: true });
@@ -1602,7 +1602,7 @@ describe("Vision route fake Gateway", () => {
         expect(firstJson.session_id.length).toBeGreaterThan(0);
         expect(firstJson.output).toContain("Gemini recovered after rejected Vision");
         expect(firstJson.tool_calls).toContainEqual({ name: "vision", status: "error" });
-        expect(first.stderr).not.toContain("Inspecting images");
+        expect(first.stderr).not.toContain("inspecting images");
         expect(first.stderr).not.toContain("Vision is unavailable right now");
         expect(gateway.chatRequests).toHaveLength(2);
         expect(gateway.chatRequests[0].body).not.toContain('"name":"vision"');
@@ -1825,7 +1825,7 @@ describe("Vision route fake Gateway", () => {
         const json = parseFxJson(result);
         expect(json.output).toContain("bounded Vision answer");
         expect(json.tool_calls).toContainEqual({ name: "vision", status: "error" });
-        expect(result.stderr).toBe("Inspecting images\n");
+        expect(result.stderr).toBe("inspecting images\n");
         expect(gateway.chatRequests).toHaveLength(3);
         expect(gateway.chatRequests[1].headers.get("ai-language-model-id")).toBe(GEMINI_MODEL);
         const resultText = toolResultText(gateway.chatRequests[2].body, "vision_bound");
@@ -2064,7 +2064,7 @@ describe("Vision route fake Gateway", () => {
     async () => {
       const root = createIsolatedRoot();
       const fixture = createScopedImageFixture(root);
-      const gateway = startImageGateway([sseText("First answer."), sseText("It shows a logo.")]);
+      const gateway = startImageGateway([sseText("first answer."), sseText("It shows a logo.")]);
       try {
         const env = fakeGatewayEnv(root, gateway, KIMI_MODEL);
         const first = parseFxJson(
@@ -2212,7 +2212,7 @@ describe("Vision route fake Gateway", () => {
         // One line names the connection, the image, and fast mode together.
         expect(fast.stderr.split(CATALOG_CONNECT_IMAGE_FAST_NOTICE)).toHaveLength(2);
         expect(fast.stderr.split("couldn't connect")).toHaveLength(2);
-        expect(fast.stderr).not.toContain("Fast mode is unavailable");
+        expect(fast.stderr).not.toContain("fast mode is unavailable");
         expect(fast.stderr).not.toContain("Earlier images aren't reaching the model right now");
 
         expect(down.chatRequests).toHaveLength(2);
@@ -2261,7 +2261,7 @@ describe("Vision route fake Gateway", () => {
         const json = parseFxJson(result);
         expect(json.output).toContain("Vision unavailable final answer");
         expect(json.tool_calls).toContainEqual({ name: "vision", status: "error" });
-        expect(result.stderr).toContain("Inspecting images\n");
+        expect(result.stderr).toContain("inspecting images\n");
         expect(result.stderr).toContain(
           "Tip: This model doesn’t support OCR, and Vision is unavailable right now. Try switching to a vision-capable model.",
         );
@@ -2708,7 +2708,7 @@ describe("Vision route fake Gateway", () => {
         const json = parseFxJson(result);
         expect(json.output).toContain("recovered after invalid Vision result");
         expect(json.tool_calls).toContainEqual({ name: "vision", status: "error" });
-        expect(result.stderr).toBe("Inspecting images\n");
+        expect(result.stderr).toBe("inspecting images\n");
         expect(gateway.chatRequests).toHaveLength(4);
         expect(gateway.chatRequests[1].headers.get("ai-language-model-id")).toBe(GEMINI_MODEL);
         expect(gateway.chatRequests[2].headers.get("ai-language-model-id")).toBe(GEMINI_MODEL);
@@ -2817,7 +2817,7 @@ describe("Vision route fake Gateway", () => {
         const json = parseFxJson(result);
         expect(json.output).toContain("recovered without re-uploading the image");
         expect(json.tool_calls).toContainEqual({ name: "vision", status: "success" });
-        expect(result.stderr).toBe("Inspecting images\n");
+        expect(result.stderr).toBe("inspecting images\n");
         expect(gateway.chatRequests).toHaveLength(4);
         expect(gateway.chatRequests[1].headers.get("ai-language-model-id")).toBe(GEMINI_MODEL);
         expect(gateway.chatRequests[2].headers.get("ai-language-model-id")).toBe(GEMINI_MODEL);
@@ -3167,7 +3167,7 @@ describe("Vision route fake Gateway", () => {
         await session.sendLiteral(" look at this image");
         await session.sendKeys("Enter");
 
-        await session.waitForText("Would you like to allow this action?", TIMEOUT);
+        await session.waitForText("would you like to allow this action?", TIMEOUT);
         await session.sendKeys("1");
         await session.sendKeys("Enter");
         await session.waitForText("@ home image flow complete", TIMEOUT);
@@ -3281,7 +3281,7 @@ describe("Vision route fake Gateway", () => {
         });
         await session.waitForPane(hasEmptyComposer, TIMEOUT);
         await session.sendText("Inspect the requested Desktop image.");
-        await session.waitForText("Would you like to allow this action?", TIMEOUT);
+        await session.waitForText("would you like to allow this action?", TIMEOUT);
         await session.waitForText(imagePath, TIMEOUT);
         await session.sendKeys("1");
         await session.sendKeys("Enter");
@@ -3350,7 +3350,7 @@ describe("Vision route fake Gateway", () => {
         });
         await session.waitForPane(hasEmptyComposer, TIMEOUT);
         await session.sendText("Inspect the hard-linked image path.");
-        await session.waitForText("Would you like to allow this action?", TIMEOUT);
+        await session.waitForText("would you like to allow this action?", TIMEOUT);
         await session.waitForText(approvedPath, TIMEOUT);
         await session.sendKeys("1");
         await session.sendKeys("Enter");
@@ -3421,7 +3421,7 @@ describe("Vision route fake Gateway", () => {
         });
         await session.waitForPane(hasEmptyComposer, TIMEOUT);
         await session.sendText("Inspect the approved image path.");
-        await session.waitForText("Would you like to allow this action?", TIMEOUT);
+        await session.waitForText("would you like to allow this action?", TIMEOUT);
         await session.waitForText(targetA, TIMEOUT);
 
         rmSync(approvedPath);
@@ -3621,9 +3621,9 @@ describe("Vision route fake Gateway", () => {
         await session.sendText(`/image ${imagePath}`);
         await session.waitForText("attached image: feedback.png", TIMEOUT);
         await session.sendText(rootRequest);
-        await session.waitForText("Would you like to allow this action?", TIMEOUT);
+        await session.waitForText("would you like to allow this action?", TIMEOUT);
         await session.sendKeys("Tab");
-        await session.waitForText("Yes, and tell fx what to do next", TIMEOUT);
+        await session.waitForText("yes, and tell fx what to do next", TIMEOUT);
         await session.sendLiteralText(feedback);
         await session.waitForText(`Yes, ${feedback}`, TIMEOUT);
         await session.sendKeys("Enter");
@@ -3698,10 +3698,10 @@ describe("Vision route fake Gateway", () => {
         await session.waitForText("attached image: first.png", TIMEOUT);
         await session.sendText("Inspect the first attached image.");
         const firstApproval = await session.waitForText(
-          "Would you like to allow this action?",
+          "would you like to allow this action?",
           TIMEOUT,
         );
-        expect(firstApproval).toContain("Inspecting images");
+        expect(firstApproval).toContain("inspecting images");
         writeFileSync(firstImagePath, readFileSync(firstMutatedPath));
         await session.sendKeys("1");
         await session.sendKeys("Enter");
@@ -3711,18 +3711,18 @@ describe("Vision route fake Gateway", () => {
         await session.waitForText("attached image: second.png", TIMEOUT);
         await session.sendText("Inspect the second attached image.");
         const secondApproval = await session.waitForText(
-          "Would you like to allow this action?",
+          "would you like to allow this action?",
           TIMEOUT,
         );
-        expect(secondApproval).toContain("Inspecting images");
+        expect(secondApproval).toContain("inspecting images");
         await session.sendKeys("1");
         await session.sendKeys("Enter");
         await session.waitForText("tmux outage continued", TIMEOUT);
 
         const scrollback = await session.captureFullScrollback();
-        expect(scrollback).toContain("Inspected images");
+        expect(scrollback).toContain("inspected images");
         // The failed call is its group's line, with its reason after it.
-        expect(scrollback).toContain("● Couldn't inspect images · Vision is unavailable right now");
+        expect(scrollback).toContain("● couldn't inspect images · Vision is unavailable right now");
         expect(scrollback).toContain(
           "Tip: This model doesn’t support OCR, and Vision is unavailable right now. Try switching to a vision-capable model.",
         );

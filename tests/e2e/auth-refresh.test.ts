@@ -581,7 +581,7 @@ test(
         logoutResult.code,
         `stdout: ${logoutResult.stdout}\nstderr: ${logoutResult.stderr}`,
       ).toBe(0);
-      expect(logoutResult.stdout).toBe("Signed out of fx.\n");
+      expect(logoutResult.stdout).toBe("signed out of fx.\n");
       expect(tokenRequestCount).toBe(1);
       expect(existsSync(join(home, ".fx", "auth.json"))).toBe(false);
       const revocations = oauth.requests.filter(
@@ -1036,7 +1036,7 @@ test(
         `stdout: ${teams.stdout}\nstderr: ${teams.stderr}`,
       ).toBe(0);
       expect(teams.stdout).toBe(
-        "Selected Vercel team: Vercel Labs (vercel-labs).\n",
+        "selected vercel team: Vercel Labs (vercel-labs).\n",
       );
       expect(teams.stderr).toBe("");
 
@@ -1053,7 +1053,7 @@ test(
 
       const logout = await runFx(["logout"], { env, timeoutMs: TIMEOUT });
       expect(logout.code).toBe(0);
-      expect(logout.stdout).toBe("Signed out of fx.\n");
+      expect(logout.stdout).toBe("signed out of fx.\n");
       expect(logout.stderr).toBe("");
 
       expect(
@@ -1123,7 +1123,7 @@ test(
       });
 
       expect(logout.code).toBe(0);
-      expect(logout.stdout).toBe("Signed out of fx.\n");
+      expect(logout.stdout).toBe("signed out of fx.\n");
       expect(logout.stderr).toBe("");
       expect(invalidIssuer.requests).toEqual([]);
       expect(logout.stdout).not.toContain("expired-access-token");

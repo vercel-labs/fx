@@ -889,7 +889,7 @@ fn writeCancelledResolution(writer: *std.Io.Writer) !void {
     try writer.writeAll(ui_render.red_style);
     try writer.writeAll("▪");
     try writer.writeAll(ui_render.reset_style);
-    try writer.writeAll(" Cancelled");
+    try writer.writeAll(" cancelled");
     try writer.writeByte('\n');
 }
 
@@ -1545,7 +1545,7 @@ test "compose question resolutions emits answered summary block" {
     const cancelled_text = try composeQuestionResolutions(std.testing.allocator, &prompt, true, 60);
     defer std.testing.allocator.free(cancelled_text);
     const expected_cancelled = try std.testing.allocator.print(
-        "{s}▪{s} Cancelled\n",
+        "{s}▪{s} cancelled\n",
         .{ ui_render.red_style, ui_render.reset_style },
     );
     defer std.testing.allocator.free(expected_cancelled);

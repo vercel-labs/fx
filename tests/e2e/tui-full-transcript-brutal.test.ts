@@ -994,7 +994,7 @@ async function runStress(config: StressConfig): Promise<StressRoot> {
     expect(readFileSync(paths.stderrPath, "utf8")).toBe("");
 
     await session.sendText("Run the prepared live command while I inspect the transcript.");
-    await session.waitForText("Running ./ctrl-o-live.sh", TIMEOUT);
+    await session.waitForText("running ./ctrl-o-live.sh", TIMEOUT);
     await session.sendLiteralText(DRAFT);
     await waitForMode(session, "main", DRAFT);
     const pid = fxProcessId(session);
@@ -1336,7 +1336,7 @@ test.skipIf(!tmuxAvailable())(
             const current = Number(pane.match(/SAVED_ROW_(\d+)/)?.[1]);
             return current > 0 && current < first;
           }, TIMEOUT);
-          expect(previous).not.toContain("Full saved result unavailable.");
+          expect(previous).not.toContain("full saved result unavailable.");
           for (const marker of previous.matchAll(/SAVED_ROW_(\d+)/g)) {
             expect(previous).toContain(lines[Number(marker[1]) - 1]!);
           }
@@ -1346,7 +1346,7 @@ test.skipIf(!tmuxAvailable())(
       }
       const scrollback = await active.captureFullScrollback();
       expect(scrollback).toContain("Saved read complete.");
-      expect(scrollback).not.toContain("Full saved result unavailable.");
+      expect(scrollback).not.toContain("full saved result unavailable.");
       expect(savedGateway.requests).toHaveLength(2);
       expect(active.isAlive()).toBe(true);
       expect(readFileSync(paths.stderrPath, "utf8")).toBe("");

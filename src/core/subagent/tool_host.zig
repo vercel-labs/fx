@@ -2296,7 +2296,7 @@ pub const Runtime = struct {
     /// Tells the owner, as child `child_id`'s own message, that its request
     /// failed and waits: for a follow-up a message back gives it, when
     /// `resend`, and otherwise for the user. `reason` is the recovery's
-    /// wording, such as "Sign-in expired".
+    /// wording, such as "sign-in expired".
     pub fn noteChildWaiting(self: *Runtime, child_id: []const u8, name: []const u8, reason: []const u8, resend: bool) void {
         const sink = self.report_sink orelse return debug_trace.logf("mailbox", "waiting note dropped child={s} reason=no_parent", .{child_id});
         var arena = std.heap.ArenaAllocator.init(self.alloc);

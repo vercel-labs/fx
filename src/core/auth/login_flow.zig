@@ -43,7 +43,7 @@ pub const LoginError = error{
 
 const LogoutError = error{SessionDeleteFailed};
 
-pub const remote_revocation_warning = "Warning: signed out locally, but the remote session could not be revoked.";
+pub const remote_revocation_warning = "warning: signed out locally, but the remote session could not be revoked.";
 /// `remote_revocation_warning`, when the session's tokens are kept and fx
 /// revokes them later (`pending_revocation`).
 pub const remote_revocation_retry_warning = remote_revocation_warning ++ " " ++ pending_revocation.retry_later ++ ".";
@@ -799,9 +799,9 @@ pub fn runLogin(
     defer prepared.deinit(alloc);
 
     const display_url = prepared.device.verification_uri_complete orelse prepared.device.verification_uri;
-    try writeStdout("Open ");
+    try writeStdout("open ");
     try writeStdout(display_url);
-    try writeStdout("\nCode: ");
+    try writeStdout("\ncode: ");
     try writeStdout(prepared.device.user_code);
     try writeStdout("\n\n");
 
@@ -944,7 +944,7 @@ pub fn runTeams(
     const selected = selection.teams.items[selected_index];
     var changed_team = try validateAndSelectTeam(alloc, &selection, selected_index, validator);
     defer changed_team.deinit(alloc);
-    try writeStdoutFmt("Selected Vercel team: {s} ({s}).\n", .{ selected.name, selected.slug });
+    try writeStdoutFmt("selected vercel team: {s} ({s}).\n", .{ selected.name, selected.slug });
 }
 
 pub fn loadTeamSelection(
@@ -1323,9 +1323,9 @@ const BrowserOpenPrompt = struct {
 
     fn writeWaitingMessage(self: BrowserOpenPrompt) !void {
         if (self.enabled) {
-            try writeStdout("Waiting for authentication. press enter to open this in your browser, or use the URL manually.\n");
+            try writeStdout("waiting for authentication. press enter to open this in your browser, or use the URL manually.\n");
         } else {
-            try writeStdout("Waiting for authentication...\n");
+            try writeStdout("waiting for authentication...\n");
         }
     }
 };
@@ -1506,25 +1506,25 @@ fn currentTeamIndex(teams: []const Team, current: ?[]const u8) ?usize {
 }
 
 fn selectTeamByLine(alloc: Allocator, teams: []const Team, default_index: usize) !usize {
-    try writeStdout("\nSelect a Vercel team for AI Gateway:\n");
-    try writeStdout("Model requests will use the selected team; Gateway access may still require billing or API setup.\n\n");
+    try writeStdout("\nselect a vercel team for AI gateway:\n");
+    try writeStdout("model requests will use the selected team; gateway access may still require billing or API setup.\n\n");
     for (teams, 0..) |team, i| {
         const marker = if (i == default_index) " (default)" else "";
         try writeStdoutFmt("  {d}. {s} ({s}){s}\n", .{ i + 1, team.name, team.slug, marker });
     }
 
     while (true) {
-        try writeStdoutFmt("Team [{d}]: ", .{default_index + 1});
+        try writeStdoutFmt("team [{d}]: ", .{default_index + 1});
         const input = try readLine(alloc);
         defer alloc.free(input);
         const trimmed = std.mem.trim(u8, input, " \t\r\n");
         if (trimmed.len == 0) return default_index;
         const parsed_index = std.fmt.parseUnsigned(usize, trimmed, 10) catch {
-            try writeStdout("Enter a team number from the list.\n");
+            try writeStdout("enter a team number from the list.\n");
             continue;
         };
         if (parsed_index >= 1 and parsed_index <= teams.len) return parsed_index - 1;
-        try writeStdout("Enter a team number from the list.\n");
+        try writeStdout("enter a team number from the list.\n");
     }
 }
 
@@ -1534,8 +1534,8 @@ fn selectTeamInteractive(alloc: Allocator, teams: []const Team, default_index: u
     var raw = try TeamPickerRawMode.enable();
     defer raw.disable();
 
-    try writeStdout("\nSelect a Vercel team for AI Gateway:\n");
-    try writeStdout("Model requests will use the selected team; Gateway access may still require billing or API setup.\n\n");
+    try writeStdout("\nselect a vercel team for AI gateway:\n");
+    try writeStdout("model requests will use the selected team; gateway access may still require billing or API setup.\n\n");
 
     var selected = default_index;
     var first_render = true;

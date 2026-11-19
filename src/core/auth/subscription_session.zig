@@ -292,7 +292,7 @@ pub fn openExistingPrivateFxDir(home_dir: *io_mod.VerifiedDir) !io_mod.VerifiedD
 const TestStore = Store(.{
     .auth_file_name = "test-auth.json",
     .mutation_lock_file_name = "test-auth.lock",
-    .trace_label = "Test",
+    .trace_label = "test",
 }, error.InvalidTestAuthSession, error.TestOAuthUnavailable);
 
 test "subscription auth session round trips without exposing token fields to structure" {

@@ -807,7 +807,7 @@ fn lifecycleTerminalLine(
     const cancelled = kind == .cancelled;
     const text_style = if (cancelled) ui_render.hint_style else "";
     const text_reset = if (cancelled) ui_render.reset_style else "";
-    const follow_up = if (cancelled) " · What can fx do differently?" else "";
+    const follow_up = if (cancelled) " · what can fx do differently?" else "";
     const normalized = if (has_marker)
         try alloc.print(
             "{s}{s}{s}{s}{s}{s}{s}{s}",
@@ -856,12 +856,12 @@ fn lifecycleFallbackLine(
 ) ![]u8 {
     return switch (outcome) {
         .completed => lifecycleLine(alloc, if (was_provisional)
-            "● Tool was not executed"
+            "● tool was not executed"
         else
-            "● Tool completion was not reported"),
-        .interrupted => lifecycleTerminalLine(alloc, .cancelled, "Tool cancelled"),
-        .failed => lifecycleTerminalLine(alloc, .failed, "Tool failed"),
-        .paused => lifecycleLine(alloc, "● Tool state preserved for recovery"),
+            "● tool completion was not reported"),
+        .interrupted => lifecycleTerminalLine(alloc, .cancelled, "tool cancelled"),
+        .failed => lifecycleTerminalLine(alloc, .failed, "tool failed"),
+        .paused => lifecycleLine(alloc, "● tool state preserved for recovery"),
     };
 }
 
@@ -2455,7 +2455,7 @@ fn checkAutoPermissionNoticeAllocationFailures(alloc: Allocator) !void {
     _ = runtime.appendSemanticNotice(alloc, .{
         .topic = "system",
         .tone = .information,
-        .body = "Auto agent approved this request: Running command.",
+        .body = "auto agent approved this request: running command.",
         .visibility = .full_only,
     }) catch |err| {
         try std.testing.expectEqual(@as(usize, 0), runtime.notebook.entries.items.len);
@@ -2709,7 +2709,7 @@ test "paused tool turn can resume the same lifecycle identity before finalizatio
     try std.testing.expect(std.mem.find(
         u8,
         paused_source.bytes,
-        "Tool state preserved for recovery",
+        "tool state preserved for recovery",
     ) != null);
 
     _ = try runtime.applyToolLifecycle(alloc, .{ .authoritative_started = .{
@@ -2792,7 +2792,7 @@ test "nonzero command remains Ran in the current compact projection" {
     defer source.deinit(alloc);
     try std.testing.expect(std.mem.find(u8, source.bytes, "Ran \x1b[38;5;245m\x1b[38;5;252mfalse\x1b[39m") != null);
     try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, source.bytes, "│ exit code 7"));
-    try std.testing.expect(std.mem.find(u8, source.bytes, "Failed") == null);
+    try std.testing.expect(std.mem.find(u8, source.bytes, "failed") == null);
 }
 
 test "terminal lifecycle records distinguish captured exec from durable actions" {
@@ -2910,7 +2910,7 @@ test "nonzero streamed command reuses its active output block" {
     try std.testing.expect(std.mem.find(u8, source.bytes, "\x1b[38;5;252m;\x1b[39m") != null);
     try std.testing.expect(std.mem.find(u8, source.bytes, "\x1b[38;5;252mexit\x1b[39m") != null);
     try std.testing.expect(std.mem.find(u8, source.bytes, "\x1b[38;5;250m7\x1b[39m") == null);
-    try std.testing.expect(std.mem.find(u8, source.bytes, "Failed") == null);
+    try std.testing.expect(std.mem.find(u8, source.bytes, "failed") == null);
 }
 
 test "compact run command group stays width safe after resize" {
@@ -3503,7 +3503,7 @@ test "historical nonzero command keeps replay ownership outside compact sideband
     try std.testing.expect(std.mem.find(u8, source.bytes, "│ exit code 7") == null);
     try std.testing.expect(std.mem.find(u8, source.bytes, "│ … 2 lines more") == null);
     try std.testing.expect(std.mem.find(u8, source.bytes, "│ five") == null);
-    try std.testing.expect(std.mem.find(u8, source.bytes, "Failed") == null);
+    try std.testing.expect(std.mem.find(u8, source.bytes, "failed") == null);
 }
 
 test "historical command detail ignores artifact-shaped command output" {
@@ -5506,7 +5506,7 @@ pub const TranscriptRuntime = struct {
         defer alloc.free(active);
         if (active.len == 0) return false;
 
-        const line = try lifecycleTerminalLine(alloc, .cancelled, "Cancelled");
+        const line = try lifecycleTerminalLine(alloc, .cancelled, "cancelled");
         defer alloc.free(line);
         const updates = try alloc.alloc(transcript_store.LifecycleEntryUpdate, active.len);
         defer alloc.free(updates);
@@ -6083,7 +6083,7 @@ pub const TranscriptRuntime = struct {
         const append_turn_cancellation = outcome.kind != .cancelled and
             self.notebook.lifecycle_state.needsTurnCancellationNoticeAfterTerminal(id);
         const turn_cancellation_line = if (append_turn_cancellation)
-            try lifecycleTerminalLine(alloc, .cancelled, "Cancelled")
+            try lifecycleTerminalLine(alloc, .cancelled, "cancelled")
         else
             null;
         defer if (turn_cancellation_line) |value| alloc.free(value);
@@ -6216,7 +6216,7 @@ pub const TranscriptRuntime = struct {
                 finished.turn_id,
             );
         const turn_cancellation_line = if (append_turn_cancellation)
-            try lifecycleTerminalLine(alloc, .cancelled, "Cancelled")
+            try lifecycleTerminalLine(alloc, .cancelled, "cancelled")
         else
             null;
         defer if (turn_cancellation_line) |value| alloc.free(value);
@@ -11408,7 +11408,7 @@ pub const TranscriptRuntime = struct {
         metrics: *Metrics,
         record: bool,
     ) !void {
-        const line = try lifecycleTerminalLine(alloc, .cancelled, "Cancelled");
+        const line = try lifecycleTerminalLine(alloc, .cancelled, "cancelled");
         defer alloc.free(line);
         try transcript_writer.writeTranscriptClassified(
             self,
@@ -14388,7 +14388,7 @@ test "history recovery preserves retained geometry and stages painted frames" {
             .footer_rows = footer_rows,
             .viewport = resolved.selection(),
             .activity = render_engine.activity_placement.resolve(
-                .{ .turn_thinking = .{ .label = "Thinking" } },
+                .{ .turn_thinking = .{ .label = "thinking" } },
                 activity,
                 candidate,
             ),

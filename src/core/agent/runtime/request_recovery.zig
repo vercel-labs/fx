@@ -695,7 +695,7 @@ test "a transient failure waits with the module's status, then resends" {
     _ = try request.failed(.{ .kind = .dropped });
     const waiting = fake.route_recovery_statuses.items[0];
     try std.testing.expectEqual(types.RouteRecoveryStatus.Kind.waiting, waiting.kind);
-    try std.testing.expectEqualStrings("Connection lost · next try in 1s · attempt 1", waiting.text.slice());
+    try std.testing.expectEqualStrings("connection lost · next try in 1s · attempt 1", waiting.text.slice());
     try std.testing.expectEqual(@as(usize, 1), waiting.attempt);
 
     const send = (try request.waitForSend()).?;
@@ -703,7 +703,7 @@ test "a transient failure waits with the module's status, then resends" {
     try std.testing.expectEqual(@as(u16, 2), request.attempt());
     const retrying = fake.route_recovery_statuses.items[fake.route_recovery_statuses.items.len - 1];
     try std.testing.expectEqual(types.RouteRecoveryStatus.Kind.retrying, retrying.kind);
-    try std.testing.expect(std.mem.startsWith(u8, retrying.text.slice(), "Connection lost · retrying · attempt 2"));
+    try std.testing.expect(std.mem.startsWith(u8, retrying.text.slice(), "connection lost · retrying · attempt 2"));
 }
 
 test "the first output clears the status and success reports the recovery" {
@@ -921,7 +921,7 @@ test "three server errors in a row with Fast on resend without Fast" {
     try std.testing.expect(send.no_fast);
     try std.testing.expect(request.send.no_fast);
     const retrying = fake.route_recovery_statuses.items[fake.route_recovery_statuses.items.len - 1];
-    try std.testing.expect(std.mem.startsWith(u8, retrying.text.slice(), "Gateway error · retrying without Fast · attempt 4"));
+    try std.testing.expect(std.mem.startsWith(u8, retrying.text.slice(), "gateway error · retrying without fast · attempt 4"));
 
     // The rest of the request stays off Fast.
     _ = try request.failed(.{ .kind = .dropped });
@@ -938,13 +938,13 @@ test "a server's Retry-After is honored up to the 30 second ceiling" {
 
     _ = try request.start(false, null);
     _ = try request.failed(.{ .kind = .server, .retry_after_ms = 3_000 });
-    try std.testing.expectEqualStrings("Gateway error · next try in 3s · attempt 1", fake.route_recovery_statuses.items[0].text.slice());
+    try std.testing.expectEqualStrings("gateway error · next try in 3s · attempt 1", fake.route_recovery_statuses.items[0].text.slice());
     var started_ms = request.nowMs();
     _ = (try request.waitForSend()).?;
     try std.testing.expectEqual(@as(u64, 3_000), request.nowMs() - started_ms);
 
     _ = try request.failed(.{ .kind = .server, .retry_after_ms = 120_000 });
-    try std.testing.expect(std.mem.startsWith(u8, fake.route_recovery_statuses.items[fake.route_recovery_statuses.items.len - 1].text.slice(), "Gateway error · next try in 30s · attempt 2"));
+    try std.testing.expect(std.mem.startsWith(u8, fake.route_recovery_statuses.items[fake.route_recovery_statuses.items.len - 1].text.slice(), "gateway error · next try in 30s · attempt 2"));
     started_ms = request.nowMs();
     _ = (try request.waitForSend()).?;
     try std.testing.expectEqual(@as(u64, 30_000), request.nowMs() - started_ms);
@@ -964,10 +964,10 @@ test "the countdown refreshes once a second while waiting" {
     var buf: [8][]const u8 = undefined;
     const texts = statusTexts(&fake, &buf);
     try std.testing.expectEqual(@as(usize, 4), texts.len);
-    try std.testing.expectEqualStrings("Rate limited · next try in 3s · attempt 1", texts[0]);
-    try std.testing.expectEqualStrings("Rate limited · next try in 2s · attempt 1", texts[1]);
-    try std.testing.expectEqualStrings("Rate limited · next try in 1s · attempt 1", texts[2]);
-    try std.testing.expectEqualStrings("Rate limited · retrying · attempt 2", texts[3]);
+    try std.testing.expectEqualStrings("rate limited · next try in 3s · attempt 1", texts[0]);
+    try std.testing.expectEqualStrings("rate limited · next try in 2s · attempt 1", texts[1]);
+    try std.testing.expectEqualStrings("rate limited · next try in 1s · attempt 1", texts[2]);
+    try std.testing.expectEqualStrings("rate limited · retrying · attempt 2", texts[3]);
 }
 
 test "the in-flight ticker hands the line back to the thinking row" {

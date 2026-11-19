@@ -46,7 +46,7 @@ const SKIP = !tmuxAvailable();
 const TIMEOUT = 30_000;
 const TEST_TEARDOWN_HEADROOM_MS = 1_000;
 const SELECTED_COMPLETION_SGR = "\x1b[1m\x1b[38;5;255m";
-const FILE_APPROVAL_QUESTION = "Apply this change?";
+const FILE_APPROVAL_QUESTION = "apply this change?";
 const LARGE_SKILL_COUNT = 85;
 const LARGE_SKILL_TIMEOUT = 180_000;
 const RAPID_SKILL_COUNT = 4;
@@ -292,7 +292,7 @@ function selectedSlashRow(escapes: string): string | null {
 }
 
 test("selected slash row ignores the welcome header help hint", () => {
-  const header = `${SELECTED_COMPLETION_SGR}𝒇x\x1b[0m\x1b[38;5;245m v0.3.27 · Run /help for commands`;
+  const header = `${SELECTED_COMPLETION_SGR}𝒇x\x1b[0m\x1b[38;5;245m v0.3.27 · run /help for commands`;
   const command = `${SELECTED_COMPLETION_SGR}  /clear\x1b[38;5;245m start a fresh session and keep background processes`;
 
   expect(selectedSlashRow(`${header}\n${command}`)).toBe(command);
@@ -646,8 +646,8 @@ function expectSkillsMenuGrid(
   const text = grid.join("\n");
   expect(catalogMenuItemCount(grid, "skills")).toBe(count);
   // The title shows only the active source; Tab moves through the rest.
-  expect(text).toContain("skills   < All >");
-  expect(text).toContain("fx · Global");
+  expect(text).toContain("skills   < all >");
+  expect(text).toContain("fx · global");
   expect(names.some((name) => text.includes(name))).toBe(true);
   expect(text).not.toContain("Visible skills (");
   expect(findInlineSkillsPicker(grid)).not.toBeNull();
@@ -1168,7 +1168,7 @@ async function runLargeSkillResizeAttempt(attempt: number): Promise<string> {
     expect(historyLimit).toBeGreaterThanOrEqual(MINIMUM_RESIZE_HISTORY_LINES);
     await s.waitForComposer(10_000);
 
-    const menuHeading = "skills   < All >";
+    const menuHeading = "skills   < all >";
     await s.sendText("/skills list");
     const beforeShrinkGrid = await waitForSkillsMenuGrid(
       s,
@@ -1764,7 +1764,7 @@ describe.skipIf(SKIP)("tui: resize", () => {
         "PRE_FX_MARKER_",
       );
       expect(scrollback.match(/𝒇x v\d+\.\d+\.\d+\b/g)).toHaveLength(1);
-      expect(scrollback.match(/Run \/help for commands/g)).toHaveLength(1);
+      expect(scrollback.match(/run \/help for commands/g)).toHaveLength(1);
       expectOrderedMarkersWithoutBlankHole(scrollback, markers);
       const grid = await waitForSettledFooter(session);
       expect(findFooterBlocks(grid)).toHaveLength(1);
@@ -1832,7 +1832,7 @@ describe.skipIf(SKIP)("tui: resize", () => {
       await session.waitForComposer(10_000);
       await session.sendText("stream the resize marker command");
       // The loop's row shows its steps in short form.
-      await session.waitForText("Running printf, sleep", TIMEOUT);
+      await session.waitForText("running printf, sleep", TIMEOUT);
 
       const resizeCount = committedResizeFrameCount(tracePath);
       await new Promise((resolve) => setTimeout(resolve, 350));
@@ -1842,10 +1842,10 @@ describe.skipIf(SKIP)("tui: resize", () => {
 
       const scrollback = await session.captureFullScrollback();
       expect(scrollback.match(/𝒇x v\d+\.\d+\.\d+\b/g)).toHaveLength(1);
-      expect(scrollback.match(/Run \/help for commands/g)).toHaveLength(1);
+      expect(scrollback.match(/run \/help for commands/g)).toHaveLength(1);
       expect(scrollback).toContain("stream the resize marker command");
       expect(scrollback).not.toContain(preFxMarker);
-      expect(scrollback).toMatch(/^● Ran printf, sleep ✓$/m);
+      expect(scrollback).toMatch(/^● ran printf, sleep ✓$/m);
       expect(scrollback).not.toContain("resize-stream-marker 001");
       expect(scrollback).not.toContain("resize-stream-marker 096");
       expect(scrollback).toContain(finalResponse);
@@ -1946,7 +1946,7 @@ describe.skipIf(SKIP)("tui: resize", () => {
         ];
         expect(ids).toEqual(expected);
         if (tailCount > 0) {
-          expect(full.match(/● Read files/g)).toHaveLength(1);
+          expect(full.match(/● read files/g)).toHaveLength(1);
           for (const path of children) expect(full).not.toContain(path);
         }
       };
@@ -1965,7 +1965,7 @@ describe.skipIf(SKIP)("tui: resize", () => {
       await assertRows(0);
       await session.sendText("Second deterministic response.");
       await waitStream(2);
-      await session.waitForText("● Read files", 10_000);
+      await session.waitForText("● read files", 10_000);
       send(1, tail(0));
       await session.waitForText("RETAIN_TAIL_0000", 10_000);
       expect(await session.capturePane()).not.toContain("xxxxxxxx");
@@ -2406,7 +2406,7 @@ describe.skipIf(SKIP)("tui: resize", () => {
       const markerPath = join(workspace, "approval-cancel-ran.txt");
       const command = "touch approval-cancel-ran.txt";
       const seedMarker = "APPROVAL_CANCEL_RESIZE_SCROLLBACK_SEED";
-      const approvalQuestion = "Would you like to run the following command?";
+      const approvalQuestion = "would you like to run the following command?";
       const stableCommitTrace = "transcript_transition_commit state=stable";
       if (!KEEP_LARGE_SKILL_ARTIFACTS) tempDirs.push(root);
       mkdirSync(join(home, ".fx"), { recursive: true });
@@ -2504,7 +2504,7 @@ describe.skipIf(SKIP)("tui: resize", () => {
 
       const beforeCancelLine = readTraceLines(tracePath).length - 1;
       await active.sendKeys("Escape");
-      await active.waitForText("▪ Cancelled", remainingTimeout());
+      await active.waitForText("▪ cancelled", remainingTimeout());
       const cancellationAttempt = await waitForCommittedTraceAttempt(
         tracePath,
         beforeCancelLine,
@@ -2530,13 +2530,13 @@ describe.skipIf(SKIP)("tui: resize", () => {
       );
       await active.waitForPane((pane) => {
         const lastLine = pane.trimEnd().split("\n").at(-1)?.trim() ?? "";
-        return pane.includes("▪ Cancelled") && lastLine.startsWith("ask ·");
+        return pane.includes("▪ cancelled") && lastLine.startsWith("ask ·");
       }, remainingTimeout());
       const afterCancelScrollback = await captureScrollback("after-cancel");
 
       const transcriptCopyCounts = (scrollback: string) => ({
         startup: scrollback.match(/𝒇x v\d+\.\d+\.\d+\b/g)?.length ?? 0,
-        help: countOccurrences(scrollback, "Run /help for commands"),
+        help: countOccurrences(scrollback, "run /help for commands"),
         recording: countOccurrences(
           scrollback,
           "! recording: visual terminal capture:",
@@ -2554,7 +2554,7 @@ describe.skipIf(SKIP)("tui: resize", () => {
       );
 
       expect(existsSync(markerPath)).toBe(false);
-      expect(afterCancelScrollback).toContain("▪ Cancelled");
+      expect(afterCancelScrollback).toContain("▪ cancelled");
       expect(afterCancelScrollback).not.toContain(approvalQuestion);
       expect(gateway.requests).toHaveLength(2);
       expect(readFileSync(stderrPath, "utf8")).toBe("");
@@ -3021,7 +3021,7 @@ describe.skipIf(SKIP)("tui: resize", () => {
       });
       await session.waitForComposer(10_000);
       await session.sendText("stream across a resize");
-      await session.waitForText("Generating", 30_000);
+      await session.waitForText("generating", 30_000);
       const activeStage = await session.captureFullScrollback();
       expect(activeStage).not.toContain(markers[0]);
       expect(activeStage).not.toContain(markers[1]);
@@ -3321,11 +3321,11 @@ describe.skipIf(SKIP)("tui: resize", () => {
       label: "statusline",
       width: 72,
       height: 16,
-      surfaceMarker: "Status line",
+      surfaceMarker: "status line",
       editedInput: "x",
       async openSurface(active) {
         await active.sendText("/statusline");
-        await active.waitForText("Status line", TIMEOUT);
+        await active.waitForText("status line", TIMEOUT);
         await active.sendKeys("Right");
         await active.waitForText("off  on", TIMEOUT);
         await active.sendKeys("Down");
@@ -3350,11 +3350,11 @@ describe.skipIf(SKIP)("tui: resize", () => {
       label: "usage",
       width: 120,
       height: 36,
-      surfaceMarker: "not signed in to AI Gateway",
+      surfaceMarker: "not signed in to AI gateway",
       editedInput: "x",
       async openSurface(active) {
         await active.sendText("/usage");
-        await active.waitForText("not signed in to AI Gateway", TIMEOUT);
+        await active.waitForText("not signed in to AI gateway", TIMEOUT);
         await active.resizeWindow(60, 12, 500);
       },
     },
@@ -3377,11 +3377,11 @@ describe.skipIf(SKIP)("tui: resize", () => {
       label: "workspace",
       width: 120,
       height: 36,
-      surfaceMarker: "Workspace",
+      surfaceMarker: "workspace",
       editedInput: "x",
       async openSurface(active) {
         await active.sendText("/workspace");
-        await active.waitForText("Workspace", TIMEOUT);
+        await active.waitForText("workspace", TIMEOUT);
         await active.resizeWindow(60, 12, 500);
       },
     },
@@ -3469,7 +3469,7 @@ describe.skipIf(SKIP)("tui: resize", () => {
       );
       session = fixture.active;
       await session.sendText("/workspace");
-      await session.waitForText("Workspace", TIMEOUT);
+      await session.waitForText("workspace", TIMEOUT);
       await session.sendKeys("Enter");
       await session.waitForPane(
         (pane) =>
@@ -3782,33 +3782,33 @@ describe.skipIf(SKIP)("tui: resize", () => {
         await session.capturePaneGrid(),
       );
       expect(fullBlock).not.toBeNull();
-      expect(fullBlock!.text).toContain("Permission needed · Review change");
-      expect(fullBlock!.text).toContain("Write · +9  -0");
+      expect(fullBlock!.text).toContain("permission needed · review change");
+      expect(fullBlock!.text).toContain("write · +9  -0");
       expect(fullBlock!.text).toContain("resize-approved.txt");
-      expect(fullBlock!.text).toContain("Apply once");
+      expect(fullBlock!.text).toContain("apply once");
       expect(fullBlock!.text).toContain(
-        "Apply + allow workspace file access for this session",
+        "apply + allow workspace file access for this session",
       );
-      expect(fullBlock!.text).toContain("Don't apply");
+      expect(fullBlock!.text).toContain("don't apply");
       expect(fullBlock!.text).toContain("+ preview-nine");
       await session.sendKeys("Right");
       await session.sendKeys("Right");
 
       await session.resizeWindow(80, 6, 500);
-      let pane = await session.waitForText("❯ 3  Don't apply", 5_000);
-      expect(pane).toContain("1  Apply once");
+      let pane = await session.waitForText("❯ 3  don't apply", 5_000);
+      expect(pane).toContain("1  apply once");
       expect(pane).toContain(
-        "2  Apply + allow workspace file access for this session",
+        "2  apply + allow workspace file access for this session",
       );
       expect(pane).not.toContain(FILE_APPROVAL_QUESTION);
 
       await session.resizeWindow(80, 8, 500);
       pane = await session.waitForText(FILE_APPROVAL_QUESTION, 5_000);
       expect(pane).toContain("resize-approved.txt");
-      expect(pane).toContain("❯ 3  Don't apply");
-      expect(pane).toContain("1  Apply once");
+      expect(pane).toContain("❯ 3  don't apply");
+      expect(pane).toContain("1  apply once");
       expect(pane).toContain(
-        "2  Apply + allow workspace file access for this session",
+        "2  apply + allow workspace file access for this session",
       );
       expect(pane).not.toContain("1Y");
       expect(pane).not.toContain("2A");
@@ -3816,10 +3816,10 @@ describe.skipIf(SKIP)("tui: resize", () => {
 
       for (const height of [9, 11, 13]) {
         await session.resizeWindow(80, height, 500);
-        pane = await session.waitForText("❯ 3  Don't apply", 5_000);
-        expect(pane).toContain("Apply once");
+        pane = await session.waitForText("❯ 3  don't apply", 5_000);
+        expect(pane).toContain("apply once");
         expect(pane).toContain(
-          "Apply + allow workspace file access for this session",
+          "apply + allow workspace file access for this session",
         );
         expect(pane).not.toContain("1Y");
         expect(pane).not.toContain("2A");
@@ -3836,7 +3836,7 @@ describe.skipIf(SKIP)("tui: resize", () => {
       fullBlock = findActiveFileApprovalBlock(await session.capturePaneGrid());
       expect(fullBlock).not.toBeNull();
       expect(
-        fullBlock!.lines.filter((row) => row.includes("❯ 3  Don't apply")),
+        fullBlock!.lines.filter((row) => row.includes("❯ 3  don't apply")),
       ).toHaveLength(1);
 
       for (let index = 0; index < 2; index++) {
@@ -3846,12 +3846,12 @@ describe.skipIf(SKIP)("tui: resize", () => {
       }
       pane = await session.waitForText("+ preview-one", 5_000);
       expect(pane).toContain(FILE_APPROVAL_QUESTION);
-      expect(pane).not.toContain("❯ 3  Don't apply");
+      expect(pane).not.toContain("❯ 3  don't apply");
 
       await session.resizeWindow(70, 17, 500);
       pane = await session.waitForText("+ preview-one", 5_000);
       expect(pane).toContain(FILE_APPROVAL_QUESTION);
-      expect(pane).not.toContain("❯ 3  Don't apply");
+      expect(pane).not.toContain("❯ 3  don't apply");
       const approvalFrames = Buffer.concat(
         stdoutFrames(tapePath).map((frame) => frame.payload),
       ).toString();
@@ -3921,13 +3921,13 @@ describe.skipIf(SKIP)("tui: resize", () => {
 
       await session.resizeWindow(80, 6, 500);
       let pane = await session.waitForText(
-        "❯ ! 1  Apply once · resize to review",
+        "❯ ! 1  apply once · resize to review",
         5_000,
       );
       await session.sendKeys("Enter");
       await new Promise((resolve) => setTimeout(resolve, 300));
       pane = await session.capturePane();
-      expect(pane).toContain("❯ ! 1  Apply once · resize to review");
+      expect(pane).toContain("❯ ! 1  apply once · resize to review");
       expect(existsSync(target)).toBe(false);
 
       execFileSync("tmux", [
@@ -3948,7 +3948,7 @@ describe.skipIf(SKIP)("tui: resize", () => {
       pane = await session.capturePane();
       expect(existsSync(target)).toBe(false);
       expect(pane).toContain(FILE_APPROVAL_QUESTION);
-      expect(pane).toContain("❯ 1  Apply once");
+      expect(pane).toContain("❯ 1  apply once");
 
       pane = await session.waitForText(FILE_APPROVAL_QUESTION, 5_000);
       await session.sendKeys("Enter");
@@ -4058,7 +4058,7 @@ describe.skipIf(SKIP)("tui: resize", () => {
       session = launched.active;
       await session.sendText("Reply with exactly resize_activity_done.");
       await waitForGatewayRequestCount(gateway, 1);
-      await session.waitForText("Generating", TIMEOUT);
+      await session.waitForText("generating", TIMEOUT);
       await session.resizeWindow(90, 30, 500);
 
       const grid = await waitForSettledFooter(session);
@@ -4145,11 +4145,11 @@ describe.skipIf(SKIP)("tui: resize", () => {
     async () => {
       session = await launchAt(120, 40);
       await session.sendText("/help");
-      await session.waitForText("commands   < All >", 5_000);
+      await session.waitForText("commands   < all >", 5_000);
       await session.resizeWindow(76, 24, 400);
 
       const grid = await session.capturePaneGrid();
-      expect(grid.join("\n")).toContain("commands   < All >");
+      expect(grid.join("\n")).toContain("commands   < all >");
       expect(findInlineHelpPicker(grid)).not.toBeNull();
 
       await session.sendKeys("Escape");
@@ -4167,7 +4167,7 @@ describe.skipIf(SKIP)("tui: resize", () => {
     async () => {
       session = await launchAt(120, 40);
       await session.sendText("/help");
-      await session.waitForText("commands   < All >", 5_000);
+      await session.waitForText("commands   < all >", 5_000);
 
       const captureScrollback = () =>
         execSync(`tmux capture-pane -t ${session!.name} -p -S -`, {
@@ -4175,7 +4175,7 @@ describe.skipIf(SKIP)("tui: resize", () => {
           stdio: "pipe",
         });
       const expectHelpCatalog = (grid: string[]) => {
-        expect(grid.join("\n")).toContain("commands   < All >");
+        expect(grid.join("\n")).toContain("commands   < all >");
         expect(findInlineHelpPicker(grid)).not.toBeNull();
       };
 
@@ -4192,8 +4192,8 @@ describe.skipIf(SKIP)("tui: resize", () => {
       );
       const restored = captureScrollback();
       expect(restored.match(/𝒇x v\d+\.\d+\.\d+\b/g)).toHaveLength(1);
-      expect(restored.match(/Run \/help for commands/g)).toHaveLength(1);
-      expect(restored).not.toContain("commands   < All >");
+      expect(restored.match(/run \/help for commands/g)).toHaveLength(1);
+      expect(restored).not.toContain("commands   < all >");
       expect(findFooter(await session.capturePaneGrid())).not.toBeNull();
     },
     TIMEOUT,
@@ -4725,7 +4725,7 @@ describe.skipIf(SKIP)("tui: resize", () => {
         expect(await session.captureFullScrollback()).toContain(marker);
 
         await session.sendText("/help");
-        await session.waitForText("commands   < All >", 5_000);
+        await session.waitForText("commands   < all >", 5_000);
         await session.resizeWindow(84, 28, 500);
 
         const catalog = await session.capturePaneGrid();
@@ -4739,7 +4739,7 @@ describe.skipIf(SKIP)("tui: resize", () => {
         );
         const scrollback = await session.captureFullScrollback();
         expect(scrollback).not.toContain(marker);
-        expect(scrollback).not.toContain("commands   < All >");
+        expect(scrollback).not.toContain("commands   < all >");
         const finalGrid = await session.capturePaneGrid();
         expect(findFooter(finalGrid), finalGrid.join("\n")).not.toBeNull();
 

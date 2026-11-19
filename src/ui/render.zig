@@ -16,7 +16,7 @@ const update_target = @import("../core/upgrade/update_target.zig");
 pub const TerminalRgb = user_message_card.Rgb;
 pub const reset_style = "\x1b[0m";
 pub const bold_style = "\x1b[1m";
-pub const ask_activity_label = "⏺ Asking";
+pub const ask_activity_label = "⏺ asking";
 
 const user_message_card = @import("assistant/user_message_card.zig");
 
@@ -211,7 +211,7 @@ pub fn welcomeMessage(alloc: std.mem.Allocator) ![]u8 {
         build_options.git_commit,
     );
     return alloc.print(
-        "{s}𝒇x{s}{s} {s} · Run /help for commands" ++ reset_style ++ "\n\n",
+        "{s}𝒇x{s}{s} {s} · run /help for commands" ++ reset_style ++ "\n\n",
         .{ subtitle_style, reset_style, dim_style, build_label },
     );
 }
@@ -952,7 +952,7 @@ test "welcomeMessage keeps only the app name bright" {
         build_options.git_commit,
     );
     const expected = try std.testing.allocator.print(
-        "{s}𝒇x{s}{s} {s} · Run /help for commands" ++ reset_style ++ "\n\n",
+        "{s}𝒇x{s}{s} {s} · run /help for commands" ++ reset_style ++ "\n\n",
         .{ subtitle_style, reset_style, dim_style, build_label },
     );
     defer std.testing.allocator.free(expected);

@@ -64,7 +64,7 @@ async function start() {
     promptHistoryStore,
     onEvent(event) { events.push(event); },
   });
-  await waitFor(terminal, () => grid(terminal).includes("Run /help for commands"), "startup");
+  await waitFor(terminal, () => grid(terminal).includes("run /help for commands"), "startup");
   return { terminal, runtime, events };
 }
 

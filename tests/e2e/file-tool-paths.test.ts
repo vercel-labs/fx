@@ -1248,8 +1248,8 @@ describe("filesystem path handling", () => {
             expect(classifiedJson.tool_calls).toEqual([
               { name: "write_file", status: "success" },
             ]);
-            expect(classified.stderr.match(/^Writing /gm)).toHaveLength(1);
-            expect(classified.stderr).not.toContain("Auto agent approved this request");
+            expect(classified.stderr.match(/^writing /gm)).toHaveLength(1);
+            expect(classified.stderr).not.toContain("auto agent approved this request");
             expect(readFileSync(scenario.target, "utf8")).toBe("CLASSIFIED_CONTENT");
           } finally {
             classifierGateway.stop();
@@ -1345,7 +1345,7 @@ describe("filesystem path handling", () => {
           { name: "write_file", status: "error" },
         ]);
         expect(json.output).toContain("large reviewed write blocked");
-        expect(result.stderr).not.toContain("Auto agent approved this request");
+        expect(result.stderr).not.toContain("auto agent approved this request");
         expect(readFileSync(target, "utf8")).toBe("before\n");
         const trace = readFileSync(tracePath, "utf8");
         expect(trace).toContain(
@@ -1486,8 +1486,8 @@ describe("filesystem path handling", () => {
             "committed file read tracker refresh failed",
           );
           expect(result.stderr).toBe(
-            "Writing typed.txt\n" +
-              "Editing typed.txt\n",
+            "writing typed.txt\n" +
+              "editing typed.txt\n",
           );
         } finally {
           gateway.stop();

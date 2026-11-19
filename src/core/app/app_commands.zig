@@ -76,10 +76,10 @@ fn format_trace_notice(
     defer out.deinit();
 
     switch (disposition) {
-        .copied_file => try out.writer.writeAll("Trace copied to clipboard. Review and redact it before sharing."),
-        .copy_failed => |path| try out.writer.print("Clipboard copy failed. Trace saved at {s}. Review and redact it before sharing.", .{path}),
-        .saved => |path| try out.writer.print("Trace saved at {s}. Review and redact it before sharing.", .{path}),
-        .unavailable => try out.writer.writeAll("Could not create trace."),
+        .copied_file => try out.writer.writeAll("trace copied to clipboard. review and redact it before sharing."),
+        .copy_failed => |path| try out.writer.print("clipboard copy failed. trace saved at {s}. review and redact it before sharing.", .{path}),
+        .saved => |path| try out.writer.print("trace saved at {s}. review and redact it before sharing.", .{path}),
+        .unavailable => try out.writer.writeAll("could not create trace."),
     }
     return out.toOwnedSlice();
 }
@@ -158,7 +158,7 @@ fn handleShellCommand(app: anytype, rest: []const u8) !void {
     try app.writeDomainNotice(.{
         .topic = "shell",
         .tone = .neutral,
-        .body = "The next command reloads your shell startup files. Remembered command approvals were reset.",
+        .body = "the next command reloads your shell startup files. remembered command approvals were reset.",
     }, true);
 }
 
@@ -174,7 +174,7 @@ fn handleWorkspaceCommand(app: anytype, rest: []const u8) !void {
     const action = maybe_action orelse {
         refreshWorkspaceAvailabilityForList(app) catch |err| {
             const reason = output_contracts.workspaceErrorMessage(err) orelse "workspace refresh failed";
-            const message = try app.alloc.print("Workspace refresh rejected: {s}", .{reason});
+            const message = try app.alloc.print("workspace refresh rejected: {s}", .{reason});
             defer app.alloc.free(message);
             try app.writeDomainNotice(.{
                 .topic = "workspace",
@@ -190,7 +190,7 @@ fn handleWorkspaceCommand(app: anytype, rest: []const u8) !void {
         try app.writeDomainNotice(.{
             .topic = "workspace",
             .tone = .neutral,
-            .body = "Workspace changes are unavailable until the active and queued work finishes.",
+            .body = "workspace changes are unavailable until the active and queued work finishes.",
         }, true);
         return;
     }
@@ -206,9 +206,9 @@ fn handleWorkspaceCommand(app: anytype, rest: []const u8) !void {
     ) catch |err| {
         const reason = output_contracts.workspaceErrorMessage(err) orelse "workspace update failed";
         const prefix: []const u8 = switch (failure_phase) {
-            .stage => "Workspace update rejected",
-            .commit => "Workspace settings were not changed",
-            .reconcile => "Workspace settings are uncertain and could not be reloaded",
+            .stage => "workspace update rejected",
+            .commit => "workspace settings were not changed",
+            .reconcile => "workspace settings are uncertain and could not be reloaded",
         };
         const message = try app.alloc.print("{s}: {s}", .{ prefix, reason });
         defer app.alloc.free(message);
@@ -230,13 +230,13 @@ fn handleWorkspaceCommand(app: anytype, rest: []const u8) !void {
             const message: []const u8 = switch (reconciliation.*) {
                 .intended => |*reconciled| blk: {
                     _ = app.installWorkspaceAccess(reconciled);
-                    break :blk "Workspace settings durability is uncertain; reloaded settings match the requested update.";
+                    break :blk "workspace settings durability is uncertain; reloaded settings match the requested update.";
                 },
                 .previous => |*reconciled| blk: {
                     _ = app.installWorkspaceAccess(reconciled);
-                    break :blk "Workspace settings durability is uncertain; reloaded settings match the previous state, so the update is not active.";
+                    break :blk "workspace settings durability is uncertain; reloaded settings match the previous state, so the update is not active.";
                 },
-                .unconfirmed => "Workspace settings durability is uncertain; reloaded settings match neither the requested nor previous state, so runtime access is unchanged.",
+                .unconfirmed => "workspace settings durability is uncertain; reloaded settings match neither the requested nor previous state, so runtime access is unchanged.",
             };
             try app.writeDomainNotice(.{
                 .topic = "workspace",
@@ -372,14 +372,14 @@ pub fn Handlers(comptime App: type) type {
                 try app.writeDomainNotice(.{
                     .topic = "",
                     .tone = .neutral,
-                    .body = "Opened https://fx.sh/feedback.",
+                    .body = "opened https://fx.sh/feedback.",
                 }, true);
                 return;
             }
             try app.writeDomainNotice(.{
                 .topic = "",
                 .tone = .@"error",
-                .body = "Could not open https://fx.sh/feedback. Open it manually.",
+                .body = "could not open https://fx.sh/feedback. open it manually.",
             }, true);
         }
 
@@ -387,13 +387,13 @@ pub fn Handlers(comptime App: type) type {
             const progress_entry_id = try app.appendReplaceableDomainNotice(.{
                 .topic = "",
                 .tone = .neutral,
-                .body = "Preparing trace...",
+                .body = "preparing trace...",
             });
             app.shell.render_requests.request(.transcript);
             try app.flushBeforeBlockingExternalWork();
 
             const report = trace_report.build(app) catch {
-                try finish_trace_notice(app, progress_entry_id, .@"error", "Failed to build trace.");
+                try finish_trace_notice(app, progress_entry_id, .@"error", "failed to build trace.");
                 return;
             };
             defer app.alloc.free(report);
@@ -472,7 +472,7 @@ pub fn Handlers(comptime App: type) type {
                 try app.writeDomainNotice(.{
                     .topic = "session",
                     .tone = .warning,
-                    .body = "Session resume is owned by the embedding SDK for this host.",
+                    .body = "session resume is owned by the embedding SDK for this host.",
                 }, true);
                 return;
             }
@@ -485,7 +485,7 @@ pub fn Handlers(comptime App: type) type {
                 try app.writeDomainNotice(.{
                     .topic = "session",
                     .tone = .warning,
-                    .body = "Session forking is owned by the embedding SDK for this host.",
+                    .body = "session forking is owned by the embedding SDK for this host.",
                 }, true);
                 return;
             }
@@ -720,13 +720,13 @@ pub fn Handlers(comptime App: type) type {
                         .{
                             .id = debug_trace.nextStepId(),
                             .label = if (decision == .allow)
-                                "Remember allow for this saved session"
+                                "remember allow for this saved session"
                             else
-                                "Remember deny for this saved session",
+                                "remember deny for this saved session",
                             .explanation = if (existing == null)
-                                "Confirm this exact saved-session permission rule. The action will not run."
+                                "confirm this exact saved-session permission rule. the action will not run."
                             else
-                                "Confirm replacement of the existing exact saved-session rule. The action will not run.",
+                                "confirm replacement of the existing exact saved-session rule. the action will not run.",
                             .command = prepared.display_identity,
                             .amendment_allowed = false,
                             .confirmation_only = true,
@@ -773,8 +773,8 @@ pub fn Handlers(comptime App: type) type {
                     app.alloc,
                     .{
                         .id = debug_trace.nextStepId(),
-                        .label = "Revoke saved-session permission rule",
-                        .explanation = "Confirm revocation of this stored rule. No current action will be prepared or run.",
+                        .label = "revoke saved-session permission rule",
+                        .explanation = "confirm revocation of this stored rule. no current action will be prepared or run.",
                         .command = rule.display_identity,
                         .amendment_allowed = false,
                         .confirmation_only = true,
@@ -851,7 +851,7 @@ pub fn Handlers(comptime App: type) type {
                 try app.writeDomainNotice(.{
                     .topic = "usage",
                     .tone = .neutral,
-                    .body = "Usage is not available in this host.",
+                    .body = "usage is not available in this host.",
                 }, true);
                 return;
             }
@@ -925,7 +925,7 @@ pub fn Handlers(comptime App: type) type {
                         std.Io.Dir.max_path_bytes,
                     );
                     defer display_path.deinit(app.alloc);
-                    break :blk try app.alloc.print("Restored {s}", .{display_path.bytes});
+                    break :blk try app.alloc.print("restored {s}", .{display_path.bytes});
                 },
                 .deleted => |path| blk: {
                     var display_path = try text_utils.encodeTerminalSafe(
@@ -934,7 +934,7 @@ pub fn Handlers(comptime App: type) type {
                         std.Io.Dir.max_path_bytes,
                     );
                     defer display_path.deinit(app.alloc);
-                    break :blk try app.alloc.print("Deleted {s} (was newly created)", .{display_path.bytes});
+                    break :blk try app.alloc.print("deleted {s} (was newly created)", .{display_path.bytes});
                 },
                 .unavailable => |path| blk: {
                     var display_path = try text_utils.encodeTerminalSafe(
@@ -944,11 +944,11 @@ pub fn Handlers(comptime App: type) type {
                     );
                     defer display_path.deinit(app.alloc);
                     break :blk try app.alloc.print(
-                        "Could not undo {s}",
+                        "could not undo {s}",
                         .{display_path.bytes},
                     );
                 },
-                .empty => try app.alloc.dupe(u8, "Nothing to undo."),
+                .empty => try app.alloc.dupe(u8, "nothing to undo."),
             };
             defer app.alloc.free(msg);
             switch (result) {
@@ -990,7 +990,7 @@ pub fn Handlers(comptime App: type) type {
                 try app.writeDomainNotice(.{
                     .topic = "skills",
                     .tone = .warning,
-                    .body = "Skills are unavailable in this host because filesystem access is not provided.",
+                    .body = "skills are unavailable in this host because filesystem access is not provided.",
                 }, true);
                 return;
             }
@@ -1028,9 +1028,9 @@ pub fn Handlers(comptime App: type) type {
                     .topic = "skills",
                     .tone = .@"error",
                     .body = if (ready.action == .startup_notice)
-                        "Skills could not be loaded. Run /skills to try again."
+                        "skills could not be loaded. run /skills to try again."
                     else
-                        "Skills could not be refreshed. The previous catalog was not shown as current.",
+                        "skills could not be refreshed. the previous catalog was not shown as current.",
                 }, true);
                 return;
             }
@@ -1066,7 +1066,7 @@ pub fn Handlers(comptime App: type) type {
 
             switch (command) {
                 .install => |install| {
-                    const install_notice = try app.alloc.print("Installing from {s}...", .{install.source});
+                    const install_notice = try app.alloc.print("installing from {s}...", .{install.source});
                     defer app.alloc.free(install_notice);
                     try app.writeDomainNotice(.{
                         .topic = "skills",
@@ -1173,7 +1173,7 @@ pub fn Handlers(comptime App: type) type {
                     defer installed_notice.deinit();
 
                     for (install_result.installed.items) |name| {
-                        try installed_notice.writer.print("Installed: {s}\n", .{name});
+                        try installed_notice.writer.print("installed: {s}\n", .{name});
                     }
 
                     const msg = try installed_notice.toOwnedSlice();
@@ -1241,7 +1241,7 @@ pub fn Handlers(comptime App: type) type {
                 try app.writeDomainNotice(.{
                     .topic = "clipboard",
                     .tone = .neutral,
-                    .body = "No assistant reply to copy.",
+                    .body = "no assistant reply to copy.",
                 }, true);
                 return;
             };
@@ -1250,14 +1250,14 @@ pub fn Handlers(comptime App: type) type {
                 try app.writeDomainNotice(.{
                     .topic = "clipboard",
                     .tone = .@"error",
-                    .body = "Failed to copy to clipboard.",
+                    .body = "failed to copy to clipboard.",
                 }, true);
                 return;
             }
             try app.writeDomainNotice(.{
                 .topic = "clipboard",
                 .tone = .neutral,
-                .body = "Copied to clipboard.",
+                .body = "copied to clipboard.",
             }, true);
         }
 
@@ -1279,7 +1279,7 @@ pub fn Handlers(comptime App: type) type {
             try app.writeDomainNotice(.{
                 .topic = "context",
                 .tone = .neutral,
-                .body = "No context to compact.",
+                .body = "no context to compact.",
             }, true);
         }
 
@@ -1359,15 +1359,15 @@ pub fn Handlers(comptime App: type) type {
                 return app.writeDomainNotice(.{
                     .topic = "credits",
                     .tone = .@"error",
-                    .body = "fx could not start a background task to check credits. Try again.",
+                    .body = "fx could not start a background task to check credits. try again.",
                 }, true);
             };
             try app.writeDomainNotice(.{
                 .topic = "credits",
                 .tone = .neutral,
                 .body = switch (started) {
-                    .started => "Checking credits…",
-                    .busy => "Credits are still loading.",
+                    .started => "checking credits…",
+                    .busy => "credits are still loading.",
                 },
             }, true);
         }
@@ -1407,7 +1407,7 @@ pub fn Handlers(comptime App: type) type {
                 try app.writeDomainNotice(.{
                     .topic = "credits",
                     .tone = .@"error",
-                    .body = "Failed to render credits.",
+                    .body = "failed to render credits.",
                 }, true);
                 return;
             };
@@ -1428,7 +1428,7 @@ pub fn Handlers(comptime App: type) type {
                         try app.writeDomainNotice(.{
                             .topic = "credits",
                             .tone = .neutral,
-                            .body = "Token Pass credit is a separate balance. See it in the Token Pass tab: " ++ token_pass.dashboard_url,
+                            .body = "token pass credit is a separate balance. see it in the token pass tab: " ++ token_pass.dashboard_url,
                         }, true);
                     }
                 }
@@ -1481,14 +1481,14 @@ pub fn Handlers(comptime App: type) type {
                 try app.writeDomainNotice(.{
                     .topic = "workspace",
                     .tone = .@"error",
-                    .body = "Workspace access is unavailable in this runtime.",
+                    .body = "workspace access is unavailable in this runtime.",
                 }, true);
                 return;
             }
             if (std.mem.trim(u8, rest, " \t").len == 0) {
                 refreshWorkspaceAvailabilityForList(app) catch |err| {
                     const reason = output_contracts.workspaceErrorMessage(err) orelse "workspace refresh failed";
-                    const message = try app.alloc.print("Workspace refresh rejected: {s}", .{reason});
+                    const message = try app.alloc.print("workspace refresh rejected: {s}", .{reason});
                     defer app.alloc.free(message);
                     try app.writeDomainNotice(.{
                         .topic = "workspace",
@@ -1523,7 +1523,7 @@ pub fn Handlers(comptime App: type) type {
             try app.writeDomainNotice(.{
                 .topic = "command",
                 .tone = .@"error",
-                .body = "Unknown command. Try /help.",
+                .body = "unknown command. try /help.",
             }, true);
         }
     };
@@ -1684,7 +1684,7 @@ test "workspace list reports refresh rejection without replacing access" {
     defer app.deinit();
     try handleWorkspaceCommand(&app, "");
     try std.testing.expectEqual(types.NoticeTone.@"error", app.last_tone.?);
-    try std.testing.expect(std.mem.find(u8, app.transcript.items, "Workspace refresh rejected: additional directory limit reached") != null);
+    try std.testing.expect(std.mem.find(u8, app.transcript.items, "workspace refresh rejected: additional directory limit reached") != null);
     try std.testing.expectEqual(@as(usize, 0), app.access.entries.len);
 }
 
@@ -2377,19 +2377,19 @@ test "trace notice distinguishes file outcomes without a feedback CTA" {
     }{
         .{
             .disposition = .{ .copied_file = report_path },
-            .expected = "Trace copied to clipboard. Review and redact it before sharing.",
+            .expected = "trace copied to clipboard. review and redact it before sharing.",
         },
         .{
             .disposition = .{ .copy_failed = report_path },
-            .expected = "Clipboard copy failed. Trace saved at /tmp/trace.jsonl. Review and redact it before sharing.",
+            .expected = "clipboard copy failed. trace saved at /tmp/trace.jsonl. review and redact it before sharing.",
         },
         .{
             .disposition = .{ .saved = report_path },
-            .expected = "Trace saved at /tmp/trace.jsonl. Review and redact it before sharing.",
+            .expected = "trace saved at /tmp/trace.jsonl. review and redact it before sharing.",
         },
         .{
             .disposition = .unavailable,
-            .expected = "Could not create trace.",
+            .expected = "could not create trace.",
         },
     };
 
@@ -2545,7 +2545,7 @@ test "copy command routes exact reply bytes through the host clipboard" {
     try std.testing.expectEqualStrings("reply\nwith exact bytes", app.copied_text.?);
     try std.testing.expectEqualStrings("clipboard", app.last_topic.?);
     try std.testing.expectEqual(types.NoticeTone.neutral, app.last_tone.?);
-    try std.testing.expectEqualStrings("Copied to clipboard.", app.last_body.?);
+    try std.testing.expectEqualStrings("copied to clipboard.", app.last_body.?);
 }
 
 test "copy command reports missing replies and host failures" {
@@ -2554,7 +2554,7 @@ test "copy command reports missing replies and host failures" {
     try Handlers(ClipboardCommandFakeApp).commandCopyLast(@ptrCast(&app));
     try std.testing.expectEqual(@as(usize, 0), app.copy_calls);
     try std.testing.expectEqual(types.NoticeTone.neutral, app.last_tone.?);
-    try std.testing.expectEqualStrings("No assistant reply to copy.", app.last_body.?);
+    try std.testing.expectEqualStrings("no assistant reply to copy.", app.last_body.?);
 
     app.agent().session.reply = "reply";
     for ([_]ClipboardCommandFakeApp.CopyOutcome{ .unavailable, .failed }) |outcome| {
@@ -2565,7 +2565,7 @@ test "copy command reports missing replies and host failures" {
         try Handlers(ClipboardCommandFakeApp).commandCopyLast(@ptrCast(&app));
 
         try std.testing.expectEqual(types.NoticeTone.@"error", app.last_tone.?);
-        try std.testing.expectEqualStrings("Failed to copy to clipboard.", app.last_body.?);
+        try std.testing.expectEqualStrings("failed to copy to clipboard.", app.last_body.?);
     }
     try std.testing.expectEqual(@as(usize, 2), app.copy_calls);
 }
@@ -2598,19 +2598,19 @@ test "skills install groups command notice fragments for entry replay" {
     try std.testing.expect(app.shell.notebook.entries.items[0] == .semantic_notice);
     try std.testing.expect(app.shell.notebook.entries.items[1] == .semantic_notice);
     try std.testing.expectEqualStrings("skills", app.shell.notebook.entries.items[0].semantic_notice.topic);
-    const installing_body = try alloc.print("Installing from {s}...", .{pack_dir});
+    const installing_body = try alloc.print("installing from {s}...", .{pack_dir});
     defer alloc.free(installing_body);
     try std.testing.expectEqualStrings(installing_body, app.shell.notebook.entries.items[0].semantic_notice.body);
     try std.testing.expectEqualStrings(
-        "Installed: root-skill\nInstalled: nested-skill",
+        "installed: root-skill\ninstalled: nested-skill",
         app.shell.notebook.entries.items[1].semantic_notice.body,
     );
 
     const rendered = try transcript_runtime.renderEntriesToBytes(alloc, app.shell.notebook.entries.items, 80, .{});
     defer alloc.free(rendered);
-    try std.testing.expect(std.mem.startsWith(u8, rendered, "* skills: Installing from "));
-    try std.testing.expect(std.mem.find(u8, rendered, "\n\n* skills: Installed: root-skill") != null);
-    try std.testing.expect(std.mem.endsWith(u8, rendered, "  Installed: nested-skill"));
+    try std.testing.expect(std.mem.startsWith(u8, rendered, "* skills: installing from "));
+    try std.testing.expect(std.mem.find(u8, rendered, "\n\n* skills: installed: root-skill") != null);
+    try std.testing.expect(std.mem.endsWith(u8, rendered, "  installed: nested-skill"));
 }
 
 test "help command opens the catalog without writing transcript output" {

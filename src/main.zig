@@ -3452,7 +3452,7 @@ const App = struct {
             try self.writeDomainNotice(.{
                 .topic = "transcript",
                 .tone = .@"error",
-                .body = "Full transcript preparation failed. The reader was closed instead of showing stale content.",
+                .body = "full transcript preparation failed. the reader was closed instead of showing stale content.",
             }, true);
         }
         const input_now_ms = io_mod.milliTimestamp();
@@ -4800,7 +4800,7 @@ test "partial session handoff resize cancels the pending transition without exit
     try std.testing.expect(app.screenAgent().worker.queued_context_compaction != null);
     try std.testing.expect(!app.shell.sessionScrollbackHandoffPending());
     try std.testing.expect(std.mem.find(u8, app.shell.notebook.transcript.items, "old session retained") != null);
-    try std.testing.expect(std.mem.find(u8, app.shell.notebook.transcript.items, "Session change cancelled") != null);
+    try std.testing.expect(std.mem.find(u8, app.shell.notebook.transcript.items, "session change cancelled") != null);
     try std.testing.expect(app.shell.render_requests.hasPending());
 }
 

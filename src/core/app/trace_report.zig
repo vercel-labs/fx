@@ -317,7 +317,7 @@ const transcript_blocks = @import("../../ui/render_engine/transcript_blocks.zig"
 
 pub const format_version: u32 = 1;
 
-const notice_text = "Private diagnostic report. It may include prompts, file paths, command output, and file snippets.";
+const notice_text = "private diagnostic report. it may include prompts, file paths, command output, and file snippets.";
 const tool_args_max_bytes: usize = 1200;
 const result_preview_max_bytes: usize = 180;
 const pending_items_shown: usize = 3;
@@ -551,7 +551,7 @@ fn writeEnd(r: *Records) !void {
 
 fn buildModeName() []const u8 {
     return switch (builtin.optimize) {
-        .debug => "Debug",
+        .debug => "debug",
         .safe => "ReleaseSafe",
         .fast => "ReleaseFast",
         .small => "ReleaseSmall",

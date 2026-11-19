@@ -1067,13 +1067,13 @@ fn permissionOutcomeSource(
 
 pub noinline fn permissionDeniedStatusLabel(reason: types.ToolPermissionDenialReason) []const u8 {
     return switch (reason) {
-        .user_denied => "Denied",
-        .auto_denied => "Denied by auto agent",
-        .review_caution => "Safety caution",
-        .review_evidence_incomplete => "Review evidence incomplete",
-        .review_unavailable => "Review unavailable",
-        .policy_denied => "Denied",
-        .permission_required => "Permission required",
+        .user_denied => "denied",
+        .auto_denied => "denied by auto agent",
+        .review_caution => "safety caution",
+        .review_evidence_incomplete => "review evidence incomplete",
+        .review_unavailable => "review unavailable",
+        .policy_denied => "denied",
+        .permission_required => "permission required",
     };
 }
 

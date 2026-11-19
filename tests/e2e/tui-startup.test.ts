@@ -67,10 +67,10 @@ describe.skipIf(SKIP)("tui: startup and exit", () => {
       session = await TmuxSession.create();
       await session.waitForComposer(10_000);
       await session.sendText("/help");
-      const pane = await session.waitForText("commands   < All >", 5_000);
+      const pane = await session.waitForText("commands   < all >", 5_000);
       expect(pane).toContain("tab category");
       expect(pane).toContain("enter open");
-      expect(pane).toContain("Run /help for commands");
+      expect(pane).toContain("run /help for commands");
     },
     TIMEOUT,
   );
@@ -277,7 +277,7 @@ describe.skipIf(SKIP_TMUX)("tui: fresh-session commands", () => {
       writeFileSync(stderrPath, "");
 
       const version = execFileSync(FX_BIN, ["--version"], { encoding: "utf8" }).trim();
-      const banner = `𝒇x v${version} · Run /help for commands`;
+      const banner = `𝒇x v${version} · run /help for commands`;
 
       try {
         session = await TmuxSession.create({
@@ -337,7 +337,7 @@ describe.skipIf(SKIP_TMUX)("tui: fresh-session commands", () => {
       mkdirSync(home, { recursive: true });
       writeFileSync(stderrPath, "");
       const version = execFileSync(FX_BIN, ["--version"], { encoding: "utf8" }).trim();
-      const banner = `𝒇x v${version} · Run /help for commands`;
+      const banner = `𝒇x v${version} · run /help for commands`;
 
       try {
         session = await TmuxSession.create({
@@ -397,7 +397,7 @@ describe.skipIf(SKIP_TMUX)("tui: fresh-session commands", () => {
       writeFileSync(stderrPath, "");
       const gateway = startDynamicFakeGateway(() => fakeGatewayFinalText("FIXTURE_REPLY_OK"));
       const version = execFileSync(FX_BIN, ["--version"], { encoding: "utf8" }).trim();
-      const banner = `𝒇x v${version} · Run /help for commands`;
+      const banner = `𝒇x v${version} · run /help for commands`;
 
       try {
         session = await TmuxSession.create({
@@ -575,7 +575,7 @@ describe.skipIf(SKIP_TMUX)("tui: fresh-session commands", () => {
       mkdirSync(home, { recursive: true });
       writeFileSync(stderrPath, "");
       const version = execFileSync(FX_BIN, ["--version"], { encoding: "utf8" }).trim();
-      const banner = `𝒇x v${version} · Run /help for commands`;
+      const banner = `𝒇x v${version} · run /help for commands`;
 
       try {
         session = await TmuxSession.create({
@@ -845,7 +845,7 @@ describe.skipIf(SKIP_TMUX)("tui: MCP startup", () => {
         while (!loaded() && Date.now() < deadline) await Bun.sleep(50);
         expect(loaded()).toBe(true);
         await session.sendKeys("Enter");
-        await session.waitForText("  Remove        /mcp remove remote", 5_000);
+        await session.waitForText("  remove        /mcp remove remote", 5_000);
       } finally {
         holder.kill();
         if (session) {
@@ -1273,7 +1273,7 @@ describe.skipIf(SKIP_TMUX)("tui: custom themes", () => {
         });
 
         const pane = await session.waitForComposer(10_000);
-        expect(pane).toContain("Run /help for commands");
+        expect(pane).toContain("run /help for commands");
         const escapes = await session.capturePaneEscapes();
         // editor.foreground #FF0000 quantizes to xterm-256 color 196 without
         // truecolor (Apple_Terminal), and themes the hint text at startup.
@@ -1303,7 +1303,7 @@ describe.skipIf(SKIP_TMUX)("tui: custom themes", () => {
           },
           { fxTheme: "e2e-pair-dark", colorFgBg: "0;15" }, // light terminal
         );
-        expect(pane).toContain("Run /help for commands");
+        expect(pane).toContain("run /help for commands");
         // The light sibling's hint (#00FF00 -> xterm-256 46) applies, not the
         // pinned dark theme's (#0000FF -> 21).
         expect(escapes).toContain("38;5;46");
@@ -1332,7 +1332,7 @@ describe.skipIf(SKIP_TMUX)("tui: custom themes", () => {
           },
           { fxTheme: "e2e-pair-dark", colorFgBg: "0;15" }, // light terminal, no e2e-pair-light.json on disk
         );
-        expect(pane).toContain("Run /help for commands");
+        expect(pane).toContain("run /help for commands");
         // Builtin fx-light hint, not the mismatched dark theme's blue.
         expect(escapes).toContain("38;5;235");
         expect(escapes).not.toContain("38;5;21");
@@ -1362,7 +1362,7 @@ describe.skipIf(SKIP_TMUX)("tui: custom themes", () => {
           },
           { fxTheme: "e2e-pair-dark", colorFgBg: "0;15" }, // light terminal
         );
-        expect(pane).toContain("Run /help for commands");
+        expect(pane).toContain("run /help for commands");
         expect(escapes).toContain("38;5;235");
         expect(escapes).not.toContain("38;5;46");
         expect(escapes).not.toContain("38;5;21");
@@ -1390,7 +1390,7 @@ describe.skipIf(SKIP_TMUX)("tui: custom themes", () => {
           },
           { settingsTheme: "e2e-accent", colorFgBg: "15;0" }, // dark terminal, no FX_THEME
         );
-        expect(pane).toContain("Run /help for commands");
+        expect(pane).toContain("run /help for commands");
         // The configured theme's hint (#FF0000 -> xterm-256 196) applies.
         expect(escapes).toContain("38;5;196");
         expect(readFileSync(stderrPath, "utf8")).toBe("");
@@ -1417,7 +1417,7 @@ describe.skipIf(SKIP_TMUX)("tui: custom themes", () => {
           },
           { settingsTheme: "e2e-accent", fxTheme: "dark", colorFgBg: "15;0" },
         );
-        expect(pane).toContain("Run /help for commands");
+        expect(pane).toContain("run /help for commands");
         // Builtin fx-dark hint (255), not the configured theme's red.
         expect(escapes).toContain("38;5;255");
         expect(escapes).not.toContain("38;5;196");
@@ -1443,7 +1443,7 @@ describe.skipIf(SKIP_TMUX)("tui: custom themes", () => {
           {},
           { settingsTheme: "dark", colorFgBg: "15;0" }, // dark terminal, pinned dark
         );
-        expect(pane).toContain("Run /help for commands");
+        expect(pane).toContain("run /help for commands");
         expect(escapes).toContain("38;5;255"); // fx-dark hint
         expect(escapes).not.toContain("38;5;235"); // fx-light hint
 

@@ -218,7 +218,7 @@ pub fn assembleParallelToolResults(
                         original_call,
                         parallel_status_started[original_index],
                         null,
-                        "Cancelled",
+                        "cancelled",
                         advertised_dynamic_tool_names,
                     );
                     continue;

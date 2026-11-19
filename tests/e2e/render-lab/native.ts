@@ -366,7 +366,7 @@ async function launchFx(
     `FX_RECORD=${shQuote(context.manifest.tapePath)} FX_RECORD_INPUT=1 ${shQuote(FX_BIN)}`,
   );
   await capture(context, controller, `${label}-fx-launch-requested`);
-  await waitForText(controller, "Run /help for commands", 30_000);
+  await waitForText(controller, "run /help for commands", 30_000);
   await capture(context, controller, `${label}-fx-prompt-visible`);
 }
 

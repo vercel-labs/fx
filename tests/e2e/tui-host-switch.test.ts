@@ -669,7 +669,7 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
           pane.includes("SWITCH_CHILD_ANSWER") && pane.includes("reviewer \u00b7 "), 15_000);
         expect(subagent).toContain("SWITCH_TASK look for nothing");
         // A new subagent opens with fx's welcome, as a fresh fx does.
-        expect(subagent).toContain("Run /help for commands");
+        expect(subagent).toContain("run /help for commands");
         expect(subagent).not.toContain("SWITCH_MAIN_FINAL");
         expect(await session.captureFullScrollback()).not.toContain("SWITCH_USER");
 
@@ -836,7 +836,7 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         await session.waitForText("esc again to interrupt", 10_000);
         await session.sendKeys("Escape");
         // The stop shows before the next key, which must not join the Esc.
-        await session.waitForText("What can fx do differently?", 15_000);
+        await session.waitForText("what can fx do differently?", 15_000);
         await showAgent(session, "main");
         // Main hears of the dropped message from the stopped work's report.
         await session.waitForText("SWITCH_MAIN_SAW_DROP", 30_000);
@@ -950,7 +950,7 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         await session.sendKeys("Escape");
         await session.waitForText("esc again to interrupt", 10_000);
         await session.sendKeys("Escape");
-        await session.waitForText("What can fx do differently?", 15_000);
+        await session.waitForText("what can fx do differently?", 15_000);
         await showAgent(session, "main");
         await session.waitForText("STOP_MAIN_SAW", 30_000);
         held_turn.release();
@@ -1008,7 +1008,7 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
           await session.sendKeys("Escape");
           await session.waitForText("esc again to interrupt", 10_000);
           await session.sendKeys("Escape");
-          await session.waitForText("What can fx do differently?", 15_000);
+          await session.waitForText("what can fx do differently?", 15_000);
           // The stopped turn is ending, held before its end is handled.
           await until("the stopped turn's held end", () => existsSync(`${endHeld}.1`), 15_000);
           expect(readFileSync(`${endHeld}.1`, "utf8")).toContain("by=user");
@@ -1118,7 +1118,7 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
           await session.sendKeys("Escape");
           await session.waitForText("esc again to interrupt", 10_000);
           await session.sendKeys("Escape");
-          await session.waitForText("What can fx do differently?", 15_000);
+          await session.waitForText("what can fx do differently?", 15_000);
           await session.sendText("SWITCH_AFTER_ESC");
           await session.waitForText("SWITCH_MAIN_NEXT", 15_000);
           // Main's turn ended with the stop, not when the 30 s wait ran out.
@@ -1862,7 +1862,7 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         // answer while it is open, and Esc brings the prompt back unanswered.
         await session.sendKeys("C-x");
         const over = await session.waitForText(LIST_HINT, 10_000);
-        expect(over).not.toContain("Apply this change?");
+        expect(over).not.toContain("apply this change?");
         // Its row names the profile it runs in, and says it waits for the
         // approval main shows for it.
         expect(over).toMatch(/^ {2}\u2514 writer {2,}.* {2,}\S+ {2,}writer\s*$/m);
@@ -1874,7 +1874,7 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         await session.sendKeys("Escape");
         await session.waitForPane((pane) => pane.includes(LIST_HINT) && !pane.includes("esc clear"), 10_000);
         await session.sendKeys("Escape");
-        const back = await session.waitForPane((pane) => !pane.includes(LIST_HINT) && pane.includes("Apply this change?"), 10_000);
+        const back = await session.waitForPane((pane) => !pane.includes(LIST_HINT) && pane.includes("apply this change?"), 10_000);
         expect(back).toContain("Subagent writer needs permission");
         expect(existsSync(join(workspace, "switch-child.txt"))).toBe(false);
 
@@ -2300,7 +2300,7 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         await showAgent(session, "follower");
         await session.waitForPane((pane) => pane.includes("ask ·"), 15_000);
         await session.sendText("SWITCH_TYPED write again");
-        await session.waitForText("Apply this change?", 30_000);
+        await session.waitForText("apply this change?", 30_000);
         expect(existsSync(join(workspace, "typed.txt"))).toBe(false);
         await session.sendKeys("1");
         await session.waitForText("SWITCH_TYPED_DONE", 30_000);
@@ -2407,7 +2407,7 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
           pane.includes("SWITCH_SAVED_ANSWER") && pane.includes("reviewer \u00b7 done"), 15_000);
         expect(subagent).toContain("SWITCH_SAVED_TASK");
         // One with a saved conversation shows it instead, as a resumed fx does.
-        expect(subagent).not.toContain("Run /help for commands");
+        expect(subagent).not.toContain("run /help for commands");
         await showAgent(resumed, "main");
         await resumed.waitForPane((pane) => pane.includes("SWITCH_MAIN_FINAL"), 15_000);
       });
@@ -3883,16 +3883,16 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         }, async (session) => {
           await session.sendText("SWITCH_USER start the reviewer and the builder");
           // The name has arrived and the rest of the call has not.
-          await session.waitForText("Managing reviewer", 15_000);
+          await session.waitForText("managing reviewer", 15_000);
           nameSent.release();
           await session.waitForText("Messaged reviewer", 15_000);
           // Both are working when main checks on them and then waits.
           await session.waitForText("Checked reviewer, builder", 15_000);
-          await session.waitForText("Waiting for reviewer, builder", 15_000);
+          await session.waitForText("waiting for reviewer, builder", 15_000);
           children.reviewer.release();
           children.builder.release();
           const done = await session.waitForPane((pane) => pane.includes("Waited for reviewer, builder"), 30_000);
-          expect(done).not.toContain("Waiting for subagents");
+          expect(done).not.toContain("waiting for subagents");
           expect(await session.captureFullScrollback()).not.toContain("Checked subagents");
         });
       } finally {
@@ -4685,7 +4685,7 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         const list = await session.waitForPane((pane) =>
           /^ {2}[\u251c\u2514] worker .*working \d+s\b/m.test(pane), 15_000);
         const workerRow = list.split("\n").find((line) => /^ {2}[\u251c\u2514] worker /.test(line)) ?? "";
-        expect(workerRow).not.toContain("Waiting for");
+        expect(workerRow).not.toContain("waiting for");
         expect(workerRow).not.toContain("TUI-QUIET-READY");
         await session.sendKeys("Escape");
         await session.waitForPane((pane) => !pane.includes(LIST_HINT), 10_000);

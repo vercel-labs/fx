@@ -242,8 +242,8 @@ pub const ConfigDiagnostic = struct {
     /// A one-line note for the user instead of a configuration issue.
     pub fn note(self: ConfigDiagnostic) ?[]const u8 {
         return switch (self.cause) {
-            .private_state_permissions_tightened => profile_paths.displayText("Other users could write to ~/.fx, so fx took that access away. " ++
-                "If you didn't write ~/.fx/settings.json yourself, check it."),
+            .private_state_permissions_tightened => profile_paths.displayText("other users could write to ~/.fx, so fx took that access away. " ++
+                "if you didn't write ~/.fx/settings.json yourself, check it."),
             else => null,
         };
     }
@@ -372,8 +372,8 @@ pub fn unknownProviderMessage(alloc: Allocator, name: []const u8) ![]u8 {
 pub fn modelNotSelectedMessage(err: anyerror) ?[]const u8 {
     const for_this_run = "or set a model for this run with --model or FX_MODEL";
     return switch (err) {
-        error.CodexModelNotSelected => "no Codex model is selected; run `fx provider codex` to choose one, " ++ for_this_run,
-        error.GrokModelNotSelected => "no Grok model is selected; run `fx provider grok` to choose one, " ++ for_this_run,
+        error.CodexModelNotSelected => "no codex model is selected; run `fx provider codex` to choose one, " ++ for_this_run,
+        error.GrokModelNotSelected => "no grok model is selected; run `fx provider grok` to choose one, " ++ for_this_run,
         error.ConfiguredModelNotSelected => profile_paths.displayText("no model is selected for this connection; save one under \"models\" in ~/.fx/settings.json, " ++ for_this_run),
         else => null,
     };
@@ -405,8 +405,8 @@ pub fn loadConfiguredProviders(alloc: Allocator) !configured_provider.Registry {
 /// (`tests/tla/configured_provider/ConfiguredResume.tla`).
 pub fn sessionConnectionNotice(err: anyerror) ?[]const u8 {
     return switch (err) {
-        error.ConfiguredProviderChanged => profile_paths.displayText("This session's custom connection changed in ~/.fx/settings.json after the session was saved: its protocol, base_url, or auth. Change it back, or start a new session."),
-        error.ConfiguredProviderRemoved => profile_paths.displayText("This session's custom connection is no longer in ~/.fx/settings.json. Add it back, or start a new session."),
+        error.ConfiguredProviderChanged => profile_paths.displayText("this session's custom connection changed in ~/.fx/settings.json after the session was saved: its protocol, base_url, or auth. change it back, or start a new session."),
+        error.ConfiguredProviderRemoved => profile_paths.displayText("this session's custom connection is no longer in ~/.fx/settings.json. add it back, or start a new session."),
         else => null,
     };
 }
@@ -478,7 +478,7 @@ fn headerVariableMessage(alloc: Allocator) Allocator.Error!?[]u8 {
         defer only = null;
         return only.?;
     }
-    const advice = profile_paths.displayText("Set or fix each variable, or remove its header from ~/.fx/settings.json");
+    const advice = profile_paths.displayText("set or fix each variable, or remove its header from ~/.fx/settings.json");
     const unlisted = count -| max_listed_headers;
     if (unlisted == 0) return try alloc.print("{d} headers can't be sent: {s}. {s}", .{ count, listed.items, advice });
     return try alloc.print("{d} headers can't be sent: {s} ({d} more). {s}", .{ count, listed.items, unlisted, advice });

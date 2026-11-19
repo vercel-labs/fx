@@ -34,14 +34,14 @@ import { stdoutFrames } from "./render-lab/tape";
 const SKIP = !tmuxAvailable();
 const TIMEOUT = 30_000;
 const OUTER_MODEL = "openai/gpt-5";
-const APPROVAL_PROMPT = "Would you like to run the following command?";
+const APPROVAL_PROMPT = "would you like to run the following command?";
 const DEFAULT_COMMAND_APPROVAL_REASON =
-  "Reason: fx needs your approval before running this shell command.";
-const COMMAND_ALWAYS_CHOICE = "Yes, and don't ask again for this exact command";
-const COMMAND_YES_CHOICE = "Yes";
-const COMMAND_NO_CHOICE = "No";
-const COMMAND_YES_AMENDMENT = "Yes, and tell fx what to do next";
-const COMMAND_NO_AMENDMENT = "No, and tell fx what to do differently";
+  "reason: fx needs your approval before running this shell command.";
+const COMMAND_ALWAYS_CHOICE = "yes, and don't ask again for this exact command";
+const COMMAND_YES_CHOICE = "yes";
+const COMMAND_NO_CHOICE = "no";
+const COMMAND_YES_AMENDMENT = "yes, and tell fx what to do next";
+const COMMAND_NO_AMENDMENT = "no, and tell fx what to do differently";
 const QUESTION_PROMPT = "Choose next step?";
 const FORBIDDEN_TYPING = "typing a reply";
 const FORBIDDEN_TYPING_SUFFIX = "ping a reply";
@@ -1251,7 +1251,7 @@ describe.skipIf(SKIP)("tui: decision prompt input isolation", () => {
       );
       expect(pane).toContain("I need to inspect one file before continuing.");
       expect(pane).not.toContain(MALFORMED_LABEL_SENTINEL);
-      expect(pane).not.toContain("● Reading");
+      expect(pane).not.toContain("● reading");
       expect(pane).not.toContain(APPROVAL_PROMPT);
       expect(pane).not.toContain(QUESTION_PROMPT);
       expect(pane).not.toContain("SyntaxError");
@@ -1573,7 +1573,7 @@ describe.skipIf(SKIP)("tui: decision prompt input isolation", () => {
       const initialPane = await ctx.session.waitForText(APPROVAL_PROMPT, TIMEOUT);
       expect(initialPane).toContain(`${COMMAND_SCROLL_LINE_PREFIX}001`);
       const initialRows = initialPane.split("\n");
-      const initialChoiceThreeRow = initialRows.findIndex((row) => row.includes("3. No"));
+      const initialChoiceThreeRow = initialRows.findIndex((row) => row.includes("3. no"));
       const initialControlsRow = initialRows.findIndex((row) => row.includes("1–3 choose"));
       expect(initialRows[initialChoiceThreeRow + 1]!.trim()).toBe("");
       expect(initialRows[initialChoiceThreeRow + 2]!.trim()).toMatch(/^─+$/);
@@ -1586,7 +1586,7 @@ describe.skipIf(SKIP)("tui: decision prompt input isolation", () => {
       const completePane = await ctx.session.capturePane();
       expect(completePane).not.toBe(initialPane);
       expect(completePane).not.toContain(`${COMMAND_SCROLL_LINE_PREFIX}001`);
-      expect(completePane).not.toContain("Cancelled");
+      expect(completePane).not.toContain("cancelled");
 
       await ctx.session.sendHexBytes(fragmentedWheel.slice(0, 6));
       await ctx.session.sendHexBytes(fragmentedWheel.slice(6));
@@ -1598,9 +1598,9 @@ describe.skipIf(SKIP)("tui: decision prompt input isolation", () => {
           hasApprovalSelection(pane, 1, COMMAND_YES_CHOICE),
         TIMEOUT,
       );
-      expect(fragmentedPane).not.toContain("Cancelled");
+      expect(fragmentedPane).not.toContain("cancelled");
       const fragmentedScrollback = await ctx.session.captureFullScrollbackEscapes();
-      expect(fragmentedScrollback).not.toContain("Cancelled");
+      expect(fragmentedScrollback).not.toContain("cancelled");
       expect(fragmentedScrollback).not.toContain("4;79;12M");
       const approvalFrames = Buffer.concat(stdoutFrames(tapePath).map((frame) => frame.payload));
       expect(approvalFrames.includes(Buffer.from("\x1b[?1000h\x1b[?1006h"))).toBe(true);
@@ -1648,7 +1648,7 @@ describe.skipIf(SKIP)("tui: decision prompt input isolation", () => {
       expect(command).toContain(FITTING_COMMAND_END);
       expectApprovalSelection(pane, 1, COMMAND_YES_CHOICE);
       const paneRows = pane.split("\n");
-      const choiceThreeRow = paneRows.findIndex((row) => row.includes("3. No"));
+      const choiceThreeRow = paneRows.findIndex((row) => row.includes("3. no"));
       const controlsRow = paneRows.findIndex((row) => row.includes("1–3 choose"));
       expect(paneRows[choiceThreeRow + 1]!.trim()).toBe("");
       expect(paneRows[choiceThreeRow + 2]!.trim()).toMatch(/^─+$/);
@@ -1680,10 +1680,10 @@ describe.skipIf(SKIP)("tui: decision prompt input isolation", () => {
 
       await ctx.session.resizeWindow(40, 13);
       await ctx.session.sendText("Request the overflowing command approval fixture.");
-      await ctx.session.waitForText("Permission needed", TIMEOUT);
+      await ctx.session.waitForText("permission needed", TIMEOUT);
 
       await ctx.session.sendKeys("Escape");
-      const cancelled = await ctx.session.waitForText("▪ Cancelled", TIMEOUT);
+      const cancelled = await ctx.session.waitForText("▪ cancelled", TIMEOUT);
       expect(cancelled).not.toContain(APPROVAL_PROMPT);
 
       await ctx.session.resizeWindow(72, 20);
@@ -1721,7 +1721,7 @@ describe.skipIf(SKIP)("tui: decision prompt input isolation", () => {
       expect(pane.replaceAll("\n    ", " ")).toContain(FITTING_COMMAND_END);
 
       await ctx.session.resizeWindow(40, 13);
-      await ctx.session.waitForText("Permission needed", TIMEOUT);
+      await ctx.session.waitForText("permission needed", TIMEOUT);
 
       await ctx.session.resizeWindow(72, 20);
       pane = await waitForPaneState(ctx.session, "command approval inline after resize", (value) =>
@@ -1783,7 +1783,7 @@ describe.skipIf(SKIP)("tui: decision prompt input isolation", () => {
 
       await ctx.session.sendText("Create the generic approval acceptance fixture.");
       const pane = await ctx.session.waitForText(
-        "Would you like to run the following command?",
+        "would you like to run the following command?",
         TIMEOUT,
       );
       expect(pane).toContain("# shell.run profile=user shell=");
@@ -1871,9 +1871,9 @@ describe.skipIf(SKIP)("tui: decision prompt input isolation", () => {
       );
       await ctx.session.sendLiteralText("inspect the file before changing it");
       const amended = await waitForPaneState(ctx.session, "type generic denial amendment", (value) =>
-        hasApprovalSelection(value, 3, "No, inspect the file before changing it"),
+        hasApprovalSelection(value, 3, "no, inspect the file before changing it"),
       );
-      expectApprovalSelection(amended, 3, "No, inspect the file before changing it");
+      expectApprovalSelection(amended, 3, "no, inspect the file before changing it");
 
       await ctx.session.sendKeys("Enter");
       await ctx.session.waitForText("amended generic denial handled", TIMEOUT);
@@ -1960,9 +1960,9 @@ describe.skipIf(SKIP)("tui: decision prompt input isolation", () => {
       );
       await ctx.session.sendLiteralText("use a safer command");
       const amended = await waitForPaneState(ctx.session, "type denial after navigation", (value) =>
-        hasApprovalSelection(value, 3, "No, use a safer command"),
+        hasApprovalSelection(value, 3, "no, use a safer command"),
       );
-      expectApprovalSelection(amended, 3, "No, use a safer command");
+      expectApprovalSelection(amended, 3, "no, use a safer command");
 
       await ctx.session.sendKeys("Enter");
       await ctx.session.waitForText("exact-command tab contract handled", TIMEOUT);
@@ -2134,15 +2134,15 @@ describe.skipIf(SKIP)("tui: decision prompt input isolation", () => {
       await ctx.session.sendKeys("Tab");
       await ctx.session.sendLiteralText("summarize the command output");
       const amended = await waitForPaneState(ctx.session, "approval amendment typing", (value) =>
-        hasApprovalSelection(value, 1, "Yes, summarize the command output"),
+        hasApprovalSelection(value, 1, "yes, summarize the command output"),
       );
-      expectApprovalSelection(amended, 1, "Yes, summarize the command output");
+      expectApprovalSelection(amended, 1, "yes, summarize the command output");
 
       await ctx.session.sendKeys("Enter");
       await ctx.session.waitForText("approval typing handled", TIMEOUT);
       const finalPane = await ctx.session.capturePane();
       expect(finalPane).toContain("summarize the command output");
-      const terminalTool = finalPane.indexOf("Ran touch generic-preview-accepted.txt");
+      const terminalTool = finalPane.indexOf("ran touch generic-preview-accepted.txt");
       const feedbackCard = finalPane.indexOf("summarize the command output");
       expect(terminalTool).toBeGreaterThanOrEqual(0);
       expect(feedbackCard).toBeGreaterThan(terminalTool);
@@ -2177,7 +2177,7 @@ describe.skipIf(SKIP)("tui: decision prompt input isolation", () => {
       await ctx.session.sendHexBytes(["06"]);
       await ctx.session.sendLiteralText("F");
       await waitForPaneState(ctx.session, "approval cursor control aliases", (value) =>
-        hasApprovalSelection(value, 3, "No, [alpha beta gammaB]F"),
+        hasApprovalSelection(value, 3, "no, [alpha beta gammaB]F"),
       );
 
       await ctx.session.sendHexBytes(["15"]);
@@ -2185,26 +2185,26 @@ describe.skipIf(SKIP)("tui: decision prompt input isolation", () => {
       await ctx.session.sendHexBytes(["17"]);
       await ctx.session.sendLiteralText("W");
       await waitForPaneState(ctx.session, "approval ctrl-w alias", (value) =>
-        hasApprovalSelection(value, 3, "No, alpha beta W"),
+        hasApprovalSelection(value, 3, "no, alpha beta W"),
       );
 
       await ctx.session.sendHexBytes(["15"]);
       await ctx.session.sendLiteralText("alpha beta");
       await ctx.session.sendHexBytes(["01", "1b", "64"]);
       await waitForPaneState(ctx.session, "approval alt-d alias", (value) =>
-        hasApprovalSelection(value, 3, "No, beta"),
+        hasApprovalSelection(value, 3, "no, beta"),
       );
       await ctx.session.sendHexBytes(["05", "1b", "7f"]);
       await waitForPaneState(ctx.session, "approval alt-backspace alias", (value) =>
-        hasApprovalSelection(value, 3, "No"),
+        hasApprovalSelection(value, 3, "no"),
       );
 
       await ctx.session.sendLiteralText("left right");
       await ctx.session.sendHexBytes(["01", "06", "0b"]);
       const finalPane = await waitForPaneState(ctx.session, "approval ctrl-k alias", (value) =>
-        hasApprovalSelection(value, 3, "No, l"),
+        hasApprovalSelection(value, 3, "no, l"),
       );
-      expectApprovalSelection(finalPane, 3, "No, l");
+      expectApprovalSelection(finalPane, 3, "no, l");
 
       await ctx.session.sendKeys("Enter");
       await ctx.session.waitForText("approval shortcut alias parity handled", TIMEOUT);
@@ -2239,9 +2239,9 @@ describe.skipIf(SKIP)("tui: decision prompt input isolation", () => {
       await ctx.session.sendLiteralText(amendment);
       await ctx.session.sendHexBytes(["19"]);
       const amended = await waitForPaneState(ctx.session, "approval shortcut isolation", (value) =>
-        hasApprovalSelection(value, 3, `No, ${amendment}`),
+        hasApprovalSelection(value, 3, `no, ${amendment}`),
       );
-      expectApprovalSelection(amended, 3, `No, ${amendment}`);
+      expectApprovalSelection(amended, 3, `no, ${amendment}`);
 
       await ctx.session.sendKeys("Enter");
       await ctx.session.waitForText("approval shortcut isolation handled", TIMEOUT);
@@ -2280,9 +2280,9 @@ describe.skipIf(SKIP)("tui: decision prompt input isolation", () => {
       await ctx.session.sendKeys("Tab");
       await sendPaste(ctx.session, payload);
       const amended = await waitForPaneState(ctx.session, "approval amendment paste", (value) =>
-        hasApprovalSelection(value, 1, `Yes, ${expected}`),
+        hasApprovalSelection(value, 1, `yes, ${expected}`),
       );
-      expectApprovalSelection(amended, 1, `Yes, ${expected}`);
+      expectApprovalSelection(amended, 1, `yes, ${expected}`);
       expectNoForbiddenComposerText(amended);
       expect(ctx.gateway.requests).toHaveLength(1);
       expectNoDropTrace(ctx.tracePath);
@@ -2292,7 +2292,7 @@ describe.skipIf(SKIP)("tui: decision prompt input isolation", () => {
       await ctx.session.waitForText("approval amendment paste handled", TIMEOUT);
       const finalPane = await ctx.session.capturePane();
       expect(finalPane).toContain(expected);
-      expect(finalPane).toContain("Ran touch generic-preview-accepted.txt");
+      expect(finalPane).toContain("ran touch generic-preview-accepted.txt");
       expect(ctx.gateway.requests).toHaveLength(2);
       expect(requestContainsExactString(ctx.gateway.requests[1]!.body, expected)).toBe(true);
       await assertProcessAliveAndClean(ctx);
@@ -2758,7 +2758,7 @@ describe.skipIf(SKIP)("tui: decision prompt input isolation", () => {
           ctx.session,
           `question page ${ordinal} of 3`,
           (value) =>
-            value.includes(question) && value.includes(`Question ${ordinal} of 3`),
+            value.includes(question) && value.includes(`question ${ordinal} of 3`),
           TIMEOUT,
         );
 
@@ -2842,7 +2842,7 @@ describe.skipIf(SKIP)("tui: decision prompt input isolation", () => {
           `full batch page ${page} of ${FULL_QUESTION_BATCH}`,
           (value) =>
             value.includes(batchQuestionText(page - 1)) &&
-            value.includes(`Question ${page} of ${FULL_QUESTION_BATCH}`),
+            value.includes(`question ${page} of ${FULL_QUESTION_BATCH}`),
           TIMEOUT,
         );
 
@@ -2926,13 +2926,13 @@ describe.skipIf(SKIP)("tui: decision prompt input isolation", () => {
       const ctx = await openQuestionPrompt("raw question cancellation completed");
 
       await ctx.session.sendKeys("Escape");
-      const cancelled = await ctx.session.waitForText("▪ Cancelled", TIMEOUT);
-      expect(countOccurrences(cancelled, "▪ Cancelled")).toBe(1);
+      const cancelled = await ctx.session.waitForText("▪ cancelled", TIMEOUT);
+      expect(countOccurrences(cancelled, "▪ cancelled")).toBe(1);
       expect(cancelled).not.toContain(QUESTION_PROMPT);
       expect(cancelled).not.toContain("raw question cancellation completed");
       const cancelledGrid = await ctx.session.capturePaneGrid();
       const footer = findFooterBlocks(cancelledGrid).at(-1);
-      const cancelledRow = cancelledGrid.findIndex((row) => row.includes("▪ Cancelled"));
+      const cancelledRow = cancelledGrid.findIndex((row) => row.includes("▪ cancelled"));
       expect(footer).toBeDefined();
       expect(cancelledRow).toBeGreaterThanOrEqual(0);
       expect(cancelledRow).toBeLessThan(footer!.topDivider);
@@ -2990,18 +2990,18 @@ describe.skipIf(SKIP)("tui: decision prompt input isolation", () => {
         ctx.session,
         "tall question cancellation",
         (grid) =>
-          grid.some((row) => row.includes("▪ Cancelled")) &&
+          grid.some((row) => row.includes("▪ cancelled")) &&
           findFooterBlocks(grid).length > 0,
       );
       expect(cancelledGrid.findIndex((row) => row.trim() === anchorText)).toBe(anchorRow);
-      const cancelledRow = cancelledGrid.findIndex((row) => row.includes("▪ Cancelled"));
+      const cancelledRow = cancelledGrid.findIndex((row) => row.includes("▪ cancelled"));
       const footer = findFooterBlocks(cancelledGrid).at(-1)!;
       expect(footer.topDivider).toBe(cancelledRow + 2);
       expect(cancelledGrid[cancelledRow + 1]!.trim()).toBe("");
       expect(cancelledGrid.at(-1)!.trim()).toBe("");
 
       const history = (await ctx.session.captureFullScrollback()).split("\n");
-      expect(longestBlankRunBetween(history, fillLine(1), "▪ Cancelled")).toBe(1);
+      expect(longestBlankRunBetween(history, fillLine(1), "▪ cancelled")).toBe(1);
       expect(countOccurrences(history.join("\n"), anchorText)).toBe(1);
       expect(ctx.gateway.requests).toHaveLength(2);
       await assertProcessAliveAndClean(ctx);
@@ -3041,11 +3041,11 @@ describe.skipIf(SKIP)("tui: decision prompt input isolation", () => {
         ctx.session,
         "in-place question cancellation",
         (grid) =>
-          grid.some((row) => row.includes("▪ Cancelled")) &&
+          grid.some((row) => row.includes("▪ cancelled")) &&
           findFooterBlocks(grid).length > 0,
       );
       const cancelledFooter = findFooterBlocks(cancelledGrid).at(-1);
-      const cancelledRow = cancelledGrid.findIndex((row) => row.includes("▪ Cancelled"));
+      const cancelledRow = cancelledGrid.findIndex((row) => row.includes("▪ cancelled"));
       expect(cancelledFooter).toBeDefined();
       // The transcript stays at the top and the rows the question freed go
       // below the footer, not above the transcript.
@@ -3063,7 +3063,7 @@ describe.skipIf(SKIP)("tui: decision prompt input isolation", () => {
       const editedFooter = findFooterBlocks(editedGrid).at(-1);
       expect(editedFooter).toEqual(cancelledFooter);
       expect(editedGrid.slice(0, cancelledRow + 1)).toEqual(cancelledGrid.slice(0, cancelledRow + 1));
-      expect(countOccurrences(editedGrid.join("\n"), "▪ Cancelled")).toBe(1);
+      expect(countOccurrences(editedGrid.join("\n"), "▪ cancelled")).toBe(1);
       expect(editedGrid.join("\n")).not.toContain(QUESTION_PROMPT);
       expect(ctx.gateway.requests).toHaveLength(2);
       await assertProcessAliveAndClean(ctx);
@@ -3078,8 +3078,8 @@ describe.skipIf(SKIP)("tui: decision prompt input isolation", () => {
       const ctx = await openQuestionPrompt("kitty question cancellation completed");
 
       await ctx.session.sendHexBytes(CSI_U_ESCAPE);
-      const cancelled = await ctx.session.waitForText("▪ Cancelled", TIMEOUT);
-      expect(countOccurrences(cancelled, "▪ Cancelled")).toBe(1);
+      const cancelled = await ctx.session.waitForText("▪ cancelled", TIMEOUT);
+      expect(countOccurrences(cancelled, "▪ cancelled")).toBe(1);
       expect(cancelled).not.toContain(QUESTION_PROMPT);
       expect(cancelled).not.toContain("kitty question cancellation completed");
 
@@ -3391,7 +3391,7 @@ describe.skipIf(SKIP)("tui: decision prompt input isolation", () => {
       expect(await ctx.session.paneTitle()).not.toContain("MARKDOWN_TITLE");
 
       await ctx.session.sendKeys("Escape");
-      await ctx.session.waitForText("▪ Cancelled", TIMEOUT);
+      await ctx.session.waitForText("▪ cancelled", TIMEOUT);
       await assertProcessAliveAndClean(ctx);
     },
     TIMEOUT,

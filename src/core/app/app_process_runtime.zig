@@ -125,7 +125,7 @@ pub fn Runtime(comptime App: type) type {
 
             return tool_result_errors.toolExecutionFailureJson(alloc, .{
                 .tool_name = tool_name,
-                .message = if (error_detail != null) "Tool execution failed while parsing or preparing data" else "Tool execution failed",
+                .message = if (error_detail != null) "tool execution failed while parsing or preparing data" else "tool execution failed",
                 .details = details,
                 .suggestion = suggestionForError(err),
             });

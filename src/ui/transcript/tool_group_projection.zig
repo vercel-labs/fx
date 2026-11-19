@@ -19,7 +19,19 @@ const vt_emulator = @import("../../core/terminal/engine.zig");
 
 const TranscriptEntry = transcript_blocks.TranscriptEntry;
 const ToolDetailRecord = transcript_blocks.ToolDetailRecord;
-const cancellation_follow_up = " · What can fx do differently?";
+const cancellation_follow_up = " · what can fx do differently?";
+
+/// The last index of `needle` in `haystack`, ignoring ASCII case, so a row
+/// saved with the earlier capitalized wording still matches.
+fn findLastIgnoreCase(haystack: []const u8, needle: []const u8) ?usize {
+    if (needle.len > haystack.len) return null;
+    var i = haystack.len - needle.len + 1;
+    while (i > 0) {
+        i -= 1;
+        if (std.ascii.eqlIgnoreCase(haystack[i .. i + needle.len], needle)) return i;
+    }
+    return null;
+}
 
 // The small helpers marked `noinline` below are called from many places in
 // the rows and headers. LLVM would copy each into every caller, and those
@@ -346,13 +358,13 @@ noinline fn writeCount(writer: *std.Io.Writer, before: []const u8, count: usize,
 
 /// Core's label for a shell run that returned while its command ran on
 /// (`still_running_label` in src/core/agent/runtime/tool_presentation.zig).
-const still_running_label = "Still running";
+const still_running_label = "still running";
 
-/// Whether a command's row reads "Still running": its call returned before
+/// Whether a command's row reads "still running": its call returned before
 /// the command ended, so it has no exit status yet.
 fn commandStillRunning(scratch: std.mem.Allocator, entry: TranscriptEntry) !bool {
     const status = try entryStatus(scratch, entry) orelse return false;
-    return std.mem.startsWith(u8, status, still_running_label ++ " ");
+    return std.ascii.startsWithIgnoreCase(status, still_running_label ++ " ");
 }
 
 /// The status phrase of a tool's status line, or null for other entries.
@@ -387,7 +399,7 @@ fn normalizeCanonicalStatus(
     }
     const owned = try out.toOwnedSlice();
     var phrase = std.mem.trim(u8, owned, " \t");
-    if (std.mem.endsWith(u8, phrase, cancellation_follow_up)) {
+    if (std.ascii.endsWithIgnoreCase(phrase, cancellation_follow_up)) {
         phrase = std.mem.trimEnd(u8, phrase[0 .. phrase.len - cancellation_follow_up.len], " \t");
     }
     return if (phrase.len == 0) null else phrase;
@@ -415,12 +427,13 @@ fn cancelledCommandNotice(scratch: std.mem.Allocator, raw: []const u8) !?[]const
         }
         break;
     }
-    const label = "Cancelled";
-    if (!std.mem.startsWith(u8, raw[index..], label)) return null;
+    // Rows saved before the lowercase interface read "Cancelled".
+    const label = "cancelled";
+    if (!std.ascii.startsWithIgnoreCase(raw[index..], label)) return null;
     const kept_end = index + label.len;
     // The command ends at the follow-up, or at the line's end on a line
     // saved without one.
-    const tail_at = std.mem.findLast(u8, raw[kept_end..], cancellation_follow_up) orelse
+    const tail_at = findLastIgnoreCase(raw[kept_end..], cancellation_follow_up) orelse
         std.mem.trimEnd(u8, raw[kept_end..], "\r\n").len;
     var out: std.Io.Writer.Allocating = .init(scratch);
     errdefer out.deinit();
@@ -987,7 +1000,7 @@ const StoryTally = struct {
     /// Commands that have not finished, which hold back the ✓.
     commands_running: usize = 0,
     /// Commands whose call returned while they ran on, which core labels
-    /// "Still running". They have no exit status, so they hold back the ✓
+    /// "still running". They have no exit status, so they hold back the ✓
     /// too, while the header still says they ran.
     commands_still_running: usize = 0,
     /// Calls other than commands that failed, such as an edit that did not
@@ -1376,8 +1389,7 @@ fn formatStoryHeader(scratch: std.mem.Allocator, tally: StoryTally, summary: Sum
     var mark_part: ?usize = null;
     if (kinds.items.len > 0) {
         const first = workPhrase(tally, kinds.items[0]);
-        try lead.writer.writeByte(std.ascii.toUpper(first[0]));
-        try lead.writer.writeAll(first[1..]);
+        try lead.writer.writeAll(first);
         if (collapsed and kinds.items[0] == .edits) try writeDiffTotals(&lead.writer, tally.diff, style);
         const named = @min(kinds.items.len, header_max_parts);
         for (kinds.items[1..named]) |kind| {
@@ -1499,7 +1511,7 @@ const StoryRowKind = enum {
     /// row that adds up their counts.
     edit,
     /// Different commands, one after the other, that share a label such as
-    /// "Ran" and did not fail: one row that names their steps.
+    /// "ran" and did not fail: one row that names their steps.
     commands,
     /// Every call of the same MCP tool in the group, wherever it is: one row
     /// that counts them.
@@ -1568,8 +1580,8 @@ fn rowListsNames(row: *const StoryRow) bool {
     return (row.identity.kind == .read or row.identity.kind == .search) and row.names.items.len > 1;
 }
 
-/// The label a command row's phrase puts before its command, such as "Ran "
-/// or "Running ". Null when the phrase does not end with the command.
+/// The label a command row's phrase puts before its command, such as "ran "
+/// or "running ". Null when the phrase does not end with the command.
 fn commandRowLabel(scratch: std.mem.Allocator, entry: TranscriptEntry, detail: ?*const ToolDetailRecord) !?[]const u8 {
     const record = detail orelse return null;
     if (record.activity_kind != .command) return null;
@@ -1598,19 +1610,20 @@ fn joinsCommandRow(scratch: std.mem.Allocator, last: *const StoryRow, entry: Tra
     // when it ends. One that ran does not join a row whose latest command
     // returned while it ran on: the row's label and mark come from its latest
     // call, so the row would say that command ran.
-    if (std.mem.eql(u8, label, last_label)) return true;
+    if (std.ascii.eqlIgnoreCase(label, last_label)) return true;
     if (!ranFamily(label) or !ranFamily(last_label)) return false;
-    return !(std.mem.eql(u8, label, "Ran ") and std.mem.eql(u8, last_label, still_running_label ++ " "));
+    return !(std.ascii.eqlIgnoreCase(label, "ran ") and std.ascii.eqlIgnoreCase(last_label, still_running_label ++ " "));
 }
 
 /// Whether `label` is what a command's row says while it runs, after its
 /// call returned while it ran on, or once it ran. Under joinsCommandRow, two
 /// calls with such labels that do not share a row never come to share one
 /// as their labels change, so no call shows on a row of its own and then
-/// folds into another.
+/// folds into another. Rows saved before labels were lowercase read "Ran",
+/// so the match ignores case.
 fn ranFamily(label: []const u8) bool {
-    return std.mem.eql(u8, label, "Ran ") or std.mem.eql(u8, label, "Running ") or
-        std.mem.eql(u8, label, still_running_label ++ " ");
+    return std.ascii.eqlIgnoreCase(label, "ran ") or std.ascii.eqlIgnoreCase(label, "running ") or
+        std.ascii.eqlIgnoreCase(label, still_running_label ++ " ");
 }
 
 /// Whether `a` and `b` name the same file, where one may be the other's end
@@ -1764,19 +1777,19 @@ const SubagentRewording = struct { match: []const u8, reads: []const u8 };
 
 /// The rows of a message to a subagent, in the order they are tried.
 const message_rewordings = [_]SubagentRewording{
-    .{ .match = "sent to ", .reads = "Messaged *" },
-    .{ .match = " busy; message not sent", .reads = "Couldn't message * (busy)" },
-    .{ .match = " failed", .reads = "Couldn't message *" },
-    .{ .match = " interrupted", .reads = "Cancelled message to *" },
-    .{ .match = " feedback not applied", .reads = "Feedback to * not applied" },
-    .{ .match = " feedback queued", .reads = "Sent feedback to *" },
-    .{ .match = " feedback applied", .reads = "Sent feedback to *" },
+    .{ .match = "sent to ", .reads = "messaged *" },
+    .{ .match = " busy; message not sent", .reads = "couldn't message * (busy)" },
+    .{ .match = " failed", .reads = "couldn't message *" },
+    .{ .match = " interrupted", .reads = "cancelled message to *" },
+    .{ .match = " feedback not applied", .reads = "feedback to * not applied" },
+    .{ .match = " feedback queued", .reads = "sent feedback to *" },
+    .{ .match = " feedback applied", .reads = "sent feedback to *" },
 };
 
 /// The rows of a report or a message a subagent sent to main.
 const report_rewordings = [_]SubagentRewording{
-    .{ .match = "from ", .reads = "Message from *" },
-    .{ .match = "report from ", .reads = "Report from *" },
+    .{ .match = "from ", .reads = "message from *" },
+    .{ .match = "report from ", .reads = "report from *" },
     .{ .match = " completed", .reads = "* finished" },
     .{ .match = " cancelled", .reads = "* was cancelled" },
     .{ .match = " interrupted", .reads = "* was interrupted" },
@@ -1816,14 +1829,6 @@ fn subagentRowPhrase(scratch: std.mem.Allocator, phrase: []const u8, record: *co
     };
     // A report or a message a subagent sent to main.
     if (action == null) return try rewordSubagentLead(scratch, lead, &report_rewordings) orelse lead;
-    // A wait, status, stop, or close leads with its verb, which takes a
-    // capital like "Ran" and "Read".
-    const verbs = [_][]const u8{ "waited ", "waiting ", "checked ", "checking ", "stopped ", "stopping ", "closed ", "closing ", "couldn't " };
-    for (verbs) |verb| if (std.mem.startsWith(u8, lead, verb)) {
-        const capital = try scratch.dupe(u8, lead);
-        capital[0] = std.ascii.toUpper(capital[0]);
-        return capital;
-    };
     return lead;
 }
 
@@ -1878,7 +1883,7 @@ fn editRowPhrase(scratch: std.mem.Allocator, phrase: []const u8, row: *const Sto
         named[0 .. named.len - shown.len]
     else if (merged)
         // The row's calls are completed or running changes, whose verb is
-        // one word, such as "Edited".
+        // one word, such as "edited".
         if (findByte(named, ' ')) |space| named[0 .. space + 1] else return null
     else
         return null;
@@ -1954,7 +1959,7 @@ fn nameListRowText(scratch: std.mem.Allocator, row: *const StoryRow, cols: u16) 
     const tool = if (is_read) "read_file" else storySearchTool(row.identity.key);
     // The row stands for every call it names, so it says what they did, even
     // while the newest still runs.
-    const verb = if (is_read) "Read" else if (std.mem.eql(u8, tool, "glob_files")) "Matched" else "Searched";
+    const verb = if (is_read) "read" else if (std.mem.eql(u8, tool, "glob_files")) "matched" else "searched";
 
     const budget: usize = if (cols > 2) cols - 2 else 1;
     const names = row.names.items;
@@ -2419,7 +2424,7 @@ const StoryRowText = struct {
 fn storyRowText(scratch: std.mem.Allocator, row: *const StoryRow, style: SummaryStyle, cols: u16) !StoryRowText {
     if (rowListsNames(row)) return nameListRowText(scratch, row, cols);
     if (row.identity.kind == .commands) {
-        const label = try commandRowLabel(scratch, row.entry, row.detail) orelse "Ran ";
+        const label = try commandRowLabel(scratch, row.entry, row.detail) orelse "ran ";
         var steps = try combinedCommandSteps(scratch, row.combined.items);
         var display = try std.mem.concat(scratch, u8, &.{ label, try formatShortCommand(scratch, steps, style.text_style) });
         // A narrow row leaves out its oldest steps first, so the newest stays
@@ -2434,7 +2439,7 @@ fn storyRowText(scratch: std.mem.Allocator, row: *const StoryRow, style: Summary
     }
     const merged_read = row.identity.kind == .read and row.count > 1;
     const status_phrase = if (merged_read)
-        try std.mem.concat(scratch, u8, &.{ "Read ", try terminalSafeText(scratch, row.identity.key) })
+        try std.mem.concat(scratch, u8, &.{ "read ", try terminalSafeText(scratch, row.identity.key) })
     else
         try entryStatus(scratch, row.entry) orelse if (row.detail) |record| record.tool_name else "tool activity";
     // A shell call that never ran says so by its command's steps, like any
@@ -2443,7 +2448,7 @@ fn storyRowText(scratch: std.mem.Allocator, row: *const StoryRow, style: Summary
     if (row.detail) |record| if (shellCallNeverRan(scratch, record)) {
         const command = storyArgString(scratch, record, "command") orelse record.command_display orelse record.tool_name;
         const short = try shortCommand(scratch, command) orelse try terminalSafeText(scratch, command);
-        const phrase = try inFailureStyle(scratch, try std.mem.concat(scratch, u8, &.{ "Couldn't run ", short }), style);
+        const phrase = try inFailureStyle(scratch, try std.mem.concat(scratch, u8, &.{ "couldn't run ", short }), style);
         const reason = if (row.ends_turn) try neverRanReason(scratch, record) orelse "" else "";
         return .{ .display = phrase, .body = phrase, .suffix = "", .reason = reason };
     };
@@ -2523,17 +2528,18 @@ fn countNote(scratch: std.mem.Allocator, before: []const u8, count: usize, after
 
 /// A phrase that still says the call is running, such as the status line
 /// `fx ask` prints when a command starts and never rewrites, or core's
-/// "Still running" for a run that returned before its command ended.
+/// "still running" for a run that returned before its command ended.
 fn phraseShowsProgress(phrase: []const u8) bool {
-    return std.mem.startsWith(u8, phrase, "Running ") or
-        std.mem.startsWith(u8, phrase, still_running_label ++ " ");
+    return std.ascii.startsWithIgnoreCase(phrase, "running ") or
+        std.ascii.startsWithIgnoreCase(phrase, still_running_label ++ " ");
 }
 
 /// Whether a row's own status already says it failed, as an old record with
-/// no exit code can ("Exited 1 make"), so it never gets a ✓.
+/// no exit code can ("Exited 1 make"), so it never gets a ✓. Such records
+/// predate lowercase labels, so the match ignores case.
 fn phraseNamesFailure(phrase: []const u8) bool {
-    const labels = [_][]const u8{ "Exited ", "Failed", "Couldn't ", "Timed out", "Killed", "Denied", "Cancelled" };
-    for (labels) |label| if (std.mem.startsWith(u8, phrase, label)) return true;
+    const labels = [_][]const u8{ "exited ", "failed", "couldn't ", "timed out", "killed", "denied", "cancelled" };
+    for (labels) |label| if (std.ascii.startsWithIgnoreCase(phrase, label)) return true;
     return false;
 }
 
@@ -2683,7 +2689,7 @@ fn splitFailedPhrase(phrase: []const u8, detail: ?*const ToolDetailRecord) ?Spli
     const colon = std.mem.find(u8, phrase, ": ") orelse return null;
     // "Failed: <action>: <error>", as `fx ask` writes it, names no target
     // before its first colon, so the row keeps the whole phrase.
-    if (std.mem.eql(u8, std.mem.trim(u8, phrase[0..colon], " "), "Failed")) return null;
+    if (std.mem.eql(u8, std.mem.trim(u8, phrase[0..colon], " "), "failed")) return null;
     const reason = std.mem.trim(u8, phrase[colon + 2 ..], " ");
     if (reason.len == 0) return null;
     return .{ .row = phrase[0..colon], .reason = reason };
@@ -2790,13 +2796,13 @@ fn firstSentence(text: []const u8) []const u8 {
 /// A failed call's row, "Couldn't edit main.zig", from core's "Failed
 /// main.zig". A call that names no target says the tool, as in "Couldn't
 /// run mcp_tool". The phrase stays as it is when it does not start with
-/// "Failed " or the tool's row says it another way.
+/// "failed " or the tool's row says it another way.
 fn couldNotPhrase(scratch: std.mem.Allocator, phrase: []const u8, record: *const ToolDetailRecord) ![]const u8 {
-    const failed = "Failed ";
+    const failed = "failed ";
     if (!std.mem.startsWith(u8, phrase, failed) or phrase.len == failed.len) return phrase;
     const verb = failedVerb(scratch, record) orelse return phrase;
     const target = phrase[failed.len..];
-    return std.mem.concat(scratch, u8, &.{ "Couldn't ", if (std.mem.eql(u8, target, record.tool_name)) "run" else verb, " ", target });
+    return std.mem.concat(scratch, u8, &.{ "couldn't ", if (std.mem.eql(u8, target, record.tool_name)) "run" else verb, " ", target });
 }
 
 /// What a failed call tried to do, as in "Couldn't edit". Null for a
@@ -2845,9 +2851,7 @@ fn formatTurnRecap(scratch: std.mem.Allocator, tally: StoryTally) ![]const u8 {
         const reads = tally.read_paths.items.len;
         try writeCount(w, "explored ", reads, pluralWord(reads, " file · ", " files · "));
     }
-    const recap = out.written();
-    if (recap.len > 0) recap[0] = std.ascii.toUpper(recap[0]);
-    return recap;
+    return out.written();
 }
 
 /// Inserts the turn recap before the first visible character of a turn
@@ -3171,7 +3175,7 @@ fn commandTailMatch(text: []const u8, base: []const u8) ?[]const u8 {
 /// terminal-session actions — so the phrase can be reclipped to the live
 /// terminal width instead of keeping the frozen "..." marker.
 ///
-/// The row's own leading label is preserved ("Running", "Ran", "Exited 1"):
+/// The row's own leading label is preserved ("running", "ran", "Exited 1"):
 /// the stored action label is a start-time prediction that cannot know the
 /// settled outcome, and an active row must never be rewritten to the
 /// completed label. Identity is proven by the command itself — the frozen
@@ -3839,18 +3843,20 @@ fn shortenCommandPhrase(
 /// recorded. Mirrors the terminal-outcome labels composed in
 /// tool_admission.permissionDeniedStatusLabel and the lifecycle rows.
 const known_multiword_labels = [_][]const u8{
-    "Denied by auto agent",
-    "Review evidence incomplete",
-    "Permission required",
-    "Safety caution",
-    "Review unavailable",
-    "Timed out",
+    "denied by auto agent",
+    "review evidence incomplete",
+    "permission required",
+    "safety caution",
+    "review unavailable",
+    "timed out",
     still_running_label,
 };
 
+/// Rows saved before labels were lowercase lead with "Timed out", so the
+/// match ignores case.
 fn knownLabelPrefix(phrase: []const u8) ?usize {
     for (known_multiword_labels) |label| {
-        if (std.mem.startsWith(u8, phrase, label) and phrase.len > label.len and phrase[label.len] == ' ')
+        if (std.ascii.startsWithIgnoreCase(phrase, label) and phrase.len > label.len and phrase[label.len] == ' ')
             return label.len;
     }
     return null;
@@ -4546,7 +4552,7 @@ fn recapTurnSummaries(
 test "collapsed tool groups render only the summary header" {
     const alloc = std.testing.allocator;
     const entries = [_]TranscriptEntry{
-        .{ .raw_bytes = .{ .id = 1, .bytes = @constCast("● Read file\n"), .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 1, .bytes = @constCast("● read file\n"), .class = .tool_status } },
         .{ .raw_bytes = .{ .id = 2, .bytes = @constCast("● List files\n"), .class = .tool_status } },
     };
     const details = [_]ToolDetailRecord{
@@ -4557,7 +4563,7 @@ test "collapsed tool groups render only the summary header" {
     var projection = try buildStyledFocused(alloc, &entries, &details, 120, null, true, .{}, .{});
     defer projection.deinit(alloc);
     const block = projection.entry_actions.items[0].override.bytes;
-    try std.testing.expectEqualStrings("● Read a file, searched", block);
+    try std.testing.expectEqualStrings("● read a file, searched", block);
     try std.testing.expect(projection.entry_actions.items[1] == .hide);
 }
 
@@ -4593,9 +4599,9 @@ test "tool relationship grouping retries cleanly after cancellation" {
 test "group header says what the group did, and a failed call's row says it failed" {
     const alloc = std.testing.allocator;
     const entries = [_]TranscriptEntry{
-        .{ .raw_bytes = .{ .id = 1, .bytes = "● Read runtime.zig\n", .class = .tool_status } },
-        .{ .raw_bytes = .{ .id = 2, .bytes = "● Edited main.zig\n", .class = .tool_status } },
-        .{ .raw_bytes = .{ .id = 3, .bytes = "● Ran zig build\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 1, .bytes = "● read runtime.zig\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 2, .bytes = "● edited main.zig\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 3, .bytes = "● ran zig build\n", .class = .tool_status } },
     };
     const details = [_]ToolDetailRecord{
         .{ .entry_id = 1, .tool_name = @constCast("read_file"), .activity_kind = .read, .outcome = .completed },
@@ -4608,10 +4614,10 @@ test "group header says what the group did, and a failed call's row says it fail
 
     try std.testing.expect(projection.entry_actions.items[0] == .override);
     try std.testing.expectEqualStrings(
-        "● Ran a command, read a file ✓\n" ++
-            "├ Read runtime.zig\n" ++
-            "├ Edited main.zig\n" ++
-            "└ Ran \x1b[38;5;252mzig\x1b[39m build",
+        "● ran a command, read a file ✓\n" ++
+            "├ read runtime.zig\n" ++
+            "├ edited main.zig\n" ++
+            "└ ran \x1b[38;5;252mzig\x1b[39m build",
         projection.entry_actions.items[0].override.bytes,
     );
     try std.testing.expect(projection.entry_actions.items[1] == .hide);
@@ -4638,7 +4644,7 @@ test "grouped subagent status keeps the vertical continuation for middle rows" {
     defer projection.deinit(alloc);
 
     try std.testing.expectEqualStrings(
-        "● Used subagents\n" ++
+        "● used subagents\n" ++
             "├ Subagent working\n│ glm-5.3-flash · max\n" ++
             "├ Subagent working\n│ glm-5.3-flash · max\n" ++
             "├ Subagent working\n│ glm-5.3-flash · max\n" ++
@@ -4667,9 +4673,9 @@ test "group summary uses singular and plural subagent labels" {
 test "small minimal tool groups surface canonical action targets" {
     const alloc = std.testing.allocator;
     const entries = [_]TranscriptEntry{
-        .{ .raw_bytes = .{ .id = 1, .bytes = "● Read\x1b[0m \x1b[38;5;245mruntime.zig\x1b[0m\n", .class = .tool_status } },
-        .{ .raw_bytes = .{ .id = 2, .bytes = "● Searched\x1b[0m \x1b[38;5;245msnapshot\x1b[0m\n", .class = .tool_status } },
-        .{ .raw_bytes = .{ .id = 3, .bytes = "● Editing\x1b[0m \x1b[38;5;245mstore.zig\x1b[0m\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 1, .bytes = "● read\x1b[0m \x1b[38;5;245mruntime.zig\x1b[0m\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 2, .bytes = "● searched\x1b[0m \x1b[38;5;245msnapshot\x1b[0m\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 3, .bytes = "● editing\x1b[0m \x1b[38;5;245mstore.zig\x1b[0m\n", .class = .tool_status } },
     };
     const details = [_]ToolDetailRecord{
         .{ .entry_id = 1, .tool_name = @constCast("read_file"), .activity_kind = .read, .outcome = .completed },
@@ -4681,10 +4687,10 @@ test "small minimal tool groups surface canonical action targets" {
     defer projection.deinit(alloc);
 
     try std.testing.expectEqualStrings(
-        "● Editing a file, read a file, searched\n" ++
-            "├ Read runtime.zig\n" ++
-            "├ Searched snapshot\n" ++
-            "└ Editing store.zig",
+        "● editing a file, read a file, searched\n" ++
+            "├ read runtime.zig\n" ++
+            "├ searched snapshot\n" ++
+            "└ editing store.zig",
         projection.entry_actions.items[0].override.bytes,
     );
 }
@@ -4744,9 +4750,9 @@ test "a group's rows keep their diff count accents, and a collapsed group's head
     ui_render.diff_removed_marker_style = "[R]";
 
     const entries = [_]TranscriptEntry{
-        .{ .raw_bytes = .{ .id = 1, .bytes = "● Read\x1b[0m \x1b[38;5;245mruntime.zig\x1b[0m\n", .class = .tool_status } },
-        .{ .raw_bytes = .{ .id = 2, .bytes = "● Wrote\x1b[0m \x1b[38;5;245mnote.txt\x1b[0m \x1b[38;2;48;164;108m+143\x1b[0m\n", .class = .tool_status } },
-        .{ .raw_bytes = .{ .id = 3, .bytes = "● Edited\x1b[0m \x1b[38;5;245mmain.zig\x1b[0m \x1b[38;2;48;164;108m+12\x1b[0m \x1b[38;5;245m/\x1b[0m \x1b[38;2;229;72;77m-3\x1b[0m\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 1, .bytes = "● read\x1b[0m \x1b[38;5;245mruntime.zig\x1b[0m\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 2, .bytes = "● wrote\x1b[0m \x1b[38;5;245mnote.txt\x1b[0m \x1b[38;2;48;164;108m+143\x1b[0m\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 3, .bytes = "● edited\x1b[0m \x1b[38;5;245mmain.zig\x1b[0m \x1b[38;2;48;164;108m+12\x1b[0m \x1b[38;5;245m/\x1b[0m \x1b[38;2;229;72;77m-3\x1b[0m\n", .class = .tool_status } },
     };
     const details = [_]ToolDetailRecord{
         .{ .entry_id = 1, .tool_name = @constCast("read_file"), .activity_kind = .read, .outcome = .completed },
@@ -4759,10 +4765,10 @@ test "a group's rows keep their diff count accents, and a collapsed group's head
 
     // The header says what the group did, and each edit's row has its counts.
     try std.testing.expectEqualStrings(
-        "● Edited files, read a file\n" ++
-            "├ Read runtime.zig\n" ++
-            "├ Wrote note.txt [G]+143\x1b[0m\n" ++
-            "└ Edited main.zig [G]+12\x1b[0m / [R]-3\x1b[0m",
+        "● edited files, read a file\n" ++
+            "├ read runtime.zig\n" ++
+            "├ wrote note.txt [G]+143\x1b[0m\n" ++
+            "└ edited main.zig [G]+12\x1b[0m / [R]-3\x1b[0m",
         projection.entry_actions.items[0].override.bytes,
     );
 
@@ -4771,7 +4777,7 @@ test "a group's rows keep their diff count accents, and a collapsed group's head
     var collapsed = try buildWithStyleAndStats(alloc, &entries, &details, 120, null, true, .{}, .{}, .compact, null, null);
     defer collapsed.deinit(alloc);
     try std.testing.expectEqualStrings(
-        "● Edited files [G]+155\x1b[0m [R]-3\x1b[0m, read a file",
+        "● edited files [G]+155\x1b[0m [R]-3\x1b[0m, read a file",
         collapsed.entry_actions.items[0].override.bytes,
     );
 }
@@ -4786,9 +4792,9 @@ test "collapsed tool group keeps diff counts when the path is clipped" {
     ui_render.diff_removed_marker_style = "[R]";
 
     const entries = [_]TranscriptEntry{
-        .{ .raw_bytes = .{ .id = 1, .bytes = "● Wrote\x1b[0m \x1b[38;5;245mdocs/release-notes/very-long-file-name.md\x1b[0m \x1b[38;2;48;164;108m+143\x1b[0m\n", .class = .tool_status } },
-        .{ .raw_bytes = .{ .id = 2, .bytes = "● Edited\x1b[0m \x1b[38;5;245msrc/ui/transcript/tool_group_projection.zig\x1b[0m \x1b[38;2;229;72;77m-27\x1b[0m\n", .class = .tool_status } },
-        .{ .raw_bytes = .{ .id = 3, .bytes = "● Edited\x1b[0m \x1b[38;5;245msrc/ui/transcript/tool_group_projection.zig\x1b[0m \x1b[38;2;48;164;108m+12\x1b[0m \x1b[38;5;245m/\x1b[0m \x1b[38;2;229;72;77m-3\x1b[0m\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 1, .bytes = "● wrote\x1b[0m \x1b[38;5;245mdocs/release-notes/very-long-file-name.md\x1b[0m \x1b[38;2;48;164;108m+143\x1b[0m\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 2, .bytes = "● edited\x1b[0m \x1b[38;5;245msrc/ui/transcript/tool_group_projection.zig\x1b[0m \x1b[38;2;229;72;77m-27\x1b[0m\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 3, .bytes = "● edited\x1b[0m \x1b[38;5;245msrc/ui/transcript/tool_group_projection.zig\x1b[0m \x1b[38;2;48;164;108m+12\x1b[0m \x1b[38;5;245m/\x1b[0m \x1b[38;2;229;72;77m-3\x1b[0m\n", .class = .tool_status } },
     };
     const details = [_]ToolDetailRecord{
         .{ .entry_id = 1, .tool_name = @constCast("write_file"), .activity_kind = .write, .outcome = .completed },
@@ -4804,10 +4810,10 @@ test "collapsed tool group keeps diff counts when the path is clipped" {
     // The phrase ends in the ellipsis and the counts follow it, so each row
     // fills the width exactly instead of losing its counts to the clip.
     try std.testing.expectEqualStrings(
-        "● Edited files\n" ++
-            "├ Wrote docs/release-notes/very-lo… [G]+143\x1b[0m\n" ++
-            "├ Edited src/ui/transcript/tool_gro… [R]-27\x1b[0m\n" ++
-            "└ Edited src/ui/transcript/too… [G]+12\x1b[0m / [R]-3\x1b[0m",
+        "● edited files\n" ++
+            "├ wrote docs/release-notes/very-lo… [G]+143\x1b[0m\n" ++
+            "├ edited src/ui/transcript/tool_gro… [R]-27\x1b[0m\n" ++
+            "└ edited src/ui/transcript/too… [G]+12\x1b[0m / [R]-3\x1b[0m",
         bytes,
     );
     var rows = std.mem.splitScalar(u8, bytes, '\n');
@@ -4822,8 +4828,8 @@ test "a collapsed group's header counts a failure its turn ended on" {
     const read_args = "{\"path\":\"/w/README.md\"}";
     const edit_args = "{\"path\":\"/w/README.md\",\"old_string\":\"a\",\"new_string\":\"b\"}";
     const entries = [_]TranscriptEntry{
-        .{ .raw_bytes = .{ .id = 1, .bytes = "● Read /w/README.md\n", .class = .tool_status } },
-        .{ .raw_bytes = .{ .id = 2, .bytes = "● Failed /w/README.md: old_string not found in file\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 1, .bytes = "● read /w/README.md\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 2, .bytes = "● failed /w/README.md: old_string not found in file\n", .class = .tool_status } },
         .{ .raw_bytes = .{ .id = 3, .bytes = "  2s", .class = .turn_summary } },
     };
     const details = [_]ToolDetailRecord{
@@ -4837,15 +4843,15 @@ test "a collapsed group's header counts a failure its turn ended on" {
         defer collapsed.deinit(alloc);
         const header = collapsed.entry_actions.items[0].override.bytes;
         errdefer std.debug.print("collapsed:\n{s}\n", .{header});
-        try std.testing.expectEqualStrings("● Read a file · 1 failed", header);
+        try std.testing.expectEqualStrings("● read a file · 1 failed", header);
     }
     // Expanded, the failed row says why, so the header does not count it.
     {
         const text = try groupTextForTest(alloc, &entries, &details);
         defer alloc.free(text);
         errdefer std.debug.print("expanded:\n{s}\n", .{text});
-        try std.testing.expectEqualStrings("● Read a file", firstLineForTest(text));
-        try std.testing.expect(std.mem.find(u8, text, "└ Couldn't edit README.md · old_string not found in file") != null);
+        try std.testing.expectEqualStrings("● read a file", firstLineForTest(text));
+        try std.testing.expect(std.mem.find(u8, text, "└ couldn't edit README.md · old_string not found in file") != null);
     }
     // A failure the turn went on after stays out of a collapsed header.
     {
@@ -4853,7 +4859,7 @@ test "a collapsed group's header counts a failure its turn ended on" {
         defer mid_turn.deinit(alloc);
         const header = mid_turn.entry_actions.items[0].override.bytes;
         errdefer std.debug.print("mid turn:\n{s}\n", .{header});
-        try std.testing.expectEqualStrings("● Read a file", header);
+        try std.testing.expectEqualStrings("● read a file", header);
     }
 }
 
@@ -4871,8 +4877,8 @@ test "a collapsed group's header keeps its edits' diff counts" {
     const arguments = "{\"path\":\"" ++ path ++ "\"}";
     const other_arguments = "{\"path\":\"" ++ other ++ "\"}";
     const entries = [_]TranscriptEntry{
-        .{ .raw_bytes = .{ .id = 1, .bytes = "● Edited " ++ path ++ " +1 / -1\n", .class = .tool_status } },
-        .{ .raw_bytes = .{ .id = 2, .bytes = "● Edited " ++ other ++ " +1 / -1\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 1, .bytes = "● edited " ++ path ++ " +1 / -1\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 2, .bytes = "● edited " ++ other ++ " +1 / -1\n", .class = .tool_status } },
     };
     const details = [_]ToolDetailRecord{
         .{ .entry_id = 1, .tool_name = @constCast("edit_file"), .activity_kind = .edit, .outcome = .completed, .arguments_json = @constCast(arguments) },
@@ -4885,11 +4891,11 @@ test "a collapsed group's header keeps its edits' diff counts" {
     const bytes = projection.entry_actions.items[0].override.bytes;
     const header = bytes[0 .. std.mem.findScalar(u8, bytes, '\n') orelse bytes.len];
     // The rows under the header name the files and their counts.
-    try std.testing.expectEqualStrings("● Edited files", header);
+    try std.testing.expectEqualStrings("● edited files", header);
 
     var collapsed = try buildWithStyleAndStats(alloc, &entries, &details, cols, null, true, .{}, .{}, .compact, null, null);
     defer collapsed.deinit(alloc);
-    try std.testing.expectEqualStrings("● Edited files [G]+2\x1b[0m [R]-2\x1b[0m", collapsed.entry_actions.items[0].override.bytes);
+    try std.testing.expectEqualStrings("● edited files [G]+2\x1b[0m [R]-2\x1b[0m", collapsed.entry_actions.items[0].override.bytes);
 }
 
 test "a failed call whose row does not say so gets a failure mark" {
@@ -4908,7 +4914,7 @@ test "a failed call whose row does not say so gets a failure mark" {
 test "a failure that names no target keeps its whole phrase" {
     const alloc = std.testing.allocator;
     const entries = [_]TranscriptEntry{
-        .{ .raw_bytes = .{ .id = 1, .bytes = "● Failed: Reading missing.txt: Path not found: missing.txt\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 1, .bytes = "● failed: Reading missing.txt: Path not found: missing.txt\n", .class = .tool_status } },
     };
     const details = [_]ToolDetailRecord{
         .{ .entry_id = 1, .tool_name = @constCast("read_file"), .activity_kind = .read, .outcome = .failed },
@@ -4916,7 +4922,7 @@ test "a failure that names no target keeps its whole phrase" {
     var projection = try build(alloc, &entries, &details, 100);
     defer projection.deinit(alloc);
     try std.testing.expectEqualStrings(
-        "● Failed: Reading missing.txt: Path not found: missing.txt",
+        "● failed: Reading missing.txt: Path not found: missing.txt",
         projection.entry_actions.items[0].override.bytes,
     );
 }
@@ -4924,7 +4930,7 @@ test "a failure that names no target keeps its whole phrase" {
 test "a command whose row still says Running gets no mark" {
     const alloc = std.testing.allocator;
     const entries = [_]TranscriptEntry{
-        .{ .raw_bytes = .{ .id = 1, .bytes = "● Running printf notice-test > ask-notice.txt\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 1, .bytes = "● running printf notice-test > ask-notice.txt\n", .class = .tool_status } },
     };
     const details = [_]ToolDetailRecord{
         .{ .entry_id = 1, .tool_name = @constCast("shell"), .activity_kind = .command, .outcome = .completed },
@@ -4932,7 +4938,7 @@ test "a command whose row still says Running gets no mark" {
     var projection = try build(alloc, &entries, &details, 80);
     defer projection.deinit(alloc);
     const bytes = projection.entry_actions.items[0].override.bytes;
-    try std.testing.expect(std.mem.startsWith(u8, bytes, "● Running "));
+    try std.testing.expect(std.mem.startsWith(u8, bytes, "● running "));
     try std.testing.expect(std.mem.find(u8, bytes, "✓") == null);
 }
 
@@ -4994,9 +5000,9 @@ test "grouped command lines shell-highlight verbs and numeric flags" {
     ui_render.diff_removed_marker_style = "[R]";
 
     const entries = [_]TranscriptEntry{
-        .{ .raw_bytes = .{ .id = 1, .bytes = "● Ran\x1b[0m \x1b[38;5;245mcat log.txt | head -80\x1b[0m\n", .class = .tool_status } },
-        .{ .raw_bytes = .{ .id = 2, .bytes = "● Wrote\x1b[0m \x1b[38;5;245mnote.txt\x1b[0m \x1b[38;2;48;164;108m+2\x1b[0m\n", .class = .tool_status } },
-        .{ .raw_bytes = .{ .id = 3, .bytes = "● Wrote\x1b[0m \x1b[38;5;245mdetached.txt\x1b[0m \x1b[38;2;48;164;108m+7\x1b[0m\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 1, .bytes = "● ran\x1b[0m \x1b[38;5;245mcat log.txt | head -80\x1b[0m\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 2, .bytes = "● wrote\x1b[0m \x1b[38;5;245mnote.txt\x1b[0m \x1b[38;2;48;164;108m+2\x1b[0m\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 3, .bytes = "● wrote\x1b[0m \x1b[38;5;245mdetached.txt\x1b[0m \x1b[38;2;48;164;108m+7\x1b[0m\n", .class = .tool_status } },
     };
     const details = [_]ToolDetailRecord{
         .{ .entry_id = 1, .tool_name = @constCast("shell"), .activity_kind = .command, .outcome = .completed },
@@ -5009,10 +5015,10 @@ test "grouped command lines shell-highlight verbs and numeric flags" {
     defer projection.deinit(alloc);
 
     try std.testing.expectEqualStrings(
-        "● Wrote a file, ran a command ✓\n" ++
-            "├ Ran \x1b[38;5;252mcat\x1b[39m log.txt \x1b[38;5;252m|\x1b[39m \x1b[38;5;252mhead\x1b[39m \x1b[38;5;250m-80\x1b[39m\n" ++
-            "├ Wrote note.txt [G]+2\x1b[0m\n" ++
-            "└ Wrote detached.txt +7",
+        "● wrote a file, ran a command ✓\n" ++
+            "├ ran \x1b[38;5;252mcat\x1b[39m log.txt \x1b[38;5;252m|\x1b[39m \x1b[38;5;252mhead\x1b[39m \x1b[38;5;250m-80\x1b[39m\n" ++
+            "├ wrote note.txt [G]+2\x1b[0m\n" ++
+            "└ wrote detached.txt +7",
         projection.entry_actions.items[0].override.bytes,
     );
 }
@@ -5096,8 +5102,8 @@ test "minimal tool group counts instruction refresh attempts without failure cou
 test "focused tool remains counted but is omitted from stable child rows" {
     const alloc = std.testing.allocator;
     const entries = [_]TranscriptEntry{
-        .{ .raw_bytes = .{ .id = 1, .bytes = "● Read runtime.zig\n", .class = .tool_status } },
-        .{ .raw_bytes = .{ .id = 2, .bytes = "● Running zig build test\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 1, .bytes = "● read runtime.zig\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 2, .bytes = "● running zig build test\n", .class = .tool_status } },
     };
     const details = [_]ToolDetailRecord{
         .{ .entry_id = 1, .tool_name = @constCast("read_file"), .activity_kind = .read, .outcome = .completed },
@@ -5108,7 +5114,7 @@ test "focused tool remains counted but is omitted from stable child rows" {
     defer projection.deinit(alloc);
 
     try std.testing.expectEqualStrings(
-        "● Running a command, read a file\n├ Read runtime.zig",
+        "● running a command, read a file\n├ read runtime.zig",
         projection.entry_actions.items[0].override.bytes,
     );
     try std.testing.expect(projection.entry_actions.items[1] == .hide);
@@ -5117,9 +5123,9 @@ test "focused tool remains counted but is omitted from stable child rows" {
 test "minimal command details expose running completed and failed process states" {
     const alloc = std.testing.allocator;
     const entries = [_]TranscriptEntry{
-        .{ .raw_bytes = .{ .id = 1, .bytes = "● Running\x1b[0m \x1b[38;5;245mrg snapshot\x1b[0m\n", .class = .tool_status } },
-        .{ .raw_bytes = .{ .id = 2, .bytes = "● Ran\x1b[0m \x1b[38;5;245mzig build\x1b[0m\n", .class = .tool_status } },
-        .{ .raw_bytes = .{ .id = 3, .bytes = "● Ran\x1b[0m \x1b[38;5;245mzig build test\x1b[0m\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 1, .bytes = "● running\x1b[0m \x1b[38;5;245mrg snapshot\x1b[0m\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 2, .bytes = "● ran\x1b[0m \x1b[38;5;245mzig build\x1b[0m\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 3, .bytes = "● ran\x1b[0m \x1b[38;5;245mzig build test\x1b[0m\n", .class = .tool_status } },
     };
     const details = [_]ToolDetailRecord{
         .{ .entry_id = 1, .tool_name = @constCast("run_command"), .activity_kind = .command, .outcome = null },
@@ -5131,10 +5137,10 @@ test "minimal command details expose running completed and failed process states
     defer projection.deinit(alloc);
 
     try std.testing.expectEqualStrings(
-        "● Ran commands ✗\n" ++
-            "├ Running \x1b[38;5;252mrg\x1b[39m snapshot\n" ++
-            "├ Ran \x1b[38;5;252mzig\x1b[39m build\n" ++
-            "└ Ran \x1b[38;5;252mzig\x1b[39m build test",
+        "● ran commands ✗\n" ++
+            "├ running \x1b[38;5;252mrg\x1b[39m snapshot\n" ++
+            "├ ran \x1b[38;5;252mzig\x1b[39m build\n" ++
+            "└ ran \x1b[38;5;252mzig\x1b[39m build test",
         projection.entry_actions.items[0].override.bytes,
     );
 }
@@ -5148,8 +5154,8 @@ test "a command still running when its call returned gets no check mark" {
     const still_args = try alloc.print("{{\"command\":{f}}}", .{std.json.fmt(still, .{})});
     defer alloc.free(still_args);
     const entries = [_]TranscriptEntry{
-        .{ .raw_bytes = .{ .id = 1, .bytes = "● Ran " ++ done ++ "\n", .class = .tool_status } },
-        .{ .raw_bytes = .{ .id = 2, .bytes = "● Still running " ++ still ++ "\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 1, .bytes = "● ran " ++ done ++ "\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 2, .bytes = "● still running " ++ still ++ "\n", .class = .tool_status } },
     };
     const details = [_]ToolDetailRecord{
         .{
@@ -5159,7 +5165,7 @@ test "a command still running when its call returned gets no check mark" {
             .activity_kind = .command,
             .arguments_json = done_args,
             .command_display = @constCast(done),
-            .command_action_label = @constCast("Ran"),
+            .command_action_label = @constCast("ran"),
             .outcome = .completed,
             .command_process_presentation = .{ .exit_code = 0 },
         },
@@ -5170,7 +5176,7 @@ test "a command still running when its call returned gets no check mark" {
             .activity_kind = .command,
             .arguments_json = still_args,
             .command_display = @constCast(still),
-            .command_action_label = @constCast("Ran"),
+            .command_action_label = @constCast("ran"),
             .outcome = .completed,
         },
     };
@@ -5193,13 +5199,13 @@ test "a command still running when its call returned gets no check mark" {
     defer alloc.free(group_text);
     errdefer std.debug.print("group:\n{s}\n", .{group_text});
     const trimmed = std.mem.trim(u8, group_text, "\n");
-    try std.testing.expectEqualStrings("● Still running echo, sleep, printf", trimmed);
+    try std.testing.expectEqualStrings("● still running echo, sleep, printf", trimmed);
 
     // Alone, the row is the header, and it gets no ✓ either.
     var single = try build(alloc, entries[1..], details[1..], 120);
     defer single.deinit(alloc);
     try std.testing.expectEqualStrings(
-        "● Still running \x1b[38;5;252msleep\x1b[39m, \x1b[38;5;252mprintf\x1b[39m",
+        "● still running \x1b[38;5;252msleep\x1b[39m, \x1b[38;5;252mprintf\x1b[39m",
         single.entry_actions.items[0].override.bytes,
     );
 }
@@ -5213,10 +5219,10 @@ test "edit rows name the file, and changes to one file share a row" {
     const write_args = "{\"path\":\"" ++ notes_path ++ "\",\"content\":\"x\"}";
     const failed_args = "{\"path\":\"" ++ app_path ++ "\",\"old_string\":\"a\",\"new_string\":\"b\"}";
     const entries = [_]TranscriptEntry{
-        .{ .raw_bytes = .{ .id = 1, .bytes = "● Edited " ++ main_path ++ " +4 / -2\n", .class = .tool_status } },
-        .{ .raw_bytes = .{ .id = 2, .bytes = "● Wrote " ++ notes_path ++ " +7\n", .class = .tool_status } },
-        .{ .raw_bytes = .{ .id = 3, .bytes = "● Edited " ++ main_path ++ " +1 / -1\n", .class = .tool_status } },
-        .{ .raw_bytes = .{ .id = 4, .bytes = "● Failed " ++ app_path ++ ": old_string not found\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 1, .bytes = "● edited " ++ main_path ++ " +4 / -2\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 2, .bytes = "● wrote " ++ notes_path ++ " +7\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 3, .bytes = "● edited " ++ main_path ++ " +1 / -1\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 4, .bytes = "● failed " ++ app_path ++ ": old_string not found\n", .class = .tool_status } },
     };
     const details = [_]ToolDetailRecord{
         .{ .entry_id = 1, .tool_name = @constCast("edit_file"), .activity_kind = .edit, .arguments_json = @constCast(edit_args), .outcome = .completed },
@@ -5243,9 +5249,9 @@ test "edit rows name the file, and changes to one file share a row" {
     // Each file shows by its name. The two edits of main.zig share one row
     // with their counts added up; the failed edit keeps its own row, which
     // says only that it failed.
-    try std.testing.expect(std.mem.find(u8, trimmed, "├ Edited main.zig +5/-3 · 2 edits\n") != null);
-    try std.testing.expect(std.mem.find(u8, trimmed, "├ Wrote notes.md +7\n") != null);
-    try std.testing.expect(std.mem.find(u8, trimmed, "└ Couldn't edit app.zig") != null);
+    try std.testing.expect(std.mem.find(u8, trimmed, "├ edited main.zig +5/-3 · 2 edits\n") != null);
+    try std.testing.expect(std.mem.find(u8, trimmed, "├ wrote notes.md +7\n") != null);
+    try std.testing.expect(std.mem.find(u8, trimmed, "└ couldn't edit app.zig") != null);
     try std.testing.expect(std.mem.find(u8, trimmed, "old_string") == null);
     try std.testing.expect(std.mem.find(u8, trimmed, "/Users/example") == null);
     // The name links to the file, as a read row's does.
@@ -5258,7 +5264,7 @@ test "edit rows name the file, and changes to one file share a row" {
     defer alloc.free(single_line);
     const single_text = try visibleLinesForTest(alloc, single_line, 120);
     defer alloc.free(single_text);
-    try std.testing.expectEqualStrings("● Edited main.zig +4/-2", std.mem.trim(u8, single_text, "\n"));
+    try std.testing.expectEqualStrings("● edited main.zig +4/-2", std.mem.trim(u8, single_text, "\n"));
 
     // Two edits of one file are one row, so the group is that one line.
     const same_entries = [_]TranscriptEntry{ entries[0], entries[2] };
@@ -5269,7 +5275,7 @@ test "edit rows name the file, and changes to one file share a row" {
     defer alloc.free(same_line);
     const same_text = try visibleLinesForTest(alloc, same_line, 120);
     defer alloc.free(same_text);
-    try std.testing.expectEqualStrings("● Edited main.zig +5/-3 · 2 edits", std.mem.trim(u8, same_text, "\n"));
+    try std.testing.expectEqualStrings("● edited main.zig +5/-3 · 2 edits", std.mem.trim(u8, same_text, "\n"));
 }
 
 test "an edit row adds up its counts when core names the file another way" {
@@ -5368,7 +5374,7 @@ test "a failed call says what it tried, and why only when its turn ended on it" 
     const skill_args = "{\"open\":\"fx-commit\"}";
     const failed_skill = TranscriptEntry{ .raw_bytes = .{
         .id = 1,
-        .bytes = "● Failed fx-commit: Skill \"fx-commit\" is ambiguous. Retry with the name and one advertised location: \"/a/fx-commit\", \"/b/fx-commit\"\n",
+        .bytes = "● failed fx-commit: Skill \"fx-commit\" is ambiguous. Retry with the name and one advertised location: \"/a/fx-commit\", \"/b/fx-commit\"\n",
         .class = .tool_status,
     } };
     const failed_skill_detail = ToolDetailRecord{ .entry_id = 1, .tool_name = @constCast("toolbox"), .activity_kind = .read, .arguments_json = @constCast(skill_args), .outcome = .failed };
@@ -5379,14 +5385,14 @@ test "a failed call says what it tried, and why only when its turn ended on it" 
     {
         const text = try groupTextForTest(alloc, &.{failed_skill}, &.{failed_skill_detail});
         defer alloc.free(text);
-        try std.testing.expectEqualStrings("● Couldn't open fx-commit", std.mem.trim(u8, text, "\n"));
+        try std.testing.expectEqualStrings("● couldn't open fx-commit", std.mem.trim(u8, text, "\n"));
     }
     // When the turn ended on the call, the row says why on its one line: the
     // first sentence of its error, without the instructions for the model.
     {
         const text = try groupTextForTest(alloc, &.{ failed_skill, turn_ended }, &.{failed_skill_detail});
         defer alloc.free(text);
-        try std.testing.expectEqualStrings("● Couldn't open fx-commit · Skill \"fx-commit\" is ambiguous", firstLineForTest(text));
+        try std.testing.expectEqualStrings("● couldn't open fx-commit · Skill \"fx-commit\" is ambiguous", firstLineForTest(text));
     }
 
     // In a group, the failed row says only that it failed, the header does
@@ -5395,9 +5401,9 @@ test "a failed call says what it tried, and why only when its turn ended on it" 
     const read_args = "{\"path\":\"/Users/example/fx/src/app.zig\"}";
     const edit_args = "{\"path\":\"" ++ path ++ "\",\"old_string\":\"a\",\"new_string\":\"b\"}";
     const entries = [_]TranscriptEntry{
-        .{ .raw_bytes = .{ .id = 1, .bytes = "● Read /Users/example/fx/src/app.zig\n", .class = .tool_status } },
-        .{ .raw_bytes = .{ .id = 2, .bytes = "● Failed " ++ path ++ ": old_string not found in file\n", .class = .tool_status } },
-        .{ .raw_bytes = .{ .id = 3, .bytes = "● Read /Users/example/fx/src/app.zig\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 1, .bytes = "● read /Users/example/fx/src/app.zig\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 2, .bytes = "● failed " ++ path ++ ": old_string not found in file\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 3, .bytes = "● read /Users/example/fx/src/app.zig\n", .class = .tool_status } },
     };
     const details = [_]ToolDetailRecord{
         .{ .entry_id = 1, .tool_name = @constCast("read_file"), .activity_kind = .read, .arguments_json = @constCast(read_args), .outcome = .completed },
@@ -5409,7 +5415,7 @@ test "a failed call says what it tried, and why only when its turn ended on it" 
         defer alloc.free(text);
         errdefer std.debug.print("group:\n{s}\n", .{text});
         try std.testing.expect(std.mem.find(u8, text, "failed") == null);
-        try std.testing.expect(std.mem.find(u8, text, "└ Couldn't edit main.zig") != null);
+        try std.testing.expect(std.mem.find(u8, text, "└ couldn't edit main.zig") != null);
         try std.testing.expect(std.mem.find(u8, text, "old_string") == null);
         try std.testing.expect(std.mem.find(u8, text, "✗") == null);
     }
@@ -5437,7 +5443,7 @@ test "a failed call says what it tried, and why only when its turn ended on it" 
 
     // A status that names only the target takes its reason from the result.
     {
-        const entry = TranscriptEntry{ .raw_bytes = .{ .id = 4, .bytes = "● Failed more output\n", .class = .tool_status } };
+        const entry = TranscriptEntry{ .raw_bytes = .{ .id = 4, .bytes = "● failed more output\n", .class = .tool_status } };
         const detail = ToolDetailRecord{
             .entry_id = 4,
             .tool_name = @constCast("read_tool_result"),
@@ -5448,22 +5454,22 @@ test "a failed call says what it tried, and why only when its turn ended on it" 
         };
         const result_text = try groupTextForTest(alloc, &.{ entry, turn_ended }, &.{detail});
         defer alloc.free(result_text);
-        try std.testing.expectEqualStrings("● Couldn't read more output · read_tool_result failed for handle h1: ResultHandleNotFound", firstLineForTest(result_text));
+        try std.testing.expectEqualStrings("● couldn't read more output · read_tool_result failed for handle h1: ResultHandleNotFound", firstLineForTest(result_text));
     }
 
     // A call that names no target says the tool it ran.
-    const mcp = TranscriptEntry{ .raw_bytes = .{ .id = 3, .bytes = "● Failed mcp_plain_getThreads: Invalid input. Labels need one item.\n", .class = .tool_status } };
+    const mcp = TranscriptEntry{ .raw_bytes = .{ .id = 3, .bytes = "● failed mcp_plain_getThreads: Invalid input. Labels need one item.\n", .class = .tool_status } };
     const mcp_detail = ToolDetailRecord{ .entry_id = 3, .tool_name = @constCast("mcp_plain_getThreads"), .activity_kind = .read, .arguments_json = @constCast("{}"), .outcome = .failed };
     const mcp_text = try groupTextForTest(alloc, &.{ mcp, turn_ended }, &.{mcp_detail});
     defer alloc.free(mcp_text);
-    try std.testing.expectEqualStrings("● Couldn't run mcp_plain_getThreads · Invalid input", firstLineForTest(mcp_text));
+    try std.testing.expectEqualStrings("● couldn't run mcp_plain_getThreads · Invalid input", firstLineForTest(mcp_text));
 
     // In a narrow row the reason clips first, and with no room it goes.
     var narrow = try build(alloc, &.{ failed_skill, turn_ended }, &.{failed_skill_detail}, 40);
     defer narrow.deinit(alloc);
     const narrow_row = narrow.entry_actions.items[0].override.bytes;
     try std.testing.expect(display_width.visibleWidthIgnoringAnsi(narrow_row) <= 40);
-    try std.testing.expect(std.mem.find(u8, narrow_row, "Couldn't open fx-commit · ") != null);
+    try std.testing.expect(std.mem.find(u8, narrow_row, "couldn't open fx-commit · ") != null);
     var tiny = try build(alloc, &.{ failed_skill, turn_ended }, &.{failed_skill_detail}, 30);
     defer tiny.deinit(alloc);
     const tiny_row = tiny.entry_actions.items[0].override.bytes;
@@ -5478,8 +5484,8 @@ test "a failed call's mark and words take the failure style" {
     const edit_args = "{\"path\":\"/w/main.zig\",\"old_string\":\"a\",\"new_string\":\"b\"}";
     const read_args = "{\"path\":\"/w/app.zig\"}";
     const entries = [_]TranscriptEntry{
-        .{ .raw_bytes = .{ .id = 1, .bytes = "● Read /w/app.zig\n", .class = .tool_status } },
-        .{ .raw_bytes = .{ .id = 2, .bytes = "● Failed /w/main.zig: old_string not found\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 1, .bytes = "● read /w/app.zig\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 2, .bytes = "● failed /w/main.zig: old_string not found\n", .class = .tool_status } },
     };
     const details = [_]ToolDetailRecord{
         .{ .entry_id = 1, .tool_name = @constCast("read_file"), .activity_kind = .read, .arguments_json = @constCast(read_args), .outcome = .completed },
@@ -5489,11 +5495,11 @@ test "a failed call's mark and words take the failure style" {
     defer projection.deinit(alloc);
     const bytes = projection.entry_actions.items[0].override.bytes;
     errdefer std.debug.print("group:\n{s}\n", .{bytes});
-    try std.testing.expect(std.mem.find(u8, bytes, "<failure>Couldn't edit ") != null);
+    try std.testing.expect(std.mem.find(u8, bytes, "<failure>couldn't edit ") != null);
 
     // A failed command's ✗ and its line of output take it too.
     const command_entries = [_]TranscriptEntry{
-        .{ .raw_bytes = .{ .id = 3, .bytes = "● Exited 1 zig build\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 3, .bytes = "● exited 1 zig build\n", .class = .tool_status } },
     };
     var command_detail = storyCommandDetail(3, "{\"action\":\"run\",\"command\":\"zig build\"}", 1, "error: expected ';'\n");
     command_detail.outcome = .failed;
@@ -5527,44 +5533,44 @@ test "a call joins its row at once, without a row of its own first" {
     // A command still running joins the row of the command that ran before it.
     {
         const entries = [_]TranscriptEntry{
-            .{ .raw_bytes = .{ .id = 1, .bytes = "● Ran echo ready\n", .class = .tool_status } },
-            .{ .raw_bytes = .{ .id = 2, .bytes = "● Running sleep 5\n", .class = .tool_status } },
+            .{ .raw_bytes = .{ .id = 1, .bytes = "● ran echo ready\n", .class = .tool_status } },
+            .{ .raw_bytes = .{ .id = 2, .bytes = "● running sleep 5\n", .class = .tool_status } },
         };
         const details = [_]ToolDetailRecord{
-            .{ .entry_id = 1, .tool_name = @constCast("shell"), .captured_command = true, .activity_kind = .command, .arguments_json = @constCast("{\"command\":\"echo ready\"}"), .command_display = @constCast("echo ready"), .command_action_label = @constCast("Ran"), .outcome = .completed, .command_process_presentation = .{ .exit_code = 0 } },
-            .{ .entry_id = 2, .tool_name = @constCast("shell"), .captured_command = true, .activity_kind = .command, .arguments_json = @constCast("{\"command\":\"sleep 5\"}"), .command_display = @constCast("sleep 5"), .command_action_label = @constCast("Ran") },
+            .{ .entry_id = 1, .tool_name = @constCast("shell"), .captured_command = true, .activity_kind = .command, .arguments_json = @constCast("{\"command\":\"echo ready\"}"), .command_display = @constCast("echo ready"), .command_action_label = @constCast("ran"), .outcome = .completed, .command_process_presentation = .{ .exit_code = 0 } },
+            .{ .entry_id = 2, .tool_name = @constCast("shell"), .captured_command = true, .activity_kind = .command, .arguments_json = @constCast("{\"command\":\"sleep 5\"}"), .command_display = @constCast("sleep 5"), .command_action_label = @constCast("ran") },
         };
         const text = try groupTextForTest(alloc, &entries, &details);
         defer alloc.free(text);
-        try std.testing.expectEqualStrings("● Running echo, sleep", std.mem.trim(u8, text, "\n"));
+        try std.testing.expectEqualStrings("● running echo, sleep", std.mem.trim(u8, text, "\n"));
     }
     // A read, a search, and an edit with no arguments yet wait in the row
     // they will join, so the group keeps one line.
     const Pending = struct { done: TranscriptEntry, done_detail: ToolDetailRecord, pending: TranscriptEntry, pending_tool: []const u8, kind: types.ToolActivityKind, row: []const u8 };
     const cases = [_]Pending{
         .{
-            .done = .{ .raw_bytes = .{ .id = 1, .bytes = "● Read /Users/example/a.zig\n", .class = .tool_status } },
+            .done = .{ .raw_bytes = .{ .id = 1, .bytes = "● read /Users/example/a.zig\n", .class = .tool_status } },
             .done_detail = .{ .entry_id = 1, .tool_name = @constCast("read_file"), .activity_kind = .read, .arguments_json = @constCast("{\"path\":\"/Users/example/a.zig\"}"), .outcome = .completed },
-            .pending = .{ .raw_bytes = .{ .id = 2, .bytes = "● Reading\n", .class = .tool_status } },
+            .pending = .{ .raw_bytes = .{ .id = 2, .bytes = "● reading\n", .class = .tool_status } },
             .pending_tool = "read_file",
             .kind = .read,
-            .row = "● Read a.zig",
+            .row = "● read a.zig",
         },
         .{
-            .done = .{ .raw_bytes = .{ .id = 1, .bytes = "● Searched foo\n", .class = .tool_status } },
+            .done = .{ .raw_bytes = .{ .id = 1, .bytes = "● searched foo\n", .class = .tool_status } },
             .done_detail = .{ .entry_id = 1, .tool_name = @constCast("grep_files"), .activity_kind = .read, .arguments_json = @constCast("{\"pattern\":\"foo\"}"), .outcome = .completed },
-            .pending = .{ .raw_bytes = .{ .id = 2, .bytes = "● Searching\n", .class = .tool_status } },
+            .pending = .{ .raw_bytes = .{ .id = 2, .bytes = "● searching\n", .class = .tool_status } },
             .pending_tool = "grep_files",
             .kind = .read,
-            .row = "● Searched foo",
+            .row = "● searched foo",
         },
         .{
-            .done = .{ .raw_bytes = .{ .id = 1, .bytes = "● Edited /Users/example/a.zig +1 / -1\n", .class = .tool_status } },
+            .done = .{ .raw_bytes = .{ .id = 1, .bytes = "● edited /Users/example/a.zig +1 / -1\n", .class = .tool_status } },
             .done_detail = .{ .entry_id = 1, .tool_name = @constCast("edit_file"), .activity_kind = .edit, .arguments_json = @constCast("{\"path\":\"/Users/example/a.zig\",\"old_string\":\"a\",\"new_string\":\"b\"}"), .outcome = .completed },
-            .pending = .{ .raw_bytes = .{ .id = 2, .bytes = "● Editing\n", .class = .tool_status } },
+            .pending = .{ .raw_bytes = .{ .id = 2, .bytes = "● editing\n", .class = .tool_status } },
             .pending_tool = "edit_file",
             .kind = .edit,
-            .row = "● Edited a.zig +1/-1",
+            .row = "● edited a.zig +1/-1",
         },
     };
     for (cases) |case| {
@@ -5626,14 +5632,14 @@ test "a denied or cancelled read, search, or command keeps its own row" {
     {
         const denied_run = TranscriptEntry{ .raw_bytes = .{ .id = 6, .bytes = "● Denied zig build\n", .class = .tool_status } };
         const ran = TranscriptEntry{ .raw_bytes = .{ .id = 7, .bytes = "● Ran zig build\n", .class = .tool_status } };
-        const denied_run_detail = ToolDetailRecord{ .entry_id = 6, .tool_name = @constCast("shell"), .captured_command = true, .activity_kind = .command, .arguments_json = @constCast("{\"command\":\"zig build\"}"), .command_display = @constCast("zig build"), .command_action_label = @constCast("Ran"), .outcome = .denied };
-        const ran_detail = ToolDetailRecord{ .entry_id = 7, .tool_name = @constCast("shell"), .captured_command = true, .activity_kind = .command, .arguments_json = @constCast("{\"command\":\"zig build\"}"), .command_display = @constCast("zig build"), .command_action_label = @constCast("Ran"), .outcome = .completed, .command_process_presentation = .{ .exit_code = 0 } };
+        const denied_run_detail = ToolDetailRecord{ .entry_id = 6, .tool_name = @constCast("shell"), .captured_command = true, .activity_kind = .command, .arguments_json = @constCast("{\"command\":\"zig build\"}"), .command_display = @constCast("zig build"), .command_action_label = @constCast("ran"), .outcome = .denied };
+        const ran_detail = ToolDetailRecord{ .entry_id = 7, .tool_name = @constCast("shell"), .captured_command = true, .activity_kind = .command, .arguments_json = @constCast("{\"command\":\"zig build\"}"), .command_display = @constCast("zig build"), .command_action_label = @constCast("ran"), .outcome = .completed, .command_process_presentation = .{ .exit_code = 0 } };
         const text = try groupTextForTest(alloc, &.{ denied_run, ran }, &.{ denied_run_detail, ran_detail });
         defer alloc.free(text);
         errdefer std.debug.print("group:\n{s}\n", .{text});
         try std.testing.expect(std.mem.find(u8, text, "×2") == null);
         try std.testing.expect(std.mem.find(u8, text, "1 denied") != null);
-        try std.testing.expect(std.mem.find(u8, text, "Denied") != null);
+        try std.testing.expect(std.mem.find(u8, text, "denied") != null);
     }
     // A denied search keeps its own row beside the searches that ran.
     {
@@ -5652,9 +5658,9 @@ test "a denied or cancelled read, search, or command keeps its own row" {
 test "a group of one row that lists names is that one line" {
     const alloc = std.testing.allocator;
     const entries = [_]TranscriptEntry{
-        .{ .raw_bytes = .{ .id = 1, .bytes = "● Searched subagent\n", .class = .tool_status } },
-        .{ .raw_bytes = .{ .id = 2, .bytes = "● Searched Subagents\n", .class = .tool_status } },
-        .{ .raw_bytes = .{ .id = 3, .bytes = "● Searched subagents\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 1, .bytes = "● searched subagent\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 2, .bytes = "● searched Subagents\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 3, .bytes = "● searched subagents\n", .class = .tool_status } },
     };
     const details = [_]ToolDetailRecord{
         .{ .entry_id = 1, .tool_name = @constCast("grep_files"), .activity_kind = .read, .arguments_json = @constCast("{\"pattern\":\"subagent\"}"), .outcome = .completed },
@@ -5663,15 +5669,15 @@ test "a group of one row that lists names is that one line" {
     };
     const text = try groupTextForTest(alloc, &entries, &details);
     defer alloc.free(text);
-    try std.testing.expectEqualStrings("● Searched subagent, Subagents, subagents", std.mem.trim(u8, text, "\n"));
+    try std.testing.expectEqualStrings("● searched subagent, Subagents, subagents", std.mem.trim(u8, text, "\n"));
 }
 
 test "a failure the model fixed at once shows as the try that worked" {
     const alloc = std.testing.allocator;
-    const failed_open = TranscriptEntry{ .raw_bytes = .{ .id = 1, .bytes = "● Failed fx-commit: Skill \"fx-commit\" is ambiguous.\n", .class = .tool_status } };
-    const failed_again = TranscriptEntry{ .raw_bytes = .{ .id = 2, .bytes = "● Failed fx-commit: Skill \"fx-commit\" is ambiguous.\n", .class = .tool_status } };
-    const opened = TranscriptEntry{ .raw_bytes = .{ .id = 3, .bytes = "● Used /a/fx-commit\n", .class = .tool_status } };
-    const other = TranscriptEntry{ .raw_bytes = .{ .id = 4, .bytes = "● Used other-skill\n", .class = .tool_status } };
+    const failed_open = TranscriptEntry{ .raw_bytes = .{ .id = 1, .bytes = "● failed fx-commit: Skill \"fx-commit\" is ambiguous.\n", .class = .tool_status } };
+    const failed_again = TranscriptEntry{ .raw_bytes = .{ .id = 2, .bytes = "● failed fx-commit: Skill \"fx-commit\" is ambiguous.\n", .class = .tool_status } };
+    const opened = TranscriptEntry{ .raw_bytes = .{ .id = 3, .bytes = "● used /a/fx-commit\n", .class = .tool_status } };
+    const other = TranscriptEntry{ .raw_bytes = .{ .id = 4, .bytes = "● used other-skill\n", .class = .tool_status } };
     const failed_detail = ToolDetailRecord{ .entry_id = 1, .tool_name = @constCast("toolbox"), .activity_kind = .read, .arguments_json = @constCast("{\"open\":\"fx-commit\"}"), .outcome = .failed };
     const failed_again_detail = ToolDetailRecord{ .entry_id = 2, .tool_name = @constCast("toolbox"), .activity_kind = .read, .arguments_json = @constCast("{\"open\":\"fx-commit\"}"), .outcome = .failed };
     // The retry names the skill by its path; its base name is the same.
@@ -5682,40 +5688,40 @@ test "a failure the model fixed at once shows as the try that worked" {
     {
         const text = try groupTextForTest(alloc, &.{ failed_open, opened }, &.{ failed_detail, opened_detail });
         defer alloc.free(text);
-        try std.testing.expectEqualStrings("● Used /a/fx-commit · 2nd try", std.mem.trim(u8, text, "\n"));
+        try std.testing.expectEqualStrings("● used /a/fx-commit · 2nd try", std.mem.trim(u8, text, "\n"));
     }
     // Two failures before it make it the 3rd try.
     {
         const text = try groupTextForTest(alloc, &.{ failed_open, failed_again, opened }, &.{ failed_detail, failed_again_detail, opened_detail });
         defer alloc.free(text);
-        try std.testing.expectEqualStrings("● Used /a/fx-commit · 3rd try", std.mem.trim(u8, text, "\n"));
+        try std.testing.expectEqualStrings("● used /a/fx-commit · 3rd try", std.mem.trim(u8, text, "\n"));
     }
     // An edit of another file with the same name did not fix it either.
     {
-        const failed_edit = TranscriptEntry{ .raw_bytes = .{ .id = 5, .bytes = "● Failed /Users/example/fx/tests/main.zig: old_string not found\n", .class = .tool_status } };
-        const other_edit = TranscriptEntry{ .raw_bytes = .{ .id = 6, .bytes = "● Edited /Users/example/fx/src/main.zig +1 / -1\n", .class = .tool_status } };
+        const failed_edit = TranscriptEntry{ .raw_bytes = .{ .id = 5, .bytes = "● failed /Users/example/fx/tests/main.zig: old_string not found\n", .class = .tool_status } };
+        const other_edit = TranscriptEntry{ .raw_bytes = .{ .id = 6, .bytes = "● edited /Users/example/fx/src/main.zig +1 / -1\n", .class = .tool_status } };
         const failed_edit_detail = ToolDetailRecord{ .entry_id = 5, .tool_name = @constCast("edit_file"), .activity_kind = .edit, .arguments_json = @constCast("{\"path\":\"/Users/example/fx/tests/main.zig\",\"old_string\":\"a\",\"new_string\":\"b\"}"), .outcome = .failed };
         const other_edit_detail = ToolDetailRecord{ .entry_id = 6, .tool_name = @constCast("edit_file"), .activity_kind = .edit, .arguments_json = @constCast("{\"path\":\"/Users/example/fx/src/main.zig\",\"old_string\":\"a\",\"new_string\":\"b\"}"), .outcome = .completed };
         const text = try groupTextForTest(alloc, &.{ failed_edit, other_edit }, &.{ failed_edit_detail, other_edit_detail });
         defer alloc.free(text);
         errdefer std.debug.print("group:\n{s}\n", .{text});
         try std.testing.expect(std.mem.find(u8, text, "1 failed") == null);
-        try std.testing.expect(std.mem.find(u8, text, "Couldn't edit main.zig") != null);
+        try std.testing.expect(std.mem.find(u8, text, "couldn't edit main.zig") != null);
         try std.testing.expect(std.mem.find(u8, text, "old_string") == null);
         try std.testing.expect(std.mem.find(u8, text, "try") == null);
     }
     // A tool whose calls name no target, such as an MCP tool, may do other
     // work on its next call, so its failure stays.
     {
-        const failed_mcp = TranscriptEntry{ .raw_bytes = .{ .id = 7, .bytes = "● Failed mcp_issues_create: Invalid input\n", .class = .tool_status } };
-        const done_mcp = TranscriptEntry{ .raw_bytes = .{ .id = 8, .bytes = "● Ran mcp_issues_create\n", .class = .tool_status } };
+        const failed_mcp = TranscriptEntry{ .raw_bytes = .{ .id = 7, .bytes = "● failed mcp_issues_create: Invalid input\n", .class = .tool_status } };
+        const done_mcp = TranscriptEntry{ .raw_bytes = .{ .id = 8, .bytes = "● ran mcp_issues_create\n", .class = .tool_status } };
         const failed_mcp_detail = ToolDetailRecord{ .entry_id = 7, .tool_name = @constCast("mcp_issues_create"), .activity_kind = .read, .arguments_json = @constCast("{\"title\":\"a\"}"), .outcome = .failed };
         const done_mcp_detail = ToolDetailRecord{ .entry_id = 8, .tool_name = @constCast("mcp_issues_create"), .activity_kind = .read, .arguments_json = @constCast("{\"title\":\"b\"}"), .outcome = .completed };
         const text = try groupTextForTest(alloc, &.{ failed_mcp, done_mcp }, &.{ failed_mcp_detail, done_mcp_detail });
         defer alloc.free(text);
         errdefer std.debug.print("group:\n{s}\n", .{text});
         try std.testing.expect(std.mem.find(u8, text, "1 failed") == null);
-        try std.testing.expect(std.mem.find(u8, text, "Couldn't run mcp_issues_create") != null);
+        try std.testing.expect(std.mem.find(u8, text, "couldn't run mcp_issues_create") != null);
         try std.testing.expect(std.mem.find(u8, text, "Invalid input") == null);
         try std.testing.expect(std.mem.find(u8, text, "try") == null);
     }
@@ -5725,7 +5731,7 @@ test "a failure the model fixed at once shows as the try that worked" {
         defer alloc.free(text);
         errdefer std.debug.print("group:\n{s}\n", .{text});
         try std.testing.expect(std.mem.find(u8, text, "1 failed") == null);
-        try std.testing.expect(std.mem.find(u8, text, "Couldn't open fx-commit") != null);
+        try std.testing.expect(std.mem.find(u8, text, "couldn't open fx-commit") != null);
         try std.testing.expect(std.mem.find(u8, text, "ambiguous") == null);
         try std.testing.expect(std.mem.find(u8, text, "try") == null);
     }
@@ -5749,7 +5755,7 @@ test "completed command rows shell-highlight quoted strings without coloring the
         .activity_kind = .command,
         .arguments_json = arguments_json,
         .command_display = @constCast(command),
-        .command_action_label = @constCast("Ran"),
+        .command_action_label = @constCast("ran"),
         .outcome = .completed,
         .command_process_presentation = .{ .exit_code = 0 },
     }};
@@ -5788,7 +5794,7 @@ test "completed command rows reproject stored commands, then show their short fo
             .activity_kind = .command,
             .arguments_json = arguments_json,
             .command_display = @constCast(command),
-            .command_action_label = @constCast("Ran"),
+            .command_action_label = @constCast("ran"),
             .outcome = .completed,
             .command_process_presentation = .{ .exit_code = 0 },
         },
@@ -5837,7 +5843,7 @@ test "completed command rows reproject stored commands, then show their short fo
             .activity_kind = .command,
             .arguments_json = relative_arguments_json,
             .command_display = @constCast(relative_command),
-            .command_action_label = @constCast("Ran"),
+            .command_action_label = @constCast("ran"),
             .outcome = .completed,
             .command_process_presentation = .{ .exit_code = 0 },
         },
@@ -5861,7 +5867,7 @@ test "completed command rows reproject stored commands, then show their short fo
         .activity_kind = .command,
         .arguments_json = arguments_json,
         .command_display = @constCast(command),
-        .command_action_label = @constCast("Installed skill"),
+        .command_action_label = @constCast("installed skill"),
         .outcome = .completed,
         .command_process_presentation = .{ .exit_code = 0 },
     }};
@@ -5877,12 +5883,12 @@ test "completed session and tty command rows reproject stored commands at the cu
     const entries = [_]TranscriptEntry{
         .{ .raw_bytes = .{
             .id = 1,
-            .bytes = "● Ran\x1b[0m \x1b[38;5;245mbun run pipeline-stage-pipeline-stage-pipeline-stage-pipeline-stage-pipeline-stage-pipeline-stage-pipeli...\x1b[0m\n",
+            .bytes = "● ran\x1b[0m \x1b[38;5;245mbun run pipeline-stage-pipeline-stage-pipeline-stage-pipeline-stage-pipeline-stage-pipeline-stage-pipeli...\x1b[0m\n",
             .class = .tool_status,
         } },
         .{ .raw_bytes = .{
             .id = 2,
-            .bytes = "● Observed\x1b[0m \x1b[38;5;245mnpm run dev-server-dev-server-dev-server-dev-server-dev-server-dev-server-dev-server-dev-server-dev-s...\x1b[0m\n",
+            .bytes = "● observed\x1b[0m \x1b[38;5;245mnpm run dev-server-dev-server-dev-server-dev-server-dev-server-dev-server-dev-server-dev-server-dev-s...\x1b[0m\n",
             .class = .tool_status,
         } },
     };
@@ -5895,7 +5901,7 @@ test "completed session and tty command rows reproject stored commands at the cu
             .captured_command = false,
             .activity_kind = .command,
             .command_display = @constCast(tty_command),
-            .command_action_label = @constCast("Ran"),
+            .command_action_label = @constCast("ran"),
             .outcome = .completed,
             .command_process_presentation = .{ .exit_code = 0 },
         },
@@ -5905,7 +5911,7 @@ test "completed session and tty command rows reproject stored commands at the cu
             .captured_command = false,
             .activity_kind = .command,
             .command_display = @constCast(observe_command),
-            .command_action_label = @constCast("Observed"),
+            .command_action_label = @constCast("observed"),
             .outcome = .completed,
         },
     };
@@ -5917,10 +5923,10 @@ test "completed session and tty command rows reproject stored commands at the cu
     _ = narrow_lines.next(); // group header
     const narrow_tty = narrow_lines.next().?;
     const narrow_observe = narrow_lines.next().?;
-    try std.testing.expect(std.mem.startsWith(u8, narrow_tty, "├ Ran \x1b[38;5;252mbun\x1b[39m run pipeline-stage-"));
+    try std.testing.expect(std.mem.startsWith(u8, narrow_tty, "├ ran \x1b[38;5;252mbun\x1b[39m run pipeline-stage-"));
     try std.testing.expect(std.mem.endsWith(u8, narrow_tty, "…\x1b[0m"));
     try std.testing.expect(display_width.visibleWidthIgnoringAnsi(narrow_tty) <= 80);
-    try std.testing.expect(std.mem.startsWith(u8, narrow_observe, "└ Observed \x1b[38;5;252mnpm\x1b[39m run dev-server-"));
+    try std.testing.expect(std.mem.startsWith(u8, narrow_observe, "└ observed \x1b[38;5;252mnpm\x1b[39m run dev-server-"));
     try std.testing.expect(std.mem.endsWith(u8, narrow_observe, "…\x1b[0m"));
     // Reprojection replaces the frozen ASCII marker before reclipping.
     try std.testing.expect(std.mem.find(u8, narrow_rows, "...") == null);
@@ -5928,9 +5934,9 @@ test "completed session and tty command rows reproject stored commands at the cu
     var wide = try build(alloc, &entries, &details, 400);
     defer wide.deinit(alloc);
     try std.testing.expectEqualStrings(
-        "● Ran commands ✓\n" ++
-            "├ Ran \x1b[38;5;252mbun\x1b[39m run " ++ text_utils.repeat("pipeline-stage-", 10) ++ "\n" ++
-            "└ Observed \x1b[38;5;252mnpm\x1b[39m run " ++ text_utils.repeat("dev-server-", 12),
+        "● ran commands ✓\n" ++
+            "├ ran \x1b[38;5;252mbun\x1b[39m run " ++ text_utils.repeat("pipeline-stage-", 10) ++ "\n" ++
+            "└ observed \x1b[38;5;252mnpm\x1b[39m run " ++ text_utils.repeat("dev-server-", 12),
         wide.entry_actions.items[0].override.bytes,
     );
 }
@@ -6055,7 +6061,7 @@ test "Ctrl+O tool lines wrap under the detail indent and keep command styling" {
             .tool_name = @constCast("shell"),
             .activity_kind = .command,
             .command_display = @constCast(first_command),
-            .command_action_label = @constCast("Ran"),
+            .command_action_label = @constCast("ran"),
             .outcome = .completed,
         },
         .{
@@ -6063,7 +6069,7 @@ test "Ctrl+O tool lines wrap under the detail indent and keep command styling" {
             .tool_name = @constCast("shell"),
             .activity_kind = .command,
             .command_display = @constCast(last_command),
-            .command_action_label = @constCast("Ran"),
+            .command_action_label = @constCast("ran"),
             .outcome = .completed,
         },
     };
@@ -6166,7 +6172,7 @@ test "expanded group children reproject stored commands at the current width" {
         .captured_command = false,
         .activity_kind = .command,
         .command_display = @constCast(command),
-        .command_action_label = @constCast("Ran"),
+        .command_action_label = @constCast("ran"),
         .outcome = .completed,
         .command_process_presentation = .{ .exit_code = 0 },
     }};
@@ -6209,7 +6215,7 @@ test "command reprojection rejects a record carrying a different command" {
         .tool_name = @constCast("shell"),
         .activity_kind = .command,
         .command_display = @constCast("zig build test --release"),
-        .command_action_label = @constCast("Ran"),
+        .command_action_label = @constCast("ran"),
         .outcome = .completed,
         .command_process_presentation = .{ .exit_code = 0 },
     }};
@@ -6234,15 +6240,15 @@ test "command reprojection keeps the row's own label across lifecycle states" {
     };
     const cases = [_]Case{
         // Active row: outcome not yet set, stored label is the start-time
-        // prediction. The live row must keep "Running", never flip to "Ran".
-        .{ .label = "Running", .outcome = null, .stored_action = "Ran" },
+        // prediction. The live row must keep "running", never flip to "ran".
+        .{ .label = "running", .outcome = null, .stored_action = "ran" },
         // Plain success: the historical happy path.
-        .{ .label = "Ran", .outcome = .completed, .stored_action = "Ran" },
+        .{ .label = "ran", .outcome = .completed, .stored_action = "ran" },
         // Nonzero exit: the tool completed but the settled label carries the
         // exit code the start-time prediction could not know.
-        .{ .label = "Exited 1", .outcome = .completed, .stored_action = "Ran" },
+        .{ .label = "Exited 1", .outcome = .completed, .stored_action = "ran" },
         // Failed tool outcome with a divergent settled label.
-        .{ .label = "Failed", .outcome = .failed, .stored_action = "Observed" },
+        .{ .label = "failed", .outcome = .failed, .stored_action = "observed" },
     };
 
     for (cases, 0..) |case, index| {
@@ -6325,15 +6331,15 @@ test "tool-heavy groups render every canonical action" {
         entry.* = .{ .raw_bytes = .{
             .id = entry_id,
             .bytes = if (is_failed_command)
-                @constCast("● Ran\x1b[0m \x1b[38;5;245mrg snapshot\x1b[0m\n")
+                @constCast("● ran\x1b[0m \x1b[38;5;245mrg snapshot\x1b[0m\n")
             else if (is_current_edit)
-                @constCast("● Editing\x1b[0m \x1b[38;5;245mruntime.zig\x1b[0m\n")
+                @constCast("● editing\x1b[0m \x1b[38;5;245mruntime.zig\x1b[0m\n")
             else if (is_command)
-                @constCast("● Ran\x1b[0m \x1b[38;5;245mzig build\x1b[0m\n")
+                @constCast("● ran\x1b[0m \x1b[38;5;245mzig build\x1b[0m\n")
             else if (is_edit)
-                @constCast("● Edited\x1b[0m \x1b[38;5;245mstore.zig\x1b[0m\n")
+                @constCast("● edited\x1b[0m \x1b[38;5;245mstore.zig\x1b[0m\n")
             else
-                @constCast("● Read\x1b[0m \x1b[38;5;245mfile.zig\x1b[0m\n"),
+                @constCast("● read\x1b[0m \x1b[38;5;245mfile.zig\x1b[0m\n"),
             .class = .tool_status,
         } };
         detail.* = .{
@@ -6354,30 +6360,30 @@ test "tool-heavy groups render every canonical action" {
 
     // The header names the main event, the edits, in the tense of the one
     // still running, and the last command's failure.
-    try std.testing.expect(std.mem.startsWith(u8, summary, "● Editing files, read files, ran commands ✗\n"));
-    try std.testing.expect(std.mem.find(u8, summary, "Ran \x1b[38;5;252mrg\x1b[39m snapshot") != null);
-    try std.testing.expect(std.mem.find(u8, summary, "Editing runtime.zig") != null);
+    try std.testing.expect(std.mem.startsWith(u8, summary, "● editing files, read files, ran commands ✗\n"));
+    try std.testing.expect(std.mem.find(u8, summary, "ran \x1b[38;5;252mrg\x1b[39m snapshot") != null);
+    try std.testing.expect(std.mem.find(u8, summary, "editing runtime.zig") != null);
     try std.testing.expectEqual(@as(usize, tool_count), std.mem.count(u8, summary, "\n"));
     var lines = std.mem.splitScalar(u8, summary, '\n');
     while (lines.next()) |line| {
         try std.testing.expect(display_width.visibleWidthIgnoringAnsi(line) <= 100);
     }
 
-    entries[19].raw_bytes.bytes = @constCast("● Edited\x1b[0m \x1b[38;5;245mruntime.zig\x1b[0m\n");
+    entries[19].raw_bytes.bytes = @constCast("● edited\x1b[0m \x1b[38;5;245mruntime.zig\x1b[0m\n");
     details[19].outcome = .completed;
     var completed_projection = try build(alloc, &entries, &details, 100);
     defer completed_projection.deinit(alloc);
     const completed_summary = completed_projection.entry_actions.items[0].override.bytes;
 
-    try std.testing.expect(std.mem.startsWith(u8, completed_summary, "● Edited files, read files, ran commands ✗\n"));
-    try std.testing.expect(std.mem.find(u8, completed_summary, "Edited runtime.zig") != null);
+    try std.testing.expect(std.mem.startsWith(u8, completed_summary, "● edited files, read files, ran commands ✗\n"));
+    try std.testing.expect(std.mem.find(u8, completed_summary, "edited runtime.zig") != null);
     try std.testing.expectEqual(@as(usize, tool_count), std.mem.count(u8, completed_summary, "\n"));
 }
 
 test "a cancelled call is its group's header above the cancellation block" {
     const alloc = std.testing.allocator;
     const entries = [_]TranscriptEntry{
-        .{ .raw_bytes = .{ .id = 1, .bytes = "▪ Cancelled sleep 30 · What can fx do differently?", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 1, .bytes = "▪ cancelled sleep 30 · what can fx do differently?", .class = .tool_status } },
     };
     const details = [_]ToolDetailRecord{
         .{ .entry_id = 1, .tool_name = @constCast("run_command"), .activity_kind = .command, .outcome = .cancelled },
@@ -6388,8 +6394,8 @@ test "a cancelled call is its group's header above the cancellation block" {
     try std.testing.expect(projection.entry_actions.items[0] == .override);
     // The row names the command; the notice under it doesn't.
     try std.testing.expectEqualStrings(
-        "● Cancelled \x1b[38;5;252msleep\x1b[39m 30\n\n" ++
-            "▪ Cancelled · What can fx do differently?",
+        "● cancelled \x1b[38;5;252msleep\x1b[39m 30\n\n" ++
+            "▪ cancelled · what can fx do differently?",
         projection.entry_actions.items[0].override.bytes,
     );
 
@@ -6582,9 +6588,9 @@ test "minimal hides command output separated from its tool status" {
 test "one presentation group keeps sibling tools in creation order across assistant prose" {
     const alloc = std.testing.allocator;
     var entries = [_]TranscriptEntry{
-        .{ .raw_bytes = .{ .id = 3, .bytes = "● Running second", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 3, .bytes = "● running second", .class = .tool_status } },
         .{ .assistant_turn = .{ .id = 2, .segments = .{} } },
-        .{ .raw_bytes = .{ .id = 1, .bytes = "● Running first", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 1, .bytes = "● running first", .class = .tool_status } },
     };
     try entries[1].assistant_turn.segments.text.appendSlice(alloc, "provider bridge");
     defer entries[1].assistant_turn.segments.deinit(alloc);
@@ -6609,9 +6615,9 @@ test "one presentation group keeps sibling tools in creation order across assist
     defer projection.deinit(alloc);
 
     try std.testing.expectEqualStrings(
-        "● Running commands\n" ++
-            "├ Running \x1b[38;5;252mfirst\x1b[39m\n" ++
-            "└ Running \x1b[38;5;252msecond\x1b[39m",
+        "● running commands\n" ++
+            "├ running \x1b[38;5;252mfirst\x1b[39m\n" ++
+            "└ running \x1b[38;5;252msecond\x1b[39m",
         projection.entry_actions.items[0].override.bytes,
     );
     try std.testing.expect(projection.entry_actions.items[1] == .keep);
@@ -6657,9 +6663,9 @@ test "different presentation groups remain separate within one turn" {
 test "legacy lifecycle records without group identity respect transcript boundaries" {
     const alloc = std.testing.allocator;
     var entries = [_]TranscriptEntry{
-        .{ .raw_bytes = .{ .id = 1, .bytes = "● Read first", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 1, .bytes = "● read first", .class = .tool_status } },
         .{ .assistant_turn = .{ .id = 2, .segments = .{} } },
-        .{ .raw_bytes = .{ .id = 3, .bytes = "● Running second", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 3, .bytes = "● running second", .class = .tool_status } },
     };
     try entries[1].assistant_turn.segments.text.appendSlice(alloc, "next model step");
     defer entries[1].assistant_turn.segments.deinit(alloc);
@@ -6682,21 +6688,21 @@ test "legacy lifecycle records without group identity respect transcript boundar
     defer projection.deinit(alloc);
 
     try std.testing.expectEqualStrings(
-        "● Read first",
+        "● read first",
         projection.entry_actions.items[0].override.bytes,
     );
     try std.testing.expect(projection.entry_actions.items[1] == .keep);
     try std.testing.expectEqualStrings(
-        "● Running \x1b[38;5;252msecond\x1b[39m",
+        "● running \x1b[38;5;252msecond\x1b[39m",
         projection.entry_actions.items[2].override.bytes,
     );
 }
 
 fn checkPresentationGroupingAllocationFailures(alloc: std.mem.Allocator) !void {
     var entries = [_]TranscriptEntry{
-        .{ .raw_bytes = .{ .id = 2, .bytes = "● Running second", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 2, .bytes = "● running second", .class = .tool_status } },
         .{ .assistant_turn = .{ .id = 3, .segments = .{} } },
-        .{ .raw_bytes = .{ .id = 1, .bytes = "● Running first", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 1, .bytes = "● running first", .class = .tool_status } },
     };
     try entries[1].assistant_turn.segments.text.appendSlice(alloc, "provider bridge");
     defer entries[1].assistant_turn.segments.deinit(alloc);
@@ -6723,9 +6729,9 @@ fn checkPresentationGroupingAllocationFailures(alloc: std.mem.Allocator) !void {
     };
     defer projection.deinit(alloc);
     try std.testing.expectEqualStrings(
-        "● Running commands\n" ++
-            "├ Running \x1b[38;5;252mfirst\x1b[39m\n" ++
-            "└ Running \x1b[38;5;252msecond\x1b[39m",
+        "● running commands\n" ++
+            "├ running \x1b[38;5;252mfirst\x1b[39m\n" ++
+            "└ running \x1b[38;5;252msecond\x1b[39m",
         projection.entry_actions.items[0].override.bytes,
     );
 }
@@ -6762,7 +6768,7 @@ test "entries hidden by compact presentation do not split tool groups" {
 
     try std.testing.expect(projection.entry_actions.items[0] == .override);
     try std.testing.expectEqualStrings(
-        "● Edited a file, read a file\n" ++
+        "● edited a file, read a file\n" ++
             "├ read_file\n" ++
             "└ edit_file",
         projection.entry_actions.items[0].override.bytes,
@@ -6851,7 +6857,7 @@ test "visible assistant messages split groups while silent entries do not" {
     defer projection.deinit(alloc);
 
     try std.testing.expectEqualStrings(
-        "● Read files, searched\n" ++
+        "● read files, searched\n" ++
             "├ read_file\n├ read_file\n├ read_file\n├ glob_files\n└ glob_files",
         projection.entry_actions.items[0].override.bytes,
     );
@@ -6862,7 +6868,7 @@ test "visible assistant messages split groups while silent entries do not" {
     try std.testing.expect(projection.entry_actions.items[6] == .override);
     try std.testing.expect(projection.entry_actions.items[7] == .keep);
     try std.testing.expectEqualStrings(
-        "● Read files, ran a command ✓\n" ++
+        "● read files, ran a command ✓\n" ++
             "├ read_file\n├ read_file\n├ read_file\n└ run_command",
         projection.entry_actions.items[8].override.bytes,
     );
@@ -6981,12 +6987,12 @@ test "narrow block clips every row without wrapping" {
 test "mixed group keeps its header before every action" {
     const alloc = std.testing.allocator;
     const entries = [_]TranscriptEntry{
-        .{ .raw_bytes = .{ .id = 1, .bytes = "● Read one.zig", .class = .tool_status } },
-        .{ .raw_bytes = .{ .id = 2, .bytes = "● Read two.zig", .class = .tool_status } },
-        .{ .raw_bytes = .{ .id = 3, .bytes = "● Read three.zig", .class = .tool_status } },
-        .{ .raw_bytes = .{ .id = 4, .bytes = "● Read four.zig", .class = .tool_status } },
-        .{ .raw_bytes = .{ .id = 5, .bytes = "● Read five.zig", .class = .tool_status } },
-        .{ .raw_bytes = .{ .id = 6, .bytes = "● Ran git -C /workspace status --short", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 1, .bytes = "● read one.zig", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 2, .bytes = "● read two.zig", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 3, .bytes = "● read three.zig", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 4, .bytes = "● read four.zig", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 5, .bytes = "● read five.zig", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 6, .bytes = "● ran git -C /workspace status --short", .class = .tool_status } },
     };
     const details = [_]ToolDetailRecord{
         .{ .entry_id = 1, .tool_name = @constCast("read_file"), .activity_kind = .read, .outcome = .completed },
@@ -7001,13 +7007,13 @@ test "mixed group keeps its header before every action" {
     defer projection.deinit(alloc);
 
     try std.testing.expectEqualStrings(
-        "● Read files, ran a command ✓\n" ++
-            "├ Read one.zig\n" ++
-            "├ Read two.zig\n" ++
-            "├ Read three.zig\n" ++
-            "├ Read four.zig\n" ++
-            "├ Read five.zig\n" ++
-            "└ Ran \x1b[38;5;252mgit\x1b[39m \x1b[38;5;250m-C\x1b[39m /workspace status \x1b[38;5;250m--short\x1b[39m",
+        "● read files, ran a command ✓\n" ++
+            "├ read one.zig\n" ++
+            "├ read two.zig\n" ++
+            "├ read three.zig\n" ++
+            "├ read four.zig\n" ++
+            "├ read five.zig\n" ++
+            "└ ran \x1b[38;5;252mgit\x1b[39m \x1b[38;5;250m-C\x1b[39m /workspace status \x1b[38;5;250m--short\x1b[39m",
         projection.entry_actions.items[0].override.bytes,
     );
 }
@@ -7219,7 +7225,7 @@ test "prose-prefixed command rows highlight only the trailing stored command" {
             .captured_command = true,
             .activity_kind = .command,
             .command_display = @constCast("echo ok"),
-            .command_action_label = @constCast("Ran"),
+            .command_action_label = @constCast("ran"),
             .outcome = .completed,
             .command_process_presentation = .{ .exit_code = 0 },
         },
@@ -7257,24 +7263,24 @@ test "subagent rows name the action and the subagent, not the message" {
     const message = "{\"action\":\"message\",\"agent\":\"pr-lister\",\"message\":\"List open PRs\"}";
     const cases = [_]Case{
         // Main's calls.
-        .{ .phrase = "sent to pr-lister · List open PRs", .args = message, .want = "Messaged pr-lister" },
+        .{ .phrase = "sent to pr-lister · List open PRs", .args = message, .want = "messaged pr-lister" },
         .{ .phrase = "pr-lister working · List open PRs", .args = message, .want = "pr-lister working" },
-        .{ .phrase = "pr-lister failed · List open PRs", .args = message, .want = "Couldn't message pr-lister" },
-        .{ .phrase = "pr-lister busy; message not sent · List open PRs", .args = message, .want = "Couldn't message pr-lister (busy)" },
-        .{ .phrase = "pr-lister interrupted · List open PRs", .args = message, .want = "Cancelled message to pr-lister" },
-        .{ .phrase = "pr-lister feedback queued · List open PRs", .args = message, .want = "Sent feedback to pr-lister" },
-        .{ .phrase = "pr-lister feedback not applied · List open PRs", .args = message, .want = "Feedback to pr-lister not applied" },
-        .{ .phrase = "waited for pr-lister, tester", .args = "{\"action\":\"wait\"}", .want = "Waited for pr-lister, tester" },
-        .{ .phrase = "checked pr-lister", .args = "{\"request\":{\"action\":\"status\",\"agent\":\"pr-lister\"}}", .want = "Checked pr-lister" },
-        .{ .phrase = "closed pr-lister", .args = "{\"action\":\"close\",\"agent\":\"pr-lister\"}", .want = "Closed pr-lister" },
-        .{ .phrase = "couldn't stop pr-lister", .args = "{\"action\":\"stop\",\"agent\":\"pr-lister\"}", .want = "Couldn't stop pr-lister" },
+        .{ .phrase = "pr-lister failed · List open PRs", .args = message, .want = "couldn't message pr-lister" },
+        .{ .phrase = "pr-lister busy; message not sent · List open PRs", .args = message, .want = "couldn't message pr-lister (busy)" },
+        .{ .phrase = "pr-lister interrupted · List open PRs", .args = message, .want = "cancelled message to pr-lister" },
+        .{ .phrase = "pr-lister feedback queued · List open PRs", .args = message, .want = "sent feedback to pr-lister" },
+        .{ .phrase = "pr-lister feedback not applied · List open PRs", .args = message, .want = "feedback to pr-lister not applied" },
+        .{ .phrase = "waited for pr-lister, tester", .args = "{\"action\":\"wait\"}", .want = "waited for pr-lister, tester" },
+        .{ .phrase = "checked pr-lister", .args = "{\"request\":{\"action\":\"status\",\"agent\":\"pr-lister\"}}", .want = "checked pr-lister" },
+        .{ .phrase = "closed pr-lister", .args = "{\"action\":\"close\",\"agent\":\"pr-lister\"}", .want = "closed pr-lister" },
+        .{ .phrase = "couldn't stop pr-lister", .args = "{\"action\":\"stop\",\"agent\":\"pr-lister\"}", .want = "couldn't stop pr-lister" },
         // Rows a subagent's report or message starts.
         .{ .phrase = "pr-lister completed · Open non-draft PRs in vercel-labs/fx", .args = "{}", .want = "pr-lister finished" },
         .{ .phrase = "pr-lister failed · the token expired", .args = "{}", .want = "pr-lister failed" },
         .{ .phrase = "pr-lister cancelled", .args = "{}", .want = "pr-lister was cancelled" },
         .{ .phrase = "pr-lister interrupted · stopped at step 3", .args = "{}", .want = "pr-lister was interrupted" },
-        .{ .phrase = "from pr-lister · need the repo name", .args = "{}", .want = "Message from pr-lister" },
-        .{ .phrase = "report from a subagent · done", .args = null, .want = "Report from a subagent" },
+        .{ .phrase = "from pr-lister · need the repo name", .args = "{}", .want = "message from pr-lister" },
+        .{ .phrase = "report from a subagent · done", .args = null, .want = "report from a subagent" },
     };
     for (cases) |case| {
         const record: ToolDetailRecord = .{
@@ -7399,9 +7405,9 @@ test "shell calls that never ran because their request was wrong read as the mod
     const refused = "{\"error\":{\"code\":\"invalid_shell_request\",\"executed\":false,\"problems\":[\"Choose either profile or shell.\"]}}";
     const refused_twice = "{\"error\":{\"code\":\"invalid_shell_request\",\"executed\":false,\"problems\":[\"Choose either profile or shell.\",\"Set tty with shell.\"]}}";
     const entries = [_]TranscriptEntry{
-        .{ .raw_bytes = .{ .id = 1, .bytes = "● Failed " ++ first ++ " · 2 invalid fields\n", .class = .tool_status } },
-        .{ .raw_bytes = .{ .id = 2, .bytes = "● Failed " ++ second ++ " · 1 invalid field\n", .class = .tool_status } },
-        .{ .raw_bytes = .{ .id = 3, .bytes = "● Ran " ++ second ++ "\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 1, .bytes = "● failed " ++ first ++ " · 2 invalid fields\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 2, .bytes = "● failed " ++ second ++ " · 1 invalid field\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 3, .bytes = "● ran " ++ second ++ "\n", .class = .tool_status } },
     };
     var details = [_]ToolDetailRecord{
         storyCommandDetail(1, "{\"command\":\"" ++ first ++ "\",\"profile\":\"clean\",\"tty\":true}", 0, refused_twice),
@@ -7421,8 +7427,8 @@ test "shell calls that never ran because their request was wrong read as the mod
     const fixed = try groupTextForTest(alloc, &entries, &details);
     defer alloc.free(fixed);
     errdefer std.debug.print("fixed group:\n{s}\n", .{fixed});
-    try std.testing.expect(std.mem.find(u8, fixed, "Ran ls, fx help · 3rd try") != null);
-    try std.testing.expect(std.mem.find(u8, fixed, "Failed") == null);
+    try std.testing.expect(std.mem.find(u8, fixed, "ran ls, fx help · 3rd try") != null);
+    try std.testing.expect(std.mem.find(u8, fixed, "failed") == null);
     try std.testing.expect(std.mem.find(u8, fixed, "invalid") == null);
     try std.testing.expect(std.mem.find(u8, fixed, "failed") == null);
     try std.testing.expect(std.mem.find(u8, fixed, "passed on") == null);
@@ -7432,13 +7438,13 @@ test "shell calls that never ran because their request was wrong read as the mod
     const alone = try groupTextForTest(alloc, entries[0..1], details[0..1]);
     defer alloc.free(alone);
     errdefer std.debug.print("alone group:\n{s}\n", .{alone});
-    try std.testing.expectEqualStrings("● Couldn't run ls, fx help", std.mem.trim(u8, alone, "\n"));
+    try std.testing.expectEqualStrings("● couldn't run ls, fx help", std.mem.trim(u8, alone, "\n"));
 
     // Before another command, the header counts neither a command nor a
     // failure for it, as for any call the model got wrong.
     const other = [_]TranscriptEntry{
         entries[0],
-        .{ .raw_bytes = .{ .id = 4, .bytes = "● Ran printf done\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 4, .bytes = "● ran printf done\n", .class = .tool_status } },
         .{ .raw_bytes = .{ .id = 5, .bytes = "  2s", .class = .turn_summary } },
     };
     var other_details = [_]ToolDetailRecord{ details[0], storyCommandDetail(4, "{\"action\":\"run\",\"command\":\"printf done\"}", 0, null) };
@@ -7446,8 +7452,8 @@ test "shell calls that never ran because their request was wrong read as the mod
     const before_other = try groupTextForTest(alloc, &other, &other_details);
     defer alloc.free(before_other);
     errdefer std.debug.print("before another command:\n{s}\n", .{before_other});
-    try std.testing.expectEqualStrings("● Ran a command ✓", firstLineForTest(before_other));
-    try std.testing.expect(std.mem.find(u8, before_other, "├ Couldn't run ls, fx help") != null);
+    try std.testing.expectEqualStrings("● ran a command ✓", firstLineForTest(before_other));
+    try std.testing.expect(std.mem.find(u8, before_other, "├ couldn't run ls, fx help") != null);
     try std.testing.expect(std.mem.find(u8, before_other, "failed") == null);
 
     // A refused request the turn ended on still shows under collapse, like
@@ -7466,7 +7472,7 @@ test "shell calls that never ran because their request was wrong read as the mod
     errdefer std.debug.print("expanded:\n{s}\n", .{expanded});
     try std.testing.expect(std.mem.find(u8, firstLineForTest(expanded), "failed") == null);
     // The row the turn ended on says why, as core counted it.
-    try std.testing.expect(std.mem.find(u8, expanded, "└ Couldn't run ls, fx help · 2 invalid fields") != null);
+    try std.testing.expect(std.mem.find(u8, expanded, "└ couldn't run ls, fx help · 2 invalid fields") != null);
     try std.testing.expect(std.mem.find(u8, expanded, "Choose either") == null);
 
     // A refused request the turn ended on, alone, says why on its one row.
@@ -7474,7 +7480,7 @@ test "shell calls that never ran because their request was wrong read as the mod
     const alone_last_text = try groupTextForTest(alloc, &alone_last, details[1..2]);
     defer alloc.free(alone_last_text);
     errdefer std.debug.print("alone, last:\n{s}\n", .{alone_last_text});
-    try std.testing.expectEqualStrings("● Couldn't run ls, fx help · 1 invalid field", firstLineForTest(alone_last_text));
+    try std.testing.expectEqualStrings("● couldn't run ls, fx help · 1 invalid field", firstLineForTest(alone_last_text));
 }
 
 test "repeated runs of one command share a row that keeps the earlier failures" {
@@ -7545,9 +7551,9 @@ test "a command that starts with a comment line shows the steps after it" {
 test "searches for one pattern share a row that names their folders" {
     const alloc = std.testing.allocator;
     const entries = [_]TranscriptEntry{
-        .{ .raw_bytes = .{ .id = 1, .bytes = "● Searched P0\n", .class = .tool_status } },
-        .{ .raw_bytes = .{ .id = 2, .bytes = "● Searched P0\n", .class = .tool_status } },
-        .{ .raw_bytes = .{ .id = 3, .bytes = "● Matched *triage*\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 1, .bytes = "● searched P0\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 2, .bytes = "● searched P0\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 3, .bytes = "● matched *triage*\n", .class = .tool_status } },
     };
     const details = [_]ToolDetailRecord{
         storySearchDetail(1, "grep_files", .read, "{\"pattern\":\"P0\",\"path\":\"/Users/example/fx/reviews\"}"),
@@ -7558,21 +7564,21 @@ test "searches for one pattern share a row that names their folders" {
     defer projection.deinit(alloc);
     // The header counts patterns, not calls.
     try std.testing.expectEqualStrings(
-        "● Searched\n├ Searched P0 in reviews, docs\n└ Matched *triage*",
+        "● searched\n├ searched P0 in reviews, docs\n└ matched *triage*",
         std.mem.trimEnd(u8, projection.entry_actions.items[0].override.bytes, "\n"),
     );
 
     // The same pattern in the same folder twice is one search made twice.
     var again = try build(alloc, entries[0..2], &.{ details[0], storySearchDetail(2, "grep_files", .read, details[0].arguments_json.?) }, 120);
     defer again.deinit(alloc);
-    try std.testing.expectEqualStrings("● Searched P0 ×2", std.mem.trimEnd(u8, again.entry_actions.items[0].override.bytes, "\n"));
+    try std.testing.expectEqualStrings("● searched P0 ×2", std.mem.trimEnd(u8, again.entry_actions.items[0].override.bytes, "\n"));
 
     // A grep and a glob for the same text do different things, so they keep
     // their own rows.
     const mixed = [_]ToolDetailRecord{ details[0], storySearchDetail(2, "glob_files", .list, "{\"pattern\":\"P0\"}") };
     var apart = try build(alloc, entries[0..2], &mixed, 120);
     defer apart.deinit(alloc);
-    try std.testing.expect(std.mem.startsWith(u8, apart.entry_actions.items[0].override.bytes, "● Searched\n├ Searched P0\n└ Searched P0"));
+    try std.testing.expect(std.mem.startsWith(u8, apart.entry_actions.items[0].override.bytes, "● searched\n├ searched P0\n└ searched P0"));
 }
 
 test "search folder names stay terminal-safe and short" {
@@ -7597,9 +7603,9 @@ test "input to a running session and its stop are not new commands" {
     const interact = "{\"action\":\"interact\",\"session_id\":\"shell-7\",\"chars\":\"q\"}";
     const stop = "{\"action\":\"stop\",\"session_id\":\"shell-7\"}";
     const entries = [_]TranscriptEntry{
-        .{ .raw_bytes = .{ .id = 1, .bytes = "● Ran npm run dev\n", .class = .tool_status } },
-        .{ .raw_bytes = .{ .id = 2, .bytes = "● Observed npm run dev\n", .class = .tool_status } },
-        .{ .raw_bytes = .{ .id = 3, .bytes = "● Stopped npm run dev\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 1, .bytes = "● ran npm run dev\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 2, .bytes = "● observed npm run dev\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 3, .bytes = "● stopped npm run dev\n", .class = .tool_status } },
         .{ .raw_bytes = .{ .id = 4, .bytes = "  2s", .class = .turn_summary } },
     };
     const details = [_]ToolDetailRecord{
@@ -7610,15 +7616,15 @@ test "input to a running session and its stop are not new commands" {
     var projection = try build(alloc, &entries, &details, 120);
     defer projection.deinit(alloc);
     const bytes = projection.entry_actions.items[0].override.bytes;
-    try std.testing.expect(std.mem.startsWith(u8, bytes, "● Ran a command ✓\n"));
+    try std.testing.expect(std.mem.startsWith(u8, bytes, "● ran a command ✓\n"));
     try std.testing.expect(std.mem.find(u8, bytes, " · 2 calls") != null);
-    try std.testing.expectEqualStrings("  Ran 1 command · 2s", projection.entry_actions.items[3].override.bytes);
+    try std.testing.expectEqualStrings("  ran 1 command · 2s", projection.entry_actions.items[3].override.bytes);
 
     // A group that only checks on the session names the session.
     var follow_ups = try build(alloc, entries[1..3], details[1..3], 120);
     defer follow_ups.deinit(alloc);
     const follow_bytes = follow_ups.entry_actions.items[0].override.bytes;
-    try std.testing.expect(std.mem.startsWith(u8, follow_bytes, "● Stopped "));
+    try std.testing.expect(std.mem.startsWith(u8, follow_bytes, "● stopped "));
     try std.testing.expect(std.mem.endsWith(u8, follow_bytes, " · 2 calls ✓") or std.mem.endsWith(u8, follow_bytes, " · 2 calls"));
 }
 
@@ -7628,9 +7634,9 @@ test "a running toolbox run of an MCP tool joins that tool's row before its argu
     const alloc = std.testing.allocator;
     const run_args = "{\"run\":\"mcp_fixture_echo\",\"arguments\":{}}";
     const entries = [_]TranscriptEntry{
-        .{ .raw_bytes = .{ .id = 1, .bytes = "● Ran MCP mcp_fixture_echo\n", .class = .tool_status } },
-        .{ .raw_bytes = .{ .id = 2, .bytes = "● Ran MCP mcp_fixture_echo\n", .class = .tool_status } },
-        .{ .raw_bytes = .{ .id = 3, .bytes = "● Running MCP mcp_fixture_echo\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 1, .bytes = "● ran MCP mcp_fixture_echo\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 2, .bytes = "● ran MCP mcp_fixture_echo\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 3, .bytes = "● running MCP mcp_fixture_echo\n", .class = .tool_status } },
     };
     const details = [_]ToolDetailRecord{
         .{ .entry_id = 1, .tool_name = @constCast("toolbox"), .activity_kind = .mcp, .outcome = .completed, .arguments_json = @constCast(run_args) },
@@ -7639,15 +7645,15 @@ test "a running toolbox run of an MCP tool joins that tool's row before its argu
     };
     const text = try groupTextForTest(alloc, &entries, &details);
     defer alloc.free(text);
-    try std.testing.expectEqualStrings("● Running MCP mcp_fixture_echo ×3", std.mem.trim(u8, text, "\n"));
+    try std.testing.expectEqualStrings("● running MCP mcp_fixture_echo ×3", std.mem.trim(u8, text, "\n"));
 }
 
 test "toolbox lookups and wrapped arguments name what the group did" {
     const alloc = std.testing.allocator;
     // A toolbox open reads no file, so it is not a search or a read.
     const opened = [_]TranscriptEntry{
-        .{ .raw_bytes = .{ .id = 1, .bytes = "● Opened mcp_fixture_echo\n", .class = .tool_status } },
-        .{ .raw_bytes = .{ .id = 2, .bytes = "● Failed mcp_fixture_echo: Invalid input\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 1, .bytes = "● opened mcp_fixture_echo\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 2, .bytes = "● failed mcp_fixture_echo: Invalid input\n", .class = .tool_status } },
     };
     const opened_details = [_]ToolDetailRecord{
         .{ .entry_id = 1, .tool_name = @constCast("toolbox"), .activity_kind = .read, .outcome = .completed, .arguments_json = @constCast("{\"open\":\"mcp_fixture_echo\"}") },
@@ -7655,14 +7661,14 @@ test "toolbox lookups and wrapped arguments name what the group did" {
     };
     var opened_projection = try build(alloc, &opened, &opened_details, 100);
     defer opened_projection.deinit(alloc);
-    try std.testing.expect(std.mem.startsWith(u8, opened_projection.entry_actions.items[0].override.bytes, "● Opened a tool\n"));
+    try std.testing.expect(std.mem.startsWith(u8, opened_projection.entry_actions.items[0].override.bytes, "● opened a tool\n"));
 
     // Fields inside {"request": {...}} count like top-level ones.
     const run = "{\"request\":{\"action\":\"run\",\"command\":\"npm run dev\",\"tty\":true}}";
     const stop = "{\"request\":{\"action\":\"stop\",\"session_id\":\"shell-7\"}}";
     const session = [_]TranscriptEntry{
-        .{ .raw_bytes = .{ .id = 1, .bytes = "● Ran npm run dev\n", .class = .tool_status } },
-        .{ .raw_bytes = .{ .id = 2, .bytes = "● Stopped npm run dev\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 1, .bytes = "● ran npm run dev\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 2, .bytes = "● stopped npm run dev\n", .class = .tool_status } },
     };
     const session_details = [_]ToolDetailRecord{
         storyCommandDetail(1, run, 0, null),
@@ -7670,15 +7676,15 @@ test "toolbox lookups and wrapped arguments name what the group did" {
     };
     var session_projection = try build(alloc, &session, &session_details, 100);
     defer session_projection.deinit(alloc);
-    try std.testing.expect(std.mem.startsWith(u8, session_projection.entry_actions.items[0].override.bytes, "● Ran a command ✓\n"));
+    try std.testing.expect(std.mem.startsWith(u8, session_projection.entry_actions.items[0].override.bytes, "● ran a command ✓\n"));
 }
 
 test "a command that failed before the last one still counts in the header" {
     const alloc = std.testing.allocator;
     const entries = [_]TranscriptEntry{
-        .{ .raw_bytes = .{ .id = 1, .bytes = "● Ran sh fast.sh\n", .class = .tool_status } },
-        .{ .raw_bytes = .{ .id = 2, .bytes = "● Exited 1 sh failed.sh\n", .class = .tool_status } },
-        .{ .raw_bytes = .{ .id = 3, .bytes = "● Ran sh last.sh\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 1, .bytes = "● ran sh fast.sh\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 2, .bytes = "● exited 1 sh failed.sh\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 3, .bytes = "● ran sh last.sh\n", .class = .tool_status } },
     };
     const details = [_]ToolDetailRecord{
         storyCommandDetail(1, "{\"command\":\"sh fast.sh\"}", 0, null),
@@ -7688,7 +7694,7 @@ test "a command that failed before the last one still counts in the header" {
     var projection = try build(alloc, &entries, &details, 120);
     defer projection.deinit(alloc);
     const bytes = projection.entry_actions.items[0].override.bytes;
-    try std.testing.expect(std.mem.startsWith(u8, bytes, "● Ran commands ✓ · 1 failed\n"));
+    try std.testing.expect(std.mem.startsWith(u8, bytes, "● ran commands ✓ · 1 failed\n"));
 
     // When the last command is the one that failed, the mark says so alone.
     const last_failed = [_]ToolDetailRecord{
@@ -7698,7 +7704,7 @@ test "a command that failed before the last one still counts in the header" {
     };
     var last = try build(alloc, &entries, &last_failed, 120);
     defer last.deinit(alloc);
-    try std.testing.expect(std.mem.startsWith(u8, last.entry_actions.items[0].override.bytes, "● Ran commands ✗\n"));
+    try std.testing.expect(std.mem.startsWith(u8, last.entry_actions.items[0].override.bytes, "● ran commands ✗\n"));
 
     // When an earlier command failed too, the count takes in the last one,
     // so it matches the rows that failed.
@@ -7710,7 +7716,7 @@ test "a command that failed before the last one still counts in the header" {
     var both = try build(alloc, &entries, &both_failed, 120);
     defer both.deinit(alloc);
     errdefer std.debug.print("both failed:\n{s}\n", .{both.entry_actions.items[0].override.bytes});
-    try std.testing.expect(std.mem.startsWith(u8, both.entry_actions.items[0].override.bytes, "● Ran commands ✗ · 2 failed\n"));
+    try std.testing.expect(std.mem.startsWith(u8, both.entry_actions.items[0].override.bytes, "● ran commands ✗ · 2 failed\n"));
 }
 
 test "a header counts each failed command once while a later command runs or was refused" {
@@ -7724,8 +7730,8 @@ test "a header counts each failed command once while a later command runs or was
     // A command failed and the next one still runs: one failure.
     {
         const entries = [_]TranscriptEntry{
-            .{ .raw_bytes = .{ .id = 1, .bytes = "● Exited 1 sh a.sh\n", .class = .tool_status } },
-            .{ .raw_bytes = .{ .id = 2, .bytes = "● Running sh b.sh\n", .class = .tool_status } },
+            .{ .raw_bytes = .{ .id = 1, .bytes = "● exited 1 sh a.sh\n", .class = .tool_status } },
+            .{ .raw_bytes = .{ .id = 2, .bytes = "● running sh b.sh\n", .class = .tool_status } },
         };
         var details = [_]ToolDetailRecord{
             storyCommandDetail(1, "{\"command\":\"sh a.sh\"}", 1, null),
@@ -7745,9 +7751,9 @@ test "a header counts each failed command once while a later command runs or was
     {
         const refused = "{\"error\":{\"code\":\"invalid_shell_request\",\"executed\":false,\"problems\":[\"Choose either profile or shell.\"]}}";
         const entries = [_]TranscriptEntry{
-            .{ .raw_bytes = .{ .id = 1, .bytes = "● Exited 1 sh a.sh\n", .class = .tool_status } },
-            .{ .raw_bytes = .{ .id = 2, .bytes = "● Failed sh b.sh · 1 invalid field\n", .class = .tool_status } },
-            .{ .raw_bytes = .{ .id = 3, .bytes = "Worked for 2s\n", .class = .turn_summary } },
+            .{ .raw_bytes = .{ .id = 1, .bytes = "● exited 1 sh a.sh\n", .class = .tool_status } },
+            .{ .raw_bytes = .{ .id = 2, .bytes = "● failed sh b.sh · 1 invalid field\n", .class = .tool_status } },
+            .{ .raw_bytes = .{ .id = 3, .bytes = "worked for 2s\n", .class = .turn_summary } },
         };
         var details = [_]ToolDetailRecord{
             storyCommandDetail(1, "{\"command\":\"sh a.sh\"}", 1, null),
@@ -7834,7 +7840,7 @@ test "a command row shows the short form and keeps its label" {
         .{ .entry_id = 2, .tool_name = @constCast("read_file"), .activity_kind = .read, .outcome = .completed, .arguments_json = @constCast("{\"path\":\"src/main.ts\"}") },
     };
     details[0].command_display = @constCast(command);
-    details[0].command_action_label = @constCast("Ran");
+    details[0].command_action_label = @constCast("ran");
     var projection = try build(alloc, &entries, &details, 120);
     defer projection.deinit(alloc);
     const bytes = projection.entry_actions.items[0].override.bytes;
@@ -7877,9 +7883,9 @@ test "a long command keeps its merge note when its row is clipped" {
 test "a command between two runs of another keeps all three rows" {
     const alloc = std.testing.allocator;
     const entries = [_]TranscriptEntry{
-        .{ .raw_bytes = .{ .id = 1, .bytes = "● Ran sh build.sh\n", .class = .tool_status } },
-        .{ .raw_bytes = .{ .id = 2, .bytes = "● Ran sh lint.sh\n", .class = .tool_status } },
-        .{ .raw_bytes = .{ .id = 3, .bytes = "● Ran sh build.sh\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 1, .bytes = "● ran sh build.sh\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 2, .bytes = "● ran sh lint.sh\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 3, .bytes = "● ran sh build.sh\n", .class = .tool_status } },
     };
     const details = [_]ToolDetailRecord{
         storyCommandDetail(1, "{\"command\":\"sh build.sh\"}", 0, null),
@@ -7889,10 +7895,10 @@ test "a command between two runs of another keeps all three rows" {
     var projection = try build(alloc, &entries, &details, 120);
     defer projection.deinit(alloc);
     try std.testing.expectEqualStrings(
-        "● Ran commands ✓\n" ++
-            "├ Ran \x1b[38;5;252msh\x1b[39m build.sh\n" ++
-            "├ Ran \x1b[38;5;252msh\x1b[39m lint.sh\n" ++
-            "└ Ran \x1b[38;5;252msh\x1b[39m build.sh",
+        "● ran commands ✓\n" ++
+            "├ ran \x1b[38;5;252msh\x1b[39m build.sh\n" ++
+            "├ ran \x1b[38;5;252msh\x1b[39m lint.sh\n" ++
+            "└ ran \x1b[38;5;252msh\x1b[39m build.sh",
         projection.entry_actions.items[0].override.bytes,
     );
 }
@@ -7900,9 +7906,9 @@ test "a command between two runs of another keeps all three rows" {
 test "one file read in parts shares a row" {
     const alloc = std.testing.allocator;
     const entries = [_]TranscriptEntry{
-        .{ .raw_bytes = .{ .id = 1, .bytes = "● Read src/main.zig\n", .class = .tool_status } },
-        .{ .raw_bytes = .{ .id = 2, .bytes = "● Read src/main.zig\n", .class = .tool_status } },
-        .{ .raw_bytes = .{ .id = 3, .bytes = "● Read src/main.zig\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 1, .bytes = "● read src/main.zig\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 2, .bytes = "● read src/main.zig\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 3, .bytes = "● read src/main.zig\n", .class = .tool_status } },
     };
     var details: [3]ToolDetailRecord = undefined;
     const args = [_][]const u8{
@@ -7919,7 +7925,7 @@ test "one file read in parts shares a row" {
     };
     var projection = try build(alloc, &entries, &details, 120);
     defer projection.deinit(alloc);
-    try std.testing.expectEqualStrings("● Read main.zig · 3 parts", projection.entry_actions.items[0].override.bytes);
+    try std.testing.expectEqualStrings("● read main.zig · 3 parts", projection.entry_actions.items[0].override.bytes);
 }
 
 fn storyReadDetailForTest(entry_id: u32, comptime path: []const u8) ToolDetailRecord {
@@ -7961,10 +7967,10 @@ test "a resumed subagent report keeps its own line after main's calls" {
     const alloc = std.testing.allocator;
     const entries = [_]TranscriptEntry{
         .{ .raw_bytes = .{ .id = 1, .bytes = "● sent to reviewer · review the change\n", .class = .tool_status } },
-        .{ .raw_bytes = .{ .id = 2, .bytes = "● Read desktop/src/main.ts\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 2, .bytes = "● read desktop/src/main.ts\n", .class = .tool_status } },
         .{ .raw_bytes = .{ .id = 3, .bytes = "● reviewer completed · Reviewed.\n", .class = .tool_status } },
         .{ .raw_bytes = .{ .id = 4, .bytes = "● tester completed · 24 tests passed.\n", .class = .tool_status } },
-        .{ .raw_bytes = .{ .id = 5, .bytes = "● Read desktop/src/window.ts\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 5, .bytes = "● read desktop/src/window.ts\n", .class = .tool_status } },
     };
     const report: ToolDetailRecord = .{
         .entry_id = 3,
@@ -7991,13 +7997,13 @@ test "a resumed subagent report keeps its own line after main's calls" {
     const text = try groupTextForTest(alloc, &entries, &details);
     defer alloc.free(text);
     try std.testing.expectEqualStrings(
-        "● Started a subagent, read a file\n" ++
-            "├ Messaged reviewer\n" ++
-            "└ Read main.ts\n" ++
-            "● Got subagent updates\n" ++
+        "● started a subagent, read a file\n" ++
+            "├ messaged reviewer\n" ++
+            "└ read main.ts\n" ++
+            "● got subagent updates\n" ++
             "├ reviewer finished\n" ++
             "└ tester finished\n" ++
-            "● Read window.ts",
+            "● read window.ts",
         std.mem.trim(u8, text, "\n"),
     );
 }
@@ -8008,9 +8014,9 @@ test "a resumed subagent call main sent with empty arguments stays in its group"
     // reads, as it does live.
     const alloc = std.testing.allocator;
     const entries = [_]TranscriptEntry{
-        .{ .raw_bytes = .{ .id = 1, .bytes = "● Read desktop/src/a.ts\n", .class = .tool_status } },
-        .{ .raw_bytes = .{ .id = 2, .bytes = "● Failed subagent\n", .class = .tool_status } },
-        .{ .raw_bytes = .{ .id = 3, .bytes = "● Read desktop/src/b.ts\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 1, .bytes = "● read desktop/src/a.ts\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 2, .bytes = "● failed subagent\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 3, .bytes = "● read desktop/src/b.ts\n", .class = .tool_status } },
     };
     const details = [_]ToolDetailRecord{
         storyReadDetailForTest(1, "desktop/src/a.ts"),
@@ -8032,9 +8038,9 @@ test "a resumed subagent call main sent with empty arguments stays in its group"
     const text = try groupTextForTest(alloc, &entries, &details);
     defer alloc.free(text);
     try std.testing.expectEqualStrings(
-        "● Read files\n" ++
-            "├ Read a.ts, b.ts\n" ++
-            "└ Failed subagent · action is required",
+        "● read files\n" ++
+            "├ read a.ts, b.ts\n" ++
+            "└ failed subagent · action is required",
         std.mem.trim(u8, text, "\n"),
     );
 }
@@ -8042,15 +8048,15 @@ test "a resumed subagent call main sent with empty arguments stays in its group"
 test "every read in a group shares one row, and so does each search tool" {
     const alloc = std.testing.allocator;
     const entries = [_]TranscriptEntry{
-        .{ .raw_bytes = .{ .id = 1, .bytes = "● Read src/a.zig\n", .class = .tool_status } },
-        .{ .raw_bytes = .{ .id = 2, .bytes = "● Searched retry\n", .class = .tool_status } },
-        .{ .raw_bytes = .{ .id = 3, .bytes = "● Read src/b.zig\n", .class = .tool_status } },
-        .{ .raw_bytes = .{ .id = 4, .bytes = "● Read src/a.zig\n", .class = .tool_status } },
-        .{ .raw_bytes = .{ .id = 5, .bytes = "● Matched *.zig\n", .class = .tool_status } },
-        .{ .raw_bytes = .{ .id = 6, .bytes = "● Searched backoff\n", .class = .tool_status } },
-        .{ .raw_bytes = .{ .id = 7, .bytes = "● Read src/c.zig\n", .class = .tool_status } },
-        .{ .raw_bytes = .{ .id = 8, .bytes = "● Read src/gone.zig\n", .class = .tool_status } },
-        .{ .raw_bytes = .{ .id = 9, .bytes = "● Ran git status\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 1, .bytes = "● read src/a.zig\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 2, .bytes = "● searched retry\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 3, .bytes = "● read src/b.zig\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 4, .bytes = "● read src/a.zig\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 5, .bytes = "● matched *.zig\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 6, .bytes = "● searched backoff\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 7, .bytes = "● read src/c.zig\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 8, .bytes = "● read src/gone.zig\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 9, .bytes = "● ran git status\n", .class = .tool_status } },
     };
     var details = [_]ToolDetailRecord{
         storyReadDetailForTest(1, "src/a.zig"),
@@ -8070,18 +8076,18 @@ test "every read in a group shares one row, and so does each search tool" {
     defer projection.deinit(alloc);
     var rows = std.mem.splitScalar(u8, projection.entry_actions.items[0].override.bytes, '\n');
     // The header says what the group did, with no counts.
-    try std.testing.expectEqualStrings("● Read files, searched, ran a command ✓", rows.next().?);
+    try std.testing.expectEqualStrings("● read files, searched, ran a command ✓", rows.next().?);
     // Each file shows once, though the model read a.zig twice with other
     // calls between, and each search tool keeps one row of its patterns.
     // a.zig was read again after b.zig, so it comes after it.
-    try std.testing.expectEqualStrings("├ Read b.zig, a.zig, c.zig", rows.next().?);
-    try std.testing.expectEqualStrings("├ Searched retry, backoff", rows.next().?);
-    try std.testing.expectEqualStrings("├ Matched *.zig", rows.next().?);
+    try std.testing.expectEqualStrings("├ read b.zig, a.zig, c.zig", rows.next().?);
+    try std.testing.expectEqualStrings("├ searched retry, backoff", rows.next().?);
+    try std.testing.expectEqualStrings("├ matched *.zig", rows.next().?);
     // A failed read keeps its own row.
-    try std.testing.expect(std.mem.startsWith(u8, rows.next().?, "├ Read gone.zig"));
+    try std.testing.expect(std.mem.startsWith(u8, rows.next().?, "├ read gone.zig"));
     var last = rows.next().?;
     if (std.mem.startsWith(u8, last, "│ ")) last = rows.next().?;
-    try std.testing.expect(std.mem.startsWith(u8, last, "└ Ran "));
+    try std.testing.expect(std.mem.startsWith(u8, last, "└ ran "));
     try std.testing.expect(rows.next() == null);
 
     // A narrow row shows the names that fit, then how many more.
@@ -8090,21 +8096,21 @@ test "every read in a group shares one row, and so does each search tool" {
     var narrow_rows = std.mem.splitScalar(u8, narrow.entry_actions.items[0].override.bytes, '\n');
     _ = narrow_rows.next();
     // A narrow row keeps the newest name and counts the older ones first.
-    try std.testing.expectEqualStrings("├ Read +2, c.zig", narrow_rows.next().?);
+    try std.testing.expectEqualStrings("├ read +2, c.zig", narrow_rows.next().?);
 
     // A narrow header drops its last parts first and keeps the failure; the
     // mark goes with the commands it is for.
     var short = try build(alloc, &entries, &details, 28);
     defer short.deinit(alloc);
     const short_bytes = short.entry_actions.items[0].override.bytes;
-    try std.testing.expectEqualStrings("● Read files, searched …", short_bytes[0..std.mem.findScalar(u8, short_bytes, '\n').?]);
+    try std.testing.expectEqualStrings("● read files, searched …", short_bytes[0..std.mem.findScalar(u8, short_bytes, '\n').?]);
 }
 
 test "a list row links each file it names" {
     const alloc = std.testing.allocator;
     const entries = [_]TranscriptEntry{
-        .{ .raw_bytes = .{ .id = 1, .bytes = "● Read /Users/example/a.zig\n", .class = .tool_status } },
-        .{ .raw_bytes = .{ .id = 2, .bytes = "● Read /Users/example/b.zig\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 1, .bytes = "● read /Users/example/a.zig\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 2, .bytes = "● read /Users/example/b.zig\n", .class = .tool_status } },
     };
     const details = [_]ToolDetailRecord{
         storyReadDetailForTest(1, "/Users/example/a.zig"),
@@ -8113,7 +8119,7 @@ test "a list row links each file it names" {
     var projection = try build(alloc, &entries, &details, 120);
     defer projection.deinit(alloc);
     try std.testing.expectEqualStrings(
-        "● Read \x1b]8;;file:///Users/example/a.zig\x1b\\a.zig" ++ link_close ++ ", \x1b]8;;file:///Users/example/b.zig\x1b\\b.zig" ++ link_close,
+        "● read \x1b]8;;file:///Users/example/a.zig\x1b\\a.zig" ++ link_close ++ ", \x1b]8;;file:///Users/example/b.zig\x1b\\b.zig" ++ link_close,
         projection.entry_actions.items[0].override.bytes,
     );
 }
@@ -8124,7 +8130,7 @@ test "a call that names no shell command does not count as one" {
     // session used, as a command.
     const entries = [_]TranscriptEntry{
         .{ .raw_bytes = .{ .id = 1, .bytes = "● Completed skill\n", .class = .tool_status } },
-        .{ .raw_bytes = .{ .id = 2, .bytes = "● Ran git status\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 2, .bytes = "● ran git status\n", .class = .tool_status } },
     };
     var details = [_]ToolDetailRecord{
         .{ .entry_id = 1, .tool_name = @constCast("skill"), .activity_kind = .command, .arguments_json = @constCast("{\"location\":\"skill:fx-conventions\"}"), .outcome = .completed },
@@ -8134,20 +8140,20 @@ test "a call that names no shell command does not count as one" {
     var projection = try build(alloc, &entries, &details, 120);
     defer projection.deinit(alloc);
     const bytes = projection.entry_actions.items[0].override.bytes;
-    try std.testing.expectEqualStrings("● Ran a command, used a tool ✓", bytes[0..std.mem.findScalar(u8, bytes, '\n').?]);
+    try std.testing.expectEqualStrings("● ran a command, used a tool ✓", bytes[0..std.mem.findScalar(u8, bytes, '\n').?]);
 }
 
 test "a header puts edits first, then the most work, and names three kinds" {
     const alloc = std.testing.allocator;
     const entries = [_]TranscriptEntry{
-        .{ .raw_bytes = .{ .id = 1, .bytes = "● Edited src/main.zig +1 / -1\n", .class = .tool_status } },
-        .{ .raw_bytes = .{ .id = 2, .bytes = "● Searched alpha\n", .class = .tool_status } },
-        .{ .raw_bytes = .{ .id = 3, .bytes = "● Searched beta\n", .class = .tool_status } },
-        .{ .raw_bytes = .{ .id = 4, .bytes = "● Searched gamma\n", .class = .tool_status } },
-        .{ .raw_bytes = .{ .id = 5, .bytes = "● Read src/x.zig\n", .class = .tool_status } },
-        .{ .raw_bytes = .{ .id = 6, .bytes = "● Read src/y.zig\n", .class = .tool_status } },
-        .{ .raw_bytes = .{ .id = 7, .bytes = "● Ran zig build\n", .class = .tool_status } },
-        .{ .raw_bytes = .{ .id = 8, .bytes = "● Fetched https://example.com\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 1, .bytes = "● edited src/main.zig +1 / -1\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 2, .bytes = "● searched alpha\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 3, .bytes = "● searched beta\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 4, .bytes = "● searched gamma\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 5, .bytes = "● read src/x.zig\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 6, .bytes = "● read src/y.zig\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 7, .bytes = "● ran zig build\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 8, .bytes = "● fetched https://example.com\n", .class = .tool_status } },
     };
     var details = [_]ToolDetailRecord{
         .{ .entry_id = 1, .tool_name = @constCast("edit_file"), .activity_kind = .edit, .arguments_json = @constCast("{\"path\":\"src/main.zig\"}"), .outcome = .completed },
@@ -8165,7 +8171,7 @@ test "a header puts edits first, then the most work, and names three kinds" {
     const bytes = projection.entry_actions.items[0].override.bytes;
     // One edit comes first; three searches did more than two reads; the
     // command and the web page are the "more", so the mark goes with them.
-    try std.testing.expectEqualStrings("● Edited a file, searched, read files, and more", bytes[0..std.mem.findScalar(u8, bytes, '\n').?]);
+    try std.testing.expectEqualStrings("● edited a file, searched, read files, and more", bytes[0..std.mem.findScalar(u8, bytes, '\n').?]);
 }
 
 test "a read row's lines never overflow, whatever numbers the model sends" {
@@ -8243,7 +8249,7 @@ test "a subagent that is only closed is not started" {
     var projection = try build(alloc, &entries, &details, 120);
     defer projection.deinit(alloc);
     try std.testing.expectEqualStrings(
-        "● Used subagents\n├ Closed reviewer\n└ Closed tester",
+        "● used subagents\n├ closed reviewer\n└ closed tester",
         projection.entry_actions.items[0].override.bytes,
     );
 }
@@ -8251,8 +8257,8 @@ test "a subagent that is only closed is not started" {
 test "the result mark shows only beside the commands it is for" {
     const alloc = std.testing.allocator;
     const entries = [_]TranscriptEntry{
-        .{ .raw_bytes = .{ .id = 1, .bytes = "● Edited src/main.zig +1 / -1\n", .class = .tool_status } },
-        .{ .raw_bytes = .{ .id = 2, .bytes = "● Exited 2 zig build\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 1, .bytes = "● edited src/main.zig +1 / -1\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 2, .bytes = "● exited 2 zig build\n", .class = .tool_status } },
     };
     var details = [_]ToolDetailRecord{
         .{ .entry_id = 1, .tool_name = @constCast("edit_file"), .activity_kind = .edit, .arguments_json = @constCast("{\"path\":\"src/main.zig\"}"), .outcome = .completed },
@@ -8262,21 +8268,21 @@ test "the result mark shows only beside the commands it is for" {
     var wide = try build(alloc, &entries, &details, 120);
     defer wide.deinit(alloc);
     const wide_bytes = wide.entry_actions.items[0].override.bytes;
-    try std.testing.expectEqualStrings("● Edited a file, ran a command ✗", wide_bytes[0..std.mem.findScalar(u8, wide_bytes, '\n').?]);
+    try std.testing.expectEqualStrings("● edited a file, ran a command ✗", wide_bytes[0..std.mem.findScalar(u8, wide_bytes, '\n').?]);
     // Clipped to the edit, the header says that a call failed, not that the
     // edit did.
     var narrow = try build(alloc, &entries, &details, 30);
     defer narrow.deinit(alloc);
     const narrow_bytes = narrow.entry_actions.items[0].override.bytes;
-    try std.testing.expectEqualStrings("● Edited a file … · 1 failed", narrow_bytes[0..std.mem.findScalar(u8, narrow_bytes, '\n').?]);
+    try std.testing.expectEqualStrings("● edited a file … · 1 failed", narrow_bytes[0..std.mem.findScalar(u8, narrow_bytes, '\n').?]);
 }
 
 test "a list row says what its calls did, and links only files that open safely" {
     const alloc = std.testing.allocator;
     const entries = [_]TranscriptEntry{
-        .{ .raw_bytes = .{ .id = 1, .bytes = "● Read /Users/example/run.command\n", .class = .tool_status } },
-        .{ .raw_bytes = .{ .id = 2, .bytes = "● Read /Users/example/bin/fx\n", .class = .tool_status } },
-        .{ .raw_bytes = .{ .id = 3, .bytes = "● Reading /Users/example/a.zig\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 1, .bytes = "● read /Users/example/run.command\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 2, .bytes = "● read /Users/example/bin/fx\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 3, .bytes = "● reading /Users/example/a.zig\n", .class = .tool_status } },
     };
     var details = [_]ToolDetailRecord{
         storyReadDetailForTest(1, "/Users/example/run.command"),
@@ -8287,9 +8293,9 @@ test "a list row says what its calls did, and links only files that open safely"
     var projection = try build(alloc, &entries, &details, 120);
     defer projection.deinit(alloc);
     // A runnable file and a file with no extension get no link; the row
-    // reads "Read" while the last read still runs.
+    // reads "read" while the last read still runs.
     try std.testing.expectEqualStrings(
-        "● Read run.command, fx, \x1b]8;;file:///Users/example/a.zig\x1b\\a.zig" ++ link_close,
+        "● read run.command, fx, \x1b]8;;file:///Users/example/a.zig\x1b\\a.zig" ++ link_close,
         projection.entry_actions.items[0].override.bytes,
     );
 }
@@ -8323,11 +8329,11 @@ test "repeated bare subagent waits share one row of their own" {
     // Main's waits share one row that shows the latest of them, and its
     // status keeps its own row, so each says what main did.
     try std.testing.expectEqualStrings(
-        "● Started subagents\n" ++
-            "├ Messaged reviewer\n" ++
-            "├ Messaged tester\n" ++
-            "├ Waited for tester\n" ++
-            "└ Checked reviewer, tester",
+        "● started subagents\n" ++
+            "├ messaged reviewer\n" ++
+            "├ messaged tester\n" ++
+            "├ waited for tester\n" ++
+            "└ checked reviewer, tester",
         projection.entry_actions.items[0].override.bytes,
     );
 
@@ -8336,16 +8342,16 @@ test "repeated bare subagent waits share one row of their own" {
     const lone_details = [_]ToolDetailRecord{ details[2], details[4] };
     var waits = try build(alloc, &lone_entries, &lone_details, 120);
     defer waits.deinit(alloc);
-    try std.testing.expectEqualStrings("● Waited for tester", waits.entry_actions.items[0].override.bytes);
+    try std.testing.expectEqualStrings("● waited for tester", waits.entry_actions.items[0].override.bytes);
 }
 
 test "saved arguments that are not usable leave rows unmerged" {
     const alloc = std.testing.allocator;
     const entries = [_]TranscriptEntry{
-        .{ .raw_bytes = .{ .id = 1, .bytes = "● Read one.zig\n", .class = .tool_status } },
-        .{ .raw_bytes = .{ .id = 2, .bytes = "● Read one.zig\n", .class = .tool_status } },
-        .{ .raw_bytes = .{ .id = 3, .bytes = "● Ran make\n", .class = .tool_status } },
-        .{ .raw_bytes = .{ .id = 4, .bytes = "● Ran make\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 1, .bytes = "● read one.zig\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 2, .bytes = "● read one.zig\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 3, .bytes = "● ran make\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 4, .bytes = "● ran make\n", .class = .tool_status } },
     };
     const args = [_][]const u8{ "{\"path\":", "{\"path\":7}", "[]", "{\"command\":\"\"}" };
     const tools = [_][]const u8{ "read_file", "read_file", "shell", "shell" };
@@ -8361,7 +8367,7 @@ test "saved arguments that are not usable leave rows unmerged" {
     var projection = try build(alloc, &entries, &details, 120);
     defer projection.deinit(alloc);
     const bytes = projection.entry_actions.items[0].override.bytes;
-    try std.testing.expect(std.mem.startsWith(u8, bytes, "● Ran commands, read files ✓\n"));
+    try std.testing.expect(std.mem.startsWith(u8, bytes, "● ran commands, read files ✓\n"));
     try std.testing.expectEqual(@as(usize, 4), std.mem.count(u8, bytes, "\n"));
 }
 
@@ -8372,12 +8378,12 @@ test "a failure reason is one line of plain text within the width" {
     const escaped = "\\x1b[31mstarting\\x1b[0m\\x0aerror: boom \\xff end";
     for ([_][]const u8{ hostile, escaped }) |result| {
         const entries = [_]TranscriptEntry{
-            .{ .raw_bytes = .{ .id = 1, .bytes = "● Exited 3 sh hostile.sh\n", .class = .tool_status } },
+            .{ .raw_bytes = .{ .id = 1, .bytes = "● exited 3 sh hostile.sh\n", .class = .tool_status } },
         };
         const details = [_]ToolDetailRecord{storyCommandDetail(1, "{\"command\":\"sh hostile.sh\"}", 3, result)};
         var projection = try build(alloc, &entries, &details, cols);
         defer projection.deinit(alloc);
-        // The reason follows the row on its one line; the row's "Exited 3"
+        // The reason follows the row on its one line; the row's "exited 3"
         // already says how the command ended.
         const reason = projection.entry_actions.items[0].override.bytes;
         try std.testing.expect(std.mem.findScalar(u8, reason, '\n') == null);
@@ -8401,9 +8407,9 @@ test "a failure reason is one line of plain text within the width" {
 test "the turn summary leads with a recap of what the turn changed and ran" {
     const alloc = std.testing.allocator;
     const entries = [_]TranscriptEntry{
-        .{ .raw_bytes = .{ .id = 1, .bytes = "● Edited main.zig +2 / -1\n", .class = .tool_status } },
-        .{ .raw_bytes = .{ .id = 2, .bytes = "● Exited 2 sh build.sh\n", .class = .tool_status } },
-        .{ .raw_bytes = .{ .id = 3, .bytes = "● Ran sh build.sh\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 1, .bytes = "● edited main.zig +2 / -1\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 2, .bytes = "● exited 2 sh build.sh\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 3, .bytes = "● ran sh build.sh\n", .class = .tool_status } },
         .{ .raw_bytes = .{ .id = 4, .bytes = "  3s (↑1 ↓2)", .class = .turn_summary } },
     };
     const details = [_]ToolDetailRecord{
@@ -8431,7 +8437,7 @@ test "the turn summary leads with a recap of what the turn changed and ran" {
 
     // A turn that only read files says so; a turn with no tools keeps its line.
     const reads = [_]TranscriptEntry{
-        .{ .raw_bytes = .{ .id = 1, .bytes = "● Read a.zig\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 1, .bytes = "● read a.zig\n", .class = .tool_status } },
         .{ .raw_bytes = .{ .id = 2, .bytes = "  1s", .class = .turn_summary } },
     };
     const read_details = [_]ToolDetailRecord{.{
@@ -8443,7 +8449,7 @@ test "the turn summary leads with a recap of what the turn changed and ran" {
     }};
     var read_projection = try build(alloc, &reads, &read_details, 120);
     defer read_projection.deinit(alloc);
-    try std.testing.expectEqualStrings("  Explored 1 file · 1s", read_projection.entry_actions.items[1].override.bytes);
+    try std.testing.expectEqualStrings("  explored 1 file · 1s", read_projection.entry_actions.items[1].override.bytes);
     var quiet = try build(alloc, reads[1..], &.{}, 120);
     defer quiet.deinit(alloc);
     try std.testing.expect(quiet.entry_actions.items[0] == .keep);
@@ -8451,7 +8457,7 @@ test "the turn summary leads with a recap of what the turn changed and ran" {
     // A turn that started subagents did more than explore, so its line stays.
     const delegated = [_]TranscriptEntry{
         .{ .raw_bytes = .{ .id = 1, .bytes = "● sent to helper · Check one-off cleanup\n", .class = .tool_status } },
-        .{ .raw_bytes = .{ .id = 2, .bytes = "● Read a.zig\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 2, .bytes = "● read a.zig\n", .class = .tool_status } },
         .{ .raw_bytes = .{ .id = 3, .bytes = "  1s", .class = .turn_summary } },
     };
     const delegated_details = [_]ToolDetailRecord{
@@ -8513,15 +8519,15 @@ fn checkStoryRows(input: []const u8) !void {
     var fuzz: StoryFuzzBytes = .{ .bytes = input };
 
     const statuses = [_][]const u8{
-        "● Ran sh test.sh\n",
-        "● Exited 1 sh test.sh\n",
-        "● Read desktop/src/main.ts\n",
-        "● Edited main.zig +2 / -1\n",
-        "● Failed main.zig: old_string not found\n",
+        "● ran sh test.sh\n",
+        "● exited 1 sh test.sh\n",
+        "● read desktop/src/main.ts\n",
+        "● edited main.zig +2 / -1\n",
+        "● failed main.zig: old_string not found\n",
         "● sent to reviewer · review\n",
-        "▪ Cancelled sleep 30 · What can fx do differently?",
-        "⊘ Denied by auto agent rm -rf build\n",
-        "● Searched createWindow(\n",
+        "▪ cancelled sleep 30 · what can fx do differently?",
+        "⊘ denied by auto agent rm -rf build\n",
+        "● searched createWindow(\n",
     };
     const Tool = struct { name: []const u8, kind: types.ToolActivityKind, key: []const u8 };
     const tools = [_]Tool{
@@ -8610,7 +8616,7 @@ fn checkStoryRows(input: []const u8) !void {
         details[index].command_display = display;
         entries[index] = .{ .raw_bytes = .{
             .id = @intCast(index + 1),
-            .bytes = try arena.print("● Ran {s}\n", .{display}),
+            .bytes = try arena.print("● ran {s}\n", .{display}),
             .class = .tool_status,
         } };
     }
@@ -8694,10 +8700,10 @@ test "a session's input joins the run that started it, though the run's record k
     const interact_args = "{\"action\":\"interact\",\"session_id\":\"shell-245\"}";
     const read_args = "{\"channel_id\":\"C1\",\"message_ts\":\"1.1\"}";
     const entries = [_]TranscriptEntry{
-        .{ .raw_bytes = .{ .id = 1, .bytes = "● Ran printf ok\n", .class = .tool_status } },
-        .{ .raw_bytes = .{ .id = 2, .bytes = "● Still running sh loop.sh\n", .class = .tool_status } },
-        .{ .raw_bytes = .{ .id = 3, .bytes = "● Ran MCP mcp_slack_read_thread\n", .class = .tool_status } },
-        .{ .raw_bytes = .{ .id = 4, .bytes = "● Exited 1 sh loop.sh\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 1, .bytes = "● ran printf ok\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 2, .bytes = "● still running sh loop.sh\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 3, .bytes = "● ran MCP mcp_slack_read_thread\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 4, .bytes = "● exited 1 sh loop.sh\n", .class = .tool_status } },
     };
     var run = storyCommandDetail(2, run_args, 0, "1.1 108\n");
     run.command_process_presentation = null;
@@ -8714,9 +8720,9 @@ test "a session's input joins the run that started it, though the run's record k
     const text = try groupTextForTest(alloc, &entries, &details);
     defer alloc.free(text);
     errdefer std.debug.print("group:\n{s}\n", .{text});
-    try std.testing.expect(std.mem.find(u8, text, "Still running") == null);
+    try std.testing.expect(std.mem.find(u8, text, "still running") == null);
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, text, "sh loop.sh"));
-    try std.testing.expect(std.mem.find(u8, text, "Exited 1 sh loop.sh · 2 calls") != null);
+    try std.testing.expect(std.mem.find(u8, text, "exited 1 sh loop.sh · 2 calls") != null);
 
     // Input to another session does not join a run with another command.
     var other = interact;
@@ -8724,7 +8730,7 @@ test "a session's input joins the run that started it, though the run's record k
     const other_text = try groupTextForTest(alloc, &entries, &.{ details[0], details[1], details[2], other });
     defer alloc.free(other_text);
     errdefer std.debug.print("other:\n{s}\n", .{other_text});
-    try std.testing.expect(std.mem.find(u8, other_text, "Still running sh loop.sh") != null);
+    try std.testing.expect(std.mem.find(u8, other_text, "still running sh loop.sh") != null);
 }
 
 test "calls of one MCP tool share a row that counts them" {
@@ -8733,18 +8739,18 @@ test "calls of one MCP tool share a row that counts them" {
     var details: [5]ToolDetailRecord = undefined;
     for (0..4) |index| {
         const id: u32 = @intCast(index + 1);
-        entries[index] = .{ .raw_bytes = .{ .id = id, .bytes = "● Ran MCP mcp_slack_read_thread\n", .class = .tool_status } };
+        entries[index] = .{ .raw_bytes = .{ .id = id, .bytes = "● ran MCP mcp_slack_read_thread\n", .class = .tool_status } };
         details[index] = .{ .entry_id = id, .tool_name = @constCast("mcp_slack_read_thread"), .activity_kind = .mcp, .outcome = .completed, .arguments_json = @constCast("{\"message_ts\":\"1\"}") };
     }
     // A failed call keeps its own row, so what happened to it shows.
-    entries[4] = .{ .raw_bytes = .{ .id = 5, .bytes = "● Failed mcp_slack_read_thread: rate limited\n", .class = .tool_status } };
+    entries[4] = .{ .raw_bytes = .{ .id = 5, .bytes = "● failed mcp_slack_read_thread: rate limited\n", .class = .tool_status } };
     details[4] = .{ .entry_id = 5, .tool_name = @constCast("mcp_slack_read_thread"), .activity_kind = .mcp, .outcome = .failed, .arguments_json = @constCast("{\"message_ts\":\"2\"}") };
     const text = try groupTextForTest(alloc, &entries, &details);
     defer alloc.free(text);
     errdefer std.debug.print("group:\n{s}\n", .{text});
-    try std.testing.expect(std.mem.find(u8, text, "Ran MCP mcp_slack_read_thread ×4") != null);
-    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, text, "Ran MCP"));
-    try std.testing.expect(std.mem.find(u8, text, "Couldn't run mcp_slack_read_thread") != null);
+    try std.testing.expect(std.mem.find(u8, text, "ran MCP mcp_slack_read_thread ×4") != null);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, text, "ran MCP"));
+    try std.testing.expect(std.mem.find(u8, text, "couldn't run mcp_slack_read_thread") != null);
 }
 
 test "a run that returns while its command goes on stays on the row it joined, and so do its session's calls" {
@@ -8759,15 +8765,15 @@ test "a run that returns while its command goes on stays on the row it joined, a
     var stop = storyCommandDetail(4, "{\"action\":\"stop\",\"session_id\":\"shell-9\"}", 0, null);
     stop.command_display = @constCast("sh loop.sh");
     const entries = [_]TranscriptEntry{
-        .{ .raw_bytes = .{ .id = 1, .bytes = "● Ran printf a\n", .class = .tool_status } },
-        .{ .raw_bytes = .{ .id = 2, .bytes = "● Still running sh loop.sh\n", .class = .tool_status } },
-        .{ .raw_bytes = .{ .id = 3, .bytes = "● Observed sh loop.sh\n", .class = .tool_status } },
-        .{ .raw_bytes = .{ .id = 4, .bytes = "● Stopped sh loop.sh\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 1, .bytes = "● ran printf a\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 2, .bytes = "● still running sh loop.sh\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 3, .bytes = "● observed sh loop.sh\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 4, .bytes = "● stopped sh loop.sh\n", .class = .tool_status } },
     };
     const details = [_]ToolDetailRecord{ first, run, observe, stop };
     // At each step the group is one line: the run joins the row that ran,
     // and its session's calls join it in turn.
-    const wants = [_][]const u8{ "● Still running printf, sh", "● Observed printf, sh", "● Stopped printf, sh" };
+    const wants = [_][]const u8{ "● still running printf, sh", "● observed printf, sh", "● stopped printf, sh" };
     for (wants, 2..) |want, count| {
         const text = try groupTextForTest(alloc, entries[0..count], details[0..count]);
         defer alloc.free(text);
@@ -8783,8 +8789,8 @@ test "a running search or edit without the argument its row needs waits in its t
     // A search whose pattern has not arrived waits in its tool's row.
     {
         const entries = [_]TranscriptEntry{
-            .{ .raw_bytes = .{ .id = 1, .bytes = "● Searching retry\n", .class = .tool_status } },
-            .{ .raw_bytes = .{ .id = 2, .bytes = "● Searching\n", .class = .tool_status } },
+            .{ .raw_bytes = .{ .id = 1, .bytes = "● searching retry\n", .class = .tool_status } },
+            .{ .raw_bytes = .{ .id = 2, .bytes = "● searching\n", .class = .tool_status } },
         };
         const details = [_]ToolDetailRecord{
             .{ .entry_id = 1, .tool_name = @constCast("grep_files"), .activity_kind = .list, .arguments_json = @constCast("{\"pattern\":\"retry\"}") },
@@ -8793,13 +8799,13 @@ test "a running search or edit without the argument its row needs waits in its t
         const text = try groupTextForTest(alloc, &entries, &details);
         defer alloc.free(text);
         errdefer std.debug.print("search:\n{s}\n", .{text});
-        try std.testing.expectEqualStrings("● Searching retry", std.mem.trim(u8, text, "\n"));
+        try std.testing.expectEqualStrings("● searching retry", std.mem.trim(u8, text, "\n"));
     }
     // So does one whose search before it has no pattern yet either.
     {
         const entries = [_]TranscriptEntry{
-            .{ .raw_bytes = .{ .id = 1, .bytes = "● Searching\n", .class = .tool_status } },
-            .{ .raw_bytes = .{ .id = 2, .bytes = "● Searching\n", .class = .tool_status } },
+            .{ .raw_bytes = .{ .id = 1, .bytes = "● searching\n", .class = .tool_status } },
+            .{ .raw_bytes = .{ .id = 2, .bytes = "● searching\n", .class = .tool_status } },
         };
         const details = [_]ToolDetailRecord{
             .{ .entry_id = 1, .tool_name = @constCast("grep_files"), .activity_kind = .list, .arguments_json = @constCast("{}") },
@@ -8808,16 +8814,16 @@ test "a running search or edit without the argument its row needs waits in its t
         const text = try groupTextForTest(alloc, &entries, &details);
         defer alloc.free(text);
         errdefer std.debug.print("searches:\n{s}\n", .{text});
-        try std.testing.expectEqualStrings("● Searching", std.mem.trim(u8, text, "\n"));
+        try std.testing.expectEqualStrings("● searching", std.mem.trim(u8, text, "\n"));
     }
     // An edit whose path has not arrived waits in the latest edit row, even
     // with another row after it.
     {
         const edit_args = "{\"path\":\"/w/a.zig\",\"old_string\":\"a\",\"new_string\":\"b\"}";
         const entries = [_]TranscriptEntry{
-            .{ .raw_bytes = .{ .id = 1, .bytes = "● Edited /w/a.zig +1 / -1\n", .class = .tool_status } },
-            .{ .raw_bytes = .{ .id = 2, .bytes = "● Read /w/b.zig\n", .class = .tool_status } },
-            .{ .raw_bytes = .{ .id = 3, .bytes = "● Editing\n", .class = .tool_status } },
+            .{ .raw_bytes = .{ .id = 1, .bytes = "● edited /w/a.zig +1 / -1\n", .class = .tool_status } },
+            .{ .raw_bytes = .{ .id = 2, .bytes = "● read /w/b.zig\n", .class = .tool_status } },
+            .{ .raw_bytes = .{ .id = 3, .bytes = "● editing\n", .class = .tool_status } },
         };
         const details = [_]ToolDetailRecord{
             .{ .entry_id = 1, .tool_name = @constCast("edit_file"), .activity_kind = .edit, .arguments_json = @constCast(edit_args), .outcome = .completed },
@@ -8827,26 +8833,26 @@ test "a running search or edit without the argument its row needs waits in its t
         const text = try groupTextForTest(alloc, &entries, &details);
         defer alloc.free(text);
         errdefer std.debug.print("edit:\n{s}\n", .{text});
-        try std.testing.expect(std.mem.find(u8, text, "├ Edited a.zig +1/-1") != null);
-        try std.testing.expect(std.mem.find(u8, text, "└ Read b.zig") != null);
-        try std.testing.expect(std.mem.find(u8, text, "├ Editing") == null);
-        try std.testing.expect(std.mem.find(u8, text, "└ Editing") == null);
+        try std.testing.expect(std.mem.find(u8, text, "├ edited a.zig +1/-1") != null);
+        try std.testing.expect(std.mem.find(u8, text, "└ read b.zig") != null);
+        try std.testing.expect(std.mem.find(u8, text, "├ editing") == null);
+        try std.testing.expect(std.mem.find(u8, text, "└ editing") == null);
 
         // One whose status already names another file shows on its own
         // row, where it stays once it completes.
         var named = entries;
-        named[2].raw_bytes.bytes = "● Editing /w/c.zig\n";
+        named[2].raw_bytes.bytes = "● editing /w/c.zig\n";
         const named_text = try groupTextForTest(alloc, &named, &details);
         defer alloc.free(named_text);
         errdefer std.debug.print("named edit:\n{s}\n", .{named_text});
-        try std.testing.expect(std.mem.find(u8, named_text, "└ Editing c.zig") != null);
+        try std.testing.expect(std.mem.find(u8, named_text, "└ editing c.zig") != null);
         // And one that names the file of the edit row waits in that row.
-        named[2].raw_bytes.bytes = "● Editing /w/a.zig\n";
+        named[2].raw_bytes.bytes = "● editing /w/a.zig\n";
         const same_text = try groupTextForTest(alloc, &named, &details);
         defer alloc.free(same_text);
         errdefer std.debug.print("same file:\n{s}\n", .{same_text});
-        try std.testing.expect(std.mem.find(u8, same_text, "├ Editing") == null);
-        try std.testing.expect(std.mem.find(u8, same_text, "└ Editing") == null);
+        try std.testing.expect(std.mem.find(u8, same_text, "├ editing") == null);
+        try std.testing.expect(std.mem.find(u8, same_text, "└ editing") == null);
     }
 }
 
@@ -9018,16 +9024,16 @@ test "a command that ran after one still running keeps its own row and no check 
     var quick = storyCommandDetail(2, "{\"action\":\"run\",\"command\":\"printf QUICK_OK\"}", 0, "QUICK_OK");
     quick.command_display = @constCast("printf QUICK_OK");
     const entries = [_]TranscriptEntry{
-        .{ .raw_bytes = .{ .id = 1, .bytes = "● Still running sleep 25\n", .class = .tool_status } },
-        .{ .raw_bytes = .{ .id = 2, .bytes = "● Ran printf QUICK_OK\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 1, .bytes = "● still running sleep 25\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 2, .bytes = "● ran printf QUICK_OK\n", .class = .tool_status } },
     };
     const text = try groupTextForTest(alloc, &entries, &.{ background, quick });
     defer alloc.free(text);
     errdefer std.debug.print("group:\n{s}\n", .{text});
     // One row with both would take the quick command's label and mark, and
     // say the one still running ran.
-    try std.testing.expect(std.mem.find(u8, text, "├ Still running sleep") != null);
-    try std.testing.expect(std.mem.find(u8, text, "└ Ran printf") != null);
+    try std.testing.expect(std.mem.find(u8, text, "├ still running sleep") != null);
+    try std.testing.expect(std.mem.find(u8, text, "└ ran printf") != null);
     try std.testing.expect(std.mem.find(u8, text, "✓") == null);
 }
 
@@ -9042,7 +9048,7 @@ test "a row of commands shows its newest steps and counts the older ones first" 
     var status_bufs: [commands.len][64]u8 = undefined;
     for (commands, 0..) |command, index| {
         const running = index == commands.len - 1;
-        const status = try std.mem.print(&status_bufs[index], "● {s} {s}\n", .{ if (running) "Running" else "Ran", command });
+        const status = try std.mem.print(&status_bufs[index], "● {s} {s}\n", .{ if (running) "running" else "ran", command });
         entries[index] = .{ .raw_bytes = .{ .id = @intCast(index + 1), .bytes = status, .class = .tool_status } };
         const json = try std.mem.print(&json_bufs[index], "{{\"command\":\"{s}\"}}", .{command});
         details[index] = storyCommandDetail(@intCast(index + 1), json, 0, null);
@@ -9054,7 +9060,7 @@ test "a row of commands shows its newest steps and counts the older ones first" 
     }
     const text = try groupTextForTest(alloc, &entries, &details);
     defer alloc.free(text);
-    try std.testing.expectEqualStrings("● Running +2, git status, sed, python3 run.py", std.mem.trim(u8, text, "\n"));
+    try std.testing.expectEqualStrings("● running +2, git status, sed, python3 run.py", std.mem.trim(u8, text, "\n"));
 
     var narrow = try build(alloc, &entries, &details, 30);
     defer narrow.deinit(alloc);
@@ -9070,7 +9076,7 @@ test "a row of commands shows its newest steps and counts the older ones first" 
     errdefer std.debug.print("narrow group:\n{s}\n", .{painted.items});
     const narrow_text = try visibleLinesForTest(alloc, painted.items, 30);
     defer alloc.free(narrow_text);
-    try std.testing.expectEqualStrings("● Running +4, python3 run.py", std.mem.trim(u8, narrow_text, "\n"));
+    try std.testing.expectEqualStrings("● running +4, python3 run.py", std.mem.trim(u8, narrow_text, "\n"));
 }
 
 test "a session's input finds its run after a quick command joined the run's row" {
@@ -9087,10 +9093,10 @@ test "a session's input finds its run after a quick command joined the run's row
     var observe = storyCommandDetail(4, "{\"action\":\"interact\",\"session_id\":\"shell-9\"}", 0, null);
     observe.command_display = @constCast("sh loop.sh");
     const entries = [_]TranscriptEntry{
-        .{ .raw_bytes = .{ .id = 1, .bytes = "● Ran printf a\n", .class = .tool_status } },
-        .{ .raw_bytes = .{ .id = 2, .bytes = "● Still running sh loop.sh\n", .class = .tool_status } },
-        .{ .raw_bytes = .{ .id = 3, .bytes = "● Running printf b\n", .class = .tool_status } },
-        .{ .raw_bytes = .{ .id = 4, .bytes = "● Observed sh loop.sh\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 1, .bytes = "● ran printf a\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 2, .bytes = "● still running sh loop.sh\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 3, .bytes = "● running printf b\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 4, .bytes = "● observed sh loop.sh\n", .class = .tool_status } },
     };
     const text = try groupTextForTest(alloc, &entries, &.{ first, run, quick, observe });
     defer alloc.free(text);
@@ -9099,7 +9105,7 @@ test "a session's input finds its run after a quick command joined the run's row
     // session still finds the run in it, so it gets no row of its own.
     const trimmed = std.mem.trim(u8, text, "\n");
     try std.testing.expect(std.mem.findScalar(u8, trimmed, '\n') == null);
-    try std.testing.expect(std.mem.startsWith(u8, trimmed, "● Observed printf, sh"));
+    try std.testing.expect(std.mem.startsWith(u8, trimmed, "● observed printf, sh"));
 }
 
 test "a command with a here-document shows its steps, whatever the document says" {

@@ -1843,16 +1843,16 @@ test "approval footer composition hides cursor while rendering command prompt" {
     var controls_row: ?u16 = null;
     var controls_count: u8 = 0;
     for (frame.rows.items, 0..) |row, row_index| {
-        saw_prompt = saw_prompt or std.mem.find(u8, row.text.items, "Would you like to run the following command?") != null;
+        saw_prompt = saw_prompt or std.mem.find(u8, row.text.items, "would you like to run the following command?") != null;
         saw_default_reason = saw_default_reason or std.mem.find(u8, row.text.items, "fx needs your approval before running this shell command") != null;
-        saw_selected_choice = saw_selected_choice or std.mem.find(u8, row.text.items, "1. Yes") != null;
-        if (std.mem.find(u8, row.text.items, "Would you like to run the following command?") != null) {
+        saw_selected_choice = saw_selected_choice or std.mem.find(u8, row.text.items, "1. yes") != null;
+        if (std.mem.find(u8, row.text.items, "would you like to run the following command?") != null) {
             prompt_row = row_index;
         }
         if (std.mem.find(u8, row.text.items, "$ echo permission test") != null) {
             command_row = row_index;
         }
-        if (std.mem.find(u8, row.text.items, "3. No") != null) {
+        if (std.mem.find(u8, row.text.items, "3. no") != null) {
             choice_three_row = row.row;
         }
         if (std.mem.find(u8, row.text.items, "1–3 choose") != null) {

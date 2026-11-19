@@ -571,8 +571,8 @@ pub fn presentation(args: std.json.ObjectMap) ?tool_dispatch.CallPresentation {
         const mcp = core_types.isMcpToolName(value.string);
         return .{
             .activity_kind = if (mcp) .mcp else .write,
-            .action_label = if (mcp) tool_presentation.mcp_running_label else "Running",
-            .completed_action_label = if (mcp) tool_presentation.mcp_ran_label else "Ran",
+            .action_label = if (mcp) tool_presentation.mcp_running_label else "running",
+            .completed_action_label = if (mcp) tool_presentation.mcp_ran_label else "ran",
             .label_arg_kind = .run,
             .label_arg_default = "tool",
         };
@@ -583,7 +583,7 @@ pub fn presentation(args: std.json.ObjectMap) ?tool_dispatch.CallPresentation {
         const lists = std.mem.trim(u8, value.string, " \t\r\n").len == 0 and args.get("server") != null;
         return .{
             .activity_kind = .read,
-            .action_label = "Searching toolbox",
+            .action_label = "searching toolbox",
             .completed_action_label = "Searched toolbox",
             .label_arg_kind = if (lists) .server else .search,
             .label_arg_default = "toolbox",
@@ -591,8 +591,8 @@ pub fn presentation(args: std.json.ObjectMap) ?tool_dispatch.CallPresentation {
     };
     if (args.get("open")) |value| if (value == .string) return .{
         .activity_kind = .read,
-        .action_label = "Opening",
-        .completed_action_label = "Opened",
+        .action_label = "opening",
+        .completed_action_label = "opened",
         .label_arg_kind = .open,
         .label_arg_default = "toolbox",
     };

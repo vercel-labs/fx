@@ -1412,7 +1412,7 @@ for (const provider of ["gateway", "codex", "grok"] as const) {
       await session.sendText(prompt);
       await session.waitForPane((pane) => pane.includes(prompt) && pane.slice(pane.lastIndexOf(prompt) + prompt.length).includes("auth:"), TIMEOUT);
       const scrollback = await session.captureFullScrollback();
-      expect(scrollback.slice(scrollback.lastIndexOf(prompt) + prompt.length)).toContain("Saved credential storage is unavailable");
+      expect(scrollback.slice(scrollback.lastIndexOf(prompt) + prompt.length)).toContain("saved credential storage is unavailable");
       expect(gateway.requests).toHaveLength(0);
       expect(oauth.requests).toHaveLength(0);
       expect(chatgptOauth.requests).toHaveLength(0);
@@ -1460,10 +1460,10 @@ for (const provider of ["codex", "grok"] as const) {
       await session.waitForComposer(TIMEOUT);
       const inactive = provider === "codex" ? "grok" : "codex";
       await session.sendText(`/logout ${inactive}`);
-      await session.waitForText(`Signed out of ${inactive === "codex" ? "Codex" : "Grok"}.`, TIMEOUT);
+      await session.waitForText(`signed out of ${inactive === "codex" ? "codex" : "grok"}.`, TIMEOUT);
       expect(JSON.parse(readFileSync(settingsPath, "utf8")).provider).toBe(provider);
       await session.sendText("/logout");
-      await session.waitForText(`Signed out of ${provider === "codex" ? "Codex" : "Grok"}.`, TIMEOUT);
+      await session.waitForText(`signed out of ${provider === "codex" ? "codex" : "grok"}.`, TIMEOUT);
       await openProviderPicker(session);
       expect(await session.capturePane()).toContain("vercel · current");
       expect(existsSync(join(home, ".fx", provider === "codex" ? "chatgpt-auth.json" : "grok-auth.json"))).toBe(false);
@@ -1510,7 +1510,7 @@ for (const provider of ["codex", "grok"] as const) {
         await Bun.sleep(20);
       }
       await session.sendKeys("C-c");
-      await session.waitForText("What can fx do differently?", TIMEOUT);
+      await session.waitForText("what can fx do differently?", TIMEOUT);
       release();
       await openProviderPicker(session);
       await session.sendKeys("Down");
@@ -1520,11 +1520,11 @@ for (const provider of ["codex", "grok"] as const) {
       else await completeDisplayedGrokLogin(session, grok);
       const label = provider === "codex" ? "Codex" : "Grok";
       const outcome = await session.waitForPane(
-        (pane) => pane.includes(`Switched to ${label} subscription`) ||
-          pane.includes("Subscription sign-in completed, but"),
+        (pane) => pane.includes(`switched to ${label} subscription`) ||
+          pane.includes("subscription sign-in completed, but"),
         TIMEOUT,
       );
-      expect(outcome).toContain(`Switched to ${label} subscription`);
+      expect(outcome).toContain(`switched to ${label} subscription`);
       await session.sendText("Use the subscription immediately after sign-in.");
       await session.waitForText(provider === "codex" ? "CHATGPT_DIRECT_RESPONSE" : "GROK_DIRECT_RESPONSE", TIMEOUT);
       expect(gateway.requests).toHaveLength(1);
@@ -1557,7 +1557,7 @@ for (const gatewayState of ["absent", "rejected"] as const) {
       });
       await session.waitForComposer(TIMEOUT);
       await session.sendText("/logout");
-      await session.waitForText("Signed out of Codex.", TIMEOUT);
+      await session.waitForText("signed out of codex.", TIMEOUT);
       await openProviderPicker(session);
       expect(await session.capturePane()).toContain("grok · current");
       await session.sendKeys("Escape");
@@ -1644,10 +1644,10 @@ for (const otherProvider of ["codex", "grok"] as const) {
     linkSync(authPath, join(home, "login.alias"));
     await session.sendText("/logout");
     const result = await session.waitForPane(
-      (pane) => pane.includes("Signed out of fx.") || pane.includes(`Signed out of ${otherProvider === "codex" ? "Codex" : "Grok"}.`),
+      (pane) => pane.includes("signed out of fx.") || pane.includes(`signed out of ${otherProvider === "codex" ? "codex" : "grok"}.`),
       TIMEOUT,
     );
-    expect(result).toContain("Signed out of fx.");
+    expect(result).toContain("signed out of fx.");
     expect(readFileSync(otherPath, "utf8")).toBe(otherCredential);
     expect(existsSync(authPath)).toBe(false);
     expect(gateway.requests).toHaveLength(0);
@@ -1670,7 +1670,7 @@ tmuxTest("provider recovery stays signed out when no replacement is connected", 
   });
   await session.waitForComposer(TIMEOUT);
   await session.sendText("/logout");
-  await session.waitForText("Signed out of Codex.", TIMEOUT);
+  await session.waitForText("signed out of codex.", TIMEOUT);
   await openProviderPicker(session);
   const pane = await session.capturePane();
   expect(pane).not.toContain("codex · current");
@@ -1726,7 +1726,7 @@ tmuxTest("/logout revokes the Codex login in the background", async () => {
   });
   await session.waitForComposer(TIMEOUT);
   await session.sendText("/logout codex");
-  await session.waitForText("Signed out of Codex.", TIMEOUT);
+  await session.waitForText("signed out of codex.", TIMEOUT);
   await waitForCodexRevocations(1);
   expect(chatgptOauth.revocations()[0]!.form).toEqual({
     token: "chatgpt-refresh", token_type_hint: "refresh_token", client_id: CODEX_CLIENT_ID,
@@ -1756,12 +1756,12 @@ tmuxTest("/logout warns when OpenAI doesn't confirm the Codex revocation", async
   });
   await session.waitForComposer(TIMEOUT);
   await session.sendText("/logout codex");
-  await session.waitForText("Signed out of Codex.", TIMEOUT);
+  await session.waitForText("signed out of codex.", TIMEOUT);
   await session.waitForText("could not be confirmed", TIMEOUT);
   // The pane wraps the warning, so wait for its last words.
   await session.waitForText("try again later.", TIMEOUT);
   const pane = (await session.capturePane()).replace(/\s+/g, " ");
-  expect(pane).toContain(`The local Codex session was removed, but remote revocation could not be confirmed. ${RETRY_LATER}.`);
+  expect(pane).toContain(`the local codex session was removed, but remote revocation could not be confirmed. ${RETRY_LATER}.`);
   expect(chatgptOauth.revocations()).toHaveLength(1);
   expect(existsSync(join(home, ".fx", "chatgpt-auth.json"))).toBe(false);
   expect(statSync(join(home, ".fx", CODEX_PENDING_FILE)).mode & 0o777).toBe(0o600);
@@ -1849,7 +1849,7 @@ tmuxTest("fx quits promptly while a Codex revocation still waits", async () => {
   });
   await session.waitForComposer(TIMEOUT);
   await session.sendText("/logout codex");
-  await session.waitForText("Signed out of Codex.", TIMEOUT);
+  await session.waitForText("signed out of codex.", TIMEOUT);
   await waitForCodexRevocations(1);
   const started = Date.now();
   await session.sendText("/quit");
@@ -1885,14 +1885,14 @@ tmuxTest("provider recovery refuses active logout before deleting a busy subscri
   }
   await session.sendText("/logout");
   const outcome = await session.waitForPane(
-    (pane) => pane.includes("Sign out is unavailable until active and queued work finishes.") ||
-      pane.includes("Signed out of Codex."),
+    (pane) => pane.includes("sign out is unavailable until active and queued work finishes.") ||
+      pane.includes("signed out of codex."),
     TIMEOUT,
   );
-  expect(outcome).toContain("Sign out is unavailable until active and queued work finishes.");
+  expect(outcome).toContain("sign out is unavailable until active and queued work finishes.");
   expect(existsSync(authPath)).toBe(true);
   await session.sendKeys("C-c");
-  await session.waitForText("What can fx do differently?", TIMEOUT);
+  await session.waitForText("what can fx do differently?", TIMEOUT);
   expect(readFileSync(stderrPath, "utf8")).toBe("");
 }, 60_000);
 
@@ -1920,7 +1920,7 @@ tmuxTest("provider recovery validates a Gateway team after a cancelled turn", as
       await Bun.sleep(20);
     }
     await session.sendKeys("C-c");
-    await session.waitForText("What can fx do differently?", TIMEOUT);
+    await session.waitForText("what can fx do differently?", TIMEOUT);
     release();
     await selectFxLoginCredential(session);
     expect(gateway.modelRequests.some((request) =>
@@ -1947,7 +1947,7 @@ tmuxTest("pending Gateway prompt waits for valid saved preferences and a repaire
   await session.waitForComposer(TIMEOUT);
   writeFileSync(settingsPath, "not-json");
   await session.sendText("PREFERENCE_RETRY_PROMPT");
-  await session.waitForText("Could not load authentication settings", TIMEOUT);
+  await session.waitForText("could not load authentication settings", TIMEOUT);
   expect(gateway.requests).toHaveLength(0);
 
   writeFileSync(settingsPath, settings);
@@ -1985,7 +1985,7 @@ test("Vercel CLI keeps an issuer authorization denial distinct from persistence 
   }, timeoutMs: TIMEOUT });
   expect(result.code).toBe(1);
   expect(result.stderr).toContain("authorization denied");
-  expect(result.stderr).not.toContain("Credential could not be saved");
+  expect(result.stderr).not.toContain("credential could not be saved");
   expect(existsSync(join(home, ".fx", "auth.json"))).toBe(false);
   expect(oauth.requests.filter((request) => request.path === "/oauth/token")).toHaveLength(0);
 }, TIMEOUT);
@@ -2017,9 +2017,9 @@ test("Vercel CLI reports a post-authorization save failure without claiming auth
   chmodSync(authPath, 0o400);
   const result = await login;
   expect(result.code).toBe(1);
-  expect(result.stderr).toContain("Credential could not be saved");
+  expect(result.stderr).toContain("credential could not be saved");
   expect(result.stderr).not.toContain("authorization denied");
-  expect(result.stdout).not.toContain("Signed in");
+  expect(result.stdout).not.toContain("signed in");
   expect(readFileSync(authPath, "utf8")).toBe(previous);
   expect(gateway.requests).toHaveLength(0);
 }, TIMEOUT);
@@ -2053,7 +2053,7 @@ tmuxTest(
           ...grok.env,
         });
         await session.waitForComposer(TIMEOUT);
-        for (const [provider, label] of [["vercel", "Vercel AI Gateway"], ["codex", "Codex subscription"], ["grok", "Grok subscription"]]) {
+        for (const [provider, label] of [["vercel", "vercel AI gateway"], ["codex", "codex subscription"], ["grok", "grok subscription"]]) {
           await session.sendKeys("Escape");
           await session.sendKeys("C-u");
           await openProviderPicker(session);
@@ -2062,8 +2062,8 @@ tmuxTest(
             await session.waitForPane((pane) => pane.includes("oauth") && pane.includes("api-key"), TIMEOUT);
             await session.sendKeys("Enter");
           }
-          await session.waitForText(`${label}: Saved credential storage is unavailable`, 10_000);
-          expect(await session.captureFullScrollback()).not.toContain("Waiting for authorization");
+          await session.waitForText(`${label}: saved credential storage is unavailable`, 10_000);
+          expect(await session.captureFullScrollback()).not.toContain("waiting for authorization");
         }
         expect(oauth.requests).toHaveLength(0);
         expect(chatgptOauth.requests).toHaveLength(0);
@@ -2103,7 +2103,7 @@ for (const command of ["/provider", "/login", "/setup"]) {
     await session.sendLiteral("retained draft");
     await session.waitForText("retained draft", TIMEOUT);
     expect(gateway.requests).toHaveLength(0);
-    expect(await session.captureFullScrollback()).not.toContain("Authorize with Codex");
+    expect(await session.captureFullScrollback()).not.toContain("authorize with codex");
     expect(readFileSync(stderrPath, "utf8")).toBe("");
   }, TIMEOUT * 2);
 }
@@ -2156,10 +2156,10 @@ for (const scenario of [
       session = await startFx(home, stderrPath, gateway);
       await session.waitForComposer(TIMEOUT);
       await session.sendText("Keep the response active while I inspect provider settings.");
-      await session.waitForText("Generating", TIMEOUT);
+      await session.waitForText("generating", TIMEOUT);
 
       await session.sendText(scenario.command);
-      const notice = "Provider switching is unavailable until active and queued work finishes.";
+      const notice = "provider switching is unavailable until active and queued work finishes.";
       await session.waitForText(notice, TIMEOUT);
       const scrollback = await session.captureFullScrollback();
       expect(scrollback.split(notice)).toHaveLength(2);
@@ -2168,7 +2168,7 @@ for (const scenario of [
 
       await session.sendKeys("C-u");
       await session.sendInterruptEscapePair(TIMEOUT);
-      await session.waitForText("What can fx do differently?", TIMEOUT);
+      await session.waitForText("what can fx do differently?", TIMEOUT);
       await session.sendText(scenario.command.trim());
       await session.waitForPane(
         (pane) => pane.includes("vercel") && pane.includes("codex") && pane.includes("grok"),
@@ -2224,10 +2224,10 @@ tmuxTest(
         }));
         const status = await runFx(["status", "--json"], { env });
         expect(status.code).toBe(0);
-        expect(JSON.parse(status.stdout).auth_help).toContain("Saved credential storage is unavailable");
+        expect(JSON.parse(status.stdout).auth_help).toContain("saved credential storage is unavailable");
         const doctor = await runFx(["doctor", "--json"], { env });
         expect(doctor.timedOut).toBe(false);
-        expect(doctor.stdout).toContain("Saved credential storage is unavailable");
+        expect(doctor.stdout).toContain("saved credential storage is unavailable");
         const ask = await runFx(["ask", "--json", "--no-save", "do not use another account"], { env });
         expect(ask.code).toBe(1);
         expect(JSON.parse(ask.stdout).error).toBe("CredentialStorageUnavailable");
@@ -2238,11 +2238,11 @@ tmuxTest(
         expect(acp.code).toBe(0);
         const response = acp.stdout.trim().split("\n").map((line) => JSON.parse(line)).find((message) => message.id === 1);
         expect(response.error.code).toBe(-32600);
-        expect(response.error.message).toContain("Saved credential storage is unavailable");
+        expect(response.error.message).toContain("saved credential storage is unavailable");
         session = await startFx(home, stderrPath, gateway, oauth.issuerUrl, undefined, env);
         await session.waitForComposer(TIMEOUT);
         const unavailable = await readStatusPanel(session, TIMEOUT, (panel) => panel.fields["Auth help"] !== undefined);
-        expect(unavailable.fields["Auth help"]).toContain("Saved credential storage is unavailable");
+        expect(unavailable.fields["Auth help"]).toContain("saved credential storage is unavailable");
         await selectEnvKeyCredential(session);
         await session.sendText("Use the working Gateway account.");
         await session.waitForText(`GATEWAY_RECOVERED_${provider}`, TIMEOUT);
@@ -2276,7 +2276,7 @@ tmuxTest(
       for (const [provider, label] of [["codex", "Codex"], ["grok", "Grok"]]) {
         await openProviderPicker(session);
         await session.sendText(provider);
-        await session.waitForText(`Authorize with ${label}`, TIMEOUT);
+        await session.waitForText(`authorize with ${label}`, TIMEOUT);
         if (provider === "codex") writeSeededChatGptLogin(home);
         else writeSeededGrokLogin(home, grok.initialAccessToken);
         const name = provider === "codex" ? "chatgpt-auth.json" : "grok-auth.json";
@@ -2284,12 +2284,12 @@ tmuxTest(
         linkSync(original, join(home, `${name}.alias`));
         await completeDisplayedSubscriptionLogin(
           session,
-          `Authorize with ${label}`,
+          `authorize with ${label}`,
           provider === "codex" ? `${chatgptOauth.baseUrl}/oauth/authorize?` : `${grok.baseUrl}/oauth2/authorize?`,
           400,
         );
         await session.waitForText(`${label} subscription: Credential could not be saved`, TIMEOUT);
-        expect(await session.captureFullScrollback()).not.toContain(`Switched to ${label}`);
+        expect(await session.captureFullScrollback()).not.toContain(`switched to ${label}`);
         expect(statSync(original).nlink).toBe(2);
         expect(readFileSync(original, "utf8")).toBe(readFileSync(join(home, `${name}.alias`), "utf8"));
         await session.waitForComposer(TIMEOUT);
@@ -2337,7 +2337,7 @@ tmuxTest(
         const result = await runFx(["login", provider], { env, timeoutMs: 3000 });
         expect(result.timedOut).toBe(false);
         expect(result.code).toBe(1);
-        expect(result.stderr).toContain("Saved credential storage is unavailable");
+        expect(result.stderr).toContain("saved credential storage is unavailable");
         expect(result.stdout).not.toContain("http");
       }
       session = await startFx(home, stderrPath, gateway, oauth.issuerUrl, undefined, env);
@@ -2346,8 +2346,8 @@ tmuxTest(
       await session.sendKeys("Enter");
       await session.waitForPane((pane) => pane.includes("oauth") && pane.includes("api-key"), TIMEOUT);
       await session.sendKeys("Enter");
-      await session.waitForText("Saved credential storage is unavailable", TIMEOUT);
-      expect(await session.captureFullScrollback()).not.toContain("Sign in with Vercel");
+      await session.waitForText("saved credential storage is unavailable", TIMEOUT);
+      expect(await session.captureFullScrollback()).not.toContain("sign in with vercel");
       for (const name of ["auth.json", "chatgpt-auth.json", "grok-auth.json"]) {
         unlinkSync(join(home, `${name}.alias`));
         chmodSync(join(home, ".fx", name), 0o400);
@@ -2356,7 +2356,7 @@ tmuxTest(
         const result = await runFx(["login", provider], { env, timeoutMs: 3000 });
         expect(result.timedOut).toBe(false);
         expect(result.code).toBe(1);
-        expect(result.stderr).toContain("Saved credential storage is unavailable");
+        expect(result.stderr).toContain("saved credential storage is unavailable");
         expect(result.stdout).not.toContain("http");
       }
       expect(oauth.requests).toHaveLength(0);
@@ -2390,8 +2390,8 @@ tmuxTest(
       10_000,
     );
     const scrollback = await session.captureFullScrollback();
-    expect(scrollback).toContain("Codex subscription is unavailable");
-    expect(scrollback).toContain("Grok subscription is unavailable");
+    expect(scrollback).toContain("codex subscription is unavailable");
+    expect(scrollback).toContain("grok subscription is unavailable");
     expect(scrollback).not.toContain("picker was not opened with stale data");
     await session.sendKeys("Escape");
     await session.sendKeys("C-u");
@@ -2431,8 +2431,8 @@ tmuxTest(
         await session.sendText(provider);
         await session.waitForText(`${label} subscription: Saved credential storage is unavailable`, 10_000);
         const blocked = await session.captureFullScrollback();
-        expect(blocked).not.toContain(`Authorize with ${label}`);
-        expect(blocked).not.toContain(`Switched to ${label}`);
+        expect(blocked).not.toContain(`authorize with ${label}`);
+        expect(blocked).not.toContain(`switched to ${label}`);
         await session.waitForComposer(TIMEOUT);
 
         const name = provider === "codex" ? "chatgpt-auth.json" : "grok-auth.json";
@@ -2442,7 +2442,7 @@ tmuxTest(
         unlinkSync(join(home, `${name}.alias`));
         await openProviderPicker(session);
         await session.sendText(provider);
-        await session.waitForText(`Switched to ${label} subscription`, TIMEOUT);
+        await session.waitForText(`switched to ${label} subscription`, TIMEOUT);
         await session.sendText(`Use the saved ${label} credential.`);
         await session.waitForText(provider === "codex" ? "CHATGPT_DIRECT_RESPONSE" : "GROK_DIRECT_RESPONSE", TIMEOUT);
       }
@@ -2487,7 +2487,7 @@ tmuxTest(
     });
     await session.waitForComposer(TIMEOUT);
     await session.sendText("Answer after I sign in again.");
-    await session.waitForText("Choose a team to finish setup", TIMEOUT);
+    await session.waitForText("choose a team to finish setup", TIMEOUT);
     // The team with a bad name shows under its slug; the team fx could not
     // send is left out.
     const picker = await session.waitForPane((pane) => pane.includes("› vercel-labs"), TIMEOUT);
@@ -2534,12 +2534,12 @@ tmuxTest(
     });
     await session.waitForComposer(TIMEOUT);
     await session.sendText("Answer on my usual team.");
-    await session.waitForText("Choose a team to finish setup", TIMEOUT);
+    await session.waitForText("choose a team to finish setup", TIMEOUT);
     await session.waitForText("› Other Team", TIMEOUT);
     await session.sendKeys("Enter");
     await session.waitForText("KEPT_TEAM_RESPONSE", TIMEOUT);
     const signedIn = await session.captureFullScrollback();
-    expect(signedIn).toContain("Using Vercel team Other Team (other-team).");
+    expect(signedIn).toContain("using vercel team Other Team (other-team).");
     expect(gateway.requests[gateway.requests.length - 1]!.headers.get("x-vercel-ai-gateway-team")).toBe("team_456");
     expect(readFileSync(stderrPath, "utf8")).toBe("");
   },
@@ -2570,9 +2570,9 @@ tmuxTest(
     });
     await session.waitForComposer(TIMEOUT);
     await session.sendText("Answer after I sign in again.");
-    await session.waitForText("Choose a team to finish setup", TIMEOUT);
+    await session.waitForText("choose a team to finish setup", TIMEOUT);
     await session.sendKeys("Escape");
-    await session.waitForPane((pane) => !pane.includes("Vercel team · Search:"), TIMEOUT);
+    await session.waitForPane((pane) => !pane.includes("vercel team · search:"), TIMEOUT);
     // The new sign-in is saved with the team the person had.
     const authPath = join(home, ".fx", "auth.json");
     const deadline = Date.now() + TIMEOUT;
@@ -2616,10 +2616,10 @@ tmuxTest(
     });
     await session.waitForComposer(TIMEOUT);
     await session.sendText("Answer after I sign in to another account.");
-    await session.waitForText("Choose a team to finish setup", TIMEOUT);
+    await session.waitForText("choose a team to finish setup", TIMEOUT);
     await session.waitForText("› Vercel Labs", TIMEOUT);
     await session.sendKeys("Escape");
-    await session.waitForPane((pane) => !pane.includes("Vercel team · Search:"), TIMEOUT);
+    await session.waitForPane((pane) => !pane.includes("vercel team · search:"), TIMEOUT);
     const authPath = join(home, ".fx", "auth.json");
     const deadline = Date.now() + TIMEOUT;
     let saved = JSON.parse(readFileSync(authPath, "utf8"));
@@ -2661,7 +2661,7 @@ tmuxTest(
     session = await startFx(home, stderrPath, gateway, oauth.issuerUrl, undefined, {
       AI_GATEWAY_API_KEY: undefined,
     }, undefined, undefined, ["login"]);
-    await session.waitForText("Select a Vercel team for AI Gateway", TIMEOUT);
+    await session.waitForText("select a vercel team for AI gateway", TIMEOUT);
     const picker = await session.waitForPane((pane) => pane.includes("› 2. Other Team (other-team) (current)"), TIMEOUT);
     expect(picker).not.toContain("Vercel Labs (vercel-labs) (current)");
     await session.sendKeys("Enter");
@@ -2693,7 +2693,7 @@ for (const [label, savedTeam] of [
       session = await startFx(home, stderrPath, gateway, oauth.issuerUrl, undefined, {
         AI_GATEWAY_API_KEY: undefined,
       }, undefined, undefined, ["login"]);
-      await session.waitForText("Select a Vercel team for AI Gateway", TIMEOUT);
+      await session.waitForText("select a vercel team for AI gateway", TIMEOUT);
       const picker = await session.waitForPane((pane) => pane.includes("› 1. Vercel Labs (vercel-labs)"), TIMEOUT);
       expect(picker).not.toContain("(current)");
       await session.sendKeys("Enter");
@@ -2720,7 +2720,7 @@ tmuxTest(
     expect(askTrace).not.toContain("team_456");
 
     session = await startFxLogin(home, stderrPath);
-    await session.waitForText("Select a Vercel team for AI Gateway", TIMEOUT);
+    await session.waitForText("select a vercel team for AI gateway", TIMEOUT);
     const picker = await session.waitForPane((pane) => pane.includes("› 2. Other Team (other-team) (current)"), TIMEOUT);
     expect(picker).not.toContain("Vercel Labs (vercel-labs) (current)");
     await session.sendKeys("Enter");
@@ -2753,7 +2753,7 @@ tmuxTest(
     expect(trace).not.toContain("team_456");
 
     session = await startFxLogin(home, stderrPath);
-    await session.waitForText("Select a Vercel team for AI Gateway", TIMEOUT);
+    await session.waitForText("select a vercel team for AI gateway", TIMEOUT);
     const picker = await session.waitForPane((pane) => pane.includes("› 1. Vercel Labs (vercel-labs)"), TIMEOUT);
     expect(picker).not.toContain("(current)");
     await session.sendKeys("Enter");
@@ -2837,7 +2837,7 @@ for (const [label, contents, mode] of [
       chmodSync(keptTeamPath(home), mode);
 
       session = await startFxLogin(home, stderrPath, tracePath);
-      await session.waitForText("Select a Vercel team for AI Gateway", TIMEOUT);
+      await session.waitForText("select a vercel team for AI gateway", TIMEOUT);
       const picker = await session.waitForPane((pane) => pane.includes("› 1. Vercel Labs (vercel-labs)"), TIMEOUT);
       expect(picker).not.toContain("(current)");
       await session.sendKeys("Enter");
@@ -2920,7 +2920,7 @@ tmuxTest(
     session = await startFx(home, stderrPath, gateway, oauth.issuerUrl, undefined, {
       AI_GATEWAY_API_KEY: undefined,
     }, undefined, undefined, ["teams"]);
-    await session.waitForText("Select a Vercel team for AI Gateway", TIMEOUT);
+    await session.waitForText("select a vercel team for AI gateway", TIMEOUT);
     const picker = await session.waitForPane((pane) => pane.includes("› 1. Vercel Labs (vercel-labs)"), TIMEOUT);
     expect(picker).not.toContain("(current)");
     await session.sendKeys("Enter");
@@ -2945,7 +2945,7 @@ tmuxTest(
     writeFileSync(keptTeamPath(home), JSON.stringify({ team_id: "team_456", team_slug: "other-team" }), { mode: 0o600 });
 
     session = await startFxLogin(home, stderrPath);
-    await session.waitForText("Select a Vercel team for AI Gateway", TIMEOUT);
+    await session.waitForText("select a vercel team for AI gateway", TIMEOUT);
     const picker = await session.waitForPane((pane) => pane.includes("› 1. Vercel Labs (vercel-labs) (current)"), TIMEOUT);
     expect(picker).not.toContain("Other Team (other-team) (current)");
     await session.sendKeys("Enter");
@@ -2980,7 +2980,7 @@ tmuxTest(
     expect(askTrace).not.toContain("team_456");
 
     session = await startFxLogin(home, stderrPath);
-    await session.waitForText("Select a Vercel team for AI Gateway", TIMEOUT);
+    await session.waitForText("select a vercel team for AI gateway", TIMEOUT);
     const picker = await session.waitForPane((pane) => pane.includes("› 1. Vercel Labs (vercel-labs)"), TIMEOUT);
     expect(picker).not.toContain("(current)");
     expect(readFileSync(stderrPath, "utf8")).toBe("");
@@ -3024,7 +3024,7 @@ tmuxTest(
     writeFileSync(keptTeamPath(home), JSON.stringify({ team_slug: "other-team" }), { mode: 0o600 });
 
     session = await startFxLogin(home, stderrPath);
-    await session.waitForText("Select a Vercel team for AI Gateway", TIMEOUT);
+    await session.waitForText("select a vercel team for AI gateway", TIMEOUT);
     await session.waitForPane((pane) => pane.includes("› 2. Other Team (other-team) (current)"), TIMEOUT);
     await session.sendKeys("Enter");
     const saved = await waitForSavedLogin(join(home, ".fx", "auth.json"));
@@ -3062,10 +3062,10 @@ tmuxTest(
     // fx opens the sign-in on its own; the fake approves the device code at
     // once, so the team choice comes next.
     const waiting = await session.waitForPane(
-      (pane) => pane.includes("Choose a team to finish setup"),
+      (pane) => pane.includes("choose a team to finish setup"),
       TIMEOUT,
     );
-    expect(waiting).toContain("Sign-in expired · waiting");
+    expect(waiting).toContain("sign-in expired · waiting");
     expect(gateway.requests).toHaveLength(1);
     // The team list shows while the request waits.
     await session.waitForText("› Vercel Labs", TIMEOUT);
@@ -3073,13 +3073,13 @@ tmuxTest(
     await session.waitForText("SIGNED_IN_RECOVERY_RESPONSE", TIMEOUT);
     // The login was already on this team, so nothing changed.
     const signedIn = await session.captureFullScrollback();
-    expect(signedIn).toContain("Using Vercel team Vercel Labs (vercel-labs).");
-    expect(signedIn).not.toContain("auth: Using Vercel team");
+    expect(signedIn).toContain("using vercel team Vercel Labs (vercel-labs).");
+    expect(signedIn).not.toContain("auth: using vercel team");
     expect(signedIn).toContain("Get $150 of tokens for $30 with Vercel Token Pass.");
     // The link sits behind the name, so the address never shows.
     expect(signedIn).not.toContain("vercel.com/get/token-pass");
     expect(signedIn).not.toContain("Preparing Vercel AI Gateway");
-    expect(signedIn).not.toContain("Changed Vercel team");
+    expect(signedIn).not.toContain("changed vercel team");
 
     expect(gateway.requests).toHaveLength(2);
     expect(gateway.requests[0]?.headers.get("authorization")).toBe(`Bearer ${LOGIN_TOKEN}`);
@@ -3119,10 +3119,10 @@ tmuxTest(
     await session.waitForComposer(TIMEOUT);
     await session.sendText("Answer once the gateway takes my login.");
     const waiting = await session.waitForPane(
-      (pane) => pane.includes("Gateway refused the login"),
+      (pane) => pane.includes("gateway refused the login"),
       TIMEOUT,
     );
-    expect(waiting).not.toContain("Sign-in expired");
+    expect(waiting).not.toContain("sign-in expired");
     await session.waitForText("REFUSED_LOGIN_RECOVERY_RESPONSE", TIMEOUT);
 
     // The gateway's own reason was on screen, without the token it named.
@@ -3130,7 +3130,7 @@ tmuxTest(
     expect(transcript).toContain("GATEWAY_REFUSED_FOR_TEST");
     expect(transcript).not.toContain(LOGIN_TOKEN);
     expect(transcript).not.toContain(ACQUIRED_LOGIN_TOKEN);
-    expect(transcript).not.toContain("Sign in with Vercel");
+    expect(transcript).not.toContain("sign in with vercel");
     expect(gateway.requests).toHaveLength(3);
     expect(gateway.requests[0]?.headers.get("authorization")).toBe(`Bearer ${LOGIN_TOKEN}`);
     expect(gateway.requests[1]?.headers.get("authorization")).toBe(`Bearer ${ACQUIRED_LOGIN_TOKEN}`);
@@ -3183,11 +3183,11 @@ tmuxTest(
     });
     await session.waitForComposer(TIMEOUT);
     await session.sendText("Answer after the code expires.");
-    await session.waitForText("Press Enter to retry with your current login", TIMEOUT);
+    await session.waitForText("press enter to retry with your current login", TIMEOUT);
     // fx tried the current login once by itself, and that refusal did not
     // open a second sign-in.
     await session.waitForPane(
-      (pane) => gateway!.requests.length === 2 && pane.includes("Sign-in expired · waiting"),
+      (pane) => gateway!.requests.length === 2 && pane.includes("sign-in expired · waiting"),
       TIMEOUT,
     );
     expect(oauth.requests.filter((request) => request.path === "/oauth/device")).toHaveLength(1);
@@ -3229,14 +3229,14 @@ tmuxTest(
     });
     await session.waitForComposer(TIMEOUT);
     await session.sendText("Answer after the gateway recovers.");
-    await session.waitForText("Press Enter to retry with your current login", TIMEOUT);
+    await session.waitForText("press enter to retry with your current login", TIMEOUT);
     await session.waitForPane((pane) => gateway!.requests.length === 2, TIMEOUT);
     // A retry after the 503 would come within a few seconds. The request
     // keeps waiting for the sign-in instead, and opens no second one.
     await Bun.sleep(5_000);
     expect(gateway.requests).toHaveLength(2);
     const pane = await session.capturePane();
-    expect(pane).toContain("Sign-in expired · waiting");
+    expect(pane).toContain("sign-in expired · waiting");
     expect(oauth.requests.filter((request) => request.path === "/oauth/device")).toHaveLength(1);
 
     await session.sendKeys("Enter");
@@ -3350,7 +3350,7 @@ tmuxTest(
     });
     await session.waitForComposer(TIMEOUT);
     await session.sendText("Answer on the team I pick.");
-    await session.waitForText("Choose a team to finish setup", TIMEOUT);
+    await session.waitForText("choose a team to finish setup", TIMEOUT);
     await session.waitForText("› Vercel Labs", TIMEOUT);
     // The sign-in saved its login before the team choice. While the choice
     // takes its time, the request waits for it and is not sent on the old
@@ -3361,7 +3361,7 @@ tmuxTest(
     await session.sendLiteral("other");
     await session.waitForText("› Other Team", TIMEOUT);
     await session.sendKeys("Enter");
-    await session.waitForText("Changed Vercel team to Other Team (other-team).", TIMEOUT);
+    await session.waitForText("changed vercel team to Other Team (other-team).", TIMEOUT);
     await session.waitForText("TEAM_CHANGE_RESPONSE", TIMEOUT);
     // The waiting request was sent again only with the team just picked.
     expect(gateway.requests.map((request) => request.headers.get("x-vercel-ai-gateway-team"))).toEqual(["team_123", "team_456"]);
@@ -3390,7 +3390,7 @@ tmuxTest(
     });
     await session.waitForComposer(TIMEOUT);
     await session.sendText("Answer with the team fx has.");
-    await session.waitForPane((pane) => pane.includes("Gateway refused the login"), TIMEOUT);
+    await session.waitForPane((pane) => pane.includes("gateway refused the login"), TIMEOUT);
     const refused = await session.captureFullScrollback();
     expect(refused).toContain("not allowed for this team");
     expect(refused).toContain("Vercel team example-internal-team");
@@ -3425,7 +3425,7 @@ tmuxTest(
     });
     await session.waitForComposer(TIMEOUT);
     await session.sendText("Answer with the team fx has.");
-    await session.waitForPane((pane) => pane.includes("Gateway refused the login"), TIMEOUT);
+    await session.waitForPane((pane) => pane.includes("gateway refused the login"), TIMEOUT);
     await session.waitForText("for the Vercel team team_123.", TIMEOUT);
     const refused = await session.captureFullScrollback();
     expect(refused).not.toContain("SLUG_TITLE");
@@ -3457,7 +3457,7 @@ tmuxTest(
     });
     await session.waitForComposer(TIMEOUT);
     await session.sendText("Stop while the gateway refuses my login.");
-    await session.waitForPane((pane) => pane.includes("Gateway refused the login"), TIMEOUT);
+    await session.waitForPane((pane) => pane.includes("gateway refused the login"), TIMEOUT);
     // Esc twice within a second interrupts a turn, as during any recovery
     // wait. Both presses go out without a screen capture between them, so a
     // slow capture on a loaded machine cannot push the second past that
@@ -3465,7 +3465,7 @@ tmuxTest(
     await session.sendKeys("Escape");
     await Bun.sleep(200);
     await session.sendKeys("Escape");
-    await session.waitForPane((pane) => !pane.includes("Gateway refused the login"), TIMEOUT);
+    await session.waitForPane((pane) => !pane.includes("gateway refused the login"), TIMEOUT);
     await session.waitForComposer(TIMEOUT);
     const sent = gateway.requests.length;
     // Longer than the wait the request was in, so a resend would have come.
@@ -3499,11 +3499,11 @@ tmuxTest(
     await session.sendKeys("Enter");
     await session.waitForPane((pane) => pane.includes("oauth") && pane.includes("api-key"), TIMEOUT);
     await session.sendKeys("Enter");
-    await session.waitForText("The Vercel sign-in code expired", TIMEOUT);
+    await session.waitForText("the vercel sign-in code expired", TIMEOUT);
     const transcript = await session.captureFullScrollback();
     // The notice wraps at the pane's width.
-    expect(transcript.replace(/\s+/g, " ")).toContain("The current credential is unchanged; run /login to try again.");
-    expect(transcript).not.toContain("Press Enter to retry with your current login");
+    expect(transcript.replace(/\s+/g, " ")).toContain("the current credential is unchanged; run /login to try again.");
+    expect(transcript).not.toContain("press enter to retry with your current login");
     expect(gateway.requests).toHaveLength(0);
     expect(readFileSync(stderrPath, "utf8")).toBe("");
   },
@@ -3538,13 +3538,13 @@ tmuxTest(
     });
     await session.waitForComposer(TIMEOUT);
     await session.sendText("Answer after I sign in on the same team.");
-    await session.waitForText("Choose a team to finish setup", TIMEOUT);
+    await session.waitForText("choose a team to finish setup", TIMEOUT);
     await session.waitForText("› Vercel Labs", TIMEOUT);
     await session.sendKeys("Enter");
     await session.waitForText("SLUG_TEAM_RECOVERY_RESPONSE", TIMEOUT);
     const signedIn = await session.captureFullScrollback();
-    expect(signedIn).toContain("Using Vercel team Vercel Labs (vercel-labs).");
-    expect(signedIn).not.toContain("Changed Vercel team");
+    expect(signedIn).toContain("using vercel team Vercel Labs (vercel-labs).");
+    expect(signedIn).not.toContain("changed vercel team");
     expect(readFileSync(stderrPath, "utf8")).toBe("");
   },
   60_000,
@@ -3580,7 +3580,7 @@ tmuxTest(
         if (Date.now() >= refreshDueAt) throw new Error("the first turn did not start before the refresh came due");
         await Bun.sleep(25);
       }
-      await session.waitForPane((pane) => pane.includes("Thinking"), TIMEOUT);
+      await session.waitForPane((pane) => pane.includes("thinking"), TIMEOUT);
       await Bun.sleep(Math.max(0, refreshDueAt - Date.now()) + 250);
 
       const queued = "QUEUED_WHILE_REFRESH_DUE";
@@ -3638,13 +3638,13 @@ for (const provider of ["codex", "grok"] as const) {
         await session.sendText(`Answer after I sign in to ${label} again.`);
         // fx opens the subscription's own sign-in while the request waits.
         const waiting = await session.waitForPane(
-          (pane) => pane.includes(`Authorize with ${label}`),
+          (pane) => pane.includes(`authorize with ${label}`),
           TIMEOUT,
         );
-        expect(waiting).toContain("Sign-in expired · waiting");
+        expect(waiting).toContain("sign-in expired · waiting");
         await completeDisplayedSubscriptionLogin(
           session,
-          `Authorize with ${label}`,
+          `authorize with ${label}`,
           provider === "codex" ? `${chatgptOauth.baseUrl}/oauth/authorize?` : `${grok.baseUrl}/oauth2/authorize?`,
         );
         await session.waitForText(provider === "codex" ? "CHATGPT_DIRECT_RESPONSE" : "GROK_DIRECT_RESPONSE", TIMEOUT);
@@ -3694,13 +3694,13 @@ tmuxTest(
     await session.waitForComposer(TIMEOUT);
     await session.sendText("Stop while I would sign in.");
     await session.waitForPane(
-      (pane) => pane.includes("Sign in with Vercel") && pane.includes("TEST-CODE") &&
-        pane.includes("Sign-in expired · waiting"),
+      (pane) => pane.includes("sign in with vercel") && pane.includes("TEST-CODE") &&
+        pane.includes("sign-in expired · waiting"),
       TIMEOUT,
     );
     await session.sendKeys("Escape");
     await session.waitForPane(
-      (pane) => !pane.includes("Sign in with Vercel") && !pane.includes("Sign-in expired"),
+      (pane) => !pane.includes("sign in with vercel") && !pane.includes("sign-in expired"),
       TIMEOUT,
     );
     await session.waitForComposer(TIMEOUT);
@@ -3735,13 +3735,13 @@ tmuxTest(
     );
     await session.sendKeys("Enter");
     const preparing = await session.waitForPane(
-      (pane) => pane.includes("Sign in with Vercel") && pane.includes("Preparing sign-in"),
+      (pane) => pane.includes("sign in with vercel") && pane.includes("preparing sign-in"),
       2_000,
     );
-    expect(preparing).not.toContain("Authorize with Vercel");
+    expect(preparing).not.toContain("authorize with vercel");
 
     await session.sendKeys("Escape");
-    await session.waitForPane((pane) => !pane.includes("Preparing sign-in"), 1_000);
+    await session.waitForPane((pane) => !pane.includes("preparing sign-in"), 1_000);
     // Past the discovery delay, a sign-in that kept going would have asked
     // for a device code.
     await Bun.sleep(5_500);
@@ -3779,16 +3779,16 @@ tmuxTest(
     await session.sendKeys("Enter");
     const signInScreen = await session.waitForPane(
       (pane) =>
-        pane.includes("Sign in with Vercel") &&
+        pane.includes("sign in with vercel") &&
         pane.includes("TEST-CODE") &&
-        pane.includes("Authorize with Vercel") &&
-        pane.includes("Waiting for authorization") &&
+        pane.includes("authorize with vercel") &&
+        pane.includes("waiting for authorization") &&
         pane.includes("enter reopens browser · esc cancels"),
       TIMEOUT,
     );
     expect(signInScreen).not.toContain("Starting Vercel sign-in");
     // The device page is a link, not its address printed out.
-    expect(signInScreen).toMatch(/^   Open\s+Authorize with Vercel$/m);
+    expect(signInScreen).toMatch(/^   open\s+authorize with vercel$/m);
     expect(signInScreen).not.toContain("/verify");
 
     await session.sendKeys("C-c");
@@ -3796,7 +3796,7 @@ tmuxTest(
 
     expect(session.isAlive()).toBe(true);
     expect(existsSync(join(home, ".fx", "auth.json"))).toBe(false);
-    expect(await session.captureFullScrollback()).not.toContain("Signed in to Vercel.");
+    expect(await session.captureFullScrollback()).not.toContain("signed in to vercel.");
     expect(readFileSync(stderrPath, "utf8")).toBe("");
   },
   60_000,
@@ -3829,14 +3829,14 @@ tmuxTest(
     await session.sendKeys("Enter");
     const signInScreen = await session.waitForPane(
       (pane) =>
-        pane.includes("Sign in with Codex") &&
-        pane.includes("Authorize with Codex") &&
-        pane.includes("Waiting for authorization") &&
+        pane.includes("sign in with codex") &&
+        pane.includes("authorize with codex") &&
+        pane.includes("waiting for authorization") &&
         pane.includes("enter reopens browser · esc cancels"),
       TIMEOUT,
     );
-    expect(signInScreen).toMatch(/^Sign in with Codex\s+Waiting for authorization…$/m);
-    expect(signInScreen).toMatch(/^  Open\s+Authorize with Codex$/m);
+    expect(signInScreen).toMatch(/^sign in with codex\s+waiting for authorization…$/m);
+    expect(signInScreen).toMatch(/^  open\s+authorize with codex$/m);
     expect(signInScreen).toMatch(/^enter reopens browser · esc cancels$/m);
     expect(signInScreen).not.toContain("Code   ");
     expect(signInScreen).not.toContain(`${chatgptOauth.baseUrl}/oauth/authorize?`);
@@ -3848,7 +3848,7 @@ tmuxTest(
 
     expect(session.isAlive()).toBe(true);
     expect(existsSync(join(home, ".fx", "chatgpt-auth.json"))).toBe(false);
-    expect(await session.captureFullScrollback()).not.toContain("Signed in with Codex.");
+    expect(await session.captureFullScrollback()).not.toContain("signed in with codex.");
     expect(readFileSync(stderrPath, "utf8")).toBe("");
   },
   60_000,
@@ -4019,7 +4019,7 @@ tmuxTest(
     await openProviderPicker(session);
     await session.sendKeys("Down");
     await session.sendKeys("Enter");
-    await session.waitForText("Switched to Codex subscription", TIMEOUT);
+    await session.waitForText("switched to codex subscription", TIMEOUT);
 
     await session.sendText("Use the selected subscription for the first prompt.");
     await session.waitForText("CHATGPT_DIRECT_RESPONSE", 10_000);
@@ -4064,15 +4064,15 @@ tmuxTest(
     await openProviderPicker(session);
     await session.sendKeys("Down");
     await session.sendKeys("Enter");
-    await session.waitForText("Sign in with Codex", TIMEOUT);
+    await session.waitForText("sign in with codex", TIMEOUT);
     await completeDisplayedCodexLogin(session, chatgptOauth);
-    await session.waitForText("Switched to Codex subscription with gpt-5.6-sol.", TIMEOUT);
+    await session.waitForText("switched to codex subscription with gpt-5.6-sol.", TIMEOUT);
 
     const authPath = join(home, ".fx", "chatgpt-auth.json");
     expect(existsSync(authPath)).toBe(true);
     expect(statSync(authPath).mode & 0o077).toBe(0);
 
-    await readStatusPanel(session, TIMEOUT, (panel) => panel.fields.Provider === "Codex subscription");
+    await readStatusPanel(session, TIMEOUT, (panel) => panel.fields.Provider === "codex subscription");
     await session.sendLiteralText("/model");
     await session.sendKeys("Tab");
     const picker = await session.waitForPane(
@@ -4130,7 +4130,7 @@ tmuxTest(
           .some((line) => line.includes("openai/gpt-5.6-sol")),
       TIMEOUT,
     );
-    expect(codexCatalog).toContain("< All >");
+    expect(codexCatalog).toContain("< all >");
     for (const vendor of ["Anthropic", "OpenAI", "xAI", "Z.AI", "Others"]) {
       expect(codexCatalog).not.toContain(vendor);
     }
@@ -4164,7 +4164,7 @@ tmuxTest(
     await session.waitForComposer(TIMEOUT);
     await readStatusPanel(session, TIMEOUT, (panel) => panel.fields.Model === "gpt-5.6-sol");
     await selectEnvKeyCredential(session);
-    await session.waitForText("Switched to Vercel AI Gateway", TIMEOUT);
+    await session.waitForText("switched to vercel AI gateway", TIMEOUT);
     const savedGateway = JSON.parse(readFileSync(settingsPath, "utf8"));
     expect(savedGateway.provider).toBe("gateway");
     expect(savedGateway.models.gateway).toBe(gatewayModelBefore);
@@ -4172,7 +4172,7 @@ tmuxTest(
     await openProviderPicker(session);
     await session.sendKeys("Down");
     await session.sendKeys("Enter");
-    await session.waitForText("Switched to Codex subscription", TIMEOUT);
+    await session.waitForText("switched to codex subscription", TIMEOUT);
     const restoredCodex = JSON.parse(readFileSync(settingsPath, "utf8"));
     expect(restoredCodex.provider).toBe("codex");
     expect(restoredCodex.models.gateway).toBe(gatewayModelBefore);
@@ -4180,7 +4180,7 @@ tmuxTest(
     expect(chatgptOauth.requests.filter((request) => request.path === "/oauth/authorize"))
       .toHaveLength(authorizeRequestsBeforeRoundTrip);
     await session.sendText("/logout codex");
-    await session.waitForText("Signed out of Codex.", TIMEOUT);
+    await session.waitForText("signed out of codex.", TIMEOUT);
     expect(existsSync(authPath)).toBe(false);
     await readStatusPanel(session, TIMEOUT, (panel) => panel.fields.Model === gatewayModelBefore);
     expect(JSON.parse(readFileSync(settingsPath, "utf8")).provider).toBe("gateway");
@@ -4191,9 +4191,9 @@ tmuxTest(
     await openProviderPicker(session);
     await session.sendKeys("Down");
     await session.sendKeys("Enter");
-    await session.waitForText("Sign in with Codex", TIMEOUT);
+    await session.waitForText("sign in with codex", TIMEOUT);
     await completeDisplayedCodexLogin(session, chatgptOauth);
-    await session.waitForText("Switched to Codex subscription with gpt-5.4-mini.", TIMEOUT);
+    await session.waitForText("switched to codex subscription with gpt-5.4-mini.", TIMEOUT);
     const reauthenticated = JSON.parse(readFileSync(settingsPath, "utf8"));
     expect(reauthenticated.provider).toBe("codex");
     expect(reauthenticated.models.codex).toBe("gpt-5.4-mini");
@@ -4233,12 +4233,12 @@ tmuxTest(
     await session.sendKeys("Down");
     await session.sendKeys("Enter");
     await completeDisplayedCodexLogin(session, chatgptOauth);
-    await session.waitForText("Switched to Codex subscription with gpt-5.6-sol.", TIMEOUT);
+    await session.waitForText("switched to codex subscription with gpt-5.6-sol.", TIMEOUT);
 
     const selected = JSON.parse(readFileSync(join(home, ".fx", "settings.json"), "utf8"));
     expect(selected.provider).toBe("codex");
     expect(selected.models.codex).toBe("gpt-5.6-sol");
-    await readStatusPanel(session, TIMEOUT, (panel) => panel.fields.Provider === "Codex subscription");
+    await readStatusPanel(session, TIMEOUT, (panel) => panel.fields.Provider === "codex subscription");
     expect(readFileSync(stderrPath, "utf8")).toBe("");
   },
   60_000,
@@ -4276,14 +4276,14 @@ tmuxTest(
     const cancelStarted = Date.now();
     await session.sendKeys("C-c");
     const cancelledPane = await session.waitForText(
-      "What can fx do differently?",
+      "what can fx do differently?",
       TIMEOUT,
     );
     await session.waitForComposer(TIMEOUT);
     expect(Date.now() - cancelStarted).toBeLessThan(500);
-    expect(cancelledPane).toContain("▪ Cancelled");
+    expect(cancelledPane).toContain("▪ cancelled");
     expect(cancelledPane).not.toContain("system: cancelled");
-    expect(cancelledPane).not.toContain("Cancelling");
+    expect(cancelledPane).not.toContain("cancelling");
     expect(session.isAlive()).toBe(true);
     expect(readFileSync(stderrPath, "utf8")).toBe("");
   },
@@ -4317,7 +4317,7 @@ tmuxTest(
     await session.sendText("retire the rejected Codex login");
     await session.waitForPane(
       (pane) =>
-        pane.includes("Codex subscription sign-in expired.") &&
+        pane.includes("codex subscription sign-in expired.") &&
         pane.includes("press enter to sign in again."),
       TIMEOUT,
     );
@@ -4361,7 +4361,7 @@ tmuxTest(
       await session.sendText("retire the rejected Grok login");
       await session.waitForPane(
         (pane) =>
-          pane.includes("Grok subscription sign-in expired.") &&
+          pane.includes("grok subscription sign-in expired.") &&
           pane.includes("press enter to sign in again."),
         TIMEOUT,
       );
@@ -4478,7 +4478,7 @@ tmuxTest(
       TIMEOUT,
     );
     expect(root).toContain("vercel · current");
-    expect(root).not.toContain("Connections");
+    expect(root).not.toContain("connections");
 
     // Right acts as Enter on the highlighted row: into the method column.
     await session.sendKeys("Right");
@@ -4511,7 +4511,7 @@ tmuxTest(
 
     await session.sendKeys("Down");
     await session.sendKeys("Right");
-    const keyField = await session.waitForText("Paste or type a key", TIMEOUT);
+    const keyField = await session.waitForText("paste or type a key", TIMEOUT);
     expect(keyField).toContain("enter saves");
     await session.sendKeys("Escape");
     await session.waitForComposer(TIMEOUT);
@@ -4543,16 +4543,16 @@ tmuxTest(
       AI_GATEWAY_API_KEY: undefined,
       FX_TEST_SKIP_ONBOARDING: "0",
     });
-    await session.waitForText("Welcome to fx", TIMEOUT);
+    await session.waitForText("welcome to fx", TIMEOUT);
     await session.sendKeys("Enter");
-    await session.waitForText("Vercel team · Search:", TIMEOUT);
+    await session.waitForText("vercel team · search:", TIMEOUT);
     await session.sendKeys("Escape");
     const setup = await session.waitForPane(
       (pane) => pane.includes("Setup") && /Connections\s+connected/.test(pane),
       TIMEOUT,
     );
-    expect(setup).toMatch(/^› Vercel team\s+choose a team$/m);
-    expect(setup).not.toContain("Welcome to fx");
+    expect(setup).toMatch(/^› vercel team\s+choose a team$/m);
+    expect(setup).not.toContain("welcome to fx");
     expect(setup).not.toContain("sign in to manage");
     expect(readFileSync(stderrPath, "utf8")).toBe("");
   },
@@ -4560,9 +4560,9 @@ tmuxTest(
 );
 
 for (const [provider, help] of [
-  ["gateway", "fx needs access to Vercel AI Gateway."],
-  ["codex", "Codex needs a subscription login."],
-  ["grok", "Grok needs a subscription login."],
+  ["gateway", "fx needs access to vercel AI gateway."],
+  ["codex", "codex needs a subscription login."],
+  ["grok", "grok needs a subscription login."],
 ] as const) {
   tmuxTest(`/status keeps ${provider} authentication requirements without credentials`, async () => {
     home = mkdtempSync(join(tmpdir(), "fx-tui-status-provider-"));
@@ -4597,7 +4597,7 @@ for (const [provider, help] of [
 
 for (const [source, help] of [
   ["vercel_oidc_token", "VERCEL_OIDC_TOKEN is selected but unavailable."],
-  ["stored_key", "A stored API key is selected but unavailable."],
+  ["stored_key", "a stored API key is selected but unavailable."],
 ] as const) {
   tmuxTest(`/status retains ${source} until another credential is selected`, async () => {
     home = mkdtempSync(join(tmpdir(), "fx-status-explicit-key-"));
@@ -4648,7 +4648,7 @@ tmuxTest("/status preserves a missing selected login through explicit key recove
   expect(await session.captureFullScrollbackEscapes()).toContain("fx login is selected but unavailable.");
   await closeStatusPanel(session, TIMEOUT);
   expect(missing.fields["Auth help"]).toStartWith("fx login is selected but unavailable.");
-  expect(missing.fields["Auth help"]).toContain("Run /login to reconnect");
+  expect(missing.fields["Auth help"]).toContain("run /login to reconnect");
   expect(missing.fields["Auth help"]).not.toContain("or set AI_GATEWAY_API_KEY");
   expect(gateway.requests).toHaveLength(0);
   expect(readFileSync(settingsPath, "utf8")).toBe(settings);
@@ -4695,9 +4695,9 @@ for (const provider of ["codex", "grok"] as const) {
     });
     await session.waitForComposer(TIMEOUT);
     await session.sendText("/logout vercel");
-    await session.waitForText("No fx login session found.", TIMEOUT);
+    await session.waitForText("no fx login session found.", TIMEOUT);
     const unavailable = await readStatusPanel(session, TIMEOUT, (panel) => panel.fields["Auth help"] !== undefined);
-    expect(unavailable.fields["Auth help"]).toContain("Saved credential storage is unavailable");
+    expect(unavailable.fields["Auth help"]).toContain("saved credential storage is unavailable");
     expect(existsSync(credentialPath)).toBe(true);
     expect(readFileSync(settingsPath, "utf8")).toBe(settings);
     expect(gateway.requests).toHaveLength(0);
@@ -4780,7 +4780,7 @@ async function enterSwitchCredential(pickerSession: TmuxSession): Promise<void> 
   await pickerSession.sendKeys("Up");
   await pickerSession.sendKeys("Enter");
   await pickerSession.waitForPane(
-    (pane) => pane.includes("Credential source") && pane.includes("Automatic"),
+    (pane) => pane.includes("credential source") && pane.includes("automatic"),
     TIMEOUT,
   );
 }
@@ -4825,7 +4825,7 @@ async function selectFxLoginCredential(pickerSession: TmuxSession): Promise<void
   );
   if (!outcome.includes("Switched credential to fx login")) {
     await pickerSession.sendKeys("Enter");
-    await pickerSession.waitForText("Changed Vercel team", TIMEOUT);
+    await pickerSession.waitForText("changed vercel team", TIMEOUT);
   }
 }
 
@@ -4873,7 +4873,7 @@ profileStoredKeyTmuxTest(
     // after "vercel" opens the methods, the space after "api-key" opens the
     // which-key column, and Enter on "new" opens the masked field.
     await session.sendText("/provider vercel api-key new");
-    await session.waitForText("Paste or type a key", TIMEOUT);
+    await session.waitForText("paste or type a key", TIMEOUT);
     await session.sendLiteralText(STORED_TOKEN);
     await session.sendKeys("Enter");
     await session.waitForText("Saved the API key to profile file and made it active", TIMEOUT);
@@ -4943,10 +4943,10 @@ tmuxTest(
       TIMEOUT,
     );
     await session.sendKeys("Enter");
-    await session.waitForText("Signed in to Vercel", TIMEOUT);
-    await session.waitForText("Vercel team · Search:", TIMEOUT);
+    await session.waitForText("signed in to vercel", TIMEOUT);
+    await session.waitForText("vercel team · search:", TIMEOUT);
     await session.sendKeys("Enter");
-    await session.waitForText("Changed Vercel team to Vercel Labs", TIMEOUT);
+    await session.waitForText("changed vercel team to Vercel Labs", TIMEOUT);
     await readStatusPanel(session, TIMEOUT, (panel) => panelAuth(panel) === "fx login");
     expect(savedCredentialSource(home)).toBe("fx_login");
     await session.sendText("use the direct login credential");
@@ -5013,7 +5013,7 @@ tmuxTest(
     await session.sendKeys("Enter");
     await session.waitForText("vercel-labs", TIMEOUT);
     await session.sendKeys("Enter");
-    await session.waitForText("Changed Vercel team to Vercel Labs", TIMEOUT);
+    await session.waitForText("changed vercel team to Vercel Labs", TIMEOUT);
     await readStatusPanel(session, TIMEOUT, (panel) => panelAuth(panel) === "fx login");
     expect(savedCredentialSource(home)).toBe("fx_login");
 
@@ -5063,8 +5063,8 @@ tmuxTest(
 
     session = await startFx(home, stderrPath, gateway, oauth.issuerUrl);
     const initial = await session.waitForComposer(TIMEOUT);
-    expect(initial).not.toContain("Sign in with Vercel");
-    expect(initial).not.toContain("Switch credential");
+    expect(initial).not.toContain("sign in with vercel");
+    expect(initial).not.toContain("switch credential");
 
     await readStatusPanel(session, TIMEOUT, (panel) => panelAuth(panel) === "AI_GATEWAY_API_KEY");
     await session.sendText("use normal startup precedence");
@@ -5104,7 +5104,7 @@ tmuxTest(
     // Acquiring a fresh login needs a signed-out state first; the remembered
     // seeded login would otherwise resolve straight into the team column.
     await session.sendText("/logout");
-    await session.waitForText("Signed out of fx.", TIMEOUT);
+    await session.waitForText("signed out of fx.", TIMEOUT);
     const oauthBase = oauth.requests.length;
     await session.sendText("/login");
     await session.waitForPane(
@@ -5117,11 +5117,11 @@ tmuxTest(
       TIMEOUT,
     );
     await session.sendKeys("Enter");
-    const loginCompleted = await session.waitForText("Signed in to Vercel", TIMEOUT);
-    expect(loginCompleted).not.toContain("Connections");
-    expect(loginCompleted).toContain("Vercel team · Search:");
+    const loginCompleted = await session.waitForText("signed in to vercel", TIMEOUT);
+    expect(loginCompleted).not.toContain("connections");
+    expect(loginCompleted).toContain("vercel team · search:");
     await session.sendKeys("Enter");
-    await session.waitForText("Changed Vercel team to Vercel Labs", TIMEOUT);
+    await session.waitForText("changed vercel team to Vercel Labs", TIMEOUT);
     const acquisition = oauth.requests
       .slice(oauthBase)
       .map((request) => `${request.method} ${request.path}`);
@@ -5146,7 +5146,7 @@ tmuxTest(
     expect(acquiredAuth.refresh_token).toBe("acquired-refresh-token");
     expect(statSync(authPath).mode & 0o777).toBe(0o600);
     expect(
-      (await session.captureFullScrollback()).match(/Signed in to Vercel\./g) ?? [],
+      (await session.captureFullScrollback()).match(/signed in to vercel\./g) ?? [],
     ).toHaveLength(1);
 
     await readStatusPanel(session, TIMEOUT, (panel) => panelAuth(panel) === "fx login");
@@ -5157,7 +5157,7 @@ tmuxTest(
 
     const revokedBefore = completedRevocations(oauth).length;
     await session.sendText("/logout");
-    await session.waitForText("Signed out of fx.", TIMEOUT);
+    await session.waitForText("signed out of fx.", TIMEOUT);
     expect(existsSync(authPath)).toBe(false);
     // The issuer revocation runs after the local sign-out, off the input loop.
     await waitForRevocations(oauth, revokedBefore + 2);
@@ -5251,16 +5251,16 @@ tmuxTest(
       TIMEOUT,
     );
     await session.sendKeys("Enter");
-    await session.waitForText("Vercel team · Search:", TIMEOUT);
+    await session.waitForText("vercel team · search:", TIMEOUT);
     await session.sendKeys("Escape");
     const setupAfterSignIn = await session.waitForPane(
       (pane) => pane.includes("Setup") && /Connections\s+connected/.test(pane),
       TIMEOUT,
     );
-    expect(setupAfterSignIn).toMatch(/^› Vercel team\s+choose a team$/m);
+    expect(setupAfterSignIn).toMatch(/^› vercel team\s+choose a team$/m);
     expect(setupAfterSignIn).not.toContain("sign in to manage");
     await session.sendKeys("Enter");
-    await session.waitForText("Vercel team · Search:", TIMEOUT);
+    await session.waitForText("vercel team · search:", TIMEOUT);
     await session.resizeWindow(80, 5);
     await session.sendLiteralText("example");
     await session.waitForPane((pane) => pane.includes("Search: example"), TIMEOUT);
@@ -5277,7 +5277,7 @@ tmuxTest(
     await session.resizeWindow(80, 24);
     await session.waitForPane(
       (pane) =>
-        pane.includes("Vercel team · Search:") &&
+        pane.includes("vercel team · search:") &&
         pane.includes("Search: example") &&
         pane.includes("Example Internal Team") &&
         !pane.includes("Other Team"),
@@ -5290,7 +5290,7 @@ tmuxTest(
       teamPickerGrid[searchRow]!.indexOf("Search: example") + "Search: example".length;
     expect(session.cursorPosition()).toEqual({ row: searchRow, col: searchEnd });
     await session.sendKeys("Enter");
-    await session.waitForText("Changed Vercel team to Example Internal Team", TIMEOUT);
+    await session.waitForText("changed vercel team to Example Internal Team", TIMEOUT);
     await waitForModelRequestCount(gateway, 3);
 
     await session.sendText("/model");
@@ -5345,7 +5345,7 @@ tmuxTest(
     expect(gateway.modelRequests[1].headers.get("x-vercel-ai-gateway-team")).toBeNull();
 
     await session.sendText("/logout");
-    await session.waitForText("Signed out of fx.", TIMEOUT);
+    await session.waitForText("signed out of fx.", TIMEOUT);
     await waitForModelRequestCount(gateway, 3);
     expect(gateway.modelRequests).toHaveLength(3);
     expect(gateway.modelRequests[2].headers.get("authorization")).toBe(`Bearer ${ENV_TOKEN}`);
@@ -5390,7 +5390,7 @@ test(
     });
 
     expect(result.code, `stdout: ${result.stdout}\nstderr: ${result.stderr}`).toBe(0);
-    expect(result.stdout).toContain("Signed in to Vercel.");
+    expect(result.stdout).toContain("signed in to vercel.");
     expect(oauth.requests.map((request) => `${request.method} ${request.path}`)).toEqual([
       "GET /.well-known/openid-configuration",
       "POST /oauth/device",
@@ -5430,7 +5430,7 @@ test(
     );
     expect(gateway.modelRequests[0]!.headers.get("x-vercel-ai-gateway-team")).toBeNull();
     expect(new URL(gateway.modelRequests[0]!.url).searchParams.get("teamId")).toBe("team_123");
-    expect(result.stdout.match(/Code: TEST-CODE/g) ?? []).toHaveLength(1);
+    expect(result.stdout.match(/code: TEST-CODE/g) ?? []).toHaveLength(1);
     expect(result.stdout).not.toContain(oauth.providerDetail);
     expect(result.stderr).toBe("");
   },
@@ -5467,7 +5467,7 @@ test(
     });
 
     expect(result.code, `stdout: ${result.stdout}\nstderr: ${result.stderr}`).toBe(0);
-    expect(result.stdout).toContain("Selected Vercel team: Vercel Labs (vercel-labs).");
+    expect(result.stdout).toContain("selected vercel team: Vercel Labs (vercel-labs).");
     expect(savedCredentialSource(home)).toBe("fx_login");
     const persisted = JSON.parse(
       readFileSync(join(home, ".fx", "auth.json"), "utf8"),
@@ -5518,8 +5518,8 @@ test(
     });
 
     expect(result.code).toBe(1);
-    expect(result.stdout).not.toContain("Selected Vercel team");
-    expect(result.stderr).toContain("selected team could not access AI Gateway");
+    expect(result.stdout).not.toContain("selected vercel team");
+    expect(result.stderr).toContain("selected team could not access AI gateway");
     expect(savedCredentialSource(home)).toBeUndefined();
     const persisted = JSON.parse(
       readFileSync(join(home, ".fx", "auth.json"), "utf8"),
@@ -5555,7 +5555,7 @@ test("fx logout clears a remembered fx login source", async () => {
   });
 
   expect(result.code, `stdout: ${result.stdout}\nstderr: ${result.stderr}`).toBe(0);
-  expect(result.stdout).toContain("Signed out of fx.");
+  expect(result.stdout).toContain("signed out of fx.");
   expect(savedCredentialSource(home)).toBeUndefined();
   expect(existsSync(join(home, ".fx", "auth.json"))).toBe(false);
 });
@@ -5645,7 +5645,7 @@ test(
 
     const login = await runCodexLoginWithBrowser(env);
     expect(login.code, `stdout: ${login.stdout}\nstderr: ${login.stderr}`).toBe(0);
-    expect(login.stdout).toContain("Signed in with Codex.");
+    expect(login.stdout).toContain("signed in with codex.");
     expect(login.stdout).not.toContain("Code:");
     expect(login.stderr).toBe("");
 
@@ -5716,7 +5716,7 @@ test(
 
     const logout = await runFx(["logout", "codex"], { env, timeoutMs: TIMEOUT });
     expect(logout.code).toBe(0);
-    expect(logout.stdout).toContain("Signed out of Codex.");
+    expect(logout.stdout).toContain("signed out of codex.");
     expect(existsSync(authPath)).toBe(false);
   },
   60_000,
@@ -5780,7 +5780,7 @@ test("Codex without a model explains the fix and fx provider codex saves one", a
   writeSeededChatGptLogin(home);
   chatgptOauth = startFakeChatGptOAuth();
   const env = withoutSavedModelEnv(home, "codex", chatgptOauth.env);
-  const guidance = "no Codex model is selected; run `fx provider codex` to choose one, or set a model for this run with --model or FX_MODEL";
+  const guidance = "no codex model is selected; run `fx provider codex` to choose one, or set a model for this run with --model or FX_MODEL";
 
   const status = await runFx(["status"], { env, timeoutMs: TIMEOUT });
   expect(status.code).toBe(1);
@@ -5809,7 +5809,7 @@ test("Codex without a model explains the fix and fx provider codex saves one", a
 
   const again = await runFx(["provider", "codex"], { env, timeoutMs: TIMEOUT });
   expect(again.code).toBe(0);
-  expect(again.stdout).toContain("Codex is already selected.");
+  expect(again.stdout).toContain("codex is already selected.");
 });
 
 test("Grok runs from FX_MODEL or --model without a saved model and fx provider grok saves one", async () => {
@@ -5824,7 +5824,7 @@ test("Grok runs from FX_MODEL or --model without a saved model and fx provider g
 
     const missing = await runFx(["status"], { env, timeoutMs: TIMEOUT });
     expect(missing.code).toBe(1);
-    expect(missing.stderr).toBe("fx: no Grok model is selected; run `fx provider grok` to choose one, or set a model for this run with --model or FX_MODEL\n");
+    expect(missing.stderr).toBe("fx: no grok model is selected; run `fx provider grok` to choose one, or set a model for this run with --model or FX_MODEL\n");
 
     const status = await runFx(["status", "--json"], { env: { ...env, FX_MODEL: "grok-4.6" }, timeoutMs: TIMEOUT });
     expect(status.code, status.stderr).toBe(0);
@@ -5957,7 +5957,7 @@ test(
 
       const login = await runGrokLoginWithBrowser(env);
       expect(login.code, `stdout: ${login.stdout}\nstderr: ${login.stderr}`).toBe(0);
-      expect(login.stdout).toContain("Signed in with Grok.");
+      expect(login.stdout).toContain("signed in with grok.");
       expect(login.stderr).toBe("");
 
       const authPath = join(home, ".fx", "grok-auth.json");
@@ -6019,7 +6019,7 @@ test(
 
       const logout = await runFx(["logout", "grok"], { env, timeoutMs: TIMEOUT });
       expect(logout.code, `stdout: ${logout.stdout}\nstderr: ${logout.stderr}`).toBe(0);
-      expect(logout.stdout).toContain("Signed out of Grok.");
+      expect(logout.stdout).toContain("signed out of grok.");
       expect(grok.requests.some((request) => request.path === "/oauth2/revoke")).toBe(true);
       expect(existsSync(authPath)).toBe(false);
     } finally {
@@ -6050,7 +6050,7 @@ test(
       }, "grok-code");
 
       expect(result.code, `stdout: ${result.stdout}\nstderr: ${result.stderr}`).toBe(0);
-      expect(result.stdout).toContain("Signed in with Grok.");
+      expect(result.stdout).toContain("signed in with grok.");
       expect(result.stdout).not.toContain("grok-code");
       expect(result.stderr).toBe("");
       expect(grok.tokenCalls()).toBe(1);
@@ -6083,7 +6083,7 @@ test("Grok logout removes local credentials when remote revocation fails", async
       timeoutMs: TIMEOUT,
     });
     expect(result.code, `stdout: ${result.stdout}\nstderr: ${result.stderr}`).toBe(0);
-    expect(result.stdout).toContain("Signed out of Grok.");
+    expect(result.stdout).toContain("signed out of grok.");
     expect(result.stderr).toContain("remote revocation could not be confirmed");
     expect(existsSync(authPath)).toBe(false);
     expect(JSON.parse(readFileSync(join(home, ".fx", "settings.json"), "utf8")).provider)
@@ -6116,7 +6116,7 @@ test("Grok logout survives a revocation answer still arriving at its limit", asy
     });
     expect(result.stderr).not.toContain("panic");
     expect(result.code, `stdout: ${result.stdout}\nstderr: ${result.stderr}`).toBe(0);
-    expect(result.stdout).toContain("Signed out of Grok.");
+    expect(result.stdout).toContain("signed out of grok.");
     expect(result.stderr).toContain("remote revocation could not be confirmed");
     expect(existsSync(authPath)).toBe(false);
     expect(grok.requests.filter((request) => request.path === "/oauth2/revoke")).toHaveLength(1);
@@ -6145,7 +6145,7 @@ test("Grok logout removes malformed and unsafe local credentials", async () => {
         timeoutMs: TIMEOUT,
       });
       expect(result.code, result.stderr).toBe(0);
-      expect(result.stdout).toContain("Signed out of Grok.");
+      expect(result.stdout).toContain("signed out of grok.");
       expect(result.stderr).toContain("remote revocation could not be confirmed");
       expect(existsSync(authPath)).toBe(false);
       expect(grok.requests).toHaveLength(0);
@@ -6157,7 +6157,7 @@ test("Grok logout removes malformed and unsafe local credentials", async () => {
 });
 
 const CODEX_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann";
-const CODEX_REVOCATION_WARNING = "fx logout: local Codex session removed, but remote revocation could not be confirmed";
+const CODEX_REVOCATION_WARNING = "fx logout: local codex session removed, but remote revocation could not be confirmed";
 /** What a logout warning adds when fx kept the token to revoke it later. */
 const RETRY_LATER = "fx will try again later";
 const CODEX_PENDING_FILE = "chatgpt-revocations.json";
@@ -6217,7 +6217,7 @@ test("fx logout codex on a terminal says it waits for OpenAI", async () => {
       "logout codex",
       codexLogoutEnv(home, codex.env.FX_TEST_CHATGPT_REVOKE_URL),
       "revoking the Codex login at OpenAI (up to 15 s)...",
-      "Signed out of Codex.",
+      "signed out of codex.",
     );
     expect(codex.revocations()).toHaveLength(1);
   } finally {
@@ -6244,14 +6244,14 @@ test("fx logout codex on a terminal prints no wait line when it sends nothing", 
   try {
     const env = codexLogoutEnv(home, codex.env.FX_TEST_CHATGPT_REVOKE_URL);
     const missing = await paneAfterExit("logout codex", env);
-    expect(missing).toContain("No Codex login session found.");
-    expect(missing).not.toContain("revoking the Codex login");
+    expect(missing).toContain("no codex login session found.");
+    expect(missing).not.toContain("revoking the codex login");
 
     writeSeededChatGptLogin(home, codex.accessToken);
     writeFileSync(join(home, ".fx", "chatgpt-auth.json"), "{invalid-json");
     const unreadable = await paneAfterExit("logout codex", env);
-    expect(unreadable).toContain("Signed out of Codex.");
-    expect(unreadable).not.toContain("revoking the Codex login");
+    expect(unreadable).toContain("signed out of codex.");
+    expect(unreadable).not.toContain("revoking the codex login");
     expect(unreadable).toContain(CODEX_REVOCATION_WARNING);
     expect(codex.revocations()).toHaveLength(0);
   } finally {
@@ -6270,7 +6270,7 @@ test("fx logout codex on a terminal shows the wait line before a failed revocati
     for (const revokeUrl of [codex.env.FX_TEST_CHATGPT_REVOKE_URL, closedUrl]) {
       writeSeededChatGptLogin(home, codex.accessToken);
       const pane = await paneAfterExit("logout codex", codexLogoutEnv(home, revokeUrl));
-      expect(pane).toContain("Signed out of Codex.");
+      expect(pane).toContain("signed out of codex.");
       const wait = pane.indexOf("revoking the Codex login at OpenAI (up to 15 s)...");
       expect(wait, pane).toBeGreaterThanOrEqual(0);
       expect(wait).toBeLessThan(pane.indexOf(CODEX_REVOCATION_WARNING));
@@ -6295,7 +6295,7 @@ test("fx logout grok on a terminal says it waits for xAI", async () => {
         FX_TEST_GROK_REVOKE_URL: grok.env.FX_TEST_GROK_REVOKE_URL,
       },
       "revoking the Grok login at xAI (up to 15 s)...",
-      "Signed out of Grok.",
+      "signed out of grok.",
     );
     expect(grok.requests.filter((request) => request.path === "/oauth2/revoke")).toHaveLength(1);
   } finally {
@@ -6321,7 +6321,7 @@ test("fx logout on a terminal says it waits for the fx login's issuer", async ()
       FX_TEST_OAUTH_ISSUER_URL: oauth.issuerUrl,
     },
     "revoking the fx login at Vercel (up to 45 s)...",
-    "Signed out of fx.",
+    "signed out of fx.",
   );
 }, 60_000);
 
@@ -6336,7 +6336,7 @@ test("Codex logout revokes the saved login at OpenAI", async () => {
       timeoutMs: TIMEOUT,
     });
     expect(result.code, `stdout: ${result.stdout}\nstderr: ${result.stderr}`).toBe(0);
-    expect(result.stdout).toContain("Signed out of Codex.");
+    expect(result.stdout).toContain("signed out of codex.");
     expect(result.stderr).toBe("");
     expect(existsSync(authPath)).toBe(false);
     // OpenAI confirmed it, so nothing stays kept for a retry.
@@ -6364,7 +6364,7 @@ test("Codex logout keeps a sign-out OpenAI refuses and finishes it at the next l
       timeoutMs: TIMEOUT,
     });
     expect(first.code, `stdout: ${first.stdout}\nstderr: ${first.stderr}`).toBe(0);
-    expect(first.stdout).toContain("Signed out of Codex.");
+    expect(first.stdout).toContain("signed out of codex.");
     expect(first.stderr).toContain(`${CODEX_REVOCATION_WARNING}; ${RETRY_LATER}`);
     expect(first.stderr).not.toContain("chatgpt-refresh");
     expect(statSync(pendingPath).mode & 0o777).toBe(0o600);
@@ -6374,7 +6374,7 @@ test("Codex logout keeps a sign-out OpenAI refuses and finishes it at the next l
       timeoutMs: TIMEOUT,
     });
     expect(second.code, `stdout: ${second.stdout}\nstderr: ${second.stderr}`).toBe(0);
-    expect(second.stdout).toContain("No Codex login session found.");
+    expect(second.stdout).toContain("no codex login session found.");
     expect(second.stderr).toBe("");
     expect(working.revocations()).toEqual([{
       method: "POST",
@@ -6404,15 +6404,15 @@ test("Grok logout keeps a sign-out xAI refuses and finishes it at the next logou
     });
     const first = await runFx(["logout", "grok"], { env: env(refusing.env.FX_TEST_GROK_REVOKE_URL), timeoutMs: TIMEOUT });
     expect(first.code, `stdout: ${first.stdout}\nstderr: ${first.stderr}`).toBe(0);
-    expect(first.stdout).toContain("Signed out of Grok.");
+    expect(first.stdout).toContain("signed out of grok.");
     expect(first.stderr).toContain(
-      `fx logout: local Grok session removed, but remote revocation could not be confirmed; ${RETRY_LATER}`,
+      `fx logout: local grok session removed, but remote revocation could not be confirmed; ${RETRY_LATER}`,
     );
     expect(statSync(pendingPath).mode & 0o777).toBe(0o600);
 
     const second = await runFx(["logout", "grok"], { env: env(working.env.FX_TEST_GROK_REVOKE_URL), timeoutMs: TIMEOUT });
     expect(second.code, `stdout: ${second.stdout}\nstderr: ${second.stderr}`).toBe(0);
-    expect(second.stdout).toContain("No Grok login session found.");
+    expect(second.stdout).toContain("no grok login session found.");
     expect(second.stderr).toBe("");
     const revoked = working.requests.filter((request) => request.path === "/oauth2/revoke");
     expect(revoked.map((request) => new URLSearchParams(request.body ?? "").get("token"))).toEqual(["grok-refresh"]);
@@ -6450,8 +6450,8 @@ test("fx logout keeps a sign-out Vercel refuses and finishes it at the next logo
     };
     const first = await runFx(["logout"], { env, timeoutMs: TIMEOUT });
     expect(first.code, `stdout: ${first.stdout}\nstderr: ${first.stderr}`).toBe(0);
-    expect(first.stdout).toContain("Signed out of fx.");
-    expect(first.stderr).toContain(`Warning: signed out locally, but the remote session could not be revoked. ${RETRY_LATER}.`);
+    expect(first.stdout).toContain("signed out of fx.");
+    expect(first.stderr).toContain(`warning: signed out locally, but the remote session could not be revoked. ${RETRY_LATER}.`);
     expect(first.stderr).not.toContain("seeded-refresh-token");
     expect(statSync(pendingPath).mode & 0o777).toBe(0o600);
 
@@ -6459,7 +6459,7 @@ test("fx logout keeps a sign-out Vercel refuses and finishes it at the next logo
     forms.length = 0;
     const second = await runFx(["logout"], { env, timeoutMs: TIMEOUT });
     expect(second.code, `stdout: ${second.stdout}\nstderr: ${second.stderr}`).toBe(0);
-    expect(second.stdout).toContain("No fx login session found.");
+    expect(second.stdout).toContain("no fx login session found.");
     expect(second.stderr).toBe("");
     expect(forms.map((form) => `${form.token_type_hint}:${form.token}`).sort()).toEqual([
       `access_token:${LOGIN_TOKEN}`,
@@ -6491,7 +6491,7 @@ test("fx login codex revokes the Codex sign-outs that earlier logouts kept", asy
     ...chatgptOauth.env,
   });
   expect(login.code, `stdout: ${login.stdout}\nstderr: ${login.stderr}`).toBe(0);
-  expect(login.stdout).toContain("Signed in with Codex.");
+  expect(login.stdout).toContain("signed in with codex.");
   expect(login.stderr).toBe("");
   expect(chatgptOauth.revocations().map((revocation) => revocation.form.token)).toEqual(["earlier-codex-refresh"]);
   expect(existsSync(pending)).toBe(false);
@@ -6511,7 +6511,7 @@ test("a kept sign-out older than 30 days is dropped without a request", async ()
       timeoutMs: TIMEOUT,
     });
     expect(result.code, result.stderr).toBe(0);
-    expect(result.stdout).toContain("No Codex login session found.");
+    expect(result.stdout).toContain("no codex login session found.");
     expect(result.stderr).toBe("");
     expect(codex.requests).toHaveLength(0);
     expect(existsSync(pending)).toBe(false);
@@ -6532,7 +6532,7 @@ test("Codex logout promises no retry when it cannot keep the token", async () =>
       timeoutMs: TIMEOUT,
     });
     expect(result.code, result.stderr).toBe(0);
-    expect(result.stdout).toContain("Signed out of Codex.");
+    expect(result.stdout).toContain("signed out of codex.");
     expect(result.stderr).toContain(CODEX_REVOCATION_WARNING);
     expect(result.stderr).not.toContain(RETRY_LATER);
     expect(existsSync(join(home, ".fx", "chatgpt-auth.json"))).toBe(false);
@@ -6600,7 +6600,7 @@ for (const failure of ["is refused with 503", "can't connect", "gets no answer"]
         timeoutMs: 40_000,
       });
       expect(result.code, `stdout: ${result.stdout}\nstderr: ${result.stderr}`).toBe(0);
-      expect(result.stdout).toContain("Signed out of Codex.");
+      expect(result.stdout).toContain("signed out of codex.");
       expect(result.stderr).toContain(CODEX_REVOCATION_WARNING);
       expect(result.stderr).not.toContain("chatgpt-refresh");
       expect(existsSync(authPath)).toBe(false);
@@ -6628,7 +6628,7 @@ test("Codex logout removes an unreadable saved login without sending it", async 
         timeoutMs: TIMEOUT,
       });
       expect(result.code, result.stderr).toBe(0);
-      expect(result.stdout).toContain("Signed out of Codex.");
+      expect(result.stdout).toContain("signed out of codex.");
       expect(result.stderr).toContain(CODEX_REVOCATION_WARNING);
       // There was no token to keep, so the warning promises no retry.
       expect(result.stderr).not.toContain(RETRY_LATER);
@@ -6651,7 +6651,7 @@ test("Codex logout without a saved login sends nothing", async () => {
       timeoutMs: TIMEOUT,
     });
     expect(result.code, result.stderr).toBe(0);
-    expect(result.stdout).toContain("No Codex login session found.");
+    expect(result.stdout).toContain("no codex login session found.");
     expect(result.stderr).toBe("");
     expect(codex.requests).toHaveLength(0);
   } finally {
@@ -6672,8 +6672,8 @@ test("Codex logouts started together revoke the login once", async () => {
       expect(result.code, `stdout: ${result.stdout}\nstderr: ${result.stderr}`).toBe(0);
       expect(result.stderr).toBe("");
     }
-    expect(results.filter((result) => result.stdout.includes("Signed out of Codex."))).toHaveLength(1);
-    expect(results.filter((result) => result.stdout.includes("No Codex login session found."))).toHaveLength(3);
+    expect(results.filter((result) => result.stdout.includes("signed out of codex."))).toHaveLength(1);
+    expect(results.filter((result) => result.stdout.includes("no codex login session found."))).toHaveLength(3);
     expect(codex.revocations()).toHaveLength(1);
     expect(existsSync(join(home, ".fx", "chatgpt-auth.json"))).toBe(false);
   } finally {
@@ -6788,34 +6788,34 @@ tmuxTest(
       await session.sendKeys("Enter");
       const collapsed = await session.waitForPane(
         (pane) =>
-          pane.includes("Authorize with Grok") &&
-          pane.includes("Browser didn't return? press tab to enter a code") &&
+          pane.includes("authorize with grok") &&
+          pane.includes("browser didn't return? press tab to enter a code") &&
           pane.includes("enter reopens browser · tab enters code · esc cancels"),
         TIMEOUT,
       );
-      expect(collapsed).toMatch(/^Sign in with Grok\s+Waiting for authorization…$/m);
-      expect(collapsed).toMatch(/^  Open\s+Authorize with Grok$/m);
-      expect(collapsed).not.toContain("Paste or type the code");
+      expect(collapsed).toMatch(/^sign in with grok\s+waiting for authorization…$/m);
+      expect(collapsed).toMatch(/^  open\s+authorize with grok$/m);
+      expect(collapsed).not.toContain("paste or type the code");
       expect(collapsed).not.toContain(`${grok.baseUrl}/oauth2/authorize?`);
       await completeDisplayedGrokLogin(session, grok);
-      await session.waitForText("Switched to Grok subscription with grok-4.20.", TIMEOUT);
+      await session.waitForText("switched to grok subscription with grok-4.20.", TIMEOUT);
       await session.sendText("Answer from Grok.");
       await session.waitForText("GROK_DIRECT_RESPONSE", TIMEOUT);
 
       const tokenCallsAfterLogin = grok.tokenCalls();
       await selectEnvKeyCredential(session);
-      await session.waitForText("Switched to Vercel AI Gateway", TIMEOUT);
+      await session.waitForText("switched to vercel AI gateway", TIMEOUT);
       await openProviderPicker(session);
       await session.sendKeys("Down");
       await session.sendKeys("Down");
       await session.sendKeys("Enter");
-      await session.waitForText("Switched to Grok subscription with grok-4.20.", TIMEOUT);
+      await session.waitForText("switched to grok subscription with grok-4.20.", TIMEOUT);
       await session.sendText("/model");
       const grokCatalog = await session.waitForPane(
         (pane) => /^models\s/m.test(pane) && pane.includes("grok-4.20"),
         TIMEOUT,
       );
-      expect(grokCatalog).toContain("< All >");
+      expect(grokCatalog).toContain("< all >");
       for (const vendor of ["Anthropic", "OpenAI", "xAI", "Z.AI", "Others"]) {
         expect(grokCatalog).not.toContain(vendor);
       }
@@ -6868,14 +6868,14 @@ tmuxTest(
       await session.sendKeys("Down");
       await session.sendKeys("Down");
       await session.sendKeys("Enter");
-      await session.waitForText("Browser didn't return? press tab to enter a code", TIMEOUT);
+      await session.waitForText("browser didn't return? press tab to enter a code", TIMEOUT);
       await session.pasteText("grok-code");
       await session.waitForPane(
         (pane) => pane.includes("•••••••••") && pane.includes("enter submits"),
         TIMEOUT,
       );
       const expanded = await session.capturePane();
-      expect(expanded).toMatch(/^  Open\s+Authorize with Grok\n\s*\n  Paste the code shown by xAI$/m);
+      expect(expanded).toMatch(/^  open\s+authorize with grok\n\s*\n  paste the code shown by xAI$/m);
       await session.resizeWindow(80, 5);
       const compactEntry = await session.waitForPane(
         (pane) =>
@@ -6884,7 +6884,7 @@ tmuxTest(
           pane.includes("esc cancels"),
         TIMEOUT,
       );
-      expect(compactEntry).not.toContain("Paste the code shown by xAI");
+      expect(compactEntry).not.toContain("paste the code shown by xAI");
       await session.sendKeys("Tab");
       const collapsedWithDraft = await session.waitForText("tab enters code", TIMEOUT);
       expect(collapsedWithDraft).not.toContain("•••••••••");
@@ -6894,7 +6894,7 @@ tmuxTest(
         TIMEOUT,
       );
       await session.sendKeys("Enter");
-      await session.waitForText("Switched to Grok subscription with grok-4.20.", TIMEOUT);
+      await session.waitForText("switched to grok subscription with grok-4.20.", TIMEOUT);
 
       const scrollback = await session.captureFullScrollback();
       expect(scrollback).not.toContain("grok-code");
@@ -7108,7 +7108,7 @@ for (const scenario of ["replace", "conflict", "invalid-index"] as const) {
         if (conflict) expect(resultJson.error).toBe(scenario === "invalid-index" ? (provider === "codex" ? "InvalidOpenAICodexSseEvent" : "InvalidXaiGrokSseEvent") : "ResponsesToolCallConflict");
         else {
           expect(resultJson.output).toBe("FINAL_RECORD_OK");
-          expect(result.stderr).toBe("Writing final.txt\n");
+          expect(result.stderr).toBe("writing final.txt\n");
         }
         const detail = await runFx(["session", "--json", "--id", resultJson.session_id], { cwd: profile, env });
         expect(detail.code).toBe(0);
@@ -7182,7 +7182,7 @@ test("native assistant messages keep their boundaries and phases through tools a
       expect(direct.bodies).toHaveLength(2);
       const resumed = await runFx(["ask", "--json", "--auto", "--resume", result.session_id, "What was the value?"], { cwd: profile, env, timeoutMs: TIMEOUT });
       expect(resumed.code, resumed.stdout + resumed.stderr).toBe(0);
-      expect(JSON.parse(resumed.stdout).output).toBe("Still 42.");
+      expect(JSON.parse(resumed.stdout).output).toBe("still 42.");
       expect(direct.bodies).toHaveLength(3);
       for (const [index, body] of direct.bodies.slice(1).entries()) {
         const input = JSON.parse(body).input;
@@ -7254,7 +7254,7 @@ test("native reasoning snapshots survive tools and saved resume exactly once", a
         continue;
       }
       expect(result.output).toBe("REASONING_SNAPSHOT_OK");
-      expect(first.stderr).toMatch(/^(?:● Reading\x1b\[0m\n)?Reading notes\.txt\n$/);
+      expect(first.stderr).toMatch(/^(?:● reading\x1b\[0m\n)?reading notes\.txt\n$/);
       expect(direct.bodies).toHaveLength(2);
       const saved = savedText(profile, result.session_id);
       expect(saved).toContain(signature);
@@ -7329,7 +7329,7 @@ test("native final snapshots preserve completed items and reject conflicting kin
         expect(trace).not.toContain("after_tool_execution");
         expect(result.output).not.toContain("CONFLICTING_TEXT");
       } else {
-        expect(result.output).toBe("Inspecting.\n\nSNAPSHOT_OK");
+        expect(result.output).toBe("inspecting.\n\nSNAPSHOT_OK");
         expect(result.tool_calls).toEqual([{ name: "read_file", status: "success" }]);
         expect(trace).toContain("after_tool_execution");
       }
@@ -7353,7 +7353,7 @@ test("native final snapshots preserve completed items and reject conflicting kin
         if (!conflict) {
           expect(outputs[0].output).toContain("SNAPSHOT_READ_RESULT");
           expect(input.filter((item: { type?: string }) => item.type === "reasoning")).toEqual([reasoning]);
-          expect(input.find((item: { phase?: string }) => item.phase === "commentary").content[0].text).toBe("Inspecting.");
+          expect(input.find((item: { phase?: string }) => item.phase === "commentary").content[0].text).toBe("inspecting.");
         }
       }
       expect(gateway.requests).toHaveLength(0);
@@ -7511,7 +7511,7 @@ test("native terminal outcomes preserve recovery and incomplete warnings", async
         expect(output.output).toBe(limited ? "LIMITED_ANSWER" : "RECOVERED_OK");
         if (limited) expect(result.stderr).toContain("response hit provider length limit");
         // A retry shows the recovery module's wording, never the provider's detail.
-        else expect(result.stderr).toMatch(/^\[notice\] Gateway error · next try in 1s · attempt 1$/m);
+        else expect(result.stderr).toMatch(/^\[notice\] gateway error · next try in 1s · attempt 1$/m);
         const detail = await runFx(["session", "--json", "--id", output.session_id], { cwd: profile, env });
         expect(detail.code).toBe(0);
         const history = JSON.parse(detail.stdout).history;
@@ -8040,7 +8040,7 @@ test(
 
     const login = await runCodexLoginWithBrowser(env);
     expect(login.code).toBe(1);
-    expect(login.stdout).not.toContain("Signed in with Codex.");
+    expect(login.stdout).not.toContain("signed in with codex.");
     expect(login.stderr).toContain("fx login: could not load the target model catalog (malformed_response)");
     expect(existsSync(join(home, ".fx", "chatgpt-auth.json"))).toBe(true);
     const settingsPath = join(home, ".fx", "settings.json");
@@ -8072,7 +8072,7 @@ test(
 
       const login = await runGrokLoginWithBrowser(env);
       expect(login.code).toBe(1);
-      expect(login.stdout).not.toContain("Signed in with Grok.");
+      expect(login.stdout).not.toContain("signed in with grok.");
       expect(login.stderr).toContain("fx login: target model catalog is empty");
       expect(existsSync(join(home, ".fx", "grok-auth.json"))).toBe(true);
       expect(existsSync(join(home, ".fx", "settings.json"))).toBe(false);
@@ -8502,21 +8502,21 @@ tmuxTest(
 
     session = await startFxWithoutAuth(home, stderrPath, gateway);
     const initial = await session.waitForComposer(TIMEOUT);
-    expect(initial).not.toContain("Sign in with Vercel");
-    expect(initial).not.toContain("Switch credential");
+    expect(initial).not.toContain("sign in with vercel");
+    expect(initial).not.toContain("switch credential");
 
     await session.sendText(`/image ${imagePath}`);
     await session.waitForText("attached image: attachment.png", TIMEOUT);
     await session.sendText(" preserve this exact prompt");
     const blocked = await session.waitForPane(
       (pane) =>
-        pane.includes("fx needs access to Vercel AI Gateway") &&
+        pane.includes("fx needs access to vercel AI gateway") &&
         pane.includes("preserve this exact prompt") &&
         pane.includes("Image 1"),
       TIMEOUT,
     );
-    expect(blocked).not.toContain("Welcome to fx");
-    expect(blocked).not.toContain("Switch credential");
+    expect(blocked).not.toContain("welcome to fx");
+    expect(blocked).not.toContain("switch credential");
     expect(gateway.requests).toHaveLength(0);
     expect(session.isAlive()).toBe(true);
     expect(readFileSync(stderrPath, "utf8")).toBe("");
@@ -8553,7 +8553,7 @@ tmuxTest(
     await session.sendText("/logout");
     const loggedOut = await session.waitForPane(
       (pane) =>
-        pane.includes("Signed out of fx.") &&
+        pane.includes("signed out of fx.") &&
         pane.includes("remote session could not be revoked"),
       TIMEOUT,
     );
@@ -8630,7 +8630,7 @@ tmuxTest(
     session = await startFx(home, stderrPath, gateway, oauth.issuerUrl);
     await session.waitForComposer(TIMEOUT);
     await session.sendText("/logout");
-    await session.waitForText("Signed out of fx.", 1_000);
+    await session.waitForText("signed out of fx.", 1_000);
 
     const quitAt = Date.now();
     await session.sendText("/quit");
@@ -8658,7 +8658,7 @@ tmuxTest(
     session = await startFx(home, stderrPath, gateway, oauth.issuerUrl);
     await session.waitForComposer(TIMEOUT);
     await session.sendText("/logout");
-    await session.waitForText("Signed out of fx.", 1_000);
+    await session.waitForText("signed out of fx.", 1_000);
     expect(existsSync(join(home, ".fx", "auth.json"))).toBe(false);
     const draft = "TYPING_WHILE_LOGOUT_REVOKES";
     await session.sendLiteral(draft);
@@ -8690,7 +8690,7 @@ tmuxTest(
     session = await startFx(home, stderrPath, gateway, oauth.issuerUrl);
     await session.waitForComposer(TIMEOUT);
     await session.sendText("/logout");
-    await session.waitForText("Signed out of fx.", TIMEOUT);
+    await session.waitForText("signed out of fx.", TIMEOUT);
     await waitForRevocations(oauth, 1);
     // Each revocation runs to its 15 s limit before fx reports it.
     await session.waitForText("remote session could not be revoked", 60_000);
@@ -8716,7 +8716,7 @@ tmuxTest(
     session = await startFx(home, stderrPath, gateway, oauth.issuerUrl);
     await session.waitForComposer(TIMEOUT);
     await session.sendText("/logout");
-    await session.waitForText("Signed out of fx.", TIMEOUT);
+    await session.waitForText("signed out of fx.", TIMEOUT);
     expect(existsSync(join(home, ".fx", "auth.json"))).toBe(false);
 
     await readStatusPanel(session, TIMEOUT, (panel) => panelAuth(panel) === "AI_GATEWAY_API_KEY");
@@ -8744,7 +8744,7 @@ tmuxTest(
     session = await startFx(home, stderrPath, gateway, oauth.issuerUrl);
     await session.waitForComposer(TIMEOUT);
     await session.sendText("/logout");
-    const loggedOut = await session.waitForText("Signed out of fx.", TIMEOUT);
+    const loggedOut = await session.waitForText("signed out of fx.", TIMEOUT);
     expect(existsSync(authPath)).toBe(false);
 
     await readStatusPanel(session, TIMEOUT, (panel) => panelAuth(panel) === "AI_GATEWAY_API_KEY");
@@ -8785,7 +8785,7 @@ tmuxTest(
       "Could not confirm durable fx logout. The active source was recalculated.",
       TIMEOUT,
     );
-    expect(failed).not.toContain("Signed out of fx.");
+    expect(failed).not.toContain("signed out of fx.");
     expect(failed).toContain(
       "Warning: signed out locally, but the remote session could not be revoked.",
     );
@@ -8815,7 +8815,7 @@ tmuxTest(
     });
     await session.waitForComposer(TIMEOUT);
     await session.sendText("/logout");
-    await session.waitForText("Signed out of fx.", TIMEOUT);
+    await session.waitForText("signed out of fx.", TIMEOUT);
     await readStatusPanel(session, TIMEOUT, (panel) => panelAuth(panel) === "missing");
 
     await session.sendText("/setup");
@@ -8823,7 +8823,7 @@ tmuxTest(
       (pane) => pane.includes("vercel") && pane.includes("codex") && pane.includes("grok"),
       TIMEOUT,
     );
-    expect(picker).not.toContain("Connections");
+    expect(picker).not.toContain("connections");
     await session.sendKeys("Escape");
     await session.waitForPane((pane) => !pane.includes("codex"), TIMEOUT);
     await session.sendKeys("C-u");
@@ -8833,14 +8833,14 @@ tmuxTest(
     const onboarding = await session.waitForPane(
       (pane) =>
         pane.includes(prompt) &&
-        pane.includes("Welcome to fx") &&
-        pane.includes("Sign in with Vercel") &&
-        pane.includes("Add an API key") &&
+        pane.includes("welcome to fx") &&
+        pane.includes("sign in with vercel") &&
+        pane.includes("add an API key") &&
         pane.includes("esc to set up later"),
       TIMEOUT,
     );
     expect(onboarding).not.toMatch(/^\s+fx login\s+/m);
-    expect(onboarding).not.toContain("Switch credential");
+    expect(onboarding).not.toContain("switch credential");
     expect(onboarding).not.toContain("Skip for now");
     expect(gateway.requests).toHaveLength(0);
     expect(session.isAlive()).toBe(true);
@@ -8869,7 +8869,7 @@ tmuxTest(
     const failed = await session.waitForPane(
       (pane) =>
         pane.includes("AI_GATEWAY_API_KEY authentication failed · HTTP 401") &&
-        pane.includes("Run /provider to repair this source."),
+        pane.includes("run /provider to repair this source."),
       TIMEOUT,
     );
 
@@ -8995,12 +8995,12 @@ for (const outcome of ["failure", "cancel"] as const) {
     await session.waitForText("DRAFT_DURING_AUTH_BOUNDARY", 1_000);
     if (outcome === "cancel") {
       await session.sendKeys("C-c");
-      await session.waitForText("Compaction cancelled. Try /compact again when ready.", 3_000);
+      await session.waitForText("compaction cancelled. try /compact again when ready.", 3_000);
     } else {
-      await session.waitForText("Compaction was not started. Check authentication and try /compact again.", TIMEOUT);
+      await session.waitForText("compaction was not started. check authentication and try /compact again.", TIMEOUT);
       const scrollback = await session.captureFullScrollback();
       expect(scrollback).toContain("/compact again");
-      expect(scrollback).not.toContain("Your prompt is saved.");
+      expect(scrollback).not.toContain("your prompt is saved.");
     }
     expect(await session.captureFullScrollback()).toContain("DRAFT_DURING_AUTH_BOUNDARY");
     expect(readFileSync(historyPath, "utf8")).toBe(before);
@@ -9108,7 +9108,7 @@ tmuxTest(
     await session.sendText(prompt);
     await waitForTrace(tracePath, "event=pending_prompt_frame_committed", 1_000);
     await session.waitForPane(
-      (pane) => pane.includes(prompt) && pane.includes("Thinking"),
+      (pane) => pane.includes(prompt) && pane.includes("thinking"),
       1_000,
     );
     const responsiveDraft = "TERMINAL_RESPONSIVE_DURING_CREDENTIAL_REFRESH";
@@ -9120,7 +9120,7 @@ tmuxTest(
     await session.sendKeys("C-u");
     await session.sendKeys("C-k");
     await session.waitForPane(
-      (pane) => pane.includes("fx login sign-in expired.") && !pane.includes("Thinking"),
+      (pane) => pane.includes("fx login sign-in expired.") && !pane.includes("thinking"),
       TIMEOUT,
     );
     expect(oauth.requests.filter((request) => request.grantType === "refresh_token")).toHaveLength(1);
@@ -9135,7 +9135,7 @@ tmuxTest(
     const firstOutput = frames.slice(enter + 1).find((frame) => frame.kind === 1);
     expect(firstOutput).toBeDefined();
     expect(firstOutput!.payload.includes(prompt)).toBe(true);
-    expect(firstOutput!.payload.includes("Thinking")).toBe(true);
+    expect(firstOutput!.payload.includes("thinking")).toBe(true);
 
     const replay = await runFx(["replay", tapePath, "--frames-dir", replayPath]);
     expect(replay.code).toBe(0);
@@ -9143,17 +9143,17 @@ tmuxTest(
       .filter((name) => name.endsWith(".grid.txt"))
       .sort()
       .map((name) => readFileSync(join(replayPath, "frames", name), "utf8"));
-    const thinkingGrids = grids.filter((grid) => grid.includes("Thinking"));
+    const thinkingGrids = grids.filter((grid) => grid.includes("thinking"));
     expect(thinkingGrids.length).toBeGreaterThan(0);
     for (const grid of thinkingGrids) {
       const rows = grid.split("\n");
       const promptRow = rows.findIndex((row) => row.includes(prompt));
       expect(promptRow).toBeGreaterThanOrEqual(0);
-      expect(rows.findIndex((row) => row.includes("Thinking"))).toBe(promptRow + 2);
+      expect(rows.findIndex((row) => row.includes("thinking"))).toBe(promptRow + 2);
     }
 
     await session.sendKeys("Enter");
-    await session.waitForText("Waiting for authorization", TIMEOUT);
+    await session.waitForText("waiting for authorization", TIMEOUT);
     expect(oauth.requests.filter((request) => request.grantType === "refresh_token")).toHaveLength(1);
 
     await session.waitForText("Team Harness", TIMEOUT);
@@ -9191,11 +9191,11 @@ tmuxTest(
     expect(oauth.requests.filter((request) => request.grantType === "refresh_token")).toHaveLength(1);
 
     await session.sendKeys("Enter");
-    await session.waitForText("Waiting for authorization", TIMEOUT);
+    await session.waitForText("waiting for authorization", TIMEOUT);
     expect(oauth.requests.filter((request) => request.path === "/oauth/device")).toHaveLength(1);
     await session.sendKeys("Escape");
     await session.waitForPane(
-      (pane) => pane.includes(prompt) && !pane.includes("Waiting for authorization"),
+      (pane) => pane.includes(prompt) && !pane.includes("waiting for authorization"),
       TIMEOUT,
     );
     await session.sendKeys("C-u");
@@ -9211,13 +9211,13 @@ tmuxTest(
       TIMEOUT,
     );
     await session.sendKeys("Enter");
-    await session.waitForText("Waiting for authorization", TIMEOUT);
+    await session.waitForText("waiting for authorization", TIMEOUT);
 
     expect(oauth.requests.filter((request) => request.path === "/oauth/device")).toHaveLength(2);
     expect(oauth.requests.filter((request) => request.grantType === "refresh_token")).toHaveLength(1);
     await session.waitForText("Team Harness", TIMEOUT);
     await session.sendKeys("Enter");
-    await session.waitForText("Changed Vercel team to Team Harness", TIMEOUT);
+    await session.waitForText("changed vercel team to Team Harness", TIMEOUT);
     expect(gateway.requests).toHaveLength(0);
 
     await session.sendText("use the repaired fx login");
@@ -9262,7 +9262,7 @@ tmuxTest(
       TIMEOUT,
     );
     await session.sendKeys("Enter");
-    await session.waitForText("Waiting for authorization", TIMEOUT);
+    await session.waitForText("waiting for authorization", TIMEOUT);
 
     expect(oauth.requests.filter((request) => request.grantType === "refresh_token")).toHaveLength(1);
     expect(oauth.requests.filter((request) => request.path === "/oauth/device")).toHaveLength(1);
@@ -9300,13 +9300,13 @@ tmuxTest(
       TIMEOUT,
     );
     await session.sendKeys("Enter");
-    await session.waitForText("Waiting for authorization", TIMEOUT);
+    await session.waitForText("waiting for authorization", TIMEOUT);
 
     expect(oauth.requests.filter((request) => request.grantType === "refresh_token")).toHaveLength(1);
     expect(oauth.requests.filter((request) => request.path === "/oauth/device")).toHaveLength(1);
     await session.sendKeys("Escape");
     await session.waitForPane(
-      (pane) => !pane.includes("Waiting for authorization"),
+      (pane) => !pane.includes("waiting for authorization"),
       TIMEOUT,
     );
     await session.sendKeys("C-u");
@@ -9321,13 +9321,13 @@ tmuxTest(
       TIMEOUT,
     );
     await session.sendKeys("Enter");
-    await session.waitForText("Waiting for authorization", TIMEOUT);
+    await session.waitForText("waiting for authorization", TIMEOUT);
 
     expect(oauth.requests.filter((request) => request.grantType === "refresh_token")).toHaveLength(1);
     expect(oauth.requests.filter((request) => request.path === "/oauth/device")).toHaveLength(2);
     await session.waitForText("Team Harness", TIMEOUT);
     await session.sendKeys("Enter");
-    await session.waitForText("Changed Vercel team to Team Harness", TIMEOUT);
+    await session.waitForText("changed vercel team to Team Harness", TIMEOUT);
     expect(savedCredentialSource(home)).toBe("fx_login");
 
     await session.sendText("use the repaired login after retiring the rejected token");
@@ -9464,7 +9464,7 @@ tmuxTest(
     await session.waitForPane(
       (pane) =>
         pane.includes(FAKE_GATEWAY_MODEL) &&
-        pane.includes("Vercel sign-in must refresh before team-private models can load.") &&
+        pane.includes("vercel sign-in must refresh before team-private models can load.") &&
         pane.includes("esc close"),
       TIMEOUT,
     );
@@ -9527,7 +9527,7 @@ tmuxTest(
     const expiredPane = await session.waitForPane(
       (pane) =>
         pane.includes(FAKE_GATEWAY_MODEL) &&
-        pane.includes("Vercel sign-in must refresh before team-private models can load.") &&
+        pane.includes("vercel sign-in must refresh before team-private models can load.") &&
         !pane.includes("private/blue-hornbill"),
       TIMEOUT,
     );
@@ -9548,7 +9548,7 @@ tmuxTest(
         pane.includes(blockedPrompt) &&
         pane.includes("fx login sign-in expired.") &&
         pane.includes("press enter to sign in again.") &&
-        !pane.includes("Model provider"),
+        !pane.includes("model provider"),
       TIMEOUT,
     );
     expect(gateway.requests).toHaveLength(0);
@@ -9558,7 +9558,7 @@ tmuxTest(
     const failedPane = await session.waitForPane(
       (pane) =>
         pane.includes(FAKE_GATEWAY_MODEL) &&
-        pane.includes("Vercel sign-in refresh failed; using the public model catalog.") &&
+        pane.includes("vercel sign-in refresh failed; using the public model catalog.") &&
         !pane.includes("private/blue-hornbill"),
       TIMEOUT,
     );
@@ -9616,7 +9616,7 @@ tmuxTest(
         pane.includes(firstPrompt) &&
         pane.includes("fx login sign-in expired.") &&
         pane.includes("press enter to sign in again.") &&
-        !pane.includes("Model provider"),
+        !pane.includes("model provider"),
       TIMEOUT,
     );
     expect(firstFailure).not.toContain("Choose another source");
@@ -9632,7 +9632,7 @@ tmuxTest(
     await session.sendText("/model");
     await session.waitForPane(
       (pane) =>
-        pane.includes("Vercel sign-in refresh failed; using the public model catalog.") &&
+        pane.includes("vercel sign-in refresh failed; using the public model catalog.") &&
         pane.includes("esc close"),
       TIMEOUT,
     );
@@ -9852,7 +9852,7 @@ tmuxTest(
     await session.waitForPane((pane) => !pane.includes("loading teams..."), 1_000);
     // Past the teams delay, the late list must not reopen a picker.
     await Bun.sleep(3_500);
-    expect(await session.capturePane()).not.toContain("Vercel team · Search:");
+    expect(await session.capturePane()).not.toContain("vercel team · search:");
     expect(oauth.requests.filter((request) => request.path === "/v2/teams")).toHaveLength(1);
     expect(readFileSync(tracePath, "utf8")).toContain("team list dropped reason=picker_moved");
     expect(readFileSync(stderrPath, "utf8")).toBe("");
@@ -9885,7 +9885,7 @@ tmuxTest(
     await Bun.sleep(Math.max(0, refreshDueAt - Date.now()) + 250);
 
     await session.sendText("/credits");
-    await session.waitForText("Your sign-in has expired. Run /login, then check credits again.", TIMEOUT);
+    await session.waitForText("your sign-in has expired. run /login, then check credits again.", TIMEOUT);
     // /credits sends nothing with the expired login.
     expect(creditsGateway.requests).toEqual([
       { method: "GET", path: "/v1/credits", authorization: `Bearer ${LOGIN_TOKEN}` },
@@ -9974,11 +9974,11 @@ tmuxTest(
     const pane = await session.waitForPane(
       (text) =>
         text.includes(FAKE_GATEWAY_MODEL) &&
-        text.includes("Using the public model catalog; sign in or use an API key for team-private models."),
+        text.includes("using the public model catalog; sign in or use an API key for team-private models."),
       TIMEOUT,
     );
     expect(pane).toContain(FAKE_GATEWAY_MODEL);
-    expect(pane).toContain("Using the public model catalog; sign in or use an API key for team-private models.");
+    expect(pane).toContain("using the public model catalog; sign in or use an API key for team-private models.");
 
     expect(gateway.requests).toHaveLength(0);
     expect(gateway.modelRequests).toHaveLength(1);
@@ -10013,11 +10013,11 @@ tmuxTest(
     const pane = await session.waitForPane(
       (text) =>
         text.includes(FAKE_GATEWAY_MODEL) &&
-        text.includes("Your Gateway credential was rejected; using the public model catalog."),
+        text.includes("your gateway credential was rejected; using the public model catalog."),
       TIMEOUT,
     );
     expect(pane).toContain(FAKE_GATEWAY_MODEL);
-    expect(pane).toContain("Your Gateway credential was rejected; using the public model catalog.");
+    expect(pane).toContain("your gateway credential was rejected; using the public model catalog.");
 
     expect(gateway.modelRequests).toHaveLength(2);
     expect(gateway.modelRequests[0].headers.get("authorization")).toBe(`Bearer ${ENV_TOKEN}`);
@@ -10355,7 +10355,7 @@ for (const provider of ["codex", "grok"] as const) {
         const responses = () => direct.requests.filter((request) => request.path === responsePath);
         if (outcome === "cancel") {
           await session.sendKeys("C-c");
-          await session.waitForText("Provider preparation cancelled.", 1500);
+          await session.waitForText("provider preparation cancelled.", 1500);
           expect(await session.capturePane()).toContain("retained café 日本語");
           release();
           await Bun.sleep(100);
@@ -10379,7 +10379,7 @@ for (const provider of ["codex", "grok"] as const) {
             expect(gateway.requests).toHaveLength(0);
             expect(JSON.parse(readFileSync(settingsPath, "utf8")).provider).toBe(provider);
           } else {
-            await session.waitForText("The target provider catalog could not be validated.", TIMEOUT);
+            await session.waitForText("the target provider catalog could not be validated.", TIMEOUT);
             expect(gateway.requests).toHaveLength(0);
             expect(responses()).toHaveLength(0);
             expect(JSON.parse(readFileSync(settingsPath, "utf8")).provider).toBe("gateway");
@@ -10476,16 +10476,16 @@ for (const outcome of ["cancel", "failure"] as const) {
       expect(readFileSync(authPath, "utf8")).toBe(beforeAuth);
       if (outcome === "cancel") {
         await session.sendKeys("C-c");
-        await session.waitForText("Provider preparation cancelled.", 1500);
+        await session.waitForText("provider preparation cancelled.", 1500);
         release();
       } else {
         release();
-        await session.waitForText("could not be validated for AI Gateway", TIMEOUT);
+        await session.waitForText("could not be validated for AI gateway", TIMEOUT);
       }
       expect(readFileSync(authPath, "utf8")).toBe(beforeAuth);
       expect(JSON.parse(readFileSync(settingsPath, "utf8")).provider).toBe("codex");
       await chooseTeam();
-      await session.waitForText("Changed Vercel team to Next Team", TIMEOUT);
+      await session.waitForText("changed vercel team to Next Team", TIMEOUT);
       expect(JSON.parse(readFileSync(authPath, "utf8")).team_id).toBe("team_next");
       expect(JSON.parse(readFileSync(settingsPath, "utf8")).provider).toBe("gateway");
       expect(JSON.parse(readFileSync(settingsPath, "utf8")).models.gateway).toBe("openai/gpt-5.6-sol");
@@ -10531,12 +10531,12 @@ tmuxTest("a Vercel team choice names an AI Gateway catalog fx could not connect 
   await session.sendKeys("Enter");
   await session.waitForText("next-team", TIMEOUT);
   await session.sendKeys("Enter");
-  await session.waitForText("couldn't connect to AI Gateway to validate", TIMEOUT);
+  await session.waitForText("couldn't connect to AI gateway to validate", TIMEOUT);
   const transcript = collapsedText(await session.captureFullScrollback());
   expect(transcript).toContain(
-    "fx couldn't connect to AI Gateway to validate the selected Vercel team. Check your network connection or firewall. The current team is unchanged.",
+    "fx couldn't connect to AI gateway to validate the selected vercel team. check your network connection or firewall. the current team is unchanged.",
   );
-  expect(transcript).not.toContain("could not be validated for AI Gateway");
+  expect(transcript).not.toContain("could not be validated for AI gateway");
   expect(readFileSync(authPath, "utf8")).toBe(beforeAuth);
   expect(JSON.parse(readFileSync(settingsPath, "utf8")).provider).toBe("codex");
   expect(readFileSync(stderrPath, "utf8")).toBe("");
@@ -10565,7 +10565,7 @@ tmuxTest("provider preparation cancellation stops logout fallback", async () => 
     await session.sendText("/logout");
     await session.waitForPane(() => entered, 5000);
     await session.sendKeys("C-c");
-    await session.waitForText("Provider preparation cancelled.", 1500);
+    await session.waitForText("provider preparation cancelled.", 1500);
     release();
     await Bun.sleep(100);
     expect(grok.requests.filter((request) => request.path === "/v1/models")).toHaveLength(0);
@@ -10604,12 +10604,12 @@ tmuxTest("a cancelled provider switch ends at once while its sign-in refresh fin
     await session.sendText("/logout");
     await session.waitForPane(() => refreshHeld, 5000);
     await session.sendKeys("C-c");
-    await session.waitForText("Provider preparation cancelled.", 1500);
+    await session.waitForText("provider preparation cancelled.", 1500);
     expect(storedFxLoginToken(home)).toBe("expired-login-token");
     // A logout would wait for the login's lock, which the refresh holds: it
     // is refused at once, and the terminal stays responsive.
     await session.sendText("/logout vercel");
-    await session.waitForText("A sign-in refresh is still finishing. Try again in a moment.", 1500);
+    await session.waitForText("a sign-in refresh is still finishing. try again in a moment.", 1500);
 
     release();
     const deadline = Date.now() + 5000;
@@ -10685,7 +10685,7 @@ tmuxTest("provider preparation resumes a held prompt after explicit provider ret
     await session.sendText("Retain this prompt across the explicit provider retry.");
     await waitForTrace(trace, "pending_prompt_adopted", 3000);
     release();
-    await session.waitForText("The target provider catalog could not be validated.", TIMEOUT);
+    await session.waitForText("the target provider catalog could not be validated.", TIMEOUT);
     await openProviderPicker(session);
     await session.sendLiteral("codex");
     await session.sendKeys("Enter");
@@ -10719,7 +10719,7 @@ tmuxTest("a provider switch names a target catalog fx could not connect to", asy
   await session.waitForText("couldn't connect to the model provider", TIMEOUT);
   const transcript = collapsedText(await session.captureFullScrollback());
   expect(transcript).toContain(
-    "fx couldn't connect to the model provider to load the target provider catalog. Check your network connection or firewall. The current provider is unchanged.",
+    "fx couldn't connect to the model provider to load the target provider catalog. check your network connection or firewall. the current provider is unchanged.",
   );
   expect(transcript).not.toContain("could not be validated");
   if (existsSync(settingsPath)) expect(JSON.parse(readFileSync(settingsPath, "utf8")).provider).not.toBe("codex");

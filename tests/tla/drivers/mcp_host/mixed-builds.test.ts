@@ -76,7 +76,7 @@ test("an older build beside this one: its login isn't taken, its writes never re
     const redirect = await fetch(url, { redirect: "manual" });
     await fetch(redirect.headers.get("location")!);
     expect(await login.done()).toBe(0);
-    expect(login.out()).toContain("Signed in to web.");
+    expect(login.out()).toContain("signed in to web.");
     expect(look()).toEqual({ v2kind: "v1", v2: true, v3: true });
     expect(bytes(olderStorePath(f))).toBe(olderText);
     const signedIn = bytes(storePath(f));
@@ -95,7 +95,7 @@ test("an older build beside this one: its login isn't taken, its writes never re
 
     // Signing out empties this build's store, and leaves the older one alone.
     const out = await run("logout", ["mcp", "logout", "web"]);
-    expect(out.stdout).toBe("Signed out of web here, but the login wasn't revoked at its server, so its tokens stay valid until they expire.\n");
+    expect(out.stdout).toBe("signed out of web here, but the login wasn't revoked at its server, so its tokens stay valid until they expire.\n");
     expect(look()).toEqual({ v2kind: "v1", v2: false, v3: false });
     expect(bytes(olderStorePath(f))).toBe(olderText);
 

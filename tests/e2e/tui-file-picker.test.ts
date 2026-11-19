@@ -1723,14 +1723,14 @@ describe("@ file picker", () => {
       rmSync(join(current.workspace, "flip-file.txt"));
       mkdirSync(join(current.workspace, "flip-file.txt"));
       await active.sendKeys("Enter");
-      await active.waitForText("Selection unavailable", TIMEOUT);
+      await active.waitForText("selection unavailable", TIMEOUT);
       expect(await composerPlainText(active)).toBe(fileDraft);
       const refreshedFileAdoption = nextFileIndexAdoption(current.tracePath);
       await active.sendKeys("Tab");
       await waitForFileText(current.tracePath, refreshedFileAdoption);
       await active.waitForText("flip-file.txt/", TIMEOUT);
       await active.sendKeys("Enter");
-      await active.waitForText("Selection unavailable", TIMEOUT);
+      await active.waitForText("selection unavailable", TIMEOUT);
       expect(await composerPlainText(active)).toBe(fileDraft);
       const refreshedFileTraceOffset = readFileSync(current.tracePath, "utf8").length;
       await active.sendKeys("Down Enter");
@@ -1750,12 +1750,12 @@ describe("@ file picker", () => {
       rmSync(join(current.workspace, "flip-dir"), { recursive: true, force: true });
       writeFileSync(join(current.workspace, "flip-dir"), "now a file");
       await active.sendKeys("Enter");
-      await active.waitForText("Selection unavailable", TIMEOUT);
+      await active.waitForText("selection unavailable", TIMEOUT);
       expect(await composerPlainText(active)).toBe(directoryDraft);
       const refreshedDirectoryAdoption = nextFileIndexAdoption(current.tracePath);
       await active.sendKeys("Tab");
       await waitForFileText(current.tracePath, refreshedDirectoryAdoption);
-      await active.waitForText("Selection unavailable", TIMEOUT);
+      await active.waitForText("selection unavailable", TIMEOUT);
       const refreshedDirectoryTraceOffset = readFileSync(
         current.tracePath,
         "utf8",
@@ -1870,13 +1870,13 @@ describe("@ file picker", () => {
       await active.sendKeys("Up");
       unlinkSync(join(current.workspace, "retry", "c.txt"));
       await active.sendKeys("Enter");
-      await active.waitForText("Selection unavailable", TIMEOUT);
+      await active.waitForText("selection unavailable", TIMEOUT);
       const retryOffset = readFileSync(current.tracePath, "utf8").length;
       await active.sendKeys("Tab");
       await waitForFileSlice(current.tracePath, retryOffset, ["file picker prepared revision="]);
       await active.waitForPane(pane => pane.includes("./retry/b.txt") && !pane.includes("./retry/c.txt"), TIMEOUT);
       await active.sendKeys("Enter");
-      await active.waitForText("Selection unavailable", TIMEOUT);
+      await active.waitForText("selection unavailable", TIMEOUT);
       expect(await composerPlainText(active)).toBe("@./retry/");
       expect(gateway?.requests).toHaveLength(0);
       // The rows are now the folder and b.txt; move from the stale slot to b.txt.
@@ -1885,7 +1885,7 @@ describe("@ file picker", () => {
 
       await clearComposer(active);
       await active.sendLiteral("@./missing/");
-      await active.waitForText("Directory unavailable.", TIMEOUT);
+      await active.waitForText("directory unavailable.", TIMEOUT);
       await active.sendKeys("Enter");
       expect(await composerPlainText(active)).toBe("@./missing/");
       expect(gateway?.requests).toHaveLength(0);
@@ -1915,7 +1915,7 @@ describe("@ file picker", () => {
       });
       expect(replay.code).toBe(0);
       expect(replay.stderr).toBe("");
-      expect(replay.stdout).toContain("Directory unavailable.");
+      expect(replay.stdout).toContain("directory unavailable.");
       expect(replay.stdout).toContain("@./c.txt");
     },
     120_000,

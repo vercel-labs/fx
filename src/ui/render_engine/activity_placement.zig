@@ -128,7 +128,7 @@ test "active tool slot stays transient when its entry is visible" {
     });
     const active = activity_runtime.ActivityProjection{ .tool_slot = .{
         .entry_id = 9,
-        .fallback_label = "Running",
+        .fallback_label = "running",
         .active = true,
         .kind = .command,
     } };
