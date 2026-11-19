@@ -20,6 +20,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const debug_trace = @import("../shared/debug_trace.zig");
 const io_mod = @import("../shared/io.zig");
+const text_utils = @import("../shared/text_utils.zig");
 const shell_resolver = @import("shell_resolver.zig");
 const command_runner = @import("../execution/command_runner.zig");
 
@@ -258,7 +259,8 @@ pub const TraceView = struct {
 
 const AliasLine = struct {
     name: []const u8,
-    /// The first word of the value; empty when it starts with anything but
+    /// The first word of the value, cut to `max_alias_target_len` without part
+    /// of a secret the cut splits; empty when it starts with anything but
     /// plain text.
     target: []const u8,
 };
@@ -282,8 +284,12 @@ fn parseAliasLine(line: []const u8) ?AliasLine {
     var value = rest[equals + 1 ..];
     if (value.len > 0 and (value[0] == '\'' or value[0] == '"')) value = value[1..];
     var end: usize = 0;
-    while (end < value.len and end < max_alias_target_len and isAliasTargetByte(value[end])) end += 1;
-    return .{ .name = name, .target = value[0..end] };
+    while (end < value.len and isAliasTargetByte(value[end])) end += 1;
+    const word = value[0..end];
+    // The target is cut without part of a secret the cut splits
+    // (`text_utils.secretSafePrefixLen`), since `/trace` masks it.
+    const kept = word[0..text_utils.secretSafePrefixLen(word, max_alias_target_len)];
+    return .{ .name = name, .target = kept };
 }
 
 fn isAliasTargetByte(byte: u8) bool {
@@ -1260,6 +1266,50 @@ test "snapshot trace view names redefined common commands and what their aliases
     try testing.expect(redefined[1].aliasTarget() == null);
     try testing.expectEqualStrings("ls", redefined[2].name);
     try testing.expectEqualStrings("eza", redefined[2].aliasTarget().?);
+}
+
+const SecretAliasCapture = struct {
+    fn capture(request: CaptureRequest) CaptureOutcome {
+        const generation = Generation.create() catch return .{ .failed = .out_of_memory };
+        const alloc = generation.arena.allocator();
+        generation.shell_path = alloc.dupe(u8, request.shell_path) catch {
+            generation.destroy();
+            return .{ .failed = .out_of_memory };
+        };
+        // `ls` keeps its word; `cat`'s first word is one token longer than the
+        // trace view keeps.
+        generation.replay = "alias ls='eza --icons'\n" ++
+            "alias cat='ghp_" ++ text_utils.repeat("A", 36) ++ text_utils.repeat("B", 40) ++ "'\n";
+        for ([_][]const u8{ "cat", "ls" }) |name| {
+            generation.names.put(alloc, name, {}) catch {};
+        }
+        return .{ .ready = generation };
+    }
+};
+
+test "the trace view keeps no part of a secret its alias target cut splits" {
+    var owner: Owner = .{ .capture_fn = SecretAliasCapture.capture };
+    defer owner.deinit();
+
+    const lease = (try owner.acquire("/bin/zsh", "/tmp", .{})).snapshot;
+    lease.release();
+    const view = owner.traceView();
+    try testing.expectEqualStrings("ready", view.state);
+    const redefined = view.redefined();
+    try testing.expectEqual(@as(usize, 2), redefined.len);
+    // The token word is one run longer than `max_alias_target_len`, so the
+    // cut leaves it out whole and no target is named.
+    try testing.expectEqualStrings("cat", redefined[0].name);
+    try testing.expect(redefined[0].aliasTarget() == null);
+    try testing.expectEqualStrings("ls", redefined[1].name);
+    try testing.expectEqualStrings("eza", redefined[1].aliasTarget().?);
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    for (redefined) |entry| {
+        const masked = try text_utils.maskSecrets(arena_state.allocator(), entry.aliasTarget() orelse "");
+        try testing.expect(std.mem.find(u8, masked, "AAAAAA") == null);
+    }
 }
 
 test "snapshot trace view says why the capture failed" {

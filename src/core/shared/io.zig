@@ -932,11 +932,18 @@ const LockFileMode = enum {
     owner_writable,
 };
 
+/// Whether a group or other write bit is set: the one rule for state an
+/// older fx release left readable by others, which fx reads only while no
+/// one else can change it (D61 in `tests/tla/session_manager/system-design.md`).
+pub fn othersCanWrite(permissions: std.Io.File.Permissions) bool {
+    return permissions.toMode() & 0o022 != 0;
+}
+
 /// A regular file only its owner can write, though others may read it.
 fn verifyOwnerWritableRegularFile(file: std.Io.File) !void {
     const stat = try file.stat(getIo());
     if (stat.kind != .file or stat.nlink != 1) return error.DurablePathUnsafe;
-    if (stat.permissions.toMode() & 0o022 != 0) return error.PrivateStatePermissionsUnsupported;
+    if (othersCanWrite(stat.permissions)) return error.PrivateStatePermissionsUnsupported;
 }
 
 fn openOrCreatePrivateLockFile(dir: *VerifiedDir, name: []const u8, existing: LockFileMode) !std.Io.File {

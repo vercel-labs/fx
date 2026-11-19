@@ -106,12 +106,16 @@ async function runScenario(name) {
   const seedTurns = automatic ? 1 : 3;
   const seedRule = "Always keep the history markers.";
   const seedReply = (turn) => `${turn === 1 ? head : `HOST_HISTORY_MIDDLE_${turn}`}\n${"history alpha beta gamma delta sample line\n".repeat(automatic ? 18_000 : 1_800)}HOST_SEED_DONE_${turn}${turn === seedTurns ? `\n${tail}` : ""}`;
-  const activity = /Compacting \((?:\d+h)?(?:\d+m)?\d+s\)/;
+  const activity = /Compacting \d+% \((?:\d+h)?(?:\d+m)?\d+s\)/;
   const forbidden = /Compacting|compaction|Context compacted|No context to compact|HOST_INTERNAL_HANDOFF_268a/i;
   // Ctrl+O gives each compaction's model call its own line, as for every call;
   // nothing else there may speak of compaction.
   const compactionCallLine = /^  (?:[A-Z][a-z]{2} \d{1,2} )?\d{2}:\d{2}:\d{2} · [^\n]* \(compaction\)$/gm;
   const withoutCompactionCallLines = (text) => text.replace(compactionCallLine, "");
+  // The line a successful compaction leaves in the transcript.
+  const compactedLine = /Context compacted \((?:\d+h)?(?:\d+m)?\d+s\)/g;
+  const compactedLines = (text) => text.match(compactedLine)?.length ?? 0;
+  const withoutCompactedLines = (text) => text.replace(compactedLine, "");
   const emptyComposer = (text) => text.split("\n").some((line) => /^[ \t]*(?:┃|❯|>)[ \t]*$/.test(line));
   const records = new Map();
   const requests = [];
@@ -217,16 +221,21 @@ async function runScenario(name) {
     await waitFor(() => {
       const rows = grid(active.terminal).split("\n").filter((line) => activity.test(line));
       assert.equal(rows.length, 1, "exactly one live activity row");
-      assert(!/[↑↓]|tokens|chunk|%/i.test(rows[0]), "compaction must not show a token suffix");
+      assert(!/[↑↓]|tokens|chunk/i.test(rows[0]), "compaction must not show a token suffix");
       markerStates.add(rows[0].includes("•"));
       return markerStates.size === 2 && !rows[0].includes(first) && active.writes >= writes + 2;
     }, `${label} marker blink and elapsed time`, 5000);
   }
-  async function silentTranscript() {
-    assert(!forbidden.test(grid(active.terminal)), "compaction output leaked into inline scrollback");
+  // Compaction leaves nothing in the transcript but one line for each
+  // compaction that succeeded on this screen.
+  async function silentTranscript(compacted = 0) {
+    assert.equal(compactedLines(grid(active.terminal)), compacted, "one compacted line for each successful compaction");
+    assert(!forbidden.test(withoutCompactedLines(grid(active.terminal))), "compaction output leaked into inline scrollback");
     active.runtime.write("\x0f");
     await waitFor(() => active.terminal.buffer.active.type === "alternate" && grid(active.terminal).includes("esc close · pgup/pgdn scroll"), "full transcript");
-    assert(!forbidden.test(withoutCompactionCallLines(grid(active.terminal))), "compaction output leaked into Ctrl+O");
+    // Ctrl+O shows one page, which may not reach the line.
+    assert(compactedLines(grid(active.terminal)) <= compacted, "at most one compacted line for each successful compaction in Ctrl+O");
+    assert(!forbidden.test(withoutCompactedLines(withoutCompactionCallLines(grid(active.terminal)))), "compaction output leaked into Ctrl+O");
     active.runtime.write("\x0f");
     await waitFor(() => active.terminal.buffer.active.type === "normal" && emptyComposer(grid(active.terminal)), "inline restoration");
   }
@@ -266,7 +275,7 @@ async function runScenario(name) {
     }
     if (name === "success") {
       await hold.releaseBody(handoff);
-      await waitFor(() => commits > beforeCommits && !activity.test(grid(active.terminal)) && emptyComposer(grid(active.terminal)), "published summary and idle composer");
+      await waitFor(() => commits > beforeCommits && !activity.test(grid(active.terminal)) && emptyComposer(grid(active.terminal)) && compactedLines(grid(active.terminal)) === 1, "published summary, its line, and idle composer");
       assert.equal(ordinary, seedTurns, "manual completion created a synthetic prompt");
       assert.notDeepEqual(records.get(sessionId).bytes, beforeBytes, "success must publish a changed checkpoint");
     } else {
@@ -287,7 +296,7 @@ async function runScenario(name) {
       active.runtime.write("\x1b");
       await waitFor(() => !/compact/i.test(grid(active.terminal)), "feedback dismissal");
     }
-    await silentTranscript();
+    await silentTranscript(name === "success" ? 1 : 0);
     if (automatic) {
       await stop();
       phase = "reopen";
@@ -317,7 +326,7 @@ async function runScenario(name) {
       handoff: JSON.stringify(request).includes("HOST_INTERNAL_HANDOFF_268a"),
     }))));
     assert.equal(followup.includes("HOST_INTERNAL_HANDOFF_268a"), name === "success");
-    await silentTranscript();
+    await silentTranscript(name === "success" ? 1 : 0);
     await stop();
     phase = "reopen";
     await start(["--resume", sessionId]);
@@ -329,6 +338,7 @@ async function runScenario(name) {
     const reopened = JSON.stringify(requests.at(-1));
     assert(reopened.includes(head) && reopened.includes(tail));
     assert.equal(reopened.includes("HOST_INTERNAL_HANDOFF_268a"), name === "success");
+    // The line is not saved, so the reopened session does not show it.
     await silentTranscript();
     await stop();
     console.log(`term compaction ${name} passed`);

@@ -37,7 +37,21 @@ pub fn Runtime(comptime App: type) type {
     return struct {
         const AppAgent = if (@hasField(App, "main_agent")) @FieldType(App, "main_agent") else struct {};
         pub fn startWorkerThread(app: *App, agent: *AppAgent) !void {
+            enableCommitGate(agent);
             agent.worker_thread = try std.Thread.spawn(.{}, workerThreadMain, .{app});
+        }
+
+        /// The main loop commits each finished turn of a threaded agent
+        /// (`app_session_runtime.zig` appendFinishedPrompt) and says so, so
+        /// the agent's next turn from mail waits for that commit
+        /// (`WorkerRuntime.enableCommitGate`). A cooperative host starts no
+        /// thread here and keeps the old order.
+        fn enableCommitGate(agent: anytype) void {
+            if (comptime @hasField(@TypeOf(agent.*), "worker") and
+                @hasDecl(@TypeOf(agent.worker), "enableCommitGate"))
+            {
+                agent.worker.enableCommitGate();
+            }
         }
 
         /// Starts `agent`'s own worker thread, which runs main's worker loop
@@ -45,6 +59,7 @@ pub fn Runtime(comptime App: type) type {
         /// threads, so it hosts only its first agent.
         pub fn startAgentWorkerThread(app: *App, agent: *agents.Agent) !void {
             if (comptime cooperativeHost(App)) return error.AgentThreadsUnavailable;
+            enableCommitGate(agent);
             agent.worker_thread = try std.Thread.spawn(.{}, agentWorkerThreadMain, .{ app, agent });
         }
 

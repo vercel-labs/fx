@@ -94,7 +94,8 @@
 //!   session with retained turns, such as a closed one: `open`, `name` (left
 //!   out for a one-off), `session_id`, the name of its folder in the session
 //!   store, `profile`, `state` (what the agent list says: `needs_approval`,
-//!   `has_question`, `needs_you`, `working`, `finished`, or `idle`),
+//!   `has_question`, `needs_you`, `working`, `finished`, `failed`,
+//!   `stopped`, or `idle`),
 //!   `activity` (its host's work phase: `idle`, `running`,
 //!   `awaiting_approval`, `interrupted`, `finished`, `closing`, or `unknown`
 //!   when its host's registry has no entry for it), `last_outcome`
@@ -103,15 +104,16 @@
 //!   that work failed, `model`, `effort`, `title` (masked), `status`
 //!   (masked), its status row, such as a failed request that waits for the
 //!   user, `task` (masked), the start of its newest retained turn's prompt:
-//!   at most 240 bytes, without the end of a word that cut would split (its
-//!   ASCII bytes, or the whole word when it holds `://`), and left out when
-//!   none of it is kept, and `task_bytes`, that prompt's whole length,
+//!   at most 240 bytes, without part of a secret that cut would split, and
+//!   left out when none of it is kept, and `task_bytes`, that prompt's whole
+//!   length,
 //!   `turns_retained`,
 //!   `turns_omitted`, and `tool_calls` {`retained`, `not_succeeded`}, its
 //!   calls in the tool-call window. A subagent that is not open has only
 //!   `open`, `session_id`, and the fields from `task` on. Masked text is cut
 //!   at 400 bytes; a cut `last_reason`, `title`, or `status` comes with
-//!   `<name>_bytes`, its whole masked length.
+//!   `<name>_bytes`, its whole masked length. A secret that a display cut
+//!   short and marked with `...` or `…` is masked too.
 //!   After each `subagent` comes a `subagent_turn` for each of its newest 8
 //!   retained turns, newest first: `session_id`, `source` with the
 //!   `subagent_id` that the turn's `tool_call`, `network_call`, and
@@ -393,7 +395,7 @@ const Records = struct {
 
     /// Text with obvious secrets replaced by `[redacted]`.
     fn masked(self: *Records, name: []const u8, value: []const u8) !void {
-        try self.text(name, try text_utils.maskSecrets(self.arena, value));
+        try self.text(name, try text_utils.maskSecretsCutShort(self.arena, value));
     }
 
     /// Text that is left out when it is empty.
@@ -495,6 +497,8 @@ pub fn build(app: anytype) ![]u8 {
     const agent = agents.screenAgentOf(app);
     const history = agent.session.agent.history.items;
     const permission_view = app_permission_runtime.Runtime(App).viewOf(app, agent);
+    // A copy: a subagent's worker can add approvals while the report is built.
+    const permission_grants = try app_permission_runtime.Runtime(App).copyGrants(app, agent, arena);
     // Taken once, so the failed calls and the shell record agree.
     const shell_view = try arena.create(shell_snapshot.TraceView);
     shell_view.* = shell_snapshot.processOwner().traceView();
@@ -511,7 +515,7 @@ pub fn build(app: anytype) ![]u8 {
     try writeNetwork(r);
     try writeModelCatalog(r, app);
     try writeToolCalls(r, history, shell_view);
-    try writePermissions(r, permission_view.grants.items);
+    try writePermissions(r, permission_grants);
     try writeAutoReviews(r);
     try writeGit(r, app.workspace_root);
     try writeSettings(r, app.workspace_root);
@@ -1031,7 +1035,7 @@ fn writeInterruptedTurn(r: *Records, history: []const types.HistoryTurn) !void {
     if (entry.tool_call) |call| {
         try r.text("in_flight_tool", traceToolDisplayName(call.name));
         if (call.arguments_json.len > 0) {
-            try r.masked("in_flight_args", text_utils.utf8PrefixByBytes(call.arguments_json, tool_args_max_bytes));
+            try r.masked("in_flight_args", call.arguments_json[0..text_utils.secretSafePrefixLen(call.arguments_json, tool_args_max_bytes)]);
             try r.number("in_flight_args_bytes", call.arguments_json.len);
         }
     }
@@ -1243,7 +1247,7 @@ fn endSubagentRecord(r: *Records, input: SubagentsInput, session_id: []const u8)
 /// nothing when it is empty.
 fn writeSubagentText(r: *Records, comptime name: []const u8, value: []const u8) !void {
     if (value.len == 0) return;
-    const masked = try text_utils.maskSecrets(r.arena, value);
+    const masked = try text_utils.maskSecretsCutShort(r.arena, value);
     const kept = text_utils.utf8PrefixByBytes(masked, subagent_text_max_bytes);
     try r.text(name, kept);
     if (kept.len < masked.len) try r.number(name ++ "_bytes", masked.len);
@@ -1251,12 +1255,11 @@ fn writeSubagentText(r: *Records, comptime name: []const u8, value: []const u8) 
 
 /// `value` with secrets masked, cut to `subagent_text_max_bytes` on a UTF-8
 /// boundary. Masking comes first, so this cut never splits a secret the mask
-/// would have found. A task comes already cut from the turn ring, which
-/// leaves out the end of the word its own cut splits
-/// (`subagent_turn_metrics.keptPrompt`), so no part of a secret that cut
-/// shortened reaches the mask.
+/// would have found. A task comes already cut from the turn ring, which keeps
+/// no part of a secret its cut splits (`text_utils.secretSafePrefixLen`), so
+/// no part of a secret that cut shortened reaches the mask.
 fn maskedSubagentText(r: *Records, value: []const u8) ![]const u8 {
-    return text_utils.utf8PrefixByBytes(try text_utils.maskSecrets(r.arena, value), subagent_text_max_bytes);
+    return text_utils.utf8PrefixByBytes(try text_utils.maskSecretsCutShort(r.arena, value), subagent_text_max_bytes);
 }
 
 fn findTraceChild(registry: []const subagent_tool_host.Runtime.TraceChild, id: []const u8) ?*const subagent_tool_host.Runtime.TraceChild {
@@ -1736,7 +1739,7 @@ fn writeToolPayload(r: *Records, comptime name: []const u8, body: []const u8, bo
     if (total_bytes == 0) return;
     // The ring cuts at a byte count; a character it cut in two is left out.
     const kept = if (total_bytes > body_len) withoutCutCharacter(body) else body;
-    const masked = try text_utils.maskSecrets(r.arena, std.mem.trim(u8, kept, " \t\r\n"));
+    const masked = try text_utils.maskSecretsCutShort(r.arena, std.mem.trim(u8, kept, " \t\r\n"));
     const trimmed = std.mem.trim(u8, masked, " \t\r\n");
     if (trimmed.len == 0) return;
     try r.text(name, trimmed);
@@ -1760,7 +1763,7 @@ fn withoutCutCharacter(text: []const u8) []const u8 {
 
 fn writeToolResultPreview(r: *Records, body: []const u8, total_bytes: u32) !void {
     if (total_bytes == 0) return;
-    const masked = try text_utils.maskSecrets(r.arena, std.mem.trim(u8, body, " \t\r\n"));
+    const masked = try text_utils.maskSecretsCutShort(r.arena, std.mem.trim(u8, body, " \t\r\n"));
     const trimmed = std.mem.trim(u8, masked, " \t\r\n");
     if (trimmed.len == 0) return;
     try r.text("result_preview", text_utils.utf8PrefixByBytes(firstUsefulPreviewLine(trimmed), result_preview_max_bytes));
@@ -1846,6 +1849,19 @@ fn writeAutoReviewFields(r: *Records, review: *const diagnostics.AutoReview) !vo
     try r.text("origin", @tagName(review.origin));
     try r.boolean("reused", review.reused);
     if (!review.reused) try r.number("elapsed_ms", review.elapsed_ms);
+    // Each send to the reviewer, so a held review shows whether a timeout
+    // was retried and how long each try took.
+    const attempts = review.attempts();
+    if (attempts.len > 0) {
+        try r.beginArray("attempts");
+        for (attempts) |attempt| {
+            try r.beginItem();
+            try r.text("result", @tagName(attempt.result));
+            try r.number("elapsed_ms", attempt.elapsed_ms);
+            try r.endItem();
+        }
+        try r.endArray();
+    }
     try r.text("call_id", review.callId());
     try r.optionalText("action_kind", review.actionKind());
     try writeToolPayload(r, "action", review.action(), review.action_len, review.action_total_bytes);
@@ -1866,7 +1882,7 @@ const skills_shown_max: usize = 400;
 /// `text` with secrets masked, cut to `setup_line_max_bytes` on a UTF-8
 /// boundary, and ending in its full size when it was cut.
 fn setupLine(arena: std.mem.Allocator, text: []const u8) ![]const u8 {
-    const masked = try text_utils.maskSecrets(arena, text);
+    const masked = try text_utils.maskSecretsCutShort(arena, text);
     const kept = text_utils.utf8PrefixByBytes(masked, setup_line_max_bytes);
     if (kept.len == masked.len) return masked;
     return arena.print("{s} ... ({d} bytes)", .{ kept, masked.len });
@@ -2322,7 +2338,7 @@ fn timelineText(arena: std.mem.Allocator, text: []const u8) ![]const u8 {
         if (trimmed.len == 0) continue;
         if (isBannerNoiseLine(trimmed)) continue;
         if (out.items.len > 0) try out.append(arena, '\n');
-        try out.appendSlice(arena, try text_utils.maskSecrets(arena, trimmed));
+        try out.appendSlice(arena, try text_utils.maskSecretsCutShort(arena, trimmed));
     }
     return out.items;
 }
@@ -2379,8 +2395,14 @@ fn writeTraceLog(r: *Records, path: []const u8) !void {
     const n = file.readPositionalAll(io_mod.getIo(), buf, offset) catch return;
     if (n == 0) return;
 
+    // A read that starts after the file's start begins inside a line, which
+    // can hold the end of a secret without the start `maskSecrets` matches
+    // on, so that partial line is left out.
+    var body = buf[0..n];
+    if (offset > 0) body = if (std.mem.findScalar(u8, body, '\n')) |line_end| body[line_end + 1 ..] else body[0..0];
+
     var lines: std.ArrayList([]const u8) = .empty;
-    var it = std.mem.splitScalar(u8, buf[0..n], '\n');
+    var it = std.mem.splitScalar(u8, body, '\n');
     while (it.next()) |line| {
         const trimmed = std.mem.trimEnd(u8, line, " \t\r");
         if (trimmed.len == 0) continue;
@@ -2396,7 +2418,7 @@ fn writeTraceLog(r: *Records, path: []const u8) !void {
     try r.end();
     for (lines.items[start..]) |line| {
         try r.begin("trace_log_line");
-        try r.text("text", try neutralized(r.arena, try text_utils.maskSecrets(r.arena, line)));
+        try r.text("text", try neutralized(r.arena, try text_utils.maskSecretsCutShort(r.arena, line)));
         try r.end();
     }
 }
@@ -3684,7 +3706,7 @@ fn checkSubagentText(fuzzed: []const u8) !void {
                 try std.testing.expectEqualStrings(try text_utils.dupeValidUtf8(ta, name), try testString(record, field));
             }
         }
-        const masked = try text_utils.maskSecrets(ta, text);
+        const masked = try text_utils.maskSecretsCutShort(ta, text);
         const kept = text_utils.utf8PrefixByBytes(masked, subagent_text_max_bytes);
         inline for (.{ "last_reason", "title", "status" }) |field| {
             try std.testing.expectEqualStrings(try text_utils.dupeValidUtf8(ta, kept), try testString(record, field));
@@ -3692,7 +3714,7 @@ fn checkSubagentText(fuzzed: []const u8) !void {
                 try std.testing.expectEqual(@as(i64, @intCast(masked.len)), try testInt(record, field ++ "_bytes"));
             } else try expectAbsent(record, field ++ "_bytes");
         }
-        const task = text_utils.utf8PrefixByBytes(try text_utils.maskSecrets(ta, turn.prompt()), subagent_text_max_bytes);
+        const task = text_utils.utf8PrefixByBytes(try text_utils.maskSecretsCutShort(ta, turn.prompt()), subagent_text_max_bytes);
         if (task.len == 0) {
             // The ring kept nothing, such as a first word that holds a URL.
             try expectAbsent(record, "task");
@@ -4517,10 +4539,16 @@ test "trace keeps a failed call whole in its own record after the window moves o
     try expectAbsent(failed, "args_omitted_bytes");
     try expectAbsent(failed, "args_tail");
     try expectStartsWith(try testString(failed, "result"), "no such dir \x1b[31mred\x1b[0m \\xff\nzzz");
-    try expectEndsWith(try testString(failed, "result_tail"), "zzz\nOUTPUT_TAIL_MARKER");
-    try std.testing.expectEqual(@as(i64, @intCast(output.len)), try testInt(failed, "result_bytes"));
+    // The tail starts inside the one long run of `z`, and a tail holds no
+    // part of a run its start splits, so it begins at the last line.
     const kept_bytes = @typeInfo(@FieldType(diagnostics.KeptText, "buf")).array.len;
-    try std.testing.expectEqual(@as(i64, @intCast(output.len - kept_bytes)), try testInt(failed, "result_omitted_bytes"));
+    const result_tail = try testString(failed, "result_tail");
+    try std.testing.expectEqualStrings("\nOUTPUT_TAIL_MARKER", result_tail);
+    try std.testing.expectEqual(@as(i64, @intCast(output.len)), try testInt(failed, "result_bytes"));
+    try std.testing.expectEqual(
+        @as(i64, @intCast(output.len - kept_bytes / 2 - result_tail.len)),
+        try testInt(failed, "result_omitted_bytes"),
+    );
 
     // The window has moved past the failed call.
     try std.testing.expectEqual(diagnostics.tool_call_ring_capacity, trace.count("tool_call"));
@@ -4957,6 +4985,45 @@ test "trace auto reviews keep holds and recent reviews with their action and rat
     try std.testing.expectEqual(@as(i64, 300), try testInt(try trace.nth("auto_review", 1), "action_bytes"));
 }
 
+test "a review record lists each send to the reviewer" {
+    diagnostics.resetSession();
+    defer diagnostics.resetSession();
+    const sends = [_]diagnostics.AutoReviewAttempt{
+        .{ .result = .timed_out, .elapsed_ms = 30_001 },
+        .{ .result = .answered, .elapsed_ms = 900 },
+    };
+    diagnostics.recordAutoReview(.{
+        .outcome = .clear,
+        .elapsed_ms = 30_901,
+        .call_id = "call_retried",
+        .tool_name = "shell",
+        .attempts = &sends,
+        .at_ms = 1_700_000_000_000,
+    });
+    diagnostics.recordAutoReview(.{
+        .outcome = .clear,
+        .call_id = "call_no_sends",
+        .tool_name = "shell",
+        .at_ms = 1_700_000_000_001,
+    });
+    const w = try TestWriter.create();
+    defer w.destroy();
+    try writeAutoReviews(&w.records);
+    var trace = try w.trace();
+    defer trace.deinit();
+
+    const retried = try trace.nth("auto_review", 0);
+    try std.testing.expectEqualStrings("call_retried", try testString(retried, "call_id"));
+    const items = retried.get("attempts").?.array.items;
+    try std.testing.expectEqual(@as(usize, 2), items.len);
+    try std.testing.expectEqualStrings("timed_out", try testString(items[0].object, "result"));
+    try std.testing.expectEqual(@as(i64, 30_001), try testInt(items[0].object, "elapsed_ms"));
+    try std.testing.expectEqualStrings("answered", try testString(items[1].object, "result"));
+    // A review with no recorded sends writes no list.
+    const plain = try trace.nth("auto_review", 1);
+    try std.testing.expect(plain.get("attempts") == null);
+}
+
 test "trace git record says when fx won't run git or the folder is not a repository" {
     const w = try TestWriter.create();
     defer w.destroy();
@@ -5288,6 +5355,63 @@ test "trace review and setup records stay valid JSON lines for fuzzed text" {
     });
 }
 
+test "trace log tail leaves out a line its read starts inside" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(dir);
+    const cut_path = try alloc.print("{s}/cut.log", .{dir});
+    defer alloc.free(cut_path);
+
+    // The read starts 20 bytes into this line, inside its token, and 77 whole
+    // lines follow it, under `trace_max_lines`, so every one is written.
+    const token_line = "token ghp_" ++ text_utils.repeat("A", 36) ++ " end\n";
+    const cut_inside = "token ghp_".len + 10;
+    try std.testing.expect(cut_inside < token_line.len);
+    const after_bytes = trace_tail_bytes + cut_inside - token_line.len;
+
+    var log: std.Io.Writer.Allocating = .init(alloc);
+    defer log.deinit();
+    for (0..200) |index| try log.writer.print("before {d}\n", .{index});
+    try log.writer.writeAll(token_line);
+    var written: usize = 0;
+    var line_index: usize = 0;
+    while (written < after_bytes) : (line_index += 1) {
+        // Lines of 79 bytes and a newline, so 77 of them fit under the cap.
+        var line: [80]u8 = undefined;
+        @memset(&line, '.');
+        _ = try std.mem.print(&line, "after line {d} ", .{line_index});
+        line[79] = '\n';
+        const take = @min(after_bytes - written, line.len);
+        try log.writer.writeAll(line[0..take]);
+        written += take;
+    }
+    {
+        var file = try tmp.dir.createFile(io_mod.getIo(), "cut.log", .{});
+        defer file.close(io_mod.getIo());
+        try file.writeStreamingAll(io_mod.getIo(), log.written());
+    }
+
+    const w = try TestWriter.create();
+    defer w.destroy();
+    try writeTraceLog(&w.records, cut_path);
+    var trace = try w.trace();
+    defer trace.deinit();
+    const summary = try trace.one("trace_log");
+    try std.testing.expectEqual(@as(i64, trace_tail_bytes), try testInt(summary, "bytes"));
+    try std.testing.expect(try testBool(summary, "older_lines_cut"));
+    // The partial line is gone, and every whole line after it stays.
+    try std.testing.expectEqual(@as(usize, 77), trace.count("trace_log_line"));
+    for (0..trace.count("trace_log_line")) |index| {
+        const line = try testString(try trace.nth("trace_log_line", index), "text");
+        try expectNotIn(line, "AAAAAA");
+    }
+    try expectStartsWith(try testString(try trace.nth("trace_log_line", 0), "text"), "after line 0 ");
+    try expectStartsWith(try testString(try trace.nth("trace_log_line", 76), "text"), "after line 76 ");
+    try expectNotIn(w.out.written(), "AAAAAA");
+}
+
 test "trace log tail keeps the newest lines, masked, and skips logs it cannot read" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -5388,7 +5512,7 @@ fn checkTextRoundTrip(input: []const u8) !void {
     const plain = try text_utils.dupeValidUtf8(a, input);
     try std.testing.expectEqualStrings(plain, try testString(record, "plain"));
     try std.testing.expectEqualStrings(plain, record.get("items").?.array.items[0].string);
-    const masked = try text_utils.dupeValidUtf8(a, try text_utils.maskSecrets(a, input));
+    const masked = try text_utils.dupeValidUtf8(a, try text_utils.maskSecretsCutShort(a, input));
     try std.testing.expectEqualStrings(masked, try testString(record, "masked"));
     const neutral = try testString(record, "neutral");
     try std.testing.expect(std.mem.count(u8, neutral, "web_search") >= std.mem.count(u8, input, "web_search"));

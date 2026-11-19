@@ -1504,12 +1504,10 @@ fn verifyPrivateDirectory(dir: std.Io.Dir) !void {
 }
 
 /// A directory only its owner can write, though others may read it.
-fn verifyOwnerWritableDirectory(dir: std.Io.Dir) !void {
+pub fn verifyOwnerWritableDirectory(dir: std.Io.Dir) !void {
     const stat = try dir.stat(io_mod.getIo());
     if (stat.kind != .directory) return error.SessionPathUnsafe;
-    if (stat.permissions.toMode() & 0o022 != 0) {
-        return error.PrivateStatePermissionsUnsupported;
-    }
+    if (io_mod.othersCanWrite(stat.permissions)) return error.PrivateStatePermissionsUnsupported;
 }
 
 fn verifyPrivateRegularFile(file: std.Io.File) !void {

@@ -21,6 +21,16 @@ pub const max_action_len: usize = 240;
 /// Bytes kept of the reviewer's rationale.
 pub const max_rationale_len: usize = 1024;
 
+/// Sends kept for one review: a review and its confirming second review,
+/// each with one transport retry and one format retry.
+pub const max_attempts: usize = 6;
+
+/// What one send to the reviewer returned.
+pub const AttemptResult = enum(u8) { answered, malformed, timed_out, transient_failure, permanent_failure, call_failed, cancelled };
+
+/// One send to the reviewer: its result and how long it took.
+pub const Attempt = struct { result: AttemptResult, elapsed_ms: u32 };
+
 pub const Outcome = enum(u8) {
     /// The reviewer cleared the action, and fx ran it.
     clear,
@@ -62,6 +72,8 @@ pub const Review = struct {
     rationale_buf: [max_rationale_len]u8 = @splat(0),
     rationale_len: u16 = 0,
     rationale_total_bytes: u32 = 0,
+    attempts_buf: [max_attempts]Attempt = @splat(.{ .result = .answered, .elapsed_ms = 0 }),
+    attempts_len: u8 = 0,
 
     pub fn callId(self: *const Review) []const u8 {
         return self.call_id_buf[0..self.call_id_len];
@@ -90,6 +102,11 @@ pub const Review = struct {
     pub fn rationale(self: *const Review) []const u8 {
         return self.rationale_buf[0..self.rationale_len];
     }
+
+    /// The sends this review made, in order.
+    pub fn attempts(self: *const Review) []const Attempt {
+        return self.attempts_buf[0..self.attempts_len];
+    }
 };
 
 pub const Record = struct {
@@ -104,6 +121,7 @@ pub const Record = struct {
     action: []const u8 = "",
     reason: []const u8 = "",
     rationale: []const u8 = "",
+    attempts: []const Attempt = &.{},
     at_ms: i64,
 };
 
@@ -158,6 +176,16 @@ fn copyInto(buf: []u8, value: []const u8) usize {
     return kept.len;
 }
 
+/// `copyInto` for text that can hold a secret: the kept part ends before a
+/// secret the cut would split (`text_utils.secretSafePrefixLen`), since
+/// `/trace` masks it with `text_utils.maskSecrets`, which finds one only
+/// whole.
+fn copySecretSafe(buf: []u8, value: []const u8) usize {
+    const n = text_utils.secretSafePrefixLen(value, buf.len);
+    @memcpy(buf[0..n], value[0..n]);
+    return n;
+}
+
 fn fill(slot: *Review, input: Record) void {
     slot.* = .{
         .at_ms = input.at_ms,
@@ -173,8 +201,11 @@ fn fill(slot: *Review, input: Record) void {
     slot.tool_name_len = @intCast(copyInto(&slot.tool_name_buf, input.tool_name));
     slot.action_kind_len = @intCast(copyInto(&slot.action_kind_buf, input.action_kind));
     slot.reason_len = @intCast(copyInto(&slot.reason_buf, input.reason));
-    slot.action_len = @intCast(copyInto(&slot.action_buf, input.action));
-    slot.rationale_len = @intCast(copyInto(&slot.rationale_buf, input.rationale));
+    slot.action_len = @intCast(copySecretSafe(&slot.action_buf, input.action));
+    slot.rationale_len = @intCast(copySecretSafe(&slot.rationale_buf, input.rationale));
+    const kept = @min(input.attempts.len, max_attempts);
+    @memcpy(slot.attempts_buf[0..kept], input.attempts[0..kept]);
+    slot.attempts_len = @intCast(kept);
 }
 
 /// Records one review. A review that did not clear also goes to the held
@@ -362,6 +393,46 @@ test "long values are cut on a UTF-8 boundary and keep their full size" {
     try testing.expect(std.unicode.utf8ValidateSlice(review.action()));
 }
 
+test "a review keeps no part of a secret the action or rationale cut splits" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const token = "ghp_" ++ text_utils.repeat("A", 36);
+    const out = try testing.allocator.alloc(Review, recent_capacity);
+    defer testing.allocator.free(out);
+    var value_buf: [max_rationale_len + token.len + 32]u8 = undefined;
+
+    var shift: usize = 0;
+    while (shift < token.len) : (shift += 1) {
+        reset();
+        const action = fillCutValue(&value_buf, token, max_action_len - token.len + shift);
+        record(.{ .outcome = .caution, .call_id = "c", .tool_name = "shell", .action = action, .at_ms = 1 });
+        try testing.expectEqual(@as(usize, 1), snapshotRecent(out));
+        try testing.expectEqual(@as(u32, @intCast(action.len)), out[0].action_total_bytes);
+        try testing.expect(std.mem.find(u8, try text_utils.maskSecrets(arena, out[0].action()), "AAAAAA") == null);
+
+        reset();
+        const rationale = fillCutValue(&value_buf, token, max_rationale_len - token.len + shift);
+        record(.{ .outcome = .caution, .call_id = "c", .tool_name = "shell", .rationale = rationale, .at_ms = 1 });
+        try testing.expectEqual(@as(usize, 1), snapshotRecent(out));
+        try testing.expectEqual(@as(u32, @intCast(rationale.len)), out[0].rationale_total_bytes);
+        try testing.expect(std.mem.find(u8, try text_utils.maskSecrets(arena, out[0].rationale()), "AAAAAA") == null);
+    }
+}
+
+/// `value_buf[0..planted_start + planted.len + " done".len]`: `x ` pairs up
+/// to `planted_start`, then `planted`, then ` done`.
+fn fillCutValue(value_buf: []u8, planted: []const u8, planted_start: usize) []const u8 {
+    for (value_buf[0..planted_start], 0..) |*byte, index| byte.* = if (index % 2 == 0) 'x' else ' ';
+    var len = planted_start;
+    @memcpy(value_buf[len..][0..planted.len], planted);
+    len += planted.len;
+    @memcpy(value_buf[len..][0.." done".len], " done");
+    len += " done".len;
+    return value_buf[0..len];
+}
+
 test "a reset clears both rings and the counts" {
     reset();
     defer reset();
@@ -520,4 +591,30 @@ fn reviewIsWhole(review: *const Review) bool {
     const seq = std.fmt.parseInt(usize, id[dash + 1 ..], 10) catch return false;
     const want: Outcome = if (seq % 4 == 0) .caution else .clear;
     return review.outcome == want and review.at_ms == @as(i64, @intCast(seq));
+}
+
+test "a review keeps its sends in order, up to the limit" {
+    reset();
+    defer reset();
+
+    var sends: [max_attempts + 2]Attempt = undefined;
+    for (&sends, 0..) |*send, index| send.* = .{
+        .result = if (index == 0) .timed_out else .answered,
+        .elapsed_ms = @intCast(index * 10),
+    };
+    record(.{
+        .outcome = .clear,
+        .call_id = "call_attempts",
+        .tool_name = "shell",
+        .attempts = &sends,
+        .at_ms = 1,
+    });
+    const snapshots = try snapshotsForTest();
+    defer freeForTest(snapshots);
+    try testing.expectEqual(@as(usize, 1), snapshots.recent.len);
+    const review = &snapshots.recent[0];
+    const kept = review.attempts();
+    try testing.expectEqual(@as(usize, max_attempts), kept.len);
+    try testing.expectEqual(AttemptResult.timed_out, kept[0].result);
+    try testing.expectEqual(@as(u32, (max_attempts - 1) * 10), kept[kept.len - 1].elapsed_ms);
 }

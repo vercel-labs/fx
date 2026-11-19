@@ -442,7 +442,7 @@ pub const Runtime = struct {
     /// Waits until `timeout_ms` for backend threads that the exit close left
     /// draining, so a test can free the backend. fx's own exit never waits
     /// past its budget, and keeps such a backend allocated instead.
-    fn joinExitDrainForTest(self: *Runtime, timeout_ms: i64) void {
+    pub fn joinExitDrainForTest(self: *Runtime, timeout_ms: i64) void {
         const zio = io_mod.getIo();
         self.backend_mutex.lockUncancelable(zio);
         defer self.backend_mutex.unlock(zio);
