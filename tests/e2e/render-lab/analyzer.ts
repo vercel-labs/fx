@@ -18,7 +18,7 @@ export const TERMINAL_TOOL_MARKER = "ran sleep, printf, sleep";
 export const EXPANDED_TERMINAL_TOOL_MARKER = "ran sleep 1; i=1";
 const ACTIVE_TOOL_FINAL_MARKER = "RENDER_LAB_LOCAL_GATEWAY_OK";
 const OBSERVABILITY_PERMISSION_PROMPT = "would you like to run the following command?";
-const OBSERVABILITY_PERMISSION_REVIEW = "Permission needed";
+const OBSERVABILITY_PERMISSION_REVIEW = "permission needed";
 
 export function commandMoreCount(text: string): number | null {
   const match = text.match(/│ … (\d+) (?:(?:line|lines) more \(ctrl(?:\+| )o to view\)|more \(ctrl(?:\+| )o\)|more)/);

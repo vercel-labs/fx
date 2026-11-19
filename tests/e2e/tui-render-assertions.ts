@@ -158,8 +158,8 @@ export function findActiveFileApprovalBlock(
   const wholeScreen = grid.map(normalizeGridLine);
   const screenText = wholeScreen.join("\n");
   if (
-    screenText.includes("Apply this change?") ||
-    screenText.includes("Reveal that this file already matches?")
+    screenText.includes("apply this change?") ||
+    screenText.includes("reveal that this file already matches?")
   ) {
     return {
       topDivider: 0,
@@ -180,8 +180,8 @@ export function findActiveFileApprovalBlock(
       .map(normalizeGridLine);
     const text = lines.join("\n");
     if (
-      text.includes("Apply this change?") ||
-      text.includes("Reveal that this file already matches?")
+      text.includes("apply this change?") ||
+      text.includes("reveal that this file already matches?")
     ) {
       return { topDivider, bottomDivider, lines, text };
     }

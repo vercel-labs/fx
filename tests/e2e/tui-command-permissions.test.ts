@@ -830,9 +830,9 @@ describe("effect-aware command permissions", () => {
       await activeSession.sendText("Run the prepared two-command history fixture.");
       await activeSession.waitForText(COMMAND_APPROVAL_PROMPT, TIMEOUT);
       await activeSession.sendKeys("Tab");
-      await activeSession.waitForText("Yes, and tell fx what to do next", TIMEOUT);
+      await activeSession.waitForText("yes, and tell fx what to do next", TIMEOUT);
       await activeSession.sendLiteralText(feedback);
-      await activeSession.waitForText(`Yes, ${feedback}`, TIMEOUT);
+      await activeSession.waitForText(`yes, ${feedback}`, TIMEOUT);
       await activeSession.sendKeys("Enter");
 
       await activeSession.waitForPane(
@@ -903,7 +903,7 @@ describe("effect-aware command permissions", () => {
       await activeSession.sendKeys("Enter");
       await activeSession.waitForText("history feedback cli resume complete", TIMEOUT);
       const pickerScrollback = await activeSession.captureFullScrollback();
-      const pickerCommandsRow = pickerScrollback.indexOf("Ran touch, printf");
+      const pickerCommandsRow = pickerScrollback.indexOf("ran touch, printf");
       expect(pickerCommandsRow).toBeGreaterThanOrEqual(0);
       expect(pickerScrollback.indexOf(feedback)).toBeGreaterThan(pickerCommandsRow);
       await activeSession.sendText("Continue through interactive resume.");
@@ -1749,8 +1749,8 @@ describe("effect-aware command permissions", () => {
       await activeSession.sendText("/trace");
       await activeSession.waitForText(
         process.platform === "darwin"
-          ? "Clipboard copy failed"
-          : "Trace saved at",
+          ? "clipboard copy failed"
+          : "trace saved at",
         TIMEOUT,
       );
       const report = readTraceReport(latestTraceReportPath(root.root));
@@ -1879,7 +1879,7 @@ describe("effect-aware command permissions", () => {
 
     await activeSession.sendText("/trace");
     await activeSession.waitForText(
-      process.platform === "darwin" ? "Clipboard copy failed" : "Trace saved at",
+      process.platform === "darwin" ? "clipboard copy failed" : "trace saved at",
       TIMEOUT,
     );
     const report = readTraceReport(latestTraceReportPath(root.root));
@@ -1983,7 +1983,7 @@ describe("effect-aware command permissions", () => {
       await activeSession.waitForText("nothing to delegate", TIMEOUT);
       await activeSession.sendText("/trace");
       await activeSession.waitForText(
-        process.platform === "darwin" ? "Clipboard copy failed" : "Trace saved at",
+        process.platform === "darwin" ? "clipboard copy failed" : "trace saved at",
         TIMEOUT,
       );
       const report = readTraceReport(latestTraceReportPath(root.root));
@@ -2063,7 +2063,7 @@ describe("effect-aware command permissions", () => {
 
       await activeSession.sendText("/trace");
       await activeSession.waitForText(
-        process.platform === "darwin" ? "Clipboard copy failed" : "Trace saved at",
+        process.platform === "darwin" ? "clipboard copy failed" : "trace saved at",
         TIMEOUT,
       );
       const report = readTraceReport(latestTraceReportPath(root.root));
@@ -2174,7 +2174,7 @@ describe("effect-aware command permissions", () => {
 
       await activeSession.sendText("/trace");
       await activeSession.waitForText(
-        process.platform === "darwin" ? "Clipboard copy failed" : "Trace saved at",
+        process.platform === "darwin" ? "clipboard copy failed" : "trace saved at",
         TIMEOUT,
       );
       const shell = readTraceReport(latestTraceReportPath(root.root)).one("shell");
@@ -2233,8 +2233,8 @@ describe("effect-aware command permissions", () => {
       await activeSession.sendText("/trace");
       await activeSession.waitForText(
         process.platform === "darwin"
-          ? "Clipboard copy failed"
-          : "Trace saved at",
+          ? "clipboard copy failed"
+          : "trace saved at",
         TIMEOUT,
       );
       const reportPath = latestTraceReportPath(root.root);
@@ -2328,7 +2328,7 @@ describe("effect-aware command permissions", () => {
 
       await activeSession.sendText("/trace");
       await activeSession.waitForText(
-        process.platform === "darwin" ? "Clipboard copy failed" : "Trace saved at",
+        process.platform === "darwin" ? "clipboard copy failed" : "trace saved at",
         TIMEOUT,
       );
       const report = readTraceReport(latestTraceReportPath(root.root));
@@ -2409,8 +2409,8 @@ describe("effect-aware command permissions", () => {
       await activeSession.sendText("/trace");
       await activeSession.waitForText(
         process.platform === "darwin"
-          ? "Trace copied to clipboard"
-          : "Trace saved at",
+          ? "trace copied to clipboard"
+          : "trace saved at",
         TIMEOUT,
       );
 
@@ -2446,7 +2446,7 @@ describe("effect-aware command permissions", () => {
       if (process.platform !== "darwin") {
         // The notice names the file, however the pane wraps it.
         const screen = (await activeSession.captureFullScrollback()).replace(/\s+/g, "");
-        expect(screen).toContain(`Tracesavedat${reportPath}.`);
+        expect(screen).toContain(`tracesavedat${reportPath}.`);
       }
       expect(existsSync(join(root.home, ".fx", "logs", "trace.log"))).toBe(false);
       expect(statSync(reportPath).mode & 0o077).toBe(0);
@@ -2494,7 +2494,7 @@ describe("effect-aware command permissions", () => {
       await activeSession.waitForText("TRACE_FAULT_READY", TIMEOUT);
 
       await activeSession.sendText("/trace");
-      await activeSession.waitForText("Could not create trace.", TIMEOUT);
+      await activeSession.waitForText("could not create trace.", TIMEOUT);
       expect(existsSync(tmpDir)).toBe(false);
 
       // With the folder there, the same session writes a whole trace, and the
@@ -2912,7 +2912,7 @@ describe("effect-aware command permissions", () => {
         expect(JSON.parse(pwdResult).output_delta).toContain(root.workspace);
 
         const scrollback = await activeSession.captureFullScrollback();
-        const completedIndex = scrollback.indexOf("Ran python3 terminal-session-fixture.py");
+        const completedIndex = scrollback.indexOf("ran python3 terminal-session-fixture.py");
         const finalIndex = scrollback.indexOf(`TTY_SESSION_FINAL_${sandbox}`);
         const followupIndex = scrollback.indexOf("Run pwd through the user profile.");
         const pwdFinalIndex = scrollback.indexOf(`TTY_SESSION_PWD_FINAL_${sandbox}`);
@@ -3021,8 +3021,8 @@ describe("effect-aware command permissions", () => {
       expect(gateway.classifierRequests).toHaveLength(1);
       expect(pane).not.toContain("Auto agent denied");
       // The held call is its group's header, which names the caution.
-      expect(pane).toContain(`● Safety caution ${command}`);
-      expect(pane).toContain(`Safety caution ${command}`);
+      expect(pane).toContain(`● safety caution ${command}`);
+      expect(pane).toContain(`safety caution ${command}`);
       expect(pane).not.toContain("└ terminal");
       expect(gateway.requests).toHaveLength(2);
       const permissionResultRequest = gateway.requests[1]!.body;
@@ -3054,10 +3054,10 @@ describe("effect-aware command permissions", () => {
       });
       await activeSession.waitForComposer(TIMEOUT);
       const resumedPane = await activeSession.waitForPane(
-        (value) => value.includes(`Safety caution ${command}`),
+        (value) => value.includes(`safety caution ${command}`),
         TIMEOUT,
       );
-      expect(resumedPane).toContain(`● Safety caution ${command}`);
+      expect(resumedPane).toContain(`● safety caution ${command}`);
       expect(resumedPane).not.toContain("└ terminal");
       expect(resumedPane).not.toContain("tool_permission_denied");
       expect(gateway.requests).toHaveLength(2);
@@ -3611,9 +3611,9 @@ describe("effect-aware command permissions", () => {
       await activeSession.waitForComposer(TIMEOUT);
       await activeSession.sendText("Create the marker.");
       const approvalPane = await activeSession.waitForText(COMMAND_APPROVAL_PROMPT, TIMEOUT);
-      expect(approvalPane).toContain("1. Yes");
-      expect(approvalPane).toContain("2. Yes, and don't ask again");
-      expect(approvalPane).toContain("3. No");
+      expect(approvalPane).toContain("1. yes");
+      expect(approvalPane).toContain("2. yes, and don't ask again");
+      expect(approvalPane).toContain("3. no");
       expect(approvalPane).toContain("touch must-not-exist");
       expect(gateway.requests).toHaveLength(1);
       expect(existsSync(marker)).toBe(false);
@@ -3753,7 +3753,7 @@ describe("effect-aware command permissions", () => {
       await activeSession.waitForComposer(TIMEOUT);
       await activeSession.sendText("Create the reusable marker.");
       const firstApprovalPane = await activeSession.waitForText(COMMAND_APPROVAL_PROMPT, TIMEOUT);
-      expect(firstApprovalPane).toContain("Yes, and don't ask again for this exact command");
+      expect(firstApprovalPane).toContain("yes, and don't ask again for this exact command");
 
       await activeSession.sendKeys("2");
       await activeSession.sendKeys("Enter");
@@ -4709,7 +4709,7 @@ describe("effect-aware command permissions", () => {
       await activeSession.waitForText("setup traced", TIMEOUT);
       await activeSession.sendText("/trace");
       await activeSession.waitForText(
-        process.platform === "darwin" ? "Clipboard copy failed" : "Trace saved at",
+        process.platform === "darwin" ? "clipboard copy failed" : "trace saved at",
         TIMEOUT,
       );
       const report = readTraceReport(latestTraceReportPath(root.root));

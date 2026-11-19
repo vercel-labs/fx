@@ -3623,7 +3623,7 @@ describe("Vision route fake Gateway", () => {
         await session.sendText(rootRequest);
         await session.waitForText("would you like to allow this action?", TIMEOUT);
         await session.sendKeys("Tab");
-        await session.waitForText("Yes, and tell fx what to do next", TIMEOUT);
+        await session.waitForText("yes, and tell fx what to do next", TIMEOUT);
         await session.sendLiteralText(feedback);
         await session.waitForText(`Yes, ${feedback}`, TIMEOUT);
         await session.sendKeys("Enter");

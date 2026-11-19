@@ -563,7 +563,7 @@ async function setupScenario(
       contains = "⊘";
       trigger = async () => {
         gate.release();
-        await session.waitForText("Apply this change?", TIMEOUT_MS);
+        await session.waitForText("apply this change?", TIMEOUT_MS);
         await session.sendKeys("3");
         await session.sendKeys("Enter");
       };
@@ -589,7 +589,7 @@ async function setupScenario(
       contains = "▪";
       trigger = async () => {
         gate.release();
-        await session.waitForText("Apply this change?", TIMEOUT_MS);
+        await session.waitForText("apply this change?", TIMEOUT_MS);
         await session.sendKeys("Escape");
       };
       expected = (record) =>

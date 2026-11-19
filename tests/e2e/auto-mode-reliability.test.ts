@@ -190,7 +190,7 @@ function startGateway(
 async function runTrace(session: TmuxSession, tmp: string): Promise<TraceReport> {
   const before = new Set(traceReportNames(tmp));
   await session.sendText("/trace");
-  await waitForEither(session, ["Clipboard copy failed", "Trace saved at"], TIMEOUT);
+  await waitForEither(session, ["clipboard copy failed", "trace saved at"], TIMEOUT);
   return waitForNewTraceReport(tmp, before);
 }
 

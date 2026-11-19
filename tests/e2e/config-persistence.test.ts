@@ -515,7 +515,7 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
         );
         await session.sendText("/statusline");
         const statusline = await session.waitForText("Context  ", TIMEOUT);
-        expect(statusline).toContain("Status line");
+        expect(statusline).toContain("status line");
         expect(statusline).not.toContain("Sandbox");
         expect(statusline).toContain("Context");
         expect(statusline).toContain("Session");

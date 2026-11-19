@@ -400,9 +400,9 @@ describe("modern MCP stdio compatibility", () => {
       expect(approval).toContain("allow this MCP tool call?");
       expect(approval).toContain(TOOL_NAME);
       expect(approval).toContain(
-        "This MCP tool needs approval before fx can send the request.",
+        "this MCP tool needs approval before fx can send the request.",
       );
-      expect(approval).toContain("3. Deny");
+      expect(approval).toContain("3. deny");
       expect(
         readWire(root.wireLogPath).some(
           (entry) => entry.message.method === "tools/call",
@@ -552,7 +552,7 @@ describe("modern MCP stdio compatibility", () => {
     );
     expect(trusted.code).toBe(0);
     // It says what the approved server runs, as the file writes it.
-    expect(trusted.stdout).toBe("Approved fixture, which runs: '${WORKSPACE_MCP_COMMAND}' '${WORKSPACE_MCP_FIXTURE}'\n");
+    expect(trusted.stdout).toBe("approved fixture, which runs: '${WORKSPACE_MCP_COMMAND}' '${WORKSPACE_MCP_FIXTURE}'\n");
     settings = readFileSync(join(root.home, ".fx", "settings.json"), "utf8");
     expect(settings).toContain("enabledMcpjsonServers");
 
@@ -825,7 +825,7 @@ describe("modern MCP stdio compatibility", () => {
       { cwd: root.workspace, env },
     );
     expect(added.code).toBe(0);
-    expect(added.stdout).toContain("Added fixture to ~/.fx/mcp.json.");
+    expect(added.stdout).toContain("added fixture to ~/.fx/mcp.json.");
     expect(existsSync(root.wireLogPath)).toBe(false);
 
     const result = await runFx(
@@ -880,7 +880,7 @@ describe("modern MCP stdio compatibility", () => {
         await tui.sendLiteral(`/mcp add ${envFlags} literal -- ${process.execPath} ${LEGACY_FIXTURE} ${packageArg}`);
         if (matchingPath) await tui.sendKeys("Tab");
         await tui.sendKeys("Enter");
-        await tui.waitForText("Added literal to ~/.fx/mcp.json.", 5_000);
+        await tui.waitForText("added literal to ~/.fx/mcp.json.", 5_000);
         // Saved as .mcp.json writes it: the program, then its arguments as typed.
         const saved = JSON.parse(readFileSync(configPath, "utf8")).mcp.literal;
         expect({ command: saved.command, args: saved.args })
@@ -989,7 +989,7 @@ describe("modern MCP stdio compatibility", () => {
       expect(existsSync(root.launchLogPath)).toBe(false);
 
       await tui.sendText("/mcp approve fixture");
-      await tui.waitForText("Approved fixture", 10_000);
+      await tui.waitForText("approved fixture", 10_000);
       await tui.sendText("/mcp");
       await tui.waitForText(/fixture +ready, 1 tool/, 15_000);
       expect(readAttemptedPids(root.launchLogPath).length).toBeGreaterThanOrEqual(1);
@@ -997,7 +997,7 @@ describe("modern MCP stdio compatibility", () => {
       await tui.waitForPane((pane) => !pane.includes("MCP servers"), 5_000);
 
       await tui.sendText("/mcp reject fixture");
-      await tui.waitForText("Rejected fixture", 10_000);
+      await tui.waitForText("rejected fixture", 10_000);
       expect(gateway.requests).toHaveLength(0);
 
       await tui.kill();
@@ -3738,7 +3738,7 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"`,
 
       await tui.waitForStableComposer(5_000);
       await tui.sendText("Confirm the next prompt works.");
-      await tui.waitForText("cancelled MCP TUI complete.", 10_000);
+      await tui.waitForText("Cancelled MCP TUI complete.", 10_000);
       expect(activeGateway.requests).toHaveLength(3);
       expect(activeGateway.requests[2]?.body).toContain("Confirm the next prompt works.");
       expect(readFileSync(stderrPath, "utf8")).toBe("");

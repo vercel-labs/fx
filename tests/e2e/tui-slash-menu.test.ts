@@ -206,7 +206,7 @@ async function waitForStatuslineMenu(
     latest = await session.capturePaneGrid();
     const pane = latest.join("\n");
     if (
-      pane.includes("Status line") &&
+      pane.includes("status line") &&
       pane.includes("↑↓ navigate") &&
       pane.includes("←→ change") &&
       (expectedSelection === undefined || pane.includes(expectedSelection))
@@ -646,7 +646,7 @@ async function waitForVisibleFxSkills(session: TmuxSession, rows: number): Promi
 
 function visibleFxSkillNames(grid: string[]): string[] {
   return grid
-    .filter((line) => line.includes("skill-") && line.includes("fx · Global"))
+    .filter((line) => line.includes("skill-") && line.includes("fx · global"))
     .map((line) => line.match(/skill-\d+/)?.[0])
     .filter((name): name is string => name !== undefined);
 }
@@ -878,7 +878,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
 
       // A $ mention picked inside a title never turns the rename into the skill.
       await s.sendLiteralText("/rename ship $dep");
-      await s.waitForText("Agents · Workspace", 5_000);
+      await s.waitForText("agents · workspace", 5_000);
       for (let press = 0; press < 4; press += 1) {
         await s.sendKeys("Enter");
         pane = await waitForSettledPane(s, () => true);
@@ -982,7 +982,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       await session.sendText("/skills");
       const menu = await waitForSkillsMenu(session, 1);
       expect(menu.join("\n")).toContain("linked-menu");
-      expect(menu.join("\n")).toContain("Codex · Workspace");
+      expect(menu.join("\n")).toContain("codex · workspace");
       await session.sendKeys("Enter");
       await session.waitForPane(
         (pane) => composerContains(pane, "linked-menu"),
@@ -1033,7 +1033,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       await session.sendText("/skills");
       const menu = await waitForSkillsMenu(session, 1);
       expect(menu.join("\n")).toContain("linked-leaf");
-      expect(menu.join("\n")).toContain("Codex · Workspace");
+      expect(menu.join("\n")).toContain("codex · workspace");
       await session.sendKeys("Enter");
       await session.waitForPane(
         (pane) => composerContains(pane, "linked-leaf"),
@@ -2367,9 +2367,9 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       expect(pane).toContain("skills   < all >");
       expect(pane).not.toContain("Claude");
       expect(pane).toContain("managed-menu");
-      expect(pane).toContain("fx · Global");
+      expect(pane).toContain("fx · global");
       expect(pane).toContain("workspace-menu");
-      expect(pane).toContain("fx · Workspace");
+      expect(pane).toContain("fx · workspace");
       expect(pane).toContain("↑↓ navigate");
       expect(pane).toContain("enter use");
 
@@ -2583,7 +2583,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       const codexPane = grid.join("\n");
       expect(codexPane).toContain("< Codex >");
       expect(codexPane).toContain("codex-menu");
-      expect(codexPane).toContain("Codex · Global");
+      expect(codexPane).toContain("codex · global");
 
       await session.sendKeys("C-[");
       await session.waitForPane((current) => !current.includes("↑↓ navigate"), 5_000);

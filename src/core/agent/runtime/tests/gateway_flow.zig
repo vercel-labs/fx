@@ -5598,12 +5598,12 @@ test "explicit skill loads publish one interactive summary without extra tool ca
     job.prompt = @constCast("Use $requested-workflow.");
     try runFakePrompt(&gateway, &hooks, config, job);
     try std.testing.expectEqual(@as(usize, 1), hooks.interactive_notices.items.len);
-    try std.testing.expectEqualStrings("1 requested skill loaded\n└ Loaded skill requested-workflow", hooks.interactive_notices.items[0].body);
+    try std.testing.expectEqualStrings("1 requested skill loaded\n└ loaded skill requested-workflow", hooks.interactive_notices.items[0].body);
     try std.testing.expectEqual(@as(usize, 1), gateway.request_bodies.items.len);
     try expectBodyContains(&gateway, 0, "REQUESTED_SKILL_CONTENT");
     try expectBodyNotContains(&gateway, 0, "1 requested skill loaded");
     try std.testing.expectEqual(@as(usize, 0), hooks.executed_names.items.len);
-    const notice_index = logIndex(&hooks, "interactive_notice::1 requested skill loaded\n└ Loaded skill requested-workflow") orelse return error.TestExpectedEqual;
+    const notice_index = logIndex(&hooks, "interactive_notice::1 requested skill loaded\n└ loaded skill requested-workflow") orelse return error.TestExpectedEqual;
     const reply_index = reply: {
         for (hooks.log.items, 0..) |entry, index| {
             if (std.mem.startsWith(u8, entry, "text:") and std.mem.find(u8, entry, "Finished") != null) break :reply index;

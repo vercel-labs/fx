@@ -80,10 +80,10 @@ describe("fx mcp", () => {
     const http = await mcp(root, "add", "web", "https://mcp.example/mcp", "--header", "X-Key=${KEY}");
     expect(http.stderr).toBe("");
     expect(http.code).toBe(0);
-    expect(http.stdout).toBe("Added web to ~/.fx/mcp.json.\n");
+    expect(http.stdout).toBe("added web to ~/.fx/mcp.json.\n");
     const stdio = await mcp(root, "add", "--project", "--env", "TOKEN=x", "local", "--", "node", "server.js", "-h");
     expect(stdio.code).toBe(0);
-    expect(stdio.stdout).toBe("Added local to .mcp.json.\n");
+    expect(stdio.stdout).toBe("added local to .mcp.json.\n");
 
     const profileText = readFileSync(root.profilePath, "utf8");
     expect(profileText).toContain('"startup_timeout_ms": 1.50');
@@ -121,7 +121,7 @@ describe("fx mcp", () => {
     expect(bad.stderr).toStartWith("'bad name' can't be a server name: use letters, digits, '-' and '_'.\nusage: fx mcp add ");
     const notUrl = await mcp(root, "add", "web2", "mcp.example");
     expect(notUrl.code).toBe(2);
-    expect(notUrl.stderr).toStartWith("'mcp.example' isn't a URL. A stdio server's command goes after --.\n");
+    expect(notUrl.stderr).toStartWith("'mcp.example' isn't a URL. a stdio server's command goes after --.\n");
   });
 
   // Fx never edits a linked file. Replacing a link forks the file it
@@ -221,7 +221,7 @@ describe("fx mcp", () => {
 
     const empty = await mcp(createRoot(), "list");
     expect(empty.code).toBe(0);
-    expect(empty.stdout).toBe("No MCP servers configured. Add one with: fx mcp add NAME URL\n");
+    expect(empty.stdout).toBe("no MCP servers configured. add one with: fx mcp add NAME URL\n");
   });
 
   test("show connects to a server and lists its tools; a broken one exits 1", async () => {
@@ -245,7 +245,7 @@ describe("fx mcp", () => {
 
     const unknown = await mcp(root, "show", "nope");
     expect(unknown.code).toBe(1);
-    expect(unknown.stderr).toBe("No MCP server named nope. fx mcp list shows them.\n");
+    expect(unknown.stderr).toBe("no MCP server named nope. fx mcp list shows them.\n");
   });
 
   test("a variable a header can't carry holds its server back instead of aborting fx", async () => {
@@ -285,11 +285,11 @@ describe("fx mcp", () => {
     );
     const both = await mcp(root, "remove", "twin");
     expect(both.code).toBe(2);
-    expect(both.stderr).toBe("twin is in both ~/.fx/mcp.json and .mcp.json. Add --global or --project.\n");
+    expect(both.stderr).toBe("twin is in both ~/.fx/mcp.json and .mcp.json. add --global or --project.\n");
 
     const project = await mcp(root, "remove", "--project", "twin");
     expect(project.code).toBe(0);
-    expect(project.stdout).toBe("Removed twin from .mcp.json.\n");
+    expect(project.stdout).toBe("removed twin from .mcp.json.\n");
     expect(JSON.parse(readFileSync(root.projectPath, "utf8"))).toEqual({ mcpServers: {} });
 
     const solo = await mcp(root, "remove", "solo");
@@ -298,7 +298,7 @@ describe("fx mcp", () => {
 
     const gone = await mcp(root, "remove", "solo");
     expect(gone.code).toBe(1);
-    expect(gone.stderr).toBe("No MCP server named solo in ~/.fx/mcp.json or .mcp.json.\n");
+    expect(gone.stderr).toBe("no MCP server named solo in ~/.fx/mcp.json or .mcp.json.\n");
 
     // `--global` names ~/.fx/mcp.json; the older `--profile` still works.
     const global = await mcp(root, "remove", "--global", "twin");
@@ -308,7 +308,7 @@ describe("fx mcp", () => {
     expect(profile.code).toBe(1);
     // The older --profile still names the profile file, with a warning.
     expect(profile.stderr).toBe(
-      "fx mcp remove: --profile is deprecated and stops working in fx 0.0.18; use --global\nNo MCP server named twin in ~/.fx/mcp.json.\n",
+      "fx mcp remove: --profile is deprecated and stops working in fx 0.0.18; use --global\nno MCP server named twin in ~/.fx/mcp.json.\n",
     );
   });
 
@@ -320,15 +320,15 @@ describe("fx mcp", () => {
     const approved = await mcp(root, "approve", "docs");
     expect(approved.stderr).toBe("");
     expect(approved.code).toBe(0);
-    expect(approved.stdout).toBe("Approved docs, which runs: node 'docs server.js'\n");
+    expect(approved.stdout).toBe("approved docs, which runs: node 'docs server.js'\n");
 
     const rejected = await mcp(root, "reject", "web");
     expect(rejected.code).toBe(0);
-    expect(rejected.stdout).toBe("Rejected web. fx won't start it in this project.\n");
+    expect(rejected.stdout).toBe("rejected web. fx won't start it in this project.\n");
 
     const all = await mcp(root, "approve", "--all");
     expect(all.code).toBe(0);
-    expect(all.stdout).toBe("Approved docs, which runs: node 'docs server.js'\n");
+    expect(all.stdout).toBe("approved docs, which runs: node 'docs server.js'\n");
     // `--all` approves the servers it shows, not a server added later.
     const settings = JSON.parse(readFileSync(join(root.home, ".fx", "settings.json"), "utf8"));
     expect(settings.workspaces[root.workspace]).toEqual({ enabledMcpjsonServers: ["docs"], disabledMcpjsonServers: ["web"] });
@@ -342,7 +342,7 @@ describe("fx mcp", () => {
 
     const profileServer = await mcp(root, "approve", "mine");
     expect(profileServer.code).toBe(1);
-    expect(profileServer.stderr).toBe("No project server named mine in .mcp.json.\n");
+    expect(profileServer.stderr).toBe("no project server named mine in .mcp.json.\n");
     const project = JSON.parse(readFileSync(root.projectPath, "utf8"));
     project.mcpServers.later = { command: "node", args: ["later.js"] };
     writeFileSync(root.projectPath, JSON.stringify(project));
@@ -354,7 +354,7 @@ describe("fx mcp", () => {
     const root = createRoot(undefined, { mcpServers: { a: { command: "node", args: ["a.js"] }, b: { type: "http", url: "https://b.example/mcp" } } });
     const all = await mcp(root, "approve", "--all");
     expect(all.code).toBe(0);
-    expect(all.stdout).toBe("Approved a, which runs: node a.js\nApproved b, which connects to: https://b.example/mcp\n");
+    expect(all.stdout).toBe("approved a, which runs: node a.js\napproved b, which connects to: https://b.example/mcp\n");
     const settings = JSON.parse(readFileSync(join(root.home, ".fx", "settings.json"), "utf8"));
     expect(settings.workspaces[root.workspace]).toEqual({ enabledMcpjsonServers: ["a", "b"] });
     writeFileSync(root.projectPath, JSON.stringify({ mcpServers: { a: { command: "node", args: ["a.js"] }, b: { type: "http", url: "https://b.example/mcp" }, c: { command: "node", args: ["c.js"] } } }));
@@ -446,7 +446,7 @@ describe("/mcp in the shell", () => {
     await tui.sendKeys("C-u");
 
     await tui.sendText("/mcp add web https://w.example/mcp");
-    await tui.waitForText("Added web to ~/.fx/mcp.json.", 10_000);
+    await tui.waitForText("added web to ~/.fx/mcp.json.", 10_000);
     await tui.sendText("/mcp list");
     // Added, it starts too; this address never answers.
     await tui.waitForText(/web +~\/\.fx\/mcp\.json +http +(connecting|retrying|failed)/, 10_000);
@@ -476,7 +476,7 @@ describe("/mcp in the shell", () => {
     await tui.waitForComposer(15_000);
     await tui.pasteText('/mcp add probe -- /bin/echo "a\\\nb"');
     await tui.sendKeys("Enter");
-    await tui.waitForText("Added probe to ~/.fx/mcp.json.", 10_000);
+    await tui.waitForText("added probe to ~/.fx/mcp.json.", 10_000);
     expect(JSON.parse(readFileSync(root.profilePath, "utf8")).mcpServers.probe).toEqual({ command: "/bin/echo", args: ["ab"] });
   }, 60_000);
 
@@ -515,28 +515,28 @@ describe("/mcp in the shell", () => {
 
       // Adding a server, approving one, and removing one leave `s` as it was.
       await tui.sendText("/mcp add web https://w.example/mcp");
-      await tui.waitForText("Added web to ~/.fx/mcp.json.", 10_000);
+      await tui.waitForText("added web to ~/.fx/mcp.json.", 10_000);
       await tui.sendText("/mcp approve proj");
-      await tui.waitForText("Approved proj", 10_000);
+      await tui.waitForText("approved proj", 10_000);
       const projBy = Date.now() + 10_000;
       while (pidIn(projPid) === 0 && Date.now() < projBy) await Bun.sleep(5);
       expect(pidIn(projPid)).not.toBe(0);
       await tui.sendText("/mcp remove web");
-      await tui.waitForText("Removed web from ~/.fx/mcp.json.", 10_000);
+      await tui.waitForText("removed web from ~/.fx/mcp.json.", 10_000);
       expect(pidIn(pidPath)).toBe(oldPid);
       expect(existsSync(eofPath)).toBe(false);
       expect(isRunning(oldPid)).toBe(true);
 
       // Removed, `s` stops; added back at once, the new copy waits for it.
       await tui.sendText("/mcp remove s");
-      await tui.waitForText("Removed s from ~/.fx/mcp.json.", 10_000);
+      await tui.waitForText("removed s from ~/.fx/mcp.json.", 10_000);
       const eofBy = Date.now() + 10_000;
       // The fixture creates the file, then writes its pid.
       while (!(existsSync(eofPath) && readFileSync(eofPath, "utf8").trim() !== "") && Date.now() < eofBy) await Bun.sleep(5);
       expect(readFileSync(eofPath, "utf8").trim()).toBe(String(oldPid));
       const flags = Object.entries(env).map(([k, v]) => `--env ${k}=${v}`).join(" ");
       await tui.sendText(`/mcp add ${flags} s -- ${process.execPath} ${MODERN_FIXTURE}`);
-      await tui.waitForText("Added s to ~/.fx/mcp.json.", 10_000);
+      await tui.waitForText("added s to ~/.fx/mcp.json.", 10_000);
       // The old copy is still stopping. Typing still shows at once.
       const typedAt = Date.now();
       await tui.sendLiteral("zq");
@@ -584,7 +584,7 @@ describe("/mcp in the shell", () => {
       await tui.sendText("/mcp show s");
       await Bun.sleep(300);
       await tui.sendText("/mcp add web https://w.example/mcp");
-      await tui.waitForText("Added web to ~/.fx/mcp.json.", 10_000);
+      await tui.waitForText("added web to ~/.fx/mcp.json.", 10_000);
       expect(await tui.capturePane()).not.toContain("Echo text through the modern MCP fixture");
 
       // The show answers from the copy it was waiting on, which keeps running.
@@ -787,7 +787,7 @@ describe("/mcp in the shell", () => {
       await tui.waitForComposer(15_000);
       // `/mcp list` checks the config files again before it answers.
       await tui.sendText("/mcp list");
-      await tui.waitForText("No MCP servers configured", 10_000);
+      await tui.waitForText("no MCP servers configured", 10_000);
       expect(await tui.captureFullScrollback()).toContain(".mcp.json server 'unknown' was skipped: fx can't read it.");
       await tui.kill();
       tui = null;
@@ -887,13 +887,13 @@ describe("/mcp in the shell", () => {
     await tui.waitForPane((pane) => catalogMenuItemCount(pane.split("\n"), "MCP servers") === 1, 5_000);
     await tui.sendKeys("Enter");
     await tui.waitForText("Echo text through the modern MCP fixture", 15_000);
-    await tui.waitForText("  Remove        /mcp remove fixture", 5_000);
+    await tui.waitForText("  remove        /mcp remove fixture", 5_000);
     // Typing filters its tools, by name or description; the list's filter waits.
     await tui.sendLiteral("zz");
     await tui.waitForText("no matching tools.", 5_000);
     await tui.sendKeys("BSpace BSpace");
     await tui.sendLiteral("THROUGH");
-    await tui.waitForText(/^ {2}Tools\s*$/m, 5_000);
+    await tui.waitForText(/^ {2}tools\s*$/m, 5_000);
     await tui.waitForText("Echo text through the modern MCP fixture", 5_000);
     // ↓ goes on into the tools, where Enter has nothing to run.
     await tui.sendKeys("Down");
@@ -922,15 +922,15 @@ describe("/mcp in the shell", () => {
     await tui.sendText("/mcp");
     await tui.waitForPane((pane) => catalogMenuItemCount(pane.split("\n"), "MCP servers") === 3, 10_000);
     await tui.sendKeys("Down Down Enter");
-    await tui.waitForText("  Approve       /mcp approve proj", 5_000);
+    await tui.waitForText("  approve       /mcp approve proj", 5_000);
     await tui.waitForText("its tools show here once you approve it.", 5_000);
     await tui.sendKeys("Enter");
-    await tui.waitForText("Approve proj for this project? It runs:", 5_000);
+    await tui.waitForText("approve proj for this project? it runs:", 5_000);
     await tui.waitForText("node proj.js --port 4100", 5_000);
     await tui.waitForText("enter confirm     esc cancel", 5_000);
     await tui.sendLiteral("n");
     await tui.waitForText("↑↓ navigate     enter run     esc back", 5_000);
-    expect(await tui.capturePane()).not.toContain("Approved proj");
+    expect(await tui.capturePane()).not.toContain("approved proj");
 
     // Confirmed, it runs `/mcp approve proj`. The menu shows the result, so
     // the conversation doesn't repeat it.
@@ -940,33 +940,33 @@ describe("/mcp in the shell", () => {
     // The reload follows, and the screen with it.
     // Approve leaves the choices once the reload lands; Reject stays.
     await tui.waitForPane(
-      (pane) => pane.includes("  Reject        /mcp reject proj") && !pane.includes("/mcp approve proj"),
+      (pane) => pane.includes("  reject        /mcp reject proj") && !pane.includes("/mcp approve proj"),
       10_000,
     );
-    expect(await tui.captureFullScrollback()).not.toContain("Approved proj");
+    expect(await tui.captureFullScrollback()).not.toContain("approved proj");
 
     // Remove asks which file it edits; Esc keeps the server, Enter removes it.
     await tui.sendKeys("Escape");
     await tui.waitForPane((pane) => catalogMenuItemCount(pane.split("\n"), "MCP servers") === 3, 5_000);
     // Approved, proj works and sorts between fixture and web.
     await tui.sendKeys("Down Enter");
-    await tui.waitForText("  Remove        /mcp remove web", 5_000);
+    await tui.waitForText("  remove        /mcp remove web", 5_000);
     await tui.sendKeys("Enter");
     // It asks on Remove's own row, with its answers; the hint line stays.
-    await tui.waitForText("  Remove web from ~/.fx/mcp.json?   yes  no", 5_000);
+    await tui.waitForText("  remove web from ~/.fx/mcp.json?   yes  no", 5_000);
     expect(await tui.capturePane()).toContain("↑↓ navigate     enter run     esc back");
     // → chooses no, and Enter on no keeps the server.
     await tui.sendKeys("Right Enter");
-    await tui.waitForText("  Remove        /mcp remove web", 5_000);
+    await tui.waitForText("  remove        /mcp remove web", 5_000);
     await tui.waitForText("↑↓ navigate     enter run     esc back", 5_000);
     expect(JSON.parse(readFileSync(root.profilePath, "utf8")).mcpServers.web).toBeDefined();
     await tui.sendKeys("Enter");
-    await tui.waitForText("Remove web from ~/.fx/mcp.json?", 5_000);
+    await tui.waitForText("remove web from ~/.fx/mcp.json?", 5_000);
     await tui.sendKeys("Enter");
     // Its screen goes with it, back to the list, which no longer shows it.
     await tui.waitForPane((pane) => catalogMenuItemCount(pane.split("\n"), "MCP servers") === 2, 10_000);
     expect(JSON.parse(readFileSync(root.profilePath, "utf8")).mcpServers.web).toBeUndefined();
-    expect(await tui.captureFullScrollback()).not.toContain("Removed web");
+    expect(await tui.captureFullScrollback()).not.toContain("removed web");
   }, 90_000);
 
   test.skipIf(!tmuxAvailable())("/mcp names HOME and writes nothing when HOME is not absolute", async () => {
@@ -998,7 +998,7 @@ describe("fx ask", () => {
       env: { ...root.env, FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl, FX_MODEL: "openai/gpt-5" },
       timeoutMs: 30_000,
     });
-    expect(result.stderr).toContain("fx ask: skipped unapproved project MCP servers: proj. Approve with fx mcp approve <name> before retrying.");
+    expect(result.stderr).toContain("fx ask: skipped unapproved project MCP servers: proj. approve with fx mcp approve <name> before retrying.");
     expect(result.stderr).not.toContain("trust");
   }, 60_000);
 
@@ -1022,7 +1022,7 @@ describe("fx ask", () => {
       timeoutMs: 30_000,
     });
     expect(ask.stderr).toContain(note);
-    expect(ask.stderr).toContain("fx ask: skipped unapproved project MCP servers: proj. Approve");
+    expect(ask.stderr).toContain("fx ask: skipped unapproved project MCP servers: proj. approve");
     expect(ask.stdout + ask.stderr).not.toContain("\u001b");
   }, 60_000);
 

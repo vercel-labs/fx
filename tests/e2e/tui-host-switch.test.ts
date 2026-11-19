@@ -1478,7 +1478,7 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
           }
           return text("child_answer", "SWITCH_CHILD_FIRST");
         }
-        if (body.includes("stopped reviewer: its turn ended")) return text("main_stopped", "SWITCH_MAIN_STOPPED");
+        if (body.includes("Stopped reviewer: its turn ended")) return text("main_stopped", "SWITCH_MAIN_STOPPED");
         if (body.includes("reviewer was not working")) return text("main_not", "SWITCH_MAIN_NOT_STOPPED");
         if (latestUserText(body).includes("SWITCH_USER_STOP")) {
           return toolCall("main_stop", "subagent", { request: { action: "stop", agent: "reviewer" } });
@@ -1542,7 +1542,7 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         // answer while it is open, and Esc brings the prompt back unanswered.
         await session.sendKeys("C-x");
         const over = await session.waitForText(LIST_HINT, 10_000);
-        expect(over).not.toContain("Apply this change?");
+        expect(over).not.toContain("apply this change?");
         // Its row names the profile it runs in, and says it waits for the
         // approval main shows for it.
         expect(over).toMatch(/^ {2}\u2514 writer {2,}.* {2,}\S+ {2,}writer\s*$/m);
@@ -1554,7 +1554,7 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         await session.sendKeys("Escape");
         await session.waitForPane((pane) => pane.includes(LIST_HINT) && !pane.includes("esc clear"), 10_000);
         await session.sendKeys("Escape");
-        const back = await session.waitForPane((pane) => !pane.includes(LIST_HINT) && pane.includes("Apply this change?"), 10_000);
+        const back = await session.waitForPane((pane) => !pane.includes(LIST_HINT) && pane.includes("apply this change?"), 10_000);
         expect(back).toContain("Subagent writer needs permission");
         expect(existsSync(join(workspace, "switch-child.txt"))).toBe(false);
 
@@ -1673,7 +1673,7 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         await showAgent(session, "follower");
         await session.waitForPane((pane) => pane.includes("ask ·"), 15_000);
         await session.sendText("SWITCH_TYPED write again");
-        await session.waitForText("Apply this change?", 30_000);
+        await session.waitForText("apply this change?", 30_000);
         expect(existsSync(join(workspace, "typed.txt"))).toBe(false);
         await session.sendKeys("1");
         await session.waitForText("SWITCH_TYPED_DONE", 30_000);

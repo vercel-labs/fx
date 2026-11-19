@@ -1248,7 +1248,7 @@ describe("web_search Gateway fixture", () => {
           providerToolIndices: [],
           guidanceMessageIndices: [],
         });
-        expect(JSON.stringify(messages)).not.toContain("found 1 result");
+        expect(JSON.stringify(messages)).not.toContain("Found 1 result");
       } finally {
         await client.close();
         gateway.stop();

@@ -4049,7 +4049,7 @@ test.skipIf(!tmuxAvailable())(
       await Bun.sleep(150);
       await active.sendHexBytes(["1b", "5b", "35", "7e"]);
       await active.sendHexBytes(["1b", "5b", "35", "7e"]);
-      await active.waitForText("Apply this change?", TIMEOUT);
+      await active.waitForText("apply this change?", TIMEOUT);
 
       await active.sendKeys("3");
       await active.sendKeys("Enter");
@@ -4062,7 +4062,7 @@ test.skipIf(!tmuxAvailable())(
       );
       const inline = await active.capturePane();
       expect(inline).toContain("CTRL_O_HANDOFF_DONE");
-      expect(inline).not.toContain("Apply this change?");
+      expect(inline).not.toContain("apply this change?");
       expect(countOccurrences(scrollback, priorSummary)).toBe(1);
       for (const line of compactOutputRows) {
         const occurrences = countOccurrences(scrollback, line);
@@ -4572,9 +4572,9 @@ test.skipIf(!tmuxAvailable())(
         () => tapeText().includes(activeDone),
         "the gated command stream to finish",
       );
-      await active.waitForText("Apply this change?", TIMEOUT);
+      await active.waitForText("apply this change?", TIMEOUT);
       const fileApprovalTape = tapeText();
-      const fileApprovalOffset = fileApprovalTape.lastIndexOf("Apply this change?");
+      const fileApprovalOffset = fileApprovalTape.lastIndexOf("apply this change?");
       expect(fileApprovalOffset).toBeGreaterThanOrEqual(0);
       expect(alternateDepthAt(fileApprovalTape, fileApprovalOffset)).toBe(1);
 
@@ -4587,7 +4587,7 @@ test.skipIf(!tmuxAvailable())(
       const afterFileRejection = await active.waitForPane(
         (pane) =>
           pane.includes("ran printf, sleep, printf") &&
-          !pane.includes("Apply this change?"),
+          !pane.includes("apply this change?"),
         TIMEOUT,
       );
       expect(afterFileRejection).not.toContain(questionMarker);
@@ -4607,7 +4607,7 @@ test.skipIf(!tmuxAvailable())(
       const questionPane = await active.capturePane();
       expect(questionPane).toContain(questionAnswerInstruction);
       expect(questionPane).toContain(questionCancelInstruction);
-      expect(questionPane).not.toContain("Apply this change?");
+      expect(questionPane).not.toContain("apply this change?");
 
       await active.sendLiteralText("1");
       await active.sendKeys("Enter");
@@ -4632,7 +4632,7 @@ test.skipIf(!tmuxAvailable())(
       expect(countOccurrences(finalScrollback, `│ ${streamGate}`)).toBe(0);
       expect(countOccurrences(finalScrollback, `│ ${activeDone}`)).toBe(0);
       expect(finalScrollback).not.toContain("lines more (ctrl+o to view)");
-      expect(finalPane).not.toContain("Apply this change?");
+      expect(finalPane).not.toContain("apply this change?");
       expect(finalPane).not.toContain(questionAnswerInstruction);
       expect(finalPane).not.toContain(questionCancelInstruction);
       expect(gateway.requests).toHaveLength(5);
@@ -4647,7 +4647,7 @@ test.skipIf(!tmuxAvailable())(
           !pane.includes(composerProbe),
         TIMEOUT,
       );
-      expect(clearedComposer).not.toContain("Apply this change?");
+      expect(clearedComposer).not.toContain("apply this change?");
       expect(clearedComposer).not.toContain(questionAnswerInstruction);
       expect(clearedComposer).not.toContain(questionCancelInstruction);
 
@@ -4699,7 +4699,7 @@ test.skipIf(!tmuxAvailable())(
       expect(replayFinalGrid.code).toBe(0);
       expect(replayFinalGrid.stderr).toBe("");
       expect(replayFinalGrid.stdout).toContain(finalSentinel);
-      expect(replayFinalGrid.stdout).not.toContain("Apply this change?");
+      expect(replayFinalGrid.stdout).not.toContain("apply this change?");
       expect(replayFinalGrid.stdout).not.toContain(questionAnswerInstruction);
       expect(replayFinalGrid.stdout).not.toContain(questionCancelInstruction);
       passed = true;
@@ -5863,11 +5863,11 @@ test.skipIf(!tmuxAvailable())(
         });
         expect(replay.code).toBe(0);
         expect(replay.stderr).toBe("");
-        expect(replay.stdout).not.toMatch(/Run \/help for commands/i);
+        expect(replay.stdout).not.toMatch(/run \/help for commands/i);
         const firstApplicationFrame = replay.stdout
           .split(/(?=--- frame \d+)/)
           .find((frame) =>
-            /Recording:|Session:|Run \/help for commands|auto ·/.test(frame),
+            /Recording:|Session:|run \/help for commands|auto ·/.test(frame),
           );
         expect(firstApplicationFrame).toContain(restoredMarker);
       }
@@ -6145,7 +6145,7 @@ test("manual upgrade output links stable notes and dev changes", async () => {
     expect(devStdout).toContain(
       `changes: https://github.com/vercel-labs/fx/compare/${buildRevision}...${revision}`,
     );
-    expect(devStdout.startsWith("Release channel set to dev in ~/.fx/settings.json.\n")).toBe(true);
+    expect(devStdout.startsWith("release channel set to dev in ~/.fx/settings.json.\n")).toBe(true);
     expect(JSON.parse(readFileSync(join(home, ".fx", "settings.json"), "utf8")).update_channel).toBe("dev");
   } finally {
     release.stop();
@@ -7079,7 +7079,7 @@ test.skipIf(!tmuxAvailable())(
       });
       await active.waitForComposer(TIMEOUT);
       await active.sendText("Ask the prepared batch of questions.");
-      await active.waitForText(`Question 1 of ${batchSize}`, TIMEOUT);
+      await active.waitForText(`question 1 of ${batchSize}`, TIMEOUT);
       await active.sendLiteralText(
         Array.from({ length: batchSize }, (_, index) => (index % 2 === 0 ? "1" : "2")).join(""),
       );
@@ -7191,7 +7191,7 @@ test.skipIf(!tmuxAvailable())(
       });
       await active.waitForComposer(TIMEOUT);
       await active.sendText("Create the first prepared resume file fixture.");
-      await active.waitForText("Apply this change?", TIMEOUT);
+      await active.waitForText("apply this change?", TIMEOUT);
       await active.sendKeys("1");
       await active.sendKeys("Enter");
       const firstLive = await waitForScrollback(active, firstCompletion);
@@ -7202,7 +7202,7 @@ test.skipIf(!tmuxAvailable())(
       );
 
       await active.sendText("Create the second prepared resume file fixture.");
-      await active.waitForText("Apply this change?", TIMEOUT);
+      await active.waitForText("apply this change?", TIMEOUT);
       await active.sendKeys("1");
       await active.sendKeys("Enter");
       const live = await waitForScrollback(active, secondCompletion);
@@ -7259,7 +7259,7 @@ test.skipIf(!tmuxAvailable())(
       await active.waitForComposer(TIMEOUT);
 
       await active.sendText("/undo");
-      await active.waitForText("Nothing to undo.", TIMEOUT);
+      await active.waitForText("nothing to undo.", TIMEOUT);
       expect(readFileSync(join(workspace, "first-large.md"), "utf8")).toBe(
         `${firstLines.join("\n")}\n`,
       );
@@ -7330,7 +7330,7 @@ test.skipIf(!tmuxAvailable())(
       });
       await active.waitForComposer(TIMEOUT);
       await active.sendText("Create the spilled diff fixture file.");
-      await active.waitForText("Apply this change?", TIMEOUT);
+      await active.waitForText("apply this change?", TIMEOUT);
       await active.sendKeys("1");
       await active.sendKeys("Enter");
       const live = await waitForScrollback(active, completion);
@@ -8385,7 +8385,7 @@ while :; do sleep 1; done
       await active.waitForComposer(TIMEOUT);
       const resumed = stripAnsi(await waitForScrollback(active, followUpMarker, timeout));
       const assistantIndex = resumed.indexOf(assistantMarker);
-      const cancelledIndex = resumed.indexOf("Cancelled");
+      const cancelledIndex = resumed.indexOf("cancelled");
       expect(assistantIndex).toBeGreaterThanOrEqual(0);
       expect(cancelledIndex).toBeGreaterThan(assistantIndex);
       expect(resumed).not.toContain(outputMarker);
@@ -8509,7 +8509,7 @@ test.skipIf(!tmuxAvailable())(
         "what can fx do differently?",
         timeout,
       ));
-      const cancelledIndex = resumed.indexOf("Cancelled");
+      const cancelledIndex = resumed.indexOf("cancelled");
       expect(cancelledIndex).toBeGreaterThanOrEqual(0);
       expect(resumed).toContain("▪ cancelled");
       expect(countOccurrences(resumed, "what can fx do differently?")).toBe(1);
@@ -8749,7 +8749,7 @@ test.skipIf(!tmuxAvailable())(
       renameSync(join(sessionDir(home, sessionId), "blobs", ref.slice("result-".length, -".txt".length)), join(root, "withheld-result.txt"));
       for (let page = 0; page < 3; page += 1) await active.sendKeys("PPage");
       const recovered = await active.waitForPane((pane) =>
-        pane.includes("Full saved result unavailable.") && pane.includes(tail),
+        pane.includes("full saved result unavailable.") && pane.includes(tail),
       TIMEOUT);
       expect(recovered).toContain("esc close · pgup/pgdn scroll");
       expect(active.isPaneAlive()).toBe(true);
@@ -8805,7 +8805,7 @@ for (const inspectDetails of [false, true]) {
         );
         await active!.waitForComposer(TIMEOUT);
       };
-      const markers = ["Wrote receipt.txt", "Created receipt.txt with:", "RECEIVED", "ledger.txt was not changed.", "missing.txt does not exist."];
+      const markers = ["wrote receipt.txt", "Created receipt.txt with:", "RECEIVED", "ledger.txt was not changed.", "missing.txt does not exist."];
       const assertHistory = async () => {
         const plain = stripAnsi(await active!.captureFullScrollbackEscapes());
         for (const marker of markers) expect(plain).toContain(marker);
@@ -9240,7 +9240,7 @@ test.skipIf(!tmuxAvailable())(
   async () => {
     const fixture = resumeFixture("fx-auto-resume-hint-");
     const { gateway, heldAtLeast, held } = holdingGateway("Map the route.");
-    const hint = "Interrupted turn · /resume to continue";
+    const hint = "interrupted turn · /resume to continue";
     const sessions: TmuxSession[] = [];
     try {
       const first = (await launchFx(fixture, gateway, "", "first")).session;
@@ -9330,7 +9330,7 @@ test.skipIf(!tmuxAvailable())(
 
       // The second crash with the send in flight asks before sending.
       active = (await launchFx(fixture, gateway, "-c", "third")).session;
-      await active.waitForText("This request crashed fx twice", TIMEOUT);
+      await active.waitForText("this request crashed fx twice", TIMEOUT);
       await Bun.sleep(300);
       expect(held()).toBe(2);
       await active.sendKeys("Escape");

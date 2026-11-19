@@ -175,7 +175,7 @@ pub fn buildExplicitPromptSection(
     const summary = if (failed == 0)
         try alloc.print("{d} requested skill{s} loaded{s}", .{ loaded, if (loaded == 1) "" else "s", load_rows.written() })
     else
-        try alloc.print("Requested skills · {d} loaded · {d} failed (ctrl+o for details){s}", .{ loaded, failed, load_rows.written() });
+        try alloc.print("requested skills · {d} loaded · {d} failed (ctrl+o for details){s}", .{ loaded, failed, load_rows.written() });
     errdefer alloc.free(summary);
     const details = if (load_details.written().len > 0) try load_details.toOwnedSlice() else null;
     errdefer if (details) |value| alloc.free(value);
@@ -205,11 +205,11 @@ pub const skill_used_open_tag = "<" ++ model_context_encoding.skill_used_tag ++ 
 fn appendExplicitLoadRow(alloc: Allocator, out: *std.Io.Writer, name: []const u8, failure: ?[]const u8) !void {
     const row = if (failure) |detail|
         if (detail.len > 0)
-            try alloc.print("Could not load {s}: {s}", .{ name, detail })
+            try alloc.print("could not load {s}: {s}", .{ name, detail })
         else
-            try alloc.print("Could not load {s}", .{name})
+            try alloc.print("could not load {s}", .{name})
     else
-        try alloc.print("Loaded skill {s}", .{name});
+        try alloc.print("loaded skill {s}", .{name});
     defer alloc.free(row);
     const sanitized = try tool_result_limits.prepareSanitizedOutput(alloc, row);
     defer alloc.free(sanitized);
@@ -228,9 +228,9 @@ test "explicit skill requests report ambiguous names without selecting a source"
     defer section.deinit(alloc);
     try std.testing.expect(std.mem.find(u8, section.text, "ambiguous") != null);
     try std.testing.expect(std.mem.find(u8, section.text, "already loaded") == null);
-    try expectContains(section.load_notice.?.body, "Requested skills · 0 loaded · 1 failed");
-    try expectContains(section.load_notice.?.body, "Could not load review:");
-    try expectNotContains(section.load_notice.?.body, "Loaded skill review");
+    try expectContains(section.load_notice.?.body, "requested skills · 0 loaded · 1 failed");
+    try expectContains(section.load_notice.?.body, "could not load review:");
+    try expectNotContains(section.load_notice.?.body, "loaded skill review");
     try expectContains(section.load_notice.?.body, "ambiguous name");
     try expectNotContains(section.load_notice.?.body, "/workspace/review");
     try expectNotContains(section.load_notice.?.body, "/global/review");
@@ -255,7 +255,7 @@ test "explicit skills include complete instructions beyond the default chunk" {
     defer section.deinit(alloc);
     try std.testing.expect(std.mem.find(u8, section.text, "BEGIN INSTRUCTIONS") != null);
     try std.testing.expect(std.mem.find(u8, section.text, "COMPLETE TAIL") != null);
-    try std.testing.expectEqualStrings("1 requested skill loaded\n└ Loaded skill workflow", section.load_notice.?.body);
+    try std.testing.expectEqualStrings("1 requested skill loaded\n└ loaded skill workflow", section.load_notice.?.body);
     try std.testing.expect(section.load_details == null);
     const bindings = [_]ExplicitBinding{ .{ .name = "workflow", .path = path }, .{ .name = "workflow", .path = path } };
     var repeated = try buildExplicitPromptSection(alloc, .{ .skills = &skills }, "$workflow $workflow", &bindings, .{}, null);
@@ -289,7 +289,7 @@ test "explicit load rows keep untrusted names terminal safe and diagnostics verb
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
     try appendExplicitLoadRow(alloc, &out.writer, "workflow\n\x1b[2J", "Failed\r\nAPI_KEY=private-skill-secret");
-    try expectContains(out.written(), "Could not load workflow");
+    try expectContains(out.written(), "could not load workflow");
     try std.testing.expect(text_utils.isTerminalSafe(out.written()));
     try expectNotContains(out.written(), "\n");
     try expectNotContains(out.written(), "\x1b");
@@ -300,8 +300,8 @@ test "explicit load summary reports a missing bound skill without success" {
     const alloc = std.testing.allocator;
     var section = try buildExplicitPromptSection(alloc, .{ .skills = &.{} }, "Use the selected workflow", &.{.{ .name = "missing-workflow", .path = "/unavailable/workflow" }}, .{}, null);
     defer section.deinit(alloc);
-    try expectContains(section.load_notice.?.body, "Requested skills · 0 loaded · 1 failed");
-    try expectContains(section.load_notice.?.body, "Could not load missing-workflow");
+    try expectContains(section.load_notice.?.body, "requested skills · 0 loaded · 1 failed");
+    try expectContains(section.load_notice.?.body, "could not load missing-workflow");
     try expectNotContains(section.load_notice.?.body, "/unavailable/workflow");
     try expectContains(section.load_details.?, "not found at advertised location");
     try expectNotContains(section.text, "<skill_content");
@@ -2008,9 +2008,9 @@ test "explicit invocation reports user byte ceilings without partial success" {
     try expectNotContains(explicit.text, "TAIL MUST WAIT");
     try std.testing.expect(explicit.notice != null);
     try expectContains(explicit.load_notice.?.body, "0 loaded · 1 failed");
-    try expectContains(explicit.load_notice.?.body, "Could not load workflow");
+    try expectContains(explicit.load_notice.?.body, "could not load workflow");
     try expectContains(explicit.load_details.?, "skill_chunk_bytes");
-    try expectNotContains(explicit.load_notice.?.body, "Loaded skill workflow");
+    try expectNotContains(explicit.load_notice.?.body, "loaded skill workflow");
 
     var fuzzy = try buildExplicitPromptSection(alloc, catalog, "please improve this workflow", &.{}, limits, null);
     defer fuzzy.deinit(alloc);

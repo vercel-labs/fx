@@ -31,7 +31,7 @@ const COMPOSER_LIMIT_PASTE_TIMEOUT = TIMEOUT * 3;
 const COMPOSER_BYTE_LIMIT = 8 * 1024 * 1024;
 const PASTE_START = ["1b", "5b", "32", "30", "30", "7e"] as const;
 const PASTE_END = ["1b", "5b", "32", "30", "31", "7e"] as const;
-const SUFFIX_IGNORED_NOTICE = "Input that arrived right after the paste was ignored.";
+const SUFFIX_IGNORED_NOTICE = "input that arrived right after the paste was ignored.";
 const MANAGED_REVIEW_BODY = "GROUP_C_MANAGED_REVIEW_BODY";
 const WORKSPACE_REVIEW_BODY = "GROUP_C_WORKSPACE_REVIEW_BODY";
 

@@ -125,8 +125,8 @@ describe.skipIf(TMUX_SKIP)("tui: no-key slash commands", () => {
     async () => {
       session = await launchAndWait();
       await session.sendText("/undo");
-      const pane = await session.waitForText("Nothing to undo.", 5_000);
-      expect(pane).toContain("Nothing to undo.");
+      const pane = await session.waitForText("nothing to undo.", 5_000);
+      expect(pane).toContain("nothing to undo.");
     },
     TIMEOUT,
   );

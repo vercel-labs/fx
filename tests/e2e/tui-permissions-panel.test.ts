@@ -130,7 +130,7 @@ scenario("a session grant an approval adds while the panel is open shows when th
 
   // The tool call arrives: its approval takes the footer over the panel.
   release();
-  await shell.session.waitForText("Apply + allow workspace file access for this session", STEP);
+  await shell.session.waitForText("apply + allow workspace file access for this session", STEP);
   await shell.session.sendKeys("2");
   await shell.session.waitForText("WROTE_NOTE", STEP);
   await waitForPanel(shell.session, "Permissions", STEP, (panel) => panel.fields["Session grants"] !== "none");
@@ -145,7 +145,7 @@ scenario("a session grant an approval adds while the panel is open shows when th
   const answer = keystrokeFrames(shell.tape).find((index) => index > submitted)!;
   const close = keystrokeFrames(shell.tape).find((index) => index > answer)!;
   const painted = [...grids.keys()].filter((index) => index > submitted && index < close).sort((a, b) => a - b);
-  const approvalShown = (grid: string[]) => grid.some((row) => row.includes("Apply + allow workspace file access for this session"));
+  const approvalShown = (grid: string[]) => grid.some((row) => row.includes("apply + allow workspace file access for this session"));
   const states = painted.map((index) => {
     const grid = grids.get(index)!;
     const panel = infoPanel(grid, "Permissions");

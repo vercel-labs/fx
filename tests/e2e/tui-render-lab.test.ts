@@ -494,7 +494,7 @@ test("render-lab analyzer rejects duplicate permission UI", () => {
         "OBSERVABILITY_TRANSCRIPT_HEAD",
         "OBSERVABILITY_TRANSCRIPT_TAIL",
         ...prompts,
-        "1. Yes",
+        "1. yes",
       ],
       null,
       [],

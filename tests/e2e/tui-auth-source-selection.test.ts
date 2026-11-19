@@ -8863,7 +8863,7 @@ for (const outcome of ["failure", "cancel"] as const) {
     await session.waitForText("DRAFT_DURING_AUTH_BOUNDARY", 1_000);
     if (outcome === "cancel") {
       await session.sendKeys("C-c");
-      await session.waitForText("Compaction cancelled. Try /compact again when ready.", 3_000);
+      await session.waitForText("compaction cancelled. try /compact again when ready.", 3_000);
     } else {
       await session.waitForText("Compaction was not started. Check authentication and try /compact again.", TIMEOUT);
       const scrollback = await session.captureFullScrollback();

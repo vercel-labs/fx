@@ -423,8 +423,8 @@ describe.skipIf(!tmuxAvailable())("tui: compaction activity", () => {
           } else f.summaryHold.release("");
         }
         const feedback = outcome === "cancel"
-          ? "Compaction cancelled. Try /compact again when ready."
-          : "Compaction failed. Try /compact again.";
+          ? "compaction cancelled. try /compact again when ready."
+          : "compaction failed. try /compact again.";
         await terminal.waitForPane((pane) => !ACTIVITY.test(pane) && pane.includes(feedback) && hasEmptyComposer(pane), 15_000);
         expect(f.durable()).toBe(0);
         expect(f.counts().ordinary).toBe(f.seedTurns);
@@ -529,7 +529,7 @@ describe.skipIf(!tmuxAvailable())("tui: compaction activity", () => {
     try {
       const terminal = await f.launch(false, false);
       await terminal.sendText("/compact");
-      await terminal.waitForText("Compaction failed. Try /compact again.", 15_000);
+      await terminal.waitForText("compaction failed. try /compact again.", 15_000);
       expect(f.durable()).toBe(0);
       f.phase("followup");
       await terminal.sendText("/compact");

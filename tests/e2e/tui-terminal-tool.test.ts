@@ -788,7 +788,7 @@ test.skipIf(!tmuxAvailable())(
       }
       return parts.join(" ");
     };
-    const expectedHeading = `Observed ${launchCommand}`;
+    const expectedHeading = `observed ${launchCommand}`;
     const settledFullGrid = async () => {
       const deadline = Date.now() + TIMEOUT;
       let grid = await session.capturePaneGrid();

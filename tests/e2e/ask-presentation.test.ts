@@ -1202,7 +1202,7 @@ describe("fx ask shell startup files", () => {
         await session.sendText("Check the secret.");
         await session.waitForText("SECRET_CHECK_DONE", TIMEOUT);
         await session.sendText("/trace");
-        await session.waitForText("Trace saved at", TIMEOUT);
+        await session.waitForText("trace saved at", TIMEOUT);
       } finally {
         await session.kill();
       }

@@ -374,7 +374,7 @@ test("the user talks to the parent while its subagent works, and a stop ends the
     const results = logLines(root.home, parent()).filter((line: any) =>
       line.kind === "item" && line.type === "tool_result" && JSON.stringify(line).includes("steering-stop"));
     expect(results).toHaveLength(1);
-    expect(JSON.stringify(results[0])).toContain("stopped worker: its turn ended.");
+    expect(JSON.stringify(results[0])).toContain("Stopped worker: its turn ended.");
     const trace = readFileSync(join(root.root, "trace.log"), "utf8");
     expect(trace).toMatch(/event=child_end .*outcome=cancelled report=false/);
   } finally {
@@ -1305,8 +1305,8 @@ describe("gateway stream lifecycle", () => {
       await tui.waitForPane((pane) => pane.includes("STATUS_FIRST_COMPLETE") && hasEmptyComposer(pane), 15_000);
       const first = await tui.captureFullScrollback();
       expect(first).toContain("2 requested skills loaded");
-      expect(first).toContain("Loaded skill status-first");
-      expect(first).toContain("Loaded skill status-second");
+      expect(first).toContain("loaded skill status-first");
+      expect(first).toContain("loaded skill status-second");
       expect(first).toMatch(/^├ loaded skill status-first$/m);
       expect(first).toMatch(/^└ loaded skill status-second$/m);
       expect(first.indexOf("2 requested skills loaded")).toBeLessThan(first.indexOf("STATUS_FIRST_COMPLETE"));
@@ -1315,17 +1315,17 @@ describe("gateway stream lifecycle", () => {
       await tui.sendText("Use $status-first and $status-duplicate.");
       await tui.waitForPane((pane) => pane.includes("STATUS_MIXED_COMPLETE") && hasEmptyComposer(pane), 15_000);
       const mixed = await tui.captureFullScrollback();
-      expect(mixed.replace(/\s+/g, " ")).toContain("Requested skills · 1 loaded · 1 failed");
-      expect(mixed).toContain("Could not load status-duplicate");
+      expect(mixed.replace(/\s+/g, " ")).toContain("requested skills · 1 loaded · 1 failed");
+      expect(mixed).toContain("could not load status-duplicate");
       expect(mixed).toContain("ambiguous");
-      expect(mixed).toMatch(/^└ Could not load status-duplicate/m);
+      expect(mixed).toMatch(/^└ could not load status-duplicate/m);
       expect(mixed.replace(/\s+/g, " ")).toContain("ctrl+o");
       expect(mixed).not.toContain("duplicate-a");
       expect(mixed).not.toContain("duplicate-b");
-      expect(mixed).not.toContain("Loaded skill status-duplicate");
+      expect(mixed).not.toContain("loaded skill status-duplicate");
       expect(mixed).not.toContain("tool call");
       await tui.sendKeys("C-o");
-      await tui.waitForText("Could not load status-duplicate", 5_000);
+      await tui.waitForText("could not load status-duplicate", 5_000);
       const details = await tui.waitForText("duplicate-a", 5_000);
       // At 48 columns a long path wraps inside itself under the indent.
       expect(details.replace(/\n {4}/g, "")).toContain("duplicate-b");
@@ -2950,7 +2950,7 @@ describe("gateway stream lifecycle", () => {
         gateway.requests[1]!.body,
         installCallId,
       );
-      expect(installOutput).toContain("installed 1 skill(s) into fx.");
+      expect(installOutput).toContain("Installed 1 skill(s) into fx.");
       expect(installOutput).toContain(`- ${skillName}\n`);
       expect(installOutput).not.toContain(bodySentinel);
       expect(installOutput).not.toContain(companionSentinel);
@@ -3326,7 +3326,7 @@ describe("gateway stream lifecycle", () => {
 
       expect(result.code).toBe(0);
       expect(result.stderr).toBe(
-        `Opening ${skillName}\nReading skill resource references/contract-design.md\n`,
+        `opening ${skillName}\nreading skill resource references/contract-design.md\n`,
       );
       expect(json.exit_code).toBe(0);
       expect(json.tool_calls).toEqual([
@@ -3677,7 +3677,7 @@ describe("gateway stream lifecycle", () => {
 
       expect(result.code).toBe(0);
       expect(result.stderr).toBe(
-        `Opening ${skillName}\nOpening ${skillName}\n`,
+        `opening ${skillName}\nopening ${skillName}\n`,
       );
       expect(json.exit_code).toBe(0);
       expect(json.error).toBeUndefined();
@@ -4119,10 +4119,10 @@ describe("gateway stream lifecycle", () => {
         );
 
         expect(result.code).toBe(0);
-        const progressLine = "Writing build/pkg/proof.txt\n";
+        const progressLine = "writing build/pkg/proof.txt\n";
         expect(occurrenceCount(result.stderr, progressLine)).toBe(1);
         expect(result.stderr).toBe(
-          "Writing file\n" +
+          "writing file\n" +
             progressLine,
         );
         const assistantOutput = variant.json
@@ -5563,7 +5563,7 @@ describe("gateway stream lifecycle", () => {
         exit_code: 0,
         output_incomplete: true,
       });
-      expect(observedFailure).toContain("partial output");
+      expect(observedFailure).toContain("Partial output");
       expect(observedFailure).toContain("do not blindly rerun");
       expect(observedFailure).not.toContain("Unexpected");
       expect(json.tool_calls).toHaveLength(1);
@@ -5827,7 +5827,7 @@ describe("gateway stream lifecycle", () => {
       await tui.waitForPane((pane) => pane.includes("LATER_TURN_COMPLETE") && hasEmptyComposer(pane), 15_000);
       expect((await tui.captureFullScrollback()).match(/failed shell request: invalid JSON arguments/g)).toHaveLength(1);
       await tui.sendText("/trace");
-      await tui.waitForText("Trace saved at", 10_000);
+      await tui.waitForText("trace saved at", 10_000);
       const report = readTraceReport(latestTraceReportPath(root.root));
       const transcript = report.all("transcript_entry").map((entry) => String(entry.text)).join("\n");
       expect(transcript).toContain("invalid JSON arguments");
@@ -8152,7 +8152,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         expect(readOutput).not.toContain("must be an object");
         // The row says what the call does, as it does for a short query, and
         // not the tool's default verb.
-        expect(pane).toMatch(new RegExp(`Searched[^\\n]*output for "${marker}`));
+        expect(pane).toMatch(new RegExp(`searched[^\\n]*output for "${marker}`));
         await tui.sendText("/quit");
         expect(await tui.waitForSessionEnd(15000)).toBe(true);
         tui = null;
@@ -8635,12 +8635,12 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
           // dozen tokens of the running turn, and the turn starts with main's
           // list of subagents, which rides with its step. Then the read is
           // compacted along with the cancelled turn, and the summary has it.
-          if (trigger === "automatic" && compactions > 0 && latest.includes("read the follow-up file") && !hasToolResult(body, "cancelled-history-wait")) {
+          if (trigger === "automatic" && compactions > 0 && latest.includes("Read the follow-up file") && !hasToolResult(body, "cancelled-history-wait")) {
             expect(summarizedFollowUp).toBe(true);
             readCompacted = true;
             return fakeGatewayFinalText("CANCEL_FOLLOWUP_COMPLETE");
           }
-          if (latest.includes("read the follow-up file")) {
+          if (latest.includes("Read the follow-up file")) {
             expect(toolResultOutput(body, "cancelled-history-wait")).toBe("aborted by user");
             return fakeGatewaySse([
               { type: "tool-call", toolCallId: "cancel-follow-up-read", toolName: "read_file", input: { path: "follow-up.txt" } },
@@ -8670,7 +8670,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
           const deadline = Date.now() + 15000;
           while (gateway.requests.length < 3 && Date.now() < deadline) await Bun.sleep(10);
           expect(gateway.requests).toHaveLength(3);
-          await tui.waitForPane((pane) => /^[• ] Running \(/m.test(pane), 15000);
+          await tui.waitForPane((pane) => /^[• ] running \(/m.test(pane), 15000);
           await tui.sendKeys("C-c");
           // The cancelled call is its group's header, and the cancellation
           // block below it says "Cancelled".
@@ -8806,7 +8806,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         expect(readFileSync(eventsPath, "utf8")).toBe(originalHistory);
         await tui.sendInterruptEscapePair(5_000);
         await tui.waitForPane(
-          (pane) => pane.includes("Compaction cancelled. Try /compact again when ready.") && compactionIdle(pane),
+          (pane) => pane.includes("compaction cancelled. try /compact again when ready.") && compactionIdle(pane),
           5_000,
         );
         expect(gateway.requests).toHaveLength(4);
@@ -8849,7 +8849,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         responses.push(fakeGatewayFinalText(""), fakeGatewayFinalText(""));
         await tui.sendText("/compact");
         await tui.waitForPane(
-          (pane) => pane.includes("Compaction failed. Try /compact again.") && compactionIdle(pane),
+          (pane) => pane.includes("compaction failed. try /compact again.") && compactionIdle(pane),
           15_000,
         );
         // An empty summary is retried once on the fallback model with the same prompt.
@@ -8964,7 +8964,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         expect(after).toContain('complete="true"');
         expect(before).not.toContain("tool_result_handle");
         expect(after).not.toContain("tool_result_handle");
-        expect(compactionRequest).toContain("read the explicit skill before compaction.");
+        expect(compactionRequest).toContain("Read the explicit skill before compaction.");
         expect(compactionRequest).toContain(bodySentinel);
         expect(compactionRequest).toContain(tailSentinel);
         expect(compactionRequest).toContain("<skill_content");
@@ -9165,10 +9165,10 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         expect(result.code).toBe(0);
         expect(result.signal).toBeNull();
         expect(result.stderr).toMatch(
-          /^\[notice\] Connection lost · next try in 1s · attempt 1$/m,
+          /^\[notice\] connection lost · next try in 1s · attempt 1$/m,
         );
         expect(result.stderr).toMatch(
-          /^\[notice\] Connection lost · retrying · attempt 2$/m,
+          /^\[notice\] connection lost · retrying · attempt 2$/m,
         );
         expect(json.exit_code).toBe(0);
         expect(json.output).toBe(expectedOutput);
@@ -9420,8 +9420,8 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       // backoff, so the reset that follows starts again at one second.
       expect(result.stderr).toMatch(/^\[notice\] gateway error · next try in 1s · attempt 1$/m);
       expect(result.stderr).toMatch(/^\[notice\] gateway error · next try in 1s · attempt 5$/m);
-      expect(result.stderr).toMatch(/^\[notice\] Connection lost · next try in 1s · attempt 6$/m);
-      expect(result.stderr).toMatch(/^\[notice\] Connection lost · retrying · attempt 7$/m);
+      expect(result.stderr).toMatch(/^\[notice\] connection lost · next try in 1s · attempt 6$/m);
+      expect(result.stderr).toMatch(/^\[notice\] connection lost · retrying · attempt 7$/m);
       expect(result.stderr).not.toMatch(/next try in (?:[2-9]|\d\d)s/);
       expect(connections).toBe(7);
       expect(requests).toBe(6);
@@ -9754,7 +9754,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
 
       expect(result.code).toBe(0);
       // The call is answered at once; the child's answer arrives as its report.
-      expect(parentResult).toContain("sent to echoer");
+      expect(parentResult).toContain("Sent to echoer");
       expect(parentResult).not.toContain("child_id");
       expect(report).toContain("Child MCP execution complete.");
       expect(json.output).toContain("Parent sent the MCP task.");
@@ -9829,7 +9829,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       );
       expect(result.code).toBe(0);
       expect(parentResult).not.toContain("AdmissionFailed");
-      expect(parentResult).toContain("sent to summarizer");
+      expect(parentResult).toContain("Sent to summarizer");
       expect(report).toContain("Child with large MCP catalog complete.");
       expect(childRequested).toBe(true);
       expect(parseAskJson(result.stdout).tool_calls).toEqual([
@@ -10629,7 +10629,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       }
       const answer = (id: string) => String(JSON.parse(results[id]!).result);
       // The first subagent starts with no other: its answer is as before.
-      expect(answer("idle_first")).toBe("sent to first, which works on it now. Its report arrives on its own when the work ends; keep working or end your turn.");
+      expect(answer("idle_first")).toBe("Sent to first, which works on it now. Its report arrives on its own when the work ends; keep working or end your turn.");
       // A new subagent's start names the idle one.
       expect(answer("idle_second")).toContain("second is new and starts with no history.");
       expect(answer("idle_second")).toContain(`Idle subagents, each with its own context:\n- first: ${tasks.first}\n`);
@@ -10638,7 +10638,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       expect(answer("idle_third")).toContain(`Idle subagents, each with its own context:\n- first: ${tasks.first}\nGive related work`);
       expect(answer("idle_third")).not.toContain("- second");
       // A message to a subagent that exists starts its turn and names none.
-      expect(answer("idle_again")).toBe("sent to first, which works on it now. Its report arrives on its own when the work ends; keep working or end your turn.");
+      expect(answer("idle_again")).toBe("Sent to first, which works on it now. Its report arrives on its own when the work ends; keep working or end your turn.");
       // Every report of a finished work says its subagent is idle now.
       expect(reports.map((report) => report.agent).sort()).toEqual(["first", "first", "second", "third"]);
       for (const report of reports) {
@@ -11976,7 +11976,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
 
     expect(result.code).toBe(0);
     expect(bodies).toHaveLength(1);
-    expect(json.final_output).toBe("partial answer");
+    expect(json.final_output).toBe("Partial answer");
     expect(`${result.stdout}\n${result.stderr}`).not.toContain("stopped without a reply");
   }, 40_000);
 
@@ -12552,8 +12552,8 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       expect(gateway.requestCount()).toBe(3);
       // Each timeout is one counted send; nothing probes the connection.
       expect(json.recovery).toEqual({ state: "recovered", attempt: 3 });
-      expect(result.stderr).toMatch(/^\[notice\] Connection lost · next try in 1s · attempt 1$/m);
-      expect(result.stderr).toMatch(/^\[notice\] Connection lost · next try in 2s · attempt 2$/m);
+      expect(result.stderr).toMatch(/^\[notice\] connection lost · next try in 1s · attempt 1$/m);
+      expect(result.stderr).toMatch(/^\[notice\] connection lost · next try in 2s · attempt 2$/m);
       expect(trace).toContain("event=route_failure");
       expect(trace).toContain("retry=true");
       expect(trace).toContain("detail=gateway_stream_timeout: stream exceeded maximum duration");
@@ -12589,7 +12589,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       expect(json.output).toBe("Recovered after the finish-only timeout.");
       expect(gateway.requestCount()).toBe(3);
       expect(json.recovery).toEqual({ state: "recovered", attempt: 3 });
-      expect(result.stderr).toMatch(/^\[notice\] Connection lost · next try in 1s · attempt 1$/m);
+      expect(result.stderr).toMatch(/^\[notice\] connection lost · next try in 1s · attempt 1$/m);
       expect(trace).toContain("event=route_failure");
       expect(trace).toContain("http_status=200");
       expect(trace).toContain("retry=true");
@@ -12850,7 +12850,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       );
       expect(result.code).toBe(0);
       expect(result.signal).toBeNull();
-      expect(result.stderr).toBe("reading fixture.txt\nReading fixture.txt\n");
+      expect(result.stderr).toBe("reading fixture.txt\nreading fixture.txt\n");
       const json = parseAskJson(result.stdout);
       expect(json.output).toContain("Finished reading the fixture.");
       expect(json.tool_calls).toEqual([
@@ -13512,8 +13512,8 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         expect(trace).toContain("event=prompt_finish");
         expect(trace).toContain("outcome_kind=assistant");
         // A stream that ends without its finish is a dropped connection.
-        expect(result.stderr).toMatch(/^\[notice\] Connection lost · next try in 1s · attempt 1$/m);
-        expect(result.stderr).toMatch(/^\[notice\] Connection lost · retrying · attempt 2$/m);
+        expect(result.stderr).toMatch(/^\[notice\] connection lost · next try in 1s · attempt 1$/m);
+        expect(result.stderr).toMatch(/^\[notice\] connection lost · retrying · attempt 2$/m);
         expect(result.stderr).not.toContain("/10");
 
         const json = parseAskJson(result.stdout);
@@ -13796,7 +13796,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       // fx never ran the first call, so the resend may call the tool again,
       // and the new call runs once.
       expect(result.code).toBe(0);
-      expect(json.output).toContain("wrote the fixture file once.");
+      expect(json.output).toContain("Wrote the fixture file once.");
       expect(json.tool_calls).toEqual([{ name: "write_file", status: "success" }]);
       expect(gateway.requestCount()).toBe(3);
       expect(gateway.requests[1]!.body).toContain("fx did not execute that call");
@@ -13848,7 +13848,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       const trace = readFileSync(tracePath, "utf8");
 
       expect(result.code).toBe(0);
-      expect(json.output).toContain("read the notes after the malformed call.");
+      expect(json.output).toContain("Read the notes after the malformed call.");
       expect(json.tool_calls).toEqual([{ name: "read_file", status: "success" }]);
       expect(json.recovery?.message ?? "").not.toContain("Tool state needs review");
       expect(gateway.requestCount()).toBe(3);
@@ -13859,7 +13859,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         '"toolChoice":{"type":"none"}',
       );
       expect(result.stderr).not.toContain("next try in");
-      expect(`${result.stdout}\n${result.stderr}`).toContain("asking it to try again.");
+      expect(`${result.stdout}\n${result.stderr}`).toContain("Asking it to try again.");
       expect(toolResultOutput(gateway.requests[2]!.body, "read_resent")).toContain(
         "malformed call fixture",
       );
@@ -14191,7 +14191,7 @@ describe("request recovery across statuses and garbled streams", () => {
       expect(result.code).toBe(0);
       expect(gateway.requestCount()).toBe(2);
       expect(result.stdout).toContain("Recovered after a garbled event.");
-      expect(result.stderr).toMatch(/^\[notice\] Unreadable reply · next try in 1s · attempt 1$/m);
+      expect(result.stderr).toMatch(/^\[notice\] unreadable reply · next try in 1s · attempt 1$/m);
     } finally {
       gateway.stop();
       rmSync(root.root, { recursive: true, force: true });
@@ -14210,7 +14210,7 @@ describe("request recovery across statuses and garbled streams", () => {
       });
       expect(result.code).not.toBe(0);
       expect(gateway.requestCount()).toBe(3);
-      expect(result.stderr).toMatch(/^\[notice\] Unreadable reply · next try in .* · attempt 2$/m);
+      expect(result.stderr).toMatch(/^\[notice\] unreadable reply · next try in .* · attempt 2$/m);
       expect(result.stderr).toMatch(/^fx: unreadable reply$/m);
       expect(result.stderr).not.toContain("MalformedGatewaySseEvent");
     } finally {
@@ -14297,7 +14297,7 @@ describe("request recovery across statuses and garbled streams", () => {
       });
       expect(result.code, result.stdout + result.stderr).toBe(0);
       expect(result.stdout).toContain("LOCAL_RECOVERED_GARBLED");
-      expect(result.stderr).toMatch(/^\[notice\] Unreadable reply · next try in 1s · attempt 1$/m);
+      expect(result.stderr).toMatch(/^\[notice\] unreadable reply · next try in 1s · attempt 1$/m);
       expect(fixture.requests.filter((request) => request.path === "/v1/chat/completions").length).toBe(2);
     } finally {
       fixture.close();
@@ -14743,7 +14743,7 @@ test("a quiet subagent command wakes main's wait once, and status names the call
     const context = relayContext(result, tracePath);
     // Main's wait woke while the subagent still waited on its command, and
     // status names that call and how long it has run.
-    expect(state.status, context).toMatch(/worker: working, in Waiting for OPENAI_API_KEY=\[redacted\] sh -c .*QUIET-RELAY-READY.* for \d+s/);
+    expect(state.status, context).toMatch(/worker: working, in waiting for OPENAI_API_KEY=\[redacted\] sh -c .*QUIET-RELAY-READY.* for \d+s/);
     expect(state.status).not.toContain(secret);
     // The note joins main's running turn, and the wait says it follows.
     expect(state.waitResult, context).toContain("A report or message arrived. It follows this result.");

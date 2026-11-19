@@ -31,8 +31,8 @@ import { onlySessionId, savedText } from "./saved-sessions";
 
 const TIMEOUT = 30_000;
 const MAXIMUM_WRITE_TIMEOUT = 120_000;
-const APPLY_QUESTION = "Apply this change?";
-const REVEAL_QUESTION = "Reveal that this file already matches?";
+const APPLY_QUESTION = "apply this change?";
+const REVEAL_QUESTION = "reveal that this file already matches?";
 
 type IsolatedRoot = {
   root: string;
@@ -226,8 +226,8 @@ function expectApprovalControls(
   },
 ) {
   const intent = opts.intent ?? "apply";
-  const verb = intent === "apply" ? "Apply" : "Reveal";
-  const denial = intent === "apply" ? "Don't apply" : "Don't reveal";
+  const verb = intent === "apply" ? "apply" : "reveal";
+  const denial = intent === "apply" ? "don't apply" : "don't reveal";
   const choices = [
     `1  ${verb} once`,
     `2  ${verb} + allow ${opts.scope}`,
@@ -255,8 +255,8 @@ function expectApprovalControls(
 
   expect(block).not.toMatch(/^\s*[123][YAN]\b/m);
   for (const oldCopy of [
-    "1. Yes, proceed",
-    "2. Yes, and don't ask again",
+    "1. yes, proceed",
+    "2. yes, and don't ask again",
     "3. No, and tell fx",
     "This action changes files in your workspace.",
   ]) {
@@ -616,8 +616,8 @@ describe.skipIf(!tmuxAvailable())("tui: file permissions", () => {
       expect(approval).not.toContain("review-line-01");
       const initialRows = approval.split("\n");
       const headerRow = initialRows.findIndex((row) =>
-        row.includes("Permission needed · Review change") &&
-        row.includes("Write")
+        row.includes("permission needed · review change") &&
+        row.includes("write")
       );
       const reviewRow = initialRows.findIndex((row) =>
         row.includes("90 + review-line-90")
@@ -640,11 +640,11 @@ describe.skipIf(!tmuxAvailable())("tui: file permissions", () => {
 
       await session.sendKeys("Right");
       await session.waitForText(
-        "❯ 2  Apply + allow workspace file access for this session",
+        "❯ 2  apply + allow workspace file access for this session",
         TIMEOUT,
       );
       await session.sendKeys("Left");
-      await session.waitForText("❯ 1  Apply once", TIMEOUT);
+      await session.waitForText("❯ 1  apply once", TIMEOUT);
 
       await session.sendHexBytes(completeWheel);
       const completeSgrApproval = (await session.capturePaneGrid()).join("\n");
@@ -699,14 +699,14 @@ describe.skipIf(!tmuxAvailable())("tui: file permissions", () => {
         [
           "1b", "5b", "3c", "36", "35", "3b", "31", "3b", "31", "4d",
         ],
-        (pane) => pane.includes("+ review-line-90") && pane.includes("3  Don't apply"),
+        (pane) => pane.includes("+ review-line-90") && pane.includes("3  don't apply"),
       );
       approval = await waitForFileApproval(session, {
         required: ["+ review-line-90"],
       });
-      expect(approval).toContain("❯ 1  Apply once");
-      expect(approval).toContain("2  Apply + allow workspace file access for this session");
-      expect(approval).toContain("3  Don't apply");
+      expect(approval).toContain("❯ 1  apply once");
+      expect(approval).toContain("2  apply + allow workspace file access for this session");
+      expect(approval).toContain("3  don't apply");
 
       await decide(session, 1);
       await session.waitForText("full review complete", TIMEOUT);
@@ -836,11 +836,11 @@ describe.skipIf(!tmuxAvailable())("tui: file permissions", () => {
       expect(grid[bottomDividerRow + 1]).toContain("1–3 choose");
       const rows = approval.split("\n");
       const headerRow = rows.findIndex((row) =>
-        row.includes("Permission needed · Review change"),
+        row.includes("permission needed · review change"),
       );
       const questionRow = rows.findIndex((row) => row.includes(APPLY_QUESTION));
-      const choiceOneRow = rows.findIndex((row) => row.includes("1  Apply once"));
-      const choiceThreeRow = rows.findIndex((row) => row.includes("3  Don't apply"));
+      const choiceOneRow = rows.findIndex((row) => row.includes("1  apply once"));
+      const choiceThreeRow = rows.findIndex((row) => row.includes("3  don't apply"));
       const hintRow = rows.findIndex((row) => row.includes("1–3 choose"));
       expect(rows[headerRow + 1]!.trim()).toBe("");
       expect(questionRow).toBe(headerRow + 2);
@@ -859,7 +859,7 @@ describe.skipIf(!tmuxAvailable())("tui: file permissions", () => {
         "1b", "5b", "3c", "36", "35", "3b", "31", "3b", "31", "4d",
       ]);
       approval = await waitForFileApproval(session, {
-        required: ["❯ 1  Apply once"],
+        required: ["❯ 1  apply once"],
       });
       expectApprovalControls(approval, {
         scope: "workspace file access for this session",
@@ -898,21 +898,21 @@ describe.skipIf(!tmuxAvailable())("tui: file permissions", () => {
         required: ["amended-review.txt", "+ amended review content"],
       });
       await session.sendKeys("Tab");
-      await session.waitForText("Apply once, and tell fx what to do next", TIMEOUT);
+      await session.waitForText("apply once, and tell fx what to do next", TIMEOUT);
       await session.sendLiteralText(feedback);
-      await session.waitForText(`Apply once, ${feedback}`, TIMEOUT);
+      await session.waitForText(`apply once, ${feedback}`, TIMEOUT);
 
       await session.resizeWindow(80, 18, 500);
       const resized = await waitForFileApproval(session, {
         required: ["amended-review.txt", "+ amended review content"],
       });
-      expect(resized).toContain(`Apply once, ${feedback}`);
+      expect(resized).toContain(`apply once, ${feedback}`);
 
       await session.sendKeys("Enter");
       await session.waitForText("amended review complete", TIMEOUT);
       const finalPane = await session.capturePane();
       expect(finalPane).toContain(feedback);
-      const terminalTool = finalPane.indexOf("Wrote amended-review.txt");
+      const terminalTool = finalPane.indexOf("wrote amended-review.txt");
       const feedbackCard = finalPane.indexOf(feedback);
       expect(terminalTool).toBeGreaterThanOrEqual(0);
       expect(feedbackCard).toBeGreaterThan(terminalTool);
@@ -983,7 +983,7 @@ describe.skipIf(!tmuxAvailable())("tui: file permissions", () => {
       expectApprovalControls(approval, {
         scope: "workspace file access for this session",
       });
-      expect(approval).toContain("Edit ");
+      expect(approval).toContain("edit ");
       expect(approval).toContain("stale.txt");
       expect(approval).toContain("- two");
       expect(approval).toContain("+ TWO");
@@ -1036,7 +1036,7 @@ describe.skipIf(!tmuxAvailable())("tui: file permissions", () => {
       expectApprovalControls(approval, {
         scope: `file changes under ${root.external} for this session`,
       });
-      expect(approval).toContain("Write ");
+      expect(approval).toContain("write ");
       expect(approval).toContain("file.txt");
       expect(approval).toContain("+ denied");
       expect(existsSync(deniedParent)).toBe(false);
@@ -1271,7 +1271,7 @@ describe.skipIf(!tmuxAvailable())("tui: file permissions", () => {
           intent: "reveal",
           scope: `file changes under ${root.external} for this session`,
         });
-        expect(approval).not.toContain("Apply once");
+        expect(approval).not.toContain("apply once");
         await decide(launched.session, decision.choice);
         if (decision.revealsEquality) {
           const repeatedApproval = await waitForFileApproval(launched.session, {

@@ -387,7 +387,7 @@ describe("modern MCP Streamable HTTP", () => {
       },
     );
     expect(added.code).toBe(0);
-    expect(added.stdout).toBe("Added fixture to ~/.fx/mcp.json.\n");
+    expect(added.stdout).toBe("added fixture to ~/.fx/mcp.json.\n");
     const methods = (from: number) => fixture!.requests.slice(from).map((entry) => entry.message.method).filter((method) => method !== "subscriptions/listen");
     // add connects once to see whether the server needs a login; this one doesn't.
     expect(methods(0)).toEqual(["server/discover", "tools/list"]);
