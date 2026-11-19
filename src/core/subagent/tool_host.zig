@@ -2393,21 +2393,17 @@ pub const Runtime = struct {
 
     /// Resolves a creation-time model override against the model catalog before
     /// any child session exists, so an unknown or ambiguous name fails fast
-    /// with actionable guidance instead of dying in the child after a wasted
-    /// gateway request. Without a resolver (or a ready catalog) the raw
-    /// override passes through and the gateway remains the final arbiter.
+    /// with actionable guidance instead of failing in the child after a model
+    /// request. Without a resolver or a ready catalog, keep the raw override.
     fn resolveOverrideModel(
         alloc: Allocator,
         override: model_contract.Override,
         options: ExecuteOptions,
     ) !OverrideModelResolution {
         const raw_model = override.model orelse return .{ .accepted = null };
-        // Only the gateway catalog is an authoritative model list. Configured
-        // providers (OpenAI-compatible endpoints) accept arbitrary model IDs,
-        // so overrides for those children pass through to the provider.
-        if (options.defaults.provider != .gateway) {
-            debug_trace.logf("subagent", "model override resolution skipped raw={s} reason=non_gateway_provider", .{raw_model});
-            return .{ .accepted = null };
+        switch (options.defaults.provider) {
+            .gateway, .codex => {},
+            .grok, .configured => return .{ .accepted = null },
         }
         const resolver = options.model_override_resolver orelse {
             debug_trace.logf("subagent", "model override resolution skipped raw={s} reason=no_resolver", .{raw_model});
@@ -6057,7 +6053,7 @@ test "unknown and ambiguous model overrides reject before any child session" {
     try std.testing.expectEqual(@as(usize, 0), registry.children.len);
 }
 
-test "model override passes through for non-gateway providers" {
+test "model override passes through for configured providers" {
     const alloc = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(alloc);
     defer arena_state.deinit();
@@ -6072,10 +6068,12 @@ test "model override passes through for non-gateway providers" {
 
     var request = try model_contract.validateRequest(alloc, .{ .message = .{ .agent = "probe", .message = "probe", .model = "unknown-model" } });
     defer request.deinit(alloc);
+    var provider = model_provider.parse("fixture-provider").?;
+    provider.configured.binding = @splat(0);
     const result = try runtime.executeManaged(arena, &request, .{
         .caller_id = parent.parent.id(),
-        .invocation_id = "override-non-gateway",
-        .defaults = .{ .provider = .codex, .model = "parent-model", .effort = .auto, .conversation_language = session.ConversationLanguage.literal("en") },
+        .invocation_id = "override-configured",
+        .defaults = .{ .provider = provider, .model = "parent-model", .effort = .auto, .conversation_language = session.ConversationLanguage.literal("en") },
         .max_result_bytes = 4096,
         .timestamp_ms = 1,
         .model_override_resolver = .{ .context = &fixture, .resolve_fn = OverrideResolverFixture.resolveModel },
