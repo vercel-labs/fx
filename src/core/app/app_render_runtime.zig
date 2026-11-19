@@ -931,7 +931,9 @@ pub fn Runtime(comptime App: type) type {
                 items.context_used = agents.loadTotal(&agent.total_input_tokens);
                 items.context_total = model_capabilities.resolveForApp(App, app, visible_model).context_window;
             }
-            if (comptime @hasField(App, "statusline_session")) {
+            if (app_session_runtime.Runtime(App).isNoSave(app)) {
+                items.session_title = "ephemeral";
+            } else if (comptime @hasField(App, "statusline_session")) {
                 if (app.statusline_session) {
                     items.session_title = app_session_runtime.Runtime(App).cachedSessionTitle(agent);
                 }

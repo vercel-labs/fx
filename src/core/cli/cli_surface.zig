@@ -173,6 +173,8 @@ pub const LaunchModifiers = struct {
     /// `--instances <n>`: how many fx instances the host opens at startup,
     /// each with its own session.
     instances: ?usize = null,
+    /// `true` for `--no-save`, `false` for `--save`, `null` if neither was given.
+    no_save: ?bool = null,
 
     pub fn deinit(self: *LaunchModifiers, alloc: Allocator) void {
         if (self.context_limit_overrides.len > 0) alloc.free(self.context_limit_overrides);
@@ -519,6 +521,8 @@ const LaunchFlag = enum {
     yolo,
     profile,
     instances,
+    save,
+    no_save,
 };
 
 const launch_flag_ids = cli_flags.idTable(LaunchFlag, &builtin_commands.launch_options);
@@ -623,6 +627,8 @@ fn parseLaunchFlags(alloc: Allocator, args: []const [:0]const u8, comptime mode:
                 if (count == 0) return error.InvalidInstancesValue;
                 modifiers.instances = count;
             },
+            .save => modifiers.no_save = false,
+            .no_save => modifiers.no_save = true,
         }
     }
 
@@ -916,6 +922,7 @@ pub fn parseInteractiveLaunch(
                 global_args.deinit(alloc);
                 global_args = launch;
             }
+            if (global_args.modifiers.no_save == true) return error.NoSaveResumeConflict;
             if (prompt) |text| {
                 if (std.mem.trim(u8, text, " \t\r\n").len == 0) return error.EmptyLaunchPrompt;
             }
@@ -1456,6 +1463,10 @@ fn runIfRequestedWithDeps(alloc: Allocator, args: []const [:0]const u8, cfg: Con
             try writeTopLevelUsage(cfg.command_catalog, deps, .@"resume");
             return usage_failure;
         }
+        if (err == error.NoSaveResumeConflict) {
+            try writeStderr(deps, "fx: --no-save cannot be used when resuming a session\n");
+            return usage_failure;
+        }
         if (removedResumeHint(err)) |hint| {
             try writeStderr(deps, hint);
             return usage_failure;
@@ -1516,6 +1527,16 @@ fn runNonInteractiveWithDeps(
     const effective_args = parsed_launch.effective_args;
     const parsed_command = parsed_launch.command;
 
+    if (global_args.modifiers.no_save) |no_save| {
+        const message = if (!no_save)
+            "fx: --save applies to interactive sessions\n"
+        else if (parsed_command == .ask)
+            "fx: put --no-save after ask: fx ask --no-save <prompt>\n"
+        else
+            "fx: --no-save applies to interactive sessions\n";
+        try writeStderr(deps, message);
+        return usage_failure;
+    }
     if (global_args.modifiers.hasWorkspaceModifiers() and
         !commandSupportsWorkspaceModifiers(parsed_command))
     {
@@ -5156,6 +5177,44 @@ fn testCommandCatalog() CommandCatalog {
     return builtin_commands.top_level_registry;
 }
 
+test "interactive save flags select session saving for this launch" {
+    const alloc = std.testing.allocator;
+    const cases = [_]struct {
+        args: []const [:0]const u8,
+        no_save: ?bool,
+        prompt: ?[]const u8 = null,
+        resume_target: ?std.meta.Tag(ResumeTarget) = null,
+    }{
+        .{ .args = &.{}, .no_save = null },
+        .{ .args = &.{"--no-save"}, .no_save = true },
+        .{ .args = &.{"--save"}, .no_save = false },
+        .{ .args = &.{ "--save", "--no-save" }, .no_save = true },
+        .{ .args = &.{ "--no-save", "--save" }, .no_save = false },
+        .{ .args = &.{ "--save", "first prompt", "--no-save" }, .no_save = true, .prompt = "first prompt" },
+        .{ .args = &.{ "--", "--no-save" }, .no_save = null, .prompt = "--no-save" },
+        .{ .args = &.{ "--no-save", "-c", "--save" }, .no_save = false, .resume_target = .remembered },
+    };
+    for (cases) |case| {
+        var parsed = try parseInteractiveLaunch(alloc, case.args, testCommandCatalog());
+        switch (parsed) {
+            .interactive => |*launch| {
+                defer launch.deinit(alloc);
+                try std.testing.expectEqual(case.no_save, launch.modifiers.no_save);
+                if (case.prompt) |prompt|
+                    try std.testing.expectEqualStrings(prompt, launch.initial_prompt.?)
+                else
+                    try std.testing.expect(launch.initial_prompt == null);
+                const resume_target: ?std.meta.Tag(ResumeTarget) = if (launch.requested_resume) |target| std.meta.activeTag(target) else null;
+                try std.testing.expectEqual(case.resume_target, resume_target);
+            },
+            .noninteractive => |*launch| {
+                launch.deinit(alloc);
+                return error.TestExpectedInteractiveLaunch;
+            },
+        }
+    }
+}
+
 test "launch flags may follow the resume word and its target" {
     const alloc = std.testing.allocator;
     const command_catalog = testCommandCatalog();
@@ -6158,7 +6217,41 @@ test "runIfRequested help writes top-level help" {
     try std.testing.expectEqual(RunResult.handled_success, result);
     try std.testing.expect(std.mem.startsWith(u8, capture.stdout.written(), "𝒇x v0.0.0\nFast, native coding agent for the terminal."));
     try std.testing.expect(std.mem.find(u8, capture.stdout.written(), testConfig().version) != null);
+    try std.testing.expect(std.mem.find(u8, capture.stdout.written(), "--save, --no-save") != null);
     try std.testing.expectEqualStrings("", capture.stderr.written());
+}
+
+test "startup save flags are rejected before noninteractive commands run" {
+    const alloc = std.testing.allocator;
+    const cases = [_]struct { args: []const [:0]const u8, diagnostic: []const u8 }{
+        .{ .args = &.{ "--no-save", "status", "--help" }, .diagnostic = "fx: --no-save applies to interactive sessions\n" },
+        .{ .args = &.{ "--no-save", "--save", "ask", "--help" }, .diagnostic = "fx: --save applies to interactive sessions\n" },
+        .{ .args = &.{ "--no-save", "ask", "--help" }, .diagnostic = "fx: put --no-save after ask: fx ask --no-save <prompt>\n" },
+    };
+    for (cases) |case| {
+        var capture = CaptureOutput.init(alloc);
+        defer capture.deinit();
+        const result = try runIfRequestedWithDeps(alloc, case.args, testConfig(), capture.deps());
+        try std.testing.expectEqual(usage_failure, result);
+        try std.testing.expectEqualStrings("", capture.stdout.written());
+        try std.testing.expectEqualStrings(case.diagnostic, capture.stderr.written());
+    }
+}
+
+test "ask keeps its own --no-save flag" {
+    const alloc = std.testing.allocator;
+    var parsed = try parseInteractiveLaunch(alloc, &.{ "ask", "--no-save", "prompt" }, testCommandCatalog());
+    switch (parsed) {
+        .noninteractive => |*launch| {
+            defer launch.deinit(alloc);
+            try std.testing.expect(launch.global_args.modifiers.no_save == null);
+            try std.testing.expectEqualStrings("--no-save", launch.command.ask[0]);
+        },
+        .interactive => |*launch| {
+            launch.deinit(alloc);
+            return error.TestExpectedNonInteractiveLaunch;
+        },
+    }
 }
 
 // `builtins/mcp.zig` "fx mcp approve saves the approval of a project server"
@@ -6691,6 +6784,28 @@ test "runIfRequested -r and a bare --resume ask which session to resume" {
         extra_capture.deps(),
     );
     try std.testing.expectEqual(usage_failure, extra);
+}
+
+test "--no-save refuses to resume a session with a usage error" {
+    const alloc = std.testing.allocator;
+    const cases = [_][]const [:0]const u8{
+        &.{ "--no-save", "-c" },
+        &.{ "--continue", "--no-save" },
+        &.{ "-r", "--no-save" },
+        &.{ "--no-save", "--resume" },
+        &.{ "--resume", "last", "--no-save" },
+        &.{ "--resume=session.123", "first prompt", "--no-save" },
+        &.{ "session", "resume", "last", "--no-save" },
+        &.{ "--save", "-c", "--no-save" },
+    };
+    for (cases) |args| {
+        var capture = CaptureOutput.init(alloc);
+        defer capture.deinit();
+        const result = try runIfRequestedWithDeps(alloc, args, testConfig(), capture.deps());
+        try std.testing.expectEqual(usage_failure, result);
+        try std.testing.expectEqualStrings("", capture.stdout.written());
+        try std.testing.expectEqualStrings("fx: --no-save cannot be used when resuming a session\n", capture.stderr.written());
+    }
 }
 
 test "runIfRequested top-level resume aliases return the existing target" {

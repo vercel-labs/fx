@@ -579,6 +579,7 @@ const App = struct {
     program_status: ui_program_status.Reporter = .{},
 
     prompt_history: PromptHistoryRuntime = .{},
+    no_save: bool = false,
     requested_resume: ?cli_surface.ResumeTarget = null,
     approval_screen: ApprovalScreenState = .{},
 
@@ -669,6 +670,7 @@ const App = struct {
             .input_runtime = undefined,
             .shell = TranscriptRuntime.init(),
             .lifecycle_runtime = hooks.Runtime.init(alloc),
+            .no_save = launch.modifiers.no_save orelse false,
             .terminal_client = terminal_client_runtime.Runtime.init(if (comptime host_target.is_wasm)
                 process_provider.unavailable_provider
             else

@@ -51,6 +51,7 @@ ShellSession holds -
 ShellSession witness-saved-empty-status NoSavedEmptyStatus
 ShellSession witness-unsaved-status NoUnsavedStatus
 ShellSession witness-storeless-status NoStorelessStatus
+ShellSession witness-no-save-with-saves NoEphemeralLaunchWithSaves
 ShellSession witness-empty-exit-line NoEmptyExitLine
 ShellSession witness-resume-after-crash NoResumeAfterCrash
 ShellSession mutant-saved-by-turns StatusUnsavedIsAbsent
@@ -61,6 +62,7 @@ ShellSession mutant-keep-pristine DiscardedNeverSaved
 ShellSession mutant-reuse-id NewIdsAreFresh
 ShellSession mutant-fork-held ForkOnDisk
 ShellSession mutant-drop-on-switch SavedStaysSaved
+ShellSession mutant-new-reopens-store StorelessStaysEphemeral
 ShellSession simulate simulate $sim
 TurnStream stream-holds -
 TurnStream stream-before-safe -

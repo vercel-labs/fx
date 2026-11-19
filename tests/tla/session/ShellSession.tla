@@ -6,11 +6,13 @@
 (* log is on disk, so a resume opens it.                                   *)
 (*                                                                         *)
 (* One profile outlives many processes. A launch opens a new session,      *)
-(* resumes a saved one, or finds no usable store and opens none. In a      *)
-(* process, a prompt's turn begins and ends, `/new` and `/clear` open a    *)
-(* new session, `/resume` opens a saved one, and `/fork` opens a new       *)
-(* session holding the turns before a chosen prompt. A process ends when   *)
-(* the user quits or it crashes.                                           *)
+(* resumes a saved one, or runs without a store. An unavailable store and  *)
+(* `fx --no-save` use the same storeless path.                             *)
+(*                                                                         *)
+(* Prompts start turns. With a store, `/new` and `/clear` open a session,   *)
+(* `/resume` opens a saved one, and `/fork` opens a new one holding the     *)
+(* turns before a chosen prompt. The process ends on quit or crash. This   *)
+(* model tracks session logs, not prompt history or extra instances.       *)
 (*                                                                         *)
 (* `last` is what the latest action showed the user. ShellSessionTrace     *)
 (* matches it, the saved ids, and their turns against what the real binary *)
@@ -35,7 +37,8 @@ Mutants == {
   "keep_pristine",     \* leaving a session never prompted saves it
   "reuse_id",          \* a new session may take an id already used
   "fork_held",         \* a fork before the first prompt waits for its first turn
-  "drop_on_switch"     \* leaving a saved session deletes it
+  "drop_on_switch",    \* leaving a saved session deletes it
+  "new_reopens_store"  \* /new enables persistence in a storeless process
 }
 
 ASSUME None \notin Ids
@@ -44,7 +47,7 @@ ASSUME Mutant \in Mutants
 
 VARIABLES
   running,    \* a process is running
-  durable,    \* this process can create sessions
+  durable,    \* this process can create saved sessions
   cur,        \* the open session's id, or None
   turnOpen,   \* a turn is running
   onDisk,     \* the ids whose log is on disk
@@ -57,8 +60,10 @@ VARIABLES
 
 vars == <<running, durable, cur, turnOpen, onDisk, turns, used, discarded, first, ended, last>>
 
-Ops == {"start", "launch", "launch_resume", "launch_no_store", "begin", "end",
-        "status", "new", "clear", "resume", "fork", "quit", "crash"}
+StorelessLaunchOps == {"launch_no_store", "launch_no_save"}
+
+Ops == StorelessLaunchOps \cup {"start", "launch", "launch_resume", "begin", "end",
+                               "status", "new", "clear", "resume", "fork", "quit", "crash"}
 
 Obs(op, id, point, saved, handoff) ==
   [op |-> op, id |-> id, point |-> point, saved |-> saved, handoff |-> handoff]
@@ -135,14 +140,14 @@ LaunchResume(i) ==
   /\ last' = Obs("launch_resume", i, 0, FALSE, None)
   /\ UNCHANGED <<turnOpen, onDisk, turns, used, discarded, ended>>
 
-(* `fx` where no session can be created: it runs, and saves nothing.       *)
-LaunchNoStore ==
+(* An unavailable or deliberately disabled store: no session to publish.  *)
+LaunchStoreless(op) ==
   /\ ~running
   /\ running' = TRUE
   /\ durable' = FALSE
   /\ cur' = None
   /\ first' = None
-  /\ last' = Quiet("launch_no_store")
+  /\ last' = Quiet(op)
   /\ UNCHANGED <<turnOpen, onDisk, turns, used, discarded, ended>>
 
 (* ------------------------------- turns ---------------------------------- *)
@@ -177,9 +182,11 @@ Status ==
 
 (* `/new` or `/clear`. Without a store the shell stays without a session.  *)
 NewSession(op, i) ==
+  LET canSave == durable \/ (op = "new" /\ Mutant = "new_reopens_store") IN
   /\ running
   /\ ~turnOpen
-  /\ IF durable
+  /\ durable' = canSave
+  /\ IF canSave
        THEN /\ i \in FreshIds
             /\ cur' = i
             /\ used' = used \cup {i}
@@ -188,7 +195,7 @@ NewSession(op, i) ==
        ELSE /\ i = None
             /\ UNCHANGED <<cur, used, onDisk, discarded>>
   /\ last' = Obs(op, i, 0, FALSE, None)
-  /\ UNCHANGED <<running, durable, turnOpen, turns, first, ended>>
+  /\ UNCHANGED <<running, turnOpen, turns, first, ended>>
 
 (* `/resume`: the picker opens another saved session.                      *)
 Resume(i) ==
@@ -248,7 +255,7 @@ Crash ==
 
 Next ==
   \/ \E i \in Ids : Launch(i) \/ LaunchResume(i)
-  \/ LaunchNoStore
+  \/ \E op \in StorelessLaunchOps : LaunchStoreless(op)
   \/ Begin
   \/ End
   \/ Status
@@ -313,6 +320,16 @@ NewIdsAreFresh ==
 (* Nothing in these flows removes a saved session.                         *)
 SavedStaysSaved == [][onDisk \subseteq onDisk']_vars
 
+(* A storeless launch leaves existing saves alone. Until exit it can      *)
+(* neither acquire a store nor hand off an id, even across `/new`.         *)
+StorelessStaysEphemeral ==
+  [][(last'.op \in StorelessLaunchOps \/ (running /\ ~durable)) =>
+      /\ ~durable'
+      /\ cur' = None
+      /\ UNCHANGED onDisk
+      /\ last'.op \notin {"resume", "fork"}
+      /\ last'.handoff = None]_vars
+
 (* ------------------------------ witnesses ------------------------------- *)
 (* Each must be violated: the state it rules out is reachable, so the      *)
 (* properties above are not vacuous there.                                 *)
@@ -326,6 +343,9 @@ NoUnsavedStatus == ~(last.op = "status" /\ ~last.saved /\ last.id # None)
 
 (* `/status` in a shell without a session.                                 *)
 NoStorelessStatus == ~(last.op = "status" /\ last.id = None)
+
+(* `--no-save` can launch in a profile that already has saved sessions.     *)
+NoEphemeralLaunchWithSaves == ~(last.op = "launch_no_save" /\ onDisk # {})
 
 (* An exit line for a session that holds no turn.                          *)
 NoEmptyExitLine == ~(last.op = "quit" /\ last.handoff # None /\ turns[last.handoff] = 0)
