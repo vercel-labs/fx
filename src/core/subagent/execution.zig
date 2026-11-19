@@ -381,10 +381,12 @@ pub const TurnContext = struct {
     /// The child's turn starts: its start capture (D98).
     pub fn startWorkspaceCapture(self: *TurnContext, fresh: bool, step: runtime_deps.AgentRuntimeDeps.WorkspaceCaptureStep) void {
         if (comptime !turn_capture.supported) return;
+        if (step == .settle) return self.turn_capture.settle();
         const context = self.workspaceCaptureContext() orelse return;
         switch (step) {
             .begin => self.turn_capture.begin(context, fresh),
             .capture => self.turn_capture.start(context, &self.capture_lock),
+            .settle => unreachable,
         }
     }
 

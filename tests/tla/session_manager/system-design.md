@@ -1971,11 +1971,16 @@ as it was sent):
     with the tool in `trigger_tool`, and its end capture closes the turn
     with the others.
   - **Host order:** the runtime begins the turn's token, then saves the
-    user's prompt through `append_turn_piece`, then takes the start
-    capture, all before the first request. The prompt's write opens the
-    turn for the token, so the start capture is written in it at once, and
-    a process killed during the capture, which can take seconds, keeps the
-    prompt. The end capture runs on the turn's own thread before the
+    user's prompt through `append_turn_piece`, then starts the start
+    capture on its own thread, beside the turn's first request, and waits
+    for it to be saved before any tool acts (`AgentRuntimeDeps.executeToolCall`
+    sends `.settle`), before a reached repository's start, before the end
+    capture, and before the next turn begins. The prompt's write opens the
+    turn for the token, so the start capture is written in it as soon as it
+    is taken, possibly after the first streamed pieces, and a process killed
+    during the capture, which can take seconds, keeps the prompt. A cancel
+    that stops the turn, quitting included, ends a start capture still
+    running as it ends any other. The end capture runs on the turn's own thread before the
     commit. In the app that is the agent's worker, as the turn finishes and
     before its finished prompt reaches the UI, so the UI's commit, which
     may run late in the pacer, only writes what is held. The end capture
