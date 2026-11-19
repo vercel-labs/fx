@@ -10329,6 +10329,18 @@ pub const TranscriptRuntime = struct {
                     scroll_facts.target_visual_offset,
                 },
             );
+            diagnostics.recordRenderEvent(
+                .transition,
+                "target_failed err={s} compatible={} geometry={} recovery={} restore={} target={d}",
+                .{
+                    @errorName(err),
+                    scroll_facts.source_compatible,
+                    scroll_facts.geometry_rebase,
+                    scroll_facts.recovery_rebase,
+                    normal_buffer_recovery_pending,
+                    scroll_facts.target_visual_offset,
+                },
+            );
             return err;
         };
         if (!projection_area.isEmpty() and

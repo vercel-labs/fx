@@ -9,6 +9,10 @@ const env_settings = @import("core/config/env_settings.zig");
 
 pub const version = "0.0.17";
 
+/// Panics save a crash record for `/trace`, except in tests, which keep the
+/// default handler.
+pub const panic = if (builtin.is_test) std.debug.FullPanic(std.debug.defaultPanic) else std.debug.FullPanic(crash_panic.handle);
+
 const app_lifecycle = @import("core/app/app_lifecycle.zig");
 const provider_runtime = @import("core/app/provider_runtime.zig");
 const auth_runtime = @import("core/auth/auth_runtime.zig");
@@ -26,6 +30,7 @@ const token_pass_check = @import("core/app/token_pass_check.zig");
 const app_auth_runtime = @import("core/app/app_auth_runtime.zig");
 const app_host_config_runtime = @import("core/app/app_host_config_runtime.zig");
 const app_entry_runtime = @import("core/app/app_entry_runtime.zig");
+const crash_panic = @import("core/app/crash_panic.zig");
 const acp_runner = @import("core/cli/acp_runner.zig");
 const acp_server = @import("acp/server.zig");
 const app_input_runtime = @import("core/app/app_input_runtime.zig");
@@ -52,6 +57,7 @@ const profiles = @import("core/profiles/profiles.zig");
 const app_workspace_runtime = @import("core/app/app_workspace_runtime.zig");
 const app_callbacks = @import("core/app/app_callbacks.zig");
 const app_commands = @import("core/app/app_commands.zig");
+const trace_report = @import("core/app/trace_report.zig");
 const change_tracker_mod = @import("core/workspace/change_tracker.zig");
 const context_contract = @import("core/workspace/context_contract.zig");
 const statusline_identity = @import("core/workspace/statusline_identity.zig");
@@ -479,6 +485,12 @@ const App = struct {
             js_host_url_opener.opener
         else
             host.unavailable_url_opener;
+    }
+
+    /// Saves the crash report for `err`. The caller owns the path and frees it
+    /// with `app.alloc`; null means the report was not saved.
+    pub fn writeCrashReport(self: *Self, err: anyerror) ?[]u8 {
+        return trace_report.writeCrashReport(self, err);
     }
 
     pub fn creditsProvider(self: *const Self) gateway_provider.CreditsProvider {

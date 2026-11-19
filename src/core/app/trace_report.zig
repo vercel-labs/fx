@@ -33,6 +33,9 @@
 //!
 //! - `fx_trace`: `format_version` (1), `fx_version`, `git_commit`,
 //!   `written_at`, and `notice`, the privacy warning.
+//! - `fatal_error`: only in a crash report, right after the header: `error`,
+//!   the error's name, `message`, the same plain words fx shows, and `at`, the
+//!   time the error ended the session.
 //! - `summary`: `os`, `arch`, `build` (`Debug`, `ReleaseSafe`, `ReleaseFast`,
 //!   or `ReleaseSmall`), `model`, `fast_mode`, `permission_mode`, `workspace`.
 //! - `current_state`: `session_id`, `session_dir`, `agent_step_limit`,
@@ -65,6 +68,13 @@
 //!   `detail`}, for the newest 3 failures.
 //! - `last_shutdown`: `status` (`recorded`, `none`, or `unreadable`),
 //!   `total_ms`, `recorded_at`, and `stages`, a list of {`name`, `step_ms`}.
+//! - `last_crash`: `status` (`recorded`, `none`, or `unreadable`), the crash
+//!   report that `writeCrashReport` saved. `none` also covers a file that
+//!   cannot be read. When `recorded`: `error` and `message` (from the
+//!   `fatal_error` record), `at` and `at_ms`, `fx_version` and `git_commit`
+//!   (from the header), `records` (the lines embedded), and `skipped` (the
+//!   lines that are not JSON objects). Then a `last_crash_record` per embedded
+//!   line, with the line's object as `record`.
 //! - `compaction`: `retained`, `failed`, `overwritten_before`, the events the
 //!   bounded ring dropped; then a `compaction_event` per retained event:
 //!   `at`, `sequence`, `event`, `turn_id`, `step_id`, `subagent_id`, `failed`,
@@ -314,10 +324,11 @@ const tool_presentation = @import("../tooling/tool_presentation.zig");
 const types = @import("../shared/types.zig");
 const assistant_presentation = @import("../agent/assistant_presentation.zig");
 const transcript_blocks = @import("../../ui/render_engine/transcript_blocks.zig");
+const crash_panic = @import("crash_panic.zig");
 
 pub const format_version: u32 = 1;
 
-const notice_text = "Private diagnostic report. It may include prompts, file paths, command output, and file snippets.";
+pub const notice_text = "Private diagnostic report. It may include prompts, file paths, command output, and file snippets.";
 const tool_args_max_bytes: usize = 1200;
 const result_preview_max_bytes: usize = 180;
 const pending_items_shown: usize = 3;
@@ -415,6 +426,13 @@ const Records = struct {
         try self.json.write(value);
     }
 
+    /// A value that is already parsed JSON, written under `name` with the same
+    /// fields and values.
+    fn parsedValue(self: *Records, name: []const u8, value: std.json.Value) !void {
+        try self.json.objectField(name);
+        try self.json.write(value);
+    }
+
     fn boolean(self: *Records, name: []const u8, value: bool) !void {
         try self.json.objectField(name);
         try self.json.write(value);
@@ -464,7 +482,7 @@ fn validUtf8(arena: std.mem.Allocator, value: []const u8) ![]const u8 {
     return text_utils.dupeValidUtf8(arena, value);
 }
 
-fn formatUtc(buf: []u8, ms: i64) ![]const u8 {
+pub fn formatUtc(buf: []u8, ms: i64) ![]const u8 {
     const secs: u64 = @intCast(@divFloor(ms, 1000));
     const ms_part: u64 = @intCast(@mod(ms, 1000));
     const epoch_secs: std.time.epoch.EpochSeconds = .{ .secs = secs };
@@ -484,6 +502,13 @@ fn formatUtc(buf: []u8, ms: i64) ![]const u8 {
 
 /// Returns the trace as JSONL bytes that the caller owns.
 pub fn build(app: anytype) ![]u8 {
+    return buildReport(app, null);
+}
+
+/// Returns the trace as JSONL bytes that the caller owns. With `fatal`, the
+/// report also holds a `fatal_error` record right after the header, which
+/// names the error that ended the session.
+fn buildReport(app: anytype, fatal: ?anyerror) ![]u8 {
     const App = @TypeOf(app.*);
     var arena_state = std.heap.ArenaAllocator.init(app.alloc);
     defer arena_state.deinit();
@@ -504,10 +529,13 @@ pub fn build(app: anytype) ![]u8 {
     shell_view.* = shell_snapshot.processOwner().traceView();
 
     try writeHeader(r, App.app_version, io_mod.milliTimestamp());
+    if (fatal) |err| try writeFatalError(r, err);
     try writeSummary(r, app, permissions.permissionModeLabel(permission_view.mode));
     try writeCurrentState(r, app);
     try writeProblems(r, app);
     try writeLastShutdown(r, app_lifecycle.readLastShutdownReport(arena));
+    // A crash report never embeds an older crash report, so the file cannot grow on each crash.
+    if (fatal == null) try writeLastCrash(r, readLastCrashReport(arena));
     try writeCompaction(r);
     try writeInterruptedTurn(r, history);
     try writeSessionTitle(r, app);
@@ -539,6 +567,17 @@ fn writeHeader(r: *Records, fx_version: []const u8, now_ms: i64) !void {
     try r.text("git_commit", build_options.git_commit);
     try r.time("written_at", now_ms);
     try r.text("notice", notice_text);
+    try r.end();
+}
+
+/// The `fatal_error` record: the name of the error that ended the session and
+/// the same plain words fx shows for it.
+fn writeFatalError(r: *Records, err: anyerror) !void {
+    var words: [128]u8 = undefined;
+    try r.begin("fatal_error");
+    try r.text("error", @errorName(err));
+    try r.text("message", types.plainErrorText(@errorName(err), &words));
+    try r.time("at", io_mod.milliTimestamp());
     try r.end();
 }
 
@@ -973,6 +1012,96 @@ fn writeLastShutdown(r: *Records, contents: ?[]const u8) !void {
         try r.endArray();
     };
     try r.end();
+}
+
+/// The most bytes of the saved crash report that `readLastCrashReport` reads.
+/// A longer file reads as none.
+const last_crash_max_bytes = 16 * 1024 * 1024;
+
+/// The crash report that `writeCrashReport` saved, read for the /trace report.
+/// Returns the file's bytes, which the caller owns; a missing or unreadable
+/// file is null.
+fn readLastCrashReport(alloc: std.mem.Allocator) ?[]u8 {
+    const home = io_mod.homeDir() orelse return null;
+    const path = profile_paths.lastCrashReportPath(alloc, home) catch return null;
+    defer alloc.free(path);
+    var file = std.Io.Dir.openFileAbsolute(io_mod.getIo(), path, .{}) catch return null;
+    defer file.close(io_mod.getIo());
+    return io_mod.readFileToEnd(alloc, &file, last_crash_max_bytes) catch null;
+}
+
+/// `contents` is the saved crash report, or null when there is none. Its
+/// first two lines must be the `fx_trace` header and the `fatal_error` record.
+/// Every JSON object line is then embedded as a `last_crash_record`; other
+/// lines are counted as skipped.
+fn writeLastCrash(r: *Records, contents: ?[]const u8) !void {
+    const report = contents orelse return writeLastCrashStatus(r, "none");
+    var objects: std.ArrayList(std.json.Value) = .empty;
+    var skipped: usize = 0;
+    var position: usize = 0;
+    var header: ?std.json.Value = null;
+    var fatal: ?std.json.Value = null;
+    var lines = std.mem.splitScalar(u8, report, '\n');
+    while (lines.next()) |raw| {
+        const line = std.mem.trim(u8, raw, " \t\r");
+        if (line.len == 0) continue;
+        position += 1;
+        const object = try parseObjectLine(r.arena, line);
+        if (position == 1) header = object;
+        if (position == 2) fatal = object;
+        if (object) |value| {
+            try objects.append(r.arena, value);
+        } else {
+            skipped += 1;
+        }
+    }
+    const head = recordOfType(header, "fx_trace") orelse return writeLastCrashStatus(r, "unreadable");
+    const crash = recordOfType(fatal, "fatal_error") orelse return writeLastCrashStatus(r, "unreadable");
+    try r.begin("last_crash");
+    try r.text("status", "recorded");
+    try textField(r, "error", crash, "error");
+    try textField(r, "message", crash, "message");
+    if (crash.get("at_ms")) |value| if (value == .integer) try r.time("at", value.integer);
+    try textField(r, "fx_version", head, "fx_version");
+    try textField(r, "git_commit", head, "git_commit");
+    try r.number("records", objects.items.len);
+    try r.number("skipped", skipped);
+    try r.end();
+    for (objects.items) |object| {
+        try r.begin("last_crash_record");
+        try r.parsedValue("record", object);
+        try r.end();
+    }
+}
+
+fn writeLastCrashStatus(r: *Records, status: []const u8) !void {
+    try r.begin("last_crash");
+    try r.text("status", status);
+    try r.end();
+}
+
+/// The line's JSON object, or null when the line is not one. Running out of
+/// memory is the only error.
+fn parseObjectLine(arena: std.mem.Allocator, line: []const u8) !?std.json.Value {
+    const value = std.json.parseFromSliceLeaky(std.json.Value, arena, line, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return null,
+    };
+    return if (value == .object) value else null;
+}
+
+/// The object of `value` when it is a record of `record_type`, else null.
+fn recordOfType(value: ?std.json.Value, record_type: []const u8) ?std.json.ObjectMap {
+    const found = value orelse return null;
+    if (found != .object) return null;
+    const kind = found.object.get("type") orelse return null;
+    if (kind != .string or !std.mem.eql(u8, kind.string, record_type)) return null;
+    return found.object;
+}
+
+/// Writes `object[key]` as the text field `name` when it is a string.
+fn textField(r: *Records, name: []const u8, object: std.json.ObjectMap, key: []const u8) !void {
+    if (object.get(key)) |value| if (value == .string) try r.text(name, value.string);
 }
 
 /// The always-on compaction decisions and failures, so a shared trace
@@ -2478,6 +2607,39 @@ pub fn writeFile(alloc: std.mem.Allocator, contents: []const u8) ![]u8 {
     return error.PathAlreadyExists;
 }
 
+/// Saves the crash report to `~/.fx/diagnostics/last-crash.jsonl` and returns
+/// its absolute path, which the caller owns and frees with `app.alloc`. The
+/// file holds the same private data as a `/trace` report, and fx overwrites it
+/// on each crash. It never returns an error: a failed write is logged to the
+/// debug trace and returns null.
+pub fn writeCrashReport(app: anytype, err: anyerror) ?[]u8 {
+    return writeCrashReportInner(app, err) catch |write_err| {
+        debug_trace.logf("core", "crash report write failed err={s}", .{@errorName(write_err)});
+        return null;
+    };
+}
+
+fn writeCrashReportInner(app: anytype, err: anyerror) ![]u8 {
+    const alloc = app.alloc;
+    const home = io_mod.homeDir() orelse return error.NoHomeDir;
+    const path = try profile_paths.lastCrashReportPath(alloc, home);
+    errdefer alloc.free(path);
+
+    const report = try buildReport(app, err);
+    defer alloc.free(report);
+
+    var home_dir = io_mod.VerifiedDir{
+        .dir = try std.Io.Dir.openDirAbsolute(io_mod.getIo(), profile_paths.rootParent(home), .{ .iterate = true }),
+    };
+    defer home_dir.close();
+    var fx_dir = try io_mod.openOrCreateVerifiedPrivateDir(&home_dir, profile_paths.rootName());
+    defer fx_dir.close();
+    var diagnostics_dir = try io_mod.openOrCreateVerifiedPrivateDir(&fx_dir, profile_paths.diagnostics_dir_name);
+    defer diagnostics_dir.close();
+    try io_mod.durableReplaceVerified(alloc, &diagnostics_dir, profile_paths.last_crash_report_file_name, report);
+    return path;
+}
+
 // Tests read the records back the way a program would: each line on its own,
 // with std.json.
 
@@ -2670,6 +2832,112 @@ test "trace header and end records frame the file" {
     const last = trace.records[trace.records.len - 1];
     try std.testing.expectEqualStrings("end", try testString(last, "type"));
     try std.testing.expectEqual(@as(i64, 2), try testInt(last, "records"));
+}
+
+test "fatal error record names the error and the words fx shows" {
+    const w = try TestWriter.create();
+    defer w.destroy();
+    try writeFatalError(&w.records, error.InvalidTranscriptTransition);
+    var trace = try w.trace();
+    defer trace.deinit();
+    const record = try trace.one("fatal_error");
+    try std.testing.expectEqualStrings("InvalidTranscriptTransition", try testString(record, "error"));
+    try std.testing.expectEqualStrings("invalid transcript transition", try testString(record, "message"));
+    try expectEndsWith(try testString(record, "at"), "Z");
+    try std.testing.expect((try testInt(record, "at_ms")) > 0);
+}
+
+// The crash report that `writeCrashReport` saves: a header, the fatal error,
+// and one record from the session.
+const crash_test_header =
+    \\{"type":"fx_trace","format_version":1,"fx_version":"9.9.9","git_commit":"abc1234","written_at":"2023-11-14T22:13:20.000Z","written_at_ms":1700000000000,"notice":"private"}
+    \\
+;
+const crash_test_fatal =
+    \\{"type":"fatal_error","error":"InvalidTranscriptTransition","message":"invalid transcript transition","at":"2023-11-14T22:13:20.123Z","at_ms":1700000000123}
+    \\
+;
+const crash_test_renderer =
+    \\{"type":"renderer_event","sequence":1,"kind":"commit","detail":"ok"}
+    \\
+;
+
+test "trace last crash record is none without a crash report" {
+    const w = try TestWriter.create();
+    defer w.destroy();
+    try writeLastCrash(&w.records, null);
+    var trace = try w.trace();
+    defer trace.deinit();
+    try std.testing.expectEqualStrings("none", try testString(try trace.one("last_crash"), "status"));
+    try std.testing.expectEqual(@as(usize, 0), trace.count("last_crash_record"));
+}
+
+test "trace last crash record embeds the lines of a crash report" {
+    const w = try TestWriter.create();
+    defer w.destroy();
+    try writeLastCrash(&w.records, crash_test_header ++ crash_test_fatal ++ crash_test_renderer);
+    var trace = try w.trace();
+    defer trace.deinit();
+    const record = try trace.one("last_crash");
+    try std.testing.expectEqualStrings("recorded", try testString(record, "status"));
+    try std.testing.expectEqualStrings("InvalidTranscriptTransition", try testString(record, "error"));
+    try std.testing.expectEqualStrings("invalid transcript transition", try testString(record, "message"));
+    try std.testing.expectEqualStrings("2023-11-14T22:13:20.123Z", try testString(record, "at"));
+    try std.testing.expectEqual(@as(i64, 1700000000123), try testInt(record, "at_ms"));
+    try std.testing.expectEqualStrings("9.9.9", try testString(record, "fx_version"));
+    try std.testing.expectEqualStrings("abc1234", try testString(record, "git_commit"));
+    try std.testing.expectEqual(@as(i64, 3), try testInt(record, "records"));
+    try std.testing.expectEqual(@as(i64, 0), try testInt(record, "skipped"));
+    try std.testing.expectEqual(@as(usize, 3), trace.count("last_crash_record"));
+    const kinds = [_][]const u8{ "fx_trace", "fatal_error", "renderer_event" };
+    for (kinds, 0..) |kind, index| {
+        const embedded = try testObject(try trace.nth("last_crash_record", index), "record");
+        try std.testing.expectEqualStrings(kind, try testString(embedded, "type"));
+    }
+}
+
+test "trace last crash record counts lines that are not JSON objects" {
+    const w = try TestWriter.create();
+    defer w.destroy();
+    try writeLastCrash(&w.records, crash_test_header ++ crash_test_fatal ++ "not json\n" ++ crash_test_renderer);
+    var trace = try w.trace();
+    defer trace.deinit();
+    const record = try trace.one("last_crash");
+    try std.testing.expectEqualStrings("recorded", try testString(record, "status"));
+    try std.testing.expectEqual(@as(i64, 3), try testInt(record, "records"));
+    try std.testing.expectEqual(@as(i64, 1), try testInt(record, "skipped"));
+    try std.testing.expectEqual(@as(usize, 3), trace.count("last_crash_record"));
+}
+
+test "trace last crash record is unreadable when the first line is not JSON" {
+    const w = try TestWriter.create();
+    defer w.destroy();
+    try writeLastCrash(&w.records, "not json\n" ++ crash_test_fatal ++ crash_test_renderer);
+    var trace = try w.trace();
+    defer trace.deinit();
+    try std.testing.expectEqualStrings("unreadable", try testString(try trace.one("last_crash"), "status"));
+    try std.testing.expectEqual(@as(usize, 0), trace.count("last_crash_record"));
+}
+
+test "trace last crash record reads back a crash panic record" {
+    const w = try TestWriter.create();
+    defer w.destroy();
+    var buf: [8192]u8 = undefined;
+    const record = crash_panic.formatRecord(&buf, "9.9.9", "abc1234", 1_700_000_000_123, "index out of bounds");
+    try writeLastCrash(&w.records, record);
+    var trace = try w.trace();
+    defer trace.deinit();
+    const crash = try trace.one("last_crash");
+    try std.testing.expectEqualStrings("recorded", try testString(crash, "status"));
+    try std.testing.expectEqualStrings("panic", try testString(crash, "error"));
+    try std.testing.expectEqualStrings("index out of bounds", try testString(crash, "message"));
+    try std.testing.expectEqualStrings("2023-11-14T22:13:20.123Z", try testString(crash, "at"));
+    try std.testing.expectEqual(@as(i64, 1700000000123), try testInt(crash, "at_ms"));
+    try std.testing.expectEqualStrings("9.9.9", try testString(crash, "fx_version"));
+    try std.testing.expectEqualStrings("abc1234", try testString(crash, "git_commit"));
+    try std.testing.expectEqual(@as(i64, 2), try testInt(crash, "records"));
+    try std.testing.expectEqual(@as(i64, 0), try testInt(crash, "skipped"));
+    try std.testing.expectEqual(@as(usize, 2), trace.count("last_crash_record"));
 }
 
 test "trace times leave out unknown values" {

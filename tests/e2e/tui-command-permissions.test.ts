@@ -2682,6 +2682,81 @@ describe("effect-aware command permissions", () => {
   );
 
   test.skipIf(!tmuxAvailable())(
+    "TUI trace carries the crash report fx saved when it last ended on an error",
+    async () => {
+      const root = createIsolatedRoot();
+      const gateway = startFakeGateway([]);
+      const stderrPath = join(root.root, "trace-crash-stderr.log");
+      installClipboardFixture(root, "#!/bin/sh\nexit 1\n");
+      writeFileSync(stderrPath, "");
+      // The file `writeCrashReport` saves when fx ends on an error: the trace
+      // header, the fatal error, and one record from the session.
+      mkdirSync(join(root.home, ".fx", "diagnostics"), { recursive: true });
+      writeFileSync(
+        join(root.home, ".fx", "diagnostics", "last-crash.jsonl"),
+        [
+          JSON.stringify({
+            type: "fx_trace",
+            format_version: 1,
+            fx_version: "9.9.9",
+            git_commit: "abc1234",
+            written_at: "2023-11-14T22:13:20.000Z",
+            written_at_ms: 1700000000000,
+            notice: "private",
+          }),
+          JSON.stringify({
+            type: "fatal_error",
+            error: "InvalidTranscriptTransition",
+            message: "invalid transcript transition",
+            at: "2023-11-14T22:13:20.123Z",
+            at_ms: 1700000000123,
+          }),
+          JSON.stringify({ type: "renderer_event", sequence: 1, kind: "commit", detail: "ok" }),
+        ].map((line) => `${line}\n`).join(""),
+      );
+      const tmpDir = join(root.root, "trace-tmp");
+      mkdirSync(tmpDir);
+
+      activeSession = await TmuxSession.create({
+        cmd: FX_BIN,
+        cwd: root.workspace,
+        env: gatewayEnv(root, gateway, {
+          PATH: hostilePath(root),
+          TMPDIR: tmpDir,
+        }),
+        stderrPath,
+        width: 120,
+        height: 40,
+      });
+      await activeSession.waitForComposer(TIMEOUT);
+
+      await activeSession.sendText("/trace");
+      const report = await waitForNewTraceReport(tmpDir);
+      expect(report.one("last_crash")).toMatchObject({
+        status: "recorded",
+        error: "InvalidTranscriptTransition",
+        message: "invalid transcript transition",
+        fx_version: "9.9.9",
+        git_commit: "abc1234",
+        records: 3,
+        skipped: 0,
+      });
+      expect(
+        report.all("last_crash_record").map((record) => (record.record as { type: string }).type),
+      ).toEqual(["fx_trace", "fatal_error", "renderer_event"]);
+      // The live report is not a crash report, so it has no fatal_error record of its own.
+      expect(report.all("fatal_error")).toHaveLength(0);
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+
+      await activeSession.sendText("/quit");
+      expect(await activeSession.waitForSessionEnd()).toBe(true);
+      await activeSession.kill();
+      activeSession = null;
+    },
+    TIMEOUT,
+  );
+
+  test.skipIf(!tmuxAvailable())(
     "TUI feedback opens fx.sh without creating a trace or touching the clipboard",
     async () => {
       const root = createIsolatedRoot();
