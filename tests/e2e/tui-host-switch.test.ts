@@ -1,8 +1,10 @@
 import { describe, expect, test } from "bun:test";
+import { processAlive } from "./process-alive";
 import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { cleanupIsolatedTestHome, createIsolatedTestHome, FX_BIN } from "../evals/eval-helpers";
+import { startFakeIssuer, unauthorized, writeFxLogin } from "./fx-login-fakes";
 import {
   FAKE_GATEWAY_MODEL,
   fakeGatewaySse,
@@ -207,10 +209,36 @@ function toolResultText(body: string, id: string): string {
   return found;
 }
 
+// The row of `agent` in main's list of subagents, as the latest user message of
+// a request carries it in a runtime context update; "" when it has none.
+function teamRow(body: string, agent: string): string {
+  const request = JSON.parse(body) as { prompt?: Array<{ role?: string; content?: unknown }> };
+  const carriers = (request.prompt ?? [])
+    .filter((message) => message.role === "user")
+    .map((message) => (typeof message.content === "string"
+      ? message.content
+      : Array.isArray(message.content) ? message.content.map((part: any) => (typeof part?.text === "string" ? part.text : "")).join("") : ""))
+    .filter((text) => text.includes("Runtime context: your subagents"));
+  const latest = carriers.at(-1) ?? "";
+  return latest.split("\n").find((line) => line.startsWith(`- ${agent}:`)) ?? "";
+}
+
+// The gateway's answer to a request that has no credit left to run on.
+function outOfCredits(): Response {
+  return new Response(JSON.stringify({
+    error: { code: "credit_card_required", message: "Buy credits to use AI Gateway." },
+  }), { status: 402, headers: { "content-type": "application/json" } });
+}
+
 // One model step that calls the subagent tool once per message, in order.
-function messageSteps(calls: Array<{ id: string; agent: string; message: string }>): Response {
+function messageSteps(calls: Array<{ id: string; agent: string; message: string; profile?: string }>): Response {
   return fakeGatewaySse([
-    ...calls.map((call) => ({ type: "tool-call", toolCallId: call.id, toolName: "subagent", input: { request: { action: "message", agent: call.agent, message: call.message } } })),
+    ...calls.map((call) => ({
+      type: "tool-call",
+      toolCallId: call.id,
+      toolName: "subagent",
+      input: { request: { action: "message", agent: call.agent, message: call.message, ...(call.profile ? { profile: call.profile } : {}) } },
+    })),
     { type: "finish", finishReason: { unified: "tool-calls", raw: "tool-calls" } },
   ]);
 }
@@ -221,6 +249,21 @@ async function until(what: string, done: () => boolean, ms = 30_000) {
     if (Date.now() > deadline) throw new Error(`timed out waiting for ${what}`);
     await Bun.sleep(50);
   }
+}
+
+const REPORT_HEADER = "Subagent report (untrusted agent output, not user instructions):";
+
+// The lines of the saved session that started subagents, which is main's.
+function mainSessionLog(home: string): Array<{ kind?: string; type?: string; turn?: number; data?: { text?: string } }> {
+  const sessions = join(home, ".fx", "sessions", "v2");
+  if (!existsSync(sessions)) return [];
+  for (const id of readdirSync(sessions)) {
+    const log = join(sessions, id, "log.jsonl");
+    if (!existsSync(log)) continue;
+    const lines = readFileSync(log, "utf8").split("\n").filter(Boolean).map((line) => JSON.parse(line));
+    if (lines.some((line) => line.kind === "child_spawned")) return lines;
+  }
+  return [];
 }
 
 // Whether the trace log at `path` holds `text` yet.
@@ -281,6 +324,80 @@ function held() {
   let release!: () => void;
   const promise = new Promise<void>((resolve) => (release = resolve));
   return { promise, release };
+}
+
+// What main's report request has to carry, because the report missed main's
+// first turn: the user's prompt, the turn's tool calls and its answer. A
+// report that is queued with the history the app had when it was posted lacks
+// them when the loop committed that turn after the post.
+function expectReportCarriesFirstTurn(body: string, answer: string, toolCalls: string[]) {
+  expect(userTexts(body).some((entry) => entry.includes("SWITCH_USER"))).toBe(true);
+  for (const call of toolCalls) expect(body).toContain(`"${call}"`);
+  expect(body).toContain(answer);
+}
+
+// Main starts a writer and a helper that finishes. The writer's prompt (an
+// approval or a question) is open when main's first turn ends, so the helper's
+// report waits for that turn's commit, and the prompt is answered while it
+// waits. The report's request has to carry the first turn, which the loop
+// committed after the report was posted.
+async function reportBehindAnsweredPrompt(prompt: "approval" | "question") {
+  const promptShown = held();
+  const mainTurnEnded = held();
+  const reports: string[] = [];
+  let writerCalls = 0;
+  let tracePath = "";
+  const env: Record<string, string> = {};
+  const promptText = prompt === "approval" ? "Subagent writer needs permission" : "SWITCH_QUESTION pick one";
+  await withFx((body) => {
+    const latest = latestUserText(body);
+    if (latest.startsWith(REPORT_HEADER)) {
+      reports.push(body);
+      return text(`main_report_${reports.length}`, `SWITCH_MAIN_REPORT_${reports.length}`);
+    }
+    if (latest.includes("SWITCH_WRITE_TASK")) {
+      writerCalls += 1;
+      if (writerCalls > 1) return text("child_done", "SWITCH_WRITER_DONE");
+      return prompt === "approval"
+        ? toolCall("child_write", "write_file", { path: "switch-child.txt", content: "SWITCH_WROTE\n" })
+        : toolCall("child_ask", "ask_user_question", {
+          questions: [{ question: "SWITCH_QUESTION pick one", options: [{ label: "SWITCH_A" }, { label: "SWITCH_B" }] }],
+        });
+    }
+    if (latest.includes("SWITCH_HELPER_TASK")) return mainTurnEnded.promise.then(() => text("helper_done", "SWITCH_HELPER_DONE"));
+    if (!body.includes('"main_w"')) {
+      return messageSteps([
+        { id: "main_w", agent: "writer", message: "SWITCH_WRITE_TASK", ...(prompt === "approval" ? { profile: "writer" } : {}) },
+        { id: "main_h", agent: "helper", message: "SWITCH_HELPER_TASK" },
+      ]);
+    }
+    return promptShown.promise.then(() => text("main_one", "SWITCH_MAIN_ONE"));
+  }, async (session) => {
+    await session.sendText("SWITCH_USER");
+    await session.waitForText(promptText, 30_000);
+    promptShown.release();
+    await until("main's first turn to end", () => traceHas(tracePath, "event=processing_finished turn_id=1 "));
+    mainTurnEnded.release();
+    // The report is posted and waits for the first turn's commit, which the open
+    // prompt keeps back. Answer the prompt once the worker holds the report, or
+    // the report started anyway.
+    await until("the report to wait for the first turn", () => traceHas(tracePath, "event=commit_gate_held") || reports.length >= 1);
+    await session.sendKeys("1");
+    await until("main's request for the helper's report", () => reports.length >= 1);
+    expectReportCarriesFirstTurn(reports[0]!, "SWITCH_MAIN_ONE", ["main_w", "main_h"]);
+    await session.waitForText("SWITCH_MAIN_REPORT_1", 30_000);
+  }, (home) => {
+    tracePath = join(home, "fx-trace.log");
+    env.FX_TRACE_LOG = tracePath;
+    if (prompt !== "approval") return;
+    const folder = join(home, ".fx", "agents", "writer");
+    mkdirSync(folder, { recursive: true });
+    writeFileSync(join(folder, "profile.json"), JSON.stringify({
+      description: "Writes one file",
+      tools: ["read_file", "write_file"],
+      permission_mode: "ask",
+    }));
+  }, false, env);
 }
 
 // Main's requests carry what the test typed to main, which always starts
@@ -368,7 +485,163 @@ async function withFx(
   }
 }
 
+// Main starts a writer and a helper that finishes. The writer's prompt (an
+// approval or a question) stays open on main's screen. The gateway holds main's
+// reply that ends its first turn until the prompt is on the screen, and the
+// helper's reply until main's worker has ended that turn, so the helper's
+// report waits for main's next turn while the pacer still holds the first turn
+// behind the open prompt. The report's turn has to start while the prompt is
+// still open: the first turn is shown once above the prompt, saved, and the
+// worker's wait for that save ends without its time limit. The helper's reply
+// comes `reportDelayMs` after main's turn ended, so the report can come after the
+// time limit that counted from the turn's end. With `secondReport`, a scout
+// replies `reportDelayMs` after the report's turn ended too, so a second hold
+// begins more than the limit after the first one did. With "none" the writer
+// has no prompt and stays at work until the end, and main's first reply comes
+// once the writer's request arrived. Whichever the case, the report's request
+// has to carry the turns main finished before it: the report was posted before
+// the loop committed them.
+async function reportWhilePromptStaysOpen(prompt: "approval" | "question" | "none", reportDelayMs = 0, secondReport = false) {
+  const promptShown = held();
+  const writerReleased = held();
+  const mainTurnEnded = held();
+  const reportTurnEnded = held();
+  const reports: string[] = [];
+  let writerCalls = 0;
+  let tracePath = "";
+  const env: Record<string, string> = {};
+  const promptText = prompt === "approval" ? "Subagent writer needs permission" : "SWITCH_QUESTION pick one";
+  await withFx((body) => {
+    const latest = latestUserText(body);
+    if (latest.startsWith(REPORT_HEADER)) {
+      reports.push(body);
+      return text(`main_report_${reports.length}`, `SWITCH_MAIN_REPORT_${reports.length}`);
+    }
+    if (latest.includes("SWITCH_WRITE_TASK")) {
+      writerCalls += 1;
+      if (writerCalls > 1) return text("child_done", "SWITCH_WRITER_DONE");
+      if (prompt === "none") return writerReleased.promise.then(() => text("child_done", "SWITCH_WRITER_DONE"));
+      return prompt === "approval"
+        ? toolCall("child_write", "write_file", { path: "switch-child.txt", content: "SWITCH_WROTE\n" })
+        : toolCall("child_ask", "ask_user_question", {
+          questions: [{ question: "SWITCH_QUESTION pick one", options: [{ label: "SWITCH_A" }, { label: "SWITCH_B" }] }],
+        });
+    }
+    if (latest.includes("SWITCH_HELPER_TASK")) {
+      return mainTurnEnded.promise.then(() => Bun.sleep(reportDelayMs)).then(() => text("helper_done", "SWITCH_HELPER_DONE"));
+    }
+    if (latest.includes("SWITCH_SCOUT_TASK")) {
+      return reportTurnEnded.promise.then(() => Bun.sleep(reportDelayMs)).then(() => text("scout_done", "SWITCH_SCOUT_DONE"));
+    }
+    if (!body.includes('"main_w"')) {
+      return messageSteps([
+        { id: "main_w", agent: "writer", message: "SWITCH_WRITE_TASK", ...(prompt === "approval" ? { profile: "writer" } : {}) },
+        { id: "main_h", agent: "helper", message: "SWITCH_HELPER_TASK" },
+        ...(secondReport ? [{ id: "main_s", agent: "scout", message: "SWITCH_SCOUT_TASK" }] : []),
+      ]);
+    }
+    return promptShown.promise.then(() => text("main_one", "SWITCH_MAIN_ONE"));
+  }, async (session, { home }) => {
+    const trace = () => (existsSync(tracePath) ? readFileSync(tracePath, "utf8") : "");
+    await session.sendText("SWITCH_USER");
+    if (prompt === "none") await until("the writer's first request", () => writerCalls >= 1);
+    else await session.waitForText(promptText, 30_000);
+    promptShown.release();
+    await until("main's first turn to end", () => traceHas(tracePath, "event=processing_finished turn_id=1 "));
+    mainTurnEnded.release();
+    await until("main's request for the helper's report", () => reports.length >= 1);
+
+    // The report was posted before the loop committed the first turn, and its
+    // request has to carry that turn: the user's prompt, the tool calls and the answer.
+    expectReportCarriesFirstTurn(reports[0]!, "SWITCH_MAIN_ONE", ["main_w", "main_h", ...(secondReport ? ["main_s"] : [])]);
+
+    // The request did not come when the worker gave up waiting for the first
+    // turn's save.
+    expect(trace()).not.toContain("event=commit_gate_expired");
+    if (prompt === "none") {
+      await session.waitForText("SWITCH_MAIN_REPORT_1", 30_000);
+    } else {
+      // It came with the prompt still open: the save released it.
+      expect(trace()).toMatch(/event=commit_gate_released [^\n]*reason=committed/);
+      const open = await session.waitForPane((pane) => pane.includes("SWITCH_MAIN_ONE") && pane.includes(promptText), 15_000);
+
+      // The first turn shows above the open prompt, once, and the prompt stays.
+      // The report turn's answer waits behind the prompt.
+      expect(open).not.toContain("SWITCH_MAIN_REPORT_1");
+      expect((await session.captureFullScrollback()).split("SWITCH_MAIN_ONE").length - 1).toBe(1);
+    }
+
+    if (secondReport) {
+      // The report's turn ends with the prompt still open, and the scout
+      // reports more than the limit after the first hold began. The second
+      // hold has a limit of its own: the commit releases it, and the second
+      // report's request comes while the prompt is still open.
+      const mainWorker = /event=processing_finished turn_id=1 worker=(\w+)/.exec(trace())?.[1];
+      expect(mainWorker).toBeDefined();
+      await until("the report's turn to end", () =>
+        trace().split("\n").filter((line) => line.includes("event=processing_finished") && line.includes(`worker=${mainWorker} `)).length >= 2);
+      reportTurnEnded.release();
+      await until("main's request for the scout's report", () => reports.length >= 2);
+      // The second report was posted before the loop committed the report's turn,
+      // so its request carries that turn too.
+      expectReportCarriesFirstTurn(reports[1]!, "SWITCH_MAIN_ONE", ["main_w", "main_h", "main_s"]);
+      expect(reports[1]).toContain("SWITCH_MAIN_REPORT_1");
+      expect(trace()).not.toContain("event=commit_gate_expired");
+      expect(trace().match(/event=commit_gate_released [^\n]*reason=committed/g)?.length).toBe(2);
+      const second = await session.waitForPane((pane) => pane.includes("SWITCH_MAIN_REPORT_1") && pane.includes(promptText), 15_000);
+      expect(second).not.toContain("SWITCH_MAIN_REPORT_2");
+      expect((await session.captureFullScrollback()).split("SWITCH_MAIN_REPORT_1").length - 1).toBe(1);
+    }
+
+    if (prompt === "none") writerReleased.release();
+    else await session.sendKeys("1");
+    const reportTurns = secondReport ? 3 : 2;
+    await session.waitForText("SWITCH_MAIN_REPORT_1", 30_000);
+    await until("the writer's report turn", () => reports.length >= reportTurns);
+    await session.waitForText(`SWITCH_MAIN_REPORT_${reportTurns}`, 30_000);
+    await until(`main's ${reportTurns + 1} turns saved`, () => mainSessionLog(home).filter((line) => line.kind === "turn_committed").length >= reportTurns + 1);
+
+    // Nothing of a turn is shown twice.
+    const after = await session.captureFullScrollback();
+    const markers = ["SWITCH_MAIN_ONE", ...Array.from({ length: reportTurns }, (_, i) => `SWITCH_MAIN_REPORT_${i + 1}`)];
+    for (const marker of markers) {
+      expect(after.split(marker).length - 1).toBe(1);
+    }
+
+    // fx saved the first turn once, and no streamed turn was cut off or dropped as stale.
+    const lines = mainSessionLog(home);
+    expect(lines.filter((line) => line.type === "superseded" || line.kind === "superseded")).toEqual([]);
+    expect(lines.filter((line) => line.kind === "turn_interrupted")).toEqual([]);
+    const first = lines.find((line) => line.type === "user" && line.data?.text?.includes("SWITCH_USER"))?.turn;
+    expect(first).toBeDefined();
+    expect(lines.some((line) => line.kind === "turn_committed" && line.turn === first)).toBe(true);
+    expect(trace()).not.toContain("dropped=stale_turn");
+  }, (home) => {
+    tracePath = join(home, "fx-trace.log");
+    env.FX_TRACE_LOG = tracePath;
+    if (prompt !== "approval") return;
+    const folder = join(home, ".fx", "agents", "writer");
+    mkdirSync(folder, { recursive: true });
+    writeFileSync(join(folder, "profile.json"), JSON.stringify({
+      description: "Writes one file",
+      tools: ["read_file", "write_file"],
+      permission_mode: "ask",
+    }));
+  }, false, env);
+}
+
 describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
+
+  for (const prompt of ["approval", "question"] as const) {
+    test(
+      `a report that waited for main's turn while a subagent's ${prompt} was open carries that turn once the prompt is answered`,
+      async () => {
+        await reportBehindAnsweredPrompt(prompt);
+      },
+      TIMEOUT,
+    );
+  }
+
   test(
     "the agent list shows a subagent's conversation, which takes messages typed there",
     async () => {
@@ -757,6 +1030,53 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
     TIMEOUT,
   );
 
+  // Main starts subagent `worker` under the never rule, so its completed work
+  // owes no report, and calls wait. The settle hold
+  // (src/core/subagent/end_test_controls.zig) stops fx after it has told main
+  // of the work's end and before it clears the subagent's busy flag. Main's
+  // wait starts in that gap, and fx lets the end go once its trace shows the
+  // wait began. The wait has to come back and main has to finish its turn.
+  test(
+    "a wait that starts as a subagent's work ends with nothing to report still returns",
+    async () => {
+      const dir = realpathSync(mkdtempSync(join(tmpdir(), "fx-wait-gap-")));
+      const settleHeld = join(dir, "settle-held");
+      const settleRelease = join(dir, "settle-release");
+      const tracePath = join(dir, "fx-trace.log");
+      let waitResult = "";
+      try {
+        await withFx(async (body) => {
+          if (!isMainRequest(body)) return text("child_answer", "WAITGAP_CHILD_DONE");
+          if (body.includes('"main_wait"')) {
+            waitResult ||= toolResultText(body, "main_wait");
+            return text("main_done", "WAITGAP_MAIN_DONE");
+          }
+          if (body.includes('"main_sub"')) {
+            // The subagent's work has ended, and fx is held before it settles it.
+            await until("the held end", () => existsSync(`${settleHeld}.1`), 30_000);
+            void until("the wait to begin", () => traceHas(tracePath, "event=wait_begin"), 30_000).then(() => writeFileSync(settleRelease, ""));
+            return toolCall("main_wait", "subagent", { request: { action: "wait" } });
+          }
+          return toolCall("main_sub", "subagent", {
+            request: { action: "message", agent: "worker", message: "WAITGAP_TASK", report: "never" },
+          });
+        }, async (session) => {
+          await session.sendText("SWITCH_USER");
+          await session.waitForText("WAITGAP_MAIN_DONE", 30_000);
+          expect(waitResult).toContain("ended without a report");
+        }, () => {}, false, {
+          FX_TRACE_LOG: tracePath,
+          FX_TEST_SUBAGENT_SETTLE_HELD: settleHeld,
+          FX_TEST_SUBAGENT_SETTLE_RELEASE: settleRelease,
+        });
+      } finally {
+        writeFileSync(settleRelease, "");
+        rmSync(dir, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
   // Main starts subagent `worker`, whose first turn the start hold
   // (src/core/subagent/start_test_controls.zig) stops before its worker
   // attaches, then messages it SWITCH_START_NOTE, which waits for that turn
@@ -1124,7 +1444,7 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         process.kill(pid, "SIGKILL");
         const gone = Date.now() + 10_000;
         while (Date.now() < gone) {
-          try { process.kill(pid, 0); } catch { break; }
+          if (!processAlive(pid)) break;
           await Bun.sleep(25);
         }
         await session.kill();
@@ -1276,7 +1596,7 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
           process.kill(pid, "SIGKILL");
           const deadline = Date.now() + 10_000;
           while (Date.now() < deadline) {
-            try { process.kill(pid, 0); } catch { break; }
+            if (!processAlive(pid)) break;
             await Bun.sleep(25);
           }
           await session.kill();
@@ -1619,6 +1939,313 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         await showAgent(session, "asker");
         await session.waitForPane((pane) => pane.includes("SWITCH_ASKER_DONE"), 15_000);
       });
+    },
+    TIMEOUT,
+  );
+
+  // Main calls `status` while the subagent waits for the user, which the
+  // subagent's first request starts, then again once the user has answered
+  // and the subagent's report has reached main. `statuses` holds the two
+  // results the model read.
+  async function mainReadsStatus(
+    child: Response,
+    agent: string,
+    task: string,
+    waitUntilPromptShows: (session: TmuxSession) => Promise<void>,
+    answer: (session: TmuxSession) => Promise<void>,
+    setupHome: (home: string) => void = () => {},
+  ): Promise<string[]> {
+    const statuses: string[] = [];
+    const promptShows = held();
+    let stage = 0;
+    let childCalls = 0;
+    await withFx(async (body) => {
+      if (!isMainRequest(body)) {
+        childCalls += 1;
+        return childCalls === 1 ? child : text("child_done", "SWITCH_CHILD_DONE");
+      }
+      stage += 1;
+      if (stage === 1) {
+        return toolCall("main_sub", "subagent", { request: { action: "message", agent, message: task, ...(agent === "writer" ? { profile: "writer" } : {}) } });
+      }
+      if (stage === 2) {
+        // Main's next step waits for the prompt on its screen, so the subagent
+        // is blocked on the user when `status` runs.
+        await promptShows.promise;
+        return toolCall("main_status_1", "subagent", { request: { action: "status" } });
+      }
+      if (stage === 3) {
+        statuses.push(toolResultText(body, "main_status_1"));
+        return text("main_idle", "SWITCH_MAIN_WAITED");
+      }
+      // The subagent's report starts main's next turn.
+      if (stage === 4) return toolCall("main_status_2", "subagent", { request: { action: "status" } });
+      statuses.push(toolResultText(body, "main_status_2"));
+      return text("main_done", "SWITCH_MAIN_DONE");
+    }, async (session) => {
+      await session.sendText("SWITCH_USER");
+      await waitUntilPromptShows(session);
+      promptShows.release();
+      await until("main's first status", () => statuses.length === 1);
+      await answer(session);
+      await until("main's second status", () => statuses.length === 2, 60_000);
+    }, setupHome);
+    return statuses;
+  }
+
+  test(
+    "main's status says a subagent waits for an approval, and not once it is answered",
+    async () => {
+      const [waiting, answered] = await mainReadsStatus(
+        toolCall("child_write", "write_file", { path: "switch-wait.txt", content: "SWITCH_WROTE\n" }),
+        "writer",
+        "SWITCH_WRITE_TASK",
+        async (session) => {
+          await session.waitForText("Subagent writer needs permission", 30_000);
+        },
+        async (session) => {
+          await session.sendKeys("1");
+        },
+        (home) => {
+          const folder = join(home, ".fx", "agents", "writer");
+          mkdirSync(folder, { recursive: true });
+          writeFileSync(join(folder, "profile.json"), JSON.stringify({
+            description: "Writes one file",
+            tools: ["read_file", "write_file"],
+            permission_mode: "ask",
+          }));
+        },
+      );
+      expect(waiting).toContain("writer: waiting for an approval");
+      expect(waiting).not.toContain("writer: working");
+      expect(answered).toContain("writer: idle");
+      expect(answered).not.toContain("waiting for");
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "main's status says a subagent waits for the user's answer, and not once it is answered",
+    async () => {
+      const [waiting, answered] = await mainReadsStatus(
+        toolCall("child_ask", "ask_user_question", {
+          questions: [{ question: "SWITCH_QUESTION pick one", options: [{ label: "SWITCH_ALPHA" }, { label: "SWITCH_BETA" }] }],
+        }),
+        "asker",
+        "SWITCH_ASK_TASK",
+        async (session) => {
+          await session.waitForPane((pane) => pane.includes("SWITCH_QUESTION pick one") && pane.includes("asker asks"), 30_000);
+        },
+        async (session) => {
+          await session.sendKeys("1");
+        },
+      );
+      expect(waiting).toContain("asker: waiting for the user's answer");
+      expect(waiting).not.toContain("asker: working");
+      expect(answered).toContain("asker: idle");
+      expect(answered).not.toContain("waiting for");
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "main's status says a subagent waits for the user's answer while the out-of-credits picker is open",
+    async () => {
+      const [waiting, answered] = await mainReadsStatus(
+        outOfCredits(),
+        "payer",
+        "SWITCH_PAY_TASK",
+        async (session) => {
+          await session.waitForPane((pane) => pane.includes("Out of credits. What should fx do?") && pane.includes("I added credits, retry"), 30_000);
+        },
+        async (session) => {
+          await session.sendKeys("1");
+        },
+      );
+      expect(waiting).toContain("payer: waiting for the user's answer");
+      expect(waiting).not.toContain("payer: working");
+      expect(answered).toContain("payer: idle");
+      expect(answered).not.toContain("waiting for");
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "main's status says working for a subagent whose request waits for a sign-in, and main is told only the user can continue it",
+    async () => {
+      const issuer = startFakeIssuer({ refresh: () => Response.json({ error: "invalid_grant" }, { status: 400 }) });
+      const waitShows = held();
+      const statuses: string[] = [];
+      let stage = 0;
+      let told = "";
+      try {
+        await withFx(async (body) => {
+          // The subagent's request is refused, and the login cannot be refreshed.
+          if (!isMainRequest(body)) return unauthorized();
+          told ||= userTexts(body).find((message) => message.includes("Only the user can continue it")) ?? "";
+          stage += 1;
+          if (stage === 1) return messageSteps([{ id: "main_sign", agent: "signer", message: "SWITCH_SIGN_TASK" }]);
+          if (stage === 2) {
+            await waitShows.promise;
+            return toolCall("main_status", "subagent", { request: { action: "status" } });
+          }
+          if (stage === 3) statuses.push(toolResultText(body, "main_status"));
+          return text(`main_done_${stage}`, "SWITCH_MAIN_DONE");
+        }, async (session) => {
+          await session.sendText("SWITCH_USER");
+          await session.waitForPane((pane) => pane.includes("signer needs you"), 30_000);
+          waitShows.release();
+          await until("main's status", () => statuses.length === 1, 60_000);
+          await until("main being told", () => told !== "", 60_000);
+        }, (home) => writeFxLogin(home, issuer.issuerUrl, "seeded-token"), false, {
+          FX_DISABLE_KEYCHAIN: "1",
+          FX_TEST_OAUTH_ISSUER_URL: issuer.issuerUrl,
+          AI_GATEWAY_API_KEY: undefined as unknown as string,
+        });
+      } finally {
+        issuer.stop();
+      }
+      expect(statuses[0]).toContain("signer: working");
+      expect(statuses[0]).not.toContain("waiting for");
+      expect(told).toContain("waits for the user (Sign-in expired). Only the user can continue it");
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "main's list of subagents says a wait began when the turn started, also once the wait is over, and the next turn's list says working",
+    async () => {
+      let stage = 0;
+      let childCalls = 0;
+      const promptShows = held();
+      const answered = held();
+      const writerResumes = held();
+      const rows: Record<string, string> = {};
+      let statusDuring = "";
+      await withFx(async (body) => {
+        if (!isMainRequest(body)) {
+          // The helper finishes once the writer's prompt is on screen, and its
+          // report starts main's second turn while the writer still waits.
+          if (body.includes("SWITCH_HELPER_TASK")) {
+            await promptShows.promise;
+            return text("helper_done", "SWITCH_HELPER_DONE");
+          }
+          childCalls += 1;
+          if (childCalls === 1) return toolCall("child_write", "write_file", { path: "switch-row.txt", content: "SWITCH_ROW\n" });
+          // After its approval the writer works until the test lets it end.
+          await writerResumes.promise;
+          return text("writer_done", "SWITCH_WRITER_DONE");
+        }
+        stage += 1;
+        if (stage === 1) {
+          return messageSteps([
+            { id: "main_writer", agent: "writer", message: "SWITCH_WRITE_TASK", profile: "writer" },
+            { id: "main_helper", agent: "helper", message: "SWITCH_HELPER_TASK" },
+          ]);
+        }
+        if (stage === 2) return text("main_started", "SWITCH_MAIN_STARTED");
+        if (stage === 3) {
+          // Main's second turn begins with the writer waiting for its approval.
+          rows.start = teamRow(body, "writer");
+          await answered.promise;
+          return toolCall("main_status", "subagent", { request: { action: "status", agent: "writer" } });
+        }
+        if (stage === 4) {
+          rows.later = teamRow(body, "writer");
+          statusDuring = toolResultText(body, "main_status");
+          return text("main_second_done", "SWITCH_MAIN_SECOND_DONE");
+        }
+        if (stage === 5) {
+          rows.next = teamRow(body, "writer");
+          return text("main_third_done", "SWITCH_MAIN_THIRD_DONE");
+        }
+        return text("main_reported", "SWITCH_MAIN_REPORTED");
+      }, async (session) => {
+        await session.sendText("SWITCH_USER");
+        await session.waitForText("Subagent writer needs permission", 30_000);
+        promptShows.release();
+        // Main's second turn is under way, held on its first request.
+        await until("main's second turn", () => stage === 3, 60_000);
+        // The user answers the approval while that turn runs.
+        await session.sendKeys("1");
+        await until("the writer's next request", () => childCalls === 2, 60_000);
+        answered.release();
+        await until("main's status", () => rows.later !== undefined, 60_000);
+        await session.waitForText("SWITCH_MAIN_SECOND_DONE", 30_000);
+        await session.waitForComposer(15_000);
+        await session.sendText("SWITCH_USER once more");
+        await until("main's third turn", () => rows.next !== undefined, 60_000);
+        writerResumes.release();
+        await until("the writer's report", () => stage >= 6, 60_000);
+      }, (home) => {
+        const folder = join(home, ".fx", "agents", "writer");
+        mkdirSync(folder, { recursive: true });
+        writeFileSync(join(folder, "profile.json"), JSON.stringify({
+          description: "Writes one file",
+          tools: ["read_file", "write_file"],
+          permission_mode: "ask",
+        }));
+      });
+      // The wait is in the list of the turn it began in, with when it was true.
+      expect(rows.start).toContain("- writer: waiting for an approval when this turn started.");
+      // The user answered during that turn: the list still says so, and `status` says working.
+      expect(rows.later).toBe(rows.start);
+      expect(statusDuring).toContain("writer: working");
+      expect(statusDuring).not.toContain("waiting for");
+      // The next turn's list is built again, and has no wait in it.
+      expect(rows.next).toContain("- writer: working.");
+      expect(rows.next).not.toContain("waiting for");
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "main's stop ends a subagent's open question and the turn that asked it",
+    async () => {
+      let stopResult = "";
+      let statusAfter = "";
+      let childCalls = 0;
+      let stage = 0;
+      const promptShows = held();
+      await withFx(async (body) => {
+        if (!isMainRequest(body)) {
+          childCalls += 1;
+          if (childCalls === 1) {
+            return toolCall("child_ask", "ask_user_question", {
+              questions: [{ question: "SWITCH_QUESTION pick one", options: [{ label: "SWITCH_ALPHA" }, { label: "SWITCH_BETA" }] }],
+            });
+          }
+          return text("child_after", "SWITCH_ASKER_STOPPED");
+        }
+        stage += 1;
+        if (stage === 1) {
+          return toolCall("main_sub", "subagent", { request: { action: "message", agent: "asker", message: "SWITCH_ASK_TASK" } });
+        }
+        if (stage === 2) {
+          // Main's next step waits for the question on its screen.
+          await promptShows.promise;
+          return toolCall("main_stop", "subagent", { request: { action: "stop", agent: "asker" } });
+        }
+        if (stage === 3) stopResult = toolResultText(body, "main_stop");
+        else statusAfter = toolResultText(body, `main_status_${stage - 1}`);
+        // The subagent's turn ends a moment after the stop, so main asks
+        // again until `status` stops saying it works.
+        if (stage < 63 && (stage === 3 || statusAfter.includes("working"))) {
+          await Bun.sleep(100);
+          return toolCall(`main_status_${stage}`, "subagent", { request: { action: "status" } });
+        }
+        return text("main_done", "SWITCH_MAIN_DONE");
+      }, async (session) => {
+        await session.sendText("SWITCH_USER");
+        await session.waitForPane((pane) => pane.includes("SWITCH_QUESTION pick one") && pane.includes("asker asks"), 30_000);
+        promptShows.release();
+        // The question leaves main's screen with the subagent's turn.
+        const main = await session.waitForPane((pane) => pane.includes("SWITCH_MAIN_DONE") && !pane.includes("SWITCH_QUESTION pick one"), 30_000);
+        expect(main).not.toContain("asker asks");
+      });
+      expect(stopResult).toContain("Stopped asker: its turn ended");
+      expect(statusAfter).toContain("asker: idle");
+      expect(statusAfter).not.toContain("working");
     },
     TIMEOUT,
   );
@@ -2222,6 +2849,195 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
   );
 
   test(
+    "a subagent with no title yet shows what it is for in the agent list, and the list's search finds a word only that text holds",
+    async () => {
+      const auditor = held();
+      const auditorTitle = held();
+      let childCalls = 0;
+      await withFx(async (body) => {
+        if (!isMainRequest(body)) {
+          childCalls += 1;
+          await auditor.promise;
+          return text("child_answer", "PURPOSE_CHILD_DONE");
+        }
+        if (!body.includes('"main_sub"')) {
+          return toolCall("main_sub", "subagent", {
+            request: {
+              action: "message",
+              agent: "auditor",
+              message: "Review src/parser.zig for bugs",
+              instructions: "You audit the zebra crossing logic.\nKeep each note short.",
+            },
+          });
+        }
+        return text("main_wait", "PURPOSE_MAIN_WAITING");
+      }, async (session) => {
+        await session.sendText("SWITCH_USER plan it");
+        await session.waitForText("PURPOSE_MAIN_WAITING", 30_000);
+        await until("the auditor's turn", () => childCalls >= 1);
+        await session.waitForPane((pane) => pane.includes("1 subagent working"), 15_000);
+        // Down opens the list only once main's turn is over and its composer is empty.
+        await session.waitForComposer(15_000);
+        await session.sendKeys("Down");
+
+        // The title model has not answered for the auditor, so its row has
+        // no title; it says what the subagent is for.
+        const untitled = await session.waitForPane((pane) => pane.includes(LIST_HINT) && /^ {2}\u2514 auditor {2,}\S/m.test(pane), 15_000);
+        expect(untitled).toMatch(/^ {2}\u2514 auditor {2,}You audit the zebra crossing logic\. {2,}working/m);
+        expect(untitled).not.toContain("new session");
+        expect(untitled).toContain("Agents 2");
+
+        // A word only that text holds finds the row, in any case.
+        await session.sendLiteral("ZEBRA");
+        const found = await session.waitForPane((pane) => composerContains(pane, "ZEBRA") && pane.includes("Agents 1"), 10_000);
+        expect(found).toMatch(/^ {2}\u2514 auditor {2,}You audit the zebra crossing logic\./m);
+        await session.sendKeys("Escape");
+        await session.waitForPane((pane) => pane.includes("Agents 2") && !composerContains(pane, "ZEBRA"), 10_000);
+
+        // Once the title model answers, the row shows the title, as any
+        // titled row does, and the search still finds it by what it is for.
+        auditorTitle.release();
+        const titled = await session.waitForPane((pane) => /^ {2}\u2514 auditor {2,}Review the parser {2,}working/m.test(pane), 15_000);
+        expect(titled).not.toContain("You audit the zebra");
+        await session.sendLiteral("zebra");
+        const matched = await session.waitForPane((pane) => composerContains(pane, "zebra") && pane.includes("Agents 1"), 10_000);
+        expect(matched).toMatch(/^ {2}\u2514 auditor {2,}Review the parser {2,}working/m);
+        await session.sendKeys("Escape");
+        await session.waitForPane((pane) => pane.includes("Agents 2") && !composerContains(pane, "zebra"), 10_000);
+        await session.sendKeys("Escape");
+        await session.waitForPane((pane) => !pane.includes(LIST_HINT), 5_000);
+        auditor.release();
+        await session.waitForPane((pane) => !pane.includes("subagent working") && !pane.includes("waiting on 1 subagent"), 30_000);
+      }, () => {}, false, {}, {
+        titleResponses: Array.from({ length: 8 }, () => async (body: string) => {
+          if (!body.includes("src/parser.zig")) return fakeGatewayFinalText("Plan the parser work");
+          await auditorTitle.promise;
+          return fakeGatewayFinalText("Review the parser");
+        }),
+      });
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "after a resume, a restored subagent with no title shows what it is for in the agent list, and the search finds it by that text",
+    async () => {
+      const auditor = held();
+      let childCalls = 0;
+      await withFx(async (body) => {
+        if (!isMainRequest(body)) {
+          childCalls += 1;
+          // The subagent's first turn is cut short by the quit, so it has
+          // saved no title.
+          await auditor.promise;
+          return text("child_answer", "PURPOSE_CHILD_LATE");
+        }
+        if (!body.includes('"main_sub"')) {
+          return toolCall("main_sub", "subagent", {
+            request: {
+              action: "message",
+              agent: "auditor",
+              message: "Review src/parser.zig for bugs",
+              instructions: "You audit the zebra crossing logic.\nKeep each note short.",
+            },
+          });
+        }
+        return text("main_wait", "PURPOSE_MAIN_WAITING");
+      }, async (session, { home, launch }) => {
+        await session.sendText("SWITCH_USER plan it");
+        await session.waitForText("PURPOSE_MAIN_WAITING", 30_000);
+        await until("the auditor's turn", () => childCalls >= 1);
+        await session.waitForComposer(15_000);
+        await session.sendText("/quit");
+        expect(await session.waitForSessionEnd(15_000)).toBe(true);
+        auditor.release();
+
+        const mains = sessionsHolding(home, "PURPOSE_MAIN_WAITING");
+        expect(mains).toHaveLength(1);
+        const resumed = await launch(`--resume ${mains[0]}`);
+        await resumed.waitForComposer(15_000);
+        // The restored subagent counts at once, so the footer offers the list.
+        await resumed.waitForPane((pane) => pane.includes("main \u2193"), 10_000);
+        await resumed.sendKeys("Down");
+        const list = await resumed.waitForPane((pane) => pane.includes(LIST_HINT) && /^ {2}\u2514 auditor {2,}\S/m.test(pane), 15_000);
+        // The quit cut the auditor's turn short, so its row says stopped.
+        expect(list).toMatch(/^ {2}\u2514 auditor {2,}You audit the zebra crossing logic\. {2,}stopped/m);
+        expect(list).not.toContain("new session");
+
+        await resumed.sendLiteral("zebra");
+        const found = await resumed.waitForPane((pane) => composerContains(pane, "zebra") && pane.includes("Agents 1"), 10_000);
+        expect(found).toMatch(/^ {2}\u2514 auditor {2,}You audit the zebra crossing logic\./m);
+        await resumed.sendKeys("Escape");
+        await resumed.waitForPane((pane) => pane.includes("Agents 2") && !composerContains(pane, "zebra"), 10_000);
+        await resumed.sendKeys("Escape");
+        await resumed.waitForPane((pane) => !pane.includes(LIST_HINT), 5_000);
+      });
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "a subagent's own subagent with no title yet shows what it is for in the agent list, and the search finds it by that text",
+    async () => {
+      const helper = held();
+      let helperAsked = false;
+      try {
+        await withFx(async (body) => {
+          if (!isMainRequest(body)) {
+            if (userTexts(body).some((text) => text.includes("PURPOSE_HELPER_TASK"))) {
+              helperAsked = true;
+              await helper.promise;
+              return text("helper", "PURPOSE_HELPER_DONE");
+            }
+            if (body.includes("PURPOSE_HELPER_DONE")) return text("lead_after", "PURPOSE_LEAD_SAW_HELPER");
+            if (!body.includes('"lead_sub"')) {
+              return toolCall("lead_sub", "subagent", {
+                request: { action: "message", agent: "helper", message: "PURPOSE_HELPER_TASK", instructions: "You check the zebra crossing logic." },
+              });
+            }
+            return text("lead_started", "PURPOSE_LEAD_STARTED");
+          }
+          if (body.includes("PURPOSE_LEAD_SAW_HELPER")) return text("main_after", "PURPOSE_MAIN_SAW_LEAD_AFTER");
+          if (body.includes("PURPOSE_LEAD_STARTED")) return text("main_idle", "PURPOSE_MAIN_IDLE");
+          if (!body.includes('"main_sub"')) {
+            return toolCall("main_sub", "subagent", {
+              request: { action: "message", agent: "lead", message: "PURPOSE_LEAD_TASK" },
+            });
+          }
+          return text("main_done", "PURPOSE_MAIN_DONE");
+        }, async (session) => {
+          await session.sendText("SWITCH_USER");
+          await session.waitForText("PURPOSE_MAIN_IDLE", 30_000);
+          await until("the helper's request", () => helperAsked);
+          await session.waitForPane((pane) => pane.includes("1 subagent working"), 15_000);
+          await session.waitForComposer(15_000);
+
+          // Lead's helper has no title yet, and sits under lead on a branch of
+          // its own; its row says what it is for.
+          await session.sendKeys("Down");
+          const list = await session.waitForPane((pane) => /^ {4}\u2514 helper /m.test(pane), 10_000);
+          expect(list).toMatch(/^ {4}\u2514 helper {2,}You check the zebra crossing logic\. {2,}working/m);
+          expect(list).not.toContain("new session");
+
+          // A word only that text holds finds it, listed on its own.
+          await session.sendLiteral("zebra");
+          const found = await session.waitForPane((pane) => composerContains(pane, "zebra") && pane.includes("Agents 1"), 10_000);
+          expect(found).toMatch(/^ {2}\u2514 helper {2,}You check the zebra crossing logic\./m);
+          await session.sendKeys("Escape");
+          await session.waitForPane((pane) => pane.includes("Agents 3") && !composerContains(pane, "zebra"), 10_000);
+          await session.sendKeys("Escape");
+          await session.waitForPane((pane) => !pane.includes(LIST_HINT), 5_000);
+          helper.release();
+          await session.waitForPane((pane) => pane.includes("PURPOSE_MAIN_SAW_LEAD_AFTER") && !pane.includes("subagent working"), 30_000);
+        });
+      } finally {
+        helper.release();
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
     "after a resume, the agent list shows a restored subagent's own title, before and after it is shown",
     async () => {
       await withFx((body) => {
@@ -2490,6 +3306,297 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         tracePath = join(home, "fx-trace.log");
         env.FX_TRACE_LOG = tracePath;
       }, false, env);
+    },
+    TIMEOUT,
+  );
+
+  // Main has started two subagents: `worker`, whose turn the test holds, so it
+  // works until the test ends, and `scribe`, which answered at once and is
+  // idle. The list shows them under main in that order. `run` gets the
+  // trace log's text, read fresh on each call.
+  async function withWorkerAndScribe(run: (session: TmuxSession, trace: () => string) => Promise<void>) {
+    const worker = held();
+    let workerCalls = 0;
+    let tracePath = "";
+    const env: Record<string, string> = {};
+    try {
+      await withFx(async (body) => {
+        if (!isMainRequest(body)) {
+          if (userTexts(body).some((value) => value.includes("RUN_WORKER"))) {
+            workerCalls += 1;
+            await worker.promise;
+            return text("worker_done", "RUN_WORKER_DONE");
+          }
+          return text("scribe_done", "RUN_SCRIBE_DONE");
+        }
+        if (!body.includes('"main_worker"')) {
+          return toolCall("main_worker", "subagent", { request: { action: "message", agent: "worker", message: "RUN_WORKER wait for me" } });
+        }
+        if (!body.includes('"main_scribe"')) {
+          return toolCall("main_scribe", "subagent", { request: { action: "message", agent: "scribe", message: "RUN_SCRIBE note it" } });
+        }
+        return text("main_done", "RUN_MAIN_DONE");
+      }, async (session) => {
+        await session.sendText("SWITCH_USER start the team");
+        await session.waitForText("RUN_MAIN_DONE", 30_000);
+        await session.waitForComposer(15_000);
+        await until("the worker's turn", () => workerCalls >= 1);
+        await run(session, () => (existsSync(tracePath) ? readFileSync(tracePath, "utf8") : ""));
+      }, (home) => {
+        tracePath = join(home, "fx-trace.log");
+        env.FX_TRACE_LOG = tracePath;
+      }, false, env);
+    } finally {
+      worker.release();
+    }
+  }
+
+  // `key` sent `count` times in one write, as a held key repeats it: fx reads
+  // them one after the other with nothing between.
+  const held_key = (key: string, count: number) => Array.from({ length: count }, () => key).join(" ");
+
+  // How many times the trace log shows `event`.
+  const eventCount = (trace: string, event: string) => trace.split("\n").filter((line) => line.includes(`event=${event} `)).length;
+
+  // The previewed worker is mid-turn, and its "Thinking (Ns)" line blinks its
+  // bullet and counts seconds, so two captures never match with it in.
+  const withoutThinkingTimer = (pane: string) => pane.replace(/^[ •]*Thinking \(\d+s\)$/gm, "Thinking");
+
+  // The pane once it has held still for 300 ms, so every key sent before is
+  // handled.
+  async function paneAtRest(session: TmuxSession, ms = 15_000): Promise<string> {
+    const deadline = Date.now() + ms;
+    let last = await session.capturePane();
+    let previous = last;
+    while (Date.now() < deadline) {
+      await Bun.sleep(300);
+      const now = await session.capturePane();
+      if (withoutThinkingTimer(now) === withoutThinkingTimer(last)) return now;
+      previous = last;
+      last = now;
+    }
+    const before = previous.split("\n");
+    const changed = last.split("\n").map((line, index) => (line === before[index] ? "" : `\n  - ${before[index]}\n  + ${line}`)).join("");
+    throw new Error(`the pane never held still; the last two captures differ in:${changed}\n${last}`);
+  }
+
+  // Opens the list and types a search that only `worker` matches, so the list
+  // shows it, working, as the only row.
+  async function searchForWorker(session: TmuxSession) {
+    await session.sendKeys("C-x");
+    await session.waitForText(LIST_HINT, 10_000);
+    await session.sendLiteral("wor");
+    const found = await session.waitForPane((pane) => pane.includes("Agents 1") && composerContains(pane, "wor")
+      && subagentRow("worker", "working").test(pane), 10_000);
+    expect(found).toContain("esc clear");
+    expect(found).not.toContain("delete close");
+  }
+
+  test(
+    "a held Backspace that empties the agent list's search goes on to nothing: no close is armed, and the highlighted agent stays open and working",
+    async () => {
+      await withWorkerAndScribe(async (session, trace) => {
+        await searchForWorker(session);
+        // Three presses empty the search and four more follow, as a held key
+        // repeats, with no other key between.
+        await session.sendKeys(held_key("BSpace", 7));
+        // fx logs each press it leaves alone; before this change nothing did,
+        // and the fourth press armed the close instead.
+        await until("the held Backspace to be handled", () =>
+          eventCount(trace(), "agents_menu_close_ignored") >= 4 || trace().includes("agents_menu_close_armed"));
+        const after = await paneAtRest(session);
+        expect(composerContains(after, "wor")).toBe(false);
+        expect(after).toContain("Agents 3");
+        expectRowOrder(after, mainRow(), subagentRow("worker", "working"), subagentRow("scribe", "idle"));
+        // Nothing is armed: the hint offers the close again, not its warning.
+        expect(after).not.toContain("press delete again");
+        expect(after).toContain("delete close");
+        const log = trace();
+        expect(log).not.toContain("agents_menu_close_armed");
+        expect(log).not.toContain("subagent_closed");
+        expect(eventCount(log, "agents_menu_close_ignored")).toBe(4);
+      });
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "after a Backspace run emptied the agent list's search, another key ends it, and two Backspaces on the next row arm and close it",
+    async () => {
+      await withWorkerAndScribe(async (session, trace) => {
+        await searchForWorker(session);
+        await session.sendKeys(held_key("BSpace", 3));
+        await paneAtRest(session);
+        // Down moves to scribe, a key other than Backspace: the run is over.
+        await session.sendKeys("Down");
+        await waitForSelectedRow(session, "scribe");
+        await session.sendKeys(held_key("BSpace", 2));
+        const closed = await session.waitForPane((pane) => !subagentRow("scribe").test(pane) && pane.includes("esc back"), 15_000);
+        expectRowOrder(closed, mainRow(), subagentRow("worker", "working"));
+        const log = trace();
+        expect(eventCount(log, "agents_menu_close_armed")).toBe(1);
+        expect(log).toContain("subagent_closed");
+        expect(log).not.toContain("agents_menu_close_ignored");
+      });
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "on a list nothing was searched in, Backspace pressed twice in a row arms and closes the highlighted subagent, as it always has",
+    async () => {
+      await withWorkerAndScribe(async (session, trace) => {
+        await session.sendKeys("C-x");
+        await session.waitForText(LIST_HINT, 10_000);
+        await session.sendKeys("Down");
+        await waitForSelectedRow(session, "worker");
+        await session.sendKeys(held_key("BSpace", 2));
+        const closed = await session.waitForPane((pane) => !subagentRow("worker").test(pane) && pane.includes("esc back"), 15_000);
+        expectRowOrder(closed, mainRow(), subagentRow("scribe", "idle"));
+        const log = trace();
+        expect(eventCount(log, "agents_menu_close_armed")).toBe(1);
+        expect(log).toContain("subagent_closed");
+        expect(log).not.toContain("agents_menu_close_ignored");
+      });
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "forward Delete after a Backspace run emptied the agent list's search arms and closes as it does on any list, since it is another key",
+    async () => {
+      await withWorkerAndScribe(async (session, trace) => {
+        await searchForWorker(session);
+        await session.sendKeys(held_key("BSpace", 3));
+        await paneAtRest(session);
+        await session.sendKeys("DC");
+        await session.waitForText("press delete again to close this subagent", 10_000);
+        await session.sendKeys("DC");
+        const closed = await session.waitForPane((pane) => !subagentRow("worker").test(pane) && pane.includes("esc back"), 15_000);
+        expectRowOrder(closed, mainRow(), subagentRow("scribe", "idle"));
+        const log = trace();
+        expect(eventCount(log, "agents_menu_close_armed")).toBe(1);
+        expect(log).toContain("subagent_closed");
+        expect(log).not.toContain("agents_menu_close_ignored");
+      });
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "a held forward Delete that empties the agent list's search from its start goes on to nothing either, and another key ends the run",
+    async () => {
+      await withWorkerAndScribe(async (session, trace) => {
+        await searchForWorker(session);
+        // Left puts the cursor at the start of the search, where Delete takes
+        // the text away letter by letter: three presses empty it, four more
+        // follow.
+        await session.sendKeys(held_key("Left", 3));
+        await session.sendKeys(held_key("DC", 7));
+        await until("the held Delete to be handled", () =>
+          eventCount(trace(), "agents_menu_close_ignored") >= 4 || trace().includes("agents_menu_close_armed"));
+        const after = await paneAtRest(session);
+        expect(composerContains(after, "wor")).toBe(false);
+        expect(after).toContain("Agents 3");
+        expectRowOrder(after, mainRow(), subagentRow("worker", "working"), subagentRow("scribe", "idle"));
+        expect(after).not.toContain("press delete again");
+        expect(after).toContain("delete close");
+        const log = trace();
+        expect(log).not.toContain("agents_menu_close_armed");
+        expect(log).not.toContain("subagent_closed");
+        expect(eventCount(log, "agents_menu_close_ignored")).toBe(4);
+
+        // Down is another key, so Delete twice closes scribe.
+        await session.sendKeys("Down");
+        await waitForSelectedRow(session, "scribe");
+        await session.sendKeys(held_key("DC", 2));
+        const closed = await session.waitForPane((pane) => !subagentRow("scribe").test(pane) && pane.includes("esc back"), 15_000);
+        expectRowOrder(closed, mainRow(), subagentRow("worker", "working"));
+      });
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "a search that matches a subagent only by what it is for, cleared by a held Backspace and then some, closes nothing: the agent stays open and working",
+    async () => {
+      const auditor = held();
+      const auditorTitle = held();
+      let childCalls = 0;
+      let tracePath = "";
+      const env: Record<string, string> = {};
+      const trace = () => (existsSync(tracePath) ? readFileSync(tracePath, "utf8") : "");
+      try {
+        await withFx(async (body) => {
+          if (!isMainRequest(body)) {
+            childCalls += 1;
+            await auditor.promise;
+            return text("child_answer", "PURPOSE_CHILD_DONE");
+          }
+          if (!body.includes('"main_sub"')) {
+            return toolCall("main_sub", "subagent", {
+              request: {
+                action: "message",
+                agent: "auditor",
+                message: "Review src/parser.zig for bugs",
+                instructions: "You audit the zebra crossing logic.\nKeep each note short.",
+              },
+            });
+          }
+          return text("main_wait", "PURPOSE_MAIN_WAITING");
+        }, async (session) => {
+          await session.sendText("SWITCH_USER plan it");
+          await session.waitForText("PURPOSE_MAIN_WAITING", 30_000);
+          await until("the auditor's turn", () => childCalls >= 1);
+          await session.waitForPane((pane) => pane.includes("1 subagent working"), 15_000);
+          await session.waitForComposer(15_000);
+          await session.sendKeys("Down");
+
+          // The title model has not answered, so the row says what the
+          // auditor is for, and only that text holds "zebra".
+          const untitled = await session.waitForPane((pane) => pane.includes(LIST_HINT)
+            && /^ {2}\u2514 auditor {2,}You audit the zebra crossing logic\. {2,}working/m.test(pane), 15_000);
+          expect(untitled).toContain("Agents 2");
+          await session.sendLiteral("zebra");
+          const found = await session.waitForPane((pane) => composerContains(pane, "zebra") && pane.includes("Agents 1"), 10_000);
+          expect(found).toMatch(/^ {2}\u2514 auditor {2,}You audit the zebra crossing logic\./m);
+
+          // Five presses empty the search and four more follow, as a held key
+          // repeats, with no other key between.
+          await session.sendKeys(held_key("BSpace", 9));
+          await until("the held Backspace to be handled", () =>
+            eventCount(trace(), "agents_menu_close_ignored") >= 4 || trace().includes("agents_menu_close_armed"));
+          const after = await paneAtRest(session);
+          expect(composerContains(after, "zebra")).toBe(false);
+          expect(after).toContain("Agents 2");
+          expectRowOrder(after, mainRow(), subagentRow("auditor", "working"));
+          await waitForSelectedRow(session, "auditor");
+          // Nothing is armed: the hint offers the close again, not its warning.
+          expect(after).not.toContain("press delete again");
+          expect(after).toContain("delete close");
+          const log = trace();
+          expect(log).not.toContain("agents_menu_close_armed");
+          expect(log).not.toContain("subagent_closed");
+          expect(eventCount(log, "agents_menu_close_ignored")).toBe(4);
+
+          await session.sendKeys("Escape");
+          await session.waitForPane((pane) => !pane.includes(LIST_HINT), 5_000);
+          auditor.release();
+          await session.waitForPane((pane) => !pane.includes("subagent working") && !pane.includes("waiting on 1 subagent"), 30_000);
+        }, (home) => {
+          tracePath = join(home, "fx-trace.log");
+          env.FX_TRACE_LOG = tracePath;
+        }, false, env, {
+          titleResponses: Array.from({ length: 8 }, () => async (body: string) => {
+            if (!body.includes("src/parser.zig")) return fakeGatewayFinalText("Plan the parser work");
+            await auditorTitle.promise;
+            return fakeGatewayFinalText("Review the parser");
+          }),
+        });
+      } finally {
+        auditor.release();
+        auditorTitle.release();
+      }
     },
     TIMEOUT,
   );
@@ -2878,6 +3985,351 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
     TIMEOUT,
   );
 
+  // Three subagents main starts together, which end three ways: `broken`
+  // fails its turn, `cut` works until the user stops it, and `fine` completes.
+  // Main's later messages to `broken` and `cut` carry ENDED_AGAIN, and a
+  // message the user types to `fine` carries ENDED_TYPED; both of those the
+  // test decides: `again` holds main's, `typed` fails the user's. `run` starts
+  // once `broken` and `fine` have ended and `cut` still works.
+  async function withEndedSubagents(
+    run: (session: TmuxSession, context: Run, gates: { cut: ReturnType<typeof held>; again: ReturnType<typeof held> }, reports: () => ReportSeen[], trace: () => string) => Promise<void>,
+    options: { trace?: boolean } = {},
+  ) {
+    const gates = { cut: held(), again: held() };
+    // With `trace`, fx writes its trace log, which `run` reads as its last argument.
+    let tracePath = "";
+    const env: Record<string, string> = {};
+    const trace = () => (tracePath && existsSync(tracePath) ? readFileSync(tracePath, "utf8") : "");
+    // The reports main has been told of, by the work they end.
+    const reported = new Map<string, ReportSeen>();
+    const steps = { broken: 0, typed: 0 };
+    // Two identical invalid calls make fx stop the tool loop: the turn fails.
+    const invalidShell = (id: string) => toolCall(id, "shell", {
+      request: { command: "printf unexpected > must-not-run.txt", tty: true, shell: { kind: "executable", path: "/bin/bash" } },
+      yield_time_ms: "1000",
+    });
+    try {
+      await withFx(async (body) => {
+        if (!isMainRequest(body)) {
+          const latest = latestUserText(body);
+          if (latest.includes("ENDED_AGAIN")) {
+            await gates.again.promise;
+            return text("again_done", "ENDED_AGAIN_DONE");
+          }
+          if (latest.includes("ENDED_TYPED")) {
+            steps.typed += 1;
+            return steps.typed <= 2 ? invalidShell(`ended_typed_${steps.typed}`) : text("typed_extra", "ENDED_TYPED_ASKED_AGAIN");
+          }
+          const users = userTexts(body);
+          if (users.some((value) => value.includes("ENDED_BROKEN"))) {
+            steps.broken += 1;
+            return steps.broken <= 2 ? invalidShell(`ended_broken_${steps.broken}`) : text("broken_extra", "ENDED_BROKEN_ASKED_AGAIN");
+          }
+          if (users.some((value) => value.includes("ENDED_CUT"))) {
+            await gates.cut.promise;
+            return text("cut_done", "ENDED_CUT_DONE");
+          }
+          return text("fine_done", "ENDED_FINE_DONE");
+        }
+        for (const report of reportsIn(body)) reported.set(report.workId, report);
+        if (latestUserText(body).includes('"child_id"')) return text(`main_saw_${reported.size}`, "ENDED_MAIN_SAW");
+        if (latestUserText(body).includes("ENDED_AGAIN")) {
+          if (!body.includes('"ended_again_broken"')) {
+            return messageSteps([
+              { id: "ended_again_broken", agent: "broken", message: "ENDED_AGAIN try once more" },
+              { id: "ended_again_cut", agent: "cut", message: "ENDED_AGAIN start over" },
+            ]);
+          }
+          return text("main_again", "ENDED_MAIN_AGAIN");
+        }
+        if (!body.includes('"ended_broken"')) {
+          return messageSteps([
+            { id: "ended_broken", agent: "broken", message: "ENDED_BROKEN run the bench" },
+            { id: "ended_cut", agent: "cut", message: "ENDED_CUT work slowly" },
+            { id: "ended_fine", agent: "fine", message: "ENDED_FINE say hello" },
+          ]);
+        }
+        return text("main_wait", "ENDED_MAIN_WAITING");
+      }, async (session, context) => {
+        await session.sendText("SWITCH_USER start the team");
+        // Main's turn is over once the three are started; the reports of
+        // `broken` and `fine` come after it.
+        await session.waitForText("ENDED_MAIN_WAITING", 60_000);
+        try {
+          await until("two reports", () => reported.size >= 2, 60_000);
+        } catch (error) {
+          throw new Error(`${(error as Error).message}: main was told of ${JSON.stringify([...reported.values()])}`);
+        }
+        await session.waitForComposer(30_000);
+        await run(session, context, gates, () => [...reported.values()], trace);
+      }, (home) => {
+        if (!options.trace) return;
+        tracePath = join(home, "fx-trace.log");
+        env.FX_TRACE_LOG = tracePath;
+      }, false, env);
+    } finally {
+      gates.cut.release();
+      gates.again.release();
+    }
+  }
+
+  // A subagent's report that main's request holds: who, the work it ends, and
+  // how it ended. A report reaches main as a message of its own or inside the
+  // update that ends the message before it, so the whole request is read, and
+  // the last user message is not.
+  type ReportSeen = { agent: string; workId: string; outcome: string };
+  const reportsIn = (body: string): ReportSeen[] => {
+    const found: ReportSeen[] = [];
+    const walk = (value: unknown) => {
+      if (typeof value === "string") {
+        for (const match of value.matchAll(/\{"agent":"([^"]*)","child_id":"[^"]*","work_id":"([^"]*)"[\s\S]*?"outcome":"(\w+)"/g)) {
+          found.push({ agent: match[1]!, workId: match[2]!, outcome: match[3]! });
+        }
+      } else if (Array.isArray(value)) value.forEach(walk);
+      else if (value && typeof value === "object") Object.values(value).forEach(walk);
+    };
+    walk(JSON.parse(body));
+    return found;
+  };
+
+  // Stops `cut`, which works, as the user does: Esc twice on its screen.
+  async function stopCut(session: TmuxSession) {
+    await showAgent(session, "cut");
+    await session.waitForPane((pane) => pane.includes("ENDED_CUT") && pane.includes("cut \u2193"), 15_000);
+    await session.sendKeys("Escape");
+    await session.waitForText("esc again to interrupt", 10_000);
+    await session.sendKeys("Escape");
+    await session.waitForText("What can fx do differently?", 15_000);
+  }
+
+  test(
+    "the agent list says failed on a subagent whose last turn failed and stopped on one the user stopped, and idle on one that completed",
+    async () => {
+      await withEndedSubagents(async (session, _context, _gates, reports) => {
+        // `broken` failed and `fine` completed while `cut` still works.
+        await session.sendKeys("C-x");
+        await session.waitForPane((pane) => pane.includes(LIST_HINT)
+          && subagentRow("broken", "failed").test(pane) && subagentRow("fine", "idle").test(pane) && subagentRow("cut", "working").test(pane), 15_000);
+        await session.sendKeys("Escape");
+        await session.waitForPane((pane) => !pane.includes(LIST_HINT), 5_000);
+
+        await stopCut(session);
+        await session.sendKeys("C-x");
+        const ended = await session.waitForPane((pane) => pane.includes(LIST_HINT) && subagentRow("cut", "stopped").test(pane), 10_000);
+        expect(ended).toMatch(subagentRow("broken", "failed"));
+        expect(ended).toMatch(subagentRow("fine", "idle"));
+        await session.sendKeys("Escape");
+        await session.waitForPane((pane) => !pane.includes(LIST_HINT), 5_000);
+        // The reports main got say the same: failed, cancelled by the user's stop, and completed.
+        await until("the report of the stop", () => reports().some((report) => report.agent === "cut"), 30_000);
+        const outcomeOf = (agent: string) => reports().find((report) => report.agent === agent)?.outcome;
+        expect(outcomeOf("broken")).toBe("failed");
+        expect(outcomeOf("cut")).toBe("cancelled");
+        expect(outcomeOf("fine")).toBe("completed");
+      });
+    },
+    TIMEOUT,
+  );
+
+  // The agent list's rows by name, top to bottom, as the screen shows them now.
+  const rowNames = async (session: TmuxSession) => agentRows(await session.capturePaneEscapes()).map((row) => row.name);
+
+  test(
+    "a failed or stopped row that a search finds keeps its label when a held Backspace clears the search and goes on, and nothing closes",
+    async () => {
+      await withEndedSubagents(async (session, _context, _gates, _reports, trace) => {
+        // `broken` failed, `fine` completed, and `cut` works. A search that
+        // only `broken` matches leaves it as the one row, still `failed`.
+        await session.sendKeys("C-x");
+        await session.waitForPane((pane) => pane.includes(LIST_HINT) && subagentRow("cut", "working").test(pane)
+          && subagentRow("broken", "failed").test(pane) && subagentRow("fine", "idle").test(pane), 10_000);
+        // Rows that do not work sort by their latest reply, so which of `broken`
+        // and `fine` comes first is not fixed. The list must come back in the
+        // order it opened in, and the working row is above the two that ended.
+        const openedOrder = await rowNames(session);
+        expect(openedOrder.slice(0, 2)).toEqual(["main", "cut"]);
+        await session.sendLiteral("bro");
+        const found = await session.waitForPane((pane) => composerContains(pane, "bro") && pane.includes("Agents 1")
+          && subagentRow("broken", "failed").test(pane), 10_000);
+        expect(found).not.toContain("delete close");
+        // Three presses empty the search and four more follow, as a held key
+        // repeats, with no other key between.
+        await session.sendKeys(held_key("BSpace", 7));
+        await until("the held Backspace to be handled", () =>
+          eventCount(trace(), "agents_menu_close_ignored") >= 4 || trace().includes("agents_menu_close_armed"));
+        const failed = await paneAtRest(session);
+        expect(composerContains(failed, "bro")).toBe(false);
+        expect(failed).toContain("Agents 4");
+        for (const [name, state] of [["cut", "working"], ["broken", "failed"], ["fine", "idle"]] as const) expect(failed).toMatch(subagentRow(name, state));
+        expect(await rowNames(session)).toEqual(openedOrder);
+        expect(failed).not.toContain("press delete again");
+        expect(failed).toContain("delete close");
+        expect(eventCount(trace(), "agents_menu_close_ignored")).toBe(4);
+        await session.sendKeys("Escape");
+        await session.waitForPane((pane) => !pane.includes(LIST_HINT), 5_000);
+
+        // The same for a row the user stopped: `cut` is the one row its
+        // search leaves, still `stopped`, and the presses past the end of
+        // the search leave it alone.
+        await stopCut(session);
+        await session.sendKeys("C-x");
+        await session.waitForPane((pane) => pane.includes(LIST_HINT) && subagentRow("cut", "stopped").test(pane)
+          && subagentRow("broken", "failed").test(pane) && subagentRow("fine", "idle").test(pane), 10_000);
+        const stoppedOrder = await rowNames(session);
+        await session.sendLiteral("cut");
+        const stopped = await session.waitForPane((pane) => composerContains(pane, "cut") && pane.includes("Agents 1")
+          && subagentRow("cut", "stopped").test(pane), 10_000);
+        expect(stopped).not.toContain("delete close");
+        await session.sendKeys(held_key("BSpace", 7));
+        await until("the second held Backspace to be handled", () =>
+          eventCount(trace(), "agents_menu_close_ignored") >= 8 || trace().includes("agents_menu_close_armed"));
+        const after = await paneAtRest(session);
+        expect(composerContains(after, "cut")).toBe(false);
+        expect(after).toContain("Agents 4");
+        for (const [name, state] of [["broken", "failed"], ["fine", "idle"], ["cut", "stopped"]] as const) expect(after).toMatch(subagentRow(name, state));
+        expect(await rowNames(session)).toEqual(stoppedOrder);
+        expect(after).not.toContain("press delete again");
+        expect(after).toContain("delete close");
+        const log = trace();
+        expect(log).not.toContain("agents_menu_close_armed");
+        expect(log).not.toContain("subagent_closed");
+        expect(eventCount(log, "agents_menu_close_ignored")).toBe(8);
+      }, { trace: true });
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "the footer on a subagent's own screen says failed or stopped after such a turn, and done after one that completed",
+    async () => {
+      await withEndedSubagents(async (session) => {
+        await stopCut(session);
+        await session.waitForPane((pane) => pane.includes("cut \u00b7 stopped"), 10_000);
+        await showAgent(session, "broken");
+        await session.waitForPane((pane) => pane.includes("broken \u00b7 failed"), 10_000);
+        await showAgent(session, "fine");
+        await session.waitForPane((pane) => pane.includes("fine \u00b7 done"), 10_000);
+      });
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "a subagent's next turn says working, and a later turn that completes clears its failed or stopped state",
+    async () => {
+      await withEndedSubagents(async (session, _context, gates) => {
+        await stopCut(session);
+        // They start out as the last turn left them.
+        await session.sendKeys("C-x");
+        await session.waitForPane((pane) => pane.includes(LIST_HINT)
+          && subagentRow("broken", "failed").test(pane) && subagentRow("cut", "stopped").test(pane), 15_000);
+        await session.sendKeys("Escape");
+        await session.waitForPane((pane) => !pane.includes(LIST_HINT), 5_000);
+        await showAgent(session, "main");
+        await session.waitForComposer(15_000);
+        // Main sends both of them a new message, which the test holds.
+        await session.sendText("SWITCH_USER again ENDED_AGAIN");
+        await session.sendKeys("C-x");
+        await session.waitForPane((pane) => pane.includes(LIST_HINT)
+          && subagentRow("broken", "working").test(pane) && subagentRow("cut", "working").test(pane), 30_000);
+        await session.sendKeys("Escape");
+        await session.waitForPane((pane) => !pane.includes(LIST_HINT), 5_000);
+        await showAgent(session, "broken");
+        // The footer's name stands alone while its turn goes.
+        const footer = await session.waitForPane((pane) => pane.includes("broken \u2193") || pane.includes("broken \u00b7 ctrl+x"), 10_000);
+        expect(footer).not.toContain("broken \u00b7 failed");
+        gates.again.release();
+        await session.waitForPane((pane) => pane.includes("broken \u00b7 done"), 30_000);
+        await session.sendKeys("C-x");
+        const cleared = await session.waitForPane((pane) => pane.includes(LIST_HINT)
+          && subagentRow("broken", "idle").test(pane) && subagentRow("cut", "idle").test(pane), 30_000);
+        // No row keeps the end it had.
+        for (const name of ["broken", "cut"]) {
+          expect(cleared).not.toMatch(subagentRow(name, "failed"));
+          expect(cleared).not.toMatch(subagentRow(name, "stopped"));
+        }
+      });
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "a turn the user types on a subagent's screen decides its row and footer, and the report to main says the same",
+    async () => {
+      await withEndedSubagents(async (session, _context, _gates, reports) => {
+        // `fine` completed the work main sent. The user's turn fails.
+        await showAgent(session, "fine");
+        await session.waitForPane((pane) => pane.includes("fine \u00b7 done"), 10_000);
+        await session.sendText("ENDED_TYPED ask once more");
+        await session.waitForPane((pane) => pane.includes("fine \u00b7 failed"), 60_000);
+        await session.sendKeys("C-x");
+        await session.waitForPane((pane) => pane.includes(LIST_HINT) && subagentRow("fine", "failed").test(pane), 15_000);
+        // The report that tells main names the same end, for the user's turn:
+        // fine's first work, main's, completed.
+        await until("the report of the user's turn", () => reports().filter((report) => report.agent === "fine").length >= 2, 60_000);
+        const ofFine = reports().filter((report) => report.agent === "fine");
+        expect(ofFine.map((report) => report.outcome).sort()).toEqual(["completed", "failed"]);
+        await session.sendKeys("Escape");
+      });
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "after a restart and a resume, a restored subagent says failed or stopped as it did, one cut short by fx quitting says stopped, and the footer on its screen too",
+    async () => {
+      await withEndedSubagents(async (session, { home, launch }) => {
+        // `cut` still works as fx quits, so its work ends as one fx cut short.
+        await session.sendText("/quit");
+        expect(await session.waitForSessionEnd(15_000)).toBe(true);
+
+        const mains = sessionsHolding(home, "ENDED_MAIN_WAITING");
+        expect(mains).toHaveLength(1);
+        const resumed = await launch(`--resume ${mains[0]}`);
+        await resumed.waitForComposer(15_000);
+        await resumed.waitForPane((pane) => pane.includes("main \u2193"), 10_000);
+        await resumed.sendKeys("Down");
+        const list = await resumed.waitForPane((pane) => pane.includes(LIST_HINT) && subagentRow("broken").test(pane)
+          && subagentRow("cut").test(pane) && subagentRow("fine").test(pane), 15_000);
+        expect(list).toMatch(subagentRow("broken", "failed"));
+        expect(list).toMatch(subagentRow("cut", "stopped"));
+        expect(list).toMatch(subagentRow("fine", "idle"));
+        await resumed.sendKeys("Escape");
+        await resumed.waitForPane((pane) => !pane.includes(LIST_HINT), 5_000);
+        await showAgent(resumed, "broken");
+        await resumed.waitForPane((pane) => pane.includes("broken \u00b7 failed"), 15_000);
+        await showAgent(resumed, "cut");
+        await resumed.waitForPane((pane) => pane.includes("cut \u00b7 stopped"), 15_000);
+        await showAgent(resumed, "fine");
+        await resumed.waitForPane((pane) => pane.includes("fine \u00b7 done"), 15_000);
+      });
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "a /fork copies each subagent with how its last turn ended, so the fork's list says failed, stopped, and idle as the source's did",
+    async () => {
+      await withEndedSubagents(async (session) => {
+        await stopCut(session);
+        await showAgent(session, "main");
+        await session.waitForComposer(15_000);
+        await session.sendText("/fork");
+        await session.waitForPane((pane) => pane.includes("enter fork"), 15_000);
+        await session.sendKeys("Enter");
+        await session.waitForPane((pane) => !pane.includes("enter fork"), 15_000);
+        await session.waitForComposer(30_000);
+        await session.sendKeys("C-x");
+        const list = await session.waitForPane((pane) => pane.includes(LIST_HINT) && subagentRow("broken").test(pane)
+          && subagentRow("cut").test(pane) && subagentRow("fine").test(pane), 30_000);
+        expect(list).toMatch(subagentRow("broken", "failed"));
+        expect(list).toMatch(subagentRow("cut", "stopped"));
+        expect(list).toMatch(subagentRow("fine", "idle"));
+      });
+    },
+    TIMEOUT,
+  );
+
   test(
     "main can still steer a working subagent after it has read 64 earlier messages",
     async () => {
@@ -2918,12 +4370,38 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
             return messageSteps(steers);
           }
           return toolCall("main_start", "subagent", { request: { action: "message", agent: "lane", message: "LANE_TASK keep working" } });
-        }, async (session) => {
+        }, async (session, { home, launch }) => {
           await session.sendText("SWITCH_USER steer the lane");
           await session.waitForText("MAIN_DONE", 120_000);
           console.log(`STEER_LAST_RESULT: ${lastResult}`);
           // None of the 64 was waiting any more, so the limit doesn't apply.
           expect(lastResult).toContain("Sent into the subagent's running turn");
+          // The lane took each steer into its running turn, so its own screen
+          // shows every one of them, once.
+          await session.waitForComposer(15_000);
+          await showAgent(session, "lane");
+          await session.waitForText("STEER_064 note", 30_000);
+          const lane = await session.captureFullScrollback();
+          expect(lane.split("STEER_001 note").length - 1).toBe(1);
+          expect(lane.split("STEER_064 note").length - 1).toBe(1);
+          // The lane's answer comes once it has taken the steers, so its
+          // turn is saved with them. Then main ends and starts again on the
+          // same session, and the lane's restored screen shows the steers.
+          await session.waitForText("LANE_DONE", 30_000);
+          await showAgent(session, "main");
+          await session.waitForComposer(15_000);
+          await session.sendText("/quit");
+          expect(await session.waitForSessionEnd(15_000)).toBe(true);
+          // Main's session holds the message the user typed, so it is the one to resume.
+          const parents = sessionsHolding(home, "SWITCH_USER steer the lane");
+          expect(parents).toHaveLength(1);
+          const resumed = await launch(`--resume ${parents[0]}`);
+          await showAgent(resumed, "lane");
+          await resumed.waitForText("STEER_064 note", 30_000);
+          const restored = await resumed.captureFullScrollback();
+          expect(restored.split("STEER_001 note").length - 1).toBe(1);
+          expect(restored.split("STEER_064 note").length - 1).toBe(1);
+          expect(restored).not.toContain("parent-agent feedback");
         }, () => {}, false, env);
       } finally {
         // A failed run must not leave gateway handlers waiting.
@@ -3217,6 +4695,51 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
           pane.includes("TUI_MAIN_SAW_RELAY") || pane.includes("TUI_MAIN_NO_RELAY"), 30_000);
         expect(pane).toContain("TUI_MAIN_SAW_RELAY");
       }, () => {}, false, { FX_TEST_SHELL_QUIET_NOTICE_MS: "3000" });
+    },
+    TIMEOUT,
+  );
+
+  for (const prompt of ["approval", "question"] as const) {
+    test(
+      `a report for main starts its next turn while a subagent's ${prompt} stays open`,
+      async () => {
+        await reportWhilePromptStaysOpen(prompt);
+      },
+      TIMEOUT,
+    );
+  }
+
+  // A person leaves a prompt open for longer than the gate's limit, and the
+  // subagent reports after that.
+  for (const [prompt, seconds] of [["approval", 6], ["approval", 10], ["question", 6]] as const) {
+    test(
+      `a report ${seconds} s late for main starts its next turn while a subagent's ${prompt} stays open`,
+      async () => {
+        await reportWhilePromptStaysOpen(prompt, seconds * 1000);
+      },
+      TIMEOUT,
+    );
+  }
+
+  // No prompt is open and a subagent is still at work. The path without a
+  // prompt was fixed by the commit gate, and the report's request has to carry
+  // the first turn there too. This test also passes without the change that
+  // adds the turn to the request: the loop usually commits the turn before the
+  // report is posted.
+  test(
+    "a report for main starts its next turn while no prompt is open, and carries the first turn",
+    async () => {
+      await reportWhilePromptStaysOpen("none");
+    },
+    TIMEOUT,
+  );
+
+  // The second report comes more than the limit after the first hold began, so
+  // a hold that kept the first one's time would give up at once.
+  test(
+    "a second report more than the limit after the first hold starts its turn while a subagent's approval stays open",
+    async () => {
+      await reportWhilePromptStaysOpen("approval", 6000, true);
     },
     TIMEOUT,
   );

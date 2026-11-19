@@ -51,7 +51,7 @@ pub fn parse(result: []const u8, round: *Round) error{Malformed}!void {
         fields.init(requests) catch return error.Malformed;
         while (fields.next() catch return error.Malformed) |field| {
             if (round.count == max_requests) return error.Malformed;
-            for (round.slice()) |other| if (std.mem.eql(u8, other.key, field.key)) return error.Malformed;
+            for (round.slice()) |other| if (wire.sameString(other.key, field.key)) return error.Malformed;
             var parts: [2]?[]const u8 = undefined;
             wire.objectFields(field.value, &.{ "method", "params" }, &parts) catch return error.Malformed;
             const method = wire.plainString(parts[0] orelse return error.Malformed) orelse return error.Malformed;
@@ -175,6 +175,65 @@ test "input requests need the capability they use" {
     try testing.expect(supported("{\"elicitation\":{\"url\":{}}}", url));
     try testing.expect(!supported("{\"elicitation\":{}}", sampling));
     try testing.expect(supported("{\"sampling\":{}}", sampling));
+}
+
+test "a URL question needs the url capability whether or not its mode is written with an escape" {
+    const url: Request = .{ .key = "\"k\"", .kind = .elicitation, .raw = "{}", .params = "{\"m\\u006fde\":\"url\",\"url\":\"https://x\"}" };
+    try testing.expect(!supported("{\"elicitation\":{\"form\":{}}}", url));
+    try testing.expect(supported("{\"elicitation\":{\"url\":{}}}", url));
+    try testing.expect(!supported("{\"elicitation\":{}}", url));
+}
+
+test "a requestState and inputRequests written with escapes are read" {
+    var round: Round = undefined;
+    try parse("{\"input\\u0052equests\":{\"k\":{\"method\":\"roots/list\"}},\"request\\u0053tate\":\"s\"}", &round);
+    try testing.expectEqual(@as(u8, 1), round.count);
+    try testing.expectEqualStrings("\"s\"", round.state orelse "(no state)");
+    // A name that is one name once decoded, written twice, is a duplicate, so the round is malformed.
+    try testing.expectError(error.Malformed, parse("{\"requestState\":\"a\",\"request\\u0053tate\":\"b\",\"inputRequests\":{}}", &round));
+}
+
+test "two input request keys that are one name once decoded make the round malformed" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const method = "{\"method\":\"roots/list\"}";
+    // The same name written two ways: plain and escaped, either order, two escapes, an accent, an astral code point.
+    const same = [_][2][]const u8{
+        .{ "\"k\"", "\"\\u006b\"" },
+        .{ "\"\\u006b\"", "\"k\"" },
+        .{ "\"\\u006B\"", "\"\\u006b\"" },
+        .{ "\"caf\\u00e9\"", "\"caf\u{e9}\"" },
+        .{ "\"\\ud83d\\ude00\"", "\"\u{1f600}\"" },
+        .{ "\"a\\/b\"", "\"a/b\"" },
+    };
+    for (same) |pair| {
+        var round: Round = undefined;
+        const text = try a.print("{{\"inputRequests\":{{{s}:{s},{s}:{s}}}}}", .{ pair[0], method, pair[1], method });
+        try testing.expectError(error.Malformed, parse(text, &round));
+    }
+}
+
+test "input request keys that differ once decoded stay apart, each kept as written" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const method = "{\"method\":\"roots/list\"}";
+    const apart = [_][2][]const u8{
+        .{ "\"k\"", "\"k2\"" },
+        .{ "\"k\"", "\"k\\u0000\"" },
+        .{ "\"\\u00e9\"", "\"e\"" },
+        .{ "\"\\u0131\"", "\"i\"" },
+        .{ "\"\\u006b\"", "\"\\u006c\"" },
+    };
+    for (apart) |pair| {
+        var round: Round = undefined;
+        const text = try a.print("{{\"inputRequests\":{{{s}:{s},{s}:{s}}}}}", .{ pair[0], method, pair[1], method });
+        try parse(text, &round);
+        try testing.expectEqual(@as(u8, 2), round.count);
+        try testing.expectEqualStrings(pair[0], round.requests[0].key);
+        try testing.expectEqualStrings(pair[1], round.requests[1].key);
+    }
 }
 
 test "a retry answers each key as written and echoes the state, or leaves both out" {

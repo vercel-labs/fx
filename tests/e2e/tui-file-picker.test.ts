@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
+import { processAlive } from "./process-alive";
 import { execFileSync } from "node:child_process";
 import {
   copyFileSync,
@@ -1133,7 +1134,7 @@ describe("@ file picker", () => {
       await active.sendText("/quit");
       expect(await active.waitForSessionEnd(TIMEOUT)).toBe(true);
       expect(active.isAlive()).toBe(false);
-      expect(() => process.kill(targetPid, 0)).toThrow();
+      expect(processAlive(targetPid)).toBe(false);
       expect(readFileSync(current.stderrPath, "utf8")).toBe("");
 
       const finalTrace = await waitForFileText(

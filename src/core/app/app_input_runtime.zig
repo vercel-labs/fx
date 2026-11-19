@@ -1766,10 +1766,50 @@ pub fn Runtime(comptime App: type) type {
             return app_agents_runtime.Runtime(App).backMenu(app);
         }
 
-        /// x in the agent list: arms, then closes, the selected subagent.
-        fn pressAgentsMenuClose(app: *App) !bool {
+        /// A close key on an empty search in the agent list: arms, then
+        /// closes, the selected row, unless its run edited the search.
+        fn pressAgentsMenuClose(app: *App, key: app_agents_runtime.CloseKey) !bool {
             if (comptime !@hasDecl(App, "openAgentsMenu")) return false;
-            return app_agents_runtime.Runtime(App).pressCloseKey(app);
+            return app_agents_runtime.Runtime(App).pressCloseKey(app, key);
+        }
+
+        /// The close key `event` is, or null for any other event. Backspace is
+        /// the bytes 127 and 8, as a terminal sends them or as Kitty's
+        /// `ESC[127u` is replayed; Delete is the forward Delete key.
+        fn agentsMenuCloseKey(event: input_action.TerminalInputEvent) ?app_agents_runtime.CloseKey {
+            return switch (event) {
+                .raw => |raw| if (raw.byte == 127 or raw.byte == 8) .backspace else null,
+                .action => |decoded| switch (decoded.action) {
+                    .remapped_byte => |byte| if (byte == 127 or byte == 8) .backspace else null,
+                    .delete_next => .delete,
+                    else => null,
+                },
+                else => null,
+            };
+        }
+
+        /// Whether `event` is a key press. A mouse report, a sequence fx
+        /// ignores, and a paste's byte are not, so none of them ends a run of
+        /// a close key that a stray report would otherwise break.
+        fn agentsMenuKeyPress(event: input_action.TerminalInputEvent) bool {
+            return switch (event) {
+                .paste_byte => false,
+                .raw => true,
+                .action => |decoded| switch (decoded.action) {
+                    .ignore, .mouse_wheel, .mouse_pointer => false,
+                    else => true,
+                },
+            };
+        }
+
+        fn noteAgentsMenuKeyPress(app: *App, pressed: ?app_agents_runtime.CloseKey) void {
+            if (comptime !@hasDecl(App, "openAgentsMenu")) return;
+            app_agents_runtime.Runtime(App).noteKeyPress(app, pressed);
+        }
+
+        fn noteAgentsMenuSearchEdit(app: *App, key: app_agents_runtime.CloseKey) void {
+            if (comptime !@hasDecl(App, "openAgentsMenu")) return;
+            app_agents_runtime.Runtime(App).noteSearchEditKey(app, key);
         }
 
         /// The composer, the open agent list's search box, holds a search.
@@ -1801,31 +1841,29 @@ pub fn Runtime(comptime App: type) type {
         /// the agent the list opened on. The composer is its search box, with
         /// the agent's draft set aside: typing, Left, and Right edit it, and
         /// the list shows the match the highlight moves to; while it holds a
-        /// search, Backspace and Delete edit it too and Esc clears it. A paste
-        /// closes the list, keeping the agent shown, and lands in its draft;
-        /// mouse input passes through. Any other key does nothing, so none
-        /// answers the prompt behind the list. Returns whether the list took
-        /// `event`.
+        /// search, Backspace and Delete edit it too and Esc clears it. A run
+        /// of presses of one of them that edited the search never arms a
+        /// close, however many go on past the emptied search, until a key
+        /// other than it is pressed. A paste closes the list, keeping the
+        /// agent shown, and lands in its draft; mouse input passes through.
+        /// Any other key does nothing, so none answers the prompt behind the
+        /// list. Returns whether the list took `event`.
         fn routeAgentsMenuInput(app: *App, event: input_action.TerminalInputEvent) !bool {
             if (!agentsMenuActive(app)) return false;
             const agent = agents.screenAgentOf(app);
-            const close_key = switch (event) {
-                .raw => |raw| raw.byte == 127 or raw.byte == 8,
-                .action => |decoded| switch (decoded.action) {
-                    .remapped_byte => |byte| byte == 127 or byte == 8,
-                    .delete_next => true,
-                    else => false,
-                },
-                else => false,
-            };
-            if (!close_key) disarmAgentsMenuClose(app);
+            const close_key = agentsMenuCloseKey(event);
+            if (close_key == null) disarmAgentsMenuClose(app);
+            if (agentsMenuKeyPress(event)) noteAgentsMenuKeyPress(app, close_key);
             switch (event) {
                 // A paste closes the list before its bytes arrive.
                 .paste_byte => return false,
                 .raw => |raw| switch (raw.byte) {
                     '\r' => _ = try submitAgentsMenuSelection(app),
-                    127, 8 => if (agentsMenuSearching(app)) return false else {
-                        _ = try pressAgentsMenuClose(app);
+                    127, 8 => if (agentsMenuSearching(app)) {
+                        noteAgentsMenuSearchEdit(app, .backspace);
+                        return false;
+                    } else {
+                        _ = try pressAgentsMenuClose(app, .backspace);
                     },
                     3, 24 => _ = try backAgentsMenu(app),
                     ' '...'~' => return false,
@@ -1836,8 +1874,11 @@ pub fn Runtime(comptime App: type) type {
                 .action => |decoded| switch (decoded.action) {
                     .cursor_up, .history_up => _ = try completion_rt.routeAgentsMenuMove(app, agent, -1),
                     .cursor_down, .history_down => _ = try completion_rt.routeAgentsMenuMove(app, agent, 1),
-                    .delete_next => if (agentsMenuSearching(app)) return false else {
-                        _ = try pressAgentsMenuClose(app);
+                    .delete_next => if (agentsMenuSearching(app)) {
+                        noteAgentsMenuSearchEdit(app, .delete);
+                        return false;
+                    } else {
+                        _ = try pressAgentsMenuClose(app, .delete);
                     },
                     .cursor_left, .cursor_right => return false,
                     .escape => {

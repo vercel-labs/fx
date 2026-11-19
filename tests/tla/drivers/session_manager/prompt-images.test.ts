@@ -14,6 +14,7 @@ import { chmodSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, writeFile
 import { join } from "node:path";
 import { artifacts, binary, testEnvironment, worktree } from "../lib/context";
 import { runTlc, sha256File, TLA_ROOT } from "../lib/tlc";
+import { ignoresFileModes } from "../../../e2e/file-modes";
 
 const { fakeGatewayTitleDefault, TITLE_GENERATION_MARKER } = await import(join(worktree, "tests", "e2e", "tmux-helpers.ts"));
 const { solidPng } = await import(join(worktree, "tests", "e2e", "fixtures", "image-encoding.ts"));
@@ -187,7 +188,7 @@ test("prompt images become blobs the notes name, across a resume (D89)", async (
   }
 }, TIMEOUT * 3);
 
-test("an image the session cannot save stays inline with no note, and a saved one keeps its note (D89)", async () => {
+test.skipIf(ignoresFileModes())("an image the session cannot save stays inline with no note, and a saved one keeps its note (D89)", async () => {
   const f = fixture("refused");
   try {
     const a = f.image("a.png", 20, 10), c = f.image("c.png", 12, 12);

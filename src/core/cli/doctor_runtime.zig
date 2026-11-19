@@ -560,6 +560,10 @@ fn appendGitCheck(checks: *std.ArrayList(Check), alloc: Allocator, workspace_roo
                 .repo_config_unavailable => .{ "fx could not read this repository's git config", "git config --list --show-origin" },
                 .unsupported_filter_name => .{ "this repository's git config names a filter fx cannot turn off, so fx does not run git here", "rename that filter in the repository's git config so its name has no =" },
                 .repository_mismatch => .{ "git would use a different repository than the one fx read here", "check GIT_DIR and GIT_WORK_TREE" },
+                .hook_config_unavailable => .{ "fx could not list the hooks your git config defines", "git config --get-regexp '^hook\\..*\\.command$'" },
+                .unsupported_hook_name => .{ "your git config names a hook with = in its name, which fx cannot turn off", "rename that hook so its name has no =" },
+                .timed_out => .{ "git did not answer fx's checks in time", "run fx doctor again" },
+                .cancelled => .{ "fx's git checks were cancelled", "run fx doctor again" },
             };
             try checks.append(alloc, .{ .name = "git", .status = .warn, .detail = text[0], .fix = text[1] });
         },

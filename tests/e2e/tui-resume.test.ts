@@ -1,4 +1,5 @@
 import { expect, test } from "bun:test";
+import { processAlive } from "./process-alive";
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
@@ -241,6 +242,24 @@ async function waitForCondition(
     await Bun.sleep(50);
   }
   throw new Error(`Timed out waiting for ${description}.`);
+}
+
+/// Waits until session `id`'s log holds its interrupted turn. fx traces
+/// `event=interrupt_persisted` when the agent worker builds that turn, and
+/// saves it a little later, when the app thread handles the worker's finish
+/// event (`finish` in `src/core/agent/runtime/finalization.zig`). The
+/// `turn_interrupted` record is the last one that save writes, after the
+/// turn's items and the blobs they name.
+async function waitForSavedInterruptedTurn(
+  home: string,
+  id: string,
+  timeout = TIMEOUT,
+): Promise<void> {
+  await waitForCondition(
+    () => logLines(home, id).some((line) => line.kind === "turn_interrupted"),
+    `session ${id} to save its interrupted turn (a turn_interrupted record in its log)`,
+    timeout,
+  );
 }
 
 async function waitForPersistedSessionMarker(
@@ -2389,6 +2408,7 @@ while :; do :; done
       expect(beforePlain).not.toContain(tailMarker);
 
       const sessionId = sessionIdFromHome(home);
+      await waitForSavedInterruptedTurn(home, sessionId, timeout);
       const replays = commandReplays(home, sessionId);
       expect(replays).toHaveLength(1);
       const replayName = replays[0]!.name;
@@ -2596,6 +2616,7 @@ while :; do :; done
       expect(countOccurrences(compact, headMarker)).toBe(0);
       expect(compact).not.toContain(tailMarker);
       const sessionId = sessionIdFromHome(home);
+      await waitForSavedInterruptedTurn(home, sessionId, timeout);
       const replays = commandReplays(home, sessionId);
       expect(replays).toHaveLength(1);
       expect(statSync(replays[0]!.path).size).toBeGreaterThan(0);
@@ -8557,6 +8578,153 @@ test.skipIf(!tmuxAvailable())(
   120_000,
 );
 
+/// The compact view's tool rows and cancellation lines on `screen`.
+function compactToolRows(screen: string): string[] {
+  return stripAnsi(screen)
+    .split("\n")
+    .map((line) => line.trimEnd())
+    .filter((line) => /^\s*[●├└▪] /.test(line));
+}
+
+/// The notice under a cancelled command, which names no command.
+const CANCELLED_COMMAND_NOTICE = "▪ Cancelled · What can fx do differently?";
+
+/// Checks that Ctrl+O shows `command` in full, then closes it.
+async function expectFullTranscriptShows(session: TmuxSession, command: string, timeout: number) {
+  await session.sendKeys("C-o");
+  expect(stripAnsi(await session.waitForText(command, timeout))).toContain(`Cancelled ${command}`);
+  await session.sendKeys("Escape");
+  await session.waitForComposer(timeout);
+}
+
+const cancelledRowCases = [
+  {
+    name: "a lone command cancelled before it printed anything",
+    command: "touch .cancel-ready && sleep 60",
+    before: [] as string[],
+    row: "● Cancelled touch, sleep",
+    printed: false,
+  },
+  {
+    name: "a lone command cancelled after it printed",
+    command: "echo CANCEL_PRINTED; touch .cancel-ready; sleep 60",
+    before: [] as string[],
+    row: "● Cancelled echo, touch, sleep",
+    printed: true,
+  },
+  {
+    name: "a silent command cancelled after another command ran",
+    command: "touch .cancel-ready && sleep 60",
+    before: ["echo FIRST_STEP_DONE"],
+    row: "└ Cancelled touch, sleep",
+    printed: false,
+  },
+];
+
+for (const scenario of cancelledRowCases) {
+  test.skipIf(!tmuxAvailable())(
+    `${scenario.name} reads the same after resume, by its short name`,
+    async () => {
+      const timeout = 60_000;
+      const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-cancelled-row-resume-")));
+      const home = join(root, "home");
+      const workspace = join(root, "workspace");
+      const tracePath = join(root, "trace.log");
+      const readyPath = join(workspace, ".cancel-ready");
+      mkdirSync(join(home, ".fx"), { recursive: true });
+      mkdirSync(workspace);
+      writeFileSync(
+        join(home, ".fx", "settings.json"),
+        JSON.stringify({ sandbox: "none", permission_mode: "auto", permission: {} }),
+      );
+      const initialGateway = startFakeGateway([
+        ...scenario.before.map((command, index) => fakeShellRun(`cancelled-row-before-${index}`, command)),
+        fakeShellRun("cancelled-row-command", scenario.command),
+      ]);
+      const resumedGateway = startFakeGateway([]);
+      let active: TmuxSession | null = null;
+      let passed = false;
+      try {
+        active = await TmuxSession.create({
+          cmd: FX_BIN,
+          cwd: realpathSync(workspace),
+          env: { ...gatewayEnv(home, initialGateway), FX_TRACE_LOG: tracePath, FX_TRACE_SCOPES: "session,interrupt" },
+          width: 100,
+          height: 32,
+        });
+        await active.waitForComposer(TIMEOUT);
+        await active.sendText("Run the commands.");
+        await waitForCondition(() => existsSync(readyPath), "the command's readiness file", timeout);
+        await active.sendInterruptEscapePair(timeout);
+        const live = compactToolRows(await waitForScrollback(active, "What can fx do differently?", timeout));
+        await waitForCondition(
+          () => existsSync(tracePath) && readFileSync(tracePath, "utf8").includes("event=interrupt_persisted"),
+          "the interrupted turn on disk",
+          timeout,
+        );
+        await expectFullTranscriptShows(active, scenario.command, timeout);
+        await active.sendText("/quit");
+        expect(await active.waitForSessionEnd()).toBe(true);
+        await active.kill();
+        active = null;
+
+        // The live row shows the command's short name, and the notice under
+        // it names no command, so no line holds the full one.
+        expect(live).toContain(scenario.row);
+        expect(live.filter((line) => line.startsWith("▪"))).toEqual([CANCELLED_COMMAND_NOTICE]);
+        expect(live.join("\n")).not.toContain(scenario.command);
+
+        const items = savedItems(home, onlySessionId(home));
+
+        active = await TmuxSession.create({
+          cmd: `${FX_BIN} --resume last`,
+          cwd: realpathSync(workspace),
+          env: gatewayEnv(home, resumedGateway),
+          width: 100,
+          height: 32,
+        });
+        await active.waitForComposer(TIMEOUT);
+        const resumed = compactToolRows(await waitForScrollback(active, "What can fx do differently?", timeout));
+        expect(resumed).toEqual(live);
+        expect(resumed.filter((line) => line.startsWith("▪"))).toEqual([CANCELLED_COMMAND_NOTICE]);
+        expect(resumed.join("\n")).not.toContain(scenario.command);
+        await expectFullTranscriptShows(active, scenario.command, timeout);
+        expect(resumedGateway.requests).toHaveLength(0);
+
+        // The saved turn named the command's output when it printed, and
+        // saved the cancelled command item when it didn't.
+        const interruption = items.find((item) => item.interruption)!.interruption;
+        const marker = items.filter((item) => item.cancelled_command);
+        if (scenario.printed) {
+          expect(interruption.command_replay_ref).toEqual(expect.any(String));
+          expect(marker).toEqual([]);
+        } else {
+          expect(interruption.command_replay_ref).toBeNull();
+          expect(marker).toEqual([{ cancelled_command: { call_id: "cancelled-row-command" } }]);
+        }
+        passed = true;
+      } finally {
+        if (active) {
+          if (!passed) {
+            try {
+              writeFileSync(join(root, "failure-scrollback.txt"), await active.captureFullScrollback());
+            } catch {}
+          }
+          await active.kill();
+        }
+        initialGateway.stop();
+        resumedGateway.stop();
+        if (passed) {
+          rmSync(root, { recursive: true, force: true });
+        } else {
+          console.error(`retained cancelled row resume artifacts at ${root}`);
+        }
+      }
+    },
+    120_000,
+  );
+}
+
 test.skipIf(!tmuxAvailable())(
   "latest and picker resume preserve conversations beside incomplete session creation",
   async () => {
@@ -8661,14 +8829,18 @@ test.skipIf(!tmuxAvailable())(
       const historyPath = logOf(home, sessionId);
       const before = readFileSync(historyPath, "utf8");
       await active.sendText("/compact");
-      // Success is silent; publication, not a transcript notice, gates resume.
+      // Publication, not the transcript line, gates resume.
       await waitForCondition(() => readFileSync(historyPath, "utf8").includes('"kind":"compacted"'), "durable context checkpoint");
-      await active.waitForPane((pane) => hasEmptyComposer(pane) && !/preparing compaction|compacting|stopping compaction/.test(pane), TIMEOUT);
+      // The success line arrives as a queued notice just after the row clears.
+      await active.waitForPane((pane) =>
+        hasEmptyComposer(pane) &&
+        !/Compacting|Stopping compaction/.test(pane) &&
+        /Context compacted \((?:\d+h)?(?:\d+m)?\d+s\)/.test(pane), TIMEOUT);
       const compacted = readFileSync(historyPath, "utf8");
       expect(compacted.startsWith(before)).toBe(true);
       const records = compacted.trim().split("\n").map((line) => JSON.parse(line));
       expect(records.filter((record) => record.kind === "compacted")).toHaveLength(1);
-      expect(await active.captureFullScrollback()).not.toContain("Context compacted.");
+      expect(await active.captureFullScrollback()).toMatch(/Context compacted \((?:\d+h)?(?:\d+m)?\d+s\)/);
       // Plain turns have nothing to summarize, but the earlier message may set
       // a rule, so the one model call files it; the checkpoint keeps the
       // earlier message and reply word for word.
@@ -9150,14 +9322,7 @@ async function endFx(session: TmuxSession, signal: "SIGKILL" | "SIGHUP") {
   const pid = session.processPid();
   process.kill(pid, signal);
   const deadline = Date.now() + 10_000;
-  while (Date.now() < deadline) {
-    try {
-      process.kill(pid, 0);
-    } catch {
-      break;
-    }
-    await Bun.sleep(25);
-  }
+  while (Date.now() < deadline && processAlive(pid)) await Bun.sleep(25);
   await session.kill();
 }
 

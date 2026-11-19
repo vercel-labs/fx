@@ -445,7 +445,8 @@ options:
 the prompt may be passed as arguments or piped on stdin when no prompt args are given.
 TTY stdout uses the minimal transcript presentation; redirected stdout emits raw assistant markdown.
 operational progress and diagnostics are written to stderr. JSON \`output\` keeps accumulated assistant markdown; \`final_output\` contains only the completed final response, or an empty string when absent.
-JSON usage sums reported main-agent input_tokens and output_tokens, including with --no-save; unreported counts are null. cache_read_tokens and cache_write_tokens appear only when the provider reports them. nested usage and dollar spend are excluded.
+JSON usage sums reported main-agent input_tokens and output_tokens, including with --no-save; unreported counts are null. cache_read_tokens and cache_write_tokens appear only when the provider reports them. Subagent usage and dollar spend are excluded.
+JSON subagents appears only when a subagent did work in this request. It lists each one in the order it first ran, with its name, id, and usage in the same shape, counted for this request alone. fx session <session_id>/<name> reads one and prints the same id.
 --system replaces only the built-in base prompt for this request; tool, skill, project, and runtime context still apply.
 with --prompt-permissions, JSON and quiet requests may prompt on stderr only when stdin is a TTY.
 `;
@@ -903,6 +904,71 @@ describe("cli: status", () => {
         ).toBe(false);
         expect(gateway.requestCount()).toBe(0);
         expect(snapshotTree(home)).toEqual(validBefore);
+      } finally {
+        gateway.stop();
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "status, status --json and doctor name why fx skips a plain-http server of .mcp.json that is not local",
+    async () => {
+      const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-e2e-mcp-url-reason-")));
+      const gateway = startFakeGateway([]);
+      try {
+        const home = join(root, "home");
+        const workspace = join(root, "workspace");
+        mkdirSync(join(home, ".fx"), { recursive: true, mode: 0o700 });
+        mkdirSync(workspace);
+        writeFileSync(
+          join(workspace, ".mcp.json"),
+          JSON.stringify({
+            mcpServers: {
+              web: { type: "http", url: "http://example.com/mcp" },
+              odd: { type: "http", url: "not a url" },
+            },
+          }) + "\n",
+        );
+        const env = {
+          HOME: home,
+          AI_GATEWAY_API_KEY: "mcp-url-reason-key",
+          VERCEL_OIDC_TOKEN: undefined,
+          FX_DISABLE_KEYCHAIN: "1",
+          FX_AUTO_UPGRADE: "0",
+          FX_MODEL: FAKE_GATEWAY_MODEL,
+          FX_TEST_GATEWAY_CHAT_URL: gateway.chatUrl,
+          FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+        };
+        const statusText = await runFx(["status"], { cwd: workspace, env });
+        const statusJson = await runFx(["status", "--json"], { cwd: workspace, env });
+        const doctorText = await runFx(["doctor"], { cwd: workspace, env });
+        const doctorJson = await runFx(["doctor", "--json"], { cwd: workspace, env });
+
+        // The reason is the URL's own, so a person knows what to change. Another URL fault keeps the generic words.
+        const web = ".mcp.json server 'web' was skipped: fx uses plain http only for localhost, 127.0.0.1 and [::1]; use https.";
+        const odd = ".mcp.json server 'odd' was skipped: its \"url\" isn't valid.";
+        const fix = "\n               fix: fix .mcp.json, then run fx doctor again\n";
+
+        expect(statusText.code, statusText.stderr).toBe(0);
+        expect(statusText.stdout).toContain(`[status] mcp_configuration_issue=${web}\n`);
+        expect(statusText.stdout).toContain(`[status] mcp_configuration_issue=${odd}\n`);
+
+        expect(statusJson.code, statusJson.stderr).toBe(0);
+        expect(JSON.parse(statusJson.stdout).mcp.configuration_issues).toEqual([web, odd]);
+
+        expect(doctorText.code, doctorText.stderr).toBe(1);
+        expect(doctorText.stdout).toContain(`  \u2717 mcp_config ${web}${fix}`);
+        expect(doctorText.stdout).toContain(`  \u2717 mcp_config ${odd}${fix}`);
+
+        const doctorChecks = JSON.parse(doctorJson.stdout);
+        expect(doctorJson.code, doctorJson.stderr).toBe(1);
+        expect(doctorChecks.mcp.configuration_issues).toEqual([web, odd]);
+        expect(
+          doctorChecks.checks.filter((check: { name: string }) => check.name === "mcp_config").map((check: { detail: string }) => check.detail),
+        ).toEqual([web, odd]);
+        expect(gateway.requestCount()).toBe(0);
       } finally {
         gateway.stop();
         rmSync(root, { recursive: true, force: true });
@@ -3282,6 +3348,45 @@ describe("cli: missing durable home", () => {
 });
 
 describe("cli: sessions", () => {
+  test(
+    "fx sessions ls lists the same sessions as fx sessions",
+    async () => {
+      const home = mkdtempSync(join(tmpdir(), "fx-e2e-sessions-ls-"));
+      try {
+        const bare = await runFx(["sessions", "--json"], { env: { HOME: home } });
+        const explicit = await runFx(["sessions", "ls", "--json"], {
+          env: { HOME: home },
+        });
+        expect(bare.code).toBe(0);
+        expect(explicit.code).toBe(0);
+        expect(explicit.stderr).toBe("");
+        const listed = JSON.parse(explicit.stdout);
+        expect(listed).toMatchObject({ kind: "sessions", count: 0, sessions: [] });
+        expect(listed).toEqual(JSON.parse(bare.stdout));
+      } finally {
+        rmSync(home, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "fx sessions --help lists ls and convert",
+    async () => {
+      const home = mkdtempSync(join(tmpdir(), "fx-e2e-sessions-help-"));
+      try {
+        const help = await runFx(["sessions", "--help"], { env: { HOME: home } });
+        expect(help.code).toBe(0);
+        expect(help.stdout).toContain("sessions [ls]");
+        expect(help.stdout).toContain("  ls");
+        expect(help.stdout).toContain("  convert");
+      } finally {
+        rmSync(home, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
   test(
     "fx sessions --json returns valid sessions JSON",
     async () => {
@@ -6702,6 +6807,7 @@ describe("cli: completion", () => {
     [["fx", "ask", "--permission-mode", ""], "ask auto full-access"],
     [["fx", "--model", "gpt-5", "ask", "--permission-m"], "--permission-mode"],
     [["fx", "mcp", ""], "list show add remove login logout approve reject call"],
+    [["fx", "sessions", ""], "ls convert"],
     [["fx", "mcp", "add", "--g"], "--global"],
     [["fx", "usage", "--period", ""], "today 7d month"],
     [["fx", "login", ""], "vercel codex grok"],

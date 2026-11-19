@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
+import { processAlive as processExists } from "./process-alive";
 import {
   chmodSync,
   existsSync,
@@ -768,10 +769,9 @@ while :; do sleep 1; done
       ]);
 
       await waitForTrace(tracePath, "finish processing queued=0", TIMEOUT);
-      await session.waitForText(
-        "Cancelled ./hold-workspace-cancel.sh · what can fx do differently?",
-        TIMEOUT,
-      );
+      // The command's row names it once its cancellation lands; the notice
+      // under the row names no command.
+      await session.waitForText("● Cancelled ./hold-workspace-cancel.sh", TIMEOUT);
       await session.sendText("/workspace list");
       await session.waitForText("available=false active=false", TIMEOUT);
       expect(countOccurrences(readTrace(tracePath), "file index generation started")).toBe(
@@ -1129,13 +1129,4 @@ async function waitForCondition(
 
 function countOccurrences(text: string, needle: string): number {
   return text.split(needle).length - 1;
-}
-
-function processExists(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch {
-    return false;
-  }
 }

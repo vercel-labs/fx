@@ -3,7 +3,7 @@
 // repeat one task, a reason line under a failed call, and a recap on the turn
 // summary.
 import { afterEach, expect, test } from "bun:test";
-import { rmSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { FX_BIN } from "../evals/eval-helpers";
 import {
@@ -66,6 +66,61 @@ const REPEATS: StoryStep[] = [
   { at: 4, calls: [{ name: "read_file", input: { path: "desktop/src/main.ts", start_line: 6, line_count: 5 } }] },
   { at: 5, calls: [{ name: "read_file", input: { path: "desktop/src/main.ts", start_line: 11, line_count: 6 } }] },
   { at: 6, text: "The tests pass on the third run." },
+];
+
+// Two shell requests the tool refuses before running anything, as a model
+// sends them, then the fixed request, which runs the same steps.
+const REFUSED_REQUESTS: StoryStep[] = [
+  {
+    at: 0,
+    calls: [{
+      name: "shell",
+      input: {
+        command: "ls -l . 2>/dev/null && printf ok | head -1",
+        profile: "clean",
+        tty: true,
+        shell: { kind: "executable", path: "/bin/sh", clean_start: true },
+      },
+    }],
+  },
+  {
+    at: 1,
+    calls: [{
+      name: "shell",
+      input: {
+        command: "ls -l .; printf ok | head -1",
+        shell: { kind: "executable", path: "/bin/sh", clean_start: true },
+      },
+    }],
+  },
+  { at: 2, calls: [sh("ls -l .; printf ok | head -1")] },
+  { at: 3, text: "The folder is listed." },
+];
+
+// A turn that ends on a request the shell refused, which the model never
+// fixed.
+const REFUSED_LAST: StoryStep[] = [
+  { at: 0, calls: [sh("printf done")] },
+  { at: 1, calls: [REFUSED_REQUESTS[0].calls![0]] },
+  { at: 2, text: "I could not list the folder." },
+];
+
+// Two commands fail, the last of them too.
+const LAST_TWO_FAILED: StoryStep[] = [
+  { at: 0, calls: [sh("printf ok"), sh("ls missing-one"), sh("cat missing-two")] },
+  { at: 3, text: "Both files are missing." },
+];
+
+// A command whose here-document holds an apostrophe, which is no shell quote.
+const HERE_DOCUMENT: StoryStep[] = [
+  { at: 0, calls: [sh("cat > notes.md <<'EOF'\nThe model's notes\nEOF\nwc -l notes.md")] },
+  { at: 1, text: "The notes are saved." },
+];
+
+// A command that prints code naming an error, then fails on its own.
+const PRINTED_CODE_THEN_FAILED: StoryStep[] = [
+  { at: 0, calls: [sh("printf 'const error_code = 1;\\nroot.get(\"error\")\\n'; ls missing-file")] },
+  { at: 1, text: "The file is missing." },
 ];
 
 const SUBAGENTS: StoryStep[] = [
@@ -149,7 +204,7 @@ async function runStory(
     width?: number;
     height?: number;
     settings?: Record<string, unknown>;
-    childReply?: (task: string) => string;
+    childReply?: (task: string) => string | Promise<string>;
   },
 ) {
   const root = createStoryRoot(options.settings);
@@ -200,7 +255,7 @@ test.skipIf(!tmuxAvailable())(
     // its own, with the error's line after it.
     expect(treeRows(checks)).toEqual([
       "├ ran sh check.sh",
-      expect.stringMatching(/^└ .*sh build\.sh · src\/main\.ts:14:15 - error TS2554: Expected 1 arguments, but got 3\.$/),
+      expect.stringMatching(/^└ .*sh build\.sh · Expected 1 arguments, but got 3\.$/),
     ]);
     expect(checks.some((line) => line.includes("✗ exit"))).toBe(false);
 
@@ -285,6 +340,9 @@ test.skipIf(!tmuxAvailable())(
       expect(message).toBeGreaterThan(0);
       // The first read keeps its own row, without the later one.
       expect(lines.slice(0, message)).toContain("├ read README.md");
+      // The failed edit names its file, also when the saved session is
+      // read back.
+      expect(lines.slice(0, message)).toContain("└ Couldn't edit README.md");
       expect(lines.some((line) => line.includes("· 2 parts"))).toBe(false);
       // The later read shows under the message that asked for it.
       expect(lines.slice(message + 1)).toContain("● read README.md");
@@ -304,6 +362,310 @@ test.skipIf(!tmuxAvailable())(
     sessions.push(resumed);
     await resumed.waitForText("The readme says hello.", TIMEOUT);
     expectReadUnderMessage(paneLines(await resumed.waitForComposer(TIMEOUT)));
+  },
+  TIMEOUT * 3,
+);
+
+test.skipIf(!tmuxAvailable())(
+  "shell requests refused before they ran read as the model's mistake, also after resume",
+  async () => {
+    const { root, gateway, session, pane } = await runStory(REFUSED_REQUESTS, {
+      prompt: "list the folder",
+      finalText: "The folder is listed.",
+    });
+    const expectFixedRequest = (lines: string[]) => {
+      // The fixed request says which try it was. The refused ones never ran,
+      // so they get no row, no failure count, and no "run" of the command.
+      expect(lines).toContain("● Ran ls, printf · 3rd try ✓");
+      expect(lines.some((line) => /Failed|invalid field|Couldn't run|passed on|failed/.test(line))).toBe(false);
+    };
+    expectFixedRequest(paneLines(pane));
+
+    await session.kill();
+    sessions.splice(sessions.indexOf(session), 1);
+    const resumed = await TmuxSession.create({
+      cmd: `${FX_BIN} --resume last`,
+      cwd: root.workspace,
+      env: storyEnv(root, gateway),
+      width: 110,
+      height: 60,
+    });
+    sessions.push(resumed);
+    await resumed.waitForText("The folder is listed.", TIMEOUT);
+    expectFixedRequest(paneLines(await resumed.waitForComposer(TIMEOUT)));
+  },
+  TIMEOUT * 3,
+);
+
+test.skipIf(!tmuxAvailable())(
+  "a header's failure count takes in the last command, also after resume",
+  async () => {
+    const { root, gateway, session, pane } = await runStory(LAST_TWO_FAILED, {
+      prompt: "read both files",
+      finalText: "Both files are missing.",
+    });
+    const expectCount = (lines: string[]) => {
+      // The mark is the last command's; the count is every failed row.
+      const header = lines.find((line) => line.startsWith("● ") && line.includes("✗"));
+      expect(header).toBeDefined();
+      expect(header!).toEndWith("✗ · 2 failed");
+      expect(lines.filter((line) => /^[├└] (Exited|Couldn't)/.test(line))).toHaveLength(2);
+    };
+    expectCount(paneLines(pane));
+
+    await session.kill();
+    sessions.splice(sessions.indexOf(session), 1);
+    const resumed = await TmuxSession.create({
+      cmd: `${FX_BIN} --resume last`,
+      cwd: root.workspace,
+      env: storyEnv(root, gateway),
+      width: 110,
+      height: 60,
+    });
+    sessions.push(resumed);
+    await resumed.waitForText("Both files are missing.", TIMEOUT);
+    expectCount(paneLines(await resumed.waitForComposer(TIMEOUT)));
+  },
+  TIMEOUT * 3,
+);
+
+test.skipIf(!tmuxAvailable())(
+  "a refused shell request the turn ended on says why, also after resume",
+  async () => {
+    const { root, gateway, session, pane } = await runStory(REFUSED_LAST, {
+      prompt: "list the folder",
+      finalText: "I could not list the folder.",
+    });
+    const expectReason = (lines: string[]) => {
+      // Like any failure a turn ends on, its row says why, as core counted
+      // it, but not the error the model got.
+      expect(lines).toContain("└ Couldn't run ls, printf · 2 invalid fields");
+      expect(lines.some((line) => /Choose either|Failed /.test(line))).toBe(false);
+    };
+    expectReason(paneLines(pane));
+
+    await session.kill();
+    sessions.splice(sessions.indexOf(session), 1);
+    const resumed = await TmuxSession.create({
+      cmd: `${FX_BIN} --resume last`,
+      cwd: root.workspace,
+      env: storyEnv(root, gateway),
+      width: 110,
+      height: 60,
+    });
+    sessions.push(resumed);
+    await resumed.waitForText("I could not list the folder.", TIMEOUT);
+    expectReason(paneLines(await resumed.waitForComposer(TIMEOUT)));
+  },
+  TIMEOUT * 3,
+);
+
+test.skipIf(!tmuxAvailable())(
+  "a command with a here-document shows its steps, also after resume",
+  async () => {
+    const { root, gateway, session, pane } = await runStory(HERE_DOCUMENT, {
+      prompt: "save the notes",
+      finalText: "The notes are saved.",
+    });
+    const expectSteps = (lines: string[]) => {
+      // The document's text is not shell words, so the row shows the steps.
+      expect(lines).toContain("● Ran cat, wc ✓");
+      expect(lines.some((line) => line.includes("model's") || line.includes("<<"))).toBe(false);
+    };
+    expectSteps(paneLines(pane));
+
+    await session.kill();
+    sessions.splice(sessions.indexOf(session), 1);
+    const resumed = await TmuxSession.create({
+      cmd: `${FX_BIN} --resume last`,
+      cwd: root.workspace,
+      env: storyEnv(root, gateway),
+      width: 110,
+      height: 60,
+    });
+    sessions.push(resumed);
+    await resumed.waitForText("The notes are saved.", TIMEOUT);
+    expectSteps(paneLines(await resumed.waitForComposer(TIMEOUT)));
+  },
+  TIMEOUT * 3,
+);
+
+test.skipIf(!tmuxAvailable())(
+  "a failed command says the error it reported, not code it printed",
+  async () => {
+    const { pane } = await runStory(PRINTED_CODE_THEN_FAILED, {
+      prompt: "check the file",
+      finalText: "The file is missing.",
+    });
+    const lines = paneLines(pane);
+    // The reason is ls's own message, not a printed line that names "error",
+    // without the words that say who spoke, and at most 40 columns.
+    const row = lines.find((line) => /^● Exited \d+ printf, ls · /.test(line));
+    expect(row).toBeDefined();
+    const reason = row!.replace(/^● Exited \d+ printf, ls · /, "").replace(/ ✗$/, "");
+    expect(reason).toMatch(/^(No such file or directory|cannot access 'missing-file': No such f…)$/);
+    expect([...reason].length).toBeLessThanOrEqual(40);
+    expect(lines.some((line) => line.includes("error_code") || line.includes('get("error")'))).toBe(false);
+  },
+  TIMEOUT * 2,
+);
+
+test.skipIf(!tmuxAvailable())(
+  "a second message to an agent joins its row while the message streams",
+  async () => {
+    const encoder = new TextEncoder();
+    let timer: ReturnType<typeof setInterval> | undefined;
+    let sendRest: (() => void) | undefined;
+    const message = `${CHILD_MARKER} Look at the window change too.`;
+    const held = () =>
+      new Response(
+        new ReadableStream<Uint8Array>({
+          start(controller) {
+            const send = (event: object) => controller.enqueue(encoder.encode(`data: ${JSON.stringify(event)}\n\n`));
+            send({ type: "tool-input-start", id: "second_message", toolName: "subagent" });
+            // The agent is whole; its message is not.
+            send({ type: "tool-input-delta", id: "second_message", delta: '{"action":"message","agent":"reviewer","message":"' });
+            timer = setInterval(() => controller.enqueue(encoder.encode(": hold-message\n\n")), 50);
+            sendRest = () => {
+              clearInterval(timer);
+              send({ type: "tool-input-delta", id: "second_message", delta: `${JSON.stringify(message).slice(1)}}` });
+              send({ type: "tool-input-end", id: "second_message" });
+              send({ type: "tool-call", toolCallId: "second_message", toolName: "subagent", input: { action: "message", agent: "reviewer", message } });
+              send({ type: "finish", finishReason: { unified: "tool-calls", raw: "tool-calls" } });
+              controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+              controller.close();
+            };
+          },
+          cancel() {
+            clearInterval(timer);
+          },
+        }),
+        { headers: { "content-type": "text/event-stream" } },
+      );
+    const steps: StoryStep[] = [
+      { at: 0, calls: [{ name: "subagent", input: { action: "message", agent: "reviewer", message: `${CHILD_MARKER} Review the createWindow change.` } }] },
+      { at: 1, calls: [{ name: "read_file", input: { path: "desktop/src/main.ts" } }] },
+      { at: 2, response: held },
+      { at: 3, text: "Asked the reviewer twice." },
+    ];
+    const root = createStoryRoot();
+    roots.push(root);
+    const gateway = startStoryGateway(steps, () => "Reviewed.");
+    gateways.push(gateway);
+    const session = await TmuxSession.create({ cwd: root.workspace, env: storyEnv(root, gateway), width: 110, height: 60 });
+    sessions.push(session);
+    await session.waitForComposer();
+    await session.sendText("ask the reviewer twice");
+    const rowsOf = (pane: string) => paneLines(pane).filter((line) => /^(●|├|└) /.test(line));
+    await session.waitForText("Read main.ts", TIMEOUT);
+    // While the second message streams, it joins the reviewer's row at once
+    // instead of showing a row of its own that folds into it later, so the
+    // group's rows never go down.
+    const frames: string[][] = [];
+    for (let i = 0; i < 15; i += 1) {
+      frames.push(rowsOf(await session.capturePane()));
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    sendRest?.();
+    for (let i = 0; i < 200; i += 1) {
+      const pane = await session.capturePane();
+      frames.push(rowsOf(pane));
+      if (pane.includes("Asked the reviewer twice.")) break;
+      await new Promise((resolve) => setTimeout(resolve, 30));
+    }
+    // The first group's tree rows, which sit right under its header.
+    const firstGroupRows = (frame: string[]) => {
+      const start = frame.findIndex((row) => row.startsWith("● "));
+      const rows: string[] = [];
+      for (const row of frame.slice(start + 1)) {
+        if (!/^(├|└) /.test(row)) break;
+        rows.push(row);
+      }
+      return rows;
+    };
+    for (let i = 1; i < frames.length; i += 1) {
+      expect(firstGroupRows(frames[i]).length).toBeGreaterThanOrEqual(firstGroupRows(frames[i - 1]).length);
+    }
+    expect(frames.every((frame) => frame.filter((row) => /^(├|└) .*reviewer/.test(row)).length <= 1)).toBe(true);
+  },
+  TIMEOUT * 2,
+);
+
+test.skipIf(!tmuxAvailable())(
+  "a report that joins a turn after its calls keeps a line of its own, also after resume",
+  async () => {
+    const encoder = new TextEncoder();
+    let timer: ReturnType<typeof setInterval> | undefined;
+    let sendRead: (() => void) | undefined;
+    let readHeld = () => {};
+    const readStarted = new Promise<void>((resolve) => (readHeld = resolve));
+    // The read's reply waits until the reviewer's report has joined the
+    // open turn, so the turn takes the report right after the read.
+    const heldRead = () =>
+      new Response(
+        new ReadableStream<Uint8Array>({
+          start(controller) {
+            const send = (event: object) => controller.enqueue(encoder.encode(`data: ${JSON.stringify(event)}\n\n`));
+            timer = setInterval(() => controller.enqueue(encoder.encode(": hold-read\n\n")), 50);
+            sendRead = () => {
+              clearInterval(timer);
+              send({ type: "tool-call", toolCallId: "held_read", toolName: "read_file", input: { path: "desktop/src/main.ts" } });
+              send({ type: "finish", finishReason: { unified: "tool-calls", raw: "tool-calls" } });
+              controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+              controller.close();
+            };
+            readHeld();
+          },
+          cancel() {
+            clearInterval(timer);
+          },
+        }),
+        { headers: { "content-type": "text/event-stream" } },
+      );
+    const steps: StoryStep[] = [
+      { at: 0, calls: [{ name: "subagent", input: { action: "message", agent: "reviewer", message: `${CHILD_MARKER} Review the createWindow change.` } }] },
+      { at: 1, response: heldRead },
+      { at: 2, text: "The reviewer is done." },
+    ];
+    const root = createStoryRoot();
+    roots.push(root);
+    // The reviewer answers once main's read is open, so its report cannot
+    // come before the read.
+    const gateway = startStoryGateway(steps, () => readStarted.then(() => "Reviewed."));
+    gateways.push(gateway);
+    const tracePath = join(root.root, "trace.log");
+    const trace = () => existsSync(tracePath) ? readFileSync(tracePath, "utf8") : "";
+    const env = { ...storyEnv(root, gateway), FX_TRACE_LOG: tracePath, FX_TRACE_SCOPES: "worker" };
+    const session = await TmuxSession.create({ cwd: root.workspace, env, width: 110, height: 60 });
+    sessions.push(session);
+    await session.waitForComposer();
+    await session.sendText("ask the reviewer");
+    await session.waitForPane(() => /event=mail_posted .*mail=report delivery=joined/.test(trace()), TIMEOUT);
+    sendRead!();
+    await session.waitForText("The reviewer is done.", TIMEOUT);
+
+    const expectOwnLine = (lines: string[]) => {
+      // Main's calls share a group; the report is a line of its own after
+      // it, not a row of that group.
+      const calls = treeRows(group(lines, /^● /));
+      expect(calls).toEqual(["├ Messaged reviewer", "└ Read main.ts"]);
+      expect(lines.filter((line) => /^● reviewer finished\b/.test(line))).toHaveLength(1);
+      expect(lines.some((line) => /^(├|└) reviewer finished\b/.test(line))).toBe(false);
+    };
+    expectOwnLine(paneLines(await session.waitForComposer(TIMEOUT)));
+
+    await session.kill();
+    sessions.splice(sessions.indexOf(session), 1);
+    const resumed = await TmuxSession.create({
+      cmd: `${FX_BIN} --resume last`,
+      cwd: root.workspace,
+      env: storyEnv(root, gateway),
+      width: 110,
+      height: 60,
+    });
+    sessions.push(resumed);
+    await resumed.waitForText("The reviewer is done.", TIMEOUT);
+    expectOwnLine(paneLines(await resumed.waitForComposer(TIMEOUT)));
   },
   TIMEOUT * 3,
 );
@@ -430,7 +792,9 @@ test.skipIf(!tmuxAvailable())(
     // there, clipped to the width.
     const row = lines.find((line) => /^● .*sh hostile\.sh · /.test(line));
     expect(row).toBeDefined();
-    expect(row!).toContain(" · error: xxxx");
+    // The reason is the error's message alone, without its "error:".
+    expect(row!).toContain(" · xxxx");
+    expect(row!).not.toContain("error:");
     expect(row!).toEndWith("…");
     expect([...row!].length).toBeLessThanOrEqual(width);
     expect(lines.some((line) => line.startsWith("  ✗ "))).toBe(false);

@@ -198,7 +198,7 @@ const subagent_properties = [_]model_tool_schema.Property{
     .{ .name = "message", .json_type = .string, .description = "For message: its task, or a message for its turn." },
     .{ .name = "instructions", .json_type = .string, .description = "For message: system instructions for this child." },
     .{ .name = "report", .json_type = .string, .shape = &.{ .enum_values = &.{ "final", "every_turn", "never" } }, .description = "For message: when it reports back. final, the default, when your work ends; every_turn after each turn; never only on failure." },
-    .{ .name = "model", .json_type = .string, .description = "Model ID for a new child. Defaults to yours." },
+    .{ .name = "model", .json_type = .string, .description = "Exact model ID for a new child. Run `fx models ls --json` when unsure. Defaults to yours." },
     .{ .name = "effort", .json_type = .string, .description = "Reasoning effort for a new child." },
     .{ .name = "profile", .json_type = .string, .description = "Agent profile for a new child, from the subagent guidance. Without one, it starts in the main profile." },
 };
@@ -847,9 +847,9 @@ test "built-in model-facing tool contract stays byte exact" {
     const actual_hex = std.fmt.bytesToHex(hasher.finalResult(), .lower);
     try std.testing.expectEqualStrings(
         if (builtin.target.os.tag.isDarwin())
-            "c6a1464fbb49bf90da21ff1539ec6c68ff7c53b53e397c3faa11f5f4dbe51d55"
+            "a84217167d9345c518d346ab58d3e117b92ac636b5272af02720011c6aa99a99"
         else
-            "cc9451614ad95340ce72782bc61c2dd90a75ea5e3e8d114727d7e494770dd865",
+            "8b6048d8bf6145c7a37a2bc376d13d4b2cfae304b179a2bd1d2e464a138d87a1",
         &actual_hex,
     );
 }
@@ -1280,7 +1280,7 @@ test "built-in subagent owns product metadata schema and callbacks" {
     // Creation-time routing overrides are advertised on both actions.
     try std.testing.expect(std.mem.find(u8, schema_json, "\"model\":") != null);
     try std.testing.expect(std.mem.find(u8, schema_json, "\"effort\":") != null);
-    try std.testing.expect(std.mem.find(u8, schema_json, "Model ID for a new child. Defaults to yours.") != null);
+    try std.testing.expect(std.mem.find(u8, schema_json, "Exact model ID for a new child. Run `fx models ls --json` when unsure. Defaults to yours.") != null);
     for ([_][]const u8{
         "\"command\":",
         "\"relationship\":",

@@ -9,6 +9,7 @@ const host = @import("../hosts/host.zig");
 const host_target = @import("../hosts/target.zig");
 const login_flow = @import("login_flow.zig");
 const pending_revocation = @import("pending_revocation.zig");
+const mcp_kept_sign_outs = @import("../mcp_host/kept_sign_outs.zig");
 const oauth_session = @import("oauth_session.zig");
 const oauth = @import("oauth.zig");
 const model_provider = @import("../config/model_provider.zig");
@@ -35,6 +36,11 @@ pub const CredentialRefreshMode = enum {
     /// Reads the stored credential again even when the request path verified
     /// it recently, as after the user signs in. Refreshes only an expired one.
     reload,
+    /// Reads the stored credential as saved and never calls the issuer, as a
+    /// request that waits for a sign-in does to notice a login another fx
+    /// process saved. With `rejected_token`, a stored credential that still
+    /// holds that token counts as none.
+    stored,
 };
 
 const credential_source_order = [_]credentials.Source{
@@ -229,7 +235,8 @@ fn resetRequestPathCredentialVerification() void {
 /// `rejected_token` is the access token the provider just answered 401 for.
 /// With `.force` the saved fx, Codex, or Grok login then rotates only while
 /// it still holds that token, so a login another fx already refreshed is used
-/// as it is (`oauth.rejectedLoginRotates`).
+/// as it is (`oauth.rejectedLoginRotates`). With `.stored` a saved login that
+/// still holds it is returned as none.
 pub fn refreshCredentialForAccount(
     transport: oauth_transport.Provider,
     alloc: Allocator,
@@ -249,6 +256,10 @@ pub fn refreshCredentialForAccount(
         return err;
     }) orelse return null;
     errdefer credential.deinit(alloc);
+    if (mode == .stored) if (rejected_token) |rejected| if (std.mem.eql(u8, credential.token, rejected)) {
+        credential.deinit(alloc);
+        return null;
+    };
     if (expected_account_id) |expected| {
         const actual = credential.accountId() orelse {
             debug_trace.logf("auth", "credential refresh rejected stage=account_missing source={t}", .{source});
@@ -259,7 +270,8 @@ pub fn refreshCredentialForAccount(
             return error.ChatGptAccountChanged;
         }
     }
-    noteRequestPathCredentialVerified(source);
+    // A stored read proves nothing about the login; only a send does.
+    if (mode != .stored) noteRequestPathCredentialVerified(source);
     return credential;
 }
 
@@ -346,14 +358,17 @@ fn loadCredentialForRefresh(
         .fx_login => switch (mode) {
             .if_needed, .reload => credentials.loadFxLoginCredential(alloc, transport),
             .force => credentials.refreshFxLoginCredential(alloc, transport, rejected_token),
+            .stored => credentials.loadStoredSource(alloc, source),
         },
         .chatgpt_subscription => switch (mode) {
             .if_needed, .reload => credentials.loadSource(alloc, transport, host.unavailable_secret_store, source),
             .force => credentials.refreshChatGptCredential(alloc, transport, rejected_token),
+            .stored => credentials.loadStoredSource(alloc, source),
         },
         .grok_subscription => switch (mode) {
             .if_needed, .reload => credentials.loadSource(alloc, transport, host.unavailable_secret_store, source),
             .force => credentials.refreshGrokCredential(alloc, transport, rejected_token),
+            .stored => credentials.loadStoredSource(alloc, source),
         },
         else => null,
     };
@@ -1091,12 +1106,15 @@ const KeptSignOutRetryTask = struct {
         const codex = chatgpt_oauth.retryKeptSignOuts(alloc, transport.provider(), null);
         const grok = grok_oauth.retryKeptSignOuts(alloc, transport.provider(), null);
         const fx_login = login_flow.retryKeptSignOuts(alloc, transport.provider(), null);
-        if (codex.revoked + grok.revoked + fx_login.revoked == 0 and !(codex.failed or grok.failed or fx_login.failed)) return;
-        debug_trace.logf("auth", "kept sign-outs retried at start codex={d} grok={d} fx_login={d} failed={}", .{
+        const mcp: pending_revocation.RetryOutcome = if (io_mod.homeDir()) |home| mcp_kept_sign_outs.retry(alloc, home, transport.provider(), null) else .{};
+        const failed = codex.failed or grok.failed or fx_login.failed or mcp.failed;
+        if (codex.revoked + grok.revoked + fx_login.revoked + mcp.revoked == 0 and !failed) return;
+        debug_trace.logf("auth", "kept sign-outs retried at start codex={d} grok={d} fx_login={d} mcp={d} failed={}", .{
             codex.revoked,
             grok.revoked,
             fx_login.revoked,
-            codex.failed or grok.failed or fx_login.failed,
+            mcp.revoked,
+            failed,
         });
     }
 
@@ -4125,6 +4143,30 @@ test "a background request reads the stored sign-in without a refresh or a reque
     var replacement = (try storedReplacement(alloc, sign_in, "launch-token")).?;
     defer replacement.deinit(alloc);
     try std.testing.expectEqualStrings("stored-token", replacement.token);
+    try std.testing.expect(!requestPathCredentialVerifiedRecently(.fx_login));
+}
+
+test "a stored read for a request waiting for a sign-in finds only a login other than the refused one" {
+    const alloc = std.testing.allocator;
+    var home: stored_login_testing.StoredLoginHome = undefined;
+    try home.install(alloc);
+    defer home.deinit();
+    resetRequestPathCredentialVerification();
+    defer resetRequestPathCredentialVerification();
+    // No transport exists here, so a refresh would fail.
+    const transport = oauth_transport.unavailable_provider;
+
+    // Nothing stored, as after another fx process removed the login.
+    try std.testing.expect((try refreshCredentialForAccount(transport, alloc, .fx_login, .stored, null, "refused-token")) == null);
+    // The store still holds the refused token.
+    try home.store("refused-token", "team-id", stored_login_testing.far_future_ms);
+    try std.testing.expect((try refreshCredentialForAccount(transport, alloc, .fx_login, .stored, null, "refused-token")) == null);
+    // Another fx process signed in, and its login is read as saved, even
+    // expired, without a refresh or a request-path proof.
+    try home.store("another-fx-token", "team-id", 1);
+    var found = (try refreshCredentialForAccount(transport, alloc, .fx_login, .stored, null, "refused-token")).?;
+    defer found.deinit(alloc);
+    try std.testing.expectEqualStrings("another-fx-token", found.token);
     try std.testing.expect(!requestPathCredentialVerifiedRecently(.fx_login));
 }
 

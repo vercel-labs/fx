@@ -16220,6 +16220,29 @@ test "recorded tool finality does not depend on the current turn watermark" {
     }
 }
 
+test "a provisional call's detail is streaming until the call starts" {
+    const alloc = std.testing.allocator;
+    var runtime = TranscriptRuntime{ .layout = transcriptTestLayout(88, 24, 20) };
+    defer runtime.deinit(alloc);
+    const id = types.ToolLifecycleId{ .turn_id = 1, .call_id = "streaming-read" };
+    _ = try runtime.applyToolLifecycle(alloc, .{ .provisional = .{
+        .id = id,
+        .presentation_group_id = null,
+        .tool_name = "read_file",
+        .activity_kind = .read,
+    } });
+    try std.testing.expectEqual(@as(usize, 1), runtime.notebook.tool_details.items.len);
+    try std.testing.expect(runtime.notebook.tool_details.items[0].streaming);
+    _ = try runtime.applyToolLifecycle(alloc, .{ .authoritative_started = .{
+        .id = id,
+        .reconciles_provisional_call_id = null,
+        .tool_name = "read_file",
+        .activity_kind = .read,
+    } });
+    try std.testing.expectEqual(@as(usize, 1), runtime.notebook.tool_details.items.len);
+    try std.testing.expect(!runtime.notebook.tool_details.items[0].streaming);
+}
+
 test "recorded tool finality stays independent of a live turn with the same number" {
     const alloc = std.testing.allocator;
     var runtime = TranscriptRuntime{ .layout = transcriptTestLayout(88, 24, 20) };

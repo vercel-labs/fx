@@ -1,4 +1,5 @@
 import { afterEach, expect, test } from "bun:test";
+import { processAlive } from "./process-alive";
 import { execFileSync } from "node:child_process";
 import {
   existsSync,
@@ -180,18 +181,6 @@ function askEnv(
     FX_TRACE_LOG: fixture.tracePath,
     FX_TRACE_SCOPES: "shell,terminal,terminal_client,terminal_host,terminal_store,shutdown",
   };
-}
-
-function processAlive(pid: number): boolean {
-  // Signal 0 to pid 0 or below reaches a whole process group, which is
-  // always alive, so only a real pid can be checked.
-  if (!(pid > 0)) throw new Error(`not a process id: ${pid}`);
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch {
-    return false;
-  }
 }
 
 /** Pids of processes whose command line contains `fragment`. */
@@ -445,15 +434,8 @@ test.skipIf(!tmuxAvailable())(
     const pid = Number(readFileSync(pidPath, "utf8"));
     expect(Number.isSafeInteger(pid) && pid > 0).toBe(true);
     const deadline = Date.now() + 3_000;
-    while (Date.now() < deadline) {
-      try {
-        process.kill(pid, 0);
-      } catch {
-        break;
-      }
-      await Bun.sleep(25);
-    }
-    expect(() => process.kill(pid, 0)).toThrow();
+    while (Date.now() < deadline && processAlive(pid)) await Bun.sleep(25);
+    expect(processAlive(pid)).toBe(false);
     expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
   },
   TIMEOUT,

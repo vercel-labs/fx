@@ -1148,11 +1148,10 @@ pub const State = struct {
     pub fn snapshotToolNames(
         self: *State,
         alloc: Allocator,
-        permission_rules: types.PermissionRuleSet,
     ) ![][]u8 {
         if (self.leaseHost()) |l| {
             defer l.deinit();
-            return l.host.catalog.snapshotToolNames(alloc, permission_rules);
+            return l.host.catalog.snapshotToolNames(alloc);
         }
         return alloc.alloc([]u8, 0);
     }
@@ -1162,11 +1161,10 @@ pub const State = struct {
         alloc: Allocator,
         owner_id: []const u8,
         parent_id: []const u8,
-        permission_rules: types.PermissionRuleSet,
     ) !?mcp_access.View {
         if (self.leaseHost()) |l| {
             defer l.deinit();
-            return try l.host.catalog.snapshotAccessView(alloc, owner_id, parent_id, permission_rules);
+            return try l.host.catalog.snapshotAccessView(alloc, owner_id, parent_id);
         }
         return null;
     }

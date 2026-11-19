@@ -16,6 +16,7 @@ const core_types = @import("../../core/shared/types.zig");
 const tool_dispatch = @import("../../core/tooling/tool_dispatch.zig");
 const mcp_call_capability = @import("../../core/tooling/mcp_call_capability.zig");
 const capability_retrieval = @import("../../core/tooling/capability_retrieval.zig");
+const tool_mcp_runtime = @import("../../core/tooling/tool_mcp_runtime.zig");
 const lexical_relevance = @import("../../core/shared/lexical_relevance.zig");
 const capability_search_impl = @import("capability_search.zig");
 const skill_impl = @import("../skills/skill.zig");
@@ -217,7 +218,7 @@ fn open(ctx: tool_dispatch.DispatchContext, input: *const Input) tool_dispatch.D
     if (input.kind) |kind| return switch (kind) {
         .skill => openSkillOrNothing(ctx, input),
         .tool => (try openTool(ctx, input)) orelse nothingNamed(ctx, "tool", input.target),
-        .mcp_server => (try openServer(ctx, input)) orelse nothingNamed(ctx, "MCP server", input.target),
+        .mcp_server => (try openServer(ctx, input)) orelse (try changedServer(ctx, input.target)) orelse nothingNamed(ctx, "MCP server", input.target),
     };
     if (hasSkill(ctx, input.target)) {
         if (alsoListedAs(ctx, input.target)) |other| return .{ .failure = try ctx.allocator.print(
@@ -228,6 +229,7 @@ fn open(ctx: tool_dispatch.DispatchContext, input: *const Input) tool_dispatch.D
     }
     if (try openTool(ctx, input)) |result| return result;
     if (try openServer(ctx, input)) |result| return result;
+    if (try changedServer(ctx, input.target)) |result| return result;
     // A skill installed since the turn started isn't in the catalog yet;
     // reading it by name finds it.
     return openSkillOrNothing(ctx, input);
@@ -240,6 +242,21 @@ fn alsoListedAs(ctx: tool_dispatch.DispatchContext, name: []const u8) ?toolbox_c
     for (ctx.toolbox_mcp_servers) |server| if (std.mem.eql(u8, server, name)) return .mcp_server;
     for (ctx.toolbox_behind) |tool| if (std.mem.eql(u8, tool, name)) return .tool;
     return null;
+}
+
+/// What `toolbox {open}` says of a server its menu lists when a subagent's
+/// view of the session's servers has changed under it: that, and not that no
+/// such server is in the menu. Null for any other name, or any other view.
+fn changedServer(ctx: tool_dispatch.DispatchContext, name: []const u8) Allocator.Error!?tool_dispatch.ToolResult {
+    if (!tool_dispatch.mcpViewChanged(ctx)) return null;
+    const listed = for (ctx.toolbox_mcp_servers) |server| {
+        if (std.mem.eql(u8, server, name)) break true;
+    } else false;
+    if (!listed) return null;
+    return .{ .failure = try ctx.allocator.print(
+        "MCP server {f} is not available to this work: {s}",
+        .{ model_context_encoding.scalar(name), tool_mcp_runtime.servers_changed_reason },
+    ) };
 }
 
 fn nothingNamed(ctx: tool_dispatch.DispatchContext, noun: []const u8, name: []const u8) Allocator.Error!tool_dispatch.ToolResult {
