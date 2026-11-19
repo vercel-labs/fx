@@ -215,7 +215,7 @@ async function fixture(trigger: Trigger, outcome: Outcome = "success", longResum
   }
   try {
     for (let turn = 1; turn <= seedTurns; turn++) {
-      const reply = await cli(["ask", "--json", "--auto", ...(sessionId ? ["--resume", sessionId] : []), `Seed ordinary historical turn ${turn}.`], "Reading seed-notes.txt\n");
+      const reply = await cli(["ask", "--json", "--auto", ...(sessionId ? ["--resume", sessionId] : []), `Seed ordinary historical turn ${turn}.`], "reading seed-notes.txt\n");
       if (sessionId) expect(reply.session_id).toBe(sessionId);
       else sessionId = reply.session_id;
       expect(sessionId).toBeTruthy();

@@ -5563,7 +5563,7 @@ describe("gateway stream lifecycle", () => {
         exit_code: 0,
         output_incomplete: true,
       });
-      expect(observedFailure).toContain("Partial output");
+      expect(observedFailure).toContain("partial output");
       expect(observedFailure).toContain("do not blindly rerun");
       expect(observedFailure).not.toContain("Unexpected");
       expect(json.tool_calls).toHaveLength(1);
@@ -11976,7 +11976,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
 
     expect(result.code).toBe(0);
     expect(bodies).toHaveLength(1);
-    expect(json.final_output).toBe("Partial answer");
+    expect(json.final_output).toBe("partial answer");
     expect(`${result.stdout}\n${result.stderr}`).not.toContain("stopped without a reply");
   }, 40_000);
 

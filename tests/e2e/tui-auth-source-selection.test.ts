@@ -1399,7 +1399,7 @@ for (const provider of ["gateway", "codex", "grok"] as const) {
       await session.sendText(prompt);
       await session.waitForPane((pane) => pane.includes(prompt) && pane.slice(pane.lastIndexOf(prompt) + prompt.length).includes("auth:"), TIMEOUT);
       const scrollback = await session.captureFullScrollback();
-      expect(scrollback.slice(scrollback.lastIndexOf(prompt) + prompt.length)).toContain("Saved credential storage is unavailable");
+      expect(scrollback.slice(scrollback.lastIndexOf(prompt) + prompt.length)).toContain("saved credential storage is unavailable");
       expect(gateway.requests).toHaveLength(0);
       expect(oauth.requests).toHaveLength(0);
       expect(chatgptOauth.requests).toHaveLength(0);
@@ -1544,7 +1544,7 @@ for (const gatewayState of ["absent", "rejected"] as const) {
       });
       await session.waitForComposer(TIMEOUT);
       await session.sendText("/logout");
-      await session.waitForText("Signed out of Codex.", TIMEOUT);
+      await session.waitForText("signed out of codex.", TIMEOUT);
       await openProviderPicker(session);
       expect(await session.capturePane()).toContain("grok · current");
       await session.sendKeys("Escape");
@@ -1631,10 +1631,10 @@ for (const otherProvider of ["codex", "grok"] as const) {
     linkSync(authPath, join(home, "login.alias"));
     await session.sendText("/logout");
     const result = await session.waitForPane(
-      (pane) => pane.includes("Signed out of fx.") || pane.includes(`Signed out of ${otherProvider === "codex" ? "Codex" : "Grok"}.`),
+      (pane) => pane.includes("signed out of fx.") || pane.includes(`Signed out of ${otherProvider === "codex" ? "Codex" : "Grok"}.`),
       TIMEOUT,
     );
-    expect(result).toContain("Signed out of fx.");
+    expect(result).toContain("signed out of fx.");
     expect(readFileSync(otherPath, "utf8")).toBe(otherCredential);
     expect(existsSync(authPath)).toBe(false);
     expect(gateway.requests).toHaveLength(0);
@@ -1657,7 +1657,7 @@ tmuxTest("provider recovery stays signed out when no replacement is connected", 
   });
   await session.waitForComposer(TIMEOUT);
   await session.sendText("/logout");
-  await session.waitForText("Signed out of Codex.", TIMEOUT);
+  await session.waitForText("signed out of codex.", TIMEOUT);
   await openProviderPicker(session);
   const pane = await session.capturePane();
   expect(pane).not.toContain("codex · current");
@@ -1713,7 +1713,7 @@ tmuxTest("/logout revokes the Codex login in the background", async () => {
   });
   await session.waitForComposer(TIMEOUT);
   await session.sendText("/logout codex");
-  await session.waitForText("Signed out of Codex.", TIMEOUT);
+  await session.waitForText("signed out of codex.", TIMEOUT);
   await waitForCodexRevocations(1);
   expect(chatgptOauth.revocations()[0]!.form).toEqual({
     token: "chatgpt-refresh", token_type_hint: "refresh_token", client_id: CODEX_CLIENT_ID,
@@ -1743,7 +1743,7 @@ tmuxTest("/logout warns when OpenAI doesn't confirm the Codex revocation", async
   });
   await session.waitForComposer(TIMEOUT);
   await session.sendText("/logout codex");
-  await session.waitForText("Signed out of Codex.", TIMEOUT);
+  await session.waitForText("signed out of codex.", TIMEOUT);
   await session.waitForText("could not be confirmed", TIMEOUT);
   // The pane wraps the warning, so wait for its last words.
   await session.waitForText("try again later.", TIMEOUT);
@@ -1794,7 +1794,7 @@ tmuxTest("fx quits promptly while a Codex revocation still waits", async () => {
   });
   await session.waitForComposer(TIMEOUT);
   await session.sendText("/logout codex");
-  await session.waitForText("Signed out of Codex.", TIMEOUT);
+  await session.waitForText("signed out of codex.", TIMEOUT);
   await waitForCodexRevocations(1);
   const started = Date.now();
   await session.sendText("/quit");
@@ -1831,7 +1831,7 @@ tmuxTest("provider recovery refuses active logout before deleting a busy subscri
   await session.sendText("/logout");
   const outcome = await session.waitForPane(
     (pane) => pane.includes("Sign out is unavailable until active and queued work finishes.") ||
-      pane.includes("Signed out of Codex."),
+      pane.includes("signed out of codex."),
     TIMEOUT,
   );
   expect(outcome).toContain("Sign out is unavailable until active and queued work finishes.");
@@ -1930,7 +1930,7 @@ test("Vercel CLI keeps an issuer authorization denial distinct from persistence 
   }, timeoutMs: TIMEOUT });
   expect(result.code).toBe(1);
   expect(result.stderr).toContain("authorization denied");
-  expect(result.stderr).not.toContain("Credential could not be saved");
+  expect(result.stderr).not.toContain("credential could not be saved");
   expect(existsSync(join(home, ".fx", "auth.json"))).toBe(false);
   expect(oauth.requests.filter((request) => request.path === "/oauth/token")).toHaveLength(0);
 }, TIMEOUT);
@@ -1962,7 +1962,7 @@ test("Vercel CLI reports a post-authorization save failure without claiming auth
   chmodSync(authPath, 0o400);
   const result = await login;
   expect(result.code).toBe(1);
-  expect(result.stderr).toContain("Credential could not be saved");
+  expect(result.stderr).toContain("credential could not be saved");
   expect(result.stderr).not.toContain("authorization denied");
   expect(result.stdout).not.toContain("Signed in");
   expect(readFileSync(authPath, "utf8")).toBe(previous);
@@ -2169,10 +2169,10 @@ tmuxTest(
         }));
         const status = await runFx(["status", "--json"], { env });
         expect(status.code).toBe(0);
-        expect(JSON.parse(status.stdout).auth_help).toContain("Saved credential storage is unavailable");
+        expect(JSON.parse(status.stdout).auth_help).toContain("saved credential storage is unavailable");
         const doctor = await runFx(["doctor", "--json"], { env });
         expect(doctor.timedOut).toBe(false);
-        expect(doctor.stdout).toContain("Saved credential storage is unavailable");
+        expect(doctor.stdout).toContain("saved credential storage is unavailable");
         const ask = await runFx(["ask", "--json", "--no-save", "do not use another account"], { env });
         expect(ask.code).toBe(1);
         expect(JSON.parse(ask.stdout).error).toBe("CredentialStorageUnavailable");
@@ -2183,11 +2183,11 @@ tmuxTest(
         expect(acp.code).toBe(0);
         const response = acp.stdout.trim().split("\n").map((line) => JSON.parse(line)).find((message) => message.id === 1);
         expect(response.error.code).toBe(-32600);
-        expect(response.error.message).toContain("Saved credential storage is unavailable");
+        expect(response.error.message).toContain("saved credential storage is unavailable");
         session = await startFx(home, stderrPath, gateway, oauth.issuerUrl, undefined, env);
         await session.waitForComposer(TIMEOUT);
         const unavailable = await readStatusPanel(session, TIMEOUT, (panel) => panel.fields["Auth help"] !== undefined);
-        expect(unavailable.fields["Auth help"]).toContain("Saved credential storage is unavailable");
+        expect(unavailable.fields["Auth help"]).toContain("saved credential storage is unavailable");
         await selectEnvKeyCredential(session);
         await session.sendText("Use the working Gateway account.");
         await session.waitForText(`GATEWAY_RECOVERED_${provider}`, TIMEOUT);
@@ -2282,7 +2282,7 @@ tmuxTest(
         const result = await runFx(["login", provider], { env, timeoutMs: 3000 });
         expect(result.timedOut).toBe(false);
         expect(result.code).toBe(1);
-        expect(result.stderr).toContain("Saved credential storage is unavailable");
+        expect(result.stderr).toContain("saved credential storage is unavailable");
         expect(result.stdout).not.toContain("http");
       }
       session = await startFx(home, stderrPath, gateway, oauth.issuerUrl, undefined, env);
@@ -2291,7 +2291,7 @@ tmuxTest(
       await session.sendKeys("Enter");
       await session.waitForPane((pane) => pane.includes("oauth") && pane.includes("api-key"), TIMEOUT);
       await session.sendKeys("Enter");
-      await session.waitForText("Saved credential storage is unavailable", TIMEOUT);
+      await session.waitForText("saved credential storage is unavailable", TIMEOUT);
       expect(await session.captureFullScrollback()).not.toContain("Sign in with Vercel");
       for (const name of ["auth.json", "chatgpt-auth.json", "grok-auth.json"]) {
         unlinkSync(join(home, `${name}.alias`));
@@ -2301,7 +2301,7 @@ tmuxTest(
         const result = await runFx(["login", provider], { env, timeoutMs: 3000 });
         expect(result.timedOut).toBe(false);
         expect(result.code).toBe(1);
-        expect(result.stderr).toContain("Saved credential storage is unavailable");
+        expect(result.stderr).toContain("saved credential storage is unavailable");
         expect(result.stdout).not.toContain("http");
       }
       expect(oauth.requests).toHaveLength(0);
@@ -2335,7 +2335,7 @@ tmuxTest(
       10_000,
     );
     const scrollback = await session.captureFullScrollback();
-    expect(scrollback).toContain("Codex subscription is unavailable");
+    expect(scrollback).toContain("codex subscription is unavailable");
     expect(scrollback).toContain("Grok subscription is unavailable");
     expect(scrollback).not.toContain("picker was not opened with stale data");
     await session.sendKeys("Escape");
@@ -3666,7 +3666,7 @@ tmuxTest(
 
     expect(session.isAlive()).toBe(true);
     expect(existsSync(join(home, ".fx", "auth.json"))).toBe(false);
-    expect(await session.captureFullScrollback()).not.toContain("Signed in to Vercel.");
+    expect(await session.captureFullScrollback()).not.toContain("signed in to vercel.");
     expect(readFileSync(stderrPath, "utf8")).toBe("");
   },
   60_000,
@@ -3718,7 +3718,7 @@ tmuxTest(
 
     expect(session.isAlive()).toBe(true);
     expect(existsSync(join(home, ".fx", "chatgpt-auth.json"))).toBe(false);
-    expect(await session.captureFullScrollback()).not.toContain("Signed in with Codex.");
+    expect(await session.captureFullScrollback()).not.toContain("signed in with codex.");
     expect(readFileSync(stderrPath, "utf8")).toBe("");
   },
   60_000,
@@ -4050,7 +4050,7 @@ tmuxTest(
     expect(chatgptOauth.requests.filter((request) => request.path === "/oauth/authorize"))
       .toHaveLength(authorizeRequestsBeforeRoundTrip);
     await session.sendText("/logout codex");
-    await session.waitForText("Signed out of Codex.", TIMEOUT);
+    await session.waitForText("signed out of codex.", TIMEOUT);
     expect(existsSync(authPath)).toBe(false);
     await readStatusPanel(session, TIMEOUT, (panel) => panel.fields.Model === gatewayModelBefore);
     expect(JSON.parse(readFileSync(settingsPath, "utf8")).provider).toBe("gateway");
@@ -4430,9 +4430,9 @@ tmuxTest(
 );
 
 for (const [provider, help] of [
-  ["gateway", "fx needs access to Vercel AI Gateway."],
-  ["codex", "Codex needs a subscription login."],
-  ["grok", "Grok needs a subscription login."],
+  ["gateway", "fx needs access to vercel AI gateway."],
+  ["codex", "codex needs a subscription login."],
+  ["grok", "grok needs a subscription login."],
 ] as const) {
   tmuxTest(`/status keeps ${provider} authentication requirements without credentials`, async () => {
     home = mkdtempSync(join(tmpdir(), "fx-tui-status-provider-"));
@@ -4467,7 +4467,7 @@ for (const [provider, help] of [
 
 for (const [source, help] of [
   ["vercel_oidc_token", "VERCEL_OIDC_TOKEN is selected but unavailable."],
-  ["stored_key", "A stored API key is selected but unavailable."],
+  ["stored_key", "a stored API key is selected but unavailable."],
 ] as const) {
   tmuxTest(`/status retains ${source} until another credential is selected`, async () => {
     home = mkdtempSync(join(tmpdir(), "fx-status-explicit-key-"));
@@ -4518,7 +4518,7 @@ tmuxTest("/status preserves a missing selected login through explicit key recove
   expect(await session.captureFullScrollbackEscapes()).toContain("fx login is selected but unavailable.");
   await closeStatusPanel(session, TIMEOUT);
   expect(missing.fields["Auth help"]).toStartWith("fx login is selected but unavailable.");
-  expect(missing.fields["Auth help"]).toContain("Run /login to reconnect");
+  expect(missing.fields["Auth help"]).toContain("run /login to reconnect");
   expect(missing.fields["Auth help"]).not.toContain("or set AI_GATEWAY_API_KEY");
   expect(gateway.requests).toHaveLength(0);
   expect(readFileSync(settingsPath, "utf8")).toBe(settings);
@@ -4567,7 +4567,7 @@ for (const provider of ["codex", "grok"] as const) {
     await session.sendText("/logout vercel");
     await session.waitForText("No fx login session found.", TIMEOUT);
     const unavailable = await readStatusPanel(session, TIMEOUT, (panel) => panel.fields["Auth help"] !== undefined);
-    expect(unavailable.fields["Auth help"]).toContain("Saved credential storage is unavailable");
+    expect(unavailable.fields["Auth help"]).toContain("saved credential storage is unavailable");
     expect(existsSync(credentialPath)).toBe(true);
     expect(readFileSync(settingsPath, "utf8")).toBe(settings);
     expect(gateway.requests).toHaveLength(0);
@@ -4974,7 +4974,7 @@ tmuxTest(
     // Acquiring a fresh login needs a signed-out state first; the remembered
     // seeded login would otherwise resolve straight into the team column.
     await session.sendText("/logout");
-    await session.waitForText("Signed out of fx.", TIMEOUT);
+    await session.waitForText("signed out of fx.", TIMEOUT);
     const oauthBase = oauth.requests.length;
     await session.sendText("/login");
     await session.waitForPane(
@@ -5027,7 +5027,7 @@ tmuxTest(
 
     const revokedBefore = completedRevocations(oauth).length;
     await session.sendText("/logout");
-    await session.waitForText("Signed out of fx.", TIMEOUT);
+    await session.waitForText("signed out of fx.", TIMEOUT);
     expect(existsSync(authPath)).toBe(false);
     // The issuer revocation runs after the local sign-out, off the input loop.
     await waitForRevocations(oauth, revokedBefore + 2);
@@ -5215,7 +5215,7 @@ tmuxTest(
     expect(gateway.modelRequests[1].headers.get("x-vercel-ai-gateway-team")).toBeNull();
 
     await session.sendText("/logout");
-    await session.waitForText("Signed out of fx.", TIMEOUT);
+    await session.waitForText("signed out of fx.", TIMEOUT);
     await waitForModelRequestCount(gateway, 3);
     expect(gateway.modelRequests).toHaveLength(3);
     expect(gateway.modelRequests[2].headers.get("authorization")).toBe(`Bearer ${ENV_TOKEN}`);
@@ -5260,7 +5260,7 @@ test(
     });
 
     expect(result.code, `stdout: ${result.stdout}\nstderr: ${result.stderr}`).toBe(0);
-    expect(result.stdout).toContain("Signed in to Vercel.");
+    expect(result.stdout).toContain("signed in to vercel.");
     expect(oauth.requests.map((request) => `${request.method} ${request.path}`)).toEqual([
       "GET /.well-known/openid-configuration",
       "POST /oauth/device",
@@ -5337,7 +5337,7 @@ test(
     });
 
     expect(result.code, `stdout: ${result.stdout}\nstderr: ${result.stderr}`).toBe(0);
-    expect(result.stdout).toContain("Selected Vercel team: Vercel Labs (vercel-labs).");
+    expect(result.stdout).toContain("selected vercel team: Vercel Labs (vercel-labs).");
     expect(savedCredentialSource(home)).toBe("fx_login");
     const persisted = JSON.parse(
       readFileSync(join(home, ".fx", "auth.json"), "utf8"),
@@ -5389,7 +5389,7 @@ test(
 
     expect(result.code).toBe(1);
     expect(result.stdout).not.toContain("Selected Vercel team");
-    expect(result.stderr).toContain("selected team could not access AI Gateway");
+    expect(result.stderr).toContain("selected team could not access AI gateway");
     expect(savedCredentialSource(home)).toBeUndefined();
     const persisted = JSON.parse(
       readFileSync(join(home, ".fx", "auth.json"), "utf8"),
@@ -5425,7 +5425,7 @@ test("fx logout clears a remembered fx login source", async () => {
   });
 
   expect(result.code, `stdout: ${result.stdout}\nstderr: ${result.stderr}`).toBe(0);
-  expect(result.stdout).toContain("Signed out of fx.");
+  expect(result.stdout).toContain("signed out of fx.");
   expect(savedCredentialSource(home)).toBeUndefined();
   expect(existsSync(join(home, ".fx", "auth.json"))).toBe(false);
 });
@@ -5515,7 +5515,7 @@ test(
 
     const login = await runCodexLoginWithBrowser(env);
     expect(login.code, `stdout: ${login.stdout}\nstderr: ${login.stderr}`).toBe(0);
-    expect(login.stdout).toContain("Signed in with Codex.");
+    expect(login.stdout).toContain("signed in with codex.");
     expect(login.stdout).not.toContain("Code:");
     expect(login.stderr).toBe("");
 
@@ -5586,7 +5586,7 @@ test(
 
     const logout = await runFx(["logout", "codex"], { env, timeoutMs: TIMEOUT });
     expect(logout.code).toBe(0);
-    expect(logout.stdout).toContain("Signed out of Codex.");
+    expect(logout.stdout).toContain("signed out of codex.");
     expect(existsSync(authPath)).toBe(false);
   },
   60_000,
@@ -5650,7 +5650,7 @@ test("Codex without a model explains the fix and fx provider codex saves one", a
   writeSeededChatGptLogin(home);
   chatgptOauth = startFakeChatGptOAuth();
   const env = withoutSavedModelEnv(home, "codex", chatgptOauth.env);
-  const guidance = "no Codex model is selected; run `fx provider codex` to choose one, or set a model for this run with --model or FX_MODEL";
+  const guidance = "no codex model is selected; run `fx provider codex` to choose one, or set a model for this run with --model or FX_MODEL";
 
   const status = await runFx(["status"], { env, timeoutMs: TIMEOUT });
   expect(status.code).toBe(1);
@@ -5694,7 +5694,7 @@ test("Grok runs from FX_MODEL or --model without a saved model and fx provider g
 
     const missing = await runFx(["status"], { env, timeoutMs: TIMEOUT });
     expect(missing.code).toBe(1);
-    expect(missing.stderr).toBe("fx: no Grok model is selected; run `fx provider grok` to choose one, or set a model for this run with --model or FX_MODEL\n");
+    expect(missing.stderr).toBe("fx: no grok model is selected; run `fx provider grok` to choose one, or set a model for this run with --model or FX_MODEL\n");
 
     const status = await runFx(["status", "--json"], { env: { ...env, FX_MODEL: "grok-4.6" }, timeoutMs: TIMEOUT });
     expect(status.code, status.stderr).toBe(0);
@@ -5827,7 +5827,7 @@ test(
 
       const login = await runGrokLoginWithBrowser(env);
       expect(login.code, `stdout: ${login.stdout}\nstderr: ${login.stderr}`).toBe(0);
-      expect(login.stdout).toContain("Signed in with Grok.");
+      expect(login.stdout).toContain("signed in with grok.");
       expect(login.stderr).toBe("");
 
       const authPath = join(home, ".fx", "grok-auth.json");
@@ -5889,7 +5889,7 @@ test(
 
       const logout = await runFx(["logout", "grok"], { env, timeoutMs: TIMEOUT });
       expect(logout.code, `stdout: ${logout.stdout}\nstderr: ${logout.stderr}`).toBe(0);
-      expect(logout.stdout).toContain("Signed out of Grok.");
+      expect(logout.stdout).toContain("signed out of grok.");
       expect(grok.requests.some((request) => request.path === "/oauth2/revoke")).toBe(true);
       expect(existsSync(authPath)).toBe(false);
     } finally {
@@ -5920,7 +5920,7 @@ test(
       }, "grok-code");
 
       expect(result.code, `stdout: ${result.stdout}\nstderr: ${result.stderr}`).toBe(0);
-      expect(result.stdout).toContain("Signed in with Grok.");
+      expect(result.stdout).toContain("signed in with grok.");
       expect(result.stdout).not.toContain("grok-code");
       expect(result.stderr).toBe("");
       expect(grok.tokenCalls()).toBe(1);
@@ -5953,7 +5953,7 @@ test("Grok logout removes local credentials when remote revocation fails", async
       timeoutMs: TIMEOUT,
     });
     expect(result.code, `stdout: ${result.stdout}\nstderr: ${result.stderr}`).toBe(0);
-    expect(result.stdout).toContain("Signed out of Grok.");
+    expect(result.stdout).toContain("signed out of grok.");
     expect(result.stderr).toContain("remote revocation could not be confirmed");
     expect(existsSync(authPath)).toBe(false);
     expect(JSON.parse(readFileSync(join(home, ".fx", "settings.json"), "utf8")).provider)
@@ -5986,7 +5986,7 @@ test("Grok logout survives a revocation answer still arriving at its limit", asy
     });
     expect(result.stderr).not.toContain("panic");
     expect(result.code, `stdout: ${result.stdout}\nstderr: ${result.stderr}`).toBe(0);
-    expect(result.stdout).toContain("Signed out of Grok.");
+    expect(result.stdout).toContain("signed out of grok.");
     expect(result.stderr).toContain("remote revocation could not be confirmed");
     expect(existsSync(authPath)).toBe(false);
     expect(grok.requests.filter((request) => request.path === "/oauth2/revoke")).toHaveLength(1);
@@ -6015,7 +6015,7 @@ test("Grok logout removes malformed and unsafe local credentials", async () => {
         timeoutMs: TIMEOUT,
       });
       expect(result.code, result.stderr).toBe(0);
-      expect(result.stdout).toContain("Signed out of Grok.");
+      expect(result.stdout).toContain("signed out of grok.");
       expect(result.stderr).toContain("remote revocation could not be confirmed");
       expect(existsSync(authPath)).toBe(false);
       expect(grok.requests).toHaveLength(0);
@@ -6087,7 +6087,7 @@ test("fx logout codex on a terminal says it waits for OpenAI", async () => {
       "logout codex",
       codexLogoutEnv(home, codex.env.FX_TEST_CHATGPT_REVOKE_URL),
       "revoking the Codex login at OpenAI (up to 15 s)...",
-      "Signed out of Codex.",
+      "signed out of codex.",
     );
     expect(codex.revocations()).toHaveLength(1);
   } finally {
@@ -6114,13 +6114,13 @@ test("fx logout codex on a terminal prints no wait line when it sends nothing", 
   try {
     const env = codexLogoutEnv(home, codex.env.FX_TEST_CHATGPT_REVOKE_URL);
     const missing = await paneAfterExit("logout codex", env);
-    expect(missing).toContain("No Codex login session found.");
+    expect(missing).toContain("no codex login session found.");
     expect(missing).not.toContain("revoking the Codex login");
 
     writeSeededChatGptLogin(home, codex.accessToken);
     writeFileSync(join(home, ".fx", "chatgpt-auth.json"), "{invalid-json");
     const unreadable = await paneAfterExit("logout codex", env);
-    expect(unreadable).toContain("Signed out of Codex.");
+    expect(unreadable).toContain("signed out of codex.");
     expect(unreadable).not.toContain("revoking the Codex login");
     expect(unreadable).toContain(CODEX_REVOCATION_WARNING);
     expect(codex.revocations()).toHaveLength(0);
@@ -6140,7 +6140,7 @@ test("fx logout codex on a terminal shows the wait line before a failed revocati
     for (const revokeUrl of [codex.env.FX_TEST_CHATGPT_REVOKE_URL, closedUrl]) {
       writeSeededChatGptLogin(home, codex.accessToken);
       const pane = await paneAfterExit("logout codex", codexLogoutEnv(home, revokeUrl));
-      expect(pane).toContain("Signed out of Codex.");
+      expect(pane).toContain("signed out of codex.");
       const wait = pane.indexOf("revoking the Codex login at OpenAI (up to 15 s)...");
       expect(wait, pane).toBeGreaterThanOrEqual(0);
       expect(wait).toBeLessThan(pane.indexOf(CODEX_REVOCATION_WARNING));
@@ -6165,7 +6165,7 @@ test("fx logout grok on a terminal says it waits for xAI", async () => {
         FX_TEST_GROK_REVOKE_URL: grok.env.FX_TEST_GROK_REVOKE_URL,
       },
       "revoking the Grok login at xAI (up to 15 s)...",
-      "Signed out of Grok.",
+      "signed out of grok.",
     );
     expect(grok.requests.filter((request) => request.path === "/oauth2/revoke")).toHaveLength(1);
   } finally {
@@ -6191,7 +6191,7 @@ test("fx logout on a terminal says it waits for the fx login's issuer", async ()
       FX_TEST_OAUTH_ISSUER_URL: oauth.issuerUrl,
     },
     "revoking the fx login at Vercel (up to 45 s)...",
-    "Signed out of fx.",
+    "signed out of fx.",
   );
 }, 60_000);
 
@@ -6206,7 +6206,7 @@ test("Codex logout revokes the saved login at OpenAI", async () => {
       timeoutMs: TIMEOUT,
     });
     expect(result.code, `stdout: ${result.stdout}\nstderr: ${result.stderr}`).toBe(0);
-    expect(result.stdout).toContain("Signed out of Codex.");
+    expect(result.stdout).toContain("signed out of codex.");
     expect(result.stderr).toBe("");
     expect(existsSync(authPath)).toBe(false);
     // OpenAI confirmed it, so nothing stays kept for a retry.
@@ -6234,7 +6234,7 @@ test("Codex logout keeps a sign-out OpenAI refuses and finishes it at the next l
       timeoutMs: TIMEOUT,
     });
     expect(first.code, `stdout: ${first.stdout}\nstderr: ${first.stderr}`).toBe(0);
-    expect(first.stdout).toContain("Signed out of Codex.");
+    expect(first.stdout).toContain("signed out of codex.");
     expect(first.stderr).toContain(`${CODEX_REVOCATION_WARNING}; ${RETRY_LATER}`);
     expect(first.stderr).not.toContain("chatgpt-refresh");
     expect(statSync(pendingPath).mode & 0o777).toBe(0o600);
@@ -6244,7 +6244,7 @@ test("Codex logout keeps a sign-out OpenAI refuses and finishes it at the next l
       timeoutMs: TIMEOUT,
     });
     expect(second.code, `stdout: ${second.stdout}\nstderr: ${second.stderr}`).toBe(0);
-    expect(second.stdout).toContain("No Codex login session found.");
+    expect(second.stdout).toContain("no codex login session found.");
     expect(second.stderr).toBe("");
     expect(working.revocations()).toEqual([{
       method: "POST",
@@ -6274,7 +6274,7 @@ test("Grok logout keeps a sign-out xAI refuses and finishes it at the next logou
     });
     const first = await runFx(["logout", "grok"], { env: env(refusing.env.FX_TEST_GROK_REVOKE_URL), timeoutMs: TIMEOUT });
     expect(first.code, `stdout: ${first.stdout}\nstderr: ${first.stderr}`).toBe(0);
-    expect(first.stdout).toContain("Signed out of Grok.");
+    expect(first.stdout).toContain("signed out of grok.");
     expect(first.stderr).toContain(
       `fx logout: local Grok session removed, but remote revocation could not be confirmed; ${RETRY_LATER}`,
     );
@@ -6320,7 +6320,7 @@ test("fx logout keeps a sign-out Vercel refuses and finishes it at the next logo
     };
     const first = await runFx(["logout"], { env, timeoutMs: TIMEOUT });
     expect(first.code, `stdout: ${first.stdout}\nstderr: ${first.stderr}`).toBe(0);
-    expect(first.stdout).toContain("Signed out of fx.");
+    expect(first.stdout).toContain("signed out of fx.");
     expect(first.stderr).toContain(`Warning: signed out locally, but the remote session could not be revoked. ${RETRY_LATER}.`);
     expect(first.stderr).not.toContain("seeded-refresh-token");
     expect(statSync(pendingPath).mode & 0o777).toBe(0o600);
@@ -6361,7 +6361,7 @@ test("fx login codex revokes the Codex sign-outs that earlier logouts kept", asy
     ...chatgptOauth.env,
   });
   expect(login.code, `stdout: ${login.stdout}\nstderr: ${login.stderr}`).toBe(0);
-  expect(login.stdout).toContain("Signed in with Codex.");
+  expect(login.stdout).toContain("signed in with codex.");
   expect(login.stderr).toBe("");
   expect(chatgptOauth.revocations().map((revocation) => revocation.form.token)).toEqual(["earlier-codex-refresh"]);
   expect(existsSync(pending)).toBe(false);
@@ -6381,7 +6381,7 @@ test("a kept sign-out older than 30 days is dropped without a request", async ()
       timeoutMs: TIMEOUT,
     });
     expect(result.code, result.stderr).toBe(0);
-    expect(result.stdout).toContain("No Codex login session found.");
+    expect(result.stdout).toContain("no codex login session found.");
     expect(result.stderr).toBe("");
     expect(codex.requests).toHaveLength(0);
     expect(existsSync(pending)).toBe(false);
@@ -6402,7 +6402,7 @@ test("Codex logout promises no retry when it cannot keep the token", async () =>
       timeoutMs: TIMEOUT,
     });
     expect(result.code, result.stderr).toBe(0);
-    expect(result.stdout).toContain("Signed out of Codex.");
+    expect(result.stdout).toContain("signed out of codex.");
     expect(result.stderr).toContain(CODEX_REVOCATION_WARNING);
     expect(result.stderr).not.toContain(RETRY_LATER);
     expect(existsSync(join(home, ".fx", "chatgpt-auth.json"))).toBe(false);
@@ -6470,7 +6470,7 @@ for (const failure of ["is refused with 503", "can't connect", "gets no answer"]
         timeoutMs: 40_000,
       });
       expect(result.code, `stdout: ${result.stdout}\nstderr: ${result.stderr}`).toBe(0);
-      expect(result.stdout).toContain("Signed out of Codex.");
+      expect(result.stdout).toContain("signed out of codex.");
       expect(result.stderr).toContain(CODEX_REVOCATION_WARNING);
       expect(result.stderr).not.toContain("chatgpt-refresh");
       expect(existsSync(authPath)).toBe(false);
@@ -6498,7 +6498,7 @@ test("Codex logout removes an unreadable saved login without sending it", async 
         timeoutMs: TIMEOUT,
       });
       expect(result.code, result.stderr).toBe(0);
-      expect(result.stdout).toContain("Signed out of Codex.");
+      expect(result.stdout).toContain("signed out of codex.");
       expect(result.stderr).toContain(CODEX_REVOCATION_WARNING);
       // There was no token to keep, so the warning promises no retry.
       expect(result.stderr).not.toContain(RETRY_LATER);
@@ -6521,7 +6521,7 @@ test("Codex logout without a saved login sends nothing", async () => {
       timeoutMs: TIMEOUT,
     });
     expect(result.code, result.stderr).toBe(0);
-    expect(result.stdout).toContain("No Codex login session found.");
+    expect(result.stdout).toContain("no codex login session found.");
     expect(result.stderr).toBe("");
     expect(codex.requests).toHaveLength(0);
   } finally {
@@ -6542,8 +6542,8 @@ test("Codex logouts started together revoke the login once", async () => {
       expect(result.code, `stdout: ${result.stdout}\nstderr: ${result.stderr}`).toBe(0);
       expect(result.stderr).toBe("");
     }
-    expect(results.filter((result) => result.stdout.includes("Signed out of Codex."))).toHaveLength(1);
-    expect(results.filter((result) => result.stdout.includes("No Codex login session found."))).toHaveLength(3);
+    expect(results.filter((result) => result.stdout.includes("signed out of codex."))).toHaveLength(1);
+    expect(results.filter((result) => result.stdout.includes("no codex login session found."))).toHaveLength(3);
     expect(codex.revocations()).toHaveLength(1);
     expect(existsSync(join(home, ".fx", "chatgpt-auth.json"))).toBe(false);
   } finally {
@@ -7910,7 +7910,7 @@ test(
 
     const login = await runCodexLoginWithBrowser(env);
     expect(login.code).toBe(1);
-    expect(login.stdout).not.toContain("Signed in with Codex.");
+    expect(login.stdout).not.toContain("signed in with codex.");
     expect(login.stderr).toContain("fx login: could not load the target model catalog (malformed_response)");
     expect(existsSync(join(home, ".fx", "chatgpt-auth.json"))).toBe(true);
     const settingsPath = join(home, ".fx", "settings.json");
@@ -7942,7 +7942,7 @@ test(
 
       const login = await runGrokLoginWithBrowser(env);
       expect(login.code).toBe(1);
-      expect(login.stdout).not.toContain("Signed in with Grok.");
+      expect(login.stdout).not.toContain("signed in with grok.");
       expect(login.stderr).toContain("fx login: target model catalog is empty");
       expect(existsSync(join(home, ".fx", "grok-auth.json"))).toBe(true);
       expect(existsSync(join(home, ".fx", "settings.json"))).toBe(false);
@@ -8423,7 +8423,7 @@ tmuxTest(
     await session.sendText("/logout");
     const loggedOut = await session.waitForPane(
       (pane) =>
-        pane.includes("Signed out of fx.") &&
+        pane.includes("signed out of fx.") &&
         pane.includes("remote session could not be revoked"),
       TIMEOUT,
     );
@@ -8500,7 +8500,7 @@ tmuxTest(
     session = await startFx(home, stderrPath, gateway, oauth.issuerUrl);
     await session.waitForComposer(TIMEOUT);
     await session.sendText("/logout");
-    await session.waitForText("Signed out of fx.", 1_000);
+    await session.waitForText("signed out of fx.", 1_000);
 
     const quitAt = Date.now();
     await session.sendText("/quit");
@@ -8528,7 +8528,7 @@ tmuxTest(
     session = await startFx(home, stderrPath, gateway, oauth.issuerUrl);
     await session.waitForComposer(TIMEOUT);
     await session.sendText("/logout");
-    await session.waitForText("Signed out of fx.", 1_000);
+    await session.waitForText("signed out of fx.", 1_000);
     expect(existsSync(join(home, ".fx", "auth.json"))).toBe(false);
     const draft = "TYPING_WHILE_LOGOUT_REVOKES";
     await session.sendLiteral(draft);
@@ -8560,7 +8560,7 @@ tmuxTest(
     session = await startFx(home, stderrPath, gateway, oauth.issuerUrl);
     await session.waitForComposer(TIMEOUT);
     await session.sendText("/logout");
-    await session.waitForText("Signed out of fx.", TIMEOUT);
+    await session.waitForText("signed out of fx.", TIMEOUT);
     await waitForRevocations(oauth, 1);
     // Each revocation runs to its 15 s limit before fx reports it.
     await session.waitForText("remote session could not be revoked", 60_000);
@@ -8586,7 +8586,7 @@ tmuxTest(
     session = await startFx(home, stderrPath, gateway, oauth.issuerUrl);
     await session.waitForComposer(TIMEOUT);
     await session.sendText("/logout");
-    await session.waitForText("Signed out of fx.", TIMEOUT);
+    await session.waitForText("signed out of fx.", TIMEOUT);
     expect(existsSync(join(home, ".fx", "auth.json"))).toBe(false);
 
     await readStatusPanel(session, TIMEOUT, (panel) => panelAuth(panel) === "AI_GATEWAY_API_KEY");
@@ -8614,7 +8614,7 @@ tmuxTest(
     session = await startFx(home, stderrPath, gateway, oauth.issuerUrl);
     await session.waitForComposer(TIMEOUT);
     await session.sendText("/logout");
-    const loggedOut = await session.waitForText("Signed out of fx.", TIMEOUT);
+    const loggedOut = await session.waitForText("signed out of fx.", TIMEOUT);
     expect(existsSync(authPath)).toBe(false);
 
     await readStatusPanel(session, TIMEOUT, (panel) => panelAuth(panel) === "AI_GATEWAY_API_KEY");
@@ -8655,7 +8655,7 @@ tmuxTest(
       "Could not confirm durable fx logout. The active source was recalculated.",
       TIMEOUT,
     );
-    expect(failed).not.toContain("Signed out of fx.");
+    expect(failed).not.toContain("signed out of fx.");
     expect(failed).toContain(
       "Warning: signed out locally, but the remote session could not be revoked.",
     );
@@ -8685,7 +8685,7 @@ tmuxTest(
     });
     await session.waitForComposer(TIMEOUT);
     await session.sendText("/logout");
-    await session.waitForText("Signed out of fx.", TIMEOUT);
+    await session.waitForText("signed out of fx.", TIMEOUT);
     await readStatusPanel(session, TIMEOUT, (panel) => panelAuth(panel) === "missing");
 
     await session.sendText("/setup");

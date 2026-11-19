@@ -915,7 +915,7 @@ test.skipIf(!tmuxAvailable())("a flipped byte in a turn the newest compaction ke
     await until(() => resumed.session.recordedExitStatus() !== null, "the app to exit");
     await resumed.session.kill();
     expect(readFileSync(resumed.stderrPath, "utf8")).toBe(
-      "fx: saved session is unreadable. Run `fx doctor`; if it is recoverable, use `fx session recover <id>`.\n",
+      "fx: saved session is unreadable. run `fx doctor`; if it is recoverable, use `fx session recover <id>`.\n",
     );
 
     // An ACP client hears the session couldn't be loaded, not that it is missing.
@@ -3523,7 +3523,7 @@ test("fx sessions --live lists the sessions other fx processes hold, with their 
     const none = await command(fixture, gateway, ["sessions", "--live"]);
     expect(none.code).toBe(0);
     expect(none.stderr).toBe("");
-    expect(none.stdout).toBe("No live sessions in this workspace.\n");
+    expect(none.stdout).toBe("no live sessions in this workspace.\n");
 
     holders.push(spawnAsk(fixture, gateway, ["Hold the live turn."]));
     await until(() => mainHeld, "the held turn");
@@ -4846,7 +4846,7 @@ test.skipIf(!tmuxAvailable())("the app refuses a damaged session, a busy one and
     try {
       const readOnly = await appExit(fixture, gateway, ["--resume", id]);
       expect(readOnly.status).toBe(1);
-      expect(readOnly.stderr).toBe("fx: this session cannot be opened for writing: permission denied. Check the permissions under ~/.fx/sessions/v2, then resume again.\n");
+      expect(readOnly.stderr).toBe("fx: this session cannot be opened for writing: permission denied. check the permissions under ~/.fx/sessions/v2, then resume again.\n");
     } finally {
       chmodSync(folder, 0o700);
       chmodSync(log, 0o600);

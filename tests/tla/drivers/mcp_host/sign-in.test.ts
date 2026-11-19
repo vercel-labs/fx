@@ -275,7 +275,7 @@ test("contract: a reload that leaves a server alone keeps its sign-in going, and
 
     records.push({ event: "reload", data: { server: "kept" }, at: Date.now() });
     await shell.tui.sendText(`/mcp add other -- ${BUN} ${stdioServer(f, "other").args[0]}`);
-    await shell.tui.waitForText("Added other", 10_000);
+    await shell.tui.waitForText("added other", 10_000);
     await Bun.sleep(1_000);
     const kept = await probe(port);
     records.push({ event: "probe", data: { login: 1, result: kept.result }, at: Date.now() });
@@ -284,7 +284,7 @@ test("contract: a reload that leaves a server alone keeps its sign-in going, and
 
     records.push({ event: "reload", data: { server: "dropped" }, at: Date.now() });
     await shell.tui.sendText("/mcp remove web");
-    await shell.tui.waitForText("Removed web", 10_000);
+    await shell.tui.waitForText("removed web", 10_000);
     let after = await probe(port);
     // A probe the closing listener drops is no answer either way: probe again.
     for (let k = 0; k < 30 && (after.result === "open" || after.result === "reset"); k++) { await Bun.sleep(100); after = await probe(port); }

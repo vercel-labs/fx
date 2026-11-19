@@ -275,7 +275,7 @@ describe("generic permission typed errors", () => {
           timeoutMs: TIMEOUT,
         });
         const json = parseFxJson(result);
-        expect(result.stderr).toBe('Running touch "./denied-marker.txt"\n');
+        expect(result.stderr).toBe('running touch "./denied-marker.txt"\n');
         expect(json.tool_calls).toContainEqual({
           name: "shell",
           status: "error",

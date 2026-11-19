@@ -7764,7 +7764,7 @@ describe("acp: model-independent", () => {
         client = await AcpClient.create({ cwd: root.workspace, env });
         const refused = await client.request("initialize", { protocolVersion: 1 }, 1) as any;
         expect(refused.error?.message).toBe(
-          "no Codex model is selected; run `fx provider codex` to choose one, or set a model for this run with --model or FX_MODEL",
+          "no codex model is selected; run `fx provider codex` to choose one, or set a model for this run with --model or FX_MODEL",
         );
         await client.close();
 

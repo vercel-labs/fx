@@ -172,7 +172,7 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
       };
 
       const first = await launch("first");
-      expect(first).toContain("note: Other users could write to ~/.fx");
+      expect(first).toContain("note: other users could write to ~/.fx");
       // The settings loaded, so nothing reports a configuration issue.
       expect(first).not.toContain("configuration issue");
       // No one else can write to either any more.

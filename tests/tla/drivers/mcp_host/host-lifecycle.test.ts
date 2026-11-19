@@ -82,7 +82,7 @@ test("reject and remove reload in place: the project server never starts, the re
     await shell.tui.waitForText("rejected p", 10_000);
     expect(await shell.status({ k: "none" })).toEqual({ k: "none", who: "", why: "", r: 0, e: 0 });
     await shell.type("/mcp remove b", { event: "reload", data: { server: "b", change: "removed" } });
-    await shell.tui.waitForText("Removed b", 10_000);
+    await shell.tui.waitForText("removed b", 10_000);
     await waitFor("b stopped", () => stopped(shell.f, "b").length, 10_000);
     expect(await shell.status({ k: "none" })).toEqual({ k: "none", who: "", why: "", r: 0, e: 0 });
     await shell.quit();
@@ -130,11 +130,11 @@ test("a removed server added back runs one process at a time: the new one starts
     await shell.start();
     await waitFor("a and s listed", () => listed(shell.f, "a").length && listed(shell.f, "s").length, 20_000);
     await shell.type("/mcp remove s", { event: "reload", data: { server: "s", change: "removed" } });
-    await shell.tui.waitForText("Removed s", 10_000);
+    await shell.tui.waitForText("removed s", 10_000);
     // Added back while the first s still lingers after its stdin ended.
     const env = Object.entries({ FIXTURE_NAME: "s", FIXTURE_LOG: shell.f.serverLog, FIXTURE_CONTROL: shell.f.control, ...slowStop }).map(([k, v]) => `--env ${k}=${v}`).join(" ");
     await shell.type(`/mcp add ${env} s -- ${BUN} ${FIXTURE}`, { event: "reload", data: { server: "s", change: "ok" } });
-    await shell.tui.waitForText("Added s", 10_000);
+    await shell.tui.waitForText("added s", 10_000);
     const runs = await waitFor("a second s listed", () => { const x = started(shell.f, "s"); return x.length === 2 && listed(shell.f, "s").length === 2 ? x : null; }, 20_000);
     const firstExit = stopped(shell.f, "s").find((e) => e.pid === runs[0]!.pid);
     save(join(shell.f.base, "add-back.json"), { s: runs.map((e) => ({ pid: e.pid, t: e.t })), firstExit: firstExit?.t ?? null });

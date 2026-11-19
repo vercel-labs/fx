@@ -112,10 +112,10 @@ await waitFor(() => grid().includes("esc close · pgup/pgdn scroll"), "full tran
 runtime.write("\x0f");
 await waitFor(() => terminal.buffer.active.type === "normal", "full transcript close");
 
-await command("/login", "Vercel sign-in failed. The current credential is unchanged.");
-await command("/resume", "Session resume is owned by the embedding SDK");
+await command("/login", "vercel sign-in failed. the current credential is unchanged.");
+await command("/resume", "session resume is owned by the embedding SDK");
 await command("/mcp list", "MCP servers are unavailable in this host");
-await command("/skills list", "Skills are unavailable in this host");
+await command("/skills list", "skills are unavailable in this host");
 
 runtime.write("/model\r");
 await waitFor(() => grid().includes("feature-model") && grid().includes("other-model"), "model catalog menu");

@@ -1669,7 +1669,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       await session.waitForComposer(10_000);
       await session.sendText("/settings");
       let grid = await waitForSettingsMenu(session);
-      expect(grid.join("\n")).toContain("Slash menu categories");
+      expect(grid.join("\n")).toContain("slash menu categories");
 
       for (let index = 0; index < 3; index += 1) {
         await session.sendKeys("Down");
@@ -1677,7 +1677,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       await session.sendKeys("Left");
       await waitForSettingValue(settingsPath, "slash_menu_categories", false);
       grid = await waitForSettingsMenu(session);
-      expect(grid.join("\n")).toContain("Slash menu categories");
+      expect(grid.join("\n")).toContain("slash menu categories");
 
       await session.sendKeys("Escape");
       await session.waitForPane(
@@ -2080,7 +2080,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       expect(pane).not.toContain("Maxxing mode");
       await session.sendKeys("Tab");
       pane = (await waitForSettingsMenu(session)).join("\n");
-      expect(pane).toContain("< Interface >");
+      expect(pane).toContain("< interface >");
       await session.sendKeys("BTab");
       pane = (await waitForSettingsMenu(session)).join("\n");
       expect(pane).toContain("< all >");
@@ -2812,7 +2812,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       expect(pane).not.toContain("xAI");
       expect(pane).not.toContain("Z.AI");
       expect(pane).toContain(currentModel);
-      expect(pane).toContain("1M context   32K output   Fast mode");
+      expect(pane).toContain("1M context   32K output   fast mode");
       expect(pane).toContain("Note: Gateway catalog is authenticated with an API key");
       const headerRow = grid.findIndex((line) => /^models\s/.test(line));
       const firstModelRow = grid.findIndex((line) => line.includes("openai/gpt-5.4"));
@@ -3419,7 +3419,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       const row = (model: string) => menu.find((line) => !isComposerLine(line) && line.includes(model)) ?? "";
       expect(menu.join("\n")).not.toContain("Token Pass");
       expect(menu.join("\n")).not.toContain("All Models");
-      expect(row("zai/glm-5.3")).toContain("200K context   Fast mode");
+      expect(row("zai/glm-5.3")).toContain("200K context   fast mode");
       expect(row("deepseek/deepseek-v4.1-flash")).toContain("128K context   Fast mode");
       await session.sendKeys("Escape");
       await session.waitForPane((pane) => !/^models\s/m.test(pane), 5_000);

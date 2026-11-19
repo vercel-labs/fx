@@ -12,7 +12,7 @@ import { fixture, fxEnv, observeStores, runFx, save, v1Entry, v1Path, storePath,
 import { checkTrace, type TraceRecord } from "./trace";
 
 const URL = "http://127.0.0.1:9/mcp";
-const UNREADABLE = "fx can't read the saved MCP sign-ins in ~/.fx/mcp-credentials/credentials-v3.json. A newer fx saved them, or they're damaged; fix or delete them, then try again.\n";
+const UNREADABLE = "fx can't read the saved MCP sign-ins in ~/.fx/mcp-credentials/credentials-v3.json. a newer fx saved them, or they're damaged; fix or delete them, then try again.\n";
 
 function setup(name: string) {
   const f = fixture(artifacts, name);
@@ -91,10 +91,10 @@ test("A newer fx's store is never written over; sign-in and sign-out say why the
   expect(list.ran.code).toBe(0);
   const logout = await s.run("logout", ["mcp", "logout", "web"], "web");
   expect(logout.ran.code).toBe(1);
-  expect(logout.ran.stderr).toBe(`Can't sign out of web: ${UNREADABLE}`);
+  expect(logout.ran.stderr).toBe(`can't sign out of web: ${UNREADABLE}`);
   const login = await s.run("put", ["mcp", "login", "--no-browser", "web"], "web");
   expect(login.ran.code).toBe(1);
-  expect(login.ran.stderr).toBe(`Can't sign in to web: ${UNREADABLE}`);
+  expect(login.ran.stderr).toBe(`can't sign in to web: ${UNREADABLE}`);
   // Independent oracle: the file is byte for byte what the newer fx wrote.
   save(join(s.f.base, "store-after.json"), readFileSync(storePath(s.f), "utf8"));
   expect(readFileSync(storePath(s.f), "utf8")).toBe(before);
@@ -116,7 +116,7 @@ test("a logout stays when the store becomes unreadable (trace ACCEPTED)", async 
   writeStore(s.f);
   s.observe();
   const out = await s.run("logout", ["mcp", "logout", "web"], "web");
-  expect(out.ran.stdout).toBe("Signed out of web here, but the login wasn't revoked at its server, so its tokens stay valid until they expire.\n");
+  expect(out.ran.stdout).toBe("signed out of web here, but the login wasn't revoked at its server, so its tokens stay valid until they expire.\n");
   expect(out.o.entries).toEqual([]);
   rewriteAsVersion(s.f, 3);
   s.fault("unreadable");

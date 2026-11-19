@@ -1486,8 +1486,8 @@ describe("filesystem path handling", () => {
             "committed file read tracker refresh failed",
           );
           expect(result.stderr).toBe(
-            "Writing typed.txt\n" +
-              "Editing typed.txt\n",
+            "writing typed.txt\n" +
+              "editing typed.txt\n",
           );
         } finally {
           gateway.stop();
