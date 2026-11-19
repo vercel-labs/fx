@@ -767,8 +767,10 @@ pub const ScopedStore = union(enum) { ready: StoreReady, failed: Failure };
 
 /// `ready` with the hooks config defines for `store` listed once, in the
 /// store's own context, so a run of commands against that one store, such
-/// as one capture's, need not list them before each command. Memory belongs
-/// to `arena`.
+/// as one capture's, need not list them before each command. The listing is
+/// a snapshot: config written after it is not seen until the next one, so a
+/// scoped handle is meant for one short run and is not kept between them.
+/// Memory belongs to `arena`.
 pub fn scopeStore(arena: Allocator, ready: StoreReady, store: Store, limits: Limits) StoreError!ScopedStore {
     var base = try environment(arena);
     return scopeStoreWith(arena, ready, store, limits, &base, capture_path);
