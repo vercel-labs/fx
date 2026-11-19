@@ -693,140 +693,56 @@ pub fn composeVariantHintRow(alloc: Allocator, width: u16, ctrl_c_pending: bool,
     return row;
 }
 
+const help_menu_hint_variants = [_][]const u8{
+    "↑↓ navigate     tab category     enter open     esc close",
+    "↑↓ navigate  tab category  enter open  esc close",
+    "↑↓ move  tab category  enter  esc",
+    "tab category  enter open  esc",
+    "tab enter esc",
+};
+
 pub fn composeHelpMenuHintRow(alloc: Allocator, width: u16, ctrl_c_pending: bool) !std.ArrayList(u8) {
-    if (ctrl_c_pending) {
-        var warning: std.ArrayList(u8) = .empty;
-        errdefer warning.deinit(alloc);
-        try warning.appendSlice(alloc, ui_render.statusline_style);
-        try row_text.appendClipped(alloc, &warning, "press ctrl+c again to exit", width);
-        try warning.appendSlice(alloc, ui_render.reset_style);
-        return warning;
-    }
-
-    const variants = [_][]const u8{
-        "↑↓ navigate     tab category     enter open     esc close",
-        "↑↓ navigate  tab category  enter open  esc close",
-        "↑↓ move  tab category  enter  esc",
-        "tab category  enter open  esc",
-        "tab enter esc",
-    };
-    var hint = variants[variants.len - 1];
-    for (variants) |candidate| {
-        if (display_width.visibleWidth(candidate) <= width) {
-            hint = candidate;
-            break;
-        }
-    }
-
-    var row: std.ArrayList(u8) = .empty;
-    errdefer row.deinit(alloc);
-    try row.appendSlice(alloc, ui_render.dim_style);
-    try row_text.appendClipped(alloc, &row, hint, width);
-    try row.appendSlice(alloc, ui_render.reset_style);
-    return row;
+    return composeVariantHintRow(alloc, width, ctrl_c_pending, &help_menu_hint_variants);
 }
+
+const effort_menu_hint_variants = [_][]const u8{
+    "↑↓ navigate     enter use     esc close",
+    "↑↓ navigate  enter use  esc close",
+    "↑↓ move  enter  esc",
+    "enter use  esc close",
+    "enter esc",
+};
 
 pub fn composeEffortMenuHintRow(alloc: Allocator, width: u16, ctrl_c_pending: bool) !std.ArrayList(u8) {
-    if (ctrl_c_pending) {
-        var warning: std.ArrayList(u8) = .empty;
-        errdefer warning.deinit(alloc);
-        try warning.appendSlice(alloc, ui_render.statusline_style);
-        try row_text.appendClipped(alloc, &warning, "press ctrl+c again to exit", width);
-        try warning.appendSlice(alloc, ui_render.reset_style);
-        return warning;
-    }
-
-    const variants = [_][]const u8{
-        "↑↓ navigate     enter use     esc close",
-        "↑↓ navigate  enter use  esc close",
-        "↑↓ move  enter  esc",
-        "enter use  esc close",
-        "enter esc",
-    };
-    var hint = variants[variants.len - 1];
-    for (variants) |candidate| {
-        if (display_width.visibleWidth(candidate) <= width) {
-            hint = candidate;
-            break;
-        }
-    }
-
-    var row: std.ArrayList(u8) = .empty;
-    errdefer row.deinit(alloc);
-    try row.appendSlice(alloc, ui_render.dim_style);
-    try row_text.appendClipped(alloc, &row, hint, width);
-    try row.appendSlice(alloc, ui_render.reset_style);
-    return row;
+    return composeVariantHintRow(alloc, width, ctrl_c_pending, &effort_menu_hint_variants);
 }
+
+const fork_menu_hint_variants = [_][]const u8{
+    "↑↓ navigate     enter fork     esc close",
+    "↑↓ navigate  enter fork  esc close",
+    "↑↓ move  enter  esc",
+    "enter fork  esc close",
+    "enter esc",
+};
 
 pub fn composeForkMenuHintRow(alloc: Allocator, width: u16, ctrl_c_pending: bool) !std.ArrayList(u8) {
-    if (ctrl_c_pending) {
-        var warning: std.ArrayList(u8) = .empty;
-        errdefer warning.deinit(alloc);
-        try warning.appendSlice(alloc, ui_render.statusline_style);
-        try row_text.appendClipped(alloc, &warning, "press ctrl+c again to exit", width);
-        try warning.appendSlice(alloc, ui_render.reset_style);
-        return warning;
-    }
-
-    const variants = [_][]const u8{
-        "↑↓ navigate     enter fork     esc close",
-        "↑↓ navigate  enter fork  esc close",
-        "↑↓ move  enter  esc",
-        "enter fork  esc close",
-        "enter esc",
-    };
-    var hint = variants[variants.len - 1];
-    for (variants) |candidate| {
-        if (display_width.visibleWidth(candidate) <= width) {
-            hint = candidate;
-            break;
-        }
-    }
-
-    var row: std.ArrayList(u8) = .empty;
-    errdefer row.deinit(alloc);
-    try row.appendSlice(alloc, ui_render.dim_style);
-    try row_text.appendClipped(alloc, &row, hint, width);
-    try row.appendSlice(alloc, ui_render.reset_style);
-    return row;
+    return composeVariantHintRow(alloc, width, ctrl_c_pending, &fork_menu_hint_variants);
 }
+
+const settings_menu_hint_variants = [_][]const u8{
+    "↑↓ navigate     tab category     ←→ change     esc close",
+    "↑↓ navigate  tab category  ←→ change  esc close",
+    "↑↓ move  tab category  ←→ change  esc",
+    "tab category  ←→ change  esc",
+    "tab ←→ esc",
+};
 
 pub fn composeSettingsMenuHintRow(
     alloc: Allocator,
     width: u16,
     ctrl_c_pending: bool,
 ) !std.ArrayList(u8) {
-    if (ctrl_c_pending) {
-        var warning: std.ArrayList(u8) = .empty;
-        errdefer warning.deinit(alloc);
-        try warning.appendSlice(alloc, ui_render.statusline_style);
-        try row_text.appendClipped(alloc, &warning, "press ctrl+c again to exit", width);
-        try warning.appendSlice(alloc, ui_render.reset_style);
-        return warning;
-    }
-
-    const variants = [_][]const u8{
-        "↑↓ navigate     tab category     ←→ change     esc close",
-        "↑↓ navigate  tab category  ←→ change  esc close",
-        "↑↓ move  tab category  ←→ change  esc",
-        "tab category  ←→ change  esc",
-        "tab ←→ esc",
-    };
-    var hint = variants[variants.len - 1];
-    for (variants) |candidate| {
-        if (display_width.visibleWidth(candidate) <= width) {
-            hint = candidate;
-            break;
-        }
-    }
-
-    var row: std.ArrayList(u8) = .empty;
-    errdefer row.deinit(alloc);
-    try row.appendSlice(alloc, ui_render.dim_style);
-    try row_text.appendClipped(alloc, &row, hint, width);
-    try row.appendSlice(alloc, ui_render.reset_style);
-    return row;
+    return composeVariantHintRow(alloc, width, ctrl_c_pending, &settings_menu_hint_variants);
 }
 
 pub fn composeCompactCommandMenuHintRow(
@@ -876,20 +792,8 @@ pub fn composeCompactCommandMenuHintRow(
             "enter esc",
         },
     };
-    var hint = variants[variants.len - 1];
-    for (variants) |candidate| {
-        if (display_width.visibleWidth(candidate) <= width) {
-            hint = candidate;
-            break;
-        }
-    }
-
-    var row: std.ArrayList(u8) = .empty;
-    errdefer row.deinit(alloc);
-    try row.appendSlice(alloc, ui_render.dim_style);
-    try row_text.appendClipped(alloc, &row, hint, width);
-    try row.appendSlice(alloc, ui_render.reset_style);
-    return row;
+    // These menus have never shown the pending Ctrl+C warning.
+    return composeVariantHintRow(alloc, width, false, &variants);
 }
 
 const CatalogTabKind = enum {
@@ -899,15 +803,6 @@ const CatalogTabKind = enum {
 };
 
 fn composeCatalogMenuHintRow(alloc: Allocator, width: u16, ctrl_c_pending: bool, tab_kind: CatalogTabKind) !std.ArrayList(u8) {
-    if (ctrl_c_pending) {
-        var warning: std.ArrayList(u8) = .empty;
-        errdefer warning.deinit(alloc);
-        try warning.appendSlice(alloc, ui_render.statusline_style);
-        try row_text.appendClipped(alloc, &warning, "press ctrl+c again to exit", width);
-        try warning.appendSlice(alloc, ui_render.reset_style);
-        return warning;
-    }
-
     const source_variants = [_][]const u8{
         "↑↓ navigate     tab source     enter use     esc close",
         "↑↓ navigate  tab source  enter use  esc close",
@@ -934,44 +829,19 @@ fn composeCatalogMenuHintRow(alloc: Allocator, width: u16, ctrl_c_pending: bool,
         .provider => provider_variants,
         .scope => scope_variants,
     };
-    var hint = variants[variants.len - 1];
-    for (variants) |candidate| {
-        if (display_width.visibleWidth(candidate) <= width) {
-            hint = candidate;
-            break;
-        }
-    }
-
-    var row: std.ArrayList(u8) = .empty;
-    errdefer row.deinit(alloc);
-    try row.appendSlice(alloc, ui_render.dim_style);
-    try row_text.appendClipped(alloc, &row, hint, width);
-    try row.appendSlice(alloc, ui_render.reset_style);
-    return row;
+    return composeVariantHintRow(alloc, width, ctrl_c_pending, &variants);
 }
 
-pub fn composeSlashMenuHintRow(alloc: Allocator, width: u16) !std.ArrayList(u8) {
-    const variants = [_][]const u8{
-        "↑↓ navigate     enter use     esc close",
-        "↑↓ navigate  enter use  esc close",
-        "↑↓ move  enter  esc",
-        "enter use  esc close",
-        "enter esc",
-    };
-    var hint = variants[variants.len - 1];
-    for (variants) |candidate| {
-        if (display_width.visibleWidth(candidate) <= width) {
-            hint = candidate;
-            break;
-        }
-    }
+const slash_menu_hint_variants = [_][]const u8{
+    "↑↓ navigate     enter use     esc close",
+    "↑↓ navigate  enter use  esc close",
+    "↑↓ move  enter  esc",
+    "enter use  esc close",
+    "enter esc",
+};
 
-    var row: std.ArrayList(u8) = .empty;
-    errdefer row.deinit(alloc);
-    try row.appendSlice(alloc, ui_render.dim_style);
-    try row_text.appendClipped(alloc, &row, hint, width);
-    try row.appendSlice(alloc, ui_render.reset_style);
-    return row;
+pub fn composeSlashMenuHintRow(alloc: Allocator, width: u16) !std.ArrayList(u8) {
+    return composeVariantHintRow(alloc, width, false, &slash_menu_hint_variants);
 }
 
 test "slash menu hint keeps navigation and selection controls width safe" {

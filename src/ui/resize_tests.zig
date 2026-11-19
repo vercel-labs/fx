@@ -6466,7 +6466,7 @@ test "picker growth advances history while shrink and dismissal do not" {
     );
 }
 
-test "slash main page renders header categories selection range and contextual controls" {
+test "slash main page renders title categories selection and a more row" {
     const alloc = std.testing.allocator;
     var h = try Harness.init(alloc, 100, 24, 4);
     defer h.deinit();
@@ -6483,8 +6483,9 @@ test "slash main page renders header categories selection range and contextual c
     try renderTestFooter(&h, &input, &approval, &h.frame_redraw);
     try h.flush();
 
-    try expectGridContains(&h, "Commands 40 · type to filter");
-    try expectGridContains(&h, "1–6");
+    try expectGridNotContains(&h, "Commands 40");
+    try expectGridNotContains(&h, "type to filter");
+    try expectGridContains(&h, "↓ 35 more");
     try expectGridContains(&h, "/help");
     try expectGridContains(&h, "General");
     try expectGridContains(&h, "↑↓ navigate     enter use     esc close");
@@ -6493,7 +6494,7 @@ test "slash main page renders header categories selection range and contextual c
     h.frame_redraw = true;
     try renderTestFooter(&h, &input, &approval, &h.frame_redraw);
     try h.flush();
-    try expectGridContains(&h, "2–7");
+    try expectGridContains(&h, "↓ 33 more");
 
     input.inputResetState().clearCurrent(alloc);
     try input.edit_state.input.appendSlice(alloc, "/permissions ");
@@ -6504,11 +6505,11 @@ test "slash main page renders header categories selection range and contextual c
 
     try expectGridContains(&h, "ask");
     try expectGridContains(&h, "test-model");
-    try expectGridNotContains(&h, "Commands 40");
+    try expectGridNotContains(&h, "↓ 3");
     try expectGridNotContains(&h, "↑↓ navigate");
 }
 
-test "slash main page drops categories and ellipsizes descriptions when narrow" {
+test "slash main page keeps categories and ellipsizes descriptions when narrow" {
     const alloc = std.testing.allocator;
     var h = try Harness.init(alloc, 42, 18, 4);
     defer h.deinit();
@@ -6525,10 +6526,10 @@ test "slash main page drops categories and ellipsizes descriptions when narrow" 
     try renderTestFooter(&h, &input, &approval, &h.frame_redraw);
     try h.flush();
 
-    try expectGridContains(&h, "Commands 1");
+    try expectGridContains(&h, "commands");
     try expectGridContains(&h, "/model");
     try expectGridContains(&h, "…");
-    try expectGridNotContains(&h, "Model");
+    try expectGridContains(&h, "Model");
 }
 
 test "footer renders slash completions while stream is active" {
