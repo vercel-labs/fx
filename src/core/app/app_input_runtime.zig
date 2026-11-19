@@ -4340,7 +4340,7 @@ test "app_input_runtime one-row session picker keeps reverse scrolling sticky" {
     try std.testing.expectEqual(@as(usize, 4), picker.window_start);
 }
 
-test "app_input_runtime roomy session picker scrolls after twenty inline rows" {
+test "app_input_runtime session picker scrolls after five inline rows" {
     const alloc = std.testing.allocator;
     var app = try RoutingFakeApp.init(alloc);
     defer app.deinit();
@@ -4356,16 +4356,18 @@ test "app_input_runtime roomy session picker scrolls after twenty inline rows" {
     picker.load_state = .ready;
     for (0..25) |index| try appendRoutingSessionPickerSummary(alloc, picker, index);
 
+    // Five sessions show above the `↓ N more` row, so the sixth scrolls the
+    // list by one, and moving back up keeps that window.
     var down: usize = 0;
-    while (down < 20) : (down += 1) {
+    while (down < 5) : (down += 1) {
         try Runtime(RoutingFakeApp).routeModifiedHistory(&app, (&app).agent(), .down, 1);
     }
 
-    try std.testing.expectEqual(@as(usize, 20), picker.selected);
+    try std.testing.expectEqual(@as(usize, 5), picker.selected);
     try std.testing.expectEqual(@as(usize, 1), picker.window_start);
 
     try Runtime(RoutingFakeApp).routeModifiedHistory(&app, (&app).agent(), .up, -1);
-    try std.testing.expectEqual(@as(usize, 19), picker.selected);
+    try std.testing.expectEqual(@as(usize, 4), picker.selected);
     try std.testing.expectEqual(@as(usize, 1), picker.window_start);
 }
 
@@ -4431,7 +4433,7 @@ test "app_input_runtime Escape closes help and clears its composer search" {
     try std.testing.expectEqual(@as(usize, 0), app.input_runtime.edit_state.input.items.len);
 }
 
-test "app_input_runtime session picker uses the expanded responsive window before scrolling" {
+test "app_input_runtime session picker shows its whole window before scrolling" {
     const alloc = std.testing.allocator;
     var app = try RoutingFakeApp.init(alloc);
     defer app.deinit();
@@ -4448,11 +4450,11 @@ test "app_input_runtime session picker uses the expanded responsive window befor
     for (0..10) |index| try appendRoutingSessionPickerSummary(alloc, picker, index);
 
     var down: usize = 0;
-    while (down < 6) : (down += 1) {
+    while (down < 4) : (down += 1) {
         try Runtime(RoutingFakeApp).routeModifiedHistory(&app, (&app).agent(), .down, 1);
     }
 
-    try std.testing.expectEqual(@as(usize, 6), picker.selected);
+    try std.testing.expectEqual(@as(usize, 4), picker.selected);
     try std.testing.expectEqual(@as(usize, 0), picker.window_start);
 }
 
@@ -4486,7 +4488,12 @@ test "app_input_runtime session picker navigation keeps the inline window stable
     try Runtime(RoutingFakeApp).routeModifiedHistory(&app, (&app).agent(), .down, 1);
 
     try std.testing.expectEqual(@as(usize, 5), picker.selected);
-    try std.testing.expectEqual(@as(usize, 0), picker.window_start);
+    try std.testing.expectEqual(@as(usize, 1), picker.window_start);
+
+    try Runtime(RoutingFakeApp).routeModifiedHistory(&app, (&app).agent(), .up, -1);
+
+    try std.testing.expectEqual(@as(usize, 4), picker.selected);
+    try std.testing.expectEqual(@as(usize, 1), picker.window_start);
 }
 
 test "app_input_runtime routes auth picker navigation before composer history" {

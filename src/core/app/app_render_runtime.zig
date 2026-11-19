@@ -5593,7 +5593,7 @@ test "core.app_render_runtime settings help and resume menus share the inline fo
     try Runtime(CoordinatorTestApp).flushRequestedFrame(&app, (&app).agent());
     try std.testing.expect(!app.terminal.catalogMenuScreenActive());
     try std.testing.expect(try coordinatorGridContains(app.shell.shadow_vt.?.*, "catalog transcript remains visible"));
-    try std.testing.expect(try coordinatorGridContains(app.shell.shadow_vt.?.*, "Settings"));
+    try std.testing.expect(try coordinatorGridContains(app.shell.shadow_vt.?.*, "settings   < All >"));
 
     app.input_runtime.settings_menu.close();
     app.input_runtime.help_menu.open();
@@ -5601,7 +5601,7 @@ test "core.app_render_runtime settings help and resume menus share the inline fo
     try Runtime(CoordinatorTestApp).flushRequestedFrame(&app, (&app).agent());
     try std.testing.expect(!app.terminal.catalogMenuScreenActive());
     try std.testing.expect(try coordinatorGridContains(app.shell.shadow_vt.?.*, "catalog transcript remains visible"));
-    try std.testing.expect(try coordinatorGridContains(app.shell.shadow_vt.?.*, "Commands 1"));
+    try std.testing.expect(try coordinatorGridContains(app.shell.shadow_vt.?.*, "commands   < All >"));
 
     app.input_runtime.help_menu.close();
     app.agent().session_persistence.session_picker.active = true;
@@ -5610,7 +5610,7 @@ test "core.app_render_runtime settings help and resume menus share the inline fo
     try Runtime(CoordinatorTestApp).flushRequestedFrame(&app, (&app).agent());
     try std.testing.expect(!app.terminal.catalogMenuScreenActive());
     try std.testing.expect(try coordinatorGridContains(app.shell.shadow_vt.?.*, "catalog transcript remains visible"));
-    try std.testing.expect(try coordinatorGridContains(app.shell.shadow_vt.?.*, "Loading sessions"));
+    try std.testing.expect(try coordinatorGridContains(app.shell.shadow_vt.?.*, "loading sessions"));
 
     var read_offset: u64 = 0;
     const terminal_bytes = try readCoordinatorFrameBytes(alloc, file, &read_offset);
@@ -5619,7 +5619,7 @@ test "core.app_render_runtime settings help and resume menus share the inline fo
     try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, terminal_bytes, "\x1b[?1049l"));
 }
 
-test "core.app_render_runtime roomy resume footer paints twenty VT session rows" {
+test "core.app_render_runtime resume footer paints five VT session rows and a more row" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -5678,7 +5678,8 @@ test "core.app_render_runtime roomy resume footer paints twenty VT session rows"
             matching_rows += 1;
         }
     }
-    try std.testing.expectEqual(@as(usize, 20), matching_rows);
+    try std.testing.expectEqual(@as(usize, 5), matching_rows);
+    try std.testing.expect(try coordinatorGridContains(app.shell.shadow_vt.?.*, "↓ 20 more"));
     try std.testing.expect(try coordinatorGridContains(app.shell.shadow_vt.?.*, "twenty-row transcript remains visible"));
     try std.testing.expect(!app.terminal.catalogMenuScreenActive());
 

@@ -32,7 +32,7 @@ import { binary, targetHelpers, worktree } from "../lib/context";
 
 export const NONE = "none";
 export const LIST_HINT = "enter switch";
-export const ARMED_HINT = "press delete again to close this";
+export const ARMED_HINT = "press delete again to remove this";
 /// The hint row while the composer, the list's search box, holds a search.
 export const SEARCH_HINT = "esc clear";
 

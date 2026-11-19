@@ -1086,7 +1086,7 @@ function findInlineSkillsPicker(
 function findInlineHelpPicker(
   grid: string[],
 ): { input: number; topDivider: number; header: number; bottomDivider: number; hint: number } | null {
-  const header = grid.findIndex((line) => line.includes("Commands "));
+  const header = grid.findIndex((line) => line.startsWith("commands   <"));
   if (header <= 1 || !isDividerRow(grid[header - 1]!)) return null;
   const input = header - 2;
   if (!isInputRow(grid[input]!)) return null;
@@ -4145,11 +4145,11 @@ describe.skipIf(SKIP)("tui: resize", () => {
     async () => {
       session = await launchAt(120, 40);
       await session.sendText("/help");
-      await session.waitForText("Commands 40", 5_000);
+      await session.waitForText("commands   < All >", 5_000);
       await session.resizeWindow(76, 24, 400);
 
       const grid = await session.capturePaneGrid();
-      expect(grid.join("\n")).toContain("Commands 40");
+      expect(grid.join("\n")).toContain("commands   < All >");
       expect(findInlineHelpPicker(grid)).not.toBeNull();
 
       await session.sendKeys("Escape");
@@ -4167,7 +4167,7 @@ describe.skipIf(SKIP)("tui: resize", () => {
     async () => {
       session = await launchAt(120, 40);
       await session.sendText("/help");
-      await session.waitForText("Commands 40", 5_000);
+      await session.waitForText("commands   < All >", 5_000);
 
       const captureScrollback = () =>
         execSync(`tmux capture-pane -t ${session!.name} -p -S -`, {
@@ -4175,7 +4175,7 @@ describe.skipIf(SKIP)("tui: resize", () => {
           stdio: "pipe",
         });
       const expectHelpCatalog = (grid: string[]) => {
-        expect(grid.join("\n")).toContain("Commands 40");
+        expect(grid.join("\n")).toContain("commands   < All >");
         expect(findInlineHelpPicker(grid)).not.toBeNull();
       };
 
@@ -4193,7 +4193,7 @@ describe.skipIf(SKIP)("tui: resize", () => {
       const restored = captureScrollback();
       expect(restored.match(/𝒇x v\d+\.\d+\.\d+\b/g)).toHaveLength(1);
       expect(restored.match(/Run \/help for commands/g)).toHaveLength(1);
-      expect(restored).not.toContain("Commands 40");
+      expect(restored).not.toContain("commands   < All >");
       expect(findFooter(await session.capturePaneGrid())).not.toBeNull();
     },
     TIMEOUT,
@@ -4725,7 +4725,7 @@ describe.skipIf(SKIP)("tui: resize", () => {
         expect(await session.captureFullScrollback()).toContain(marker);
 
         await session.sendText("/help");
-        await session.waitForText("Commands 40", 5_000);
+        await session.waitForText("commands   < All >", 5_000);
         await session.resizeWindow(84, 28, 500);
 
         const catalog = await session.capturePaneGrid();
@@ -4739,7 +4739,7 @@ describe.skipIf(SKIP)("tui: resize", () => {
         );
         const scrollback = await session.captureFullScrollback();
         expect(scrollback).not.toContain(marker);
-        expect(scrollback).not.toContain("Commands 40");
+        expect(scrollback).not.toContain("commands   < All >");
         const finalGrid = await session.capturePaneGrid();
         expect(findFooter(finalGrid), finalGrid.join("\n")).not.toBeNull();
 

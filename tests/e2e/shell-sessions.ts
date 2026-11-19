@@ -7,6 +7,7 @@
 import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { cleanupIsolatedTestHome, createIsolatedTestHome, FX_BIN } from "../evals/eval-helpers";
+import { catalogMenuItemCount } from "./tui-render-assertions";
 import { infoPanel, panelReports, showsPanel, type InfoPanel, type PanelReport, type PanelTitle } from "./info-panel";
 import { FAKE_GATEWAY_MODEL, fakeGatewayFinalText, heldFakeGatewayFinalText, startDynamicFakeGateway, TmuxSession } from "./tmux-helpers";
 
@@ -298,9 +299,9 @@ export class Shell {
     return this.switching(async () => {
       await this.session.sendKeys("C-u");
       await this.session.sendText("/resume");
-      await this.session.waitForPane((pane) => pane.includes("Sessions") && /\[(Current|All) workspaces?\]/.test(pane), TIMEOUT);
+      await this.session.waitForPane((pane) => /^sessions   < (Current|All) workspaces? >/m.test(pane), TIMEOUT);
       await this.session.sendLiteralText(title);
-      await this.session.waitForPane((pane) => pane.includes("Sessions 1"), TIMEOUT);
+      await this.session.waitForPane((pane) => catalogMenuItemCount(pane.split("\n"), "sessions") === 1, TIMEOUT);
       await this.session.sendKeys("Enter");
       await this.session.waitForText("session resumed", TIMEOUT);
     }, "Open");

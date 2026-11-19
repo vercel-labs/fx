@@ -14,6 +14,7 @@ import {
   TmuxSession,
   tmuxAvailable,
 } from "./tmux-helpers";
+import { catalogMenuItemCount } from "./tui-render-assertions";
 
 // Switching between main and its subagents through the agent list, in one fx
 // process: ↓ on an empty composer or Ctrl+X opens it, moving through it shows
@@ -28,6 +29,11 @@ const LIST_HINT = "enter switch";
 // The agent list's row for main, which comes first, and for subagent `name`,
 // which sits under it behind a branch. With `state`, the row must also show
 // that state, such as "working".
+// The agents the list shows, from its rows and its `↓ N more` row.
+function agentCount(pane: string): number | null {
+  return catalogMenuItemCount(pane.split("\n"), "agents");
+}
+
 function mainRow(state = ""): RegExp {
   return new RegExp(`^ {2}main {2,}${state ? `.* {2,}${state}(?: {2,}|$)` : ""}`, "m");
 }
@@ -1152,10 +1158,10 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
           await session.waitForPane((pane) => /^[●├└] worker working$/m.test(pane), 15_000);
           await selectAgent(session, "worker");
           await session.sendKeys("BSpace");
-          await session.waitForText("press delete again to close this subagent", 10_000);
+          await session.waitForText("press delete again to remove this subagent", 10_000);
           await session.sendKeys("BSpace");
           // The closed worker leaves the list, which stays open on main.
-          await session.waitForPane((pane) => !subagentRow("worker").test(pane) && mainRow().test(pane) && pane.includes("esc back"), 15_000);
+          await session.waitForPane((pane) => !subagentRow("worker").test(pane) && mainRow().test(pane) && pane.includes("esc close"), 15_000);
           await session.sendKeys("Escape");
           await session.waitForText("SWITCH_MAIN_DONE", 30_000);
           // The close refused the message; it neither joined the closed
@@ -1762,7 +1768,7 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
           const list = await session.waitForPane((pane) => /^ {4}\u2514 helper /m.test(pane), 10_000);
           expect(list).toMatch(/^ {2}\u2514 lead /m);
           await session.sendKeys("Escape");
-          await session.waitForPane((pane) => !pane.includes("esc back"), 10_000);
+          await session.waitForPane((pane) => !pane.includes("esc close"), 10_000);
           // Lead, the helper's parent, waits on it.
           await showAgent(session, "lead");
           await session.waitForPane((pane) => /\u2022 waiting on 1 subagent \(\d+s\) \u00b7 \u2193 to view/.test(pane), 15_000);
@@ -2574,7 +2580,7 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         // From the idle composer it opens the list on main's row.
         await session.sendKeys("Down");
         const list = await session.waitForText(LIST_HINT, 10_000);
-        expect(list).toContain("Agents 2");
+        expect(agentCount(list)).toBe(2);
         expectRowOrder(list, mainRow(), subagentRow("reviewer"));
 
         // Down again shows the subagent above the list at once, and the list
@@ -2666,22 +2672,22 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         await session.sendKeys("C-x");
         // The draft is set aside, so the composer is the search box.
         const opened = await session.waitForPane((pane) => pane.includes(LIST_HINT) && !composerContains(pane, "EDGE_KEEP_ME"), 10_000);
-        expect(opened).toContain("Agents 2");
+        expect(agentCount(opened)).toBe(2);
 
         // Case aside, only reviewer's name has it, so main's row goes, and
         // the highlight moves to reviewer, which shows at once as a move
         // would show it.
         await session.sendLiteral("VIEW");
-        const found = await session.waitForPane((pane) => pane.includes("Agents 1") && composerContains(pane, "VIEW") && pane.includes("\u2503 EDGE_TASK"), 10_000);
+        const found = await session.waitForPane((pane) => agentCount(pane) === 1 && composerContains(pane, "VIEW") && pane.includes("\u2503 EDGE_TASK"), 10_000);
         expect(found).toMatch(subagentRow("reviewer"));
         expect(found).toContain("esc clear");
-        expect(found).not.toContain("delete close");
+        expect(found).not.toContain("delete remove");
         expect(found).not.toContain("EDGE_MAIN_FINAL");
 
         // Nothing matches: the list stays open, with no rows, and the agent
         // shown stays.
         await session.sendLiteral("q");
-        const none = await session.waitForPane((pane) => pane.includes("Agents 0") && composerContains(pane, "VIEWq"), 10_000);
+        const none = await session.waitForPane((pane) => pane.includes("no matching agents.") && composerContains(pane, "VIEWq"), 10_000);
         expect(none).not.toMatch(subagentRow("reviewer"));
         expect(none).toContain("\u2503 EDGE_TASK");
 
@@ -2691,16 +2697,16 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         // reviewer.
         await session.sendKeys("Up");
         await session.sendKeys("BSpace");
-        await session.waitForPane((pane) => pane.includes("Agents 1") && !composerContains(pane, "VIEWq"), 10_000);
+        await session.waitForPane((pane) => agentCount(pane) === 1 && !composerContains(pane, "VIEWq"), 10_000);
         await session.sendKeys("Escape");
-        const cleared = await session.waitForPane((pane) => pane.includes("Agents 2") && pane.includes("esc back"), 10_000);
+        const cleared = await session.waitForPane((pane) => agentCount(pane) === 2 && pane.includes("esc close"), 10_000);
         expect(composerContains(cleared, "VIEW")).toBe(false);
         await waitForSelectedRow(session, "reviewer");
 
         // Ctrl+X, with a search typed, goes back to main, the agent the list
         // opened on, with its draft.
         await session.sendLiteral("rev");
-        await session.waitForPane((pane) => pane.includes("Agents 1") && composerContains(pane, "rev"), 10_000);
+        await session.waitForPane((pane) => agentCount(pane) === 1 && composerContains(pane, "rev"), 10_000);
         await session.sendKeys("C-x");
         const back = await session.waitForPane((pane) => !pane.includes(LIST_HINT) && pane.includes("main \u00b7 ctrl+x"), 10_000);
         expect(back).toContain("EDGE_MAIN_FINAL");
@@ -2710,7 +2716,7 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         await session.sendKeys("C-x");
         await session.waitForText(LIST_HINT, 10_000);
         await session.sendLiteral("rev");
-        await session.waitForPane((pane) => pane.includes("Agents 1") && composerContains(pane, "rev"), 10_000);
+        await session.waitForPane((pane) => agentCount(pane) === 1 && composerContains(pane, "rev"), 10_000);
         await session.sendKeys("Enter");
         const child = await session.waitForPane((pane) => pane.includes("reviewer \u00b7 done \u2193"), 10_000);
         expect(composerContains(child, "rev")).toBe(false);
@@ -2829,11 +2835,11 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         // The model follows the state; the main profile goes unnamed.
         const list = await session.waitForPane((pane) => /^ {2}\u2514 reviewer {2,}Review the parser {2,}working {2,}\S+\s*$/m.test(pane), 15_000);
         expect(list).toMatch(/^ {2}main {2,}Plan the parser work {2,}idle {2,}\S+\s*$/m);
-        expect(list).toContain("Agents 2");
+        expect(agentCount(list)).toBe(2);
         // Main's row stays first and selected, above a working child.
         expectRowOrder(list, mainRow(), subagentRow("reviewer"));
-        expect(list).toContain("\u2191\u2193 preview     enter switch     esc back");
-        expect(list).not.toContain("delete close");
+        expect(list).toContain("\u2191\u2193 preview     enter switch     esc close");
+        expect(list).not.toContain("delete remove");
         await session.sendKeys("Escape");
         reviewer.release();
         await session.waitForPane((pane) => !pane.includes("subagent working") && !pane.includes("waiting on 1 subagent"), 30_000);
@@ -3141,7 +3147,7 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
           await waitForSelectedRow(session, "reviewer");
           await session.sendKeys("Down");
           const moved = await waitForSelectedRow(session, "tester");
-          expect(moved).toContain("enter switch     delete close     esc back");
+          expect(moved).toContain("enter switch     delete remove     esc close");
           // Each move shows the agent it lands on: tester is on screen now.
           const onTester = await session.waitForPane((pane) => pane.includes("\u2503 ORDER_TEST_TASK") && pane.includes(LIST_HINT), 10_000);
           expect(onTester).not.toContain("ORDER_MAIN_IDLE");
@@ -3172,7 +3178,7 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
           await session.waitForPane((pane) => pane.includes("ORDER_TESTER_DONE") && pane.includes(LIST_HINT), 10_000);
           // Enter keeps tester; wait for its footer, not only for the list to go.
           await session.sendKeys("Enter");
-          const kept = await session.waitForPane((pane) => !pane.includes("esc back") && pane.includes("tester \u00b7 done \u2193"), 10_000);
+          const kept = await session.waitForPane((pane) => !pane.includes("esc close") && pane.includes("tester \u00b7 done \u2193"), 10_000);
           expect(kept).toContain("ORDER_TESTER_DONE");
           expect(kept).toContain("tester \u00b7 done \u2193");
           expect(kept).not.toContain("ORDER_MAIN_IDLE");
@@ -3185,7 +3191,7 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
           const mainNewest = await session.waitForPane((pane) => pane.includes(LIST_HINT)
             && mainRow("idle").test(pane), 15_000);
           expectRowOrder(mainNewest, mainRow(), subagentRow("tester"), subagentRow("reviewer"));
-          expect(mainNewest).not.toContain("delete close");
+          expect(mainNewest).not.toContain("delete remove");
           await session.sendKeys("Enter");
           await session.waitForPane((pane) => !pane.includes(LIST_HINT), 10_000);
           expect(await session.captureFullScrollback()).toContain("ORDER_MAIN_NEWEST");
@@ -3200,7 +3206,7 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
           const restored = await resumed.waitForPane((pane) => pane.includes(LIST_HINT)
             && subagentRow("tester").test(pane) && subagentRow("reviewer").test(pane), 15_000);
           expectRowOrder(restored, mainRow(), subagentRow("tester"), subagentRow("reviewer"));
-          expect(restored).not.toContain("delete close");
+          expect(restored).not.toContain("delete remove");
           // Moving onto a saved subagent's row shows its saved conversation,
           // and moving back shows main's again.
           await resumed.sendKeys("Down");
@@ -3246,13 +3252,13 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         await session.waitForText("CLOSE_MAIN_WAITING", 30_000);
         await until("the reviewer's turn", () => childCalls >= 1);
         await session.sendKeys("Down");
-        await session.waitForText("esc back", 10_000);
+        await session.waitForText("esc close", 10_000);
         // On main's row, Delete does nothing: closing the only instance would end fx. The
         // next key is handled once the hint changes, so by then the trace
         // shows whether Delete armed anything.
         await session.sendKeys("BSpace");
         await session.sendKeys("Down");
-        const working = await session.waitForText("enter switch     delete close     esc back", 10_000);
+        const working = await session.waitForText("enter switch     delete remove     esc close", 10_000);
         // Behind the list is main's conversation, whose row names the
         // reviewer it messaged, or the highlighted reviewer's, which starts
         // with that message; which one shows first depends on timing.
@@ -3260,24 +3266,24 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         expectRowOrder(working, mainRow(), subagentRow("reviewer"));
         expect(readFileSync(tracePath, "utf8")).not.toContain("agents_menu_close_armed");
         await session.sendKeys("BSpace");
-        const warning = await session.waitForText("press delete again to close this subagent", 10_000);
+        const warning = await session.waitForText("press delete again to remove this subagent", 10_000);
         expect(warning).not.toContain("any other key");
         expect(readFileSync(tracePath, "utf8")).toContain("agents_menu_close_armed");
         // Any other key keeps it. Main's row is above the worker.
         await session.sendKeys("Up");
-        await session.waitForPane((pane) => !pane.includes("press delete again to close this subagent")
-          && mainRow().test(pane) && !pane.includes("delete close"), 10_000);
+        await session.waitForPane((pane) => !pane.includes("press delete again to remove this subagent")
+          && mainRow().test(pane) && !pane.includes("delete remove"), 10_000);
         await session.sendKeys("Down");
         // The forward Delete key arms and closes, as Backspace does.
         await session.sendKeys("DC");
-        await session.waitForText("press delete again to close this subagent", 10_000);
+        await session.waitForText("press delete again to remove this subagent", 10_000);
         await session.sendKeys("DC");
-        const closed = await session.waitForPane((pane) => !subagentRow("reviewer").test(pane) && pane.includes("esc back"), 15_000);
+        const closed = await session.waitForPane((pane) => !subagentRow("reviewer").test(pane) && pane.includes("esc close"), 15_000);
         // Main is on screen again, and the reviewer's turn ended with the close.
         expect(closed).toContain("SWITCH_USER review it");
         await session.sendKeys("Escape");
         // The list takes every key until it closes, /quit below included.
-        await session.waitForPane((pane) => !pane.includes("esc back"), 10_000);
+        await session.waitForPane((pane) => !pane.includes("esc close"), 10_000);
         await session.waitForText("CLOSE_MAIN_TOLD", 30_000);
         expect(await session.capturePane()).not.toContain("subagent working");
         reviewer.release();
@@ -3295,7 +3301,7 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         await resumed.sendKeys("Down");
         await resumed.sendLiteral("z");
         const typed = await resumed.waitForPane((pane) => composerContains(pane, "z"), 10_000);
-        expect(typed).not.toContain("esc back");
+        expect(typed).not.toContain("esc close");
       }, (home) => {
         tracePath = join(home, "fx-trace.log");
         env.FX_TRACE_LOG = tracePath;
@@ -3618,15 +3624,15 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         await session.waitForText("NOTE_MAIN_DONE", 30_000);
         await session.waitForComposer(15_000);
         await session.sendKeys("Down");
-        await session.waitForText("esc back", 10_000);
+        await session.waitForText("esc close", 10_000);
         await session.sendKeys("Down");
-        await session.waitForText("delete close", 10_000);
+        await session.waitForText("delete remove", 10_000);
         await session.sendKeys("BSpace");
-        await session.waitForText("press delete again to close this subagent", 10_000);
+        await session.waitForText("press delete again to remove this subagent", 10_000);
         await session.sendKeys("BSpace");
-        await session.waitForPane((pane) => !subagentRow("reviewer").test(pane) && pane.includes("esc back"), 15_000);
+        await session.waitForPane((pane) => !subagentRow("reviewer").test(pane) && pane.includes("esc close"), 15_000);
         await session.sendKeys("Escape");
-        await session.waitForPane((pane) => !pane.includes("esc back"), 10_000);
+        await session.waitForPane((pane) => !pane.includes("esc close"), 10_000);
         await session.sendText("SWITCH_USER again");
         await session.waitForText("NOTE_MAIN_AGAIN", 30_000);
       });
@@ -3671,33 +3677,33 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         await waitForSelectedRow(session, "tester");
         await session.sendKeys("Down");
         await waitForSelectedRow(session, "reviewer");
-        await session.waitForPane((pane) => pane.includes("\u2503 MIDDLE_REVIEW") && pane.includes("enter switch     delete close     esc back"), 10_000);
+        await session.waitForPane((pane) => pane.includes("\u2503 MIDDLE_REVIEW") && pane.includes("enter switch     delete remove     esc close"), 10_000);
         await session.sendKeys("BSpace");
-        await session.waitForText("press delete again to close this subagent", 10_000);
+        await session.waitForText("press delete again to remove this subagent", 10_000);
         // Any other key keeps it, and its warning goes at once.
         await session.sendKeys("Tab");
-        await session.waitForText("enter switch     delete close     esc back", 10_000);
+        await session.waitForText("enter switch     delete remove     esc close", 10_000);
         // Kitty-encoded Backspace also preserves the two-press confirmation.
         await session.sendLiteral("\x1b[127u");
-        await session.waitForText("press delete again to close this subagent", 10_000);
+        await session.waitForText("press delete again to remove this subagent", 10_000);
         await session.sendLiteral("\x1b[127;1u");
         // Reviewer, the agent shown, closes, and the row above it, tester,
         // takes its place on screen and in the highlight, not main.
-        await session.waitForPane((pane) => !subagentRow("reviewer").test(pane) && pane.includes("esc back"), 15_000);
+        await session.waitForPane((pane) => !subagentRow("reviewer").test(pane) && pane.includes("esc close"), 15_000);
         await waitForSelectedRow(session, "tester");
-        const above = await session.waitForPane((pane) => pane.includes("\u2503 MIDDLE_TEST") && pane.includes("delete close"), 10_000);
+        const above = await session.waitForPane((pane) => pane.includes("\u2503 MIDDLE_TEST") && pane.includes("delete remove"), 10_000);
         expect(above).toMatch(subagentRow("tester"));
         // Closing tester then shows main, the row above it.
         await session.sendKeys("BSpace");
-        await session.waitForText("press delete again to close this subagent", 10_000);
+        await session.waitForText("press delete again to remove this subagent", 10_000);
         await session.sendKeys("BSpace");
-        const closed = await session.waitForPane((pane) => !subagentRow("tester").test(pane) && pane.includes("esc back"), 15_000);
-        expect(closed).toContain("\u2191\u2193 preview     enter switch     esc back");
+        const closed = await session.waitForPane((pane) => !subagentRow("tester").test(pane) && pane.includes("esc close"), 15_000);
+        expect(closed).toContain("\u2191\u2193 preview     enter switch     esc close");
         await waitForSelectedRow(session, "main");
-        expect(closed).not.toContain("delete close");
+        expect(closed).not.toContain("delete remove");
         expect(await session.captureFullScrollback()).not.toContain("for good");
         await session.sendKeys("Enter");
-        const kept = await session.waitForPane((pane) => !pane.includes("esc back"), 10_000);
+        const kept = await session.waitForPane((pane) => !pane.includes("esc close"), 10_000);
         expect(kept).toContain("MIDDLE_MAIN_DONE");
         // Main is the only agent left, so the footer names none.
         expect(kept).not.toContain("main \u2193");
@@ -3756,7 +3762,7 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
           await session.sendKeys("C-x");
           await waitForSelectedRow(session, "lead");
           await session.sendKeys("BSpace");
-          await session.waitForText("press delete again to close this subagent", 10_000);
+          await session.waitForText("press delete again to remove this subagent", 10_000);
           await session.sendKeys("BSpace");
           await session.waitForPane((pane) => !subagentRow("lead").test(pane) && !/[\u251c\u2514] helper /.test(pane) && pane.includes(LIST_HINT), 15_000);
           await waitForSelectedRow(session, "first");
@@ -3920,7 +3926,7 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         await session.sendKeys("Down");
         await session.sendLiteral("z");
         const typed = await session.waitForPane((pane) => composerContains(pane, "z"), 10_000);
-        expect(typed).not.toContain("esc back");
+        expect(typed).not.toContain("esc close");
       });
     },
     TIMEOUT,

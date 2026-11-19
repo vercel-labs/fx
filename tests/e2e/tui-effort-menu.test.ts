@@ -19,6 +19,7 @@ import {
   TmuxSession,
   tmuxAvailable,
 } from "./tmux-helpers";
+import { catalogMenuItemCount } from "./tui-render-assertions";
 
 const TIMEOUT = 60_000;
 const MODEL = "acme/thinker";
@@ -139,27 +140,33 @@ async function quit(current: Shell): Promise<void> {
   shell = null;
 }
 
-/// What the `/effort` menu shows in `grid`, or null: its `Effort` title
-/// with the level count and the model, then one row per level, the one in
-/// use marked `current`.
+/// What the `/effort` menu shows in `grid`, or null: its `effort · <model>`
+/// title, then one row per level, the one in use marked `current`, and a
+/// `↓ N more` row for the levels below the window. `count` adds those up.
 type EffortMenuView = { count: number; model: string; levels: string[]; current: string | null };
 
 function effortMenu(grid: string[]): EffortMenuView | null {
   const rows = grid.map((row) => row.trimEnd());
-  const top = rows.findIndex((row) => /^Effort \d+(?: {2}\S.*)?$/.test(row));
+  const top = rows.findIndex((row) => /^effort(?: · \S.*)?$/.test(row));
   if (top < 0) return null;
-  const header = /^Effort (\d+)(?: {2}(.*))?$/.exec(rows[top]!)!;
+  const header = /^effort(?: · (.*))?$/.exec(rows[top]!)!;
   const levels: string[] = [];
   let current: string | null = null;
+  let below = 0;
   for (let at = top + 1; at < rows.length; at++) {
     const row = rows[at]!;
     if (row === "" && levels.length === 0) continue;
+    const more = /^ {2}↓ (\d+) more$/.exec(row);
+    if (more) {
+      below = Number(more[1]);
+      break;
+    }
     const level = /^ {2}(\S+)(?: +(current))?$/.exec(row);
     if (!level) break;
     levels.push(level[1]!);
     if (level[2]) current = level[1]!;
   }
-  return { count: Number(header[1]), model: header[2] ?? "", levels, current };
+  return { count: levels.length + below, model: header[1] ?? "", levels, current };
 }
 
 /// Each grid of the tape that shows the menu, in order, with its frame.
@@ -189,19 +196,23 @@ function highlightsAfter(current: Shell, key: RegExp): string[] {
       .filter((frame) => frame.kind === STDOUT && frame.index > press.index && frame.index < next)
       .map((frame) => frame.payload.toString("utf8"))
       .join("");
-    const bold = [...painted.matchAll(new RegExp(`\\x1b\\[1m(?:\\x1b\\[[0-9;]*m)*(${labels})(?![a-z])`, "g"))];
+    const bold = [...painted.matchAll(new RegExp(`\\x1b\\[1m(?:\\x1b\\[[0-9;]*m)* *(${labels})(?![a-z])`, "g"))];
     return bold.at(-1)?.[1] ?? "<none>";
   });
 }
 
 type Traced = { session: TmuxSession; tape: string; trace: string };
 
-/// Waits for `text` in the `/effort` menu after `/effort` and Enter. CI keeps
-/// no tape or trace, so when the menu does not show it this prints what fx
-/// read and what its input code did, then fails as the wait failed.
-async function waitForEffortMenu(current: Traced, text = "Effort 5"): Promise<void> {
+/// The effort menu's title row, `effort · <model>`.
+const EFFORT_TITLE = /^effort( · |\s*$)/m;
+
+/// Waits for the `/effort` menu to list `levels` levels after `/effort` and
+/// Enter. CI keeps no tape or trace, so when the menu does not show them this
+/// prints what fx read and what its input code did, then fails as the wait
+/// failed.
+async function waitForEffortMenu(current: Traced, levels = 5): Promise<void> {
   try {
-    await current.session.waitForText(text, 5_000);
+    await current.session.waitForPane((pane) => catalogMenuItemCount(pane.split("\n"), "effort") === levels, 5_000);
   } catch (error) {
     console.error(effortMenuDiagnostics(current));
     throw error;
@@ -283,14 +294,14 @@ test.skipIf(!tmuxAvailable())("/effort lists the model's levels with the one in 
   // Opened again, the menu marks and highlights the level now in use. Esc
   // closes it without a change.
   await session.sendText("/effort");
-  await waitForEffortMenu(current, "high     current");
+  await current.session.waitForText(/^ {2}high +current$/m, 5_000);
   await session.sendKeys("Escape");
-  await session.waitForPane((pane) => !pane.includes("Effort 5"), 5_000);
+  await session.waitForPane((pane) => !EFFORT_TITLE.test(pane), 5_000);
   // A typed character closes the menu and lands in the composer.
   await session.sendText("/effort");
   await waitForEffortMenu(current);
   await session.sendLiteral("x");
-  await session.waitForPane((pane) => !pane.includes("Effort 5") && /^┃ x$/m.test(pane), 5_000);
+  await session.waitForPane((pane) => !EFFORT_TITLE.test(pane) && /^┃ x$/m.test(pane), 5_000);
   await session.sendKeys("C-u");
   expect(savedEffort(current)).toBe("high");
   expect(readFileSync(current.stderrPath, "utf8")).toBe("");
@@ -308,7 +319,7 @@ test.skipIf(!tmuxAvailable())("/effort lists the model's levels with the one in 
   const grids = replayGrids(FX_BIN, current.tape, join(current.root, "apply-final.frames"));
   const last = [...grids.entries()].sort((a, b) => a[0] - b[0]).at(-1)![1].join("\n");
   expect(count(last, "Reasoning effort set to high for acme/thinker")).toBe(1);
-  expect(last).not.toContain("Effort 5");
+  expect(last).not.toMatch(EFFORT_TITLE);
   expect(last).not.toMatch(/^ {2}medium$/m);
 }, TIMEOUT);
 
@@ -405,17 +416,23 @@ test.skipIf(!tmuxAvailable())("a short terminal shows one level at a time, ↓ s
   const { session } = current;
   const kept = lastTranscriptRow((await session.capturePane()).split("\n"));
   await session.sendText("/effort");
-  await waitForEffortMenu(current);
+  // Two rows leave no room for the title: one level, then the more row.
+  await session.waitForPane((pane) => /^ {2}default +current$/m.test(pane) && pane.includes("↓ 4 more"), 5_000);
   for (let step = 1; step < LEVELS.length; step++) await press(session, "Down");
   await session.sendKeys("Escape");
-  await session.waitForPane((pane) => !pane.includes("Effort 5"), 5_000);
+  await session.waitForPane((pane) => !/^ {2}↓ \d+ more$/m.test(pane) && !/^ {2}xhigh$/m.test(pane), 5_000);
   await quit(current);
 
-  const views = menuViews(current, "short");
-  // One level shows under the title, and each ↓ shows the next one.
-  const shown = views.map((view) => view.menu.levels);
-  expect(shown.every((levels) => levels.length === 1)).toBe(true);
-  expect([...new Set(shown.map((levels) => levels[0]))]).toEqual(LEVELS);
+  // Without a title, the menu's level rows mark it in each grid of the tape.
+  const levelRow = new RegExp(`^ {2}(${LEVELS.join("|")})(?: +current)?$`);
+  const grids = replayGrids(FX_BIN, current.tape, join(current.root, "short.frames"));
+  const views = [...grids.entries()]
+    .sort((a, b) => a[0] - b[0])
+    .map(([, grid]) => ({ grid, levels: grid.map((row) => levelRow.exec(row.trimEnd())?.[1]).filter((level) => level !== undefined) }))
+    .filter((view) => view.levels.length > 0);
+  // One level shows at a time, and each ↓ shows the next one.
+  expect(views.every((view) => view.levels.length === 1)).toBe(true);
+  expect([...new Set(views.map((view) => view.levels[0]))]).toEqual(LEVELS);
   // The menu leaves the end of the transcript in view rather than cover it.
   for (const view of views) expect(view.grid.map((row) => row.trimEnd())).toContain(kept);
 }, TIMEOUT);
@@ -500,7 +517,7 @@ test.skipIf(!tmuxAvailable())("Ctrl+T steps from default through the model's lev
   await waitForEffortMenu(current);
   await press(session, "Up");
   await session.sendKeys("C-t");
-  await session.waitForPane((pane) => !pane.includes("Effort 5") && pane.includes("auto · thinker · low"), 5_000);
+  await session.waitForPane((pane) => !EFFORT_TITLE.test(pane) && pane.includes("auto · thinker · low"), 5_000);
   expect(savedEffort(current)).toBe("low");
 
   // The status line names each level, and the draft stays as typed. After
@@ -586,7 +603,7 @@ test.skipIf(!tmuxAvailable())("on a custom connection, /effort lists the levels 
   const { session, f } = current;
   try {
     await session.sendText("/effort");
-    await waitForEffortMenu(current, "Effort 3");
+    await waitForEffortMenu(current, 3);
     // default, high, low: Down twice reaches low.
     await press(session, "Down");
     await press(session, "Down");

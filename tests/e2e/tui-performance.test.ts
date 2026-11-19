@@ -40,10 +40,10 @@ const ACTIVE_TURN_DESCRIPTOR_BUDGET = 7;
 const TIMEOUT = 60_000;
 
 const LOCAL_MENU_ACTIONS = [
-  { name: "helpOpen", command: "/help", marker: "Commands " },
-  { name: "settingsOpen", command: "/settings", marker: "Settings" },
+  { name: "helpOpen", command: "/help", marker: "tab category" },
+  { name: "settingsOpen", command: "/settings", marker: "←→ change" },
   { name: "modelOpen", command: "/model", marker: "models" },
-  { name: "resumeOpen", command: "/resume", marker: "Sessions " },
+  { name: "resumeOpen", command: "/resume", marker: "tab scope" },
   { name: "mcpOpen", command: "/mcp", marker: "MCP servers" },
   { name: "usageOpen", command: "/usage", marker: "usage: API key" },
   { name: "statuslineOpen", command: "/statusline", marker: "Status line" },

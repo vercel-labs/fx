@@ -500,10 +500,13 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
         expect(startup).not.toContain("adaptive");
         expect(startup).not.toContain("⚡︎ fast");
         await session.sendText("/settings");
-        const pane = await session.waitForText("←→ change", TIMEOUT);
-        expect(pane).toContain("anthropic/claude-opus-4.7");
-        expect(pane).toContain("Startup scrollback");
-        expect(pane).toContain("Prompt history");
+        await session.waitForText("←→ change", TIMEOUT);
+        // The list shows five settings at a time, so the search finds each.
+        for (const [query, shown] of [["model", "anthropic/claude-opus-4.7"], ["startup", "Startup scrollback"], ["prompt history", "Prompt history"]]) {
+          await session.sendLiteralText(query);
+          await session.waitForText(shown, TIMEOUT);
+          await session.sendKeys("C-u");
+        }
         await session.sendKeys("Escape");
         await session.waitForPane(
           (current) =>

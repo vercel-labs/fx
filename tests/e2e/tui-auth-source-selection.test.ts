@@ -3924,7 +3924,7 @@ for (const [provider, previousProvider] of [
           await session.waitForComposer(TIMEOUT);
           if (resumeMode === "picker") {
             await session.sendText("/resume");
-            await session.waitForPane((pane) => pane.includes("Sessions") && /\bturns?\b/.test(pane), TIMEOUT);
+            await session.waitForPane((pane) => pane.includes("sessions   <") && /\bturns?\b/.test(pane), TIMEOUT);
             await session.sendKeys("Enter");
             await session.waitForText("* session resumed:", TIMEOUT);
           }
