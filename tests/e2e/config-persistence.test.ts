@@ -78,7 +78,7 @@ async function disablePromptHistory(
   await session.waitForText("←→ change", TIMEOUT);
   await session.sendLiteral("prompt history");
   await session.waitForPane(
-    (pane) => pane.includes("Prompt history") && !pane.includes("Startup scrollback"),
+    (pane) => pane.includes("prompt history") && !pane.includes("Startup scrollback"),
     TIMEOUT,
   );
   await session.sendKeys("Left");
@@ -180,7 +180,7 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
       expect(statSync(settingsPath).mode & 0o022).toBe(0);
 
       const second = await launch("second");
-      expect(second).not.toContain("Other users could write");
+      expect(second).not.toContain("other users could write");
       expect(second).not.toContain("configuration issue");
     } finally {
       await session?.kill();
@@ -259,7 +259,7 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
       if (created.code !== 0) throw new Error(created.stdout + created.stderr);
       const id = JSON.parse(created.stdout).session_id;
       session = await TmuxSession.create({ cmd: `${JSON.stringify(FX_BIN)} --resume ${JSON.stringify(id)}`, cwd: fixture.workspace, env: { ...env, FX_TEST_PROVIDER_TOKEN: undefined } });
-      await session.waitForText("Configured provider authentication is unavailable", TIMEOUT);
+      await session.waitForText("configured provider authentication is unavailable", TIMEOUT);
       await session.waitForComposer(TIMEOUT);
       await session.sendText("must not send with the startup key");
       await Bun.sleep(500);
@@ -713,7 +713,7 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
         });
         await session.waitForText("run /help", TIMEOUT);
         await session.sendText("/output quiet");
-        await session.waitForText("fx needs access to Vercel AI Gateway", TIMEOUT);
+        await session.waitForText("fx needs access to vercel AI gateway", TIMEOUT);
         expect(composerContains(await session.capturePane(), "/output quiet")).toBe(
           true,
         );
@@ -1029,7 +1029,7 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
         await session.sendText("/settings");
         await session.waitForText("←→ change", TIMEOUT);
         await session.sendLiteral("reason");
-        const effortSetting = await session.waitForText("Reasoning effort", TIMEOUT);
+        const effortSetting = await session.waitForText("reasoning effort", TIMEOUT);
         expect(effortSetting).toContain("low");
         await session.sendKeys("Right");
 

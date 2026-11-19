@@ -98,7 +98,7 @@ describe("TUI custom connection errors", () => {
       await tui.sendText("/resume");
       // The only saved session is selected, so Enter opens it.
       await tui.sendKeys("Enter");
-      await tui.waitForText("This session's custom connection changed in ~/.fx/settings.json after the session was saved", 15000);
+      await tui.waitForText("this session's custom connection changed in ~/.fx/settings.json after the session was saved", 15000);
       expect(f.requests).toHaveLength(1);
     } finally {
       await tui?.kill();
@@ -119,7 +119,7 @@ describe("TUI custom connection errors", () => {
       f.save();
       await tui.sendText("second turn");
       await tui.sendKeys("Enter");
-      const screen = await tui.waitForText("This session's custom connection changed in ~/.fx/settings.json after the session was saved", 15000);
+      const screen = await tui.waitForText("this session's custom connection changed in ~/.fx/settings.json after the session was saved", 15000);
       expect(screen).not.toContain("press enter to retry");
       expect(f.requests).toHaveLength(1);
     } finally {

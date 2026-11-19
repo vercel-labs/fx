@@ -85,16 +85,16 @@ scenario("a remembered rule shows with the id /permissions revoke takes, and is 
   await shell.prompt("Save this session first.", "SESSION_SAVED");
   const args = JSON.stringify({ action: "run", timeout_ms: 600_000, command: "touch remembered-marker" });
   await shell.session.sendText(`/permissions remember deny shell ${args}`);
-  await shell.session.waitForText("Remember deny for this saved session", STEP);
+  await shell.session.waitForText("remember deny for this saved session", STEP);
   await shell.session.sendKeys("1");
   await shell.session.waitForText("saved-session permission rule updated", STEP);
   await shell.session.waitForStableComposer(STEP);
 
   const live = await shell.permissions();
-  const ruleId = /^(\d+) deny /.exec(live.items["Saved rules"]?.[0] ?? "")?.[1];
+  const ruleId = /^(\d+) deny /.exec(live.items["saved rules"]?.[0] ?? "")?.[1];
   expect(ruleId).toBeDefined();
   await shell.session.sendText(`/permissions revoke ${ruleId}`);
-  await shell.session.waitForText("Revoke this saved-session permission rule?", STEP);
+  await shell.session.waitForText("revoke this saved-session permission rule?", STEP);
   await shell.session.sendKeys("1");
   await shell.session.waitForStableComposer(STEP);
   await shell.permissions();
@@ -105,7 +105,7 @@ scenario("a remembered rule shows with the id /permissions revoke takes, and is 
   expectPanel(remembered!, "auto");
   expect(remembered!.fields["Saved rules"]).toBe("1");
   expect(remembered!.items["Saved rules"]).toHaveLength(1);
-  expect(remembered!.items["Saved rules"]![0]).toMatch(new RegExp(`^${ruleId} deny shell\\.run touch \\S*remembered-marker$`));
+  expect(remembered!.items["saved rules"]![0]).toMatch(new RegExp(`^${ruleId} deny shell\\.run touch \\S*remembered-marker$`));
   expectPanel(revoked!, "auto");
   expect(revoked!.fields["Saved rules"]).toBe("none");
   expect(revoked!.items["Saved rules"]).toBeUndefined();
@@ -148,7 +148,7 @@ scenario("a session grant an approval adds while the panel is open shows when th
   const approvalShown = (grid: string[]) => grid.some((row) => row.includes("apply + allow workspace file access for this session"));
   const states = painted.map((index) => {
     const grid = grids.get(index)!;
-    const panel = infoPanel(grid, "Permissions");
+    const panel = infoPanel(grid, "permissions");
     const wrote = grid.some((row) => row.includes("wrote note.txt"));
     return { index, approval: approvalShown(grid), wrote, grants: panel?.fields["Session grants"], items: panel?.items["Session grants"] };
   });
@@ -184,7 +184,7 @@ scenario("a long rule wraps under its bullet in a narrow terminal and reads back
   const [report] = shell.reports("Permissions");
   expectPanel(report!, "auto");
   expect(report!.grid.every((row) => [...row].length <= 50)).toBe(true);
-  expect(report!.items["Configured rules"]).toEqual([`allow bash → ${pattern}`]);
+  expect(report!.items["configured rules"]).toEqual([`allow bash → ${pattern}`]);
   // The rule's later lines start under its text, past the bullet.
   const bullet = report!.rows.findIndex((row) => row.trimStart().startsWith("• allow bash"));
   const column = report!.rows[bullet]!.indexOf("•");

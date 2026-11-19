@@ -297,7 +297,7 @@ describe("fx doctor exit code and output", () => {
     const result = await doctor(r, env(r, { ...acceptingGateway(), AI_GATEWAY_API_KEY: "doctor-key" }));
     const out = result.stdout;
     expect(out).toMatch(/^fx doctor  fx \S+\n\n/);
-    expect(out).toContain(`  Workspace    ${realpathSync(r.workspace)}\n`);
+    expect(out).toContain(`  workspace    ${realpathSync(r.workspace)}\n`);
     expect(out).toContain(`  Model        ${MODEL}\n`);
     expect(out).toContain("  Auth         AI_GATEWAY_API_KEY\n");
     expect(out).toMatch(/^  Permissions  \S+$/m);

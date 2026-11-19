@@ -712,7 +712,7 @@ describe.skipIf(!tmuxAvailable())("tui: file permissions", () => {
       await session.waitForText("full review complete", TIMEOUT);
       expect(gateway.requests).toHaveLength(3);
       const scrollback = await session.captureFullScrollback();
-      expect(scrollback).not.toContain("Apply this change?");
+      expect(scrollback).not.toContain("apply this change?");
       expect(scrollback).not.toContain("+ review-line-15");
       const replay = await runFx(["replay", tapePath, "--frames"], {
         cwd: root.workspace,
@@ -791,7 +791,7 @@ describe.skipIf(!tmuxAvailable())("tui: file permissions", () => {
         ) + "\n",
       );
       const scrollback = await session.captureFullScrollback();
-      expect(scrollback).not.toContain("Apply this change?");
+      expect(scrollback).not.toContain("apply this change?");
       expect(scrollback).not.toContain("line-0500");
       expect(scrollback).not.toContain("line-0501");
       expect(scrollback).not.toContain("⋯ 495 unchanged lines ⋯");

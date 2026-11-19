@@ -95,8 +95,8 @@ describe.skipIf(TMUX_SKIP)("tui: no-key slash commands", () => {
       session = launched.terminal;
       try {
         await session.sendText("/compact");
-        await session.waitForText("No context to compact.", 5_000);
-        await session.waitForPane((pane) => !pane.includes("No context to compact."), 5_000);
+        await session.waitForText("no context to compact.", 5_000);
+        await session.waitForPane((pane) => !pane.includes("no context to compact."), 5_000);
         await session.waitForComposer(5_000);
         const scrollback = await session.captureFullScrollbackEscapes();
         expect(scrollback).toContain("run /help for commands");
@@ -194,7 +194,7 @@ describe.skipIf(TMUX_SKIP)("tui: no-key slash commands", () => {
   /// Rows of `scrollback` that hold a labeled line of the `/status` panel.
   function panelLinesIn(scrollback: string): string[] {
     return scrollback.split("\n").filter((row) =>
-      ["Session", "Permissions", "Session grants"].some((label) => new RegExp(`^ {2}${label} {2,}\\S`).test(row)));
+      ["Session", "permissions", "session grants"].some((label) => new RegExp(`^ {2}${label} {2,}\\S`).test(row)));
   }
 
   test(

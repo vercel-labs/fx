@@ -710,7 +710,7 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
         const printed = await quitWith(session, "/exit");
         const second = sessionHolding(home, "HOST_ANSWER_B");
         expect(second).not.toBeNull();
-        expect(printed).toContain(`Resume this session with:\nfx --resume ${second}\n`);
+        expect(printed).toContain(`resume this session with:\nfx --resume ${second}\n`);
         expect(printed).not.toContain(`fx --resume ${sessionHolding(home, "HOST_ANSWER_A")}`);
       });
     },
@@ -738,7 +738,7 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
         });
         const saved = sessionHolding(home, "HOST_ANSWER_A");
         expect(saved).not.toBeNull();
-        expect(printed).toContain(`Resume this session with:\nfx --resume ${saved}\n`);
+        expect(printed).toContain(`resume this session with:\nfx --resume ${saved}\n`);
         // Resuming it brings back fx 1 alone, with no notice about the others.
         await withHost(answerByLetter, { args: `--resume ${saved}`, reuse: { home, workspace } }, async ({ session }) => {
           const pane = await session.waitForPane((value) => value.includes("HOST_ANSWER_A"), 30_000);
@@ -765,7 +765,7 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
         const printed = await quitWith(session, "/close");
         const last = sessionHolding(home, "HOST_ANSWER_B");
         expect(last).not.toBeNull();
-        expect(printed).toContain(`Resume this session with:\nfx --resume ${last}\n`);
+        expect(printed).toContain(`resume this session with:\nfx --resume ${last}\n`);
       });
     },
     TIMEOUT,
@@ -1427,7 +1427,7 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
         await session.waitForPane((pane) => pane.includes("fx 2/2"), 15_000);
         await session.waitForComposer(15_000);
         await session.sendText("/effort low");
-        await session.waitForText("Reasoning effort set to", 15_000);
+        await session.waitForText("reasoning effort set to", 15_000);
         await session.waitForComposer(15_000);
         await promptMarker(session, "EFFORT_SECOND");
         await switchAgent(session, "previous");
@@ -1631,7 +1631,7 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
           await session.waitForPane((pane) => pane.includes("fx 2/2"), 15_000);
           await session.waitForComposer(15_000);
           await session.sendText("/effort low");
-          await session.waitForText("Reasoning effort set to", 15_000);
+          await session.waitForText("reasoning effort set to", 15_000);
           await session.waitForComposer(15_000);
           await promptMarker(session, "SAVED_TURN");
           await quitWith(session, "/exit");
@@ -1911,10 +1911,10 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
         // Ctrl+X opens the list in place of an open panel, which holds
         // typed keys.
         await session.sendText("/status");
-        await session.waitForPane((pane) => pane.includes("Step limit"), 15_000);
+        await session.waitForPane((pane) => pane.includes("step limit"), 15_000);
         await session.sendKeys("C-x");
         const list = await session.waitForPane((pane) => instanceRow(3).test(pane), 15_000);
-        expect(list).not.toContain("Step limit");
+        expect(list).not.toContain("step limit");
         expect(catalogMenuItemCount(list.split("\n"), "agents")).toBe(3);
         expect(list).toMatch(instanceRow(1));
         expect(list).toMatch(/^ {2}fx 2 {2,}new session {2,}idle {2,}\S+\s*$/m);
@@ -2250,7 +2250,7 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
         await session.sendKeys("Escape");
         // Esc on its own screen ends the request, and the note goes.
         await switchAgent(session, "next");
-        await session.waitForPane((pane) => pane.includes("fx 2/2") && pane.includes("press Esc"), 15_000);
+        await session.waitForPane((pane) => pane.includes("fx 2/2") && pane.includes("press esc"), 15_000);
         await session.sendKeys("Escape");
         await session.waitForPane((pane) => !pane.includes("the provider rejected this request"), 15_000);
         await switchAgent(session, "previous");

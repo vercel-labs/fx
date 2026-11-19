@@ -194,7 +194,7 @@ function expectTwoTurns(rows: string[]) {
     ["┃ List the folder"],
     ["Checking the folder."],
     [MODEL, "in 120", "out 18", genId(1)],
-    ["Ran", "printf 'alpha\\nbeta\\n'"],
+    ["ran", "printf 'alpha\\nbeta\\n'"],
     ["alpha"],
     ["beta"],
     ["Done: two lines."],
@@ -261,7 +261,7 @@ describe("Ctrl+O full detail", () => {
       await Bun.sleep(3_000);
       session = await start(`${binary} --resume ${onlySessionId(env.home)}`, env.workspace, env.env);
       const resumed = await fullDetail(session);
-      expectInOrder(resumed, [["┃ Stop me midway"], ["Checking the folder."], [MODEL, "in 120", "out 18", genId(4)], ["Ran", "printf"]]);
+      expectInOrder(resumed, [["┃ Stop me midway"], ["Checking the folder."], [MODEL, "in 120", "out 18", genId(4)], ["ran", "printf"]]);
       const [sent, shown] = [promptTimes(live)[0]!, promptTimes(resumed)[0]!];
       expect(Math.abs(secondsOf(shown) - secondsOf(sent))).toBeLessThanOrEqual(2);
     } finally {
@@ -280,7 +280,7 @@ describe("Ctrl+O full detail", () => {
       expectNoClutter(rows);
       expectInOrder(rows, [
         ["┃ Try the flaky route"],
-        ["Error ·", "rate limited"],
+        ["error ·", "rate limited"],
         ["gateway", MODEL],
         ["Recovered answer."],
         [MODEL, "in 90", "out 4", genId(7)],
@@ -303,7 +303,7 @@ describe("Ctrl+O full detail", () => {
       expectInOrder(rows, [
         ["┃ Run it quietly"],
         [MODEL, "in 50", "out 6", genId(5)],
-        ["Ran", "printf quiet"],
+        ["ran", "printf quiet"],
         ["Answered without an ID."],
         [MODEL, "in 7", "out 2", "no gen ID"],
         ["Turn ·"],
@@ -322,7 +322,7 @@ describe("Ctrl+O full detail", () => {
       await ask(session, "Try the broken route", "Second try worked.");
       const rows = await fullDetail(session);
       expectNoClutter(rows);
-      expectInOrder(rows, [["┃ Try the broken route"], ["Error ·"], ["gateway", MODEL], ["Second try worked."], [MODEL, "in 30", "out 3", genId(8)]]);
+      expectInOrder(rows, [["┃ Try the broken route"], ["error ·"], ["gateway", MODEL], ["Second try worked."], [MODEL, "in 30", "out 3", genId(8)]]);
     } finally {
       await session?.kill();
       env.cleanup();
@@ -365,7 +365,7 @@ describe("Ctrl+O full detail", () => {
         const rows = await fullDetail(session);
         expectNoClutter(rows);
         for (const row of rows) expect([...row].length).toBeLessThanOrEqual(width);
-        expectInOrder(rows, [["┃ List the folder"], ["Checking the folder."], [genId(1)], ["Ran"], ["alpha"], ["Done: two lines."], [genId(2)]]);
+        expectInOrder(rows, [["┃ List the folder"], ["Checking the folder."], [genId(1)], ["ran"], ["alpha"], ["Done: two lines."], [genId(2)]]);
       } finally {
         await session?.kill();
         env.cleanup();
@@ -416,7 +416,7 @@ describe("Ctrl+O full detail", () => {
         "  Done: two lines.",
         `  <time> · gpt-5 · <secs> · in 210 · out 9 · ${genId(2)}`,
         "",
-        "  Turn · <time> · <secs> (↑4 ↓27)",
+        "  turn · <time> · <secs> (↑4 ↓27)",
       ]);
     } finally {
       await session?.kill();

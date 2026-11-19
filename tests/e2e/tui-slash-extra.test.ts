@@ -211,14 +211,14 @@ describe.skipIf(!tmuxAvailable())("tui: credits slash command", () => {
         await waitForRequestCount(gateway.requests, 1);
 
         await session.sendText("/credits");
-        await session.waitForText("Checking credits…", 1_000);
+        await session.waitForText("checking credits…", 1_000);
         const draft = "TYPING_WHILE_CREDITS_LOAD";
         await session.sendLiteral(draft);
         await session.waitForPane((pane) => pane.includes(draft), 1_000);
         await session.sendKeys("C-u");
         await session.sendKeys("C-k");
         await session.sendText("/credits");
-        await session.waitForText("Credits are still loading.", 1_000);
+        await session.waitForText("credits are still loading.", 1_000);
 
         await session.waitForText("Buy credits to use AI Gateway.", 10_000);
         await session.waitForComposer(10_000);
@@ -281,13 +281,13 @@ describe.skipIf(!tmuxAvailable() || CLIPBOARD_PROGRAM === null)("tui: clipboard 
         await session.waitForText("clipboard host sentinel", 10_000);
         await session.waitForComposer(10_000);
         await session.sendText("/copy");
-        await session.waitForText("Copied to clipboard.", 5_000);
+        await session.waitForText("copied to clipboard.", 5_000);
 
         expect(readFileSync(capturePath, "utf8")).toBe(reply);
 
         writeFileSync(clipboardPath, "#!/bin/sh\nexit 23\n");
         await session.sendText("/copy");
-        await session.waitForText("Failed to copy to clipboard.", 5_000);
+        await session.waitForText("failed to copy to clipboard.", 5_000);
         expect(readFileSync(stderrPath, "utf8")).toBe("");
       } finally {
         if (session) {

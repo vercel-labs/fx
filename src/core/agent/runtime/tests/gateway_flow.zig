@@ -9307,7 +9307,7 @@ test "processQueuedPrompt waits for a sign-in after an expired login and resends
     try runFakePrompt(&gateway, &hooks, config, job);
 
     try std.testing.expectEqual(@as(usize, 2), gateway.request_models.items.len);
-    try std.testing.expectEqualStrings("Sign-in expired · waiting 0s · next try in 3m 00s", needUserText(&hooks).?);
+    try std.testing.expectEqualStrings("sign-in expired · waiting 0s · next try in 3m 00s", needUserText(&hooks).?);
     const modes = hooks.credential_refresh_modes.items;
     try std.testing.expectEqualSlices(runtime_deps.CredentialRefreshMode, &.{ .if_needed, .reload, .force, .reload }, modes);
     // Only the forced refresh names a rejected token: the one the 401 refused.
@@ -9658,7 +9658,7 @@ test "processQueuedPrompt waits for a sign-in when a refused login's refresh sto
     try std.testing.expectEqual(@as(usize, 4), gateway.request_models.items.len);
     try std.testing.expect(waitingTextStarting(&hooks, "gateway refused the login · next try in "));
     const asked = needUserText(&hooks) orelse return error.TestExpectedSignInWait;
-    try std.testing.expect(std.mem.startsWith(u8, asked, "Sign-in expired · waiting "));
+    try std.testing.expect(std.mem.startsWith(u8, asked, "sign-in expired · waiting "));
     try std.testing.expectEqual(@as(usize, 2), std.mem.count(runtime_deps.CredentialRefreshMode, hooks.credential_refresh_modes.items, &.{.force}));
     try std.testing.expectEqual(types.TurnPresentationOutcome.completed, hooks.finalized_outcome.?);
 }
@@ -9694,7 +9694,7 @@ test "processQueuedPrompt waits for a sign-in on a subscription 401 after a refr
         try std.testing.expect(!waitingTextStarting(&hooks, "Gateway refused the login"));
         try std.testing.expectEqual(@as(usize, 0), hooks.system_notices.items.len);
         const asked = needUserText(&hooks) orelse return error.TestExpectedSignInWait;
-        try std.testing.expect(std.mem.startsWith(u8, asked, "Sign-in expired · waiting "));
+        try std.testing.expect(std.mem.startsWith(u8, asked, "sign-in expired · waiting "));
         try std.testing.expectEqual(types.TurnPresentationOutcome.completed, hooks.finalized_outcome.?);
     }
 }
@@ -9776,7 +9776,7 @@ test "processQueuedPrompt waiting for a sign-in resends on its own and finishes 
     try runFakePrompt(&gateway, &hooks, config, job);
 
     try std.testing.expectEqual(@as(usize, 3), gateway.request_models.items.len);
-    try std.testing.expect(std.mem.startsWith(u8, needUserText(&hooks).?, "Sign-in expired · waiting "));
+    try std.testing.expect(std.mem.startsWith(u8, needUserText(&hooks).?, "sign-in expired · waiting "));
     // The timed resends kept the sign-in status: no retry status between them.
     for (hooks.route_recovery_statuses.items) |*status| {
         try std.testing.expect(status.kind != .retrying);

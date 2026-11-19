@@ -134,14 +134,14 @@ async function runTtyPromptPermissionsCase(
       env: permissionEnv(root.home, gateway),
       remainOnExit: true,
     });
-    const prompt = await session.waitForText("Approve? [y/N]", TIMEOUT);
+    const prompt = await session.waitForText("approve? [y/N]", TIMEOUT);
     expect(prompt).toContain("fx wants to run:");
     expect(existsSync(marker)).toBe(false);
     await session.sendText(decision === "approve" ? "y" : "n");
     await waitForPaneExit(session, 0);
 
     const stdout = readFileSync(stdoutPath, "utf8");
-    expect(stdout).not.toContain("Approve? [y/N]");
+    expect(stdout).not.toContain("approve? [y/N]");
     if (outputMode === "json") {
       const json = JSON.parse(stdout) as FxJson;
       expect(json.exit_code).toBe(0);
@@ -358,12 +358,12 @@ describe("generic permission typed errors", () => {
         });
         await waitForPaneExit(session, 0);
         const scrollback = await session.captureFullScrollback();
-        expect(scrollback).not.toContain("Approve? [y/N]");
+        expect(scrollback).not.toContain("approve? [y/N]");
         for (const marker of markers) expect(existsSync(marker)).toBe(false);
         expect(gateway.classifierRequests).toHaveLength(4);
 
         const stdout = readFileSync(stdoutPath, "utf8");
-        expect(stdout).not.toContain("Approve? [y/N]");
+        expect(stdout).not.toContain("approve? [y/N]");
         const json = JSON.parse(stdout) as FxJson;
         expect(json.output).toContain("Advisory cautions handled normally.");
         expect(json.tool_calls.filter((call) => call.status === "error")).toHaveLength(4);
@@ -431,7 +431,7 @@ describe("generic permission typed errors", () => {
           expect(result.timedOut).toBe(false);
           expect(result.code).toBe(1);
           expect(result.stderr).toContain("noninteractive_permission_prompt_unavailable");
-          expect(result.stderr).not.toContain("Approve? [y/N]");
+          expect(result.stderr).not.toContain("approve? [y/N]");
           if (testCase.mode === "json") {
             const json = JSON.parse(result.stdout) as FxJson & {
               error: string;

@@ -1249,7 +1249,7 @@ describe("filesystem path handling", () => {
               { name: "write_file", status: "success" },
             ]);
             expect(classified.stderr.match(/^writing /gm)).toHaveLength(1);
-            expect(classified.stderr).not.toContain("Auto agent approved this request");
+            expect(classified.stderr).not.toContain("auto agent approved this request");
             expect(readFileSync(scenario.target, "utf8")).toBe("CLASSIFIED_CONTENT");
           } finally {
             classifierGateway.stop();
@@ -1345,7 +1345,7 @@ describe("filesystem path handling", () => {
           { name: "write_file", status: "error" },
         ]);
         expect(json.output).toContain("large reviewed write blocked");
-        expect(result.stderr).not.toContain("Auto agent approved this request");
+        expect(result.stderr).not.toContain("auto agent approved this request");
         expect(readFileSync(target, "utf8")).toBe("before\n");
         const trace = readFileSync(tracePath, "utf8");
         expect(trace).toContain(

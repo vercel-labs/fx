@@ -1246,7 +1246,7 @@ test("ACP finishes a provider search the turn ended before it finished", async (
       .filter((message: any) => message.method === "session/update" && message.params?.update?.toolCallId === "search_open")
       .map((message: any) => message.params.update);
     expect(search.map((update: any) => update.status)).toEqual(["pending", "failed"]);
-    expect(acpContentText(search[1].content)).toBe("Tool completion was not reported");
+    expect(acpContentText(search[1].content)).toBe("tool completion was not reported");
     expect(client.stderr).toBe("");
   } finally {
     await client?.close();
@@ -2163,7 +2163,7 @@ describe("acp: model-independent", () => {
         // The module's status shape, then a `recovered` that carries only the
         // attempt that succeeded.
         expect(allUpdates).toMatch(
-          /"modelResponseRecovery":\{"state":"waiting","attempt":1,"message":"Connection lost · next try in 1s · attempt 1"\}/,
+          /"modelResponseRecovery":\{"state":"waiting","attempt":1,"message":"connection lost · next try in 1s · attempt 1"\}/,
         );
         expect(allUpdates).toContain(
           '"modelResponseRecovery":{"state":"recovered","attempt":4}',
@@ -11267,7 +11267,7 @@ describe("acp: model-independent", () => {
           [6, "session/set_mode", { modeId: "yolo" }],
         ] as const) {
           const response = await client.request(method, params, id) as any;
-          expect(response.error).toMatchObject({ code: -32602, message: "Unknown mode" });
+          expect(response.error).toMatchObject({ code: -32602, message: "unknown mode" });
         }
         expect(savedMode()).toBe("ask");
 

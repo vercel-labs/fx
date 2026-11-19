@@ -536,7 +536,7 @@ test.skipIf(!tmuxAvailable())("Ctrl+T steps from default through the model's lev
   const pane = await session.capturePane();
   expect(pane).toMatch(/^┃ keep this draft$/m);
   // The shortcut writes nothing to the transcript.
-  expect(pane).not.toContain("Reasoning effort");
+  expect(pane).not.toContain("reasoning effort");
 
   await session.sendKeys("Enter");
   await session.waitForText("ANSWER", 10_000);

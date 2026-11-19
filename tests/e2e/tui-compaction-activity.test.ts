@@ -471,7 +471,7 @@ describe.skipIf(!tmuxAvailable())("tui: compaction activity", () => {
         await terminal.waitForText(trigger === "auto" ? ACTIVITY : /thinking \(/, 10_000);
         await terminal.sendInterruptEscapePair(10_000);
         if (trigger === "auto") {
-          await terminal.waitForText("Compaction cancelled.", 10_000);
+          await terminal.waitForText("compaction cancelled.", 10_000);
           // An empty composer already exists while feedback is visible. Wait
           // for Escape's visible acknowledgement, not a fixed sendKeys delay,
           // so the slash in /quit cannot become part of a Meta key sequence.
@@ -576,7 +576,7 @@ describe.skipIf(!tmuxAvailable())("tui: compaction activity", () => {
     let passed = false;
     try {
       const terminal = await f.launch(true);
-      const authMessage = "fx needs access to Vercel AI Gateway";
+      const authMessage = "fx needs access to vercel AI gateway";
       async function authNotices(label: string) {
         await terminal.sendKeys("C-o");
         await terminal.waitForText("esc close · pgup/pgdn scroll", 5000);
@@ -590,7 +590,7 @@ describe.skipIf(!tmuxAvailable())("tui: compaction activity", () => {
       const initialNotices = await authNotices("auth-before");
       expect(initialNotices).toBeGreaterThan(0);
       await terminal.sendText("/compact");
-      await terminal.waitForText("Compaction was not started.", 5000);
+      await terminal.waitForText("compaction was not started.", 5000);
       expect(f.counts().summaries).toBe(0);
       expect(f.counts().ordinary).toBe(f.seedTurns);
       expect(f.durable()).toBe(0);
@@ -884,7 +884,7 @@ describe.skipIf(!tmuxAvailable())("tui: compaction activity", () => {
       expect(summaryTokens.slice(1).length).toBeGreaterThan(0);
       expect(summaryTokens.slice(1).every((token) => token === "rotated-token")).toBe(true);
       expect(issuer.refreshes).toHaveLength(0);
-      expect(await terminal.capturePane()).not.toContain("Compaction failed");
+      expect(await terminal.capturePane()).not.toContain("compaction failed");
       // The next request carries the compacted context.
       await terminal.sendText("Follow the latest request.");
       await terminal.waitForPane((pane) => pane.includes(FOLLOWUP) && hasEmptyComposer(pane), 15_000);

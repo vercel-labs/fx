@@ -60,7 +60,7 @@ async function disablePromptHistory(
   await session.waitForText("←→ change", TIMEOUT);
   await session.sendLiteral("prompt history");
   await session.waitForPane(
-    (pane) => pane.includes("Prompt history") && !pane.includes("Startup scrollback"),
+    (pane) => pane.includes("prompt history") && !pane.includes("Startup scrollback"),
     TIMEOUT,
   );
   await session.sendKeys("Left");

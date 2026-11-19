@@ -2064,7 +2064,7 @@ describe("Vision route fake Gateway", () => {
     async () => {
       const root = createIsolatedRoot();
       const fixture = createScopedImageFixture(root);
-      const gateway = startImageGateway([sseText("First answer."), sseText("It shows a logo.")]);
+      const gateway = startImageGateway([sseText("first answer."), sseText("It shows a logo.")]);
       try {
         const env = fakeGatewayEnv(root, gateway, KIMI_MODEL);
         const first = parseFxJson(
@@ -2212,7 +2212,7 @@ describe("Vision route fake Gateway", () => {
         // One line names the connection, the image, and fast mode together.
         expect(fast.stderr.split(CATALOG_CONNECT_IMAGE_FAST_NOTICE)).toHaveLength(2);
         expect(fast.stderr.split("couldn't connect")).toHaveLength(2);
-        expect(fast.stderr).not.toContain("Fast mode is unavailable");
+        expect(fast.stderr).not.toContain("fast mode is unavailable");
         expect(fast.stderr).not.toContain("Earlier images aren't reaching the model right now");
 
         expect(down.chatRequests).toHaveLength(2);

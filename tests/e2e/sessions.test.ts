@@ -921,7 +921,7 @@ test.skipIf(!tmuxAvailable())("a flipped byte in a turn the newest compaction ke
     // An ACP client hears the session couldn't be loaded, not that it is missing.
     client = await AcpRpc.start(fixture, gateway);
     const loaded = await client.request("session/load", { sessionId: id, cwd: fixture.workspace, mcpServers: [] });
-    expect(loaded.error?.message).toBe("Session could not be loaded");
+    expect(loaded.error?.message).toBe("session could not be loaded");
     expect(await client.close()).toBe(0);
     client = undefined;
 
@@ -1360,7 +1360,7 @@ function keepRunForOfflineCheck(fixture: Fixture, name: string, traces: string[]
 }
 
 /// The line above the command that reopens a fork's source.
-const FORK_RESUME_LABEL = "Resume the original session with:";
+const FORK_RESUME_LABEL = "resume the original session with:";
 
 /// The pane once the fork notice has settled at its end: the label, the
 /// command alone on the next line, and a blank row above the composer, which
@@ -1983,7 +1983,7 @@ test.skipIf(!tmuxAvailable())("/fork asks once and copies the subagents made bef
     // Only helper existed before that prompt.
     const asked = await app.session.waitForPane((pane) => FORK_QUESTION.test(pane) && pane.includes(FORK_QUESTION_HINT), TIMEOUT);
     expect(asked.match(FORK_QUESTION)![1]).toBe("1");
-    expect(asked).toContain("Bring 1 subagent into the fork?");
+    expect(asked).toContain("bring 1 subagent into the fork?");
     await app.session.sendKeys("Enter");
     await waitForForkNotice(app.session, source, "Copy prompt three.");
 
@@ -2120,7 +2120,7 @@ test.skipIf(!tmuxAvailable())("a copy of a subagent whose turn runs across the f
     await app.session.waitForPane((pane) => pane.includes("enter fork"), TIMEOUT);
     await selectForkPrompt(app.session, "Long prompt two.");
     await app.session.sendKeys("Enter");
-    await app.session.waitForPane((pane) => pane.includes("Bring 1 subagent into the fork?"), TIMEOUT);
+    await app.session.waitForPane((pane) => pane.includes("bring 1 subagent into the fork?"), TIMEOUT);
     await app.session.sendKeys("y");
     await waitForForkNotice(app.session, source, "Long prompt two.");
 
@@ -2201,7 +2201,7 @@ test.skipIf(!tmuxAvailable())("a fork of a fork asks again at the fork's first p
     await app.session.waitForPane((pane) => pane.includes("enter fork"), TIMEOUT);
     await selectForkPrompt(app.session, "Twice prompt two.");
     await app.session.sendKeys("Enter");
-    await app.session.waitForPane((pane) => pane.includes("Bring 1 subagent into the fork?"), TIMEOUT);
+    await app.session.waitForPane((pane) => pane.includes("bring 1 subagent into the fork?"), TIMEOUT);
     await app.session.sendKeys("Enter");
     await waitForForkNotice(app.session, source, "Twice prompt two.");
     const first = rootSessionIds(fixture.home).find((id) => id !== source)!;
@@ -2217,7 +2217,7 @@ test.skipIf(!tmuxAvailable())("a fork of a fork asks again at the fork's first p
     await app.session.waitForPane((pane) => pane.includes("enter fork"), TIMEOUT);
     await selectForkPrompt(app.session, "Twice prompt three.");
     await app.session.sendKeys("Enter");
-    await app.session.waitForPane((pane) => pane.includes("Bring 1 subagent into the fork?"), TIMEOUT);
+    await app.session.waitForPane((pane) => pane.includes("bring 1 subagent into the fork?"), TIMEOUT);
     await app.session.sendKeys("Enter");
     await waitForForkNotice(app.session, first, "Twice prompt three.");
     const second = rootSessionIds(fixture.home).find((id) => id !== source && id !== first)!;
@@ -2406,7 +2406,7 @@ test("ACP keeps a session once prompted, lists it, and loads every turn after a 
 
     client = await AcpRpc.start(fixture, gateway);
     const missing = await client.request("session/load", { sessionId: unused, cwd: fixture.workspace, mcpServers: [] });
-    expect(missing.error?.message).toBe("Session not found");
+    expect(missing.error?.message).toBe("session not found");
     await client.ok("session/load", { sessionId: id, cwd: fixture.workspace, mcpServers: [] });
     expect(client.texts("user_message_chunk")).toEqual(["First ACP question.", "Second ACP question."]);
     expect(client.texts("agent_message_chunk")).toEqual(["ACP_ONE", "ACP_TWO"]);
@@ -2766,7 +2766,7 @@ test("a second ACP process is refused an open v2 session, then loads it once the
     await owner.ok("session/prompt", { sessionId: id, ...acpPrompt("Hold this session.") });
     other = await AcpRpc.start(fixture, gateway);
     const refused = await other.request("session/load", { sessionId: id, cwd: fixture.workspace, mcpServers: [] });
-    expect(refused.error?.message).toBe("Session is busy");
+    expect(refused.error?.message).toBe("session is busy");
     expect(await owner.close()).toBe(0);
     owner = undefined;
     await other.ok("session/load", { sessionId: id, cwd: fixture.workspace, mcpServers: [] });
@@ -4883,7 +4883,7 @@ test("ACP refuses a damaged or read-only session and leaves its log as it was", 
 
     flipMiddleByte(log);
     const damaged = readFileSync(log);
-    expect((await load()).error.message).toBe("Session could not be loaded");
+    expect((await load()).error.message).toBe("session could not be loaded");
     expect(readFileSync(log)).toEqual(damaged);
     writeFileSync(log, good);
 
@@ -4921,7 +4921,7 @@ test.skipIf(!tmuxAvailable())("the app and ACP refuse a session whose blob went 
     expect(app.stderr).not.toContain("NotFound");
     client = await AcpRpc.start(fixture, gateway);
     const load = await client.request("session/load", { sessionId: id, cwd: fixture.workspace, mcpServers: [] });
-    expect(load.error.message).toBe("Session could not be loaded");
+    expect(load.error.message).toBe("session could not be loaded");
     expect(await client.close()).toBe(0);
     client = undefined;
     expect(gateway.requests).toHaveLength(1);

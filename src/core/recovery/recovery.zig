@@ -639,9 +639,9 @@ fn retryingStatus(state: *const State) Status {
 fn signInStatus(state: *const State, now_ms: u64) Status {
     const waited = Clock.of(@min((now_ms -| state.asked_ms) / 1000, max_sign_in_wait_seconds));
     const text = if (state.polling)
-        textOf("Sign-in expired · waiting {s} · trying again", .{waited.slice()})
+        textOf("sign-in expired · waiting {s} · trying again", .{waited.slice()})
     else
-        textOf("Sign-in expired · waiting {s} · next try in {s}", .{
+        textOf("sign-in expired · waiting {s} · next try in {s}", .{
             waited.slice(),
             Clock.of(@max(1, (state.wait_until_ms -| now_ms +| 999) / 1000)).slice(),
         });
@@ -649,14 +649,14 @@ fn signInStatus(state: *const State, now_ms: u64) Status {
         .kind = .need_user,
         .need = .sign_in,
         .text = text,
-        .short = textOf("Sign-in expired · waiting {s}", .{waited.slice()}),
+        .short = textOf("sign-in expired · waiting {s}", .{waited.slice()}),
     };
 }
 
 fn needStatus(need: Status.Need) Status {
     return switch (need) {
         // askUser routes a sign-in to signInStatus, which counts the wait.
-        .sign_in => needOf(need, "Sign-in expired", ""),
+        .sign_in => needOf(need, "sign-in expired", ""),
         .quota => needOf(need, "out of credits", ""),
         .content_filter => needOf(
             need,
@@ -1101,8 +1101,8 @@ test "sign-in waits, then names the retry" {
     const ask = fail(&state, .sign_in, 1_000);
     try testing.expectEqual(Status.Kind.need_user, ask.status.?.kind);
     try testing.expectEqual(Status.Need.sign_in, ask.status.?.need.?);
-    try testing.expectEqualStrings("Sign-in expired · waiting 0s · next try in 3m 00s", ask.status.?.text.slice());
-    try testing.expectEqualStrings("Sign-in expired · waiting 0s", ask.status.?.short.slice());
+    try testing.expectEqualStrings("sign-in expired · waiting 0s · next try in 3m 00s", ask.status.?.text.slice());
+    try testing.expectEqualStrings("sign-in expired · waiting 0s", ask.status.?.short.slice());
     const resumed = step(&state, .user_continue, 64_000);
     try testing.expectEqualStrings("signed in · retrying · attempt 2", resumed.status.?.text.slice());
 }
@@ -1114,16 +1114,16 @@ test "a wait for a sign-in resends on its own after three minutes and keeps the 
     // The wait counts up every second and sends nothing before its end.
     const early = step(&state, .tick, 2_000);
     try testing.expect(early.send == null);
-    try testing.expectEqualStrings("Sign-in expired · waiting 1s · next try in 2m 59s", early.status.?.text.slice());
+    try testing.expectEqualStrings("sign-in expired · waiting 1s · next try in 2m 59s", early.status.?.text.slice());
     const last_second = step(&state, .tick, 180_999);
     try testing.expect(last_second.send == null);
-    try testing.expectEqualStrings("Sign-in expired · waiting 2m 59s · next try in 1s", last_second.status.?.text.slice());
+    try testing.expectEqualStrings("sign-in expired · waiting 2m 59s · next try in 1s", last_second.status.?.text.slice());
 
     const polled = step(&state, .tick, 181_000);
     try testing.expectEqual(Send{}, polled.send.?);
     try testing.expectEqual(Status.Kind.need_user, polled.status.?.kind);
     try testing.expectEqual(Status.Need.sign_in, polled.status.?.need.?);
-    try testing.expectEqualStrings("Sign-in expired · waiting 3m 00s · trying again", polled.status.?.text.slice());
+    try testing.expectEqualStrings("sign-in expired · waiting 3m 00s · trying again", polled.status.?.text.slice());
     try testing.expectEqual(@as(u16, 2), state.attempt);
     // The record says a send is in flight, and holds no need.
     const saved = decode(polled.save.?).?;
@@ -1136,7 +1136,7 @@ test "a wait for a sign-in resends on its own after three minutes and keeps the 
     // A refusal waits again, and the status counts the whole wait.
     const again = fail(&state, .sign_in, 191_000);
     try testing.expect(again.send == null);
-    try testing.expectEqualStrings("Sign-in expired · waiting 3m 10s · next try in 3m 00s", again.status.?.text.slice());
+    try testing.expectEqualStrings("sign-in expired · waiting 3m 10s · next try in 3m 00s", again.status.?.text.slice());
     try testing.expectEqual(@as(u64, 371_000), state.wait_until_ms);
 }
 
@@ -1187,7 +1187,7 @@ test "a sign-in resend that fails on the way keeps the sign-in wait, so fx opens
         try testing.expectEqual(Status.Need.sign_in, kept.status.?.need.?);
         // The status counts the whole wait, and the next resend is a full
         // wait away.
-        try testing.expectEqualStrings("Sign-in expired · waiting 3m 10s · next try in 3m 00s", kept.status.?.text.slice());
+        try testing.expectEqualStrings("sign-in expired · waiting 3m 10s · next try in 3m 00s", kept.status.?.text.slice());
         try testing.expectEqual(@as(u64, 371_000), state.wait_until_ms);
         // After a sign-in that finished while that resend was on the wire,
         // the failure is an ordinary one: a short wait, then a resend with
@@ -1282,7 +1282,7 @@ test "a resumed wait for a sign-in counts its time from the relaunch" {
     const record = step(&state, .closing, 500_000).save.?;
     var next: State = .{};
     const resumed = step(&next, .{ .start = .{ .resume_from = record } }, 9_000_000);
-    try testing.expectEqualStrings("Sign-in expired · waiting 0s · next try in 3m 00s", resumed.status.?.text.slice());
+    try testing.expectEqualStrings("sign-in expired · waiting 0s · next try in 3m 00s", resumed.status.?.text.slice());
     try testing.expect(resumed.send == null);
     try testing.expectEqual(Send{}, step(&next, .tick, 9_180_000).send.?);
 }
@@ -1304,7 +1304,7 @@ test "hours of sign-in resends keep the status, the attempt count, and the recor
         try testing.expect(decode(again.save.?) != null);
     }
     try testing.expectEqual(std.math.maxInt(u16), state.attempt);
-    try testing.expectEqualStrings("Sign-in expired · waiting 999h 59m", signInStatus(&state, now_ms).short.slice());
+    try testing.expectEqualStrings("sign-in expired · waiting 999h 59m", signInStatus(&state, now_ms).short.slice());
 }
 
 test "Esc ends the request from every active phase" {
