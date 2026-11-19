@@ -1093,6 +1093,8 @@ const FakeRecorder = struct {
 const GateRecorder = struct {
     var open: std.Io.Event = .unset;
     var started: std.Io.Event = .unset;
+    /// Set just before the call under test, which must settle first.
+    var calling: std.Io.Event = .unset;
     var order = std.atomic.Value(u32).init(0);
     var start_at = std.atomic.Value(u32).init(0);
     var end_at = std.atomic.Value(u32).init(0);
@@ -1100,6 +1102,7 @@ const GateRecorder = struct {
     fn reset() void {
         open = .unset;
         started = .unset;
+        calling = .unset;
         order.store(0, .seq_cst);
         start_at.store(0, .seq_cst);
         end_at.store(0, .seq_cst);
@@ -1151,11 +1154,15 @@ const Settlers = struct {
 };
 
 fn endIn(captures: *TurnCapture, context: Context, lock: *std.Io.Mutex) void {
+    GateRecorder.calling.set(std.testing.io);
     _ = captures.end(context, lock);
 }
 
-fn releaseOnceStarted() void {
+/// Opens the gate once the held capture began and the call under test is
+/// about to run.
+fn releaseOnceCalling() void {
     GateRecorder.waitStarted();
+    GateRecorder.calling.waitUncancelable(std.testing.io);
     GateRecorder.release();
 }
 
@@ -1204,6 +1211,7 @@ test "the end capture of a turn that ran no tool waits for its start capture" {
     captures.start(context, &lock);
     GateRecorder.waitStarted();
     const ender = try std.Thread.spawn(.{}, endIn, .{ &captures, context, &lock });
+    GateRecorder.calling.waitUncancelable(std.testing.io);
     GateRecorder.release();
     ender.join();
     try std.testing.expectEqual(@as(u32, 1), GateRecorder.start_at.load(.seq_cst));
@@ -1223,10 +1231,11 @@ test "the next turn and teardown wait for a start capture a turn never settled" 
         defer GateRecorder.release();
         captures.begin(context, true);
         captures.start(context, &lock);
-        const opener = try std.Thread.spawn(.{}, releaseOnceStarted, .{});
+        const opener = try std.Thread.spawn(.{}, releaseOnceCalling, .{});
         defer opener.join();
         // A fresh prompt after a turn that ended without a tool or an end
         // capture: the old start lands before the new turn begins.
+        GateRecorder.calling.set(std.testing.io);
         captures.begin(context, true);
         try std.testing.expectEqual(@as(u32, 1), GateRecorder.start_at.load(.seq_cst));
     }
@@ -1236,9 +1245,10 @@ test "the next turn and teardown wait for a start capture a turn never settled" 
         defer GateRecorder.release();
         captures.begin(context, true);
         captures.start(context, &lock);
-        const opener = try std.Thread.spawn(.{}, releaseOnceStarted, .{});
+        const opener = try std.Thread.spawn(.{}, releaseOnceCalling, .{});
         defer opener.join();
         // The host tearing down mid-turn leaves no thread behind.
+        GateRecorder.calling.set(std.testing.io);
         captures.deinit();
         try std.testing.expectEqual(@as(u32, 1), GateRecorder.start_at.load(.seq_cst));
     }
