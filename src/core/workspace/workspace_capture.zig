@@ -190,12 +190,14 @@ fn untrackedReason(entry: Candidate, limits: Limits) ?@FieldType(Exclusion, "rea
 /// case. Such files only lose their turn under the count limit.
 fn inGeneratedFolder(path: []const u8) bool {
     const names = [_][]const u8{
-        "node_modules",  "bower_components", ".venv",       "venv",          "__pycache__",
-        ".tox",          ".nox",             ".mypy_cache", ".pytest_cache", ".ruff_cache",
-        ".gradle",       ".next",            ".nuxt",       ".svelte-kit",   ".turbo",
-        ".parcel-cache", ".cache",           ".dart_tool",  "Pods",          ".terraform",
-        ".zig-cache",    "zig-out",          "target",      "dist",          "build",
-        "coverage",
+        "node_modules", "bower_components", ".yarn",         ".pnpm-store", "vendor",
+        ".venv",        "venv",             "env",           "__pycache__", ".tox",
+        ".nox",         ".mypy_cache",      ".pytest_cache", ".ruff_cache", ".gradle",
+        ".next",        ".nuxt",            ".svelte-kit",   ".angular",    ".expo",
+        ".turbo",       ".parcel-cache",    ".cache",        ".dart_tool",  "Pods",
+        ".terraform",   ".stack-work",      "dist-newstyle", "elm-stuff",   "_build",
+        "deps",         ".zig-cache",       "zig-out",       "target",      "dist",
+        "build",        "out",              "obj",           "coverage",
     };
     const slash = std.mem.findScalarLast(u8, path, '/') orelse return false;
     var folders = std.mem.splitScalar(u8, path[0..slash], '/');
@@ -430,6 +432,25 @@ test "capture selection gives untracked places to files outside dependency and b
     for (result.excluded) |exclusion| try std.testing.expectEqual(.file_limit, exclusion.reason);
 }
 
+test "capture selection gives a generated folder the places of files left out for other reasons" {
+    const alloc = std.testing.allocator;
+    const entries = [_]Candidate{
+        .{ .path = "a", .tracked = false },
+        .{ .path = "b", .tracked = false },
+        .{ .path = ".env", .tracked = false },
+        .{ .path = "huge.bin", .tracked = false, .bytes = 11 },
+        .{ .path = "node_modules/x/i.js", .tracked = false },
+        .{ .path = "node_modules/x/j.js", .tracked = false },
+    };
+    const result = try select(alloc, &entries, &.{}, .{ .untracked_count = 3, .untracked_file_bytes = 10 });
+    defer result.deinit(alloc);
+    // `.env` and `huge.bin` take no place, so one is left for the folder.
+    try expectPaths(&.{ "a", "b", "node_modules/x/i.js" }, result.read);
+    try std.testing.expectEqual(@as(usize, 3), result.excluded.len);
+    try std.testing.expectEqual(.file_limit, result.excluded[2].reason);
+    try std.testing.expectEqualStrings("node_modules/x/j.js", result.excluded[2].path);
+}
+
 test "capture selection admits files outside generated folders in path order when they alone pass the limit" {
     const alloc = std.testing.allocator;
     const entries = [_]Candidate{
@@ -451,11 +472,11 @@ test "capture selection admits files outside generated folders in path order whe
 }
 
 test "capture selection knows generated folders at any depth by folder name only" {
-    for ([_][]const u8{ "node_modules/a.js", "web/node_modules/p/a.js", ".VENV/lib/x.py", "pkg/__pycache__/m.pyc", "target/debug/app", "Pods/x.m" }) |path| {
+    for ([_][]const u8{ "node_modules/a.js", "web/node_modules/p/a.js", ".VENV/lib/x.py", "env/lib/x.py", "vendor/pkg/a.go", "pkg/__pycache__/m.pyc", "target/debug/app", "Pods/x.m" }) |path| {
         if (!inGeneratedFolder(path)) std.debug.print("{s} should be generated\n", .{path});
         try std.testing.expect(inGeneratedFolder(path));
     }
-    for ([_][]const u8{ "build", "dist.txt", "src/build.zig", "node_modules", "docs/targets/x.md", "my_venv/x.py" }) |path| {
+    for ([_][]const u8{ "build", "dist.txt", "src/build.zig", "node_modules", "docs/targets/x.md", "my_venv/x.py", "bin/run.sh", "environment/x.txt" }) |path| {
         if (inGeneratedFolder(path)) std.debug.print("{s} should not be generated\n", .{path});
         try std.testing.expect(!inGeneratedFolder(path));
     }
