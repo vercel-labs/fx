@@ -9467,7 +9467,10 @@ pub const TranscriptRuntime = struct {
             self.resize_history_row_delta == null and
             !destructive_invalidation and
             target.visual_offset >= target.history_visual_offset and
-            scroll_facts.target_visual_offset < anchor.visual_offset;
+            // Rows between the history offset and the logical offset are on no
+            // screen, so a target at or after the history offset does not rewind
+            // what the terminal shows.
+            scroll_facts.target_visual_offset < committedProjectionVisualOffset(anchor);
     }
 
     fn semanticProgressNeedsStaging(
@@ -15383,6 +15386,88 @@ test "preserved source rewrite holds the normal buffer at committed history" {
         },
         .invalid, .recovering => return error.TestExpectedStableTranscript,
     }
+}
+
+test "a target between the on-screen history offset and the logical offset is not a rewind" {
+    const runtime = TranscriptRuntime{
+        .layout = .{
+            .rows = 8,
+            .cols = 40,
+            .content_bottom = 4,
+            .divider_top_row = 5,
+            .input_row = 6,
+            .divider_bottom_row = 7,
+            .hint_row = 8,
+        },
+        .committed_frame_layout = .{
+            .layout_id = 17,
+            .owned_top = 1,
+            .owned_band = .{ .top = 1, .bottom = 8 },
+            .body_area = .{ .top = 1, .bottom = 4 },
+            .transcript_area = .{ .top = 1, .bottom = 4 },
+            .footer_area = .{ .top = 5, .bottom = 8 },
+            .solved_frame_height = 8,
+            .terminal_rows = 8,
+            .terminal_cols = 40,
+        },
+    };
+    const selection: ViewportSelection = .{
+        .top_row = 1,
+        .bottom_row = 4,
+        .start_line = 2,
+        .partial_skip_rows = 0,
+        .line_count = 6,
+        .last_visible_row = 4,
+    };
+    // The footer shrank during a long turn: the logical offset is 30, and the
+    // screen shows the history offset, 27.
+    const anchor: CommittedTranscriptAnchor = .{
+        .selection = selection,
+        .visual_offset = 30,
+        .history_visual_offset = 27,
+        .total_visual_rows = 40,
+        .flow = &.{},
+        .cursor_row = 4,
+        .cursor_col = 1,
+        .occupied_last_row = 4,
+        .occupied_last_row_blank = false,
+        .layout_id = 17,
+        .normal_buffer_recovery_pending = true,
+    };
+    const target: TranscriptRuntime.TransitionTarget = .{
+        .selection = selection,
+        .visual_offset = 28,
+        .history_visual_offset = 27,
+        .source_endpoint_visual_offset = 28,
+        .total_visual_rows = 40,
+        .cursor_row = 4,
+        .cursor_col = 1,
+        .measured_history_origin = null,
+    };
+    const facts: TranscriptScrollFacts = .{
+        .source_compatible = true,
+        .geometry_rebase = false,
+        .target_visual_offset = 28,
+    };
+
+    try std.testing.expect(!runtime.paintedStableTargetWouldRewind(target, anchor, facts, false));
+
+    // A target behind the on-screen offset is still a rewind. Its history
+    // offset matches its visual offset, as TransitionTarget.init sets them.
+    var behind = target;
+    behind.visual_offset = 26;
+    behind.history_visual_offset = 26;
+    behind.source_endpoint_visual_offset = 26;
+    var behind_facts = facts;
+    behind_facts.target_visual_offset = 26;
+    try std.testing.expect(runtime.paintedStableTargetWouldRewind(behind, anchor, behind_facts, false));
+
+    // Without pending recovery, the logical offset 30 is the projection, so 28
+    // still rewinds.
+    var settled = anchor;
+    settled.normal_buffer_recovery_pending = false;
+    settled.history_visual_offset = 30;
+    try std.testing.expect(runtime.paintedStableTargetWouldRewind(target, settled, facts, false));
 }
 
 test "frame scroll commit consumption releases rows before transition advancement" {
