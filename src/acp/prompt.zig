@@ -557,6 +557,19 @@ const AcpContext = struct {
         try self.published_tool_calls.ensureUnusedCapacity(self.alloc, 1);
         const owned_id = try self.alloc.dupe(u8, call.id);
         errdefer self.alloc.free(owned_id);
+        // Without `follow_supported` no follower takes the other card, so only the owner's is built.
+        if (comptime !server.follow_supported) {
+            const meta: ?acp_types.ToolCallMeta = if (self.state.extensions.contains(.tool_call)) presentation.meta else null;
+            var out: std.Io.Writer.Allocating = .init(self.alloc);
+            defer out.deinit();
+            try acp_types.writeToolCall(&out.writer, owned_id, name, presentation.title, kind, .pending, raw_input, meta);
+            try self.sendUpdate(out.writer.buffered());
+            self.published_tool_calls.putAssumeCapacity(
+                owned_id,
+                if (tool_presentation.isProviderSearchAlias(call.name)) .awaiting_provider_terminal else .open,
+            );
+            return owned_id;
+        }
         // The card with and without `_meta`. Each member takes the one its own
         // `sh.fx/toolCall` setting asks for, and the turn's copy keeps both.
         var with_meta: std.Io.Writer.Allocating = .init(self.alloc);
@@ -674,6 +687,16 @@ const AcpContext = struct {
     fn sendToolCallCompletedWithDiff(self: *AcpContext, tool_call_id: []const u8, diff: ?acp_types.ToolDiff, result_text: ?[]const u8, command_result_json: ?[]const u8) !void {
         var arena_state: std.heap.ArenaAllocator = .init(self.alloc);
         defer arena_state.deinit();
+        // Without `follow_supported` only the owner's result is built; it takes a command result only when it lists one.
+        if (comptime !server.follow_supported) {
+            const command_result = if (self.state.extensions.contains(.command_result)) parsedCommandResult(arena_state.allocator(), tool_call_id, command_result_json) else null;
+            var out: std.Io.Writer.Allocating = .init(self.alloc);
+            defer out.deinit();
+            try acp_types.writeToolCallUpdateWithDiff(&out.writer, tool_call_id, .completed, diff, result_text, command_result);
+            try self.sendUpdate(out.writer.buffered());
+            self.markCardFinished(tool_call_id);
+            return;
+        }
         const command_result = parsedCommandResult(arena_state.allocator(), tool_call_id, command_result_json);
         var with_result: std.Io.Writer.Allocating = .init(self.alloc);
         defer with_result.deinit();
@@ -701,6 +724,16 @@ const AcpContext = struct {
     fn sendToolCallErrorWithCommandResult(self: *AcpContext, tool_call_id: []const u8, err_text: []const u8, command_result_json: ?[]const u8) !void {
         var arena_state: std.heap.ArenaAllocator = .init(self.alloc);
         defer arena_state.deinit();
+        // Without `follow_supported` only the owner's result is built; it takes a command result only when it lists one.
+        if (comptime !server.follow_supported) {
+            const command_result = if (self.state.extensions.contains(.command_result)) parsedCommandResult(arena_state.allocator(), tool_call_id, command_result_json) else null;
+            var out: std.Io.Writer.Allocating = .init(self.alloc);
+            defer out.deinit();
+            try acp_types.writeToolCallUpdateWithCommandResult(&out.writer, tool_call_id, .failed, err_text, command_result);
+            try self.sendUpdate(out.writer.buffered());
+            self.markCardFinished(tool_call_id);
+            return;
+        }
         const command_result = parsedCommandResult(arena_state.allocator(), tool_call_id, command_result_json);
         var with_result: std.Io.Writer.Allocating = .init(self.alloc);
         defer with_result.deinit();
@@ -2486,6 +2519,15 @@ fn acceptHostSteering(ctx: *AcpContext, taken: []const js_host_steering.Taken) !
 fn publishSteeringReplay(ctx: *AcpContext, text: []const u8, request_id: ?jsonrpc.RequestId, input_id: ?[]const u8) !void {
     var message_id_storage: acp_types.MessageIdBuffer = undefined;
     const message_id = acp_types.generateMessageId(&message_id_storage);
+    // Without `follow_supported` no follower takes the other version: the owner's own steer setting picks it.
+    if (comptime !server.follow_supported) {
+        const params = try server.steerChunkParams(ctx.alloc, ctx.session_id, message_id, text, request_id, input_id, ctx.state.sendsSteerInput());
+        defer ctx.alloc.free(params);
+        var audience = server.lockAudience(ctx.session);
+        defer audience.unlock();
+        try audience.deliver(ctx.alloc, "session/update", .none, params, null);
+        return;
+    }
     // Each member takes the chunk with or without `sh.fx/steerInput`, by its own prompt delivery.
     const with = try server.steerChunkParams(ctx.alloc, ctx.session_id, message_id, text, request_id, input_id, true);
     defer ctx.alloc.free(with);
@@ -3954,6 +3996,19 @@ fn pushContextNotice(raw_ctx: *anyopaque, text: []const u8) !void {
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
     const session = ctx.session;
     if (!try session.session_rt.claimContextNotice(ctx.alloc, text)) return;
+    // Without `follow_supported` no follower can take the other version, so only the owner's is sent:
+    // its notice when it lists notices, otherwise its message, as before the audience.
+    if (comptime !server.follow_supported) {
+        if (ctx.state.client_notices) {
+            const with = ctx.noticeParams(text) catch return;
+            defer ctx.alloc.free(with);
+            var audience = server.lockAudience(session);
+            defer audience.unlock();
+            audience.deliver(ctx.alloc, "session/update", .none, with, null) catch {};
+            return;
+        }
+        return pushSystemNotice(raw_ctx, text);
+    }
     // Both versions are built, so a joiner whose client lacks notices gets the message.
     const with = ctx.noticeParams(text) catch |err| {
         debug_trace.logf("acp", "dropped a context notice reason={s}", .{@errorName(err)});

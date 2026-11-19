@@ -585,9 +585,11 @@ pub const ServerState = struct {
     pub fn deinit(self: *ServerState) void {
         // Followers are listed by their owners' sessions, so this connection leaves them
         // before anything it owns is freed: no session may keep a pointer to it.
-        for (self.following.items) |session_id| {
-            detachFollower(self, session_id, "connection_end");
-            self.alloc.free(session_id);
+        if (comptime follow_supported) {
+            for (self.following.items) |session_id| {
+                detachFollower(self, session_id, "connection_end");
+                self.alloc.free(session_id);
+            }
         }
         self.following.deinit(self.alloc);
         if (self.token_pass_run) |*check| check.finish(self.alloc, "shutdown");
@@ -975,6 +977,7 @@ pub const Audience = struct {
     /// Whether the owner or a follower lists `extension`. It does not move `next`.
     pub fn anyLists(self: *const Audience, extension: sh_fx.Extension) bool {
         if (self.session.server.extensions.contains(extension)) return true;
+        if (comptime !follow_supported) return false;
         for (self.session.followers.items) |member| {
             if (member.extensions.contains(extension)) return true;
         }
@@ -1036,6 +1039,13 @@ pub const Audience = struct {
         with: []const u8,
         without: ?[]const u8,
     ) !void {
+        // Without `follow_supported` no follower exists, so the owner is the only member:
+        // its version goes straight to its writer, and its error reaches the turn as before.
+        if (comptime !follow_supported) {
+            const params = if (memberTakes(self.session.server, need)) with else (without orelse return);
+            try self.session.server.writer.writeNotification(alloc, method, params);
+            return;
+        }
         while (self.next()) |member| {
             const params = if (memberTakes(member, need)) with else (without orelse continue);
             try self.writeNotification(member, alloc, method, params);
@@ -1154,6 +1164,9 @@ pub const RunningCopy = struct {
         with: []const u8,
         without: ?[]const u8,
     ) void {
+        // Only a joined connection reads the copy, and one exists only where
+        // `follow_supported` holds, so nothing is kept without it.
+        if (comptime !follow_supported) return;
         const size = with.len + (if (without) |bytes| bytes.len else 0);
         if (self.dropped > 0 or self.bytes + size > limit_bytes) return self.drop(method, "limit");
         const kept_with = alloc.dupe(u8, with) catch return self.drop(method, "out_of_memory");
@@ -1185,6 +1198,8 @@ pub const RunningCopy = struct {
 
     /// Keeps `params` as the turn's latest progress, in place of an earlier one.
     fn setProgress(self: *RunningCopy, alloc: Allocator, params: []const u8) void {
+        // Only a joined connection replays the progress; see `follow_supported`.
+        if (comptime !follow_supported) return;
         if (self.progress) |current| if (std.mem.eql(u8, current, params)) return;
         const kept = alloc.dupe(u8, params) catch {
             debug_trace.logf(
@@ -1201,6 +1216,8 @@ pub const RunningCopy = struct {
     /// Frees every entry and the progress. A copy that is freed unsaved logs what
     /// it held: those updates reached the owner, and no joiner can see them now.
     fn release(self: *RunningCopy, alloc: Allocator, reason: Reason) void {
+        // Nothing is kept without `follow_supported`, so there is nothing to free.
+        if (comptime !follow_supported) return;
         if (self.entries.items.len > 0 or self.dropped > 0) {
             debug_trace.logf(
                 "acp",
@@ -1236,6 +1253,8 @@ fn memberTakes(member: *const ServerState, need: RunningCopy.Need) bool {
 /// write, then audience), so the copy and the log change together. The turn's end
 /// calls it without that lock, since the turn has no commit to match.
 pub fn releaseRunningCopy(session: *ActiveSessionState, reason: RunningCopy.Reason) void {
+    // Without `follow_supported` no copy is kept, so the save takes no lock for it.
+    if (comptime !follow_supported) return;
     session.audience_mutex.lockUncancelable(io_mod.getIo());
     defer session.audience_mutex.unlock(io_mod.getIo());
     session.running_copy.release(session.server.alloc, reason);
@@ -1308,12 +1327,15 @@ pub fn openSession(state: *ServerState, value: ActiveSessionState, binding: ?*wo
     session.gateway_team = null;
     try copyDefaultCredential(state, session);
     state.sessions.appendAssumeCapacity(session);
-    if (state.shared) |shared| {
-        // A session that is not listed still works on this connection; another
-        // connection of the process then cannot follow it, and opens the store.
-        shared.register(state.alloc, session) catch |err| {
-            debug_trace.logf("acp", "event=shared_session_not_registered session={s} err={s}", .{ session.session_id, @errorName(err) });
-        };
+    // Without `follow_supported` no other connection can follow the session.
+    if (comptime follow_supported) {
+        if (state.shared) |shared| {
+            // A session that is not listed still works on this connection; another
+            // connection of the process then cannot follow it, and opens the store.
+            shared.register(state.alloc, session) catch |err| {
+                debug_trace.logf("acp", "event=shared_session_not_registered session={s} err={s}", .{ session.session_id, @errorName(err) });
+            };
+        }
     }
     return session;
 }
@@ -1383,6 +1405,8 @@ const partial_copy_notice = "fx kept only the start of this turn's output, so pa
 /// copy dropped updates. The caller holds the session's `session_write_mutex`
 /// and `audience_mutex`, so the copy is not changed while it is replayed.
 pub fn replayRunningCopy(member: *ServerState, alloc: Allocator, session: *ActiveSessionState) !void {
+    // A joined connection replays the copy, and one exists only where `follow_supported` holds.
+    if (comptime !follow_supported) return;
     const copy = &session.running_copy;
     for (copy.entries.items) |entry| {
         const params = (if (memberTakes(member, entry.need)) entry.with else entry.without) orelse continue;
@@ -1469,6 +1493,8 @@ pub fn forgetFollowing(state: *ServerState, session_id: []const u8) void {
 /// followers when the session is still in the table. A session that has left the
 /// table already dropped its followers, so there is nothing left to remove.
 pub fn detachFollower(state: *ServerState, session_id: []const u8, reason: []const u8) void {
+    // A follower can exist only where `follow_supported` holds.
+    if (comptime !follow_supported) return;
     debug_trace.logf("acp", "event=follower_detached session={s} reason={s}", .{ session_id, reason });
     const shared = state.shared orelse return;
     shared.mutex.lockUncancelable(io_mod.getIo());
@@ -1482,6 +1508,8 @@ pub fn detachFollower(state: *ServerState, session_id: []const u8, reason: []con
 /// Drops the followers of `active` as its session closes. A follower belongs to
 /// its own connection, so only the list is cleared here; each drop is traced.
 fn dropFollowersAtClose(active: *ActiveSessionState) void {
+    // A follower can exist only where `follow_supported` holds.
+    if (comptime !follow_supported) return;
     active.audience_mutex.lockUncancelable(io_mod.getIo());
     defer active.audience_mutex.unlock(io_mod.getIo());
     for (active.followers.items) |_| {
@@ -1492,7 +1520,7 @@ fn dropFollowersAtClose(active: *ActiveSessionState) void {
 
 fn destroySession(state: *ServerState, active: *ActiveSessionState) void {
     // The table lets go first, so no connection can find the session once it starts to be freed.
-    if (state.shared) |shared| shared.unregister(active);
+    if (comptime follow_supported) if (state.shared) |shared| shared.unregister(active);
     dropFollowersAtClose(active);
     if (active.title_task) |task| {
         debug_trace.logf("session", "event=title_generation_dropped reason=session_release", .{});
@@ -1747,6 +1775,13 @@ const RunOptions = struct {
 /// sockets, the same macOS and Linux set as `host.zig`'s terminal support.
 /// WASM has no sockets, so its `run` caller gets no leader from this gate.
 const leader_supported = !host_target.is_wasm and (builtin.os.tag == .macos or builtin.os.tag == .linux);
+
+/// Whether a second connection can open a session of this process, so whether the
+/// follow code is compiled. A second connection exists only through the leader
+/// socket, which is served exactly where `leader_supported` holds, so the two
+/// gates are the same. WebAssembly has no socket and one connection; each follow-only
+/// entry returns at comptime when this is false, and the compiler drops its code.
+pub const follow_supported = leader_supported;
 
 pub fn run(alloc: Allocator, cfg: Config) !void {
     // One table for every connection this process serves. `runServer` closes its
@@ -3549,10 +3584,12 @@ fn requireParsedSessionTarget(
     // A follower changes nothing: the connection that owns the session does. This is the one
     // lookup that the session-scoped handlers share (prompt, cancel, set_mode, set_config_option),
     // so checking the follow here covers each of them.
-    if (requestedSessionId(root)) |requested| {
-        if (followedElsewhere(state, requested)) {
-            try state.writer.writeError(alloc, id, .{ .code = ErrorCode.invalid_request, .message = follower_refusal });
-            return null;
+    if (comptime follow_supported) {
+        if (requestedSessionId(root)) |requested| {
+            if (followedElsewhere(state, requested)) {
+                try state.writer.writeError(alloc, id, .{ .code = ErrorCode.invalid_request, .message = follower_refusal });
+                return null;
+            }
         }
     }
     try writeSessionTargetError(state, alloc, id, decision, root);
@@ -3567,6 +3604,8 @@ const follower_refusal = "This session is open on another connection; only that 
 /// forgotten here, so the request gets the same not-found answer as any id that
 /// is not open.
 fn followedElsewhere(state: *ServerState, session_id: []const u8) bool {
+    // A follow exists only where `follow_supported` holds.
+    if (comptime !follow_supported) return false;
     if (!followsSession(state, session_id)) return false;
     const shared = state.shared orelse return false;
     shared.mutex.lockUncancelable(io_mod.getIo());
@@ -3774,6 +3813,19 @@ fn publishStartingSteers(session: *ActiveSessionState, alloc: Allocator, steers:
     for (steers) |steer| {
         var message_id_storage: acp_types.MessageIdBuffer = undefined;
         const message_id = acp_types.generateMessageId(&message_id_storage);
+        // Without `follow_supported` no follower takes the other version, so only the owner's is built.
+        if (comptime !follow_supported) {
+            const params = steerChunkParams(alloc, session.session_id, message_id, steer.text, steer.request_id, null, session.server.sendsSteerInput()) catch {
+                debug_trace.logf("acp", "dropped the update for a steer that starts a turn reason=out_of_memory", .{});
+                continue;
+            };
+            defer alloc.free(params);
+            var audience = lockAudience(session);
+            defer audience.unlock();
+            audience.deliver(alloc, "session/update", .none, params, null) catch |err|
+                debug_trace.logf("acp", "failed to send the update for a steer that starts a turn err={s}", .{@errorName(err)});
+            continue;
+        }
         // Both versions are built, so a joiner takes the one its prompt delivery asks for.
         const with = steerChunkParams(alloc, session.session_id, message_id, steer.text, steer.request_id, null, true) catch {
             debug_trace.logf("acp", "dropped the update for a steer that starts a turn reason=out_of_memory", .{});
@@ -4390,17 +4442,20 @@ fn writeInitializeAnswer(state: *ServerState, alloc: Allocator, id: ?jsonrpc.Req
     var capabilities = agentCapabilities(state);
     var arena: std.heap.ArenaAllocator = .init(alloc);
     defer arena.deinit();
-    if (state.leader_info) |info| {
-        const ids = info.sessions.copy_ids(info.sessions.context, arena.allocator()) catch {
-            debug_trace.logf("acp", "event=leader_sessions_unlisted", .{});
-            return state.writer.writeError(alloc, id, .{
-                .code = ErrorCode.internal_error,
-                .message = "Could not list the sessions this process leads",
-            });
-        };
-        const view = try arena.allocator().alloc([]const u8, ids.len);
-        for (ids, view) |listed, *slot| slot.* = listed;
-        capabilities.leader = .{ .pid = info.pid, .sessions = view };
+    // Only a socket connection has leader info, and a socket exists only where `follow_supported` holds.
+    if (comptime follow_supported) {
+        if (state.leader_info) |info| {
+            const ids = info.sessions.copy_ids(info.sessions.context, arena.allocator()) catch {
+                debug_trace.logf("acp", "event=leader_sessions_unlisted", .{});
+                return state.writer.writeError(alloc, id, .{
+                    .code = ErrorCode.internal_error,
+                    .message = "Could not list the sessions this process leads",
+                });
+            };
+            const view = try arena.allocator().alloc([]const u8, ids.len);
+            for (ids, view) |listed, *slot| slot.* = listed;
+            capabilities.leader = .{ .pid = info.pid, .sessions = view };
+        }
     }
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
@@ -4911,10 +4966,12 @@ pub fn handleCloseSession(state: *ServerState, alloc: Allocator, msg: *jsonrpc.M
             .message = "Missing sessionId",
         });
     // A session this connection follows is detached, not closed: its owner keeps it open.
-    if (followsSession(state, session_id)) {
-        detachFollower(state, session_id, "close");
-        forgetFollowing(state, session_id);
-        return state.writer.writeResponse(alloc, msg.id, "{}");
+    if (comptime follow_supported) {
+        if (followsSession(state, session_id)) {
+            detachFollower(state, session_id, "close");
+            forgetFollowing(state, session_id);
+            return state.writer.writeResponse(alloc, msg.id, "{}");
+        }
     }
     // Closing is idempotent in ACP v1: a session that isn't open, or doesn't exist, closes with the
     // same empty result, and every open session stays open.

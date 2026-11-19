@@ -787,6 +787,8 @@ fn followSharedSession(
     observer_hooks: ?libfx_hooks.Config,
     requested_system_prompt: ?[]const u8,
 ) !bool {
+    // A follow exists only where `server.follow_supported` holds.
+    if (comptime !server.follow_supported) return false;
     const shared = state.shared orelse return false;
     shared.mutex.lockUncancelable(io_mod.getIo());
     defer shared.mutex.unlock(io_mod.getIo());
@@ -836,6 +838,8 @@ fn joinSession(
     kind: RestoreKind,
     answer: []const u8,
 ) !void {
+    // A join exists only where `server.follow_supported` holds.
+    if (comptime !server.follow_supported) return;
     if (kind.replaysHistory()) session.session_write_mutex.lockUncancelable(io_mod.getIo());
     defer if (kind.replaysHistory()) session.session_write_mutex.unlock(io_mod.getIo());
     session.audience_mutex.lockUncancelable(io_mod.getIo());
