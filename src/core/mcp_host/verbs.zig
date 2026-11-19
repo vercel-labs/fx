@@ -12,7 +12,11 @@ const config_runtime = @import("../config/config_runtime.zig");
 const project_config = @import("../mcp/project_config.zig");
 const config_file = @import("config_file.zig");
 const credentials = @import("credentials.zig");
+const kept_sign_outs = @import("kept_sign_outs.zig");
 const secret = @import("../auth/secret.zig");
+const auth_oauth = @import("../auth/oauth.zig");
+const oauth_transport = @import("../auth/oauth_transport.zig");
+const pending_revocation = @import("../auth/pending_revocation.zig");
 const slack = @import("slack.zig");
 const login_words = @import("login_words.zig");
 const runtime_mod = @import("runtime.zig");
@@ -382,6 +386,27 @@ pub const Context = struct {
     hosts: Hosts,
     /// Ends a `show` still connecting, such as when fx quits.
     cancel: ?*const std.atomic.Value(bool) = null,
+    /// How a `login` that signs in and every `logout` send the sign-outs that
+    /// earlier logouts kept (`kept_sign_outs.zig`). Null: they wait for the
+    /// next TUI start, or for an `fx mcp` command that has this.
+    kept_sign_outs: ?KeptSignOutRetry = null,
+};
+
+const KeptSignOutRetry = struct {
+    transport: oauth_transport.Provider,
+    /// Runs before the first revocation goes out.
+    notice: ?auth_oauth.BeforeRevocation = null,
+
+    /// Sends those of the logins saved under `home`; one that fails stays
+    /// kept for the next retry, and nothing is said, since the logout that
+    /// kept it already did.
+    fn run(retry: ?KeptSignOutRetry, alloc: Allocator, home: []const u8) void {
+        const r = retry orelse return;
+        const outcome = kept_sign_outs.retry(alloc, home, r.transport, r.notice);
+        if (outcome.revoked != 0 or outcome.failed) {
+            debug_trace.logf("mcp", "MCP kept sign-outs retried revoked={d} failed={}", .{ outcome.revoked, outcome.failed });
+        }
+    }
 };
 
 /// Runs `fx mcp ARGS` or `/mcp ARGS` and returns the exit code: 0 for
@@ -507,6 +532,28 @@ fn whyNot(arena: Allocator, err: anyerror, path: []const u8) ![]const u8 {
     };
     const target = try safe(arena, buffer[0..n]);
     return try arena.print("it's a link to {s}, and fx edits only a plain file; edit {s} by hand", .{ target, target });
+}
+
+/// Why an edit isn't made, ending a sentence like "Couldn't add NAME to FILE: ...".
+/// The reader's own words for an entry it would skip; for a misspelled key, the
+/// words of the skip note, with the command to run again, so a person or an
+/// agent can follow it.
+fn refusalWords(arena: Allocator, refusal: config_file.Refusal) ![]const u8 {
+    switch (refusal) {
+        .entry => |problem| return project_config.entryProblemWords(problem),
+        .misspelled => |misspelled| {
+            const words = try project_config.misspelledWords(arena, misspelled);
+            return arena.print("{s}, and run the command again", .{words});
+        },
+    }
+}
+
+/// A refusal for the trace log: a fixed word, never an entry's text.
+fn refusalToken(refusal: config_file.Refusal) []const u8 {
+    return switch (refusal) {
+        .entry => |problem| @tagName(problem),
+        .misspelled => "misspelled_key",
+    };
 }
 
 /// fx's words for an error, never its name.
@@ -798,10 +845,18 @@ pub fn toolDescription(arena: Allocator, raw: []const u8) !?[]const u8 {
 fn add(c: Context, arena: Allocator, name: []const u8, file: config_file.File, entry: config_file.Entry, login_after: bool) !u8 {
     const p = try paths(c, arena);
     const path = if (file == .project) p.project else p.profile;
-    _ = config_file.update(c.gpa, p.profile, file, path, .{ .add = .{ .name = name, .entry = entry } }) catch |err| {
+    const updated = config_file.update(c.gpa, p.profile, file, path, .{ .add = .{ .name = name, .entry = entry } }) catch |err| {
         try c.err.print("Couldn't add {s} to {s}: {s}.\n", .{ name, fileLabel(file), try whyNot(arena, err, path) });
         return 1;
     };
+    switch (updated) {
+        .refused => |refusal| {
+            debug_trace.logf("mcp", "MCP add refused server={s} file={s} why={s}", .{ name, @tagName(file), refusalToken(refusal) });
+            try c.err.print("Couldn't add {s} to {s}: {s}.\n", .{ name, fileLabel(file), try refusalWords(arena, refusal) });
+            return 1;
+        },
+        .added, .removed, .missing => {},
+    }
     c.hosts.changed(c.hosts.context);
     try c.out.print("Added {s} to {s}.\n", .{ name, fileLabel(file) });
     const other: config_file.File = if (file == .project) .profile else .project;
@@ -826,6 +881,9 @@ fn add(c: Context, arena: Allocator, name: []const u8, file: config_file.File, e
 /// login, signs in the way `login` does, waiting for the browser. Without a
 /// browser to open, it names the command instead, since taking a pasted
 /// address back is `login`'s. The server stays added whatever happens here.
+/// The host may not list the server by now, and then there is nothing to sign
+/// in to: `add` saves only what the reader loads, but the reader holds a server
+/// back while a ${VAR} in it isn't set, and another fx may have changed the file.
 fn signInAfterAdd(c: Context, arena: Allocator, name: []const u8) !void {
     var waiter: Waiter = .{ .gpa = c.gpa, .name = name };
     defer waiter.deinit();
@@ -875,6 +933,11 @@ fn remove(c: Context, arena: Allocator, name: []const u8, only: ?config_file.Fil
     };
     const url = switch (updated) {
         .removed => |u| u,
+        .refused => |refusal| {
+            debug_trace.logf("mcp", "MCP remove refused server={s} file={s} why={s}", .{ try safe(arena, name), @tagName(file), refusalToken(refusal) });
+            try c.err.print("Couldn't remove {s} from {s}: {s}.\n", .{ try safe(arena, name), fileLabel(file), try refusalWords(arena, refusal) });
+            return 1;
+        },
         .added, .missing => null,
     };
     defer if (url) |u| c.gpa.free(u);
@@ -1019,11 +1082,18 @@ fn logout(c: Context, arena: Allocator, name: []const u8) !u8 {
             // The server never hears of a logout it wasn't sent: a copy of
             // the tokens keeps working there.
             .none => try c.out.print("Signed out of {s} here, but the login wasn't revoked at its server, so its tokens stay valid until they expire.\n", .{shown}),
-            .unconfirmed => try c.out.print("Signed out of {s} here, but its server didn't confirm the revocation, so its tokens may stay valid until they expire.\n", .{shown}),
+            .unconfirmed => if (done.retry_later)
+                try c.out.print("Signed out of {s} here, but its server didn't confirm the revocation, so its tokens may stay valid for now. " ++ pending_revocation.retry_later ++ ".\n", .{shown})
+            else
+                try c.out.print("Signed out of {s} here, but its server didn't confirm the revocation, so its tokens may stay valid until they expire.\n", .{shown}),
         }
     } else {
         try c.out.print("{s} wasn't signed in.\n", .{try safe(arena, name)});
     }
+    // The sign-out just kept is leased to this fx, so this retry leaves it
+    // and sends only older ones.
+    try c.out.flush();
+    KeptSignOutRetry.run(c.kept_sign_outs, c.gpa, c.home);
     return 0;
 }
 
@@ -1163,6 +1233,8 @@ fn waitForLogin(c: Context, arena: Allocator, host: *Host, waiter: *Waiter, open
                 if (unchecked) {
                     try c.out.print("Signed in to {s}, but fx couldn't check the login with it.\n", .{try safe(arena, name)});
                 } else try c.out.print("Signed in to {s}.\n", .{try safe(arena, name)});
+                try c.out.flush();
+                KeptSignOutRetry.run(c.kept_sign_outs, c.gpa, c.home);
                 return 0;
             }
             try c.err.print("Couldn't sign in to {s}: {s}.\n", .{ try safe(arena, name), try safeLong(arena, waiter.reason orelse "the server refused") });
@@ -1420,6 +1492,28 @@ test "list lines up its columns and keeps hostile names inert" {
         \\{"servers":[{"name":"context7","source":"profile","file":"/h/.fx/mcp.json","transport":"http","status":"ready","error":null,"tools":2}]}
         \\
     , json.written());
+}
+
+test "a refused add names a misspelled key by how it starts when it is too long to show whole, in words that end by saying to run the command again" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var text: std.ArrayList(u8) = .empty;
+    try text.appendSlice(arena, "{\"mcp_servers");
+    for (0..70) |_| try text.appendSlice(arena, "\u{e9}");
+    try text.appendSlice(arena, "\":{\"a\":{\"command\":\"x\"}}}");
+    const key = (try project_config.misspelledKey(arena, text.items)).?;
+    const words = try refusalWords(arena, .{ .misspelled = key });
+    try std.testing.expect(std.unicode.utf8ValidateSlice(words));
+    try std.testing.expect(std.mem.startsWith(u8, words, "the key that starts with \"mcp_servers"));
+    try std.testing.expect(std.mem.endsWith(u8, words, "then delete that key, and run the command again"));
+    try std.testing.expect(std.mem.find(u8, words, "the key \"mcp_servers") == null);
+    // A key that fits is named whole, in the skip note's words.
+    const small = (try project_config.misspelledKey(arena, "{\"mcp_servers\":{\"a\":{\"command\":\"x\"}}}")).?;
+    try std.testing.expectEqualStrings(
+        "the key \"mcp_servers\" looks like a misspelling of \"mcpServers\", so fx doesn't read it. Move its servers into \"mcpServers\", then delete \"mcp_servers\", and run the command again",
+        try refusalWords(arena, .{ .misspelled = small }),
+    );
 }
 
 test "an MCP file fx can't read gets fx's words, and only mcp.json's own errors name it" {
