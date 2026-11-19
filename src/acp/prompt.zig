@@ -377,24 +377,30 @@ const AcpContext = struct {
     /// `_sh.fx/session/turn_progress`, for a client that lists
     /// `sh.fx/turnProgress` (`tests/tla/acp/AcpTurnEvents.tla` OptIn).
     fn sendTurnProgress(self: *AcpContext) !void {
-        if (!self.state.extensions.contains(.turn_progress)) return;
         var out: std.Io.Writer.Allocating = .init(self.alloc);
         defer out.deinit();
         try acp_types.writeTurnProgressParams(&out.writer, self.session_id, self.progress);
+        var audience = server.lockAudience(self.session);
+        defer audience.unlock();
+        // A joiner gets the latest progress from the copy, whether or not a member lists it now.
+        audience.keepProgress(out.written());
         if (self.progress_sent) |sent| if (std.mem.eql(u8, sent, out.written())) return;
-        try self.state.writer.writeNotification(self.alloc, sh_fx.method.session_turn_progress, out.written());
+        // Nothing is sent, and progress_sent is not updated, when no member lists the extension.
+        if (!audience.anyLists(.turn_progress)) return;
+        try audience.writeEach(self.alloc, sh_fx.method.session_turn_progress, .{ .extension = .turn_progress }, out.written(), null);
         const sent = try self.alloc.dupe(u8, out.written());
         if (self.progress_sent) |old| self.alloc.free(old);
         self.progress_sent = sent;
     }
 
-    /// `_sh.fx/session/model_call`, for a client that lists `sh.fx/modelCalls`.
+    /// `_sh.fx/session/model_call`, for each audience member that lists `sh.fx/modelCalls`.
     fn sendModelCall(self: *AcpContext, call: types.ModelCallRecord) !void {
-        if (!self.state.extensions.contains(.model_calls)) return;
         var out: std.Io.Writer.Allocating = .init(self.alloc);
         defer out.deinit();
         try acp_types.writeModelCallParams(self.alloc, &out.writer, self.session_id, call);
-        try self.state.writer.writeNotification(self.alloc, sh_fx.method.session_model_call, out.written());
+        var audience = server.lockAudience(self.session);
+        defer audience.unlock();
+        try audience.deliver(self.alloc, sh_fx.method.session_model_call, .{ .extension = .model_calls }, out.written(), null);
     }
 
     fn sendCompactionUpdate(self: *AcpContext, number: usize, status: acp_types.CompactionStatus, error_text: ?[]const u8) !void {
@@ -405,11 +411,22 @@ const AcpContext = struct {
         try self.sendUpdate(out.written());
     }
 
-    fn sendUpdate(self: *AcpContext, update_json: []const u8) !void {
+    /// The params of a `session/update` that carries `update_json`. The caller frees them.
+    fn updateParams(self: *AcpContext, update_json: []const u8) ![]u8 {
         var out: std.Io.Writer.Allocating = .init(self.alloc);
         defer out.deinit();
         try acp_types.writeSessionUpdate(&out.writer, self.session_id, update_json);
-        try self.state.writer.writeNotification(self.alloc, "session/update", out.writer.buffered());
+        return try out.toOwnedSlice();
+    }
+
+    /// Sends one `session/update` to every audience member, the owner first.
+    /// Each member gets the same bytes, and the turn's copy keeps them.
+    fn sendUpdate(self: *AcpContext, update_json: []const u8) !void {
+        const params = try self.updateParams(update_json);
+        defer self.alloc.free(params);
+        var audience = server.lockAudience(self.session);
+        defer audience.unlock();
+        try audience.deliver(self.alloc, "session/update", .none, params, null);
     }
 
     fn assistantMessageId(self: *AcpContext) []const u8 {
@@ -429,43 +446,61 @@ const AcpContext = struct {
     }
 
     fn sendAgentText(self: *AcpContext, message_id: []const u8, text: []const u8) !void {
-        const plain = try stripAnsiAlloc(self.alloc, text);
-        defer if (plain.ptr != text.ptr) self.alloc.free(plain);
-        var out: std.Io.Writer.Allocating = .init(self.alloc);
-        defer out.deinit();
-        try acp_types.writeAgentMessageChunk(&out.writer, message_id, plain);
-        try self.sendUpdate(out.writer.buffered());
+        const params = try self.agentTextParams(message_id, text);
+        defer self.alloc.free(params);
+        var audience = server.lockAudience(self.session);
+        defer audience.unlock();
+        try audience.deliver(self.alloc, "session/update", .none, params, null);
     }
 
-    /// A notice the client shows outside the conversation (ACP v1).
-    fn sendNotice(self: *AcpContext, text: []const u8) !void {
+    /// The params of an agent text chunk, with ANSI stripped. The caller frees them.
+    fn agentTextParams(self: *AcpContext, message_id: []const u8, text: []const u8) ![]u8 {
+        const plain = try stripAnsiAlloc(self.alloc, text);
+        defer if (plain.ptr != text.ptr) self.alloc.free(plain);
+        var update: std.Io.Writer.Allocating = .init(self.alloc);
+        defer update.deinit();
+        try acp_types.writeAgentMessageChunk(&update.writer, message_id, plain);
+        return self.updateParams(update.writer.buffered());
+    }
+
+    /// The params of a notice the client shows outside the conversation (ACP v1).
+    /// The caller frees them.
+    fn noticeParams(self: *AcpContext, text: []const u8) ![]u8 {
         const plain = try stripAnsiAlloc(self.alloc, text);
         defer if (plain.ptr != text.ptr) self.alloc.free(plain);
         // The tag is for the model; a notice's title stands alone.
         const title = std.mem.trimStart(u8, std.mem.cutPrefix(u8, plain, "[context]") orelse plain, " ");
-        var out: std.Io.Writer.Allocating = .init(self.alloc);
-        defer out.deinit();
-        try acp_types.writeNotice(&out.writer, "info", if (title.len > 0) title else plain);
-        try self.sendUpdate(out.writer.buffered());
+        var update: std.Io.Writer.Allocating = .init(self.alloc);
+        defer update.deinit();
+        try acp_types.writeNotice(&update.writer, "info", if (title.len > 0) title else plain);
+        return self.updateParams(update.writer.buffered());
     }
 
     fn sendModelRecoveryStatus(
         self: *AcpContext,
         status: types.RouteRecoveryStatus,
     ) !void {
-        if (!self.state.extensions.contains(.model_response_recovery)) return;
-        var out: std.Io.Writer.Allocating = .init(self.alloc);
-        defer out.deinit();
-        try acp_types.writeModelRecoveryInfoUpdate(&out.writer, status);
-        try self.sendUpdate(out.writer.buffered());
+        var update: std.Io.Writer.Allocating = .init(self.alloc);
+        defer update.deinit();
+        try acp_types.writeModelRecoveryInfoUpdate(&update.writer, status);
+        try self.deliverRecoveryStatus(update.writer.buffered());
+    }
+
+    /// Sends a model recovery status to the members that list it, and keeps it
+    /// for a joiner that does.
+    fn deliverRecoveryStatus(self: *AcpContext, update_json: []const u8) !void {
+        const params = try self.updateParams(update_json);
+        defer self.alloc.free(params);
+        var audience = server.lockAudience(self.session);
+        defer audience.unlock();
+        try audience.deliver(self.alloc, "session/update", .{ .extension = .model_response_recovery }, params, null);
     }
 
     fn clearModelRecoveryStatus(self: *AcpContext) !void {
-        if (!self.state.extensions.contains(.model_response_recovery)) return;
-        var out: std.Io.Writer.Allocating = .init(self.alloc);
-        defer out.deinit();
-        try acp_types.writeModelRecoveryInfoUpdate(&out.writer, null);
-        try self.sendUpdate(out.writer.buffered());
+        var update: std.Io.Writer.Allocating = .init(self.alloc);
+        defer update.deinit();
+        try acp_types.writeModelRecoveryInfoUpdate(&update.writer, null);
+        try self.deliverRecoveryStatus(update.writer.buffered());
     }
 
     fn mcpToolIdentity(self: *AcpContext, arena: Allocator, name: []const u8) ?catalog_state.ToolIdentity {
@@ -522,11 +557,23 @@ const AcpContext = struct {
         try self.published_tool_calls.ensureUnusedCapacity(self.alloc, 1);
         const owned_id = try self.alloc.dupe(u8, call.id);
         errdefer self.alloc.free(owned_id);
-        var out: std.Io.Writer.Allocating = .init(self.alloc);
-        defer out.deinit();
-        const meta: ?acp_types.ToolCallMeta = if (self.state.extensions.contains(.tool_call)) presentation.meta else null;
-        try acp_types.writeToolCall(&out.writer, owned_id, name, presentation.title, kind, .pending, raw_input, meta);
-        try self.sendUpdate(out.writer.buffered());
+        // The card with and without `_meta`. Each member takes the one its own
+        // `sh.fx/toolCall` setting asks for, and the turn's copy keeps both.
+        var with_meta: std.Io.Writer.Allocating = .init(self.alloc);
+        defer with_meta.deinit();
+        try acp_types.writeToolCall(&with_meta.writer, owned_id, name, presentation.title, kind, .pending, raw_input, presentation.meta);
+        var without_meta: std.Io.Writer.Allocating = .init(self.alloc);
+        defer without_meta.deinit();
+        try acp_types.writeToolCall(&without_meta.writer, owned_id, name, presentation.title, kind, .pending, raw_input, null);
+        const with_params = try self.updateParams(with_meta.writer.buffered());
+        defer self.alloc.free(with_params);
+        const without_params = try self.updateParams(without_meta.writer.buffered());
+        defer self.alloc.free(without_params);
+        {
+            var audience = server.lockAudience(self.session);
+            defer audience.unlock();
+            try audience.deliver(self.alloc, "session/update", .{ .extension = .tool_call }, with_params, without_params);
+        }
         self.published_tool_calls.putAssumeCapacity(
             owned_id,
             if (tool_presentation.isProviderSearchAlias(call.name)) .awaiting_provider_terminal else .open,
@@ -613,12 +660,11 @@ const AcpContext = struct {
         try self.sendToolCallCompletedWithDiff(tool_call_id, null, result_text, command_result_json);
     }
 
-    /// A shell call's command result for `sh.fx/commandResult`, for a client
-    /// that lists it. The core hands it over as JSON in fx's own names; one
-    /// that doesn't parse is left out of the update, and fx logs why.
-    fn commandResultFor(self: *AcpContext, arena: std.mem.Allocator, tool_call_id: []const u8, json: ?[]const u8) ?acp_types.CommandResult {
+    /// A shell call's command result, parsed for `sh.fx/commandResult`. The
+    /// core hands it over as JSON in fx's own names; one that doesn't parse is
+    /// left out of the update, and fx logs why.
+    fn parsedCommandResult(arena: std.mem.Allocator, tool_call_id: []const u8, json: ?[]const u8) ?acp_types.CommandResult {
         const text = json orelse return null;
-        if (!self.state.extensions.contains(.command_result)) return null;
         return acp_types.parseCommandResult(arena, text) catch |err| {
             debug_trace.logf("acp", "sh.fx/commandResult left out of tool call {s}: its command result did not parse err={s}", .{ tool_call_id, @errorName(err) });
             return null;
@@ -628,11 +674,23 @@ const AcpContext = struct {
     fn sendToolCallCompletedWithDiff(self: *AcpContext, tool_call_id: []const u8, diff: ?acp_types.ToolDiff, result_text: ?[]const u8, command_result_json: ?[]const u8) !void {
         var arena_state: std.heap.ArenaAllocator = .init(self.alloc);
         defer arena_state.deinit();
-        const command_result = self.commandResultFor(arena_state.allocator(), tool_call_id, command_result_json);
-        var out: std.Io.Writer.Allocating = .init(self.alloc);
-        defer out.deinit();
-        try acp_types.writeToolCallUpdateWithDiff(&out.writer, tool_call_id, .completed, diff, result_text, command_result);
-        try self.sendUpdate(out.writer.buffered());
+        const command_result = parsedCommandResult(arena_state.allocator(), tool_call_id, command_result_json);
+        var with_result: std.Io.Writer.Allocating = .init(self.alloc);
+        defer with_result.deinit();
+        try acp_types.writeToolCallUpdateWithDiff(&with_result.writer, tool_call_id, .completed, diff, result_text, command_result);
+        var without_result: std.Io.Writer.Allocating = .init(self.alloc);
+        defer without_result.deinit();
+        try acp_types.writeToolCallUpdateWithDiff(&without_result.writer, tool_call_id, .completed, diff, result_text, null);
+        const with_params = try self.updateParams(with_result.writer.buffered());
+        defer self.alloc.free(with_params);
+        const without_params = try self.updateParams(without_result.writer.buffered());
+        defer self.alloc.free(without_params);
+        {
+            var audience = server.lockAudience(self.session);
+            defer audience.unlock();
+            // A member takes the result when its own `sh.fx/commandResult` setting asks for it.
+            try audience.deliver(self.alloc, "session/update", .{ .extension = .command_result }, with_params, without_params);
+        }
         self.markCardFinished(tool_call_id);
     }
 
@@ -643,11 +701,23 @@ const AcpContext = struct {
     fn sendToolCallErrorWithCommandResult(self: *AcpContext, tool_call_id: []const u8, err_text: []const u8, command_result_json: ?[]const u8) !void {
         var arena_state: std.heap.ArenaAllocator = .init(self.alloc);
         defer arena_state.deinit();
-        const command_result = self.commandResultFor(arena_state.allocator(), tool_call_id, command_result_json);
-        var out: std.Io.Writer.Allocating = .init(self.alloc);
-        defer out.deinit();
-        try acp_types.writeToolCallUpdateWithCommandResult(&out.writer, tool_call_id, .failed, err_text, command_result);
-        try self.sendUpdate(out.writer.buffered());
+        const command_result = parsedCommandResult(arena_state.allocator(), tool_call_id, command_result_json);
+        var with_result: std.Io.Writer.Allocating = .init(self.alloc);
+        defer with_result.deinit();
+        try acp_types.writeToolCallUpdateWithCommandResult(&with_result.writer, tool_call_id, .failed, err_text, command_result);
+        var without_result: std.Io.Writer.Allocating = .init(self.alloc);
+        defer without_result.deinit();
+        try acp_types.writeToolCallUpdateWithCommandResult(&without_result.writer, tool_call_id, .failed, err_text, null);
+        const with_params = try self.updateParams(with_result.writer.buffered());
+        defer self.alloc.free(with_params);
+        const without_params = try self.updateParams(without_result.writer.buffered());
+        defer self.alloc.free(without_params);
+        {
+            var audience = server.lockAudience(self.session);
+            defer audience.unlock();
+            // A member takes the result when its own `sh.fx/commandResult` setting asks for it.
+            try audience.deliver(self.alloc, "session/update", .{ .extension = .command_result }, with_params, without_params);
+        }
         self.markCardFinished(tool_call_id);
     }
 
@@ -1312,7 +1382,8 @@ pub fn handlePrompt(
     } else if (session.journal) |*journal| {
         // A new prompt instead of a resume ends the open turn as interrupted.
         if (journal.pending_resume) |pending| {
-            try persistAcpHistoryTurn(alloc, session, pending.interruptedTurn(), null, null);
+            // An earlier turn that a new prompt ends: the copy holds this turn's updates, not its, so it stays.
+            try persistAcpHistoryTurn(alloc, session, pending.interruptedTurn(), null, null, false);
             journal.dropPendingResume(state.alloc);
         }
     }
@@ -1478,8 +1549,8 @@ pub fn handlePrompt(
     }
     prompt_input.retainImageSnapshots();
     completeAcpTitleTask(state, session);
-    try sessions.sendSessionInfoUpdate(state, session, alloc, true);
-    try sessions.sendSessionUsageUpdate(state, session, turn_settings.model, turn_settings.provider, alloc);
+    try sessions.sendTurnSessionInfoUpdate(session, alloc, true);
+    try sessions.sendTurnSessionUsageUpdate(session, turn_settings.model, turn_settings.provider, alloc);
 
     // A steer's interrupt the turn finished before reaching is not a cancel.
     server.releaseSteeringInterrupt(session);
@@ -2415,14 +2486,14 @@ fn acceptHostSteering(ctx: *AcpContext, taken: []const js_host_steering.Taken) !
 fn publishSteeringReplay(ctx: *AcpContext, text: []const u8, request_id: ?jsonrpc.RequestId, input_id: ?[]const u8) !void {
     var message_id_storage: acp_types.MessageIdBuffer = undefined;
     const message_id = acp_types.generateMessageId(&message_id_storage);
-    var update: std.Io.Writer.Allocating = .init(ctx.alloc);
-    defer update.deinit();
-    try update.writer.writeAll("{\"sessionId\":");
-    try jsonrpc.writeJsonStr(ctx.session_id, &update.writer);
-    try update.writer.writeAll(",\"update\":");
-    try acp_types.writeSteeringUserMessageChunk(&update.writer, message_id, text, request_id, input_id, ctx.state.sendsSteerInput());
-    try update.writer.writeByte('}');
-    try ctx.state.writer.writeNotification(ctx.alloc, "session/update", update.written());
+    // Each member takes the chunk with or without `sh.fx/steerInput`, by its own prompt delivery.
+    const with = try server.steerChunkParams(ctx.alloc, ctx.session_id, message_id, text, request_id, input_id, true);
+    defer ctx.alloc.free(with);
+    const without = try server.steerChunkParams(ctx.alloc, ctx.session_id, message_id, text, request_id, input_id, false);
+    defer ctx.alloc.free(without);
+    var audience = server.lockAudience(ctx.session);
+    defer audience.unlock();
+    try audience.deliver(ctx.alloc, "session/update", .steer_input, with, without);
 }
 
 fn releaseAgentTerminalLease(raw_ctx: *anyopaque, session_id: []const u8) !void {
@@ -3168,12 +3239,19 @@ fn toolUpdateContentText(result: ToolExecutionResult) []const u8 {
 
 fn propagateHistoryTurn(raw_ctx: *anyopaque, turn: HistoryTurn) !void {
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
+    // A compaction summary is not a save of the running turn, so its copy stays.
+    // The switch has no default: a new history variant needs its own answer here.
+    const saves_running_turn = switch (turn) {
+        .compacted_summary => false,
+        .assistant, .interrupted => true,
+    };
     try persistAcpHistoryTurn(
         ctx.alloc,
         ctx.session,
         turn,
         ctx.current_prompt_input,
         ctx.state.alloc,
+        saves_running_turn,
     );
 }
 
@@ -3419,7 +3497,8 @@ fn commitCancelledJournalTurn(alloc: Allocator, session_alloc: Allocator, sessio
         break :cancelled checkpoint;
     };
     defer cancelled.deinit(session_alloc);
-    try persistAcpHistoryTurn(alloc, session, cancelled.interruptedTurn(), prompt_input, session_alloc);
+    // The cancelled turn is the running turn, so its save commits the copy's updates.
+    try persistAcpHistoryTurn(alloc, session, cancelled.interruptedTurn(), prompt_input, session_alloc, true);
 }
 
 fn sessionChildCapability(session: *server.ActiveSessionState) ?*session_child_store.SessionChildCapability {
@@ -3429,12 +3508,20 @@ fn sessionChildCapability(session: *server.ActiveSessionState) ?*session_child_s
 
 /// `hand_back_alloc`, set when the running turn ends, owns its queued
 /// steering, which is handed back first.
+///
+/// `releases_copy` is set when this save commits the running turn. The turn's
+/// running copy is then freed inside the same `session_write_mutex` hold, right
+/// after the commit, so a join (C3) that takes `session_write_mutex` before it
+/// reads the log and the copy never sees the turn in both. A save that is not
+/// the running turn's, such as a compaction summary or an earlier turn, leaves
+/// the copy alone.
 fn persistAcpHistoryTurn(
     alloc: Allocator,
     session: *server.ActiveSessionState,
     turn: HistoryTurn,
     current_prompt_input: ?*ParsedPromptInput,
     hand_back_alloc: ?Allocator,
+    releases_copy: bool,
 ) !void {
     session.session_write_mutex.lockUncancelable(io_mod.getIo());
     defer session.session_write_mutex.unlock(io_mod.getIo());
@@ -3449,6 +3536,7 @@ fn persistAcpHistoryTurn(
     }
     if (comptime host_target.is_wasm) {
         session.session_rt.commitPreparedHistoryEntry(alloc, prepared);
+        if (releases_copy) server.releaseRunningCopy(session, .turn_saved);
         prepared_owned = false;
         if (current_prompt_input) |prompt_input| prompt_input.retainImageSnapshots();
         try keepImageWindow(alloc, session);
@@ -3462,6 +3550,8 @@ fn persistAcpHistoryTurn(
             if (session_adapter.writeMayHaveLanded(err)) if (current_prompt_input) |input| input.retainImageSnapshots();
             return err;
         };
+        // The log holds the turn now, so the copy goes in this same hold.
+        if (releases_copy) server.releaseRunningCopy(session, .turn_saved);
         session.session_rt.commitPreparedHistoryEntry(alloc, prepared);
         prepared_owned = false;
         if (current_prompt_input) |prompt_input| prompt_input.retainImageSnapshots();
@@ -3469,6 +3559,7 @@ fn persistAcpHistoryTurn(
     }
     // No saved store: the turn lives in memory, within its image window.
     session.session_rt.commitPreparedHistoryEntry(alloc, prepared);
+    if (releases_copy) server.releaseRunningCopy(session, .turn_saved);
     prepared_owned = false;
     if (current_prompt_input) |prompt_input| prompt_input.retainImageSnapshots();
     try keepImageWindow(alloc, session);
@@ -3863,10 +3954,29 @@ fn pushContextNotice(raw_ctx: *anyopaque, text: []const u8) !void {
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
     const session = ctx.session;
     if (!try session.session_rt.claimContextNotice(ctx.alloc, text)) return;
-    // ACP v1 Session Notices where the client shows them;
-    // otherwise a message, as ACP allows.
-    if (ctx.state.client_notices) return ctx.sendNotice(text) catch {};
-    try pushSystemNotice(raw_ctx, text);
+    // Both versions are built, so a joiner whose client lacks notices gets the message.
+    const with = ctx.noticeParams(text) catch |err| {
+        debug_trace.logf("acp", "dropped a context notice reason={s}", .{@errorName(err)});
+        return;
+    };
+    defer ctx.alloc.free(with);
+    var audience = server.lockAudience(session);
+    defer audience.unlock();
+    // The message fallback takes the operational id, as before, when a member lacks
+    // notices. When none does, a fresh id leaves the owner's id state unchanged.
+    var fresh: acp_types.MessageIdBuffer = undefined;
+    var some_member_lacks_notices = !ctx.state.client_notices;
+    for (session.followers.items) |member| {
+        if (!member.client_notices) some_member_lacks_notices = true;
+    }
+    const message_id = if (some_member_lacks_notices) ctx.operationalMessageId() else acp_types.generateMessageId(&fresh);
+    const without = ctx.agentTextParams(message_id, text) catch |err| {
+        debug_trace.logf("acp", "dropped a context notice's message reason={s}", .{@errorName(err)});
+        return;
+    };
+    defer ctx.alloc.free(without);
+    // The owner's error is swallowed, as a notice's always was.
+    audience.deliver(ctx.alloc, "session/update", .notices, with, without) catch {};
 }
 
 fn pushDiffBlock(raw_ctx: *anyopaque, payload: agent_runtime.DiffEntryPayload) !void {
@@ -4314,6 +4424,7 @@ fn finishAcpUrlElicitations(
             params.writer.writeAll("{\"elicitationId\":") catch continue;
             std.json.Stringify.value(id, .{}, &params.writer) catch continue;
             params.writer.writeByte('}') catch continue;
+            // It completes a request only the owner's client was sent, so only the owner gets it.
             responder.acp.state.writer.writeNotification(
                 alloc,
                 "elicitation/complete",
@@ -6477,4 +6588,301 @@ test "ACP prompt agent config carries request options from active session" {
     try std.testing.expectEqualStrings(state.cfg.gateway_chat_url, server.firstSession(&state).?.web_search_runtime.gateway_chat_url);
     try std.testing.expectEqualStrings("/models", tool_ctx.gateway_models_path);
     try std.testing.expect(tool_ctx.ultrafast_mode);
+}
+
+/// Keeps the frames a connection's writer is given, in order, for a test.
+const WireCapture = struct {
+    alloc: Allocator,
+    bytes: std.ArrayList(u8) = .empty,
+
+    fn write(raw: ?*anyopaque, frame: []const u8) anyerror!void {
+        const self: *WireCapture = @ptrCast(@alignCast(raw.?));
+        try self.bytes.appendSlice(self.alloc, frame);
+    }
+
+    fn deinit(self: *WireCapture) void {
+        self.bytes.deinit(self.alloc);
+    }
+};
+
+/// A connection's write that always fails, so the audience drops that connection.
+fn refuseWrite(_: ?*anyopaque, _: []const u8) anyerror!void {
+    return error.WriteFailed;
+}
+
+test "an audience member gets each update in the owner's bytes, and turn progress only where it lists it" {
+    const alloc = std.testing.allocator;
+    var state: server.ServerState = undefined;
+    try initTestAcpState(&state, alloc, "/tmp/workspace", .ask);
+    defer state.deinit();
+    var owner_wire = WireCapture{ .alloc = alloc };
+    defer owner_wire.deinit();
+    state.writer = jsonrpc.Writer.initCallback(&owner_wire, WireCapture.write);
+    state.extensions = sh_fx.Set.initMany(&.{.turn_progress});
+    const session = server.firstSession(&state).?;
+
+    var follower_wire = WireCapture{ .alloc = alloc };
+    defer follower_wire.deinit();
+    var follower = server.ServerState{
+        .alloc = alloc,
+        .cfg = undefined,
+        .writer = jsonrpc.Writer.initCallback(&follower_wire, WireCapture.write),
+    };
+    try session.followers.append(alloc, &follower);
+
+    var turn_settings = try TurnSettings.capture(alloc, session);
+    defer turn_settings.deinit(alloc);
+    var ctx = AcpContext{ .alloc = alloc, .state = &state, .session = session, .turn = &turn_settings, .session_id = "session_1" };
+    defer ctx.deinitPublishedToolCalls();
+
+    // An update goes to both members, byte for byte the same.
+    try ctx.sendUpdate("{\"sessionUpdate\":\"agent_thought_chunk\",\"content\":{\"type\":\"text\",\"text\":\"shared\"}}");
+    try std.testing.expect(owner_wire.bytes.items.len > 0);
+    try std.testing.expectEqualSlices(u8, owner_wire.bytes.items, follower_wire.bytes.items);
+
+    // Turn progress goes only to the member that lists it.
+    const owner_before = owner_wire.bytes.items.len;
+    const follower_before = follower_wire.bytes.items.len;
+    try ctx.sendTurnProgress();
+    try std.testing.expect(owner_wire.bytes.items.len > owner_before);
+    try std.testing.expect(std.mem.find(u8, owner_wire.bytes.items[owner_before..], sh_fx.method.session_turn_progress) != null);
+    try std.testing.expectEqual(follower_before, follower_wire.bytes.items.len);
+}
+
+test "an audience member whose write fails is dropped, and the owner still gets the update" {
+    const alloc = std.testing.allocator;
+    var state: server.ServerState = undefined;
+    try initTestAcpState(&state, alloc, "/tmp/workspace", .ask);
+    defer state.deinit();
+    var owner_wire = WireCapture{ .alloc = alloc };
+    defer owner_wire.deinit();
+    state.writer = jsonrpc.Writer.initCallback(&owner_wire, WireCapture.write);
+    const session = server.firstSession(&state).?;
+
+    var follower = server.ServerState{
+        .alloc = alloc,
+        .cfg = undefined,
+        .writer = jsonrpc.Writer.initCallback(null, refuseWrite),
+    };
+    try session.followers.append(alloc, &follower);
+
+    var turn_settings = try TurnSettings.capture(alloc, session);
+    defer turn_settings.deinit(alloc);
+    var ctx = AcpContext{ .alloc = alloc, .state = &state, .session = session, .turn = &turn_settings, .session_id = "session_1" };
+    defer ctx.deinitPublishedToolCalls();
+
+    try ctx.sendUpdate("{\"sessionUpdate\":\"agent_thought_chunk\",\"content\":{\"type\":\"text\",\"text\":\"owner\"}}");
+    try std.testing.expect(owner_wire.bytes.items.len > 0);
+    try std.testing.expectEqual(@as(usize, 0), session.followers.items.len);
+}
+
+test "an audience member whose writer has stopped is dropped after the next update, and the owner still gets it" {
+    const alloc = std.testing.allocator;
+    var state: server.ServerState = undefined;
+    try initTestAcpState(&state, alloc, "/tmp/workspace", .ask);
+    defer state.deinit();
+    var owner_wire = WireCapture{ .alloc = alloc };
+    defer owner_wire.deinit();
+    state.writer = jsonrpc.Writer.initCallback(&owner_wire, WireCapture.write);
+    const session = server.firstSession(&state).?;
+
+    var follower_wire = WireCapture{ .alloc = alloc };
+    defer follower_wire.deinit();
+    var follower = server.ServerState{
+        .alloc = alloc,
+        .cfg = undefined,
+        .writer = jsonrpc.Writer.initCallback(&follower_wire, WireCapture.write),
+    };
+    // Its client closed: the writer drops later notifications without an error.
+    follower.writer.dropping = true;
+    try session.followers.append(alloc, &follower);
+
+    var turn_settings = try TurnSettings.capture(alloc, session);
+    defer turn_settings.deinit(alloc);
+    var ctx = AcpContext{ .alloc = alloc, .state = &state, .session = session, .turn = &turn_settings, .session_id = "session_1" };
+    defer ctx.deinitPublishedToolCalls();
+
+    try ctx.sendUpdate("{\"sessionUpdate\":\"agent_thought_chunk\",\"content\":{\"type\":\"text\",\"text\":\"after\"}}");
+    try std.testing.expectEqual(@as(usize, 0), session.followers.items.len);
+    try std.testing.expectEqual(@as(usize, 0), follower_wire.bytes.items.len);
+    try std.testing.expect(owner_wire.bytes.items.len > 0);
+}
+
+test "a running turn's copy keeps each update in order, with the params each kind of client takes" {
+    const alloc = std.testing.allocator;
+    var state: server.ServerState = undefined;
+    try initTestAcpState(&state, alloc, "/tmp/workspace", .ask);
+    defer state.deinit();
+    var owner_wire = WireCapture{ .alloc = alloc };
+    defer owner_wire.deinit();
+    state.writer = jsonrpc.Writer.initCallback(&owner_wire, WireCapture.write);
+    const session = server.firstSession(&state).?;
+    var turn_settings = try TurnSettings.capture(alloc, session);
+    defer turn_settings.deinit(alloc);
+    var ctx = AcpContext{ .alloc = alloc, .state = &state, .session = session, .turn = &turn_settings, .session_id = "session_1" };
+    defer ctx.deinitPublishedToolCalls();
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+
+    try ctx.sendUpdate("{\"sessionUpdate\":\"agent_thought_chunk\",\"content\":{\"type\":\"text\",\"text\":\"thinking\"}}");
+    _ = try ctx.sendToolCallPending(arena_state.allocator(), .{ .id = "call_1", .name = "read_file", .arguments_json = "{\"path\":\"a.txt\"}" });
+    try ctx.sendModelCall(.{ .at_ms = 1, .provider = "gateway", .model = "test-model" });
+
+    const entries = session.running_copy.entries.items;
+    try std.testing.expectEqual(@as(usize, 3), entries.len);
+
+    // A thought goes to every member, with the same params.
+    try std.testing.expectEqualStrings("session/update", entries[0].method);
+    try std.testing.expect(std.meta.activeTag(entries[0].need) == .none);
+    try std.testing.expect(entries[0].without == null);
+    try std.testing.expect(std.mem.find(u8, entries[0].with, "thinking") != null);
+
+    // The tool call: its `_meta` only for a member whose `sh.fx/toolCall` is set.
+    try std.testing.expectEqualStrings("session/update", entries[1].method);
+    try std.testing.expectEqual(sh_fx.Extension.tool_call, entries[1].need.extension);
+    try std.testing.expect(std.mem.find(u8, entries[1].with, "sh.fx/toolCall") != null);
+    try std.testing.expect(std.mem.find(u8, entries[1].without.?, "sh.fx/toolCall") == null);
+
+    // The model call: a whole message only for a member that lists `sh.fx/modelCalls`.
+    try std.testing.expectEqualStrings(sh_fx.method.session_model_call, entries[2].method);
+    try std.testing.expectEqual(sh_fx.Extension.model_calls, entries[2].need.extension);
+    try std.testing.expect(entries[2].without == null);
+    try std.testing.expect(std.mem.find(u8, entries[2].with, "test-model") != null);
+
+    // The owner lists none of these, so it received the thought as `with` and the tool call as `without`.
+    try std.testing.expect(std.mem.find(u8, owner_wire.bytes.items, entries[0].with) != null);
+    try std.testing.expect(std.mem.find(u8, owner_wire.bytes.items, entries[1].without.?) != null);
+}
+
+test "a running turn's copy keeps only its latest turn progress" {
+    const alloc = std.testing.allocator;
+    var state: server.ServerState = undefined;
+    try initTestAcpState(&state, alloc, "/tmp/workspace", .ask);
+    defer state.deinit();
+    // The owner's frames go to a capture, not to stdout: the test runner reads stdout as its protocol.
+    var owner_wire = WireCapture{ .alloc = alloc };
+    defer owner_wire.deinit();
+    state.writer = jsonrpc.Writer.initCallback(&owner_wire, WireCapture.write);
+    const session = server.firstSession(&state).?;
+    var turn_settings = try TurnSettings.capture(alloc, session);
+    defer turn_settings.deinit(alloc);
+    var ctx = AcpContext{ .alloc = alloc, .state = &state, .session = session, .turn = &turn_settings, .session_id = "session_1" };
+    defer ctx.deinitPublishedToolCalls();
+
+    ctx.progress.provider = try alloc.dupe(u8, "first");
+    try ctx.sendTurnProgress();
+    if (ctx.progress.provider) |old| alloc.free(old);
+    ctx.progress.provider = try alloc.dupe(u8, "second");
+    try ctx.sendTurnProgress();
+
+    const progress = session.running_copy.progress orelse return error.TestExpectedEqual;
+    try std.testing.expect(std.mem.find(u8, progress, "second") != null);
+    try std.testing.expect(std.mem.find(u8, progress, "first") == null);
+    // Progress is not an entry: the copy holds no update for it.
+    try std.testing.expectEqual(@as(usize, 0), session.running_copy.entries.items.len);
+}
+
+test "releasing a running turn's copy frees its entries and its progress" {
+    const alloc = std.testing.allocator;
+    var state: server.ServerState = undefined;
+    try initTestAcpState(&state, alloc, "/tmp/workspace", .ask);
+    defer state.deinit();
+    // The owner's frames go to a capture, not to stdout: the test runner reads stdout as its protocol.
+    var owner_wire = WireCapture{ .alloc = alloc };
+    defer owner_wire.deinit();
+    state.writer = jsonrpc.Writer.initCallback(&owner_wire, WireCapture.write);
+    const session = server.firstSession(&state).?;
+    var turn_settings = try TurnSettings.capture(alloc, session);
+    defer turn_settings.deinit(alloc);
+    var ctx = AcpContext{ .alloc = alloc, .state = &state, .session = session, .turn = &turn_settings, .session_id = "session_1" };
+    defer ctx.deinitPublishedToolCalls();
+
+    try ctx.sendUpdate("{\"sessionUpdate\":\"agent_thought_chunk\",\"content\":{\"type\":\"text\",\"text\":\"one\"}}");
+    try ctx.sendTurnProgress();
+    try std.testing.expectEqual(@as(usize, 1), session.running_copy.entries.items.len);
+    try std.testing.expect(session.running_copy.progress != null);
+
+    // The turn ends: nothing of it is left. The allocator checks that each allocation is freed.
+    server.releaseRunningCopy(session, .turn_ended);
+    try std.testing.expectEqual(@as(usize, 0), session.running_copy.entries.items.len);
+    try std.testing.expect(session.running_copy.progress == null);
+
+    // The next turn starts from an empty copy, and its end frees it too.
+    try ctx.sendUpdate("{\"sessionUpdate\":\"agent_thought_chunk\",\"content\":{\"type\":\"text\",\"text\":\"two\"}}");
+    server.releaseRunningCopy(session, .turn_ended);
+    try std.testing.expectEqual(@as(usize, 0), session.running_copy.entries.items.len);
+}
+
+test "a running turn's copy stops at its limit, and later updates are counted as dropped" {
+    const alloc = std.testing.allocator;
+    var state: server.ServerState = undefined;
+    try initTestAcpState(&state, alloc, "/tmp/workspace", .ask);
+    defer state.deinit();
+    var owner_wire = WireCapture{ .alloc = alloc };
+    defer owner_wire.deinit();
+    state.writer = jsonrpc.Writer.initCallback(&owner_wire, WireCapture.write);
+    const session = server.firstSession(&state).?;
+    var turn_settings = try TurnSettings.capture(alloc, session);
+    defer turn_settings.deinit(alloc);
+    var ctx = AcpContext{ .alloc = alloc, .state = &state, .session = session, .turn = &turn_settings, .session_id = "session_1" };
+    defer ctx.deinitPublishedToolCalls();
+
+    // Eighteen 1 MiB chunks are more than the copy's 16 MiB limit.
+    const chunk = try alloc.alloc(u8, 1 << 20);
+    defer alloc.free(chunk);
+    @memset(chunk, 'x');
+    const message_id = ctx.assistantMessageId();
+    for (0..18) |_| try ctx.sendAgentText(message_id, chunk);
+
+    const copy = &session.running_copy;
+    try std.testing.expect(copy.entries.items.len < 18);
+    try std.testing.expectEqual(@as(usize, 18), copy.entries.items.len + copy.dropped);
+    try std.testing.expect(copy.bytes <= server.RunningCopy.limit_bytes);
+    // The owner still received every chunk: the limit changes only the copy.
+    try std.testing.expect(owner_wire.bytes.items.len > 18 << 20);
+    server.releaseRunningCopy(session, .turn_ended);
+}
+
+test "a turn's save empties its running copy, a later update waits for the turn's end, and a compaction summary keeps the copy" {
+    const alloc = std.testing.allocator;
+    var state: server.ServerState = undefined;
+    try initTestAcpState(&state, alloc, "/tmp/workspace", .ask);
+    defer state.deinit();
+    // The owner's frames go to a capture, not to stdout: the test runner reads stdout as its protocol.
+    var owner_wire = WireCapture{ .alloc = alloc };
+    defer owner_wire.deinit();
+    state.writer = jsonrpc.Writer.initCallback(&owner_wire, WireCapture.write);
+    const session = server.firstSession(&state).?;
+    var turn_settings = try TurnSettings.capture(alloc, session);
+    defer turn_settings.deinit(alloc);
+    var ctx = AcpContext{ .alloc = alloc, .state = &state, .session = session, .turn = &turn_settings, .session_id = "session_1" };
+    defer ctx.deinitPublishedToolCalls();
+
+    try ctx.sendUpdate("{\"sessionUpdate\":\"agent_thought_chunk\",\"content\":{\"type\":\"text\",\"text\":\"before the save\"}}");
+    try std.testing.expectEqual(@as(usize, 1), session.running_copy.entries.items.len);
+
+    // The save commits the turn to the session, so the log holds the update and the copy goes.
+    const saved: HistoryTurn = .{ .assistant = .{
+        .user = .{ .text = @constCast("question") },
+        .assistant = @constCast("answer"),
+    } };
+    try propagateHistoryTurn(@ptrCast(&ctx), saved);
+    try std.testing.expectEqual(@as(usize, 0), session.running_copy.entries.items.len);
+
+    // An update sent after the save goes into the empty copy, and waits there until the turn ends.
+    try ctx.sendUpdate("{\"sessionUpdate\":\"agent_thought_chunk\",\"content\":{\"type\":\"text\",\"text\":\"after the save\"}}");
+    try std.testing.expectEqual(@as(usize, 1), session.running_copy.entries.items.len);
+    try std.testing.expect(std.mem.find(u8, session.running_copy.entries.items[0].with, "after the save") != null);
+
+    // A compaction summary is not the turn's save, so the copy stays as it was.
+    const compacted: HistoryTurn = .{ .compacted_summary = .{
+        .summary = @constCast("summary"),
+        .removed_turn_count = 1,
+        .compaction_count = 1,
+    } };
+    try propagateHistoryTurn(@ptrCast(&ctx), compacted);
+    try std.testing.expectEqual(@as(usize, 1), session.running_copy.entries.items.len);
+
+    server.releaseRunningCopy(session, .turn_ended);
+    try std.testing.expectEqual(@as(usize, 0), session.running_copy.entries.items.len);
 }

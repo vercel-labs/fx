@@ -769,6 +769,93 @@ pub fn handleResumeSession(state: *server.ServerState, alloc: Allocator, msg: *j
     return handleRestoreSession(state, alloc, msg, .reconnect);
 }
 
+/// Follows `session_id` when another connection of this process has it open,
+/// instead of opening the store again. Returns false when no other connection
+/// has it, so the request takes the normal path.
+///
+/// The answer is built under `shared.mutex`, which keeps the session alive. The
+/// join writes it after the replay and before it lists the connection, so a
+/// follower's answer always comes before its first live update (`joinSession`).
+/// The request's `systemPrompt` and hooks are traced and not applied: a follower
+/// only watches the session, and only its owner changes the session's settings.
+fn followSharedSession(
+    state: *server.ServerState,
+    alloc: Allocator,
+    msg: *jsonrpc.Message,
+    session_id: []const u8,
+    kind: RestoreKind,
+    observer_hooks: ?libfx_hooks.Config,
+    requested_system_prompt: ?[]const u8,
+) !bool {
+    const shared = state.shared orelse return false;
+    shared.mutex.lockUncancelable(io_mod.getIo());
+    defer shared.mutex.unlock(io_mod.getIo());
+    const session = shared.findLocked(session_id) orelse {
+        // The owner closed it, so this connection's older follow of it has ended.
+        server.forgetFollowing(state, session_id);
+        return false;
+    };
+    if (session.server == state) return false;
+    traceIgnoredFollowerChanges(session, requested_system_prompt, observer_hooks);
+    // Built before the join takes `session_write_mutex`: building takes `settings_mutex`, which comes first in the lock order.
+    const answer = try buildSessionAnswer(state, alloc, session, session.workspace_root);
+    defer alloc.free(answer);
+    try joinSession(state, alloc, msg, session, session_id, kind, answer);
+    return true;
+}
+
+/// Traces the `systemPrompt` and hooks of a join request that a follower does not
+/// apply. The prompt is traced only when it differs from the session's own.
+fn traceIgnoredFollowerChanges(
+    session: *server.ActiveSessionState,
+    requested_system_prompt: ?[]const u8,
+    observer_hooks: ?libfx_hooks.Config,
+) void {
+    if (requested_system_prompt) |text| {
+        session.settings_mutex.lockUncancelable(io_mod.getIo());
+        const differs = !std.mem.eql(u8, session.client_system_prompt, text);
+        session.settings_mutex.unlock(io_mod.getIo());
+        if (differs) debug_trace.logf("acp", "event=follower_change_ignored session={s} field=systemPrompt", .{session.session_id});
+    }
+    if (observer_hooks != null) debug_trace.logf("acp", "event=follower_change_ignored session={s} field=hooks", .{session.session_id});
+}
+
+/// Joins `session` for `state`. The caller holds `shared.mutex`. A load replays
+/// what it needs first: the saved turns, the saved title, then the running copy.
+/// A resume replays nothing. Then the answer is written, and only then is `state`
+/// listed as a follower, so no live update reaches it before its answer. The
+/// session's `audience_mutex` is held from the replay to the listing, so no
+/// update is sent in between. A load also holds `session_write_mutex`, so the
+/// saved turns and the copy do not change during the replay.
+fn joinSession(
+    state: *server.ServerState,
+    alloc: Allocator,
+    msg: *jsonrpc.Message,
+    session: *server.ActiveSessionState,
+    session_id: []const u8,
+    kind: RestoreKind,
+    answer: []const u8,
+) !void {
+    if (kind.replaysHistory()) session.session_write_mutex.lockUncancelable(io_mod.getIo());
+    defer if (kind.replaysHistory()) session.session_write_mutex.unlock(io_mod.getIo());
+    session.audience_mutex.lockUncancelable(io_mod.getIo());
+    defer session.audience_mutex.unlock(io_mod.getIo());
+    if (kind.replaysHistory()) {
+        var sources: runtime_tool_presentation.ReplayedSavedOutputSources = .{};
+        defer sources.deinit(alloc);
+        try sendActiveHistoryUpdates(state, session, alloc, &sources);
+        // The running turn owns the history a title may be derived from, so only a saved title goes out here.
+        try sendSessionInfoUpdate(state, session, alloc, false);
+        try server.replayRunningCopy(state, alloc, session);
+    }
+    const newly_following = try server.recordFollowing(state, session_id);
+    errdefer if (newly_following) server.forgetFollowing(state, session_id);
+    // The room is made before the answer goes out, so the listing after it cannot fail.
+    try server.reserveFollowerLocked(session, alloc);
+    try state.writer.writeResponse(alloc, msg.id, answer);
+    server.listFollowerLocked(session, state);
+}
+
 fn handleRestoreSession(
     state: *server.ServerState,
     alloc: Allocator,
@@ -813,6 +900,11 @@ fn handleRestoreSession(
     // out, before any server starts (`tests/tla/acp/AcpSessions.tla`
     // ReuseKeepsTurn). It keeps its workspace, so none is staged.
     const open_session = server.findSession(state, session_id);
+    // Another connection of this process may own the session: follow it, and read
+    // neither this request's workspace nor its MCP servers, which the session keeps.
+    if (open_session == null) {
+        if (try followSharedSession(state, alloc, msg, session_id, kind, observer_hooks, requested_system_prompt)) return;
+    }
     var workspace = if (open_session != null) null else workspace_binding.prepare(state, alloc, msg.params_raw) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return state.writer.writeError(alloc, msg.id, .{
@@ -1167,6 +1259,20 @@ fn writeLoadSessionResponse(
     observer_hooks: ?libfx_hooks.Config,
 ) !void {
     setObserverHooks(session, observer_hooks);
+    const answer = try buildSessionAnswer(state, alloc, session, null);
+    defer alloc.free(answer);
+    try state.writer.writeResponse(alloc, msg.id, answer);
+}
+
+/// The answer to a load or resume of `session`: its options and modes. A session
+/// this connection follows also gets `_meta["sh.fx/cwd"]`, its folder. The caller
+/// frees the bytes.
+fn buildSessionAnswer(
+    state: *server.ServerState,
+    alloc: Allocator,
+    session: *server.ActiveSessionState,
+    folder: ?[]const u8,
+) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
     {
@@ -1212,9 +1318,13 @@ fn writeLoadSessionResponse(
     try out.writer.writeAll(",\"availableModes\":");
     try writeModesArray(&out.writer, state.cfg.mode_registry);
     try out.writer.writeByte('}');
+    if (folder) |path| {
+        try out.writer.writeAll(",\"_meta\":{\"sh.fx/cwd\":");
+        try writeJsonStr(path, &out.writer);
+        try out.writer.writeByte('}');
+    }
     try out.writer.writeByte('}');
-
-    try state.writer.writeResponse(alloc, msg.id, out.writer.buffered());
+    return out.toOwnedSlice();
 }
 
 fn freshAcpState(
@@ -1411,7 +1521,7 @@ fn handleLoadFailure(
         .{@errorName(err)},
     );
     // v2 names a storage fault (D29); v1 keeps its messages below.
-    if (state.sessions_v2 != null) {
+    if (server.sessionsStore(state) != null) {
         if (v2StorageFaultMessage("Session could not be loaded", err)) |message| {
             return state.writer.writeError(alloc, msg.id, .{ .code = ErrorCode.internal_error, .message = message });
         }
@@ -1451,7 +1561,7 @@ fn handleLoadFailure(
         err == error.DurablePathUnsafe)
     {
         // A v1 session that can't be converted says why (D61).
-        if (state.sessions_v2) |*store| if (err == error.InvalidSessionFormat) if (store.conversionProblem()) |problem| {
+        if (server.sessionsStore(state)) |store| if (err == error.InvalidSessionFormat) if (store.conversionProblem()) |problem| {
             const message = try alloc.print("Session could not be loaded (InvalidSessionFormat): {s}", .{problem});
             defer alloc.free(message);
             return state.writer.writeError(alloc, msg.id, .{ .code = ErrorCode.internal_error, .message = message });
@@ -2115,15 +2225,16 @@ fn sendAvailableCommands(state: *server.ServerState, alloc: Allocator, session_i
     try state.writer.writeNotification(alloc, "session/update", out.writer.buffered());
 }
 
-/// Sends `session`'s title and time. The title comes from the saved session,
-/// or from the history in memory when `owns_history`: the caller is the
-/// session's own turn, or no turn runs.
-pub fn sendSessionInfoUpdate(state: *server.ServerState, active: *server.ActiveSessionState, alloc: Allocator, owns_history: bool) !void {
+/// Builds the `session/update` that sends `active`'s title and time, or null
+/// when it sends none. The title comes from the saved session, or from the
+/// history in memory when `owns_history`: the caller is the session's own
+/// turn, or no turn runs. The caller frees the bytes.
+fn sessionInfoUpdate(alloc: Allocator, active: *server.ActiveSessionState, owns_history: bool) !?[]u8 {
     const v2_info: ?session_adapter.Session.Info = if (active.v2) |v2| try v2.info(alloc) else null;
     var metadata: session_display_metadata.DisplayMetadata = metadata: {
         if (v2_info) |info| if (info.title) |title| break :metadata .{ .present = true, .title = title };
         // The running turn sends the update when it ends.
-        if (!owns_history) return;
+        if (!owns_history) return null;
         break :metadata try session_display_metadata.deriveFromHistory(
             alloc,
             active.session_rt.agent.history.items,
@@ -2147,25 +2258,47 @@ pub fn sendSessionInfoUpdate(state: *server.ServerState, active: *server.ActiveS
     try out.writer.writeAll(",\"update\":");
     try acp_types.writeSessionInfoUpdate(&out.writer, metadata.title, updated_at);
     try out.writer.writeAll("}");
-    try state.writer.writeNotification(alloc, "session/update", out.writer.buffered());
+    return try out.toOwnedSlice();
 }
 
-/// The turn passes its own model and provider (TurnSettings), so a
-/// session/set_config_option during the turn doesn't change which context
-/// window the update reports.
-pub fn sendSessionUsageUpdate(state: *server.ServerState, active: *server.ActiveSessionState, model: []const u8, provider: model_provider.ProviderId, alloc: Allocator) !void {
+/// Sends `active`'s title and time to the connection that loads it, `state`,
+/// and only to it. `session/load` and `session/resume` use this.
+pub fn sendSessionInfoUpdate(state: *server.ServerState, active: *server.ActiveSessionState, alloc: Allocator, owns_history: bool) !void {
+    const json = (try sessionInfoUpdate(alloc, active, owns_history)) orelse return;
+    defer alloc.free(json);
+    try state.writer.writeNotification(alloc, "session/update", json);
+}
+
+/// Sends a running turn's title and time to every audience member, the owner
+/// first. Only the turn's own end uses this (prompt.zig). Neither the title nor
+/// the time depends on a member's capabilities, so the bytes are built once.
+pub fn sendTurnSessionInfoUpdate(active: *server.ActiveSessionState, alloc: Allocator, owns_history: bool) !void {
+    const json = (try sessionInfoUpdate(alloc, active, owns_history)) orelse return;
+    defer alloc.free(json);
+    try sendToAudience(active, alloc, json);
+}
+
+/// Builds the usage `session/update` for `active`'s latest completion, against
+/// `owner`'s catalog, or null when it reports none. The caller frees the bytes.
+fn sessionUsageUpdate(
+    alloc: Allocator,
+    owner: *server.ServerState,
+    active: *server.ActiveSessionState,
+    model: []const u8,
+    provider: model_provider.ProviderId,
+) !?[]u8 {
     const used = active.context_used.load(.acquire);
-    if (used == 0) return;
-    const provider_bundle = state.cfg.provider_set.select(provider);
+    if (used == 0) return null;
+    const provider_bundle = owner.cfg.provider_set.select(provider);
     const capabilities = capabilities: {
-        server.lockCatalog(state);
-        defer server.unlockCatalog(state);
-        break :capabilities state.capability_resolver.available(
+        server.lockCatalog(owner);
+        defer server.unlockCatalog(owner);
+        break :capabilities owner.capability_resolver.available(
             model,
             provider_bundle.fallbackModelCapabilities(model),
         );
     };
-    const context_window = capabilities.context_window orelse return;
+    const context_window = capabilities.context_window orelse return null;
 
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
@@ -2174,7 +2307,29 @@ pub fn sendSessionUsageUpdate(state: *server.ServerState, active: *server.Active
     try out.writer.writeAll(",\"update\":");
     try acp_types.writeUsageUpdate(&out.writer, used, context_window);
     try out.writer.writeAll("}");
-    try state.writer.writeNotification(alloc, "session/update", out.writer.buffered());
+    return try out.toOwnedSlice();
+}
+
+/// The turn's usage update, to every audience member. The turn passes its own
+/// model and provider (TurnSettings), so a session/set_config_option during the
+/// turn doesn't change which context window the update reports. The owner's
+/// catalog builds the bytes, and every member gets the same ones.
+pub fn sendTurnSessionUsageUpdate(
+    active: *server.ActiveSessionState,
+    model: []const u8,
+    provider: model_provider.ProviderId,
+    alloc: Allocator,
+) !void {
+    const json = (try sessionUsageUpdate(alloc, active.server, active, model, provider)) orelse return;
+    defer alloc.free(json);
+    try sendToAudience(active, alloc, json);
+}
+
+/// Writes one `session/update` with `json` to every audience member, the owner first.
+fn sendToAudience(active: *server.ActiveSessionState, alloc: Allocator, json: []const u8) !void {
+    var audience = server.lockAudience(active);
+    defer audience.unlock();
+    try audience.deliver(alloc, "session/update", .none, json, null);
 }
 
 const formatIso8601 = acp_types.formatIso8601;
@@ -3507,4 +3662,459 @@ test "libfx/new rejects a session id that is not header and path safe" {
     }
     const long = "{\"sessionId\":\"" ++ text_utils.repeat("a", 256) ++ "\"}";
     try std.testing.expectError(error.InvalidSessionId, requestedLibfxSessionId(alloc, long));
+}
+
+/// A connection's frames in the order it wrote them, for the join tests.
+const JoinFrames = struct {
+    alloc: Allocator,
+    bytes: std.ArrayList(u8) = .empty,
+
+    fn write(raw: ?*anyopaque, frame: []const u8) anyerror!void {
+        const self: *JoinFrames = @ptrCast(@alignCast(raw.?));
+        try self.bytes.appendSlice(self.alloc, frame);
+    }
+
+    fn deinit(self: *JoinFrames) void {
+        self.bytes.deinit(self.alloc);
+    }
+};
+
+/// A connection of the join tests: its writer keeps its frames, and it shares `shared`.
+fn joinTestState(alloc: Allocator, shared: *server.SharedSessions, frames: *JoinFrames, root: []const u8) !server.ServerState {
+    return .{
+        .alloc = alloc,
+        .cfg = acpSessionTestConfig(),
+        .writer = jsonrpc.Writer.initCallback(frames, JoinFrames.write),
+        .launch = .{ .root = try alloc.dupe(u8, root) },
+        .shared = shared,
+    };
+}
+
+/// Opens the owner's session `session_joined`, with no history and no turn.
+fn openJoinSession(owner: *server.ServerState) !*server.ActiveSessionState {
+    const session_id = try owner.alloc.dupe(u8, "session_joined");
+    const model = try owner.alloc.dupe(u8, "test/model");
+    return server.openSession(owner, .{
+        .session_id = session_id,
+        .model = model,
+        .mode = test_session_mode_registry.default_mode_id,
+        .workspace_root = &.{},
+        .api_key = &.{},
+        .agent_step_limit = 8,
+        .max_tool_result_bytes = 64 * 1024,
+        .fast_mode = false,
+        .effort = .auto,
+        .first_call_tool_choice = .auto,
+        .permission_mode = .ask,
+        .permission_rules = .{},
+        .session_rt = .{ .max_history_turns = 100 },
+        .cancel_flag = std.atomic.Value(bool).init(false),
+        .pending_prompt_id = null,
+    }, null);
+}
+
+/// Saves one turn to the owner's history, as a finished turn does.
+fn commitJoinTestTurn(alloc: Allocator, session: *server.ActiveSessionState, question: []const u8, answer: []const u8) !void {
+    const turn: types.HistoryTurn = .{ .assistant = .{
+        .user = .{ .text = @constCast(question) },
+        .assistant = @constCast(answer),
+    } };
+    const prepared = try session.session_rt.prepareHistoryEntry(alloc, turn);
+    session.session_rt.commitPreparedHistoryEntry(alloc, prepared);
+}
+
+/// The owner's turn sends one agent thought, as its audience sees it.
+fn deliverOwnerThought(alloc: Allocator, session: *server.ActiveSessionState, text: []const u8) !void {
+    const params = try alloc.print(
+        "{{\"sessionId\":\"session_joined\",\"update\":{{\"sessionUpdate\":\"agent_thought_chunk\",\"content\":{{\"type\":\"text\",\"text\":\"{s}\"}}}}}}",
+        .{text},
+    );
+    defer alloc.free(params);
+    var audience = server.lockAudience(session);
+    defer audience.unlock();
+    try audience.deliver(alloc, "session/update", .none, params, null);
+}
+
+/// Asserts that `needle` occurs `expected` times in `bytes`.
+fn expectOccurrences(bytes: []const u8, needle: []const u8, expected: usize) !void {
+    var seen: usize = 0;
+    var rest = bytes;
+    while (std.mem.find(u8, rest, needle)) |at| {
+        seen += 1;
+        rest = rest[at + needle.len ..];
+    }
+    try std.testing.expectEqual(expected, seen);
+}
+
+test "a second connection of the process follows a loaded session: the saved turns, the running copy, the answer, then live updates" {
+    const alloc = std.testing.allocator;
+    var owner_frames = JoinFrames{ .alloc = alloc };
+    defer owner_frames.deinit();
+    var joiner_frames = JoinFrames{ .alloc = alloc };
+    defer joiner_frames.deinit();
+    var shared: server.SharedSessions = .{};
+    defer shared.deinit(alloc);
+    var owner = try joinTestState(alloc, &shared, &owner_frames, "/tmp/workspace");
+    defer owner.deinit();
+    const session = try openJoinSession(&owner);
+    try commitJoinTestTurn(alloc, session, "question one", "answer one");
+    try deliverOwnerThought(alloc, session, "thought before join");
+
+    var joiner = try joinTestState(alloc, &shared, &joiner_frames, "/tmp/elsewhere");
+    defer joiner.deinit();
+    var load_msg = jsonrpc.Message{
+        .id = .{ .integer = 2 },
+        .method = "session/load",
+        .params_raw = "{\"sessionId\":\"session_joined\",\"cwd\":\"/elsewhere\",\"mcpServers\":[]}",
+    };
+    try handleLoadSession(&joiner, alloc, &load_msg);
+
+    // The saved turn, then the copy's thought, then the answer with the owner's folder.
+    const history_at = std.mem.find(u8, joiner_frames.bytes.items, "question one") orelse return error.TestExpectedEqual;
+    const thought_at = std.mem.find(u8, joiner_frames.bytes.items, "thought before join") orelse return error.TestExpectedEqual;
+    const answer_at = std.mem.find(u8, joiner_frames.bytes.items, "\"sh.fx/cwd\":\"/tmp/workspace\"") orelse return error.TestExpectedEqual;
+    try std.testing.expect(history_at < thought_at and thought_at < answer_at);
+
+    // A live update after the join reaches both connections once, and the joiner gets it after the answer.
+    try deliverOwnerThought(alloc, session, "after join");
+    try expectOccurrences(owner_frames.bytes.items, "after join", 1);
+    try expectOccurrences(joiner_frames.bytes.items, "after join", 1);
+    try expectOccurrences(joiner_frames.bytes.items, "thought before join", 1);
+    try expectOccurrences(owner_frames.bytes.items, "thought before join", 1);
+    const live_at = std.mem.find(u8, joiner_frames.bytes.items, "after join") orelse return error.TestExpectedEqual;
+    try std.testing.expect(live_at > answer_at);
+}
+
+test "a resume joins a session another connection has open, with no replay" {
+    const alloc = std.testing.allocator;
+    var owner_frames = JoinFrames{ .alloc = alloc };
+    defer owner_frames.deinit();
+    var joiner_frames = JoinFrames{ .alloc = alloc };
+    defer joiner_frames.deinit();
+    var shared: server.SharedSessions = .{};
+    defer shared.deinit(alloc);
+    var owner = try joinTestState(alloc, &shared, &owner_frames, "/tmp/workspace");
+    defer owner.deinit();
+    const session = try openJoinSession(&owner);
+    try commitJoinTestTurn(alloc, session, "question one", "answer one");
+    try deliverOwnerThought(alloc, session, "thought before join");
+
+    var joiner = try joinTestState(alloc, &shared, &joiner_frames, "/tmp/elsewhere");
+    defer joiner.deinit();
+    var resume_msg = jsonrpc.Message{
+        .id = .{ .integer = 3 },
+        .method = "session/resume",
+        .params_raw = "{\"sessionId\":\"session_joined\"}",
+    };
+    try handleResumeSession(&joiner, alloc, &resume_msg);
+
+    // No replay: neither the saved turn nor the copy is sent, only the answer.
+    try expectOccurrences(joiner_frames.bytes.items, "question one", 0);
+    try expectOccurrences(joiner_frames.bytes.items, "thought before join", 0);
+    try expectOccurrences(joiner_frames.bytes.items, "\"sh.fx/cwd\":\"/tmp/workspace\"", 1);
+
+    try deliverOwnerThought(alloc, session, "after resume");
+    try expectOccurrences(joiner_frames.bytes.items, "after resume", 1);
+    try expectOccurrences(owner_frames.bytes.items, "after resume", 1);
+}
+
+test "a follower's session/close detaches it, the session stays open for its owner, and later updates reach only the owner" {
+    const alloc = std.testing.allocator;
+    var owner_frames = JoinFrames{ .alloc = alloc };
+    defer owner_frames.deinit();
+    var joiner_frames = JoinFrames{ .alloc = alloc };
+    defer joiner_frames.deinit();
+    var shared: server.SharedSessions = .{};
+    defer shared.deinit(alloc);
+    var owner = try joinTestState(alloc, &shared, &owner_frames, "/tmp/workspace");
+    defer owner.deinit();
+    const session = try openJoinSession(&owner);
+
+    var joiner = try joinTestState(alloc, &shared, &joiner_frames, "/tmp/elsewhere");
+    defer joiner.deinit();
+    var load_msg = jsonrpc.Message{
+        .id = .{ .integer = 2 },
+        .method = "session/load",
+        .params_raw = "{\"sessionId\":\"session_joined\",\"mcpServers\":[]}",
+    };
+    try handleLoadSession(&joiner, alloc, &load_msg);
+    try std.testing.expectEqual(@as(usize, 1), session.followers.items.len);
+
+    var close_msg = jsonrpc.Message{
+        .id = .{ .integer = 4 },
+        .method = "session/close",
+        .params_raw = "{\"sessionId\":\"session_joined\"}",
+    };
+    try server.handleCloseSession(&joiner, alloc, &close_msg);
+    try std.testing.expectEqual(@as(usize, 0), session.followers.items.len);
+    try std.testing.expectEqual(@as(usize, 0), joiner.following.items.len);
+
+    // The owner's session is still open, and the owner gets the next update alone.
+    try std.testing.expect(server.findSession(&owner, "session_joined") != null);
+    try deliverOwnerThought(alloc, session, "after close");
+    try expectOccurrences(owner_frames.bytes.items, "after close", 1);
+    try expectOccurrences(joiner_frames.bytes.items, "after close", 0);
+}
+
+test "a follower connection that ends detaches from the session it followed" {
+    const alloc = std.testing.allocator;
+    var owner_frames = JoinFrames{ .alloc = alloc };
+    defer owner_frames.deinit();
+    var joiner_frames = JoinFrames{ .alloc = alloc };
+    defer joiner_frames.deinit();
+    var shared: server.SharedSessions = .{};
+    defer shared.deinit(alloc);
+    var owner = try joinTestState(alloc, &shared, &owner_frames, "/tmp/workspace");
+    defer owner.deinit();
+    const session = try openJoinSession(&owner);
+
+    var joiner = try joinTestState(alloc, &shared, &joiner_frames, "/tmp/elsewhere");
+    var load_msg = jsonrpc.Message{
+        .id = .{ .integer = 2 },
+        .method = "session/load",
+        .params_raw = "{\"sessionId\":\"session_joined\",\"mcpServers\":[]}",
+    };
+    try handleLoadSession(&joiner, alloc, &load_msg);
+    try std.testing.expectEqual(@as(usize, 1), session.followers.items.len);
+
+    // The connection ends: its deinit leaves the session before anything it owns is freed.
+    joiner.deinit();
+    try std.testing.expectEqual(@as(usize, 0), session.followers.items.len);
+
+    try deliverOwnerThought(alloc, session, "after end");
+    try expectOccurrences(owner_frames.bytes.items, "after end", 1);
+    try expectOccurrences(joiner_frames.bytes.items, "after end", 0);
+}
+
+/// A connection whose writer the test chooses, for the tests that need more than a capture.
+fn joinTestStateOn(alloc: Allocator, shared: *server.SharedSessions, writer: jsonrpc.Writer, root: []const u8) !server.ServerState {
+    return .{
+        .alloc = alloc,
+        .cfg = acpSessionTestConfig(),
+        .writer = writer,
+        .launch = .{ .root = try alloc.dupe(u8, root) },
+        .shared = shared,
+    };
+}
+
+/// The number of times `needle` occurs in `bytes`.
+fn countOccurrences(bytes: []const u8, needle: []const u8) usize {
+    var seen: usize = 0;
+    var rest = bytes;
+    while (std.mem.find(u8, rest, needle)) |at| {
+        seen += 1;
+        rest = rest[at + needle.len ..];
+    }
+    return seen;
+}
+
+/// Sends an owner update from another thread as the joiner's answer is written.
+/// The join holds the session's audience lock while it writes the answer, so the
+/// thread waits until the joiner is listed, and the update then follows the answer.
+const SendOnAnswer = struct {
+    alloc: Allocator,
+    frames: *JoinFrames,
+    session: *server.ActiveSessionState,
+    thread: ?std.Thread = null,
+
+    fn write(raw: ?*anyopaque, frame: []const u8) anyerror!void {
+        const self: *SendOnAnswer = @ptrCast(@alignCast(raw.?));
+        try self.frames.bytes.appendSlice(self.frames.alloc, frame);
+        if (self.thread == null and std.mem.find(u8, frame, "sh.fx/cwd") != null) {
+            self.thread = try std.Thread.spawn(.{}, sendOwnerThought, .{ self.alloc, self.session });
+        }
+    }
+
+    fn sendOwnerThought(alloc: Allocator, session: *server.ActiveSessionState) void {
+        // A failed send leaves the update out of the joiner's frames, which the test reports.
+        deliverOwnerThought(alloc, session, "right after the join") catch {};
+    }
+};
+
+test "a joiner of a running turn whose copy dropped part of its output gets the kept start, the notice, then the answer" {
+    const alloc = std.testing.allocator;
+    var owner_frames = JoinFrames{ .alloc = alloc };
+    defer owner_frames.deinit();
+    var joiner_frames = JoinFrames{ .alloc = alloc };
+    defer joiner_frames.deinit();
+    var shared: server.SharedSessions = .{};
+    defer shared.deinit(alloc);
+    var owner = try joinTestState(alloc, &shared, &owner_frames, "/tmp/workspace");
+    defer owner.deinit();
+    const session = try openJoinSession(&owner);
+
+    // The copy keeps the first update. The second is larger than the copy's limit, so it is dropped, and so is every update after it.
+    try deliverOwnerThought(alloc, session, "kept start");
+    const prefix = "{\"sessionId\":\"session_joined\",\"update\":{\"sessionUpdate\":\"agent_thought_chunk\",\"content\":{\"type\":\"text\",\"text\":\"";
+    const suffix = "\"}}}";
+    const body_len = server.RunningCopy.limit_bytes + 1;
+    const oversized = try alloc.alloc(u8, prefix.len + body_len + suffix.len);
+    defer alloc.free(oversized);
+    @memcpy(oversized[0..prefix.len], prefix);
+    @memset(oversized[prefix.len..][0..body_len], 'x');
+    @memcpy(oversized[prefix.len + body_len ..], suffix);
+    {
+        var audience = server.lockAudience(session);
+        defer audience.unlock();
+        try audience.deliver(alloc, "session/update", .none, oversized, null);
+    }
+    try deliverOwnerThought(alloc, session, "after the drop");
+    try std.testing.expectEqual(@as(usize, 1), session.running_copy.entries.items.len);
+    try std.testing.expect(session.running_copy.dropped > 0);
+
+    var joiner = try joinTestState(alloc, &shared, &joiner_frames, "/tmp/elsewhere");
+    defer joiner.deinit();
+    var load_msg = jsonrpc.Message{
+        .id = .{ .integer = 2 },
+        .method = "session/load",
+        .params_raw = "{\"sessionId\":\"session_joined\",\"mcpServers\":[]}",
+    };
+    try handleLoadSession(&joiner, alloc, &load_msg);
+
+    const kept_at = std.mem.find(u8, joiner_frames.bytes.items, "kept start") orelse return error.TestExpectedEqual;
+    const notice_at = std.mem.find(u8, joiner_frames.bytes.items, "fx kept only the start of this turn's output, so part of it isn't shown.") orelse return error.TestExpectedEqual;
+    const answer_at = std.mem.find(u8, joiner_frames.bytes.items, "\"sh.fx/cwd\"") orelse return error.TestExpectedEqual;
+    try std.testing.expect(kept_at < notice_at and notice_at < answer_at);
+    try expectOccurrences(joiner_frames.bytes.items, "fx kept only the start of this turn's output, so part of it isn't shown.", 1);
+    try expectOccurrences(joiner_frames.bytes.items, "after the drop", 0);
+    try expectOccurrences(owner_frames.bytes.items, "after the drop", 1);
+}
+
+test "a joiner's answer comes before an owner update sent right after the join" {
+    const alloc = std.testing.allocator;
+    var owner_frames = JoinFrames{ .alloc = alloc };
+    defer owner_frames.deinit();
+    var joiner_frames = JoinFrames{ .alloc = alloc };
+    defer joiner_frames.deinit();
+    var shared: server.SharedSessions = .{};
+    defer shared.deinit(alloc);
+    var owner = try joinTestState(alloc, &shared, &owner_frames, "/tmp/workspace");
+    defer owner.deinit();
+    const session = try openJoinSession(&owner);
+    try commitJoinTestTurn(alloc, session, "question one", "answer one");
+
+    var send = SendOnAnswer{ .alloc = alloc, .frames = &joiner_frames, .session = session };
+    var joiner = try joinTestStateOn(alloc, &shared, jsonrpc.Writer.initCallback(&send, SendOnAnswer.write), "/tmp/elsewhere");
+    defer joiner.deinit();
+    // Declared after the joiner, so the thread finishes before the joiner is freed.
+    defer if (send.thread) |thread| thread.join();
+    var load_msg = jsonrpc.Message{
+        .id = .{ .integer = 2 },
+        .method = "session/load",
+        .params_raw = "{\"sessionId\":\"session_joined\",\"mcpServers\":[]}",
+    };
+    try handleLoadSession(&joiner, alloc, &load_msg);
+    if (send.thread) |thread| {
+        thread.join();
+        send.thread = null;
+    }
+
+    const answer_at = std.mem.find(u8, joiner_frames.bytes.items, "\"sh.fx/cwd\"") orelse return error.TestExpectedEqual;
+    const update_at = std.mem.find(u8, joiner_frames.bytes.items, "right after the join") orelse return error.TestExpectedEqual;
+    try std.testing.expect(answer_at < update_at);
+    try expectOccurrences(joiner_frames.bytes.items, "right after the join", 1);
+    try expectOccurrences(owner_frames.bytes.items, "right after the join", 1);
+}
+
+test "a repeat session/load of a followed session replays again and adds no second follower" {
+    const alloc = std.testing.allocator;
+    var owner_frames = JoinFrames{ .alloc = alloc };
+    defer owner_frames.deinit();
+    var joiner_frames = JoinFrames{ .alloc = alloc };
+    defer joiner_frames.deinit();
+    var shared: server.SharedSessions = .{};
+    defer shared.deinit(alloc);
+    var owner = try joinTestState(alloc, &shared, &owner_frames, "/tmp/workspace");
+    defer owner.deinit();
+    const session = try openJoinSession(&owner);
+    try commitJoinTestTurn(alloc, session, "question one", "answer one");
+    try deliverOwnerThought(alloc, session, "thought before join");
+
+    var joiner = try joinTestState(alloc, &shared, &joiner_frames, "/tmp/elsewhere");
+    defer joiner.deinit();
+    var load_msg = jsonrpc.Message{
+        .id = .{ .integer = 2 },
+        .method = "session/load",
+        .params_raw = "{\"sessionId\":\"session_joined\",\"mcpServers\":[]}",
+    };
+    try handleLoadSession(&joiner, alloc, &load_msg);
+    const once = countOccurrences(joiner_frames.bytes.items, "question one");
+    try std.testing.expect(once > 0);
+
+    var repeat_msg = jsonrpc.Message{
+        .id = .{ .integer = 3 },
+        .method = "session/load",
+        .params_raw = "{\"sessionId\":\"session_joined\",\"mcpServers\":[]}",
+    };
+    try handleLoadSession(&joiner, alloc, &repeat_msg);
+
+    try std.testing.expectEqual(@as(usize, 1), session.followers.items.len);
+    try std.testing.expectEqual(@as(usize, 1), joiner.following.items.len);
+    try expectOccurrences(joiner_frames.bytes.items, "question one", 2 * once);
+    try expectOccurrences(joiner_frames.bytes.items, "thought before join", 2);
+    try expectOccurrences(joiner_frames.bytes.items, "\"sh.fx/cwd\"", 2);
+
+    try deliverOwnerThought(alloc, session, "after repeat");
+    try expectOccurrences(joiner_frames.bytes.items, "after repeat", 1);
+    try expectOccurrences(owner_frames.bytes.items, "after repeat", 1);
+}
+
+test "a follower's prompt, set_mode, cancel and set_config_option get -32600, and the owner's session is unchanged" {
+    const alloc = std.testing.allocator;
+    var owner_frames = JoinFrames{ .alloc = alloc };
+    defer owner_frames.deinit();
+    var joiner_frames = JoinFrames{ .alloc = alloc };
+    defer joiner_frames.deinit();
+    var shared: server.SharedSessions = .{};
+    defer shared.deinit(alloc);
+    var owner = try joinTestState(alloc, &shared, &owner_frames, "/tmp/workspace");
+    defer owner.deinit();
+    const session = try openJoinSession(&owner);
+
+    var joiner = try joinTestState(alloc, &shared, &joiner_frames, "/tmp/elsewhere");
+    defer joiner.deinit();
+    var load_msg = jsonrpc.Message{
+        .id = .{ .integer = 2 },
+        .method = "session/load",
+        .params_raw = "{\"sessionId\":\"session_joined\",\"mcpServers\":[]}",
+    };
+    try handleLoadSession(&joiner, alloc, &load_msg);
+    joiner.initialized = true;
+
+    const mode_before = session.mode;
+    const owner_bytes_before = owner_frames.bytes.items.len;
+    const joiner_bytes_before = joiner_frames.bytes.items.len;
+
+    var prompt_msg = jsonrpc.Message{
+        .id = .{ .integer = 10 },
+        .method = "session/prompt",
+        .params_raw = "{\"sessionId\":\"session_joined\",\"prompt\":[{\"type\":\"text\",\"text\":\"change it\"}]}",
+    };
+    try server.dispatch(&joiner, alloc, &prompt_msg);
+    var mode_msg = jsonrpc.Message{
+        .id = .{ .integer = 11 },
+        .method = "session/set_mode",
+        .params_raw = "{\"sessionId\":\"session_joined\",\"modeId\":\"plan\"}",
+    };
+    try server.dispatch(&joiner, alloc, &mode_msg);
+    var cancel_msg = jsonrpc.Message{
+        .id = .{ .integer = 12 },
+        .method = "session/cancel",
+        .params_raw = "{\"sessionId\":\"session_joined\"}",
+    };
+    try server.dispatch(&joiner, alloc, &cancel_msg);
+    var config_msg = jsonrpc.Message{
+        .id = .{ .integer = 13 },
+        .method = "session/set_config_option",
+        .params_raw = "{\"sessionId\":\"session_joined\",\"configId\":\"model\",\"value\":\"test/other\"}",
+    };
+    try server.dispatch(&joiner, alloc, &config_msg);
+
+    const refused = joiner_frames.bytes.items[joiner_bytes_before..];
+    try expectOccurrences(refused, "\"code\":-32600", 4);
+    try expectOccurrences(refused, "This session is open on another connection; only that connection can change it.", 4);
+    try std.testing.expectEqual(owner_bytes_before, owner_frames.bytes.items.len);
+    try std.testing.expectEqualStrings(mode_before, session.mode);
+    try std.testing.expect(session.prompt == null);
+    try std.testing.expectEqual(@as(usize, 1), session.followers.items.len);
 }

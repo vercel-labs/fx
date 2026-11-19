@@ -1808,6 +1808,197 @@ function leaveBeforeAnswer(socketPath: string): Promise<void> {
   });
 }
 
+/// The client capabilities that list every sh.fx extension, as AcpClient sends them.
+const fxClientCapabilities = { _meta: Object.fromEntries(FX_EXTENSIONS.map((name) => [name, {}])) };
+
+/// A JSON-RPC client over a leader socket that stays connected. `request` matches
+/// each answer to its request by id. `received` keeps every message the socket
+/// sent, answers and notifications alike, in the order it arrived.
+class LeaderSocketClient {
+  readonly received: any[] = [];
+  private buffer = "";
+  private nextId = 1;
+  private closed = false;
+  private waiters: Array<() => void> = [];
+
+  private constructor(private readonly socket: ReturnType<typeof createConnection>) {
+    socket.setEncoding("utf8");
+    socket.on("data", (chunk: string) => {
+      this.buffer += chunk;
+      let end = this.buffer.indexOf("\n");
+      while (end !== -1) {
+        const line = this.buffer.slice(0, end);
+        this.buffer = this.buffer.slice(end + 1);
+        if (line.trim()) this.received.push(JSON.parse(line));
+        end = this.buffer.indexOf("\n");
+      }
+      this.wake();
+    });
+    const markClosed = () => {
+      this.closed = true;
+      this.wake();
+    };
+    socket.on("close", markClosed);
+    socket.on("error", markClosed);
+  }
+
+  /// Connects to the leader socket at `socketPath`.
+  static connect(socketPath: string): Promise<LeaderSocketClient> {
+    return new Promise((resolve, reject) => {
+      const socket = createConnection({ path: socketPath });
+      socket.once("error", reject);
+      socket.once("connect", () => {
+        socket.removeListener("error", reject);
+        resolve(new LeaderSocketClient(socket));
+      });
+    });
+  }
+
+  /// Sends one request and waits for its answer. Returns the answer, and the
+  /// messages that arrived before it, in order.
+  async request(method: string, params: object, timeoutMs = TIMEOUT): Promise<{ answer: any; before: any[] }> {
+    const id = this.nextId++;
+    const start = this.received.length;
+    this.socket.write(`${JSON.stringify({ jsonrpc: "2.0", id, method, params })}\n`);
+    const answered = () =>
+      this.received.slice(start).find(
+        (message) => message.id === id && (message.result !== undefined || message.error !== undefined),
+      );
+    await this.until(() => answered() !== undefined, `the answer to ${method}`, timeoutMs);
+    const answer = answered();
+    return { answer, before: this.received.slice(start, this.received.indexOf(answer)) };
+  }
+
+  /// Waits until a message that `predicate` accepts has arrived.
+  waitForMessage(predicate: (message: any) => boolean, label: string, timeoutMs = TIMEOUT): Promise<void> {
+    return this.until(() => this.received.some(predicate), label, timeoutMs);
+  }
+
+  /// Ends this connection.
+  close(): void {
+    this.socket.destroy();
+  }
+
+  private async until(predicate: () => boolean, label: string, timeoutMs: number): Promise<void> {
+    const deadline = Date.now() + timeoutMs;
+    while (!predicate()) {
+      if (this.closed) throw new Error(`the leader socket closed before ${label}`);
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) throw new Error(`timed out waiting for ${label}`);
+      await new Promise<void>((resolve) => {
+        const timer = setTimeout(resolve, Math.min(remaining, 200));
+        this.waiters.push(() => {
+          clearTimeout(timer);
+          resolve();
+        });
+      });
+    }
+  }
+
+  private wake(): void {
+    for (const wakeWaiter of this.waiters.splice(0)) wakeWaiter();
+  }
+}
+
+/// Whether a message is the agent text chunk `text`.
+function agentChunk(text: string): (message: any) => boolean {
+  return (message) =>
+    message.method === "session/update" &&
+    message.params?.update?.sessionUpdate === "agent_message_chunk" &&
+    message.params.update.content?.text === text;
+}
+
+/// The position in `messages` of the first message that `predicate` accepts, or -1.
+function indexOfMessage(messages: any[], predicate: (message: any) => boolean): number {
+  return messages.findIndex(predicate);
+}
+
+/// The text of the agent message chunks in `messages`, in order.
+function agentMessageText(messages: any[]): string {
+  return messages
+    .filter((message) => message.method === "session/update" && message.params?.update?.sessionUpdate === "agent_message_chunk")
+    .map((message) => message.params.update.content?.text ?? "")
+    .join("");
+}
+
+/// The session updates in `messages`, in order.
+function sessionUpdates(messages: any[]): any[] {
+  return messages.filter((message) => message.method === "session/update").map((message) => message.params.update);
+}
+
+/// The lines a client was sent, with the values that differ between two runs of
+/// one plan replaced by fixed names: the session id and the folders, the request
+/// id of a prompt that publishLedSession sends (runPrompt picks it at random, from
+/// 1000 up), the message ids, and the timestamps.
+function normalizedLines(lines: string[], names: Array<[string, string]>): string[] {
+  return lines.map((line) => {
+    let text = line;
+    for (const [value, name] of names) text = text.split(value).join(name);
+    return text
+      .replace(/"id":\d{4,}/g, '"id":"<prompt>"')
+      .replace(/"messageId":"[0-9a-f]+"/g, '"messageId":"<message>"')
+      .replace(/"updatedAt":"[^"]*"/g, '"updatedAt":"<time>"');
+  });
+}
+
+/// Runs a session whose second turn is held. `TURN_ONE` finishes first. Then
+/// `RUNNING_PROMPT` streams `RUNNING_SO_FAR` and a read_file call, and its next
+/// model reply waits. `whileHeld` runs while that reply waits. The reply is then
+/// released with `LIVE_AFTER_JOIN`, and the owner's turn must end. Returns the
+/// owner's messages, normalized so that two runs of one plan compare equal, and
+/// what `whileHeld` returned.
+async function playHeldRunningTurn<T>(
+  root: ReturnType<typeof createShortIsolatedRoot>,
+  whileHeld: (held: { sessionId: string; socket: string; modelRequests: () => number }) => Promise<T>,
+): Promise<{ owner: string[]; ownerStderr: string; result: T }> {
+  writeFileSync(join(root.workspace, "notes.md"), "held notes\n");
+  const heldReply = deferred<Response>();
+  const gateway = startFakeGateway([
+    finalText("TURN_ONE"),
+    fakeGatewaySerializedToolCall("running_read_1", "read_file", JSON.stringify({ path: "notes.md" }), "RUNNING_SO_FAR"),
+    () => heldReply.promise,
+  ]);
+  let owner: AcpClient | undefined;
+  try {
+    owner = await AcpClient.create({ cwd: root.workspace, env: leaderEnv(root, gateway) });
+    const { sessionId } = await publishLedSession(owner, "TURN_ONE_PROMPT");
+    const record = JSON.parse(sessionLock(root.home, sessionId)) as { socket: string };
+    sendPrompt(owner, 10, "RUNNING_PROMPT");
+    await waitForCondition("the held model reply", () => gateway.requests.length === 3, TIMEOUT);
+    const result = await whileHeld({
+      sessionId,
+      socket: record.socket,
+      modelRequests: () => gateway.requests.length,
+    });
+    heldReply.resolve(finalText("LIVE_AFTER_JOIN"));
+    const prompt = await readResponse(owner, 10);
+    expect(prompt.result.stopReason).toBe("end_turn");
+    return {
+      owner: normalizedLines(owner.rawLines, [
+        [sessionId, "<session>"],
+        [root.workspace, "<workspace>"],
+        [root.root, "<root>"],
+      ]),
+      ownerStderr: owner.stderr,
+      result,
+    };
+  } finally {
+    await owner?.close();
+    gateway.stop();
+  }
+}
+
+/// The owner's messages for the held-turn plan when no client follows it: the
+/// baseline that every followed run must match.
+async function unfollowedHeldTurn(): Promise<string[]> {
+  const root = createShortIsolatedRoot("fx-acp-socket-alone-");
+  try {
+    return (await playHeldRunningTurn(root, async () => undefined)).owner;
+  } finally {
+    rmSync(root.root, { recursive: true, force: true });
+  }
+}
+
 /// The bytes fx wrote into one session's lock file.
 function sessionLock(home: string, sessionId: string): string {
   return readFileSync(join(sessionDir(home, sessionId), "lock"), "utf8");
@@ -12492,33 +12683,27 @@ describe("acp: model-independent", () => {
   );
 
   test(
-    "the leader socket answers only initialize",
+    "the leader socket answers ACP requests as stdio does",
     async () => {
-      const root = createShortIsolatedRoot("fx-acp-leader-only-");
-      const gateway = startFakeGateway([finalText("LEADER_ONLY_DONE")]);
+      const root = createShortIsolatedRoot("fx-acp-leader-acp-");
+      const gateway = startFakeGateway([finalText("LEADER_ACP_DONE")]);
+      let socket: LeaderSocketClient | undefined;
       try {
         client = await AcpClient.create({ cwd: root.workspace, env: leaderEnv(root, gateway) });
-        const { sessionId } = await publishLedSession(client, "LEADER_ONLY_PROMPT");
+        const { sessionId } = await publishLedSession(client, "LEADER_ACP_PROMPT");
         const record = JSON.parse(sessionLock(root.home, sessionId));
 
-        const refused = await leaderRequest(record.socket, {
-          jsonrpc: "2.0",
-          id: 2,
-          method: "session/new",
-          params: { mcpServers: [] },
-        });
-        expect(refused.error.code).toBe(-32601);
-        expect(refused.result).toBeUndefined();
+        socket = await LeaderSocketClient.connect(record.socket);
+        const initialized = await socket.request("initialize", { protocolVersion: 1, clientCapabilities: fxClientCapabilities });
+        expect(initialized.answer.error).toBeUndefined();
+        expect(initialized.answer.result._meta["sh.fx/leader"]).toEqual({ pid: client.pid, sessions: [sessionId] });
 
-        const answered = await leaderRequest(record.socket, {
-          jsonrpc: "2.0",
-          id: 3,
-          method: "initialize",
-          params: { protocolVersion: 1 },
-        });
-        expect(answered.result._meta["sh.fx/leader"].pid).toBe(client.pid);
+        const created = await socket.request("session/new", { mcpServers: [] });
+        expect(created.answer.error).toBeUndefined();
+        expect(typeof created.answer.result.sessionId).toBe("string");
         expect(client.stderr).toBe("");
       } finally {
+        socket?.close();
         await client?.close();
         gateway.stop();
         rmSync(root.root, { recursive: true, force: true });
@@ -12661,6 +12846,180 @@ describe("acp: model-independent", () => {
       } finally {
         await client?.close();
         gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "a client on the leader socket loads a session and sees its saved turns, the running turn so far, then live updates",
+    async () => {
+      const shared = createShortIsolatedRoot("fx-acp-socket-load-");
+      let follower: LeaderSocketClient | undefined;
+      try {
+        const baseline = await unfollowedHeldTurn();
+
+        const followed = await playHeldRunningTurn(shared, async ({ sessionId, socket }) => {
+          follower = await LeaderSocketClient.connect(socket);
+          const initialized = await follower.request("initialize", { protocolVersion: 1, clientCapabilities: fxClientCapabilities });
+          expect(initialized.answer.error).toBeUndefined();
+          const loaded = await follower.request("session/load", { sessionId, cwd: shared.workspace, mcpServers: [] });
+          expect(loaded.answer.error).toBeUndefined();
+          return loaded;
+        });
+        const loaded = followed.result;
+
+        // Before the answer: the saved turn, then the running text, then its tool call, each once.
+        expect(occurrenceCount(agentMessageText(loaded.before), "TURN_ONE")).toBe(1);
+        expect(occurrenceCount(agentMessageText(loaded.before), "RUNNING_SO_FAR")).toBe(1);
+        const running = indexOfMessage(loaded.before, agentChunk("RUNNING_SO_FAR"));
+        const toolCall = indexOfMessage(
+          loaded.before,
+          (message) =>
+            message.method === "session/update" &&
+            message.params.update.sessionUpdate === "tool_call" &&
+            message.params.update.toolCallId === "running_read_1",
+        );
+        expect(agentMessageText(loaded.before).indexOf("TURN_ONE")).toBeLessThan(agentMessageText(loaded.before).indexOf("RUNNING_SO_FAR"));
+        expect(running).toBeGreaterThanOrEqual(0);
+        expect(toolCall).toBeGreaterThan(running);
+        expect(sessionUpdates(loaded.before).filter((update) => update.toolCallId === "running_read_1" && update.sessionUpdate === "tool_call")).toHaveLength(1);
+        expect(loaded.answer.result._meta["sh.fx/cwd"]).toBe(shared.workspace);
+
+        // After the answer: the live text, once.
+        await follower!.waitForMessage(agentChunk("LIVE_AFTER_JOIN"), "the live text");
+        const afterAnswer = follower!.received.slice(follower!.received.indexOf(loaded.answer) + 1);
+        expect(agentMessageText(afterAnswer)).toBe("LIVE_AFTER_JOIN");
+        expect(agentMessageText(follower!.received)).toBe("TURN_ONE" + "RUNNING_SO_FAR" + "LIVE_AFTER_JOIN");
+
+        // The owner's view is the same as when no client followed it.
+        expect(followed.owner).toEqual(baseline);
+        expect(followed.ownerStderr).toBe("");
+      } finally {
+        follower?.close();
+        rmSync(shared.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "a client on the leader socket can't change a session it follows",
+    async () => {
+      const root = createShortIsolatedRoot("fx-acp-socket-refuse-");
+      const baseline = await unfollowedHeldTurn();
+      let follower: LeaderSocketClient | undefined;
+      try {
+        const run = await playHeldRunningTurn(root, async ({ sessionId, socket, modelRequests }) => {
+          follower = await LeaderSocketClient.connect(socket);
+          await follower.request("initialize", { protocolVersion: 1, clientCapabilities: fxClientCapabilities });
+          await follower.request("session/load", { sessionId, cwd: root.workspace, mcpServers: [] });
+
+          const requestsBefore = modelRequests();
+          const prompt = await follower.request("session/prompt", {
+            sessionId,
+            prompt: [{ type: "text", text: "FOLLOWER_PROMPT" }],
+          });
+          const mode = await follower.request("session/set_mode", { sessionId, modeId: "plan" });
+          expect(modelRequests()).toBe(requestsBefore);
+
+          // A load answers with the session's current mode, so the follower can read that it did not change.
+          const reloaded = await follower.request("session/load", { sessionId, cwd: root.workspace, mcpServers: [] });
+          return { prompt: prompt.answer, mode: mode.answer, reloaded: reloaded.answer };
+        });
+
+        const refusal = {
+          code: -32600,
+          message: "This session is open on another connection; only that connection can change it.",
+        };
+        expect(run.result.prompt.error).toEqual(refusal);
+        expect(run.result.mode.error).toEqual(refusal);
+        expect(run.result.reloaded.result.modes.currentModeId).toBe("auto");
+
+        // The owner's turn finished with its own text, and nothing from the refused prompt reached it.
+        expect(run.owner.join("\n")).not.toContain("FOLLOWER_PROMPT");
+        expect(run.ownerStderr).toBe("");
+        expect(run.owner).toEqual(baseline);
+        expect(JSON.stringify(follower!.received)).not.toContain("FOLLOWER_PROMPT");
+      } finally {
+        follower?.close();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "a follower that closes the session or disconnects doesn't stop the owner's turn",
+    async () => {
+      const root = createShortIsolatedRoot("fx-acp-socket-close-");
+      const baseline = await unfollowedHeldTurn();
+      let follower: LeaderSocketClient | undefined;
+      let third: LeaderSocketClient | undefined;
+      try {
+        const run = await playHeldRunningTurn(root, async ({ sessionId, socket }) => {
+          follower = await LeaderSocketClient.connect(socket);
+          await follower.request("initialize", { protocolVersion: 1, clientCapabilities: fxClientCapabilities });
+          const loaded = await follower.request("session/load", { sessionId, cwd: root.workspace, mcpServers: [] });
+          expect(loaded.answer.error).toBeUndefined();
+
+          const closed = await follower.request("session/close", { sessionId });
+          expect(closed.answer.error).toBeUndefined();
+          expect(closed.answer.result).toEqual({});
+
+          // A third client follows the held turn, then disconnects while the turn is still held.
+          third = await LeaderSocketClient.connect(socket);
+          await third.request("initialize", { protocolVersion: 1, clientCapabilities: fxClientCapabilities });
+          const thirdLoad = await third.request("session/load", { sessionId, cwd: root.workspace, mcpServers: [] });
+          expect(agentMessageText(thirdLoad.before)).toContain("RUNNING_SO_FAR");
+          third.close();
+          return { closedAt: follower.received.indexOf(closed.answer) };
+        });
+
+        // The owner's turn finished normally, and fx wrote nothing to its stderr.
+        expect(run.owner.join("\n")).toContain("LIVE_AFTER_JOIN");
+        expect(run.ownerStderr).toBe("");
+        // The closed follower gets nothing after its close answer. The wait lets any
+        // message still in flight arrive before the check.
+        await Bun.sleep(300);
+        expect(run.result.closedAt).toBeGreaterThanOrEqual(0);
+        expect(follower!.received.slice(run.result.closedAt + 1)).toEqual([]);
+        expect(run.owner).toEqual(baseline);
+      } finally {
+        follower?.close();
+        third?.close();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "a client on the leader socket resumes a session and gets only live updates",
+    async () => {
+      const root = createShortIsolatedRoot("fx-acp-socket-resume-");
+      const baseline = await unfollowedHeldTurn();
+      let follower: LeaderSocketClient | undefined;
+      try {
+        const run = await playHeldRunningTurn(root, async ({ sessionId, socket }) => {
+          follower = await LeaderSocketClient.connect(socket);
+          await follower.request("initialize", { protocolVersion: 1, clientCapabilities: fxClientCapabilities });
+          return follower.request("session/resume", { sessionId, cwd: root.workspace, mcpServers: [] });
+        });
+        const resumed = run.result;
+
+        expect(resumed.answer.error).toBeUndefined();
+        expect(resumed.answer.result._meta["sh.fx/cwd"]).toBe(root.workspace);
+        // Resume replays nothing, so no message comes before the answer.
+        expect(resumed.before).toEqual([]);
+
+        await follower!.waitForMessage(agentChunk("LIVE_AFTER_JOIN"), "the live text");
+        expect(agentMessageText(follower!.received)).toBe("LIVE_AFTER_JOIN");
+        expect(run.ownerStderr).toBe("");
+        expect(run.owner).toEqual(baseline);
+      } finally {
+        follower?.close();
         rmSync(root.root, { recursive: true, force: true });
       }
     },

@@ -1,12 +1,12 @@
 //! The leader socket: one Unix socket per `fx acp` process, recorded in each
 //! session lock the process holds, so another process can find the holder.
-//! It answers `initialize` only, with this process's pid and the sessions it
-//! leads in `_meta["sh.fx/leader"]`; every other request gets -32601.
+//! Each client that connects is served as a full ACP connection by the
+//! `ConnectionRunner` the process gives, so it shares the process's sessions and
+//! store. This file knows nothing of ACP: it accepts, bounds, and stops.
 
 const std = @import("std");
 const posix = std.posix;
 const builtin = @import("builtin");
-const acp_types = @import("types.zig");
 const jsonrpc = @import("jsonrpc.zig");
 const debug_trace = @import("../core/shared/debug_trace.zig");
 const io_mod = @import("../core/shared/io.zig");
@@ -21,9 +21,6 @@ const max_socket_path_bytes = 103;
 /// Connections served at once. A connection past this is closed at once, so
 /// one client cannot hold every thread.
 const max_connections = 16;
-/// A request line longer than this closes its connection, so one client cannot
-/// grow a buffer without bound.
-const max_line_bytes = 64 * 1024;
 /// How long one reply may take to reach a client, counted over the whole
 /// reply. `stop` waits for every connection, so no write may take longer than
 /// this: a client that stops reading, or reads too slowly, is dropped after it.
@@ -80,12 +77,18 @@ pub const SessionList = struct {
     copy_ids: *const fn (context: ?*anyopaque, alloc: Allocator) error{OutOfMemory}![][]u8,
 };
 
+/// Serves one accepted connection as a full ACP connection. `run` gets the
+/// socket's reader and writer, and returns when the connection ends. server.zig
+/// gives it, so this file stays free of server.zig.
+pub const ConnectionRunner = struct {
+    context: ?*anyopaque,
+    run: *const fn (context: ?*anyopaque, reader: jsonrpc.Reader, writer: jsonrpc.Writer) void,
+};
+
 pub const Leader = struct {
     alloc: Allocator,
     io: std.Io,
-    pid: i64,
-    capabilities: acp_types.AgentCapabilities,
-    sessions: SessionList,
+    runner: ConnectionRunner,
     /// `{base}/fx-leader-{hex}`: the folder that holds the socket, removed at stop.
     folder_path: []u8,
     /// `{folder_path}/s`: the socket another process connects to.
@@ -100,13 +103,13 @@ pub const Leader = struct {
     stop_flag: std.atomic.Value(bool) = .init(false),
 
     /// Starts the leader: makes the folder, binds the socket in it, and starts
-    /// the accept loop. The caller ends it with `stop`.
+    /// the accept loop. Each connection is served by `runner`. The caller ends it
+    /// with `stop`.
     pub fn start(
         alloc: Allocator,
         io: std.Io,
         tmpdir: ?[]const u8,
-        capabilities: acp_types.AgentCapabilities,
-        sessions: SessionList,
+        runner: ConnectionRunner,
     ) !*Leader {
         var random: [random_len]u8 = undefined;
         io.random(&random);
@@ -138,9 +141,7 @@ pub const Leader = struct {
         self.* = .{
             .alloc = alloc,
             .io = io,
-            .pid = pid,
-            .capabilities = capabilities,
-            .sessions = sessions,
+            .runner = runner,
             .folder_path = folder_path,
             .socket_path = socket_path,
             .record = record,
@@ -215,119 +216,20 @@ pub const Leader = struct {
         self.open_connections -= 1;
     }
 
-    /// Serves one client: reads newline-delimited requests and answers each.
-    /// Ends when the client closes, a line is too long, a read or write fails,
-    /// or the leader stops.
+    /// Serves one client as a full ACP connection: the runner reads its requests
+    /// from the socket and writes its answers to it. Returns when the runner
+    /// returns, which is when the client closed, the leader stopped, or a write
+    /// failed.
     fn serveConnection(self: *Leader, stream: std.Io.net.Stream) void {
         defer self.finishConnection(stream);
         const fd = stream.socket.handle;
         var sink: Sink = .{ .fd = fd };
-        var writer = jsonrpc.Writer.initCallback(&sink, Sink.write);
-        var line: std.ArrayList(u8) = .empty;
-        defer line.deinit(self.alloc);
-        var chunk: [4096]u8 = undefined;
-        while (!self.stop_flag.load(.acquire)) {
-            var fds = [_]posix.pollfd{.{ .fd = fd, .events = posix.POLL.IN, .revents = 0 }};
-            const ready = posix.poll(&fds, poll_ms) catch |err| {
-                debug_trace.logf("acp", "event=leader_poll_failed err={s} unread_bytes={d}", .{ @errorName(err), line.items.len });
-                return;
-            };
-            if (ready == 0) continue;
-            const n = posix.read(fd, &chunk) catch |err| {
-                debug_trace.logf("acp", "event=leader_read_failed err={s} unread_bytes={d}", .{ @errorName(err), line.items.len });
-                return;
-            };
-            if (n == 0) {
-                debug_trace.logf("acp", "event=leader_client_closed unread_bytes={d}", .{line.items.len});
-                return;
-            }
-            var rest = chunk[0..n];
-            while (std.mem.findScalar(u8, rest, '\n')) |end| {
-                // Checked per line, not per chunk: a chunk holds many lines, and
-                // each reply may take up to `max_write_wait_ms`, so `stop` must
-                // not wait for the rest of the chunk.
-                if (self.stop_flag.load(.acquire)) {
-                    debug_trace.logf("acp", "event=leader_connection_stopped unread_bytes={d}", .{line.items.len + rest.len});
-                    return;
-                }
-                if (line.items.len + end > max_line_bytes) return lineTooLong(line.items.len + end);
-                line.appendSlice(self.alloc, rest[0..end]) catch |err| {
-                    debug_trace.logf("acp", "event=leader_connection_ended err={s} unread_bytes={d}", .{ @errorName(err), line.items.len + rest.len });
-                    return;
-                };
-                self.answerLine(&writer, line.items) catch |err| {
-                    debug_trace.logf("acp", "event=leader_connection_ended err={s} unread_bytes={d}", .{ @errorName(err), rest.len - end - 1 });
-                    return;
-                };
-                line.clearRetainingCapacity();
-                rest = rest[end + 1 ..];
-            }
-            if (line.items.len + rest.len > max_line_bytes) return lineTooLong(line.items.len + rest.len);
-            line.appendSlice(self.alloc, rest) catch |err| {
-                debug_trace.logf("acp", "event=leader_connection_ended err={s} unread_bytes={d}", .{ @errorName(err), line.items.len + rest.len });
-                return;
-            };
-        }
-        debug_trace.logf("acp", "event=leader_connection_stopped unread_bytes={d}", .{line.items.len});
-    }
-
-    /// Answers one request line. A line that is not JSON-RPC, a response, or a
-    /// notification is ignored with a trace line. A request other than
-    /// `initialize` gets -32601; the socket answers no other method.
-    fn answerLine(self: *Leader, writer: *jsonrpc.Writer, line: []const u8) !void {
-        var msg = jsonrpc.parseMessage(self.alloc, line) catch |err| {
-            debug_trace.logf("acp", "event=leader_line_ignored err={s}", .{@errorName(err)});
-            return;
-        };
-        defer jsonrpc.freeMessage(self.alloc, &msg);
-        if (msg.isResponse()) {
-            debug_trace.logf("acp", "event=leader_line_ignored reason=response", .{});
-            return;
-        }
-        if (msg.id == null) {
-            debug_trace.logf("acp", "event=leader_line_ignored reason=notification method={s}", .{msg.method});
-            return;
-        }
-        if (std.mem.eql(u8, msg.method, "initialize")) return self.answerInitialize(writer, msg.id);
-        try writer.writeError(self.alloc, msg.id, .{
-            .code = jsonrpc.ErrorCode.method_not_found,
-            .message = "This socket answers only initialize",
-        });
-    }
-
-    /// The `initialize` answer: the same result as stdio gives, plus this
-    /// process's pid and the sessions it leads, so the caller learns who holds
-    /// its locks. If the sessions cannot be copied, the answer is an error, not
-    /// a list that may be wrong.
-    fn answerInitialize(self: *Leader, writer: *jsonrpc.Writer, id: ?jsonrpc.RequestId) !void {
-        const ids = self.sessions.copy_ids(self.sessions.context, self.alloc) catch {
-            debug_trace.logf("acp", "event=leader_sessions_unlisted", .{});
-            return writer.writeError(self.alloc, id, .{
-                .code = jsonrpc.ErrorCode.internal_error,
-                .message = "Could not list the sessions this process leads",
-            });
-        };
-        defer freeIds(self.alloc, ids);
-        const view = try self.alloc.alloc([]const u8, ids.len);
-        defer self.alloc.free(view);
-        for (ids, view) |listed, *slot| slot.* = listed;
-        var capabilities = self.capabilities;
-        capabilities.leader = .{ .pid = self.pid, .sessions = view };
-        var out: std.Io.Writer.Allocating = .init(self.alloc);
-        defer out.deinit();
-        try acp_types.writeInitializeResponse(&out.writer, capabilities);
-        try writer.writeResponse(self.alloc, id, out.writer.buffered());
+        const writer = jsonrpc.Writer.initCallback(&sink, Sink.write);
+        var source: SocketSource = .{ .stop_flag = &self.stop_flag, .fd = fd };
+        const reader = jsonrpc.Reader.initCallback(&source, SocketSource.read);
+        self.runner.run(self.runner.context, reader, writer);
     }
 };
-
-fn freeIds(alloc: Allocator, ids: [][]u8) void {
-    for (ids) |id| alloc.free(id);
-    alloc.free(ids);
-}
-
-fn lineTooLong(length: usize) void {
-    debug_trace.logf("acp", "event=leader_line_too_long bytes={d} limit={d}", .{ length, max_line_bytes });
-}
 
 /// Removes the socket file, then its folder. A failure is traced and left
 /// behind: the folder name is random, so a leftover never blocks a later start.
@@ -413,6 +315,36 @@ const Sink = struct {
     }
 };
 
+/// The read side of one connection. It waits in `poll_ms` steps, so it sees the
+/// stop flag, and it reports end of input when the leader stops, when the client
+/// closes, and when a read fails. A stop therefore ends a connection the way a
+/// client that closed its input does. Lines the reader already holds are still
+/// answered first, since the reader serves them before it asks for more input.
+const SocketSource = struct {
+    stop_flag: *const std.atomic.Value(bool),
+    fd: posix.socket_t,
+
+    fn read(context: ?*anyopaque, buffer: []u8) usize {
+        const source: *SocketSource = @ptrCast(@alignCast(context.?));
+        while (!source.stop_flag.load(.acquire)) {
+            var fds = [_]posix.pollfd{.{ .fd = source.fd, .events = posix.POLL.IN, .revents = 0 }};
+            const ready = posix.poll(&fds, poll_ms) catch |err| {
+                debug_trace.logf("acp", "event=leader_poll_failed err={s}", .{@errorName(err)});
+                return 0;
+            };
+            if (ready == 0) continue;
+            const n = posix.read(source.fd, buffer) catch |err| {
+                debug_trace.logf("acp", "event=leader_read_failed err={s}", .{@errorName(err)});
+                return 0;
+            };
+            if (n == 0) debug_trace.logf("acp", "event=leader_client_closed", .{});
+            return n;
+        }
+        debug_trace.logf("acp", "event=leader_connection_stopped", .{});
+        return 0;
+    }
+};
+
 test "socketBase keeps TMPDIR and trims its trailing slashes when the socket path fits" {
     try testing.expectEqualStrings("/var/folders/ab/T", socketBase("/var/folders/ab/T/"));
     try testing.expectEqualStrings("/tmp/x", socketBase("/tmp/x///"));
@@ -458,13 +390,30 @@ test "writeRecord escapes a quote in the socket path, and the line is still vali
     try testing.expectEqualStrings("/tmp/a\"b/s", parsed.value.object.get("socket").?.string);
 }
 
-const TestIds = struct {
-    fn copy(context: ?*anyopaque, alloc: Allocator) error{OutOfMemory}![][]u8 {
-        _ = context;
-        const out = try alloc.alloc([]u8, 1);
-        errdefer alloc.free(out);
-        out[0] = try alloc.dupe(u8, "sess-leader-test-1");
-        return out;
+/// Stands in for the connection runner `server.zig` gives. It answers each request
+/// line with a result, and it ends when a read or a write fails, as `runServer` does.
+const FakeRunner = struct {
+    /// Set when a request whose method is `ping` arrives.
+    got_ping: std.atomic.Value(bool) = .init(false),
+    /// Set when the runner returns, so a test can see that the connection ended.
+    done: std.atomic.Value(bool) = .init(false),
+
+    fn run(context: ?*anyopaque, reader: jsonrpc.Reader, writer: jsonrpc.Writer) void {
+        const self: *FakeRunner = @ptrCast(@alignCast(context.?));
+        defer self.done.store(true, .release);
+        var input = reader;
+        var output = writer;
+        while (true) {
+            const read = (input.readLine(testing.allocator) catch return) orelse return;
+            switch (read) {
+                .overflow => return,
+                .line => |line| {
+                    defer testing.allocator.free(line);
+                    if (std.mem.find(u8, line, "\"method\":\"ping\"") != null) self.got_ping.store(true, .release);
+                    output.writeResponse(testing.allocator, jsonrpc.RequestId{ .integer = 7 }, "{\"ok\":true}") catch return;
+                },
+            }
+        }
     }
 };
 
@@ -492,16 +441,13 @@ fn readReplyLine(fd: posix.socket_t, buffer: []u8) ![]const u8 {
     return error.LineTooLong;
 }
 
-test "a leader answers initialize with its pid and sessions, refuses another method, and leaves no file behind" {
+test "a leader hands each connection a reader and a writer: a request reaches the runner, its reply reaches the client, and stop waits for the connection to end" {
     const io = testing.io;
     const alloc = testing.allocator;
-    const leader = try Leader.start(alloc, io, null, .{ .image_prompts = true }, .{
-        .context = null,
-        .copy_ids = TestIds.copy,
-    });
+    var fake: FakeRunner = .{};
+    const leader = try Leader.start(alloc, io, null, .{ .context = &fake, .run = FakeRunner.run });
     var stopped = false;
     defer if (!stopped) leader.stop(io);
-    const pid: i64 = @intCast(std.c.getpid());
     const socket_copy = try alloc.dupe(u8, leader.socket_path);
     defer alloc.free(socket_copy);
     const folder_copy = try alloc.dupe(u8, leader.folder_path);
@@ -511,27 +457,23 @@ test "a leader answers initialize with its pid and sessions, refuses another met
     const client = try address.connect(io);
     var client_closed = false;
     defer if (!client_closed) client.close(io);
-    try sendLine(io, client, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":1}}\n");
-    var buffer: [16 * 1024]u8 = undefined;
+    try sendLine(io, client, "{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"ping\",\"params\":{}}\n");
+    var buffer: [1024]u8 = undefined;
     const reply = try readReplyLine(client.socket.handle, &buffer);
-    try testing.expect(std.mem.startsWith(u8, reply, "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":"));
-    const meta = try std.fmt.allocPrint(alloc, "\"_meta\":{{\"sh.fx/leader\":{{\"pid\":{d},\"sessions\":[\"sess-leader-test-1\"]}}}}", .{pid});
-    defer alloc.free(meta);
-    try testing.expect(std.mem.indexOf(u8, reply, meta) != null);
-
-    try sendLine(io, client, "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"session/new\",\"params\":{}}\n");
-    const refused = try readReplyLine(client.socket.handle, &buffer);
-    try testing.expect(std.mem.indexOf(u8, refused, "\"error\":{\"code\":-32601,\"message\":\"This socket answers only initialize\"}") != null);
+    try testing.expect(std.mem.find(u8, reply, "\"id\":7") != null);
+    try testing.expect(std.mem.find(u8, reply, "\"result\":{\"ok\":true}") != null);
+    try testing.expect(fake.got_ping.load(.acquire));
 
     client.close(io);
     client_closed = true;
     leader.stop(io);
     stopped = true;
+    try testing.expect(fake.done.load(.acquire));
     try testing.expect(pathGone(io, socket_copy));
     try testing.expect(pathGone(io, folder_copy));
 }
 
-const initialize_line = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":1}}\n";
+const request_line = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\",\"params\":{}}\n";
 /// The most lines the stall test sends. The test fails if the client never
 /// stops sending within this many lines; then this number must go up.
 const never_read_lines = 5000;
@@ -555,10 +497,8 @@ fn sendLineNoWait(fd: posix.socket_t, line: []const u8) !bool {
 test "a client that never reads cannot hold up stop: it returns within 3 s and removes the socket and folder" {
     const io = testing.io;
     const alloc = testing.allocator;
-    const leader = try Leader.start(alloc, io, null, .{ .image_prompts = true }, .{
-        .context = null,
-        .copy_ids = TestIds.copy,
-    });
+    var fake: FakeRunner = .{};
+    const leader = try Leader.start(alloc, io, null, .{ .context = &fake, .run = FakeRunner.run });
     var stopped = false;
     defer if (!stopped) leader.stop(io);
     const socket_copy = try alloc.dupe(u8, leader.socket_path);
@@ -575,7 +515,7 @@ test "a client that never reads cannot hold up stop: it returns within 3 s and r
     // more, because its buffer is full or the leader has dropped it.
     var send_refused = false;
     for (0..never_read_lines) |_| {
-        if (!try sendLineNoWait(client.socket.handle, initialize_line)) {
+        if (!try sendLineNoWait(client.socket.handle, request_line)) {
             send_refused = true;
             break;
         }
