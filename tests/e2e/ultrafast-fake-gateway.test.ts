@@ -1157,7 +1157,10 @@ describe("ultrafast fake Gateway", () => {
           await session.waitForComposer(TIMEOUT);
           await waitForGatewayModelCatalog(gateway);
           await session.sendKeys("C-p");
-          const catalog = await session.waitForText("tab provider", TIMEOUT);
+          const catalog = await session.waitForPane(
+            (pane) => /^models\s/m.test(pane) && pane.includes(ULTRA_MODEL),
+            TIMEOUT,
+          );
           expect(catalog).toContain(ULTRA_MODEL);
           expect(catalog).toContain("Ultra");
           await session.sendKeys("Enter");

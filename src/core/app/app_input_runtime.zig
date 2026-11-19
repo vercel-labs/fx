@@ -5956,19 +5956,19 @@ test "app_input_runtime enter on tab-filtered empty dollar menu submits raw" {
     const alloc = std.testing.allocator;
     var app = try RoutingFakeApp.init(alloc);
     defer app.deinit();
-    const skills = [_]skill_runtime.Skill{.{
-        .name = "managed",
-        .description = "",
-        .path = "/tmp/managed/SKILL.md",
-        .source = .global_codex,
-    }};
+    const skills = [_]skill_runtime.Skill{
+        .{ .name = "managed", .description = "", .path = "/tmp/managed/SKILL.md", .source = .global_codex },
+        .{ .name = "zeta", .description = "", .path = "/tmp/zeta/SKILL.md", .source = .global_fx },
+    };
     app.skills.items = @constCast(&skills);
 
     try feedRoutingBytes(&app, "$man");
     try std.testing.expect(app.skills.selectedMenuSkill() != null);
 
-    // .all -> .fx: the codex-sourced skill vanishes, nothing is selectable.
+    // .all -> .fx: fx has a skill, but none matches "man", so the codex-sourced
+    // match vanishes and nothing is selectable.
     try feedRoutingBytes(&app, "\t");
+    try std.testing.expectEqual(skill_runtime.SkillMenuSourceFilter.fx, app.skills.menu.source_filter);
     try std.testing.expect(app.skills.menu.active);
     try std.testing.expect(app.skills.selectedMenuSkill() == null);
 

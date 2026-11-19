@@ -1498,22 +1498,29 @@ pub const SkillMenu = struct {
     }
 
     pub fn moveSourceFilter(self: *SkillMenu, items: []const Skill, delta: i32) bool {
-        if (!self.advanceSourceFilter(delta)) return false;
+        if (!self.advanceSourceFilter(items, delta)) return false;
         self.clamp(items);
         return true;
     }
 
-    fn advanceSourceFilter(self: *SkillMenu, delta: i32) bool {
+    /// Moves to the next source with skills, skipping empty ones; `All`
+    /// always counts. Returns false when no other source has any.
+    fn advanceSourceFilter(self: *SkillMenu, items: []const Skill, delta: i32) bool {
         if (!self.active) return false;
-        const count = skill_menu_source_filters.len;
-        const current = skillMenuSourceFilterIndex(self.source_filter);
-        var next = @as(i32, @intCast(current)) + delta;
-        if (next < 0) next = @as(i32, @intCast(count)) - 1;
-        if (next >= @as(i32, @intCast(count))) next = 0;
-        self.source_filter = skill_menu_source_filters[@intCast(next)];
-        self.selected_index = 0;
-        self.window_start = 0;
-        return true;
+        const count: i32 = @intCast(skill_menu_source_filters.len);
+        const step: i32 = if (delta < 0) -1 else 1;
+        var next: i32 = @intCast(skillMenuSourceFilterIndex(self.source_filter));
+        var tries: i32 = 1;
+        while (tries < count) : (tries += 1) {
+            next = @mod(next + step, count);
+            const candidate = skill_menu_source_filters[@intCast(next)];
+            if (!skillMenuSourceFilterAvailable(items, candidate)) continue;
+            self.source_filter = candidate;
+            self.selected_index = 0;
+            self.window_start = 0;
+            return true;
+        }
+        return false;
     }
 
     pub fn clamp(self: *SkillMenu, items: []const Skill) void {
@@ -2130,6 +2137,24 @@ fn optionalStringEqual(left: ?[]const u8, right: ?[]const u8) bool {
     return std.mem.eql(u8, left.?, right.?);
 }
 
+/// Whether the skills menu offers `filter`: `All` always, any other source
+/// only when it has at least one skill.
+pub fn skillMenuSourceFilterAvailable(items: []const Skill, filter: SkillMenuSourceFilter) bool {
+    if (filter == .all) return true;
+    for (items) |skill| {
+        if (skillMenuFilterForSource(skill.source) == filter) return true;
+    }
+    return false;
+}
+
+/// Whether Tab can move the skills menu to another source.
+pub fn skillMenuHasOtherSource(items: []const Skill, current: SkillMenuSourceFilter) bool {
+    for (skill_menu_source_filters) |filter| {
+        if (filter != current and skillMenuSourceFilterAvailable(items, filter)) return true;
+    }
+    return false;
+}
+
 fn skillMenuSourceFilterIndex(filter: SkillMenuSourceFilter) usize {
     for (skill_menu_source_filters, 0..) |candidate, index| {
         if (candidate == filter) return index;
@@ -2585,7 +2610,7 @@ pub const Runtime = struct {
     }
 
     pub fn moveMenuSourceFilter(self: *Runtime, delta: i32) bool {
-        if (!self.menu.advanceSourceFilter(delta)) return false;
+        if (!self.menu.advanceSourceFilter(self.items, delta)) return false;
         self.rebuildPreparedMenuIndex();
         self.menu.clampCount(self.menuItemCount());
         return true;
@@ -4010,6 +4035,38 @@ test "skill menu empty query and source filters preserve source grouping" {
     try std.testing.expectEqual(@as(usize, 1), skillMenuFilterQueryCount(&skills, .agents, "zig"));
 }
 
+test "skill menu source tabs skip empty sources and stay put when none other has skills" {
+    const skills = [_]Skill{
+        staticSkill("managed", "managed skill", .global_fx),
+        staticSkill("compat", "compatibility skill", .global_agents),
+    };
+    var menu: SkillMenu = .{};
+    menu.open(&skills);
+    var seen: [skill_menu_source_filters.len]SkillMenuSourceFilter = undefined;
+    for (&seen) |*filter| {
+        try std.testing.expect(menu.moveSourceFilter(&skills, 1));
+        filter.* = menu.source_filter;
+        try std.testing.expect(skillMenuSourceFilterAvailable(&skills, filter.*));
+    }
+    try std.testing.expectEqual(SkillMenuSourceFilter.fx, seen[0]);
+    try std.testing.expectEqual(SkillMenuSourceFilter.agents, seen[1]);
+    try std.testing.expectEqual(SkillMenuSourceFilter.all, seen[2]);
+    try std.testing.expect(skillMenuHasOtherSource(&skills, .all));
+
+    const only_fx = [_]Skill{staticSkill("managed", "managed skill", .global_fx)};
+    menu.open(&only_fx);
+    try std.testing.expect(menu.moveSourceFilter(&only_fx, 1));
+    try std.testing.expectEqual(SkillMenuSourceFilter.fx, menu.source_filter);
+    try std.testing.expect(menu.moveSourceFilter(&only_fx, 1));
+    try std.testing.expectEqual(SkillMenuSourceFilter.all, menu.source_filter);
+
+    const none = [_]Skill{};
+    menu.open(&none);
+    try std.testing.expect(!menu.moveSourceFilter(&none, 1));
+    try std.testing.expectEqual(SkillMenuSourceFilter.all, menu.source_filter);
+    try std.testing.expect(!skillMenuHasOtherSource(&none, .all));
+}
+
 test "skill menu opens focuses moves and clamps loaded items" {
     const skills = [_]Skill{
         staticSkill("managed", "managed skill", .global_fx),
@@ -4040,9 +4097,10 @@ test "skill menu opens focuses moves and clamps loaded items" {
     try std.testing.expectEqual(@as(usize, 0), runtime.menu.selected_index);
     try std.testing.expectEqualStrings("workspace", runtime.selectedMenuSkill().?.name);
 
+    // Tab skips the sources with no skills, Claude and Codex here.
     try std.testing.expect(runtime.moveMenuSourceFilter(1));
-    try std.testing.expectEqual(SkillMenuSourceFilter.claude, runtime.menu.source_filter);
-    try std.testing.expect(runtime.selectedMenuSkill() == null);
+    try std.testing.expectEqual(SkillMenuSourceFilter.agents, runtime.menu.source_filter);
+    try std.testing.expectEqualStrings("compat", runtime.selectedMenuSkill().?.name);
     try std.testing.expect(runtime.moveMenuSourceFilter(-1));
     try std.testing.expectEqual(SkillMenuSourceFilter.workspace, runtime.menu.source_filter);
     try std.testing.expectEqualStrings("workspace", runtime.selectedMenuSkill().?.name);

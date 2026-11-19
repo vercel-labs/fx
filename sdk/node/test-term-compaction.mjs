@@ -254,9 +254,9 @@ async function runScenario(name) {
     await start(["--resume", sessionId]);
     // A known context window bounds the turns kept unchanged, so older turns compact.
     active.runtime.write("/model\r");
-    await waitFor(() => grid(active.terminal).includes("128K context") && grid(active.terminal).includes("tab provider"), "model capabilities loaded");
+    await waitFor(() => grid(active.terminal).includes("128K context") && /^models\s/m.test(grid(active.terminal)), "model capabilities loaded");
     active.runtime.write("\x1b");
-    await waitFor(() => !grid(active.terminal).includes("tab provider") && emptyComposer(grid(active.terminal)), "model catalog closed");
+    await waitFor(() => !/^models\s/m.test(grid(active.terminal)) && emptyComposer(grid(active.terminal)), "model catalog closed");
     const beforeCommits = commits;
     const beforeBytes = [...records.values()][0].bytes.slice();
     const cancelledPrompt = "Cancel this automatic summary before headers.";

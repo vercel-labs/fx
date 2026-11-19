@@ -120,7 +120,7 @@ await command("/skills list", "Skills are unavailable in this host");
 runtime.write("/model\r");
 await waitFor(() => grid().includes("feature-model") && grid().includes("other-model"), "model catalog menu");
 runtime.write("\x1b");
-await waitFor(() => !grid().includes("tab provider"), "model catalog close");
+await waitFor(() => !/^models\s/m.test(grid()), "model catalog close");
 
 runtime.write("/exit\r");
 const code = await Promise.race([runtime.exited, new Promise((_, reject) => setTimeout(() => reject(new Error("exit timeout")), 5000))]);

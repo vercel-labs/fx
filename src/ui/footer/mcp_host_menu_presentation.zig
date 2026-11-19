@@ -7,6 +7,7 @@ const profile_paths = @import("../../core/shared/profile_paths.zig");
 const display_width = @import("../../core/shared/display_width.zig");
 const menu = @import("../../core/mcp_host/menu.zig");
 const verbs = @import("../../core/mcp_host/verbs.zig");
+const menu_frame = @import("menu_frame.zig");
 const row_text = @import("row_text.zig");
 const text_utils = @import("../../core/shared/text_utils.zig");
 const ui_render = @import("../render.zig");
@@ -14,7 +15,8 @@ const ui_render = @import("../render.zig");
 const Allocator = std.mem.Allocator;
 const Row = std.ArrayList(u8);
 
-pub const max_inline_rows: u16 = menu.server_window + 1;
+/// The title, the blank row under it, and the server window.
+pub const max_inline_rows: u16 = menu.server_window + 2;
 /// Where a server's facts start: after `http`, `runs`, `file`, `status`,
 /// `protocol`, `error`.
 const fact_col: usize = 12;
@@ -83,8 +85,9 @@ pub fn menuRowCount(p: Projection, width: u16, budget: u16) u16 {
     var confirm: Confirm = undefined;
     const wanted: usize = switch (p.state.screen) {
         .list => blk: {
+            // Every server's lines, filtered or not, so typing never shrinks the list.
             var buf: [256]menu.Row = undefined;
-            const shown = @max(listLines(menu.viewOf(&p.state, p.rows, p.filter, p.tools, &buf)), 1);
+            const shown = @max(listLines(menu.viewOf(&p.state, p.rows, "", p.tools, &buf)), 1);
             break :blk 1 + (if (p.rows.len == 0) 2 else shown) + @as(usize, @intFromBool(p.notes > 0));
         },
         .server => if (p.openRow()) |r| serverRows(p, r, width) else 1,
@@ -93,7 +96,16 @@ pub fn menuRowCount(p: Projection, width: u16, budget: u16) u16 {
         else
             1 + confirmLines(p, r, width, &confirm).len) else 1,
     };
-    return @intCast(@min(wanted, budget));
+    return @intCast(@min(wanted + @intFromBool(hasTitleGap(p)), budget));
+}
+
+/// Whether a blank row follows the title. The separate confirmation opens
+/// with its own blank line.
+fn hasTitleGap(p: Projection) bool {
+    return switch (p.state.screen) {
+        .list, .server => true,
+        .confirm => asksInPlace(p),
+    };
 }
 
 /// A server's screen: its title and lines, the panel's height, made taller
@@ -163,23 +175,29 @@ pub fn composeRow(alloc: Allocator, p: Projection, index: u16, width: u16, row_c
     var arena_state: std.heap.ArenaAllocator = .init(alloc);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    return switch (p.state.screen) {
-        .list => listRow(alloc, arena, p, index, width, row_count),
-        .server => serverRow(alloc, arena, p, index, width, row_count),
-        .confirm => if (asksInPlace(p)) serverRow(alloc, arena, p, index, width, row_count) else confirmRow(alloc, arena, p, index, width),
-    };
+    if (hasTitleGap(p)) {
+        if (index == 1) return .empty;
+        const shifted = if (index > 1) index - 1 else index;
+        const rows = row_count - 1;
+        return switch (p.state.screen) {
+            .list => listRow(alloc, arena, p, shifted, width, rows),
+            .server, .confirm => serverRow(alloc, arena, p, shifted, width, rows),
+        };
+    }
+    return confirmRow(alloc, arena, p, index, width);
 }
 
-fn title(alloc: Allocator, name: []const u8, meta: []const u8, width: u16) !Row {
+fn title(alloc: Allocator, text: []const u8, width: u16) !Row {
+    return menu_frame.composeTitleRow(alloc, text, null, width);
+}
+
+/// A heading inside the list: bold and bright at the rows' indent.
+fn listHeading(alloc: Allocator, name: []const u8, width: u16) !Row {
     var row: Row = .empty;
     errdefer row.deinit(alloc);
-    try row.appendSlice(alloc, "  ");
-    try row.appendSlice(alloc, ui_render.subtitle_style);
-    try row_text.appendTerminalSafeSingleLine(alloc, &row, name, @as(usize, width) / 2);
-    try row.appendSlice(alloc, ui_render.reset_style);
-    try row.appendSlice(alloc, "  ");
-    try row.appendSlice(alloc, ui_render.dim_style);
-    try row_text.appendTerminalSafeSingleLine(alloc, &row, meta, @as(usize, width) -| display_width.visibleWidthIgnoringAnsi(row.items));
+    if (width > 2) try row.appendSlice(alloc, "  ");
+    try row.appendSlice(alloc, ui_render.selected_completion_style);
+    try row_text.appendTerminalSafeSingleLine(alloc, &row, name, @as(usize, width) -| 3);
     try row.appendSlice(alloc, ui_render.reset_style);
     return row;
 }
@@ -188,29 +206,19 @@ fn listRow(alloc: Allocator, arena: Allocator, p: Projection, index: u16, width:
     var buf: [256]menu.Row = undefined;
     const view = menu.viewOf(&p.state, p.rows, p.filter, p.tools, &buf);
     const rows = view.rows;
-    if (index == 0) {
-        const meta = if (p.rows.len == 0)
-            "none yet"
-        else if (p.filter.len > 0)
-            try arena.print("{d} of {d}", .{ rows.len, p.rows.len })
-        else
-            try arena.print("{d}", .{p.rows.len});
-        return title(alloc, "MCP servers", meta, width);
-    }
+    if (index == 0) return title(alloc, "MCP servers", width);
     const has_note = p.notes > 0;
     if (has_note and index == row_count - 1) {
         const note = try arena.print("{d} config note{s}: /mcp list shows {s}", .{ p.notes, if (p.notes == 1) "" else "s", if (p.notes == 1) "it" else "them" });
         return row_text.composeTextRow(alloc, note, width, ui_render.dim_style, 2);
     }
-    if (p.rows.len == 0) return if (index == 1)
-        row_text.composeTextRow(alloc, "Add one with /mcp add NAME URL", width, "", 2)
-    else
-        row_text.composeTextRow(alloc, "or /mcp add NAME -- COMMAND", width, "", 11);
+    if (p.rows.len == 0) return menu_frame.composeMessageRow(
+        alloc,
+        if (index == 1) "no MCP servers." else "add one with /mcp add NAME URL or /mcp add NAME -- COMMAND.",
+        width,
+    );
     const body = row_count - 1 - @as(u16, @intFromBool(has_note));
-    if (rows.len == 0) {
-        const none = try arena.print("No server matches \"{s}\"", .{p.filter});
-        return row_text.composeTextRow(alloc, none, width, ui_render.dim_style, 2);
-    }
+    if (rows.len == 0) return if (index == 1) menu_frame.composeMessageRow(alloc, "no matching servers.", width) else .empty;
     const selected = p.state.selectedIndex(rows) orelse 0;
     // The window keeps the selection in view.
     const selected_line = lineOfRow(view, selected);
@@ -221,7 +229,7 @@ fn listRow(alloc: Allocator, arena: Allocator, p: Projection, index: u16, width:
         const heading = headingLines(view);
         if (line >= first and line < first + heading) {
             if (line + 1 < first + heading) return .empty;
-            return title(alloc, "Needs attention", try arena.print("{d}", .{rows.len - first}), width);
+            return listHeading(alloc, "Needs attention", width);
         }
         const i = if (line > first) line - heading else line;
         return serverListRow(alloc, arena, rows[i], i == selected, width);
@@ -236,27 +244,18 @@ fn serverListRow(alloc: Allocator, arena: Allocator, r: menu.Row, selected: bool
     const source_col = status_col + 22 + 2;
     var row: Row = .empty;
     errdefer row.deinit(alloc);
-    // Like fx's other pickers: dim rows, the selected one bright.
+    // Like fx's other menus: gray rows, the selected one bright, no marker.
     try row.appendSlice(alloc, if (selected) ui_render.selected_completion_style else ui_render.dim_style);
-    try row.appendSlice(alloc, if (selected) "› " else "  ");
+    try row.appendSlice(alloc, "  ");
     try row_text.appendTerminalSafeSingleLine(alloc, &row, r.status.name, name_width);
-    try row.appendSlice(alloc, ui_render.reset_style);
     try row_text.appendSpacesToColumn(alloc, &row, status_col);
-    const needs_you = r.status.needs_login or switch (r.status.state) {
-        .failed, .retrying, .waiting_for_approval, .missing_env, .invalid_env => true,
-        else => false,
-    };
-    // What needs the user stays bright so it stands out among dim rows.
-    try row.appendSlice(alloc, if (needs_you) ui_render.hint_style else ui_render.dim_style);
     const status_width = if (show_source) 22 else @as(usize, width) -| status_col;
     try row_text.appendTerminalSafeSingleLine(alloc, &row, try verbs.statusText(arena, runState(r.status)), status_width);
-    try row.appendSlice(alloc, ui_render.reset_style);
     if (show_source) {
         try row_text.appendSpacesToColumn(alloc, &row, source_col);
-        try row.appendSlice(alloc, ui_render.dim_style);
         try row.appendSlice(alloc, if (r.status.source == .workspace) "project" else "profile");
-        try row.appendSlice(alloc, ui_render.reset_style);
     }
+    try row.appendSlice(alloc, ui_render.reset_style);
     return row;
 }
 
@@ -292,10 +291,11 @@ fn serverLine(alloc: Allocator, arena: Allocator, p: Projection, r: menu.Row, l:
     const at = line - l.lead;
     if (at < cs.len) {
         const selected = p.state.cursor == at;
+        const style = if (selected) ui_render.selected_completion_style else ui_render.dim_style;
         var row: Row = .empty;
         errdefer row.deinit(alloc);
-        try row.appendSlice(alloc, if (selected) ui_render.selected_completion_style else "");
-        try row.appendSlice(alloc, if (selected) "› " else "  ");
+        try row.appendSlice(alloc, style);
+        try row.appendSlice(alloc, "  ");
         // Remove and Reject ask on their own row, answers included: the
         // chosen one is bright, and ← → move between them.
         if (asksInPlace(p) and p.state.confirm.? == cs[at]) {
@@ -314,14 +314,12 @@ fn serverLine(alloc: Allocator, arena: Allocator, p: Projection, r: menu.Row, l:
             return row;
         }
         try row.appendSlice(alloc, cs[at].label());
-        try row.appendSlice(alloc, ui_render.reset_style);
         if (width >= 56) {
             try row_text.appendSpacesToColumn(alloc, &row, 16);
-            try row.appendSlice(alloc, ui_render.dim_style);
             const command = try arena.print("/mcp {s} {s}", .{ cs[at].verb(), r.status.name });
             try row_text.appendTerminalSafeSingleLine(alloc, &row, command, @as(usize, width) -| 16);
-            try row.appendSlice(alloc, ui_render.reset_style);
         }
+        try row.appendSlice(alloc, ui_render.reset_style);
         return row;
     }
     const after = at - cs.len;
@@ -329,7 +327,7 @@ fn serverLine(alloc: Allocator, arena: Allocator, p: Projection, r: menu.Row, l:
     if (after == 1) {
         if (p.waitingAddress(r)) |url| {
             if (headingLinks(url, width)) return signInLinkRow(alloc, url, width);
-            return row_text.composeTextRow(alloc, "Waiting for the browser. Didn't open? Go to:", width, ui_render.dim_style, 2);
+            return menu_frame.composeMessageRow(alloc, "Waiting for the browser. Didn't open? Go to:", width);
         }
     }
     if (after >= 2 and after < 2 + l.waiting) {
@@ -354,23 +352,21 @@ fn serverLine(alloc: Allocator, arena: Allocator, p: Projection, r: menu.Row, l:
     }
     // From Log in until the address comes, the requests before it can take seconds.
     if (after == 1 and r.status.signing_in and menu.toolsFor(r, p.tools) != .ready)
-        return row_text.composeTextRow(alloc, "Signing in…", width, ui_render.dim_style, 2);
+        return menu_frame.composeMessageRow(alloc, "Signing in…", width);
     if (after == 1) {
-        const heading: []const u8 = switch (menu.toolsFor(r, p.tools)) {
-            .loading => "Loading tools…",
-            .needs_login => "Its tools show here once you log in.",
-            .needs_approval => "Its tools show here once you approve it.",
-            .failed => |reason| try arena.print("Its tools couldn't load: {s}", .{reason}),
+        const message: []const u8 = switch (menu.toolsFor(r, p.tools)) {
+            .loading => "loading tools…",
+            .needs_login => "its tools show here once you log in.",
+            .needs_approval => "its tools show here once you approve it.",
+            .failed => |reason| try arena.print("its tools couldn't load: {s}", .{reason}),
             .ready => |t| if (t.len == 0)
-                "It has no tools."
-            else if (p.filter.len == 0)
-                try arena.print("Tools {d}", .{t.len})
+                "it has no tools."
             else if (l.tools == 0)
-                "No tools match."
+                "no matching tools."
             else
-                try arena.print("Tools {d} of {d}", .{ l.tools, t.len }),
+                return listHeading(alloc, "Tools", width),
         };
-        return row_text.composeTextRow(alloc, heading, width, ui_render.dim_style, 2);
+        return menu_frame.composeMessageRow(alloc, message, width);
     }
     const tools = switch (p.tools) {
         .ready => |t| t,
@@ -381,12 +377,10 @@ fn serverLine(alloc: Allocator, arena: Allocator, p: Projection, r: menu.Row, l:
     const selected = p.state.cursor == cs.len + ti;
     var row: Row = .empty;
     errdefer row.deinit(alloc);
-    try row.appendSlice(alloc, if (selected) ui_render.selected_completion_style else "");
-    try row.appendSlice(alloc, if (selected) "› " else "  ");
+    try row.appendSlice(alloc, if (selected) ui_render.selected_completion_style else ui_render.dim_style);
+    try row.appendSlice(alloc, "  ");
     try row_text.appendTerminalSafeSingleLine(alloc, &row, tool.name, 20);
-    try row.appendSlice(alloc, ui_render.reset_style);
     try row_text.appendSpacesToColumn(alloc, &row, 24);
-    try row.appendSlice(alloc, ui_render.dim_style);
     try row_text.appendTerminalSafeSingleLine(alloc, &row, tool.description, @as(usize, width) -| 24);
     try row.appendSlice(alloc, ui_render.reset_style);
     return row;
@@ -394,7 +388,7 @@ fn serverLine(alloc: Allocator, arena: Allocator, p: Projection, r: menu.Row, l:
 
 fn serverRow(alloc: Allocator, arena: Allocator, shown: Projection, index: u16, width: u16, row_count: u16) !Row {
     const r = shown.openRow() orelse return .empty;
-    if (index == 0) return title(alloc, r.status.name, "", width);
+    if (index == 0) return title(alloc, r.status.name, width);
     const l = shown.screenLayout(r, width);
     // A filter typed since the last key can leave fewer items than the
     // selection's place; draw it on the last one left.
@@ -405,7 +399,7 @@ fn serverRow(alloc: Allocator, arena: Allocator, shown: Projection, index: u16, 
     const v = scrolled(p.state, l, window);
     const slot: usize = index - 1;
     if (slot < v.lines) return serverLine(alloc, arena, p, r, l, v.top + slot, width);
-    if (slot == v.lines and v.below > 0) return countRow(alloc, arena, v.below, "more below", width);
+    if (slot == v.lines and v.below > 0) return menu_frame.composeMessageRow(alloc, try arena.print("↓ {d} more", .{v.below}), width);
     return .empty;
 }
 
@@ -425,10 +419,6 @@ fn scrolled(state: menu.State, l: menu.Layout, window: usize) Scrolled {
     if (top + lines < l.lines()) lines -= 1;
     lines = @min(lines, l.lines() - top);
     return .{ .top = top, .lines = lines, .below = l.lines() - top - lines };
-}
-
-fn countRow(alloc: Allocator, arena: Allocator, n: usize, where: []const u8, width: u16) !Row {
-    return row_text.composeTextRow(alloc, try arena.print("{d} {s}", .{ n, where }), width, ui_render.dim_style, 2);
 }
 
 const ConfirmLine = struct { text: []const u8, style: enum { question, detail, target } };
@@ -484,7 +474,7 @@ fn confirmLines(p: Projection, r: menu.Row, width: u16, out: *Confirm) []const C
 fn confirmRow(alloc: Allocator, arena: Allocator, p: Projection, index: u16, width: u16) !Row {
     const r = p.openRow() orelse return .empty;
     // The confirmation hides the server's facts, so its title keeps the status.
-    if (index == 0) return title(alloc, r.status.name, try statusFact(arena, r), width);
+    if (index == 0) return title(alloc, try arena.print("{s} · {s}", .{ r.status.name, try statusFact(arena, r) }), width);
     var confirm: Confirm = undefined;
     const lines = confirmLines(p, r, width, &confirm);
     if (index - 1 >= lines.len) return .empty;
@@ -507,12 +497,18 @@ fn asksInPlace(p: Projection) bool {
 /// fx's hint line for where the menu is, widest first.
 pub fn hintVariants(p: Projection) []const []const u8 {
     return switch (p.state.screen) {
-        .list => if (p.rows.len == 0) &.{"esc close"} else &.{ "↑↓ navigate     enter open     esc close", "↑↓ move  enter open  esc", "enter open  esc close", "enter esc" },
+        .list => if (shownServerCount(p) == 0) &.{"esc close"} else &.{ "↑↓ navigate     enter open     esc close", "↑↓ move  enter open  esc", "enter open  esc close", "enter esc" },
         // A question asked in place leaves the server's hint line as it was;
         // the row shows its answers.
         .confirm => if (asksInPlace(p)) serverHints(p) else &.{ "enter confirm     esc cancel", "enter confirm  esc cancel", "enter esc" },
         .server => serverHints(p),
     };
+}
+
+/// The servers the list shows after the composer's filter.
+fn shownServerCount(p: Projection) usize {
+    var buf: [256]menu.Row = undefined;
+    return menu.viewOf(&p.state, p.rows, p.filter, p.tools, &buf).rows.len;
 }
 
 fn serverHints(p: Projection) []const []const u8 {
@@ -594,12 +590,13 @@ test "the list is fx's picker: a title, rows with status and source, and a filte
     const text = try render(p, 88);
     defer testing.allocator.free(text);
     // The servers that work come first; the ones that need the user follow
-    // under their own heading.
+    // under their own heading. A filter keeps the list's height.
     try testing.expectEqualStrings(
-        \\  MCP servers  3
-        \\› context7                ready, 2 tools          profile
+        \\MCP servers
         \\
-        \\  Needs attention  2
+        \\  context7                ready, 2 tools          profile
+        \\
+        \\  Needs attention
         \\  docs                    waiting for approval    project
         \\  linear                  needs login             profile
         \\
@@ -609,9 +606,13 @@ test "the list is fx's picker: a title, rows with status and source, and a filte
     const filtered = try render(p, 88);
     defer testing.allocator.free(filtered);
     try testing.expectEqualStrings(
-        \\  MCP servers  1 of 3
-        \\  Needs attention  1
-        \\› linear                  needs login             profile
+        \\MCP servers
+        \\
+        \\  Needs attention
+        \\  linear                  needs login             profile
+        \\
+        \\
+        \\
         \\
     , filtered);
 
@@ -620,10 +621,11 @@ test "the list is fx's picker: a title, rows with status and source, and a filte
     const narrow = try render(p, 48);
     defer testing.allocator.free(narrow);
     try testing.expectEqualStrings(
-        \\  MCP servers  3
-        \\› context7      ready, 2 tools
+        \\MCP servers
         \\
-        \\  Needs attention  2
+        \\  context7      ready, 2 tools
+        \\
+        \\  Needs attention
         \\  docs          waiting for approval
         \\  linear        needs login
         \\  1 config note: /mcp list shows it
@@ -648,8 +650,8 @@ test "a long list scrolls to a selection below the attention heading" {
     try testing.expectEqual(max_inline_rows, menuRowCount(p, 88, max_inline_rows));
     const text = try render(p, 88);
     defer testing.allocator.free(text);
-    try testing.expect(std.mem.find(u8, text, "  Needs attention  6\n") != null);
-    try testing.expect(std.mem.endsWith(u8, text, "› srv13                   needs login             profile\n"));
+    try testing.expect(std.mem.find(u8, text, "  Needs attention\n") != null);
+    try testing.expect(std.mem.endsWith(u8, text, "  srv13                   needs login             profile\n"));
 }
 
 test "the list says how a server runs; its login shows on its screen" {
@@ -661,8 +663,9 @@ test "the list says how a server runs; its login shows on its screen" {
     const text = try render(p, 88);
     defer testing.allocator.free(text);
     try testing.expectEqualStrings(
-        \\  MCP servers  1
-        \\› plain                   not started             profile
+        \\MCP servers
+        \\
+        \\  plain                   not started             profile
         \\
     , text);
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
@@ -687,16 +690,17 @@ test "a server's screen: facts, choices with their commands, then tools" {
     const text = try render(p, 88);
     defer testing.allocator.free(text);
     try testing.expectEqualStrings(
-        \\  github
+        \\github
+        \\
         \\  http      https://api.githubcopilot.com/mcp/
         \\  file      ~/.fx/mcp.json
         \\  status    ready
         \\  protocol  2025-11-25
         \\
-        \\› Log out       /mcp logout github
+        \\  Log out       /mcp logout github
         \\  Remove        /mcp remove github
         \\
-        \\  Tools 2
+        \\  Tools
         \\  create_issue          Create a new issue.
         \\  search_code           Search for code.
         \\
@@ -721,8 +725,9 @@ test "a long tool list scrolls with the selection and counts what's below" {
     defer testing.allocator.free(text);
     // What scrolled off the top isn't counted; what's below is.
     try testing.expect(std.mem.find(u8, text, "above\n") == null);
-    try testing.expect(std.mem.find(u8, text, "more below\n") != null);
-    try testing.expect(std.mem.find(u8, text, "› tool11") != null);
+    try testing.expect(std.mem.find(u8, text, "  ↓ ") != null);
+    try testing.expect(std.mem.find(u8, text, " more\n") != null);
+    try testing.expect(std.mem.find(u8, text, "  tool11") != null);
     try testing.expectEqual(@as(u16, max_inline_rows), menuRowCount(p, 60, max_inline_rows));
 }
 
@@ -739,7 +744,7 @@ test "a confirmation names its target, and an approval shows everything it trust
     const text = try render(p, 48);
     defer testing.allocator.free(text);
     try testing.expectEqualStrings(
-        \\  docs  waiting for approval
+        \\docs · waiting for approval
         \\
         \\  Approve docs for this project? It runs:
         \\    node ./scripts/docs-server.js --root .
@@ -766,10 +771,10 @@ test "Remove asks on its own row, at the same size" {
     // the server screen's.
     const text = try render(p, 88);
     defer testing.allocator.free(text);
-    try testing.expect(std.mem.find(u8, text, "› Remove github and its login from ~/.fx/mcp.json?   yes  no\n") != null);
+    try testing.expect(std.mem.find(u8, text, "  Remove github and its login from ~/.fx/mcp.json?   yes  no\n") != null);
     try testing.expect(std.mem.find(u8, text, "  Log out       /mcp logout github\n") != null);
     try testing.expectEqualStrings("↑↓ navigate     enter run     esc back", hintVariants(p)[0]);
-    var asked = try composeRow(testing.allocator, p, 6, 88, menuRowCount(p, 88, 40));
+    var asked = try composeRow(testing.allocator, p, 7, 88, menuRowCount(p, 88, 40));
     defer asked.deinit(testing.allocator);
     const answers = try testing.allocator.print("{s}yes{s}  {s}no{s}", .{ ui_render.selected_completion_style, ui_render.reset_style, ui_render.dim_style, ui_render.reset_style });
     defer testing.allocator.free(answers);
@@ -781,7 +786,7 @@ test "Remove asks on its own row, at the same size" {
     menu.open(&odd.state);
     _ = menu.press(&odd.state, .{ .rows = &odd_rows }, .enter);
     _ = menu.press(&odd.state, .{ .rows = &odd_rows, .open = odd_rows[0], .layout = odd.layout(odd_rows[0]) }, .enter);
-    var row = try composeRow(testing.allocator, odd, 5, 88, menuRowCount(odd, 88, 40));
+    var row = try composeRow(testing.allocator, odd, 6, 88, menuRowCount(odd, 88, 40));
     defer row.deinit(testing.allocator);
     try testing.expect(std.mem.find(u8, row.items, "Remove x") != null);
     try testing.expect(std.mem.find(u8, row.items, "\x1b[2J") == null);
@@ -798,13 +803,13 @@ test "a sign-in that waits links its address in one line, like the transcript" {
     const text = try render(p, 80);
     defer testing.allocator.free(text);
     try testing.expect(std.mem.find(u8, text, "  Waiting for the browser. Didn't open? Open the sign-in page.\n") != null);
-    try testing.expect(std.mem.find(u8, text, "Its tools show here once you log in.") == null);
+    try testing.expect(std.mem.find(u8, text, "its tools show here once you log in.") == null);
     try testing.expect(std.mem.find(u8, text, "https://linear.app/oauth") == null);
-    // Title, three facts and a blank, two choices, a blank and the heading:
-    // the address takes no lines of its own.
-    try testing.expectEqual(@as(u16, 9), menuRowCount(p, 80, 40));
+    // Title and its blank, three facts and a blank, two choices, a blank and
+    // the heading: the address takes no lines of its own.
+    try testing.expectEqual(@as(u16, 10), menuRowCount(p, 80, 40));
     p.sign_in_url = null;
-    try testing.expectEqual(@as(u16, 9), menuRowCount(p, 80, 40));
+    try testing.expectEqual(@as(u16, 10), menuRowCount(p, 80, 40));
     p.sign_in_url = url;
 
     // The label links the whole address; narrower screens drop the lead.
@@ -915,12 +920,13 @@ test "a login under way says so until its address comes" {
     const text = try render(p, 80);
     defer testing.allocator.free(text);
     try testing.expectEqualStrings(
-        \\  linear
+        \\linear
+        \\
         \\  http      https://mcp.linear.app/mcp
         \\  file      ~/.fx/mcp.json
         \\  status    needs login
         \\
-        \\› Log in        /mcp login linear
+        \\  Log in        /mcp login linear
         \\  Remove        /mcp remove linear
         \\
         \\  Signing in…
@@ -942,7 +948,7 @@ test "a login under way says so until its address comes" {
     _ = menu.press(&gh.state, .{ .rows = &gh_rows }, .enter);
     const ready = try render(gh, 80);
     defer testing.allocator.free(ready);
-    try testing.expect(std.mem.find(u8, ready, "It has no tools.") != null);
+    try testing.expect(std.mem.find(u8, ready, "it has no tools.") != null);
     try testing.expect(std.mem.find(u8, ready, "Signing in…") == null);
 }
 
@@ -968,9 +974,10 @@ test "no servers points to /mcp add" {
     const text = try render(p, 80);
     defer testing.allocator.free(text);
     try testing.expectEqualStrings(
-        \\  MCP servers  none yet
-        \\  Add one with /mcp add NAME URL
-        \\           or /mcp add NAME -- COMMAND
+        \\MCP servers
+        \\
+        \\  no MCP servers.
+        \\  add one with /mcp add NAME URL or /mcp add NAME -- COMMAND.
         \\
     , text);
     try testing.expectEqualStrings("esc close", hintVariants(p)[0]);
@@ -987,15 +994,16 @@ test "a server that needs a login says so, once" {
     const text = try render(p, 80);
     defer testing.allocator.free(text);
     try testing.expectEqualStrings(
-        \\  linear
+        \\linear
+        \\
         \\  http      https://mcp.linear.app/mcp
         \\  file      ~/.fx/mcp.json
         \\  status    needs login
         \\
-        \\› Log in        /mcp login linear
+        \\  Log in        /mcp login linear
         \\  Remove        /mcp remove linear
         \\
-        \\  Its tools show here once you log in.
+        \\  its tools show here once you log in.
         \\
     , text);
 }

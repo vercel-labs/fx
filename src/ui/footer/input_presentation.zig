@@ -657,16 +657,23 @@ pub fn dangerStatusText(
     return "";
 }
 
-pub fn composeSkillsMenuHintRow(alloc: Allocator, width: u16, ctrl_c_pending: bool) !std.ArrayList(u8) {
-    return composeCatalogMenuHintRow(alloc, width, ctrl_c_pending, .source);
+/// What a catalog menu can do right now, so its hint names only keys that
+/// act: moving and choosing need items, and tab needs another tab to go to.
+pub const CatalogHintState = struct {
+    has_items: bool = true,
+    can_tab: bool = true,
+};
+
+pub fn composeSkillsMenuHintRow(alloc: Allocator, width: u16, ctrl_c_pending: bool, state: CatalogHintState) !std.ArrayList(u8) {
+    return composeCatalogMenuHintRow(alloc, width, ctrl_c_pending, .source, state);
 }
 
-pub fn composeModelsMenuHintRow(alloc: Allocator, width: u16, ctrl_c_pending: bool) !std.ArrayList(u8) {
-    return composeCatalogMenuHintRow(alloc, width, ctrl_c_pending, .provider);
+pub fn composeModelsMenuHintRow(alloc: Allocator, width: u16, ctrl_c_pending: bool, state: CatalogHintState) !std.ArrayList(u8) {
+    return composeCatalogMenuHintRow(alloc, width, ctrl_c_pending, .provider, state);
 }
 
 pub fn composeResumeMenuHintRow(alloc: Allocator, width: u16, ctrl_c_pending: bool) !std.ArrayList(u8) {
-    return composeCatalogMenuHintRow(alloc, width, ctrl_c_pending, .scope);
+    return composeCatalogMenuHintRow(alloc, width, ctrl_c_pending, .scope, .{});
 }
 
 /// fx's hint line: the widest of `variants` that fits, or the warning that
@@ -802,35 +809,65 @@ const CatalogTabKind = enum {
     scope,
 };
 
-fn composeCatalogMenuHintRow(alloc: Allocator, width: u16, ctrl_c_pending: bool, tab_kind: CatalogTabKind) !std.ArrayList(u8) {
-    const source_variants = [_][]const u8{
-        "↑↓ navigate     tab source     enter use     esc close",
-        "↑↓ navigate  tab source  enter use  esc close",
-        "↑↓ move  tab source  enter  esc",
-        "enter use  esc close",
-        "enter esc",
+fn composeCatalogMenuHintRow(
+    alloc: Allocator,
+    width: u16,
+    ctrl_c_pending: bool,
+    tab_kind: CatalogTabKind,
+    state: CatalogHintState,
+) !std.ArrayList(u8) {
+    const variants: []const []const u8 = if (!state.has_items and !state.can_tab)
+        &.{ "esc close", "esc" }
+    else if (!state.has_items) switch (tab_kind) {
+        .source => &.{ "tab source     esc close", "tab source  esc", "tab  esc" },
+        .provider => &.{ "tab provider     esc close", "tab provider  esc", "tab  esc" },
+        .scope => &.{ "tab scope     esc close", "tab scope  esc", "tab  esc" },
+    } else if (!state.can_tab) switch (tab_kind) {
+        .source, .provider => &catalog_use_hint_variants,
+        .scope => &catalog_resume_hint_variants,
+    } else switch (tab_kind) {
+        .source => &catalog_source_hint_variants,
+        .provider => &catalog_provider_hint_variants,
+        .scope => &catalog_scope_hint_variants,
     };
-    const provider_variants = [_][]const u8{
-        "↑↓ navigate     tab provider     enter use     esc close",
-        "↑↓ navigate  tab provider  enter use  esc close",
-        "↑↓ move  tab provider  enter  esc",
-        "enter use  esc close",
-        "enter esc",
-    };
-    const scope_variants = [_][]const u8{
-        "↑↓ navigate     tab scope     enter resume     esc close",
-        "↑↓ navigate  tab scope  enter resume  esc close",
-        "↑↓ move  tab scope  enter  esc",
-        "enter resume  esc close",
-        "enter esc",
-    };
-    const variants = switch (tab_kind) {
-        .source => source_variants,
-        .provider => provider_variants,
-        .scope => scope_variants,
-    };
-    return composeVariantHintRow(alloc, width, ctrl_c_pending, &variants);
+    return composeVariantHintRow(alloc, width, ctrl_c_pending, variants);
 }
+
+const catalog_source_hint_variants = [_][]const u8{
+    "↑↓ navigate     tab source     enter use     esc close",
+    "↑↓ navigate  tab source  enter use  esc close",
+    "↑↓ move  tab source  enter  esc",
+    "enter use  esc close",
+    "enter esc",
+};
+const catalog_provider_hint_variants = [_][]const u8{
+    "↑↓ navigate     tab provider     enter use     esc close",
+    "↑↓ navigate  tab provider  enter use  esc close",
+    "↑↓ move  tab provider  enter  esc",
+    "enter use  esc close",
+    "enter esc",
+};
+const catalog_scope_hint_variants = [_][]const u8{
+    "↑↓ navigate     tab scope     enter resume     esc close",
+    "↑↓ navigate  tab scope  enter resume  esc close",
+    "↑↓ move  tab scope  enter  esc",
+    "enter resume  esc close",
+    "enter esc",
+};
+const catalog_use_hint_variants = [_][]const u8{
+    "↑↓ navigate     enter use     esc close",
+    "↑↓ navigate  enter use  esc close",
+    "↑↓ move  enter  esc",
+    "enter use  esc close",
+    "enter esc",
+};
+const catalog_resume_hint_variants = [_][]const u8{
+    "↑↓ navigate     enter resume     esc close",
+    "↑↓ navigate  enter resume  esc close",
+    "↑↓ move  enter  esc",
+    "enter resume  esc close",
+    "enter esc",
+};
 
 const slash_menu_hint_variants = [_][]const u8{
     "↑↓ navigate     enter use     esc close",

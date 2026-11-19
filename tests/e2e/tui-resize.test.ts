@@ -37,6 +37,7 @@ import {
   isDividerRow,
   isInputRow,
   type FooterBlock,
+  catalogMenuItemCount,
 } from "./tui-render-assertions";
 import { readTapeFrames, stdoutFrames } from "./render-lab/tape";
 import { logLines, onlySessionId, sessionDir } from "./saved-sessions";
@@ -627,7 +628,7 @@ async function waitForSkillsMenuGrid(
   while (Date.now() < deadline) {
     last = await s.capturePaneGrid();
     const text = last.join("\n");
-    if (text.includes(`Skills ${count}`) && findInlineSkillsPicker(last) !== null) {
+    if (catalogMenuItemCount(last, "skills") === count && findInlineSkillsPicker(last) !== null) {
       return last;
     }
     await new Promise((resolve) => setTimeout(resolve, 100));
@@ -643,12 +644,9 @@ function expectSkillsMenuGrid(
   names: string[],
 ): void {
   const text = grid.join("\n");
-  expect(text).toContain(`Skills ${count}`);
-  expect(text).toContain("[All]");
-  expect(text).toContain("fx");
-  expect(text).not.toContain("[Fx]");
-  expect(text).toContain("Workspace");
-  expect(text).toContain("Codex");
+  expect(catalogMenuItemCount(grid, "skills")).toBe(count);
+  // The title shows only the active source; Tab moves through the rest.
+  expect(text).toContain("skills   < All >");
   expect(text).toContain("fx · Global");
   expect(names.some((name) => text.includes(name))).toBe(true);
   expect(text).not.toContain("Visible skills (");
@@ -1069,7 +1067,7 @@ function findFooter(grid: string[]): FooterBlock | null {
 function findInlineSkillsPicker(
   grid: string[],
 ): { input: number; topDivider: number; header: number; bottomDivider: number; hint: number } | null {
-  const header = grid.findIndex((line) => line.includes("Skills "));
+  const header = grid.findIndex((line) => /^skills\s/.test(line));
   if (header <= 1 || !isDividerRow(grid[header - 1]!)) return null;
   const input = header - 2;
   if (!isInputRow(grid[input]!)) return null;
@@ -1170,7 +1168,7 @@ async function runLargeSkillResizeAttempt(attempt: number): Promise<string> {
     expect(historyLimit).toBeGreaterThanOrEqual(MINIMUM_RESIZE_HISTORY_LINES);
     await s.waitForComposer(10_000);
 
-    const menuHeading = `Skills ${LARGE_SKILL_COUNT}`;
+    const menuHeading = "skills   < All >";
     await s.sendText("/skills list");
     const beforeShrinkGrid = await waitForSkillsMenuGrid(
       s,

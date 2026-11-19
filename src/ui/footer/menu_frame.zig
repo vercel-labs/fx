@@ -168,12 +168,34 @@ fn rowIndent(budget: usize) usize {
 }
 
 fn appendTitle(alloc: Allocator, row: *std.ArrayList(u8), spec: Spec, width: u16) !void {
+    try appendTitleText(alloc, row, spec.title, spec.active_tab, width);
+}
+
+/// A menu title row on its own, for menus that lay out their list
+/// themselves. The caller owns the returned list.
+pub fn composeTitleRow(alloc: Allocator, title: []const u8, active_tab: ?[]const u8, width: u16) !std.ArrayList(u8) {
+    var row: std.ArrayList(u8) = .empty;
+    errdefer row.deinit(alloc);
+    if (width > 0) try appendTitleText(alloc, &row, title, active_tab, width);
+    return row;
+}
+
+/// A gray, indented message row, the frame's empty-state style, for menus
+/// that lay out their list themselves. The caller owns the returned list.
+pub fn composeMessageRow(alloc: Allocator, text: []const u8, width: u16) !std.ArrayList(u8) {
+    var row: std.ArrayList(u8) = .empty;
+    errdefer row.deinit(alloc);
+    if (width > 0) try appendDimLine(alloc, &row, text, width);
+    return row;
+}
+
+fn appendTitleText(alloc: Allocator, row: *std.ArrayList(u8), title: []const u8, active_tab: ?[]const u8, width: u16) !void {
     const budget = contentWidth(width);
     try row.appendSlice(alloc, ui_render.dim_style);
-    try row_text.appendTerminalSafeSingleLine(alloc, row, spec.title, budget);
+    try row_text.appendTerminalSafeSingleLine(alloc, row, title, budget);
     try row.appendSlice(alloc, ui_render.reset_style);
 
-    const tab = spec.active_tab orelse return;
+    const tab = active_tab orelse return;
     const used = display_width.visibleWidthIgnoringAnsi(row.items);
     // `< ` and ` >` around the tab name.
     const decoration = tab_gap.len + 4;

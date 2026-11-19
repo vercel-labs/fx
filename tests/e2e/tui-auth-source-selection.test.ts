@@ -3930,7 +3930,7 @@ for (const [provider, previousProvider] of [
           }
           await session.sendText("/model");
           const catalog = await session.waitForPane(
-            (pane) => pane.includes("Models") && pane.includes(model) && pane.includes(otherModel),
+            (pane) => /^models\s/m.test(pane) && pane.includes(model) && pane.includes(otherModel),
             10_000,
           );
           if (provider !== "gateway") expect(catalog).not.toContain(FAKE_GATEWAY_MODEL);
@@ -4121,7 +4121,7 @@ tmuxTest(
     await session.sendText("/model");
     const codexCatalog = await session.waitForPane(
       (pane) =>
-        pane.includes("Models") &&
+        /^models\s/m.test(pane) &&
         pane.includes("gpt-5.6-sol") &&
         pane.includes("gpt-5.4-mini") &&
         !pane
@@ -4130,7 +4130,7 @@ tmuxTest(
           .some((line) => line.includes("openai/gpt-5.6-sol")),
       TIMEOUT,
     );
-    expect(codexCatalog).toContain("[All]");
+    expect(codexCatalog).toContain("< All >");
     for (const vendor of ["Anthropic", "OpenAI", "xAI", "Z.AI", "Others"]) {
       expect(codexCatalog).not.toContain(vendor);
     }
@@ -6812,10 +6812,10 @@ tmuxTest(
       await session.waitForText("Switched to Grok subscription with grok-4.20.", TIMEOUT);
       await session.sendText("/model");
       const grokCatalog = await session.waitForPane(
-        (pane) => pane.includes("Models") && pane.includes("grok-4.20"),
+        (pane) => /^models\s/m.test(pane) && pane.includes("grok-4.20"),
         TIMEOUT,
       );
-      expect(grokCatalog).toContain("[All]");
+      expect(grokCatalog).toContain("< All >");
       for (const vendor of ["Anthropic", "OpenAI", "xAI", "Z.AI", "Others"]) {
         expect(grokCatalog).not.toContain(vendor);
       }
@@ -9537,7 +9537,7 @@ tmuxTest(
 
     await session.sendKeys("Escape");
     await session.waitForPane(
-      (pane) => !pane.includes("Models ") && !pane.includes("esc close"),
+      (pane) => !/^models\s/m.test(pane) && !pane.includes("esc close"),
       TIMEOUT,
     );
     await session.waitForComposer(TIMEOUT);
@@ -10068,10 +10068,10 @@ for (const scenario of [
 
       await session.sendText("/model");
       const pane = await session.waitForPane(
-        (text) => text.includes("No models available.") && text.includes(scenario.status),
+        (text) => text.includes("no models.") && text.includes(scenario.status),
         TIMEOUT,
       );
-      expect(pane).toContain("No models available.");
+      expect(pane).toContain("no models.");
       expect(pane).toContain(scenario.status);
 
       expect(gateway.modelRequests).toHaveLength(scenario.authenticated ? 2 : 1);

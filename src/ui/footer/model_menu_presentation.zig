@@ -7,6 +7,7 @@ const token_pass = @import("../../core/gateway/token_pass.zig");
 const vt_emulator = @import("../../core/terminal/engine.zig");
 const ui_render = @import("../render.zig");
 const render_input = @import("render_input.zig");
+const menu_frame = @import("menu_frame.zig");
 const row_text = @import("row_text.zig");
 
 const Allocator = std.mem.Allocator;
@@ -168,7 +169,21 @@ fn groupedFirstLine(window_start: usize, token_pass_rows: usize, match_count: us
 }
 
 pub fn menuRowCount(projection: ModelMenuProjection, _: u16, max_rows: u16) u16 {
-    return ModelMenuLayout.build(projection, max_rows).row_count;
+    return @max(ModelMenuLayout.build(projection, max_rows).row_count, stableRowCount(projection, max_rows));
+}
+
+/// The rows the menu holds for every model of the catalog, so typing a
+/// query never shrinks it under the composer.
+fn stableRowCount(projection: ModelMenuProjection, row_budget: u16) u16 {
+    if (row_budget <= header_rows + roomy_top_gap_rows) return 0;
+    const first_item_row = header_rows + roomy_top_gap_rows;
+    const item_budget = row_budget - first_item_row;
+    var unfiltered = projection;
+    unfiltered.query = "";
+    const headings: usize = if (tokenPassLeadCount(unfiltered, unfiltered.filteredItemCount()) != null) group_heading_rows else 0;
+    const body: u16 = @intCast(@min(projection.items.len + headings, item_budget, max_visible_items));
+    const show_status = loadedCatalogStatusText(projection.catalog_state) != null and item_budget - body >= status_gap_rows + 1;
+    return first_item_row + body + @intFromBool(show_status) * (status_gap_rows + 1);
 }
 
 pub fn visibleNavigationItemsForBudget(projection: ModelMenuProjection, row_budget: u16) u16 {
@@ -191,14 +206,14 @@ pub inline fn composeModelMenuRow(
         if (layout.state_row == row_index) return composeStateRow(alloc, projection, width);
         if (layout.status_row == row_index) {
             const text = loadedCatalogStatusText(projection.catalog_state) orelse return row;
-            return composeDimmedRow(alloc, text, width);
+            return menu_frame.composeMessageRow(alloc, text, width);
         }
         return row;
     }
     if (layout.status_row) |status_row| {
         if (row_index == status_row) {
             const text = loadedCatalogStatusText(projection.catalog_state) orelse return row;
-            return composeDimmedRow(alloc, text, width);
+            return menu_frame.composeMessageRow(alloc, text, width);
         }
     }
     if (row_index < layout.first_item_row) return row;
@@ -214,9 +229,9 @@ pub inline fn composeModelMenuRow(
     const item_row: u16, const display_index: usize = if (layout.token_pass_rows) |token_pass_rows| blk: {
         const line = groupedFirstLine(window_start, token_pass_rows, layout.match_count, layout.body_rows) + body_offset;
         switch (groupedLine(line, token_pass_rows)) {
-            .token_pass_heading => return composeGroupHeading(alloc, "Token Pass", token_pass_rows, width),
+            .token_pass_heading => return composeGroupHeading(alloc, "Token Pass", width),
             .gap => return row,
-            .others_heading => return composeGroupHeading(alloc, "All Models", layout.match_count - token_pass_rows, width),
+            .others_heading => return composeGroupHeading(alloc, "All Models", width),
             .item => |index| break :blk .{ 0, index },
         }
     } else .{ body_offset % layout.item_stride, window_start + body_offset / layout.item_stride };
@@ -235,49 +250,14 @@ pub inline fn composeModelMenuRow(
 }
 
 fn composeHeaderRow(alloc: Allocator, projection: ModelMenuProjection, width: u16) !std.ArrayList(u8) {
-    var row: std.ArrayList(u8) = .empty;
-    defer row.deinit(alloc);
-    try appendHeaderTitle(alloc, &row, projection.filteredItemCount());
-
     const tabs = ProviderTabs.build(projection.items);
-    const active_position = tabs.activePosition(projection.provider_index);
-    const active_index = tabs.indices[active_position];
-    const title_width = display_width.visibleWidthIgnoringAnsi(row.items);
-    if (title_width + 2 + providerTabWidth(active_index, active_index) > width) {
-        try row.appendSlice(alloc, "  ");
-        try appendProviderTabAt(alloc, &row, active_index, active_index);
-        return cloneClippedRow(alloc, row.items, width);
-    }
+    const active_index = tabs.indices[tabs.activePosition(projection.provider_index)];
+    return menu_frame.composeTitleRow(alloc, "models", providerTabLabel(active_index), width);
+}
 
-    var start = active_position;
-    var end = active_position + 1;
-    while (true) {
-        var expanded = false;
-        if (end < tabs.len and title_width + 2 + providerRangeWidth(tabs, start, end + 1, active_index) <= width) {
-            end += 1;
-            expanded = true;
-        }
-        if (start > 0 and title_width + 2 + providerRangeWidth(tabs, start - 1, end, active_index) <= width) {
-            start -= 1;
-            expanded = true;
-        }
-        if (!expanded) break;
-    }
-
-    try row.appendSlice(alloc, "  ");
-    if (start > 0) {
-        try appendProviderOverflowMarker(alloc, &row);
-        try row.appendSlice(alloc, "  ");
-    }
-    for (start..end) |position| {
-        if (position > start) try row.appendSlice(alloc, "  ");
-        try appendProviderTabAt(alloc, &row, tabs.indices[position], active_index);
-    }
-    if (end < tabs.len) {
-        try row.appendSlice(alloc, "  ");
-        try appendProviderOverflowMarker(alloc, &row);
-    }
-    return cloneClippedRow(alloc, row.items, width);
+/// Whether Tab can move the model menu to another provider.
+pub fn hasOtherProvider(projection: ModelMenuProjection) bool {
+    return ProviderTabs.build(projection.items).len > 1;
 }
 
 const ProviderTabs = struct {
@@ -303,37 +283,6 @@ const ProviderTabs = struct {
     }
 };
 
-fn appendHeaderTitle(alloc: Allocator, row: *std.ArrayList(u8), count: usize) !void {
-    try row.appendSlice(alloc, ui_render.selected_completion_style);
-    var buf: [48]u8 = undefined;
-    const title = std.mem.print(&buf, "Models {d}", .{count}) catch "Models";
-    try row.appendSlice(alloc, title);
-    try row.appendSlice(alloc, ui_render.reset_style);
-}
-
-fn appendProviderTab(alloc: Allocator, row: *std.ArrayList(u8), label: []const u8, active: bool) !void {
-    try row.appendSlice(alloc, if (active) ui_render.selected_completion_style else ui_render.dim_style);
-    if (active) try row.append(alloc, '[');
-    try row.appendSlice(alloc, label);
-    if (active) try row.append(alloc, ']');
-    try row.appendSlice(alloc, ui_render.reset_style);
-}
-
-fn appendProviderTabAt(
-    alloc: Allocator,
-    row: *std.ArrayList(u8),
-    index: usize,
-    active_index: usize,
-) !void {
-    try appendProviderTab(alloc, row, providerTabLabel(index), index == active_index);
-}
-
-fn appendProviderOverflowMarker(alloc: Allocator, row: *std.ArrayList(u8)) !void {
-    try row.appendSlice(alloc, ui_render.dim_style);
-    try row.appendSlice(alloc, "…");
-    try row.appendSlice(alloc, ui_render.reset_style);
-}
-
 fn providerTabLabel(index: usize) []const u8 {
     const filter: model_cache_runtime.ModelProviderFilter = @fromBackingInt(@intCast(index));
     return switch (filter) {
@@ -344,26 +293,6 @@ fn providerTabLabel(index: usize) []const u8 {
         .zai => "Z.AI",
         .others => "Others",
     };
-}
-
-fn providerTabWidth(index: usize, active_index: usize) usize {
-    const active_padding: usize = if (index == active_index) 2 else 0;
-    return display_width.visibleWidth(providerTabLabel(index)) + active_padding;
-}
-
-fn providerRangeWidth(
-    tabs: ProviderTabs,
-    start: usize,
-    end: usize,
-    active_index: usize,
-) usize {
-    var width: usize = if (start > 0) 3 else 0;
-    for (start..end) |position| {
-        if (position > start) width += 2;
-        width += providerTabWidth(tabs.indices[position], active_index);
-    }
-    if (end < tabs.len) width += 3;
-    return width;
 }
 
 /// The spaces between a model's id and its first fact, and between facts.
@@ -571,14 +500,13 @@ fn composeTitleRow(
 
     const id_budget = if (columns) |c| c.start - indent_width - fact_gap else @as(usize, width) -| indent_width;
     try row_text.appendSingleLineMiddleEllipsized(alloc, &row, item.id, id_budget);
-    if (selected) try row.appendSlice(alloc, ui_render.reset_style);
 
     if (cells.items.len > 0) {
         try row_text.appendSpacesToColumn(alloc, &row, columns.?.start);
-        try row.appendSlice(alloc, ui_render.dim_style);
+        try row.appendSlice(alloc, if (selected) ui_render.selected_completion_style else ui_render.dim_style);
         try row.appendSlice(alloc, cells.items);
-        try row.appendSlice(alloc, ui_render.reset_style);
     }
+    try row.appendSlice(alloc, ui_render.reset_style);
     return row;
 }
 
@@ -592,11 +520,11 @@ const token_pass_fact = "Token Pass";
 
 fn composeStateRow(alloc: Allocator, projection: ModelMenuProjection, width: u16) !std.ArrayList(u8) {
     const text = switch (projection.load_state) {
-        .loading => "Loading models…",
-        .failed => retryableFailureText(projection.catalog_state.failure) orelse "Unable to load models.",
-        .ready => if (projection.items.len == 0) "No models available." else "No models found.",
+        .loading => "loading models…",
+        .failed => retryableFailureText(projection.catalog_state.failure) orelse "unable to load models.",
+        .ready => if (projection.query.len > 0) "no matching models." else "no models.",
     };
-    return composeDimmedRow(alloc, text, width);
+    return menu_frame.composeMessageRow(alloc, text, width);
 }
 
 fn loadedCatalogStatusText(state: model_cache_runtime.ModelMenuCatalogState) ?[]const u8 {
@@ -641,31 +569,16 @@ fn retryableFailureText(failure: ?model_cache_runtime.ModelMenuCatalogState.Fail
     };
 }
 
-/// A group's heading in the list, styled like the headings in `/mcp` and
-/// always bold, whatever the theme's subtitle style is.
-fn composeGroupHeading(alloc: Allocator, name: []const u8, count: usize, width: u16) !std.ArrayList(u8) {
+/// A group's heading in the list: bold and bright at the rows' indent, with
+/// no count.
+fn composeGroupHeading(alloc: Allocator, name: []const u8, width: u16) !std.ArrayList(u8) {
     var text: std.ArrayList(u8) = .empty;
     defer text.deinit(alloc);
-    var count_buf: [24]u8 = undefined;
     if (width > 2) try text.appendSlice(alloc, "  ");
-    try text.appendSlice(alloc, ui_render.subtitle_style);
-    try text.appendSlice(alloc, ui_render.bold_style);
+    try text.appendSlice(alloc, ui_render.selected_completion_style);
     try text.appendSlice(alloc, name);
     try text.appendSlice(alloc, ui_render.reset_style);
-    try text.appendSlice(alloc, "  ");
-    try text.appendSlice(alloc, ui_render.dim_style);
-    try text.appendSlice(alloc, std.mem.print(&count_buf, "{d}", .{count}) catch "");
-    try text.appendSlice(alloc, ui_render.reset_style);
     return cloneClippedRow(alloc, text.items, width);
-}
-
-fn composeDimmedRow(alloc: Allocator, text: []const u8, width: u16) !std.ArrayList(u8) {
-    var row: std.ArrayList(u8) = .empty;
-    errdefer row.deinit(alloc);
-    try row.appendSlice(alloc, ui_render.dim_style);
-    try row_text.appendSingleLineEllipsized(alloc, &row, text, width);
-    try row.appendSlice(alloc, ui_render.reset_style);
-    return row;
 }
 
 fn cloneClippedRow(alloc: Allocator, text: []const u8, width: u16) !std.ArrayList(u8) {
@@ -710,9 +623,10 @@ test "model menu renders provider tabs and compact model facts" {
 
     var header = try composeModelMenuRow(alloc, projection, 0, 120, rows);
     defer header.deinit(alloc);
-    try std.testing.expect(std.mem.find(u8, header.items, "Models 2") != null);
-    try std.testing.expect(std.mem.find(u8, header.items, "[All]") != null);
-    try std.testing.expect(std.mem.find(u8, header.items, "Anthropic") != null);
+    try std.testing.expect(std.mem.find(u8, header.items, "models") != null);
+    try std.testing.expect(std.mem.find(u8, header.items, "Models 2") == null);
+    try std.testing.expect(std.mem.find(u8, header.items, "< All >") != null);
+    try std.testing.expect(std.mem.find(u8, header.items, "Anthropic") == null);
 
     var title = try composeModelMenuRow(alloc, projection, 2, 120, rows);
     defer title.deinit(alloc);
@@ -750,7 +664,7 @@ test "model menu keeps active provider visible and omits unknown metadata" {
     const rows = menuRowCount(projection, 42, 5);
     var header = try composeModelMenuRow(alloc, projection, 0, 42, rows);
     defer header.deinit(alloc);
-    try std.testing.expect(std.mem.find(u8, header.items, "[Others]") != null);
+    try std.testing.expect(std.mem.find(u8, header.items, "< Others >") != null);
     try std.testing.expect(display_width.visibleWidthIgnoringAnsi(header.items) <= 42);
 
     var title = try composeModelMenuRow(alloc, projection, 2, 24, rows);
@@ -792,12 +706,12 @@ test "model menu states and navigation budget stay bounded" {
     try std.testing.expectEqual(@as(u16, 3), rows);
     var state = try composeModelMenuRow(alloc, loading, 2, 80, rows);
     defer state.deinit(alloc);
-    try std.testing.expect(std.mem.find(u8, state.items, "Loading models…") != null);
+    try std.testing.expect(std.mem.find(u8, state.items, "loading models…") != null);
 
     const empty: ModelMenuProjection = .{ .active = true, .load_state = .ready };
     var empty_state = try composeModelMenuRow(alloc, empty, 2, 80, menuRowCount(empty, 80, 10));
     defer empty_state.deinit(alloc);
-    try std.testing.expect(std.mem.find(u8, empty_state.items, "No models available.") != null);
+    try std.testing.expect(std.mem.find(u8, empty_state.items, "no models.") != null);
 
     const failed: ModelMenuProjection = .{ .active = true, .load_state = .failed, .catalog_state = .{ .failure = .{ .category = .transport, .retryable = true } } };
     var failed_state = try composeModelMenuRow(alloc, failed, 2, 80, menuRowCount(failed, 80, 10));
@@ -829,7 +743,7 @@ test "empty model menu keeps catalog provenance below the empty state" {
 
     var state = try composeModelMenuRow(alloc, projection, 2, 80, rows);
     defer state.deinit(alloc);
-    try std.testing.expect(std.mem.find(u8, state.items, "No models available.") != null);
+    try std.testing.expect(std.mem.find(u8, state.items, "no models.") != null);
 
     var gap = try composeModelMenuRow(alloc, projection, 3, 80, rows);
     defer gap.deinit(alloc);
@@ -956,7 +870,7 @@ test "model menu status follows provenance and retryable failure precedence" {
     }
 }
 
-test "model menu header shows only vendor filters represented by the catalog" {
+test "model menu header shows only the active vendor filter" {
     const alloc = std.testing.allocator;
     const items = [_]model_cache_runtime.ModelMenuItem{
         .{ .id = @constCast("anthropic/claude"), .provider = "anthropic", .capabilities = .{} },
@@ -971,10 +885,10 @@ test "model menu header shows only vendor filters represented by the catalog" {
 
     var header = try composeModelMenuRow(alloc, projection, 0, 60, 3);
     defer header.deinit(alloc);
-    try std.testing.expect(std.mem.find(u8, header.items, "[All]") != null);
-    try std.testing.expect(std.mem.find(u8, header.items, "Anthropic") != null);
-    try std.testing.expect(std.mem.find(u8, header.items, "OpenAI") != null);
-    try std.testing.expect(std.mem.find(u8, header.items, "Others") != null);
+    try std.testing.expect(std.mem.find(u8, header.items, "< All >") != null);
+    try std.testing.expect(std.mem.find(u8, header.items, "Anthropic") == null);
+    try std.testing.expect(std.mem.find(u8, header.items, "OpenAI") == null);
+    try std.testing.expect(std.mem.find(u8, header.items, "Others") == null);
     try std.testing.expect(std.mem.find(u8, header.items, "xAI") == null);
     try std.testing.expect(std.mem.find(u8, header.items, "Z.AI") == null);
     try std.testing.expect(std.mem.find(u8, header.items, "…") == null);
@@ -996,7 +910,7 @@ test "model menu header hides redundant vendor filters for a single-vendor catal
 
     var header = try composeModelMenuRow(alloc, projection, 0, 120, 3);
     defer header.deinit(alloc);
-    try std.testing.expect(std.mem.find(u8, header.items, "[All]") != null);
+    try std.testing.expect(std.mem.find(u8, header.items, "< All >") != null);
     try std.testing.expect(std.mem.find(u8, header.items, "Anthropic") == null);
     try std.testing.expect(std.mem.find(u8, header.items, "OpenAI") == null);
     try std.testing.expect(std.mem.find(u8, header.items, "xAI") == null);
@@ -1377,16 +1291,17 @@ test "model menu groups Token Pass models under their own heading until a search
             try std.testing.expectEqual(@as(usize, 0), row.items.len);
         }
     }
-    for ([_]struct { row: u16, name: []const u8, count: []const u8 }{
-        .{ .row = 2, .name = ui_render.bold_style ++ "Token Pass", .count = "3" },
-        .{ .row = 7, .name = ui_render.bold_style ++ "All Models", .count = "10" },
+    // Headings are bold and bright at the rows' indent, with no count.
+    for ([_]struct { row: u16, name: []const u8 }{
+        .{ .row = 2, .name = "Token Pass" },
+        .{ .row = 7, .name = "All Models" },
     }) |heading| {
         var row = try composeModelMenuRow(alloc, projection, heading.row, 100, all_rows);
         defer row.deinit(alloc);
-        try std.testing.expect(std.mem.find(u8, row.items, heading.name) != null);
-        const count = try std.mem.concat(alloc, u8, &.{ ui_render.dim_style, heading.count, ui_render.reset_style });
-        defer alloc.free(count);
-        try std.testing.expect(std.mem.find(u8, row.items, count) != null);
+        const expected_heading = try std.mem.concat(alloc, u8, &.{ "  ", ui_render.selected_completion_style, heading.name, ui_render.reset_style });
+        defer alloc.free(expected_heading);
+        try std.testing.expect(std.mem.startsWith(u8, row.items, expected_heading));
+        try std.testing.expect(std.mem.find(u8, row.items, ui_render.dim_style) == null);
     }
 
     // A short menu keeps the same height and pages by the models it shows,
@@ -1401,11 +1316,12 @@ test "model menu groups Token Pass models under their own heading until a search
     try std.testing.expect(std.mem.find(u8, last.items, "acme/model-09") != null);
     try std.testing.expect(std.mem.find(u8, last.items, ui_render.selected_completion_style) != null);
 
-    // A search ranks models by match, so the list has no headings.
+    // A search ranks models by match, so the list has no headings, and the
+    // menu keeps the height it had before the search.
     projection.selected_index = 0;
     projection.query = "a";
     const searched_rows = menuRowCount(projection, 100, 40);
-    try std.testing.expectEqual(@as(u16, 2 + 13), searched_rows);
+    try std.testing.expectEqual(@as(u16, 2 + 13 + group_heading_rows), searched_rows);
     var first = try composeModelMenuRow(alloc, projection, 2, 100, searched_rows);
     defer first.deinit(alloc);
     try std.testing.expect(std.mem.find(u8, first.items, "/") != null);

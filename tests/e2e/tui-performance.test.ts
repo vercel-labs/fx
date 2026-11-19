@@ -42,7 +42,7 @@ const TIMEOUT = 60_000;
 const LOCAL_MENU_ACTIONS = [
   { name: "helpOpen", command: "/help", marker: "Commands " },
   { name: "settingsOpen", command: "/settings", marker: "Settings" },
-  { name: "modelOpen", command: "/model", marker: "Models " },
+  { name: "modelOpen", command: "/model", marker: "models" },
   { name: "resumeOpen", command: "/resume", marker: "Sessions " },
   { name: "mcpOpen", command: "/mcp", marker: "MCP servers" },
   { name: "usageOpen", command: "/usage", marker: "usage: API key" },
@@ -459,13 +459,13 @@ test.skipIf(!tmuxAvailable())(
       });
       await session.waitForComposer(TIMEOUT);
       await session.sendText("/skills");
-      await session.waitForText("Skills 289", TIMEOUT);
-      await closeSurface(session, "Skills ");
+      await session.waitForText("↓ 284 more", TIMEOUT);
+      await closeSurface(session, "skills   < All >");
 
       const newest = writeGenerationSkill(fixture.generationSkillPath, 999);
       sendOverlappingSkillCommands(session, newest);
       await session.waitForText(newest, TIMEOUT);
-      await session.waitForText("Skills 289", TIMEOUT);
+      await session.waitForText("↓ 284 more", TIMEOUT);
       expect(session.isAlive()).toBe(true);
       expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
     } finally {
@@ -550,8 +550,8 @@ test.skipIf(!tmuxAvailable())(
       });
       await active.waitForComposer(TIMEOUT);
       await active.sendText("/skills");
-      await active.waitForText("Skills 289", TIMEOUT);
-      await closeSurface(active, "Skills ");
+      await active.waitForText("↓ 284 more", TIMEOUT);
+      await closeSurface(active, "skills   < All >");
 
       writeFileSync(
         join(candidate, "SKILL.md"),
@@ -559,7 +559,7 @@ test.skipIf(!tmuxAvailable())(
       );
       await active.sendText("/skills");
       const refreshed = await active.waitForText("late-skill", TIMEOUT);
-      expect(refreshed).toContain("Skills 290");
+      expect(refreshed).toContain("↓ 285 more");
       expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
     } finally {
       await active?.kill();
@@ -614,12 +614,16 @@ test.skipIf(!tmuxAvailable())(
       await active.waitForComposer(TIMEOUT);
       active.sendLiteralImmediate("$global");
       await active.waitForText("global-skill", TIMEOUT);
-      await closeSurface(active, "Skills ");
+      await closeSurface(active, "skills   < All >");
 
       sendOverlappingSkillCommands(active, "global-skill");
       await active.waitForText("global-skill", 5_000);
-      await active.waitForText("Skills 290", 5_000);
-      await closeSurface(active, "Skills ");
+      await closeSurface(active, "skills   <");
+      // `/skills show` scrolls to its skill; from the top, the more row
+      // counts the whole catalog: 5 shown and 285 below.
+      await active.sendText("/skills");
+      await active.waitForText("↓ 285 more", 5_000);
+      await closeSurface(active, "skills   <");
 
       await active.sendText("Submit after canonical home refresh.");
       await active.waitForText("SYMLINKED_HOME_PROMPT_OK", TIMEOUT);
@@ -813,8 +817,8 @@ test.skipIf(!ENABLED || !tmuxAvailable())(
         const query = await measureAction(
           fixture.tapePath,
           () => session!.sendLiteralImmediate("needle"),
-          () => session!.waitForText("Skills 144", TIMEOUT),
-          "Skills 144",
+          () => session!.waitForText("↓ 139 more", TIMEOUT),
+          "↓ 139 more",
         );
         session.sendKeysImmediate(["Escape"]);
         await session.waitForComposer(TIMEOUT);
@@ -883,16 +887,16 @@ test.skipIf(!ENABLED || !tmuxAvailable())(
         const dollarOpen = await measureAction(
           fixture.tapePath,
           () => session!.sendLiteralImmediate("$"),
-          () => session!.waitForText("Skills 289", TIMEOUT),
-          "Skills 289",
+          () => session!.waitForText("↓ 284 more", TIMEOUT),
+          "↓ 284 more",
         );
         const dollarQuery = await measureAction(
           fixture.tapePath,
           () => session!.sendLiteralImmediate("needle"),
-          () => session!.waitForText("Skills 144", TIMEOUT),
-          "Skills 144",
+          () => session!.waitForText("↓ 139 more", TIMEOUT),
+          "↓ 139 more",
         );
-        await closeSurface(session, "Skills ");
+        await closeSurface(session, "skills   < All >");
         if (cycle >= WARMUPS) {
           appendMeasured(samples.dollarOpen, dollarOpen);
           appendMeasured(samples.dollarQuery, dollarQuery);
@@ -1103,7 +1107,7 @@ test.skipIf(!LIVE_ENABLED || !tmuxAvailable())(
       await session.waitForComposer(TIMEOUT);
 
       await session.sendText("/skills");
-      await session.waitForText("Skills 289", TIMEOUT);
+      await session.waitForText("↓ 284 more", TIMEOUT);
       session.sendKeysImmediate(["Escape"]);
       await session.waitForComposer(TIMEOUT);
 

@@ -5487,7 +5487,7 @@ test "core.app_render_runtime main skill menu origins share the inline footer" {
     app.shell.render_requests.request(.modal);
     try Runtime(CoordinatorTestApp).flushRequestedFrame(&app, (&app).agent());
     try std.testing.expect(!app.terminal.catalogMenuScreenActive());
-    try std.testing.expect(try coordinatorGridContains(app.shell.shadow_vt.?.*, "Skills 1"));
+    try std.testing.expect(try coordinatorGridContains(app.shell.shadow_vt.?.*, "skills   < All >"));
 
     const options = [_]types.QuestionOption{
         .{ .label = "Inspect repo state", .description = null },
@@ -5506,7 +5506,7 @@ test "core.app_render_runtime main skill menu origins share the inline footer" {
     app.shell.render_requests.request(.modal);
     try Runtime(CoordinatorTestApp).flushRequestedFrame(&app, (&app).agent());
     try std.testing.expect(!app.terminal.catalogMenuScreenActive());
-    try std.testing.expect(try coordinatorGridContains(app.shell.shadow_vt.?.*, "Skills 1"));
+    try std.testing.expect(try coordinatorGridContains(app.shell.shadow_vt.?.*, "skills   < All >"));
 
     try app.shell.writeTranscript(alloc, &app.metrics, "background transcript update\n", true);
     app.shell.render_requests.request(.transcript);
@@ -5986,8 +5986,8 @@ test "core.app_render_runtime inline model catalog survives modal preemption and
     try Runtime(CoordinatorTestApp).flushRequestedFrame(&app, (&app).agent());
 
     try std.testing.expect(!app.terminal.catalogMenuScreenActive());
-    try std.testing.expect(try coordinatorGridContains(app.shell.shadow_vt.?.*, "Models 0"));
-    try std.testing.expect(try coordinatorGridContains(app.shell.shadow_vt.?.*, "Loading models"));
+    try std.testing.expect(try coordinatorGridContains(app.shell.shadow_vt.?.*, "models   < All >"));
+    try std.testing.expect(try coordinatorGridContains(app.shell.shadow_vt.?.*, "loading models"));
     try std.testing.expect(try coordinatorGridContains(app.shell.shadow_vt.?.*, "model catalog transcript stays behind"));
 
     try std.testing.expect(try app.agent().approval_prompt.syncRequest(alloc, .{
@@ -6003,7 +6003,7 @@ test "core.app_render_runtime inline model catalog survives modal preemption and
     app.shell.render_requests.request(.modal);
     try Runtime(CoordinatorTestApp).flushRequestedFrame(&app, (&app).agent());
     try std.testing.expect(!app.terminal.catalogMenuScreenActive());
-    try std.testing.expect(try coordinatorGridContains(app.shell.shadow_vt.?.*, "Loading models"));
+    try std.testing.expect(try coordinatorGridContains(app.shell.shadow_vt.?.*, "loading models"));
 
     app.model_cache.closeMenu();
     app.shell.render_requests.request(.footer);
@@ -6101,7 +6101,7 @@ test "core.app_render_runtime file approval returns to the preserved inline skil
     try std.testing.expectEqual(shell_runtime.AlternateScreenOwner.none, app.terminal.alternate_screen_owner);
     try std.testing.expectEqualStrings("$pure", app.input_runtime.edit_state.input.items);
     try std.testing.expectEqualStrings("pure", app.skills.menu.query());
-    try std.testing.expect(try coordinatorGridContains(app.shell.shadow_vt.?.*, "Skills 1"));
+    try std.testing.expect(try coordinatorGridContains(app.shell.shadow_vt.?.*, "skills   < All >"));
     try std.testing.expect(try coordinatorGridContains(app.shell.shadow_vt.?.*, "transcript behind inline skills"));
 
     app.skills.closeMenu();
