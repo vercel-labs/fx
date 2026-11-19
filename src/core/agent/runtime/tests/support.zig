@@ -1103,8 +1103,9 @@ pub const FakeAgentRuntimeDeps = struct {
     fn recordCaptureLog(self: *FakeAgentRuntimeDeps, comptime fmt: []const u8, args: anytype) void {
         self.execute_mutex.lockUncancelable(io_mod.getIo());
         defer self.execute_mutex.unlock(io_mod.getIo());
-        const line = self.alloc.print(fmt, args) catch @panic("test allocation failed");
-        self.capture_log.append(self.alloc, line) catch @panic("test allocation failed");
+        // A line lost to a failed allocation fails the test's length check.
+        const line = self.alloc.print(fmt, args) catch return;
+        self.capture_log.append(self.alloc, line) catch return self.alloc.free(line);
     }
 
     fn record(self: *FakeAgentRuntimeDeps, comptime fmt: []const u8, args: anytype) !void {
