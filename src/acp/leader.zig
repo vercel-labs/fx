@@ -481,15 +481,12 @@ const never_read_lines = 5000;
 /// Sends one whole line without waiting. Returns false when the client can send
 /// no more: its buffer is full (AGAIN, or NOBUFS on macOS), or the leader has
 /// dropped the connection at its write deadline (PIPE, CONNRESET). Any other
-/// errno is an error, and the test output names it.
+/// errno returns error.SendFailed, which fails the test that sends the line.
 fn sendLineNoWait(fd: posix.socket_t, line: []const u8) !bool {
     const rc = std.c.send(fd, line.ptr, line.len, posix.MSG.NOSIGNAL | posix.MSG.DONTWAIT);
     if (rc < 0) switch (posix.errno(rc)) {
         .AGAIN, .NOBUFS, .PIPE, .CONNRESET => return false,
-        else => |err| {
-            std.debug.print("sendLineNoWait: send failed with errno {t}\n", .{err});
-            return error.SendFailed;
-        },
+        else => return error.SendFailed,
     };
     return @as(usize, @intCast(rc)) == line.len;
 }
