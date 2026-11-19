@@ -434,6 +434,15 @@ const Run = struct {
             if (!store_missing and failure == .timeout) return self.fail(.unavailable, .capture_locked);
             return self.gitFail(failure);
         }
+        // The store exists now: list its hooks once for the rest of this
+        // capture's commands, all against this one store.
+        self.store_ready = switch (safe_git.scopeStore(arena, self.store_ready, self.store, .{ .deadline = setup_deadline, .cancel = self.request.cancel }) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.InvalidArgument => return self.gitFail(.path_rejected),
+        }) {
+            .ready => |scoped| scoped,
+            .failed => |failure| return self.gitFail(failure),
+        };
         // Until the store holds a capture, a copy has nothing to leave out
         // and takes the whole tree, so the capture keeps the first budget;
         // a new store holds none.

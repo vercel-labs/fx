@@ -428,6 +428,24 @@ pub const StoreReady = struct {
     /// Names of hooks that global or system config defines with
     /// `hook.<name>.command`; each store command turns them off.
     hook_names: []const []const u8 = &.{},
+    /// The store whose own hooks `hook_names` already holds (`scopeStore`).
+    /// A command for exactly this store skips listing them again; a command
+    /// for any other store lists its own.
+    scope: ?StoreScope = null,
+
+    fn scopedTo(self: StoreReady, store: Store) bool {
+        const scope = self.scope orelse return false;
+        return std.mem.eql(u8, scope.git_dir, store.git_dir) and
+            std.mem.eql(u8, scope.index_file, store.index_file) and
+            std.mem.eql(u8, scope.work_tree, store.work_tree);
+    }
+};
+
+/// The paths that set a store command's config context.
+pub const StoreScope = struct {
+    git_dir: []const u8,
+    index_file: []const u8,
+    work_tree: []const u8,
 };
 
 /// Most bytes a `git config --name-only --list` reply may have.
@@ -745,15 +763,31 @@ pub fn runStore(arena: Allocator, ready: StoreReady, store: Store, command: Stor
     return runStoreWith(arena, ready, store, command, limits, &base, capture_path);
 }
 
-fn runStoreWith(
-    arena: Allocator,
-    ready: StoreReady,
-    store: Store,
-    command: StoreCommand,
-    limits: Limits,
-    base: *std.process.Environ.Map,
-    route_path: []const u8,
-) StoreError!Outcome {
+pub const ScopedStore = union(enum) { ready: StoreReady, failed: Failure };
+
+/// `ready` with the hooks config defines for `store` listed once, in the
+/// store's own context, so a run of commands against that one store, such
+/// as one capture's, need not list them before each command. Memory belongs
+/// to `arena`.
+pub fn scopeStore(arena: Allocator, ready: StoreReady, store: Store, limits: Limits) StoreError!ScopedStore {
+    var base = try environment(arena);
+    return scopeStoreWith(arena, ready, store, limits, &base, capture_path);
+}
+
+fn scopeStoreWith(arena: Allocator, ready: StoreReady, store: Store, limits: Limits, base: *std.process.Environ.Map, route_path: []const u8) StoreError!ScopedStore {
+    try putStoreEnvironment(base, store, route_path);
+    var scoped = ready;
+    scoped.hook_names = switch (try storeHookNames(arena, ready, store, base, limits)) {
+        .names => |names| names,
+        .failed => |failure| return .{ .failed = failure },
+    };
+    scoped.scope = .{ .git_dir = store.git_dir, .index_file = store.index_file, .work_tree = store.work_tree };
+    return .{ .ready = scoped };
+}
+
+/// Points `base` at `store` the way every store command runs: its git dir,
+/// capture index and worktree, the capture identity, and the fixed PATH.
+fn putStoreEnvironment(base: *std.process.Environ.Map, store: Store, route_path: []const u8) StoreError!void {
     try blockLazyFetch(base);
     for ([_][]const u8{ store.git_dir, store.index_file, store.work_tree, store.scratch_dir }) |dir| {
         if (!std.Io.Dir.path.isAbsolute(dir)) return error.InvalidArgument;
@@ -766,6 +800,18 @@ fn runStoreWith(
     try base.put("GIT_AUTHOR_EMAIL", capture_identity_email);
     try base.put("GIT_COMMITTER_NAME", capture_identity_name);
     try base.put("GIT_COMMITTER_EMAIL", capture_identity_email);
+}
+
+fn runStoreWith(
+    arena: Allocator,
+    ready: StoreReady,
+    store: Store,
+    command: StoreCommand,
+    limits: Limits,
+    base: *std.process.Environ.Map,
+    route_path: []const u8,
+) StoreError!Outcome {
+    try putStoreEnvironment(base, store, route_path);
     var argv: std.ArrayList([]const u8) = .empty;
     var input: std.ArrayList(u8) = .empty;
     var has_input = false;
@@ -880,9 +926,10 @@ fn runStoreWith(
         .repack => try argv.appendSlice(arena, &.{ "repack", "-a", "-d", "-k", "-q", "-n", "--no-write-bitmap-index" }),
     }
     // Config can define hooks for this store alone, such as through a global
-    // `includeIf "gitdir:"`, so they are listed in the store's own context.
+    // `includeIf "gitdir:"`, so they are listed in the store's own context,
+    // unless `scopeStore` already listed them there for this store.
     var store_ready = ready;
-    store_ready.hook_names = switch (try storeHookNames(arena, ready, store, base, limits)) {
+    if (!ready.scopedTo(store)) store_ready.hook_names = switch (try storeHookNames(arena, ready, store, base, limits)) {
         .names => |names| names,
         .failed => |failure| return .{ .failed = failure },
     };
@@ -2241,6 +2288,69 @@ test "safe git store commands turn off a hook a global include adds only for the
     const tree = try fixture.ok(.write_tree);
     const commit = try fixture.ok(.{ .commit_tree = .{ .tree = tree, .parent = null, .message = "capture\n", .unix_seconds = 7 } });
     _ = try fixture.ok(.{ .update_ref = .{ .ref = "refs/fx/sessions/s1/w", .new = commit, .old = null } });
+    try std.testing.expectEqual(@as(usize, 0), try repo.runs());
+}
+
+test "safe git store commands for a scoped store list its hooks once, and another store's again" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const repo = try SentinelRepo.init(arena_state.allocator(), tmp.dir);
+    const head = try repo.plainOutput(repo.repo, &.{ "rev-parse", "HEAD" });
+    var fixture = try StoreFixture.init(repo);
+    try repo.write("hooks.inc", try repo.arena.print("[hook \"inc\"]\n\tcommand = {s}\n\tevent = post-index-change\n\tevent = reference-transaction\n", .{repo.sentinel}));
+    try repo.write("home/.gitconfig", try repo.arena.print("[includeIf \"gitdir:{s}\"]\n\tpath = {s}\n", .{ fixture.store.git_dir, try repo.path("hooks.inc") }));
+    // A wrapper around the trusted git that logs every run, so the test can
+    // count hook listings.
+    const calls = try repo.path("git-calls.log");
+    const wrapper = try repo.path("git-wrapper.sh");
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{
+        .sub_path = wrapper,
+        .data = try repo.arena.print("#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{s}'\nexec '{s}' \"$@\"\n", .{ calls, fixture.ready.executable }),
+        .flags = .{ .permissions = .fromMode(0o755) },
+    });
+    fixture.ready.executable = wrapper;
+    const listings = struct {
+        fn count(path: []const u8, arena: Allocator) !usize {
+            const text = std.Io.Dir.cwd().readFileAlloc(std.testing.io, path, arena, .limited(1 << 20)) catch |err| switch (err) {
+                error.FileNotFound => return 0,
+                else => return err,
+            };
+            return std.mem.count(u8, text, "config -z --name-only --list");
+        }
+    };
+
+    var env = try repo.childEnvironment(.{ .safe = null });
+    fixture.ready = switch (try scopeStoreWith(repo.arena, fixture.ready, fixture.store, .{}, &env, fixture.path)) {
+        .ready => |value| value,
+        .failed => return error.TestUnexpectedFailure,
+    };
+    // The one listing ran in the store's own context, so it found the hook
+    // the include adds only for the store.
+    var saw_inc = false;
+    for (fixture.ready.hook_names) |name| {
+        if (std.mem.eql(u8, name, "inc")) saw_inc = true;
+    }
+    try std.testing.expect(saw_inc);
+    try std.testing.expectEqual(@as(usize, 1), try listings.count(calls, repo.arena));
+
+    _ = try fixture.ok(.{ .read_tree = head });
+    try repo.write("repo/a.txt", "ten\n");
+    _ = try fixture.ok(.{ .add_remove = &.{"a.txt"} });
+    const tree = try fixture.ok(.write_tree);
+    const commit = try fixture.ok(.{ .commit_tree = .{ .tree = tree, .parent = null, .message = "capture\n", .unix_seconds = 7 } });
+    _ = try fixture.ok(.{ .update_ref = .{ .ref = "refs/fx/sessions/s1/w", .new = commit, .old = null } });
+    // The commands listed nothing more, and the hook never ran.
+    try std.testing.expectEqual(@as(usize, 1), try listings.count(calls, repo.arena));
+    try std.testing.expectEqual(@as(usize, 0), try repo.runs());
+
+    // A command for another store, here another capture index, lists that
+    // store's hooks itself.
+    var other = fixture;
+    other.store.index_file = try repo.path("other-index");
+    _ = try other.ok(.{ .read_tree = head });
+    try std.testing.expectEqual(@as(usize, 2), try listings.count(calls, repo.arena));
     try std.testing.expectEqual(@as(usize, 0), try repo.runs());
 }
 
