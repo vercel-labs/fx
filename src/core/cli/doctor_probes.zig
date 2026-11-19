@@ -1136,8 +1136,11 @@ test "a check killed at the deadline takes with it what it started in a group of
     defer alloc.free(pid_file);
     // Like an `fx mcp show` child and its stdio server: the server moves to a
     // group of its own, ignores SIGTERM and holds the pipe, and the child
-    // waits on it.
-    const script = "perl -MPOSIX -e '$SIG{TERM} = \"IGNORE\"; POSIX::setpgid(0, 0); open(F, \">\", $ARGV[0]) or exit 1; print F $$; close F; sleep 20' \"$0\" & wait";
+    // waits on it. It ignores SIGHUP too: the kernel hangs up a stopped
+    // process in a group that its parent's death orphans, which would end it
+    // without fx's own kill of what a check started outside its group, and
+    // this test must prove that kill.
+    const script = "perl -MPOSIX -e '$SIG{HUP} = \"IGNORE\"; $SIG{TERM} = \"IGNORE\"; POSIX::setpgid(0, 0); open(F, \">\", $ARGV[0]) or exit 1; print F $$; close F; sleep 20' \"$0\" & wait";
     var waiters: std.Io.Group = .init;
     var reader: ChildStatusReader = undefined;
     reader.init();

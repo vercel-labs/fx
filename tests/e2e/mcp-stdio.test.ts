@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
+import { processAlive as isProcessAlive } from "./process-alive";
 import {
   existsSync,
   mkdirSync,
@@ -12,6 +13,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { FX_BIN, runFx } from "../evals/eval-helpers";
 import { contentText } from "./conditional-guidance-oracle";
+import { LARGE_TOOL, OTHER_TOOL, SMALL_TOOL, runPaths, seen, type PathName, type PathsRun } from "./mcp-rules-paths";
 import { pngPixelSize, solidPng } from "./fixtures/image-encoding";
 import {
   fakeGatewayFinalText,
@@ -110,9 +112,12 @@ type RootOptions = {
     | "startup_exit_after_delay"
     | "startup_garbage"
     | "exit_after_result"
-    | "typed_arguments";
+    | "typed_arguments"
+    | "refused_reply";
   startupTimeoutMs?: number;
   protocolErrorMessage?: string;
+  /** Nests JSON `depth` levels deep at `site` in the legacy fixture's reply or tool list (see the fixture). */
+  deep?: { site: string; depth: number; shape?: "object" | "array" | "mixed"; fault?: "cut" };
   /** The text a `tool_failure` server's error carries, or a `tool_protocol_error` server's message, in place of its plain two lines. */
   failureText?: string;
   operationTimeoutMs?: number;
@@ -134,6 +139,16 @@ type RootOptions = {
   resourceTtlMs?: number;
   captureEnvironment?: boolean;
   image?: Buffer;
+  /** For mode "refused_reply": what the server does with each tools/call, in order. */
+  refused?: { calls: RefusedCall[] };
+};
+
+/** A line fx refuses and cannot attach to a call, then what the server does (mcp-legacy-stdio.mjs says). */
+type RefusedCall = {
+  bad?: "utf8_last" | "deep_last" | "garbage" | "duplicate_escaped" | "cut";
+  then?: "silent" | "exit";
+  slowMs?: number;
+  progressEveryMs?: number;
 };
 
 function createRoot(
@@ -188,6 +203,10 @@ function createRoot(
             FX_MCP_MODE: options.mode ?? "normal",
             FX_MCP_IMAGE_PATH: options.image ? imagePath : undefined,
             FX_MCP_PROTOCOL_ERROR_MESSAGE: options.protocolErrorMessage,
+            FX_MCP_DEEP_SITE: options.deep?.site,
+            FX_MCP_DEEP_DEPTH: options.deep?.depth.toString(),
+            FX_MCP_DEEP_SHAPE: options.deep?.shape,
+            FX_MCP_DEEP_FAULT: options.deep?.fault,
             // JSON, so the text can hold bytes an environment variable cannot.
             FX_MCP_FAILURE_TEXT: options.failureText === undefined
               ? undefined
@@ -214,6 +233,7 @@ function createRoot(
               options.legacyRejectNewerInitialize ? "1" : undefined,
             FX_MCP_DRAFT7_PATTERN: options.draft7Pattern,
             FX_MCP_URL_REQUIRED_OPERATION: options.urlRequiredOperation,
+            FX_MCP_REFUSED: options.refused ? JSON.stringify(options.refused) : undefined,
             FX_MCP_ENV_CAPTURE: options.captureEnvironment
               ? environmentCapturePath
               : undefined,
@@ -291,6 +311,39 @@ function startToolGateway(finalText: string) {
   });
 }
 
+/**
+ * One `fx ask` against the legacy fixture in refused_reply mode, with its own root, gateway and
+ * clean-up so that several can run at once. The model calls the tool once per entry in `calls`.
+ */
+async function askRefused(label: string, calls: RefusedCall[], timeoutMs = 75_000) {
+  const root = createRoot(label, LEGACY_FIXTURE, { mode: "refused_reply", refused: { calls } });
+  const ids = calls.map((_, index) => `call_mcp${index === 0 ? "" : index + 1}`);
+  const activeGateway = startFakeGateway([
+    fakeGatewayToolCall("select_mcp", "toolbox", { open: TOOL_NAME }),
+    ...ids.map((id) => fakeGatewayToolCall(id, "toolbox", { run: TOOL_NAME, arguments: { text: "hello" } })),
+    fakeGatewayFinalText("Refused reply complete."),
+  ], { models: [{ id: MODEL, type: "language", tags: ["tool-use"] }] });
+  const started = Date.now();
+  try {
+    const result = await runFx(
+      ["ask", "--json", "--auto", "--no-save", "Call the refused-reply fixture."],
+      { cwd: root.workspace, env: fixtureEnv(root, activeGateway), timeoutMs },
+    );
+    const body = activeGateway.requests.at(-1)?.body ?? "";
+    return {
+      code: result.code,
+      seconds: (Date.now() - started) / 1000,
+      requests: activeGateway.requests.length,
+      results: activeGateway.requests.length === ids.length + 2 ? ids.map((id) => toolResultText(body, id)) : [],
+      wire: existsSync(root.wireLogPath) ? readWire(root.wireLogPath) : [],
+      trace: existsSync(root.traceLogPath) ? readFileSync(root.traceLogPath, "utf8") : "",
+    };
+  } finally {
+    activeGateway.stop();
+    rmSync(root.root, { recursive: true, force: true });
+  }
+}
+
 function writeFakeUrlOpeners(directory: string, script: string): void {
   for (const name of ["open", "xdg-open"]) {
     writeFileSync(join(directory, name), script, { mode: 0o755 });
@@ -312,15 +365,6 @@ function readAttemptedPids(path: string): number[] {
     .split("\n")
     .filter(Boolean)
     .map(Number);
-}
-
-function isProcessAlive(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch {
-    return false;
-  }
 }
 
 async function expectFixtureProcessesExited(wire: WireEntry[], timeoutMs = 5_000) {
@@ -358,6 +402,90 @@ async function waitForTtyAskExit(
 }
 
 describe("modern MCP stdio compatibility", () => {
+  test.skipIf(!tmuxAvailable())(
+    "a toolbox run of an MCP tool streams into that tool's row, with no Using row",
+    async () => {
+      // The shell can ask, so it says so in every request's capabilities.
+      const root = createRoot("tui-streamed-toolbox-run", MODERN_FIXTURE, {
+        expectedElicitation: "both",
+      });
+      const stderrPath = join(root.root, "stderr.log");
+      const encoder = new TextEncoder();
+      let timer: ReturnType<typeof setInterval> | undefined;
+      let sendRest: (() => void) | undefined;
+      const activeGateway = startFakeGateway([
+        fakeGatewayToolCall("select_mcp", "toolbox", { open: TOOL_NAME }),
+        fakeGatewayToolCall("call_1", "toolbox", { run: TOOL_NAME, arguments: { text: "first" } }),
+        fakeGatewayToolCall("call_2", "toolbox", { run: TOOL_NAME, arguments: { text: "second" } }),
+        () =>
+          new Response(
+            new ReadableStream<Uint8Array>({
+              start(controller) {
+                const send = (event: object) =>
+                  controller.enqueue(encoder.encode(`data: ${JSON.stringify(event)}\n\n`));
+                send({ type: "tool-input-start", id: "call_3", toolName: "toolbox" });
+                send({ type: "tool-input-delta", id: "call_3", delta: `{"run":"${TOOL_NAME}",` });
+                timer = setInterval(() => controller.enqueue(encoder.encode(": hold-toolbox-arguments\n\n")), 50);
+                sendRest = () => {
+                  clearInterval(timer);
+                  send({ type: "tool-input-delta", id: "call_3", delta: '"arguments":{"text":"third"}}' });
+                  send({ type: "tool-input-end", id: "call_3" });
+                  send({
+                    type: "tool-call",
+                    toolCallId: "call_3",
+                    toolName: "toolbox",
+                    input: { run: TOOL_NAME, arguments: { text: "third" } },
+                  });
+                  send({ type: "finish", finishReason: { unified: "tool-calls", raw: "tool-calls" } });
+                  controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+                  controller.close();
+                };
+              },
+              cancel() {
+                clearInterval(timer);
+              },
+            }),
+            { headers: { "content-type": "text/event-stream" } },
+          ),
+        fakeGatewayFinalText("MCP_STREAMED_RUN_DONE"),
+      ], {
+        models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
+      });
+      gateway = activeGateway;
+      tui = await TmuxSession.create({
+        isolated: true,
+        cwd: root.workspace,
+        width: 140,
+        height: 40,
+        stderrPath,
+        env: fixtureEnv(root, activeGateway),
+      });
+
+      await tui.waitForComposer(15_000);
+      await tui.sendText("Call the MCP fixture three times.");
+      const toolRows = (pane: string) => pane.split("\n").filter((line) => /^[●├└] /.test(line) && line.includes(`MCP ${TOOL_NAME}`));
+      // The held call's arguments name its tool and nothing more: it waits
+      // in that tool's row, which says it runs, and shows no row of its own.
+      await tui.waitForPane((pane) => sendRest !== undefined && pane.includes(`Running MCP ${TOOL_NAME} ×3`), 20_000);
+      for (let sample = 0; sample < 6; sample += 1) {
+        const pane = await tui.capturePane();
+        expect(pane).not.toMatch(/^[●├└] Using\b/m);
+        expect(toolRows(pane)).toHaveLength(1);
+        await Bun.sleep(100);
+      }
+
+      sendRest?.();
+      const done = await tui.waitForText("MCP_STREAMED_RUN_DONE", 20_000);
+      expect(toolRows(done)).toEqual([expect.stringContaining(`Ran MCP ${TOOL_NAME} ×3`)]);
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+
+      await tui.kill();
+      tui = null;
+      await expectFixtureProcessesExited(readWire(root.wireLogPath));
+    },
+    60_000,
+  );
+
   test.skipIf(!tmuxAvailable())(
     "the TUI shows exact dynamic MCP arguments before human approval",
     async () => {
@@ -1948,13 +2076,7 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"`,
         // Call again only after the first server has exited.
         const firstExited = () => {
           const [pid] = readAttemptedPids(root.launchLogPath);
-          if (pid === undefined) return false;
-          try {
-            process.kill(Number(pid), 0);
-            return false;
-          } catch {
-            return true;
-          }
+          return pid !== undefined && !isProcessAlive(pid);
         };
         const deadline = Date.now() + 5_000;
         while (!firstExited()) {
@@ -2371,6 +2493,78 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"`,
     expect(cancelled?.message.params?.requestId).toBe(call?.message.id);
     await expectFixtureProcessesExited(wire);
   }, 30_000);
+
+  test("fx ask ends a call that a refused line leaves silent 30 seconds later, as malformed, and cancels it; one that shows progress, or starts after the line, goes on", async () => {
+    // Each server writes a line fx refuses and cannot attach to the call (its id comes after the
+    // bad part, or it has none), then says nothing. Until now fx waited out the operation timeout,
+    // 5 minutes by default, and then said that the server did not answer.
+    const variants: Array<[string, RefusedCall]> = [
+      ["bytes that are not UTF-8, the id after them", { bad: "utf8_last", then: "silent" }],
+      ["JSON nested past the engine's limit, the id last", { bad: "deep_last", then: "silent" }],
+      ["a line with no JSON in it", { bad: "garbage", then: "silent" }],
+      // `responseId` reads the line with the same decoder as the engine, which refuses a repeated name
+      // however it is written, so this line names no call.
+      ["a result written twice, the second time with an escape, the id first", { bad: "duplicate_escaped", then: "silent" }],
+    ];
+    // All of them at once, so the test takes as long as its slowest wait, not their sum.
+    const [runs, progress, later] = await Promise.all([
+      Promise.all(variants.map(([, spec], index) => askRefused(`refused-grace-${index}`, [spec]))),
+      // The line, then 36 s of work with progress for the call's own token: the grace is cleared.
+      askRefused("refused-progress", [{ bad: "garbage", slowMs: 36_000, progressEveryMs: 4_000 }]),
+      // The first call ends at once; the second starts after the line and is slow with no
+      // progress at all: it gets no grace, so it returns its result after 36 s.
+      askRefused("refused-later", [{ bad: "garbage" }, { slowMs: 36_000 }]),
+    ]);
+    for (const [index, run] of runs.entries()) {
+      const what = variants[index]![0];
+      expect({ what, code: run.code, requests: run.requests }).toEqual({ what, code: 0, requests: 3 });
+      expect({ what, text: run.results[0] }).toEqual({
+        what,
+        text: expect.stringContaining("the server's answer was malformed"),
+      });
+      expect(run.results[0]).not.toContain("operation timeout");
+      // About 30 s after the line: not at once, and nowhere near the 300 s default.
+      expect({ what, late: run.seconds > 28, early: run.seconds < 55 }).toEqual({ what, late: true, early: true });
+      const call = run.wire.filter((entry) => entry.message.method === "tools/call").at(-1);
+      const cancelled = run.wire.find((entry) => entry.message.method === "notifications/cancelled");
+      expect({ what, cancelled: cancelled?.message.params?.requestId }).toEqual({ what, cancelled: call?.message.id });
+      // The debug trace says what ended the call and how long the line was. Nothing of the line.
+      expect({ what, line: run.trace.match(/MCP call ended server=fixture transport=stdio code=malformed reason=unreadable_line bytes=\d+/)?.[0] }).toEqual({
+        what,
+        line: expect.stringContaining("code=malformed"),
+      });
+      for (const text of ["xxxxxxxxxxxxxxxxxxxx", '"jsonrpc"', "structuredContent", '{"a":{"a":']) {
+        expect({ what, text, traced: run.trace.includes(text) }).toEqual({ what, text, traced: false });
+      }
+    }
+    // A call that showed progress, or started after the line, was not ended: no such line.
+    expect(progress.trace).not.toContain("code=malformed");
+    expect(later.trace).not.toContain("code=malformed");
+    expect({ code: progress.code, requests: progress.requests }).toEqual({ code: 0, requests: 3 });
+    expect(progress.results[0]).toContain(LEGACY_RESULT);
+    expect(progress.seconds).toBeGreaterThan(33);
+    expect({ code: later.code, requests: later.requests }).toEqual({ code: 0, requests: 4 });
+    expect(later.results[0]).toContain(LEGACY_RESULT);
+    expect(later.results[1]).toContain(LEGACY_RESULT);
+    expect(later.results[1]).not.toContain("malformed");
+    expect(later.seconds).toBeGreaterThan(33);
+  }, 90_000);
+
+  test("fx ask still returns a valid reply that follows a refused line inside the grace, and ends at once when the server exits", async () => {
+    const [late, notified, cut] = await Promise.all([
+      askRefused("refused-valid-late", [{ bad: "utf8_last", slowMs: 3_000 }], 30_000),
+      askRefused("refused-notification", [{ bad: "garbage" }], 30_000),
+      askRefused("refused-cut", [{ bad: "cut", then: "exit" }], 30_000),
+    ]);
+    for (const run of [late, notified]) {
+      expect({ code: run.code, requests: run.requests }).toEqual({ code: 0, requests: 3 });
+      expect(run.results[0]).toContain(LEGACY_RESULT);
+      expect(run.seconds).toBeLessThan(20);
+    }
+    expect({ code: cut.code, requests: cut.requests }).toEqual({ code: 0, requests: 3 });
+    expect(cut.results[0]).toContain("the server went away");
+    expect(cut.seconds).toBeLessThan(20);
+  }, 60_000);
 
   test.skipIf(!tmuxAvailable())(
     "the TUI calls the modern stdio fixture through the shared runtime",
@@ -4087,6 +4281,170 @@ describe("MCP stdio servers", () => {
     // Nothing needed the configured server, so it never started.
     expect(existsSync(root.wireLogPath)).toBe(false);
   }, 25_000);
+
+  // A server's JSON is written again by `std.json.Stringify`, which holds 256 levels in a safe build, so fx
+  // refuses a result or a listed tool nested past 128 levels (`src/core/mcp/server_json_depth.zig`).
+  const DEEP_WORDS = "the server's reply is nested deeper than fx accepts (128 levels)";
+  // What the toolbox says of a tool it does not list, and what it shows of one it does (the deep tool's description).
+  const NOT_LISTED = "Nothing named mcp_fixture_deep is in the toolbox menu";
+  const DEEP_TOOL_SHOWN = "A tool whose listing is nested deeper than fx accepts";
+  const deepResultSites = ["structured", "content_meta", "content_annotations"] as const;
+  const deepToolSites = ["tool_meta", "tool_annotations", "tool_icons"] as const;
+  const trace = (root: FixtureRoot) => readFileSync(root.traceLogPath, "utf8");
+  // The trace lines the limit writes, as the text after "[mcp] ": the code, the limit and the place, and no server text.
+  const refusedLines = (root: FixtureRoot) =>
+    trace(root).split("\n").filter((line) => line.includes("JSON refused")).map((line) => line.slice(line.indexOf("[mcp] ") + "[mcp] ".length));
+  const refusedAt = (place: string) => `MCP server JSON refused code=NestingTooDeep limit=128 at=${place}`;
+  const deepGateway = (final: string, withDeepTool: boolean) => startFakeGateway([
+    fakeGatewayToolCall("select_mcp", "toolbox", { open: TOOL_NAME }),
+    fakeGatewayToolCall("call_mcp", "toolbox", { run: TOOL_NAME, arguments: { text: "hello" } }),
+    ...(withDeepTool ? [fakeGatewayToolCall("select_deep", "toolbox", { open: "mcp_fixture_deep" })] : []),
+    fakeGatewayFinalText(final),
+  ], { models: [{ id: MODEL, type: "language", tags: ["tool-use"] }] });
+  const deepRoot = (label: string, site: string, depth: number, extra: Partial<NonNullable<RootOptions["deep"]>> = {}) =>
+    createRoot(label, LEGACY_FIXTURE, { legacyVersion: "2025-11-25", deep: { site, depth, ...extra } });
+
+  for (const site of deepResultSites) {
+    test(`a result nested past the limit in ${site} ends the call with the limit's words, and fx stays up`, async () => {
+      for (const depth of [2000, 258, 256, 129]) {
+        const root = deepRoot(`deep-${site}-${depth}`, site, depth);
+        gateway = deepGateway(`DEEP_${depth}_DONE`, false);
+        const result = await ask(root, "Use the stdio MCP echo tool.");
+        // Not a crash: without the limit, a result 257 levels deep or more aborts fx.
+        expect({ depth, code: result.code, signal: result.signal }).toEqual({ depth, code: 0, signal: null });
+        expect(result.stdout).toContain(`DEEP_${depth}_DONE`);
+        expect(toolResultText(gateway.requests.at(-1)!.body, "call_mcp")).toContain(`MCP protocol failure: ${DEEP_WORDS}`);
+        expect(refusedLines(root)).toEqual([refusedAt("result")]);
+        expect(calls(root)).toHaveLength(1);
+        await expectFixtureProcessesExited(readWire(root.wireLogPath));
+        gateway.stop();
+        gateway = null;
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    }, 60_000);
+
+    test(`a result nested 127 and 128 levels deep in ${site} reaches the model as before`, async () => {
+      for (const depth of [127, 128]) {
+        const root = deepRoot(`deep-ok-${site}-${depth}`, site, depth);
+        gateway = deepGateway(`DEEP_OK_${depth}_DONE`, false);
+        const result = await ask(root, "Use the stdio MCP echo tool.");
+        expect(result.code).toBe(0);
+        const seen = toolResultText(gateway.requests.at(-1)!.body, "call_mcp");
+        expect(seen).toContain(LEGACY_RESULT);
+        expect(seen).not.toContain("MCP protocol failure");
+        expect(refusedLines(root)).toEqual([]);
+        gateway.stop();
+        gateway = null;
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    }, 40_000);
+  }
+
+  for (const site of deepToolSites) {
+    test(`a tool listed with ${site} nested past the limit is dropped and the server's other tool stays`, async () => {
+      for (const depth of [2000, 258, 256, 129]) {
+        const root = deepRoot(`deep-${site}-${depth}`, site, depth);
+        gateway = deepGateway(`DEEP_TOOL_${depth}_DONE`, true);
+        const result = await ask(root, "Use the stdio MCP echo tool.");
+        // Not a crash at connect: without the limit, a tool listing 258 levels deep or more aborts fx.
+        expect({ depth, code: result.code, signal: result.signal }).toEqual({ depth, code: 0, signal: null });
+        expect(toolResultText(gateway.requests.at(-1)!.body, "select_deep")).toContain(NOT_LISTED);
+        expect(toolResultText(gateway.requests.at(-1)!.body, "call_mcp")).toContain(LEGACY_RESULT);
+        expect([...new Set(refusedLines(root))]).toEqual([refusedAt("tool")]);
+        gateway.stop();
+        gateway = null;
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    }, 60_000);
+
+    test(`a tool listed with ${site} nested 127 and 128 levels deep stays listed`, async () => {
+      for (const depth of [127, 128]) {
+        const root = deepRoot(`deep-ok-${site}-${depth}`, site, depth);
+        gateway = deepGateway(`DEEP_TOOL_OK_${depth}_DONE`, true);
+        const result = await ask(root, "Use the stdio MCP echo tool.");
+        expect(result.code).toBe(0);
+        expect(toolResultText(gateway.requests.at(-1)!.body, "select_deep")).toContain(DEEP_TOOL_SHOWN);
+        expect(toolResultText(gateway.requests.at(-1)!.body, "select_deep")).not.toContain(NOT_LISTED);
+        expect(toolResultText(gateway.requests.at(-1)!.body, "call_mcp")).toContain(LEGACY_RESULT);
+        expect(refusedLines(root)).toEqual([]);
+        gateway.stop();
+        gateway = null;
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    }, 40_000);
+  }
+
+  test("deep arrays, deep objects and mixed nesting count the same at the limit", async () => {
+    for (const shape of ["object", "array", "mixed"] as const) {
+      for (const [depth, refused] of [[128, false], [129, true]] as const) {
+        const root = deepRoot(`deep-shape-${shape}-${depth}`, "structured", depth, { shape });
+        gateway = deepGateway(`DEEP_SHAPE_${shape}_${depth}_DONE`, false);
+        const result = await ask(root, "Use the stdio MCP echo tool.");
+        expect(result.code).toBe(0);
+        const seen = toolResultText(gateway.requests.at(-1)!.body, "call_mcp");
+        if (refused) expect(seen).toContain(DEEP_WORDS);
+        else expect(seen).toContain(LEGACY_RESULT);
+        gateway.stop();
+        gateway = null;
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    }
+  }, 60_000);
+
+  test("a protocol error whose data is nested 2000 levels deep still reaches the model with its message", async () => {
+    // The host drops an error's `data` and keeps its code and message, so no depth refusal is traced here:
+    // this test does not reach the check on `data`, which the Zig tests of `parseProtocolError` pin.
+    const root = deepRoot("deep-error-data", "error_data", 2000);
+    gateway = deepGateway("DEEP_ERROR_DATA_DONE", false);
+    const result = await ask(root, "Use the stdio MCP echo tool.");
+    expect(result.code).toBe(0);
+    const seen = toolResultText(gateway.requests.at(-1)!.body, "call_mcp");
+    expect(seen).toContain("MCP protocol error -32602: bad");
+    expect(seen).not.toContain(DEEP_WORDS);
+    expect(refusedLines(root)).toEqual([]);
+  }, 25_000);
+
+  test("a reply cut inside deep nesting ends the call, and fx neither crashes nor waits", async () => {
+    const root = deepRoot("deep-cut", "structured", 300, { fault: "cut" });
+    gateway = deepGateway("DEEP_CUT_DONE", false);
+    const started = Date.now();
+    const result = await ask(root, "Use the stdio MCP echo tool.");
+    expect(result.code).toBe(0);
+    expect(result.signal).toBeNull();
+    expect(Date.now() - started).toBeLessThan(15_000);
+    expect(result.stdout).toContain("DEEP_CUT_DONE");
+    expect(toolResultText(gateway.requests.at(-1)!.body, "call_mcp")).not.toContain(LEGACY_RESULT);
+  }, 25_000);
+
+  test("a result nested past the engine's own limit ends the call after the grace for an unreadable line, as malformed, and cancels it", async () => {
+    // The engine reads a message up to about 2,584 levels deep and drops a deeper one, so fx never sees
+    // the depth limit's check: the call waits out the grace for a line it cannot read (30 seconds), then
+    // ends as malformed and is cancelled on the server.
+    const root = deepRoot("deep-past-engine", "structured", 3000);
+    gateway = deepGateway("DEEP_PAST_ENGINE_DONE", false);
+    const started = Date.now();
+    const result = await runFx(["ask", "--json", "--auto", "--no-save", "Use the stdio MCP echo tool."], {
+      cwd: root.workspace,
+      env: v2Env(root, gateway),
+      timeoutMs: 60_000,
+    });
+    const seconds = (Date.now() - started) / 1000;
+    expect({ code: result.code, signal: result.signal }).toEqual({ code: 0, signal: null });
+    expect(result.stdout).toContain("DEEP_PAST_ENGINE_DONE");
+    const seen = toolResultText(gateway.requests.at(-1)!.body, "call_mcp");
+    expect(seen).toContain("the server's answer was malformed");
+    expect(seen).not.toContain(DEEP_WORDS);
+    expect(seen).not.toContain(LEGACY_RESULT);
+    // About 30 seconds after the line: not at once, and far from the 5 minutes an operation waits by default.
+    expect({ late: seconds > 28, early: seconds < 55 }).toEqual({ late: true, early: true });
+    const wire = readWire(root.wireLogPath);
+    const call = wire.filter((entry) => entry.message.method === "tools/call").at(-1);
+    const cancelled = wire.find((entry) => entry.message.method === "notifications/cancelled");
+    expect(cancelled?.message.params?.requestId).toBe(call?.message.id);
+    // The depth check never ran: the engine dropped the message first.
+    expect(refusedLines(root)).toEqual([]);
+    await expectFixtureProcessesExited(wire);
+  }, 90_000);
 });
 
 // `fx mcp call` lets a command fx's shell tool runs call the session's MCP
@@ -4211,9 +4569,40 @@ describe("fx mcp call", () => {
     expect(toolCalls(root)).toHaveLength(0);
   }, 60_000);
 
+  test("an auto-mode call too large to review in full runs nothing, and the command learns why", async () => {
+    const root = bridgeRoot("bridge-unreviewable");
+    // Larger than the 64 KiB of one action field the safety review can see.
+    writeFileSync(join(root.workspace, "args.json"), JSON.stringify({ text: "x".repeat(70 * 1024) }));
+    const bigCall = `"${FX_BIN}" mcp call ${TOOL_NAME} "$(cat args.json)" > out.txt 2> err.txt; echo "exit=$?"; cat err.txt`;
+    let seen = "";
+    gateway = startFakeGateway([
+      fakeGatewayToolCall("run_call", "shell", { action: "run", command: bigCall }),
+      (body: string) => {
+        seen = toolResultText(body, "run_call");
+        return fakeGatewayFinalText("BRIDGE_UNREVIEWABLE");
+      },
+    ], {
+      models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
+    });
+    const result = await runFx(["ask", "--json", "--auto", "--no-save", "Echo the text."], {
+      cwd: root.workspace,
+      env: fixtureEnv(root, gateway),
+      timeoutMs: 60_000,
+    });
+    expect(result.code).toBe(0);
+    expect(seen).toContain("exit=5");
+    expect(seen).toContain("Safety review evidence incomplete; action held");
+    expect(seen).toContain("Do not retry unchanged; reduce the action");
+    expect(seen).not.toContain("was not granted");
+    expect(toolCalls(root)).toHaveLength(0);
+    // Only the shell command was reviewed; the oversized call never reached
+    // the reviewer.
+    expect(gateway.classifierRequests).toHaveLength(1);
+  }, 90_000);
+
   // Runs one shell command through the built binary and returns what the
   // model saw of it.
-  const runBridgeCommand = async (root: FixtureRoot, shellCommand: string) => {
+  const runBridgeCommand = async (root: FixtureRoot, shellCommand: string, modeFlag: "--full-access" | "--auto" = "--full-access") => {
     let seen = "";
     gateway = startFakeGateway([
       fakeGatewayToolCall("run_call", "shell", { action: "run", command: shellCommand }),
@@ -4224,7 +4613,7 @@ describe("fx mcp call", () => {
     ], {
       models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
     });
-    const result = await runFx(["ask", "--json", "--full-access", "--no-save", "Run the command."], {
+    const result = await runFx(["ask", "--json", modeFlag, "--no-save", "Run the command."], {
       cwd: root.workspace,
       env: fixtureEnv(root, gateway),
       timeoutMs: 80_000,
@@ -4513,16 +4902,29 @@ describe("fx mcp call", () => {
     expect(toolCalls(root)).toHaveLength(0);
   }, 90_000);
 
-  test("list, search, and help hide a tool the permission rules deny", async () => {
+  test("in auto, list, search, and help hide a tool the permission rules deny", async () => {
     const root = bridgeRoot("bridge-lookups-denied", { permission: { bash: { "*": "allow" }, [TOOL_NAME]: "deny" } });
     const seen = shellOutput(await runBridgeCommand(root, [
       `"${FX_BIN}" mcp call list fixture; echo "list=$?"`,
       `"${FX_BIN}" mcp call help ${TOOL_NAME}; echo "help=$?"`,
-    ].join("\n")));
+    ].join("\n"), "--auto"));
     expect(seen).not.toContain(`${TOOL_NAME}\t`);
     expect(seen).toContain("list=0");
     expect(seen).toContain(`No MCP tool named ${TOOL_NAME} is available to this agent.`);
     expect(seen).toContain("help=1");
+  }, 90_000);
+
+  // Full access ignores MCP deny rules on every path (tests/tla/mcp_host/McpRules.tla, FullAccessIgnoresRules).
+  test("in full access, list and help show a tool the permission rules deny", async () => {
+    const root = bridgeRoot("bridge-lookups-denied-full", { permission: { bash: { "*": "allow" }, [TOOL_NAME]: "deny" } });
+    const seen = shellOutput(await runBridgeCommand(root, [
+      `"${FX_BIN}" mcp call list fixture; echo "list=$?"`,
+      `"${FX_BIN}" mcp call help ${TOOL_NAME}; echo "help=$?"`,
+    ].join("\n")));
+    expect(seen).toContain(`${TOOL_NAME}\t`);
+    expect(seen).toContain("list=0");
+    expect(seen).not.toContain(`No MCP tool named ${TOOL_NAME} is available to this agent.`);
+    expect(seen).toContain("help=0");
   }, 90_000);
 
   test.skipIf(!tmuxAvailable())(
@@ -4569,6 +4971,67 @@ describe("fx mcp call", () => {
   );
 
   test.skipIf(!tmuxAvailable())(
+    "in the TUI, the MCP row of a command's calls comes back after --resume last, without their arguments or results",
+    async () => {
+      const root = bridgeRoot("bridge-tui-resumed-rows", {}, { mode: "paged", expectedElicitation: "both" });
+      const stderrPath = join(root.root, "stderr.log");
+      const activeGateway = startFakeGateway([
+        fakeGatewayToolCall("run_call", "shell", { action: "run", command: pageLoop }),
+        fakeGatewayFinalText("BRIDGE_ROWS_SAVED"),
+      ], {
+        models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
+      });
+      gateway = activeGateway;
+      const env = { ...fixtureEnv(root, activeGateway), FX_PERMISSION_MODE: "full-access" };
+      tui = await TmuxSession.create({ isolated: true, cwd: root.workspace, width: 140, height: 40, stderrPath, env });
+      await tui.waitForComposer(15_000);
+      await tui.sendText("Page through the list.");
+      await tui.waitForText("BRIDGE_ROWS_SAVED", 30_000);
+      await tui.waitForComposer(10_000);
+      expect(await tui.captureFullScrollback()).toContain(`└ Ran MCP ${TOOL_NAME} ×3`);
+      await tui.sendText("/quit");
+      expect(await tui.waitForSessionEnd(10_000)).toBe(true);
+      tui = null;
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+
+      // The resumed session shows the rows the live one did, in the
+      // command's group, and asks the model nothing.
+      const resumedStderrPath = join(root.root, "resumed-stderr.log");
+      tui = await TmuxSession.create({
+        cmd: `${JSON.stringify(FX_BIN)} --resume last`,
+        isolated: true,
+        cwd: root.workspace,
+        width: 140,
+        height: 40,
+        stderrPath: resumedStderrPath,
+        env,
+      });
+      await tui.waitForComposer(15_000);
+      await tui.waitForText("BRIDGE_ROWS_SAVED", 15_000);
+      const resumed = await tui.captureFullScrollback();
+      expect(resumed).toContain("● Used MCP tools, ran a command ✓");
+      expect(resumed.split(`Ran MCP ${TOOL_NAME}`)).toHaveLength(2);
+      expect(resumed).toContain(`└ Ran MCP ${TOOL_NAME} ×3`);
+      expect(resumed).not.toContain("Running MCP");
+
+      // Ctrl+O shows each call's row, and neither the arguments the
+      // command sent nor the pages the tool returned.
+      await tui.sendKeys("C-o");
+      const full = await tui.waitForPane((pane) => pane.split(`Ran MCP ${TOOL_NAME}`).length === 4, 10_000);
+      expect(full).not.toContain('"text":"1"');
+      expect(full).not.toContain("item-0");
+      await tui.sendKeys("C-o");
+      await tui.waitForComposer(10_000);
+      await tui.sendText("/quit");
+      expect(await tui.waitForSessionEnd(10_000)).toBe(true);
+      tui = null;
+      expect(activeGateway.requests).toHaveLength(2);
+      expect(readFileSync(resumedStderrPath, "utf8")).toBe("");
+    },
+    90_000,
+  );
+
+  test.skipIf(!tmuxAvailable())(
     "in the TUI, a call that runs when the user cancels shows as running, then as cancelled",
     async () => {
       const root = bridgeRoot("bridge-tui-cancel", {}, { mode: "stall_operation", operationTimeoutMs: 30_000, expectedElicitation: "both" });
@@ -4580,13 +5043,14 @@ describe("fx mcp call", () => {
         models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
       });
       gateway = activeGateway;
+      const env = { ...fixtureEnv(root, activeGateway), FX_PERMISSION_MODE: "full-access" };
       tui = await TmuxSession.create({
         isolated: true,
         cwd: root.workspace,
         width: 140,
         height: 40,
         stderrPath,
-        env: { ...fixtureEnv(root, activeGateway), FX_PERMISSION_MODE: "full-access" },
+        env,
       });
 
       await tui.waitForComposer(15_000);
@@ -4596,13 +5060,193 @@ describe("fx mcp call", () => {
       await tui.sendInterruptEscapePair(10_000);
       await tui.waitForText(`Cancelled ${TOOL_NAME}`, 10_000);
       await tui.waitForStableComposer(10_000);
-      expect(await tui.captureFullScrollback()).not.toContain("Running MCP");
+      const liveScreen = await tui.captureFullScrollback();
+      expect(liveScreen).not.toContain("Running MCP");
+      // The compact rows of the cancelled turn: its command by its short
+      // name, in one group with the call.
+      const compactRows = (screen: string) =>
+        screen.split("\n").map((line) => line.trimEnd()).filter((line) => /^\s*[●├└▪] /.test(line));
+      const live = compactRows(liveScreen);
+      expect(live.some((line) => /^[├└] Cancelled /.test(line) && !line.includes(TOOL_NAME))).toBe(true);
+      expect(live).toContain(`└ Cancelled ${TOOL_NAME}`);
+      // The command's notice names no command, so no row holds the command
+      // line, its fx path, or its arguments; the call's own notice names its
+      // tool, as before.
+      const cancelledNotices = [
+        "▪ Cancelled · What can fx do differently?",
+        `▪ Cancelled ${TOOL_NAME} · What can fx do differently?`,
+      ];
+      expect(live.filter((line) => line.startsWith("▪"))).toEqual(cancelledNotices);
+      expect(live.join("\n")).not.toContain("> out.txt");
+      expect(live.join("\n")).not.toContain(FX_BIN);
 
       // The session goes on.
       await tui.sendText("Go on.");
       await tui.waitForText("BRIDGE_AFTER_CANCEL", 10_000);
+      await tui.waitForComposer(10_000);
+      await tui.sendText("/quit");
+      expect(await tui.waitForSessionEnd(10_000)).toBe(true);
+      tui = null;
       expect(readFileSync(stderrPath, "utf8")).toBe("");
+
+      // A resume shows the call as it ended, cancelled.
+      const resumedStderrPath = join(root.root, "resumed-stderr.log");
+      tui = await TmuxSession.create({
+        cmd: `${JSON.stringify(FX_BIN)} --resume last`,
+        isolated: true,
+        cwd: root.workspace,
+        width: 140,
+        height: 40,
+        stderrPath: resumedStderrPath,
+        env,
+      });
+      await tui.waitForComposer(15_000);
+      await tui.waitForText("BRIDGE_AFTER_CANCEL", 15_000);
+      const resumed = await tui.captureFullScrollback();
+      // The cancelled turn's rows read as they did live, the command's row
+      // and the call's in one group.
+      const followUp = resumed.indexOf("┃ Go on.");
+      expect(followUp).toBeGreaterThan(0);
+      const resumedRows = compactRows(resumed.slice(0, followUp));
+      expect(resumedRows).toEqual(live);
+      expect(resumedRows.filter((line) => line.startsWith("▪"))).toEqual(cancelledNotices);
+      expect(resumedRows.join("\n")).not.toContain("> out.txt");
+      expect(resumed).not.toContain("Running MCP");
+      expect(toolCalls(root)).toHaveLength(1);
+      await tui.sendText("/quit");
+      expect(await tui.waitForSessionEnd(10_000)).toBe(true);
+      tui = null;
+      expect(readFileSync(resumedStderrPath, "utf8")).toBe("");
     },
-    60_000,
+    90_000,
   );
+});
+
+// A deny rule names an MCP tool. In full access fx skips its permission
+// policy, so no rule hides or blocks an MCP tool on any path: toolbox search,
+// open of a small and of a large server, open and run of a tool, and a shell
+// command's `fx mcp call` list, search, help and call, for the main agent and
+// for a subagent. In ask and auto a denied tool stays hidden and refused on
+// every path. What a subagent's access allows holds in every mode.
+describe("MCP deny rules by permission mode", () => {
+  const rules = { [SMALL_TOOL]: "deny", [LARGE_TOOL]: "deny" };
+  const DENIED: Array<[PathName, string]> = [
+    ["search", SMALL_TOOL], ["search", LARGE_TOOL],
+    ["open_small", SMALL_TOOL], ["open_large", LARGE_TOOL],
+    ["open_tool", SMALL_TOOL], ["open_tool", LARGE_TOOL],
+    ["run", SMALL_TOOL], ["run", LARGE_TOOL],
+    ["bridge_list", SMALL_TOOL], ["bridge_list", LARGE_TOOL],
+    ["bridge_search", SMALL_TOOL], ["bridge_search", LARGE_TOOL],
+    ["bridge_help", SMALL_TOOL], ["bridge_help", LARGE_TOOL],
+    ["bridge_call", SMALL_TOOL], ["bridge_call", LARGE_TOOL],
+  ];
+  const READ_ONLY = DENIED.filter(([path]) => path === "search" || path.startsWith("open_"));
+  const UNDENIED: Array<[PathName, string]> = [["open_large", OTHER_TOOL], ["open_tool", OTHER_TOOL], ["run", OTHER_TOOL], ["bridge_call", OTHER_TOOL]];
+  const name = ([path, tool]: [PathName, string]) => `${path} ${tool}`;
+  const hidden = (run: PathsRun, pairs: Array<[PathName, string]>) => pairs.filter(([p, t]) => !seen(run, p, t).shown).map(name);
+  const shown = (run: PathsRun, pairs: Array<[PathName, string]>) => pairs.filter(([p, t]) => seen(run, p, t).shown).map(name);
+  const ok = (run: PathsRun) => expect([run.code, run.stderr.slice(-200)]).toEqual([0, run.stderr.slice(-200)]);
+
+  test("full access: every path finds, opens and runs a tool a deny rule names", async () => {
+    const run = await runPaths({ bin: FX_BIN, mode: "full", rules });
+    ok(run);
+    expect(hidden(run, DENIED)).toEqual([]);
+    expect(hidden(run, UNDENIED)).toEqual([]);
+  }, 240_000);
+
+  test("full access: a subagent finds, opens and runs it too", async () => {
+    const run = await runPaths({ bin: FX_BIN, mode: "full", agent: "child", rules });
+    ok(run);
+    expect(hidden(run, DENIED)).toEqual([]);
+    expect(hidden(run, UNDENIED)).toEqual([]);
+  }, 240_000);
+
+  test("guard: in full access a subagent limited to the big server still gets 'not found' for the other server's tool", async () => {
+    const run = await runPaths({ bin: FX_BIN, mode: "full", agent: "child", rules: { [SMALL_TOOL]: "deny" }, childServers: ["big"] });
+    ok(run);
+    const fixture = DENIED.filter(([, tool]) => tool === SMALL_TOOL);
+    expect(shown(run, fixture)).toEqual([]);
+    expect(hidden(run, [...UNDENIED, ["open_large", LARGE_TOOL], ["run", LARGE_TOOL]])).toEqual([]);
+  }, 240_000);
+
+  test("edge: a subagent whose profile sets full access under a host in auto ignores the rule, as the mode it runs in says", async () => {
+    const run = await runPaths({ bin: FX_BIN, mode: "auto", childMode: "full", agent: "child", rules, label: "child-full-under-auto" });
+    ok(run);
+    expect(hidden(run, DENIED)).toEqual([]);
+    expect(hidden(run, UNDENIED)).toEqual([]);
+  }, 240_000);
+
+  test("guard: a subagent whose profile sets auto under a host in full access still gets the rule", async () => {
+    const run = await runPaths({ bin: FX_BIN, mode: "full", childMode: "auto", agent: "child", rules, label: "child-auto-under-full" });
+    ok(run);
+    expect(shown(run, DENIED)).toEqual([]);
+    expect(hidden(run, UNDENIED)).toEqual([]);
+  }, 240_000);
+
+  test("guard: in auto a denied tool stays hidden and refused on every path, in the words it has always had", async () => {
+    const run = await runPaths({ bin: FX_BIN, mode: "auto", rules });
+    ok(run);
+    expect(shown(run, DENIED)).toEqual([]);
+    expect(hidden(run, UNDENIED)).toEqual([]);
+    expect(seen(run, "open_tool", SMALL_TOOL).text).toContain(`Nothing named ${SMALL_TOOL} is in the toolbox menu. Use toolbox search to find it.`);
+    expect(seen(run, "run", SMALL_TOOL).text).toContain(`No tool named ${SMALL_TOOL} is in the toolbox. Use toolbox search to find it.`);
+    expect(seen(run, "bridge_help", SMALL_TOOL).text).toContain(`No MCP tool named ${SMALL_TOOL} is available to this agent.`);
+  }, 240_000);
+
+  test("guard: in auto a subagent's denied tool stays hidden and refused too", async () => {
+    const run = await runPaths({ bin: FX_BIN, mode: "auto", agent: "child", rules });
+    ok(run);
+    expect(shown(run, DENIED)).toEqual([]);
+    expect(hidden(run, UNDENIED)).toEqual([]);
+  }, 240_000);
+
+  test("guard: in ask, search and open hide a denied tool", async () => {
+    const run = await runPaths({ bin: FX_BIN, mode: "ask", rules, readOnly: true });
+    ok(run);
+    expect(shown(run, READ_ONLY)).toEqual([]);
+    expect(hidden(run, [["open_large", OTHER_TOOL], ["open_tool", OTHER_TOOL]])).toEqual([]);
+  }, 240_000);
+
+  test("edge: a rule on a whole server hides all of it in auto and nothing of it in full access", async () => {
+    const wholeServer = { "mcp_big_*": "deny" };
+    const bigTools = DENIED.filter(([, tool]) => tool === LARGE_TOOL);
+    const auto = await runPaths({ bin: FX_BIN, mode: "auto", rules: wholeServer, label: "whole-auto" });
+    ok(auto);
+    expect(shown(auto, [...bigTools, ...UNDENIED.filter(([, tool]) => tool === OTHER_TOOL)])).toEqual([]);
+    const full = await runPaths({ bin: FX_BIN, mode: "full", rules: wholeServer, label: "whole-full" });
+    ok(full);
+    expect(hidden(full, [...bigTools, ...UNDENIED])).toEqual([]);
+  }, 400_000);
+
+  test("edge: with an allow rule and a deny rule for one tool, auto keeps the deny and full access ignores both", async () => {
+    const both = { "mcp_fixture_*": "allow", [SMALL_TOOL]: "deny" };
+    const smallTool = DENIED.filter(([, tool]) => tool === SMALL_TOOL);
+    const auto = await runPaths({ bin: FX_BIN, mode: "auto", rules: both, label: "both-auto" });
+    ok(auto);
+    expect(shown(auto, smallTool)).toEqual([]);
+    const full = await runPaths({ bin: FX_BIN, mode: "full", rules: both, label: "both-full" });
+    ok(full);
+    expect(hidden(full, smallTool)).toEqual([]);
+  }, 400_000);
+
+  test("edge: a rule for the bare tool name matches nothing, in every mode", async () => {
+    const bare = { echo: "deny", tool_01: "deny" };
+    for (const mode of ["auto", "full"] as const) {
+      const run = await runPaths({ bin: FX_BIN, mode, rules: bare, label: `bare-${mode}` });
+      ok(run);
+      expect([mode, hidden(run, DENIED)]).toEqual([mode, []]);
+    }
+  }, 400_000);
+
+  test("fault: a server that is down answers the same in full access and in auto", async () => {
+    const auto = await runPaths({ bin: FX_BIN, mode: "auto", rules: {}, down: true, readOnly: true, label: "down-auto" });
+    const full = await runPaths({ bin: FX_BIN, mode: "full", rules: {}, down: true, readOnly: true, label: "down-full" });
+    ok(auto);
+    ok(full);
+    // A server that exits at start is not in the menu: the same words in both modes.
+    expect(seen(auto, "open_small", SMALL_TOOL).text).toContain("Nothing named fixture is in the toolbox menu.");
+    for (const path of ["search", "open_small", "open_tool"] as const) {
+      expect([path, seen(full, path, SMALL_TOOL).text]).toEqual([path, seen(auto, path, SMALL_TOOL).text]);
+    }
+  }, 400_000);
 });

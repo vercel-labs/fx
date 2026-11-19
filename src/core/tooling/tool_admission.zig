@@ -825,6 +825,11 @@ fn shellInputReceiver(
     const snapshot = terminal_managed_observer.inspectInput(context, session_id) catch |err| {
         if (err == error.OutOfMemory or err == error.Cancelled) return err;
         debug_trace.logf("permission", "event=shell_input_review_receiver_unavailable call_id={s} session_id={s} reason={s}", .{ call.id, session_id, @errorName(err) });
+        // A session that has exited, closed, or gone missing can no longer
+        // take input. Closing it revokes its authority, so that error means
+        // the same. Any other failure keeps the review hold.
+        if (err == error.TerminalSessionEnded or err == error.TerminalSessionNotFound or
+            err == error.TerminalSessionLost or err == error.AuthorityRevoked) return error.ShellInputSessionEnded;
         return null;
     };
     // The request borrows these owned slices for the admission arena's lifetime.
@@ -834,6 +839,17 @@ fn shellInputReceiver(
         .cwd = snapshot.cwd,
         .screen = snapshot.screen,
     };
+}
+
+/// Tells the agent that its input went nowhere because the target session has
+/// ended, and what to do instead.
+fn shellInputSessionEndedText(arena: Allocator, call: ToolCall) ![]const u8 {
+    const args = try tool_args.parseToolArgsObject(arena, call.arguments_json);
+    const session_id = try tool_args.requiredStringArg(args, "session_id");
+    return arena.print(
+        "Session {f} is no longer running, so it can't take input. Nothing was sent. Start a new session, or read the old session's final output with an interact call that sends no input.",
+        .{text_utils.terminalSafe(session_id)},
+    );
 }
 
 fn provenBindingsForAction(
@@ -957,6 +973,7 @@ const ReviewTrace = struct {
     /// Why no decision came, or the error's name.
     reason: []const u8 = "",
     rationale: []const u8 = "",
+    attempts: []const diagnostics.AutoReviewAttempt = &.{},
 };
 
 fn reviewTraceOf(review: permission_auto_classifier.ParseOutcome) ReviewTrace {
@@ -1022,6 +1039,7 @@ fn recordAutoReview(
         .action = if (action) |value| reviewedActionText(value) else call.arguments_json,
         .reason = trace.reason,
         .rationale = trace.rationale,
+        .attempts = trace.attempts,
         .at_ms = started_ms,
     });
 }
@@ -1130,14 +1148,21 @@ fn automaticReviewOutcome(
         return reviewerUnavailableOutcome(input, call, .turn_review_budget_exhausted);
     }
 
-    const request = try reviewRequestForCall(
+    var request = reviewRequestForCall(
         input,
         arena,
         call,
         targets,
         is_dynamic_tool,
         file_authorization,
-    );
+    ) catch |err| switch (err) {
+        // Input cannot reach a session that has ended, so nothing would run
+        // and there is nothing to review.
+        error.ShellInputSessionEnded => return .{ .tool_failure = try shellInputSessionEndedText(arena, call) },
+        else => return err,
+    };
+    var attempt_log: permission_auto_classifier.AttemptLog = .{};
+    request.attempt_log = &attempt_log;
     const review = try runAutomaticReview(input, arena, call, request);
     if (nonAllowAutoReviewOutcome(review)) |blocked| return blocked;
     var outcome = if (file_authorization) |authorization|
@@ -1159,6 +1184,25 @@ fn automaticReviewOutcome(
     return outcome;
 }
 
+/// The sends `request`'s review made, for `/trace`. The arena owns the slice.
+fn traceAttempts(arena: Allocator, request: permission_auto_classifier.ReviewRequest) []const diagnostics.AutoReviewAttempt {
+    const log = request.attempt_log orelse return &.{};
+    const out = arena.alloc(diagnostics.AutoReviewAttempt, log.slice().len) catch return &.{};
+    for (log.slice(), out) |attempt, *slot| slot.* = .{
+        .result = switch (attempt.result) {
+            .answered => .answered,
+            .malformed => .malformed,
+            .timed_out => .timed_out,
+            .transient_failure => .transient_failure,
+            .permanent_failure => .permanent_failure,
+            .call_failed => .call_failed,
+            .cancelled => .cancelled,
+        },
+        .elapsed_ms = attempt.elapsed_ms,
+    };
+    return out;
+}
+
 fn runAutomaticReview(
     input: Input,
     arena: Allocator,
@@ -1177,10 +1221,12 @@ fn runAutomaticReview(
             "event=auto_review_result tool_name={s} decision=cancelled_or_error fallback_reason={s} elapsed_ms={d} execution_started=false call_id={s}",
             .{ call.name, @errorName(err), io_mod.milliTimestamp() - started_ms, call.id },
         );
-        recordAutoReview(call, request.review_turn, request.action, .{ .outcome = .@"error", .reason = @errorName(err) }, started_ms, io_mod.milliTimestamp());
+        recordAutoReview(call, request.review_turn, request.action, .{ .outcome = .@"error", .reason = @errorName(err), .attempts = traceAttempts(arena, request) }, started_ms, io_mod.milliTimestamp());
         return err;
     };
-    recordAutoReview(call, request.review_turn, request.action, reviewTraceOf(review), started_ms, io_mod.milliTimestamp());
+    var trace = reviewTraceOf(review);
+    trace.attempts = traceAttempts(arena, request);
+    recordAutoReview(call, request.review_turn, request.action, trace, started_ms, io_mod.milliTimestamp());
     switch (review) {
         .valid => |result| debug_trace.logf(
             "permission",
@@ -6191,6 +6237,74 @@ test "session deny narrows configured command allow" {
     try std.testing.expectEqual(ToolPermissionDecision.policy_denied, denied.decision);
     try std.testing.expect(denied.execution_authority == null);
     try std.testing.expectEqual(@as(usize, 0), recording.calls);
+}
+
+test "a session approval merged into a turn's list lets its command run with no prompt, and another command, a deny rule, and another root still win" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var worker: WorkerRuntime = .{};
+    defer worker.deinit(alloc);
+    var input = testInputWithClassifier(
+        &worker,
+        permission_auto_classifier.Classifier.disabled(),
+    );
+    var recording = RecordingPrompter{};
+    input.permission_prompter = recording.prompter();
+    const call = ToolCall{
+        .id = "merged-grant",
+        .name = "shell",
+        .arguments_json = "{\"action\":\"run\",\"command\":\"touch granted.txt\"}",
+    };
+    const other = ToolCall{
+        .id = "merged-other",
+        .name = "shell",
+        .arguments_json = "{\"action\":\"run\",\"command\":\"touch other.txt\"}",
+    };
+    const target = try permissionTargetForCall(input, arena, call);
+    // What a subagent's answer adds to the instance's list, as it reaches the
+    // list a turn of main checks against.
+    const grants = try permissions.suggestedSessionGrants(arena, input.workspace_root, "run_command", target, .command_cwd);
+
+    // Without it the command asks.
+    _ = try requestPermissionOutcome(input, arena, call, .ask, &.{});
+    try std.testing.expectEqual(@as(usize, 1), recording.calls);
+    // With it the same command runs with no prompt, and another one asks.
+    const allowed = try requestPermissionOutcome(input, arena, call, .ask, grants);
+    try std.testing.expect(!allowed.decision.isDenied());
+    try std.testing.expectEqual(@as(usize, 1), recording.calls);
+    _ = try requestPermissionOutcome(input, arena, other, .ask, grants);
+    try std.testing.expectEqual(@as(usize, 2), recording.calls);
+
+    // In `auto` mode the approval skips the automatic safety check too. The
+    // classifier here cannot run, so without the approval the command is not
+    // allowed silently, and with it the command is allowed and nothing asks.
+    const before_auto = recording.calls;
+    const auto_without = try requestPermissionOutcome(input, arena, call, .auto, &.{});
+    try std.testing.expect(auto_without.decision.isDenied() or recording.calls > before_auto);
+    const before_auto_granted = recording.calls;
+    const auto_with = try requestPermissionOutcome(input, arena, call, .auto, grants);
+    try std.testing.expect(!auto_with.decision.isDenied());
+    try std.testing.expectEqual(before_auto_granted, recording.calls);
+
+    // The approval of a file change covers the tree it was given in, and no
+    // other root.
+    const tree = try permissions.suggestedSessionGrants(arena, "/tmp/workspace", "write_file", "/tmp/workspace/app/page.tsx", .path_create_parent);
+    try std.testing.expect(permissions.sessionGrantAllowed(tree, "write_file", "/tmp/workspace/other/file.txt"));
+    try std.testing.expect(!permissions.sessionGrantAllowed(tree, "write_file", "/tmp/elsewhere/file.txt"));
+
+    // A rule that denies the command wins over the approval, with no prompt.
+    var rules = [_]types.PermissionRule{.{
+        .permission = @constCast("bash"),
+        .pattern = @constCast("touch *"),
+        .action = .deny,
+    }};
+    input.permission_rules = .{ .rules = &rules };
+    const before_denied = recording.calls;
+    const denied = try requestPermissionOutcome(input, arena, call, .ask, grants);
+    try std.testing.expectEqual(ToolPermissionDecision.policy_denied, denied.decision);
+    try std.testing.expectEqual(before_denied, recording.calls);
 }
 
 test "prepared session deny blocks local file mutation without setup effects" {
