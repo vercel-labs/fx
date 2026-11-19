@@ -1099,13 +1099,16 @@ pub fn commandApprovalFitsInline(
     layout: types.Layout,
     banner_row_count: usize,
 ) !bool {
-    const picker_rows = try approval_ui.inlineApprovalPanelRowsForCommand(
+    const picker_rows = approval_ui.inlineApprovalPanelRowsForCommand(
         alloc,
         label,
         command,
         layout.cols,
         layout.rows,
-    );
+    ) catch |err| switch (err) {
+        error.CommandDoesNotFit => return false,
+        else => return err,
+    };
     const banner_rows: u16 = @intCast(@min(banner_row_count, std.math.maxInt(u16)));
     const measurement = SurfaceFooterMeasurement{
         .input_visible = false,
