@@ -127,6 +127,7 @@ const Writable = enum {
     auto_upgrade,
     cache_warming,
     collapse_tool_calls,
+    show_reasoning,
     context,
     effort,
     fast_mode,
@@ -230,6 +231,7 @@ pub fn change(options: Options, problem: *WriteProblem) error{ RefusedConfigSett
         .auto_upgrade => patch.auto_upgrade = enabled,
         .cache_warming => patch.cache_warming = enabled,
         .collapse_tool_calls => patch.collapse_tool_calls = enabled,
+        .show_reasoning => patch.show_reasoning = enabled,
         .context => patch.context = enabled,
         .fast_mode => patch.fast_mode = enabled,
         .@"prompt_history.enabled" => patch.prompt_history_enabled = enabled,
@@ -449,16 +451,16 @@ pub const Effective = union(enum) {
 /// The keys `fx config` reads from the resolved state instead of the files.
 /// A test checks that each plain key is here or in `files_only_keys`.
 pub const resolved_keys = [_][]const u8{
-    "auto_compact_percent",           "auto_upgrade",             "cache_warming",
-    "collapse_tool_calls",            "context",                  "effort",
-    "experimental.workspace_capture", "fast_mode",                "first_call_tool_choice",
-    "max_agent_steps",                "max_tool_result_bytes",    "permission_mode",
-    "prompt_history.enabled",         "provider",                 "provider_order",
-    "provider_strict",                "review_model",             "session_titles",
-    "slash_menu_categories",          "sound.attention_required", "sound.max",
-    "sound.turn_end",                 "startup_scrollback",       "status_line.context",
-    "status_line.session",            "status_line.workspace",    "theme",
-    "ultrafast_mode",                 "update_channel",
+    "auto_compact_percent",           "auto_upgrade",          "cache_warming",
+    "collapse_tool_calls",            "context",               "effort",
+    "experimental.workspace_capture", "fast_mode",             "first_call_tool_choice",
+    "max_agent_steps",                "max_tool_result_bytes", "permission_mode",
+    "prompt_history.enabled",         "provider",              "provider_order",
+    "provider_strict",                "review_model",          "session_titles",
+    "show_reasoning",                 "slash_menu_categories", "sound.attention_required",
+    "sound.max",                      "sound.turn_end",        "startup_scrollback",
+    "status_line.context",            "status_line.session",   "status_line.workspace",
+    "theme",                          "ultrafast_mode",        "update_channel",
 };
 
 /// Keys `fx config` shows as the files set them: objects fx checks with its
@@ -485,6 +487,7 @@ pub fn effectiveValue(
     if (eql(u8, key, "auto_compact_percent")) return integer(arena, state.auto_compact_percent);
     if (eql(u8, key, "auto_upgrade")) return boolean(state.auto_upgrade);
     if (eql(u8, key, "collapse_tool_calls")) return boolean(state.collapse_tool_calls);
+    if (eql(u8, key, "show_reasoning")) return boolean(state.show_reasoning);
     if (eql(u8, key, "context")) return boolean(state.context_enabled);
     if (eql(u8, key, "effort")) return string(state.effort.label());
     if (eql(u8, key, "experimental.workspace_capture")) return boolean(state.workspace_capture);

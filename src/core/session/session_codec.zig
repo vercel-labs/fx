@@ -1871,13 +1871,23 @@ fn writeExecutionMemoryJsonFrom(
 ) !void {
     std.debug.assert(from.tool_steps <= execution.tool_steps.len and from.files <= execution.files.len and from.steering <= execution.steering.len);
     // Version 11 adds `context_notes` (D93) and version 12 `runtime_context`
-    // (D94). Only an execution that has them uses them, so one without keeps
-    // version 10 and its exact bytes; an older fx rejects either version as it
-    // rejects every newer version.
+    // (D94). Version 13 adds `reasoning`. Only an execution that has them uses
+    // them, so one without keeps the older version and its exact bytes; an
+    // older fx rejects either newer version as it rejects every newer version.
+    const with_reasoning = format == .durable and execution.reasoning != null;
     const with_runtime_context = format == .durable and execution.runtime_context != null;
-    try writer.writeAll(if (with_runtime_context)
+    const with_notes = format == .durable and execution.context_notes.len > 0;
+    // Versions 12 and 13 always name the notes list; an older version names
+    // it only when it has notes.
+    const names_context_notes = with_reasoning or with_runtime_context or with_notes;
+    // Without a runtime context, version 13 closes the notes list beside its
+    // null runtime context, so the turn summary follows without another `]`.
+    const runtime_line_closes_notes = with_reasoning and !with_runtime_context;
+    try writer.writeAll(if (with_reasoning)
+        "{\"schema_version\":13,\"tool_steps\":["
+    else if (with_runtime_context)
         "{\"schema_version\":12,\"tool_steps\":["
-    else if (format == .durable and execution.context_notes.len > 0)
+    else if (with_notes)
         "{\"schema_version\":11,\"tool_steps\":["
     else if (format == .durable)
         "{\"schema_version\":10,\"tool_steps\":["
@@ -1897,10 +1907,10 @@ fn writeExecutionMemoryJsonFrom(
         if (i > 0) try writer.writeByte(',');
         try writeExecutionSteering(writer, steering, format);
     }
-    if (with_runtime_context or (format == .durable and execution.context_notes.len > 0)) {
+    if (names_context_notes) {
         // Only an execution with notes names them, so one without stays as
-        // before (D93); version 12 always names them. A delta writes them
-        // whole: the journal's merge keeps the delta's list (`journal.zig`
+        // before (D93); versions 12 and 13 always name them. A delta writes
+        // them whole: the journal's merge keeps the delta's list (`journal.zig`
         // mergeDelta).
         try writer.writeAll("],\"context_notes\":[");
         for (execution.context_notes, 0..) |note, i| {
@@ -1919,18 +1929,45 @@ fn writeExecutionMemoryJsonFrom(
             if (i > 0) try writer.writeByte(',');
             try writeExecutionBytes(writer, text, format);
         }
+    } else if (with_reasoning) {
+        // Schema 13 always names the key, so a turn without one writes null.
+        try writer.writeAll("],\"runtime_context\":null");
     }
     if (format == .durable) {
-        try writer.writeAll("],\"turn_summary\":");
+        // The last list stays open until here: the steering list, or the notes
+        // list when one was named, or the runtime context. Version 13's null
+        // runtime context already closed the notes list itself.
+        try writer.writeAll(if (runtime_line_closes_notes)
+            ",\"turn_summary\":"
+        else
+            "],\"turn_summary\":");
         if (execution.turn_summary) |summary| {
             try writeTurnSummary(writer, summary);
         } else {
             try writer.writeAll("null");
         }
+        if (with_reasoning) {
+            try writer.writeAll(",\"reasoning\":");
+            if (execution.reasoning) |record| {
+                try writeReasoningRecord(writer, record, format);
+            } else {
+                try writer.writeAll("null");
+            }
+        }
     } else {
         try writer.writeByte(']');
     }
     try writer.writeByte('}');
+}
+
+fn writeReasoningRecord(
+    writer: *std.Io.Writer,
+    record: types.ReasoningRecord,
+    format: ExecutionMemoryJsonFormat,
+) !void {
+    try writer.writeAll("{\"text\":");
+    try writeExecutionBytes(writer, record.text, format);
+    try writer.print(",\"duration_ms\":{d},\"tokens\":{d}}}", .{ record.duration_ms, record.tokens });
 }
 
 fn writeExecutionToolStep(writer: *std.Io.Writer, step: session.ToolExecutionStep, format: ExecutionMemoryJsonFormat, image_mode: anytype) !void {
@@ -2044,7 +2081,8 @@ pub fn executionHashes(alloc: Allocator, checkpoint: RecoveryCheckpoint) !Execut
 }
 
 fn hasDurableExecutionMemory(execution: session.ExecutionMemory) bool {
-    return !execution.isEmpty() or execution.turn_summary != null or execution.runtime_context != null;
+    return !execution.isEmpty() or execution.turn_summary != null or
+        execution.runtime_context != null or execution.reasoning != null;
 }
 
 fn writeTurnSummary(writer: *std.Io.Writer, summary: types.TurnSummary) !void {
@@ -2579,6 +2617,7 @@ fn parseExecutionMemoryWith(alloc: Allocator, value: std.json.Value, sources: Im
         7...10 => try exactObject(value, &.{ "schema_version", "tool_steps", "files", "steering", "turn_summary" }),
         11 => try exactObject(value, &.{ "schema_version", "tool_steps", "files", "steering", "context_notes", "turn_summary" }),
         12 => try exactObject(value, &.{ "schema_version", "tool_steps", "files", "steering", "context_notes", "runtime_context", "turn_summary" }),
+        13 => try exactObject(value, &.{ "schema_version", "tool_steps", "files", "steering", "context_notes", "runtime_context", "turn_summary", "reasoning" }),
         else => return error.InvalidSessionFormat,
     };
     const tool_steps = try parseToolSteps(
@@ -2605,15 +2644,21 @@ fn parseExecutionMemoryWith(alloc: Allocator, value: std.json.Value, sources: Im
     else
         &.{};
     errdefer types.freePersistedContextNotes(alloc, context_notes);
-    const runtime_context: ?[][]u8 = if (object.get("runtime_context")) |texts|
-        try parseRuntimeContext(alloc, texts)
-    else
-        null;
+    const runtime_context: ?[][]u8 = if (object.get("runtime_context")) |texts| blk: {
+        // Version 13 always names the key, so a turn without one writes null.
+        if (texts == .null and schema_version >= 13) break :blk null;
+        break :blk try parseRuntimeContext(alloc, texts);
+    } else null;
     errdefer if (runtime_context) |texts| types.freeRuntimeContext(alloc, texts);
     const turn_summary = if (schema_version >= 5)
         try parseOptionalTurnSummary(object.get("turn_summary").?)
     else
         null;
+    const reasoning: ?types.ReasoningRecord = if (schema_version >= 13)
+        try parseOptionalReasoning(alloc, object.get("reasoning").?)
+    else
+        null;
+    errdefer if (reasoning) |record| types.freeReasoningRecord(alloc, record);
     return .{
         .tool_steps = tool_steps,
         .files = files,
@@ -2621,7 +2666,22 @@ fn parseExecutionMemoryWith(alloc: Allocator, value: std.json.Value, sources: Im
         .context_notes = context_notes,
         .runtime_context = runtime_context,
         .turn_summary = turn_summary,
+        .reasoning = reasoning,
     };
+}
+
+/// Schema 13's reasoning, or null when the turn never thought. The text is
+/// the transcript's, so it is bounded and valid UTF-8.
+fn parseOptionalReasoning(alloc: Allocator, value: std.json.Value) !?types.ReasoningRecord {
+    if (value == .null) return null;
+    const object = try exactObject(value, &.{ "text", "duration_ms", "tokens" });
+    const duration_ms = try requireU64(object, "duration_ms");
+    const tokens = try requireU64(object, "tokens");
+    const text = try parseDurableBytes(alloc, object.get("text") orelse return error.InvalidSessionFormat);
+    errdefer alloc.free(text);
+    if (text.len == 0 or text.len > types.ReasoningRecord.max_text_bytes or
+        !std.unicode.utf8ValidateSlice(text)) return error.InvalidSessionFormat;
+    return .{ .text = text, .duration_ms = duration_ms, .tokens = tokens };
 }
 
 /// Caller owns the result. Boundaries never decrease and never pass the
@@ -5053,6 +5113,102 @@ test "execution memory codec writes the runtime context only for the turn that c
         defer session.freeExecutionMemory(alloc, execution);
         try std.testing.expectEqual(@as(usize, 2), execution.runtime_context.?.len);
         try std.testing.expectEqualStrings("b", execution.runtime_context.?[1]);
+    }
+}
+
+test "execution memory codec writes the reasoning only for a turn that has it (schema 13)" {
+    const alloc = std.testing.allocator;
+    var captured = [_][]u8{@constCast("runtime context")};
+    var notes = [_]types.PersistedContextNote{.{ .text = @constCast("note"), .after_tool_step_count = 0 }};
+    const record = types.ReasoningRecord{
+        .text = @constCast("first\n\nsecond"),
+        .duration_ms = 4_200,
+        .tokens = 37,
+    };
+    const Case = struct {
+        runtime: bool,
+        notes: bool,
+        text: []const u8,
+        version: []const u8,
+    };
+    for ([_]Case{
+        .{ .runtime = false, .notes = false, .text = "\"schema_version\":13", .version = "\"runtime_context\":null" },
+        .{ .runtime = false, .notes = true, .text = "\"schema_version\":13", .version = "\"runtime_context\":null" },
+        .{ .runtime = true, .notes = false, .text = "\"schema_version\":13", .version = "\"runtime_context\":[\"runtime context\"]" },
+        .{ .runtime = true, .notes = true, .text = "\"schema_version\":13", .version = "\"runtime_context\":[\"runtime context\"]" },
+    }) |case| {
+        const turn: session.HistoryTurn = .{ .assistant = .{
+            .user = .{ .text = @constCast("prompt") },
+            .assistant = @constCast("done"),
+            .execution = .{
+                .context_notes = if (case.notes) notes[0..] else &.{},
+                .runtime_context = if (case.runtime) captured[0..] else null,
+                .reasoning = record,
+            },
+        } };
+        var encoded: std.Io.Writer.Allocating = .init(alloc);
+        defer encoded.deinit();
+        try writeHistoryTurn(&encoded.writer, turn);
+        try std.testing.expect(std.mem.find(u8, encoded.written(), case.text) != null);
+        try std.testing.expect(std.mem.find(u8, encoded.written(), case.version) != null);
+        try std.testing.expect(std.mem.find(u8, encoded.written(), "\"reasoning\":{\"text\":\"first\\n\\nsecond\",\"duration_ms\":4200,\"tokens\":37}") != null);
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, encoded.written(), .{});
+        defer parsed.deinit();
+        const decoded = try parseHistoryTurn(alloc, parsed.value);
+        defer session.freeHistoryTurn(alloc, decoded);
+        const execution = decoded.assistant.execution;
+        try std.testing.expectEqualStrings(record.text, execution.reasoning.?.text);
+        try std.testing.expectEqual(record.duration_ms, execution.reasoning.?.duration_ms);
+        try std.testing.expectEqual(record.tokens, execution.reasoning.?.tokens);
+        if (case.runtime) {
+            try std.testing.expectEqual(@as(usize, 1), execution.runtime_context.?.len);
+        } else {
+            try std.testing.expect(execution.runtime_context == null);
+        }
+        // The legacy presentation export names its own version and never the
+        // reasoning.
+        var shown: std.Io.Writer.Allocating = .init(alloc);
+        defer shown.deinit();
+        try writeExecutionMemoryJson(&shown.writer, turn.assistant.execution, .presentation);
+        try std.testing.expect(std.mem.find(u8, shown.written(), "\"schema_version\":3") != null);
+        try std.testing.expect(std.mem.find(u8, shown.written(), "reasoning") == null);
+    }
+
+    // A turn without reasoning keeps exactly the older bytes.
+    var plain_json: std.Io.Writer.Allocating = .init(alloc);
+    defer plain_json.deinit();
+    try writeExecutionMemoryJson(&plain_json.writer, .{}, .durable);
+    try std.testing.expectEqualStrings(
+        "{\"schema_version\":10,\"tool_steps\":[],\"files\":[],\"steering\":[],\"turn_summary\":null}",
+        plain_json.written(),
+    );
+
+    for ([_]struct { json: []const u8, valid: bool }{
+        .{ .json = "{\"schema_version\":13,\"tool_steps\":[],\"files\":[],\"steering\":[],\"context_notes\":[],\"runtime_context\":null,\"turn_summary\":null,\"reasoning\":null}", .valid = true },
+        .{ .json = "{\"schema_version\":13,\"tool_steps\":[],\"files\":[],\"steering\":[],\"context_notes\":[],\"runtime_context\":null,\"turn_summary\":null,\"reasoning\":{\"text\":\"a\",\"duration_ms\":1,\"tokens\":2}}", .valid = true },
+        .{ .json = "{\"schema_version\":13,\"tool_steps\":[],\"files\":[],\"steering\":[],\"context_notes\":[],\"runtime_context\":null,\"turn_summary\":null}", .valid = false },
+        .{ .json = "{\"schema_version\":13,\"tool_steps\":[],\"files\":[],\"steering\":[],\"context_notes\":[],\"runtime_context\":null,\"turn_summary\":null,\"reasoning\":{\"text\":\"\",\"duration_ms\":1,\"tokens\":2}}", .valid = false },
+        .{ .json = "{\"schema_version\":13,\"tool_steps\":[],\"files\":[],\"steering\":[],\"context_notes\":[],\"runtime_context\":null,\"turn_summary\":null,\"reasoning\":{\"text\":\"a\",\"duration_ms\":1}}", .valid = false },
+        .{ .json = "{\"schema_version\":13,\"tool_steps\":[],\"files\":[],\"steering\":[],\"context_notes\":[],\"runtime_context\":[\"a\"],\"turn_summary\":null,\"reasoning\":null}", .valid = true },
+        .{ .json = "{\"schema_version\":13,\"tool_steps\":[],\"files\":[],\"steering\":[],\"context_notes\":[],\"runtime_context\":[],\"turn_summary\":null,\"reasoning\":null}", .valid = false },
+        .{ .json = "{\"schema_version\":12,\"tool_steps\":[],\"files\":[],\"steering\":[],\"context_notes\":[],\"runtime_context\":null,\"turn_summary\":null}", .valid = false },
+    }) |case| {
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, case.json, .{});
+        defer parsed.deinit();
+        if (!case.valid) {
+            try std.testing.expectError(error.InvalidSessionFormat, parseExecutionMemory(alloc, parsed.value));
+            continue;
+        }
+        const execution = try parseExecutionMemory(alloc, parsed.value);
+        defer session.freeExecutionMemory(alloc, execution);
+        if (execution.reasoning) |reasoning| {
+            try std.testing.expectEqualStrings("a", reasoning.text);
+            try std.testing.expectEqual(@as(u64, 1), reasoning.duration_ms);
+            try std.testing.expectEqual(@as(u64, 2), reasoning.tokens);
+        }
+        if (execution.runtime_context) |texts| {
+            try std.testing.expectEqualStrings("a", texts[0]);
+        }
     }
 }
 

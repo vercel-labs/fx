@@ -463,6 +463,28 @@ pub fn wrapTranscriptAssistantTextWithFinalityInterruptible(
     };
 }
 
+/// Reflows the model's reasoning at the assistant gutter like reply prose.
+/// `text` carries its own dim styling; wrapping keeps that and any hyperlinks
+/// at every row boundary. The returned slice is owned by the caller.
+pub fn wrapTranscriptReasoningTextInterruptible(
+    alloc: Allocator,
+    text: []const u8,
+    cols: u16,
+    checkpoint: ?*build_checkpoint.BuildCheckpoint,
+) ![]u8 {
+    return wrapAssistantTextWithBaseGutter(
+        alloc,
+        text,
+        cols,
+        gutterWidth(cols),
+        false,
+        .prose,
+        checkpoint,
+        null,
+        null,
+    );
+}
+
 pub const RetentionSourceMap = struct {
     pub const Point = struct { source: usize, rendered: usize };
     rows: std.ArrayList(usize) = .empty,

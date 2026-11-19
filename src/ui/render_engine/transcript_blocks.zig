@@ -142,6 +142,12 @@ pub const RawEntryClass = enum {
     question_resolution,
     turn_cancellation,
     subagent_status,
+    /// The model's reasoning, streaming while the turn thinks. Its bytes are
+    /// dim, terminal-safe prose that the transcript reflows at each width.
+    assistant_reasoning,
+    /// The one-line `Thought for 12s · 1,204 tokens` row that replaces the
+    /// streaming block once the answer or a tool starts.
+    assistant_reasoning_summary,
     unknown_raw,
 };
 
@@ -214,6 +220,8 @@ pub fn blockKindForRawClass(class: RawEntryClass) TranscriptBlockKind {
         .question_resolution => .cancel_notice,
         .turn_cancellation => .cancel_notice,
         .subagent_status => .subagent_status,
+        .assistant_reasoning => .assistant_turn,
+        .assistant_reasoning_summary => .turn_summary,
         .unknown_raw => .unknown_raw,
     };
 }
@@ -273,6 +281,8 @@ pub fn entryClassForEntry(entry: TranscriptEntry) TranscriptEntryClass {
             .question_resolution => .cancel_notice,
             .turn_cancellation => .cancel_notice,
             .subagent_status => .subagent_status,
+            .assistant_reasoning => .assistant_turn,
+            .assistant_reasoning_summary => .turn_summary,
             .unknown_raw => .unknown_raw,
         },
     };
@@ -1982,7 +1992,10 @@ fn renderEntryToBlockForPresentationInterruptible(
         };
     }
     return switch (entry) {
-        .raw_bytes => |e| if (e.class == .tool_status and presentation == .full) blk: {
+        .raw_bytes => |e| if (e.class == .assistant_reasoning or e.class == .assistant_reasoning_summary) blk: {
+            const wrapped = try assistant_wrap.wrapTranscriptReasoningTextInterruptible(alloc, e.bytes, cols, checkpoint);
+            break :blk try normalizeOwnedRenderedBlock(alloc, kind, wrapped);
+        } else if (e.class == .tool_status and presentation == .full) blk: {
             const full = try formatFullToolStatus(alloc, e.bytes, cols);
             break :blk try normalizeOwnedRenderedBlock(alloc, kind, full);
         } else if (e.class == .tool_status and toolStatusNeedsPreview(e.bytes, cols)) blk: {
@@ -5534,4 +5547,15 @@ test "a preparation resumed after any prefix equals the full preparation" {
         try std.testing.expectEqual(full.trailing_boundary_blank_rows, resumed.trailing_boundary_blank_rows);
         try std.testing.expectEqualSlices(?usize, &full_floors, &floors);
     }
+}
+
+test "reasoning raw classes render as assistant and summary blocks" {
+    try std.testing.expectEqual(
+        TranscriptBlockKind.assistant_turn,
+        blockKindForRawClass(.assistant_reasoning),
+    );
+    try std.testing.expectEqual(
+        TranscriptBlockKind.turn_summary,
+        blockKindForRawClass(.assistant_reasoning_summary),
+    );
 }

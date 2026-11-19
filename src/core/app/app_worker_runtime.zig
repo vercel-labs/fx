@@ -83,6 +83,9 @@ pub const WorkerEventHandlers = struct {
     write_user_prompt: *const fn (*anyopaque, types.UserTurn) anyerror!void,
     write_user_prompt_with_skill_bindings: ?*const fn (*anyopaque, types.UserTurn, []const worker_runtime.SkillBinding, []const worker_runtime.SkillDisplaySpan) anyerror!void = null,
     append_text: *const fn (*anyopaque, []const u8) anyerror!void,
+    /// One chunk of the model's reasoning, streamed into the transcript.
+    /// Null: the host shows no reasoning text.
+    append_reasoning: ?*const fn (*anyopaque, []const u8) anyerror!void = null,
     append_table: *const fn (*anyopaque, assistant_presentation.TablePayload) anyerror!void = discardTable,
     append_code_block: *const fn (*anyopaque, assistant_presentation.CodeBlockPayload) anyerror!void = discardCodeBlock,
     append_thematic_rule: *const fn (*anyopaque) anyerror!void = discardThematicRule,
@@ -1303,6 +1306,10 @@ pub fn Runtime(comptime App: type) type {
                         }
                     },
                     .assistant_presentation => |presentation| {
+                        switch (presentation) {
+                            .reasoning_delta => {},
+                            else => finalizeTurnReasoning(app),
+                        }
                         if (presentation.requiresTextDrain() and !try requireAssistantTextDrain(handlers)) {
                             try retainClaimedEventAndSuffix(agent, &batch, "assistant_text_drain_blocked");
                             drain_owns_current = false;
@@ -1342,6 +1349,9 @@ pub fn Runtime(comptime App: type) type {
                                 if (!try replaceRestartedAttempt(app)) {
                                     try handlers.append_text(handlers.ctx, fallback);
                                 }
+                            },
+                            .reasoning_delta => |delta| {
+                                if (handlers.append_reasoning) |append| try append(handlers.ctx, delta);
                             },
                         }
                         traceMainEvent(app, "agent_event_applied", event, null);
@@ -1703,7 +1713,10 @@ pub fn Runtime(comptime App: type) type {
             }
 
             const focused_activity_kind = transition.snapshot.focused_activity_kind;
-            if (tool_work_active) agent.stream.phase = .running;
+            if (tool_work_active) {
+                if (agent.stream.phase == .thinking) finalizeTurnReasoning(app);
+                agent.stream.phase = .running;
+            }
             agent.stream.last_activity_kind = focused_activity_kind;
             if (transition.focus_changed()) {
                 app.shell.render_requests.requestAnimationReset();
@@ -1720,11 +1733,27 @@ pub fn Runtime(comptime App: type) type {
         }
 
         fn resetStream(app: *App, agent: *AppAgent, clear_route_recovery: bool) void {
+            finalizeTurnReasoning(app);
             agent.stream = .{};
             if (clear_route_recovery and app.shell.worker_status_state().clear()) {
                 app.shell.render_requests.request(.footer);
             }
             app.shell.resetCommandOutputDisplay(app.alloc, "worker inactive");
+        }
+
+        /// A thinking phase ends wherever the transcript must grow again. The
+        /// streaming block is only replaceable while it is the trailing row,
+        /// so it collapses here, before whatever comes next lands.
+        fn finalizeTurnReasoning(app: *App) void {
+            if (comptime !@hasField(App, "shell")) return;
+            if (comptime !@hasDecl(@TypeOf(app.shell), "finalizeActiveReasoning")) return;
+            app.shell.finalizeActiveReasoning(app.alloc, io_mod.milliTimestamp()) catch |err| {
+                debug_trace.logf(
+                    "worker",
+                    "reasoning_finalize_failed err={s}",
+                    .{@errorName(err)},
+                );
+            };
         }
 
         fn applyToolActivity(stream: *types.StreamState, kind: types.ToolActivityKind) void {
@@ -1760,6 +1789,9 @@ pub fn Runtime(comptime App: type) type {
             if (update.step_id < agent.stream.phase_step_id) return;
 
             const changed = agent.stream.phase != update.phase;
+            if (changed and agent.stream.phase == .thinking and update.phase != .thinking) {
+                finalizeTurnReasoning(app);
+            }
             agent.stream.phase = update.phase;
             agent.stream.phase_step_id = update.step_id;
             if (changed) app.shell.render_requests.request(.footer);

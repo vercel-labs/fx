@@ -110,6 +110,12 @@ pub const ResumeProjection = struct {
         return self.appendRawOwned(owned, class);
     }
 
+    /// A saved turn's reasoning: the summary row shows inline, its full text
+    /// only in the Ctrl+O transcript.
+    pub fn appendReasoning(self: *ResumeProjection, record: types.ReasoningRecord) !void {
+        try self.runtime.appendReasoningRecord(self.alloc, record, self.created_at_ms);
+    }
+
     fn appendRawOwned(
         self: *ResumeProjection,
         owned: []u8,

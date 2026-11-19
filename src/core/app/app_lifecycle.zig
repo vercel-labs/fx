@@ -240,6 +240,7 @@ pub const StartupState = struct {
     fast_mode_source: config_runtime.ConfigSource = .compiled_default,
     slash_menu_categories: bool = true,
     collapse_tool_calls: bool = false,
+    show_reasoning: bool = false,
     auto_upgrade: bool = true,
     update_channel: update_target.Channel = .stable,
     startup_scrollback: bool = true,
@@ -917,6 +918,7 @@ pub fn resolveSettings(alloc: Allocator, state: *StartupState, detailed: *const 
     state.ultrafast_mode_source = detailed.sources.ultrafast_mode;
     state.slash_menu_categories = settings.slash_menu_categories orelse true;
     state.collapse_tool_calls = settings.collapse_tool_calls orelse false;
+    state.show_reasoning = settings.show_reasoning orelse false;
     state.auto_upgrade = settings.auto_upgrade orelse true;
     state.update_channel = settings.update_channel orelse .stable;
     state.startup_scrollback = settings.startup_scrollback orelse true;

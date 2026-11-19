@@ -702,6 +702,8 @@ function parseAskJson(stdout: string): {
   error?: string;
   session_id: string;
   tool_calls: Array<{ name: string; status: string }>;
+  // Present only when the provider streamed thinking in this request.
+  reasoning?: string;
   usage: { input_tokens: number | null; output_tokens: number | null; cache_read_tokens?: number; cache_write_tokens?: number };
   // Present only when a subagent did work in the run.
   subagents?: Array<{
@@ -4481,7 +4483,9 @@ describe("gateway stream lifecycle", () => {
       };
       expect(firstJson.model).toBe(MODEL);
       expect(firstJson.final_output).toBe("First saved turn completed.");
-      expect(first.stdout).not.toContain("REPLAY_PRIVATE_REASONING");
+      // The thought prints as JSON for the reader; only the provider's signed
+      // replay stays out of stdout.
+      expect(firstJson.reasoning).toContain("REPLAY_PRIVATE_REASONING");
       expect(first.stdout).not.toContain("REPLAY_TOOL_SIGNATURE");
       expect(gateway.requests[1].body).toContain("REPLAY_TOOL_SIGNATURE");
       expect(gateway.requests[1].body).toContain("REPLAY_CALL_ITEM");

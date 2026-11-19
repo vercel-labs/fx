@@ -369,6 +369,7 @@ pub fn Bindings(comptime App: type) type {
                 .propagate_grant = agentPropagateGrant,
                 .push_event = agentPushEvent,
                 .push_text = agentPushText,
+                .push_reasoning_delta = agentPushReasoningDelta,
                 .push_tool_lifecycle = agentPushToolLifecycle,
                 .push_diff_block = agentPushDiffBlock,
                 .push_system_notice = agentPushSystemNotice,
@@ -517,6 +518,7 @@ pub fn Bindings(comptime App: type) type {
                 .write_user_prompt = workerBridgeWriteUserPrompt,
                 .write_user_prompt_with_skill_bindings = workerBridgeWriteUserPromptWithSkillBindings,
                 .append_text = workerBridgeAppendText,
+                .append_reasoning = workerBridgeAppendReasoning,
                 .append_table = workerBridgeAppendTable,
                 .append_code_block = workerBridgeAppendCodeBlock,
                 .append_thematic_rule = workerBridgeAppendThematicRule,
@@ -1349,6 +1351,17 @@ pub fn Bindings(comptime App: type) type {
             }
         }
 
+        /// Each reasoning chunk reaches the transcript as its own queued event,
+        /// so the transcript streams it where it arrived.
+        fn agentPushReasoningDelta(ctx: *anyopaque, delta: []const u8) !void {
+            const agent: *AppAgent = @ptrCast(@alignCast(ctx));
+            const app = appOf(agent);
+            // pushEvent copies the payload into the queue's ownership.
+            try app_worker_runtime.Runtime(App).pushEvent(app, agent, .{
+                .assistant_presentation = .{ .reasoning_delta = @constCast(delta) },
+            });
+        }
+
         fn agentPushTable(ctx: *anyopaque, table: assistant_presentation.TablePayload) !void {
             const agent: *AppAgent = @ptrCast(@alignCast(ctx));
             const app = appOf(agent);
@@ -1561,6 +1574,15 @@ pub fn Bindings(comptime App: type) type {
             try app.pacer.enqueue(app.alloc, text);
         }
 
+        fn workerBridgeAppendReasoning(ctx: *anyopaque, delta: []const u8) !void {
+            const agent: *AppAgent = @ptrCast(@alignCast(ctx));
+            const app = appOf(agent);
+            if (comptime @hasDecl(@TypeOf(app.shell), "appendReasoningDelta")) {
+                const turn_id = agent.worker.activeTurnId();
+                try app.shell.appendReasoningDelta(app.alloc, turn_id, delta);
+            }
+        }
+
         fn workerBridgeAppendTable(ctx: *anyopaque, table: assistant_presentation.TablePayload) !void {
             const agent: *AppAgent = @ptrCast(@alignCast(ctx));
             const app = appOf(agent);
@@ -1766,7 +1788,7 @@ const FakeWorker = struct {
             switch (event) {
                 .assistant_presentation => |presentation| switch (presentation) {
                     .table, .code_block => return error.TestSemanticPresentationPublicationFailure,
-                    .text, .thematic_rule, .attempt_start, .attempt_restart => {},
+                    .text, .thematic_rule, .attempt_start, .attempt_restart, .reasoning_delta => {},
                 },
                 else => {},
             }

@@ -16664,3 +16664,159 @@ test "rewrite publication keeps the frozen prefix when a finished turn holds a h
     resumed.deinit(alloc);
     try std.testing.expectEqual(misses, runtime.frozen_prefix.misses);
 }
+
+test "reasoning deltas grow one trailing block and finalize into a summary plus hidden text" {
+    const alloc = std.testing.allocator;
+    var runtime = TranscriptRuntime{ .layout = transcriptTestLayout(40, 24, 16), .show_reasoning = true };
+    defer runtime.deinit(alloc);
+
+    try runtime.appendReasoningDelta(alloc, 7, "first ");
+    try std.testing.expectEqual(@as(usize, 1), runtime.notebook.entries.items.len);
+    const active_id = runtime.notebook.entries.items[0].id();
+    try std.testing.expectEqual(RawEntryClass.assistant_reasoning, runtime.notebook.entries.items[0].raw_bytes.class);
+    try std.testing.expect(!runtime.notebook.entries.items[0].raw_bytes.inline_hidden);
+
+    try runtime.appendReasoningDelta(alloc, 7, "second");
+    try std.testing.expectEqual(@as(usize, 1), runtime.notebook.entries.items.len);
+    try std.testing.expectEqual(active_id, runtime.notebook.entries.items[0].id());
+    try std.testing.expect(std.mem.find(
+        u8,
+        runtime.notebook.entries.items[0].raw_bytes.bytes,
+        "first second",
+    ) != null);
+
+    const started_ms = runtime.notebook.reasoning_active_started_ms;
+    try std.testing.expect(started_ms > 0);
+    try runtime.finalizeActiveReasoning(alloc, started_ms + 2_000);
+
+    try std.testing.expectEqual(@as(usize, 2), runtime.notebook.entries.items.len);
+    const summary = runtime.notebook.entries.items[0].raw_bytes;
+    try std.testing.expectEqual(RawEntryClass.assistant_reasoning_summary, summary.class);
+    try std.testing.expect(!summary.inline_hidden);
+    try std.testing.expect(std.mem.find(u8, summary.bytes, "Thought for 2s") != null);
+    try std.testing.expect(std.mem.find(u8, summary.bytes, "tokens") != null);
+    const full = runtime.notebook.entries.items[1].raw_bytes;
+    try std.testing.expectEqual(RawEntryClass.assistant_reasoning, full.class);
+    try std.testing.expect(full.inline_hidden);
+    try std.testing.expect(std.mem.find(u8, full.bytes, "first second") != null);
+
+    // The turn keeps its aggregate for the saved record.
+    try std.testing.expectEqualStrings("first second", runtime.notebook.reasoning_turn_text.items);
+    try std.testing.expect(runtime.notebook.reasoning_turn_tokens > 0);
+    try std.testing.expectEqual(@as(u64, 2_000), runtime.notebook.reasoning_turn_duration_ms);
+
+    const record = (try runtime.peekTurnReasoning(alloc)).?;
+    defer types.freeReasoningRecord(alloc, record);
+    try std.testing.expectEqualStrings("first second", record.text);
+    try std.testing.expectEqual(@as(u64, 2_000), record.duration_ms);
+
+    // A second finalize has nothing left to collapse.
+    try runtime.finalizeActiveReasoning(alloc, started_ms + 5_000);
+    try std.testing.expectEqual(@as(usize, 2), runtime.notebook.entries.items.len);
+}
+
+test "reasoning stays hidden until show_reasoning is on" {
+    const alloc = std.testing.allocator;
+    var runtime = TranscriptRuntime{ .layout = transcriptTestLayout(40, 24, 16) };
+    defer runtime.deinit(alloc);
+
+    try runtime.appendReasoningDelta(alloc, 5, "hidden thought");
+    try std.testing.expectEqual(@as(usize, 0), runtime.notebook.entries.items.len);
+
+    try runtime.finalizeActiveReasoning(alloc, io_mod.milliTimestamp());
+    try std.testing.expectEqual(@as(usize, 0), runtime.notebook.entries.items.len);
+    try std.testing.expect((try runtime.peekTurnReasoning(alloc)) == null);
+
+    // A saved turn's reasoning replays only when the setting is on, so an
+    // earlier session's thinking cannot leak past it.
+    try runtime.appendReasoningRecord(alloc, .{
+        .text = @constCast("saved thought"),
+        .duration_ms = 3_000,
+        .tokens = 9,
+    }, 1_000);
+    try std.testing.expectEqual(@as(usize, 0), runtime.notebook.entries.items.len);
+
+    runtime.show_reasoning = true;
+    try runtime.appendReasoningDelta(alloc, 5, "now visible");
+    try std.testing.expectEqual(@as(usize, 1), runtime.notebook.entries.items.len);
+    try std.testing.expectEqual(RawEntryClass.assistant_reasoning, runtime.notebook.entries.items[0].raw_bytes.class);
+}
+
+test "reasoning display text neutralizes provider escape bytes" {
+    const alloc = std.testing.allocator;
+    var runtime = TranscriptRuntime{ .layout = transcriptTestLayout(40, 24, 16), .show_reasoning = true };
+    defer runtime.deinit(alloc);
+
+    try runtime.appendReasoningDelta(alloc, 3, "safe \x1b[31mred\x1b[0m\x07 text");
+    try std.testing.expectEqual(@as(usize, 1), runtime.notebook.entries.items.len);
+    const bytes = runtime.notebook.entries.items[0].raw_bytes.bytes;
+    try std.testing.expect(std.mem.find(u8, bytes, "\x1b[31m") == null);
+    try std.testing.expect(std.mem.find(u8, bytes, "\x07") == null);
+    try std.testing.expect(std.mem.find(u8, bytes, "red") != null);
+}
+
+test "a saved reasoning record replays as its summary row and hidden full text" {
+    const alloc = std.testing.allocator;
+    var runtime = TranscriptRuntime{ .layout = transcriptTestLayout(40, 24, 16), .show_reasoning = true };
+    defer runtime.deinit(alloc);
+
+    try runtime.appendReasoningRecord(alloc, .{
+        .text = @constCast("plan the change\n\ncheck the tests"),
+        .duration_ms = 12_000,
+        .tokens = 42,
+    }, 1_000);
+
+    try std.testing.expectEqual(@as(usize, 2), runtime.notebook.entries.items.len);
+    try std.testing.expectEqual(RawEntryClass.assistant_reasoning_summary, runtime.notebook.entries.items[0].raw_bytes.class);
+    try std.testing.expect(std.mem.find(u8, runtime.notebook.entries.items[0].raw_bytes.bytes, "Thought for 12s · 42 tokens") != null);
+    try std.testing.expectEqual(RawEntryClass.assistant_reasoning, runtime.notebook.entries.items[1].raw_bytes.class);
+    try std.testing.expect(runtime.notebook.entries.items[1].raw_bytes.inline_hidden);
+    try std.testing.expect(std.mem.find(u8, runtime.notebook.entries.items[1].raw_bytes.bytes, "plan the change\n\ncheck the tests") != null);
+}
+
+test "clearing the transcript forgets the turn's reasoning" {
+    const alloc = std.testing.allocator;
+    var runtime = TranscriptRuntime{ .layout = transcriptTestLayout(40, 24, 16), .show_reasoning = true };
+    defer runtime.deinit(alloc);
+
+    try runtime.appendReasoningDelta(alloc, 9, "thinking");
+    try runtime.finalizeActiveReasoning(alloc, runtime.notebook.reasoning_active_started_ms + 1_000);
+    runtime.clearTranscript(alloc);
+    try std.testing.expect((try runtime.peekTurnReasoning(alloc)) == null);
+    try std.testing.expectEqual(@as(usize, 0), runtime.notebook.entries.items.len);
+}
+
+test "reasoning shows as its summary inline and its full text only in the full transcript" {
+    const alloc = std.testing.allocator;
+    var runtime = TranscriptRuntime{ .layout = transcriptTestLayout(40, 24, 16), .show_reasoning = true };
+    defer runtime.deinit(alloc);
+
+    try runtime.appendReasoningRecord(alloc, .{
+        .text = @constCast("weigh the options\nand check the tests"),
+        .duration_ms = 4_000,
+        .tokens = 12,
+    }, 1_000);
+    _ = try runtime.appendRawTranscriptEntryClassified(alloc, "the answer\n", .unknown_raw);
+
+    const compact = try renderEntriesToBytes(alloc, runtime.notebook.entries.items, runtime.layout.cols);
+    defer alloc.free(compact);
+    try std.testing.expect(std.mem.find(u8, compact, "Thought for 4s") != null);
+    try std.testing.expect(std.mem.find(u8, compact, "weigh the options") == null);
+
+    var projection = try runtime.buildFullTranscriptProjection(alloc, null);
+    defer projection.deinit(alloc);
+    const full = try full_transcript_screen.renderProjectionViewportSourceInterruptible(
+        alloc,
+        &projection,
+        null,
+        runtime.layout.cols,
+        64,
+        0,
+        null,
+    );
+    defer alloc.free(full);
+    try std.testing.expect(std.mem.find(u8, full, "weigh the options") != null);
+    try std.testing.expect(std.mem.find(u8, full, "and check the tests") != null);
+    try std.testing.expect(std.mem.find(u8, full, "Thought for 4s") == null);
+    try std.testing.expect(std.mem.find(u8, full, "the answer") != null);
+}

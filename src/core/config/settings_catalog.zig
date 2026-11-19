@@ -29,6 +29,7 @@ pub const SettingId = enum {
     statusline_workspace,
     slash_menu_categories,
     collapse_tool_calls,
+    show_reasoning,
     session_titles,
     model,
     effort,
@@ -61,6 +62,7 @@ pub const Snapshot = struct {
     statusline_workspace: bool = false,
     slash_menu_categories: bool = true,
     collapse_tool_calls: bool = false,
+    show_reasoning: bool = false,
     session_titles: bool = true,
     startup_scrollback: bool = true,
     prompt_history: bool = true,
@@ -78,6 +80,7 @@ pub const Snapshot = struct {
             .statusline_workspace => onOff(self.statusline_workspace),
             .slash_menu_categories => onOff(self.slash_menu_categories),
             .collapse_tool_calls => onOff(self.collapse_tool_calls),
+            .show_reasoning => onOff(self.show_reasoning),
             .session_titles => onOff(self.session_titles),
             .startup_scrollback => onOff(self.startup_scrollback),
             .prompt_history => onOff(self.prompt_history),
@@ -265,6 +268,7 @@ const specs = [_]Spec{
     .{ .id = .statusline_workspace, .category = .interface, .label = "Status line workspace", .description = "Show the workspace path and Git branch in the status line" },
     .{ .id = .slash_menu_categories, .category = .interface, .label = "Slash menu categories", .description = "Show categories and skill sources in slash-command results" },
     .{ .id = .collapse_tool_calls, .category = .interface, .label = "Collapse tool calls", .description = "Show only a summary for each group of tool calls" },
+    .{ .id = .show_reasoning, .category = .interface, .label = "Show reasoning", .description = "Show the model's reasoning in the transcript" },
     .{ .id = .model, .category = .agent, .label = "Model", .description = "Choose the model used for new turns" },
     .{ .id = .effort, .category = .agent, .label = "Reasoning effort", .description = "Control how much reasoning the model applies" },
     .{ .id = .fast_mode, .category = .agent, .label = "Fast mode", .description = "Use faster inference when the model supports it" },
@@ -357,6 +361,7 @@ fn staticOptionsFor(id: SettingId) []const []const u8 {
         .statusline_workspace,
         .slash_menu_categories,
         .collapse_tool_calls,
+        .show_reasoning,
         .session_titles,
         .startup_scrollback,
         .prompt_history,
@@ -421,8 +426,8 @@ test "settings catalog projects grouped searchable preferences" {
         .sound_level = "on",
     };
 
-    try std.testing.expectEqual(@as(usize, 14), filteredCount(snapshot, .all, ""));
-    try std.testing.expectEqual(@as(usize, 5), filteredCount(snapshot, .interface, ""));
+    try std.testing.expectEqual(@as(usize, 15), filteredCount(snapshot, .all, ""));
+    try std.testing.expectEqual(@as(usize, 6), filteredCount(snapshot, .interface, ""));
     try std.testing.expectEqual(@as(usize, 6), filteredCount(snapshot, .agent, ""));
     try std.testing.expectEqual(@as(usize, 1), filteredCount(snapshot, .notifications, ""));
     try std.testing.expectEqual(@as(usize, 2), filteredCount(snapshot, .advanced, ""));
@@ -483,6 +488,18 @@ test "settings catalog exposes collapse tool calls as an interface toggle" {
     const collapse = changeAt(&expanded, .collapse_tool_calls, 1).?;
     try std.testing.expectEqual(SettingId.collapse_tool_calls, collapse.setting);
     try std.testing.expectEqualStrings("on", collapse.value);
+}
+
+test "settings catalog exposes show reasoning as an interface toggle" {
+    const hidden: Snapshot = .{ .show_reasoning = false };
+    const item = itemAt(hidden, .interface, "show reasoning", 0).?;
+
+    try std.testing.expectEqual(SettingId.show_reasoning, item.id);
+    try std.testing.expectEqualStrings("Show reasoning", item.label);
+    try std.testing.expectEqualStrings("off", item.value);
+    const shown = changeAt(&hidden, .show_reasoning, 1).?;
+    try std.testing.expectEqual(SettingId.show_reasoning, shown.setting);
+    try std.testing.expectEqualStrings("on", shown.value);
 }
 
 test "settings catalog exposes slash menu categories as an interface toggle" {
