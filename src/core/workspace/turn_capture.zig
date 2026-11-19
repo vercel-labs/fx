@@ -1088,17 +1088,18 @@ const FakeRecorder = struct {
 };
 
 /// Holds each start capture until a test opens the gate, and numbers the
-/// start and end saves in the order they land.
+/// start and end saves, and the settles the tests run, in the order they
+/// land.
 const GateRecorder = struct {
-    var open = std.atomic.Value(bool).init(false);
-    var started = std.atomic.Value(bool).init(false);
+    var open: std.Io.Event = .unset;
+    var started: std.Io.Event = .unset;
     var order = std.atomic.Value(u32).init(0);
     var start_at = std.atomic.Value(u32).init(0);
     var end_at = std.atomic.Value(u32).init(0);
 
     fn reset() void {
-        open.store(false, .seq_cst);
-        started.store(false, .seq_cst);
+        open = .unset;
+        started = .unset;
         order.store(0, .seq_cst);
         start_at.store(0, .seq_cst);
         end_at.store(0, .seq_cst);
@@ -1107,32 +1108,55 @@ const GateRecorder = struct {
     fn record(context: Context, turn: Session.CaptureTurn, phase: capture_store.Phase, lock: *std.Io.Mutex, trigger_tool: ?[]const u8, skip: ?capture_policy.Reason) void {
         _ = .{ context, turn, lock, trigger_tool, skip };
         if (phase == .end) {
-            end_at.store(order.fetchAdd(1, .seq_cst) + 1, .seq_cst);
+            end_at.store(next(), .seq_cst);
             return;
         }
-        started.store(true, .seq_cst);
-        var waited: usize = 0;
-        while (!open.load(.seq_cst) and waited < 5000) : (waited += 1) io_mod.sleep(std.time.ns_per_ms);
-        start_at.store(order.fetchAdd(1, .seq_cst) + 1, .seq_cst);
+        started.set(std.testing.io);
+        open.waitUncancelable(std.testing.io);
+        start_at.store(next(), .seq_cst);
+    }
+
+    fn next() u32 {
+        return order.fetchAdd(1, .seq_cst) + 1;
     }
 
     fn waitStarted() void {
-        while (!started.load(.seq_cst)) io_mod.sleep(std.time.ns_per_ms);
+        started.waitUncancelable(std.testing.io);
+    }
+
+    /// Opens the gate; a test defers it so a failure never leaves the
+    /// start capture's thread waiting.
+    fn release() void {
+        open.set(std.testing.io);
     }
 };
 
-fn settleCounting(captures: *TurnCapture, done: *std.atomic.Value(usize)) void {
-    captures.settle();
-    _ = done.fetchAdd(1, .seq_cst);
-}
+/// Three tool calls in parallel, each settling before it acts.
+const Settlers = struct {
+    var entering = std.atomic.Value(usize).init(0);
+    var all_entering: std.Io.Event = .unset;
+    var returned_at: [3]std.atomic.Value(u32) = @splat(.init(0));
+
+    fn reset() void {
+        entering.store(0, .seq_cst);
+        all_entering = .unset;
+        for (&returned_at) |*at| at.store(0, .seq_cst);
+    }
+
+    fn run(captures: *TurnCapture, index: usize) void {
+        if (entering.fetchAdd(1, .seq_cst) + 1 == returned_at.len) all_entering.set(std.testing.io);
+        captures.settle();
+        returned_at[index].store(GateRecorder.next(), .seq_cst);
+    }
+};
 
 fn endIn(captures: *TurnCapture, context: Context, lock: *std.Io.Mutex) void {
     _ = captures.end(context, lock);
 }
 
-fn openGateLater() void {
-    io_mod.sleep(50 * std.time.ns_per_ms);
-    GateRecorder.open.store(true, .seq_cst);
+fn releaseOnceStarted() void {
+    GateRecorder.waitStarted();
+    GateRecorder.release();
 }
 
 test "the start capture runs beside the turn, and each tool's settle waits until it is saved" {
@@ -1140,25 +1164,27 @@ test "the start capture runs beside the turn, and each tool's settle waits until
     try t.init();
     defer t.deinit();
     GateRecorder.reset();
+    Settlers.reset();
     var lock: std.Io.Mutex = .init;
     var captures: TurnCapture = .{ .recorder = &GateRecorder.record };
     defer captures.deinit();
+    defer GateRecorder.release();
     const context = t.context();
     captures.begin(context, true);
-    // `start` returns while the capture runs, so the first request goes out.
+    // `start` returns while the capture is held, so the first request goes
+    // out beside it.
     captures.start(context, &lock);
     GateRecorder.waitStarted();
     try std.testing.expectEqual(@as(u32, 0), GateRecorder.start_at.load(.seq_cst));
-    // Three tool calls in parallel each wait for it before acting.
-    var done = std.atomic.Value(usize).init(0);
-    var threads: [3]std.Thread = undefined;
-    for (&threads) |*thread| thread.* = try std.Thread.spawn(.{}, settleCounting, .{ &captures, &done });
-    io_mod.sleep(50 * std.time.ns_per_ms);
-    try std.testing.expectEqual(@as(usize, 0), done.load(.seq_cst));
-    GateRecorder.open.store(true, .seq_cst);
+    var threads: [Settlers.returned_at.len]std.Thread = undefined;
+    for (&threads, 0..) |*thread, index| thread.* = try std.Thread.spawn(.{}, Settlers.run, .{ &captures, index });
+    Settlers.all_entering.waitUncancelable(std.testing.io);
+    GateRecorder.release();
     for (threads) |thread| thread.join();
-    try std.testing.expectEqual(@as(usize, 3), done.load(.seq_cst));
-    try std.testing.expectEqual(@as(u32, 1), GateRecorder.start_at.load(.seq_cst));
+    // Every settle returned after the start capture was saved.
+    const saved = GateRecorder.start_at.load(.seq_cst);
+    try std.testing.expect(saved > 0);
+    for (&Settlers.returned_at) |*at| try std.testing.expect(at.load(.seq_cst) > saved);
     try std.testing.expect(captures.start_thread == null and !captures.start_running);
     // Settling again, as every later tool does, returns at once.
     captures.settle();
@@ -1172,14 +1198,13 @@ test "the end capture of a turn that ran no tool waits for its start capture" {
     var lock: std.Io.Mutex = .init;
     var captures: TurnCapture = .{ .recorder = &GateRecorder.record };
     defer captures.deinit();
+    defer GateRecorder.release();
     const context = t.context();
     captures.begin(context, true);
     captures.start(context, &lock);
     GateRecorder.waitStarted();
     const ender = try std.Thread.spawn(.{}, endIn, .{ &captures, context, &lock });
-    io_mod.sleep(50 * std.time.ns_per_ms);
-    try std.testing.expectEqual(@as(u32, 0), GateRecorder.end_at.load(.seq_cst));
-    GateRecorder.open.store(true, .seq_cst);
+    GateRecorder.release();
     ender.join();
     try std.testing.expectEqual(@as(u32, 1), GateRecorder.start_at.load(.seq_cst));
     try std.testing.expectEqual(@as(u32, 2), GateRecorder.end_at.load(.seq_cst));
@@ -1195,10 +1220,10 @@ test "the next turn and teardown wait for a start capture a turn never settled" 
         GateRecorder.reset();
         var captures: TurnCapture = .{ .recorder = &GateRecorder.record };
         defer captures.deinit();
+        defer GateRecorder.release();
         captures.begin(context, true);
         captures.start(context, &lock);
-        GateRecorder.waitStarted();
-        const opener = try std.Thread.spawn(.{}, openGateLater, .{});
+        const opener = try std.Thread.spawn(.{}, releaseOnceStarted, .{});
         defer opener.join();
         // A fresh prompt after a turn that ended without a tool or an end
         // capture: the old start lands before the new turn begins.
@@ -1208,10 +1233,10 @@ test "the next turn and teardown wait for a start capture a turn never settled" 
     {
         GateRecorder.reset();
         var captures: TurnCapture = .{ .recorder = &GateRecorder.record };
+        defer GateRecorder.release();
         captures.begin(context, true);
         captures.start(context, &lock);
-        GateRecorder.waitStarted();
-        const opener = try std.Thread.spawn(.{}, openGateLater, .{});
+        const opener = try std.Thread.spawn(.{}, releaseOnceStarted, .{});
         defer opener.join();
         // The host tearing down mid-turn leaves no thread behind.
         captures.deinit();
