@@ -2250,13 +2250,13 @@ describe("acp: model-independent", () => {
         expect(result.promptResult.result.stopReason).toBe("end_turn");
         expect(gateway.requests).toHaveLength(4);
         const allUpdates = JSON.stringify(result.messages);
-        // The module's status shape, then a `recovered` that carries only the
-        // attempt that succeeded.
+        // The module's status shape, then a `recovered` that carries the
+        // attempt that succeeded and the last failure.
         expect(allUpdates).toMatch(
-          /"modelResponseRecovery":\{"state":"waiting","attempt":1,"message":"Connection lost · next try in 1s · attempt 1"\}/,
+          /"modelResponseRecovery":\{"state":"waiting","attempt":1,"cause":"dropped","message":"Connection lost · next try in 1s · attempt 1"\}/,
         );
         expect(allUpdates).toContain(
-          '"modelResponseRecovery":{"state":"recovered","attempt":4}',
+          '"modelResponseRecovery":{"state":"recovered","attempt":4,"cause":"server"}',
         );
         // The partial streamed once, then the full replacement (which carries
         // the partial as its prefix) streamed once.
