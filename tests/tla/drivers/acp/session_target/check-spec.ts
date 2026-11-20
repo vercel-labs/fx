@@ -33,15 +33,15 @@ const MUTANTS: Mutant[] = [
   },
   {
     id: "close-other-closes-open",
-    note: "closing another session closes the open one",
+    note: "closing a session that isn't open closes the open ones",
     from: `                        ELSE Obs("close", t, FALSE, -32602, FALSE, "none")\n             /\\ UNCHANGED state`,
-    to: `                        ELSE Obs("close", t, FALSE, -32602, FALSE, "none")\n             /\\ open' = "none"\n             /\\ UNCHANGED <<created, saved, nextNew>>`,
+    to: `                        ELSE Obs("close", t, FALSE, -32602, FALSE, "none")\n             /\\ open' = {}\n             /\\ UNCHANGED <<created, saved, nextNew>>`,
     expect: "CloseIdempotent",
   },
   {
     id: "close-keeps-open",
-    note: "closing the open session leaves it open",
-    from: `/\\ last' = Obs("close", t, TRUE, 0, FALSE, "empty")\n             /\\ open' = "none"`,
+    note: "closing an open session leaves it open",
+    from: `/\\ last' = Obs("close", t, TRUE, 0, FALSE, "empty")\n             /\\ open' = open \\ {t}`,
     to: `/\\ last' = Obs("close", t, TRUE, 0, FALSE, "empty")\n             /\\ open' = open`,
     expect: "CloseClosesOpen",
   },
@@ -70,14 +70,14 @@ const MUTANTS: Mutant[] = [
     id: "error-closes-session",
     note: "a request for an unknown session closes the open one",
     from: `      [] OTHER ->\n             /\\ last' = NotFound(op, t)\n             /\\ UNCHANGED state\n\nClose(t) ==`,
-    to: `      [] OTHER ->\n             /\\ last' = NotFound(op, t)\n             /\\ open' = "none"\n             /\\ UNCHANGED <<created, saved, nextNew>>\n\nClose(t) ==`,
+    to: `      [] OTHER ->\n             /\\ last' = NotFound(op, t)\n             /\\ open' = {}\n             /\\ UNCHANGED <<created, saved, nextNew>>\n\nClose(t) ==`,
     expect: "ErrorChangesNothing",
   },
   {
     id: "saved-load-refused",
     note: "a saved session can't be loaded",
-    from: `      [] t \\in saved \\/ t = open ->`,
-    to: `      [] t = open ->`,
+    from: `      [] t \\in saved \\/ t \\in open ->`,
+    to: `      [] t \\in open ->`,
     expect: "SavedSessionOpens",
   },
   {
@@ -86,6 +86,13 @@ const MUTANTS: Mutant[] = [
     from: `             /\\ last' = Obs(op, t, TRUE, 0, FALSE, Answer(op))`,
     to: `             /\\ last' = NotFound(op, t)`,
     expect: "OpenSessionAnswers",
+  },
+  {
+    id: "new-closes-others",
+    note: "opening or restoring a session closes the others, as fx acp did with one session",
+    from: `Opened(id) == IF Many THEN open \\cup {id} ELSE {id}`,
+    to: `Opened(id) == {id}`,
+    expect: "OthersStayOpen",
   },
   {
     id: "close-answers-null",
@@ -98,7 +105,7 @@ const MUTANTS: Mutant[] = [
 
 const SPEC_FILES = ["AcpSessionTarget.tla", "MCAcpSessionTarget.tla", "MCAcpSessionTarget.cfg"];
 const ACTION_PROPERTIES = new Set([
-  "UnknownSessionAnswer", "CloseIdempotent", "CloseClosesOpen", "OpenSessionAnswers", "SavedSessionOpens", "ErrorChangesNothing",
+  "UnknownSessionAnswer", "CloseIdempotent", "CloseClosesOpen", "OpenSessionAnswers", "SavedSessionOpens", "ErrorChangesNothing", "OthersStayOpen",
 ]);
 
 /// Checks a mutant against its target property alone, so a kill shows that
@@ -107,6 +114,7 @@ function targetCfg(target: string): string {
   return [
     "CONSTANTS",
     "    Fixed = TRUE",
+    "    Many = TRUE",
     "INIT Init",
     "NEXT Next",
     `${ACTION_PROPERTIES.has(target) ? "PROPERTY" : "INVARIANT"} ${target}`,

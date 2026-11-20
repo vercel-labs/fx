@@ -1,11 +1,13 @@
 //! Binds an ACP session to the workspace its client names in `cwd`.
 //!
-//! The server's workspace starts as the directory `fx acp` was launched in.
-//! `session/new`, `session/load`, and `session/resume` may name a different
-//! absolute directory; that session then uses it for file access, shell
-//! commands, project instructions, project skills, project MCP servers, and
-//! its session record. Connection settings such as model, provider,
-//! credentials, and permission policy stay as resolved at `initialize`.
+//! Each session of `fx acp` keeps its own workspace (ACP v1: a session's cwd
+//! MUST be used for that session). `session/new`, `session/load`, and
+//! `session/resume` name it in `cwd`, or take the directory `fx acp` was
+//! launched in; the session then uses it for file access, shell commands,
+//! project instructions, project skills, project MCP servers, and its session
+//! record. Connection settings such as model, provider, credentials, and
+//! permission policy stay as resolved at `initialize`. The libfx kernel's one
+//! session uses the launch workspace.
 
 const std = @import("std");
 const server = @import("server.zig");
@@ -28,7 +30,7 @@ pub const PrepareError = Allocator.Error || error{
 };
 
 /// A staged workspace for one session. Nothing on the server changes until
-/// `commit`, so a rejected request leaves the active session untouched.
+/// `install`, so a rejected request leaves every open session untouched.
 pub const Binding = struct {
     root: []u8,
     access: workspace_access.WorkspaceAccess,
@@ -53,29 +55,14 @@ pub fn prepareErrorMessage(err: PrepareError) []const u8 {
     };
 }
 
-/// Stages the workspace named by `cwd`. Returns null when `cwd` is absent,
-/// names the current workspace, or the host pins the workspace root.
+/// Stages the workspace a session opens in: the one `cwd` names, or the
+/// launch workspace when `cwd` is absent or the host pins the workspace root.
+/// Returns null for the libfx kernel, whose one session uses the launch
+/// workspace.
 pub fn prepare(state: *const server.ServerState, alloc: Allocator, params_raw: ?[]const u8) PrepareError!?Binding {
-    if (state.cfg.minimal_kernel or state.cfg.workspace_root_override != null) return null;
-    const raw = params_raw orelse return null;
-    const parsed = std.json.parseFromSlice(std.json.Value, alloc, raw, .{}) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => return error.InvalidParams,
-    };
-    defer parsed.deinit();
-    if (parsed.value != .object) return error.InvalidParams;
-    const cwd = parsed.value.object.get("cwd") orelse return null;
-    if (cwd == .null) return null;
-    if (cwd != .string) return error.InvalidCwd;
-    if (!std.Io.Dir.path.isAbsolute(cwd.string)) return error.CwdNotAbsolute;
-
-    const root = io_mod.realpathAlloc(alloc, cwd.string) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => return error.CwdUnavailable,
-    };
+    const root = (try resolveRoot(state, alloc, params_raw)) orelse return null;
     var root_owned = true;
     defer if (root_owned) alloc.free(root);
-    if (std.mem.eql(u8, root, state.workspace_root)) return null;
     var dir = std.Io.Dir.openDirAbsolute(io_mod.getIo(), root, .{}) catch return error.CwdUnavailable;
     dir.close(io_mod.getIo());
 
@@ -87,6 +74,36 @@ pub fn prepare(state: *const server.ServerState, alloc: Allocator, params_raw: ?
 
     root_owned = false;
     return .{ .root = root, .access = access, .skills = skills };
+}
+
+/// The workspace root a session request names, as `prepare` stages it,
+/// owned by the caller; null for the libfx kernel.
+pub fn resolveRoot(state: *const server.ServerState, alloc: Allocator, params_raw: ?[]const u8) PrepareError!?[]u8 {
+    if (state.cfg.minimal_kernel) return null;
+    const cwd = try requestedCwd(alloc, params_raw);
+    defer if (cwd) |path| alloc.free(path);
+    if (state.cfg.workspace_root_override != null or cwd == null) return try alloc.dupe(u8, state.launch.root);
+    return io_mod.realpathAlloc(alloc, cwd.?) catch |err| switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        else => error.CwdUnavailable,
+    };
+}
+
+/// The absolute `cwd` a request names, owned by the caller; null when it
+/// names none.
+fn requestedCwd(alloc: Allocator, params_raw: ?[]const u8) PrepareError!?[]u8 {
+    const raw = params_raw orelse return null;
+    const parsed = std.json.parseFromSlice(std.json.Value, alloc, raw, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.InvalidParams,
+    };
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidParams;
+    const cwd = parsed.value.object.get("cwd") orelse return null;
+    if (cwd == .null) return null;
+    if (cwd != .string) return error.InvalidCwd;
+    if (!std.Io.Dir.path.isAbsolute(cwd.string)) return error.CwdNotAbsolute;
+    return try alloc.dupe(u8, cwd.string);
 }
 
 /// Saved directories come from the profile entry for the new root; command
@@ -119,20 +136,15 @@ fn loadAccess(state: *const server.ServerState, alloc: Allocator, root: []const 
     };
 }
 
-/// Installs a staged workspace and leaves `binding` empty, so its owner may
-/// still call `deinit`. The previous session must already be released
-/// because it borrows the server's workspace root.
-pub fn commit(state: *server.ServerState, binding: *Binding) Allocator.Error!void {
-    std.debug.assert(state.active_session == null);
-    try state.skills.replaceLoaded(state.alloc, binding.skills.dir, binding.skills.skills, binding.skills.diagnostics);
+/// Moves a staged workspace into a session's empty `workspace` and leaves
+/// `binding` empty, so its owner may still call `deinit`.
+pub fn install(alloc: Allocator, workspace: *server.Workspace, binding: *Binding) Allocator.Error!void {
+    std.debug.assert(workspace.root.len == 0);
+    try workspace.skills.replaceLoaded(alloc, binding.skills.dir, binding.skills.skills, binding.skills.diagnostics);
     binding.skills = .{};
-    debug_trace.logf("acp", "session workspace rebound bytes={d}", .{binding.root.len});
-    if (state.workspace_root.len > 0) state.alloc.free(state.workspace_root);
-    state.workspace_root = binding.root;
+    debug_trace.logf("acp", "session workspace bound bytes={d}", .{binding.root.len});
+    workspace.root = binding.root;
     binding.root = &.{};
-    state.workspace_access.deinit(state.alloc);
-    state.workspace_access = binding.access;
+    workspace.access = binding.access;
     binding.access = .{};
-    state.context_snapshot.deinit(state.alloc);
-    state.context_snapshot = .{};
 }

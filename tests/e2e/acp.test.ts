@@ -1053,7 +1053,7 @@ test.each(["empty", "unrelated"])("configured provider ACP preserves explicit mo
   } finally { await client.close(); fixture.close(); }
 }, 45000);
 
-test.each(["local", "remote"])("configured provider ACP loading %s stages credentials before canceling the active prompt", async targetProvider => {
+test.each(["local", "remote"])("configured provider ACP loading %s stages credentials and leaves the other session's prompt running", async targetProvider => {
   const target = createConfiguredProviderFixture();
   const fixture = createConfiguredProviderFixture(body => {
     if (body.messages.some((message: any) => message.role === "user" && message.content === "hold this")) {
@@ -1091,13 +1091,15 @@ test.each(["local", "remote"])("configured provider ACP loading %s stages creden
     fixture.save();
     const loaded = await client.request("session/load", { sessionId: targetId, cwd: fixture.workspace, mcpServers: [] }, 902) as any;
     if (loaded.error) throw new Error(JSON.stringify(loaded));
-    const messages = client.rawLines.map(line => JSON.parse(line));
-    const cancelledIndex = messages.findIndex(message => message.id === 900);
-    expect(cancelledIndex).toBeGreaterThanOrEqual(0);
-    expect(cancelledIndex).toBeLessThan(messages.findIndex(message => message.id === 902));
-    expect(messages[cancelledIndex].result.stopReason).toBe("cancelled");
+    // The open session keeps its turn: loading another session opens it
+    // beside the first.
+    expect(client.rawLines.some(line => JSON.parse(line).id === 900)).toBe(false);
     const prompted = await client.request("session/prompt", { prompt: [{ type: "text", text: "after load" }] }) as any;
     if (prompted.error) throw new Error(JSON.stringify(prompted));
+    expect(client.rawLines.some(line => JSON.parse(line).id === 900)).toBe(false);
+    await client.request("session/cancel", { sessionId: active.result.sessionId }, 903);
+    await waitForCondition("the cancelled prompt's answer", () => rawResponse(client!, 900) !== undefined, 5000);
+    expect(rawResponse(client, 900)?.result.stopReason).toBe("cancelled");
     expect(fixture.requests.every(request => request.authorization === `Bearer ${env.FX_TEST_LOCAL_TOKEN}`)).toBe(true);
     expect(target.requests.every(request => request.authorization === `Bearer ${env.FX_TEST_PROVIDER_TOKEN}`)).toBe(true);
     expect(targetProvider === "remote" ? target.requests.length : fixture.requests.length).toBe(targetProvider === "remote" ? 1 : 2);
@@ -1629,6 +1631,26 @@ function sendPrompt(client: AcpClient, id: number, text: string): void {
     method: "session/prompt",
     params: { prompt: [{ type: "text", text }] },
   });
+}
+
+/// Sends a prompt to the session `sessionId` names.
+function sendSessionPrompt(client: AcpClient, id: number, sessionId: string, text: string): void {
+  client.send({
+    jsonrpc: "2.0",
+    id,
+    method: "session/prompt",
+    params: { sessionId, prompt: [{ type: "text", text }] },
+  });
+}
+
+/// The answer to request `id` among every line the client has read, or
+/// undefined.
+function rawResponse(client: Pick<AcpClient, "rawLines">, id: number): any {
+  for (const line of client.rawLines) {
+    const message = JSON.parse(line);
+    if (message.id === id && (message.result !== undefined || message.error !== undefined)) return message;
+  }
+  return undefined;
 }
 
 async function readResponse(
@@ -4047,7 +4069,7 @@ describe("acp: model-independent", () => {
   );
 
   test(
-    "ACP answers session/load at once while the old session's stdio server stops",
+    "ACP answers session/close at once while the session's stdio server stops",
     async () => {
       const root = createIsolatedRoot("fx-acp-mcp-v2-load-stop-");
       const pidPath = join(root.root, "fixture.pid");
@@ -4083,8 +4105,8 @@ describe("acp: model-independent", () => {
         oldPid = Number(readFileSync(pidPath, "utf8").trim());
 
         const sentAt = Date.now();
-        const loaded = await client.request("session/load", { sessionId: created.result.sessionId, cwd: root.workspace, mcpServers: [server] }, 4) as any;
-        expect(loaded.error).toBeUndefined();
+        const closed = await client.request("session/close", { sessionId: created.result.sessionId }, 4) as any;
+        expect(closed.error).toBeUndefined();
         expect(Date.now() - sentAt).toBeLessThan(1_000);
         // The fixture creates the file, then writes its pid.
         await waitForCondition("the old server to see its input close", () => existsSync(eofPath) && readFileSync(eofPath, "utf8").trim() !== "", 5_000);
@@ -4152,7 +4174,11 @@ describe("acp: model-independent", () => {
         const oldPid = Number(readFileSync(pidPath, "utf8").trim());
         pids.add(oldPid);
 
-        const loaded = await client.request("session/load", { sessionId: created.result.sessionId, cwd: root.workspace, mcpServers: [server] }, 4) as any;
+        // A load of the open session reuses it and its server, so the session
+        // closes first; its server stops on its own.
+        const closed = await client.request("session/close", { sessionId: created.result.sessionId }, 4) as any;
+        expect(closed.error).toBeUndefined();
+        const loaded = await client.request("session/load", { sessionId: created.result.sessionId, cwd: root.workspace, mcpServers: [server] }, 5) as any;
         expect(loaded.error).toBeUndefined();
         expect(processAlive(oldPid)).toBe(true);
         // The model calls the tool at once: the new copy starts only once the old one is gone.
@@ -5677,26 +5703,21 @@ describe("acp: model-independent", () => {
   );
 
   test(
-    "ACP replacement and close cancel stalled HTTP MCP calls",
+    "ACP close cancels its own session's stalled HTTP MCP call while another session runs on",
     async () => {
       const root = createIsolatedRoot("fx-acp-mcp-http-cancel-");
-      const replacementFixture = startModernMcpHttpFixture("stall_call");
+      const stalledFixture = startModernMcpHttpFixture("stall_call");
       const fastFixture = startModernMcpHttpFixture("json");
-      const closeFixture = startModernMcpHttpFixture("stall_call");
       const gateway = startFakeGateway([
-        fakeGatewayToolCall("select_http_replacement_slow", "toolbox", { open: MCP_TOOL_NAME }),
-        fakeGatewayToolCall("call_http_replacement_slow", "toolbox", { run: MCP_TOOL_NAME, arguments: {
+        fakeGatewayToolCall("select_http_stalled", "toolbox", { open: MCP_TOOL_NAME }),
+        fakeGatewayToolCall("call_http_stalled", "toolbox", { run: MCP_TOOL_NAME, arguments: {
           text: "slow",
         } }),
-        fakeGatewayToolCall("select_http_replacement_fast", "toolbox", { open: MCP_TOOL_NAME }),
-        fakeGatewayToolCall("call_http_replacement_fast", "toolbox", { run: MCP_TOOL_NAME, arguments: {
+        fakeGatewayToolCall("select_http_fast", "toolbox", { open: MCP_TOOL_NAME }),
+        fakeGatewayToolCall("call_http_fast", "toolbox", { run: MCP_TOOL_NAME, arguments: {
           text: "fast",
         } }),
-        finalText("HTTP replacement complete"),
-        fakeGatewayToolCall("select_http_close_slow", "toolbox", { open: MCP_TOOL_NAME }),
-        fakeGatewayToolCall("call_http_close_slow", "toolbox", { run: MCP_TOOL_NAME, arguments: {
-          text: "slow",
-        } }),
+        finalText("HTTP fast call complete"),
       ]);
       try {
         client = await AcpClient.create({
@@ -5704,72 +5725,56 @@ describe("acp: model-independent", () => {
           env: fakeGatewayEnv(root, gateway),
         });
         await client.request("initialize", { protocolVersion: 1 }, 1);
-        await client.request(
+        const stalled = await client.request(
           "session/new",
-          { mcpServers: [acpHttpServer(replacementFixture, "replacement")] },
+          { mcpServers: [acpHttpServer(stalledFixture, "stalled")] },
           2,
-        );
+        ) as any;
         await client.readLine();
         await client.request("session/set_mode", { modeId: "auto" }, 3);
         sendPrompt(client, 4, "Call the supplied MCP echo tool.");
         await waitForCondition(
-          "replacement stalled HTTP call",
-          () => replacementFixture.requests.some((entry) =>
+          "the stalled HTTP call",
+          () => stalledFixture.requests.some((entry) =>
             entry.message.method === "tools/call"
           ),
           TIMEOUT,
         );
 
-        client.send({
-          jsonrpc: "2.0",
-          id: 5,
-          method: "session/new",
-          params: {
-            mcpServers: [acpHttpServer(fastFixture, "fast")],
-          },
-        });
-        const replacement = await readResponse(client, 5, LIVE_TIMEOUT);
-        expect(replacement.error).toBeUndefined();
+        // A second session opens beside the first, whose call still waits,
+        // and its own MCP call completes.
+        const fast = await client.request(
+          "session/new",
+          { mcpServers: [acpHttpServer(fastFixture, "fast")] },
+          5,
+        ) as any;
+        expect(fast.error).toBeUndefined();
         await client.readLine();
-        await expectHttpCallCancelled(replacementFixture);
         await client.request("session/set_mode", { modeId: "auto" }, 6);
         await runMcpToolPrompt(
           client,
           gateway,
-          "call_http_replacement_fast",
+          "call_http_fast",
           `${MODERN_HTTP_TOOL_RESULT}:fast`,
         );
+        expect(client.rawLines.some((line) => JSON.parse(line).id === 4)).toBe(false);
 
-        const closing = await client.request(
-          "session/new",
-          { mcpServers: [acpHttpServer(closeFixture, "close")] },
-          7,
-        ) as any;
-        await client.readLine();
-        await client.request("session/set_mode", { modeId: "auto" }, 8);
-        sendPrompt(client, 9, "Call the supplied MCP echo tool.");
-        await waitForCondition(
-          "close stalled HTTP call",
-          () => closeFixture.requests.some((entry) =>
-            entry.message.method === "tools/call"
-          ),
-          TIMEOUT,
-        );
         client.send({
           jsonrpc: "2.0",
-          id: 10,
+          id: 7,
           method: "session/close",
-          params: { sessionId: closing.result.sessionId },
+          params: { sessionId: stalled.result.sessionId },
         });
-        expect((await readResponse(client, 10, LIVE_TIMEOUT)).result).toEqual({});
-        await expectHttpCallCancelled(closeFixture);
+        expect((await readResponse(client, 7, LIVE_TIMEOUT)).result).toEqual({});
+        await expectHttpCallCancelled(stalledFixture);
+        // Closing stops the session's turn before it answers.
+        expect(rawResponse(client, 4)?.result.stopReason).toBe("cancelled");
         expect(client.stderr).toBe("");
       } finally {
         await client?.close();
         gateway.stop();
-        replacementFixture.stop();
+        stalledFixture.stop();
         fastFixture.stop();
-        closeFixture.stop();
         rmSync(root.root, { recursive: true, force: true });
       }
     },
@@ -7616,7 +7621,7 @@ describe("acp: model-independent", () => {
   );
 
   test(
-    "sequential ACP sessions isolate same-named MCP tools",
+    "concurrently open ACP sessions isolate same-named MCP tools",
     async () => {
       const root = createIsolatedRoot("fx-acp-mcp-isolation-");
       const firstPid = join(root.root, "mcp-first.pid");
@@ -7637,18 +7642,18 @@ describe("acp: model-independent", () => {
           env: fakeGatewayEnv(root, gateway),
         });
         await client.request("initialize", { protocolVersion: 1 }, 1);
-        await client.request(
+        const first = await client.request(
           "session/new",
           { mcpServers: [acpStdioServer("FIRST_RUNTIME", firstPid)] },
           2,
-        );
+        ) as any;
         await client.readLine();
         await client.request("session/set_mode", { modeId: "auto" }, 3);
         await runMcpToolPrompt(client, gateway, "call_first", "FIRST_RUNTIME:one");
 
-        // A replacement whose server can't start still opens and replaces
-        // the first session: the first server exits, and the model hears the
-        // new one is unavailable, never the first one's tool.
+        // A session whose server can't start still opens beside the first:
+        // its model hears that server is unavailable, never the first
+        // session's tool.
         const brokenReplacement = await client.request(
           "session/new",
           {
@@ -7663,7 +7668,8 @@ describe("acp: model-independent", () => {
         ) as any;
         expect(brokenReplacement.error).toBeUndefined();
         await client.readLine();
-        await expectMcpProcessExited(firstPid);
+        const firstProcess = Number(readFileSync(firstPid, "utf8").trim());
+        expect(processAlive(firstProcess)).toBe(true);
         const brokenStart = gateway.requests.length;
         const broken = await runPrompt(client, "Use the replacement server.", TIMEOUT);
         expect(broken.promptResult.result.stopReason).toBe("end_turn");
@@ -7689,6 +7695,13 @@ describe("acp: model-independent", () => {
           7,
         );
         await expectMcpProcessExited(secondPid);
+        expect(processAlive(firstProcess)).toBe(true);
+        await client.request(
+          "session/close",
+          { sessionId: first.result.sessionId },
+          8,
+        );
+        await expectMcpProcessExited(firstPid);
         expect(client.stderr).toBe("");
       } finally {
         await client?.close();
@@ -7815,7 +7828,8 @@ describe("acp: model-independent", () => {
           9,
         ) as any;
         expect(omittedLoadList.error).toBeUndefined();
-        await expectMcpProcessExited(suppliedPid);
+        // The session is open, so load and resume reuse it and its server.
+        expect(processAlive(suppliedProcess)).toBe(true);
 
         const resumedWithoutList = await client.request(
           "session/resume",
@@ -7823,12 +7837,13 @@ describe("acp: model-independent", () => {
           10,
         ) as any;
         expect(resumedWithoutList.error).toBeUndefined();
-        expect(processAlive(suppliedProcess)).toBe(false);
+        expect(processAlive(suppliedProcess)).toBe(true);
         await client.request(
           "session/close",
           { sessionId: created.result.sessionId },
           11,
         );
+        await expectMcpProcessExited(suppliedPid);
         expect(client.stderr).toBe("");
       } finally {
         await client?.close();
@@ -7840,22 +7855,18 @@ describe("acp: model-independent", () => {
   );
 
   test(
-    "replacement and close cancel slow MCP calls and reap children",
+    "a close cancels its own session's slow MCP call and reaps its children while another session runs on",
     async () => {
       const root = createIsolatedRoot("fx-acp-mcp-cancel-");
-      const replacementPid = join(root.root, "replacement-slow.pid");
-      const replacementWire = join(root.root, "replacement-slow.jsonl");
-      const fastPid = join(root.root, "replacement-fast.pid");
-      const closePid = join(root.root, "close-slow.pid");
-      const closeWire = join(root.root, "close-slow.jsonl");
+      const slowPid = join(root.root, "slow.pid");
+      const slowWire = join(root.root, "slow.jsonl");
+      const fastPid = join(root.root, "fast.pid");
       const gateway = startFakeGateway([
-        fakeGatewayToolCall("select_replacement_slow", "toolbox", { open: MCP_TOOL_NAME }),
-        fakeGatewayToolCall("call_replacement_slow", "toolbox", { run: MCP_TOOL_NAME, arguments: { text: "slow" } }),
-        fakeGatewayToolCall("select_replacement_fast", "toolbox", { open: MCP_TOOL_NAME }),
-        fakeGatewayToolCall("call_replacement_fast", "toolbox", { run: MCP_TOOL_NAME, arguments: { text: "fast" } }),
-        finalText("replacement complete"),
-        fakeGatewayToolCall("select_close_slow", "toolbox", { open: MCP_TOOL_NAME }),
-        fakeGatewayToolCall("call_close_slow", "toolbox", { run: MCP_TOOL_NAME, arguments: { text: "slow" } }),
+        fakeGatewayToolCall("select_slow", "toolbox", { open: MCP_TOOL_NAME }),
+        fakeGatewayToolCall("call_slow", "toolbox", { run: MCP_TOOL_NAME, arguments: { text: "slow" } }),
+        fakeGatewayToolCall("select_fast", "toolbox", { open: MCP_TOOL_NAME }),
+        fakeGatewayToolCall("call_fast", "toolbox", { run: MCP_TOOL_NAME, arguments: { text: "fast" } }),
+        finalText("fast session complete"),
       ]);
       try {
         client = await AcpClient.create({
@@ -7863,81 +7874,57 @@ describe("acp: model-independent", () => {
           env: fakeGatewayEnv(root, gateway),
         });
         await client.request("initialize", { protocolVersion: 1 }, 1);
-        await client.request(
+        const slow = await client.request(
           "session/new",
           {
             mcpServers: [acpStdioServer(
               "UNREACHABLE",
-              replacementPid,
+              slowPid,
               "stall_operation",
-              { FX_MCP_WIRE_LOG: replacementWire },
+              { FX_MCP_WIRE_LOG: slowWire },
             )],
           },
           2,
-        );
+        ) as any;
         await client.readLine();
         await client.request("session/set_mode", { modeId: "auto" }, 3);
         sendPrompt(client, 4, "Call the supplied MCP echo tool.");
         await waitForCondition(
-          "replacement slow MCP call",
+          "the slow MCP call",
           () =>
-            existsSync(replacementWire) &&
-            readFileSync(replacementWire, "utf8").includes('"method":"tools/call"'),
+            existsSync(slowWire) &&
+            readFileSync(slowWire, "utf8").includes('"method":"tools/call"'),
           TIMEOUT,
         );
 
-        client.send({
-          jsonrpc: "2.0",
-          id: 5,
-          method: "session/new",
-          params: {
-            mcpServers: [acpStdioServer("FAST_RUNTIME", fastPid)],
-          },
-        });
-        const replacement = await readResponse(client, 5, LIVE_TIMEOUT);
-        expect(replacement.error).toBeUndefined();
-        await client.readLine();
-        await expectMcpProcessExited(replacementPid);
-        await client.request("session/set_mode", { modeId: "auto" }, 6);
-        await runMcpToolPrompt(
-          client,
-          gateway,
-          "call_replacement_fast",
-          "FAST_RUNTIME:fast",
-        );
-        await expectMcpProcessExited(replacementPid);
-
-        const closing = await client.request(
+        // A second session opens beside the first, whose call still waits,
+        // and its own MCP call completes.
+        const fast = await client.request(
           "session/new",
-          {
-            mcpServers: [acpStdioServer(
-              "UNREACHABLE",
-              closePid,
-              "stall_operation",
-              { FX_MCP_WIRE_LOG: closeWire },
-            )],
-          },
-          7,
+          { mcpServers: [acpStdioServer("FAST_RUNTIME", fastPid)] },
+          5,
         ) as any;
+        expect(fast.error).toBeUndefined();
         await client.readLine();
-        await expectMcpProcessExited(fastPid);
-        await client.request("session/set_mode", { modeId: "auto" }, 8);
-        sendPrompt(client, 9, "Call the supplied MCP echo tool.");
-        await waitForCondition(
-          "close slow MCP call",
-          () =>
-            existsSync(closeWire) &&
-            readFileSync(closeWire, "utf8").includes('"method":"tools/call"'),
-          TIMEOUT,
-        );
+        await client.request("session/set_mode", { modeId: "auto" }, 6);
+        await runMcpToolPrompt(client, gateway, "call_fast", "FAST_RUNTIME:fast");
+        const slowProcess = Number(readFileSync(slowPid, "utf8").trim());
+        expect(processAlive(slowProcess)).toBe(true);
+        expect(rawResponse(client, 4)).toBeUndefined();
+
         client.send({
           jsonrpc: "2.0",
-          id: 10,
+          id: 7,
           method: "session/close",
-          params: { sessionId: closing.result.sessionId },
+          params: { sessionId: slow.result.sessionId },
         });
-        expect((await readResponse(client, 10, LIVE_TIMEOUT)).result).toEqual({});
-        await expectMcpProcessExited(closePid);
+        expect((await readResponse(client, 7, LIVE_TIMEOUT)).result).toEqual({});
+        expect(rawResponse(client, 4)?.result.stopReason).toBe("cancelled");
+        await expectMcpProcessExited(slowPid);
+        const fastProcess = Number(readFileSync(fastPid, "utf8").trim());
+        expect(processAlive(fastProcess)).toBe(true);
+        await client.request("session/close", { sessionId: fast.result.sessionId }, 8);
+        await expectMcpProcessExited(fastPid);
         expect(client.stderr).toBe("");
       } finally {
         await client?.close();
@@ -8109,7 +8096,7 @@ describe("acp: model-independent", () => {
   );
 
   test(
-    "session-scoped requests reject a stale active-session target",
+    "session-scoped requests reach every open session and reject a closed one",
     async () => {
       const root = createIsolatedRoot("fx-acp-stale-session-target-");
       const gateway = startFakeGateway([finalText("stale prompt executed")]);
@@ -8134,6 +8121,22 @@ describe("acp: model-independent", () => {
         const staleSessionId = first.result.sessionId as string;
         const activeSessionId = second.result.sessionId as string;
         expect(staleSessionId).not.toBe(activeSessionId);
+
+        // Opening the second session leaves the first open.
+        const stillOpen = await client.request(
+          "session/set_mode",
+          { sessionId: staleSessionId, modeId: "auto" },
+          31,
+        ) as any;
+        expect(stillOpen.error).toBeUndefined();
+        const closed = await client.request("session/close", { sessionId: staleSessionId }, 32) as any;
+        expect(closed.error).toBeUndefined();
+        const secondStillOpen = await client.request(
+          "session/set_mode",
+          { sessionId: activeSessionId, modeId: "auto" },
+          33,
+        ) as any;
+        expect(secondStillOpen.error).toBeUndefined();
 
         for (const [id, method, params] of [
           [4, "session/set_mode", { sessionId: staleSessionId, modeId: "auto" }],
@@ -9337,7 +9340,7 @@ describe("acp: model-independent", () => {
 
 
   test(
-    "running prompt rejects non-cancel requests",
+    "a running prompt holds its own session's requests, not another session's or session/list",
     async () => {
       const root = createIsolatedRoot("fx-acp-running-prompt-");
       const heldResponse = deferred<Response>();
@@ -9347,7 +9350,7 @@ describe("acp: model-independent", () => {
           cwd: root.workspace,
           env: fakeGatewayEnv(root, gateway),
         });
-        await startAutoSession(client);
+        const runningId = await startAutoSession(client);
         sendPrompt(client, 96, "Wait for the held response.");
         await waitForCondition(
           "the prompt Gateway request",
@@ -9360,17 +9363,15 @@ describe("acp: model-independent", () => {
           method: "session/list",
           params: {},
         });
-        const rejected = await readResponse(client, 97);
-        expect(rejected.error).toEqual({
-          code: -32600,
-          message: "Prompt already in progress",
-        });
+        const listed = await readResponse(client, 97);
+        expect(listed.error).toBeUndefined();
+        expect(Array.isArray(listed.result.sessions)).toBe(true);
 
         client.send({
           jsonrpc: "2.0",
           id: 98,
           method: "session/set_config_option",
-          params: { configId: "provider", value: "codex" },
+          params: { sessionId: runningId, configId: "provider", value: "codex" },
         });
         const providerChange = await readResponse(client, 98);
         expect(providerChange.error).toEqual({
@@ -9378,13 +9379,206 @@ describe("acp: model-independent", () => {
           message: "Prompt already in progress",
         });
 
+        const other = await client.request("session/new", { cwd: root.workspace, mcpServers: [] }, 99) as any;
+        expect(other.error).toBeUndefined();
+        const otherMode = await client.request(
+          "session/set_config_option",
+          { sessionId: other.result.sessionId, configId: "mode", value: "auto" },
+          100,
+        ) as any;
+        expect(otherMode.error).toBeUndefined();
+
         heldResponse.resolve(finalText("held prompt complete"));
-        const prompt = await readResponse(client, 96);
+        await waitForCondition("the held prompt's answer", () => rawResponse(client!, 96) !== undefined, TIMEOUT);
+        const prompt = rawResponse(client, 96);
         expect(prompt.error).toBeUndefined();
         expect(prompt.result.stopReason).toBe("end_turn");
         expect(client.stderr).toBe("");
       } finally {
         heldResponse.resolve(finalText("held prompt cleanup"));
+        await client?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  // One connection holds many sessions (`tests/tla/acp/AcpSessions.tla`).
+  test(
+    "ACP runs two open sessions' turns at the same time, each with its own answer and updates",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-two-turns-");
+      const heldA = deferred<Response>();
+      const heldB = deferred<Response>();
+      const gateway = startFakeGateway([() => heldA.promise, () => heldB.promise]);
+      try {
+        client = await AcpClient.create({ cwd: root.workspace, env: fakeGatewayEnv(root, gateway) });
+        await client.request("initialize", { protocolVersion: 1 }, 1);
+        const a = await client.request("session/new", { cwd: root.workspace, mcpServers: [] }, 2) as any;
+        const b = await client.request("session/new", { cwd: root.workspace, mcpServers: [] }, 3) as any;
+        const aId = a.result.sessionId as string;
+        const bId = b.result.sessionId as string;
+        sendSessionPrompt(client, 10, aId, "the first session's prompt");
+        await waitForCondition("the first session's model request", () => gateway.requests.length === 1);
+        sendSessionPrompt(client, 11, bId, "the second session's prompt");
+        // Both turns wait for the model at once.
+        await waitForCondition("the second session's model request", () => gateway.requests.length === 2);
+        expect(gateway.requests[0]!.body).toContain("the first session's prompt");
+        expect(gateway.requests[1]!.body).toContain("the second session's prompt");
+
+        heldB.resolve(finalText("ANSWER_FOR_B"));
+        await waitForCondition("the second session's answer", () => rawResponse(client!, 11) !== undefined);
+        expect(rawResponse(client, 11).result.stopReason).toBe("end_turn");
+        expect(rawResponse(client, 10)).toBeUndefined();
+        heldA.resolve(finalText("ANSWER_FOR_A"));
+        await waitForCondition("the first session's answer", () => rawResponse(client!, 10) !== undefined);
+        expect(rawResponse(client, 10).result.stopReason).toBe("end_turn");
+
+        // Each answer's text reached only its own session (RoutedUpdates).
+        const chunks = client.rawLines
+          .map((line) => JSON.parse(line))
+          .filter((message) => message.method === "session/update" && message.params?.update?.sessionUpdate === "agent_message_chunk");
+        const textOf = (sessionId: string) =>
+          chunks.filter((message) => message.params.sessionId === sessionId).map((message) => JSON.stringify(message.params.update)).join("");
+        expect(textOf(aId)).toContain("ANSWER_FOR_A");
+        expect(textOf(aId)).not.toContain("ANSWER_FOR_B");
+        expect(textOf(bId)).toContain("ANSWER_FOR_B");
+        expect(textOf(bId)).not.toContain("ANSWER_FOR_A");
+        expect(client.stderr).toBe("");
+      } finally {
+        heldA.resolve(finalText("cleanup"));
+        heldB.resolve(finalText("cleanup"));
+        await client?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "ACP session/cancel stops one open session's turn and leaves the other's running",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-cancel-one-");
+      const heldA = deferred<Response>();
+      const heldB = deferred<Response>();
+      const gateway = startFakeGateway([() => heldA.promise, () => heldB.promise]);
+      try {
+        client = await AcpClient.create({ cwd: root.workspace, env: fakeGatewayEnv(root, gateway) });
+        await client.request("initialize", { protocolVersion: 1 }, 1);
+        const a = await client.request("session/new", { cwd: root.workspace, mcpServers: [] }, 2) as any;
+        const b = await client.request("session/new", { cwd: root.workspace, mcpServers: [] }, 3) as any;
+        sendSessionPrompt(client, 10, a.result.sessionId, "hold the first session");
+        await waitForCondition("the first session's model request", () => gateway.requests.length === 1);
+        sendSessionPrompt(client, 11, b.result.sessionId, "hold the second session");
+        await waitForCondition("the second session's model request", () => gateway.requests.length === 2);
+
+        client.send({ jsonrpc: "2.0", method: "session/cancel", params: { sessionId: a.result.sessionId } });
+        await waitForCondition("the first session's answer", () => rawResponse(client!, 10) !== undefined);
+        expect(rawResponse(client, 10).result.stopReason).toBe("cancelled");
+        await Bun.sleep(200);
+        expect(rawResponse(client, 11)).toBeUndefined();
+
+        heldB.resolve(finalText("SECOND_SESSION_DONE"));
+        await waitForCondition("the second session's answer", () => rawResponse(client!, 11) !== undefined);
+        expect(rawResponse(client, 11).result.stopReason).toBe("end_turn");
+        expect(client.stderr).toBe("");
+      } finally {
+        heldA.resolve(finalText("cleanup"));
+        heldB.resolve(finalText("cleanup"));
+        await client?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "each open ACP session's tools act in its own cwd",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-own-cwd-");
+      const first = join(root.root, "first");
+      const second = join(root.root, "second");
+      mkdirSync(first, { recursive: true });
+      mkdirSync(second, { recursive: true });
+      const gateway = startFakeGateway([
+        fileToolCall("write_first", "marker.txt", "from the first session"),
+        finalText("first written"),
+        fileToolCall("write_second", "marker.txt", "from the second session"),
+        finalText("second written"),
+        fileToolCall("write_first_again", "again.txt", "the first session again"),
+        finalText("first written again"),
+      ]);
+      try {
+        client = await AcpClient.create({ cwd: root.workspace, env: fakeGatewayEnv(root, gateway) });
+        await client.request("initialize", { protocolVersion: 1 }, 1);
+        const a = await client.request("session/new", { cwd: first, mcpServers: [] }, 2) as any;
+        expect(a.error).toBeUndefined();
+        await client.request("session/set_mode", { sessionId: a.result.sessionId, modeId: "auto" }, 3);
+        expect((await runPrompt(client, "Write the first marker.", TIMEOUT)).promptResult.result.stopReason).toBe("end_turn");
+
+        const b = await client.request("session/new", { cwd: second, mcpServers: [] }, 4) as any;
+        expect(b.error).toBeUndefined();
+        await client.request("session/set_mode", { sessionId: b.result.sessionId, modeId: "auto" }, 5);
+        expect((await runPrompt(client, "Write the second marker.", TIMEOUT)).promptResult.result.stopReason).toBe("end_turn");
+
+        // The first session keeps its own workspace once the second opens.
+        sendSessionPrompt(client, 6, a.result.sessionId, "Write again in the first workspace.");
+        await waitForCondition("the first session's second answer", () => rawResponse(client!, 6) !== undefined, TIMEOUT);
+        expect(rawResponse(client, 6).result.stopReason).toBe("end_turn");
+
+        expect(readFileSync(join(first, "marker.txt"), "utf8")).toBe("from the first session");
+        expect(readFileSync(join(second, "marker.txt"), "utf8")).toBe("from the second session");
+        expect(readFileSync(join(first, "again.txt"), "utf8")).toBe("the first session again");
+        expect(existsSync(join(second, "again.txt"))).toBe(false);
+        expect(existsSync(join(root.workspace, "marker.txt"))).toBe(false);
+        expect(client.stderr).toBe("");
+      } finally {
+        await client?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "session/load of an open ACP session reuses it while its turn runs",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-reuse-open-");
+      const elsewhere = join(root.root, "elsewhere");
+      mkdirSync(elsewhere, { recursive: true });
+      const held = deferred<Response>();
+      const gateway = startFakeGateway([finalText("SAVED_ANSWER"), () => held.promise]);
+      try {
+        client = await AcpClient.create({ cwd: root.workspace, env: fakeGatewayEnv(root, gateway) });
+        await client.request("initialize", { protocolVersion: 1 }, 1);
+        const created = await client.request("session/new", { cwd: root.workspace, mcpServers: [] }, 2) as any;
+        const sessionId = created.result.sessionId as string;
+        expect((await runPrompt(client, "Save this turn.", TIMEOUT)).promptResult.result.stopReason).toBe("end_turn");
+        sendSessionPrompt(client, 10, sessionId, "Hold this turn.");
+        await waitForCondition("the held model request", () => gateway.requests.length === 2);
+
+        const linesBefore = client.rawLines.length;
+        const loaded = await client.request("session/load", { sessionId, cwd: root.workspace, mcpServers: [] }, 20) as any;
+        expect(loaded.error).toBeUndefined();
+        // Load replays the saved history, and the turn keeps running.
+        const replayed = client.rawLines.slice(linesBefore).join("\n");
+        expect(replayed).toContain("Save this turn.");
+        expect(replayed).toContain("SAVED_ANSWER");
+        expect(rawResponse(client, 10)).toBeUndefined();
+
+        const moved = await client.request("session/load", { sessionId, cwd: elsewhere, mcpServers: [] }, 21) as any;
+        expect(moved.error).toEqual({ code: -32602, message: "Session is open in another workspace" });
+
+        held.resolve(finalText("HELD_ANSWER"));
+        await waitForCondition("the held turn's answer", () => rawResponse(client!, 10) !== undefined);
+        expect(rawResponse(client, 10).result.stopReason).toBe("end_turn");
+        expect(client.stderr).toBe("");
+      } finally {
+        held.resolve(finalText("cleanup"));
         await client?.close();
         gateway.stop();
         rmSync(root.root, { recursive: true, force: true });
@@ -11980,9 +12174,9 @@ describe("acp: model-independent", () => {
     TIMEOUT,
   );
 
-  // A session/load or session/resume of the session that is already active
-  // reloads it. Its working subagents go on, and their reports arrive as they
-  // do after a session/cancel: as the session's next turns.
+  // A session/load or session/resume of the session that is already open
+  // reuses it. Its running prompt and its working subagents go on, and their
+  // reports arrive in the prompt that waits for them.
   const reloadChildPrompt = "Remain active until the session is reloaded.";
   const reloadCallId = "acp_reload_child";
 
@@ -12019,14 +12213,19 @@ describe("acp: model-independent", () => {
 
           // The reload names the client's hooks again, as a client that reloads does.
           client.send({ jsonrpc: "2.0", id: 7302, method: via, params: { sessionId, mcpServers: [], _meta: { "sh.fx/hooks": { captureContent: true } } } });
-          const reloaded = await readUntilResponses(client, [7301, 7302], TIMEOUT);
+          const reloaded = await readUntilResponses(client, [7302], TIMEOUT);
           expect(reloaded.responses.get(7302).error).toBeUndefined();
-          // The reload ends the parent's wait, as a cancel does, and not the child's work.
-          expect(reloaded.responses.get(7301).result.stopReason).toBe("cancelled");
+          // The reload leaves the parent's prompt waiting, and the child at work.
+          expect(reloadChildOutcomes(root.home, sessionId)).toEqual([]);
 
           heldChild.resolve(finalText("late child completion"));
-          await waitForCondition("the child's finish", () => reloadChildOutcomes(root.home, sessionId).length > 0, TIMEOUT);
+          // The report runs in the prompt that waited for it, which then ends by itself.
+          const waited = await readUntilResponses(client, [7301], TIMEOUT);
+          expect(waited.responses.get(7301).result.stopReason).toBe("end_turn");
           expect(reloadChildOutcomes(root.home, sessionId)).toEqual(["ok"]);
+          expect(JSON.stringify(waited.messages)).toContain("ACP_RELOAD_REPORT_SEEN");
+          // The report completes the call that sent the work.
+          expect(JSON.stringify(reportUpdatesFor(waited.messages, reloadCallId).at(-1))).toContain("late child completion");
 
           const followUp = await runPrompt(client, "Confirm the reloaded session is usable.", TIMEOUT);
           expect(followUp.promptResult.result.stopReason).toBe("end_turn");
@@ -12035,9 +12234,6 @@ describe("acp: model-independent", () => {
           expect(bodies.some((body) => body.includes("fx stopped before it finished"))).toBe(false);
           expect(bodies.filter((body) => acpLatestUserIsReport(body))).toHaveLength(1);
           expect(JSON.stringify(followUp)).toContain("ACP_RELOAD_FOLLOWUP_OK");
-          expect(JSON.stringify(followUp)).toContain("ACP_RELOAD_REPORT_SEEN");
-          // The report completes the call that sent the work.
-          expect(JSON.stringify(reportUpdatesFor(followUp.messages, reloadCallId).at(-1))).toContain("late child completion");
           const phases = client.hookEvents.filter((event) => event.type === "delegation" && event.data.callId === reloadCallId).map((event) => event.data.phase);
           expect(phases).toContain("completed");
           expect(phases).not.toContain("failed");
@@ -12149,7 +12345,9 @@ describe("acp: model-independent", () => {
             ? { jsonrpc: "2.0", id: 7502, method: "session/cancel", params: {} }
             : { jsonrpc: "2.0", id: 7502, method: "session/load", params: { sessionId, mcpServers: [] } });
           const stopped = await readUntilResponses(acp, [7501, 7502], TIMEOUT);
-          expect(stopped.responses.get(7501).result.stopReason).toBe("cancelled");
+          // A cancel ends the prompt. A load leaves it running: the writer's stopped work reports into it,
+          // and it ends by itself.
+          expect(stopped.responses.get(7501).result.stopReason).toBe(via === "session/cancel" ? "cancelled" : "end_turn");
           expect(stopped.responses.get(7502).error).toBeUndefined();
           expect(stopped.messages.some((message: any) => message.method === "session/request_permission")).toBe(false);
           const outcomesBefore = reloadChildOutcomes(root.home, sessionId);
@@ -12167,10 +12365,10 @@ describe("acp: model-independent", () => {
           expect(existsSync(target)).toBe(false);
           seen[via] = { outcomesBefore, note, stopReason: ended.responses.get(7503).result.stopReason, requests: gateway.requests.length - base };
           if (via === "session/load") {
-            // The prompt ended by itself: its own turn, then the writer's report, which says it was stopped.
-            const reportTurn = gateway.requests[base + 1]!.body;
-            expect(acpLatestUserIsReport(reportTurn)).toBe(true);
-            expect(reportTurn).toContain("fx stopped before it finished");
+            // The prompt that waited ran the writer's report, which says it was stopped; the next one runs alone.
+            const reportTurns = gateway.requests.slice(0, base).map((request) => request.body).filter(acpLatestUserIsReport);
+            expect(reportTurns).toHaveLength(1);
+            expect(reportTurns[0]).toContain("fx stopped before it finished");
             const trace = readFileSync(tracePath, "utf8");
             expect(trace).toContain("event=reload_interrupted_approval_waits");
             expect(trace).toContain("count=1");
@@ -12191,7 +12389,7 @@ describe("acp: model-independent", () => {
       // A reload ends the wait: the work ended interrupted, and the next prompt needs no cancel.
       expect(seen["session/load"]!.outcomesBefore).toEqual(["interrupted"]);
       expect(seen["session/load"]!.stopReason).toBe("end_turn");
-      expect(seen["session/load"]!.requests).toBe(2);
+      expect(seen["session/load"]!.requests).toBe(1);
     },
     TIMEOUT * 2,
   );
@@ -12236,27 +12434,32 @@ describe("acp: model-independent", () => {
         await waitForCondition("both subagents' requests", () => gateway.requests.length === 5, TIMEOUT);
         await waitForCondition("the writer's wait for an approval", () => approvalWaitRegistered(tracePath), TIMEOUT);
 
+        const base = gateway.requests.length;
         acp.send({ jsonrpc: "2.0", id: 7602, method: "session/load", params: { sessionId, mcpServers: [] } });
-        const reloaded = await readUntilResponses(acp, [7601, 7602], TIMEOUT);
+        const reloaded = await readUntilResponses(acp, [7602], TIMEOUT);
         expect(reloaded.responses.get(7602).error).toBeUndefined();
         // The writer's work ended interrupted, and the holder's goes on.
         expect(reloadChildOutcomes(root.home, sessionId)).toEqual(["interrupted"]);
 
-        // The prompt runs the writer's report, then waits for the holder.
-        const base = gateway.requests.length;
-        sendPrompt(acp, 7603, "Confirm the reloaded session is usable.");
-        await waitForCondition("the prompt's turn and the writer's report", () => gateway.requests.length === base + 2, TIMEOUT);
-        expect(acpLatestUserIsReport(gateway.requests[base + 1]!.body)).toBe(true);
-        expect(gateway.requests[base + 1]!.body).toContain("fx stopped before it finished");
+        // The prompt that waited runs the writer's report, then waits for the holder.
+        await waitForCondition("the writer's report", () => gateway.requests.length === base + 1, TIMEOUT);
+        expect(acpLatestUserIsReport(gateway.requests[base]!.body)).toBe(true);
+        expect(gateway.requests[base]!.body).toContain("fx stopped before it finished");
         expect(reloadChildOutcomes(root.home, sessionId)).toEqual(["interrupted"]);
 
         holder.resolve(finalText("HOLDER_DONE"));
-        const ended = await readUntilResponses(acp, [7603], TIMEOUT);
-        expect(ended.responses.get(7603).result.stopReason).toBe("end_turn");
+        const ended = await readUntilResponses(acp, [7601], TIMEOUT);
+        expect(ended.responses.get(7601).result.stopReason).toBe("end_turn");
         expect(reloadChildOutcomes(root.home, sessionId)).toEqual(["interrupted", "ok"]);
-        expect(gateway.requests.length).toBe(base + 3);
-        expect(gateway.requests[base + 2]!.body).toContain("HOLDER_DONE");
+        expect(gateway.requests.length).toBe(base + 2);
+        expect(gateway.requests[base + 1]!.body).toContain("HOLDER_DONE");
         expect(existsSync(target)).toBe(false);
+
+        // The session takes the next prompt as usual.
+        sendPrompt(acp, 7603, "Confirm the reloaded session is usable.");
+        const next = await readUntilResponses(acp, [7603], TIMEOUT);
+        expect(next.responses.get(7603).result.stopReason).toBe("end_turn");
+        expect(gateway.requests.length).toBe(base + 3);
         expect(acp.stderr).toBe("");
       } finally {
         holder.resolve(finalText("held subagent cleanup"));
@@ -12335,9 +12538,9 @@ describe("acp: model-independent", () => {
         pid = Number(readFileSync(join(root.root, "fixture.pid"), "utf8").trim());
 
         client.send({ jsonrpc: "2.0", id: 7602, method: "session/load", params: { sessionId, mcpServers: [server] } });
-        const reloaded = await readUntilResponses(client, [7601, 7602], TIMEOUT);
+        // The reload leaves the parent's prompt waiting for the subagent.
+        const reloaded = await readUntilResponses(client, [7602], TIMEOUT);
         expect(reloaded.responses.get(7602).error).toBeUndefined();
-        expect(reloaded.responses.get(7601).result.stopReason).toBe("cancelled");
         // The same server list restarts nothing, and the host stayed where it was.
         expect(Number(readFileSync(join(root.root, "fixture.pid"), "utf8").trim())).toBe(pid);
         expect(processAlive(pid)).toBe(true);
@@ -12345,7 +12548,10 @@ describe("acp: model-independent", () => {
 
         // The held call ends, and the subagent calls the same tool again: its authority is as it was.
         writeFileSync(hold.release, "");
-        await waitForCondition("the subagent's finish", () => reloadChildOutcomes(root.home, sessionId).length > 0, TIMEOUT);
+        // The subagent's report runs in the prompt that waited for it, which then ends by itself.
+        const waited = await readUntilResponses(client, [7601], TIMEOUT);
+        expect(waited.responses.get(7601).result.stopReason).toBe("end_turn");
+        expect(JSON.stringify(waited.messages)).toContain("ACP_RELOAD_MCP_REPORT_SEEN");
         expect(reloadChildOutcomes(root.home, sessionId)).toEqual(["ok"]);
         expect(reloadMcpResult(gateway, "child_mcp_held")).toContain("MODERN_MCP_TOOL_RESULT");
         expect(reloadMcpResult(gateway, "child_mcp_after")).toContain("MODERN_MCP_TOOL_RESULT");
@@ -12353,7 +12559,6 @@ describe("acp: model-independent", () => {
 
         const followUp = await runPrompt(client, "Confirm the reloaded session is usable.", TIMEOUT);
         expect(followUp.promptResult.result.stopReason).toBe("end_turn");
-        expect(JSON.stringify(followUp)).toContain("ACP_RELOAD_MCP_REPORT_SEEN");
         expect(client.stderr).toBe("");
       } finally {
         writeFileSync(hold.release, "");
@@ -12408,7 +12613,9 @@ describe("acp: model-independent", () => {
           client.send({ jsonrpc: "2.0", id: 7612, method: "session/load", params: { sessionId, mcpServers: after } });
           const reloaded = await readUntilResponses(client, [7611, 7612], TIMEOUT);
           expect(reloaded.responses.get(7612).error).toBeUndefined();
-          expect(reloaded.responses.get(7611).result.stopReason).toBe("cancelled");
+          // The reload left the parent's prompt waiting: the subagent's report ran in it, and it ended by itself.
+          expect(reloaded.responses.get(7611).result.stopReason).toBe("end_turn");
+          expect(JSON.stringify(reloaded.messages)).toContain("ACP_RELOAD_MCP_REPORT_SEEN");
           const reloadTrace = readFileSync(tracePath, "utf8");
           expect(reloadTrace).toContain("event=reload_mcp_in_place");
           // The model catalog is left as it is while a subagent works.
@@ -12426,7 +12633,6 @@ describe("acp: model-independent", () => {
 
           const followUp = await runPrompt(client, "Confirm the reloaded session is usable.", TIMEOUT);
           expect(followUp.promptResult.result.stopReason).toBe("end_turn");
-          expect(JSON.stringify(followUp)).toContain("ACP_RELOAD_MCP_REPORT_SEEN");
           expect(client.stderr).toBe("");
         } finally {
           writeFileSync(hold.release, "");
@@ -12527,9 +12733,9 @@ describe("acp: model-independent", () => {
         sendPrompt(client, 8301, "Start the subagent that runs the command.");
         await waitForPath(started, TIMEOUT);
         client.send({ jsonrpc: "2.0", id: 8302, method: "session/load", params: { sessionId, mcpServers: [] } });
-        const ended = await readUntilResponses(client, [8301, 8302], TIMEOUT);
-        expect(ended.responses.get(8301).result.stopReason).toBe("cancelled");
-        // The reload kept the subagent and its command still runs.
+        const reloaded = await readUntilResponses(client, [8302], TIMEOUT);
+        expect(reloaded.responses.get(8302).error).toBeUndefined();
+        // The reload kept the prompt waiting and the subagent, and its command still runs.
         expect(reloadChildOutcomes(root.home, sessionId)).toEqual([]);
 
         client.endStdin();
@@ -12588,7 +12794,7 @@ describe("acp: model-independent", () => {
 
         // The session has no MCP host, so there is none to reload in place: the new one is set for the session.
         client.send({ jsonrpc: "2.0", id: 7622, method: "session/load", params: { sessionId, mcpServers: [fixture] } });
-        const reloaded = await readUntilResponses(client, [7621, 7622], TIMEOUT);
+        const reloaded = await readUntilResponses(client, [7622], TIMEOUT);
         expect(reloaded.responses.get(7622).error).toBeUndefined();
         const gainTrace = readFileSync(tracePath, "utf8");
         expect(gainTrace).not.toContain("event=reload_mcp_in_place");
@@ -12600,10 +12806,13 @@ describe("acp: model-independent", () => {
         expect(reloadChildOutcomes(root.home, sessionId)).toEqual(["ok"]);
         expect(reloadMcpResult(gateway, "child_mcp_gain")).toBe(`No tool named ${MCP_TOOL_NAME} is in the toolbox. Use toolbox search to find it.`);
         expect(existsSync(join(root.root, "fixture.pid"))).toBe(false);
+        // The reload left the parent's prompt waiting: the report runs in it, and it ends by itself.
+        const waited = await readUntilResponses(client, [7621], TIMEOUT);
+        expect(waited.responses.get(7621).result.stopReason).toBe("end_turn");
+        expect(JSON.stringify(waited.messages)).toContain("ACP_RELOAD_GAIN_REPORT_SEEN");
 
         const followUp = await runPrompt(client, "Confirm the reloaded session is usable.", TIMEOUT);
         expect(followUp.promptResult.result.stopReason).toBe("end_turn");
-        expect(JSON.stringify(followUp)).toContain("ACP_RELOAD_GAIN_REPORT_SEEN");
 
         // The next work uses the new server.
         const next = await runPrompt(client, "Call the new server.", TIMEOUT);
@@ -12862,9 +13071,9 @@ describe("acp: model-independent", () => {
     TIMEOUT,
   );
 
-  // A switch to another session stops the session's subagents as cancelled,
-  // owing no report, and what they posted before it stays with the old
-  // session (D41, D97).
+  // A close of a session stops its subagents as cancelled, owing no report
+  // (D41, D97). Opening another session leaves the open one, and its
+  // subagents, at work: what they post reaches their own session.
   const switchHooks = { _meta: { "sh.fx/hooks": { captureContent: true } } };
   const switchChildPrompt = "Remain active until the session is switched away.";
   const switchCallId = "acp_switch_child";
@@ -12898,7 +13107,9 @@ describe("acp: model-independent", () => {
 
   for (const via of ["session/new", "session/load", "session/resume", "session/close"] as const) {
     test(
-      `ACP ${via} away from a working subagent sends none of its report to the next session`,
+      via === "session/close"
+        ? `ACP ${via} away from a working subagent sends none of its report to the next session`
+        : `ACP ${via} away from a working subagent sends none of its report to the next session, and its own session gets it once`,
       async () => {
         const root = createIsolatedRoot("fx-acp-subagent-switch-");
         const tracePath = join(root.root, "trace.log");
@@ -12944,22 +13155,42 @@ describe("acp: model-independent", () => {
           expect(JSON.stringify(next.messages)).not.toContain(switchCallId);
           expect(client.hookEvents.filter((event) => event.type === "delegation").map((event) => event.data.phase)).toEqual(["dispatched"]);
 
-          // The switch ended the old session's work as cancelled, owing no report.
-          const finishes = childLines(root.home, firstId).filter((line) => line.kind === "child_finished");
-          expect(finishes.map((line) => line.outcome)).toEqual(["cancelled"]);
-          expect(finishes[0].data?.report).toBeUndefined();
-          // A stopped child posted nothing, so the switch had no mail to drop.
-          expect(existsSync(tracePath) ? readFileSync(tracePath, "utf8") : "").not.toContain("subagent_mail_dropped");
+          if (via === "session/close") {
+            // The close ended the old session's work as cancelled, owing no report.
+            const finishes = childLines(root.home, firstId).filter((line) => line.kind === "child_finished");
+            expect(finishes.map((line) => line.outcome)).toEqual(["cancelled"]);
+            expect(finishes[0].data?.report).toBeUndefined();
+            // A stopped child posted nothing, so the close had no mail to drop.
+            expect(existsSync(tracePath) ? readFileSync(tracePath, "utf8") : "").not.toContain("subagent_mail_dropped");
 
-          // Reopened, the old session posts nothing for it, and its model reads that the work was cancelled.
-          const reopenBase = gateway.requests.length;
-          await client.request("session/load", { sessionId: firstId, cwd: root.workspace, mcpServers: [], ...switchHooks }, 7);
-          const reopened = await runPrompt(client, "Confirm the first session is usable.", TIMEOUT);
-          expect(reopened.promptResult.result.stopReason).toBe("end_turn");
-          const reopenedBodies = gateway.requests.slice(reopenBase).map((request) => request.body);
-          expect(reopenedBodies.some((body) => body.includes("Subagent report"))).toBe(false);
-          expect(reopenedBodies).toHaveLength(1);
-          expect(acpPromptText(reopenedBodies[0]!)).toContain(`- waiter: idle, last work cancelled. For: ${switchChildPrompt}`);
+            // Reopened, the old session posts nothing for it, and its model reads that the work was cancelled.
+            const reopenBase = gateway.requests.length;
+            await client.request("session/load", { sessionId: firstId, cwd: root.workspace, mcpServers: [], ...switchHooks }, 7);
+            const reopened = await runPrompt(client, "Confirm the first session is usable.", TIMEOUT);
+            expect(reopened.promptResult.result.stopReason).toBe("end_turn");
+            const reopenedBodies = gateway.requests.slice(reopenBase).map((request) => request.body);
+            expect(reopenedBodies.some((body) => body.includes("Subagent report"))).toBe(false);
+            expect(reopenedBodies).toHaveLength(1);
+            expect(acpPromptText(reopenedBodies[0]!)).toContain(`- waiter: idle, last work cancelled. For: ${switchChildPrompt}`);
+          } else {
+            // The old session stays open, and its child keeps working.
+            expect(childLines(root.home, firstId).filter((line) => line.kind === "child_finished")).toEqual([]);
+            // When the child ends, its report waits for its own session, which runs it once at its next prompt.
+            heldChild.resolve(finalText("late child completion"));
+            await waitForCondition("the child's work to be recorded done", () => childWork(root.home, firstId).outcome === "ok", TIMEOUT);
+            const reopenBase = gateway.requests.length;
+            const reopenedLoad = await client.request("session/load", { sessionId: firstId, cwd: root.workspace, mcpServers: [], ...switchHooks }, 7) as any;
+            expect(reopenedLoad.error).toBeUndefined();
+            const reopened = await runPrompt(client, "Confirm the first session is usable.", TIMEOUT);
+            expect(reopened.promptResult.result.stopReason).toBe("end_turn");
+            const reopenedBodies = gateway.requests.slice(reopenBase).map((request) => request.body);
+            // The user's prompt, then one turn for the report.
+            expect(reopenedBodies).toHaveLength(2);
+            expect(reopenedBodies.filter(acpLatestUserIsReport)).toHaveLength(1);
+            expect(reopenedBodies[1]).toContain("late child completion");
+            // Nothing was dropped: every session kept what its subagents posted.
+            expect(existsSync(tracePath) ? readFileSync(tracePath, "utf8") : "").not.toContain("subagent_mail_dropped");
+          }
           expect(client.stderr).toBe("");
         } finally {
           heldChild.resolve(finalText("held child cleanup"));
@@ -12973,7 +13204,7 @@ describe("acp: model-independent", () => {
   }
 
   test(
-    "ACP session/new drops a report queued for the old session, and reopening that session delivers it once",
+    "ACP session/new keeps a report queued for the old session, and that session's next prompt delivers it once",
     async () => {
       const root = createIsolatedRoot("fx-acp-subagent-switch-queued-");
       const tracePath = join(root.root, "trace.log");
@@ -13003,15 +13234,13 @@ describe("acp: model-independent", () => {
         expect(nextBodies).toHaveLength(1);
         expect(JSON.stringify(next.messages)).not.toContain(switchCallId);
         expect(client.hookEvents.filter((event) => event.type === "delegation").map((event) => event.data.phase)).toEqual(["dispatched"]);
-        // The trace names what the switch dropped, and why.
-        const work = childWork(root.home, firstId);
-        const dropped = readFileSync(tracePath, "utf8").split("\n").filter((line) => line.includes("subagent_mail_dropped"));
-        expect(dropped).toHaveLength(1);
-        expect(dropped[0]).toContain(`session=${firstId} kind=report child=${work.child} work=${work.work} reason=session_switch`);
+        // The new session dropped nothing of the old one's.
+        expect(existsSync(tracePath) ? readFileSync(tracePath, "utf8") : "").not.toContain("subagent_mail_dropped");
 
-        // The old session's log still owes the report, so reopening it delivers it, once.
+        // The old session stays open with the report queued, so its next prompt delivers it, once.
         const reopenBase = gateway.requests.length;
-        await client.request("session/load", { sessionId: firstId, cwd: root.workspace, mcpServers: [], ...switchHooks }, 5);
+        const reopenedLoad = await client.request("session/load", { sessionId: firstId, cwd: root.workspace, mcpServers: [], ...switchHooks }, 5) as any;
+        expect(reopenedLoad.error).toBeUndefined();
         const reopened = await runPrompt(client, "Confirm the first session is usable.", TIMEOUT);
         expect(reopened.promptResult.result.stopReason).toBe("end_turn");
         const reopenedBodies = gateway.requests.slice(reopenBase).map((request) => request.body);
@@ -13030,12 +13259,12 @@ describe("acp: model-independent", () => {
     TIMEOUT,
   );
 
-  // A load of the active session under another `cwd` releases it and opens it
-  // again, so the log hands out what it still owes once more. The host is
-  // joined and what it queued is dropped first, so the report runs once.
+  // A load of the open session under another `cwd` is refused, and changes
+  // nothing: the session keeps its workspace, its subagents, and what they
+  // queued, so a report runs once, at the session's next prompt after it.
   for (const child of ["finished", "working"] as const) {
     test(
-      `ACP session/load of the active session under another cwd runs the report of a ${child} subagent once`,
+      `ACP session/load of the open session under another cwd is refused, and the report of a ${child} subagent runs once`,
       async () => {
         const root = createIsolatedRoot("fx-acp-subagent-recwd-");
         const other = join(root.root, "other");
@@ -13060,23 +13289,28 @@ describe("acp: model-independent", () => {
             await waitForCondition("the child's work to be recorded done", () => childWork(root.home, firstId).outcome === "ok", TIMEOUT);
           }
 
-          const reloadBase = gateway.requests.length;
           const loaded = await client.request("session/load", { sessionId: firstId, cwd: otherRoot, mcpServers: [], ...switchHooks }, 4) as any;
-          expect(loaded.error).toBeUndefined();
+          expect(loaded.error?.code).toBe(-32602);
+          expect(loaded.error?.message).toBe("Session is open in another workspace");
+          if (child === "working") {
+            // The refused load left the child at work, until it ends.
+            expect(childWork(root.home, firstId).outcome).toBeNull();
+            heldChild.resolve(finalText("late child completion"));
+            await waitForCondition("the child's work to be recorded done", () => childWork(root.home, firstId).outcome === "ok", TIMEOUT);
+          }
+
+          const reportBase = gateway.requests.length;
           const run = await runPrompt(client, "Confirm the first session is usable.", TIMEOUT);
           expect(run.promptResult.result.stopReason).toBe("end_turn");
-          const bodies = gateway.requests.slice(reloadBase).map((request) => request.body);
+          const bodies = gateway.requests.slice(reportBase).map((request) => request.body);
           // The same session: the report reaches it once. The user's prompt, then one turn for the report.
           expect(bodies.filter(acpLatestUserIsReport)).toHaveLength(1);
           expect(bodies).toHaveLength(2);
-          expect(bodies[1]).toContain(child === "finished" ? "late child completion" : "fx stopped before it finished");
+          expect(bodies[1]).toContain("late child completion");
 
-          // The log holds the child's finish once, owing its report, and the trace names what the reload dropped.
-          const work = childWork(root.home, firstId);
-          expect(work.outcome).toBe(child === "finished" ? "ok" : "interrupted");
-          const dropped = readFileSync(tracePath, "utf8").split("\n").filter((line) => line.includes("subagent_mail_dropped"));
-          expect(dropped).toHaveLength(1);
-          expect(dropped[0]).toContain(`session=${firstId} kind=report child=${work.child} work=${work.work} reason=session_reload`);
+          // The log holds the child's finish once, and nothing was dropped.
+          expect(childWork(root.home, firstId).outcome).toBe("ok");
+          expect(readFileSync(tracePath, "utf8")).not.toContain("subagent_mail_dropped");
           expect(client.stderr).toBe("");
         } finally {
           heldChild.resolve(finalText("held child cleanup"));
@@ -13089,12 +13323,11 @@ describe("acp: model-independent", () => {
     );
   }
 
-  // A message a child sent is in no log of the parent, so a load of the active
-  // session under another `cwd` keeps it queued, with the report the host
-  // queued dropped and the reopened log posting it again: the prompt after the
-  // load runs its own turn, then the message, then the report, each once.
+  // A load of the open session under another `cwd` is refused and keeps a
+  // message a child queued: the prompt after it runs its own turn, then the
+  // message, then the report, each once.
   test(
-    "ACP session/load of the active session under another cwd runs a child's queued message once, before its report",
+    "ACP session/load of the open session under another cwd is refused, and a child's queued message runs once, before its report",
     async () => {
       const root = createIsolatedRoot("fx-acp-subagent-recwd-note-");
       const other = join(root.root, "other");
@@ -13136,24 +13369,25 @@ describe("acp: model-independent", () => {
 
         const reloadBase = gateway.requests.length;
         const loaded = await client.request("session/load", { sessionId: firstId, cwd: otherRoot, mcpServers: [], ...switchHooks }, 4) as any;
-        expect(loaded.error).toBeUndefined();
+        expect(loaded.error?.code).toBe(-32602);
+        expect(loaded.error?.message).toBe("Session is open in another workspace");
+        // The child ends after its message, so both wait for the session's next prompt.
+        afterNote.resolve(finalText("child done after its note"));
+        await waitForCondition("the child's work to be recorded done", () => childWork(root.home, firstId).outcome === "ok", TIMEOUT);
         const run = await runPrompt(client, "Confirm the first session is usable.", TIMEOUT);
         expect(run.promptResult.result.stopReason).toBe("end_turn");
         const bodies = gateway.requests.slice(reloadBase).map((request) => request.body).filter((body) => !body.includes("You are the subagent"));
-        // The prompt's own turn, the child's message, then the report the reopened log posts again: each once, in that order.
+        // The prompt's own turn, the child's message, then its report: each once, in that order.
         expect(bodies).toHaveLength(3);
         expect(acpLatestPromptText(bodies[0]!)).toContain("Confirm the first session is usable.");
         expect(acpLatestPromptText(bodies[1]!)).toContain(messageHeader);
         expect(acpLatestPromptText(bodies[1]!)).toContain(note);
         expect(acpLatestUserIsReport(bodies[2]!)).toBe(true);
-        expect(bodies[2]).toContain("fx stopped before it finished");
+        expect(bodies[2]).toContain("child done after its note");
         expect(bodies.filter((body) => acpLatestPromptText(body).includes(note))).toHaveLength(1);
 
-        // The reload dropped the report and only the report: the log owes it, and no log holds the message.
-        const dropped = readFileSync(tracePath, "utf8").split("\n").filter((line) => line.includes("subagent_mail_dropped"));
-        expect(dropped).toHaveLength(1);
-        expect(dropped[0]).toContain(`session=${firstId} kind=report `);
-        expect(dropped[0]).toContain("reason=session_reload");
+        // The refused load dropped nothing.
+        expect(readFileSync(tracePath, "utf8")).not.toContain("subagent_mail_dropped");
         expect(client.stderr).toBe("");
       } finally {
         firstRequest.resolve(finalText("held child cleanup"));
@@ -13624,12 +13858,15 @@ describe("acp: model-independent", () => {
     TIMEOUT,
   );
 
-  // A switch away from a session stops its subagents and joins their threads. The first subagent ends
-  // at once and the second only after its command's grace period, which is when the owner has already
-  // freed the first one's slot. The subagents start in two model turns, so they stay in that order.
+  // A close of a session stops its subagents and joins their threads, and so does the end of stdin for
+  // a session another one left open. The first subagent ends at once and the second only after its
+  // command's grace period, which is when the owner has already freed the first one's slot. The
+  // subagents start in two model turns, so they stay in that order.
   for (const via of ["session/new", "session/load", "session/close"] as const) {
     test(
-      `ACP ${via} away from two subagents inside shell commands stops both and answers`,
+      via === "session/close"
+        ? `ACP ${via} away from two subagents inside shell commands stops both and answers`
+        : `ACP ${via} away from two subagents inside shell commands keeps both working and answers, and the end of stdin stops both`,
       async () => {
         const root = createIsolatedRoot("fx-acp-switch-two-");
         const startedOne = join(root.root, "shell-started-one");
@@ -13687,9 +13924,9 @@ describe("acp: model-independent", () => {
             const next = await runPrompt(client, "Answer in the next session.", TIMEOUT);
             expect(next.promptResult.result.stopReason).toBe("end_turn");
           }
-          // Both works ended with the switch, whatever their outcome.
           const finished = (logLines(root.home, firstId) as any[]).filter((line) => line.kind === "child_finished");
-          expect(finished).toHaveLength(2);
+          // Both works ended with the close, whatever their outcome. Another session left both at work.
+          expect(finished).toHaveLength(via === "session/close" ? 2 : 0);
           client.endStdin();
           const code = await client.waitForExit(TIMEOUT);
           expect({ code, stderr: client.stderr }).toEqual({ code: 0, stderr: "" });
@@ -14716,7 +14953,7 @@ test.skipIf(!tmuxAvailable())(
 // Claude cache warming (src/core/agent/runtime/cache_warmer.zig) in an ACP
 // session: the session's runtime owns the warmer, so a new session closes
 // the old one's. FX_TEST_CACHE_WARMING_TTL_MS sets a two-second lifetime.
-test("ACP keeps an idle Claude session's cache warm until the next session replaces it", async () => {
+test("ACP keeps an idle Claude session's cache warm while it stays open, and stops when it closes", async () => {
   const root = createIsolatedRoot("fx-acp-cache-warming-");
   const isPing = (body: string) => JSON.parse(body).maxOutputTokens === 1;
   const gateway = startDynamicFakeGateway((body) => fakeGatewaySse([
@@ -14753,8 +14990,13 @@ test("ACP keeps an idle Claude session's cache warm until the next session repla
     expect(pings()[0]!.body).toBe(agent.body.replace(/"maxOutputTokens":\d+/, '"maxOutputTokens":1'));
     expect(pings()[0]!.headers.get("x-session-affinity")).toBe(agent.headers.get("x-session-affinity"));
 
-    const replaced = await client.request("session/new", { cwd: root.workspace, mcpServers: [] }, 4) as any;
-    if (replaced.error) throw new Error(JSON.stringify(replaced));
+    // A second session leaves the first open, and its cache warm.
+    const other = await client.request("session/new", { cwd: root.workspace, mcpServers: [] }, 4) as any;
+    if (other.error) throw new Error(JSON.stringify(other));
+    const warm = pings().length;
+    await waitForCondition("a ping after the second session opens", () => pings().length > warm, 8_000);
+    const closed = await client.request("session/close", { sessionId: created.result.sessionId }, 5) as any;
+    if (closed.error) throw new Error(JSON.stringify(closed));
     const before = pings().length;
     await Bun.sleep(4_000);
     expect(pings().length).toBe(before);

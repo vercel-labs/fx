@@ -21,10 +21,11 @@
 (*    turn, gets a title, or is deleted, fx sends a hint to every         *)
 (*    connection that listed that folder or every folder.                 *)
 (*                                                                         *)
-(* Today (Rules = FALSE): fx sends no state and no hint; session/status   *)
-(* is an unknown method, which gets -32601, or -32600 while a turn runs   *)
-(* on the connection; and session/list gets -32600 while a turn runs on   *)
-(* the connection.                                                         *)
+(* Today (Rules = FALSE): fx sends no state and no hint, and session/status *)
+(* is an unknown method, which gets -32601, or -32600 while the session it *)
+(* names runs a turn. session/list answers during a turn: since fx acp     *)
+(* holds many sessions (AcpSessions.tla), a turn holds up only requests    *)
+(* for its own session. Before, list got -32600 while any turn ran.        *)
 (***************************************************************************)
 EXTENDS Integers, Sequences, FiniteSets
 
@@ -121,13 +122,18 @@ Close(c, s) ==
                    refused, badOrder, turns, changes>>
 
 \* session/prompt on an idle session starts a turn.
+\* A prompt starts a turn. fx writes the turn's start to disk before it asks
+\* the model, so a session's first turn saves it, which changes its folder's
+\* list.
 Prompt(c, s) ==
     /\ s \in open[c] /\ st[s] = "idle" /\ turns < MaxTurns
     /\ st' = [st EXCEPT ![s] = "running"]
     /\ owner' = [owner EXCEPT ![s] = c]
     /\ turns' = turns + 1
-    /\ Write(s, "running", "none", FALSE)
-    /\ UNCHANGED <<exists, open, saved, deleted, ver, view, subs, seen, hinted,
+    /\ saved' = [saved EXCEPT ![s] = TRUE]
+    /\ IF saved[s] THEN UNCHANGED ver ELSE Bump(s)
+    /\ Write(s, "running", "none", ~saved[s])
+    /\ UNCHANGED <<exists, open, deleted, view, subs, seen, hinted,
                    refused, badOrder, changes>>
 
 \* An update of the running turn, such as a message chunk, to every
@@ -184,8 +190,13 @@ Delete(s) ==
 
 \* session/list of one folder, or of every folder. The client then holds the
 \* current version of each folder it read.
+\* Whether session/list is refused: never, under the rules and since fx acp
+\* holds many sessions. Before, fx refused it while a turn ran on the
+\* connection.
+RefusesList(c) == FALSE
+
 List(c, f) ==
-    /\ IF ~Rules /\ Busy(c)
+    /\ IF RefusesList(c)
        THEN /\ refused' = TRUE
             /\ UNCHANGED <<subs, seen, hinted>>
        ELSE /\ subs' = [subs EXCEPT ![c] = @ \cup {f}]
@@ -204,7 +215,7 @@ Truth(s) ==
 \* What fx answers.
 Answer(c, s) ==
     IF Rules THEN Truth(s)
-    ELSE [kind |-> IF Busy(c) THEN "busy" ELSE "no_method", status |-> "none", state |-> "none"]
+    ELSE [kind |-> IF owner[s] = c THEN "busy" ELSE "no_method", status |-> "none", state |-> "none"]
 
 \* The client reads the next message fx wrote to it.
 Deliver(c) ==

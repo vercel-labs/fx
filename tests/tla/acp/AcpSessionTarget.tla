@@ -4,15 +4,19 @@
 (* ACP v1's error rules (src/acp/server.zig, src/acp/sessions.zig,        *)
 (* src/acp/jsonrpc.zig).                                                  *)
 (*                                                                         *)
-(*  - A request that names the open session works. A prompt that ends     *)
+(*  - A request that names an open session works. A prompt that ends     *)
 (*    saves the session, as fx saves a chat at its first turn.            *)
+(*  - With `Many`, as on fx acp, session/new, load, and resume leave every *)
+(*    other open session open (`AcpSessions.tla` models their turns).     *)
+(*    Without it, as on libfx's minimal kernel, the session they open is   *)
+(*    the only one open.                                                  *)
 (*  - A request that names a session that doesn't exist or isn't open    *)
 (*    fails with -32002, "Resource not found", and `data.sessionId` set   *)
 (*    to the id it named. For session/load and session/resume, a session  *)
 (*    exists once it is saved.                                            *)
 (*  - A request with no sessionId, or one that isn't a string, fails      *)
 (*    with -32602, "Invalid params".                                      *)
-(*  - session/close of the open session closes it. Closing a session      *)
+(*  - session/close of an open session closes it. Closing a session      *)
 (*    that isn't open succeeds with {} and changes nothing.               *)
 (*  - A request frame over the 8 MiB limit fails with -32600, and the     *)
 (*    connection goes on.                                                 *)
@@ -28,7 +32,9 @@
 (* `Fixed` set to FALSE gives fx before these rules (origin/main at       *)
 (* 15dab7bb4): -32602 with no data for a session that isn't open, an      *)
 (* error for closing one, and -32000 for an oversized frame. The          *)
-(* AcpSessionTargetBefore-*.cfg configs show each rule failing then.      *)
+(* AcpSessionTargetBefore-*.cfg configs show each rule failing then, and   *)
+(* AcpSessionTargetBefore-many.cfg shows one open session at a time,      *)
+(* fx acp before one connection held many sessions.                       *)
 (*                                                                         *)
 (* `last` is what the client observes for the latest step. A test client  *)
 (* creates at most two sessions, A and B, in that order; X names a        *)
@@ -42,9 +48,10 @@
 (***************************************************************************)
 EXTENDS Integers, Sequences
 
-CONSTANT Fixed   \* TRUE: ACP v1's rules; FALSE: fx before them
+CONSTANTS Fixed,  \* TRUE: ACP v1's rules; FALSE: fx before them
+          Many    \* TRUE: many sessions open at once; FALSE: one
 
-ASSUME Fixed \in BOOLEAN
+ASSUME Fixed \in BOOLEAN /\ Many \in BOOLEAN
 
 IdSeq == <<"A", "B">>
 Ids == {IdSeq[k] : k \in 1..Len(IdSeq)}
@@ -68,7 +75,7 @@ Answer(op) ==
       [] op = "withdraw" -> "object"
       [] op = "followup" -> "null"
 
-VARIABLES open,     \* the session open in the running process, or "none"
+VARIABLES open,     \* the sessions open in the running process
           created,  \* the sessions the client created
           saved,    \* the sessions fx saved, which a later load can open
           nextNew,  \* the index in IdSeq of the next session/new
@@ -92,8 +99,11 @@ OpenFailure(op, t) ==
     IF op = "steer" THEN Obs(op, t, FALSE, -32600, FALSE, "none")
     ELSE Obs(op, t, FALSE, -32602, FALSE, "none")
 
+\* The sessions open once `id` opens.
+Opened(id) == IF Many THEN open \cup {id} ELSE {id}
+
 Init ==
-    /\ open = "none"
+    /\ open = {}
     /\ created = {}
     /\ saved = {}
     /\ nextNew = 1
@@ -102,7 +112,7 @@ Init ==
 NewSession ==
     /\ nextNew <= Len(IdSeq)
     /\ LET id == IdSeq[nextNew] IN
-           /\ open' = id
+           /\ open' = Opened(id)
            /\ created' = created \cup {id}
            /\ last' = Obs("new", id, TRUE, 0, FALSE, "object")
     /\ nextNew' = nextNew + 1
@@ -110,7 +120,7 @@ NewSession ==
 
 \* A new fx acp process: nothing is open, and saved sessions stay saved.
 Restart ==
-    /\ open' = "none"
+    /\ open' = {}
     /\ last' = Obs("restart", "none", TRUE, 0, FALSE, "none")
     /\ UNCHANGED <<created, saved, nextNew>>
 
@@ -118,10 +128,10 @@ Target(op, t) ==
     CASE t \in Missing ->
              /\ last' = InvalidParams(op, t)
              /\ UNCHANGED state
-      [] t = open /\ op \in OpenFails ->
+      [] t \in open /\ op \in OpenFails ->
              /\ last' = OpenFailure(op, t)
              /\ UNCHANGED state
-      [] t = open ->
+      [] t \in open ->
              /\ last' = Obs(op, t, TRUE, 0, FALSE, Answer(op))
              /\ saved' = IF op = "prompt" THEN saved \cup {t} ELSE saved
              /\ UNCHANGED <<open, created, nextNew>>
@@ -133,24 +143,24 @@ Close(t) ==
     CASE t \in Missing ->
              /\ last' = InvalidParams("close", t)
              /\ UNCHANGED state
-      [] t = open ->
+      [] t \in open ->
              /\ last' = Obs("close", t, TRUE, 0, FALSE, "empty")
-             /\ open' = "none"
+             /\ open' = open \ {t}
              /\ UNCHANGED <<created, saved, nextNew>>
       [] OTHER ->
              /\ last' = IF Fixed THEN Obs("close", t, TRUE, 0, FALSE, "empty")
                         ELSE Obs("close", t, FALSE, -32602, FALSE, "none")
              /\ UNCHANGED state
 
-\* session/load and session/resume open a saved session, or reopen the
-\* open one.
+\* session/load and session/resume open a saved session, or reuse an open
+\* one.
 Restore(op, t) ==
     CASE t \in Missing ->
              /\ last' = InvalidParams(op, t)
              /\ UNCHANGED state
-      [] t \in saved \/ t = open ->
+      [] t \in saved \/ t \in open ->
              /\ last' = Obs(op, t, TRUE, 0, FALSE, "object")
-             /\ open' = t
+             /\ open' = Opened(t)
              /\ UNCHANGED <<created, saved, nextNew>>
       [] OTHER ->
              /\ last' = NotFound(op, t)
@@ -175,7 +185,7 @@ Spec == Init /\ [][Next]_vars
 (* Safety properties. *)
 
 TypeOK ==
-    /\ open \in Ids \cup {"none"}
+    /\ open \subseteq Ids
     /\ created \subseteq Ids
     /\ saved \subseteq created
     /\ nextNew \in 1..(Len(IdSeq) + 1)
@@ -196,7 +206,7 @@ MissingIdIs32602 ==
 \* A session that doesn't exist or isn't open, named by a request.
 Absent(op, t) ==
     /\ t \notin Missing
-    /\ t # open
+    /\ t \notin open
     /\ op \in RestoreOps => t \notin saved
 
 UnknownSessionAnswer ==
@@ -206,26 +216,30 @@ UnknownSessionAnswer ==
            /\ last'.dataSid]_vars
 
 CloseIdempotent ==
-    [][(last'.op = "close" /\ last'.arg \notin Missing /\ last'.arg # open) =>
+    [][(last'.op = "close" /\ last'.arg \notin Missing /\ last'.arg \notin open) =>
            /\ last'.ok
            /\ last'.result = "empty"
            /\ open' = open]_vars
 
 CloseClosesOpen ==
-    [][(last'.op = "close" /\ open # "none" /\ last'.arg = open) =>
+    [][(last'.op = "close" /\ last'.arg \in open) =>
            /\ last'.ok
            /\ last'.result = "empty"
-           /\ open' = "none"]_vars
+           /\ open' = open \ {last'.arg}]_vars
 
 OpenSessionAnswers ==
-    [][(last'.op \in TargetOps \ OpenFails /\ open # "none" /\ last'.arg = open) =>
+    [][(last'.op \in TargetOps \ OpenFails /\ last'.arg \in open) =>
            /\ last'.ok
            /\ last'.result = Answer(last'.op)]_vars
 
 SavedSessionOpens ==
     [][(last'.op \in RestoreOps /\ last'.arg \in saved) =>
            /\ last'.ok
-           /\ open' = last'.arg]_vars
+           /\ last'.arg \in open']_vars
+
+\* Opening or restoring a session leaves every other open session open.
+OthersStayOpen ==
+    [][(last'.op \in {"new"} \cup RestoreOps /\ last'.ok) => open \subseteq open']_vars
 
 ErrorChangesNothing == [][~last'.ok => UNCHANGED state]_vars
 =============================================================================
