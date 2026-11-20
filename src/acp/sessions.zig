@@ -644,7 +644,7 @@ pub fn handleLoadWasmSession(state: *server.ServerState, alloc: Allocator, msg: 
             for (active.session_rt.agent.history.items) |turn| try sendHistoryTurnAsUpdates(state, alloc, session_id, &sources, turn);
             try sendActiveSessionInfoUpdate(state, alloc);
             setObserverHooks(state, observer_hooks);
-            return writeLoadSessionResponse(state, alloc, msg, active.model, observer_hooks);
+            return writeLoadSessionResponse(state, alloc, msg, active.model);
         }
     }
 
@@ -710,7 +710,7 @@ pub fn handleLoadWasmSession(state: *server.ServerState, alloc: Allocator, msg: 
     for (state.active_session.?.session_rt.agent.history.items) |turn| try sendHistoryTurnAsUpdates(state, alloc, session_id, &sources, turn);
     try sendActiveSessionInfoUpdate(state, alloc);
     setObserverHooks(state, observer_hooks);
-    try writeLoadSessionResponse(state, alloc, msg, state.active_session.?.model, observer_hooks);
+    try writeLoadSessionResponse(state, alloc, msg, state.active_session.?.model);
 }
 
 pub fn handleListWasmSessions(state: *server.ServerState, alloc: Allocator, msg: *jsonrpc.Message) !void {
@@ -1009,7 +1009,6 @@ fn handleRestoreSession(
         alloc,
         msg,
         state.active_session.?.model,
-        observer_hooks,
     );
 }
 
@@ -1217,7 +1216,7 @@ fn reloadActiveSession(
         try sendActiveHistoryUpdates(state, alloc, session_id, &sources);
     }
     try sendActiveSessionInfoUpdate(state, alloc);
-    return writeLoadSessionResponse(state, alloc, msg, active.model, observer_hooks);
+    return writeLoadSessionResponse(state, alloc, msg, active.model);
 }
 
 /// Sets the hook config of the active session under the lock its subagents
@@ -1233,7 +1232,6 @@ fn writeLoadSessionResponse(
     alloc: Allocator,
     msg: *jsonrpc.Message,
     model: []const u8,
-    observer_hooks: ?libfx_hooks.Config,
 ) !void {
     try server.refreshModelCatalogForOptions(state);
     var out: std.Io.Writer.Allocating = .init(alloc);

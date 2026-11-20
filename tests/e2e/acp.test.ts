@@ -11897,7 +11897,7 @@ describe("acp: model-independent", () => {
           await waitForCondition("the parent's finished turn and the held child", () => gateway.requests.length === 3, TIMEOUT);
 
           // The reload names the client's hooks again, as a client that reloads does.
-          client.send({ jsonrpc: "2.0", id: 7302, method: via, params: { sessionId, mcpServers: [], _meta: { fx: { hooks: { captureContent: true } } } } });
+          client.send({ jsonrpc: "2.0", id: 7302, method: via, params: { sessionId, mcpServers: [], _meta: { "sh.fx/hooks": { captureContent: true } } } });
           const reloaded = await readUntilResponses(client, [7301, 7302], TIMEOUT);
           expect(reloaded.responses.get(7302).error).toBeUndefined();
           // The reload ends the parent's wait, as a cancel does, and not the child's work.
@@ -12203,7 +12203,7 @@ describe("acp: model-independent", () => {
           env: { ...fakeGatewayEnv(root, gateway), FX_TRACE_LOG: tracePath, FX_TRACE_SCOPES: "acp" },
         });
         await client.request("initialize", { protocolVersion: 1 }, 1);
-        const created = await client.request("session/new", { cwd: root.workspace, mcpServers: [server], _meta: { fx: { hooks: { captureContent: true } } } }, 2) as any;
+        const created = await client.request("session/new", { cwd: root.workspace, mcpServers: [server], _meta: { "sh.fx/hooks": { captureContent: true } } }, 2) as any;
         const sessionId = created.result.sessionId as string;
         await client.readLine();
         await client.request("session/set_mode", { modeId: "auto" }, 3);
@@ -12275,7 +12275,7 @@ describe("acp: model-independent", () => {
             env: { ...fakeGatewayEnv(root, gateway), FX_TRACE_LOG: tracePath, FX_TRACE_SCOPES: "acp" },
           });
           await client.request("initialize", { protocolVersion: 1 }, 1);
-          const created = await client.request("session/new", { cwd: root.workspace, mcpServers: before, _meta: { fx: { hooks: { captureContent: true } } } }, 2) as any;
+          const created = await client.request("session/new", { cwd: root.workspace, mcpServers: before, _meta: { "sh.fx/hooks": { captureContent: true } } }, 2) as any;
           const sessionId = created.result.sessionId as string;
           await client.readLine();
           await client.request("session/set_mode", { modeId: "auto" }, 3);
@@ -12328,7 +12328,7 @@ describe("acp: model-independent", () => {
       const root = createIsolatedRoot("fx-acp-reload-mcp-lookups-");
       const hold = { started: join(root.root, "call-started"), release: join(root.root, "call-release") };
       // Behind toolbox, the subagent's menu lists the server and `open` can name it.
-      const behind = (server: ReturnType<typeof reloadMcpServer>) => ({ ...server, _meta: { fx: { alwaysLoaded: false } } });
+      const behind = (server: ReturnType<typeof reloadMcpServer>) => ({ ...server, _meta: { "sh.fx/alwaysLoaded": false } });
       const held = behind(reloadMcpServer(root, "fixture", hold));
       const changed = behind(reloadMcpServer(root, "fixture"));
       const calls: Array<[string, string, object]> = [
@@ -12352,7 +12352,7 @@ describe("acp: model-independent", () => {
       try {
         client = await AcpClient.create({ cwd: root.workspace, env: fakeGatewayEnv(root, gateway) });
         await client.request("initialize", { protocolVersion: 1 }, 1);
-        const created = await client.request("session/new", { cwd: root.workspace, mcpServers: [held], _meta: { fx: { hooks: { captureContent: true } } } }, 2) as any;
+        const created = await client.request("session/new", { cwd: root.workspace, mcpServers: [held], _meta: { "sh.fx/hooks": { captureContent: true } } }, 2) as any;
         const sessionId = created.result.sessionId as string;
         await client.readLine();
         await client.request("session/set_mode", { modeId: "auto" }, 3);
@@ -12457,7 +12457,7 @@ describe("acp: model-independent", () => {
           env: { ...fakeGatewayEnv(root, gateway), FX_TRACE_LOG: tracePath, FX_TRACE_SCOPES: "acp" },
         });
         await client.request("initialize", { protocolVersion: 1 }, 1);
-        const created = await client.request("session/new", { cwd: root.workspace, mcpServers: [], _meta: { fx: { hooks: { captureContent: true } } } }, 2) as any;
+        const created = await client.request("session/new", { cwd: root.workspace, mcpServers: [], _meta: { "sh.fx/hooks": { captureContent: true } } }, 2) as any;
         const sessionId = created.result.sessionId as string;
         await client.readLine();
         await client.request("session/set_mode", { modeId: "auto" }, 3);
@@ -12744,7 +12744,7 @@ describe("acp: model-independent", () => {
   // A switch to another session stops the session's subagents as cancelled,
   // owing no report, and what they posted before it stays with the old
   // session (D41, D97).
-  const switchHooks = { _meta: { fx: { hooks: { captureContent: true } } } };
+  const switchHooks = { _meta: { "sh.fx/hooks": { captureContent: true } } };
   const switchChildPrompt = "Remain active until the session is switched away.";
   const switchCallId = "acp_switch_child";
 
