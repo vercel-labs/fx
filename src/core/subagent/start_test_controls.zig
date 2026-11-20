@@ -10,8 +10,13 @@
 //! starting a subagent joins its first task";
 //! `tests/tla/drivers/subagent/stop-message.test.ts`).
 //! `FX_TEST_SUBAGENT_START_WAIT_MS` shortens how long a message waits for such
-//! a start before it goes to the subagent's next turn. Only those tests set
-//! the controls, so the libfx artifacts leave them out.
+//! a start before it goes to the subagent's next turn.
+//! `FX_TEST_SUBAGENT_START_FAIL=<n>` makes the first n starts in the process
+//! fail where the slot's thread would spawn, after the work is saved, so a test
+//! can see what a failed start leaves behind
+//! (`tests/e2e/gateway-stream-lifecycle.test.ts`, "a subagent whose start
+//! failed is idle and takes the next message"). Only those tests set the
+//! controls, so the libfx artifacts leave them out.
 const std = @import("std");
 const builtin = @import("builtin");
 const build_options = @import("build_options");
@@ -27,6 +32,7 @@ const max_hold_ms = 60_000;
 pub const default_wait_limit_ms: u64 = 10_000;
 
 var holds = std.atomic.Value(u32).init(0);
+var failed_starts = std.atomic.Value(u32).init(0);
 
 /// Test builds only: an inline test sets it to hold a work's start, in place
 /// of the file controls.
@@ -34,6 +40,33 @@ pub var test_hold: if (builtin.is_test) ?*const fn (child_id: []const u8) void e
 
 /// Test builds only: an inline test sets it to shorten the wait limit.
 pub var test_wait_limit_ms: if (builtin.is_test) ?u64 else void = if (builtin.is_test) null else {};
+
+/// Test builds only: while an inline test sets it, every start fails where its
+/// thread would spawn.
+pub var test_fail_spawn: if (builtin.is_test) bool else void = if (builtin.is_test) false else {};
+
+/// Whether the start that is about to spawn its slot's thread fails instead.
+pub fn spawnFails() bool {
+    if (comptime build_options.libfx) return false;
+    if (builtin.is_test) return test_fail_spawn;
+    const raw = io_mod.getenv("FX_TEST_SUBAGENT_START_FAIL") orelse return false;
+    const limit = std.fmt.parseInt(u32, raw, 10) catch return false;
+    return failed_starts.fetchAdd(1, .seq_cst) < limit;
+}
+
+/// Test builds only: an inline test sets it to run code where a waiting
+/// message's failed start has been ended and its report is not yet built, as a
+/// close of the child can land there.
+pub var test_failed_start_ended: if (builtin.is_test) ?*const fn (child_id: []const u8) void else void = if (builtin.is_test) null else {};
+
+/// Called by `Runtime.endUserWork` between the end of a waiting message's
+/// failed start and the building of its report.
+pub fn failedStartEnded(child_id: []const u8) void {
+    if (comptime build_options.libfx) return;
+    if (builtin.is_test) {
+        if (test_failed_start_ended) |hook| hook(child_id);
+    }
+}
 
 /// Whether a work's start may be held, so the slot checks only when a test
 /// asked.
@@ -100,4 +133,12 @@ test "a test build holds a work's start and sets the wait limit only through its
     test_wait_limit_ms = 25;
     defer test_wait_limit_ms = null;
     try std.testing.expectEqual(@as(u64, 25), waitLimitMs());
+    // Without a hook a failed start's report is built at once.
+    try std.testing.expect(test_failed_start_ended == null);
+    failedStartEnded("child");
+    // Starts fail only while a test asks, and never from the file controls.
+    try std.testing.expect(!spawnFails());
+    test_fail_spawn = true;
+    defer test_fail_spawn = false;
+    try std.testing.expect(spawnFails());
 }
