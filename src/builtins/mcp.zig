@@ -500,12 +500,6 @@ fn writeTempFile(tmp: *std.testing.TmpDir, sub_path: []const u8, content: []cons
     try file.writeStreamingAll(io_mod.getIo(), content);
 }
 
-fn readFileForTest(alloc: Allocator, path: []const u8) ![]u8 {
-    var file = try std.Io.Dir.openFileAbsolute(io_mod.getIo(), path, .{});
-    defer file.close(io_mod.getIo());
-    return io_mod.readFileToEnd(alloc, &file, 1024 * 1024);
-}
-
 test "MCP config diagnostic treats nonblocking profile states as clear" {
     const alloc = std.testing.allocator;
 
