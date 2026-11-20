@@ -2009,6 +2009,7 @@ pub const Runtime = struct {
             // too, and so do the messages its slot keeps or carries into the
             // next work (`tests/tla/subagent/StopMessage.tla` NoSilentLoss).
             const unread = self.managed.stop(child_id);
+            end_test_controls.holdInStop(child_id);
             const held = self.managed.takeDropped(child_id);
             if (unread) |count| break :blk .{ waiting + count + held, true };
             break :blk .{ waiting + held, self.stopTurnWorkLocked(child_id) };
@@ -2097,7 +2098,10 @@ pub const Runtime = struct {
             } or self.stopTurnWorkLocked(child_id);
             // So do the messages its slot keeps or carries into the next work.
             // The user's close counts none of them.
-            if (by == .parent) unread += self.managed.takeDropped(child_id);
+            if (by == .parent) {
+                end_test_controls.holdInStop(child_id);
+                unread += self.managed.takeDropped(child_id);
+            }
             self.closing.appendAssumeCapacity(.{ .id = owned });
             self.closed_unseen.appendAssumeCapacity(unseen);
             self.closed_waiting.store(true, .release);
@@ -7051,6 +7055,236 @@ test "a stop that lands between a turn's end and the slot finishing its work cou
     var registry = try runtime.managed.state_store.load(alloc);
     defer registry.deinit(alloc);
     try std.testing.expect(registry.findPersistent("reviewer").?.active == null);
+}
+
+/// The slot's end and the host's hold in a parent's stop or close
+/// (`end_test_controls.test_hold_stop`): the slot waits after its turn ended and
+/// before it records the end, and again once it has. From its hook the stop or
+/// close lets the slot go and waits until the end is recorded, so the end runs
+/// right after the owner stopped the turn.
+const EndInStop = struct {
+    var before = TestHold{};
+    var after = TestHold{};
+
+    fn heldAt(_: []const u8, recorded: bool) void {
+        if (recorded) after.once() else before.once();
+    }
+
+    fn inStop(_: []const u8) void {
+        before.release();
+        after.waitHeld() catch std.debug.print("the slot's end was not recorded in time\n", .{});
+    }
+
+    fn arm() void {
+        before.reset();
+        after.reset();
+        end_test_controls.test_hold_run = heldAt;
+        end_test_controls.test_hold_stop = inStop;
+    }
+
+    fn clear() void {
+        end_test_controls.test_hold_run = null;
+        end_test_controls.test_hold_stop = null;
+    }
+
+    fn release() void {
+        before.release();
+        after.release();
+    }
+};
+
+/// The same for a work the slot starts or the host chose, held before its
+/// worker attaches: the hook lets the worker attach and waits until it has, so
+/// the attach runs right after the owner stopped the work.
+const AttachInStop = struct {
+    fn inStop(_: []const u8) void {
+        HeldStart.release();
+        AttachedHold.first.waitHeld() catch std.debug.print("the work's worker did not attach in time\n", .{});
+    }
+
+    fn arm() void {
+        HeldStart.arm();
+        AttachedHold.arm(0);
+        end_test_controls.test_hold_stop = inStop;
+    }
+
+    fn clear() void {
+        HeldStart.clear();
+        fixture_run_hook = null;
+        end_test_controls.test_hold_stop = null;
+    }
+
+    fn release() void {
+        HeldStart.release();
+        AttachedHold.release();
+    }
+};
+
+/// The same for a work the host chose that ends before its worker attaches: the
+/// hook lets the slot go on and waits until the work's end is recorded.
+const EndedInStop = struct {
+    fn inStop(_: []const u8) void {
+        PublishHeldTwice.first.release();
+        HeldRecorded.waitHeld() catch std.debug.print("the work's end was not recorded in time\n", .{});
+    }
+
+    fn arm() void {
+        HeldRecorded.arm();
+        end_test_controls.test_hold_stop = inStop;
+    }
+
+    fn clear() void {
+        end_test_controls.test_hold_run = null;
+        end_test_controls.test_hold_stop = null;
+    }
+};
+
+/// Fails with the answer in the output when it lacks `expected`.
+fn expectAnswerHas(answer: []const u8, expected: []const u8) !void {
+    if (std.mem.find(u8, answer, expected) != null) return;
+    std.debug.print("expected the answer to hold: {s}\nthe answer: {s}\n", .{ expected, answer });
+    return error.TestExpectedEqual;
+}
+
+const stopped_and_dropped = "Stopped reviewer: its turn ended, and the message waiting for it was dropped.";
+const closed_and_dropped = "Closed reviewer, ending its turn. The message waiting for it was dropped. A later message to reviewer starts a new one.";
+
+test "a stop whose turn's slot ends right after the owner stopped it counts the message the turn never took" {
+    EndInStop.arm();
+    defer EndInStop.clear();
+    var t: StopFixture = undefined;
+    try t.init(.{ .hold = true, .steerable = true });
+    defer t.deinit();
+    const arena = t.arena();
+    const runtime = t.runtime;
+    const fixture = &t.fixture;
+    defer EndInStop.release();
+
+    try Leftovers.endFirstWorkUnread(runtime, fixture, arena);
+    try EndInStop.before.waitHeld();
+    const child_id = try reviewerId(runtime, arena);
+    const stopped = try callTool(runtime, arena, .{ .stop = .{ .agent = "reviewer" } }, "call-3", null);
+    // A second stop of the same end counts nothing more.
+    const again = try callTool(runtime, arena, .{ .stop = .{ .agent = "reviewer" } }, "call-4", null);
+    EndInStop.release();
+    try waitForSlotEnd(runtime, child_id);
+    try expectAnswerHas(stopped, stopped_and_dropped);
+    try std.testing.expect(std.mem.find(u8, again, "dropped") == null);
+    // The message never ran, and a stop owes no report.
+    try std.testing.expectEqual(@as(usize, 1), fixture.runs.load(.seq_cst));
+    try std.testing.expectEqual(@as(usize, 0), fixture.reportCount());
+}
+
+test "the parent's close whose turn's slot ends right after the owner stopped it counts the message the turn never took" {
+    EndInStop.arm();
+    defer EndInStop.clear();
+    var t: StopFixture = undefined;
+    try t.init(.{ .hold = true, .steerable = true });
+    defer t.deinit();
+    const alloc = std.testing.allocator;
+    const arena = t.arena();
+    const runtime = t.runtime;
+    const fixture = &t.fixture;
+    defer EndInStop.release();
+
+    try Leftovers.endFirstWorkUnread(runtime, fixture, arena);
+    try EndInStop.before.waitHeld();
+    const child_id = try reviewerId(runtime, arena);
+    const closed = try callTool(runtime, arena, .{ .close = .{ .agent = "reviewer" } }, "call-3", null);
+    EndInStop.release();
+    try waitForSlotEnd(runtime, child_id);
+    try expectAnswerHas(closed, closed_and_dropped);
+    try std.testing.expectEqual(@as(usize, 1), fixture.runs.load(.seq_cst));
+    var registry = try runtime.managed.state_store.load(alloc);
+    defer registry.deinit(alloc);
+    try std.testing.expect(registry.findById(child_id) == null);
+}
+
+/// A work the host chose from the message that waited for the user's turn is
+/// held before its worker attaches; the hook in the stop or close lets it
+/// attach.
+fn heldChosenWork(t: *StopFixture, child_id: *[]const u8, work_id: *[]u8) !void {
+    const alloc = std.testing.allocator;
+    const arena = t.arena();
+    const runtime = t.runtime;
+    _ = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "working" } }, "call-1", null);
+    try waitUntilQuiet(runtime);
+    child_id.* = try reviewerId(runtime, arena);
+    work_id.* = runtime.beginUserWork(alloc, child_id.*, null).?;
+    const queued = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "after the user" } }, "call-2", null);
+    try std.testing.expect(std.mem.find(u8, queued, "is busy") != null);
+    AttachInStop.arm();
+    runtime.endUserWork(child_id.*, work_id.*, .completed, "");
+    try HeldStart.waitHeld();
+}
+
+test "a stop whose chosen work attaches right after the owner stopped it counts the message that waited for it" {
+    defer AttachInStop.clear();
+    var t: StopFixture = undefined;
+    try t.init(.{});
+    defer t.deinit();
+    const alloc = std.testing.allocator;
+    const runtime = t.runtime;
+    const fixture = &t.fixture;
+    var child_id: []const u8 = undefined;
+    var work_id: []u8 = undefined;
+    try heldChosenWork(&t, &child_id, &work_id);
+    defer alloc.free(work_id);
+    defer AttachInStop.release();
+
+    const stopped = try callTool(runtime, t.arena(), .{ .stop = .{ .agent = "reviewer" } }, "call-3", null);
+    AttachInStop.release();
+    try waitUntilQuiet(runtime);
+    try std.testing.expectEqual(@as(usize, 1), fixture.begun.load(.seq_cst));
+    try expectAnswerHas(stopped, stopped_and_dropped);
+}
+
+test "the parent's close whose chosen work attaches right after the owner stopped it counts the message that waited for it" {
+    defer AttachInStop.clear();
+    var t: StopFixture = undefined;
+    try t.init(.{});
+    defer t.deinit();
+    const alloc = std.testing.allocator;
+    const runtime = t.runtime;
+    const fixture = &t.fixture;
+    var child_id: []const u8 = undefined;
+    var work_id: []u8 = undefined;
+    try heldChosenWork(&t, &child_id, &work_id);
+    defer alloc.free(work_id);
+    defer AttachInStop.release();
+
+    const closed = try callTool(runtime, t.arena(), .{ .close = .{ .agent = "reviewer" } }, "call-3", null);
+    AttachInStop.release();
+    try waitForSlotEnd(runtime, child_id);
+    try std.testing.expectEqual(@as(usize, 1), fixture.begun.load(.seq_cst));
+    try expectAnswerHas(closed, closed_and_dropped);
+}
+
+/// A parent's stop or close of a work the host chose, whose bind to its agent
+/// then ends it before its worker attaches, the end recorded right after the
+/// owner stopped the work.
+fn expectCountedWhenChosenWorkEnds(actor: Actor, expected: []const u8) !void {
+    defer EndedInStop.clear();
+    var cell: AccountCell = undefined;
+    try cell.init(.next_one_failed, true);
+    defer cell.deinit();
+    try cell.reach();
+    EndedInStop.arm();
+    defer HeldRecorded.release();
+    try cell.act(actor, 1);
+    HeldRecorded.release();
+    try cell.finish();
+    try expectAnswerHas(cell.answers.items[0], expected);
+    // Only the first work's turn began.
+    try std.testing.expectEqual(@as(usize, 1), cell.fixture.begun.load(.seq_cst));
+}
+
+test "a stop whose chosen work ends before it attaches right after the owner stopped it counts the message that waited for it" {
+    try expectCountedWhenChosenWorkEnds(.parent_stop, stopped_and_dropped);
+}
+
+test "the parent's close whose chosen work ends before it attaches right after the owner stopped it counts the message that waited for it" {
+    try expectCountedWhenChosenWorkEnds(.parent_close, closed_and_dropped);
 }
 
 test "the parent's close that lands as the next work is installed drops it, and it never begins" {
