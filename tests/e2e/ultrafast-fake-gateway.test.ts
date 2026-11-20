@@ -11,6 +11,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { FX_BIN, runFx } from "../evals/eval-helpers";
+import { LineQueue } from "./line-queue";
 import {
   fakeGatewayFinalText,
   fakeGatewaySse,
@@ -186,8 +187,7 @@ async function waitForGatewayModelCatalog(gateway: Gateway): Promise<void> {
 
 class AcpClient {
   private buffer = "";
-  private lines: string[] = [];
-  private waiters: Array<(line: string) => void> = [];
+  private queue = new LineQueue();
   private closed = false;
   private stderr = "";
   private readonly exited: Promise<{ code: number | null; signal: NodeJS.Signals | null }>;
@@ -208,9 +208,7 @@ class AcpClient {
       this.buffer = lines.pop() ?? "";
       for (const line of lines) {
         if (!line.trim()) continue;
-        const waiter = this.waiters.shift();
-        if (waiter) waiter(line);
-        else this.lines.push(line);
+        this.queue.push(line);
       }
     });
   }
@@ -263,27 +261,9 @@ class AcpClient {
   }
 
   async readLine(timeoutMs = TIMEOUT): Promise<any> {
-    const line = await new Promise<string>((resolve, reject) => {
-      const buffered = this.lines.shift();
-      if (buffered) {
-        resolve(buffered);
-        return;
-      }
-      if (this.closed) {
-        reject(new Error(`ACP exited before a response: ${this.stderr}`));
-        return;
-      }
-      const waiter = (value: string) => {
-        clearTimeout(timer);
-        resolve(value);
-      };
-      const timer = setTimeout(() => {
-        const index = this.waiters.indexOf(waiter);
-        if (index !== -1) this.waiters.splice(index, 1);
-        reject(new Error(`ACP read timeout: ${this.stderr}`));
-      }, timeoutMs);
-      this.waiters.push(waiter);
-    });
+    // Once the process has closed no line is still to come: the queued ones are read, and then the read ends at once.
+    const line = await this.queue.next(this.closed ? 0 : timeoutMs, () =>
+      new Error(this.closed ? `ACP exited before a response: ${this.stderr}` : `ACP read timeout: ${this.stderr}`));
     return JSON.parse(line);
   }
 
