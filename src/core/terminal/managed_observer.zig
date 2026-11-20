@@ -65,14 +65,19 @@ pub fn inspectInput(ctx: Context, session_id: []const u8) !InputReview {
     } });
     defer inspected.deinit(ctx.alloc);
     const value = switch (inspected.view()) {
-        .failure => |failure| return mapTerminalFailure(failure.code),
+        .failure => |failure| return mapTerminalFailure(failure),
         .success => |success| switch (success) {
             .inspect => |value| value,
             else => return error.InvalidTerminalResult,
         },
     };
-    if (!std.mem.eql(u8, value.session.session_id, session_id) or
-        value.session.lifecycle != .running) return error.TerminalNotReady;
+    if (!std.mem.eql(u8, value.session.session_id, session_id)) return error.TerminalNotReady;
+    switch (value.session.lifecycle) {
+        .running => {},
+        .starting => return error.TerminalNotReady,
+        // Input can no longer reach a session that has ended.
+        .exited, .lost, .closed => return error.TerminalSessionEnded,
+    }
     const command = value.command orelse return error.TerminalCommandUnavailable;
     const owned_id = try ctx.alloc.dupe(u8, session_id);
     errdefer ctx.alloc.free(owned_id);
@@ -135,7 +140,7 @@ pub fn observe(
     } });
     defer inspected.deinit(ctx.alloc);
     const facts = switch (inspected.view()) {
-        .failure => |failure| return mapTerminalFailure(failure.code),
+        .failure => |failure| return mapTerminalFailure(failure),
         .success => |success| switch (success) {
             .inspect => |value| value.session,
             else => return error.InvalidTerminalResult,
@@ -175,7 +180,7 @@ pub fn observe(
             } });
             defer read.deinit(ctx.alloc);
             const result = switch (read.view()) {
-                .failure => |failure| return mapTerminalFailure(failure.code),
+                .failure => |failure| return mapTerminalFailure(failure),
                 .success => |success| switch (success) {
                     .read => |value| value,
                     else => return error.InvalidTerminalResult,
@@ -242,7 +247,7 @@ pub fn syncOwned(ctx: Context, requested_session_id: []const u8) !SyncOutcome {
     } });
     defer listed.deinit(ctx.alloc);
     const sessions = switch (listed.view()) {
-        .failure => |failure| return mapTerminalFailure(failure.code),
+        .failure => |failure| return mapTerminalFailure(failure),
         .success => |success| switch (success) {
             .list => |value| value.sessions,
             else => return error.InvalidTerminalResult,
@@ -271,7 +276,7 @@ pub fn syncOwned(ctx: Context, requested_session_id: []const u8) !SyncOutcome {
         } });
         defer inspected.deinit(ctx.alloc);
         const inspect = switch (inspected.view()) {
-            .failure => |failure| return mapTerminalFailure(failure.code),
+            .failure => |failure| return mapTerminalFailure(failure),
             .success => |success| switch (success) {
                 .inspect => |value| value,
                 else => return error.InvalidTerminalResult,
@@ -387,7 +392,7 @@ fn currentScreenText(
     } });
     defer screen.deinit(ctx.alloc);
     const snapshot = switch (screen.view()) {
-        .failure => |failure| return mapTerminalFailure(failure.code),
+        .failure => |failure| return mapTerminalFailure(failure),
         .success => |success| switch (success) {
             .screen => |value| value.snapshot,
             else => return error.InvalidTerminalResult,
@@ -471,12 +476,17 @@ fn reloadOwnerCatalogAuthority(
     });
 }
 
-fn mapTerminalFailure(code: contracts.StructuredErrorCode) anyerror {
-    return switch (code) {
+fn mapTerminalFailure(failure: contracts.StructuredError) anyerror {
+    return switch (failure.code) {
         .session_not_found => error.TerminalSessionNotFound,
         .session_lost => error.TerminalSessionLost,
         .authority_denied, .authority_retired => error.TerminalAuthorityLost,
         .cancelled => error.Cancelled,
+        // Only a busy refusal can run again later.
+        .capacity_exceeded => if (failure.isBusyRefusal())
+            error.TerminalCapacityExceeded
+        else
+            error.TerminalObservationFailed,
         else => error.TerminalObservationFailed,
     };
 }
@@ -485,6 +495,23 @@ fn isDefinitiveLoss(err: anyerror) bool {
     return err == error.TerminalSessionNotFound or
         err == error.TerminalSessionLost or
         err == error.TerminalAuthorityLost;
+}
+
+test "only a capacity refusal marked retryable maps to the retryable error" {
+    // The client's admission refusal, which can run again later.
+    try std.testing.expectEqual(
+        error.TerminalCapacityExceeded,
+        mapTerminalFailure(.{ .action = .read, .code = .capacity_exceeded, .retryable = true }),
+    );
+    // The host's own store or monitor limit, which a retry does not lift.
+    try std.testing.expectEqual(
+        error.TerminalObservationFailed,
+        mapTerminalFailure(.{ .action = .read, .code = .capacity_exceeded, .retryable = false }),
+    );
+    try std.testing.expectEqual(
+        error.TerminalSessionLost,
+        mapTerminalFailure(.{ .action = .wait, .code = .session_lost, .retryable = true }),
+    );
 }
 
 test "screen projection collapses blank repaint rows" {
