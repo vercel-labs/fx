@@ -41,7 +41,10 @@
         "sh.fx/hostTools": { "$ref": "#/$defs/Capability" },
         "sh.fx/toolCall": { "$ref": "#/$defs/Capability" },
         "sh.fx/permissionMode": { "$ref": "#/$defs/Capability" },
-        "sh.fx/modelResponseRecovery": { "$ref": "#/$defs/Capability" }
+        "sh.fx/modelResponseRecovery": { "$ref": "#/$defs/Capability" },
+        "sh.fx/turnProgress": { "$ref": "#/$defs/Capability" },
+        "sh.fx/modelCalls": { "$ref": "#/$defs/Capability" },
+        "sh.fx/usage": { "$ref": "#/$defs/Capability" }
       },
       "patternProperties": {
         "^sh\\.fx/": { "$ref": "#/$defs/Capability" }
@@ -66,7 +69,10 @@
         "sh.fx/hostTools": { "$ref": "#/$defs/HostToolsCapability" },
         "sh.fx/toolCall": { "$ref": "#/$defs/Capability" },
         "sh.fx/permissionMode": { "$ref": "#/$defs/Capability" },
-        "sh.fx/modelResponseRecovery": { "$ref": "#/$defs/Capability" }
+        "sh.fx/modelResponseRecovery": { "$ref": "#/$defs/Capability" },
+        "sh.fx/turnProgress": { "$ref": "#/$defs/Capability" },
+        "sh.fx/modelCalls": { "$ref": "#/$defs/Capability" },
+        "sh.fx/usage": { "$ref": "#/$defs/Capability" }
       },
       "patternProperties": {
         "^sh\\.fx/": { "$ref": "#/$defs/Capability" }
@@ -278,6 +284,57 @@
         }
       },
       "required": ["cwd"]
+    },
+    "TurnPhase": {
+      "description": "The `phase` of a turn's progress: what the turn is doing.",
+      "type": "string",
+      "enum": ["thinking", "generating", "running", "waiting_for_subagent"]
+    },
+    "TurnProgressParams": {
+      "description": "The params of the `_sh.fx/session/turn_progress` notification: the running turn's whole progress, not a change.",
+      "type": "object",
+      "properties": {
+        "sessionId": { "type": "string", "minLength": 1 },
+        "phase": { "$ref": "#/$defs/TurnPhase" },
+        "inputTokens": { "description": "The turn's input tokens so far.", "type": "integer", "minimum": 0 },
+        "outputTokens": { "description": "The turn's output tokens so far.", "type": "integer", "minimum": 0 },
+        "inputExact": { "description": "False while `inputTokens` is fx's estimate.", "type": "boolean" },
+        "outputExact": { "description": "False while `outputTokens` is fx's estimate.", "type": "boolean" },
+        "provider": { "description": "The provider that served the turn's latest request, when the gateway names it.", "type": "string", "minLength": 1 }
+      },
+      "required": ["sessionId", "inputTokens", "outputTokens", "inputExact", "outputExact"]
+    },
+    "ModelCallParams": {
+      "description": "The params of the `_sh.fx/session/model_call` notification: one model call that ended.",
+      "type": "object",
+      "properties": {
+        "sessionId": { "type": "string", "minLength": 1 },
+        "purpose": { "type": "string", "enum": ["turn", "compaction"] },
+        "outcome": { "type": "string", "enum": ["completed", "failed", "cancelled"] },
+        "provider": { "description": "The provider fx asked.", "type": "string", "minLength": 1 },
+        "model": { "description": "The model fx asked.", "type": "string", "minLength": 1 },
+        "servedBy": { "description": "The provider that served the call, when the gateway names it.", "type": "string" },
+        "generationId": { "description": "The provider's id for the call.", "type": "string" },
+        "finish": { "description": "The provider's finish reason.", "type": "string" },
+        "failure": { "description": "Why the call failed.", "type": "string" },
+        "retryAfterSeconds": { "description": "How long the provider asked fx to wait before a retry.", "type": "integer", "minimum": 0 },
+        "inputTokens": { "type": "integer", "minimum": 0 },
+        "outputTokens": { "type": "integer", "minimum": 0 },
+        "endedAt": { "description": "When the call ended, as an ISO 8601 time.", "type": "string" },
+        "durationMs": { "description": "How long the call ran.", "type": "integer", "minimum": 0 }
+      },
+      "required": ["sessionId", "purpose", "outcome", "provider", "model", "endedAt", "durationMs"]
+    },
+    "TurnUsage": {
+      "description": "The value of `sh.fx/usage` in the `_meta` of a `session/prompt` response: what ACP's `usage` field lacks.",
+      "type": "object",
+      "properties": {
+        "durationMs": { "description": "From the prompt to the end of the turn.", "type": "integer", "minimum": 0 },
+        "thinkingMs": { "description": "The time the model spent reasoning.", "type": "integer", "minimum": 0 },
+        "inputExact": { "description": "False when `usage.inputTokens` is fx's estimate.", "type": "boolean" },
+        "outputExact": { "description": "False when `usage.outputTokens` is fx's estimate.", "type": "boolean" }
+      },
+      "required": ["durationMs", "thinkingMs", "inputExact", "outputExact"]
     }
   }
 }

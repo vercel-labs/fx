@@ -1683,6 +1683,12 @@ fn sendActiveHistoryUpdates(
             pub fn append(self: *@This(), turn: types.HistoryTurn) !void {
                 try sendHistoryTurnAsUpdates(self.state, self.session, self.alloc, self.sources, turn);
             }
+
+            /// A saved session's log keeps each compaction in its place
+            /// among the turns, as a summary `append` never sees.
+            pub fn compaction(self: *@This(), number: usize) !void {
+                try sendCompactionHistory(self.state, self.alloc, self.session.session_id, number);
+            }
         };
         var visitor = Visitor{ .state = state, .session = active, .alloc = alloc, .sources = sources };
         return v2.visitHistory(alloc, &visitor);
@@ -1703,7 +1709,7 @@ fn sendHistoryTurnAsUpdates(
     switch (turn) {
         .assistant => |assistant| try sendUserHistoryTurn(state, alloc, session_id, assistant.user),
         .interrupted => |interrupted| try sendUserHistoryTurn(state, alloc, session_id, interrupted.user),
-        .compacted_summary => return,
+        .compacted_summary => |summary| return sendCompactionHistory(state, alloc, session_id, summary.compaction_count),
     }
 
     switch (turn) {
@@ -2084,6 +2090,22 @@ fn sendSteeringHistoryChunk(state: *server.ServerState, alloc: Allocator, sessio
     try state.writer.writeNotification(alloc, "session/update", out.writer.buffered());
 }
 
+/// A saved compaction, replayed in its place as one `completed` update with
+/// the id it had live, for a client that lists ACP's `session.compaction`
+/// (`src/protocol/spec/sh-fx.md` "Turn events").
+fn sendCompactionHistory(state: *server.ServerState, alloc: Allocator, session_id: []const u8, number: usize) !void {
+    if (!state.client_compaction) return;
+    var id: [32]u8 = undefined;
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    try out.writer.writeAll("{\"sessionId\":");
+    try writeJsonStr(session_id, &out.writer);
+    try out.writer.writeAll(",\"update\":");
+    try acp_types.writeCompactionUpdate(&out.writer, try acp_types.writeCompactionId(&id, number), .completed, null);
+    try out.writer.writeAll("}");
+    try state.writer.writeNotification(alloc, "session/update", out.writer.buffered());
+}
+
 fn sendAgentHistoryChunk(state: *server.ServerState, alloc: Allocator, session_id: []const u8, text: []const u8) !void {
     var message_id: acp_types.MessageIdBuffer = undefined;
     var out: std.Io.Writer.Allocating = .init(alloc);
@@ -2170,22 +2192,7 @@ pub fn sendSessionUsageUpdate(state: *server.ServerState, active: *server.Active
     try state.writer.writeNotification(alloc, "session/update", out.writer.buffered());
 }
 
-fn formatIso8601(alloc: Allocator, timestamp_ms: i64) ![]u8 {
-    const epoch_secs: u64 = @intCast(@divTrunc(timestamp_ms, 1000));
-    const epoch = std.time.epoch.EpochSeconds{ .secs = epoch_secs };
-    const day = epoch.getDaySeconds();
-    const year_day = epoch.getEpochDay().calculateYearDay();
-    const month_day = year_day.calculateMonthDay();
-
-    return alloc.print("{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}Z", .{
-        year_day.year,
-        @backingInt(month_day.month),
-        month_day.day_index + 1,
-        day.getHoursIntoDay(),
-        day.getMinutesIntoHour(),
-        day.getSecondsIntoMinute(),
-    });
-}
+const formatIso8601 = acp_types.formatIso8601;
 
 pub fn writeModelConfigOption(
     w: *std.Io.Writer,
@@ -2662,6 +2669,34 @@ test "ACP history excludes typed summaries without filtering original user text"
     defer alloc.free(captured);
     try std.testing.expect(std.mem.find(u8, captured, original) != null);
     try std.testing.expect(std.mem.find(u8, captured, "original reply") != null);
+    try std.testing.expect(std.mem.find(u8, captured, "internal summary") == null);
+}
+
+test "ACP history replays a saved compaction as one completed update, without its summary, for a client that takes them" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(workspace);
+    var capture = try tmp.dir.createFile(io_mod.getIo(), "history.jsonl", .{ .read = true });
+    defer capture.close(io_mod.getIo());
+    var state = try initAcpSessionTestState(arena, workspace, capture);
+    defer state.deinit();
+    state.client_compaction = true;
+
+    try sendTestHistoryTurn(&state, arena, "session-1", .{ .compacted_summary = .{
+        .summary = @constCast("internal summary"),
+        .removed_turn_count = 4,
+        .compaction_count = 3,
+    } });
+    var file = try tmp.dir.openFile(io_mod.getIo(), "history.jsonl", .{});
+    defer file.close(io_mod.getIo());
+    const captured = try io_mod.readFileToEnd(alloc, &file, 16 * 1024);
+    defer alloc.free(captured);
+    try std.testing.expect(std.mem.find(u8, captured, "{\"sessionUpdate\":\"compaction_update\",\"compactionId\":\"compaction-3\",\"status\":\"completed\"}") != null);
     try std.testing.expect(std.mem.find(u8, captured, "internal summary") == null);
 }
 

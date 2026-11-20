@@ -10,7 +10,9 @@
 # session/load and session/resume, and the prompt each turn sends.
 # AcpPromptDelivery: steering and queued prompts as the sh.fx spec
 # defines them. AcpSessions: one connection holding many sessions, each with
-# its own turn and workspace. AcpFollow: following a session on several
+# its own turn and workspace. AcpTurnEvents: what a client hears of a
+# running turn: the sh.fx turn events it lists and ACP v1's compaction
+# updates. AcpFollow: following a session on several
 # connections and catching up by log position, which hasn't landed in
 # src/acp/ yet. AcpSessionState: session state, session/status, and list
 # change hints, likewise not landed. AcpSharedSession: what the clients of
@@ -75,6 +77,10 @@ MCAcpSessions MCAcpSessionsOverlap AtMostOneRunning
 MCAcpSessions AcpSessionsToday-others OthersUntouched
 MCAcpSessions AcpSessionsToday-reuse ReuseKeepsTurn
 MCAcpSessions AcpSessionsToday-overlap -
+MCAcpTurnEvents MCAcpTurnEvents -
+MCAcpTurnEvents MCAcpTurnEventsPlain -
+MCAcpTurnEvents MCAcpTurnEventsSome -
+MCAcpTurnEvents AcpTurnEventsToday Complete
 MCAcpSystemPrompt MCAcpSystemPrompt -
 MCAcpSystemPrompt AcpSystemPromptBefore-v1-refused V1Accepted
 MCAcpSystemPrompt AcpSystemPromptBefore-old-accepted OtherShapesRefused

@@ -406,30 +406,151 @@ test "steering replay and responses carry no sh.fx key for a client that doesn't
     try std.testing.expectEqualStrings("{\"stopReason\":\"end_turn\",\"_meta\":{\"sh.fx/steeringDelivery\":\"absorbed\"}}", out.written());
 }
 
+/// Answers the prompt that started a turn with its stop reason and its
+/// tokens in `usage`, the field ACP's unstable schema defines on the
+/// response. Counts the provider reported come first; where it reported
+/// none, the counts fx estimated for the turn's summary stand in. `usage` is
+/// left out when the input or output count is unknown. With `timing`, for a
+/// client that lists `sh.fx/usage`, the response's `_meta` adds how long the
+/// turn ran and whether each count is exact (`src/protocol/spec/sh-fx.md`
+/// "Turn events").
 pub fn writePromptResponseWithUsage(
     w: *std.Io.Writer,
     reason: StopReason,
     usage: core_types.Usage,
+    summary: ?core_types.TurnSummary,
+    timing: bool,
 ) !void {
     try w.writeAll("{\"stopReason\":");
     try writeJsonStr(reason.jsonString(), w);
-    try w.writeAll(",\"usage\":{");
-    var first = true;
+    const progress: ?core_types.TurnTokenProgress = if (summary) |value| value.token_progress else null;
+    const input: ?u64 = usage.input_tokens orelse if (progress) |value| value.input_tokens else null;
+    const output: ?u64 = usage.output_tokens orelse if (progress) |value| value.output_tokens else null;
+    const input_exact = usage.input_tokens != null or (progress != null and progress.?.input_exact);
+    const output_exact = usage.output_tokens != null or (progress != null and progress.?.output_exact);
+    if (input != null and output != null) {
+        try w.print(",\"usage\":{{\"inputTokens\":{d},\"outputTokens\":{d},\"totalTokens\":{d}", .{ input.?, output.?, input.? +| output.? });
+        inline for (.{
+            .{ "thoughtTokens", usage.reasoning_tokens },
+            .{ "cachedReadTokens", usage.cache_read_tokens },
+            .{ "cachedWriteTokens", usage.cache_write_tokens },
+        }) |field| {
+            if (field[1]) |value| try w.print(",\"{s}\":{d}", .{ field[0], value });
+        }
+        try w.writeByte('}');
+    }
+    if (timing) if (summary) |value| {
+        try w.print(
+            ",\"_meta\":{{\"sh.fx/usage\":{{\"durationMs\":{d},\"thinkingMs\":{d},\"inputExact\":{},\"outputExact\":{}}}}}",
+            .{ value.turn_duration_ms, value.thinking_duration_ms, input != null and input_exact, output != null and output_exact },
+        );
+    };
+    try w.writeByte('}');
+}
+
+/// A time in milliseconds since the epoch as an ISO 8601 UTC time to the
+/// second, as ACP's timestamps are. Caller owns the result.
+pub fn formatIso8601(alloc: Allocator, timestamp_ms: i64) ![]u8 {
+    const epoch_secs: u64 = @intCast(@divTrunc(@max(timestamp_ms, 0), 1000));
+    const epoch = std.time.epoch.EpochSeconds{ .secs = epoch_secs };
+    const day = epoch.getDaySeconds();
+    const year_day = epoch.getEpochDay().calculateYearDay();
+    const month_day = year_day.calculateMonthDay();
+
+    return alloc.print("{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}Z", .{
+        year_day.year,
+        @backingInt(month_day.month),
+        month_day.day_index + 1,
+        day.getHoursIntoDay(),
+        day.getMinutesIntoHour(),
+        day.getSecondsIntoMinute(),
+    });
+}
+
+/// A running turn's progress, which `_sh.fx/session/turn_progress` sends
+/// whole each time it changes (`src/protocol/spec/sh-fx.md` "Turn events").
+pub const TurnProgress = struct {
+    phase: ?core_types.TurnPhase = null,
+    tokens: core_types.TurnTokenProgress = .{},
+    /// The provider that served the turn's latest request, when the gateway
+    /// names it.
+    provider: ?[]const u8 = null,
+};
+
+pub fn writeTurnProgressParams(w: *std.Io.Writer, session_id: []const u8, progress: TurnProgress) !void {
+    try w.writeAll("{\"sessionId\":");
+    try writeJsonStr(session_id, w);
+    if (progress.phase) |phase| {
+        try w.writeAll(",\"phase\":");
+        try writeJsonStr(@tagName(phase), w);
+    }
+    try w.print(",\"inputTokens\":{d},\"outputTokens\":{d},\"inputExact\":{},\"outputExact\":{}", .{
+        progress.tokens.input_tokens,
+        progress.tokens.output_tokens,
+        progress.tokens.input_exact,
+        progress.tokens.output_exact,
+    });
+    if (progress.provider) |provider| {
+        try w.writeAll(",\"provider\":");
+        try writeJsonStr(provider, w);
+    }
+    try w.writeByte('}');
+}
+
+/// One model call that ended, as `_sh.fx/session/model_call` carries it.
+pub fn writeModelCallParams(alloc: Allocator, w: *std.Io.Writer, session_id: []const u8, call: core_types.ModelCallRecord) !void {
+    try w.writeAll("{\"sessionId\":");
+    try writeJsonStr(session_id, w);
+    try w.writeAll(",\"purpose\":");
+    try writeJsonStr(@tagName(call.purpose), w);
+    try w.writeAll(",\"outcome\":");
+    try writeJsonStr(@tagName(call.outcome), w);
+    try w.writeAll(",\"provider\":");
+    try writeJsonStr(call.provider, w);
+    try w.writeAll(",\"model\":");
+    try writeJsonStr(call.model, w);
     inline for (.{
-        .{ "inputTokens", usage.input_tokens },
-        .{ "outputTokens", usage.output_tokens },
-        .{ "cacheReadTokens", usage.cache_read_tokens },
-        .{ "cacheWriteTokens", usage.cache_write_tokens },
-        .{ "reasoningTokens", usage.reasoning_tokens },
+        .{ "servedBy", call.served_by },
+        .{ "generationId", call.generation_id },
+        .{ "finish", call.finish },
+        .{ "failure", call.failure },
     }) |field| {
         if (field[1]) |value| {
-            if (!first) try w.writeByte(',');
-            first = false;
-            try writeJsonStr(field[0], w);
-            try w.print(":{d}", .{value});
+            try w.print(",\"{s}\":", .{field[0]});
+            try writeJsonStr(value, w);
         }
     }
-    try w.writeAll("}}");
+    if (call.retry_after_s) |value| try w.print(",\"retryAfterSeconds\":{d}", .{value});
+    if (call.input_tokens) |value| try w.print(",\"inputTokens\":{d}", .{value});
+    if (call.output_tokens) |value| try w.print(",\"outputTokens\":{d}", .{value});
+    const ended_at = try formatIso8601(alloc, call.at_ms);
+    defer alloc.free(ended_at);
+    try w.writeAll(",\"endedAt\":");
+    try writeJsonStr(ended_at, w);
+    try w.print(",\"durationMs\":{d}}}", .{call.elapsed_ms});
+}
+
+/// The status of a context compaction in ACP v1's `compaction_update`.
+pub const CompactionStatus = enum { in_progress, completed, failed, cancelled };
+
+/// ACP v1's `compaction_update`, only for a client that lists
+/// `session.compaction`. fx sends no `summary`: the one it keeps is written
+/// for the model (`src/protocol/spec/sh-fx.md` "Turn events").
+pub fn writeCompactionUpdate(w: *std.Io.Writer, compaction_id: []const u8, status: CompactionStatus, error_text: ?[]const u8) !void {
+    try w.writeAll("{\"sessionUpdate\":\"compaction_update\",\"compactionId\":");
+    try writeJsonStr(compaction_id, w);
+    try w.writeAll(",\"status\":");
+    try writeJsonStr(@tagName(status), w);
+    if (error_text) |text| {
+        try w.writeAll(",\"error\":");
+        try writeJsonStr(text, w);
+    }
+    try w.writeByte('}');
+}
+
+/// The id of a session's n-th saved compaction, live and in a replay.
+pub fn writeCompactionId(buf: []u8, number: usize) ![]const u8 {
+    return std.mem.print(buf, "compaction-{d}", .{number});
 }
 
 pub fn writeAvailableCommandsUpdate(w: *std.Io.Writer, commands_json: []const u8) !void {
@@ -705,4 +826,88 @@ test "writeToolCall leaves out sh.fx/toolCall for a client that doesn't list it"
     defer out.deinit();
     try writeToolCall(&out.writer, "call_1", "read_file", "Reading file", .read, .pending, null, null);
     try std.testing.expect(std.mem.find(u8, out.writer.buffered(), "_meta") == null);
+}
+
+test "writePromptResponseWithUsage uses ACP's usage names and adds sh.fx/usage only when listed" {
+    const alloc = std.testing.allocator;
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    const summary: core_types.TurnSummary = .{
+        .turn_duration_ms = 4210,
+        .thinking_duration_ms = 640,
+        .token_progress = .{ .input_tokens = 1700, .output_tokens = 400, .input_exact = false, .output_exact = false },
+    };
+    try writePromptResponseWithUsage(&out.writer, .end_turn, .{ .input_tokens = 1820, .output_tokens = 412, .cache_read_tokens = 1536, .reasoning_tokens = 30 }, summary, true);
+    try std.testing.expectEqualStrings(
+        "{\"stopReason\":\"end_turn\",\"usage\":{\"inputTokens\":1820,\"outputTokens\":412,\"totalTokens\":2232,\"thoughtTokens\":30,\"cachedReadTokens\":1536}," ++
+            "\"_meta\":{\"sh.fx/usage\":{\"durationMs\":4210,\"thinkingMs\":640,\"inputExact\":true,\"outputExact\":true}}}",
+        out.written(),
+    );
+    out.clearRetainingCapacity();
+    // A provider that reports no counts: fx's estimate stands in, flagged.
+    try writePromptResponseWithUsage(&out.writer, .end_turn, .{}, summary, true);
+    try std.testing.expectEqualStrings(
+        "{\"stopReason\":\"end_turn\",\"usage\":{\"inputTokens\":1700,\"outputTokens\":400,\"totalTokens\":2100}," ++
+            "\"_meta\":{\"sh.fx/usage\":{\"durationMs\":4210,\"thinkingMs\":640,\"inputExact\":false,\"outputExact\":false}}}",
+        out.written(),
+    );
+    out.clearRetainingCapacity();
+    // No counts and no summary: no usage, and no sh.fx/usage for a client
+    // that doesn't list it.
+    try writePromptResponseWithUsage(&out.writer, .cancelled, .{}, null, false);
+    try std.testing.expectEqualStrings("{\"stopReason\":\"cancelled\"}", out.written());
+    out.clearRetainingCapacity();
+    try writePromptResponseWithUsage(&out.writer, .end_turn, .{ .input_tokens = 5, .output_tokens = 2 }, summary, false);
+    try std.testing.expectEqualStrings("{\"stopReason\":\"end_turn\",\"usage\":{\"inputTokens\":5,\"outputTokens\":2,\"totalTokens\":7}}", out.written());
+}
+
+test "writeTurnProgressParams sends the whole progress, and the phase and provider once known" {
+    const alloc = std.testing.allocator;
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    try writeTurnProgressParams(&out.writer, "sess-1", .{});
+    try std.testing.expectEqualStrings("{\"sessionId\":\"sess-1\",\"inputTokens\":0,\"outputTokens\":0,\"inputExact\":true,\"outputExact\":true}", out.written());
+    out.clearRetainingCapacity();
+    try writeTurnProgressParams(&out.writer, "sess-1", .{
+        .phase = .waiting_for_subagent,
+        .tokens = .{ .input_tokens = 1820, .output_tokens = 96, .output_exact = false },
+        .provider = "xai",
+    });
+    try std.testing.expectEqualStrings(
+        "{\"sessionId\":\"sess-1\",\"phase\":\"waiting_for_subagent\",\"inputTokens\":1820,\"outputTokens\":96,\"inputExact\":true,\"outputExact\":false,\"provider\":\"xai\"}",
+        out.written(),
+    );
+}
+
+test "writeModelCallParams gives the call's fields, its end as ISO 8601, and leaves out unknown ones" {
+    const alloc = std.testing.allocator;
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    try writeModelCallParams(alloc, &out.writer, "sess-1", .{
+        .at_ms = 1_700_000_000_512,
+        .elapsed_ms = 3120,
+        .purpose = .compaction,
+        .outcome = .failed,
+        .provider = "gateway",
+        .model = "xai/grok-4",
+        .failure = "rate \"limited\"",
+        .retry_after_s = 30,
+    });
+    try std.testing.expectEqualStrings(
+        "{\"sessionId\":\"sess-1\",\"purpose\":\"compaction\",\"outcome\":\"failed\",\"provider\":\"gateway\",\"model\":\"xai/grok-4\"," ++
+            "\"failure\":\"rate \\\"limited\\\"\",\"retryAfterSeconds\":30,\"endedAt\":\"2023-11-14T22:13:20Z\",\"durationMs\":3120}",
+        out.written(),
+    );
+}
+
+test "writeCompactionUpdate writes ACP v1's compaction_update with no summary" {
+    const alloc = std.testing.allocator;
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    var id: [32]u8 = undefined;
+    try writeCompactionUpdate(&out.writer, try writeCompactionId(&id, 2), .in_progress, null);
+    try std.testing.expectEqualStrings("{\"sessionUpdate\":\"compaction_update\",\"compactionId\":\"compaction-2\",\"status\":\"in_progress\"}", out.written());
+    out.clearRetainingCapacity();
+    try writeCompactionUpdate(&out.writer, try writeCompactionId(&id, 2), .failed, "Compaction failed.");
+    try std.testing.expectEqualStrings("{\"sessionUpdate\":\"compaction_update\",\"compactionId\":\"compaction-2\",\"status\":\"failed\",\"error\":\"Compaction failed.\"}", out.written());
 }

@@ -99,6 +99,7 @@ else
 const types = @import("../core/shared/types.zig");
 const history_range = @import("../core/shared/history_range.zig");
 const worker_runtime = @import("../core/agent/worker_runtime.zig");
+const compaction_activity = @import("../core/output/compaction_activity.zig");
 const agent_stream_provider = @import("../core/agent/stream_provider.zig");
 const libfx_hooks = @import("libfx_hooks.zig");
 const runtime_gateway_step = @import("../core/agent/runtime/gateway_step.zig");
@@ -350,6 +351,15 @@ const AcpContext = struct {
     /// never opened steering cancels nothing this way.
     saw_host_steering_open: bool = false,
     closed_host_steering: bool = false,
+    /// The turn's progress, which `_sh.fx/session/turn_progress` sends whole
+    /// each time it changes. Its provider is owned.
+    progress: acp_types.TurnProgress = .{},
+    /// The params the last `_sh.fx/session/turn_progress` sent, owned, so a
+    /// report that changes nothing sends nothing.
+    progress_sent: ?[]u8 = null,
+    /// The compaction the turn runs, for ACP v1's compaction updates.
+    compaction: ?LiveCompaction = null,
+    next_compaction_operation: u64 = 1,
     /// The MCP host a subagent's turn uses, read once with its mode under the
     /// authority lock, since a reload that keeps the subagent running may set
     /// the session's host. Null for a prompt's own context: a reload joins
@@ -403,6 +413,41 @@ const AcpContext = struct {
         var keys = self.published_tool_calls.keyIterator();
         while (keys.next()) |key| self.alloc.free(key.*);
         self.published_tool_calls.deinit(self.alloc);
+        if (self.progress.provider) |provider| self.alloc.free(provider);
+        self.progress.provider = null;
+        if (self.progress_sent) |sent| self.alloc.free(sent);
+        self.progress_sent = null;
+    }
+
+    /// `_sh.fx/session/turn_progress`, for a client that lists
+    /// `sh.fx/turnProgress` (`tests/tla/acp/AcpTurnEvents.tla` OptIn).
+    fn sendTurnProgress(self: *AcpContext) !void {
+        if (!self.state.extensions.contains(.turn_progress)) return;
+        var out: std.Io.Writer.Allocating = .init(self.alloc);
+        defer out.deinit();
+        try acp_types.writeTurnProgressParams(&out.writer, self.session_id, self.progress);
+        if (self.progress_sent) |sent| if (std.mem.eql(u8, sent, out.written())) return;
+        try self.state.writer.writeNotification(self.alloc, sh_fx.method.session_turn_progress, out.written());
+        const sent = try self.alloc.dupe(u8, out.written());
+        if (self.progress_sent) |old| self.alloc.free(old);
+        self.progress_sent = sent;
+    }
+
+    /// `_sh.fx/session/model_call`, for a client that lists `sh.fx/modelCalls`.
+    fn sendModelCall(self: *AcpContext, call: types.ModelCallRecord) !void {
+        if (!self.state.extensions.contains(.model_calls)) return;
+        var out: std.Io.Writer.Allocating = .init(self.alloc);
+        defer out.deinit();
+        try acp_types.writeModelCallParams(self.alloc, &out.writer, self.session_id, call);
+        try self.state.writer.writeNotification(self.alloc, sh_fx.method.session_model_call, out.written());
+    }
+
+    fn sendCompactionUpdate(self: *AcpContext, number: usize, status: acp_types.CompactionStatus, error_text: ?[]const u8) !void {
+        var id: [32]u8 = undefined;
+        var out: std.Io.Writer.Allocating = .init(self.alloc);
+        defer out.deinit();
+        try acp_types.writeCompactionUpdate(&out.writer, try acp_types.writeCompactionId(&id, number), status, error_text);
+        try self.sendUpdate(out.written());
     }
 
     fn sendUpdate(self: *AcpContext, update_json: []const u8) !void {
@@ -1230,6 +1275,7 @@ pub fn handlePrompt(
 
     session.pending_prompt_id = msg.id;
     defer session.pending_prompt_id = null;
+    session.turn_summary = null;
 
     var ctx = AcpContext{
         .alloc = alloc,
@@ -2294,6 +2340,11 @@ fn agentRuntimeDeps(ctx: *AcpContext) agent_runtime.AgentRuntimeDeps {
         else
             null,
         .propagate_grant = retainAcpGrant,
+        .compaction_activity = if (ctx.state.client_compaction) .{
+            .begin = compactionBegin,
+            .running = compactionRunning,
+            .settle = compactionSettle,
+        } else null,
         .push_event = pushEvent,
         .push_text = pushText,
         .push_reasoning_delta = pushReasoningDelta,
@@ -3670,21 +3721,148 @@ fn retainAcpGrant(raw_ctx: *anyopaque, tool_name: []const u8, target_path: []con
     try session.retainGrant(ctx.alloc, tool_name, target_path);
 }
 
+/// Takes the event on success; on an error its sender still owns it.
 fn pushEvent(raw_ctx: *anyopaque, event: worker_runtime.WorkerEvent) !void {
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
+    // Every kind has its own arm, with no catch-all, so a new kind doesn't
+    // compile until it is mapped (`tests/tla/acp/AcpTurnEvents.tla`).
     switch (event) {
         .clear_route_recovery_status => try ctx.clearModelRecoveryStatus(),
-        // A steer cuts a streaming reply short, as in the fx CLI, but waits
-        // once the model streams a tool call's arguments.
         .turn_phase_update => |update| {
+            // A steer cuts a streaming reply short, as in the fx CLI, but
+            // waits once the model streams a tool call's arguments.
             server.noteSteeringPhase(ctx.session, update.step_id, switch (update.phase) {
                 .thinking, .generating => .reply,
                 .running, .waiting_for_subagent => .tools,
             });
+            ctx.progress.phase = update.phase;
+            try ctx.sendTurnProgress();
         },
-        else => {},
+        .turn_token_update => |tokens| {
+            ctx.progress.tokens = tokens;
+            try ctx.sendTurnProgress();
+        },
+        .provider_resolved => |provider| {
+            const owned = try ctx.alloc.dupe(u8, provider);
+            if (ctx.progress.provider) |old| ctx.alloc.free(old);
+            ctx.progress.provider = owned;
+            try ctx.sendTurnProgress();
+        },
+        .model_call => |call| try ctx.sendModelCall(call),
+        // The response reports the turn's times and the tokens fx counted.
+        .finish_prompt => |finished| ctx.session.turn_summary = finished.summary,
+        // A permission answer's feedback is the user's own words, which the
+        // model reads next. ACP's permission answers carry none today.
+        .append_user_feedback => |text| {
+            var message_id: acp_types.MessageIdBuffer = undefined;
+            _ = acp_types.generateMessageId(&message_id);
+            var out: std.Io.Writer.Allocating = .init(ctx.alloc);
+            defer out.deinit();
+            try acp_types.writeUserMessageChunk(&out.writer, &message_id, text);
+            try ctx.sendUpdate(out.written());
+        },
+        // `propagate_grant` already kept the grant for this session
+        // (`retainAcpGrant`), and the client chose it.
+        .session_grant => {},
+        // fx's terminal opens its model picker after a turn fails on its
+        // model. The turn's error already reached the client, which offers
+        // its own choice of model.
+        .open_model_picker => {},
+        // The terminal's worker makes these from its own sinks and its input.
+        // The loop never sends them here; an ACP turn gets their content
+        // through its own sinks.
+        .begin_prompt,
+        .begin_prompt_with_skill_bindings,
+        .begin_presented_prompt,
+        .begin_resumed_prompt,
+        .append_agent_message,
+        .assistant_presentation,
+        .notification,
+        .question_requested,
+        .semantic_notice,
+        .route_recovery_status,
+        .api_status_text,
+        .credential_refreshed,
+        .command_output,
+        .command_output_complete,
+        .tool_lifecycle,
+        .diff_block,
+        .context_compaction,
+        .error_text,
+        .restore_failed_prompt,
+        => debug_trace.logf("acp", "dropped worker event kind={s}: the loop never sends it to an ACP turn", .{@tagName(event)}),
     }
     worker_runtime.freeWorkerEvent(std.heap.c_allocator, event);
+}
+
+/// A compaction a turn runs, as ACP v1's compaction updates report it
+/// (`tests/tla/acp/AcpTurnEvents.tla` Lifecycle).
+const LiveCompaction = struct {
+    operation: compaction_activity.OperationId,
+    /// The number the compaction gets once it is saved, which makes its id
+    /// the one a replay gives it.
+    number: usize,
+    /// `in_progress` went out: its summary or its saving started.
+    started: bool = false,
+};
+
+/// The number the session's next saved compaction gets.
+fn nextCompactionNumber(session: *server.ActiveSessionState) usize {
+    var latest: usize = 0;
+    for (session.session_rt.agent.history.items) |turn| switch (turn) {
+        .compacted_summary => |summary| latest = @max(latest, summary.compaction_count),
+        .assistant, .interrupted => {},
+    };
+    return latest + 1;
+}
+
+fn compactionBegin(raw_ctx: *anyopaque, _: compaction_activity.Origin, _: ?u64) compaction_activity.OperationId {
+    const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
+    const operation: compaction_activity.OperationId = @fromBackingInt(ctx.next_compaction_operation);
+    ctx.next_compaction_operation += 1;
+    ctx.compaction = .{ .operation = operation, .number = nextCompactionNumber(ctx.session) };
+    return operation;
+}
+
+/// The compaction's summary or its saving started: `in_progress`, once.
+fn compactionRunning(raw_ctx: *anyopaque, operation: compaction_activity.OperationId, stage: compaction_activity.Stage) void {
+    const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
+    const live = if (ctx.compaction) |*value| value else return;
+    if (live.operation != operation or live.started or stage == .preparation) return;
+    live.started = true;
+    ctx.sendCompactionUpdate(live.number, .in_progress, null) catch |err|
+        debug_trace.logf("acp", "compaction update failed status=in_progress err={s}", .{@errorName(err)});
+}
+
+/// The compaction's one end. One that ends before its summary or saving
+/// started shows nothing, unless it failed (`tests/tla/acp/AcpTurnEvents.tla`
+/// Complete).
+fn compactionSettle(raw_ctx: *anyopaque, operation: compaction_activity.OperationId, feedback: compaction_activity.Feedback) void {
+    const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
+    const live = ctx.compaction orelse return;
+    if (live.operation != operation) return;
+    ctx.compaction = null;
+    const status: acp_types.CompactionStatus = switch (feedback.outcome) {
+        .succeeded => .completed,
+        .failed => .failed,
+        .cancelled, .no_op, .busy => .cancelled,
+    };
+    if (!live.started and status != .failed) return;
+    ctx.sendCompactionUpdate(live.number, status, if (status == .failed) compactionFailureText(feedback) else null) catch |err|
+        debug_trace.logf("acp", "compaction update failed status={s} err={s}", .{ @tagName(status), @errorName(err) });
+}
+
+/// A failed compaction's error, in the words of fx's terminal without its
+/// `/compact` advice, which an ACP client can't follow.
+fn compactionFailureText(feedback: compaction_activity.Feedback) []const u8 {
+    if (feedback.publication == .uncertain) return "Compaction could not confirm saved context. Reopen the session before retrying.";
+    if (feedback.publication == .committed) return "Compaction saved context, but could not finish. Reopen the session before retrying.";
+    if (feedback.err) |err| switch (err) {
+        error.CompactionAuthenticationRejected => return "Compaction was not started. Check authentication.",
+        error.ContextCapacityExceeded => return "Context is too large to compact. Choose a model with a larger context window.",
+        else => {},
+    };
+    return if (feedback.stage == .preparation) "Compaction was not started." else "Compaction failed.";
 }
 
 fn pushRouteRecoveryStatus(

@@ -71,7 +71,7 @@ After `initialize`, these rules apply to the connection:
 - Each side ignores the names it doesn't know in the other side's list.
 - A request that would make fx send a client an extension's messages, such as `_sh.fx/journal/open` or a session's hook settings, fails with `-32602` when that client doesn't list the extension.
 
-Each extension's section defines its capabilities, which `AgentCapabilitiesMeta` and `ClientCapabilitiesMeta` in `sh-fx.schema.json` also list. The steering section defines `sh.fx/promptDelivery` and `sh.fx/hostSteering`, the following section defines `sh.fx/logPosition` and `sh.fx/sessionClients`, the status section defines `sh.fx/sessionState` and `sh.fx/listChanges`, the subagents section defines `sh.fx/subagentPrompts`, the fork section defines `sh.fx/fork` and `sh.fx/rewind`, the turn diff section defines `sh.fx/turnDiff`, the sections for a host define `sh.fx/journal`, `sh.fx/hooks`, and `sh.fx/hostTools`, and the section on details defines `sh.fx/toolCall`, `sh.fx/permissionMode`, and `sh.fx/modelResponseRecovery`.
+Each extension's section defines its capabilities, which `AgentCapabilitiesMeta` and `ClientCapabilitiesMeta` in `sh-fx.schema.json` also list. The steering section defines `sh.fx/promptDelivery` and `sh.fx/hostSteering`, the following section defines `sh.fx/logPosition` and `sh.fx/sessionClients`, the status section defines `sh.fx/sessionState` and `sh.fx/listChanges`, the subagents section defines `sh.fx/subagentPrompts`, the fork section defines `sh.fx/fork` and `sh.fx/rewind`, the turn diff section defines `sh.fx/turnDiff`, the turn events section defines `sh.fx/turnProgress`, `sh.fx/modelCalls`, and `sh.fx/usage`, the sections for a host define `sh.fx/journal`, `sh.fx/hooks`, and `sh.fx/hostTools`, and the section on details defines `sh.fx/toolCall`, `sh.fx/permissionMode`, and `sh.fx/modelResponseRecovery`.
 
 ## Extensions
 
@@ -85,6 +85,7 @@ Each extension gets its own section here when it is written.
 | Subagents | The child sessions that a turn starts | [Subagent Sessions](https://agentclientprotocol.com/rfds/subagents) |
 | Fork and rewind | A new session copied from another, whole or up to a prompt, and the removal of the turns from a prompt on | [`session/fork`](https://agentclientprotocol.com/rfds/session-fork) for fork, and none for rewind |
 | Turn diff | The combined file changes of one turn | None |
+| Turn events | A turn's progress, its model calls, and how long it ran | None; the turn's tokens use ACP's unstable `usage` field |
 | A host's journal, hooks, and tools | What fx's SDK needs to keep a session's journal itself, observe a turn, and run its own tools | None |
 | Details on standard messages | Which tool calls are fx's own steps, the permission mode of each session mode, and the state of a model request that an earlier fx left running | None |
 
@@ -488,6 +489,87 @@ Each line of `preview` and `review` gives its `op`, which is `context`, `add`, o
 
 This extension sets no rule on order or timing, so it has no TLA+ model. The tests of its code check how fx combines a turn's changes.
 
+### Turn events
+
+fx's agent loop reports more about a running turn than ACP's standard updates carry. The standard updates give the reply, the reasoning, the tool calls, the context window's use at the end of the turn, notices, and compactions, and the `session/prompt` response gives the turn's tokens. This extension sends the rest, so a client can show a turn as fx's terminal does. Each part has its own capability, and fx sends a part only to a client that lists it:
+
+| Capability | What fx sends | When |
+| --- | --- | --- |
+| `sh.fx/turnProgress` | `_sh.fx/session/turn_progress` | Each time the turn's phase, its token counts, or the provider that serves it changes |
+| `sh.fx/modelCalls` | `_sh.fx/session/model_call` | Once for each model call that ends, whether it completed, failed, or was cancelled |
+| `sh.fx/usage` | `sh.fx/usage` in the `_meta` of the `session/prompt` response: how long the turn ran, and whether its token counts are exact | When the turn ends |
+
+A `_sh.fx/session/turn_progress` notification holds the turn's whole progress, not a change, so the last one a client read is current. fx sends one only when the progress differs from the last one it sent. `phase` is one of these values:
+
+| `phase` | Meaning |
+| --- | --- |
+| `thinking` | The model reasons before it writes |
+| `generating` | The model writes its reply or a tool call |
+| `running` | The model calls a tool, and fx runs the turn's tools |
+| `waiting_for_subagent` | The turn waits for a subagent's report |
+
+`inputTokens` and `outputTokens` count the turn's tokens so far. `inputExact` and `outputExact` are false while a count is fx's estimate, before the provider reports its own. `provider` names the provider that served the turn's latest request, when the gateway says which one did.
+
+```json
+{
+  "jsonrpc": "2.0",
+  "method": "_sh.fx/session/turn_progress",
+  "params": {
+    "sessionId": "sess_abc123",
+    "phase": "generating",
+    "inputTokens": 1820,
+    "outputTokens": 96,
+    "inputExact": true,
+    "outputExact": false,
+    "provider": "xai"
+  }
+}
+```
+
+A `_sh.fx/session/model_call` notification gives one model call as fx's full transcript shows it: its `purpose`, which is `turn` or `compaction`, its `outcome`, which is `completed`, `failed`, or `cancelled`, the `provider` and `model` fx asked, and, when known, the provider that served it, the provider's generation id, the finish reason, the failure, the tokens, and how long the provider asked fx to wait before a retry. `endedAt` is when the call ended, as an ISO 8601 time, and `durationMs` how long it ran. A load doesn't replay these notifications yet.
+
+```json
+{
+  "jsonrpc": "2.0",
+  "method": "_sh.fx/session/model_call",
+  "params": {
+    "sessionId": "sess_abc123",
+    "purpose": "turn",
+    "outcome": "completed",
+    "provider": "gateway",
+    "model": "xai/grok-4",
+    "servedBy": "xai",
+    "finish": "stop",
+    "inputTokens": 1820,
+    "outputTokens": 412,
+    "endedAt": "2026-11-14T22:41:07Z",
+    "durationMs": 3120
+  }
+}
+```
+
+The `session/prompt` response carries the turn's tokens in `usage`, the field that ACP's unstable schema defines on it: `inputTokens`, `outputTokens`, `totalTokens`, their sum, and, when the provider reports them, `thoughtTokens`, `cachedReadTokens`, and `cachedWriteTokens`. Where a provider reports no counts, fx gives its own estimate. fx sends `usage` to every client, as before this extension, when it knows the input and output counts. Before, fx named three of them `cacheReadTokens`, `cacheWriteTokens`, and `reasoningTokens`, and sent no `totalTokens`.
+
+`sh.fx/usage` in the response's `_meta` adds what ACP's `usage` lacks: `durationMs`, from the prompt to the end of the turn, `thinkingMs`, the time the model spent reasoning, and `inputExact` and `outputExact`, which are false when a count in `usage` is fx's estimate.
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 3,
+  "result": {
+    "stopReason": "end_turn",
+    "usage": { "inputTokens": 1820, "outputTokens": 412, "totalTokens": 2232, "cachedReadTokens": 1536 },
+    "_meta": {
+      "sh.fx/usage": { "durationMs": 4210, "thinkingMs": 640, "inputExact": true, "outputExact": true }
+    }
+  }
+}
+```
+
+fx also sends ACP v1's compaction updates, to a client that lists ACP's `session.compaction` capability, and no compaction updates to other clients. Once a compaction of a session's context starts its summary, fx sends `compaction_update` with `in_progress`. When it ends, fx sends one more `compaction_update` with the same `compactionId`: `completed`, `failed` with the error, or `cancelled`. The updates carry no `summary`, because the summary fx keeps is written for the model and fx's terminal doesn't show it either. A compaction that ends before its summary starts, such as one that finds nothing to compact, sends nothing unless it failed. A load replays each saved compaction as one `completed` update, in its place in the history.
+
+A turn's notifications from this extension, and its compaction updates, reach the client before the turn's `session/prompt` response, in the order the loop reported them. `tests/tla/acp/AcpTurnEvents.tla` models these rules, and TLC checks that a client receives only the parts it lists, every reported event of those parts, each compaction's `in_progress` before its one end and nothing after it, and all of it before the response.
+
 ### A host's journal
 
 A host that keeps a session's journal itself, such as fx's SDK, uses these methods. fx lists the `sh.fx/journal` capability for them, and a host lists it to receive the journal's messages:
@@ -622,3 +704,7 @@ The keys and capabilities moved with the method names: fx reads and sends only t
 | `SessionStateUpdate` | The `update` of `_sh.fx/session/state_update`, a part of ACP's `StateUpdate` |
 | `SessionStateUpdateParams` | The params of `_sh.fx/session/state_update` |
 | `ListChangedParams` | The params of `_sh.fx/session/list_changed` |
+| `TurnPhase` | The `phase` of a turn's progress: `thinking`, `generating`, `running`, or `waiting_for_subagent` |
+| `TurnProgressParams` | The params of `_sh.fx/session/turn_progress` |
+| `ModelCallParams` | The params of `_sh.fx/session/model_call` |
+| `TurnUsage` | The value of `sh.fx/usage`: how long the turn ran, and whether its token counts are exact |

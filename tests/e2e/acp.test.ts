@@ -1787,6 +1787,16 @@ async function startAutoSession(client: AcpClient, hooks = false) {
   return created.result.sessionId as string;
 }
 
+/// Like startAutoSession, for a client that lists exactly `capabilities` at
+/// initialize.
+async function startSessionListing(client: AcpClient, capabilities: object) {
+  await client.request("initialize", { protocolVersion: 1, clientCapabilities: capabilities }, 1);
+  const created = await client.request("session/new", { mcpServers: [] }, 2) as any;
+  await client.readLine(); // consume session/update notification
+  await client.request("session/set_mode", { modeId: "auto" }, 3);
+  return created.result.sessionId as string;
+}
+
 async function runPrompt(client: AcpClient, text: string, timeoutMs = LIVE_TIMEOUT) {
   return runPromptBlocks(client, [{ type: "text", text }], timeoutMs);
 }
@@ -2909,6 +2919,126 @@ describe("acp: model-independent", () => {
           // A plain turn has nothing to note, so compacting it needs no model call.
           expect(gateway.requests).toHaveLength(2);
           expect(gateway.requests[1]!.body.includes("compacted_conversation"), `percent ${percent ?? "default"}`).toBe(percent !== undefined);
+          expect(client.stderr).toBe("");
+        } finally {
+          await client?.close();
+          gateway.stop();
+          rmSync(root.root, { recursive: true, force: true });
+        }
+      }
+    },
+    TIMEOUT * 2,
+  );
+
+  test(
+    "ACP sends turn progress, model calls, and sh.fx/usage only to a client that lists them",
+    async () => {
+      const listed = { _meta: { "sh.fx/turnProgress": {}, "sh.fx/modelCalls": {}, "sh.fx/usage": {} } };
+      for (const capabilities of [listed, { _meta: {} }]) {
+        const root = createIsolatedRoot("fx-acp-turn-events-");
+        writeFileSync(join(root.workspace, "progress-note.txt"), "ACP_PROGRESS_NOTE\n");
+        const gateway = startFakeGateway([
+          fakeGatewayToolCall("progress_call_1", "read_file", { path: "progress-note.txt" }),
+          fakeGatewaySse([
+            { type: "text-delta", id: "answer_1", delta: "ACP_PROGRESS_DONE" },
+            {
+              type: "finish",
+              finishReason: { unified: "stop", raw: "stop" },
+              usage: { inputTokens: { total: 900, noCache: 400, cacheRead: 500, cacheWrite: 0 }, outputTokens: { total: 12, text: 12, reasoning: 0 } },
+            },
+          ]),
+        ]);
+        try {
+          client = await AcpClient.create({ cwd: root.workspace, env: fakeGatewayEnv(root, gateway) });
+          const sessionId = await startSessionListing(client, capabilities);
+          const { promptResult, messages } = await runPrompt(client, "Read the note.", TIMEOUT);
+          expect(promptResult.result.stopReason).toBe("end_turn");
+          const progress = messages.filter((m) => m.method === "_sh.fx/session/turn_progress").map((m) => m.params);
+          const calls = messages.filter((m) => m.method === "_sh.fx/session/model_call").map((m) => m.params);
+          // Every client gets the turn's tokens under ACP's unstable names.
+          const usage = promptResult.result.usage;
+          expect(usage.totalTokens).toBe(usage.inputTokens + usage.outputTokens);
+          expect(usage.cachedReadTokens).toBe(500);
+          expect(Object.keys(usage)).not.toContain("cacheReadTokens");
+          if (capabilities !== listed) {
+            expect(progress).toEqual([]);
+            expect(calls).toEqual([]);
+            expect(promptResult.result._meta?.["sh.fx/usage"]).toBeUndefined();
+          } else {
+            expect(progress.length).toBeGreaterThan(0);
+            expect(progress.every((p) => p.sessionId === sessionId)).toBe(true);
+            // A report that changes nothing sends nothing.
+            const sent = progress.map((p) => JSON.stringify(p));
+            expect(sent.every((p, i) => i === 0 || p !== sent[i - 1])).toBe(true);
+            expect(progress.some((p) => p.phase === "generating")).toBe(true);
+            expect(progress.at(-1).outputTokens).toBeGreaterThan(0);
+            // One record for each request the model got, in order.
+            expect(calls).toHaveLength(gateway.requests.length);
+            for (const call of calls) {
+              expect(call).toMatchObject({ sessionId, purpose: "turn", outcome: "completed" });
+              expect(typeof call.provider).toBe("string");
+              expect(typeof call.model).toBe("string");
+              expect(call.endedAt).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/);
+              expect(call.durationMs).toBeGreaterThanOrEqual(0);
+            }
+            expect(calls.at(-1).inputTokens).toBe(900);
+            expect(promptResult.result._meta["sh.fx/usage"]).toMatchObject({ inputExact: true, outputExact: true });
+            expect(promptResult.result._meta["sh.fx/usage"].durationMs).toBeGreaterThanOrEqual(0);
+            expect(promptResult.result._meta["sh.fx/usage"].thinkingMs).toBeGreaterThanOrEqual(0);
+          }
+          expect(client.stderr).toBe("");
+        } finally {
+          await client?.close();
+          gateway.stop();
+          rmSync(root.root, { recursive: true, force: true });
+        }
+      }
+    },
+    TIMEOUT * 2,
+  );
+
+  test(
+    "ACP sends compaction updates only to a client that lists session.compaction, and a load replays them",
+    async () => {
+      const reply = (text: string) => fakeGatewaySse([
+        { type: "text-delta", id: "answer_1", delta: text },
+        { type: "finish", finishReason: { unified: "stop", raw: "stop" } },
+      ]);
+      const large = "ACP_LARGE_REPLY\n" + "historical reference line, not new completed work.\n".repeat(2_400);
+      const compactionUpdates = (messages: any[]) => messages
+        .filter((m) => m.method === "session/update" && m.params.update.sessionUpdate === "compaction_update")
+        .map((m) => m.params.update);
+      for (const lists of [true, false]) {
+        const capabilities = lists ? { session: { compaction: {} }, _meta: {} } : { _meta: {} };
+        const root = createIsolatedRoot("fx-acp-compaction-updates-");
+        const gateway = startFakeGateway([reply(large), reply("ACP_AFTER_REPLY")], {
+          models: [{ id: FAKE_GATEWAY_MODEL, type: "language", tags: ["tool-use"], context_window: 128_000 }],
+        });
+        const env = { ...fakeGatewayEnv(root, gateway), FX_AUTO_COMPACT_PERCENT: "20" };
+        try {
+          client = await AcpClient.create({ cwd: root.workspace, env });
+          const sessionId = await startSessionListing(client, capabilities);
+          expect(compactionUpdates((await runPrompt(client, "Write the large reply.", TIMEOUT)).messages)).toEqual([]);
+          const second = await runPrompt(client, "Continue.", TIMEOUT);
+          expect(second.promptResult.result.stopReason).toBe("end_turn");
+          expect(gateway.requests[1]!.body.includes("compacted_conversation")).toBe(true);
+          expect(compactionUpdates(second.messages)).toEqual(lists
+            ? [
+              { sessionUpdate: "compaction_update", compactionId: "compaction-1", status: "in_progress" },
+              { sessionUpdate: "compaction_update", compactionId: "compaction-1", status: "completed" },
+            ]
+            : []);
+          expect(client.stderr).toBe("");
+          await client.close();
+
+          // A load replays the saved compaction as one completed update, with
+          // the id it had live.
+          client = await AcpClient.create({ cwd: root.workspace, env });
+          await client.request("initialize", { protocolVersion: 1, clientCapabilities: capabilities }, 1);
+          const loaded = await client.request("session/load", { sessionId, cwd: root.workspace, mcpServers: [] }, 2) as any;
+          expect(loaded.error).toBeUndefined();
+          const replayed = compactionUpdates(client.rawLines.map((line) => JSON.parse(line)));
+          expect(replayed).toEqual(lists ? [{ sessionUpdate: "compaction_update", compactionId: "compaction-1", status: "completed" }] : []);
           expect(client.stderr).toBe("");
         } finally {
           await client?.close();
@@ -13426,7 +13556,7 @@ describe("acp: model-independent", () => {
         expect(result.promptResult.result.stopReason).toBe("end_turn");
         // The turn that sends work (2 requests), the child, and the report turn.
         expect(gateway.requests).toHaveLength(4);
-        expect(result.promptResult.result.usage).toEqual({ inputTokens: 700, outputTokens: 7, cacheReadTokens: 70 });
+        expect(result.promptResult.result.usage).toEqual({ inputTokens: 700, outputTokens: 7, totalTokens: 707, cachedReadTokens: 70 });
         expect(client.stderr).toBe("");
       } finally {
         await client?.close();
@@ -13471,7 +13601,7 @@ describe("acp: model-independent", () => {
         // Two requests of the first turn, the first child, two of the second turn, the second child, and the third turn.
         expect(gateway.requests).toHaveLength(7);
         expect(JSON.stringify(result.messages)).toContain("ACP_USAGE_ALL_DONE");
-        expect(result.promptResult.result.usage).toEqual({ inputTokens: 3100, outputTokens: 31, cacheReadTokens: 310 });
+        expect(result.promptResult.result.usage).toEqual({ inputTokens: 3100, outputTokens: 31, totalTokens: 3131, cachedReadTokens: 310 });
         expect(client.stderr).toBe("");
       } finally {
         await client?.close();
@@ -13514,7 +13644,7 @@ describe("acp: model-independent", () => {
         client.send({ jsonrpc: "2.0", id: 6821, method: "session/cancel", params: {} });
         const response = await readResponse(client, promptId);
         expect(response.result.stopReason).toBe("cancelled");
-        expect(response.result.usage).toEqual({ inputTokens: 300, outputTokens: 3, cacheReadTokens: 30 });
+        expect(response.result.usage).toEqual({ inputTokens: 300, outputTokens: 3, totalTokens: 303, cachedReadTokens: 30 });
         expect(client.stderr).toBe("");
       } finally {
         held.release("ACP_USAGE_CANCEL_LATE");
@@ -13553,7 +13683,7 @@ describe("acp: model-independent", () => {
         await startAutoSession(client);
         const result = await runPrompt(client, "Delegate the failing task.", TIMEOUT);
         expect(result.promptResult.result.stopReason).toBe("refused");
-        expect(result.promptResult.result.usage).toEqual({ inputTokens: 300, outputTokens: 3, cacheReadTokens: 30 });
+        expect(result.promptResult.result.usage).toEqual({ inputTokens: 300, outputTokens: 3, totalTokens: 303, cachedReadTokens: 30 });
         expect(client.stderr).toBe("");
       } finally {
         await client?.close();
@@ -13577,7 +13707,7 @@ describe("acp: model-independent", () => {
         await startAutoSession(client);
         const result = await runPrompt(client, "Answer once.", TIMEOUT);
         expect(result.promptResult.result.stopReason).toBe("end_turn");
-        expect(result.promptResult.result.usage).toEqual({ inputTokens: 123, outputTokens: 45, cacheReadTokens: 6 });
+        expect(result.promptResult.result.usage).toEqual({ inputTokens: 123, outputTokens: 45, totalTokens: 168, cachedReadTokens: 6 });
         expect(client.stderr).toBe("");
       } finally {
         await client?.close();
