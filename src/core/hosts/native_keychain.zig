@@ -31,6 +31,8 @@ pub const oauth_session_service_name = "FX_OAUTH_SESSION_V1";
 /// The fx login's sign-outs that its issuer did not confirm, kept to revoke
 /// later (`auth/pending_revocation.zig`).
 pub const oauth_pending_revocations_service_name = "FX_OAUTH_PENDING_REVOCATIONS_V1";
+/// MCP logins' sign-outs that their server did not confirm, kept the same way.
+pub const mcp_pending_revocations_service_name = "FX_MCP_PENDING_REVOCATIONS_V1";
 
 /// Backing store for a resolved account name. Must outlive any argv built from it.
 pub const AccountBuffer = [256]u8;
@@ -39,7 +41,7 @@ const passwd_scratch_bytes = 2048;
 const max_mcp_credentials_bytes: usize = 1024 * 1024;
 const max_oauth_session_bytes: usize = 64 * 1024;
 /// `pending_revocation.max_record_bytes`.
-const max_oauth_pending_revocations_bytes: usize = 128 * 1024;
+const max_oauth_pending_revocations_bytes: usize = 256 * 1024;
 /// How long one Keychain call may take, in milliseconds; leased locks held
 /// across Keychain calls allow each call this much (`shared/leased_lock.zig`).
 pub const keychain_call_ms: i64 = 10_000;
@@ -402,6 +404,26 @@ pub fn storeOAuthPendingRevocations(value: []const u8) Error!void {
 
 pub fn deleteOAuthPendingRevocations(alloc: std.mem.Allocator) Error!bool {
     if (comptime builtin.target.os.tag == .macos) return deleteMcpValueMac(alloc, oauth_pending_revocations_service_name);
+    return error.UnsupportedPlatform;
+}
+
+/// Returns error.KeychainItemNotFound when no MCP sign-out is kept.
+pub fn loadMcpPendingRevocations(alloc: std.mem.Allocator) Error!?[]u8 {
+    if (comptime builtin.target.os.tag == .macos) return loadMcpValueMacControlled(alloc, mcp_pending_revocations_service_name, null);
+    return error.UnsupportedPlatform;
+}
+
+pub fn storeMcpPendingRevocations(value: []const u8) Error!void {
+    if (!isAvailable()) return error.UnsupportedPlatform;
+    if (value.len == 0 or value.len > max_oauth_pending_revocations_bytes) {
+        return error.KeychainWriteFailed;
+    }
+    if (comptime builtin.target.os.tag == .macos) return storeMcpValueMac(mcp_pending_revocations_service_name, value);
+    return error.UnsupportedPlatform;
+}
+
+pub fn deleteMcpPendingRevocations(alloc: std.mem.Allocator) Error!bool {
+    if (comptime builtin.target.os.tag == .macos) return deleteMcpValueMac(alloc, mcp_pending_revocations_service_name);
     return error.UnsupportedPlatform;
 }
 

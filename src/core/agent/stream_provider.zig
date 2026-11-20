@@ -536,6 +536,13 @@ pub const Failure = struct {
 
 /// Whether the provider refused the request as longer than the model's
 /// context window, in any family's wording.
+///
+/// The phrases match anywhere in the detail, because only OpenAI-style bodies
+/// carry `code: "context_length_exceeded"`. Gateway, Anthropic and xAI send
+/// only text, and a Gateway multi-attempt body holds it only under
+/// `providerAttempts[].error`. So a rare refusal for another cause that quotes
+/// one of these phrases counts as an overflow: the main request compacts once
+/// and retries, and the compactor sends up to three smaller requests.
 pub fn isContextOverflow(failure: Failure) bool {
     if (failure.kind == .request_too_large) return true;
     if (failure.kind != .invalid_request) return false;
