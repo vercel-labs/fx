@@ -2690,7 +2690,10 @@ describe("effect-aware command permissions", () => {
       installClipboardFixture(root, "#!/bin/sh\nexit 1\n");
       writeFileSync(stderrPath, "");
       // The file `writeCrashReport` saves when fx ends on an error: the trace
-      // header, the fatal error, and one record from the session.
+      // header, the fatal error, and one record from the session. It is dated an
+      // hour ago, because `/trace` shows a crash report only within 24 hours of it.
+      const crashAtMs = Date.now() - 60 * 60 * 1000;
+      const crashAt = new Date(crashAtMs).toISOString();
       mkdirSync(join(root.home, ".fx", "diagnostics"), { recursive: true });
       writeFileSync(
         join(root.home, ".fx", "diagnostics", "last-crash.jsonl"),
@@ -2700,16 +2703,16 @@ describe("effect-aware command permissions", () => {
             format_version: 1,
             fx_version: "9.9.9",
             git_commit: "abc1234",
-            written_at: "2023-11-14T22:13:20.000Z",
-            written_at_ms: 1700000000000,
+            written_at: crashAt,
+            written_at_ms: crashAtMs,
             notice: "private",
           }),
           JSON.stringify({
             type: "fatal_error",
             error: "InvalidTranscriptTransition",
             message: "invalid transcript transition",
-            at: "2023-11-14T22:13:20.123Z",
-            at_ms: 1700000000123,
+            at: crashAt,
+            at_ms: crashAtMs,
           }),
           JSON.stringify({ type: "renderer_event", sequence: 1, kind: "commit", detail: "ok" }),
         ].map((line) => `${line}\n`).join(""),

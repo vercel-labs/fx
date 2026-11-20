@@ -67,10 +67,12 @@ const TraceReportDisposition = union(enum) {
     unavailable,
 };
 
-/// Returns an owned trace notice whose bytes belong to the caller.
+/// Returns an owned trace notice whose bytes belong to the caller. When the
+/// trace includes a saved crash report, the notice says so, with its time.
 fn format_trace_notice(
     alloc: std.mem.Allocator,
     disposition: TraceReportDisposition,
+    crash: ?trace_report.IncludedCrash,
 ) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
@@ -81,7 +83,15 @@ fn format_trace_notice(
         .saved => |path| try out.writer.print("Trace saved at {s}. Review and redact it before sharing.", .{path}),
         .unavailable => try out.writer.writeAll("Could not create trace."),
     }
+    // A trace that was not written contains no crash report to name.
+    if (crash) |included| if (disposition != .unavailable) try writeIncludedCrash(&out.writer, included);
     return out.toOwnedSlice();
+}
+
+fn writeIncludedCrash(writer: *std.Io.Writer, included: trace_report.IncludedCrash) !void {
+    const at_ms = included.at_ms orelse return writer.writeAll(" Includes the crash report.");
+    var time_buf: [32]u8 = undefined;
+    try writer.print(" Includes the crash report from {s}.", .{try trace_report.formatUtcMinute(&time_buf, at_ms)});
 }
 
 fn persistUserPreferences(
@@ -392,14 +402,14 @@ pub fn Handlers(comptime App: type) type {
             app.shell.render_requests.request(.transcript);
             try app.flushBeforeBlockingExternalWork();
 
-            const report = trace_report.build(app) catch {
+            const built = trace_report.build(app) catch {
                 try finish_trace_notice(app, progress_entry_id, .@"error", "Failed to build trace.");
                 return;
             };
-            defer app.alloc.free(report);
+            defer app.alloc.free(built.bytes);
 
             const builtin = @import("builtin");
-            const report_path: ?[]u8 = trace_report.writeFile(app.alloc, report) catch null;
+            const report_path: ?[]u8 = trace_report.writeFile(app.alloc, built.bytes) catch null;
             defer if (report_path) |path| app.alloc.free(path);
             const disposition: TraceReportDisposition = if (report_path) |path| blk: {
                 const copied = if (comptime @hasDecl(App, "clipboard"))
@@ -412,7 +422,7 @@ pub fn Handlers(comptime App: type) type {
             } else blk: {
                 break :blk .unavailable;
             };
-            const body = try format_trace_notice(app.alloc, disposition);
+            const body = try format_trace_notice(app.alloc, disposition, built.crash);
             defer app.alloc.free(body);
             const tone: types.NoticeTone = switch (disposition) {
                 .copied_file, .saved => .neutral,
@@ -2394,12 +2404,35 @@ test "trace notice distinguishes file outcomes without a feedback CTA" {
     };
 
     for (cases) |case| {
-        const body = try format_trace_notice(std.testing.allocator, case.disposition);
+        const body = try format_trace_notice(std.testing.allocator, case.disposition, null);
         defer std.testing.allocator.free(body);
         try std.testing.expectEqualStrings(case.expected, body);
         try std.testing.expect(std.mem.find(u8, body, "feedback") == null);
         try std.testing.expect(std.mem.find(u8, body, "Report issue") == null);
     }
+}
+
+test "trace notice says when the trace includes a crash report and when it was saved" {
+    const report_path = "/tmp/trace.jsonl";
+    const timed: trace_report.IncludedCrash = .{ .at_ms = 1_794_966_120_000 };
+    const saved = try format_trace_notice(std.testing.allocator, .{ .saved = report_path }, timed);
+    defer std.testing.allocator.free(saved);
+    try std.testing.expectEqualStrings(
+        "Trace saved at /tmp/trace.jsonl. Review and redact it before sharing. Includes the crash report from 2026-11-18 01:42 UTC.",
+        saved,
+    );
+
+    const unavailable = try format_trace_notice(std.testing.allocator, .unavailable, timed);
+    defer std.testing.allocator.free(unavailable);
+    try std.testing.expectEqualStrings("Could not create trace.", unavailable);
+
+    const untimed: trace_report.IncludedCrash = .{ .at_ms = null };
+    const copied = try format_trace_notice(std.testing.allocator, .{ .copied_file = report_path }, untimed);
+    defer std.testing.allocator.free(copied);
+    try std.testing.expectEqualStrings(
+        "Trace copied to clipboard. Review and redact it before sharing. Includes the crash report.",
+        copied,
+    );
 }
 
 test "app_commands exposes active handler API surface" {

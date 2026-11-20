@@ -624,6 +624,43 @@ pub fn readFileToEndZ(alloc: std.mem.Allocator, file: *std.Io.File, max_bytes: u
     return result[0..data.len :0];
 }
 
+/// What reading a file at a path found. `unreadable` covers a failed open or
+/// read, and any path that is not a regular file, such as a FIFO, a device, or
+/// a directory.
+pub const FileRead = union(enum) {
+    missing,
+    unreadable,
+    too_large,
+    bytes: []const u8,
+};
+
+/// Reads the regular file at the absolute `path`, up to `max_bytes`, and returns
+/// its bytes in `alloc`. A file of exactly `max_bytes` is too large, as with
+/// `readFileToEnd`. The open does not block, so a FIFO is refused at once rather
+/// than waiting for a writer, and the open file is checked to be a regular file
+/// before any byte is read. A symbolic link is followed, as the crash and
+/// shutdown readers did before. An allocation failure reads as unreadable.
+pub fn readRegularFile(alloc: std.mem.Allocator, path: []const u8, max_bytes: usize) FileRead {
+    var path_z: [std.Io.Dir.max_path_bytes:0]u8 = undefined;
+    if (path.len >= path_z.len) return .unreadable;
+    @memcpy(path_z[0..path.len], path);
+    path_z[path.len] = 0;
+    // O_NONBLOCK makes the open of a FIFO return at once. It does not change how
+    // a regular file reads.
+    const fd = std.c.open(&path_z, .{ .ACCMODE = .RDONLY, .NONBLOCK = true, .CLOEXEC = true });
+    if (fd < 0) return if (std.posix.errno(fd) == .NOENT) .missing else .unreadable;
+    const zio = getIo();
+    var file: std.Io.File = .{ .handle = fd, .flags = .{ .nonblocking = true } };
+    defer file.close(zio);
+    const stat = file.stat(zio) catch return .unreadable;
+    if (stat.kind != .file) return .unreadable;
+    const bytes = readFileToEnd(alloc, &file, max_bytes) catch |err| return switch (err) {
+        error.StreamTooLong => .too_large,
+        else => .unreadable,
+    };
+    return .{ .bytes = bytes };
+}
+
 // Called from hundreds of sites; one out-of-line copy keeps each call small.
 pub noinline fn milliTimestamp() i64 {
     const ts = std.Io.Timestamp.now(getIo(), .real);
@@ -1569,6 +1606,59 @@ test "readFileToEnd: file at exact cap returns error.StreamTooLong" {
     } else |err| {
         try std.testing.expectEqual(error.StreamTooLong, err);
     }
+}
+
+const fifo_c = struct {
+    extern "c" fn mkfifo(path: [*:0]const u8, mode: std.c.mode_t) c_int;
+};
+
+test "readRegularFile reads a regular file under the cap and reports one at the cap as too large" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "small", .data = "hello" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "at-cap", .data = "abcd" });
+    const dir = try dirRealpathAlloc(std.testing.allocator, tmp.dir, ".");
+    defer std.testing.allocator.free(dir);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const small = try std.Io.Dir.path.join(arena.allocator(), &.{ dir, "small" });
+    const at_cap = try std.Io.Dir.path.join(arena.allocator(), &.{ dir, "at-cap" });
+
+    switch (readRegularFile(arena.allocator(), small, 16)) {
+        .bytes => |bytes| try std.testing.expectEqualStrings("hello", bytes),
+        else => return error.TestExpectedBytes,
+    }
+    try std.testing.expect(std.meta.activeTag(readRegularFile(arena.allocator(), at_cap, 4)) == .too_large);
+}
+
+test "readRegularFile reports a missing path as missing and a directory as unreadable" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "folder");
+    const dir = try dirRealpathAlloc(std.testing.allocator, tmp.dir, ".");
+    defer std.testing.allocator.free(dir);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const missing = try std.Io.Dir.path.join(arena.allocator(), &.{ dir, "absent" });
+    const folder = try std.Io.Dir.path.join(arena.allocator(), &.{ dir, "folder" });
+
+    try std.testing.expect(std.meta.activeTag(readRegularFile(arena.allocator(), missing, 16)) == .missing);
+    try std.testing.expect(std.meta.activeTag(readRegularFile(arena.allocator(), folder, 16)) == .unreadable);
+}
+
+test "readRegularFile refuses a FIFO at once instead of waiting for a writer" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try dirRealpathAlloc(std.testing.allocator, tmp.dir, ".");
+    defer std.testing.allocator.free(dir);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const fifo = try std.Io.Dir.path.join(arena.allocator(), &.{ dir, "fifo" });
+    const fifo_z = try arena.allocator().allocSentinel(u8, fifo.len, 0);
+    @memcpy(fifo_z, fifo);
+    try std.testing.expectEqual(@as(c_int, 0), fifo_c.mkfifo(fifo_z, 0o600));
+
+    try std.testing.expect(std.meta.activeTag(readRegularFile(arena.allocator(), fifo, 1024)) == .unreadable);
 }
 
 test "readFileToEnd: file over cap returns error.StreamTooLong" {

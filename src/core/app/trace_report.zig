@@ -349,6 +349,8 @@ const Records = struct {
     arena: std.mem.Allocator,
     json: std.json.Stringify,
     count: usize = 0,
+    /// The saved crash report that this trace includes, set by `writeLastCrash`.
+    included_crash: ?IncludedCrash = null,
 
     fn init(out: *std.Io.Writer, arena: std.mem.Allocator) Records {
         return .{ .out = out, .arena = arena, .json = .{ .writer = out } };
@@ -500,16 +502,42 @@ pub fn formatUtc(buf: []u8, ms: i64) ![]const u8 {
     });
 }
 
-/// Returns the trace as JSONL bytes that the caller owns.
-pub fn build(app: anytype) ![]u8 {
+/// `ms` as a UTC clock time to the minute, such as `2026-11-18 01:42 UTC`. The
+/// time must be one that `formatUtc` accepts, so check it first.
+pub fn formatUtcMinute(buf: []u8, ms: i64) ![]const u8 {
+    var iso_buf: [40]u8 = undefined;
+    const iso = try formatUtc(&iso_buf, ms);
+    return std.mem.print(buf, "{s} {s} UTC", .{ iso[0..10], iso[11..16] });
+}
+
+/// A saved crash report that a trace includes.
+pub const IncludedCrash = struct {
+    /// When the crash was saved, in Unix milliseconds, or null when the report
+    /// does not give a time the trace can write.
+    at_ms: ?i64,
+};
+
+/// A trace, and the saved crash report that it includes, if any.
+pub const BuiltTrace = struct {
+    /// The trace's JSON Lines bytes. The caller owns them.
+    bytes: []u8,
+    /// The crash report that the trace includes as `last_crash`, or null.
+    crash: ?IncludedCrash,
+};
+
+/// Returns the trace as JSONL bytes that the caller owns, with the crash report
+/// it includes, if any.
+pub fn build(app: anytype) !BuiltTrace {
     return buildReport(app, null);
 }
 
 /// Returns the trace as JSONL bytes that the caller owns. With `fatal`, the
 /// report also holds a `fatal_error` record right after the header, which
 /// names the error that ended the session.
-fn buildReport(app: anytype, fatal: ?anyerror) ![]u8 {
+fn buildReport(app: anytype, fatal: ?anyerror) !BuiltTrace {
     const App = @TypeOf(app.*);
+    // Read once, so every age check in this trace uses the same time.
+    const now_ms = io_mod.milliTimestamp();
     var arena_state = std.heap.ArenaAllocator.init(app.alloc);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -533,9 +561,9 @@ fn buildReport(app: anytype, fatal: ?anyerror) ![]u8 {
     try writeSummary(r, app, permissions.permissionModeLabel(permission_view.mode));
     try writeCurrentState(r, app);
     try writeProblems(r, app);
-    try writeLastShutdown(r, app_lifecycle.readLastShutdownReport(arena));
+    try writeLastShutdownRead(r, app_lifecycle.readLastShutdownReport(arena));
     // A crash report never embeds an older crash report, so the file cannot grow on each crash.
-    if (fatal == null) try writeLastCrash(r, readLastCrashReport(arena));
+    if (fatal == null) try writeLastCrashRead(r, readLastCrashReport(arena), now_ms);
     try writeCompaction(r);
     try writeInterruptedTurn(r, history);
     try writeSessionTitle(r, app);
@@ -557,7 +585,7 @@ fn buildReport(app: anytype, fatal: ?anyerror) ![]u8 {
         try writeTraceLog(r, path);
     }
     try writeEnd(r);
-    return out.toOwnedSlice();
+    return .{ .bytes = try out.toOwnedSlice(), .crash = records.included_crash };
 }
 
 fn writeHeader(r: *Records, fx_version: []const u8, now_ms: i64) !void {
@@ -981,6 +1009,20 @@ fn writeModelCatalogProblems(p: *Records) !void {
     }
 }
 
+/// Writes the last-shutdown section for a read of the saved report. A report
+/// that cannot be read as a regular file is `unreadable`.
+fn writeLastShutdownRead(r: *Records, read: io_mod.FileRead) !void {
+    switch (read) {
+        .bytes => |bytes| try writeLastShutdown(r, bytes),
+        .missing, .too_large => try writeLastShutdown(r, null),
+        .unreadable => {
+            try r.begin("last_shutdown");
+            try r.text("status", "unreadable");
+            try r.end();
+        },
+    }
+}
+
 /// `contents` is the saved last-shutdown report, or null when there is none.
 fn writeLastShutdown(r: *Records, contents: ?[]const u8) !void {
     try r.begin("last_shutdown");
@@ -1019,22 +1061,36 @@ fn writeLastShutdown(r: *Records, contents: ?[]const u8) !void {
 const last_crash_max_bytes = 16 * 1024 * 1024;
 
 /// The crash report that `writeCrashReport` saved, read for the /trace report.
-/// Returns the file's bytes, which the caller owns; a missing or unreadable
-/// file is null.
-fn readLastCrashReport(alloc: std.mem.Allocator) ?[]u8 {
-    const home = io_mod.homeDir() orelse return null;
-    const path = profile_paths.lastCrashReportPath(alloc, home) catch return null;
+/// The bytes are allocated in `alloc`. A home folder that is not known reads as
+/// missing.
+fn readLastCrashReport(alloc: std.mem.Allocator) io_mod.FileRead {
+    const home = io_mod.homeDir() orelse return .missing;
+    const path = profile_paths.lastCrashReportPath(alloc, home) catch return .unreadable;
     defer alloc.free(path);
-    var file = std.Io.Dir.openFileAbsolute(io_mod.getIo(), path, .{}) catch return null;
-    defer file.close(io_mod.getIo());
-    return io_mod.readFileToEnd(alloc, &file, last_crash_max_bytes) catch null;
+    return readLastCrashReportAt(alloc, path);
+}
+
+/// Reads the crash report at `path`, as `readLastCrashReport` does.
+fn readLastCrashReportAt(alloc: std.mem.Allocator, path: []const u8) io_mod.FileRead {
+    return io_mod.readRegularFile(alloc, path, last_crash_max_bytes);
+}
+
+/// Writes the last-crash section for a read of the saved report. A report that
+/// cannot be read as a regular file is `unreadable`; a missing or too large one
+/// is `none`.
+fn writeLastCrashRead(r: *Records, read: io_mod.FileRead, now_ms: i64) !void {
+    switch (read) {
+        .bytes => |bytes| try writeLastCrash(r, bytes, now_ms),
+        .missing, .too_large => try writeLastCrash(r, null, now_ms),
+        .unreadable => try writeLastCrashStatus(r, "unreadable"),
+    }
 }
 
 /// `contents` is the saved crash report, or null when there is none. Its
 /// first two lines must be the `fx_trace` header and the `fatal_error` record.
 /// Every JSON object line is then embedded as a `last_crash_record`; other
 /// lines are counted as skipped.
-fn writeLastCrash(r: *Records, contents: ?[]const u8) !void {
+fn writeLastCrash(r: *Records, contents: ?[]const u8, now_ms: i64) !void {
     const report = contents orelse return writeLastCrashStatus(r, "none");
     var objects: std.ArrayList(std.json.Value) = .empty;
     var skipped: usize = 0;
@@ -1057,11 +1113,22 @@ fn writeLastCrash(r: *Records, contents: ?[]const u8) !void {
     }
     const head = recordOfType(header, "fx_trace") orelse return writeLastCrashStatus(r, "unreadable");
     const crash = recordOfType(fatal, "fatal_error") orelse return writeLastCrashStatus(r, "unreadable");
+    const crash_at_ms = crashTimeMs(head, crash);
+    const known_at_ms = knownTime(crash_at_ms);
+    const check = checkCrashReport(crash_at_ms, now_ms);
+    if (check != .current) {
+        // The report stays on disk, but `/trace` shows only its status and time.
+        try r.begin("last_crash");
+        try r.text("status", @tagName(check));
+        if (known_at_ms) |ms| try r.time("at", ms);
+        return r.end();
+    }
+    r.included_crash = .{ .at_ms = known_at_ms };
     try r.begin("last_crash");
     try r.text("status", "recorded");
     try textField(r, "error", crash, "error");
-    try textField(r, "message", crash, "message");
-    if (crash.get("at_ms")) |value| if (value == .integer) try r.time("at", value.integer);
+    try maskedTextField(r, "message", crash, "message");
+    if (known_at_ms) |ms| try r.time("at", ms);
     try textField(r, "fx_version", head, "fx_version");
     try textField(r, "git_commit", head, "git_commit");
     try r.number("records", objects.items.len);
@@ -1069,7 +1136,7 @@ fn writeLastCrash(r: *Records, contents: ?[]const u8) !void {
     try r.end();
     for (objects.items) |object| {
         try r.begin("last_crash_record");
-        try r.parsedValue("record", object);
+        try r.parsedValue("record", try shownRecord(r.arena, object));
         try r.end();
     }
 }
@@ -1078,6 +1145,68 @@ fn writeLastCrashStatus(r: *Records, status: []const u8) !void {
     try r.begin("last_crash");
     try r.text("status", status);
     try r.end();
+}
+
+/// How old a crash can be and still be shown in `/trace`: 24 hours.
+const crash_report_max_age_ms: i64 = 24 * 60 * 60 * 1000;
+/// How far a crash time may be ahead of the clock, for clock skew: 5 minutes.
+const crash_report_max_skew_ms: i64 = 5 * 60 * 1000;
+
+/// Whether `/trace` shows a saved crash report, and if not, the `status` that
+/// it shows in its place.
+const CrashReportCheck = enum {
+    /// Shown: the crash is at most `crash_report_max_age_ms` old, and at most
+    /// `crash_report_max_skew_ms` ahead of the clock.
+    current,
+    /// The crash was more than `crash_report_max_age_ms` before now.
+    stale,
+    /// The crash time is more than `crash_report_max_skew_ms` after now.
+    future,
+    /// The report has no usable time.
+    undated,
+};
+
+/// The one place that decides which saved crash reports `/trace` shows. Times
+/// outside the years 1970 to 9999 count as no time.
+fn checkCrashReport(crash_at_ms: ?i64, now_ms: i64) CrashReportCheck {
+    const at_ms = knownTime(crash_at_ms) orelse return .undated;
+    if (at_ms > now_ms + crash_report_max_skew_ms) return .future;
+    if (at_ms < now_ms - crash_report_max_age_ms) return .stale;
+    return .current;
+}
+
+/// The time of a saved crash: the `fatal_error` line's `at_ms` when that key is
+/// present, else the header's `written_at_ms`. Null when the value is not a whole
+/// number.
+fn crashTimeMs(head: std.json.ObjectMap, crash: std.json.ObjectMap) ?i64 {
+    if (crash.get("at_ms")) |value| return if (value == .integer) value.integer else null;
+    const written = head.get("written_at_ms") orelse return null;
+    return if (written == .integer) written.integer else null;
+}
+
+/// `ms` when `formatUtc` can write it, or null when it is unknown or outside
+/// the years 1970 to 9999.
+fn knownTime(ms: ?i64) ?i64 {
+    const value = ms orelse return null;
+    if (value <= 0 or value > local_time.max_timestamp_ms) return null;
+    return value;
+}
+
+/// Writes `object[key]` as the text field `name`, with obvious secrets masked.
+fn maskedTextField(r: *Records, name: []const u8, object: std.json.ObjectMap, key: []const u8) !void {
+    if (object.get(key)) |value| if (value == .string) try r.masked(name, value.string);
+}
+
+/// The record as `/trace` shows it. The message of a `fatal_error` record is
+/// masked as the `last_crash` message is. The change is made on a copy, so the
+/// parsed record is not changed.
+fn shownRecord(arena: std.mem.Allocator, object: std.json.Value) !std.json.Value {
+    const crash = recordOfType(object, "fatal_error") orelse return object;
+    const message = crash.get("message") orelse return object;
+    if (message != .string) return object;
+    var copy = try crash.clone(arena);
+    try copy.put(arena, "message", .{ .string = try text_utils.maskSecretsCutShort(arena, message.string) });
+    return .{ .object = copy };
 }
 
 /// The line's JSON object, or null when the line is not one. Running out of
@@ -2625,7 +2754,7 @@ fn writeCrashReportInner(app: anytype, err: anyerror) ![]u8 {
     const path = try profile_paths.lastCrashReportPath(alloc, home);
     errdefer alloc.free(path);
 
-    const report = try buildReport(app, err);
+    const report = (try buildReport(app, err)).bytes;
     defer alloc.free(report);
 
     var home_dir = io_mod.VerifiedDir{
@@ -2862,10 +2991,14 @@ const crash_test_renderer =
     \\
 ;
 
+/// The fixed clock for these tests: one hour after the crash in the fixtures, so
+/// they are current. Tests never read the real clock.
+const crash_test_now_ms: i64 = 1_700_000_000_123 + 60 * 60 * 1000;
+
 test "trace last crash record is none without a crash report" {
     const w = try TestWriter.create();
     defer w.destroy();
-    try writeLastCrash(&w.records, null);
+    try writeLastCrash(&w.records, null, crash_test_now_ms);
     var trace = try w.trace();
     defer trace.deinit();
     try std.testing.expectEqualStrings("none", try testString(try trace.one("last_crash"), "status"));
@@ -2875,7 +3008,7 @@ test "trace last crash record is none without a crash report" {
 test "trace last crash record embeds the lines of a crash report" {
     const w = try TestWriter.create();
     defer w.destroy();
-    try writeLastCrash(&w.records, crash_test_header ++ crash_test_fatal ++ crash_test_renderer);
+    try writeLastCrash(&w.records, crash_test_header ++ crash_test_fatal ++ crash_test_renderer, crash_test_now_ms);
     var trace = try w.trace();
     defer trace.deinit();
     const record = try trace.one("last_crash");
@@ -2899,7 +3032,7 @@ test "trace last crash record embeds the lines of a crash report" {
 test "trace last crash record counts lines that are not JSON objects" {
     const w = try TestWriter.create();
     defer w.destroy();
-    try writeLastCrash(&w.records, crash_test_header ++ crash_test_fatal ++ "not json\n" ++ crash_test_renderer);
+    try writeLastCrash(&w.records, crash_test_header ++ crash_test_fatal ++ "not json\n" ++ crash_test_renderer, crash_test_now_ms);
     var trace = try w.trace();
     defer trace.deinit();
     const record = try trace.one("last_crash");
@@ -2912,7 +3045,7 @@ test "trace last crash record counts lines that are not JSON objects" {
 test "trace last crash record is unreadable when the first line is not JSON" {
     const w = try TestWriter.create();
     defer w.destroy();
-    try writeLastCrash(&w.records, "not json\n" ++ crash_test_fatal ++ crash_test_renderer);
+    try writeLastCrash(&w.records, "not json\n" ++ crash_test_fatal ++ crash_test_renderer, crash_test_now_ms);
     var trace = try w.trace();
     defer trace.deinit();
     try std.testing.expectEqualStrings("unreadable", try testString(try trace.one("last_crash"), "status"));
@@ -2924,7 +3057,7 @@ test "trace last crash record reads back a crash panic record" {
     defer w.destroy();
     var buf: [8192]u8 = undefined;
     const record = crash_panic.formatRecord(&buf, "9.9.9", "abc1234", 1_700_000_000_123, "index out of bounds");
-    try writeLastCrash(&w.records, record);
+    try writeLastCrash(&w.records, record, crash_test_now_ms);
     var trace = try w.trace();
     defer trace.deinit();
     const crash = try trace.one("last_crash");
@@ -2938,6 +3071,179 @@ test "trace last crash record reads back a crash panic record" {
     try std.testing.expectEqual(@as(i64, 2), try testInt(crash, "records"));
     try std.testing.expectEqual(@as(i64, 0), try testInt(crash, "skipped"));
     try std.testing.expectEqual(@as(usize, 2), trace.count("last_crash_record"));
+}
+
+test "trace last crash record masks a secret in the panic message in both places" {
+    const w = try TestWriter.create();
+    defer w.destroy();
+    var buf: [8192]u8 = undefined;
+    const record = crash_panic.formatRecord(&buf, "9.9.9", "abc1234", 1_700_000_000_123, "panic with AI_GATEWAY_API_KEY=abcdefghijklmnop inside");
+    try writeLastCrash(&w.records, record, crash_test_now_ms);
+    var trace = try w.trace();
+    defer trace.deinit();
+    const crash = try trace.one("last_crash");
+    try std.testing.expect(std.mem.find(u8, try testString(crash, "message"), "abcdefghijklmnop") == null);
+    try std.testing.expect(std.mem.find(u8, try testString(crash, "message"), "[redacted]") != null);
+    const shown = try testObject(try trace.nth("last_crash_record", 1), "record");
+    try std.testing.expect(std.mem.find(u8, try testString(shown, "message"), "abcdefghijklmnop") == null);
+    try std.testing.expect(std.mem.find(u8, try testString(shown, "message"), "[redacted]") != null);
+}
+
+test "trace last crash record names the time of the crash it includes" {
+    var buf: [8192]u8 = undefined;
+    const timed = crash_panic.formatRecord(&buf, "9.9.9", "abc1234", 1_700_000_000_123, "boom");
+    const w = try TestWriter.create();
+    defer w.destroy();
+    try writeLastCrash(&w.records, timed, crash_test_now_ms);
+    try std.testing.expectEqual(@as(?i64, 1_700_000_000_123), w.records.included_crash.?.at_ms);
+
+    const none = try TestWriter.create();
+    defer none.destroy();
+    try writeLastCrash(&none.records, null, crash_test_now_ms);
+    try std.testing.expect(none.records.included_crash == null);
+
+    // A crash saved without a usable time is not shown: its status says so.
+    const untimed = crash_panic.formatRecord(&buf, "9.9.9", "abc1234", -5, "no clock");
+    const no_time = try TestWriter.create();
+    defer no_time.destroy();
+    try writeLastCrash(&no_time.records, untimed, crash_test_now_ms);
+    try std.testing.expect(no_time.records.included_crash == null);
+}
+
+test "trace last crash read refuses a FIFO and reads a regular file" {
+    const fifo_c = struct {
+        extern "c" fn mkfifo(path: [*:0]const u8, mode: std.c.mode_t) c_int;
+    };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, ".");
+    defer std.testing.allocator.free(dir);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const fifo = try std.Io.Dir.path.join(a, &.{ dir, "fifo-crash.jsonl" });
+    const fifo_z = try a.allocSentinel(u8, fifo.len, 0);
+    @memcpy(fifo_z, fifo);
+    try std.testing.expectEqual(@as(c_int, 0), fifo_c.mkfifo(fifo_z, 0o600));
+    const blocked = try TestWriter.create();
+    defer blocked.destroy();
+    try writeLastCrashRead(&blocked.records, readLastCrashReportAt(a, fifo), crash_test_now_ms);
+    var blocked_trace = try blocked.trace();
+    defer blocked_trace.deinit();
+    try std.testing.expectEqualStrings("unreadable", try testString(try blocked_trace.one("last_crash"), "status"));
+
+    var buf: [8192]u8 = undefined;
+    const record = crash_panic.formatRecord(&buf, "9.9.9", "abc1234", 1_700_000_000_123, "boom");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "normal-crash.jsonl", .data = record });
+    const normal = try std.Io.Dir.path.join(a, &.{ dir, "normal-crash.jsonl" });
+    const recorded = try TestWriter.create();
+    defer recorded.destroy();
+    try writeLastCrashRead(&recorded.records, readLastCrashReportAt(a, normal), crash_test_now_ms);
+    var recorded_trace = try recorded.trace();
+    defer recorded_trace.deinit();
+    try std.testing.expectEqualStrings("recorded", try testString(try recorded_trace.one("last_crash"), "status"));
+}
+
+test "trace time to the minute reads as a UTC clock time" {
+    var buf: [32]u8 = undefined;
+    try std.testing.expectEqualStrings("2026-11-18 01:42 UTC", try formatUtcMinute(&buf, 1_794_966_120_000));
+    try std.testing.expectEqualStrings("2023-11-14 22:13 UTC", try formatUtcMinute(&buf, 1_700_000_000_123));
+}
+
+test "trace last crash record shows a crash one hour old" {
+    var buf: [8192]u8 = undefined;
+    const crash_at = crash_test_now_ms - 60 * 60 * 1000;
+    const record = crash_panic.formatRecord(&buf, "9.9.9", "abc1234", crash_at, "boom");
+    const w = try TestWriter.create();
+    defer w.destroy();
+    try writeLastCrash(&w.records, record, crash_test_now_ms);
+    var trace = try w.trace();
+    defer trace.deinit();
+    const crash = try trace.one("last_crash");
+    try std.testing.expectEqualStrings("recorded", try testString(crash, "status"));
+    try std.testing.expectEqual(@as(usize, 2), trace.count("last_crash_record"));
+    try std.testing.expectEqual(crash_at, w.records.included_crash.?.at_ms.?);
+}
+
+test "trace last crash record leaves out a crash 25 hours old and its records" {
+    var buf: [8192]u8 = undefined;
+    const crash_at = crash_test_now_ms - 25 * 60 * 60 * 1000;
+    const record = crash_panic.formatRecord(&buf, "9.9.9", "abc1234", crash_at, "boom");
+    const w = try TestWriter.create();
+    defer w.destroy();
+    try writeLastCrash(&w.records, record, crash_test_now_ms);
+    var trace = try w.trace();
+    defer trace.deinit();
+    const crash = try trace.one("last_crash");
+    try std.testing.expectEqualStrings("stale", try testString(crash, "status"));
+    try std.testing.expectEqual(crash_at, try testInt(crash, "at_ms"));
+    try expectAbsent(crash, "error");
+    try expectAbsent(crash, "message");
+    try std.testing.expectEqual(@as(usize, 0), trace.count("last_crash_record"));
+    try std.testing.expect(w.records.included_crash == null);
+}
+
+test "trace last crash record names an undated crash as undated" {
+    var buf: [8192]u8 = undefined;
+    const record = crash_panic.formatRecord(&buf, "9.9.9", "abc1234", -5, "no clock");
+    const w = try TestWriter.create();
+    defer w.destroy();
+    try writeLastCrash(&w.records, record, crash_test_now_ms);
+    var trace = try w.trace();
+    defer trace.deinit();
+    const crash = try trace.one("last_crash");
+    try std.testing.expectEqualStrings("undated", try testString(crash, "status"));
+    try expectAbsent(crash, "at");
+    try expectAbsent(crash, "message");
+    try std.testing.expectEqual(@as(usize, 0), trace.count("last_crash_record"));
+    try std.testing.expect(w.records.included_crash == null);
+}
+
+test "trace last crash record leaves out a crash ten minutes in the future" {
+    var buf: [8192]u8 = undefined;
+    const crash_at = crash_test_now_ms + 10 * 60 * 1000;
+    const record = crash_panic.formatRecord(&buf, "9.9.9", "abc1234", crash_at, "boom");
+    const w = try TestWriter.create();
+    defer w.destroy();
+    try writeLastCrash(&w.records, record, crash_test_now_ms);
+    var trace = try w.trace();
+    defer trace.deinit();
+    const crash = try trace.one("last_crash");
+    try std.testing.expectEqualStrings("future", try testString(crash, "status"));
+    try std.testing.expectEqual(crash_at, try testInt(crash, "at_ms"));
+    try std.testing.expectEqual(@as(usize, 0), trace.count("last_crash_record"));
+    try std.testing.expect(w.records.included_crash == null);
+}
+
+test "trace last crash record window is 24 hours back and 5 minutes ahead" {
+    const cases = [_]struct { at_ms: i64, status: []const u8 }{
+        .{ .at_ms = crash_test_now_ms - 24 * 60 * 60 * 1000, .status = "recorded" },
+        .{ .at_ms = crash_test_now_ms - 24 * 60 * 60 * 1000 - 1, .status = "stale" },
+        .{ .at_ms = crash_test_now_ms + 5 * 60 * 1000, .status = "recorded" },
+        .{ .at_ms = crash_test_now_ms + 5 * 60 * 1000 + 1, .status = "future" },
+    };
+    for (cases) |case| {
+        var buf: [8192]u8 = undefined;
+        const record = crash_panic.formatRecord(&buf, "9.9.9", "abc1234", case.at_ms, "boom");
+        const w = try TestWriter.create();
+        defer w.destroy();
+        try writeLastCrash(&w.records, record, crash_test_now_ms);
+        var trace = try w.trace();
+        defer trace.deinit();
+        try std.testing.expectEqualStrings(case.status, try testString(try trace.one("last_crash"), "status"));
+    }
+}
+
+test "trace last crash record reads the header time when the crash line has none" {
+    const fatal = "{\"type\":\"fatal_error\",\"error\":\"panic\",\"message\":\"boom\"}\n";
+    const w = try TestWriter.create();
+    defer w.destroy();
+    try writeLastCrash(&w.records, crash_test_header ++ fatal, crash_test_now_ms);
+    var trace = try w.trace();
+    defer trace.deinit();
+    try std.testing.expectEqualStrings("recorded", try testString(try trace.one("last_crash"), "status"));
+    try std.testing.expectEqual(@as(?i64, 1_700_000_000_000), w.records.included_crash.?.at_ms);
 }
 
 test "trace times leave out unknown values" {

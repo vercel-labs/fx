@@ -1,14 +1,17 @@
 //! Saves a crash record when fx panics, so `/trace` can show it as `last_crash`.
 //!
 //! When a panic starts, the handler writes two JSON lines to
-//! `~/.fx/diagnostics/last-crash.jsonl`: the `fx_trace` header and a
+//! `~/.fx/diagnostics/last-crash.jsonl.<pid>.tmp`, syncs it to disk, and renames
+//! it over `last-crash.jsonl`, so a failed write keeps the last saved record. The lines
+//! are the `fx_trace` header and a
 //! `fatal_error` record whose error is `panic`. `trace_report.zig` reads that
 //! file. The handler then calls `std.debug.defaultPanic`, so stderr and the
 //! abort stay as they were.
 //!
-//! The handler can run on any thread and in any state, so it does not allocate,
-//! take a lock, or create folders. `prepare` computes the path at startup, and
-//! the `diagnostics` folder must already exist. A write that fails is ignored.
+//! The handler can run on any thread and in any state, so it does not allocate
+//! or take a lock. `prepare` computes the paths at startup. The handler creates
+//! the `diagnostics` folder when it is missing, private to the user. A call that
+//! fails is ignored.
 //! The renderer event ring is not saved, because reading it needs a blocking
 //! lock that the handler does not take. Segfaults do not reach this handler:
 //! `std.debug` prints them and aborts on its own.
@@ -18,6 +21,7 @@ const build_options = @import("build_options");
 const io_mod = @import("../shared/io.zig");
 const local_time = @import("../shared/local_time.zig");
 const profile_paths = @import("../shared/profile_paths.zig");
+const text_utils = @import("../shared/text_utils.zig");
 const trace_report = @import("trace_report.zig");
 const writeJsonStr = @import("../../acp/jsonrpc.zig").writeJsonStr;
 
@@ -30,8 +34,15 @@ const record_buf_bytes = 8192;
 const path_max_bytes = 1024;
 const not_utf8_note = "panic message is not valid UTF-8";
 
+/// The diagnostics folder's path, with a zero after it. `prepare` sets it.
+var dir_buf: [path_max_bytes:0]u8 = undefined;
 /// The crash file's path, with a zero after it. `prepare` sets it.
 var path_buf: [path_max_bytes:0]u8 = undefined;
+/// The temporary file's path, with a zero after it. The handler writes the
+/// record there, then renames it over the crash file. The name ends in the
+/// process ID, so two fx processes that panic at once never share it.
+/// `prepare` sets it.
+var tmp_path_buf: [path_max_bytes:0]u8 = undefined;
 /// Zero means no path is set, so the handler writes no record.
 var path_len: usize = 0;
 /// Set by the first panic. A panic that finds it set skips the save.
@@ -39,20 +50,34 @@ var handling: std.atomic.Value(bool) = .init(false);
 /// Storage for the record, so the handler needs no stack space for it.
 var record_buf: [record_buf_bytes]u8 = undefined;
 
-/// Computes the crash file's path under `home`, in the same folder that
-/// `trace_report.zig` writes `last-crash.jsonl` to. It allocates nothing, does
-/// no file I/O, and creates no folder. A path that does not fit leaves no path
-/// set, so the handler writes no record.
+/// Computes the diagnostics folder, the crash file's path, and the temporary
+/// file's path under `home`, in the folder that `trace_report.zig` reads
+/// `last-crash.jsonl` from. It allocates nothing, does no file I/O, and creates
+/// no folder. A path that does not fit leaves no path set, so the handler writes
+/// no record.
 pub fn prepare(home: []const u8) void {
     path_len = 0;
-    const path = std.mem.print(path_buf[0..path_max_bytes], "{s}/{s}/{s}/{s}", .{
+    const dir_len = printPath(&dir_buf, "{s}/{s}/{s}", .{
         profile_paths.rootParent(home),
         profile_paths.rootName(),
         profile_paths.diagnostics_dir_name,
+    }) orelse return;
+    const dir = dir_buf[0..dir_len];
+    const file_len = printPath(&path_buf, "{s}/{s}", .{ dir, profile_paths.last_crash_report_file_name }) orelse return;
+    _ = printPath(&tmp_path_buf, "{s}/{s}.{d}.tmp", .{
+        dir,
         profile_paths.last_crash_report_file_name,
-    }) catch return;
-    path_buf[path.len] = 0;
-    path_len = path.len;
+        std.c.getpid(),
+    }) orelse return;
+    path_len = file_len;
+}
+
+/// Prints a path into `buf` with a zero after it, and returns its length. Null
+/// when the path and its zero do not fit, so a path is never cut short.
+fn printPath(buf: *[path_max_bytes:0]u8, comptime fmt: []const u8, args: anytype) ?usize {
+    const text = std.mem.print(buf[0 .. path_max_bytes - 1], fmt, args) catch return null;
+    buf[text.len] = 0;
+    return text.len;
 }
 
 /// The root panic handler. The first panic saves its record, and every panic
@@ -64,10 +89,15 @@ pub fn handle(msg: []const u8, first_trace_addr: ?usize) noreturn {
     std.debug.defaultPanic(msg, first_trace_addr);
 }
 
-/// Writes the record to the prepared path and replaces the file. Every error is
-/// ignored, because the panic must still reach `std.debug.defaultPanic`.
+/// Writes the record to the temporary file, then renames it over the crash file.
+/// Every error is ignored, because the panic must still reach
+/// `std.debug.defaultPanic`.
 fn saveRecord(msg: []const u8) void {
     if (path_len == 0) return;
+    // Creates the diagnostics folder, private to the user, when it is missing.
+    // The result is not checked: "already exists" is expected, and any other
+    // failure shows up in the open below.
+    _ = std.c.mkdir(&dir_buf, 0o700);
     const record = formatRecord(
         &record_buf,
         build_options.app_version,
@@ -76,17 +106,31 @@ fn saveRecord(msg: []const u8) void {
         msg,
     );
     if (record.len == 0) return;
-    // The file is created private to the user, and a symbolic link at the last
-    // path component is refused.
-    const fd = std.c.open(&path_buf, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true, .NOFOLLOW = true }, @as(c_uint, 0o600));
+    // The record goes to the temporary file first. The rename replaces the crash
+    // file in one step, and only after every byte is written, so a failed write
+    // leaves the last saved record in place. The temporary file is created private
+    // to the user, and a symbolic link at its path is refused.
+    const fd = std.c.open(&tmp_path_buf, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true, .NOFOLLOW = true }, @as(c_uint, 0o600));
     if (fd < 0) return;
-    defer _ = std.c.close(fd);
+    const written = writeAll(fd, record);
+    // The record reaches the disk before the rename makes it the crash file. The
+    // result is ignored, as with the other calls here. A failed sync still renames,
+    // so the newest record replaces the old one, but it may not survive a power loss.
+    if (written) _ = std.c.fsync(fd);
+    _ = std.c.close(fd);
+    if (written and std.c.rename(&tmp_path_buf, &path_buf) == 0) return;
+    _ = std.c.unlink(&tmp_path_buf);
+}
+
+/// Writes all of `bytes` to `fd`. Returns false when a write fails.
+fn writeAll(fd: c_int, bytes: []const u8) bool {
     var written: usize = 0;
-    while (written < record.len) {
-        const n = std.c.write(fd, record[written..].ptr, record.len - written);
-        if (n <= 0) return;
+    while (written < bytes.len) {
+        const n = std.c.write(fd, bytes[written..].ptr, bytes.len - written);
+        if (n <= 0) return false;
         written += @intCast(n);
     }
+    return true;
 }
 
 /// Writes the record's two lines into `buf` and returns them. The first line is
@@ -114,32 +158,30 @@ fn writeLines(w: *std.Io.Writer, fx_version: []const u8, git_commit: []const u8,
     try writeJsonStr(fx_version, w);
     try w.writeAll(",\"git_commit\":");
     try writeJsonStr(git_commit, w);
-    if (utc) |text| {
-        try w.writeAll(",\"written_at\":");
-        try writeJsonStr(text, w);
-        try w.print(",\"written_at_ms\":{d}", .{now_ms});
-    }
+    if (utc) |text| try writeTime(w, "written_at", text, now_ms);
     try w.writeAll(",\"notice\":");
     try writeJsonStr(trace_report.notice_text, w);
     try w.writeAll("}\n");
 
     try w.writeAll("{\"type\":\"fatal_error\",\"error\":\"panic\",\"message\":");
     try writeJsonStr(keptMessage(msg), w);
-    if (utc) |text| {
-        try w.writeAll(",\"at\":");
-        try writeJsonStr(text, w);
-        try w.print(",\"at_ms\":{d}", .{now_ms});
-    }
+    if (utc) |text| try writeTime(w, "at", text, now_ms);
     try w.writeAll("}\n");
 }
 
-/// The message cut to `max_message_bytes` at a UTF-8 boundary. When the kept
-/// bytes are not valid UTF-8, the record holds a fixed note instead.
+/// Writes the `"<name>":<utc>,"<name>_ms":<now_ms>` pair that the record uses for
+/// each time. `utc` is the UTC text of `now_ms`.
+fn writeTime(w: *std.Io.Writer, name: []const u8, utc: []const u8, now_ms: i64) !void {
+    try w.print(",\"{s}\":", .{name});
+    try writeJsonStr(utc, w);
+    try w.print(",\"{s}_ms\":{d}", .{ name, now_ms });
+}
+
+/// The message cut to `max_message_bytes` at a UTF-8 boundary, which
+/// `text_utils.utf8PrefixByBytes` does without allocating. When the kept bytes
+/// are not valid UTF-8, the record holds a fixed note instead.
 fn keptMessage(msg: []const u8) []const u8 {
-    var end = @min(msg.len, max_message_bytes);
-    // Step back past continuation bytes, so the cut does not split a character.
-    while (end > 0 and end < msg.len and (msg[end] & 0xc0) == 0x80) : (end -= 1) {}
-    const kept = msg[0..end];
+    const kept = text_utils.utf8PrefixByBytes(msg, max_message_bytes);
     if (!std.unicode.utf8ValidateSlice(kept)) return not_utf8_note;
     return kept;
 }
@@ -204,6 +246,101 @@ test "crash panic record fits a message made of control bytes" {
     try std.testing.expect(record.len <= buf.len);
 }
 
+/// The message of the `fatal_error` line in `record`.
+fn fatalMessage(arena: std.mem.Allocator, record: []const u8) ![]const u8 {
+    var lines = std.mem.splitScalar(u8, std.mem.trimEnd(u8, record, "\n"), '\n');
+    _ = lines.next();
+    const fatal = try parseRecordLine(arena, lines.next().?);
+    return fatal.get("message").?.string;
+}
+
+test "crash panic cut at 512 bytes drops a character that the cut splits" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    // The two bytes of the character sit at 511 and 512, so the cut at 512 splits it.
+    var msg: [514]u8 = @splat('x');
+    msg[511] = 0xc3;
+    msg[512] = 0xa9;
+    msg[513] = 't';
+    var buf: [record_buf_bytes]u8 = undefined;
+    const record = formatRecord(&buf, "0.0.17", "abc1234", 1_700_000_000_123, &msg);
+    try std.testing.expectEqualSlices(u8, msg[0..511], try fatalMessage(arena.allocator(), record));
+}
+
+test "crash panic keeps a message of exactly 512 bytes, and a character that ends at the cut" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var buf: [record_buf_bytes]u8 = undefined;
+
+    const ascii: [512]u8 = @splat('x');
+    const kept_ascii = try fatalMessage(arena.allocator(), formatRecord(&buf, "0.0.17", "abc1234", 1_700_000_000_123, &ascii));
+    try std.testing.expectEqualSlices(u8, &ascii, kept_ascii);
+
+    // The two bytes of the character end at 512, so the whole character is kept.
+    var ending: [512]u8 = @splat('x');
+    ending[510] = 0xc3;
+    ending[511] = 0xa9;
+    const kept_ending = try fatalMessage(arena.allocator(), formatRecord(&buf, "0.0.17", "abc1234", 1_700_000_000_123, &ending));
+    try std.testing.expectEqualSlices(u8, &ending, kept_ending);
+}
+
+test "crash panic keeps a note instead of a message that is not UTF-8" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var buf: [record_buf_bytes]u8 = undefined;
+    const record = formatRecord(&buf, "0.0.17", "abc1234", 1_700_000_000_123, "bad \xff byte");
+    try std.testing.expectEqualStrings(not_utf8_note, try fatalMessage(arena.allocator(), record));
+}
+
+test "crash panic writes the record when only the fx folder exists" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, ".fx");
+    const home = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, ".");
+    defer std.testing.allocator.free(home);
+    defer path_len = 0;
+
+    prepare(home);
+    saveRecord("no folder yet");
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, path_buf[0..path_len], std.testing.allocator, .limited(64 * 1024));
+    defer std.testing.allocator.free(bytes);
+    try std.testing.expect(std.mem.find(u8, bytes, "no folder yet") != null);
+}
+
+test "crash panic renames the temporary file over the crash file and leaves none" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, ".fx/diagnostics");
+    const home = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, ".");
+    defer std.testing.allocator.free(home);
+    defer path_len = 0;
+
+    prepare(home);
+    saveRecord("renamed into place");
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, path_buf[0..path_len], std.testing.allocator, .limited(64 * 1024));
+    defer std.testing.allocator.free(bytes);
+    try std.testing.expect(std.mem.find(u8, bytes, "renamed into place") != null);
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().openFile(std.testing.io, std.mem.sliceTo(&tmp_path_buf, 0), .{}));
+}
+
+test "crash panic keeps the last record when the temporary file cannot be written" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, ".fx/diagnostics");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = ".fx/diagnostics/last-crash.jsonl", .data = "last saved record\n" });
+    const home = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, ".");
+    defer std.testing.allocator.free(home);
+    defer path_len = 0;
+
+    prepare(home);
+    // A folder at the temporary file's path makes the open of that path fail.
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, std.mem.sliceTo(&tmp_path_buf, 0));
+    saveRecord("not saved");
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, path_buf[0..path_len], std.testing.allocator, .limited(64 * 1024));
+    defer std.testing.allocator.free(bytes);
+    try std.testing.expectEqualStrings("last saved record\n", bytes);
+}
+
 test "crash panic prepare sets no path when the crash file path is too long" {
     defer path_len = 0;
     const long_home: [path_max_bytes]u8 = @splat('h');
@@ -215,6 +352,9 @@ test "crash panic prepare sets no path when the crash file path is too long" {
         "/tmp/fake-home/.fx/diagnostics/last-crash.jsonl",
         path_buf[0..path_len],
     );
+    const expected_tmp = try std.testing.allocator.print("/tmp/fake-home/.fx/diagnostics/last-crash.jsonl.{d}.tmp", .{std.c.getpid()});
+    defer std.testing.allocator.free(expected_tmp);
+    try std.testing.expectEqualStrings(expected_tmp, std.mem.sliceTo(&tmp_path_buf, 0));
 }
 
 test "crash panic writes the record to the prepared file" {
