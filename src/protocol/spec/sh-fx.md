@@ -129,6 +129,8 @@ These rules apply to both deliveries:
 - A prompt without `sh.fx/delivery` that arrives while a turn runs fails with `-32600`, "Prompt already in progress".
 - fx keeps one order for each session across all of its clients.
 
+A `session/set_config_option` that arrives while a turn runs is answered at once. The running turn keeps the model, provider, credential, Fast, Ultrafast, and effort it started with, and the change applies from the next turn, as in fx's terminal app. A credential that the running turn renews replaces the session's only while the session still has the turn's provider. `tests/tla/acp/AcpConfigTurn.tla` checks these rules, and `tests/tla/drivers/acp/config_turn/driver.ts` checks model changes during a turn on fx.
+
 #### Steers
 
 - A steer holds only text content blocks. fx joins their text, which must be 1 byte to 64 KiB long. A steer with any other block fails with `-32602`, and the client can send the same prompt with `"queue"`.

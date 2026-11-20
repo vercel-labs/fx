@@ -22,7 +22,9 @@
 # Subagent Sessions, likewise not landed. AcpForkRewind: forking a session
 # before a prompt and rewinding one, likewise not landed. Their Before configs show fx before
 # the fixes, their Today configs show fx now, and each must fail on the rule it
-# names. The other configs must pass.
+# names. The other configs must pass. AcpConfigTurn: session/set_config_option
+# while a turn runs: answered at once, and the running turn keeps its own
+# settings.
 #
 # The planted bugs and the runs of the real `fx acp` binary are in
 # ../drivers/acp/:
@@ -40,6 +42,8 @@
 #   bun ../drivers/acp/prompt_delivery/driver.ts   # the sh.fx rules; --model today is fx acp before them
 #   bun ../drivers/acp/follow/check-spec.ts
 #   bun ../drivers/acp/follow/driver.ts   # one connection: replayed message ids
+#   bun ../drivers/acp/config_turn/check-spec.ts
+#   bun ../drivers/acp/config_turn/driver.ts   # set_config_option during a turn
 #   bun ../drivers/acp/session_state/check-spec.ts
 #   bun ../drivers/acp/session_state/driver.ts   # today's fx acp; --model rules fails until the rules land
 #   bun ../drivers/acp/shared_session/check-spec.ts
@@ -121,6 +125,8 @@ MCAcpSubagents AcpSubagentsToday-replay ReplayComplete
 MCAcpForkRewind MCAcpForkRewind -
 MCAcpForkRewind AcpForkRewindToday-fork ForkAvailable
 MCAcpForkRewind AcpForkRewindToday-rewind RewindAvailable
+MCAcpConfigTurn MCAcpConfigTurn -
+MCAcpConfigTurn AcpConfigTurnToday AnswersDuringTurn
 EOF
 
 if [ "$ci" = true ]; then

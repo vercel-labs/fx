@@ -140,11 +140,14 @@ const AcpMethod = enum {
             .libfx_withdraw,
             .libfx_handoff,
             .libfx_follow_up,
+            // Answered during a turn; the running turn keeps its own copy of
+            // the settings (TurnSettings), and the change applies from
+            // the next turn, as in the TUI.
+            .session_set_config_option,
             => false,
             .session_list,
             .session_delete,
             .session_prompt,
-            .session_set_config_option,
             .libfx_checkpoint,
             .libfx_restore,
             .libfx_snapshot,
@@ -293,6 +296,13 @@ pub const ActiveSessionState = struct {
     wasm_state: ?session_codec.DurableSessionState = null,
     wasm_revision: ?[]u8 = null,
     session_write_mutex: std.Io.Mutex = .init,
+    /// Guards the session's settings: `model`, `provider`, the credential
+    /// fields, `fast_mode`, `ultrafast_mode` and `effort`. The request thread
+    /// holds it while `session/set_config_option` changes them; a turn holds it
+    /// while it picks its credential and copies them, and while it publishes a
+    /// renewed credential. Lock order: `settings_mutex`, then `catalog_mutex`,
+    /// then `session_write_mutex`.
+    settings_mutex: std.Io.Mutex = .init,
     /// Input plus output tokens of the latest main-model completion, the
     /// context `usage_update` reports; 0 until a completion reports both.
     /// `usize` keeps it atomic on wasm32.
@@ -640,6 +650,15 @@ fn takeSessionCredential(session: *ActiveSessionState) TakenCredential {
     return taken;
 }
 
+/// Points `session`'s web search runtime at the session's own credential and
+/// worker model, under `subagent_authority_mutex`, when a prompt's turn ends
+/// and frees the copy it pointed the runtime at.
+pub fn pointWebSearchBackAtSession(session: *ActiveSessionState) void {
+    session.server.subagent_authority_mutex.lockUncancelable(io_mod.getIo());
+    defer session.server.subagent_authority_mutex.unlock(io_mod.getIo());
+    pointWebSearchAtSession(session);
+}
+
 /// Points `session`'s web search runtime at its credential and worker model
 /// again. The runtime borrows them, and a switch of the model or of the
 /// credential frees what it borrowed. Call with `subagent_authority_mutex`
@@ -822,6 +841,7 @@ pub fn catalogProviderFor(
 
 pub fn refreshModelCredential(
     raw: *anyopaque,
+    expected_provider: model_provider.ProviderId,
     alloc: Allocator,
     source: types.CredentialSource,
     mode: auth_runtime.CredentialRefreshMode,
@@ -849,6 +869,7 @@ pub fn refreshModelCredential(
     try publishRefreshedCredential(
         state.alloc,
         session,
+        expected_provider,
         &refreshed,
         expected_account_id,
         source == .fx_login,
@@ -857,20 +878,29 @@ pub fn refreshModelCredential(
 }
 
 /// Gives a refreshed credential to the session whose turn refreshed it, when
-/// it still names the same source, account, and team.
+/// it still names the same provider, source, account, and team. Holds the
+/// session's settings lock, so a `session/set_config_option` cannot change
+/// them between the checks and the adoption.
 fn publishRefreshedCredential(
     alloc: Allocator,
     session: *ActiveSessionState,
+    expected_provider: model_provider.ProviderId,
     refreshed: *credentials.Credential,
     expected_account_id: ?[]const u8,
     check_team: bool,
 ) !void {
+    session.settings_mutex.lockUncancelable(io_mod.getIo());
+    defer session.settings_mutex.unlock(io_mod.getIo());
     // A subagent's turn refreshes from its own thread, and a switch of the provider replaces the
     // session's credential, team and account, so the checks, the reads of the team included, and
-    // the adoption are one step under the lock.
+    // the adoption are one step under both locks, in their order.
     const state = session.server;
     state.subagent_authority_mutex.lockUncancelable(io_mod.getIo());
     defer state.subagent_authority_mutex.unlock(io_mod.getIo());
+    if (!session.provider.eql(expected_provider)) {
+        debug_trace.logf("auth", "ACP credential publication rejected stage=session_provider: the session changed provider during the turn, so the renewed credential stays the turn's own", .{});
+        return error.CredentialAuthorityChanged;
+    }
     if (session.credential_source != refreshed.source) {
         debug_trace.logf("auth", "ACP credential publication rejected stage=session_source", .{});
         return error.CredentialAuthorityChanged;
@@ -4296,6 +4326,10 @@ fn handleSetConfigOption(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Me
     const root = parsed.value;
     if (root != .object) return state.writer.writeError(alloc, msg.id, .{ .code = ErrorCode.invalid_params, .message = "Params must be object" });
     const target_session = (try requireParsedSessionTarget(state, alloc, msg.id, root)) orelse return;
+    // Held for every branch and the response, so a turn that publishes a
+    // renewed credential sees the settings either before or after this change.
+    target_session.settings_mutex.lockUncancelable(io_mod.getIo());
+    defer target_session.settings_mutex.unlock(io_mod.getIo());
 
     const config_id = blk: {
         if (root.object.get("configId")) |v| {
@@ -5206,7 +5240,7 @@ test "ACP prompt gate policy keeps lifecycle interruption responsive" {
     try std.testing.expect(!AcpMethod.session_close.waitsForActivePrompt());
     try std.testing.expect(AcpMethod.session_list.waitsForActivePrompt());
     try std.testing.expect(AcpMethod.session_prompt.waitsForActivePrompt());
-    try std.testing.expect(AcpMethod.session_set_config_option.waitsForActivePrompt());
+    try std.testing.expect(!AcpMethod.session_set_config_option.waitsForActivePrompt());
     try std.testing.expect(!AcpMethod.session_set_mode.waitsForActivePrompt());
     try std.testing.expect(!AcpMethod.libfx_steer.waitsForActivePrompt());
     try std.testing.expect(AcpMethod.unknown.waitsForActivePrompt());
@@ -5714,6 +5748,10 @@ fn testCredentialServer(alloc: Allocator) ServerState {
 
 fn testCodexSession(state: *ServerState, alloc: Allocator, token: []const u8) !ActiveSessionState {
     var session: ActiveSessionState = undefined;
+    // Publishing locks the settings mutex and checks the provider, so both
+    // must be set; `undefined` would leave them as garbage.
+    session.settings_mutex = .init;
+    session.provider = .codex;
     session.server = state;
     session.model = &.{};
     session.web_search_runtime = web_search_runtime.Runtime.init(.{});
@@ -5741,7 +5779,7 @@ test "ACP gives a refreshed Codex token to the session whose turn refreshed it, 
         .refresh_after_ms = 100,
     };
     defer refreshed.deinit(alloc);
-    try publishRefreshedCredential(alloc, &refreshing, &refreshed, "acct-1", false);
+    try publishRefreshedCredential(alloc, &refreshing, refreshing.provider, &refreshed, "acct-1", false);
 
     try std.testing.expectEqualStrings("fresh-token", refreshing.api_key);
     try std.testing.expectEqualStrings("acct-1", refreshing.account_id.?);
@@ -5775,7 +5813,7 @@ test "ACP rejects a refreshed Gateway login for another team and takes one for t
         .refresh_after_ms = 100,
     };
     defer other_team.deinit(alloc);
-    try std.testing.expectError(error.CredentialAuthorityChanged, publishRefreshedCredential(alloc, &session, &other_team, null, true));
+    try std.testing.expectError(error.CredentialAuthorityChanged, publishRefreshedCredential(alloc, &session, session.provider, &other_team, null, true));
     try std.testing.expectEqualStrings("stale-token", session.api_key);
     try std.testing.expectEqualStrings("team-a", session.gateway_team.?);
 
@@ -5786,7 +5824,7 @@ test "ACP rejects a refreshed Gateway login for another team and takes one for t
         .refresh_after_ms = 100,
     };
     defer same_team.deinit(alloc);
-    try publishRefreshedCredential(alloc, &session, &same_team, null, true);
+    try publishRefreshedCredential(alloc, &session, session.provider, &same_team, null, true);
     try std.testing.expectEqualStrings("fresh-token", session.api_key);
     try std.testing.expectEqualStrings("team-a", session.gateway_team.?);
 }
@@ -5807,9 +5845,36 @@ test "ACP rejects refreshed Codex tokens for another account" {
     try std.testing.expectError(error.ChatGptAccountChanged, publishRefreshedCredential(
         alloc,
         &session,
+        session.provider,
         &refreshed,
         "acct-2",
         false,
     ));
     try std.testing.expectEqualStrings("stale-token", session.api_key);
+}
+
+test "ACP keeps a renewed credential out of a session that changed provider during the turn" {
+    const alloc = std.testing.allocator;
+    var state = testCredentialServer(alloc);
+    var session = try testCodexSession(&state, alloc, "stale-token");
+    defer freeSessionCredential(alloc, &session);
+    const before = session.api_key;
+
+    var refreshed = credentials.Credential{
+        .token = try alloc.dupe(u8, "fresh-token"),
+        .source = .chatgpt_subscription,
+        .account_id = try alloc.dupe(u8, "acct-1"),
+        .refresh_after_ms = 100,
+    };
+    defer refreshed.deinit(alloc);
+    // The turn started on the gateway, and the session has since become Codex.
+    try std.testing.expectError(error.CredentialAuthorityChanged, publishRefreshedCredential(
+        alloc,
+        &session,
+        .gateway,
+        &refreshed,
+        "acct-1",
+        false,
+    ));
+    try std.testing.expectEqualStrings(before, session.api_key);
 }
