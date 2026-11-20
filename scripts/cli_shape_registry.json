@@ -408,8 +408,7 @@
     "FX_MCP_PENDING_REVOCATIONS_V1": "Keychain service name for MCP logins' kept sign-outs, not an env var",
     "FX_OAUTH_PENDING_REVOCATIONS_V1": "Keychain service name for the fx login's kept sign-outs, not an env var",
     "FX_OAUTH_SESSION_V1": "Keychain service name for the fx OAuth session, not an env var",
-    "FX_PARITY_LOG": "Set for the fake shell in a unit test; fx never reads it",
-    "FX_TEST_AI_GATEWAY_API_KEY": "Keychain service name used by keychain tests, not an env var"
+    "FX_PARITY_LOG": "Set for the fake shell in a unit test; fx never reads it"
   },
   "external_env": [
     "AI_GATEWAY_API_KEY",
