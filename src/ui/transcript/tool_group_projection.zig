@@ -2850,6 +2850,23 @@ fn formatTurnRecap(scratch: std.mem.Allocator, tally: StoryTally) ![]const u8 {
     return recap;
 }
 
+/// Index of the first entry of the turn that the turn summary at
+/// `summary_index` ends: the entry after its prompt, or after the turn
+/// summary or cancellation before it when the prompt is gone.
+pub fn turnSummaryTurnStart(entries: []const TranscriptEntry, summary_index: usize) usize {
+    var turn_start = summary_index;
+    while (turn_start > 0) {
+        const boundary = switch (entries[turn_start - 1]) {
+            .user_turn => true,
+            .raw_bytes => |raw| raw.class == .turn_summary or raw.class == .turn_cancellation,
+            else => false,
+        };
+        if (boundary) break;
+        turn_start -= 1;
+    }
+    return turn_start;
+}
+
 /// Inserts the turn recap before the first visible character of a turn
 /// summary row, after its indent and any leading style. Null when the turn
 /// has nothing to recap or the longer row would not fit `cols`, since the
@@ -2870,17 +2887,7 @@ fn recapTurnSummary(
     defer mem_utils.deinit_arena(scratch_state);
     const scratch = scratch_state.allocator();
 
-    var turn_start = summary_index;
-    while (turn_start > 0) {
-        const entry = entries[turn_start - 1];
-        const boundary = switch (entry) {
-            .user_turn => true,
-            .raw_bytes => |raw| raw.class == .turn_summary or raw.class == .turn_cancellation,
-            else => false,
-        };
-        if (boundary) break;
-        turn_start -= 1;
-    }
+    const turn_start = turnSummaryTurnStart(entries, summary_index);
     var tally: StoryTally = .{};
     for (entries[turn_start..summary_index]) |entry| {
         const entry_id = toolStatusEntryId(entry) orelse continue;
