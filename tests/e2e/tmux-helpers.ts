@@ -312,6 +312,8 @@ export function heldFakeGatewayFinalText() {
   let timer: ReturnType<typeof setInterval> | undefined;
   let response: Response | undefined;
   let pendingText: string | undefined;
+  // Parts sent before fx opened the stream, in order.
+  const pendingParts: string[] = [];
 
   const stopTimer = () => {
     if (timer) clearInterval(timer);
@@ -343,6 +345,16 @@ export function heldFakeGatewayFinalText() {
     ));
     close();
   };
+  // Streams `text` as one more piece of the reply and keeps the rest held.
+  const send = (text: string) => {
+    if (closed) return;
+    const frame = `data: ${JSON.stringify({ type: "text-delta", id: "answer_1", delta: text })}\n\n`;
+    if (!controller) {
+      pendingParts.push(frame);
+      return;
+    }
+    controller.enqueue(encoder.encode(frame));
+  };
   const createResponse = () => new Response(
     new ReadableStream<Uint8Array>({
       start(value) {
@@ -356,6 +368,7 @@ export function heldFakeGatewayFinalText() {
         };
         keepAlive();
         timer = setInterval(keepAlive, 50);
+        for (const frame of pendingParts.splice(0)) value.enqueue(encoder.encode(frame));
         if (pendingText !== undefined) finish(pendingText);
       },
       cancel() {
@@ -370,6 +383,7 @@ export function heldFakeGatewayFinalText() {
       response ??= createResponse();
       return response;
     },
+    send,
     release: finish,
     dispose: close,
   };
@@ -406,6 +420,7 @@ export type FakeGatewayModel = {
     type: string;
     [key: string]: unknown;
   }>;
+  fast_variant_of?: string;
 };
 
 export type FakeGatewayModelRequest = {
