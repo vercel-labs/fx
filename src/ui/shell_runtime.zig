@@ -20,7 +20,7 @@ const TranscriptRuntime = transcript_runtime.TranscriptRuntime;
 const TmuxHistoryClearRunner = *const fn (Allocator, []const []const u8) anyerror!void;
 var tmux_history_clear_test_runner: if (builtin.is_test) ?TmuxHistoryClearRunner else void = if (builtin.is_test) null else {};
 
-const supports_test_pty = switch (builtin.target.os.tag) {
+pub const supports_test_pty = switch (builtin.target.os.tag) {
     .linux,
     .macos,
     .freebsd,
@@ -220,6 +220,11 @@ pub const TerminalState = struct {
     ) !void {
         var stdout_file = std.Io.File.stdout();
         try stdout_file.writeStreamingAll(io_mod.getIo(), cursor_probe.queryBytes(protocol));
+    }
+
+    pub fn enableBracketedPaste(_: TerminalState) !void {
+        var stdout_file = std.Io.File.stdout();
+        try stdout_file.writeStreamingAll(io_mod.getIo(), ui_terminal.bracketed_paste_enable_sequence);
     }
 
     pub fn enableThemeNotifications(_: TerminalState) !void {
@@ -594,11 +599,11 @@ test "direct Apple Terminal uses RIS for terminal history resets" {
     try std.testing.expect(!historyResetUsesRisForValues("Ghostty", null));
 }
 
-const TestPty = struct {
+pub const TestPty = struct {
     master: std.posix.fd_t,
     slave: std.posix.fd_t,
 
-    fn open() !TestPty {
+    pub fn open() !TestPty {
         const flags = std.posix.O{
             .ACCMODE = .RDWR,
             .NOCTTY = true,

@@ -226,7 +226,7 @@ fn appendAction(
 fn shouldReplayControlAfterBareEscape(byte: u8) bool {
     if (shortcuts.fromControlByte(byte) != null) return true;
     return switch (byte) {
-        3, 7, 12, 15, 16, 22, 24 => true,
+        3, 7, 12, 15, 16, 20, 22, 24 => true,
         else => false,
     };
 }

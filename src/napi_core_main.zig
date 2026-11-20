@@ -15,6 +15,7 @@ const fetch_state = @import("napi_fetch_state.zig");
 const http_config = @import("core/mcp/http_config.zig");
 const host_stream_provider = @import("gateway/host_stream_provider.zig");
 const host_openai_codex = @import("gateway/host_openai_codex.zig");
+const openai_codex = @import("gateway/openai_codex.zig");
 const host_xai_grok = @import("gateway/host_xai_grok.zig");
 const host_chat_completions = @import("gateway/host_chat_completions.zig");
 const configured_provider = @import("core/config/configured_provider.zig");
@@ -720,6 +721,7 @@ const Runtime = struct {
             .chat_url = builtin_gateway.provider.chat_url,
         };
         var providers = provider_set.gateway_only(.{
+            .capabilities = .{ .gateway_prompt_caching = true },
             .presentation = builtin_gateway.provider_bundle.presentation,
             .auth_strategy = .vercel,
             .fallback_model_capabilities_fn = builtin_gateway.provider_bundle.fallback_model_capabilities_fn,
@@ -727,6 +729,7 @@ const Runtime = struct {
             .model_catalog = @import("gateway/host_model_catalog.zig").provider(&self.stream_context.transport),
         });
         providers.codex = .{
+            .capabilities = openai_codex.bundle_capabilities,
             .presentation = provider_catalog.find(.codex),
             .auth_strategy = .chatgpt,
             .agent_stream = bridgeBound(host_openai_codex.provider(&self.codex_context)),

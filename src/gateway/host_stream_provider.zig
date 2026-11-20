@@ -178,7 +178,7 @@ fn stream(raw: ?*anyopaque, alloc: Allocator, request: stream_provider.ModelRequ
         return .{ .failed = .{
             .kind = if (size_rejected) .request_too_large else kind,
             .http_status = opened.status,
-            .detail = try withoutCredential(alloc, body, request.credential.secret()),
+            .detail = try chat_completions_protocol.redactOwnedErrorBody(alloc, body, request.credential.secret()),
             .retry_after_seconds = opened.retry_after_seconds,
             .ownership = .owned,
         } };
@@ -302,16 +302,6 @@ pub fn get(
     const http_status = httpStatus(status_code) orelse return error.HostStreamFailed;
     const body = try readBody(alloc, transport, handle, max_body_bytes, cancel_flag, deadline, cooperative_pulse);
     return .{ .status = http_status, .body = body };
-}
-
-/// `body` with the request's own key masked, as fx masks a configured
-/// provider's: the detail reaches the turn, its events and the saved session,
-/// so a server that quotes the key back must not put it there. Takes `body`;
-/// the caller owns the result.
-fn withoutCredential(alloc: Allocator, body: []u8, secret: ?[]const u8) Allocator.Error![]u8 {
-    const credential = secret orelse return body;
-    defer alloc.free(body);
-    return chat_completions_protocol.redact_error_detail(alloc, body, credential);
 }
 
 /// Reads a non-success response body, bounded. The caller owns the bytes.

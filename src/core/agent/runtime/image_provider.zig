@@ -9,9 +9,12 @@ const runtime_gateway_step = @import("gateway_step.zig");
 const Allocator = std.mem.Allocator;
 const ChatMessage = types.ChatMessage;
 
-const model = "google/gemini-2.5-flash";
+/// The model that reads images for the vision tool unless the caller names
+/// another.
+pub const default_model = "google/gemini-2.5-flash";
 
 pub const Request = struct {
+    model: []const u8 = default_model,
     observer: ?*observation.Observer = null,
     parent_call_id: ?[]const u8 = null,
     stream_provider: agent_stream_provider.Provider,
@@ -69,7 +72,7 @@ pub fn inspect(
                     .tenant_context = request.gateway_team,
                 } },
             .session_id = request.session_id,
-            .model = model,
+            .model = request.model,
             .retry_count = request.retry_count,
             .instructions = &instructions,
             .messages = &messages,

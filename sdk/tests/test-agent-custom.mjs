@@ -272,7 +272,29 @@ const assertNoGateway = (log) => assert.equal(log.some((entry) => entry.url.incl
   }
 }
 
-// 8. Options are checked before anything starts.
+// 8. A model's request fields and its declared effort level reach the body,
+// in the settings' names; with no level chosen, only the model's own fields go.
+{
+  const tuned = {
+    ...provider,
+    models: { "local-model": { ...provider.models["local-model"], outputLimitField: "max_completion_tokens", request: { temperature: 0.2 }, reasoningEfforts: { low: { reasoning_effort: "low" }, high: { reasoning_effort: "high", temperature: 0.7 } } } },
+  };
+  const world = server();
+  const { result } = await runTurn({ fetch: world.fetch, provider: tuned, model: { id: "local-model", effort: "high" } });
+  assert.equal(result.stopReason, "end_turn");
+  const high = JSON.parse(chatRequests(world.log)[0].body);
+  assert.equal(high.reasoning_effort, "high");
+  assert.equal(high.temperature, 0.7);
+  assert.equal(high.max_completion_tokens, 4096);
+  assert.equal(high.max_tokens, undefined);
+  const plain = server();
+  await runTurn({ fetch: plain.fetch, provider: tuned });
+  const body = JSON.parse(chatRequests(plain.log)[0].body);
+  assert.equal(body.reasoning_effort, undefined);
+  assert.equal(body.temperature, 0.2);
+}
+
+// 9. Options are checked before anything starts.
 const base = { ...backendOptions, model: "local-model" };
 await assert.rejects(createFxEngine({ ...base, provider: { ...provider, name: "codex" } }), /provider.name must be/);
 await assert.rejects(createFxEngine({ ...base, provider: { ...provider, name: "1local" } }), /provider.name must be/);
@@ -286,7 +308,12 @@ await assert.rejects(createFxEngine({ ...base, provider, onCredentials: () => {}
 await assert.rejects(createFxEngine({ ...base, provider, refreshLock: async (_info, refresh) => refresh() }), /refreshLock needs provider "codex" or "grok"/);
 await assert.rejects(createFxEngine({ ...base, provider: { ...provider, models: { "local-model": { contextWindow: 100, maxOutputTokens: 100 } } } }), /maxOutputTokens must be less than contextWindow/);
 await assert.rejects(createFxEngine({ ...base, provider: { ...provider, models: { "local-model": { supportsVision: "yes" } } } }), /supportsVision must be a boolean/);
+await assert.rejects(createFxEngine({ ...base, provider: { ...provider, models: { "local-model": { reasoningEfforts: { high: "high" } } } } }), /reasoningEfforts must map each effort level/);
+await assert.rejects(createFxEngine({ ...base, provider: { ...provider, models: { "local-model": { outputLimitField: "limit" } } } }), /outputLimitField must be/);
+await assert.rejects(createFxEngine({ ...base, provider: { ...provider, titleModel: "" } }), /provider.titleModel must be a model id/);
 // The engine applies the CLI's complete rules to what passes the quick checks.
 await assert.rejects(createFxEngine({ ...base, provider: { ...provider, baseUrl: "https://models_example.test/v1" } }));
+// A field fx writes itself cannot be replaced.
+await assert.rejects(createFxEngine({ ...base, provider: { ...provider, models: { "local-model": { request: { messages: [] } } } } }));
 
 console.log(`${process.versions.bun ? "Bun" : "Node"} ${backend} custom provider agent passed`);

@@ -16,10 +16,10 @@ test("TLC: every model's smoke and stress pass, every planted bug is caught, sta
   save(join(artifacts, "gate-summary.json"), results.map(({ module, label, kind, verdict, expected, distinct, exit }) => ({ module, label, kind, verdict, expected, distinct, exit })));
   expect(results.filter((r) => r.verdict === "FAIL").map((r) => r.label)).toEqual([]);
   const count = (kind: string, verdict: string) => results.filter((r) => r.kind === kind && r.verdict === verdict).length;
-  // SharedLogins, SubagentAccess, UrlRetry, MixedBuilds, StoreLockBudget and
-  // RefreshLease joined the four.
-  expect(count("smoke", "PASS")).toBe(10);
-  expect(count("stress", "PASS")).toBe(10);
+  // SharedLogins, SubagentAccess, UrlRetry, MixedBuilds, StoreLockBudget,
+  // RefreshLease, ErrorData, ConfigEdit and McpRules joined the four.
+  expect(count("smoke", "PASS")).toBe(13);
+  expect(count("stress", "PASS")).toBe(13);
   expect(count("mutant", "CAUGHT")).toBe(results.filter((r) => r.kind === "mutant").length);
   // Credentials' two findings and its repair witness became the code.
   // HostLifecycle's OneProcessPerServer did too: it
@@ -30,9 +30,21 @@ test("TLC: every model's smoke and stress pass, every planted bug is caught, sta
   // IndicatorClears. UrlRetry's finding is the code before the held call:
   // it ended the call at the -32042 error. HostLifecycle's AtMostOneOwner
   // became the code once a reload kept its host: its smoke and stress
-  // configs check it.
-  expect(count("finding", "FINDING")).toBe(2);
-  expect(count("repair", "PASS")).toBe(1);
+  // configs check it. ErrorData's one is the code before the fix (a failed call's error data
+  // never reached the model). McpRules' three are the code before the fix (each MCP
+  // path picked its rule set on its own, so in full access toolbox search and the
+  // open of a small server ignored deny rules, and every other MCP path still
+  // applied them). SignIn's five findings are fx before the check request
+  // (a login reported as signed in before the server took it, a refused login
+  // saved, a refused login another fx takes), the branch for an unreadable
+  // store answering a sign-in's check request first, and a failed refresh after a
+  // 401 read as a check that couldn't be made; its repair witness is the code.
+  // ConfigEdit's four are the code before the reader check (a save the reader
+  // skips, a profile rewritten under a misspelled key) and the two designs fx
+  // does not use for the check: its bounded load scan gives up on a big file,
+  // and a dry run outside the lock does not see a change another fx makes.
+  expect(count("finding", "FINDING")).toBe(15);
+  expect(count("repair", "PASS")).toBe(2);
 }, 1_800_000);
 
 const controls: { name: string; module: string; constants: Record<string, never> | Record<string, unknown>; good: TraceRecord[]; bad: TraceRecord[]; badAt: number }[] = [
@@ -71,10 +83,11 @@ const controls: { name: string; module: string; constants: Record<string, never>
   },
   {
     name: "sign-in", module: "SignIn",
-    constants: { ObsMaxLogins: 1, ObsMaxHosts: 1, ObsMaxLeases: 0, ObsBridge: false },
+    constants: { ObsMaxLogins: 1, ObsMaxHosts: 1, ObsMaxLeases: 0, ObsBridge: false, ObsCheckFirst: true },
     good: [
       { event: "login" }, { event: "authorize", data: { login: 1 } }, { event: "probe", data: { login: 1, result: "open" } },
       { event: "callback", data: { login: 1, state: 1, kind: "get" } }, { event: "redeem", data: { login: 1 } },
+      { event: "check", data: { login: 1, result: "accept" } },
       { event: "signed_in", data: { login: 1 } }, { event: "probe", data: { login: 1, result: "closed" } },
     ],
     // A code redeemed for a callback whose state fx never made.
@@ -97,6 +110,22 @@ const controls: { name: string; module: string; constants: Record<string, never>
       { event: "answer", data: { q: 1 } }, { event: "delivered", data: { target: 2, from: 1 } },
     ],
     badAt: 4,
+  },
+  {
+    name: "error data", module: "ErrorData",
+    constants: { ObsCap: 8192, ObsMaxSize: 1_048_576, ObsMaxChar: 6, ObsCarry: "data" },
+    good: [
+      { event: "observed", data: { code: "invalid_params", kind: "text", size: 40, form: "whole", prefix: 40, extra: 0, marked: false, split: false, logged: false } },
+      // 10,002 bytes of escaped quotes: 4,095 of them, written with 4,095 more bytes, fill the cap with the quotes around them.
+      { event: "observed", data: { code: "invalid_params", kind: "text", size: 10002, form: "cut", prefix: 4095, extra: 4095, marked: true, split: false, logged: false } },
+      { event: "observed", data: { code: "url_required", kind: "text", size: 50, form: "none", prefix: 0, extra: 0, marked: false, split: false, logged: false } },
+    ],
+    // The same quotes cut by their raw bytes: 8,190 of them are 16,380 bytes once written, twice the cap.
+    bad: [
+      { event: "observed", data: { code: "invalid_params", kind: "text", size: 40, form: "whole", prefix: 40, extra: 0, marked: false, split: false, logged: false } },
+      { event: "observed", data: { code: "invalid_params", kind: "text", size: 10002, form: "cut", prefix: 8190, extra: 8190, marked: true, split: false, logged: false } },
+    ],
+    badAt: 1,
   },
   {
     name: "URL retry", module: "UrlRetry",
@@ -129,6 +158,38 @@ const controls: { name: string; module: string; constants: Record<string, never>
       { event: "run", data: { cmd: "signin" } }, { event: "observe", data: { v2kind: "v2", v2: true, v3: false } },
     ],
     badAt: 2,
+  },
+  {
+    name: "config edit", module: "ConfigEdit",
+    constants: { ObsNames: ["a"], ObsClasses: ["ok", "bad", "auth"], ObsChecked: true, ObsKeyScan: "complete", ObsGuardRemove: true, ObsAtomic: true },
+    good: [
+      { event: "init", data: { profile: { st: "ok", typo: false, both: false, big: false, ent: { a: "none" } }, project: { st: "absent", typo: false, both: false, big: false, ent: { a: "none" } } } },
+      { event: "add", data: { file: "profile", name: "a", class: "bad", outcome: "refused", same: true } },
+      { event: "add", data: { file: "profile", name: "a", class: "ok", outcome: "added", same: false } },
+      { event: "list", data: { file: "profile", loaded: ["a"] } },
+    ],
+    // An add of an entry the reader skips that says "Added": the model refuses it.
+    bad: [
+      { event: "init", data: { profile: { st: "ok", typo: false, both: false, big: false, ent: { a: "none" } }, project: { st: "absent", typo: false, both: false, big: false, ent: { a: "none" } } } },
+      { event: "add", data: { file: "profile", name: "a", class: "bad", outcome: "added", same: false } },
+    ],
+    badAt: 1,
+  },
+  {
+    name: "MCP rules", module: "McpRules",
+    constants: { ObsTools: ["a", "b"], ObsOwnRules: [] },
+    good: [
+      { event: "init", data: { mode: "full", childMode: "full", denied: ["a"], view: ["a", "b"] } },
+      { event: "ask", data: { path: "run", agent: "main", tool: "a", answer: "shown" } },
+      { event: "mode", data: { mode: "auto" } },
+      { event: "ask", data: { path: "run", agent: "main", tool: "a", answer: "hidden" } },
+    ],
+    // A tool a rule names, hidden on one path in full access.
+    bad: [
+      { event: "init", data: { mode: "full", childMode: "full", denied: ["a"], view: ["a", "b"] } },
+      { event: "ask", data: { path: "open_tool", agent: "main", tool: "a", answer: "hidden" } },
+    ],
+    badAt: 1,
   },
 ];
 
@@ -188,6 +249,6 @@ test("bridge control (refresh lease): going ahead behind a frozen holder on time
 }, 300_000);
 
 test("bridge control: an empty trace is INCONCLUSIVE, never a pass", async () => {
-  const v = await checkTrace({ module: "SignIn", records: [], constants: { ObsMaxLogins: 1, ObsMaxHosts: 1, ObsMaxLeases: 0, ObsBridge: false }, dir: join(artifacts, "bridge", "empty") });
+  const v = await checkTrace({ module: "SignIn", records: [], constants: { ObsMaxLogins: 1, ObsMaxHosts: 1, ObsMaxLeases: 0, ObsBridge: false, ObsCheckFirst: true }, dir: join(artifacts, "bridge", "empty") });
   expect(v.verdict).toBe("INCONCLUSIVE");
 });

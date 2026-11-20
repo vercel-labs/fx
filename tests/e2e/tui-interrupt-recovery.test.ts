@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
+import { processAlive as processExists } from "./process-alive";
 import {
   chmodSync,
   existsSync,
@@ -440,6 +441,8 @@ describe.skipIf(SKIP)("tui: interrupt recovery", () => {
           HOME: home,
           AI_GATEWAY_API_KEY: "fake-steer-retract-key",
           VERCEL_OIDC_TOKEN: undefined,
+          // Holds the steer behind the running command so it can be taken back.
+          FX_TEST_STEER_YIELD_GRACE_MS: "600000",
           FX_AUTO_UPGRADE: "0",
           FX_SOUND: "0",
           FX_PERMISSION_MODE: "yolo",
@@ -766,10 +769,9 @@ while :; do sleep 1; done
       ]);
 
       await waitForTrace(tracePath, "finish processing queued=0", TIMEOUT);
-      await session.waitForText(
-        "Cancelled ./hold-workspace-cancel.sh · What can fx do differently?",
-        TIMEOUT,
-      );
+      // The command's row names it once its cancellation lands; the notice
+      // under the row names no command.
+      await session.waitForText("● Cancelled ./hold-workspace-cancel.sh", TIMEOUT);
       await session.sendText("/workspace list");
       await session.waitForText("available=false active=false", TIMEOUT);
       expect(countOccurrences(readTrace(tracePath), "file index generation started")).toBe(
@@ -1127,13 +1129,4 @@ async function waitForCondition(
 
 function countOccurrences(text: string, needle: string): number {
   return text.split(needle).length - 1;
-}
-
-function processExists(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch {
-    return false;
-  }
 }

@@ -13,9 +13,19 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import {
+  buildEvalProcessEnv,
+  cleanupIsolatedTestHome,
+  createIsolatedTestHome,
+  envWithoutFxHome,
+  FX_BIN,
+  needsProcessSnapshot,
+  runFx,
+} from "../evals/eval-helpers";
+import {
   buildObservedCommand,
   heldFakeGatewayFinalText,
   isVolatileTokenStatusRow,
+  localCreditsEnv,
   paneExitMatches,
   parseSingleChildPid,
   TmuxSession,
@@ -29,6 +39,14 @@ const ISOLATED_KEYS = [
   "FX_TEST_GATEWAY_CHAT_URL",
   "FX_TEST_GATEWAY_MODELS_URL",
   "FX_TEST_GATEWAY_CREDITS_URL",
+  // A developer's terminal recording and the bridge of the fx session that
+  // started their tmux server must not reach a test's fx.
+  "FX_DEBUG_RECORD",
+  "FX_DEBUG_RECORD_SILENT_BANNER",
+  "FX_RECORD",
+  "FX_RECORD_INPUT",
+  "FX_MCP_CALL_SOCKET",
+  "FX_MCP_CALL_TOKEN",
 ] as const;
 
 test("pane exit matching requires the expected observed status", () => {
@@ -240,6 +258,7 @@ tmuxTest("tmux launch scrubs stale overrides without storing explicit credential
     for (const key of ISOLATED_KEYS) delete process.env[key];
 
     const explicitCredential = "explicit-auth-sentinel";
+    const explicitRecordInput = "explicit-record-input-sentinel";
     writeFileSync(
       probePath,
       `await Bun.write(${JSON.stringify(resultPath)}, JSON.stringify({\n` +
@@ -254,6 +273,7 @@ tmuxTest("tmux launch scrubs stale overrides without storing explicit credential
       socketName,
       env: {
         AI_GATEWAY_API_KEY: explicitCredential,
+        FX_RECORD_INPUT: explicitRecordInput,
       },
     });
 
@@ -264,10 +284,15 @@ tmuxTest("tmux launch scrubs stale overrides without storing explicit credential
     expect(existsSync(resultPath)).toBe(true);
     const observed = JSON.parse(readFileSync(resultPath, "utf8"));
     expect(observed.AI_GATEWAY_API_KEY).toBe(explicitCredential);
-    expect(observed.VERCEL_OIDC_TOKEN).toBeNull();
-    expect(observed.FX_TEST_GATEWAY_CHAT_URL).toBeNull();
-    expect(observed.FX_TEST_GATEWAY_MODELS_URL).toBeNull();
-    expect(observed.FX_TEST_GATEWAY_CREDITS_URL).toBeNull();
+    // A key the test sets itself is kept; every other stale one is gone. The
+    // Token Pass check's credits URL is the harness's closed loopback port,
+    // never a stale one.
+    expect(observed.FX_RECORD_INPUT).toBe(explicitRecordInput);
+    expect(observed.FX_TEST_GATEWAY_CREDITS_URL).toBe(localCreditsEnv({}).FX_TEST_GATEWAY_CREDITS_URL);
+    for (const key of ISOLATED_KEYS) {
+      if (key === "AI_GATEWAY_API_KEY" || key === "FX_RECORD_INPUT" || key === "FX_TEST_GATEWAY_CREDITS_URL") continue;
+      expect(observed[key], `${key} reached the pane`).toBeNull();
+    }
 
     const startCommand = execFileSync(
       "tmux",
@@ -407,3 +432,116 @@ tmuxTest("minimum history lines survive a fresh tmux server restart", async () =
     } catch {}
   }
 });
+
+tmuxTest("tmux launch drops an inherited FX_HOME unless the test passes one", async () => {
+  const socketName = `fx-fx-home-${process.pid}-${Date.now()}`;
+  const root = mkdtempSync(join(tmpdir(), "fx-tmux-fx-home-"));
+  const previous = process.env.FX_HOME;
+  const sessions: TmuxSession[] = [];
+  const paneFxHome = async (name: string, env: Record<string, string>) => {
+    const probePath = join(root, `${name}.mjs`);
+    const resultPath = join(root, `${name}.json`);
+    writeFileSync(
+      probePath,
+      `await Bun.write(${JSON.stringify(resultPath)}, JSON.stringify({ FX_HOME: process.env.FX_HOME ?? null }));\n` +
+        "await Bun.sleep(5_000);\n",
+    );
+    sessions.push(await TmuxSession.create({
+      cmd: `${process.execPath} ${probePath}`,
+      startupWaitMs: 200,
+      socketName,
+      env,
+    }));
+    const deadline = Date.now() + 5_000;
+    while (!existsSync(resultPath) && Date.now() < deadline) {
+      await Bun.sleep(25);
+    }
+    expect(existsSync(resultPath)).toBe(true);
+    return JSON.parse(readFileSync(resultPath, "utf8")).FX_HOME;
+  };
+
+  try {
+    process.env.FX_HOME = join(root, "developer-profile");
+    expect(await paneFxHome("inherited", {})).toBeNull();
+
+    const explicit = join(root, "test-profile");
+    expect(await paneFxHome("explicit", { FX_HOME: explicit })).toBe(explicit);
+  } finally {
+    for (const session of sessions) await session.kill();
+    try {
+      execFileSync("tmux", ["-L", socketName, "kill-server"], {
+        stdio: "pipe",
+      });
+    } catch {}
+    if (previous === undefined) delete process.env.FX_HOME;
+    else process.env.FX_HOME = previous;
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("envWithoutFxHome drops FX_HOME and keeps the rest", () => {
+  const env = { FX_HOME: "/Users/example/profile", HOME: "/Users/example", PATH: "/usr/bin" };
+
+  expect(envWithoutFxHome(env)).toEqual({ HOME: "/Users/example", PATH: "/usr/bin" });
+  expect(env.FX_HOME).toBe("/Users/example/profile");
+});
+
+test("buildEvalProcessEnv drops the inherited FX_HOME", () => {
+  const previous = process.env.FX_HOME;
+  process.env.FX_HOME = "/Users/example/profile";
+
+  try {
+    const env = buildEvalProcessEnv("/tmp/fx-eval-home-test", "selected/model");
+
+    expect(env).not.toHaveProperty("FX_HOME");
+    expect(env.HOME).toBe("/tmp/fx-eval-home-test");
+  } finally {
+    if (previous === undefined) delete process.env.FX_HOME;
+    else process.env.FX_HOME = previous;
+  }
+});
+
+test("runFx takes the process snapshot after a timeout or a signal", () => {
+  expect(needsProcessSnapshot({ code: 0, signal: null, timedOut: false })).toBe(false);
+  expect(needsProcessSnapshot({ code: 2, signal: null, timedOut: false })).toBe(false);
+  expect(needsProcessSnapshot({ code: 0, signal: null, timedOut: true })).toBe(true);
+  expect(needsProcessSnapshot({ code: null, signal: "SIGTERM", timedOut: false })).toBe(true);
+});
+
+test("runFx takes the process snapshot on a plain failure when asked", () => {
+  expect(needsProcessSnapshot({ code: 2, signal: null, timedOut: false }, true)).toBe(true);
+  expect(needsProcessSnapshot({ code: 0, signal: null, timedOut: false }, true)).toBe(false);
+});
+
+test.skipIf(!existsSync(FX_BIN))(
+  "runFx passes FX_HOME to fx only when the test sets it",
+  async () => {
+    const previous = process.env.FX_HOME;
+    const home = createIsolatedTestHome();
+    const fxHome = createIsolatedTestHome();
+    writeFileSync(join(fxHome, "settings.json"), '{"update_channel":"dev"}\n');
+    process.env.FX_HOME = fxHome;
+    const env = {
+      HOME: home,
+      AI_GATEWAY_API_KEY: undefined,
+      VERCEL_OIDC_TOKEN: undefined,
+      FX_DISABLE_KEYCHAIN: "1",
+      FX_SOUND: "0",
+    };
+
+    try {
+      const inherited = await runFx(["status", "--json"], { env });
+      expect(inherited.code).toBe(0);
+      expect(JSON.parse(inherited.stdout).update_channel).toBe("stable");
+
+      const passed = await runFx(["status", "--json"], { env: { ...env, FX_HOME: fxHome } });
+      expect(passed.code).toBe(0);
+      expect(JSON.parse(passed.stdout).update_channel).toBe("dev");
+    } finally {
+      if (previous === undefined) delete process.env.FX_HOME;
+      else process.env.FX_HOME = previous;
+      cleanupIsolatedTestHome(fxHome);
+      cleanupIsolatedTestHome(home);
+    }
+  },
+);

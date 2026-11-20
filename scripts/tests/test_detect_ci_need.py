@@ -155,8 +155,11 @@ class DetectCiNeedTests(unittest.TestCase):
             "tests/tla/subagent/check.sh",
             "tests/tla/session/SessionWrite.tla",
             "tests/tla/session/session-write.cfg",
+            "tests/tla/session/LiveSessions.tla",
+            "tests/tla/session/live-holds.cfg",
             "tests/tla/drivers/subagent/stop-message.test.ts",
             "tests/tla/drivers/session/write.test.ts",
+            "tests/tla/drivers/session/live.test.ts",
             "tests/tla/lib/tlc.sh",
         ), libfx=False, mcp=False, subagent=True)
 
