@@ -13,11 +13,18 @@
 (*             one call of that step ran, and main heard `answer`, with    *)
 (*             the `count` of messages a stop or close dropped;            *)
 (*   "begin"   subagent `sub`'s starting turn began: the driver let go of  *)
-(*             its start hold (FX_TEST_SUBAGENT_START_HELD);               *)
+(*             its start hold (FX_TEST_SUBAGENT_START_HELD), and the turn  *)
+(*             read the messages `msgs` that made it, if any did;          *)
 (*   "read"    subagent `sub`'s running turn read the messages `msgs`;     *)
 (*   "finish"  its turn ended with nothing more to read;                  *)
-(*   "end"     its stopped or closed work ended, and its next turn read    *)
-(*             the waiting messages `msgs` (none when nothing waited).     *)
+(*   "end"     its stopped or closed work ended, and the waiting messages  *)
+(*             became its next work, to begin later;                       *)
+(*   "end_gap" the same, and the slot is held where the host has chosen   *)
+(*             that work and its turn has not begun (the driver holds it   *)
+(*             there with FX_TEST_SUBAGENT_PUBLISH_HELD).                  *)
+(*   "write_close"                                                         *)
+(*             the close of subagent `sub`, whose work just ended, was     *)
+(*             written: fx's trace says "closed". Until then it is closing.*)
 (* A finish or end carries `note`, what fx told main of it: "none" when it *)
 (* queued no report, "idle" when its report said the subagent is idle,    *)
 (* "plain" otherwise. A send carries `named`, the idle subagents its       *)
@@ -55,6 +62,7 @@ Observable(o) ==
      /\ Write(AsCalls(o.calls))
      /\ UNCHANGED <<phase, unread, waitq, read, dropped, toldDropped, told,
                     refusedOpen, coverBroken, lateStart>>
+     /\ UNCHANGED heldVars
      /\ UNCHANGED idleVars
   \/ /\ o.op \in {"send", "stop", "close"}
      /\ Exec
@@ -66,6 +74,7 @@ Observable(o) ==
      /\ o.op = "send" => NamedMatches(o)
   \/ /\ o.op = "begin"
      /\ Begin(o.sub)
+     /\ read' \ read = o.msgs
   \/ /\ o.op = "read"
      /\ Read(o.sub)
      /\ read' \ read = o.msgs
@@ -77,6 +86,12 @@ Observable(o) ==
      /\ EndStopped(o.sub)
      /\ read' \ read = o.msgs
      /\ note' = o.note
+  \/ /\ o.op = "end_gap"
+     /\ EndStoppedInGap(o.sub)
+     /\ read' \ read = o.msgs
+     /\ note' = o.note
+  \/ /\ o.op = "write_close"
+     /\ WriteClose(o.sub)
 
 ASSUME Len(Observed) >= 1
 

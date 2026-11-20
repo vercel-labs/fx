@@ -14,6 +14,8 @@ export type StoryStep = {
   at: number;
   text?: string;
   calls?: StoryCall[];
+  /** A reply of its own, such as a stream that holds partway, in place of text and calls. */
+  response?: () => Response;
 };
 
 export const CHILD_MARKER = "[story-child]";
@@ -68,17 +70,19 @@ function requestShape(body: string): RequestShape {
   return { toolResults, childTask };
 }
 
-export function startStoryGateway(steps: StoryStep[], childReply?: (task: string) => string) {
+/** `childReply` may hold the child's reply until a later moment of the story. */
+export function startStoryGateway(steps: StoryStep[], childReply?: (task: string) => string | Promise<string>) {
   return startDynamicFakeGateway((body) => {
     const shape = requestShape(body);
     if (shape.childTask !== undefined && childReply) {
-      return storyReply({ text: childReply(shape.childTask) });
+      const reply = childReply(shape.childTask);
+      return typeof reply === "string" ? storyReply({ text: reply }) : reply.then((text) => storyReply({ text }));
     }
     const step = steps.find((candidate) => candidate.at === shape.toolResults);
     if (!step) {
       return new Response(`no scripted step after ${shape.toolResults} tool results`, { status: 500 });
     }
-    return storyReply(step);
+    return step.response ? step.response() : storyReply(step);
   });
 }
 
