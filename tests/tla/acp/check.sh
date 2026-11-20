@@ -11,8 +11,8 @@
 # AcpPromptDelivery: steering and queued prompts as the sh.fx spec
 # defines them. AcpSessions: one connection holding many sessions, each with
 # its own turn and workspace. AcpTurnEvents: what a client hears of a
-# running turn: the sh.fx turn events it lists and ACP v1's compaction
-# updates. AcpToolDiffs: the diff an edit's tool call shows, before
+# running turn: the sh.fx turn events it lists, a shell call's
+# sh.fx/commandResult, and ACP v1's compaction updates. AcpToolDiffs: the diff an edit's tool call shows, before
 # approval and once it is committed. AcpFollow: following a session on several
 # connections and catching up by log position, which hasn't landed in
 # src/acp/ yet. AcpSessionState: session state, session/status, and list
@@ -82,6 +82,7 @@ MCAcpTurnEvents MCAcpTurnEvents -
 MCAcpTurnEvents MCAcpTurnEventsPlain -
 MCAcpTurnEvents MCAcpTurnEventsSome -
 MCAcpTurnEvents AcpTurnEventsToday Complete
+MCAcpTurnEvents AcpTurnEventsRootField StandardOnly
 MCAcpToolDiffs MCAcpToolDiffs -
 MCAcpToolDiffs MCAcpToolDiffsAsk -
 MCAcpToolDiffs AcpToolDiffsToday Complete

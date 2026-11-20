@@ -1,7 +1,8 @@
 // Exhaustive TLC check of tests/tla/acp/AcpTurnEvents.tla plus its planted
 // bugs: each mutant must violate the property it names, checked alone,
 // which shows that property catches that mistake. The model's Today
-// config, in tests/tla/acp/check.sh, shows fx acp before turn events.
+// config, in tests/tla/acp/check.sh, shows fx acp before turn events, and its
+// RootField config fx acp before sh.fx/commandResult.
 //
 //   bun tests/tla/drivers/acp/turn_events/check-spec.ts
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
@@ -10,7 +11,7 @@ import { SPEC_DIR, outDir, runTlc, sha256File, tlcToolchain, writeJson } from ".
 
 type Mutant = { id: string; note: string; from: string; to: string; expect: string; parts: string };
 
-const ALL = `{"progress", "calls", "usage", "compaction"}`;
+const ALL = `{"progress", "calls", "usage", "compaction", "command"}`;
 
 const MUTANTS: Mutant[] = [
   {
@@ -69,6 +70,38 @@ const MUTANTS: Mutant[] = [
     expect: "BeforeResponse",
     parts: ALL,
   },
+  {
+    id: "command-root-kept",
+    note: "a client that doesn't list sh.fx/commandResult still gets the command_result field at the root of the update",
+    from: `THEN IF "command" \\in Parts THEN "meta" ELSE "none"`,
+    to: `THEN IF "command" \\in Parts THEN "meta" ELSE "root"`,
+    expect: "StandardOnly",
+    parts: `{"calls"}`,
+  },
+  {
+    id: "command-to-plain",
+    note: "sh.fx/commandResult goes to a client that doesn't list it",
+    from: `THEN IF "command" \\in Parts THEN "meta" ELSE "none"`,
+    to: `THEN "meta"`,
+    expect: "OptIn",
+    parts: `{"calls", "compaction"}`,
+  },
+  {
+    id: "command-dropped",
+    note: "a shell call's update leaves out its command result for a client that lists sh.fx/commandResult",
+    from: `THEN IF "command" \\in Parts THEN "meta" ELSE "none"`,
+    to: `THEN "none"`,
+    expect: "Complete",
+    parts: ALL,
+  },
+  {
+    id: "update-dropped",
+    note: "a shell call with nothing for the client's _meta sends no tool_call_update at all",
+    from: `/\\ chan' = Append(chan, Msg("tool", 0, CommandTag, FALSE))`,
+    to: `/\\ chan' = IF CommandTag = "none" THEN chan ELSE Append(chan, Msg("tool", 0, CommandTag, FALSE))`,
+    expect: "Complete",
+    parts: "{}",
+  },
 ];
 
 const SPEC_FILES = [
@@ -85,10 +118,12 @@ function targetCfg(target: string, parts: string): string {
   return [
     "CONSTANTS",
     "    Rules = TRUE",
+    "    CommandMeta = TRUE",
     `    Parts = ${parts}`,
     "    Ks = {1, 2}",
     "    MaxProgress = 2",
     "    MaxCalls = 1",
+    "    MaxShells = 1",
     "    MaxTurns = 2",
     "INIT Init",
     "NEXT Next",

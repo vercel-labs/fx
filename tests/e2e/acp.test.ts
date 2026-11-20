@@ -2997,6 +2997,60 @@ describe("acp: model-independent", () => {
     TIMEOUT * 2,
   );
 
+
+  test(
+    "ACP sends a shell call's command result as sh.fx/commandResult only to a client that lists it, and never at the root",
+    async () => {
+      const listed = { _meta: { "sh.fx/commandResult": {} } };
+      for (const capabilities of [listed, { _meta: {} }]) {
+        const root = createIsolatedRoot("fx-acp-command-result-");
+        const toolCallId = "acp_command_result_1";
+        const gateway = startFakeGateway([
+          fakeGatewayToolCall(toolCallId, "shell", {
+            request: { action: "run", command: "printf ACP_COMMAND_RESULT", yield_time_ms: 30_000 },
+          }),
+          finalText("ACP_COMMAND_RESULT_DONE"),
+        ]);
+        try {
+          client = await AcpClient.create({ cwd: root.workspace, env: fakeGatewayEnv(root, gateway) });
+          client.setPermissionOption("allow_once");
+          await startSessionListing(client, capabilities);
+          const { promptResult, messages } = await runPrompt(client, "Run the command.", TIMEOUT);
+          expect(promptResult.result.stopReason).toBe("end_turn");
+          const updates = messages
+            .filter((m) => m.method === "session/update" && m.params.update.sessionUpdate === "tool_call_update" && m.params.update.toolCallId === toolCallId)
+            .map((m) => m.params.update);
+          expect(updates.at(-1).status).toBe("completed");
+          // ACP reserves the root of its types: no update carries a field there that ACP doesn't define.
+          for (const update of updates) expect(update).not.toHaveProperty("command_result");
+          const results = updates.map((update) => update._meta?.["sh.fx/commandResult"]).filter((value) => value !== undefined);
+          if (capabilities !== listed) {
+            expect(results).toEqual([]);
+          } else {
+            expect(results).toHaveLength(1);
+            expect(updates.at(-1)._meta["sh.fx/commandResult"]).toEqual({
+              command: "printf ACP_COMMAND_RESULT",
+              cwd: root.workspace,
+              exitCode: 0,
+              timedOut: false,
+              durationMs: expect.any(Number),
+              stdoutBytes: "ACP_COMMAND_RESULT".length,
+              stderrBytes: 0,
+              truncated: false,
+              // The name of the saved output in the session's store, not a path.
+              outputFile: expect.stringMatching(/^fx-command-replay-[a-f0-9-]+\.bin$/),
+            });
+          }
+          expect(client.stderr).toBe("");
+        } finally {
+          await client?.close();
+          gateway.stop();
+          rmSync(root.root, { recursive: true, force: true });
+        }
+      }
+    },
+    TIMEOUT * 2,
+  );
   test(
     "ACP sends compaction updates only to a client that lists session.compaction, and a load replays them",
     async () => {

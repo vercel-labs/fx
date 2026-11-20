@@ -7,6 +7,8 @@ const io_mod = @import("../core/shared/io.zig");
 const Allocator = std.mem.Allocator;
 const writeJsonStr = jsonrpc.writeJsonStr;
 const sh_fx = @import("sh_fx.zig");
+const command_contract = @import("../core/execution/command_contract.zig");
+const json_decode = @import("../core/shared/json_decode.zig");
 
 pub const MessageIdBuffer = [32]u8;
 
@@ -240,14 +242,51 @@ pub fn writeToolCallUpdate(w: *std.Io.Writer, tool_call_id: []const u8, status: 
     try writeToolCallUpdateWithCommandResult(w, tool_call_id, status, content_text, null);
 }
 
+/// A shell call's result, as the core's command runner reports it.
+pub const CommandResult = command_contract.CommandResult;
+
+/// The core's command result from its JSON, which uses fx's own snake_case
+/// names (`CommandResult.writeJson`). Strings point into `arena`.
+pub fn parseCommandResult(arena: std.mem.Allocator, json: []const u8) !CommandResult {
+    return json_decode.parseFromSliceLeaky(CommandResult, arena, json, .{ .ignore_unknown_fields = true });
+}
+
+/// `sh.fx/commandResult` in an update's `_meta`, in camelCase. Values the
+/// command runner doesn't know, such as the exit code of a command a signal
+/// stopped, are left out, and so are `terminationIndeterminate` and
+/// `outputIncomplete` when they are false.
+fn writeCommandResultMeta(w: *std.Io.Writer, result: CommandResult) !void {
+    try w.writeAll(",\"_meta\":{\"sh.fx/commandResult\":{\"command\":");
+    try writeJsonStr(result.command, w);
+    try w.writeAll(",\"cwd\":");
+    try writeJsonStr(result.cwd, w);
+    if (result.exit_code) |code| try w.print(",\"exitCode\":{d}", .{code});
+    if (result.signal) |signal| try w.print(",\"signal\":{d}", .{signal});
+    try w.writeAll(if (result.timed_out) ",\"timedOut\":true" else ",\"timedOut\":false");
+    if (result.termination_indeterminate) try w.writeAll(",\"terminationIndeterminate\":true");
+    if (result.output_incomplete) try w.writeAll(",\"outputIncomplete\":true");
+    if (result.duration_ms) |ms| try w.print(",\"durationMs\":{d}", .{ms});
+    try w.print(",\"stdoutBytes\":{d},\"stderrBytes\":{d}", .{ result.stdout_bytes, result.stderr_bytes });
+    try w.writeAll(if (result.truncated) ",\"truncated\":true" else ",\"truncated\":false");
+    inline for (.{ .{ "outputFile", "output_file" }, .{ "stdoutFile", "stdout_file" }, .{ "stderrFile", "stderr_file" } }) |field| {
+        if (@field(result, field[1])) |path| {
+            try w.writeAll(",\"" ++ field[0] ++ "\":");
+            try writeJsonStr(path, w);
+        }
+    }
+    try w.writeAll("}}");
+}
+
+/// A shell call's `tool_call_update`. `command_result` is null for a client
+/// that doesn't list `sh.fx/commandResult`, which gets standard ACP only.
 pub fn writeToolCallUpdateWithCommandResult(
     w: *std.Io.Writer,
     tool_call_id: []const u8,
     status: ToolCallStatus,
     content_text: ?[]const u8,
-    command_result_json: ?[]const u8,
+    command_result: ?CommandResult,
 ) !void {
-    try writeToolCallUpdateWithDiff(w, tool_call_id, status, null, content_text, command_result_json);
+    try writeToolCallUpdateWithDiff(w, tool_call_id, status, null, content_text, command_result);
 }
 
 /// A file a tool call changes, whole before and after, as ACP v1's `diff`
@@ -291,7 +330,7 @@ pub fn writeToolCallUpdateWithDiff(
     status: ToolCallStatus,
     diff: ?ToolDiff,
     content_text: ?[]const u8,
-    command_result_json: ?[]const u8,
+    command_result: ?CommandResult,
 ) !void {
     try w.writeAll("{\"sessionUpdate\":\"tool_call_update\",\"toolCallId\":");
     try writeJsonStr(tool_call_id, w);
@@ -308,10 +347,7 @@ pub fn writeToolCallUpdateWithDiff(
         }
         try w.writeByte(']');
     }
-    if (command_result_json) |json| {
-        try w.writeAll(",\"command_result\":");
-        try w.writeAll(json);
-    }
+    if (command_result) |result| try writeCommandResultMeta(w, result);
     try w.writeAll("}");
 }
 
@@ -710,26 +746,92 @@ test "writeToolCallUpdate with content" {
     try std.testing.expect(std.mem.find(u8, out.writer.buffered(), "File written successfully") != null);
 }
 
-test "writeToolCallUpdate can include structured command result" {
+test "a shell call's command result goes in _meta as sh.fx/commandResult, in camelCase, and never at the root" {
     const alloc = std.testing.allocator;
+    var arena_state: std.heap.ArenaAllocator = .init(alloc);
+    defer arena_state.deinit();
+    const result = try parseCommandResult(
+        arena_state.allocator(),
+        "{\"kind\":\"command\",\"command\":\"printf ok\",\"cwd\":\"/tmp\",\"exit_code\":0,\"signal\":null,\"timed_out\":false,\"duration_ms\":null,\"stdout_bytes\":2,\"stderr_bytes\":0,\"truncated\":false,\"output_file\":null,\"stdout_file\":null,\"stderr_file\":null}",
+    );
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
-
-    try writeToolCallUpdateWithCommandResult(
-        &out.writer,
-        "call_002",
-        .completed,
-        "exit_code=0\n<stdout>\nok\n</stdout>\n",
-        "{\"kind\":\"command\",\"command\":\"printf ok\",\"cwd\":\"/tmp\",\"exit_code\":0,\"signal\":null,\"timed_out\":false,\"stdout_bytes\":2,\"stderr_bytes\":0,\"truncated\":false}",
-    );
+    try writeToolCallUpdateWithCommandResult(&out.writer, "call_002", .completed, "exit_code=0\n<stdout>\nok\n</stdout>\n", result);
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, out.writer.buffered(), .{});
     defer parsed.deinit();
 
     try std.testing.expectEqualStrings("tool_call_update", parsed.value.object.get("sessionUpdate").?.string);
-    const command_result = parsed.value.object.get("command_result").?.object;
-    try std.testing.expectEqualStrings("command", command_result.get("kind").?.string);
-    try std.testing.expectEqual(@as(i64, 0), command_result.get("exit_code").?.integer);
+    try std.testing.expect(parsed.value.object.get("command_result") == null);
     try std.testing.expect(parsed.value.object.get("content") != null);
+    const meta = parsed.value.object.get("_meta").?.object.get("sh.fx/commandResult").?.object;
+    try std.testing.expectEqualStrings("printf ok", meta.get("command").?.string);
+    try std.testing.expectEqualStrings("/tmp", meta.get("cwd").?.string);
+    try std.testing.expectEqual(@as(i64, 0), meta.get("exitCode").?.integer);
+    try std.testing.expect(!meta.get("timedOut").?.bool);
+    try std.testing.expectEqual(@as(i64, 2), meta.get("stdoutBytes").?.integer);
+    try std.testing.expectEqual(@as(i64, 0), meta.get("stderrBytes").?.integer);
+    try std.testing.expect(!meta.get("truncated").?.bool);
+    // Unknown values and false flags are left out, and so is the core's kind.
+    for ([_][]const u8{ "kind", "signal", "durationMs", "terminationIndeterminate", "outputIncomplete", "outputFile", "stdoutFile", "stderrFile" }) |name| {
+        try std.testing.expect(meta.get(name) == null);
+    }
+    try std.testing.expectEqual(@as(usize, 7), meta.count());
+}
+
+test "a command result keeps every field through the core's JSON and into sh.fx/commandResult" {
+    const alloc = std.testing.allocator;
+    var arena_state: std.heap.ArenaAllocator = .init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const full: CommandResult = .{
+        .command = "sleep 9",
+        .cwd = "/work",
+        .exit_code = null,
+        .signal = 9,
+        .timed_out = true,
+        .termination_indeterminate = true,
+        .output_incomplete = true,
+        .duration_ms = 30_000,
+        .stdout_bytes = 12,
+        .stderr_bytes = 3,
+        .truncated = true,
+        .output_file = "/out/all",
+        .stdout_file = "/out/stdout",
+        .stderr_file = "/out/stderr",
+    };
+    const back = try parseCommandResult(arena, try full.toJson(arena));
+    try std.testing.expectEqualDeep(full, back);
+
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    try writeToolCallUpdateWithCommandResult(&out.writer, "call_9", .failed, "command timed out", back);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, out.writer.buffered(), .{});
+    defer parsed.deinit();
+    const meta = parsed.value.object.get("_meta").?.object.get("sh.fx/commandResult").?.object;
+    try std.testing.expect(meta.get("exitCode") == null);
+    try std.testing.expectEqual(@as(i64, 9), meta.get("signal").?.integer);
+    try std.testing.expect(meta.get("timedOut").?.bool);
+    try std.testing.expect(meta.get("terminationIndeterminate").?.bool);
+    try std.testing.expect(meta.get("outputIncomplete").?.bool);
+    try std.testing.expectEqual(@as(i64, 30_000), meta.get("durationMs").?.integer);
+    try std.testing.expect(meta.get("truncated").?.bool);
+    try std.testing.expectEqualStrings("/out/all", meta.get("outputFile").?.string);
+    try std.testing.expectEqualStrings("/out/stdout", meta.get("stdoutFile").?.string);
+    try std.testing.expectEqualStrings("/out/stderr", meta.get("stderrFile").?.string);
+    var keys = meta.iterator();
+    while (keys.next()) |entry| try std.testing.expect(std.mem.findScalar(u8, entry.key_ptr.*, '_') == null);
+}
+
+test "a shell call's update for a client that doesn't list sh.fx/commandResult is standard ACP only" {
+    const alloc = std.testing.allocator;
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    try writeToolCallUpdateWithCommandResult(&out.writer, "call_003", .completed, "ok\n", null);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, out.writer.buffered(), .{});
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value.object.get("_meta") == null);
+    try std.testing.expect(parsed.value.object.get("command_result") == null);
+    try std.testing.expectEqual(@as(usize, 4), parsed.value.object.count());
 }
 
 test "writeToolCallUpdate without content" {

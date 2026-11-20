@@ -3789,7 +3789,7 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
 /// tools. Every build sends hooks, tool call identities, permission modes,
 /// model recovery, and turn events to a client that lists them.
 fn agentExtensions(minimal_kernel: bool) sh_fx.Set {
-    var set: sh_fx.Set = .initMany(&.{ .hooks, .tool_call, .permission_mode, .model_response_recovery, .turn_progress, .model_calls, .usage });
+    var set: sh_fx.Set = .initMany(&.{ .hooks, .tool_call, .permission_mode, .model_response_recovery, .turn_progress, .model_calls, .usage, .command_result });
     if (minimal_kernel) {
         set.setUnion(.initMany(&.{ .host_steering, .journal, .host_tools }));
     } else if (!host_target.is_wasm) {

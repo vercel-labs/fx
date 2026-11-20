@@ -685,10 +685,25 @@ const AcpContext = struct {
         try self.sendToolCallCompletedWithDiff(tool_call_id, null, result_text, command_result_json);
     }
 
+    /// A shell call's command result for `sh.fx/commandResult`, for a client
+    /// that lists it. The core hands it over as JSON in fx's own names; one
+    /// that doesn't parse is left out of the update, and fx logs why.
+    fn commandResultFor(self: *AcpContext, arena: std.mem.Allocator, tool_call_id: []const u8, json: ?[]const u8) ?acp_types.CommandResult {
+        const text = json orelse return null;
+        if (!self.state.extensions.contains(.command_result)) return null;
+        return acp_types.parseCommandResult(arena, text) catch |err| {
+            debug_trace.logf("acp", "sh.fx/commandResult left out of tool call {s}: its command result did not parse err={s}", .{ tool_call_id, @errorName(err) });
+            return null;
+        };
+    }
+
     fn sendToolCallCompletedWithDiff(self: *AcpContext, tool_call_id: []const u8, diff: ?acp_types.ToolDiff, result_text: ?[]const u8, command_result_json: ?[]const u8) !void {
+        var arena_state: std.heap.ArenaAllocator = .init(self.alloc);
+        defer arena_state.deinit();
+        const command_result = self.commandResultFor(arena_state.allocator(), tool_call_id, command_result_json);
         var out: std.Io.Writer.Allocating = .init(self.alloc);
         defer out.deinit();
-        try acp_types.writeToolCallUpdateWithDiff(&out.writer, tool_call_id, .completed, diff, result_text, command_result_json);
+        try acp_types.writeToolCallUpdateWithDiff(&out.writer, tool_call_id, .completed, diff, result_text, command_result);
         try self.sendUpdate(out.writer.buffered());
         self.markCardFinished(tool_call_id);
     }
@@ -698,9 +713,12 @@ const AcpContext = struct {
     }
 
     fn sendToolCallErrorWithCommandResult(self: *AcpContext, tool_call_id: []const u8, err_text: []const u8, command_result_json: ?[]const u8) !void {
+        var arena_state: std.heap.ArenaAllocator = .init(self.alloc);
+        defer arena_state.deinit();
+        const command_result = self.commandResultFor(arena_state.allocator(), tool_call_id, command_result_json);
         var out: std.Io.Writer.Allocating = .init(self.alloc);
         defer out.deinit();
-        try acp_types.writeToolCallUpdateWithCommandResult(&out.writer, tool_call_id, .failed, err_text, command_result_json);
+        try acp_types.writeToolCallUpdateWithCommandResult(&out.writer, tool_call_id, .failed, err_text, command_result);
         try self.sendUpdate(out.writer.buffered());
         self.markCardFinished(tool_call_id);
     }

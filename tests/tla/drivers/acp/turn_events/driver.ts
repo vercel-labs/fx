@@ -1,40 +1,71 @@
 // Runtime driver: runs the real `fx acp` binary through three turns (a large
-// reply, a turn that compacts the context first, and a tool call with a
-// reply) for clients that list different parts of the turn events.
+// reply, a turn that compacts the context first, and a shell call with a
+// reply) for clients that list different parts of the turn events, and
+// checks the camelCase fields of each sh.fx/commandResult it reads.
 // It records every turn event the client reads, in order, and asks TLC
 // whether each run is a behavior of tests/tla/acp/AcpTurnEvents.tla.
 //
 //   bun tests/tla/drivers/acp/turn_events/driver.ts                 # after zig build
 //   bun tests/tla/drivers/acp/turn_events/driver.ts --model today   # fx acp before turn events
+//   bun tests/tla/drivers/acp/turn_events/driver.ts --model root-field   # before sh.fx/commandResult
 //
 // --model rules (the default) checks the turn events rules. --model today
 // checks the model of fx acp before them; a build from before turn events,
 // chosen with FX_WORKTREE or FX_BIN, fails --model rules for every client
-// that lists a part. --only takes a pattern of plan names. No model calls:
-// every reply comes from a fake Gateway.
+// that lists a part. --model root-field checks fx acp with those rules but a
+// root command_result field on shell calls; a build from before
+// sh.fx/commandResult fails --model rules for every client. --only takes a
+// pattern of plan names. No model calls: every reply comes from a fake
+// Gateway.
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { binary, worktree } from "../../lib/context";
-import { Fixture } from "./harness";
+import { Fixture, SHELL_CALL_ID, SHELL_COMMAND } from "./harness";
 import { outDir, sha256File, sha256Text, tlcToolchain, writeJson } from "./tlc";
-import { type Observation, type Parts, validate } from "./trace";
+import { type Model, type Observation, type Parts, validate } from "./trace";
 
 type Plan = { name: string; parts: Parts };
 
 const PLANS: Plan[] = [
-  { name: "all-parts", parts: ["progress", "calls", "usage", "compaction"] },
+  { name: "all-parts", parts: ["progress", "calls", "usage", "compaction", "command"] },
   { name: "plain-client", parts: [] },
   { name: "calls-and-compaction", parts: ["calls", "compaction"] },
   { name: "progress-and-usage", parts: ["progress", "usage"] },
+  { name: "command-only", parts: ["command"] },
 ];
 
-const PROMPTS = ["Write the long reply.", "Continue.", "Read note.txt, then finish."];
+const PROMPTS = ["Write the long reply.", "Continue.", `Run ${SHELL_COMMAND}, then finish.`];
+
+/// Where a shell call's last update carried its command result.
+function commandTag(update: any): "meta" | "root" | "both" | "none" {
+  const meta = update._meta?.["sh.fx/commandResult"] !== undefined;
+  const root = "command_result" in update;
+  return meta && root ? "both" : meta ? "meta" : root ? "root" : "none";
+}
+
+/// The fields of sh.fx/commandResult that this run fixes, in camelCase, with
+/// no snake_case name and no value left as null.
+function checkCommandResult(result: any, workspace: string): string | null {
+  if (typeof result !== "object" || result === null) return "is not an object";
+  const snake = Object.keys(result).filter((key) => key.includes("_"));
+  if (snake.length) return `has snake_case names ${snake.join(", ")}`;
+  const nulls = Object.keys(result).filter((key) => result[key] === null);
+  if (nulls.length) return `has null values ${nulls.join(", ")}`;
+  if ("kind" in result) return "has kind";
+  if (result.command !== SHELL_COMMAND) return `command is ${JSON.stringify(result.command)}`;
+  if (result.cwd !== workspace) return `cwd is ${JSON.stringify(result.cwd)}`;
+  if (result.exitCode !== 0) return `exitCode is ${JSON.stringify(result.exitCode)}`;
+  if (result.timedOut !== false) return `timedOut is ${JSON.stringify(result.timedOut)}`;
+  if (result.stdoutBytes !== "TURN_EVENTS_NOTE\n".length) return `stdoutBytes is ${JSON.stringify(result.stdoutBytes)}`;
+  return null;
+}
 
 function capabilities(parts: Parts): object {
   const meta: Record<string, object> = {};
   if (parts.includes("progress")) meta["sh.fx/turnProgress"] = {};
   if (parts.includes("calls")) meta["sh.fx/modelCalls"] = {};
   if (parts.includes("usage")) meta["sh.fx/usage"] = {};
+  if (parts.includes("command")) meta["sh.fx/commandResult"] = {};
   return { ...(parts.includes("compaction") ? { session: { compaction: {} } } : {}), _meta: meta };
 }
 
@@ -59,7 +90,18 @@ async function runPlan(plan: Plan) {
       for (const message of client.inbox.slice(start)) {
         if (message.method === "_sh.fx/session/turn_progress") observations.push({ kind: "progress" });
         else if (message.method === "_sh.fx/session/model_call") observations.push({ kind: "call" });
-        else if (message.method === "session/update" && message.params?.update?.sessionUpdate === "compaction_update") {
+        else if (
+          message.method === "session/update" && message.params?.update?.sessionUpdate === "tool_call_update" &&
+          message.params.update.toolCallId === SHELL_CALL_ID && ["completed", "failed"].includes(message.params.update.status)
+        ) {
+          const update = message.params.update;
+          const status = commandTag(update);
+          if (status === "meta") {
+            const wrong = checkCommandResult(update._meta["sh.fx/commandResult"], fixture.workspace);
+            if (wrong) throw new Error(`sh.fx/commandResult ${wrong}`);
+          }
+          observations.push({ kind: "tool", status });
+        } else if (message.method === "session/update" && message.params?.update?.sessionUpdate === "compaction_update") {
           const update = message.params.update;
           if (!compactionIds.has(update.compactionId)) compactionIds.set(update.compactionId, compactionIds.size + 1);
           observations.push({ kind: "comp", k: compactionIds.get(update.compactionId)!, status: update.status });
@@ -68,6 +110,7 @@ async function runPlan(plan: Plan) {
             kind: "response",
             usage: message.result?._meta?.["sh.fx/usage"] !== undefined,
             calls: turnRequests.length,
+            shells: turnRequests.some((request) => request.body.includes(SHELL_CALL_ID)) ? 1 : 0,
             streamed: true,
             compacted: turnRequests.some((request) => request.body.includes("compacted_conversation")),
           });
@@ -113,9 +156,9 @@ function git(...args: string[]): string {
 
 async function main() {
   if (!existsSync(binary)) throw new Error(`missing ${binary}; run zig build first or set FX_BIN`);
-  const model = argValue("--model") ?? "rules";
-  if (model !== "rules" && model !== "today") throw new Error(`--model must be rules or today, not ${model}`);
-  const rules = model === "rules";
+  const model = (argValue("--model") ?? "rules") as Model;
+  if (!["rules", "today", "root-field"].includes(model)) throw new Error(`--model must be rules, today, or root-field, not ${model}`);
+  const rules = model !== "today";
   const only = argValue("--only");
 
   const reportDir = outDir(`acp-turn-events-${model}`);
@@ -134,7 +177,7 @@ async function main() {
     const run = await runPlan(plan);
     writeJson(join(dir, "observations.json"), run.observations);
     const processFailed = run.process !== null && (run.process.exit !== 0 || run.process.stderr !== "");
-    const checked = run.error ? null : await validate(run.observations, dir, rules, plan.parts);
+    const checked = run.error ? null : await validate(run.observations, dir, model, plan.parts);
     const verdict = run.error ? "RUN_ERROR" : processFailed ? "PROCESS_ERROR" : checked!.verdict;
     if (verdict === "ACCEPTED" && !tamperSource && tamper(run.observations, rules)) tamperSource = { observations: run.observations, parts: plan.parts };
     const kinds = run.observations.reduce<Record<string, number>>((acc, o) => ({ ...acc, [o.kind]: (acc[o.kind] ?? 0) + 1 }), {});
@@ -144,10 +187,10 @@ async function main() {
 
   // Controls show the checker separates runs the model allows from runs it doesn't.
   const controls = [];
-  controls.push({ name: "empty-trace", expect: "TOOL_ERROR", got: (await validate([], join(reportDir, "controls", "empty-trace"), rules, [])).verdict });
+  controls.push({ name: "empty-trace", expect: "TOOL_ERROR", got: (await validate([], join(reportDir, "controls", "empty-trace"), model, [])).verdict });
   if (tamperSource) {
     const tampered = tamper(tamperSource.observations, rules)!;
-    controls.push({ name: rules ? "tampered-dropped-call" : "tampered-added-progress", expect: "REJECTED", got: (await validate(tampered, join(reportDir, "controls", "tampered"), rules, tamperSource.parts)).verdict });
+    controls.push({ name: rules ? "tampered-dropped-call" : "tampered-added-progress", expect: "REJECTED", got: (await validate(tampered, join(reportDir, "controls", "tampered"), model, tamperSource.parts)).verdict });
   }
   for (const control of controls) console.log(`control ${control.name}: ${control.got} (expected ${control.expect})`);
 
