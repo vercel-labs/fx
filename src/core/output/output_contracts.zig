@@ -49,6 +49,648 @@ pub const OutputFormat = enum {
 /// that fails after the command line is accepted exits 1.
 pub const usage_exit_code: u8 = 2;
 
+/// Whether a hook runs. `trusted` runs, `waiting` needs the person's trust, `disabled` is switched off by the person.
+pub const HookStatus = enum { trusted, waiting, disabled };
+
+/// One hook as `fx hook list` and `fx hook show` report it.
+pub const HookRow = struct {
+    id: []const u8,
+    event: []const u8,
+    /// Null when the hook has no matcher.
+    matcher: ?[]const u8,
+    /// The shell text, or the argv items joined by spaces.
+    command: []const u8,
+    layer: []const u8,
+    /// The file the hook came from, as fx read it.
+    file: []const u8,
+    status: HookStatus,
+};
+
+/// A problem fx found while it read a hook file.
+pub const HookProblem = struct {
+    file: []const u8,
+    where: []const u8,
+    message: []const u8,
+};
+
+/// `fx hook list`, as text or JSON. Both formats come from this one snapshot.
+pub const HookListSnapshot = struct {
+    enabled: bool,
+    workspace: []const u8,
+    trust_refused: bool,
+    hooks: []const HookRow = &.{},
+    problems: []const HookProblem = &.{},
+    /// The hook files fx reads. Text lists them when there are no hooks; JSON leaves them out.
+    checked_files: []const []const u8 = &.{},
+
+    pub fn render(self: HookListSnapshot, alloc: Allocator, format: OutputFormat) ![]u8 {
+        return switch (format) {
+            .text => self.renderText(alloc),
+            .json => self.renderJson(alloc),
+        };
+    }
+
+    fn renderJson(self: HookListSnapshot, alloc: Allocator) ![]u8 {
+        var out: std.Io.Writer.Allocating = .init(alloc);
+        defer out.deinit();
+        try out.writer.print("{{\"kind\":\"hook_list\",\"enabled\":{},\"workspace\":", .{self.enabled});
+        try std.json.Stringify.value(self.workspace, .{}, &out.writer);
+        try out.writer.print(",\"trust_refused\":{},\"hooks\":[", .{self.trust_refused});
+        for (self.hooks, 0..) |hook, index| {
+            if (index > 0) try out.writer.writeByte(',');
+            try out.writer.writeByte('{');
+            try writeHookRowFields(&out.writer, hook);
+            try out.writer.writeByte('}');
+        }
+        try out.writer.writeAll("],\"problems\":[");
+        for (self.problems, 0..) |problem, index| {
+            if (index > 0) try out.writer.writeByte(',');
+            try out.writer.writeAll("{\"file\":");
+            try std.json.Stringify.value(problem.file, .{}, &out.writer);
+            try out.writer.writeAll(",\"where\":");
+            try std.json.Stringify.value(problem.where, .{}, &out.writer);
+            try out.writer.writeAll(",\"message\":");
+            try std.json.Stringify.value(problem.message, .{}, &out.writer);
+            try out.writer.writeByte('}');
+        }
+        try out.writer.writeAll("]}");
+        return try out.toOwnedSlice();
+    }
+
+    fn renderText(self: HookListSnapshot, alloc: Allocator) ![]u8 {
+        var arena_state = std.heap.ArenaAllocator.init(alloc);
+        defer arena_state.deinit();
+        var out: std.Io.Writer.Allocating = .init(alloc);
+        defer out.deinit();
+        const w = &out.writer;
+
+        try w.print("Hooks for {f}", .{text_utils.terminalSafe(self.workspace)});
+        if (!self.enabled) try w.writeAll(" (experimental.hooks is off: no hook runs)");
+        try w.writeByte('\n');
+        if (self.hooks.len == 0) {
+            try w.writeAll("No hooks for this workspace.\n");
+            try w.writeAll("fx reads hook files from:\n");
+            for (self.checked_files) |file| {
+                try w.writeAll("  ");
+                try writeSafePath(alloc, w, file);
+                try w.writeByte('\n');
+            }
+        } else {
+            try writeHookTable(arena_state.allocator(), w, self.hooks);
+            try w.writeByte('\n');
+            try writeHookSummary(w, self.hooks, self.trust_refused);
+        }
+        if (self.trust_refused) try w.writeAll("\nThe trust file was refused, so no hook runs. See the problems below.\n");
+        if (self.problems.len > 0) {
+            try w.writeAll("\nProblems:\n");
+            for (self.problems) |problem| {
+                try w.writeAll("  ");
+                try writeSafePath(alloc, w, problem.file);
+                if (problem.where.len > 0) try w.print(" ({f})", .{text_utils.terminalSafe(problem.where)});
+                try w.print(": {f}\n", .{text_utils.terminalSafe(problem.message)});
+            }
+        }
+        return try out.toOwnedSlice();
+    }
+};
+
+/// `fx hook show ID`, as text or JSON.
+pub const HookShowSnapshot = struct {
+    hook: HookRow,
+    /// The only hook type fx runs today.
+    hook_type: []const u8 = "command",
+    timeout_ms: u32,
+    on_failure: []const u8,
+    named_files: []const []const u8 = &.{},
+    /// How many files the command named past the cap. Trust does not cover them, so the person must see the count.
+    named_files_dropped: usize = 0,
+
+    pub fn render(self: HookShowSnapshot, alloc: Allocator, format: OutputFormat) ![]u8 {
+        return switch (format) {
+            .text => self.renderText(alloc),
+            .json => self.renderJson(alloc),
+        };
+    }
+
+    fn renderJson(self: HookShowSnapshot, alloc: Allocator) ![]u8 {
+        var out: std.Io.Writer.Allocating = .init(alloc);
+        defer out.deinit();
+        try out.writer.writeAll("{\"kind\":\"hook_show\",\"hook\":{");
+        try writeHookRowFields(&out.writer, self.hook);
+        try out.writer.writeAll(",\"type\":");
+        try std.json.Stringify.value(self.hook_type, .{}, &out.writer);
+        try out.writer.writeAll(",\"timeout_seconds\":");
+        try writeSeconds(&out.writer, self.timeout_ms);
+        try out.writer.writeAll(",\"on_failure\":");
+        try std.json.Stringify.value(self.on_failure, .{}, &out.writer);
+        try out.writer.writeAll(",\"named_files\":[");
+        for (self.named_files, 0..) |file, index| {
+            if (index > 0) try out.writer.writeByte(',');
+            try std.json.Stringify.value(file, .{}, &out.writer);
+        }
+        try out.writer.writeAll("],\"named_files_dropped\":");
+        try out.writer.print("{d}", .{self.named_files_dropped});
+        try out.writer.writeAll("}}");
+        return try out.toOwnedSlice();
+    }
+
+    fn renderText(self: HookShowSnapshot, alloc: Allocator) ![]u8 {
+        var out: std.Io.Writer.Allocating = .init(alloc);
+        defer out.deinit();
+        const w = &out.writer;
+
+        try w.print("id: {f}\n", .{text_utils.terminalSafe(self.hook.id)});
+        try w.print("event: {s}\n", .{self.hook.event});
+        try w.print("matcher: {f}\n", .{text_utils.terminalSafe(self.hook.matcher orelse "none")});
+        try w.print("command: {f}\n", .{text_utils.terminalSafe(self.hook.command)});
+        try w.print("layer: {s}\n", .{self.hook.layer});
+        try w.writeAll("file: ");
+        try writeSafePath(alloc, w, self.hook.file);
+        try w.writeByte('\n');
+        try w.print("status: {s}\n", .{@tagName(self.hook.status)});
+        try w.print("type: {s}\n", .{self.hook_type});
+        try w.writeAll("timeout_seconds: ");
+        try writeSeconds(w, self.timeout_ms);
+        try w.writeByte('\n');
+        try w.print("on_failure: {s}\n", .{self.on_failure});
+        try w.writeAll("named_files: ");
+        if (self.named_files.len == 0) try w.writeAll("none");
+        for (self.named_files, 0..) |file, index| {
+            if (index > 0) try w.writeAll(", ");
+            try w.print("{f}", .{text_utils.terminalSafe(file)});
+        }
+        try w.writeByte('\n');
+        try w.print("named_files_dropped: {d}\n", .{self.named_files_dropped});
+        return try out.toOwnedSlice();
+    }
+};
+
+/// One hook run, as `fx hook log` reads it from the run log.
+pub const HookLogEntry = struct {
+    time_ms: i64,
+    event: []const u8,
+    match: ?[]const u8,
+    surface: []const u8,
+    session_id: ?[]const u8,
+    ran: usize,
+    decision: []const u8,
+    decided_by: ?[]const u8,
+    reason: ?[]const u8,
+    notices: usize,
+};
+
+/// `fx hook log`: the most recent hook runs, oldest first. Text and JSON come from this one snapshot.
+pub const HookLogSnapshot = struct {
+    /// The current run log, as fx reads it.
+    file: []const u8,
+    entries: []const HookLogEntry = &.{},
+    /// Lines in the shown range that did not parse. They are counted, not shown.
+    skipped_lines: usize = 0,
+
+    pub fn render(self: HookLogSnapshot, alloc: Allocator, format: OutputFormat) ![]u8 {
+        return switch (format) {
+            .text => self.renderText(alloc),
+            .json => self.renderJson(alloc),
+        };
+    }
+
+    fn renderJson(self: HookLogSnapshot, alloc: Allocator) ![]u8 {
+        var out: std.Io.Writer.Allocating = .init(alloc);
+        defer out.deinit();
+        const w = &out.writer;
+        try w.writeAll("{\"kind\":\"hook_log\",\"file\":");
+        try std.json.Stringify.value(self.file, .{}, w);
+        try w.writeAll(",\"entries\":[");
+        for (self.entries, 0..) |entry, index| {
+            if (index > 0) try w.writeByte(',');
+            try w.print("{{\"time_ms\":{d},\"event\":", .{entry.time_ms});
+            try std.json.Stringify.value(entry.event, .{}, w);
+            try w.writeAll(",\"match\":");
+            try writeJsonOptionalString(w, entry.match);
+            try w.writeAll(",\"surface\":");
+            try std.json.Stringify.value(entry.surface, .{}, w);
+            try w.writeAll(",\"session_id\":");
+            try writeJsonOptionalString(w, entry.session_id);
+            try w.print(",\"ran\":{d},\"decision\":", .{entry.ran});
+            try std.json.Stringify.value(entry.decision, .{}, w);
+            try w.writeAll(",\"decided_by\":");
+            try writeJsonOptionalString(w, entry.decided_by);
+            try w.writeAll(",\"reason\":");
+            try writeJsonOptionalString(w, entry.reason);
+            try w.print(",\"notices\":{d}}}", .{entry.notices});
+        }
+        try w.print("],\"skipped_lines\":{d}}}", .{self.skipped_lines});
+        return try out.toOwnedSlice();
+    }
+
+    fn renderText(self: HookLogSnapshot, alloc: Allocator) ![]u8 {
+        var arena_state = std.heap.ArenaAllocator.init(alloc);
+        defer arena_state.deinit();
+        var out: std.Io.Writer.Allocating = .init(alloc);
+        defer out.deinit();
+        const w = &out.writer;
+        if (self.entries.len == 0) {
+            try w.writeAll("No hook has run yet.\n");
+            try w.writeAll("Log: ");
+            try writeSafePath(alloc, w, self.file);
+            try w.writeByte('\n');
+        } else {
+            try writeHookLogTable(arena_state.allocator(), w, self.entries);
+        }
+        if (self.skipped_lines > 0) {
+            try w.print("{d} {s} could not be read.\n", .{ self.skipped_lines, if (self.skipped_lines == 1) "line" else "lines" });
+        }
+        return try out.toOwnedSlice();
+    }
+};
+
+/// The table `fx hook log` prints: TIME, EVENT, MATCH, RAN, DECISION, BY. A reason goes on the line after its row.
+fn writeHookLogTable(arena: Allocator, w: *std.Io.Writer, entries: []const HookLogEntry) !void {
+    const header = [_][]const u8{ "TIME", "EVENT", "MATCH", "RAN", "DECISION", "BY" };
+    const cells = try arena.alloc([6][]const u8, entries.len + 1);
+    cells[0] = header;
+    for (entries, 1..) |entry, row| {
+        var time_buf: [19]u8 = undefined;
+        cells[row] = .{
+            try arena.dupe(u8, formatLogTime(&time_buf, entry.time_ms)),
+            entry.event,
+            try safeCell(arena, entry.match orelse "-"),
+            try arena.print("{d}", .{entry.ran}),
+            entry.decision,
+            try safeCell(arena, entry.decided_by orelse "-"),
+        };
+    }
+    var widths: [6]usize = @splat(0);
+    for (cells) |row| for (row, 0..) |cell, column| {
+        widths[column] = @max(widths[column], cell.len);
+    };
+    for (cells, 0..) |row, index| {
+        for (row, 0..) |cell, column| {
+            try w.writeAll(cell);
+            if (column + 1 == row.len) break;
+            for (0..widths[column] - cell.len + 2) |_| try w.writeByte(' ');
+        }
+        try w.writeByte('\n');
+        if (index > 0) {
+            if (entries[index - 1].reason) |reason| try w.print("  reason: {f}\n", .{text_utils.terminalSafe(reason)});
+        }
+    }
+}
+
+/// `2023-11-14 17:13:20` in local time, or `unknown` outside the supported range.
+fn formatLogTime(buf: *[19]u8, ms: i64) []const u8 {
+    const reading = local_time.local(ms) orelse return "unknown";
+    return std.mem.print(buf, "{d:0>4}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}:{d:0>2}", .{
+        reading.year,
+        reading.month.numeric(),
+        reading.day,
+        reading.hour,
+        reading.minute,
+        reading.second,
+    }) catch "unknown";
+}
+
+/// One notice a hook left during `fx hook test`.
+pub const HookNoticeRow = struct {
+    kind: []const u8,
+    hook_id: []const u8,
+    text: []const u8,
+};
+
+/// `fx hook test EVENT`: the answer the matching hooks gave, merged the way fx merges it. Text and JSON come from this one snapshot.
+pub const HookTestSnapshot = struct {
+    event: []const u8,
+    /// The value the hooks matched on, when the person gave one.
+    match: ?[]const u8 = null,
+    ran: usize,
+    trust_refused: bool,
+    /// Matching hooks that waited for trust and did not run, because fx's own agent runs only trusted hooks.
+    skipped_waiting: usize = 0,
+    decision: []const u8,
+    reason: ?[]const u8 = null,
+    decided_by: ?[]const u8 = null,
+    updated_input: ?[]const u8 = null,
+    /// True when `updated_input` is raw JSON, as a PreToolUse answer carries it. Otherwise JSON writes it as a string.
+    updated_input_is_json: bool = false,
+    additional_context: ?[]const u8 = null,
+    continue_reason: ?[]const u8 = null,
+    stop_reason: ?[]const u8 = null,
+    /// Always a JSON string: a PostToolUse answer may be plain text or JSON.
+    updated_output: ?[]const u8 = null,
+    retry: bool = false,
+    notices: []const HookNoticeRow = &.{},
+
+    pub fn render(self: HookTestSnapshot, alloc: Allocator, format: OutputFormat) ![]u8 {
+        return switch (format) {
+            .text => self.renderText(alloc),
+            .json => self.renderJson(alloc),
+        };
+    }
+
+    fn renderJson(self: HookTestSnapshot, alloc: Allocator) ![]u8 {
+        var out: std.Io.Writer.Allocating = .init(alloc);
+        defer out.deinit();
+        const w = &out.writer;
+        try w.writeAll("{\"kind\":\"hook_test\",\"event\":");
+        try std.json.Stringify.value(self.event, .{}, w);
+        try w.print(",\"ran\":{d},\"decision\":", .{self.ran});
+        try std.json.Stringify.value(self.decision, .{}, w);
+        try w.writeAll(",\"reason\":");
+        try writeJsonOptionalString(w, self.reason);
+        try w.writeAll(",\"decided_by\":");
+        try writeJsonOptionalString(w, self.decided_by);
+        try w.writeAll(",\"updated_input\":");
+        if (self.updated_input) |text| {
+            if (self.updated_input_is_json) {
+                try w.writeAll(text);
+            } else {
+                try std.json.Stringify.value(text, .{}, w);
+            }
+        } else {
+            try w.writeAll("null");
+        }
+        try w.writeAll(",\"additional_context\":");
+        try writeJsonOptionalString(w, self.additional_context);
+        try w.writeAll(",\"continue_reason\":");
+        try writeJsonOptionalString(w, self.continue_reason);
+        try w.writeAll(",\"stop_reason\":");
+        try writeJsonOptionalString(w, self.stop_reason);
+        try w.writeAll(",\"updated_output\":");
+        try writeJsonOptionalString(w, self.updated_output);
+        try w.print(",\"retry\":{},\"notices\":[", .{self.retry});
+        for (self.notices, 0..) |notice, index| {
+            if (index > 0) try w.writeByte(',');
+            try w.writeAll("{\"kind\":");
+            try std.json.Stringify.value(notice.kind, .{}, w);
+            try w.writeAll(",\"hook_id\":");
+            try std.json.Stringify.value(notice.hook_id, .{}, w);
+            try w.writeAll(",\"text\":");
+            try std.json.Stringify.value(notice.text, .{}, w);
+            try w.writeByte('}');
+        }
+        try w.print("],\"trust_refused\":{},\"skipped_waiting\":{d}}}", .{ self.trust_refused, self.skipped_waiting });
+        return try out.toOwnedSlice();
+    }
+
+    fn renderText(self: HookTestSnapshot, alloc: Allocator) ![]u8 {
+        var out: std.Io.Writer.Allocating = .init(alloc);
+        defer out.deinit();
+        const w = &out.writer;
+        if (self.ran == 0) {
+            try w.print("No hook matched {s}", .{self.event});
+            if (self.match) |value| try w.print(" for \"{f}\"", .{text_utils.terminalSafe(value)});
+            try w.writeAll(".\n");
+            if (self.trust_refused) try w.writeAll("The trust file was refused, so no hook runs.\n");
+            try writeSkippedWaiting(w, self.skipped_waiting);
+            return try out.toOwnedSlice();
+        }
+        try w.print("Ran {d} {s} for {s}.\n", .{ self.ran, if (self.ran == 1) "hook" else "hooks", self.event });
+        try writeSkippedWaiting(w, self.skipped_waiting);
+        try w.print("decision: {s}\n", .{self.decision});
+        try writeTextOptionalLine(w, "reason", self.reason);
+        try writeTextOptionalLine(w, "decided_by", self.decided_by);
+        try writeTextOptionalLine(w, "updated_input", self.updated_input);
+        try writeTextOptionalLine(w, "additional_context", self.additional_context);
+        try writeTextOptionalLine(w, "continue_reason", self.continue_reason);
+        try writeTextOptionalLine(w, "stop_reason", self.stop_reason);
+        try writeTextOptionalLine(w, "updated_output", self.updated_output);
+        if (self.retry) try w.writeAll("retry: true\n");
+        for (self.notices) |notice| {
+            try w.print("notice: {s} from {f}: {f}\n", .{
+                notice.kind,
+                text_utils.terminalSafe(notice.hook_id),
+                text_utils.terminalSafe(notice.text),
+            });
+        }
+        return try out.toOwnedSlice();
+    }
+};
+
+/// Writes a string as JSON, or `null` when it is absent.
+fn writeJsonOptionalString(writer: *std.Io.Writer, value: ?[]const u8) !void {
+    if (value) |text| {
+        try std.json.Stringify.value(text, .{}, writer);
+    } else {
+        try writer.writeAll("null");
+    }
+}
+
+/// Says how many matching hooks fx's own agent skipped because they wait for trust. Writes nothing for zero.
+fn writeSkippedWaiting(writer: *std.Io.Writer, count: usize) !void {
+    if (count == 0) return;
+    try writer.print("Skipped {d} waiting {s}: fx's own agent runs only trusted hooks.\n", .{ count, if (count == 1) "hook" else "hooks" });
+}
+
+/// Writes `label: value` when the value is present.
+fn writeTextOptionalLine(writer: *std.Io.Writer, label: []const u8, value: ?[]const u8) !void {
+    const text = value orelse return;
+    try writer.print("{s}: {f}\n", .{ label, text_utils.terminalSafe(text) });
+}
+
+/// `fx hook trust`: the hooks this call trusted, and the trust file. Text names them; JSON carries the ids.
+pub const HookTrustSnapshot = struct {
+    trusted: []const []const u8,
+    /// The trust file, as fx reads and writes it.
+    file: []const u8,
+
+    pub fn render(self: HookTrustSnapshot, alloc: Allocator, format: OutputFormat) ![]u8 {
+        return switch (format) {
+            .text => self.renderText(alloc),
+            .json => self.renderJson(alloc),
+        };
+    }
+
+    fn renderJson(self: HookTrustSnapshot, alloc: Allocator) ![]u8 {
+        var out: std.Io.Writer.Allocating = .init(alloc);
+        defer out.deinit();
+        try out.writer.writeAll("{\"kind\":\"hook_trust\",\"trusted\":[");
+        for (self.trusted, 0..) |id, index| {
+            if (index > 0) try out.writer.writeByte(',');
+            try std.json.Stringify.value(id, .{}, &out.writer);
+        }
+        try out.writer.writeAll("],\"file\":");
+        try std.json.Stringify.value(self.file, .{}, &out.writer);
+        try out.writer.writeByte('}');
+        return try out.toOwnedSlice();
+    }
+
+    fn renderText(self: HookTrustSnapshot, alloc: Allocator) ![]u8 {
+        var out: std.Io.Writer.Allocating = .init(alloc);
+        defer out.deinit();
+        const w = &out.writer;
+        if (self.trusted.len == 0) {
+            try w.writeAll("No hook waits for trust.\n");
+            return try out.toOwnedSlice();
+        }
+        if (self.trusted.len == 1) {
+            try w.print("Trusted hook {f}.", .{text_utils.terminalSafe(self.trusted[0])});
+        } else {
+            try w.print("Trusted {d} hooks: ", .{self.trusted.len});
+            for (self.trusted, 0..) |id, index| {
+                if (index > 0) try w.writeAll(", ");
+                try w.print("{f}", .{text_utils.terminalSafe(id)});
+            }
+            try w.writeByte('.');
+        }
+        try w.writeAll(" Saved to ");
+        try writeSafePath(alloc, w, self.file);
+        try w.writeAll(".\n");
+        return try out.toOwnedSlice();
+    }
+};
+
+/// `fx hook enable` and `fx hook disable`: the state one hook now has in this workspace.
+pub const HookStateSnapshot = struct {
+    id: []const u8,
+    disabled: bool,
+    /// The trust file, as fx reads and writes it.
+    file: []const u8,
+
+    pub fn render(self: HookStateSnapshot, alloc: Allocator, format: OutputFormat) ![]u8 {
+        return switch (format) {
+            .text => self.renderText(alloc),
+            .json => self.renderJson(alloc),
+        };
+    }
+
+    fn renderJson(self: HookStateSnapshot, alloc: Allocator) ![]u8 {
+        var out: std.Io.Writer.Allocating = .init(alloc);
+        defer out.deinit();
+        try out.writer.writeAll("{\"kind\":\"hook_state\",\"id\":");
+        try std.json.Stringify.value(self.id, .{}, &out.writer);
+        try out.writer.print(",\"disabled\":{},\"file\":", .{self.disabled});
+        try std.json.Stringify.value(self.file, .{}, &out.writer);
+        try out.writer.writeByte('}');
+        return try out.toOwnedSlice();
+    }
+
+    fn renderText(self: HookStateSnapshot, alloc: Allocator) ![]u8 {
+        var out: std.Io.Writer.Allocating = .init(alloc);
+        defer out.deinit();
+        const w = &out.writer;
+        try w.print("{s} hook {f} for this workspace. Saved to ", .{
+            if (self.disabled) "Disabled" else "Enabled",
+            text_utils.terminalSafe(self.id),
+        });
+        try writeSafePath(alloc, w, self.file);
+        try w.writeAll(".\n");
+        return try out.toOwnedSlice();
+    }
+};
+
+/// The fields a hook row shares between list and show, without the braces.
+fn writeHookRowFields(writer: *std.Io.Writer, hook: HookRow) !void {
+    try writer.writeAll("\"id\":");
+    try std.json.Stringify.value(hook.id, .{}, writer);
+    try writer.writeAll(",\"event\":");
+    try std.json.Stringify.value(hook.event, .{}, writer);
+    try writer.writeAll(",\"matcher\":");
+    if (hook.matcher) |matcher| {
+        try std.json.Stringify.value(matcher, .{}, writer);
+    } else {
+        try writer.writeAll("null");
+    }
+    try writer.writeAll(",\"command\":");
+    try std.json.Stringify.value(hook.command, .{}, writer);
+    try writer.writeAll(",\"layer\":");
+    try std.json.Stringify.value(hook.layer, .{}, writer);
+    try writer.writeAll(",\"file\":");
+    try std.json.Stringify.value(hook.file, .{}, writer);
+    try writer.print(",\"status\":\"{s}\"", .{@tagName(hook.status)});
+}
+
+/// The table `fx hook list` prints: ID, EVENT, MATCHER, STATUS, FILE. The last column is not padded.
+fn writeHookTable(arena: Allocator, w: *std.Io.Writer, hooks: []const HookRow) !void {
+    const header = [_][]const u8{ "ID", "EVENT", "MATCHER", "STATUS", "FILE" };
+    const cells = try arena.alloc([5][]const u8, hooks.len + 1);
+    cells[0] = header;
+    for (hooks, 1..) |hook, row| {
+        cells[row] = .{
+            try safeCell(arena, hook.id),
+            hook.event,
+            try safeCell(arena, hook.matcher orelse "-"),
+            @tagName(hook.status),
+            try safeCell(arena, try displayPath(arena, hook.file)),
+        };
+    }
+    var widths: [5]usize = @splat(0);
+    for (cells) |row| for (row, 0..) |cell, column| {
+        widths[column] = @max(widths[column], cell.len);
+    };
+    for (cells) |row| {
+        for (row, 0..) |cell, column| {
+            try w.writeAll(cell);
+            if (column + 1 == row.len) break;
+            for (0..widths[column] - cell.len + 2) |_| try w.writeByte(' ');
+        }
+        try w.writeByte('\n');
+    }
+}
+
+fn writeHookSummary(w: *std.Io.Writer, hooks: []const HookRow, trust_refused: bool) !void {
+    var trusted: usize = 0;
+    var waiting: usize = 0;
+    var disabled: usize = 0;
+    for (hooks) |hook| switch (hook.status) {
+        .trusted => trusted += 1,
+        .waiting => waiting += 1,
+        .disabled => disabled += 1,
+    };
+    try w.print("{d} {s}: {d} trusted, {d} waiting for trust", .{
+        hooks.len,
+        if (hooks.len == 1) "hook" else "hooks",
+        trusted,
+        waiting,
+    });
+    if (disabled > 0) try w.print(", {d} disabled", .{disabled});
+    try w.writeByte('.');
+    // The hint names the first waiting hook. It is left out when the trust file is refused, since the trust command would refuse too.
+    if (waiting > 0 and !trust_refused) {
+        for (hooks) |hook| {
+            if (hook.status != .waiting) continue;
+            try w.print(" Run fx hook trust {f} to trust one.", .{text_utils.terminalSafe(hook.id)});
+            break;
+        }
+    }
+    try w.writeByte('\n');
+}
+
+/// A path as the person sees it: `~/.fx` when the profile is the default one.
+fn displayPath(arena: Allocator, path: []const u8) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(arena);
+    try profile_paths.writeDisplayText(&out.writer, path);
+    return try out.toOwnedSlice();
+}
+
+/// `text` as a table cell, in arena memory, with control bytes escaped. The table measures the cell,
+/// so the width it pads to is the width the terminal shows.
+fn safeCell(arena: Allocator, text: []const u8) ![]u8 {
+    return arena.print("{f}", .{text_utils.terminalSafe(text)});
+}
+
+/// Writes a path the way a person reads it, with control bytes escaped.
+fn writeSafePath(alloc: Allocator, writer: *std.Io.Writer, path: []const u8) !void {
+    var display: std.Io.Writer.Allocating = .init(alloc);
+    defer display.deinit();
+    try profile_paths.writeDisplayText(&display.writer, path);
+    try writer.print("{f}", .{text_utils.terminalSafe(display.written())});
+}
+
+/// Writes a timeout in seconds without rounding: 60000 is `60`, 1500 is `1.5`.
+fn writeSeconds(writer: *std.Io.Writer, ms: u32) std.Io.Writer.Error!void {
+    try writer.print("{d}", .{ms / 1000});
+    const fraction = ms % 1000;
+    if (fraction == 0) return;
+    var digits: [3]u8 = .{
+        '0' + @as(u8, @intCast(fraction / 100)),
+        '0' + @as(u8, @intCast(fraction / 10 % 10)),
+        '0' + @as(u8, @intCast(fraction % 10)),
+    };
+    var len: usize = digits.len;
+    while (digits[len - 1] == '0') len -= 1;
+    try writer.print(".{s}", .{digits[0..len]});
+}
+
 pub const CommandFailureSnapshot = struct {
     kind: []const u8,
     message: []const u8,
@@ -868,6 +1510,41 @@ pub const McpLocalSnapshot = struct {
     }
 };
 
+/// What `fx status` says about the hooks in this workspace: the counts of the same load `fx hook list`
+/// makes. The other fields are counts; `problems` lists each problem, for `fx doctor`.
+pub const HooksSummary = struct {
+    enabled: bool,
+    count: usize,
+    trusted: usize,
+    waiting: usize,
+    disabled: usize,
+    trust_refused: bool,
+    problems: []const HookProblem,
+};
+
+/// The hooks state a status snapshot carries. `not_checked` leaves the hooks out, as the `/status`
+/// panel does. `unavailable` says the hook files could not be read; the trace says why.
+pub const HooksStatus = union(enum) {
+    not_checked,
+    unavailable,
+    summary: HooksSummary,
+};
+
+fn writeHooksText(writer: *std.Io.Writer, hooks: HooksStatus) !void {
+    switch (hooks) {
+        .not_checked => {},
+        .unavailable => try writer.writeAll("[status] hooks=unavailable\n"),
+        .summary => |summary| {
+            if (!summary.enabled) return writer.writeAll("[status] hooks=off (experimental.hooks)\n");
+            try writer.print("[status] hooks={d} ({d} trusted, {d} waiting for trust", .{ summary.count, summary.trusted, summary.waiting });
+            if (summary.disabled > 0) try writer.print(", {d} disabled", .{summary.disabled});
+            if (summary.problems.len > 0) try writer.print(", {d} problem{s}", .{ summary.problems.len, if (summary.problems.len == 1) "" else "s" });
+            if (summary.trust_refused) try writer.writeAll("; the trust file was refused");
+            try writer.writeAll(")\n");
+        },
+    }
+}
+
 pub const StatusSnapshot = struct {
     model: []const u8,
     /// Where startup found `model`: FX_MODEL, settings, or default.
@@ -902,6 +1579,8 @@ pub const StatusSnapshot = struct {
     agent_step_limit: usize,
     /// Requested Ultrafast mode. The serving provider may still fall back.
     ultrafast_requested: bool = false,
+    /// The hooks in this workspace. `fx status` fills it; the `/status` panel leaves it `.not_checked`.
+    hooks: HooksStatus = .not_checked,
 
     pub const SessionModes = struct {
         current: []const u8,
@@ -1030,6 +1709,7 @@ pub const StatusSnapshot = struct {
         }
         try out.writer.print("[status] permission_mode={s}\n", .{permissions.permissionModeDisplayLabel(self.permission_mode)});
         try out.writer.print("[status] workspace={s}\n", .{self.workspace_root});
+        try writeHooksText(&out.writer, self.hooks);
         if (self.fx_home) |path| try out.writer.print("[status] fx_home={s}\n", .{path});
         try out.writer.print("[status] history_turns={d}\n", .{self.history_turns});
         try out.writer.print("[status] session_permission_grants={d}\n", .{self.session_permission_grants});
@@ -1165,6 +1845,14 @@ pub const StatusSnapshot = struct {
         if (self.mcp) |mcp| {
             try writer.writeAll(",\"mcp\":");
             try mcp.writeJson(writer);
+        }
+        switch (self.hooks) {
+            .not_checked => {},
+            .unavailable => try writer.writeAll(",\"hooks\":null"),
+            .summary => |summary| try writer.print(
+                ",\"hooks\":{{\"enabled\":{},\"count\":{d},\"trusted\":{d},\"waiting\":{d},\"disabled\":{d},\"problems\":{d},\"trust_refused\":{}}}",
+                .{ summary.enabled, summary.count, summary.trusted, summary.waiting, summary.disabled, summary.problems.len, summary.trust_refused },
+            ),
         }
         try writer.writeByte('}');
     }
@@ -2632,6 +3320,7 @@ const DoctorGroup = enum {
             .{ "install", .install },
             .{ "config", .config },
             .{ "env", .config },
+            .{ "hooks", .config },
             .{ "startup", .config },
             .{ "mcp_config", .mcp },
             .{ "auth", .auth },
@@ -3029,6 +3718,119 @@ test "status reports where the model came from alongside the model" {
     const json = try snapshot.renderJson(std.testing.allocator);
     defer std.testing.allocator.free(json);
     try std.testing.expect(std.mem.startsWith(u8, json, "{\"kind\":\"status\",\"model\":\"gpt-5.4\",\"model_origin\":\"FX_MODEL\","));
+}
+
+fn hooksTestStatus(hooks: HooksStatus) StatusSnapshot {
+    return .{
+        .model = "gpt-5.4",
+        .permission_mode = .auto,
+        .workspace_root = "/w",
+        .history_turns = 0,
+        .session_permission_grants = 0,
+        .agent_step_limit = 24,
+        .hooks = hooks,
+    };
+}
+
+test "status says whether hooks run here, and what is wrong, in text" {
+    const alloc = std.testing.allocator;
+    const problems = [_]HookProblem{
+        .{ .file = "/w/.fx/hooks.json", .where = "hooks.Nope", .message = "unknown event \"Nope\"" },
+        .{ .file = "/w/.fx/hooks.json", .where = "hooks.Stop", .message = "bad matcher" },
+    };
+
+    const off = try hooksTestStatus(.{ .summary = .{
+        .enabled = false,
+        .count = 1,
+        .trusted = 0,
+        .waiting = 1,
+        .disabled = 0,
+        .trust_refused = false,
+        .problems = &.{},
+    } }).renderText(alloc);
+    defer alloc.free(off);
+    try std.testing.expect(std.mem.find(u8, off, "[status] hooks=off (experimental.hooks)\n") != null);
+    try std.testing.expect(std.mem.find(u8, off, "[status] hooks=1") == null);
+
+    const clean = try hooksTestStatus(.{ .summary = .{
+        .enabled = true,
+        .count = 2,
+        .trusted = 2,
+        .waiting = 0,
+        .disabled = 0,
+        .trust_refused = false,
+        .problems = &.{},
+    } }).renderText(alloc);
+    defer alloc.free(clean);
+    try std.testing.expect(std.mem.find(u8, clean, "[status] hooks=2 (2 trusted, 0 waiting for trust)\n") != null);
+
+    const one_problem = try hooksTestStatus(.{ .summary = .{
+        .enabled = true,
+        .count = 1,
+        .trusted = 0,
+        .waiting = 1,
+        .disabled = 0,
+        .trust_refused = false,
+        .problems = problems[0..1],
+    } }).renderText(alloc);
+    defer alloc.free(one_problem);
+    try std.testing.expect(std.mem.find(u8, one_problem, "[status] hooks=1 (0 trusted, 1 waiting for trust, 1 problem)\n") != null);
+
+    const counted = try hooksTestStatus(.{ .summary = .{
+        .enabled = true,
+        .count = 3,
+        .trusted = 2,
+        .waiting = 1,
+        .disabled = 1,
+        .trust_refused = true,
+        .problems = &problems,
+    } }).renderText(alloc);
+    defer alloc.free(counted);
+    try std.testing.expect(std.mem.find(
+        u8,
+        counted,
+        "[status] hooks=3 (2 trusted, 1 waiting for trust, 1 disabled, 2 problems; the trust file was refused)\n",
+    ) != null);
+
+    const unavailable = try hooksTestStatus(.unavailable).renderText(alloc);
+    defer alloc.free(unavailable);
+    try std.testing.expect(std.mem.find(u8, unavailable, "[status] hooks=unavailable\n") != null);
+
+    const unchecked = try hooksTestStatus(.not_checked).renderText(alloc);
+    defer alloc.free(unchecked);
+    try std.testing.expect(std.mem.find(u8, unchecked, "hooks=") == null);
+}
+
+test "status JSON carries the hook counts, and null when they could not be read" {
+    const alloc = std.testing.allocator;
+    const problems = [_]HookProblem{
+        .{ .file = "/w/.fx/hooks.json", .where = "hooks.Nope", .message = "unknown event \"Nope\"" },
+        .{ .file = "/w/.fx/hooks.json", .where = "hooks.Stop", .message = "bad matcher" },
+    };
+
+    const counted = try hooksTestStatus(.{ .summary = .{
+        .enabled = true,
+        .count = 3,
+        .trusted = 2,
+        .waiting = 1,
+        .disabled = 1,
+        .trust_refused = true,
+        .problems = &problems,
+    } }).renderJson(alloc);
+    defer alloc.free(counted);
+    try std.testing.expect(std.mem.endsWith(
+        u8,
+        counted,
+        ",\"hooks\":{\"enabled\":true,\"count\":3,\"trusted\":2,\"waiting\":1,\"disabled\":1,\"problems\":2,\"trust_refused\":true}}",
+    ));
+
+    const unavailable = try hooksTestStatus(.unavailable).renderJson(alloc);
+    defer alloc.free(unavailable);
+    try std.testing.expect(std.mem.endsWith(u8, unavailable, ",\"hooks\":null}"));
+
+    const unchecked = try hooksTestStatus(.not_checked).renderJson(alloc);
+    defer alloc.free(unchecked);
+    try std.testing.expect(std.mem.find(u8, unchecked, "\"hooks\"") == null);
 }
 
 test "status reports the effort a new session starts with after the model" {
@@ -4645,6 +5447,360 @@ pub const SlackSnapshot = struct {
         return out.toOwnedSlice();
     }
 };
+
+test "hook list renders text and JSON from one snapshot" {
+    const alloc = std.testing.allocator;
+    const hooks = [_]HookRow{
+        .{ .id = "lint", .event = "PreToolUse", .matcher = "Bash", .command = "./check.sh", .layer = "profile", .file = "/home/visitor/.fx/hooks.json", .status = .trusted },
+        .{ .id = "notes", .event = "Stop", .matcher = null, .command = "./notes.sh", .layer = "project", .file = "/work/app/.fx/hooks.json", .status = .waiting },
+    };
+    const problems = [_]HookProblem{.{ .file = "/work/app/.fx/hooks.json", .where = "hooks.Nope", .message = "unknown event Nope" }};
+    const snapshot: HookListSnapshot = .{ .enabled = false, .workspace = "/work/app", .trust_refused = false, .hooks = &hooks, .problems = &problems };
+
+    const text = try snapshot.render(alloc, .text);
+    defer alloc.free(text);
+    try std.testing.expectEqualStrings(
+        \\Hooks for /work/app (experimental.hooks is off: no hook runs)
+        \\ID     EVENT       MATCHER  STATUS   FILE
+        \\lint   PreToolUse  Bash     trusted  /home/visitor/.fx/hooks.json
+        \\notes  Stop        -        waiting  /work/app/.fx/hooks.json
+        \\
+        \\2 hooks: 1 trusted, 1 waiting for trust. Run fx hook trust notes to trust one.
+        \\
+        \\Problems:
+        \\  /work/app/.fx/hooks.json (hooks.Nope): unknown event Nope
+        \\
+    , text);
+
+    const json = try snapshot.render(alloc, .json);
+    defer alloc.free(json);
+    try std.testing.expectEqualStrings(
+        "{\"kind\":\"hook_list\",\"enabled\":false,\"workspace\":\"/work/app\",\"trust_refused\":false,\"hooks\":[" ++
+            "{\"id\":\"lint\",\"event\":\"PreToolUse\",\"matcher\":\"Bash\",\"command\":\"./check.sh\",\"layer\":\"profile\",\"file\":\"/home/visitor/.fx/hooks.json\",\"status\":\"trusted\"}," ++
+            "{\"id\":\"notes\",\"event\":\"Stop\",\"matcher\":null,\"command\":\"./notes.sh\",\"layer\":\"project\",\"file\":\"/work/app/.fx/hooks.json\",\"status\":\"waiting\"}" ++
+            "],\"problems\":[{\"file\":\"/work/app/.fx/hooks.json\",\"where\":\"hooks.Nope\",\"message\":\"unknown event Nope\"}]}",
+        json,
+    );
+}
+
+test "hook show renders text and JSON, with the timeout in exact seconds" {
+    const alloc = std.testing.allocator;
+    const row: HookRow = .{ .id = "lint", .event = "PreToolUse", .matcher = "Bash", .command = "./check.sh", .layer = "profile", .file = "/home/visitor/.fx/hooks.json", .status = .trusted };
+    const snapshot: HookShowSnapshot = .{ .hook = row, .timeout_ms = 60_000, .on_failure = "proceed", .named_files = &.{"/work/app/check.sh"} };
+
+    const json = try snapshot.render(alloc, .json);
+    defer alloc.free(json);
+    try std.testing.expectEqualStrings(
+        "{\"kind\":\"hook_show\",\"hook\":{\"id\":\"lint\",\"event\":\"PreToolUse\",\"matcher\":\"Bash\",\"command\":\"./check.sh\",\"layer\":\"profile\",\"file\":\"/home/visitor/.fx/hooks.json\",\"status\":\"trusted\",\"type\":\"command\",\"timeout_seconds\":60,\"on_failure\":\"proceed\",\"named_files\":[\"/work/app/check.sh\"],\"named_files_dropped\":0}}",
+        json,
+    );
+
+    const text = try snapshot.render(alloc, .text);
+    defer alloc.free(text);
+    try std.testing.expect(std.mem.find(u8, text, "matcher: Bash\n") != null);
+    try std.testing.expect(std.mem.find(u8, text, "timeout_seconds: 60\n") != null);
+    try std.testing.expect(std.mem.find(u8, text, "named_files: /work/app/check.sh\n") != null);
+
+    const fractional: HookShowSnapshot = .{ .hook = row, .timeout_ms = 1_500, .on_failure = "block" };
+    const half = try fractional.render(alloc, .json);
+    defer alloc.free(half);
+    try std.testing.expect(std.mem.find(u8, half, "\"timeout_seconds\":1.5,") != null);
+    try std.testing.expect(std.mem.find(u8, half, "\"named_files\":[]") != null);
+}
+
+test "hook list with no hooks names the files it reads and a refused trust file" {
+    const alloc = std.testing.allocator;
+    const files = [_][]const u8{ "/home/visitor/.fx/hooks.json", "/work/app/.fx/hooks.json" };
+    const snapshot: HookListSnapshot = .{ .enabled = true, .workspace = "/work/app", .trust_refused = false, .checked_files = &files };
+
+    const text = try snapshot.render(alloc, .text);
+    defer alloc.free(text);
+    try std.testing.expectEqualStrings(
+        "Hooks for /work/app\nNo hooks for this workspace.\nfx reads hook files from:\n  /home/visitor/.fx/hooks.json\n  /work/app/.fx/hooks.json\n",
+        text,
+    );
+
+    const refused: HookListSnapshot = .{ .enabled = true, .workspace = "/work/app", .trust_refused = true, .checked_files = &files };
+    const refused_text = try refused.render(alloc, .text);
+    defer alloc.free(refused_text);
+    try std.testing.expect(std.mem.find(u8, refused_text, "The trust file was refused, so no hook runs. See the problems below.\n") != null);
+    const refused_json = try refused.render(alloc, .json);
+    defer alloc.free(refused_json);
+    try std.testing.expect(std.mem.find(u8, refused_json, "\"trust_refused\":true,\"hooks\":[]") != null);
+}
+
+test "hook trust and state render text and JSON" {
+    const alloc = std.testing.allocator;
+    const file = "/home/visitor/.fx/hooks-trust.json";
+
+    const one: HookTrustSnapshot = .{ .trusted = &.{"lint"}, .file = file };
+    const one_text = try one.render(alloc, .text);
+    defer alloc.free(one_text);
+    try std.testing.expectEqualStrings("Trusted hook lint. Saved to /home/visitor/.fx/hooks-trust.json.\n", one_text);
+    const one_json = try one.render(alloc, .json);
+    defer alloc.free(one_json);
+    try std.testing.expectEqualStrings("{\"kind\":\"hook_trust\",\"trusted\":[\"lint\"],\"file\":\"/home/visitor/.fx/hooks-trust.json\"}", one_json);
+
+    const two: HookTrustSnapshot = .{ .trusted = &.{ "lint", "notes" }, .file = file };
+    const two_text = try two.render(alloc, .text);
+    defer alloc.free(two_text);
+    try std.testing.expectEqualStrings("Trusted 2 hooks: lint, notes. Saved to /home/visitor/.fx/hooks-trust.json.\n", two_text);
+
+    const none: HookTrustSnapshot = .{ .trusted = &.{}, .file = file };
+    const none_text = try none.render(alloc, .text);
+    defer alloc.free(none_text);
+    try std.testing.expectEqualStrings("No hook waits for trust.\n", none_text);
+    const none_json = try none.render(alloc, .json);
+    defer alloc.free(none_json);
+    try std.testing.expectEqualStrings("{\"kind\":\"hook_trust\",\"trusted\":[],\"file\":\"/home/visitor/.fx/hooks-trust.json\"}", none_json);
+
+    const off: HookStateSnapshot = .{ .id = "lint", .disabled = true, .file = file };
+    const off_text = try off.render(alloc, .text);
+    defer alloc.free(off_text);
+    try std.testing.expectEqualStrings("Disabled hook lint for this workspace. Saved to /home/visitor/.fx/hooks-trust.json.\n", off_text);
+    const off_json = try off.render(alloc, .json);
+    defer alloc.free(off_json);
+    try std.testing.expectEqualStrings("{\"kind\":\"hook_state\",\"id\":\"lint\",\"disabled\":true,\"file\":\"/home/visitor/.fx/hooks-trust.json\"}", off_json);
+
+    const on: HookStateSnapshot = .{ .id = "lint", .disabled = false, .file = file };
+    const on_text = try on.render(alloc, .text);
+    defer alloc.free(on_text);
+    try std.testing.expectEqualStrings("Enabled hook lint for this workspace. Saved to /home/visitor/.fx/hooks-trust.json.\n", on_text);
+}
+
+test "a refused trust change renders its failure as JSON" {
+    const alloc = std.testing.allocator;
+    const failure: CommandFailureSnapshot = .{
+        .kind = "hook_trust",
+        .message = "The trust file was refused: other users can write this file; fx runs no hook until you run chmod go-w on it",
+        .code = "TrustFileRefused",
+    };
+    const json = try failure.renderJson(alloc);
+    defer alloc.free(json);
+    try std.testing.expectEqualStrings(
+        "{\"kind\":\"hook_trust\",\"error\":\"The trust file was refused: other users can write this file; fx runs no hook until you run chmod go-w on it\",\"code\":\"TrustFileRefused\"}",
+        json,
+    );
+}
+
+test "hook show reports how many named files trust does not cover" {
+    const alloc = std.testing.allocator;
+    const row: HookRow = .{ .id = "lint", .event = "PreToolUse", .matcher = null, .command = "./check.sh", .layer = "project", .file = "/work/app/.fx/hooks.json", .status = .waiting };
+    const snapshot: HookShowSnapshot = .{ .hook = row, .timeout_ms = 500, .on_failure = "proceed", .named_files = &.{"/work/app/check.sh"}, .named_files_dropped = 3 };
+
+    const text = try snapshot.render(alloc, .text);
+    defer alloc.free(text);
+    try std.testing.expect(std.mem.find(u8, text, "timeout_seconds: 0.5\n") != null);
+    try std.testing.expect(std.mem.find(u8, text, "named_files_dropped: 3\n") != null);
+
+    const json = try snapshot.render(alloc, .json);
+    defer alloc.free(json);
+    try std.testing.expect(std.mem.find(u8, json, "\"named_files\":[\"/work/app/check.sh\"],\"named_files_dropped\":3}}") != null);
+}
+
+test "the list hint is left out when the trust file is refused" {
+    const alloc = std.testing.allocator;
+    const hooks = [_]HookRow{
+        .{ .id = "lint", .event = "PreToolUse", .matcher = null, .command = "./check.sh", .layer = "project", .file = "/work/app/.fx/hooks.json", .status = .waiting },
+    };
+    const snapshot: HookListSnapshot = .{ .enabled = true, .workspace = "/work/app", .trust_refused = true, .hooks = &hooks };
+
+    const text = try snapshot.render(alloc, .text);
+    defer alloc.free(text);
+    try std.testing.expect(std.mem.find(u8, text, "Run fx hook trust") == null);
+    try std.testing.expect(std.mem.find(u8, text, "1 waiting for trust.\n") != null);
+}
+
+test "hook test renders a deny with its notice as text and JSON" {
+    const alloc = std.testing.allocator;
+    const notices = [_]HookNoticeRow{.{ .kind = "message", .hook_id = "lint", .text = "no rm" }};
+    const snapshot: HookTestSnapshot = .{
+        .event = "PreToolUse",
+        .match = "shell",
+        .ran = 1,
+        .trust_refused = false,
+        .decision = "deny",
+        .reason = "no rm",
+        .decided_by = "lint",
+        .notices = &notices,
+    };
+
+    const text = try snapshot.render(alloc, .text);
+    defer alloc.free(text);
+    try std.testing.expectEqualStrings("Ran 1 hook for PreToolUse.\ndecision: deny\nreason: no rm\ndecided_by: lint\nnotice: message from lint: no rm\n", text);
+
+    const json = try snapshot.render(alloc, .json);
+    defer alloc.free(json);
+    try std.testing.expectEqualStrings(
+        "{\"kind\":\"hook_test\",\"event\":\"PreToolUse\",\"ran\":1,\"decision\":\"deny\",\"reason\":\"no rm\",\"decided_by\":\"lint\",\"updated_input\":null,\"additional_context\":null,\"continue_reason\":null,\"stop_reason\":null,\"updated_output\":null,\"retry\":false,\"notices\":[{\"kind\":\"message\",\"hook_id\":\"lint\",\"text\":\"no rm\"}],\"trust_refused\":false,\"skipped_waiting\":0}",
+        json,
+    );
+}
+
+test "hook test with no matching hook says so, and says why when trust is refused" {
+    const alloc = std.testing.allocator;
+    const none: HookTestSnapshot = .{ .event = "PreToolUse", .match = "read_file", .ran = 0, .trust_refused = false, .decision = "proceed" };
+    const none_text = try none.render(alloc, .text);
+    defer alloc.free(none_text);
+    try std.testing.expectEqualStrings("No hook matched PreToolUse for \"read_file\".\n", none_text);
+
+    const refused: HookTestSnapshot = .{ .event = "PreToolUse", .ran = 0, .trust_refused = true, .decision = "proceed" };
+    const refused_text = try refused.render(alloc, .text);
+    defer alloc.free(refused_text);
+    try std.testing.expectEqualStrings("No hook matched PreToolUse.\nThe trust file was refused, so no hook runs.\n", refused_text);
+    const refused_json = try refused.render(alloc, .json);
+    defer alloc.free(refused_json);
+    try std.testing.expectEqualStrings(
+        "{\"kind\":\"hook_test\",\"event\":\"PreToolUse\",\"ran\":0,\"decision\":\"proceed\",\"reason\":null,\"decided_by\":null,\"updated_input\":null,\"additional_context\":null,\"continue_reason\":null,\"stop_reason\":null,\"updated_output\":null,\"retry\":false,\"notices\":[],\"trust_refused\":true,\"skipped_waiting\":0}",
+        refused_json,
+    );
+}
+
+test "hook test says how many waiting hooks fx's own agent skipped, in text and in JSON" {
+    const alloc = std.testing.allocator;
+    const skipped: HookTestSnapshot = .{ .event = "PreToolUse", .match = "shell", .ran = 0, .trust_refused = false, .decision = "proceed", .skipped_waiting = 2 };
+    const text = try skipped.render(alloc, .text);
+    defer alloc.free(text);
+    try std.testing.expectEqualStrings(
+        "No hook matched PreToolUse for \"shell\".\nSkipped 2 waiting hooks: fx's own agent runs only trusted hooks.\n",
+        text,
+    );
+    const json = try skipped.render(alloc, .json);
+    defer alloc.free(json);
+    try std.testing.expect(std.mem.endsWith(u8, json, ",\"trust_refused\":false,\"skipped_waiting\":2}"));
+}
+
+test "hook text escapes control bytes from the hook's own text in each text render, and JSON keeps them escaped" {
+    const alloc = std.testing.allocator;
+    const esc = "\x1b[31m";
+
+    const row: HookRow = .{
+        .id = "bad" ++ esc,
+        .event = "PreToolUse",
+        .matcher = "shell" ++ esc,
+        .command = "true",
+        .layer = "project",
+        .file = "/fixture/.fx/hooks.json",
+        .status = .waiting,
+    };
+    const list: HookListSnapshot = .{ .enabled = true, .workspace = "/fixture", .trust_refused = false, .hooks = &.{row} };
+    const list_text = try list.render(alloc, .text);
+    defer alloc.free(list_text);
+    try std.testing.expect(std.mem.findScalar(u8, list_text, 0x1b) == null);
+
+    const test_result: HookTestSnapshot = .{
+        .event = "PreToolUse",
+        .match = "shell" ++ esc,
+        .ran = 1,
+        .trust_refused = false,
+        .decision = "deny",
+        .reason = "no" ++ esc,
+        .decided_by = "guard",
+        .notices = &.{.{ .kind = "message", .hook_id = "guard", .text = "hi" ++ esc }},
+    };
+    const test_text = try test_result.render(alloc, .text);
+    defer alloc.free(test_text);
+    try std.testing.expect(std.mem.findScalar(u8, test_text, 0x1b) == null);
+    try std.testing.expect(std.mem.find(u8, test_text, "reason: no") != null);
+    const test_json = try test_result.render(alloc, .json);
+    defer alloc.free(test_json);
+    try std.testing.expect(std.mem.find(u8, test_json, "no\\u001b[31m") != null);
+
+    const entry: HookLogEntry = .{
+        .time_ms = 1700000000000,
+        .event = "PreToolUse",
+        .match = "shell" ++ esc,
+        .surface = "ask",
+        .session_id = null,
+        .ran = 1,
+        .decision = "deny",
+        .decided_by = "guard" ++ esc,
+        .reason = "no" ++ esc,
+        .notices = 0,
+    };
+    const log: HookLogSnapshot = .{ .file = "/fixture/logs/hooks.jsonl", .entries = &.{entry} };
+    const log_text = try log.render(alloc, .text);
+    defer alloc.free(log_text);
+    try std.testing.expect(std.mem.findScalar(u8, log_text, 0x1b) == null);
+    try std.testing.expect(std.mem.find(u8, log_text, "reason: no") != null);
+}
+
+test "hook test writes a PreToolUse input as JSON and a prompt rewrite as a string" {
+    const alloc = std.testing.allocator;
+    const pre: HookTestSnapshot = .{
+        .event = "PreToolUse",
+        .ran = 1,
+        .trust_refused = false,
+        .decision = "allow",
+        .updated_input = "{\"command\":\"ls\"}",
+        .updated_input_is_json = true,
+    };
+    const pre_json = try pre.render(alloc, .json);
+    defer alloc.free(pre_json);
+    try std.testing.expect(std.mem.find(u8, pre_json, "\"updated_input\":{\"command\":\"ls\"},") != null);
+    const pre_text = try pre.render(alloc, .text);
+    defer alloc.free(pre_text);
+    try std.testing.expect(std.mem.find(u8, pre_text, "updated_input: {\"command\":\"ls\"}\n") != null);
+
+    const prompt: HookTestSnapshot = .{
+        .event = "UserPromptSubmit",
+        .ran = 1,
+        .trust_refused = false,
+        .decision = "proceed",
+        .updated_input = "rewritten text",
+    };
+    const prompt_json = try prompt.render(alloc, .json);
+    defer alloc.free(prompt_json);
+    try std.testing.expect(std.mem.find(u8, prompt_json, "\"updated_input\":\"rewritten text\",") != null);
+}
+
+test "hook log renders text and JSON from one snapshot" {
+    const alloc = std.testing.allocator;
+    local_time.test_zone = .{ .offset_s = -5 * 3600, .name = "EST" };
+    defer local_time.test_zone = .utc;
+    const entries = [_]HookLogEntry{
+        .{ .time_ms = 1_700_000_000_000, .event = "PreToolUse", .match = "shell", .surface = "ask", .session_id = null, .ran = 1, .decision = "deny", .decided_by = "guard", .reason = "no rm", .notices = 0 },
+        .{ .time_ms = 1_700_000_060_000, .event = "Stop", .match = null, .surface = "interactive", .session_id = "s1", .ran = 2, .decision = "proceed", .decided_by = null, .reason = null, .notices = 1 },
+    };
+    const snapshot: HookLogSnapshot = .{ .file = "/home/visitor/.fx/logs/hooks.jsonl", .entries = &entries, .skipped_lines = 1 };
+
+    const text = try snapshot.render(alloc, .text);
+    defer alloc.free(text);
+    try std.testing.expectEqualStrings(
+        "TIME                 EVENT       MATCH  RAN  DECISION  BY\n" ++
+            "2023-11-14 17:13:20  PreToolUse  shell  1    deny      guard\n" ++
+            "  reason: no rm\n" ++
+            "2023-11-14 17:14:20  Stop        -      2    proceed   -\n" ++
+            "1 line could not be read.\n",
+        text,
+    );
+
+    const json = try snapshot.render(alloc, .json);
+    defer alloc.free(json);
+    try std.testing.expectEqualStrings(
+        "{\"kind\":\"hook_log\",\"file\":\"/home/visitor/.fx/logs/hooks.jsonl\",\"entries\":[" ++
+            "{\"time_ms\":1700000000000,\"event\":\"PreToolUse\",\"match\":\"shell\",\"surface\":\"ask\",\"session_id\":null,\"ran\":1,\"decision\":\"deny\",\"decided_by\":\"guard\",\"reason\":\"no rm\",\"notices\":0}," ++
+            "{\"time_ms\":1700000060000,\"event\":\"Stop\",\"match\":null,\"surface\":\"interactive\",\"session_id\":\"s1\",\"ran\":2,\"decision\":\"proceed\",\"decided_by\":null,\"reason\":null,\"notices\":1}" ++
+            "],\"skipped_lines\":1}",
+        json,
+    );
+}
+
+test "hook log with no run says so, names the log, and counts lines it could not read" {
+    const alloc = std.testing.allocator;
+    const empty: HookLogSnapshot = .{ .file = "/home/visitor/.fx/logs/hooks.jsonl" };
+    const text = try empty.render(alloc, .text);
+    defer alloc.free(text);
+    try std.testing.expectEqualStrings("No hook has run yet.\nLog: /home/visitor/.fx/logs/hooks.jsonl\n", text);
+    const json = try empty.render(alloc, .json);
+    defer alloc.free(json);
+    try std.testing.expectEqualStrings("{\"kind\":\"hook_log\",\"file\":\"/home/visitor/.fx/logs/hooks.jsonl\",\"entries\":[],\"skipped_lines\":0}", json);
+
+    const broken: HookLogSnapshot = .{ .file = "/home/visitor/.fx/logs/hooks.jsonl", .skipped_lines = 2 };
+    const broken_text = try broken.render(alloc, .text);
+    defer alloc.free(broken_text);
+    try std.testing.expectEqualStrings("No hook has run yet.\nLog: /home/visitor/.fx/logs/hooks.jsonl\n2 lines could not be read.\n", broken_text);
+}
 
 test "slack text reads the access expiry in the local zone" {
     const alloc = std.testing.allocator;

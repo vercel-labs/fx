@@ -75,6 +75,7 @@ const runtime_tool_admission = @import("tool_admission.zig");
 const runtime_interruption = @import("interruption.zig");
 const runtime_parallel_execution = @import("parallel_execution.zig");
 const runtime_tool_batch = @import("tool_batch.zig");
+const runtime_user_hooks = @import("user_hooks.zig");
 const observation = @import("observation.zig");
 const model_call_record = @import("model_call_record.zig");
 const resend_strategy = @import("resend_strategy.zig");
@@ -442,6 +443,7 @@ fn continue_steering_after_stop(
     stop_state.retained_candidate = null;
     stop_state.latest_partial = null;
     stop_state.dispatched = false;
+    stop_state.user_stop_done = false;
     return true;
 }
 
@@ -3116,6 +3118,7 @@ fn queueAttachedFolderRules(
     replaced_sources: []const []const u8,
     remind_sources: *std.ArrayList([]const u8),
     pending_notes: *std.ArrayList(ChatMessage),
+    instructions: *runtime_user_hooks.InstructionFilterState,
 ) !void {
     if (images.len == 0 and attached.isEmpty()) return;
     const targets = try std.mem.concat(arena, context_contract.ApplicableTarget, &.{
@@ -3132,6 +3135,7 @@ fn queueAttachedFolderRules(
         .omissions = attached.omissions,
         .omission_summary = attached.omission_summary,
         .context_limits = config.context_limits,
+        .instruction_filter = instructions.filter(),
     });
     defer selected.deinit(arena);
     for (selected.notices) |notice| try deps.pushContextNotice(notice);
@@ -3206,6 +3210,7 @@ fn candidateHasApplicableContextDelta(
     config: Config,
     context_delivery_state: *const context_contract.DeliveryState,
     candidate: tool_preparation.Candidate,
+    instructions: *runtime_user_hooks.InstructionFilterState,
 ) !bool {
     switch (candidate.kind) {
         .advertised_dynamic, .deferred_dynamic, .legacy_target_resolution => return true,
@@ -3219,6 +3224,7 @@ fn candidateHasApplicableContextDelta(
         .delivered_sources = context_delivery_state.delivered_sources.items,
         .evaluated_endpoints = context_delivery_state.evaluated_endpoints.items,
         .context_limits = config.context_limits,
+        .instruction_filter = instructions.filter(),
     });
     defer selected.deinit(arena);
     return selected.content != null;
@@ -3772,7 +3778,21 @@ pub const CommonStopState = struct {
     latest_partial: ?[]const u8 = null,
     dispatched: bool = false,
     terminal_materializing: bool = false,
+    /// Continuations the user's Stop hooks gave in this turn; capped per turn.
+    user_stop_continuations: u8 = 0,
+    /// The user's Stop hooks let this reply end; they do not check it again.
+    user_stop_done: bool = false,
 };
+
+/// Whether no Stop check is still to run for this reply: neither fx's own nor the user's hooks.
+fn stopGateClosed(
+    lifecycle: LifecycleContext,
+    stop_state: *const CommonStopState,
+    user_hooks: *const runtime_user_hooks.TurnHooks,
+) bool {
+    return (!lifecycle.view.hasStop() or stop_state.dispatched) and
+        !user_hooks.stopPending(stop_state.user_stop_continuations, stop_state.user_stop_done);
+}
 
 fn completionContentBytes(completion: types.ModelCompletion) usize {
     return if (completion.content) |content| content.len else 0;
@@ -4303,12 +4323,42 @@ fn armCacheWarming(deps: *const AgentRuntimeDeps, request: CacheWarmingRequest) 
     });
 }
 
+/// The turn's user hooks, with the permission mode the model hooks report. A copy, so the loop's own
+/// `user_hooks.mode`, which the tool steps set, stays as it was. Null when no hook is active, so a turn
+/// without hooks does no work here.
+fn modelRequestHooks(
+    user_hooks: *const runtime_user_hooks.TurnHooks,
+    permission_mode: types.PermissionMode,
+    deps: *const AgentRuntimeDeps,
+) ?runtime_user_hooks.TurnHooks {
+    if (!user_hooks.active()) return null;
+    var copy = user_hooks.*;
+    copy.mode = permissionModeForAction(permission_mode, snapshotRootPermissionMode(deps), null);
+    return copy;
+}
+
+/// The turn's own model request. Its PreModelRequest and PostModelRequest hooks only observe it.
 fn streamMainCompletion(
     deps: *const AgentRuntimeDeps,
     arena: Allocator,
     request: agent_stream_provider.ModelRequest,
+    user_hooks: ?*runtime_user_hooks.TurnHooks,
 ) !runtime_gateway_step.StreamResult {
-    var result = try runtime_gateway_step.streamModelCompletion(deps.agent_stream_provider, arena, request);
+    if (user_hooks) |turn_hooks| turn_hooks.preModelRequest(arena, request.model, request.messages.len);
+    var result = runtime_gateway_step.streamModelCompletion(deps.agent_stream_provider, arena, request) catch |err| {
+        if (user_hooks) |turn_hooks| turn_hooks.postModelRequest(arena, request.model, @errorName(err), null, null);
+        return err;
+    };
+    if (user_hooks) |turn_hooks| {
+        const usage: types.Usage = switch (result) {
+            .completed => |value| value.completion.usage,
+            .failed => .{},
+        };
+        turn_hooks.postModelRequest(arena, request.model, switch (result) {
+            .completed => "completed",
+            .failed => "failed",
+        }, usage.input_tokens, usage.output_tokens);
+    }
     if (result != .completed) return result;
     const confirm = deps.confirm_session_writer orelse return result;
     confirm(deps.ctx) catch |err| switch (err) {
@@ -6032,6 +6082,9 @@ pub fn processAgentPrompt(
     {
         effective_lifecycle.scope.subagent_id = effective_config.subagent_id;
     }
+    if (comptime !host_target.is_wasm) {
+        if (effective_lifecycle.user_hooks) |hooks_runtime| hooks_runtime.refresh();
+    }
     agent.startTurn();
     var finalization = TurnFinalizationGuard.init(
         deps,
@@ -6055,6 +6108,16 @@ pub fn processAgentPrompt(
     });
     defer {
         const outcome = observedTurnOutcome(observed_error, finalization.outcome);
+        // The user's Interrupt hooks run once, after the turn has ended, for a cancel the user
+        // made. The cancel flag is no longer read here, so the hooks get no cancel of their own.
+        if (comptime !host_target.is_wasm) {
+            if (finalization.ended_by_user) {
+                var interrupt_arena = std.heap.ArenaAllocator.init(std.heap.c_allocator);
+                defer interrupt_arena.deinit();
+                var interrupt_hooks = runtime_user_hooks.TurnHooks.init(effective_lifecycle, deps, effective_job.turn_id, null);
+                interrupt_hooks.interrupt(interrupt_arena.allocator());
+            }
+        }
         if (deps.observer) |observer| observer.endTurn(outcome, if (observed_error) |err| @errorName(err) else null);
         if (traced_subagent_id != 0) diagnostics.recordSubagentTurnEnd(traced_subagent_id, @tagName(outcome));
     }
@@ -6525,6 +6588,34 @@ fn processQueuedPromptInner(
 
     var within_turn_suffix: std.ArrayList(ChatMessage) = .empty;
     defer within_turn_suffix.deinit(arena);
+
+    // The turn's user hooks. SessionStart and SubagentStart run once per session, before the turn's first
+    // request. A person's prompt goes through UserPromptSubmit before the skills and the model read it.
+    // Fx's own turns (subagent, mail, recovery) are not asked. No cancel flag: a cancelled run starts no
+    // hook, so a block would pass unchecked, and a session start lost to a cancel would never run again.
+    var turn_hooks = runtime_user_hooks.TurnHooks.init(lifecycle, deps, turn_id, null);
+    turn_hooks.mode = permissionModeForAction(job.permission_mode, snapshotRootPermissionMode(deps), null);
+    turn_hooks.sessionStart(arena, job.history.len > 0);
+    var prompt_context: ?[]const u8 = null;
+    if (comptime !host_target.is_wasm) {
+        const person_prompt = config.origin == .root and job.author == .user and job.mail == .none and
+            job.recovery_checkpoint == null and job.recovery_resume == null;
+        if (person_prompt) {
+            const applied = turn_hooks.userPromptSubmit(arena, job.prompt);
+            if (applied.blocked_notice) |notice| {
+                debug_trace.logf("hooks", "a UserPromptSubmit hook blocked the prompt; no model call and no saved turn", .{});
+                deps.pushHookNotice(.warning, notice) catch |err| {
+                    debug_trace.logf("hooks", "blocked prompt notice not shown: {s}", .{@errorName(err)});
+                };
+                try finalization.finish(.failed, null, null);
+                finish_trace.finish("prompt_blocked");
+                return;
+            }
+            if (applied.prompt) |rewritten| job.prompt = try arena.dupe(u8, rewritten);
+            prompt_context = applied.context;
+        }
+    }
+
     if (job.recovery_checkpoint) |checkpoint| {
         for (checkpoint.user.images) |attachment| {
             var verified = image_attachments.loadVerifiedSnapshot(
@@ -6691,6 +6782,13 @@ fn processQueuedPromptInner(
     }
     const toolbox_menu = try toolboxMenu(arena, deps, config, agent, if (skill_section) |*section| section else null, request_capabilities.context_window, &within_turn_suffix);
     try appendStablePromptContext(arena, deps, config, toolbox_menu orelse if (skill_section) |section| section.text else null, &stable_prefix);
+    // The session's start context, from SessionStart or SubagentStart, is the same in every request of the
+    // session, so each turn of the session puts it in its stable instructions.
+    if (turn_hooks.sessionContext(arena)) |session_context| {
+        const start = stable_prefix.items.len;
+        try stable_prefix.append(arena, .{ .role = .system, .content = session_context });
+        markCacheBreakpoint(stable_prefix.items[start..]);
+    }
     const active_history = job.history;
     const history_messages_before = stable_prefix.items.len;
     const interrupted_turns = runtime_interruption.countInterruptedHistory(active_history);
@@ -6760,7 +6858,7 @@ fn processQueuedPromptInner(
         start(deps.ctx, fresh, .capture);
     }
 
-    const current_user_message: ChatMessage = .{
+    var current_user_message: ChatMessage = .{
         .role = .user,
         .content = if (job.delivery.isContinuation())
             try framedMessage(arena, job.author, job.prompt)
@@ -6770,6 +6868,15 @@ fn processQueuedPromptInner(
             job.prompt,
         .images = job.images,
     };
+
+    // Added context joins only the model's copy of this message; the saved prompt text is unchanged.
+    if (prompt_context) |framed| {
+        current_user_message.content = try arena.print("{s}\n\n{s}", .{ current_user_message.content.?, framed });
+    }
+    // Notes that PostModelSwitch queued for this session reach its next turn only, once, after the prompt context.
+    if (turn_hooks.takeSessionNotes(arena)) |notes| {
+        current_user_message.content = try arena.print("{s}\n\n{s}", .{ current_user_message.content.?, notes });
+    }
 
     var stop_state = CommonStopState{};
     processQueuedPromptLoop(
@@ -7335,6 +7442,8 @@ pub const ContextCompactionRequest = struct {
     /// sent.
     before_summary: ?BeforeSummary = null,
     compactor: compactor.Request,
+    /// Extra instructions for the summary, such as the user's PreCompact hooks gave; null for none.
+    instructions: ?[]const u8 = null,
 };
 
 pub const BeforeSummary = struct {
@@ -7401,6 +7510,7 @@ fn compactWithProgress(
     const cancel_flag = request.compactor.cancel_flag;
     var compactor_request = request.compactor;
     compactor_request.progress = progress.interface();
+    compactor_request.instructions = request.instructions;
     var result = try compactor.compact(alloc, compactor_request) orelse {
         compactor.traceEvent(trace_ctx, .decision, "decision=no_op origin={s} reason=nothing_to_compact", .{@tagName(request.activity_origin)});
         if (progress.operation_id) |id| deps.compaction_activity.?.settle(deps.ctx, id, .{ .outcome = .no_op });
@@ -7891,6 +8001,9 @@ fn processQueuedPromptLoop(
     defer turn_file_mutation_denials.deinit(arena);
     var turn_review_cache: runtime_tool_admission.TurnReviewCache = .{};
     defer turn_review_cache.deinit(arena);
+    var user_hooks = runtime_user_hooks.TurnHooks.init(lifecycle, deps, turn_id, config.cancel_flag);
+    // A replacement tool output is cut to the same limit as the tool's own output.
+    user_hooks.max_tool_result_bytes = config.max_tool_result_bytes;
     var terminal_validation_retry: runtime_tool_admission.TerminalValidationRetryState = .{};
     defer terminal_validation_retry.deinit(arena);
     var shell_execution_failure_retry: runtime_tool_admission.ShellExecutionFailureRetryState = .{};
@@ -7935,6 +8048,8 @@ fn processQueuedPromptLoop(
     // Notes the gate queued during a step; they join the turn at the next
     // step boundary.
     var pending_context_notes: std.ArrayList(ChatMessage) = .empty;
+    // The user's InstructionsLoaded hooks decide each folder file that a context selection would load.
+    var instruction_filter_state: runtime_user_hooks.InstructionFilterState = .{ .lifecycle = lifecycle };
     // The rules of the folders the turn's attachments come from join the
     // turn's own message at its first boundary.
     if (deps.context_enabled) if (deps.context_registry) |registry| try queueAttachedFolderRules(
@@ -7948,6 +8063,7 @@ fn processQueuedPromptLoop(
         replaced_note_sources.items,
         &remind_sources,
         &pending_context_notes,
+        &instruction_filter_state,
     );
     const root_user_intent_context = switch (config.origin) {
         .subagent => if (config.current_prompt_is_root_authority)
@@ -8088,6 +8204,9 @@ fn processQueuedPromptLoop(
     debug_trace.logf("context", "runtime context saved_copy={} known_update={}", .{ runtime_context.frozen != null, runtime_context.known_update != null });
     var step: usize = 0;
     agent_steps_loop: while (agent_steps.allowsStep(config.agent_step_limit, step)) : (step += 1) {
+        // Each step is one reply, which the user's Stop hooks judge on its own. A steering or
+        // nudge continue loops back here too, so no earlier answer carries into the next reply.
+        stop_state.user_stop_done = false;
         // The notes the last step's gate queued follow that step's results and
         // come before any steering at this boundary (D93), including the
         // steering the last step ended with.
@@ -8776,11 +8895,19 @@ fn processQueuedPromptLoop(
                     };
                     defer summary_model.deinit();
                     var compaction_failure: ?compaction_activity.ErrorProvenance = null;
+                    const pre_compact = user_hooks.preCompact(arena, "auto");
+                    if (pre_compact.blocked_notice) |notice| {
+                        deps.pushHookNotice(.warning, notice) catch |err| {
+                            debug_trace.logf("hooks", "compaction block notice dropped: {s}", .{@errorName(err)});
+                        };
+                    }
                     const compaction_started_ms = io_mod.milliTimestamp();
-                    const compaction_result = compactContext(arena, deps, .{
+                    // A blocked compaction takes the path a null result takes: no summary, then the turn goes on, or fails when the overflow needed it.
+                    const compaction_result: anyerror!?compactor.Result = if (pre_compact.blocked_notice != null) @as(?compactor.Result, null) else compactContext(arena, deps, .{
                         .activity_origin = if (overflow_pending) .provider_overflow else .automatic,
                         .failure_provenance = &compaction_failure,
                         .before_summary = source.hook(),
+                        .instructions = pre_compact.instructions,
                         .compactor = .{
                             .history = compaction_history,
                             .append_messages = session_runtime.appendHistoryChatMessages,
@@ -8830,6 +8957,7 @@ fn processQueuedPromptLoop(
                         return err;
                     };
                     if (compacted) |outcome| {
+                        user_hooks.postCompact(arena, "auto", outcome.cut.turns, outcome.model_text.len);
                         const raw_history_turns = history_range.rawHistoryTurnCount(compaction_history);
                         const active_cut: runtime_execution_memory.CompactedExecutionBoundary = if (outcome.cut.turns == raw_history_turns) .{
                             .tool_steps = outcome.cut.tool_steps,
@@ -8972,7 +9100,8 @@ fn processQueuedPromptLoop(
                 .provider_attempt_owner = .agent,
             };
             request_recovery.beginSend();
-            const streamed = streamMainCompletion(deps, arena, model_request);
+            var model_hooks = modelRequestHooks(&user_hooks, job.permission_mode, deps);
+            const streamed = streamMainCompletion(deps, arena, model_request, if (model_hooks) |*turn_hooks| turn_hooks else null);
             request_recovery.endSend();
             stream_result = streamed catch |err| {
                 runtime_assistant_stream.pushTokenProgressUpdate(&stream_ctx, summary_accumulator.finishTokenRequestWithoutUsage(gateway_delivery.load() == .possibly_sent)) catch |progress_err| {
@@ -9212,7 +9341,8 @@ fn processQueuedPromptLoop(
                     model_request.attempt_evidence = &replay_evidence;
                     const replay_wait_started_ms = io_mod.milliTimestamp();
                     request_started_ms = replay_wait_started_ms;
-                    stream_result = try streamMainCompletion(deps, arena, model_request);
+                    var replay_hooks = modelRequestHooks(&user_hooks, job.permission_mode, deps);
+                    stream_result = try streamMainCompletion(deps, arena, model_request, if (replay_hooks) |*turn_hooks| turn_hooks else null);
                     noteSettledCall(deps, finalization, &held_live_call, stream_ctx.raw_text.items.len > 0, settledCallRecord(job.provider.label(), gateway_model, replay_wait_started_ms, &stream_result, config.cancel_flag));
                     debug_trace.eventf(
                         "auth",
@@ -10056,6 +10186,15 @@ fn processQueuedPromptLoop(
                 const http_detail = try httpFailureDetail(arena, failure, job, request_capabilities);
                 try deps.push_http_error(deps.ctx, failureStatus(failure), http_detail, job.credential_source);
             }
+            // The user's StopFailure hooks see the failed request before the turn ends. A detail that
+            // cannot be built is traced and the hooks are skipped, so no exit below changes.
+            if (user_hooks.active()) {
+                if (httpFailureDetail(arena, failure, job, request_capabilities)) |failure_detail| {
+                    user_hooks.stopFailure(arena, @backingInt(failureStatus(failure)), failure_detail);
+                } else |err| {
+                    debug_trace.logf("hooks", "dropped StopFailure hooks: the error text failed ({s})", .{@errorName(err)});
+                }
+            }
             if (stop_state.retained_candidate != null) {
                 stop_state.terminal_materializing = true;
                 const assistant_text = try runtime_finalization.stopTerminalText(
@@ -10439,8 +10578,21 @@ fn processQueuedPromptLoop(
             const history_text = try arena.dupe(u8, raw_final);
             const history_replay = if (has_content) final_provider_replay else try deps.agent_stream_provider.projectReplay(arena, final_provider_replay, &.{}, false, true);
 
+            // The user's Stop hooks judge the reply first when fx's own Stop has nothing to run, so a reply they let
+            // end follows the normal steering and finish path below. Only a continue request takes the open branch.
+            var user_stop_message: ?[]const u8 = null;
+            if (!(lifecycle.view.hasStop() and !stop_state.dispatched) and
+                user_hooks.stopPending(stop_state.user_stop_continuations, stop_state.user_stop_done))
+            {
+                // A stalled empty reply never reaches Stop: it nudges or fails below. The hooks are not asked,
+                // and marking the reply done gives the steering boundary the value a turn without hooks gets.
+                if (agent_steps.allowsStep(config.agent_step_limit, step + 1) and !empty_other)
+                    user_stop_message = user_hooks.stop(arena, rendered, stop_state.user_stop_continuations);
+                if (user_stop_message == null) stop_state.user_stop_done = true;
+            }
+
             if (agent_steps.allowsStep(config.agent_step_limit, step + 1) and
-                try append_pending_steering_after_assistant(deps, arena, &within_turn_suffix, turn_id, history_text, history_replay, if (!lifecycle.view.hasStop() or stop_state.dispatched) .finalizing else .model))
+                try append_pending_steering_after_assistant(deps, arena, &within_turn_suffix, turn_id, history_text, history_replay, if (stopGateClosed(lifecycle, stop_state, &user_hooks)) .finalizing else .model))
             {
                 try deps.push_text(deps.ctx, .{ .assistant_rendered = "\n" });
                 continue;
@@ -10480,7 +10632,7 @@ fn processQueuedPromptLoop(
                 return;
             }
 
-            if (!lifecycle.view.hasStop() or stop_state.dispatched) {
+            if (stopGateClosed(lifecycle, stop_state, &user_hooks)) {
                 if (!has_content) {
                     try deps.push_text(deps.ctx, .{ .operational = rendered });
                 }
@@ -10539,7 +10691,9 @@ fn processQueuedPromptLoop(
             }
             try deps.push_text(deps.ctx, .{ .assistant_rendered = "\n" });
 
-            var stop_outcome = runtime_lifecycle.dispatchStopCheckpoint(
+            // fx's own Stop runs only when a Stop hook exists and has not run for this turn.
+            var stop_outcome: hooks.StopOutcome = .allow;
+            if (lifecycle.view.hasStop() and !stop_state.dispatched) stop_outcome = runtime_lifecycle.dispatchStopCheckpoint(
                 lifecycle,
                 config.cancel_flag,
                 .{
@@ -10588,6 +10742,21 @@ fn processQueuedPromptLoop(
                     if (agent_steps.allowsStep(config.agent_step_limit, step + 1) and
                         try continue_steering_after_stop(deps, arena, &within_turn_suffix, turn_id, stop_state))
                         continue :agent_steps_loop;
+                    // A continue request from the user's Stop hooks. It is asked here only when fx's own Stop ran first.
+                    const message = user_stop_message orelse if (agent_steps.allowsStep(config.agent_step_limit, step + 1))
+                        user_hooks.stop(arena, rendered, stop_state.user_stop_continuations)
+                    else
+                        null;
+                    if (message) |text| {
+                        stop_state.user_stop_continuations += 1;
+                        try within_turn_suffix.append(arena, .{
+                            .role = .user,
+                            .content = text,
+                            .recovery_prompt = true,
+                        });
+                        continue :agent_steps_loop;
+                    }
+                    stop_state.user_stop_done = true;
                     stop_state.terminal_materializing = true;
                     try finishCommonAssistantTerminal(
                         deps,
@@ -10733,6 +10902,21 @@ fn processQueuedPromptLoop(
             .ready => try toolboxSubject(deps, arena, prepared_call.call(), if (skills.catalog) |catalog| &catalog.locations else null, config.toolbox_mcp_servers, &advertised_dynamic_tools, &advertised_dynamic_tool_names),
             .blocked, .provider_executed => null,
         };
+        var hook_stop_reason: ?[]const u8 = null;
+        // One permission hint per prepared call, by its index; calls that no hook answered keep `.none`.
+        const hook_permissions = try arena.alloc(runtime_user_hooks.PermissionHint, prepared_tool_calls.len);
+        @memset(hook_permissions, .none);
+        // The step's hook mode; the PermissionRequest callback reads it when a prompt comes up.
+        const hook_mode = permissionModeForAction(job.permission_mode, snapshotRootPermissionMode(deps), null);
+        user_hooks.mode = hook_mode;
+        if (user_hooks.active()) {
+            for (prepared_tool_calls, toolbox_subjects, 0..) |*prepared, *subject, call_index| {
+                const applied = try user_hooks.preToolUse(arena, hook_mode, prepared, subject);
+                hook_permissions[call_index] = applied.permission;
+                if (hook_stop_reason == null) hook_stop_reason = applied.stop_reason;
+                if (config.cancel_flag.load(.seq_cst)) break;
+            }
+        }
         const effective_tool_calls = try arena.alloc(
             ToolCall,
             prepared_tool_calls.len,
@@ -10866,6 +11050,7 @@ fn processQueuedPromptLoop(
                 .evaluated_endpoints = context_delivery_state.evaluated_endpoints.items,
                 .remind_sources = remind_sources.items,
                 .context_limits = config.context_limits,
+                .instruction_filter = instruction_filter_state.filter(),
             }) catch |err| {
                 return settleFailedContextGate(
                     deps,
@@ -10908,6 +11093,7 @@ fn processQueuedPromptLoop(
                             config,
                             &context_delivery_state,
                             candidate,
+                            &instruction_filter_state,
                         ) catch |err| {
                             if (config.cancel_flag.load(.seq_cst)) break :context_probes;
                             return settleFailedContextGate(
@@ -11006,7 +11192,11 @@ fn processQueuedPromptLoop(
         var step_batch = runtime_tool_batch.StepBatchState{
             .observer = deps.observer,
             .identical_failure_escalation = &identical_failure_escalation,
+            .user_hooks = &user_hooks,
         };
+        step_batch.stop_reason = hook_stop_reason;
+        for (user_hooks.pending_notes.items) |note| try runtime_tool_batch.appendToolNotice(arena, &step_batch, note);
+        user_hooks.pending_notes.clearRetainingCapacity();
         terminal_validation_retry.beginBatch();
         shell_execution_failure_retry.beginBatch();
         malformed_arguments_retry.beginBatch();
@@ -11186,7 +11376,7 @@ fn processQueuedPromptLoop(
                         null;
                     const parallel_review_attempt_available = root_action_permission_mode != .auto or
                         turn_review_cache.reviewAttemptAvailable(parallel_call);
-                    const parallel_review_context = buildReviewTurnContext(
+                    var parallel_review_context = buildReviewTurnContext(
                         config,
                         successful_gateway_model,
                         root_user_intent_context,
@@ -11196,6 +11386,8 @@ fn processQueuedPromptLoop(
                         parallel_call.id,
                         parallel_review_attempt_available,
                     );
+                    parallel_review_context.hook_permission = hook_permissions[tool_call_index + group_index];
+                    parallel_review_context.permission_request_hook = user_hooks.permissionRequestHook();
                     if (parallel_preserved_review_hold) |hold| {
                         debug_trace.eventf(
                             "permission",
@@ -11248,7 +11440,10 @@ fn processQueuedPromptLoop(
                     if (decision.isDenied()) {
                         const reason = permission_outcome.denial_reason orelse
                             decision.denialReason() orelse .user_denied;
-                        try turn_review_cache.remember(
+                        // A PermissionDenied retry leaves the denial uncached, so the next try is reviewed again.
+                        const hook_retry = (reason == .auto_denied or reason == .review_caution or reason == .review_evidence_incomplete) and
+                            user_hooks.permissionDenied(arena, parallel_call, @tagName(reason));
+                        if (!hook_retry) try turn_review_cache.remember(
                             arena,
                             parallel_call,
                             permission_outcome,
@@ -11277,6 +11472,11 @@ fn processQueuedPromptLoop(
                             .model_output = denied_output,
                             .tool_result_memory = reviewFeedbackMemory(reason, denied_output),
                         };
+                        if (hook_retry) try runtime_tool_batch.appendToolNotice(
+                            arena,
+                            &step_batch,
+                            try runtime_user_hooks.deniedRetryNote(arena, parallel_call.name),
+                        );
                         continue;
                     }
 
@@ -12143,7 +12343,7 @@ fn processQueuedPromptLoop(
                 tool_call;
             const review_attempt_available = action_permission_mode != .auto or
                 turn_review_cache.reviewAttemptAvailable(execution_call);
-            const review_context = buildReviewTurnContext(
+            var review_context = buildReviewTurnContext(
                 config,
                 successful_gateway_model,
                 root_user_intent_context,
@@ -12153,6 +12353,8 @@ fn processQueuedPromptLoop(
                 execution_call.id,
                 review_attempt_available,
             );
+            review_context.hook_permission = hook_permissions[tool_call_index];
+            review_context.permission_request_hook = user_hooks.permissionRequestHook();
             const tool_execution_root_user_context = try buildToolExecutionRootUserContext(
                 call_allocator,
                 root_user_intent_context,
@@ -12407,7 +12609,7 @@ fn processQueuedPromptLoop(
                     tool_call,
                     prepared_failure.model_output,
                     prepared_failure.memory,
-                    .{ .increment_error = true },
+                    .{ .increment_error = true, .post_hook = true },
                 );
                 // A permission-stage tool_failure ran the tool's preflight
                 // content checks and failed them; record a tool failure.
@@ -12440,7 +12642,10 @@ fn processQueuedPromptLoop(
                 }
                 const reason = permission_outcome.denial_reason orelse
                     decision.denialReason() orelse .user_denied;
-                try turn_review_cache.remember(
+                // A PermissionDenied retry leaves the denial uncached, so the next try is reviewed again.
+                const hook_retry = (reason == .auto_denied or reason == .review_caution or reason == .review_evidence_incomplete) and
+                    user_hooks.permissionDenied(arena, execution_call, @tagName(reason));
+                if (!hook_retry) try turn_review_cache.remember(
                     arena,
                     tool_call,
                     permission_outcome,
@@ -12497,6 +12702,11 @@ fn processQueuedPromptLoop(
                         &.{feedback},
                     );
                 }
+                if (hook_retry) try runtime_tool_batch.appendToolNotice(
+                    arena,
+                    &step_batch,
+                    try runtime_user_hooks.deniedRetryNote(arena, tool_call.name),
+                );
                 try runtime_tool_admission.recordRejectedToolCall(
                     deps,
                     arena,
@@ -13098,6 +13308,14 @@ fn processQueuedPromptLoop(
             }
         }
 
+        if (user_hooks.active()) {
+            // The user's PostToolBatch hooks see every call of this step, named as the per-call hooks name them.
+            const hook_batch_calls = try arena.alloc(ToolCall, effective_tool_calls.len);
+            for (hook_batch_calls, effective_tool_calls, 0..) |*hook_call, effective_call, call_index| {
+                hook_call.* = toolbox_subjects[call_index] orelse effective_call;
+            }
+            user_hooks.postToolBatch(arena, &step_batch, hook_batch_calls);
+        }
         try runtime_tool_batch.drainPendingUserSuffix(
             arena,
             &step_batch,
@@ -13111,6 +13329,34 @@ fn processQueuedPromptLoop(
                 .{ .valid = settled_vision_ids.items },
             );
             pending_image_ids = transition.pending_ids;
+        }
+        if (step_batch.stop_reason) |hook_reason| {
+            const hook_notice = try runtime_user_hooks.stopNoticeText(arena, hook_reason);
+            deps.pushHookNotice(.warning, hook_notice) catch |err| debug_trace.logf("hooks", "dropped hook notice: {s}", .{@errorName(err)});
+            const assistant_text: runtime_finalization.TerminalText = .{ .history = "", .presentation = if (stop_state.retained_candidate != null)
+                try hooks.prompt.joinVisibleSegments(
+                    arena,
+                    stop_state.retained_candidate,
+                    stop_state.latest_partial,
+                )
+            else
+                null };
+            stop_state.terminal_materializing = true;
+            try finishCommonAssistantTerminal(
+                deps,
+                finalization,
+                arena,
+                job,
+                within_turn_suffix.items,
+                &summary_accumulator,
+                assistant_text,
+                .completed,
+                null,
+                &finish_trace,
+                "hook_stop",
+                null,
+            );
+            return;
         }
         try runtime_tool_batch.appendReviewContinuationSuffix(
             config.review_enabled,
@@ -13207,14 +13453,25 @@ fn processQueuedPromptLoop(
             const final_text = try runtime_assistant_stream.normalizeAssistantTextForDisplay(arena, raw_final);
             const rendered = if (final_text.len > 0) final_text else "Done.";
 
+            // The user's Stop hooks judge the reply first when fx's own Stop has nothing to run, so a reply they let
+            // end follows the normal steering and finish path below. Only a continue request takes the open branch.
+            var user_stop_message: ?[]const u8 = null;
+            if (!(lifecycle.view.hasStop() and !stop_state.dispatched) and
+                user_hooks.stopPending(stop_state.user_stop_continuations, stop_state.user_stop_done))
+            {
+                if (agent_steps.allowsStep(config.agent_step_limit, step + 1))
+                    user_stop_message = user_hooks.stop(arena, rendered, stop_state.user_stop_continuations);
+                if (user_stop_message == null) stop_state.user_stop_done = true;
+            }
+
             if (agent_steps.allowsStep(config.agent_step_limit, step + 1) and
-                try append_pending_steering_after_assistant(deps, arena, &within_turn_suffix, turn_id, raw_final, final_provider_replay, if (!lifecycle.view.hasStop() or stop_state.dispatched) .finalizing else .model))
+                try append_pending_steering_after_assistant(deps, arena, &within_turn_suffix, turn_id, raw_final, final_provider_replay, if (stopGateClosed(lifecycle, stop_state, &user_hooks)) .finalizing else .model))
             {
                 try deps.push_text(deps.ctx, .{ .assistant_rendered = "\n" });
                 continue;
             }
 
-            if (!lifecycle.view.hasStop() or stop_state.dispatched) {
+            if (stopGateClosed(lifecycle, stop_state, &user_hooks)) {
                 try deps.push_text(deps.ctx, .{ .assistant_rendered = "\n" });
 
                 const history_text = try arena.dupe(u8, raw_final);
@@ -13266,7 +13523,9 @@ fn processQueuedPromptLoop(
             stop_state.latest_partial = null;
             try deps.push_text(deps.ctx, .{ .assistant_rendered = "\n" });
 
-            var stop_outcome = runtime_lifecycle.dispatchStopCheckpoint(
+            // fx's own Stop runs only when a Stop hook exists and has not run for this turn.
+            var stop_outcome: hooks.StopOutcome = .allow;
+            if (lifecycle.view.hasStop() and !stop_state.dispatched) stop_outcome = runtime_lifecycle.dispatchStopCheckpoint(
                 lifecycle,
                 config.cancel_flag,
                 .{
@@ -13315,6 +13574,21 @@ fn processQueuedPromptLoop(
                     if (agent_steps.allowsStep(config.agent_step_limit, step + 1) and
                         try continue_steering_after_stop(deps, arena, &within_turn_suffix, turn_id, stop_state))
                         continue :agent_steps_loop;
+                    // A continue request from the user's Stop hooks. It is asked here only when fx's own Stop ran first.
+                    const message = user_stop_message orelse if (agent_steps.allowsStep(config.agent_step_limit, step + 1))
+                        user_hooks.stop(arena, rendered, stop_state.user_stop_continuations)
+                    else
+                        null;
+                    if (message) |text| {
+                        stop_state.user_stop_continuations += 1;
+                        try within_turn_suffix.append(arena, .{
+                            .role = .user,
+                            .content = text,
+                            .recovery_prompt = true,
+                        });
+                        continue :agent_steps_loop;
+                    }
+                    stop_state.user_stop_done = true;
                     stop_state.terminal_materializing = true;
                     try finishCommonAssistantTerminal(
                         deps,

@@ -281,6 +281,8 @@ pub const State = struct {
         if (self.rawProviderPickerQuery(editor) != null) return null;
         const command_text = std.mem.trimStart(u8, editor.input.items, " \t\r\n");
         if (tokenMatchesAt(command_text, 0, "/mcp")) return null;
+        if (tokenMatchesAt(command_text, 0, "/hook")) return null;
+        if (tokenMatchesAt(command_text, 0, "/hooks")) return null;
         return findFilePickerQuery(editor.input.items, editor.cursor);
     }
 

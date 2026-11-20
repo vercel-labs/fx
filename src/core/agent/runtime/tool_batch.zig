@@ -16,6 +16,7 @@ const runtime_telemetry = @import("telemetry.zig");
 const runtime_tool_admission = @import("tool_admission.zig");
 const runtime_tool_contracts = @import("tool_contracts.zig");
 const runtime_tool_presentation = @import("tool_presentation.zig");
+const runtime_user_hooks = @import("user_hooks.zig");
 
 const Allocator = std.mem.Allocator;
 const ChatMessage = types.ChatMessage;
@@ -39,6 +40,10 @@ pub const StepBatchState = struct {
     /// Turn-scoped identical-failure tracker owned by the orchestrator step
     /// loop. Null disables escalation (tests and non-turn callers).
     identical_failure_escalation: ?*runtime_tool_admission.IdenticalFailureEscalationState = null,
+    /// Set when a hook asked to end the turn; the turn ends after this step.
+    stop_reason: ?[]const u8 = null,
+    /// The turn's user hooks, which see each executed tool's result; null in tests and outside a turn.
+    user_hooks: ?*runtime_user_hooks.TurnHooks = null,
 
     pub fn allToolResultsFailed(self: StepBatchState) bool {
         return self.step_total_count > 0 and self.step_error_count == self.step_total_count;
@@ -51,6 +56,8 @@ pub const ToolResultAccounting = struct {
     record_completion: bool = false,
     mark_write: bool = false,
     status: ?types.PersistedToolStatus = null,
+    /// The tool ran, so the user's post-tool hooks see this result.
+    post_hook: bool = false,
 };
 
 pub fn appendAssistantToolCallStep(
@@ -82,15 +89,31 @@ pub fn appendToolResultContent(
     if (accounting.increment_error) batch.step_error_count += 1;
     if (accounting.mark_write) batch.step_had_writes = true;
     var content = model_output;
+    var result_memory = memory;
+    const result_status: types.PersistedToolStatus = accounting.status orelse
+        if (accounting.increment_error) .failure else .success;
+    // A post-tool hook sees the tool's own output and may replace it, before escalation.
+    if (accounting.post_hook) {
+        if (batch.user_hooks) |hooks| {
+            const applied = hooks.postToolResult(arena, batch, tool_call, model_output, result_status == .success);
+            if (applied.replaced) {
+                // The saved copy of the tool's output is dropped, so resume cannot send the original.
+                debug_trace.logf("hooks", "post-tool hook replaced the output of {s}; its saved memory is dropped", .{tool_call.name});
+                content = applied.output;
+                result_memory = null;
+            }
+        }
+    }
     // Only well-formed calls escalate: malformed-argument rejections never
-    // execute and already have their own hard-stop path.
+    // execute and already have their own hard-stop path. Escalation adds to the
+    // final output, so a hook's replacement keeps the escalation text.
     if (tool_call.argument_integrity == .valid) {
         if (batch.identical_failure_escalation) |escalation| {
             const failure_count = try escalation.observe(arena, tool_call, accounting.increment_error);
             if (failure_count >= 2) {
                 content = try runtime_tool_admission.appendIdenticalFailureEscalation(
                     arena,
-                    model_output,
+                    content,
                     failure_count,
                 );
             }
@@ -101,9 +124,8 @@ pub fn appendToolResultContent(
         .content = content,
         .tool_call_id = tool_call.id,
         .tool_name = tool_call.calledName(),
-        .tool_result_status = accounting.status orelse
-            if (accounting.increment_error) .failure else .success,
-        .tool_result_memory = memory,
+        .tool_result_status = result_status,
+        .tool_result_memory = result_memory,
         .tool_result_created_at_ms = io_mod.milliTimestamp(),
     });
     if (accounting.record_completion) {
@@ -112,7 +134,7 @@ pub fn appendToolResultContent(
     if (batch.observer) |observer| observer.emit(.{ .tool_result = .{
         .call = tool_call,
         .output = content,
-        .status = accounting.status orelse if (accounting.increment_error) .failure else .success,
+        .status = result_status,
     } });
 }
 
@@ -335,6 +357,7 @@ pub fn assembleParallelToolResults(
             .{
                 .increment_error = execution.status == .failure or tool_result_errors.isToolOutputError(safe_tool_output),
                 .record_completion = execution.status == .success,
+                .post_hook = precomputed == null,
                 .status = runtime_execution_memory.persistedStatusForCurrentFxLocalResult(
                     execution.status,
                     safe_tool_output,
@@ -408,22 +431,36 @@ pub fn processCommittedFileResult(
         );
         break :blk null;
     };
+    const result_status = runtime_execution_memory.persistedStatusForCurrentFxLocalResult(
+        execution.status,
+        model_output,
+    );
+    // A post-tool hook sees the committed file's result and may replace it. The file is
+    // already written, so nothing before the append below may return an error.
+    var content = model_output;
+    var message_memory: ?types.ToolResultMemory = prepared_memory;
+    if (batch.user_hooks) |user_hooks| {
+        const applied = user_hooks.postToolResult(history_allocator, batch, tool_call, model_output, result_status == .success);
+        if (applied.replaced) {
+            // The saved copy of the tool's output is dropped, so resume cannot send the original.
+            debug_trace.logf("hooks", "post-tool hook replaced the output of {s}; its saved memory is dropped", .{tool_call.name});
+            content = applied.output;
+            message_memory = null;
+        }
+    }
     within_turn_suffix.appendAssumeCapacity(.{
         .role = .tool,
-        .content = model_output,
+        .content = content,
         .tool_call_id = tool_call.id,
         .tool_name = tool_call.calledName(),
-        .tool_result_status = runtime_execution_memory.persistedStatusForCurrentFxLocalResult(
-            execution.status,
-            model_output,
-        ),
-        .tool_result_memory = prepared_memory,
+        .tool_result_status = result_status,
+        .tool_result_memory = message_memory,
         .tool_result_created_at_ms = io_mod.milliTimestamp(),
     });
     if (batch.observer) |observer| observer.emit(.{ .tool_result = .{
         .call = tool_call,
-        .output = model_output,
-        .status = runtime_execution_memory.persistedStatusForCurrentFxLocalResult(execution.status, model_output),
+        .output = content,
+        .status = result_status,
     } });
     debug_trace.eventf(
         "tool",
@@ -561,6 +598,7 @@ pub fn appendOrdinaryExecutedResult(
                 execution.status,
                 model_output,
             ),
+            .post_hook = true,
         },
     );
 }

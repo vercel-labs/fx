@@ -64,6 +64,8 @@ pub const ShellAuthorizationSource = enum {
     auto_classifier,
     yolo,
     js_host,
+    /// A user's PreToolUse hook approved the call.
+    hook,
 };
 
 pub const CommandExecutionAuthority = union(enum) {

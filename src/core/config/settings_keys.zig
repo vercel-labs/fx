@@ -102,8 +102,9 @@ const status_line_child_descriptions = [_][]const u8{
     "Show the session title in the footer",
     "Show the workspace path and Git branch in the footer",
 };
-const experimental_children = [_][]const u8{"workspace_capture"};
+const experimental_children = [_][]const u8{ "hooks", "workspace_capture" };
 const experimental_child_descriptions = [_][]const u8{
+    "Run hooks from hook files; the interactive shell runs only hooks you trust",
     "Record the repository's state at each turn's start and end in the session, for evals",
 };
 const retired_description = "No longer used; fx ignores it";
@@ -424,6 +425,7 @@ test "project files ignore profile keys but not project-safe or retired ones" {
     try std.testing.expect(ignoredInProject("model"));
     try std.testing.expect(ignoredInProject("workspaces"));
     try std.testing.expect(ignoredInProject("enabledMcpjsonServers"));
+    try std.testing.expect(ignoredInProject("experimental"));
     try std.testing.expect(!ignoredInProject("max_agent_steps"));
     try std.testing.expect(!ignoredInProject("provider_order"));
     try std.testing.expect(!ignoredInProject("maxxing_mode"));

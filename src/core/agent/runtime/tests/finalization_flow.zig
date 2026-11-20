@@ -12,6 +12,11 @@ const test_support = @import("support.zig");
 const runtime_finalization = @import("../finalization.zig");
 const runtime_orchestrator = @import("../orchestrator.zig");
 const runtime_telemetry = @import("../telemetry.zig");
+const runtime_lifecycle = @import("../lifecycle.zig");
+const profile_paths = @import("../../../shared/profile_paths.zig");
+const runtime_user_hooks = @import("../user_hooks.zig");
+const hooks_host = @import("../../../hooks_host/hooks_host.zig");
+const hooks_engine = @import("../../../../hooks/hooks.zig");
 
 const ChatMessage = types.ChatMessage;
 const ToolCall = types.ToolCall;
@@ -632,6 +637,79 @@ test "a cancelled turn is reported before the commands steering detached are sto
     }
 }
 
+test "an Interrupt hook runs once when the user stops the turn" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var user_fixture = try UserStopFixture.init(alloc);
+    defer user_fixture.deinit(alloc);
+    // Each run appends a line, so the file shows how many times the hook ran.
+    const marker_path = try std.Io.Dir.path.join(arena, &.{ user_fixture.workspace, "interrupt_marker.txt" });
+    const hooks_json = try arena.print(
+        "{{\"hooks\":{{\"Interrupt\":[{{\"hooks\":[{{\"type\":\"command\",\"command\":\"echo ran >> '{s}'\"}}]}}]}}}}",
+        .{marker_path},
+    );
+    var runtime = try user_fixture.startRuntime(alloc, hooks_json);
+    defer runtime.deinit();
+
+    const completions = [_]FakeCompletion{.{ .cancel_before_output = true }};
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var deps = FakeAgentRuntimeDeps.init(alloc);
+    defer deps.deinit();
+    // The host says the cancel came from the user, not from steering.
+    deps.steering_detached_explicit_cancel = true;
+    var fixture = PromptFixture{};
+    var lifecycle = testLifecycleContext(lifecycle_hooks.RuntimeView.empty(), alloc, user_fixture.workspace);
+    lifecycle.user_hooks = &runtime;
+
+    try runFakePromptWithLifecycle(&gateway, &deps, fixture.config(), fixture.job(), lifecycle);
+
+    try std.testing.expectEqual(types.TurnPresentationOutcome.interrupted, deps.finalized_outcome.?);
+    const marker = try readTraceFile(alloc, marker_path, 4096);
+    defer alloc.free(marker);
+    try std.testing.expectEqualStrings("ran\n", marker);
+}
+
+test "an Interrupt hook does not run for a steering interruption" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var user_fixture = try UserStopFixture.init(alloc);
+    defer user_fixture.deinit(alloc);
+    const marker_path = try std.Io.Dir.path.join(arena, &.{ user_fixture.workspace, "interrupt_marker.txt" });
+    const hooks_json = try arena.print(
+        "{{\"hooks\":{{\"Interrupt\":[{{\"hooks\":[{{\"type\":\"command\",\"command\":\"echo ran >> '{s}'\"}}]}}]}}}}",
+        .{marker_path},
+    );
+    var runtime = try user_fixture.startRuntime(alloc, hooks_json);
+    defer runtime.deinit();
+
+    const completions = [_]FakeCompletion{.{ .cancel_before_output = true }};
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var deps = FakeAgentRuntimeDeps.init(alloc);
+    defer deps.deinit();
+    // The host says steering ended the turn, so the cancel is not the user's.
+    deps.steering_detached_explicit_cancel = false;
+    var fixture = PromptFixture{};
+    var lifecycle = testLifecycleContext(lifecycle_hooks.RuntimeView.empty(), alloc, user_fixture.workspace);
+    lifecycle.user_hooks = &runtime;
+
+    try runFakePromptWithLifecycle(&gateway, &deps, fixture.config(), fixture.job(), lifecycle);
+
+    try std.testing.expectEqual(types.TurnPresentationOutcome.interrupted, deps.finalized_outcome.?);
+    const ran = if (readTraceFile(alloc, marker_path, 4096)) |marker| blk: {
+        alloc.free(marker);
+        break :blk true;
+    } else |_| false;
+    try std.testing.expect(!ran);
+}
+
 test "a turn that completes never asks to stop steering-detached commands" {
     const alloc = std.testing.allocator;
     const completions = [_]FakeCompletion{.{ .content = "Final" }};
@@ -990,6 +1068,571 @@ test "common Stop continues once with original history and joined presentation" 
         gateway.request_bodies.items[1],
         follow_gateway.request_bodies.items[0],
     );
+}
+
+/// A temp profile and workspace for a user hooks runtime, set up as the user-hook tests set them up.
+const UserStopFixture = struct {
+    tmp: std.testing.TmpDir,
+    home: []u8,
+    workspace: []u8,
+    env: std.process.Environ.Map,
+
+    fn init(alloc: std.mem.Allocator) !UserStopFixture {
+        var tmp = std.testing.tmpDir(.{});
+        errdefer tmp.cleanup();
+        try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+        try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+        const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+        errdefer alloc.free(home);
+        const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+        errdefer alloc.free(workspace);
+        var env = std.process.Environ.Map.init(alloc);
+        errdefer env.deinit();
+        try env.put("PATH", "/usr/bin:/bin");
+        return .{ .tmp = tmp, .home = home, .workspace = workspace, .env = env };
+    }
+
+    fn deinit(self: *UserStopFixture, alloc: std.mem.Allocator) void {
+        alloc.free(self.home);
+        alloc.free(self.workspace);
+        self.env.deinit();
+        self.tmp.cleanup();
+        self.* = undefined;
+    }
+
+    /// Writes the profile's hooks file, then starts a user hooks runtime that reads it.
+    fn startRuntime(self: *UserStopFixture, alloc: std.mem.Allocator, hooks_json: []const u8) !runtime_lifecycle.UserHooksRuntime {
+        const file_path = try profile_paths.rootPath(alloc, self.home, &.{"hooks.json"});
+        defer alloc.free(file_path);
+        try io_mod.writeFileAtomic(alloc, file_path, hooks_json);
+        try std.Io.Dir.cwd().setFilePermissions(io_mod.getIo(), file_path, std.Io.File.Permissions.fromMode(0o600), .{});
+        try self.trustHooks(alloc, hooks_json);
+        var runtime = try runtime_lifecycle.UserHooksRuntime.init(alloc, .{
+            .enabled = true,
+            .home = self.home,
+            .workspace_root = self.workspace,
+        });
+        runtime.native.base_env = &self.env;
+        runtime.refresh();
+        return runtime;
+    }
+
+    /// Trusts every hook in `hooks_json`, as `fx hook trust --all` does, so the runtime runs them. The digests
+    /// come from the trust API, and the file keeps the trust it already has.
+    fn trustHooks(self: *const UserStopFixture, alloc: std.mem.Allocator, hooks_json: []const u8) !void {
+        var parsed = try hooks_engine.config.parse(alloc, hooks_json, .{ .layer = .profile, .workspace_root = self.workspace });
+        defer parsed.deinit(alloc);
+        const trust_file = try hooks_host.trust.path(alloc, self.home);
+        defer alloc.free(trust_file);
+        var store = try hooks_host.trust.load(alloc, trust_file);
+        defer store.deinit(alloc);
+        for (parsed.hooks) |*hook| {
+            var named = try hooks_host.trust.namedFiles(alloc, hook.command, self.workspace, self.home);
+            defer named.deinit(alloc);
+            const value = try hooks_host.trust.digest(alloc, hook, self.workspace, named.files);
+            try store.add(alloc, value, hook.id);
+        }
+        try hooks_host.trust.save(alloc, trust_file, &store);
+    }
+};
+
+const overflow_model = "provider/context-overflow-recovery";
+const overflow_capabilities = [_]test_support.ModelCapabilityOverride{.{
+    .model = overflow_model,
+    .capabilities = .{ .context_window = 128_000, .max_output_tokens = 16_384 },
+}};
+const overflow_error_body = "{\"error\":{\"message\":\"AI_APICallError: Your input exceeds the context window of this model.\"}}";
+const overflow_completions = [_]FakeCompletion{
+    .{ .status = .bad_request, .err_body = overflow_error_body },
+    .{ .content = "Retain the completed prior turn and continue from it." },
+    .{ .content = "CONTEXT_OVERFLOW_RECOVERED" },
+};
+
+/// Runs a turn with one prior tool turn whose first request overflows the context window.
+/// The turn compacts once and retries, unless a PreCompact hook blocks the compaction.
+fn runOverflowTurn(gateway: *FakeGateway, deps: *FakeAgentRuntimeDeps, lifecycle: runtime_lifecycle.LifecycleContext) !void {
+    deps.available_capability_overrides = &overflow_capabilities;
+    var fixture = PromptFixture{};
+    var job = fixture.job();
+    job.model = @constCast(overflow_model);
+    var prior_calls = [_]ToolCall{toolCall("prior-read", "read_file", "{\"path\":\"notes.md\"}")};
+    var prior_results = [_]types.PersistedToolResult{.{
+        .tool_call_id = @constCast("prior-read"),
+        .tool_name = @constCast("read_file"),
+        .status = .success,
+        .output = @constCast("HOOK_PRIOR_TOOL_OUTPUT"),
+        .output_bytes = 22,
+        .stored_output_bytes = 22,
+    }};
+    var prior_steps = [_]types.ToolExecutionStep{.{ .tool_calls = &prior_calls, .tool_results = &prior_results }};
+    var history = [_]types.HistoryTurn{.{ .assistant = .{
+        .user = .{ .text = @constCast("HOOK_PRIOR_USER") },
+        .assistant = @constCast("HOOK_PRIOR_ASSISTANT"),
+        .execution = .{ .tool_steps = &prior_steps },
+    } }};
+    job.history = &history;
+    try runFakePromptWithLifecycle(gateway, deps, fixture.config(), job, lifecycle);
+}
+
+test "a PreCompact hook blocks an automatic compaction" {
+    const alloc = std.testing.allocator;
+    var user_fixture = try UserStopFixture.init(alloc);
+    defer user_fixture.deinit(alloc);
+    const marker = try std.Io.Dir.path.join(alloc, &.{ user_fixture.workspace, "block.txt" });
+    defer alloc.free(marker);
+    const command = try std.mem.concat(alloc, u8, &.{ "echo ran >> '", marker, "'; echo 'no compaction now' >&2; exit 2" });
+    defer alloc.free(command);
+    const hooks_json = try startEventHooksJson(alloc, "PreCompact", command);
+    defer alloc.free(hooks_json);
+    var runtime = try user_fixture.startRuntime(alloc, hooks_json);
+    defer runtime.deinit();
+    var gateway = FakeGateway.init(alloc, &overflow_completions);
+    defer gateway.deinit();
+    var deps = FakeAgentRuntimeDeps.init(alloc);
+    defer deps.deinit();
+    var lifecycle = testLifecycleContext(lifecycle_hooks.RuntimeView.empty(), alloc, user_fixture.workspace);
+    lifecycle.user_hooks = &runtime;
+    lifecycle.scope.session_id = "session-1";
+
+    // With the compaction blocked, the overflow stays unresolved and the turn fails before any retry.
+    runOverflowTurn(&gateway, &deps, lifecycle) catch |err| try std.testing.expect(err == error.ContextCapacityExceeded);
+    try std.testing.expectEqual(@as(usize, 1), gateway.request_bodies.items.len);
+    const written = try readHookOutput(alloc, &user_fixture, "workspace/block.txt");
+    defer alloc.free(written);
+    try std.testing.expectEqualStrings("ran\n", written);
+    var noticed = false;
+    for (deps.system_notices.items) |notice| {
+        if (std.mem.find(u8, notice, "A hook blocked this compaction") != null) noticed = true;
+    }
+    try std.testing.expect(noticed);
+    for (deps.history_turns.items) |turn| try std.testing.expect(turn != .compacted_summary);
+}
+
+test "PreCompact context reaches the summary request" {
+    const alloc = std.testing.allocator;
+    var user_fixture = try UserStopFixture.init(alloc);
+    defer user_fixture.deinit(alloc);
+    const hooks_json = try startEventHooksJson(alloc, "PreCompact", "printf '%s' 'keep the file names'");
+    defer alloc.free(hooks_json);
+    var runtime = try user_fixture.startRuntime(alloc, hooks_json);
+    defer runtime.deinit();
+    var gateway = FakeGateway.init(alloc, &overflow_completions);
+    defer gateway.deinit();
+    var deps = FakeAgentRuntimeDeps.init(alloc);
+    defer deps.deinit();
+    var lifecycle = testLifecycleContext(lifecycle_hooks.RuntimeView.empty(), alloc, user_fixture.workspace);
+    lifecycle.user_hooks = &runtime;
+    lifecycle.scope.session_id = "session-1";
+
+    try runOverflowTurn(&gateway, &deps, lifecycle);
+    // Request 1 is the summary request; the hook's context is its instructions.
+    try expectBodyContains(&gateway, 1, "Additional instructions for this summary:\\nkeep the file names");
+}
+
+test "a PostCompact hook runs once after a compaction" {
+    const alloc = std.testing.allocator;
+    var user_fixture = try UserStopFixture.init(alloc);
+    defer user_fixture.deinit(alloc);
+    const marker = try std.Io.Dir.path.join(alloc, &.{ user_fixture.workspace, "post.txt" });
+    defer alloc.free(marker);
+    const command = try std.mem.concat(alloc, u8, &.{ "printf '%s\\n' \"$(cat)\" >> '", marker, "'" });
+    defer alloc.free(command);
+    const hooks_json = try startEventHooksJson(alloc, "PostCompact", command);
+    defer alloc.free(hooks_json);
+    var runtime = try user_fixture.startRuntime(alloc, hooks_json);
+    defer runtime.deinit();
+    var gateway = FakeGateway.init(alloc, &overflow_completions);
+    defer gateway.deinit();
+    var deps = FakeAgentRuntimeDeps.init(alloc);
+    defer deps.deinit();
+    var lifecycle = testLifecycleContext(lifecycle_hooks.RuntimeView.empty(), alloc, user_fixture.workspace);
+    lifecycle.user_hooks = &runtime;
+    lifecycle.scope.session_id = "session-1";
+
+    try runOverflowTurn(&gateway, &deps, lifecycle);
+    // The overflow, the summary and the retry: three requests.
+    try std.testing.expectEqual(@as(usize, 3), gateway.request_bodies.items.len);
+    // Fails by name when the hook left no marker: the hook file did not load, or PostCompact did not run.
+    var marker_file = user_fixture.tmp.dir.openFile(io_mod.getIo(), "workspace/post.txt", .{}) catch |err| {
+        std.debug.print("PostCompact left no marker ({s}): its hook did not run after the committed compaction\n", .{@errorName(err)});
+        return error.PostCompactMarkerMissing;
+    };
+    defer marker_file.close(io_mod.getIo());
+    const written = try io_mod.readFileToEnd(alloc, &marker_file, 65536);
+    defer alloc.free(written);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, written, "\n"));
+    try std.testing.expect(std.mem.find(u8, written, "\"trigger\":\"auto\"") != null);
+}
+
+test "a PostModelSwitch note reaches the next turn once" {
+    const alloc = std.testing.allocator;
+    var user_fixture = try UserStopFixture.init(alloc);
+    defer user_fixture.deinit(alloc);
+    const hooks_json = try startEventHooksJson(alloc, "PostModelSwitch", "printf '%s' 'the new model is faster'");
+    defer alloc.free(hooks_json);
+    var runtime = try user_fixture.startRuntime(alloc, hooks_json);
+    defer runtime.deinit();
+    var lifecycle = testLifecycleContext(lifecycle_hooks.RuntimeView.empty(), alloc, user_fixture.workspace);
+    lifecycle.user_hooks = &runtime;
+    lifecycle.scope.session_id = "session-1";
+
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    _ = runtime_user_hooks.postModelSwitch(lifecycle, arena_state.allocator(), "provider/a", "provider/b");
+
+    var gateway = FakeGateway.init(alloc, &.{ .{ .content = "first" }, .{ .content = "second" } });
+    defer gateway.deinit();
+    var deps = FakeAgentRuntimeDeps.init(alloc);
+    defer deps.deinit();
+    var fixture = PromptFixture{};
+    try runFakePromptWithLifecycle(&gateway, &deps, fixture.config(), fixture.job(), lifecycle);
+    try expectBodyContains(&gateway, 0, "the new model is faster");
+    try runFakePromptWithLifecycle(&gateway, &deps, fixture.config(), fixture.job(), lifecycle);
+    try expectBodyNotContains(&gateway, 1, "the new model is faster");
+}
+
+/// Asks for one more turn only while the check is not already a continuation.
+const stop_continue_once_script =
+    \\input=$(cat)
+    \\case "$input" in
+    \\  *'"stop_hook_active":true'*) printf '%s' '{}' ;;
+    \\  *) printf '%s' '{"decision":"block","reason":"check the tests"}' ;;
+    \\esac
+    \\
+;
+
+/// A Stop hook that always asks for another turn.
+const stop_always_continue_file =
+    \\{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"printf '%s' '{\"decision\":\"block\",\"reason\":\"again\"}'"}]}]}}
+;
+
+/// How many times `needle` appears in a saved assistant turn: its reply and the text of each tool step.
+fn countInSavedAssistant(turn: types.AssistantHistoryTurn, needle: []const u8) usize {
+    var total = countNeedle(turn.assistant, needle);
+    for (turn.execution.tool_steps) |step| {
+        if (step.assistant) |text| total += countNeedle(text, needle);
+    }
+    return total;
+}
+
+test "a user Stop hook makes the turn continue once" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var user_fixture = try UserStopFixture.init(alloc);
+    defer user_fixture.deinit(alloc);
+    const script_path = try std.Io.Dir.path.join(arena, &.{ user_fixture.workspace, "stop.sh" });
+    try io_mod.writeFileAtomic(alloc, script_path, stop_continue_once_script);
+    const hooks_json = try arena.print(
+        "{{\"hooks\":{{\"Stop\":[{{\"hooks\":[{{\"type\":\"command\",\"command\":\"sh '{s}'\"}}]}}]}}}}",
+        .{script_path},
+    );
+    var runtime = try user_fixture.startRuntime(alloc, hooks_json);
+    defer runtime.deinit();
+
+    var gateway = FakeGateway.init(alloc, &.{
+        .{ .content = "first reply" },
+        .{ .content = "second reply" },
+    });
+    defer gateway.deinit();
+    var deps = FakeAgentRuntimeDeps.init(alloc);
+    defer deps.deinit();
+    var fixture = PromptFixture{};
+    var lifecycle = testLifecycleContext(lifecycle_hooks.RuntimeView.empty(), alloc, user_fixture.workspace);
+    lifecycle.user_hooks = &runtime;
+
+    try runFakePromptWithLifecycle(&gateway, &deps, fixture.config(), fixture.job(), lifecycle);
+
+    try std.testing.expectEqual(@as(usize, 2), gateway.request_bodies.items.len);
+    try expectBodyContains(&gateway, 1, "check the tests");
+    try std.testing.expectEqualStrings("second reply", deps.history_turns.items[0].assistant.assistant);
+    // The first reply is saved once, in the turn's tool steps, not again as the final reply.
+    try std.testing.expectEqual(@as(usize, 1), countInSavedAssistant(deps.history_turns.items[0].assistant, "first reply"));
+}
+
+test "a user Stop hook continues at most three times per turn" {
+    const alloc = std.testing.allocator;
+    var user_fixture = try UserStopFixture.init(alloc);
+    defer user_fixture.deinit(alloc);
+    var runtime = try user_fixture.startRuntime(alloc, stop_always_continue_file);
+    defer runtime.deinit();
+
+    var gateway = FakeGateway.init(alloc, &.{
+        .{ .content = "reply 1" },
+        .{ .content = "reply 2" },
+        .{ .content = "reply 3" },
+        .{ .content = "reply 4" },
+        .{ .content = "reply 5" },
+    });
+    defer gateway.deinit();
+    var deps = FakeAgentRuntimeDeps.init(alloc);
+    defer deps.deinit();
+    var fixture = PromptFixture{};
+    var lifecycle = testLifecycleContext(lifecycle_hooks.RuntimeView.empty(), alloc, user_fixture.workspace);
+    lifecycle.user_hooks = &runtime;
+
+    try runFakePromptWithLifecycle(&gateway, &deps, fixture.config(), fixture.job(), lifecycle);
+
+    // One model call for the first reply and one for each of the three continuations.
+    try std.testing.expectEqual(@as(usize, 4), gateway.request_bodies.items.len);
+    try std.testing.expectEqualStrings("reply 4", deps.history_turns.items[0].assistant.assistant);
+}
+
+test "a user Stop hook makes a terminal completion continue once" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var user_fixture = try UserStopFixture.init(alloc);
+    defer user_fixture.deinit(alloc);
+    const script_path = try std.Io.Dir.path.join(arena, &.{ user_fixture.workspace, "stop.sh" });
+    try io_mod.writeFileAtomic(alloc, script_path, stop_continue_once_script);
+    const hooks_json = try arena.print(
+        "{{\"hooks\":{{\"Stop\":[{{\"hooks\":[{{\"type\":\"command\",\"command\":\"sh '{s}'\"}}]}}]}}}}",
+        .{script_path},
+    );
+    var runtime = try user_fixture.startRuntime(alloc, hooks_json);
+    defer runtime.deinit();
+
+    // The first reply ran a provider tool and stops, so it is a terminal provider completion.
+    const provider_calls = [_]ToolCall{.{
+        .id = "call_search",
+        .name = "perplexity_search",
+        .arguments_json = "{}",
+        .provider_result = "search result",
+        .provenance = .provider_executed,
+    }};
+    var gateway = FakeGateway.init(alloc, &.{
+        .{ .content = "candidate", .tool_calls = &provider_calls, .finish_reason = .stop },
+        .{ .content = "final" },
+    });
+    defer gateway.deinit();
+    var deps = FakeAgentRuntimeDeps.init(alloc);
+    defer deps.deinit();
+    var fixture = PromptFixture{};
+    var lifecycle = testLifecycleContext(lifecycle_hooks.RuntimeView.empty(), alloc, user_fixture.workspace);
+    lifecycle.user_hooks = &runtime;
+
+    try runFakePromptWithLifecycle(&gateway, &deps, fixture.config(), fixture.job(), lifecycle);
+
+    try std.testing.expectEqual(@as(usize, 2), gateway.request_bodies.items.len);
+    try expectBodyContains(&gateway, 1, "check the tests");
+    try std.testing.expectEqualStrings("final", deps.history_turns.items[0].assistant.assistant);
+    // The first reply is saved once, in the turn's tool steps, not again as the final reply.
+    try std.testing.expectEqual(@as(usize, 1), countInSavedAssistant(deps.history_turns.items[0].assistant, "candidate"));
+}
+
+test "a UserPromptSubmit hook blocks a prompt before the model" {
+    const alloc = std.testing.allocator;
+    var user_fixture = try UserStopFixture.init(alloc);
+    defer user_fixture.deinit(alloc);
+    var runtime = try user_fixture.startRuntime(alloc,
+        \\{"hooks":{"UserPromptSubmit":[{"hooks":[{"type":"command","command":"printf '%s' 'no secrets' >&2; exit 2"}]}]}}
+    );
+    defer runtime.deinit();
+    var gateway = FakeGateway.init(alloc, &.{.{ .content = "unused" }});
+    defer gateway.deinit();
+    var deps = FakeAgentRuntimeDeps.init(alloc);
+    defer deps.deinit();
+    var fixture = PromptFixture{};
+    var lifecycle = testLifecycleContext(lifecycle_hooks.RuntimeView.empty(), alloc, user_fixture.workspace);
+    lifecycle.user_hooks = &runtime;
+
+    try runFakePromptWithLifecycle(&gateway, &deps, fixture.config(), fixture.job(), lifecycle);
+
+    try std.testing.expectEqual(@as(usize, 0), gateway.request_bodies.items.len);
+    try std.testing.expectEqual(@as(usize, 1), deps.system_notices.items.len);
+    try std.testing.expectEqualStrings("A hook blocked this prompt: no secrets", deps.system_notices.items[0]);
+    try std.testing.expectEqual(@as(usize, 0), deps.history_turns.items.len);
+    try std.testing.expectEqual(types.TurnPresentationOutcome.failed, deps.finalized_outcome.?);
+}
+
+test "a UserPromptSubmit hook rewrites the prompt the model sees" {
+    const alloc = std.testing.allocator;
+    var user_fixture = try UserStopFixture.init(alloc);
+    defer user_fixture.deinit(alloc);
+    var runtime = try user_fixture.startRuntime(alloc,
+        \\{"hooks":{"UserPromptSubmit":[{"hooks":[{"type":"command","command":"printf '%s' '{\"hookSpecificOutput\":{\"hookEventName\":\"UserPromptSubmit\",\"updatedPrompt\":\"say hi\"}}'"}]}]}}
+    );
+    defer runtime.deinit();
+    var gateway = FakeGateway.init(alloc, &.{.{ .content = "answer" }});
+    defer gateway.deinit();
+    var deps = FakeAgentRuntimeDeps.init(alloc);
+    defer deps.deinit();
+    var fixture = PromptFixture{};
+    var job = fixture.job();
+    job.prompt = @constCast("ORIGINAL_PROMPT_42");
+    var lifecycle = testLifecycleContext(lifecycle_hooks.RuntimeView.empty(), alloc, user_fixture.workspace);
+    lifecycle.user_hooks = &runtime;
+
+    try runFakePromptWithLifecycle(&gateway, &deps, fixture.config(), job, lifecycle);
+
+    try std.testing.expectEqual(@as(usize, 1), gateway.request_bodies.items.len);
+    try std.testing.expect(std.mem.find(u8, gateway.request_bodies.items[0], "say hi") != null);
+    try std.testing.expect(std.mem.find(u8, gateway.request_bodies.items[0], "ORIGINAL_PROMPT_42") == null);
+}
+
+test "a UserPromptSubmit hook adds context only to the model's message" {
+    const alloc = std.testing.allocator;
+    var user_fixture = try UserStopFixture.init(alloc);
+    defer user_fixture.deinit(alloc);
+    var runtime = try user_fixture.startRuntime(alloc,
+        \\{"hooks":{"UserPromptSubmit":[{"hooks":[{"type":"command","command":"printf '%s' 'use British spelling'"}]}]}}
+    );
+    defer runtime.deinit();
+    var gateway = FakeGateway.init(alloc, &.{.{ .content = "answer" }});
+    defer gateway.deinit();
+    var deps = FakeAgentRuntimeDeps.init(alloc);
+    defer deps.deinit();
+    var fixture = PromptFixture{};
+    var job = fixture.job();
+    job.prompt = @constCast("my prompt");
+    var lifecycle = testLifecycleContext(lifecycle_hooks.RuntimeView.empty(), alloc, user_fixture.workspace);
+    lifecycle.user_hooks = &runtime;
+
+    try runFakePromptWithLifecycle(&gateway, &deps, fixture.config(), job, lifecycle);
+
+    try expectBodyContains(&gateway, 0, "use British spelling");
+    try expectBodyContains(&gateway, 0, "UserPromptSubmit");
+    try std.testing.expectEqualStrings("my prompt", deps.history_turns.items[0].assistant.user.text);
+}
+
+test "UserPromptSubmit does not run for a subagent turn" {
+    const alloc = std.testing.allocator;
+    var user_fixture = try UserStopFixture.init(alloc);
+    defer user_fixture.deinit(alloc);
+    var runtime = try user_fixture.startRuntime(alloc,
+        \\{"hooks":{"UserPromptSubmit":[{"hooks":[{"type":"command","command":"printf '%s' 'no secrets' >&2; exit 2"}]}]}}
+    );
+    defer runtime.deinit();
+    var gateway = FakeGateway.init(alloc, &.{.{ .content = "answer" }});
+    defer gateway.deinit();
+    var deps = FakeAgentRuntimeDeps.init(alloc);
+    defer deps.deinit();
+    var fixture = PromptFixture{};
+    var config = fixture.config();
+    config.origin = .subagent;
+    var lifecycle = testLifecycleContext(lifecycle_hooks.RuntimeView.empty(), alloc, user_fixture.workspace);
+    lifecycle.user_hooks = &runtime;
+
+    try runFakePromptWithLifecycle(&gateway, &deps, config, fixture.job(), lifecycle);
+
+    try std.testing.expectEqual(@as(usize, 1), gateway.request_bodies.items.len);
+    try std.testing.expectEqual(@as(usize, 0), deps.system_notices.items.len);
+}
+
+test "a UserPromptSubmit hook blocks a prompt with its reason" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var user_fixture = try UserStopFixture.init(alloc);
+    defer user_fixture.deinit(alloc);
+    var runtime = try user_fixture.startRuntime(alloc,
+        \\{"hooks":{"UserPromptSubmit":[{"hooks":[{"type":"command","command":"printf '%s' 'no secrets' >&2; exit 2"}]}]}}
+    );
+    defer runtime.deinit();
+    var fake = FakeAgentRuntimeDeps.init(alloc);
+    defer fake.deinit();
+    var runtime_deps = fake.deps();
+    var lifecycle = testLifecycleContext(lifecycle_hooks.RuntimeView.empty(), alloc, user_fixture.workspace);
+    lifecycle.user_hooks = &runtime;
+    var hooks = runtime_user_hooks.TurnHooks.init(lifecycle, &runtime_deps, 1, null);
+
+    const applied = hooks.userPromptSubmit(arena, "my prompt");
+    try std.testing.expectEqualStrings("A hook blocked this prompt: no secrets", applied.blocked_notice.?);
+    try std.testing.expect(applied.prompt == null);
+    try std.testing.expect(applied.context == null);
+}
+
+test "a UserPromptSubmit hook rewrites a prompt" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var user_fixture = try UserStopFixture.init(alloc);
+    defer user_fixture.deinit(alloc);
+    var runtime = try user_fixture.startRuntime(alloc,
+        \\{"hooks":{"UserPromptSubmit":[{"hooks":[{"type":"command","command":"printf '%s' '{\"hookSpecificOutput\":{\"hookEventName\":\"UserPromptSubmit\",\"updatedPrompt\":\"say hi\"}}'"}]}]}}
+    );
+    defer runtime.deinit();
+    var fake = FakeAgentRuntimeDeps.init(alloc);
+    defer fake.deinit();
+    var runtime_deps = fake.deps();
+    var lifecycle = testLifecycleContext(lifecycle_hooks.RuntimeView.empty(), alloc, user_fixture.workspace);
+    lifecycle.user_hooks = &runtime;
+    var hooks = runtime_user_hooks.TurnHooks.init(lifecycle, &runtime_deps, 1, null);
+
+    const applied = hooks.userPromptSubmit(arena, "my prompt");
+    try std.testing.expectEqualStrings("say hi", applied.prompt.?);
+    try std.testing.expect(applied.blocked_notice == null);
+    try std.testing.expect(applied.context == null);
+}
+
+test "a UserPromptSubmit hook adds framed context to the prompt" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var user_fixture = try UserStopFixture.init(alloc);
+    defer user_fixture.deinit(alloc);
+    var runtime = try user_fixture.startRuntime(alloc,
+        \\{"hooks":{"UserPromptSubmit":[{"hooks":[{"type":"command","command":"printf '%s' 'use British spelling'"}]}]}}
+    );
+    defer runtime.deinit();
+    var fake = FakeAgentRuntimeDeps.init(alloc);
+    defer fake.deinit();
+    var runtime_deps = fake.deps();
+    var lifecycle = testLifecycleContext(lifecycle_hooks.RuntimeView.empty(), alloc, user_fixture.workspace);
+    lifecycle.user_hooks = &runtime;
+    var hooks = runtime_user_hooks.TurnHooks.init(lifecycle, &runtime_deps, 1, null);
+
+    const applied = hooks.userPromptSubmit(arena, "my prompt");
+    try std.testing.expectEqualStrings(
+        "<hook-context event=\"UserPromptSubmit\">\nuse British spelling\n</hook-context>",
+        applied.context.?,
+    );
+    try std.testing.expect(applied.prompt == null);
+    try std.testing.expect(applied.blocked_notice == null);
+}
+
+test "a StopFailure hook sees a failed model request" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var user_fixture = try UserStopFixture.init(alloc);
+    defer user_fixture.deinit(alloc);
+    // The hook appends its input, so a second run would show up as a second copy.
+    const seen_path = try std.Io.Dir.path.join(arena, &.{ user_fixture.workspace, "stop_failure_input.json" });
+    const hooks_json = try arena.print(
+        "{{\"hooks\":{{\"StopFailure\":[{{\"hooks\":[{{\"type\":\"command\",\"command\":\"cat >> '{s}'\"}}]}}]}}}}",
+        .{seen_path},
+    );
+    var runtime = try user_fixture.startRuntime(alloc, hooks_json);
+    defer runtime.deinit();
+
+    var gateway = FakeGateway.init(alloc, &.{.{ .status = .bad_request, .err_body = "bad" }});
+    defer gateway.deinit();
+    var deps = FakeAgentRuntimeDeps.init(alloc);
+    defer deps.deinit();
+    var fixture = PromptFixture{};
+    var lifecycle = testLifecycleContext(lifecycle_hooks.RuntimeView.empty(), alloc, user_fixture.workspace);
+    lifecycle.user_hooks = &runtime;
+
+    try runFakePromptWithLifecycle(&gateway, &deps, fixture.config(), fixture.job(), lifecycle);
+
+    const seen = try readTraceFile(alloc, seen_path, 65536);
+    defer alloc.free(seen);
+    try std.testing.expectEqual(@as(usize, 1), countNeedle(seen, "\"hook_event_name\":\"StopFailure\""));
+    try std.testing.expect(std.mem.find(u8, seen, "\"status\":400") != null);
 }
 
 test "the next turn extends the request that carried a Stop hook's message" {
@@ -2478,4 +3121,198 @@ test "TurnFinalizationGuard runs PostTurnEnd after failed finish prompt publicat
     try std.testing.expectEqual(@as(u64, 9), hook_capture.turn_ids[0]);
     try std.testing.expectEqual(types.TurnPresentationOutcome.completed, hook_capture.outcomes[0]);
     try std.testing.expectEqual(@as(?types.ProviderCompletionDisposition, .completed), hook_capture.dispositions[0]);
+}
+
+/// A hooks file whose one hook for `event` runs `command`.
+/// The hook file that runs `command` for `event`. The command is escaped as a JSON string, so a
+/// command with quotes or backslashes still makes a file the loader can read.
+fn startEventHooksJson(alloc: std.mem.Allocator, event: []const u8, command: []const u8) ![]u8 {
+    var escaped: std.ArrayList(u8) = .empty;
+    defer escaped.deinit(alloc);
+    for (command) |byte| {
+        if (byte == '"' or byte == '\\') try escaped.append(alloc, '\\');
+        try escaped.append(alloc, byte);
+    }
+    return std.mem.concat(alloc, u8, &.{ "{\"hooks\":{\"", event, "\":[{\"hooks\":[{\"type\":\"command\",\"command\":\"", escaped.items, "\"}]}]}}" });
+}
+
+/// Reads what a test hook wrote, from under the fixture's tmp dir.
+fn readHookOutput(alloc: std.mem.Allocator, fixture: *UserStopFixture, name: []const u8) ![]u8 {
+    var file = try fixture.tmp.dir.openFile(io_mod.getIo(), name, .{});
+    defer file.close(io_mod.getIo());
+    return io_mod.readFileToEnd(alloc, &file, 65536);
+}
+
+test "a SessionStart hook adds context to every request of the session" {
+    const alloc = std.testing.allocator;
+    var user_fixture = try UserStopFixture.init(alloc);
+    defer user_fixture.deinit(alloc);
+    const marker = try std.Io.Dir.path.join(alloc, &.{ user_fixture.workspace, "start.txt" });
+    defer alloc.free(marker);
+    const command = try std.mem.concat(alloc, u8, &.{ "echo ran >> '", marker, "'; printf '%s' 'repo uses zig'" });
+    defer alloc.free(command);
+    const hooks_json = try startEventHooksJson(alloc, "SessionStart", command);
+    defer alloc.free(hooks_json);
+    var runtime = try user_fixture.startRuntime(alloc, hooks_json);
+    defer runtime.deinit();
+    var gateway = FakeGateway.init(alloc, &.{ .{ .content = "first" }, .{ .content = "second" } });
+    defer gateway.deinit();
+    var deps = FakeAgentRuntimeDeps.init(alloc);
+    defer deps.deinit();
+    var fixture = PromptFixture{};
+    var lifecycle = testLifecycleContext(lifecycle_hooks.RuntimeView.empty(), alloc, user_fixture.workspace);
+    lifecycle.user_hooks = &runtime;
+    lifecycle.scope.session_id = "session-1";
+
+    try runFakePromptWithLifecycle(&gateway, &deps, fixture.config(), fixture.job(), lifecycle);
+    try runFakePromptWithLifecycle(&gateway, &deps, fixture.config(), fixture.job(), lifecycle);
+
+    try expectBodyContains(&gateway, 0, "repo uses zig");
+    try expectBodyContains(&gateway, 1, "repo uses zig");
+    const written = try readHookOutput(alloc, &user_fixture, "workspace/start.txt");
+    defer alloc.free(written);
+    try std.testing.expectEqualStrings("ran\n", written);
+}
+
+test "SessionStart reports resume for a session that has history" {
+    const alloc = std.testing.allocator;
+    var user_fixture = try UserStopFixture.init(alloc);
+    defer user_fixture.deinit(alloc);
+    const copy = try std.Io.Dir.path.join(alloc, &.{ user_fixture.workspace, "start-input.json" });
+    defer alloc.free(copy);
+    const command = try std.mem.concat(alloc, u8, &.{ "cat > '", copy, "'" });
+    defer alloc.free(command);
+    const hooks_json = try startEventHooksJson(alloc, "SessionStart", command);
+    defer alloc.free(hooks_json);
+    var runtime = try user_fixture.startRuntime(alloc, hooks_json);
+    defer runtime.deinit();
+    var gateway = FakeGateway.init(alloc, &.{ .{ .content = "first" }, .{ .content = "second" } });
+    defer gateway.deinit();
+    var deps = FakeAgentRuntimeDeps.init(alloc);
+    defer deps.deinit();
+    var fixture = PromptFixture{};
+    var lifecycle = testLifecycleContext(lifecycle_hooks.RuntimeView.empty(), alloc, user_fixture.workspace);
+    lifecycle.user_hooks = &runtime;
+
+    // The first turn of session-1 saves one history turn. Session-2 then starts with that history.
+    lifecycle.scope.session_id = "session-1";
+    try runFakePromptWithLifecycle(&gateway, &deps, fixture.config(), fixture.job(), lifecycle);
+    try std.testing.expectEqual(@as(usize, 1), deps.history_turns.items.len);
+    var history = [_]types.HistoryTurn{deps.history_turns.items[0]};
+    var job = fixture.job();
+    job.history = &history;
+    lifecycle.scope.session_id = "session-2";
+    try runFakePromptWithLifecycle(&gateway, &deps, fixture.config(), job, lifecycle);
+
+    const input = try readHookOutput(alloc, &user_fixture, "workspace/start-input.json");
+    defer alloc.free(input);
+    try std.testing.expect(std.mem.find(u8, input, "\"source\":\"resume\"") != null);
+}
+
+test "a SubagentStart hook runs for a subagent turn" {
+    const alloc = std.testing.allocator;
+    var user_fixture = try UserStopFixture.init(alloc);
+    defer user_fixture.deinit(alloc);
+    const marker = try std.Io.Dir.path.join(alloc, &.{ user_fixture.workspace, "subagent-start.txt" });
+    defer alloc.free(marker);
+    const command = try std.mem.concat(alloc, u8, &.{ "echo ran >> '", marker, "'" });
+    defer alloc.free(command);
+    const hooks_json = try startEventHooksJson(alloc, "SubagentStart", command);
+    defer alloc.free(hooks_json);
+    var runtime = try user_fixture.startRuntime(alloc, hooks_json);
+    defer runtime.deinit();
+    var gateway = FakeGateway.init(alloc, &.{.{ .content = "answer" }});
+    defer gateway.deinit();
+    var deps = FakeAgentRuntimeDeps.init(alloc);
+    defer deps.deinit();
+    var fixture = PromptFixture{};
+    var config = fixture.config();
+    config.origin = .subagent;
+    var lifecycle = testLifecycleContext(lifecycle_hooks.RuntimeView.empty(), alloc, user_fixture.workspace);
+    lifecycle.user_hooks = &runtime;
+    lifecycle.scope.kind = .subagent;
+    lifecycle.scope.session_id = "child-1";
+
+    try runFakePromptWithLifecycle(&gateway, &deps, config, fixture.job(), lifecycle);
+
+    const written = try readHookOutput(alloc, &user_fixture, "workspace/subagent-start.txt");
+    defer alloc.free(written);
+    try std.testing.expectEqualStrings("ran\n", written);
+}
+
+/// The hook output is exactly one line: the hook's input, then the newline its `echo` adds.
+fn expectSingleLine(text: []const u8) !void {
+    try std.testing.expect(text.len > 0 and text[text.len - 1] == '\n');
+    try std.testing.expect(std.mem.find(u8, text[0 .. text.len - 1], "\n") == null);
+}
+
+test "model request hooks run around each model request" {
+    const alloc = std.testing.allocator;
+    var user_fixture = try UserStopFixture.init(alloc);
+    defer user_fixture.deinit(alloc);
+    const pre_path = try std.Io.Dir.path.join(alloc, &.{ user_fixture.workspace, "pre_model.txt" });
+    defer alloc.free(pre_path);
+    const post_path = try std.Io.Dir.path.join(alloc, &.{ user_fixture.workspace, "post_model.txt" });
+    defer alloc.free(post_path);
+    const pre_command = try std.mem.concat(alloc, u8, &.{ "cat >> '", pre_path, "'; echo >> '", pre_path, "'" });
+    defer alloc.free(pre_command);
+    const post_command = try std.mem.concat(alloc, u8, &.{ "cat >> '", post_path, "'; echo >> '", post_path, "'" });
+    defer alloc.free(post_command);
+    const hooks_json = try std.mem.concat(alloc, u8, &.{
+        "{\"hooks\":{\"PreModelRequest\":[{\"hooks\":[{\"type\":\"command\",\"command\":\"",
+        pre_command,
+        "\"}]}],\"PostModelRequest\":[{\"hooks\":[{\"type\":\"command\",\"command\":\"",
+        post_command,
+        "\"}]}]}}",
+    });
+    defer alloc.free(hooks_json);
+    var runtime = try user_fixture.startRuntime(alloc, hooks_json);
+    defer runtime.deinit();
+    var gateway = FakeGateway.init(alloc, &.{.{ .content = "answer" }});
+    defer gateway.deinit();
+    var deps = FakeAgentRuntimeDeps.init(alloc);
+    defer deps.deinit();
+    var fixture = PromptFixture{};
+    var lifecycle = testLifecycleContext(lifecycle_hooks.RuntimeView.empty(), alloc, user_fixture.workspace);
+    lifecycle.user_hooks = &runtime;
+
+    try runFakePromptWithLifecycle(&gateway, &deps, fixture.config(), fixture.job(), lifecycle);
+
+    const pre = try readHookOutput(alloc, &user_fixture, "workspace/pre_model.txt");
+    defer alloc.free(pre);
+    try expectSingleLine(pre);
+    try std.testing.expect(std.mem.find(u8, pre, "claude-opus-4.6") != null);
+    try std.testing.expect(std.mem.find(u8, pre, "\"message_count\":") != null);
+    const post = try readHookOutput(alloc, &user_fixture, "workspace/post_model.txt");
+    defer alloc.free(post);
+    try expectSingleLine(post);
+    try std.testing.expect(std.mem.find(u8, post, "\"outcome\":\"completed\"") != null);
+}
+
+test "a PostModelRequest hook sees a failed model request" {
+    const alloc = std.testing.allocator;
+    var user_fixture = try UserStopFixture.init(alloc);
+    defer user_fixture.deinit(alloc);
+    const post_path = try std.Io.Dir.path.join(alloc, &.{ user_fixture.workspace, "post_model.txt" });
+    defer alloc.free(post_path);
+    const post_command = try std.mem.concat(alloc, u8, &.{ "cat >> '", post_path, "'; echo >> '", post_path, "'" });
+    defer alloc.free(post_command);
+    const hooks_json = try startEventHooksJson(alloc, "PostModelRequest", post_command);
+    defer alloc.free(hooks_json);
+    var runtime = try user_fixture.startRuntime(alloc, hooks_json);
+    defer runtime.deinit();
+    var gateway = FakeGateway.init(alloc, &.{.{ .status = .bad_request, .err_body = "bad" }});
+    defer gateway.deinit();
+    var deps = FakeAgentRuntimeDeps.init(alloc);
+    defer deps.deinit();
+    var fixture = PromptFixture{};
+    var lifecycle = testLifecycleContext(lifecycle_hooks.RuntimeView.empty(), alloc, user_fixture.workspace);
+    lifecycle.user_hooks = &runtime;
+
+    try runFakePromptWithLifecycle(&gateway, &deps, fixture.config(), fixture.job(), lifecycle);
+
+    const post = try readHookOutput(alloc, &user_fixture, "workspace/post_model.txt");
+    defer alloc.free(post);
+    try std.testing.expect(std.mem.find(u8, post, "\"outcome\":\"") != null);
+    try std.testing.expect(std.mem.find(u8, post, "\"outcome\":\"completed\"") == null);
 }

@@ -205,6 +205,10 @@ pub const FileMutationPreflightRequest = struct {
     can_prompt: bool,
     session_permission_state: ?*const session_permission_state.State = null,
     prepare_permission_identity: bool = false,
+    /// A user's PreToolUse hook asked for a person: the change prompts even when rules, grants, or the mode would approve it.
+    hook_asks: bool = false,
+    /// A user's PreToolUse hook approved the call: the change is prepared even when no prompter is present, so the approval can bind to it.
+    hook_allows: bool = false,
 };
 
 pub const FileMutationPreparationRequest = struct {
@@ -496,7 +500,8 @@ pub fn preflightPreparedFileMutation(
     var policy_targets_owned = true;
     defer if (policy_targets_owned) policy_targets.deinitOwned(arena);
 
-    const edit_prompt_required = policy_targets.prompt_required;
+    // A hook's ask makes the change need a prompt, even when the policy and grants would approve it.
+    const edit_prompt_required = policy_targets.prompt_required or request.hook_asks;
     const read_requires_prompt =
         request.permission_mode != .yolo and
         try fileMutationEqualityDisclosureRequiresPrompt(
@@ -528,7 +533,8 @@ pub fn preflightPreparedFileMutation(
         policy_targets_owned = false;
         return .{ .allowed = authorization };
     }
-    if (!request.can_prompt and edit_prompt_required and equality_prompt_required) {
+    // A hook's answer still prepares the change before fx reports that no prompter is present.
+    if (!request.can_prompt and edit_prompt_required and equality_prompt_required and !request.hook_asks and !request.hook_allows) {
         input_owned = false;
         policy_targets_owned = false;
         return .{ .permission_required = authorization };
@@ -552,14 +558,18 @@ pub fn preflightPreparedFileMutation(
         if (key) |resolved_key| switch (session_permission_state.decide(state.*, resolved_key)) {
             .deny => return .policy_denied,
             .allow => {
-                input_owned = false;
-                policy_targets_owned = false;
-                return .{ .allowed = authorization };
+                // A hook that asks for a person does not accept a saved approval.
+                if (!request.hook_asks) {
+                    input_owned = false;
+                    policy_targets_owned = false;
+                    return .{ .allowed = authorization };
+                }
             },
             .unresolved => {},
         };
     }
-    const prompt_required = if (file_mutation_contract.preparedMutationIsNoop(
+    // A hook's ask makes the change need a prompt, including a no-op change that would need only disclosure.
+    const prompt_required = request.hook_asks or if (file_mutation_contract.preparedMutationIsNoop(
         authorization.prepared.?,
     ))
         equality_prompt_required
@@ -1375,6 +1385,8 @@ fn fileMutationPreflightRequest(
         .local_grants = local_grants,
         .can_prompt = input.permission_prompter != null or permission_mode == .auto,
         .session_permission_state = input.session_permission_state,
+        .hook_asks = hookPermissionOf(input) == .ask,
+        .hook_allows = hookPermissionOf(input) == .allow,
     };
 }
 
@@ -1393,6 +1405,21 @@ fn resolveFileMutationPreflightAdmission(
             .execution_authority = .{ .file_mutation = authorization },
         } },
         .permission_required, .prompt => |authorization| blk: {
+            // A hook that asks for a person takes the prompt, not the automatic bypass or review.
+            if (hookPermissionOf(input) == .ask) break :blk .{ .prompt = .{
+                .authorization = authorization,
+            } };
+            // A hook approval replaces the review and the prompt, but not a configured ask rule.
+            // Execution refuses an unprepared change that needs a prompt, so that case keeps the normal path.
+            if (hookPermissionOf(input) == .allow and
+                authorization.prepared != null and
+                !fileMutationTargetsContainConfiguredAsk(authorization.policy_targets))
+            {
+                break :blk .{ .resolved = .{
+                    .decision = .once,
+                    .execution_authority = .{ .file_mutation = authorization },
+                } };
+            }
             if (permission_mode == .auto and
                 fileMutationAuthorizationMayBypassAutoReview(input, authorization))
             {
@@ -1466,6 +1493,23 @@ pub fn requestPermissionOutcome(
     );
 }
 
+/// The PreToolUse hook's answer for this call; `none` when no hook answered.
+fn hookPermissionOf(input: Input) permission_auto_classifier.HookPermission {
+    return if (input.permission_review_turn) |turn| turn.hook_permission else .none;
+}
+
+/// The user's PermissionRequest hooks' answer for this prompt, or null to ask the person.
+fn permissionRequestVerdictOf(
+    input: Input,
+    arena: Allocator,
+    call: ToolCall,
+    label: []const u8,
+) ?permission_auto_classifier.PermissionRequestVerdict {
+    const turn = input.permission_review_turn orelse return null;
+    const hook = turn.permission_request_hook orelse return null;
+    return hook.run(hook.context, arena, call, label);
+}
+
 fn requestPermissionOutcomeResolved(
     input: Input,
     arena: Allocator,
@@ -1524,7 +1568,10 @@ fn requestPermissionOutcomeResolved(
         try formatVisionPathPermissionLabel(arena, authority)
     else
         null;
-    if (permission_mode == .yolo) {
+    // A PreToolUse hook's answer for this call; `none` when no hook answered.
+    const hook_permission = hookPermissionOf(input);
+    // Full access approves without asking, unless a hook asks for a person.
+    if (permission_mode == .yolo and hook_permission != .ask) {
         return bindVisionPathExecutionAuthority(try permissionOutcomeForDecision(
             input,
             arena,
@@ -1567,19 +1614,25 @@ fn requestPermissionOutcomeResolved(
                 .decision = .policy_denied,
                 .denial_reason = .policy_denied,
             },
-            .allow => return bindVisionPathExecutionAuthority(
-                try permissionOutcomeForDecision(
-                    input,
-                    arena,
-                    call,
-                    .once,
-                    .session_state,
-                ),
-                vision_path_authority,
-            ),
+            .allow => {
+                // A hook that asks for a person overrides a saved approval.
+                if (hook_permission != .ask) return bindVisionPathExecutionAuthority(
+                    try permissionOutcomeForDecision(
+                        input,
+                        arena,
+                        call,
+                        .once,
+                        .session_state,
+                    ),
+                    vision_path_authority,
+                );
+            },
             .unresolved => {},
         };
     }
+
+    // A hook that asks for a person prompts the way a configured ask does.
+    if (hook_permission == .ask) configured_ask = true;
 
     if (configured_ask) {
         if (input.permission_prompter == null) return .{
@@ -1628,6 +1681,13 @@ fn requestPermissionOutcomeResolved(
             try runCommandContext(input, arena, call),
             .once,
             .js_host,
+        );
+    }
+    // A hook approval replaces the reviewer and the prompt; rules and grants above keep their own label.
+    if (hook_permission == .allow and !configured_ask) {
+        return bindVisionPathExecutionAuthority(
+            try permissionOutcomeForDecision(input, arena, call, .once, .hook),
+            vision_path_authority,
         );
     }
     const resolution = try resolveOrdinaryPermissionOutcome(
@@ -1968,6 +2028,22 @@ fn requestFileMutationPermissionOutcomeFromAdmission(
                 &prepared.review
             else
                 return error.RequestProjectionTooLarge;
+            // A user's PermissionRequest hook answers in place of a person when it can.
+            if (permissionRequestVerdictOf(input, arena, call, request_view.label)) |verdict| {
+                const hooked: command_admission.PermissionOutcome = switch (verdict) {
+                    .allow => .{
+                        .decision = .once,
+                        .execution_authority = .{ .file_mutation = authorization },
+                        .human_approval = .once,
+                    },
+                    .deny => |reason| .{
+                        .decision = .deny,
+                        .denial_reason = .user_denied,
+                        .feedback = try arena.print("A hook denied this request: {s}", .{reason}),
+                    },
+                };
+                break :blk hooked;
+            }
             var response = prompter.request(
                 std.heap.c_allocator,
                 request_view,
@@ -2224,6 +2300,27 @@ fn promptPermissionOutcome(
         try exactApprovalLocalGrants(input, arena, call, &.{}, .ordinary)
     else
         null;
+    // A user's PermissionRequest hook answers in place of a person when it can.
+    if (permissionRequestVerdictOf(input, arena, call, request.label)) |verdict| {
+        var hooked = switch (verdict) {
+            .allow => blk: {
+                var outcome = try permissionOutcomeForDecision(input, arena, call, .once, .hook);
+                // A hook approval covers this call once, like a person's once.
+                if (outcome.decision == .once) outcome.human_approval = .once;
+                break :blk outcome;
+            },
+            .deny => |reason| blk: {
+                const hook_response = permission_request.OwnedPermissionResponse.init(
+                    arena,
+                    .deny,
+                    try arena.print("A hook denied this request: {s}", .{reason}),
+                );
+                break :blk try permissionOutcomeForResponse(input, arena, call, &hook_response, .interactive_once);
+            },
+        };
+        hooked.auto_review_result = auto_review_result;
+        return hooked;
+    }
     var response = prompter.request(
         std.heap.c_allocator,
         request,
@@ -6239,6 +6336,270 @@ test "session deny narrows configured command allow" {
     try std.testing.expectEqual(@as(usize, 0), recording.calls);
 }
 
+test "hook allow approves a shell call once with no prompt" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var worker: WorkerRuntime = .{};
+    defer worker.deinit(std.testing.allocator);
+    var input = testInputWithClassifier(
+        &worker,
+        permission_auto_classifier.Classifier.disabled(),
+    );
+    var recording = RecordingPrompter{};
+    input.permission_prompter = recording.prompter();
+    input.permission_review_turn.?.hook_permission = .allow;
+    const call = ToolCall{
+        .id = "hook-allow",
+        .name = "shell",
+        .arguments_json = "{\"action\":\"run\",\"command\":\"touch hooked.txt\"}",
+    };
+
+    const outcome = try requestPermissionOutcome(input, arena_state.allocator(), call, .ask, &.{});
+    try std.testing.expectEqual(@as(usize, 0), recording.calls);
+    try std.testing.expectEqual(ToolPermissionDecision.once, outcome.decision);
+    try std.testing.expectEqual(
+        command_admission.ShellAuthorizationSource.hook,
+        outcome.execution_authority.?.run_command.shell_allowed.source,
+    );
+}
+
+test "hook allow never overrides a configured deny rule" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var worker: WorkerRuntime = .{};
+    defer worker.deinit(std.testing.allocator);
+    var input = testInputWithClassifier(
+        &worker,
+        permission_auto_classifier.Classifier.disabled(),
+    );
+    var recording = RecordingPrompter{};
+    input.permission_prompter = recording.prompter();
+    input.permission_review_turn.?.hook_permission = .allow;
+    var rules = [_]types.PermissionRule{.{
+        .permission = @constCast("bash"),
+        .pattern = @constCast("touch *"),
+        .action = .deny,
+    }};
+    input.permission_rules = .{ .rules = &rules };
+    const call = ToolCall{
+        .id = "hook-allow-denied",
+        .name = "shell",
+        .arguments_json = "{\"action\":\"run\",\"command\":\"touch hooked.txt\"}",
+    };
+
+    const outcome = try requestPermissionOutcome(input, arena_state.allocator(), call, .ask, &.{});
+    try std.testing.expectEqual(ToolPermissionDecision.policy_denied, outcome.decision);
+    try std.testing.expect(outcome.execution_authority == null);
+    try std.testing.expectEqual(@as(usize, 0), recording.calls);
+}
+
+test "hook allow still prompts for a configured ask rule" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var worker: WorkerRuntime = .{};
+    defer worker.deinit(std.testing.allocator);
+    var input = testInputWithClassifier(
+        &worker,
+        permission_auto_classifier.Classifier.disabled(),
+    );
+    var recording = RecordingPrompter{};
+    input.permission_prompter = recording.prompter();
+    input.permission_review_turn.?.hook_permission = .allow;
+    var rules = [_]types.PermissionRule{.{
+        .permission = @constCast("bash"),
+        .pattern = @constCast("touch *"),
+        .action = .ask,
+    }};
+    input.permission_rules = .{ .rules = &rules };
+    const call = ToolCall{
+        .id = "hook-allow-ask",
+        .name = "shell",
+        .arguments_json = "{\"action\":\"run\",\"command\":\"touch hooked.txt\"}",
+    };
+
+    const outcome = try requestPermissionOutcome(input, arena_state.allocator(), call, .ask, &.{});
+    try std.testing.expectEqual(@as(usize, 1), recording.calls);
+    try std.testing.expectEqual(ToolPermissionDecision.once, outcome.decision);
+    try std.testing.expectEqual(
+        command_admission.ShellAuthorizationSource.interactive_once,
+        outcome.execution_authority.?.run_command.shell_allowed.source,
+    );
+}
+
+test "hook allow keeps a configured allow rule's label" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var worker: WorkerRuntime = .{};
+    defer worker.deinit(std.testing.allocator);
+    var input = testInputWithClassifier(
+        &worker,
+        permission_auto_classifier.Classifier.disabled(),
+    );
+    var recording = RecordingPrompter{};
+    input.permission_prompter = recording.prompter();
+    input.permission_review_turn.?.hook_permission = .allow;
+    var rules = [_]types.PermissionRule{.{
+        .permission = @constCast("bash"),
+        .pattern = @constCast("touch *"),
+        .action = .allow,
+    }};
+    input.permission_rules = .{ .rules = &rules };
+    const call = ToolCall{
+        .id = "hook-allow-configured",
+        .name = "shell",
+        .arguments_json = "{\"action\":\"run\",\"command\":\"touch hooked.txt\"}",
+    };
+
+    const outcome = try requestPermissionOutcome(input, arena_state.allocator(), call, .ask, &.{});
+    try std.testing.expectEqual(@as(usize, 0), recording.calls);
+    try std.testing.expectEqual(ToolPermissionDecision.once, outcome.decision);
+    try std.testing.expectEqual(
+        command_admission.ShellAuthorizationSource.configured_rule,
+        outcome.execution_authority.?.run_command.shell_allowed.source,
+    );
+}
+
+test "hook allow skips the automatic reviewer in auto mode" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var worker: WorkerRuntime = .{};
+    defer worker.deinit(std.testing.allocator);
+    var fake = FakeAutoClassifier{};
+    var input = testInputWithClassifier(
+        &worker,
+        permission_auto_classifier.Classifier.withOverride(
+            @ptrCast(&fake),
+            FakeAutoClassifier.classify,
+        ),
+    );
+    var recording = RecordingPrompter{};
+    input.permission_prompter = recording.prompter();
+    input.permission_review_turn.?.hook_permission = .allow;
+    const call = ToolCall{
+        .id = "hook-allow-auto",
+        .name = "shell",
+        .arguments_json = "{\"action\":\"run\",\"command\":\"touch hooked.txt\"}",
+    };
+
+    const outcome = try requestPermissionOutcome(input, arena_state.allocator(), call, .auto, &.{});
+    try std.testing.expectEqual(@as(usize, 0), fake.calls);
+    try std.testing.expectEqual(@as(usize, 0), recording.calls);
+    try std.testing.expectEqual(ToolPermissionDecision.once, outcome.decision);
+    try std.testing.expectEqual(
+        command_admission.ShellAuthorizationSource.hook,
+        outcome.execution_authority.?.run_command.shell_allowed.source,
+    );
+}
+
+test "hook ask prompts in full access" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var worker: WorkerRuntime = .{};
+    defer worker.deinit(std.testing.allocator);
+    var input = testInputWithClassifier(
+        &worker,
+        permission_auto_classifier.Classifier.disabled(),
+    );
+    var recording = RecordingPrompter{};
+    input.permission_prompter = recording.prompter();
+    input.permission_review_turn.?.hook_permission = .ask;
+    const call = ToolCall{
+        .id = "hook-ask-yolo",
+        .name = "shell",
+        .arguments_json = "{\"action\":\"run\",\"command\":\"touch hooked.txt\"}",
+    };
+
+    const outcome = try requestPermissionOutcome(input, arena_state.allocator(), call, .yolo, &.{});
+    try std.testing.expectEqual(@as(usize, 1), recording.calls);
+    try std.testing.expectEqual(ToolPermissionDecision.once, outcome.decision);
+    try std.testing.expectEqual(
+        command_admission.ShellAuthorizationSource.interactive_once,
+        outcome.execution_authority.?.run_command.shell_allowed.source,
+    );
+}
+
+test "hook ask prompts over a saved-session allow" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var worker: WorkerRuntime = .{};
+    defer worker.deinit(alloc);
+    var input = testInputWithClassifier(
+        &worker,
+        permission_auto_classifier.Classifier.disabled(),
+    );
+    var recording = RecordingPrompter{};
+    input.permission_prompter = recording.prompter();
+    const call = ToolCall{
+        .id = "hook-ask-session",
+        .name = "shell",
+        .arguments_json = "{\"action\":\"run\",\"command\":\"touch hooked.txt\"}",
+    };
+    const key = try permissionStateKeyForCall(input, arena, call);
+    var empty: session_permission_state.State = .{};
+    defer empty.deinit(alloc);
+    var applied = try session_permission_state.apply(alloc, empty, .{ .set = .{
+        .key = key,
+        .display_identity = "touch hooked.txt",
+        .decision = .allow,
+        .expected_generation = null,
+    } });
+    var state = applied.takeApplied() orelse return error.TestExpectedAppliedState;
+    defer state.deinit(alloc);
+    input.session_permission_state = &state;
+
+    // Without a hook, the saved allow approves with no prompt.
+    const saved = try requestPermissionOutcome(input, arena, call, .ask, &.{});
+    try std.testing.expectEqual(@as(usize, 0), recording.calls);
+    try std.testing.expectEqual(
+        command_admission.ShellAuthorizationSource.session_state,
+        saved.execution_authority.?.run_command.shell_allowed.source,
+    );
+
+    // A hook that asks still prompts despite the saved allow.
+    input.permission_review_turn.?.hook_permission = .ask;
+    const asked = try requestPermissionOutcome(input, arena, call, .ask, &.{});
+    try std.testing.expectEqual(@as(usize, 1), recording.calls);
+    try std.testing.expectEqual(
+        command_admission.ShellAuthorizationSource.interactive_once,
+        asked.execution_authority.?.run_command.shell_allowed.source,
+    );
+}
+
+test "hook ask without a prompter ends like a configured ask" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var worker: WorkerRuntime = .{};
+    defer worker.deinit(std.testing.allocator);
+    var input = testInputWithClassifier(
+        &worker,
+        permission_auto_classifier.Classifier.disabled(),
+    );
+    const call = ToolCall{
+        .id = "hook-ask-headless",
+        .name = "shell",
+        .arguments_json = "{\"action\":\"run\",\"command\":\"touch hooked.txt\"}",
+    };
+
+    input.permission_review_turn.?.hook_permission = .ask;
+    const hooked = try requestPermissionOutcome(input, arena_state.allocator(), call, .ask, &.{});
+
+    var rules = [_]types.PermissionRule{.{
+        .permission = @constCast("bash"),
+        .pattern = @constCast("touch *"),
+        .action = .ask,
+    }};
+    input.permission_rules = .{ .rules = &rules };
+    input.permission_review_turn.?.hook_permission = .none;
+    const configured = try requestPermissionOutcome(input, arena_state.allocator(), call, .ask, &.{});
+
+    try std.testing.expectEqual(ToolPermissionDecision.permission_required, hooked.decision);
+    try std.testing.expectEqual(configured.decision, hooked.decision);
+    try std.testing.expectEqual(configured.denial_reason, hooked.denial_reason);
+    try std.testing.expectEqual(configured.requirement, hooked.requirement);
+}
+
 test "a session approval merged into a turn's list lets its command run with no prompt, and another command, a deny rule, and another root still win" {
     const alloc = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(alloc);
@@ -6692,6 +7053,774 @@ test "automatic workspace write uses reversible admission without reviewer" {
     try std.testing.expectEqual(@as(usize, 0), fake.calls);
     try std.testing.expectEqual(ToolPermissionDecision.once, edit_outcome.decision);
     try std.testing.expect(edit_outcome.execution_authority.? == .file_mutation);
+}
+
+test "hook ask prompts for a file change a configured allow rule approves" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    var editable = try tmp.dir.createFile(
+        io_mod.getIo(),
+        "workspace/editable.txt",
+        .{ .truncate = true },
+    );
+    defer editable.close(io_mod.getIo());
+    try editable.writeStreamingAll(io_mod.getIo(), "before\n");
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace);
+
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var worker: WorkerRuntime = .{};
+    defer worker.deinit(alloc);
+    var recording = RecordingPrompter{};
+    var input = testInputWithClassifier(
+        &worker,
+        permission_auto_classifier.Classifier.disabled(),
+    );
+    input.workspace_root = workspace;
+    input.permission_prompter = recording.prompter();
+    input.permission_review_turn.?.hook_permission = .ask;
+    var rules = [_]types.PermissionRule{.{
+        .permission = @constCast("edit"),
+        .pattern = @constCast("**"),
+        .action = .allow,
+    }};
+    input.permission_rules = .{ .rules = &rules };
+    const edit_target = try std.Io.Dir.path.join(arena, &.{ workspace, "editable.txt" });
+    const arguments_json = try arena.print(
+        "{{\"path\":\"{s}\",\"old_string\":\"before\",\"new_string\":\"after\"}}",
+        .{edit_target},
+    );
+
+    const outcome = try requestPermissionOutcome(
+        input,
+        arena,
+        .{ .id = "hook-ask-allowed-edit", .name = "edit_file", .arguments_json = arguments_json },
+        .ask,
+        &.{},
+    );
+    try std.testing.expectEqual(@as(usize, 1), recording.calls);
+    try std.testing.expect(recording.last_grant_offer != null);
+    try std.testing.expectEqual(ToolPermissionDecision.once, outcome.decision);
+    const authority = outcome.execution_authority orelse return error.TestExpectedEqual;
+    const authorization = switch (authority) {
+        .file_mutation => |value| value,
+        else => return error.TestExpectedEqual,
+    };
+    try std.testing.expect(authorization.prepared != null);
+}
+
+test "hook ask prompts for a file change in full access" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    var editable = try tmp.dir.createFile(
+        io_mod.getIo(),
+        "workspace/editable.txt",
+        .{ .truncate = true },
+    );
+    defer editable.close(io_mod.getIo());
+    try editable.writeStreamingAll(io_mod.getIo(), "before\n");
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace);
+
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var worker: WorkerRuntime = .{};
+    defer worker.deinit(alloc);
+    var recording = RecordingPrompter{};
+    var input = testInputWithClassifier(
+        &worker,
+        permission_auto_classifier.Classifier.disabled(),
+    );
+    input.workspace_root = workspace;
+    input.permission_prompter = recording.prompter();
+    input.permission_review_turn.?.hook_permission = .ask;
+    const edit_target = try std.Io.Dir.path.join(arena, &.{ workspace, "editable.txt" });
+    const arguments_json = try arena.print(
+        "{{\"path\":\"{s}\",\"old_string\":\"before\",\"new_string\":\"after\"}}",
+        .{edit_target},
+    );
+
+    const outcome = try requestPermissionOutcome(
+        input,
+        arena,
+        .{ .id = "hook-ask-yolo-edit", .name = "edit_file", .arguments_json = arguments_json },
+        .yolo,
+        &.{},
+    );
+    try std.testing.expectEqual(@as(usize, 1), recording.calls);
+    try std.testing.expect(recording.last_grant_offer != null);
+    try std.testing.expectEqual(ToolPermissionDecision.once, outcome.decision);
+    const authority = outcome.execution_authority orelse return error.TestExpectedEqual;
+    const authorization = switch (authority) {
+        .file_mutation => |value| value,
+        else => return error.TestExpectedEqual,
+    };
+    try std.testing.expect(authorization.prepared != null);
+}
+
+test "hook ask never overrides a configured deny for a file change" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    var editable = try tmp.dir.createFile(
+        io_mod.getIo(),
+        "workspace/editable.txt",
+        .{ .truncate = true },
+    );
+    defer editable.close(io_mod.getIo());
+    try editable.writeStreamingAll(io_mod.getIo(), "before\n");
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace);
+
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var worker: WorkerRuntime = .{};
+    defer worker.deinit(alloc);
+    var recording = RecordingPrompter{};
+    var input = testInputWithClassifier(
+        &worker,
+        permission_auto_classifier.Classifier.disabled(),
+    );
+    input.workspace_root = workspace;
+    input.permission_prompter = recording.prompter();
+    input.permission_review_turn.?.hook_permission = .ask;
+    var rules = [_]types.PermissionRule{.{
+        .permission = @constCast("edit"),
+        .pattern = @constCast("**"),
+        .action = .deny,
+    }};
+    input.permission_rules = .{ .rules = &rules };
+    const edit_target = try std.Io.Dir.path.join(arena, &.{ workspace, "editable.txt" });
+    const arguments_json = try arena.print(
+        "{{\"path\":\"{s}\",\"old_string\":\"before\",\"new_string\":\"after\"}}",
+        .{edit_target},
+    );
+
+    const outcome = try requestPermissionOutcome(
+        input,
+        arena,
+        .{ .id = "hook-ask-denied-edit", .name = "edit_file", .arguments_json = arguments_json },
+        .ask,
+        &.{},
+    );
+    try std.testing.expectEqual(ToolPermissionDecision.policy_denied, outcome.decision);
+    try std.testing.expect(outcome.execution_authority == null);
+    try std.testing.expectEqual(@as(usize, 0), recording.calls);
+}
+
+test "hook ask skips auto review for a file change" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    var editable = try tmp.dir.createFile(
+        io_mod.getIo(),
+        "workspace/editable.txt",
+        .{ .truncate = true },
+    );
+    defer editable.close(io_mod.getIo());
+    try editable.writeStreamingAll(io_mod.getIo(), "before\n");
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace);
+
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var worker: WorkerRuntime = .{};
+    defer worker.deinit(alloc);
+    var fake = FakeAutoClassifier{};
+    var recording = RecordingPrompter{};
+    var input = testInputWithClassifier(
+        &worker,
+        permission_auto_classifier.Classifier.withOverride(
+            @ptrCast(&fake),
+            FakeAutoClassifier.classify,
+        ),
+    );
+    input.workspace_root = workspace;
+    input.permission_prompter = recording.prompter();
+    input.permission_review_turn.?.hook_permission = .ask;
+    const edit_target = try std.Io.Dir.path.join(arena, &.{ workspace, "editable.txt" });
+    const arguments_json = try arena.print(
+        "{{\"path\":\"{s}\",\"old_string\":\"before\",\"new_string\":\"after\"}}",
+        .{edit_target},
+    );
+
+    const outcome = try requestPermissionOutcome(
+        input,
+        arena,
+        .{ .id = "hook-ask-auto-edit", .name = "edit_file", .arguments_json = arguments_json },
+        .auto,
+        &.{},
+    );
+    try std.testing.expectEqual(@as(usize, 0), fake.calls);
+    try std.testing.expectEqual(@as(usize, 1), recording.calls);
+    try std.testing.expect(recording.last_grant_offer != null);
+    try std.testing.expectEqual(ToolPermissionDecision.once, outcome.decision);
+    const authority = outcome.execution_authority orelse return error.TestExpectedEqual;
+    const authorization = switch (authority) {
+        .file_mutation => |value| value,
+        else => return error.TestExpectedEqual,
+    };
+    try std.testing.expect(authorization.prepared != null);
+}
+
+test "hook ask prompts over a saved-session allow for a file change" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace);
+
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var worker: WorkerRuntime = .{};
+    defer worker.deinit(alloc);
+    var recording = RecordingPrompter{};
+    var input = testInputWithClassifier(
+        &worker,
+        permission_auto_classifier.Classifier.disabled(),
+    );
+    input.workspace_root = workspace;
+    input.permission_prompter = recording.prompter();
+    const target_path = try std.Io.Dir.path.join(arena, &.{ workspace, "note.txt" });
+    const arguments_json = try arena.print(
+        "{{\"path\":\"{s}\",\"content\":\"hello\\n\"}}",
+        .{target_path},
+    );
+    const call = ToolCall{
+        .id = "hook-ask-session-write",
+        .name = "write_file",
+        .arguments_json = arguments_json,
+    };
+
+    const identity = try preparePermissionStateAction(input, arena, call);
+    var empty: session_permission_state.State = .{};
+    defer empty.deinit(alloc);
+    var applied = try session_permission_state.apply(alloc, empty, .{ .set = .{
+        .key = identity.key,
+        .display_identity = identity.display_identity,
+        .decision = .allow,
+        .expected_generation = null,
+    } });
+    var state = applied.takeApplied() orelse return error.TestExpectedAppliedState;
+    defer state.deinit(alloc);
+    input.session_permission_state = &state;
+
+    // Control: with no hook, the saved allow approves the write without a prompt.
+    const saved = try requestPermissionOutcome(input, arena, call, .ask, &.{});
+    try std.testing.expectEqual(@as(usize, 0), recording.calls);
+    try std.testing.expectEqual(ToolPermissionDecision.once, saved.decision);
+
+    // With a hook that asks, the saved allow no longer decides the write.
+    input.permission_review_turn.?.hook_permission = .ask;
+    const asked = try requestPermissionOutcome(input, arena, call, .ask, &.{});
+    try std.testing.expectEqual(@as(usize, 1), recording.calls);
+    try std.testing.expect(recording.last_grant_offer != null);
+    try std.testing.expectEqual(ToolPermissionDecision.once, asked.decision);
+    const authority = asked.execution_authority orelse return error.TestExpectedEqual;
+    const authorization = switch (authority) {
+        .file_mutation => |value| value,
+        else => return error.TestExpectedEqual,
+    };
+    try std.testing.expect(authorization.prepared != null);
+}
+
+test "hook allow approves a file change with no prompt" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    var editable = try tmp.dir.createFile(
+        io_mod.getIo(),
+        "workspace/editable.txt",
+        .{ .truncate = true },
+    );
+    defer editable.close(io_mod.getIo());
+    try editable.writeStreamingAll(io_mod.getIo(), "before\n");
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace);
+
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var worker: WorkerRuntime = .{};
+    defer worker.deinit(alloc);
+    var recording = RecordingPrompter{};
+    var input = testInputWithClassifier(
+        &worker,
+        permission_auto_classifier.Classifier.disabled(),
+    );
+    input.workspace_root = workspace;
+    input.permission_prompter = recording.prompter();
+    input.permission_review_turn.?.hook_permission = .allow;
+    const edit_target = try std.Io.Dir.path.join(arena, &.{ workspace, "editable.txt" });
+    const arguments_json = try arena.print(
+        "{{\"path\":\"{s}\",\"old_string\":\"before\",\"new_string\":\"after\"}}",
+        .{edit_target},
+    );
+
+    const outcome = try requestPermissionOutcome(
+        input,
+        arena,
+        .{ .id = "hook-allow-edit", .name = "edit_file", .arguments_json = arguments_json },
+        .ask,
+        &.{},
+    );
+    try std.testing.expectEqual(@as(usize, 0), recording.calls);
+    try std.testing.expectEqual(ToolPermissionDecision.once, outcome.decision);
+    const authority = outcome.execution_authority orelse return error.TestExpectedEqual;
+    const authorization = switch (authority) {
+        .file_mutation => |value| value,
+        else => return error.TestExpectedEqual,
+    };
+    try std.testing.expect(authorization.prepared != null);
+}
+
+test "hook allow still prompts for a file change a configured ask rule covers" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    var editable = try tmp.dir.createFile(
+        io_mod.getIo(),
+        "workspace/editable.txt",
+        .{ .truncate = true },
+    );
+    defer editable.close(io_mod.getIo());
+    try editable.writeStreamingAll(io_mod.getIo(), "before\n");
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace);
+
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var worker: WorkerRuntime = .{};
+    defer worker.deinit(alloc);
+    var recording = RecordingPrompter{};
+    var input = testInputWithClassifier(
+        &worker,
+        permission_auto_classifier.Classifier.disabled(),
+    );
+    input.workspace_root = workspace;
+    input.permission_prompter = recording.prompter();
+    input.permission_review_turn.?.hook_permission = .allow;
+    var rules = [_]types.PermissionRule{.{
+        .permission = @constCast("edit"),
+        .pattern = @constCast("**"),
+        .action = .ask,
+    }};
+    input.permission_rules = .{ .rules = &rules };
+    const edit_target = try std.Io.Dir.path.join(arena, &.{ workspace, "editable.txt" });
+    const arguments_json = try arena.print(
+        "{{\"path\":\"{s}\",\"old_string\":\"before\",\"new_string\":\"after\"}}",
+        .{edit_target},
+    );
+
+    const outcome = try requestPermissionOutcome(
+        input,
+        arena,
+        .{ .id = "hook-allow-asked-edit", .name = "edit_file", .arguments_json = arguments_json },
+        .ask,
+        &.{},
+    );
+    try std.testing.expectEqual(@as(usize, 1), recording.calls);
+    try std.testing.expectEqual(ToolPermissionDecision.once, outcome.decision);
+}
+
+test "hook allow skips auto review for a file change" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace/.git/hooks");
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace);
+
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var worker: WorkerRuntime = .{};
+    defer worker.deinit(alloc);
+    var fake = FakeAutoClassifier{};
+    var recording = RecordingPrompter{};
+    var input = testInputWithClassifier(
+        &worker,
+        permission_auto_classifier.Classifier.withOverride(
+            @ptrCast(&fake),
+            FakeAutoClassifier.classify,
+        ),
+    );
+    input.workspace_root = workspace;
+    input.permission_prompter = recording.prompter();
+    input.permission_review_turn.?.hook_permission = .allow;
+    // A write into .git/hooks is a sensitive target: without a hook it goes to the reviewer.
+    const target_path = try std.Io.Dir.path.join(arena, &.{ workspace, ".git/hooks/pre-commit" });
+    const arguments_json = try arena.print(
+        "{{\"path\":\"{s}\",\"content\":\"test\\n\"}}",
+        .{target_path},
+    );
+
+    const outcome = try requestPermissionOutcome(
+        input,
+        arena,
+        .{ .id = "hook-allow-auto-write", .name = "write_file", .arguments_json = arguments_json },
+        .auto,
+        &.{},
+    );
+    try std.testing.expectEqual(@as(usize, 0), fake.calls);
+    try std.testing.expectEqual(@as(usize, 0), recording.calls);
+    try std.testing.expectEqual(ToolPermissionDecision.once, outcome.decision);
+    const authority = outcome.execution_authority orelse return error.TestExpectedEqual;
+    const authorization = switch (authority) {
+        .file_mutation => |value| value,
+        else => return error.TestExpectedEqual,
+    };
+    try std.testing.expect(authorization.prepared != null);
+}
+
+test "hook allow approves a file change with no prompter" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    var editable = try tmp.dir.createFile(
+        io_mod.getIo(),
+        "workspace/editable.txt",
+        .{ .truncate = true },
+    );
+    defer editable.close(io_mod.getIo());
+    try editable.writeStreamingAll(io_mod.getIo(), "before\n");
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace);
+
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var worker: WorkerRuntime = .{};
+    defer worker.deinit(alloc);
+    var input = testInputWithClassifier(
+        &worker,
+        permission_auto_classifier.Classifier.disabled(),
+    );
+    input.workspace_root = workspace;
+    const edit_target = try std.Io.Dir.path.join(arena, &.{ workspace, "editable.txt" });
+    const arguments_json = try arena.print(
+        "{{\"path\":\"{s}\",\"old_string\":\"before\",\"new_string\":\"after\"}}",
+        .{edit_target},
+    );
+    // A read rule that asks makes the edit need an equality disclosure, which reaches the early return.
+    var read_rules = [_]types.PermissionRule{.{
+        .permission = @constCast("read"),
+        .pattern = @constCast("**"),
+        .action = .ask,
+    }};
+    input.permission_rules = .{ .rules = &read_rules };
+    const call = ToolCall{
+        .id = "hook-allow-headless-edit",
+        .name = "edit_file",
+        .arguments_json = arguments_json,
+    };
+
+    // Control: without a hook and without a prompter, the change is permission required.
+    const control = try requestPermissionOutcome(input, arena, call, .ask, &.{});
+    try std.testing.expectEqual(ToolPermissionDecision.permission_required, control.decision);
+    try std.testing.expect(control.execution_authority == null);
+
+    input.permission_review_turn.?.hook_permission = .allow;
+    const outcome = try requestPermissionOutcome(input, arena, call, .ask, &.{});
+    try std.testing.expectEqual(ToolPermissionDecision.once, outcome.decision);
+    const authority = outcome.execution_authority orelse return error.TestExpectedEqual;
+    const authorization = switch (authority) {
+        .file_mutation => |value| value,
+        else => return error.TestExpectedEqual,
+    };
+    try std.testing.expect(authorization.prepared != null);
+}
+
+test "hook allow never overrides a configured deny for a file change" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    var editable = try tmp.dir.createFile(
+        io_mod.getIo(),
+        "workspace/editable.txt",
+        .{ .truncate = true },
+    );
+    defer editable.close(io_mod.getIo());
+    try editable.writeStreamingAll(io_mod.getIo(), "before\n");
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace);
+
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var worker: WorkerRuntime = .{};
+    defer worker.deinit(alloc);
+    var recording = RecordingPrompter{};
+    var input = testInputWithClassifier(
+        &worker,
+        permission_auto_classifier.Classifier.disabled(),
+    );
+    input.workspace_root = workspace;
+    input.permission_prompter = recording.prompter();
+    input.permission_review_turn.?.hook_permission = .allow;
+    var rules = [_]types.PermissionRule{.{
+        .permission = @constCast("edit"),
+        .pattern = @constCast("**"),
+        .action = .deny,
+    }};
+    input.permission_rules = .{ .rules = &rules };
+    const edit_target = try std.Io.Dir.path.join(arena, &.{ workspace, "editable.txt" });
+    const arguments_json = try arena.print(
+        "{{\"path\":\"{s}\",\"old_string\":\"before\",\"new_string\":\"after\"}}",
+        .{edit_target},
+    );
+
+    const outcome = try requestPermissionOutcome(
+        input,
+        arena,
+        .{ .id = "hook-allow-denied-edit", .name = "edit_file", .arguments_json = arguments_json },
+        .ask,
+        &.{},
+    );
+    try std.testing.expectEqual(ToolPermissionDecision.policy_denied, outcome.decision);
+    try std.testing.expect(outcome.execution_authority == null);
+    try std.testing.expectEqual(@as(usize, 0), recording.calls);
+}
+
+/// Counts calls to a fake PermissionRequest hook and answers with a fixed verdict.
+const FakePermissionRequestHook = struct {
+    calls: usize = 0,
+    verdict: ?permission_auto_classifier.PermissionRequestVerdict = null,
+
+    fn run(
+        raw: *anyopaque,
+        _: Allocator,
+        _: ToolCall,
+        _: []const u8,
+    ) ?permission_auto_classifier.PermissionRequestVerdict {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        self.calls += 1;
+        return self.verdict;
+    }
+
+    fn asHook(self: *@This()) permission_auto_classifier.PermissionRequestHook {
+        return .{ .context = @ptrCast(self), .run = run };
+    }
+};
+
+test "a permission request hook approves a shell prompt" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var worker: WorkerRuntime = .{};
+    defer worker.deinit(std.testing.allocator);
+    var recording = RecordingPrompter{};
+    var input = testInputWithClassifier(
+        &worker,
+        permission_auto_classifier.Classifier.disabled(),
+    );
+    input.permission_prompter = recording.prompter();
+    var hook = FakePermissionRequestHook{ .verdict = .allow };
+    input.permission_review_turn.?.permission_request_hook = hook.asHook();
+    const call = ToolCall{
+        .id = "prompt-hook-allow",
+        .name = "shell",
+        .arguments_json = "{\"action\":\"run\",\"command\":\"touch prompted.txt\"}",
+    };
+
+    const outcome = try requestPermissionOutcome(input, arena_state.allocator(), call, .ask, &.{});
+    try std.testing.expectEqual(@as(usize, 1), hook.calls);
+    try std.testing.expectEqual(@as(usize, 0), recording.calls);
+    try std.testing.expectEqual(ToolPermissionDecision.once, outcome.decision);
+    try std.testing.expectEqual(command_admission.HumanApprovalProvenance.once, outcome.human_approval);
+    try std.testing.expectEqual(
+        command_admission.ShellAuthorizationSource.hook,
+        outcome.execution_authority.?.run_command.shell_allowed.source,
+    );
+}
+
+test "a permission request hook denies a shell prompt with its reason" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var worker: WorkerRuntime = .{};
+    defer worker.deinit(std.testing.allocator);
+    var recording = RecordingPrompter{};
+    var input = testInputWithClassifier(
+        &worker,
+        permission_auto_classifier.Classifier.disabled(),
+    );
+    input.permission_prompter = recording.prompter();
+    var hook = FakePermissionRequestHook{ .verdict = .{ .deny = "no" } };
+    input.permission_review_turn.?.permission_request_hook = hook.asHook();
+    const call = ToolCall{
+        .id = "prompt-hook-deny",
+        .name = "shell",
+        .arguments_json = "{\"action\":\"run\",\"command\":\"touch prompted.txt\"}",
+    };
+
+    const outcome = try requestPermissionOutcome(input, arena_state.allocator(), call, .ask, &.{});
+    try std.testing.expectEqual(@as(usize, 1), hook.calls);
+    try std.testing.expectEqual(@as(usize, 0), recording.calls);
+    try std.testing.expectEqual(ToolPermissionDecision.deny, outcome.decision);
+    try std.testing.expectEqual(types.ToolPermissionDenialReason.user_denied, outcome.denial_reason.?);
+    try std.testing.expect(std.mem.find(u8, outcome.feedback.?, "A hook denied this request: no") != null);
+}
+
+test "a permission request hook with no answer shows the prompt" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var worker: WorkerRuntime = .{};
+    defer worker.deinit(std.testing.allocator);
+    var recording = RecordingPrompter{};
+    var input = testInputWithClassifier(
+        &worker,
+        permission_auto_classifier.Classifier.disabled(),
+    );
+    input.permission_prompter = recording.prompter();
+    var hook = FakePermissionRequestHook{};
+    input.permission_review_turn.?.permission_request_hook = hook.asHook();
+    const call = ToolCall{
+        .id = "prompt-hook-silent",
+        .name = "shell",
+        .arguments_json = "{\"action\":\"run\",\"command\":\"touch prompted.txt\"}",
+    };
+
+    const outcome = try requestPermissionOutcome(input, arena_state.allocator(), call, .ask, &.{});
+    try std.testing.expectEqual(@as(usize, 1), hook.calls);
+    try std.testing.expectEqual(@as(usize, 1), recording.calls);
+    try std.testing.expectEqual(ToolPermissionDecision.once, outcome.decision);
+}
+
+test "a permission request hook approves a file change prompt" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    var editable = try tmp.dir.createFile(
+        io_mod.getIo(),
+        "workspace/editable.txt",
+        .{ .truncate = true },
+    );
+    defer editable.close(io_mod.getIo());
+    try editable.writeStreamingAll(io_mod.getIo(), "before\n");
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace);
+
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var worker: WorkerRuntime = .{};
+    defer worker.deinit(alloc);
+    var recording = RecordingPrompter{};
+    var input = testInputWithClassifier(
+        &worker,
+        permission_auto_classifier.Classifier.disabled(),
+    );
+    input.workspace_root = workspace;
+    input.permission_prompter = recording.prompter();
+    var hook = FakePermissionRequestHook{ .verdict = .allow };
+    input.permission_review_turn.?.permission_request_hook = hook.asHook();
+    const edit_target = try std.Io.Dir.path.join(arena, &.{ workspace, "editable.txt" });
+    const arguments_json = try arena.print(
+        "{{\"path\":\"{s}\",\"old_string\":\"before\",\"new_string\":\"after\"}}",
+        .{edit_target},
+    );
+
+    const outcome = try requestPermissionOutcome(
+        input,
+        arena,
+        .{ .id = "prompt-hook-file-allow", .name = "edit_file", .arguments_json = arguments_json },
+        .ask,
+        &.{},
+    );
+    try std.testing.expectEqual(@as(usize, 1), hook.calls);
+    try std.testing.expectEqual(@as(usize, 0), recording.calls);
+    try std.testing.expectEqual(ToolPermissionDecision.once, outcome.decision);
+    try std.testing.expectEqual(command_admission.HumanApprovalProvenance.once, outcome.human_approval);
+    const authority = outcome.execution_authority orelse return error.TestExpectedEqual;
+    const authorization = switch (authority) {
+        .file_mutation => |value| value,
+        else => return error.TestExpectedEqual,
+    };
+    try std.testing.expect(authorization.prepared != null);
+}
+
+test "a permission request hook is not asked when no prompt is needed" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var worker: WorkerRuntime = .{};
+    defer worker.deinit(std.testing.allocator);
+    var recording = RecordingPrompter{};
+    var input = testInputWithClassifier(
+        &worker,
+        permission_auto_classifier.Classifier.disabled(),
+    );
+    input.permission_prompter = recording.prompter();
+    var hook = FakePermissionRequestHook{ .verdict = .allow };
+    input.permission_review_turn.?.permission_request_hook = hook.asHook();
+    var rules = [_]types.PermissionRule{.{
+        .permission = @constCast("bash"),
+        .pattern = @constCast("touch *"),
+        .action = .allow,
+    }};
+    input.permission_rules = .{ .rules = &rules };
+    const call = ToolCall{
+        .id = "prompt-hook-unneeded",
+        .name = "shell",
+        .arguments_json = "{\"action\":\"run\",\"command\":\"touch prompted.txt\"}",
+    };
+
+    const outcome = try requestPermissionOutcome(input, arena_state.allocator(), call, .ask, &.{});
+    try std.testing.expectEqual(@as(usize, 0), hook.calls);
+    try std.testing.expectEqual(@as(usize, 0), recording.calls);
+    try std.testing.expectEqual(ToolPermissionDecision.once, outcome.decision);
+    try std.testing.expectEqual(
+        command_admission.ShellAuthorizationSource.configured_rule,
+        outcome.execution_authority.?.run_command.shell_allowed.source,
+    );
+}
+
+test "a permission request hook is not asked for a configured deny" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var worker: WorkerRuntime = .{};
+    defer worker.deinit(std.testing.allocator);
+    var recording = RecordingPrompter{};
+    var input = testInputWithClassifier(
+        &worker,
+        permission_auto_classifier.Classifier.disabled(),
+    );
+    input.permission_prompter = recording.prompter();
+    var hook = FakePermissionRequestHook{ .verdict = .allow };
+    input.permission_review_turn.?.permission_request_hook = hook.asHook();
+    var rules = [_]types.PermissionRule{.{
+        .permission = @constCast("bash"),
+        .pattern = @constCast("touch *"),
+        .action = .deny,
+    }};
+    input.permission_rules = .{ .rules = &rules };
+    const call = ToolCall{
+        .id = "prompt-hook-configured-deny",
+        .name = "shell",
+        .arguments_json = "{\"action\":\"run\",\"command\":\"touch prompted.txt\"}",
+    };
+
+    const outcome = try requestPermissionOutcome(input, arena_state.allocator(), call, .ask, &.{});
+    try std.testing.expectEqual(ToolPermissionDecision.policy_denied, outcome.decision);
+    try std.testing.expectEqual(@as(usize, 0), hook.calls);
+    try std.testing.expectEqual(@as(usize, 0), recording.calls);
 }
 
 test "automatic added-root write bypasses reviewer while untrusted external write does not" {

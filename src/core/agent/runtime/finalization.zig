@@ -40,6 +40,9 @@ pub const TurnFinalizationGuard = struct {
     lifecycle: LifecycleContext,
     state: State = .open,
     outcome: ?types.TurnPresentationOutcome = null,
+    /// The user stopped the turn with a cancel, not a steering message. Set in `finish`
+    /// once the host has said so; `processAgentPrompt` runs the user's Interrupt hooks for it.
+    ended_by_user: bool = false,
     compacted_execution: execution_memory.CompactedExecutionBoundary = .{},
     /// The runtime context this turn captured for the session, if it did.
     /// Every save of the turn carries it, so a streamed turn keeps one prefix
@@ -148,13 +151,21 @@ pub const TurnFinalizationGuard = struct {
         }
     }
 
-    /// Whether the turn's end must stop the commands steering moved to the
-    /// background: only when the user cancelled it.
-    fn stops_steering_detached_commands(self: *TurnFinalizationGuard, outcome: types.TurnPresentationOutcome) bool {
+    /// Whether the turn ended because the user cancelled it. Only an interrupted
+    /// turn can be one, and the host must confirm it: steering that hands the turn
+    /// off also ends it interrupted. A host without the callback gives no answer,
+    /// so its interruption is not counted as the user's. The host is asked at most
+    /// once per finish, while the turn is still the active one.
+    fn endsByUserCancel(self: *TurnFinalizationGuard, outcome: types.TurnPresentationOutcome) bool {
         if (outcome != .interrupted) return false;
-        if (self.deps.stop_steering_detached_commands == null) return false;
         const explicit = self.deps.turn_ends_by_explicit_cancel orelse return false;
         return explicit(self.deps.ctx, self.turn_id);
+    }
+
+    /// Whether the turn's end must stop the commands steering moved to the
+    /// background: only when the user cancelled it.
+    fn stops_steering_detached_commands(self: *TurnFinalizationGuard, ended_by_user: bool) bool {
+        return ended_by_user and self.deps.stop_steering_detached_commands != null;
     }
 
     fn stop_steering_detached_commands(self: *TurnFinalizationGuard) void {
@@ -191,7 +202,9 @@ pub const TurnFinalizationGuard = struct {
         // reported can join its ending as steering. The stops run after it:
         // a command that ignores SIGTERM takes seconds to stop, and the user
         // sees the turn end without waiting for it.
-        const stop_detached = self.stops_steering_detached_commands(outcome);
+        const ended_by_user = self.endsByUserCancel(outcome);
+        self.ended_by_user = ended_by_user;
+        const stop_detached = self.stops_steering_detached_commands(ended_by_user);
 
         self.deps.finalize_turn(self.deps.ctx, self.turn_id, outcome, disposition) catch |err| {
             self.state = .fatal;

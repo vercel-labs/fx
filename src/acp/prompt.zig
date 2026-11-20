@@ -38,6 +38,7 @@ const sessions = @import("sessions.zig");
 const client_instructions = @import("client_instructions.zig");
 const tool_call_identities = @import("tool_call_identities.zig");
 const agent_runtime = @import("../core/agent/agent_runtime.zig");
+const runtime_user_hooks = @import("../core/agent/runtime/user_hooks.zig");
 const agent_execution_memory = @import("../core/agent/execution_memory.zig");
 const diff_mod = @import("../core/output/diff.zig");
 const file_mutation = @import("../core/tooling/file_mutation.zig");
@@ -425,6 +426,16 @@ const AcpContext = struct {
         var out: std.Io.Writer.Allocating = .init(self.alloc);
         defer out.deinit();
         try acp_types.writeAgentMessageChunk(&out.writer, message_id, plain);
+        try self.sendUpdate(out.writer.buffered());
+    }
+
+    /// A hook's notice as an ACP v1 Session Notice, with the tone as its severity.
+    fn sendHookNotice(self: *AcpContext, tone: agent_runtime.HookNoticeTone, text: []const u8) !void {
+        const plain = try stripAnsiAlloc(self.alloc, text);
+        defer if (plain.ptr != text.ptr) self.alloc.free(plain);
+        var out: std.Io.Writer.Allocating = .init(self.alloc);
+        defer out.deinit();
+        try acp_types.writeNotice(&out.writer, hookNoticeSeverity(tone), plain);
         try self.sendUpdate(out.writer.buffered());
     }
 
@@ -1215,7 +1226,7 @@ pub fn handlePrompt(
 
     // The prompt's attached files stay out of the instructions: the runtime
     // delivers their folders' rules as a note on the turn's own message.
-    try refreshProjectContext(state, alloc);
+    try refreshProjectContext(state, alloc, session);
 
     session.pending_prompt_id = msg.id;
     defer session.pending_prompt_id = null;
@@ -1429,6 +1440,9 @@ pub fn handlePrompt(
             .session_id = session.session_id,
         },
         .outcome_allocator = alloc,
+        .user_hooks = state.hooksRuntime(),
+        .trust_required = true,
+        .libfx = state.cfg.minimal_kernel,
     }, agent_config, job);
     // The next turn starts the agent's usage over, so this turn's is added to
     // the prompt's now, however it ended. The agent's own count stays as it
@@ -1642,12 +1656,15 @@ pub fn runSubagentChild(
         .project_context = project_context.modelVisibleBytes(),
         .lifecycle_view = state.lifecycle_view,
         .workspace_capture = childCaptureTarget(state),
+        .user_hooks = state.hooksRuntime(),
+        .hooks_trust_required = true,
     }, turn, message, admission, cancel);
 }
 
 fn refreshProjectContext(
     state: *server.ServerState,
     alloc: Allocator,
+    session: ?*server.ActiveSessionState,
 ) context_contract.ProviderError!void {
     {
         // A subagent's turn copies the snapshot under this lock when it starts, so what this frees
@@ -1658,10 +1675,15 @@ fn refreshProjectContext(
     }
     if (!state.context_enabled) return;
 
+    // The session's InstructionsLoaded hooks decide each instruction file, once per session and stamp.
+    var instructions: runtime_user_hooks.InstructionFilterState = .{
+        .lifecycle = if (session) |active| server.connectionLifecycle(state, active, alloc) else null,
+    };
     const gathered = state.cfg.context_registry.gatherDefaultSnapshot(alloc, .{
         .workspace_root = state.workspace_root,
         .access_scope = state.workspace_access.scope(state.workspace_root),
         .context_limits = state.context_limits,
+        .instruction_filter = instructions.filter(),
     }) catch |err| {
         debug_trace.logf("context", "acp gather failed err={s}", .{@errorName(err)});
         return err;
@@ -2286,6 +2308,7 @@ fn agentRuntimeDeps(ctx: *AcpContext) agent_runtime.AgentRuntimeDeps {
         .push_tool_lifecycle = pushToolLifecycle,
         .push_diff_block = pushDiffBlock,
         .push_system_notice = pushSystemNotice,
+        .push_hook_notice = pushHookNotice,
         .push_context_notice = pushContextNotice,
         // The same path: once per session, as a notice where the client shows them.
         .push_session_notice = pushContextNotice,
@@ -3392,6 +3415,9 @@ fn runReportTurns(
                 .session_id = session.session_id,
             },
             .outcome_allocator = alloc,
+            .user_hooks = state.hooksRuntime(),
+            .trust_required = true,
+            .libfx = state.cfg.minimal_kernel,
         }, agent_config, job);
         usage_total.add(session.session_rt.agent.turn_usage);
         report_turn catch |err| {
@@ -3741,7 +3767,51 @@ fn pushToolLifecycle(raw_ctx: *anyopaque, event: types.ToolLifecycleEvent) !void
 
 fn pushSystemNotice(raw_ctx: *anyopaque, text: []const u8) !void {
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
-    ctx.sendAgentText(ctx.operationalMessageId(), text) catch {};
+    ctx.sendAgentText(ctx.operationalMessageId(), text) catch |err| {
+        debug_trace.logf("hooks", "dropped system notice for ACP: bytes={d}: {s}", .{ text.len, @errorName(err) });
+    };
+}
+
+/// The ACP v1 severity a hook's notice shows with: a warning for a failed or dropped hook answer, `info` otherwise.
+fn hookNoticeSeverity(tone: agent_runtime.HookNoticeTone) []const u8 {
+    return switch (tone) {
+        .neutral => "info",
+        .warning => "warning",
+    };
+}
+
+/// A hook's notice. A client that set `session.notices` gets an ACP v1 Session Notice with the tone as its
+/// severity; any other client gets the notice as agent text, as before.
+fn pushHookNotice(raw_ctx: *anyopaque, tone: agent_runtime.HookNoticeTone, text: []const u8) !void {
+    const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
+    if (!ctx.state.client_notices) return pushSystemNotice(raw_ctx, text);
+    ctx.sendHookNotice(tone, text) catch |err| {
+        debug_trace.logf("hooks", "dropped hook notice for ACP: bytes={d}: {s}", .{ text.len, @errorName(err) });
+    };
+}
+
+/// Shows a settings or model change's hook notices on `session_id`. Such a change has no prompt
+/// turn. A client that did not set `session.notices` gets nothing: agent text outside a turn would
+/// show as a stray assistant message.
+pub fn sendSettingsHookNotices(
+    state: *server.ServerState,
+    alloc: Allocator,
+    session_id: []const u8,
+    notices: []const agent_runtime.HookNotice,
+) void {
+    if (notices.len == 0) return;
+    if (!state.client_notices) {
+        for (notices) |notice| {
+            debug_trace.logf("hooks", "kept hook notice off ACP: client has no notices: bytes={d}", .{notice.text.len});
+        }
+        return;
+    }
+    var ctx: AcpContext = .{ .alloc = alloc, .state = state, .session_id = session_id };
+    for (notices) |notice| {
+        pushHookNotice(&ctx, notice.tone, notice.text) catch |err| {
+            debug_trace.logf("hooks", "dropped settings hook notice for ACP: bytes={d}: {s}", .{ notice.text.len, @errorName(err) });
+        };
+    }
 }
 
 fn pushContextNotice(raw_ctx: *anyopaque, text: []const u8) !void {
@@ -3750,7 +3820,9 @@ fn pushContextNotice(raw_ctx: *anyopaque, text: []const u8) !void {
     if (!try session.session_rt.claimContextNotice(ctx.alloc, text)) return;
     // ACP v1 Session Notices where the client shows them;
     // otherwise a message, as ACP allows.
-    if (ctx.state.client_notices) return ctx.sendNotice(text) catch {};
+    if (ctx.state.client_notices) return ctx.sendNotice(text) catch |err| {
+        debug_trace.logf("hooks", "dropped context notice for ACP: bytes={d}: {s}", .{ text.len, @errorName(err) });
+    };
     try pushSystemNotice(raw_ctx, text);
 }
 
@@ -4808,6 +4880,66 @@ test "ACP tool notifications preserve UTF-8 for clipped and unsafe output" {
     }
 }
 
+/// Records the frames the JSON-RPC writer sends, for the hook notice test.
+const HookNoticeCapture = struct {
+    bytes: std.ArrayList(u8) = .empty,
+
+    fn write(raw: ?*anyopaque, frame: []const u8) anyerror!void {
+        const self: *HookNoticeCapture = @ptrCast(@alignCast(raw.?));
+        try self.bytes.appendSlice(std.testing.allocator, frame);
+    }
+};
+
+test "a hook notice is an ACP notice when the client set notices, and agent text when not" {
+    const alloc = std.testing.allocator;
+    var state = try initTestAcpState(alloc, "/tmp/workspace", .ask);
+    defer state.deinit();
+    var capture: HookNoticeCapture = .{};
+    defer capture.bytes.deinit(alloc);
+    state.writer = jsonrpc.Writer.initCallback(&capture, HookNoticeCapture.write);
+    var ctx = AcpContext{
+        .alloc = alloc,
+        .state = &state,
+        .session_id = "session_1",
+    };
+    const text = "Hook fail-open failed: exited with code 1: oops";
+
+    state.client_notices = true;
+    try pushHookNotice(@ptrCast(&ctx), .warning, text);
+    try std.testing.expect(std.mem.find(u8, capture.bytes.items, "\"sessionUpdate\":\"notice\",\"severity\":\"warning\"") != null);
+    try std.testing.expect(std.mem.find(u8, capture.bytes.items, "agent_message_chunk") == null);
+
+    capture.bytes.clearRetainingCapacity();
+    state.client_notices = false;
+    try pushHookNotice(@ptrCast(&ctx), .warning, text);
+    try std.testing.expect(std.mem.find(u8, capture.bytes.items, "\"sessionUpdate\":\"agent_message_chunk\"") != null);
+    try std.testing.expect(std.mem.find(u8, capture.bytes.items, "\"sessionUpdate\":\"notice\"") == null);
+}
+
+test "a settings hook notice reaches an ACP client only when it set notices" {
+    const alloc = std.testing.allocator;
+    var state = try initTestAcpState(alloc, "/tmp/workspace", .ask);
+    defer state.deinit();
+    var capture: HookNoticeCapture = .{};
+    defer capture.bytes.deinit(alloc);
+    state.writer = jsonrpc.Writer.initCallback(&capture, HookNoticeCapture.write);
+    const notices = [_]agent_runtime.HookNotice{.{ .tone = .warning, .text = "Hook guard failed: exited with code 1: oops" }};
+
+    state.client_notices = false;
+    sendSettingsHookNotices(&state, alloc, "session_1", &notices);
+    try std.testing.expectEqual(@as(usize, 0), capture.bytes.items.len);
+
+    state.client_notices = true;
+    sendSettingsHookNotices(&state, alloc, "session_1", &notices);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, capture.bytes.items, "\"sessionUpdate\":\"notice\""));
+    try std.testing.expect(std.mem.find(u8, capture.bytes.items, "agent_message_chunk") == null);
+}
+
+test "a hook's tone is the ACP notice severity" {
+    try std.testing.expectEqualStrings("info", hookNoticeSeverity(.neutral));
+    try std.testing.expectEqualStrings("warning", hookNoticeSeverity(.warning));
+}
+
 test "ACP message IDs rotate when the logical message kind resumes" {
     const alloc = std.testing.allocator;
     var state = try initTestAcpState(alloc, "/tmp/workspace", .ask);
@@ -5597,19 +5729,19 @@ test "ACP refreshes typed registry context and propagates enabled gathering erro
     var state = try initTestAcpState(alloc, "/tmp/workspace", .ask);
     defer state.deinit();
 
-    try refreshProjectContext(&state, alloc);
+    try refreshProjectContext(&state, alloc, null);
     try std.testing.expectEqual(@as(usize, 1), AcpContextRegistryFixture.gather_calls);
     var contribution = state.context_snapshot.contribution orelse return error.TestExpectedEqual;
     try std.testing.expectEqualStrings("test.acp_context", contribution.provider_id);
     try std.testing.expectEqualStrings("ACP registry context 1", contribution.content);
 
-    try refreshProjectContext(&state, alloc);
+    try refreshProjectContext(&state, alloc, null);
     try std.testing.expectEqual(@as(usize, 2), AcpContextRegistryFixture.gather_calls);
     contribution = state.context_snapshot.contribution orelse return error.TestExpectedEqual;
     try std.testing.expectEqualStrings("ACP registry context 2", contribution.content);
 
     state.context_enabled = false;
-    try refreshProjectContext(&state, alloc);
+    try refreshProjectContext(&state, alloc, null);
     try std.testing.expectEqual(@as(usize, 2), AcpContextRegistryFixture.gather_calls);
     try std.testing.expect(state.context_snapshot.contribution == null);
 
@@ -5617,7 +5749,7 @@ test "ACP refreshes typed registry context and propagates enabled gathering erro
     AcpContextRegistryFixture.gather_error = error.WriteFailed;
     try std.testing.expectError(
         error.WriteFailed,
-        refreshProjectContext(&state, alloc),
+        refreshProjectContext(&state, alloc, null),
     );
     try std.testing.expectEqual(@as(usize, 3), AcpContextRegistryFixture.gather_calls);
     try std.testing.expect(state.context_snapshot.contribution == null);
@@ -5628,7 +5760,7 @@ test "a copy of the project context keeps its bytes when the next prompt gathers
     AcpContextRegistryFixture.reset();
     var state = try initTestAcpState(alloc, "/tmp/workspace", .ask);
     defer state.deinit();
-    try refreshProjectContext(&state, alloc);
+    try refreshProjectContext(&state, alloc, null);
 
     // What a subagent's turn takes when it starts.
     var copy = try state.context_snapshot.dupe(alloc);
@@ -5636,7 +5768,7 @@ test "a copy of the project context keeps its bytes when the next prompt gathers
     try std.testing.expectEqualStrings("ACP registry context 1", copy.modelVisibleBytes());
 
     // The next prompt gathers the context again and frees the snapshot the copy was made from.
-    try refreshProjectContext(&state, alloc);
+    try refreshProjectContext(&state, alloc, null);
     try std.testing.expectEqualStrings("ACP registry context 2", state.context_snapshot.modelVisibleBytes());
     try std.testing.expectEqualStrings("ACP registry context 1", copy.modelVisibleBytes());
 }
@@ -5676,7 +5808,7 @@ test "ACP registry callbacks preserve snapshot bytes before transient context" {
 
     var state = try initTestAcpState(alloc, "/tmp/workspace", .ask);
     defer state.deinit();
-    try refreshProjectContext(&state, alloc);
+    try refreshProjectContext(&state, alloc, null);
 
     var ctx = AcpContext{
         .alloc = alloc,

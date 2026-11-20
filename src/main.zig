@@ -3,6 +3,7 @@ const agents = @import("core/agents/agents.zig");
 const builtin = @import("builtin");
 const build_options = @import("build_options");
 const io_mod = @import("core/shared/io.zig");
+const hooks_host = @import("core/hooks_host/hooks_host.zig");
 const profile_paths = @import("core/shared/profile_paths.zig");
 const terminal_env = @import("core/shared/terminal_env.zig");
 const env_settings = @import("core/config/env_settings.zig");
@@ -89,6 +90,8 @@ const file_index_mod = @import("core/workspace/file_index.zig");
 const mcp_host = @import("core/mcp_host/host.zig");
 const mcp_access_policy = @import("core/mcp/access_policy.zig");
 const app_mcp_runtime = @import("core/app/app_mcp_runtime.zig");
+const app_hook_job_runtime = @import("core/app/app_hook_job_runtime.zig");
+const app_hook_gate_runtime = @import("core/app/app_hook_gate_runtime.zig");
 const skill_commands = @import("core/skills/skill_commands.zig");
 const skill_runtime = @import("core/skills/skill_runtime.zig");
 const cli_surface = @import("core/cli/cli_surface.zig");
@@ -383,6 +386,7 @@ test "skill submit snapshot keeps display spans exact while agent bindings dedup
 var resize_interlock = shell_runtime.ResizeApprovalInterlock{};
 const default_context_registry = context_contract.Registry{ .default_provider = builtin_context.provider };
 const WorkspaceHostRuntime = if (host_target.is_wasm) js_host_workspace.Runtime else struct {};
+const UserHooksSlot = if (host_target.is_wasm) void else ?hooks_host.Runtime;
 const selected_host_profile = if (host_target.is_wasm) host_runtime_profile.wasm else host_runtime_profile.native;
 const app_api_key_validator = if (host_target.is_wasm)
     api_key_validator.unavailable_provider
@@ -574,6 +578,8 @@ const App = struct {
     web_search_models_path: []const u8 = builtin_gateway.models_path,
     lifecycle_runtime: hooks.Runtime = hooks.Runtime.init(std.heap.c_allocator),
     lifecycle_view: hooks.RuntimeView = hooks.RuntimeView.empty(),
+    /// The user's hooks runtime for this process, or null when hooks are off or on Wasm.
+    user_hooks: UserHooksSlot = if (host_target.is_wasm) {} else null,
     notifications: builtin_hooks.notifications.State = .{},
     herdr: builtin_hooks.Client = .{},
     program_status: ui_program_status.Reporter = .{},
@@ -624,6 +630,10 @@ const App = struct {
 
     upgrader: auto_upgrade.AutoUpgrade = .{},
     mcp: app_mcp_runtime.State = .{},
+    /// The `/hook` verbs, run off the UI thread (app_hook_job_runtime.zig).
+    hook_job: app_hook_job_runtime.State = .{},
+    /// A setting change waiting for its ConfigChange hooks (app_hook_gate_runtime.zig).
+    hook_gate: app_hook_gate_runtime.State = .{},
     /// The profiles `/launch` completes.
     launch_completion: app_profile_runtime.LaunchCompletion = .{},
     skills: skill_runtime.Runtime = .{},
@@ -968,6 +978,9 @@ const App = struct {
     /// The caller must end the process without further teardown; the returned
     /// handoff is owned by the caller.
     pub fn shutdownForProcessExit(self: *App) app_session_runtime.ShutdownOutcome {
+        // The process ends here, so every session closed below reports exit, whatever brought it here. A hangup
+        // closes without setting should_exit, and its SessionEnd hooks would otherwise run as a switch.
+        self.should_exit = true;
         // Shutdown is main's own; its subagents stop in stopChildren and
         // shutdownChildren. Main is named here, not found as the agent on
         // screen, so quitting from a subagent's screen stops main.
@@ -1041,6 +1054,9 @@ const App = struct {
         shutdown_trace.mark("credentials_saved");
         self.mcp.deinitForProcessExit();
         shutdown_trace.mark("mcp_children_terminated");
+        self.hook_gate.deinit();
+        self.hook_job.deinit();
+        shutdown_trace.mark("hook_job_joined");
         shutdown_trace.mark("complete");
         if (was_interactive) app_lifecycle.writeLastShutdownReport(self.alloc, &shutdown_trace);
         return .{ .handoff = resume_handoff, .failure = shutdown_failure };
@@ -1130,6 +1146,8 @@ const App = struct {
         main_agent.change_tracker.deinit(std.heap.c_allocator);
         for (main_agent.diff_entries.items) |*entry| entry.deinit(std.heap.c_allocator);
         main_agent.diff_entries.deinit(std.heap.c_allocator);
+        self.hook_job.deinit();
+        shutdown_trace.mark("hook_job_joined");
         self.mcp.deinit();
         shutdown_trace.mark("mcp_deinit");
         self.launch_completion.deinit();
@@ -1138,6 +1156,11 @@ const App = struct {
         self.main_agent.profile.deinit();
         self.file_index.deinit(std.heap.c_allocator);
         self.lifecycle_runtime.deinit();
+        if (comptime !host_target.is_wasm) {
+            // The check holds the hook runtime, so it ends first (cancel, then join).
+            self.hook_gate.deinit();
+            if (self.user_hooks) |*rt| rt.deinit();
+        }
 
         self.auth.deinit(self.alloc);
         WorkspaceAppRuntime.deinit(self);
@@ -3309,6 +3332,8 @@ const App = struct {
             AuthAppRuntime.collectDeferredStartupInventory(self);
         }
         if (comptime host_profile.durable_sessions) SessionAppRuntime.collectInterruptedTurnHint(self);
+        // Before the submit facts: a held prompt starts with the settings the gate decided in this same tick (R2.1).
+        try app_commands.Handlers(App).collectHookGateFacts(self);
         InputSubmitRuntime.collectPendingSubmissionFacts(self, self.screenAgent());
         try InputSubmitRuntime.collectLaunchPromptFacts(self, max_prompt_history);
         InputAppRuntime.collectFilePickerFacts(self, self.screenAgent());
@@ -3336,6 +3361,7 @@ const App = struct {
             RenderAppRuntime.requestActiveSurfaceFrame(self, .footer);
         }
         try app_commands.Handlers(App).collectMcpHostFacts(self, self.screenAgent());
+        try app_commands.Handlers(App).collectHookVerbFacts(self);
         if (self.launch_completion.refresh(self.alloc, self.input_runtime.edit_state.input.items, io_mod.homeDir(), self.workspace_root, self.instances.seed.launchDefaults())) {
             RenderAppRuntime.requestActiveSurfaceFrame(self, .footer);
         }
@@ -4254,6 +4280,10 @@ fn needsEarlyThreadedIo(args: []const [:0]const u8) bool {
             std.mem.eql(u8, effective_args[1], "approve") or
             std.mem.eql(u8, effective_args[1], "reject");
     }
+    if (std.mem.eql(u8, command, "hook") or std.mem.eql(u8, command, "hooks")) {
+        // `fx hook test` starts the hook commands as child processes.
+        return effective_args.len >= 2 and std.mem.eql(u8, effective_args[1], "test");
+    }
     return std.mem.eql(u8, command, "slack") or
         std.mem.eql(u8, command, "login") or
         std.mem.eql(u8, command, "logout") or
@@ -4284,6 +4314,17 @@ test "auth and upgrade commands use early threaded io without full entry config"
     try std.testing.expect(needsEarlyThreadedIo(&.{@as([:0]const u8, "provider")}));
     try std.testing.expect(needsEarlyThreadedIo(&.{@as([:0]const u8, "usage")}));
     try std.testing.expect(needsEarlyThreadedIo(&.{@as([:0]const u8, "setup")}));
+}
+
+test "fx hook test uses early threaded io, and the other hook verbs do not" {
+    const test_pre = [_][:0]const u8{ "hook", "test", "PreToolUse" };
+    const test_stop = [_][:0]const u8{ "hooks", "test", "Stop" };
+    const list = [_][:0]const u8{ "hook", "list" };
+    const bare = [_][:0]const u8{"hook"};
+    try std.testing.expect(needsEarlyThreadedIo(&test_pre));
+    try std.testing.expect(needsEarlyThreadedIo(&test_stop));
+    try std.testing.expect(!needsEarlyThreadedIo(&list));
+    try std.testing.expect(!needsEarlyThreadedIo(&bare));
 }
 
 test "every alias of an early threaded io command uses early threaded io" {
@@ -4649,6 +4690,10 @@ fn emptyEntryConfig(auth_mode: credentials.AuthMode) app_entry_runtime.Config {
 }
 
 fn runAcpServer(_: ?*anyopaque, alloc: Allocator, cfg: acp_runner.Config) anyerror!void {
+    // Only the `fx acp` command installs the signal handlers. The libfx addon starts the server through
+    // `acp_server.runWithTransport` (napi_core_main.zig) and never reaches this function (R1.4, R3.9).
+    hooks_host.installExitSignals(&hooks_host.surface_exit_signals);
+    defer hooks_host.restoreExitSignals(&hooks_host.surface_exit_signals);
     return acp_server.run(alloc, cfg);
 }
 
@@ -5400,6 +5445,9 @@ test {
     _ = @import("core/agent/runtime/journal.zig");
     _ = @import("acp/libfx_journal.zig");
     _ = @import("mcp/mcp.zig");
+    _ = @import("hooks/hooks.zig");
+    _ = @import("core/hooks_host/hooks_host.zig");
+    _ = @import("core/hooks_host/decoder_tests.zig");
     _ = @import("core/mcp_host/runtime.zig");
     _ = @import("core/mcp_host/wire_tests.zig");
     _ = @import("core/mcp_host/mcp_call.zig");
@@ -5430,6 +5478,7 @@ test {
     _ = @import("core/agent/runtime/tool_admission.zig");
     _ = @import("core/agent/runtime/prompt_context.zig");
     _ = @import("core/agent/runtime/runtime_context.zig");
+    _ = @import("core/agent/runtime/user_hooks.zig");
     _ = @import("core/app/app_agent_runtime.zig");
     _ = @import("core/app/app_auth_runtime.zig");
     _ = auth_runtime;
@@ -5443,6 +5492,8 @@ test {
     _ = @import("core/workspace/auto_review_metrics.zig");
     _ = @import("core/app/app_workspace_runtime.zig");
     _ = @import("core/app/app_bootstrap_runtime.zig");
+    _ = @import("core/app/app_hook_job_runtime.zig");
+    _ = @import("core/app/app_hook_gate_runtime.zig");
     _ = @import("core/app/app_callbacks.zig");
     _ = @import("core/app/app_commands.zig");
     _ = @import("core/app/usage_host.zig");
@@ -5482,6 +5533,7 @@ test {
     _ = @import("core/cli/cli_ask.zig");
     _ = @import("core/cli/cli_replay.zig");
     _ = @import("core/cli/cli_surface.zig");
+    _ = @import("core/cli/hook_verbs.zig");
     _ = @import("core/slack/install.zig");
     _ = @import("core/workspace/change_tracker.zig");
     _ = @import("core/shared/collections.zig");

@@ -66,7 +66,10 @@ const project_config = @import("../mcp/project_config.zig");
 const mcp_host = @import("../mcp_host/host.zig");
 const mcp_verbs = @import("../mcp_host/verbs.zig");
 const text_utils = @import("../shared/text_utils.zig");
+const fuzzy_match = @import("../shared/fuzzy_match.zig");
 const profile_paths = @import("../shared/profile_paths.zig");
+const hooks_host = @import("../hooks_host/hooks_host.zig");
+const hook_verbs = @import("hook_verbs.zig");
 const tool_set_contract = @import("../tooling/tool_set.zig");
 const workspace_access = @import("../workspace/workspace_access.zig");
 const workspace_commands = @import("../workspace/workspace_commands.zig");
@@ -91,6 +94,7 @@ pub const Command = union(enum) {
     status: []const [:0]const u8,
     permissions: []const [:0]const u8,
     mcp: []const [:0]const u8,
+    hook: []const [:0]const u8,
     slack: []const [:0]const u8,
     models: []const [:0]const u8,
     provider: []const [:0]const u8,
@@ -455,6 +459,8 @@ const WriteFn = *const fn (?*anyopaque, []const u8) anyerror!void;
 const LoadStartupStateFn = *const fn (Allocator, oauth_transport.Provider, host.SecretStore, []const u8, usize) anyerror!app_lifecycle.StartupState;
 const LoadStartupStateWithoutCredentialsFn = *const fn (Allocator, []const u8, usize) anyerror!app_lifecycle.StartupState;
 const LoadStartupStatusFn = *const fn (Allocator, host.SecretStore, []const u8, usize) anyerror!app_lifecycle.StartupStatus;
+const LoadHookSettingsFn = *const fn (Allocator, []const u8) anyerror!config_runtime.DetailedSettings;
+const StatusHooksFn = *const fn (Allocator, bool, ?[]const u8, []const u8) output_contracts.HooksStatus;
 const LoadStartupStateWithAuthModeFn = *const fn (Allocator, oauth_transport.Provider, host.SecretStore, []const u8, usize, credentials.AuthMode) anyerror!app_lifecycle.StartupState;
 const LoadCatalogStartupStateWithAuthModeFn = *const fn (Allocator, host.SecretStore, []const u8, usize, credentials.AuthMode, ?model_provider.ProviderId, ?[]const u8) anyerror!app_lifecycle.StartupState;
 const LoadStartupStatusWithAuthModeFn = *const fn (Allocator, host.SecretStore, []const u8, usize, credentials.AuthMode) anyerror!app_lifecycle.StartupStatus;
@@ -473,6 +479,11 @@ const RunDeps = struct {
     load_startup_state_with_auth_mode: LoadStartupStateWithAuthModeFn = app_lifecycle.loadStartupStateWithAuthMode,
     load_catalog_startup_state_with_auth_mode: LoadCatalogStartupStateWithAuthModeFn = app_lifecycle.loadCatalogStartupStateWithAuthMode,
     load_startup_status_with_auth_mode: LoadStartupStatusWithAuthModeFn = app_lifecycle.loadStartupStatusWithAuthMode,
+    load_hook_settings: LoadHookSettingsFn = config_runtime.loadMergedSettingsDetailed,
+    /// The hooks `fx status` shows. Tests stand in for it, so no test reads a real profile.
+    status_hooks: StatusHooksFn = hook_verbs.statusHooks,
+    /// The hooks `fx doctor` checks. Tests stand in for it, so no test reads a real profile.
+    summarize_hooks: doctor_runtime.HookSummaryFn = hook_verbs.loadSummary,
     environ_map: EnvironMapFn = environMapDefault,
     read_masked_key: ReadMaskedKeyFn = readMaskedKeyDefault,
     setup_terminal_available: SetupTerminalAvailableFn = setupTerminalAvailableDefault,
@@ -748,6 +759,7 @@ pub fn parse(command_catalog: CommandCatalog, args: []const [:0]const u8) Comman
     switch (command[0]) {
         '-', 'h' => {
             if (command_specs.matchesTopLevel(command_catalog, command, .help)) return .help;
+            if (command_specs.matchesTopLevel(command_catalog, command, .hook)) return .{ .hook = args[1..] };
             if (command_specs.matchesTopLevel(command_catalog, command, .@"resume") or
                 std.mem.startsWith(u8, command, resume_inline_prefix) or
                 std.mem.startsWith(u8, command, resume_id_alias_prefix))
@@ -1885,6 +1897,10 @@ fn runNonInteractiveWithDeps(
             const fx_home = try profile_paths.activeRoot(alloc, io_mod.homeDir());
             defer if (fx_home) |path| alloc.free(path);
             snapshot.fx_home = fx_home;
+            // The hooks line reads the same files `fx hook list` reads. Its strings live until this command returns.
+            var hooks_arena = std.heap.ArenaAllocator.init(alloc);
+            defer hooks_arena.deinit();
+            snapshot.hooks = deps.status_hooks(hooks_arena.allocator(), startup.experimental_hooks, io_mod.homeDir(), startup.workspace_root);
             if (opts.format == .json) {
                 try writeStatusJsonLine(alloc, deps, snapshot);
                 return .handled_success;
@@ -1941,6 +1957,9 @@ fn runNonInteractiveWithDeps(
         },
         .mcp => |rest| {
             return runTopLevelMcp(alloc, rest, cfg, deps);
+        },
+        .hook => |rest| {
+            return runTopLevelHook(alloc, rest, cfg, deps);
         },
         .models => |rest| {
             const opts = parseLocalSurfaceArgs(modelsListArgs(rest)) catch |err| {
@@ -2836,6 +2855,118 @@ fn localMcpView(
     };
 }
 
+/// `fx hook`: runs the verbs in `hook_verbs.zig`, the same code the TUI's `/hook` runs. The settings and
+/// the workspace are read only when a verb runs. A usage error, and fx's own agent asking for a refused
+/// trust change, read nothing. A settings file that does not parse is ignored with its diagnostic, as
+/// `fx status` ignores it: hooks stay off and the verb still runs.
+fn runTopLevelHook(alloc: Allocator, rest: []const [:0]const u8, cfg: Config, deps: RunDeps) !RunResult {
+    _ = cfg;
+    const agent_is_fx = hooks_host.trust.refusedForAgent(io_mod.getenv("AI_AGENT"));
+    if (!hook_verbs.needsSettings(rest, agent_is_fx)) {
+        return printHookRun(alloc, deps, rest, false, "", agent_is_fx);
+    }
+    const workspace_root = try io_mod.realpathAlloc(alloc, ".");
+    defer alloc.free(workspace_root);
+    debug_trace.configureFromEnv(alloc, workspace_root);
+    // The same loader and the same `experimental.hooks` value `fx status` reads. Unlike the startup state
+    // loader, it has no guard for a rejected profile, so a malformed file is a diagnostic, not a failure.
+    var detailed = deps.load_hook_settings(alloc, workspace_root) catch |err| {
+        try writeStderrLine(alloc, deps, "fx hook: could not read settings: {s}\n", @errorName(err));
+        return .handled_failure;
+    };
+    defer detailed.deinit(alloc);
+    try writeConfigDiagnostics(alloc, deps, detailed.diagnostics);
+    return printHookRun(alloc, deps, rest, detailed.settings.experimental_hooks orelse false, workspace_root, agent_is_fx);
+}
+
+/// Runs the verbs with buffered output, then writes that output to the terminal.
+fn printHookRun(
+    alloc: Allocator,
+    deps: RunDeps,
+    rest: []const [:0]const u8,
+    hooks_enabled: bool,
+    workspace_root: []const u8,
+    agent_is_fx: bool,
+) !RunResult {
+    var stdout_text: std.Io.Writer.Allocating = .init(alloc);
+    defer stdout_text.deinit();
+    var stderr_text: std.Io.Writer.Allocating = .init(alloc);
+    defer stderr_text.deinit();
+    // A signal ends the hook group too (R3.9). Only this command-line path installs the handlers: the TUI runs the same
+    // verbs on its job thread, and a handler there would replace the TUI's own signal closer (R2.5).
+    const code = blk: {
+        hooks_host.installExitSignals(&hooks_host.surface_exit_signals);
+        defer hooks_host.restoreExitSignals(&hooks_host.surface_exit_signals);
+        break :blk hook_verbs.run(.{
+            .gpa = alloc,
+            .out = &stdout_text.writer,
+            .err = &stderr_text.writer,
+            .home = io_mod.homeDir(),
+            .workspace_root = workspace_root,
+            .hooks_enabled = hooks_enabled,
+            .agent_is_fx = agent_is_fx,
+        }, rest);
+    };
+    try writeStdout(deps, stdout_text.written());
+    try writeStderr(deps, stderr_text.written());
+    return switch (code) {
+        0 => .handled_success,
+        1 => .handled_failure,
+        else => .{ .handled_exit = code },
+    };
+}
+
+test "fx hook with a malformed settings file treats hooks as off, names the problem, and still lists" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(home);
+    try tmp.dir.createDirPath(io_mod.getIo(), ".fx");
+    const settings_path = try std.Io.Dir.path.join(alloc, &.{ home, ".fx", "settings.json" });
+    defer alloc.free(settings_path);
+    try io_mod.writeFileAtomic(alloc, settings_path, "{not json");
+
+    var environ = std.process.Environ.Map.init(alloc);
+    defer environ.deinit();
+    try environ.put("HOME", home);
+    io_mod.setEnvironMap(&environ);
+    defer io_mod.resetEnvironForTest();
+
+    var capture = CaptureOutput.init(alloc);
+    defer capture.deinit();
+    const deps = capture.deps();
+    const result = try runIfRequestedWithDeps(
+        alloc,
+        &.{ @constCast("hook"), @constCast("list") },
+        testConfig(),
+        deps,
+    );
+    try std.testing.expectEqual(RunResult.handled_success, result);
+    try std.testing.expect(std.mem.find(u8, capture.stdout.written(), "experimental.hooks is off") != null);
+    try std.testing.expect(std.mem.find(u8, capture.stderr.written(), "malformed_settings") != null);
+}
+
+test "fx hook reads list, ls, and show with --json" {
+    switch (parse(testCommandCatalog(), &.{ @constCast("hooks"), @constCast("ls"), @constCast("--json") })) {
+        .hook => |rest| try std.testing.expectEqual(@as(usize, 2), rest.len),
+        else => return error.TestExpectedEqual,
+    }
+    const listed = try hook_verbs.parseHookArgs(&.{ "ls", "--json" });
+    try std.testing.expect(listed.json);
+    try std.testing.expect(listed.command == .list);
+    const shown = try hook_verbs.parseHookArgs(&.{ "show", "lint" });
+    try std.testing.expectEqualStrings("lint", shown.command.show);
+    try std.testing.expect(!shown.json);
+    try std.testing.expectError(error.HookNeedsId, hook_verbs.parseHookArgs(&.{"show"}));
+    try std.testing.expectError(error.HookNeedsCommand, hook_verbs.parseHookArgs(&.{"--json"}));
+    try std.testing.expectError(error.UnknownHookCommand, hook_verbs.parseHookArgs(&.{"frob"}));
+    try std.testing.expectError(error.TooManyHookArgs, hook_verbs.parseHookArgs(&.{ "list", "extra" }));
+    try std.testing.expectError(error.InvalidHookFlag, hook_verbs.parseHookArgs(&.{ "list", "--nope" }));
+    try std.testing.expectEqualStrings("list", hook_verbs.hookWordSuggestion("lst").?);
+    try std.testing.expect(hook_verbs.hookWordSuggestion("frob") == null);
+}
+
 fn runTopLevelMcp(
     alloc: Allocator,
     rest: []const [:0]const u8,
@@ -3028,6 +3159,7 @@ fn parsedOptions(kind: TopLevelKind) ?[]const command_specs.OptionDoc {
         .usage => &builtin_commands.usage_options,
         .upgrade => &builtin_commands.upgrade_options,
         .workspace => &builtin_commands.workspace_options,
+        .hook => &builtin_commands.hook_parse_options,
         .config => &builtin_commands.config_parse_options,
         .session => &builtin_commands.session_options,
         .acp => &builtin_commands.acp_options,
@@ -4608,6 +4740,7 @@ fn runDoctor(alloc: Allocator, cfg: Config, deps: RunDeps, opts: DoctorOptions) 
             .version = cfg.version,
             .channel = cfg.build_channel.label(),
             .skill_root_policy = cfg.skill_root_policy,
+            .summarize_hooks = deps.summarize_hooks,
         },
     );
     defer snapshot.deinit(alloc);
@@ -7199,6 +7332,27 @@ test "runIfRequested local json success appends exactly one newline" {
     try std.testing.expect(!std.mem.endsWith(u8, capture.stdout.written(), "\n\n"));
 }
 
+test "status JSON carries the hooks state the seam reports" {
+    const alloc = std.testing.allocator;
+    var status_capture = CaptureOutput.init(alloc);
+    defer status_capture.deinit();
+    var status_deps = status_capture.deps();
+    status_deps.load_startup_status = stubLoadStartupStatus;
+    status_deps.status_hooks = statusHooksTwoWaiting;
+    const result = try runIfRequestedWithDeps(
+        alloc,
+        &.{ @constCast("status"), @constCast("--json") },
+        testConfig(),
+        status_deps,
+    );
+    try std.testing.expectEqual(RunResult.handled_success, result);
+    try std.testing.expect(std.mem.find(
+        u8,
+        status_capture.stdout.written(),
+        ",\"hooks\":{\"enabled\":true,\"count\":2,\"trusted\":1,\"waiting\":1,\"disabled\":0,\"problems\":0,\"trust_refused\":false}}",
+    ) != null);
+}
+
 test "status and doctor inspect MCP configuration once per command" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -7348,6 +7502,8 @@ const CaptureOutput = struct {
             .write_stdout = captureStdout,
             .write_stderr = captureStderr,
             .read_masked_key = captureReadMaskedKey,
+            .status_hooks = statusHooksNotChecked,
+            .summarize_hooks = summarizeHooksNone,
             .setup_terminal_available = captureSetupTerminalAvailable,
         };
     }
@@ -7529,6 +7685,19 @@ fn stubLoadStartupStateWithoutCredentials(
     errdefer state.deinit(alloc);
     state.workspace_root = try alloc.dupe(u8, "/tmp/fx");
     return state;
+}
+
+/// Test stand-ins for the hook reads: the default test deps report nothing read, so no test reads a real profile.
+fn statusHooksNotChecked(_: Allocator, _: bool, _: ?[]const u8, _: []const u8) output_contracts.HooksStatus {
+    return .not_checked;
+}
+
+fn summarizeHooksNone(_: Allocator, enabled: bool, _: []const u8, _: []const u8) anyerror!output_contracts.HooksSummary {
+    return .{ .enabled = enabled, .count = 0, .trusted = 0, .waiting = 0, .disabled = 0, .trust_refused = false, .problems = &.{} };
+}
+
+fn statusHooksTwoWaiting(_: Allocator, _: bool, _: ?[]const u8, _: []const u8) output_contracts.HooksStatus {
+    return .{ .summary = .{ .enabled = true, .count = 2, .trusted = 1, .waiting = 1, .disabled = 0, .trust_refused = false, .problems = &.{} } };
 }
 
 fn failingStartupStateWithoutCredentials(

@@ -1,6 +1,9 @@
 const std = @import("std");
 const agents = @import("../agents/agents.zig");
 const app_worker_runtime = @import("app_worker_runtime.zig");
+const app_hook_gate_runtime = @import("app_hook_gate_runtime.zig");
+const app_session_runtime = @import("app_session_runtime.zig");
+const app_agent_runtime = @import("app_agent_runtime.zig");
 const config_runtime = @import("../config/config_runtime.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const io_mod = @import("../shared/io.zig");
@@ -19,6 +22,12 @@ pub const State = struct {
 
 pub const yolo_warning_text = permissions.yolo_warning_text;
 pub const yolo_warning_compact_text = "Full access";
+/// What a permission-mode change did. `pending`: a hook check runs, and the change applies when its answer comes (R2.1).
+pub const ModeChange = enum { applied, refused, pending };
+
+/// Where a mode change came from. A typed `/permissions` prints its notice when the change applies; Shift+Tab prints none.
+pub const ChangeOrigin = enum { typed, shortcut };
+
 const yolo_warning_visible_ms: i64 = 4000;
 
 pub fn monotonicMillis() i64 {
@@ -339,6 +348,28 @@ pub fn Runtime(comptime App: type) type {
         }
 
         pub fn selectMode(app: *App, agent: *AppAgent, mode: types.PermissionMode) !void {
+            _ = try trySelectMode(app, agent, mode, .shortcut);
+        }
+
+        /// Sets `mode` and saves it, as `selectMode` does. When a ConfigChange hook would run for the change,
+        /// the change waits for its answer: the result is `pending`, and `finishGatedChange` applies or shows it on a
+        /// later tick (R2.1). `refused` means a hook refused it or another change already waits; nothing changed then.
+        pub fn trySelectMode(app: *App, agent: *AppAgent, mode: types.PermissionMode, origin: ChangeOrigin) !ModeChange {
+            const current = modeOf(app, agent);
+            if (mode != current) {
+                if (try gateModeChange(app, agent, .{
+                    .old = current,
+                    .target = mode,
+                    .reset = false,
+                    .typed = origin == .typed,
+                })) |outcome| return outcome;
+            }
+            try applySelectMode(app, agent, mode);
+            return .applied;
+        }
+
+        /// The steps of a mode change that no hook refused: set it, save it, and finish the preference.
+        fn applySelectMode(app: *App, agent: *AppAgent, mode: types.PermissionMode) !void {
             setMode(app, agent, mode);
             if (comptime @hasDecl(App, "persistAcceptedPermissionMode")) {
                 try app.persistAcceptedPermissionMode(mode);
@@ -358,6 +389,103 @@ pub fn Runtime(comptime App: type) type {
         /// `/permissions reset` on `agent`'s screen: its permission owner goes
         /// back to ask with no session approvals.
         pub fn reset(app: *App, agent: *AppAgent) !void {
+            _ = try tryReset(app, agent, .shortcut);
+        }
+
+        /// Resets as `reset` does. The mode change the reset makes (to ask) waits for a ConfigChange hook as
+        /// `trySelectMode` does. `refused` means nothing changed.
+        pub fn tryReset(app: *App, agent: *AppAgent, origin: ChangeOrigin) !ModeChange {
+            const current = modeOf(app, agent);
+            if (current != .ask) {
+                if (try gateModeChange(app, agent, .{
+                    .old = current,
+                    .target = .ask,
+                    .reset = true,
+                    .typed = origin == .typed,
+                })) |outcome| return outcome;
+            }
+            try resetNow(app, agent);
+            return .applied;
+        }
+
+        /// Starts the hook check for a mode change. Null when no trusted hook would run for it: the caller applies the change
+        /// now. `.pending` when the check started. `.refused` when another change waits, or the check could not start: the change
+        /// fails closed, with a notice (R4.2).
+        fn gateModeChange(app: *App, agent: *AppAgent, change: app_hook_gate_runtime.PermissionModeChange) !?ModeChange {
+            if (comptime !@hasField(App, "hook_gate")) return null;
+            const lifecycle = app_agent_runtime.Runtime(App).lifecycleContext(app, agent);
+            const session_id = app_session_runtime.Runtime(App).activeSessionId(agent);
+            const started = app.hook_gate.begin(lifecycle, .{ .permission_mode = change }, @intFromPtr(agent), session_id) catch |err| {
+                switch (err) {
+                    error.HookGateBusy => writeChangeNotice(app, "A hook check is still running. Press Esc twice to stop it."),
+                    else => {
+                        debug_trace.logf("hooks", "refused the permission mode change: its hook check could not start: {s}", .{@errorName(err)});
+                        writeChangeNotice(app, "The permission mode change was refused: its hook check could not start.");
+                    },
+                }
+                return .refused;
+            };
+            return if (started) .pending else null;
+        }
+
+        /// Applies or shows a finished permission-mode check, on the UI thread (R2.1). The change applies to the screen
+        /// agent of the session it was made in. If either changed meanwhile, the change is dropped and the person is told.
+        pub fn finishGatedChange(app: *App, taken: *app_hook_gate_runtime.Taken) !void {
+            const agent = agents.screenAgentOf(app);
+            if (!app_agent_runtime.gatedTargetIsCurrent(app, taken)) {
+                debug_trace.logf("hooks", "dropped the permission mode change: the screen or the session changed while its hook check ran", .{});
+                writeChangeNotice(app, "The permission mode change was dropped: the session changed while its hooks ran.");
+                return;
+            }
+            switch (taken.result.outcome) {
+                .allowed => {},
+                .refused => writeChangeNotice(app, taken.result.refusal orelse "A hook refused the permission mode change."),
+                .cancelled => writeChangeNotice(app, "The permission mode change was cancelled. Its hooks were stopped."),
+            }
+            app_agent_runtime.showHookNotices(app, taken.result.notices, "ConfigChange");
+            if (taken.result.outcome != .allowed) return;
+            switch (taken.change) {
+                .permission_mode => |change| {
+                    if (change.reset) {
+                        try resetNow(app, agent);
+                        if (change.typed) try writeResetNotice(app);
+                    } else {
+                        try applySelectMode(app, agent, change.target);
+                        if (change.typed) try writeModeNotice(app, change.target);
+                    }
+                },
+                // The other kinds finish where they apply: settings in app_commands.zig, models in session_commands.zig.
+                .setting, .model, .model_switched => unreachable,
+            }
+        }
+
+        /// The notice a typed `/permissions <mode>` prints once the mode is set.
+        pub fn writeModeNotice(app: *App, mode: types.PermissionMode) !void {
+            try app.writeDomainNotice(.{
+                .topic = "permissions",
+                .tone = if (mode == .yolo) .warning else .neutral,
+                .body = switch (mode) {
+                    .ask => "mode set to ask",
+                    .auto => "mode set to auto",
+                    .yolo => "mode set to full access",
+                },
+            }, true);
+        }
+
+        /// The notice a typed `/permissions reset` prints once the reset is made.
+        pub fn writeResetNotice(app: *App) !void {
+            try app.writeDomainNotice(.{ .topic = "permissions", .tone = .neutral, .body = "permissions reset to ask, session grants cleared" }, true);
+        }
+
+        /// A notice about a gated change (a permission mode or a model) that waits, was refused, or was dropped. A notice
+        /// that cannot be shown is traced.
+        pub fn writeChangeNotice(app: *App, body: []const u8) void {
+            app.writeDomainNotice(.{ .topic = "settings", .tone = .warning, .body = body }, true) catch |err| {
+                debug_trace.logf("hooks", "dropped a permission mode notice: {s}", .{@errorName(err)});
+            };
+        }
+
+        fn resetNow(app: *App, agent: *AppAgent) !void {
             lockAuthority(app);
             if (comptime per_instance) {
                 const owner = permissionOwner(app, agent);

@@ -195,6 +195,15 @@ pub const RefreshedGatewayCredential = struct {
     gateway_team_label: ?[]u8 = null,
 };
 
+/// The tone a hook's notice shows with. A failure or a dropped answer is a warning; the rest are neutral.
+pub const HookNoticeTone = enum { neutral, warning };
+
+/// One hook notice with the tone it shows with.
+pub const HookNotice = struct {
+    tone: HookNoticeTone,
+    text: []const u8,
+};
+
 pub const AgentRuntimeDeps = struct {
     /// The steps of `start_workspace_capture`.
     pub const WorkspaceCaptureStep = enum { begin, capture };
@@ -321,6 +330,8 @@ pub const AgentRuntimeDeps = struct {
     /// Source-limit notices use a session-scoped deduplicating path when the
     /// host provides one; ordinary system notices remain unaffected.
     push_context_notice: ?*const fn (ctx: *anyopaque, text: []const u8) anyerror!void = null,
+    /// Shows a hook's notice with its tone, under topic `hooks`. Null: the notice goes to `push_system_notice`.
+    push_hook_notice: ?*const fn (ctx: *anyopaque, tone: HookNoticeTone, text: []const u8) anyerror!void = null,
     /// A notice the person should see once in a live session, however many
     /// turns repeat its cause. The host shows it where they read the
     /// transcript and drops a text it has already shown. Null: the host has
@@ -363,6 +374,12 @@ pub const AgentRuntimeDeps = struct {
     // Captured by value at construction; that is safe only while the marker
     // colors never change after startup (they are theme-independent).
     diff_marker_styles: DiffMarkerStyles = .{},
+
+    /// Shows a hook's notice with its tone. Without `push_hook_notice`, the text goes out as a system notice.
+    pub fn pushHookNotice(self: *const AgentRuntimeDeps, tone: HookNoticeTone, text: []const u8) !void {
+        if (self.push_hook_notice) |push| return push(self.ctx, tone, text);
+        return self.push_system_notice(self.ctx, text);
+    }
 
     pub fn pushContextNotice(self: *const AgentRuntimeDeps, text: []const u8) !void {
         if (self.push_context_notice) |push| return push(self.ctx, text);

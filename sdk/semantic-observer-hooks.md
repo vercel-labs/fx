@@ -1,7 +1,8 @@
 # Semantic observer hooks
 
-libfx exposes execution facts to host-owned instrumentation through `hooks`.
-See [the SDK contract](README.md#instrumentation-hooks) for usage and
+libfx exposes execution facts to host-owned instrumentation through `observe`
+(its old name, `hooks`, still works and is deprecated).
+See [the SDK contract](README.md#observe-semantic-execution) for usage and
 `sdk/types/libfx.d.cts` for event types.
 
 The JavaScript host owns trace topology, span names, attribute conventions,
@@ -66,7 +67,7 @@ host boundary; the isolated MCP engine has no tracing imports.
 Native child runtimes allocate a fresh execution observer and carry the existing
 durable message/work identity. They don't retain a pointer to a parent's
 turn-scoped observer. Host-created JavaScript children receive the equivalent
-parent relationship through `context.observation.childHooks()`.
+parent relationship through `context.observation.childObserve()`.
 
 ## Lifecycle and durability rules
 

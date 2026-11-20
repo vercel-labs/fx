@@ -129,6 +129,7 @@ const Writable = enum {
     collapse_tool_calls,
     context,
     effort,
+    @"experimental.hooks",
     fast_mode,
     max_agent_steps,
     max_tool_result_bytes,
@@ -231,6 +232,7 @@ pub fn change(options: Options, problem: *WriteProblem) error{ RefusedConfigSett
         .cache_warming => patch.cache_warming = enabled,
         .collapse_tool_calls => patch.collapse_tool_calls = enabled,
         .context => patch.context = enabled,
+        .@"experimental.hooks" => patch.experimental_hooks = enabled,
         .fast_mode => patch.fast_mode = enabled,
         .@"prompt_history.enabled" => patch.prompt_history_enabled = enabled,
         .provider_strict => patch.provider_strict = enabled,
@@ -290,6 +292,7 @@ fn ownerHint(key: []const u8) []const u8 {
         .{ .keys = &.{"status_line"}, .hint = "set status_line.context, status_line.session, or status_line.workspace" },
         .{ .keys = &.{"sound"}, .hint = "set sound.turn_end, sound.attention_required, or sound.max" },
         .{ .keys = &.{"prompt_history"}, .hint = "set prompt_history.enabled" },
+        .{ .keys = &.{"experimental"}, .hint = "set experimental.hooks" },
         .{ .keys = &.{"tool_placement"}, .hint = "set tool_placement.<tool> to toolbox or direct, for one of " ++ config_runtime.tool_placement.movable_list },
     };
     for (hints) |entry| {
@@ -449,16 +452,16 @@ pub const Effective = union(enum) {
 /// The keys `fx config` reads from the resolved state instead of the files.
 /// A test checks that each plain key is here or in `files_only_keys`.
 pub const resolved_keys = [_][]const u8{
-    "auto_compact_percent",           "auto_upgrade",             "cache_warming",
-    "collapse_tool_calls",            "context",                  "effort",
-    "experimental.workspace_capture", "fast_mode",                "first_call_tool_choice",
-    "max_agent_steps",                "max_tool_result_bytes",    "permission_mode",
-    "prompt_history.enabled",         "provider",                 "provider_order",
-    "provider_strict",                "review_model",             "session_titles",
-    "slash_menu_categories",          "sound.attention_required", "sound.max",
-    "sound.turn_end",                 "startup_scrollback",       "status_line.context",
-    "status_line.session",            "status_line.workspace",    "theme",
-    "ultrafast_mode",                 "update_channel",
+    "auto_compact_percent",   "auto_upgrade",                   "cache_warming",
+    "collapse_tool_calls",    "context",                        "effort",
+    "experimental.hooks",     "experimental.workspace_capture", "fast_mode",
+    "first_call_tool_choice", "max_agent_steps",                "max_tool_result_bytes",
+    "permission_mode",        "prompt_history.enabled",         "provider",
+    "provider_order",         "provider_strict",                "review_model",
+    "session_titles",         "slash_menu_categories",          "sound.attention_required",
+    "sound.max",              "sound.turn_end",                 "startup_scrollback",
+    "status_line.context",    "status_line.session",            "status_line.workspace",
+    "theme",                  "ultrafast_mode",                 "update_channel",
 };
 
 /// Keys `fx config` shows as the files set them: objects fx checks with its
@@ -493,6 +496,7 @@ pub fn effectiveValue(
     if (eql(u8, key, "max_agent_steps")) return integer(arena, state.agent_step_limit);
     if (eql(u8, key, "max_tool_result_bytes")) return integer(arena, state.max_tool_result_bytes);
     if (eql(u8, key, "permission_mode")) return string(state.permission_mode.label());
+    if (eql(u8, key, "experimental.hooks")) return boolean(state.experimental_hooks);
     if (eql(u8, key, "prompt_history.enabled")) return boolean(state.prompt_history_enabled);
     if (eql(u8, key, "provider")) return string(try arena.dupe(u8, provider.label()));
     if (eql(u8, key, "provider_order")) {
@@ -748,6 +752,10 @@ test "config set turns each value into the patch the save path writes" {
     try std.testing.expectEqual(false, fast.patch.fast_mode.?);
     try std.testing.expect(!fast.value.?.bool);
 
+    const hook = try changeForTest(&.{ "set", "experimental.hooks", "true" }, &problem);
+    try std.testing.expectEqual(true, hook.patch.experimental_hooks.?);
+    try std.testing.expect(hook.value.?.bool);
+
     const status = try changeForTest(&.{ "set", "statusLine.workspace", "true" }, &problem);
     try std.testing.expectEqual(settings_store.StatuslineItem.workspace, status.patch.statusline_item.?.item);
 
@@ -763,6 +771,10 @@ test "config set turns each value into the patch the save path writes" {
     const removed = try changeForTest(&.{ "unset", "notifications.max" }, &problem);
     try std.testing.expectEqualStrings("sound.max", removed.patch.remove.?);
     try std.testing.expect(removed.value == null);
+
+    const unset_hook = try changeForTest(&.{ "unset", "experimental.hooks" }, &problem);
+    try std.testing.expectEqualStrings("experimental.hooks", unset_hook.patch.remove.?);
+    try std.testing.expect(unset_hook.value == null);
 }
 
 test "config set explains a bad value or a key it doesn't change" {

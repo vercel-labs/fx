@@ -255,6 +255,23 @@ const ReviewView = enum {
     contextual,
 };
 
+/// What a user's PreToolUse hook asked of the permission check for one call.
+pub const HookPermission = enum { none, allow, ask };
+
+/// What a user's PermissionRequest hook answered in place of a person.
+pub const PermissionRequestVerdict = union(enum) {
+    allow,
+    /// The reason fx gives the model.
+    deny: []const u8,
+};
+
+/// Asks the user's hooks about one permission prompt before a person sees it.
+pub const PermissionRequestHook = struct {
+    context: *anyopaque,
+    /// Null means no hook answered; fx then asks the person. Memory comes from `arena`.
+    run: *const fn (context: *anyopaque, arena: std.mem.Allocator, call: types.ToolCall, label: []const u8) ?PermissionRequestVerdict,
+};
+
 /// Borrowed view of the successful model turn. Every referenced slice must
 /// remain valid until `Reviewer.review` returns.
 pub const ReviewTurnContext = struct {
@@ -266,6 +283,10 @@ pub const ReviewTurnContext = struct {
     /// Host-owned current-turn I/O gate. False short-circuits only if
     /// deterministic admission reaches remote model review.
     review_attempt_available: bool = true,
+    /// The PreToolUse hook's answer for this call; `none` when no hook answered.
+    hook_permission: HookPermission = .none,
+    /// The user's PermissionRequest hooks for this call, or null when none can run.
+    permission_request_hook: ?PermissionRequestHook = null,
     credential: types.CredentialLease = .{ .direct = .{} },
     /// Canonical root-user context for contextual security review. Assistant,
     /// tool, repository, attachment, and permission-feedback text never become

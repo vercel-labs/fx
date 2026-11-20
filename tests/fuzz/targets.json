@@ -96,6 +96,11 @@
     {"name": "mcp_json_depth", "module": "fx", "test": "a server's JSON is refused past 128 levels and kept up to it, whatever its site, shape and depth, on fuzzed bytes", "iterations": 100000},
     {"name": "mcp_request_grace", "module": "fx", "test": "a fuzzed run of requests, lines that name no request, replies, progress and timers ends each request once and ends only a silent request that has a grace as malformed", "iterations": 1000000},
     {"name": "turn_clock", "module": "fx", "test": "the turn clock keeps its laws on fuzzed event sequences", "iterations": 2000000},
-    {"name": "compaction_progress", "module": "fx", "test": "the notes count keeps its laws on fuzzed replies", "iterations": 2000000}
+    {"name": "compaction_progress", "module": "fx", "test": "the notes count keeps its laws on fuzzed replies", "iterations": 2000000},
+    {"name": "hook_file_parse", "module": "fx", "test": "a hook file parses into owned hooks and diagnostics for fuzzed bytes", "iterations": 500000},
+    {"name": "hook_matcher_compile", "module": "fx", "test": "a hook matcher compiles or is refused, and a compiled matcher answers any name for fuzzed bytes", "iterations": 140000},
+    {"name": "hook_output_read", "module": "fx", "test": "a hook's stdout and exit code read as one answer or failure, borrowing from the output for fuzzed bytes", "iterations": 1000000},
+    {"name": "hook_trust_load", "module": "fx", "test": "a trust file loads into digests and disabled hooks, or is refused, for fuzzed bytes", "iterations": 60000},
+    {"name": "hook_log_line", "module": "fx", "test": "a run-log line is read as one run, or skipped, for fuzzed bytes", "iterations": 900000}
   ]
 }

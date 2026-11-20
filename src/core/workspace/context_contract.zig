@@ -75,6 +75,9 @@ pub const OmissionReason = enum {
     symlink,
     selection_cap,
     host_unreadable,
+    /// The caller's instruction filter left the file out. Last, so the backing
+    /// integers of the earlier reasons stay as they are.
+    hook_denied,
 
     pub fn label(self: OmissionReason) []const u8 {
         return switch (self) {
@@ -87,6 +90,7 @@ pub const OmissionReason = enum {
             .symlink => "symlinked rule file",
             .selection_cap => "selection cap",
             .host_unreadable => "host cannot read instruction files",
+            .hook_denied => "a hook left it out",
         };
     }
 };
@@ -225,12 +229,29 @@ fn hashUsize(hasher: *std.crypto.hash.sha2.Sha256, value: usize) void {
 /// since those would change the instructions the provider cached: a turn's
 /// attachments reach the model as a note, through `LaterContextInput`
 /// (`AttachedFiles`).
+/// Why fx is about to load an instruction file, as hooks name it.
+pub const InstructionLoadReason = enum {
+    /// The profile, project, or launch-ancestor file, loaded when the context gathers.
+    session_start,
+    /// A folder file that a tool call's target or an attachment reaches.
+    nested_traversal,
+};
+
+/// Asks whether an instruction file may load. fx leaves the file out, and records a
+/// `hook_denied` omission, when `allow` returns false. `stamp` is the file's `sourceStamp`.
+pub const InstructionFilter = struct {
+    context: *anyopaque,
+    allow: *const fn (context: *anyopaque, path: []const u8, reason: InstructionLoadReason, stamp: u64) bool,
+};
+
 pub const InitialContextInput = struct {
     workspace_root: []const u8,
     access_scope: ?workspace_access.AccessScope = null,
     context_limits: context_limits.Values = .{},
     /// Assigned by `Registry` from its composition when routed through it.
     instruction_files: InstructionFiles = .filesystem,
+    /// Asked before each instruction file loads. Null loads every file.
+    instruction_filter: ?InstructionFilter = null,
 };
 
 pub const LaterContextInput = struct {
@@ -249,6 +270,8 @@ pub const LaterContextInput = struct {
     context_limits: context_limits.Values = .{},
     /// Assigned by `Registry` from its composition when routed through it.
     instruction_files: InstructionFiles = .filesystem,
+    /// Asked before each instruction file loads. Null loads every file.
+    instruction_filter: ?InstructionFilter = null,
 };
 
 /// Owns provider-produced context bytes and delivery-state additions. The
