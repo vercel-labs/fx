@@ -16,6 +16,7 @@ const session_codec = @import("../session/session_codec.zig");
 const js_host_session_store = @import("../session/js_host_session_store.zig");
 const session_title_generation = @import("../session/session_title_generation.zig");
 const session_adapter = @import("../session/session_adapter.zig");
+const turn_capture = @import("../workspace/turn_capture.zig");
 const session_store = @import("../session/session_store.zig");
 const session_catalog_cache = @import("../session/session_catalog_cache.zig");
 const session_summary_codec = @import("../session/session_summary_codec.zig");
@@ -995,6 +996,17 @@ pub const TranscriptArchiveRead = struct {
         return task;
     }
 
+    /// Drops a finished read that started at another archive generation,
+    /// which a compaction, resume, drop, or clear made stale. Returns
+    /// whether it dropped one.
+    pub fn dropIfStale(self: *TranscriptArchiveRead, generation: u64) bool {
+        const task = self.completed() orelse return false;
+        if (task.request.generation == generation) return false;
+        debug_trace.logf("full_transcript_cache", "archive_read_dropped back={d} reason=stale turns={d}", .{ task.request.back, task.turns.items.len });
+        self.finish();
+        return true;
+    }
+
     /// Frees the finished read `completed` returned.
     pub fn finish(self: *TranscriptArchiveRead) void {
         const task = self.task orelse return;
@@ -1029,6 +1041,13 @@ pub const Persistence = struct {
     /// session closes; the new session starts with it.
     next_session_preferences: ?session_codec.DurableSessionPreferences = null,
     fast_mode_model_bound: bool = false,
+    /// `experimental.workspace_capture`, from startup.
+    workspace_capture: bool = false,
+    /// The current turn's workspace captures (D98).
+    turn_capture: turn_capture.TurnCapture = .{},
+    /// Forks' capture copies still running or not yet reaped, off the UI
+    /// thread (D98); finished at teardown.
+    fork_copies: std.ArrayList(*turn_capture.ForkCopy) = .empty,
     js_host_store: JsHostSessionStore = .{},
     js_host_session: ?JsHostSessionOwner = null,
     process_provider_override: ?model_provider.ProviderId = null,
@@ -1071,7 +1090,7 @@ pub const Persistence = struct {
     /// in a static release-binary template.
     pub fn initInto(storage: *Persistence) void {
         comptime {
-            if (@typeInfo(Persistence).@"struct".field_names.len != 33) {
+            if (@typeInfo(Persistence).@"struct".field_names.len != 36) {
                 @compileError("update Persistence.initInto for the changed field set");
             }
         }
@@ -1083,6 +1102,9 @@ pub const Persistence = struct {
         storage.session_preferences = null;
         storage.next_session_preferences = null;
         storage.fast_mode_model_bound = false;
+        storage.workspace_capture = false;
+        storage.turn_capture = .{};
+        storage.fork_copies = .empty;
         storage.js_host_store = .{};
         storage.js_host_session = null;
         storage.process_provider_override = null;
@@ -1115,6 +1137,26 @@ pub const Persistence = struct {
         self.deinitWithCatalog(alloc, .free);
     }
 
+    /// Copies a fork's workspace captures as a `std.Io` task, so the fork
+    /// never waits on git (D98), and frees the copies already done.
+    pub fn startForkCaptureCopy(self: *Persistence, alloc: Allocator, home: []const u8, source_id: []const u8, fork: *session_adapter.Session, copies: []const session_adapter.Session.ChildCopy) void {
+        var kept: usize = 0;
+        for (self.fork_copies.items) |copy| {
+            if (copy.done()) {
+                copy.finish();
+            } else {
+                self.fork_copies.items[kept] = copy;
+                kept += 1;
+            }
+        }
+        self.fork_copies.shrinkRetainingCapacity(kept);
+        const task = turn_capture.ForkCopy.start(home, source_id, fork, copies) orelse return;
+        self.fork_copies.append(alloc, task) catch |err| {
+            debug_trace.logf("workspace", "event=workspace_capture_fork_refs_awaited err={s}", .{@errorName(err)});
+            task.finish();
+        };
+    }
+
     /// Process exit leaves the session picker catalog to the exiting process;
     /// freeing thousands of cached sessions one by one only delays exit.
     pub fn deinitForProcessExit(self: *Persistence, alloc: Allocator) void {
@@ -1143,6 +1185,9 @@ pub const Persistence = struct {
             alloc.destroy(children);
         }
         if (self.v2) |v2| v2.close();
+        for (self.fork_copies.items) |copy| copy.finish();
+        self.fork_copies.deinit(alloc);
+        self.turn_capture.deinit();
         if (self.workspace_preferences) |*preferences| preferences.deinit(alloc);
         if (self.session_preferences) |*preferences| preferences.deinit(alloc);
         if (self.next_session_preferences) |*preferences| preferences.deinit(alloc);
@@ -1191,4 +1236,96 @@ test "persistence in-place initialization preserves empty ownership" {
     try std.testing.expect(persistence.session_picker_load.task == null);
     try std.testing.expect(!persistence.session_picker_cache.ready);
     try std.testing.expect(persistence.resume_handoff_intent == .none);
+}
+
+/// A saved session with `turns` turns in one compaction cycle, for the
+/// Ctrl+O archive read tests.
+const ArchiveReadTestHome = struct {
+    tmp: std.testing.TmpDir,
+    home: []u8,
+    store: session_adapter.Store,
+    session: *session_adapter.Session,
+    model: [1]u8 = "m".*,
+
+    fn init(self: *ArchiveReadTestHome, turns: usize) !void {
+        const alloc = std.testing.allocator;
+        self.* = .{ .tmp = std.testing.tmpDir(.{ .iterate = true }), .home = undefined, .store = undefined, .session = undefined };
+        errdefer self.tmp.cleanup();
+        self.home = try io_mod.dirRealpathAlloc(alloc, self.tmp.dir, ".");
+        errdefer alloc.free(self.home);
+        self.store = try session_adapter.Store.open(alloc, self.home);
+        errdefer self.store.deinit(alloc);
+        self.session = try session_adapter.Session.create(alloc, &self.store, "/w", .ask, .{
+            .preferences = .{ .model = &self.model, .effort = .auto, .fast_mode = false },
+            .language = types.ConversationLanguage.default(),
+            .permission_state = .{},
+        });
+        errdefer self.session.close();
+        for (0..turns) |_| {
+            try self.session.commitTurn(.{ .assistant = .{
+                .user = .{ .text = @constCast("question") },
+                .assistant = @constCast("answer"),
+            } }, types.ConversationLanguage.default());
+        }
+    }
+
+    fn deinit(self: *ArchiveReadTestHome) void {
+        self.session.close();
+        self.store.deinit(std.testing.allocator);
+        std.testing.allocator.free(self.home);
+        self.tmp.cleanup();
+    }
+
+    fn start(self: *ArchiveReadTestHome, read: *TranscriptArchiveRead, generation: u64) !void {
+        try read.start(try self.session.cycleReader(std.heap.c_allocator), .{ .back = 1, .start = null, .generation = generation });
+    }
+};
+
+fn waitForArchiveRead(read: *TranscriptArchiveRead) !*TranscriptArchiveRead.Task {
+    for (0..5000) |_| {
+        if (read.completed()) |task| return task;
+        io_mod.sleep(std.time.ns_per_ms);
+    }
+    return error.TestArchiveReadTimedOut;
+}
+
+test "a finished Ctrl+O archive read at an older generation is dropped, and one at the current generation stays" {
+    var home: ArchiveReadTestHome = undefined;
+    try home.init(2);
+    defer home.deinit();
+    var read: TranscriptArchiveRead = .{};
+    defer read.cancel();
+
+    try home.start(&read, 4);
+    const task = try waitForArchiveRead(&read);
+    try std.testing.expectEqual(@as(?anyerror, null), task.failure);
+    try std.testing.expectEqual(@as(usize, 2), task.turns.items.len);
+    // Still the transcript's generation: it waits for its replay.
+    try std.testing.expect(!read.dropIfStale(4));
+    try std.testing.expect(read.busy());
+    // A compaction, resume, drop, or clear since then: it goes.
+    try std.testing.expect(read.dropIfStale(5));
+    try std.testing.expect(!read.busy());
+    try std.testing.expect(!read.dropIfStale(5));
+}
+
+test "cancelling a running Ctrl+O archive read stops it, and the next read finishes whole" {
+    var home: ArchiveReadTestHome = undefined;
+    try home.init(300);
+    defer home.deinit();
+    var read: TranscriptArchiveRead = .{};
+    defer read.cancel();
+
+    // Cancelled right after it starts, mostly while it still reads.
+    try home.start(&read, 1);
+    read.cancel();
+    try std.testing.expect(!read.busy());
+    try std.testing.expect(read.completed() == null);
+
+    try home.start(&read, 1);
+    const task = try waitForArchiveRead(&read);
+    try std.testing.expectEqual(@as(?anyerror, null), task.failure);
+    try std.testing.expectEqual(@as(usize, 300), task.turns.items.len);
+    read.finish();
+    try std.testing.expect(!read.busy());
 }
