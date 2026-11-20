@@ -12581,12 +12581,14 @@ test "current compact projection groups tool rows without mutating entries" {
     const entry_count = runtime.notebook.entries.items.len;
     var compact = try runtime.prepareTranscriptSource(alloc, null);
     defer compact.deinit(alloc);
+    // The failed edit is not a command, so its row says only that it failed,
+    // in the failure style, and the header does not count it.
     try std.testing.expect(std.mem.find(
         u8,
         compact.bytes,
-        "\x1b[38;5;255m●\x1b[0m \x1b[38;5;245mRead a file · 1 failed\x1b[0m\n" ++
+        "\x1b[38;5;255m●\x1b[0m \x1b[38;5;245mRead a file\x1b[0m\n" ++
             "\x1b[38;5;245m├ Read file\x1b[0m\n" ++
-            "\x1b[38;5;245m└ Edit failed\x1b[0m",
+            "\x1b[38;5;245m└ \x1b[38;5;245mEdit failed\x1b[0m\x1b[38;5;245m\x1b[0m",
     ) != null);
     try std.testing.expectEqual(entry_count, runtime.notebook.entries.items.len);
 }
@@ -16216,6 +16218,29 @@ test "recorded tool finality does not depend on the current turn watermark" {
             try std.testing.expectEqualStrings("saved-write", archived_id.call_id);
         }
     }
+}
+
+test "a provisional call's detail is streaming until the call starts" {
+    const alloc = std.testing.allocator;
+    var runtime = TranscriptRuntime{ .layout = transcriptTestLayout(88, 24, 20) };
+    defer runtime.deinit(alloc);
+    const id = types.ToolLifecycleId{ .turn_id = 1, .call_id = "streaming-read" };
+    _ = try runtime.applyToolLifecycle(alloc, .{ .provisional = .{
+        .id = id,
+        .presentation_group_id = null,
+        .tool_name = "read_file",
+        .activity_kind = .read,
+    } });
+    try std.testing.expectEqual(@as(usize, 1), runtime.notebook.tool_details.items.len);
+    try std.testing.expect(runtime.notebook.tool_details.items[0].streaming);
+    _ = try runtime.applyToolLifecycle(alloc, .{ .authoritative_started = .{
+        .id = id,
+        .reconciles_provisional_call_id = null,
+        .tool_name = "read_file",
+        .activity_kind = .read,
+    } });
+    try std.testing.expectEqual(@as(usize, 1), runtime.notebook.tool_details.items.len);
+    try std.testing.expect(!runtime.notebook.tool_details.items[0].streaming);
 }
 
 test "recorded tool finality stays independent of a live turn with the same number" {
