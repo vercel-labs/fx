@@ -1551,7 +1551,7 @@ test "surface footer frame snapshots manual compaction blink with an inactive st
     var frame = try prepareSurfaceFooterFrameWithReservation(alloc, &shell, &metrics, &force_redraw, null, ctx, .{}, FrameInvalidationSet.empty());
     defer frame.deinit(alloc);
     try std.testing.expectEqual(@as(?bool, false), frame.thinking_blink);
-    try std.testing.expect(std.mem.find(u8, frame.activity_label.items, "Compacting (0s)") != null);
+    try std.testing.expect(std.mem.find(u8, frame.activity_label.items, "Compacting 0% (0s)") != null);
     try std.testing.expect(!ctx.stream.active);
 }
 

@@ -157,10 +157,65 @@ pub fn Runtime(comptime App: type) type {
             }
         }
 
-        /// The session approvals `agent`'s tool calls use.
-        pub fn grantsOf(app: anytype, agent: anytype) []const types.PermissionGrant {
+        /// The list of session approvals `agent`'s tool calls use. A subagent's
+        /// worker adds to it, which can move it, so only a caller that holds the
+        /// authority lock may use what this returns, and only until it lets go.
+        /// Every other reader takes a copy: `copyGrants`, `liveGrants`, or
+        /// `liveGrantCount`.
+        pub fn grantsLocked(app: anytype, agent: anytype) []const types.PermissionGrant {
             if (comptime per_instance) return permissionOwner(app, agent).session_grants.items;
             return app.permission_engine.grants.items;
+        }
+
+        /// A copy of `agent`'s session approvals in `alloc`, taken under the
+        /// authority lock that every write to the list holds. The caller owns it
+        /// and frees it with `types.freePermissionGrantSlice`, or with `alloc`
+        /// when that is an arena.
+        pub fn copyGrants(app: anytype, agent: anytype, alloc: std.mem.Allocator) ![]types.PermissionGrant {
+            lockAuthority(app);
+            defer unlockAuthority(app);
+            return types.dupePermissionGrantSlice(alloc, grantsLocked(app, agent));
+        }
+
+        /// `own`, a turn's list of approvals, followed by a copy of `agent`'s
+        /// instance's taken under the authority lock now. A turn that has no
+        /// run authority of its own checks and executes against this, so it
+        /// reads what the instance holds at that moment and not only what the
+        /// turn was given when it began or answered. `own`'s entries stay the
+        /// caller's. The copy is in `arena`, which frees all of it: one slice
+        /// and two strings for each of the instance's approvals.
+        pub fn copyGrantsAfter(app: anytype, agent: anytype, arena: std.mem.Allocator, own: []const types.PermissionGrant) ![]types.PermissionGrant {
+            lockAuthority(app);
+            defer unlockAuthority(app);
+            const live = grantsLocked(app, agent);
+            const merged = try arena.alloc(types.PermissionGrant, own.len + live.len);
+            @memcpy(merged[0..own.len], own);
+            for (live, merged[own.len..]) |grant, *slot| slot.* = .{
+                .tool_name = try arena.dupe(u8, grant.tool_name),
+                .target_path = try arena.dupe(u8, grant.target_path),
+            };
+            return merged;
+        }
+
+        /// How many of `agent`'s session approvals still apply, counted under
+        /// the authority lock.
+        pub fn liveGrantCount(app: anytype, agent: anytype) usize {
+            lockAuthority(app);
+            defer unlockAuthority(app);
+            return permissions.liveSessionGrantCount(grantsLocked(app, agent));
+        }
+
+        /// The session approvals that still apply, for display, copied in
+        /// `alloc` under the authority lock like `copyGrants`: the slice and
+        /// its strings are the caller's, to free with
+        /// `types.freePermissionGrantSlice`, or with `alloc` when that is an
+        /// arena.
+        pub fn liveGrants(app: anytype, agent: anytype, alloc: std.mem.Allocator) ![]types.PermissionGrant {
+            lockAuthority(app);
+            defer unlockAuthority(app);
+            const live = try permissions.liveSessionGrants(alloc, grantsLocked(app, agent));
+            defer alloc.free(live);
+            return types.dupePermissionGrantSlice(alloc, live);
         }
 
         /// Records an "always" approval from `agent`'s turn on its
@@ -175,6 +230,17 @@ pub fn Runtime(comptime App: type) type {
             }
         }
 
+        /// Records, at once, an "always" approval `agent`'s turn just gave, on
+        /// its worker's thread. Every agent of the instance reads the instance's
+        /// list at its next check, and a subagent's next call may run before
+        /// the main loop handles the event that carries the same approval. The
+        /// main loop records it again then, and the list keeps one row, since
+        /// `allowToolForSession` skips an approval the list already allows.
+        pub fn allowAtOnce(app: *App, agent: *AppAgent, tool_name: []const u8, target_path: []const u8) !void {
+            if (comptime !per_instance) return;
+            try allowForSession(app, agent, tool_name, target_path);
+        }
+
         /// Drops `agent`'s session approvals when its session ends: they
         /// last one session, and only its own end.
         pub fn clearSessionGrants(app: *App, agent: *AppAgent) void {
@@ -187,25 +253,28 @@ pub fn Runtime(comptime App: type) type {
             }
         }
 
-        /// Frees `agent`'s session approvals when the agent goes. Its
-        /// worker has stopped, so nothing else reads them.
+        /// Frees `agent`'s session approvals when the agent goes. It takes no
+        /// lock: the agent's worker and the worker of every subagent in its
+        /// tree have been joined first, as `closeTree` and `shutdownChildren`
+        /// do before they free the agent, so nothing else reads or writes them.
         pub fn deinitSessionGrants(app: *App, agent: *AppAgent) void {
             if (comptime !per_instance) return;
             permissions.clearAllowedTools(app.alloc, &agent.session_grants);
             agent.session_grants.deinit(app.alloc);
         }
 
-        /// The permission state `agent`'s screen reports: its permission
-        /// owner's mode and approvals over the host's rules. Borrowed;
-        /// never deinit it.
-        pub fn viewOf(app: anytype, agent: anytype) permissions.PermissionEngine {
-            if (comptime !per_instance) return app.permission_engine;
-            const owner = permissionOwner(app, agent);
-            return .{
-                .mode = instanceMode(app, owner),
-                .grants = owner.session_grants,
-                .rules = app.permission_engine.rules,
-            };
+        /// What `agent`'s screen reports of its permissions.
+        const View = struct {
+            /// Its permission owner's mode.
+            mode: types.PermissionMode,
+        };
+
+        /// The permission state `agent`'s screen reports. Its approvals are not
+        /// part of it, because a copy of the list's header would outlive the
+        /// lock; read them with `copyGrants` or `liveGrantCount`.
+        pub fn viewOf(app: anytype, agent: anytype) View {
+            if (comptime !per_instance) return .{ .mode = app.permission_engine.mode };
+            return .{ .mode = instanceMode(app, permissionOwner(app, agent)) };
         }
 
         /// Session-scoped mode change: applies the mode and syncs queued
