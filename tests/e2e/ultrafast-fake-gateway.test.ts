@@ -22,6 +22,7 @@ import {
   TmuxSession,
   tmuxAvailable,
 } from "./tmux-helpers";
+import { holdChildAnswer } from "./saved-sessions";
 
 const TIMEOUT = 20_000;
 const ULTRA_MODEL = "openai/gpt-6-astra";
@@ -877,8 +878,13 @@ describe("ultrafast fake Gateway", () => {
     "an allowed subagent child inherits ultrafast routing",
     async () => {
       const root = createIsolatedRoot();
-      const gateway = startDynamicFakeGateway((body) => {
-        if (!body.includes('"name":"subagent"')) return finishWithServiceTier("child completed", "ultrafast");
+      const hold = holdChildAnswer(root.home);
+      const gateway = startDynamicFakeGateway(async (body) => {
+        if (!body.includes('"name":"subagent"')) {
+          const refused = await hold.wait();
+          if (refused) return refused;
+          return finishWithServiceTier("child completed", "ultrafast");
+        }
         if (latestUserIsReport(body)) return finishWithServiceTier("parent read the report", "ultrafast");
         if (body.includes("subagent_1")) return finishWithServiceTier("parent observed the child", "ultrafast");
         return fakeGatewayToolCall(
@@ -890,8 +896,11 @@ describe("ultrafast fake Gateway", () => {
       try {
         const result = await runFx(
           ["ask", "--full-access", "--json", "--ultrafast", "Delegate one task."],
-          { cwd: root.workspace, env: fakeGatewayEnv(root, gateway), timeoutMs: TIMEOUT },
+          // Below the test's limit, so a failed hold ends fx here and the kept
+          // error is thrown, instead of Bun ending the test with fx still running.
+          { cwd: root.workspace, env: fakeGatewayEnv(root, gateway), timeoutMs: TIMEOUT - 5_000 },
         );
+        hold.check();
         expect(result.code, result.stderr).toBe(0);
         const output = JSON.parse(result.stdout).output;
         expect(output).toContain("parent observed the child");
@@ -915,10 +924,13 @@ describe("ultrafast fake Gateway", () => {
     async () => {
       const root = createIsolatedRoot({ ultrafast_mode: true, models: { gateway: ULTRA_MODEL } });
       const childBodies: string[] = [];
+      const hold = holdChildAnswer(root.home);
       let parentRequests = 0;
       let round = 1;
-      const gateway = startDynamicFakeGateway((body) => {
+      const gateway = startDynamicFakeGateway(async (body) => {
         if (!body.includes('"name":"subagent"')) {
+          const refused = await hold.wait();
+          if (refused) return refused;
           childBodies.push(body);
           return finishWithServiceTier(
             `ULTRA_CHILD_${childBodies.length}`,
@@ -947,6 +959,7 @@ describe("ultrafast fake Gateway", () => {
         let sessionId: string | undefined;
         for (const current of [1, 2, 3]) {
           round = current;
+          hold.mark();
           const result = await runFx(
             [
               "ask", "--full-access", "--json",
@@ -954,8 +967,10 @@ describe("ultrafast fake Gateway", () => {
               ...(round === 3 ? ["--no-ultrafast"] : []),
               `Ask the named reviewer for round ${round}.`,
             ],
-            { cwd: root.workspace, env, timeoutMs: TIMEOUT },
+            // Below the test's limit, as above.
+            { cwd: root.workspace, env, timeoutMs: TIMEOUT - 5_000 },
           );
+          hold.check();
           expect(result.code, result.stderr).toBe(0);
           const payload = JSON.parse(result.stdout);
           expect(payload.output).toContain(`ULTRA_PARENT_${round}`);
