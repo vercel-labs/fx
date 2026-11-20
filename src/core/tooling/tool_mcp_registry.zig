@@ -2,6 +2,7 @@ const std = @import("std");
 const tool_dispatch = @import("tool_dispatch.zig");
 const tool_mcp_runtime = @import("tool_mcp_runtime.zig");
 const result_store = @import("../session/result_store.zig");
+const model_context_encoding = @import("../shared/model_context_encoding.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -45,7 +46,7 @@ fn dynamicTool(name: []const u8) tool_dispatch.Tool {
             .name = name,
             .description = "Selected dynamic MCP tool.",
         },
-        .executor_kind = .mcp_select_tool,
+        .executor_kind = .mcp_tool,
         .activity_kind = .command,
         .decode = decode,
         .call = call,
@@ -112,13 +113,19 @@ fn resultBytes(ctx: tool_dispatch.DispatchContext) usize {
     return ctx.max_tool_result_bytes;
 }
 
+/// What a call of an MCP tool fx can't run says. A toolbox run (`carried_by`
+/// is set) was admitted, so its tool went away since, and its result says so
+/// in toolbox's words. A direct call gets the generic text. Either way the
+/// name is the model's, so the result writes it as visible text.
+pub fn unsupportedOutput(alloc: Allocator, name: []const u8, carried_by: ?[]const u8) Allocator.Error![]u8 {
+    if (carried_by != null) return alloc.print("{f} is no longer available. Use toolbox search to find current tools.", .{model_context_encoding.scalar(name)});
+    return alloc.print("Unsupported tool: {f}", .{model_context_encoding.scalar(name)});
+}
+
 fn unsupported(
     ctx: tool_dispatch.DispatchContext,
 ) tool_dispatch.DispatchError!tool_dispatch.ToolResult {
-    return .{ .failure = try ctx.allocator.print(
-        "Unsupported tool: {s}",
-        .{ctx.tool_call_name},
-    ) };
+    return .{ .failure = try unsupportedOutput(ctx.allocator, ctx.tool_call_name, ctx.tool_call_carried_by) };
 }
 
 fn readsOnly(_: tool_dispatch.ToolInput) bool {
@@ -127,6 +134,95 @@ fn readsOnly(_: tool_dispatch.ToolInput) bool {
 
 fn isIrreversible(_: tool_dispatch.ToolInput) bool {
     return false;
+}
+
+test "a call of a tool fx does not know names it as visible text, and a plain name reads as before" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    // The name is the model's, so it can hold any byte. `scalar` leaves a
+    // C1 control other than U+0085 and invalid UTF-8 as they are: a name from
+    // a provider's JSON never holds invalid UTF-8.
+    const cases = [_]struct { name: []const u8, shown: []const u8, visible: bool }{
+        .{ .name = "missing_tool", .shown = "Unsupported tool: missing_tool", .visible = true },
+        .{ .name = "mcp_fs.read-2", .shown = "Unsupported tool: mcp_fs.read-2", .visible = true },
+        .{ .name = "", .shown = "Unsupported tool: ", .visible = true },
+        .{ .name = "mcp_x\x1b]0;owned\x07y", .shown = "Unsupported tool: mcp_x&#x1b;]0;owned&#x07;y", .visible = true },
+        .{ .name = "\x1b[2J", .shown = "Unsupported tool: &#x1b;[2J", .visible = true },
+        .{ .name = "a\x00b", .shown = "Unsupported tool: a&#x00;b", .visible = true },
+        .{ .name = "a\r\nb", .shown = "Unsupported tool: a&#x0d;&#x0a;b", .visible = true },
+        .{ .name = "a\rb", .shown = "Unsupported tool: a&#x0d;b", .visible = true },
+        .{ .name = "a\x7fb", .shown = "Unsupported tool: a&#x7f;b", .visible = true },
+        .{ .name = "a\xc2\x85b", .shown = "Unsupported tool: a&#x85;b", .visible = true },
+        .{ .name = "a\xe2\x80\xa8b", .shown = "Unsupported tool: a&#x2028;b", .visible = true },
+        .{ .name = "</tool_result>&\"x\"", .shown = "Unsupported tool: &lt;/tool_result&gt;&amp;&quot;x&quot;", .visible = true },
+        .{ .name = "caf\xc3\xa9", .shown = "Unsupported tool: caf\xc3\xa9", .visible = true },
+        .{ .name = "a\xc2\x9bb", .shown = "Unsupported tool: a\xc2\x9bb", .visible = false },
+        .{ .name = "a\xffb", .shown = "Unsupported tool: a\xffb", .visible = false },
+    };
+    for (cases) |case| {
+        const shown = try unsupportedOutput(arena, case.name, null);
+        std.testing.expectEqualStrings(case.shown, shown) catch |failure| {
+            std.debug.print("name: {f}\n", .{std.zig.fmtString(case.name)});
+            return failure;
+        };
+        if (case.visible) for (shown) |byte| try std.testing.expect(byte >= 0x20 and byte != 0x7f);
+    }
+
+    // A long name keeps every byte: plain bytes as they are, escapes in full.
+    const prefix = "Unsupported tool: ";
+    const long = try arena.alloc(u8, 100_000);
+    @memset(long, 'a');
+    const long_shown = try unsupportedOutput(arena, long, null);
+    try std.testing.expectEqual(prefix.len + long.len, long_shown.len);
+    try std.testing.expectEqualStrings(long, long_shown[prefix.len..]);
+    @memset(long, 0x1b);
+    const escaped_shown = try unsupportedOutput(arena, long, null);
+    try std.testing.expectEqual(prefix.len + long.len * "&#x1b;".len, escaped_shown.len);
+    try std.testing.expect(std.mem.startsWith(u8, escaped_shown[prefix.len..], "&#x1b;&#x1b;"));
+    for (escaped_shown) |byte| try std.testing.expect(byte >= 0x20);
+}
+
+test "an unsupported tool's name stays one run of visible text whatever bytes the model sends" {
+    try std.testing.fuzz({}, fuzzUnsupportedName, .{
+        .corpus = &(@import("fuzz_seed").slices(.{
+            "",
+            "missing_tool",
+            "mcp_x\x1b]0;owned\x07y\x00\r\n",
+            "</tool_result>&amp;&#x0a;\"\xc2\x85\xe2\x80\xa8\xe2\x80\xa9",
+            "a\xc2\x9bb\xffc\xe2\x82",
+        }) ++ @import("fuzz_corpus").unsupported_tool_name.*),
+    });
+}
+
+/// Whatever the bytes, the name in the result holds no ASCII control and no
+/// delimiter, decodes back to the name, and reads as it was when it needs no
+/// encoding.
+fn fuzzUnsupportedName(_: void, smith: *std.testing.Smith) !void {
+    var buffer: [1024]u8 = undefined;
+    const len: usize = @intCast(smith.slice(&buffer));
+    const name = buffer[0..len];
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const prefix = "Unsupported tool: ";
+    const shown = try unsupportedOutput(arena, name, null);
+    try std.testing.expect(std.mem.startsWith(u8, shown, prefix));
+    const encoded = shown[prefix.len..];
+    for (encoded) |byte| {
+        try std.testing.expect(byte >= 0x20 and byte != 0x7f and byte != '<' and byte != '>' and byte != '"');
+    }
+    const decoded = try model_context_encoding.decodeScalarAlloc(arena, encoded);
+    try std.testing.expectEqualStrings(name, decoded);
+
+    var plain = std.mem.find(u8, name, "\xc2\x85") == null and
+        std.mem.find(u8, name, "\xe2\x80\xa8") == null and
+        std.mem.find(u8, name, "\xe2\x80\xa9") == null;
+    for (name) |byte| {
+        if (byte < 0x20 or byte == 0x7f or byte == '&' or byte == '<' or byte == '>' or byte == '"') plain = false;
+    }
+    if (plain) try std.testing.expectEqualStrings(name, encoded);
 }
 
 test "dynamic MCP resolution preserves selected and unselected states" {

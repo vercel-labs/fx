@@ -5,6 +5,7 @@
 //
 //   bun tests/tla/drivers/drive-steer.mjs [ideal|faults] [--walks N] [--seed S]
 //     [--backend native|wasm] [--durability local|world] [--verbose] [--hooks]
+//     [--stream-lag MS]
 //
 // `tests/tla/sdk/check.sh` model-checks the spec and writes its
 // graphs/steer-<graph>.dot. The
@@ -40,6 +41,11 @@ const backend = option("backend", "native");
 const durabilityKind = option("durability", "local");
 if (!["local", "world"].includes(durabilityKind)) throw new Error("--durability is local or world");
 const verbose = args.includes("--verbose");
+// Each line of the session's stream shows only this many milliseconds after
+// the driver first reads it, as on a busy machine, where the stream trails
+// the model requests it describes.
+const streamLagMs = Number(option("stream-lag", 0));
+if (!Number.isFinite(streamLagMs) || streamLagMs < 0) throw new Error("--stream-lag is a number of milliseconds");
 let seed = Number(option("seed", 1));
 const here = fileURLToPath(new URL(".", import.meta.url));
 const addon = resolve(here, "../../../zig-out/lib/libfx.node");
@@ -196,6 +202,8 @@ async function harness() {
     durability,
   });
 
+  // When the driver first read each stream line, by its cursor.
+  const firstRead = new Map();
   async function streamLines() {
     if (!sessionId) return [];
     const reader = agent.session(sessionId).stream(0).getReader();
@@ -215,9 +223,20 @@ async function harness() {
       }
     }
     await reader.cancel().catch(() => {});
-    return lines;
+    if (streamLagMs === 0) return lines;
+    // A line shows once the lag has passed, and never before an earlier one.
+    const now = Date.now();
+    const shown = [];
+    for (const line of lines) {
+      if (!firstRead.has(line.cursor)) firstRead.set(line.cursor, now);
+      if (shown.length === lines.indexOf(line) && now - firstRead.get(line.cursor) >= streamLagMs) shown.push(line);
+    }
+    return shown;
   }
 
+  // Whether the last read saw the stream behind the requests: a view the
+  // model is never in, so the code has not settled.
+  let behind = false;
   async function read() {
     // How each turn the stream shows ended, by the message that owns it.
     const lines = await streamLines();
@@ -244,21 +263,34 @@ async function harness() {
       else turns.at(-1)?.ctx.add(m);
     }
     const phase = calls.length > 0 ? "tool" : open.length > 0 ? open.at(-1).phase : "idle";
+    const shown = turns.map((turn) => ({ owner: turn.owner, state: stateOf.get(turn.owner) ?? "running", ctx: sorted(turn.ctx) }));
+    // fx sends a turn's model request before it writes the turn's
+    // turn_start line, and writes turn_end only after the turn's last
+    // request has ended. Until both lines land, the newest request carries a
+    // message that starts no turn, or a turn runs with nothing open.
+    const owners = new Set(ownerOf.values());
+    const startsLate = (requests.at(-1)?.users ?? []).some((text) => {
+      const m = messageIn(text);
+      return m !== null && !steering(text) && !owners.has(m);
+    });
+    const endsLate = phase === "idle" && shown.some((turn) => turn.state === "running");
+    behind = startsLate || endsLate;
     return JSON.stringify({
-      turns: turns.map((turn) => ({ owner: turn.owner, state: stateOf.get(turn.owner) ?? "running", ctx: sorted(turn.ctx) })),
+      turns: shown,
       phase,
       twice: sorted([...counts].filter(([, count]) => count > 1).map(([m]) => m)),
     });
   }
 
-  // The code has settled when it shows the same state for quietMs.
+  // The code has settled when it shows the same state for quietMs, with the
+  // stream caught up with the requests.
   async function observe() {
     let seen = await read();
     const started = Date.now();
     for (;;) {
       await sleep(quietMs);
       const again = await read();
-      if (again === seen) break;
+      if (again === seen && !behind) break;
       seen = again;
       if (Date.now() - started > stepTimeoutMs) break;
     }

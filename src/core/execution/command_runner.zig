@@ -394,6 +394,8 @@ const ChildWaiter = struct {
     child: *std.process.Child,
     io: std.Io,
     ready: std.atomic.Value(bool) = .init(false),
+    /// Set with `ready`, so a loop that waits on it wakes when the child exits.
+    done: std.Io.Event = .unset,
     result: std.process.Child.WaitError!std.process.Child.Term = undefined,
     /// When the wait returned. Valid once `ready` is observed.
     completed_ms: i64 = 0,
@@ -418,6 +420,7 @@ const ChildWaiter = struct {
         self.result = self.child.wait(self.io);
         self.completed_ms = io_mod.milliTimestamp();
         self.ready.store(true, .release);
+        self.done.set(self.io);
     }
 
     fn isReady(self: *const ChildWaiter) bool {
@@ -446,6 +449,58 @@ const ChildWaiter = struct {
     }
 };
 
+/// The pace at which the foreground supervisor refreshes the target's process
+/// tree. On macOS a refresh lists the children of every tracked process, and
+/// each list scans the whole process table, so a refresh every millisecond
+/// costs a supervisor whose command only waits several percent of a core.
+///
+/// The pace stays at `foreground_refresh_fast_ns` while the tree can change
+/// quickly: for `foreground_refresh_fast_window_ms` after the command starts
+/// and after the tracked set grows, and while a stop is in progress. A quiet
+/// tree waits twice as long after each refresh, up to
+/// `foreground_refresh_slow_ns`, and never past the command's deadline. The
+/// target's exit wakes the supervisor at once, so the pace never delays a
+/// command's completion. A process that a short-lived parent starts in a
+/// quiet stretch is still found: on macOS the lineage scan matches its
+/// original parent or the inherited witness when the target exits or a stop
+/// begins, and on Linux the supervisor is its subreaper.
+const ForegroundRefreshPace = struct {
+    interval_ns: u64 = foreground_refresh_fast_ns,
+    fast_until_ms: i64,
+    tracked: usize = 0,
+
+    fn init(now_ms: i64) ForegroundRefreshPace {
+        return .{ .fast_until_ms = now_ms +| foreground_refresh_fast_window_ms };
+    }
+
+    /// The wait before the next refresh, after a refresh at `now_ms` that
+    /// tracked `tracked` descendants.
+    fn next(
+        self: *ForegroundRefreshPace,
+        now_ms: i64,
+        tracked: usize,
+        stopping: bool,
+        deadline_ms: ?i64,
+    ) u64 {
+        if (tracked != self.tracked) {
+            self.tracked = tracked;
+            self.fast_until_ms = now_ms +| foreground_refresh_fast_window_ms;
+        }
+        self.interval_ns = if (stopping or now_ms < self.fast_until_ms)
+            foreground_refresh_fast_ns
+        else
+            @min(self.interval_ns *| 2, foreground_refresh_slow_ns);
+        const deadline = deadline_ms orelse return self.interval_ns;
+        if (deadline <= now_ms) return foreground_refresh_fast_ns;
+        const left_ns = @as(u64, @intCast(deadline - now_ms)) *| std.time.ns_per_ms;
+        return @max(foreground_refresh_fast_ns, @min(self.interval_ns, left_ns));
+    }
+};
+
+const foreground_refresh_fast_ns: u64 = std.time.ns_per_ms;
+const foreground_refresh_slow_ns: u64 = 25 * std.time.ns_per_ms;
+const foreground_refresh_fast_window_ms: i64 = 100;
+
 fn waitForForegroundTarget(
     target: *std.process.Child,
     process_witness: ?*const process_tree.DarwinProcessWitness,
@@ -469,6 +524,7 @@ fn waitForForegroundTarget(
     var termination_started_ms: ?i64 = null;
     var forced = false;
     var owner_alive = true;
+    var pace = ForegroundRefreshPace.init(io_mod.milliTimestamp());
 
     while (true) {
         const now_ms = io_mod.milliTimestamp();
@@ -537,7 +593,16 @@ fn waitForForegroundTarget(
             }
             return term;
         }
-        io_mod.sleep(std.time.ns_per_ms);
+        const wait_ns = pace.next(
+            io_mod.milliTimestamp(),
+            descendants.processes.items.len,
+            request != .none or termination_started_ms != null,
+            deadline_ms,
+        );
+        waiter.done.waitTimeout(waiter.io, .{ .duration = .{
+            .raw = .fromNanoseconds(@intCast(wait_ns)),
+            .clock = .awake,
+        } }) catch {};
     }
 }
 
@@ -2346,6 +2411,39 @@ test "bash user profile commands reuse one startup-file snapshot" {
     try std.testing.expectEqualStrings("loaded\n", try readAbsoluteFile(arena, loads_path, 4096));
 }
 
+test "bash user profile snapshot restores a helper that needs extglob" {
+    if (comptime !shell_snapshot.isSupported() or !supports_foreground_session) return;
+    std.Io.Dir.accessAbsolute(io_mod.getIo(), "/bin/bash", .{}) catch
+        return error.SkipZigTest;
+    shell_snapshot.resetProcessOwnerForTest(shell_snapshot.real_capture_fn);
+    defer shell_snapshot.resetProcessOwnerForTest(shell_snapshot.real_capture_fn);
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // bash parses `@(a|b)` only with extglob on, so a replay that defines
+    // the helper before it restores the option fails as a whole.
+    const paths = try writeSnapshotTestShellFor(
+        arena,
+        &tmp,
+        "bash",
+        ".bash_profile",
+        "printf 'loaded\\n' >> \"$HOME/rc-loads.log\"\n" ++
+            "shopt -s extglob\n" ++
+            "_fxsnap_glob_helper() { case $1 in @(a|b)) printf 'glob-ok\\n';; esac; }\n",
+    );
+    const config = Config{ .max_command_output_bytes = 16 * 1024 };
+    for (0..2) |_| {
+        const result = try executeCommandInEnvironment(config, arena, "_fxsnap_glob_helper a", paths.workspace, .{ .user = paths.shell });
+        try std.testing.expectEqualStrings("exit_code=0\n<stdout>\nglob-ok\n</stdout>\n", result.output);
+    }
+    // Both commands ran from the snapshot, so startup ran only for its capture.
+    const loads_path = try std.Io.Dir.path.join(arena, &.{ paths.home, "rc-loads.log" });
+    try std.testing.expectEqualStrings("loaded\n", try readAbsoluteFile(arena, loads_path, 4096));
+}
+
 test "user profile commands reuse one startup-file snapshot" {
     if (comptime !shell_snapshot.isSupported() or !supports_foreground_session) return;
     std.Io.Dir.accessAbsolute(io_mod.getIo(), "/bin/zsh", .{}) catch
@@ -2409,6 +2507,39 @@ test "user profile commands reuse one startup-file snapshot" {
     const loads_path = try std.Io.Dir.path.join(arena, &.{ paths.home, "rc-loads.log" });
     const loads = try readAbsoluteFile(arena, loads_path, 4096);
     try std.testing.expectEqualStrings("loaded\n", loads);
+}
+
+test "bash user profile snapshot restores a replay larger than the pipe buffer" {
+    if (comptime !shell_snapshot.isSupported() or !supports_foreground_session) return;
+    std.Io.Dir.accessAbsolute(io_mod.getIo(), "/bin/bash", .{}) catch
+        return error.SkipZigTest;
+    shell_snapshot.resetProcessOwnerForTest(shell_snapshot.real_capture_fn);
+    defer shell_snapshot.resetProcessOwnerForTest(shell_snapshot.real_capture_fn);
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // bash 3.2, macOS's /bin/bash, sources a pipe only as far as the bytes
+    // it holds at that moment. Thousands of functions push the replay well
+    // past that, so a partial read would lose the last ones and the command.
+    const paths = try writeSnapshotTestShellFor(
+        arena,
+        &tmp,
+        "bash",
+        ".bash_profile",
+        "printf 'loaded\\n' >> \"$HOME/rc-loads.log\"\n" ++
+            "for i in {1..3000}; do eval \"fxsnap_bulk_$i() { printf 'bulk-$i\\n'; }\"; done\n",
+    );
+    const config = Config{ .max_command_output_bytes = 16 * 1024 };
+    for (0..2) |_| {
+        const result = try executeCommandInEnvironment(config, arena, "fxsnap_bulk_2999", paths.workspace, .{ .user = paths.shell });
+        try std.testing.expectEqualStrings("exit_code=0\n<stdout>\nbulk-2999\n</stdout>\n", result.output);
+    }
+    // Both commands ran from the snapshot, so startup ran only for its capture.
+    const loads_path = try std.Io.Dir.path.join(arena, &.{ paths.home, "rc-loads.log" });
+    try std.testing.expectEqualStrings("loaded\n", try readAbsoluteFile(arena, loads_path, 4096));
 }
 
 test "zsh user profile snapshot restores a function that replaces a default alias" {
@@ -4569,18 +4700,16 @@ test "detached session preserves replacement failure with a zero output budget" 
     );
 }
 
+const long_script_filler_line =
+    "# long script transport filler ............................................................................................................................\n";
+
 test "raw process execution transports long scripts without exposing stdin" {
     if (builtin.target.os.tag == .windows) return;
 
     const alloc = std.testing.allocator;
     var script: std.ArrayList(u8) = .empty;
     defer script.deinit(alloc);
-    for (0..160) |_| {
-        try script.appendSlice(
-            alloc,
-            "# long script transport filler ............................................................................................................................\n",
-        );
-    }
+    for (0..160) |_| try script.appendSlice(alloc, long_script_filler_line);
     try script.appendSlice(
         alloc,
         "if IFS= read -r value; then printf 'stdin=pipe:%s\\n' \"$value\"; else printf 'stdin=eof\\n'; fi\nprintf 'long-script-ok\\n'\n",
@@ -4595,6 +4724,29 @@ test "raw process execution transports long scripts without exposing stdin" {
     try std.testing.expect(std.mem.find(u8, result.output, "exit_code=0\n") != null);
     try std.testing.expect(std.mem.find(u8, result.output, "stdin=eof\n") != null);
     try std.testing.expect(std.mem.find(u8, result.output, "long-script-ok\n") != null);
+}
+
+test "raw process execution transports a script larger than any pipe buffer" {
+    if (builtin.target.os.tag == .windows) return;
+
+    // On macOS the target starts suspended, so a helper that writes the script
+    // before the target reads it hangs once the script outgrows the pipe. The
+    // test above fits an idle 64 KiB pipe whole; this one exceeds every pipe
+    // buffer.
+    const alloc = std.testing.allocator;
+    var script: std.ArrayList(u8) = .empty;
+    defer script.deinit(alloc);
+    for (0..2048) |_| try script.appendSlice(alloc, long_script_filler_line);
+    try script.appendSlice(alloc, "printf 'huge-script-ok\\n'\n");
+    try std.testing.expect(script.items.len > 256 * 1024);
+
+    const result = try executeCommand(.{
+        .max_command_output_bytes = 4096,
+    }, alloc, script.items, "/tmp");
+    defer alloc.free(result.output);
+
+    try std.testing.expect(std.mem.find(u8, result.output, "exit_code=0\n") != null);
+    try std.testing.expect(std.mem.find(u8, result.output, "huge-script-ok\n") != null);
 }
 
 test "large stdout writes command artifact and returns bounded preview" {
@@ -6705,6 +6857,78 @@ test "foreground supervisor fallback leaves the parent two termination polls" {
         @as(?i64, std.math.maxInt(i64)),
         foreground_supervisor_fallback_deadline_ms(std.math.maxInt(i64) - 100),
     );
+}
+
+/// Walks `pace` through a quiet tree from `now_ms` until it reaches the slow
+/// pace, and returns the time then.
+fn quietForegroundRefreshPaceForTest(pace: *ForegroundRefreshPace, now_ms: i64) i64 {
+    var now = now_ms;
+    while (true) {
+        const wait_ns = pace.next(now, pace.tracked, false, null);
+        if (wait_ns == foreground_refresh_slow_ns) return now;
+        now += @intCast(wait_ns / std.time.ns_per_ms);
+    }
+}
+
+test "foreground refresh pace stays fast while a command starts" {
+    var pace = ForegroundRefreshPace.init(1_000);
+    var now: i64 = 1_000;
+    while (now < 1_000 + foreground_refresh_fast_window_ms) : (now += 1) {
+        try std.testing.expectEqual(foreground_refresh_fast_ns, pace.next(now, 0, false, null));
+    }
+}
+
+test "foreground refresh pace backs off on a quiet tree" {
+    const ms = std.time.ns_per_ms;
+    var pace = ForegroundRefreshPace.init(0);
+    const quiet = foreground_refresh_fast_window_ms;
+    try std.testing.expectEqual(2 * ms, pace.next(quiet, 0, false, null));
+    try std.testing.expectEqual(4 * ms, pace.next(quiet + 2, 0, false, null));
+    try std.testing.expectEqual(8 * ms, pace.next(quiet + 6, 0, false, null));
+    try std.testing.expectEqual(16 * ms, pace.next(quiet + 14, 0, false, null));
+    try std.testing.expectEqual(foreground_refresh_slow_ns, pace.next(quiet + 30, 0, false, null));
+    try std.testing.expectEqual(foreground_refresh_slow_ns, pace.next(quiet + 55, 0, false, null));
+}
+
+test "foreground refresh pace turns fast again when the tree grows" {
+    var pace = ForegroundRefreshPace.init(0);
+    const now = quietForegroundRefreshPaceForTest(&pace, foreground_refresh_fast_window_ms);
+    try std.testing.expectEqual(foreground_refresh_fast_ns, pace.next(now, 1, false, null));
+    try std.testing.expectEqual(
+        foreground_refresh_fast_ns,
+        pace.next(now + foreground_refresh_fast_window_ms - 1, 1, false, null),
+    );
+    try std.testing.expectEqual(
+        2 * std.time.ns_per_ms,
+        pace.next(now + foreground_refresh_fast_window_ms, 1, false, null),
+    );
+}
+
+test "foreground refresh pace stays fast while a stop is in progress" {
+    var pace = ForegroundRefreshPace.init(0);
+    const now = quietForegroundRefreshPaceForTest(&pace, foreground_refresh_fast_window_ms);
+    try std.testing.expectEqual(foreground_refresh_fast_ns, pace.next(now, 0, true, null));
+    try std.testing.expectEqual(foreground_refresh_fast_ns, pace.next(now + 500, 0, true, null));
+}
+
+test "foreground refresh pace never waits past the command deadline" {
+    var pace = ForegroundRefreshPace.init(0);
+    const now = quietForegroundRefreshPaceForTest(&pace, foreground_refresh_fast_window_ms);
+    try std.testing.expectEqual(7 * std.time.ns_per_ms, pace.next(now, 0, false, now + 7));
+    try std.testing.expectEqual(foreground_refresh_fast_ns, pace.next(now, 0, false, now));
+    try std.testing.expectEqual(foreground_refresh_fast_ns, pace.next(now, 0, false, now - 5));
+}
+
+test "a quiet two-second command refreshes its tree a tenth as often as a fixed millisecond pace" {
+    var pace = ForegroundRefreshPace.init(0);
+    const two_seconds_ns: u64 = 2 * std.time.ns_per_s;
+    var now_ns: u64 = 0;
+    var refreshes: u64 = 0;
+    while (now_ns < two_seconds_ns) : (refreshes += 1) {
+        now_ns += pace.next(@intCast(now_ns / std.time.ns_per_ms), 0, false, null);
+    }
+    // A fixed one-millisecond pace refreshes 2,000 times.
+    try std.testing.expect(refreshes <= two_seconds_ns / std.time.ns_per_ms / 10);
 }
 
 test "cancel and timeout tie chooses cancellation" {

@@ -18,6 +18,7 @@ const std = @import("std");
 const checkpoint = @import("checkpoint.zig");
 const trace = @import("trace.zig");
 const text_utils = @import("../shared/text_utils.zig");
+const types = @import("../shared/types.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -452,12 +453,12 @@ pub fn read(arena: Allocator, reply: []const u8, known: Known, earlier: []const 
             if (rest.len > 0) try earlier_summary.print(arena, "{s}\n", .{rest});
             continue;
         }
-        if (sectionRest(plain)) |rest| {
+        if (sectionHeading(plain)) |heading| {
             in_sections = true;
             in_earlier = false;
             turn = null;
             current = null;
-            try sections.print(arena, "{s}\n", .{rest});
+            try sections.print(arena, "{s}\n", .{heading.rest});
             continue;
         }
         if (in_earlier) {
@@ -656,16 +657,51 @@ fn earlierRest(plain: []const u8) ?[]const u8 {
     return null;
 }
 
-/// What follows a section heading like `Rules:` or `Facts of the session:`
-/// on its line, or null when `plain` is not one.
-fn sectionRest(plain: []const u8) ?[]const u8 {
-    const headings = [_][]const u8{ "Rules of the session", "Facts of the session", "Status and open", "Rules", "Facts", "Decisions", "Status", "Open" };
-    for (headings) |heading| {
-        if (!startsWithIgnoreCase(plain, heading)) continue;
-        const after = plain[heading.len..];
-        if (after.len == 0) return after;
-        if (after[0] == ':') return std.mem.trim(u8, after[1..], " ");
+/// A section of the notes after the turns', and Earlier, which only a request
+/// that folds the compaction before it asks for.
+pub const Section = enum { rules, facts, decisions, status, open, earlier };
+
+/// The section headings `read` accepts, a longer one before its prefix.
+const section_headings = [_]struct { name: []const u8, section: Section }{
+    .{ .name = "Rules of the session", .section = .rules },
+    .{ .name = "Facts of the session", .section = .facts },
+    .{ .name = "Status and open", .section = .status },
+    .{ .name = "Rules", .section = .rules },
+    .{ .name = "Facts", .section = .facts },
+    .{ .name = "Decisions", .section = .decisions },
+    .{ .name = "Status", .section = .status },
+    .{ .name = "Open", .section = .open },
+};
+
+const SectionHeading = struct { section: Section, rest: []const u8 };
+
+/// The section a heading like `Rules:` or `Facts of the session:` starts and
+/// what follows it on its line, or null when `plain` is not one.
+fn sectionHeading(plain: []const u8) ?SectionHeading {
+    for (section_headings) |heading| {
+        if (!startsWithIgnoreCase(plain, heading.name)) continue;
+        const after = plain[heading.name.len..];
+        if (after.len == 0) return .{ .section = heading.section, .rest = after };
+        if (after[0] == ':') return .{ .section = heading.section, .rest = std.mem.trim(u8, after[1..], " ") };
     }
+    return null;
+}
+
+/// What a line of the notes starts, read as `read` reads it.
+pub const LineStart = union(enum) {
+    /// A note for calls `first` through `last`.
+    tools: struct { first: usize, last: usize },
+    section: Section,
+};
+
+/// What `line` starts, or null for any other line. `arena` holds the line
+/// without its Markdown when it has any `**`, never more than `line.len`
+/// bytes.
+pub fn lineStart(arena: Allocator, line: []const u8) Allocator.Error!?LineStart {
+    const plain = try undecorated(arena, std.mem.trim(u8, line, " \t\r"));
+    if (toolNote(plain)) |note| return .{ .tools = .{ .first = note.number, .last = @max(note.number, note.last) } };
+    if (earlierRest(plain) != null) return .{ .section = .earlier };
+    if (sectionHeading(plain)) |heading| return .{ .section = heading.section };
     return null;
 }
 
@@ -830,9 +866,22 @@ pub fn addUsed(arena: Allocator, earlier: []const checkpoint.Used, calls: []cons
 const Found = struct { kind: checkpoint.Used.Kind, name: []const u8 };
 
 /// The skill or MCP tool a call used: a `skill` call's location (and
-/// resource), an MCP tool by its name, or an `mcp_features` call by its
-/// server and action.
+/// resource), an MCP tool by its name, an `mcp_features` call by its server
+/// and action, or what a `toolbox` call opened or ran.
 fn usedBy(arena: Allocator, call: Call) Allocator.Error!?Found {
+    if (std.mem.eql(u8, call.name, "toolbox")) {
+        if (try stringArgument(arena, call.arguments, "run")) |tool| {
+            return if (types.isMcpToolName(tool)) .{ .kind = .mcp, .name = tool } else null;
+        }
+        const opened = try stringArgument(arena, call.arguments, "open") orelse return null;
+        // An MCP tool's definition isn't a use of it. Any other open is
+        // counted as the skill it most often is; a server's name can't be
+        // told apart from a skill's here.
+        if (types.isMcpToolName(opened)) return null;
+        const resource = try stringArgument(arena, call.arguments, "resource") orelse "";
+        const name = if (resource.len == 0) opened else try arena.print("{s} {s}", .{ opened, resource });
+        return .{ .kind = .skill, .name = name };
+    }
     if (std.mem.eql(u8, call.name, "skill")) {
         const location = try stringArgument(arena, call.arguments, "location") orelse return null;
         const resource = try stringArgument(arena, call.arguments, "resource") orelse "";
@@ -844,7 +893,7 @@ fn usedBy(arena: Allocator, call: Call) Allocator.Error!?Found {
         const action = try stringArgument(arena, call.arguments, "action") orelse "";
         return .{ .kind = .mcp, .name = try arena.print("mcp_features {s} {s}", .{ server, action }) };
     }
-    if (std.mem.startsWith(u8, call.name, "mcp_") and !std.mem.eql(u8, call.name, "mcp_select_tool")) {
+    if (types.isMcpToolName(call.name) and !std.mem.eql(u8, call.name, "mcp_select_tool")) {
         return .{ .kind = .mcp, .name = try arena.dupe(u8, call.name) };
     }
     return null;
@@ -862,6 +911,20 @@ fn stringArgument(arena: Allocator, arguments: []const u8, field: []const u8) Al
 }
 
 const testing = std.testing;
+
+test "a toolbox call is used as the skill it opened or the MCP tool it ran" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const opened = (try usedBy(arena, .{ .number = 1, .name = "toolbox", .arguments = "{\"open\":\"fx-commit\",\"resource\":\"ship.md\"}" })).?;
+    try std.testing.expectEqual(checkpoint.Used.Kind.skill, opened.kind);
+    try std.testing.expectEqualStrings("fx-commit ship.md", opened.name);
+    const ran = (try usedBy(arena, .{ .number = 2, .name = "toolbox", .arguments = "{\"run\":\"mcp_linear_get_issue\",\"arguments\":{}}" })).?;
+    try std.testing.expectEqual(checkpoint.Used.Kind.mcp, ran.kind);
+    try std.testing.expectEqualStrings("mcp_linear_get_issue", ran.name);
+    try std.testing.expectEqual(@as(?Found, null), try usedBy(arena, .{ .number = 3, .name = "toolbox", .arguments = "{\"open\":\"mcp_linear_get_issue\"}" }));
+    try std.testing.expectEqual(@as(?Found, null), try usedBy(arena, .{ .number = 4, .name = "toolbox", .arguments = "{\"run\":\"install_skill\",\"arguments\":{}}" }));
+}
 
 test "a saved entry with an empty ID is skipped when new IDs are numbered" {
     var text: std.ArrayList(u8) = .empty;

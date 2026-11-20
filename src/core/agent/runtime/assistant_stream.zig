@@ -67,6 +67,9 @@ pub const StreamChunkContext = struct {
     saw_visible_text: bool = false,
     saw_tool_start: bool = false,
     saw_provider_tool_start: bool = false,
+    /// A started tool may run at the provider and does more than read, so a
+    /// failed attempt cannot run it again without checking.
+    saw_unrepeatable_provider_tool_start: bool = false,
     saw_visible_text_after_tool_start: bool = false,
     last_byte_was_newline: bool = false,
     trailing_newline_count: u8 = 0,
@@ -160,6 +163,7 @@ pub const StreamChunkContext = struct {
         self.response_language_next_probe_bytes = 5;
         self.saw_tool_start = false;
         self.saw_provider_tool_start = false;
+        self.saw_unrepeatable_provider_tool_start = false;
         self.saw_visible_text_after_tool_start = false;
         self.first_model_output_at_ms = null;
         self.streamed_output_bytes = 0;
@@ -290,6 +294,21 @@ pub fn onStreamToolInputChunk(ctx: *anyopaque, chunk: []const u8) void {
     }
 }
 
+/// A streamed tool call's arguments so far, by its id: a subagent call's row
+/// names its subagent as soon as they hold the name.
+pub fn onStreamToolInputProgress(ctx: *anyopaque, tool_id: []const u8, arguments: []const u8) void {
+    const stream_ctx: *StreamChunkContext = @ptrCast(@alignCast(ctx));
+    stream_ctx.provisional_statuses.observeArguments(
+        stream_ctx.hooks,
+        stream_ctx.alloc,
+        stream_ctx.turn_id,
+        tool_id,
+        arguments,
+    ) catch |err| {
+        debug_trace.logf("ui_activity", "streamed tool row not named call_id={s} err={s}", .{ tool_id, @errorName(err) });
+    };
+}
+
 pub fn pushTokenProgressUpdate(stream_ctx: *StreamChunkContext, update: runtime_telemetry.TokenProgressUpdate) !void {
     switch (update) {
         .unchanged => {},
@@ -353,6 +372,9 @@ pub fn recordStreamToolStart(ctx: *anyopaque, tool_name: []const u8) void {
         tool_name,
     )) {
         stream_ctx.saw_provider_tool_start = true;
+        if (!runtime_tool_presentation.providerToolOnlyReads(stream_ctx.hooks.tool_registry, tool_name)) {
+            stream_ctx.saw_unrepeatable_provider_tool_start = true;
+        }
     }
 }
 

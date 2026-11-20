@@ -19,6 +19,7 @@ const app_permission_runtime = @import("app_permission_runtime.zig");
 const provider_runtime = @import("provider_runtime.zig");
 const core_input_runtime = @import("../input/runtime.zig");
 const app_worker_runtime = @import("app_worker_runtime.zig");
+const turn_capture = @import("../workspace/turn_capture.zig");
 const app_session_runtime = @import("app_session_runtime.zig");
 const runtime_profile = @import("../hosts/runtime_profile.zig");
 const change_tracker_mod = @import("../workspace/change_tracker.zig");
@@ -43,6 +44,7 @@ const worker_runtime = @import("../agent/worker_runtime.zig");
 const assistant_presentation = @import("../agent/assistant_presentation.zig");
 const activity_runtime = @import("../output/activity_runtime.zig");
 const compaction_activity = @import("../output/compaction_activity.zig");
+const activity_status = @import("../output/activity_status.zig");
 const assistant_pacer = @import("../../ui/assistant/pacer.zig");
 const ui_render = @import("../../ui/render.zig");
 const render_request = @import("../../ui/render_request.zig");
@@ -306,6 +308,7 @@ pub fn Bindings(comptime App: type) type {
                 .tool_registry = if (comptime @hasDecl(App, "toolRegistry")) app.toolRegistry(agent) else .{},
                 .context_registry = if (comptime @hasDecl(App, "contextRegistry")) app.contextRegistry() else null,
                 .context_enabled = if (comptime @hasField(App, "context_enabled")) app.context_enabled else false,
+                .image_folder_rules = comptime agents.hasAgentField(App, "pending_images"),
                 .snapshot_root_permission_mode = if (comptime @hasField(App, "permission_engine"))
                     agentSnapshotRootPermissionMode
                 else
@@ -317,7 +320,6 @@ pub fn Bindings(comptime App: type) type {
                 .validate_tool_call = agentValidateToolCall,
                 .snapshot_mcp_definition = agentSnapshotMcpDefinition,
                 .resolve_unselected_mcp_tool = if (comptime @hasDecl(App, "resolveUnselectedMcpTool")) agentResolveUnselectedMcpTool else null,
-                .prepare_skill_call = if (comptime @hasField(App, "skills") and @hasDecl(App, "toolRegistry")) agentPrepareSkillCall else null,
                 .check_tool_availability = agentCheckToolAvailability,
                 .request_tool_permission = agentRequestToolPermission,
                 .request_prepared_file_mutation_permission = agentRequestPreparedFileMutationPermission,
@@ -338,6 +340,7 @@ pub fn Bindings(comptime App: type) type {
                     .begin = beginCompactionActivity,
                     .running = runCompactionActivity,
                     .settle = settleCompactionActivity,
+                    .written = if (comptime @hasDecl(@TypeOf(agent.worker), "writtenCompactionActivity")) writtenCompactionActivity else null,
                 } else null,
                 .append_turn_piece = if (comptime agents.hasAgentField(App, "session_persistence"))
                     if (agent.session_persistence.v2 != null) agentAppendTurnPiece else null
@@ -349,6 +352,14 @@ pub fn Bindings(comptime App: type) type {
                     null,
                 .save_prompt_images = if (comptime agents.hasAgentField(App, "session_persistence"))
                     if (agent.session_persistence.v2 != null) agentSavePromptImages else null
+                else
+                    null,
+                .start_workspace_capture = if (comptime agents.hasAgentField(App, "session_persistence") and turn_capture.supported)
+                    if (agent.session_persistence.v2 != null and agent.session_persistence.workspace_capture) agentStartWorkspaceCapture else null
+                else
+                    null,
+                .reach_workspace = if (comptime agents.hasAgentField(App, "session_persistence") and turn_capture.supported)
+                    if (agent.session_persistence.v2 != null and agent.session_persistence.workspace_capture) agentReachWorkspace else null
                 else
                     null,
                 .save_recovery_record = if (comptime agents.hasAgentField(App, "session_persistence"))
@@ -363,6 +374,7 @@ pub fn Bindings(comptime App: type) type {
                 .push_system_notice = agentPushSystemNotice,
                 .push_interactive_notice = agentPushInteractiveNotice,
                 .push_context_notice = agentPushContextNotice,
+                .push_session_notice = agentPushSessionNotice,
                 .push_route_recovery_status = agentPushRouteRecoveryStatus,
                 .restore_failed_prompt = agentRestoreFailedPrompt,
                 .push_command_output_complete = agentPushCommandOutputComplete,
@@ -391,6 +403,10 @@ pub fn Bindings(comptime App: type) type {
             if (comptime @hasDecl(App, "releaseAgentTerminalLease")) {
                 deps.release_agent_terminal_lease = agentReleaseTerminalLease;
             }
+            if (comptime @hasDecl(App, "stopSteeringDetachedCommands")) {
+                deps.turn_ends_by_explicit_cancel = agentTurnEndsByExplicitCancel;
+                deps.stop_steering_detached_commands = agentStopSteeringDetachedCommands;
+            }
             return deps;
         }
 
@@ -400,13 +416,27 @@ pub fn Bindings(comptime App: type) type {
             return app.releaseAgentTerminalLease(agent, session_id);
         }
 
+        /// Main's and each subagent's turns end here. Only an explicit
+        /// cancel stops what steering detached; a turn steering ended keeps
+        /// its commands.
+        fn agentTurnEndsByExplicitCancel(ctx: *anyopaque, turn_id: u64) bool {
+            const agent: *AppAgent = @ptrCast(@alignCast(ctx));
+            return agent.worker.turnEndsByExplicitCancel(turn_id);
+        }
+
+        fn agentStopSteeringDetachedCommands(ctx: *anyopaque, turn_id: u64) !void {
+            const agent: *AppAgent = @ptrCast(@alignCast(ctx));
+            return appOf(agent).stopSteeringDetachedCommands(agent, turn_id);
+        }
+
         fn refreshGatewayCredential(
             raw_ctx: *anyopaque,
             alloc: std.mem.Allocator,
             source: credentials.Source,
             mode: auth_runtime.CredentialRefreshMode,
             expected_account_id: ?[]const u8,
-        ) !?[]u8 {
+            rejected_token: ?[]const u8,
+        ) !?agent_runtime.RefreshedGatewayCredential {
             const agent: *AppAgent = @ptrCast(@alignCast(raw_ctx));
             const app = appOf(agent);
             if (mode == .if_needed and auth_runtime.requestPathCredentialVerifiedRecently(source)) {
@@ -419,20 +449,40 @@ pub fn Bindings(comptime App: type) type {
                 source,
                 mode,
                 expected_account_id,
+                rejected_token,
             )) orelse return null;
             var owns_refreshed = true;
             defer if (owns_refreshed) refreshed.deinit(std.heap.c_allocator);
+            // This session's own sign-in saved this login before its team is
+            // chosen; that sign-in continues the request with the team.
+            if (comptime @hasField(@TypeOf(app.auth), "sign_in_flow")) {
+                if (mode == .stored and app.auth.sign_in_flow.savedToken(refreshed.token)) {
+                    debug_trace.logf("auth", "stored login skipped source={t} reason=saved_by_this_session", .{source});
+                    return null;
+                }
+            }
             if (app.auth.preparedCredentialChange(refreshed) == .authority) {
                 return error.CredentialAuthorityChanged;
             }
 
             const worker_token = try alloc.dupe(u8, refreshed.token);
             errdefer secret.zeroAndFree(alloc, worker_token);
+            // The login matches the app's current choice, which can be a team
+            // the user picked after the request started, so the request sends
+            // this team from now on.
+            const worker_team = if (refreshed.gatewayTeam()) |team| try alloc.dupe(u8, team) else null;
+            errdefer if (worker_team) |team| alloc.free(team);
+            const worker_team_label = if (refreshed.team_slug) |slug| try alloc.dupe(u8, slug) else null;
+            errdefer if (worker_team_label) |label| alloc.free(label);
             try app_worker_runtime.Runtime(App).pushOwnedEvent(app, agent, .{
                 .credential_refreshed = refreshed,
             });
             owns_refreshed = false;
-            return worker_token;
+            return .{
+                .token = worker_token,
+                .gateway_team = worker_team,
+                .gateway_team_label = worker_team_label,
+            };
         }
 
         /// Resolves models for `agent`, under its own turn settings.
@@ -742,6 +792,15 @@ pub fn Bindings(comptime App: type) type {
             try app_worker_runtime.Runtime(App).pushToolLifecycle(appOf(agent), agent, event);
         }
 
+        /// Keeps the row of a call made through `fx mcp call` in the
+        /// agent's session, so a resume shows it again
+        /// (`tool_runtime.ToolLifecyclePublisher`).
+        pub fn saveNestedBridgeCall(ctx: *anyopaque, record: types.BridgeCallRecord) !void {
+            if (comptime !agents.hasAgentField(App, "session_persistence")) return;
+            const agent: *AppAgent = @ptrCast(@alignCast(ctx));
+            try app_session_runtime.Runtime(App).saveBridgeCall(agent, record);
+        }
+
         fn renderSubagentStatusLine(ctx: *anyopaque, buf: []u8, status: types.SubagentStatus) []const u8 {
             const agent: *AppAgent = @ptrCast(@alignCast(ctx));
             const app = appOf(agent);
@@ -948,7 +1007,9 @@ pub fn Bindings(comptime App: type) type {
         fn agentSnapshotMcpDefinition(ctx: *anyopaque, arena: Allocator, name: []const u8, known: tool_mcp_runtime.Binding) !tool_mcp_runtime.DefinitionSnapshot {
             const agent: *AppAgent = @ptrCast(@alignCast(ctx));
             const app = appOf(agent);
-            if (comptime @hasDecl(App, "snapshotMcpDefinition")) return app.snapshotMcpDefinition(arena, name, known);
+            if (comptime @hasDecl(App, "snapshotMcpDefinition")) {
+                return app.snapshotMcpDefinition(arena, name, known, app_permission_runtime.Runtime(App).livePermissionSnapshot(app, agent).mode);
+            }
             return .unavailable;
         }
 
@@ -968,25 +1029,6 @@ pub fn Bindings(comptime App: type) type {
             const agent: *AppAgent = @ptrCast(@alignCast(ctx));
             const app = appOf(agent);
             return app.checkToolAvailability(agent, arena, call);
-        }
-
-        fn agentPrepareSkillCall(ctx: *anyopaque, arena: Allocator, call: ToolCall, locations: ?*const skill_contract.Locations) !skill_contract.CallPreparation {
-            const agent: *AppAgent = @ptrCast(@alignCast(ctx));
-            const app = appOf(agent);
-            const tool = app.toolRegistry(agent).lookup(call.name) orelse return error.UnsupportedTool;
-            const prepare = tool.prepare_skill_call_fn orelse return error.UnsupportedTool;
-            const workspace_root = if (comptime @hasDecl(App, "workspaceHostInfo"))
-                if (app.workspaceHostInfo()) |info| info.root() else app.workspace_root
-            else
-                app.workspace_root;
-            return prepare(.{
-                .allocator = arena,
-                .workspace_root = workspace_root,
-                .skills_dir = app.skills.dir,
-                .skill_locations = locations,
-                .max_tool_result_bytes = agent.worker.effectiveAgentTurnSettings().max_tool_result_bytes,
-                .cancel_flag = &agent.worker.worker_cancel_requested,
-            }, call.arguments_json);
         }
 
         fn agentResolveToolActionDisplayTarget(ctx: *anyopaque, arena: Allocator, call: ToolCall) !?[]const u8 {
@@ -1042,6 +1084,7 @@ pub fn Bindings(comptime App: type) type {
                 .model_output = model_output,
                 .outcome = .rejected,
                 .started_at_ms = io_mod.milliTimestamp(),
+                .call_id = call.id,
             });
         }
 
@@ -1059,6 +1102,7 @@ pub fn Bindings(comptime App: type) type {
                 .model_output = model_output,
                 .outcome = .tool_failed,
                 .started_at_ms = io_mod.milliTimestamp(),
+                .call_id = call.id,
             });
         }
 
@@ -1166,9 +1210,40 @@ pub fn Bindings(comptime App: type) type {
             agent.worker.runCompactionActivity(id, stage);
         }
 
+        fn writtenCompactionActivity(ctx: *anyopaque, id: compaction_activity.OperationId, percent: u8) void {
+            const agent: *AppAgent = @ptrCast(@alignCast(ctx));
+            agent.worker.writtenCompactionActivity(id, percent);
+        }
+
         fn settleCompactionActivity(ctx: *anyopaque, id: compaction_activity.OperationId, feedback: compaction_activity.Feedback) void {
             const agent: *AppAgent = @ptrCast(@alignCast(ctx));
             agent.worker.settleCompactionActivity(id, feedback);
+            if (feedback.outcome == .succeeded) pushCompactionDoneNotice(agent, id);
+        }
+
+        /// Leaves `Context compacted (2m10s)` in the transcript once the
+        /// compaction `id` has succeeded, with the time its row showed last.
+        fn pushCompactionDoneNotice(agent: *AppAgent, id: compaction_activity.OperationId) void {
+            if (comptime !@hasDecl(@TypeOf(agent.worker), "compactionActivitySnapshot")) return;
+            const op = agent.worker.compactionActivitySnapshot().operation orelse {
+                debug_trace.logf("compaction", "event=compaction_notice_dropped reason=no_operation", .{});
+                return;
+            };
+            if (op.id != id) {
+                debug_trace.logf("compaction", "event=compaction_notice_dropped reason=superseded", .{});
+                return;
+            }
+            var buf: [64]u8 = undefined;
+            const body = activity_status.compactionDoneNotice(&buf, op) orelse {
+                debug_trace.logf("compaction", "event=compaction_notice_dropped reason=no_line", .{});
+                return;
+            };
+            // No topic, so the line reads `✓ Context compacted (2m10s)`.
+            app_worker_runtime.Runtime(App).pushSemanticNotice(appOf(agent), agent, .{
+                .topic = "",
+                .tone = .success,
+                .body = body,
+            }) catch |err| debug_trace.logf("compaction", "event=compaction_notice_dropped reason={t}", .{err});
         }
 
         fn agentCommitContextCompaction(
@@ -1218,6 +1293,16 @@ pub fn Bindings(comptime App: type) type {
             try app_session_runtime.Runtime(App).savePromptImages(agent, alloc, images);
         }
 
+        fn agentStartWorkspaceCapture(ctx: *anyopaque, fresh: bool, step: agent_runtime.AgentRuntimeDeps.WorkspaceCaptureStep) void {
+            const agent: *AppAgent = @ptrCast(@alignCast(ctx));
+            app_session_runtime.Runtime(App).startWorkspaceCapture(appOf(agent), agent, fresh, step);
+        }
+
+        fn agentReachWorkspace(ctx: *anyopaque, dir: []const u8, tool_name: []const u8) void {
+            const agent: *AppAgent = @ptrCast(@alignCast(ctx));
+            app_session_runtime.Runtime(App).reachWorkspace(appOf(agent), agent, dir, tool_name);
+        }
+
         fn agentPropagateGrant(ctx: *anyopaque, tool_name: []const u8, target_path: []const u8) !void {
             const agent: *AppAgent = @ptrCast(@alignCast(ctx));
             const app = appOf(agent);
@@ -1228,12 +1313,19 @@ pub fn Bindings(comptime App: type) type {
             const agent: *AppAgent = @ptrCast(@alignCast(ctx));
             const app = appOf(agent);
             var owned_event = event;
-            if (event == .finish_prompt and
-                comptime @hasDecl(@TypeOf(agent.worker), "handoffActivePromptSnapshots"))
-            {
+            if (event == .finish_prompt) {
                 var finished = event.finish_prompt;
-                finished.snapshot_file_ownership =
-                    try agent.worker.handoffActivePromptSnapshots(std.heap.c_allocator);
+                // The turn's end capture runs here, on the agent's worker,
+                // before the finished prompt reaches the UI that commits it,
+                // and the prompt carries the turn's token so that commit
+                // writes only this turn's captures, however late (D98).
+                if (comptime agents.hasAgentField(App, "session_persistence") and turn_capture.supported) {
+                    if (app_session_runtime.Runtime(App).endWorkspaceCapture(app, agent)) |token| finished.capture_turn = @backingInt(token);
+                }
+                if (comptime @hasDecl(@TypeOf(agent.worker), "handoffActivePromptSnapshots")) {
+                    finished.snapshot_file_ownership =
+                        try agent.worker.handoffActivePromptSnapshots(std.heap.c_allocator);
+                }
                 owned_event = .{ .finish_prompt = finished };
             }
             defer worker_runtime.freeWorkerEvent(std.heap.c_allocator, owned_event);
@@ -1324,6 +1416,19 @@ pub fn Bindings(comptime App: type) type {
                 .tone = .warning,
                 .body = body,
                 .visibility = .full_only,
+            });
+        }
+
+        fn agentPushSessionNotice(ctx: *anyopaque, text: []const u8) !void {
+            const agent: *AppAgent = @ptrCast(@alignCast(ctx));
+            const app = appOf(agent);
+            if (comptime @hasDecl(@TypeOf(agent.session), "claimContextNotice")) {
+                if (!try agent.session.claimContextNotice(std.heap.c_allocator, text)) return;
+            }
+            try app_worker_runtime.Runtime(App).pushSemanticNotice(app, agent, .{
+                .topic = "effort",
+                .tone = .neutral,
+                .body = text,
             });
         }
 
@@ -1593,7 +1698,7 @@ pub fn Bindings(comptime App: type) type {
         fn workerBridgeAppendHistoryTurn(ctx: *anyopaque, finished: types.FinishedPrompt) !app_worker_runtime.HistoryDelivery {
             const agent: *AppAgent = @ptrCast(@alignCast(ctx));
             const app = appOf(agent);
-            if (try app.pacer.deferFinish(app.alloc, finished)) return .retained;
+            if (try app_worker_runtime.Runtime(App).deferFinish(app, agent, finished)) return .retained;
             return .{ .settled = try appendHistoryTurn(app, agent, finished) };
         }
 
@@ -1754,7 +1859,7 @@ const FakePacer = struct {
         try self.text.appendSlice(alloc, text);
     }
 
-    fn deferFinish(self: *FakePacer, alloc: std.mem.Allocator, finished: types.FinishedPrompt) !bool {
+    pub fn deferFinish(self: *FakePacer, alloc: std.mem.Allocator, finished: types.FinishedPrompt) !bool {
         _ = alloc;
         _ = finished;
         return self.defer_history;
@@ -1846,47 +1951,6 @@ const FakeShell = struct {
         return self.lifecycle.finalizedToolTurnWatermark();
     }
 };
-
-test "skill preparation uses the active turn tool result budget" {
-    const alloc = std.testing.allocator;
-    const SkillApp = struct {
-        const dispatch = @import("../tooling/tool_dispatch.zig");
-        const tool = registered: {
-            var value = @import("../../builtins/tools.zig").skill;
-            value.prepare_skill_call_fn = observeBudget;
-            break :registered value;
-        };
-        workspace_root: []const u8 = "/workspace",
-        skills: struct { dir: []const u8 = "/skills" } = .{},
-        main_agent: struct {
-            worker: worker_runtime.WorkerRuntime = .{},
-        } = .{},
-
-        pub fn toolRegistry(_: *@This(), _: anytype) dispatch.Registry {
-            return .{ .tools = &.{tool} };
-        }
-
-        fn observeBudget(ctx: dispatch.DispatchContext, _: []const u8) dispatch.DispatchError!skill_contract.CallPreparation {
-            return .{ .failure = .{ .model_output = try ctx.allocator.print("{d}", .{ctx.max_tool_result_bytes}) } };
-        }
-
-        pub fn agent(self: anytype) @TypeOf(&self.main_agent) {
-            return &self.main_agent;
-        }
-    };
-    var app: SkillApp = .{};
-    defer app.agent().worker.deinit(alloc);
-    app.agent().worker.agent_turn_settings.max_tool_result_bytes = 16 * 1024;
-    app.agent().worker.active_agent_turn_settings = .{ .max_tool_result_bytes = 4096 };
-    const call: ToolCall = .{ .id = "skill", .name = "skill", .arguments_json = "{}" };
-    const active = try Bindings(SkillApp).agentPrepareSkillCall((&app).agent(), alloc, call, null);
-    defer @import("../skills/skill_invocation.zig").freeCallPreparation(alloc, active);
-    try std.testing.expectEqualStrings("4096", active.failure.model_output);
-    app.agent().worker.active_agent_turn_settings = null;
-    const current = try Bindings(SkillApp).agentPrepareSkillCall((&app).agent(), alloc, call, null);
-    defer @import("../skills/skill_invocation.zig").freeCallPreparation(alloc, current);
-    try std.testing.expectEqualStrings("16384", current.failure.model_output);
-}
 
 const FakeApp = struct {
     alloc: std.mem.Allocator,

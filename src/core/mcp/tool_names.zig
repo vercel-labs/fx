@@ -2,6 +2,7 @@ const std = @import("std");
 const tool_dispatch = @import("../tooling/tool_dispatch.zig");
 const Allocator = std.mem.Allocator;
 const collections = @import("../shared/collections.zig");
+const core_types = @import("../shared/types.zig");
 const max_mcp_tool_tags: usize = 16;
 
 /// One alias authority for a session. Retired names remain reserved so a later
@@ -72,9 +73,9 @@ pub const Registry = struct {
 
 /// Match the configured namespace without allocating or interpreting tool arguments.
 pub fn matchesServer(name: []const u8, server_name: []const u8) bool {
-    if (!std.mem.startsWith(u8, name, "mcp_")) return false;
+    if (!core_types.isMcpToolName(name)) return false;
     const source = if (server_name.len == 0) "server" else server_name;
-    const segment = name[4..];
+    const segment = name[core_types.mcp_tool_prefix.len..];
     for (source, 0..) |byte, index| {
         if (index >= segment.len) return false;
         const normalized = if (isIdentifierByte(byte)) byte else '_';
@@ -87,7 +88,7 @@ fn buildBaseToolName(alloc: Allocator, server_name: []const u8, tool_name: []con
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
 
-    try out.writer.writeAll("mcp_");
+    try out.writer.writeAll(core_types.mcp_tool_prefix);
     if (server_name.len == 0) {
         try out.writer.writeAll("server");
     } else {

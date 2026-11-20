@@ -88,11 +88,22 @@ pub const Store = struct {
     /// Why the store couldn't be written, for a notice: "<place> couldn't be
     /// written: <why>", held in `buffer`.
     pub fn writeFailure(s: Store, buffer: []u8, err: anyerror) []const u8 {
-        const why: []const u8 = switch (err) {
+        return std.mem.print(buffer, "{s} couldn't be written: {s}", .{ s.place(), cause(err, "write") }) catch "the saved MCP sign-ins couldn't be written";
+    }
+
+    /// Why the store couldn't be read, for a server's status: "<place>
+    /// couldn't be read: <why>", held in `buffer`.
+    pub fn readFailure(s: Store, buffer: []u8, err: anyerror) []const u8 {
+        return std.mem.print(buffer, "{s} couldn't be read: {s}", .{ s.place(), cause(err, "read") }) catch "the saved MCP sign-ins couldn't be read";
+    }
+
+    /// A store error in words, for an attempt to `verb` the store.
+    fn cause(err: anyerror, comptime verb: []const u8) []const u8 {
+        return switch (err) {
             // A store over fx's size limit is one fx can't read either.
             error.CredentialStoreUnreadable, error.StreamTooLong => "a newer fx saved it, or it's damaged",
             error.LockBusy => "another fx kept it busy",
-            error.AccessDenied => "fx isn't allowed to write it",
+            error.AccessDenied => "fx isn't allowed to " ++ verb ++ " it",
             error.PrivateStatePermissionsUnsupported => "its permissions let others read it, or fx can't make them private",
             error.DurablePathUnsafe => "it isn't a plain file",
             error.NoSpaceLeft, error.DiskQuota => "the disk is full",
@@ -100,7 +111,6 @@ pub const Store = struct {
             error.KeychainReadFailed, error.KeychainWriteFailed, error.KeychainDeleteFailed => "the Keychain refused it or didn't answer",
             else => @errorName(err),
         };
-        return std.mem.print(buffer, "{s} couldn't be written: {s}", .{ s.place(), why }) catch "the saved MCP sign-ins couldn't be written";
     }
 
     /// The credential saved under `key`, or null, also when the store can't be
@@ -500,6 +510,15 @@ test "a store that can't be written says where and why in words" {
     try testing.expectEqualStrings("~/.fx/mcp-credentials/credentials-v3.json couldn't be written: the disk is full", file.writeFailure(&buffer, error.NoSpaceLeft));
     const keychain: Store = .{ .home = "/home/example", .backend = .keychain };
     try testing.expectEqualStrings("the Keychain item " ++ native_keychain.mcp_host_credentials_service_name ++ " couldn't be written: the Keychain refused it or didn't answer", keychain.writeFailure(&buffer, error.KeychainWriteFailed));
+}
+
+test "a store that can't be read says where and why in words" {
+    var buffer: [320]u8 = undefined;
+    const keychain: Store = .{ .home = "/home/example", .backend = .keychain };
+    try testing.expectEqualStrings("the Keychain item " ++ native_keychain.mcp_host_credentials_service_name ++ " couldn't be read: the Keychain refused it or didn't answer", keychain.readFailure(&buffer, error.KeychainReadFailed));
+    const file: Store = .{ .home = "/home/example", .backend = .file };
+    try testing.expectEqualStrings("~/.fx/mcp-credentials/credentials-v3.json couldn't be read: a newer fx saved it, or it's damaged", file.readFailure(&buffer, error.CredentialStoreUnreadable));
+    try testing.expectEqualStrings("~/.fx/mcp-credentials/credentials-v3.json couldn't be read: fx isn't allowed to read it", file.readFailure(&buffer, error.AccessDenied));
 }
 
 test "a credential is kept per server name and URL, replaced, and removed" {

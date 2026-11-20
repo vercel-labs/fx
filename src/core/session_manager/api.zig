@@ -46,6 +46,8 @@ pub const From = session_mod.From;
 pub const Direction = session_mod.Direction;
 pub const ForkPoint = session_mod.ForkPoint;
 pub const Verified = session_mod.Verified;
+pub const VerifyOptions = session_mod.VerifyOptions;
+pub const Stop = session_mod.Stop;
 pub const Summary = catalog_mod.Summary;
 pub const ListPage = catalog_mod.Page;
 pub const ListCursor = catalog_mod.Cursor;
@@ -55,6 +57,7 @@ pub const BlobHash = [schema.blob_hash_len]u8;
 pub const max_blob_bytes = session_mod.max_blob_bytes;
 pub const new_id_len = schema.new_id_len;
 pub const newId = schema.newId;
+pub const validId = schema.validId;
 /// Largest `data` or `value` accepted in one event; the adapter moves
 /// bodies above its own, smaller threshold into blobs.
 pub const max_value_bytes: usize = log_mod.max_line_bytes - 64 * 1024;
@@ -129,7 +132,11 @@ pub const ForkOptions = struct {
     at: ForkPoint,
     workspace: []const u8,
     host: Host,
+    /// The source's children the fork takes a copy of (D97).
+    children: []const ChildCopy = &.{},
 };
+
+pub const ChildCopy = session_mod.ChildCopy;
 
 pub const ImportOptions = struct {
     /// The v1 id, kept (D8).
@@ -332,19 +339,39 @@ pub const Manager = struct {
     pub fn openFork(m: *Manager, options: ForkOptions) OpenError!Session {
         try checkId(options.source);
         try checkText(options.workspace);
+        for (options.children) |child| {
+            try checkId(child.id);
+            try checkText(child.work_id);
+        }
         try ready(m);
-        const inner = session_mod.openFork(&m.env, .{
+        const forked = session_mod.openForkWithChildren(&m.env, .{
             .source = options.source,
             .at = options.at,
             .workspace = options.workspace,
             .host = options.host,
-        }) catch |err| return switch (err) {
+        }, options.children) catch |err| return switch (err) {
             error.NotFound, error.Busy, error.ChildSession, error.Corrupt, error.UnsupportedVersion, error.InvalidForkPoint, error.OutOfMemory => |e| e,
             else => |io_err| storage.ioFault(io_err),
         };
-        const session: Session = .{ .manager = m, .inner = inner };
+        defer m.gpa.free(forked.copies);
+        // Each copy is whole on disk; closing it appends `closed`, and the
+        // index lists it as its parent's child.
+        for (forked.copies) |copy| (Session{ .manager = m, .inner = copy }).release();
+        const session: Session = .{ .manager = m, .inner = forked.session };
         session.updateIndexAs(.published);
         return session;
+    }
+
+    /// `source`'s state just past fork point `at`: which children it had
+    /// then, and how each one's newest work stood (D97). The caller frees
+    /// it with `deinit`.
+    pub fn stateAt(m: *Manager, source: []const u8, at: ForkPoint) OpenError!State {
+        try checkId(source);
+        if (!try readyToRead(m)) return error.NotFound;
+        return session_mod.stateAt(&m.env, source, at) catch |err| switch (err) {
+            error.NotFound, error.Busy, error.ChildSession, error.Corrupt, error.UnsupportedVersion, error.InvalidForkPoint, error.OutOfMemory => |e| e,
+            else => |io_err| storage.ioFault(io_err),
+        };
     }
 
     /// The v1 conversion only (D8): a new session under an existing id,
@@ -494,9 +521,14 @@ pub const Manager = struct {
 
     /// Doctor: checks every line and snapshot of one session.
     pub fn verify(m: *Manager, id: []const u8) VerifyError!Verified {
+        return m.verifyWith(id, .{});
+    }
+
+    /// Doctor: `verify`, with the blob check and the stop `options` choose.
+    pub fn verifyWith(m: *Manager, id: []const u8, options: VerifyOptions) VerifyError!Verified {
         try checkId(id);
         if (!try readyToRead(m)) return error.NotFound;
-        return session_mod.verifySession(&m.env, id) catch |err| switch (err) {
+        return session_mod.verifySession(&m.env, id, options) catch |err| switch (err) {
             error.NotFound, error.OutOfMemory => |e| e,
             error.Busy, error.ChildSession, error.Corrupt, error.UnsupportedVersion => error.Io,
             else => |io_err| storage.ioFault(io_err),
@@ -2010,6 +2042,71 @@ const api_tests = struct {
         try testing.expectEqual(@as(u64, 1), copied.last_turn);
         try testing.expectEqual(@as(?[]u8, null), copied.moved_files);
         copy.release();
+    }
+
+    test "verify checks each blob once, only stats it in exists mode, and ends where a stop asks" {
+        var f: Fixture = undefined;
+        try f.init();
+        defer f.deinit();
+        const m = f.manager;
+        const s = try m.openNew(.{ .workspace = "/w", .host = .app });
+        _ = try s.append(&.{ .turn_started, piece, .turn_committed });
+        const hash = try s.putBlob("a body from the side folder");
+        const refs = [_][]const u8{&hash};
+        const value = try gpa.print("{{\"map\":\"{s}\"}}", .{&hash});
+        defer gpa.free(value);
+        // Two lines name the same blob.
+        _ = try s.append(&.{.{ .set = .{ .key = .moved_files, .value = value, .blobs = &refs } }});
+        _ = try s.append(&.{.{ .set = .{ .key = .moved_files, .value = value, .blobs = &refs } }});
+        const id = try gpa.dupe(u8, s.id());
+        defer gpa.free(id);
+        s.release();
+
+        var root = try f.dir();
+        defer root.close(io);
+        const path = try gpa.print("{s}/blobs/{s}", .{ id, &hash });
+        defer gpa.free(path);
+        // Other bytes under the same name: only reading the blob finds it,
+        // and it counts once though two lines name it.
+        try root.deleteFile(io, path);
+        try root.writeFile(io, .{ .sub_path = path, .data = "A body from the side folder" });
+        try testing.expectEqual(@as(u64, 1), (try m.verify(id)).bad_blobs);
+        try testing.expectEqual(@as(u64, 0), (try m.verifyWith(id, .{ .blobs = .exists })).bad_blobs);
+        // A missing blob is found either way.
+        try root.deleteFile(io, path);
+        try testing.expectEqual(@as(u64, 1), (try m.verifyWith(id, .{ .blobs = .exists })).bad_blobs);
+
+        const Always = struct {
+            fn requested(_: *anyopaque) bool {
+                return true;
+            }
+        };
+        var context: u8 = 0;
+        const stopped = try m.verifyWith(id, .{ .stop = .{ .context = &context, .requested = Always.requested } });
+        try testing.expectEqual(@as(?u64, 0), stopped.stopped_at);
+        try testing.expectEqual(@as(u64, 0), stopped.lines);
+        const whole = try m.verify(id);
+        try testing.expectEqual(@as(?u64, null), whole.stopped_at);
+
+        // A stop that comes once the last line is read leaves the check whole.
+        const AfterLast = struct {
+            lines: u64,
+            asked: u64 = 0,
+            fn requested(raw: *anyopaque) bool {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                self.asked += 1;
+                return self.asked > self.lines;
+            }
+        };
+        var after: AfterLast = .{ .lines = whole.lines };
+        const late = try m.verifyWith(id, .{ .stop = .{ .context = &after, .requested = AfterLast.requested } });
+        try testing.expectEqual(@as(?u64, null), late.stopped_at);
+        try testing.expectEqual(whole.lines, late.lines);
+        // One line earlier, it stops at the last line.
+        var before: AfterLast = .{ .lines = whole.lines - 1 };
+        const cut = try m.verifyWith(id, .{ .stop = .{ .context = &before, .requested = AfterLast.requested } });
+        try testing.expect(cut.stopped_at != null);
+        try testing.expectEqual(whole.lines - 1, cut.lines);
     }
 
     test "compactor records are a setting that lists blobs inside a turn, and the newest wins on resume and in a fork (D50)" {

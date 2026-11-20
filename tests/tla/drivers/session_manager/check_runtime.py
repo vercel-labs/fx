@@ -230,9 +230,10 @@ def verify(request, report):
                     children_checked += 1
                     checks.append({'kind': 'children', 'sessionId': sid, **executor.last})
             if 'fork' in required and lines[0].get('forked_from'):
-                copied, source = saved.fork_target(saved.read_lines(snapshot / sid / 'log.jsonl', raw=True), str(snapshot))
-                executor.expected = len(copied)
-                saved.check_fork(copied, source)
+                # A root fork, or a fork's copy of a child (D97).
+                target = saved.fork_target(saved.read_lines(snapshot / sid / 'log.jsonl', raw=True), str(snapshot))
+                executor.expected = len(target[0])
+                saved.check_fork(*target)
                 forks_checked += 1
                 checks.append({'kind': 'fork', 'sessionId': sid, **executor.last})
         except (saved.Unreadable, KeyError, TypeError, ValueError) as error:

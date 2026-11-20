@@ -10,6 +10,7 @@ const debug_trace = @import("../../core/shared/debug_trace.zig");
 const io_mod = @import("../../core/shared/io.zig");
 const types = @import("../../core/shared/types.zig");
 const cursor_probe = @import("../terminal/cursor_probe.zig");
+const mode_rearm = @import("../terminal/mode_rearm.zig");
 const theme_monitor = @import("../terminal/theme_monitor.zig");
 const gesture_state = @import("../../core/input/gesture_state.zig");
 const horizontal_navigation = @import("../../core/input/horizontal_navigation.zig");
@@ -582,6 +583,10 @@ pub const DeferredSessionInput = union(enum) {
 pub const Runtime = struct {
     terminal_cursor_probe: cursor_probe.Parser = .{},
     terminal_theme_monitor: theme_monitor.Monitor = .{},
+    /// When fx next turns bracketed paste (DEC mode 2004) on again. Without
+    /// it, the terminal sends a paste as typed keys, and each line break in
+    /// the paste presses Enter.
+    bracketed_paste_rearm: mode_rearm.Schedule = .{},
     deferred_terminal_input_source: ?DeferredTerminalInputSource = null,
     deferred_session_input: std.ArrayList(DeferredSessionInput) = .empty,
     deferred_session_input_index: usize = 0,
@@ -3163,6 +3168,15 @@ test "input escape parser admits raw ctrl+p control byte" {
         controlByteFeatureAction(16),
     );
     try std.testing.expectEqual(@as(?InputEscapeAction, null), controlByteFeatureAction(14));
+}
+
+test "input escape parser admits ctrl+t, raw or reported as a key, as the effort cycle" {
+    try std.testing.expectEqual(@as(?InputEscapeAction, .cycle_effort), controlByteFeatureAction(20));
+    try std.testing.expectEqual(@as(?InputEscapeAction, null), controlByteFeatureAction(19));
+    try std.testing.expectEqual(@as(?InputEscapeAction, null), controlByteFeatureAction(21));
+    // The kitty keyboard protocol reports Ctrl+T as a key, which replays as
+    // the raw byte above.
+    try expectEscapeAction("[116;5u", .{ .remapped_byte = 20 });
 }
 
 test "input escape parser admits ctrl+x, raw or reported as a key, as the agent list" {

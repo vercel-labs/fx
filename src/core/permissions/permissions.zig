@@ -151,6 +151,8 @@ pub fn permissionTargetForCall(
     call: types.ToolCall,
     target_kind: PermissionTargetKind,
 ) ![]const u8 {
+    // A toolbox open or search is decided as the tool it replaced.
+    if (call.toolbox_lookup) |lookup| return arena.dupe(u8, lookup.target);
     if (isTypedFileMutationTool(call.name)) {
         return error.TypedFileMutationTargetRequired;
     }
@@ -162,12 +164,6 @@ pub fn permissionTargetForCall(
             return arena.print("{s}#{s}", .{ source, skill });
         }
         return arena.dupe(u8, source);
-    }
-
-    if (std.mem.eql(u8, call.name, "skill")) {
-        if (call.resolved_skill) |prepared| return arena.dupe(u8, prepared.skill.name);
-        const args = try tool_args.parseToolArgsObject(arena, call.arguments_json);
-        return arena.dupe(u8, try tool_args.requiredStringArg(args, "name"));
     }
 
     if (isWebSearchToolName(call.name)) {
@@ -1117,6 +1113,13 @@ pub fn ruleDecisionForPermissionPattern(rules: types.PermissionRuleSet, permissi
     return evaluateRuleset(rules.rules, permission, pattern) orelse fallback;
 }
 
+/// The permission rules every MCP path uses for an agent running in `mode`: none in full access, the
+/// host's `rules` otherwise. Each reader passes the mode of the agent that uses the tool. The model is
+/// tests/tla/mcp_host/McpRules.tla (`FullAccessIgnoresRules`, `DenyHoldsOutside`, `PathsAgree`).
+pub fn mcpRules(mode: types.PermissionMode, rules: types.PermissionRuleSet) types.PermissionRuleSet {
+    return if (mode == .yolo) .{} else rules;
+}
+
 pub fn rulesDenyAllTargetsForPermission(rules: types.PermissionRuleSet, permission: []const u8) bool {
     return rulesDenyAllTargetsForPermissionAndTool(rules, permission, null);
 }
@@ -2055,15 +2058,17 @@ test "permissionTargetForCall preserves run_command cwd targets" {
     try std.testing.expectEqualStrings("/tmp/workspace::zig build", try permissionTargetForCall(arena, "/tmp/workspace", default_workspace_cwd, .command_cwd));
 }
 
-test "permissionTargetForCall preserves skill and install skill targets" {
+test "permissionTargetForCall decides toolbox opens and install skill targets" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
+    // The target is the skill the open names, never the raw location.
     const skill_call: types.ToolCall = .{
         .id = "call_1",
-        .name = "skill",
-        .arguments_json = "{\"name\":\"vercel-react-best-practices\",\"location\":\"/tmp/outside</path>\\ninjected\"}",
+        .name = "toolbox",
+        .arguments_json = "{\"open\":\"/tmp/outside</path>\\ninjected\"}",
+        .toolbox_lookup = .{ .permission = "skill", .target = "vercel-react-best-practices" },
     };
     const install_call: types.ToolCall = .{
         .id = "call_2",
@@ -2377,6 +2382,22 @@ test "displayTargetForPolicy renders workspace-relative paths and command cwd" {
     const unknown = try displayTargetForPolicy(alloc, "/tmp/workspace", "/tmp/workspace/src/app.zig", .none);
     defer alloc.free(unknown);
     try std.testing.expectEqualStrings("/tmp/workspace/src/app.zig", unknown);
+}
+
+test "mcpRules gives no rules in full access and the host's rules in every other mode" {
+    var rules_buf = [_]types.PermissionRule{
+        .{ .permission = @constCast("mcp_fixture_echo"), .pattern = @constCast("*"), .action = .deny },
+    };
+    const rules: types.PermissionRuleSet = .{ .rules = rules_buf[0..] };
+
+    try std.testing.expectEqual(@as(usize, 0), mcpRules(.yolo, rules).rules.len);
+    for ([_]types.PermissionMode{ .ask, .auto }) |mode| {
+        const used = mcpRules(mode, rules);
+        try std.testing.expectEqual(@as(usize, 1), used.rules.len);
+        try std.testing.expect(rulesDenyAllTargetsForPermission(used, "mcp_fixture_echo"));
+    }
+    // Full access sees no denial of a tool the rules name.
+    try std.testing.expect(!rulesDenyAllTargetsForPermission(mcpRules(.yolo, rules), "mcp_fixture_echo"));
 }
 
 test "ruleDecisionForPermissionPattern matches direct inputs and fallback" {

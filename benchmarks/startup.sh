@@ -129,19 +129,7 @@ HOME="$GENERAL_FIXTURE_HOME" hyperfine \
 
 echo ""
 
-# Benchmark 3: fx doctor --json (system checks)
-echo "--- fx doctor --json ---"
-HOME="$GENERAL_FIXTURE_HOME" hyperfine \
-  "${SHELL_OPTS[@]}" \
-  --runs "$RUNS" \
-  --warmup "$WARMUP" \
-  --export-json "${RESULTS_DIR}/doctor.json" \
-  --command-name "fx doctor --json" \
-  "$FX_BIN doctor --json"
-
-echo ""
-
-# Benchmark 4: fx sessions --json (file I/O path)
+# Benchmark 3: fx sessions --json (file I/O path)
 echo "--- fx sessions --json ---"
 HOME="$SESSION_FIXTURE_HOME" hyperfine \
   "${SHELL_OPTS[@]}" \

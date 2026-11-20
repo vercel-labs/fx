@@ -16,9 +16,12 @@ on:
 
 concurrency:
   # A manual dispatch gets its own group so it cannot cancel the push run on
-  # main.
+  # main. A push to main runs the durable-session model check, which takes
+  # about 40 minutes, so a newer push waits instead of cancelling it. Without
+  # this, merges land faster than a run can finish and main never reports a
+  # result. GitHub keeps only the newest waiting run.
   group: ci-${{ github.event_name == 'workflow_dispatch' && 'dispatch-' || '' }}${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   zig_mode:
@@ -37,7 +40,7 @@ jobs:
         id: zig
         uses: ./.github/actions/setup-zig
         with:
-          version: "0.17.0"
+          version: "0.17.1"
           cache-key: ci-unit-${{ matrix.optimize }}
 
       - name: Check formatting
@@ -77,6 +80,9 @@ jobs:
       - name: Model-check the connection open hand-off
         run: TLA2TOOLS_JAR="$RUNNER_TEMP/tla2tools.jar" tests/tla/gateway_open/check.sh
 
+      - name: Model-check session titles and the model list under a shared sign-in
+        run: TLA2TOOLS_JAR="$RUNNER_TEMP/tla2tools.jar" tests/tla/session_title/check.sh
+
       - name: Setup Bun
         uses: oven-sh/setup-bun@v2
         with:
@@ -94,11 +100,17 @@ jobs:
       - name: Test CI and release scripts
         run: python3 -m unittest scripts.tests.test_macos_signing scripts.tests.test_signed_macos scripts.tests.test_detect_macos_need scripts.tests.test_detect_ci_need scripts.tests.test_fuzz_nightly scripts.tests.test_check_cli_shape
 
+      - name: Test the zig skill's scripts and examples
+        run: python3 -m unittest discover -s .fx/skills/zig/scripts
+
       - name: Build
         run: zig build -Doptimize=${{ matrix.optimize }}
 
       - name: Walk fx ask turns along the empty-reply model
         run: TLA2TOOLS_JAR="$RUNNER_TEMP/tla2tools.jar" bun tests/tla/drivers/agent_runtime/driver.ts --self-check
+
+      - name: Walk fx ask turns along the malformed tool call model
+        run: TLA2TOOLS_JAR="$RUNNER_TEMP/tla2tools.jar" bun tests/tla/drivers/agent_runtime/malformed.ts --self-check
 
       # The zsh user profile tests in src/core/execution/command_runner.zig
       # skip without /bin/zsh. They start interactive zsh with no terminal,
@@ -133,7 +145,7 @@ jobs:
   zig:
     name: Build & Test
     if: ${{ always() }}
-    needs: [zig_mode, sdk-node-wasm, sdk-node-napi, sdk-bun, sdk-package-guards, sdk-browser-wasm, tla-mcp, tla-transcript-window]
+    needs: [zig_mode, sdk-node-wasm, sdk-node-napi, sdk-bun, sdk-package-guards, sdk-browser-wasm, tla-mcp, tla-mcp-host, tla-transcript-window, tla-subagent]
     runs-on: ubuntu-latest
     steps:
       - name: Require unit tests and every SDK job
@@ -141,7 +153,7 @@ jobs:
           RESULTS: ${{ toJSON(needs.*.result) }}
         run: |
           printf '%s\n' "$RESULTS"
-          jq -e 'length == 8 and all(.[]; . == "success")' <<<"$RESULTS"
+          jq -e 'length == 10 and all(.[]; . == "success")' <<<"$RESULTS"
 
   build:
     name: Build fx (ReleaseSafe)
@@ -157,7 +169,7 @@ jobs:
         id: zig
         uses: ./.github/actions/setup-zig
         with:
-          version: "0.17.0"
+          version: "0.17.1"
           cache-key: ci-build-ReleaseSafe
 
       # Other runners execute this binary, and their CPUs can differ from this
@@ -184,11 +196,11 @@ jobs:
           cache-hit: ${{ steps.zig.outputs.cache-hit }}
 
   # The durable-session model check in SDK (Bun + N-API/WASM) takes about 40
-  # minutes, the TLA+ MCP models and drivers about 20, and the TLA+ transcript
-  # window model a few. A pull request runs each only when it changes the code
-  # that check covers; see scripts/detect-ci-need.sh. Pushes to main and manual
-  # dispatches always run all three, so the main run that Publish libfx waits
-  # for includes them.
+  # minutes, the two TLA+ MCP jobs about 20 each, and the TLA+ transcript
+  # window and subagent models a few each. A pull request runs each only when
+  # it changes the code that check covers; see scripts/detect-ci-need.sh.
+  # Pushes to main and manual dispatches always run all four, so the main run
+  # that Publish libfx waits for includes them.
   ci-need:
     name: Detect CI need
     runs-on: ubuntu-24.04
@@ -197,6 +209,7 @@ jobs:
       libfx: ${{ steps.detect.outputs.libfx }}
       mcp: ${{ steps.detect.outputs.mcp }}
       transcript_window: ${{ steps.detect.outputs.transcript_window }}
+      subagent: ${{ steps.detect.outputs.subagent }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -220,7 +233,7 @@ jobs:
         id: zig
         uses: ./.github/actions/setup-zig
         with:
-          version: "0.17.0"
+          version: "0.17.1"
           cache-key: ci-sdk-wasm
 
       - name: Build WASM surfaces (ReleaseSmall)
@@ -284,7 +297,7 @@ jobs:
         id: zig
         uses: ./.github/actions/setup-zig
         with:
-          version: "0.17.0"
+          version: "0.17.1"
           cache-key: ci-sdk-napi-${{ matrix.platform }}
 
       - name: Build N-API addon (ReleaseSafe)
@@ -491,6 +504,7 @@ jobs:
           bun tests/tla/drivers/drive-steer.mjs faults --walks 20 --seed 4
           bun tests/tla/drivers/drive-steer.mjs faults --walks 10 --seed 4 --hooks
           bun tests/tla/drivers/drive-steer.mjs faults --walks 10 --seed 6 --backend wasm
+          bun tests/tla/drivers/drive-steer.mjs faults --walks 8 --seed 8 --stream-lag 400
 
       - name: Test libfx on a World
         run: |
@@ -667,11 +681,12 @@ jobs:
           CHROME_PATH: ${{ steps.setup-chrome.outputs.chrome-path }}
         run: npm run --prefix sdk test:browser-wasm
 
-  # The MCP engine and host models, and the drivers that run src/mcp/ and
-  # fx along them. Their planted bugs stay local (tests/tla/mcp/check.sh):
-  # they measure the checks, not the code.
+  # The MCP engine models and the driver that runs src/mcp/ along them. The
+  # host models and drivers run in the next job, in parallel, so neither job
+  # takes the whole 40 minutes alone. Their planted bugs stay local
+  # (tests/tla/mcp/check.sh): they measure the checks, not the code.
   tla-mcp:
-    name: TLA+ MCP models and drivers
+    name: TLA+ MCP engine models and driver
     needs: [build, ci-need]
     runs-on: ubuntu-24.04
     timeout-minutes: 40
@@ -691,7 +706,7 @@ jobs:
       - name: Setup Zig
         uses: ./.github/actions/setup-zig
         with:
-          version: "0.17.0"
+          version: "0.17.1"
           cache-key: ci-tla-mcp
       - name: Setup Bun
         uses: oven-sh/setup-bun@v2
@@ -702,7 +717,7 @@ jobs:
           command -v tmux >/dev/null 2>&1 || { sudo apt-get update && sudo apt-get install -y tmux; }
           printf 'set-option -g history-limit 100000\n' > "$HOME/.tmux.conf"
           tmux -V
-      - name: Model-check the MCP engine and host, and drive the code along the models
+      - name: Model-check the MCP engine, and drive src/mcp/ along the models
         if: needs.ci-need.outputs.mcp == 'true'
         run: |
           set -euo pipefail
@@ -711,8 +726,51 @@ jobs:
           echo "936a262061c914694dfd669a543be24573c45d5aa0ff20a8b96b23d01e050e88  $jar" | sha256sum -c -
           export TLA2TOOLS_JAR="$jar"
           python3 tests/tla/mcp/run.py check
-          tests/tla/mcp_host/check.sh
           bun tests/tla/drivers/mcp/driver.ts
+
+  # The MCP host models, which models.test.ts checks with TLC, and the drivers
+  # that run fx along them. It runs beside the engine job above. Planted bugs
+  # stay local (tests/tla/mcp_host/check.sh).
+  tla-mcp-host:
+    name: TLA+ MCP host models and drivers
+    needs: [build, ci-need]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    env:
+      AI_GATEWAY_API_KEY: ""
+      VERCEL_OIDC_TOKEN: ""
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download fx
+        uses: actions/download-artifact@v4
+        with:
+          name: fx-linux-x86_64
+          path: zig-out/bin
+      - name: Restore executable mode
+        run: chmod +x zig-out/bin/fx
+      # The same toolchain as the engine job.
+      - name: Setup Zig
+        uses: ./.github/actions/setup-zig
+        with:
+          version: "0.17.1"
+          cache-key: ci-tla-mcp-host
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.3.14"
+      - name: Install tmux
+        run: |
+          command -v tmux >/dev/null 2>&1 || { sudo apt-get update && sudo apt-get install -y tmux; }
+          printf 'set-option -g history-limit 100000\n' > "$HOME/.tmux.conf"
+          tmux -V
+      - name: Model-check the MCP host, and drive fx along the models
+        if: needs.ci-need.outputs.mcp == 'true'
+        run: |
+          set -euo pipefail
+          jar="$RUNNER_TEMP/tla2tools.jar"
+          curl -fsSL -o "$jar" https://github.com/tlaplus/tlaplus/releases/download/v1.7.4/tla2tools.jar
+          echo "936a262061c914694dfd669a543be24573c45d5aa0ff20a8b96b23d01e050e88  $jar" | sha256sum -c -
+          export TLA2TOOLS_JAR="$jar"
           bun test ./tests/tla/drivers/mcp_host/
 
   # The transcript window model and the window's core driven along it both
@@ -736,7 +794,7 @@ jobs:
         if: needs.ci-need.outputs.transcript_window == 'true'
         uses: ./.github/actions/setup-zig
         with:
-          version: "0.17.0"
+          version: "0.17.1"
           cache-key: ci-tla-transcript-window
       - name: Setup Bun
         if: needs.ci-need.outputs.transcript_window == 'true'
@@ -751,6 +809,53 @@ jobs:
           curl -fsSL -o "$jar" https://github.com/tlaplus/tlaplus/releases/download/v1.7.4/tla2tools.jar
           echo "936a262061c914694dfd669a543be24573c45d5aa0ff20a8b96b23d01e050e88  $jar" | sha256sum -c -
           TLA2TOOLS_JAR="$jar" tests/tla/transcript_window/check.sh --ci
+
+  # The subagent steering, stop-then-message, main-mail and wait-nudge models, the
+  # session-write and live sessions models, and the drivers that run a built fx
+  # along them. Only the design configs and the session witnesses run here; the
+  # planted bugs and fx's old defects stay local (both check.sh scripts with no
+  # arguments): they measure the checks, not the code.
+  tla-subagent:
+    name: TLA+ subagent and session-write models
+    needs: [build, ci-need]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      AI_GATEWAY_API_KEY: ""
+      VERCEL_OIDC_TOKEN: ""
+    steps:
+      - uses: actions/checkout@v4
+        if: needs.ci-need.outputs.subagent == 'true'
+      - name: Download fx
+        if: needs.ci-need.outputs.subagent == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          name: fx-linux-x86_64
+          path: zig-out/bin
+      - name: Restore executable mode
+        if: needs.ci-need.outputs.subagent == 'true'
+        run: chmod +x zig-out/bin/fx
+      - name: Setup Bun
+        if: needs.ci-need.outputs.subagent == 'true'
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.3.14"
+      - name: Model-check subagent messages, session writes, and live sessions, and drive fx along the models
+        if: needs.ci-need.outputs.subagent == 'true'
+        run: |
+          set -euo pipefail
+          jar="$RUNNER_TEMP/tla2tools.jar"
+          curl -fsSL -o "$jar" https://github.com/tlaplus/tlaplus/releases/download/v1.7.4/tla2tools.jar
+          echo "936a262061c914694dfd669a543be24573c45d5aa0ff20a8b96b23d01e050e88  $jar" | sha256sum -c -
+          export TLA2TOOLS_JAR="$jar"
+          tests/tla/subagent/check.sh steer-queue steer-queue-deep stop-message stop-message-deep main-mail main-mail-acp quiet-relay quiet-relay-deep wait-nudge
+          tests/tla/session/check.sh session-write session-write-witness-added-during-write session-write-witness-waits session-write-witness-relisted live-holds live-simulate live-witness-stale live-witness-idle-parent live-witness-open-fails-on-scan
+          bun tests/tla/drivers/subagent/driver.ts
+          bun test ./tests/tla/drivers/subagent/stop-message.test.ts
+          bun test ./tests/tla/drivers/subagent/main-mail.test.ts
+          bun test ./tests/tla/drivers/subagent/quiet-relay.test.ts
+          bun test ./tests/tla/drivers/session/write.test.ts
+          bun test ./tests/tla/drivers/session/live.test.ts
 
   e2e_mode:
     name: E2E (deterministic, shard ${{ matrix.shard.label }})
@@ -794,7 +899,7 @@ jobs:
         id: zig
         uses: ./.github/actions/setup-zig
         with:
-          version: "0.17.0"
+          version: "0.17.1"
           cache-key: ci-e2e-fixtures
 
       - name: Setup Bun
@@ -974,7 +1079,7 @@ jobs:
         id: zig
         uses: ./.github/actions/setup-zig
         with:
-          version: "0.17.0"
+          version: "0.17.1"
           cache-key: ci-unit-ReleaseSafe
 
       - name: Build

@@ -461,6 +461,9 @@ pub fn Runtime(comptime App: type) type {
                 app.adoptWorkspaceAccess(startup.takeWorkspaceAccess());
             }
             const credential_deferred = try beginDeferredCredential(app, &startup);
+            // Sign-outs a provider did not confirm are revoked on a worker, so
+            // the first frame does not wait for them (`pending_revocation`).
+            if (comptime @hasDecl(@TypeOf(app.auth), "beginKeptSignOutRetry")) app.auth.beginKeptSignOutRetry();
             if (startup.takeCredential()) |credential_value| {
                 var credential = credential_value;
                 defer credential.deinit(app.alloc);
@@ -584,10 +587,17 @@ pub fn Runtime(comptime App: type) type {
             agent.worker.agent_turn_settings.max_tool_result_bytes = startup.max_tool_result_bytes;
             agent.worker.agent_turn_settings.auto_compact_percent = startup.auto_compact_percent;
             if (comptime @hasField(App, "context_limits")) app.context_limits = startup.context_limits;
+            if (comptime @hasField(App, "tool_placement")) {
+                app.tool_placement = startup.tool_placement;
+                app.toolbox_behind = config_runtime.tool_placement.behindToolbox(startup.tool_placement, &.{});
+            }
             agent.worker.agent_turn_settings.first_call_tool_choice = startup.first_call_tool_choice;
             agent.worker.agent_turn_settings.fast_mode = startup.fast_mode;
             agent.worker.agent_turn_settings.ultrafast_mode = startup.ultrafast_mode;
             agent.worker.agent_turn_settings.effort = startup.effort;
+            if (comptime agents.hasAgentField(App, "session_persistence")) {
+                agent.session_persistence.workspace_capture = startup.workspace_capture;
+            }
             // Worker-owned memory uses the C allocator, matching worker deinit.
             try agent.worker.setProviderRouting(std.heap.c_allocator, startup.provider_order, startup.provider_strict);
             app.context_enabled = startup.context_enabled;

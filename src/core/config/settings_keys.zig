@@ -53,8 +53,9 @@ pub const Key = struct {
     children: []const []const u8 = &.{},
     /// What each of `children` does, in the same order.
     child_descriptions: []const []const u8 = &.{},
-    /// The strings fx accepts for a string key with a fixed set. fx ignores
-    /// case; the schema lists the spellings fx writes and documents.
+    /// The strings fx accepts for a string key, or for each value of a string
+    /// map, with a fixed set. fx ignores case; the schema lists the spellings
+    /// fx writes and documents.
     values: []const []const u8 = &.{},
     /// Inclusive bounds of an integer key.
     minimum: ?i64 = null,
@@ -101,6 +102,10 @@ const status_line_child_descriptions = [_][]const u8{
     "Show the session title in the footer",
     "Show the workspace path and Git branch in the footer",
 };
+const experimental_children = [_][]const u8{"workspace_capture"};
+const experimental_child_descriptions = [_][]const u8{
+    "Record the repository's state at each turn's start and end in the session, for evals",
+};
 const retired_description = "No longer used; fx ignores it";
 
 pub const keys = [_]Key{
@@ -118,6 +123,7 @@ pub const keys = [_]Key{
     .{ .name = "effort", .where = .profile, .kind = .string_or_null, .description = "Reasoning effort: auto or a name the model supports; null means auto" },
     .{ .name = "enableAllProjectMcpServers", .where = .profile, .kind = .boolean, .workspace_only = true, .description = "Approve every server in this workspace's .mcp.json; manage it with fx mcp approve and reject" },
     .{ .name = "enabledMcpjsonServers", .where = .profile, .kind = .strings, .workspace_only = true, .description = "Project MCP servers approved in this workspace; manage them with fx mcp approve and reject" },
+    .{ .name = "experimental", .where = .profile, .kind = .switches, .children = &experimental_children, .child_descriptions = &experimental_child_descriptions, .description = "Unfinished features, off by default" },
     .{ .name = "fast_mode", .where = .profile, .kind = .boolean, .description = "Use faster inference when the model supports it" },
     .{ .name = "fast_mode_model_bound", .where = .profile, .kind = .boolean, .description = "Managed by fx alongside fast_mode" },
     .{ .name = "first_call_tool_choice", .where = .profile, .kind = .string, .values = &.{ "auto", "none" }, .description = "Tool choice for the first request of a turn" },
@@ -148,6 +154,7 @@ pub const keys = [_]Key{
     .{ .name = "statusLine", .where = .profile, .kind = .switches, .children = &status_line_children, .child_descriptions = &status_line_child_descriptions, .renamed_to = "status_line", .description = "Renamed to status_line" },
     .{ .name = "status_line", .where = .profile, .kind = .switches, .children = &status_line_children, .child_descriptions = &status_line_child_descriptions, .description = "What the footer shows" },
     .{ .name = "theme", .where = .profile, .kind = .string, .description = "light, dark, or the name of a theme file in ~/.fx/themes" },
+    .{ .name = "tool_placement", .where = .profile, .kind = .string_map, .map = true, .values = &.{ "direct", "toolbox" }, .description = "Where each built-in tool is offered: \"direct\" sends it with the tools, \"toolbox\" lists it in the toolbox menu" },
     .{ .name = "ultrafast_mode", .where = .profile, .kind = .boolean, .description = "Request the higher-priced Ultrafast tier for an eligible AI Gateway model" },
     .{ .name = "update_channel", .where = .profile, .kind = .string, .values = &.{ "stable", "dev" }, .description = "Release channel for updates" },
     .{ .name = "web_fetch_worker_model", .where = .retired, .kind = .any, .description = retired_description },
@@ -339,7 +346,7 @@ test "every key says what it holds and what it does" {
         try std.testing.expectEqual(key.children.len > 0, key.kind == .switches);
         try std.testing.expectEqual(key.where == .retired, key.kind == .any);
         try std.testing.expect(!(key.workspace_only and key.top_level_only));
-        if (key.values.len > 0) try std.testing.expectEqual(Kind.string, key.kind);
+        if (key.values.len > 0) try std.testing.expect(key.kind == .string or key.kind == .string_map);
         if (key.minimum != null or key.maximum != null) try std.testing.expectEqual(Kind.integer, key.kind);
         if (key.max_items != null) try std.testing.expectEqual(Kind.strings, key.kind);
         if (key.superseded_by) |path| {

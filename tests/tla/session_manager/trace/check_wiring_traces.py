@@ -112,6 +112,8 @@ def selftest():
         ("a crash mid-turn, then a resume", [S, O, B, crash, S, O, B, commit, C, X], ["s1"], "ACCEPTED"),
         ("a child inside a turn", [S, O, B, spawn, done, commit, C, X], ["s1"], "ACCEPTED"),
         ("planted: close while a child runs", [S, O, B, spawn, C], ["s1"], "REJECTED"),
+        ("planted: a switch closes while a child of the session runs, the hang D97 ends", [S, O, B, spawn, commit, O2, C], ["s1", "s2"], "REJECTED"),
+        ("a switch stops the session's child, then closes it (D97)", [S, O, B, spawn, commit, O2, done, C, B, commit, C2, X], ["s1", "s2"], "ACCEPTED"),
         ("a switch: the next session opens before the current closes (D41)", [S, O, B, commit, O2, C, B, commit, C2, X], ["s1", "s2"], "ACCEPTED"),
         ("a failed switch closes the next session and keeps the current", [S, O, O2, C2, B, commit, C, X], ["s1", "s2"], "ACCEPTED"),
         ("planted: a third open while a switch is pending", [S, O, O2, ("Open", "s3", "none")], ["s1", "s2", "s3"], "REJECTED"),

@@ -12,13 +12,24 @@ pub fn capabilitiesForModel(model: []const u8) model_capabilities.Capabilities {
 }
 
 /// The cache markers fx sends for `model`. AI Gateway's automatic caching
-/// covers every family; fx adds markers only where the provider honors them:
-/// Anthropic models, and OpenAI GPT-5.6 and later through explicit
-/// breakpoints.
+/// covers most families; fx adds markers only where the provider honors them:
+/// Anthropic models, OpenAI GPT-5.6 and later through explicit breakpoints,
+/// and Amazon Nova through Bedrock cache points, which the Gateway never adds.
 pub fn cacheMarkers(model: []const u8) model_capabilities.CacheMarkers {
     if (std.mem.startsWith(u8, model, "anthropic/")) return .anthropic;
     if (takesPromptCacheOptions(model)) return .openai;
+    if (takesBedrockCachePoints(model)) return .bedrock;
     return .none;
+}
+
+/// Whether `model` is an Amazon Nova chat model that reads its prompt cache
+/// from a Bedrock cache point. Without one, Nova reports no cache reads.
+/// A model joins the list once the Gateway prices its cache reads.
+fn takesBedrockCachePoints(model: []const u8) bool {
+    for ([_][]const u8{ "amazon/nova-micro", "amazon/nova-lite", "amazon/nova-pro", "amazon/nova-2-lite" }) |candidate| {
+        if (std.mem.eql(u8, model, candidate)) return true;
+    }
+    return false;
 }
 
 /// Whether `model` takes only one system message, at the start. Qwen's chat
@@ -65,7 +76,10 @@ test "cache markers follow the model family" {
     try std.testing.expectEqual(.anthropic, cacheMarkers("anthropic/claude-sonnet-5.5"));
     try std.testing.expectEqual(.openai, cacheMarkers("openai/gpt-6.1-sol"));
     try std.testing.expectEqual(.openai, cacheMarkers("openai/gpt-5.6-luna"));
-    for ([_][]const u8{ "openai/gpt-5", "openai/gpt-5.5-pro", "bedrock/anthropic.claude", "anthropic", "google/gemini-3-flash" }) |model| {
+    for ([_][]const u8{ "amazon/nova-micro", "amazon/nova-lite", "amazon/nova-pro", "amazon/nova-2-lite" }) |model| {
+        try std.testing.expectEqual(.bedrock, cacheMarkers(model));
+    }
+    for ([_][]const u8{ "openai/gpt-5", "openai/gpt-5.5-pro", "bedrock/anthropic.claude", "anthropic", "google/gemini-3-flash", "amazon/titan-embed-text-v2", "amazon/nova", "nova-pro" }) |model| {
         try std.testing.expectEqual(.none, cacheMarkers(model));
     }
 }

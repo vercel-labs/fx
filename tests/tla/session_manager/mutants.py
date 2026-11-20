@@ -98,9 +98,11 @@ MUTANTS = [
      "    /\\ Works(c) < MaxWork",
      "OneOpenWork"),
     ("Wiring", "close without joining child threads",
-     "    /\\ child = \"none\"\n    /\\ cur' = IF s = cur",
-     "    /\\ cur' = IF s = cur",
+     'ChildrenJoined == child = "none"', 'ChildrenJoined == TRUE',
      "ParentOutlivesChildren"),
+    ("Wiring", "a switch closes before it stops the subagents",
+     "StoppedFirst == ChildrenJoined", "StoppedFirst == TRUE",
+     "temporal"),
     ("Wiring", "switch to the session already open",
      "    /\\ s # cur\n",
      "",
@@ -183,6 +185,22 @@ MUTANTS = [
      'images |-> [d \\in Digests |-> IF d \\in turn.asked THEN turn.form[d] ELSE "none"]',
      'images |-> [d \\in Digests |-> IF d \\in turn.asked /\\ turn.form[d] = "ref" THEN "ref" ELSE "none"]',
      "ItemKeepsImages"),
+    ("ForkChildren", "the fork registers a copy before it is on disk",
+     "    /\\ \\A c \\in plan : copied[c]\n", "",
+     "RegisteredExist"),
+    ("ForkChildren", "a copy takes child lines after the fork point",
+     "copy' = [copy EXCEPT ![c] = Cut(clog[c], point)]", "copy' = [copy EXCEPT ![c] = Cut(clog[c], now)]",
+     "CopyAtPoint"),
+    ("ForkChildren", "the fork offers a child made after the point",
+     "plan' = IF yes THEN Eligible(p) ELSE {}", "plan' = IF yes THEN {c \\in Children : spawned[c] # Never} ELSE {}",
+     "OnlyEligible"),
+    ("ForkChildren", "a copy leaves the cut turn open",
+     'Cut(s, p) == LET c == Upto(s, p) IN IF IsOpen(c) THEN Append(c, L("interrupt", p)) ELSE c',
+     "Cut(s, p) == Upto(s, p)",
+     "CopyAtPoint"),
+    ("ForkChildren", "a yes copies only some of the children",
+     "    /\\ reg' = plan\n", "    /\\ reg' = IF plan = {} THEN {} ELSE {CHOOSE c \\in plan : TRUE}\n",
+     "AllOrNone"),
 ]
 
 
@@ -232,8 +250,10 @@ def main():
                 cwd=work, capture_output=True, text=True, timeout=900,
             )
             output = run.stdout + run.stderr
+            # "temporal": a liveness property must fail; TLC names none.
             if (f"Invariant {expected} is violated" in output
-                    or f"Action property {expected} is violated" in output):
+                    or f"Action property {expected} is violated" in output
+                    or (expected == "temporal" and "Temporal properties were violated" in output)):
                 print(f"{spec:15s} {desc:42s} caught by {expected}")
             else:
                 print(f"{spec:15s} {desc:42s} SURVIVED (expected {expected} to fail)")

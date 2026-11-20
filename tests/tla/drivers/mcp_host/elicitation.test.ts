@@ -23,8 +23,8 @@ test("An answer to a withdrawn 2025 question reaches no one, and question 2 gets
   writeProfile(f, { fixture: stdioServer(f, "fixture") });
   const { TmuxSession, startFakeGateway, fakeGatewayToolCall, fakeGatewayFinalText } = await targetHelpers();
   const gateway = startFakeGateway([
-    fakeGatewayToolCall("select", "mcp_select_tool", { name: TOOL }),
-    fakeGatewayToolCall("call", TOOL, {}),
+    fakeGatewayToolCall("open", "toolbox", { open: TOOL }),
+    fakeGatewayToolCall("call", "toolbox", { run: TOOL, arguments: {} }),
     fakeGatewayFinalText("ELICIT_TURN_DONE"),
   ], { models: [{ id: "openai/gpt-5", type: "language", tags: ["tool-use"] }] });
   const env = fxEnv(f, { FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl, FX_MODEL: "openai/gpt-5", FX_PERMISSION_MODE: "full-access" });

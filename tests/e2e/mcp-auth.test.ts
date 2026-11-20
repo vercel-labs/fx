@@ -16,6 +16,7 @@ import {
 } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
+import { traceReportNames, waitForNewTraceReport, type TraceReport } from "./trace-report";
 import { spawnSync } from "node:child_process";
 import { FX_BIN, runFx } from "../evals/eval-helpers";
 import { startIdleDropProxy } from "./fixtures/idle-drop-proxy";
@@ -100,6 +101,71 @@ function unusedCallbackPort(): number {
   return port;
 }
 
+/** What `readLoginAddress` needs of a child made with `Bun.spawn` and three pipes. */
+type LoginChild = {
+  readonly exited: Promise<number>;
+  readonly signalCode: string | null;
+  readonly stderr: ReadableStream<Uint8Array>;
+  kill(): void;
+};
+
+const timedOut = Symbol("timed out");
+/** How long a child that closed its stdout is given to exit. */
+const exitGraceMs = 2_000;
+
+/** `work`, or `timedOut` once `ms` have passed; the timer never outlives the wait. */
+async function raceDeadline<T>(work: Promise<T>, ms: number): Promise<T | typeof timedOut> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([work, new Promise<typeof timedOut>((resolve) => { timer = setTimeout(() => resolve(timedOut), Math.max(ms, 0)); })]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
+ * Reads `reader`, the stdout of `child`, until the whole line holding the sign-in address has arrived (a long
+ * address can arrive in pieces), and returns the address with everything read so far. When stdout ends or
+ * `timeoutMs` passes first, it stops `child` and throws how it ended, what both streams held, and its trace at
+ * `tracePath`, so a failure says why there was no address.
+ */
+async function readLoginAddress(
+  child: LoginChild,
+  reader: ReadableStreamDefaultReader<Uint8Array>,
+  tracePath: string,
+  timeoutMs = 15_000,
+): Promise<{ address: string; stdout: string }> {
+  const started = performance.now();
+  const decoder = new TextDecoder();
+  let stdout = "";
+  for (;;) {
+    const line = /^[^\n]*\/authorize\?[^\n]*(?=\n)/m.exec(stdout);
+    if (line) return { address: line[0].trim(), stdout };
+    const chunk = await raceDeadline(reader.read(), timeoutMs - (performance.now() - started));
+    if (chunk !== timedOut && !chunk.done) {
+      stdout += decoder.decode(chunk.value, { stream: true });
+      continue;
+    }
+    // A child that closed its stdout may still be running; give it a moment, then stop it so its stderr ends.
+    const exit = chunk === timedOut ? timedOut : await raceDeadline(child.exited, exitGraceMs);
+    if (exit === timedOut) child.kill();
+    const code = await child.exited;
+    const stderr = await new Response(child.stderr).text();
+    const trace = existsSync(tracePath) ? readFileSync(tracePath, "utf8").trim() : "";
+    const how = exit !== timedOut
+      ? (child.signalCode ? `it was killed by ${child.signalCode}` : `it exited with code ${code}`)
+      : chunk === timedOut
+        ? `it was still running after ${timeoutMs} ms, so it was stopped`
+        : `it closed its stdout but was still running ${exitGraceMs} ms later, so it was stopped`;
+    throw new Error([
+      `fx mcp login printed no sign-in address, after ${Math.round(performance.now() - started)} ms: ${how}`,
+      `stdout: ${JSON.stringify(stdout)}`,
+      `stderr: ${JSON.stringify(stderr)}`,
+      `trace: ${trace === "" ? "(empty)" : trace}`,
+    ].join("\n"));
+  }
+}
+
 afterEach(async () => {
   const activeTui = tui;
   const activeGateway = gateway;
@@ -149,6 +215,8 @@ function startAuthFixture(
     resourceAtOrigin?: boolean;
     /** Answer revocations this late. */
     revokeDelayMs?: number;
+    /** Answer revocations with this status, in place of 200. */
+    revokeStatus?: number;
     /** Answer the authorization server's metadata this late, like a slow sign-in. */
     discoveryDelayMs?: number;
     /**
@@ -165,6 +233,24 @@ function startAuthFixture(
     codeBarrierReleasePath?: string;
     /** Lists a registration endpoint, so a server added without a client ID can sign in. */
     registration?: boolean;
+    /**
+     * Every 401 names this error in its challenge and body, as ClickState's does:
+     * `Bearer error="invalid_token", error_description="No authorization provided"`.
+     */
+    refusal?: { error: string; description?: string };
+    /** A request that carries a token the server takes still gets the 401 when it is a `tools/call`, as a login that worked and then stops. */
+    refuseToolCalls?: boolean;
+    /** Every 401 comes without a WWW-Authenticate header. */
+    omitChallenge?: boolean;
+    /** Put in front of the Bearer challenge in each 401's header, such as `Basic realm="fx", `. */
+    challengePrefix?: string;
+    /** The code exchange brings no refresh token. */
+    noRefreshToken?: boolean;
+    /** The MCP endpoint holds each request that carries the rotated token (`ACCESS_REFRESHED`) until this file exists, after writing the other, then answers by whether the token is valid then. */
+    checkBarrierStartedPath?: string;
+    checkBarrierReleasePath?: string;
+    /** How long that hold lasts without the release file, in milliseconds (20 000 by default). */
+    checkBarrierMs?: number;
   } = {},
 ) {
   const resourcePath = "/mcp";
@@ -178,6 +264,8 @@ function startAuthFixture(
     body: string;
   }> = [];
   const validTokens = new Set([ACCESS_INITIAL, ACCESS_REFRESHED]);
+  // A scope the server asks for on top of a valid token: a step-up.
+  let moreScopes: string | null = null;
   let authorizationRequests = 0;
   let tokenExchanges = 0;
   let refreshes = 0;
@@ -226,13 +314,31 @@ function startAuthFixture(
       if (protectedRoute) {
         const bearer = request.headers.get("authorization");
         const token = bearer?.startsWith("Bearer ") ? bearer.slice(7) : "";
-        if (!validTokens.has(token)) {
+        if (options.checkBarrierStartedPath && options.checkBarrierReleasePath && token === ACCESS_REFRESHED) {
+          writeFileSync(options.checkBarrierStartedPath, "check-started");
+          if (!await waitForFile(options.checkBarrierReleasePath, options.checkBarrierMs ?? 20_000)) return new Response("", { status: 504 });
+        }
+        const refusedCall = options.refuseToolCalls === true && body.includes("\"tools/call\"");
+        if (!validTokens.has(token) || refusedCall) {
+          const refusal = options.refusal;
+          const errorParams = refusal
+            ? `error="${refusal.error}", ${refusal.description === undefined ? "" : `error_description="${refusal.description}", `}`
+            : "";
+          const challenge = `${options.challengePrefix ?? ""}Bearer ${errorParams}${options.omitScopes
+            ? `resource_metadata="${origin}/.well-known/oauth-protected-resource${resourcePath}"`
+            : `resource_metadata="${origin}/.well-known/oauth-protected-resource${resourcePath}", scope="${options.challengeScope ?? "tools.read"}"`}`;
+          const headers = options.omitChallenge ? {} : { "www-authenticate": challenge };
+          if (!refusal) return new Response("", { status: 401, headers });
+          return Response.json(
+            refusal.description === undefined ? { error: refusal.error } : { error: refusal.error, error_description: refusal.description },
+            { status: 401, headers },
+          );
+        }
+        if (moreScopes) {
           return new Response("", {
-            status: 401,
+            status: 403,
             headers: {
-              "www-authenticate": options.omitScopes
-                ? `Bearer resource_metadata="${origin}/.well-known/oauth-protected-resource${resourcePath}"`
-                : `Bearer resource_metadata="${origin}/.well-known/oauth-protected-resource${resourcePath}", scope="${options.challengeScope ?? "tools.read"}"`,
+              "www-authenticate": `Bearer error="insufficient_scope", scope="${moreScopes}", resource_metadata="${origin}/.well-known/oauth-protected-resource${resourcePath}"`,
             },
           });
         }
@@ -334,7 +440,7 @@ function startAuthFixture(
             return Response.json({ error: "invalid_grant" }, { status: 400 });
           }
           // A refused refresh is refused whichever token it presents.
-          if (!options.rejectRefresh) expect(form.get("refresh_token")).toBe(REFRESH_INITIAL);
+          if (!options.rejectRefresh) expect(form.get("refresh_token")).toBe(options.rotateAuthorizationToken ? REFRESH_ROTATED : REFRESH_INITIAL);
           if (options.stallRefresh && refreshes === 1) {
             return new Response(
               new ReadableStream({
@@ -386,9 +492,9 @@ function startAuthFixture(
           access_token: (options.rotateAuthorizationToken
             ? ACCESS_REFRESHED
             : ACCESS_INITIAL) + (options.accessTokenSuffix ?? ""),
-          refresh_token: options.rotateAuthorizationToken
-            ? REFRESH_ROTATED
-            : REFRESH_INITIAL,
+          ...(options.noRefreshToken
+            ? {}
+            : { refresh_token: options.rotateAuthorizationToken ? REFRESH_ROTATED : REFRESH_INITIAL }),
           token_type: "Bearer",
           ...(options.omitScopes ? {} : { scope: expectedScope }),
           expires_in: 3600,
@@ -397,7 +503,7 @@ function startAuthFixture(
       if (url.pathname === "/revoke") {
         revocations += 1;
         if (options.revokeDelayMs) await Bun.sleep(options.revokeDelayMs);
-        return new Response("", { status: 200 });
+        return new Response("", { status: options.revokeStatus ?? 200 });
       }
       if (url.pathname === "/register" && options.registration && request.method === "POST") {
         registrations += 1;
@@ -414,6 +520,10 @@ function startAuthFixture(
     requests,
     /** The access tokens the server takes; a test may withdraw them. */
     validTokens,
+    /** From now on, a valid token gets a 403 asking for `scope` too; null stops it. */
+    askForMoreScopes(scope: string | null) {
+      moreScopes = scope;
+    },
     get authorizationRequests() {
       return authorizationRequests;
     },
@@ -452,6 +562,7 @@ function createRoot(
   serverUrl = activeAuth.url,
   followAuthorization = true,
   clientId = "fx-mcp-auth-test",
+  startupMs = 5_000,
 ) {
   const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-mcp-auth-")));
   cleanupRoot = root;
@@ -484,7 +595,7 @@ function createRoot(
                 },
               }
             : {}),
-          startup_timeout_ms: 5_000,
+          startup_timeout_ms: startupMs,
         },
       },
     }),
@@ -655,8 +766,8 @@ function releaseProcess(pid: number | null) {
 
 function startToolGateway() {
   return startFakeGateway([
-    fakeGatewayToolCall("select_mcp", "mcp_select_tool", { name: TOOL_NAME }),
-    fakeGatewayToolCall("call_mcp", TOOL_NAME, { text: "authenticated" }),
+    fakeGatewayToolCall("select_mcp", "toolbox", { open: TOOL_NAME }),
+    fakeGatewayToolCall("call_mcp", "toolbox", { run: TOOL_NAME, arguments: { text: "authenticated" } }),
     fakeGatewayFinalText("Authenticated MCP call complete."),
   ], {
     models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
@@ -666,12 +777,12 @@ function startToolGateway() {
 /// Holds the call to the protected tool until `callAt`, a wall-clock time in ms.
 function startDelayedToolGateway(callAt: number, finalText: string) {
   return startFakeGateway([
-    fakeGatewayToolCall("select_mcp", "mcp_select_tool", { name: TOOL_NAME }),
+    fakeGatewayToolCall("select_mcp", "toolbox", { open: TOOL_NAME }),
     async () => {
       await Bun.sleep(Math.max(0, callAt - Date.now()));
-      return fakeGatewayToolCall("call_mcp", TOOL_NAME, {
+      return fakeGatewayToolCall("call_mcp", "toolbox", { run: TOOL_NAME, arguments: {
         text: "authenticated",
-      });
+      } });
     },
     fakeGatewayFinalText(finalText),
   ], {
@@ -683,28 +794,22 @@ function startDelayedToolGateway(callAt: number, finalText: string) {
 /// time in ms.
 function startRefreshRecoveryGateway(callAt: () => number) {
   return startFakeGateway([
-    fakeGatewayToolCall("select_cancel", "mcp_select_tool", {
-      name: TOOL_NAME,
-    }),
+    fakeGatewayToolCall("select_cancel", "toolbox", { open: TOOL_NAME }),
     async () => {
       await Bun.sleep(Math.max(0, callAt() - Date.now()));
-      return fakeGatewayToolCall("call_cancel", TOOL_NAME, {
+      return fakeGatewayToolCall("call_cancel", "toolbox", { run: TOOL_NAME, arguments: {
         text: "cancelled",
-      });
+      } });
     },
-    fakeGatewayToolCall("select_retry", "mcp_select_tool", {
-      name: TOOL_NAME,
-    }),
-    fakeGatewayToolCall("call_retry", TOOL_NAME, {
+    fakeGatewayToolCall("select_retry", "toolbox", { open: TOOL_NAME }),
+    fakeGatewayToolCall("call_retry", "toolbox", { run: TOOL_NAME, arguments: {
       text: "retried",
-    }),
+    } }),
     fakeGatewayFinalText("Retry ended."),
-    fakeGatewayToolCall("select_recovery", "mcp_select_tool", {
-      name: TOOL_NAME,
-    }),
-    fakeGatewayToolCall("call_recovery", TOOL_NAME, {
+    fakeGatewayToolCall("select_recovery", "toolbox", { open: TOOL_NAME }),
+    fakeGatewayToolCall("call_recovery", "toolbox", { run: TOOL_NAME, arguments: {
       text: "recovered",
-    }),
+    } }),
     fakeGatewayFinalText("Refresh recovery complete."),
   ], {
     models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
@@ -777,21 +882,11 @@ describe("MCP login", () => {
         }),
       );
       gateway = startFakeGateway([
-        fakeGatewayToolCall("search_exact", "capability_search", {
-          query: "Please use mcp_linear_echo for this request",
-        }),
-        fakeGatewayToolCall("search_noisy", "capability_search", {
-          query: "linear issue",
-        }),
-        fakeGatewayToolCall("search_auth_collision", "capability_search", {
-          query: "slack data",
-        }),
-        fakeGatewayToolCall("search_targeted", "capability_search", {
-          query: "authenticate slack now",
-        }),
-        fakeGatewayToolCall("search_healthy", "capability_search", {
-          query: "linear echo",
-        }),
+        fakeGatewayToolCall("search_exact", "toolbox", { search: "Please use mcp_linear_echo for this request" }),
+        fakeGatewayToolCall("search_noisy", "toolbox", { search: "linear issue" }),
+        fakeGatewayToolCall("search_auth_collision", "toolbox", { search: "slack data" }),
+        fakeGatewayToolCall("search_targeted", "toolbox", { search: "authenticate slack now" }),
+        fakeGatewayToolCall("search_healthy", "toolbox", { search: "linear echo" }),
         fakeGatewayFinalText("MCP search isolation observed."),
       ], {
         models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
@@ -850,7 +945,7 @@ describe("MCP login", () => {
   };
   // What the model is told to ask for depends on where the user is.
   const searchNeedingLogin = () => startFakeGateway([
-    fakeGatewayToolCall("search_auth", "capability_search", { query: "fixture", server: "fixture" }),
+    fakeGatewayToolCall("search_auth", "toolbox", { search: "fixture", server: "fixture" }),
     fakeGatewayFinalText("Sign in first."),
   ], { models: [{ id: MODEL, type: "language", tags: ["tool-use"] }] });
 
@@ -878,7 +973,7 @@ describe("MCP login", () => {
     config.mcp.broken = { type: "local", command: ["false"], startup_timeout_ms: 5_000 };
     writeFileSync(profile, JSON.stringify(config));
     gateway = startFakeGateway([
-      fakeGatewayToolCall("search_open", "capability_search", { query: "weather forecast" }),
+      fakeGatewayToolCall("search_open", "toolbox", { search: "weather forecast" }),
       fakeGatewayFinalText("Nothing found."),
     ], { models: [{ id: MODEL, type: "language", tags: ["tool-use"] }] });
     const result = await runFx(["ask", "--json", "--auto", "--no-save", "What's the weather?"], {
@@ -894,6 +989,37 @@ describe("MCP login", () => {
     expect(told).toContain("\"MCP server 'broken' is unavailable: ");
     expect(auth.authorizationRequests).toBe(0);
   }, 45_000);
+
+  // A deny rule names the tool, but the server's list is not loaded until the
+  // user signs in, so open answers why, in the same words in every mode: full
+  // access ignores the rule and the login text is not a rule's doing.
+  test("a tool of a server that needs a login says so in the same words in full access and in auto, with a deny rule on it", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    auth = startAuthFixture(upstream.url);
+    const root = createRoot(auth);
+    const settingsPath = join(root.home, ".fx", "settings.json");
+    const settings = JSON.parse(readFileSync(settingsPath, "utf8"));
+    writeFileSync(settingsPath, JSON.stringify({ ...settings, permission: { [TOOL_NAME]: "deny" } }));
+    const told: Record<string, string> = {};
+    for (const mode of ["--auto", "--full-access"]) {
+      gateway = startFakeGateway([
+        fakeGatewayToolCall("open_login", "toolbox", { open: TOOL_NAME }),
+        fakeGatewayFinalText("Sign in first."),
+      ], { models: [{ id: MODEL, type: "language", tags: ["tool-use"] }] });
+      const result = await runFx(["ask", "--json", mode, "--no-save", "Open the protected tool."], {
+        cwd: root.workspace,
+        env: { ...v2Env(root), FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl },
+        timeoutMs: 20_000,
+      });
+      expect(result.code).toBe(0);
+      told[mode] = toolResultText(gateway.requests[1]?.body ?? "", "open_login", "error-text");
+      gateway.stop();
+      gateway = null;
+    }
+    expect(told["--auto"]).toContain("needs a login");
+    expect(told["--full-access"]).toBe(told["--auto"]);
+    expect(auth.authorizationRequests).toBe(0);
+  }, 60_000);
 
   test.skipIf(!tmuxAvailable())("the shell tells the model the user signs in with /mcp login", async () => {
     upstream = startModernMcpHttpFixture("json");
@@ -953,6 +1079,178 @@ describe("MCP login", () => {
     expect(await statusOf(root)).toBe("not_started");
   }, 60_000);
 
+  // Before, a logout that sent no revocation, as for a server whose
+  // authorization server takes none, still said only "Signed out", though
+  // the tokens kept working there.
+  test("a logout that can't revoke the login at its server says the tokens stay valid", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    auth = startAuthFixture(upstream.url);
+    const root = createRoot(auth);
+    const env = v2Env(root);
+    seedV2Credential(root, auth, { revocation_endpoint: null });
+    expect(await statusOf(root)).toBe("signed_in");
+
+    const logout = await runFx(["mcp", "logout", "fixture"], { cwd: root.workspace, env, timeoutMs: 20_000 });
+    expect(logout.stdout).toBe("Signed out of fixture here, but the login wasn't revoked at its server, so its tokens stay valid until they expire.\n");
+    expect(logout.stderr).toBe("");
+    expect(logout.code).toBe(0);
+    expect(auth.revocations).toBe(0);
+    expect(await statusOf(root)).toBe("not_started");
+  }, 60_000);
+
+  // A revocation the server refused, or didn't answer before fx stopped
+  // waiting, may have left the tokens working there. Before, fx forgot them
+  // and never tried again; now it keeps them to revoke later.
+  const unconfirmedLogout =
+    "Signed out of fixture here, but its server didn't confirm the revocation, so its tokens may stay valid for now. fx will try again later.\n";
+  const keptSignOuts = (root: { home: string }) => join(root.home, ".fx", "mcp-revocations.json");
+  const revokedTokens = (fixture: AuthFixture) =>
+    fixture.requests.filter((request) => request.path === "/revoke").map((request) => new URLSearchParams(request.body).get("token"));
+
+  for (const [what, options] of [
+    ["refuses", { revokeStatus: 503 }],
+    ["doesn't answer in time", { revokeDelayMs: 4_000 }],
+  ] as const) {
+    test(`a logout whose revocation the server ${what} keeps it to try again later`, async () => {
+      upstream = startModernMcpHttpFixture("json");
+      auth = startAuthFixture(upstream.url, options);
+      const root = createRoot(auth);
+      seedV2Credential(root, auth);
+      const logout = await runFx(["mcp", "logout", "fixture"], { cwd: root.workspace, env: v2Env(root), timeoutMs: 20_000 });
+      expect(logout.stdout).toBe(unconfirmedLogout);
+      expect(logout.stderr).toBe("");
+      expect(logout.code).toBe(0);
+      expect(auth.revocations).toBe(1);
+      expect(await statusOf(root)).toBe("not_started");
+      // Kept in a private file, with the refresh token the revocation sent.
+      expect(statSync(keptSignOuts(root)).mode & 0o777).toBe(0o600);
+      expect(readFileSync(keptSignOuts(root), "utf8")).toContain(`"refresh_token":"${REFRESH_INITIAL}"`);
+    }, 60_000);
+  }
+
+  test("a logout whose revocation can't reach the server keeps it to try again later", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    auth = startAuthFixture(upstream.url);
+    const root = createRoot(auth);
+    // A port that was just listening and is now closed refuses the connection.
+    const closed = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: () => new Response(null) });
+    const revokeUrl = `http://127.0.0.1:${closed.port}/revoke`;
+    closed.stop(true);
+    seedV2Credential(root, auth, { revocation_endpoint: revokeUrl });
+    const logout = await runFx(["mcp", "logout", "fixture"], { cwd: root.workspace, env: v2Env(root), timeoutMs: 20_000 });
+    expect(logout.stdout).toBe(unconfirmedLogout);
+    expect(logout.stderr).toBe("");
+    expect(logout.code).toBe(0);
+    expect(auth.revocations).toBe(0);
+    expect(await statusOf(root)).toBe("not_started");
+    expect(existsSync(keptSignOuts(root))).toBe(true);
+  }, 60_000);
+
+  test("the next fx mcp logout revokes a sign-out its server didn't confirm, and forgets it", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    const options: { revokeStatus?: number } = { revokeStatus: 503 };
+    auth = startAuthFixture(upstream.url, options);
+    const root = createRoot(auth);
+    seedV2Credential(root, auth);
+    const env = v2Env(root);
+    const first = await runFx(["mcp", "logout", "fixture"], { cwd: root.workspace, env, timeoutMs: 20_000 });
+    expect(first.stdout).toBe(unconfirmedLogout);
+    // The logout's own retry leaves the sign-out it just kept to itself.
+    expect(auth.revocations).toBe(1);
+    expect(existsSync(keptSignOuts(root))).toBe(true);
+
+    // The server works again. The next logout has nothing of its own to
+    // sign out of, and sends the kept revocation.
+    delete options.revokeStatus;
+    const second = await runFx(["mcp", "logout", "fixture"], { cwd: root.workspace, env, timeoutMs: 20_000 });
+    expect(second.stdout).toBe("fixture wasn't signed in.\n");
+    expect(second.stderr).toBe("");
+    expect(second.code).toBe(0);
+    expect(revokedTokens(auth)).toEqual([REFRESH_INITIAL, REFRESH_INITIAL]);
+    expect(existsSync(keptSignOuts(root))).toBe(false);
+
+    // Nothing is kept, so a third sends nothing.
+    const third = await runFx(["mcp", "logout", "fixture"], { cwd: root.workspace, env, timeoutMs: 20_000 });
+    expectExit0(third);
+    expect(auth.revocations).toBe(2);
+  }, 60_000);
+
+  // RFC 7009 confirms a revocation with any 2xx. Before, the retry took only
+  // a 200, so a server that answers 204 got the same kept sign-out again at
+  // every later command.
+  test("a kept sign-out its server confirms with a 204 is forgotten", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    const options: { revokeStatus?: number } = { revokeStatus: 503 };
+    auth = startAuthFixture(upstream.url, options);
+    const root = createRoot(auth);
+    seedV2Credential(root, auth);
+    const env = v2Env(root);
+    const first = await runFx(["mcp", "logout", "fixture"], { cwd: root.workspace, env, timeoutMs: 20_000 });
+    expect(first.stdout).toBe(unconfirmedLogout);
+
+    options.revokeStatus = 204;
+    const second = await runFx(["mcp", "logout", "fixture"], { cwd: root.workspace, env, timeoutMs: 20_000 });
+    expectExit0(second);
+    expect(revokedTokens(auth)).toEqual([REFRESH_INITIAL, REFRESH_INITIAL]);
+    expect(existsSync(keptSignOuts(root))).toBe(false);
+    const third = await runFx(["mcp", "logout", "fixture"], { cwd: root.workspace, env, timeoutMs: 20_000 });
+    expectExit0(third);
+    expect(auth.revocations).toBe(2);
+  }, 60_000);
+
+  test("the next fx mcp login that signs in revokes a sign-out its server didn't confirm", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    const options: { revokeStatus?: number } = { revokeStatus: 503 };
+    auth = startAuthFixture(upstream.url, options);
+    const root = createRoot(auth);
+    seedV2Credential(root, auth);
+    const env = v2Env(root);
+    const logout = await runFx(["mcp", "logout", "fixture"], { cwd: root.workspace, env, timeoutMs: 20_000 });
+    expect(logout.stdout).toBe(unconfirmedLogout);
+    expect(existsSync(keptSignOuts(root))).toBe(true);
+
+    delete options.revokeStatus;
+    const login = await runFx(["mcp", "login", "fixture"], { cwd: root.workspace, env, timeoutMs: 20_000 });
+    expect(login.stderr).toBe("");
+    expectExit0(login);
+    expect(login.stdout).toContain("Signed in to fixture.");
+    expect(auth.tokenExchanges).toBe(1);
+    // After the sign-in, the kept revocation goes, and nothing stays kept.
+    expect(revokedTokens(auth)).toEqual([REFRESH_INITIAL, REFRESH_INITIAL]);
+    expect(existsSync(keptSignOuts(root))).toBe(false);
+    expect(await statusOf(root)).toBe("signed_in");
+  }, 60_000);
+
+  test("an fx mcp login that fails sends no kept sign-out and keeps it", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    const options: { revokeStatus?: number; rejectCodeExchange?: boolean } = { revokeStatus: 503 };
+    auth = startAuthFixture(upstream.url, options);
+    const root = createRoot(auth);
+    seedV2Credential(root, auth);
+    const env = v2Env(root);
+    const logout = await runFx(["mcp", "logout", "fixture"], { cwd: root.workspace, env, timeoutMs: 20_000 });
+    expect(logout.stdout).toBe(unconfirmedLogout);
+
+    delete options.revokeStatus;
+    options.rejectCodeExchange = true;
+    const login = await runFx(["mcp", "login", "fixture"], { cwd: root.workspace, env, timeoutMs: 20_000 });
+    expect(login.code).toBe(1);
+    expect(login.stderr).toContain("Couldn't sign in to fixture");
+    expect(auth.revocations).toBe(1);
+    expect(readFileSync(keptSignOuts(root), "utf8")).toContain(`"refresh_token":"${REFRESH_INITIAL}"`);
+  }, 60_000);
+
+  test("a confirmed logout keeps nothing", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    auth = startAuthFixture(upstream.url);
+    const root = createRoot(auth);
+    seedV2Credential(root, auth);
+    const logout = await runFx(["mcp", "logout", "fixture"], { cwd: root.workspace, env: v2Env(root), timeoutMs: 20_000 });
+    expect(logout.stdout).toBe("Signed out of fixture.\n");
+    expect(auth.revocations).toBe(1);
+    expect(existsSync(keptSignOuts(root))).toBe(false);
+  }, 60_000);
+
   test("fx mcp login says why the server refused the sign-in, in its words", async () => {
     upstream = startModernMcpHttpFixture("json");
     auth = startAuthFixture(upstream.url, { rejectCodeExchange: true });
@@ -966,6 +1264,567 @@ describe("MCP login", () => {
     expect(await statusOf(root)).not.toBe("signed_in");
   }, 30_000);
 
+  // ---- A server that refuses a login says so ----
+  //
+  // The server answers every request that carries fx's token with 401 invalid_token. The
+  // sign-in then ends with the server's own words and saves nothing, so the person can tell
+  // that the server refused the token, instead of finding only "needs login" later.
+  const REFUSAL = { error: "invalid_token", description: "No authorization provided" };
+  // The server's own words go in quotes inside fx's sentence, so they can't close it.
+  const REFUSED_NEW = 'fixture refused the new login (invalid_token: "No authorization provided")';
+  const REFUSED_SAVED = 'fixture refused the saved login (invalid_token: "No authorization provided")';
+  // A description that tries to end fx's sentence and start one of its own.
+  const FORGED = "x). Signed in to fixture";
+  // The model's search answer is JSON whose text the search escapes for HTML, so a quote reaches it as `&quot;`.
+  const inSearch = (words: string) => words.replaceAll('"', "&quot;");
+
+  test("fx mcp login to a server that refuses the new login says so, exits 1, and saves nothing", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    auth = startAuthFixture(upstream.url, { refusal: REFUSAL });
+    auth.validTokens.clear();
+    const root = createRoot(auth);
+    const login = await runFx(["mcp", "login", "fixture"], { cwd: root.workspace, env: v2Env(root), timeoutMs: 30_000 });
+    expect(login.stdout).not.toContain("Signed in");
+    expect(login.stderr).toBe(`Couldn't sign in to fixture: ${REFUSED_NEW}.\n`);
+    expect(login.code).toBe(1);
+    expect(auth.tokenExchanges).toBe(1);
+    // Forgetting the refused token is not a logout: nothing is revoked, and nothing says "Signed out".
+    expect(auth.revocations).toBe(0);
+    expect(login.stdout + login.stderr).not.toContain("Signed out");
+    // The server was asked once with the new token, and the refused token was never saved.
+    expect(auth.requests.filter((r) => r.authorization === `Bearer ${ACCESS_INITIAL}`).length).toBeGreaterThan(0);
+    expect(await statusOf(root)).toBe("not_started");
+  }, 60_000);
+
+  // The server refuses the new token with a 401, and the token endpoint then fails the refresh that
+  // 401 starts (a 500, a 429). The 401 is the server's answer to the new login, so the sign-in ends
+  // refused and nothing is saved, whatever happens to the refresh. fx used to take the failed refresh
+  // for "couldn't check", save the token the server had refused, and say it couldn't reach the server.
+  for (const [what, answer] of [
+    ["answers 500", { status: 500, body: { error: "server_error" } }],
+    ["answers 429", { status: 429, body: { error: "slow_down" } }],
+  ] as const) {
+    test(`fx mcp login to a server that refuses the new login, whose refresh then ${what}, is refused, exits 1, and saves nothing`, async () => {
+      upstream = startModernMcpHttpFixture("json");
+      auth = startAuthFixture(upstream.url, { refusal: REFUSAL, refreshAnswer: answer });
+      auth.validTokens.clear();
+      const root = createRoot(auth);
+      const store = join(root.home, ".fx", "mcp-credentials", "credentials-v3.json");
+      const login = await runFx(["mcp", "login", "fixture"], { cwd: root.workspace, env: v2Env(root), timeoutMs: 30_000 });
+      expect(login.code).toBe(1);
+      expect(login.stdout).not.toContain("Signed in");
+      // The store holds nothing: the refused token was never written.
+      expect(existsSync(store)).toBe(false);
+      expect(await statusOf(root)).toBe("not_started");
+      expect(login.stderr).toBe(`Couldn't sign in to fixture: ${REFUSED_NEW}.\n`);
+      // The 401 did start a refresh, and it was the one that failed.
+      expect(auth.refreshes).toBe(1);
+      expect(auth.revocations).toBe(0);
+    }, 60_000);
+  }
+
+  // The server refuses the new token with a 401 and takes the refresh that 401 starts, then holds
+  // the request that carries the refreshed token past the owner's 45 second wait for the check.
+  // The engine still holds the 401 when that wait ends, so the sign-in ends refused and nothing is
+  // saved. fx used to keep the login then, with a note, though the server had refused its token.
+  test("fx mcp login to a server that refuses the new login, whose retry then hangs past the wait, is refused, exits 1, and saves nothing", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    const barrier = mkdtempSync(join(tmpdir(), "fx-mcp-check-barrier-"));
+    const started = join(barrier, "started");
+    const release = join(barrier, "release");
+    auth = startAuthFixture(upstream.url, { refusal: REFUSAL, checkBarrierStartedPath: started, checkBarrierReleasePath: release, checkBarrierMs: 80_000 });
+    // The new token is refused; the refresh brings one the server takes, and holds its request.
+    auth.validTokens.delete(ACCESS_INITIAL);
+    // The server's start budget is longer than the owner's 45 second wait, so the engine's own timer
+    // doesn't end the check first.
+    const root = createRoot(auth, true, "http", auth.url, true, "fx-mcp-auth-test", 120_000);
+    const store = join(root.home, ".fx", "mcp-credentials", "credentials-v3.json");
+    const began = Date.now();
+    const login = await runFx(["mcp", "login", "fixture"], { cwd: root.workspace, env: v2Env(root), timeoutMs: 100_000 });
+    const seconds = (Date.now() - began) / 1000;
+    writeFileSync(release, "go");
+    expect(existsSync(started)).toBe(true);
+    expect(login.stdout).not.toContain("Signed in");
+    expect(login.stderr).toBe(`Couldn't sign in to fixture: ${REFUSED_NEW}.\n`);
+    expect(login.code).toBe(1);
+    // The wait ended it, not the engine: the request with the refreshed token was still held.
+    expect(seconds).toBeGreaterThan(40);
+    expect(auth.refreshes).toBe(1);
+    expect(auth.revocations).toBe(0);
+    expect(existsSync(store)).toBe(false);
+    expect(await statusOf(root)).toBe("not_started");
+  }, 150_000);
+
+  test("a new login the server refuses, whose refresh then fails, leaves the saved login as it was", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    const options: { rotateAuthorizationToken?: boolean; refusal: typeof REFUSAL; refreshAnswer: { status: number; body: unknown } } = {
+      refusal: REFUSAL, refreshAnswer: { status: 500, body: { error: "server_error" } },
+    };
+    auth = startAuthFixture(upstream.url, options);
+    const root = createRoot(auth);
+    const env = v2Env(root);
+    const store = join(root.home, ".fx", "mcp-credentials", "credentials-v3.json");
+    expectExit0(await runFx(["mcp", "login", "fixture"], { cwd: root.workspace, env, timeoutMs: 30_000 }));
+    const before = readFileSync(store, "utf8");
+    // The server takes the login it has and refuses the next one it issues.
+    auth.validTokens.clear();
+    auth.validTokens.add(ACCESS_INITIAL);
+    options.rotateAuthorizationToken = true;
+    const again = await runFx(["mcp", "login", "fixture"], { cwd: root.workspace, env, timeoutMs: 30_000 });
+    expect(again.code).toBe(1);
+    expect(again.stdout).not.toContain("Signed in");
+    expect(readFileSync(store, "utf8")).toBe(before);
+    expect(again.stderr).toContain(REFUSED_NEW);
+    const show = await runFx(["mcp", "show", "fixture"], { cwd: root.workspace, env, timeoutMs: 30_000 });
+    expect(show.code).toBe(0);
+    expect(show.stdout).toMatch(/status +ready/);
+  }, 120_000);
+
+  // The host's store of saved logins turns unreadable while a new login waits for its check
+  // request (a reload read it for a server it added, and a newer fx had saved it). The
+  // branch for an unreadable store must not take the server's refusal of the new login:
+  // the sign-in still ends refused, with nothing saved.
+  test.skipIf(!tmuxAvailable())("a new login the server refuses is refused when the saved logins can't be read meanwhile, and nothing is saved", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    const barrier = mkdtempSync(join(tmpdir(), "fx-mcp-check-barrier-"));
+    const started = join(barrier, "started");
+    const release = join(barrier, "release");
+    auth = startAuthFixture(upstream.url, {
+      rotateAuthorizationToken: true, noRefreshToken: true, refusal: REFUSAL, checkBarrierStartedPath: started, checkBarrierReleasePath: release,
+    });
+    const root = createRoot(auth);
+    const env = v2Env(root);
+    const storePath = seedV2Credential(root, auth, { refresh: null });
+    auth.validTokens.delete(ACCESS_INITIAL);
+    gateway = startFakeGateway([], { models: [{ id: MODEL, type: "language", tags: ["tool-use"] }] });
+    tui = await TmuxSession.create({
+      isolated: true, cwd: root.workspace, width: 140, height: 36,
+      env: { ...env, FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl },
+    });
+    await tui.waitForComposer(15_000);
+    await tui.sendText("/mcp login fixture");
+    expect(await waitForFile(started, 20_000)).toBe(true);
+    // A newer fx saves the store, and a reload that adds a server reads it: it can't.
+    writeFileSync(storePath, JSON.stringify({ ...JSON.parse(readFileSync(storePath, "utf8")), version: 3 }));
+    const before = readFileSync(storePath, "utf8");
+    await tui.sendText(`/mcp add --no-login web ${auth.url}`);
+    await tui.waitForText("Added web to ~/.fx/mcp.json.", 10_000);
+    await tui.sendText("/mcp show web");
+    await tui.waitForText("couldn't be read: a newer fx saved it, or it's damaged", 10_000);
+    // The server refuses the new login now.
+    auth.validTokens.delete(ACCESS_REFRESHED);
+    writeFileSync(release, "go");
+    await tui.waitForText(`Couldn't sign in to fixture: ${REFUSED_NEW}.`, 20_000);
+    expect(await tui.captureFullScrollback()).not.toContain("Signed in to fixture");
+    expect(readFileSync(storePath, "utf8")).toBe(before);
+  }, 120_000);
+
+  test("fx mcp show says the server refused the saved login, with its error, in text and in --json", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    auth = startAuthFixture(upstream.url, { noRefreshToken: true, refusal: REFUSAL });
+    const root = createRoot(auth);
+    const env = v2Env(root);
+    expectExit0(await runFx(["mcp", "login", "fixture"], { cwd: root.workspace, env, timeoutMs: 30_000 }));
+    // The server stops taking that login, and there is no refresh token to try.
+    auth.validTokens.clear();
+    const show = await runFx(["mcp", "show", "fixture"], { cwd: root.workspace, env, timeoutMs: 30_000 });
+    expect(show.code).toBe(1);
+    expect(show.stdout).toMatch(/status +needs login/);
+    expect(show.stdout).toContain(REFUSED_SAVED);
+    const json = await runFx(["mcp", "show", "fixture", "--json"], { cwd: root.workspace, env, timeoutMs: 30_000 });
+    expect(json.code).toBe(1);
+    const shown = JSON.parse(json.stdout);
+    expect(shown.status).toBe("needs_login");
+    expect(shown.error).toContain(REFUSED_SAVED);
+    expect(`${show.stdout}${json.stdout}`).not.toContain(ACCESS_INITIAL);
+  }, 90_000);
+
+  test("fx mcp show with a refresh token tries one refresh and one retry, then says the server refused the login", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    auth = startAuthFixture(upstream.url, { refusal: REFUSAL });
+    const root = createRoot(auth);
+    const env = v2Env(root);
+    expectExit0(await runFx(["mcp", "login", "fixture"], { cwd: root.workspace, env, timeoutMs: 30_000 }));
+    // The server refuses the saved token, and the one a refresh brings.
+    auth.validTokens.clear();
+    const show = await runFx(["mcp", "show", "fixture"], { cwd: root.workspace, env, timeoutMs: 30_000 });
+    expect(show.code).toBe(1);
+    expect(show.stdout).toContain(REFUSED_SAVED);
+    expect(auth.refreshes).toBe(1);
+    expect(auth.requests.filter((r) => r.authorization === `Bearer ${ACCESS_REFRESHED}`).length).toBe(1);
+  }, 90_000);
+
+  test("fx mcp show with no saved login still says needs login, with no error and the command to run", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    auth = startAuthFixture(upstream.url, { refusal: REFUSAL });
+    const root = createRoot(auth);
+    const env = v2Env(root);
+    const show = await runFx(["mcp", "show", "fixture"], { cwd: root.workspace, env, timeoutMs: 30_000 });
+    expect(show.code).toBe(1);
+    expect(show.stdout).toMatch(/status +needs login/);
+    expect(show.stdout).not.toContain("refused");
+    expect(show.stdout).toContain("fx mcp login fixture");
+    const json = JSON.parse((await runFx(["mcp", "show", "fixture", "--json"], { cwd: root.workspace, env, timeoutMs: 30_000 })).stdout);
+    expect(json.status).toBe("needs_login");
+    expect(json.error ?? null).toBeNull();
+  }, 90_000);
+
+  test("a refused refresh keeps its own words, not the words for a refused login", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    const options: { rejectRefresh?: boolean; refusal?: typeof REFUSAL } = { refusal: REFUSAL };
+    auth = startAuthFixture(upstream.url, options);
+    const root = createRoot(auth);
+    const env = v2Env(root);
+    expectExit0(await runFx(["mcp", "login", "fixture"], { cwd: root.workspace, env, timeoutMs: 30_000 }));
+    // The server stops taking that login, and refuses its refresh too.
+    auth.validTokens.clear();
+    options.rejectRefresh = true;
+    const show = await runFx(["mcp", "show", "fixture"], { cwd: root.workspace, env, timeoutMs: 30_000 });
+    expect(show.stdout).toMatch(/status +needs login/);
+    expect(show.stdout).not.toContain("refused the saved login");
+  }, 90_000);
+
+  test("a refusal's words hold no control characters and are cut at a bound", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    const description = `bad\u007f\u009b[31mred${"x".repeat(1000)}`;
+    auth = startAuthFixture(upstream.url, { noRefreshToken: true, refusal: { error: "invalid_token", description } });
+    const root = createRoot(auth);
+    const env = v2Env(root);
+    expectExit0(await runFx(["mcp", "login", "fixture"], { cwd: root.workspace, env, timeoutMs: 30_000 }));
+    auth.validTokens.clear();
+    const show = await runFx(["mcp", "show", "fixture"], { cwd: root.workspace, env, timeoutMs: 30_000 });
+    const json = await runFx(["mcp", "show", "fixture", "--json"], { cwd: root.workspace, env, timeoutMs: 30_000 });
+    // The JSON output writes a quote as \".
+    for (const [text, opening] of [[show.stdout, 'refused the saved login (invalid_token: "bad'], [json.stdout, 'refused the saved login (invalid_token: \\"bad']] as const) {
+      expect(text).toContain(opening);
+      expect(text).not.toMatch(/[\u007f-\u009f]/);
+      expect(text).not.toContain("x".repeat(300));
+      expect(text).toContain("x".repeat(50));
+    }
+  }, 90_000);
+
+  test("a refusal with no challenge header is still named, with no server text", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    auth = startAuthFixture(upstream.url, { noRefreshToken: true, omitChallenge: true });
+    const root = createRoot(auth);
+    const env = v2Env(root);
+    expectExit0(await runFx(["mcp", "login", "fixture"], { cwd: root.workspace, env, timeoutMs: 30_000 }));
+    auth.validTokens.clear();
+    const show = await runFx(["mcp", "show", "fixture"], { cwd: root.workspace, env, timeoutMs: 30_000 });
+    expect(show.stdout).toContain("fixture refused the saved login.");
+    expect(show.stdout).not.toContain("(");
+  }, 90_000);
+
+  test("a refusal that follows another scheme's challenge in the header is still named", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    auth = startAuthFixture(upstream.url, { noRefreshToken: true, challengePrefix: 'Basic realm="fx", ', refusal: REFUSAL });
+    const root = createRoot(auth);
+    const env = v2Env(root);
+    expectExit0(await runFx(["mcp", "login", "fixture"], { cwd: root.workspace, env, timeoutMs: 30_000 }));
+    auth.validTokens.clear();
+    const show = await runFx(["mcp", "show", "fixture"], { cwd: root.workspace, env, timeoutMs: 30_000 });
+    expect(show.stdout).toContain(REFUSED_SAVED);
+  }, 90_000);
+
+  test("a refused new login leaves the saved login another sign-in made as it was", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    const options: { rotateAuthorizationToken?: boolean; refusal?: typeof REFUSAL; noRefreshToken?: boolean } = { refusal: REFUSAL, noRefreshToken: true };
+    auth = startAuthFixture(upstream.url, options);
+    const root = createRoot(auth);
+    const env = v2Env(root);
+    expectExit0(await runFx(["mcp", "login", "fixture"], { cwd: root.workspace, env, timeoutMs: 30_000 }));
+    // The server takes the login it has and refuses the next one it issues.
+    auth.validTokens.clear();
+    auth.validTokens.add(ACCESS_INITIAL);
+    options.rotateAuthorizationToken = true;
+    const again = await runFx(["mcp", "login", "fixture"], { cwd: root.workspace, env, timeoutMs: 30_000 });
+    expect(again.code).toBe(1);
+    expect(again.stderr).toContain(REFUSED_NEW);
+    const show = await runFx(["mcp", "show", "fixture"], { cwd: root.workspace, env, timeoutMs: 30_000 });
+    expect(show.code).toBe(0);
+    expect(show.stdout).toMatch(/status +ready/);
+  }, 120_000);
+
+  // ---- Every surface says it in the same words (acceptance A8) ----
+  //
+  // One words function turns the login's reason into text. A saved login the server
+  // refuses reads the same on the model's search page, `fx mcp call`, the status
+  // line and /trace, with the server's error.
+  /** A login that worked, then the server stops taking it, with no refresh token to try. */
+  const refusedSavedLogin = async (refusal: { error: string; description?: string } = REFUSAL) => {
+    upstream = startModernMcpHttpFixture("json");
+    auth = startAuthFixture(upstream.url, { noRefreshToken: true, refusal });
+    const root = createRoot(auth);
+    expectExit0(await runFx(["mcp", "login", "fixture"], { cwd: root.workspace, env: v2Env(root), timeoutMs: 30_000 }));
+    auth.validTokens.clear();
+    return root;
+  };
+
+  test("capability_search tells the model the server refused the saved login, with its error", async () => {
+    const root = await refusedSavedLogin();
+    gateway = searchNeedingLogin();
+    const result = await runFx(["ask", "--json", "--auto", "--no-save", "Find the protected MCP tool."], {
+      cwd: root.workspace,
+      env: { ...v2Env(root), FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl },
+      timeoutMs: 30_000,
+    });
+    expect(result.code).toBe(0);
+    const told = toolResultText(gateway.requests[1]?.body ?? "", "search_auth");
+    expect(told).toContain(inSearch(REFUSED_SAVED));
+    // The way back is still said.
+    expect(told).toContain("fx mcp login fixture");
+    expect(told).not.toContain(ACCESS_INITIAL);
+  }, 60_000);
+
+  test("fx mcp call, run from the agent's shell, prints that the server refused the saved login", async () => {
+    const root = await refusedSavedLogin();
+    let seen = "";
+    gateway = startFakeGateway([
+      fakeGatewayToolCall("run_call", "shell", { action: "run", command: `"${FX_BIN}" mcp call list fixture; echo "list=$?"` }),
+      (body: string) => {
+        seen = toolResultText(body, "run_call");
+        return fakeGatewayFinalText("CALL_DONE");
+      },
+    ], { models: [{ id: MODEL, type: "language", tags: ["tool-use"] }] });
+    const result = await runFx(["ask", "--json", "--full-access", "--no-save", "Run the command."], {
+      cwd: root.workspace,
+      env: { ...v2Env(root), FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl },
+      timeoutMs: 60_000,
+    });
+    expect(result.code).toBe(0);
+    // What the shell printed comes back inside the tool result's JSON, which writes a quote as \".
+    expect(seen).toContain(`MCP server 'fixture' needs a login: ${REFUSED_SAVED.replaceAll('"', '\\"')}`);
+    expect(seen).not.toContain(ACCESS_INITIAL);
+  }, 90_000);
+
+  // A server's words go in quotes inside fx's sentence, so a description that tries to end it and
+  // start one of fx's own stays inside the quotes, wherever fx says it.
+  test("a server's words are quoted, so they cannot close fx's sentence, in the sign-in's words and the model's", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    auth = startAuthFixture(upstream.url, { noRefreshToken: true, refusal: { error: "invalid_token", description: FORGED } });
+    auth.validTokens.clear();
+    const refused = createRoot(auth);
+    const login = await runFx(["mcp", "login", "fixture"], { cwd: refused.workspace, env: v2Env(refused), timeoutMs: 30_000 });
+    expect(login.code).toBe(1);
+    expect(login.stderr).toBe(`Couldn't sign in to fixture: fixture refused the new login (invalid_token: "${FORGED}").\n`);
+    expect(login.stdout).not.toContain("Signed in");
+
+    const root = await refusedSavedLogin({ error: "invalid_token", description: FORGED });
+    gateway = searchNeedingLogin();
+    const search = await runFx(["ask", "--json", "--auto", "--no-save", "Find the protected MCP tool."], {
+      cwd: root.workspace,
+      env: { ...v2Env(root), FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl },
+      timeoutMs: 30_000,
+    });
+    expect(search.code).toBe(0);
+    const told = toolResultText(gateway.requests[1]?.body ?? "", "search_auth");
+    expect(told).toContain(inSearch(`fixture refused the saved login (invalid_token: "${FORGED}")`));
+    // The words are not fx's: nothing outside the quotes says the person is signed in.
+    expect(told.replace(inSearch(`"${FORGED}"`), "")).not.toContain("Signed in to fixture");
+    const show = await runFx(["mcp", "show", "fixture"], { cwd: root.workspace, env: v2Env(root), timeoutMs: 30_000 });
+    expect(show.stdout).toContain(`fixture refused the saved login (invalid_token: "${FORGED}")`);
+  }, 120_000);
+
+  // A login that worked and then stops: the server takes the token for initialize and the tool
+  // list, and refuses the tool call itself with a 401. The model hears the refusal, with the
+  // server's words, as it does when the server refused the saved login at start.
+  for (const [what, description] of [
+    ["its words", REFUSAL.description],
+    ["words that try to close fx's sentence", FORGED],
+  ] as const) {
+    test(`a tool call that gets the 401 itself tells the model the server refused the saved login, with ${what}`, async () => {
+      upstream = startModernMcpHttpFixture("json");
+      auth = startAuthFixture(upstream.url, { noRefreshToken: true, refuseToolCalls: true, refusal: { error: "invalid_token", description } });
+      const root = createRoot(auth);
+      const env = v2Env(root);
+      expectExit0(await runFx(["mcp", "login", "fixture"], { cwd: root.workspace, env, timeoutMs: 30_000 }));
+      gateway = startToolGateway();
+      const result = await runFx(["ask", "--json", "--auto", "--no-save", "Call the protected fixture."], {
+        cwd: root.workspace,
+        env: { ...env, FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl },
+        timeoutMs: 30_000,
+      });
+      expect(result.code).toBe(0);
+      const told = toolResultText(gateway.requests[2]?.body ?? "", "call_mcp", "error-text");
+      expect(told).toContain(
+        `MCP server 'fixture' needs a login: fixture refused the saved login (invalid_token: "${description}"). Ask the user to run fx mcp login fixture in a terminal, then try again.`,
+      );
+      expect(told).not.toContain(ACCESS_INITIAL);
+      // The server never ran the tool.
+      expect(auth.protectedToolCalls).toBe(0);
+    }, 90_000);
+  }
+
+  test.skipIf(!tmuxAvailable())("the /mcp status line and /trace say the server refused the saved login", async () => {
+    const root = await refusedSavedLogin();
+    const traceDir = join(root.home, "tmp");
+    mkdirSync(traceDir, { recursive: true });
+    gateway = startFakeGateway([], { models: [{ id: MODEL, type: "language", tags: ["tool-use"] }] });
+    tui = await TmuxSession.create({
+      isolated: true, cwd: root.workspace, width: 140, height: 36,
+      env: { ...v2Env(root), TMPDIR: traceDir, FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl },
+    });
+    await tui.waitForComposer(15_000);
+    // The shell starts the server on its own; the status line says why it needs a login.
+    await tui.waitForText("fixture refused the saved login · /mcp", 20_000);
+    const before = new Set(traceReportNames(traceDir));
+    await tui.sendText("/trace");
+    const report = await waitForNewTraceReport(traceDir, before);
+    // The trace's problem for the server names the refusal in the server's words, as the status line does.
+    const problem = report.problems("mcp_server").find((p) => p.name === "fixture");
+    expect(problem?.issue).toBe("needs_login");
+    expect(problem?.error).toContain(REFUSED_SAVED);
+    expect(report.text).not.toContain(ACCESS_INITIAL);
+    expect(await tui.captureFullScrollback()).not.toContain(ACCESS_INITIAL);
+  }, 90_000);
+
+  // The shell reads the store of saved logins again for a server that needs a login
+  // (before a status, a tool list, a call), and takes the login saved there. A new
+  // login that waits for its check request is the one in use: a login another fx saved
+  // meanwhile is not taken in its place.
+  test.skipIf(!tmuxAvailable())("a login another fx saved is not taken in place of a new login that waits for its check request", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    const barrier = mkdtempSync(join(tmpdir(), "fx-mcp-check-barrier-"));
+    const started = join(barrier, "started");
+    const release = join(barrier, "release");
+    auth = startAuthFixture(upstream.url, {
+      rotateAuthorizationToken: true, noRefreshToken: true, refusal: REFUSAL, checkBarrierStartedPath: started, checkBarrierReleasePath: release,
+    });
+    const root = createRoot(auth);
+    const env = v2Env(root);
+    // The saved login is one the server no longer takes: it needs a login.
+    const storePath = seedV2Credential(root, auth, { refresh: null });
+    auth.validTokens.delete(ACCESS_INITIAL);
+    gateway = startFakeGateway([], { models: [{ id: MODEL, type: "language", tags: ["tool-use"] }] });
+    tui = await TmuxSession.create({
+      isolated: true, cwd: root.workspace, width: 140, height: 36,
+      env: { ...env, FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl },
+    });
+    await tui.waitForComposer(15_000);
+    await tui.sendText("/mcp show fixture");
+    await tui.waitForText(/status +needs login/, 20_000);
+    await tui.waitForComposer(10_000);
+    await tui.sendText("/mcp login fixture");
+    expect(await waitForFile(started, 20_000)).toBe(true);
+    // Another fx saves a different login the server takes, while the new one waits for its check.
+    const other = "mcp-access-other-fx-secret";
+    auth.validTokens.add(other);
+    seedV2Credential(root, auth, { access: other, refresh: null });
+    // `/mcp list` reads the saved logins again before it shows the servers (`pickUpLogins`), and ends
+    // while the check is still held.
+    await tui.sendText("/mcp list");
+    await tui.waitForText("TRANSPORT  STATUS", 15_000);
+    writeFileSync(release, "go");
+    await tui.waitForText("Signed in to fixture.", 20_000);
+    // The server was never asked with the other login: the new one was kept, then saved.
+    expect(auth.requests.some((r) => r.authorization === `Bearer ${other}`)).toBe(false);
+    expect(auth.requests.some((r) => r.authorization === `Bearer ${ACCESS_REFRESHED}`)).toBe(true);
+    expect(readFileSync(storePath, "utf8")).toContain(ACCESS_REFRESHED);
+  }, 120_000);
+
+  // A logout while a new login waits for its check request ends that login with it: its tokens
+  // are gone, so the answer to the check has nothing to save, and "Signed in" is never said.
+  test.skipIf(!tmuxAvailable())("a logout while a new login waits for its check request ends that login: nothing is saved and nothing says signed in", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    const barrier = mkdtempSync(join(tmpdir(), "fx-mcp-check-barrier-"));
+    const started = join(barrier, "started");
+    const release = join(barrier, "release");
+    auth = startAuthFixture(upstream.url, {
+      rotateAuthorizationToken: true, noRefreshToken: true, checkBarrierStartedPath: started, checkBarrierReleasePath: release,
+    });
+    const root = createRoot(auth);
+    const env = v2Env(root);
+    gateway = startFakeGateway([], { models: [{ id: MODEL, type: "language", tags: ["tool-use"] }] });
+    tui = await TmuxSession.create({
+      isolated: true, cwd: root.workspace, width: 140, height: 36,
+      env: { ...env, FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl },
+    });
+    await tui.waitForComposer(15_000);
+    await tui.sendText("/mcp login fixture");
+    expect(await waitForFile(started, 20_000)).toBe(true);
+    await tui.sendText("/mcp logout fixture");
+    await tui.waitForText("Couldn't sign in to fixture: signed out before the server answered.", 15_000);
+    // The server answers the held request now, to a login that is gone.
+    writeFileSync(release, "go");
+    await Bun.sleep(2_000);
+    expect(await tui.captureFullScrollback()).not.toContain("Signed in to fixture");
+    const storePath = join(root.home, ".fx", "mcp-credentials", "credentials-v3.json");
+    expect(existsSync(storePath) ? readFileSync(storePath, "utf8") : "").not.toContain(ACCESS_REFRESHED);
+    await tui.waitForComposer(10_000);
+    await tui.sendText("/mcp list");
+    await tui.waitForText(/fixture +~\/\.fx\/mcp\.json +http +needs login/, 15_000);
+  }, 120_000);
+
+  // A server that is up, with its tools listed, must still be asked about the new login: a
+  // list kept from the old one doesn't say the new tokens work.
+  test.skipIf(!tmuxAvailable())("a new login the server refuses is refused even while the server is up with its tools listed", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    const options: { rotateAuthorizationToken?: boolean; refusal?: typeof REFUSAL; noRefreshToken?: boolean } = { refusal: REFUSAL, noRefreshToken: true };
+    auth = startAuthFixture(upstream.url, options);
+    const root = createRoot(auth);
+    const env = v2Env(root);
+    expectExit0(await runFx(["mcp", "login", "fixture"], { cwd: root.workspace, env, timeoutMs: 30_000 }));
+    gateway = startFakeGateway([], { models: [{ id: MODEL, type: "language", tags: ["tool-use"] }] });
+    tui = await TmuxSession.create({
+      isolated: true, cwd: root.workspace, width: 140, height: 36,
+      env: { ...env, FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl },
+    });
+    await tui.waitForComposer(15_000);
+    // Up on the saved login, with the tools listed.
+    await tui.sendText("/mcp show fixture");
+    await tui.waitForText(/status +ready/, 20_000);
+    // The server keeps the login it has and refuses the next one it issues.
+    auth.validTokens.clear();
+    auth.validTokens.add(ACCESS_INITIAL);
+    options.rotateAuthorizationToken = true;
+    await tui.waitForComposer(10_000);
+    await tui.sendText("/mcp login fixture");
+    await tui.waitForText(`Couldn't sign in to fixture: ${REFUSED_NEW}.`, 20_000);
+    expect(await tui.captureFullScrollback()).not.toContain("Signed in to fixture");
+    // The server comes back up on the saved login that worked. No sign-in happened, so neither the
+    // footer nor the transcript says the person signed in.
+    await tui.waitForComposer(10_000);
+    await tui.sendText("/mcp show fixture");
+    await tui.waitForText(/status +ready/, 20_000);
+    const quiet = Date.now() + 2_500;
+    while (Date.now() < quiet) {
+      expect(await tui.capturePane()).not.toContain("Signed in to fixture");
+      await Bun.sleep(250);
+    }
+    expect(await tui.captureFullScrollback()).not.toContain("Signed in to fixture");
+    // The login the store holds is still the one that worked.
+    const show = await runFx(["mcp", "show", "fixture"], { cwd: root.workspace, env, timeoutMs: 30_000 });
+    expect(show.code).toBe(0);
+    expect(show.stdout).toMatch(/status +ready/);
+  }, 120_000);
+
+  // The saved login a refusal takes back is taken without a notice, since no sign-in happened. That
+  // holds only for the moments after the refusal: a login another fx saves long after is a new login,
+  // and fx says so.
+  test.skipIf(!tmuxAvailable())("a login another fx saves long after a refused new login is taken with the notice", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    auth = startAuthFixture(upstream.url, { refusal: REFUSAL, noRefreshToken: true });
+    auth.validTokens.clear();
+    const root = createRoot(auth);
+    const env = v2Env(root);
+    gateway = startFakeGateway([], { models: [{ id: MODEL, type: "language", tags: ["tool-use"] }] });
+    tui = await TmuxSession.create({
+      isolated: true, cwd: root.workspace, width: 140, height: 36,
+      env: { ...env, FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl },
+    });
+    await tui.waitForComposer(15_000);
+    await tui.sendText("/mcp login fixture");
+    await tui.waitForText(`Couldn't sign in to fixture: ${REFUSED_NEW}.`, 20_000);
+    await tui.waitForComposer(10_000);
+    // Long after, another fx saves a login the server takes.
+    await Bun.sleep(35_000);
+    auth.validTokens.add(ACCESS_INITIAL);
+    seedV2Credential(root, auth, { refresh: null });
+    // `/mcp list` reads the saved logins again before it shows the servers (`pickUpLogins`).
+    await tui.sendText("/mcp list");
+    await tui.waitForText("Signed in to fixture.", 20_000);
+  }, 120_000);
+
   test("fx mcp login --no-browser takes the address pasted back", async () => {
     upstream = startModernMcpHttpFixture("json");
     auth = startAuthFixture(upstream.url);
@@ -978,19 +1837,11 @@ describe("MCP login", () => {
       stderr: "pipe",
     });
     const reader = child.stdout.getReader();
-    let stdout = "";
     const decoder = new TextDecoder();
-    const deadline = Date.now() + 15_000;
-    // Wait for the whole line: a long address can arrive in pieces.
-    while (!/\/authorize\?[^\n]*\n/.test(stdout) && Date.now() < deadline) {
-      const { value, done } = await reader.read();
-      if (done) break;
-      stdout += decoder.decode(value);
-    }
-    const address = stdout.split("\n").map((line) => line.trim()).find((line) => line.includes("/authorize?"));
-    expect(address).toBeDefined();
+    const { address, stdout: printed } = await readLoginAddress(child, reader, root.trace);
+    let stdout = printed;
     // The user approves in some other browser, which ends on the loopback address.
-    const approved = await fetch(address!, { redirect: "manual" });
+    const approved = await fetch(address, { redirect: "manual" });
     const back = approved.headers.get("location")!;
     expect(new URL(back).hostname).toBe("127.0.0.1");
     child.stdin.write(`${back}\n`);
@@ -1022,24 +1873,17 @@ describe("MCP login", () => {
     let silent: Awaited<ReturnType<typeof Bun.connect>> | undefined;
     try {
       const reader = child.stdout.getReader();
-      let stdout = "";
       const decoder = new TextDecoder();
-      const deadline = Date.now() + 15_000;
-      while (!/\/authorize\?[^\n]*\n/.test(stdout) && Date.now() < deadline) {
-        const { value, done } = await reader.read();
-        if (done) break;
-        stdout += decoder.decode(value);
-      }
-      const address = stdout.split("\n").map((line) => line.trim()).find((line) => line.includes("/authorize?"));
-      expect(address).toBeDefined();
-      const port = Number(new URL(new URL(address!).searchParams.get("redirect_uri")!).port);
+      const { address, stdout: printed } = await readLoginAddress(child, reader, root.trace);
+      let stdout = printed;
+      const port = Number(new URL(new URL(address).searchParams.get("redirect_uri")!).port);
       // A return with a state fx never made, from anything that can reach the
       // port: a 404, and the sign-in goes on.
       const stray = await fetch(`http://127.0.0.1:${port}/callback?code=stray&state=not-the-state-fx-made`, { signal: AbortSignal.timeout(5_000) });
       expect(stray.status).toBe(404);
       // A connection that sends nothing, as a browser's spare one does.
       silent = await Bun.connect({ hostname: "127.0.0.1", port, socket: { data() {} } });
-      const approved = await fetch(address!, { redirect: "manual" });
+      const approved = await fetch(address, { redirect: "manual" });
       const back = approved.headers.get("location")!;
       const page = await fetch(back, { signal: AbortSignal.timeout(5_000) });
       expect(page.status).toBe(200);
@@ -1075,19 +1919,8 @@ describe("MCP login", () => {
       stderr: "pipe",
     });
     try {
-      const reader = child.stdout.getReader();
-      let stdout = "";
-      const decoder = new TextDecoder();
-      const deadline = Date.now() + 15_000;
-      // Wait for the whole line: a long address can arrive in pieces.
-      while (!/\/authorize\?[^\n]*\n/.test(stdout) && Date.now() < deadline) {
-        const { value, done } = await reader.read();
-        if (done) break;
-        stdout += decoder.decode(value);
-      }
-      const address = stdout.split("\n").map((line) => line.trim()).find((line) => line.includes("/authorize?"));
-      expect(address).toBeDefined();
-      const scopes = (new URL(address!).searchParams.get("scope") ?? "").split(" ");
+      const { address } = await readLoginAddress(child, child.stdout.getReader(), root.trace);
+      const scopes = (new URL(address).searchParams.get("scope") ?? "").split(" ");
       expect(scopes).toContain("custom.scope");
       expect(scopes).toContain("other.scope");
     } finally {
@@ -1195,18 +2028,9 @@ describe("MCP login", () => {
       stderr: "pipe",
     });
     const reader = child.stdout.getReader();
-    let stdout = "";
-    const decoder = new TextDecoder();
-    const deadline = Date.now() + 15_000;
-    while (!/\/authorize\?[^\n]*\n/.test(stdout) && Date.now() < deadline) {
-      const { value, done } = await reader.read();
-      if (done) break;
-      stdout += decoder.decode(value);
-    }
-    const address = stdout.split("\n").map((line) => line.trim()).find((line) => line.includes("/authorize?"));
-    expect(address).toBeDefined();
+    const { address } = await readLoginAddress(child, reader, root.trace);
     // The user says no; the browser ends on the loopback address with the refusal.
-    const approved = await fetch(address!, { redirect: "manual" });
+    const approved = await fetch(address, { redirect: "manual" });
     const back = new URL(approved.headers.get("location")!);
     back.searchParams.delete("code");
     back.searchParams.set("error", "access_denied");
@@ -1220,6 +2044,68 @@ describe("MCP login", () => {
     expect(await new Response(child.stderr).text()).toBe("Couldn't sign in to fixture: the sign-in page returned an error (access_denied).\n");
     expect(auth.tokenExchanges).toBe(0);
   }, 40_000);
+
+  // What `readLoginAddress` throws when the login never prints its address.
+  const endOf = (waiting: Promise<unknown>) => waiting.then(() => "", (error: Error) => error.message);
+  const stub = (script: string) => Bun.spawn(["sh", "-c", script], { stdin: "pipe", stdout: "pipe", stderr: "pipe" });
+
+  test("fx mcp login that ends before it prints its address is reported with its exit code and stderr", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    auth = startAuthFixture(upstream.url);
+    const root = createRoot(auth, true, "http", auth.url, false);
+    // A server that isn't configured: fx says so on stderr and exits 1, with nothing on stdout.
+    const child = Bun.spawn([FX_BIN, "mcp", "login", "--no-browser", "nosuchserver"], {
+      cwd: root.workspace,
+      env: Object.fromEntries(Object.entries({ ...process.env, ...v2Env(root) }).filter(([, v]) => v !== undefined)) as Record<string, string>,
+      stdin: "pipe",
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const message = await endOf(readLoginAddress(child, child.stdout.getReader(), root.trace));
+    expect(message).toContain("fx mcp login printed no sign-in address");
+    expect(message).toContain("it exited with code 1");
+    expect(message).toContain('stderr: "No MCP server named nosuchserver.');
+  }, 20_000);
+
+  test("a login that is killed before it prints its address is reported with the signal and what both streams held", async () => {
+    // Killed by a signal after a line on each stream.
+    const killed = stub("echo starting; echo 'about to die' >&2; kill -9 $$");
+    const message = await endOf(readLoginAddress(killed, killed.stdout.getReader(), "/nonexistent/trace.log"));
+    expect(message).toContain("it was killed by SIGKILL");
+    expect(message).toContain('stdout: "starting\\n"');
+    expect(message).toContain('stderr: "about to die\\n"');
+  }, 20_000);
+
+  test("a login that lingers with its stdout closed before it prints its address is stopped after a moment and reported as such", async () => {
+    // Stdout closed, the process still alive: it is given a moment to exit, then stopped.
+    const lingering = stub("exec >&-; exec sleep 30");
+    const message = await endOf(readLoginAddress(lingering, lingering.stdout.getReader(), "/nonexistent/trace.log"));
+    expect(message).toContain(`it closed its stdout but was still running ${exitGraceMs} ms later, so it was stopped`);
+    expect(await lingering.exited).not.toBe(0);
+  }, 20_000);
+
+  test("a login that stays silent past the deadline before it prints its address is stopped at the deadline and reported as such", async () => {
+    // Alive and silent: the deadline ends the wait, and the child is stopped.
+    const silent = stub("exec sleep 30");
+    const started = performance.now();
+    const message = await endOf(readLoginAddress(silent, silent.stdout.getReader(), "/nonexistent/trace.log", 300));
+    expect(message).toContain("it was still running after 300 ms, so it was stopped");
+    expect(performance.now() - started).toBeLessThan(5_000);
+    expect(await silent.exited).not.toBe(0);
+  }, 20_000);
+
+  test("a login address that arrives in pieces is read whole", async () => {
+    // The first piece ends inside the address, after the `?`, so the line holding it is not complete yet.
+    const child = stub("printf 'Open this address:\\n  http://127.0.0.1:1/authorize?sta'; sleep 0.3; printf 'te=s\\nThen paste it here\\n'; exec sleep 30");
+    try {
+      const { address, stdout } = await readLoginAddress(child, child.stdout.getReader(), "/nonexistent/trace.log");
+      expect(address).toBe("http://127.0.0.1:1/authorize?state=s");
+      expect(stdout).toStartWith("Open this address:\n");
+    } finally {
+      child.kill();
+      await child.exited;
+    }
+  }, 20_000);
 
   test.skipIf(!tmuxAvailable())("/mcp login signs in in the background and says when it's done", async () => {
     upstream = startModernMcpHttpFixture("json");
@@ -1237,7 +2123,8 @@ describe("MCP login", () => {
     await tui.waitForText("Signed in to fixture.", 15_000);
     expect(auth.tokenExchanges).toBe(1);
     await tui.sendText("/mcp list");
-    await tui.waitForText("signed in", 10_000);
+    // The sign-in ended when the server answered a request with the new login, so it is up.
+    await tui.waitForText("ready, 1 tool", 10_000);
     const pane = await tui.captureFullScrollback();
     expect(pane).not.toContain(ACCESS_INITIAL);
   }, 60_000);
@@ -1340,20 +2227,10 @@ describe("MCP login", () => {
     const traceDir = join(root.home, "tmp");
     mkdirSync(traceDir, { recursive: true });
     // /trace writes a report to $TMPDIR; read the newest once it is complete.
-    const captureTrace = async (): Promise<string> => {
-      const reports = () => readdirSync(traceDir).filter(name => name.startsWith("fx-trace-") && name.endsWith(".md")).sort();
-      const before = new Set(reports());
+    const captureTrace = async (): Promise<TraceReport> => {
+      const before = new Set(traceReportNames(traceDir));
       await tui!.sendText("/trace");
-      const deadline = Date.now() + 15_000;
-      while (Date.now() < deadline) {
-        const fresh = reports().filter(name => !before.has(name));
-        if (fresh.length > 0) {
-          const content = readFileSync(join(traceDir, fresh[fresh.length - 1]), "utf8");
-          if (content.includes("## Transcript Timeline")) return content;
-        }
-        await new Promise(resolve => setTimeout(resolve, 100));
-      }
-      throw new Error("trace report was not written");
+      return waitForNewTraceReport(traceDir, before);
     };
     gateway = startFakeGateway([], { models: [{ id: MODEL, type: "language", tags: ["tool-use"] }] });
     tui = await TmuxSession.create({
@@ -1375,9 +2252,9 @@ describe("MCP login", () => {
     await tui.sendKeys("C-c");
     await tui.waitForPane((pane) => !pane.includes("MCP servers") && !pane.includes("esc back"), 5_000);
     const waiting = await captureTrace();
-    expect(waiting).toContain("- mcp server needs login name=fixture");
-    expect(waiting).toMatch(/- fixture state=\w+ transport=http tools=0 signed_in=false needs_login=true/);
-    expect(waiting).not.toContain("mcp_servers: runtime not loaded");
+    expect(waiting.problems("mcp_server").find((problem) => problem.name === "fixture")?.issue).toBe("needs_login");
+    expect(waiting.one("runtime_context").mcp_servers).toBe(1);
+    expect(waiting.one("mcp_server")).toMatchObject({ name: "fixture", transport: "http", tools: 0, signed_in: false, needs_login: true });
 
     await tui.sendText("/mcp");
     await tui.waitForText("MCP servers  1", 10_000);
@@ -1399,8 +2276,11 @@ describe("MCP login", () => {
     await tui.waitForPane((pane) => !pane.includes("Signed in to fixture."), 10_000);
     expect(await tui.capturePane()).not.toMatch(/mcp \d+\/\d+/);
     const ready = await captureTrace();
-    expect(ready).toMatch(/- fixture state=ready transport=http tools=\d+ signed_in=true needs_login=false\n(?! {4}error:)/);
-    expect(ready).not.toContain("- mcp server needs login name=fixture");
+    const server = ready.one("mcp_server");
+    expect(server).toMatchObject({ name: "fixture", state: "ready", transport: "http", signed_in: true, needs_login: false });
+    expect(server.tools).toEqual(expect.any(Number));
+    expect(server.error).toBeUndefined();
+    expect(ready.problems("mcp_server")).toEqual([]);
     expect(await tui.captureFullScrollback()).not.toContain(ACCESS_INITIAL);
   }, 60_000);
 
@@ -1793,6 +2673,52 @@ describe("MCP login", () => {
     expect(auth.tokenExchanges).toBe(1);
   }, 60_000);
 
+  // Before, a store fx couldn't read, here one a newer fx saved, left the
+  // server asking for a sign-in, which couldn't be saved there either.
+  test("a server whose saved logins fx can't read is down for that reason, not asked to sign in", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    auth = startAuthFixture(upstream.url);
+    const root = createRoot(auth);
+    const env = v2Env(root);
+    expectExit0(await runFx(["mcp", "login", "fixture"], { cwd: root.workspace, env, timeoutMs: 20_000 }));
+    const storePath = join(root.home, ".fx", "mcp-credentials", "credentials-v3.json");
+    writeFileSync(storePath, JSON.stringify({ ...JSON.parse(readFileSync(storePath, "utf8")), version: 3 }));
+    const why = "~/.fx/mcp-credentials/credentials-v3.json couldn't be read: a newer fx saved it, or it's damaged";
+
+    const shown = await runFx(["mcp", "show", "fixture"], { cwd: root.workspace, env, timeoutMs: 20_000 });
+    expect(shown.stdout).toMatch(/status +failed/);
+    expect(shown.stdout).toContain(`error      ${why}`);
+    expect(shown.stdout).not.toContain("needs login");
+    expect(shown.stdout).not.toContain("login fixture");
+    expect(shown.code).toBe(1);
+    const json = await runFx(["mcp", "show", "fixture", "--json"], { cwd: root.workspace, env, timeoutMs: 20_000 });
+    expect(JSON.parse(json.stdout)).toMatchObject({ name: "fixture", status: "failed", error: why, tools: [] });
+    expect(json.code).toBe(1);
+  }, 60_000);
+
+  // Before, a server a reload added read its login from a store fx could no
+  // longer read, found none, and asked for a sign-in that couldn't be saved.
+  test.skipIf(!tmuxAvailable())("a server a reload adds while fx can't read its saved logins is down for that reason, not asked to sign in", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    auth = startAuthFixture(upstream.url);
+    const root = createRoot(auth);
+    seedV2Credential(root, auth);
+    gateway = startFakeGateway([], { models: [{ id: MODEL, type: "language", tags: ["tool-use"] }] });
+    tui = await TmuxSession.create({
+      isolated: true, cwd: root.workspace, width: 140, height: 36,
+      env: { ...v2Env(root), FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl },
+    });
+    await tui.waitForComposer(15_000);
+    // The host read the store when it started; a newer fx saves it now.
+    const storePath = join(root.home, ".fx", "mcp-credentials", "credentials-v3.json");
+    writeFileSync(storePath, JSON.stringify({ ...JSON.parse(readFileSync(storePath, "utf8")), version: 3 }));
+    await tui.sendText(`/mcp add --no-login web ${auth.url}`);
+    await tui.waitForText("Added web to ~/.fx/mcp.json.", 10_000);
+    await tui.waitForText("web failed · /mcp", 15_000);
+    expect(await tui.capturePane()).not.toContain("web needs login");
+    expect(auth.authorizationRequests).toBe(0);
+  }, 60_000);
+
   test.skipIf(!tmuxAvailable())("a login made by another fx process reaches a running shell", async () => {
     upstream = startModernMcpHttpFixture("json");
     auth = startAuthFixture(upstream.url);
@@ -1879,15 +2805,15 @@ describe("MCP login", () => {
     const env = v2Env(root);
     expectExit0(await runFx(["mcp", "login", "fixture"], { cwd: root.workspace, env, timeoutMs: 20_000 }));
     gateway = startFakeGateway([
-      fakeGatewayToolCall("select", "mcp_select_tool", { name: "mcp_fixture_echo" }),
-      fakeGatewayToolCall("first", "mcp_fixture_echo", { text: "first" }),
+      fakeGatewayToolCall("select", "toolbox", { open: "mcp_fixture_echo" }),
+      fakeGatewayToolCall("first", "toolbox", { run: "mcp_fixture_echo", arguments: { text: "first" } }),
       fakeGatewayFinalText("First call done."),
       // A selected tool lasts for its turn, so each turn selects it again.
-      fakeGatewayToolCall("select2", "mcp_select_tool", { name: "mcp_fixture_echo" }),
-      fakeGatewayToolCall("second", "mcp_fixture_echo", { text: "second" }),
+      fakeGatewayToolCall("select2", "toolbox", { open: "mcp_fixture_echo" }),
+      fakeGatewayToolCall("second", "toolbox", { run: "mcp_fixture_echo", arguments: { text: "second" } }),
       fakeGatewayFinalText("It needs a login."),
-      fakeGatewayToolCall("select3", "mcp_select_tool", { name: "mcp_fixture_echo" }),
-      fakeGatewayToolCall("third", "mcp_fixture_echo", { text: "third" }),
+      fakeGatewayToolCall("select3", "toolbox", { open: "mcp_fixture_echo" }),
+      fakeGatewayToolCall("third", "toolbox", { run: "mcp_fixture_echo", arguments: { text: "third" } }),
       fakeGatewayFinalText("Third call done."),
     ], { models: [{ id: MODEL, type: "language", tags: ["tool-use"] }] });
     tui = await TmuxSession.create({
@@ -1925,14 +2851,14 @@ describe("MCP login", () => {
     const storePath = join(root.home, ".fx", "mcp-credentials", "credentials-v3.json");
     expectExit0(await runFx(["mcp", "login", "fixture"], { cwd: root.workspace, env, timeoutMs: 20_000 }));
     gateway = startFakeGateway([
-      fakeGatewayToolCall("select", "mcp_select_tool", { name: "mcp_fixture_echo" }),
-      fakeGatewayToolCall("first", "mcp_fixture_echo", { text: "first" }),
+      fakeGatewayToolCall("select", "toolbox", { open: "mcp_fixture_echo" }),
+      fakeGatewayToolCall("first", "toolbox", { run: "mcp_fixture_echo", arguments: { text: "first" } }),
       fakeGatewayFinalText("First call done."),
-      fakeGatewayToolCall("select2", "mcp_select_tool", { name: "mcp_fixture_echo" }),
-      fakeGatewayToolCall("second", "mcp_fixture_echo", { text: "second" }),
+      fakeGatewayToolCall("select2", "toolbox", { open: "mcp_fixture_echo" }),
+      fakeGatewayToolCall("second", "toolbox", { run: "mcp_fixture_echo", arguments: { text: "second" } }),
       fakeGatewayFinalText("Second call done."),
-      fakeGatewayToolCall("select3", "mcp_select_tool", { name: "mcp_fixture_echo" }),
-      fakeGatewayToolCall("third", "mcp_fixture_echo", { text: "third" }),
+      fakeGatewayToolCall("select3", "toolbox", { open: "mcp_fixture_echo" }),
+      fakeGatewayToolCall("third", "toolbox", { run: "mcp_fixture_echo", arguments: { text: "third" } }),
       fakeGatewayFinalText("Third call done."),
     ], { models: [{ id: MODEL, type: "language", tags: ["tool-use"] }] });
     tui = await TmuxSession.create({
@@ -1970,11 +2896,11 @@ describe("MCP login", () => {
     const storePath = join(root.home, ".fx", "mcp-credentials", "credentials-v3.json");
     expectExit0(await runFx(["mcp", "login", "fixture"], { cwd: root.workspace, env, timeoutMs: 20_000 }));
     gateway = startFakeGateway([
-      fakeGatewayToolCall("select", "mcp_select_tool", { name: "mcp_fixture_echo" }),
-      fakeGatewayToolCall("first", "mcp_fixture_echo", { text: "first" }),
+      fakeGatewayToolCall("select", "toolbox", { open: "mcp_fixture_echo" }),
+      fakeGatewayToolCall("first", "toolbox", { run: "mcp_fixture_echo", arguments: { text: "first" } }),
       fakeGatewayFinalText("First call done."),
-      fakeGatewayToolCall("select2", "mcp_select_tool", { name: "mcp_fixture_echo" }),
-      fakeGatewayToolCall("second", "mcp_fixture_echo", { text: "second" }),
+      fakeGatewayToolCall("select2", "toolbox", { open: "mcp_fixture_echo" }),
+      fakeGatewayToolCall("second", "toolbox", { run: "mcp_fixture_echo", arguments: { text: "second" } }),
       fakeGatewayFinalText("Second call done."),
     ], { models: [{ id: MODEL, type: "language", tags: ["tool-use"] }] });
     tui = await TmuxSession.create({
@@ -2027,14 +2953,14 @@ describe("MCP login", () => {
     const storePath = join(root.home, ".fx", "mcp-credentials", "credentials-v3.json");
     expectExit0(await runFx(["mcp", "login", "fixture"], { cwd: root.workspace, env, timeoutMs: 20_000 }));
     gateway = startFakeGateway([
-      fakeGatewayToolCall("select", "mcp_select_tool", { name: "mcp_fixture_echo" }),
-      fakeGatewayToolCall("first", "mcp_fixture_echo", { text: "first" }),
+      fakeGatewayToolCall("select", "toolbox", { open: "mcp_fixture_echo" }),
+      fakeGatewayToolCall("first", "toolbox", { run: "mcp_fixture_echo", arguments: { text: "first" } }),
       fakeGatewayFinalText("First call done."),
-      fakeGatewayToolCall("select2", "mcp_select_tool", { name: "mcp_fixture_echo" }),
-      fakeGatewayToolCall("second", "mcp_fixture_echo", { text: "second" }),
+      fakeGatewayToolCall("select2", "toolbox", { open: "mcp_fixture_echo" }),
+      fakeGatewayToolCall("second", "toolbox", { run: "mcp_fixture_echo", arguments: { text: "second" } }),
       fakeGatewayFinalText("Second call done."),
-      fakeGatewayToolCall("select3", "mcp_select_tool", { name: "mcp_fixture_echo" }),
-      fakeGatewayToolCall("third", "mcp_fixture_echo", { text: "third" }),
+      fakeGatewayToolCall("select3", "toolbox", { open: "mcp_fixture_echo" }),
+      fakeGatewayToolCall("third", "toolbox", { run: "mcp_fixture_echo", arguments: { text: "third" } }),
       fakeGatewayFinalText("Third call done."),
     ], { models: [{ id: MODEL, type: "language", tags: ["tool-use"] }] });
     tui = await TmuxSession.create({
@@ -2101,20 +3027,20 @@ describe("MCP login", () => {
     // withdrawn; the second calls once the first's refresh is out.
     let second: ReturnType<typeof startFakeGateway> | null = null;
     gateway = startFakeGateway([
-      fakeGatewayToolCall("select_first", "mcp_select_tool", { name: TOOL_NAME }),
+      fakeGatewayToolCall("select_first", "toolbox", { open: TOOL_NAME }),
       async () => {
         await until("the second fx to connect", () => (second?.requests.length ?? 0) >= 2);
         activeAuth.validTokens.delete(ACCESS_INITIAL);
-        return fakeGatewayToolCall("first", TOOL_NAME, { text: "first" });
+        return fakeGatewayToolCall("first", "toolbox", { run: TOOL_NAME, arguments: { text: "first" } });
       },
       fakeGatewayFinalText("First call done."),
     ], models);
     const first = gateway;
     second = startFakeGateway([
-      fakeGatewayToolCall("select_second", "mcp_select_tool", { name: TOOL_NAME }),
+      fakeGatewayToolCall("select_second", "toolbox", { open: TOOL_NAME }),
       async () => {
         await until("the first fx's refresh", () => activeAuth.refreshes >= 1);
-        return fakeGatewayToolCall("second", TOOL_NAME, { text: "second" });
+        return fakeGatewayToolCall("second", "toolbox", { run: TOOL_NAME, arguments: { text: "second" } });
       },
       fakeGatewayFinalText("Second call done."),
     ], models);
@@ -2159,10 +3085,10 @@ describe("MCP login", () => {
     const renewed = (withdrawn: string, id: string, waitMs: number) => async () => {
       await Bun.sleep(waitMs);
       activeAuth.validTokens.delete(withdrawn);
-      return fakeGatewayToolCall(id, TOOL_NAME, { text: id });
+      return fakeGatewayToolCall(id, "toolbox", { run: TOOL_NAME, arguments: { text: id } });
     };
     gateway = startFakeGateway([
-      fakeGatewayToolCall("select_mcp", "mcp_select_tool", { name: TOOL_NAME }),
+      fakeGatewayToolCall("select_mcp", "toolbox", { open: TOOL_NAME }),
       renewed(ACCESS_INITIAL, "first", 0),
       renewed(`${ACCESS_REFRESHED}-1`, "second", 600),
       fakeGatewayFinalText("Renewed twice."),
@@ -2254,6 +3180,25 @@ describe("MCP login", () => {
     expect(readFileSync(storePath, "utf8")).toContain(ACCESS_INITIAL);
   }, 60_000);
 
+  // A held server has no session to sign out of, so its logout removes the
+  // saved login without revoking it, and says that.
+  test("a logout of a held server says its login wasn't revoked at its server", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    auth = startAuthFixture(upstream.url);
+    const root = createRoot(auth);
+    moveAuthFixtureToWorkspace(root);
+    const storePath = seedV2Credential(root, auth);
+    const doc = JSON.parse(readFileSync(storePath, "utf8"));
+    doc.servers[0].workspace = root.workspace;
+    writeFileSync(storePath, JSON.stringify(doc));
+    const done = await runFx(["mcp", "logout", "fixture"], { cwd: root.workspace, env: v2Env(root), timeoutMs: 20_000 });
+    expect(done.stdout).toBe("Signed out of fixture here, but the login wasn't revoked at its server, so its tokens stay valid until they expire.\n");
+    expect(done.stderr).toBe("");
+    expect(done.code).toBe(0);
+    expect(auth.revocations).toBe(0);
+    expect(readFileSync(storePath, "utf8")).not.toContain(ACCESS_INITIAL);
+  }, 60_000);
+
   test("a logout while another fx keeps the saved logins busy changes nothing and says so", async () => {
     upstream = startModernMcpHttpFixture("json");
     auth = startAuthFixture(upstream.url);
@@ -2279,14 +3224,14 @@ describe("MCP login", () => {
     const storePath = join(root.home, ".fx", "mcp-credentials", "credentials-v3.json");
     expectExit0(await runFx(["mcp", "login", "fixture"], { cwd: root.workspace, env, timeoutMs: 20_000 }));
     gateway = startFakeGateway([
-      fakeGatewayToolCall("select", "mcp_select_tool", { name: "mcp_fixture_echo" }),
-      fakeGatewayToolCall("first", "mcp_fixture_echo", { text: "first" }),
+      fakeGatewayToolCall("select", "toolbox", { open: "mcp_fixture_echo" }),
+      fakeGatewayToolCall("first", "toolbox", { run: "mcp_fixture_echo", arguments: { text: "first" } }),
       fakeGatewayFinalText("First call done."),
-      fakeGatewayToolCall("select2", "mcp_select_tool", { name: "mcp_fixture_echo" }),
-      fakeGatewayToolCall("second", "mcp_fixture_echo", { text: "second" }),
+      fakeGatewayToolCall("select2", "toolbox", { open: "mcp_fixture_echo" }),
+      fakeGatewayToolCall("second", "toolbox", { run: "mcp_fixture_echo", arguments: { text: "second" } }),
       fakeGatewayFinalText("Second call done."),
-      fakeGatewayToolCall("select3", "mcp_select_tool", { name: "mcp_fixture_echo" }),
-      fakeGatewayToolCall("third", "mcp_fixture_echo", { text: "third" }),
+      fakeGatewayToolCall("select3", "toolbox", { open: "mcp_fixture_echo" }),
+      fakeGatewayToolCall("third", "toolbox", { run: "mcp_fixture_echo", arguments: { text: "third" } }),
       fakeGatewayFinalText("Third call done."),
     ], { models: [{ id: MODEL, type: "language", tags: ["tool-use"] }] });
     tui = await TmuxSession.create({
@@ -2343,8 +3288,8 @@ describe("MCP login", () => {
       FX_NO_OPEN_BROWSER: undefined, FX_TRACE_SCOPES: "mcp,keychain",
     };
     const call = (id: string, done: string) => [
-      fakeGatewayToolCall(`select_${id}`, "mcp_select_tool", { name: TOOL_NAME }),
-      fakeGatewayToolCall(`call_${id}`, TOOL_NAME, { text: id }),
+      fakeGatewayToolCall(`select_${id}`, "toolbox", { open: TOOL_NAME }),
+      fakeGatewayToolCall(`call_${id}`, "toolbox", { run: TOOL_NAME, arguments: { text: id } }),
       fakeGatewayFinalText(done),
     ];
     const models = [{ id: MODEL, type: "language", tags: ["tool-use"] }];
@@ -2409,6 +3354,91 @@ describe("MCP login", () => {
       unlinkSync(join(root.home, "Library", "Keychains"));
     }
   }, 150_000);
+
+  // Before, a Keychain read that hung past its budget when fx started left
+  // the server asking for a sign-in, though its login was saved. Now the
+  // store is read again when the server asks for one.
+  test.skipIf(process.platform !== "darwin")("a saved login the Keychain didn't give at the start is read again when the server asks for one", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    auth = startAuthFixture(upstream.url);
+    const root = createRoot(auth);
+    mkdirSync(join(root.home, "Library"), { recursive: true });
+    symlinkSync(join(homedir(), "Library", "Keychains"), join(root.home, "Library", "Keychains"), "dir");
+    const account = `${MCP_KEYCHAIN_ACCOUNT_PREFIX}${process.pid}-${randomUUID()}`;
+    const env = {
+      ...baseEnv(root), USER: account, FX_DISABLE_KEYCHAIN: undefined, DISPLAY: ":0", SSH_CONNECTION: undefined,
+      FX_NO_OPEN_BROWSER: undefined, FX_TRACE_SCOPES: "mcp,keychain",
+    };
+    let paused: number | null = null;
+    let watcher: { pid: Promise<number | null>; stop: () => void } | null = null;
+    try {
+      expectExit0(await runFx(["mcp", "login", "fixture"], { cwd: root.workspace, env, timeoutMs: 20_000 }));
+      expect(mcpKeychainItem("load", account, root.home)).toContain(ACCESS_INITIAL);
+      // The next fx's first Keychain read hangs, and fx cuts it at its budget.
+      watcher = pauseNextKeychainRead(account);
+      const showing = runFx(["mcp", "show", "fixture"], { cwd: root.workspace, env, timeoutMs: 40_000 });
+      paused = await watcher.pid;
+      expect(paused).not.toBeNull();
+      const shown = await showing;
+      expect(shown.stdout).toMatch(/status +ready/);
+      expect(shown.stdout).not.toContain("needs login");
+      expect(shown.code).toBe(0);
+      expect(auth.tokenExchanges).toBe(1);
+    } finally {
+      releaseProcess(paused);
+      watcher?.stop();
+      try { mcpKeychainItem("delete", account, root.home); } catch (err) { console.log(String(err)); }
+      // Only the link goes, never the Keychains it points at.
+      unlinkSync(join(root.home, "Library", "Keychains"));
+    }
+  }, 60_000);
+
+  // The login read again after a slow first Keychain read can still be
+  // refused, or the server can ask for more scopes: either way the server
+  // waits for a sign-in, as it does when the store was read at once.
+  for (const [what, refuse] of [
+    ["the server refuses", (fixture: AuthFixture) => fixture.validTokens.clear()],
+    ["the server asks more scopes of", (fixture: AuthFixture) => fixture.askForMoreScopes("tools.call")],
+  ] as const) {
+    test.skipIf(process.platform !== "darwin")(`a login read again after a slow Keychain that ${what} leaves the server needing a login`, async () => {
+      upstream = startModernMcpHttpFixture("json");
+      auth = startAuthFixture(upstream.url, { refreshAnswer: { status: 400, body: { error: "invalid_grant" } } });
+      const root = createRoot(auth);
+      mkdirSync(join(root.home, "Library"), { recursive: true });
+      symlinkSync(join(homedir(), "Library", "Keychains"), join(root.home, "Library", "Keychains"), "dir");
+      const account = `${MCP_KEYCHAIN_ACCOUNT_PREFIX}${process.pid}-${randomUUID()}`;
+      const env = {
+        ...baseEnv(root), USER: account, FX_DISABLE_KEYCHAIN: undefined, DISPLAY: ":0", SSH_CONNECTION: undefined,
+        FX_NO_OPEN_BROWSER: undefined, FX_TRACE_SCOPES: "mcp,keychain",
+      };
+      let paused: number | null = null;
+      let watcher: { pid: Promise<number | null>; stop: () => void } | null = null;
+      try {
+        expectExit0(await runFx(["mcp", "login", "fixture"], { cwd: root.workspace, env, timeoutMs: 20_000 }));
+        expect(mcpKeychainItem("load", account, root.home)).toContain(ACCESS_INITIAL);
+        refuse(auth);
+        // The next fx's first Keychain read hangs, and fx cuts it at its budget.
+        watcher = pauseNextKeychainRead(account);
+        const showing = runFx(["mcp", "show", "fixture"], { cwd: root.workspace, env, timeoutMs: 40_000 });
+        paused = await watcher.pid;
+        expect(paused).not.toBeNull();
+        const shown = await showing;
+        expect(shown.stdout).toMatch(/status +needs login/);
+        expect(shown.stdout).not.toMatch(/status +(ready|failed)/);
+        expect(auth.tokenExchanges).toBe(1);
+        // A step-up keeps the login for what it already had.
+        if (what === "the server asks more scopes of") {
+          expect(mcpKeychainItem("load", account, root.home)).toContain(ACCESS_INITIAL);
+        }
+      } finally {
+        releaseProcess(paused);
+        watcher?.stop();
+        try { mcpKeychainItem("delete", account, root.home); } catch (err) { console.log(String(err)); }
+        // Only the link goes, never the Keychains it points at.
+        unlinkSync(join(root.home, "Library", "Keychains"));
+      }
+    }, 60_000);
+  }
 
   test("a configured oauth.resource reaches the authorization server as written", async () => {
     upstream = startModernMcpHttpFixture("json");
@@ -2565,11 +3595,11 @@ describe("MCP login", () => {
     const listens = () => upstream!.requests.filter((request) => request.message.method === "subscriptions/listen");
     const calls = () => upstream!.requests.filter((request) => request.message.method === "tools/call");
     gateway = startFakeGateway([
-      fakeGatewayToolCall("select_first", "mcp_select_tool", { name: TOOL_NAME }),
-      fakeGatewayToolCall("call_first", TOOL_NAME, { text: "first" }),
+      fakeGatewayToolCall("select_first", "toolbox", { open: TOOL_NAME }),
+      fakeGatewayToolCall("call_first", "toolbox", { run: TOOL_NAME, arguments: { text: "first" } }),
       fakeGatewayFinalText("First call complete."),
-      fakeGatewayToolCall("select_second", "mcp_select_tool", { name: TOOL_NAME }),
-      fakeGatewayToolCall("call_second", TOOL_NAME, { text: "second" }),
+      fakeGatewayToolCall("select_second", "toolbox", { open: TOOL_NAME }),
+      fakeGatewayToolCall("call_second", "toolbox", { run: TOOL_NAME, arguments: { text: "second" } }),
       fakeGatewayFinalText("Second call complete."),
     ], { models: [{ id: MODEL, type: "language", tags: ["tool-use"] }] });
     tui = await TmuxSession.create({

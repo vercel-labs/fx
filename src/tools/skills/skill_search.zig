@@ -85,6 +85,8 @@ fn renderProjectedSearch(
     var identity_scratch_state = std.heap.ArenaAllocator.init(alloc);
     defer identity_scratch_state.deinit();
     const identity_scratch = identity_scratch_state.allocator();
+    var listed: std.ArrayList(skill_runtime.Skill) = .empty;
+    defer listed.deinit(alloc);
     var document_count: usize = 0;
     for (skills) |*skill| {
         if (!try tool_result_limits.modelProjectionPreservesText(identity_scratch, skill.name) or
@@ -92,6 +94,11 @@ fn renderProjectedSearch(
         {
             continue;
         }
+        // A copy of a skill already found gives the model nothing to choose
+        // between, so only the first in discovery order is, as the skill
+        // catalog and the toolbox menu list it.
+        if (skill_runtime.listsSameSkill(listed.items, skill.*)) continue;
+        try listed.append(alloc, skill.*);
         documents[document_count] = .{
             .identities = .{ skill.name, "" },
             .stable_key = skill.path,
@@ -233,6 +240,47 @@ test "skill search preserves projected identities and verbatim descriptions" {
     try std.testing.expect(std.mem.find(u8, output, "API_KEY=description-secret-value") != null);
     try std.testing.expect(std.mem.find(u8, output, "\"count\":2") != null);
     try std.testing.expect(std.mem.find(u8, output, "\"more_available\":false") != null);
+}
+
+test "skill search finds a skill copied into two folders once" {
+    const alloc = std.testing.allocator;
+    const skills = [_]skill_runtime.Skill{
+        .{ .name = "review", .description = "Review a change.", .path = "/workspace/.agents/skills/review", .source = .workspace_agents },
+        .{ .name = "review", .description = "Review a change.", .path = "/home/.fx/skills/review", .source = .global_fx },
+        .{ .name = "review", .description = "Review a pull request as an exam.", .path = "/home/.agents/skills/review", .source = .global_agents },
+    };
+    const query = try lexical_relevance.prepare("review");
+    var result = try renderProjectedSearch(
+        alloc,
+        .{ .query = &query, .kind = .skill, .limit = capability_retrieval.default_limit },
+        &skills,
+        (context_limits.Values{}).skill_description_bytes,
+        4096,
+    );
+    defer result.deinit(alloc);
+    const output = result.model_output;
+    try std.testing.expectEqual(@as(usize, 2), result.count);
+    try std.testing.expectEqual(@as(usize, 2), result.total_matches);
+    try std.testing.expect(std.mem.find(u8, output, "/workspace/.agents/skills/review") != null);
+    try std.testing.expect(std.mem.find(u8, output, "/home/.fx/skills/review") == null);
+    try std.testing.expect(std.mem.find(u8, output, "/home/.agents/skills/review") != null);
+}
+
+test "skill search keeps a description to 1 KiB, not the catalog's default characters" {
+    const alloc = std.testing.allocator;
+    const skills = [_]skill_runtime.Skill{
+        .{ .name = "long", .description = text_utils.repeat("x", 300), .path = "/skills/long/SKILL.md", .source = .workspace_fx },
+    };
+    const query = try lexical_relevance.prepare("");
+    var result = try renderProjectedSearch(
+        alloc,
+        .{ .query = &query, .kind = .skill, .limit = capability_retrieval.default_limit },
+        &skills,
+        (context_limits.Values{}).skill_description_bytes,
+        4096,
+    );
+    defer result.deinit(alloc);
+    try std.testing.expect(std.mem.find(u8, result.model_output, text_utils.repeat("x", 300)) != null);
 }
 
 test "skill search caps ranked entries and atomically omits byte overflow" {

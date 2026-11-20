@@ -1,6 +1,5 @@
 const std = @import("std");
 const testing_allocator = @import("../../core/shared/testing_allocator.zig");
-const lexical_relevance = @import("../../core/shared/lexical_relevance.zig");
 const result_store = @import("../../core/session/result_store.zig");
 const capability_retrieval = @import("../../core/tooling/capability_retrieval.zig");
 const tool_dispatch = @import("../../core/tooling/tool_dispatch.zig");
@@ -9,111 +8,17 @@ const tool_result_limits = @import("../../core/tooling/tool_result_limits.zig");
 const skill_search = @import("../skills/skill_search.zig");
 
 const Allocator = std.mem.Allocator;
-const Input = struct {
-    query: []u8,
-    prepared: lexical_relevance.PreparedQuery,
-    server: ?[]u8,
-
-    fn deinit(self: *Input, alloc: Allocator) void {
-        alloc.free(self.query);
-        if (self.server) |server| alloc.free(server);
-        self.* = undefined;
-    }
-
-    fn request(self: *const Input) capability_retrieval.Request {
-        return .{
-            .query = &self.prepared,
-            .kind = if (self.server == null) .all else .mcp,
-            .server = self.server,
-            .limit = capability_retrieval.default_limit,
-            .relevance_policy = .intent,
-        };
-    }
-};
-
-pub fn decode(
+/// Searches skills and MCP tools for `request`, as toolbox search answers.
+/// A request that loads schemas reports the MCP tools it loaded as selected
+/// for the next step.
+pub fn search(
     ctx: tool_dispatch.DispatchContext,
-    args_json: []const u8,
-) tool_dispatch.DispatchError!tool_dispatch.DecodeResult {
-    var parsed = std.json.parseFromSlice(std.json.Value, ctx.allocator, args_json, .{}) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => return failure(ctx.allocator, "capability_search arguments must be valid JSON"),
-    };
-    defer parsed.deinit();
-
-    if (parsed.value != .object) {
-        return failure(ctx.allocator, "capability_search arguments must be an object");
-    }
-    const query_value = parsed.value.object.get("query") orelse
-        return failure(ctx.allocator, "capability_search field \"query\" is required");
-    if (query_value != .string) {
-        return failure(ctx.allocator, "capability_search field \"query\" must be a string");
-    }
-    if (query_value.string.len == 0) {
-        return failure(ctx.allocator, "capability_search field \"query\" must not be empty");
-    }
-    if (query_value.string.len > lexical_relevance.max_query_bytes) {
-        return failure(ctx.allocator, "capability_search query must not exceed 4096 bytes");
-    }
-
-    const server_value = parsed.value.object.get("server");
-    if (server_value) |value| {
-        if (value != .string) {
-            return failure(ctx.allocator, "capability_search field \"server\" must be a string");
-        }
-        if (value.string.len == 0) {
-            return failure(ctx.allocator, "capability_search field \"server\" must not be empty");
-        }
-    }
-    const query = try ctx.allocator.dupe(u8, query_value.string);
-    errdefer ctx.allocator.free(query);
-    const prepared = lexical_relevance.prepare(query) catch |err| switch (err) {
-        error.QueryTooLong => unreachable,
-    };
-    const server = if (server_value) |value|
-        try ctx.allocator.dupe(u8, value.string)
-    else
-        null;
-    errdefer if (server) |owned| ctx.allocator.free(owned);
-    const input = try ctx.allocator.create(Input);
-    errdefer ctx.allocator.destroy(input);
-    input.* = .{
-        .query = query,
-        .prepared = prepared,
-        .server = server,
-    };
-    return .{ .input = .{ .ptr = input, .deinit_fn = inputDeinit } };
-}
-
-pub fn validate(
-    _: tool_dispatch.DispatchContext,
-    _: tool_dispatch.ToolInput,
-) tool_dispatch.DispatchError!?[]u8 {
-    return null;
-}
-
-pub fn presentation(args: std.json.ObjectMap) ?tool_dispatch.CallPresentation {
-    const server = args.get("server") orelse return null;
-    if (server != .string or server.string.len == 0) return null;
-    return .{
-        .activity_kind = .read,
-        .action_label = "Searching capabilities",
-        .completed_action_label = "Searched capabilities",
-        .label_arg_kind = .server,
-        .label_arg_default = "MCP server",
-    };
-}
-
-pub fn call(
-    ctx: tool_dispatch.DispatchContext,
-    erased: tool_dispatch.ToolInput,
+    request: capability_retrieval.Request,
 ) tool_dispatch.DispatchError!tool_dispatch.ToolResult {
-    const input = erased.as(Input);
     const output_cap = @min(
         ctx.max_tool_result_bytes,
         result_store.large_result_threshold_bytes,
     );
-    const request = input.request();
     const searches_skills = request.includes(.skill);
     const searches_mcp = request.includes(.mcp);
     const domain_cap = if (searches_skills and searches_mcp and output_cap > 512)
@@ -145,27 +50,7 @@ pub fn call(
         error.OutOfMemory => return error.OutOfMemory,
         else => return executionFailure(ctx.allocator, "combined", err),
     };
-    errdefer ctx.allocator.free(combined);
-    for (mcp_result.selected_tools) |selected| try tool_dispatch.reportSelectedDynamicTool(ctx, selected.name, selected.schema_json, selected.mcp_binding);
     return .{ .success = combined };
-}
-
-pub fn readsOnly(_: tool_dispatch.ToolInput) bool {
-    return true;
-}
-
-pub fn isIrreversible(_: tool_dispatch.ToolInput) bool {
-    return false;
-}
-
-fn inputDeinit(ptr: *anyopaque, alloc: Allocator) void {
-    const input: *Input = @ptrCast(@alignCast(ptr));
-    input.deinit(alloc);
-    alloc.destroy(input);
-}
-
-fn failure(alloc: Allocator, message: []const u8) Allocator.Error!tool_dispatch.DecodeResult {
-    return .{ .failure = try alloc.dupe(u8, message) };
 }
 
 fn executionFailure(
@@ -174,7 +59,7 @@ fn executionFailure(
     err: anyerror,
 ) Allocator.Error!tool_dispatch.ToolResult {
     return .{ .failure = try alloc.print(
-        "capability_search {s} search failed: {s}",
+        "The {s} search failed ({s}). Try it again, or open a skill or MCP server by name with toolbox.",
         .{ domain, @errorName(err) },
     ) };
 }
@@ -233,6 +118,9 @@ fn combineProjected(
         mcp_parsed.value.object.get("error"),
         mcp_parsed.value.object.get("context_limit"),
         mcp_parsed.value.object.get("unavailable"),
+        // Skills and MCP tools page apart, so only a search of MCP alone
+        // offers its next page.
+        if (skill_result == null) mcp_parsed.value.object.get("next_cursor") else null,
     ) catch |err| switch (err) {
         error.WriteFailed => return error.OutOfMemory,
         else => return err,
@@ -255,6 +143,8 @@ fn renderCombined(
     mcp_context_limit: ?std.json.Value,
     /// Servers a search that matched no tool couldn't look in, and why.
     mcp_unavailable: ?std.json.Value,
+    /// The MCP page's next_cursor, for a search of MCP alone.
+    mcp_next_cursor: ?std.json.Value,
 ) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
@@ -302,6 +192,10 @@ fn renderCombined(
         try out.writer.writeAll(",\"mcp_unavailable\":");
         try std.json.Stringify.value(value, .{}, &out.writer);
     }
+    if (mcp_next_cursor) |value| if (value == .string) {
+        try out.writer.writeAll(",\"next_cursor\":");
+        try std.json.Stringify.value(value, .{}, &out.writer);
+    };
     try out.writer.writeByte('}');
     return out.toOwnedSlice();
 }
@@ -310,74 +204,6 @@ fn objectNonNegativeCount(value: std.json.Value, field: []const u8) usize {
     const candidate = value.object.get(field) orelse return 0;
     if (candidate != .integer or candidate.integer < 0) return 0;
     return std.math.cast(usize, candidate.integer) orelse 0;
-}
-
-test "capability search decoder owns one bounded prepared query" {
-    const alloc = std.testing.allocator;
-    const decoded = try decode(.{ .allocator = alloc }, "{\"query\":\"send an email\"}");
-    switch (decoded) {
-        .failure => |message| {
-            defer alloc.free(message);
-            return error.TestUnexpectedResult;
-        },
-        .input => |input| {
-            defer input.deinit(alloc);
-            const value = input.as(Input);
-            try std.testing.expectEqualStrings("send an email", value.prepared.raw);
-            try std.testing.expectEqual(@as(usize, 3), value.prepared.token_count);
-        },
-    }
-}
-
-test "capability search decoder accepts optional exact server scope" {
-    const alloc = std.testing.allocator;
-    const decoded = try decode(
-        .{ .allocator = alloc },
-        "{\"query\":\"list production monitors\",\"server\":\"datadog\"}",
-    );
-    switch (decoded) {
-        .failure => |message| {
-            defer alloc.free(message);
-            return error.TestUnexpectedResult;
-        },
-        .input => |input| {
-            defer input.deinit(alloc);
-            const value = input.as(Input);
-            try std.testing.expectEqualStrings("list production monitors", value.query);
-            try std.testing.expectEqualStrings("datadog", value.server.?);
-            try std.testing.expectEqual(capability_retrieval.Kind.mcp, value.request().kind);
-        },
-    }
-}
-
-test "capability search decoder rejects a missing or empty task" {
-    const alloc = std.testing.allocator;
-    for ([_][]const u8{ "{}", "{\"query\":\"\"}" }) |args| {
-        const decoded = try decode(.{ .allocator = alloc }, args);
-        switch (decoded) {
-            .failure => |message| {
-                defer alloc.free(message);
-                try std.testing.expect(std.mem.find(u8, message, "query") != null);
-            },
-            .input => |input| {
-                input.deinit(alloc);
-                return error.TestUnexpectedResult;
-            },
-        }
-    }
-}
-
-test "capability search presents exact server scope" {
-    var parsed = try std.json.parseFromSlice(
-        std.json.Value,
-        std.testing.allocator,
-        "{\"server\":\"clerk\",\"query\":\"list sdk snippets\"}",
-        .{},
-    );
-    defer parsed.deinit();
-    const resolved = presentation(parsed.value.object).?;
-    try std.testing.expectEqual(tool_dispatch.LabelArgKind.server, resolved.label_arg_kind);
-    try std.testing.expectEqualStrings("clerk", tool_dispatch.presentationLabelValue(resolved, parsed.value.object).?);
 }
 
 test "capability search combines bounded skill and MCP results" {

@@ -4,7 +4,7 @@
 //   reflow_clear_guard_rows, viewport_clear_pending, replaceable_row,
 //   last_paint_bottom_reserved_rows, last_visible_transcript_*,
 //   last_viewport_selection, paint_trace, has_painted_transcript,
-//   resize_bottom_anchor_pending, footer_viewport, full_transcript
+//   footer_viewport, full_transcript
 // - notebook fields (`self.notebook.*`): transcript, entries,
 //   replaceable_last_line, replaceable_start, last_rendered_cols,
 //   folded_command_blocks
@@ -1987,10 +1987,6 @@ fn prepareTranscriptSurfacePaintInternal(
                     stable.flow_unchanged and
                     stable.visual_offset == stable.history_visual_offset and
                     source.tail_kind != .assistant_turn;
-                const resize_anchored_cancel_growth =
-                    !stable.flow_unchanged and
-                    self.resize_bottom_anchor_pending and
-                    source.tail_kind == .cancel_notice;
                 const repaint_required = self.render_requests.attemptHasInvalidations();
                 const invalidation_allows_preservation =
                     !repaint_required or
@@ -2002,6 +1998,12 @@ fn prepareTranscriptSurfacePaintInternal(
                     invalidation_allows_preservation and
                     next_offset < stable.history_visual_offset)
                 {
+                    // The rows above the floor are already in scrollback, so
+                    // the rows this leaves unused stay below the transcript.
+                    // Moving the projection down would put a blank band under
+                    // scrollback (`src/ui/resize_tests.zig` "question
+                    // cancellation after an earlier resize keeps the transcript
+                    // in place").
                     setSelectionVisualOffset(
                         &viewport_selection_snapshot,
                         prepared.sourceVisualRows(),
@@ -2019,15 +2021,6 @@ fn prepareTranscriptSurfacePaintInternal(
                         .{ stable.history_visual_offset, next_offset },
                     );
                 }
-                if (resize_anchored_cancel_growth and
-                    rows_budget > 0 and
-                    rows_budget < visible_rows)
-                {
-                    top_row += rows_budget;
-                    visible_rows -= rows_budget;
-                    prepared.projection_area.top = top_row;
-                    viewport_selection_snapshot.top_row = top_row;
-                }
                 if (invalidation_allows_preservation and
                     (!allow_projection_rebase or
                         exact_history_reflow or
@@ -2042,8 +2035,12 @@ fn prepareTranscriptSurfacePaintInternal(
                         viewport_selection_snapshot.partial_skip_rows = committed.partial_skip_rows;
                         const stable_occupied_rows =
                             stable.occupied_last_row -| stable.selection.top_row +| 1;
+                        // Only a cancel projection that already ends on the
+                        // body bottom is kept there. A repaint never moves a
+                        // higher one down, which would open a blank band
+                        // under scrollback.
                         const align_stable_cancel_to_bottom =
-                            (repaint_required or stable.occupied_last_row == bottom_row) and
+                            stable.occupied_last_row == bottom_row and
                             settled_history_reflow and
                             source.tail_kind == .cancel_notice and
                             stable_occupied_rows > 0 and

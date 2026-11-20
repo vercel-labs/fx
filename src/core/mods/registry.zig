@@ -24,7 +24,13 @@ pub const ArgumentCompletion = struct {
     /// The whole input it completes to, such as "/mcp show context7".
     full: []const u8,
     description: ?[]const u8 = null,
+    /// Selected, the whole row is drawn selected, its description included,
+    /// as the agent list draws its rows. Otherwise the description stays dim.
+    select_description: bool = false,
 };
+
+/// How many commands can take argument completions from the running app.
+const max_argument_groups = 2;
 
 pub fn CommandRegistry(comptime Command: type) type {
     return struct {
@@ -36,8 +42,9 @@ pub fn CommandRegistry(comptime Command: type) type {
         };
 
         commands: []const Command = &.{},
-        /// Argument completions the app supplies at run time, all for one command.
-        arguments: []const ArgumentCompletion = &.{},
+        /// Argument completions the app supplies at run time, one group per
+        /// command, such as `/mcp`'s and `/launch`'s. An empty group is unused.
+        argument_groups: [max_argument_groups][]const ArgumentCompletion = @splat(&.{}),
 
         pub fn lookup(self: Self, command: []const u8) ?*const Command {
             const matched = self.matchExact(command) orelse return null;
