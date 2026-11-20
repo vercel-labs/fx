@@ -83,6 +83,9 @@ jobs:
       - name: Model-check session titles and the model list under a shared sign-in
         run: TLA2TOOLS_JAR="$RUNNER_TEMP/tla2tools.jar" tests/tla/session_title/check.sh
 
+      - name: Model-check the compaction row's number
+        run: TLA2TOOLS_JAR="$RUNNER_TEMP/tla2tools.jar" tests/tla/compaction_progress/check.sh
+
       - name: Setup Bun
         uses: oven-sh/setup-bun@v2
         with:
@@ -93,6 +96,9 @@ jobs:
 
       - name: Walk the connection open hand-off along its model
         run: TLA2TOOLS_JAR="$RUNNER_TEMP/tla2tools.jar" bun tests/tla/drivers/gateway_open/driver.ts --self-check
+
+      - name: Walk the compaction row's number along its model
+        run: TLA2TOOLS_JAR="$RUNNER_TEMP/tla2tools.jar" bun tests/tla/drivers/compaction_progress/driver.ts --self-check
 
       - name: Check CLI shape
         run: python3 -m scripts.check_cli_shape

@@ -66,6 +66,8 @@ pub const CompactionActivityEffect = struct {
     settle: *const fn (ctx: *anyopaque, id: compaction_activity.OperationId, feedback: compaction_activity.Feedback) void,
     /// How much of the summary the model has written, from 1 to 99.
     written: ?*const fn (ctx: *anyopaque, id: compaction_activity.OperationId, percent: u8) void = null,
+    /// A summary request is about to be sent; the row counts its wait.
+    asked: ?*const fn (ctx: *anyopaque, id: compaction_activity.OperationId) void = null,
 };
 
 pub const ContextCompactionCommitEffect = struct {
