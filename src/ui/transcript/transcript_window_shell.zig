@@ -82,12 +82,12 @@ pub const Shell = struct {
     /// a finished block the log holds, and the current cycle starts at the
     /// first of them.
     pub fn resumed(self: *Shell, alloc: Allocator, entries: []const TranscriptEntry) !void {
+        self.reset(alloc);
         var ignored: std.ArrayList(u32) = .empty;
         defer ignored.deinit(alloc);
-        // `reset` keeps the capacity, so the appends below cannot fail.
+        // A failed reserve leaves the window empty, so the next sync reports the resumed entries again.
         try self.finished.ensureTotalCapacity(alloc, entries.len);
         try ignored.ensureTotalCapacity(alloc, entries.len);
-        self.reset(alloc);
         for (entries) |entry| {
             self.finished.appendAssumeCapacity(entry.id());
             self.seen_through = @max(self.seen_through, entry.id());
@@ -397,6 +397,56 @@ test "a failed allocation in a sync leaves the transcript window shell as it was
         try testing.expectEqualDeep(core.abstract(&state_before), core.abstract(&shell.state));
         try testing.expectEqualSlices(core.BlockId, state_before.live.items(), shell.state.live.items());
         try testing.expectEqual(@as(usize, 0), drops.items.len);
+    }
+    try testing.expect(induced_failures > 0);
+}
+
+test "a failed allocation in a resume leaves the transcript window shell empty" {
+    // A resume that fails leaves an empty window, so the next sync reports the
+    // resumed entries again.
+    var induced_failures: usize = 0;
+    var fail_after: usize = 0;
+    while (true) : (fail_after += 1) {
+        var failing = std.testing.FailingAllocator.init(testing_allocator.no_resize, .{});
+        const alloc = failing.allocator();
+        var shell = Shell.init(true);
+        defer shell.deinit(alloc);
+        var drops: std.ArrayList(u32) = .empty;
+        defer drops.deinit(alloc);
+        var entries: std.ArrayList(TranscriptEntry) = .empty;
+        defer entries.deinit(alloc);
+        try entries.appendSlice(alloc, &.{ user(1), rawEntry(2, .tool_status, false), rawEntry(3, .turn_summary, false) });
+        try shell.sync(alloc, entries.items, &drops);
+        try entries.appendSlice(alloc, &.{ user(4), rawEntry(5, .tool_status, true) });
+        try shell.compacted(alloc, entries.items, &drops);
+        try entries.append(alloc, notice(6));
+        entries.items[4] = rawEntry(5, .tool_status, false);
+        try entries.append(alloc, rawEntry(7, .turn_summary, false));
+        try shell.sync(alloc, entries.items, &drops);
+
+        var resumed_entries: std.ArrayList(TranscriptEntry) = .empty;
+        defer resumed_entries.deinit(alloc);
+        try resumed_entries.appendSlice(alloc, &.{ user(10), rawEntry(11, .tool_status, false), rawEntry(12, .turn_summary, false), notice(13) });
+        shell.finished.shrinkAndFree(alloc, shell.finished.items.len);
+
+        failing.fail_index = failing.alloc_index + fail_after;
+        const result = shell.resumed(alloc, resumed_entries.items);
+        const induced = failing.has_induced_failure;
+        failing.fail_index = std.math.maxInt(usize);
+        if (!induced) {
+            try result;
+            try testing.expectEqualSlices(u32, &.{ 10, 11, 12, 13 }, shell.finished.items);
+            try testing.expectEqual(@as(u32, 13), shell.seen_through);
+            break;
+        }
+        induced_failures += 1;
+        try testing.expectError(error.OutOfMemory, result);
+        try testing.expectEqual(@as(usize, 0), shell.finished.items.len);
+        try testing.expectEqual(@as(usize, 0), shell.pending_drops.items.len);
+        try testing.expectEqual(@as(u32, 0), shell.seen_through);
+        try testing.expectEqual(@as(core.Seq, 0), shell.base);
+        try shell.sync(alloc, resumed_entries.items, &drops);
+        try testing.expectEqualSlices(u32, &.{ 10, 11, 12, 13 }, shell.finished.items);
     }
     try testing.expect(induced_failures > 0);
 }
