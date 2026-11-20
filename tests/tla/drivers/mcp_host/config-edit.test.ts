@@ -311,9 +311,10 @@ test("fault: twenty fx processes adding at once each keep their entry, and the e
 }, 240_000);
 
 // How many adds a kill must end for the test to say anything about a kill mid-add, and how many adds it may make
-// to get there.
+// to get there. Under 16 busy loops on 8 CPUs it took 40 to 98 adds to end 5, so the limit leaves room for a runner
+// that is slower still.
 const KILLS_AT_LEAST = 5;
-const ADDS_AT_MOST = 120;
+const ADDS_AT_MOST = 240;
 
 test("crash: a kill at any moment of an add leaves the profile as it was or as the add made it, and the next fx takes the lock", async () => {
   const s = new Scenario("config-edit-crash", { st: "ok", ent: { a: "ok" } }, NONE);
