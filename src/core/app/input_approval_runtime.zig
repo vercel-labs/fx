@@ -19,6 +19,7 @@ const interaction_state = @import("../../ui/footer/interaction_state.zig");
 const approval_prompt = @import("../permissions/approval_prompt.zig");
 const render_request = @import("../../ui/render_request.zig");
 const text_utils = @import("../shared/text_utils.zig");
+const app_worker_runtime = @import("app_worker_runtime.zig");
 
 const ToolPermissionDecision = types.ToolPermissionDecision;
 
@@ -371,7 +372,7 @@ pub fn ApprovalRuntime(comptime App: type) type {
             app.input_runtime.input_limit_rejection = input_limit_rejection.clear();
 
             if (!already_cancelled and agent.stream.active) {
-                app.pacer.clear(app.alloc);
+                app_worker_runtime.Runtime(App).clearPacer(app, agent, "cancel_approval");
                 app.stopStream(agent);
             }
             requestActiveSurfaceFrame(app);
