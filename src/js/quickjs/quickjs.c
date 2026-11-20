@@ -48298,6 +48298,19 @@ static int to_utf32_buf(JSContext *ctx, JSString *p, uint32_t **pbuf)
     return j;
 }
 
+/* fx: DynBufReallocFunc wrappers for unicode_normalize. Calling js_realloc
+   and js_realloc_rt through a DynBufReallocFunc pointer fails the
+   function-type check that fx builds this file with. */
+static void *fx_dbuf_realloc_ctx(void *opaque, void *ptr, size_t size)
+{
+    return js_realloc(opaque, ptr, size);
+}
+
+static void *fx_dbuf_realloc_rt(void *opaque, void *ptr, size_t size)
+{
+    return js_realloc_rt(opaque, ptr, size);
+}
+
 static JSValue js_string_localeCompare(JSContext *ctx, JSValueConst this_val,
                                        int argc, JSValueConst *argv)
 {
@@ -48327,7 +48340,7 @@ static JSValue js_string_localeCompare(JSContext *ctx, JSValueConst this_val,
 
     // TODO(bnoordhuis) skip normalization when input is latin1
     an = unicode_normalize(&ts, as, an, UNICODE_NFC, ctx,
-                           (DynBufReallocFunc *)js_realloc);
+                           fx_dbuf_realloc_ctx);
     if (an == -1)
         goto exception;
     js_free(ctx, as);
@@ -48335,7 +48348,7 @@ static JSValue js_string_localeCompare(JSContext *ctx, JSValueConst this_val,
 
     // TODO(bnoordhuis) skip normalization when input is latin1
     bn = unicode_normalize(&ts, bs, bn, UNICODE_NFC, ctx,
-                           (DynBufReallocFunc *)js_realloc);
+                           fx_dbuf_realloc_ctx);
     if (bn == -1)
         goto exception;
     js_free(ctx, bs);
@@ -48477,7 +48490,7 @@ static JSValue js_string_normalize(JSContext *ctx, JSValueConst this_val,
     }
 
     out_len = unicode_normalize(&out_buf, buf, buf_len, n_type,
-                                ctx->rt, (DynBufReallocFunc *)js_realloc_rt);
+                                ctx->rt, fx_dbuf_realloc_rt);
     js_free(ctx, buf);
     if (out_len < 0)
         return JS_EXCEPTION;
