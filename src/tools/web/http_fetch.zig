@@ -666,9 +666,9 @@ fn readResponse(
     errdefer body.deinit(alloc);
     const pending_body = received.items[final_head_end..];
     switch (framing) {
-        .no_body => {
-            if (pending_body.len > 0) return error.UnexpectedBodyForBodylessResponse;
-        },
+        // A 204 or 304 ends at its head (RFC 9112 section 6.3). Like bytes after a framed
+        // body, later bytes belong to no response, since each connection carries one request.
+        .no_body => {},
         .chunked => {
             var chunk_reader = BodyReader.init(reader, pending_body, options);
             try readChunkedBody(&chunk_reader, &body, alloc, cap);
@@ -1308,9 +1308,13 @@ fn addressToPosix(address: IpAddress, storage: *PosixAddress) posix.socklen_t {
     };
 }
 
+/// A socket for one fetch, close-on-exec and non-blocking from the moment it
+/// exists where `socket` takes those flags, as std's own sockets are. macOS
+/// takes neither, so there `fcntl` sets both right after it opens.
 fn openSocket(family: posix.sa_family_t) !posix.fd_t {
+    const flags: u32 = posix.SOCK.STREAM | if (std.Io.Threaded.socket_flags_unsupported) 0 else posix.SOCK.CLOEXEC | posix.SOCK.NONBLOCK;
     const fd = while (true) {
-        const rc = posix.system.socket(family, posix.SOCK.STREAM, 0);
+        const rc = posix.system.socket(family, flags, 0);
         switch (posix.errno(rc)) {
             .SUCCESS => break @as(posix.fd_t, @intCast(rc)),
             .INTR => continue,
@@ -1322,8 +1326,10 @@ fn openSocket(family: posix.sa_family_t) !posix.fd_t {
         }
     };
     errdefer closeFd(fd);
-    try setCloexec(fd);
-    try setNonblocking(fd);
+    if (std.Io.Threaded.socket_flags_unsupported) {
+        try setCloexec(fd);
+        try setNonblocking(fd);
+    }
     return fd;
 }
 
@@ -1908,7 +1914,7 @@ test "web_fetch transfer encoding parser validates ordered coding members" {
     );
 }
 
-test "web_fetch bodyless response framing ignores fields and rejects pending body" {
+test "web_fetch bodyless response framing ignores fields" {
     try expectResponseBody(
         "HTTP/1.1 204 No Content\r\nTransfer-Encoding: gzip\r\nContent-Length: 99\r\n\r\n",
         204,
@@ -1919,10 +1925,26 @@ test "web_fetch bodyless response framing ignores fields and rejects pending bod
         304,
         "",
     );
-    try expectResponseError(
-        error.UnexpectedBodyForBodylessResponse,
-        "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\nunexpected",
-    );
+}
+
+test "web_fetch bodyless response ends at its head however the bytes after it are split" {
+    const alloc = std.testing.allocator;
+    const cases = [_]struct { head: []const u8, status: u16 }{
+        .{ .head = "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n", .status = 204 },
+        .{ .head = "HTTP/1.1 304 Not Modified\r\n\r\n", .status = 304 },
+    };
+    for (cases) |case| {
+        const wire = try alloc.print("{s}unexpected", .{case.head});
+        defer alloc.free(wire);
+        const whole = [_]usize{wire.len};
+        const at_head = [_]usize{ case.head.len, wire.len };
+        for ([_][]const usize{ &whole, &at_head }) |splits| {
+            var response = try readFuzzResponse(alloc, wire, splits, max_body_bytes);
+            defer response.deinit(alloc);
+            try std.testing.expectEqual(case.status, @backingInt(response.status));
+            try std.testing.expectEqualStrings("", response.body);
+        }
+    }
 }
 
 test "web_fetch response parser consumes informational heads before final response" {
@@ -3875,6 +3897,23 @@ test "web_fetch deadline adapters retain invalid descriptor causes" {
     try writer.interface.writeAll("x");
     try std.testing.expectError(error.WriteFailed, writer.interface.flush());
     try std.testing.expectEqual(error.InvalidDescriptor, writer.err.?);
+}
+
+test "web_fetch sockets are close-on-exec and non-blocking from the start" {
+    for ([_]posix.sa_family_t{ posix.AF.INET, posix.AF.INET6 }) |family| {
+        const fd = openSocket(family) catch |err| switch (err) {
+            error.AddressFamilyUnsupported => continue,
+            else => return err,
+        };
+        defer closeFd(fd);
+        const fd_flags = posix.system.fcntl(fd, posix.F.GETFD, @as(usize, 0));
+        try std.testing.expect(fd_flags >= 0);
+        try std.testing.expect(@as(usize, @intCast(fd_flags)) & posix.FD_CLOEXEC != 0);
+        const status = posix.system.fcntl(fd, posix.F.GETFL, @as(usize, 0));
+        try std.testing.expect(status >= 0);
+        const nonblock: usize = @as(usize, 1) << @bitOffsetOf(posix.O, "NONBLOCK");
+        try std.testing.expect(@as(usize, @intCast(status)) & nonblock != 0);
+    }
 }
 
 test "web_fetch closed peer write returns a cause without terminating process" {

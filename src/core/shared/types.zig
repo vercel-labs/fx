@@ -42,6 +42,9 @@ pub const SemanticNotice = struct {
     tone: NoticeTone,
     body: []const u8,
     visibility: NoticeVisibility = .compact_and_full,
+    /// An optional dim line under the body, indented like a wrapped body row
+    /// and without its own glyph.
+    detail: []const u8 = "",
 };
 
 /// Status glyph leading every semantic notice, keyed by tone. Tool activity
@@ -59,22 +62,26 @@ pub fn noticeGlyph(tone: NoticeTone) []const u8 {
     };
 }
 
-/// Returns a duplicate with owned topic and body bytes. The caller frees it
+/// Returns a duplicate with owned topic, body, and detail bytes. The caller frees it
 /// with `freeSemanticNotice` using the same allocator.
 pub fn dupeSemanticNotice(alloc: std.mem.Allocator, notice: SemanticNotice) std.mem.Allocator.Error!SemanticNotice {
     const topic = try alloc.dupe(u8, notice.topic);
     errdefer alloc.free(topic);
+    const body = try alloc.dupe(u8, notice.body);
+    errdefer alloc.free(body);
     return .{
         .topic = topic,
         .tone = notice.tone,
-        .body = try alloc.dupe(u8, notice.body),
+        .body = body,
         .visibility = notice.visibility,
+        .detail = try alloc.dupe(u8, notice.detail),
     };
 }
 
 pub fn freeSemanticNotice(alloc: std.mem.Allocator, notice: SemanticNotice) void {
     alloc.free(notice.topic);
     alloc.free(notice.body);
+    alloc.free(notice.detail);
 }
 
 /// Converts legacy context-notice text into a semantic notice body while
@@ -297,9 +304,10 @@ pub const StreamState = struct {
     /// When the turn started; 0 hides the elapsed counter and activity blink.
     /// Monotonic for the whole turn: phase and tool boundaries never reset it.
     turn_started_ms: i64 = 0,
-    /// When fx started waiting on user input (approval or question); 0 means
-    /// not waiting. While set, the turn clock freezes at this instant;
-    /// on resume the wait is excluded by shifting turn_started_ms forward.
+    /// When the turn started waiting, on user input (approval or question)
+    /// or on a compaction; 0 means not waiting. While set, the turn clock
+    /// freezes at this instant; on resume the wait is excluded by shifting
+    /// turn_started_ms forward.
     waiting_since_ms: i64 = 0,
 };
 
@@ -434,6 +442,10 @@ pub fn plainErrorText(raw: []const u8, buf: []u8) []const u8 {
         .{ "MalformedOpenAICodexSseEvent", "unreadable reply" },
         .{ "MalformedXaiGrokSseEvent", "unreadable reply" },
         .{ "MalformedChatCompletionsChunk", "unreadable reply" },
+        .{ "InvalidResponsesEvent", "unreadable reply" },
+        .{ "MalformedResponsesEvent", "unreadable reply" },
+        .{ "MalformedMessagesEvent", "unreadable reply" },
+        .{ "ResponsesEventTooLarge", "reply too large to read" },
         .{ "InvalidProviderFinishReason", "unreadable reply" },
         .{ "GatewaySseEventTooLarge", "reply too large to read" },
         .{ "OpenAICodexSseEventTooLarge", "reply too large to read" },
@@ -1364,6 +1376,19 @@ pub const ToolResultMemory = struct {
     command_output_replay: ?CommandOutputReplay = null,
     command_process_presentation: ?CommandProcessPresentation = null,
     terminal_action_presentation: ?TerminalActionPresentation = null,
+    /// Set on a running shell result whose wait ended when its command
+    /// crossed the quiet limit (`src/core/execution/quiet_notice.zig`), for
+    /// the note fx relays to a subagent's parent. Only the tool's end event
+    /// reads it; the session never saves it.
+    quiet_crossing: ?QuietCrossing = null,
+};
+
+/// A shell command that crossed the quiet limit during a wait: its command
+/// line and how long it had printed nothing. Each quiet spell crosses once
+/// (`tests/tla/subagent/QuietRelay.tla`).
+pub const QuietCrossing = struct {
+    command: []const u8,
+    quiet_ms: u64,
 };
 
 pub const ToolExecutionStep = struct {
@@ -1498,6 +1523,79 @@ pub fn freeModelCallRecords(alloc: std.mem.Allocator, records: []const ModelCall
     alloc.free(records);
 }
 
+/// How a call a command made through `fx mcp call` ended.
+pub const BridgeCallOutcome = enum {
+    completed,
+    failed,
+    cancelled,
+
+    pub fn toolOutcome(self: BridgeCallOutcome) ToolOutcomeKind {
+        return switch (self) {
+            .completed => .completed,
+            .failed => .failed,
+            .cancelled => .cancelled,
+        };
+    }
+};
+
+/// A call a command made through `fx mcp call`, which the TUI showed as a
+/// row in its shell call's group. The session keeps it so a resume shows
+/// that row again: the tool's name and how the call ended, never its
+/// arguments or its result. Display data, never sent to the model.
+pub const BridgeCallRecord = struct {
+    /// The shell call whose command made the call.
+    call_id: []const u8,
+    /// The bridge's id for the call.
+    request_id: []const u8,
+    tool: []const u8,
+    outcome: BridgeCallOutcome,
+};
+
+/// Whether a record may be saved and shown: each string short, valid UTF-8
+/// and free of control characters, as a model call record's are
+/// (`validModelCallText`).
+pub fn validBridgeCallRecord(record: BridgeCallRecord) bool {
+    inline for (.{ record.call_id, record.request_id, record.tool }) |text| {
+        if (!validModelCallText(text)) return false;
+    }
+    return true;
+}
+
+/// Caller owns the copy's strings; free them with `freeBridgeCallRecordStrings`.
+pub fn dupeBridgeCallRecord(alloc: std.mem.Allocator, record: BridgeCallRecord) !BridgeCallRecord {
+    const call_id = try alloc.dupe(u8, record.call_id);
+    errdefer alloc.free(call_id);
+    const request_id = try alloc.dupe(u8, record.request_id);
+    errdefer alloc.free(request_id);
+    return .{ .call_id = call_id, .request_id = request_id, .tool = try alloc.dupe(u8, record.tool), .outcome = record.outcome };
+}
+
+pub fn freeBridgeCallRecordStrings(alloc: std.mem.Allocator, record: BridgeCallRecord) void {
+    alloc.free(record.call_id);
+    alloc.free(record.request_id);
+    alloc.free(record.tool);
+}
+
+/// Caller owns the copy; free it with `freeBridgeCallRecords`.
+pub fn dupeBridgeCallRecords(alloc: std.mem.Allocator, records: []const BridgeCallRecord) ![]BridgeCallRecord {
+    const copies = try alloc.alloc(BridgeCallRecord, records.len);
+    var done: usize = 0;
+    errdefer {
+        for (copies[0..done]) |copy| freeBridgeCallRecordStrings(alloc, copy);
+        alloc.free(copies);
+    }
+    for (records, copies) |record, *copy| {
+        copy.* = try dupeBridgeCallRecord(alloc, record);
+        done += 1;
+    }
+    return copies;
+}
+
+pub fn freeBridgeCallRecords(alloc: std.mem.Allocator, records: []const BridgeCallRecord) void {
+    for (records) |record| freeBridgeCallRecordStrings(alloc, record);
+    alloc.free(records);
+}
+
 pub const SteeringDelivery = enum(u8) { queued, applied, not_applied };
 
 pub const FileEvidence = struct {
@@ -1528,6 +1626,11 @@ pub const ExecutionMemory = struct {
     /// The turn's settled model calls, in order, for Ctrl+O. Display data:
     /// never part of what the model is sent.
     model_calls: []ModelCallRecord = &.{},
+    /// The calls the turn's commands made through `fx mcp call`, in the
+    /// order they ended, each naming its shell call. Only a resumed turn
+    /// holds them, for the rows its replay shows; display data, never part
+    /// of what the model is sent.
+    bridge_calls: []BridgeCallRecord = &.{},
 
     pub fn isEmpty(self: ExecutionMemory) bool {
         return self.tool_steps.len == 0 and self.files.len == 0 and self.steering.len == 0 and self.context_notes.len == 0;
@@ -1614,6 +1717,10 @@ pub fn dupeToolResultMemory(alloc: std.mem.Allocator, memory: ToolResultMemory) 
     else
         null;
     errdefer if (command_output_replay) |replay| freeCommandOutputReplay(alloc, replay);
+    const quiet_crossing: ?QuietCrossing = if (memory.quiet_crossing) |crossing|
+        .{ .command = try alloc.dupe(u8, crossing.command), .quiet_ms = crossing.quiet_ms }
+    else
+        null;
     return .{
         .review_feedback = memory.review_feedback,
         .tool_images = tool_images,
@@ -1628,6 +1735,7 @@ pub fn dupeToolResultMemory(alloc: std.mem.Allocator, memory: ToolResultMemory) 
         .command_output_replay = command_output_replay,
         .command_process_presentation = memory.command_process_presentation,
         .terminal_action_presentation = memory.terminal_action_presentation,
+        .quiet_crossing = quiet_crossing,
     };
 }
 
@@ -1640,6 +1748,7 @@ pub fn freeToolResultMemory(alloc: std.mem.Allocator, memory: ToolResultMemory) 
     if (memory.preview) |value| alloc.free(value);
     if (memory.committed_file_presentation) |presentation| freeCommittedFilePresentation(alloc, presentation);
     if (memory.command_output_replay) |replay| freeCommandOutputReplay(alloc, replay);
+    if (memory.quiet_crossing) |crossing| alloc.free(crossing.command);
 }
 
 test "dupeToolResultMemory copies survive teardown of every source allocation" {
@@ -1825,10 +1934,11 @@ pub const ChatMessage = struct {
     permission_feedback: bool = false,
     /// Checkpoint steering text has already had its envelope removed.
     restored_steering: bool = false,
-    /// A prompt fx sent on its own to a turn that stopped without a final
-    /// answer, as plain user text. A save of the turn keeps it in the
+    /// A message fx sent the model on its own, as plain user text: a prompt
+    /// to a turn that stopped without a final answer, a tool's notice, or a
+    /// Stop hook's message to continue. A save of the turn keeps it in the
     /// steering list inside a marker (`recovery_prompt.saved`), and a
-    /// restored one comes back with this flag and the bare prompt.
+    /// restored one comes back with this flag and the bare text.
     recovery_prompt: bool = false,
     /// A `.system` message fx added after the conversation started, which
     /// only the messages lane carries (D93). Plain text content only.
@@ -1995,6 +2105,34 @@ pub const ProviderFinishRaw = struct {
     }
 };
 
+/// Gemini's stop reason for a function call it could not write, which the AI
+/// SDK reports as the finish `error`.
+pub const malformed_function_call_reason = "MALFORMED_FUNCTION_CALL";
+
+/// Whether a reply ended because the provider could not read the model's tool
+/// call. The reply's calls never ran, and the same request can fail the same
+/// way, so fx gives the model feedback instead of a plain resend.
+pub fn isMalformedToolCallFinish(
+    finish_reason: ?ProviderFinishReason,
+    finish_reason_raw: ProviderFinishRaw,
+) bool {
+    const reason = finish_reason orelse return false;
+    return reason == .provider_error and
+        std.mem.eql(u8, finish_reason_raw.slice(), malformed_function_call_reason);
+}
+
+test "only a provider error named MALFORMED_FUNCTION_CALL is a malformed tool call" {
+    const malformed = ProviderFinishRaw.init("MALFORMED_FUNCTION_CALL");
+    try std.testing.expect(isMalformedToolCallFinish(.provider_error, malformed));
+    try std.testing.expect(!isMalformedToolCallFinish(.other, malformed));
+    try std.testing.expect(!isMalformedToolCallFinish(.stop, malformed));
+    try std.testing.expect(!isMalformedToolCallFinish(null, malformed));
+    try std.testing.expect(!isMalformedToolCallFinish(.provider_error, ProviderFinishRaw.init("provider_error")));
+    try std.testing.expect(!isMalformedToolCallFinish(.provider_error, ProviderFinishRaw.init("malformed_function_call")));
+    try std.testing.expect(!isMalformedToolCallFinish(.provider_error, ProviderFinishRaw.init("MALFORMED_FUNCTION_CALL_X")));
+    try std.testing.expect(!isMalformedToolCallFinish(.provider_error, ProviderFinishRaw.init("")));
+}
+
 test "provider finish raw keeps a bounded printable copy" {
     try std.testing.expectEqualStrings("UNEXPECTED_TOOL_CALL", ProviderFinishRaw.init("UNEXPECTED_TOOL_CALL").slice());
     try std.testing.expectEqualStrings("", ProviderFinishRaw.init("").slice());
@@ -2014,12 +2152,20 @@ fn fuzzProviderFinishRaw(_: void, smith: *std.testing.Smith) anyerror!void {
         try std.testing.expect(byte >= 0x21 and byte <= 0x7e);
         try std.testing.expectEqual(if (source >= 0x21 and source <= 0x7e) source else '?', byte);
     }
+    // Only the exact reason marks a malformed tool call: a longer one cut to
+    // the capacity, or one whose unprintable bytes became '?', does not.
+    try std.testing.expectEqual(
+        std.mem.eql(u8, input, malformed_function_call_reason),
+        isMalformedToolCallFinish(.provider_error, raw),
+    );
+    try std.testing.expect(!isMalformedToolCallFinish(.other, raw));
 }
 
 test "fuzz provider finish raw" {
     try std.testing.fuzz({}, fuzzProviderFinishRaw, .{
         .corpus = &(@import("fuzz_seed").slices(.{
             "UNEXPECTED_TOOL_CALL",
+            "MALFORMED_FUNCTION_CALL",
             "",
             "BAD\x07REASON",
             "\xc3\xa9 \x00\xff",
@@ -2115,6 +2261,57 @@ pub fn validGatewayTeam(team: []const u8) bool {
         else => return false,
     };
     return true;
+}
+
+/// The name fx shows for a Vercel team: the slug when it is a valid team
+/// name, else the id when it is, else none. A saved login's slug is not
+/// checked when it loads, so the refused-login notice, the status view's team
+/// (`displayTeam` in `auth_runtime.zig`), and the usage label name a team
+/// through here.
+pub fn displayGatewayTeam(slug: ?[]const u8, id: ?[]const u8) ?[]const u8 {
+    if (slug) |value| if (validGatewayTeam(value)) return value;
+    if (id) |value| if (validGatewayTeam(value)) return value;
+    return null;
+}
+
+test "displayGatewayTeam shows only a valid team name" {
+    try std.testing.expectEqualStrings("vercel-labs", displayGatewayTeam("vercel-labs", "team_123").?);
+    try std.testing.expectEqualStrings("team_123", displayGatewayTeam("\x1b]2;title\x07\x1b[2J", "team_123").?);
+    try std.testing.expectEqualStrings("team_123", displayGatewayTeam("", "team_123").?);
+    try std.testing.expectEqualStrings("team_123", displayGatewayTeam(null, "team_123").?);
+    try std.testing.expectEqualStrings("team_123", displayGatewayTeam("\xe2\x80\xaeslug", "team_123").?);
+    try std.testing.expect(displayGatewayTeam("bad slug", "team a") == null);
+    try std.testing.expect(displayGatewayTeam(null, null) == null);
+    const longest = text_utils.repeat("a", 128);
+    try std.testing.expectEqualStrings(longest, displayGatewayTeam(longest, "team_123").?);
+    try std.testing.expectEqualStrings("team_123", displayGatewayTeam(text_utils.repeat("a", 129), "team_123").?);
+}
+
+fn fuzzDisplayGatewayTeam(_: void, smith: *std.testing.Smith) anyerror!void {
+    var slug_buffer: [192]u8 = undefined;
+    const slug_len: usize = @intCast(smith.slice(&slug_buffer));
+    var id_buffer: [192]u8 = undefined;
+    const id_len: usize = @intCast(smith.slice(&id_buffer));
+    const slug = slug_buffer[0..slug_len];
+    const id = id_buffer[0..id_len];
+    const shown = displayGatewayTeam(slug, id) orelse {
+        try std.testing.expect(!validGatewayTeam(slug) and !validGatewayTeam(id));
+        return;
+    };
+    try std.testing.expect(validGatewayTeam(shown));
+    try std.testing.expect(shown.ptr == slug.ptr or shown.ptr == id.ptr);
+    for (shown) |byte| try std.testing.expect(byte >= 0x21 and byte <= 0x7e);
+}
+
+test "fuzzed team slugs and ids show only a valid team name" {
+    try std.testing.fuzz({}, fuzzDisplayGatewayTeam, .{
+        .corpus = &(@import("fuzz_seed").slices(.{
+            "vercel-labs",
+            "",
+            "\x1b]2;title\x07\x1b[2J",
+            "\xe2\x80\xaeslug",
+        }) ++ @import("fuzz_corpus").gateway_team_display.*),
+    });
 }
 
 pub fn validCredentialAccountId(account_id: []const u8) bool {
@@ -2634,6 +2831,10 @@ pub const FinishedPrompt = struct {
     terminal_projection: FinishedPromptProjection = .history_default,
     terminal_outcome: ?TurnPresentationOutcome = null,
     snapshot_file_ownership: ?SnapshotFileOwnership = null,
+    /// The workspace capture token of this turn (D98), set by the app as
+    /// the turn's end capture is taken, so the commit writes only this
+    /// turn's captures however late it runs; 0 when it has none.
+    capture_turn: u64 = 0,
 };
 
 pub const PermissionMode = enum {
@@ -2853,6 +3054,10 @@ pub const QuestionOption = struct {
 
 pub const QuestionBatchEntry = struct {
     question: []const u8,
+    /// The question and the option descriptions are Markdown and may have
+    /// several lines, as `ask_user_question` sends them. Other prompts show
+    /// their text as written.
+    markdown: bool = false,
     options: []const QuestionOption,
     /// Submission prompts return JSON {"value": string} or {"option": index},
     /// keeping typed text distinct from action labels such as Decline.
@@ -3027,6 +3232,7 @@ pub fn dupeFinishedPrompt(alloc: std.mem.Allocator, finished: FinishedPrompt) !F
         .terminal_projection = finished.terminal_projection,
         .terminal_outcome = finished.terminal_outcome,
         .snapshot_file_ownership = finished.snapshot_file_ownership,
+        .capture_turn = finished.capture_turn,
     };
 }
 
@@ -3068,6 +3274,8 @@ pub fn dupeExecutionMemory(alloc: std.mem.Allocator, memory: ExecutionMemory) !E
     const runtime_context = if (memory.runtime_context) |texts| try dupeRuntimeContext(alloc, texts) else null;
     errdefer if (runtime_context) |texts| freeRuntimeContext(alloc, texts);
     const model_calls = try dupeModelCallRecords(alloc, memory.model_calls);
+    errdefer freeModelCallRecords(alloc, model_calls);
+    const bridge_calls = try dupeBridgeCallRecords(alloc, memory.bridge_calls);
     return .{
         .tool_steps = tool_steps,
         .files = files,
@@ -3076,10 +3284,12 @@ pub fn dupeExecutionMemory(alloc: std.mem.Allocator, memory: ExecutionMemory) !E
         .runtime_context = runtime_context,
         .turn_summary = memory.turn_summary,
         .model_calls = model_calls,
+        .bridge_calls = bridge_calls,
     };
 }
 
 pub fn freeExecutionMemory(alloc: std.mem.Allocator, memory: ExecutionMemory) void {
+    freeBridgeCallRecords(alloc, memory.bridge_calls);
     freeModelCallRecords(alloc, memory.model_calls);
     freeToolExecutionSteps(alloc, memory.tool_steps);
     freeFileEvidenceSlice(alloc, memory.files);

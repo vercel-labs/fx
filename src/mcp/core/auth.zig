@@ -92,7 +92,7 @@ pub const Gate = struct {
     entries: [max_requests]Entry = undefined,
     count: usize = 0,
 
-    fn token(g: *const Gate) u32 {
+    pub fn token(g: *const Gate) u32 {
         return if (g.held) g.gen else 0;
     }
 

@@ -2,10 +2,11 @@
 \* Small constants for TLC. agents-menu.cfg: two instances, the first with
 \* two subagents and the second with one, one subagent open at the start.
 \* agents-menu-three.cfg: three instances, so a closed instance gives way to
-\* the next one in launch order, wrapping. agents-menu-drive.cfg: the world
+\* the next one in launch order, wrapping. Both have the environment and the
+\* person's searches. agents-menu-drive.cfg: the world
 \* tests/tla/drivers/agents_menu/spec-to-binary.ts starts, two instances and
-\* the first's subagents alpha and beta, with only the person's steps, whose
-\* state graph the driver walks on the binary.
+\* the first's subagents alpha and beta, with only the person's steps and no
+\* search, whose state graph the driver walks on the binary.
 EXTENDS AgentsMenu
 
 MCInstanceOrder == <<"i1", "i2">>

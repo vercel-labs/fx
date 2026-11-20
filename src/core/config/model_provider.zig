@@ -50,9 +50,12 @@ pub const ProviderId = union(enum) {
         );
     }
 
-    pub fn bind(self: ProviderId, registry: configured_provider.Registry) error{ UnknownConfiguredProvider, ConfiguredProviderChanged }!ProviderId {
+    /// A name from a flag or settings that has no definition is unknown; a
+    /// saved session's bound name whose definition is gone was removed.
+    pub fn bind(self: ProviderId, registry: configured_provider.Registry) error{ UnknownConfiguredProvider, ConfiguredProviderChanged, ConfiguredProviderRemoved }!ProviderId {
         if (self != .configured) return self;
-        const definition = registry.get(self.label()) orelse return error.UnknownConfiguredProvider;
+        const definition = registry.get(self.label()) orelse
+            return if (self.configured.binding != null) error.ConfiguredProviderRemoved else error.UnknownConfiguredProvider;
         const binding = definition.binding_identity();
         if (self.configured.binding) |expected| {
             if (!std.mem.eql(u8, &binding, &expected)) return error.ConfiguredProviderChanged;
@@ -171,7 +174,10 @@ test "configured provider identity serializes its binding and rejects rebinding"
     var changed = bound;
     changed.configured.binding.?[0] ^= 1;
     try std.testing.expectError(error.ConfiguredProviderChanged, changed.bind(registry));
-    try std.testing.expectError(error.UnknownConfiguredProvider, bound.bind(.{}));
+    var empty = try configured_provider.Registry.parse_json(alloc, "{}");
+    defer empty.deinit(alloc);
+    try std.testing.expectError(error.ConfiguredProviderRemoved, bound.bind(empty));
+    try std.testing.expectError(error.UnknownConfiguredProvider, unbound.bind(empty));
     try std.testing.expectError(error.InvalidProviderBinding, parse_saved(.{ .string = "local" }));
     try std.testing.expect(!authorizesCredential(.gateway, .configured));
     try std.testing.expect(!authorizesCredential(bound, .ai_gateway_api_key));

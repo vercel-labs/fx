@@ -11,7 +11,9 @@ const execution_router = @import("router.zig");
 const io_mod = @import("../shared/io.zig");
 const types = @import("../shared/types.zig");
 const command_replay_store = @import("../session/command_replay_store.zig");
+const quiet_notice = @import("quiet_notice.zig");
 const session_child_store = @import("../session/session_child_store.zig");
+const text_utils = @import("../shared/text_utils.zig");
 
 const Allocator = std.mem.Allocator;
 const max_entries = contract.max_live_entries + contract.max_tombstones;
@@ -19,6 +21,47 @@ const captured_stop_settle_timeout_ms: i64 = if (builtin.is_test)
     100
 else
     command_runner.termination_settle_timeout_ms + 1_000;
+
+/// The quiet limit (`quiet_notice.zig`), or the shorter one the end-to-end
+/// tests set with `FX_TEST_SHELL_QUIET_NOTICE_MS`. Read when a wait or a
+/// result needs it, since `Runtime.init` also runs at compile time as a
+/// default field value.
+fn quietLimitMs() u64 {
+    return quiet_notice.limitFromValue(io_mod.getenv("FX_TEST_SHELL_QUIET_NOTICE_MS"));
+}
+
+/// How long a wait still runs after it starts when steering asks it to
+/// yield, so a quick command, shell startup included, returns its result
+/// instead of a session. A command already past it yields at once.
+const default_steer_yield_grace_ms: i64 = 1_000;
+
+/// The steering yield grace, or the one the end-to-end tests set with
+/// `FX_TEST_STEER_YIELD_GRACE_MS` to hold steering behind a running command.
+/// Read once per wait.
+pub fn steerYieldGraceMs() i64 {
+    return steerYieldGraceFromValue(io_mod.getenv("FX_TEST_STEER_YIELD_GRACE_MS"));
+}
+
+/// The grace `value` names in whole milliseconds, or the default when it is
+/// missing, not a number, or negative.
+fn steerYieldGraceFromValue(value: ?[]const u8) i64 {
+    const raw = value orelse return default_steer_yield_grace_ms;
+    const parsed = std.fmt.parseInt(i64, raw, 10) catch return default_steer_yield_grace_ms;
+    return if (parsed < 0) default_steer_yield_grace_ms else parsed;
+}
+
+/// Whether a wait that began at `started_ms` stops now for steering: the
+/// flag is set and `grace_ms` has passed.
+pub fn steerYieldDue(
+    flag: ?*const std.atomic.Value(bool),
+    started_ms: i64,
+    now_ms: i64,
+    grace_ms: i64,
+) bool {
+    const yield_flag = flag orelse return false;
+    if (!yield_flag.load(.seq_cst)) return false;
+    return now_ms - started_ms >= grace_ms;
+}
 
 pub const StartCapturedInput = struct {
     execution_id: []const u8,
@@ -35,6 +78,9 @@ pub const StartCapturedInput = struct {
     on_output_chunk: ?command_runner.CommandOutputCallback = null,
     yield_time_ms: u32 = contract.default_yield_time_ms,
     cancel_flag: ?*std.atomic.Value(bool) = null,
+    /// When set, `startCaptured` stops waiting before `yield_time_ms` and
+    /// returns the command running (`steerYieldDue`). It never stops it.
+    tool_yield_flag: ?*const std.atomic.Value(bool) = null,
     /// Added to the command's environment. Copied before `startCaptured`
     /// returns.
     extra_environment: []const command_runner.EnvironmentVariable = &.{},
@@ -93,6 +139,17 @@ pub const Snapshot = struct {
     stdout_bytes: usize = 0,
     stderr_bytes: usize = 0,
     error_name: ?[]u8 = null,
+    /// How long a running captured command has run and printed nothing, and
+    /// whether that quiet time has reached the limit
+    /// (`quiet_notice.zig`). Null and false on every other snapshot.
+    running_ms: ?u64 = null,
+    quiet_ms: ?u64 = null,
+    quiet_notice: bool = false,
+    /// Set when this snapshot ends a wait at the quiet crossing: the
+    /// command still runs and its quiet spell crossed the limit during this
+    /// wait. A spell crosses once, so a later wait in it leaves this false
+    /// (`tests/tla/managed_execution/QuietWait.tla`).
+    quiet_crossed: bool = false,
 
     pub fn deinit(self: *Snapshot, alloc: Allocator) void {
         alloc.free(self.execution_id);
@@ -185,7 +242,12 @@ const Entry = struct {
     state: contract.State = .starting,
     barrier: contract.CompletionBarrier = .{},
     backend_state: BackendState,
+    /// Output not yet delivered (`appendBoundedOutput`). Once some was
+    /// dropped, `output.items[0..output_gap_at]` is its start, the rest its
+    /// newest bytes, and `output_dropped` bytes between them were left out.
     output: std.ArrayList(u8) = .empty,
+    output_gap_at: usize = 0,
+    output_dropped: u64 = 0,
     replay_capture: ?*command_replay_store.Capture = null,
     replay_capability: ?*session_child_store.SessionChildCapability = null,
     output_chunk_lifecycle_id: ?types.ToolLifecycleId = null,
@@ -198,6 +260,10 @@ const Entry = struct {
     stderr_bytes: usize = 0,
     output_truncated: bool = false,
     output_incomplete: bool = false,
+    /// When the entry was made, and when its command last printed: its
+    /// start until then. Guarded by `mutex`.
+    started_ms: i64 = 0,
+    last_output_ms: i64 = 0,
     delivery: contract.DeliveryState = .{},
     active_waiter: ?u64 = null,
     preempted_waiter: ?u64 = null,
@@ -210,6 +276,10 @@ const Entry = struct {
     /// Serializes joins of `thread`; see `Runtime.joinEntry`.
     join_mutex: std.Io.Mutex = .init,
     published_running: bool = false,
+    /// The turn whose steering returned this command running, if one did.
+    /// An explicit cancel of that turn stops the command
+    /// (`Runtime.takeSteeringDetached`).
+    steering_detached_turn_id: ?u64 = null,
     tombstone_sequence: std.atomic.Value(u32) = .init(0),
     active_operations: usize = 0,
     pending_delete: bool = false,
@@ -289,6 +359,8 @@ const Entry = struct {
             .on_output_chunk = input.on_output_chunk,
             .extra_environment = extra_environment,
         };
+        entry.started_ms = io_mod.milliTimestamp();
+        entry.last_output_ms = entry.started_ms;
         return entry;
     }
 
@@ -323,12 +395,6 @@ const Entry = struct {
         if (raw_output.len != 0) {
             replay_capture.appendAccepted(owned, .stdout, raw_output);
         }
-        var output: std.ArrayList(u8) = .empty;
-        errdefer output.deinit(runtime.alloc);
-        try output.appendSlice(runtime.alloc, input.output[0..@min(
-            input.output.len,
-            input.max_output_bytes,
-        )]);
         const error_name = if (input.error_name) |value|
             try owned.dupe(u8, value)
         else
@@ -350,15 +416,15 @@ const Entry = struct {
                 .session_id = execution_id,
                 .cursor = input.next_cursor orelse .{},
             } },
-            .output = output,
             .replay_capture = replay_capture,
             .replay_capability = replay_capability,
             .published_running = input.published_running,
-            .output_truncated = input.output.len > input.max_output_bytes,
             .output_incomplete = input.output_incomplete,
             .stdout_bytes = raw_output.len,
             .error_name = error_name,
         };
+        errdefer entry.output.deinit(runtime.alloc);
+        try entry.appendBoundedOutput(input.output);
         if (entry.isTerminal()) entry.finalizeReplayLocked();
         return entry;
     }
@@ -411,13 +477,97 @@ const Entry = struct {
         return self.persistence_kind;
     }
 
+    /// Keeps at most `max_output_bytes` of the output not yet delivered:
+    /// all of it while it fits, then its first half as a head and its newest
+    /// bytes as a rolling tail, so a long command's end stays in view
+    /// (`command_runner.StreamPreview` splits the same way).
     fn appendBoundedOutput(self: *Entry, chunk: []const u8) !void {
-        const available = self.max_output_bytes -| self.output.items.len;
-        const retained = @min(available, chunk.len);
-        if (retained != 0) {
-            try self.output.appendSlice(self.runtime.alloc, chunk[0..retained]);
+        if (chunk.len == 0) return;
+        const alloc = self.runtime.alloc;
+        if (self.output_dropped == 0 and
+            chunk.len <= self.max_output_bytes -| self.output.items.len)
+        {
+            return self.output.appendSlice(alloc, chunk);
         }
-        if (retained != chunk.len) self.output_truncated = true;
+        // The output never grows past the limit from here.
+        try self.output.ensureTotalCapacity(alloc, self.max_output_bytes);
+        var rest = chunk;
+        if (self.output_dropped == 0) {
+            const head_limit = (self.max_output_bytes + 1) / 2;
+            if (self.output.items.len < head_limit) {
+                const take = head_limit - self.output.items.len;
+                self.output.appendSliceAssumeCapacity(rest[0..take]);
+                rest = rest[take..];
+            }
+            self.output_gap_at = head_limit;
+        }
+        const tail_limit = self.max_output_bytes - self.output_gap_at;
+        const tail_len = self.output.items.len - self.output_gap_at;
+        if (rest.len >= tail_limit) {
+            self.output_dropped += tail_len + (rest.len - tail_limit);
+            self.output.items.len = self.output_gap_at;
+            self.output.appendSliceAssumeCapacity(rest[rest.len - tail_limit ..]);
+        } else {
+            const drop = (tail_len + rest.len) -| tail_limit;
+            if (drop != 0) {
+                const tail = self.output.items[self.output_gap_at..];
+                @memmove(tail[0 .. tail.len - drop], tail[drop..]);
+                self.output.items.len -= drop;
+                self.output_dropped += drop;
+            }
+            self.output.appendSliceAssumeCapacity(rest);
+        }
+        self.output_truncated = true;
+    }
+
+    /// The output not yet delivered, counted as the command printed it,
+    /// dropped bytes included: the unit of `delivery`'s ranges.
+    fn pendingOutputBytes(self: *const Entry) u64 {
+        return @as(u64, self.output.items.len) + self.output_dropped;
+    }
+
+    /// Removes the first `delivered` bytes of the output not yet delivered,
+    /// counted as `pendingOutputBytes` counts them. What stays is exactly
+    /// the output after them, with the bytes of it that were dropped still
+    /// counted in `output_dropped`.
+    fn removeDeliveredOutput(self: *Entry, delivered: u64) error{InvalidOutputRange}!void {
+        if (delivered > self.pendingOutputBytes()) return error.InvalidOutputRange;
+        const len = self.output.items.len;
+        const gap_at: u64 = if (self.output_dropped == 0) len else self.output_gap_at;
+        const gap_end = gap_at + self.output_dropped;
+        // How many kept bytes go.
+        var removed: usize = undefined;
+        if (delivered <= gap_at) {
+            // Delivered ends in the head.
+            removed = @intCast(delivered);
+            self.output_gap_at = @intCast(gap_at - delivered);
+        } else if (delivered >= gap_end) {
+            // Delivered ends in the tail; nothing ahead was dropped.
+            removed = @intCast(delivered - self.output_dropped);
+            self.output_gap_at = 0;
+            self.output_dropped = 0;
+        } else {
+            // Delivered ends in the gap; what stays starts with dropped bytes.
+            removed = @intCast(gap_at);
+            self.output_gap_at = 0;
+            self.output_dropped = gap_end - delivered;
+        }
+        @memmove(self.output.items[0 .. len - removed], self.output.items[removed..]);
+        self.output.items.len -= removed;
+    }
+
+    /// The output not yet delivered as a snapshot shows it: whole, or its
+    /// head, a line that counts the bytes left out, and its tail, both cut
+    /// on UTF-8 boundaries. Caller owns the returned bytes.
+    fn outputDeltaAlloc(self: *const Entry, alloc: Allocator) ![]u8 {
+        if (self.output_dropped == 0) return alloc.dupe(u8, self.output.items);
+        const kept_head = self.output.items[0..self.output_gap_at];
+        const head = withoutCutSequence(kept_head);
+        const kept_tail = self.output.items[self.output_gap_at..];
+        const tail = kept_tail[text_utils.utf8ForwardBoundary(kept_tail, 0)..];
+        const omitted = self.output_dropped + (kept_head.len - head.len) + (kept_tail.len - tail.len);
+        const line_break = if (head.len == 0 or std.mem.endsWith(u8, head, "\n")) "" else "\n";
+        return alloc.print("{s}{s}[... {d} bytes truncated ...]\n{s}", .{ head, line_break, omitted, tail });
     }
 
     fn appendOutput(raw: *anyopaque, _: ?@import("../shared/types.zig").ToolLifecycleId, stream: command_contract.CommandOutputStream, chunk: []const u8) !void {
@@ -426,6 +576,7 @@ const Entry = struct {
         const zio = io_mod.getIo();
         self.mutex.lockUncancelable(zio);
         defer self.mutex.unlock(zio);
+        self.last_output_ms = io_mod.milliTimestamp();
         if (self.replay_capture) |capture| {
             capture.appendAccepted(self.arena.allocator(), stream, chunk);
         }
@@ -591,6 +742,7 @@ pub const Runtime = struct {
         entry.start_gate.set(io_mod.getIo());
 
         const started_ms = io_mod.milliTimestamp();
+        const yield_grace_ms = if (input.tool_yield_flag != null) steerYieldGraceMs() else 0;
         const zio = io_mod.getIo();
         while (true) {
             entry.mutex.lockUncancelable(zio);
@@ -609,9 +761,14 @@ pub const Runtime = struct {
                     return prepared;
                 }
             }
-            const elapsed = io_mod.milliTimestamp() - started_ms;
+            const now_ms = io_mod.milliTimestamp();
+            const elapsed = now_ms - started_ms;
             const held = if (input.yield_hold) |hold| hold.load(.acquire) > 0 else false;
             if (elapsed >= input.yield_time_ms and !held) break;
+            if (!held and steerYieldDue(input.tool_yield_flag, started_ms, now_ms, yield_grace_ms)) {
+                debug_trace.logf("managed-execution", "run yielded for steering execution={s} elapsed_ms={d}", .{ entry.execution_id, elapsed });
+                break;
+            }
             io_mod.sleep(10 * std.time.ns_per_ms);
         }
 
@@ -877,6 +1034,21 @@ pub const Runtime = struct {
         wait_ceiling_ms: u32,
         cancel_flag: ?*std.atomic.Value(bool),
     ) !PreparedSnapshot {
+        // `waitOrYield` without steering, for callers no steering reaches,
+        // such as tests.
+        return self.waitOrYield(alloc, execution_id, wait_ceiling_ms, cancel_flag, null);
+    }
+
+    /// `wait`, which also returns the command running once `tool_yield_flag`
+    /// is set and `steerYieldDue` passes, so steering need not wait for it.
+    pub fn waitOrYield(
+        self: *Runtime,
+        alloc: Allocator,
+        execution_id: []const u8,
+        wait_ceiling_ms: u32,
+        cancel_flag: ?*std.atomic.Value(bool),
+        tool_yield_flag: ?*const std.atomic.Value(bool),
+    ) !PreparedSnapshot {
         if (wait_ceiling_ms > contract.max_wait_ceiling_ms) {
             return error.InvalidWaitCeiling;
         }
@@ -895,20 +1067,41 @@ pub const Runtime = struct {
             return error.ExecutionBusy;
         }
         entry.active_waiter = waiter_id;
+        // The wait ends at its ceiling, or when the command reaches the quiet
+        // limit after the wait saw it under it (`quiet_notice.poll`).
+        const limit_ms = quietLimitMs();
+        const wait_started_ms = io_mod.milliTimestamp();
+        const yield_grace_ms = if (tool_yield_flag != null) steerYieldGraceMs() else 0;
+        var quiet_wait = quiet_notice.beginWait(wait_started_ms, entry.last_output_ms, wait_ceiling_ms, limit_ms);
         entry.mutex.unlock(zio);
         defer self.clearActiveWaiter(entry, waiter_id);
-        const started_ms = io_mod.milliTimestamp();
         while (true) {
             entry.mutex.lockUncancelable(zio);
             const terminal = entry.isTerminal();
             const preempted = entry.preempted_waiter == waiter_id;
+            const last_output_ms = entry.last_output_ms;
             entry.mutex.unlock(zio);
             if (preempted) return error.WaitPreempted;
             if (terminal) break;
             if (cancel_flag) |flag| {
                 if (flag.load(.seq_cst)) return error.Cancelled;
             }
-            if (io_mod.milliTimestamp() - started_ms >= wait_ceiling_ms) break;
+            const now_ms = io_mod.milliTimestamp();
+            if (steerYieldDue(tool_yield_flag, wait_started_ms, now_ms, yield_grace_ms)) {
+                debug_trace.logf("managed-execution", "wait yielded for steering execution={s} elapsed_ms={d}", .{ execution_id, now_ms - wait_started_ms });
+                break;
+            }
+            const step = quiet_notice.poll(quiet_wait, now_ms, last_output_ms, limit_ms);
+            quiet_wait = step.wait;
+            if (step.end) |end| {
+                if (end == .quiet) {
+                    var prepared = try self.prepareSnapshotForEntry(alloc, entry);
+                    // A command that ended as the wait crossed is no crossing.
+                    prepared.snapshot.quiet_crossed = prepared.snapshot.quiet_notice;
+                    return prepared;
+                }
+                break;
+            }
             io_mod.sleep(10 * std.time.ns_per_ms);
         }
         return self.prepareSnapshotForEntry(alloc, entry);
@@ -973,6 +1166,10 @@ pub const Runtime = struct {
                 if (prepared.snapshot.state == .running) {
                     prepared.snapshot.state = .lost;
                     prepared.snapshot.output_incomplete = true;
+                    // Time fields belong to a running command only.
+                    prepared.snapshot.running_ms = null;
+                    prepared.snapshot.quiet_ms = null;
+                    prepared.snapshot.quiet_notice = false;
                     if (prepared.snapshot.error_name) |name| alloc.free(name);
                     prepared.snapshot.error_name = try alloc.dupe(
                         u8,
@@ -1015,6 +1212,59 @@ pub const Runtime = struct {
         return result.toOwnedSlice(alloc);
     }
 
+    /// Records that steering in turn `turn_id` returned the running command
+    /// `execution_id` to the model, so it now runs in the background. A
+    /// later mark replaces an earlier one. A missing or ended command is
+    /// left alone.
+    pub fn markSteeringDetached(
+        self: *Runtime,
+        execution_id: []const u8,
+        turn_id: u64,
+    ) void {
+        const entry = self.acquireEntry(execution_id) orelse return;
+        defer self.releaseEntry(entry);
+        const zio = io_mod.getIo();
+        entry.mutex.lockUncancelable(zio);
+        defer entry.mutex.unlock(zio);
+        if (entry.isTerminal()) return;
+        entry.steering_detached_turn_id = turn_id;
+    }
+
+    /// The ids of the commands steering detached in turn `turn_id` that
+    /// still run, for an explicit cancel of that turn to stop. Their marks
+    /// are cleared, so each id is returned once. Commands the model left in
+    /// the background itself, and those of other turns, are not returned.
+    /// The caller owns the slice and each id.
+    pub fn takeSteeringDetached(
+        self: *Runtime,
+        alloc: Allocator,
+        turn_id: u64,
+    ) Allocator.Error![][]u8 {
+        const zio = io_mod.getIo();
+        self.mutex.lockUncancelable(zio);
+        defer self.mutex.unlock(zio);
+        var result: std.ArrayList([]u8) = .empty;
+        errdefer {
+            for (result.items) |id| alloc.free(id);
+            result.deinit(alloc);
+        }
+        for (self.entries) |candidate| {
+            const entry = candidate orelse continue;
+            entry.mutex.lockUncancelable(zio);
+            defer entry.mutex.unlock(zio);
+            const marked = entry.steering_detached_turn_id orelse continue;
+            if (marked != turn_id) continue;
+            if (entry.isTerminal()) {
+                entry.steering_detached_turn_id = null;
+                continue;
+            }
+            try result.ensureUnusedCapacity(alloc, 1);
+            result.appendAssumeCapacity(try alloc.dupe(u8, entry.execution_id));
+            entry.steering_detached_turn_id = null;
+        }
+        return result.toOwnedSlice(alloc);
+    }
+
     pub fn commitDelivery(
         self: *Runtime,
         execution_id: []const u8,
@@ -1037,20 +1287,12 @@ pub const Runtime = struct {
             return error.UnknownReservation;
         };
         const next = try entry.delivery.commit(reservation_id);
-        const delivered: usize = @intCast(reservation.range.end - reservation.range.start);
-        if (delivered > entry.output.items.len) {
+        entry.removeDeliveredOutput(reservation.range.end - reservation.range.start) catch |err| {
             entry.mutex.unlock(zio);
-            return error.InvalidOutputRange;
-        }
-        if (delivered != 0) {
-            @memmove(
-                entry.output.items[0 .. entry.output.items.len - delivered],
-                entry.output.items[delivered..],
-            );
-            entry.output.items.len -= delivered;
-        }
+            return err;
+        };
         entry.delivery = next;
-        entry.output_truncated = false;
+        entry.output_truncated = entry.output_dropped != 0;
         const terminal = entry.isTerminal();
         const should_remove = terminal and !entry.published_running;
         if (terminal and entry.published_running) self.clearAuthorityLocked(entry);
@@ -1200,7 +1442,7 @@ pub const Runtime = struct {
         defer entry.mutex.unlock(zio);
         entry.delivery = try entry.delivery.prepare(
             reservation_id,
-            entry.delivery.committed + entry.output.items.len,
+            entry.delivery.committed + entry.pendingOutputBytes(),
         );
         errdefer entry.delivery = entry.delivery.cancel(reservation_id) catch entry.delivery;
         const metadata = if (entry.result) |result|
@@ -1213,7 +1455,7 @@ pub const Runtime = struct {
         errdefer alloc.free(command);
         const cwd = try alloc.dupe(u8, entry.cwd);
         errdefer alloc.free(cwd);
-        const output_delta = try alloc.dupe(u8, entry.output.items);
+        const output_delta = try entry.outputDeltaAlloc(alloc);
         errdefer alloc.free(output_delta);
         const output_file = if (entry.output_handle) |handle|
             try alloc.dupe(u8, handle)
@@ -1222,6 +1464,18 @@ pub const Runtime = struct {
         errdefer if (output_file) |value| alloc.free(value);
         const error_name = if (entry.error_name) |name|
             try alloc.dupe(u8, name)
+        else
+            null;
+        // Only a running captured command reports its time: a terminal
+        // session waits for input by design.
+        const times = if (entry.backend() == .captured)
+            quiet_notice.timesFor(
+                !entry.isTerminal(),
+                io_mod.milliTimestamp(),
+                entry.started_ms,
+                entry.last_output_ms,
+                quietLimitMs(),
+            )
         else
             null;
         return .{
@@ -1251,6 +1505,9 @@ pub const Runtime = struct {
                 else
                     entry.stderr_bytes,
                 .error_name = error_name,
+                .running_ms = if (times) |value| value.running_ms else null,
+                .quiet_ms = if (times) |value| value.quiet_ms else null,
+                .quiet_notice = if (times) |value| value.notice else false,
             },
         };
     }
@@ -1489,6 +1746,18 @@ fn applyTtyUpdateLocked(entry: *Entry, input: TtyUpdate) !void {
         entry.error_name = try entry.arena.allocator().dupe(u8, error_name);
     }
     if (entry.isTerminal()) entry.finalizeReplayLocked();
+}
+
+/// `text` without the UTF-8 sequence its end cuts short, if it ends in one.
+fn withoutCutSequence(text: []const u8) []const u8 {
+    var start = text.len;
+    while (start > 0 and text.len - start < 4) {
+        start -= 1;
+        if (text[start] & 0b1100_0000 == 0b1000_0000) continue;
+        const sequence_len = std.unicode.utf8ByteSequenceLength(text[start]) catch return text;
+        return if (text.len - start < sequence_len) text[0..start] else text;
+    }
+    return text;
 }
 
 fn optionalStringEql(left: ?[]const u8, right: ?[]const u8) bool {
@@ -1794,9 +2063,14 @@ test "captured stop returns lost when its worker cannot settle" {
                 finished.store(true, .seq_cst);
                 return;
             };
+            // A lost result carries no running time, quiet time, or notice:
+            // those belong to a command still running.
             lost.store(
                 stopped.snapshot.state == .lost and
                     stopped.snapshot.output_incomplete and
+                    stopped.snapshot.running_ms == null and
+                    stopped.snapshot.quiet_ms == null and
+                    !stopped.snapshot.quiet_notice and
                     if (stopped.snapshot.error_name) |name|
                         std.mem.eql(u8, name, "StopSettlementTimedOut")
                     else
@@ -1891,6 +2165,165 @@ test "captured managed execution capacity rejects before spawn" {
         error.ExecutionCapacityExceeded,
         runtime.startCaptured(alloc, overflow),
     );
+}
+
+test "steering yield returns a captured command running and keeps it running" {
+    if (comptime builtin.target.os.tag == .wasi) return;
+    const alloc = std.testing.allocator;
+    var runtime = Runtime.init(alloc);
+    defer runtime.deinit();
+    var yield_flag = std.atomic.Value(bool).init(true);
+    var input = StartCapturedInput{
+        .execution_id = "managed-steer-yield",
+        .command = "sleep 4; printf done",
+        .cwd = "/tmp",
+        .environment = .legacy,
+        .authority = undefined,
+        .max_output_bytes = 4096,
+        .timeout_ms = 10_000,
+        .command_artifact_dir = null,
+        .yield_time_ms = contract.max_yield_time_ms,
+        .tool_yield_flag = &yield_flag,
+    };
+    input.authority = testAuthority(input);
+    const started_ms = io_mod.milliTimestamp();
+    var started = try runtime.startCaptured(alloc, input);
+    defer started.deinit(alloc);
+    try std.testing.expectEqual(SnapshotState.running, started.snapshot.state);
+    // It returns after the grace time, long before `yield_time_ms`.
+    const returned_after_ms = io_mod.milliTimestamp() - started_ms;
+    try std.testing.expect(returned_after_ms >= steerYieldGraceMs());
+    try std.testing.expect(returned_after_ms < 3_000);
+    try runtime.commitDelivery(started.snapshot.execution_id, started.reservation_id);
+
+    // A follow-up wait yields too, and the command still runs.
+    var followed = try runtime.waitOrYield(alloc, input.execution_id, 30_000, null, &yield_flag);
+    defer followed.deinit(alloc);
+    try std.testing.expectEqual(SnapshotState.running, followed.snapshot.state);
+    try runtime.commitDelivery(followed.snapshot.execution_id, followed.reservation_id);
+
+    // Once the turn takes its steering, a wait sees the command finish.
+    yield_flag.store(false, .seq_cst);
+    var completed = try runtime.wait(alloc, input.execution_id, 10_000, null);
+    defer completed.deinit(alloc);
+    switch (completed.snapshot.state) {
+        .completed => {},
+        else => return error.TestUnexpectedResult,
+    }
+    try std.testing.expect(std.mem.find(u8, completed.snapshot.output_delta, "done") != null);
+    try runtime.commitDelivery(completed.snapshot.execution_id, completed.reservation_id);
+}
+
+test "a command that ends inside the steering grace returns its result" {
+    if (comptime builtin.target.os.tag == .wasi) return;
+    const alloc = std.testing.allocator;
+    var runtime = Runtime.init(alloc);
+    defer runtime.deinit();
+    var yield_flag = std.atomic.Value(bool).init(true);
+    var input = StartCapturedInput{
+        .execution_id = "managed-steer-grace",
+        .command = "printf quick",
+        .cwd = "/tmp",
+        .environment = .legacy,
+        .authority = undefined,
+        .max_output_bytes = 4096,
+        .timeout_ms = 10_000,
+        .command_artifact_dir = null,
+        .yield_time_ms = contract.max_yield_time_ms,
+        .tool_yield_flag = &yield_flag,
+    };
+    input.authority = testAuthority(input);
+    var started = try runtime.startCaptured(alloc, input);
+    defer started.deinit(alloc);
+    switch (started.snapshot.state) {
+        .completed => {},
+        else => return error.TestUnexpectedResult,
+    }
+    try std.testing.expect(std.mem.find(u8, started.snapshot.output_delta, "quick") != null);
+    try runtime.commitDelivery(started.snapshot.execution_id, started.reservation_id);
+}
+
+test "a cancel takes only the running commands steering detached in its turn" {
+    if (comptime builtin.target.os.tag == .wasi) return;
+    const alloc = std.testing.allocator;
+    var runtime = Runtime.init(alloc);
+    defer runtime.deinit();
+    const ids = [_][]const u8{ "steered-in-7", "steered-in-8", "background", "ended" };
+    for (ids) |id| {
+        var input = StartCapturedInput{
+            .execution_id = id,
+            .command = if (std.mem.eql(u8, id, "ended")) "printf done" else "sleep 30",
+            .cwd = "/tmp",
+            .environment = .legacy,
+            .authority = undefined,
+            .max_output_bytes = 4096,
+            .timeout_ms = 60_000,
+            .command_artifact_dir = null,
+            .yield_time_ms = 0,
+        };
+        input.authority = testAuthority(input);
+        var started = try runtime.startCaptured(alloc, input);
+        defer started.deinit(alloc);
+        try runtime.commitDelivery(started.snapshot.execution_id, started.reservation_id);
+    }
+    var ended = try runtime.wait(alloc, "ended", 10_000, null);
+    defer ended.deinit(alloc);
+    try std.testing.expect(ended.snapshot.state != .running);
+    try runtime.commitDelivery(ended.snapshot.execution_id, ended.reservation_id);
+
+    runtime.markSteeringDetached("steered-in-7", 7);
+    runtime.markSteeringDetached("steered-in-8", 8);
+    // An ended command and an unknown id take no mark.
+    runtime.markSteeringDetached("ended", 7);
+    runtime.markSteeringDetached("missing", 7);
+
+    const taken = try runtime.takeSteeringDetached(alloc, 7);
+    defer {
+        for (taken) |id| alloc.free(id);
+        alloc.free(taken);
+    }
+    try std.testing.expectEqual(@as(usize, 1), taken.len);
+    try std.testing.expectEqualStrings("steered-in-7", taken[0]);
+
+    // Each id is taken once, and a turn with no steered command takes none.
+    const again = try runtime.takeSteeringDetached(alloc, 7);
+    defer alloc.free(again);
+    try std.testing.expectEqual(@as(usize, 0), again.len);
+    const unmarked = try runtime.takeSteeringDetached(alloc, 9);
+    defer alloc.free(unmarked);
+    try std.testing.expectEqual(@as(usize, 0), unmarked.len);
+
+    // A later steering mark moves the command to its own turn.
+    runtime.markSteeringDetached("steered-in-8", 9);
+    const moved_from = try runtime.takeSteeringDetached(alloc, 8);
+    defer alloc.free(moved_from);
+    try std.testing.expectEqual(@as(usize, 0), moved_from.len);
+    const moved_to = try runtime.takeSteeringDetached(alloc, 9);
+    defer {
+        for (moved_to) |id| alloc.free(id);
+        alloc.free(moved_to);
+    }
+    try std.testing.expectEqual(@as(usize, 1), moved_to.len);
+    try std.testing.expectEqualStrings("steered-in-8", moved_to[0]);
+    try std.testing.expectEqual(SnapshotState.running, runtime.stateFor("background").?);
+}
+
+test "steering yield waits out its grace time" {
+    var flag = std.atomic.Value(bool).init(false);
+    try std.testing.expect(!steerYieldDue(&flag, 0, 10_000, 1_000));
+    flag.store(true, .seq_cst);
+    try std.testing.expect(!steerYieldDue(&flag, 0, 999, 1_000));
+    try std.testing.expect(steerYieldDue(&flag, 0, 1_000, 1_000));
+    try std.testing.expect(!steerYieldDue(null, 0, 10_000, 1_000));
+}
+
+test "the steering grace falls back to the default for a bad test value" {
+    try std.testing.expectEqual(default_steer_yield_grace_ms, steerYieldGraceFromValue(null));
+    try std.testing.expectEqual(default_steer_yield_grace_ms, steerYieldGraceFromValue(""));
+    try std.testing.expectEqual(default_steer_yield_grace_ms, steerYieldGraceFromValue("-5"));
+    try std.testing.expectEqual(default_steer_yield_grace_ms, steerYieldGraceFromValue("abc"));
+    try std.testing.expectEqual(@as(i64, 0), steerYieldGraceFromValue("0"));
+    try std.testing.expectEqual(@as(i64, 2_500), steerYieldGraceFromValue("2500"));
 }
 
 test "captured managed execution exposes full output only by opaque replay handle" {
@@ -2197,4 +2630,219 @@ test "TTY cursor advances monotonically and delivers each delta once" {
         .max_output_bytes = 64,
         .published_running = true,
     }));
+}
+
+/// An entry with only what the output buffer uses.
+fn testOutputEntry(runtime: *Runtime, max_output_bytes: usize) Entry {
+    return .{
+        .runtime = runtime,
+        .arena = undefined,
+        .execution_id = "output-test",
+        .command = "true",
+        .cwd = "/tmp",
+        .environment = .legacy,
+        .max_output_bytes = max_output_bytes,
+        .timeout_ms = null,
+        .command_artifact_dir = null,
+        .backend_kind = .captured,
+        .persistence_kind = .process,
+        .backend_state = .tombstone,
+    };
+}
+
+fn expectOutputDelta(entry: *const Entry, expected: []const u8) !void {
+    const delta = try entry.outputDeltaAlloc(std.testing.allocator);
+    defer std.testing.allocator.free(delta);
+    try std.testing.expectEqualStrings(expected, delta);
+}
+
+const TestDeltaParts = struct { head: []const u8, omitted: ?u64, tail: []const u8 };
+
+/// Splits a delta of output with no line breaks at its marker.
+fn splitTestDelta(delta: []const u8) !TestDeltaParts {
+    const open = "[... ";
+    const close = " bytes truncated ...]\n";
+    const at = std.mem.find(u8, delta, open) orelse return .{ .head = delta, .omitted = null, .tail = "" };
+    const count_end = std.mem.findPos(u8, delta, at, close) orelse return error.TestUnexpectedDelta;
+    var head = delta[0..at];
+    if (std.mem.endsWith(u8, head, "\n")) head = head[0 .. head.len - 1];
+    return .{
+        .head = head,
+        .omitted = try std.fmt.parseInt(u64, delta[at + open.len .. count_end], 10),
+        .tail = delta[count_end + close.len ..],
+    };
+}
+
+test "command output under the limit is kept whole" {
+    var runtime = Runtime.init(std.testing.allocator);
+    defer runtime.deinit();
+    var entry = testOutputEntry(&runtime, 16);
+    defer entry.output.deinit(std.testing.allocator);
+    try entry.appendBoundedOutput("abc");
+    try entry.appendBoundedOutput("");
+    try entry.appendBoundedOutput("defghijklmnop");
+    try std.testing.expect(!entry.output_truncated);
+    try std.testing.expectEqual(@as(u64, 16), entry.pendingOutputBytes());
+    try expectOutputDelta(&entry, "abcdefghijklmnop");
+}
+
+test "command output over the limit keeps its head and newest tail for any chunk size" {
+    const stream = "0123456789ABCDEF";
+    for (1..stream.len + 1) |chunk_len| {
+        var runtime = Runtime.init(std.testing.allocator);
+        defer runtime.deinit();
+        var entry = testOutputEntry(&runtime, 10);
+        defer entry.output.deinit(std.testing.allocator);
+        var start: usize = 0;
+        while (start < stream.len) : (start += chunk_len) {
+            try entry.appendBoundedOutput(stream[start..@min(stream.len, start + chunk_len)]);
+        }
+        try std.testing.expect(entry.output_truncated);
+        try std.testing.expectEqual(@as(usize, 10), entry.output.items.len);
+        try std.testing.expectEqual(@as(u64, stream.len), entry.pendingOutputBytes());
+        try expectOutputDelta(&entry, "01234\n[... 6 bytes truncated ...]\nBCDEF");
+    }
+}
+
+test "command output head and tail are cut on UTF-8 boundaries" {
+    var runtime = Runtime.init(std.testing.allocator);
+    defer runtime.deinit();
+    var entry = testOutputEntry(&runtime, 10);
+    defer entry.output.deinit(std.testing.allocator);
+    // The head's fifth byte starts "é", and the tail's first two bytes end "€".
+    try entry.appendBoundedOutput("abcd\xc3\xa9XYZ\xe2\x82\xaclmn");
+    const delta = try entry.outputDeltaAlloc(std.testing.allocator);
+    defer std.testing.allocator.free(delta);
+    try std.testing.expectEqualStrings("abcd\n[... 8 bytes truncated ...]\nlmn", delta);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(delta));
+}
+
+test "a delivery that ends in the head, the gap, or the tail keeps exactly the later output" {
+    const alloc = std.testing.allocator;
+    var runtime = Runtime.init(alloc);
+    defer runtime.deinit();
+
+    // Ends in the head: the output overflows while the delivery is pending.
+    var head = testOutputEntry(&runtime, 10);
+    defer head.output.deinit(alloc);
+    try head.appendBoundedOutput("abc");
+    const head_delivered = head.pendingOutputBytes();
+    try head.appendBoundedOutput("defghijklmnop");
+    try head.removeDeliveredOutput(head_delivered);
+    try std.testing.expectEqual(@as(u64, 13), head.pendingOutputBytes());
+    try expectOutputDelta(&head, "de\n[... 6 bytes truncated ...]\nlmnop");
+
+    // Ends in the gap: more bytes were dropped than the tail held.
+    var gap = testOutputEntry(&runtime, 10);
+    defer gap.output.deinit(alloc);
+    try gap.appendBoundedOutput("0123456789ABCDEF");
+    const gap_delivered = gap.pendingOutputBytes();
+    try gap.appendBoundedOutput("ghijklm");
+    try gap.removeDeliveredOutput(gap_delivered);
+    try std.testing.expectEqual(@as(u64, 7), gap.pendingOutputBytes());
+    try expectOutputDelta(&gap, "[... 2 bytes truncated ...]\nijklm");
+
+    // Ends in the tail: nothing after the delivery was dropped.
+    var tail = testOutputEntry(&runtime, 10);
+    defer tail.output.deinit(alloc);
+    try tail.appendBoundedOutput("0123456789ABCDEF");
+    const tail_delivered = tail.pendingOutputBytes();
+    try tail.appendBoundedOutput("gh");
+    try tail.removeDeliveredOutput(tail_delivered);
+    try std.testing.expectEqual(@as(u64, 2), tail.pendingOutputBytes());
+    try std.testing.expectEqual(@as(u64, 0), tail.output_dropped);
+    try expectOutputDelta(&tail, "gh");
+
+    try std.testing.expectError(error.InvalidOutputRange, tail.removeDeliveredOutput(3));
+}
+
+test "command output deliveries neither repeat nor skip bytes when output, delivery, and cancel interleave" {
+    const alloc = std.testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0x5eed_0f_0a7);
+    const random = prng.random();
+    for ([_]usize{ 1, 2, 7, 10, 33 }) |max| {
+        var runtime = Runtime.init(alloc);
+        defer runtime.deinit();
+        var entry = testOutputEntry(&runtime, max);
+        defer entry.output.deinit(alloc);
+        var stream: std.ArrayList(u8) = .empty;
+        defer stream.deinit(alloc);
+        var committed: u64 = 0;
+        var pending: ?u64 = null;
+        for (0..2000) |_| {
+            switch (random.uintLessThan(u8, 4)) {
+                0, 1 => {
+                    var chunk: [80]u8 = undefined;
+                    const chunk_len = random.uintAtMost(usize, @min(chunk.len, 3 * max));
+                    for (chunk[0..chunk_len]) |*byte| byte.* = 'a' + random.uintLessThan(u8, 26);
+                    try stream.appendSlice(alloc, chunk[0..chunk_len]);
+                    try entry.appendBoundedOutput(chunk[0..chunk_len]);
+                },
+                2 => if (pending) |end| {
+                    try entry.removeDeliveredOutput(end - committed);
+                    committed = end;
+                    pending = null;
+                } else {
+                    const end = committed + entry.pendingOutputBytes();
+                    const delta = try entry.outputDeltaAlloc(alloc);
+                    defer alloc.free(delta);
+                    const delivered = stream.items[@intCast(committed)..@intCast(end)];
+                    const parts = try splitTestDelta(delta);
+                    if (parts.omitted) |omitted| {
+                        try std.testing.expectEqual(@as(u64, delivered.len), parts.head.len + omitted + parts.tail.len);
+                        try std.testing.expectEqualStrings(delivered[0..parts.head.len], parts.head);
+                        try std.testing.expectEqualStrings(delivered[delivered.len - parts.tail.len ..], parts.tail);
+                        try std.testing.expect(parts.head.len <= (max + 1) / 2);
+                        try std.testing.expect(parts.head.len + parts.tail.len <= max);
+                    } else {
+                        try std.testing.expectEqualStrings(delivered, delta);
+                    }
+                    pending = end;
+                },
+                // A delivery the caller drops is shown again with the next one.
+                else => pending = null,
+            }
+            try std.testing.expect(entry.output.items.len <= max);
+            try std.testing.expectEqual(@as(u64, stream.items.len) - committed, entry.pendingOutputBytes());
+        }
+    }
+}
+
+test "terminal output keeps its head and tail through restore, refresh, and delivery" {
+    const alloc = std.testing.allocator;
+    var runtime = Runtime.init(alloc);
+    defer runtime.deinit();
+    var restored = try runtime.registerTty(alloc, .{
+        .execution_id = "tty-head-tail",
+        .command = "interactive",
+        .state = .running,
+        .output = "0123456789ABCDEF",
+        .max_output_bytes = 10,
+        .published_running = true,
+    });
+    defer restored.deinit(alloc);
+    try std.testing.expect(restored.snapshot.output_truncated);
+    try std.testing.expectEqualStrings("01234\n[... 6 bytes truncated ...]\nBCDEF", restored.snapshot.output_delta);
+
+    // Output that arrives before the delivery commits comes in the next one.
+    try runtime.refreshTty(.{
+        .execution_id = "tty-head-tail",
+        .command = "interactive",
+        .state = .running,
+        .output = "gh",
+        .max_output_bytes = 10,
+        .published_running = true,
+    });
+    try runtime.commitDelivery(restored.snapshot.execution_id, restored.reservation_id);
+    var next = try runtime.updateTty(alloc, .{
+        .execution_id = "tty-head-tail",
+        .command = "interactive",
+        .state = .running,
+        .max_output_bytes = 10,
+        .published_running = true,
+    });
+    defer next.deinit(alloc);
+    try std.testing.expectEqualStrings("gh", next.snapshot.output_delta);
+    try std.testing.expect(!next.snapshot.output_truncated);
+    try runtime.commitDelivery(next.snapshot.execution_id, next.reservation_id);
 }

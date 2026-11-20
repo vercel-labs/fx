@@ -87,6 +87,9 @@ pub const ModelMenuProjection = struct {
     selected_index: usize = 0,
     window_start: usize = 0,
     query: []const u8 = "",
+    /// Whether the team has Token Pass. Only then does the menu name Token
+    /// Pass and lead with its models.
+    token_pass: bool = false,
 
     pub fn providerFilter(self: ModelMenuProjection) model_cache_runtime.ModelProviderFilter {
         return @fromBackingInt(@intCast(@min(self.provider_index, model_cache_runtime.model_provider_filter_count - 1)));
@@ -193,9 +196,15 @@ pub const AgentsMenuRow = struct {
     nested: bool = false,
     /// Its session's title, or empty before it has one.
     title: []const u8,
-    /// The agent profile it runs in.
-    profile: []const u8,
-    /// What it is doing, such as "needs approval".
+    /// What a subagent is for, the one line its parent started it with, which
+    /// the row shows while it has no title; empty for an instance and for a
+    /// subagent with none.
+    purpose: []const u8 = "",
+    /// The agent profile it runs in, or empty for the main one, which the
+    /// list leaves unnamed.
+    profile: []const u8 = "",
+    /// What it is doing, such as "needs approval", or "working 12s" while a
+    /// subagent is in a tool call, for as long as that call has run.
     state: []const u8,
     state_tone: AgentStateTone = .idle,
     /// The model its turns use, as the agent's settings name it, such as
@@ -402,6 +411,7 @@ pub fn modelMenuProjection(cache: *const model_cache_runtime.Runtime) ModelMenuP
         .selected_index = cache.menu.selected_index,
         .window_start = cache.menu.window_start,
         .query = cache.menu.query(),
+        .token_pass = cache.tokenPassStatus() == .active,
     };
 }
 
@@ -733,7 +743,7 @@ pub fn frameOwnedActivityProjection(
     approval: ?approval_prompt.Projection,
 ) ActivityProjection {
     if (approval != null or ctx.question != null) return .none;
-    const compaction = activity_status.compactionProjection(buf, ctx.compaction, ctx.stream, ctx.now_ms);
+    const compaction = activity_status.compactionProjection(buf, ctx.compaction, ctx.now_ms);
     if (compaction == .none and !ctx.stream.active and ctx.pending_prompt_activity) {
         return .{ .turn_thinking = .{ .label = "• Thinking" } };
     }
@@ -785,7 +795,7 @@ test "a status shows its short form only when the row is narrower than its text"
 pub fn frameActivityBlink(ctx: RenderContext) ?bool {
     if (ctx.compaction.operation) |op| {
         if (op.active() and op.visible(ctx.now_ms)) {
-            return activity_status.activityBlinkVisible(activity_status.compactionClock(ctx.stream, op), ctx.now_ms);
+            return activity_status.activityBlinkVisible(activity_status.compactionClock(op), ctx.now_ms);
         }
     }
     if (subagentWaitShown(ctx)) {
@@ -1041,11 +1051,11 @@ test "frame compaction overrides idle and tool activity but not blocking feedbac
         .input = &input,
     };
     var buf: [256]u8 = undefined;
-    try std.testing.expectEqualStrings("• Compacting (1s)", frameOwnedActivityProjection(&buf, &shell, ctx, null).turn_thinking.label);
+    try std.testing.expectEqualStrings("• Compacting 0% (1s)", frameOwnedActivityProjection(&buf, &shell, ctx, null).turn_thinking.label);
     try std.testing.expectEqual(@as(?bool, false), frameActivityBlink(ctx));
     try std.testing.expect(!ctx.stream.active);
     ctx.activity = .{ .tool_slot = .{ .entry_id = 1, .fallback_label = "reading", .active = true, .kind = .read } };
-    try std.testing.expectEqualStrings("• Compacting (1s)", frameOwnedActivityProjection(&buf, &shell, ctx, null).turn_thinking.label);
+    try std.testing.expectEqualStrings("• Compacting 0% (1s)", frameOwnedActivityProjection(&buf, &shell, ctx, null).turn_thinking.label);
     ctx.activity = .{ .turn_thinking = .{ .label = "Blocking status", .tone = .danger } };
     try std.testing.expectEqualStrings("Blocking status", frameOwnedActivityProjection(&buf, &shell, ctx, null).turn_thinking.label);
     ctx.question = .{ .current_entry = null, .current_index = 0, .entry_count = 0 };

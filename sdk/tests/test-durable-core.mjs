@@ -4,8 +4,10 @@
 // smallest example of one.
 //
 //   node sdk/tests/test-durable-core.mjs [memory|local|world|queue]
+//
+// LIBFX_TEST_ONLY=<part of a name> runs only the tests whose names contain it.
 import { strict as assert } from "node:assert";
-import { mkdtemp, readdir, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readdir, readFile, rm, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createDurableAgentFactory, extendLogView, foldSessionLog, handoffEntries, memory, wakeHandler } from "../durable.js";
@@ -403,6 +405,106 @@ if (durabilityKind === "local") {
     await support.close();
     await coding.close();
   });
+
+  // `durability`, with each World's start run through `wrap(start, world)`.
+  const wrappingWorldStart = (durability, wrap) => ({
+    ...durability,
+    async world() {
+      const instance = await durability.world();
+      const start = instance.start.bind(instance);
+      instance.start = () => wrap(start, instance);
+      return instance;
+    },
+  });
+
+  // `durability`, with each World's start counted, and taking a while, so
+  // starts that overlap show.
+  const countingWorldStarts = (durability, starts) => wrappingWorldStart(durability, async (start) => {
+    starts.count += 1;
+    starts.running += 1;
+    starts.most = Math.max(starts.most, starts.running);
+    try {
+      await sleep(20);
+      return await start();
+    } finally {
+      starts.running -= 1;
+    }
+  });
+
+  // world-local fails a start that reads its data folder's version file
+  // while another start is writing it.
+  test("agents that start their Worlds on one store at once start them one at a time", async () => {
+    const starts = { count: 0, running: 0, most: 0 };
+    const durability = countingWorldStarts(await durabilityFor(), starts);
+    const names = ["support", "coding", "billing", "ops"];
+    const agents = names.map((name) => createTaggedAgent({ durability, name, tag: name }));
+    const results = await Promise.all(agents.map((agent, index) => textOf(agent.session().prompt(`w${index}`))));
+    results.forEach(({ text }, index) => assert.equal(text, `w${index}-0 w${index}-1 w${index}-2`));
+    assert.deepEqual([starts.count, starts.most], [names.length, 1], "each agent started its World, one at a time");
+    for (const agent of agents) await agent.close();
+  });
+
+  test("Worlds on one folder named through a symlink start one at a time", async () => {
+    const real = await mkdtemp(join(tmpdir(), "libfx-core-real-"));
+    const link = `${real}-link`;
+    await symlink(real, link);
+    dirs.push(real, link);
+    // The folder itself does not exist yet: the first start creates it.
+    const starts = { count: 0, running: 0, most: 0 };
+    const agents = [join(real, "sessions"), join(link, "sessions")].map((dir, index) => createTaggedAgent({
+      durability: countingWorldStarts(local({ dir }), starts),
+      name: `folder-${index}`,
+      tag: `folder-${index}`,
+    }));
+    const results = await Promise.all(agents.map((agent, index) => textOf(agent.session().prompt(`f${index}`))));
+    results.forEach(({ text }, index) => assert.equal(text, `f${index}-0 f${index}-1 f${index}-2`));
+    assert.deepEqual([starts.count, starts.most], [2, 1], "the two Worlds of one folder started one at a time");
+    for (const agent of agents) await agent.close();
+  });
+
+  // A World an app creates through world() may connect to a service at its
+  // start, with no time limit.
+  test("a World whose durability names no start turn starts while another start on its store hangs", async () => {
+    // local()'s own Worlds start in turn; this one is local() without that.
+    const { startTurnKey: _, ...durability } = await durabilityFor();
+    const hung = [];
+    const hanging = wrappingWorldStart(durability, (start, instance) => {
+      if (hung.length > 0) return start();
+      hung.push(instance);
+      return new Promise(() => {});
+    });
+    const agents = ["support", "coding"].map((name) => createTaggedAgent({ durability: hanging, name, tag: name }));
+    const ids = agents.map((agent) => agent.newSessionId());
+    const first = await Promise.race([Promise.any(ids.map((id, index) => id.then(() => index))), sleep(3000).then(() => null)]);
+    assert.notEqual(first, null, "an agent started its World within 3 s");
+    const { text } = await textOf(agents[first].session().prompt("after"));
+    assert.equal(text, "after-0 after-1 after-2");
+    await agents[first].close();
+    // The other agent's World never starts, so its close never ends.
+    void agents[1 - first].close();
+  });
+
+  test("a World that fails to start leaves the next World on its store free to start", async () => {
+    const failed = [];
+    const durability = wrappingWorldStart(await durabilityFor(), async (start, instance) => {
+      if (failed.length === 0) {
+        failed.push(instance);
+        throw new Error("the data folder is full");
+      }
+      return start();
+    });
+    const agents = ["support", "coding"].map((name) => createTaggedAgent({ durability, name, tag: name }));
+    const results = await Promise.allSettled(agents.map((agent) => agent.newSessionId()));
+    assert.deepEqual(results.map((result) => result.status).sort(), ["fulfilled", "rejected"]);
+    assert.match(results.find((result) => result.status === "rejected").reason.message, /the data folder is full/);
+    const started = agents[results.findIndex((result) => result.status === "fulfilled")];
+    const { text } = await textOf(started.session().prompt("after"));
+    assert.equal(text, "after-0 after-1 after-2");
+    for (const agent of agents) await agent.close();
+    // No agent holds the World that failed to start. Closing it is best
+    // effort, as libfx's is: under Bun its HTTP agent cannot close.
+    for (const instance of failed) await instance.close().catch(() => {});
+  });
 }
 
 test("an agent's name defaults to default, and a malformed one is refused", async () => {
@@ -632,7 +734,8 @@ test("a started turn whose engine keeps stopping is cancelled, and the prompts b
 });
 
 // An agent whose first `works` engines open and whose later ones cannot,
-// or, given a function, whose engines open when `opens(n)` says so.
+// or, given a function, whose engines open when `opens(n)` says so, after
+// the function's promise settles if it returns one.
 function agentWhoseEnginesFailAfter(works, durability) {
   const scripted = scriptedHarness();
   const counts = { opens: 0 };
@@ -642,7 +745,7 @@ function agentWhoseEnginesFailAfter(works, durability) {
       const base = scripted(options);
       return { open: async (args) => {
         counts.opens += 1;
-        if (!opens(counts.opens)) throw new Error("no engine");
+        if (!(await opens(counts.opens))) throw new Error("no engine");
         return base.open(args);
       } };
     },
@@ -701,26 +804,32 @@ test("a cancel for a turn whose engine cannot open is not retried forever", asyn
   await agent.close();
 });
 
-// Engines that open, except during a 1.5 s outage that starts once engine
-// `after` has opened.
+// Engines that open, except for an outage that starts once engine `after` has
+// opened and lasts until the test calls `end()`. The clock never ends it: the
+// engine the outage must refuse is opened by a retry libfx schedules, and a
+// runner that stalls past any fixed window would open it after the window,
+// so the open turn would be cancelled instead of failed. The first engine the
+// outage refuses opens 2 s late, as it does on such a runner, so that an
+// outage ended by the clock fails these tests every time, not now and then.
 function outageAfter(after) {
-  const outage = { until: Infinity };
-  const opens = (n) => {
-    if (n === after) outage.until = Date.now() + 1500;
-    return n <= after || Date.now() >= outage.until;
+  const outage = { over: false };
+  const opens = async (n) => {
+    if (n === after + 1) await sleep(2000);
+    return n <= after || outage.over;
   };
-  return { opens, over: () => sleep(Math.max(0, outage.until - Date.now()) + 50) };
+  return { opens, end: () => { outage.over = true; } };
 }
 
 test("an outage while a stuck turn is cancelled does not halt the session", async () => {
-  // Three engines stop under the turn; the next ones cannot open for a while.
+  // Three engines stop under the turn; the next ones cannot open until the
+  // test ends the outage.
   const outage = outageAfter(3);
   const { agent } = agentWhoseEnginesFailAfter(outage.opens, await durabilityFor());
   const session = agent.session();
   const stuck = await session.prompt(brittle, { messageId: "turn-outage" }).result;
   assert.equal(stuck.stopReason, "error");
   assert.match(stuck.error?.message ?? "", /no engine/);
-  await outage.over();
+  outage.end();
   // The next prompt's engine cancels the open turn, then runs the prompt.
   assert.equal((await session.prompt("kappa2").result).stopReason, "end_turn");
   assert.equal((await session.prompt("lambda2").result).stopReason, "end_turn");
@@ -728,14 +837,15 @@ test("an outage while a stuck turn is cancelled does not halt the session", asyn
 });
 
 test("an outage while a cancel waits does not halt the session", async () => {
-  // The first engine stops under the turn; the next ones cannot open for a while.
+  // The first engine stops under the turn; the next ones cannot open until
+  // the test ends the outage.
   const outage = outageAfter(1);
   const { agent } = agentWhoseEnginesFailAfter(outage.opens, await durabilityFor());
   const session = agent.session();
   const ended = await session.prompt(brittle, { messageId: "turn-blip" }).result;
   assert.equal(ended.stopReason, "error");
   await session.cancel();
-  await outage.over();
+  outage.end();
   assert.equal((await session.prompt("mu2").result).stopReason, "end_turn");
   assert.equal((await session.prompt("nu2").result).stopReason, "end_turn");
   await agent.close();
@@ -3868,8 +3978,11 @@ if (durabilityKind === "queue") {
   });
 }
 
+// LIBFX_TEST_ONLY runs only the tests whose names contain it.
+const only = process.env.LIBFX_TEST_ONLY;
+const selected = only ? tests.filter(([name]) => name.includes(only)) : tests;
 let failed = 0;
-for (const [name, fn] of tests) {
+for (const [name, fn] of selected) {
   const started = performance.now();
   try {
     let timer;
@@ -3883,5 +3996,5 @@ for (const [name, fn] of tests) {
 await closeAppWorlds?.();
 await closeQueueWorlds?.();
 for (const dir of dirs) await rm(dir, { recursive: true, force: true }).catch(() => {});
-console.log(`${tests.length - failed}/${tests.length} core tests passed (${durabilityKind})`);
+console.log(`${selected.length - failed}/${selected.length} core tests passed (${durabilityKind})`);
 process.exit(failed ? 1 : 0);
