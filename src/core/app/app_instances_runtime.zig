@@ -44,6 +44,8 @@ pub const Seed = struct {
     provider_order: [][]u8 = &.{},
     provider_strict: bool = false,
     agent_effort: types.ReasoningEffort = .auto,
+    /// `experimental.workspace_capture`, read once at startup (D98).
+    workspace_capture: bool = false,
     profile_name: ?[]u8 = null,
 
     pub fn deinit(self: *Seed, alloc: Allocator) void {
@@ -112,6 +114,7 @@ pub const Seed = struct {
         self.turn_settings = agent.worker.agent_turn_settings;
         self.turn_settings.provider_order = &.{};
         self.agent_effort = agent.effort;
+        self.workspace_capture = agent.session_persistence.workspace_capture;
         self.permission_mode = mode;
         self.captured = true;
     }
@@ -267,6 +270,7 @@ pub fn Runtime(comptime App: type) type {
             errdefer AgentsRuntime.dropHosted(app, child);
             const agent = &child.agent;
             app_session_runtime.Persistence.initInto(&agent.session_persistence);
+            agent.session_persistence.workspace_capture = seed.workspace_capture;
             const name = profile_name orelse seed.profile_name;
             if (name) |value| try app.applyInstanceProfile(agent, value);
             try SessionRuntime.configureStartupPreferences(
