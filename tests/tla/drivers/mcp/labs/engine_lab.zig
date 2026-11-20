@@ -6,7 +6,7 @@
 //!
 //! Usage: engine_lab <trace-path> <script> [--deny TOOL]... [--capabilities JSON]
 //!          [--max-attempts N] [--no-listen] [--preferred V1,V2] [--probe-ms N]
-//!          [--timeout-ms IDLE] [--hard-ms N] [--start-ms N]
+//!          [--timeout-ms IDLE] [--hard-ms N] [--start-ms N] [--refused-ms N]
 //!          [--define NAME=VALUE]... (each {NAME} in the script becomes VALUE)
 //!
 //! Script, one action per line (blank lines and lines starting with # are skipped):
@@ -138,7 +138,11 @@ const Lab = struct {
                     .failure => |f| try lab.arena.print("error {d} {s}", .{ f.code, f.message }),
                     else => @tagName(a),
                 } else null;
-                try lab.print("event", .{ .tag = t, .maybe_ran = c.maybe_ran, .timed_out = c.timed_out, .answer = answer });
+                const is_error: ?bool = if (c.answer) |a| switch (a) {
+                    .result => |r| r.is_error,
+                    else => null,
+                } else null;
+                try lab.print("event", .{ .tag = t, .maybe_ran = c.maybe_ran, .timed_out = c.timed_out, .answer = answer, .is_error = is_error });
             },
             .input => |q| try lab.print("event", .{ .tag = t, .requests = q.requests.len }),
             .progress => |p| try lab.print("event", .{ .tag = t, .progress = p.progress, .total = p.total, .message = p.message }),
@@ -327,6 +331,9 @@ pub fn main(init: std.process.Init) !void {
             options.timeouts.idle_ms = try std.fmt.parseInt(u32, value, 10);
         } else if (std.mem.eql(u8, flag, "--hard-ms")) {
             options.timeouts.hard_ms = try std.fmt.parseInt(u32, value, 10);
+        } else if (std.mem.eql(u8, flag, "--refused-ms")) {
+            // The grace for a refused line that names no request.
+            options.timeouts.refused_ms = try std.fmt.parseInt(u32, value, 10);
         } else if (std.mem.eql(u8, flag, "--start-ms")) {
             options.timeouts.start_ms = try std.fmt.parseInt(u32, value, 10);
         } else if (std.mem.eql(u8, flag, "--preferred")) {
