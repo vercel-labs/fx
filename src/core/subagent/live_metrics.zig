@@ -98,7 +98,7 @@ pub const Call = struct {
 /// (`text_utils.maskSecrets`), whitespace runs become one space, control
 /// bytes and invalid UTF-8 get visible escapes, and a cut label ends in an
 /// ellipsis. The label reaches another agent's model through status and the
-/// quiet note, and the user's agent list. Returns the length written.
+/// quiet note. Returns the length written.
 pub fn storeLabel(out: *[max_label_bytes]u8, raw: []const u8) usize {
     var scratch: [6 * max_masked_label_bytes]u8 = undefined;
     var fixed = std.heap.FixedBufferAllocator.init(&scratch);

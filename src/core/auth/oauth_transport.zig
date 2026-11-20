@@ -38,9 +38,13 @@ pub const Disposition = enum {
 };
 
 pub const Response = struct {
+    /// `accepted` only for a 200.
     disposition: Disposition,
     /// Owned bytes allocated with the allocator passed to `Provider.execute`.
     body: []u8,
+    /// The HTTP status, or 0 when the transport doesn't say. A caller that
+    /// takes any 2xx, as an RFC 7009 revocation does, reads it.
+    status: u16 = 0,
 
     pub fn deinit(self: *Response, alloc: Allocator) void {
         secret.zeroAndFree(alloc, self.body);

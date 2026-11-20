@@ -1,8 +1,9 @@
 // Sessions kept in files on this machine, through Workflow's local World.
 // libfx bundles that World into this module when it is packaged, so an app
 // installs nothing more.
+import { realpath } from "node:fs/promises";
 import { hostname } from "node:os";
-import { resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import { createWorld } from "@workflow/world-local";
 import { world } from "./world.mjs";
 
@@ -16,7 +17,7 @@ const host = hostname();
  */
 export function local({ dir, maxDurationMs, reserveMs } = {}) {
   if (dir !== undefined && (typeof dir !== "string" || dir.length === 0)) throw new TypeError("local() dir must be a path");
-  return world(() => createWorld({ ...(dir === undefined ? {} : { dataDir: dir }), recoverActiveRuns: false }), {
+  const durability = world(() => createWorld({ ...(dir === undefined ? {} : { dataDir: dir }), recoverActiveRuns: false }), {
     name: "local",
     // Each folder is a store of its own.
     store: `local:${dir === undefined ? "" : resolve(dir)}`,
@@ -37,4 +38,22 @@ export function local({ dir, maxDurationMs, reserveMs } = {}) {
       }
     },
   });
+  // world-local's start creates its folder's version file and then writes
+  // it, so a start that reads it between the two finds it empty and fails.
+  // The Worlds of one folder start one at a time, however `dir` names it.
+  // world-local picks the folder of a local() without `dir` once per
+  // process, which this cannot see, so those Worlds share a key of their own.
+  durability.startTurnKey = async () => `local:${dir === undefined ? "" : await realFolder(dir)}`;
+  return durability;
+}
+
+// `dir` with its symlinks resolved, as far as it exists: a start creates the rest.
+async function realFolder(dir) {
+  const path = resolve(dir);
+  try {
+    return await realpath(path);
+  } catch {
+    const parent = dirname(path);
+    return parent === path ? path : join(await realFolder(parent), basename(path));
+  }
 }
