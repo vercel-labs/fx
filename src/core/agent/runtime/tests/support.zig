@@ -817,16 +817,7 @@ pub const FakeAgentRuntimeDeps = struct {
             .restore_failed_prompt = if (self.capture_restored_prompts or self.record_restored_prompt) restoreFailedPrompt else null,
             .confirm_session_writer = confirmSessionWriter,
             .propagate_grant = @This().propagateGrant,
-            .push_event = pushEvent,
-            .push_text = pushText,
-            .push_tool_lifecycle = pushToolLifecycle,
-            .push_diff_block = pushDiff,
-            .push_system_notice = systemNotice,
-            .push_interactive_notice = if (self.enable_interactive_notices) interactiveNotice else null,
-            .push_context_notice = contextNotice,
-            .push_route_recovery_status = routeRecoveryStatus,
-            .push_command_output_complete = commandOutputComplete,
-            .push_http_error = httpError,
+            .emit_event = emitEvent,
             .refresh_gateway_credential = refreshGatewayCredential,
             .ask_out_of_credits = askOutOfCredits,
             .save_recovery_record = if (self.enable_recovery_record) saveRecoveryRecord else null,
@@ -1724,9 +1715,33 @@ pub const FakeAgentRuntimeDeps = struct {
         try self.record("propagate_grant:{s}:{s}", .{ tool_name, target_path });
     }
 
+    /// The fake front end's one sink. Each lent event reaches the recorder
+    /// for its kind. A notice shows its semantic form only with
+    /// `enable_interactive_notices`, and its plain text otherwise, as a front
+    /// end without interactive notices does.
+    pub fn emitEvent(raw: *anyopaque, event: runtime_deps.TurnEvent) !void {
+        const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
+        switch (event) {
+            .worker => |worker| switch (worker) {
+                .tool_lifecycle => |lifecycle| try pushToolLifecycle(raw, lifecycle),
+                .diff_block => |payload| try pushDiff(raw, payload),
+                .route_recovery_status => |status| try routeRecoveryStatus(raw, status),
+                .command_output_complete => |lifecycle_id| try commandOutputComplete(raw, lifecycle_id),
+                else => try pushEvent(raw, worker),
+            },
+            .text => |emission| try pushText(raw, emission),
+            .reasoning_delta, .session_notice => {},
+            .notice => |notice| {
+                if (self.enable_interactive_notices) if (notice.semantic) |semantic| return interactiveNotice(raw, semantic);
+                if (notice.plain) |text| try systemNotice(raw, text);
+            },
+            .context_notice => |text| try contextNotice(raw, text),
+            .http_error => |failure| try httpError(raw, failure.status, failure.detail, failure.credential_source),
+        }
+    }
+
     fn pushEvent(raw: *anyopaque, event: WorkerEvent) !void {
         const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
-        defer worker_runtime.freeWorkerEvent(std.heap.c_allocator, event);
         if (self.steering_worker) |worker| try worker.pushEvent(self.alloc, event);
         switch (event) {
             .model_call => |call| {

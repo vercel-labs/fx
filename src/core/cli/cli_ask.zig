@@ -2314,17 +2314,8 @@ fn agentRuntimeDeps(ctx: *AskContext) agent_runtime.AgentRuntimeDeps {
         .start_workspace_capture = if (ctx.workspaceCaptureContext() != null) startWorkspaceCapture else null,
         .reach_workspace = if (ctx.workspaceCaptureContext() != null) reachWorkspace else null,
         .propagate_grant = propagateGrant,
-        .push_event = pushEvent,
-        .push_text = pushText,
-        .push_tool_lifecycle = pushToolLifecycle,
-        .push_diff_block = pushDiffBlock,
-        .push_system_notice = pushSystemNotice,
-        .push_context_notice = pushContextNotice,
-        .push_session_notice = pushSessionNotice,
-        .push_route_recovery_status = pushRouteRecoveryStatus,
+        .emit_event = emitEvent,
         .begin_route_recovery_request = beginRouteRecoveryRequest,
-        .push_command_output_complete = pushCommandOutputComplete,
-        .push_http_error = pushHttpError,
         .refresh_gateway_credential = refreshGatewayCredential,
         .available_model_capabilities = availableModelCapabilities,
         .resolve_model_capabilities = resolveModelCapabilities,
@@ -3325,10 +3316,30 @@ fn reachWorkspace(raw_ctx: *anyopaque, dir: []const u8, tool_name: []const u8) v
 
 fn propagateGrant(_: *anyopaque, _: []const u8, _: []const u8) !void {}
 
-fn pushEvent(raw_ctx: *anyopaque, event: WorkerEvent) !void {
-    const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
-    defer worker_runtime.freeWorkerEvent(std.heap.c_allocator, event);
+/// fx ask's one sink for the agent loop's events, each lent for the call
+/// (`tests/tla/agent_runtime/TurnEvents.tla` InOrder).
+fn emitEvent(raw_ctx: *anyopaque, event: agent_runtime.TurnEvent) !void {
     switch (event) {
+        .worker => |worker| try pushWorkerEvent(raw_ctx, worker),
+        .text => |emission| try pushText(raw_ctx, emission),
+        // fx ask doesn't show the model's reasoning.
+        .reasoning_delta => {},
+        // fx ask shows no semantic notices, so it writes the plain text, and
+        // nothing for a notice that has none.
+        .notice => |notice| if (notice.plain) |text| try pushSystemNotice(raw_ctx, text),
+        .context_notice => |text| try pushContextNotice(raw_ctx, text),
+        .session_notice => |text| try pushSessionNotice(raw_ctx, text),
+        .http_error => |failure| try pushHttpError(raw_ctx, failure.status, failure.detail, failure.credential_source),
+    }
+}
+
+fn pushWorkerEvent(raw_ctx: *anyopaque, event: WorkerEvent) !void {
+    const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
+    switch (event) {
+        .tool_lifecycle => |lifecycle| try pushToolLifecycle(raw_ctx, lifecycle),
+        .diff_block => |payload| try pushDiffBlock(raw_ctx, payload),
+        .route_recovery_status => |status| try pushRouteRecoveryStatus(raw_ctx, status),
+        .command_output_complete => |lifecycle_id| try pushCommandOutputComplete(raw_ctx, lifecycle_id),
         .clear_route_recovery_status => {
             ctx.last_recovery_status = null;
             ctx.last_recovery_notice_kind = null;
@@ -3649,7 +3660,6 @@ fn pushRouteRecoveryStatus(raw_ctx: *anyopaque, status: types.RouteRecoveryStatu
 fn pushDiffBlock(raw_ctx: *anyopaque, payload: agent_runtime.DiffEntryPayload) !void {
     const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
     if (ctx.presenter) |presenter| return presenter.pushDiffBlock(payload);
-    defer diff_mod.freeDiffEntryPayload(std.heap.c_allocator, payload);
     try ctx.writeStderr(payload.preview);
 }
 
@@ -4638,8 +4648,8 @@ fn testPresentKeySavedStartup(alloc: Allocator, transport: oauth_transport.Provi
 }
 
 fn testPushAssistantText(deps: *const agent_runtime.AgentRuntimeDeps, text: []const u8) !void {
-    try deps.push_text(deps.ctx, .{ .assistant_source = text });
-    try deps.push_text(deps.ctx, .{ .assistant_rendered = text });
+    try deps.emit(.{ .text = .{ .assistant_source = text } });
+    try deps.emit(.{ .text = .{ .assistant_rendered = text } });
 }
 
 fn testProcessQueuedPrompt(_: *agent_runtime.Agent, deps: *const agent_runtime.AgentRuntimeDeps, semantic_presentation: ?agent_runtime.SemanticPresentationSink, lifecycle: agent_runtime.LifecycleContext, _: agent_runtime.Config, _: worker_runtime.QueuedPrompt) !void {
@@ -4653,11 +4663,11 @@ fn testProcessQueuedPromptRecoveryLifecycle(_: *agent_runtime.Agent, deps: *cons
     try std.testing.expect(semantic_presentation == null);
     try std.testing.expectEqual(hooks.ScopeKind.ask, lifecycle.scope.kind);
     // One-second refreshes of the same kind print once.
-    try deps.push_route_recovery_status(deps.ctx, .{ .kind = .waiting, .text = testRecoveryText("Offline · next try in 2s · 0s"), .attempt = 1 });
-    try deps.push_route_recovery_status(deps.ctx, .{ .kind = .waiting, .text = testRecoveryText("Offline · next try in 1s · 1s"), .attempt = 1 });
-    try deps.push_route_recovery_status(deps.ctx, .{ .kind = .retrying, .text = testRecoveryText("Offline · retrying · attempt 2 · 2s"), .attempt = 2 });
-    try deps.push_event(deps.ctx, .clear_route_recovery_status);
-    try deps.push_route_recovery_status(deps.ctx, .{ .kind = .recovered, .attempt = 2 });
+    try deps.emit(.{ .worker = .{ .route_recovery_status = .{ .kind = .waiting, .text = testRecoveryText("Offline · next try in 2s · 0s"), .attempt = 1 } } });
+    try deps.emit(.{ .worker = .{ .route_recovery_status = .{ .kind = .waiting, .text = testRecoveryText("Offline · next try in 1s · 1s"), .attempt = 1 } } });
+    try deps.emit(.{ .worker = .{ .route_recovery_status = .{ .kind = .retrying, .text = testRecoveryText("Offline · retrying · attempt 2 · 2s"), .attempt = 2 } } });
+    try deps.emit(.{ .worker = .clear_route_recovery_status });
+    try deps.emit(.{ .worker = .{ .route_recovery_status = .{ .kind = .recovered, .attempt = 2 } } });
     try testPushAssistantText(deps, "assistant text");
 }
 
@@ -4668,27 +4678,27 @@ fn testProcessQueuedPromptRecoveredThenFailed(_: *agent_runtime.Agent, deps: *co
     const begin = deps.begin_route_recovery_request.?;
     // The first step's request recovers from a 503.
     begin(deps.ctx);
-    try deps.push_route_recovery_status(deps.ctx, .{ .kind = .waiting, .text = testRecoveryText("Gateway error · next try in 1s · attempt 1 · 0s"), .attempt = 1 });
-    try deps.push_event(deps.ctx, .clear_route_recovery_status);
-    try deps.push_route_recovery_status(deps.ctx, .{ .kind = .recovered, .attempt = 2 });
+    try deps.emit(.{ .worker = .{ .route_recovery_status = .{ .kind = .waiting, .text = testRecoveryText("Gateway error · next try in 1s · attempt 1 · 0s"), .attempt = 1 } } });
+    try deps.emit(.{ .worker = .clear_route_recovery_status });
+    try deps.emit(.{ .worker = .{ .route_recovery_status = .{ .kind = .recovered, .attempt = 2 } } });
     // The second step's request fails with HTTP 400 on its first try.
     begin(deps.ctx);
-    try deps.push_http_error(deps.ctx, .bad_request, "bad request body", null);
+    try deps.emit(.{ .http_error = .{ .status = .bad_request, .detail = "bad request body", .credential_source = null } });
     return error.ModelError;
 }
 
 fn testProcessQueuedPromptRetryAdmissionFailure(_: *agent_runtime.Agent, deps: *const agent_runtime.AgentRuntimeDeps, semantic_presentation: ?agent_runtime.SemanticPresentationSink, _: agent_runtime.LifecycleContext, _: agent_runtime.Config, _: worker_runtime.QueuedPrompt) !void {
     try std.testing.expect(semantic_presentation == null);
-    try deps.push_route_recovery_status(deps.ctx, .{
+    try deps.emit(.{ .worker = .{ .route_recovery_status = .{
         .kind = .waiting,
         .text = testRecoveryText("Gateway error · next try in 4s · attempt 1 · 0s"),
         .attempt = 1,
-    });
-    try deps.push_route_recovery_status(deps.ctx, .{
+    } } });
+    try deps.emit(.{ .worker = .{ .route_recovery_status = .{
         .kind = .terminal_provider_error,
         .attempt = 1,
         .diagnostic = types.ModelFailureDiagnostic.init("TestProviderSerializationFailed"),
-    });
+    } } });
     return error.TestProviderSerializationFailed;
 }
 
@@ -4713,8 +4723,8 @@ fn testProcessQueuedPromptRepeatsSkillDiagnostic(agent: *agent_runtime.Agent, de
     var notice: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer notice.deinit();
     try skill_runtime.writeDiagnosticSummary(std.testing.allocator, &notice.writer, &diagnostics);
-    try deps.push_context_notice.?(deps.ctx, notice.written());
-    try deps.push_context_notice.?(deps.ctx, notice.written());
+    try deps.emit(.{ .context_notice = notice.written() });
+    try deps.emit(.{ .context_notice = notice.written() });
     try testProcessQueuedPrompt(agent, deps, semantic_presentation, lifecycle, cfg, job);
 }
 
@@ -4792,32 +4802,17 @@ fn testProcessQueuedPromptChecksInjectedToolSet(_: *agent_runtime.Agent, deps: *
 
 fn testProcessQueuedPromptHttp413(_: *agent_runtime.Agent, deps: *const agent_runtime.AgentRuntimeDeps, semantic_presentation: ?agent_runtime.SemanticPresentationSink, _: agent_runtime.LifecycleContext, _: agent_runtime.Config, _: worker_runtime.QueuedPrompt) !void {
     try std.testing.expect(semantic_presentation == null);
-    try deps.push_http_error(
-        deps.ctx,
-        .payload_too_large,
-        "provider payload rejected\n\nprompt_too_long=true\nProvider rejected the prompt as too large. Latest local tool evidence remains in session history/result handles; no local tool actions were replayed.",
-        null,
-    );
+    try deps.emit(.{ .http_error = .{ .status = .payload_too_large, .detail = "provider payload rejected\n\nprompt_too_long=true\nProvider rejected the prompt as too large. Latest local tool evidence remains in session history/result handles; no local tool actions were replayed.", .credential_source = null } });
 }
 
 fn testProcessQueuedPromptRestrictedProvider(_: *agent_runtime.Agent, deps: *const agent_runtime.AgentRuntimeDeps, semantic_presentation: ?agent_runtime.SemanticPresentationSink, _: agent_runtime.LifecycleContext, _: agent_runtime.Config, _: worker_runtime.QueuedPrompt) !void {
     try std.testing.expect(semantic_presentation == null);
-    try deps.push_http_error(
-        deps.ctx,
-        .forbidden,
-        "{\"error\":{\"message\":\"Your team has restricted access to this provider. Contact the owner of the account for more details. Providers considered: wafer\",\"type\":\"no_providers_available\",\"param\":{\"name\":\"RestrictedProvidersError\",\"message\":\"Your team has restricted access to this provider. Contact the owner of the account for more details. Providers considered: wafer\"}},\"providerMetadata\":{\"gateway\":{\"routing\":{}}}}",
-        null,
-    );
+    try deps.emit(.{ .http_error = .{ .status = .forbidden, .detail = "{\"error\":{\"message\":\"Your team has restricted access to this provider. Contact the owner of the account for more details. Providers considered: wafer\",\"type\":\"no_providers_available\",\"param\":{\"name\":\"RestrictedProvidersError\",\"message\":\"Your team has restricted access to this provider. Contact the owner of the account for more details. Providers considered: wafer\"}},\"providerMetadata\":{\"gateway\":{\"routing\":{}}}}", .credential_source = null } });
 }
 
 fn testProcessQueuedPromptUnauthorized(_: *agent_runtime.Agent, deps: *const agent_runtime.AgentRuntimeDeps, semantic_presentation: ?agent_runtime.SemanticPresentationSink, _: agent_runtime.LifecycleContext, _: agent_runtime.Config, job: worker_runtime.QueuedPrompt) !void {
     try std.testing.expect(semantic_presentation == null);
-    try deps.push_http_error(
-        deps.ctx,
-        .unauthorized,
-        "provider rejected secret-key body",
-        job.credential_source,
-    );
+    try deps.emit(.{ .http_error = .{ .status = .unauthorized, .detail = "provider rejected secret-key body", .credential_source = job.credential_source } });
 }
 
 var test_initialize_session_store_calls: usize = 0;
@@ -9249,31 +9244,31 @@ test "CLI tagged stream routes source output rendering and diagnostics by mode" 
     ctx.output_mode = .raw;
 
     const deps = agentRuntimeDeps(&ctx);
-    try deps.push_text(deps.ctx, .{ .assistant_rendered = rendered_span });
-    for (source_spans) |span| try deps.push_text(deps.ctx, .{ .assistant_source = span });
+    try deps.emit(.{ .text = .{ .assistant_rendered = rendered_span } });
+    for (source_spans) |span| try deps.emit(.{ .text = .{ .assistant_source = span } });
 
     try std.testing.expectEqualStrings(source_output, stdout_capture.bytes.items);
     try std.testing.expectEqualStrings("", stderr_capture.bytes.items);
     try std.testing.expectEqual(@as(usize, 0), ctx.assistant_output.items.len);
 
-    try deps.push_tool_lifecycle(deps.ctx, .{
+    try deps.emit(.{ .worker = .{ .tool_lifecycle = .{
         .authoritative_started = .{
             .id = .{ .turn_id = 1, .call_id = "read_1" },
             .reconciles_provisional_call_id = null,
             .tool_name = "read_file",
             .activity_kind = .read,
         },
-    });
+    } } });
     try std.testing.expectEqual(@as(usize, 1), ctx.step_count);
-    try deps.push_tool_lifecycle(deps.ctx, .{
+    try deps.emit(.{ .worker = .{ .tool_lifecycle = .{
         .progress = .{
             .id = .{ .turn_id = 1, .call_id = "read_1" },
             .text = "Reading src/main.zig",
         },
-    });
+    } } });
     try std.testing.expectEqualStrings("Reading src/main.zig\n", stderr_capture.bytes.items);
-    try deps.push_text(deps.ctx, .{ .assistant_source = "after **tool**\n" });
-    try deps.push_text(deps.ctx, .{ .operational = "diagnostic\n" });
+    try deps.emit(.{ .text = .{ .assistant_source = "after **tool**\n" } });
+    try deps.emit(.{ .text = .{ .operational = "diagnostic\n" } });
 
     try std.testing.expectEqualStrings(
         source_output ++ "\nafter **tool**\n",
@@ -9300,9 +9295,9 @@ test "CLI tagged stream routes source output rendering and diagnostics by mode" 
     json_ctx.output_mode = .json;
 
     const json_deps = agentRuntimeDeps(&json_ctx);
-    try json_deps.push_text(json_deps.ctx, .{ .assistant_rendered = rendered_span });
-    for (source_spans) |span| try json_deps.push_text(json_deps.ctx, .{ .assistant_source = span });
-    try json_deps.push_text(json_deps.ctx, .{ .operational = "diagnostic\n" });
+    try json_deps.emit(.{ .text = .{ .assistant_rendered = rendered_span } });
+    for (source_spans) |span| try json_deps.emit(.{ .text = .{ .assistant_source = span } });
+    try json_deps.emit(.{ .text = .{ .operational = "diagnostic\n" } });
     const finished = try types.dupeFinishedPrompt(std.heap.c_allocator, .{
         .turn = .{ .assistant = .{
             .user = .{ .text = @constCast("prompt") },
@@ -9310,7 +9305,8 @@ test "CLI tagged stream routes source output rendering and diagnostics by mode" 
         } },
         .terminal_outcome = .completed,
     });
-    try json_deps.push_event(json_deps.ctx, .{ .finish_prompt = finished });
+    defer types.freeFinishedPrompt(std.heap.c_allocator, finished);
+    try json_deps.emit(.{ .worker = .{ .finish_prompt = finished } });
 
     try std.testing.expectEqualStrings(source_output, json_ctx.assistant_output.items);
     try std.testing.expectEqualStrings("final answer", json_ctx.final_output.items);
@@ -9342,22 +9338,22 @@ test "CLI response restart preserves completed output and removes only the faile
     defer ctx.deinit();
     ctx.output_mode = .json;
     const deps = agentRuntimeDeps(&ctx);
-    try deps.push_text(deps.ctx, .assistant_started);
-    try deps.push_text(deps.ctx, .{ .assistant_source = "Completed tool commentary." });
-    try deps.push_text(deps.ctx, .assistant_started);
-    try deps.push_text(deps.ctx, .{ .assistant_source = "DISCARDED partial" });
-    try deps.push_text(deps.ctx, .{ .assistant_restarted = "Restart notice\n" });
+    try deps.emit(.{ .text = .assistant_started });
+    try deps.emit(.{ .text = .{ .assistant_source = "Completed tool commentary." } });
+    try deps.emit(.{ .text = .assistant_started });
+    try deps.emit(.{ .text = .{ .assistant_source = "DISCARDED partial" } });
+    try deps.emit(.{ .text = .{ .assistant_restarted = "Restart notice\n" } });
     try std.testing.expectEqualStrings("Completed tool commentary.DISCARDED partial", ctx.assistant_output.items);
-    try deps.push_text(deps.ctx, .assistant_started);
-    try deps.push_text(deps.ctx, .{ .assistant_source = "Replacement." });
+    try deps.emit(.{ .text = .assistant_started });
+    try deps.emit(.{ .text = .{ .assistant_source = "Replacement." } });
     try std.testing.expectEqualStrings("Completed tool commentary.\n\nReplacement.", ctx.assistant_output.items);
     try std.testing.expectEqualStrings("Restart notice\n", stderr_capture.bytes.items);
     try std.testing.expectEqualStrings("", stdout_capture.bytes.items);
 
     ctx.output_mode = .raw;
-    try deps.push_text(deps.ctx, .{ .assistant_source = "partial" });
-    try deps.push_text(deps.ctx, .{ .assistant_restarted = "\n\nRestart notice\n\n" });
-    try deps.push_text(deps.ctx, .{ .assistant_source = "Replacement." });
+    try deps.emit(.{ .text = .{ .assistant_source = "partial" } });
+    try deps.emit(.{ .text = .{ .assistant_restarted = "\n\nRestart notice\n\n" } });
+    try deps.emit(.{ .text = .{ .assistant_source = "Replacement." } });
     try std.testing.expectEqualStrings("partial\n\nRestart notice\n\nReplacement.", stdout_capture.bytes.items);
 }
 
@@ -9377,12 +9373,12 @@ test "CLI keeps an unreplaced preview on failure and discards it on completion" 
         defer ctx.deinit();
         ctx.output_mode = .json;
         const deps = agentRuntimeDeps(&ctx);
-        try deps.push_text(deps.ctx, .assistant_started);
-        try deps.push_text(deps.ctx, .{ .assistant_source = "Completed commentary.\n\n" });
-        try deps.push_text(deps.ctx, .assistant_started);
-        try deps.push_text(deps.ctx, .{ .assistant_source = "Retained preview." });
-        try deps.push_text(deps.ctx, .{ .assistant_restarted = "Restart\n" });
-        try deps.push_text(deps.ctx, .{ .assistant_restarted = "Restart\n" });
+        try deps.emit(.{ .text = .assistant_started });
+        try deps.emit(.{ .text = .{ .assistant_source = "Completed commentary.\n\n" } });
+        try deps.emit(.{ .text = .assistant_started });
+        try deps.emit(.{ .text = .{ .assistant_source = "Retained preview." } });
+        try deps.emit(.{ .text = .{ .assistant_restarted = "Restart\n" } });
+        try deps.emit(.{ .text = .{ .assistant_restarted = "Restart\n" } });
         try deps.finalize_turn(deps.ctx, 1, outcome, null);
         try std.testing.expectEqualStrings(
             if (outcome == .completed) "Completed commentary.\n\n" else "Completed commentary.\n\nRetained preview.",
@@ -9448,7 +9444,8 @@ test "CLI final output admits only completed assistant finish prompts" {
 
     for (cases) |source| {
         const owned = try types.dupeFinishedPrompt(std.heap.c_allocator, source);
-        try deps.push_event(deps.ctx, .{ .finish_prompt = owned });
+        defer types.freeFinishedPrompt(std.heap.c_allocator, owned);
+        try deps.emit(.{ .worker = .{ .finish_prompt = owned } });
         try std.testing.expectEqual(@as(usize, 0), ctx.final_output.items.len);
         try std.testing.expectEqual(@as(usize, 0), ctx.final_source.items.len);
     }
@@ -9471,10 +9468,10 @@ test "CLI final source keeps only the completed response with its Markdown" {
     const deps = agentRuntimeDeps(&ctx);
 
     const draft = "Add note probe\n\n## Summary\n\n- Uses **bold** and `inline code`.";
-    try deps.push_text(deps.ctx, .assistant_started);
-    try deps.push_text(deps.ctx, .{ .assistant_source = "Let me check the note first." });
-    try deps.push_text(deps.ctx, .assistant_started);
-    try deps.push_text(deps.ctx, .{ .assistant_source = draft });
+    try deps.emit(.{ .text = .assistant_started });
+    try deps.emit(.{ .text = .{ .assistant_source = "Let me check the note first." } });
+    try deps.emit(.{ .text = .assistant_started });
+    try deps.emit(.{ .text = .{ .assistant_source = draft } });
     const finished = try types.dupeFinishedPrompt(std.heap.c_allocator, .{
         .turn = .{ .assistant = .{
             .user = .{ .text = @constCast("prompt") },
@@ -9482,7 +9479,8 @@ test "CLI final source keeps only the completed response with its Markdown" {
         } },
         .terminal_outcome = .completed,
     });
-    try deps.push_event(deps.ctx, .{ .finish_prompt = finished });
+    defer types.freeFinishedPrompt(std.heap.c_allocator, finished);
+    try deps.emit(.{ .worker = .{ .finish_prompt = finished } });
 
     const result = try takePromptRunResult(&ctx, alloc);
     defer result.deinit(alloc);
@@ -9498,7 +9496,8 @@ test "CLI final source keeps only the completed response with its Markdown" {
         .presentation_text = "Earlier candidate.\n\n" ++ draft,
         .terminal_outcome = .completed,
     });
-    try deps.push_event(deps.ctx, .{ .finish_prompt = displayed });
+    defer types.freeFinishedPrompt(std.heap.c_allocator, displayed);
+    try deps.emit(.{ .worker = .{ .finish_prompt = displayed } });
     try std.testing.expectEqualStrings(draft, ctx.final_source.items);
     try std.testing.expect(std.mem.startsWith(u8, ctx.final_output.items, "Earlier candidate."));
 }
@@ -9547,123 +9546,123 @@ test "CLI nonterminal progress preserves distinct not-run labels without duplica
     ctx.output_mode = .raw;
 
     const deps = agentRuntimeDeps(&ctx);
-    try deps.push_tool_lifecycle(deps.ctx, .{ .authoritative_started = .{
+    try deps.emit(.{ .worker = .{ .tool_lifecycle = .{ .authoritative_started = .{
         .id = .{ .turn_id = 1, .call_id = "deferred_write" },
         .reconciles_provisional_call_id = null,
         .tool_name = "write_file",
         .activity_kind = .write,
-    } });
-    try deps.push_tool_lifecycle(deps.ctx, .{ .progress = .{
+    } } } });
+    try deps.emit(.{ .worker = .{ .tool_lifecycle = .{ .progress = .{
         .id = .{ .turn_id = 1, .call_id = "deferred_write" },
         .text = "Writing file",
-    } });
-    try deps.push_tool_lifecycle(deps.ctx, .{ .terminal = .{
+    } } } });
+    try deps.emit(.{ .worker = .{ .tool_lifecycle = .{ .terminal = .{
         .id = .{ .turn_id = 1, .call_id = "deferred_write" },
         .outcome = .{ .kind = .deferred, .summary = "Reading project instructions before continuing: Writing file" },
-    } });
+    } } } });
     try std.testing.expectEqualStrings("Writing file\n", stderr_capture.bytes.items);
 
-    try deps.push_tool_lifecycle(deps.ctx, .{ .authoritative_started = .{
+    try deps.emit(.{ .worker = .{ .tool_lifecycle = .{ .authoritative_started = .{
         .id = .{ .turn_id = 2, .call_id = "retry_write" },
         .reconciles_provisional_call_id = null,
         .tool_name = "write_file",
         .activity_kind = .write,
-    } });
-    try deps.push_tool_lifecycle(deps.ctx, .{ .progress = .{
+    } } } });
+    try deps.emit(.{ .worker = .{ .tool_lifecycle = .{ .progress = .{
         .id = .{ .turn_id = 2, .call_id = "retry_write" },
         .text = "Writing file",
-    } });
+    } } } });
     try std.testing.expectEqualStrings("Writing file\n", stderr_capture.bytes.items);
-    try deps.push_tool_lifecycle(deps.ctx, .{ .terminal = .{
+    try deps.emit(.{ .worker = .{ .tool_lifecycle = .{ .terminal = .{
         .id = .{ .turn_id = 2, .call_id = "retry_write" },
         .outcome = .{ .kind = .deferred, .summary = "Reading project instructions before continuing: Writing file" },
-    } });
+    } } } });
 
-    try deps.push_tool_lifecycle(deps.ctx, .{ .authoritative_started = .{
+    try deps.emit(.{ .worker = .{ .tool_lifecycle = .{ .authoritative_started = .{
         .id = .{ .turn_id = 3, .call_id = "final_retry_write" },
         .reconciles_provisional_call_id = null,
         .tool_name = "write_file",
         .activity_kind = .write,
-    } });
-    try deps.push_tool_lifecycle(deps.ctx, .{ .progress = .{
+    } } } });
+    try deps.emit(.{ .worker = .{ .tool_lifecycle = .{ .progress = .{
         .id = .{ .turn_id = 3, .call_id = "final_retry_write" },
         .text = "Writing file",
-    } });
+    } } } });
     try std.testing.expectEqualStrings("Writing file\n", stderr_capture.bytes.items);
 
-    try deps.push_tool_lifecycle(deps.ctx, .{ .authoritative_started = .{
+    try deps.emit(.{ .worker = .{ .tool_lifecycle = .{ .authoritative_started = .{
         .id = .{ .turn_id = 4, .call_id = "resolved_write" },
         .reconciles_provisional_call_id = null,
         .tool_name = "write_file",
         .activity_kind = .write,
-    } });
-    try deps.push_tool_lifecycle(deps.ctx, .{ .progress = .{
+    } } } });
+    try deps.emit(.{ .worker = .{ .tool_lifecycle = .{ .progress = .{
         .id = .{ .turn_id = 4, .call_id = "resolved_write" },
         .text = "Writing build/pkg/proof.txt",
-    } });
+    } } } });
     try std.testing.expectEqualStrings(
         "Writing file\nWriting build/pkg/proof.txt\n",
         stderr_capture.bytes.items,
     );
 
-    try deps.push_tool_lifecycle(deps.ctx, .{ .authoritative_started = .{
+    try deps.emit(.{ .worker = .{ .tool_lifecycle = .{ .authoritative_started = .{
         .id = .{ .turn_id = 5, .call_id = "invalid_fetch" },
         .reconciles_provisional_call_id = null,
         .tool_name = "web_fetch",
         .activity_kind = .read,
-    } });
-    try deps.push_tool_lifecycle(deps.ctx, .{ .progress = .{
+    } } } });
+    try deps.emit(.{ .worker = .{ .tool_lifecycle = .{ .progress = .{
         .id = .{ .turn_id = 5, .call_id = "invalid_fetch" },
         .text = "Fetching",
-    } });
+    } } } });
     try std.testing.expectEqualStrings(
         "Writing file\nWriting build/pkg/proof.txt\n",
         stderr_capture.bytes.items,
     );
 
-    try deps.push_tool_lifecycle(deps.ctx, .{ .provisional = .{
+    try deps.emit(.{ .worker = .{ .tool_lifecycle = .{ .provisional = .{
         .id = .{ .turn_id = 6, .call_id = "streamed_read" },
         .tool_name = "read_file",
         .activity_kind = .read,
-    } });
-    try deps.push_tool_lifecycle(deps.ctx, .{ .progress = .{
+    } } } });
+    try deps.emit(.{ .worker = .{ .tool_lifecycle = .{ .progress = .{
         .id = .{ .turn_id = 6, .call_id = "streamed_read" },
         .text = "Reading streamed input",
-    } });
+    } } } });
     try std.testing.expectEqualStrings(
         "Writing file\nWriting build/pkg/proof.txt\nReading streamed input\n",
         stderr_capture.bytes.items,
     );
 
-    try deps.push_tool_lifecycle(deps.ctx, .{ .authoritative_started = .{
+    try deps.emit(.{ .worker = .{ .tool_lifecycle = .{ .authoritative_started = .{
         .id = .{ .turn_id = 7, .call_id = "legacy_deferred_write" },
         .reconciles_provisional_call_id = null,
         .tool_name = "write_file",
         .activity_kind = .write,
-    } });
-    try deps.push_tool_lifecycle(deps.ctx, .{ .progress = .{
+    } } } });
+    try deps.emit(.{ .worker = .{ .tool_lifecycle = .{ .progress = .{
         .id = .{ .turn_id = 7, .call_id = "legacy_deferred_write" },
         .text = "Writing legacy file",
-    } });
-    try deps.push_tool_lifecycle(deps.ctx, .{ .terminal = .{
+    } } } });
+    try deps.emit(.{ .worker = .{ .tool_lifecycle = .{ .terminal = .{
         .id = .{ .turn_id = 7, .call_id = "legacy_deferred_write" },
         .outcome = .{ .kind = .denied, .summary = "Not executed: Writing legacy file" },
-    } });
+    } } } });
     try std.testing.expectEqualStrings(
         "Writing file\nWriting build/pkg/proof.txt\nReading streamed input\nWriting legacy file\n",
         stderr_capture.bytes.items,
     );
 
-    try deps.push_tool_lifecycle(deps.ctx, .{ .authoritative_started = .{
+    try deps.emit(.{ .worker = .{ .tool_lifecycle = .{ .authoritative_started = .{
         .id = .{ .turn_id = 8, .call_id = "legacy_retry_write" },
         .reconciles_provisional_call_id = null,
         .tool_name = "write_file",
         .activity_kind = .write,
-    } });
-    try deps.push_tool_lifecycle(deps.ctx, .{ .progress = .{
+    } } } });
+    try deps.emit(.{ .worker = .{ .tool_lifecycle = .{ .progress = .{
         .id = .{ .turn_id = 8, .call_id = "legacy_retry_write" },
         .text = "Writing legacy file",
-    } });
+    } } } });
     try std.testing.expectEqualStrings(
         "Writing file\nWriting build/pkg/proof.txt\nReading streamed input\nWriting legacy file\n",
         stderr_capture.bytes.items,

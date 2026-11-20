@@ -1151,10 +1151,10 @@ pub fn appendFrozenFileMutationGrants(
 
 fn propagateGrant(hooks: *const AgentRuntimeDeps, grant: PermissionGrant) !void {
     try hooks.propagate_grant(hooks.ctx, grant.tool_name, grant.target_path);
-    try hooks.push_event(hooks.ctx, .{ .session_grant = .{
-        .tool_name = try std.heap.c_allocator.dupe(u8, grant.tool_name),
-        .target_path = try std.heap.c_allocator.dupe(u8, grant.target_path),
-    } });
+    try hooks.emit(.{ .worker = .{ .session_grant = .{
+        .tool_name = @constCast(grant.tool_name),
+        .target_path = @constCast(grant.target_path),
+    } } });
 }
 
 pub fn registeredToolValidationFailure(hooks: *const AgentRuntimeDeps, arena: Allocator, call: ToolCall) !?ToolExecutionResult {

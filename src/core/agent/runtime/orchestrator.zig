@@ -14,6 +14,7 @@ const model_catalog = @import("../../gateway/model_catalog.zig");
 const types = @import("../../shared/types.zig");
 const history_range = @import("../../shared/history_range.zig");
 const worker_runtime = @import("../worker_runtime.zig");
+const diff_mod = @import("../../output/diff.zig");
 const agent_stream_provider = @import("../stream_provider.zig");
 const session_runtime = @import("../../session/session.zig");
 const session_codec = @import("../../session/session_codec.zig");
@@ -3134,7 +3135,7 @@ fn queueAttachedFolderRules(
         .context_limits = config.context_limits,
     });
     defer selected.deinit(arena);
-    for (selected.notices) |notice| try deps.pushContextNotice(notice);
+    for (selected.notices) |notice| try deps.emit(.{ .context_notice = notice });
     const queued_before = pending_notes.items.len;
     try commitContextNote(arena, pending_notes, context_delivery_state, registry.instruction_files, &selected, replaced_sources, remind_sources);
     debug_trace.logf("context", "attached folder rules images={d} files={d} omitted={d} notes_queued={d}", .{
@@ -4705,10 +4706,11 @@ fn publishModelCall(deps: *const AgentRuntimeDeps, record: types.ModelCallRecord
     publishHeldModelCall(deps, owned);
 }
 
-/// Shows an owned call record in Ctrl+O, giving it to the event queue.
+/// Shows an owned call record in Ctrl+O, then frees it: the event is lent,
+/// and a front end copies what it keeps.
 fn publishHeldModelCall(deps: *const AgentRuntimeDeps, owned: types.ModelCallRecord) void {
-    deps.push_event(deps.ctx, .{ .model_call = owned }) catch |err| {
-        types.freeModelCallRecordStrings(std.heap.c_allocator, owned);
+    defer types.freeModelCallRecordStrings(std.heap.c_allocator, owned);
+    deps.emit(.{ .worker = .{ .model_call = owned } }) catch |err| {
         debug_trace.logf("agent", "model call record publication failed err={s} dropped=live_call_record", .{@errorName(err)});
     };
 }
@@ -4989,11 +4991,7 @@ fn pushWaitingHttpFailureReason(
 ) !void {
     const detail = try httpFailureDetail(arena, failure, job, request_capabilities);
     const message = try gateway_error_format.formatHttpErrorMessage(arena, failureStatus(failure), detail);
-    if (deps.push_interactive_notice) |push| {
-        try push(deps.ctx, .{ .topic = "system", .tone = .warning, .body = message });
-    } else {
-        try deps.push_system_notice(deps.ctx, message);
-    }
+    try deps.emit(.{ .notice = .{ .semantic = .{ .topic = "system", .tone = .warning, .body = message }, .plain = message } });
 }
 
 /// Names the Vercel team a refused login was sent for, and how to choose
@@ -5012,11 +5010,7 @@ fn pushRefusedTeamHint(deps: *const AgentRuntimeDeps, arena: Allocator, job: Que
         )
     else
         "fx sent this request for this login's Vercel team. If that is the wrong team, press Esc twice, run /login, choose another team, and send it again.";
-    if (deps.push_interactive_notice) |push| {
-        try push(deps.ctx, .{ .topic = "system", .tone = .warning, .body = message });
-    } else {
-        try deps.push_system_notice(deps.ctx, message);
-    }
+    try deps.emit(.{ .notice = .{ .semantic = .{ .topic = "system", .tone = .warning, .body = message }, .plain = message } });
 }
 
 const UserAnswer = enum { resend, cancelled, switch_model };
@@ -5535,6 +5529,13 @@ test "deferred tool cleanup contains publication failure and preserves tracking"
             self.failed_terminal = event == .terminal and event.terminal.outcome.kind == .failed;
             return error.TestCleanupSinkFailed;
         }
+
+        fn emit(raw: *anyopaque, event: runtime_deps.TurnEvent) !void {
+            switch (event) {
+                .worker => |worker| if (worker == .tool_lifecycle) return push(raw, worker.tool_lifecycle),
+                else => {},
+            }
+        }
     };
     const alloc = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(alloc);
@@ -5547,7 +5548,7 @@ test "deferred tool cleanup contains publication failure and preserves tracking"
     defer stream_ctx.deinit();
     try stream_ctx.provisional_statuses.publish(&deps, alloc, 73, "local", "read_file", .read, "Reading", "fixture.txt", null);
     deps.ctx = &sink;
-    deps.push_tool_lifecycle = Sink.push;
+    deps.emit_event = Sink.emit;
     var cancelled = std.atomic.Value(bool).init(false);
     settle_deferred_tool_starts(&deps, &stream_ctx, arena_state.allocator(), 73, &cancelled);
     try std.testing.expectEqual(@as(usize, 1), sink.calls);
@@ -6093,11 +6094,7 @@ fn appendPermissionFeedbackAfterToolResult(
     );
     for (feedback) |text| {
         if (text.len == 0) continue;
-        const event = worker_runtime.WorkerEvent{
-            .append_user_feedback = try std.heap.c_allocator.dupe(u8, text),
-        };
-        errdefer worker_runtime.freeWorkerEvent(std.heap.c_allocator, event);
-        try deps.push_event(deps.ctx, event);
+        try deps.emit(.{ .worker = .{ .append_user_feedback = @constCast(text) } });
     }
 }
 
@@ -6233,9 +6230,9 @@ fn prepareSkillCatalog(
     // With toolbox the catalog's text isn't sent, so its shortening isn't
     // news; the menu counts what it leaves out.
     if (!toolbox.isAdvertised(config.advertised_tool_names)) {
-        if (section.notice) |notice| try deps.pushContextNotice(notice);
+        if (section.notice) |notice| try deps.emit(.{ .context_notice = notice });
     }
-    if (section.diagnostic_notice) |notice| try deps.pushContextNotice(notice);
+    if (section.diagnostic_notice) |notice| try deps.emit(.{ .context_notice = notice });
     return section;
 }
 
@@ -6262,7 +6259,7 @@ fn toolboxMenu(
     if (descriptions_limited > 0) {
         var notice: std.Io.Writer.Allocating = .init(arena);
         skill_runtime.writeDescriptionsShortened(&notice.writer, descriptions_limited, config.context_limits) catch return error.OutOfMemory;
-        try deps.pushContextNotice(notice.written());
+        try deps.emit(.{ .context_notice = notice.written() });
     }
     // Sorted here, so the menu never depends on the order a host lists them.
     const servers = try arena.dupe([]const u8, config.toolbox_mcp_servers);
@@ -6280,7 +6277,7 @@ fn toolboxMenu(
     if (decided.shortened) {
         var notice: std.Io.Writer.Allocating = .init(arena);
         skill_runtime.writeListShortened(&notice.writer, config.context_limits, context_window) catch return error.OutOfMemory;
-        try deps.pushContextNotice(notice.written());
+        try deps.emit(.{ .context_notice = notice.written() });
     }
     if (decided.note) |note| {
         // A note in the turn, saved with it, so the model learns of the
@@ -6667,17 +6664,16 @@ fn processQueuedPromptInner(
             };
             break :load_explicit prepared;
         };
-        if (explicit_section.?.notice) |notice| try deps.pushContextNotice(notice);
-        if (explicit_section.?.diagnostic_notice) |notice| try deps.pushContextNotice(notice);
-        if (deps.push_interactive_notice) |push_notice| {
-            if (explicit_section.?.load_details) |details| try push_notice(deps.ctx, .{
-                .topic = "skills",
-                .tone = .warning,
-                .body = details,
-                .visibility = .full_only,
-            });
-            if (explicit_section.?.load_notice) |notice| try push_notice(deps.ctx, notice);
-        }
+        if (explicit_section.?.notice) |notice| try deps.emit(.{ .context_notice = notice });
+        if (explicit_section.?.diagnostic_notice) |notice| try deps.emit(.{ .context_notice = notice });
+        // Only a front end that shows semantic notices shows these.
+        if (explicit_section.?.load_details) |details| try deps.emit(.{ .notice = .{ .semantic = .{
+            .topic = "skills",
+            .tone = .warning,
+            .body = details,
+            .visibility = .full_only,
+        } } });
+        if (explicit_section.?.load_notice) |notice| try deps.emit(.{ .notice = .{ .semantic = notice } });
     }
     // A named skill's text rides on the turn's own message, so the
     // instructions stay as they were cached, and the turn saves it as sent,
@@ -7761,7 +7757,7 @@ test "compaction activity transaction settles only after publication and preserv
         deps.agent_stream_provider.stream_fn = Host.stream;
         deps.compaction_activity = .{ .begin = Host.begin, .running = Host.running, .settle = Host.settle };
         deps.commit_context_compaction = .{ .commit = Host.commit };
-        deps.push_interactive_notice = null;
+        host.fake.enable_interactive_notices = false;
         var tmp = std.testing.tmpDir(.{});
         defer tmp.cleanup();
         const dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
@@ -8221,7 +8217,7 @@ fn processQueuedPromptLoop(
                     checkpoint.assistant_source,
                     job.recovery_source_already_presented,
                 );
-                if (!job.recovery_source_already_presented) try deps.push_text(deps.ctx, .{ .assistant_rendered = "\n" });
+                if (!job.recovery_source_already_presented) try deps.emit(.{ .text = .{ .assistant_rendered = "\n" } });
                 try finishCommonAssistantTerminal(
                     deps,
                     finalization,
@@ -8424,8 +8420,8 @@ fn processQueuedPromptLoop(
                     // connection fx could not make.
                     const failure = if (deps.model_catalog_failure) |catalog_failure| catalog_failure(deps.ctx) else null;
                     if (try catalogUnreachableImageLine(overlay_arena, failure, model_catalog.serviceName(job.provider))) |line| {
-                        try deps.push_text(deps.ctx, .{ .operational = line });
-                        try deps.push_text(deps.ctx, .{ .operational = "\n" });
+                        try deps.emit(.{ .text = .{ .operational = line } });
+                        try deps.emit(.{ .text = .{ .operational = "\n" } });
                     }
                     return error.ModelImageCapabilityUnavailable;
                 },
@@ -8567,9 +8563,7 @@ fn processQueuedPromptLoop(
             // IgnoredEffortNoticed, NoticeOncePerSession).
             if (job.provider == .configured and !step_effort.isDefault() and provider_opts.reasoning == null and !ignored_effort_notified) {
                 ignored_effort_notified = true;
-                if (deps.push_session_notice) |push| {
-                    try push(deps.ctx, try overlay_arena.print(ignored_effort_notice, .{ step_effort.label(), gateway_model }));
-                }
+                try deps.emit(.{ .session_notice = try overlay_arena.print(ignored_effort_notice, .{ step_effort.label(), gateway_model }) });
             }
             // Fast drops silently when the catalog cannot confirm support.
             // Tell the user once per turn, but only when the catalog itself is
@@ -8596,8 +8590,8 @@ fn processQueuedPromptLoop(
                     .fast_off = fast_catalog_failure != null,
                 });
                 for (lines.slice()) |line| {
-                    try deps.push_text(deps.ctx, .{ .operational = line });
-                    try deps.push_text(deps.ctx, .{ .operational = "\n" });
+                    try deps.emit(.{ .text = .{ .operational = line } });
+                    try deps.emit(.{ .text = .{ .operational = "\n" } });
                 }
             }
             const tool_choice: types.ToolChoice = if (recovery_strategy == .reconcile_tool)
@@ -9105,7 +9099,7 @@ fn processQueuedPromptLoop(
                             &preserved_tool_evidence,
                         );
                         if (interruption_source.len > 0) {
-                            try deps.push_text(deps.ctx, .{ .assistant_rendered = "\n" });
+                            try deps.emit(.{ .text = .{ .assistant_rendered = "\n" } });
                         }
                         continue :agent_steps_loop;
                     }
@@ -9228,7 +9222,7 @@ fn processQueuedPromptLoop(
                     debug_trace.eventf("gateway", "ultrafast_served_tier", step_ctx, "requested=ultrafast served={s}", .{if (completion.service_tier) |tier| @tagName(tier) else "unconfirmed"});
                     if (completion.service_tier != .ultrafast and !ultrafast_unconfirmed_notified) {
                         ultrafast_unconfirmed_notified = true;
-                        try deps.push_text(deps.ctx, .{ .operational = "Ultrafast was requested, but Gateway did not confirm it was served; this response may have used a standard or lower tier.\n" });
+                        try deps.emit(.{ .text = .{ .operational = "Ultrafast was requested, but Gateway did not confirm it was served; this response may have used a standard or lower tier.\n" } });
                     }
                 }
                 agent.observeUsage(completion.usage);
@@ -9256,17 +9250,10 @@ fn processQueuedPromptLoop(
                 });
                 // The completion buffer is step-scoped, so no cross-step
                 // dedupe: each completion reports its serving provider once.
-                // The push_event callback takes ownership of the payload on
-                // every outcome, including error returns, so this scope never
-                // frees `owned` after the call.
                 if (completion.resolved_provider) |provider| {
-                    if (std.heap.c_allocator.dupe(u8, provider)) |owned| {
-                        deps.push_event(deps.ctx, .{ .provider_resolved = owned }) catch |err| {
-                            debug_trace.logf("agent", "provider_resolved event dropped err={s}", .{@errorName(err)});
-                        };
-                    } else |_| {
-                        debug_trace.logf("agent", "provider_resolved event dropped err=OutOfMemory", .{});
-                    }
+                    deps.emit(.{ .worker = .{ .provider_resolved = @constCast(provider) } }) catch |err| {
+                        debug_trace.logf("agent", "provider_resolved event dropped err={s}", .{@errorName(err)});
+                    };
                 }
                 completion.tool_calls = try normalize_terminal_request_tool_calls(
                     arena,
@@ -9578,7 +9565,7 @@ fn processQueuedPromptLoop(
                             // draft and the user can send it again on the new
                             // model.
                             restorePromptAfterTerminalFailure(deps, job, config);
-                            try deps.push_event(deps.ctx, .open_model_picker);
+                            try deps.emit(.{ .worker = .open_model_picker });
                         },
                         .cancelled => {},
                     }
@@ -9625,7 +9612,7 @@ fn processQueuedPromptLoop(
                         &preserved_tool_evidence,
                     );
                     if (interruption_source.len > 0) {
-                        try deps.push_text(deps.ctx, .{ .assistant_rendered = "\n" });
+                        try deps.emit(.{ .text = .{ .assistant_rendered = "\n" } });
                     }
                     continue :agent_steps_loop;
                 }
@@ -9702,7 +9689,7 @@ fn processQueuedPromptLoop(
                             continue;
                         }
                         stream_ctx.drop_staged_response_language_candidate();
-                        try deps.push_system_notice(deps.ctx, response_language_failure_notice);
+                        try deps.emit(.{ .notice = .{ .plain = response_language_failure_notice } });
                         finish_trace.finish("response_language_mismatch");
                         return error.ResponseLanguageMismatch;
                     },
@@ -9842,8 +9829,8 @@ fn processQueuedPromptLoop(
                             );
                             return;
                         }
-                        try deps.push_text(deps.ctx, .{ .operational = malformed_tool_call_retry_notice });
-                        try deps.push_text(deps.ctx, .{ .operational = "\n" });
+                        try deps.emit(.{ .text = .{ .operational = malformed_tool_call_retry_notice } });
+                        try deps.emit(.{ .text = .{ .operational = "\n" } });
                         // The feedback stays in the turn, so a later request
                         // in it still explains the earlier stall.
                         try within_turn_suffix.append(arena, .{
@@ -9902,7 +9889,7 @@ fn processQueuedPromptLoop(
                             &preserved_tool_evidence,
                         );
                         if (partial_assistant.len > 0) {
-                            try deps.push_text(deps.ctx, .{ .assistant_rendered = "\n" });
+                            try deps.emit(.{ .text = .{ .assistant_rendered = "\n" } });
                         }
                         continue :agent_steps_loop;
                     }
@@ -9922,7 +9909,7 @@ fn processQueuedPromptLoop(
                     attempt_completion.tool_calls.len,
                 });
                 if (attempt_completion.provider_failure_cause == .non_retryable) {
-                    try deps.push_system_notice(deps.ctx, diagnostic.view());
+                    try deps.emit(.{ .notice = .{ .plain = diagnostic.view() } });
                     restorePromptAfterTerminalFailure(deps, job, config);
                     const failed_assistant_source = stream_ctx.interruption_source_or("");
                     if (stop_state.retained_candidate == null and
@@ -10054,7 +10041,7 @@ fn processQueuedPromptLoop(
             request_recovery.endWithError();
             if (!http_failure_notice_shown) {
                 const http_detail = try httpFailureDetail(arena, failure, job, request_capabilities);
-                try deps.push_http_error(deps.ctx, failureStatus(failure), http_detail, job.credential_source);
+                try deps.emit(.{ .http_error = .{ .status = failureStatus(failure), .detail = http_detail, .credential_source = job.credential_source } });
             }
             if (stop_state.retained_candidate != null) {
                 stop_state.terminal_materializing = true;
@@ -10340,8 +10327,8 @@ fn processQueuedPromptLoop(
                 raised_limit,
                 effort.label(),
             });
-            try deps.push_text(deps.ctx, .{ .operational = lengthResendNotice(raised_limit != null, lowered_effort != null) });
-            try deps.push_text(deps.ctx, .{ .operational = "\n" });
+            try deps.emit(.{ .text = .{ .operational = lengthResendNotice(raised_limit != null, lowered_effort != null) } });
+            try deps.emit(.{ .text = .{ .operational = "\n" } });
             continue;
         }
         try runtime_assistant_stream.emitProviderLengthNotice(deps, arena, disposition);
@@ -10360,7 +10347,7 @@ fn processQueuedPromptLoop(
             if (agent_steps.allowsStep(config.agent_step_limit, step + 1) and
                 try append_pending_steering_after_assistant(deps, arena, &within_turn_suffix, turn_id, assistant_text, provider_replay, .finalizing))
             {
-                try deps.push_text(deps.ctx, .{ .assistant_rendered = "\n" });
+                try deps.emit(.{ .text = .{ .assistant_rendered = "\n" } });
                 continue :agent_steps_loop;
             }
             if (stop_state.retained_candidate != null) {
@@ -10442,7 +10429,7 @@ fn processQueuedPromptLoop(
             if (agent_steps.allowsStep(config.agent_step_limit, step + 1) and
                 try append_pending_steering_after_assistant(deps, arena, &within_turn_suffix, turn_id, history_text, history_replay, if (!lifecycle.view.hasStop() or stop_state.dispatched) .finalizing else .model))
             {
-                try deps.push_text(deps.ctx, .{ .assistant_rendered = "\n" });
+                try deps.emit(.{ .text = .{ .assistant_rendered = "\n" } });
                 continue;
             }
 
@@ -10457,8 +10444,8 @@ fn processQueuedPromptLoop(
                 });
                 if (nudge) {
                     empty_reply_nudged = true;
-                    try deps.push_text(deps.ctx, .{ .operational = try emptyReplyNotice(arena, provider_reason, empty_reply_asking) });
-                    try deps.push_text(deps.ctx, .{ .operational = "\n" });
+                    try deps.emit(.{ .text = .{ .operational = try emptyReplyNotice(arena, provider_reason, empty_reply_asking) } });
+                    try deps.emit(.{ .text = .{ .operational = "\n" } });
                     try appendContinuationPrompt(arena, &within_turn_suffix, completion.content, provider_replay, empty_reply_nudge_prompt);
                     continue;
                 }
@@ -10482,9 +10469,9 @@ fn processQueuedPromptLoop(
 
             if (!lifecycle.view.hasStop() or stop_state.dispatched) {
                 if (!has_content) {
-                    try deps.push_text(deps.ctx, .{ .operational = rendered });
+                    try deps.emit(.{ .text = .{ .operational = rendered } });
                 }
-                try deps.push_text(deps.ctx, .{ .assistant_rendered = "\n" });
+                try deps.emit(.{ .text = .{ .assistant_rendered = "\n" } });
 
                 const persisted_text = try runtime_finalization.stopTerminalText(
                     arena,
@@ -10535,9 +10522,9 @@ fn processQueuedPromptLoop(
             stop_state.retained_candidate = history_text;
             stop_state.latest_partial = null;
             if (!has_content) {
-                try deps.push_text(deps.ctx, .{ .operational = rendered });
+                try deps.emit(.{ .text = .{ .operational = rendered } });
             }
-            try deps.push_text(deps.ctx, .{ .assistant_rendered = "\n" });
+            try deps.emit(.{ .text = .{ .assistant_rendered = "\n" } });
 
             var stop_outcome = runtime_lifecycle.dispatchStopCheckpoint(
                 lifecycle,
@@ -10878,7 +10865,7 @@ fn processQueuedPromptLoop(
                 );
             };
             defer selected.deinit(arena);
-            for (selected.notices) |notice| try deps.pushContextNotice(notice);
+            for (selected.notices) |notice| try deps.emit(.{ .context_notice = notice });
 
             context_delta = selected.content != null;
             if (context_delta) {
@@ -10997,7 +10984,7 @@ fn processQueuedPromptLoop(
         if (step_has_content) {
             const first_tool_is_ask = effective_tool_calls.len > 0 and
                 runtime_tool_presentation.activityKindForCall(arena, deps.tool_registry, effective_tool_calls[0]) == .ask;
-            if (!first_tool_is_ask) try deps.push_text(deps.ctx, .{ .assistant_rendered = "\n" });
+            if (!first_tool_is_ask) try deps.emit(.{ .text = .{ .assistant_rendered = "\n" } });
             silent_tool_steps = 0;
         } else {
             silent_tool_steps += 1;
@@ -12771,7 +12758,7 @@ fn processQueuedPromptLoop(
                     advertised_dynamic_tool_names,
                 );
                 if (execution_is_command) {
-                    try deps.push_command_output_complete(deps.ctx, execution_lifecycle_id);
+                    try deps.emit(.{ .worker = .{ .command_output_complete = execution_lifecycle_id } });
                 }
                 try runtime_tool_batch.drainPendingUserSuffix(arena, &step_batch, &within_turn_suffix);
                 const persist_error = if (execution_is_command)
@@ -12897,7 +12884,9 @@ fn processQueuedPromptLoop(
 
             runtime_parallel_execution.reportInnerToolUsage(deps, tool_call.name, execution);
             if (execution.diff_entry) |payload| {
-                try deps.push_diff_block(deps.ctx, payload);
+                // The event is lent; the payload is ours to free.
+                defer diff_mod.freeDiffEntryPayload(std.heap.c_allocator, payload);
+                try deps.emit(.{ .worker = .{ .diff_block = payload } });
             }
             var replay_handed_off = execution.command_replay_capture == null;
             defer if (!replay_handed_off) {
@@ -12957,10 +12946,10 @@ fn processQueuedPromptLoop(
             );
             if (status_started) replay_handed_off = true;
             if (execution_is_command) {
-                try deps.push_command_output_complete(deps.ctx, execution_lifecycle_id);
+                try deps.emit(.{ .worker = .{ .command_output_complete = execution_lifecycle_id } });
             }
             for (execution.context_notices) |notice| {
-                try deps.pushContextNotice(notice);
+                try deps.emit(.{ .context_notice = notice });
             }
 
             if (execution.finish_turn) {
@@ -13001,17 +12990,8 @@ fn processQueuedPromptLoop(
                     &step_batch,
                     &within_turn_suffix,
                 );
-                var pushed_interactive_notice = false;
-                if (execution.interactive_notice) |notice| {
-                    if (deps.push_interactive_notice) |push_notice| {
-                        try push_notice(deps.ctx, notice);
-                        pushed_interactive_notice = true;
-                    }
-                }
-                if (!pushed_interactive_notice) {
-                    if (execution.system_notice) |notice| {
-                        try deps.push_system_notice(deps.ctx, notice);
-                    }
+                if (execution.interactive_notice != null or execution.system_notice != null) {
+                    try deps.emit(.{ .notice = .{ .semantic = execution.interactive_notice, .plain = execution.system_notice } });
                 }
                 const assistant_text: runtime_finalization.TerminalText = .{ .history = "", .presentation = if (stop_state.retained_candidate != null)
                     try hooks.prompt.joinVisibleSegments(
@@ -13081,11 +13061,7 @@ fn processQueuedPromptLoop(
                 try runtime_tool_batch.appendToolNotice(arena, &step_batch, notice);
             }
             if (execution.interactive_notice) |notice| {
-                if (deps.push_interactive_notice) |push_notice| {
-                    try push_notice(deps.ctx, notice);
-                } else {
-                    try deps.push_system_notice(deps.ctx, notice.body);
-                }
+                try deps.emit(.{ .notice = .{ .semantic = notice, .plain = notice.body } });
             }
             if (permission_outcome.feedback) |feedback| {
                 try appendPermissionFeedbackAfterToolResult(
@@ -13210,12 +13186,12 @@ fn processQueuedPromptLoop(
             if (agent_steps.allowsStep(config.agent_step_limit, step + 1) and
                 try append_pending_steering_after_assistant(deps, arena, &within_turn_suffix, turn_id, raw_final, final_provider_replay, if (!lifecycle.view.hasStop() or stop_state.dispatched) .finalizing else .model))
             {
-                try deps.push_text(deps.ctx, .{ .assistant_rendered = "\n" });
+                try deps.emit(.{ .text = .{ .assistant_rendered = "\n" } });
                 continue;
             }
 
             if (!lifecycle.view.hasStop() or stop_state.dispatched) {
-                try deps.push_text(deps.ctx, .{ .assistant_rendered = "\n" });
+                try deps.emit(.{ .text = .{ .assistant_rendered = "\n" } });
 
                 const history_text = try arena.dupe(u8, raw_final);
                 const persisted_text = try runtime_finalization.stopTerminalText(
@@ -13264,7 +13240,7 @@ fn processQueuedPromptLoop(
             });
             stop_state.retained_candidate = retained_final;
             stop_state.latest_partial = null;
-            try deps.push_text(deps.ctx, .{ .assistant_rendered = "\n" });
+            try deps.emit(.{ .text = .{ .assistant_rendered = "\n" } });
 
             var stop_outcome = runtime_lifecycle.dispatchStopCheckpoint(
                 lifecycle,
@@ -13386,8 +13362,8 @@ fn finishFailedTurnWithNotice(
     notice: []const u8,
     trace_outcome: []const u8,
 ) !void {
-    try deps.push_text(deps.ctx, .{ .operational = notice });
-    try deps.push_text(deps.ctx, .{ .operational = "\n" });
+    try deps.emit(.{ .text = .{ .operational = notice } });
+    try deps.emit(.{ .text = .{ .operational = "\n" } });
     if (stop_state.retained_candidate != null) {
         const assistant_text = try runtime_finalization.stopTerminalText(
             arena,

@@ -636,7 +636,8 @@ test "same completion duplicate toolbox opens both execute for explicit rereads"
 test "explicit skill preload cancellation finalizes as interrupted before model dispatch" {
     const alloc = std.testing.allocator;
     const Trigger = struct {
-        fn notice(raw: *anyopaque, _: []const u8) !void {
+        fn emit(raw: *anyopaque, event: runtime_deps.TurnEvent) !void {
+            if (event != .context_notice) return FakeAgentRuntimeDeps.emitEvent(raw, event);
             const hooks: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
             hooks.cancel_on_execute.?.store(true, .seq_cst);
         }
@@ -648,7 +649,7 @@ test "explicit skill preload cancellation finalizes as interrupted before model 
     var gateway = FakeGateway.init(alloc, &.{});
     defer gateway.deinit();
     var deps = hooks.deps();
-    deps.push_context_notice = Trigger.notice;
+    deps.emit_event = Trigger.emit;
     deps.agent_stream_provider = gateway.provider();
     var config = fixture.config();
     config.skill_catalog = .{
@@ -6018,12 +6019,13 @@ test "processQueuedPrompt forwards diff payload instead of display text" {
     var gateway = FakeGateway.init(alloc, &completions);
     defer gateway.deinit();
     var hooks = FakeAgentRuntimeDeps.init(alloc);
-    hooks.exec_plans = &.{.{ .result = .{
+    // The loop frees a diff it emitted with the allocator tools use for it.
+    const preview = try std.heap.c_allocator.dupe(u8, "diff preview");
+    const plans = [_]test_support.FakeExecPlan{.{ .result = .{
         .model_output = "patched",
-        .diff_entry = .{
-            .preview = @constCast("diff preview"),
-        },
+        .diff_entry = .{ .preview = preview },
     } }};
+    hooks.exec_plans = &plans;
     defer hooks.deinit();
     var fixture = PromptFixture{};
 

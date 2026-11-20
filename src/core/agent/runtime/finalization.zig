@@ -215,7 +215,9 @@ pub const TurnFinalizationGuard = struct {
         if (finished_prompt) |finished| {
             var qualified_finished = finished;
             qualified_finished.terminal_outcome = outcome;
-            try self.deps.push_event(self.deps.ctx, .{ .finish_prompt = qualified_finished });
+            // The event is lent; the finished prompt is ours to free.
+            defer types.freeFinishedPrompt(std.heap.c_allocator, qualified_finished);
+            try self.deps.emit(.{ .worker = .{ .finish_prompt = qualified_finished } });
         }
     }
 };

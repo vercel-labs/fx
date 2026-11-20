@@ -345,10 +345,10 @@ pub const RequestRecovery = struct {
         if (!self.recovery_shown) return;
         self.recovery_shown = false;
         self.host_showing = false;
-        try self.deps.push_route_recovery_status(self.deps.ctx, .{
+        try self.deps.emit(.{ .worker = .{ .route_recovery_status = .{
             .kind = .recovered,
             .attempt = self.attempts,
-        });
+        } } });
     }
 
     /// Esc or quitting: ends the request and clears its status.
@@ -365,7 +365,7 @@ pub const RequestRecovery = struct {
         defer self.mutex.unlock(io);
         self.host_showing = false;
         self.recovery_shown = false;
-        try self.deps.push_route_recovery_status(self.deps.ctx, status);
+        try self.deps.emit(.{ .worker = .{ .route_recovery_status = status } });
     }
 
     /// The request ended on an error with no success, cancel, or terminal
@@ -380,10 +380,10 @@ pub const RequestRecovery = struct {
         if (!self.recovery_shown) return self.clearShownLocked();
         self.recovery_shown = false;
         self.host_showing = false;
-        self.deps.push_route_recovery_status(self.deps.ctx, .{
+        self.deps.emit(.{ .worker = .{ .route_recovery_status = .{
             .kind = .failed,
             .attempt = self.attempts,
-        }) catch |err| {
+        } } }) catch |err| {
             debug_trace.logf("recovery", "failed status publication failed err={s}", .{@errorName(err)});
         };
     }
@@ -391,7 +391,7 @@ pub const RequestRecovery = struct {
     fn clearShownLocked(self: *RequestRecovery) void {
         if (!self.host_showing) return;
         self.host_showing = false;
-        self.deps.push_event(self.deps.ctx, .clear_route_recovery_status) catch |err| {
+        self.deps.emit(.{ .worker = .clear_route_recovery_status }) catch |err| {
             debug_trace.logf("recovery", "stale status clear failed err={s}", .{@errorName(err)});
         };
     }
@@ -425,7 +425,7 @@ pub const RequestRecovery = struct {
     /// The turn loop keeps calling the host's other callbacks meanwhile, and
     /// each host takes a status from another thread safely:
     ///
-    /// - TUI (`app_callbacks.agentPushRouteRecoveryStatus`): copies the event
+    /// - TUI (`app_callbacks.agentEmit`): copies the event
     ///   with `std.heap.c_allocator` and queues it under `worker_mutex`.
     /// - ACP (`AcpContext.sendModelRecoveryStatus`): formats into a local
     ///   writer and writes one frame under `jsonrpc.Writer.mutex`; libfx's
@@ -597,10 +597,10 @@ pub const RequestRecovery = struct {
         if (types.RouteRecoveryStatus.fromRecovery(status, self.attempts)) |shown| {
             self.recovery_shown = true;
             self.host_showing = true;
-            try self.deps.push_route_recovery_status(self.deps.ctx, shown);
+            try self.deps.emit(.{ .worker = .{ .route_recovery_status = shown } });
         } else {
             self.host_showing = false;
-            try self.deps.push_event(self.deps.ctx, .clear_route_recovery_status);
+            try self.deps.emit(.{ .worker = .clear_route_recovery_status });
         }
     }
 

@@ -130,8 +130,8 @@ pub const Runtime = struct {
         }
     }
 
+    /// Shows a diff. The payload is lent; the transcript keeps a copy.
     pub fn pushDiffBlock(self: *Runtime, payload: diff_mod.DiffEntryPayload) !void {
-        defer diff_mod.freeDiffEntryPayload(std.heap.c_allocator, payload);
         try self.checkPendingError();
         _ = self.shell.appendRawTranscriptEntryClassified(
             self.alloc,

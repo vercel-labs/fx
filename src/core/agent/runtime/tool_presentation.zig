@@ -225,23 +225,23 @@ pub const ProvisionalToolStatuses = struct {
             return;
         }
         self.tracked.items[index].shown = true;
-        hooks.push_tool_lifecycle(hooks.ctx, .{
+        hooks.emit(.{ .worker = .{ .tool_lifecycle = .{
             .provisional = .{
                 .id = .{ .turn_id = turn_id, .call_id = tool_id },
                 .presentation_group_id = self.presentation_group_id,
                 .tool_name = shown_tool_name,
                 .activity_kind = observed_kind,
             },
-        }) catch |err| {
+        } } }) catch |err| {
             if (recorded) self.forget(alloc, tool_id);
             return err;
         };
-        hooks.push_tool_lifecycle(hooks.ctx, .{
+        hooks.emit(.{ .worker = .{ .tool_lifecycle = .{
             .progress = .{
                 .id = .{ .turn_id = turn_id, .call_id = tool_id },
                 .text = label,
             },
-        }) catch {};
+        } } }) catch {};
     }
 
     /// Names a streaming call's row as soon as its arguments so far say what
@@ -296,12 +296,12 @@ pub const ProvisionalToolStatuses = struct {
             "{s} failed: {s}",
             .{ fallbackToolDisplay(hooks.tool_registry, call.name), if (call.argument_integrity == .non_object_json) "non-object arguments" else "invalid JSON arguments" },
         );
-        try hooks.push_tool_lifecycle(hooks.ctx, .{
+        try hooks.emit(.{ .worker = .{ .tool_lifecycle = .{
             .terminal = .{
                 .id = .{ .turn_id = turn_id, .call_id = call_id },
                 .outcome = .{ .kind = .failed, .summary = summary },
             },
-        });
+        } } });
     }
 
     pub fn finishMalformedProviderToolArguments(
@@ -557,10 +557,10 @@ pub const ProvisionalToolStatuses = struct {
                 diff.max_encoded_label_bytes,
             );
             const summary = try arena.print("Cancelled {s}", .{encoded.bytes});
-            try hooks.push_tool_lifecycle(hooks.ctx, .{ .terminal = .{
+            try hooks.emit(.{ .worker = .{ .tool_lifecycle = .{ .terminal = .{
                 .id = .{ .turn_id = turn_id, .call_id = status.id },
                 .outcome = .{ .kind = .cancelled, .summary = summary },
-            } });
+            } } } });
             self.forget(alloc, status.id);
         }
     }
@@ -606,10 +606,10 @@ pub const ProvisionalToolStatuses = struct {
                 "Connection interrupted before {s} ran",
                 .{encoded.bytes},
             );
-            try hooks.push_tool_lifecycle(hooks.ctx, .{ .terminal = .{
+            try hooks.emit(.{ .worker = .{ .tool_lifecycle = .{ .terminal = .{
                 .id = .{ .turn_id = turn_id, .call_id = status.id },
                 .outcome = .{ .kind = .failed, .summary = summary },
-            } });
+            } } } });
             self.forget(alloc, status.id);
         }
     }
@@ -1135,7 +1135,7 @@ pub noinline fn startToolVisibleLifecycle(
         display_target,
         advertised_dynamic_tool_names,
     ) else null;
-    try hooks.push_tool_lifecycle(hooks.ctx, .{ .authoritative_started = .{
+    try hooks.emit(.{ .worker = .{ .tool_lifecycle = .{ .authoritative_started = .{
         .id = .{ .turn_id = turn_id, .call_id = call.id },
         .presentation_group_id = presentation_group_id,
         .reconciles_provisional_call_id = call.provisional_id,
@@ -1144,12 +1144,12 @@ pub noinline fn startToolVisibleLifecycle(
         .arguments_json = redacted_arguments,
         .place_after_current_transcript = false,
         .resolved_display_target = call.resolved_display_target,
-    } });
+    } } } });
     if (activity_line) |line| {
-        try hooks.push_tool_lifecycle(hooks.ctx, .{ .progress = .{
+        try hooks.emit(.{ .worker = .{ .tool_lifecycle = .{ .progress = .{
             .id = .{ .turn_id = turn_id, .call_id = call.id },
             .text = line,
-        } });
+        } } } });
     }
     return true;
 }
@@ -1194,13 +1194,13 @@ fn finishDeferredToolStatus(
         types.context_deferred_tool_status_label,
         advertised_dynamic_tool_names,
     );
-    try hooks.push_tool_lifecycle(hooks.ctx, .{ .terminal = .{
+    try hooks.emit(.{ .worker = .{ .tool_lifecycle = .{ .terminal = .{
         .id = .{ .turn_id = turn_id, .call_id = call.id },
         .outcome = .{
             .kind = .deferred,
             .summary = line,
         },
-    } });
+    } } } });
 }
 
 fn finishDeniedToolStatusInternal(
@@ -1229,7 +1229,7 @@ fn finishDeniedToolStatusInternal(
         try commandArtifactHandle(arena, command_result_json)
     else
         null;
-    try hooks.push_tool_lifecycle(hooks.ctx, .{
+    try hooks.emit(.{ .worker = .{ .tool_lifecycle = .{
         .terminal = .{
             .id = .{ .turn_id = turn_id, .call_id = call.id },
             .outcome = .{
@@ -1245,7 +1245,7 @@ fn finishDeniedToolStatusInternal(
             .result_memory = result_memory,
             .command_artifact_handle = command_artifact_handle,
         },
-    });
+    } } });
 }
 
 pub fn finishCancelledToolStatus(
@@ -1284,7 +1284,7 @@ pub fn finishCancelledToolStatus(
         }
     else
         null;
-    try hooks.push_tool_lifecycle(hooks.ctx, .{ .terminal = .{
+    try hooks.emit(.{ .worker = .{ .tool_lifecycle = .{ .terminal = .{
         .id = .{ .turn_id = turn_id, .call_id = call.id },
         .outcome = .{
             .kind = .cancelled,
@@ -1292,7 +1292,7 @@ pub fn finishCancelledToolStatus(
         },
         .result_memory = result.tool_result_memory,
         .command_artifact_handle = command_artifact_handle,
-    } });
+    } } } });
 }
 
 fn isShellWaitCall(arena: Allocator, call: ToolCall) Allocator.Error!bool {
@@ -1359,10 +1359,10 @@ pub fn publishSubagentCompletionPreview(
         renderedSubagentSummary(hooks, arena, base_line, status)
     else
         base_line;
-    try hooks.push_tool_lifecycle(hooks.ctx, .{ .progress = .{
+    try hooks.emit(.{ .worker = .{ .tool_lifecycle = .{ .progress = .{
         .id = .{ .turn_id = turn_id, .call_id = call.id },
         .text = line,
-    } });
+    } } } });
     return true;
 }
 
@@ -1484,7 +1484,7 @@ pub fn finishExecutedToolStatus(
         try commandArtifactHandle(arena, result.command_result_json)
     else
         null;
-    try hooks.push_tool_lifecycle(hooks.ctx, .{
+    try hooks.emit(.{ .worker = .{ .tool_lifecycle = .{
         .terminal = .{
             .id = .{ .turn_id = turn_id, .call_id = call.id },
             .outcome = .{
@@ -1500,7 +1500,7 @@ pub fn finishExecutedToolStatus(
             .result_memory = presentation_memory,
             .command_artifact_handle = command_artifact_handle,
         },
-    });
+    } } });
 }
 
 fn presentedToolResult(
@@ -1841,7 +1841,7 @@ pub fn finishCommittedFileStatus(
         preview.deletions,
         hooks.diff_marker_styles,
     );
-    try hooks.push_tool_lifecycle(hooks.ctx, .{
+    try hooks.emit(.{ .worker = .{ .tool_lifecycle = .{
         .terminal = .{
             .id = .{ .turn_id = turn_id, .call_id = call.id },
             .outcome = .{
@@ -1849,7 +1849,7 @@ pub fn finishCommittedFileStatus(
                 .summary = line,
             },
         },
-    });
+    } } });
 }
 
 fn renderedSubagentSummary(
@@ -1957,13 +1957,7 @@ const ProvisionalStatusTestCapture = struct {
             .publish_committed_file_handoff = noopPublishCommittedFileHandoff,
             .propagate_history_turn = noopPropagateHistoryTurn,
             .propagate_grant = noopPropagateGrant,
-            .push_event = noopPushEvent,
-            .push_text = noopPushText,
-            .push_tool_lifecycle = captureToolLifecycle,
-            .push_diff_block = noopPushDiffBlock,
-            .push_system_notice = noopPushSystemNotice,
-            .push_command_output_complete = noopPushCommandOutputComplete,
-            .push_http_error = noopPushHttpError,
+            .emit_event = captureTurnEvent,
             .format_tool_execution_error = noopFormatToolExecutionError,
         };
     }
@@ -1989,12 +1983,13 @@ const ProvisionalStatusTestCapture = struct {
     }
     fn noopPropagateHistoryTurn(_: *anyopaque, _: types.HistoryTurn) !void {}
     fn noopPropagateGrant(_: *anyopaque, _: []const u8, _: []const u8) !void {}
-    fn noopPushEvent(_: *anyopaque, _: @import("../worker_runtime.zig").WorkerEvent) !void {}
-    fn noopPushText(_: *anyopaque, _: runtime_deps.TextEmission) !void {}
-    fn noopPushDiffBlock(_: *anyopaque, _: DiffEntryPayload) !void {}
-    fn noopPushSystemNotice(_: *anyopaque, _: []const u8) !void {}
-    fn noopPushCommandOutputComplete(_: *anyopaque, _: ?types.ToolLifecycleId) !void {}
-    fn noopPushHttpError(_: *anyopaque, _: std.http.Status, _: []const u8, _: ?types.CredentialSource) !void {}
+    /// Keeps the tool lifecycle it is shown, and nothing else.
+    fn captureTurnEvent(raw: *anyopaque, event: runtime_deps.TurnEvent) !void {
+        switch (event) {
+            .worker => |worker| if (worker == .tool_lifecycle) try captureToolLifecycle(raw, worker.tool_lifecycle),
+            else => {},
+        }
+    }
     fn noopFormatToolExecutionError(_: *anyopaque, arena: Allocator, _: []const u8, err: anyerror) ![]const u8 {
         return arena.print("{s}", .{@errorName(err)});
     }

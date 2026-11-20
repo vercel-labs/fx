@@ -2395,18 +2395,7 @@ fn agentRuntimeDeps(ctx: *AcpContext) agent_runtime.AgentRuntimeDeps {
             .running = compactionRunning,
             .settle = compactionSettle,
         } else null,
-        .push_event = pushEvent,
-        .push_text = pushText,
-        .push_reasoning_delta = pushReasoningDelta,
-        .push_route_recovery_status = pushRouteRecoveryStatus,
-        .push_tool_lifecycle = pushToolLifecycle,
-        .push_diff_block = pushDiffBlock,
-        .push_system_notice = pushSystemNotice,
-        .push_context_notice = pushContextNotice,
-        // The same path: once per session, as a notice where the client shows them.
-        .push_session_notice = pushContextNotice,
-        .push_command_output_complete = pushCommandOutputComplete,
-        .push_http_error = pushHttpError,
+        .emit_event = emitEvent,
         .refresh_gateway_credential = refreshGatewayCredential,
         .available_model_capabilities = availableModelCapabilities,
         .resolve_model_capabilities = resolveModelCapabilities,
@@ -3831,11 +3820,33 @@ fn retainAcpGrant(raw_ctx: *anyopaque, tool_name: []const u8, target_path: []con
 }
 
 /// Takes the event on success; on an error its sender still owns it.
-fn pushEvent(raw_ctx: *anyopaque, event: worker_runtime.WorkerEvent) !void {
-    const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
-    // Every kind has its own arm, with no catch-all, so a new kind doesn't
-    // compile until it is mapped (`tests/tla/acp/AcpTurnEvents.tla`).
+/// fx acp's one sink for the agent loop's events, each lent for the call.
+/// Every kind has its own arm, with no catch-all, so a new kind doesn't
+/// compile until it is mapped (`tests/tla/acp/AcpTurnEvents.tla`,
+/// `tests/tla/agent_runtime/TurnEvents.tla` InOrder).
+fn emitEvent(raw_ctx: *anyopaque, event: agent_runtime.TurnEvent) !void {
     switch (event) {
+        .worker => |worker| try pushWorkerEvent(raw_ctx, worker),
+        .text => |emission| try pushText(raw_ctx, emission),
+        .reasoning_delta => |delta| try pushReasoningDelta(raw_ctx, delta),
+        // fx acp shows no semantic notices, so the client gets the plain
+        // text, and nothing for a notice that has none.
+        .notice => |notice| if (notice.plain) |text| try pushSystemNotice(raw_ctx, text),
+        .context_notice => |text| try pushContextNotice(raw_ctx, text),
+        // The same path: once per session, as a notice where the client
+        // shows them.
+        .session_notice => |text| try pushContextNotice(raw_ctx, text),
+        .http_error => |failure| try pushHttpError(raw_ctx, failure.status, failure.detail, failure.credential_source),
+    }
+}
+
+fn pushWorkerEvent(raw_ctx: *anyopaque, event: worker_runtime.WorkerEvent) !void {
+    const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
+    switch (event) {
+        .tool_lifecycle => |lifecycle| try pushToolLifecycle(raw_ctx, lifecycle),
+        .diff_block => |payload| try pushDiffBlock(raw_ctx, payload),
+        .route_recovery_status => |status| try pushRouteRecoveryStatus(raw_ctx, status),
+        .command_output_complete => |lifecycle_id| try pushCommandOutputComplete(raw_ctx, lifecycle_id),
         .clear_route_recovery_status => try ctx.clearModelRecoveryStatus(),
         .turn_phase_update => |update| {
             // A steer cuts a streaming reply short, as in the fx CLI, but
@@ -3889,19 +3900,14 @@ fn pushEvent(raw_ctx: *anyopaque, event: worker_runtime.WorkerEvent) !void {
         .notification,
         .question_requested,
         .semantic_notice,
-        .route_recovery_status,
         .api_status_text,
         .credential_refreshed,
         .command_output,
-        .command_output_complete,
-        .tool_lifecycle,
-        .diff_block,
         .context_compaction,
         .error_text,
         .restore_failed_prompt,
         => debug_trace.logf("acp", "dropped worker event kind={s}: the loop never sends it to an ACP turn", .{@tagName(event)}),
     }
-    worker_runtime.freeWorkerEvent(std.heap.c_allocator, event);
 }
 
 /// A compaction a turn runs, as ACP v1's compaction updates report it
@@ -4058,7 +4064,6 @@ fn pushContextNotice(raw_ctx: *anyopaque, text: []const u8) !void {
 }
 
 fn pushDiffBlock(raw_ctx: *anyopaque, payload: agent_runtime.DiffEntryPayload) !void {
-    defer diff_mod.freeDiffEntryPayload(std.heap.c_allocator, payload);
     try pushText(raw_ctx, .{ .operational = payload.preview });
 }
 
@@ -5183,15 +5188,15 @@ test "ACP stream adapter forwards raw Markdown and suppresses rendered duplicate
         const deps = agentRuntimeDeps(&ctx);
 
         for (source_spans, rendered_spans) |source, rendered| {
-            try deps.push_text(deps.ctx, .{ .assistant_source = source });
-            try deps.push_text(deps.ctx, .{ .assistant_rendered = rendered });
+            try deps.emit(.{ .text = .{ .assistant_source = source } });
+            try deps.emit(.{ .text = .{ .assistant_rendered = rendered } });
         }
-        try deps.push_text(deps.ctx, .{ .assistant_source = "" });
-        try deps.push_text(deps.ctx, .{ .operational = operational_span });
-        try deps.push_text(deps.ctx, .{ .assistant_restarted = "Response interrupted. Restarting.\n" });
+        try deps.emit(.{ .text = .{ .assistant_source = "" } });
+        try deps.emit(.{ .text = .{ .operational = operational_span } });
+        try deps.emit(.{ .text = .{ .assistant_restarted = "Response interrupted. Restarting.\n" } });
         const interrupted_message_id = ctx.message_id;
-        try deps.push_text(deps.ctx, .assistant_started);
-        try deps.push_text(deps.ctx, .{ .assistant_source = "Replacement response." });
+        try deps.emit(.{ .text = .assistant_started });
+        try deps.emit(.{ .text = .{ .assistant_source = "Replacement response." } });
         try std.testing.expect(!std.mem.eql(u8, &interrupted_message_id, &ctx.message_id));
         try capture.sync(io_mod.getIo());
     }
@@ -5243,7 +5248,7 @@ test "ACP stream adapter forwards raw Markdown and suppresses rendered duplicate
     try std.testing.expect(writer_failed);
 
     const failed_deps = agentRuntimeDeps(&failed_ctx);
-    try failed_deps.push_text(failed_deps.ctx, .{ .assistant_source = "writer failure remains suppressed" });
+    try failed_deps.emit(.{ .text = .{ .assistant_source = "writer failure remains suppressed" } });
 }
 
 test "ACP auth failure emits a valid detail-free JSON-RPC notification" {
@@ -5270,12 +5275,7 @@ test "ACP auth failure emits a valid detail-free JSON-RPC notification" {
     );
 
     const deps = agentRuntimeDeps(&ctx);
-    try deps.push_http_error(
-        deps.ctx,
-        .unauthorized,
-        "provider rejected access-token-secret",
-        server.firstSession(&state).?.credential_source,
-    );
+    try deps.emit(.{ .http_error = .{ .status = .unauthorized, .detail = "provider rejected access-token-secret", .credential_source = server.firstSession(&state).?.credential_source } });
     try capture.sync(io_mod.getIo());
 
     var captured_file = try tmp.dir.openFile(io_mod.getIo(), "acp-auth-failure.jsonl", .{});

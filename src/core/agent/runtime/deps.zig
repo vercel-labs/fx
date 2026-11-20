@@ -17,6 +17,8 @@ const tool_dispatch = @import("../../tooling/tool_dispatch.zig");
 const tool_contracts = @import("tool_contracts.zig");
 const context_contract = @import("../../workspace/context_contract.zig");
 const compaction_activity = @import("../../output/compaction_activity.zig");
+const turn_event = @import("turn_event.zig");
+const debug_trace = @import("../../shared/debug_trace.zig");
 
 const Allocator = std.mem.Allocator;
 const ChatMessage = types.ChatMessage;
@@ -24,7 +26,6 @@ const HistoryTurn = types.HistoryTurn;
 const PermissionGrant = types.PermissionGrant;
 const PermissionMode = types.PermissionMode;
 const ToolCall = types.ToolCall;
-const WorkerEvent = worker_runtime.WorkerEvent;
 
 const DeferredToolCompletion = tool_contracts.DeferredToolCompletion;
 const DiffEntryPayload = tool_contracts.DiffEntryPayload;
@@ -143,8 +144,6 @@ pub const ToolActivityRecorder = struct {
 };
 
 fn acknowledgePromptFinalization(_: *anyopaque, _: u64, _: types.TurnPresentationOutcome, _: ?types.ProviderCompletionDisposition) !void {}
-fn discardToolLifecycle(_: *anyopaque, _: types.ToolLifecycleEvent) !void {}
-fn discardRouteRecoveryStatus(_: *anyopaque, _: types.RouteRecoveryStatus) !void {}
 fn localAvailableModelCapabilities(_: *anyopaque, model: []const u8) model_capabilities.Capabilities {
     return model_capabilities.capabilitiesForModel(model);
 }
@@ -167,13 +166,8 @@ pub const CredentialRefreshMode = auth_runtime.CredentialRefreshMode;
 
 /// Ordered text emitted by the agent runtime. Payloads are borrowed for the
 /// duration of the callback.
-pub const TextEmission = union(enum) {
-    assistant_started,
-    assistant_source: []const u8,
-    assistant_rendered: []const u8,
-    assistant_restarted: []const u8,
-    operational: []const u8,
-};
+pub const TextEmission = turn_event.TextEmission;
+pub const TurnEvent = turn_event.TurnEvent;
 
 /// Accent colors for diff add/remove markers. Named fields so the two styles
 /// cannot be swapped silently at a call site. Empty means the neutral accent.
@@ -311,22 +305,10 @@ pub const AgentRuntimeDeps = struct {
     /// Another process may have taken the session over.
     confirm_session_writer: ?*const fn (ctx: *anyopaque) anyerror!void = null,
     propagate_grant: *const fn (ctx: *anyopaque, tool_name: []const u8, target_path: []const u8) anyerror!void,
-    push_event: *const fn (ctx: *anyopaque, event: WorkerEvent) anyerror!void,
-    push_text: *const fn (ctx: *anyopaque, emission: TextEmission) anyerror!void,
-    push_reasoning_delta: ?*const fn (ctx: *anyopaque, delta: []const u8) anyerror!void = null,
-    push_tool_lifecycle: *const fn (ctx: *anyopaque, event: types.ToolLifecycleEvent) anyerror!void = discardToolLifecycle,
-    push_diff_block: *const fn (ctx: *anyopaque, payload: DiffEntryPayload) anyerror!void,
-    push_system_notice: *const fn (ctx: *anyopaque, text: []const u8) anyerror!void,
-    push_interactive_notice: ?*const fn (ctx: *anyopaque, notice: types.SemanticNotice) anyerror!void = null,
-    /// Source-limit notices use a session-scoped deduplicating path when the
-    /// host provides one; ordinary system notices remain unaffected.
-    push_context_notice: ?*const fn (ctx: *anyopaque, text: []const u8) anyerror!void = null,
-    /// A notice the person should see once in a live session, however many
-    /// turns repeat its cause. The host shows it where they read the
-    /// transcript and drops a text it has already shown. Null: the host has
-    /// no session to remember it in, and the notice is not shown.
-    push_session_notice: ?*const fn (ctx: *anyopaque, text: []const u8) anyerror!void = null,
-    push_route_recovery_status: *const fn (ctx: *anyopaque, status: types.RouteRecoveryStatus) anyerror!void = discardRouteRecoveryStatus,
+    /// The front end's one sink for every `TurnEvent`. The event is lent to
+    /// it for the call, so it copies what it keeps
+    /// (`tests/tla/agent_runtime/TurnEvents.tla` MemorySafe).
+    emit_event: *const fn (ctx: *anyopaque, event: TurnEvent) anyerror!void,
     /// A new model request starts. A host that reports the last request's
     /// recovery, as `fx ask --json` does, forgets the previous request's
     /// here. Null: the host keeps no per-request report.
@@ -334,8 +316,6 @@ pub const AgentRuntimeDeps = struct {
     /// A turn that can never recover hands the user's prompt back to the
     /// composer so nothing typed is lost. Null: host keeps the prompt as-is.
     restore_failed_prompt: ?*const fn (ctx: *anyopaque, prompt: []const u8) anyerror!void = null,
-    push_command_output_complete: *const fn (ctx: *anyopaque, lifecycle_id: ?types.ToolLifecycleId) anyerror!void,
-    push_http_error: *const fn (ctx: *anyopaque, status: std.http.Status, detail: []const u8, credential_source: ?types.CredentialSource) anyerror!void,
     /// `rejected_token` is the access token the provider just answered 401
     /// for, with `.force`; see `auth_runtime.refreshCredentialForAccount`.
     refresh_gateway_credential: ?*const fn (ctx: *anyopaque, alloc: Allocator, source: types.CredentialSource, mode: CredentialRefreshMode, expected_account_id: ?[]const u8, rejected_token: ?[]const u8) anyerror!?RefreshedGatewayCredential = null,
@@ -364,9 +344,11 @@ pub const AgentRuntimeDeps = struct {
     // colors never change after startup (they are theme-independent).
     diff_marker_styles: DiffMarkerStyles = .{},
 
-    pub fn pushContextNotice(self: *const AgentRuntimeDeps, text: []const u8) !void {
-        if (self.push_context_notice) |push| return push(self.ctx, text);
-        return self.push_system_notice(self.ctx, text);
+    /// Tells the front end about the running turn. The event is lent: its
+    /// payload is valid only during the call, and the caller frees what it
+    /// allocated once `emit` returns.
+    pub fn emit(self: *const AgentRuntimeDeps, event: TurnEvent) !void {
+        return self.emit_event(self.ctx, event);
     }
 
     pub fn executeToolCall(self: *const AgentRuntimeDeps, request: ToolExecutionRequest) !ToolExecutionResult {

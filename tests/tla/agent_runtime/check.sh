@@ -37,6 +37,22 @@
 # MalformedToolCallTrace.tla checks turns of the built fx binary against that
 # model; tests/tla/drivers/agent_runtime/malformed.ts runs it.
 #
+# turn-events*.cfg check what the loop tells a front end through
+# AgentRuntimeDeps.emit: in order, every event, and its lent payload freed
+# once, by the loop. turn-events-today.cfg is fx before it, whose push_event
+# and push_diff_block took the loop's payload (LoopFrees). Each
+# turn-events-mutation-*.cfg plants one defect, checked against the rule it
+# names alone:
+#
+#   keep-lent         the TUI queues the lent payload, not a copy        MemorySafe
+#   free-in-front     a front end frees a lent payload                    MemorySafe
+#   no-free           the loop never frees what it emitted                NoLeak
+#   drop-kind         a front end drops notices                           Complete
+#   bypass-queue      the TUI shows text ahead of its queue               InOrder
+#
+# TurnEventsTrace.tla checks turns of the built fx binary against that model;
+# tests/tla/drivers/agent_runtime/turn_events.ts runs it.
+#
 # Needs Java 11+ and tla2tools.jar, as ../README.md describes.
 #
 # Usage:
@@ -70,4 +86,12 @@ MalformedToolCall malformed-tool-call-mutation-no-reset EveryStallGetsFeedback
 MalformedToolCall malformed-tool-call-mutation-run-call MalformedNeverRuns
 MalformedToolCall malformed-tool-call-mutation-reconcile-loop ReconcileMalformedStops
 MalformedToolCall malformed-tool-call-mutation-search-reconcile SearchKeepsTools
+MCTurnEvents turn-events -
+MCTurnEvents turn-events-queued -
+MCTurnEvents turn-events-today LoopFrees
+MCTurnEvents turn-events-mutation-keep-lent MemorySafe
+MCTurnEvents turn-events-mutation-free-in-front MemorySafe
+MCTurnEvents turn-events-mutation-no-free NoLeak
+MCTurnEvents turn-events-mutation-drop-kind Complete
+MCTurnEvents turn-events-mutation-bypass-queue InOrder
 VERDICTS
