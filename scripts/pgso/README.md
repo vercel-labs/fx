@@ -33,7 +33,10 @@ main PGSO executable uses LLVM's temporal function order through the native
 Apple linker; benchmark and other native release links keep their existing
 paths. Identical-code folding stays disabled. The function-starts table is
 omitted, matching the existing stripped Zig link. The exact optimized Zig
-runtime object and bundled system-library stub remain the link inputs; the
+runtime object and bundled system-library stub remain the link inputs, with any
+objects the ReleaseSafe control linked beside Zig's own, such as C the build
+compiles. The control build records those from its `--verbose-link` output and
+keeps copies that travel with the seed, and each link checks their hashes; the
 selected Xcode SDK supplies re-export stubs. Compatibility and sysroot SDK
 versions are recorded separately. Build evidence retains input digests, every
 mapped or unmapped profile name, the full linker map, and verified ordered code

@@ -848,6 +848,17 @@ def run_training_shard(arguments: argparse.Namespace) -> pathlib.Path:
     return manifest_path
 
 
+def _copy_control_link(seed: PipelinePaths, paths: PipelinePaths) -> None:
+    """Carry the seed control's link record, and the objects it names, to the
+    candidate's run, whose link adds them. The link checks their hashes."""
+    record = seed.logs / "control-link.json"
+    if not record.is_file():
+        raise PgsoError(f"seed has no control link record: {record}")
+    shutil.copy2(record, paths.logs / "control-link.json")
+    if seed.control_link_inputs.is_dir():
+        shutil.copytree(seed.control_link_inputs, paths.control_link_inputs)
+
+
 def run_candidate(arguments: argparse.Namespace) -> pathlib.Path:
     output = _fresh_directory(arguments.output_dir)
     paths = PipelinePaths.create(output)
@@ -878,6 +889,7 @@ def run_candidate(arguments: argparse.Namespace) -> pathlib.Path:
     paths.control_binary.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(seed_paths.control_binary, paths.control_binary)
     shutil.copy2(seed_paths.merged_profile, paths.merged_profile)
+    _copy_control_link(seed_paths, paths)
     shard_profiles: list[pathlib.Path] = []
     for manifest_path, document in zip(manifest_paths, documents, strict=True):
         profile = manifest_path.parent / "profile.profdata"

@@ -102,6 +102,7 @@ jobs:
           path: |
             ${{ runner.temp }}/fx-pgso-seed/manifest.json
             ${{ runner.temp }}/fx-pgso-seed/control/bin/fx
+            ${{ runner.temp }}/fx-pgso-seed/control/link-inputs
             ${{ runner.temp }}/fx-pgso-seed/ir/pgso/fx.bc
             ${{ runner.temp }}/fx-pgso-seed/instrumented/fx
             ${{ runner.temp }}/fx-pgso-seed/profiles/merged.profdata
