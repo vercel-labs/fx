@@ -9725,8 +9725,9 @@ fn processQueuedPromptLoop(
                     attempt_disposition == .provider_failure))
             {
                 // A response cut short or ended by a provider error waits and
-                // resends through the recovery module. Content-filter and
-                // non-retryable endings keep their terminal path below.
+                // resends through the recovery module, and so does a content
+                // filter's block until the module needs the user. Endings it
+                // does not resend keep their terminal path below.
                 const finish_reason = attempt_completion.finish_reason;
                 const failure_cause = attempt_completion.provider_failure_cause;
                 const content_filtered = attempt_disposition == .provider_failure and
@@ -9745,25 +9746,31 @@ fn processQueuedPromptLoop(
                     if (content_filtered) "content_filter" else types.ModelFailureDiagnostic.defaultTextForCause(cause),
                 );
                 attempt_failure_diagnostic = diagnostic;
-                // A content filter waits for the user on a host that can ask,
-                // and ends the turn elsewhere, as other non-retryable endings do.
+                // The module resends a content filter's block at once a few
+                // times. Then a host that can ask waits for the user, and
+                // elsewhere the turn ends as other non-retryable endings do.
                 const failure_kind: ?runtime_request_recovery.Failure.Kind = if (content_filtered)
-                    (if (request_recovery.canAskUser()) .content_filter else null)
+                    .content_filter
                 else if (failure_cause == .non_retryable)
                     null
                 else
                     runtime_request_recovery.failureKind(cause);
                 const retryable = failure_kind != null and !config.cancel_flag.load(.seq_cst);
                 const retries = retryable;
-                if (attempt_disposition == .provider_failure or
-                    failure_cause == .gateway_stream_timeout)
+                // The send that failed, for its trace.
+                const failed_attempt = request_recovery.attempt();
+                // A block's trace waits for the module's answer below, so
+                // its `retry` says whether the module resends it.
+                if ((attempt_disposition == .provider_failure or
+                    failure_cause == .gateway_stream_timeout) and
+                    !(content_filtered and retries))
                 {
                     traceRouteFailure(
                         step_ctx,
                         job.model,
                         gateway_model,
                         attempt_fast_mode,
-                        request_recovery.attempt(),
+                        failed_attempt,
                         attempt_completion,
                         &stream_ctx,
                         retries,
@@ -9858,7 +9865,7 @@ fn processQueuedPromptLoop(
                         continue;
                     }
                 }
-                if (retries) {
+                if (retries) retry: {
                     const failure_tool_evidence = settledAttemptToolEvidence(
                         deps.tool_registry,
                         preserved_tool_evidence,
@@ -9866,8 +9873,31 @@ fn processQueuedPromptLoop(
                         attempt_disposition,
                         &stream_ctx,
                     );
-                    _ = try request_recovery.failed(.{ .kind = failure_kind.? });
-                    if (try request_recovery.waitForSend() != null) {
+                    // Only a content filter's block gets a send back at once;
+                    // every other failure here waits.
+                    const resend_now = try request_recovery.failed(.{ .kind = failure_kind.? }) != null;
+                    if (content_filtered) traceRouteFailure(
+                        step_ctx,
+                        job.model,
+                        gateway_model,
+                        attempt_fast_mode,
+                        failed_attempt,
+                        attempt_completion,
+                        &stream_ctx,
+                        resend_now,
+                    );
+                    if (resend_now) {
+                        debug_trace.eventf("agent", "content_filter_resend", step_ctx, "attempt={d} model={s}", .{
+                            request_recovery.attempt(),
+                            gateway_model,
+                        });
+                    }
+                    // Past its resends, the module needs the user. A host
+                    // that can ask waits for them below; on one that cannot,
+                    // the turn ends on the content-filter error further
+                    // down, as it did before the resends.
+                    if (content_filtered and !resend_now and !request_recovery.canAskUser()) break :retry;
+                    if (resend_now or try request_recovery.waitForSend() != null) {
                         preserved_tool_evidence = failure_tool_evidence;
                         recovery_strategy = resend_strategy.select(.possibly_sent, failure_tool_evidence);
                         recovery_cause = cause;

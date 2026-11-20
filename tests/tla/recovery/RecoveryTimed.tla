@@ -49,7 +49,7 @@ TTypeOK ==
     /\ pollWaited \in BOOLEAN
 
 \* Nothing in the world is failing the request.
-Healthy == net = "up" /\ gateway = "ok" /\ ~needUser
+Healthy == net = "up" /\ gateway = "ok" /\ ~needUser /\ ~blocked
 
 \* A server's Retry-After longer than the ceiling.
 LongHint == Ceiling + 1
@@ -63,8 +63,9 @@ Waits(hinted) ==
         (IF hinted THEN {IF Bug = "unbounded_wait" THEN LongHint ELSE Ceiling}
                    ELSE {})
 
-\* A send planned in this step.
-NewSend == inflight' /\ ~inflight
+\* A send planned in this step: one where none was on the wire, or a block's
+\* resend at once, which replaces the send the filter blocked.
+NewSend == inflight' /\ (~inflight \/ Blocked)
 
 \* The module waits for a sign-in.
 SignInWait == phase = "need_user" /\ askedSignIn
@@ -81,7 +82,7 @@ Follow(A, hinted) ==
     \* A sign-in wait that starts shows its status again, with its new
     \* time, even when the line already asked for a sign-in.
     /\ fresh' = (fresh \/ status' # status \/ NewSend \/ (SignInWait' /\ ~SignInWait))
-    /\ sendAge' = IF inflight' /\ inflight THEN sendAge ELSE 0
+    /\ sendAge' = IF inflight' /\ ~NewSend THEN sendAge ELSE 0
     /\ healAge' = IF faults' > faults \/ ~alive' THEN 0 ELSE healAge
     /\ signInAge' = IF SignInWait' /\ SignInWait /\ alive THEN signInAge ELSE 0
     /\ UNCHANGED pollWaited
@@ -141,16 +142,21 @@ TInit ==
 \* may take. SignInPoll is both: a Tick at the end of the wait, or at once
 \* when the sign-in fx opened closes without a new login (`sign_in_closed`).
 \* A broken gateway's answer is the one failure that may carry Retry-After.
+\* A block's resend on a host that cannot ask goes out in the same step, so
+\* its retry status must hand off like any other resend's (HandsOff).
 TNext ==
     \/ Follow(Responding, FALSE)
     \/ Follow(Respond, net = "up" /\ ~needUser /\ gateway = "broken")
+    \/ Follow(Blocked, FALSE)
     \/ Follow(Drop, FALSE) \/ Follow(StaleSocket, FALSE)
     \/ Follow(NetDown, FALSE) \/ Follow(NetUp, FALSE)
     \/ Follow(GatewayBreak, FALSE) \/ Follow(GatewayHeal, FALSE)
     \/ Follow(NeedUserFault, FALSE) \/ Follow(TroubleClears, FALSE)
+    \/ Follow(FilterFault, FALSE) \/ Follow(FilterClears, FALSE)
     \/ Follow(SignInPoll, FALSE)
     \/ Follow(Crash, FALSE) \/ Follow(Close, FALSE) \/ Follow(Relaunch, FALSE)
     \/ Follow(UserCancels, FALSE) \/ Follow(UserActs, FALSE)
+    \/ Follow(HostEnds, FALSE)
     \/ Tick
     \/ Follow(Finished, FALSE)
 
