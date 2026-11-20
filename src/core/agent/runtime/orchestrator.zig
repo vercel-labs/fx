@@ -7152,6 +7152,7 @@ fn processQueuedPromptLoop(
         var skip_next_preflight_refresh = false;
         var context_overflow_recovery: ContextOverflowRecoveryState = .ready;
         var request_size_retries: u8 = 0;
+        var length_limit_retries: u8 = 0;
         var recovery_has_unexecuted_tool_start = false;
         var successful_recovery_strategy: ?model_response_recovery.Strategy = null;
         defer {
@@ -9027,6 +9028,29 @@ fn processQueuedPromptLoop(
                 }
                 finish_trace.finish(if (finish_reason == .provider_error) "provider_error" else "content_filter");
                 return error.ModelError;
+            }
+
+            if (streamSucceeded(stream_result) and
+                attempt_disposition == .length_limited and
+                length_limit_retries < config.length_limit_retries and
+                semantic_attempt + 1 < semantic_limit)
+            {
+                // Same request, same output cap: the truncated response never reaches history.
+                length_limit_retries += 1;
+                debug_trace.eventf("agent", "provider_length_retry", step_ctx, "retry={d}/{d} content_bytes={d} tool_call_count={d}", .{
+                    length_limit_retries,
+                    config.length_limit_retries,
+                    completionContentBytes(attempt_completion),
+                    attempt_completion.tool_calls.len,
+                });
+                const notice = try arena.print("response hit provider length limit; retrying the same request ({d}/{d})", .{ length_limit_retries, config.length_limit_retries });
+                try deps.push_system_notice(deps.ctx, notice);
+                stream_result.deinit(arena);
+                stream_result_set = false;
+                semantic_attempt += 1;
+                retry_pacing = .idle;
+                reset_stream_for_next_attempt = true;
+                continue;
             }
 
             successful_gateway_model = gateway_model;

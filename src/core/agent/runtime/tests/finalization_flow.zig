@@ -456,7 +456,10 @@ test "processQueuedPrompt continues with steering queued before a length-limited
     defer hooks.deinit();
     var fixture = PromptFixture{};
 
-    try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
+    // The length-limit retries are used up.
+    var config = fixture.config();
+    config.length_limit_retries = 0;
+    try runFakePrompt(&gateway, &hooks, config, fixture.job());
 
     try std.testing.expectEqual(@as(usize, 2), gateway.request_bodies.items.len);
     try expectBodyContainsInOrder(&gateway, 1, &.{
@@ -1358,10 +1361,13 @@ test "common Stop length-limited tool failure retains candidate" {
     defer handler.deinit();
     const view = try registerStopTestHandler(&lifecycle_runtime, &handler);
 
+    // The length-limit retries are used up.
+    var config = fixture.config();
+    config.length_limit_retries = 0;
     try runFakePromptWithLifecycle(
         &gateway,
         &deps,
-        fixture.config(),
+        config,
         fixture.job(),
         testLifecycleContext(view, alloc, fixture.workspace_root),
     );

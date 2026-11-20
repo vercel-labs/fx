@@ -2131,7 +2131,10 @@ test "processQueuedPrompt length-limited calls bypass malformed local tool ident
     defer hooks.deinit();
     var fixture = PromptFixture{};
 
-    try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
+    // The length-limit retries are used up.
+    var config = fixture.config();
+    config.length_limit_retries = 0;
+    try runFakePrompt(&gateway, &hooks, config, fixture.job());
 
     try std.testing.expectEqual(@as(usize, 0), hooks.permission_names.items.len);
     try std.testing.expectEqual(@as(usize, 0), hooks.executed_names.items.len);
@@ -3732,7 +3735,10 @@ test "processQueuedPrompt length-limited calls bypass malformed provider result 
     defer hooks.deinit();
     var fixture = PromptFixture{};
 
-    try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
+    // The length-limit retries are used up.
+    var config = fixture.config();
+    config.length_limit_retries = 0;
+    try runFakePrompt(&gateway, &hooks, config, fixture.job());
 
     try std.testing.expectEqual(@as(usize, 0), hooks.permission_names.items.len);
     try std.testing.expectEqual(@as(usize, 0), hooks.executed_names.items.len);

@@ -29,6 +29,11 @@ pub const Config = struct {
     skill_bindings: []const skill_invocation.ExplicitBinding = &.{},
     gateway_retry_count: usize,
     max_provider_attempts: usize = model_response_recovery.default_max_provider_attempts,
+    /// Times the same request is sent again after the provider stops it at the
+    /// output limit. A runaway generation is a provider failure, not an answer,
+    /// and a fresh attempt usually completes; each retry uses the turn's
+    /// provider-attempt budget.
+    length_limit_retries: u8 = 3,
     /// Interactive hosts may request a durable "try later" pause separately
     /// from cancellation. Headless hosts leave this null.
     recovery_pause_flag: ?*std.atomic.Value(bool) = null,

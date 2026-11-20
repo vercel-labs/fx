@@ -8343,7 +8343,10 @@ test "processQueuedPrompt no-tool length bypasses silent-tool continuation" {
     defer hooks.deinit();
     var fixture = PromptFixture{};
 
-    try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
+    // The length-limit retries are used up.
+    var config = fixture.config();
+    config.length_limit_retries = 0;
+    try runFakePrompt(&gateway, &hooks, config, fixture.job());
 
     try std.testing.expectEqual(@as(usize, 3), gateway.request_bodies.items.len);
     try std.testing.expectEqual(@as(usize, 2), hooks.executed_names.items.len);
@@ -8726,7 +8729,10 @@ test "processQueuedPrompt does not execute tool calls from length-truncated comp
     defer hooks.deinit();
     var fixture = PromptFixture{};
 
-    try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
+    // The length-limit retries are used up.
+    var config = fixture.config();
+    config.length_limit_retries = 0;
+    try runFakePrompt(&gateway, &hooks, config, fixture.job());
 
     try std.testing.expectEqual(@as(usize, 0), hooks.permission_names.items.len);
     try std.testing.expectEqual(@as(usize, 0), hooks.executed_names.items.len);
@@ -8742,6 +8748,49 @@ test "processQueuedPrompt does not execute tool calls from length-truncated comp
     );
 }
 
+test "processQueuedPrompt retries a length-truncated completion with the same request" {
+    const alloc = std.testing.allocator;
+    const calls = [_]ToolCall{toolCall("call_write", "write_file", "{\"path\":\"a.txt\",\"content\":\"x\"}")};
+    const completions = [_]FakeCompletion{
+        .{ .content = "Runaway", .tool_calls = &calls, .finish_reason = .length },
+        .{ .tool_calls = &calls },
+        .{ .content = "Done" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+
+    try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
+
+    try std.testing.expectEqual(@as(usize, 3), gateway.request_bodies.items.len);
+    try std.testing.expectEqualStrings(gateway.request_bodies.items[0], gateway.request_bodies.items[1]);
+    try std.testing.expectEqual(@as(usize, 1), hooks.executed_names.items.len);
+    try std.testing.expectEqualStrings("response hit provider length limit; retrying the same request (1/3)", hooks.system_notices.items[0]);
+    try std.testing.expectEqual(types.TurnPresentationOutcome.completed, hooks.finalized_outcome.?);
+}
+
+test "processQueuedPrompt stops a length-truncated tool completion when the retries are used up" {
+    const alloc = std.testing.allocator;
+    const calls = [_]ToolCall{toolCall("call_write", "write_file", "{\"path\":\"a.txt\",\"content\":\"x\"}")};
+    const truncated: FakeCompletion = .{ .content = "Runaway", .tool_calls = &calls, .finish_reason = .length };
+    const completions = [_]FakeCompletion{ truncated, truncated, truncated, truncated };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+
+    try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
+
+    try std.testing.expectEqual(@as(usize, 4), gateway.request_bodies.items.len);
+    try std.testing.expectEqual(@as(usize, 0), hooks.executed_names.items.len);
+    try std.testing.expectEqualStrings("response hit provider length limit; retrying the same request (3/3)", hooks.system_notices.items[2]);
+    try std.testing.expectEqual(types.TurnPresentationOutcome.failed, hooks.finalized_outcome.?);
+    try std.testing.expectEqual(types.ProviderCompletionDisposition.length_limited, hooks.finalized_disposition.?);
+}
+
 test "processQueuedPrompt no-tool length preserves completed presentation with length disposition" {
     const alloc = std.testing.allocator;
     const completions = [_]FakeCompletion{.{
@@ -8754,7 +8803,10 @@ test "processQueuedPrompt no-tool length preserves completed presentation with l
     defer hooks.deinit();
     var fixture = PromptFixture{};
 
-    try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
+    // The length-limit retries are used up.
+    var config = fixture.config();
+    config.length_limit_retries = 0;
+    try runFakePrompt(&gateway, &hooks, config, fixture.job());
 
     try std.testing.expectEqual(types.TurnPresentationOutcome.completed, hooks.finalized_outcome.?);
     try std.testing.expectEqual(types.ProviderCompletionDisposition.length_limited, hooks.finalized_disposition.?);
