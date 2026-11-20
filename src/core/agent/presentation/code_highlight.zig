@@ -141,7 +141,13 @@ pub fn highlight(
             continue;
         }
         if (isIdentifierStart(byte)) {
-            const end = identifierEnd(source, index);
+            // Program names often contain dashes or dots (agent-browser,
+            // docker-compose, python3.12), so a word in command position keeps
+            // them; argument words still stop at the first dash.
+            const end = if (profile.command_words and command_position)
+                commandWordEnd(source, index)
+            else
+                identifierEnd(source, index);
             const token = source[index..end];
             // A word glued to a path separator is a path segment, not syntax:
             // /dev/null keeps "null" plain.
@@ -410,6 +416,12 @@ fn flagEnd(source: []const u8, start: usize, operators: []const u8) ?usize {
 
 fn isIdentifierContinue(byte: u8) bool {
     return isIdentifierStart(byte) or std.ascii.isDigit(byte);
+}
+
+fn commandWordEnd(source: []const u8, start: usize) usize {
+    var index = start + 1;
+    while (index < source.len and (isIdentifierContinue(source[index]) or source[index] == '-' or source[index] == '.')) : (index += 1) {}
+    return index;
 }
 
 fn identifierEnd(source: []const u8, start: usize) usize {
@@ -710,6 +722,23 @@ test "command position colors any command word and only command words" {
         defer alloc.free(wrapped);
         try std.testing.expect(std.mem.find(u8, chain, wrapped) != null);
     }
+}
+
+test "command words keep dashes and dots in program names" {
+    const alloc = std.testing.allocator;
+    const styled = try highlight(alloc, "agent-browser open agent-browser.dev && docker-compose up -d", languages.resolve("sh").?, .dark, null);
+    defer alloc.free(styled);
+
+    // The whole program name colors, not just the part before the dash.
+    try std.testing.expect(std.mem.find(u8, styled, "\x1b[38;5;252magent-browser\x1b[39m open") != null);
+    try std.testing.expect(std.mem.find(u8, styled, "\x1b[38;5;252mdocker-compose\x1b[39m") != null);
+    // An argument that looks like a program name stays plain.
+    try std.testing.expect(std.mem.find(u8, styled, " agent-browser.dev ") != null);
+    try std.testing.expect(std.mem.find(u8, styled, "\x1b[38;5;250m-d\x1b[39m") != null);
+
+    const versioned = try highlight(alloc, "python3.12 -m venv .venv", languages.resolve("sh").?, .dark, null);
+    defer alloc.free(versioned);
+    try std.testing.expect(std.mem.startsWith(u8, versioned, "\x1b[38;5;252mpython3.12\x1b[39m"));
 }
 
 test "bare number arguments stay plain but redirect fds color" {
