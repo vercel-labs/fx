@@ -666,9 +666,9 @@ fn readResponse(
     errdefer body.deinit(alloc);
     const pending_body = received.items[final_head_end..];
     switch (framing) {
-        .no_body => {
-            if (pending_body.len > 0) return error.UnexpectedBodyForBodylessResponse;
-        },
+        // A 204 or 304 ends at its head (RFC 9112 section 6.3). Like bytes after a framed
+        // body, later bytes belong to no response, since each connection carries one request.
+        .no_body => {},
         .chunked => {
             var chunk_reader = BodyReader.init(reader, pending_body, options);
             try readChunkedBody(&chunk_reader, &body, alloc, cap);
@@ -1914,7 +1914,7 @@ test "web_fetch transfer encoding parser validates ordered coding members" {
     );
 }
 
-test "web_fetch bodyless response framing ignores fields and rejects pending body" {
+test "web_fetch bodyless response framing ignores fields" {
     try expectResponseBody(
         "HTTP/1.1 204 No Content\r\nTransfer-Encoding: gzip\r\nContent-Length: 99\r\n\r\n",
         204,
@@ -1925,10 +1925,26 @@ test "web_fetch bodyless response framing ignores fields and rejects pending bod
         304,
         "",
     );
-    try expectResponseError(
-        error.UnexpectedBodyForBodylessResponse,
-        "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\nunexpected",
-    );
+}
+
+test "web_fetch bodyless response ends at its head however the bytes after it are split" {
+    const alloc = std.testing.allocator;
+    const cases = [_]struct { head: []const u8, status: u16 }{
+        .{ .head = "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n", .status = 204 },
+        .{ .head = "HTTP/1.1 304 Not Modified\r\n\r\n", .status = 304 },
+    };
+    for (cases) |case| {
+        const wire = try alloc.print("{s}unexpected", .{case.head});
+        defer alloc.free(wire);
+        const whole = [_]usize{wire.len};
+        const at_head = [_]usize{ case.head.len, wire.len };
+        for ([_][]const usize{ &whole, &at_head }) |splits| {
+            var response = try readFuzzResponse(alloc, wire, splits, max_body_bytes);
+            defer response.deinit(alloc);
+            try std.testing.expectEqual(case.status, @backingInt(response.status));
+            try std.testing.expectEqualStrings("", response.body);
+        }
+    }
 }
 
 test "web_fetch response parser consumes informational heads before final response" {

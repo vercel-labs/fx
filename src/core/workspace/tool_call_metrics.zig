@@ -3,6 +3,11 @@
 // tools, without forcing a persistent trace log. web_fetch is compact-only
 // because its prompt and fetched content are sensitive.
 //
+// The rings keep text as it was recorded, cut so that no part of a secret is
+// kept (`text_utils.secretSafePrefixLen` and `secretSafeSuffixStart`), and
+// `/trace` masks it when it writes the trace, so recording a call runs no
+// mask.
+//
 // Two rings hold them. The window keeps the last calls of every outcome, so a
 // busy agent or a few subagents move a failure out of it within minutes. The
 // failure ring keeps only calls that did not succeed, with larger head and
@@ -12,6 +17,7 @@
 const std = @import("std");
 const io_mod = @import("../shared/io.zig");
 const tool_result_display = @import("../tooling/tool_result_display.zig");
+const text_utils = @import("../shared/text_utils.zig");
 
 pub const max_name_len: usize = 64;
 pub const max_args_len: usize = 1200;
@@ -77,17 +83,21 @@ pub const ToolCallMetric = struct {
         self.call_id_len = @intCast(n);
     }
 
+    /// Keeps the first bytes that fit, without part of a secret the cut
+    /// splits (`text_utils.secretSafePrefixLen`).
     pub fn setArgs(self: *ToolCallMetric, value: []const u8) void {
         self.args_total_bytes = @intCast(@min(value.len, std.math.maxInt(u32)));
-        const n = utf8PrefixLen(value, max_args_len);
+        const n = text_utils.secretSafePrefixLen(value, max_args_len);
         @memcpy(self.args_buf[0..n], value[0..n]);
         self.args_len = @intCast(n);
     }
 
+    /// Keeps the first bytes that fit, without part of a secret the cut
+    /// splits (`text_utils.secretSafePrefixLen`).
     pub fn setResult(self: *ToolCallMetric, value: []const u8) void {
         const normalized = tool_result_display.contentForDisplay(value);
         self.result_total_bytes = @intCast(@min(normalized.len, std.math.maxInt(u32)));
-        const n = utf8PrefixLen(normalized, max_result_len);
+        const n = text_utils.secretSafePrefixLen(normalized, max_result_len);
         @memcpy(self.result_buf[0..n], normalized[0..n]);
         self.result_len = @intCast(n);
     }
@@ -112,7 +122,8 @@ pub const ToolCallMetric = struct {
 };
 
 /// One field of a kept failure: its first and last bytes, each cut on a
-/// UTF-8 boundary, and how many bytes the value had in all.
+/// UTF-8 boundary without part of a secret a cut splits, and how many bytes
+/// the value had in all.
 pub const KeptText = struct {
     buf: [max_failure_field_len]u8 = @splat(0),
     head_len: u16 = 0,
@@ -187,12 +198,14 @@ const HeadTailCut = struct {
 };
 
 /// Splits `value` into a head and a tail that fit `budget` bytes together,
-/// each cut on a UTF-8 boundary. A value that fits stays whole in the head.
+/// each cut on a UTF-8 boundary and so that neither keeps part of a secret a
+/// cut splits, which `maskSecrets` would not find when `/trace` writes them.
+/// A value that fits stays whole in the head.
 fn headTailCut(value: []const u8, budget: usize) HeadTailCut {
     if (value.len <= budget) return .{ .head_len = value.len, .tail_len = 0 };
-    const head_len = utf8PrefixLen(value, budget / 2);
-    const tail_len = utf8SuffixLen(value, budget - head_len);
-    return .{ .head_len = head_len, .tail_len = tail_len };
+    const head_len = text_utils.secretSafePrefixLen(value, budget / 2);
+    const tail_start = text_utils.secretSafeSuffixStart(value, value.len - utf8SuffixLen(value, budget - head_len));
+    return .{ .head_len = head_len, .tail_len = value.len - tail_start };
 }
 
 fn isContinuationByte(byte: u8) bool {
@@ -574,8 +587,15 @@ test "kept text holds a value whole at the cap and its head and tail past it" {
     try std.testing.expectEqual(@as(u32, 0), kept.omittedBytes());
 
     kept.set(at_cap);
+    // The tail starts inside the one long run, and a tail holds no part of a
+    // run its start splits.
     try std.testing.expectEqual(@as(u32, max_failure_field_len + 1), kept.total_bytes);
-    try std.testing.expectEqual(@as(u32, 1), kept.omittedBytes());
+    try std.testing.expectEqual(@as(usize, max_failure_field_len / 2), kept.head().len);
+    try std.testing.expectEqual(@as(usize, 0), kept.tail().len);
+    try std.testing.expectEqual(
+        @as(u32, max_failure_field_len + 1 - max_failure_field_len / 2),
+        kept.omittedBytes(),
+    );
     try std.testing.expect(std.mem.startsWith(u8, at_cap, kept.head()));
     try std.testing.expect(std.mem.endsWith(u8, at_cap, kept.tail()));
     try std.testing.expect(kept.head().len + kept.tail().len <= max_failure_field_len);
@@ -715,9 +735,34 @@ fn expectCutLaws(value: []const u8, budget: usize, valid_utf8: bool) !void {
     if (valid_utf8) {
         try std.testing.expect(std.unicode.utf8ValidateSlice(value[0..cut.head_len]));
         try std.testing.expect(std.unicode.utf8ValidateSlice(value[value.len - cut.tail_len ..]));
-        // A valid cut loses at most three bytes on each side.
-        try std.testing.expect(cut.head_len + 3 >= budget / 2);
-        try std.testing.expect(cut.head_len + cut.tail_len + 3 >= budget);
+        // A UTF-8 cut loses at most three bytes on each side, and the
+        // secret-safe cut keeps no more than it
+        // (`text_utils.secretSafePrefixLen`, `text_utils.secretSafeSuffixStart`).
+        const utf8_head = utf8PrefixLen(value, budget / 2);
+        try std.testing.expect(utf8_head + 3 >= budget / 2);
+        try std.testing.expect(cut.head_len <= utf8_head);
+        // What a short head leaves out holds no whitespace:
+        // it lies inside one word.
+        for (value[cut.head_len..utf8_head]) |byte| try std.testing.expect(!std.ascii.isWhitespace(byte));
+        const utf8_tail = utf8SuffixLen(value, budget - cut.head_len);
+        try std.testing.expect(cut.head_len + utf8_tail + 3 >= budget);
+        try std.testing.expect(cut.tail_len <= utf8_tail);
+        // The kept tail starts where the secret-safe cut moves the UTF-8
+        // start, and no later: `text_utils.secretSafeSuffixStart` and its
+        // tests pin which secrets it steps past.
+        try std.testing.expectEqual(value.len - text_utils.secretSafeSuffixStart(value, value.len - utf8_tail), cut.tail_len);
+        // In a value with no secret `maskSecrets` finds, no URL, and no
+        // `Bearer ` token, what the tail loses holds no whitespace: it lies
+        // inside one word.
+        const lost = value[value.len - utf8_tail .. value.len - cut.tail_len];
+        if (std.mem.findAny(u8, lost, " \t\n\r\x0b\x0c") != null) {
+            var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+            defer arena_state.deinit();
+            const masked = try text_utils.maskSecrets(arena_state.allocator(), value);
+            try std.testing.expect(!std.mem.eql(u8, masked, value) or
+                std.mem.find(u8, value, "://") != null or
+                std.mem.find(u8, value, "Bearer ") != null);
+        }
     }
 }
 
@@ -820,4 +865,139 @@ fn idsAscendPerThread(comptime T: type, calls: []const T) bool {
         last[thread_index] = seq;
     }
     return true;
+}
+
+test "a recorded call's arguments and result keep no part of a secret their cut splits" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const token: []const u8 = "ghp_" ++ text_utils.repeat("A", 36);
+    const args_prefix = "{\"action\":\"run\",\"command\":\"echo ";
+    const args_suffix = " done\"}";
+    var value_buf: [max_result_len + 128]u8 = undefined;
+
+    var shift: usize = 0;
+    while (shift < token.len) : (shift += 1) {
+        var call: ToolCallMetric = .{};
+
+        // A JSON command string moves the token across the argument cut.
+        const filler_len = max_args_len - token.len + shift - args_prefix.len;
+        var len: usize = 0;
+        @memcpy(value_buf[0..args_prefix.len], args_prefix);
+        len += args_prefix.len;
+        for (value_buf[len..][0..filler_len], 0..) |*byte, index| byte.* = if (index % 2 == 0) 'x' else ' ';
+        len += filler_len;
+        @memcpy(value_buf[len..][0..token.len], token);
+        len += token.len;
+        @memcpy(value_buf[len..][0..args_suffix.len], args_suffix);
+        len += args_suffix.len;
+        const args = value_buf[0..len];
+
+        call.setArgs(args);
+        try std.testing.expectEqual(@as(u32, @intCast(args.len)), call.args_total_bytes);
+        const masked_args = try text_utils.maskSecrets(arena, call.args());
+        try std.testing.expect(std.mem.find(u8, masked_args, "AAAAAA") == null);
+
+        // Plain text moves the same token across the result cut;
+        // `contentForDisplay` keeps it as it is.
+        const result_filler_len = max_result_len - token.len + shift;
+        for (value_buf[0..result_filler_len], 0..) |*byte, index| byte.* = if (index % 2 == 0) 'x' else ' ';
+        len = result_filler_len;
+        @memcpy(value_buf[len..][0..token.len], token);
+        len += token.len;
+        @memcpy(value_buf[len..][0.." done".len], " done");
+        len += " done".len;
+        const result = value_buf[0..len];
+
+        call = .{};
+        call.setResult(result);
+        try std.testing.expectEqual(@as(u32, @intCast(result.len)), call.result_total_bytes);
+        const masked_result = try text_utils.maskSecrets(arena, call.result());
+        try std.testing.expect(std.mem.find(u8, masked_result, "AAAAAA") == null);
+    }
+}
+
+test "a kept failure's head and tail keep no part of a secret their cuts split" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const token: []const u8 = "ghp_" ++ text_utils.repeat("A", 36);
+    var value_buf: [max_failure_field_len + 512]u8 = undefined;
+
+    // The head cut falls at `max_failure_field_len / 2`.
+    var shift: usize = 1;
+    while (shift < token.len) : (shift += 1) {
+        const token_start = max_failure_field_len / 2 - token.len + shift;
+        const value = fillKeptValue(&value_buf, token, token_start);
+        var kept: KeptText = .{};
+        kept.set(value);
+        try expectKeptTextKeepsNoToken(arena, kept, value);
+    }
+
+    // The tail starts where `headTailCut` puts it for a value of this length.
+    const value_len = max_failure_field_len + 200;
+    for (value_buf[0..value_len], 0..) |*byte, index| byte.* = "word "[index % "word ".len];
+    const shape = value_buf[0..value_len];
+    const shape_head_len = text_utils.secretSafePrefixLen(shape, max_failure_field_len / 2);
+    const tail_start = shape.len - (max_failure_field_len - shape_head_len);
+
+    var straddled: usize = 0;
+    var tail_shift: usize = 0;
+    while (tail_shift <= 60) : (tail_shift += 1) {
+        const token_start = tail_start - 30 + tail_shift;
+        const value = fillKeptValue(&value_buf, token, token_start);
+        var kept: KeptText = .{};
+        kept.set(value);
+        try expectKeptTextKeepsNoToken(arena, kept, value);
+        if (token_start < tail_start and tail_start <= token_start + token.len) straddled += 1;
+    }
+    try std.testing.expect(straddled >= 30);
+}
+
+test "a kept failure's head leaves out a URL whose credential the cut splits" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const url = "https://admin:P\u{e4}ss1234@example.com/x";
+    const at = std.mem.findScalar(u8, url, '@').?;
+    const cut = max_failure_field_len / 2;
+    // Place the URL so the head cut falls inside `admin:P\u{e4}ss1234`.
+    const url_start = cut - at + 4;
+    try std.testing.expect(url_start + "https://".len < cut and cut < url_start + at);
+
+    var value_buf: [max_failure_field_len + 512]u8 = undefined;
+    const value = fillKeptValue(&value_buf, url, url_start);
+
+    var kept: KeptText = .{};
+    kept.set(value);
+    const masked_head = try text_utils.maskSecrets(arena, kept.head());
+    try std.testing.expect(std.mem.find(u8, masked_head, "admin:") == null);
+    try std.testing.expect(std.mem.find(u8, masked_head, "ss1234") == null);
+}
+
+/// A `max_failure_field_len + 200` byte value of `word ` cycles, with
+/// `planted` at `planted_start` after a space, and ` done` at the end.
+fn fillKeptValue(value_buf: []u8, planted: []const u8, planted_start: usize) []const u8 {
+    const value = value_buf[0 .. max_failure_field_len + 200];
+    for (value, 0..) |*byte, index| byte.* = "word "[index % "word ".len];
+    if (planted_start > 0) value[planted_start - 1] = ' ';
+    @memcpy(value[planted_start..][0..planted.len], planted);
+    @memcpy(value[value.len - " done".len ..], " done");
+    return value;
+}
+
+fn expectKeptTextKeepsNoToken(arena: std.mem.Allocator, kept: KeptText, value: []const u8) !void {
+    try std.testing.expect(kept.head().len + kept.tail().len <= max_failure_field_len);
+    try std.testing.expectEqual(@as(u32, @intCast(value.len)), kept.total_bytes);
+    try std.testing.expectEqual(
+        @as(u32, @intCast(value.len - kept.head().len - kept.tail().len)),
+        kept.omittedBytes(),
+    );
+    const masked_head = try text_utils.maskSecrets(arena, kept.head());
+    try std.testing.expect(std.mem.find(u8, masked_head, "AAAAAA") == null);
+    const masked_tail = try text_utils.maskSecrets(arena, kept.tail());
+    try std.testing.expect(std.mem.find(u8, masked_tail, "AAAAAA") == null);
 }
