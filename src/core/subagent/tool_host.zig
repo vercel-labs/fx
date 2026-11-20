@@ -2945,8 +2945,11 @@ const MailboxFixture = struct {
     /// While set, the first run fails once released.
     fail_first: bool = false,
     /// While set, a cancelled run stays in its turn until `release`, so a
-    /// stop meets a turn that is still winding down.
+    /// stop meets a turn that is still winding down. It waits at most 10 s: a
+    /// run that was never released fails and sets `linger_timed_out`, which the
+    /// tests that use `linger` check.
     linger: bool = false,
+    linger_timed_out: std.atomic.Value(bool) = .init(false),
     /// While set, each run saves an empty reply.
     empty_reply: bool = false,
     /// While set, the sink takes no report, as when its owner is gone.
@@ -3054,7 +3057,13 @@ const MailboxFixture = struct {
         const run_number = self.runs.fetchAdd(1, .seq_cst) + 1;
         self.ask(worker, message.content);
         while (self.hold and !self.release.isSet() and !cancel.load(.seq_cst)) io_mod.sleep(std.time.ns_per_ms);
-        if (self.linger and cancel.load(.seq_cst)) self.release.waitUncancelable(io_mod.getIo());
+        if (self.linger and cancel.load(.seq_cst)) {
+            self.release.waitTimeout(io_mod.getIo(), .{ .duration = .{ .clock = .awake, .raw = .fromSeconds(10) } }) catch {
+                self.linger_timed_out.store(true, .seq_cst);
+                std.debug.print("a lingering turn was not released within 10 s\n", .{});
+                return error.ProviderFailed;
+            };
+        }
         if (cancel.load(.seq_cst)) return error.Cancelled;
         if (self.fail_first and run_number == 1) return error.ProviderFailed;
         if (turn.isHosted()) return .completed;
@@ -8108,6 +8117,36 @@ test "a stop that lands between a turn's end and the slot finishing its work cou
     try std.testing.expect(registry.findPersistent("reviewer").?.active == null);
 }
 
+/// What a stop hook did. A hook counts itself as entered only once the wait it
+/// makes for the slot has succeeded. A wait that ran out is counted apart and
+/// says what it waited for, so a test or cell that checks both fails when the
+/// slot never went on, and does not read on as if it had.
+const InStopCount = struct {
+    entered: std.atomic.Value(u32) = .init(0),
+    timed_out: std.atomic.Value(u32) = .init(0),
+
+    fn reset(self: *InStopCount) void {
+        self.entered.store(0, .seq_cst);
+        self.timed_out.store(0, .seq_cst);
+    }
+
+    /// Notes how a hook's wait for `what` ended.
+    fn note(self: *InStopCount, waited: anyerror!void, what: []const u8) void {
+        waited catch {
+            _ = self.timed_out.fetchAdd(1, .seq_cst);
+            std.debug.print("a stop's hook waited 10 s and {s}\n", .{what});
+            return;
+        };
+        _ = self.entered.fetchAdd(1, .seq_cst);
+    }
+
+    /// Fails unless no wait ran out and the hook was entered `expected` times.
+    fn expectEntered(self: *InStopCount, expected: u32) !void {
+        try std.testing.expectEqual(@as(u32, 0), self.timed_out.load(.seq_cst));
+        try std.testing.expectEqual(expected, self.entered.load(.seq_cst));
+    }
+};
+
 /// The slot's end and the host's hold in a parent's stop or close
 /// (`end_test_controls.test_hold_stop`): the slot waits after its turn ended and
 /// before it records the end, and again once it has. From its hook the stop or
@@ -8116,23 +8155,21 @@ test "a stop that lands between a turn's end and the slot finishing its work cou
 const EndInStop = struct {
     var before = TestHold{};
     var after = TestHold{};
-    /// How many times a stop or close ran the hook.
-    var entered = std.atomic.Value(u32).init(0);
+    var count = InStopCount{};
 
     fn heldAt(_: []const u8, recorded: bool) void {
         if (recorded) after.once() else before.once();
     }
 
     fn inStop(_: []const u8) void {
-        _ = entered.fetchAdd(1, .seq_cst);
         before.release();
-        after.waitHeld() catch std.debug.print("the slot's end was not recorded in time\n", .{});
+        count.note(after.waitHeld(), "the slot's end was not recorded");
     }
 
     fn arm() void {
         before.reset();
         after.reset();
-        entered.store(0, .seq_cst);
+        count.reset();
         end_test_controls.test_hold_run = heldAt;
         end_test_controls.test_hold_stop = inStop;
     }
@@ -8152,16 +8189,15 @@ const EndInStop = struct {
 /// worker attaches: the hook lets the worker attach and waits until it has, so
 /// the attach runs right after the owner stopped the work.
 const AttachInStop = struct {
-    var entered = std.atomic.Value(u32).init(0);
+    var count = InStopCount{};
 
     fn inStop(_: []const u8) void {
-        _ = entered.fetchAdd(1, .seq_cst);
         HeldStart.release();
-        AttachedHold.first.waitHeld() catch std.debug.print("the work's worker did not attach in time\n", .{});
+        count.note(AttachedHold.first.waitHeld(), "the work's worker did not attach");
     }
 
     fn arm() void {
-        entered.store(0, .seq_cst);
+        count.reset();
         HeldStart.arm();
         AttachedHold.arm(0);
         end_test_controls.test_hold_stop = inStop;
@@ -8182,16 +8218,15 @@ const AttachInStop = struct {
 /// The same for a work the host chose that ends before its worker attaches: the
 /// hook lets the slot go on and waits until the work's end is recorded.
 const EndedInStop = struct {
-    var entered = std.atomic.Value(u32).init(0);
+    var count = InStopCount{};
 
     fn inStop(_: []const u8) void {
-        _ = entered.fetchAdd(1, .seq_cst);
         PublishHeldTwice.first.release();
-        HeldRecorded.waitHeld() catch std.debug.print("the work's end was not recorded in time\n", .{});
+        count.note(HeldRecorded.waitHeld(), "the work's end was not recorded");
     }
 
     fn arm() void {
-        entered.store(0, .seq_cst);
+        count.reset();
         HeldRecorded.arm();
         end_test_controls.test_hold_stop = inStop;
     }
@@ -8233,8 +8268,9 @@ test "a stop whose turn's slot ends right after the owner stopped it counts the 
     try waitForSlotEnd(runtime, child_id);
     try expectAnswerHas(stopped, stopped_and_dropped);
     try std.testing.expect(std.mem.find(u8, again, "dropped") == null);
-    // Each stop let the slot go inside it.
-    try std.testing.expectEqual(@as(u32, 2), EndInStop.entered.load(.seq_cst));
+    // Each stop let the slot go inside it, and the slot's end was recorded
+    // there, in time.
+    try EndInStop.count.expectEntered(2);
     // The message never ran, and a stop owes no report.
     try std.testing.expectEqual(@as(usize, 1), fixture.runs.load(.seq_cst));
     try std.testing.expectEqual(@as(usize, 0), fixture.reportCount());
@@ -8259,7 +8295,7 @@ test "the parent's close whose turn's slot ends right after the owner stopped it
     EndInStop.release();
     try waitForSlotEnd(runtime, child_id);
     try expectAnswerHas(closed, closed_and_dropped);
-    try std.testing.expectEqual(@as(u32, 1), EndInStop.entered.load(.seq_cst));
+    try EndInStop.count.expectEntered(1);
     try std.testing.expectEqual(@as(usize, 1), fixture.runs.load(.seq_cst));
     var registry = try runtime.managed.state_store.load(alloc);
     defer registry.deinit(alloc);
@@ -8303,7 +8339,7 @@ test "a stop whose chosen work attaches right after the owner stopped it counts 
     try waitUntilQuiet(runtime);
     try std.testing.expectEqual(@as(usize, 1), fixture.begun.load(.seq_cst));
     try expectAnswerHas(stopped, stopped_and_dropped);
-    try std.testing.expectEqual(@as(u32, 1), AttachInStop.entered.load(.seq_cst));
+    try AttachInStop.count.expectEntered(1);
 }
 
 test "the parent's close whose chosen work attaches right after the owner stopped it counts the message that waited for it" {
@@ -8325,7 +8361,7 @@ test "the parent's close whose chosen work attaches right after the owner stoppe
     try waitForSlotEnd(runtime, child_id);
     try std.testing.expectEqual(@as(usize, 1), fixture.begun.load(.seq_cst));
     try expectAnswerHas(closed, closed_and_dropped);
-    try std.testing.expectEqual(@as(u32, 1), AttachInStop.entered.load(.seq_cst));
+    try AttachInStop.count.expectEntered(1);
 }
 
 /// A parent's stop or close of a work the host chose, whose bind to its agent
@@ -8343,7 +8379,7 @@ fn expectCountedWhenChosenWorkEnds(actor: Actor, expected: []const u8) !void {
     HeldRecorded.release();
     try cell.finish();
     try expectAnswerHas(cell.answers.items[0], expected);
-    try std.testing.expectEqual(@as(u32, 1), EndedInStop.entered.load(.seq_cst));
+    try EndedInStop.count.expectEntered(1);
     // Only the first work's turn began.
     try std.testing.expectEqual(@as(usize, 1), cell.fixture.begun.load(.seq_cst));
 }
@@ -8579,6 +8615,7 @@ test "a message counted by the parent's stop is not counted again by the user's 
     fixture.release.set(io_mod.getIo());
     try waitForSlotEnd(runtime, child_id);
     try std.testing.expectEqual(@as(usize, 1), fixture.runs.load(.seq_cst));
+    try std.testing.expect(!fixture.linger_timed_out.load(.seq_cst));
 }
 
 /// A hold after each of the first two works recorded its end, before the host's
@@ -8985,6 +9022,15 @@ const Plan = struct {
         return self.first == .parent_stop or self.first == .parent_close or
             self.second == Actor.parent_stop or self.second == Actor.parent_close;
     }
+
+    /// Whether a parent's stop or close meets a child that is still open, and
+    /// so runs the hook inside the stop. Every plan with one does, but the
+    /// user's close and then the parent's: the second close finds the child
+    /// already closing and returns before the hook.
+    fn reachesStopHook(self: Plan) bool {
+        if (self.first == .user_close and self.second == Actor.parent_close) return false;
+        return self.hasParent();
+    }
 };
 
 /// The pairs that end in a user's stop are not run: the app calls
@@ -9321,6 +9367,7 @@ const AccountCell = struct {
             // the waiting message starts and not the first one.
             .starting_one, .starting_two => if (self.in_stop) {
                 AttachedHold.arm(1);
+                AttachInStop.count.reset();
                 end_test_controls.test_hold_stop = AttachInStop.inStop;
             },
             .recorded_kept_failed_first => RecordedHeld.arm(),
@@ -9328,7 +9375,30 @@ const AccountCell = struct {
             .attached_not_begun => AttachedHold.arm(0),
             .next_attached_not_begun => AttachedHold.arm(1),
         }
-        if (self.in_stop and self.scenario == .next_one_failed) end_test_controls.test_hold_stop = EndedInStop.inStop;
+        if (self.in_stop and self.scenario == .next_one_failed) {
+            EndedInStop.count.reset();
+            end_test_controls.test_hold_stop = EndedInStop.inStop;
+        }
+    }
+
+    /// What the hook inside the stop did in this cell's window.
+    fn stopCount(self: *AccountCell) *InStopCount {
+        return switch (self.scenario) {
+            .returned_kept => &EndInStop.count,
+            .starting_one, .starting_two => &AttachInStop.count,
+            .next_one_failed => &EndedInStop.count,
+            else => unreachable,
+        };
+    }
+
+    /// Whether the slot went on inside the stop, in time: no wait of the hook
+    /// ran out, and the hook was entered exactly when a stop or close of the
+    /// plan meets the open child.
+    fn stopHeld(self: *AccountCell, plan: Plan) bool {
+        const count = self.stopCount();
+        if (count.timed_out.load(.seq_cst) != 0) return false;
+        const entered = count.entered.load(.seq_cst);
+        return if (plan.reachesStopHook()) entered > 0 else entered == 0;
     }
 
     fn releaseHolds(self: *AccountCell) void {
@@ -9733,13 +9803,24 @@ fn runAccountCell(scenario: Scenario, hosted_path: bool, in_stop: bool, plan: Pl
     try cell.act(plan.first, 1);
     if (plan.second) |second| try cell.act(second, 2);
     try cell.finish();
+    // A lingering turn that was never released waited out its 10 s and failed.
+    // Every other cell of the window would wait as long, so the table stops
+    // there, as it does for a cell it cannot drive.
+    if (cell.fixture.linger_timed_out.load(.seq_cst)) return error.LingerNeverReleased;
     const as_on_main = accountAsOnMain(plan, scenario, hosted_path);
     const ledger = cell.tally();
     const verdict = accountVerdict(ledger, as_on_main);
-    if (verdict == .ok) return true;
     var buf: [160]u8 = undefined;
-    cell.print(accountCellName(&buf, scenario, hosted_path, in_stop, plan, as_on_main), ledger, verdict);
-    return false;
+    const name = accountCellName(&buf, scenario, hosted_path, in_stop, plan, as_on_main);
+    // A stop that read on before the slot went on proves nothing about the
+    // order the cell is there for, whatever the verdict says.
+    const slot_went_on = !in_stop or cell.stopHeld(plan);
+    if (!slot_went_on) {
+        const count = cell.stopCount();
+        std.debug.print("\nTABLE {s}: the slot did not go on inside the stop: the hook went on {d} times and {d} of its waits ran out\n", .{ name, count.entered.load(.seq_cst), count.timed_out.load(.seq_cst) });
+    }
+    if (verdict != .ok) cell.print(name, ledger, verdict);
+    return verdict == .ok and slot_went_on;
 }
 
 test "every message main sends has one account in every window of a subagent's slot, for each stop and close" {
