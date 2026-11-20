@@ -1,0 +1,32 @@
+[
+  {
+    "description": "A name written with an escape matches no field again, as before the fix",
+    "old": "EngineCount(p, e, o) == p + (IF KeyRead = \"decoded\" THEN e ELSE 0)",
+    "new": "EngineCount(p, e, o) == p",
+    "invariant": "AgreeOrRefused"
+  },
+  {
+    "description": "A name is matched by its last piece, so x\\u0000id counts as id",
+    "old": "EngineCount(p, e, o) == p + (IF KeyRead = \"decoded\" THEN e ELSE 0)",
+    "new": "EngineCount(p, e, o) == p + e + o",
+    "invariant": "AgreeOrRefused"
+  },
+  {
+    "description": "A name written twice is not refused",
+    "old": "/\\ refused' = (EngineView(p, e, o) = \"dup\")",
+    "new": "/\\ refused' = FALSE",
+    "invariant": "DupRefused"
+  },
+  {
+    "description": "The last of two members wins instead of a refusal",
+    "old": "EngineView(p, e, o) == ViewOf(EngineCount(p, e, o))",
+    "new": "EngineView(p, e, o) == IF EngineCount(p, e, o) = 0 THEN \"absent\" ELSE \"value\"",
+    "invariant": "AgreeOrRefused"
+  },
+  {
+    "description": "A field that is absent is reported as true",
+    "old": "EngineReported == IF engineView = \"value\" THEN flag ELSE FALSE",
+    "new": "EngineReported == IF engineView = \"value\" THEN flag ELSE TRUE",
+    "invariant": "ReportedAsSaid"
+  }
+]

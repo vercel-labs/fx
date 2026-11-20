@@ -9,6 +9,7 @@ const std = @import("std");
 const fuzzy_match = @import("../shared/fuzzy_match.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const runtime = @import("runtime.zig");
+const login_words = @import("login_words.zig");
 
 pub const Screen = enum { list, server, confirm };
 
@@ -556,7 +557,7 @@ pub fn needsAttention(s: runtime.Status) bool {
 
 /// What a server needs from the user, if anything.
 fn attention(s: runtime.Status) ?[]const u8 {
-    if (s.needs_login) return "needs login";
+    if (s.needs_login) return login_words.attention(s.reason);
     return switch (s.state) {
         .waiting_for_approval => "is waiting for approval",
         .failed => "failed",
