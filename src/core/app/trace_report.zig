@@ -518,7 +518,7 @@ pub const IncludedCrash = struct {
 };
 
 /// A trace, and the saved crash report that it includes, if any.
-pub const BuiltTrace = struct {
+const BuiltTrace = struct {
     /// The trace's JSON Lines bytes. The caller owns them.
     bytes: []u8,
     /// The crash report that the trace includes as `last_crash`, or null.

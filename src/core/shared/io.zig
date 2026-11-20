@@ -636,33 +636,16 @@ pub const FileRead = union(enum) {
 
 /// Reads the regular file at the absolute `path`, up to `max_bytes`, and returns
 /// its bytes in `alloc`. A file of exactly `max_bytes` is too large, as with
-/// `readFileToEnd`. The open does not block, so a FIFO is refused at once rather
-/// than waiting for a writer, and the open file is checked to be a regular file
-/// before any byte is read. A symbolic link is followed, as the crash and
-/// shutdown readers did before. An allocation failure reads as unreadable.
+/// `readFileToEnd`. The open is `openExistingReadOnlyRegularFile`, which refuses
+/// a FIFO or another special file before it opens the path, and checks the
+/// opened file again. A symbolic link is followed, as the crash and shutdown
+/// readers did before. An allocation failure reads as unreadable.
 pub fn readRegularFile(alloc: std.mem.Allocator, path: []const u8, max_bytes: usize) FileRead {
-    const zio = getIo();
-    var file: std.Io.File = if (comptime builtin.target.os.tag == .wasi) blk: {
-        // WASI has no POSIX open flags, so this uses the std Io open, as the readers
-        // did before the FIFO check. WASI has no FIFOs to block on.
-        break :blk std.Io.Dir.openFileAbsolute(zio, path, .{}) catch |err| return switch (err) {
-            error.FileNotFound => .missing,
-            else => .unreadable,
-        };
-    } else blk: {
-        var path_z: [std.Io.Dir.max_path_bytes:0]u8 = undefined;
-        if (path.len >= path_z.len) return .unreadable;
-        @memcpy(path_z[0..path.len], path);
-        path_z[path.len] = 0;
-        // O_NONBLOCK makes the open of a FIFO return at once. It does not change how
-        // a regular file reads.
-        const fd = std.c.open(&path_z, .{ .ACCMODE = .RDONLY, .NONBLOCK = true, .CLOEXEC = true });
-        if (fd < 0) return if (std.posix.errno(fd) == .NOENT) .missing else .unreadable;
-        break :blk .{ .handle = fd, .flags = .{ .nonblocking = true } };
+    var file = openExistingReadOnlyRegularFile(std.Io.Dir.cwd(), path, .follow) catch |err| return switch (err) {
+        error.FileNotFound => .missing,
+        else => .unreadable,
     };
-    defer file.close(zio);
-    const stat = file.stat(zio) catch return .unreadable;
-    if (stat.kind != .file) return .unreadable;
+    defer file.close(getIo());
     const bytes = readFileToEnd(alloc, &file, max_bytes) catch |err| return switch (err) {
         error.StreamTooLong => .too_large,
         else => .unreadable,
