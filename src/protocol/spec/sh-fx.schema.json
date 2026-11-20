@@ -28,7 +28,9 @@
       "properties": {
         "sh.fx/promptDelivery": { "$ref": "#/$defs/PromptDeliveryCapability" },
         "sh.fx/hostSteering": { "$ref": "#/$defs/Capability" },
-        "sh.fx/logPosition": { "$ref": "#/$defs/Capability" }
+        "sh.fx/logPosition": { "$ref": "#/$defs/Capability" },
+        "sh.fx/sessionState": { "$ref": "#/$defs/Capability" },
+        "sh.fx/listChanges": { "$ref": "#/$defs/Capability" }
       },
       "patternProperties": {
         "^sh\\.fx/": { "$ref": "#/$defs/Capability" }
@@ -39,7 +41,9 @@
       "type": "object",
       "properties": {
         "sh.fx/promptDelivery": { "$ref": "#/$defs/Capability" },
-        "sh.fx/logPosition": { "$ref": "#/$defs/Capability" }
+        "sh.fx/logPosition": { "$ref": "#/$defs/Capability" },
+        "sh.fx/sessionState": { "$ref": "#/$defs/Capability" },
+        "sh.fx/listChanges": { "$ref": "#/$defs/Capability" }
       },
       "patternProperties": {
         "^sh\\.fx/": { "$ref": "#/$defs/Capability" }
@@ -95,6 +99,44 @@
       "description": "The value of sh.fx/replay in the `_meta` of a `session/load` response: whether fx replayed the turns after the position, or the whole session because it didn't know the position.",
       "type": "string",
       "enum": ["after_position", "full"]
+    },
+    "SessionState": {
+      "description": "The value of sh.fx/state in the `_meta` of a `session/status` response and of a `session/list` row, and the `state` of a session state update: what the session is doing.",
+      "type": "string",
+      "enum": ["running", "requires_action", "idle"]
+    },
+    "SessionStateUpdate": {
+      "description": "The `update` of `_sh.fx/session/state_update`: the states of ACP's `StateUpdate` that fx sends. ACP v2 sends the same object as a `state_update`.",
+      "type": "object",
+      "properties": {
+        "state": { "$ref": "#/$defs/SessionState" },
+        "stopReason": {
+          "description": "With `idle` after a turn: the turn's stopReason, one of ACP's StopReason values.",
+          "type": "string"
+        }
+      },
+      "required": ["state"]
+    },
+    "SessionStateUpdateParams": {
+      "description": "The params of the `_sh.fx/session/state_update` notification.",
+      "type": "object",
+      "properties": {
+        "sessionId": { "type": "string", "minLength": 1 },
+        "update": { "$ref": "#/$defs/SessionStateUpdate" }
+      },
+      "required": ["sessionId", "update"]
+    },
+    "ListChangedParams": {
+      "description": "The params of the `_sh.fx/session/list_changed` notification: the folder whose list of sessions changed.",
+      "type": "object",
+      "properties": {
+        "cwd": {
+          "description": "The absolute folder of the session that changed.",
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "required": ["cwd"]
     }
   }
 }
