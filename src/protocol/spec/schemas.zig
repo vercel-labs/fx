@@ -358,9 +358,9 @@ fn codeCell(cell: []const u8) ?[]const u8 {
     return if (std.mem.findScalar(u8, inner, '`') == null) inner else null;
 }
 
-test "the table of names in use today gives each name one valid new name" {
-    const table = section(fx_spec.bytes, "Names in use today") orelse {
-        std.debug.print("sh-fx.md has no \"Names in use today\" section\n", .{});
+test "the table of names fx used before gives each name one valid new name" {
+    const table = section(fx_spec.bytes, "Names fx used before sh.fx") orelse {
+        std.debug.print("sh-fx.md has no \"Names fx used before sh.fx\" section\n", .{});
         return error.TestUnexpectedResult;
     };
     const meta = try parseSpecFile(acp_meta);
@@ -374,7 +374,7 @@ test "the table of names in use today gives each name one valid new name" {
     var lines = std.mem.splitScalar(u8, table, '\n');
     while (lines.next()) |line| {
         if (!std.mem.startsWith(u8, line, "|")) continue;
-        if (std.mem.startsWith(u8, line, "| Today |") or std.mem.startsWith(u8, line, "| --- |")) continue;
+        if (std.mem.startsWith(u8, line, "| Before |") or std.mem.startsWith(u8, line, "| --- |")) continue;
         var cells: [6][]const u8 = undefined;
         var count: usize = 0;
         var parts = std.mem.splitScalar(u8, line, '|');
@@ -436,9 +436,9 @@ fn keyKind(cell: []const u8) ?KeyKind {
     return null;
 }
 
-test "the table of keys in use today gives each key one valid new name" {
-    const table = section(fx_spec.bytes, "Keys in use today") orelse {
-        std.debug.print("sh-fx.md has no \"Keys in use today\" section\n", .{});
+test "the table of keys fx used before gives each key one valid new name" {
+    const table = section(fx_spec.bytes, "Keys fx used before sh.fx") orelse {
+        std.debug.print("sh-fx.md has no \"Keys fx used before sh.fx\" section\n", .{});
         return error.TestUnexpectedResult;
     };
     const Row = struct { today: []const u8, where: []const u8, new: []const u8, kind: KeyKind };
@@ -447,7 +447,7 @@ test "the table of keys in use today gives each key one valid new name" {
     var lines = std.mem.splitScalar(u8, table, '\n');
     while (lines.next()) |line| {
         if (!std.mem.startsWith(u8, line, "|")) continue;
-        if (std.mem.startsWith(u8, line, "| Today |") or std.mem.startsWith(u8, line, "| --- |")) continue;
+        if (std.mem.startsWith(u8, line, "| Before |") or std.mem.startsWith(u8, line, "| --- |")) continue;
         var cells: [7][]const u8 = undefined;
         var cell_count: usize = 0;
         var parts = std.mem.splitScalar(u8, line, '|');

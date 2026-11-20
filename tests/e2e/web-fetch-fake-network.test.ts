@@ -579,7 +579,6 @@ describe("web_fetch Gateway fixture", () => {
             url: "https://example.com/docs",
             prompt: "legacy",
           },
-          _meta: { fx: { toolCall: { internal: false } } },
         });
       } finally {
         await client.close();

@@ -349,7 +349,7 @@ async function installedWorkerMain() {
       apiKey: "test-placeholder",
       checkpoint: new Uint8Array([1, 2, 3]),
     }));
-    assert.match(invalidCheckpoint.message, /Invalid or non-fresh libfx checkpoint/);
+    assert.match(invalidCheckpoint.message, /Invalid or non-fresh checkpoint/);
     const recovery = await esm.createFxEngine({ backend: "native", apiKey: "test-placeholder" });
     const checkpoint = await recovery.checkpoint();
     await recovery.close();

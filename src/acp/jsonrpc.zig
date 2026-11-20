@@ -45,13 +45,21 @@ fn writeOneLine(w: *std.Io.Writer, json: []const u8) !void {
     try w.writeAll(rest);
 }
 
+/// The error codes fx sends. ACP v1 gives codes from -32000 to -32099 its own meanings, such as
+/// -32000 for "Authentication required", so fx uses one of them only with ACP's meaning.
 pub const ErrorCode = struct {
-    pub const request_frame_too_large: i64 = -32000;
     pub const parse_error: i64 = -32700;
     pub const invalid_request: i64 = -32600;
     pub const method_not_found: i64 = -32601;
     pub const invalid_params: i64 = -32602;
     pub const internal_error: i64 = -32603;
+    /// ACP's "Resource not found", such as a request that names a session that doesn't exist or
+    /// isn't open on the connection.
+    pub const resource_not_found: i64 = -32002;
+    /// ACP's "Request cancelled", for a request that the client's own cancel
+    /// ended before it ran, such as a steer still waiting when the client
+    /// stops the turn.
+    pub const request_cancelled: i64 = -32800;
 };
 
 pub const RequestId = union(enum) {
@@ -76,12 +84,32 @@ pub const Message = struct {
 pub const RpcError = struct {
     code: i64,
     message: []const u8,
-    data: ?struct {
-        code: []const u8,
-        model: []const u8,
-        capability: []const u8,
-    } = null,
+    data: ?Data = null,
+
+    /// The `data` object of an error. Each kind writes its own fields.
+    pub const Data = union(enum) {
+        /// The selected model doesn't support a capability the request asked for.
+        model_capability: struct {
+            code: []const u8,
+            model: []const u8,
+            capability: []const u8,
+        },
+        /// `{"sessionId": ...}`: the session a request named, for ACP's unknown-session answer.
+        session: struct { session_id: []const u8 },
+    };
 };
+
+/// ACP's answer to a session-scoped request that names a session that doesn't exist or isn't open
+/// on the connection: `-32002` with `data.sessionId` set to the id the request named
+/// (`tests/tla/acp/AcpSessionTarget.tla` UnknownSessionAnswer). The error borrows `session_id`, so
+/// the caller writes it before that memory is freed.
+pub fn sessionNotFound(message: []const u8, session_id: []const u8) RpcError {
+    return .{
+        .code = ErrorCode.resource_not_found,
+        .message = message,
+        .data = .{ .session = .{ .session_id = session_id } },
+    };
+}
 
 pub fn parseMessage(alloc: Allocator, line: []const u8) !Message {
     const parsed = std.json.parseFromSlice(std.json.Value, alloc, line, .{}) catch
@@ -195,15 +223,22 @@ pub const Writer = struct {
                     try w.print("{d}", .{response.err.code});
                     try w.writeAll(",\"message\":");
                     try writeJsonStr(response.err.message, w);
-                    if (response.err.data) |data| {
-                        try w.writeAll(",\"data\":{\"code\":");
-                        try writeJsonStr(data.code, w);
-                        try w.writeAll(",\"model\":");
-                        try writeJsonStr(data.model, w);
-                        try w.writeAll(",\"capability\":");
-                        try writeJsonStr(data.capability, w);
-                        try w.writeByte('}');
-                    }
+                    if (response.err.data) |data| switch (data) {
+                        .model_capability => |model| {
+                            try w.writeAll(",\"data\":{\"code\":");
+                            try writeJsonStr(model.code, w);
+                            try w.writeAll(",\"model\":");
+                            try writeJsonStr(model.model, w);
+                            try w.writeAll(",\"capability\":");
+                            try writeJsonStr(model.capability, w);
+                            try w.writeByte('}');
+                        },
+                        .session => |session| {
+                            try w.writeAll(",\"data\":{\"sessionId\":");
+                            try writeJsonStr(session.session_id, w);
+                            try w.writeByte('}');
+                        },
+                    };
                     try w.writeAll("}}\n");
                 },
                 .notification => |notification| {
@@ -596,15 +631,28 @@ test "Writer Frame formats protocol lines" {
             .err = .{
                 .code = ErrorCode.invalid_params,
                 .message = "Unsupported fast mode",
-                .data = .{
-                    .code = "LIBFX_MODEL_UNSUPPORTED_FAST",
+                .data = .{ .model_capability = .{
+                    .code = "MODEL_UNSUPPORTED_FAST",
                     .model = "provider/quoted\"model",
                     .capability = "fast",
-                },
+                } },
             },
         } }).write(&out.writer);
         try std.testing.expectEqualStrings(
-            "{\"jsonrpc\":\"2.0\",\"id\":7,\"error\":{\"code\":-32602,\"message\":\"Unsupported fast mode\",\"data\":{\"code\":\"LIBFX_MODEL_UNSUPPORTED_FAST\",\"model\":\"provider/quoted\\\"model\",\"capability\":\"fast\"}}}\n",
+            "{\"jsonrpc\":\"2.0\",\"id\":7,\"error\":{\"code\":-32602,\"message\":\"Unsupported fast mode\",\"data\":{\"code\":\"MODEL_UNSUPPORTED_FAST\",\"model\":\"provider/quoted\\\"model\",\"capability\":\"fast\"}}}\n",
+            out.writer.buffered(),
+        );
+    }
+
+    {
+        var out: std.Io.Writer.Allocating = .init(alloc);
+        defer out.deinit();
+        try (Writer.Frame{ .error_response = .{
+            .id = .{ .integer = 8 },
+            .err = sessionNotFound("Session not found", "sess\"quoted"),
+        } }).write(&out.writer);
+        try std.testing.expectEqualStrings(
+            "{\"jsonrpc\":\"2.0\",\"id\":8,\"error\":{\"code\":-32002,\"message\":\"Session not found\",\"data\":{\"sessionId\":\"sess\\\"quoted\"}}}\n",
             out.writer.buffered(),
         );
     }
@@ -713,7 +761,7 @@ test "Writer keeps each frame on one line when caller JSON has line breaks" {
     var capture: Capture = .{};
     defer capture.bytes.deinit(alloc);
     var writer = Writer.initCallback(&capture, Capture.write);
-    try writer.writeRequest(alloc, .{ .integer = 1 }, "libfx/tool_call", "{\"name\":\"todo\",\"input\":" ++ input ++ "}");
+    try writer.writeRequest(alloc, .{ .integer = 1 }, "_sh.fx/tools/call", "{\"name\":\"todo\",\"input\":" ++ input ++ "}");
     try writer.writeNotification(alloc, "session/update", input);
     try writer.writeResponse(alloc, .{ .integer = 2 }, input);
 

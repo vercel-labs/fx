@@ -1,10 +1,11 @@
 //! The ACP side of the libfx journal. A journaled session sends each event
-//! to the host as a `libfx/journal_append` notification, in `seq` order, and
-//! opens from the events the host stored through `libfx/journal_open`.
+//! to the host as a `_sh.fx/journal/append` notification, in `seq` order, and
+//! opens from the events the host stored through `_sh.fx/journal/open`.
 //! The events themselves are `core/agent/runtime/journal.zig`'s.
 const std = @import("std");
 const observation = @import("../core/agent/runtime/observation.zig");
 const jsonrpc = @import("jsonrpc.zig");
+const sh_fx = @import("sh_fx.zig");
 const journal = @import("../core/agent/runtime/journal.zig");
 const session_runtime = @import("../core/session/session.zig");
 const session_codec = @import("../core/session/session_codec.zig");
@@ -327,7 +328,7 @@ pub const Journal = struct {
         try params.writer.writeByte(']');
         if (barrier) try params.writer.writeAll(",\"barrier\":true");
         try params.writer.writeByte('}');
-        try self.writer.writeNotification(alloc, "libfx/journal_append", params.written());
+        try self.writer.writeNotification(alloc, sh_fx.method.journal_append, params.written());
         self.cursor = next;
         // Matches the fold: intents and compaction leave the open turn
         // standing.

@@ -69,8 +69,9 @@ After `initialize`, these rules apply to the connection:
 - fx sends an extension's notifications and `_meta` keys to a client only when both lists name the extension. A client that lists no `sh.fx/` capability receives only standard ACP messages.
 - A client calls an extension's methods only when fx's list names the extension. fx answers a method it doesn't support with the JSON-RPC error `-32601`, "Method not found".
 - Each side ignores the names it doesn't know in the other side's list.
+- A request that would make fx send a client an extension's messages, such as `_sh.fx/journal/open` or a session's hook settings, fails with `-32602` when that client doesn't list the extension.
 
-Each extension's section defines its capabilities, which `AgentCapabilitiesMeta` and `ClientCapabilitiesMeta` in `sh-fx.schema.json` also list. The steering section defines `sh.fx/promptDelivery` and `sh.fx/hostSteering`, the following section defines `sh.fx/logPosition` and `sh.fx/sessionClients`, the status section defines `sh.fx/sessionState` and `sh.fx/listChanges`, the subagents section defines `sh.fx/subagentPrompts`, the fork section defines `sh.fx/fork` and `sh.fx/rewind`, and the turn diff section defines `sh.fx/turnDiff`. The table in "Keys in use today" names two more that replace fields fx uses today, `sh.fx/hooks` and `sh.fx/hostTools`, which later sections define.
+Each extension's section defines its capabilities, which `AgentCapabilitiesMeta` and `ClientCapabilitiesMeta` in `sh-fx.schema.json` also list. The steering section defines `sh.fx/promptDelivery` and `sh.fx/hostSteering`, the following section defines `sh.fx/logPosition` and `sh.fx/sessionClients`, the status section defines `sh.fx/sessionState` and `sh.fx/listChanges`, the subagents section defines `sh.fx/subagentPrompts`, the fork section defines `sh.fx/fork` and `sh.fx/rewind`, the turn diff section defines `sh.fx/turnDiff`, the sections for a host define `sh.fx/journal`, `sh.fx/hooks`, and `sh.fx/hostTools`, and the section on details defines `sh.fx/toolCall`, `sh.fx/permissionMode`, and `sh.fx/modelResponseRecovery`.
 
 ## Extensions
 
@@ -84,6 +85,8 @@ Each extension gets its own section here when it is written.
 | Subagents | The child sessions that a turn starts | [Subagent Sessions](https://agentclientprotocol.com/rfds/subagents) |
 | Fork and rewind | A new session copied from another, whole or up to a prompt, and the removal of the turns from a prompt on | [`session/fork`](https://agentclientprotocol.com/rfds/session-fork) for fork, and none for rewind |
 | Turn diff | The combined file changes of one turn | None |
+| A host's journal, hooks, and tools | What fx's SDK needs to keep a session's journal itself, observe a turn, and run its own tools | None |
+| Details on standard messages | Which tool calls are fx's own steps, the permission mode of each session mode, and the state of a model request that an earlier fx left running | None |
 
 ### Steering and queued prompts
 
@@ -95,7 +98,7 @@ fx lists the `sh.fx/promptDelivery` capability with the deliveries it supports:
 { "sh.fx/promptDelivery": { "steer": {}, "queue": {} } }
 ```
 
-A client lists `sh.fx/promptDelivery` to receive the `sh.fx/steerInput` and `sh.fx/steeringDelivery` keys that this section describes.
+A client lists `sh.fx/promptDelivery` to receive the `sh.fx/steerInput` and `sh.fx/steeringDelivery` keys that this section describes. Until fx queues prompts, it lists `steer` alone, and a prompt with `"queue"` that arrives while a turn runs fails with `-32602`.
 
 #### Deliveries
 
@@ -169,7 +172,7 @@ A host that keeps the session's journal itself, such as fx's SDK, steers through
 | `_sh.fx/session/end_turn_for_steer` | `sessionId` | Ends the running turn at its next safe point, so that a steer that can't join it, such as one with images, runs next | `null` |
 | `_sh.fx/session/follow_up` | `sessionId`, the input `id`, and 1 byte to 64 KiB of `text` | Records in the journal a prompt that the host queued behind the running turn. The host runs the prompt itself | `null` |
 
-A `user_message_chunk` update for a host steer carries a `requestId` of `null` in `sh.fx/steerInput`, and the steer's input id as `inputId`.
+A host lists `sh.fx/hostSteering` in `clientCapabilities._meta` to receive `sh.fx/steerInput` on the updates for its steers. For a host steer, that key carries a `requestId` of `null` and the steer's input id as `inputId`.
 
 ### Following a session
 
@@ -485,11 +488,52 @@ Each line of `preview` and `review` gives its `op`, which is `context`, `add`, o
 
 This extension sets no rule on order or timing, so it has no TLA+ model. The tests of its code check how fx combines a turn's changes.
 
-## Names in use today
+### A host's journal
 
-fx's ACP server names its additions today with a `libfx/` prefix, which doesn't follow ACP's extension rules, and its wasm build accepts `session/remove`, which ACP calls `session/delete`. Each one gets the new name in this table:
+A host that keeps a session's journal itself, such as fx's SDK, uses these methods. fx lists the `sh.fx/journal` capability for them, and a host lists it to receive the journal's messages:
 
-| Today | Direction | New name | What it does |
+| Method | Direction | What it does |
+| --- | --- | --- |
+| `_sh.fx/session/new` | client to fx, request | Creates a session with an id that the host may choose, optional `hooks` settings, and the host's instructions as ACP's standard `systemPrompt` in `append` mode |
+| `_sh.fx/session/checkpoint` | client to fx, request | Saves the state of a session that has no running turn as bytes in a binary attachment |
+| `_sh.fx/session/restore` | client to fx, request | Loads the state of a session from a checkpoint attachment |
+| `_sh.fx/journal/snapshot` | client to fx, request | Returns a snapshot of the session for its journal to store |
+| `_sh.fx/journal/open` | client to fx, request | Opens a new session's journal from the events that its host stored |
+| `_sh.fx/journal/stage_images` | client to fx, request | Stages images from the host's store for the journal that the session opens next |
+| `_sh.fx/journal/append` | fx to client, notification | Sends a journal event for the host to store |
+| `_sh.fx/journal/flush` | fx to client, request | Waits until the host holds every journal event sent so far |
+
+`_sh.fx/journal/open` fails with `-32602` when the host doesn't list `sh.fx/journal`, because an open journal sends `_sh.fx/journal/append` and `_sh.fx/journal/flush`.
+
+A journaled turn's `session/prompt` carries its host's bookkeeping in `_meta`: `sh.fx/inputId` and `sh.fx/inputAccepted` for the follow-up it runs, `sh.fx/turnId`, `sh.fx/yieldAt`, and for a resumed turn `sh.fx/continueRecovery`, `sh.fx/freshOutput`, and `sh.fx/rerun`. An image block carries `sh.fx/attachment` in place of `data`, and `sh.fx/storedImage` when the host already stored it. "Keys fx used before sh.fx" describes each key.
+
+### Hooks
+
+A client lists `sh.fx/hooks` to observe a turn: fx sends it `_sh.fx/hooks/event` notifications, such as the end of a turn, for each session whose hook settings turn them on. The settings, such as `{ "captureContent": true }`, are the `hooks` field of `_sh.fx/session/new`, or `sh.fx/hooks` in the `_meta` of `session/new`, `session/load`, or `session/resume`. A request with settings fails with `-32602` when the client doesn't list `sh.fx/hooks`. fx lists `sh.fx/hooks` in every build.
+
+### Host tools
+
+A client that runs tools for fx lists them in the value of its `sh.fx/hostTools` capability, as `{ "tools": [...] }`. fx asks it to run one with a `_sh.fx/tools/call` request, and the client answers with the tool's result. Only libfx's kernel lists `sh.fx/hostTools`; `fx acp` ignores the tools a client lists.
+
+### Details on standard messages
+
+Three keys add fx's details to standard ACP messages. Each has a capability of the same name, which fx always lists and a client lists to receive the key:
+
+| Key | Where | What it carries |
+| --- | --- | --- |
+| `sh.fx/toolCall` | `tool_call` updates | Whether the call is fx's own bookkeeping step, and the server and tool name of an MCP call |
+| `sh.fx/permissionMode` | each value of the `mode` config option | The permission mode that the session mode applies, with fx's original names, such as `yolo` for full access |
+| `sh.fx/modelResponseRecovery` | `session_info_update` | A model request that an earlier fx process was running when it stopped. fx sends this update only to a client that lists the key |
+
+### Keys a client sends
+
+fx reads three keys from any client, with no capability: `sh.fx/alwaysLoaded` on an MCP server the client supplies, `sh.fx/profileMcpServers` in the params of `session/new`, and `sh.fx/terminalUi` in the params of `initialize`. A client that doesn't know them doesn't send them.
+
+## Names fx used before sh.fx
+
+Before sh.fx, fx's ACP server named its additions with a `libfx/` prefix, which doesn't follow ACP's extension rules, and its wasm build accepted `session/remove`, which ACP calls `session/delete`. Each one has the new name in this table:
+
+| Before | Direction | New name | What it does |
 | --- | --- | --- | --- |
 | `libfx/steer` | client to fx, request | `_sh.fx/session/steer` | Adds text to the running turn |
 | `libfx/withdraw` | client to fx, request | `_sh.fx/session/withdraw_steer` | Takes back a steer that the running turn hasn't given to the model yet |
@@ -507,13 +551,13 @@ fx's ACP server names its additions today with a `libfx/` prefix, which doesn't 
 | `libfx/tool_call` | fx to client, request | `_sh.fx/tools/call` | Asks the client to run a tool that the client listed at `initialize` |
 | `session/remove` | client to fx, request | `session/delete` | Deletes a session. The new name is ACP's standard method |
 
-For some releases after fx moves to the new names, fx also accepts the `libfx/*` names, and it sends a client the old names unless the client lists the extension's capability. `session/remove` moves to `session/delete` with no such period.
+fx and its SDK moved to the new names together, so fx accepts only the new names: a client that sends an old one gets `-32601`, "Method not found". `session/delete` returns `{}`, also for a session that doesn't exist.
 
-## Keys in use today
+## Keys fx used before sh.fx
 
-fx's ACP server puts its extra data under `_meta.fx.<key>` today, and it reads two fields of a custom `libfx` object at the root of `clientCapabilities`, which ACP forbids. Each one becomes an `sh.fx/` key or capability in this table, or goes away in favor of a standard ACP field:
+Before sh.fx, fx's ACP server put its extra data under `_meta.fx.<key>`, and it read two fields of a custom `libfx` object at the root of `clientCapabilities`, which ACP forbids. Each one became an `sh.fx/` key or capability in this table, or went away in favor of a standard ACP field:
 
-| Today | Where | New | Kind | What it carries |
+| Before | Where | New | Kind | What it carries |
 | --- | --- | --- | --- | --- |
 | `_meta.fx.steering` | `agentCapabilities` in the `initialize` response | `sh.fx/promptDelivery` | capability | fx accepts steering. Its value lists the deliveries fx supports, in place of `true` |
 | `_meta.fx.steering` | the `session/prompt` response to a steer | `sh.fx/steeringDelivery` | `_meta` key | How the steer ran: `absorbed` or `next_turn`. Today's `dropped` goes away, because a steer that a turn doesn't take runs in the next turn |
@@ -539,9 +583,9 @@ fx's ACP server puts its extra data under `_meta.fx.<key>` today, and it reads t
 | `_meta.fx.systemPrompt` | `session/new` params | - | removed | A copy of `systemPrompt`. Clients send ACP's standard `systemPrompt` field |
 | `systemPromptMode` | `session/new` params, a custom field at the root | - | removed | How fx combines the system prompt with its own. ACP v1 puts it in `systemPrompt.mode` |
 | `clientCapabilities.libfx.tools` | the `initialize` request | `sh.fx/hostTools` | capability | The tools that the client runs for fx, as `{ "tools": [...] }` in the capability's value |
-| `clientCapabilities.libfx.instructions` | the `initialize` request | - | removed | Text that the client adds to fx's system prompt. The client sends it as ACP's standard `systemPrompt` in `append` mode on each session |
+| `clientCapabilities.libfx.instructions` | the `initialize` request | - | removed | Text that the client adds to fx's system prompt. The client sends it as ACP's standard `systemPrompt` in `append` mode on `_sh.fx/session/new` |
 
-The keys and capabilities move with the method names, under the same rules: for some releases fx also accepts the old forms, and it sends a client the old ones unless the client lists the extension's capability.
+The keys and capabilities moved with the method names: fx reads and sends only the new forms, and a client that lists no `sh.fx/` capability receives none of them.
 
 ## Schema
 
@@ -555,6 +599,7 @@ The keys and capabilities move with the method names, under the same rules: for 
 | `Capability` | The value of an `sh.fx` capability entry |
 | `AgentCapabilitiesMeta` | The `sh.fx` entries in `agentCapabilities._meta` |
 | `ClientCapabilitiesMeta` | The `sh.fx` entries in `clientCapabilities._meta` |
+| `HostToolsCapability` | The value of the `sh.fx/hostTools` capability that a client lists |
 | `PromptDeliveryCapability` | The value of the `sh.fx/promptDelivery` capability that fx lists |
 | `PromptDelivery` | The value of `sh.fx/delivery`: `steer` or `queue` |
 | `SteeringDelivery` | The value of `sh.fx/steeringDelivery`: `absorbed` or `next_turn` |

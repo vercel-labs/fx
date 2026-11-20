@@ -493,10 +493,10 @@ for (const reason of [undefined, "handoff"]) {
   try {
     await drain(engine.prompt("hooks disabled"));
     const created = diagnostics.find(
-      (event) => event.type === "acp.send" && event.message?.method === "libfx/new",
+      (event) => event.type === "acp.send" && event.message?.method === "_sh.fx/session/new",
     );
     assert.equal(created.message.params.hooks, undefined);
-    assert.ok(!diagnostics.some((event) => event.message?.method === "libfx/hook"));
+    assert.ok(!diagnostics.some((event) => event.message?.method === "_sh.fx/hooks/event"));
   } finally {
     await engine.close();
   }
@@ -716,9 +716,11 @@ for (const propagateCorrelation of [false, true]) {
           handler({
             id: message.id,
             result:
-              message.method === "libfx/new"
-                ? { sessionId: "child-root", _meta: { fx: { hooksVersion: 1 } } }
-                : {},
+              message.method === "_sh.fx/session/new"
+                ? { sessionId: "child-root" }
+                : message.method === "initialize"
+                  ? { agentCapabilities: { _meta: { "sh.fx/hooks": {} } } }
+                  : {},
           }),
         );
     },
@@ -774,9 +776,9 @@ for (const propagateCorrelation of [false, true]) {
       executionId: "child-execution",
       data: { resumed: false },
     };
-    handler({ method: "libfx/hook", params: frame });
+    handler({ method: "_sh.fx/hooks/event", params: frame });
     handler({
-      method: "libfx/hook",
+      method: "_sh.fx/hooks/event",
       params: {
         ...frame,
         sessionId: "native-grandchild",
@@ -794,7 +796,7 @@ for (const propagateCorrelation of [false, true]) {
     const turn = engine.prompt("scope collision fixture");
     await promptStarted.promise;
     const emit = (overrides) =>
-      handler({ method: "libfx/hook", params: { ...frame, ...overrides } });
+      handler({ method: "_sh.fx/hooks/event", params: { ...frame, ...overrides } });
     const call = { callId: "same", name: "lookup", provenance: "fx_local" };
     emit({ type: "tool.start", executionId: "root-scope", data: { call, rerun: false } });
     emit({
