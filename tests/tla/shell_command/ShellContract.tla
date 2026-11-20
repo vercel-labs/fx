@@ -74,11 +74,13 @@ ExactlyReadable(e) == e.shape \notin (Unreadable \cup Ambiguous)
 (*   that action before it is stored or admitted                             *)
 (*   (normalize_terminal_request_tool_calls with shell's inferAction). Every *)
 (*   legacy_names call fits one; the proposed flat form fits one only for a  *)
-(*   plain command, whose field names are today's.                           *)
+(*   plain command, whose field names are today's. A default-valued field    *)
+(*   that the command's action does not take is ignored when nothing fits    *)
+(*   otherwise, so with_irrelevant fits for the same plain commands.         *)
 Inferred(e) ==
   /\ Design = "current"
   /\ \/ e.shape = "legacy_names"
-     \/ e.shape = "flat_new" /\ e.intent \in {"run", "run_eq", "run_bash"}
+     \/ e.shape \in {"flat_new", "with_irrelevant"} /\ e.intent \in {"run", "run_eq", "run_bash"}
 
 CurrentReadable(e) == e.shape \in {"flat_action", "wrapped"} \/ Inferred(e)
 

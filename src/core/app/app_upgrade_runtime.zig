@@ -1,5 +1,6 @@
 const std = @import("std");
 const agents = @import("../agents/agents.zig");
+const app_agents_runtime = @import("app_agents_runtime.zig");
 const auto_upgrade = @import("../upgrade/auto_upgrade.zig");
 const types = @import("../shared/types.zig");
 const upgrade_helpers = @import("../upgrade/upgrade_helpers.zig");
@@ -47,6 +48,17 @@ pub fn Runtime(comptime App: type) type {
             if (upgradeUnavailableNotice(app, agent)) |notice| {
                 try writeUpgradeNotice(app, .neutral, notice);
                 return .unavailable;
+            }
+            // The upgrade restarts fx, which would stop every other agent
+            // of the process too: subagents and other instances.
+            if (comptime @hasDecl(App, "busyAgentElsewhere")) {
+                var name_buf: [32]u8 = undefined;
+                if (app.busyAgentElsewhere(&name_buf)) |busy| {
+                    const notice = try app.alloc.print("upgrade is unavailable while {s} {s}", .{ busy.name, busyPhrase(busy.doing) });
+                    defer app.alloc.free(notice);
+                    try writeUpgradeNotice(app, .neutral, notice);
+                    return .unavailable;
+                }
             }
 
             if (!autoUpgradeEnabled(app)) {
@@ -97,6 +109,17 @@ pub fn Runtime(comptime App: type) type {
             app.requestResumeHandoffForUpgrade(agent);
             if (comptime @hasField(App, "should_exit")) app.should_exit = true;
             return .relaunch_requested;
+        }
+
+        fn busyPhrase(doing: app_agents_runtime.Busiest) []const u8 {
+            return switch (doing) {
+                .needs_approval => "needs approval",
+                .has_question => "has a question",
+                .needs_you => "needs you",
+                .working => "is working",
+                // `busyAgentElsewhere` never names an idle agent.
+                .idle => unreachable,
+            };
         }
 
         fn upgradeUnavailableNotice(app: *App, agent: *AppAgent) ?[]const u8 {
@@ -250,6 +273,7 @@ const TestApp = struct {
     relaunch_path_len: usize = 0,
     prepare_error: ?anyerror = null,
     relaunch_error: ?error{NameTooLong} = null,
+    busy_elsewhere: ?app_agents_runtime.BusyAgent = null,
 
     fn deinit(self: *TestApp) void {
         self.input_runtime.edit_state.deinit(self.alloc);
@@ -271,6 +295,10 @@ const TestApp = struct {
 
     fn requestResumeHandoffForUpgrade(self: *TestApp, _: anytype) void {
         self.request_handoff_count += 1;
+    }
+
+    pub fn busyAgentElsewhere(self: *TestApp, _: []u8) ?app_agents_runtime.BusyAgent {
+        return self.busy_elsewhere;
     }
 
     fn writeDomainNotice(self: *TestApp, notice: types.SemanticNotice, _: bool) !void {
@@ -305,6 +333,21 @@ fn currentExecutablePathForTest(
     if (executable_path.len > executable_buf.len) return error.PathTooLong;
     @memcpy(executable_buf[0..executable_path.len], executable_path);
     return executable_buf[0..executable_path.len];
+}
+
+test "app_upgrade_runtime refuses while another agent is busy, and names it" {
+    var app = TestApp{ .alloc = std.testing.allocator };
+    defer app.deinit();
+    app.upgrader.state = .ready;
+    app.busy_elsewhere = .{ .name = "reviewer", .doing = .working };
+    var deps_state = TestDepsState{};
+    const outcome = try Runtime(TestApp).applyReadyUpgradeWithDeps(&app, (&app).agent(), deps_state.deps());
+
+    try std.testing.expectEqual(ApplyOutcome.unavailable, outcome);
+    try std.testing.expectEqualStrings("upgrade is unavailable while reviewer is working", app.notices.items);
+    try std.testing.expectEqual(@as(usize, 0), app.prepare_count);
+    try std.testing.expectEqual(@as(usize, 0), deps_state.path_count);
+    try std.testing.expect(!app.should_exit);
 }
 
 test "app_upgrade_runtime validates then requests normal relaunch handoff" {

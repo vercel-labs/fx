@@ -553,34 +553,6 @@ test "structured user turn source keeps full prompt beyond byte cache cap" {
     try std.testing.expect(std.mem.find(u8, source.bytes, "assistant after long prompt") != null);
 }
 
-test "large current user turn survives assistant retention pass" {
-    const alloc = std.testing.allocator;
-    var runtime = TranscriptRuntime{
-        .layout = transcriptTestLayout(80, 18, 14),
-        .owned_top_row = 1,
-        .notebook = .{ .max_transcript_bytes = 256, .max_retained_transcript_bytes = 128 },
-    };
-    defer runtime.deinit(alloc);
-
-    const prompt = try makeLongPastePrompt(alloc, 64);
-    const user_id = try runtime.appendUserTurnOwned(alloc, .{
-        .text = prompt,
-        .images = &.{},
-    });
-    const assistant_id = try runtime.appendAssistantTurnEntry(alloc);
-    const assistant = runtime.lookupAssistantSegments(assistant_id) orelse unreachable;
-    try assistant.text.appendSlice(alloc, "assistant begins\n");
-
-    try std.testing.expectEqual(@as(usize, 2), runtime.notebook.entries.items.len);
-    try std.testing.expectEqual(user_id, runtime.notebook.entries.items[0].id());
-    try std.testing.expectEqual(assistant_id, runtime.notebook.entries.items[1].id());
-
-    var source = try runtime.prepareTranscriptSource(alloc, null);
-    defer source.deinit(alloc);
-    try std.testing.expect(std.mem.find(u8, source.bytes, "LONG_PASTE_FIRST_MARKER") != null);
-    try std.testing.expect(std.mem.find(u8, source.bytes, "assistant begins") != null);
-}
-
 test "finalize transcript transition rejects frame inline row mismatch" {
     const alloc = std.testing.allocator;
     var runtime = TranscriptRuntime{
@@ -1224,7 +1196,7 @@ fn createProductionCappedFoldedRecoveryTransition(
         ),
         .owned_top_row = initial_owned_top,
         .full_transcript = .{ .depth = .full },
-        .notebook = .{ .max_transcript_bytes = 2 * 1024 * 1024, .max_retained_transcript_bytes = 2 * 1024 * 1024 },
+        .notebook = .{ .max_transcript_bytes = 2 * 1024 * 1024 },
     };
     defer runtime.deinit(alloc);
     try runtime.enableShadowVt(alloc);
@@ -2093,7 +2065,16 @@ test "one retained semantic notice reflows through compact and full projection w
             null,
         );
         defer alloc.free(full);
-        try std.testing.expect(std.mem.find(u8, full, expected) != null);
+        // Ctrl+O draws the notice as gray rows that lead with its time,
+        // wrapped to the width, with the same words.
+        const plain = try plainTextForTest(alloc, full);
+        defer alloc.free(plain);
+        var rows = std.mem.splitScalar(u8, plain, '\n');
+        while (rows.next()) |row| try std.testing.expect(display_width.visibleWidthIgnoringAnsi(row) <= case.cols);
+        var words: std.ArrayList(u8) = .empty;
+        defer words.deinit(alloc);
+        for (plain) |byte| if (!std.ascii.isWhitespace(byte)) try words.append(alloc, byte);
+        try std.testing.expect(std.mem.find(u8, words.items, "paths:review/workspace/packages/terminal/rendering.zigbeforecontinuing") != null);
         try std.testing.expectEqual(entry_id, runtime.notebook.entries.items[0].id());
     }
 }
@@ -6376,50 +6357,6 @@ test "structured replacement preserves reflow debt and drops old semantic debt" 
     );
 }
 
-test "structured retention preserves recovery reflow debt" {
-    const alloc = std.testing.allocator;
-    var runtime = TranscriptRuntime{
-        .layout = transcriptTestLayout(20, 8, 4),
-        .owned_top_row = 1,
-    };
-    defer runtime.deinit(alloc);
-
-    _ = try runtime.appendRawTranscriptEntry(alloc, "stable\n");
-    _ = try runtime.appendRawTranscriptEntry(alloc, "base\n");
-    try enterResizeReflowRecoveryWithAcceptedRows(
-        &runtime,
-        alloc,
-        null,
-        .terminal_partial_write,
-        0,
-    );
-
-    runtime.notebook.max_retained_transcript_bytes = "base\n".len;
-    try runtime.enforceStructuredRetention(alloc, null);
-    try std.testing.expectEqualStrings("base\n", runtime.notebook.transcript.items);
-    const recovery = runtime.transcriptCommitDiagnostic();
-    try std.testing.expectEqual(
-        transcript_runtime.TranscriptCommitDiagnosticState.recovering,
-        recovery.state,
-    );
-    try std.testing.expectEqual(@as(u16, 2), recovery.remaining_inline_rows);
-
-    var source = try runtime.prepareTranscriptSource(alloc, null);
-    defer source.deinit(alloc);
-    var prepared = try prepareTestSourceForCurrentArea(
-        &runtime,
-        alloc,
-        &source,
-    );
-    defer prepared.deinit(alloc);
-    const facts = runtime.planTranscriptScroll(&prepared);
-    try std.testing.expect(!facts.source_compatible);
-    try std.testing.expect(facts.recovery_rebase);
-    try std.testing.expectEqual(@as(u16, 2), facts.resize_reflow_rows);
-    try std.testing.expectEqual(@as(u16, 0), facts.semantic_rows);
-    try std.testing.expectEqual(@as(u16, 2), facts.planned_rows);
-}
-
 test "invalid origin partial recovery rebases until complete repaint then appends" {
     const alloc = std.testing.allocator;
     const flow = "0\n1\n2\n3\n4\n5\n6\n7";
@@ -9277,62 +9214,6 @@ test "production all-pruned command keeps process and hint at final anchor" {
     try std.testing.expect(std.mem.find(u8, source.bytes, "pruned-1") == null);
 }
 
-test "pruned command ranges bridge after their separator is retained then removed" {
-    var sink = try std.Io.Dir.openFileAbsolute(io_mod.getIo(), "/dev/null", .{ .mode = .write_only });
-    defer sink.close(io_mod.getIo());
-
-    const alloc = std.testing.allocator;
-    var runtime = commandOutputTestRuntime(sink);
-    defer runtime.deinit(alloc);
-    var metrics = Metrics{};
-    const styles = commandOutputTestStyles();
-
-    const status_entry_id = try transcript_store.appendPinnedToolStatusAtomic(
-        &runtime,
-        alloc,
-        "● Ran printf ranges\n",
-    );
-    try runtime.writeCommandOutputChunk(alloc, &metrics, styles, .stdout, "range-0\nrange-1\n", true);
-    _ = try runtime.appendRawTranscriptEntryClassified(alloc, "range-separator\n", .subagent_status);
-    try runtime.writeCommandOutputChunk(alloc, &metrics, styles, .stdout, "range-2\nrange-3\n", true);
-    try runtime.flushCommandOutputSummary(alloc, &metrics, styles, true);
-    try runtime.attachHistoricalToolDetailAfterCommandOutput(
-        alloc,
-        status_entry_id,
-        .{ .id = "ranges", .name = "run_command", .arguments_json = "{\"command\":\"printf ranges\"}" },
-        .command,
-        .{
-            .tool_call_id = @constCast("ranges"),
-            .tool_name = @constCast("run_command"),
-            .status = .success,
-            .output = @constCast("exit_code=0\n<stdout>\nrange-0\nrange-1\nrange-2\nrange-3\n</stdout>\n"),
-            .output_bytes = "exit_code=0\n<stdout>\nrange-0\nrange-1\nrange-2\nrange-3\n</stdout>\n".len,
-            .stored_output_bytes = "exit_code=0\n<stdout>\nrange-0\nrange-1\nrange-2\nrange-3\n</stdout>\n".len,
-        },
-    );
-
-    while (runtime.notebook.command_output_blocks.items[0].lines.items.len > 0) {
-        try std.testing.expect(try command_output_runtime.trimRetainedCommandOutputLine(
-            &runtime,
-            alloc,
-            0,
-            0,
-        ));
-    }
-    try std.testing.expectEqual(@as(usize, 2), runtime.notebook.command_output_blocks.items[0].pruned_ranges.items.len);
-
-    const retained_before = transcript_store.retainedStructuredBytes(&runtime);
-    runtime.notebook.max_retained_transcript_bytes = retained_before - 1;
-    try runtime.enforceStructuredRetention(alloc, null);
-    try std.testing.expectEqual(@as(usize, 1), runtime.notebook.command_output_blocks.items[0].pruned_ranges.items.len);
-    const range = runtime.notebook.command_output_blocks.items[0].pruned_ranges.items[0];
-    try std.testing.expectEqual(@as(usize, 0), range.start_record);
-    try std.testing.expectEqual(@as(usize, 4), range.end_record);
-    try std.testing.expect(
-        transcript_store.retainedStructuredBytes(&runtime) <= runtime.notebook.max_retained_transcript_bytes,
-    );
-}
-
 test "command output detail retargets when first split source row is pruned" {
     var sink = try std.Io.Dir.openFileAbsolute(io_mod.getIo(), "/dev/null", .{ .mode = .write_only });
     defer sink.close(io_mod.getIo());
@@ -9373,7 +9254,7 @@ test "command output detail retargets when first split source row is pruned" {
         break;
     }
 
-    try runtime.enforceStructuredRetention(alloc, second_source_id);
+    try runtime.pruneOrphanedCommandState(alloc);
 
     try std.testing.expectEqual(second_source_id, runtime.notebook.command_output_blocks.items[0].entry_id.?);
     try std.testing.expectEqual(second_source_id, runtime.toolDetailForEntry(status_entry_id).?.command_output_entry_id.?);
@@ -9548,90 +9429,6 @@ test "command output display caps at five physical rows" {
     try std.testing.expect(std.mem.find(u8, projection.bytes.items, "│ … 21 lines more (ctrl+o to view)") != null);
 }
 
-test "structured retention prunes old raw transcript entries past cap" {
-    var sink = try std.Io.Dir.openFileAbsolute(io_mod.getIo(), "/dev/null", .{ .mode = .write_only });
-    defer sink.close(io_mod.getIo());
-
-    const alloc = std.testing.allocator;
-    var runtime = TranscriptRuntime{
-        .stdout_file = sink,
-        .layout = .{ .rows = 24, .cols = 80, .content_bottom = 21, .divider_top_row = 22, .input_row = 23, .divider_bottom_row = 24, .hint_row = 22 },
-        .notebook = .{ .max_transcript_bytes = 128, .max_retained_transcript_bytes = 32 },
-    };
-    defer runtime.deinit(alloc);
-
-    var metrics = Metrics{};
-    try runtime.initViewport(&metrics, 1);
-    try runtime.writeTranscript(alloc, &metrics, "raw-one-12345\n", true);
-    try runtime.writeTranscript(alloc, &metrics, "raw-two-12345\n", true);
-    try runtime.writeTranscript(alloc, &metrics, "raw-three-123\n", true);
-
-    try std.testing.expect(transcript_store.retainedStructuredBytes(&runtime) <= runtime.notebook.max_retained_transcript_bytes);
-    try std.testing.expect(runtime.notebook.entries.items.len < 3);
-    try std.testing.expect(std.mem.find(u8, runtime.notebook.transcript.items, "raw-one") == null);
-    try std.testing.expect(std.mem.find(u8, runtime.notebook.transcript.items, "raw-three") != null);
-}
-
-test "structured retention compacts a large pruning pass in entry order" {
-    var sink = try std.Io.Dir.openFileAbsolute(io_mod.getIo(), "/dev/null", .{ .mode = .write_only });
-    defer sink.close(io_mod.getIo());
-
-    const alloc = std.testing.allocator;
-    var runtime = TranscriptRuntime{
-        .stdout_file = sink,
-        .layout = .{ .rows = 24, .cols = 80, .content_bottom = 21, .divider_top_row = 22, .input_row = 23, .divider_bottom_row = 24, .hint_row = 22 },
-        .notebook = .{ .max_transcript_bytes = 4096, .max_retained_transcript_bytes = std.math.maxInt(usize) },
-    };
-    defer runtime.deinit(alloc);
-
-    for (0..2048) |index| {
-        const line = try alloc.print("retained-entry-{d:0>4}\n", .{index});
-        _ = runtime.appendRawBytesEntryClassified(alloc, line, .unknown_raw) catch |err| {
-            alloc.free(line);
-            return err;
-        };
-    }
-
-    runtime.notebook.max_retained_transcript_bytes = 1024;
-    try runtime.enforceStructuredRetention(alloc, null);
-
-    try std.testing.expect(transcript_store.retainedStructuredBytes(&runtime) <= 1024);
-    try std.testing.expect(runtime.notebook.entries.items.len < 2048);
-    try std.testing.expect(runtime.notebook.entries.items.len > 0);
-    for (runtime.notebook.entries.items[1..], runtime.notebook.entries.items[0 .. runtime.notebook.entries.items.len - 1]) |entry, previous| {
-        try std.testing.expect(previous.id() < entry.id());
-    }
-    try std.testing.expect(std.mem.find(u8, runtime.notebook.transcript.items, "retained-entry-0000") == null);
-    try std.testing.expect(std.mem.find(u8, runtime.notebook.transcript.items, "retained-entry-2047") != null);
-}
-
-test "assistant streaming retention trims active segment text" {
-    var sink = try std.Io.Dir.openFileAbsolute(io_mod.getIo(), "/dev/null", .{ .mode = .write_only });
-    defer sink.close(io_mod.getIo());
-
-    const alloc = std.testing.allocator;
-    var runtime = TranscriptRuntime{
-        .stdout_file = sink,
-        .layout = .{ .rows = 24, .cols = 80, .content_bottom = 21, .divider_top_row = 22, .input_row = 23, .divider_bottom_row = 24, .hint_row = 22 },
-        .notebook = .{ .max_transcript_bytes = 128, .max_retained_transcript_bytes = 32 },
-    };
-    defer runtime.deinit(alloc);
-
-    var metrics = Metrics{};
-    try runtime.initViewport(&metrics, 1);
-    _ = try runtime.streamAssistantChunk(alloc, &metrics, "aaaaaaaaaaaaaaaa\n");
-    _ = try runtime.streamAssistantChunk(alloc, &metrics, "bbbbbbbbbbbbbbbb\n");
-    _ = try runtime.streamAssistantChunk(alloc, &metrics, "cccccccccccccccc\n");
-
-    try std.testing.expectEqual(@as(usize, 1), runtime.notebook.entries.items.len);
-    try std.testing.expect(runtime.notebook.entries.items[0] == .assistant_turn);
-    const text = runtime.notebook.entries.items[0].assistant_turn.segments.text.items;
-    try std.testing.expect(text.len <= runtime.notebook.max_retained_transcript_bytes);
-    try std.testing.expect(std.mem.find(u8, text, "cccccccc") != null);
-    try std.testing.expect(std.mem.find(u8, text, "aaaaaaaa") == null);
-    try std.testing.expect(transcript_store.retainedStructuredBytes(&runtime) <= runtime.notebook.max_retained_transcript_bytes);
-}
-
 test "hidden command output becomes count-only at the hard cap" {
     var sink = try std.Io.Dir.openFileAbsolute(io_mod.getIo(), "/dev/null", .{ .mode = .write_only });
     defer sink.close(io_mod.getIo());
@@ -9659,13 +9456,13 @@ test "hidden command output becomes count-only at the hard cap" {
         try runtime.writeCommandOutputChunk(alloc, &metrics, styles, stream, line, true);
     }
 
-    runtime.notebook.max_retained_transcript_bytes = transcript_store.retainedStructuredBytes(&runtime);
+    runtime.notebook.command_output_block_cap = command_output_runtime.commandOutputBlockRetainedBytes(runtime.notebook.command_output_blocks.items[0]);
     try runtime.writeCommandOutputChunk(alloc, &metrics, styles, .stdout, "line-06\n", true);
 
     try std.testing.expectEqual(@as(usize, 6), runtime.notebook.command_output_blocks.items[0].lines.items.len);
     try std.testing.expectEqualStrings("line-00", runtime.notebook.command_output_blocks.items[0].lines.items[0].text);
     try std.testing.expect(std.mem.find(u8, runtime.notebook.command_output_blocks.items[0].lines.items[5].text, "line-06") == null);
-    try std.testing.expect(transcript_store.retainedStructuredBytes(&runtime) <= runtime.notebook.max_retained_transcript_bytes);
+    try std.testing.expect(command_output_runtime.commandOutputBlockRetainedBytes(runtime.notebook.command_output_blocks.items[0]) <= runtime.notebook.command_output_block_cap);
 
     var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
     try runtime.writeCommandOutputChunk(
@@ -9719,7 +9516,7 @@ test "command output becomes count-only at the hard cap" {
     try runtime.writeCommandOutputChunk(alloc, &metrics, styles, .stdout, "line-00\n", true);
     try runtime.writeCommandOutputChunk(alloc, &metrics, styles, .stderr, "line-01\n", true);
 
-    runtime.notebook.max_retained_transcript_bytes = transcript_store.retainedStructuredBytes(&runtime);
+    runtime.notebook.command_output_block_cap = command_output_runtime.commandOutputBlockRetainedBytes(runtime.notebook.command_output_blocks.items[0]);
     try runtime.writeCommandOutputChunk(alloc, &metrics, styles, .stdout, "line-02\n", true);
 
     var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
@@ -9736,7 +9533,7 @@ test "command output becomes count-only at the hard cap" {
     const block = runtime.notebook.command_output_blocks.items[0];
     try std.testing.expectEqual(@as(usize, 4), block.total_lines);
     try std.testing.expect(block.lines.items.len < block.total_lines);
-    try std.testing.expect(transcript_store.retainedStructuredBytes(&runtime) <= runtime.notebook.max_retained_transcript_bytes);
+    try std.testing.expect(command_output_runtime.commandOutputBlockRetainedBytes(block) <= runtime.notebook.command_output_block_cap);
 }
 
 test "blank hidden command output becomes count-only at the hard cap" {
@@ -9747,7 +9544,7 @@ test "blank hidden command output becomes count-only at the hard cap" {
     var runtime = TranscriptRuntime{
         .stdout_file = sink,
         .layout = .{ .rows = 24, .cols = 80, .content_bottom = 21, .divider_top_row = 22, .input_row = 23, .divider_bottom_row = 24, .hint_row = 22 },
-        .notebook = .{ .max_transcript_bytes = 256, .max_retained_transcript_bytes = 64 },
+        .notebook = .{ .max_transcript_bytes = 256, .command_output_block_cap = 64 },
     };
     defer runtime.deinit(alloc);
 
@@ -9761,7 +9558,7 @@ test "blank hidden command output becomes count-only at the hard cap" {
     try std.testing.expect(block.lines.items.len < block.total_lines);
     try std.testing.expectEqual(@as(usize, 8), block.total_lines);
     try std.testing.expectEqual(@as(usize, 0), block.retained_text_bytes);
-    try std.testing.expect(transcript_store.retainedStructuredBytes(&runtime) <= runtime.notebook.max_retained_transcript_bytes);
+    try std.testing.expect(command_output_runtime.commandOutputBlockRetainedBytes(block.*) <= runtime.notebook.command_output_block_cap);
 
     var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
     try runtime.writeCommandOutputChunk(
@@ -9776,7 +9573,7 @@ test "blank hidden command output becomes count-only at the hard cap" {
     try std.testing.expectEqual(@as(usize, 9), block.total_lines);
 }
 
-test "command output lines count toward structured retention" {
+test "clearTranscript frees entries and command output blocks" {
     var sink = try std.Io.Dir.openFileAbsolute(io_mod.getIo(), "/dev/null", .{ .mode = .write_only });
     defer sink.close(io_mod.getIo());
 
@@ -9784,105 +9581,7 @@ test "command output lines count toward structured retention" {
     var runtime = TranscriptRuntime{
         .stdout_file = sink,
         .layout = .{ .rows = 24, .cols = 80, .content_bottom = 21, .divider_top_row = 22, .input_row = 23, .divider_bottom_row = 24, .hint_row = 22 },
-        .notebook = .{ .max_transcript_bytes = 256, .max_retained_transcript_bytes = 512 },
-    };
-    defer runtime.deinit(alloc);
-
-    var metrics = Metrics{};
-    const styles: Styles = .{
-        .system_notice_label_style = "",
-        .system_notice_text_style = "",
-        .reset_style = "",
-        .dim_style = "",
-        .red_style = "",
-    };
-
-    var i: usize = 0;
-    while (i < 6) : (i += 1) {
-        try runtime.writeCommandOutputChunk(alloc, &metrics, styles, .stdout, "hidden-command-line\n", true);
-    }
-    try runtime.flushCommandOutputSummary(alloc, &metrics, styles, true);
-
-    try std.testing.expectEqual(@as(usize, 1), runtime.notebook.command_output_blocks.items.len);
-    try std.testing.expect(runtime.notebook.command_output_blocks.items[0].entry_id != null);
-    try std.testing.expect(runtime.notebook.command_output_blocks.items[0].lines.items.len < 6);
-    try std.testing.expectEqual(@as(usize, 6), runtime.notebook.command_output_blocks.items[0].total_lines);
-    var retained_text_bytes: usize = 0;
-    for (runtime.notebook.command_output_blocks.items[0].lines.items) |line| retained_text_bytes += line.text.len;
-    try std.testing.expectEqual(retained_text_bytes, runtime.notebook.command_output_blocks.items[0].retained_text_bytes);
-    try std.testing.expect(transcript_store.retainedStructuredBytes(&runtime) <= runtime.notebook.max_retained_transcript_bytes);
-}
-
-test "structured retention prunes old command output block state" {
-    var sink = try std.Io.Dir.openFileAbsolute(io_mod.getIo(), "/dev/null", .{ .mode = .write_only });
-    defer sink.close(io_mod.getIo());
-
-    const alloc = std.testing.allocator;
-    var runtime = TranscriptRuntime{
-        .stdout_file = sink,
-        .layout = .{ .rows = 24, .cols = 80, .content_bottom = 21, .divider_top_row = 22, .input_row = 23, .divider_bottom_row = 24, .hint_row = 22 },
-        .notebook = .{ .max_transcript_bytes = 256, .max_retained_transcript_bytes = 260 },
-    };
-    defer runtime.deinit(alloc);
-
-    var metrics = Metrics{};
-    const styles = commandOutputTestStyles();
-
-    try runtime.writeCommandOutputChunk(alloc, &metrics, styles, .stdout, "old-command-output-line-that-should-prune\n", true);
-    try runtime.flushCommandOutputSummary(alloc, &metrics, styles, true);
-    try std.testing.expectEqual(@as(usize, 1), runtime.notebook.command_output_blocks.items.len);
-
-    try runtime.writeCommandOutputChunk(alloc, &metrics, styles, .stdout, "new-command-output-line-that-should-remain\n", true);
-    try runtime.flushCommandOutputSummary(alloc, &metrics, styles, true);
-
-    try std.testing.expectEqual(@as(usize, 1), runtime.notebook.command_output_blocks.items.len);
-    try std.testing.expectEqual(@as(usize, 1), runtime.notebook.command_output_blocks.items[0].lines.items.len);
-    try std.testing.expect(std.mem.find(u8, runtime.notebook.command_output_blocks.items[0].lines.items[0].text, "new-command-output") != null);
-    try std.testing.expect(std.mem.find(u8, runtime.notebook.transcript.items, "old-command-output") == null);
-    try std.testing.expect(transcript_store.retainedStructuredBytes(&runtime) <= runtime.notebook.max_retained_transcript_bytes);
-}
-
-test "resize preparation uses retained entries after pruning without rewriting cache" {
-    var sink = try std.Io.Dir.openFileAbsolute(io_mod.getIo(), "/dev/null", .{ .mode = .write_only });
-    defer sink.close(io_mod.getIo());
-
-    const alloc = std.testing.allocator;
-    var runtime = TranscriptRuntime{
-        .stdout_file = sink,
-        .layout = .{ .rows = 24, .cols = 80, .content_bottom = 21, .divider_top_row = 22, .input_row = 23, .divider_bottom_row = 24, .hint_row = 22 },
-        .notebook = .{ .max_transcript_bytes = 128, .max_retained_transcript_bytes = 40 },
-    };
-    defer runtime.deinit(alloc);
-    try runtime.enableShadowVt(alloc);
-
-    var metrics = Metrics{};
-    try runtime.initViewport(&metrics, 1);
-    try runtime.writeTranscript(alloc, &metrics, "old-entry-that-will-prune\n", true);
-    try runtime.writeTranscript(alloc, &metrics, "latest-entry-stays\n", true);
-
-    const cache_before = try alloc.dupe(u8, runtime.notebook.transcript.items);
-    defer alloc.free(cache_before);
-    const rendered_cols_before = runtime.notebook.last_rendered_cols;
-
-    runtime.layout.cols = 20;
-    var prepared = try runtime.prepareTranscriptSurfacePaint(alloc, &metrics, 0);
-    defer prepared.deinit(alloc);
-
-    try std.testing.expectEqual(rendered_cols_before, runtime.notebook.last_rendered_cols);
-    try std.testing.expectEqualStrings(cache_before, runtime.notebook.transcript.items);
-    try std.testing.expect(std.mem.find(u8, prepared.bytes, "latest-entry-stays") != null);
-    try std.testing.expect(std.mem.find(u8, prepared.bytes, "old-entry") == null);
-}
-
-test "clearTranscript after retention pruning frees retained entries and command output blocks" {
-    var sink = try std.Io.Dir.openFileAbsolute(io_mod.getIo(), "/dev/null", .{ .mode = .write_only });
-    defer sink.close(io_mod.getIo());
-
-    const alloc = std.testing.allocator;
-    var runtime = TranscriptRuntime{
-        .stdout_file = sink,
-        .layout = .{ .rows = 24, .cols = 80, .content_bottom = 21, .divider_top_row = 22, .input_row = 23, .divider_bottom_row = 24, .hint_row = 22 },
-        .notebook = .{ .max_transcript_bytes = 128, .max_retained_transcript_bytes = 64 },
+        .notebook = .{ .max_transcript_bytes = 128 },
     };
     defer runtime.deinit(alloc);
 
@@ -9899,7 +9598,6 @@ test "clearTranscript after retention pruning frees retained entries and command
     try runtime.writeTranscript(alloc, &metrics, "second-entry-to-keep\n", true);
     try runtime.writeCommandOutputChunk(alloc, &metrics, styles, .stdout, "hidden-command-line\n", true);
     try runtime.flushCommandOutputSummary(alloc, &metrics, styles, true);
-    try std.testing.expect(transcript_store.retainedStructuredBytes(&runtime) <= runtime.notebook.max_retained_transcript_bytes);
 
     runtime.clearTranscript(alloc);
 
@@ -10307,117 +10005,6 @@ test "streamAssistantChunk extends the trailing assistant_turn on subsequent chu
     try std.testing.expectEqualStrings("alpha beta", runtime.notebook.entries.items[0].assistant_turn.segments.text.items);
 }
 
-test "recorded assistant stream slow path preserves a canonical anchor when retention rewrites its source" {
-    const alloc = std.testing.allocator;
-    var runtime = TranscriptRuntime{
-        .layout = transcriptTestLayout(48, 12, 8),
-        .owned_top_row = 1,
-        .notebook = .{ .max_transcript_bytes = 64 },
-    };
-    defer runtime.deinit(alloc);
-    try runtime.enableShadowVt(alloc);
-
-    const old_prefix = "old retained prefix\n";
-    _ = try runtime.appendRawTranscriptEntryClassified(
-        alloc,
-        old_prefix,
-        .subagent_status,
-    );
-    const long_prompt = try makeLongPastePrompt(alloc, 40);
-    defer alloc.free(long_prompt);
-    var metrics: Metrics = .{};
-    const user_id = try runtime.writeUserPromptCard(
-        alloc,
-        &metrics,
-        .{ .text = long_prompt, .images = &.{} },
-        false,
-        &.{},
-    );
-
-    var committed_source = try runtime.prepareTranscriptSource(alloc, null);
-    defer committed_source.deinit(alloc);
-    try std.testing.expect(committed_source.recorded_entries_authoritative);
-    try std.testing.expect(committed_source.bytes.len > runtime.notebook.transcript.items.len);
-    var committed_prepared = try runtime.prepareTranscriptSurfacePaintForArea(
-        alloc,
-        &metrics,
-        .{ .top = runtime.owned_top_row, .bottom = runtime.layout.content_bottom },
-    );
-    defer committed_prepared.deinit(alloc);
-    try installStableAnchorForTest(
-        &runtime,
-        alloc,
-        committed_source.bytes,
-        committed_prepared.selection,
-        preparedVisualOffsetForTest(&committed_prepared),
-        committed_prepared.cursor.cursor_row,
-        committed_prepared.cursor.cursor_col,
-        1,
-    );
-    // The synthetic anchor helper does not seal a source. Supply the same
-    // entry identity as a real sealed frame before exercising retention.
-    runtime.transcript_commit_state.stable.retention_identity = try @import("source_preparation.zig").RetentionIdentity.capture(&runtime, alloc, &committed_source);
-    try committed_source.ensureLineIndex(alloc);
-    const committed_history_visual_offset = try stableHistoryVisualOffsetForTest(&runtime);
-    const user_start = for (committed_source.line_provenance, 0..) |identity, index| {
-        if (identity == .entry and identity.entry.entry_id == user_id) break index;
-    } else return error.TestExpectedUserEntry;
-    const removed_rows = committed_source.transcript_visual_row_offsets[user_start];
-    try std.testing.expect(removed_rows > 0);
-    const old_boundary = committed_source.byteAtVisualOffset(committed_history_visual_offset);
-    const old_suffix = committed_source.bytes[old_boundary..];
-    const boundary_row = old_suffix[0..std.mem.findScalar(u8, old_suffix, '\n').?];
-    try std.testing.expect(std.mem.find(u8, boundary_row, "long-paste-line-34") != null);
-
-    const chunk = "trimmed assistant tail";
-    runtime.notebook.max_retained_transcript_bytes =
-        transcript_store.retainedStructuredBytes(&runtime) + chunk.len - old_prefix.len;
-    const assistant_id = try runtime.streamAssistantChunk(alloc, &metrics, chunk);
-
-    var rebased_source = (try runtime.prepareCommittedRetentionSource(alloc)) orelse
-        return error.TestExpectedStableTranscript;
-    defer rebased_source.deinit(alloc);
-    const rebased = runtime.transcript_commit_state.stable;
-    try std.testing.expectEqual(committed_history_visual_offset - removed_rows, rebased.history_visual_offset);
-    try std.testing.expectEqual(rebased.history_visual_offset, rebased.visual_offset);
-    try std.testing.expectEqualStrings(
-        committed_source.bytes[committed_source.hard_line_starts[user_start]..],
-        rebased_source.bytes,
-    );
-    try std.testing.expectEqualStrings(
-        committed_source.bytes[old_boundary..],
-        rebased_source.bytes[rebased_source.byteAtVisualOffset(rebased.history_visual_offset)..],
-    );
-    const boundary_identity = rebased_source.line_provenance[rebased.selection.start_line];
-    try std.testing.expect(boundary_identity == .entry);
-    try std.testing.expectEqual(user_id, boundary_identity.entry.entry_id);
-    try std.testing.expectEqual(transcript_blocks.TranscriptEntryClass.user_turn, boundary_identity.entry.entry_class);
-    try std.testing.expect(rebased.flow_materialized);
-    try std.testing.expect(!rebased.normal_buffer_recovery_pending);
-    try std.testing.expect(std.mem.find(u8, rebased_source.bytes, chunk) == null);
-    try std.testing.expect(
-        transcript_store.retainedStructuredBytes(&runtime) <=
-            runtime.notebook.max_retained_transcript_bytes,
-    );
-    try std.testing.expect(runtime.lookupAssistantSegments(assistant_id) != null);
-    var appended_source = try runtime.prepareTranscriptSource(alloc, null);
-    defer appended_source.deinit(alloc);
-    try std.testing.expect(!std.mem.startsWith(
-        u8,
-        appended_source.bytes,
-        committed_source.bytes,
-    ));
-    try std.testing.expectEqual(
-        @as(usize, 0),
-        std.mem.count(u8, appended_source.bytes, old_prefix),
-    );
-    try std.testing.expectEqual(
-        @as(usize, 1),
-        std.mem.count(u8, appended_source.bytes, "LONG_PASTE_LAST_MARKER"),
-    );
-    try std.testing.expect(runtime.notebook.entries.items[0].id() == user_id);
-}
-
 const AssistantStreamFastPathCase = enum {
     opening,
     continuation,
@@ -10467,10 +10054,6 @@ fn checkOrdinaryAssistantStreamAllocationFailures(
     const cache_origin_before = runtime.notebook.transcript_cache_origin_untrimmed;
     const repaint_count_before = runtime.render_requests.pendingReasonCount();
 
-    try std.testing.expect(retained_before <= runtime.notebook.max_retained_transcript_bytes);
-    try std.testing.expect(
-        chunk.len <= runtime.notebook.max_retained_transcript_bytes - retained_before,
-    );
     try std.testing.expect(
         chunk.len > runtime.notebook.transcript.capacity - runtime.notebook.transcript.items.len,
     );
@@ -10539,185 +10122,6 @@ fn checkOrdinaryAssistantStreamAllocationFailures(
     try std.testing.expectEqual(repaint_count_before + 1, runtime.render_requests.pendingReasonCount());
     try std.testing.expect(runtime.render_requests.hasReason(.transcript));
     try std.testing.expect(runtime.transcript_band_dirty);
-}
-
-test "ordinary assistant stream admission is atomic across allocation failures" {
-    var opening_witness = AssistantStreamFastPathFailureWitness{};
-    try std.testing.checkAllAllocationFailures(
-        testing_allocator.no_resize,
-        checkOrdinaryAssistantStreamAllocationFailures,
-        .{ .opening, &opening_witness },
-    );
-    try std.testing.expectEqual(@as(usize, 3), opening_witness.target_failures);
-
-    var continuation_witness = AssistantStreamFastPathFailureWitness{};
-    try std.testing.checkAllAllocationFailures(
-        testing_allocator.no_resize,
-        checkOrdinaryAssistantStreamAllocationFailures,
-        .{ .continuation, &continuation_witness },
-    );
-    try std.testing.expectEqual(@as(usize, 2), continuation_witness.target_failures);
-}
-
-fn checkOpeningAssistantStreamAllocationFailures(alloc: Allocator) !void {
-    var runtime = TranscriptRuntime{ .layout = transcriptTestLayout(24, 12, 8) };
-    defer runtime.deinit(alloc);
-    var metrics = Metrics{};
-
-    try runtime.writeTranscript(alloc, &metrics, "older transcript row\n", true);
-    const prompt = try alloc.dupe(u8, "prompt");
-    _ = try runtime.appendUserTurnOwned(alloc, .{ .text = prompt, .images = &.{} });
-    runtime.notebook.max_retained_transcript_bytes = "prompt".len + "first chunk".len;
-    runtime.render_requests.clearReason(.transcript);
-    runtime.transcript_band_dirty = false;
-
-    const transcript_before = try std.testing.allocator.dupe(u8, runtime.notebook.transcript.items);
-    defer std.testing.allocator.free(transcript_before);
-    const entry_count_before = runtime.notebook.entries.items.len;
-    const next_entry_id_before = runtime.notebook.next_entry_id;
-    const cursor_row_before = runtime.cursor_row;
-    const cursor_col_before = runtime.cursor_col;
-    const retained_before = transcript_store.retainedStructuredBytes(&runtime);
-    const cache_origin_before = runtime.notebook.transcript_cache_origin_untrimmed;
-    const repaint_count_before = runtime.render_requests.pendingReasonCount();
-
-    const entry_id = runtime.streamAssistantChunk(
-        alloc,
-        &metrics,
-        "first chunk",
-    ) catch |err| {
-        try std.testing.expectEqualStrings(transcript_before, runtime.notebook.transcript.items);
-        try std.testing.expectEqual(entry_count_before, runtime.notebook.entries.items.len);
-        try std.testing.expectEqual(next_entry_id_before, runtime.notebook.next_entry_id);
-        try std.testing.expectEqual(cursor_row_before, runtime.cursor_row);
-        try std.testing.expectEqual(cursor_col_before, runtime.cursor_col);
-        try std.testing.expectEqual(retained_before, transcript_store.retainedStructuredBytes(&runtime));
-        try std.testing.expectEqual(cache_origin_before, runtime.notebook.transcript_cache_origin_untrimmed);
-        try std.testing.expectEqual(repaint_count_before, runtime.render_requests.pendingReasonCount());
-        try std.testing.expect(!runtime.render_requests.hasReason(.transcript));
-        try std.testing.expect(!runtime.transcript_band_dirty);
-        return switch (err) {
-            error.WriteFailed => error.OutOfMemory,
-            else => err,
-        };
-    };
-
-    try std.testing.expectEqual(next_entry_id_before, entry_id);
-    try std.testing.expectEqual(next_entry_id_before +% 1, runtime.notebook.next_entry_id);
-    try std.testing.expectEqual(entry_count_before, runtime.notebook.entries.items.len);
-    try std.testing.expect(runtime.notebook.entries.items[0] == .user_turn);
-    try std.testing.expect(runtime.notebook.entries.items[1] == .assistant_turn);
-    try std.testing.expectEqual(entry_id, runtime.notebook.entries.items[1].id());
-    try std.testing.expectEqualStrings(
-        "first chunk",
-        runtime.notebook.entries.items[1].assistant_turn.segments.text.items,
-    );
-    try std.testing.expectEqual(
-        runtime.notebook.max_retained_transcript_bytes,
-        transcript_store.retainedStructuredBytes(&runtime),
-    );
-    const rendered = try renderEntriesToBytes(
-        std.testing.allocator,
-        runtime.notebook.entries.items,
-        runtime.layout.cols,
-    );
-    defer std.testing.allocator.free(rendered);
-    try std.testing.expectEqualStrings(rendered, runtime.notebook.transcript.items);
-    try std.testing.expectEqual(repaint_count_before + 1, runtime.render_requests.pendingReasonCount());
-    try std.testing.expect(runtime.render_requests.hasReason(.transcript));
-    try std.testing.expect(runtime.transcript_band_dirty);
-}
-
-test "opening a recorded assistant stream is atomic across allocation failures" {
-    try std.testing.checkAllAllocationFailures(
-        testing_allocator.no_resize,
-        checkOpeningAssistantStreamAllocationFailures,
-        .{},
-    );
-}
-
-fn checkExtendingAssistantStreamAllocationFailures(alloc: Allocator) !void {
-    var runtime = TranscriptRuntime{ .layout = transcriptTestLayout(24, 12, 8) };
-    defer runtime.deinit(alloc);
-    var metrics = Metrics{};
-
-    try runtime.writeTranscript(alloc, &metrics, "older transcript row\n", true);
-    const entry_id = try runtime.streamAssistantChunk(alloc, &metrics, "alpha ");
-    runtime.notebook.max_retained_transcript_bytes = "alpha beta".len;
-    runtime.render_requests.clearReason(.transcript);
-    runtime.transcript_band_dirty = false;
-
-    const transcript_before = try std.testing.allocator.dupe(u8, runtime.notebook.transcript.items);
-    defer std.testing.allocator.free(transcript_before);
-    const assistant_before = try std.testing.allocator.dupe(
-        u8,
-        runtime.lookupAssistantSegments(entry_id).?.text.items,
-    );
-    defer std.testing.allocator.free(assistant_before);
-    const entry_count_before = runtime.notebook.entries.items.len;
-    const next_entry_id_before = runtime.notebook.next_entry_id;
-    const cursor_row_before = runtime.cursor_row;
-    const cursor_col_before = runtime.cursor_col;
-    const retained_before = transcript_store.retainedStructuredBytes(&runtime);
-    const cache_origin_before = runtime.notebook.transcript_cache_origin_untrimmed;
-    const repaint_count_before = runtime.render_requests.pendingReasonCount();
-
-    const continued_id = runtime.streamAssistantChunk(
-        alloc,
-        &metrics,
-        "beta",
-    ) catch |err| {
-        try std.testing.expectEqualStrings(transcript_before, runtime.notebook.transcript.items);
-        try std.testing.expectEqualStrings(
-            assistant_before,
-            runtime.lookupAssistantSegments(entry_id).?.text.items,
-        );
-        try std.testing.expectEqual(entry_count_before, runtime.notebook.entries.items.len);
-        try std.testing.expectEqual(next_entry_id_before, runtime.notebook.next_entry_id);
-        try std.testing.expectEqual(cursor_row_before, runtime.cursor_row);
-        try std.testing.expectEqual(cursor_col_before, runtime.cursor_col);
-        try std.testing.expectEqual(retained_before, transcript_store.retainedStructuredBytes(&runtime));
-        try std.testing.expectEqual(cache_origin_before, runtime.notebook.transcript_cache_origin_untrimmed);
-        try std.testing.expectEqual(repaint_count_before, runtime.render_requests.pendingReasonCount());
-        try std.testing.expect(!runtime.render_requests.hasReason(.transcript));
-        try std.testing.expect(!runtime.transcript_band_dirty);
-        return switch (err) {
-            error.WriteFailed => error.OutOfMemory,
-            else => err,
-        };
-    };
-
-    try std.testing.expectEqual(entry_id, continued_id);
-    try std.testing.expectEqual(entry_count_before - 1, runtime.notebook.entries.items.len);
-    try std.testing.expectEqual(next_entry_id_before, runtime.notebook.next_entry_id);
-    try std.testing.expect(runtime.notebook.entries.items[0] == .assistant_turn);
-    try std.testing.expectEqual(entry_id, runtime.notebook.entries.items[0].id());
-    try std.testing.expectEqualStrings(
-        "alpha beta",
-        runtime.notebook.entries.items[0].assistant_turn.segments.text.items,
-    );
-    try std.testing.expectEqual(
-        runtime.notebook.max_retained_transcript_bytes,
-        transcript_store.retainedStructuredBytes(&runtime),
-    );
-    const rendered = try renderEntriesToBytes(
-        std.testing.allocator,
-        runtime.notebook.entries.items,
-        runtime.layout.cols,
-    );
-    defer std.testing.allocator.free(rendered);
-    try std.testing.expectEqualStrings(rendered, runtime.notebook.transcript.items);
-    try std.testing.expectEqual(repaint_count_before + 1, runtime.render_requests.pendingReasonCount());
-    try std.testing.expect(runtime.render_requests.hasReason(.transcript));
-    try std.testing.expect(runtime.transcript_band_dirty);
-}
-
-test "extending a recorded assistant stream is atomic across allocation failures" {
-    try std.testing.checkAllAllocationFailures(
-        testing_allocator.no_resize,
-        checkExtendingAssistantStreamAllocationFailures,
-        .{},
-    );
 }
 
 test "paced assistant continuations do not clone retained history per chunk" {
@@ -11197,61 +10601,6 @@ test "recorded user prompt card preserves a committed anchor after a non-prefix 
     );
 }
 
-test "recorded user prompt card preserves an anchor when retention prunes its source" {
-    const alloc = std.testing.allocator;
-    var runtime = TranscriptRuntime{
-        .layout = transcriptTestLayout(40, 8, 4),
-        .owned_top_row = 1,
-    };
-    defer runtime.deinit(alloc);
-    try runtime.enableShadowVt(alloc);
-
-    _ = try runtime.appendRawTranscriptEntryClassified(
-        alloc,
-        "anchored transcript\n",
-        .subagent_status,
-    );
-    var committed_source = try runtime.prepareTranscriptSource(alloc, null);
-    defer committed_source.deinit(alloc);
-    try installStableAnchorForTest(
-        &runtime,
-        alloc,
-        committed_source.bytes,
-        testSelection(0),
-        0,
-        4,
-        1,
-        1,
-    );
-    const committed_history_visual_offset = try stableHistoryVisualOffsetForTest(&runtime);
-
-    const prompt = "retained prompt";
-    runtime.notebook.max_retained_transcript_bytes = prompt.len;
-    var metrics = Metrics{};
-    _ = try runtime.writeUserPromptCard(
-        alloc,
-        &metrics,
-        .{ .text = @constCast(prompt), .images = &.{} },
-        true,
-        &.{},
-    );
-
-    try expectStableNormalBufferRecoveryForTest(
-        &runtime,
-        committed_history_visual_offset,
-    );
-    var retained_source = try runtime.prepareTranscriptSource(alloc, null);
-    defer retained_source.deinit(alloc);
-    try std.testing.expectEqual(
-        @as(usize, 0),
-        std.mem.count(u8, retained_source.bytes, "anchored transcript"),
-    );
-    try std.testing.expectEqual(
-        @as(usize, 1),
-        std.mem.count(u8, retained_source.bytes, prompt),
-    );
-}
-
 test "recorded transcript append preserves an authoritative committed anchor" {
     const alloc = std.testing.allocator;
     var runtime = TranscriptRuntime{
@@ -11476,7 +10825,7 @@ test "light to dark theme retint preserves retention with equal-width tokens" {
         "\x1b[38;5;238mRETINT_GROWTH_MARKER\x1b[39m\n",
         .subagent_status,
     );
-    runtime.notebook.max_retained_transcript_bytes = transcript_store.retainedStructuredBytes(&runtime);
+    const retained_before_retint = transcript_store.retainedStructuredBytes(&runtime);
     var committed_source = try runtime.prepareTranscriptSource(alloc, null);
     defer committed_source.deinit(alloc);
     try installStableAnchorForTest(
@@ -11496,9 +10845,8 @@ test "light to dark theme retint preserves retention with equal-width tokens" {
         transcript_runtime.TranscriptCommitDiagnosticState.stable,
         runtime.transcriptCommitDiagnostic().state,
     );
-    try std.testing.expect(
-        transcript_store.retainedStructuredBytes(&runtime) <= runtime.notebook.max_retained_transcript_bytes,
-    );
+    // Equal-width tokens: the retint does not grow what is held.
+    try std.testing.expect(transcript_store.retainedStructuredBytes(&runtime) <= retained_before_retint);
     var source = try runtime.prepareTranscriptSource(alloc, null);
     defer source.deinit(alloc);
     try std.testing.expect(std.mem.find(
@@ -11595,61 +10943,6 @@ test "theme retint is atomic across allocation failures" {
         testing_allocator.no_resize,
         checkThemeRetintAllocationFailures,
         .{},
-    );
-}
-
-test "recorded transcript append preserves an anchor when retention prunes its source" {
-    const alloc = std.testing.allocator;
-    var runtime = TranscriptRuntime{
-        .layout = transcriptTestLayout(40, 8, 4),
-        .owned_top_row = 1,
-    };
-    defer runtime.deinit(alloc);
-    try runtime.enableShadowVt(alloc);
-
-    _ = try runtime.appendRawTranscriptEntryClassified(
-        alloc,
-        "anchored transcript\n",
-        .subagent_status,
-    );
-    var committed_source = try runtime.prepareTranscriptSource(alloc, null);
-    defer committed_source.deinit(alloc);
-    try installStableAnchorForTest(
-        &runtime,
-        alloc,
-        committed_source.bytes,
-        testSelection(0),
-        0,
-        4,
-        1,
-        1,
-    );
-    const committed_history_visual_offset = try stableHistoryVisualOffsetForTest(&runtime);
-
-    const notice = "permission accepted\n";
-    runtime.notebook.max_retained_transcript_bytes = notice.len;
-    var metrics = Metrics{};
-    try runtime.writeTranscriptClassified(
-        alloc,
-        &metrics,
-        notice,
-        true,
-        .subagent_status,
-    );
-
-    try expectStableNormalBufferRecoveryForTest(
-        &runtime,
-        committed_history_visual_offset,
-    );
-    var retained_source = try runtime.prepareTranscriptSource(alloc, null);
-    defer retained_source.deinit(alloc);
-    try std.testing.expectEqual(
-        @as(usize, 0),
-        std.mem.count(u8, retained_source.bytes, "anchored transcript"),
-    );
-    try std.testing.expectEqual(
-        @as(usize, 1),
-        std.mem.count(u8, retained_source.bytes, "permission accepted"),
     );
 }
 
@@ -12115,176 +11408,6 @@ fn expectRecordedWriteCommandOutputFixture(
     try std.testing.expectEqualStrings(fixture.line, block.lines.items[0].text);
 }
 
-test "command output retention preserves its artifact detail owner" {
-    const alloc = std.testing.allocator;
-    var runtime = TranscriptRuntime{ .notebook = .{ .max_retained_transcript_bytes = 128 } };
-    defer runtime.deinit(alloc);
-
-    const detail_entry_id = try runtime.appendRawTranscriptEntryClassified(
-        alloc,
-        "● Ran command\n",
-        .tool_status,
-    );
-    const command_entry_id = try runtime.appendRawTranscriptEntryClassified(
-        alloc,
-        "│ ... command lines folded\n",
-        .command_output,
-    );
-    const detail: RecordedWriteToolDetailFixture = .{
-        .entry_id = detail_entry_id,
-        .tool_name = "run_command",
-        .arguments_json = "{\"command\":\"generate output\"}",
-        .result = "output_file=/tmp/fx-command-retained.log\n",
-        .result_handle = "result-run-command.txt",
-        .turn_id = 1,
-        .call_id = "retained-command",
-        .command_output_entry_id = command_entry_id,
-    };
-    try appendRecordedWriteToolDetailFixture(&runtime, alloc, detail);
-    try appendRecordedWriteCommandOutputFixture(&runtime, alloc, .{
-        .entry_id = command_entry_id,
-        .turn_id = 1,
-        .call_id = "retained-command",
-        .line = "XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX",
-    });
-    runtime.notebook.command_output_blocks.items[0].total_lines = 2;
-
-    try transcript_store.enforceStructuredRetention(&runtime, alloc, command_entry_id);
-
-    try std.testing.expect(runtime.toolDetailForEntry(detail_entry_id) != null);
-    try std.testing.expect(runtime.rawEntryClass(detail_entry_id) == .tool_status);
-    try std.testing.expect(runtime.rawEntryClass(command_entry_id) == .command_output);
-    try std.testing.expectEqual(@as(usize, 2), runtime.notebook.command_output_blocks.items[0].total_lines);
-    try std.testing.expectEqual(@as(usize, 0), runtime.notebook.command_output_blocks.items[0].lines.items.len);
-    try std.testing.expectEqual(@as(usize, 0), runtime.notebook.command_output_blocks.items[0].retained_text_bytes);
-    try std.testing.expect(transcript_store.retainedStructuredBytes(&runtime) <= runtime.notebook.max_retained_transcript_bytes);
-}
-
-fn checkRecordedTranscriptWriteAllocationFailures(alloc: Allocator) !void {
-    var runtime = TranscriptRuntime{
-        .layout = transcriptTestLayout(20, 8, 4),
-        .owned_top_row = 1,
-        .viewport_top_row = 1,
-        .cursor_row = 2,
-        .cursor_col = 4,
-        .command_output_render = .{},
-        .notebook = .{ .max_transcript_bytes = 8, .max_retained_transcript_bytes = 19 + @sizeOf(command_output_runtime.CommandOutputLine) },
-    };
-    defer runtime.deinit(alloc);
-
-    const existing_id = try runtime.appendRawTranscriptEntryClassified(
-        alloc,
-        "old\n",
-        .subagent_status,
-    );
-    const replaceable_id = try runtime.appendRawTranscriptEntryClassified(
-        alloc,
-        "tail\n",
-        .subagent_status,
-    );
-    const pruned_detail: RecordedWriteToolDetailFixture = .{
-        .entry_id = existing_id,
-        .tool_name = "read_file",
-        .arguments_json = "{\"path\":\"old\"}",
-        .result = "old result",
-        .result_handle = "old-result.txt",
-        .turn_id = 1,
-        .call_id = "call-old",
-        .command_output_entry_id = existing_id,
-    };
-    const retained_detail: RecordedWriteToolDetailFixture = .{
-        .entry_id = replaceable_id,
-        .tool_name = "write_file",
-        .arguments_json = "{\"path\":\"tail\"}",
-        .result = "tail result",
-        .result_handle = "tail-result.txt",
-        .turn_id = 2,
-        .call_id = "call-tail",
-        .command_output_entry_id = replaceable_id,
-    };
-    const retained_command_output: RecordedWriteCommandOutputFixture = .{
-        .entry_id = replaceable_id,
-        .turn_id = 3,
-        .call_id = "call-command-tail",
-        .line = "x",
-    };
-    try appendRecordedWriteToolDetailFixture(&runtime, alloc, pruned_detail);
-    try appendRecordedWriteToolDetailFixture(&runtime, alloc, retained_detail);
-    try appendRecordedWriteCommandOutputFixture(&runtime, alloc, retained_command_output);
-    runtime.cursor_row = 2;
-    runtime.cursor_col = 4;
-    runtime.notebook.replaceable_last_line = true;
-    runtime.notebook.replaceable_start = 0;
-    runtime.render_requests.clearReason(.transcript);
-    runtime.transcript_band_dirty = false;
-
-    const entry_count_before = runtime.notebook.entries.items.len;
-    const next_entry_id_before = runtime.notebook.next_entry_id;
-    const cursor_row_before = runtime.cursor_row;
-    const cursor_col_before = runtime.cursor_col;
-    const replaceable_before = runtime.notebook.replaceable_last_line;
-    const replaceable_start_before = runtime.notebook.replaceable_start;
-    const repaint_count_before = runtime.render_requests.pendingReasonCount();
-    const transcript_before = "tail\n";
-    try std.testing.expectEqualStrings(transcript_before, runtime.notebook.transcript.items);
-
-    var metrics = Metrics{};
-    const entry_id = transcript_writer.writeTranscriptReturningEntryIdClassified(
-        &runtime,
-        alloc,
-        &metrics,
-        "first\nsecond\n",
-        true,
-        .question_resolution,
-    ) catch |err| {
-        try std.testing.expectEqual(entry_count_before, runtime.notebook.entries.items.len);
-        try std.testing.expectEqual(existing_id, runtime.notebook.entries.items[0].id());
-        try std.testing.expectEqualStrings("old\n", runtime.notebook.entries.items[0].raw_bytes.bytes);
-        try std.testing.expectEqual(replaceable_id, runtime.notebook.entries.items[1].id());
-        try std.testing.expectEqualStrings("tail\n", runtime.notebook.entries.items[1].raw_bytes.bytes);
-        try std.testing.expectEqualStrings(transcript_before, runtime.notebook.transcript.items);
-        try std.testing.expectEqual(next_entry_id_before, runtime.notebook.next_entry_id);
-        try std.testing.expectEqual(cursor_row_before, runtime.cursor_row);
-        try std.testing.expectEqual(cursor_col_before, runtime.cursor_col);
-        try std.testing.expectEqual(replaceable_before, runtime.notebook.replaceable_last_line);
-        try std.testing.expectEqual(replaceable_start_before, runtime.notebook.replaceable_start);
-        try std.testing.expectEqual(@as(usize, 2), runtime.notebook.tool_details.items.len);
-        try expectRecordedWriteToolDetailFixture(&runtime, pruned_detail);
-        try expectRecordedWriteToolDetailFixture(&runtime, retained_detail);
-        try expectRecordedWriteCommandOutputFixture(&runtime, retained_command_output);
-        try std.testing.expectEqual(repaint_count_before, runtime.render_requests.pendingReasonCount());
-        try std.testing.expect(!runtime.render_requests.hasReason(.transcript));
-        try std.testing.expect(!runtime.transcript_band_dirty);
-        return err;
-    };
-
-    try std.testing.expectEqual(@as(u32, 3), entry_id);
-    try std.testing.expectEqual(@as(u32, 4), runtime.notebook.next_entry_id);
-    try std.testing.expectEqual(@as(usize, 2), runtime.notebook.entries.items.len);
-    try std.testing.expectEqual(replaceable_id, runtime.notebook.entries.items[0].id());
-    try std.testing.expectEqual(entry_id, runtime.notebook.entries.items[1].id());
-    try std.testing.expectEqual(RawEntryClass.question_resolution, runtime.notebook.entries.items[1].raw_bytes.class);
-    try std.testing.expectEqualStrings("first\nsecond\n", runtime.notebook.entries.items[1].raw_bytes.bytes);
-    try std.testing.expectEqualStrings("second\n", runtime.notebook.transcript.items);
-    try std.testing.expect(!runtime.notebook.replaceable_last_line);
-    try std.testing.expectEqual(@as(usize, 0), runtime.notebook.replaceable_start);
-    try std.testing.expectEqual(@as(usize, 1), runtime.notebook.tool_details.items.len);
-    try std.testing.expect(runtime.toolDetailForEntry(existing_id) == null);
-    try expectRecordedWriteToolDetailFixture(&runtime, retained_detail);
-    try expectRecordedWriteCommandOutputFixture(&runtime, retained_command_output);
-    try std.testing.expectEqual(@as(usize, 1), runtime.render_requests.pendingReasonCount());
-    try std.testing.expect(runtime.render_requests.hasReason(.transcript));
-    try std.testing.expect(runtime.transcript_band_dirty);
-}
-
-test "recorded transcript write is atomic across entry cache and retention allocation failures" {
-    try std.testing.checkAllAllocationFailures(
-        testing_allocator.no_resize,
-        checkRecordedTranscriptWriteAllocationFailures,
-        .{},
-    );
-}
-
 test "context notices stay canonical and ordered across compact and full projections" {
     const alloc = std.testing.allocator;
     var runtime = TranscriptRuntime{ .layout = transcriptTestLayout(80, 24, 20) };
@@ -12540,8 +11663,6 @@ test "visible recorded command output preserves a capped canonical anchor withou
     const committed_diagnostic = runtime.transcriptCommitDiagnostic();
 
     const styles = commandOutputAnsiTestStyles();
-    const retained_before = transcript_store.retainedStructuredBytes(&runtime);
-    runtime.notebook.max_retained_transcript_bytes = retained_before + 512;
 
     try runtime.writeCommandOutputChunk(
         alloc,
@@ -12570,9 +11691,6 @@ test "visible recorded command output preserves a capped canonical anchor withou
     try std.testing.expectEqual(@as(usize, 1), block.lines.items.len);
     try std.testing.expectEqual(@as(usize, 1), block.live_entry_ids.items.len);
     try std.testing.expectEqual(runtime.notebook.entries.items[1].id(), block.live_entry_ids.items[0]);
-    try std.testing.expect(
-        transcript_store.retainedStructuredBytes(&runtime) <= runtime.notebook.max_retained_transcript_bytes,
-    );
     var appended_source = try runtime.prepareTranscriptSource(alloc, null);
     defer appended_source.deinit(alloc);
     try std.testing.expect(std.mem.startsWith(
@@ -12594,8 +11712,6 @@ test "visible recorded command output survives consolidation" {
     const fixture = try setupRecordedCommandOutputAtomicFixture(&runtime, alloc);
     var metrics: Metrics = .{};
     const styles = commandOutputAnsiTestStyles();
-    const retained_before = transcript_store.retainedStructuredBytes(&runtime);
-    runtime.notebook.max_retained_transcript_bytes = retained_before + 512;
 
     try runtime.writeCommandOutputChunkForLifecycle(
         alloc,
@@ -13051,67 +12167,6 @@ test "recorded command output completion does not allocate without a matching bl
     try std.testing.expectEqual(display_before.open_command_block, runtime.notebook.command_output_display.open_command_block);
 }
 
-test "recorded command output consolidation preserves its anchor when retention changes" {
-    const alloc = std.testing.allocator;
-    var runtime = TranscriptRuntime{ .layout = transcriptTestLayout(80, 12, 8) };
-    defer runtime.deinit(alloc);
-    const fixture = try setupRecordedCommandOutputAtomicFixture(&runtime, alloc);
-    var metrics = Metrics{};
-    const styles = commandOutputAnsiTestStyles();
-
-    try runtime.writeCommandOutputChunkForLifecycle(
-        alloc,
-        &metrics,
-        styles,
-        fixture.lifecycle_id,
-        .stdout,
-        "one\n",
-        true,
-    );
-    try runtime.writeCommandOutputChunkForLifecycle(
-        alloc,
-        &metrics,
-        styles,
-        fixture.lifecycle_id,
-        .stdout,
-        "two\n",
-        true,
-    );
-    const retained_before = transcript_store.retainedStructuredBytes(&runtime);
-    runtime.notebook.max_retained_transcript_bytes = retained_before - 1;
-    try runtime.enableShadowVt(alloc);
-    try installStableAnchorForTest(
-        &runtime,
-        alloc,
-        "pre-retention source\n",
-        testSelection(0),
-        0,
-        3,
-        1,
-        91,
-    );
-    try std.testing.expectEqual(
-        transcript_runtime.TranscriptCommitDiagnosticState.stable,
-        runtime.transcriptCommitDiagnostic().state,
-    );
-    const committed_history_visual_offset = try stableHistoryVisualOffsetForTest(&runtime);
-
-    try runtime.flushCommandOutputSummaryForLifecycle(
-        alloc,
-        &metrics,
-        styles,
-        fixture.lifecycle_id,
-        true,
-    );
-
-    try std.testing.expect(transcript_store.retainedStructuredBytes(&runtime) <= runtime.notebook.max_retained_transcript_bytes);
-    try std.testing.expect(runtime.notebook.command_output_blocks.items[0].lines.items.len < 2);
-    try expectStableNormalBufferRecoveryForTest(
-        &runtime,
-        committed_history_visual_offset,
-    );
-}
-
 test "writeTranscriptBytes does NOT append an entry" {
     var sink = try std.Io.Dir.openFileAbsolute(io_mod.getIo(), "/dev/null", .{ .mode = .write_only });
     defer sink.close(io_mod.getIo());
@@ -13287,7 +12342,7 @@ test "tool status raw entry updates after command output appends" {
         null,
     );
     defer alloc.free(full);
-    try std.testing.expect(std.mem.find(u8, full, "│ ok") != null);
+    try std.testing.expect(std.mem.find(u8, full, "    ok") != null);
     try std.testing.expect(std.mem.find(u8, full, "Running npm test") == null);
 }
 
@@ -13469,12 +12524,8 @@ test "streamed chunk-split produces same viewport as single emission" {
     try std.testing.expectEqual(single.cursor_col, split.cursor_col);
 }
 
-fn lifecycleTestRuntime(max_retained_bytes: ?usize) TranscriptRuntime {
-    var runtime = TranscriptRuntime{
-        .layout = transcriptTestLayout(80, 24, 20),
-    };
-    if (max_retained_bytes) |value| runtime.notebook.max_retained_transcript_bytes = value;
-    return runtime;
+fn lifecycleTestRuntime() TranscriptRuntime {
+    return .{ .layout = transcriptTestLayout(80, 24, 20) };
 }
 
 fn lifecycleId(turn_id: u64, call_id: []const u8) types.ToolLifecycleId {
@@ -13500,7 +12551,7 @@ test "current compact projection groups tool rows without mutating entries" {
     const alloc = std.testing.allocator;
     defer user_message_card.setStyle(false, null);
     user_message_card.setStyle(false, null);
-    var runtime = lifecycleTestRuntime(null);
+    var runtime = lifecycleTestRuntime();
     defer runtime.deinit(alloc);
 
     const read_id = lifecycleId(1, "read");
@@ -13530,12 +12581,14 @@ test "current compact projection groups tool rows without mutating entries" {
     const entry_count = runtime.notebook.entries.items.len;
     var compact = try runtime.prepareTranscriptSource(alloc, null);
     defer compact.deinit(alloc);
+    // The failed edit is not a command, so its row says only that it failed,
+    // in the failure style, and the header does not count it.
     try std.testing.expect(std.mem.find(
         u8,
         compact.bytes,
-        "\x1b[38;5;255m●\x1b[0m \x1b[38;5;245m2 tool calls · 1 read · 1 edit · 1 failed\x1b[0m\n" ++
+        "\x1b[38;5;255m●\x1b[0m \x1b[38;5;245mRead a file\x1b[0m\n" ++
             "\x1b[38;5;245m├ Read file\x1b[0m\n" ++
-            "\x1b[38;5;245m└ Edit failed\x1b[0m",
+            "\x1b[38;5;245m└ \x1b[38;5;245mEdit failed\x1b[0m\x1b[38;5;245m\x1b[0m",
     ) != null);
     try std.testing.expectEqual(entry_count, runtime.notebook.entries.items.len);
 }
@@ -13550,14 +12603,14 @@ test "current compact projection finalizes tool groups from turn finished fallba
         fallback_disposition: ?transcript_blocks.ToolFallbackDisposition,
         summary_text: []const u8,
     }{
-        .{ .call_id = "unreported", .provisional = false, .turn_outcome = .completed, .detail_outcome = .completed, .fallback_disposition = .completion_unreported, .summary_text = "1 tool call · 1 read · 1 unreported" },
-        .{ .call_id = "not-executed", .provisional = true, .turn_outcome = .completed, .detail_outcome = .completed, .fallback_disposition = .not_executed, .summary_text = "1 tool call · 1 read · 1 not executed" },
-        .{ .call_id = "interrupted", .provisional = false, .turn_outcome = .interrupted, .detail_outcome = .cancelled, .fallback_disposition = null, .summary_text = "1 cancelled" },
+        .{ .call_id = "unreported", .provisional = false, .turn_outcome = .completed, .detail_outcome = .completed, .fallback_disposition = .completion_unreported, .summary_text = "Tool completion was not reported" },
+        .{ .call_id = "not-executed", .provisional = true, .turn_outcome = .completed, .detail_outcome = .completed, .fallback_disposition = .not_executed, .summary_text = "Tool was not executed" },
+        .{ .call_id = "interrupted", .provisional = false, .turn_outcome = .interrupted, .detail_outcome = .cancelled, .fallback_disposition = null, .summary_text = "Tool cancelled" },
         .{ .call_id = "failed", .provisional = false, .turn_outcome = .failed, .detail_outcome = .failed, .fallback_disposition = null, .summary_text = "Tool failed" },
     };
 
     for (cases) |case| {
-        var runtime = lifecycleTestRuntime(null);
+        var runtime = lifecycleTestRuntime();
         defer runtime.deinit(alloc);
 
         const id = lifecycleId(1, case.call_id);
@@ -13598,7 +12651,7 @@ test "current compact projection finalizes tool groups from turn finished fallba
 }
 
 fn checkCompactParallelFallbackAllocationFailuresImpl(alloc: Allocator) !void {
-    var runtime = lifecycleTestRuntime(null);
+    var runtime = lifecycleTestRuntime();
     defer runtime.deinit(alloc);
     const ids = [_]types.ToolLifecycleId{
         lifecycleId(1, "provisional-a"),
@@ -13772,28 +12825,6 @@ test "preserving batch lifecycle rewrite keeps a capped canonical anchor" {
     ) != null);
 }
 
-test "turn finished anchor preservation keeps a same-epoch retention rewrite" {
-    const alloc = std.testing.allocator;
-
-    var runtime = TranscriptRuntime{
-        .layout = transcriptTestLayout(40, 8, 4),
-        .owned_top_row = 1,
-    };
-    defer runtime.deinit(alloc);
-    try prepareTurnFinishedAnchor(&runtime, alloc);
-    const committed_history_visual_offset = try stableHistoryVisualOffsetForTest(&runtime);
-    runtime.notebook.max_retained_transcript_bytes = 0;
-
-    _ = try runtime.applyToolLifecyclePreservingNormalBufferAnchor(alloc, .{
-        .turn_finished = .{ .turn_id = 1, .outcome = .interrupted },
-    });
-
-    try expectStableNormalBufferRecoveryForTest(
-        &runtime,
-        committed_history_visual_offset,
-    );
-}
-
 test "turn finished anchor preservation falls back for strict mode or geometry blocker" {
     const alloc = std.testing.allocator;
 
@@ -13935,7 +12966,7 @@ test "untrimmed pinned status replacement preserves anchor through scroll transi
 
 test "command terminal replacement preserves committed scrollback anchor" {
     const alloc = std.testing.allocator;
-    var runtime = lifecycleTestRuntime(null);
+    var runtime = lifecycleTestRuntime();
     defer runtime.deinit(alloc);
     try runtime.enableShadowVt(alloc);
 
@@ -14051,96 +13082,8 @@ test "pinned status admission preserves an authoritative committed anchor" {
     try std.testing.expectEqual(@as(usize, 2), runtime.lifecyclePinCount());
 }
 
-test "pinned status admission preserves an anchor when retention prunes its source" {
+test "pinned status replacement preserves authoritative cache changes and rebases geometry" {
     const alloc = std.testing.allocator;
-    var runtime = TranscriptRuntime{
-        .layout = transcriptTestLayout(40, 8, 4),
-        .owned_top_row = 1,
-    };
-    defer runtime.deinit(alloc);
-    try runtime.enableShadowVt(alloc);
-
-    _ = try runtime.appendRawTranscriptEntryClassified(
-        alloc,
-        "anchored transcript\n",
-        .subagent_status,
-    );
-    var committed_source = try runtime.prepareTranscriptSource(alloc, null);
-    defer committed_source.deinit(alloc);
-    try installStableAnchorForTest(
-        &runtime,
-        alloc,
-        committed_source.bytes,
-        testSelection(0),
-        0,
-        4,
-        1,
-        1,
-    );
-    const committed_history_visual_offset = try stableHistoryVisualOffsetForTest(&runtime);
-    runtime.notebook.max_retained_transcript_bytes = "pending\n".len;
-
-    _ = try transcript_store.appendPinnedToolStatusAtomic(
-        &runtime,
-        alloc,
-        "pending\n",
-    );
-
-    try expectStableNormalBufferRecoveryForTest(
-        &runtime,
-        committed_history_visual_offset,
-    );
-    var retained_source = try runtime.prepareTranscriptSource(alloc, null);
-    defer retained_source.deinit(alloc);
-    try std.testing.expectEqual(
-        @as(usize, 0),
-        std.mem.count(u8, retained_source.bytes, "anchored transcript"),
-    );
-    try std.testing.expectEqual(@as(usize, 1), runtime.lifecyclePinCount());
-}
-
-test "pinned status replacement preserves authoritative cache changes and rebases retention or geometry" {
-    const alloc = std.testing.allocator;
-
-    {
-        var runtime = TranscriptRuntime{
-            .layout = transcriptTestLayout(40, 8, 4),
-            .owned_top_row = 1,
-        };
-        defer runtime.deinit(alloc);
-        try runtime.enableShadowVt(alloc);
-        _ = try runtime.appendRawTranscriptEntryClassified(
-            alloc,
-            "ordinary retained entry\n",
-            .subagent_status,
-        );
-        const entry_id = try transcript_store.appendPinnedToolStatusAtomic(
-            &runtime,
-            alloc,
-            "pending\n",
-        );
-        runtime.notebook.max_retained_transcript_bytes = transcript_store.retainedStructuredBytes(&runtime);
-        try installStableAnchorForTest(
-            &runtime,
-            alloc,
-            runtime.notebook.transcript.items,
-            testSelection(0),
-            0,
-            4,
-            1,
-            1,
-        );
-        try std.testing.expect(try transcript_store.replacePinnedToolStatusAtomic(
-            &runtime,
-            alloc,
-            entry_id,
-            "replacement that requires structured retention\n",
-        ));
-        try std.testing.expectEqual(
-            transcript_runtime.TranscriptCommitDiagnosticState.invalid,
-            runtime.transcriptCommitDiagnostic().state,
-        );
-    }
 
     {
         var runtime = TranscriptRuntime{
@@ -14260,7 +13203,7 @@ test "pinned status replacement preserves authoritative cache changes and rebase
 
 test "visual epoch retains full history across repeated clears and compact rebuilds" {
     const alloc = std.testing.allocator;
-    var runtime = lifecycleTestRuntime(null);
+    var runtime = lifecycleTestRuntime();
     defer runtime.deinit(alloc);
 
     _ = try runtime.appendRawTranscriptEntryClassified(alloc, "old welcome\n", .welcome);
@@ -14317,7 +13260,7 @@ test "visual epoch retains full history across repeated clears and compact rebui
 test "visual epoch preserves monotonic entry IDs across repeated clears" {
     const alloc = std.testing.allocator;
     for ([_]bool{ true, false }) |has_original_welcome| {
-        var runtime = lifecycleTestRuntime(null);
+        var runtime = lifecycleTestRuntime();
         defer runtime.deinit(alloc);
         if (has_original_welcome) {
             _ = try runtime.appendRawTranscriptEntryClassified(alloc, "original welcome\n", .welcome);
@@ -14364,7 +13307,7 @@ test "visual epoch preserves monotonic entry IDs across repeated clears" {
 }
 
 fn checkVisualEpochAllocationFailuresImpl(alloc: Allocator) !void {
-    var runtime = lifecycleTestRuntime(null);
+    var runtime = lifecycleTestRuntime();
     defer runtime.deinit(alloc);
     _ = try runtime.appendRawTranscriptEntryClassified(alloc, "original welcome\n", .welcome);
     const old_id = try runtime.appendRawTranscriptEntryClassified(alloc, "borrowed answer\n", .subagent_status);
@@ -14401,7 +13344,7 @@ fn checkVisualEpochAllocationFailures(alloc: Allocator) !void {
 
 test "visual epoch starts a visible assistant tail without resurrecting cleared text" {
     const alloc = std.testing.allocator;
-    var runtime = lifecycleTestRuntime(null);
+    var runtime = lifecycleTestRuntime();
     defer runtime.deinit(alloc);
     var metrics = Metrics{};
     _ = try runtime.appendRawTranscriptEntryClassified(alloc, "welcome\n", .welcome);
@@ -14426,7 +13369,7 @@ test "visual epoch reset is atomic across allocation failures" {
 
 test "visual epoch hides ordinary entries and preserves live tool identities through settlement" {
     const alloc = std.testing.allocator;
-    var runtime = lifecycleTestRuntime(null);
+    var runtime = lifecycleTestRuntime();
     defer runtime.deinit(alloc);
 
     _ = try runtime.appendRawTranscriptEntryClassified(alloc, "original welcome\n", .welcome);
@@ -14547,7 +13490,7 @@ test "visual epoch retains command output blocks and detail associations" {
 
 test "transcript lifecycle identity updates are idempotent and atomic" {
     const alloc = std.testing.allocator;
-    var runtime = lifecycleTestRuntime(null);
+    var runtime = lifecycleTestRuntime();
     defer runtime.deinit(alloc);
 
     for ([_]?[]const u8{ null, "read_file", "read_file" }) |tool_name| {
@@ -14628,7 +13571,7 @@ test "transcript lifecycle identity updates are idempotent and atomic" {
 
 test "authoritative lifecycle can place a provisional row after the latest transcript entry" {
     const alloc = std.testing.allocator;
-    var runtime = lifecycleTestRuntime(null);
+    var runtime = lifecycleTestRuntime();
     defer runtime.deinit(alloc);
 
     const id = lifecycleId(1, "command");
@@ -14809,98 +13752,9 @@ test "coalesced approval lifecycle reposition preserves an authoritative committ
     try std.testing.expectEqual(committed_offset, facts.source_visual_offset);
 }
 
-test "coalesced approval lifecycle reposition preserves its anchor when retention prunes its source" {
-    const alloc = std.testing.allocator;
-    var runtime = TranscriptRuntime{
-        .layout = transcriptTestLayout(48, 12, 8),
-        .owned_top_row = 1,
-        .notebook = .{ .max_transcript_bytes = 64 },
-    };
-    defer runtime.deinit(alloc);
-    try runtime.enableShadowVt(alloc);
-
-    const anchored = "anchored transcript\n";
-    _ = try runtime.appendRawTranscriptEntryClassified(
-        alloc,
-        anchored,
-        .subagent_status,
-    );
-    var committed_source = try runtime.prepareTranscriptSource(alloc, null);
-    defer committed_source.deinit(alloc);
-    try installStableAnchorForTest(
-        &runtime,
-        alloc,
-        committed_source.bytes,
-        testSelection(0),
-        0,
-        4,
-        1,
-        1,
-    );
-    const committed_history_visual_offset = try stableHistoryVisualOffsetForTest(&runtime);
-
-    const id = lifecycleId(92, "retained-command");
-    _ = try runtime.applyToolLifecycle(alloc, .{ .provisional = .{
-        .id = id,
-        .tool_name = "run_command",
-        .activity_kind = .command,
-    } });
-    _ = try runtime.appendSemanticNotice(alloc, .{
-        .topic = "permissions",
-        .tone = .success,
-        .body = "Auto agent approved this request: Running command.",
-        .visibility = .full_only,
-    });
-    runtime.notebook.max_retained_transcript_bytes =
-        transcript_store.retainedStructuredBytes(&runtime) - anchored.len;
-
-    _ = try runtime.applyToolLifecycle(alloc, .{ .authoritative_started = .{
-        .id = id,
-        .reconciles_provisional_call_id = null,
-        .tool_name = "run_command",
-        .activity_kind = .command,
-        .arguments_json = "{\"command\":\"seq 1 1\"}",
-        .place_after_current_transcript = true,
-    } });
-
-    try expectStableNormalBufferRecoveryForTest(
-        &runtime,
-        committed_history_visual_offset,
-    );
-    var retained_source = try runtime.prepareTranscriptSource(alloc, null);
-    defer retained_source.deinit(alloc);
-    try std.testing.expectEqual(
-        @as(usize, 0),
-        std.mem.count(u8, retained_source.bytes, "anchored transcript"),
-    );
-    try std.testing.expect(std.mem.find(u8, retained_source.bytes, "Auto agent approved") == null);
-    try std.testing.expect(std.mem.find(
-        u8,
-        retained_source.bytes,
-        "run_command",
-    ) != null);
-    var projection = try runtime.buildFullTranscriptProjection(alloc, null);
-    defer projection.deinit(alloc);
-    const full = try full_transcript_screen.renderProjectionViewportSourceInterruptible(
-        alloc,
-        &projection,
-        null,
-        runtime.layout.cols,
-        64,
-        0,
-        null,
-    );
-    defer alloc.free(full);
-    const notice_index = std.mem.find(u8, full, "Auto agent approved") orelse
-        return error.TestExpectedEqual;
-    const status_index = std.mem.find(u8, full, "run_command") orelse
-        return error.TestExpectedEqual;
-    try std.testing.expect(notice_index < status_index);
-}
-
 test "transcript lifecycle preserves caller resolved activity metadata" {
     const alloc = std.testing.allocator;
-    var runtime = lifecycleTestRuntime(null);
+    var runtime = lifecycleTestRuntime();
     defer runtime.deinit(alloc);
 
     const id = lifecycleId(1, "custom-browser");
@@ -14922,7 +13776,7 @@ test "transcript lifecycle preserves caller resolved activity metadata" {
 
 test "transcript lifecycle terminal and finalization transitions stay batch safe" {
     const alloc = std.testing.allocator;
-    var runtime = lifecycleTestRuntime(null);
+    var runtime = lifecycleTestRuntime();
     defer runtime.deinit(alloc);
 
     const cases = [_]struct {
@@ -15016,7 +13870,7 @@ test "transcript lifecycle terminal and finalization transitions stay batch safe
 
 test "completed tool status projection keeps lifecycle styling without activity state" {
     const alloc = std.testing.allocator;
-    var runtime = lifecycleTestRuntime(null);
+    var runtime = lifecycleTestRuntime();
     defer runtime.deinit(alloc);
     var metrics: Metrics = .{};
 
@@ -15041,7 +13895,7 @@ test "completed tool status projection keeps lifecycle styling without activity 
 
 test "transcript lifecycle terminal markers preserve ANSI summaries and normalize markerless failures" {
     const alloc = std.testing.allocator;
-    var runtime = lifecycleTestRuntime(null);
+    var runtime = lifecycleTestRuntime();
     defer runtime.deinit(alloc);
 
     const styled_entry_id = try startLifecycle(&runtime, alloc, 1, "styled");
@@ -15127,7 +13981,7 @@ test "transcript lifecycle terminal markers preserve ANSI summaries and normaliz
 
 test "active tool cancellation is presented immediately without closing lifecycle state" {
     const alloc = std.testing.allocator;
-    var runtime = lifecycleTestRuntime(null);
+    var runtime = lifecycleTestRuntime();
     defer runtime.deinit(alloc);
 
     const ids = [_]types.ToolLifecycleId{
@@ -15165,7 +14019,7 @@ test "active tool cancellation is presented immediately without closing lifecycl
 test "late successful settlement preserves its result and one turn cancellation" {
     const alloc = std.testing.allocator;
     for ([_]bool{ false, true }) |finish_before_terminal| {
-        var runtime = lifecycleTestRuntime(null);
+        var runtime = lifecycleTestRuntime();
         defer runtime.deinit(alloc);
 
         const id = lifecycleId(1, "late-success");
@@ -15218,7 +14072,7 @@ test "late successful settlement preserves its result and one turn cancellation"
 test "post-cancel sibling settlement preserves one turn cancellation" {
     const alloc = std.testing.allocator;
     for ([_]bool{ false, true }) |sibling_reports_terminal| {
-        var runtime = lifecycleTestRuntime(null);
+        var runtime = lifecycleTestRuntime();
         defer runtime.deinit(alloc);
 
         const first = lifecycleId(1, "first");
@@ -15268,7 +14122,7 @@ test "post-cancel sibling settlement preserves one turn cancellation" {
 test "late zero-output command settlement reserves distinct presentation entries" {
     const alloc = std.testing.allocator;
     for ([_]bool{ false, true }) |finish_before_terminal| {
-        var runtime = lifecycleTestRuntime(null);
+        var runtime = lifecycleTestRuntime();
         defer runtime.deinit(alloc);
 
         const id = lifecycleId(1, "zero-output-command");
@@ -15330,7 +14184,7 @@ test "late zero-output command settlement reserves distinct presentation entries
 }
 
 fn checkLateZeroOutputCommandCancellationAllocationFailuresImpl(alloc: Allocator) !void {
-    var runtime = lifecycleTestRuntime(null);
+    var runtime = lifecycleTestRuntime();
     defer runtime.deinit(alloc);
 
     const id = lifecycleId(1, "allocation-command");
@@ -15558,66 +14412,8 @@ test "lifecycle pin cleanup preserves a capped canonical anchor without pruning"
     try std.testing.expectEqualStrings(committed_source.bytes, cleaned_source.bytes);
 }
 
-test "lifecycle pin cleanup preserves a canonical anchor when retention prunes" {
-    const alloc = std.testing.allocator;
-    var runtime = TranscriptRuntime{
-        .layout = transcriptTestLayout(48, 12, 8),
-        .owned_top_row = 1,
-    };
-    defer runtime.deinit(alloc);
-    try runtime.enableShadowVt(alloc);
-
-    const anchored = "anchored lifecycle cleanup transcript\n";
-    _ = try runtime.appendRawTranscriptEntryClassified(
-        alloc,
-        anchored,
-        .subagent_status,
-    );
-    const id = lifecycleId(95, "pruning-cleanup-command");
-    _ = try startLifecycle(&runtime, alloc, id.turn_id, id.call_id);
-    _ = try runtime.applyToolLifecycle(alloc, .{ .turn_finished = .{
-        .turn_id = id.turn_id,
-        .outcome = .completed,
-    } });
-    _ = try runtime.applyToolLifecycle(alloc, .{ .terminal = .{
-        .id = id,
-        .outcome = .{ .kind = .completed, .summary = "Cleanup complete" },
-    } });
-
-    var committed_source = try runtime.prepareTranscriptSource(alloc, null);
-    defer committed_source.deinit(alloc);
-    try installStableAnchorForTest(
-        &runtime,
-        alloc,
-        committed_source.bytes,
-        testSelection(0),
-        0,
-        4,
-        1,
-        1,
-    );
-    const committed_history_visual_offset = try stableHistoryVisualOffsetForTest(&runtime);
-    runtime.notebook.max_retained_transcript_bytes =
-        transcript_store.retainedStructuredBytes(&runtime) - anchored.len;
-
-    try runtime.finishLifecycleBatch(alloc);
-
-    try expectStableNormalBufferRecoveryForTest(
-        &runtime,
-        committed_history_visual_offset,
-    );
-    try std.testing.expectEqual(@as(usize, 0), runtime.lifecyclePinCount());
-    try std.testing.expectEqual(@as(usize, 0), runtime.toolActivityRecordCount());
-    var retained_source = try runtime.prepareTranscriptSource(alloc, null);
-    defer retained_source.deinit(alloc);
-    try std.testing.expectEqual(
-        @as(usize, 0),
-        std.mem.count(u8, retained_source.bytes, anchored),
-    );
-}
-
 fn checkLifecycleAllocationFailuresImpl(alloc: Allocator) !void {
-    var runtime = lifecycleTestRuntime(64);
+    var runtime = lifecycleTestRuntime();
     defer runtime.deinit(alloc);
     const existing = try runtime.appendRawTranscriptEntryClassified(
         alloc,
@@ -15674,7 +14470,7 @@ test "transcript lifecycle transactions are atomic across allocation failures" {
 }
 
 fn checkLateTerminalFallbackAllocationFailuresImpl(alloc: Allocator) !void {
-    var runtime = lifecycleTestRuntime(null);
+    var runtime = lifecycleTestRuntime();
     defer runtime.deinit(alloc);
     const id = lifecycleId(1, "late-terminal");
 
@@ -15703,7 +14499,7 @@ fn checkLateTerminalFallbackAllocationFailuresImpl(alloc: Allocator) !void {
         );
         var compact = try runtime.prepareTranscriptSource(std.testing.allocator, null);
         defer compact.deinit(std.testing.allocator);
-        try std.testing.expect(std.mem.find(u8, compact.bytes, "1 not executed") != null);
+        try std.testing.expect(std.mem.find(u8, compact.bytes, "Tool was not executed") != null);
         return err;
     };
 
@@ -15718,7 +14514,7 @@ fn checkLateTerminalFallbackAllocationFailuresImpl(alloc: Allocator) !void {
     try std.testing.expect(detail.fallback_disposition == null);
     var compact = try runtime.prepareTranscriptSource(std.testing.allocator, null);
     defer compact.deinit(std.testing.allocator);
-    try std.testing.expect(std.mem.find(u8, compact.bytes, "1 not executed") == null);
+    try std.testing.expect(std.mem.find(u8, compact.bytes, "Tool was not executed") == null);
     try std.testing.expect(std.mem.find(u8, compact.bytes, "Late completion") != null);
 }
 
@@ -15738,7 +14534,7 @@ test "late terminal fallback replacement is atomic across allocation failures" {
 }
 
 fn checkProvisionalTerminalAllocationFailuresImpl(alloc: Allocator) !void {
-    var runtime = lifecycleTestRuntime(null);
+    var runtime = lifecycleTestRuntime();
     defer runtime.deinit(alloc);
     const id = lifecycleId(1, "provisional-terminal");
 
@@ -15795,7 +14591,7 @@ test "provisional terminal admission is atomic across allocation failures" {
 }
 
 fn checkCommandProcessTerminalAllocationFailuresImpl(alloc: Allocator) !void {
-    var runtime = lifecycleTestRuntime(null);
+    var runtime = lifecycleTestRuntime();
     defer runtime.deinit(alloc);
     const id = lifecycleId(1, "command-process-terminal");
 
@@ -15857,11 +14653,11 @@ test "command process terminal admission is atomic across allocation failures" {
     );
 }
 
-test "capped parallel lifecycle progress keeps bounded allocations and pins" {
+test "parallel lifecycle progress keeps bounded allocations and pins" {
     const backing = testing_allocator.no_resize;
     var counted = std.testing.FailingAllocator.init(backing, .{});
     const alloc = counted.allocator();
-    var runtime = lifecycleTestRuntime(256);
+    var runtime = lifecycleTestRuntime();
     defer runtime.deinit(alloc);
 
     _ = try runtime.appendRawTranscriptEntryClassified(
@@ -15900,57 +14696,6 @@ test "capped parallel lifecycle progress keeps bounded allocations and pins" {
 }
 
 const call_ids = [_][]const u8{ "first", "second" };
-
-test "lifecycle pins survive low cap until batch cleanup restores prune eligibility" {
-    const alloc = std.testing.allocator;
-    var runtime = lifecycleTestRuntime(48);
-    defer runtime.deinit(alloc);
-
-    const first = try startLifecycle(&runtime, alloc, 1, call_ids[0]);
-    const second = try startLifecycle(&runtime, alloc, 1, call_ids[1]);
-    _ = try runtime.appendRawTranscriptEntryClassified(
-        alloc,
-        "ordinary output that creates retention pressure\n",
-        .subagent_status,
-    );
-
-    try std.testing.expectEqual(@as(usize, 2), runtime.lifecyclePinCount());
-    try std.testing.expect(transcriptContainsEntry(&runtime, first));
-    try std.testing.expect(transcriptContainsEntry(&runtime, second));
-
-    _ = try runtime.applyToolLifecycle(alloc, .{ .turn_finished = .{
-        .turn_id = 1,
-        .outcome = .completed,
-    } });
-    _ = try runtime.applyToolLifecycle(alloc, .{ .terminal = .{
-        .id = lifecycleId(1, "first"),
-        .outcome = .{ .kind = .completed, .summary = "● First complete" },
-    } });
-    try std.testing.expectEqual(@as(usize, 2), runtime.lifecyclePinCount());
-    var first_complete_expected: [128]u8 = undefined;
-    try std.testing.expectEqualStrings(
-        try std.mem.print(
-            &first_complete_expected,
-            "{s}●{s} First complete\n",
-            .{ ui_render.system_notice_text_style, ui_render.reset_style },
-        ),
-        runtime.notebook.entries.items[0].raw_bytes.bytes,
-    );
-
-    try runtime.finishLifecycleBatch(alloc);
-    _ = try runtime.appendRawTranscriptEntryClassified(
-        alloc,
-        "next ordinary retention pass\n",
-        .subagent_status,
-    );
-
-    try std.testing.expectEqual(@as(usize, 0), runtime.lifecyclePinCount());
-    try std.testing.expectEqual(@as(usize, 0), runtime.toolActivityRecordCount());
-    try std.testing.expect(
-        !transcriptContainsEntry(&runtime, first) or
-            !transcriptContainsEntry(&runtime, second),
-    );
-}
 
 test "streaming assistant finality releases complete rows and holds only the partial tail" {
     const alloc = std.testing.allocator;
@@ -16210,6 +14955,251 @@ test "finality floor holds unfenced tool turn across quiet ticks and settles aft
     try std.testing.expectEqual(settled.visual_offset, settled.history_visual_offset);
 }
 
+const debt_base_flow =
+    "row-00\nrow-01\nrow-02\nrow-03\n" ++
+    "row-04\nrow-05\nrow-06\nrow-07\n" ++
+    "row-08\nrow-09\nrow-10\nrow-11\n";
+const debt_mid_rows = "row-12\nrow-13\nrow-14\n";
+const debt_grown_flow = debt_base_flow ++ debt_mid_rows ++ "row-15\n";
+// Each rewrite changes the last row it has in common with the one before, so
+// it is not a prefix growth, and leaves the rows a replay would write intact.
+const debt_rewrite_1_flow = debt_base_flow ++ debt_mid_rows ++ "row-15 rewrite 1\n";
+const debt_rewrite_2_flow = debt_base_flow ++ debt_mid_rows ++ "row-15 rewrite 2\nrow-16\n";
+const debt_rewrite_3_flow = debt_base_flow ++ debt_mid_rows ++ "row-15 rewrite 3\nrow-16\nrow-17\n";
+const debt_growth_flow = debt_rewrite_2_flow ++ "row-17\n";
+
+const debt_history_for_test: u32 = 8;
+
+/// Leaves a stable anchor whose history trails the viewport by four rows, the
+/// way a recovery does: a frame whose terminal write fails leaves a receipt
+/// that owes rows, and the next frame, over a rewritten source, drops that
+/// debt and commits stable. The receipt keeps count of the rows it dropped,
+/// so the anchor carries the catch-up flag.
+fn leaveHistoryDebtForTest(runtime: *TranscriptRuntime, alloc: Allocator) !void {
+    var base = try testSource(alloc, debt_base_flow, runtime.layout.cols);
+    defer base.deinit(alloc);
+    var base_prepared = try prepareTestSourceForCurrentArea(runtime, alloc, &base);
+    defer base_prepared.deinit(alloc);
+    try commitPreparedForTest(runtime, alloc, &base, &base_prepared);
+
+    var grown = try testSource(alloc, debt_grown_flow, runtime.layout.cols);
+    defer grown.deinit(alloc);
+    var grown_prepared = try prepareTestSourceForCurrentArea(runtime, alloc, &grown);
+    defer grown_prepared.deinit(alloc);
+    try commitPreparedPartiallyForTest(runtime, alloc, &grown, &grown_prepared);
+    try std.testing.expectEqual(
+        transcript_runtime.TranscriptCommitDiagnosticState.recovering,
+        runtime.transcriptCommitDiagnostic().state,
+    );
+
+    var rewritten = try testSource(alloc, debt_rewrite_1_flow, runtime.layout.cols);
+    defer rewritten.deinit(alloc);
+    var rewritten_prepared = try prepareTestSourceForCurrentArea(runtime, alloc, &rewritten);
+    defer rewritten_prepared.deinit(alloc);
+    try commitPreparedForTest(runtime, alloc, &rewritten, &rewritten_prepared);
+    const anchor = runtime.transcript_commit_state.stable;
+    try std.testing.expectEqual(debt_history_for_test, anchor.history_visual_offset);
+    try std.testing.expectEqual(debt_history_for_test + 4, anchor.visual_offset);
+    try std.testing.expect(anchor.history_catchup_pending);
+    try std.testing.expect(!anchor.normal_buffer_recovery_pending);
+}
+
+/// Clears the catch-up flag of the anchor `leaveHistoryDebtForTest` leaves, so
+/// no frame is asked to replay the rows between its history and its viewport.
+/// A recovery from an invalid origin still leaves an anchor like that, and a
+/// frame over it must hold those rows instead of scrolling rows nothing writes.
+fn unflagHistoryDebtForTest(runtime: *TranscriptRuntime) void {
+    runtime.transcript_commit_state.stable.history_catchup_pending = false;
+}
+
+/// Commits one more rewritten frame over the debt. It cannot replay the owed
+/// rows, so it holds them and flags the next frame to replay.
+fn holdHistoryDebtForTest(runtime: *TranscriptRuntime, alloc: Allocator) !void {
+    var source = try testSource(alloc, debt_rewrite_2_flow, runtime.layout.cols);
+    defer source.deinit(alloc);
+    var prepared = try prepareTestSourceForCurrentArea(runtime, alloc, &source);
+    defer prepared.deinit(alloc);
+    try commitPreparedForTest(runtime, alloc, &source, &prepared);
+    const held = runtime.transcript_commit_state.stable;
+    try std.testing.expectEqual(debt_history_for_test, held.history_visual_offset);
+    try std.testing.expect(held.visual_offset > held.history_visual_offset);
+    try std.testing.expect(held.history_catchup_pending);
+}
+
+const DebtFrameForTest = struct {
+    semantic_rows: u32,
+    terminal_scroll_rows: u16,
+    appends: bool,
+    history_visual_offset: u32,
+};
+
+/// Plans and seals one frame over `flow` without committing it.
+fn sealDebtFrameForTest(
+    runtime: *TranscriptRuntime,
+    alloc: Allocator,
+    flow: []const u8,
+    destructive: bool,
+) !DebtFrameForTest {
+    var source = try testSource(alloc, flow, runtime.layout.cols);
+    defer source.deinit(alloc);
+    var prepared = try prepareTestSourceForCurrentArea(runtime, alloc, &source);
+    defer prepared.deinit(alloc);
+    const facts = runtime.planTranscriptScroll(&prepared);
+    const scroll_plan = render_engine.frame_scroll_plan.merge(
+        runtime.layout.rows,
+        runtime.owned_top_row,
+        0,
+        facts.planned_rows,
+    );
+    var plan = testPaintPlan(runtime, prepared.selection);
+    if (destructive) {
+        try plan.invalidation.append(.{
+            .reason = .external_clear,
+            .top = runtime.owned_top_row,
+            .bottom = runtime.layout.content_bottom,
+        });
+    }
+    var transition = try resolveAndSealTranscriptTransitionForTest(
+        runtime,
+        alloc,
+        &source,
+        &prepared,
+        render_engine.frame_layout.CommittedLayoutSnapshot.fromPaintPlan(plan),
+        &plan,
+        scroll_plan,
+    );
+    defer transition.deinit(alloc);
+    return .{
+        .semantic_rows = facts.semantic_rows,
+        .terminal_scroll_rows = scroll_plan.terminal_scroll_rows,
+        .appends = !transition.document_append.isEmpty(),
+        .history_visual_offset = transition.history_visual_offset,
+    };
+}
+
+fn expectDebtFrameHeld(frame: DebtFrameForTest) !void {
+    // Rows above the viewport sit on no screen, so a frame without a replay
+    // for them must not scroll them: the terminal would push blank rows into
+    // native scrollback and history would claim rows nothing wrote.
+    try std.testing.expectEqual(@as(u32, 0), frame.semantic_rows);
+    try std.testing.expectEqual(@as(u16, 0), frame.terminal_scroll_rows);
+    try std.testing.expect(!frame.appends);
+    try std.testing.expectEqual(debt_history_for_test, frame.history_visual_offset);
+}
+
+fn expectDebtFrameReplayed(frame: DebtFrameForTest) !void {
+    try std.testing.expect(frame.semantic_rows > 0);
+    try std.testing.expect(frame.terminal_scroll_rows > 0);
+    try std.testing.expect(frame.appends);
+    try std.testing.expect(frame.history_visual_offset > debt_history_for_test);
+}
+
+test "stable frame after a source rewrite scrolls no rows its anchor cannot replay" {
+    const alloc = std.testing.allocator;
+    var runtime = TranscriptRuntime{
+        .layout = transcriptTestLayout(20, 8, 4),
+        .owned_top_row = 1,
+    };
+    defer runtime.deinit(alloc);
+    try leaveHistoryDebtForTest(&runtime, alloc);
+    unflagHistoryDebtForTest(&runtime);
+
+    const frame = try sealDebtFrameForTest(&runtime, alloc, debt_rewrite_2_flow, false);
+    try expectDebtFrameHeld(frame);
+}
+
+test "stable frame under an external clear scrolls no rows its anchor cannot replay" {
+    const alloc = std.testing.allocator;
+    var runtime = TranscriptRuntime{
+        .layout = transcriptTestLayout(20, 8, 4),
+        .owned_top_row = 1,
+    };
+    defer runtime.deinit(alloc);
+    try leaveHistoryDebtForTest(&runtime, alloc);
+    unflagHistoryDebtForTest(&runtime);
+
+    const frame = try sealDebtFrameForTest(&runtime, alloc, debt_rewrite_2_flow, true);
+    try expectDebtFrameHeld(frame);
+}
+
+test "stable frame after a source rewrite replays the owed rows once a frame held them" {
+    const alloc = std.testing.allocator;
+    var runtime = TranscriptRuntime{
+        .layout = transcriptTestLayout(20, 8, 4),
+        .owned_top_row = 1,
+    };
+    defer runtime.deinit(alloc);
+    try leaveHistoryDebtForTest(&runtime, alloc);
+    unflagHistoryDebtForTest(&runtime);
+    try holdHistoryDebtForTest(&runtime, alloc);
+
+    const frame = try sealDebtFrameForTest(&runtime, alloc, debt_rewrite_3_flow, false);
+    try expectDebtFrameReplayed(frame);
+}
+
+test "stable frame under an external clear replays the owed rows once a frame held them" {
+    const alloc = std.testing.allocator;
+    var runtime = TranscriptRuntime{
+        .layout = transcriptTestLayout(20, 8, 4),
+        .owned_top_row = 1,
+    };
+    defer runtime.deinit(alloc);
+    try leaveHistoryDebtForTest(&runtime, alloc);
+    unflagHistoryDebtForTest(&runtime);
+    try holdHistoryDebtForTest(&runtime, alloc);
+
+    // The plan cannot see the invalidation, so the replay must not wait on it.
+    const frame = try sealDebtFrameForTest(&runtime, alloc, debt_rewrite_3_flow, true);
+    try expectDebtFrameReplayed(frame);
+}
+
+test "stable frame after a source rewrite replays the rows a recovered frame left owed" {
+    const alloc = std.testing.allocator;
+    var runtime = TranscriptRuntime{
+        .layout = transcriptTestLayout(20, 8, 4),
+        .owned_top_row = 1,
+    };
+    defer runtime.deinit(alloc);
+    try leaveHistoryDebtForTest(&runtime, alloc);
+
+    // The flag the dropped rows set needs no held frame first.
+    const frame = try sealDebtFrameForTest(&runtime, alloc, debt_rewrite_2_flow, false);
+    try expectDebtFrameReplayed(frame);
+}
+
+test "compatible stable frame without a replay range grants no owed rows" {
+    const alloc = std.testing.allocator;
+    var runtime = TranscriptRuntime{
+        .layout = transcriptTestLayout(20, 8, 4),
+        .owned_top_row = 1,
+    };
+    defer runtime.deinit(alloc);
+    try leaveHistoryDebtForTest(&runtime, alloc);
+    unflagHistoryDebtForTest(&runtime);
+    try holdHistoryDebtForTest(&runtime, alloc);
+    // The committed layout no longer matches the anchor, so neither a history
+    // replay nor an append on the retained screen can write the owed rows.
+    runtime.committed_frame_layout.layout_id +%= 1;
+
+    const frame = try sealDebtFrameForTest(&runtime, alloc, debt_growth_flow, false);
+    try expectDebtFrameHeld(frame);
+}
+
+test "history debt a stable frame could not write is replayed by the next frame" {
+    const alloc = std.testing.allocator;
+    var runtime = TranscriptRuntime{
+        .layout = transcriptTestLayout(20, 8, 4),
+        .owned_top_row = 1,
+    };
+    defer runtime.deinit(alloc);
+    try leaveHistoryDebtForTest(&runtime, alloc);
+    unflagHistoryDebtForTest(&runtime);
+    try holdHistoryDebtForTest(&runtime, alloc);
+
+    const frame = try sealDebtFrameForTest(&runtime, alloc, debt_growth_flow, false);
+    try expectDebtFrameReplayed(frame);
+}
+
 test "catch-up release materializes history before staging a larger finality hold" {
     const alloc = std.testing.allocator;
     const committed_flow =
@@ -16290,6 +15280,551 @@ test "catch-up release materializes history before staging a larger finality hol
         .rows => |rows| try std.testing.expectEqual(@as(u16, 3), rows),
         .remainder => return error.TestExpectedHistoryReplay,
     }
+}
+
+const recovered_base_flow =
+    "row-00\nrow-01\nrow-02\nrow-03\n" ++
+    "row-04\nrow-05\nrow-06\nrow-07\n" ++
+    "row-08\nrow-09\nrow-10\nrow-11\n";
+const recovered_mid_rows = "row-12\nrow-13\nrow-14\n";
+const recovered_grown_flow = recovered_base_flow ++ recovered_mid_rows ++ "row-15\n";
+// The rewrite changes the last row the receipt's flow ends with, so it is
+// not a prefix growth, and leaves every row a replay would write intact.
+const recovered_rewrite_flow = recovered_base_flow ++ recovered_mid_rows ++ "row-15 rewrite\n";
+const recovered_growth_flow = recovered_rewrite_flow ++ "row-16\n";
+
+/// Leaves the runtime recovering: a frame whose terminal write fails commits
+/// a receipt that owes the four rows it wanted to scroll.
+fn leaveRecoveringReceiptForTest(runtime: *TranscriptRuntime, alloc: Allocator) !void {
+    var base = try testSource(alloc, recovered_base_flow, runtime.layout.cols);
+    defer base.deinit(alloc);
+    var base_prepared = try prepareTestSourceForCurrentArea(runtime, alloc, &base);
+    defer base_prepared.deinit(alloc);
+    try commitPreparedForTest(runtime, alloc, &base, &base_prepared);
+
+    var grown = try testSource(alloc, recovered_grown_flow, runtime.layout.cols);
+    defer grown.deinit(alloc);
+    var grown_prepared = try prepareTestSourceForCurrentArea(runtime, alloc, &grown);
+    defer grown_prepared.deinit(alloc);
+    try commitPreparedPartiallyForTest(runtime, alloc, &grown, &grown_prepared);
+    try std.testing.expectEqual(
+        transcript_runtime.TranscriptCommitDiagnosticState.recovering,
+        runtime.transcriptCommitDiagnostic().state,
+    );
+}
+
+fn commitRecoveredFrameForTest(
+    runtime: *TranscriptRuntime,
+    alloc: Allocator,
+    flow: []const u8,
+) !void {
+    var source = try testSource(alloc, flow, runtime.layout.cols);
+    defer source.deinit(alloc);
+    var prepared = try prepareTestSourceForCurrentArea(runtime, alloc, &source);
+    defer prepared.deinit(alloc);
+    try commitPreparedForTest(runtime, alloc, &source, &prepared);
+}
+
+test "recovered frame that leaves history behind the viewport flags the debt" {
+    const alloc = std.testing.allocator;
+    var runtime = TranscriptRuntime{
+        .layout = transcriptTestLayout(20, 8, 4),
+        .owned_top_row = 1,
+    };
+    defer runtime.deinit(alloc);
+    try leaveRecoveringReceiptForTest(&runtime, alloc);
+
+    // The frame's source no longer extends the receipt's flow, so its plan
+    // drops the receipt's four rows (the store's own rewrite path is covered
+    // by the tests below) and it commits stable with them still above the
+    // viewport.
+    try commitRecoveredFrameForTest(&runtime, alloc, recovered_rewrite_flow);
+    const anchor = runtime.transcript_commit_state.stable;
+    try std.testing.expectEqual(@as(u32, 8), anchor.history_visual_offset);
+    try std.testing.expectEqual(@as(u32, 12), anchor.visual_offset);
+    try std.testing.expect(anchor.history_catchup_pending);
+}
+
+test "compatible growth after a recovered frame replays the rows it never wrote" {
+    const alloc = std.testing.allocator;
+    var runtime = TranscriptRuntime{
+        .layout = transcriptTestLayout(20, 8, 4),
+        .owned_top_row = 1,
+    };
+    defer runtime.deinit(alloc);
+    try leaveRecoveringReceiptForTest(&runtime, alloc);
+    try commitRecoveredFrameForTest(&runtime, alloc, recovered_rewrite_flow);
+
+    // Only compatible growth follows, and the finality floor sits at the
+    // target, so a frame that releases just the rows leaving the screen top
+    // would leave the gap in scrollback for good.
+    var source = try testSource(alloc, recovered_growth_flow, runtime.layout.cols);
+    defer source.deinit(alloc);
+    var prepared = try prepareTestSourceForCurrentArea(&runtime, alloc, &source);
+    defer prepared.deinit(alloc);
+    const facts = runtime.planTranscriptScroll(&prepared);
+    try std.testing.expect(facts.source_compatible);
+    const scroll_plan = render_engine.frame_scroll_plan.merge(
+        runtime.layout.rows,
+        runtime.owned_top_row,
+        0,
+        facts.planned_rows,
+    );
+    var plan = testPaintPlan(&runtime, prepared.selection);
+    var transition = try resolveAndSealTranscriptTransitionForTest(
+        &runtime,
+        alloc,
+        &source,
+        &prepared,
+        render_engine.frame_layout.CommittedLayoutSnapshot.fromPaintPlan(plan),
+        &plan,
+        scroll_plan,
+    );
+    defer transition.deinit(alloc);
+    try std.testing.expect(!transition.document_append.isEmpty());
+    try std.testing.expectEqual(transition.visual_offset, transition.history_visual_offset);
+}
+
+test "recovered frame that leaves no debt is not flagged" {
+    const alloc = std.testing.allocator;
+    var runtime = TranscriptRuntime{
+        .layout = transcriptTestLayout(20, 8, 4),
+        .owned_top_row = 1,
+    };
+    defer runtime.deinit(alloc);
+    try leaveRecoveringReceiptForTest(&runtime, alloc);
+
+    // The same flow again writes the rows the receipt owed.
+    try commitRecoveredFrameForTest(&runtime, alloc, recovered_grown_flow);
+    const anchor = runtime.transcript_commit_state.stable;
+    try std.testing.expectEqual(anchor.visual_offset, anchor.history_visual_offset);
+    try std.testing.expect(!anchor.history_catchup_pending);
+}
+
+fn reconcileRecoveredRewriteForTest(
+    runtime: *TranscriptRuntime,
+    mode: transcript_store.TranscriptSourceRewriteMode,
+) void {
+    runtime.reconcileTranscriptCommitSourceWithRewriteMode(
+        recovered_rewrite_flow,
+        false,
+        "test source rewrite",
+        mode,
+    );
+}
+
+fn expectRecoveringDebtDroppedForTest(runtime: *const TranscriptRuntime) !void {
+    // The store zeroed the receipt's debt before any frame saw the rewrite.
+    const receipt = runtime.transcript_commit_state.recovering;
+    try std.testing.expectEqual(@as(u32, 0), receipt.remaining_semantic_rows);
+    try std.testing.expect(receipt.projection_rebase_pending);
+}
+
+fn expectFlaggedDebtIsReplayedForTest(runtime: *TranscriptRuntime, alloc: Allocator) !void {
+    const anchor = runtime.transcript_commit_state.stable;
+    try std.testing.expectEqual(@as(u32, 8), anchor.history_visual_offset);
+    try std.testing.expectEqual(@as(u32, 12), anchor.visual_offset);
+    try std.testing.expect(anchor.history_catchup_pending);
+
+    var source = try testSource(alloc, recovered_growth_flow, runtime.layout.cols);
+    defer source.deinit(alloc);
+    var prepared = try prepareTestSourceForCurrentArea(runtime, alloc, &source);
+    defer prepared.deinit(alloc);
+    const facts = runtime.planTranscriptScroll(&prepared);
+    try std.testing.expect(facts.source_compatible);
+    const scroll_plan = render_engine.frame_scroll_plan.merge(
+        runtime.layout.rows,
+        runtime.owned_top_row,
+        0,
+        facts.planned_rows,
+    );
+    var plan = testPaintPlan(runtime, prepared.selection);
+    var transition = try resolveAndSealTranscriptTransitionForTest(
+        runtime,
+        alloc,
+        &source,
+        &prepared,
+        render_engine.frame_layout.CommittedLayoutSnapshot.fromPaintPlan(plan),
+        &plan,
+        scroll_plan,
+    );
+    defer transition.deinit(alloc);
+    try std.testing.expect(!transition.document_append.isEmpty());
+    try std.testing.expectEqual(transition.visual_offset, transition.history_visual_offset);
+}
+
+test "source rewrite through the store keeps the rows it dropped owed" {
+    const alloc = std.testing.allocator;
+    const modes = [_]transcript_store.TranscriptSourceRewriteMode{ .strict, .preserve_same_epoch };
+    for (modes) |mode| {
+        var runtime = TranscriptRuntime{
+            .layout = transcriptTestLayout(20, 8, 4),
+            .owned_top_row = 1,
+        };
+        defer runtime.deinit(alloc);
+        try leaveRecoveringReceiptForTest(&runtime, alloc);
+        reconcileRecoveredRewriteForTest(&runtime, mode);
+        try expectRecoveringDebtDroppedForTest(&runtime);
+
+        try commitRecoveredFrameForTest(&runtime, alloc, recovered_rewrite_flow);
+        try expectFlaggedDebtIsReplayedForTest(&runtime, alloc);
+    }
+}
+
+test "a second source rewrite over the zeroed receipt keeps the dropped rows owed" {
+    const alloc = std.testing.allocator;
+    var runtime = TranscriptRuntime{
+        .layout = transcriptTestLayout(20, 8, 4),
+        .owned_top_row = 1,
+    };
+    defer runtime.deinit(alloc);
+    try leaveRecoveringReceiptForTest(&runtime, alloc);
+    reconcileRecoveredRewriteForTest(&runtime, .strict);
+    // The receipt now owes nothing, so the second rewrite returns early and
+    // must not forget what the first one dropped.
+    reconcileRecoveredRewriteForTest(&runtime, .strict);
+    try expectRecoveringDebtDroppedForTest(&runtime);
+
+    try commitRecoveredFrameForTest(&runtime, alloc, recovered_rewrite_flow);
+    try expectFlaggedDebtIsReplayedForTest(&runtime, alloc);
+}
+
+test "a rewritten frame that is itself a partial write keeps the dropped rows owed" {
+    const alloc = std.testing.allocator;
+    var runtime = TranscriptRuntime{
+        .layout = transcriptTestLayout(20, 8, 4),
+        .owned_top_row = 1,
+    };
+    defer runtime.deinit(alloc);
+    try leaveRecoveringReceiptForTest(&runtime, alloc);
+    reconcileRecoveredRewriteForTest(&runtime, .strict);
+
+    var rewritten = try testSource(alloc, recovered_rewrite_flow, runtime.layout.cols);
+    defer rewritten.deinit(alloc);
+    var rewritten_prepared = try prepareTestSourceForCurrentArea(&runtime, alloc, &rewritten);
+    defer rewritten_prepared.deinit(alloc);
+    try commitPreparedPartiallyForTest(&runtime, alloc, &rewritten, &rewritten_prepared);
+    try expectRecoveringDebtDroppedForTest(&runtime);
+
+    // The next frame commits stable, and the count survived the receipt that
+    // was rebuilt in between.
+    try commitRecoveredFrameForTest(&runtime, alloc, recovered_rewrite_flow);
+    try expectFlaggedDebtIsReplayedForTest(&runtime, alloc);
+}
+
+test "a source rewrite over a receipt that owed nothing flags nothing" {
+    const alloc = std.testing.allocator;
+    var runtime = TranscriptRuntime{
+        .layout = transcriptTestLayout(20, 8, 4),
+        .owned_top_row = 1,
+    };
+    defer runtime.deinit(alloc);
+
+    // An invalid origin recovers with nothing owed: the rows above the
+    // viewport were never this runtime's to write.
+    var first = try testSource(alloc, recovered_base_flow, runtime.layout.cols);
+    defer first.deinit(alloc);
+    var first_prepared = try prepareTestSourceForCurrentArea(&runtime, alloc, &first);
+    defer first_prepared.deinit(alloc);
+    try commitPreparedPartiallyForTest(&runtime, alloc, &first, &first_prepared);
+    const receipt = runtime.transcript_commit_state.recovering;
+    try std.testing.expectEqual(@as(u32, 0), receipt.remaining_semantic_rows);
+
+    runtime.reconcileTranscriptCommitSourceWithRewriteMode(
+        recovered_rewrite_flow,
+        false,
+        "test source rewrite",
+        .strict,
+    );
+    try commitRecoveredFrameForTest(&runtime, alloc, recovered_rewrite_flow);
+    const anchor = runtime.transcript_commit_state.stable;
+    try std.testing.expect(anchor.history_visual_offset < anchor.visual_offset);
+    try std.testing.expect(!anchor.history_catchup_pending);
+}
+
+test "stable frame over an unflagged recovered anchor scrolls no rows above its viewport" {
+    const alloc = std.testing.allocator;
+    var runtime = TranscriptRuntime{
+        .layout = transcriptTestLayout(20, 8, 4),
+        .owned_top_row = 1,
+    };
+    defer runtime.deinit(alloc);
+
+    // The recovery of an invalid origin leaves history behind the viewport
+    // and nothing flagged to replay it.
+    var first = try testSource(alloc, recovered_base_flow, runtime.layout.cols);
+    defer first.deinit(alloc);
+    var first_prepared = try prepareTestSourceForCurrentArea(&runtime, alloc, &first);
+    defer first_prepared.deinit(alloc);
+    try commitPreparedPartiallyForTest(&runtime, alloc, &first, &first_prepared);
+    runtime.reconcileTranscriptCommitSourceWithRewriteMode(
+        recovered_rewrite_flow,
+        false,
+        "test source rewrite",
+        .strict,
+    );
+    try commitRecoveredFrameForTest(&runtime, alloc, recovered_rewrite_flow);
+    const anchor = runtime.transcript_commit_state.stable;
+    try std.testing.expect(anchor.history_visual_offset < anchor.visual_offset);
+    try std.testing.expect(!anchor.history_catchup_pending);
+
+    // Another rewrite has no replay for those rows, so its frame holds them.
+    const frame = try sealDebtFrameForTest(
+        &runtime,
+        alloc,
+        recovered_base_flow ++ recovered_mid_rows ++ "row-15 rewrite 2\nrow-16\n",
+        false,
+    );
+    try std.testing.expectEqual(@as(u32, 0), frame.semantic_rows);
+    try std.testing.expectEqual(@as(u16, 0), frame.terminal_scroll_rows);
+    try std.testing.expect(!frame.appends);
+    try std.testing.expectEqual(anchor.history_visual_offset, frame.history_visual_offset);
+}
+
+test "invalidating a receipt that holds a publication keeps its owed rows flagged" {
+    const alloc = std.testing.allocator;
+    var runtime = TranscriptRuntime{
+        .layout = transcriptTestLayout(20, 8, 4),
+        .owned_top_row = 1,
+    };
+    defer runtime.deinit(alloc);
+    try leaveRecoveringReceiptForTest(&runtime, alloc);
+    // Only a published projection makes the invalidation defer instead of
+    // resetting the anchor, so the receipt gets one.
+    runtime.transcript_commit_state.recovering.retention_identity.publication_entries =
+        try alloc.dupe(u32, &.{1});
+    runtime.committed_frame_layout.terminal_cols = 20;
+    runtime.committed_frame_layout.terminal_rows = 8;
+    runtime.invalidateTranscriptAnchor("test invalidation");
+
+    // The invalidation rebases the receipt but keeps the four rows it owes.
+    const receipt = runtime.transcript_commit_state.recovering;
+    try std.testing.expectEqual(@as(u32, 4), receipt.remaining_semantic_rows);
+    try std.testing.expect(receipt.projection_rebase_pending);
+
+    // The anchor it commits keeps them owed through the restore and catch-up
+    // flags, so no gap stays behind.
+    try commitRecoveredFrameForTest(&runtime, alloc, recovered_grown_flow);
+    const anchor = runtime.transcript_commit_state.stable;
+    try std.testing.expect(anchor.normal_buffer_recovery_pending);
+    try std.testing.expect(anchor.history_catchup_pending);
+}
+
+// Rows of 19 characters fit 20 columns and wrap to two rows at 12 columns.
+fn wrappedRowsFlow(comptime first: usize, comptime last: usize) []const u8 {
+    comptime var flow: []const u8 = "";
+    inline for (first..last + 1) |n| {
+        flow = flow ++ std.fmt.comptimePrint("row-{d:0>2} aaaaaaaaaaaa\n", .{n});
+    }
+    return flow;
+}
+
+const wrapped_base_flow = wrappedRowsFlow(0, 11);
+const wrapped_grown_flow = wrapped_base_flow ++ wrappedRowsFlow(12, 15);
+const wrapped_rewrite_flow = wrapped_base_flow ++ wrappedRowsFlow(12, 14) ++ "row-15 bbbbbbbbbbbb\n";
+const wrapped_grown_next_flow = wrapped_grown_flow ++ wrappedRowsFlow(16, 16);
+const wrapped_rewrite_next_flow = wrapped_rewrite_flow ++ wrappedRowsFlow(16, 16);
+
+/// Leaves the runtime recovering with the four owed rows, like
+/// `leaveRecoveringReceiptForTest`, for rows that wrap when the width shrinks.
+fn leaveWrappedRecoveringReceiptForTest(runtime: *TranscriptRuntime, alloc: Allocator) !void {
+    var base = try testSource(alloc, wrapped_base_flow, runtime.layout.cols);
+    defer base.deinit(alloc);
+    var base_prepared = try prepareTestSourceForCurrentArea(runtime, alloc, &base);
+    defer base_prepared.deinit(alloc);
+    try commitPreparedForTest(runtime, alloc, &base, &base_prepared);
+
+    var grown = try testSource(alloc, wrapped_grown_flow, runtime.layout.cols);
+    defer grown.deinit(alloc);
+    var grown_prepared = try prepareTestSourceForCurrentArea(runtime, alloc, &grown);
+    defer grown_prepared.deinit(alloc);
+    try commitPreparedPartiallyForTest(runtime, alloc, &grown, &grown_prepared);
+    try std.testing.expectEqual(
+        transcript_runtime.TranscriptCommitDiagnosticState.recovering,
+        runtime.transcriptCommitDiagnostic().state,
+    );
+}
+
+fn commitWrappedFrameForTest(
+    runtime: *TranscriptRuntime,
+    alloc: Allocator,
+    flow: []const u8,
+    partial: bool,
+) !void {
+    var source = try testSource(alloc, flow, runtime.layout.cols);
+    defer source.deinit(alloc);
+    var prepared = try prepareTestSourceForCurrentArea(runtime, alloc, &source);
+    defer prepared.deinit(alloc);
+    if (partial) {
+        try commitPreparedPartiallyForTest(runtime, alloc, &source, &prepared);
+    } else {
+        try commitPreparedForTest(runtime, alloc, &source, &prepared);
+    }
+}
+
+const ResizeCase = struct {
+    cols: u16,
+    history_row_delta: ?i32,
+};
+
+/// A width where every row wraps with its measured history delta, the same
+/// width with a delta that is still pending, and a width change the terminal
+/// could not measure.
+const resize_cases = [_]ResizeCase{
+    .{ .cols = 12, .history_row_delta = 8 },
+    .{ .cols = 12, .history_row_delta = null },
+    .{ .cols = 20, .history_row_delta = 3 },
+};
+
+/// Resizes, commits a partial resize frame and then the settled frame, and
+/// checks that nothing is flagged and the next growth frame does not write
+/// rows again that the old width already put in scrollback.
+fn expectResizeSettlesWithoutReplayForTest(
+    runtime: *TranscriptRuntime,
+    alloc: Allocator,
+    flow: []const u8,
+    next_flow: []const u8,
+    resize: ResizeCase,
+) !void {
+    runtime.layout = transcriptTestLayout(resize.cols, 8, 4);
+    runtime.resize_history_row_delta = resize.history_row_delta;
+    try commitWrappedFrameForTest(runtime, alloc, flow, true);
+    runtime.resize_history_row_delta = null;
+    try commitWrappedFrameForTest(runtime, alloc, flow, false);
+    const anchor = runtime.transcript_commit_state.stable;
+    try std.testing.expect(!anchor.history_catchup_pending);
+
+    var source = try testSource(alloc, next_flow, runtime.layout.cols);
+    defer source.deinit(alloc);
+    var prepared = try prepareTestSourceForCurrentArea(runtime, alloc, &source);
+    defer prepared.deinit(alloc);
+    const facts = runtime.planTranscriptScroll(&prepared);
+    const scroll_plan = render_engine.frame_scroll_plan.merge(
+        runtime.layout.rows,
+        runtime.owned_top_row,
+        0,
+        facts.planned_rows,
+    );
+    var plan = testPaintPlan(runtime, prepared.selection);
+    var transition = try resolveAndSealTranscriptTransitionForTest(
+        runtime,
+        alloc,
+        &source,
+        &prepared,
+        render_engine.frame_layout.CommittedLayoutSnapshot.fromPaintPlan(plan),
+        &plan,
+        scroll_plan,
+    );
+    defer transition.deinit(alloc);
+    // Rows 4 to 7 were already in scrollback at the old width.
+    try std.testing.expect(std.mem.find(u8, transition.document_append.bytes, "row-04") == null);
+}
+
+test "a width resize leaves the rows a rewrite left owed at the old width alone" {
+    const alloc = std.testing.allocator;
+    for (resize_cases) |resize| {
+        var runtime = TranscriptRuntime{
+            .layout = transcriptTestLayout(20, 8, 4),
+            .owned_top_row = 1,
+        };
+        defer runtime.deinit(alloc);
+        try leaveWrappedRecoveringReceiptForTest(&runtime, alloc);
+        runtime.reconcileTranscriptCommitSourceWithRewriteMode(
+            wrapped_rewrite_flow,
+            false,
+            "test source rewrite",
+            .strict,
+        );
+        try expectResizeSettlesWithoutReplayForTest(
+            &runtime,
+            alloc,
+            wrapped_rewrite_flow,
+            wrapped_rewrite_next_flow,
+            resize,
+        );
+    }
+}
+
+test "a width resize leaves the rows a partial write left owed at the old width alone" {
+    const alloc = std.testing.allocator;
+    for (resize_cases) |resize| {
+        var runtime = TranscriptRuntime{
+            .layout = transcriptTestLayout(20, 8, 4),
+            .owned_top_row = 1,
+        };
+        defer runtime.deinit(alloc);
+        try leaveWrappedRecoveringReceiptForTest(&runtime, alloc);
+        // A terminal reset keeps a receipt that holds a publication and rebases
+        // it, and the first frame after the resize then drops its rows.
+        runtime.transcript_commit_state.recovering.retention_identity.publication_entries =
+            try alloc.dupe(u32, &.{1});
+        runtime.committed_frame_layout.terminal_cols = 20;
+        runtime.committed_frame_layout.terminal_rows = 8;
+        runtime.invalidateTranscriptAnchor("test terminal reset");
+        runtime.terminal_reset_pending = true;
+        try expectResizeSettlesWithoutReplayForTest(
+            &runtime,
+            alloc,
+            wrapped_grown_flow,
+            wrapped_grown_next_flow,
+            resize,
+        );
+    }
+}
+
+test "a retry that writes some owed rows before a rewrite replays only the rest" {
+    const alloc = std.testing.allocator;
+    var runtime = TranscriptRuntime{
+        .layout = transcriptTestLayout(20, 8, 4),
+        .owned_top_row = 1,
+    };
+    defer runtime.deinit(alloc);
+    try leaveRecoveringReceiptForTest(&runtime, alloc);
+
+    // The retry writes two of the four owed rows.
+    _ = try consumeRendererRecoveryAttempt(
+        &runtime,
+        alloc,
+        recovered_grown_flow,
+        2,
+        .terminal_partial_write,
+    );
+    const receipt = runtime.transcript_commit_state.recovering;
+    try std.testing.expectEqual(@as(u32, 2), receipt.remaining_semantic_rows);
+    try std.testing.expectEqual(@as(u32, 10), receipt.accepted_history_visual_offset);
+
+    reconcileRecoveredRewriteForTest(&runtime, .strict);
+    try commitRecoveredFrameForTest(&runtime, alloc, recovered_rewrite_flow);
+    const anchor = runtime.transcript_commit_state.stable;
+    try std.testing.expectEqual(@as(u32, 10), anchor.history_visual_offset);
+    try std.testing.expectEqual(@as(u32, 12), anchor.visual_offset);
+    try std.testing.expect(anchor.history_catchup_pending);
+
+    var source = try testSource(alloc, recovered_growth_flow, runtime.layout.cols);
+    defer source.deinit(alloc);
+    var prepared = try prepareTestSourceForCurrentArea(&runtime, alloc, &source);
+    defer prepared.deinit(alloc);
+    const facts = runtime.planTranscriptScroll(&prepared);
+    const scroll_plan = render_engine.frame_scroll_plan.merge(
+        runtime.layout.rows,
+        runtime.owned_top_row,
+        0,
+        facts.planned_rows,
+    );
+    var plan = testPaintPlan(&runtime, prepared.selection);
+    var transition = try resolveAndSealTranscriptTransitionForTest(
+        &runtime,
+        alloc,
+        &source,
+        &prepared,
+        render_engine.frame_layout.CommittedLayoutSnapshot.fromPaintPlan(plan),
+        &plan,
+        scroll_plan,
+    );
+    defer transition.deinit(alloc);
+    // Rows 8 and 9 were written by the retry, so the replay starts at row 10.
+    try std.testing.expect(std.mem.startsWith(u8, transition.document_append.bytes, "row-10"));
+    try std.testing.expect(std.mem.find(u8, transition.document_append.bytes, "row-09") == null);
 }
 
 test "partial finality release bounds append before staging withheld viewport" {
@@ -16408,6 +15943,153 @@ test "recovery growth does not release rows past the finality floor" {
     try std.testing.expectEqual(@as(u32, 8), facts.target_visual_offset);
     try std.testing.expectEqual(@as(u32, 0), facts.semantic_rows);
     try std.testing.expectEqual(@as(u32, 0), facts.semantic_progress_rows);
+    try std.testing.expectEqual(@as(u16, 0), facts.planned_rows);
+}
+
+const rebase_retained_attempt_flow =
+    "row-00\nrow-01\nrow-02\nrow-03\n" ++
+    "row-04\nrow-05\nrow-06\nrow-07\n";
+const rebase_retained_grown_flow = rebase_retained_attempt_flow ++
+    "row-08\nrow-09\nrow-10\nrow-11\n";
+
+/// Leaves the runtime holding the receipt of a partial frame that still owes
+/// four semantic rows.
+fn installRetainedRowsReceiptForTest(
+    runtime: *TranscriptRuntime,
+    alloc: Allocator,
+    rebase_pending: bool,
+) !void {
+    runtime.transcript_commit_state = .{
+        .recovering = .{
+            .accepted_visual_offset = 4,
+            .accepted_history_visual_offset = 4,
+            .attempt_visual_offset = 4,
+            .attempt_total_visual_rows = 8,
+            .materialized_visual_offset = 4,
+            .materialized_visual_rows = 4,
+            .materialized_flow_len = if (rebase_pending) null else rebase_retained_attempt_flow.len,
+            .remaining_semantic_rows = 4,
+            .remaining_semantic_progress_rows = if (rebase_pending) 0 else 4,
+            .attempt_cols = 20,
+            .projection_rebase_pending = rebase_pending,
+            .tracks_semantic_progress = !rebase_pending,
+            .flow = try alloc.dupe(u8, rebase_retained_attempt_flow),
+            .cursor_row = 4,
+            .cursor_col = 1,
+            // A rebase frame defers history it could not write.
+            .normal_buffer_recovery_pending = rebase_pending,
+        },
+    };
+}
+
+test "rebase receipt without publication entries plans no retained scroll rows" {
+    const alloc = std.testing.allocator;
+    var runtime = TranscriptRuntime{
+        .layout = transcriptTestLayout(20, 8, 4),
+        .owned_top_row = 1,
+    };
+    defer runtime.deinit(alloc);
+    try installRetainedRowsReceiptForTest(&runtime, alloc, true);
+
+    var source = try testSource(alloc, rebase_retained_grown_flow, runtime.layout.cols);
+    defer source.deinit(alloc);
+    var prepared = try prepareTestSourceForCurrentArea(&runtime, alloc, &source);
+    defer prepared.deinit(alloc);
+
+    // A rebase receipt can append only through its publication replay. With
+    // none, the retained rows cannot be written, so scrolling them would push
+    // blank rows into native scrollback while history stays behind.
+    const facts = runtime.planTranscriptScroll(&prepared);
+    try std.testing.expect(facts.source_compatible);
+    try std.testing.expect(facts.recovery_rebase);
+    try std.testing.expectEqual(@as(u32, 0), facts.semantic_rows);
+    try std.testing.expectEqual(@as(u16, 0), facts.planned_rows);
+}
+
+test "frame from a rebase receipt without publication entries scrolls only rows it writes" {
+    const alloc = std.testing.allocator;
+    var runtime = TranscriptRuntime{
+        .layout = transcriptTestLayout(20, 8, 4),
+        .owned_top_row = 1,
+    };
+    defer runtime.deinit(alloc);
+    try installRetainedRowsReceiptForTest(&runtime, alloc, true);
+
+    var source = try testSource(alloc, rebase_retained_grown_flow, runtime.layout.cols);
+    defer source.deinit(alloc);
+    var prepared = try prepareTestSourceForCurrentArea(&runtime, alloc, &source);
+    defer prepared.deinit(alloc);
+
+    const facts = runtime.planTranscriptScroll(&prepared);
+    const scroll_plan = render_engine.frame_scroll_plan.merge(
+        runtime.layout.rows,
+        runtime.owned_top_row,
+        0,
+        facts.planned_rows,
+    );
+    var plan = testPaintPlan(&runtime, prepared.selection);
+    var transition = try resolveAndSealTranscriptTransitionForTest(
+        &runtime,
+        alloc,
+        &source,
+        &prepared,
+        render_engine.frame_layout.CommittedLayoutSnapshot.fromPaintPlan(plan),
+        &plan,
+        scroll_plan,
+    );
+    defer transition.deinit(alloc);
+
+    // No append base exists for this receipt, so history stays where it was.
+    // Scrolling the terminal anyway would push blank rows into native
+    // scrollback, and the next frame would write the same rows again.
+    try std.testing.expect(transition.document_append.isEmpty());
+    try std.testing.expectEqual(@as(u32, 4), transition.history_visual_offset);
+    try std.testing.expectEqual(@as(u16, 0), scroll_plan.terminal_scroll_rows);
+}
+
+test "progress receipt keeps planning its retained scroll rows on growth" {
+    const alloc = std.testing.allocator;
+    var runtime = TranscriptRuntime{
+        .layout = transcriptTestLayout(20, 8, 4),
+        .owned_top_row = 1,
+    };
+    defer runtime.deinit(alloc);
+    try installRetainedRowsReceiptForTest(&runtime, alloc, false);
+
+    var source = try testSource(alloc, rebase_retained_grown_flow, runtime.layout.cols);
+    defer source.deinit(alloc);
+    var prepared = try prepareTestSourceForCurrentArea(&runtime, alloc, &source);
+    defer prepared.deinit(alloc);
+
+    const facts = runtime.planTranscriptScroll(&prepared);
+    try std.testing.expect(facts.source_compatible);
+    try std.testing.expect(!facts.recovery_rebase);
+    try std.testing.expect(facts.semantic_rows >= 4);
+    try std.testing.expect(facts.planned_rows > 0);
+}
+
+test "rebase receipt with publication entries also releases no retained scroll rows" {
+    const alloc = std.testing.allocator;
+    var runtime = TranscriptRuntime{
+        .layout = transcriptTestLayout(20, 8, 4),
+        .owned_top_row = 1,
+    };
+    defer runtime.deinit(alloc);
+    try installRetainedRowsReceiptForTest(&runtime, alloc, true);
+    runtime.transcript_commit_state.recovering.retention_identity.publication_entries =
+        try alloc.dupe(u32, &.{1});
+    runtime.committed_frame_layout.terminal_cols = 20;
+    runtime.committed_frame_layout.terminal_rows = 8;
+
+    var source = try testSource(alloc, rebase_retained_grown_flow, runtime.layout.cols);
+    defer source.deinit(alloc);
+    var prepared = try prepareTestSourceForCurrentArea(&runtime, alloc, &source);
+    defer prepared.deinit(alloc);
+
+    // The publication hold already releases nothing for a rebase receipt.
+    const facts = runtime.planTranscriptScroll(&prepared);
+    try std.testing.expectEqual(true, facts.recovery_rebase);
+    try std.testing.expectEqual(@as(u32, 0), facts.semantic_rows);
     try std.testing.expectEqual(@as(u16, 0), facts.planned_rows);
 }
 
@@ -16536,6 +16218,29 @@ test "recorded tool finality does not depend on the current turn watermark" {
             try std.testing.expectEqualStrings("saved-write", archived_id.call_id);
         }
     }
+}
+
+test "a provisional call's detail is streaming until the call starts" {
+    const alloc = std.testing.allocator;
+    var runtime = TranscriptRuntime{ .layout = transcriptTestLayout(88, 24, 20) };
+    defer runtime.deinit(alloc);
+    const id = types.ToolLifecycleId{ .turn_id = 1, .call_id = "streaming-read" };
+    _ = try runtime.applyToolLifecycle(alloc, .{ .provisional = .{
+        .id = id,
+        .presentation_group_id = null,
+        .tool_name = "read_file",
+        .activity_kind = .read,
+    } });
+    try std.testing.expectEqual(@as(usize, 1), runtime.notebook.tool_details.items.len);
+    try std.testing.expect(runtime.notebook.tool_details.items[0].streaming);
+    _ = try runtime.applyToolLifecycle(alloc, .{ .authoritative_started = .{
+        .id = id,
+        .reconciles_provisional_call_id = null,
+        .tool_name = "read_file",
+        .activity_kind = .read,
+    } });
+    try std.testing.expectEqual(@as(usize, 1), runtime.notebook.tool_details.items.len);
+    try std.testing.expect(!runtime.notebook.tool_details.items[0].streaming);
 }
 
 test "recorded tool finality stays independent of a live turn with the same number" {
@@ -16676,12 +16381,12 @@ test "finality candidates anchor a fully grouped turn at its newest rendered gro
     try std.testing.expect(source.finality.mutation_pin_start == null);
 
     const group_a_header = try alloc.print(
-        "{s}●\x1b[0m {s}3 tool calls · 3 read\x1b[0m",
+        "{s}●\x1b[0m {s}Read files\x1b[0m",
         .{ user_message_card.promptMarkerStyle(), ui_render.statusline_style },
     );
     defer alloc.free(group_a_header);
     const group_b_header = try alloc.print(
-        "{s}●\x1b[0m {s}1 tool call · 1 read\x1b[0m",
+        "{s}●\x1b[0m {s}Read finality fixture\x1b[0m",
         .{ user_message_card.promptMarkerStyle(), ui_render.statusline_style },
     );
     defer alloc.free(group_b_header);
@@ -16717,7 +16422,7 @@ test "finality candidates keep a mixed legacy turn at its earliest rendered tool
     try std.testing.expect(source.finality.mutation_pin_start == null);
 
     const group_a_header = try alloc.print(
-        "{s}●\x1b[0m {s}1 tool call · 1 read\x1b[0m",
+        "{s}●\x1b[0m {s}Read finality fixture\x1b[0m",
         .{ user_message_card.promptMarkerStyle(), ui_render.statusline_style },
     );
     defer alloc.free(group_a_header);
@@ -16853,4 +16558,109 @@ test "retint rewrites custom theme colors on a variant flip" {
     try std.testing.expect(std.mem.find(u8, muted, "\x1b[38;5;89mMuted row") != null);
     try std.testing.expect(std.mem.find(u8, muted, "\x1b[38;5;90mKeyword row") != null);
     try std.testing.expect(std.mem.find(u8, muted, "\x1b[38;5;201muser output") != null);
+}
+
+test "retint rewrites inline code and links inside table cells" {
+    const alloc = std.testing.allocator;
+    const assistant_presentation = @import("../../core/agent/assistant_presentation.zig");
+    var runtime = TranscriptRuntime{
+        .layout = transcriptTestLayout(80, 14, 10),
+        .owned_top_row = 1,
+    };
+    defer runtime.deinit(alloc);
+    try runtime.enableShadowVt(alloc);
+
+    var custom_dark = shared_theme.fx_dark;
+    custom_dark.name = "probe-dark";
+    custom_dark.inline_code_open = "\x1b[38;2;136;192;208m";
+    custom_dark.link_style = "\x1b[38;2;129;161;193m";
+    var custom_light = shared_theme.fx_light;
+    custom_light.name = "probe-light";
+    custom_light.inline_code_open = "\x1b[38;2;23;108;116m";
+    custom_light.link_style = "\x1b[38;2;0;100;176m";
+
+    // The table renders its cells in the theme active when it finishes.
+    const previous = shared_theme.current();
+    shared_theme.activate(custom_dark);
+    assistant_presentation.applyTheme(custom_dark);
+    defer {
+        shared_theme.activate(previous);
+        assistant_presentation.applyTheme(previous);
+    }
+    var table = try assistant_presentation.parseTablePayload(
+        alloc,
+        "| Command | Docs |\n" ++
+            "|---------|------|\n" ++
+            "| `zig build` | [guide](https://example.com/guide) |\n",
+    );
+    _ = runtime.appendAssistantTableOwned(alloc, table) catch |err| {
+        table.deinit(alloc);
+        return err;
+    };
+    const drawn = runtime.notebook.transcript.items;
+    try std.testing.expect(std.mem.find(u8, drawn, "\x1b[38;2;136;192;208mzig build") != null);
+    try std.testing.expect(std.mem.find(u8, drawn, "\x1b[38;2;129;161;193m") != null);
+
+    try runtime.retintEntriesForTheme(alloc, custom_dark, custom_light);
+
+    const retinted = runtime.notebook.transcript.items;
+    try std.testing.expect(std.mem.find(u8, retinted, "\x1b[38;2;23;108;116mzig build") != null);
+    try std.testing.expect(std.mem.find(u8, retinted, "\x1b[38;2;0;100;176m") != null);
+    try std.testing.expect(std.mem.find(u8, retinted, "136;192;208") == null);
+    try std.testing.expect(std.mem.find(u8, retinted, "129;161;193") == null);
+}
+
+test "rewrite publication keeps the frozen prefix when a finished turn holds a hidden notice" {
+    const alloc = std.testing.allocator;
+    const source_preparation = @import("source_preparation.zig");
+    const frozen_prefix = @import("frozen_prefix.zig");
+    var runtime = TranscriptRuntime{
+        .layout = .{ .cols = 80, .rows = 24, .content_bottom = 20, .divider_top_row = 21, .input_row = 22, .divider_bottom_row = 23, .hint_row = 24 },
+        .detached_commit_alloc = alloc,
+        .committed_frame_layout = .{ .terminal_cols = 80, .terminal_rows = 24 },
+    };
+    defer runtime.deinit(alloc);
+    // A finished turn whose model call left a full-detail line, which the
+    // inline transcript never draws.
+    for (0..8) |_| _ = try runtime.appendRawTranscriptEntryClassified(alloc, "historical row\n", .unknown_raw);
+    _ = try transcript_store.appendSemanticNoticeAtomic(&runtime, alloc, .{
+        .topic = "model call",
+        .tone = .neutral,
+        .body = "12:00:01 PM · model",
+        .visibility = .full_only,
+    });
+    _ = try runtime.appendTurnSummaryEntry(alloc, .{ .turn_duration_ms = 1200 });
+    const live_id = try runtime.appendRawTranscriptEntryClassified(alloc, "live row\n", .unknown_raw);
+    _ = try runtime.appendRawTranscriptEntryClassified(alloc, "next live row\n", .unknown_raw);
+    var source = try source_preparation.prepareRetentionSource(&runtime, alloc);
+    defer source.deinit(alloc);
+    runtime.transcript_commit_state = .{ .stable = .{
+        .flow = try alloc.dupe(u8, source.bytes),
+        .retention_identity = try source_preparation.RetentionIdentity.capture(&runtime, alloc, &source),
+        .visual_offset = 0,
+        .history_visual_offset = 0,
+        .total_visual_rows = source.transcript_visual_row_offsets[source.transcript_visual_row_offsets.len - 1],
+        .selection = .{ .start_line = 0, .top_row = 1, .bottom_row = 20, .partial_skip_rows = 0, .line_count = 20 },
+        .cursor_row = 12,
+        .cursor_col = 1,
+        .occupied_last_row = 12,
+        .occupied_last_row_blank = false,
+        .layout_id = 0,
+    } };
+    var captured = try source_preparation.prepareTranscriptSource(&runtime, alloc, null);
+    captured.deinit(alloc);
+    const boundary = frozen_prefix.boundary(runtime.notebook.entries.items);
+    try std.testing.expect(boundary > 0);
+
+    // Dropping a live row changes the entries, so its commit rebases the
+    // committed flow over a copy of the transcript.
+    try std.testing.expect(try transcript_store.dropEntriesAtomic(&runtime, alloc, &.{live_id}));
+
+    // That copy left the live prefix in place: the next frame resumes after it.
+    const slot = runtime.frozen_prefix.slots[@backingInt(frozen_prefix.Mode.prepared)] orelse return error.NoPrefix;
+    try std.testing.expectEqual(boundary, slot.state.entry_count);
+    const misses = runtime.frozen_prefix.misses;
+    var resumed = try source_preparation.prepareTranscriptSource(&runtime, alloc, null);
+    resumed.deinit(alloc);
+    try std.testing.expectEqual(misses, runtime.frozen_prefix.misses);
 }

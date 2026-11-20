@@ -108,7 +108,7 @@ for (const expected of ["first question", "first answer", "second question"]) {
 runtime.write("\x0f");
 await waitFor(() => terminal.buffer.active.type === "alternate", "full transcript alternate screen");
 runtime.write("\x1b[C");
-await waitFor(() => grid().includes("full detail"), "full transcript detail");
+await waitFor(() => grid().includes("esc close · pgup/pgdn scroll"), "full transcript detail");
 runtime.write("\x0f");
 await waitFor(() => terminal.buffer.active.type === "normal", "full transcript close");
 

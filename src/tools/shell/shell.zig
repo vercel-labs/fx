@@ -94,27 +94,49 @@ pub fn actionFieldContract(action: Action) ActionFieldContract {
 
 /// Names the action of a call that omits `action` when exactly one action
 /// takes every field it sends and gets every field it requires. Fields that
-/// decode treats as absent, null or the text "null", are ignored. A bare
-/// session_id fits both interact and stop, so it names neither. The
-/// orchestrator adds the result before the call is stored or admitted, so
-/// permission admission and decode read the same arguments
+/// decode treats as absent, null or the text "null", are ignored. When no
+/// action fits, a second pass also ignores known fields set to an empty
+/// value that the action does not take, which decode drops for that action;
+/// a call that fits today keeps its action. A bare session_id fits both
+/// interact and stop, so it names neither. The orchestrator adds the result
+/// before the call is stored or admitted, so permission admission and decode
+/// read the same arguments
 /// (`tests/tla/shell_command/ShellContract.tla` AdmissionConsistency).
 pub fn inferAction(object: std.json.ObjectMap) ?[]const u8 {
     if (object.get("action") != null) return null;
-    var found: ?Action = null;
-    for (std.enums.values(Action)) |action| {
-        if (!fieldsFitAction(object, actionFieldContract(action))) continue;
-        if (found != null) return null;
-        found = action;
-    }
-    return if (found) |action| @tagName(action) else null;
+    return switch (fittingAction(object, .counted)) {
+        .one => |action| @tagName(action),
+        .several => null,
+        .none => switch (fittingAction(object, .ignored_outside_action)) {
+            .one => |action| @tagName(action),
+            .several, .none => null,
+        },
+    };
 }
 
-fn fieldsFitAction(object: std.json.ObjectMap, contract: ActionFieldContract) bool {
+const Fit = union(enum) { none, one: Action, several };
+
+/// Whether an empty field the action does not take stops the action from
+/// fitting (`counted`) or is skipped as decode would drop it.
+const EmptyFields = enum { counted, ignored_outside_action };
+
+fn fittingAction(object: std.json.ObjectMap, empty_fields: EmptyFields) Fit {
+    var found: ?Action = null;
+    for (std.enums.values(Action)) |action| {
+        if (!fieldsFitAction(object, actionFieldContract(action), empty_fields)) continue;
+        if (found != null) return .several;
+        found = action;
+    }
+    return if (found) |action| .{ .one = action } else .none;
+}
+
+fn fieldsFitAction(object: std.json.ObjectMap, contract: ActionFieldContract, empty_fields: EmptyFields) bool {
     var fields = object.iterator();
     while (fields.next()) |entry| {
         if (isAbsentValue(entry.value_ptr.*)) continue;
-        if (!containsFieldName(contract.allowed, entry.key_ptr.*)) return false;
+        if (containsFieldName(contract.allowed, entry.key_ptr.*)) continue;
+        if (empty_fields == .ignored_outside_action and isDroppableOutsideAction(entry.key_ptr.*, entry.value_ptr.*)) continue;
+        return false;
     }
     for (contract.required) |name| {
         if (std.mem.eql(u8, name, "action")) continue;
@@ -127,6 +149,60 @@ fn fieldsFitAction(object: std.json.ObjectMap, contract: ActionFieldContract) bo
 fn isAbsentValue(value: std.json.Value) bool {
     return value == .null or
         (value == .string and tool_args.isNullPlaceholderText(value.string));
+}
+
+/// A known shell field with an empty value (`tool_args.isEmptyArgumentValue`)
+/// means the same as leaving it out for an action that does not take it.
+/// Unknown names still reach the field check, since they can carry intent
+/// that dropping would lose.
+fn isDroppableOutsideAction(name: []const u8, value: std.json.Value) bool {
+    return containsFieldName(public_field_names[1..], name) and tool_args.isEmptyArgumentValue(value);
+}
+
+/// A run without a terminal uses the login shell and `profile`, which is
+/// also what permission admission checks, and `shell` applies only with
+/// tty=true. Some models send a `shell` that names the login shell anyway,
+/// often beside `profile`; that `shell` changes nothing, so it is dropped
+/// rather than rejected or reported as a conflict. It stays when it names
+/// another shell, or when its clean_start asks for a clean start that
+/// `profile` does not, since running then would not do what was asked.
+fn elideLoginShellOnPlainRun(object: *std.json.ObjectMap, action: Action, login_shell: ?[]const u8) void {
+    if (action != .run) return;
+    const login = login_shell orelse return;
+    if (object.get("tty")) |tty| if (tty != .bool or tty.bool) return;
+    const profile: ?[]const u8 = if (object.get("profile")) |value| switch (value) {
+        .string => |text| text,
+        else => return,
+    } else null;
+    const shell = object.get("shell") orelse return;
+    if (shell != .object) return;
+    const kind = shell.object.get("kind") orelse return;
+    const path = shell.object.get("path") orelse return;
+    if (kind != .string or !std.mem.eql(u8, kind.string, "executable")) return;
+    if (path != .string or !std.mem.eql(u8, path.string, login)) return;
+    for (shell.object.keys()) |member| {
+        if (!std.mem.eql(u8, member, "kind") and !std.mem.eql(u8, member, "path") and !std.mem.eql(u8, member, "clean_start")) return;
+    }
+    if (shell.object.get("clean_start")) |clean_start| {
+        if (clean_start != .bool) return;
+        if (clean_start.bool and !std.mem.eql(u8, profile orelse "user", "clean")) return;
+    }
+    debug_trace.logf(
+        "shell",
+        "run without tty ignored shell field: it names the login shell path=\"{f}\"",
+        .{std.zig.fmtString(login)},
+    );
+    _ = object.orderedRemove("shell");
+}
+
+/// Drops the empty fields `isDroppableOutsideAction` describes for `action`.
+fn elideEmptyFieldsOutsideAction(object: *std.json.ObjectMap, action: Action) void {
+    const allowed = actionFieldContract(action).allowed;
+    for (public_field_names[1..]) |field_name| {
+        if (containsFieldName(allowed, field_name)) continue;
+        const value = object.get(field_name) orelse continue;
+        if (isDroppableOutsideAction(field_name, value)) _ = object.orderedRemove(field_name);
+    }
 }
 
 fn containsFieldName(names: []const []const u8, name: []const u8) bool {
@@ -144,6 +220,16 @@ test "inferAction names the one action a call's fields fit" {
         .{ .args = "{\"session_id\":\"shell-1\",\"chars\":\"y\\n\"}", .action = "interact" },
         .{ .args = "{\"session_id\":\"shell-1\",\"yield_time_ms\":5000}", .action = "interact" },
         .{ .args = "{\"session_id\":\"shell-1\",\"force\":true}", .action = "stop" },
+        // Empty fields that only another action takes ask for nothing.
+        .{ .args = "{\"command\":\"ls\",\"chars\":\"\",\"session_id\":\"\",\"force\":false,\"reload\":false}", .action = "run" },
+        // A call that fits under the strict pass keeps that action.
+        .{ .args = "{\"session_id\":\"shell-1\",\"chars\":\"\"}", .action = "interact" },
+        .{ .args = "{\"session_id\":\"shell-1\",\"force\":false}", .action = "stop" },
+        // Ignoring an empty command still leaves session_id fitting two actions.
+        .{ .args = "{\"session_id\":\"shell-1\",\"command\":\"\"}", .action = null },
+        // Unknown names and set values are never dropped.
+        .{ .args = "{\"command\":\"ls\",\"note\":\"\"}", .action = null },
+        .{ .args = "{\"command\":\"ls\",\"chars\":\"y\"}", .action = null },
         // A bare session_id could observe or stop the session.
         .{ .args = "{\"session_id\":\"shell-1\"}", .action = null },
         // A command beside a session could start one or write to one.
@@ -211,6 +297,9 @@ fn decode_input(
     const action = std.meta.stringToEnum(Action, raw_action.string) orelse
         return null;
     elideKnownNullFields(&raw.object);
+    elideEmptyFieldsOutsideAction(&raw.object, action);
+    var login_shell_buffer: [4096]u8 = undefined;
+    elideLoginShellOnPlainRun(&raw.object, action, shell_resolver.configuredLoginShellInto(&login_shell_buffer));
 
     var correction_scratch: ActionFieldCorrectionScratch = .{};
     defer correction_scratch.deinit(ctx.allocator);
@@ -299,12 +388,12 @@ fn request_correction(alloc: Allocator, args_json: []const u8, supports_tty: boo
     if (raw.object.get("request")) |wrapper| {
         try problems.append(arena, "Put the action fields at the top level; shell takes no request wrapper.");
         var request = wrapper;
-        if (request == .string) {
-            request = std.json.parseFromSliceLeaky(std.json.Value, arena, request.string, .{}) catch |err| switch (err) {
-                error.OutOfMemory => return error.OutOfMemory,
-                else => return correction_json(alloc, problems.items, null),
-            };
-        }
+        // A wrapper written as JSON text is read like intake reads it, with
+        // the same depth limit.
+        tool_args.normalizeCompositeObjectValue(arena, &request) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return correction_json(alloc, problems.items, null),
+        };
         if (request != .object or request.object.count() > 32) {
             return correction_json(alloc, problems.items, null);
         }
@@ -337,6 +426,9 @@ fn request_correction(alloc: Allocator, args_json: []const u8, supports_tty: boo
         try object.put(arena, "action", .{ .string = "run" });
         break :blk .run;
     };
+    elideEmptyFieldsOutsideAction(&object, action);
+    var login_shell_buffer: [4096]u8 = undefined;
+    elideLoginShellOnPlainRun(&object, action, shell_resolver.configuredLoginShellInto(&login_shell_buffer));
 
     var scratch: ActionFieldCorrectionScratch = .{};
     if (try actionFieldCorrection(arena, action, object, &scratch)) |correction| {
@@ -681,6 +773,7 @@ fn callRun(
         .on_output_chunk = ctx.on_output_chunk,
         .yield_time_ms = input.yield_time_ms,
         .cancel_flag = ctx.cancel_flag,
+        .tool_yield_flag = ctx.tool_yield_flag,
     }) catch |err| {
         if (err == error.Cancelled and
             ctx.cancel_flag != null and
@@ -691,7 +784,7 @@ fn callRun(
         return runtimeFailure(ctx, err);
     };
     defer prepared.deinit(ctx.allocator);
-    const result = try finishPrepared(ctx, runtime, &prepared, .command);
+    const result = try finishPrepared(withoutSteeringYield(ctx, input.yield_time_ms), runtime, &prepared, .run);
     return attachSnapshotNotice(ctx.allocator, result) catch |err| {
         result.deinit(ctx.allocator);
         return err;
@@ -711,19 +804,354 @@ fn attachSnapshotNotice(
     if (body.len == 0 or body[body.len - 1] != '}') return result;
     const notice = (try shell_snapshot.processOwner().takeResultNotice(alloc)) orelse return result;
     defer alloc.free(notice);
-    var out: std.Io.Writer.Allocating = .init(alloc);
-    errdefer out.deinit();
-    out.writer.writeAll(body[0 .. body.len - 1]) catch return error.OutOfMemory;
-    out.writer.writeAll(",\"notice\":") catch return error.OutOfMemory;
-    std.json.Stringify.value(notice, .{}, &out.writer) catch return error.OutOfMemory;
-    out.writer.writeByte('}') catch return error.OutOfMemory;
-    const updated = try out.toOwnedSlice();
+    const updated = (try withJsonStringField(alloc, body, "notice", notice)).?;
     alloc.free(body);
     return switch (result) {
         .success => .{ .success = updated },
         .failure => .{ .failure = updated },
         .rich => unreachable,
     };
+}
+
+/// Returns a copy of the JSON object `body` with the string field `name`,
+/// a plain key, set to `value` at its end, or null when `body` does not end
+/// in `}`. The caller owns the copy; `body` is left as it is.
+fn withJsonStringField(
+    alloc: Allocator,
+    body: []const u8,
+    comptime name: []const u8,
+    value: []const u8,
+) Allocator.Error!?[]u8 {
+    if (body.len == 0 or body[body.len - 1] != '}') return null;
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    out.writer.writeAll(body[0 .. body.len - 1]) catch return error.OutOfMemory;
+    out.writer.writeAll(",\"" ++ name ++ "\":") catch return error.OutOfMemory;
+    std.json.Stringify.value(value, .{}, &out.writer) catch return error.OutOfMemory;
+    out.writer.writeByte('}') catch return error.OutOfMemory;
+    return try out.toOwnedSlice();
+}
+
+const steering_notice = "New steering arrived, so this call returned while the command keeps running. " ++
+    "Read the steering first. The session stays yours: use interact with this session_id to follow it, or stop to end it.";
+
+fn steerYieldRequested(ctx: tool_dispatch.DispatchContext) bool {
+    const flag = ctx.tool_yield_flag orelse return false;
+    return flag.load(.seq_cst);
+}
+
+/// Adds `steering_notice` to a JSON result of a command that returned
+/// running for steering. Frees `body` only when it returns the new one.
+fn attachSteeringNotice(alloc: Allocator, body: []u8) Allocator.Error![]u8 {
+    const updated = (try withJsonStringField(alloc, body, "steering_notice", steering_notice)) orelse return body;
+    alloc.free(body);
+    return updated;
+}
+
+/// `attachSteeringNotice` for a result of `prepared` when its command still
+/// runs and steering asked it to yield. When `started_here` is set, the
+/// call started the command, so steering moved a command of this turn to
+/// the background: it is marked as detached by steering in this call's
+/// turn, and an explicit cancel of that turn stops it
+/// (`stopSteeringDetached`). An `interact` poll passes false, so a command
+/// the model left in the background itself, or one from an earlier turn,
+/// keeps running. On failure it gives up the result's delivery, and the
+/// caller still owns `body`.
+fn noteSteeringYield(
+    ctx: tool_dispatch.DispatchContext,
+    runtime: *managed_execution.Runtime,
+    prepared: *managed_execution.PreparedSnapshot,
+    body: []u8,
+    started_here: bool,
+) Allocator.Error![]u8 {
+    if (prepared.snapshot.state != .running or !steerYieldRequested(ctx)) return body;
+    const updated = attachSteeringNotice(ctx.allocator, body) catch |err| {
+        runtime.cancelDelivery(
+            prepared.snapshot.execution_id,
+            prepared.reservation_id,
+        ) catch {};
+        return err;
+    };
+    if (!started_here) return updated;
+    if (ctx.output_chunk_lifecycle_id) |lifecycle_id| {
+        runtime.markSteeringDetached(prepared.snapshot.execution_id, lifecycle_id.turn_id);
+    }
+    return updated;
+}
+
+/// A call that asked to return at once (`yield_time_ms` 0) never waited, so
+/// steering did not move its command to the background: its result gets no
+/// steering notice, and a cancel of the turn leaves the command running.
+fn withoutSteeringYield(ctx: tool_dispatch.DispatchContext, yield_time_ms: u32) tool_dispatch.DispatchContext {
+    var result = ctx;
+    if (yield_time_ms == 0) result.tool_yield_flag = null;
+    return result;
+}
+
+/// Stops every command that steering moved to the background during turn
+/// `turn_id`, after an explicit cancel of that turn, the way the `stop`
+/// action does: gracefully first, then by force if the command still runs.
+/// Commands the model left in the background itself and those of other
+/// turns keep running. `ctx` must not carry the cancelled turn's cancel
+/// flag, or the stop itself would be cancelled. It runs after the turn is
+/// reported, and its last trace line says it is done.
+///
+/// Up to `max_parallel_detached_stops` stops run at once, as tasks of one
+/// `std.Io.Group` that this call awaits, so the 2 s waits of stubborn tty
+/// commands overlap. Their graceful closes do not: the terminal client runs
+/// every write, resize, signal and close in one admission order, so each
+/// tty command that ignores SIGTERM still adds its 800 ms close, and each
+/// further group of `max_parallel_detached_stops` adds another 2 s wait.
+/// Two such commands take about 3.5 s, 12 about 14 s, and 20 about 23 s.
+/// A stop the busy terminal client refuses runs again
+/// (`max_busy_terminal_attempts`), which can add up to about 3.1 s for
+/// each command.
+pub fn stopSteeringDetached(
+    ctx: tool_dispatch.DispatchContext,
+    turn_id: u64,
+) Allocator.Error!void {
+    const runtime = ctx.managed_executions orelse return;
+    const ids = try runtime.takeSteeringDetached(ctx.allocator, turn_id);
+    defer {
+        for (ids) |id| ctx.allocator.free(id);
+        ctx.allocator.free(ids);
+    }
+    var queue: DetachedStopQueue = .{ .ctx = ctx, .ids = ids, .turn_id = turn_id };
+    const io = io_mod.getIo();
+    var group: std.Io.Group = .init;
+    for (0..@min(ids.len, max_parallel_detached_stops)) |_| group.async(io, DetachedStopQueue.run, .{&queue});
+    group.await(io) catch |err| debug_trace.logf(
+        "shell",
+        "steering-detached command stops awaited after cancel turn_id={d} err={s}",
+        .{ turn_id, @errorName(err) },
+    );
+    debug_trace.logf(
+        "shell",
+        "steering-detached command stops done turn_id={d} count={d}",
+        .{ turn_id, ids.len },
+    );
+}
+
+/// Each running stop holds one terminal client request at a time. The
+/// client runs at most 32 requests at once for all agents and refuses the
+/// rest, so one cancel uses at most this many and leaves room for the others.
+const max_parallel_detached_stops = 8;
+
+/// The commands of one `stopSteeringDetached`. Its tasks take them one by
+/// one, in list order, until none is left.
+const DetachedStopQueue = struct {
+    ctx: tool_dispatch.DispatchContext,
+    ids: []const []const u8,
+    turn_id: u64,
+    next: std.atomic.Value(usize) = .init(0),
+
+    /// Stops the next commands until none is left. Each stop gets its own
+    /// arena over `ctx.lifecycle_allocator`, which is thread-safe; the
+    /// caller's allocator may be an arena that only its own thread may use.
+    fn run(self: *DetachedStopQueue) void {
+        while (true) {
+            const index = self.next.fetchAdd(1, .monotonic);
+            if (index >= self.ids.len) return;
+            const session_id = self.ids[index];
+            var arena = std.heap.ArenaAllocator.init(self.ctx.lifecycle_allocator);
+            defer arena.deinit();
+            var ctx = self.ctx;
+            ctx.allocator = arena.allocator();
+            stopOneSteeringDetached(ctx, session_id, self.turn_id) catch |err| {
+                debug_trace.logf(
+                    "shell",
+                    "steering-detached command stop failed session_id={s} turn_id={d} err={s} dropped=background_command_stop",
+                    .{ session_id, self.turn_id, @errorName(err) },
+                );
+            };
+        }
+    }
+};
+
+/// Stops `session_id`, a command steering moved to the background in turn
+/// `turn_id`: gracefully, then by force if it still runs.
+fn stopOneSteeringDetached(
+    ctx: tool_dispatch.DispatchContext,
+    session_id: []const u8,
+    turn_id: u64,
+) Allocator.Error!void {
+    debug_trace.logf(
+        "shell",
+        "stopping steering-detached command session_id={s} turn_id={d} reason=turn_cancelled",
+        .{ session_id, turn_id },
+    );
+    var cause: DetachedStopCause = .{};
+    switch (try stopDetachedOnce(ctx, session_id, false, &cause)) {
+        .ended => return,
+        .not_ended => debug_trace.logf(
+            "shell",
+            "graceful stop did not end steering-detached command session_id={s} turn_id={d} failure={s} next=force",
+            .{ session_id, turn_id, cause.text() },
+        ),
+        .refused => debug_trace.logf(
+            "shell",
+            "graceful stop of steering-detached command never ran session_id={s} turn_id={d} reason=terminal_busy next=force",
+            .{ session_id, turn_id },
+        ),
+    }
+    cause = .{};
+    switch (try stopDetachedOnce(ctx, session_id, true, &cause)) {
+        .ended => {},
+        .not_ended => debug_trace.logf(
+            "shell",
+            "steering-detached command stop failed session_id={s} turn_id={d} failure={s}",
+            .{ session_id, turn_id, cause.text() },
+        ),
+        .refused => debug_trace.logf(
+            "shell",
+            "steering-detached command stop failed session_id={s} turn_id={d} reason=terminal_busy",
+            .{ session_id, turn_id },
+        ),
+    }
+}
+
+/// What one `stopDetachedOnce` did: the command ended, the stop ran and
+/// left it running or failed, or the busy terminal client refused every run.
+const DetachedStopOutcome = enum { ended, not_ended, refused };
+
+/// Why a stop did not end its command: the failure code or error name, or
+/// `none` when the stop gave no reason.
+const DetachedStopCause = struct {
+    buffer: [64]u8 = undefined,
+    len: usize = 0,
+
+    fn set(self: *DetachedStopCause, reason: []const u8) void {
+        self.len = @min(reason.len, self.buffer.len);
+        @memcpy(self.buffer[0..self.len], reason[0..self.len]);
+    }
+
+    fn text(self: *const DetachedStopCause) []const u8 {
+        return if (self.len == 0) "none" else self.buffer[0..self.len];
+    }
+};
+
+/// How many times a terminal request at a turn's end, such as a
+/// steering-detached stop or a lease release, runs while the terminal
+/// client refuses it as busy, and the first wait between two runs, which
+/// doubles each time: 50, 100, 200, 400 and 800 ms, about 1.5 s for one
+/// request. A command whose graceful and forced stops are both refused
+/// every time takes about 3.1 s.
+const max_busy_terminal_attempts = 6;
+const busy_terminal_first_backoff_ms = 50;
+
+/// Runs the `stop` action on `session_id` and reports what it did. The
+/// terminal client runs at most 32 requests for all agents and refuses the
+/// rest with a retryable failure; such a stop runs again after a short
+/// wait, up to `max_busy_terminal_attempts` times, so a busy client does
+/// not leave the command running after the cancel. When the command does
+/// not end, `cause` says why.
+fn stopDetachedOnce(
+    ctx: tool_dispatch.DispatchContext,
+    session_id: []const u8,
+    force: bool,
+    cause: *DetachedStopCause,
+) Allocator.Error!DetachedStopOutcome {
+    const force_name = if (force) "true" else "false";
+    var backoff_ms: u64 = busy_terminal_first_backoff_ms;
+    var attempt: usize = 1;
+    while (true) : (attempt += 1) {
+        const result = callStop(ctx, .{
+            .action = .stop,
+            .session_id = session_id,
+            .force = force,
+        }) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => {
+                debug_trace.logf(
+                    "shell",
+                    "steering-detached command stop errored session_id={s} force={s} err={s}",
+                    .{ session_id, force_name, @errorName(err) },
+                );
+                cause.set(@errorName(err));
+                return .not_ended;
+            },
+        };
+        defer result.deinit(ctx.allocator);
+        const ended = switch (result) {
+            .success => true,
+            .failure, .rich => false,
+        };
+        var code_buffer: [64]u8 = undefined;
+        const failure = stopFailure(ctx.allocator, result, &code_buffer);
+        if (!ended and failure.busy) {
+            if (attempt == max_busy_terminal_attempts) {
+                debug_trace.logf(
+                    "shell",
+                    "steering-detached command stop gave up session_id={s} force={s} attempts={d} reason=terminal_busy dropped=background_command_stop",
+                    .{ session_id, force_name, attempt },
+                );
+                return .refused;
+            }
+            debug_trace.logf(
+                "shell",
+                "steering-detached command stop refused session_id={s} force={s} attempt={d} reason=terminal_busy retry_in_ms={d}",
+                .{ session_id, force_name, attempt, backoff_ms },
+            );
+            io_mod.sleep(backoff_ms * std.time.ns_per_ms);
+            backoff_ms *= 2;
+            continue;
+        }
+        if (ended) {
+            debug_trace.logf(
+                "shell",
+                "stopped steering-detached command session_id={s} force={s} ended=true",
+                .{ session_id, force_name },
+            );
+            return .ended;
+        }
+        debug_trace.logf(
+            "shell",
+            "stopped steering-detached command session_id={s} force={s} ended=false failure={s}",
+            .{ session_id, force_name, failure.code },
+        );
+        cause.set(failure.code);
+        return .not_ended;
+    }
+}
+
+/// What a failed stop says about itself: its error code, or "none", and
+/// whether the terminal client refused it because it was busy, which is the
+/// only failure a stop runs again for. A cloned terminal failure
+/// (`{"failure":{...}}`) is busy when `StructuredError.isBusyRefusal` says
+/// so. A shell failure (`{"error":{...}}`) is busy when it is the
+/// retryable `TerminalCapacityExceeded`, which the tty observer gives only
+/// for such a refusal.
+const StopFailure = struct { busy: bool, code: []const u8 };
+
+/// `code_buffer` holds the returned code.
+fn stopFailure(alloc: Allocator, result: tool_dispatch.ToolResult, code_buffer: *[64]u8) StopFailure {
+    const none: StopFailure = .{ .busy = false, .code = "none" };
+    const body = switch (result) {
+        .failure => |body| body,
+        .success, .rich => return none,
+    };
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch return none;
+    defer parsed.deinit();
+    if (parsed.value != .object) return none;
+    for ([_][]const u8{ "failure", "error" }) |key| {
+        const inner = parsed.value.object.get(key) orelse continue;
+        if (inner != .object) continue;
+        const code_value = inner.object.get("code") orelse continue;
+        if (code_value != .string or code_value.string.len > code_buffer.len) continue;
+        const code = code_buffer[0..code_value.string.len];
+        @memcpy(code, code_value.string);
+        const retryable = if (inner.object.get("retryable")) |value| value == .bool and value.bool else false;
+        const busy = if (std.mem.eql(u8, key, "failure")) busy: {
+            const terminal_code = std.meta.stringToEnum(terminal_contracts.StructuredErrorCode, code) orelse break :busy false;
+            const action_value = inner.object.get("action") orelse break :busy false;
+            if (action_value != .string) break :busy false;
+            const action = std.meta.stringToEnum(terminal_contracts.Action, action_value.string) orelse break :busy false;
+            const failure: terminal_contracts.StructuredError = .{ .action = action, .code = terminal_code, .retryable = retryable };
+            break :busy failure.isBusyRefusal();
+        } else retryable and std.mem.eql(u8, code, @errorName(error.TerminalCapacityExceeded));
+        return .{ .busy = busy, .code = code };
+    }
+    return none;
 }
 
 fn callInteract(
@@ -753,14 +1181,15 @@ fn callInteract(
         return callTtyInteract(ctx, input, yield_time_ms);
     }
     if (chars.len != 0) return runtimeFailure(ctx, error.InvalidBackend);
-    var prepared = runtime.wait(
+    var prepared = runtime.waitOrYield(
         ctx.allocator,
         session_id,
         yield_time_ms,
         ctx.cancel_flag,
+        ctx.tool_yield_flag,
     ) catch |err| return runtimeFailure(ctx, err);
     defer prepared.deinit(ctx.allocator);
-    return finishPrepared(ctx, runtime, &prepared, .command);
+    return finishPrepared(withoutSteeringYield(ctx, yield_time_ms), runtime, &prepared, .command);
 }
 
 fn callStop(
@@ -865,12 +1294,16 @@ fn callTtyRun(
         .lifetime = .session,
     }) catch |err| return runtimeFailure(ctx, err);
     defer persistence.deinit();
+    // With a steering yield flag, the start returns once the command runs
+    // and a separate wait, which steering can end, waits for its exit.
+    // Cancelling the start itself would end the command.
+    const split_wait = ctx.tool_yield_flag != null and input.yield_time_ms != 0;
     const request = terminal_contracts.ActionRequest{ .start = .{
         .cwd = cwd,
         .command = command,
         .shell = shell,
         .backend = .native,
-        .return_when = if (input.yield_time_ms == 0) .started else .exit,
+        .return_when = if (input.yield_time_ms == 0 or split_wait) .started else .exit,
         .wait_ceiling_ms = @max(@as(u64, 1), input.yield_time_ms),
         .timeout_ms = input.timeout_ms,
         .persistence = persistence.view(),
@@ -887,7 +1320,13 @@ fn callTtyRun(
     };
     var session_owned = true;
     defer if (session_owned) closeTtyBestEffort(ctx, started.session.session_id);
-    const initial_state = terminal_managed_observer.snapshotState(started.session, started.outcome);
+    var initial_state = terminal_managed_observer.snapshotState(started.session, started.outcome);
+    if (split_wait and initial_state == .running) {
+        switch (try waitTtyExitOrYield(ctx, started.session.session_id, input.yield_time_ms)) {
+            .state => |state| initial_state = state,
+            .failure => |failure| return failure,
+        }
+    }
     var observed = terminal_managed_observer.observe(
         ttyObserverContext(ctx, runtime) orelse return unavailable(ctx),
         started.session.session_id,
@@ -916,7 +1355,7 @@ fn callTtyRun(
     session_owned = false;
     defer prepared.deinit(ctx.allocator);
     _ = owner;
-    return finishPrepared(ctx, runtime, &prepared, .command);
+    return finishPrepared(withoutSteeringYield(ctx, input.yield_time_ms), runtime, &prepared, .run);
 }
 
 fn callTtyInteract(
@@ -1005,21 +1444,10 @@ fn callTtyInteract(
         return runtimeFailure(ctx, err);
     defer runtime.releaseExternalWait(session_id, waiter_id);
     if (state == .running and yield_time_ms != 0) {
-        var waited = executeAuthorizedTerminal(ctx, session_id, .{ .wait = .{
-            .session_id = session_id,
-            .return_when = .exit,
-            .safety_ceiling_ms = yield_time_ms,
-            .authority = null,
-        } }) catch |err| return runtimeFailure(ctx, err);
-        defer waited.deinit(ctx.allocator);
-        const result = switch (waited.result.view()) {
-            .failure => return cloneTerminalFailure(ctx, waited.result.view()),
-            .success => |success| switch (success) {
-                .wait => |value| value,
-                else => return runtimeFailure(ctx, error.InvalidTerminalResult),
-            },
-        };
-        state = terminal_managed_observer.snapshotState(result.session, result.outcome);
+        switch (try waitTtyExitOrYield(ctx, session_id, yield_time_ms)) {
+            .state => |waited_state| state = waited_state,
+            .failure => |failure| return failure,
+        }
     }
     if (accepted_bytes != null and yield_time_ms == 0) {
         io_mod.sleep(100 * std.time.ns_per_ms);
@@ -1050,10 +1478,11 @@ fn callTtyInteract(
         .published_running = true,
     }) catch |err| return runtimeFailure(ctx, err);
     defer prepared.deinit(ctx.allocator);
+    const finish_ctx = withoutSteeringYield(ctx, yield_time_ms);
     return if (accepted_bytes) |count|
-        finishPreparedWithAccepted(ctx, runtime, &prepared, count)
+        finishPreparedWithAccepted(finish_ctx, runtime, &prepared, count)
     else
-        finishPrepared(ctx, runtime, &prepared, .command);
+        finishPrepared(finish_ctx, runtime, &prepared, .command);
 }
 
 fn callTtyStop(
@@ -1220,6 +1649,52 @@ fn executeAuthorizedTerminal(
     return executeTerminal(ctx, authorized);
 }
 
+const TtyWaitOutcome = union(enum) {
+    state: managed_execution.SnapshotState,
+    failure: tool_dispatch.ToolResult,
+};
+
+/// Waits up to `ceiling_ms` for tty session `session_id` to exit. Steering
+/// (`ctx.tool_yield_flag`) ends the wait early with the session still
+/// running; only the wait is cancelled, never the session.
+fn waitTtyExitOrYield(
+    ctx: tool_dispatch.DispatchContext,
+    session_id: []const u8,
+    ceiling_ms: u32,
+) tool_dispatch.DispatchError!TtyWaitOutcome {
+    var authority = reloadTerminalAuthority(ctx, session_id) catch |err|
+        return .{ .failure = try runtimeFailure(ctx, err) };
+    defer authority.deinit();
+    var waited: ParsedTerminalExecution = .{ .result = terminal_action_executor.execute(.{
+        .alloc = ctx.allocator,
+        .lifecycle_allocator = ctx.lifecycle_allocator,
+        .runtime = ctx.terminal_client orelse return .{ .failure = try unavailable(ctx) },
+        .cancel_flag = ctx.cancel_flag,
+        .yield_flag = ctx.tool_yield_flag,
+        .yield_grace_ms = managed_execution.steerYieldGraceMs(),
+    }, .{ .wait = .{
+        .session_id = session_id,
+        .return_when = .exit,
+        .safety_ceiling_ms = ceiling_ms,
+        .authority = authority.view(),
+    } }) catch |err| return .{ .failure = try runtimeFailure(ctx, err) } };
+    defer waited.deinit(ctx.allocator);
+    switch (waited.result.view()) {
+        .failure => |failure| {
+            const user_cancelled = if (ctx.cancel_flag) |flag| flag.load(.seq_cst) else false;
+            if (failure.code == .cancelled and !user_cancelled and steerYieldRequested(ctx)) {
+                debug_trace.logf("shell", "tty wait yielded for steering session={s}", .{session_id});
+                return .{ .state = .running };
+            }
+            return .{ .failure = try cloneTerminalFailure(ctx, waited.result.view()) };
+        },
+        .success => |success| switch (success) {
+            .wait => |value| return .{ .state = terminal_managed_observer.snapshotState(value.session, value.outcome) },
+            else => return .{ .failure = try runtimeFailure(ctx, error.InvalidTerminalResult) },
+        },
+    }
+}
+
 fn reloadTerminalAuthority(
     ctx: tool_dispatch.DispatchContext,
     session_id: []const u8,
@@ -1281,25 +1756,48 @@ fn releaseTtyLease(
     released.deinit(ctx.allocator);
 }
 
+/// Releases the agent's write lease on `session_id` at a turn's end. A
+/// release the busy terminal client refuses runs again after a short wait,
+/// up to `max_busy_terminal_attempts` times, as a steered stop does.
 pub fn releaseAgentWriteLease(
     ctx: tool_dispatch.DispatchContext,
     session_id: []const u8,
 ) !void {
-    var released = try executeAuthorizedTerminal(ctx, session_id, .{ .write = .{
-        .session_id = session_id,
-        .lease = .release,
-        .authority = null,
-    } });
-    defer released.deinit(ctx.allocator);
-    switch (released.result.view()) {
-        .success => |success| switch (success) {
-            .write => {},
-            else => return error.InvalidTerminalLeaseCleanupResult,
-        },
-        .failure => |failure| switch (failure.code) {
-            .session_not_found, .lease_conflict => {},
-            else => return error.TerminalLeaseCleanupFailed,
-        },
+    var backoff_ms: u64 = busy_terminal_first_backoff_ms;
+    var attempt: usize = 1;
+    while (true) : (attempt += 1) {
+        var released = try executeAuthorizedTerminal(ctx, session_id, .{ .write = .{
+            .session_id = session_id,
+            .lease = .release,
+            .authority = null,
+        } });
+        defer released.deinit(ctx.allocator);
+        switch (released.result.view()) {
+            .success => |success| switch (success) {
+                .write => return,
+                else => return error.InvalidTerminalLeaseCleanupResult,
+            },
+            .failure => |failure| switch (failure.code) {
+                .session_not_found, .lease_conflict => return,
+                // Only a busy refusal goes away when the release runs again.
+                else => if (!failure.isBusyRefusal()) return error.TerminalLeaseCleanupFailed,
+            },
+        }
+        if (attempt == max_busy_terminal_attempts) {
+            debug_trace.logf(
+                "shell",
+                "terminal lease release gave up session_id={s} attempts={d} reason=terminal_busy dropped=agent_write_lease_release",
+                .{ session_id, attempt },
+            );
+            return error.TerminalLeaseCleanupFailed;
+        }
+        debug_trace.logf(
+            "shell",
+            "terminal lease release refused session_id={s} attempt={d} reason=terminal_busy retry_in_ms={d}",
+            .{ session_id, attempt, backoff_ms },
+        );
+        io_mod.sleep(backoff_ms * std.time.ns_per_ms);
+        backoff_ms *= 2;
     }
 }
 
@@ -1331,19 +1829,59 @@ fn closeTtyBestEffort(
     ctx: tool_dispatch.DispatchContext,
     session_id: []const u8,
 ) void {
-    var closed = executeAuthorizedTerminal(ctx, session_id, .{ .close = .{
-        .session_id = session_id,
-        .policy = .force,
-        .authority = null,
-    } }) catch |err| {
+    // The close ignores `cancel_flag`. A user cancel is when this cleanup
+    // matters most, and with the flag set the executor would cancel the
+    // close too and leave the command running.
+    // A close the busy terminal client refuses runs again after a short
+    // wait, up to `max_busy_terminal_attempts` times, as a steered stop does.
+    var close_ctx = ctx;
+    close_ctx.cancel_flag = null;
+    var backoff_ms: u64 = busy_terminal_first_backoff_ms;
+    var attempt: usize = 1;
+    while (true) : (attempt += 1) {
+        var closed = executeAuthorizedTerminal(close_ctx, session_id, .{ .close = .{
+            .session_id = session_id,
+            .policy = .force,
+            .authority = null,
+        } }) catch |err| {
+            debug_trace.logf(
+                "shell",
+                "unpublished TTY cleanup failed session_id={s} err={s} dropped=unpublished_tty_close",
+                .{ session_id, @errorName(err) },
+            );
+            return;
+        };
+        defer closed.deinit(ctx.allocator);
+        const failure = switch (closed.result.view()) {
+            .success => return,
+            .failure => |failure| failure,
+        };
+        // The terminal is already gone, so nothing is left to close.
+        if (failure.code == .session_not_found) return;
+        if (!failure.isBusyRefusal()) {
+            debug_trace.logf(
+                "shell",
+                "unpublished TTY cleanup failed session_id={s} code={s} dropped=unpublished_tty_close",
+                .{ session_id, @tagName(failure.code) },
+            );
+            return;
+        }
+        if (attempt == max_busy_terminal_attempts) {
+            debug_trace.logf(
+                "shell",
+                "unpublished TTY cleanup gave up session_id={s} attempts={d} reason=terminal_busy dropped=unpublished_tty_close",
+                .{ session_id, attempt },
+            );
+            return;
+        }
         debug_trace.logf(
             "shell",
-            "unpublished TTY cleanup failed session_id={s} err={s}",
-            .{ session_id, @errorName(err) },
+            "unpublished TTY cleanup refused session_id={s} attempt={d} reason=terminal_busy retry_in_ms={d}",
+            .{ session_id, attempt, backoff_ms },
         );
-        return;
-    };
-    closed.deinit(ctx.allocator);
+        io_mod.sleep(backoff_ms * std.time.ns_per_ms);
+        backoff_ms *= 2;
+    }
 }
 
 fn finishPreparedWithAccepted(
@@ -1352,7 +1890,7 @@ fn finishPreparedWithAccepted(
     prepared: *managed_execution.PreparedSnapshot,
     accepted_bytes: u32,
 ) tool_dispatch.DispatchError!tool_dispatch.ToolResult {
-    const body = formatSnapshotWithLimit(
+    var body = formatSnapshotWithLimit(
         ctx.allocator,
         prepared.snapshot,
         accepted_bytes,
@@ -1366,6 +1904,7 @@ fn finishPreparedWithAccepted(
         return runtimeFailure(ctx, err);
     };
     errdefer ctx.allocator.free(body);
+    body = try noteSteeringYield(ctx, runtime, prepared, body, false);
     publishSnapshotMetadata(ctx, prepared.snapshot) catch |err| {
         runtime.cancelDelivery(
             prepared.snapshot.execution_id,
@@ -1462,9 +2001,11 @@ fn finishPrepared(
     ctx: tool_dispatch.DispatchContext,
     runtime: *managed_execution.Runtime,
     prepared: *managed_execution.PreparedSnapshot,
-    action: enum { command, stop },
+    /// `run` is the result of the call that started the command, `command`
+    /// a later observation of it, and `stop` the result of a stop.
+    action: enum { run, command, stop },
 ) tool_dispatch.DispatchError!tool_dispatch.ToolResult {
-    const body = formatSnapshotWithLimit(
+    var body = formatSnapshotWithLimit(
         ctx.allocator,
         prepared.snapshot,
         null,
@@ -1478,6 +2019,10 @@ fn finishPrepared(
         return .{ .failure = try ctx.allocator.dupe(u8, "shell result is unavailable") };
     };
     errdefer ctx.allocator.free(body);
+    switch (action) {
+        .run, .command => body = try noteSteeringYield(ctx, runtime, prepared, body, action == .run),
+        .stop => {},
+    }
     publishSnapshotMetadata(ctx, prepared.snapshot) catch |err| {
         runtime.cancelDelivery(
             prepared.snapshot.execution_id,
@@ -1490,7 +2035,7 @@ fn finishPrepared(
         return .{ .failure = try ctx.allocator.dupe(u8, "shell result commit failed") };
     };
     const failed = switch (action) {
-        .command => snapshotFailed(prepared.snapshot),
+        .run, .command => snapshotFailed(prepared.snapshot),
         .stop => stop_result_failed(prepared.snapshot.state),
     };
     return if (failed)
@@ -1509,7 +2054,7 @@ fn publishSnapshotMetadata(
         .completed => |value| value,
         .stopped => |value| value,
         .lost => .indeterminate,
-        .running => return,
+        .running => return publishQuietCrossing(ctx, snapshot),
     };
     const projection: command_contract.StatusProjection = if (status) |value|
         command_contract.projectStatus(value)
@@ -1576,6 +2121,22 @@ fn publishSnapshotMetadata(
     if (ctx.tool_result_memory_sink != null) {
         tool_dispatch.reportToolResultMemory(ctx, memory);
     }
+}
+
+/// A running result carries metadata only when its wait ended at the quiet
+/// crossing: the command and its quiet time, for the note fx relays to a
+/// subagent's parent (`noteChildQuiet` in `src/core/subagent/tool_host.zig`).
+fn publishQuietCrossing(
+    ctx: tool_dispatch.DispatchContext,
+    snapshot: managed_execution.Snapshot,
+) !void {
+    if (!snapshot.quiet_crossed or ctx.tool_result_memory_sink == null) return;
+    const command = try ctx.allocator.dupe(u8, snapshot.command);
+    debug_trace.eventf("shell", "quiet_crossing", .{}, "session={s} quiet_ms={d}", .{ snapshot.execution_id, snapshot.quiet_ms orelse 0 });
+    tool_dispatch.reportToolResultMemory(ctx, .{ .quiet_crossing = .{
+        .command = command,
+        .quiet_ms = snapshot.quiet_ms orelse 0,
+    } });
 }
 
 fn handoffPreparedDelivery(
@@ -1788,6 +2349,9 @@ fn shellParseRetryGuidance(output: []const u8, whole_output: bool) ?[]const u8 {
 // snapshot, bash names the script it sources from `/dev/fd/0`
 // (`snapshotScript` in shell_resolver.zig), followed by `eval:`. Anchoring
 // bash to that path keeps the `eval` errors of a script the command runs out.
+// bash 3.2 evaluates the snapshot script instead of sourcing it
+// (`snapshotInvocation`), so it names the shell, which the basename match
+// covers.
 fn shellErrorFamily(line: []const u8) ?ShellFamily {
     const colon = std.mem.findScalar(u8, line, ':') orelse return null;
     const token = line[0..colon];
@@ -1824,7 +2388,10 @@ fn hasUsageBannerOutput(output: []const u8) bool {
 /// model can still use, and otherwise only when they are not the default
 /// `captured` and `process`, such as a command that ran on a terminal.
 /// `output_terminal_safe` marks output whose unsafe bytes were written as
-/// escapes (`escaped`).
+/// escapes (`escaped`). A running captured command also says how long it has
+/// run (`running_ms`) and printed nothing (`quiet_ms`), and once that quiet
+/// time reaches the limit, `quiet_notice` asks the model to check it
+/// (`src/core/execution/quiet_notice.zig`).
 fn formatSnapshotRaw(
     alloc: Allocator,
     snapshot: managed_execution.Snapshot,
@@ -1858,6 +2425,11 @@ fn formatSnapshotRaw(
         ),
         .running, .stopped => null,
     };
+    var notice_buffer: [quiet_notice_max_bytes]u8 = undefined;
+    const notice: ?[]const u8 = if (snapshot.quiet_notice)
+        quietNoticeText(&notice_buffer, snapshot.quiet_ms orelse 0)
+    else
+        null;
     var out: std.Io.Writer.Allocating = .init(alloc);
     errdefer out.deinit();
     const retained = snapshot.retained;
@@ -1874,6 +2446,9 @@ fn formatSnapshotRaw(
         .signal = projection.signal,
         .termination_indeterminate = presentFlag(projection.termination_indeterminate),
         .duration_ms = snapshot.duration_ms,
+        .running_ms = snapshot.running_ms,
+        .quiet_ms = snapshot.quiet_ms,
+        .quiet_notice = notice,
         .accepted_bytes = accepted_bytes,
         .@"error" = snapshot.error_name,
         .retry_guidance = retry_guidance,
@@ -1881,6 +2456,29 @@ fn formatSnapshotRaw(
     }, .{ .emit_null_optional_fields = false }, &out.writer);
     return try out.toOwnedSlice();
 }
+
+const quiet_notice_max_bytes = 192;
+
+comptime {
+    // The longest notice, for the largest quiet time, fits the buffer.
+    std.debug.assert(quiet_notice_max_bytes >= "No output for 18446744073709551615 min. ".len + quiet_notice_check.len);
+}
+
+/// The check a running command's result asks for once it has printed nothing
+/// for the quiet limit. fx never stops the command: it may have hung, or it
+/// may be a server or watcher at rest.
+fn quietNoticeText(buffer: *[quiet_notice_max_bytes]u8, quiet_ms: u64) []const u8 {
+    const minutes = quiet_ms / std.time.ms_per_min;
+    const text = if (minutes > 0)
+        std.mem.print(buffer, "No output for {d} min. " ++ quiet_notice_check, .{minutes})
+    else
+        std.mem.print(buffer, "No output for {d} s. " ++ quiet_notice_check, .{quiet_ms / std.time.ms_per_s});
+    // The buffer fits every notice (see the comptime check above); the check
+    // alone stands in if it ever does not.
+    return text catch quiet_notice_check;
+}
+
+const quiet_notice_check = "Check whether this command is still working or has hung; a server or watcher can stay quiet while it works.";
 
 /// A flag the result writes only when it is set.
 fn presentFlag(value: bool) ?bool {
@@ -1932,9 +2530,12 @@ fn runtimeFailure(
     err: anyerror,
 ) tool_dispatch.DispatchError!tool_dispatch.ToolResult {
     if (err == error.OutOfMemory) return error.OutOfMemory;
+    // A busy terminal client refuses a request without running it, so the
+    // same request can run again later.
+    const retryable = err == error.TerminalCapacityExceeded;
     return .{ .failure = try ctx.allocator.print(
-        "{{\"error\":{{\"tool\":\"shell\",\"code\":\"{s}\",\"retryable\":false}}}}",
-        .{@errorName(err)},
+        "{{\"error\":{{\"tool\":\"shell\",\"code\":\"{s}\",\"retryable\":{s}}}}}",
+        .{ @errorName(err), if (retryable) "true" else "false" },
     ) };
 }
 
@@ -1952,15 +2553,14 @@ fn resolveCwd(
     ctx: tool_dispatch.DispatchContext,
     requested: ?[]const u8,
 ) ![]const u8 {
-    const scope = ctx.access_scope orelse
-        workspace_access.AccessScope.primaryOnly(ctx.workspace_root);
-    const value = requested orelse return arena.dupe(u8, scope.primary_directory);
+    const primary = workspace_access.AccessScope.primaryDirectoryOf(ctx.access_scope, ctx.workspace_root);
+    const value = requested orelse return arena.dupe(u8, primary);
     if (std.mem.eql(u8, value, ".")) {
-        return arena.dupe(u8, scope.primary_directory);
+        return arena.dupe(u8, primary);
     }
     return pathing.resolveWorkspaceOrExternalPath(
         arena,
-        scope.primary_directory,
+        primary,
         value,
     );
 }
@@ -2103,11 +2703,19 @@ test "shell request correction suggests only unambiguous repairs without executi
         .{ .input = "{\"session_id\":\"shell-3\"}", .retry = null },
         .{ .input = "{\"command\":\"true\",\"session_id\":\"shell-3\"}", .retry = null },
         .{ .input = "{\"action\":\"run\",\"command\":\"true\",\"background\":true}", .retry = null },
-        .{ .input = "{\"action\":\"run\",\"command\":\"true\",\"profile\":\"clean\",\"shell\":{\"kind\":\"executable\",\"path\":\"/bin/bash\"}}", .retry = null },
+        // A shell that is no host's login shell: the decoder drops a `shell`
+        // naming the login shell on a run without a terminal, so a common path
+        // such as /bin/bash would make this case depend on the host.
+        .{ .input = "{\"action\":\"run\",\"command\":\"true\",\"profile\":\"clean\",\"shell\":{\"kind\":\"executable\",\"path\":\"/opt/example/bin/bash\"}}", .retry = null },
         .{ .input = "{\"request\":{\"action\":\"run\",\"command\":\"true\",\"yield_time_ms\":\"1000\",\"timeout_ms\":0}}", .retry = null },
         .{ .input = "{\"action\":\"run\",\"command\":\"true\",\"yield_time_ms\":4294967296}", .retry = null },
         .{ .input = "{\"action\":\"stop\",\"session_id\":\"shell-3\",\"force\":\"true\"}", .retry = null },
         .{ .input = "{\"request\":{\"action\":\"run\",\"command\":\"true\"},\"command\":\"false\"}", .retry = null },
+        // Text nested deeper than tool input may be, and an object encoded
+        // twice, are refused without a suggestion.
+        .{ .input = "{\"request\":\"" ++ text_utils.repeat("{\\\"a\\\":", 300) ++ "1" ++ text_utils.repeat("}", 300) ++ "\",\"yield_time_ms\":1}", .retry = null },
+        .{ .input = "{\"request\":\"{\\\"action\\\":\\\"run\\\",\\\"command\\\":\\\"true\\\",\\\"x\\\":" ++ text_utils.repeat("{\\\"a\\\":", 300) ++ "1" ++ text_utils.repeat("}", 300) ++ "}\",\"yield_time_ms\":1}", .retry = null },
+        .{ .input = "{\"request\":\"\\\"{\\\\\\\"action\\\\\\\":\\\\\\\"run\\\\\\\",\\\\\\\"command\\\\\\\":\\\\\\\"true\\\\\\\"}\\\"\"}", .retry = null },
         .{ .input = "{", .retry = null },
         .{ .input = "[]", .retry = null },
     };
@@ -2144,6 +2752,28 @@ test "shell request correction suggests only unambiguous repairs without executi
             try std.testing.expect(detail.get("retry_with") == null);
         }
     }
+}
+
+test "shell request correction does not read a text wrapper nested deeper than tool input may be" {
+    const alloc = std.testing.allocator;
+    const deep = text_utils.repeat("{\\\"a\\\":", 300) ++ "1" ++ text_utils.repeat("}", 300);
+    const input = "{\"request\":\"{\\\"action\\\":\\\"run\\\",\\\"command\\\":\\\"true\\\",\\\"x\\\":" ++ deep ++ "}\",\"yield_time_ms\":1}";
+    const failure = switch (try decode(.{ .allocator = alloc }, input)) {
+        .failure => |failure| failure,
+        .input => |decoded| {
+            decoded.deinit(alloc);
+            return error.TestUnexpectedResult;
+        },
+    };
+    defer alloc.free(failure);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, failure, .{});
+    defer parsed.deinit();
+    const detail = parsed.value.object.get("error").?.object;
+    // Only the wrapper is named: nothing inside the text was read.
+    const problems = detail.get("problems").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), problems.len);
+    try std.testing.expectEqualStrings("Put the action fields at the top level; shell takes no request wrapper.", problems[0].string);
+    try std.testing.expect(detail.get("retry_with") == null);
 }
 
 fn check_request_correction_allocations(alloc: Allocator, args_json: []const u8) !void {
@@ -2341,6 +2971,104 @@ test "shell decoder preserves null omission and rejects cross action fields" {
     }
 }
 
+/// Decodes arguments a test expects to decode, printing the failure text
+/// when they do not.
+fn decodeOrFail(ctx: tool_dispatch.DispatchContext, args_json: []const u8) !tool_dispatch.ToolInput {
+    return switch (try decode(ctx, args_json)) {
+        .input => |input| input,
+        .failure => |failure| {
+            defer ctx.allocator.free(failure);
+            std.debug.print("{s}\n", .{failure});
+            return error.TestUnexpectedResult;
+        },
+    };
+}
+
+test "shell decoder drops empty fields the action does not take" {
+    const alloc = std.testing.allocator;
+    const ctx = tool_dispatch.DispatchContext{ .allocator = alloc };
+    // Every advertised field filled in, the unused ones empty.
+    {
+        const input = try decodeOrFail(
+            ctx,
+            "{\"action\":\"run\",\"command\":\"true\",\"chars\":\"\",\"session_id\":\"\",\"force\":false,\"reload\":false,\"tty\":false}",
+        );
+        defer input.deinit(alloc);
+        const value = input.as(OwnedInput).value;
+        try std.testing.expect(isCapturedCommand(input));
+        try std.testing.expect(value.chars == null and value.session_id == null and !value.force);
+    }
+    {
+        const stop = try decodeOrFail(ctx, "{\"action\":\"stop\",\"session_id\":\"shell-1\",\"command\":\"\",\"tty\":false}");
+        defer stop.deinit(alloc);
+        try std.testing.expectEqual(Action.stop, stop.as(OwnedInput).value.action);
+    }
+    // Text to type, a true flag, or an unknown name still does not belong to run.
+    for ([_][]const u8{
+        "{\"action\":\"run\",\"command\":\"true\",\"chars\":\"y\"}",
+        "{\"action\":\"run\",\"command\":\"true\",\"force\":true}",
+        "{\"action\":\"run\",\"command\":\"true\",\"note\":\"\"}",
+    }) |args| {
+        switch (try decode(ctx, args)) {
+            .input => |input| {
+                defer input.deinit(alloc);
+                return error.TestUnexpectedResult;
+            },
+            .failure => |failure| {
+                defer alloc.free(failure);
+                try std.testing.expect(std.mem.find(u8, failure, "invalid_shell_request") != null);
+            },
+        }
+    }
+}
+
+test "a login shell on a run without a terminal is dropped" {
+    const alloc = std.testing.allocator;
+    const Case = struct { args: []const u8, dropped: bool };
+    const cases = [_]Case{
+        .{ .args = "{\"profile\":\"clean\",\"shell\":{\"kind\":\"executable\",\"path\":\"/bin/zsh\"},\"tty\":false}", .dropped = true },
+        .{ .args = "{\"profile\":\"clean\",\"shell\":{\"kind\":\"executable\",\"path\":\"/bin/zsh\",\"clean_start\":true}}", .dropped = true },
+        .{ .args = "{\"profile\":\"user\",\"shell\":{\"kind\":\"executable\",\"path\":\"/bin/zsh\"}}", .dropped = true },
+        // A clean start that profile does not ask for would be lost.
+        .{ .args = "{\"profile\":\"user\",\"shell\":{\"kind\":\"executable\",\"path\":\"/bin/zsh\",\"clean_start\":true}}", .dropped = false },
+        // Without profile, the login shell with a default start changes nothing.
+        .{ .args = "{\"shell\":{\"kind\":\"executable\",\"path\":\"/bin/zsh\"}}", .dropped = true },
+        .{ .args = "{\"shell\":{\"kind\":\"executable\",\"path\":\"/bin/zsh\",\"clean_start\":false},\"tty\":false}", .dropped = true },
+        .{ .args = "{\"shell\":{\"kind\":\"executable\",\"path\":\"/bin/zsh\",\"clean_start\":true}}", .dropped = false },
+        // Another shell or a terminal keeps shell and its checks.
+        .{ .args = "{\"profile\":\"clean\",\"shell\":{\"kind\":\"executable\",\"path\":\"/bin/bash\"}}", .dropped = false },
+        .{ .args = "{\"shell\":{\"kind\":\"executable\",\"path\":\"/bin/bash\"}}", .dropped = false },
+        .{ .args = "{\"profile\":\"clean\",\"shell\":{\"kind\":\"executable\",\"path\":\"/bin/zsh\"},\"tty\":true}", .dropped = false },
+        .{ .args = "{\"profile\":\"clean\",\"shell\":{\"kind\":\"executable\",\"path\":\"/bin/zsh\",\"extra\":1}}", .dropped = false },
+    };
+    for (cases) |case| {
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, case.args, .{});
+        defer parsed.deinit();
+        elideLoginShellOnPlainRun(&parsed.value.object, .run, "/bin/zsh");
+        try std.testing.expectEqual(!case.dropped, parsed.value.object.contains("shell"));
+    }
+    // Only run takes the change, and no login shell means nothing to compare.
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, cases[0].args, .{});
+    defer parsed.deinit();
+    elideLoginShellOnPlainRun(&parsed.value.object, .interact, "/bin/zsh");
+    elideLoginShellOnPlainRun(&parsed.value.object, .run, null);
+    try std.testing.expect(parsed.value.object.contains("shell"));
+}
+
+test "shell decoder runs a call that names the login shell" {
+    const alloc = std.testing.allocator;
+    var login_shell_buffer: [4096]u8 = undefined;
+    const login = shell_resolver.configuredLoginShellInto(&login_shell_buffer) orelse return error.SkipZigTest;
+    const ctx = tool_dispatch.DispatchContext{ .allocator = alloc };
+    const args = try std.mem.concat(alloc, u8, &.{ "{\"action\":\"run\",\"command\":\"true\",\"profile\":\"clean\",\"shell\":{\"kind\":\"executable\",\"path\":\"", login, "\"},\"tty\":false}" });
+    defer alloc.free(args);
+    const input = try decodeOrFail(ctx, args);
+    defer input.deinit(alloc);
+    const value = input.as(OwnedInput).value;
+    try std.testing.expect(value.shell == null);
+    try std.testing.expectEqual(command_environment.Profile.clean, value.profile.?);
+}
+
 test "shell decoder applies action specific observation defaults" {
     const alloc = std.testing.allocator;
     const ctx = tool_dispatch.DispatchContext{ .allocator = alloc };
@@ -2375,6 +3103,23 @@ test "shell decoder applies action specific observation defaults" {
             );
         },
     }
+}
+
+test "a command returned for steering tells the model it still runs" {
+    const alloc = std.testing.allocator;
+    const body = try alloc.dupe(u8, "{\"state\":\"running\",\"session_id\":\"shell-1\"}");
+    const updated = try attachSteeringNotice(alloc, body);
+    defer alloc.free(updated);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, updated, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("shell-1", parsed.value.object.get("session_id").?.string);
+    try std.testing.expectEqualStrings(steering_notice, parsed.value.object.get("steering_notice").?.string);
+
+    var flag = std.atomic.Value(bool).init(false);
+    try std.testing.expect(!steerYieldRequested(.{ .allocator = alloc }));
+    try std.testing.expect(!steerYieldRequested(.{ .allocator = alloc, .tool_yield_flag = &flag }));
+    flag.store(true, .seq_cst);
+    try std.testing.expect(steerYieldRequested(.{ .allocator = alloc, .tool_yield_flag = &flag }));
 }
 
 test "shell interaction wait bounds empty observations without delaying writes" {
@@ -2495,6 +3240,39 @@ test "stopped execution is a successful shell observation without command failur
     }
 }
 
+test "only a running result that ended its wait at the quiet crossing carries the crossing" {
+    const alloc = std.testing.allocator;
+    for ([_]bool{ true, false }) |crossed| {
+        var memory: ?types.ToolResultMemory = null;
+        try publishSnapshotMetadata(.{
+            .allocator = alloc,
+            .tool_result_memory_sink = &memory,
+        }, .{
+            .execution_id = @constCast("shell-quiet"),
+            .command = @constCast("node verify.mjs --mock"),
+            .cwd = @constCast("/tmp"),
+            .retained = true,
+            .state = .running,
+            .output_delta = @constCast(""),
+            .output_truncated = false,
+            .running_ms = 130_000,
+            .quiet_ms = 125_000,
+            .quiet_notice = true,
+            // A later wait in the same spell gets the notice without crossing.
+            .quiet_crossed = crossed,
+        });
+        if (!crossed) {
+            try std.testing.expect(memory == null);
+            continue;
+        }
+        defer types.freeToolResultMemory(alloc, memory.?);
+        const crossing = memory.?.quiet_crossing.?;
+        try std.testing.expectEqualStrings("node verify.mjs --mock", crossing.command);
+        try std.testing.expectEqual(@as(u64, 125_000), crossing.quiet_ms);
+        try std.testing.expect(memory.?.command_process_presentation == null);
+    }
+}
+
 test "lost shell snapshot preserves indeterminate execution guidance" {
     const alloc = std.testing.allocator;
     const body = try formatSnapshot(alloc, .{
@@ -2573,6 +3351,51 @@ test "a command still running names its session with the backend and persistence
         "{\"session_id\":\"shell-live\",\"state\":\"running\",\"backend\":\"captured\",\"persistence\":\"process\",\"output_delta\":\"partial\\n\"}",
         body,
     );
+}
+
+test "a running command says how long it has run and been quiet, and asks for a check at the limit" {
+    const alloc = std.testing.allocator;
+    const under = try formatSnapshot(alloc, .{
+        .execution_id = @constCast("shell-live"),
+        .command = @constCast("sleep 30"),
+        .cwd = @constCast("/tmp"),
+        .retained = true,
+        .state = .running,
+        .output_delta = @constCast(""),
+        .output_truncated = false,
+        .running_ms = 4_000,
+        .quiet_ms = 3_000,
+    }, null);
+    defer alloc.free(under);
+    try std.testing.expectEqualStrings(
+        "{\"session_id\":\"shell-live\",\"state\":\"running\",\"backend\":\"captured\",\"persistence\":\"process\",\"running_ms\":4000,\"quiet_ms\":3000,\"output_delta\":\"\"}",
+        under,
+    );
+    const quiet = try formatSnapshot(alloc, .{
+        .execution_id = @constCast("shell-live"),
+        .command = @constCast("sleep 300"),
+        .cwd = @constCast("/tmp"),
+        .retained = true,
+        .state = .running,
+        .output_delta = @constCast(""),
+        .output_truncated = false,
+        .running_ms = 185_000,
+        .quiet_ms = 150_000,
+        .quiet_notice = true,
+    }, null);
+    defer alloc.free(quiet);
+    try std.testing.expectEqualStrings(
+        "{\"session_id\":\"shell-live\",\"state\":\"running\",\"backend\":\"captured\",\"persistence\":\"process\",\"running_ms\":185000,\"quiet_ms\":150000,\"quiet_notice\":\"No output for 2 min. Check whether this command is still working or has hung; a server or watcher can stay quiet while it works.\",\"output_delta\":\"\"}",
+        quiet,
+    );
+}
+
+test "the quiet notice names seconds under a minute and fits its buffer for any quiet time" {
+    var buffer: [quiet_notice_max_bytes]u8 = undefined;
+    try std.testing.expect(std.mem.startsWith(u8, quietNoticeText(&buffer, 1_500), "No output for 1 s. "));
+    try std.testing.expect(std.mem.startsWith(u8, quietNoticeText(&buffer, 59_999), "No output for 59 s. "));
+    try std.testing.expect(std.mem.startsWith(u8, quietNoticeText(&buffer, 60_000), "No output for 1 min. "));
+    try std.testing.expect(std.mem.endsWith(u8, quietNoticeText(&buffer, std.math.maxInt(u64)), quiet_notice_check));
 }
 
 test "completed shell snapshot reports incomplete output without losing status" {
@@ -2777,6 +3600,11 @@ test "failure guidance detectors match only their signatures" {
     try std.testing.expectEqual(
         line_shell_parse_retry_guidance,
         failureRetryGuidance(1, "/dev/fd/0: eval: line 40: unexpected EOF while looking for matching `\"'\n", true),
+    );
+    // bash 3.2 evaluates the snapshot script, so it names the shell instead.
+    try std.testing.expectEqual(
+        line_shell_parse_retry_guidance,
+        failureRetryGuidance(1, "/bin/bash: eval: line 11: unexpected EOF while looking for matching `\"'\n/bin/bash: eval: line 12: syntax error: unexpected end of file\n", true),
     );
     try std.testing.expectEqual(
         line_shell_parse_retry_guidance,
@@ -3079,6 +3907,476 @@ test "registered shell empty observation waits through one managed execution" {
     try std.testing.expect(replay == .available);
 }
 
+/// The setup the steering cancel tests share: the managed runtime, the
+/// shell tool, a clean command environment, and a steering wait that never
+/// ends, as when the user types while a command runs.
+const SteeringCancelTest = struct {
+    alloc: Allocator,
+    runtime: managed_execution.Runtime,
+    environment_arena: std.heap.ArenaAllocator,
+    environment: command_environment.Environment,
+    yield_flag: std.atomic.Value(bool),
+
+    const Started = struct { id: []u8, notice: bool };
+
+    const registry = tool_dispatch.Registry{ .tools = &.{tool_dispatch.Tool{
+        .name = "shell",
+        .description = "shell",
+        .model_schema = .{ .name = "shell", .description = "shell" },
+        .executor_kind = .terminal,
+        .activity_kind = .command,
+        .requires_approval = true,
+        .decode = decode,
+        .validate = validate,
+        .call = call,
+        .captured_command_action = "run",
+        .captured_command_fn = isCapturedCommand,
+        .process_local_fn = isProcessLocal,
+        .reads_only_fn = readsOnly,
+        .irreversible_fn = isIrreversible,
+    }} };
+
+    fn init(self: *SteeringCancelTest, alloc: Allocator) !void {
+        self.* = .{
+            .alloc = alloc,
+            .runtime = managed_execution.Runtime.init(alloc),
+            .environment_arena = std.heap.ArenaAllocator.init(alloc),
+            .environment = undefined,
+            .yield_flag = .init(true),
+        };
+        errdefer self.deinit();
+        self.environment = try commandEnvironment(
+            self.environment_arena.allocator(),
+            .{ .allocator = alloc, .workspace_root = "/tmp" },
+            .clean,
+        );
+    }
+
+    fn deinit(self: *SteeringCancelTest) void {
+        self.environment_arena.deinit();
+        self.runtime.deinit();
+    }
+
+    /// Dispatches one shell call with `arguments` in turn `turn_id` while
+    /// steering waits. Its result must show the command running. Returns
+    /// the command's session id, which the caller frees, and whether the
+    /// result got the steering notice.
+    fn dispatch(
+        self: *SteeringCancelTest,
+        command: []const u8,
+        arguments: []const u8,
+        turn_id: u64,
+    ) !Started {
+        const authority = command_admission.CommandExecutionAuthority{ .shell_allowed = .{
+            .fingerprint = .init(.{
+                .command = command,
+                .resolved_cwd = "/tmp",
+                .target_os = @import("builtin").target.os.tag,
+                .environment = self.environment,
+            }),
+            .source = .yolo,
+        } };
+        const result = try tool_dispatch.dispatchAuthorizedToolCall(.{
+            .allocator = self.alloc,
+            .workspace_root = "/tmp",
+            .tool_call_id = "steered-call",
+            .managed_executions = &self.runtime,
+            .execution_authority = .{ .run_command = authority },
+            .max_command_output_bytes = 4096,
+            .tool_yield_flag = &self.yield_flag,
+            .output_chunk_lifecycle_id = .{ .turn_id = turn_id, .call_id = "steered-call" },
+        }, registry, .{ .id = "steered-call", .name = "shell", .arguments_json = arguments });
+        defer result.deinit(self.alloc);
+        var parsed = try std.json.parseFromSlice(std.json.Value, self.alloc, result.body, .{});
+        defer parsed.deinit();
+        try std.testing.expectEqualStrings("running", parsed.value.object.get("state").?.string);
+        return .{
+            .id = try self.alloc.dupe(u8, parsed.value.object.get("session_id").?.string),
+            .notice = parsed.value.object.get("steering_notice") != null,
+        };
+    }
+
+    /// Starts `command` in turn `turn_id` with a `run` that waits up to
+    /// `yield_time_ms`.
+    fn run(self: *SteeringCancelTest, command: []const u8, yield_time_ms: u32, turn_id: u64) !Started {
+        const arguments = try self.alloc.print(
+            "{{\"action\":\"run\",\"command\":\"{s}\",\"cwd\":\"/tmp\",\"profile\":\"clean\",\"yield_time_ms\":{d}}}",
+            .{ command, yield_time_ms },
+        );
+        defer self.alloc.free(arguments);
+        return self.dispatch(command, arguments, turn_id);
+    }
+
+    /// Waits on the output of `started`, which runs `command`, with an
+    /// `interact` poll in turn `turn_id`.
+    fn poll(self: *SteeringCancelTest, command: []const u8, started: Started, turn_id: u64) !Started {
+        const arguments = try self.alloc.print(
+            "{{\"action\":\"interact\",\"session_id\":\"{s}\",\"yield_time_ms\":30000}}",
+            .{started.id},
+        );
+        defer self.alloc.free(arguments);
+        return self.dispatch(command, arguments, turn_id);
+    }
+
+    /// What an explicit cancel of turn `turn_id` does.
+    fn cancelTurn(self: *SteeringCancelTest, turn_id: u64) !void {
+        try stopSteeringDetached(.{ .allocator = self.alloc, .managed_executions = &self.runtime }, turn_id);
+    }
+
+    fn state(self: *SteeringCancelTest, started: Started) ?managed_execution.SnapshotState {
+        return self.runtime.stateFor(started.id);
+    }
+};
+
+test "a turn cancel stops the command steering detached and keeps a background one" {
+    if (comptime @import("builtin").target.os.tag == .wasi) return;
+    var t: SteeringCancelTest = undefined;
+    try t.init(std.testing.allocator);
+    defer t.deinit();
+
+    // Two commands steering moved, which stop on threads of their own.
+    const steered = [_]SteeringCancelTest.Started{
+        try t.run("sleep 30", 30_000, 5),
+        try t.run("sleep 32", 30_000, 5),
+    };
+    defer for (steered) |started| t.alloc.free(started.id);
+    for (steered) |started| try std.testing.expect(started.notice);
+    // A call that asked to return at once was not moved by steering.
+    const background = try t.run("sleep 31", 0, 5);
+    defer t.alloc.free(background.id);
+    try std.testing.expect(!background.notice);
+
+    // A cancel of another turn stops nothing.
+    try t.cancelTurn(6);
+    for (steered) |started| try std.testing.expectEqual(managed_execution.SnapshotState.running, t.state(started).?);
+
+    try t.cancelTurn(5);
+    const deadline_ms = io_mod.milliTimestamp() + 10_000;
+    for (steered) |started| while (t.state(started)) |state| {
+        if (state != .running) break;
+        if (io_mod.milliTimestamp() > deadline_ms) return error.TestUnexpectedResult;
+        io_mod.sleep(20 * std.time.ns_per_ms);
+    };
+    try std.testing.expectEqual(managed_execution.SnapshotState.running, t.state(background).?);
+}
+
+test "a turn cancel stops more steered commands than run at once, also when no task can start" {
+    if (comptime @import("builtin").target.os.tag == .wasi) return;
+    // `.nothing` runs every task of the group on the caller, as a
+    // single-threaded build does.
+    for ([_]std.Io.Limit{ std.testing.io_instance.async_limit, .nothing }) |limit| {
+        const previous_async_limit = std.testing.io_instance.async_limit;
+        std.testing.io_instance.setAsyncLimit(limit);
+        defer std.testing.io_instance.setAsyncLimit(previous_async_limit);
+        var t: SteeringCancelTest = undefined;
+        try t.init(std.testing.allocator);
+        defer t.deinit();
+
+        var steered: [max_parallel_detached_stops + 2]SteeringCancelTest.Started = undefined;
+        var started: usize = 0;
+        defer for (steered[0..started]) |command| t.alloc.free(command.id);
+        for (&steered) |*command| {
+            command.* = try t.run("sleep 30", 30_000, 5);
+            started += 1;
+            try std.testing.expect(command.notice);
+        }
+
+        try t.cancelTurn(5);
+        const deadline_ms = io_mod.milliTimestamp() + 10_000;
+        for (steered) |command| while (t.state(command)) |state| {
+            if (state != .running) break;
+            if (io_mod.milliTimestamp() > deadline_ms) return error.TestUnexpectedResult;
+            io_mod.sleep(20 * std.time.ns_per_ms);
+        };
+    }
+}
+
+test "a turn cancel keeps a command that steering cut short only in an interact poll" {
+    if (comptime @import("builtin").target.os.tag == .wasi) return;
+    var t: SteeringCancelTest = undefined;
+    try t.init(std.testing.allocator);
+    defer t.deinit();
+
+    // The model starts a server in the background itself, then polls it
+    // while steering waits. The poll returns for steering, but the cancel
+    // of its turn keeps the server.
+    const background = try t.run("sleep 30", 0, 5);
+    defer t.alloc.free(background.id);
+    try std.testing.expect(!background.notice);
+    const polled = try t.poll("sleep 30", background, 5);
+    defer t.alloc.free(polled.id);
+    try std.testing.expect(polled.notice);
+    try t.cancelTurn(5);
+    try std.testing.expectEqual(managed_execution.SnapshotState.running, t.state(background).?);
+
+    // A command steering cut short in turn 7 and polled in turn 8 stays
+    // with turn 7: the cancel of turn 8 keeps it.
+    const steered = try t.run("sleep 31", 30_000, 7);
+    defer t.alloc.free(steered.id);
+    try std.testing.expect(steered.notice);
+    const later_poll = try t.poll("sleep 31", steered, 8);
+    defer t.alloc.free(later_poll.id);
+    try std.testing.expect(later_poll.notice);
+    try t.cancelTurn(8);
+    try std.testing.expectEqual(managed_execution.SnapshotState.running, t.state(steered).?);
+    try std.testing.expectEqual(managed_execution.SnapshotState.running, t.state(background).?);
+}
+
+/// The steering cancel setup with a real terminal: the shell tool runs tty
+/// commands through an in-process terminal client in a private profile.
+const TtySteeringCancelTest = struct {
+    const owner_session_id = "steered-stop-owner";
+    const shell_path = "/bin/bash";
+    const terminal_client = @import("../../core/terminal/client.zig");
+    const session_child_store = @import("../../core/session/session_child_store.zig");
+
+    alloc: Allocator,
+    tmp: std.testing.TmpDir,
+    home: []u8,
+    capability: session_child_store.SessionChildCapability,
+    client: terminal_client.Runtime,
+    runtime: managed_execution.Runtime,
+    yield_flag: std.atomic.Value(bool),
+
+    fn init(self: *TtySteeringCancelTest) !void {
+        const host = @import("../../core/hosts/host.zig");
+        if (comptime !host.terminalSupportForOs(builtin.target.os.tag).isSupported()) {
+            return error.SkipZigTest;
+        }
+        const alloc = std.testing.allocator;
+        self.alloc = alloc;
+        self.yield_flag = .init(true);
+        self.tmp = std.testing.tmpDir(.{});
+        errdefer self.tmp.cleanup();
+        self.home = try io_mod.dirRealpathAlloc(alloc, self.tmp.dir, ".");
+        errdefer alloc.free(self.home);
+        var root = io_mod.VerifiedDir{ .dir = try self.tmp.dir.openDir(
+            std.testing.io,
+            ".",
+            .{ .iterate = true, .follow_symlinks = false },
+        ) };
+        defer root.close();
+        var fx_dir = try io_mod.openOrCreateVerifiedPrivateDir(&root, ".fx");
+        defer fx_dir.close();
+        var sessions = try io_mod.openOrCreateVerifiedPrivateDir(&fx_dir, "sessions");
+        defer sessions.close();
+        var owner = try io_mod.openOrCreateVerifiedPrivateDir(&sessions, owner_session_id);
+        defer owner.close();
+        const session_path = try std.Io.Dir.path.join(alloc, &.{ self.home, ".fx", "sessions", owner_session_id });
+        defer alloc.free(session_path);
+        self.capability = try session_child_store.SessionChildCapability.initForTesting(
+            alloc,
+            owner.dir,
+            session_path,
+            .writable,
+            .{},
+        );
+        errdefer self.capability.deinit();
+        self.client = terminal_client.Runtime.init(@import("process_provider.zig").provider);
+        self.client.profile_home = self.home;
+        self.runtime = managed_execution.Runtime.init(alloc);
+    }
+
+    fn deinit(self: *TtySteeringCancelTest) void {
+        self.client.closeOwnedTerminals();
+        self.client.joinExitDrainForTest(10_000);
+        self.client.deinit();
+        self.runtime.deinit();
+        self.capability.deinit();
+        self.alloc.free(self.home);
+        self.tmp.cleanup();
+    }
+
+    /// The context of a call outside any turn, as the cancel uses.
+    fn context(self: *TtySteeringCancelTest) tool_dispatch.DispatchContext {
+        return .{
+            .allocator = self.alloc,
+            .lifecycle_allocator = self.alloc,
+            .workspace_root = self.home,
+            .managed_executions = &self.runtime,
+            .terminal_client = &self.client,
+            .session_child_capability = &self.capability,
+            .terminal_owner_session_id = owner_session_id,
+            .max_command_output_bytes = 4096,
+        };
+    }
+
+    /// Runs `command` in a tty in turn `turn_id` while steering waits, and
+    /// returns its session id, which the caller frees.
+    fn run(self: *TtySteeringCancelTest, command: []const u8, turn_id: u64) ![]u8 {
+        var arena_state = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        var login_shell_buffer: [4096]u8 = undefined;
+        const environment = try shell_resolver.environmentForShellSpec(
+            arena,
+            shell_resolver.configuredLoginShellInto(&login_shell_buffer),
+            .{ .executable = .{ .path = shell_path, .clean_start = true } },
+        );
+        const authority = command_admission.CommandExecutionAuthority{ .shell_allowed = .{
+            .fingerprint = .init(.{
+                .command = command,
+                .resolved_cwd = self.home,
+                .target_os = builtin.target.os.tag,
+                .environment = environment,
+                .execution_mode = .tty,
+            }),
+            .source = .yolo,
+        } };
+        const arguments = try arena.print(
+            "{{\"action\":\"run\",\"tty\":true,\"command\":\"{s}\",\"shell\":{{\"kind\":\"executable\",\"path\":\"{s}\",\"clean_start\":true}},\"yield_time_ms\":30000}}",
+            .{ command, shell_path },
+        );
+        var ctx = self.context();
+        ctx.tool_call_id = "steered-tty-call";
+        ctx.execution_authority = .{ .run_command = authority };
+        ctx.tool_yield_flag = &self.yield_flag;
+        ctx.output_chunk_lifecycle_id = .{ .turn_id = turn_id, .call_id = "steered-tty-call" };
+        const result = try tool_dispatch.dispatchAuthorizedToolCall(
+            ctx,
+            SteeringCancelTest.registry,
+            .{ .id = "steered-tty-call", .name = "shell", .arguments_json = arguments },
+        );
+        defer result.deinit(self.alloc);
+        var parsed = try std.json.parseFromSlice(std.json.Value, self.alloc, result.body, .{});
+        defer parsed.deinit();
+        std.testing.expectEqualStrings("running", parsed.value.object.get("state").?.string) catch |err| {
+            std.debug.print("tty run result: {s}\n", .{result.body});
+            return err;
+        };
+        try std.testing.expect(parsed.value.object.get("steering_notice") != null);
+        return self.alloc.dupe(u8, parsed.value.object.get("session_id").?.string);
+    }
+
+    /// Admits waits for the exit of `session_id` until the client has
+    /// refused them for 200 ms, so every request slot is taken and not only
+    /// the intake queue. Returns how many it admitted.
+    fn fill(self: *TtySteeringCancelTest, session_id: []const u8, out: []terminal_contracts.CorrelationId) !usize {
+        var authority = try reloadTerminalAuthority(self.context(), session_id);
+        defer authority.deinit();
+        var count: usize = 0;
+        var refused_since_ms: ?i64 = null;
+        while (count < out.len) {
+            const correlation_id = self.client.nextCorrelationId();
+            self.client.admit(self.alloc, correlation_id, .{ .wait = .{
+                .session_id = session_id,
+                .return_when = .exit,
+                .safety_ceiling_ms = 30_000,
+                .authority = authority.view(),
+            } }) catch |err| switch (err) {
+                error.QueueFull => {
+                    const now_ms = io_mod.milliTimestamp();
+                    const since_ms = refused_since_ms orelse now_ms;
+                    if (now_ms - since_ms >= 200) return count;
+                    refused_since_ms = since_ms;
+                    io_mod.sleep(10 * std.time.ns_per_ms);
+                    continue;
+                },
+                else => return err,
+            };
+            refused_since_ms = null;
+            out[count] = correlation_id;
+            count += 1;
+        }
+        return error.TestUnexpectedResult;
+    }
+
+    /// Waits `delay_ms`, then cancels the waits `fill` admitted and takes
+    /// their completions, which frees their slots.
+    fn release(self: *TtySteeringCancelTest, ids: []const terminal_contracts.CorrelationId, delay_ms: u64) void {
+        io_mod.sleep(delay_ms * std.time.ns_per_ms);
+        for (ids) |id| _ = self.client.cancel(id);
+        const deadline_ms = io_mod.milliTimestamp() + 10_000;
+        for (ids) |id| while (io_mod.milliTimestamp() < deadline_ms) {
+            if (self.client.takeCompletionFor(id)) |completion_value| {
+                var completion = completion_value;
+                completion.deinit();
+                break;
+            }
+            io_mod.sleep(5 * std.time.ns_per_ms);
+        };
+    }
+};
+
+test "a stop failure counts as busy only for a retryable capacity refusal" {
+    const alloc = std.testing.allocator;
+    const cases = [_]struct { body: []const u8, busy: bool, code: []const u8 }{
+        // A cloned terminal failure, as the client's admission refusal gives.
+        .{ .body = "{\"failure\":{\"action\":\"signal\",\"code\":\"capacity_exceeded\",\"retryable\":true}}", .busy = true, .code = "capacity_exceeded" },
+        // The host's own limit, which a retry does not lift.
+        .{ .body = "{\"failure\":{\"action\":\"wait\",\"code\":\"capacity_exceeded\",\"retryable\":false}}", .busy = false, .code = "capacity_exceeded" },
+        // A lost host session is retryable for a wait, but not busy.
+        .{ .body = "{\"failure\":{\"action\":\"wait\",\"code\":\"session_lost\",\"retryable\":true}}", .busy = false, .code = "session_lost" },
+        // A shell failure.
+        .{ .body = "{\"error\":{\"tool\":\"shell\",\"code\":\"TerminalCapacityExceeded\",\"retryable\":true}}", .busy = true, .code = "TerminalCapacityExceeded" },
+        .{ .body = "{\"error\":{\"tool\":\"shell\",\"code\":\"TerminalObservationFailed\",\"retryable\":false}}", .busy = false, .code = "TerminalObservationFailed" },
+        .{ .body = "{\"error\":{\"tool\":\"shell\",\"code\":\"TerminalCapacityExceeded\",\"retryable\":\"true\"}}", .busy = false, .code = "TerminalCapacityExceeded" },
+        // Bodies that are not a failure object.
+        .{ .body = "not json", .busy = false, .code = "none" },
+        .{ .body = "[true]", .busy = false, .code = "none" },
+        .{ .body = "{\"retryable\":true}", .busy = false, .code = "none" },
+        .{ .body = "{\"error\":{\"retryable\":true}}", .busy = false, .code = "none" },
+    };
+    for (cases) |case| {
+        const body = try alloc.dupe(u8, case.body);
+        const result: tool_dispatch.ToolResult = .{ .failure = body };
+        defer result.deinit(alloc);
+        var code_buffer: [64]u8 = undefined;
+        const failure = stopFailure(alloc, result, &code_buffer);
+        std.testing.expectEqual(case.busy, failure.busy) catch |err| {
+            std.debug.print("body: {s}\n", .{case.body});
+            return err;
+        };
+        try std.testing.expectEqualStrings(case.code, failure.code);
+    }
+    const success: tool_dispatch.ToolResult = .{ .success = try alloc.dupe(u8, "{\"retryable\":true}") };
+    defer success.deinit(alloc);
+    var code_buffer: [64]u8 = undefined;
+    try std.testing.expect(!stopFailure(alloc, success, &code_buffer).busy);
+}
+
+test "a turn cancel stops a steered tty command while the terminal client is full" {
+    if (comptime builtin.target.os.tag == .wasi) return;
+    var t: TtySteeringCancelTest = undefined;
+    try t.init();
+    defer t.deinit();
+
+    const steered = try t.run("sleep 30", 5);
+    defer t.alloc.free(steered);
+
+    // Other agents hold every request slot of the terminal client.
+    var fillers: [64]terminal_contracts.CorrelationId = undefined;
+    const filled = try t.fill(steered, &fillers);
+    try std.testing.expect(filled > 0);
+    {
+        var authority = try reloadTerminalAuthority(t.context(), steered);
+        defer authority.deinit();
+        var refused = try terminal_action_executor.execute(.{
+            .alloc = t.alloc,
+            .lifecycle_allocator = t.alloc,
+            .runtime = &t.client,
+        }, .{ .screen = .{ .session_id = steered, .authority = authority.view() } });
+        defer refused.deinit(t.alloc);
+        switch (refused.view()) {
+            .failure => |failure| try std.testing.expect(failure.retryable),
+            .success => return error.TestUnexpectedResult,
+        }
+    }
+
+    // The slots free up while the cancel runs, after its first stop was
+    // refused. The stop runs again and ends the command.
+    const io = io_mod.getIo();
+    var releaser: std.Io.Group = .init;
+    releaser.concurrent(io, TtySteeringCancelTest.release, .{ &t, fillers[0..filled], 300 }) catch {
+        t.release(fillers[0..filled], 0);
+        return error.SkipZigTest;
+    };
+    try stopSteeringDetached(t.context(), 5);
+    releaser.await(io) catch {};
+    // A stopped command is either marked stopped or already gone.
+    if (t.runtime.stateFor(steered)) |state| try std.testing.expect(state != .running);
+}
+
 test "shell delivery advances only after result commit" {
     if (comptime @import("builtin").target.os.tag == .wasi) return;
     const alloc = std.testing.allocator;
@@ -3160,4 +4458,98 @@ test "shell run result carries a snapshot fallback notice once" {
     const second = try attachSnapshotNotice(alloc, .{ .success = try alloc.dupe(u8, "{\"state\":\"completed\"}") });
     defer second.deinit(alloc);
     try std.testing.expectEqualStrings("{\"state\":\"completed\"}", second.success);
+}
+
+test "a turn cancel gives up a steered tty stop the full terminal client keeps refusing" {
+    if (comptime builtin.target.os.tag == .wasi) return;
+    var t: TtySteeringCancelTest = undefined;
+    try t.init();
+    defer t.deinit();
+
+    const steered = try t.run("sleep 30", 5);
+    defer t.alloc.free(steered);
+    var fillers: [64]terminal_contracts.CorrelationId = undefined;
+    const filled = try t.fill(steered, &fillers);
+    defer t.release(fillers[0..filled], 0);
+
+    // The client stays full, so the graceful and the forced stop each run
+    // `max_busy_terminal_attempts` times and give up, and the command still
+    // runs. The waits between the runs add up to about 3.1 s.
+    const started_ms = io_mod.milliTimestamp();
+    try stopSteeringDetached(t.context(), 5);
+    const took_ms = io_mod.milliTimestamp() - started_ms;
+    try std.testing.expect(took_ms >= 2 * 1_550);
+    try std.testing.expectEqual(managed_execution.SnapshotState.running, t.runtime.stateFor(steered).?);
+}
+
+test "a turn-end lease release runs again while the terminal client is full" {
+    if (comptime builtin.target.os.tag == .wasi) return;
+    var t: TtySteeringCancelTest = undefined;
+    try t.init();
+    defer t.deinit();
+
+    const steered = try t.run("sleep 30", 5);
+    defer t.alloc.free(steered);
+    var fillers: [64]terminal_contracts.CorrelationId = undefined;
+    const filled = try t.fill(steered, &fillers);
+
+    // The slots free up 300 ms into the release, after its first run was
+    // refused, and it runs again.
+    const io = io_mod.getIo();
+    var releaser: std.Io.Group = .init;
+    releaser.concurrent(io, TtySteeringCancelTest.release, .{ &t, fillers[0..filled], 300 }) catch {
+        t.release(fillers[0..filled], 0);
+        return error.SkipZigTest;
+    };
+    const result = releaseAgentWriteLease(t.context(), steered);
+    releaser.await(io) catch {};
+    try result;
+
+    // With the client still full at the end, the release gives up.
+    const refilled = try t.fill(steered, &fillers);
+    defer t.release(fillers[0..refilled], 0);
+    try std.testing.expectError(error.TerminalLeaseCleanupFailed, releaseAgentWriteLease(t.context(), steered));
+}
+
+test "an unpublished tty close runs again while the terminal client is full" {
+    if (comptime builtin.target.os.tag == .wasi) return;
+    var t: TtySteeringCancelTest = undefined;
+    try t.init();
+    defer t.deinit();
+
+    const command = try t.run("sleep 30", 5);
+    defer t.alloc.free(command);
+    var fillers: [64]terminal_contracts.CorrelationId = undefined;
+    const filled = try t.fill(command, &fillers);
+
+    // The slots free up 300 ms into the close, after its first run was
+    // refused, and it runs again and ends the terminal.
+    const io = io_mod.getIo();
+    var releaser: std.Io.Group = .init;
+    releaser.concurrent(io, TtySteeringCancelTest.release, .{ &t, fillers[0..filled], 300 }) catch {
+        t.release(fillers[0..filled], 0);
+        return error.SkipZigTest;
+    };
+    closeTtyBestEffort(t.context(), command);
+    releaser.await(io) catch {};
+
+    // A closed terminal's authority is revoked; a running one still loads.
+    var authority = reloadTerminalAuthority(t.context(), command) catch |err| {
+        try std.testing.expectEqual(error.AuthorityRevoked, err);
+        return;
+    };
+    defer authority.deinit();
+    var inspected = try terminal_action_executor.execute(.{
+        .alloc = t.alloc,
+        .lifecycle_allocator = t.alloc,
+        .runtime = &t.client,
+    }, .{ .inspect = .{ .session_id = command, .authority = authority.view() } });
+    defer inspected.deinit(t.alloc);
+    switch (inspected.view()) {
+        .failure => |failure| try std.testing.expectEqual(terminal_contracts.StructuredErrorCode.session_not_found, failure.code),
+        .success => |success| switch (success) {
+            .inspect => |value| try std.testing.expect(value.session.lifecycle != .running),
+            else => return error.TestUnexpectedResult,
+        },
+    }
 }

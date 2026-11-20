@@ -126,6 +126,10 @@ fn writeKey(jw: *std.json.Stringify, key: settings_keys.Key) !void {
             try jw.objectField("additionalProperties");
             try jw.beginObject();
             try field(jw, "type", "string");
+            if (key.values.len > 0) {
+                try jw.objectField("enum");
+                try jw.write(key.values);
+            }
             try jw.endObject();
         },
         .switches => {

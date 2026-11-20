@@ -5,6 +5,7 @@ import json
 import os
 import pathlib
 import tempfile
+import types
 import unittest
 
 from scripts.pgso import macos
@@ -30,11 +31,14 @@ from scripts.pgso.pipeline import (
     FX_CODEGEN_FLAGS,
     GENERATION_FLAGS,
     IR_OUTLINER_FLAGS,
+    IR_OUTLINER_ROUNDS,
     OUTLINE_CLEANUP_FLAGS,
     PROFILE_PREPARATION_PASSES,
     USE_FLAGS,
     ArtifactSpec,
     PipelinePaths,
+    _outline_excluding_dropped_outputs,
+    _outline_without_folded_constants,
     apply_profile,
     cleanup_outlined_ir_argv,
     candidate_object_argv,
@@ -51,6 +55,7 @@ from scripts.pgso.pipeline import (
     profile_use_argv,
     reject_profile_outputs,
     remove_profile_records,
+    unoptimized_bitcode_argv,
     validate_archive_unchanged,
     validate_bitcode_hash,
     validate_candidate_size,
@@ -302,20 +307,31 @@ class PgsoPipelineTests(unittest.TestCase):
             f"""import pathlib,sys
 with pathlib.Path({str(actions)!r}).open('a') as stream:
     stream.write('ir_size ' + ' '.join(sys.argv[1:]) + '\\n')
+if 'dropped-outputs' in sys.argv:
+    print('{{"callers": [], "instances": [], "outlined_functions": 0}}')
+    sys.exit(0)
 if 'check-outlined' not in sys.argv:
     pathlib.Path(sys.argv[-1]).write_bytes({output!r})
 print('{{}}')""",
         )
 
-    def write_bitcode_zig(self, actions: pathlib.Path) -> pathlib.Path:
+    def write_bitcode_zig(self, actions: pathlib.Path, *, rerun_output: bytes = b"BC\xc0\xdezig") -> pathlib.Path:
+        """`zig build pgso-ir --verbose` installs an optimized, wrapped module
+        and prints its compile; that compile run again writes `rerun_output`
+        to its `--verbose-llvm-bc` path."""
         return self.write_executable(
             "bitcode-zig",
             f"""import pathlib,sys
 with pathlib.Path({str(actions)!r}).open('a') as stream:
     stream.write('zig ' + ' '.join(sys.argv[1:]) + '\\n')
-prefix = pathlib.Path(sys.argv[sys.argv.index('--prefix') + 1])
-(prefix / 'pgso').mkdir(parents=True, exist_ok=True)
-(prefix / 'pgso' / 'fx.bc').write_bytes(b'BC\\xc0\\xdezig')""",
+if sys.argv[1] == 'build':
+    prefix = pathlib.Path(sys.argv[sys.argv.index('--prefix') + 1])
+    (prefix / 'pgso').mkdir(parents=True, exist_ok=True)
+    (prefix / 'pgso' / 'fx.bc').write_bytes(b'\\xde\\xc0\\x17\\x0boptimized')
+    sys.stderr.write('info(verbose): ' + sys.argv[0] + ' build-exe -Osafe -Mroot=src/main.zig -femit-llvm-bc --name fx --listen=-\\n')
+else:
+    out = [a for a in sys.argv if a.startswith('--verbose-llvm-bc=')][0].split('=', 1)[1]
+    pathlib.Path(out).write_bytes({rerun_output!r})""",
         )
 
     def test_emitted_bitcode_outlines_helpers_before_identity_is_recorded(self) -> None:
@@ -332,12 +348,17 @@ prefix = pathlib.Path(sys.argv[sys.argv.index('--prefix') + 1])
         self.assertEqual(b"BC\xc0\xdestaged", self.paths.bitcode.read_bytes())
         self.assertEqual(sha256_file(self.paths.bitcode), digest)
         lines = actions.read_text().splitlines()
-        self.assertEqual(2, len(lines))
+        self.assertEqual(3, len(lines))
         self.assertTrue(lines[0].startswith("zig build pgso-ir "))
+        self.assertTrue(lines[0].endswith(" --verbose"))
+        self.assertEqual(
+            f"zig build-exe -Osafe -Mroot=src/main.zig --name fx -fno-emit-bin --verbose-llvm-bc={self.paths.bitcode}",
+            lines[1],
+        )
         self.assertEqual(
             f"ir_size --libllvm {toolchain.libllvm} outline-helpers "
             f"{self.paths.bitcode} {self.paths.bitcode}.staged",
-            lines[1],
+            lines[2],
         )
         self.assertFalse(self.paths.bitcode.with_name("fx.bc.staged").exists())
         emit_bitcode(toolchain, self.spec, self.paths, expected_sha256=digest)
@@ -356,6 +377,137 @@ prefix = pathlib.Path(sys.argv[sys.argv.index('--prefix') + 1])
 
         self.assertEqual(wrapped, self.paths.bitcode.read_bytes())
         self.assertEqual(sha256_file(self.paths.bitcode), digest)
+
+    def test_emitted_bitcode_is_the_module_zig_generated_not_the_optimized_one(self) -> None:
+        # Zig 0.17.1's -femit-llvm-bc is optimized, and LLVM's writer wraps
+        # Darwin bitcode, which Zig's own writer never does.
+        actions = self.root / "emit-optimized"
+        toolchain = dataclasses.replace(
+            self.toolchain,
+            zig=self.write_bitcode_zig(actions, rerun_output=b"\xde\xc0\x17\x0boptimized"),
+            ir_size=self.write_ir_size(actions),
+        )
+        self.spec.repo_root.mkdir(parents=True)
+
+        with self.assertRaisesRegex(PgsoError, "was not written by Zig"):
+            emit_bitcode(toolchain, self.spec, self.paths)
+
+    def test_emitted_bitcode_never_keeps_the_installed_optimized_module(self) -> None:
+        actions = self.root / "emit-missing"
+        toolchain = dataclasses.replace(
+            self.toolchain,
+            zig=self.write_executable(
+                "no-rerun-zig",
+                f"""import pathlib,sys
+with pathlib.Path({str(actions)!r}).open('a') as stream:
+    stream.write('zig ' + ' '.join(sys.argv[1:]) + '\\n')
+if sys.argv[1] == 'build':
+    prefix = pathlib.Path(sys.argv[sys.argv.index('--prefix') + 1])
+    (prefix / 'pgso').mkdir(parents=True, exist_ok=True)
+    (prefix / 'pgso' / 'fx.bc').write_bytes(b'BC\\xc0\\xdeoptimized')
+    sys.stderr.write('info(verbose): ' + sys.argv[0] + ' build-exe -femit-llvm-bc --listen=-\\n')""",
+            ),
+            ir_size=self.write_ir_size(actions),
+        )
+        self.spec.repo_root.mkdir(parents=True)
+
+        with self.assertRaisesRegex(PgsoError, "ReleaseSafe LLVM bitcode"):
+            emit_bitcode(toolchain, self.spec, self.paths)
+        self.assertFalse(self.paths.bitcode.exists())
+
+    def write_unreproducible_zig(self, actions: pathlib.Path, *, new_result_each_build: bool = False) -> pathlib.Path:
+        """Like Zig 0.17.1: the printed compile writes different bytes on every
+        run. `pgso-ir` installs the same optimized module each time, as on a
+        cache hit, unless `new_result_each_build` is set."""
+        counter = self.root / "build-counter"
+        return self.write_executable(
+            "unreproducible-zig",
+            f"""import os,pathlib,sys
+with pathlib.Path({str(actions)!r}).open('a') as stream:
+    stream.write('zig ' + ' '.join(sys.argv[1:]) + '\\n')
+if sys.argv[1] == 'build':
+    count = pathlib.Path({str(counter)!r})
+    n = int(count.read_text()) + 1 if count.exists() else 1
+    count.write_text(str(n))
+    prefix = pathlib.Path(sys.argv[sys.argv.index('--prefix') + 1])
+    (prefix / 'pgso').mkdir(parents=True, exist_ok=True)
+    result = str(n) if {new_result_each_build!r} else 'cached'
+    (prefix / 'pgso' / 'fx.bc').write_bytes(b'\\xde\\xc0\\x17\\x0boptimized' + result.encode())
+    sys.stderr.write('info(verbose): ' + sys.argv[0] + ' build-exe -Mroot=src/main.zig -femit-llvm-bc --listen=-\\n')
+else:
+    out = [a for a in sys.argv if a.startswith('--verbose-llvm-bc=')][0].split('=', 1)[1]
+    pathlib.Path(out).write_bytes(b'BC\\xc0\\xde' + os.urandom(16))""",
+        )
+
+    def write_passthrough_ir_size(self) -> pathlib.Path:
+        return self.write_executable(
+            "passthrough-ir-size",
+            """import pathlib,sys
+pathlib.Path(sys.argv[-1]).write_bytes(pathlib.Path(sys.argv[-2]).read_bytes())
+print('{}')""",
+        )
+
+    def test_a_later_emit_of_the_same_pgso_ir_result_matches_the_first(self) -> None:
+        # The distributed and benchmark flows emit twice in one run and
+        # require the same hash; Zig 0.17.1's compile is not reproducible.
+        actions = self.root / "emit-twice"
+        toolchain = dataclasses.replace(
+            self.toolchain,
+            zig=self.write_unreproducible_zig(actions),
+            ir_size=self.write_passthrough_ir_size(),
+        )
+        self.spec.repo_root.mkdir(parents=True)
+
+        digest = emit_bitcode(toolchain, self.spec, self.paths)
+        self.assertEqual(digest, emit_bitcode(toolchain, self.spec, self.paths, expected_sha256=digest))
+
+        compiles = [line for line in actions.read_text().splitlines() if line.startswith("zig build-exe ")]
+        self.assertEqual(1, len(compiles))
+
+    def test_a_new_pgso_ir_result_compiles_the_module_again(self) -> None:
+        actions = self.root / "emit-new-result"
+        toolchain = dataclasses.replace(
+            self.toolchain,
+            zig=self.write_unreproducible_zig(actions, new_result_each_build=True),
+            ir_size=self.write_passthrough_ir_size(),
+        )
+        self.spec.repo_root.mkdir(parents=True)
+
+        digest = emit_bitcode(toolchain, self.spec, self.paths)
+        with self.assertRaisesRegex(PgsoError, "bitcode identity mismatch"):
+            emit_bitcode(toolchain, self.spec, self.paths, expected_sha256=digest)
+
+        compiles = [line for line in actions.read_text().splitlines() if line.startswith("zig build-exe ")]
+        self.assertEqual(2, len(compiles))
+
+    def test_unoptimized_bitcode_argv_reruns_the_one_printed_compile(self) -> None:
+        bitcode = pathlib.Path("/tmp/out/fx.bc")
+        output = (
+            "info(verbose): /z/zig build-exe --name configurer -Mroot=configurer.zig --listen=-\n"
+            "info(verbose): /z/zig build-exe -Osafe -Mroot=src/main.zig -femit-llvm-bc -femit-bin=x --cache-dir /c --listen=-\n"
+        )
+        self.assertEqual(
+            ("/z/zig", "build-exe", "-Osafe", "-Mroot=src/main.zig", "--cache-dir", "/c", "-fno-emit-bin", f"--verbose-llvm-bc={bitcode}"),
+            unoptimized_bitcode_argv(output, bitcode),
+        )
+        test_output = "info(verbose): /z/zig test -Osafe -Mroot=src/main.zig -femit-llvm-bc --listen=-\n"
+        self.assertEqual(
+            ("/z/zig", "test", "-Osafe", "-Mroot=src/main.zig", "--test-no-exec", "-fno-emit-bin", f"--verbose-llvm-bc={bitcode}"),
+            unoptimized_bitcode_argv(test_output, bitcode),
+        )
+
+    def test_unoptimized_bitcode_argv_rejects_output_it_cannot_trust(self) -> None:
+        bitcode = pathlib.Path("/tmp/out/fx.bc")
+        line = "info(verbose): /z/zig build-exe -femit-llvm-bc --listen=-"
+        for output, message in (
+            ("", "found 0"),
+            ("info(verbose): /z/zig build-exe -Mroot=a.zig --listen=-", "found 0"),
+            (line + "\n" + line, "found 2"),
+            ("info(verbose): /z/zig build-exe -femit-llvm-bc", "unexpected pgso-ir compile"),
+            ("info(verbose): /z/zig build-exe -femit-llvm-bc=a.bc --listen=-", "unexpected pgso-ir compile"),
+        ):
+            with self.subTest(output=output), self.assertRaisesRegex(PgsoError, message):
+                unoptimized_bitcode_argv(output, bitcode)
 
     def test_emitted_bitcode_rejects_a_failed_or_invalid_helper_pass(self) -> None:
         actions = self.root / "emit-failures"
@@ -399,25 +551,28 @@ pathlib.Path(sys.argv[sys.argv.index('-o') + 1]).write_bytes(b'bitcode')""",
 
         self.assertEqual(paths.profile_use_bitcode, result)
         lines = actions.read_text().splitlines()
-        self.assertEqual(10, len(lines))
+        self.assertEqual(12, len(lines))
         self.assertIn(f"-passes={PROFILE_PREPARATION_PASSES},default<O2>,mergefunc ", lines[0])
         self.assertTrue(lines[0].endswith(f"-o {paths.profile_use_base_bitcode}"))
         base = paths.profile_use_base_bitcode
         expanded = base.with_name(base.name + ".expanded.bc")
         swapped = base.with_name(base.name + ".swapped.bc")
+        widened = base.with_name(base.name + ".widened.bc")
         self.assertIn(f"expand-constant-exprs {base} {expanded}", lines[1])
         self.assertIn(f"swap-compares {expanded} {swapped}", lines[2])
-        self.assertIn(f"-passes=iroutliner {swapped} -o {paths.profile_use_bitcode}", lines[3])
-        self.assertTrue(lines[4].endswith(f"check-outlined {paths.profile_use_bitcode}"))
-        self.assertIn(f"sparse-constants {paths.profile_use_bitcode} ", lines[5])
+        self.assertIn(f"widen-constants {swapped} {widened}", lines[3])
+        self.assertIn(f"-passes=iroutliner {widened} -o {paths.profile_use_bitcode}", lines[4])
+        self.assertTrue(lines[5].endswith(f"dropped-outputs {paths.profile_use_bitcode}"))
+        self.assertTrue(lines[6].endswith(f"check-outlined {paths.profile_use_bitcode}"))
+        self.assertIn(f"sparse-constants {paths.profile_use_bitcode} ", lines[7])
         sparse = paths.profile_use_bitcode.with_name(paths.profile_use_bitcode.name + ".sparse")
         overlaid = paths.profile_use_bitcode.with_name(paths.profile_use_bitcode.name + ".overlaid")
         zero_filled = paths.profile_use_bitcode.with_name(paths.profile_use_bitcode.name + ".zero-filled")
         compacted = paths.profile_use_bitcode.with_name(paths.profile_use_bitcode.name + ".compacted")
-        self.assertIn(f"overlay-constants {sparse} {overlaid}", lines[6])
-        self.assertIn(f"zero-fill-globals {overlaid} {zero_filled}", lines[7])
-        self.assertIn(f"compact-error-names {zero_filled} {compacted}", lines[8])
-        self.assertIn(f"-passes=globaldce,verify {compacted} -o {paths.profile_use_bitcode}", lines[9])
+        self.assertIn(f"overlay-constants {sparse} {overlaid}", lines[8])
+        self.assertIn(f"zero-fill-globals {overlaid} {zero_filled}", lines[9])
+        self.assertIn(f"compact-error-names {zero_filled} {compacted}", lines[10])
+        self.assertIn(f"-passes=globaldce,verify {compacted} -o {paths.profile_use_bitcode}", lines[11])
 
     def test_profile_use_stops_when_the_outliner_folds_a_nested_constant(self) -> None:
         actions = self.root / "folded-actions"
@@ -431,8 +586,11 @@ pathlib.Path(sys.argv[sys.argv.index('-o') + 1]).write_bytes(b'bitcode')""",
             f"""import pathlib,sys
 with pathlib.Path({str(actions)!r}).open('a') as stream:
     stream.write('ir_size ' + ' '.join(sys.argv[1:]) + '\\n')
+if 'dropped-outputs' in sys.argv:
+    print('{{"callers": [], "instances": [], "outlined_functions": 0}}')
+    sys.exit(0)
 if 'check-outlined' in sys.argv:
-    sys.stderr.write('ir_size: IR outliner folded a nested constant into a parameter')
+    sys.stderr.write('ir_size: IR outliner miscompiled an outlined function: outlined_ir_func_3: constant expression with a parameter operand')
     sys.exit(1)
 pathlib.Path(sys.argv[-1]).write_bytes(b'BC\\xc0\\xdestaged')
 print('{{}}')""",
@@ -445,6 +603,115 @@ print('{{}}')""",
         with self.assertRaisesRegex(PgsoError, "failed with exit code 1"):
             apply_profile(toolchain, paths, sha256_file(paths.bitcode))
         self.assertNotIn("sparse-constants", actions.read_text())
+
+    def outline_with_drops(self, drops: list[list[str]]) -> tuple[list[str], pathlib.Path]:
+        """Run the outlining path with a fake outliner whose nth result drops
+        the outputs of a function called from `drops[n]`."""
+        actions = self.root / "drop-actions"
+        state = self.root / "drop-state"
+        opt = self.write_executable(
+            "drop-opt",
+            f"""import pathlib,sys
+with pathlib.Path({str(actions)!r}).open('a') as stream:
+    stream.write('opt ' + ' '.join(sys.argv[1:]) + '\\n')
+pathlib.Path(sys.argv[sys.argv.index('-o') + 1]).write_bytes(b'BC\\xc0\\xdeoutlined')""",
+        )
+        ir_size = self.write_executable(
+            "drop-ir-size",
+            f"""import json,pathlib,sys
+args = sys.argv[3:]
+with pathlib.Path({str(actions)!r}).open('a') as stream:
+    stream.write('ir_size ' + ' '.join(args) + '\\n')
+    if 'no-outline' in args:
+        stream.write('excluded ' + pathlib.Path(args[args.index('--functions') + 1]).read_text().replace('\\n', ' ') + '\\n')
+state = pathlib.Path({str(state)!r})
+seen = int(state.read_text()) if state.exists() else 0
+drops = {drops!r}
+if 'dropped-outputs' in args:
+    callers = drops[seen] if seen < len(drops) else []
+    state.write_text(str(seen + 1))
+    instances = [{{'function': 'outlined_ir_func_7', 'blocks': ['output_block_1_0'], 'stores_to_parameter': True, 'callers': callers}}] if callers else []
+    print(json.dumps({{'callers': callers, 'instances': instances, 'outlined_functions': 3}}))
+    sys.exit(0)
+if 'check-outlined' in args:
+    if drops[seen - 1] if seen <= len(drops) else []:
+        sys.stderr.write('ir_size: IR outliner miscompiled an outlined function: outlined_ir_func_7')
+        sys.exit(1)
+    print('{{}}')
+    sys.exit(0)
+pathlib.Path(args[-1]).write_bytes(b'BC\\xc0\\xdestaged')
+print('{{}}')""",
+        )
+        toolchain = dataclasses.replace(self.toolchain, opt=opt, ir_size=ir_size)
+        source = self.paths.profile_use_base_bitcode
+        source.write_bytes(b"BC\xc0\xdebase")
+        try:
+            _outline_without_folded_constants(toolchain, self.paths, source, self.paths.outlined_bitcode, "drops")
+        finally:
+            lines = actions.read_text().splitlines()
+        return lines, source.with_name(source.name + ".widened.bc")
+
+    def test_outlining_excludes_callers_of_dropped_outputs_and_outlines_again(self) -> None:
+        lines, widened = self.outline_with_drops([["caller.b", "caller.a"], []])
+
+        outlines = [line for line in lines if line.startswith("opt ")]
+        self.assertEqual(2, len(outlines))
+        self.assertIn(f"-passes=iroutliner {widened} -o ", outlines[0])
+        excluded = widened.with_name(widened.name + ".excluded.bc")
+        self.assertIn(f"-passes=iroutliner {excluded} -o ", outlines[1])
+        self.assertIn("excluded caller.b caller.a ", lines)
+        no_outline = next(line for line in lines if " no-outline " in line)
+        self.assertTrue(no_outline.endswith(f"no-outline {widened} {excluded}"))
+        self.assertTrue(lines[-1].endswith(f"check-outlined {self.paths.outlined_bitcode}"))
+        rounds = json.loads((self.paths.logs / "outline-rounds-drops.json").read_text())
+        self.assertEqual(["caller.b", "caller.a"], rounds["excluded"])
+        self.assertEqual([1, 2], [entry["round"] for entry in rounds["rounds"]])
+        self.assertEqual(["caller.b", "caller.a"], rounds["rounds"][0]["excluded"])
+        self.assertEqual("outlined_ir_func_7", rounds["rounds"][0]["dropped_outputs"][0]["function"])
+        self.assertEqual([], rounds["rounds"][1]["dropped_outputs"])
+        for log in ("outline-drops-round-2", "dropped-outputs-drops-round-2", "no-outline-drops-round-1"):
+            self.assertTrue((self.paths.logs / f"{log}.json").is_file(), log)
+
+    def test_outlining_fails_closed_when_outputs_are_still_dropped_after_the_last_round(self) -> None:
+        drops = [[f"caller.{number}"] for number in range(IR_OUTLINER_ROUNDS)]
+
+        with self.assertRaisesRegex(PgsoError, "failed with exit code 1"):
+            self.outline_with_drops(drops)
+
+        lines = (self.root / "drop-actions").read_text().splitlines()
+        self.assertEqual(IR_OUTLINER_ROUNDS, sum(line.startswith("opt ") for line in lines))
+        self.assertEqual(IR_OUTLINER_ROUNDS - 1, sum(" no-outline " in line for line in lines))
+        self.assertTrue(lines[-1].endswith(f"check-outlined {self.paths.outlined_bitcode}"))
+        rounds = json.loads((self.paths.logs / "outline-rounds-drops.json").read_text())
+        self.assertEqual([f"caller.{number}" for number in range(IR_OUTLINER_ROUNDS - 1)], rounds["excluded"])
+        self.assertEqual([], rounds["rounds"][-1]["excluded"])
+        self.assertEqual(["caller.3"], rounds["rounds"][-1]["dropped_outputs"][0]["callers"])
+
+    def test_outlining_rejects_a_dropped_outputs_result_it_cannot_read(self) -> None:
+        opt = self.write_executable(
+            "unread-opt",
+            """import pathlib,sys
+pathlib.Path(sys.argv[sys.argv.index('-o') + 1]).write_bytes(b'BC\\\\xc0\\\\xdeoutlined')""",
+        )
+        source = self.paths.profile_use_base_bitcode
+        source.write_bytes(b"BC\xc0\xdebase")
+        for name, printed in (
+            ("list", "[1, 2]"),
+            ("text", "not json"),
+            ("caller", '{"callers": [7], "instances": [], "outlined_functions": 1}'),
+        ):
+            with self.subTest(name):
+                ir_size = self.write_executable(
+                    f"unread-ir-size-{name}",
+                    f"""import sys
+if 'dropped-outputs' in sys.argv:
+    print({printed!r})
+    sys.exit(0)
+print('{{}}')""",
+                )
+                toolchain = dataclasses.replace(self.toolchain, opt=opt, ir_size=ir_size)
+                with self.assertRaisesRegex(PgsoError, "dropped-outputs printed no"):
+                    _outline_excluding_dropped_outputs(toolchain, self.paths, source, self.paths.outlined_bitcode, name)
 
     def test_profile_pipelines_use_the_exact_accepted_flags(self) -> None:
         self.assertEqual(
@@ -532,6 +799,21 @@ print('{{}}')""",
             ),
             profile_use_argv(self.toolchain, benchmark_paths),
         )
+        self.assertEqual(
+            (
+                str(self.toolchain.opt),
+                *USE_FLAGS,
+                f"-profile-file={benchmark_paths.merged_profile}",
+                str(benchmark_paths.bitcode),
+                "-o",
+                str(benchmark_paths.profile_use_base_bitcode),
+            ),
+            profile_use_argv(
+                self.toolchain,
+                benchmark_paths,
+                production_flags=True,
+            ),
+        )
         mapped_profile = self.paths.profiles / "production.profdata"
         self.assertEqual(
             f"-profile-file={mapped_profile}",
@@ -618,6 +900,7 @@ print('{{}}')""",
                 "approval-review-bench",
                 "approval-review.bc",
             ),
+            ("unit_tests", "install-test", "fx-test", "unit-tests.bc"),
         )
         for selector, build_step, binary_name, bitcode_name in cases:
             with self.subTest(selector=selector):
@@ -660,9 +943,15 @@ print('{{}}')""",
             selector="file_index",
         )
         benchmark_object = candidate_object_argv(self.toolchain, benchmark_paths)
+        measured_benchmark_object = candidate_object_argv(
+            self.toolchain,
+            benchmark_paths,
+            production_flags=True,
+        )
 
         for alignment in PROFILE_SECTION_ALIGNMENTS:
             self.assertIn(alignment, instrumented)
+        self.assertIn(f"-Wl,-map,{self.paths.logs / 'instrumented-link.map'}", instrumented)
         self.assertIn("-mmacosx-version-min=13.0", instrumented)
         self.assertIn(str(self.toolchain.tools.sdk), instrumented)
         self.assertIn(str(self.toolchain.profile_runtime), instrumented)
@@ -685,6 +974,7 @@ print('{{}}')""",
         for flag in FX_CODEGEN_FLAGS:
             self.assertIn(flag, candidate_object)
             self.assertNotIn(flag, benchmark_object)
+            self.assertIn(flag, measured_benchmark_object)
 
     def test_candidate_object_and_signing_contract(self) -> None:
         actions = self.root / "candidate-actions.txt"
@@ -823,6 +1113,34 @@ pathlib.Path(sys.argv[sys.argv.index('-map') + 1]).write_bytes({link_map!r}.enco
             (self.paths.logs / "candidate-layout.json").read_text(),
         )
 
+    def test_the_platform_prepares_the_bitcode_before_code_generation(self) -> None:
+        actions = self.root / "prepare-actions.txt"
+        tool = self.write_executable(
+            "prepare-tool",
+            f"""import pathlib,sys
+with pathlib.Path({str(actions)!r}).open('a') as stream:
+    stream.write('tool ' + ('-S' if '-S' in sys.argv else '-filetype=obj') + '\\n')
+pathlib.Path(sys.argv[sys.argv.index('-o') + 1]).write_bytes(b'artifact')""",
+        )
+
+        def record(step: str):
+            def hook(_toolchain, _paths) -> None:
+                with actions.open("a") as stream:
+                    stream.write(step + "\n")
+            return hook
+
+        platform = types.SimpleNamespace(
+            prepare_candidate_bitcode=record("prepare"),
+            candidate_object_flags=lambda _paths: (),
+            link_candidate_binary=record("link"),
+        )
+        toolchain = self.replace_toolchain(opt=tool, llc=tool, platform=platform)
+        self.paths.profile_use_bitcode.write_bytes(b"bitcode")
+
+        link_candidate(toolchain, self.paths, require_release_safe_evidence=False)
+
+        self.assertEqual(["prepare", "tool -S", "tool -filetype=obj", "link"], actions.read_text().splitlines())
+
     def test_benchmark_candidate_keeps_the_zig_linker(self) -> None:
         paths = PipelinePaths.create(self.root / "benchmark-link", selector="ui_activity")
         artifact = self.write_executable(
@@ -841,6 +1159,69 @@ pathlib.Path(sys.argv[sys.argv.index('-o') + 1]).write_bytes(b'artifact')""",
         ))
         self.assertFalse((paths.logs / "candidate-runtime-probe.json").exists())
         self.assertFalse((paths.logs / "candidate-layout.json").exists())
+
+    def test_measured_benchmark_candidate_builds_with_the_production_flags(self) -> None:
+        for production_flags, use_flags, codegen_flags in (
+            (False, BENCHMARK_USE_FLAGS, ()),
+            (True, USE_FLAGS, FX_CODEGEN_FLAGS),
+        ):
+            with self.subTest(production_flags=production_flags):
+                actions = self.root / f"measured-actions-{production_flags}"
+                artifact = self.write_executable(
+                    f"measured-tool-{production_flags}",
+                    f"""import pathlib,sys
+with pathlib.Path({str(actions)!r}).open('a') as stream:
+    stream.write(' '.join(sys.argv[1:]) + '\\n')
+pathlib.Path(sys.argv[sys.argv.index('-o') + 1]).write_bytes(b'artifact')""",
+                )
+                noop = self.write_executable("noop", "pass")
+                toolchain = self.replace_toolchain(
+                    zig=artifact, opt=artifact, llc=artifact,
+                    strip=noop, codesign=noop,
+                    ir_size=self.write_ir_size(actions),
+                )
+                paths = PipelinePaths.create(
+                    self.root / f"measured-{production_flags}",
+                    selector="file_index",
+                )
+                paths.bitcode.write_bytes(b"same bitcode")
+                paths.merged_profile.write_bytes(b"profile")
+
+                apply_profile(
+                    toolchain,
+                    paths,
+                    sha256_file(paths.bitcode),
+                    production_flags=production_flags,
+                )
+                link_candidate(
+                    toolchain,
+                    paths,
+                    require_release_safe_evidence=False,
+                    production_flags=production_flags,
+                )
+
+                lines = actions.read_text().splitlines()
+                self.assertEqual(
+                    " ".join((
+                        *use_flags,
+                        f"-profile-file={paths.merged_profile}",
+                        str(paths.bitcode),
+                        "-o",
+                        str(paths.profile_use_base_bitcode),
+                    )),
+                    lines[0],
+                )
+                self.assertIn(
+                    " ".join((
+                        "-filetype=obj",
+                        "-O=2",
+                        *codegen_flags,
+                        str(paths.profile_use_bitcode),
+                        "-o",
+                        str(paths.profile_use_object),
+                    )),
+                    lines,
+                )
 
     def test_bitcode_hash_must_match_the_original(self) -> None:
         bitcode = self.root / "fx.bc"
@@ -1146,7 +1527,7 @@ print('_main T ---------------- 0')""",
         )
 
         lines = actions.read_text().splitlines()
-        self.assertEqual(14, len(lines))
+        self.assertEqual(16, len(lines))
         self.assertTrue(lines[0].startswith("opt "))
         marked = self.paths.profile_use_base_bitcode.with_name(
             self.paths.profile_use_base_bitcode.name + ".no-outline.bc"
@@ -1175,7 +1556,7 @@ print('_main T ---------------- 0')""",
         self.assertEqual(self.paths.profile_use_bitcode, result)
         self.assertEqual(b"bitcode", result.read_bytes())
         lines = actions.read_text().splitlines()
-        self.assertEqual(13, len(lines))
+        self.assertEqual(15, len(lines))
         self.assertIn("-passes=function(sroa,instcombine<no-verify-fixpoint>,loop-unroll-full,instcombine<no-verify-fixpoint>,simplifycfg),default<O2>,mergefunc", lines[0])
         self.assertNotIn("iroutliner", lines[0])
         self.assertEqual("nm", lines[1])
@@ -1183,22 +1564,28 @@ print('_main T ---------------- 0')""",
         outlined = self.paths.outlined_bitcode
         expanded = source.with_name(source.name + ".expanded.bc")
         swapped = source.with_name(source.name + ".swapped.bc")
+        widened = source.with_name(source.name + ".widened.bc")
         self.assertIn(f"expand-constant-exprs {source} {expanded}", lines[2])
         self.assertIn(f"swap-compares {expanded} {swapped}", lines[3])
-        self.assertIn(f"-passes=iroutliner {swapped} -o {outlined}", lines[4])
-        self.assertTrue(lines[5].endswith(f"check-outlined {outlined}"))
+        self.assertIn(f"widen-constants {swapped} {widened}", lines[4])
+        self.assertIn(f"-passes=iroutliner {widened} -o {outlined}", lines[5])
+        self.assertTrue(lines[6].endswith(f"dropped-outputs {outlined}"))
+        self.assertTrue(lines[7].endswith(f"check-outlined {outlined}"))
         self.assertTrue((self.paths.logs / "swap-compares-profile-use.json").is_file())
+        self.assertTrue((self.paths.logs / "widen-constants-profile-use.json").is_file())
         self.assertTrue((self.paths.logs / "check-outlined-profile-use.json").is_file())
-        self.assertIn("-passes=internalize,constmerge,globaldce,mergefunc,verify", lines[6])
-        self.assertIn(f"{outlined} -o {self.paths.profile_use_bitcode}", lines[6])
-        self.assertTrue(lines[7].startswith("ir_size --libllvm "))
-        self.assertIn(f"sparse-constants {self.paths.profile_use_bitcode} ", lines[7])
-        self.assertIn("overlay-constants ", lines[8])
-        self.assertIn("zero-fill-globals ", lines[9])
-        self.assertIn("compact-error-names ", lines[10])
-        self.assertIn("-passes=globaldce,verify", lines[11])
-        self.assertTrue(lines[11].endswith(f"-o {self.paths.profile_use_bitcode}"))
-        self.assertEqual("nm", lines[12])
+        rounds = json.loads((self.paths.logs / "outline-rounds-profile-use.json").read_text())
+        self.assertEqual({"excluded": [], "rounds": [{"dropped_outputs": [], "excluded": [], "outlined_functions": 0, "round": 1}]}, rounds)
+        self.assertIn("-passes=internalize,constmerge,globaldce,mergefunc,verify", lines[8])
+        self.assertIn(f"{outlined} -o {self.paths.profile_use_bitcode}", lines[8])
+        self.assertTrue(lines[9].startswith("ir_size --libllvm "))
+        self.assertIn(f"sparse-constants {self.paths.profile_use_bitcode} ", lines[9])
+        self.assertIn("overlay-constants ", lines[10])
+        self.assertIn("zero-fill-globals ", lines[11])
+        self.assertIn("compact-error-names ", lines[12])
+        self.assertIn("-passes=globaldce,verify", lines[13])
+        self.assertTrue(lines[13].endswith(f"-o {self.paths.profile_use_bitcode}"))
+        self.assertEqual("nm", lines[14])
         for suffix in (".sparse", ".overlaid", ".zero-filled", ".compacted"):
             self.assertFalse(
                 self.paths.profile_use_bitcode.with_name(

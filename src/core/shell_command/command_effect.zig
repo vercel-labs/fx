@@ -55,12 +55,6 @@ fn isStageSeparator(token: command_lex.ArgvToken) bool {
     return std.mem.eql(u8, token.raw, "&&");
 }
 
-/// Every shell reads a word that starts with an unquoted `#` as the start of
-/// a comment, so the rest of the command never reaches the program.
-fn startsComment(raw: []const u8) bool {
-    return raw.len > 0 and raw[0] == '#';
-}
-
 fn isUnsupportedAutoOperator(token: command_lex.ArgvToken) bool {
     return isUnsupportedAutoControlOperator(token) or
         (!token.quoted and command_lex.redirection_kind(token.value) != null);
@@ -105,8 +99,7 @@ fn reversibleAutoStage(raw_tokens: []const command_lex.ArgvToken) bool {
     if (tokens.len == 0) return false;
     for (tokens) |token| {
         if (isUnsupportedAutoOperator(token) or
-            tokenHasDynamicShellSyntax(token.raw) or
-            startsComment(token.raw))
+            tokenHasDynamicShellSyntax(token.raw))
         {
             return false;
         }
@@ -133,7 +126,8 @@ fn reversibleAutoStage(raw_tokens: []const command_lex.ArgvToken) bool {
 
 // `^` and `#` are globs in zsh with `extendedglob`, which fx replays from the
 // user's startup files: `^x` matches every file not named `x`, and `x#`
-// matches any run of `x`, so a workspace file could supply the word.
+// matches any run of `x`, so a workspace file could supply the word. A word
+// that starts with an unquoted `#` also starts a comment in every shell.
 fn tokenHasDynamicShellSyntax(raw: []const u8) bool {
     for (raw) |byte| switch (byte) {
         '$', '`', '*', '?', '[', '~', '^', '#', '\n', '\r', ';', '(', ')', '{', '}' => return true,
@@ -364,6 +358,8 @@ test "known reversible auto commands exclude destructive and hidden effects" {
         "git fetch ^nomatch .",
         "git fetch --prun#e",
         "npm install react@^18",
+        // Quoting does not help: the check reads the word as written.
+        "npm install 'react@^18'",
         "npm test x##",
         // The shell reads `2` as a file descriptor only when it is bare and
         // touches `>&`. Each of these passes `2` to git as an argument and
@@ -685,6 +681,9 @@ fn planPrintf(
         return .{ .approval_required = .unsupported_argument };
     };
     if (words.len - 2 != conversions) return .{ .approval_required = .unsupported_argument };
+    for (words[2..]) |data| {
+        if (printfDataReadsAsOption(data)) return .{ .approval_required = .unsupported_argument };
+    }
 
     var argv: std.ArrayList([]const u8) = .empty;
     try argv.append(alloc, policy.executable);
@@ -700,6 +699,17 @@ fn printfPolicy(target_os: std.Target.Os.Tag) PrintfPolicy {
         .macos, .linux => .{ .executable = "/usr/bin/printf" },
         else => unreachable,
     };
+}
+
+/// uutils printf, which is `/usr/bin/printf` on Ubuntu 26.04, reads a data
+/// argument of `--help`, `--version`, `--help=x`, or `--` as its own option,
+/// while the shell's printf prints it. GNU and BSD printf read no option
+/// after the format, and no printf reads a single-dash data argument as one.
+/// Every value read so far is a long option or the end of options, so any
+/// data that starts with `--` runs in the shell instead. Pinned by "planner
+/// refuses printf data that the binary reads as an option".
+fn printfDataReadsAsOption(data: []const u8) bool {
+    return std.mem.startsWith(u8, data, "--");
 }
 
 fn printfStringConversionCount(format: []const u8) ?usize {
@@ -1307,7 +1317,8 @@ test "planner admits the reviewed direct command matrix" {
         "printf 'hello\\n'",
         "printf x",
         "printf '%%'",
-        "printf '%s' '--help'",
+        "printf '%s' '-h'",
+        "printf '%s' '-V'",
         "printf '%s%s' one two",
         "printf '$(touch x)'",
         "pwd",
@@ -1415,6 +1426,10 @@ test "planner returns stable reasons for approval-bearing forms" {
         .{ .command = "printf '' x", .reason = .unsupported_argument },
         .{ .command = "printf --help", .reason = .unsupported_argument },
         .{ .command = "printf --", .reason = .unsupported_argument },
+        .{ .command = "printf -- x", .reason = .unsupported_argument },
+        .{ .command = "printf '%s' '--help'", .reason = .unsupported_argument },
+        .{ .command = "printf '%s' '--version'", .reason = .unsupported_argument },
+        .{ .command = "printf '%s' '--'", .reason = .unsupported_argument },
         .{ .command = "printf %q x", .reason = .unsupported_argument },
         .{ .command = "printf %b '\\x41'", .reason = .unsupported_argument },
         .{ .command = "printf %d 1.5", .reason = .unsupported_argument },
@@ -1695,6 +1710,9 @@ test "planner generated printf grammar accepts only exact productions and data c
     const data_classes = [_][]const u8{
         "",
         "-leading",
+        "-h",
+        "-V",
+        "-",
         "100%",
         "\\x41",
         "printable ASCII",
@@ -1787,6 +1805,37 @@ test "planner preserves accepted printf argv exactly" {
     try std.testing.expectEqualStrings("caf\u{00e9}", argv[3]);
 }
 
+test "planner refuses printf data that the binary reads as an option" {
+    const alloc = std.testing.allocator;
+    // uutils printf 0.10.0 reads the first five as options after the format.
+    // The rest share the `--` prefix of every long option.
+    const option_like = [_][]const u8{
+        "--help",
+        "--version",
+        "--help=x",
+        "--version=1",
+        "--",
+        "--he",
+        "--x",
+        "---",
+    };
+    for ([_]std.Target.Os.Tag{ .macos, .linux }) |target_os| {
+        for (option_like) |data| {
+            for ([_][]const u8{ "%s", "prefix:%s" }) |format| {
+                const command = try buildPrintfCommand(alloc, format, &.{data});
+                defer alloc.free(command);
+                try expectApproval(command, false, target_os, .unsupported_argument);
+            }
+            const first = try buildPrintfCommand(alloc, "%s:%s", &.{ data, "x" });
+            defer alloc.free(first);
+            try expectApproval(first, false, target_os, .unsupported_argument);
+            const later = try buildPrintfCommand(alloc, "%s:%s", &.{ "x", data });
+            defer alloc.free(later);
+            try expectApproval(later, false, target_os, .unsupported_argument);
+        }
+    }
+}
+
 test "planner native printf forms match shell-visible execution" {
     const builtin = @import("builtin");
     if (builtin.target.os.tag != .macos and builtin.target.os.tag != .linux) return error.SkipZigTest;
@@ -1795,7 +1844,10 @@ test "planner native printf forms match shell-visible execution" {
         "printf x",
         "printf 'hello\\n'",
         "printf '%%'",
-        "printf '%s' '--help'",
+        "printf '%s' '-h'",
+        "printf '%s' '-V'",
+        "printf '%s' '-'",
+        "printf '%s%s' '-x' '-h'",
         "printf '%s%s' one two",
         "printf '%s' 'caf\u{00e9}'",
     };
@@ -1812,6 +1864,9 @@ test "planner generated native printf matrix matches shell bytes status and stde
     const data_classes = [_][]const u8{
         "",
         "-leading",
+        "-h",
+        "-V",
+        "-",
         "100%",
         "\\x41",
         "printable ASCII",

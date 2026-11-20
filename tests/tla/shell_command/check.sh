@@ -3,9 +3,11 @@
 # expected verdict.
 #
 # GitAdmission (src/core/shell_command/safe_git.zig): how an agent git command
-# is planned, admitted, and run in every permission mode and shell environment.
-# git-admission.cfg must pass; git-admission-mutation.cfg plants a bug that
-# HoldSafety must catch.
+# is planned, admitted, and run in every permission mode and shell environment,
+# and how a workspace capture writes into fx's own store. git-admission.cfg must
+# pass; git-admission-mutation.cfg plants a bug that HoldSafety must catch, and
+# the git-admission-capture-*-mutation.cfg files plant a store route that reads
+# the repository, which CaptureNeverFires and CaptureLeavesUserIndex must catch.
 #
 # ShellContract: one model turn through the shell tool, for the design fx
 # implements ("current") and a redesign ("proposed"). proposed.cfg and
@@ -13,7 +15,14 @@
 # design breaks, and each mutant-*.cfg plants a bug that its property must
 # catch.
 #
-# Run the real binary through every modeled shell call and have TLC replay it:
+# FailureStreak (src/core/agent/runtime/tool_admission.zig
+# ShellExecutionFailureRetryState): when repeated shell failures end a turn.
+# failure-streak.cfg must pass. failure-streak-current.cfg is fx before the
+# streak restarted on a file change, which breaks EditedRetryContinues, and
+# each failure-streak-mutant-*.cfg plants a bug that its property must catch.
+#
+# Run the real binary through every modeled shell call and every failure
+# streak, and have TLC replay what it did:
 #   bun test ../drivers/shell_command/
 #
 # Needs Java 11+ and tla2tools.jar, as ../README.md describes.
@@ -26,6 +35,8 @@ cd "$(dirname "$0")"
 tlc_verdicts "$@" <<'EOF'
 GitAdmission git-admission - -deadlock
 GitAdmission git-admission-mutation HoldSafety -deadlock
+GitAdmission git-admission-capture-mutation CaptureNeverFires -deadlock
+GitAdmission git-admission-capture-index-mutation CaptureLeavesUserIndex -deadlock
 ShellContract proposed -
 ShellContract current-holds -
 ShellContract current-completeness Completeness
@@ -33,4 +44,9 @@ ShellContract current-history HistoryFidelity
 ShellContract current-zsh ZshForgiving
 ShellContract mutant-admission-raw AdmissionConsistency
 ShellContract mutant-guess Exactness
+FailureStreak failure-streak - -deadlock
+FailureStreak failure-streak-current EditedRetryContinues -deadlock
+FailureStreak failure-streak-mutant-any-write BlindLoopBounded -deadlock
+FailureStreak failure-streak-mutant-late BlindLoopBounded -deadlock
+FailureStreak failure-streak-mutant-early StopsOnlyAfterLimit -deadlock
 EOF

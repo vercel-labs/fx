@@ -37,6 +37,10 @@ const ActiveTokenRequest = struct {
 pub const GatewayFailureDiagnostics = struct {
     schema: []const u8 = "",
     request_shape: []const u8 = "",
+    /// The provider's own reason behind `terminal_stop_reason`.
+    provider_stop_reason: []const u8 = "",
+    /// What the gateway said about a failed call, masked for display.
+    error_message: []const u8 = "",
 };
 
 pub fn recordGatewayCallMetric(model: []const u8, started_at_ms: i64, status: u16, response_bytes: u32, input_tokens: u32, output_tokens: u32, turn_id: u64, step_id: u64, subagent_id: u64, error_name: []const u8, terminal_stop_reason: []const u8) void {
@@ -73,14 +77,19 @@ pub fn recordGatewayCallMetricWithDiagnostics(
     call.setModel(model);
     if (error_name.len > 0) call.setError(error_name);
     if (terminal_stop_reason.len > 0) call.setTerminalStopReason(terminal_stop_reason);
+    if (failure_diagnostics.provider_stop_reason.len > 0) call.setProviderStopReason(failure_diagnostics.provider_stop_reason);
     if (failure_diagnostics.schema.len > 0) call.setGatewaySchemaDiagnostic(failure_diagnostics.schema);
     if (failure_diagnostics.request_shape.len > 0) call.setGatewayRequestShape(failure_diagnostics.request_shape);
+    if (failure_diagnostics.error_message.len > 0) call.setGatewayErrorMessage(failure_diagnostics.error_message);
     diagnostics.recordNetworkCall(call);
 }
 
 pub const TurnSummaryAccumulator = struct {
     turn_started_at_ms: i64,
     thinking_duration_ms: u64 = 0,
+    /// Time the turn spent compacting its context. The turn's duration leaves
+    /// it out, as the live turn clock does.
+    compaction_duration_ms: u64 = 0,
     settled_token_progress: types.TurnTokenProgress = .{},
     active_token_request: ?ActiveTokenRequest = null,
 
@@ -99,6 +108,11 @@ pub const TurnSummaryAccumulator = struct {
     pub fn addThinkingWait(self: *TurnSummaryAccumulator, started_at_ms: i64, ended_at_ms: i64) void {
         if (ended_at_ms <= started_at_ms) return;
         self.thinking_duration_ms += @intCast(ended_at_ms - started_at_ms);
+    }
+
+    pub fn addCompaction(self: *TurnSummaryAccumulator, started_at_ms: i64, ended_at_ms: i64) void {
+        if (ended_at_ms <= started_at_ms) return;
+        self.compaction_duration_ms += @intCast(ended_at_ms - started_at_ms);
     }
 
     pub fn prepareTokenRequest(self: *TurnSummaryAccumulator) void {
@@ -168,13 +182,16 @@ pub const TurnSummaryAccumulator = struct {
     }
 
     pub fn finish(self: *const TurnSummaryAccumulator) types.TurnSummary {
-        const now_ms = io_mod.milliTimestamp();
-        const elapsed = if (now_ms > self.turn_started_at_ms) now_ms - self.turn_started_at_ms else 0;
+        return self.finishAt(io_mod.milliTimestamp());
+    }
+
+    fn finishAt(self: *const TurnSummaryAccumulator, now_ms: i64) types.TurnSummary {
+        const elapsed: u64 = if (now_ms > self.turn_started_at_ms) @intCast(now_ms - self.turn_started_at_ms) else 0;
         return .{
             .started_at_ms = self.turn_started_at_ms,
             .completed_at_ms = now_ms,
             .thinking_duration_ms = self.thinking_duration_ms,
-            .turn_duration_ms = @intCast(elapsed),
+            .turn_duration_ms = elapsed -| self.compaction_duration_ms,
             .token_progress = self.tokenProgress(),
         };
     }
@@ -338,6 +355,25 @@ test "gateway call metrics retain provider terminal stop reason" {
     try std.testing.expectEqualStrings("stop", calls[0].terminalStopReason());
     try std.testing.expectEqualStrings("length", calls[1].terminalStopReason());
     try std.testing.expectEqualStrings("missing_provider_finish", calls[2].terminalStopReason());
+}
+
+test "turn duration leaves out compaction and keeps the wall-clock start and end" {
+    var accumulator = TurnSummaryAccumulator.init(1_000, "");
+    accumulator.addCompaction(4_000, 10_000);
+    accumulator.addCompaction(12_000, 12_500);
+    // A compaction that did not take time adds nothing.
+    accumulator.addCompaction(13_000, 13_000);
+    accumulator.addCompaction(14_000, 13_000);
+    const summary = accumulator.finishAt(16_000);
+    try std.testing.expectEqual(@as(i64, 1_000), summary.started_at_ms);
+    try std.testing.expectEqual(@as(i64, 16_000), summary.completed_at_ms);
+    try std.testing.expectEqual(@as(u64, 15_000 - 6_500), summary.turn_duration_ms);
+
+    // The duration never goes below zero.
+    var short = TurnSummaryAccumulator.init(1_000, "");
+    short.addCompaction(0, 5_000);
+    try std.testing.expectEqual(@as(u64, 0), short.finishAt(2_000).turn_duration_ms);
+    try std.testing.expectEqual(@as(u64, 0), short.finishAt(500).turn_duration_ms);
 }
 
 test "turn token progress counts only the submitted prompt once" {

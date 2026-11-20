@@ -36,6 +36,7 @@ const worker_runtime = @import("../agent/worker_runtime.zig");
 const context_limits = @import("../config/context_limits.zig");
 const workspace_access = @import("../workspace/workspace_access.zig");
 const current_branch = @import("../workspace/current_branch.zig");
+const diagnostics = @import("../workspace/diagnostics.zig");
 
 const Allocator = std.mem.Allocator;
 const ToolCall = types.ToolCall;
@@ -160,6 +161,8 @@ fn isRunCommandCall(input: Input, arena: Allocator, call: ToolCall) !bool {
 }
 
 fn permissionNameForCall(input: Input, arena: Allocator, call: ToolCall) ![]const u8 {
+    // A toolbox open or search meets the rules of the tool it replaced.
+    if (call.toolbox_lookup) |lookup| return lookup.permission;
     const command_call = try isRunCommandCall(input, arena, call);
     if (command_call) return "run_command";
     return if (std.mem.eql(u8, call.name, "shell")) "terminal" else call.name;
@@ -170,6 +173,7 @@ fn permissionTargetKindForCall(
     arena: Allocator,
     call: ToolCall,
 ) !permissions.PermissionTargetKind {
+    if (call.toolbox_lookup != null) return .none;
     return if (try isRunCommandCall(input, arena, call))
         .command_cwd
     else
@@ -493,19 +497,23 @@ pub fn preflightPreparedFileMutation(
     defer if (policy_targets_owned) policy_targets.deinitOwned(arena);
 
     const edit_prompt_required = policy_targets.prompt_required;
-    const equality_prompt_required =
+    const read_requires_prompt =
         request.permission_mode != .yolo and
-        policy_targets.items[0].expected_identity != null and
         try fileMutationEqualityDisclosureRequiresPrompt(
             arena,
             request,
             policy_targets.canonical_target_path,
         );
+    const equality_prompt_required =
+        read_requires_prompt and policy_targets.items[0].expected_identity != null;
 
     var authorization: file_mutation_contract.FileExecutionAuthorization = .{
         .input = input,
         .policy_targets = policy_targets,
         .read_disclosure_required = equality_prompt_required,
+        // A failed edit here returns before any prompt or review, so it may
+        // quote the file only when reading it needs neither.
+        .edit_failure_detail = if (read_requires_prompt) .plain else .file_lines,
     };
     const state_may_decide = if (request.session_permission_state) |state|
         state.rules.items.len > 0
@@ -531,6 +539,7 @@ pub fn preflightPreparedFileMutation(
         call,
         input,
         policy_targets,
+        authorization.edit_failure_detail,
     )) {
         .semantic_failure => |reason| return .{ .tool_failure = reason },
         .prepared => |value| value,
@@ -816,6 +825,11 @@ fn shellInputReceiver(
     const snapshot = terminal_managed_observer.inspectInput(context, session_id) catch |err| {
         if (err == error.OutOfMemory or err == error.Cancelled) return err;
         debug_trace.logf("permission", "event=shell_input_review_receiver_unavailable call_id={s} session_id={s} reason={s}", .{ call.id, session_id, @errorName(err) });
+        // A session that has exited, closed, or gone missing can no longer
+        // take input. Closing it revokes its authority, so that error means
+        // the same. Any other failure keeps the review hold.
+        if (err == error.TerminalSessionEnded or err == error.TerminalSessionNotFound or
+            err == error.TerminalSessionLost or err == error.AuthorityRevoked) return error.ShellInputSessionEnded;
         return null;
     };
     // The request borrows these owned slices for the admission arena's lifetime.
@@ -825,6 +839,17 @@ fn shellInputReceiver(
         .cwd = snapshot.cwd,
         .screen = snapshot.screen,
     };
+}
+
+/// Tells the agent that its input went nowhere because the target session has
+/// ended, and what to do instead.
+fn shellInputSessionEndedText(arena: Allocator, call: ToolCall) ![]const u8 {
+    const args = try tool_args.parseToolArgsObject(arena, call.arguments_json);
+    const session_id = try tool_args.requiredStringArg(args, "session_id");
+    return arena.print(
+        "Session {f} is no longer running, so it can't take input. Nothing was sent. Start a new session, or read the old session's final output with an interact call that sends no input.",
+        .{text_utils.terminalSafe(session_id)},
+    );
 }
 
 fn provenBindingsForAction(
@@ -941,6 +966,107 @@ test "direct git push branch proof accepts only explicit literal operands" {
     }
 }
 
+/// What `/trace` keeps of one review's result.
+const ReviewTrace = struct {
+    outcome: diagnostics.AutoReviewOutcome,
+    risk: diagnostics.AutoReviewRisk = .none,
+    /// Why no decision came, or the error's name.
+    reason: []const u8 = "",
+    rationale: []const u8 = "",
+    attempts: []const diagnostics.AutoReviewAttempt = &.{},
+};
+
+fn reviewTraceOf(review: permission_auto_classifier.ParseOutcome) ReviewTrace {
+    return switch (review) {
+        .valid => |result| .{
+            .outcome = switch (result.decision) {
+                .clear => .clear,
+                .caution => .caution,
+            },
+            .risk = traceRisk(result.risk),
+            .rationale = result.rationale,
+        },
+        .evidence_incomplete => .{ .outcome = .held, .reason = "review_evidence_incomplete" },
+        .invalid => |reason| .{ .outcome = .unavailable, .reason = @tagName(reason) },
+    };
+}
+
+fn traceRisk(risk: permission_auto_classifier.Risk) diagnostics.AutoReviewRisk {
+    return switch (risk) {
+        .low => .low,
+        .medium => .medium,
+        .high => .high,
+        .critical => .critical,
+    };
+}
+
+fn traceOrigin(review_turn: ?permission_auto_classifier.ReviewTurnContext) diagnostics.AutoReviewOrigin {
+    const turn = review_turn orelse return .root;
+    return switch (turn.origin) {
+        .root => .root,
+        .subagent => .subagent,
+    };
+}
+
+/// The command, shell input, file path, or tool arguments a review judged.
+fn reviewedActionText(action: permission_auto_classifier.Action) []const u8 {
+    return switch (action) {
+        .command => |command| command.command,
+        .shell_input => |shell_input| shell_input.arguments_json,
+        .file_mutation => |mutation| mutation.display_path,
+        .tool => |tool| tool.arguments_json,
+    };
+}
+
+/// Records a review for `/trace`. With no reviewed action, as when no review
+/// could start, the call's own arguments stand in for it.
+fn recordAutoReview(
+    call: ToolCall,
+    review_turn: ?permission_auto_classifier.ReviewTurnContext,
+    action: ?permission_auto_classifier.Action,
+    trace: ReviewTrace,
+    started_ms: i64,
+    ended_ms: i64,
+) void {
+    diagnostics.recordAutoReview(.{
+        .outcome = trace.outcome,
+        .risk = trace.risk,
+        .origin = traceOrigin(review_turn),
+        .elapsed_ms = @intCast(std.math.clamp(ended_ms - started_ms, 0, std.math.maxInt(u32))),
+        .call_id = call.id,
+        .tool_name = call.name,
+        .action_kind = if (action) |value| @tagName(std.meta.activeTag(value)) else "",
+        .action = if (action) |value| reviewedActionText(value) else call.arguments_json,
+        .reason = trace.reason,
+        .rationale = trace.rationale,
+        .attempts = trace.attempts,
+        .at_ms = started_ms,
+    });
+}
+
+/// Records, for `/trace`, a hold the turn's review cache returned for `call`
+/// with no new review. Its arguments stand in for the reviewed action.
+pub fn recordReusedReviewHold(
+    call: ToolCall,
+    hold: command_admission.PermissionOutcome,
+    from_subagent: bool,
+) void {
+    const evidence_incomplete = hold.denial_reason == .review_evidence_incomplete;
+    const caution = hold.auto_review_result;
+    diagnostics.recordAutoReview(.{
+        .outcome = if (evidence_incomplete) .held else .caution,
+        .risk = if (caution) |result| traceRisk(result.risk) else .none,
+        .origin = if (from_subagent) .subagent else .root,
+        .reused = true,
+        .call_id = call.id,
+        .tool_name = call.name,
+        .action = call.arguments_json,
+        .reason = if (evidence_incomplete) "review_evidence_incomplete" else "",
+        .rationale = if (caution) |result| result.rationale else "",
+        .at_ms = io_mod.milliTimestamp(),
+    });
+}
+
 /// An unavailable or invalid automatic review never executes anything. It is
 /// returned to the primary model as neutral advisory unavailability.
 fn traceReviewerUnavailable(
@@ -955,10 +1081,13 @@ fn traceReviewerUnavailable(
 }
 
 fn reviewerUnavailableOutcome(
+    input: Input,
     call: ToolCall,
     failure: permission_auto_classifier.InvalidReason,
 ) command_admission.PermissionOutcome {
     traceReviewerUnavailable(call, failure);
+    const now_ms = io_mod.milliTimestamp();
+    recordAutoReview(call, input.permission_review_turn, null, .{ .outcome = .unavailable, .reason = @tagName(failure) }, now_ms, now_ms);
     return .{
         .decision = .deny,
         .denial_reason = .review_unavailable,
@@ -1006,27 +1135,34 @@ fn automaticReviewOutcome(
     file_authorization: ?file_mutation_contract.FileExecutionAuthorization,
 ) !command_admission.PermissionOutcome {
     if (!input.auto_classifier.enabled()) {
-        return reviewerUnavailableOutcome(call, .reviewer_unconfigured);
+        return reviewerUnavailableOutcome(input, call, .reviewer_unconfigured);
     }
     const review_turn = input.permission_review_turn orelse
-        return reviewerUnavailableOutcome(call, .invalid_context);
+        return reviewerUnavailableOutcome(input, call, .invalid_context);
     if (!review_turn.review_attempt_available) {
         debug_trace.logf(
             "permission",
             "event=auto_review_budget_exhausted tool_name={s} call_id={s} execution_started=false",
             .{ call.name, call.id },
         );
-        return reviewerUnavailableOutcome(call, .turn_review_budget_exhausted);
+        return reviewerUnavailableOutcome(input, call, .turn_review_budget_exhausted);
     }
 
-    const request = try reviewRequestForCall(
+    var request = reviewRequestForCall(
         input,
         arena,
         call,
         targets,
         is_dynamic_tool,
         file_authorization,
-    );
+    ) catch |err| switch (err) {
+        // Input cannot reach a session that has ended, so nothing would run
+        // and there is nothing to review.
+        error.ShellInputSessionEnded => return .{ .tool_failure = try shellInputSessionEndedText(arena, call) },
+        else => return err,
+    };
+    var attempt_log: permission_auto_classifier.AttemptLog = .{};
+    request.attempt_log = &attempt_log;
     const review = try runAutomaticReview(input, arena, call, request);
     if (nonAllowAutoReviewOutcome(review)) |blocked| return blocked;
     var outcome = if (file_authorization) |authorization|
@@ -1048,6 +1184,25 @@ fn automaticReviewOutcome(
     return outcome;
 }
 
+/// The sends `request`'s review made, for `/trace`. The arena owns the slice.
+fn traceAttempts(arena: Allocator, request: permission_auto_classifier.ReviewRequest) []const diagnostics.AutoReviewAttempt {
+    const log = request.attempt_log orelse return &.{};
+    const out = arena.alloc(diagnostics.AutoReviewAttempt, log.slice().len) catch return &.{};
+    for (log.slice(), out) |attempt, *slot| slot.* = .{
+        .result = switch (attempt.result) {
+            .answered => .answered,
+            .malformed => .malformed,
+            .timed_out => .timed_out,
+            .transient_failure => .transient_failure,
+            .permanent_failure => .permanent_failure,
+            .call_failed => .call_failed,
+            .cancelled => .cancelled,
+        },
+        .elapsed_ms = attempt.elapsed_ms,
+    };
+    return out;
+}
+
 fn runAutomaticReview(
     input: Input,
     arena: Allocator,
@@ -1066,8 +1221,12 @@ fn runAutomaticReview(
             "event=auto_review_result tool_name={s} decision=cancelled_or_error fallback_reason={s} elapsed_ms={d} execution_started=false call_id={s}",
             .{ call.name, @errorName(err), io_mod.milliTimestamp() - started_ms, call.id },
         );
+        recordAutoReview(call, request.review_turn, request.action, .{ .outcome = .@"error", .reason = @errorName(err), .attempts = traceAttempts(arena, request) }, started_ms, io_mod.milliTimestamp());
         return err;
     };
+    var trace = reviewTraceOf(review);
+    trace.attempts = traceAttempts(arena, request);
+    recordAutoReview(call, request.review_turn, request.action, trace, started_ms, io_mod.milliTimestamp());
     switch (review) {
         .valid => |result| debug_trace.logf(
             "permission",
@@ -1951,10 +2110,7 @@ fn permissionOutcomeForDecision(
 fn shellCallRequestsReload(arena: Allocator, call: ToolCall) bool {
     const value = std.json.parseFromSliceLeaky(std.json.Value, arena, call.arguments_json, .{}) catch return false;
     if (value != .object) return false;
-    const args = if (value.object.get("request")) |request| switch (request) {
-        .object => |object| object,
-        else => return false,
-    } else value.object;
+    const args = (tool_args.unwrapRequest(arena, value.object) catch return false) orelse return false;
     const reload = args.get("reload") orelse return false;
     return reload == .bool and reload.bool;
 }
@@ -1969,7 +2125,11 @@ test "shell reload detection reads top-level and wrapped arguments" {
         .{ .arguments_json = "{\"action\":\"run\",\"command\":\"git status\",\"reload\":false}", .reload = false },
         .{ .arguments_json = "{\"action\":\"run\",\"command\":\"git status\"}", .reload = false },
         .{ .arguments_json = "{\"action\":\"run\",\"command\":\"git status\",\"reload\":\"true\"}", .reload = false },
-        .{ .arguments_json = "{\"request\":\"{\\\"reload\\\":true}\"}", .reload = false },
+        // Intake runs a wrapper written as JSON text, so its reload counts too.
+        .{ .arguments_json = "{\"request\":\"{\\\"reload\\\":true}\"}", .reload = true },
+        .{ .arguments_json = "{\"request\":\"{\\\"reload\\\":false}\"}", .reload = false },
+        .{ .arguments_json = "{\"request\":\"[{\\\"reload\\\":true}]\"}", .reload = false },
+        .{ .arguments_json = "{\"request\":\"not json\"}", .reload = false },
         .{ .arguments_json = "not json", .reload = false },
     };
     for (cases) |case| {
@@ -2552,6 +2712,11 @@ fn targetPathForFailureMessage(arena: Allocator, call: ToolCall) !?[]const u8 {
 }
 
 fn permissionTargetsForCall(input: Input, arena: Allocator, call: ToolCall) !permissions.PermissionCallTargets {
+    if (call.toolbox_lookup) |lookup| {
+        const items = try arena.alloc(permissions.PermissionCallTarget, 1);
+        items[0] = .{ .role = "target", .path = try arena.dupe(u8, lookup.target) };
+        return .{ .items = items };
+    }
     if (isAvailableDynamicTool(input, call.name)) {
         const items = try arena.alloc(permissions.PermissionCallTarget, 1);
         items[0] = .{ .role = "target", .path = try arena.dupe(u8, call.name) };
@@ -3619,6 +3784,87 @@ test "file mutation preflight compatibility wrapper preserves deny and target fa
     );
 }
 
+test "a failed edit quotes its file only when reading the file needs no approval" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    var file = try tmp.dir.createFile(io_mod.getIo(), "workspace/credentials", .{ .truncate = true });
+    defer file.close(io_mod.getIo());
+    try file.writeStreamingAll(io_mod.getIo(), "[default]\naws_secret_access_key = stored-value\n");
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace);
+
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const call: ToolCall = .{
+        .id = "guessed-edit",
+        .name = "edit_file",
+        .arguments_json = "{\"path\":\"credentials\",\"old_string\":\"aws_secret_access_key = guess\",\"new_string\":\"aws_secret_access_key = rotated\"}",
+    };
+    const request: FileMutationPreflightRequest = .{
+        .tool_registry = test_admission_registry,
+        .workspace_root = workspace,
+        .permission_rules = .{},
+        .permission_mode = .auto,
+        .can_prompt = false,
+    };
+    const edit_allowed: types.PermissionRule = .{
+        .permission = @constCast("edit"),
+        .pattern = @constCast("**"),
+        .action = .allow,
+    };
+
+    // An edit that needs no prompt is prepared at execution, with the detail
+    // admission chose.
+    var allow_rules = [_]types.PermissionRule{edit_allowed};
+    var allowed_request = request;
+    allowed_request.permission_rules = .{ .rules = &allow_rules };
+    switch (try preflightFileMutation(arena, call, allowed_request)) {
+        .allowed => |authorization| try std.testing.expectEqual(
+            file_mutation_contract.EditFailureDetail.file_lines,
+            authorization.edit_failure_detail,
+        ),
+        else => |outcome| {
+            std.debug.print("unexpected {s}\n", .{@tagName(outcome)});
+            return error.TestExpectedAllowed;
+        },
+    }
+
+    // One that needs a prompt is prepared here, and fails before it.
+    const open = switch (try preflightFileMutation(arena, call, request)) {
+        .tool_failure => |value| value,
+        else => |outcome| {
+            std.debug.print("unexpected {s}\n", .{@tagName(outcome)});
+            return error.TestExpectedToolFailure;
+        },
+    };
+    try std.testing.expect(std.mem.find(u8, open, "aws_secret_access_key = stored-value") != null);
+
+    // A read rule that denies the file, or asks first, keeps its text out.
+    for ([_]types.PermissionAction{ .deny, .ask }) |action| {
+        var rules = [_]types.PermissionRule{ edit_allowed, .{
+            .permission = @constCast("read_file"),
+            .pattern = @constCast("*"),
+            .action = action,
+        } };
+        var guarded_request = request;
+        guarded_request.permission_rules = .{ .rules = &rules };
+        const guarded = switch (try preflightFileMutation(arena, call, guarded_request)) {
+            .tool_failure => |value| value,
+            else => |outcome| {
+                std.debug.print("unexpected {s} for read {s}\n", .{ @tagName(outcome), @tagName(action) });
+                return error.TestExpectedToolFailure;
+            },
+        };
+        try std.testing.expectEqualStrings(
+            "edit_file failed: old_string not found in file. Re-read the file to see its current contents; if the change is already applied, do not retry this edit.",
+            guarded,
+        );
+    }
+}
+
 test "file mutation preflight fails closed without registered input ownership" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
@@ -3869,7 +4115,7 @@ fn testInputWithClassifier(
     };
 }
 
-test "resolved skill calls retain name policy and ordinary execution authority" {
+test "a toolbox open is decided by its skill's name and keeps ordinary execution authority" {
     const alloc = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(alloc);
     defer arena_state.deinit();
@@ -3877,23 +4123,20 @@ test "resolved skill calls retain name policy and ordinary execution authority" 
     var worker: WorkerRuntime = .{};
     defer worker.deinit(alloc);
     var input = testInputWithClassifier(&worker, permission_auto_classifier.Classifier.disabled());
-    input.tool_registry = .{ .tools = &.{test_builtin_tools.skill} };
+    input.tool_registry = .{ .tools = &.{test_builtin_tools.toolbox} };
     var rules = [_]types.PermissionRule{.{
         .permission = @constCast("skill"),
         .pattern = @constCast("restricted-name"),
         .action = .deny,
     }};
     input.permission_rules = .{ .rules = &rules };
-    const skill: @import("../skills/skill_contract.zig").PreparedSkill = .{ .skill = .{
-        .name = "restricted-name",
-        .description = "",
-        .path = "/installed/different-directory-name",
-        .source = .global_fx,
-    } };
+    // However the open names it, by location, path, or a folder with another
+    // name, the rule for the skill's own name decides it.
+    const lookup: types.ToolboxLookup = .{ .permission = "skill", .target = "restricted-name" };
     const calls = [_]ToolCall{
-        .{ .id = "alias", .name = "skill", .arguments_json = "{\"location\":\"skill:0000000000000001:0/different-directory-name\"}", .resolved_skill = &skill },
-        .{ .id = "canonical", .name = "skill", .arguments_json = "{\"location\":\"/installed/different-directory-name\",\"resource\":\"reference.md\"}", .resolved_skill = &skill },
-        .{ .id = "legacy", .name = "skill", .arguments_json = "{\"name\":\"restricted-name\",\"location\":\"/installed/different-directory-name\",\"offset\":1}", .resolved_skill = &skill },
+        .{ .id = "alias", .name = "toolbox", .arguments_json = "{\"open\":\"skill:0000000000000001:0/different-directory-name\"}", .toolbox_lookup = lookup },
+        .{ .id = "canonical", .name = "toolbox", .arguments_json = "{\"open\":\"/installed/different-directory-name\",\"resource\":\"reference.md\"}", .toolbox_lookup = lookup },
+        .{ .id = "named", .name = "toolbox", .arguments_json = "{\"open\":\"restricted-name\",\"offset\":1}", .toolbox_lookup = lookup },
     };
     for (calls) |call| {
         try std.testing.expectEqualStrings("restricted-name", try permissionTargetForCall(input, arena, call));
@@ -3907,11 +4150,6 @@ test "resolved skill calls retain name policy and ordinary execution authority" 
     const allowed = try requestPermissionOutcome(input, arena, calls[0], .ask, &.{});
     try std.testing.expectEqual(ToolPermissionDecision.once, allowed.decision);
     try std.testing.expect(allowed.execution_authority.? == .ordinary);
-    var legacy_unbound = calls[2];
-    legacy_unbound.resolved_skill = null;
-    const old_key = try permissionStateKeyForCall(input, arena, legacy_unbound);
-    const bound_key = try permissionStateKeyForCall(input, arena, calls[2]);
-    try std.testing.expect(old_key.eql(bound_key));
 }
 
 test "exact command approval remains valid across live authority revalidation" {
@@ -5311,6 +5549,94 @@ test "invalid automatic review returns to the agent before prompting" {
     try std.testing.expect(outcome.auto_review_result == null);
 }
 
+test "every automatic review and every review that could not start is recorded for the trace" {
+    diagnostics.resetSession();
+    defer diagnostics.resetSession();
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var worker: WorkerRuntime = .{};
+    defer worker.deinit(std.testing.allocator);
+
+    var caution = FakeAutoClassifier{ .decision = .caution, .risk = .high, .rationale = "Held for the trace." };
+    _ = try requestPermissionOutcome(
+        testInputWithClassifier(&worker, permission_auto_classifier.Classifier.withOverride(@ptrCast(&caution), FakeAutoClassifier.classify)),
+        arena,
+        .{ .id = "trace-caution", .name = "shell", .arguments_json = "{\"action\":\"run\",\"command\":\"touch public\"}" },
+        .auto,
+        &.{},
+    );
+    var clear = FakeAutoClassifier{};
+    _ = try requestPermissionOutcome(
+        testInputWithClassifier(&worker, permission_auto_classifier.Classifier.withOverride(@ptrCast(&clear), FakeAutoClassifier.classify)),
+        arena,
+        .{ .id = "trace-clear", .name = "shell", .arguments_json = "{\"action\":\"run\",\"command\":\"touch cleared.txt\"}" },
+        .auto,
+        &.{},
+    );
+    var invalid = FakeAutoClassifier{ .invalid_reason = .transport_timed_out };
+    _ = try requestPermissionOutcome(
+        testInputWithClassifier(&worker, permission_auto_classifier.Classifier.withOverride(@ptrCast(&invalid), FakeAutoClassifier.classify)),
+        arena,
+        .{ .id = "trace-timeout", .name = "shell", .arguments_json = "{\"action\":\"run\",\"command\":\"touch slow.txt\"}" },
+        .auto,
+        &.{},
+    );
+    _ = try requestPermissionOutcome(
+        testInputWithClassifier(&worker, .disabled()),
+        arena,
+        .{ .id = "trace-unconfigured", .name = "shell", .arguments_json = "{\"action\":\"run\",\"command\":\"touch none.txt\"}" },
+        .auto,
+        &.{},
+    );
+    var spent = FakeAutoClassifier{};
+    var spent_input = testInputWithClassifier(&worker, permission_auto_classifier.Classifier.withOverride(@ptrCast(&spent), FakeAutoClassifier.classify));
+    spent_input.permission_review_turn.?.review_attempt_available = false;
+    spent_input.permission_review_turn.?.origin = .subagent;
+    _ = try requestPermissionOutcome(
+        spent_input,
+        arena,
+        .{ .id = "trace-spent", .name = "shell", .arguments_json = "{\"action\":\"run\",\"command\":\"touch spent.txt\"}" },
+        .auto,
+        &.{},
+    );
+    try std.testing.expectEqual(@as(usize, 0), spent.calls);
+
+    try std.testing.expectEqual(
+        diagnostics.AutoReviewCounts{ .reviews = 5, .clear = 1, .caution = 1, .unavailable = 3 },
+        diagnostics.autoReviewCounts(),
+    );
+    var recent: [diagnostics.auto_review_recent_capacity]diagnostics.AutoReview = undefined;
+    try std.testing.expectEqual(@as(usize, 5), diagnostics.snapshotAutoReviews(&recent));
+    var held: [diagnostics.auto_review_held_capacity]diagnostics.AutoReview = undefined;
+    try std.testing.expectEqual(@as(usize, 4), diagnostics.snapshotHeldAutoReviews(&held));
+
+    try std.testing.expectEqualStrings("trace-caution", held[0].callId());
+    try std.testing.expectEqual(diagnostics.AutoReviewOutcome.caution, held[0].outcome);
+    try std.testing.expectEqual(diagnostics.AutoReviewRisk.high, held[0].risk);
+    try std.testing.expectEqualStrings("command", held[0].actionKind());
+    try std.testing.expectEqualStrings("touch public", held[0].action());
+    try std.testing.expectEqualStrings("Held for the trace.", held[0].rationale());
+
+    try std.testing.expectEqualStrings("trace-timeout", held[1].callId());
+    try std.testing.expectEqualStrings("transport_timed_out", held[1].reason());
+    try std.testing.expectEqualStrings("touch slow.txt", held[1].action());
+
+    // No review started, so the call's arguments stand in for the action.
+    try std.testing.expectEqualStrings("trace-unconfigured", held[2].callId());
+    try std.testing.expectEqualStrings("reviewer_unconfigured", held[2].reason());
+    try std.testing.expectEqualStrings("", held[2].actionKind());
+    try std.testing.expectEqualStrings("{\"action\":\"run\",\"command\":\"touch none.txt\"}", held[2].action());
+
+    try std.testing.expectEqualStrings("trace-spent", held[3].callId());
+    try std.testing.expectEqualStrings("turn_review_budget_exhausted", held[3].reason());
+    try std.testing.expectEqual(diagnostics.AutoReviewOrigin.subagent, held[3].origin);
+
+    try std.testing.expectEqualStrings("trace-clear", recent[1].callId());
+    try std.testing.expectEqual(diagnostics.AutoReviewOutcome.clear, recent[1].outcome);
+    try std.testing.expectEqual(diagnostics.AutoReviewRisk.low, recent[1].risk);
+}
+
 test "invalid automatic review returns a recoverable denial without a prompter" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
@@ -5911,6 +6237,74 @@ test "session deny narrows configured command allow" {
     try std.testing.expectEqual(ToolPermissionDecision.policy_denied, denied.decision);
     try std.testing.expect(denied.execution_authority == null);
     try std.testing.expectEqual(@as(usize, 0), recording.calls);
+}
+
+test "a session approval merged into a turn's list lets its command run with no prompt, and another command, a deny rule, and another root still win" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var worker: WorkerRuntime = .{};
+    defer worker.deinit(alloc);
+    var input = testInputWithClassifier(
+        &worker,
+        permission_auto_classifier.Classifier.disabled(),
+    );
+    var recording = RecordingPrompter{};
+    input.permission_prompter = recording.prompter();
+    const call = ToolCall{
+        .id = "merged-grant",
+        .name = "shell",
+        .arguments_json = "{\"action\":\"run\",\"command\":\"touch granted.txt\"}",
+    };
+    const other = ToolCall{
+        .id = "merged-other",
+        .name = "shell",
+        .arguments_json = "{\"action\":\"run\",\"command\":\"touch other.txt\"}",
+    };
+    const target = try permissionTargetForCall(input, arena, call);
+    // What a subagent's answer adds to the instance's list, as it reaches the
+    // list a turn of main checks against.
+    const grants = try permissions.suggestedSessionGrants(arena, input.workspace_root, "run_command", target, .command_cwd);
+
+    // Without it the command asks.
+    _ = try requestPermissionOutcome(input, arena, call, .ask, &.{});
+    try std.testing.expectEqual(@as(usize, 1), recording.calls);
+    // With it the same command runs with no prompt, and another one asks.
+    const allowed = try requestPermissionOutcome(input, arena, call, .ask, grants);
+    try std.testing.expect(!allowed.decision.isDenied());
+    try std.testing.expectEqual(@as(usize, 1), recording.calls);
+    _ = try requestPermissionOutcome(input, arena, other, .ask, grants);
+    try std.testing.expectEqual(@as(usize, 2), recording.calls);
+
+    // In `auto` mode the approval skips the automatic safety check too. The
+    // classifier here cannot run, so without the approval the command is not
+    // allowed silently, and with it the command is allowed and nothing asks.
+    const before_auto = recording.calls;
+    const auto_without = try requestPermissionOutcome(input, arena, call, .auto, &.{});
+    try std.testing.expect(auto_without.decision.isDenied() or recording.calls > before_auto);
+    const before_auto_granted = recording.calls;
+    const auto_with = try requestPermissionOutcome(input, arena, call, .auto, grants);
+    try std.testing.expect(!auto_with.decision.isDenied());
+    try std.testing.expectEqual(before_auto_granted, recording.calls);
+
+    // The approval of a file change covers the tree it was given in, and no
+    // other root.
+    const tree = try permissions.suggestedSessionGrants(arena, "/tmp/workspace", "write_file", "/tmp/workspace/app/page.tsx", .path_create_parent);
+    try std.testing.expect(permissions.sessionGrantAllowed(tree, "write_file", "/tmp/workspace/other/file.txt"));
+    try std.testing.expect(!permissions.sessionGrantAllowed(tree, "write_file", "/tmp/elsewhere/file.txt"));
+
+    // A rule that denies the command wins over the approval, with no prompt.
+    var rules = [_]types.PermissionRule{.{
+        .permission = @constCast("bash"),
+        .pattern = @constCast("touch *"),
+        .action = .deny,
+    }};
+    input.permission_rules = .{ .rules = &rules };
+    const before_denied = recording.calls;
+    const denied = try requestPermissionOutcome(input, arena, call, .ask, grants);
+    try std.testing.expectEqual(ToolPermissionDecision.policy_denied, denied.decision);
+    try std.testing.expectEqual(before_denied, recording.calls);
 }
 
 test "prepared session deny blocks local file mutation without setup effects" {

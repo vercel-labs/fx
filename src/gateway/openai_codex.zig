@@ -7,9 +7,11 @@ const stream_provider = @import("../core/agent/stream_provider.zig");
 const io_mod = @import("../core/shared/io.zig");
 const types = @import("../core/shared/types.zig");
 const gateway_client = @import("client.zig");
+const chat_completions_protocol = @import("chat_completions_protocol.zig");
 const responses_protocol = @import("responses_protocol.zig");
 const sse_stream = @import("sse.zig");
 const model_tool_schema = @import("../core/tooling/model_tool_schema.zig");
+const provider_set = @import("../core/gateway/provider_set.zig");
 
 const Allocator = std.mem.Allocator;
 const endpoint = "https://chatgpt.com/backend-api/codex/responses";
@@ -46,6 +48,11 @@ fn validateModel(model: []const u8) !void {
         if (byte <= 0x20 or byte == 0x7f) return error.InvalidOpenAICodexModel;
     }
 }
+
+/// The capabilities every Codex provider bundle declares, in the CLI and in
+/// libfx. `buildRequest` never writes an output limit, so a resend that only
+/// raises the limit would repeat the request.
+pub const bundle_capabilities: provider_set.Bundle.Capabilities = .{ .sends_output_limit = false };
 
 pub fn buildRequest(
     alloc: Allocator,
@@ -282,27 +289,18 @@ pub fn streamPrepared(
     var extra_headers_buf: [max_extra_headers]std.http.Header = undefined;
     const extra_headers = extraHeaders(&extra_headers_buf, auth_headers.account_id, request.session_id);
 
-    var client: std.http.Client = .{ .allocator = alloc, .io = io_mod.getIo() };
-    defer client.deinit();
-    var open_operation = gateway_client.PostOperation{
-        .client = &client,
-        .uri = uri,
-        .authorization = auth_headers.authorization,
-        .extra_headers = extra_headers,
-    };
     const connect_deadline = std.Io.Clock.Timestamp.fromNow(io_mod.getIo(), .{
         .clock = .awake,
         .raw = .fromMilliseconds(connect_timeout_ms),
     });
     try request.admission.admit();
-    var opened = try gateway_client.openBoundedPost(
-        alloc,
-        request.cancel_flag,
-        connect_deadline,
-        &open_operation,
-    );
-    var http_request = opened.take();
-    defer http_request.deinit();
+    var opened = try gateway_client.openBoundedPost(request.cancel_flag, connect_deadline, .{
+        .uri = uri,
+        .authorization = auth_headers.authorization,
+        .extra_headers = extra_headers,
+    });
+    defer opened.deinit();
+    const http_request = &opened.request;
     var watch: gateway_client.ConnectionWatch = .init(.{
         .patient = true,
         .stall_timeout_ms = gateway_client.ConnectionWatch.bodyStallTimeoutMs(request.deadline),
@@ -325,17 +323,27 @@ pub fn streamPrepared(
     var response = http_request.receiveHead(&.{}) catch |err| return watch.failure(err);
     if (watch.commitHead()) |err| return err;
     if (response.head.status != .ok) {
+        // Read before the body, whose reads reuse the buffer the head's
+        // header bytes live in.
+        const retry_after = gateway_client.retryAfterSeconds(response.head);
         var transfer: [16 * 1024]u8 = undefined;
         const reader = response.reader(&transfer);
         const body = reader.allocRemaining(alloc, .limited(max_error_body_bytes)) catch |err| switch (err) {
             error.StreamTooLong => try alloc.dupe(u8, "OpenAI Codex error response exceeded the local limit"),
             else => return err,
         };
-        return .{ .failed = .{
-            .kind = gateway_client.httpFailureKind(alloc, .fromHttpStatus(response.head.status), body),
-            .detail = body,
-            .ownership = .owned,
-        } };
+        const kind = gateway_client.httpFailureKind(alloc, .fromHttpStatus(response.head.status), body);
+        return .{
+            .failed = .{
+                .kind = kind,
+                .http_status = response.head.status,
+                // The body can quote the token this request sent, and the detail
+                // reaches the transcript and the trace.
+                .detail = try chat_completions_protocol.redactOwnedErrorBody(alloc, body, request.credential.secret()),
+                .retry_after_seconds = retry_after,
+                .ownership = .owned,
+            },
+        };
     }
 
     var transfer_buffer: [transfer_buffer_bytes]u8 = undefined;
@@ -433,6 +441,7 @@ fn mapReducerError(err: anyerror) anyerror {
     return switch (err) {
         error.EventTooLarge => error.OpenAICodexSseEventTooLarge,
         error.InvalidEvent => error.InvalidOpenAICodexSseEvent,
+        error.MalformedEvent => error.MalformedOpenAICodexSseEvent,
         error.StreamIncomplete => error.OpenAICodexStreamIncomplete,
         error.ToolCallLimitExceeded => error.OpenAICodexToolCallLimitExceeded,
         error.ToolArgumentsTooLarge => error.OpenAICodexToolArgumentsTooLarge,
@@ -947,4 +956,12 @@ test "Responses streams give the same result however they are cut into events an
     try std.testing.fuzz({}, fuzzResponsesChunkedStream, .{
         .corpus = &(.{""} ++ @import("fuzz_corpus").responses_stream.*),
     });
+}
+
+test "a Codex event that is not JSON resends, and a duplicate key still ends the turn" {
+    const partial = "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"content_index\":0,\"delta\":\"partial\"}\n\n";
+    try expectOpenAICodexSseError(error.MalformedOpenAICodexSseEvent, partial ++ "data: {not-json}\n\n", .{});
+    try std.testing.expect(gateway_client.networkFailureEvidence(error.MalformedOpenAICodexSseEvent, .possibly_sent) != null);
+    try expectOpenAICodexSseError(error.InvalidOpenAICodexSseEvent, partial ++ "data: {\"type\":\"a\",\"type\":\"b\"}\n\n", .{});
+    try std.testing.expect(gateway_client.networkFailureEvidence(error.InvalidOpenAICodexSseEvent, .possibly_sent) == null);
 }

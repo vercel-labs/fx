@@ -6,10 +6,13 @@ const host_contract = @import("../hosts/host.zig");
 const host_target = @import("../hosts/target.zig");
 const native_keychain = @import("../hosts/native_keychain.zig");
 const io_mod = @import("../shared/io.zig");
+const leased_lock = @import("../shared/leased_lock.zig");
+const oauth_transport = @import("oauth_transport.zig");
 const profile_paths = @import("../shared/profile_paths.zig");
 const js_host_auth = @import("js_host_auth.zig");
 const secret = @import("secret.zig");
 const session_presence = @import("session_presence.zig");
+const types = @import("../shared/types.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -18,11 +21,33 @@ pub const client_id_env = "FX_OAUTH_CLIENT_ID";
 pub const default_client_id = "cl_zzh5hiOZbwJ9bfqEcYqPIJv3TaPaEYL0";
 const e2e_issuer_url_env = "FX_TEST_OAUTH_ISSUER_URL";
 pub const auth_file_name = profile_paths.auth_file_name;
+/// Keeps the Vercel team of the last fx login that fx retired, so a later
+/// sign-in in any fx process starts on the person's team. It holds the team's
+/// id and slug only, never a token.
+pub const kept_team_file_name = "vercel-team.json";
+const max_kept_team_file_bytes = 1024;
+
+/// True when a login has a team `Mutation.keepTeam` can keep: a team id or
+/// slug that is a valid team name.
+pub fn hasKeepableTeam(team_id: ?[]const u8, team_slug: ?[]const u8) bool {
+    return keepableTeamValue(team_id) != null or keepableTeamValue(team_slug) != null;
+}
+
+fn keepableTeamValue(value: ?[]const u8) ?[]const u8 {
+    const team = value orelse return null;
+    return if (types.validGatewayTeam(team)) team else null;
+}
 const schema_version: i64 = 1;
 const max_auth_file_bytes: usize = 64 * 1024;
 const expiry_skew_ms: i64 = 60 * 1000;
 const mutation_lock_file_name = "auth.lock";
-const mutation_lock_deadline_ms: u64 = 2000;
+/// The lock is leased (`leased_lock`): its holder stamps it before each
+/// Keychain call and each request to the issuer, and each ends within
+/// `mutation_step_ms`, the longer of their timeouts. A waiting fx gives up
+/// `leased_lock.slack_ms` after that, so it waits for another refreshing the
+/// login however slowly, and one frozen holding the lock (ctrl+z) costs it 17 s.
+const mutation_step_ms: i64 = @max(native_keychain.keychain_call_ms, oauth_transport.default_request_timeout_ms);
+const mutation_lock_wait_ms: i64 = mutation_step_ms + leased_lock.slack_ms;
 const e2e_lock_contention_file_name = "auth-lock-contention";
 
 const StorageBackend = enum {
@@ -94,6 +119,11 @@ fn nativeKeychainDelete(_: ?*anyopaque, alloc: Allocator) KeychainError!bool {
 fn selectStorageBackend(os_tag: std.Target.Os.Tag, keychain_disabled: bool) StorageBackend {
     if (os_tag == .macos and !keychain_disabled) return .macos_keychain;
     return .profile_file;
+}
+
+/// Whether the fx login is kept in the macOS Keychain rather than the profile file.
+pub fn storesInKeychain() bool {
+    return storageBackend() == .macos_keychain;
 }
 
 fn storageBackend() StorageBackend {
@@ -294,24 +324,14 @@ const KeychainObservation = union(enum) {
 };
 
 fn observeAuthFile(alloc: Allocator, fx_dir: *std.Io.Dir) !FileObservation {
-    var file = fx_dir.openFile(io_mod.getIo(), auth_file_name, .{
-        .mode = .read_only,
-        .allow_directory = false,
-        .follow_symlinks = false,
-        .resolve_beneath = true,
-    }) catch |err| switch (err) {
-        error.FileNotFound => return .absent,
-        else => {
-            debug_trace.logf("auth", "session load failed source=file step=open err={s}", .{@errorName(err)});
-            return .unusable;
-        },
-    };
-    defer file.close(io_mod.getIo());
-
-    const stat = file.stat(io_mod.getIo()) catch |err| {
-        debug_trace.logf("auth", "session load failed source=file step=stat err={s}", .{@errorName(err)});
+    var current = (session_presence.openCurrent(fx_dir.*, auth_file_name) catch |err| {
+        debug_trace.logf("auth", "session load failed source=file step=open err={s}", .{@errorName(err)});
         return .unusable;
-    };
+    }) orelse return .absent;
+    defer current.file.close(io_mod.getIo());
+    var file = current.file;
+
+    const stat = current.stat;
     if (stat.kind != .file or stat.nlink != 1 or stat.permissions.toMode() & 0o077 != 0) {
         debug_trace.logf("auth", "session load failed source=file step=permissions err=InsecureAuthFile", .{});
         return .unusable;
@@ -376,6 +396,8 @@ pub const Mutation = if (host_target.is_wasm) HostMutation else NativeMutation;
 const NativeMutation = struct {
     fx_dir: io_mod.VerifiedDir,
     lock: io_mod.TimedAdvisoryLock,
+    /// The lease's last stamp, on the awake clock (`mutation_lock_wait_ms`).
+    stamp_ms: i64,
     backend: StorageBackend,
     keychain: KeychainBackend,
     authority: Authority = .unresolved,
@@ -386,7 +408,50 @@ const NativeMutation = struct {
         }
     }
 
+    /// Stamps the lease again, before a request to the issuer: the request
+    /// has its whole budget from a fresh stamp. Keychain calls stamp it
+    /// themselves (`stamped`).
+    pub fn restamp(self: *NativeMutation) void {
+        self.stamp_ms = leased_lock.restamp(self.lock.file, "auth", "fx login");
+    }
+
+    /// `keychain`, stamping the lease before each call.
+    fn stamped(self: *NativeMutation) KeychainBackend {
+        return .{
+            .context = self,
+            .load_fn = stampedLoad,
+            .store_fn = stampedStore,
+            .delete_fn = stampedDelete,
+            .presence_fn = stampedPresence,
+        };
+    }
+
+    fn stampedLoad(context: ?*anyopaque, alloc: Allocator) KeychainError!?[]u8 {
+        const self: *NativeMutation = @ptrCast(@alignCast(context.?));
+        self.restamp();
+        return self.keychain.load(alloc);
+    }
+
+    fn stampedStore(context: ?*anyopaque, value: []const u8) KeychainError!void {
+        const self: *NativeMutation = @ptrCast(@alignCast(context.?));
+        self.restamp();
+        return self.keychain.store(value);
+    }
+
+    fn stampedDelete(context: ?*anyopaque, alloc: Allocator) KeychainError!bool {
+        const self: *NativeMutation = @ptrCast(@alignCast(context.?));
+        self.restamp();
+        return self.keychain.delete(alloc);
+    }
+
+    fn stampedPresence(context: ?*anyopaque) native_keychain.Error!host_contract.SecretStorePresence {
+        const self: *NativeMutation = @ptrCast(@alignCast(context.?));
+        self.restamp();
+        return self.keychain.presence();
+    }
+
     pub fn deinit(self: *Mutation) void {
+        debug_trace.logf("auth", "fx login lock released stamp={d} at={d}", .{ self.stamp_ms, io_mod.awakeMilliTimestamp() });
         self.lock.release();
         self.fx_dir.close();
         self.* = undefined;
@@ -414,10 +479,28 @@ const NativeMutation = struct {
         try io_mod.durableReplaceVerified(alloc, &self.fx_dir, auth_file_name, text);
     }
 
+    /// Keeps the team of a login fx is about to retire, so a later sign-in
+    /// starts on it. A login without a team to keep (`hasKeepableTeam`) is
+    /// refused; forget the kept team for it instead.
+    pub fn keepTeam(self: *Mutation, alloc: Allocator, team_id: ?[]const u8, team_slug: ?[]const u8) !void {
+        const text = (try stringifyKeptTeam(alloc, team_id, team_slug)) orelse return error.NoKeepableTeam;
+        defer alloc.free(text);
+        try io_mod.durableReplaceVerified(alloc, &self.fx_dir, kept_team_file_name, text);
+    }
+
+    /// Forgets the kept team, as a sign-out does. True when there was one.
+    pub fn forgetTeam(self: *Mutation) !bool {
+        self.fx_dir.dir.deleteFile(io_mod.getIo(), kept_team_file_name) catch |err| switch (err) {
+            error.FileNotFound => return false,
+            else => return err,
+        };
+        return true;
+    }
+
     pub fn delete(self: *Mutation, alloc: Allocator) !DeleteResult {
         var result: DeleteResult = .{};
         if (self.backend == .macos_keychain) {
-            const deleted = self.keychain.delete(alloc) catch blk: {
+            const deleted = self.stamped().delete(alloc) catch blk: {
                 result.local_cleanup_failed = true;
                 break :blk false;
             };
@@ -443,7 +526,7 @@ const NativeMutation = struct {
     fn loadKeychainResolved(self: *Mutation, alloc: Allocator) !?Session {
         var file = try observeAuthFile(alloc, &self.fx_dir.dir);
         defer file.deinit(alloc);
-        var keychain = try observeKeychain(alloc, self.keychain);
+        var keychain = try observeKeychain(alloc, self.stamped());
         defer keychain.deinit(alloc);
 
         switch (selectResolution(file.state(), keychain.state())) {
@@ -482,7 +565,7 @@ const NativeMutation = struct {
                 if (migrated) self.authority = .keychain;
             },
             .keychain, .missing => {
-                try publishAndVerifyKeychain(alloc, self.keychain, session);
+                try publishAndVerifyKeychain(alloc, self.stamped(), session);
                 self.authority = .keychain;
             },
             .unresolved => unreachable,
@@ -490,7 +573,7 @@ const NativeMutation = struct {
     }
 
     fn publishAndCleanup(self: *Mutation, alloc: Allocator, session: Session) !bool {
-        publishAndVerifyKeychain(alloc, self.keychain, session) catch |err| {
+        publishAndVerifyKeychain(alloc, self.stamped(), session) catch |err| {
             debug_trace.logf("auth", "session migration deferred step=publish err={s}", .{@errorName(err)});
             return false;
         };
@@ -524,6 +607,9 @@ const HostMutation = struct {
     // Host storage validates writes through its revisioned save callback.
     pub fn requireWritable(_: *HostMutation) error{CredentialStorageUnavailable}!void {}
 
+    /// The host serializes its own storage; there is no lock to stamp.
+    pub fn restamp(_: *HostMutation) void {}
+
     fn init(store: js_host_auth.SessionStore) HostMutation {
         return .{ .store = store };
     }
@@ -551,6 +637,14 @@ const HostMutation = struct {
         const revision = try self.store.commit(alloc, text, expected);
         defer alloc.free(revision);
         try self.captureStoredRevision(revision);
+    }
+
+    /// A host keeps no files, so a sign-in there starts only on the saved
+    /// login's team.
+    pub fn keepTeam(_: *HostMutation, _: Allocator, _: ?[]const u8, _: ?[]const u8) !void {}
+
+    pub fn forgetTeam(_: *HostMutation) !bool {
+        return false;
     }
 
     pub fn delete(self: *HostMutation, _: Allocator) !DeleteResult {
@@ -633,11 +727,7 @@ pub fn load(alloc: Allocator) !?Session {
         return null;
     };
     if (storageBackend() == .macos_keychain) {
-        if (try beginExistingNativeMutation()) |existing| {
-            var mutation = existing;
-            defer mutation.deinit();
-            return mutation.load(alloc);
-        }
+        if (try openExistingNativeFxDir()) |fx_dir| return loadKeychainProfile(alloc, fx_dir, native_keychain_backend);
         return loadKeychainWithoutProfile(alloc);
     }
     var home_dir = std.Io.Dir.openDirAbsolute(io_mod.getIo(), profile_paths.rootParent(home), .{ .iterate = true }) catch |err| {
@@ -667,27 +757,19 @@ fn loadFromHost(alloc: Allocator, store: js_host_auth.SessionStore) !?Session {
 }
 
 fn loadFromDir(alloc: Allocator, fx_dir: *std.Io.Dir) !?Session {
-    var file = fx_dir.openFile(io_mod.getIo(), auth_file_name, .{
-        .mode = .read_only,
-        .allow_directory = false,
-        .follow_symlinks = false,
-        .resolve_beneath = true,
-    }) catch |err| switch (err) {
-        error.FileNotFound => return null,
-        else => {
-            debug_trace.logf("auth", "session load failed step=open_file err={s}", .{@errorName(err)});
-            return session_presence.storageError(auth_file_name, err);
-        },
-    };
-    defer file.close(io_mod.getIo());
+    var current = (session_presence.openCurrent(fx_dir.*, auth_file_name) catch |err| {
+        debug_trace.logf("auth", "session load failed step=open_file err={s}", .{@errorName(err)});
+        return session_presence.storageError(auth_file_name, err);
+    }) orelse return null;
+    defer current.file.close(io_mod.getIo());
 
-    const stat = file.stat(io_mod.getIo()) catch |err| return session_presence.storageError(auth_file_name, err);
+    const stat = current.stat;
     if (stat.kind != .file or stat.nlink != 1 or stat.permissions.toMode() & 0o077 != 0) {
         debug_trace.logf("auth", "session load failed step=permissions err=InsecureAuthFile", .{});
         return error.InsecureAuthFile;
     }
 
-    const bytes = io_mod.readFileToEnd(alloc, &file, max_auth_file_bytes) catch |err| return session_presence.storageError(auth_file_name, err);
+    const bytes = io_mod.readFileToEnd(alloc, &current.file, max_auth_file_bytes) catch |err| return session_presence.storageError(auth_file_name, err);
     defer secret.zeroAndFree(alloc, bytes);
     return try parseStoredSession(alloc, bytes);
 }
@@ -725,28 +807,67 @@ pub fn beginExistingMutation() !?Mutation {
 }
 
 fn beginExistingNativeMutation() !?Mutation {
+    const fx_dir = (try openExistingNativeFxDir()) orelse return null;
+    return @as(?Mutation, try lockMutation(fx_dir));
+}
+
+/// The fx profile folder, null when it does not exist.
+fn openExistingNativeFxDir() !?io_mod.VerifiedDir {
     const home = io_mod.homeDir() orelse return error.HomeNotSet;
     var home_dir = io_mod.VerifiedDir{
         .dir = std.Io.Dir.openDirAbsolute(io_mod.getIo(), profile_paths.rootParent(home), .{ .iterate = true }) catch |err| return session_presence.storageError(auth_file_name, err),
     };
     defer home_dir.close();
 
-    const fx_dir = openExistingPrivateFxDir(&home_dir) catch |err| switch (err) {
-        error.FileNotFound => return null,
-        else => return session_presence.storageError(auth_file_name, err),
+    return openExistingPrivateFxDir(&home_dir) catch |err| switch (err) {
+        error.FileNotFound => null,
+        else => session_presence.storageError(auth_file_name, err),
     };
-    return @as(?Mutation, try lockMutation(fx_dir));
+}
+
+/// Reads the login in `fx_dir` and `keychain`, and takes `fx_dir`. Under the
+/// fx login lock, when it is free, a valid profile file also migrates into the
+/// Keychain. A read never waits for the lock: while another fx process holds
+/// it, such as through a refresh's token request, the read takes the file and
+/// the Keychain as they are and leaves the migration to a later load. Writers
+/// replace the file in one rename and the Keychain item in one call, so the
+/// read gets the login from before or after the write.
+fn loadKeychainProfile(alloc: Allocator, fx_dir: io_mod.VerifiedDir, keychain: KeychainBackend) !?Session {
+    var read_dir = fx_dir;
+    defer read_dir.close();
+    const lock_dir: io_mod.VerifiedDir = .{
+        .dir = read_dir.dir.openDir(io_mod.getIo(), ".", .{ .iterate = true }) catch |err| return session_presence.storageError(auth_file_name, err),
+    };
+    var mutation = lockMutationWithBackend(lock_dir, 0, .{}, .macos_keychain, keychain) catch |err| {
+        if (err != error.LockBusy) return err;
+        debug_trace.logf("auth", "session load read without the fx login lock reason=lock_busy", .{});
+        return loadKeychainUnlocked(alloc, &read_dir.dir, keychain);
+    };
+    defer mutation.deinit();
+    return mutation.load(alloc);
+}
+
+/// The login as the profile file and the Keychain hold it now, read without
+/// the fx login lock. A valid file wins, as under the lock, but does not
+/// migrate.
+fn loadKeychainUnlocked(alloc: Allocator, fx_dir: *std.Io.Dir, keychain: KeychainBackend) !?Session {
+    var file = try observeAuthFile(alloc, fx_dir);
+    defer file.deinit(alloc);
+    var observed = try observeKeychain(alloc, keychain);
+    defer observed.deinit(alloc);
+    return switch (selectResolution(file.state(), observed.state())) {
+        .missing => null,
+        .keychain => observed.takeSession().?,
+        .file_migrate, .file_defer_migration => file.takeSession().?,
+        .storage_error => observed.storageError(),
+    };
 }
 
 fn loadKeychainWithoutProfile(alloc: Allocator) !?Session {
     var keychain = try observeKeychain(alloc, native_keychain_backend);
     defer keychain.deinit(alloc);
 
-    if (try beginExistingNativeMutation()) |existing| {
-        var mutation = existing;
-        defer mutation.deinit();
-        return mutation.load(alloc);
-    }
+    if (try openExistingNativeFxDir()) |fx_dir| return loadKeychainProfile(alloc, fx_dir, native_keychain_backend);
 
     return switch (selectResolution(.absent, keychain.state())) {
         .missing => null,
@@ -769,7 +890,7 @@ fn beginMutation() !Mutation {
 
 fn lockMutation(open_fx_dir: io_mod.VerifiedDir) !Mutation {
     var probe = MutationLockProbe{ .fx_dir = open_fx_dir.dir };
-    return lockMutationWithOps(open_fx_dir, mutation_lock_deadline_ms, .{
+    return lockMutationWithOps(open_fx_dir, mutation_lock_wait_ms, .{
         .ctx = &probe,
         .try_lock = MutationLockProbe.tryLock,
     });
@@ -777,12 +898,12 @@ fn lockMutation(open_fx_dir: io_mod.VerifiedDir) !Mutation {
 
 fn lockMutationWithOps(
     open_fx_dir: io_mod.VerifiedDir,
-    deadline_ms: u64,
+    wait_ms: i64,
     ops: io_mod.LockOps,
 ) !Mutation {
     return lockMutationWithBackend(
         open_fx_dir,
-        deadline_ms,
+        wait_ms,
         ops,
         storageBackend(),
         native_keychain_backend,
@@ -791,7 +912,7 @@ fn lockMutationWithOps(
 
 fn lockMutationWithBackend(
     open_fx_dir: io_mod.VerifiedDir,
-    deadline_ms: u64,
+    wait_ms: i64,
     ops: io_mod.LockOps,
     backend: StorageBackend,
     keychain: KeychainBackend,
@@ -799,17 +920,22 @@ fn lockMutationWithBackend(
     var fx_dir = open_fx_dir;
     errdefer fx_dir.close();
 
-    var lock = io_mod.acquireTimedAdvisoryLockWithOps(
+    const taken = leased_lock.acquire(
         &fx_dir,
         mutation_lock_file_name,
-        deadline_ms,
+        io_mod.awakeMilliTimestamp(),
+        wait_ms,
         ops,
+        "auth",
+        "fx login",
     ) catch |err| return session_presence.storageError(auth_file_name, err);
+    var lock = taken.lock;
     errdefer lock.release();
 
     return .{
         .fx_dir = fx_dir,
         .lock = lock,
+        .stamp_ms = taken.stamp_ms,
         .backend = backend,
         .keychain = keychain,
     };
@@ -888,6 +1014,137 @@ pub fn parse(alloc: Allocator, bytes: []const u8) !Session {
         .team_slug = team_slug,
         .team_id = team_id,
     };
+}
+
+/// A team read back from `kept_team_file_name`: each value is a valid team
+/// name (`types.validGatewayTeam`), and at least one is set.
+pub const KeptTeam = struct {
+    id: ?[]u8 = null,
+    slug: ?[]u8 = null,
+
+    pub fn deinit(self: *KeptTeam, alloc: Allocator) void {
+        if (self.id) |value| alloc.free(value);
+        if (self.slug) |value| alloc.free(value);
+        self.* = .{};
+    }
+};
+
+/// The team `Mutation.keepTeam` kept, or null when there is none or it cannot
+/// be used; the trace says why, without the team. It reads without the login
+/// lock: `keepTeam` replaces the file in one rename, so a reader sees either
+/// the old file or the new one.
+pub fn loadKeptTeam(alloc: Allocator) ?KeptTeam {
+    if (comptime host_target.is_wasm) return null;
+    return readKeptTeam(alloc) catch |err| {
+        debug_trace.logf("auth", "kept team ignored reason={s}", .{@errorName(err)});
+        return null;
+    };
+}
+
+fn readKeptTeam(alloc: Allocator) !?KeptTeam {
+    const home = io_mod.homeDir() orelse return null;
+    var home_dir = std.Io.Dir.openDirAbsolute(io_mod.getIo(), profile_paths.rootParent(home), .{}) catch |err| switch (err) {
+        error.FileNotFound => return null,
+        else => return err,
+    };
+    defer home_dir.close(io_mod.getIo());
+    var fx_dir = home_dir.openDir(io_mod.getIo(), profile_paths.rootName(), .{ .follow_symlinks = false }) catch |err| switch (err) {
+        error.FileNotFound => return null,
+        else => return err,
+    };
+    defer fx_dir.close(io_mod.getIo());
+
+    var current = (try session_presence.openCurrent(fx_dir, kept_team_file_name)) orelse return null;
+    defer current.file.close(io_mod.getIo());
+    const stat = current.stat;
+    if (stat.kind != .file or stat.nlink != 1 or stat.permissions.toMode() & 0o077 != 0) return error.InsecureKeptTeamFile;
+    const bytes = try io_mod.readFileToEnd(alloc, &current.file, max_kept_team_file_bytes);
+    defer alloc.free(bytes);
+    return try parseKeptTeam(alloc, bytes);
+}
+
+/// Reads a kept-team file. Every value must be a valid team name and at least
+/// one must be set; anything else is `error.InvalidKeptTeam`.
+fn parseKeptTeam(alloc: Allocator, bytes: []const u8) !KeptTeam {
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, bytes, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.InvalidKeptTeam,
+    };
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidKeptTeam;
+    const id = try keptTeamValue(parsed.value.object, "team_id");
+    const slug = try keptTeamValue(parsed.value.object, "team_slug");
+    if (id == null and slug == null) return error.InvalidKeptTeam;
+    const id_copy = if (id) |value| try alloc.dupe(u8, value) else null;
+    errdefer if (id_copy) |value| alloc.free(value);
+    const slug_copy = if (slug) |value| try alloc.dupe(u8, value) else null;
+    return .{ .id = id_copy, .slug = slug_copy };
+}
+
+fn keptTeamValue(object: std.json.ObjectMap, key: []const u8) error{InvalidKeptTeam}!?[]const u8 {
+    const value = object.get(key) orelse return null;
+    if (value == .null) return null;
+    if (value != .string or !types.validGatewayTeam(value.string)) return error.InvalidKeptTeam;
+    return value.string;
+}
+
+/// The kept-team file for a team, or null when neither value is a valid team
+/// name.
+fn stringifyKeptTeam(alloc: Allocator, team_id: ?[]const u8, team_slug: ?[]const u8) !?[]u8 {
+    const id = keepableTeamValue(team_id);
+    const slug = keepableTeamValue(team_slug);
+    if (id == null and slug == null) return null;
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    const writer = &out.writer;
+    try writer.writeAll("{");
+    if (id) |value| {
+        try std.json.Stringify.value("team_id", .{}, writer);
+        try writer.writeAll(":");
+        try std.json.Stringify.value(value, .{}, writer);
+    }
+    if (slug) |value| {
+        if (id != null) try writer.writeAll(",");
+        try std.json.Stringify.value("team_slug", .{}, writer);
+        try writer.writeAll(":");
+        try std.json.Stringify.value(value, .{}, writer);
+    }
+    try writer.writeAll("}\n");
+    return try out.toOwnedSlice();
+}
+
+fn fuzzParseKeptTeam(_: void, smith: *std.testing.Smith) anyerror!void {
+    const alloc = std.testing.allocator;
+    var buffer: [max_kept_team_file_bytes]u8 = undefined;
+    const len: usize = @intCast(smith.slice(&buffer));
+    var kept = parseKeptTeam(alloc, buffer[0..len]) catch |err| switch (err) {
+        error.InvalidKeptTeam => return,
+        else => return err,
+    };
+    defer kept.deinit(alloc);
+    try std.testing.expect(kept.id != null or kept.slug != null);
+    if (kept.id) |value| try std.testing.expect(types.validGatewayTeam(value));
+    if (kept.slug) |value| try std.testing.expect(types.validGatewayTeam(value));
+    // What fx writes for that team reads back as the same team.
+    const text = (try stringifyKeptTeam(alloc, kept.id, kept.slug)).?;
+    defer alloc.free(text);
+    var again = try parseKeptTeam(alloc, text);
+    defer again.deinit(alloc);
+    try std.testing.expectEqualDeep(kept.id, again.id);
+    try std.testing.expectEqualDeep(kept.slug, again.slug);
+}
+
+test "a kept team file reads as valid team names or is refused on fuzzed bytes" {
+    try std.testing.fuzz({}, fuzzParseKeptTeam, .{
+        .corpus = &(@import("fuzz_seed").slices(.{
+            "{\"team_id\":\"team_456\",\"team_slug\":\"other-team\"}\n",
+            "{\"team_slug\":\"other-team\"}",
+            "{\"team_id\":\"team 456;\"}",
+            "{\"team_id\":null,\"team_slug\":null}",
+            "[\"team_456\"]",
+            "{\"team_id\":\"\xe2\x80\xaeteam\"}",
+        }) ++ @import("fuzz_corpus").kept_team_file.*),
+    });
 }
 
 pub fn stringify(alloc: Allocator, session: Session) ![]u8 {
@@ -1150,6 +1407,69 @@ fn testKeychainMutation(dir: std.Io.Dir, keychain: KeychainBackend) !Mutation {
     );
 }
 
+test "the fx login lock is stamped before each Keychain call made under it" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // The Keychain, recording the lock's stamp as each call finds it. Each
+    // call takes 3 ms, so a stamp written before the next one shows.
+    const Probe = struct {
+        fake: FakeOAuthKeychain,
+        dir: std.Io.Dir,
+        stamps: std.ArrayList(i64) = .empty,
+
+        fn backend(self: *@This()) KeychainBackend {
+            return .{ .context = self, .load_fn = probeLoad, .store_fn = probeStore, .delete_fn = probeDelete, .presence_fn = probePresence };
+        }
+
+        fn record(self: *@This()) void {
+            var dir: io_mod.VerifiedDir = .{ .dir = self.dir };
+            const stamp = leased_lock.readStamp(&dir, mutation_lock_file_name) orelse return;
+            self.stamps.append(std.testing.allocator, stamp) catch return;
+            io_mod.sleep(3 * std.time.ns_per_ms);
+        }
+
+        fn probeLoad(raw: ?*anyopaque, a: Allocator) KeychainError!?[]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.record();
+            return FakeOAuthKeychain.loadCallback(&self.fake, a);
+        }
+
+        fn probeStore(raw: ?*anyopaque, value: []const u8) KeychainError!void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.record();
+            return FakeOAuthKeychain.storeCallback(&self.fake, value);
+        }
+
+        fn probeDelete(raw: ?*anyopaque, a: Allocator) KeychainError!bool {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.record();
+            return FakeOAuthKeychain.deleteCallback(&self.fake, a);
+        }
+
+        fn probePresence(raw: ?*anyopaque) native_keychain.Error!host_contract.SecretStorePresence {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            return FakeOAuthKeychain.presenceCallback(&self.fake);
+        }
+    };
+    var probe: Probe = .{ .fake = .{ .alloc = alloc }, .dir = tmp.dir };
+    defer probe.fake.deinit();
+    defer probe.stamps.deinit(alloc);
+
+    var mutation = try testKeychainMutation(tmp.dir, probe.backend());
+    defer mutation.deinit();
+    const taken = mutation.stamp_ms;
+    var session = try parse(alloc, test_session_json);
+    defer session.deinit(alloc);
+    // A save writes the login, then reads it back: two calls, two stamps.
+    try mutation.save(alloc, session);
+    try std.testing.expectEqual(@as(usize, 2), probe.stamps.items.len);
+    try std.testing.expect(probe.stamps.items[0] >= taken);
+    try std.testing.expect(probe.stamps.items[1] > probe.stamps.items[0]);
+    try std.testing.expectEqual(probe.stamps.items[1], mutation.stamp_ms);
+}
+
 test "OAuth migration keeps a valid file authoritative until verified cleanup" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -1188,6 +1508,50 @@ test "OAuth migration keeps a valid file authoritative until verified cleanup" {
     var updated = try parse(alloc, fake.value.?);
     defer updated.deinit(alloc);
     try std.testing.expectEqualStrings("keychain-only-update", updated.access_token);
+}
+
+test "a Keychain login read never waits for another process's fx login lock and migrates once the lock is free" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeTestAuthFile(tmp.dir, test_session_json);
+    var fake = FakeOAuthKeychain{ .alloc = alloc };
+    defer fake.deinit();
+
+    // Another fx process holds the lock, as through a refresh's token request.
+    var holder = try testKeychainMutation(tmp.dir, fake.backend());
+    const started = io_mod.milliTimestamp();
+    var busy = (try loadKeychainProfile(alloc, .{ .dir = try tmp.dir.openDir(std.testing.io, ".", .{ .iterate = true }) }, fake.backend())).?;
+    defer busy.deinit(alloc);
+    try std.testing.expect(io_mod.milliTimestamp() - started < 1_000);
+    try std.testing.expectEqualStrings("access", busy.access_token);
+    // Without the lock the file is read as it is: it does not migrate.
+    try std.testing.expectEqual(@as(usize, 0), fake.store_calls);
+    _ = try tmp.dir.statFile(std.testing.io, auth_file_name, .{});
+    holder.deinit();
+
+    var free = (try loadKeychainProfile(alloc, .{ .dir = try tmp.dir.openDir(std.testing.io, ".", .{ .iterate = true }) }, fake.backend())).?;
+    defer free.deinit(alloc);
+    try std.testing.expectEqualStrings("access", free.access_token);
+    try std.testing.expectEqual(@as(usize, 1), fake.store_calls);
+    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(std.testing.io, auth_file_name, .{}));
+}
+
+test "a Keychain login read while another process holds the fx login lock returns the Keychain login" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var fake = FakeOAuthKeychain{ .alloc = alloc, .value = try alloc.dupe(u8, alternate_test_session_json) };
+    defer fake.deinit();
+    var holder = try testKeychainMutation(tmp.dir, fake.backend());
+    defer holder.deinit();
+
+    var loaded = (try loadKeychainProfile(alloc, .{ .dir = try tmp.dir.openDir(std.testing.io, ".", .{ .iterate = true }) }, fake.backend())).?;
+    defer loaded.deinit(alloc);
+    var expected = try parse(alloc, alternate_test_session_json);
+    defer expected.deinit(alloc);
+    try std.testing.expectEqualStrings(expected.access_token, loaded.access_token);
+    try std.testing.expectEqual(@as(usize, 0), fake.store_calls);
 }
 
 test "new OAuth login replaces an existing file before deferred migration" {

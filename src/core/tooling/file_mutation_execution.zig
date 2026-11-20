@@ -69,6 +69,7 @@ pub fn execute(input: Input) Error!ToolExecutionResult {
             input.call,
             authorization.input,
             authorization.policy_targets,
+            authorization.edit_failure_detail,
         ) catch |err| return mapFileMutationOperationalError(err)) {
             .prepared => |prepared| prepared,
             .semantic_failure => |reason| return fileMutationFailure(
@@ -476,6 +477,7 @@ test "post-commit full view capture failure preserves the committed file" {
         call,
         mutation_input,
         policy_targets,
+        .plain,
     )) {
         .prepared => |value| value,
         .semantic_failure => return error.TestExpectedPreparedMutation,

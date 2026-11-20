@@ -6,6 +6,6 @@
   "dependencies": {
     "@vercel/oidc": "3.8.10",
     "@workflow/world-local": "5.1.1",
-    "@workflow/world-vercel": "5.2.1"
+    "@workflow/world-vercel": "5.6.0"
   }
 }

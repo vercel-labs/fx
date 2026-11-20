@@ -1,5 +1,6 @@
 const std = @import("std");
 const agent_frame = @import("../shared/agent_frame.zig");
+const recovery_prompt = @import("../shared/recovery_prompt.zig");
 const testing_allocator = @import("../shared/testing_allocator.zig");
 const kernel_agent = @import("../agent/runtime/agent.zig");
 const cache_warmer = @import("../agent/runtime/cache_warmer.zig");
@@ -71,6 +72,78 @@ pub const resumed_request_prompt =
     "A tool that was running may have partly run. Check what finished, rerun only what is safe to repeat, " ++
     "and continue the previous request.\n" ++
     "</session_resumed>";
+
+/// What the model reads in place of `resumed_request_prompt` when the turn fx
+/// stopped ran no tool: that turn is projected as the user's own message, so
+/// there is nothing to check and nothing to say no to.
+pub const resumed_request_note_no_tool =
+    "<session_resumed>\n" ++
+    "fx stopped before it answered the message above, because it crashed or its window was closed. " ++
+    "Nothing ran. Answer that message now.\n" ++
+    "</session_resumed>";
+
+/// Whether an interrupted turn ran no tool at all. A tool fx stopped in the
+/// middle of is not `tool_call`: the session repairs it into a step of its
+/// own, answered as possibly run.
+fn ranNothing(entry: core_types.InterruptedHistoryTurn) bool {
+    return entry.tool_call == null and entry.completed_tool_names.len == 0 and entry.execution.tool_steps.len == 0;
+}
+
+/// Drops trailing interrupted turns that were themselves resumes and ran
+/// nothing, so a request closed twice continues the turn fx stopped first.
+pub fn withoutSupersededResumes(history: []const HistoryTurn) []const HistoryTurn {
+    var end = history.len;
+    while (end > 0) : (end -= 1) {
+        switch (history[end - 1]) {
+            .interrupted => |entry| if (ranNothing(entry) and std.mem.eql(u8, entry.user.text, resumed_request_prompt)) continue,
+            else => {},
+        }
+        break;
+    }
+    return history[0..end];
+}
+
+/// Whether a turn is a resume fx sent for a request it stopped. Its saved
+/// text is always `resumed_request_prompt`; the projection picks the note.
+fn isResumeTurn(turn: HistoryTurn) bool {
+    const text = switch (turn) {
+        .assistant => |entry| entry.user.text,
+        .interrupted => |entry| entry.user.text,
+        .compacted_summary => return false,
+    };
+    return std.mem.eql(u8, text, resumed_request_prompt);
+}
+
+/// A resume that ran nothing before fx resumed the request again: the later
+/// resume dropped it, so every later request drops it too.
+fn isSupersededResume(history: []const HistoryTurn, index: usize) bool {
+    if (index + 1 >= history.len) return false;
+    return switch (history[index]) {
+        .interrupted => |entry| ranNothing(entry) and isResumeTurn(history[index]) and isResumeTurn(history[index + 1]),
+        else => false,
+    };
+}
+
+/// Whether fx later resumed the request this interrupted turn left
+/// unfinished. Such a turn reads as the resume request read it: with no
+/// abort note, since the request went on.
+fn isResumedLater(history: []const HistoryTurn, index: usize) bool {
+    if (history[index] != .interrupted) return false;
+    var next = index + 1;
+    while (next < history.len and isSupersededResume(history, next)) next += 1;
+    return next < history.len and isResumeTurn(history[next]);
+}
+
+/// The note a resumed request sends. A stopped turn that ran a tool keeps
+/// the caveat that it may have partly run; one that ran nothing is the
+/// user's message, still to answer.
+pub fn resumedRequestNote(history: []const HistoryTurn) []const u8 {
+    if (history.len == 0) return resumed_request_note_no_tool;
+    return switch (history[history.len - 1]) {
+        .interrupted => |entry| if (ranNothing(entry)) resumed_request_note_no_tool else resumed_request_prompt,
+        else => resumed_request_note_no_tool,
+    };
+}
 
 /// What the transcript shows in place of `resumed_request_prompt`, live and
 /// when the session is replayed.
@@ -1734,7 +1807,9 @@ pub const SessionRuntime = struct {
     ) void {
         if (isCurrentCompactionCheckpoint(turn)) {
             self.disarmCacheWarming("history_compacted");
-            self.agent.clearHistory(alloc);
+            // The conversation goes on after compacting: it keeps its toolbox
+            // menu (`tests/tla/toolbox/Toolbox.tla` MenuFixed).
+            self.agent.dropHistory(alloc);
             self.unversioned_history_len = 0;
         }
         self.agent.history.appendAssumeCapacity(turn);
@@ -1748,7 +1823,7 @@ pub const SessionRuntime = struct {
     pub fn commitCompactedHistory(self: *SessionRuntime, alloc: Allocator, history: []HistoryTurn) void {
         const uncertain = self.unversioned_history_len != 0;
         self.disarmCacheWarming("history_compacted");
-        self.agent.clearHistory(alloc);
+        self.agent.dropHistory(alloc);
         self.agent.history.deinit(alloc);
         self.agent.history = std.ArrayList(HistoryTurn).fromOwnedSlice(history);
         self.agent.fresh = false;
@@ -2122,19 +2197,16 @@ fn appendActiveContextHistoryChatMessagesWithTrailingProjection(
         if (remaining != 0) return error.InvalidContextHistoryStart;
         for (history[retained_start..context_history_start], retained_start..) |turn, index| {
             if (turn == .compacted_summary) continue;
-            try appendHistoryChatMessagesImpl(
-                alloc,
-                messages,
-                history[index .. index + 1],
-                .closed,
-            );
+            try appendHistoryRangeChatMessages(alloc, messages, history, index, index + 1, .closed);
         }
     }
     if (context_history_start + 1 < history.len) {
-        try appendHistoryChatMessagesImpl(
+        try appendHistoryRangeChatMessages(
             alloc,
             messages,
-            history[context_history_start + 1 ..],
+            history,
+            context_history_start + 1,
+            history.len,
             interrupted_projection,
         );
     }
@@ -2215,20 +2287,8 @@ fn appendHistoryChatMessagesWithTrailingProjection(
         return;
     }
 
-    if (history.len > 1) {
-        try appendHistoryChatMessagesImpl(
-            alloc,
-            messages,
-            history[0 .. history.len - 1],
-            .closed,
-        );
-    }
-    try appendHistoryChatMessagesImpl(
-        alloc,
-        messages,
-        history[history.len - 1 ..],
-        trailing_interrupted_projection,
-    );
+    try appendHistoryRangeChatMessages(alloc, messages, history, 0, history.len - 1, .closed);
+    try appendHistoryRangeChatMessages(alloc, messages, history, history.len - 1, history.len, trailing_interrupted_projection);
 }
 
 fn appendHistoryMessagesImpl(
@@ -2354,11 +2414,6 @@ fn appendExecutionMemoryMessages(
             }
         }
     }
-    if (execution.files.len > 0) {
-        const text = try formatExecutionFileContext(alloc, execution.files);
-        errdefer alloc.free(text);
-        try messages.append(alloc, message.Message.userOwned(text));
-    }
     while (steering_index < execution.steering.len) : (steering_index += 1) {
         const steering = execution.steering[steering_index];
         if (steering.assistant_prefix) |prefix| {
@@ -2422,14 +2477,10 @@ pub fn appendExecutionMemoryChatMessages(
             }
         }
     }
-    // Notes after the last step follow its results, as the turn sent them,
-    // and come before the file context a saved turn adds.
+    // Notes after the last step follow its results, as the turn sent them.
+    // Nothing the turn never sent joins it here: a model that checks earlier
+    // reasoning rejects a reply whose preceding messages changed.
     try appendContextNoteChatMessages(alloc, messages, execution.context_notes, &note_index, null);
-    if (execution.files.len > 0) {
-        const text = try formatExecutionFileContext(alloc, execution.files);
-        errdefer alloc.free(text);
-        try messages.append(alloc, .{ .role = .user, .content = text });
-    }
     while (steering_index < execution.steering.len) : (steering_index += 1) {
         const steering = execution.steering[steering_index];
         if (steering.assistant_prefix) |prefix| {
@@ -2460,14 +2511,77 @@ fn appendContextNoteChatMessages(
 /// Steering comes from whoever drives this session, so compaction keeps it as
 /// user text rather than a generated notice. A subagent's report or message
 /// a boundary took is not the user's, so it stays ordinary text in its own
-/// frame. Empty entries only mark a checkpoint boundary. Borrows `text`.
+/// frame. fx's own prompt to a stalled turn is steering the user never typed:
+/// it comes back as the plain user text the turn sent, never as the user's
+/// words. Empty entries only mark a checkpoint boundary. Borrows `text`.
 fn restoredSteeringChatMessage(text: []const u8) core_types.ChatMessage {
+    if (recovery_prompt.fromSaved(text)) |prompt| {
+        return .{ .role = .user, .content = prompt, .recovery_prompt = true };
+    }
     return .{
         .role = .user,
         .content = text,
         .restored_steering = true,
         .context_origin = if (text.len > 0 and !agent_frame.isFrame(text)) .user_turn else .ordinary,
     };
+}
+
+test "saved steering with a half marker comes back as the user's words, never as fx's message" {
+    for ([_][]const u8{
+        "<fx_recovery_prompt>\nnotice with no closing line",
+        "no opening line\n</fx_recovery_prompt>",
+        "<fx_recovery_prompt>\n</fx_recovery_prompt>x",
+    }) |text| {
+        const back = restoredSteeringChatMessage(text);
+        try std.testing.expect(back.restored_steering and !back.recovery_prompt);
+        try std.testing.expectEqualStrings(text, back.content.?);
+        try std.testing.expect(back.context_origin == .user_turn);
+    }
+}
+
+test "a recovery prompt a turn sent after its last step ends the saved turn as the turn sent it" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var calls = [_]core_types.ToolCall{.{ .id = "call_1", .name = "read_file", .arguments_json = "{\"path\":\"a\"}" }};
+    var results = [_]core_types.PersistedToolResult{.{
+        .tool_call_id = @constCast("call_1"),
+        .tool_name = @constCast("read_file"),
+        .status = .success,
+        .output = @constCast("a"),
+        .output_bytes = 1,
+        .stored_output_bytes = 1,
+    }};
+    var steps = [_]core_types.ToolExecutionStep{.{ .tool_calls = &calls, .tool_results = &results }};
+    var files = [_]core_types.FileEvidence{.{
+        .path = @constCast("a"),
+        .tool_call_id = @constCast("call_1"),
+        .tool_name = @constCast("read_file"),
+        .action = .read,
+    }};
+    const prompt = try recovery_prompt.saved(arena, "Summarize what you just did.");
+    var steering = [_]core_types.PersistedSteering{
+        .{ .text = prompt, .after_tool_step_count = 1 },
+        .{ .text = @constCast("later update"), .after_tool_step_count = 1 },
+    };
+
+    var messages: std.ArrayList(core_types.ChatMessage) = .empty;
+    try appendExecutionMemoryChatMessages(arena, &messages, .{ .tool_steps = &steps, .files = &files, .steering = &steering });
+
+    // The turn's last request ended with the prompt and the update, so the
+    // next request ends the turn with both, and nothing the turn never sent
+    // follows them, though the turn read a file.
+    try std.testing.expectEqual(@as(usize, 4), messages.items.len);
+    try std.testing.expect(messages.items[2].recovery_prompt);
+    try std.testing.expectEqualStrings("Summarize what you just did.", messages.items[2].content.?);
+    try std.testing.expect(messages.items[3].restored_steering);
+    try std.testing.expectEqualStrings("later update", messages.items[3].content.?);
+
+    var user_only: std.ArrayList(core_types.ChatMessage) = .empty;
+    try appendExecutionMemoryChatMessages(arena, &user_only, .{ .tool_steps = &steps, .files = &files, .steering = steering[1..] });
+    try std.testing.expectEqual(@as(usize, 3), user_only.items.len);
+    try std.testing.expectEqualStrings("later update", user_only.items[2].content.?);
 }
 
 test "a restored subagent frame is never the user's text" {
@@ -2499,7 +2613,31 @@ fn appendHistoryChatMessagesImpl(
     history: []const HistoryTurn,
     interrupted_projection: InterruptedChatProjection,
 ) !void {
-    for (history) |turn| {
+    return appendHistoryRangeChatMessages(alloc, messages, history, 0, history.len, interrupted_projection);
+}
+
+/// Projects `history[start..end]`, reading the turns around it so every
+/// request after a resume sees the conversation as the resume request did:
+/// the stopped turn without its abort note, the resume with the note that
+/// fits what ran, and no resume a later one replaced.
+fn appendHistoryRangeChatMessages(
+    alloc: Allocator,
+    messages: *std.ArrayList(core_types.ChatMessage),
+    history: []const HistoryTurn,
+    start: usize,
+    end: usize,
+    trailing_projection: InterruptedChatProjection,
+) !void {
+    for (history[start..end], start..) |turn, index| {
+        if (isSupersededResume(history, index)) continue;
+        const interrupted_projection: InterruptedChatProjection = if (isResumedLater(history, index))
+            .steering_continuation
+        else
+            trailing_projection;
+        const resume_note: ?[]const u8 = if (isResumeTurn(turn))
+            resumedRequestNote(withoutSupersededResumes(history[0..index]))
+        else
+            null;
         switch (turn) {
             .compacted_summary => |entry| {
                 const text = try formatCompactedContinuationMessage(alloc, entry.summary);
@@ -2511,14 +2649,14 @@ fn appendHistoryChatMessagesImpl(
                 });
             },
             .assistant => |entry| {
-                try messages.append(alloc, .{ .role = .user, .content = entry.user.text, .images = entry.user.images, .context_origin = .user_turn });
+                try messages.append(alloc, .{ .role = .user, .content = resume_note orelse entry.user.text, .images = entry.user.images, .context_origin = .user_turn });
                 try appendExecutionMemoryChatMessages(alloc, messages, entry.execution);
                 if (entry.assistant.len > 0 or entry.provider_replay != null) {
                     try messages.append(alloc, .{ .role = .assistant, .content = entry.assistant, .provider_replay = entry.provider_replay });
                 }
             },
             .interrupted => |entry| {
-                try messages.append(alloc, .{ .role = .user, .content = entry.user.text, .images = entry.user.images, .context_origin = .user_turn });
+                try messages.append(alloc, .{ .role = .user, .content = resume_note orelse entry.user.text, .images = entry.user.images, .context_origin = .user_turn });
                 try appendExecutionMemoryChatMessages(alloc, messages, entry.execution);
                 if (entry.tool_call) |tool_call| {
                     const assistant_content = try formatInterruptedAssistantToolContent(alloc, entry);
@@ -2579,28 +2717,6 @@ pub fn formatCompactedContinuationMessage(alloc: Allocator, summary: []const u8)
         "{s}{s}\n\n{s}\n{s}",
         .{ compact_continuation_preamble, summary, compact_recent_messages_note, compact_direct_resume_instruction },
     );
-}
-
-pub fn formatExecutionFileContext(alloc: Allocator, files: []const core_types.FileEvidence) ![]u8 {
-    var out: std.Io.Writer.Allocating = .init(alloc);
-    errdefer out.deinit();
-
-    out.writer.writeAll("Session file evidence from previous tool execution. Re-read stale paths before relying on exact contents:") catch return error.OutOfMemory;
-    for (files) |file| {
-        out.writer.print("\n- action={s} status={s} path={s}", .{ @tagName(file.action), @tagName(file.status), file.path }) catch return error.OutOfMemory;
-        if (file.new_path) |new_path| {
-            out.writer.print(" new_path={s}", .{new_path}) catch return error.OutOfMemory;
-        }
-        if (file.model_view_covers_full_file) {
-            out.writer.writeAll(" model_view=full") catch return error.OutOfMemory;
-        }
-        if (file.stale) {
-            out.writer.writeAll(" stale=true") catch return error.OutOfMemory;
-        }
-        out.writer.print(" tool={s}", .{file.tool_name}) catch return error.OutOfMemory;
-    }
-
-    return out.toOwnedSlice() catch return error.OutOfMemory;
 }
 
 pub fn formatInterruptedHistoryContext(alloc: Allocator, entry: InterruptedHistoryTurn) ![]u8 {
@@ -2847,7 +2963,7 @@ test "resume history preserves steering between tool episodes" {
     try std.testing.expectEqualStrings("after second", messages.items[6].content.?.asText());
 }
 
-test "resume history keeps context notes between tool episodes, before steering and the file context (D93)" {
+test "resume history keeps context notes between tool episodes and before steering (D93)" {
     const alloc = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(alloc);
     defer arena_state.deinit();
@@ -2910,19 +3026,17 @@ test "resume history keeps context notes between tool episodes, before steering 
         .{ .assistant, null },
         .{ .tool, "second result" },
         .{ .system, "note after second" },
-        .{ .user, null },
         .{ .user, "after second" },
         .{ .assistant, "finished" },
     };
+    // The saved file list adds no message: the turn never sent one, and a
+    // message it never sent would change what came before its reply.
     try std.testing.expectEqual(expected.len, messages.items.len);
     for (expected, messages.items) |want, got| {
         try std.testing.expectEqual(want[0], got.role);
         try std.testing.expectEqual(want[0] == .system, got.context_note);
         if (want[1]) |text| try std.testing.expectEqualStrings(text, got.content.?);
     }
-    // The file context a saved turn adds follows the last step's note, which
-    // rides on that step's result, and comes before the last steering.
-    try std.testing.expect(std.mem.find(u8, messages.items[8].content.?, "first") != null);
 }
 
 test "resume projection replays assistant tool execution memory before final answer" {
@@ -2963,16 +3077,16 @@ test "resume projection replays assistant tool execution memory before final ans
     defer deinitMessages(alloc, &messages);
     try appendHistoryMessages(alloc, &messages, &history);
 
-    try std.testing.expectEqual(@as(usize, 5), messages.items.len);
+    // The final answer directly follows the last tool result, as the turn
+    // sent them; the saved file list adds nothing between.
+    try std.testing.expectEqual(@as(usize, 4), messages.items.len);
     try std.testing.expectEqual(.user, messages.items[0].role);
     try std.testing.expectEqual(.assistant, messages.items[1].role);
     try std.testing.expectEqualStrings("call_read", messages.items[1].tool_calls[0].id);
     try std.testing.expectEqual(.tool, messages.items[2].role);
     try std.testing.expectEqualStrings("file contents", messages.items[2].content.?.asText());
-    try std.testing.expectEqual(.user, messages.items[3].role);
-    try std.testing.expect(std.mem.find(u8, messages.items[3].content.?.asText(), "model_view=full") != null);
-    try std.testing.expectEqual(.assistant, messages.items[4].role);
-    try std.testing.expectEqualStrings("main wires the app", messages.items[4].content.?.asText());
+    try std.testing.expectEqual(.assistant, messages.items[3].role);
+    try std.testing.expectEqualStrings("main wires the app", messages.items[3].content.?.asText());
 }
 
 test "resume projections omit empty terminal assistant after completed execution" {
@@ -4193,20 +4307,19 @@ fn checkPromptHistoryMessageProjectionAllocationFailures(
         return err;
     };
 
-    try std.testing.expect(messages.items.len >= 6);
+    try std.testing.expectEqual(@as(usize, 6), messages.items.len);
     try std.testing.expectEqualStrings(
         "latest user",
-        messages.items[messages.items.len - 5].content.?.asText(),
+        messages.items[messages.items.len - 4].content.?.asText(),
     );
     try std.testing.expectEqual(
         PersistedToolStatus.failure,
-        messages.items[messages.items.len - 3].tool_result_status.?,
+        messages.items[messages.items.len - 2].tool_result_status.?,
     );
-    try std.testing.expect(std.mem.find(
-        u8,
-        messages.items[messages.items.len - 2].content.?.asText(),
-        "src/latest.zig",
-    ) != null);
+    try std.testing.expectEqualStrings(
+        "latest assistant",
+        messages.items[messages.items.len - 1].content.?.asText(),
+    );
 }
 
 test "prompt history cleanup is independent after snapshot creation" {
@@ -4802,4 +4915,92 @@ test "image catalog merges a retained recovery image and rejects changed identit
     try std.testing.expectEqual(@as(usize, 7), merged[0].id);
     images[0].snapshot_sha256 = @constCast(text_utils.repeat("b", 64));
     try std.testing.expectError(error.StaleImageCatalog, merge_image_catalog_history_turn(alloc, catalog, turn));
+}
+
+test "a resumed request's note names a tool only when the stopped turn ran one" {
+    const prompt = @constCast("Name the capital.");
+    try std.testing.expectEqualStrings(resumed_request_note_no_tool, resumedRequestNote(&.{}));
+    const plain = [_]HistoryTurn{.{ .interrupted = .{ .user = .{ .text = prompt } } }};
+    try std.testing.expectEqualStrings(resumed_request_note_no_tool, resumedRequestNote(&plain));
+    // A tool fx stopped in the middle of comes back as a step of its own.
+    var repaired = [_]core_types.ToolExecutionStep{.{}};
+    const running = [_]HistoryTurn{.{ .interrupted = .{ .user = .{ .text = prompt }, .execution = .{ .tool_steps = &repaired } } }};
+    try std.testing.expectEqualStrings(resumed_request_prompt, resumedRequestNote(&running));
+    var completed = [_][]u8{@constCast("read_file")};
+    const ran = [_]HistoryTurn{.{ .interrupted = .{ .user = .{ .text = prompt }, .completed_tool_names = &completed } }};
+    try std.testing.expectEqualStrings(resumed_request_prompt, resumedRequestNote(&ran));
+    const answered = [_]HistoryTurn{.{ .assistant = .{ .user = .{ .text = prompt }, .assistant = @constCast("Paris") } }};
+    try std.testing.expectEqualStrings(resumed_request_note_no_tool, resumedRequestNote(&answered));
+}
+
+test "resume turns that ran nothing are dropped, however many stacked up" {
+    const prompt = @constCast("List the planets.");
+    const resume_text = @constCast(resumed_request_prompt);
+    var history: [51]HistoryTurn = undefined;
+    history[0] = .{ .interrupted = .{ .user = .{ .text = prompt } } };
+    for (history[1..]) |*turn| turn.* = .{ .interrupted = .{ .user = .{ .text = resume_text } } };
+    const kept = withoutSupersededResumes(&history);
+    try std.testing.expectEqual(@as(usize, 1), kept.len);
+    try std.testing.expectEqualStrings("List the planets.", kept[0].interrupted.user.text);
+    try std.testing.expectEqual(@as(usize, 0), withoutSupersededResumes(history[1..]).len);
+
+    // A resume that ran a tool did something, so it stays, and so does
+    // everything before it.
+    var repaired = [_]core_types.ToolExecutionStep{.{}};
+    var with_tool = history;
+    with_tool[25] = .{ .interrupted = .{ .user = .{ .text = resume_text }, .execution = .{ .tool_steps = &repaired } } };
+    try std.testing.expectEqual(@as(usize, 26), withoutSupersededResumes(&with_tool).len);
+    // A stopped turn the user wrote is never dropped.
+    try std.testing.expectEqual(@as(usize, 1), withoutSupersededResumes(history[0..1]).len);
+}
+
+fn projectedTexts(arena: Allocator, history: []const HistoryTurn) ![]const []const u8 {
+    var messages: std.ArrayList(core_types.ChatMessage) = .empty;
+    try appendActiveContextHistoryChatMessages(arena, &messages, history, 0);
+    const texts = try arena.alloc([]const u8, messages.items.len);
+    for (messages.items, texts) |chat, *text| text.* = chat.content orelse "";
+    return texts;
+}
+
+test "every request after a resume projects the stopped turn as the resume request did" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const resume_text = @constCast(resumed_request_prompt);
+    const history = [_]HistoryTurn{
+        .{ .interrupted = .{ .user = .{ .text = @constCast("Name the capital.") } } },
+        .{ .assistant = .{ .user = .{ .text = resume_text }, .assistant = @constCast("Paris") } },
+        .{ .assistant = .{ .user = .{ .text = @constCast("Name the river.") }, .assistant = @constCast("Seine") } },
+    };
+    const texts = try projectedTexts(arena, &history);
+    try std.testing.expectEqual(@as(usize, 5), texts.len);
+    try std.testing.expectEqualStrings("Name the capital.", texts[0]);
+    // No abort note, and the note that fits a turn that ran nothing.
+    try std.testing.expectEqualStrings(resumed_request_note_no_tool, texts[1]);
+    try std.testing.expectEqualStrings("Paris", texts[2]);
+    for (texts) |text| try std.testing.expect(std.mem.find(u8, text, "<turn_aborted>") == null);
+}
+
+test "a resume closed before it ran anything stays out of every later request" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const resume_text = @constCast(resumed_request_prompt);
+    var completed = [_][]u8{@constCast("read_file")};
+    const history = [_]HistoryTurn{
+        .{ .interrupted = .{ .user = .{ .text = @constCast("List the planets.") }, .completed_tool_names = &completed } },
+        .{ .interrupted = .{ .user = .{ .text = resume_text } } },
+        .{ .assistant = .{ .user = .{ .text = resume_text }, .assistant = @constCast("Mercury") } },
+    };
+    const texts = try projectedTexts(arena, &history);
+    var notes: usize = 0;
+    for (texts) |text| {
+        if (std.mem.startsWith(u8, text, "<session_resumed>")) notes += 1;
+        try std.testing.expect(std.mem.find(u8, text, "<turn_aborted>") == null);
+    }
+    try std.testing.expectEqual(@as(usize, 1), notes);
+    // The stopped turn ran a tool, so the note keeps its caveat.
+    var found_caveat = false;
+    for (texts) |text| found_caveat = found_caveat or std.mem.eql(u8, text, resumed_request_prompt);
+    try std.testing.expect(found_caveat);
 }

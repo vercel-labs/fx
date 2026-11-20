@@ -719,14 +719,24 @@ const ColumnTestApp = struct {
     }
 };
 
-fn columnFor(app: *ColumnTestApp, stage: ProviderPickerStage, query: []const u8) ColumnBuffer {
-    var column: ColumnBuffer = .{};
+fn fillColumn(app: *ColumnTestApp, stage: ProviderPickerStage, query: []const u8, column: *ColumnBuffer) void {
+    column.* = .{};
     _ = Runtime(ColumnTestApp).columnOptions(app, .{
         .stage = stage,
         .prefix = "/provider ",
         .query = query,
         .token_start = 0,
-    }, &column);
+    }, column);
+}
+
+/// Returns a copy of the column, so it serves only stages whose labels do not
+/// point into the buffer's own `field`. The key stage writes its row there, and
+/// a copy's label would still point at this function's dead stack frame; use
+/// `fillColumn` with a caller-owned buffer for it.
+fn columnFor(app: *ColumnTestApp, stage: ProviderPickerStage, query: []const u8) ColumnBuffer {
+    std.debug.assert(stage != .api_key);
+    var column: ColumnBuffer = .{};
+    fillColumn(app, stage, query, &column);
     return column;
 }
 
@@ -823,19 +833,22 @@ test "key column is a masked field, not a list of options" {
     defer app.deinit();
     try app.input_runtime.picker.beginProviderPickerFlow(alloc, "vercel", "api-key", .api_key);
 
-    const empty = columnFor(&app, .api_key, "");
+    var empty: ColumnBuffer = undefined;
+    fillColumn(&app, .api_key, "", &empty);
     try std.testing.expectEqual(@as(usize, 1), empty.count);
     try std.testing.expect(std.mem.endsWith(u8, empty.labels[0], provider_picker_catalog.key_field_placeholder));
 
     app.auth.mask_count = 4;
-    const typed = columnFor(&app, .api_key, "");
+    var typed: ColumnBuffer = undefined;
+    fillColumn(&app, .api_key, "", &typed);
     try std.testing.expectEqual(@as(usize, 1), typed.count);
     try std.testing.expect(std.mem.find(u8, typed.labels[0], provider_picker_catalog.key_field_placeholder) == null);
 
     // While the save thread works the row says so instead of rendering an
     // empty ready-looking field.
     app.auth.save_in_flight = true;
-    const saving = columnFor(&app, .api_key, "");
+    var saving: ColumnBuffer = undefined;
+    fillColumn(&app, .api_key, "", &saving);
     try std.testing.expectEqual(@as(usize, 1), saving.count);
     try std.testing.expectEqualStrings("saving the key...", saving.labels[0]);
 }

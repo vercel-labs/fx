@@ -7,7 +7,7 @@ import { isAbsolute, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { bundledAssetUrl } from "./bundled-asset.js";
 import { CoreOutput } from "./core-output.js";
-import { fetchCleanupAction, cleanupTimeoutMs, cleanupByteLimit } from "./fetch-cleanup.js";
+import { fetchCleanupAction, cleanupTimeoutMs, cleanupByteLimit, retryAfterSeconds } from "./fetch-cleanup.js";
 import { createDurableAgentFactory, memory, wakeHandler } from "./durable.js";
 import { fxHarness } from "./fx-harness.js";
 import {
@@ -471,7 +471,11 @@ function createNativeCoreRuntime(addon, options) {
       });
       const response = await wait(responseTask);
       if (settled && !state.consumed) throw new DOMException("Aborted", "AbortError");
-      const started = settled ? fetchOperationStale : addon.startCoreFetchResponse(core, state.handle, response.status);
+      const started = settled
+        ? fetchOperationStale
+        : typeof addon.startCoreFetchResponseWithRetryAfter === "function"
+          ? addon.startCoreFetchResponseWithRetryAfter(core, state.handle, response.status, retryAfterSeconds(response.headers))
+          : addon.startCoreFetchResponse(core, state.handle, response.status);
       if (started !== fetchOperationApplied && started !== fetchOperationStale) throw new Error(`invalid native fetch start result ${started}`);
       state.active = started === fetchOperationApplied;
       reader = response.body?.getReader();

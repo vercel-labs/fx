@@ -101,8 +101,12 @@ class PgsoQualificationTests(unittest.TestCase):
         self.assertEqual(50.0, percentile(samples, 0.50))
         self.assertEqual(95.0, percentile(samples, 0.95))
 
-    def test_production_plans_cover_five_startup_and_six_heavy_workloads(self) -> None:
-        self.assertEqual(5, len(STARTUP_COMMANDS))
+    def test_production_plans_cover_four_startup_and_six_heavy_workloads(self) -> None:
+        # fx doctor waits on network checks, so it is not a startup command.
+        self.assertEqual(
+            ("help", "version", "status", "sessions"),
+            tuple(name for name, _argv in STARTUP_COMMANDS),
+        )
         workload_names = tuple(
             workload.name
             for plan in BENCHMARK_PLANS
@@ -134,9 +138,9 @@ class PgsoQualificationTests(unittest.TestCase):
         self.assertTrue(all(plan.function_prefixes for plan in BENCHMARK_PLANS))
 
     def test_startup_selection_returns_only_the_assigned_command(self) -> None:
-        selected = select_startup_commands(("doctor",))
+        selected = select_startup_commands(("sessions",))
 
-        self.assertEqual((("doctor", ("doctor", "--json")),), selected)
+        self.assertEqual((("sessions", ("sessions", "--json")),), selected)
 
     def test_startup_selection_rejects_an_unknown_command(self) -> None:
         with self.assertRaisesRegex(PgsoError, "unknown startup command: missing"):
@@ -314,10 +318,10 @@ class PgsoQualificationTests(unittest.TestCase):
                 output_dir=self.root / "measurements",
                 samples=50,
                 timeout_s=10,
-                command_names=("doctor",),
+                command_names=("sessions",),
             )
 
-        self.assertEqual(("startup-doctor",), tuple(item.name for item in results))
+        self.assertEqual(("startup-sessions",), tuple(item.name for item in results))
         self.assertEqual(100, sum(command[0] == str(hyperfine) for command in calls))
         self.assertIsNone(results[0].first_attempt)
 
@@ -428,7 +432,8 @@ class PgsoQualificationTests(unittest.TestCase):
         hyperfine_calls = [
             command for command in calls if command[0] == str(hyperfine)
         ]
-        self.assertEqual(500, len(hyperfine_calls))
+        # 100 rounds for each of the four startup commands.
+        self.assertEqual(400, len(hyperfine_calls))
         for command_start in range(0, len(hyperfine_calls), 100):
             command_rounds = hyperfine_calls[command_start : command_start + 100]
             for round_index, command in enumerate(command_rounds):
@@ -986,8 +991,11 @@ class PgsoQualificationTests(unittest.TestCase):
                 return_value=(raw_profile,),
             ) as instrument,
             mock.patch("scripts.pgso.qualify.merge_profile_batch", return_value=1),
-            mock.patch("scripts.pgso.qualify.apply_profile"),
-            mock.patch("scripts.pgso.qualify.link_candidate", return_value=candidate),
+            mock.patch("scripts.pgso.qualify.apply_profile") as apply,
+            mock.patch(
+                "scripts.pgso.qualify.link_candidate",
+                return_value=candidate,
+            ) as link,
         ):
             pair = build_benchmark_pair(
                 types.SimpleNamespace(platform=macos, target=macos.TARGET), self.root, output, plan,
@@ -996,6 +1004,10 @@ class PgsoQualificationTests(unittest.TestCase):
         self.assertEqual(external, pair.control_binary)
         self.assertEqual(external, read_identity.call_args.args[1])
         self.assertEqual({"minimum_macos": "15.0"}, instrument.call_args.args[2])
+        # The supplement build keeps the benchmark profile-use flags and the
+        # default code generation.
+        self.assertNotIn("production_flags", apply.call_args.kwargs)
+        self.assertNotIn("production_flags", link.call_args.kwargs)
 
     def test_builds_all_profile_linked_benchmarks_before_candidate_link(self) -> None:
         paths = PipelinePaths.create(self.root / "run")
@@ -1092,17 +1104,23 @@ class PgsoQualificationTests(unittest.TestCase):
                 "scripts.pgso.qualify.create_mapped_benchmark_profile",
                 side_effect=fake_map,
             ),
-            mock.patch("scripts.pgso.qualify.apply_profile"),
+            mock.patch("scripts.pgso.qualify.apply_profile") as apply,
             mock.patch(
                 "scripts.pgso.qualify.link_candidate",
                 side_effect=fake_link,
-            ),
+            ) as link,
         ):
             linked = relink_profile_linked_benchmarks(
                 object(),
                 paths,
                 linked,
             )
+
+        # The measured candidates build with the production flags.
+        self.assertEqual(len(BENCHMARK_PLANS), apply.call_count)
+        self.assertEqual(len(BENCHMARK_PLANS), link.call_count)
+        for call in (*apply.call_args_list, *link.call_args_list):
+            self.assertIs(True, call.kwargs["production_flags"])
 
         with mock.patch(
             "scripts.pgso.qualify.verify_supplement_functions",

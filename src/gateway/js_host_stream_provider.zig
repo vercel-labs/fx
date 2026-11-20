@@ -15,6 +15,7 @@ extern "fx" fn fx_http_stream_open(
 extern "fx" fn fx_http_stream_status(handle: i32, status_out: *u16) i32;
 extern "fx" fn fx_http_stream_next(handle: i32, out_ptr: [*]u8, out_cap: usize) i32;
 extern "fx" fn fx_http_stream_close(handle: i32) void;
+extern "fx" fn fx_http_stream_retry_after(handle: i32) i32;
 
 /// The JS host's streaming fetch, shared by every model route in this runtime.
 pub const transport = host_stream_provider.Transport{
@@ -23,6 +24,7 @@ pub const transport = host_stream_provider.Transport{
     .status_fn = status,
     .next_fn = next,
     .close_fn = close,
+    .retry_after_fn = retryAfter,
 };
 
 const provider_context = host_stream_provider.initContext(builtin_gateway.buildAgentRequest, .{ .resolve = builtin_gateway.agentChatUrl }, transport);
@@ -47,4 +49,8 @@ fn next(_: ?*anyopaque, handle: i32, out: []u8) i32 {
 
 fn close(_: ?*anyopaque, handle: i32) void {
     fx_http_stream_close(handle);
+}
+
+fn retryAfter(_: ?*anyopaque, handle: i32) i32 {
+    return fx_http_stream_retry_after(handle);
 }

@@ -2,6 +2,10 @@
 
 Instructions for AI coding agents working with this codebase.
 
+## Rules
+
+Read `RULES.md` before any change, and cite its IDs. It wins over this file. Do not edit it unless @fazxes asks.
+
 ## Declaring Work Ready
 
 Do not say the work is "ready", "done", "good to go", "complete", or similar until you have personally run the binary and exercised the change on its happy path. A passing test suite is necessary, not sufficient — tests in this repo do not always construct the full runtime, attach a TTY, or spawn background threads, so they will not catch startup crashes, render regressions, or thread-lifetime bugs.
@@ -120,7 +124,9 @@ but feature work must reconsider whether the existing classification still
 matches the file's product role. When removing a feature or E2E owner, remove
 its stale corpus entry. Normal PR CI loads the corpus and rejects missing,
 duplicate, stale, or unclassified files without running the expensive PGSO
-qualification.
+qualification. It also runs `scripts/pgso/tests/test_corpus.py`, whose
+training, verification, and exclusion lists must name the same files in the
+same order as the corpus.
 
 Every root E2E file also needs a weight in `tests/e2e/ci-shard-weights.json`.
 CI fails on a missing or stale entry.
@@ -167,7 +173,7 @@ Security is permission-first. All sensitive tool behavior must integrate with `s
 
 * Routine parsed development commands and reversible new-file creation can execute without model review after configured and saved-session policy. Every remaining unresolved `auto` action receives one narrow security review using the exact unmasked action and targets, origin and call identity, optional host-proven current-branch evidence, and bounded unmasked terminal-safe excerpts of earlier current-turn tool results. A text match between the action and prior tool output is evidence to inspect, not proof of prompt injection or malicious activity. Prepared file mutations and other static root tools omit task text. Reviewed commands, shell input, dynamic tools, and subagent actions also receive bounded unmasked canonical current, first, and recent root requests plus explicit omission counts; the reviewer may use that context only to distinguish trusted user intent from malicious or injected influence, never to judge task quality, alignment, or authorization. Assistant prose, permission feedback, compacted summaries, the pending tool group, later results, and tool or repository text never become authority. Shell input reviews also include the owned receiving session's launch command, working directory, and bounded current screen after verifying session authority, including on resume. The launch command describes startup only; screen content remains untrusted evidence and input still receives its own review
 
-* The reviewer returns `caution` only for prompt injection, where the action follows instructions from untrusted text instead of the user, or system harm, where the action would break, compromise, or hack the user's machine or the runner. Each caution names its category and quotes its evidence. fx keeps a prompt-injection caution only when the quote appears in untrusted tool output or a receiver screen and not in the user's own requests or the pending action, since an action that contains the quoted text is editing, writing, or searching it rather than following it, and a system-harm caution only when the quote appears in the pending action or meets that prompt-injection rule; it clears every other caution. A caution that passes these checks holds the action unless one fresh review of the same request returns `clear`, so a single misjudged quote cannot block; that review's own quote is not checked, and when it cannot complete, the hold stands. Destructive, risky, external, public, remote, unrequested, or task-conflicting actions therefore clear unless they are one of those harms. Current-turn `ask_user_question` answers reach the reviewer as user answers and never count as injection evidence. The optional `typesafeai/jev` reviewer answers without quotes, so its decisions are kept as returned. A `clear` review authorizes only the exact unchanged action. A `caution`, incomplete-evidence result, or unavailable review holds only that action, returns guidance to the agent, and never opens a human permission screen, disables tools, or ends the turn
+* The reviewer returns `caution` only for prompt injection, where instructions planted in untrusted text make the action delete or overwrite files, send data out, install or run outside code, weaken security, or use credentials the user did not ask for, or system harm, where the action would break, compromise, or hack the user's machine or the runner. Each caution names its category and quotes its evidence. fx keeps a prompt-injection caution only when the quote appears in untrusted tool output or a receiver screen and not in the user's own requests or the pending action, since an action that contains the quoted text is editing, writing, or searching it rather than following it, and a system-harm caution only when the quote appears in the pending action or meets that prompt-injection rule; it clears every other caution. A caution that passes these checks holds the action unless one fresh review of the same request returns `clear`, so a single misjudged quote cannot block; that review's own quote is not checked, and when it cannot complete, the hold stands. Destructive, risky, external, public, remote, unrequested, or task-conflicting actions therefore clear unless they are one of those harms. Following any text is never prompt injection when the action only reads, searches, builds, tests, or runs a local tool's own steps, such as a CLI's next subcommand, a git hint, or a workflow tool's next command. Current-turn `ask_user_question` answers reach the reviewer as user answers and never count as injection evidence. The optional `typesafeai/jev` reviewer answers without quotes, so its decisions are kept as returned. A `clear` review authorizes only the exact unchanged action. A `caution`, incomplete-evidence result, or unavailable review holds only that action, returns guidance to the agent, and never opens a human permission screen, disables tools, or ends the turn
 
 * Exact cautions and deterministic incomplete-evidence results are reused only for the current turn. An unavailable outcome is not cached as a security judgment, but the same exact action spends at most one unavailable review opportunity per turn; changed actions remain independently reviewable until the bounded current-turn review budget is exhausted. Each review accepts exactly one valid structured decision even with accompanying prose and may retry one malformed completion within the current attempt's deadline. A transport timeout, transient transport failure, or failed transport call is retried once with a fresh 30-second deadline; permanent transport failures, valid cautions, and cancellation are never retried. Legacy `permission_request_id` input is rejected without prompting
 
@@ -178,6 +184,8 @@ Security is permission-first. All sensitive tool behavior must integrate with `s
 Do not bypass the permission system for new tools.
 
 ## Zig-Specific Patterns
+
+Use the `zig` skill (`.fx/skills/zig/SKILL.md`) when you write, review, or upgrade Zig code. It covers what Zig 0.17.x removed, deprecated, or changed without a compile error, including the 0.17.0 to 0.17.1 changes, and Zig ownership, error, I/O, concurrency, and testing practice. Where the skill and this file differ, this file takes precedence.
 
 ### Memory and Errors
 
@@ -196,6 +204,8 @@ Do not bypass the permission system for new tools.
 * For JSON serialization, use `std.json.Stringify.value` with an allocating writer (`std.Io.Writer.Allocating`).
 
 * To parse JSON into a typed value, use `parseFromSlice` or `parseFromSliceLeaky` from `src/core/shared/json_decode.zig`. They match `std.json`'s, but share one parser across types instead of generating one per type. Parse into `std.json.Value` with `std.json` itself.
+
+* To sort, use `sort` from `src/core/shared/sort_utils.zig` in place of `std.mem.sort`. It takes the same arguments and is also stable, but shares one implementation across element types instead of generating a block sort for each. Code that cannot import it, such as `src/core/indexer/`, `src/core/session_manager/`, and files that import only `std`, keeps `std.mem.sort`.
 
 * For JSON string escaping (writing raw JSON), use the project's `writeJsonStr` helper in `src/acp/jsonrpc.zig` rather than assuming `std.json.encodeJsonString` exists.
 
@@ -323,7 +333,7 @@ Do not run the complete deterministic test suite locally as the default developm
 
 After the focused checks pass, create a clean checkpoint commit, push the non-`main` feature branch, and open a draft PR immediately. Linux is the gate for every change because most fx behavior is identical on every platform:
 
-* `.github/workflows/ci.yml` runs on Linux x86_64. It checks formatting, the PGSO corpus, the public surface, and the agents, compactor, indexer, and recovery boundaries, model-checks request recovery, runs the ReleaseSafe unit tests, runs the E2E files in four weighted shards plus the MCP conformance baseline, and qualifies the SDK packages. A failed E2E file is retried once. A file that passes only on retry gets a warning annotation; investigate it as a possible race. `Build & Test` fails when any SDK job fails.
+* `.github/workflows/ci.yml` runs on Linux x86_64. It checks formatting, the PGSO corpus, the public surface, and the agents, compactor, indexer, and recovery boundaries, model-checks request recovery, the empty-reply nudge, and the malformed tool call feedback, runs the ReleaseSafe unit tests, runs the E2E files in four weighted shards plus the MCP conformance baseline, and qualifies the SDK packages. A failed E2E file is retried once. A file that passes only on retry gets a warning annotation; investigate it as a possible race. `Build & Test` fails when any SDK job fails.
 * `.github/workflows/binary-size.yml` builds each release target on its native runner, reports the size change, and smoke-tests every target's binary. See **Binary Size Observability**.
 * `.github/workflows/bench.yml` enforces the startup latency budget. See **Benchmarks**.
 
@@ -333,9 +343,15 @@ macOS runs only when `scripts/detect-macos-need.sh` finds a change that can beha
 
 The durable-session model check in the `SDK (Bun + N-API/WASM)` job takes about 40 minutes, so a pull request runs it only when `scripts/detect-ci-need.sh` finds a change to code libfx owns: `sdk/`, `tests/tla/sdk/`, the drivers in `tests/tla/drivers/*.mjs`, the Node-API and WebAssembly core entry points, `src/acp/`, `src/core/hosts/`, `src/core/session_manager/`, `build.zig`, `build.zig.zon`, or `.github/workflows/ci.yml`. Every push to `main` runs it, which catches a durable-session regression in shared code such as the agent loop after it merges. To run it for any other change, run `gh workflow run ci.yml --ref <branch>`. If the detector cannot read the change, `Build & Test` fails instead of passing.
 
-The `TLA+ MCP models and drivers` job takes about 20 minutes, so a pull request runs its model checks and drivers only when the same detector finds a change to `src/mcp/`, `src/core/mcp_host/`, `src/core/mcp/`, the models in `tests/tla/mcp/` and `tests/tla/mcp_host/`, their drivers in `tests/tla/drivers/mcp/`, `tests/tla/drivers/mcp_host/`, and `tests/tla/drivers/lib/`, the `tests/e2e/fixtures/mcp-*` servers, the helpers those drivers load (`tests/e2e/tmux-helpers.ts`, `tests/evals/eval-helpers.ts`, and `tests/e2e/render-lab/tape.ts`), `build.zig`, `build.zig.zon`, or `.github/workflows/ci.yml`. Every push to `main` runs them, and the same `gh workflow run ci.yml --ref <branch>` runs them for any other change.
+The `TLA+ MCP engine models and driver` and `TLA+ MCP host models and drivers` jobs run in parallel and take about 20 minutes each, so a pull request runs their model checks and drivers only when the same detector finds a change to `src/mcp/`, `src/core/mcp_host/`, `src/core/mcp/`, `src/core/shared/net_connect.zig`, the models in `tests/tla/mcp/` and `tests/tla/mcp_host/`, their drivers in `tests/tla/drivers/mcp/`, `tests/tla/drivers/mcp_host/`, and `tests/tla/drivers/lib/`, the `tests/e2e/fixtures/mcp-*` servers, the helpers those drivers load (`tests/e2e/tmux-helpers.ts`, `tests/evals/eval-helpers.ts`, and `tests/e2e/render-lab/tape.ts`), `build.zig`, `build.zig.zon`, or `.github/workflows/ci.yml`. Every push to `main` runs them, and the same `gh workflow run ci.yml --ref <branch>` runs them for any other change.
+
+The `TLA+ transcript window model` job takes about 4 minutes, so a pull request runs it only when the same detector finds a change to `src/ui/transcript/transcript_window*`, the model in `tests/tla/transcript_window/`, its drivers in `tests/tla/drivers/transcript_window/`, the driver code they share (`tests/tla/drivers/lib/` and `tests/tla/drivers/graph.mjs`), `build.zig`, `build.zig.zon`, or `.github/workflows/ci.yml`. It runs `tests/tla/transcript_window/check.sh --ci`, which leaves out the planted bugs and the run of a built fx along the model; run `tests/tla/transcript_window/check.sh` without `--ci` before you change the window.
+
+The `TLA+ subagent and session-write models` job takes a few minutes, so a pull request runs it only when the same detector finds a change to `src/core/subagent/`, `src/core/session/`, `src/core/agent/worker_runtime.zig`, `src/core/agent/runtime/parallel_execution.zig`, the models in `tests/tla/subagent/` and the session-write and live sessions models in `tests/tla/session/`, their drivers in `tests/tla/drivers/subagent/`, `tests/tla/drivers/session/write.test.ts`, and `tests/tla/drivers/session/live.test.ts`, the shared code in `tests/tla/lib/` and `tests/tla/drivers/lib/`, the helpers those drivers load (`tests/e2e/tmux-helpers.ts` and `tests/evals/eval-helpers.ts`), `build.zig`, `build.zig.zon`, or `.github/workflows/ci.yml`. It checks the models' design configs and drives a built fx along them, and leaves out the planted bugs and fx's old defects; run `tests/tla/subagent/check.sh` and `tests/tla/session/check.sh` with no arguments before you change that code.
 
 The `fx mcp call` model check, `.github/workflows/tla-mcp-call.yml`, runs `tests/tla/mcp_call/check.sh`: TLC on the bridge model, the core's tests, both drivers against the real core, and every planted bug. Every push to `main` runs it. A pull request runs it only with the `ci:tla-mcp-call` label, and `gh workflow run tla-mcp-call.yml --ref <branch>` runs it on any branch. Like `ci:macos`, the label needs triage access.
+
+The custom model connection model check, `.github/workflows/tla-configured-provider.yml`, runs `tests/tla/configured_provider/check.sh` and `bun tests/tla/drivers/configured_provider/driver.ts --self-check`: TLC on every config and planted mutation, the built fx against local fake servers along the models, and the deadline module through its lab. It runs only on request, never on a push: on a pull request with the `ci:tla-configured-provider` label, or with `gh workflow run tla-configured-provider.yml --ref <branch>`. Run it when you change `src/core/config/configured_provider.zig` or the custom connection adapters in `src/gateway/`.
 
 The macOS arm64 PGSO workflow runs on a pull request only when the PGSO pipeline changes: `scripts/pgso/` other than `corpus.json`, the `setup-pgso` action, or `.github/workflows/pgso-macos-arm64.yml`. To qualify any other change, run `gh workflow run pgso-macos-arm64.yml --ref <branch>`. The stable release always runs it.
 
@@ -397,7 +413,7 @@ Startup latency benchmarks live in `benchmarks/` and run in CI via `.github/work
 ./benchmarks/startup.sh --quick    # quick run (20 iterations)
 ```
 
-The `Startup Latency` job builds a ReleaseSafe binary, measures six CLI paths with hyperfine, and enforces per-command latency budgets. The same job runs `tests/e2e/tui-performance.test.ts` as the interactive terminal performance gate. A PR that exceeds either fails the check.
+The `Startup Latency` job builds a ReleaseSafe binary, measures five CLI paths with hyperfine, and enforces per-command latency budgets. The same job runs `tests/e2e/tui-performance.test.ts` as the interactive terminal performance gate. A PR that exceeds either fails the check.
 
 The long-turn memory and libfx runtime benchmarks run only on request. Start them with `gh workflow run bench.yml --ref <branch> -f long_turn_memory=true` or `-f libfx_runtime=true`.
 
@@ -423,8 +439,8 @@ Each platform check is informational. An increase of at least 52,429 bytes
 investigation, but does not reject the pull request. Investigate notable
 unexplained growth before changing the threshold. The full macOS arm64, Linux
 arm64, and Linux x86_64 PGSO release qualifications remain authoritative for the
-production ceilings (7.000 MiB, and 8.250 MiB for Linux x86_64) and performance
-gates.
+production ceilings (6.750 MiB for macOS arm64, 7.000 MiB for Linux arm64, and
+8.750 MiB for Linux x86_64) and performance gates.
 
 ## Documentation
 

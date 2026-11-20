@@ -10,6 +10,7 @@ const debug_trace = @import("../../core/shared/debug_trace.zig");
 const io_mod = @import("../../core/shared/io.zig");
 const types = @import("../../core/shared/types.zig");
 const cursor_probe = @import("../terminal/cursor_probe.zig");
+const mode_rearm = @import("../terminal/mode_rearm.zig");
 const theme_monitor = @import("../terminal/theme_monitor.zig");
 const gesture_state = @import("../../core/input/gesture_state.zig");
 const horizontal_navigation = @import("../../core/input/horizontal_navigation.zig");
@@ -582,6 +583,10 @@ pub const DeferredSessionInput = union(enum) {
 pub const Runtime = struct {
     terminal_cursor_probe: cursor_probe.Parser = .{},
     terminal_theme_monitor: theme_monitor.Monitor = .{},
+    /// When fx next turns bracketed paste (DEC mode 2004) on again. Without
+    /// it, the terminal sends a paste as typed keys, and each line break in
+    /// the paste presses Enter.
+    bracketed_paste_rearm: mode_rearm.Schedule = .{},
     deferred_terminal_input_source: ?DeferredTerminalInputSource = null,
     deferred_session_input: std.ArrayList(DeferredSessionInput) = .empty,
     deferred_session_input_index: usize = 0,
@@ -3165,6 +3170,15 @@ test "input escape parser admits raw ctrl+p control byte" {
     try std.testing.expectEqual(@as(?InputEscapeAction, null), controlByteFeatureAction(14));
 }
 
+test "input escape parser admits ctrl+t, raw or reported as a key, as the effort cycle" {
+    try std.testing.expectEqual(@as(?InputEscapeAction, .cycle_effort), controlByteFeatureAction(20));
+    try std.testing.expectEqual(@as(?InputEscapeAction, null), controlByteFeatureAction(19));
+    try std.testing.expectEqual(@as(?InputEscapeAction, null), controlByteFeatureAction(21));
+    // The kitty keyboard protocol reports Ctrl+T as a key, which replays as
+    // the raw byte above.
+    try expectEscapeAction("[116;5u", .{ .remapped_byte = 20 });
+}
+
 test "input escape parser admits ctrl+x, raw or reported as a key, as the agent list" {
     try std.testing.expectEqual(@as(?InputEscapeAction, .open_agent_list), controlByteFeatureAction(24));
     try std.testing.expectEqual(@as(?InputEscapeAction, null), controlByteFeatureAction(25));
@@ -4348,7 +4362,7 @@ test "line deletion boundary no-ops preserve the kill ring" {
     try runtime.insertionState().insertSlice(std.testing.allocator, "alpha\nbeta", .preserve);
     try runtime.kill_ring.text.appendSlice(std.testing.allocator, "existing kill");
 
-    runtime.edit_state.cursor = "alpha\n".len;
+    runtime.edit_state.cursor = 0;
     try std.testing.expect(!try runtime.killRingState(null).delete(
         std.testing.allocator,
         .line_start,
@@ -4381,6 +4395,31 @@ test "deleteToLineEnd at non-final eol joins the next logical line" {
     try std.testing.expectEqualStrings("alpha\nbetagamma", runtime.edit_state.input.items);
     try std.testing.expectEqual(@as(usize, "alpha\nbeta".len), runtime.edit_state.cursor);
     try std.testing.expectEqualStrings("\n", runtime.kill_ring.text.items);
+}
+
+test "deleteToLineStart at non-first line start joins and keeps adjacent entities" {
+    const alloc = std.testing.allocator;
+    var runtime = InputRuntime{};
+    defer runtime.deinit(alloc);
+    var images: ImageBlocks = .empty;
+    defer deinitImageBlocksForTest(&images, alloc);
+
+    try runtime.edit_state.input.appendSlice(alloc, "[Pasted text #7, 1 line]\n[Image #8]");
+    try appendPastedBlockForTest(&runtime, alloc, 7, "pasted");
+    try appendImageBlockForTest(&runtime, &images, alloc, 8);
+    runtime.edit_state.cursor = "[Pasted text #7, 1 line]\n".len;
+
+    try std.testing.expect(try runtime.killRingState(&images).delete(alloc, .line_start));
+    try std.testing.expectEqualStrings("[Pasted text #7, 1 line][Image #8]", runtime.edit_state.input.items);
+    try std.testing.expectEqual(@as(usize, "[Pasted text #7, 1 line]".len), runtime.edit_state.cursor);
+    try std.testing.expectEqualStrings("\n", runtime.kill_ring.text.items);
+    try std.testing.expectEqual(@as(usize, 1), runtime.entities.pasted_blocks.items.len);
+    try std.testing.expectEqual(@as(usize, 1), images.items.len);
+    try std.testing.expectEqual(@as(usize, 1), runtime.entities.image_tokens.items.len);
+    try std.testing.expectEqual(
+        @as(usize, "[Pasted text #7, 1 line]".len),
+        runtime.entities.image_tokens.items[0].span.raw_start,
+    );
 }
 
 test "line deletion preserves newline ownership and utf8 outside the range" {
@@ -4425,7 +4464,7 @@ test "line deletion no-op preserves input state and metadata" {
 
     try primeComposerHistoryDraftForTest(&runtime, alloc, "draft");
     try runtime.textReplacementState().replace(alloc, "alpha\n[Pasted text #7, 1 line]\n[Image #8]");
-    runtime.edit_state.cursor = "alpha\n".len;
+    runtime.edit_state.cursor = 0;
     try runtime.kill_ring.text.appendSlice(alloc, "existing kill");
     try appendPastedBlockForTest(&runtime, alloc, 7, "pasted");
     try appendImageBlockForTest(&runtime, &images, alloc, 8);
@@ -4447,26 +4486,31 @@ test "line deletion no-op preserves input state and metadata" {
     try std.testing.expectEqualStrings("draft", runtime.composer_history.draftText().?);
 }
 
-test "line deletion no-ops on empty logical lines and clamps an oversized cursor" {
+test "line deletion on empty logical lines stops only at input boundaries and clamps an oversized cursor" {
     const alloc = std.testing.allocator;
-    const cases = [_]struct {
-        input: []const u8,
-        cursor: usize,
-    }{
-        .{ .input = "", .cursor = 0 },
-        .{ .input = "alpha\n", .cursor = "alpha\n".len },
-    };
 
-    for (cases) |case| {
+    {
         var runtime = InputRuntime{};
         defer runtime.deinit(alloc);
-        try runtime.edit_state.input.appendSlice(alloc, case.input);
         try runtime.kill_ring.text.appendSlice(alloc, "existing kill");
-        runtime.edit_state.cursor = case.cursor;
         try std.testing.expect(!try runtime.killRingState(null).delete(alloc, .line_start));
         try std.testing.expect(!try runtime.killRingState(null).delete(alloc, .line_end));
-        try std.testing.expectEqualStrings(case.input, runtime.edit_state.input.items);
+        try std.testing.expectEqualStrings("", runtime.edit_state.input.items);
         try std.testing.expectEqualStrings("existing kill", runtime.kill_ring.text.items);
+    }
+
+    {
+        var runtime = InputRuntime{};
+        defer runtime.deinit(alloc);
+        try runtime.edit_state.input.appendSlice(alloc, "alpha\n");
+        try runtime.kill_ring.text.appendSlice(alloc, "existing kill");
+        runtime.edit_state.cursor = "alpha\n".len;
+        try std.testing.expect(!try runtime.killRingState(null).delete(alloc, .line_end));
+        try std.testing.expectEqualStrings("existing kill", runtime.kill_ring.text.items);
+        try std.testing.expect(try runtime.killRingState(null).delete(alloc, .line_start));
+        try std.testing.expectEqualStrings("alpha", runtime.edit_state.input.items);
+        try std.testing.expectEqual(@as(usize, "alpha".len), runtime.edit_state.cursor);
+        try std.testing.expectEqualStrings("\n", runtime.kill_ring.text.items);
     }
 
     var runtime = InputRuntime{};

@@ -12,6 +12,7 @@ const model_provider = @import("model_provider.zig");
 const workspace_access = @import("../workspace/workspace_access.zig");
 const sort_utils = @import("../shared/sort_utils.zig");
 const update_target = @import("../upgrade/update_target.zig");
+const tool_placement = @import("tool_placement.zig");
 const settings_keys = @import("settings_keys.zig");
 const theme_mod = @import("../shared/theme.zig");
 
@@ -124,6 +125,9 @@ pub const UserSettingsPatch = struct {
     auto_compact_percent: ?u8 = null,
     provider_strict: ?bool = null,
     context: ?bool = null,
+    cache_warming: ?bool = null,
+    /// One `tool_placement.<tool>` entry.
+    tool_placement: ?ToolPlacementPatch = null,
     /// Removes a plain setting, such as `fast_mode` or `statusLine.context`,
     /// so it falls back to its default. Distinct from the fields above, where
     /// null means "leave unchanged".
@@ -156,8 +160,17 @@ pub const UserSettingsPatch = struct {
             self.auto_compact_percent == null and
             self.provider_strict == null and
             self.context == null and
+            self.cache_warming == null and
+            self.tool_placement == null and
             self.remove == null;
     }
+};
+
+pub const ToolPlacementPatch = struct {
+    /// A built-in tool that can move, `tool_placement.Tool`.
+    tool: []const u8,
+    /// `toolbox` or `direct`.
+    placement: []const u8,
 };
 
 pub const ModelPreferencePatch = struct {
@@ -1001,6 +1014,11 @@ fn validateUserPatch(patch: UserSettingsPatch) !void {
     if (patch.auto_compact_percent) |percent| {
         if (!compactor.isValidPercent(percent)) return error.InvalidSettingsFormat;
     }
+    if (patch.tool_placement) |entry| {
+        if (tool_placement.Tool.parse(entry.tool) == null or tool_placement.Placement.parse(entry.placement) == null) {
+            return error.InvalidSettingsFormat;
+        }
+    }
     if (patch.remove) |path| {
         if (!removablePath(path)) return error.InvalidSettingsFormat;
     }
@@ -1012,7 +1030,8 @@ fn removablePath(path: []const u8) bool {
     if (settings_keys.unknownPart(path) != null) return false;
     const dot = std.mem.findScalar(u8, path, '.');
     const key = settings_keys.find(path[0 .. dot orelse path.len]) orelse return false;
-    if (key.map) return false;
+    // A map's entries are free-form; only a tool's placement is one fx sets.
+    if (key.map) return tool_placement.toolOfKey(path) != null;
     return dot == null or key.children.len > 0;
 }
 
@@ -1063,9 +1082,11 @@ test "plain preference patches write their keys and report no change when equal"
         .auto_compact_percent = 70,
         .provider_strict = true,
         .context = false,
+        .cache_warming = false,
     };
     const first = try applyUserPatchToRoot(arena.allocator(), &root, patch);
     try std.testing.expect(first.changed);
+    try std.testing.expect(!root.object.get("cache_warming").?.bool);
     try std.testing.expectEqual(false, root.object.get("auto_upgrade").?.bool);
     try std.testing.expectEqual(@as(i64, 40), root.object.get("max_agent_steps").?.integer);
     try std.testing.expectEqual(@as(i64, 4096), root.object.get("max_tool_result_bytes").?.integer);
@@ -1301,6 +1322,17 @@ fn applyUserPatchToRoot(
     if (patch.auto_compact_percent) |value| application.changed = try putInteger(arena, &root.object, "auto_compact_percent", value) or application.changed;
     if (patch.provider_strict) |value| application.changed = try putBool(arena, &root.object, "provider_strict", value) or application.changed;
     if (patch.context) |value| application.changed = try putBool(arena, &root.object, "context", value) or application.changed;
+    if (patch.cache_warming) |value| application.changed = try putBool(arena, &root.object, "cache_warming", value) or application.changed;
+    if (patch.tool_placement) |entry| {
+        const placements = if (root.object.getPtr("tool_placement")) |value| blk: {
+            if (value.* != .object) return error.InvalidSettingsFormat;
+            break :blk value;
+        } else blk: {
+            try root.object.put(arena, "tool_placement", .{ .object = .empty });
+            break :blk root.object.getPtr("tool_placement").?;
+        };
+        application.changed = try putString(arena, &placements.object, entry.tool, entry.placement) or application.changed;
+    }
     if (patch.remove) |path| application.changed = removePath(&root.object, path) or application.changed;
     try cleanupLegacyWorkspacePreferences(arena, root, patch, &application);
     return application;
@@ -1473,7 +1505,7 @@ fn cleanupLegacyWorkspacePreferences(
 
 /// The settings paths a patch from `fx config set` or `unset` writes that the
 /// `/settings` cleanup above doesn't already cover.
-fn configWrittenPaths(patch: UserSettingsPatch) [8]?[]const u8 {
+fn configWrittenPaths(patch: UserSettingsPatch) [9]?[]const u8 {
     return .{
         if (patch.theme != null) "theme" else null,
         if (patch.auto_upgrade != null) "auto_upgrade" else null,
@@ -1482,6 +1514,7 @@ fn configWrittenPaths(patch: UserSettingsPatch) [8]?[]const u8 {
         if (patch.auto_compact_percent != null) "auto_compact_percent" else null,
         if (patch.provider_strict != null) "provider_strict" else null,
         if (patch.context != null) "context" else null,
+        if (patch.cache_warming != null) "cache_warming" else null,
         patch.remove,
     };
 }

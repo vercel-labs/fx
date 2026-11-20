@@ -4,8 +4,11 @@
 //! happened to the request (`start`, `failed`, `responding`, `succeeded`,
 //! `cancel`), and each report becomes one `recovery.step` call on the boot
 //! clock. Its plan's status goes to the host, and its send tells the loop to
-//! resend. Between sends `waitForSend` delivers `tick` once a second and polls
-//! the cancel flag every 25 ms. While a send is on the wire, a ticker keeps the
+//! resend. Between sends `waitForSend` delivers `tick` every 100 ms, so a
+//! jittered wait ends within a tick of its time, and polls the cancel flag
+//! every 25 ms; in single-threaded builds each poll also gives the host its
+//! cooperative pulse, which is where the host's Esc arrives. While a send is
+//! on the wire, a ticker keeps the
 //! retrying status counting: a thread in threaded builds, or the transport's
 //! cooperative pulse in single-threaded ones.
 //!
@@ -18,9 +21,11 @@
 //! write before that send (`sendRecord`), so a turn's first write carries it;
 //! a completed response clears it in the write that saves the response
 //! (`responseRecord`); any other save is written at once. A launch reads the
-//! newest one to resume the request (`tests/tla/recovery/Resume.tla`). One
-//! request at a time registers for `closeActive`, which SIGHUP and SIGTERM
-//! call from the closer thread.
+//! newest one to resume the request (`tests/tla/recovery/Resume.tla`). Every
+//! request that keeps a record registers for `closeActive`, which SIGHUP and
+//! SIGTERM call from the closer thread, and a terminal that hangs up calls
+//! from the main thread. One fx process runs main, its subagents and other
+//! instances, and each can have a request in flight.
 //!
 //! The module retries every transient failure for as long as it lasts, and fx
 //! adds no limit of its own: only Esc ends a request whose failures keep
@@ -38,10 +43,17 @@ const runtime_deps = @import("deps.zig");
 pub const Failure = recovery.Failure;
 pub const Send = recovery.Send;
 
-/// The module expects `tick` once a second from `start` until `finish`.
+/// The module expects `tick` at least once a second from `start` until
+/// `finish`; a send on the wire ticks this often.
 const tick_ms: u64 = 1_000;
+/// How often a wait ticks. The module ends a wait at the first tick past its
+/// jittered time, so a whole-second tick would round every wait up to a
+/// whole second and every client would resend together.
+const wait_tick_ms: u64 = 100;
 /// How often a wait checks for Esc.
 const cancel_poll_ms: u64 = 25;
+/// How often a wait for a sign-in asks whether the store holds a new login.
+const sign_in_check_ms: u64 = 1_000;
 /// Tests run the ticker thread fast; the module still sees the virtual clock.
 const ticker_interval_ns: i96 = if (builtin.is_test) 5 * std.time.ns_per_ms else tick_ms * std.time.ns_per_ms;
 /// The virtual boot clock tests start at.
@@ -62,6 +74,18 @@ pub fn failureKind(cause: types.ModelRecoveryCause) ?Failure.Kind {
     };
 }
 
+/// The unreadable replies one request takes before its turn ends: a server
+/// that sends one every time is broken, not having a bad moment.
+const max_unreadable_replies = 3;
+
+/// Whether the store now holds a login the waiting request can send, other
+/// than the one the provider refused, as another fx process that signs in
+/// saves.
+const SignInRenewed = struct {
+    ctx: *anyopaque,
+    check: *const fn (ctx: *anyopaque) bool,
+};
+
 pub const RequestRecovery = struct {
     deps: *const runtime_deps.AgentRuntimeDeps,
     cancel_flag: *std.atomic.Value(bool),
@@ -70,8 +94,21 @@ pub const RequestRecovery = struct {
     /// for example with Enter. Null on hosts that cannot ask the user, which
     /// end the turn instead (`canAskUser`).
     continue_flag: ?*std.atomic.Value(bool) = null,
+    /// Set by the same host when the sign-in it opened for this request
+    /// closes without a new login (`recovery.Event.sign_in_closed`).
+    sign_in_closed_flag: ?*std.atomic.Value(bool) = null,
+    /// Set by fx while the request waits for a sign-in. Asked about once a
+    /// second; a new login answers the wait as the user's continue does.
+    sign_in_renewed: ?SignInRenewed = null,
     /// Off in tests unless a test exercises the thread itself.
     ticker_enabled: bool = !builtin.is_test,
+    /// Replies this request could not read. Touched only by the request's
+    /// own thread.
+    unreadable_replies: u8 = 0,
+    /// Links the request into `registry` while it is registered. Guarded by
+    /// `registry_mutex`, not `mutex`.
+    registry_node: std.DoublyLinkedList.Node = .{},
+    registered: bool = false,
 
     mutex: std.Io.Mutex = .init,
     // Everything below is guarded by `mutex`.
@@ -174,17 +211,38 @@ pub const RequestRecovery = struct {
         self.writeRecordLocked();
     }
 
-    /// SIGHUP or SIGTERM: delivers `closing` to the registered request and
-    /// writes the clean record it returns, so the next launch resumes the
-    /// request without counting a death (`tests/tla/recovery/Resume.tla`
-    /// NoFalseCrashQuestion). Waits at most `close_wait_ms` for each lock.
-    /// Returns whether a record was written.
-    pub fn closeActive() bool {
+    /// SIGHUP, SIGTERM, or a terminal that hangs up: delivers `closing` to
+    /// every registered request and writes the clean record each returns, so
+    /// the next launch resumes them without counting a death
+    /// (`tests/tla/recovery/Resume.tla` NoFalseCrashQuestion). Main, its
+    /// subagents and other instances can each have a request in flight.
+    /// Waits at most `close_wait_ms` for each lock. Returns how many records
+    /// were written.
+    pub fn closeActive() usize {
         const io = io_mod.getIo();
-        if (!lockWithin(&active_mutex, close_wait_ms)) return false;
-        defer active_mutex.unlock(io);
-        const self = active orelse return false;
-        if (!lockWithin(&self.mutex, close_wait_ms)) return false;
+        if (!lockWithin(&registry_mutex, close_wait_ms)) {
+            debug_trace.logf("recovery", "closing skipped every request reason=registry_busy", .{});
+            return 0;
+        }
+        defer registry_mutex.unlock(io);
+        var written: usize = 0;
+        var node = registry.first;
+        while (node) |current| : (node = current.next) {
+            const request: *RequestRecovery = @fieldParentPtr("registry_node", current);
+            if (request.close()) written += 1;
+        }
+        return written;
+    }
+
+    /// Closes this request for `closeActive`. Returns whether its clean
+    /// record was written.
+    fn close(self: *RequestRecovery) bool {
+        const io = io_mod.getIo();
+        if (!lockWithin(&self.mutex, close_wait_ms)) {
+            // Its record stays as it was, so the next launch counts a death.
+            debug_trace.eventf("recovery", "closing_skipped", self.trace_ctx, "reason=request_busy", .{});
+            return false;
+        }
         defer self.mutex.unlock(io);
         if (self.closed) return false;
         _ = self.stepLocked(.closing) catch |err| {
@@ -197,11 +255,22 @@ pub const RequestRecovery = struct {
     }
 
     /// Reports a failed send. Returns the send the module asks for at once,
-    /// which only compaction does. Any other kind makes the module wait or
-    /// ask the user; the caller then calls `waitForSend`.
+    /// which only compaction and a sign-in failure the user already answered
+    /// do. Any other kind makes the module wait or ask the user; the caller
+    /// then calls `waitForSend`.
     pub fn failed(self: *RequestRecovery, failure: Failure) !?Send {
-        // An answer given before this failure answers nothing.
-        if (self.continue_flag) |flag| flag.store(false, .seq_cst);
+        // An answer given before this failure answers nothing, except a
+        // sign-in that finished while a resend for one was on the wire: the
+        // module keeps that one and resends at once with the new login. It
+        // ignores the continue in every other phase.
+        if (self.continue_flag) |flag| if (flag.swap(false, .seq_cst)) {
+            _ = try self.deliverAnswer(.user_continue, "failed_send");
+        };
+        // The send that failed was the saved login's try, so a sign-in that
+        // closed while it was on the wire leaves nothing more to try.
+        if (self.sign_in_closed_flag) |flag| if (flag.swap(false, .seq_cst)) {
+            debug_trace.eventf("recovery", "answer_dropped", self.trace_ctx, "event=sign_in_closed origin=failed_send reason=the_failed_send_tried_the_saved_login", .{});
+        };
         return self.event(.{ .failed = failure });
     }
 
@@ -215,26 +284,37 @@ pub const RequestRecovery = struct {
     /// the continue flag, for example with a picker choice. Returns the
     /// module's send.
     pub fn userContinue(self: *RequestRecovery) !?Send {
-        return self.event(.user_continue);
+        return self.deliverAnswer(.user_continue, "host");
     }
 
-    /// Waits for the module's next send, delivering `tick` once a second and
-    /// `user_continue` when the continue flag is set. Returns null when the
-    /// cancel flag is set; the caller then runs its cancel path, which calls
-    /// `cancel`.
+    /// Waits for the module's next send, delivering `tick` every
+    /// `wait_tick_ms`, `user_continue` when the continue flag is set or
+    /// `sign_in_renewed` finds a new login, and `sign_in_closed` when the
+    /// sign-in closed flag is set. Returns null when the cancel flag is set;
+    /// the caller then runs its cancel path, which calls `cancel`.
     pub fn waitForSend(self: *RequestRecovery) !?Send {
-        var next_tick_ms = self.nowMs() +| tick_ms;
+        var next_tick_ms = self.nowMs() +| wait_tick_ms;
+        var next_sign_in_check_ms = self.nowMs() +| sign_in_check_ms;
         while (true) {
             if (self.cancel_flag.load(.seq_cst)) return null;
             if (self.continue_flag) |flag| if (flag.swap(false, .seq_cst)) {
-                if (try self.event(.user_continue)) |send| return send;
+                if (try self.deliverAnswer(.user_continue, "wait")) |send| return send;
+            };
+            if (self.sign_in_closed_flag) |flag| if (flag.swap(false, .seq_cst)) {
+                if (try self.deliverAnswer(.sign_in_closed, "wait")) |send| return send;
             };
             const now_ms = self.nowMs();
+            if (self.sign_in_renewed) |renewed| if (now_ms >= next_sign_in_check_ms) {
+                next_sign_in_check_ms = now_ms +| sign_in_check_ms;
+                if (renewed.check(renewed.ctx)) {
+                    if (try self.deliverAnswer(.user_continue, "stored_sign_in")) |send| return send;
+                }
+            };
             if (now_ms < next_tick_ms) {
                 self.sleepMs(@min(cancel_poll_ms, next_tick_ms - now_ms));
                 continue;
             }
-            next_tick_ms = now_ms +| tick_ms;
+            next_tick_ms = now_ms +| wait_tick_ms;
             if (try self.event(.tick)) |send| return send;
         }
     }
@@ -317,6 +397,14 @@ pub const RequestRecovery = struct {
     }
 
     /// Sends so far, including the first.
+    /// Counts a reply this request could not read, and says whether it is
+    /// the last one: past `max_unreadable_replies` the turn ends with the
+    /// error instead of another resend.
+    pub fn unreadableReplyEndsRequest(self: *RequestRecovery) bool {
+        self.unreadable_replies +|= 1;
+        return self.unreadable_replies >= max_unreadable_replies;
+    }
+
     pub fn attempt(self: *RequestRecovery) u16 {
         const io = io_mod.getIo();
         self.mutex.lockUncancelable(io);
@@ -429,6 +517,20 @@ pub const RequestRecovery = struct {
         return self.stepLocked(value);
     }
 
+    /// Steps the module with a user's answer, and traces the answer when
+    /// the module has no use for it, since that drops what the user did: an
+    /// Enter while nothing waits for them, or a closed sign-in while no wait
+    /// is for one. `origin` names where the answer was read.
+    fn deliverAnswer(self: *RequestRecovery, value: recovery.Event, origin: []const u8) !?Send {
+        const io = io_mod.getIo();
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        if (!recovery.usesAnswer(&self.state, value)) {
+            debug_trace.eventf("recovery", "answer_dropped", self.trace_ctx, "event={s} origin={s} reason=nothing_waits_for_it", .{ @tagName(value), origin });
+        }
+        return self.stepLocked(value);
+    }
+
     /// Steps the module and carries out its plan in field order. Returns
     /// the plan's send, which the caller carries out.
     fn stepLocked(self: *RequestRecovery, value: recovery.Event) !?Send {
@@ -513,6 +615,14 @@ pub const RequestRecovery = struct {
             _ = self.virtual_now_ms.fetchAdd(ms, .seq_cst);
             return;
         }
+        // A single-threaded host, such as the browser SDK, delivers Esc only
+        // through the cooperative pulse, so a wait that never pulsed ended
+        // before the cancel could arrive.
+        if (comptime builtin.single_threaded) {
+            if (self.inner_pulse) |inner| inner.pulse() catch |err| {
+                debug_trace.logf("recovery", "wait pulse failed err={s}", .{@errorName(err)});
+            };
+        }
         io_mod.getIo().sleep(.fromNanoseconds(@as(i96, ms) * std.time.ns_per_ms), .awake) catch {};
     }
 };
@@ -529,23 +639,31 @@ fn lockWithin(mutex: *std.Io.Mutex, ms: u64) bool {
     return true;
 }
 
-/// The request `closeActive` closes. One host process runs one request that
-/// keeps a record at a time.
-var active_mutex: std.Io.Mutex = .init;
-var active: ?*RequestRecovery = null;
+/// The requests `closeActive` closes: every running request that keeps a
+/// record, in every agent of the process. Each links itself through its own
+/// `registry_node`, so registering never allocates.
+var registry_mutex: std.Io.Mutex = .init;
+var registry: std.DoublyLinkedList = .{};
 
 fn register(request: *RequestRecovery) void {
     const io = io_mod.getIo();
-    active_mutex.lockUncancelable(io);
-    defer active_mutex.unlock(io);
-    active = request;
+    registry_mutex.lockUncancelable(io);
+    defer registry_mutex.unlock(io);
+    if (request.registered) return;
+    registry.append(&request.registry_node);
+    request.registered = true;
 }
 
+/// Removes only `request`, so a request that ends never takes another
+/// agent's out of `closeActive`'s reach.
 fn unregister(request: *RequestRecovery) void {
     const io = io_mod.getIo();
-    active_mutex.lockUncancelable(io);
-    defer active_mutex.unlock(io);
-    if (active == request) active = null;
+    registry_mutex.lockUncancelable(io);
+    defer registry_mutex.unlock(io);
+    if (!request.registered) return;
+    registry.remove(&request.registry_node);
+    request.registry_node = .{};
+    request.registered = false;
 }
 
 // Tests.
@@ -651,6 +769,116 @@ test "a healthy request shows nothing and reports no recovery" {
     try request.succeeded();
     try std.testing.expectEqual(@as(usize, 0), fake.route_recovery_statuses.items.len);
     try std.testing.expectEqual(@as(usize, 0), fake.route_recovery_clear_count);
+}
+
+const StoredSignInProbe = struct {
+    found_after: usize,
+    checks: usize = 0,
+
+    fn check(raw: *anyopaque) bool {
+        const self: *StoredSignInProbe = @ptrCast(@alignCast(raw));
+        self.checks += 1;
+        return self.checks > self.found_after;
+    }
+};
+
+test "a request waiting for a sign-in resends once another fx process saves a login" {
+    var fake = support.FakeAgentRuntimeDeps.init(std.testing.allocator);
+    defer fake.deinit();
+    const deps = fake.deps();
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    var continue_flag = std.atomic.Value(bool).init(false);
+    var request = RequestRecovery.init(&deps, &cancel_flag, .{});
+    request.continue_flag = &continue_flag;
+    defer request.deinit();
+    var probe = StoredSignInProbe{ .found_after = 2 };
+    request.sign_in_renewed = .{ .ctx = &probe, .check = StoredSignInProbe.check };
+
+    _ = try request.start(false, null);
+    try std.testing.expect(try request.failed(.{ .kind = .sign_in }) == null);
+    const waited_from_ms = request.nowMs();
+    try std.testing.expectEqual(Send{}, (try request.waitForSend()).?);
+    try std.testing.expectEqual(@as(usize, 3), probe.checks);
+    try std.testing.expectEqual(@as(u16, 2), request.attempt());
+    // About a second apart, and long before the wait's own next try.
+    const waited_ms = request.nowMs() - waited_from_ms;
+    try std.testing.expect(waited_ms >= 3 * sign_in_check_ms);
+    try std.testing.expect(waited_ms < 60 * 1000);
+}
+
+test "a sign-in that finishes while a sign-in resend is on the wire sends again when that resend fails" {
+    var fake = support.FakeAgentRuntimeDeps.init(std.testing.allocator);
+    defer fake.deinit();
+    const deps = fake.deps();
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    var continue_flag = std.atomic.Value(bool).init(false);
+    var closed_flag = std.atomic.Value(bool).init(false);
+    var request = RequestRecovery.init(&deps, &cancel_flag, .{});
+    request.continue_flag = &continue_flag;
+    request.sign_in_closed_flag = &closed_flag;
+    defer request.deinit();
+
+    _ = try request.start(false, null);
+    try std.testing.expect(try request.failed(.{ .kind = .sign_in }) == null);
+    // The sign-in fx opened closes, so the request tries its saved login.
+    closed_flag.store(true, .seq_cst);
+    try std.testing.expectEqual(Send{}, (try request.waitForSend()).?);
+    try std.testing.expectEqual(@as(u16, 2), request.attempt());
+    try std.testing.expect(!closed_flag.load(.seq_cst));
+    // The user signs in while that resend is on the wire, and it fails.
+    continue_flag.store(true, .seq_cst);
+    try std.testing.expectEqual(Send{}, (try request.failed(.{ .kind = .sign_in })).?);
+    try std.testing.expectEqual(@as(u16, 3), request.attempt());
+    try std.testing.expect(!continue_flag.load(.seq_cst));
+}
+
+test "a sign-in during a sign-in resend that then fails on the way waits briefly, then resends" {
+    var fake = support.FakeAgentRuntimeDeps.init(std.testing.allocator);
+    defer fake.deinit();
+    const deps = fake.deps();
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    var continue_flag = std.atomic.Value(bool).init(false);
+    var closed_flag = std.atomic.Value(bool).init(false);
+    var request = RequestRecovery.init(&deps, &cancel_flag, .{});
+    request.continue_flag = &continue_flag;
+    request.sign_in_closed_flag = &closed_flag;
+    defer request.deinit();
+
+    _ = try request.start(false, null);
+    try std.testing.expect(try request.failed(.{ .kind = .sign_in }) == null);
+    closed_flag.store(true, .seq_cst);
+    try std.testing.expectEqual(Send{}, (try request.waitForSend()).?);
+    // The user signs in while that resend is on the wire, and the connection
+    // drops. The turn loop's transient sites take their send from
+    // `waitForSend`, so `failed` must not hand one back here.
+    continue_flag.store(true, .seq_cst);
+    try std.testing.expect(try request.failed(.{ .kind = .dropped }) == null);
+    try std.testing.expect(!continue_flag.load(.seq_cst));
+    try std.testing.expectEqual(Send{}, (try request.waitForSend()).?);
+    try std.testing.expectEqual(@as(u16, 3), request.attempt());
+}
+
+test "a continue or a closed sign-in before an ordinary failure answers nothing" {
+    var fake = support.FakeAgentRuntimeDeps.init(std.testing.allocator);
+    defer fake.deinit();
+    const deps = fake.deps();
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    var continue_flag = std.atomic.Value(bool).init(false);
+    var closed_flag = std.atomic.Value(bool).init(false);
+    var request = RequestRecovery.init(&deps, &cancel_flag, .{});
+    request.continue_flag = &continue_flag;
+    request.sign_in_closed_flag = &closed_flag;
+    defer request.deinit();
+
+    _ = try request.start(false, null);
+    continue_flag.store(true, .seq_cst);
+    closed_flag.store(true, .seq_cst);
+    try std.testing.expect(try request.failed(.{ .kind = .dropped }) == null);
+    try std.testing.expect(!continue_flag.load(.seq_cst));
+    try std.testing.expect(!closed_flag.load(.seq_cst));
+    // The request still waits, then resends.
+    _ = (try request.waitForSend()).?;
+    try std.testing.expectEqual(@as(u16, 2), request.attempt());
 }
 
 test "Esc during a wait stops waiting and cancel clears the status" {
@@ -903,20 +1131,59 @@ test "closing saves a clean record that resumes without a death, and nothing rep
         defer request.deinit();
         _ = (try request.start(false, null)).?;
         _ = request.sendRecord();
-        try std.testing.expect(RequestRecovery.closeActive());
+        try std.testing.expectEqual(@as(usize, 1), RequestRecovery.closeActive());
         const saved = fake.recovery_record.?;
         // The dying send's failure saves nothing over it.
         try std.testing.expectEqual(@as(?Send, null), try request.failed(.{ .kind = .dropped }));
         try std.testing.expectEqual(saved, fake.recovery_record.?);
-        try std.testing.expect(!RequestRecovery.closeActive());
+        try std.testing.expectEqual(@as(usize, 0), RequestRecovery.closeActive());
     }
     // Ended requests are not closed.
-    try std.testing.expect(!RequestRecovery.closeActive());
+    try std.testing.expectEqual(@as(usize, 0), RequestRecovery.closeActive());
 
     var probe: recovery.State = .{};
     const plan = recovery.step(&probe, .{ .start = .{ .resume_from = fake.recovery_record.? } }, 0);
     try std.testing.expect(plan.send != null);
     try std.testing.expectEqual(@as(u8, 0), probe.abrupt_deaths);
+}
+
+test "closing saves a clean record for every request in flight" {
+    var main_fake = recordingFake();
+    defer main_fake.deinit();
+    var subagent_fake = recordingFake();
+    defer subagent_fake.deinit();
+    var ended_fake = recordingFake();
+    defer ended_fake.deinit();
+    const main_deps = main_fake.deps();
+    const subagent_deps = subagent_fake.deps();
+    const ended_deps = ended_fake.deps();
+    var cancel_flag = std.atomic.Value(bool).init(false);
+
+    var main_request = RequestRecovery.init(&main_deps, &cancel_flag, .{});
+    defer main_request.deinit();
+    _ = (try main_request.start(false, null)).?;
+    _ = main_request.sendRecord();
+    // A request that starts later and ends first leaves main's registered.
+    {
+        var ended = RequestRecovery.init(&ended_deps, &cancel_flag, .{});
+        defer ended.deinit();
+        _ = (try ended.start(false, null)).?;
+        _ = ended.sendRecord();
+    }
+    // Another agent's request starts after main's.
+    var subagent_request = RequestRecovery.init(&subagent_deps, &cancel_flag, .{});
+    defer subagent_request.deinit();
+    _ = (try subagent_request.start(false, null)).?;
+    _ = subagent_request.sendRecord();
+
+    try std.testing.expectEqual(@as(usize, 2), RequestRecovery.closeActive());
+    for ([_]*const support.FakeAgentRuntimeDeps{ &main_fake, &subagent_fake }) |fake| {
+        var probe: recovery.State = .{};
+        const plan = recovery.step(&probe, .{ .start = .{ .resume_from = fake.recovery_record.? } }, 0);
+        try std.testing.expect(plan.send != null);
+        try std.testing.expectEqual(@as(u8, 0), probe.abrupt_deaths);
+    }
+    try std.testing.expectEqual(@as(usize, 0), RequestRecovery.closeActive());
 }
 
 test "a resumed start that must ask first sends nothing" {
@@ -944,4 +1211,53 @@ test "a resumed start that must ask first sends nothing" {
         defer request.deinit();
         try std.testing.expectEqual(@as(?Send, null), try request.start(false, .{ .stale = true }));
     }
+}
+
+test "a resend leaves within one wait tick of its jittered deadline" {
+    var fake = support.FakeAgentRuntimeDeps.init(std.testing.allocator);
+    defer fake.deinit();
+    const deps = fake.deps();
+    var below: usize = 0;
+    var seed: u64 = 0;
+    while (seed < 40) : (seed += 1) {
+        var cancel_flag = std.atomic.Value(bool).init(false);
+        var request = RequestRecovery.init(&deps, &cancel_flag, .{});
+        defer request.deinit();
+        request.virtual_now_ms.store(test_epoch_ms + seed * 7_919, .seq_cst);
+        _ = try request.start(false, null);
+        _ = try request.failed(.{ .kind = .server });
+        const failed_at = request.virtual_now_ms.load(.seq_cst);
+        _ = (try request.waitForSend()).?;
+        const waited = request.virtual_now_ms.load(.seq_cst) - failed_at;
+        // The first step is 1 s jittered to 80-100 %: 800 to 1000 ms, plus
+        // at most one wait tick.
+        try std.testing.expect(waited >= 800 and waited <= 1_000 + wait_tick_ms);
+        if (waited <= 950) below += 1;
+        _ = try request.cancel();
+    }
+    // A whole-second tick would put every resend at 1000 ms.
+    try std.testing.expect(below >= 10);
+}
+
+test "ten thousand failures in a row keep every wait within its cap and never stop retrying" {
+    var fake = support.FakeAgentRuntimeDeps.init(std.testing.allocator);
+    defer fake.deinit();
+    const deps = fake.deps();
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    var request = RequestRecovery.init(&deps, &cancel_flag, .{});
+    defer request.deinit();
+    request.virtual_now_ms.store(test_epoch_ms, .seq_cst);
+    _ = try request.start(false, null);
+    var longest: u64 = 0;
+    for (0..10_000) |_| {
+        _ = try request.failed(.{ .kind = .server });
+        const failed_at = request.virtual_now_ms.load(.seq_cst);
+        _ = (try request.waitForSend()) orelse return error.TestExpectedSend;
+        const waited = request.virtual_now_ms.load(.seq_cst) - failed_at;
+        longest = @max(longest, waited);
+        // The backoff tops out at 30 s; a wait ends within one tick of its time.
+        try std.testing.expect(waited <= 30_000 + wait_tick_ms);
+    }
+    try std.testing.expect(longest >= 24_000);
+    _ = try request.cancel();
 }

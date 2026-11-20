@@ -1,0 +1,32 @@
+[
+  {
+    "description": "The waiter's give-up runs from its own start, not the current holder's stamp, so holders taking turns ahead of it outlast it",
+    "old": "Deadline == Max(lockStamp, wStart) + Budget + Slack",
+    "new": "Deadline == wStart + Budget + Slack",
+    "invariant": "NoGiveUpOnLiveHolder"
+  },
+  {
+    "description": "One stamp per hold, written before its first call only, so a hold with two slow calls outlasts the waiter",
+    "old": "    /\\ lockStamp' = WClock\n",
+    "new": "    /\\ lockStamp' = IF calls[h] = 0 THEN WClock ELSE lockStamp\n",
+    "invariant": "NoGiveUpOnLiveHolder"
+  },
+  {
+    "description": "A Keychain call outlives the stamp written before it: its own timeout is longer than the Budget waiters allow",
+    "old": "CallOver(h) == inCall[h] /\\ awake - callAt[h] >= CallMax",
+    "new": "CallOver(h) == inCall[h] /\\ awake - callAt[h] >= CallMax + 1",
+    "invariant": "NoGiveUpOnLiveHolder"
+  },
+  {
+    "description": "The waiter measures on the real clock, which jumps across a laptop sleep while the holder's awake-clock stamps stand still",
+    "old": "WClock == awake",
+    "new": "WClock == real",
+    "invariant": "NoGiveUpOnLiveHolder"
+  },
+  {
+    "description": "No slack: the waiter gives up the moment a call's budget ends, before the cut call has released the lock",
+    "old": "Deadline == Max(lockStamp, wStart) + Budget + Slack",
+    "new": "Deadline == Max(lockStamp, wStart) + Budget",
+    "invariant": "NoGiveUpOnLiveHolder"
+  }
+]

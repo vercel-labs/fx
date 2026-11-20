@@ -34,6 +34,10 @@ pub var dim_style: []const u8 = shared_theme.fx_dark.dim_style;
 pub var warning_style: []const u8 = shared_theme.fx_dark.warning_style;
 pub var green_style: []const u8 = shared_theme.fx_dark.green_style;
 pub var red_style: []const u8 = shared_theme.fx_dark.red_style;
+/// A failed tool call's ✗ and the words that say it failed: the red of a
+/// named theme that sets its own, and dim under fx's themes, where a failure
+/// the model works past stays quiet.
+pub var failure_style: []const u8 = shared_theme.fx_dark.dim_style;
 pub var diff_added_style: []const u8 = shared_theme.fx_dark.diff_added_style;
 pub var diff_removed_style: []const u8 = shared_theme.fx_dark.diff_removed_style;
 pub var diff_added_marker_style: []const u8 = "";
@@ -62,6 +66,26 @@ pub fn truecolorIsEnabled() bool {
     return truecolor_enabled;
 }
 
+/// The failure style under `theme`: its own red when it is a named theme
+/// that sets one, and its dim otherwise, since fx's themes have no red.
+fn failureStyle(theme: shared_theme.Theme, named: bool) []const u8 {
+    const base = shared_theme.builtin(theme.light);
+    if (named and !std.mem.eql(u8, theme.red_style, base.red_style)) return theme.red_style;
+    return theme.dim_style;
+}
+
+test "a failure is dim under fx's themes and red under a named theme that sets red" {
+    try std.testing.expectEqualStrings(shared_theme.fx_dark.dim_style, failureStyle(shared_theme.fx_dark, false));
+    try std.testing.expectEqualStrings(shared_theme.fx_light.dim_style, failureStyle(shared_theme.fx_light, false));
+    // A named theme that keeps fx's red, which is not red, stays dim too.
+    try std.testing.expectEqualStrings(shared_theme.fx_dark.dim_style, failureStyle(shared_theme.fx_dark, true));
+    var named = shared_theme.fx_dark;
+    named.red_style = "\x1b[38;2;227;70;113m";
+    try std.testing.expectEqualStrings("\x1b[38;2;227;70;113m", failureStyle(named, true));
+    // Without a name, the theme is fx's own.
+    try std.testing.expectEqualStrings(named.dim_style, failureStyle(named, false));
+}
+
 pub fn initTheme(light: bool, terminal_bg: ?TerminalRgb) void {
     applyTheme(shared_theme.builtin(light), terminal_bg);
 }
@@ -82,6 +106,7 @@ pub fn applyTheme(theme: shared_theme.Theme, terminal_bg: ?TerminalRgb) void {
     warning_style = theme.warning_style;
     green_style = theme.green_style;
     red_style = theme.red_style;
+    failure_style = failureStyle(theme, shared_theme.sourceName() != null);
     diff_added_style = theme.diff_added_style;
     diff_removed_style = theme.diff_removed_style;
     approval_button_active_style = theme.approval_button_active_style;
@@ -204,7 +229,9 @@ pub const StatuslineItems = struct {
 /// upstream, so this only bounds pathological single-word titles.
 const max_session_title_cells: usize = 32;
 
-fn compactModelLabel(model: []const u8, out: []u8) []const u8 {
+/// A model id as the status line names it: without its provider, and
+/// a Claude model as "opus 4-7". May use `out`.
+pub fn compactModelLabel(model: []const u8, out: []u8) []const u8 {
     var start: usize = 0;
     for (model, 0..) |byte, i| {
         if (byte == '/') start = i + 1;
@@ -790,19 +817,13 @@ test "terminal title clear restores a predictable empty state" {
     try std.testing.expectEqualStrings("\x1b]2;\x07", written);
 }
 
-pub fn formatResumeHandoff(
-    buffer: []u8,
-    session_id: []const u8,
-    terminal_cols: u16,
-) ![]const u8 {
-    const label = "Continue session with:";
-    const command = "fx --resume ";
-    const single_row_width = label.len + 1 + command.len + session_id.len;
-    const separator = if (single_row_width <= terminal_cols) " " else "\n  ";
+/// The command gets a line to itself, so selecting that line copies only the
+/// command.
+pub fn formatResumeHandoff(buffer: []u8, session_id: []const u8) ![]const u8 {
     return std.mem.print(
         buffer,
-        "{s}{s}{s}{s}{s}{s}\n",
-        .{ dim_style, label, separator, command, session_id, reset_style },
+        "{s}Resume this session with:\nfx --resume {s}{s}\n",
+        .{ dim_style, session_id, reset_style },
     );
 }
 
@@ -859,23 +880,15 @@ test "initTheme sets light mode styles" {
     try std.testing.expectEqualStrings("\x1b[1;38;5;255m", subtitle_style);
 }
 
-test "resume handoff uses one row only when the full instruction fits" {
+test "resume handoff puts the command alone on the line under its label" {
     initTheme(false, null);
     defer initTheme(false, null);
 
-    const single_row = "Continue session with: fx --resume session-123";
-    var exact_buffer: [128]u8 = undefined;
-    const exact = try formatResumeHandoff(&exact_buffer, "session-123", single_row.len);
+    var buffer: [128]u8 = undefined;
+    const message = try formatResumeHandoff(&buffer, "session-123");
     try std.testing.expectEqualStrings(
-        "\x1b[38;5;245mContinue session with: fx --resume session-123\x1b[0m\n",
-        exact,
-    );
-
-    var narrow_buffer: [128]u8 = undefined;
-    const narrow = try formatResumeHandoff(&narrow_buffer, "session-123", single_row.len - 1);
-    try std.testing.expectEqualStrings(
-        "\x1b[38;5;245mContinue session with:\n  fx --resume session-123\x1b[0m\n",
-        narrow,
+        "\x1b[38;5;245mResume this session with:\nfx --resume session-123\x1b[0m\n",
+        message,
     );
 }
 
@@ -884,9 +897,9 @@ test "resume handoff follows the active muted theme shade" {
     defer initTheme(false, null);
 
     var buffer: [128]u8 = undefined;
-    const message = try formatResumeHandoff(&buffer, "session-123", 80);
+    const message = try formatResumeHandoff(&buffer, "session-123");
     try std.testing.expectEqualStrings(
-        "\x1b[38;5;247mContinue session with: fx --resume session-123\x1b[0m\n",
+        "\x1b[38;5;247mResume this session with:\nfx --resume session-123\x1b[0m\n",
         message,
     );
 }

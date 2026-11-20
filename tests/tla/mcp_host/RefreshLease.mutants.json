@@ -1,0 +1,32 @@
+[
+  {
+    "description": "The waiter goes ahead a fixed time after it starts, as before the lease, so a refresh slower than that is refreshed past",
+    "old": "    now >= Max(Max(rStamp, WStart) + RefreshMax, Max(storeStamp, WStart) + Budget + Slack) + Slack\n",
+    "new": "    now >= WStart + Budget\n",
+    "invariant": "NoGoAheadPastLiveRefresher"
+  },
+  {
+    "description": "The waiter reads only the refresh lock's stamp, so a refresher waiting its turn for the store is refreshed past",
+    "old": "    now >= Max(Max(rStamp, WStart) + RefreshMax, Max(storeStamp, WStart) + Budget + Slack) + Slack\n",
+    "new": "    now >= Max(rStamp, WStart) + RefreshMax + Slack\n",
+    "invariant": "NoGoAheadPastLiveRefresher"
+  },
+  {
+    "description": "No Slack past the store's lease: the waiter goes ahead the moment a refresher behind a frozen store holder gives up, before it stamps the refresh lock",
+    "old": "    now >= Max(Max(rStamp, WStart) + RefreshMax, Max(storeStamp, WStart) + Budget + Slack) + Slack\n",
+    "new": "    now >= Max(Max(rStamp, WStart) + RefreshMax, Max(storeStamp, WStart) + Budget) + Slack\n",
+    "invariant": "NoGoAheadPastLiveRefresher"
+  },
+  {
+    "description": "The refresher doesn't stamp the refresh lock before saving, so a slow answer and a stuck store add up past the waiter's rule",
+    "old": "    /\\ rStamp' = IF p \\in {\"network\", \"save\"} THEN now ELSE rStamp",
+    "new": "    /\\ rStamp' = IF p = \"network\" THEN now ELSE rStamp",
+    "invariant": "NoGoAheadPastLiveRefresher"
+  },
+  {
+    "description": "The refresher doesn't stamp the refresh lock before sending, so a long wait for the store and a slow answer add up past the waiter's rule",
+    "old": "    /\\ rStamp' = IF p \\in {\"network\", \"save\"} THEN now ELSE rStamp",
+    "new": "    /\\ rStamp' = IF p = \"save\" THEN now ELSE rStamp",
+    "invariant": "NoGoAheadPastLiveRefresher"
+  }
+]

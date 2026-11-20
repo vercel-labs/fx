@@ -5,8 +5,10 @@ const grok_session = @import("../core/auth/grok_session.zig");
 const secret = @import("../core/auth/secret.zig");
 const stream_provider = @import("../core/agent/stream_provider.zig");
 const io_mod = @import("../core/shared/io.zig");
+const testing_listener = @import("../core/shared/testing_listener.zig");
 const types = @import("../core/shared/types.zig");
 const gateway_client = @import("client.zig");
+const chat_completions_protocol = @import("chat_completions_protocol.zig");
 const responses_protocol = @import("responses_protocol.zig");
 const sse_stream = @import("sse.zig");
 const model_tool_schema = @import("../core/tooling/model_tool_schema.zig");
@@ -282,14 +284,6 @@ pub fn streamPrepared(
         .session_id = request.session_id,
     });
 
-    var client: std.http.Client = .{ .allocator = alloc, .io = io_mod.getIo() };
-    defer client.deinit();
-    var open_operation = gateway_client.PostOperation{
-        .client = &client,
-        .uri = uri,
-        .authorization = auth_headers.authorization,
-        .extra_headers = extra_headers,
-    };
     var connect_deadline = std.Io.Clock.Timestamp.fromNow(io_mod.getIo(), .{
         .clock = .awake,
         .raw = .fromMilliseconds(connect_timeout_ms),
@@ -300,14 +294,13 @@ pub fn streamPrepared(
         }
     }
     try request.admission.admit();
-    var opened = try gateway_client.openBoundedPost(
-        alloc,
-        request.cancel_flag,
-        connect_deadline,
-        &open_operation,
-    );
-    var http_request = opened.take();
-    defer http_request.deinit();
+    var opened = try gateway_client.openBoundedPost(request.cancel_flag, connect_deadline, .{
+        .uri = uri,
+        .authorization = auth_headers.authorization,
+        .extra_headers = extra_headers,
+    });
+    defer opened.deinit();
+    const http_request = &opened.request;
     var watch: gateway_client.ConnectionWatch = .init(.{
         .patient = true,
         .stall_timeout_ms = gateway_client.ConnectionWatch.bodyStallTimeoutMs(request.deadline),
@@ -330,6 +323,9 @@ pub fn streamPrepared(
     var response = http_request.receiveHead(&.{}) catch |err| return watch.failure(err);
     if (watch.commitHead()) |err| return err;
     if (response.head.status != .ok) {
+        // Read before the body, whose reads reuse the buffer the head's
+        // header bytes live in.
+        const retry_after = gateway_client.retryAfterSeconds(response.head);
         var transfer: [16 * 1024]u8 = undefined;
         const reader = response.reader(&transfer);
         const bounded_body = reader.allocRemaining(alloc, .limited(max_error_body_bytes + 1)) catch |err| switch (err) {
@@ -340,11 +336,18 @@ pub fn streamPrepared(
             alloc.free(bounded_body);
             break :body try alloc.dupe(u8, "xAI Grok error response exceeded the local limit");
         } else bounded_body;
-        return .{ .failed = .{
-            .kind = gateway_client.httpFailureKind(alloc, .fromHttpStatus(response.head.status), body),
-            .detail = body,
-            .ownership = .owned,
-        } };
+        const kind = gateway_client.httpFailureKind(alloc, .fromHttpStatus(response.head.status), body);
+        return .{
+            .failed = .{
+                .kind = kind,
+                .http_status = response.head.status,
+                // The body can quote the token this request sent, and the detail
+                // reaches the transcript and the trace.
+                .detail = try chat_completions_protocol.redactOwnedErrorBody(alloc, body, request.credential.secret()),
+                .retry_after_seconds = retry_after,
+                .ownership = .owned,
+            },
+        };
     }
 
     var transfer_buffer: [transfer_buffer_bytes]u8 = undefined;
@@ -442,6 +445,7 @@ fn mapReducerError(err: anyerror) anyerror {
         error.EventTooLarge => error.XaiGrokSseEventTooLarge,
         error.StreamTooLarge => error.XaiGrokResourceLimitExceeded,
         error.InvalidEvent => error.InvalidXaiGrokSseEvent,
+        error.MalformedEvent => error.MalformedXaiGrokSseEvent,
         error.StreamIncomplete => error.XaiGrokStreamIncomplete,
         error.ToolCallLimitExceeded => error.XaiGrokToolCallLimitExceeded,
         error.ToolArgumentsTooLarge => error.XaiGrokToolArgumentsTooLarge,
@@ -714,14 +718,11 @@ const TestResponseFixture = struct {
     fn deinit(self: *@This()) void {
         if (!self.server_open) return;
         self.stopping.store(true, .seq_cst);
-        const zio = self.io();
         if (self.thread) |thread| {
-            const listener = std.Io.net.Stream{ .socket = self.server.socket };
-            listener.shutdown(zio, .both) catch {};
             thread.join();
             self.thread = null;
         }
-        self.server.deinit(zio);
+        self.server.deinit(self.io());
         self.server_open = false;
     }
 
@@ -736,7 +737,7 @@ const TestResponseFixture = struct {
     fn run(self: *@This()) void {
         self.runFallible() catch |err| {
             if (self.stopping.load(.seq_cst) and
-                (err == error.SocketNotListening or err == error.BrokenPipe or err == error.ConnectionResetByPeer))
+                (err == error.BrokenPipe or err == error.ConnectionResetByPeer))
             {
                 return;
             }
@@ -746,7 +747,7 @@ const TestResponseFixture = struct {
 
     fn runFallible(self: *@This()) !void {
         const zio = self.io();
-        var stream = try self.server.accept(zio);
+        var stream = (try testing_listener.acceptUnlessStopping(&self.server, zio, &self.stopping)) orelse return;
         defer stream.close(zio);
         try readTestRequest(zio, stream);
         switch (self.mode) {
@@ -777,6 +778,15 @@ const TestResponseFixture = struct {
         }
     }
 };
+
+test "Grok response fixture cleanup joins without a client" {
+    var fixture = try TestResponseFixture.init(.slow_head);
+    defer fixture.deinit();
+    try fixture.start();
+    fixture.deinit();
+    try std.testing.expect(fixture.thread == null);
+    try std.testing.expect(fixture.failure == null);
+}
 
 fn readTestRequest(zio: std.Io, stream: std.Io.net.Stream) !void {
     var socket_buffer: [4096]u8 = undefined;
@@ -957,7 +967,12 @@ test "xAI Grok error-body reader accepts the exact bound and replaces one beyond
         if (fixture.failure) |err| return err;
         try std.testing.expectEqual(stream_provider.FailureKind.rate_limited, result.failed.kind);
         if (mode == .error_body_exact) {
-            try std.testing.expectEqual(max_error_body_bytes, result.failed.detail.?.len);
+            // The reader keeps a body at the bound; masking the request's
+            // token then replaces one that large with its own fixed message.
+            try std.testing.expectEqualStrings(
+                "Provider error details exceeded the local limit",
+                result.failed.detail.?,
+            );
         } else {
             try std.testing.expectEqualStrings(
                 "xAI Grok error response exceeded the local limit",
@@ -1151,4 +1166,12 @@ test "xAI Grok SSE reducer cleans up bounded tool arguments and provider state" 
     const excess_state = try buildProviderStateSse(std.testing.allocator, max_provider_state_bytes + 1);
     defer std.testing.allocator.free(excess_state);
     try expectTestSseError(error.XaiGrokResourceLimitExceeded, excess_state);
+}
+
+test "an xAI event that is not JSON resends, and a duplicate key still ends the turn" {
+    const partial = "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"content_index\":0,\"delta\":\"partial\"}\n\n";
+    try expectTestSseError(error.MalformedXaiGrokSseEvent, partial ++ "data: {not-json}\n\n");
+    try std.testing.expect(gateway_client.networkFailureEvidence(error.MalformedXaiGrokSseEvent, .possibly_sent) != null);
+    try expectTestSseError(error.InvalidXaiGrokSseEvent, partial ++ "data: {\"type\":\"a\",\"type\":\"b\"}\n\n");
+    try std.testing.expect(gateway_client.networkFailureEvidence(error.InvalidXaiGrokSseEvent, .possibly_sent) == null);
 }

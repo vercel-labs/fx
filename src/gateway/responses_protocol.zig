@@ -6,7 +6,7 @@ const model_tool_schema = @import("../core/tooling/model_tool_schema.zig");
 const types = @import("../core/shared/types.zig");
 const image_attachments = @import("../core/images/image_attachments.zig");
 const tool_call_ids = @import("tool_call_ids.zig");
-const json_depth = @import("json_depth.zig");
+const json_depth = @import("../core/shared/json_depth.zig");
 const json_comparison = @import("../core/shared/json_comparison.zig");
 const text_utils = @import("../core/shared/text_utils.zig");
 
@@ -922,7 +922,10 @@ pub const Reducer = struct {
         if (json_depth.exceeds(json_text)) return error.InvalidEvent;
         var parsed = std.json.parseFromSlice(std.json.Value, alloc, json_text, .{}) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
-            else => return error.InvalidEvent,
+            // Valid JSON that fx refuses ends the turn. Text that is not JSON
+            // at all was damaged on the way, so the caller resends it.
+            error.DuplicateField => return error.InvalidEvent,
+            else => return error.MalformedEvent,
         };
         defer parsed.deinit();
         if (parsed.value != .object) return false;
@@ -2738,4 +2741,13 @@ test "Responses usage projection retains optional cached and reasoning detail" {
     try std.testing.expectEqual(@as(?u64, 5), usage.cache_read_tokens);
     try std.testing.expectEqual(@as(?u64, 2), usage.cache_write_tokens);
     try std.testing.expectEqual(@as(?u64, 3), usage.reasoning_tokens);
+}
+
+test "a Responses event that is not JSON is malformed, and valid JSON fx refuses is invalid" {
+    var garbled = ToolRecordTest.init(std.testing.allocator);
+    defer garbled.deinit();
+    try std.testing.expectError(error.MalformedEvent, garbled.apply("{\"type\":\"response.output_text.delta\",\"delta\":\"\x01broken"));
+    var duplicate = ToolRecordTest.init(std.testing.allocator);
+    defer duplicate.deinit();
+    try std.testing.expectError(error.InvalidEvent, duplicate.apply("{\"type\":\"response.created\",\"type\":\"response.completed\"}"));
 }

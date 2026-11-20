@@ -18,6 +18,7 @@ const command_replay_store = @import("../../../session/command_replay_store.zig"
 const session_child_store = @import("../../../session/session_child_store.zig");
 const lifecycle_hooks = @import("../../../hooks/hooks.zig");
 const model_capabilities = @import("../../../config/model_capabilities.zig");
+const model_catalog = @import("../../../gateway/model_catalog.zig");
 const provider_set = @import("../../../gateway/provider_set.zig");
 const file_mutation = @import("../../../tooling/file_mutation.zig");
 const file_mutation_contract = @import("../../../tooling/file_mutation_contract.zig");
@@ -151,7 +152,7 @@ fn discardVisionToolOutput(
     _: []const u8,
 ) anyerror!void {}
 
-const test_tools = [_]tool_dispatch.Tool{
+pub const test_tools = [_]tool_dispatch.Tool{
     builtin_tools.glob_files,
     builtin_tools.grep_files,
     builtin_tools.read_file,
@@ -160,11 +161,9 @@ const test_tools = [_]tool_dispatch.Tool{
     builtin_tools.web_fetch,
     builtin_tools.web_search,
     builtin_tools.shell,
-    builtin_tools.capability_search,
-    builtin_tools.skill,
     builtin_tools.install_skill,
     builtin_tools.subagent,
-    builtin_tools.mcp_select_tool,
+    builtin_tools.toolbox,
     builtin_tools.ask_user_question,
     builtin_tools.read_tool_result,
 };
@@ -206,6 +205,8 @@ pub const FakeCompletion = struct {
     provider_failure_cause: ?types.ProviderFailureCause = null,
     provider_failure_detail: ?[]const u8 = null,
     finish_reason: ?types.ProviderFinishReason = null,
+    /// The provider's own stop reason, such as Gemini's MALFORMED_FUNCTION_CALL.
+    finish_reason_raw: []const u8 = "",
     omit_finish: bool = false,
     usage: types.Usage = .{},
     generation_id: ?[]const u8 = null,
@@ -213,6 +214,9 @@ pub const FakeCompletion = struct {
     cancel_before_output: bool = false,
     cancel_after_chunks: bool = false,
     cancel_during_tool_stream: bool = false,
+    /// Set while this request is on the wire, before its answer, as when
+    /// the user signs in during a resend.
+    set_before_answer: ?*std.atomic.Value(bool) = null,
 };
 
 /// Fails a model request whose prompt ends on an assistant message, and one the
@@ -244,6 +248,8 @@ pub const FakeGateway = struct {
     request_bodies: std.ArrayList([]u8) = .empty,
     request_models: std.ArrayList([]u8) = .empty,
     request_api_keys: std.ArrayList([]u8) = .empty,
+    /// The Vercel team each request sent, null for none.
+    request_teams: std.ArrayList(?[]u8) = .empty,
     request_session_ids: std.ArrayList(?[]u8) = .empty,
     admitted_requests: usize = 0,
     observe_request: ?*const fn (agent_stream_provider.ModelRequest) anyerror!void = null,
@@ -262,6 +268,8 @@ pub const FakeGateway = struct {
         self.request_models.deinit(self.alloc);
         for (self.request_api_keys.items) |api_key| self.alloc.free(api_key);
         self.request_api_keys.deinit(self.alloc);
+        for (self.request_teams.items) |team| if (team) |value| self.alloc.free(value);
+        self.request_teams.deinit(self.alloc);
         for (self.request_session_ids.items) |session_id| {
             if (session_id) |id| self.alloc.free(id);
         }
@@ -288,12 +296,16 @@ pub const FakeGateway = struct {
         try self.request_bodies.append(self.alloc, try self.alloc.dupe(u8, payload));
         try self.request_models.append(self.alloc, try self.alloc.dupe(u8, request.model));
         try self.request_api_keys.append(self.alloc, try self.alloc.dupe(u8, request.credential.secret() orelse ""));
+        const team = if (request.credential.tenant()) |value| try self.alloc.dupe(u8, value) else null;
+        errdefer if (team) |value| self.alloc.free(value);
+        try self.request_teams.append(self.alloc, team);
         const session_id = if (request.session_id) |id| try self.alloc.dupe(u8, id) else null;
         errdefer if (session_id) |id| self.alloc.free(id);
         try self.request_session_ids.append(self.alloc, session_id);
         if (self.index >= self.completions.len) return error.TestUnexpectedGatewayRequest;
         const completion = self.completions[self.index];
         self.index += 1;
+        if (completion.set_before_answer) |flag| flag.store(true, .seq_cst);
         if (completion.pre_admission_error) |err| return err;
         try request.admission.admit();
         self.admitted_requests += 1;
@@ -342,6 +354,7 @@ pub const FakeGateway = struct {
             const failure_request_shape = if (completion.failure_request_shape) |value| try alloc.dupe(u8, value) else null;
             return .{ .failed = .{
                 .kind = gateway_client.httpFailureKind(alloc, .fromHttpStatus(completion.status), err_body),
+                .http_status = completion.status,
                 .detail = err_body,
                 .retry_after_seconds = completion.retry_after_seconds,
                 .diagnostics = .{
@@ -365,6 +378,7 @@ pub const FakeGateway = struct {
                     null
                 else
                     completion.finish_reason orelse if (completion.tool_calls.len > 0) .tool_calls else .stop,
+                .finish_reason_raw = types.ProviderFinishRaw.init(completion.finish_reason_raw),
                 .usage = completion.usage,
                 .generation_id = completion.generation_id,
             },
@@ -455,6 +469,7 @@ pub const FakeAgentRuntimeDeps = struct {
     tool_registry: tool_dispatch.Registry = test_tool_registry,
     context_registry: ?context_contract.Registry = null,
     context_enabled: bool = false,
+    image_folder_rules: bool = false,
     root_permission_mode: ?PermissionMode = null,
     cache_warmer: ?*cache_warmer.Warmer = null,
     /// Records each usage the agent loop saves, as a saved session would.
@@ -518,7 +533,7 @@ pub const FakeAgentRuntimeDeps = struct {
     permission_waiting: ?*std.atomic.Value(bool) = null,
     permission_release: ?*std.atomic.Value(bool) = null,
     tool_execution_override: ?ToolExecutionOverride = null,
-    catalog_unavailable: bool = false,
+    catalog_failure: ?model_catalog.FailureCategory = null,
     permission_failure_names: []const []const u8 = &.{},
     permission_index: usize = 0,
     exec_plans: []const FakeExecPlan = &.{},
@@ -544,7 +559,7 @@ pub const FakeAgentRuntimeDeps = struct {
     last_execute_grant_count: usize = 0,
     command_complete_count: usize = 0,
     route_recovery_clear_count: usize = 0,
-    full_detail_records: std.ArrayList(types.SemanticNotice) = .empty,
+    model_calls: std.ArrayList(types.ModelCallRecord) = .empty,
     finish_event_count: usize = 0,
     finish_event_attempt_count: usize = 0,
     finish_event_error: ?anyerror = null,
@@ -553,6 +568,10 @@ pub const FakeAgentRuntimeDeps = struct {
     finalized_outcome: ?types.TurnPresentationOutcome = null,
     finalized_disposition: ?types.ProviderCompletionDisposition = null,
     finalization_error: ?anyerror = null,
+    /// When set, the host stops steering-detached commands, and this is
+    /// its answer to whether an interrupted turn was cancelled by the user.
+    /// Both hooks write to `log`.
+    steering_detached_explicit_cancel: ?bool = null,
     terminal_lease_cleanup_ids: std.ArrayList([]u8) = .empty,
     terminal_lease_cleanup_errors: []const ?anyerror = &.{},
     terminal_lease_cleanup_index: usize = 0,
@@ -626,12 +645,25 @@ pub const FakeAgentRuntimeDeps = struct {
     cancel_on_capability_resolution: ?*std.atomic.Value(bool) = null,
     cancel_after_capability_resolution: ?*std.atomic.Value(bool) = null,
     credential_refresh_tokens: []const []const u8 = &.{},
+    /// The team each refreshed token comes with, by index; past its end, or
+    /// null, the refresh keeps the request's team.
+    credential_refresh_teams: []const ?[]const u8 = &.{},
     credential_refresh_index: usize = 0,
     credential_refresh_sources: std.ArrayList(types.CredentialSource) = .empty,
     credential_refresh_modes: std.ArrayList(runtime_deps.CredentialRefreshMode) = .empty,
+    /// The rejected token each refresh carried, in the order of the modes.
+    credential_refresh_rejected: std.ArrayList(?[]u8) = .empty,
     credential_refresh_error: ?anyerror = null,
     /// A forced refresh finds nothing, as when the refresh token is rejected.
     credential_refresh_fail_force: bool = false,
+    /// The login a `.stored` read finds, as another fx process saves one;
+    /// those reads are counted here and nowhere else.
+    credential_stored_token: ?[]const u8 = null,
+    credential_stored_reads: usize = 0,
+    /// Only this many forced refreshes work; later ones find nothing, as
+    /// when the refresh token is revoked during the turn.
+    credential_refresh_force_successes: ?usize = null,
+    credential_refresh_force_count: usize = 0,
     last_credential_refresh_expected_account: ?[]u8 = null,
     enable_interactive_notices: bool = false,
     enable_recovery_checkpoint: bool = false,
@@ -683,8 +715,8 @@ pub const FakeAgentRuntimeDeps = struct {
         freeStringList(self.alloc, &self.restored_prompts);
         for (self.interactive_notices.items) |notice| types.freeSemanticNotice(self.alloc, notice);
         self.interactive_notices.deinit(self.alloc);
-        for (self.full_detail_records.items) |notice| types.freeSemanticNotice(self.alloc, notice);
-        self.full_detail_records.deinit(self.alloc);
+        for (self.model_calls.items) |call| types.freeModelCallRecordStrings(self.alloc, call);
+        self.model_calls.deinit(self.alloc);
         freeStringList(self.alloc, &self.context_notices);
         self.route_recovery_statuses.deinit(self.alloc);
         freeStringList(self.alloc, &self.permission_names);
@@ -739,6 +771,8 @@ pub const FakeAgentRuntimeDeps = struct {
         freeStringList(self.alloc, &self.capability_queries);
         self.credential_refresh_sources.deinit(self.alloc);
         self.credential_refresh_modes.deinit(self.alloc);
+        for (self.credential_refresh_rejected.items) |token| if (token) |value| self.alloc.free(value);
+        self.credential_refresh_rejected.deinit(self.alloc);
         if (self.last_credential_refresh_expected_account) |value| self.alloc.free(value);
         for (self.recovery_checkpoints.items) |*checkpoint| checkpoint.deinit(self.alloc);
         self.recovery_checkpoints.deinit(self.alloc);
@@ -753,12 +787,15 @@ pub const FakeAgentRuntimeDeps = struct {
             .tool_activity_recorder = self.tool_activity_recorder,
             .context_registry = self.context_registry,
             .context_enabled = self.context_enabled,
+            .image_folder_rules = self.image_folder_rules,
             .snapshot_root_permission_mode = if (self.root_permission_mode != null)
                 snapshotRootPermissionMode
             else
                 null,
             .finalize_turn = finalizeTurn,
             .release_agent_terminal_lease = releaseAgentTerminalLease,
+            .turn_ends_by_explicit_cancel = if (self.steering_detached_explicit_cancel != null) turnEndsByExplicitCancel else null,
+            .stop_steering_detached_commands = if (self.steering_detached_explicit_cancel != null) stopSteeringDetachedCommands else null,
             .append_runtime_context = appendRuntimeContext,
             .append_static_context = appendStaticContext,
             .validate_tool_call = validateToolCall,
@@ -795,7 +832,7 @@ pub const FakeAgentRuntimeDeps = struct {
             .save_recovery_record = if (self.enable_recovery_record) saveRecoveryRecord else null,
             .available_model_capabilities = availableModelCapabilities,
             .resolve_model_capabilities = resolveModelCapabilities,
-            .model_catalog_unavailable = catalogUnavailable,
+            .model_catalog_failure = catalogFailure,
             .take_steering_boundary = if (self.steering_worker != null)
                 takeWorkerSteeringBoundary
             else if (self.steering_messages.len > 0 or
@@ -861,9 +898,9 @@ pub const FakeAgentRuntimeDeps = struct {
         return self.root_permission_mode.?;
     }
 
-    fn catalogUnavailable(raw: *anyopaque) bool {
+    fn catalogFailure(raw: *anyopaque) ?model_catalog.FailureCategory {
         const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
-        return self.catalog_unavailable;
+        return self.catalog_failure;
     }
 
     fn resolveModelCapabilities(raw: *anyopaque, _: Allocator, model: []const u8) !model_capabilities.Capabilities {
@@ -893,10 +930,18 @@ pub const FakeAgentRuntimeDeps = struct {
         return self.default_model_capabilities;
     }
 
-    fn refreshGatewayCredential(raw: *anyopaque, alloc: Allocator, source: types.CredentialSource, mode: runtime_deps.CredentialRefreshMode, expected_account_id: ?[]const u8) !?[]u8 {
+    fn refreshGatewayCredential(raw: *anyopaque, alloc: Allocator, source: types.CredentialSource, mode: runtime_deps.CredentialRefreshMode, expected_account_id: ?[]const u8, rejected_token: ?[]const u8) !?runtime_deps.RefreshedGatewayCredential {
         const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
+        if (mode == .stored) {
+            self.credential_stored_reads += 1;
+            const stored = self.credential_stored_token orelse return null;
+            if (rejected_token) |rejected| if (std.mem.eql(u8, stored, rejected)) return null;
+            return .{ .token = try alloc.dupe(u8, stored) };
+        }
         try self.credential_refresh_sources.append(self.alloc, source);
         try self.credential_refresh_modes.append(self.alloc, mode);
+        try self.credential_refresh_rejected.ensureUnusedCapacity(self.alloc, 1);
+        self.credential_refresh_rejected.appendAssumeCapacity(if (rejected_token) |token| try self.alloc.dupe(u8, token) else null);
         if (self.last_credential_refresh_expected_account) |value| self.alloc.free(value);
         self.last_credential_refresh_expected_account = if (expected_account_id) |account_id|
             try self.alloc.dupe(u8, account_id)
@@ -904,10 +949,24 @@ pub const FakeAgentRuntimeDeps = struct {
             null;
         if (self.credential_refresh_error) |err| return err;
         if (self.credential_refresh_fail_force and mode == .force) return null;
+        if (mode == .force) if (self.credential_refresh_force_successes) |limit| {
+            if (self.credential_refresh_force_count >= limit) return null;
+            self.credential_refresh_force_count += 1;
+        };
         if (self.credential_refresh_index >= self.credential_refresh_tokens.len) return null;
-        const token = self.credential_refresh_tokens[self.credential_refresh_index];
+        const index = self.credential_refresh_index;
+        const token = self.credential_refresh_tokens[index];
         self.credential_refresh_index += 1;
-        return try alloc.dupe(u8, token);
+        const team: ?[]const u8 = if (index < self.credential_refresh_teams.len) self.credential_refresh_teams[index] else null;
+        const token_copy = try alloc.dupe(u8, token);
+        errdefer alloc.free(token_copy);
+        const team_copy = if (team) |value| try alloc.dupe(u8, value) else null;
+        errdefer if (team_copy) |value| alloc.free(value);
+        return .{
+            .token = token_copy,
+            .gateway_team = team_copy,
+            .gateway_team_label = if (team) |value| try alloc.dupe(u8, value) else null,
+        };
     }
 
     fn takeSteeringBoundary(
@@ -995,6 +1054,18 @@ pub const FakeAgentRuntimeDeps = struct {
         self.finalized_disposition = disposition;
         try self.record("event:turn_finished", .{});
         if (self.finalization_error) |err| return err;
+    }
+
+    fn turnEndsByExplicitCancel(raw: *anyopaque, _: u64) bool {
+        const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
+        self.record("hook:explicit_cancel", .{}) catch {};
+        return self.steering_detached_explicit_cancel.?;
+    }
+
+    fn stopSteeringDetachedCommands(raw: *anyopaque, turn_id: u64) !void {
+        const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
+        try std.testing.expectEqual(self.finalized_turn_id, turn_id);
+        try self.record("hook:stop_steering_detached", .{});
     }
 
     fn releaseAgentTerminalLease(raw: *anyopaque, session_id: []const u8) !void {
@@ -1120,7 +1191,10 @@ pub const FakeAgentRuntimeDeps = struct {
                 advertised_dynamic_tool_names,
             );
         }
-        try self.permission_names.append(self.alloc, try self.alloc.dupe(u8, call.name));
+        // The name the rules decide: a toolbox open or search is decided as
+        // the tool it replaced.
+        const permission_name = if (call.toolbox_lookup) |lookup| lookup.permission else call.name;
+        try self.permission_names.append(self.alloc, try self.alloc.dupe(u8, permission_name));
         try self.permission_call_ids.append(self.alloc, try self.alloc.dupe(u8, call.id));
         try self.permission_user_intent_contexts.append(
             self.alloc,
@@ -1655,11 +1729,11 @@ pub const FakeAgentRuntimeDeps = struct {
         defer worker_runtime.freeWorkerEvent(std.heap.c_allocator, event);
         if (self.steering_worker) |worker| try worker.pushEvent(self.alloc, event);
         switch (event) {
-            .full_detail_record => |notice| {
-                const owned = try types.dupeSemanticNotice(self.alloc, notice);
-                errdefer types.freeSemanticNotice(self.alloc, owned);
-                try self.full_detail_records.append(self.alloc, owned);
-                try self.record("full_detail_record:{s}:{s}", .{ notice.topic, notice.body });
+            .model_call => |call| {
+                const owned = try types.dupeModelCallRecord(self.alloc, call);
+                errdefer types.freeModelCallRecordStrings(self.alloc, owned);
+                try self.model_calls.append(self.alloc, owned);
+                try self.record("model_call:{s}:{s}", .{ @tagName(call.outcome), call.model });
             },
             .open_model_picker => try self.record("event:open_model_picker", .{}),
             .clear_route_recovery_status => {
@@ -2172,6 +2246,29 @@ pub fn expectGatewayPromptFinalUserText(gateway: *const FakeGateway, index: usiz
         return;
     }
     return error.TestExpectedPromptMessageMissing;
+}
+
+/// Fails unless every message of `previous_body`'s prompt opens `next_body`'s
+/// prompt, byte for byte and in order: the next request extends the previous
+/// one, so the provider's prompt cache still covers all of it.
+pub fn expectPromptExtends(previous_body: []const u8, next_body: []const u8) !void {
+    const alloc = std.testing.allocator;
+    var previous = try std.json.parseFromSlice(std.json.Value, alloc, previous_body, .{});
+    defer previous.deinit();
+    var next = try std.json.parseFromSlice(std.json.Value, alloc, next_body, .{});
+    defer next.deinit();
+    const previous_prompt = previous.value.object.get("prompt").?.array.items;
+    const next_prompt = next.value.object.get("prompt").?.array.items;
+    try std.testing.expect(next_prompt.len >= previous_prompt.len);
+    for (previous_prompt, next_prompt[0..previous_prompt.len]) |earlier, later| {
+        var earlier_bytes: std.Io.Writer.Allocating = .init(alloc);
+        defer earlier_bytes.deinit();
+        try std.json.Stringify.value(earlier, .{}, &earlier_bytes.writer);
+        var later_bytes: std.Io.Writer.Allocating = .init(alloc);
+        defer later_bytes.deinit();
+        try std.json.Stringify.value(later, .{}, &later_bytes.writer);
+        try std.testing.expectEqualStrings(earlier_bytes.written(), later_bytes.written());
+    }
 }
 
 pub fn countText(hooks: *const FakeAgentRuntimeDeps, needle: []const u8) usize {

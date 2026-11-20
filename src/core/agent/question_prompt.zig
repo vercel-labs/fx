@@ -65,6 +65,9 @@ pub const OwnedQuestionOption = struct {
 
 pub const OwnedQuestionEntry = struct {
     question: []const u8,
+    /// The question and descriptions are Markdown; see
+    /// `types.QuestionBatchEntry.markdown`.
+    markdown: bool = false,
     submission: @FieldType(types.QuestionBatchEntry, "submission") = .none,
     submission_buffer: ?[]u8 = null,
     options: std.ArrayList(OwnedQuestionOption) = .empty,
@@ -94,6 +97,7 @@ pub const OwnedQuestionEntry = struct {
 
 pub const EntryProjection = struct {
     question: []const u8,
+    question_markdown: bool = false,
     options: []const OwnedQuestionOption,
     choice_index: usize,
     freeform_buffer: []const u8,
@@ -140,6 +144,7 @@ pub const QuestionPrompt = struct {
             const entry = self.entries.items[current_index];
             break :blk .{
                 .question = entry.question,
+                .question_markdown = entry.markdown,
                 .options = entry.options.items,
                 .choice_index = entry.choice_index,
                 .freeform_buffer = entry.freeform_buffer.items,
@@ -265,6 +270,7 @@ pub const QuestionPrompt = struct {
 
             self.entries.appendAssumeCapacity(.{
                 .question = q_copy,
+                .markdown = incoming.markdown,
                 .options = opts,
                 .submission = incoming.submission,
                 .choice_index = if (incoming.submission == .input) @intCast(incoming.options.len) else 0,
@@ -277,6 +283,7 @@ pub const QuestionPrompt = struct {
         if (self.entries.items.len != entries.len) return false;
         for (self.entries.items, entries) |owned, incoming| {
             if (owned.submission != incoming.submission) return false;
+            if (owned.markdown != incoming.markdown) return false;
             const has_freeform = switch (incoming.submission) {
                 .none => append_freeform,
                 .input => true,
@@ -559,7 +566,11 @@ pub const QuestionPrompt = struct {
         if (!self.isFreeformSelected()) return;
         var entry = &self.entries.items[self.current_index];
         entry.freeform_preferred_column = null;
-        const start = text_boundaries.logicalLineStart(entry.freeform_buffer.items, entry.freeform_cursor);
+        const line_start = text_boundaries.logicalLineStart(entry.freeform_buffer.items, entry.freeform_cursor);
+        const start = if (entry.freeform_cursor == line_start and line_start > 0)
+            line_start - 1
+        else
+            line_start;
         _ = edit_contract.deleteRange(&entry.freeform_buffer, &entry.freeform_cursor, start, entry.freeform_cursor);
     }
 
@@ -1180,6 +1191,30 @@ test "question prompt syncFrom is idempotent for identical payloads" {
     try std.testing.expectEqual(@as(u8, 1), currentChoiceIndex(&prompt));
 }
 
+test "question prompt carries the markdown mark and replaces a prompt that differs in it" {
+    var prompt = QuestionPrompt{};
+    defer prompt.deinit(std.testing.allocator);
+    const options = [_]types.QuestionOption{
+        .{ .label = "Yes", .description = null },
+        .{ .label = "No", .description = null },
+    };
+    const plain = [_]types.QuestionBatchEntry{.{ .question = "Use **this**?", .options = &options }};
+    const markdown = [_]types.QuestionBatchEntry{.{ .question = "Use **this**?", .markdown = true, .options = &options }};
+
+    try prompt.syncFrom(std.testing.allocator, &plain);
+    try std.testing.expect(!prompt.projection().?.current_entry.?.question_markdown);
+    prompt.moveChoice(1);
+
+    try prompt.syncFrom(std.testing.allocator, &markdown);
+    try std.testing.expect(prompt.projection().?.current_entry.?.question_markdown);
+    try std.testing.expectEqual(@as(u8, 0), currentChoiceIndex(&prompt));
+
+    // The same payload again leaves the prompt as it is.
+    prompt.moveChoice(1);
+    try prompt.syncFrom(std.testing.allocator, &markdown);
+    try std.testing.expectEqual(@as(u8, 1), currentChoiceIndex(&prompt));
+}
+
 test "syncFrom appends freeform slot to every entry" {
     var prompt = QuestionPrompt{};
     defer prompt.deinit(std.testing.allocator);
@@ -1450,6 +1485,17 @@ test "question freeform applies word and logical line deletions" {
     prompt.freeformDeleteToLineEnd();
     try std.testing.expectEqualStrings("alphabeta", prompt.entries.items[0].freeform_buffer.items);
     try std.testing.expectEqual(@as(usize, "alpha".len), prompt.entries.items[0].freeform_cursor);
+
+    prompt.clearFreeformDraft("test_cleanup");
+    try std.testing.expectEqual(
+        FreeformInsertResult.inserted,
+        try prompt.insertFreeformSlice(std.testing.allocator, "alpha\nbeta", 64),
+    );
+    for ([_][]const u8{ "alpha\n", "alpha", "", "" }) |expected| {
+        prompt.freeformDeleteToLineStart();
+        try std.testing.expectEqualStrings(expected, prompt.entries.items[0].freeform_buffer.items);
+        try std.testing.expectEqual(expected.len, prompt.entries.items[0].freeform_cursor);
+    }
 }
 
 test "question freeform word deletion keeps preceding characters intact" {

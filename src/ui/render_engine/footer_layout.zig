@@ -36,6 +36,17 @@ pub fn reservedBaseRows(input_visible: bool, composer_top_chrome_rows: u16) u16 
     return if (input_visible) 2 +| composer_top_chrome_rows else 3;
 }
 
+/// Ctrl+O's footer is its keys alone, on the bottom row, under one blank
+/// row that sets them apart from the page.
+pub const transcript_viewer_rows: u16 = 1;
+pub const transcript_viewer_gap_rows: u16 = 1;
+
+/// `reservedBaseRows` for the footer on screen, which Ctrl+O shrinks to its
+/// keys.
+pub fn surfaceBaseRows(transcript_viewer: bool, input_visible: bool, composer_top_chrome_rows: u16) u16 {
+    return if (transcript_viewer) transcript_viewer_rows else reservedBaseRows(input_visible, composer_top_chrome_rows);
+}
+
 pub fn resolve(input: Input) FooterRows {
     if (input.allocated_rows) |allocated_rows| {
         return resolveAllocated(input, allocated_rows);

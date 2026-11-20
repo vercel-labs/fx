@@ -5,6 +5,7 @@ import json
 import os
 import pathlib
 import re
+import shlex
 import shutil
 import stat
 import sys
@@ -51,15 +52,21 @@ USE_FLAGS = (
     f"-passes={PROFILE_PREPARATION_PASSES},default<O2>,mergefunc",
 )
 
-# Each outliner input first goes through `ir_size.py expand-constant-exprs`
-# and `ir_size.py swap-compares`, and each output through `ir_size.py
-# check-outlined`: the outliner can fold a constant nested in a constant
-# expression into a parameter that carries a different constant, and it can
-# pass a greater-than comparison's operands in the wrong order (see
-# ir_size.py).
+# Each outliner input first goes through `ir_size.py expand-constant-exprs`,
+# `ir_size.py swap-compares`, and `ir_size.py widen-constants`, and each
+# output through `ir_size.py check-outlined`: the outliner can fold a constant
+# nested in a constant expression into a parameter that carries a different
+# constant, pass a greater-than comparison's operands in the wrong order, and
+# replace the constant an exit returns with a parameter (see ir_size.py).
 IR_OUTLINER_FLAGS = (
     "-passes=iroutliner",
 )
+
+# The outliner can also leave an outlined function's output stores where
+# nothing reaches them (`ir_size.py dropped-outputs`). Each round marks the
+# callers of such functions `nooutline` and outlines again from the same
+# input; a function still found after this many rounds fails the build.
+IR_OUTLINER_ROUNDS = 4
 
 # The platform adds the symbols that stay external (`public_api_flags`).
 OUTLINE_CLEANUP_FLAGS = (
@@ -103,6 +110,9 @@ ARTIFACT_LAYOUTS = {
         "approval-review-bench",
         "approval-review.bc",
     ),
+    # Linux only: scripts/pgso/unit_tests.py runs the unit tests on
+    # transformed code.
+    "unit_tests": ("install-test", "fx-test", "unit-tests.bc"),
 }
 
 
@@ -376,9 +386,11 @@ def ir_size_argv(
     toolchain: Toolchain,
     command: str,
     source: pathlib.Path,
-    output: pathlib.Path,
+    output: pathlib.Path | None,
     options: Sequence[str] = (),
 ) -> tuple[str, ...]:
+    """`output` is None for the commands that only read their input,
+    check-outlined and dropped-outputs."""
     return (
         sys.executable,
         str(toolchain.ir_size),
@@ -387,21 +399,7 @@ def ir_size_argv(
         *options,
         command,
         str(source),
-        str(output),
-    )
-
-
-def check_outlined_argv(
-    toolchain: Toolchain,
-    source: pathlib.Path,
-) -> tuple[str, ...]:
-    return (
-        sys.executable,
-        str(toolchain.ir_size),
-        "--libllvm",
-        str(toolchain.libllvm),
-        "check-outlined",
-        str(source),
+        *(() if output is None else (str(output),)),
     )
 
 
@@ -424,9 +422,15 @@ def profile_use_argv(
     paths: PipelinePaths,
     profile_path: pathlib.Path | None = None,
     output: pathlib.Path | None = None,
+    *,
+    production_flags: bool = False,
 ) -> tuple[str, ...]:
+    # A benchmark trained on its own workload uses the higher cold cutoff, so
+    # its IR keeps the functions that workload runs speed-shaped. The measured
+    # benchmark candidates pass `production_flags` to build the way fx does.
     profile = profile_path or paths.merged_profile
-    flags = USE_FLAGS if paths.selector == "fx" else BENCHMARK_USE_FLAGS
+    production = production_flags or paths.selector == "fx"
+    flags = USE_FLAGS if production else BENCHMARK_USE_FLAGS
     return (
         str(toolchain.opt),
         *flags,
@@ -475,12 +479,18 @@ def instrumented_run_argv(
 def candidate_object_argv(
     toolchain: Toolchain,
     paths: PipelinePaths,
+    *,
+    production_flags: bool = False,
 ) -> tuple[str, ...]:
-    # A second AArch64 outliner pass can fold sequences exposed by the first,
-    # and each size-optimized function saves and restores its callee-saved
-    # registers through a shared frame helper instead of inline. Keep
-    # benchmark artifacts on their established code-generation contract.
-    codegen_flags = FX_CODEGEN_FLAGS if paths.selector == "fx" else ()
+    # A second outliner pass can fold sequences exposed by the first. It runs
+    # wherever the outliner runs: AArch64, and cold code on Linux x86_64. On
+    # AArch64, each size-optimized function also saves and restores its
+    # callee-saved registers through a shared frame helper instead of inline.
+    # The measured benchmark candidates pass `production_flags` so the heavy
+    # gates measure the code generation fx ships. A benchmark trained on its
+    # own workload keeps the default code generation.
+    production = production_flags or paths.selector == "fx"
+    codegen_flags = FX_CODEGEN_FLAGS if production else ()
     return (
         str(toolchain.llc),
         "-filetype=obj",
@@ -491,6 +501,11 @@ def candidate_object_argv(
         "-o",
         str(paths.profile_use_object),
     )
+
+
+# A ReleaseSafe build of fx takes about 7 minutes on the PGSO runners and the
+# unit test executable up to about 13, so this only ends a build that hangs.
+ZIG_BUILD_TIMEOUT_S = 1800
 
 
 def build_control(
@@ -505,12 +520,45 @@ def build_control(
         ),
         cwd=spec.repo_root,
         env=zig_build_env(paths),
-        timeout_s=900,
+        timeout_s=ZIG_BUILD_TIMEOUT_S,
         log_path=paths.logs / "build-control.json",
     )
     _require_nonempty_file(paths.control_binary, "ReleaseSafe control")
     toolchain.platform.record_control_build(toolchain, result, paths)
     return paths.control_binary
+
+
+# Zig 0.17.1 writes `-femit-llvm-bc` after LLVM has optimized the module, but
+# PGSO instruments and optimizes the module Zig generated, which is what 0.17.0
+# wrote there. Only `--verbose-llvm-bc=PATH` still writes that module, and
+# `zig build` can't pass it to one step, so `pgso-ir` runs with `--verbose` and
+# the compile it printed runs again with the flag. With no binary to emit, that
+# compile stops before LLVM's passes.
+_VERBOSE_COMMAND = "info(verbose): "
+
+
+def unoptimized_bitcode_argv(build_output: str, bitcode: pathlib.Path) -> tuple[str, ...]:
+    """The compile `zig build pgso-ir --verbose` printed, changed to write the
+    module Zig generated to `bitcode` and nothing else."""
+    compiles = [
+        line.split(_VERBOSE_COMMAND, 1)[1]
+        for line in build_output.splitlines()
+        if _VERBOSE_COMMAND in line and " -femit-llvm-bc" in line
+    ]
+    if len(compiles) != 1:
+        raise PgsoError(f"pgso-ir must print one compile that emits LLVM bitcode, found {len(compiles)}")
+    argv = shlex.split(compiles[0])
+    if argv.count("-femit-llvm-bc") != 1 or argv.count("--listen=-") != 1:
+        raise PgsoError(f"unexpected pgso-ir compile: {compiles[0]}")
+    kept = [
+        argument
+        for argument in argv
+        if argument not in ("-femit-llvm-bc", "--listen=-", "-fno-emit-bin")
+        and not argument.startswith("-femit-bin")
+    ]
+    # Without `--listen=-`, `zig test` would run the tests it built.
+    no_exec = ("--test-no-exec",) if kept[1:2] == ["test"] else ()
+    return (*kept, *no_exec, "-fno-emit-bin", f"--verbose-llvm-bc={bitcode}")
 
 
 def emit_bitcode(
@@ -520,15 +568,45 @@ def emit_bitcode(
     *,
     expected_sha256: str | None = None,
 ) -> str:
-    run_checked(
-        zig_build_argv(toolchain, spec, paths, emit_ir=True),
+    build = run_checked(
+        (*zig_build_argv(toolchain, spec, paths, emit_ir=True), "--verbose"),
         cwd=spec.repo_root,
         env=zig_build_env(paths),
-        timeout_s=900,
+        timeout_s=ZIG_BUILD_TIMEOUT_S,
         log_path=paths.logs / "emit-bitcode.json",
     )
+    if build.stdout_truncated or build.stderr_truncated:
+        raise PgsoError("pgso-ir output was truncated before its compile command")
+    compile_argv = unoptimized_bitcode_argv(build.stdout + "\n" + build.stderr, paths.bitcode)
+    # A compile is not byte-identical to the one before it: the path of the
+    # builtin.zig Zig generates, which the debug info records, changes on
+    # every fresh compile. A later emit in the same run must match the first,
+    # so the module is kept under the hash of the optimized one `pgso-ir`
+    # installed, which a `zig build` cache hit installs again unchanged.
+    _require_nonempty_file(paths.bitcode, "pgso-ir bitcode")
+    kept = paths.ir_cache / "pgso-unoptimized" / f"{sha256_file(paths.bitcode)}.bc"
+    # `pgso-ir` installed the optimized module here; it must not survive.
+    paths.bitcode.unlink()
+    if kept.is_file():
+        shutil.copyfile(kept, paths.bitcode)
+    else:
+        run_checked(
+            compile_argv,
+            cwd=spec.repo_root,
+            env=zig_build_env(paths),
+            timeout_s=ZIG_BUILD_TIMEOUT_S,
+            log_path=paths.logs / "emit-unoptimized-bitcode.json",
+        )
     _require_nonempty_file(paths.bitcode, "ReleaseSafe LLVM bitcode")
-    _require_bitcode_header(paths.bitcode)
+    # Zig's own writer never wraps; LLVM's wraps Darwin bitcode.
+    with paths.bitcode.open("rb") as stream:
+        if stream.read(4) != BITCODE_MAGICS[0]:
+            raise PgsoError(f"ReleaseSafe LLVM bitcode was not written by Zig: {paths.bitcode}")
+    if not kept.is_file():
+        kept.parent.mkdir(parents=True, exist_ok=True)
+        staged = kept.with_name(kept.name + ".staged")
+        shutil.copyfile(paths.bitcode, staged)
+        os.replace(staged, kept)
     # Every job derives instrumentation and profile use from this file, so
     # the helper attributes are part of the recorded bitcode identity.
     staged = paths.bitcode.with_name(paths.bitcode.name + ".staged")
@@ -1114,18 +1192,25 @@ def apply_profile(
     *,
     profile_path: pathlib.Path | None = None,
     no_outline_functions: pathlib.Path | None = None,
+    production_flags: bool = False,
 ) -> pathlib.Path:
     """Apply the profile, then outline and clean up the result.
 
     The functions listed in `no_outline_functions`, one per line, are marked
     `nooutline` first, so neither outliner moves their code into shared
-    helpers placed elsewhere.
+    helpers placed elsewhere. `production_flags` gives a benchmark the
+    production profile-use flags.
     """
     validate_bitcode_hash(paths.bitcode, expected_bitcode_sha256)
     profile = profile_path or paths.merged_profile
     _require_nonempty_file(profile, "merged profile")
     run_checked(
-        profile_use_argv(toolchain, paths, profile),
+        profile_use_argv(
+            toolchain,
+            paths,
+            profile,
+            production_flags=production_flags,
+        ),
         cwd=paths.root,
         env=os.environ.copy(),
         timeout_s=900,
@@ -1230,22 +1315,99 @@ def _outline_without_folded_constants(
         require_empty_stderr=True,
     )
     _require_bitcode_header(swapped)
+    widened = source.with_name(source.name + ".widened.bc")
     run_checked(
-        outline_ir_argv(toolchain, swapped, output),
+        ir_size_argv(toolchain, "widen-constants", swapped, widened),
         cwd=paths.root,
         env=os.environ.copy(),
         timeout_s=900,
-        log_path=paths.logs / f"outline-{name}.json",
+        log_path=paths.logs / f"widen-constants-{name}.json",
         require_empty_stderr=True,
     )
-    _require_nonempty_file(output, "outlined IR")
+    _require_bitcode_header(widened)
+    _outline_excluding_dropped_outputs(toolchain, paths, widened, output, name)
     run_checked(
-        check_outlined_argv(toolchain, output),
+        ir_size_argv(toolchain, "check-outlined", output, None),
         cwd=paths.root,
         env=os.environ.copy(),
         timeout_s=900,
         log_path=paths.logs / f"check-outlined-{name}.json",
         require_empty_stderr=True,
+    )
+
+
+def _outline_excluding_dropped_outputs(
+    toolchain: Toolchain,
+    paths: PipelinePaths,
+    source: pathlib.Path,
+    output: pathlib.Path,
+    name: str,
+) -> None:
+    """Outline `source` into `output`, and while the outliner drops an
+    outlined function's output stores, mark that function's callers
+    `nooutline` and outline `source` again.
+
+    Each round is logged in `outline-rounds-{name}.json`. The caller's
+    check-outlined fails on anything still dropped after the last round.
+    """
+    excluded: list[str] = []
+    excluded_list = paths.logs / f"outline-excluded-{name}.txt"
+    marked = source.with_name(source.name + ".excluded.bc")
+    rounds = []
+    candidate = source
+    for number in range(1, IR_OUTLINER_ROUNDS + 1):
+        run_checked(
+            outline_ir_argv(toolchain, candidate, output),
+            cwd=paths.root,
+            env=os.environ.copy(),
+            timeout_s=900,
+            log_path=paths.logs / f"outline-{name}-round-{number}.json",
+            require_empty_stderr=True,
+        )
+        _require_nonempty_file(output, "outlined IR")
+        result = run_checked(
+            ir_size_argv(toolchain, "dropped-outputs", output, None),
+            cwd=paths.root,
+            env=os.environ.copy(),
+            timeout_s=900,
+            log_path=paths.logs / f"dropped-outputs-{name}-round-{number}.json",
+            require_empty_stderr=True,
+        )
+        try:
+            summary = json.loads(result.stdout)
+        except json.JSONDecodeError as error:
+            raise PgsoError(f"dropped-outputs printed no JSON: {result.stdout!r}") from error
+        if (
+            not isinstance(summary, dict)
+            or not isinstance(summary.get("instances"), list)
+            or not isinstance(summary.get("callers"), list)
+            or not all(isinstance(caller, str) for caller in summary["callers"])
+        ):
+            raise PgsoError(f"dropped-outputs printed no instance list: {result.stdout!r}")
+        added = [caller for caller in summary["callers"] if caller not in excluded]
+        rounds.append({
+            "round": number,
+            "outlined_functions": summary.get("outlined_functions"),
+            "dropped_outputs": summary["instances"],
+            "excluded": added if number < IR_OUTLINER_ROUNDS else [],
+        })
+        if not summary["instances"] or not added or number == IR_OUTLINER_ROUNDS:
+            break
+        excluded.extend(added)
+        excluded_list.write_text("".join(f"{caller}\n" for caller in excluded), encoding="utf-8")
+        run_checked(
+            ir_size_argv(toolchain, "no-outline", source, marked, ("--functions", str(excluded_list))),
+            cwd=paths.root,
+            env=os.environ.copy(),
+            timeout_s=900,
+            log_path=paths.logs / f"no-outline-{name}-round-{number}.json",
+            require_empty_stderr=True,
+        )
+        _require_bitcode_header(marked)
+        candidate = marked
+    (paths.logs / f"outline-rounds-{name}.json").write_text(
+        json.dumps({"rounds": rounds, "excluded": excluded}, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
     )
 
 
@@ -1277,8 +1439,10 @@ def link_candidate(
     paths: PipelinePaths,
     *,
     require_release_safe_evidence: bool = True,
+    production_flags: bool = False,
 ) -> pathlib.Path:
     _require_nonempty_file(paths.profile_use_bitcode, "profile-use bitcode")
+    toolchain.platform.prepare_candidate_bitcode(toolchain, paths)
     run_checked(
         (
             str(toolchain.opt),
@@ -1298,7 +1462,11 @@ def link_candidate(
         verify_release_safe_ir(paths.profile_use_ir)
 
     run_checked(
-        candidate_object_argv(toolchain, paths),
+        candidate_object_argv(
+            toolchain,
+            paths,
+            production_flags=production_flags,
+        ),
         cwd=paths.root,
         env=os.environ.copy(),
         timeout_s=900,

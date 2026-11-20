@@ -5,6 +5,7 @@ const grok_session = @import("../core/auth/grok_session.zig");
 const model_catalog = @import("../core/gateway/model_catalog.zig");
 const gateway_provider = @import("../core/gateway/gateway_provider.zig");
 const io_mod = @import("../core/shared/io.zig");
+const testing_listener = @import("../core/shared/testing_listener.zig");
 const secret = @import("../core/auth/secret.zig");
 const types = @import("../core/shared/types.zig");
 const gateway_client = @import("client.zig");
@@ -197,8 +198,6 @@ const FetchOperation = struct {
     client_version: ?versions.Version = null,
 
     pub fn run(self: *@This()) !FetchResponse {
-        var client: std.http.Client = .{ .allocator = self.alloc, .io = io_mod.getIo() };
-        defer client.deinit();
         var auth_header: ?[]u8 = null;
         defer if (auth_header) |value| secret.zeroAndFree(self.alloc, value);
         var headers: std.http.Client.Request.Headers = .{
@@ -230,7 +229,7 @@ const FetchOperation = struct {
             extra_headers_buffer[extra_headers_len] = .{ .name = "x-grok-client-identifier", .value = "fx" };
             extra_headers_len += 1;
         }
-        const result = client.fetch(.{
+        const result = gateway_client.fetchOnOpenJob(.{
             .location = .{ .url = self.url },
             .method = .GET,
             .headers = headers,
@@ -753,16 +752,12 @@ const CatalogBodyFixture = struct {
 
     fn deinit(self: *@This()) void {
         if (!self.server_open) return;
-        const zio = self.io();
         self.stopping.store(true, .seq_cst);
         if (self.thread) |thread| {
-            const listener = std.Io.net.Stream{ .socket = self.server.socket };
-            listener.shutdown(zio, .both) catch {};
-            self.wakeAccept();
             thread.join();
             self.thread = null;
         }
-        self.server.deinit(zio);
+        self.server.deinit(self.io());
         self.server_open = false;
     }
 
@@ -774,24 +769,15 @@ const CatalogBodyFixture = struct {
         return self.server.socket.address.getPort();
     }
 
-    fn wakeAccept(self: *@This()) void {
-        var wake_io_backend: std.Io.Threaded = .init_single_threaded;
-        const zio = wake_io_backend.io();
-        const address = std.Io.net.IpAddress{ .ip4 = .loopback(self.port()) };
-        var stream = address.connect(zio, .{ .mode = .stream }) catch return;
-        stream.close(zio);
-    }
-
     fn run(self: *@This()) void {
         self.runFallible() catch |err| {
-            if (self.stopping.load(.seq_cst) and err == error.SocketNotListening) return;
             self.failure = err;
         };
     }
 
     fn runFallible(self: *@This()) !void {
         const zio = self.io();
-        var stream = try self.server.accept(zio);
+        var stream = (try testing_listener.acceptUnlessStopping(&self.server, zio, &self.stopping)) orelse return;
         defer stream.close(zio);
         if (self.stopping.load(.seq_cst)) return;
         var socket_buffer: [4096]u8 = undefined;
@@ -1002,4 +988,24 @@ test "Grok catalog adapter rejects oversized subscription bodies but tolerates u
     modalities_fixture.deinit();
     if (valid_fixture.failure) |err| return err;
     if (modalities_fixture.failure) |err| return err;
+}
+
+test "a Grok catalog fetch ends at its deadline during a lookup that hangs" {
+    const stuck_lookup_testing = @import("stuck_lookup_testing.zig");
+    var stuck = stuck_lookup_testing.StuckLookups.install();
+    defer gateway_client.waitForOwnClientOpenJobs() catch {};
+    defer stuck.deinit();
+    var never_cancelled = std.atomic.Value(bool).init(false);
+    const started = std.Io.Clock.Timestamp.now(io_mod.getIo(), .awake);
+    try std.testing.expectError(error.Timeout, fetchCatalogResponse(
+        std.testing.allocator,
+        "https://grok.stuck-lookup.test/v1/models",
+        "grok-key",
+        "user-example",
+        true,
+        null,
+        &never_cancelled,
+        std.Io.Clock.Timestamp.fromNow(io_mod.getIo(), .{ .clock = .awake, .raw = .fromMilliseconds(100) }),
+    ));
+    try std.testing.expect(stuck_lookup_testing.elapsedMsSince(started) < 1_000);
 }

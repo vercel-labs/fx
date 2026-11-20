@@ -227,6 +227,10 @@ test "runtime initInto preserves defaults without copying file picker scratch bu
     var expected: Runtime = .{};
     @memset(expected.picker.file_completion.raw_query[0..], 0xa5);
     @memset(expected.picker.file_completion.lookup_query[0..], 0xa5);
+    // The effort menu's options are undefined past `option_count`, so both
+    // get the same defined value instead of comparing undefined bytes.
+    @memset(expected.effort_menu.options[expected.effort_menu.option_count..], .auto);
+    @memset(actual.effort_menu.options[actual.effort_menu.option_count..], .auto);
 
     try std.testing.expectEqualDeep(expected, actual);
 }

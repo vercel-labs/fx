@@ -133,7 +133,11 @@ pub const State = struct {
 
     pub fn deleteToLineStart(self: *State) void {
         const slot = self.activeSlot() orelse return;
-        const start = text_boundaries.logicalLineStart(slot.draft.items, slot.cursor.*);
+        const line_start = text_boundaries.logicalLineStart(slot.draft.items, slot.cursor.*);
+        const start = if (slot.cursor.* == line_start and line_start > 0)
+            line_start - 1
+        else
+            line_start;
         _ = edit_contract.deleteRange(slot.draft, slot.cursor, start, slot.cursor.*);
     }
 
@@ -343,6 +347,15 @@ test "approval amendment applies word and logical line deletions to either draft
     amendment.deleteToLineEnd();
     try std.testing.expectEqualStrings("alphabeta", amendment.draftForChoice(0));
     try std.testing.expectEqual(@as(usize, "alpha".len), amendment.cursorForChoice(0));
+
+    amendment.discard(alloc, "test_reset");
+    amendment.begin(2);
+    try amendment.insertSlice(alloc, "alpha\nbeta");
+    for ([_][]const u8{ "alpha\n", "alpha", "", "" }) |expected| {
+        amendment.deleteToLineStart();
+        try std.testing.expectEqualStrings(expected, amendment.draftForChoice(2));
+        try std.testing.expectEqual(expected.len, amendment.cursorForChoice(2));
+    }
 }
 
 test "approval amendment deletion keeps terminal characters intact" {

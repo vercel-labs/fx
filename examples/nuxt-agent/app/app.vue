@@ -41,6 +41,6 @@ async function send() {
     <p role="status">{{ status }}</p>
     <label for="reply">Reply</label><br>
     <textarea id="reply" :value="reply" rows="12" cols="30" readonly />
-    <p><a href="https://github.com/vercel-labs/fx/blob/b9f8b733803f170d1a09cadf1bf5033e04bf44ed/examples/README.md#run-an-example">Code and setup</a></p>
+    <p><a href="https://github.com/vercel-labs/fx/blob/91ee71fe820940b986945c7a2e0d78aa537fe745/examples/README.md#run-an-example">Code and setup</a></p>
   </main>
 </template>

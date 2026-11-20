@@ -790,10 +790,24 @@ fn expectState(p: *Process, state: core.State) !void {
     return error.TestUnexpectedResult;
 }
 
+fn expectStderr(p: *Process, line: []const u8) !void {
+    for (0..200) |_| switch (try p.next(5_000)) {
+        .stderr => |bytes| if (std.mem.eql(u8, bytes, line)) return,
+        .timeout => return error.TestTimeout,
+        else => {},
+    };
+    return error.TestUnexpectedResult;
+}
+
 test "messages arrive, and a stop that closes stdin ends the server" {
     const argv = shell("printf '{\"jsonrpc\":\"2.0\",\"method\":\"notifications/message\"}\\n'; exec cat >/dev/null");
+    // `cat` exits as soon as stdin closes, but a busy machine can take longer
+    // than test_config's grace to run it, and then the stop sends SIGTERM. A
+    // long grace keeps SIGTERM out; a passing run returns when `cat` exits.
+    var config = test_config;
+    config.grace_ms = 5_000;
     var p: Process = undefined;
-    initTest(&p, &argv);
+    p.init(testing.io, testing.allocator, .{ .argv = &argv, .config = config, .poll_ms = 5, .max_line = 64 });
     defer p.deinit();
     try p.start();
     try testing.expectEqual(core.State.running, p.conn.state);
@@ -841,7 +855,9 @@ test "a server that ignores closed stdin gets SIGTERM, then SIGKILL if it ignore
     // The shell runs its TERM trap only once its `sleep` returns, so the one
     // that exits on SIGTERM gets a long window: a slow machine still sees it
     // exit before SIGKILL. The one that ignores SIGTERM keeps the short one.
-    inline for (.{ .{ "trap 'exit 0' TERM; while :; do sleep 0.02; done", false, 5_000 }, .{ "trap '' TERM; while :; do sleep 0.02; done", true, test_config.term_ms } }) |case| {
+    // Each says `ready` once its trap is set, so on a slow machine the stop
+    // cannot reach the shell before the trap does.
+    inline for (.{ .{ "trap 'exit 0' TERM; echo ready >&2; while :; do sleep 0.02; done", false, 5_000 }, .{ "trap '' TERM; echo ready >&2; while :; do sleep 0.02; done", true, test_config.term_ms } }) |case| {
         const argv = shell(case[0]);
         var config = test_config;
         config.term_ms = case[2];
@@ -849,6 +865,7 @@ test "a server that ignores closed stdin gets SIGTERM, then SIGKILL if it ignore
         p.init(testing.io, testing.allocator, .{ .argv = &argv, .config = config, .poll_ms = 5, .max_line = 64 });
         defer p.deinit();
         try p.start();
+        try expectStderr(&p, "ready");
         try p.stop();
         try expectState(&p, .stopped);
         try testing.expect(p.conn.term_sent);
@@ -1270,21 +1287,33 @@ fn openDescriptors() usize {
     return n;
 }
 
+/// Starts a server where only `limit` tasks can run, and checks that the
+/// start fails because a task can't run.
+fn startWithTaskLimit(limit: usize) !void {
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{ .concurrent_limit = .limited(limit) });
+    defer threaded.deinit();
+    // `cat` keeps stdout and stderr open until its stdin closes, so no task
+    // the start runs can end and free its place for the next one. A server
+    // that closes stdout at once ends the stdout reader early, and on a busy
+    // machine every task then runs.
+    const argv = shell("exec cat");
+    var p: Process = undefined;
+    p.init(threaded.io(), testing.allocator, .{ .argv = &argv, .config = test_config, .poll_ms = 5, .max_line = 64 });
+    // Before `threaded.deinit`, which waits for every task: a failed check
+    // must still stop the server, or its readers never end.
+    defer p.deinit();
+    // The backoff timer after the failed spawn can't run either.
+    p.start() catch |err| try testing.expectEqual(error.ConcurrencyUnavailable, err);
+    try testing.expectEqual(@as(?SpawnError, error.ConcurrencyUnavailable), p.spawn_error);
+}
+
 test "a start whose tasks can't all run closes each of the server's pipes once" {
     helper.start(testing.io);
     // One, two, then three tasks run: the stdout reader, then the stderr
     // reader, then the exit watcher can't start.
     for ([_]usize{ 1, 2, 3 }) |limit| {
-        var threaded: std.Io.Threaded = .init(testing.allocator, .{ .concurrent_limit = .limited(limit) });
-        defer threaded.deinit();
         const before = openDescriptors();
-        const argv = shell("exec cat >/dev/null");
-        var p: Process = undefined;
-        p.init(threaded.io(), testing.allocator, .{ .argv = &argv, .config = test_config, .poll_ms = 5, .max_line = 64 });
-        // The backoff timer after the failed spawn can't run either.
-        p.start() catch |err| try testing.expectEqual(error.ConcurrencyUnavailable, err);
-        try testing.expectEqual(@as(?SpawnError, error.ConcurrencyUnavailable), p.spawn_error);
-        p.deinit();
+        try startWithTaskLimit(limit);
         // A pipe closed twice would have hit unreachable; one never closed leaks.
         try testing.expectEqual(before, openDescriptors());
     }

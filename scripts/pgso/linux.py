@@ -32,6 +32,7 @@ from scripts.pgso.pipeline import (
     _decode_llvm_identifier,
     _defined_external_symbols,
     _require_nonempty_file,
+    ir_size_argv,
 )
 from scripts.pgso.runner import CommandResult, run_checked
 from scripts.pgso.toolchain import Toolchain, _capture
@@ -45,7 +46,6 @@ STARTUP_SCENARIOS = (
     "direct-help",
     "direct-version",
     "direct-status",
-    "direct-doctor",
     "direct-sessions",
 )
 ZIG_CC_LINK_FLAGS = ("-Wl,--gc-sections",)
@@ -366,6 +366,23 @@ def public_api_flags(toolchain: Toolchain, paths: PipelinePaths) -> tuple[str, .
     return (f"-internalize-public-api-file={api}",)
 
 
+def prepare_candidate_bitcode(toolchain: Toolchain, paths: PipelinePaths) -> None:
+    """Give each private fx function a symbol, so the symbol order can place it."""
+    if paths.selector != "fx":
+        return
+    named = paths.profile_use_bitcode.with_name(paths.profile_use_bitcode.name + ".named")
+    run_checked(
+        ir_size_argv(toolchain, "name-functions", paths.profile_use_bitcode, named),
+        cwd=paths.root,
+        env=os.environ.copy(),
+        timeout_s=300,
+        log_path=paths.logs / "name-functions.json",
+        require_empty_stderr=True,
+    )
+    _require_nonempty_file(named, "named-function bitcode")
+    named.replace(paths.profile_use_bitcode)
+
+
 def candidate_object_flags(paths: PipelinePaths) -> tuple[str, ...]:
     # lld orders whole sections, so each fx function needs its own.
     return ("-function-sections",) if paths.selector == "fx" else ()
@@ -482,6 +499,23 @@ def map_addresses(link_map: str, names: Sequence[str]) -> dict[str, int]:
     return found
 
 
+# An lld map line for a function section of `obj` that has no symbol: the
+# assembler names a private function's section `.text..L<name>`, with a
+# `.hot.` or `.unlikely.` prefix when the profile set one.
+def unnamed_function_sections(link_map: str, obj: pathlib.Path) -> list[str]:
+    """The function sections of `obj` in the lld map that have no symbol to order."""
+    marker = f"{obj}:("
+    unnamed = []
+    for line in link_map.splitlines():
+        start = line.find(marker)
+        if start < 0:
+            continue
+        section = line[start + len(marker):].rstrip().removesuffix(")")
+        if re.fullmatch(r"\.text(?:\.[a-z]+)?\.\.L.*", section):
+            unnamed.append(section)
+    return unnamed
+
+
 def check_applied_order(
     ordered: Sequence[str],
     found: Mapping[str, int],
@@ -566,7 +600,14 @@ def _link_ordered_candidate(toolchain: Toolchain, paths: PipelinePaths) -> None:
     if result.stdout_truncated:
         raise PgsoError("candidate linker output exceeded the capture limit")
     removed = removed_sections(result.stdout, paths.profile_use_object)
-    found = map_addresses(link_map.read_text(encoding="utf-8", errors="replace"), ordered)
+    map_text = link_map.read_text(encoding="utf-8", errors="replace")
+    unnamed = unnamed_function_sections(map_text, paths.profile_use_object)
+    if unnamed:
+        raise PgsoError(
+            f"{len(unnamed)} candidate function sections have no symbol, so the link order "
+            f"cannot place them: {unnamed[:3]}"
+        )
+    found = map_addresses(map_text, ordered)
     linker_removed = check_applied_order(ordered, found, removed)
     layout = {
         "linker": "ld.lld",
@@ -637,6 +678,8 @@ class Platform:
     # The architecture of LLVM's release build of the profile runtime.
     PROFILE_RUNTIME_TRIPLE: str
     SIZE_CEILING_MIB: float
+    # `llc` flags for every candidate object on this architecture.
+    CODEGEN_FLAGS: tuple[str, ...] = ()
 
     LIBLLVM_NAME: ClassVar[str] = LIBLLVM_NAME
     CONTROL_BUILD_FLAGS: ClassVar[tuple[str, ...]] = CONTROL_BUILD_FLAGS
@@ -650,13 +693,16 @@ class Platform:
     control_identity_from_evidence = staticmethod(control_identity_from_evidence)
     link_instrumented = staticmethod(link_instrumented)
     public_api_flags = staticmethod(public_api_flags)
-    candidate_object_flags = staticmethod(candidate_object_flags)
+    prepare_candidate_bitcode = staticmethod(prepare_candidate_bitcode)
     link_candidate_binary = staticmethod(link_candidate_binary)
     inspect_candidate = staticmethod(inspect_candidate)
     candidate_evidence = staticmethod(candidate_evidence)
 
     def check_host(self) -> str:
         return check_host(self.HOST_ARCH)
+
+    def candidate_object_flags(self, paths: PipelinePaths) -> tuple[str, ...]:
+        return (*self.CODEGEN_FLAGS, *candidate_object_flags(paths))
 
     def discover_tools(
         self, zig_path: pathlib.Path, clang: pathlib.Path
@@ -669,6 +715,8 @@ ARM64 = Platform(
     DISPLAY_NAME="Linux arm64",
     HOST_ARCH="aarch64",
     PROFILE_RUNTIME_TRIPLE="aarch64-unknown-linux-gnu",
+    # Linux arm64 candidates measure about 0.2 MiB larger than macOS arm64's
+    # and need the 0.250 MiB preferred headroom on top.
     SIZE_CEILING_MIB=7.000,
 )
 X86_64 = Platform(
@@ -676,7 +724,12 @@ X86_64 = Platform(
     DISPLAY_NAME="Linux x86_64",
     HOST_ARCH="x86_64",
     PROFILE_RUNTIME_TRIPLE="x86_64-unknown-linux-gnu",
-    # x86_64 code is larger: candidates have measured 7.654 to 7.804 MiB, and
-    # the 0.250 MiB preferred headroom needs a ceiling of at least 8.054 MiB.
-    SIZE_CEILING_MIB=8.250,
+    # x86_64 code is larger: candidates have measured 7.654 to 8.156 MiB, and
+    # the 0.250 MiB preferred headroom needs a ceiling of at least 8.406 MiB.
+    SIZE_CEILING_MIB=8.750,
+    # LLVM runs the machine outliner by default only on AArch64, where it
+    # outlines the functions compiled for size. On x86_64, outline only code
+    # the profile marks cold: code without profile data counts as hot, and the
+    # startup functions are `nooutline`.
+    CODEGEN_FLAGS=("-enable-machine-outliner=conservative-pgo",),
 )

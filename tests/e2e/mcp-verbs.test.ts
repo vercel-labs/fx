@@ -1,16 +1,18 @@
 import { afterEach, describe, expect, test } from "bun:test";
+import { processAlive as isRunning } from "./process-alive";
 import { chmodSync, existsSync, linkSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { runFx } from "../evals/eval-helpers";
-import { fakeGatewayFinalText, heldFakeGatewayFinalText, startFakeGateway, TmuxSession, tmuxAvailable } from "./tmux-helpers";
+import { logLines, onlySessionId } from "./saved-sessions";
+import { fakeGatewayFinalText, heldFakeGatewayFinalText, startDynamicFakeGateway, startFakeGateway, TmuxSession, tmuxAvailable } from "./tmux-helpers";
 
 // `fx mcp`. Sign-in is covered in mcp-auth.test.ts.
 
 const MODERN_FIXTURE = join(import.meta.dirname, "fixtures", "mcp-modern-stdio.mjs");
 
 let cleanup: string | null = null;
-let gateway: ReturnType<typeof startFakeGateway> | null = null;
+let gateway: ReturnType<typeof startFakeGateway> | ReturnType<typeof startDynamicFakeGateway> | null = null;
 let tui: TmuxSession | null = null;
 
 afterEach(async () => {
@@ -21,15 +23,6 @@ afterEach(async () => {
   if (cleanup) rmSync(cleanup, { recursive: true, force: true });
   cleanup = null;
 });
-
-function isRunning(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch {
-    return false;
-  }
-}
 
 function createRoot(profile?: unknown, project?: unknown) {
   const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-mcp-verbs-")));
@@ -375,7 +368,7 @@ describe("fx mcp", () => {
 
     const unknownVerb = await mcp(root, "nope");
     expect(unknownVerb.code).toBe(2);
-    expect(unknownVerb.stderr).toStartWith("'nope' isn't a fx mcp command.\nusage: fx mcp COMMAND\n");
+    expect(unknownVerb.stderr).toStartWith("'nope' isn't an fx mcp command.\nusage: fx mcp COMMAND\n");
     const badFlag = await mcp(root, "logout", "--json", "x");
     expect(badFlag.code).toBe(2);
     expect(badFlag.stderr).toBe("fx mcp logout: unknown flag --json\nusage: fx mcp logout NAME\n");
@@ -458,6 +451,25 @@ describe("/mcp in the shell", () => {
     await tui.waitForText("/mcp auth is now /mcp login NAME.", 10_000);
     expect(JSON.parse(readFileSync(root.profilePath, "utf8")).mcpServers.web).toEqual({ type: "http", url: "https://w.example/mcp" });
   }, 90_000);
+
+  test.skipIf(!tmuxAvailable())("/mcp add joins a backslash-newline in its arguments the way the shell does", async () => {
+    // Every shell reads `"a\<newline>b"` as `ab`, so that is the argument
+    // the saved server gets.
+    const root = createRoot();
+    gateway = startFakeGateway([], { models: [{ id: "openai/gpt-5", type: "language", tags: ["tool-use"] }] });
+    tui = await TmuxSession.create({
+      isolated: true,
+      cwd: root.workspace,
+      width: 120,
+      height: 40,
+      env: { ...root.env, FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl, FX_MODEL: "openai/gpt-5" },
+    });
+    await tui.waitForComposer(15_000);
+    await tui.pasteText('/mcp add probe -- /bin/echo "a\\\nb"');
+    await tui.sendKeys("Enter");
+    await tui.waitForText("Added probe to ~/.fx/mcp.json.", 10_000);
+    expect(JSON.parse(readFileSync(root.profilePath, "utf8")).mcpServers.probe).toEqual({ command: "/bin/echo", args: ["ab"] });
+  }, 60_000);
 
   test.skipIf(!tmuxAvailable())("a config change restarts only the server it changed, never freezes the shell, and a server runs one copy at a time", async () => {
     // `s` keeps running after its input closes and ignores SIGTERM, so fx
@@ -591,7 +603,19 @@ describe("/mcp in the shell", () => {
       env: { ...root.env, FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl, FX_MODEL: "openai/gpt-5" },
     });
     await tui.waitForComposer(15_000);
-    const servers = (body: string) => body.slice(body.lastIndexOf("<mcp_servers>"), body.lastIndexOf("</mcp_servers>"));
+    // Every string in a request, decoded, so the menu and notes read as the model reads them.
+    const strings = (value: unknown): string[] =>
+      typeof value === "string" ? [value]
+        : Array.isArray(value) ? value.flatMap(strings)
+        : value !== null && typeof value === "object" ? Object.values(value).flatMap(strings)
+        : [];
+    const text = (body: string) => strings(JSON.parse(body)).join("\n");
+    const menu = (body: string) => {
+      const all = text(body);
+      return all.slice(all.indexOf("<toolbox>"), all.indexOf("</toolbox>"));
+    };
+    // The toolbox's change note, as its MCP servers line.
+    const notedServers = (body: string) => /The toolbox now holds[\s\S]*?MCP servers: (.*)\n/.exec(text(body))?.[1] ?? "";
 
     // Another fx process writes the profile, as an agent's shell tool would.
     expect((await mcp(root, "add", "outside", "--", process.execPath, MODERN_FIXTURE)).code).toBe(0);
@@ -599,20 +623,97 @@ describe("/mcp in the shell", () => {
     await tui.sendText("first prompt");
     await tui.waitForText("first done", 15_000);
     expect(gateway.requests).toHaveLength(1);
-    expect(servers(gateway.requests[0]!.body)).toContain("fixture");
-    expect(servers(gateway.requests[0]!.body)).toContain("outside");
+    const firstMenu = menu(gateway.requests[0]!.body);
+    expect(firstMenu).toContain("- fixture");
+    expect(firstMenu).toContain("- outside");
     // The session runs it, so `/mcp list` reports it.
     await tui.sendText("/mcp list");
     await tui.waitForText(/outside +~\/\.fx\/mcp\.json +stdio/, 10_000);
 
-    // Removed the same way, it's gone by the next prompt.
+    // Removed the same way, it's gone by the next prompt. The menu stays as
+    // first sent, so nothing earlier requests sent changes, and a note names
+    // the servers toolbox holds now.
     expect((await mcp(root, "remove", "outside")).code).toBe(0);
     await tui.sendText("second prompt");
     await tui.waitForText("second done", 15_000);
     expect(gateway.requests).toHaveLength(2);
-    expect(servers(gateway.requests[1]!.body)).toContain("fixture");
-    expect(servers(gateway.requests[1]!.body)).not.toContain("outside");
+    expect(menu(gateway.requests[1]!.body)).toBe(firstMenu);
+    expect(notedServers(gateway.requests[1]!.body)).toBe("fixture");
   }, 90_000);
+
+  test.skipIf(!tmuxAvailable())("a change noted in a turn that compaction folds away is noted again, and the menu stays as first sent", async () => {
+    const root = createRoot({ mcpServers: { fixture: fixtureServer(), outside: fixtureServer() } });
+    let answered = 0;
+    const dynamic = startDynamicFakeGateway((raw: string) => {
+      const request = JSON.parse(raw);
+      if (request.tools?.length === 0 && request.toolChoice?.type === "none") return fakeGatewayFinalText("Turn 1\nIn between: none");
+      answered += 1;
+      return fakeGatewayFinalText(`done ${answered}`);
+    }, { models: [{ id: "openai/gpt-5", type: "language", tags: ["tool-use"] }] });
+    gateway = dynamic;
+    tui = await TmuxSession.create({
+      isolated: true,
+      cwd: root.workspace,
+      width: 120,
+      height: 40,
+      env: { ...root.env, FX_GATEWAY_BASE_URL: dynamic.baseUrl, FX_GATEWAY_CHAT_URL: dynamic.chatUrl, FX_MODEL: "openai/gpt-5" },
+    });
+    await tui.waitForComposer(15_000);
+    const strings = (value: unknown): string[] =>
+      typeof value === "string" ? [value]
+        : Array.isArray(value) ? value.flatMap(strings)
+        : value !== null && typeof value === "object" ? Object.values(value).flatMap(strings)
+        : [];
+    const text = (body: string) => strings(JSON.parse(body)).join("\n");
+    const menu = (body: string) => {
+      const all = text(body);
+      return all.slice(all.indexOf("<toolbox>"), all.indexOf("</toolbox>"));
+    };
+    const notedServers = (body: string) => [...text(body).matchAll(/The toolbox now holds[\s\S]*?MCP servers: (.*)\n/g)].map((match) => match[1]);
+    const agentBodies = () => dynamic.requests.map((request) => request.body)
+      .filter((body) => { const request = JSON.parse(body); return !(request.tools?.length === 0 && request.toolChoice?.type === "none"); });
+    // Each turn ends with its status line; the next prompt waits for it, so
+    // no keystroke lands while the turn is still finishing.
+    const prompt = async (words: string) => {
+      const turn = answered + 1;
+      await tui!.sendText(words);
+      const ended = new RegExp(`done ${turn}\\n\\s*\\d+s \\(↑`);
+      await tui!.waitForPane((pane) => ended.test(pane), 15_000);
+      await tui!.waitForComposer(15_000);
+    };
+    const compactions = () => logLines(root.home, onlySessionId(root.home)).filter((line) => line.kind === "compacted").length;
+
+    await prompt("first prompt");
+    const firstMenu = menu(agentBodies()[0]!);
+    expect(firstMenu).toContain("- fixture");
+    expect(firstMenu).toContain("- outside");
+    // The note telling the model that outside is gone goes in this turn.
+    expect((await mcp(root, "remove", "outside")).code).toBe(0);
+    await prompt("NOTED_TURN_PROMPT");
+    expect(notedServers(agentBodies()[1]!)).toEqual(["fixture"]);
+    // Four more turns, so the noted turn is older than the turns compaction keeps.
+    for (const n of [3, 4, 5, 6]) await prompt(`prompt ${n}`);
+
+    await tui.sendText("/compact");
+    for (let i = 0; i < 600 && compactions() === 0; i++) await Bun.sleep(25);
+    expect(compactions()).toBe(1);
+    await tui.waitForComposer(15_000);
+    await prompt("after compaction");
+    const after = agentBodies().at(-1)!;
+    // The noted turn was folded into the summary, and its note with it; the
+    // newer turns follow as sent.
+    const users = JSON.parse(after).prompt.filter((message: any) => message.role === "user")
+      .map((message: any) => typeof message.content === "string" ? message.content : message.content.map((part: any) => part.text ?? "").join(""));
+    expect(users[0]).toStartWith("<compacted_conversation>");
+    expect(users[0]).toContain("NOTED_TURN_PROMPT");
+    expect(users.slice(1, -1)).toEqual(["prompt 3", "prompt 4", "prompt 5", "prompt 6"]);
+    // The note rides the new prompt, after everything earlier requests sent.
+    expect(users.at(-1)).toStartWith("after compaction\n");
+    // The conversation keeps its menu, so fx tells the model again what the
+    // toolbox holds now.
+    expect(menu(after)).toBe(firstMenu);
+    expect(notedServers(after)).toEqual(["fixture"]);
+  }, 120_000);
 
   test.skipIf(!tmuxAvailable())("a prompt sent while a turn runs keeps the current servers, and the next prompt after the turn loads the change", async () => {
     // Only SIGTERM ends it: it never reads stdin, and never answers.
@@ -854,6 +955,25 @@ describe("/mcp in the shell", () => {
     expect(JSON.parse(readFileSync(root.profilePath, "utf8")).mcpServers.web).toBeUndefined();
     expect(await tui.captureFullScrollback()).not.toContain("Removed web");
   }, 90_000);
+
+  test.skipIf(!tmuxAvailable())("/mcp names HOME and writes nothing when HOME is not absolute", async () => {
+    // fx treats a relative HOME as unset, and the shell's /mcp must not build
+    // `.fx/mcp.json` against the workspace instead.
+    const root = createRoot();
+    gateway = startFakeGateway([], { models: [{ id: "openai/gpt-5", type: "language", tags: ["tool-use"] }] });
+    tui = await TmuxSession.create({
+      isolated: true,
+      cwd: root.workspace,
+      width: 120,
+      height: 40,
+      env: { ...root.env, HOME: "relative/home", FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl, FX_MODEL: "openai/gpt-5" },
+    });
+    await tui.waitForComposer(15_000);
+    await tui.sendText("/mcp add web https://w.example/mcp");
+    await tui.waitForText("/mcp: HOME is not set to an absolute path", 10_000);
+    expect(existsSync(join(root.workspace, ".fx"))).toBe(false);
+    expect(existsSync(join(root.workspace, "relative"))).toBe(false);
+  }, 60_000);
 });
 
 describe("fx ask", () => {
@@ -912,4 +1032,353 @@ describe("fx ask", () => {
     expect(ask.code).toBe(0);
     expect(ask.stderr).toContain(note);
   }, 60_000);
+});
+
+// `fx mcp add` and `remove` never save an entry that fx's own reader skips, and
+// never rewrite a profile whose servers key looks misspelled. The reader owns
+// the rules (src/core/mcp/project_config.zig); these tests check what the
+// person sees and that a refused command leaves the file byte for byte as it was.
+// A test named "guard: ..." holds on the code before the change.
+describe("fx mcp add and remove refuse what fx would skip", () => {
+  const PLAIN_HTTP = "fx uses plain http only for localhost, 127.0.0.1 and [::1]; use https";
+  const NEEDS_PORT = "a plain http address needs a port, such as http://localhost:8080/mcp";
+  const AUTHORIZATION = 'fx won\'t send its Authorization header; put the token in "bearer_token_env", or sign in with login';
+  const fixFor = (key: string, real: string) =>
+    `the key "${key}" looks like a misspelling of "${real}", so fx doesn't read it. Move its servers into "${real}", then delete "${key}", and run the command again`;
+
+  // createRoot keeps one folder to clean; a test with several roots would leak the earlier ones.
+  const earlier: string[] = [];
+  const fresh = (profile?: unknown, project?: unknown) => {
+    if (cleanup) earlier.push(cleanup);
+    cleanup = null;
+    return createRoot(profile, project);
+  };
+  afterEach(() => {
+    for (const dir of earlier.splice(0)) rmSync(dir, { recursive: true, force: true });
+  });
+
+  const bytesOf = (path: string): string | null => (existsSync(path) ? readFileSync(path, "utf8") : null);
+  const loaded = async (root: Root) => {
+    const list = await mcp(root, "list", "--json");
+    expect(list.code).toBe(0);
+    return (JSON.parse(list.stdout).servers as { name: string }[]).map((s) => s.name);
+  };
+
+  /** A profile of `filler` unrelated top-level keys, then `tail` (the keys that follow them). */
+  const bigProfile = (filler: number, tail: Record<string, unknown>) => {
+    const object: Record<string, unknown> = {};
+    for (let i = 0; i < filler; i++) object[`note${i}`] = i;
+    return JSON.stringify({ ...object, ...tail });
+  };
+
+  async function refused(root: Root, args: string[], why: string, file = "~/.fx/mcp.json", verb = "add", name = "web", path = root.profilePath) {
+    const before = bytesOf(path);
+    const ran = await mcp(root, verb, ...args);
+    expect(ran.stderr).toBe(`Couldn't ${verb} ${name} ${verb === "add" ? "to" : "from"} ${file}: ${why}.\n`);
+    expect(ran.stdout).toBe("");
+    expect(ran.code).toBe(1);
+    expect(bytesOf(path)).toBe(before);
+  }
+
+  test("add refuses plain http to a host that isn't localhost, 127.0.0.1 or [::1], says why, and leaves the file as it was", async () => {
+    const none = fresh();
+    await refused(none, ["--no-login", "web", "http://example.com/mcp"], PLAIN_HTTP);
+    expect(existsSync(none.profilePath)).toBe(false);
+
+    const root = fresh({ theme: "dark", mcpServers: { old: { command: "true" } } });
+    await refused(root, ["--no-login", "web", "http://example.com:8080/mcp"], PLAIN_HTTP);
+    await refused(root, ["--no-login", "web", "http://localhost.:8080/mcp"], PLAIN_HTTP);
+    await refused(root, ["--no-login", "web", "http://127.0.0.2:8080/mcp"], PLAIN_HTTP);
+    expect(await loaded(root)).toEqual(["old"]);
+  }, 120_000);
+
+  test("add refuses plain http to localhost without a port, and says a port is needed", async () => {
+    const root = fresh({ mcpServers: { old: { command: "true" } } });
+    await refused(root, ["--no-login", "web", "http://localhost/mcp"], NEEDS_PORT);
+    await refused(root, ["--no-login", "web", "http://127.0.0.1/mcp"], NEEDS_PORT);
+    await refused(root, ["--no-login", "web", "http://[::1]/mcp"], NEEDS_PORT);
+  }, 120_000);
+
+  test("add refuses an address with a user name or password, a #fragment, or no host, each for its own reason", async () => {
+    const root = fresh({ mcpServers: { old: { command: "true" } } });
+    await refused(root, ["--no-login", "web", "https://user:secret@x.example/mcp"], 'its "url" has a user name or password in it; remove it');
+    await refused(root, ["--no-login", "web", "https://x.example/mcp#part"], 'its "url" has a #fragment; remove it');
+    await refused(root, ["--no-login", "web", "https:///mcp"], 'its "url" has no host name');
+    // The same entries in .mcp.json get the same reasons.
+    const project = fresh(undefined, { mcpServers: { old: { command: "true" } } });
+    await refused(project, ["--no-login", "--project", "web", "http://example.com/mcp"], PLAIN_HTTP, ".mcp.json", "add", "web", project.projectPath);
+  }, 120_000);
+
+  test("add refuses an Authorization header for the profile, in any spelling, with the reader's words", async () => {
+    const root = fresh({ mcpServers: { old: { command: "true" } } });
+    for (const header of ["Authorization=Bearer abc", "authorization=Bearer abc", "AUTHORIZATION=Bearer abc"]) {
+      await refused(root, ["--no-login", "authd", "https://x.example/mcp", "--header", header], AUTHORIZATION, "~/.fx/mcp.json", "add", "authd");
+    }
+  }, 120_000);
+
+  test("add refuses headers and variables the reader would skip: reserved, duplicate, badly named, or a malformed ${", async () => {
+    const root = fresh({ mcpServers: { old: { command: "true" } } });
+    const url = "https://x.example/mcp";
+    await refused(root, ["--no-login", "web", url, "--header", "Host=a"], 'its "headers" isn\'t valid');
+    await refused(root, ["--no-login", "web", url, "--header", "X-A=1", "--header", "x-a=2"], 'its "headers" isn\'t valid');
+    await refused(root, ["--no-login", "web", url, "--header", "Bad Header=1"], 'its "headers" isn\'t valid');
+    await refused(root, ["--no-login", "web", url, "--header", "X-K=${"], "a ${...} in it isn't valid");
+    await refused(root, ["--no-login", "web", url, "--header", "X-K=${1X}"], "a ${...} in it isn't valid");
+    await refused(root, ["--env", "K=${", "web", "--", "node", "server.js"], "a ${...} in it isn't valid");
+  }, 120_000);
+
+  test("guard: add takes an Authorization header for --project, as .mcp.json allows it", async () => {
+    const root = fresh(undefined, { mcpServers: {} });
+    const added = await mcp(root, "add", "--no-login", "--project", "authd", "https://x.example/mcp", "--header", "Authorization=Bearer abc");
+    expect(added.stderr).toBe("");
+    expect(added.code).toBe(0);
+    expect(added.stdout).toBe("Added authd to .mcp.json.\n");
+    expect(JSON.parse(readFileSync(root.projectPath, "utf8")).mcpServers.authd.headers).toEqual({ Authorization: "Bearer abc" });
+  }, 120_000);
+
+  test("guard: add still takes everything the reader loads", async () => {
+    const root = fresh();
+    const adds: string[][] = [
+      ["--no-login", "https", "https://x.example/mcp"],
+      ["--no-login", "local1", "http://localhost:8080/mcp"],
+      ["--no-login", "local2", "http://127.0.0.1:8080/mcp"],
+      ["--no-login", "local3", "http://[::1]:8080/mcp"],
+      ["--no-login", "header", "https://x.example/mcp", "--header", "X-Foo=1"],
+      ["--no-login", "empty", "https://x.example/mcp", "--header", "X-Foo="],
+      ["--no-login", "slack"],
+      ["stdio", "--", "node", "server.js"],
+    ];
+    for (const args of adds) {
+      const added = await mcp(root, "add", ...args);
+      expect(added.stderr).toBe("");
+      expect(added.code).toBe(0);
+      expect(added.stdout).toStartWith(`Added ${args.find((a) => !a.startsWith("-"))} to ~/.fx/mcp.json.`);
+    }
+    expect(await loaded(root)).toEqual(["https", "local1", "local2", "local3", "header", "empty", "slack", "stdio"]);
+
+    // A variable that isn't set holds the server back, and list says which; add still saves it.
+    const unset = await mcp(root, "add", "--no-login", "later", "https://x.example/mcp", "--header", "X-K=${FX_VERBS_NOT_SET}");
+    expect(unset.code).toBe(0);
+    expect(unset.stdout).toBe("Added later to ~/.fx/mcp.json.\n");
+    const noted = await mcp(root, "list");
+    expect(noted.stderr).toBe("note: ~/.fx/mcp.json server 'later' field http_header requires environment variable 'FX_VERBS_NOT_SET'; set it or use ${FX_VERBS_NOT_SET:-default}.\n");
+  }, 120_000);
+
+  test("guard: the duplicate name, both keys, an old bad entry, and the case-sensitive prefix keep today's behavior", async () => {
+    const both = fresh({ mcp: { a: { command: "x" } }, mcpServers: { b: { command: "y" } } });
+    await refused(both, ["--no-login", "web", "https://x.example/mcp"], 'the file has both "mcp" and "mcpServers"; merge them into one');
+
+    const taken = fresh({ mcpServers: { web: { command: "x" } } });
+    await refused(taken, ["--no-login", "web", "https://x.example/mcp"], "that name is already in the file; remove it first");
+
+    // An entry already in the file that the reader skips doesn't stop a good one.
+    const old = fresh({ mcpServers: { broken: { type: "http", url: "http://example.com/mcp" } } });
+    const added = await mcp(old, "add", "--no-login", "web", "https://x.example/mcp");
+    expect(added.code).toBe(0);
+    expect(await loaded(old)).toEqual(["web"]);
+
+    // add's own prefix check is case-sensitive: a usage mistake, exit 2, before anything is read.
+    const upper = await mcp(fresh(), "add", "--no-login", "web", "HTTPS://x.example/mcp");
+    expect(upper.code).toBe(2);
+    expect(upper.stderr).toStartWith("'HTTPS://x.example/mcp' isn't a URL. A stdio server's command goes after --.\n");
+  }, 120_000);
+
+  test("add refuses a profile whose servers key looks misspelled, names the key, and gives the fix", async () => {
+    const cases: { text: string; key: string; real: string }[] = [
+      { text: '{"mcp_servers":{"a":{"command":"x"}}}', key: "mcp_servers", real: "mcpServers" },
+      { text: '{"theme":"dark","servers":{"a":{"command":"x"}},"mcpServers":{"b":{"command":"y"}}}', key: "servers", real: "mcpServers" },
+      { text: '{"MCP-Servers":{"a":{"command":"x"}},"mcp":{"b":{"command":"y"}}}', key: "MCP-Servers", real: "mcp" },
+    ];
+    for (const c of cases) {
+      const root = fresh(c.text);
+      await refused(root, ["--no-login", "web", "https://x.example/mcp"], fixFor(c.key, c.real));
+      await refused(root, ["web", "--", "node", "server.js"], fixFor(c.key, c.real));
+    }
+  }, 120_000);
+
+  test("guard: a misspelled key in the profile doesn't stop add --project, and a key that holds no servers isn't a misspelling", async () => {
+    const root = fresh({ mcp_servers: { a: { command: "x" } } }, { mcpServers: {} });
+    const project = await mcp(root, "add", "--no-login", "--project", "web", "https://x.example/mcp");
+    expect(project.code).toBe(0);
+    expect(project.stdout).toBe("Added web to .mcp.json.\n");
+
+    const notes = fresh({ servers: { note: 1 }, mcpServers: {} });
+    const added = await mcp(notes, "add", "--no-login", "web", "https://x.example/mcp");
+    expect(added.stderr).toBe("");
+    expect(added.code).toBe(0);
+  }, 120_000);
+
+  test("remove refuses to rewrite a profile whose servers key looks misspelled, names the key, and gives the fix", async () => {
+    const root = fresh({ mcpServers: { a: { command: "x" } }, servers: { b: { command: "y" } } });
+    await refused(root, ["a"], fixFor("servers", "mcpServers"), "~/.fx/mcp.json", "remove", "a");
+    const withMcp = fresh({ mcp: { a: { command: "x" } }, mcp_servers: { b: { command: "y" } } });
+    await refused(withMcp, ["a"], fixFor("mcp_servers", "mcp"), "~/.fx/mcp.json", "remove", "a");
+  }, 120_000);
+
+  test("guard: remove of a name that is only under the misspelled key, or in .mcp.json, behaves as before", async () => {
+    const root = fresh({ mcpServers: { a: { command: "x" } }, servers: { b: { command: "y" } } }, { mcpServers: { p: { command: "z" } } });
+    const before = readFileSync(root.profilePath, "utf8");
+    const missing = await mcp(root, "remove", "b");
+    expect(missing.code).toBe(1);
+    expect(missing.stderr).toBe("No MCP server named b in ~/.fx/mcp.json or .mcp.json.\n");
+    expect(readFileSync(root.profilePath, "utf8")).toBe(before);
+    // A project server has no misspelled-key check: .mcp.json is not scanned.
+    const project = await mcp(root, "remove", "p");
+    expect(project.code).toBe(0);
+    expect(project.stdout).toBe("Removed p from .mcp.json.\n");
+    expect(readFileSync(root.profilePath, "utf8")).toBe(before);
+  }, 120_000);
+
+  test("the edit check reads every key: a misspelled key after 64 others, or after 64 entries that aren't servers, is found", async () => {
+    const last = fresh(bigProfile(64, { mcpServers: { a: { command: "x" } }, mcp_servers: { b: { command: "y" } } }));
+    await refused(last, ["--no-login", "web", "https://x.example/mcp"], fixFor("mcp_servers", "mcpServers"));
+    await refused(last, ["a"], fixFor("mcp_servers", "mcpServers"), "~/.fx/mcp.json", "remove", "a");
+
+    const wide: Record<string, unknown> = {};
+    for (let i = 0; i < 64; i++) wide[`n${i}`] = i;
+    wide.real = { command: "y" };
+    const deep = fresh({ mcpServers: { a: { command: "x" } }, servers: wide });
+    await refused(deep, ["--no-login", "web", "https://x.example/mcp"], fixFor("servers", "mcpServers"));
+
+    // 64 entries that aren't servers come first, so a scan that stops at 64 entries misses the 70 servers after them.
+    const many: Record<string, unknown> = {};
+    for (let i = 0; i < 64; i++) many[`n${i}`] = i;
+    for (let i = 0; i < 70; i++) many[`s${i}`] = { command: "y" };
+    const crowd = fresh({ mcpServers: { a: { command: "x" } }, mcp_servers: many });
+    await refused(crowd, ["--no-login", "web", "https://x.example/mcp"], fixFor("mcp_servers", "mcpServers"));
+  }, 120_000);
+
+  test("a misspelled key too long to show whole is named by how it starts, cut at a character, and the file is left as it was", async () => {
+    // 11 + 140 bytes: a cut at 128 bytes lands inside a character.
+    const wide = "mcp_servers" + "\u00e9".repeat(70);
+    const root = fresh({ mcpServers: { a: { command: "x" } }, [wide]: { b: { command: "y" } } });
+    const before = bytesOf(root.profilePath);
+    const ran = await mcp(root, "add", "--no-login", "web", "https://x.example/mcp");
+    expect(ran.code).toBe(1);
+    expect(ran.stdout).toBe("");
+    // The words are valid UTF-8 with no cut character, and name no key that the file lacks.
+    const words = ran.stderr;
+    expect(words).not.toContain("\ufffd");
+    expect(words).not.toContain("\\xc3");
+    expect(words).toContain(`Couldn't add web to ~/.fx/mcp.json: the key that starts with "mcp_servers\u00e9`);
+    expect(words).not.toContain('the key "mcp_servers');
+    expect(words).toContain(`" looks like a misspelling of "mcpServers", so fx doesn't read it. Move its servers into "mcpServers", then delete that key, and run the command again.\n`);
+    const quoted = words.slice(words.indexOf('starts with "') + 'starts with "'.length, words.indexOf('" looks like'));
+    expect(wide.startsWith(quoted)).toBe(true);
+    expect(bytesOf(root.profilePath)).toBe(before);
+  }, 120_000);
+
+  test("a misspelled key whose terminal-safe text is cut is named by how it starts, in the skip note and in the refusal", async () => {
+    // 111 bytes, so the load scan reads it, but each control character shows as four, and the words show only the start.
+    const key = "mcp_servers" + "\u0001".repeat(100);
+    const root = fresh({ mcpServers: { a: { command: "x" } }, [key]: { b: { command: "y" } } });
+    const list = await mcp(root, "list");
+    const start = String.raw`the key that starts with "mcp_servers(\\x01)+\.\.\."`;
+    const tail = String.raw` looks like a misspelling of "mcpServers", so fx doesn't read it\. Move its servers into "mcpServers", then delete that key`;
+    expect(list.stderr).toMatch(new RegExp(String.raw`^note: ~/\.fx/mcp\.json: ${start}${tail}\.\n$`));
+    const before = bytesOf(root.profilePath);
+    const ran = await mcp(root, "add", "--no-login", "web", "https://x.example/mcp");
+    expect(ran.code).toBe(1);
+    expect(ran.stderr).toMatch(new RegExp(String.raw`^Couldn't add web to ~/\.fx/mcp\.json: ${start}${tail}, and run the command again\.\n$`));
+    expect(bytesOf(root.profilePath)).toBe(before);
+  }, 120_000);
+
+  test("guard: a profile with 65 or more top-level keys and no misspelled key still takes add and remove", async () => {
+    const root = fresh(bigProfile(70, { mcpServers: { a: { command: "x" } } }));
+    const added = await mcp(root, "add", "--no-login", "web", "https://x.example/mcp");
+    expect(added.stderr).toBe("");
+    expect(added.code).toBe(0);
+    const removed = await mcp(root, "remove", "a");
+    expect(removed.code).toBe(0);
+    expect(removed.stdout).toBe("Removed a from ~/.fx/mcp.json.\n");
+    expect(await loaded(root)).toEqual(["web"]);
+  }, 120_000);
+
+  test("the skip note for an address fx won't use says why, in the words add refuses with", async () => {
+    const entry = (url: string) => ({ type: "http", url });
+    const cases: [string, string][] = [
+      ["http://example.com/mcp", PLAIN_HTTP],
+      ["http://localhost.:8080/mcp", PLAIN_HTTP],
+      ["http://localhost/mcp", NEEDS_PORT],
+      ["https://user:secret@x.example/mcp", 'its "url" has a user name or password in it; remove it'],
+      ["https://x.example/mcp#part", 'its "url" has a #fragment; remove it'],
+      ["https:///mcp", 'its "url" has no host name'],
+      ["ftp://x.example/mcp", 'its "url" must start with https:// (or http:// for localhost)'],
+    ];
+    for (const [url, why] of cases) {
+      const root = fresh({ mcpServers: { web: entry(url), ok: entry("https://x.example/mcp") } });
+      const list = await mcp(root, "list");
+      expect(list.stderr).toBe(`note: ~/.fx/mcp.json server 'web' was skipped: ${why}.\n`);
+      expect(list.stdout).toContain("ok");
+      expect(list.stdout).not.toContain("web");
+    }
+    // The notes for the other fields keep their words.
+    const headers = fresh({ mcpServers: { web: { type: "http", url: "https://x.example/mcp", headers: { Host: "a" } } } });
+    expect((await mcp(headers, "list")).stderr).toBe('note: ~/.fx/mcp.json server \'web\' was skipped: its "headers" isn\'t valid.\n');
+  }, 120_000);
+
+  test("list says at load that a misspelled servers key is not read, and gives the same fix", async () => {
+    const root = fresh({ mcpServers: { a: { command: "x" } }, mcp_servers: { b: { command: "y" } } });
+    const list = await mcp(root, "list");
+    expect(list.code).toBe(0);
+    expect(list.stdout).toContain("a ");
+    expect(list.stderr).toBe(
+      'note: ~/.fx/mcp.json: the key "mcp_servers" looks like a misspelling of "mcpServers", so fx doesn\'t read it. Move its servers into "mcpServers", then delete "mcp_servers".\n',
+    );
+  }, 120_000);
+
+  test("fx ask says at load that a misspelled servers key is not read, and gives the fix", async () => {
+    const root = fresh({ mcpServers: { a: fixtureServer() }, servers: { b: fixtureServer() } });
+    const note =
+      'note: ~/.fx/mcp.json: the key "servers" looks like a misspelling of "mcpServers", so fx doesn\'t read it. Move its servers into "mcpServers", then delete "servers".';
+    gateway = startFakeGateway([fakeGatewayFinalText("done")], { models: [{ id: "openai/gpt-5", type: "language", tags: ["tool-use"] }] });
+    const ask = await runFx(["ask", "--no-save", "hello"], {
+      cwd: root.workspace,
+      env: { ...root.env, FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl, FX_MODEL: "openai/gpt-5" },
+      timeoutMs: 60_000,
+    });
+    expect(ask.code).toBe(0);
+    expect(ask.stderr).toContain(note);
+  }, 120_000);
+
+  test.skipIf(!tmuxAvailable())("the shell's status line counts a misspelled servers key as a config problem, and /mcp list gives the fix", async () => {
+    const root = fresh({ mcpServers: { a: { command: "true" } }, mcp_servers: { b: { command: "true" } } });
+    gateway = startFakeGateway([], { models: [{ id: "openai/gpt-5", type: "language", tags: ["tool-use"] }] });
+    tui = await TmuxSession.create({
+      isolated: true,
+      cwd: root.workspace,
+      width: 200,
+      height: 36,
+      env: { ...root.env, FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl, FX_MODEL: "openai/gpt-5" },
+    });
+    await tui.waitForComposer(15_000);
+    await tui.waitForText("MCP config has 1 problem · /mcp list", 10_000);
+    await tui.sendText("/mcp list");
+    await tui.waitForText('the key "mcp_servers" looks like a misspelling of "mcpServers", so fx doesn\'t read it.', 10_000);
+    await tui.waitForText('Move its servers into "mcpServers", then delete "mcp_servers".', 10_000);
+  }, 120_000);
+
+  test.skipIf(!tmuxAvailable())("/mcp add and /mcp remove print the same refusals and the shell keeps running", async () => {
+    const root = fresh({ mcpServers: { a: { command: "true" } }, servers: { b: { command: "true" } } });
+    gateway = startFakeGateway([], { models: [{ id: "openai/gpt-5", type: "language", tags: ["tool-use"] }] });
+    tui = await TmuxSession.create({
+      isolated: true,
+      cwd: root.workspace,
+      width: 220,
+      height: 40,
+      env: { ...root.env, FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl, FX_MODEL: "openai/gpt-5" },
+    });
+    await tui.waitForComposer(15_000);
+    const before = readFileSync(root.profilePath, "utf8");
+    await tui.sendText("/mcp add web https://x.example/mcp");
+    await tui.waitForText(`Couldn't add web to ~/.fx/mcp.json: ${fixFor("servers", "mcpServers")}.`, 10_000);
+    await tui.sendText("/mcp remove a");
+    await tui.waitForText(`Couldn't remove a from ~/.fx/mcp.json: ${fixFor("servers", "mcpServers")}.`, 10_000);
+    expect(readFileSync(root.profilePath, "utf8")).toBe(before);
+    // The shell still answers.
+    await tui.sendText("/mcp list");
+    await tui.waitForText("~/.fx/mcp.json", 10_000);
+    await tui.sendText("/mcp add --no-login --project web https://x.example/mcp");
+    await tui.waitForText("Added web to .mcp.json.", 10_000);
+  }, 90_000);
 });

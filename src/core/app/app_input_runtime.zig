@@ -29,6 +29,7 @@ const paste_framing = @import("../input/paste_framing.zig");
 const text_scalar = @import("../input/text_scalar.zig");
 const io_mod = @import("../shared/io.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
+const config_runtime = @import("../config/config_runtime.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const image_attachments = @import("../images/image_attachments.zig");
 const image_commands = @import("../images/image_commands.zig");
@@ -96,6 +97,8 @@ fn classifyResumeFailure(err: anyerror) session_catalog.ResumeFailure {
         error.SessionAuthorityBoundaryUnavailable,
         error.SessionCommitBoundaryUnavailable,
         => .being_updated,
+        error.ConfiguredProviderChanged => .connection_changed,
+        error.ConfiguredProviderRemoved => .connection_removed,
         else => .unavailable,
     };
 }
@@ -957,6 +960,9 @@ pub fn Runtime(comptime App: type) type {
                     if (app.shell.fullTranscriptActive()) return .done;
                     if (!app_agents_runtime.Runtime(App).hasAnotherAgent(app)) return .done;
                     dismissActiveMenusThenRedraw(app, agents.screenAgentOf(app));
+                    // The list sets the draft aside itself, so the model
+                    // picker's goes back to the composer first.
+                    restoreModelPickerDraft(app);
                     try app.openAgentsMenu();
                 }
                 return .done;
@@ -985,7 +991,9 @@ pub fn Runtime(comptime App: type) type {
                 else => {},
             }
 
-            if (agents.screenAgentOf(app).question_prompt.isActive()) {
+            // The open agent list covers the prompt, and its search box
+            // takes the keys it passes on.
+            if (agents.screenAgentOf(app).question_prompt.isActive() and !agentsMenuActive(app)) {
                 try question_rt.routeQuestionEscapeAction(
                     app,
                     agents.screenAgentOf(app),
@@ -995,7 +1003,7 @@ pub fn Runtime(comptime App: type) type {
                 return .done;
             }
 
-            if (agents.screenAgentOf(app).approval_prompt.isActive()) {
+            if (agents.screenAgentOf(app).approval_prompt.isActive() and !agentsMenuActive(app)) {
                 try approval_rt.routeApprovalEscapeAction(
                     app,
                     agents.screenAgentOf(app),
@@ -1118,6 +1126,19 @@ pub fn Runtime(comptime App: type) type {
                         try openModelPickerShortcut(app);
                     }
                 },
+                .cycle_effort => {
+                    // Ctrl+T sets the effort of the agent on screen, as
+                    // `/effort` does.
+                    const agent = agents.screenAgentOf(app);
+                    if (effortCycleShortcutBlocked(app, agent)) return .done;
+                    // The `/effort` menu marks the level that was in use
+                    // when it opened.
+                    if (cancelEffortMenu(app)) {
+                        debug_trace.logf("input", "effort menu closed without applying its highlight reason=ctrl_t_cycle", .{});
+                    }
+                    try session_commands.Commands(App).cycleEffort(app, agent);
+                    app.shell.render_requests.request(.footer);
+                },
                 .paste_start => dismissActiveMenusThenRedraw(app, agents.screenAgentOf(app)),
                 .paste_end => {},
                 .remapped_byte => unreachable,
@@ -1167,6 +1188,9 @@ pub fn Runtime(comptime App: type) type {
             max_input_len: usize,
         ) !bool {
             const byte = raw.byte;
+            // The open agent list covers the prompt; its search box takes the
+            // bytes it passes on.
+            if (agentsMenuActive(app)) return false;
             if ((agent.question_prompt.isActive() or approvalOwnsCurrentSurface(app, agent)) and byte == ctrl_g_upgrade_byte) {
                 _ = try routeUpgradeShortcut(app, agent, byte);
                 return true;
@@ -1224,6 +1248,7 @@ pub fn Runtime(comptime App: type) type {
                 return true;
             }
             if (try routeMcpHostMenuByte(app, byte)) return true;
+            if (try routeForkQuestionByte(app, agent, byte)) return true;
             if (activeCompactCommandMenu(app)) |menu| {
                 if (byte >= 0x80) {
                     input_reset.resetPendingTextScalarWithTrace(
@@ -1383,13 +1408,11 @@ pub fn Runtime(comptime App: type) type {
                                 app.shell.render_requests.request(.footer);
                             } else if (command_specs.nthSlashCompletion(app.slashRegistry(), prefix, idx)) |completion| {
                                 if (command_specs.slashCompletionHasArgs(app.slashRegistry(), completion)) {
-                                    var buf: [128]u8 = undefined;
-                                    const with_space = std.mem.print(&buf, "{s} ", .{completion}) catch completion;
-                                    try app.input_runtime.textReplacementState().replace(app.alloc, with_space);
+                                    try typeCommandAwaitingArgument(app, completion);
                                 } else {
                                     try app.input_runtime.textReplacementState().replace(app.alloc, completion);
+                                    app.shell.render_requests.request(.footer);
                                 }
-                                app.shell.render_requests.request(.footer);
                             }
                         }
                     }
@@ -1443,7 +1466,7 @@ pub fn Runtime(comptime App: type) type {
                     if (try submitSlashPickerSelection(app, agent)) return;
                     if (comptime runtime_profile.allows(App, .durable_sessions)) {
                         if (try submitSessionPickerSelection(app, agent)) return;
-                        if (try submitForkMenuSelection(app, agent, max_input_len)) return;
+                        if (try submitForkMenuSelection(app, agent, null, max_input_len)) return;
                     }
                     if (try completion_rt.submitFilePickerOnEnter(app, agent, max_input_len)) |result| {
                         if (result == .limit_exceeded) {
@@ -1711,7 +1734,7 @@ pub fn Runtime(comptime App: type) type {
                     try app.writeDomainNotice(.{
                         .topic = "session",
                         .tone = .@"error",
-                        .body = "Unable to resume selected session.",
+                        .body = config_runtime.sessionConnectionNotice(err) orelse "Unable to resume selected session.",
                     }, true);
                 }
                 app.shell.render_requests.request(.footer);
@@ -1737,45 +1760,139 @@ pub fn Runtime(comptime App: type) type {
             return app_agents_runtime.Runtime(App).closeMenu(app);
         }
 
-        /// Closes the agent list and puts back the agent it opened on.
+        /// Closes the agent list and shows again the agent it opened on.
         fn backAgentsMenu(app: *App) !bool {
             if (comptime !@hasDecl(App, "openAgentsMenu")) return false;
             return app_agents_runtime.Runtime(App).backMenu(app);
         }
 
+        /// A close key on an empty search in the agent list: arms, then
+        /// closes, the selected row, unless its run edited the search.
+        fn pressAgentsMenuClose(app: *App, key: app_agents_runtime.CloseKey) !bool {
+            if (comptime !@hasDecl(App, "openAgentsMenu")) return false;
+            return app_agents_runtime.Runtime(App).pressCloseKey(app, key);
+        }
+
+        /// The close key `event` is, or null for any other event. Backspace is
+        /// the bytes 127 and 8, as a terminal sends them or as Kitty's
+        /// `ESC[127u` is replayed; Delete is the forward Delete key.
+        fn agentsMenuCloseKey(event: input_action.TerminalInputEvent) ?app_agents_runtime.CloseKey {
+            return switch (event) {
+                .raw => |raw| if (raw.byte == 127 or raw.byte == 8) .backspace else null,
+                .action => |decoded| switch (decoded.action) {
+                    .remapped_byte => |byte| if (byte == 127 or byte == 8) .backspace else null,
+                    .delete_next => .delete,
+                    else => null,
+                },
+                else => null,
+            };
+        }
+
+        /// Whether `event` is a key press. A mouse report, a sequence fx
+        /// ignores, and a paste's byte are not, so none of them ends a run of
+        /// a close key that a stray report would otherwise break.
+        fn agentsMenuKeyPress(event: input_action.TerminalInputEvent) bool {
+            return switch (event) {
+                .paste_byte => false,
+                .raw => true,
+                .action => |decoded| switch (decoded.action) {
+                    .ignore, .mouse_wheel, .mouse_pointer => false,
+                    else => true,
+                },
+            };
+        }
+
+        fn noteAgentsMenuKeyPress(app: *App, pressed: ?app_agents_runtime.CloseKey) void {
+            if (comptime !@hasDecl(App, "openAgentsMenu")) return;
+            app_agents_runtime.Runtime(App).noteKeyPress(app, pressed);
+        }
+
+        fn noteAgentsMenuSearchEdit(app: *App, key: app_agents_runtime.CloseKey) void {
+            if (comptime !@hasDecl(App, "openAgentsMenu")) return;
+            app_agents_runtime.Runtime(App).noteSearchEditKey(app, key);
+        }
+
+        /// The composer, the open agent list's search box, holds a search.
+        fn agentsMenuSearching(app: *App) bool {
+            return app.input_runtime.edit_state.input.items.len > 0;
+        }
+
+        fn clearAgentsMenuSearch(app: *App) void {
+            app.input_runtime.inputResetState().clearCurrent(app.alloc);
+            paste_blocks.clearBlocks(app.alloc, &app.input_runtime.entities.pasted_blocks);
+            syncAgentsMenu(app);
+        }
+
+        fn syncAgentsMenu(app: *App) void {
+            if (comptime !@hasDecl(App, "openAgentsMenu")) return;
+            app_agents_runtime.Runtime(App).searchChanged(app);
+        }
+
+        fn disarmAgentsMenuClose(app: *App) void {
+            if (comptime !@hasDecl(App, "openAgentsMenu")) return;
+            app_agents_runtime.Runtime(App).disarmClose(app);
+        }
+
         /// While the agent list is open it takes every key, ahead of the
-        /// prompts and composer of the agent it shows, which is a preview:
-        /// ↑ and ↓ move and preview, Enter keeps the agent shown, and Esc,
-        /// Ctrl+X, and Ctrl+C go back to the one it opened on. A paste keeps
-        /// the agent shown and lands in its composer, and mouse input passes
-        /// through. Any other key does nothing, so none edits the previewed
-        /// agent's draft or answers its prompt. Returns whether the list
-        /// took `event`.
+        /// prompts and composer of the agent it shows, which is a preview: ↑
+        /// and ↓ move and show the agent they land on, ↑ on the first row
+        /// closes the list, Enter keeps the agent shown, Backspace or Delete
+        /// arms and then closes it, and Esc, Ctrl+X, and Ctrl+C go back to
+        /// the agent the list opened on. The composer is its search box, with
+        /// the agent's draft set aside: typing, Left, and Right edit it, and
+        /// the list shows the match the highlight moves to; while it holds a
+        /// search, Backspace and Delete edit it too and Esc clears it. A run
+        /// of presses of one of them that edited the search never arms a
+        /// close, however many go on past the emptied search, until a key
+        /// other than it is pressed. A paste closes the list, keeping the
+        /// agent shown, and lands in its draft; mouse input passes through.
+        /// Any other key does nothing, so none answers the prompt behind the
+        /// list. Returns whether the list took `event`.
         fn routeAgentsMenuInput(app: *App, event: input_action.TerminalInputEvent) !bool {
             if (!agentsMenuActive(app)) return false;
             const agent = agents.screenAgentOf(app);
+            const close_key = agentsMenuCloseKey(event);
+            if (close_key == null) disarmAgentsMenuClose(app);
+            if (agentsMenuKeyPress(event)) noteAgentsMenuKeyPress(app, close_key);
             switch (event) {
                 // A paste closes the list before its bytes arrive.
                 .paste_byte => return false,
                 .raw => |raw| switch (raw.byte) {
                     '\r' => _ = try submitAgentsMenuSelection(app),
+                    127, 8 => if (agentsMenuSearching(app)) {
+                        noteAgentsMenuSearchEdit(app, .backspace);
+                        return false;
+                    } else {
+                        _ = try pressAgentsMenuClose(app, .backspace);
+                    },
                     3, 24 => _ = try backAgentsMenu(app),
+                    ' '...'~' => return false,
                     10 => _ = try completion_rt.routeAgentsMenuMove(app, agent, 1),
                     11 => _ = try completion_rt.routeAgentsMenuMove(app, agent, -1),
-                    else => if (raw.byte >= 0x80) input_reset.resetPendingTextScalarWithTrace(
-                        &app.input_runtime.text_scalar,
-                        "agents_menu_active",
-                    ),
+                    else => if (raw.byte >= 0x80) return false,
                 },
                 .action => |decoded| switch (decoded.action) {
                     .cursor_up, .history_up => _ = try completion_rt.routeAgentsMenuMove(app, agent, -1),
                     .cursor_down, .history_down => _ = try completion_rt.routeAgentsMenuMove(app, agent, 1),
-                    .escape, .open_agent_list => {
+                    .delete_next => if (agentsMenuSearching(app)) {
+                        noteAgentsMenuSearchEdit(app, .delete);
+                        return false;
+                    } else {
+                        _ = try pressAgentsMenuClose(app, .delete);
+                    },
+                    .cursor_left, .cursor_right => return false,
+                    .escape => {
+                        if (agentsMenuSearching(app)) clearAgentsMenuSearch(app) else _ = try backAgentsMenu(app);
+                        _ = disarmEscapeClear(app);
+                    },
+                    .open_agent_list => {
                         _ = try backAgentsMenu(app);
                         _ = disarmEscapeClear(app);
                     },
+                    // A paste closes the list on the agent shown and lands in
+                    // its draft.
                     .paste_start => {
-                        _ = try submitAgentsMenuSelection(app);
+                        _ = cancelAgentsMenu(app);
                         return false;
                     },
                     // Replayed as the byte it stands for, which comes back here.
@@ -1787,16 +1904,23 @@ pub fn Runtime(comptime App: type) type {
         }
 
         /// Forks before the selected prompt and puts its text in the composer.
-        fn submitForkMenuSelection(app: *App, agent: *AppAgent, max_input_len: usize) !bool {
-            if (comptime !@hasDecl(App, "forkBeforeSelectedPrompt")) return false;
+        /// Enter on `/fork`'s prompts (`bring` null), or the answer to its
+        /// question whether the fork takes copies of the subagents (D97).
+        fn submitForkMenuSelection(app: *App, agent: *AppAgent, bring: ?bool, max_input_len: usize) !bool {
+            if (comptime !@hasDecl(App, "submitForkMenu")) return false;
             if (!forkMenuActive(agent)) return false;
-            const prompt = app.forkBeforeSelectedPrompt(agent) catch |err| {
+            const forked = app.submitForkMenu(agent, bring) catch |err| {
                 debug_trace.logf("session", "fork failed err={s}", .{@errorName(err)});
                 try app.writeDomainNotice(.{
                     .topic = "session",
                     .tone = .@"error",
                     .body = "Unable to fork the session.",
                 }, true);
+                app.shell.render_requests.request(.footer);
+                return true;
+            };
+            // The menu asks its question first.
+            const prompt = forked orelse {
                 app.shell.render_requests.request(.footer);
                 return true;
             };
@@ -1851,6 +1975,45 @@ pub fn Runtime(comptime App: type) type {
         fn sessionMenuActive(agent: *AppAgent) bool {
             if (comptime !agents.hasAgentField(App, "session_persistence")) return false;
             return agent.session_persistence.session_picker.active;
+        }
+
+        /// While `/fork` asks whether the fork takes copies of the session's
+        /// subagents (D97), Enter or y answers yes and n answers no; Esc
+        /// also answers no (`answerForkQuestionOnEscape`). Other printable
+        /// bytes are dropped with a trace line, so a stray key never forks;
+        /// control bytes pass, so Ctrl+C still works.
+        fn routeForkQuestionByte(app: *App, agent: *AppAgent, byte: u8) !bool {
+            if (comptime !runtime_profile.allows(App, .durable_sessions)) return false;
+            if (comptime !agents.hasAgentField(App, "session_persistence")) return false;
+            if (!agent.session_persistence.fork_menu.asking()) return false;
+            const bring: ?bool = switch (byte) {
+                '\r', 'y', 'Y' => true,
+                'n', 'N' => false,
+                else => null,
+            };
+            if (bring) |yes| {
+                _ = try submitForkMenuSelection(app, agent, yes, forkPromptLimit());
+                return true;
+            }
+            if (byte < 0x20) return false;
+            if (byte >= 0x80) input_reset.resetPendingTextScalarWithTrace(&app.input_runtime.text_scalar, "fork_question");
+            debug_trace.logf("input", "fork question ignored byte=0x{x} reason=not_an_answer", .{byte});
+            return true;
+        }
+
+        fn answerForkQuestionOnEscape(app: *App, agent: *AppAgent) !bool {
+            if (comptime !runtime_profile.allows(App, .durable_sessions)) return false;
+            if (comptime !agents.hasAgentField(App, "session_persistence")) return false;
+            if (!agent.session_persistence.fork_menu.asking()) return false;
+            return submitForkMenuSelection(app, agent, false, forkPromptLimit());
+        }
+
+        /// The composer's limit, which the fork's restored prompt keeps.
+        fn forkPromptLimit() usize {
+            return if (comptime @hasDecl(App, "input_limits"))
+                App.input_limits.composer_bytes
+            else
+                std.math.maxInt(usize);
         }
 
         fn forkMenuActive(agent: *AppAgent) bool {
@@ -2098,6 +2261,22 @@ pub fn Runtime(comptime App: type) type {
             return false;
         }
 
+        /// Ctrl+T is a no-op while another surface owns the keyboard, and
+        /// while the model picker or an `/effort ` query previews a level in
+        /// the status line that is not the one in use.
+        fn effortCycleShortcutBlocked(app: *App, agent: *AppAgent) bool {
+            const reason: []const u8 = if (modelPickerShortcutBlocked(app, agent))
+                "surface_owns_input"
+            else if (modelMenuActive(app) or app.input_runtime.model_picker_draft != null)
+                "model_picker_open"
+            else if (completion_rt.hasModelQuery(app))
+                "model_query"
+            else
+                return false;
+            debug_trace.logf("input", "ctrl+t effort cycle ignored reason={s}", .{reason});
+            return true;
+        }
+
         fn toggleSessionPickerScopeIfActive(app: *App, agent: *AppAgent) !bool {
             if (comptime !runtime_profile.allows(App, .durable_sessions)) return false;
             if (comptime !agents.hasAgentField(App, "session_persistence")) return false;
@@ -2106,12 +2285,11 @@ pub fn Runtime(comptime App: type) type {
         }
 
         fn dismissActiveMenusForComposerEdit(app: *App, agent: *AppAgent) bool {
-            // The fork and effort menus and the instance list read no query
-            // from the composer, so an edit closes them.
+            // The fork and effort menus read no query from the composer, so an
+            // edit closes them. The agent list searches with it instead.
             const fork_menu_closed = cancelForkMenu(app, agent);
             const effort_menu_closed = cancelEffortMenu(app);
-            const agents_menu_closed = cancelAgentsMenu(app);
-            return dismissAuthPickerForComposerEdit(app, agent) or fork_menu_closed or effort_menu_closed or agents_menu_closed;
+            return dismissAuthPickerForComposerEdit(app, agent) or fork_menu_closed or effort_menu_closed;
         }
 
         fn dismissActiveMenusThenRedraw(app: *App, agent: *AppAgent) void {
@@ -2503,8 +2681,16 @@ pub fn Runtime(comptime App: type) type {
                 app.slashRegistry(),
                 items,
             ) orelse return false;
-            if (app.slashRegistry().matchExact(prefix) != null) return false;
             const count = completion_rt.visibleSlashCompletionCount(app, agent);
+            if (app.slashRegistry().matchExact(prefix)) |exact| {
+                // `/rename` typed in full waits for its title, as when it is
+                // picked from a prefix below. `/rename ` with nothing after
+                // it is sent on purpose, so it runs and says how to use it.
+                if (count == 0 or !exact.command.requires_args) return false;
+                if (std.mem.trimEnd(u8, prefix, " \t").len != prefix.len) return false;
+                try typeCommandAwaitingArgument(app, prefix);
+                return true;
+            }
             if (count == 0) return false;
             const idx = app.input_runtime.picker.slash_completion_index % count;
             if (!picker_presentation.mixedSlashCompletionIsSkill(
@@ -2520,11 +2706,27 @@ pub fn Runtime(comptime App: type) type {
                     idx,
                 ) orelse return false;
                 const spec = app.slashRegistry().matchExact(selected) orelse return false;
+                if (spec.command.requires_args) {
+                    // Only while the name is still being typed: text after it
+                    // is the argument, and Enter sends it as it is.
+                    if (std.mem.findAny(u8, prefix, " \t") != null) return false;
+                    try typeCommandAwaitingArgument(app, selected);
+                    return true;
+                }
                 if (spec.command.kind != .model) return false;
                 try openModelBrowseCatalog(app);
                 return true;
             }
             return try bindSelectedSlashSkill(app, idx);
+        }
+
+        /// Replaces the composer text with `command` and a space, so the
+        /// command waits for its argument.
+        fn typeCommandAwaitingArgument(app: *App, command: []const u8) !void {
+            var buf: [128]u8 = undefined;
+            const with_space = std.mem.print(&buf, "{s} ", .{command}) catch command;
+            try app.input_runtime.textReplacementState().replace(app.alloc, with_space);
+            app.shell.render_requests.request(.footer);
         }
 
         fn nonSlashPickerOwnsEnter(app: *App, agent: *AppAgent) bool {
@@ -2596,6 +2798,11 @@ pub fn Runtime(comptime App: type) type {
                 selected_index,
             ) orelse return false;
             const leading_ws = items.len - prefix.len;
+            debug_trace.logf(
+                "skills",
+                "slash menu replaced composer text with skill={s} dropped_bytes={d}",
+                .{ skill.name, prefix.len },
+            );
             try app.input_runtime.skillBindingState().bindSkillToken(
                 app.alloc,
                 leading_ws,
@@ -2610,6 +2817,7 @@ pub fn Runtime(comptime App: type) type {
         }
 
         fn syncCatalogMenus(app: *App, agent: *AppAgent) void {
+            syncAgentsMenu(app);
             syncSettingsMenu(app);
             syncHelpMenu(app);
             syncSkillsMenu(app);
@@ -2825,6 +3033,12 @@ pub fn Runtime(comptime App: type) type {
             if (try backAgentsMenu(app)) {
                 _ = disarmEscapeClear(app);
                 _ = disarmEscapeInterrupt(app, "menu");
+                return;
+            }
+            // Esc answers `/fork`'s question: fork without the subagents (D97).
+            if (try answerForkQuestionOnEscape(app, agent)) {
+                _ = disarmEscapeClear(app);
+                _ = disarmEscapeInterrupt(app, "fork_question");
                 return;
             }
             if (was_cancel_pending) {
@@ -3591,7 +3805,6 @@ const RoutingFakeApp = struct {
     file_index_refresh_count: usize = 0,
     file_index_loading: bool = false,
     file_index_failed: bool = false,
-    working_report_count: usize = 0,
     submitted_prompt_count: usize = 0,
     submitted_prompt: [128]u8 = undefined,
     submitted_prompt_len: usize = 0,
@@ -3611,10 +3824,6 @@ const RoutingFakeApp = struct {
     upgrade_denied_count: usize = 0,
     suspend_count: usize = 0,
     workspace_access: app_workspace_runtime.Access = .{},
-
-    pub fn reportWorking(self: *RoutingFakeApp) void {
-        self.working_report_count += 1;
-    }
 
     pub fn slashRegistry(_: *const RoutingFakeApp) command_specs.SlashRegistry {
         return routing_test_slash_registry;
@@ -6072,6 +6281,12 @@ test "app_input_runtime Enter consumes an active session picker on target failur
     try std.testing.expectEqual(@as(usize, 0), app.submitted_prompt_count);
     try std.testing.expectEqual(session_catalog.ResumeFailure.unavailable, picker.selection_failure.?);
     try std.testing.expect(std.mem.find(u8, app.transcript.items, "unable to resume") == null);
+}
+
+test "a resume refused for a changed or removed custom connection says which" {
+    try std.testing.expectEqual(session_catalog.ResumeFailure.connection_changed, classifyResumeFailure(error.ConfiguredProviderChanged));
+    try std.testing.expectEqual(session_catalog.ResumeFailure.connection_removed, classifyResumeFailure(error.ConfiguredProviderRemoved));
+    try std.testing.expectEqual(session_catalog.ResumeFailure.unavailable, classifyResumeFailure(error.UnknownConfiguredProvider));
 }
 
 test "app_input_runtime reports resume failure after picker transition" {
@@ -8919,6 +9134,206 @@ test "app_input_runtime ctrl+p leaves the draft alone when a decision owns input
     }
 }
 
+const routing_cycle_efforts = [_]types.ReasoningEffort{
+    types.ReasoningEffort.literal("low"),
+    types.ReasoningEffort.literal("medium"),
+    types.ReasoningEffort.literal("high"),
+};
+
+test "app_input_runtime ctrl+t steps from default through the model's effort levels and back to default" {
+    const alloc = std.testing.allocator;
+    var app = try RoutingFakeApp.init(alloc);
+    defer app.deinit();
+    app.setGatewayControls("test/model", &routing_cycle_efforts, false);
+    try app.input_runtime.textReplacementState().replace(alloc, "keep this draft");
+    app.input_runtime.edit_state.cursor = 4;
+
+    // From `default` the first press takes the first level the model lists,
+    // and the press after the last one goes back to `default`.
+    const expected = routing_cycle_efforts ++ [_]types.ReasoningEffort{ .auto, routing_cycle_efforts[0] };
+    for (expected, 1..) |effort, press| {
+        app.shell.render_requests.clearReason(.footer);
+        try feedRoutingBytes(&app, "\x14");
+
+        try std.testing.expectEqual(effort, app.agent().effort);
+        try std.testing.expectEqual(effort, app.last_preference_effort.?);
+        try std.testing.expectEqual(press, app.preference_commit_count);
+        try std.testing.expect(app.shell.render_requests.hasReason(.footer));
+    }
+
+    // The status line names the level; the draft and the transcript are
+    // left alone, and the model stays the one in use.
+    try std.testing.expectEqualStrings("keep this draft", app.input_runtime.edit_state.input.items);
+    try std.testing.expectEqual(@as(usize, 4), app.input_runtime.edit_state.cursor);
+    try std.testing.expectEqual(@as(usize, 0), app.notice_write_count);
+    try std.testing.expectEqualStrings("", app.transcript.items);
+    try std.testing.expectEqualStrings("test/model", app.selected_model.items);
+    try std.testing.expectEqualStrings("", app.last_preference_model.items);
+}
+
+test "app_input_runtime ctrl+t reported as a key or after a bare escape still cycles the effort" {
+    const alloc = std.testing.allocator;
+    var app = try RoutingFakeApp.init(alloc);
+    defer app.deinit();
+    app.setGatewayControls("test/model", &routing_cycle_efforts, false);
+
+    // The kitty keyboard protocol reports Ctrl+T as a key.
+    try feedRoutingBytes(&app, "\x1b[116;5u");
+    try std.testing.expectEqual(routing_cycle_efforts[0], app.agent().effort);
+
+    try feedRoutingBytes(&app, "\x1b\x14");
+    try std.testing.expectEqual(routing_cycle_efforts[1], app.agent().effort);
+    try std.testing.expectEqual(@as(usize, 2), app.preference_commit_count);
+}
+
+test "app_input_runtime ctrl+t moves a level the model does not offer to default and toggles an only level" {
+    const alloc = std.testing.allocator;
+    var app = try RoutingFakeApp.init(alloc);
+    defer app.deinit();
+    app.setGatewayControls("test/model", &routing_cycle_efforts, false);
+    app.agent().effort = types.ReasoningEffort.literal("saved-for-another-model");
+
+    try feedRoutingBytes(&app, "\x14");
+    try std.testing.expectEqual(types.ReasoningEffort.auto, app.agent().effort);
+    try std.testing.expectEqual(types.ReasoningEffort.auto, app.last_preference_effort.?);
+    try std.testing.expectEqual(@as(usize, 1), app.preference_commit_count);
+
+    // A model with one level switches between it and `default`.
+    app.setGatewayControls("test/model", routing_cycle_efforts[0..1], false);
+    for ([_]types.ReasoningEffort{ routing_cycle_efforts[0], .auto }, 2..) |effort, commits| {
+        try feedRoutingBytes(&app, "\x14");
+        try std.testing.expectEqual(effort, app.agent().effort);
+        try std.testing.expectEqual(commits, app.preference_commit_count);
+    }
+    try std.testing.expectEqual(@as(usize, 0), app.notice_write_count);
+}
+
+test "app_input_runtime ctrl+t on a model without levels says why and changes nothing" {
+    const alloc = std.testing.allocator;
+    var app = try RoutingFakeApp.init(alloc);
+    defer app.deinit();
+    try app.input_runtime.textReplacementState().replace(alloc, "draft");
+
+    try feedRoutingBytes(&app, "\x14");
+    try std.testing.expectEqualStrings("effort", app.notice_topic.items);
+    try std.testing.expectEqualStrings("test/model has no levels to choose from", app.notice_body.items);
+
+    app.model_cache_loading = true;
+    try feedRoutingBytes(&app, "\x14");
+    try std.testing.expectEqualStrings(
+        "levels for test/model are still loading; try ctrl+t again in a moment",
+        app.notice_body.items,
+    );
+
+    try std.testing.expectEqual(@as(usize, 2), app.notice_write_count);
+    try std.testing.expectEqual(types.ReasoningEffort.auto, app.agent().effort);
+    try std.testing.expectEqual(@as(usize, 0), app.preference_commit_count);
+    try std.testing.expectEqualStrings("draft", app.input_runtime.edit_state.input.items);
+}
+
+test "app_input_runtime ctrl+t leaves the effort alone when a decision owns input" {
+    const alloc = std.testing.allocator;
+    for ([_]RoutingDecisionKind{ .question, .approval }) |kind| {
+        var app = try RoutingFakeApp.init(alloc);
+        defer app.deinit();
+        app.setGatewayControls("test/model", &routing_cycle_efforts, false);
+        try activateRoutingDecision(&app, kind);
+
+        try feedRoutingBytes(&app, "\x14");
+
+        try std.testing.expectEqual(types.ReasoningEffort.auto, app.agent().effort);
+        try std.testing.expectEqual(@as(usize, 0), app.preference_commit_count);
+        try std.testing.expectEqual(@as(usize, 0), app.notice_write_count);
+    }
+}
+
+test "app_input_runtime ctrl+t leaves the effort alone while the model picker previews one" {
+    const alloc = std.testing.allocator;
+    const Stage = enum { catalog, inline_effort };
+    for ([_]Stage{ .catalog, .inline_effort }) |stage| {
+        var app = try RoutingFakeApp.init(alloc);
+        defer app.deinit();
+        app.setGatewayControls("test/model", &routing_cycle_efforts, false);
+        switch (stage) {
+            .catalog => {
+                try app.input_runtime.textReplacementState().replace(alloc, "draft");
+                try feedRoutingBytes(&app, "\x10");
+                try std.testing.expect(app.model_cache.menu.active);
+            },
+            .inline_effort => {
+                try enterRoutingShortcutEffortStage(&app, "draft", 2);
+                try std.testing.expectEqual(picker_state.ModelPickerStage.effort, app.input_runtime.picker.model_picker_stage);
+            },
+        }
+        const borrowed_composer = try alloc.dupe(u8, app.input_runtime.edit_state.input.items);
+        defer alloc.free(borrowed_composer);
+
+        try feedRoutingBytes(&app, "\x14");
+
+        // The picker keeps the keyboard and its stashed draft.
+        try std.testing.expectEqual(types.ReasoningEffort.auto, app.agent().effort);
+        try std.testing.expectEqual(@as(usize, 0), app.preference_commit_count);
+        try std.testing.expectEqual(@as(usize, 0), app.notice_write_count);
+        try std.testing.expectEqualStrings(borrowed_composer, app.input_runtime.edit_state.input.items);
+        try std.testing.expect(app.input_runtime.model_picker_draft != null);
+        try std.testing.expectEqual(stage == .catalog, app.model_cache.menu.active);
+    }
+}
+
+test "app_input_runtime ctrl+t leaves the effort alone while another surface owns the keyboard" {
+    const alloc = std.testing.allocator;
+    const Surface = enum { effort_query, model_query, auth_picker, settings_menu, help_menu };
+    for ([_]Surface{ .effort_query, .model_query, .auth_picker, .settings_menu, .help_menu }) |surface| {
+        var app = try RoutingFakeApp.init(alloc);
+        defer app.deinit();
+        app.setGatewayControls("test/model", &routing_cycle_efforts, false);
+        switch (surface) {
+            // The `/effort ` and `/model ` columns under the composer preview
+            // a level in the status line.
+            .effort_query => try app.input_runtime.textReplacementState().replace(alloc, "/effort "),
+            .model_query => try app.input_runtime.textReplacementState().replace(alloc, "/model test"),
+            .auth_picker => try openRoutingAuthPicker(&app),
+            .settings_menu => app.input_runtime.settings_menu.open(),
+            .help_menu => app.input_runtime.help_menu.open(),
+        }
+        if (surface == .effort_query or surface == .model_query) {
+            try std.testing.expect(input_completion_runtime.CompletionRuntime(RoutingFakeApp).hasModelQuery(&app));
+        }
+        const composer = try alloc.dupe(u8, app.input_runtime.edit_state.input.items);
+        defer alloc.free(composer);
+
+        try feedRoutingBytes(&app, "\x14");
+
+        try std.testing.expectEqual(types.ReasoningEffort.auto, app.agent().effort);
+        try std.testing.expectEqual(@as(usize, 0), app.preference_commit_count);
+        try std.testing.expectEqual(@as(usize, 0), app.notice_write_count);
+        try std.testing.expectEqualStrings(composer, app.input_runtime.edit_state.input.items);
+    }
+}
+
+test "app_input_runtime ctrl+t closes the open effort menu and cycles from the level in use" {
+    const alloc = std.testing.allocator;
+    var app = try RoutingFakeApp.init(alloc);
+    defer app.deinit();
+    app.setGatewayControls("test/model", &routing_cycle_efforts, false);
+    app.agent().effort = routing_cycle_efforts[1];
+    try app.input_runtime.effort_menu.open(
+        alloc,
+        "test/model",
+        app.resolvedModelCapabilities("test/model"),
+        app.agent().effort,
+    );
+    // The highlight is not the level in use, and Ctrl+T does not apply it.
+    app.input_runtime.effort_menu.move(-1);
+
+    try feedRoutingBytes(&app, "\x14");
+
+    try std.testing.expect(!app.input_runtime.effort_menu.active);
+    try std.testing.expectEqual(routing_cycle_efforts[2], app.agent().effort);
+    try std.testing.expectEqual(@as(usize, 1), app.preference_commit_count);
+    try std.testing.expectEqual(@as(usize, 0), app.notice_write_count);
+}
+
 test "app_input_runtime ctrl+c while the picker borrows the composer keeps the stashed draft and its image" {
     const alloc = std.testing.allocator;
     var app = try RoutingFakeApp.init(alloc);
@@ -10580,18 +10995,20 @@ test "app_input_runtime full transcript page wheel and alternate-scroll keys scr
     try std.testing.expect(!app.shell.full_transcript.follow_tail);
     try std.testing.expect(app.shell.render_requests.hasReason(.modal));
 
+    // A page is the screen less Ctrl+O's key row and the blank row over it:
+    // 22 of 24 rows.
     try feedRoutingBytes(&app, "\x1b[6~");
-    try std.testing.expectEqual(@as(u32, 20), app.shell.full_transcript.scroll_rows);
+    try std.testing.expectEqual(@as(u32, 22), app.shell.full_transcript.scroll_rows);
 
     try feedRoutingBytes(&app, "\x1b[<64;1;1M");
-    try std.testing.expectEqual(@as(u32, 17), app.shell.full_transcript.scroll_rows);
+    try std.testing.expectEqual(@as(u32, 19), app.shell.full_transcript.scroll_rows);
     try feedRoutingBytes(&app, "\x1b[<65;1;1M");
-    try std.testing.expectEqual(@as(u32, 20), app.shell.full_transcript.scroll_rows);
+    try std.testing.expectEqual(@as(u32, 22), app.shell.full_transcript.scroll_rows);
 
     try feedRoutingBytes(&app, "\x1b[A");
-    try std.testing.expectEqual(@as(u32, 17), app.shell.full_transcript.scroll_rows);
+    try std.testing.expectEqual(@as(u32, 19), app.shell.full_transcript.scroll_rows);
     try feedRoutingBytes(&app, "\x1b[B");
-    try std.testing.expectEqual(@as(u32, 20), app.shell.full_transcript.scroll_rows);
+    try std.testing.expectEqual(@as(u32, 22), app.shell.full_transcript.scroll_rows);
 
     try std.testing.expect(app.terminal.fullTranscriptScreenActive());
     try std.testing.expectEqual(@as(usize, 0), app.input_runtime.edit_state.input.items.len);
@@ -12050,7 +12467,7 @@ test "question resolution append does not add a second gap after prompt card" {
     try std.testing.expect(std.mem.find(u8, app.shell.transcript.items, "     Inspect repo state") != null);
 }
 
-test "question submission reports working only after the worker accepts the answers" {
+test "a question submission the worker refuses keeps the question open" {
     const alloc = std.testing.allocator;
     const opts = [_]types.QuestionOption{
         .{ .label = "Continue", .description = null },
@@ -12071,12 +12488,10 @@ test "question submission reports working only after the worker accepts the answ
 
         try std.testing.expectError(error.OutOfMemory, Runtime(RoutingFakeApp).submitQuestionBatch(&app, (&app).agent()));
         try std.testing.expect(app.agent().question_prompt.isActive());
-        try std.testing.expectEqual(@as(usize, 0), app.working_report_count);
 
         app.agent().worker.question_submission_fails = false;
         try Runtime(RoutingFakeApp).submitQuestionBatch(&app, (&app).agent());
         try std.testing.expect(!app.agent().question_prompt.isActive());
-        try std.testing.expectEqual(@as(usize, 1), app.working_report_count);
     }
 }
 
@@ -12156,10 +12571,8 @@ test "app_input_runtime submits multi-question answers in entry order" {
 
     try feedRoutingBytes(&app, "\r");
     try std.testing.expect(app.agent().question_prompt.isActive());
-    try std.testing.expectEqual(@as(usize, 0), app.working_report_count);
     try feedRoutingBytes(&app, "2");
 
-    try std.testing.expectEqual(@as(usize, 1), app.working_report_count);
     try std.testing.expectEqual(@as(usize, 2), app.agent().worker.submitted_question_count);
     try std.testing.expectEqualStrings(
         "First",
@@ -12322,9 +12735,26 @@ const FakeSubmitApp = struct {
     fail_pending_finalization: bool = false,
     fail_command_after_pending_clear: bool = false,
     snapshot_dir: ?[]const u8 = null,
+    /// Submits land on a subagent's screen, whose turns open a work in the
+    /// parent's log.
+    on_subagent_screen: bool = false,
+    /// Works those submits opened.
+    opened_turn_works: usize = 0,
 
     pub fn slashRegistry(_: *const FakeSubmitApp) command_specs.SlashRegistry {
         return routing_test_slash_registry;
+    }
+
+    pub fn prepareSubagentOnScreen(self: *FakeSubmitApp, _: anytype) !bool {
+        return self.on_subagent_screen;
+    }
+
+    pub fn openSubagentTurnWork(self: *FakeSubmitApp) void {
+        self.opened_turn_works += 1;
+    }
+
+    pub fn screenAgentId(self: *const FakeSubmitApp) []const u8 {
+        return if (self.on_subagent_screen) "reviewer" else "main";
     }
 
     fn deinit(self: *FakeSubmitApp) void {
@@ -12774,6 +13204,37 @@ test "composer shortcut line delete joins at non-final line end and rejects unkn
     try std.testing.expect(app.shell.render_requests.hasReason(.footer));
     try std.testing.expectEqual(@as(?input_action.ShortcutAction, null), test_ui_input.shortcutFromControlByte('x'));
     try std.testing.expectEqualStrings("alphabeta", app.input_runtime.edit_state.input.items);
+}
+
+test "composer shortcut line delete joins at non-first line start" {
+    const alloc = std.testing.allocator;
+    var app = try RoutingFakeApp.init(alloc);
+    defer app.deinit();
+
+    try app.input_runtime.edit_state.input.appendSlice(alloc, "alpha\nbeta");
+    try app.input_runtime.kill_ring.text.appendSlice(alloc, "existing kill");
+    app.input_runtime.edit_state.cursor = "alpha\n".len;
+
+    _ = try Runtime(RoutingFakeApp).routeResolvedEscapeAction(
+        &app,
+        .delete_to_line_start,
+        .delete_to_line_start,
+        null,
+        null,
+        false,
+        4096,
+    );
+    try std.testing.expectEqualStrings("alphabeta", app.input_runtime.edit_state.input.items);
+    try std.testing.expectEqual(@as(usize, "alpha".len), app.input_runtime.edit_state.cursor);
+    try std.testing.expectEqualStrings("\n", app.input_runtime.kill_ring.text.items);
+    try std.testing.expect(app.shell.render_requests.hasReason(.footer));
+
+    app.shell.render_requests.clearReason(.footer);
+    app.input_runtime.edit_state.cursor = 0;
+    try Runtime(RoutingFakeApp).handleByte(&app, 21, 4096, 100);
+    try std.testing.expectEqualStrings("alphabeta", app.input_runtime.edit_state.input.items);
+    try std.testing.expectEqualStrings("\n", app.input_runtime.kill_ring.text.items);
+    try std.testing.expect(!app.shell.render_requests.hasReason(.footer));
 }
 
 test "composer shortcut yank commits fresh image ids only after insertion" {
@@ -13376,6 +13837,48 @@ test "app_input_runtime submits one prompt carrying every image attached by repe
     try std.testing.expectEqual(@as(usize, 2), app.last_images[1].id);
     try std.testing.expectEqual(@as(usize, 0), app.agent().pending_images.items.len);
     try std.testing.expectEqual(@as(usize, 0), app.input_runtime.edit_state.input.items.len);
+}
+test "a submit on a subagent's screen opens its turn's work only once the prompt is queued" {
+    const alloc = std.testing.allocator;
+    const Submit = struct { text: bool, image: bool, credential: bool = true, queue: bool = true };
+    const cases = [_]struct { submit: Submit, opened: usize }{
+        // Text, or an image with no text, is queued and opens one work.
+        .{ .submit = .{ .text = true, .image = false }, .opened = 1 },
+        .{ .submit = .{ .text = false, .image = true }, .opened = 1 },
+        // A prompt that isn't queued, for want of a credential or because
+        // the queue refused it, opens none.
+        .{ .submit = .{ .text = true, .image = false, .credential = false }, .opened = 0 },
+        .{ .submit = .{ .text = false, .image = true, .credential = false }, .opened = 0 },
+        .{ .submit = .{ .text = true, .image = false, .queue = false }, .opened = 0 },
+        .{ .submit = .{ .text = false, .image = true, .queue = false }, .opened = 0 },
+        // Nothing to send opens none.
+        .{ .submit = .{ .text = false, .image = false }, .opened = 0 },
+    };
+    for (cases) |case| {
+        var app = FakeSubmitApp{
+            .alloc = alloc,
+            .on_subagent_screen = true,
+            .prompt_admitted = case.submit.credential,
+            .queue_admitted = case.submit.queue,
+        };
+        defer app.deinit();
+        if (case.submit.text) try app.input_runtime.edit_state.input.appendSlice(alloc, "check the parser");
+        if (case.submit.image) {
+            try appendOwnedPendingImage(&app, 1, "/tmp/only.png");
+            app.next_image_id_counter = 2;
+        }
+        try Runtime(FakeSubmitApp).submit(&app, 100);
+        try std.testing.expectEqual(case.opened, app.queue_accept_count);
+        try std.testing.expectEqual(case.opened, app.opened_turn_works);
+    }
+
+    // On main's screen a queued prompt opens no subagent work.
+    var main_screen = FakeSubmitApp{ .alloc = alloc };
+    defer main_screen.deinit();
+    try main_screen.input_runtime.edit_state.input.appendSlice(alloc, "check the parser");
+    try Runtime(FakeSubmitApp).submit(&main_screen, 100);
+    try std.testing.expectEqual(@as(usize, 1), main_screen.queue_accept_count);
+    try std.testing.expectEqual(@as(usize, 0), main_screen.opened_turn_works);
 }
 
 test "app_input_runtime rejected second image keeps the first pending image and its snapshot" {

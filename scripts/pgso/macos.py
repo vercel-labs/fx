@@ -32,7 +32,7 @@ TARGET = "aarch64-macos"
 DISPLAY_NAME = "macOS arm64"
 HOST_ARCH = "arm64"
 LIBLLVM_NAME = "libLLVM.dylib"
-SIZE_CEILING_MIB = 7.000
+SIZE_CEILING_MIB = 6.750
 # The ordinary control build already records everything the links reuse.
 CONTROL_BUILD_FLAGS: tuple[str, ...] = ()
 # Apple ld's dead-code stripping for `zig cc` links.
@@ -89,7 +89,9 @@ def _zig_darwin_sdk(zig: pathlib.Path) -> tuple[pathlib.Path, str]:
         settings = json.loads((sdk / "SDKSettings.json").read_text(encoding="utf-8"))
     except (OSError, ValueError) as error:
         raise PgsoError("could not read Zig Darwin SDK settings") from error
-    version = settings.get("MinimalDisplayName") if isinstance(settings, dict) else None
+    # Zig 0.17.1's stub names the version `Version`, the key its linker reads;
+    # 0.17.0's named it `MinimalDisplayName`.
+    version = settings.get("Version") if isinstance(settings, dict) else None
     if not isinstance(version, str) or re.fullmatch(r"\d+\.\d+(?:\.\d+)?", version) is None:
         raise PgsoError("invalid Zig Darwin SDK version")
     return sdk, version
@@ -210,6 +212,9 @@ def instrumented_link_argv(
         "-isysroot",
         str(toolchain.tools.sdk),
         "-Wl,-dead_strip",
+        # The map names the function at each address of the stripped
+        # binary, for its crash reports.
+        f"-Wl,-map,{paths.logs / 'instrumented-link.map'}",
         *PROFILE_SECTION_ALIGNMENTS,
         str(paths.instrumented_object),
         str(toolchain.profile_runtime),
@@ -870,6 +875,10 @@ def link_instrumented(
 
 def record_control_build(toolchain: Toolchain, result: CommandResult, paths: PipelinePaths) -> None:
     """Nothing to record: the macOS links rebuild their own commands."""
+
+
+def prepare_candidate_bitcode(toolchain: Toolchain, paths: PipelinePaths) -> None:
+    """The Apple link orders sections, so private functions need no symbol."""
 
 
 def candidate_object_flags(paths: PipelinePaths) -> tuple[str, ...]:

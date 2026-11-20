@@ -4,6 +4,7 @@
 //! the screen; `app_session_runtime.zig` runs it.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const model_provider = @import("../config/model_provider.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const host_target = @import("../hosts/target.zig");
@@ -15,6 +16,7 @@ const session_codec = @import("../session/session_codec.zig");
 const js_host_session_store = @import("../session/js_host_session_store.zig");
 const session_title_generation = @import("../session/session_title_generation.zig");
 const session_adapter = @import("../session/session_adapter.zig");
+const turn_capture = @import("../workspace/turn_capture.zig");
 const session_store = @import("../session/session_store.zig");
 const session_catalog_cache = @import("../session/session_catalog_cache.zig");
 const session_summary_codec = @import("../session/session_summary_codec.zig");
@@ -190,23 +192,56 @@ pub const ForkMenu = struct {
     /// The first menu line shown. It starts past the end, which shows the
     /// newest prompts, and moves only as far as keeps the selection whole.
     window_start: usize = std.math.maxInt(usize),
+    /// Once Enter chose a prompt where the session had subagents: those it
+    /// had there, while the menu asks whether the fork takes copies of the
+    /// ones it can (D97). Null while the prompts show.
+    question: ?[]session_adapter.Child = null,
 
     pub fn active(self: *const ForkMenu) bool {
         return self.points.len > 0;
     }
 
+    pub fn asking(self: *const ForkMenu) bool {
+        return self.question != null;
+    }
+
     /// Moves the selection, stopping at the oldest and the newest prompt.
+    /// The question keeps the chosen prompt.
     pub fn move(self: *ForkMenu, delta: i32) void {
-        if (self.points.len == 0) return;
+        if (self.points.len == 0 or self.asking()) return;
         const next = @as(i64, @intCast(self.selected)) + delta;
         self.selected = @intCast(std.math.clamp(next, 0, @as(i64, @intCast(self.points.len - 1))));
     }
 
     pub fn close(self: *ForkMenu, alloc: Allocator) void {
         session_adapter.Session.freeForkPoints(alloc, self.points);
+        if (self.question) |children| session_adapter.freeChildren(alloc, children);
         self.* = .{};
     }
 };
+
+test "the fork menu's question keeps the chosen prompt, and closing frees it (D97)" {
+    const alloc = std.testing.allocator;
+    const points = try alloc.alloc(session_adapter.Session.ForkPoint, 2);
+    points[0] = .{ .turn = 1, .prompt = try alloc.dupe(u8, "first") };
+    points[1] = .{ .turn = 2, .prompt = try alloc.dupe(u8, "second") };
+    const children = try alloc.alloc(session_adapter.Child, 1);
+    children[0] = .{
+        .id = try alloc.dupe(u8, "kid"),
+        .work_id = try alloc.dupe(u8, "w1"),
+        .open = false,
+        .outcome = .ok,
+        .spawn_data = try alloc.dupe(u8, "{}"),
+        .finish_data = null,
+        .seq = 4,
+    };
+    var menu: ForkMenu = .{ .points = points, .selected = 1, .question = children };
+    try std.testing.expect(menu.asking());
+    menu.move(-1);
+    try std.testing.expectEqual(@as(usize, 1), menu.selected);
+    menu.close(alloc);
+    try std.testing.expect(!menu.active() and !menu.asking());
+}
 
 pub const SessionPickerCatalogCache = struct {
     ready: bool = false,
@@ -594,6 +629,12 @@ pub const SessionPickerLoad = struct {
 pub const TitleGenerationLoad = struct {
     task: ?*session_title_generation.Task = null,
     last: LastResult = .{},
+    /// The session whose title request started. The gate checks it, because
+    /// a first turn the next prompt interrupts reaches the history only after
+    /// that prompt starts (tests/tla/session_title/SessionTitle.tla
+    /// AtMostOneTitleRequest).
+    started_session_buf: [LastResult.max_session_bytes]u8 = undefined,
+    started_session_len: u8 = 0,
 
     /// Final state of the most recent attempt, retained for diagnostics after
     /// the task itself is destroyed. `detail` is a static string borrowed from
@@ -649,9 +690,27 @@ pub const TitleGenerationLoad = struct {
             old.destroy();
         }
         self.task = task;
+        self.recordStarted(task.session_id);
+    }
+
+    /// Whether `session_id` already started a title request.
+    pub fn startedFor(self: *const TitleGenerationLoad, session_id: []const u8) bool {
+        return self.started_session_len > 0 and
+            std.mem.eql(u8, self.started_session_buf[0..self.started_session_len], session_id);
+    }
+
+    fn recordStarted(self: *TitleGenerationLoad, session_id: []const u8) void {
+        if (session_id.len == 0 or session_id.len > self.started_session_buf.len) {
+            debug_trace.logf("session", "event=title_generation_start_unrecorded reason=session_id_len len={d}", .{session_id.len});
+            self.started_session_len = 0;
+            return;
+        }
+        @memcpy(self.started_session_buf[0..session_id.len], session_id);
+        self.started_session_len = @intCast(session_id.len);
     }
 
     pub fn recordSpawnFailure(self: *TitleGenerationLoad, session_id: []const u8, model: []const u8, err: anyerror) void {
+        self.recordStarted(session_id);
         var last = LastResult{
             .status = .failed,
             .reason = .spawn_failed,
@@ -790,6 +849,184 @@ pub const PendingCancelledCommand = struct {
     }
 };
 
+/// The boundaries of the older compaction cycles, found walking back from
+/// the held one as Ctrl+O reads older, so each cycle is found once.
+pub const TranscriptArchiveBoundaries = struct {
+    /// The newest compaction, and whether the transcript window held the
+    /// cycle before it, when the walk started: a change starts it over.
+    key: ?struct { newest: session_adapter.LogCursor, holds_previous: bool } = null,
+    /// Where the held entries start: the end of cycle 1 back.
+    held_start: ?session_adapter.LogCursor = null,
+    /// `starts[k - 1]` is where cycle `k` back starts, and so where cycle
+    /// `k + 1` ends; null at the log's start.
+    starts: std.ArrayList(?session_adapter.LogCursor) = .empty,
+    /// The first cycle back whose start a damaged log line hid: it and every
+    /// older cycle Ctrl+O shows may be missing turns.
+    damaged_from: ?u32 = null,
+
+    /// Records that finding where cycle `back` starts stopped at a damaged
+    /// line, and returns the start to use: none, the log's start.
+    pub fn startOf(self: *TranscriptArchiveBoundaries, back: u32, found: session_adapter.Session.PreviousCompaction) ?session_adapter.LogCursor {
+        if (found.damaged and self.damaged_from == null) self.damaged_from = back;
+        return found.cursor;
+    }
+
+    pub fn damages(self: *const TranscriptArchiveBoundaries, back: u32) bool {
+        const from = self.damaged_from orelse return false;
+        return back >= from;
+    }
+
+    pub fn deinit(self: *TranscriptArchiveBoundaries, alloc: Allocator) void {
+        self.starts.deinit(alloc);
+        self.* = .{};
+    }
+};
+
+/// Reads one older compaction cycle of the session log for Ctrl+O on a
+/// background thread (`loadTranscriptArchive`), so the main thread only
+/// replays the turns it read. One read at a time. The task and its turns use
+/// `std.heap.c_allocator`, which any thread can free with.
+pub const TranscriptArchiveRead = struct {
+    task: ?*Task = null,
+
+    /// What a read is for, which the main thread checks when it finishes.
+    pub const Request = struct {
+        /// Cycles before the held entries: 1 is the newest older one.
+        back: u32,
+        /// The compaction line the cycle opens at, or null at the log's start.
+        start: ?session_adapter.LogCursor,
+        /// The transcript's archive generation when the read started: a
+        /// compaction, resume, or drop since then makes the read stale.
+        generation: u64,
+    };
+
+    pub const Task = struct {
+        /// The read's `std.Io` task, which `completed` and `cancel` await.
+        future: ?std.Io.Future(void) = null,
+        done: std.atomic.Value(bool) = .init(false),
+        cancel_requested: std.atomic.Value(bool) = .init(false),
+        reader: session_adapter.CycleReader,
+        request: Request,
+        started_ns: i128,
+        read_ns: i128 = 0,
+        /// The cycle's turns, oldest first, owned by the task.
+        turns: std.ArrayList(types.HistoryTurn) = .empty,
+        /// Reading stopped at a damaged line, so turns are missing.
+        damaged: bool = false,
+        failure: ?anyerror = null,
+        /// The main thread's replay of the turns read, which runs a few
+        /// turns per loop turn so no frame waits for the whole cycle. The
+        /// app owns its state and frees it through `deinit_fn`.
+        replay: ?Replay = null,
+
+        pub const Replay = struct {
+            state: *anyopaque,
+            deinit_fn: *const fn (*anyopaque) void,
+        };
+
+        const alloc = std.heap.c_allocator;
+
+        fn run(self: *Task) void {
+            defer self.done.store(true, .release);
+            const Visitor = struct {
+                task: *Task,
+
+                pub fn append(visitor: *@This(), turn: types.HistoryTurn) !void {
+                    if (visitor.task.cancel_requested.load(.acquire)) return error.TranscriptArchiveReadCancelled;
+                    try visitor.task.turns.ensureUnusedCapacity(alloc, 1);
+                    visitor.task.turns.appendAssumeCapacity(try types.dupeHistoryTurn(alloc, turn));
+                }
+            };
+            var visitor = Visitor{ .task = self };
+            self.damaged = self.reader.visitHistoryCycle(alloc, self.request.start, &visitor) catch |err| blk: {
+                self.failure = err;
+                break :blk false;
+            };
+            self.read_ns = io_mod.nanoTimestamp() - self.started_ns;
+        }
+
+        pub fn deinit(self: *Task) void {
+            if (self.replay) |replay| replay.deinit_fn(replay.state);
+            for (self.turns.items) |turn| types.freeHistoryTurn(alloc, turn);
+            self.turns.deinit(alloc);
+            self.reader.deinit();
+            alloc.destroy(self);
+        }
+    };
+
+    /// Whether a read for `back` at `generation` is running or waits to be
+    /// taken.
+    pub fn pendingFor(self: *const TranscriptArchiveRead, back: u32, generation: u64) bool {
+        const task = self.task orelse return false;
+        return task.request.back == back and task.request.generation == generation;
+    }
+
+    pub fn busy(self: *const TranscriptArchiveRead) bool {
+        return self.task != null;
+    }
+
+    /// Starts reading with `reader`, which the task takes, after stopping
+    /// any read already running. Without threads the read runs here.
+    pub fn start(self: *TranscriptArchiveRead, reader: session_adapter.CycleReader, request: Request) !void {
+        self.cancel();
+        var owned_reader = reader;
+        const task = Task.alloc.create(Task) catch |err| {
+            owned_reader.deinit();
+            return err;
+        };
+        task.* = .{ .reader = owned_reader, .request = request, .started_ns = io_mod.nanoTimestamp() };
+        if (comptime builtin.single_threaded or host_target.is_wasm) {
+            task.run();
+        } else {
+            task.future = io_mod.getIo().concurrent(Task.run, .{task}) catch |err| {
+                task.deinit();
+                return err;
+            };
+        }
+        self.task = task;
+    }
+
+    /// The finished read, which stays here, and busy, while the main thread
+    /// replays its turns; `finish` frees it.
+    pub fn completed(self: *TranscriptArchiveRead) ?*Task {
+        const task = self.task orelse return null;
+        if (!task.done.load(.acquire)) return null;
+        if (task.future) |*future| future.await(io_mod.getIo());
+        task.future = null;
+        return task;
+    }
+
+    /// Drops a finished read that started at another archive generation,
+    /// which a compaction, resume, drop, or clear made stale. Returns
+    /// whether it dropped one.
+    pub fn dropIfStale(self: *TranscriptArchiveRead, generation: u64) bool {
+        const task = self.completed() orelse return false;
+        if (task.request.generation == generation) return false;
+        debug_trace.logf("full_transcript_cache", "archive_read_dropped back={d} reason=stale turns={d}", .{ task.request.back, task.turns.items.len });
+        self.finish();
+        return true;
+    }
+
+    /// Frees the finished read `completed` returned.
+    pub fn finish(self: *TranscriptArchiveRead) void {
+        const task = self.task orelse return;
+        std.debug.assert(task.future == null);
+        self.task = null;
+        task.deinit();
+    }
+
+    /// Stops a running read and waits for its task. The turns it read are
+    /// dropped; the log keeps them.
+    pub fn cancel(self: *TranscriptArchiveRead) void {
+        const task = self.task orelse return;
+        self.task = null;
+        task.cancel_requested.store(true, .release);
+        if (task.future) |*future| future.await(io_mod.getIo());
+        debug_trace.logf("full_transcript_cache", "archive_read_dropped back={d} reason=cancelled turns={d}", .{ task.request.back, task.turns.items.len });
+        task.deinit();
+    }
+};
+
 pub const Persistence = struct {
     // Serializes event-log mutations with worker usage callbacks. Usage takes
     // its checkpoint mutex first, so callers must not checkpoint while held.
@@ -800,7 +1037,17 @@ pub const Persistence = struct {
     v2_children: ?*subagent_child_state.V2Children = null,
     workspace_preferences: ?session_codec.DurableSessionPreferences = null,
     session_preferences: ?session_codec.DurableSessionPreferences = null,
+    /// What the session `/new` replaces had saved, read just before that
+    /// session closes; the new session starts with it.
+    next_session_preferences: ?session_codec.DurableSessionPreferences = null,
     fast_mode_model_bound: bool = false,
+    /// `experimental.workspace_capture`, from startup.
+    workspace_capture: bool = false,
+    /// The current turn's workspace captures (D98).
+    turn_capture: turn_capture.TurnCapture = .{},
+    /// Forks' capture copies still running or not yet reaped, off the UI
+    /// thread (D98); finished at teardown.
+    fork_copies: std.ArrayList(*turn_capture.ForkCopy) = .empty,
     js_host_store: JsHostSessionStore = .{},
     js_host_session: ?JsHostSessionOwner = null,
     process_provider_override: ?model_provider.ProviderId = null,
@@ -812,9 +1059,17 @@ pub const Persistence = struct {
     session_picker_load: SessionPickerLoad = .{},
     session_picker_cache: SessionPickerCatalogCache = .{},
     fork_menu: ForkMenu = .{},
+    /// How many subagent tasks the last switch stopped, for its notice in
+    /// the session it opens (D97).
+    switch_stopped_tasks: usize = 0,
     title_generation: TitleGenerationLoad = .{},
     degraded_warning_emitted: bool = false,
     pending_cancelled_command: ?PendingCancelledCommand = null,
+    /// Where the older compaction cycles Ctrl+O read start in the session log
+    /// (`loadTranscriptArchive`).
+    transcript_archive_boundaries: TranscriptArchiveBoundaries = .{},
+    /// The background read of the cycle Ctrl+O asked for.
+    transcript_archive_read: TranscriptArchiveRead = .{},
     image_snapshot_temp_dir: ?[]u8 = null,
     resume_handoff_intent: ResumeHandoffIntent = .none,
     pending_live_session_policy: ?BackgroundSessionPolicy = null,
@@ -835,7 +1090,7 @@ pub const Persistence = struct {
     /// in a static release-binary template.
     pub fn initInto(storage: *Persistence) void {
         comptime {
-            if (@typeInfo(Persistence).@"struct".field_names.len != 29) {
+            if (@typeInfo(Persistence).@"struct".field_names.len != 36) {
                 @compileError("update Persistence.initInto for the changed field set");
             }
         }
@@ -845,7 +1100,11 @@ pub const Persistence = struct {
         storage.v2_children = null;
         storage.workspace_preferences = null;
         storage.session_preferences = null;
+        storage.next_session_preferences = null;
         storage.fast_mode_model_bound = false;
+        storage.workspace_capture = false;
+        storage.turn_capture = .{};
+        storage.fork_copies = .empty;
         storage.js_host_store = .{};
         storage.js_host_session = null;
         storage.process_provider_override = null;
@@ -857,9 +1116,12 @@ pub const Persistence = struct {
         storage.session_picker_load = .{};
         storage.session_picker_cache = .{};
         storage.fork_menu = .{};
+        storage.switch_stopped_tasks = 0;
         storage.title_generation = .{};
         storage.degraded_warning_emitted = false;
         storage.pending_cancelled_command = null;
+        storage.transcript_archive_boundaries = .{};
+        storage.transcript_archive_read = .{};
         storage.image_snapshot_temp_dir = null;
         storage.resume_handoff_intent = .none;
         storage.pending_live_session_policy = null;
@@ -873,6 +1135,26 @@ pub const Persistence = struct {
 
     pub fn deinit(self: *Persistence, alloc: Allocator) void {
         self.deinitWithCatalog(alloc, .free);
+    }
+
+    /// Copies a fork's workspace captures as a `std.Io` task, so the fork
+    /// never waits on git (D98), and frees the copies already done.
+    pub fn startForkCaptureCopy(self: *Persistence, alloc: Allocator, home: []const u8, source_id: []const u8, fork: *session_adapter.Session, copies: []const session_adapter.Session.ChildCopy) void {
+        var kept: usize = 0;
+        for (self.fork_copies.items) |copy| {
+            if (copy.done()) {
+                copy.finish();
+            } else {
+                self.fork_copies.items[kept] = copy;
+                kept += 1;
+            }
+        }
+        self.fork_copies.shrinkRetainingCapacity(kept);
+        const task = turn_capture.ForkCopy.start(home, source_id, fork, copies) orelse return;
+        self.fork_copies.append(alloc, task) catch |err| {
+            debug_trace.logf("workspace", "event=workspace_capture_fork_refs_awaited err={s}", .{@errorName(err)});
+            task.finish();
+        };
     }
 
     /// Process exit leaves the session picker catalog to the exiting process;
@@ -903,8 +1185,12 @@ pub const Persistence = struct {
             alloc.destroy(children);
         }
         if (self.v2) |v2| v2.close();
+        for (self.fork_copies.items) |copy| copy.finish();
+        self.fork_copies.deinit(alloc);
+        self.turn_capture.deinit();
         if (self.workspace_preferences) |*preferences| preferences.deinit(alloc);
         if (self.session_preferences) |*preferences| preferences.deinit(alloc);
+        if (self.next_session_preferences) |*preferences| preferences.deinit(alloc);
         if (self.js_host_session) |*owner| owner.deinit(alloc);
         if (self.process_model_override) |model| alloc.free(model);
         self.session_picker.deinit(alloc);
@@ -912,6 +1198,9 @@ pub const Persistence = struct {
         if (catalog == .free) self.session_picker_cache.deinit();
         self.fork_menu.close(alloc);
         self.title_generation.deinit();
+        // Before the store, which the read's reader reads through.
+        self.transcript_archive_read.cancel();
+        self.transcript_archive_boundaries.deinit(alloc);
         // After the picker thread, which lists through it, has joined.
         if (self.v2_store) |store| {
             store.deinit(alloc);
@@ -947,4 +1236,96 @@ test "persistence in-place initialization preserves empty ownership" {
     try std.testing.expect(persistence.session_picker_load.task == null);
     try std.testing.expect(!persistence.session_picker_cache.ready);
     try std.testing.expect(persistence.resume_handoff_intent == .none);
+}
+
+/// A saved session with `turns` turns in one compaction cycle, for the
+/// Ctrl+O archive read tests.
+const ArchiveReadTestHome = struct {
+    tmp: std.testing.TmpDir,
+    home: []u8,
+    store: session_adapter.Store,
+    session: *session_adapter.Session,
+    model: [1]u8 = "m".*,
+
+    fn init(self: *ArchiveReadTestHome, turns: usize) !void {
+        const alloc = std.testing.allocator;
+        self.* = .{ .tmp = std.testing.tmpDir(.{ .iterate = true }), .home = undefined, .store = undefined, .session = undefined };
+        errdefer self.tmp.cleanup();
+        self.home = try io_mod.dirRealpathAlloc(alloc, self.tmp.dir, ".");
+        errdefer alloc.free(self.home);
+        self.store = try session_adapter.Store.open(alloc, self.home);
+        errdefer self.store.deinit(alloc);
+        self.session = try session_adapter.Session.create(alloc, &self.store, "/w", .ask, .{
+            .preferences = .{ .model = &self.model, .effort = .auto, .fast_mode = false },
+            .language = types.ConversationLanguage.default(),
+            .permission_state = .{},
+        });
+        errdefer self.session.close();
+        for (0..turns) |_| {
+            try self.session.commitTurn(.{ .assistant = .{
+                .user = .{ .text = @constCast("question") },
+                .assistant = @constCast("answer"),
+            } }, types.ConversationLanguage.default());
+        }
+    }
+
+    fn deinit(self: *ArchiveReadTestHome) void {
+        self.session.close();
+        self.store.deinit(std.testing.allocator);
+        std.testing.allocator.free(self.home);
+        self.tmp.cleanup();
+    }
+
+    fn start(self: *ArchiveReadTestHome, read: *TranscriptArchiveRead, generation: u64) !void {
+        try read.start(try self.session.cycleReader(std.heap.c_allocator), .{ .back = 1, .start = null, .generation = generation });
+    }
+};
+
+fn waitForArchiveRead(read: *TranscriptArchiveRead) !*TranscriptArchiveRead.Task {
+    for (0..5000) |_| {
+        if (read.completed()) |task| return task;
+        io_mod.sleep(std.time.ns_per_ms);
+    }
+    return error.TestArchiveReadTimedOut;
+}
+
+test "a finished Ctrl+O archive read at an older generation is dropped, and one at the current generation stays" {
+    var home: ArchiveReadTestHome = undefined;
+    try home.init(2);
+    defer home.deinit();
+    var read: TranscriptArchiveRead = .{};
+    defer read.cancel();
+
+    try home.start(&read, 4);
+    const task = try waitForArchiveRead(&read);
+    try std.testing.expectEqual(@as(?anyerror, null), task.failure);
+    try std.testing.expectEqual(@as(usize, 2), task.turns.items.len);
+    // Still the transcript's generation: it waits for its replay.
+    try std.testing.expect(!read.dropIfStale(4));
+    try std.testing.expect(read.busy());
+    // A compaction, resume, drop, or clear since then: it goes.
+    try std.testing.expect(read.dropIfStale(5));
+    try std.testing.expect(!read.busy());
+    try std.testing.expect(!read.dropIfStale(5));
+}
+
+test "cancelling a running Ctrl+O archive read stops it, and the next read finishes whole" {
+    var home: ArchiveReadTestHome = undefined;
+    try home.init(300);
+    defer home.deinit();
+    var read: TranscriptArchiveRead = .{};
+    defer read.cancel();
+
+    // Cancelled right after it starts, mostly while it still reads.
+    try home.start(&read, 1);
+    read.cancel();
+    try std.testing.expect(!read.busy());
+    try std.testing.expect(read.completed() == null);
+
+    try home.start(&read, 1);
+    const task = try waitForArchiveRead(&read);
+    try std.testing.expectEqual(@as(?anyerror, null), task.failure);
+    try std.testing.expectEqual(@as(usize, 300), task.turns.items.len);
+    read.finish();
+    try std.testing.expect(!read.busy());
 }

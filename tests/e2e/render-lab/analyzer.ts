@@ -11,8 +11,11 @@ import type {
   RenderLabManifest,
 } from "./types";
 
-export const ACTIVE_TOOL_MARKER = "Running sleep 1; i=1";
-export const TERMINAL_TOOL_MARKER = "Ran sleep 1; i=1";
+// The scenario's command row shows its steps in short form.
+export const ACTIVE_TOOL_MARKER = "Running sleep, printf, sleep";
+export const TERMINAL_TOOL_MARKER = "Ran sleep, printf, sleep";
+// Ctrl+O shows the scenario's command in full.
+export const EXPANDED_TERMINAL_TOOL_MARKER = "Ran sleep 1; i=1";
 const ACTIVE_TOOL_FINAL_MARKER = "RENDER_LAB_LOCAL_GATEWAY_OK";
 const OBSERVABILITY_PERMISSION_PROMPT = "Would you like to run the following command?";
 const OBSERVABILITY_PERMISSION_REVIEW = "Permission needed";
@@ -481,7 +484,7 @@ function assertActiveToolPlacementScenario(
   ].includes(frame.event)) {
     assertMarkerCount(failures, frame, activeMarker, 0);
     if (frame.event !== "active-tool-command-output-expanded-shrink") {
-      assertMarkerCount(failures, frame, terminalMarker, 1);
+      assertMarkerCount(failures, frame, EXPANDED_TERMINAL_TOOL_MARKER, 1);
     }
     assertSemanticScrollbackMarkerCount(
       failures,
@@ -494,7 +497,7 @@ function assertActiveToolPlacementScenario(
       assertSemanticScrollbackMarkerCount(
         failures,
         frame,
-        terminalMarker,
+        EXPANDED_TERMINAL_TOOL_MARKER,
         1,
         "active-tool-terminal-scrollback-once",
       );
@@ -565,8 +568,13 @@ function assertActiveActivitySequence(
   const submittedRows = lines.flatMap((line, row) =>
     line.includes(submittedMarker) ? [row] : []
   );
+  // A group with one call has no summary row: the call is the group's
+  // header, so its activity row is also its group row.
   const groupRows = lines.flatMap((line, row) =>
-    line.includes("tool call") && row < lines.length - 1 ? [row] : []
+    (line.includes("tool call") || (line.startsWith("● ") && line.includes(activeMarker))) &&
+      row < lines.length - 1
+      ? [row]
+      : []
   );
   const activityRows = lines.flatMap((line, row) =>
     line.includes(activeMarker) ? [row] : []
@@ -584,7 +592,7 @@ function assertActiveActivitySequence(
   const submittedRow = submittedRows[0]!;
   const groupRow = groupRows[0]!;
   const activityRow = activityRows[0]!;
-  if (submittedRow >= groupRow || groupRow >= activityRow) {
+  if (submittedRow >= groupRow || groupRow > activityRow) {
     push(
       failures,
       "active-tool-activity-marker-order",
@@ -663,8 +671,10 @@ function assertCommandOutputScrollback(
   let previousRow = -1;
   for (let index = 1; index <= 32; index++) {
     const marker = `ACTIVE_TOOL_LINE_${String(index).padStart(2, "0")}`;
+    // Ctrl+O shows a command's output under it at the detail indent, with
+    // no rail; the main screen's railed rows never count.
     const rows = lines.flatMap((line, row) =>
-      line.trimStart().startsWith(`│ ${marker}`) ? [row] : []
+      line.trimStart().startsWith(marker) ? [row] : []
     );
     if (rows.length !== 1) {
       push(
@@ -1086,17 +1096,13 @@ function isFooterHintRow(line: string): boolean {
   return text.length > 0 && !isDividerRow(line) && !isInputRow(text);
 }
 
+// Ctrl+O's footer is its keys alone, on the bottom row, under one blank row.
 function hasTranscriptViewerFooter(grid: string[]): boolean {
-  for (let row = 0; row + 2 < grid.length; row += 1) {
-    const navigation = semanticText(grid[row] ?? "").trim();
-    if (navigation !== "┃ full detail · ctrl+o close · pgup/pgdn scroll · esc close") {
-      continue;
-    }
-    if (isSemanticBlank(grid[row + 1] ?? "") && isFooterHintRow(grid[row + 2] ?? "")) {
-      return true;
-    }
-  }
-  return false;
+  let row = grid.length - 1;
+  while (row > 0 && isSemanticBlank(grid[row] ?? "")) row -= 1;
+  return row > 0 &&
+    semanticText(grid[row] ?? "").trim() === "esc close · pgup/pgdn scroll" &&
+    isSemanticBlank(grid[row - 1] ?? "");
 }
 
 function isDividerRow(line: string): boolean {

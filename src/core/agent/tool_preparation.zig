@@ -585,7 +585,7 @@ test "classifiers are ordered" {
 
         fn idempotent(_: ?*anyopaque, callback_alloc: Allocator, call: ToolCall) anyerror!?CallbackTerminal {
             idempotent_calls += 1;
-            if (!std.mem.eql(u8, call.name, "skill")) return null;
+            if (!std.mem.eql(u8, call.name, "toolbox")) return null;
             return .{ .model_output = try callback_alloc.dupe(u8, "already loaded") };
         }
 
@@ -604,7 +604,7 @@ test "classifiers are ordered" {
     test_web_search.name = "web_search";
     test_web_search.model_schema.name = "web_search";
     const tools = [_]tool_dispatch.Tool{
-        builtin_tools.skill,
+        builtin_tools.toolbox,
         test_web_search,
         builtin_tools.shell,
     };
@@ -619,8 +619,8 @@ test "classifiers are ordered" {
     Fixture.validation_calls = 0;
     Fixture.availability_calls = 0;
     var skipped = try prepareReadyCall(alloc, .{
-        .id = "skill",
-        .name = "skill",
+        .id = "toolbox",
+        .name = "toolbox",
         .arguments_json = "{\"name\":\"demo\",\"location\":\"/tmp/demo\"}",
     }, .{ .tool_registry = registry, .workspace_root = "/tmp/workspace", .classifiers = classifiers });
     defer skipped.deinit(alloc);

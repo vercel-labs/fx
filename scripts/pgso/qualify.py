@@ -54,7 +54,6 @@ STARTUP_COMMANDS = (
     ("help", ("help",)),
     ("version", ("--version",)),
     ("status", ("status", "--json")),
-    ("doctor", ("doctor", "--json")),
     ("sessions", ("sessions", "--json")),
 )
 
@@ -123,6 +122,10 @@ BENCHMARK_PLANS = (
         function_prefixes=(
             "core.output.diff.",
             "core.permissions.approval_prompt.",
+            # The review rows spend most of their time measuring and encoding
+            # text, so the shared text helpers carry this workload's counts.
+            "core.shared.display_width.",
+            "core.shared.text_utils.",
             "ui.approval_screen.",
             "ui.footer.approval_ui.",
             "ui.render_engine.transcript_blocks.",
@@ -521,7 +524,7 @@ def measure_alternating(
     )
 
 
-def measure_with_one_retry(
+def _measure_with_one_retry(
     measure: Callable[[pathlib.Path], MeasurementResult],
     logs: pathlib.Path,
 ) -> MeasurementResult:
@@ -792,11 +795,13 @@ def relink_profile_linked_benchmarks(
             pair_paths,
             pair.bitcode_sha256,
             profile_path=mapped_profile_path,
+            production_flags=True,
         )
         candidate = link_candidate(
             toolchain,
             pair_paths,
             require_release_safe_evidence=False,
+            production_flags=True,
         )
         relinked[plan.selector] = dataclasses.replace(
             linked,
@@ -1012,7 +1017,7 @@ def measure_startup(
             )
 
         results.append(
-            measure_with_one_retry(measure_command, logs)
+            _measure_with_one_retry(measure_command, logs)
             if retry_speed_failures
             else measure_command(logs)
         )
@@ -1217,7 +1222,7 @@ def measure_heavy_workloads(
                     sample_runner=sample_runner,
                 )
 
-            results.append(measure_with_one_retry(measure_workload, logs / workload.name))
+            results.append(_measure_with_one_retry(measure_workload, logs / workload.name))
     return tuple(results)
 
 

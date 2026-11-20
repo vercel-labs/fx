@@ -1,5 +1,6 @@
 const std = @import("std");
 const model_capabilities = @import("../core/config/model_capabilities.zig");
+const ascii_case = @import("../core/shared/ascii_case.zig");
 
 pub fn capabilitiesForModel(model: []const u8) model_capabilities.Capabilities {
     var capabilities = model_capabilities.capabilitiesForModel(model);
@@ -11,13 +12,24 @@ pub fn capabilitiesForModel(model: []const u8) model_capabilities.Capabilities {
 }
 
 /// The cache markers fx sends for `model`. AI Gateway's automatic caching
-/// covers every family; fx adds markers only where the provider honors them:
-/// Anthropic models, and OpenAI GPT-5.6 and later through explicit
-/// breakpoints.
+/// covers most families; fx adds markers only where the provider honors them:
+/// Anthropic models, OpenAI GPT-5.6 and later through explicit breakpoints,
+/// and Amazon Nova through Bedrock cache points, which the Gateway never adds.
 pub fn cacheMarkers(model: []const u8) model_capabilities.CacheMarkers {
     if (std.mem.startsWith(u8, model, "anthropic/")) return .anthropic;
     if (takesPromptCacheOptions(model)) return .openai;
+    if (takesBedrockCachePoints(model)) return .bedrock;
     return .none;
+}
+
+/// Whether `model` is an Amazon Nova chat model that reads its prompt cache
+/// from a Bedrock cache point. Without one, Nova reports no cache reads.
+/// A model joins the list once the Gateway prices its cache reads.
+fn takesBedrockCachePoints(model: []const u8) bool {
+    for ([_][]const u8{ "amazon/nova-micro", "amazon/nova-lite", "amazon/nova-pro", "amazon/nova-2-lite" }) |candidate| {
+        if (std.mem.eql(u8, model, candidate)) return true;
+    }
+    return false;
 }
 
 /// Whether `model` takes only one system message, at the start. Qwen's chat
@@ -64,7 +76,10 @@ test "cache markers follow the model family" {
     try std.testing.expectEqual(.anthropic, cacheMarkers("anthropic/claude-sonnet-5.5"));
     try std.testing.expectEqual(.openai, cacheMarkers("openai/gpt-6.1-sol"));
     try std.testing.expectEqual(.openai, cacheMarkers("openai/gpt-5.6-luna"));
-    for ([_][]const u8{ "openai/gpt-5", "openai/gpt-5.5-pro", "bedrock/anthropic.claude", "anthropic", "google/gemini-3-flash" }) |model| {
+    for ([_][]const u8{ "amazon/nova-micro", "amazon/nova-lite", "amazon/nova-pro", "amazon/nova-2-lite" }) |model| {
+        try std.testing.expectEqual(.bedrock, cacheMarkers(model));
+    }
+    for ([_][]const u8{ "openai/gpt-5", "openai/gpt-5.5-pro", "bedrock/anthropic.claude", "anthropic", "google/gemini-3-flash", "amazon/titan-embed-text-v2", "amazon/nova", "nova-pro" }) |model| {
         try std.testing.expectEqual(.none, cacheMarkers(model));
     }
 }
@@ -89,7 +104,7 @@ pub fn contextWindowSize(model: []const u8) ?u32 {
         return 200_000;
     }
     if (std.mem.startsWith(u8, model, "openai/")) {
-        if (containsIgnoreCase(model, "gpt-5")) return 256_000;
+        if (ascii_case.hasMajorVersionAtLeast(model, "gpt-", 5)) return 256_000;
         if (containsIgnoreCase(model, "o3") or
             containsIgnoreCase(model, "o4") or
             containsIgnoreCase(model, "o1")) return 200_000;
@@ -118,4 +133,11 @@ test "Vercel fallback policy owns vendor model heuristics" {
     try std.testing.expect(!capabilitiesForModel("moonshotai/kimi-k3-fast").supports_fast_mode);
     try std.testing.expectEqual(@as(?u32, 1_000_000), contextWindowSize("anthropic/claude-opus-4.8"));
     try std.testing.expectEqual(@as(?bool, true), capabilitiesForModel("xai/grok-4").parallel_tool_calls);
+}
+
+test "fallback context window covers every GPT major from 5" {
+    for ([_][]const u8{ "openai/gpt-5.4", "openai/gpt-6-sol", "openai/gpt-6.1-sol" }) |model| {
+        try std.testing.expectEqual(@as(?u32, 256_000), contextWindowSize(model));
+    }
+    try std.testing.expectEqual(@as(?u32, 128_000), contextWindowSize("openai/gpt-4o"));
 }

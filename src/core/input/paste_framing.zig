@@ -545,6 +545,48 @@ test "a same-epoch suffix is counted and never captured" {
     );
 }
 
+test "generated same-epoch suffixes never join the paste and are all counted" {
+    // A crafted clipboard can follow an embedded end marker with anything,
+    // including more end markers and paste starts. None of it may join the
+    // paste, and every byte must be counted for the dropped-input notice.
+    const alloc = std.testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0x1379);
+    const random = prng.random();
+    var payload: std.ArrayList(u8) = .empty;
+    defer payload.deinit(alloc);
+    var suffix: std.ArrayList(u8) = .empty;
+    defer suffix.deinit(alloc);
+    for (0..2_000) |_| {
+        payload.clearRetainingCapacity();
+        suffix.clearRetainingCapacity();
+        for (0..random.uintLessThan(usize, 64)) |_| {
+            const byte: u8 = if (random.uintLessThan(u8, 20) == 0) '\n' else random.intRangeAtMost(u8, ' ', '~');
+            try payload.append(alloc, byte);
+        }
+        for (0..random.uintLessThan(usize, 48)) |_| {
+            switch (random.uintLessThan(u8, 10)) {
+                0 => try suffix.appendSlice(alloc, paste_end_marker),
+                1 => try suffix.appendSlice(alloc, "\x1b[200~"),
+                2 => try suffix.append(alloc, '\r'),
+                else => try suffix.append(alloc, random.int(u8)),
+            }
+        }
+
+        var state: State = .{};
+        defer state.deinit(alloc);
+        state.begin(.composer, std.math.maxInt(usize));
+        for (payload.items) |byte| try state.consumeByte(alloc, byte);
+        for (paste_end_marker) |byte| try state.consumeByte(alloc, byte);
+        for (suffix.items) |byte| try state.consumeByte(alloc, byte);
+
+        try std.testing.expectEqualStrings(payload.items, state.buffer.items);
+        try std.testing.expectEqual(
+            Settlement{ .finish = .{ .dropped_suffix_bytes = suffix.items.len } },
+            state.settleDeliveryEpoch(),
+        );
+    }
+}
+
 test "traced reset reports dropped captures and clears only paste state" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});

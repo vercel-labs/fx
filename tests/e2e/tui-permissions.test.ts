@@ -1146,7 +1146,9 @@ describe.skipIf(!tmuxAvailable())("tui: file permissions", () => {
       const cases = [
         {
           name: "denied",
-          outcome: "1 denied",
+          // The group's only call is its header, which says it was denied
+          // and names the file it would have written.
+          outcome: "● Denied marker-denied.txt",
           resolve: async (session: TmuxSession) => {
             await decide(session, 3);
           },
@@ -1430,6 +1432,68 @@ describe.skipIf(!tmuxAvailable())("tui: file permissions", () => {
     90_000,
   );
 
+  test.skipIf(!tmuxAvailable())(
+    "an edit row keeps its counts when a long file name is clipped",
+    async () => {
+      const width = 80;
+      const root = createIsolatedRoot();
+      const relativePath =
+        "packages/render-pipeline/transcript-projection/grouped-rows/edit-row-fixture-with-a-file-name-much-too-long-for-an-eighty-column-row.txt";
+      const target = join(root.workspace, relativePath);
+      mkdirSync(join(target, ".."), { recursive: true });
+      writeFileSync(target, "one\ntwo\n");
+      const gateway = startFakeGateway([
+        toolCall("first_long_edit", "edit_file", {
+          path: relativePath,
+          old_string: "one\n",
+          new_string: "uno\n",
+        }),
+        toolCall("second_long_edit", "edit_file", {
+          path: relativePath,
+          old_string: "two\n",
+          new_string: "dos\n",
+        }),
+        finalText("long path edits complete"),
+      ]);
+      const { session, stderrPath } = await launch(root, gateway, { width }, {
+        FX_PERMISSION_MODE: "full-access",
+        FX_THEME: "dark",
+        NO_COLOR: undefined,
+        COLORTERM: undefined,
+        TERM_PROGRAM: "Apple_Terminal",
+        COLORFGBG: "15;0",
+      });
+
+      await session.sendText("Edit the long path fixture twice.");
+      // Both edits change one file, so they share one row, which is the
+      // group's line. It shows the file by name, not its path.
+      await session.waitForPane(
+        (pane) => pane.includes("long path edits complete") && /^● Edited edit-row-fixture/m.test(pane),
+        TIMEOUT,
+      );
+      expect(readFileSync(target, "utf8")).toBe("uno\ndos\n");
+
+      const grid = await session.capturePaneGrid();
+      const rows = grid.filter((line) => line.startsWith("● Edited edit-row-fixture"));
+      expect(rows).toHaveLength(1);
+      expect([...rows[0]!.trimEnd()].length).toBeLessThanOrEqual(width);
+      // The name clips; the added-up counts and the merge note stay.
+      expect(rows[0]!.trimEnd()).toMatch(/^● Edited edit-row-fixture\S*… \+2\/-2 · 2 edits$/);
+      expect(grid.some((line) => line.includes("packages/"))).toBe(false);
+
+      const escapes = await session.capturePaneEscapes();
+      // The counts keep their colors after the clipped name.
+      const styledRows = escapes.split("\n").filter((line) => line.includes("Edited ") && line.includes("edit-row-fixture"));
+      expect(styledRows).toHaveLength(1);
+      expect(styledRows[0]).toContain("\x1b[38;5;71m+2");
+      expect(styledRows[0]).toContain("\x1b[38;5;167m-2");
+      expectCleanStderr(stderrPath);
+      await session.kill();
+      activeSession = null;
+    },
+    60_000,
+  );
+
   test(
     "file session grant reuses the canonical target without a second prompt",
     async () => {
@@ -1543,7 +1607,7 @@ describe.skipIf(!tmuxAvailable())("tui: file permissions", () => {
       expect(compactScrollback).not.toContain("CTRL_O_FIRST_060");
 
       await session.sendKeys("C-o");
-      await session.waitForText("full detail · ctrl+o close", TIMEOUT);
+      await session.waitForText("esc close · pgup/pgdn scroll", TIMEOUT);
       // Page to the tail of the second diff; the page count varies with
       // session and network record height at the top of the transcript.
       let fullSecond = await session.capturePane();
@@ -1630,7 +1694,7 @@ describe.skipIf(!tmuxAvailable())("tui: file permissions", () => {
       expect(inline).not.toContain("NEW_WRAP_TAIL");
 
       await session.sendKeys("C-o");
-      await session.waitForText("full detail · ctrl+o close", TIMEOUT);
+      await session.waitForText("esc close · pgup/pgdn scroll", TIMEOUT);
       const full = await session.capturePane();
       expectDiffSentinelOnRail(full, "OLD_WRAP_TAIL");
       expectDiffSentinelOnRail(full, "NEW_WRAP_TAIL");

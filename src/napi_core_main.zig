@@ -15,6 +15,7 @@ const fetch_state = @import("napi_fetch_state.zig");
 const http_config = @import("core/mcp/http_config.zig");
 const host_stream_provider = @import("gateway/host_stream_provider.zig");
 const host_openai_codex = @import("gateway/host_openai_codex.zig");
+const openai_codex = @import("gateway/openai_codex.zig");
 const host_xai_grok = @import("gateway/host_xai_grok.zig");
 const host_chat_completions = @import("gateway/host_chat_completions.zig");
 const configured_provider = @import("core/config/configured_provider.zig");
@@ -395,6 +396,8 @@ const FetchBridge = struct {
     last_consumed_handle: ?fetch_state.Handle = null,
     next_handle: fetch_state.Handle = 1,
     status: u16 = 0,
+    /// The response's Retry-After in whole seconds, or -1 when it has none.
+    retry_after_seconds: i32 = -1,
     ready: ?*ReadyNotifier = null,
 
     fn clearPendingRequest(self: *FetchBridge) void {
@@ -484,6 +487,20 @@ const FetchBridge = struct {
         };
     }
 
+    /// Read only after `statusFn` reports the response, so the value the host
+    /// published with the status is already in place.
+    fn retryAfterFn(raw: ?*anyopaque, handle: i32) i32 {
+        const self: *FetchBridge = @ptrCast(@alignCast(raw.?));
+        const io = io_mod.getIo();
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        return switch (self.phase) {
+            .streaming => |active| if (active == handle) self.retry_after_seconds else -1,
+            .terminal => |terminal| if (terminal.handle == handle and terminal.kind == .success) self.retry_after_seconds else -1,
+            else => -1,
+        };
+    }
+
     fn next(raw: ?*anyopaque, handle: i32, out: []u8) i32 {
         const self: *FetchBridge = @ptrCast(@alignCast(raw.?));
         const io = io_mod.getIo();
@@ -532,6 +549,7 @@ const FetchBridge = struct {
         self.clearPendingRequest();
         self.phase = decision.phase;
         self.status = 0;
+        self.retry_after_seconds = -1;
         self.response.clearRetainingCapacity();
         self.response_offset = 0;
         self.wake.broadcast(io);
@@ -556,13 +574,14 @@ const FetchBridge = struct {
         return fetch_state.disposition(self.phase, self.last_consumed_handle, handle);
     }
 
-    fn startResponse(self: *FetchBridge, handle: fetch_state.Handle, status: u16) FetchOperationResult {
+    fn startResponse(self: *FetchBridge, handle: fetch_state.Handle, status: u16, retry_after_seconds: i32) FetchOperationResult {
         const io = io_mod.getIo();
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
         const decision = fetch_state.decide(self.phase, .{ .start = handle });
         if (decision.action == .stale) return .stale;
         self.status = status;
+        self.retry_after_seconds = retry_after_seconds;
         self.phase = decision.phase;
         self.wake.broadcast(io);
         return .applied;
@@ -702,6 +721,7 @@ const Runtime = struct {
             .chat_url = builtin_gateway.provider.chat_url,
         };
         var providers = provider_set.gateway_only(.{
+            .capabilities = .{ .gateway_prompt_caching = true },
             .presentation = builtin_gateway.provider_bundle.presentation,
             .auth_strategy = .vercel,
             .fallback_model_capabilities_fn = builtin_gateway.provider_bundle.fallback_model_capabilities_fn,
@@ -709,6 +729,7 @@ const Runtime = struct {
             .model_catalog = @import("gateway/host_model_catalog.zig").provider(&self.stream_context.transport),
         });
         providers.codex = .{
+            .capabilities = openai_codex.bundle_capabilities,
             .presentation = provider_catalog.find(.codex),
             .auth_strategy = .chatgpt,
             .agent_stream = bridgeBound(host_openai_codex.provider(&self.codex_context)),
@@ -1081,6 +1102,7 @@ fn createRuntime(env: c.napi_env, options: c.napi_value) CreateError!*Runtime {
         .next_fn = FetchBridge.next,
         .close_fn = FetchBridge.close,
         .consumed_fn = FetchBridge.markConsumed,
+        .retry_after_fn = FetchBridge.retryAfterFn,
     });
     runtime.codex_context = .{ .transport = runtime.stream_context.transport };
     runtime.grok_context = .{ .transport = runtime.stream_context.transport };
@@ -1401,10 +1423,40 @@ fn startCoreFetchResponse(env: c.napi_env, info: c.napi_callback_info) callconv(
     const fetch_handle = fetch_handle_arg(env, argv[1]) orelse return null;
     const runtime = lockRuntime(env, runtime_handle) orelse return null;
     defer unlockRuntime(runtime_handle);
+    const status = fetch_status_arg(env, argv[2]) orelse return null;
+    return fetch_operation_value(env, runtime.fetch.startResponse(fetch_handle, status, -1));
+}
+
+/// Like `startCoreFetchResponse`, and also publishes the response's
+/// Retry-After in whole seconds, or -1 when it has none. A separate export so
+/// a loader can tell whether the addon takes it.
+fn startCoreFetchResponseWithRetryAfter(env: c.napi_env, info: c.napi_callback_info) callconv(.c) c.napi_value {
+    var argv: [4]c.napi_value = undefined;
+    const runtime_handle = runtimeHandleArg(env, info, &argv) orelse return null;
+    const fetch_handle = fetch_handle_arg(env, argv[1]) orelse return null;
+    const runtime = lockRuntime(env, runtime_handle) orelse return null;
+    defer unlockRuntime(runtime_handle);
+    const status = fetch_status_arg(env, argv[2]) orelse return null;
+    var seconds: f64 = 0;
+    if (c.napi_get_value_double(env, argv[3], &seconds) != c.napi_ok or
+        !std.math.isFinite(seconds) or
+        seconds < -1 or
+        seconds > @as(f64, @floatFromInt(std.math.maxInt(i32))) or
+        @floor(seconds) != seconds)
+    {
+        _ = c.napi_throw_type_error(env, "LIBFX_INVALID_ARGUMENT", "fetch Retry-After must be -1 or a non-negative int32");
+        return null;
+    }
+    return fetch_operation_value(env, runtime.fetch.startResponse(fetch_handle, status, @intFromFloat(seconds)));
+}
+
+fn fetch_status_arg(env: c.napi_env, value: c.napi_value) ?u16 {
     var status: u32 = 0;
-    if (c.napi_get_value_uint32(env, argv[2], &status) != c.napi_ok or status > std.math.maxInt(u16))
-        return throw(env, "LIBFX_INVALID_ARGUMENT", "fetch response status must be a uint16");
-    return fetch_operation_value(env, runtime.fetch.startResponse(fetch_handle, @intCast(status)));
+    if (c.napi_get_value_uint32(env, value, &status) != c.napi_ok or status > std.math.maxInt(u16)) {
+        _ = throw(env, "LIBFX_INVALID_ARGUMENT", "fetch response status must be a uint16");
+        return null;
+    }
+    return @intCast(status);
 }
 
 fn pushCoreFetchResponse(env: c.napi_env, info: c.napi_callback_info) callconv(.c) c.napi_value {
@@ -1516,6 +1568,7 @@ export fn napi_register_module_v1(env: c.napi_env, exports: c.napi_value) callco
     if (!exportFunction(env, exports, "coreFetchActive", coreFetchActive)) return null;
     if (!exportFunction(env, exports, "coreFetchDisposition", coreFetchDisposition)) return null;
     if (!exportFunction(env, exports, "startCoreFetchResponse", startCoreFetchResponse)) return null;
+    if (!exportFunction(env, exports, "startCoreFetchResponseWithRetryAfter", startCoreFetchResponseWithRetryAfter)) return null;
     if (!exportFunction(env, exports, "pushCoreFetchResponse", pushCoreFetchResponse)) return null;
     if (!exportFunction(env, exports, "finishCoreFetch", finishCoreFetch)) return null;
     if (!exportFunction(env, exports, "failCoreFetch", failCoreFetch)) return null;

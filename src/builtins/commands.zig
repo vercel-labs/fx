@@ -34,6 +34,7 @@ pub const login_options = [_]command_specs.OptionDoc{
 };
 
 pub const sessions_options = [_]command_specs.OptionDoc{
+    .{ .flag = "--live", .description = "List only the sessions an fx process has open now, with their subagents" },
     .{ .flag = "--all", .description = "List saved sessions across every workspace in this profile" },
     .{ .flag = "--limit <1-100>", .description = "Set the maximum sessions returned per page" },
     .{ .flag = "--cursor <cursor>", .description = "Continue from a prior sessions result" },
@@ -42,9 +43,26 @@ pub const sessions_options = [_]command_specs.OptionDoc{
 
 pub const sessions_convert_options = [_]command_specs.OptionDoc{json_option};
 
+const sessions_subcommands = [_]command_specs.SubcommandDoc{
+    .{ .usage = "ls", .description = "List saved sessions (default)", .options = &sessions_options },
+    .{ .usage = "convert", .description = "Convert every session saved in the previous format", .options = &sessions_convert_options },
+};
+
+const models_subcommands = [_]command_specs.SubcommandDoc{
+    .{ .usage = "ls", .description = "List available models (default)", .options = &.{json_option} },
+};
+
 pub const usage_options = [_]command_specs.OptionDoc{
     .{ .flag = "--period <today|7d|month>", .description = "Select the period, in UTC days (default: month)" },
     json_option,
+};
+
+/// Options for `fx doctor`. Its parser in `src/core/cli/cli_surface.zig`
+/// reads this list, so help and parsing can't disagree.
+pub const doctor_options = [_]command_specs.OptionDoc{
+    json_option,
+    .{ .flag = "--fix", .description = "Remove old terminal and side folders whose session is gone" },
+    .{ .flag = "--deep", .description = "Read every saved file of each session checked, with no time limit; slower" },
 };
 
 pub const upgrade_options = [_]command_specs.OptionDoc{
@@ -91,6 +109,7 @@ const session_subcommands = [_]command_specs.SubcommandDoc{
 
 pub const session_options = [_]command_specs.OptionDoc{
     .{ .flag = "--id <id>", .description = "Inspect a saved session by exact id" },
+    .{ .flag = "--tail <1-1000>", .description = "Show only the last turns, each under its own number" },
     json_option,
 };
 
@@ -193,8 +212,8 @@ fn agentRunOptions(comptime scope: []const u8, comptime provider_order: Provider
         .{ .flag = "--effort <level>", .description = "Override the reasoning effort for " ++ scope },
         .{ .flag = "--fast", .description = "Enable Fast mode for " ++ scope ++ " when the model supports it" },
         .{ .flag = "--no-fast", .description = "Disable Fast mode for " ++ scope },
-        .{ .flag = "--ultrafast", .description = "Request Ultra mode for " ++ scope ++ " when the model supports it" },
-        .{ .flag = "--no-ultrafast", .description = "Disable Ultra mode for " ++ scope },
+        .{ .flag = "--ultrafast", .description = "Request Ultrafast mode for " ++ scope ++ " when the model supports it" },
+        .{ .flag = "--no-ultrafast", .description = "Disable Ultrafast mode for " ++ scope },
         .{ .flag = "--provider-order <a,b,...>", .description = "Prefer these gateway providers in order for " ++ scope },
         .{ .flag = "--provider-strict", .description = "Restrict " ++ scope ++ " to only the providers in --provider-order" },
         .{ .flag = "--no-provider-strict", .description = "Clear the provider restriction for " ++ scope },
@@ -239,7 +258,8 @@ pub const top_level_specs = [_]TopLevelSpec{
             "The prompt may be passed as arguments or piped on stdin when no prompt args are given.",
             "TTY stdout uses the Minimal transcript presentation; redirected stdout emits raw assistant Markdown.",
             "Operational progress and diagnostics are written to stderr. JSON `output` keeps accumulated assistant Markdown; `final_output` contains only the completed final response, or an empty string when absent.",
-            "JSON usage sums reported main-agent input_tokens and output_tokens, including with --no-save; unreported counts are null. cache_read_tokens and cache_write_tokens appear only when the provider reports them. Nested usage and dollar spend are excluded.",
+            "JSON usage sums reported main-agent input_tokens and output_tokens, including with --no-save; unreported counts are null. cache_read_tokens and cache_write_tokens appear only when the provider reports them. Subagent usage and dollar spend are excluded.",
+            "JSON subagents appears only when a subagent did work in this request. It lists each one in the order it first ran, with its name, id, and usage in the same shape, counted for this request alone. fx session <session_id>/<name> reads one and prints the same id.",
             "--system replaces only the built-in base prompt for this request; tool, skill, project, and runtime context still apply.",
             "With --prompt-permissions, JSON and quiet requests may prompt on stderr only when stdin is a TTY.",
         },
@@ -326,8 +346,9 @@ pub const top_level_specs = [_]TopLevelSpec{
     .{
         .kind = .models,
         .token = "models",
-        .usage = "models [--json]",
+        .usage = "models [ls] [--json]",
         .summary = "List available models",
+        .subcommands = &models_subcommands,
         .options = &.{json_option},
     },
     .{
@@ -339,9 +360,9 @@ pub const top_level_specs = [_]TopLevelSpec{
     .{
         .kind = .doctor,
         .token = "doctor",
-        .usage = "doctor [--json]",
-        .summary = "Run local health and preflight checks",
-        .options = &.{json_option},
+        .usage = "doctor [--json] [--fix] [--deep]",
+        .summary = "Check that fx can work here, with a fix for each problem",
+        .options = &doctor_options,
     },
     .{
         .kind = .teams,
@@ -352,18 +373,25 @@ pub const top_level_specs = [_]TopLevelSpec{
     .{
         .kind = .session,
         .token = "session",
-        .usage = "session <last|id>|--id <id> [--json] | session resume [last|<id>] | session recover <id>|--id <id> [--json]",
+        .usage = "session <last|id|id/agent>|--id <id> [--tail <1-1000>] [--json] | session resume [last|<id>] | session recover <id>|--id <id> [--json]",
         .summary = "Inspect, resume, or recover saved sessions",
         .subcommands = &session_subcommands,
         .options = &session_options,
+        .details = &.{
+            "<id>/<agent> reads a subagent by the name its parent gave it, and <id>/<agent>/<agent> that subagent's own; fx sessions --live lists them.",
+            "Reading takes no lock, so it works while another fx has the session open. --tail shows finished turns; the one in progress is not saved yet.",
+        },
     },
     .{
         .kind = .sessions,
         .token = "sessions",
-        .usage = "sessions [--all] [--limit <1-100>] [--cursor <cursor>] [--json] | sessions convert [--json]",
+        .usage = "sessions [ls] [--all] [--limit <1-100>] [--cursor <cursor>] [--json] | sessions [ls] --live [--all] [--json] | sessions convert [--json]",
         .summary = "List saved sessions for the current workspace",
-        .subcommands = &.{.{ .usage = "convert", .description = "Convert every session saved in the previous format", .options = &sessions_convert_options }},
+        .subcommands = &sessions_subcommands,
         .options = &sessions_options,
+        .details = &.{
+            "--live shows each session's state (working, idle, or unknown) and the model saved with it, with its subagents in a tree below it; fx session <id>/<agent> reads one.",
+        },
     },
     .{
         .kind = .@"resume",
@@ -512,6 +540,7 @@ pub const launch_wide_options = [_]command_specs.OptionDoc{
     .{ .flag = "--context-limit <spec>", .description = "" },
     .{ .flag = "--add-dir <path>", .description = "" },
     .{ .flag = "--no-additional-dirs", .description = "" },
+    .{ .flag = "--tool-placement <spec>", .description = "" },
 };
 
 /// The flags `fx` reads before a command or an interactive launch, in the
@@ -572,6 +601,10 @@ pub const top_level_flags = [_]TopLevelFlag{
         .description = "Ignore saved additional directories",
     },
     .{
+        .usage = "--tool-placement <spec>",
+        .description = "Move a built-in tool: tool=toolbox or tool=direct; repeatable",
+    },
+    .{
         .usage = "--provider <name>",
         .description = "Override the model provider for an interactive session (gateway, codex, grok, or a configured name)",
     },
@@ -605,7 +638,7 @@ pub const top_level_flags = [_]TopLevelFlag{
     },
     .{
         .usage = "--ultrafast, --no-ultrafast",
-        .description = "Request Ultra mode on or off for an interactive session",
+        .description = "Request Ultrafast mode on or off for an interactive session",
     },
     .{
         .usage = "--permission-mode <mode>",
@@ -696,15 +729,15 @@ pub const slash_specs = [_]SlashSpec{
     .{ .kind = .launch_instance, .command = "/launch", .help_entry = "/launch [profile]", .completion_description = "start another fx instance on this host", .presentation_category = .session, .has_args = true, .accepts_payload = true },
     .{ .kind = .close_instance, .command = "/close", .help_entry = "/close", .completion_description = "close the fx instance on screen", .presentation_category = .session },
     .{ .kind = .show_agents, .command = "/agents", .help_entry = "/agents", .completion_description = "list the open agents and switch to one", .presentation_category = .session },
-    .{ .kind = .rename_session, .command = "/rename", .help_entry = "/rename <title>", .completion_description = "rename the current session", .presentation_category = .session, .has_args = true, .accepts_payload = true },
+    .{ .kind = .rename_session, .command = "/rename", .help_entry = "/rename <title>", .completion_description = "rename the current session", .presentation_category = .session, .has_args = true, .requires_args = true, .accepts_payload = true },
     .{ .kind = .fork_session, .command = "/fork", .help_entry = "/fork", .completion_description = "fork the session before a prompt", .presentation_category = .session },
     .{ .kind = .login, .command = "/login", .help_entry = "/login", .completion_description = "choose the model provider and how it signs in", .presentation_category = .account, .has_args = true },
     .{ .kind = .logout, .command = "/logout", .help_entry = "/logout [vercel|codex|grok]", .completion_description = "sign out of a provider session", .presentation_category = .account, .has_args = true, .accepts_payload = true },
     .{ .kind = .provider, .command = "/provider", .aliases = &.{"/setup"}, .show_aliases_in_completion = false, .help_entry = "/provider", .completion_description = "choose the model provider and how it signs in", .presentation_category = .account, .has_args = true },
-    .{ .kind = .stats, .command = "/stats", .help_entry = "/stats", .completion_description = "show token and turn statistics", .presentation_category = .account },
+    .{ .kind = .stats, .command = "/stats", .help_entry = "/stats", .completion_description = "show terminal rendering counters", .presentation_category = .account },
     .{ .kind = .usage, .command = "/usage", .aliases = &.{}, .help_entry = "/usage", .completion_description = "show your provider's usage and spend", .presentation_category = .account },
     .{ .kind = .status, .command = "/status", .help_entry = "/status", .completion_description = "show runtime configuration and the session ID", .presentation_category = .general, .show_in_welcome = true },
-    .{ .kind = .image, .command = "/image", .aliases = &.{"/img"}, .help_entry = "/image <path> (/img)", .completion_description = "attach an image by path", .presentation_category = .media, .has_args = true, .accepts_payload = true },
+    .{ .kind = .image, .command = "/image", .aliases = &.{"/img"}, .help_entry = "/image <path> (/img)", .completion_description = "attach an image by path", .presentation_category = .media, .has_args = true, .requires_args = true, .accepts_payload = true },
     .{ .kind = .images, .command = "/images", .help_entry = "/images [clear]", .completion_description = "manage pending image attachments", .presentation_category = .media, .has_args = true, .accepts_payload = true },
     .{ .kind = .model, .command = "/model", .help_entry = "/model <id-or-query>", .completion_description = "choose what model and reasoning effort to use", .presentation_category = .model, .has_args = true, .accepts_payload = true },
     .{ .kind = .effort, .command = "/effort", .help_entry = "/effort [level]", .completion_description = "choose the reasoning effort for the current model", .presentation_category = .model, .has_args = true, .accepts_payload = true },
@@ -715,17 +748,17 @@ pub const slash_specs = [_]SlashSpec{
     .{ .kind = .skills, .command = "/skills", .help_entry = "/skills [list|add|install|show|create|remove|path] [name|url|path] ($ opens skill search)", .completion_description = "browse and manage skills", .presentation_category = .extensions, .has_args = true, .accepts_payload = true },
     .{ .kind = .copy, .command = "/copy", .help_entry = "/copy", .completion_description = "copy the last assistant response", .presentation_category = .session },
     .{ .kind = .feedback, .command = "/feedback", .help_entry = "/feedback", .completion_description = "open the fx feedback form", .presentation_category = .product, .show_in_welcome = true },
-    .{ .kind = .trace, .command = "/trace", .help_entry = "/trace", .completion_description = "copy a private diagnostic trace", .presentation_category = .product },
+    .{ .kind = .trace, .command = "/trace", .help_entry = "/trace", .completion_description = "copy a private diagnostic trace as JSONL", .presentation_category = .product },
     .{ .kind = .compact, .command = "/compact", .help_entry = "/compact", .completion_description = "summarize context into a fresh window", .presentation_category = .session },
     .{ .kind = .settings, .command = "/settings", .help_entry = "/settings [startup-scrollback [on|off]]", .completion_description = "browse and update settings", .presentation_category = .appearance, .has_args = true, .accepts_payload = true },
     .{ .kind = .credits, .command = "/credits", .aliases = &.{"/balance"}, .help_entry = "/credits (/balance)", .completion_description = "show gateway credits balance", .presentation_category = .account, .requires_prompt_credential = true },
     .{ .kind = .paste, .command = "/paste", .help_entry = "/paste", .completion_description = "attach an image from the clipboard when supported", .presentation_category = .media },
     .{ .kind = .fast, .command = "/fast", .help_entry = "/fast [on|off]", .completion_description = "toggle Fast mode when supported", .presentation_category = .model, .has_args = true, .accepts_payload = true },
-    .{ .kind = .ultrafast, .command = "/ultrafast", .help_entry = "/ultrafast [on|off|status]", .completion_description = "request Ultra mode when supported", .presentation_category = .model, .has_args = true, .accepts_payload = true },
+    .{ .kind = .ultrafast, .command = "/ultrafast", .help_entry = "/ultrafast [on|off|status]", .completion_description = "request Ultrafast mode when supported", .presentation_category = .model, .has_args = true, .accepts_payload = true },
     .{ .kind = .statusline, .command = "/statusline", .help_entry = "/statusline [context|session|workspace]", .completion_description = "toggle status line segments", .presentation_category = .appearance, .has_args = true, .accepts_payload = true },
     .{ .kind = .notifications, .command = "/sound", .help_entry = "/sound [on|off|max]", .completion_description = "toggle sounds and terminal bells", .presentation_category = .appearance, .has_args = true, .accepts_payload = true },
     .{ .kind = .workspace, .command = "/workspace", .help_entry = "/workspace [list|add PATH|remove PATH|clear]", .completion_description = "manage additional workspace directories", .presentation_category = .workspace, .show_in_welcome = true, .has_args = true, .accepts_payload = true },
-    .{ .kind = .shell, .command = "/shell", .help_entry = "/shell reload", .completion_description = "reload shell startup files for commands", .presentation_category = .workspace, .has_args = true, .accepts_payload = true },
+    .{ .kind = .shell, .command = "/shell", .help_entry = "/shell reload", .completion_description = "reload shell startup files for commands", .presentation_category = .workspace, .has_args = true, .requires_args = true, .accepts_payload = true },
     .{ .kind = .version, .command = "/version", .help_entry = "/version", .completion_description = "show the fx version", .presentation_category = .general },
     .{ .kind = .quit, .command = "/quit", .aliases = &.{"/exit"}, .help_entry = "/quit", .completion_description = "exit the interactive shell", .presentation_category = .general, .show_in_welcome = true },
 };

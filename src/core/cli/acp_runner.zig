@@ -65,6 +65,7 @@ pub const Config = struct {
     workspace_root_override: ?[]const u8 = null,
     log_file: ?[]const u8 = null,
     context_limit_overrides: []const config_runtime.context_limits.Override = &.{},
+    tool_placement_overrides: []const config_runtime.tool_placement.Override = &.{},
     additional_directories: []const []const u8 = &.{},
     saved_directories_suppressed: bool = false,
     allow_acp_mcp: bool = true,

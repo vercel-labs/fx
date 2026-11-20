@@ -104,7 +104,7 @@ fn collectScoredMatches(
     return out.toOwnedSlice(alloc);
 }
 
-pub const Action = enum { message, wait, status, stop };
+pub const Action = enum { message, wait, status, stop, close };
 
 /// The name a subagent gives its own parent in `message{agent}`. No child
 /// can be named it.
@@ -124,6 +124,7 @@ pub const RequestInput = union(Action) {
     wait,
     status: struct { agent: ?[]const u8 = null },
     stop: struct { agent: []const u8 },
+    close: struct { agent: []const u8 },
 };
 
 /// Creation-time overrides carried by a request. Model and effort default to
@@ -159,6 +160,8 @@ pub const Request = union(Action) {
     status: struct { agent: ?[]u8 = null },
     /// Ends a subagent's running turn and drops what waits for it.
     stop: struct { agent: []u8 },
+    /// Stops a subagent and removes it for good, with its conversation.
+    close: struct { agent: []u8 },
 
     pub fn deinit(self: *Request, alloc: Allocator) void {
         switch (self.*) {
@@ -172,6 +175,7 @@ pub const Request = union(Action) {
             .wait => {},
             .status => |value| if (value.agent) |agent| alloc.free(agent),
             .stop => |value| alloc.free(value.agent),
+            .close => |value| alloc.free(value.agent),
         }
         self.* = undefined;
     }
@@ -186,6 +190,7 @@ pub const Request = union(Action) {
             .wait => null,
             .status => |value| value.agent,
             .stop => |value| value.agent,
+            .close => |value| value.agent,
         };
     }
 
@@ -198,7 +203,7 @@ pub const Request = union(Action) {
     pub fn override(self: Request) Override {
         return switch (self) {
             .message => |value| .{ .model = value.model, .effort = value.effort, .profile = value.profile },
-            .wait, .status, .stop => .{},
+            .wait, .status, .stop, .close => .{},
         };
     }
 };
@@ -206,6 +211,8 @@ pub const Request = union(Action) {
 pub const ValidationError = error{
     OutOfMemory,
     InvalidAgent,
+    /// `stop` or `close` named "parent", which is no subagent of the caller's.
+    InvalidParentTarget,
     InvalidInstructions,
     InvalidMessage,
     InvalidReport,
@@ -269,8 +276,14 @@ pub fn validateRequest(
             break :blk .{ .status = .{ .agent = try dupeOptional(alloc, value.agent) } };
         },
         .stop => |value| blk: {
-            if (!domain.validAgentName(value.agent) or std.mem.eql(u8, value.agent, parent_agent)) return error.InvalidAgent;
+            if (!domain.validAgentName(value.agent)) return error.InvalidAgent;
+            if (std.mem.eql(u8, value.agent, parent_agent)) return error.InvalidParentTarget;
             break :blk .{ .stop = .{ .agent = try alloc.dupe(u8, value.agent) } };
+        },
+        .close => |value| blk: {
+            if (!domain.validAgentName(value.agent)) return error.InvalidAgent;
+            if (std.mem.eql(u8, value.agent, parent_agent)) return error.InvalidParentTarget;
+            break :blk .{ .close = .{ .agent = try alloc.dupe(u8, value.agent) } };
         },
     };
 }
@@ -355,7 +368,7 @@ pub fn requestFingerprint(request: Request) [32]u8 {
     hash.update(@tagName(request.action()));
     hash.update("\x00");
     switch (request) {
-        .wait, .status, .stop => return hash.finalResult(),
+        .wait, .status, .stop, .close => return hash.finalResult(),
         .message => |value| {
             hash.update(value.agent);
             hash.update("\x00");
@@ -411,6 +424,10 @@ pub const Result = struct {
     result: ?[]const u8 = null,
     error_code: ?[]const u8 = null,
     delivery: ?types.SteeringDelivery = null,
+    /// The subagents a call that concerns them all was about: those a
+    /// `wait` waited for, or those a `status` that names none listed, so
+    /// its row can name them, live and after a resume.
+    subagents: ?[]const []const u8 = null,
 };
 
 pub fn feedbackResult(delivery: types.SteeringDelivery) Result {
@@ -440,6 +457,14 @@ pub fn encodeResultAlloc(alloc: Allocator, result: Result) ![]u8 {
     );
     if (result.pending) try out.writer.writeAll(",\"pending\":true");
     if (result.delivery) |delivery| try out.writer.print(",\"delivery\":\"{s}\"", .{@tagName(delivery)});
+    if (result.subagents) |names| if (names.len > 0) {
+        try out.writer.writeAll(",\"subagents\":[");
+        for (names, 0..) |name, index| {
+            if (index > 0) try out.writer.writeByte(',');
+            try std.json.Stringify.value(name, .{}, &out.writer);
+        }
+        try out.writer.writeByte(']');
+    };
     try out.writer.writeByte('}');
     return out.toOwnedSlice();
 }
@@ -454,7 +479,7 @@ fn writeOptionalString(writer: *std.Io.Writer, value: ?[]const u8) !void {
 
 test "minimal request validation owns each action's intent" {
     const alloc = std.testing.allocator;
-    try std.testing.expectEqual(@as(usize, 4), @typeInfo(Action).@"enum".field_names.len);
+    try std.testing.expectEqual(@as(usize, 5), @typeInfo(Action).@"enum".field_names.len);
     var wait = try validateRequest(alloc, .wait);
     defer wait.deinit(alloc);
     try std.testing.expectEqual(Action.wait, wait.action());
@@ -464,7 +489,11 @@ test "minimal request validation owns each action's intent" {
     var stop = try validateRequest(alloc, .{ .stop = .{ .agent = "reviewer" } });
     defer stop.deinit(alloc);
     try std.testing.expectEqualStrings("reviewer", stop.agentName().?);
-    try std.testing.expectError(error.InvalidAgent, validateRequest(alloc, .{ .stop = .{ .agent = "parent" } }));
+    try std.testing.expectError(error.InvalidParentTarget, validateRequest(alloc, .{ .stop = .{ .agent = "parent" } }));
+    var close = try validateRequest(alloc, .{ .close = .{ .agent = "reviewer" } });
+    defer close.deinit(alloc);
+    try std.testing.expectEqualStrings("reviewer", close.agentName().?);
+    try std.testing.expectError(error.InvalidParentTarget, validateRequest(alloc, .{ .close = .{ .agent = "parent" } }));
     try std.testing.expectError(error.InvalidAgent, validateRequest(alloc, .{ .status = .{ .agent = "Bad Name" } }));
 
     var message = try validateRequest(alloc, .{ .message = .{
@@ -487,6 +516,53 @@ test "minimal request validation owns each action's intent" {
             .message = "review this",
         } }),
     );
+}
+
+test "an empty optional string is refused here, so only the decoder treats one as absent" {
+    const alloc = std.testing.allocator;
+    const plain: MessageInput = .{ .agent = "reviewer", .message = "review this" };
+    var instructions = plain;
+    instructions.instructions = "";
+    try std.testing.expectError(error.InvalidInstructions, validateRequest(alloc, .{ .message = instructions }));
+    var report = plain;
+    report.report = "";
+    try std.testing.expectError(error.InvalidReport, validateRequest(alloc, .{ .message = report }));
+    var model = plain;
+    model.model = "";
+    try std.testing.expectError(error.InvalidModel, validateRequest(alloc, .{ .message = model }));
+    var effort = plain;
+    effort.effort = "";
+    try std.testing.expectError(error.InvalidEffort, validateRequest(alloc, .{ .message = effort }));
+    var profile = plain;
+    profile.profile = "";
+    try std.testing.expectError(error.InvalidProfile, validateRequest(alloc, .{ .message = profile }));
+    // The same holds for an agent: status takes one but does not need it, and
+    // stop and close do need it, so none of the three accepts an empty one here.
+    try std.testing.expectError(error.InvalidAgent, validateRequest(alloc, .{ .status = .{ .agent = "" } }));
+    try std.testing.expectError(error.InvalidAgent, validateRequest(alloc, .{ .stop = .{ .agent = "" } }));
+    try std.testing.expectError(error.InvalidAgent, validateRequest(alloc, .{ .close = .{ .agent = "" } }));
+}
+
+test "a message with no optional fields is planned on every path, and a present one is not" {
+    const alloc = std.testing.allocator;
+    var plain = try validateRequest(alloc, .{ .message = .{ .agent = "reviewer", .message = "next" } });
+    defer plain.deinit(alloc);
+    try std.testing.expect(!plain.override().present());
+    try std.testing.expectEqual(Plan.create_persistent, plan(plain, null));
+    try std.testing.expectEqual(Plan.continue_persistent, plan(plain, .{ .kind = .persistent, .phase = .idle }));
+    try std.testing.expectEqual(Plan.continue_persistent, plan(plain, .{ .kind = .persistent, .phase = .interrupted }));
+    try std.testing.expectEqual(Plan.steer_persistent, plan(plain, .{ .kind = .persistent, .phase = .running }));
+    try std.testing.expectEqual(Plan.steer_persistent, plan(plain, .{ .kind = .persistent, .phase = .awaiting_approval }));
+
+    // What the decoder keeps out of a message that asked for nothing: a child
+    // at work refuses instructions, and an existing child refuses an override
+    // (`Runtime.admitManagedWork`).
+    var instructed = try validateRequest(alloc, .{ .message = .{ .agent = "reviewer", .message = "next", .instructions = "Review strictly." } });
+    defer instructed.deinit(alloc);
+    try std.testing.expectEqual(Plan{ .reject = .child_busy }, plan(instructed, .{ .kind = .persistent, .phase = .running }));
+    var routed = try validateRequest(alloc, .{ .message = .{ .agent = "reviewer", .message = "next", .model = "gpt-5.6-sol-fast" } });
+    defer routed.deinit(alloc);
+    try std.testing.expect(routed.override().present());
 }
 
 test "persistent instruction updates participate in operation identity" {
@@ -685,6 +761,16 @@ test "terminal result omits scheduler identities and phases" {
     try std.testing.expect(std.mem.find(u8, encoded, "operation_id") == null);
     try std.testing.expect(std.mem.find(u8, encoded, "child_id") == null);
     try std.testing.expect(std.mem.find(u8, encoded, "status") == null);
+}
+
+test "a result lists the subagents it concerns only when there are some" {
+    const alloc = std.testing.allocator;
+    const listed = try encodeResultAlloc(alloc, .{ .ok = true, .result = "done", .subagents = &.{ "reviewer", "a\"b" } });
+    defer alloc.free(listed);
+    try std.testing.expectEqualStrings("{\"ok\":true,\"result\":\"done\",\"error_code\":null,\"subagents\":[\"reviewer\",\"a\\\"b\"]}", listed);
+    const empty = try encodeResultAlloc(alloc, .{ .ok = true, .result = "done", .subagents = &.{} });
+    defer alloc.free(empty);
+    try std.testing.expectEqualStrings("{\"ok\":true,\"result\":\"done\",\"error_code\":null}", empty);
 }
 
 test "a subagent request's profile is checked and changes its fingerprint only when present" {

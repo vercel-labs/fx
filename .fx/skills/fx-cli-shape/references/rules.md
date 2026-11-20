@@ -71,9 +71,9 @@ Run flags and env vars never save; setter commands do (see Flags). Every effecti
 - Group nouns are singular. Plural forms that already exist stay as aliases (`fx sessions`). The target adds `fx session list` as the full form.
 - A command that only shows things never changes anything. A setter command, whose whole job is to change a setting, may save: `fx provider codex`, `fx teams`.
 - Existing aliases stay: `credits`/`balance`, `/credits`/`/balance`, `/usage`/`/cost`, `/quit`/`/exit`, `/image`/`/img`, `fx sessions`.
-- User aliases are planned as `alias.<name>` settings that work as `fx <name>` and `/<name>`. An alias never shadows a built-in command. Today `/alias` only reports that aliases aren't configurable.
+- User aliases are planned as `alias.<name>` settings that work as `fx <name>` and `/<name>`. An alias never shadows a built-in command. Until they exist there is no `/alias` command: the placeholder that only said aliases weren't configurable was removed.
 - `fx foo` never runs an `fx-foo` program from `PATH`. Skills and MCP are the extension points.
-- A hidden command is either internal, and labeled so in its spec, or deprecated. `fx replay` is hidden and labeled as a developer tool in its spec.
+- A hidden command is either internal, and labeled so in its spec, or deprecated. `fx replay` is hidden and labeled as a developer tool in its spec. A command that does nothing yet is removed rather than hidden, and a removed slash command keeps a line in the router's `parse rejects removed slash commands` test.
 - A new top-level command needs a maintainer's explicit approval.
 
 ## Flags
@@ -81,7 +81,7 @@ Run flags and env vars never save; setter commands do (see Flags). Every effecti
 - Long flags are kebab-case. Short flags are scarce and keep one meaning: `-h` help, `-v` version, `-c` continue, `-r` resume. A short flag means the same as its long form, so `-r` is the short form of `--resume`: with no value both open the session picker, `last` opens the newest session, and an ID opens that one (`--resume=<id>` works too). Because `-c` is taken, git's `-c key=value` can't be copied.
 - `--x value` and `--x=value` both work on every command. The shared parser in `src/core/cli/cli_flags.zig` provides both.
 - A boolean pairs `--x` with `--no-x`.
-- When a flag repeats or conflicts, the last one wins, on every command. `--fast --no-fast` means Fast mode off; `--fast --ultrafast` means Ultra mode. Every command follows this.
+- When a flag repeats or conflicts, the last one wins, on every command. `--fast --no-fast` means Fast mode off; `--fast --ultrafast` means Ultrafast mode. Every command follows this.
 - An enum is one flag that takes the value: `--permission-mode <ask|auto|full-access>`. Shortcut aliases stay: `--auto`, `--full-access`, `--yolo`, plus `--ask`. Every command that runs the agent takes the whole set.
 - Flags people bring from other agents get a pointer, not an alias: `fx -p` and `fx --print` fail with exit 2 and say to use `fx ask "<prompt>"`.
 - No flag carries a value in its name. `--resume-<id>` was removed and fails with a hint naming `--resume <id>`.

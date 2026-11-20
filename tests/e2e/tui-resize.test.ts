@@ -166,13 +166,6 @@ function countOccurrences(value: string, needle: string): number {
   }
 }
 
-function textHex(value: string): string[] {
-  return Array.from(
-    Buffer.from(value),
-    (byte) => byte.toString(16).padStart(2, "0"),
-  );
-}
-
 function gatedResizeResponse(
   first: string,
   second: string,
@@ -947,6 +940,17 @@ async function waitForResizeAndInputTapeFrames(
       frames.map((frame) => frame.kind).join(",")
     }`,
   );
+}
+
+function setPaneBackground(session: TmuxSession, colour: string): void {
+  execFileSync("tmux", [
+    "set-option",
+    "-p",
+    "-t",
+    session.name,
+    "window-style",
+    `bg=${colour}`,
+  ]);
 }
 
 function sendRawTmuxBytes(
@@ -1829,7 +1833,8 @@ describe.skipIf(SKIP)("tui: resize", () => {
       });
       await session.waitForComposer(10_000);
       await session.sendText("stream the resize marker command");
-      await session.waitForText("Running for i in $(seq 1 96)", TIMEOUT);
+      // The loop's row shows its steps in short form.
+      await session.waitForText("Running printf, sleep", TIMEOUT);
 
       const resizeCount = committedResizeFrameCount(tracePath);
       await new Promise((resolve) => setTimeout(resolve, 350));
@@ -1842,8 +1847,7 @@ describe.skipIf(SKIP)("tui: resize", () => {
       expect(scrollback.match(/Run \/help for commands/g)).toHaveLength(1);
       expect(scrollback).toContain("stream the resize marker command");
       expect(scrollback).not.toContain(preFxMarker);
-      expect(scrollback).toContain("● 1 tool call · 1 command");
-      expect(scrollback).toContain("Ran for i in $(seq 1 96)");
+      expect(scrollback).toMatch(/^● Ran printf, sleep ✓$/m);
       expect(scrollback).not.toContain("resize-stream-marker 001");
       expect(scrollback).not.toContain("resize-stream-marker 096");
       expect(scrollback).toContain(finalResponse);
@@ -1859,7 +1863,7 @@ describe.skipIf(SKIP)("tui: resize", () => {
   );
 
   test(
-    "assistant stream retention preserves visible rows at default cap",
+    "a long assistant stream keeps every row and the collapsed group in order",
     async () => {
       const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-assistant-retention-")));
       if (!KEEP_LARGE_SKILL_ARTIFACTS) tempDirs.push(root);
@@ -1905,11 +1909,10 @@ describe.skipIf(SKIP)("tui: resize", () => {
         })}\n\ndata: [DONE]\n\n`));
         streams[turn].close();
       };
-      // Bounded inert destinations consume the real cap without thousands of rows.
+      // Long inert link destinations make each row large without thousands of rows.
       const inertRow = (marker: string) => Array.from({ length: 14 }, (_, index) =>
         `[${index === 0 ? marker : "."}](https://example.invalid/${"x".repeat(1000)})`
       ).join("") + "\n\n";
-      // Removing the old response must leave the collapsed group through a retention frame.
       const old = (id: number) => id === 0
         ? inertRow("RETAIN_OLD_0000")
         : `RETAIN_OLD_${String(id).padStart(4, "0")} immutable sentinel\n\n`;
@@ -1945,7 +1948,7 @@ describe.skipIf(SKIP)("tui: resize", () => {
         ];
         expect(ids).toEqual(expected);
         if (tailCount > 0) {
-          expect(full.match(/3 tool calls/g)).toHaveLength(1);
+          expect(full.match(/● Read files/g)).toHaveLength(1);
           for (const path of children) expect(full).not.toContain(path);
         }
       };
@@ -1964,7 +1967,7 @@ describe.skipIf(SKIP)("tui: resize", () => {
       await assertRows(0);
       await session.sendText("Second deterministic response.");
       await waitStream(2);
-      await session.waitForText("3 tool calls", 10_000);
+      await session.waitForText("● Read files", 10_000);
       send(1, tail(0));
       await session.waitForText("RETAIN_TAIL_0000", 10_000);
       expect(await session.capturePane()).not.toContain("xxxxxxxx");
@@ -1975,21 +1978,14 @@ describe.skipIf(SKIP)("tui: resize", () => {
       await session.waitForText("RETAIN_TAIL_0064", 15_000);
       await Bun.sleep(300);
       await assertRows(65);
-      expect(readFileSync(tracePath, "utf8")).not.toContain("pruned entry");
       let tailCount = 65;
-      let retained = false;
       for (let id = 65; id < 81; id++) {
         send(1, tail(id));
         await session.waitForText(`RETAIN_TAIL_${String(id).padStart(4, "0")}`, 10_000);
         await Bun.sleep(150);
         tailCount = id + 1;
         await assertRows(tailCount);
-        if (readFileSync(tracePath, "utf8").includes("trimmed protected entry")) {
-          retained = true;
-          break;
-        }
       }
-      expect(retained).toBe(true);
       finish(1);
       await session.waitForStableComposer(15_000);
       await assertRows(tailCount);
@@ -2005,14 +2001,14 @@ describe.skipIf(SKIP)("tui: resize", () => {
     120_000,
   );
 
-  for (const { label, pressure, viewerCols } of [
-    { label: "no-prune control", pressure: false, viewerCols: 0 },
-    { label: "pressure", pressure: true, viewerCols: 0 },
-    { label: "pressure with Ctrl+O", pressure: true, viewerCols: 80 },
-    { label: "pressure with Ctrl+O resize 80 to 100", pressure: true, viewerCols: 100 },
+  for (const { label, large, viewerCols } of [
+    { label: "small output", large: false, viewerCols: 0 },
+    { label: "large output", large: true, viewerCols: 0 },
+    { label: "large output with Ctrl+O", large: true, viewerCols: 80 },
+    { label: "large output with Ctrl+O resize 80 to 100", large: true, viewerCols: 100 },
   ]) {
     test(
-      `command retention preserves native paragraphs at default cap (${label})`,
+      `command output keeps native paragraphs in history (${label})`,
       async () => {
         const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-command-retention-")));
         const home = join(root, "home");
@@ -2026,7 +2022,7 @@ describe.skipIf(SKIP)("tui: resize", () => {
         writeFileSync(join(home, ".fx", "settings.json"), "{}");
         writeFileSync(stderrPath, "");
         // Keep geometry and logical rows identical; only the old retained payload differs.
-        writeFileSync(join(workspace, "old.txt"), "S".repeat(pressure ? 1_040_000 : 8_000) + "\n");
+        writeFileSync(join(workspace, "old.txt"), "S".repeat(large ? 1_040_000 : 8_000) + "\n");
         writeFileSync(join(workspace, "new.txt"), "N".repeat(80_000) + "\n");
         writeFileSync(join(workspace, "probe.sh"), [
           "printf started > started",
@@ -2143,9 +2139,6 @@ describe.skipIf(SKIP)("tui: resize", () => {
           await session.waitForStableComposer(15_000);
           const seeded = await capture("seeded");
           check("seeded history", () => expectHistory(seeded, false));
-          check("seed stays below default cap", () => {
-            expect(readFileSync(tracePath, "utf8")).not.toMatch(/pruned (?:command output|entry)/);
-          });
 
           await session.sendText("Run the new prepared output, then the later response.");
           const deadline = Date.now() + 15_000;
@@ -2155,16 +2148,15 @@ describe.skipIf(SKIP)("tui: resize", () => {
             await Bun.sleep(25);
           }
           await capture("before-output");
-          const fullFooter = "full detail · ctrl+o close";
+          const fullFooter = "esc close · pgup/pgdn scroll";
           if (viewerCols) {
             await session.sendHexBytes(["0f"]);
             await session.waitForText(fullFooter, TIMEOUT);
             await capture("viewer-open-before-output");
-            check("viewer admitted before first retirement", () => {
+            check("viewer opened before the output", () => {
               expect(existsSync(releasePath)).toBe(false);
               expect(existsSync(join(workspace, "finished"))).toBe(false);
               expect(requestCount).toBe(3);
-              expect(readFileSync(tracePath, "utf8")).not.toMatch(/pruned (?:command output|entry)/);
             });
           }
           const traceOffset = readFileSync(tracePath, "utf8").length;
@@ -2186,16 +2178,14 @@ describe.skipIf(SKIP)("tui: resize", () => {
                 .some(record => record.kind === "turn_committed");
               return completed && requestCount === 4 &&
                 existsSync(join(workspace, "finished")) &&
-                existsSync(join(workspace, "sibling-finished")) &&
-                /pruned (?:command output|entry)/.test(readFileSync(tracePath, "utf8").slice(traceOffset));
+                existsSync(join(workspace, "sibling-finished"));
             }, TIMEOUT);
-            checks["viewer turn completed and pruned before close"] = "PASS";
+            checks["viewer turn completed before close"] = "PASS";
             writeFileSync(join(root, "viewer-completed.events.jsonl"), readFileSync(eventsPath));
             const viewerTrace = readFileSync(tracePath, "utf8").slice(traceOffset);
             writeFileSync(join(root, "viewer-completed.trace.log"), viewerTrace);
             await capture("viewer-completed-before-close");
-            check("retirement completed while viewer owns screen", () => {
-              expect(viewerTrace).toMatch(/pruned (?:command output|entry)/);
+            check("turn completed while viewer owns screen", () => {
               expect(readFileSync(join(workspace, "finished"), "utf8")).toBe("finished");
               expect(readFileSync(join(workspace, "sibling-finished"), "utf8")).toBe("finished");
               expect(gateway.requests).toHaveLength(4);
@@ -2221,13 +2211,6 @@ describe.skipIf(SKIP)("tui: resize", () => {
           const afterOutput = await capture("after-output");
           const boundary = readFileSync(tracePath, "utf8").slice(traceOffset);
           writeFileSync(join(root, "output-trace.log"), boundary);
-          // Scheduling can coalesce atomic append/status frames. Require actual pruning,
-          // not a particular frame reason; coordinator tests own those exact boundaries.
-          check("retention boundary", () => {
-            const prunes = boundary.match(/pruned (?:command output|entry)/g) ?? [];
-            if (pressure) expect(prunes.length).toBeGreaterThan(0);
-            else expect(prunes).toHaveLength(0);
-          });
           check("commands finished", () => {
             expect(readFileSync(join(workspace, "finished"), "utf8")).toBe("finished");
             expect(readFileSync(join(workspace, "sibling-finished"), "utf8")).toBe("finished");
@@ -2240,9 +2223,6 @@ describe.skipIf(SKIP)("tui: resize", () => {
           await session.waitForStableComposer(10_000);
           const afterNotice = await capture("after-notice");
           check("native history after a local notice", () => expectHistory(afterNotice, true));
-          if (!pressure) check("control never prunes", () => {
-            expect(readFileSync(tracePath, "utf8")).not.toMatch(/pruned (?:command output|entry)/);
-          });
           await session.sendText("/quit");
           await session.waitForPane(() => session!.paneStatus().dead, 10_000);
           check("clean exit", () => {
@@ -2273,7 +2253,7 @@ describe.skipIf(SKIP)("tui: resize", () => {
         } finally {
           writeFileSync(releasePath, "cleanup");
           if (session) await capture("last");
-          writeFileSync(join(root, "checks.json"), JSON.stringify({ pressure, viewerCols, requestCount, checks }, null, 2));
+          writeFileSync(join(root, "checks.json"), JSON.stringify({ large, viewerCols, requestCount, checks }, null, 2));
           if (passed && !KEEP_LARGE_SKILL_ARTIFACTS) tempDirs.push(root);
           else console.error(`command retention evidence retained: ${root}`);
         }
@@ -4789,9 +4769,6 @@ describe.skipIf(SKIP)("tui: resize", () => {
 
       const inlineMarker = "THEME_RESET_INLINE_CODE";
       const inlineTailMarker = "THEME_RESET_INLINE_TAIL";
-      const responseFence = textHex("\x1b[?1;2c");
-      const darkBackground = textHex("\x1b]11;rgb:0000/0000/0000\x1b\\");
-      const lightBackground = textHex("\x1b]11;rgb:ffff/ffff/ffff\x1b\\");
       const gateway = startFakeGateway([
         fakeGatewayFinalText(
           `THEME_RESET_FIRST_RESPONSE \`${inlineMarker} ${"x".repeat(10_000)}\` ${inlineTailMarker}\n`,
@@ -4857,6 +4834,9 @@ describe.skipIf(SKIP)("tui: resize", () => {
         rawBackgroundRequests,
       );
 
+      // tmux answers fx's background query from the pane's style, as a real
+      // terminal reports its own colors.
+      setPaneBackground(session, "#ffffff");
       sendRawTmuxBytes(
         session,
         "initial-theme-notification",
@@ -4872,13 +4852,9 @@ describe.skipIf(SKIP)("tui: resize", () => {
         "theme_query_requested kind=background",
         backgroundRequests + 1,
       );
-      await session.sendHexBytes([
-        ...responseFence,
-        ...darkBackground,
-        ...lightBackground,
-        ...responseFence,
-      ]);
       await waitForTraceText(tracePath, "theme_update_settled light=true rgb=terminal");
+      // The redraw in the new theme clears the screen, and the trace says so.
+      await waitForTraceText(tracePath, "event=theme_change_redraw dropped=terminal_screen_and_scrollback");
       await waitForTapeOutputCount(tapePath, "\x1b[3J", resetCountBefore + 1);
 
       const replayed = await session.waitForText(inlineTailMarker, TIMEOUT);
@@ -4908,6 +4884,8 @@ describe.skipIf(SKIP)("tui: resize", () => {
       trace = readFileSync(tracePath, "utf8");
       fenceRequests = countOccurrences(trace, "theme_query_requested kind=response_fence");
       backgroundRequests = countOccurrences(trace, "theme_query_requested kind=background");
+      // The notification says light, but the terminal's dark background wins.
+      setPaneBackground(session, "#000000");
       sendRawTmuxBytes(
         session,
         "theme-notification",
@@ -4921,12 +4899,6 @@ describe.skipIf(SKIP)("tui: resize", () => {
       expect(
         countOccurrences(queryTrace, "theme_query_requested kind=response_fence"),
       ).toBeGreaterThanOrEqual(fenceRequests + 1);
-      await session.sendHexBytes([
-        ...responseFence,
-        ...lightBackground,
-        ...darkBackground,
-        ...responseFence,
-      ]);
       await waitForTraceText(tracePath, "theme_update_settled light=false rgb=terminal");
       expect(
         await waitForTapeOutputCount(tapePath, "\x1b[3J", resetCountBefore + 2),
@@ -4937,6 +4909,123 @@ describe.skipIf(SKIP)("tui: resize", () => {
       expect(session.isPaneAlive()).toBe(true);
       trace = readFileSync(tracePath, "utf8");
       expect(trace).not.toContain("rgb=fallback");
+      expectEmptyStderr(stderrPath);
+    },
+    90_000,
+  );
+
+  test(
+    "a custom theme flip recolors inline code and links in prose, table cells, and a hidden agent",
+    async () => {
+      const root = mkdtempSync(join(tmpdir(), "fx-custom-theme-flip-"));
+      const home = join(root, "home");
+      const workspace = join(root, "workspace");
+      const tracePath = join(root, "trace.log");
+      const stderrPath = join(root, "stderr.log");
+      const tapePath = join(root, "custom-theme-flip.fxtape");
+      tempDirs.push(root);
+      mkdirSync(join(home, ".fx", "themes"), { recursive: true });
+      mkdirSync(workspace, { recursive: true });
+      // A theme pair named like the files editors ship: fx follows the
+      // terminal from one variant to its sibling.
+      writeFileSync(
+        join(home, ".fx", "themes", "probe-dark.json"),
+        JSON.stringify({ type: "dark", name: "probe-dark", colors: { inline_code: "#88C0D0", link: "#81A1C1" } }),
+      );
+      writeFileSync(
+        join(home, ".fx", "themes", "probe-light.json"),
+        JSON.stringify({ type: "light", name: "probe-light", colors: { inline_code: "#176C74", link: "#0064B0" } }),
+      );
+      writeFileSync(join(home, ".fx", "settings.json"), JSON.stringify({ theme: "probe-dark" }));
+      writeFileSync(stderrPath, "");
+      const dark = { code: "\x1b[38;2;136;192;208m", link: "\x1b[38;2;129;161;193m" };
+      const light = { code: "\x1b[38;2;23;108;116m", link: "\x1b[38;2;0;100;176m" };
+
+      const gateway = startFakeGateway([
+        fakeGatewayFinalText(
+          "Prose has `PROSE_CODE` and [PROSE_LINK](https://example.com/prose).\n\n" +
+            "| Command | Docs |\n" +
+            "|---------|------|\n" +
+            "| `TABLE_CODE` | [TABLE_LINK](https://example.com/table) |\n\n" +
+            "CUSTOM_THEME_TAIL\n",
+        ),
+      ]);
+      gateways.push(gateway);
+      session = await createResizeSession({
+        cmd: FX_BIN,
+        cwd: workspace,
+        env: {
+          HOME: home,
+          AI_GATEWAY_API_KEY: "fake-custom-theme-key",
+          VERCEL_OIDC_TOKEN: undefined,
+          FX_GATEWAY_BASE_URL: gateway.baseUrl,
+          FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+          FX_MODEL: FAKE_GATEWAY_MODEL,
+          FX_AUTO_UPGRADE: "0",
+          COLORTERM: "truecolor",
+          FX_RECORD: tapePath,
+          FX_TRACE_LOG: tracePath,
+          FX_TRACE_SCOPES: "theme",
+        },
+        stderrPath,
+        width: 120,
+        height: 40,
+      });
+      await session.waitForComposer(TIMEOUT);
+      await session.sendText("Show prose and a table with code and links.");
+      await session.waitForText("CUSTOM_THEME_TAIL", TIMEOUT);
+
+      // The text before the last full redraw is the screen fx drew last.
+      const lastRedraw = (): string => {
+        const stdout = Buffer.concat(stdoutFrames(tapePath).map((frame) => frame.payload)).toString();
+        return stdout.slice(stdout.lastIndexOf("\x1b[3J"));
+      };
+      const expectColors = (drawn: string, want: typeof dark, other: typeof dark): void => {
+        for (const marker of ["PROSE_CODE", "TABLE_CODE"]) {
+          expect(drawn).toContain(`${want.code}${marker}`);
+        }
+        for (const marker of ["PROSE_LINK", "TABLE_LINK"]) {
+          expect(drawn).toMatch(new RegExp(`${want.link.replace(/[[\]]/g, "\\$&")}(\\x1b\\[[0-9;]*m)*${marker}`));
+        }
+        expect(drawn).not.toContain(other.code);
+        expect(drawn).not.toContain(other.link);
+      };
+      const resets = (): number =>
+        countOccurrences(Buffer.concat(stdoutFrames(tapePath).map((frame) => frame.payload)).toString(), "\x1b[3J");
+
+      // A second instance takes the screen, so the first one's transcript is
+      // hidden when the terminal turns light.
+      await session.sendText("/launch");
+      await session.waitForPane((pane) => pane.includes("fx 2/2"), TIMEOUT);
+      await session.waitForComposer(TIMEOUT);
+      let resetsBefore = resets();
+      setPaneBackground(session, "#ffffff");
+      sendRawTmuxBytes(session, "custom-theme-to-light", Buffer.from("\x1b[?997;2n"));
+      await waitForTraceText(tracePath, "theme_update_settled light=true");
+      await waitForTapeOutputCount(tapePath, "\x1b[3J", resetsBefore + 1);
+
+      // Back on the first instance, its transcript shows the light colors.
+      resetsBefore = resets();
+      await session.sendKeys("C-x");
+      await session.waitForText("enter switch", TIMEOUT);
+      await session.sendKeys("Up");
+      await session.sendKeys("Enter");
+      await session.waitForPane((pane) => pane.includes("fx 1/2") && !pane.includes("enter switch"), TIMEOUT);
+      await waitForTapeOutputCount(tapePath, "\x1b[3J", resetsBefore + 1);
+      await session.waitForText("CUSTOM_THEME_TAIL", TIMEOUT);
+      expectColors(lastRedraw(), light, dark);
+
+      // And with it on screen, the flip back to dark recolors it again.
+      resetsBefore = resets();
+      setPaneBackground(session, "#000000");
+      sendRawTmuxBytes(session, "custom-theme-to-dark", Buffer.from("\x1b[?997;1n"));
+      await waitForTraceText(tracePath, "theme_update_settled light=false");
+      await waitForTapeOutputCount(tapePath, "\x1b[3J", resetsBefore + 1);
+      await session.waitForText("CUSTOM_THEME_TAIL", TIMEOUT);
+      expectColors(lastRedraw(), dark, light);
+
+      expect(session.isPaneAlive()).toBe(true);
+      expect(readFileSync(tracePath, "utf8")).toContain("theme_variant_swapped from=probe-dark to=probe-light");
       expectEmptyStderr(stderrPath);
     },
     90_000,

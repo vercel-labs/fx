@@ -18,9 +18,9 @@ const tool_presentation = @import("../tooling/tool_presentation.zig");
 const tool_result_errors = @import("../tooling/tool_result_errors.zig");
 const model_tool_schema = @import("../tooling/model_tool_schema.zig");
 const tool_runtime = @import("../tooling/tool_runtime.zig");
+const toolbox = @import("../tooling/toolbox.zig");
 const tool_mcp_runtime = @import("../tooling/tool_mcp_runtime.zig");
 const mcp_access = @import("../mcp/access_policy.zig");
-const model_catalog = @import("../mcp/model_catalog.zig");
 const context_contract = @import("../workspace/context_contract.zig");
 const hooks = @import("../hooks/hooks.zig");
 const execution_memory = @import("../agent/execution_memory.zig");
@@ -28,6 +28,7 @@ const gateway_error_format = @import("../shared/gateway_error_format.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const mem_utils = @import("../shared/mem_utils.zig");
 const types = @import("../shared/types.zig");
+const io_mod = @import("../shared/io.zig");
 const diff_mod = @import("../output/diff.zig");
 const domain = @import("domain.zig");
 const execution = @import("execution.zig");
@@ -36,6 +37,7 @@ const authority_mod = @import("authority.zig");
 const tool_dispatch = @import("../tooling/tool_dispatch.zig");
 const tool_host = @import("tool_host.zig");
 const child_state = @import("child_state.zig");
+const turn_capture = @import("../workspace/turn_capture.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -64,6 +66,9 @@ pub const Config = struct {
     system_prompt: []const u8,
     model_prompt_overlay: ?[]const u8 = null,
     skill_catalog: skill_invocation.Catalog = .{ .skills = &.{} },
+    /// The built-in tools the parent offers through toolbox; the child offers
+    /// the same.
+    toolbox_behind: []const []const u8 = &toolbox.default_behind,
     advertised_tool_names: []const []const u8 = &.{},
     advertised_functions: []const model_tool_schema.FunctionSchema = &.{},
     custom_tool_guidance: []const u8 = "",
@@ -71,6 +76,9 @@ pub const Config = struct {
     context_enabled: bool,
     project_context: []const u8 = "",
     lifecycle_view: hooks.RuntimeView = hooks.RuntimeView.empty(),
+    /// The parent's capture target while `experimental.workspace_capture` is
+    /// on; the child's own session receives its captures (D98).
+    workspace_capture: ?turn_capture.Target = null,
 };
 
 const Context = struct {
@@ -215,11 +223,16 @@ pub fn run(
         .subagent_id = trace_context.subagent_id,
     };
     defer if (context.refreshed_credential) |*credential| credential.deinit(turn.alloc);
+    turn.workspace_capture = config.workspace_capture;
+    turn.capture_cancel = cancel;
     turn.beginTurn() catch |err| {
         if (err == error.OutOfMemory) return error.OutOfMemory;
         turn.setFailureDiagnostic("turn_open_failed", @errorName(err));
         return error.ProviderFailed;
     };
+    // The child has done work in this run, whatever its replies report: the
+    // run's `subagents` result lists it (`usage_ledger.zig`).
+    if (turn.child_id) |child_id| try config.host.noteChildTurnStarted(child_id, turn.child_name);
     const history = turn.sessionRuntime().snapshotHistory(arena) catch return error.OutOfMemory;
     const prompt = worker_runtime.QueuedPrompt{
         .turn_id = trace_context.turn_id,
@@ -264,13 +277,13 @@ pub fn run(
         arena,
         config.advertised_tool_names,
         config.tool_context.tool_registry,
-        .{ .profile = profile },
+        .{ .profile = .{ .value = profile, .behind = config.toolbox_behind } },
     );
     const child_functions = try childFunctions(
         arena,
         config.advertised_functions,
         config.tool_context.tool_registry,
-        .{ .profile = profile },
+        .{ .profile = .{ .value = profile, .behind = config.toolbox_behind } },
     );
     // This engine never gives a child subagents of its own, so main
     // started every child it runs.
@@ -292,6 +305,10 @@ pub fn run(
             turn.active_work_id orelse "unknown",
         },
     );
+    // The child's toolbox menu lists the MCP servers its view may use.
+    var toolbox_arena_state = std.heap.ArenaAllocator.init(turn.alloc);
+    defer toolbox_arena_state.deinit();
+    const arena_for_toolbox = toolbox_arena_state.allocator();
     const deps = runtimeDeps(&context);
     agent_runtime.processAgentPrompt(
         &turn.sessionRuntime().agent,
@@ -311,6 +328,11 @@ pub fn run(
             .system_prompt = child_system_prompt,
             .model_prompt_overlay = config.model_prompt_overlay,
             .skill_catalog = config.skill_catalog,
+            .toolbox_behind = config.toolbox_behind,
+            .toolbox_mcp_servers = try viewServerNames(
+                arena_for_toolbox,
+                if (admission.mcp_view) |*view| view else null,
+            ),
             .gateway_retry_count = config.tool_context.gateway_retry_count,
             .gateway_chat_url = config.tool_context.gateway_chat_url,
             .advertised_tool_names = child_tool_names,
@@ -415,8 +437,9 @@ pub fn childSystemPrompt(
 /// integrations instead.
 pub const Shown = union(enum) {
     /// The old engine's: the ones its profile allows, never `subagent`,
-    /// because it has no host for a child's own subagents.
-    profile: ?*const profiles.Profile,
+    /// because it has no host for a child's own subagents. `behind` names
+    /// the built-in tools the run offers through toolbox.
+    profile: struct { value: ?*const profiles.Profile, behind: []const []const u8 },
     /// The interactive app's: the ones its run was admitted with, its
     /// parent's narrowed by its profile, so it is never shown a tool its
     /// parent lacks. `subagent` is among them
@@ -429,9 +452,9 @@ fn childSees(registry: tool_dispatch.Registry, shown: Shown, name: []const u8) b
     switch (shown) {
         .profile => |profile| {
             if (subagent) return false;
-            const value = profile orelse return true;
+            const value = profile.value orelse return true;
             if (registry.lookup(name) == null) return true;
-            return profiles.allowsTool(value, name);
+            return profiles.allowsTool(value, name, profile.behind);
         },
         .admitted => |admitted| {
             if (subagent and !admitted.starts_subagents) return false;
@@ -483,8 +506,8 @@ fn runtimeDeps(context: *Context) agent_runtime.AgentRuntimeDeps {
         .append_static_context = appendStaticContext,
         .validate_tool_call = validateToolCall,
         .snapshot_mcp_definition = snapshotMcpDefinition,
-        .prepare_skill_call = prepareSkillCall,
         .check_tool_availability = checkToolAvailability,
+        .resolve_unselected_mcp_tool = resolveUnselectedMcpTool,
         .request_tool_permission = requestToolPermission,
         .request_prepared_file_mutation_permission = requestPreparedFileMutationPermission,
         .resolve_tool_action_display_target = resolveToolActionDisplayTarget,
@@ -495,6 +518,8 @@ fn runtimeDeps(context: *Context) agent_runtime.AgentRuntimeDeps {
         .execute_tool_call = executeToolCall,
         .publish_committed_file_handoff = publishCommittedFileHandoff,
         .propagate_history_turn = propagateHistoryTurn,
+        .start_workspace_capture = if (context.turn.capturesWorkspace()) startWorkspaceCapture else null,
+        .reach_workspace = if (context.turn.capturesWorkspace()) reachWorkspace else null,
         .commit_context_compaction = .{ .commit = commitContextCompaction },
         .propagate_grant = discardGrant,
         .push_event = pushLiveEvent,
@@ -510,6 +535,16 @@ fn runtimeDeps(context: *Context) agent_runtime.AgentRuntimeDeps {
         .report_usage = reportUsage,
         .record_usage = recordUsage,
     };
+}
+
+fn startWorkspaceCapture(raw: *anyopaque, fresh: bool, step: agent_runtime.AgentRuntimeDeps.WorkspaceCaptureStep) void {
+    const context: *Context = @ptrCast(@alignCast(raw));
+    context.turn.startWorkspaceCapture(fresh, step);
+}
+
+fn reachWorkspace(raw: *anyopaque, dir: []const u8, tool_name: []const u8) void {
+    const context: *Context = @ptrCast(@alignCast(raw));
+    context.turn.reachWorkspace(dir, tool_name);
 }
 
 fn availableModelCapabilities(raw: *anyopaque, model: []const u8) model_capabilities.Capabilities {
@@ -619,14 +654,14 @@ test "child runtime capability callbacks preserve fallback and child cancellatio
     };
     const deps = runtimeDeps(&context);
     const fallback = model_capabilities.capabilitiesForModel("legacy-fast");
-    try std.testing.expectEqualDeep(fallback, deps.available_model_capabilities(deps.ctx, "legacy-fast"));
-    try std.testing.expectEqualDeep(fallback, try deps.resolve_model_capabilities(deps.ctx, alloc, "legacy-fast"));
+    try model_capabilities.expectCapabilitiesEqualForTest(fallback, deps.available_model_capabilities(deps.ctx, "legacy-fast"));
+    try model_capabilities.expectCapabilitiesEqualForTest(fallback, try deps.resolve_model_capabilities(deps.ctx, alloc, "legacy-fast"));
     context.config.provider_set.gateway.model_catalog.?.lookup_capabilities_fn = Fixture.lookup;
     const available = deps.available_model_capabilities(deps.ctx, "child-model");
     try std.testing.expectEqual(@as(?u32, 512), available.max_output_tokens);
     try std.testing.expectEqual(@as(?u32, 32768), available.context_window);
-    try std.testing.expectEqualDeep(available, try deps.resolve_model_capabilities(deps.ctx, alloc, "child-model"));
-    try std.testing.expectEqualDeep(model_capabilities.Capabilities{}, deps.available_model_capabilities(deps.ctx, "unknown-fast"));
+    try model_capabilities.expectCapabilitiesEqualForTest(available, try deps.resolve_model_capabilities(deps.ctx, alloc, "child-model"));
+    try model_capabilities.expectCapabilitiesEqualForTest(.{}, deps.available_model_capabilities(deps.ctx, "unknown-fast"));
     context.config.tool_context.model_capability_resolver = .{ .ctx = &fixture, .resolve_fn = Fixture.resolveCapabilities };
     const resolved = try deps.resolve_model_capabilities(deps.ctx, alloc, "child-model");
     try std.testing.expectEqual(model_capabilities.ImageInputSupport.native, resolved.image_input_support);
@@ -662,7 +697,8 @@ fn refreshGatewayCredential(
     source: types.CredentialSource,
     mode: auth_runtime.CredentialRefreshMode,
     expected_account_id: ?[]const u8,
-) !?[]u8 {
+    rejected_token: ?[]const u8,
+) !?agent_runtime.RefreshedGatewayCredential {
     const context: *Context = @ptrCast(@alignCast(raw));
     if (mode == .if_needed and auth_runtime.requestPathCredentialVerifiedRecently(source)) {
         debug_trace.logf("auth", "credential refresh skipped source={t} reason=verified_recently", .{source});
@@ -674,6 +710,7 @@ fn refreshGatewayCredential(
         source,
         mode,
         expected_account_id,
+        rejected_token,
     )) orelse return null;
     defer refreshed.deinit(context.turn.alloc);
     if (context.config.tool_context.credential_source != refreshed.source or
@@ -702,7 +739,8 @@ fn refreshGatewayCredential(
     context.config.tool_context.credential_source = current.source;
     context.config.tool_context.account_id = current.accountId();
     context.config.tool_context.gateway_team = current.gatewayTeam();
-    return worker_token;
+    // A team change is refused above, so the request keeps its team.
+    return .{ .token = worker_token };
 }
 
 fn optionalCredentialFieldEqual(left: ?[]const u8, right: ?[]const u8) bool {
@@ -736,49 +774,30 @@ fn appendStaticContext(raw: *anyopaque, arena: Allocator, messages: *std.ArrayLi
     try context.config.context_registry.appendDefaultStatic(.{
         .project_context = context.config.project_context,
     }, arena, messages);
-    var snapshot = try snapshotModelCatalogForView(
-        arena,
-        if (context.admission.mcp_view) |*view| view else null,
-    );
-    defer snapshot.deinit(arena);
-    const section = try model_catalog.render(arena, snapshot);
-    if (section.text.len > 0) {
-        try messages.append(arena, .{ .role = .system, .content = section.text });
-    }
-    if (section.notice) |notice| try pushLiveNotice(raw, notice);
+    // The toolbox menu lists the child's MCP servers (its config's
+    // toolbox_mcp_servers), so there is no MCP block here.
 }
 
-fn snapshotModelCatalogForView(
-    alloc: Allocator,
-    maybe_view: ?*const mcp_access.View,
-) !model_catalog.Snapshot {
-    const view = maybe_view orelse return model_catalog.Snapshot.empty(alloc);
-    const servers = try alloc.alloc(model_catalog.ServerSummary, view.servers.len);
+/// The names of the MCP servers in the child's captured view, for its
+/// toolbox menu. `alloc` owns the slice and each name.
+fn viewServerNames(alloc: Allocator, maybe_view: ?*const mcp_access.View) ![]const []const u8 {
+    const view = maybe_view orelse return &.{};
+    const names = try alloc.alloc([]const u8, view.servers.len);
     var initialized: usize = 0;
     errdefer {
-        for (servers[0..initialized]) |server| alloc.free(server.name);
-        alloc.free(servers);
+        for (names[0..initialized]) |name| alloc.free(name);
+        alloc.free(names);
     }
-    for (view.servers, 0..) |server, index| {
-        var tool_count: usize = 0;
-        for (view.tools) |tool| {
-            if (std.mem.eql(u8, tool.server_name, server.name)) tool_count += 1;
-        }
-        // Generation 0: the server's list hadn't loaded when the view was
-        // taken, so it starts when the subagent first needs it.
-        const on_demand = tool_count == 0 and server.catalog_generation == 0;
-        servers[index] = .{
-            .name = try alloc.dupe(u8, server.name),
-            .availability = if (on_demand) .available_on_demand else .ready,
-            .tool_count = if (on_demand) null else tool_count,
-        };
+    for (view.servers, names) |server, *name| {
+        name.* = try alloc.dupe(u8, server.name);
         initialized += 1;
     }
-    return .{ .servers = servers };
+    return names;
 }
 
-test "subagent model catalog counts the captured view's tools and offers servers not yet listed" {
-    const alloc = std.testing.allocator;
+test "a subagent's toolbox lists every server in its captured view" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
     var servers = [_]mcp_access.ServerIdentity{ .{
         .name = @constCast("chrome-devtools"),
         .source = .profile,
@@ -794,28 +813,19 @@ test "subagent model catalog counts the captured view's tools and offers servers
         .catalog_generation = 0,
         .auth_generation = 0,
     } };
-    var tools = [_]mcp_access.ToolIdentity{
-        .{ .name = @constCast("mcp_chrome_one"), .server_name = @constCast("chrome-devtools") },
-        .{ .name = @constCast("mcp_chrome_two"), .server_name = @constCast("chrome-devtools") },
-    };
     const view = mcp_access.View{
         .runtime_generation = 1,
         .owner_id = @constCast("child"),
         .parent_id = @constCast("parent"),
         .servers = &servers,
-        .tools = &tools,
+        .tools = &.{},
     };
-
-    var snapshot = try snapshotModelCatalogForView(alloc, &view);
-    defer snapshot.deinit(alloc);
-
-    try std.testing.expectEqual(@as(usize, 2), snapshot.servers.len);
-    try std.testing.expectEqualStrings("chrome-devtools", snapshot.servers[0].name);
-    try std.testing.expectEqual(model_catalog.Availability.ready, snapshot.servers[0].availability);
-    try std.testing.expectEqual(@as(?usize, 2), snapshot.servers[0].tool_count);
-    // A server whose list hadn't loaded is offered, not shown as empty.
-    try std.testing.expectEqual(model_catalog.Availability.available_on_demand, snapshot.servers[1].availability);
-    try std.testing.expectEqual(@as(?usize, null), snapshot.servers[1].tool_count);
+    const names = try viewServerNames(arena_state.allocator(), &view);
+    try std.testing.expectEqual(@as(usize, 2), names.len);
+    try std.testing.expectEqualStrings("chrome-devtools", names[0]);
+    // A server whose list hadn't loaded is listed too: it starts on demand.
+    try std.testing.expectEqualStrings("later", names[1]);
+    try std.testing.expectEqual(@as(usize, 0), (try viewServerNames(arena_state.allocator(), null)).len);
 }
 
 test "subagent inherits model capabilities" {
@@ -849,14 +859,16 @@ fn validateToolCall(raw: *anyopaque, arena: Allocator, call: types.ToolCall) !ag
     return tool_runtime.validateToolCall(context.toolContext(), arena, call);
 }
 
+/// An MCP tool the child's request didn't send, for a toolbox run that carries
+/// it: the child runs it as its own direct call, under its MCP access.
+fn resolveUnselectedMcpTool(raw: *anyopaque, arena: Allocator, name: []const u8) !?tool_mcp_runtime.SelectedTool {
+    const context: *Context = @ptrCast(@alignCast(raw));
+    return tool_runtime.resolveUnselectedMcpTool(context.toolContext(), arena, name);
+}
+
 fn checkToolAvailability(raw: *anyopaque, arena: Allocator, call: types.ToolCall) !?[]const u8 {
     const context: *Context = @ptrCast(@alignCast(raw));
     return tool_runtime.checkToolAvailability(context.toolContext(), arena, call);
-}
-
-fn prepareSkillCall(raw: *anyopaque, arena: Allocator, call: types.ToolCall, locations: ?*const skill_contract.Locations) !skill_contract.CallPreparation {
-    const context: *Context = @ptrCast(@alignCast(raw));
-    return tool_runtime.prepareSkillCall(context.toolContext(), arena, call, locations);
 }
 
 fn admissionContext(
@@ -1002,6 +1014,9 @@ fn reportUsage(raw: *anyopaque, usage: types.Usage) void {
 /// own (D92). The parent's total leaves the child's out.
 fn recordUsage(raw: *anyopaque, usage: types.Usage) !void {
     const context: *Context = @ptrCast(@alignCast(raw));
+    // The reply was billed whether or not it is saved, so the run's result
+    // counts it first (`usage_ledger.zig`).
+    if (context.turn.child_id) |child_id| context.config.host.noteChildUsage(child_id, usage);
     // A hosted run has no session here; its own agent saves its usage.
     const child = context.turn.child orelse return;
     try child.recordUsage(usage);
@@ -1036,7 +1051,37 @@ fn pushLiveToolLifecycle(
     event: types.ToolLifecycleEvent,
 ) !void {
     const context: *Context = @ptrCast(@alignCast(raw));
+    noteCallActivity(context, event);
     context.turn.appendLiveEvent(.{ .tool_lifecycle = event });
+}
+
+/// Keeps the turn's current call, with the label its own rows use, for the
+/// parent's status and agent list, and relays a shell command that crossed
+/// the quiet limit to the parent (`Runtime.noteChildQuiet`).
+fn noteCallActivity(context: *Context, event: types.ToolLifecycleEvent) void {
+    switch (event) {
+        .authoritative_started => |started| {
+            const metrics = context.turn.live_metrics orelse return;
+            var arena = std.heap.ArenaAllocator.init(std.heap.c_allocator);
+            defer arena.deinit();
+            const call: types.ToolCall = .{
+                .id = started.id.call_id,
+                .name = started.tool_name,
+                .arguments_json = started.arguments_json orelse "{}",
+            };
+            const target = resolveToolActionDisplayTarget(context, arena.allocator(), call) catch null;
+            const label = describeToolAction(context, arena.allocator(), call, target, &.{}) catch started.tool_name;
+            metrics.callStarted(started.id.call_id, label, io_mod.milliTimestamp());
+        },
+        .terminal => |terminal| {
+            if (context.turn.live_metrics) |metrics| metrics.callEnded(terminal.id.call_id);
+            const memory = terminal.result_memory orelse return;
+            const crossing = memory.quiet_crossing orelse return;
+            const child_id = context.turn.child_id orelse return;
+            context.config.host.noteChildQuiet(child_id, context.turn.child_name orelse child_id, crossing);
+        },
+        .provisional, .progress, .turn_finished => {},
+    }
 }
 
 fn pushLiveDiff(

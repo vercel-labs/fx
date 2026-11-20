@@ -3,7 +3,10 @@ const session_notices = @import("../session/session.zig");
 const agents = @import("../agents/agents.zig");
 const credentials = @import("../auth/credentials.zig");
 const activity_status = @import("../output/activity_status.zig");
+const compaction_activity = @import("../output/compaction_activity.zig");
+const turn_clock = @import("../output/turn_clock.zig");
 const app_permission_runtime = @import("app_permission_runtime.zig");
+const token_pass_check = @import("token_pass_check.zig");
 const app_session_runtime = @import("app_session_runtime.zig");
 const app_agents_runtime = @import("app_agents_runtime.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
@@ -15,6 +18,7 @@ const permission_request = @import("../permissions/permission_request.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const shared_theme = @import("../shared/theme.zig");
 const types = @import("../shared/types.zig");
+const full_transcript_metadata = @import("../output/full_transcript_metadata.zig");
 const worker_runtime = @import("../agent/worker_runtime.zig");
 const assistant_presentation = @import("../agent/assistant_presentation.zig");
 const assistant_pacer = @import("../../ui/assistant/pacer.zig");
@@ -29,6 +33,13 @@ const transcript_runtime = @import("../../ui/transcript/runtime.zig");
 const program_status = @import("../../ui/terminal/program_status.zig");
 
 const WorkerEvent = worker_runtime.WorkerEvent;
+const HeadSegmentScan = worker_runtime.HeadSegmentScan;
+
+/// How long one interactive drain applies worker events before it lets the
+/// loop read keys and paint. Late in a long session an event costs several
+/// milliseconds, and hundreds can be queued at once. Every slice costs a
+/// frame, so a shorter budget makes the whole turn slower.
+pub const interactive_drain_budget_ns: i128 = 32 * std.time.ns_per_ms;
 const InputRuntime = core_input_runtime.Runtime;
 
 const CancelledEventAdmission = enum {
@@ -56,6 +67,9 @@ fn discardCodeBlock(_: *anyopaque, block: assistant_presentation.CodeBlockPayloa
 fn discardThematicRule(_: *anyopaque) !void {}
 fn discardContextCompaction(_: *anyopaque, _: worker_runtime.ContextCompaction) !void {}
 fn discardCredentialRefresh(_: *anyopaque, _: credentials.Credential) !void {}
+fn holdNoModelCall(_: *anyopaque, _: types.ModelCallRecord) !bool {
+    return false;
+}
 
 /// A retained delivery owns its own payload; a settled delivery acknowledges history.
 pub const HistoryDelivery = union(enum) {
@@ -73,6 +87,9 @@ pub const WorkerEventHandlers = struct {
     append_code_block: *const fn (*anyopaque, assistant_presentation.CodeBlockPayload) anyerror!void = discardCodeBlock,
     append_thematic_rule: *const fn (*anyopaque) anyerror!void = discardThematicRule,
     drain_assistant_text: *const fn (*anyopaque) anyerror!AssistantTextDrainResult,
+    /// Holds a call's Ctrl+O line until the paced text before it is shown;
+    /// false when nothing is pending and the line is written now.
+    hold_model_call: *const fn (*anyopaque, types.ModelCallRecord) anyerror!bool = holdNoModelCall,
     open_model_picker: *const fn (*anyopaque) anyerror!void,
     semantic_notice: *const fn (*anyopaque, types.SemanticNotice) anyerror!void,
     credential_refreshed: *const fn (*anyopaque, credentials.Credential) anyerror!void = discardCredentialRefresh,
@@ -90,18 +107,36 @@ pub const AssistantTextDrainResult = enum {
     blocked,
 };
 
-/// Writes one full-detail record for a terminal route recovery outcome, which
-/// preserves the failure in the ctrl+o full transcript's detail section. The
-/// recovery module's statuses live only in the status row and refresh every
-/// second, so they are never recorded.
+/// Writes the full-only notice for a terminal route recovery outcome, which
+/// keeps the failure in Ctrl+O where it happened. The recovery module's
+/// statuses live only in the status row and refresh every second, so they
+/// are never recorded.
 fn recordRouteRecoveryNotice(app: anytype, status: types.RouteRecoveryStatus) !void {
     if (status.fromModule() or status.kind == .recovered or status.kind == .failed) return;
     var body: std.Io.Writer.Allocating = .init(std.heap.c_allocator);
     defer body.deinit();
     try writeRouteRecoveryBody(&body.writer, status);
-    try app.shell.appendFullDetailRecord(app.alloc, .{
+    try app.writeDomainNotice(.{
         .topic = "recovery",
         .tone = routeRecoveryNoticeTone(status),
+        .body = body.written(),
+        .visibility = .full_only,
+    }, true);
+}
+
+/// One settled model call as the full-only notice Ctrl+O shows where it
+/// happened; a failed call shows as an error.
+pub fn writeModelCallNotice(
+    ctx: *anyopaque,
+    write: *const fn (*anyopaque, types.SemanticNotice) anyerror!void,
+    record: types.ModelCallRecord,
+) !void {
+    var body: std.Io.Writer.Allocating = .init(std.heap.c_allocator);
+    defer body.deinit();
+    try full_transcript_metadata.writeModelCallText(&body.writer, record);
+    try write(ctx, .{
+        .topic = full_transcript_metadata.model_call_topic,
+        .tone = if (record.outcome == .failed) .@"error" else .neutral,
         .body = body.written(),
         .visibility = .full_only,
     });
@@ -307,29 +342,60 @@ fn batchContainsTerminalClosure(
 }
 
 fn batchSegmentIsInterrupted(events: []const WorkerEvent, cancelled_turn_id: ?u64) bool {
-    var turn_id: ?u64 = null;
-    scan: for (events, 0..) |event, index| {
-        if (index > 0) switch (event) {
-            .begin_prompt, .begin_prompt_with_skill_bindings, .begin_presented_prompt, .begin_resumed_prompt => break :scan,
-            else => {},
-        };
-        switch (event) {
-            .begin_presented_prompt, .begin_resumed_prompt => |id| turn_id = id,
-            .turn_phase_update => |phase| turn_id = phase.turn_id,
-            .tool_lifecycle => |lifecycle| {
-                turn_id = switch (lifecycle) {
-                    .turn_finished => |finished| return finished.outcome == .interrupted,
-                    .provisional => |value| value.id.turn_id,
-                    .authoritative_started => |value| value.id.turn_id,
-                    .progress => |value| value.id.turn_id,
-                    .terminal => |value| value.id.turn_id,
-                };
-            },
-            else => {},
-        }
+    return segmentInterrupted(scanSegment(.fresh, events), cancelled_turn_id);
+}
+
+/// Whether `event` begins a new prompt, and so a new segment.
+fn startsSegment(event: WorkerEvent) bool {
+    return switch (event) {
+        .begin_prompt, .begin_prompt_with_skill_bindings, .begin_presented_prompt, .begin_resumed_prompt => true,
+        else => false,
+    };
+}
+
+/// Whether a time-bounded drain has passed its deadline; never for an
+/// unbounded one.
+fn budgetSpent(deadline_ns: ?i128) bool {
+    const deadline = deadline_ns orelse return false;
+    return io_mod.nanoTimestamp() >= deadline;
+}
+
+/// Continues `state` over `events`, which carry on the segment `state`
+/// describes, stopping where the next prompt begins.
+fn scanSegment(state: HeadSegmentScan, events: []const WorkerEvent) HeadSegmentScan {
+    var scan = state;
+    for (events, 0..) |event, index| {
+        if (index > 0 and startsSegment(event)) break;
+        scan = scanSegmentEvent(scan, event);
+        if (scan == .settled) break;
     }
-    const cancelled = cancelled_turn_id orelse return false;
-    return turn_id == null or turn_id.? == cancelled;
+    return scan;
+}
+
+fn scanSegmentEvent(state: HeadSegmentScan, event: WorkerEvent) HeadSegmentScan {
+    if (state == .settled) return state;
+    return switch (event) {
+        .begin_presented_prompt, .begin_resumed_prompt => |id| .{ .turn = id },
+        .turn_phase_update => |phase| .{ .turn = phase.turn_id },
+        .tool_lifecycle => |lifecycle| switch (lifecycle) {
+            .turn_finished => |finished| .{ .settled = finished.outcome == .interrupted },
+            .provisional => |value| .{ .turn = value.id.turn_id },
+            .authoritative_started => |value| .{ .turn = value.id.turn_id },
+            .progress => |value| .{ .turn = value.id.turn_id },
+            .terminal => |value| .{ .turn = value.id.turn_id },
+        },
+        else => state,
+    };
+}
+
+fn segmentInterrupted(state: HeadSegmentScan, cancelled_turn_id: ?u64) bool {
+    return switch (state) {
+        .settled => |interrupted| interrupted,
+        .turn => |turn_id| {
+            const cancelled = cancelled_turn_id orelse return false;
+            return turn_id == null or turn_id.? == cancelled;
+        },
+    };
 }
 
 pub fn Runtime(comptime App: type) type {
@@ -354,7 +420,6 @@ pub fn Runtime(comptime App: type) type {
                 .assistant_presentation,
                 .open_model_picker,
                 .semantic_notice,
-                .full_detail_record,
                 .command_output,
                 .turn_token_update,
                 .turn_phase_update,
@@ -362,6 +427,8 @@ pub fn Runtime(comptime App: type) type {
                 .restore_failed_prompt,
                 => .drop,
                 .route_recovery_status => .drop,
+                // A stopped turn's calls still show where they happened.
+                .model_call => .admit,
                 .command_output_complete => |lifecycle_id| if (cancelledCommandCompletionMatches(presenter, lifecycle_id))
                     .admit
                 else
@@ -445,6 +512,80 @@ pub fn Runtime(comptime App: type) type {
             }
         }
 
+        /// Tells `agent`'s worker that a finished turn it pushed is gone
+        /// without a commit, so its commit gate stops waiting for it
+        /// (`WorkerRuntime.acknowledgeFinishDropped`). Every place that frees
+        /// a finished turn unsaved calls this or goes through `clearPacer` or
+        /// `deferFinish`; a turn that is saved is acknowledged by
+        /// `appendFinishedPrompt`.
+        pub fn acknowledgeDroppedFinish(agent: *AppAgent, reason: []const u8) void {
+            if (comptime @hasField(AppAgent, "worker") and
+                @hasDecl(@TypeOf(agent.worker), "acknowledgeFinishDropped"))
+            {
+                agent.worker.acknowledgeFinishDropped(reason);
+            }
+        }
+
+        fn pacerHoldsFinish(app: *App) bool {
+            if (comptime !@hasField(@TypeOf(app.pacer), "deferred_turn")) return false;
+            return app.pacer.deferred_turn != null;
+        }
+
+        /// Shows the finished turn that the pacer of `agent`, the agent in
+        /// context, keeps behind an open prompt, and commits it, when the
+        /// worker holds mail for that commit. The loop does not tick a pacer
+        /// under a prompt, so the commit waits for the prompt to close; and
+        /// the mail's turn, whose start flushes the pacer
+        /// (`workerBridgeDrainAssistantText`), waits for the commit. Without
+        /// this the worker's time limit is all that ends the hold, and the
+        /// mail's turn then starts before the commit and cuts the finished
+        /// turn off in the session. It runs on the loop's thread, which owns
+        /// the pacer. A flush that fails is logged and not tried again until
+        /// the hold is over: the finished turn stays in the pacer, and the
+        /// worker's time limit ends the hold as it did before.
+        pub fn flushPacerForHeldMail(app: *App, agent: *AppAgent, now_ns: i128) void {
+            if (comptime !(@hasField(AppAgent, "worker") and
+                @hasDecl(@TypeOf(agent.worker), "commitGateWaitsForCommit")))
+            {
+                return;
+            }
+            if (!pacerHoldsFinish(app)) return;
+            if (!agent.worker.commitGateWaitsForCommit()) return;
+            debug_trace.logf("worker", "commit gate flushes the pacer behind a prompt for held mail", .{});
+            app.pacer.flushPresentationAtBoundary(app.alloc, now_ns, app.pacerCallbacks()) catch |err| {
+                debug_trace.logf("worker", "commit gate flush failed err={s}; the time limit ends the hold dropped=none", .{@errorName(err)});
+                agent.worker.noteCommitGateFlushFailed();
+            };
+        }
+
+        /// Clears the pacer of `agent`, the agent in context: the text it had
+        /// not shown, and a finished turn it deferred, which is never saved
+        /// then. A cancel and a session switch clear it. `reason` names which.
+        pub fn clearPacer(app: *App, agent: *AppAgent, reason: []const u8) void {
+            const held_finish = pacerHoldsFinish(app);
+            app.pacer.clear(app.alloc);
+            if (held_finish) {
+                debug_trace.logf("worker", "pacer cleared a deferred finished turn unsaved reason={s}", .{reason});
+                acknowledgeDroppedFinish(agent, reason);
+            }
+        }
+
+        /// Defers `finished` in the pacer of `agent` while text is still being
+        /// shown. A finished turn the pacer already held is replaced and never
+        /// saved, so that one is acknowledged as dropped.
+        pub fn deferFinish(app: *App, agent: *AppAgent, finished: types.FinishedPrompt) !bool {
+            const replaced = pacerHoldsFinish(app);
+            const retained = app.pacer.deferFinish(app.alloc, finished) catch |err| {
+                if (replaced and !pacerHoldsFinish(app)) acknowledgeDroppedFinish(agent, "pacer_replaced");
+                return err;
+            };
+            if (retained and replaced) {
+                debug_trace.logf("worker", "pacer replaced a deferred finished turn unsaved", .{});
+                acknowledgeDroppedFinish(agent, "pacer_replaced");
+            }
+            return retained;
+        }
+
         fn preserveFinishedAfterDrainFailure(app: *App, agent: *AppAgent, batch: *DetachedWorkerEventBatch, may_persist: bool) void {
             var can_persist = may_persist;
             if (can_persist) settleDeferredFinish(app, agent) catch {
@@ -460,6 +601,7 @@ pub fn Runtime(comptime App: type) type {
                             };
                         } else {
                             debug_trace.logf("worker", "finished turn not persisted after earlier save failure", .{});
+                            acknowledgeDroppedFinish(agent, "not_persisted");
                         }
                     },
                     else => debug_trace.logf("worker", "presentation failure discarded worker event kind={s}", .{@tagName(event)}),
@@ -496,11 +638,9 @@ pub fn Runtime(comptime App: type) type {
             agent: *AppAgent,
             snapshot: worker_runtime.PermissionSnapshot,
         ) !void {
-            try agent.worker.syncQueuedPromptPermissionState(
-                std.heap.c_allocator,
-                app_permission_runtime.Runtime(App).grantsOf(app, agent),
-                snapshot,
-            );
+            const grants = try app_permission_runtime.Runtime(App).copyGrants(app, agent, std.heap.c_allocator);
+            defer types.freePermissionGrantSlice(std.heap.c_allocator, grants);
+            try agent.worker.syncQueuedPromptPermissionState(std.heap.c_allocator, grants, snapshot);
         }
 
         pub fn propagateHistoryTurn(app: *App, agent: *AppAgent, turn: types.HistoryTurn, max_history_turns: usize) !void {
@@ -536,6 +676,7 @@ pub fn Runtime(comptime App: type) type {
                 try app.propagateGrant(tool_name, target_path);
                 return;
             }
+            try app_permission_runtime.Runtime(App).allowAtOnce(app, agent, tool_name, target_path);
             try agent.worker.propagateGrant(std.heap.c_allocator, tool_name, target_path);
         }
 
@@ -784,13 +925,18 @@ pub fn Runtime(comptime App: type) type {
                 agent.stream.turn_started_ms = io_mod.milliTimestamp();
                 app.shell.render_requests.request(.footer);
             }
-            // Waiting on an approval or question is not thinking: freeze the
-            // elapsed clock for the duration of the wait.
-            activity_status.syncWaitingClock(&agent.stream, modal_active, io_mod.milliTimestamp());
+            // Waiting on an approval, a question, or a compaction is not the
+            // turn's work: freeze the elapsed clock for the duration of the
+            // wait. A compaction shows a clock of its own meanwhile.
+            const compaction: compaction_activity.Snapshot = if (comptime @hasDecl(@TypeOf(agent.worker), "compactionActivitySnapshot"))
+                agent.worker.compactionActivitySnapshot()
+            else
+                .{};
+            activity_status.syncWaitingClock(&agent.stream, turn_clock.waits(modal_active, compaction), io_mod.milliTimestamp());
 
             if (comptime @hasField(App, "program_status")) {
                 reportProgramStatus(app, agent, !cancellation_stops_turn and
-                    (agent.stream.active or snapshot.processing or snapshot.queued_count > 0));
+                    (agent.stream.active or snapshot.processing or snapshot.queued_count > 0), compaction);
             }
         }
 
@@ -816,11 +962,9 @@ pub fn Runtime(comptime App: type) type {
 
         /// Tells the terminal what the user would see: a decision prompt,
         /// running work, or the result of the last turn.
-        fn reportProgramStatus(app: *App, agent: *AppAgent, busy: bool) void {
+        fn reportProgramStatus(app: *App, agent: *AppAgent, busy: bool, compaction: compaction_activity.Snapshot) void {
             if (offScreen(app, agent)) return;
-            if (comptime @hasDecl(@TypeOf(agent.worker), "compactionActivitySnapshot")) {
-                app.program_status.noteCompaction(agent.worker.compactionActivitySnapshot());
-            }
+            app.program_status.noteCompaction(compaction);
             const activity: program_status.Activity = if (agent.approval_prompt.isActive())
                 .{ .blocked = .{
                     .kind = .permission,
@@ -864,8 +1008,29 @@ pub fn Runtime(comptime App: type) type {
             agent: *AppAgent,
             event_handlers: WorkerEventHandlers,
         ) !void {
+            try tickWithDrainBudget(app, agent, event_handlers, null);
+        }
+
+        /// `tick` for the interactive loop: once `budget_ns` has passed, the
+        /// drain stops before its next event and puts the rest back, so the
+        /// loop reads keys and paints before applying them.
+        pub fn tickWithinBudget(
+            app: *App,
+            agent: *AppAgent,
+            event_handlers: WorkerEventHandlers,
+            budget_ns: i128,
+        ) !void {
+            try tickWithDrainBudget(app, agent, event_handlers, budget_ns);
+        }
+
+        fn tickWithDrainBudget(
+            app: *App,
+            agent: *AppAgent,
+            event_handlers: WorkerEventHandlers,
+            budget_ns: ?i128,
+        ) !void {
             if (!try authorizeInteractiveAdmission(app, agent)) return;
-            try drainEvents(app, agent, event_handlers);
+            try drainEvents(app, agent, event_handlers, budget_ns);
             syncState(app, agent, event_handlers.tool_lifecycle);
 
             const now_ms = io_mod.milliTimestamp();
@@ -892,7 +1057,7 @@ pub fn Runtime(comptime App: type) type {
             }
             const compaction_active = if (compaction.operation) |op| op.active() and op.visible(now_ms) else false;
             if (!compaction_active and !agent.stream.active and !app.pacer.hasCompletedAssistantPresentationTail()) {
-                return false;
+                return advanceSubagentWaitBlink(app, agent, now_ms);
             }
             if (agent.approval_prompt.isActive() or
                 agent.question_prompt.isActive() or
@@ -913,6 +1078,23 @@ pub fn Runtime(comptime App: type) type {
             return true;
         }
 
+        /// Keeps frames coming while the idle agent on screen shows "waiting
+        /// on N subagents", so its bullet blinks like a turn's.
+        fn advanceSubagentWaitBlink(app: *App, agent: *AppAgent, now_ms: i64) bool {
+            if (comptime !@hasDecl(App, "subagentWaitCount")) return false;
+            if (offScreen(app, agent)) return false;
+            if (agent.approval_prompt.isActive() or agent.question_prompt.isActive() or !app.shell.shimmer_active) return false;
+            // A worker status, such as a failed request, shows in its place.
+            switch (app.shell.activityProjection()) {
+                .turn_thinking => |thinking| if (thinking.tone != .thinking) return false,
+                .none, .tool_slot => {},
+            }
+            // Counting walks every subagent, so wait until a frame is due.
+            if (!app.shell.render_requests.animationDue(now_ms)) return false;
+            if (app.subagentWaitCount() == 0) return false;
+            return app.shell.render_requests.requestAnimationDue(now_ms);
+        }
+
         fn activityShimmerLabel(
             app: *App,
             agent: *AppAgent,
@@ -925,7 +1107,7 @@ pub fn Runtime(comptime App: type) type {
                 .turn_thinking => |thinking| if (thinking.tone != .thinking) return null,
                 .none, .tool_slot => {},
             }
-            switch (activity_status.compactionProjection(buf, compaction, agent.stream, now_ms)) {
+            switch (activity_status.compactionProjection(buf, compaction, now_ms)) {
                 .turn_thinking => |thinking| return if (thinking.tone == .thinking) thinking.label else null,
                 .none, .tool_slot => {},
             }
@@ -954,7 +1136,7 @@ pub fn Runtime(comptime App: type) type {
             }
         }
 
-        fn drainEvents(app: *App, agent: *AppAgent, handlers: WorkerEventHandlers) !void {
+        fn drainEvents(app: *App, agent: *AppAgent, handlers: WorkerEventHandlers, budget_ns: ?i128) !void {
             errdefer if (comptime @hasDecl(@TypeOf(agent.worker), "failPendingHistoryPublication")) {
                 agent.worker.failPendingHistoryPublication(error.HistoryPublicationDeliveryFailed);
             };
@@ -981,16 +1163,36 @@ pub fn Runtime(comptime App: type) type {
             var can_persist_finished = true;
             errdefer preserveFinishedAfterDrainFailure(app, agent, &batch, can_persist_finished);
 
-            var interrupted_segment = batchSegmentIsInterrupted(batch.events.items, taken.cancelled_turn_id);
+            // A take's cancellation snapshot stays with the events taken under
+            // it, so a batch that carries one is never split.
+            const deadline_ns: ?i128 = if (budget_ns) |budget|
+                if (taken.cancelled_turn_id == null) io_mod.nanoTimestamp() + budget else null
+            else
+                null;
+            var segment_scan: HeadSegmentScan = taken.head_segment orelse .fresh;
+            var interrupted_segment = segmentInterrupted(
+                scanSegment(segment_scan, batch.events.items),
+                taken.cancelled_turn_id,
+            );
             var first_event = true;
 
             events: while (batch.claim()) |event| {
-                if (!first_event) switch (event) {
-                    .begin_prompt, .begin_prompt_with_skill_bindings, .begin_presented_prompt, .begin_resumed_prompt => {
+                if (!first_event) {
+                    const starts_segment = startsSegment(event);
+                    if (budgetSpent(deadline_ns)) {
+                        try retainClaimedEventAndSuffixForBudget(
+                            agent,
+                            &batch,
+                            if (starts_segment) null else segment_scan,
+                        );
+                        break :events;
+                    }
+                    if (starts_segment) {
                         interrupted_segment = batchSegmentIsInterrupted(batch.claimedAndRemaining(), taken.cancelled_turn_id);
-                    },
-                    else => {},
-                };
+                        segment_scan = .fresh;
+                    }
+                }
+                segment_scan = scanSegmentEvent(segment_scan, event);
                 first_event = false;
                 var drain_owns_current = true;
                 defer if (drain_owns_current) {
@@ -1205,10 +1407,22 @@ pub fn Runtime(comptime App: type) type {
                             drain_owns_current = false;
                             break :events;
                         }
+                        observeTokenPassDenial(app, notice);
                         try handlers.semantic_notice(handlers.ctx, notice);
                     },
-                    .full_detail_record => |notice| {
-                        try app.shell.appendFullDetailRecord(app.alloc, notice);
+                    .model_call => |record| {
+                        if (comptime @hasField(App, "model_cache")) {
+                            if (record.outcome == .completed) {
+                                if (record.served_by) |served_by| token_pass_check.Runtime(App).observeServedBy(app, served_by);
+                            }
+                        }
+                        // After the text the call wrote. The line shows only
+                        // in Ctrl+O, so it waits for text still being paced
+                        // out instead of showing that text early, as in
+                        // front of an approval.
+                        if (!try handlers.hold_model_call(handlers.ctx, record)) {
+                            try writeModelCallNotice(handlers.ctx, handlers.semantic_notice, record);
+                        }
                     },
                     .route_recovery_status => |status| {
                         if (!try requireAssistantTextDrain(handlers)) {
@@ -1220,6 +1434,7 @@ pub fn Runtime(comptime App: type) type {
                         // recovered or failed; the error itself arrives on
                         // its own. The status line returns to normal activity.
                         const was_waiting_for_sign_in = app.shell.worker_status_state().waitsForSignIn();
+                        const was_waiting = app.shell.worker_status_state().waitsForUser();
                         if (status.kind == .recovered or status.kind == .failed) {
                             _ = app.shell.worker_status_state().clear_route_recovery();
                         } else {
@@ -1236,12 +1451,19 @@ pub fn Runtime(comptime App: type) type {
                         }
                         app.shell.render_requests.request(.footer);
                         try recordRouteRecoveryNotice(app, status);
-                        if (comptime agents.hasAgentField(App, "child_run")) app_agents_runtime.Runtime(App).noteChildFailure(app, agent, status);
+                        if (comptime agents.hasAgentField(App, "child_run")) {
+                            app_agents_runtime.Runtime(App).noteChildFailure(app, agent, status);
+                            const waiting = app.shell.worker_status_state().waitsForUser();
+                            if (!was_waiting and waiting) app_agents_runtime.Runtime(App).noteChildWaiting(app, agent, status);
+                            // A wait the user ended leaves nothing for the parent to answer.
+                            if (!waiting) agent.worker.parent_may_continue.store(false, .seq_cst);
+                        }
                     },
                     .clear_route_recovery_status => {
                         if (app.shell.worker_status_state().clear_route_recovery()) {
                             app.shell.render_requests.request(.footer);
                         }
+                        if (comptime agents.hasAgentField(App, "child_run")) agent.worker.parent_may_continue.store(false, .seq_cst);
                     },
                     // The serving provider already appears on the ctrl+o
                     // network record; nothing interactive consumes the event
@@ -1253,7 +1475,15 @@ pub fn Runtime(comptime App: type) type {
                         app.shell.render_requests.request(.footer);
                     },
                     .credential_refreshed => |credential| {
+                        // During a wait for a sign-in, a credential comes only
+                        // from a login another fx process saved, which the
+                        // request now sends instead of this session's own
+                        // sign-in.
+                        const waited_for_sign_in = app.shell.worker_status_state().waitsForSignIn();
                         try handlers.credential_refreshed(handlers.ctx, credential);
+                        if (waited_for_sign_in) if (comptime @hasDecl(App, "closeRecoverySignInForStoredLogin")) {
+                            if (agent == app.screenAgent()) try app.closeRecoverySignInForStoredLogin(credential.source);
+                        };
                     },
                     .command_output => |chunk| {
                         try handlers.command_output(handlers.ctx, chunk.lifecycle_id, chunk.stream, chunk.text);
@@ -1294,6 +1524,9 @@ pub fn Runtime(comptime App: type) type {
                             },
                             .progress, .terminal, .turn_finished => {},
                         }
+                        if (comptime agents.hasAgentField(App, "child_run")) {
+                            app_agents_runtime.Runtime(App).noteChildToolLifecycle(app, agent, lifecycle);
+                        }
                         try applyToolLifecycle(app, agent, handlers.tool_lifecycle, lifecycle);
                     },
                     .finish_prompt => |finished| {
@@ -1302,9 +1535,14 @@ pub fn Runtime(comptime App: type) type {
                             settleDeferredFinish(app, agent) catch {
                                 can_persist_finished = false;
                             };
-                            if (can_persist_finished) persistFinishedPrompt(app, agent, finished) catch {
-                                can_persist_finished = false;
-                            };
+                            if (can_persist_finished) {
+                                persistFinishedPrompt(app, agent, finished) catch {
+                                    can_persist_finished = false;
+                                };
+                            } else {
+                                debug_trace.logf("worker", "finished turn not persisted after earlier save failure", .{});
+                                acknowledgeDroppedFinish(agent, "not_persisted");
+                            }
                         };
                         try flushPendingCommandOutputAtTurnBoundary(app, handlers);
                         resetStream(app, agent, false);
@@ -1332,6 +1570,7 @@ pub fn Runtime(comptime App: type) type {
                         if (comptime @hasField(App, "program_status")) {
                             if (notice.tone == .@"error" and !offScreen(app, agent)) app.program_status.noteFailure();
                         }
+                        observeTokenPassDenial(app, notice);
                         app.shell.render_requests.request(.footer);
                         try handlers.error_text(handlers.ctx, notice);
                     },
@@ -1406,6 +1645,24 @@ pub fn Runtime(comptime App: type) type {
             );
         }
 
+        /// Puts the claimed event and the rest back for the next drain, with
+        /// the scan of the segment they continue (null when the claimed event
+        /// starts one).
+        fn retainClaimedEventAndSuffixForBudget(
+            agent: *AppAgent,
+            batch: *DetachedWorkerEventBatch,
+            head_segment: ?HeadSegmentScan,
+        ) !void {
+            const retained = batch.claimedAndRemaining();
+            try agent.worker.prependOwnedEventsForBudget(batch.alloc, retained, head_segment);
+            batch.markClaimedAndRemainingTransferred();
+            debug_trace.logf(
+                "worker",
+                "retained detached worker events reason=drain_time_budget count={d}",
+                .{retained.len},
+            );
+        }
+
         fn applyToolLifecycle(
             app: *App,
             agent: *AppAgent,
@@ -1452,6 +1709,14 @@ pub fn Runtime(comptime App: type) type {
                 app.shell.render_requests.requestAnimationReset();
             }
             app.shell.render_requests.request(.footer);
+        }
+
+        /// A warning or error that AI Gateway's Token Pass denial produced
+        /// tells the model cache the team has no active Token Pass.
+        fn observeTokenPassDenial(app: *App, notice: types.SemanticNotice) void {
+            if (comptime !@hasField(App, "model_cache")) return;
+            if (notice.tone != .warning and notice.tone != .@"error") return;
+            token_pass_check.Runtime(App).observeErrorText(app, notice.body);
         }
 
         fn resetStream(app: *App, agent: *AppAgent, clear_route_recovery: bool) void {
@@ -1605,6 +1870,8 @@ const FakeWorker = struct {
 
     worker_cancel_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     events: std.ArrayList(WorkerEvent) = .empty,
+    head_segment: ?HeadSegmentScan = null,
+    drain_continuation_due: bool = false,
     queued_count: usize = 0,
     processing: bool = false,
     cancel_continues_turn: bool = false,
@@ -1617,6 +1884,12 @@ const FakeWorker = struct {
     propagated_grants: usize = 0,
     reset_cancel_after_take_events: bool = false,
     admission_snapshot: worker_runtime.InteractiveAdmissionSnapshot = .open,
+    /// Finished turns the app told this worker it dropped without saving.
+    dropped_finishes: usize = 0,
+
+    pub fn acknowledgeFinishDropped(self: *FakeWorker, _: []const u8) void {
+        self.dropped_finishes += 1;
+    }
 
     pub fn compactionActivitySnapshot(self: *FakeWorker) @import("../output/compaction_activity.zig").Snapshot {
         self.compaction_reads += 1;
@@ -1650,6 +1923,22 @@ const FakeWorker = struct {
         try self.events.insertSlice(alloc, 0, events);
     }
 
+    fn prependOwnedEventsForBudget(
+        self: *FakeWorker,
+        alloc: std.mem.Allocator,
+        events: []const WorkerEvent,
+        head_segment: ?HeadSegmentScan,
+    ) !void {
+        try self.events.insertSlice(alloc, 0, events);
+        self.head_segment = head_segment;
+        self.drain_continuation_due = true;
+    }
+
+    fn takeDrainContinuationDue(self: *FakeWorker) bool {
+        defer self.drain_continuation_due = false;
+        return self.drain_continuation_due;
+    }
+
     fn takeEvents(self: *FakeWorker) std.ArrayList(WorkerEvent) {
         const events = self.events;
         self.events = .empty;
@@ -1662,9 +1951,11 @@ const FakeWorker = struct {
 
     fn takeEventBatch(self: *FakeWorker) worker_runtime.WorkerEventBatch {
         const cancel_requested = self.worker_cancel_requested.load(.seq_cst);
+        defer self.head_segment = null;
         return .{
             .events = self.takeEvents(),
             .cancelled_turn_id = if (cancel_requested and self.active_turn_id != 0) self.active_turn_id else null,
+            .head_segment = self.head_segment,
         };
     }
 
@@ -1871,10 +2162,6 @@ const FakeShell = struct {
         return @intCast(self.raw_entries.items.len);
     }
 
-    fn appendFullDetailRecord(self: *FakeShell, alloc: std.mem.Allocator, notice: types.SemanticNotice) !void {
-        return self.lifecycle.appendFullDetailRecord(alloc, notice);
-    }
-
     fn appendRawTranscriptEntryClassified(self: *FakeShell, alloc: std.mem.Allocator, line: []const u8, class: transcript_runtime.RawEntryClass) !u32 {
         self.last_class = class;
         return self.appendRawTranscriptEntry(alloc, line);
@@ -1984,6 +2271,8 @@ const FakeShell = struct {
 const FakePacer = struct {
     flushed: usize = 0,
     completed_assistant_presentation_tail: bool = false,
+    deferred_turn: ?types.FinishedPrompt = null,
+    deferred_started_ns: ?i128 = null,
 
     fn flushPendingText(self: *FakePacer, callbacks: anytype) !void {
         _ = callbacks;
@@ -2055,6 +2344,7 @@ const FakeApp = struct {
     }
 
     fn deinit(self: *FakeApp) void {
+        if (self.pacer.deferred_turn) |finished| types.freeFinishedPrompt(self.alloc, finished);
         for (self.persisted_finishes.items) |finished| types.freeFinishedPrompt(self.alloc, finished);
         self.persisted_finishes.deinit(self.alloc);
         self.program_status_reports.deinit(self.alloc);
@@ -2349,6 +2639,10 @@ const PacedTranscriptBridge = struct {
     finish_count: usize = 0,
     order: [8]u8 = undefined,
     order_len: usize = 0,
+    emitted_bytes: usize = 0,
+    held_call_lines: usize = 0,
+    emitted_when_call_written: usize = 0,
+    entries_when_call_written: usize = 0,
 
     fn init(app: *FakeApp) PacedTranscriptBridge {
         return .{ .app = app };
@@ -2364,6 +2658,7 @@ const PacedTranscriptBridge = struct {
             .emit_fn = emit,
             .finish_ctx = @ptrCast(self),
             .finish_fn = finish,
+            .model_call_fn = writeHeldCall,
         };
     }
 
@@ -2373,6 +2668,7 @@ const PacedTranscriptBridge = struct {
         bridge.write_user_prompt = writeUserPrompt;
         bridge.append_text = appendText;
         bridge.drain_assistant_text = drainAssistantText;
+        bridge.hold_model_call = holdModelCall;
         bridge.semantic_notice = semanticNotice;
         bridge.append_history_turn = appendHistoryTurn;
         return bridge;
@@ -2432,8 +2728,21 @@ const PacedTranscriptBridge = struct {
         return .{ .settled = .committed };
     }
 
+    fn holdModelCall(raw: *anyopaque, call: types.ModelCallRecord) !bool {
+        const self: *PacedTranscriptBridge = @ptrCast(@alignCast(raw));
+        return self.pacer.holdModelCall(self.app.alloc, call);
+    }
+
+    fn writeHeldCall(raw: *anyopaque, _: types.ModelCallRecord) !void {
+        const self: *PacedTranscriptBridge = @ptrCast(@alignCast(raw));
+        self.held_call_lines += 1;
+        self.emitted_when_call_written = self.emitted_bytes;
+        self.entries_when_call_written = self.app.shell.lifecycle.notebook.entries.items.len;
+    }
+
     fn emit(raw: *anyopaque, text: []const u8) !void {
         const self: *PacedTranscriptBridge = @ptrCast(@alignCast(raw));
+        self.emitted_bytes += text.len;
         _ = try self.app.shell.lifecycle.streamAssistantChunk(
             self.app.alloc,
             &self.metrics,
@@ -2996,7 +3305,7 @@ test "core.app_worker_runtime a recovery leaves no status and no recovered summa
     try std.testing.expect(std.mem.find(u8, app.shell.lifecycle.notebook.entries.items[0].raw_bytes.bytes, "✓ recovered") == null);
 }
 
-test "core.app_worker_runtime records a terminal route recovery as a full-detail record" {
+test "core.app_worker_runtime writes a terminal route recovery where it happened" {
     var app = FakeApp.init(std.testing.allocator);
     defer app.deinit();
 
@@ -3007,17 +3316,118 @@ test "core.app_worker_runtime records a terminal route recovery as a full-detail
     } });
     try tickNoop(&app);
 
-    try std.testing.expectEqual(@as(usize, 1), app.shell.lifecycle.notebook.full_detail_records.items.len);
-    const record = app.shell.lifecycle.notebook.full_detail_records.items[0].notice;
-    try std.testing.expectEqualStrings("recovery", record.topic);
-    try std.testing.expectEqual(types.NoticeTone.@"error", record.tone);
-    try std.testing.expectEqual(types.NoticeVisibility.full_only, record.visibility);
-    try std.testing.expect(std.mem.find(u8, record.body, "stopped after 2 attempts") != null);
-    try std.testing.expect(std.mem.find(u8, record.body, "kind: terminal_provider_error") != null);
-    try std.testing.expect(std.mem.find(u8, record.body, "cause: rate_limited") != null);
-    try std.testing.expect(std.mem.find(u8, record.body, "attempt: 2") != null);
-    // The record stays out of the transcript entry store.
+    const written = app.transcript.items;
+    try std.testing.expect(std.mem.startsWith(u8, written, "recovery:"));
+    try std.testing.expect(std.mem.find(u8, written, "stopped after 2 attempts") != null);
+    try std.testing.expect(std.mem.find(u8, written, "kind: terminal_provider_error") != null);
+    try std.testing.expect(std.mem.find(u8, written, "cause: rate_limited") != null);
+    try std.testing.expect(std.mem.find(u8, written, "attempt: 2") != null);
+}
+
+test "core.app_worker_runtime writes a model call as a full-only notice without draining paced text" {
+    var app = FakeApp.init(std.testing.allocator);
+    defer app.deinit();
+    const Capture = struct {
+        var drains: usize = 0;
+        var notice: ?types.SemanticNotice = null;
+        var body: [256]u8 = undefined;
+        var body_len: usize = 0;
+        fn drain(_: *anyopaque) !AssistantTextDrainResult {
+            drains += 1;
+            return .drained;
+        }
+        fn write(_: *anyopaque, value: types.SemanticNotice) !void {
+            @memcpy(body[0..value.body.len], value.body);
+            body_len = value.body.len;
+            notice = value;
+        }
+    };
+    var handlers = NoopBridge.handlers(&app);
+    handlers.drain_assistant_text = Capture.drain;
+    handlers.semantic_notice = Capture.write;
+    try app.agent().worker.pushEvent(std.heap.c_allocator, .{ .model_call = .{
+        .at_ms = 1_000,
+        .elapsed_ms = 2_140,
+        .provider = "gateway",
+        .model = "anthropic/claude-opus-4.8",
+        .generation_id = "gen_01JC7P5XQ2M8VZ",
+        .input_tokens = 1_204,
+        .output_tokens = 188,
+    } });
+    try Runtime(FakeApp).tick(&app, app.agent(), handlers);
+
+    // Nothing was pending, so the line is written at once, and never by
+    // showing paced text early.
+    try std.testing.expectEqual(@as(usize, 0), Capture.drains);
+    const notice = Capture.notice.?;
+    try std.testing.expectEqualStrings(full_transcript_metadata.model_call_topic, notice.topic);
+    try std.testing.expectEqual(types.NoticeVisibility.full_only, notice.visibility);
+    try std.testing.expectEqual(types.NoticeTone.neutral, notice.tone);
+    try std.testing.expectEqualStrings(
+        "claude-opus-4.8 · 2.1 s · in 1,204 · out 188 · gen_01JC7P5XQ2M8VZ",
+        Capture.body[0..Capture.body_len],
+    );
+}
+
+const test_held_call: types.ModelCallRecord = .{
+    .at_ms = 1_000,
+    .elapsed_ms = 900,
+    .provider = "gateway",
+    .model = "openai/gpt-5.4",
+    .generation_id = "gen_held",
+};
+
+test "app worker holds a model call's line behind paced text instead of showing the text" {
+    var app = FakeApp.init(std.testing.allocator);
+    defer app.deinit();
+    app.agent().worker.processing = true;
+    var bridge = PacedTranscriptBridge.init(&app);
+    defer bridge.deinit();
+
+    const text = "reply before the call";
+    try app.agent().worker.pushEvent(std.heap.c_allocator, .{
+        .assistant_presentation = .{ .text = @constCast(text) },
+    });
+    try app.agent().worker.pushEvent(std.heap.c_allocator, .{ .model_call = test_held_call });
+    try Runtime(FakeApp).tick(&app, (&app).agent(), bridge.handlers());
+
+    // An approval opening now would find the text still unshown.
+    try std.testing.expectEqual(@as(usize, 0), bridge.drain_count);
+    try std.testing.expectEqual(@as(usize, 0), bridge.notice_count);
+    try std.testing.expectEqual(@as(usize, 0), bridge.held_call_lines);
     try std.testing.expectEqual(@as(usize, 0), app.shell.lifecycle.notebook.entries.items.len);
+    try std.testing.expect(bridge.pacer.hasPending());
+
+    try bridge.tickPacer(0);
+    try std.testing.expectEqual(@as(usize, 1), bridge.held_call_lines);
+    try std.testing.expectEqual(text.len, bridge.emitted_when_call_written);
+    try std.testing.expectEqual(@as(usize, 0), bridge.notice_count);
+    try std.testing.expect(!bridge.pacer.hasPending());
+}
+
+test "app worker writes a held model call's line before the tool that shows its text" {
+    var app = FakeApp.init(std.testing.allocator);
+    defer app.deinit();
+    app.agent().worker.processing = true;
+    var bridge = PacedTranscriptBridge.init(&app);
+    defer bridge.deinit();
+
+    const text = "reading the file";
+    try app.agent().worker.pushEvent(std.heap.c_allocator, .{
+        .assistant_presentation = .{ .text = @constCast(text) },
+    });
+    try app.agent().worker.pushEvent(std.heap.c_allocator, .{ .model_call = test_held_call });
+    try queueToolStart(&app, 1, "read_a", "read_file");
+    try Runtime(FakeApp).tick(&app, (&app).agent(), bridge.handlers());
+
+    // The tool's drain shows the text, then the line, then the tool.
+    try std.testing.expectEqual(@as(usize, 1), bridge.drain_count);
+    try std.testing.expectEqual(@as(usize, 1), bridge.held_call_lines);
+    try std.testing.expectEqual(text.len, bridge.emitted_when_call_written);
+    try std.testing.expectEqual(@as(usize, 1), bridge.entries_when_call_written);
+    try std.testing.expectEqual(@as(usize, 2), app.shell.lifecycle.notebook.entries.items.len);
+    try std.testing.expect(app.shell.lifecycle.notebook.entries.items[0] == .assistant_turn);
+    try std.testing.expect(app.shell.lifecycle.notebook.entries.items[1] == .raw_bytes);
 }
 
 test "core.app_worker_runtime keeps recovery module statuses out of the transcript" {
@@ -3032,7 +3442,7 @@ test "core.app_worker_runtime keeps recovery module statuses out of the transcri
     } });
     try tickNoop(&app);
 
-    try std.testing.expectEqual(@as(usize, 0), app.shell.lifecycle.notebook.full_detail_records.items.len);
+    try std.testing.expect(std.mem.find(u8, app.transcript.items, "recovery:") == null);
     try std.testing.expect(app.shell.activityProjection() == .none);
 }
 
@@ -3048,7 +3458,7 @@ test "core.app_worker_runtime skips the recovery record for statuses dropped by 
         .attempt = 1,
     } });
     try tickNoop(&app);
-    try std.testing.expectEqual(@as(usize, 0), app.shell.lifecycle.notebook.full_detail_records.items.len);
+    try std.testing.expect(std.mem.find(u8, app.transcript.items, "recovery:") == null);
 }
 
 test "writeRouteRecoveryBody omits absent facts" {
@@ -3470,6 +3880,25 @@ test "core.app_worker_runtime syncState freezes the turn clock while an approval
     app.agent().worker.pending_permission_request = null;
     Runtime(FakeApp).syncState(&app, (&app).agent(), NoopBridge.lifecyclePresenter(&app));
     try std.testing.expect(!app.agent().approval_prompt.isActive());
+    try std.testing.expect(app.agent().stream.active);
+    try std.testing.expectEqual(@as(i64, 0), app.agent().stream.waiting_since_ms);
+}
+
+test "core.app_worker_runtime syncState holds the turn clock while a compaction runs" {
+    var app = FakeApp.init(std.testing.allocator);
+    defer app.deinit();
+
+    app.agent().worker.processing = true;
+    app.agent().stream.active = true;
+    app.agent().stream.turn_started_ms = io_mod.milliTimestamp() - 615_000;
+    const id = app.agent().worker.compaction.begin(.automatic, 1, io_mod.milliTimestamp());
+    app.agent().worker.compaction.running(id, .summary);
+    Runtime(FakeApp).syncState(&app, (&app).agent(), NoopBridge.lifecyclePresenter(&app));
+    try std.testing.expect(app.agent().stream.waiting_since_ms > 0);
+
+    // A failed compaction's feedback stays on screen but holds nothing.
+    app.agent().worker.compaction.settle(id, compaction_activity.failure(error.ConnectionTimedOut, .summary, false), io_mod.milliTimestamp());
+    Runtime(FakeApp).syncState(&app, (&app).agent(), NoopBridge.lifecyclePresenter(&app));
     try std.testing.expect(app.agent().stream.active);
     try std.testing.expectEqual(@as(i64, 0), app.agent().stream.waiting_since_ms);
 }
@@ -5274,4 +5703,668 @@ test "unaccepted worker finish records save failure and stops the detached suffi
     try std.testing.expectEqual(@as(?anyerror, error.InputOutput), app.agent().session_persistence.shutdown_failure);
     try std.testing.expectEqual(@as(usize, 0), app.persisted_finishes.items.len);
     try std.testing.expectEqual(@as(usize, 0), app.agent().worker.events.items.len);
+}
+
+test "a finish the drain's handler cannot save after the pacer's turn failed to save is acknowledged as dropped" {
+    const alloc = std.testing.allocator;
+    var app = FakeApp.init(alloc);
+    defer app.deinit();
+    app.agent().worker.processing = true;
+    app.finish_persistence_error = error.InputOutput;
+    // The pacer still holds an earlier finished turn. When the handler fails,
+    // the drain saves that turn first, and the save fails, so it may not save
+    // the finish the handler was applying.
+    app.pacer.deferred_turn = try types.dupeFinishedPrompt(alloc, .{ .turn = .{ .assistant = .{
+        .user = .{ .text = @constCast("earlier request") },
+        .assistant = @constCast("earlier answer"),
+    } } });
+    const Capture = struct {
+        fn history(_: *anyopaque, _: types.FinishedPrompt) !HistoryDelivery {
+            return error.InjectedDeliveryFailure;
+        }
+    };
+    var handlers = NoopBridge.handlers(&app);
+    handlers.append_history_turn = Capture.history;
+    try app.agent().worker.pushEvent(std.heap.c_allocator, .{ .finish_prompt = .{ .turn = .{ .assistant = .{
+        .user = .{ .text = @constCast("request") },
+        .assistant = @constCast("answer"),
+    } } } });
+    try std.testing.expectError(error.InjectedDeliveryFailure, Runtime(FakeApp).tick(&app, (&app).agent(), handlers));
+    try std.testing.expectEqual(@as(usize, 0), app.persisted_finishes.items.len);
+    try std.testing.expect(app.pacer.deferred_turn == null);
+    // The finish that was not saved is acknowledged as dropped, once.
+    try std.testing.expectEqual(@as(usize, 1), app.agent().worker.dropped_finishes);
+}
+
+test "a segment scan resumed at any split point decides like one full scan" {
+    const finished = struct {
+        fn event(turn_id: u64, outcome: types.TurnPresentationOutcome) WorkerEvent {
+            return .{ .tool_lifecycle = .{ .turn_finished = .{ .turn_id = turn_id, .outcome = outcome } } };
+        }
+        fn phase(turn_id: u64) WorkerEvent {
+            return .{ .turn_phase_update = .{ .turn_id = turn_id, .step_id = 1, .phase = .generating } };
+        }
+    };
+    var prompt_text = "p".*;
+    const alphabet = [_]WorkerEvent{
+        .clear_route_recovery_status,
+        .{ .begin_prompt = .{ .text = &prompt_text } },
+        .{ .begin_presented_prompt = 5 },
+        .{ .begin_resumed_prompt = 6 },
+        finished.phase(5),
+        finished.phase(6),
+        finished.event(5, .interrupted),
+        finished.event(6, .completed),
+    };
+    const max_len = 6;
+    var events: [max_len]WorkerEvent = undefined;
+    var checked: usize = 0;
+    for (1..max_len + 1) |len| {
+        var digits: [max_len]usize = @splat(0);
+        while (true) {
+            for (0..len) |i| events[i] = alphabet[digits[i]];
+            const sequence = events[0..len];
+            const whole = scanSegment(.fresh, sequence);
+            for (0..len + 1) |split| {
+                // A drain puts events back only inside a segment, never before
+                // the event that starts the next one.
+                const resumed = scanSegment(scanSegment(.fresh, sequence[0..split]), sequence[split..]);
+                const segment_end = for (sequence, 0..) |event, i| {
+                    if (i > 0 and (event == .begin_prompt or event == .begin_presented_prompt or event == .begin_resumed_prompt)) break i;
+                } else len;
+                if (split > 0 and split >= segment_end) continue;
+                for ([_]?u64{ null, 5, 6 }) |cancelled| {
+                    try std.testing.expectEqual(segmentInterrupted(whole, cancelled), segmentInterrupted(resumed, cancelled));
+                    checked += 1;
+                }
+            }
+            var carry: usize = 0;
+            while (carry < len) : (carry += 1) {
+                digits[carry] += 1;
+                if (digits[carry] < alphabet.len) break;
+                digits[carry] = 0;
+            }
+            if (carry == len) break;
+        }
+    }
+    try std.testing.expect(checked > 100_000);
+}
+
+const BudgetCapture = struct {
+    texts: std.ArrayList([]const u8) = .empty,
+    prompts: usize = 0,
+
+    fn deinit(self: *BudgetCapture) void {
+        for (self.texts.items) |shown| std.testing.allocator.free(shown);
+        self.texts.deinit(std.testing.allocator);
+    }
+
+    fn text(raw: *anyopaque, value: []const u8) !void {
+        const self: *BudgetCapture = @ptrCast(@alignCast(raw));
+        try self.texts.append(std.testing.allocator, try std.testing.allocator.dupe(u8, value));
+    }
+
+    fn prompt(raw: *anyopaque, _: types.UserTurn) !void {
+        const self: *BudgetCapture = @ptrCast(@alignCast(raw));
+        self.prompts += 1;
+    }
+
+    fn handlers(self: *BudgetCapture, app: *FakeApp) WorkerEventHandlers {
+        var value = NoopBridge.handlers(app);
+        value.ctx = @ptrCast(self);
+        value.append_text = text;
+        value.write_user_prompt = prompt;
+        return value;
+    }
+
+    fn joined(self: *const BudgetCapture) ![]u8 {
+        return std.mem.join(std.testing.allocator, ",", self.texts.items);
+    }
+};
+
+const BudgetEvent = union(enum) {
+    phase: u64,
+    text: []const u8,
+    prompt: []const u8,
+    finished: struct { turn_id: u64, outcome: types.TurnPresentationOutcome },
+};
+
+fn queueBudgetEvents(app: *FakeApp, events: []const BudgetEvent) !void {
+    for (events) |event| switch (event) {
+        .phase => |turn_id| try app.main_agent.worker.pushEvent(std.heap.c_allocator, .{ .turn_phase_update = .{
+            .turn_id = turn_id,
+            .step_id = 1,
+            .phase = .generating,
+        } }),
+        .text => |value| try app.main_agent.worker.pushEvent(std.heap.c_allocator, .{ .assistant_presentation = .{
+            .text = @constCast(value),
+        } }),
+        .prompt => |value| try app.main_agent.worker.pushEvent(std.heap.c_allocator, .{ .begin_prompt = .{ .text = @constCast(value) } }),
+        .finished => |finished| try queueTurnFinished(app, finished.turn_id, finished.outcome),
+    };
+}
+
+/// Drains `events` once unbounded and once one event per tick (budget 0),
+/// returning both texts shown so a test can compare them.
+fn expectBudgetMatchesUnbounded(
+    events: []const BudgetEvent,
+    cancelled_active_turn: ?u64,
+    expected_texts: []const u8,
+) !void {
+    var results: [2][]u8 = undefined;
+    var filled: usize = 0;
+    defer for (results[0..filled]) |value| std.testing.allocator.free(value);
+    for ([_]bool{ false, true }) |bounded| {
+        var app = FakeApp.init(std.testing.allocator);
+        defer app.deinit();
+        if (cancelled_active_turn) |turn_id| {
+            app.main_agent.worker.active_turn_id = turn_id;
+            app.main_agent.worker.worker_cancel_requested.store(true, .seq_cst);
+        }
+        var capture = BudgetCapture{};
+        defer capture.deinit();
+        try queueBudgetEvents(&app, events);
+        if (bounded) {
+            var ticks: usize = 0;
+            while (app.main_agent.worker.events.items.len > 0) : (ticks += 1) {
+                try std.testing.expect(ticks < events.len * 2 + 2);
+                try Runtime(FakeApp).tickWithinBudget(&app, (&app).agent(), capture.handlers(&app), 0);
+            }
+        } else {
+            try Runtime(FakeApp).tick(&app, (&app).agent(), capture.handlers(&app));
+        }
+        results[filled] = try capture.joined();
+        filled += 1;
+    }
+    try std.testing.expectEqualStrings(expected_texts, results[0]);
+    try std.testing.expectEqualStrings(results[0], results[1]);
+}
+
+test "a time-bounded drain applies one event per tick at budget 0 in order" {
+    var app = FakeApp.init(std.testing.allocator);
+    defer app.deinit();
+    var capture = BudgetCapture{};
+    defer capture.deinit();
+    try queueBudgetEvents(&app, &.{ .{ .text = "a" }, .{ .text = "b" }, .{ .text = "c" } });
+
+    try Runtime(FakeApp).tickWithinBudget(&app, (&app).agent(), capture.handlers(&app), 0);
+    try std.testing.expectEqual(@as(usize, 1), capture.texts.items.len);
+    try std.testing.expectEqual(@as(usize, 2), app.main_agent.worker.events.items.len);
+    try std.testing.expect(app.main_agent.worker.takeDrainContinuationDue());
+    try std.testing.expect(!app.main_agent.worker.takeDrainContinuationDue());
+
+    try Runtime(FakeApp).tickWithinBudget(&app, (&app).agent(), capture.handlers(&app), 0);
+    try Runtime(FakeApp).tickWithinBudget(&app, (&app).agent(), capture.handlers(&app), 0);
+    try std.testing.expectEqual(@as(usize, 0), app.main_agent.worker.events.items.len);
+    try std.testing.expect(app.main_agent.worker.takeDrainContinuationDue());
+    try Runtime(FakeApp).tickWithinBudget(&app, (&app).agent(), capture.handlers(&app), 0);
+    try std.testing.expect(!app.main_agent.worker.takeDrainContinuationDue());
+    const shown = try capture.joined();
+    defer std.testing.allocator.free(shown);
+    try std.testing.expectEqualStrings("a,b,c", shown);
+}
+
+test "a time-bounded drain with a large budget applies the whole batch" {
+    var app = FakeApp.init(std.testing.allocator);
+    defer app.deinit();
+    var capture = BudgetCapture{};
+    defer capture.deinit();
+    try queueBudgetEvents(&app, &.{ .{ .text = "a" }, .{ .text = "b" }, .{ .text = "c" } });
+    try Runtime(FakeApp).tickWithinBudget(&app, (&app).agent(), capture.handlers(&app), std.time.ns_per_s * 60);
+    try std.testing.expectEqual(@as(usize, 3), capture.texts.items.len);
+    try std.testing.expect(!app.main_agent.worker.takeDrainContinuationDue());
+}
+
+test "a time-bounded split keeps an earlier turn's tail when a later turn is cancelled" {
+    const two_turns = [_]BudgetEvent{
+        .{ .phase = 5 },
+        .{ .text = "a" },
+        .{ .text = "b" },
+        .{ .prompt = "next" },
+        .{ .phase = 6 },
+        .{ .text = "c" },
+    };
+    try expectBudgetMatchesUnbounded(&two_turns, null, "a,b,c");
+    // The cancel is in the first take, so that batch is never split.
+    try expectBudgetMatchesUnbounded(&two_turns, 6, "a,b");
+}
+
+test "a time-bounded split resumes the earlier turn's scan after a cancel between slices" {
+    var app = FakeApp.init(std.testing.allocator);
+    defer app.deinit();
+    var capture = BudgetCapture{};
+    defer capture.deinit();
+    try queueBudgetEvents(&app, &.{
+        .{ .phase = 5 },
+        .{ .text = "a" },
+        .{ .text = "b" },
+        .{ .prompt = "next" },
+        .{ .phase = 6 },
+        .{ .text = "c" },
+    });
+    try Runtime(FakeApp).tickWithinBudget(&app, (&app).agent(), capture.handlers(&app), 0);
+    // Turn 6 is cancelled after the first slice: turn 5's tail still shows,
+    // and turn 6's text is dropped as if it had arrived after the cancel.
+    app.main_agent.worker.active_turn_id = 6;
+    app.main_agent.worker.worker_cancel_requested.store(true, .seq_cst);
+    while (app.main_agent.worker.events.items.len > 0) {
+        try Runtime(FakeApp).tickWithinBudget(&app, (&app).agent(), capture.handlers(&app), 0);
+    }
+    const shown = try capture.joined();
+    defer std.testing.allocator.free(shown);
+    try std.testing.expectEqualStrings("a,b", shown);
+}
+
+test "a time-bounded split keeps a settled interrupted finish for the rest of its segment" {
+    try expectBudgetMatchesUnbounded(&.{
+        .{ .phase = 5 },
+        .{ .finished = .{ .turn_id = 5, .outcome = .interrupted } },
+        .{ .text = "late" },
+        .{ .prompt = "next" },
+        .{ .text = "shown" },
+    }, null, "shown");
+}
+
+test "a time-bounded split right before a prompt starts that segment's scan fresh" {
+    var app = FakeApp.init(std.testing.allocator);
+    defer app.deinit();
+    var capture = BudgetCapture{};
+    defer capture.deinit();
+    try queueBudgetEvents(&app, &.{
+        .{ .phase = 5 },
+        .{ .text = "a" },
+        .{ .prompt = "next" },
+        .{ .text = "b" },
+    });
+    try Runtime(FakeApp).tickWithinBudget(&app, (&app).agent(), capture.handlers(&app), 0);
+    try Runtime(FakeApp).tickWithinBudget(&app, (&app).agent(), capture.handlers(&app), 0);
+    try std.testing.expect(app.main_agent.worker.events.items[0] == .begin_prompt);
+    try std.testing.expectEqual(@as(?HeadSegmentScan, null), app.main_agent.worker.head_segment);
+    // A cancel now applies to the new prompt's segment, which names no turn.
+    app.main_agent.worker.active_turn_id = 6;
+    app.main_agent.worker.worker_cancel_requested.store(true, .seq_cst);
+    while (app.main_agent.worker.events.items.len > 0) {
+        try Runtime(FakeApp).tickWithinBudget(&app, (&app).agent(), capture.handlers(&app), 0);
+    }
+    const shown = try capture.joined();
+    defer std.testing.allocator.free(shown);
+    try std.testing.expectEqualStrings("a", shown);
+    try std.testing.expectEqual(@as(usize, 1), capture.prompts);
+}
+
+test "a time-bounded drain applies a cancelled take whole" {
+    // This take's cancel snapshot is the only one that drops turn 5, so its
+    // events must not be put back for a later take that no longer cancels.
+    var app = FakeApp.init(std.testing.allocator);
+    defer app.deinit();
+    app.main_agent.worker.active_turn_id = 5;
+    app.main_agent.worker.worker_cancel_requested.store(true, .seq_cst);
+    app.main_agent.worker.reset_cancel_after_take_events = true;
+    var capture = BudgetCapture{};
+    defer capture.deinit();
+    try queueBudgetEvents(&app, &.{ .{ .phase = 5 }, .{ .text = "a" }, .{ .text = "b" } });
+    try Runtime(FakeApp).tickWithinBudget(&app, (&app).agent(), capture.handlers(&app), 0);
+    try std.testing.expectEqual(@as(usize, 0), app.main_agent.worker.events.items.len);
+    try std.testing.expectEqual(@as(usize, 0), capture.texts.items.len);
+    try std.testing.expect(!app.main_agent.worker.takeDrainContinuationDue());
+}
+
+const GateApp = struct {
+    alloc: std.mem.Allocator,
+    pacer: assistant_pacer.AssistantPacer = .{},
+    main_agent: struct {
+        total_input_tokens: u64 = 0,
+        total_output_tokens: u64 = 0,
+        session: @import("../session/session.zig").SessionRuntime = .{ .max_history_turns = 8 },
+        session_persistence: app_session_runtime.Persistence = .{},
+        worker: worker_runtime.WorkerRuntime = .{},
+    } = .{},
+
+    pub fn agent(self: anytype) @TypeOf(&self.main_agent) {
+        return &self.main_agent;
+    }
+
+    fn pushFinish(self: *GateApp, answer: []const u8) !void {
+        const turn: types.HistoryTurn = .{ .assistant = .{ .user = .{ .text = @constCast("prompt") }, .assistant = @constCast(answer) } };
+        try self.agent().worker.pushEvent(std.heap.c_allocator, .{ .finish_prompt = .{ .turn = turn } });
+    }
+
+    /// What the loop does with the events it took: applies them, here by dropping them.
+    fn takeAndDrop(self: *GateApp) void {
+        var events = self.agent().worker.takeEvents();
+        for (events.items) |event| worker_runtime.freeWorkerEvent(std.heap.c_allocator, event);
+        events.deinit(std.heap.c_allocator);
+    }
+};
+
+test "a finished turn the pacer replaces or clears is acknowledged as dropped, and the one it holds is not" {
+    const alloc = std.testing.allocator;
+    var app: GateApp = .{ .alloc = alloc };
+    defer app.agent().session_persistence.deinit(alloc);
+    defer app.agent().session.deinit(alloc);
+    defer app.agent().worker.deinit(std.heap.c_allocator);
+    defer app.pacer.deinit(alloc);
+    const agent = app.agent();
+    agent.worker.enableCommitGate();
+
+    try app.pushFinish("first");
+    try app.pushFinish("second");
+    app.takeAndDrop();
+    try std.testing.expectEqual(@as(u32, 2), agent.worker.unacknowledged_finishes);
+
+    try app.pacer.enqueue(alloc, "text still showing");
+    const first: types.FinishedPrompt = .{ .turn = .{ .assistant = .{ .user = .{ .text = @constCast("prompt") }, .assistant = @constCast("first") } } };
+    const second: types.FinishedPrompt = .{ .turn = .{ .assistant = .{ .user = .{ .text = @constCast("prompt") }, .assistant = @constCast("second") } } };
+    try std.testing.expect(try Runtime(GateApp).deferFinish(&app, agent, first));
+    // The pacer holds the first turn, which a commit will still acknowledge.
+    try std.testing.expectEqual(@as(u32, 2), agent.worker.unacknowledged_finishes);
+    // A second turn replaces it unsaved: that one is acknowledged as dropped.
+    try std.testing.expect(try Runtime(GateApp).deferFinish(&app, agent, second));
+    try std.testing.expectEqual(@as(u32, 1), agent.worker.unacknowledged_finishes);
+    // Clearing the pacer drops the second.
+    Runtime(GateApp).clearPacer(&app, agent, "cancel");
+    try std.testing.expect(app.pacer.deferred_turn == null);
+    try std.testing.expectEqual(@as(u32, 0), agent.worker.unacknowledged_finishes);
+    // Clearing a pacer that holds no turn acknowledges nothing.
+    try app.pushFinish("third");
+    app.takeAndDrop();
+    Runtime(GateApp).clearPacer(&app, agent, "cancel");
+    try std.testing.expectEqual(@as(u32, 1), agent.worker.unacknowledged_finishes);
+}
+
+test "a finished turn the loop does not save after an earlier save failure is acknowledged as dropped" {
+    const alloc = std.testing.allocator;
+    var app: GateApp = .{ .alloc = alloc };
+    defer app.agent().session_persistence.deinit(alloc);
+    defer app.agent().session.deinit(alloc);
+    defer app.agent().worker.deinit(std.heap.c_allocator);
+    defer app.pacer.deinit(alloc);
+    const agent = app.agent();
+    agent.worker.enableCommitGate();
+
+    try app.pushFinish("one");
+    try app.pushFinish("two");
+    try std.testing.expectEqual(@as(u32, 2), agent.worker.unacknowledged_finishes);
+    const taken = agent.worker.takeEventBatch();
+    var batch = DetachedWorkerEventBatch.init(std.heap.c_allocator, taken.events);
+    defer batch.deinit();
+    // The drain failed after a save failure, so it may not save what is left.
+    Runtime(GateApp).preserveFinishedAfterDrainFailure(&app, agent, &batch, false);
+    try std.testing.expectEqual(@as(u32, 0), agent.worker.unacknowledged_finishes);
+}
+
+/// An app whose pacer shows text into `emitted`, and whose finish callback
+/// acknowledges the commit the way `appendFinishedPrompt` does.
+const FlushApp = struct {
+    alloc: std.mem.Allocator,
+    pacer: assistant_pacer.AssistantPacer = .{},
+    main_agent: struct {
+        total_input_tokens: u64 = 0,
+        total_output_tokens: u64 = 0,
+        session: @import("../session/session.zig").SessionRuntime = .{ .max_history_turns = 8 },
+        session_persistence: app_session_runtime.Persistence = .{},
+        worker: worker_runtime.WorkerRuntime = .{},
+    } = .{},
+    emitted: std.ArrayList(u8) = .empty,
+    emit_attempts: usize = 0,
+    fail_emit: bool = false,
+    /// The commit acknowledges, as `appendFinishedPrompt` does in a `defer`,
+    /// and then fails.
+    fail_commit: bool = false,
+    commits: usize = 0,
+
+    const finished_turn: types.HistoryTurn = .{ .assistant = .{ .user = .{ .text = @constCast("prompt") }, .assistant = @constCast("answer") } };
+
+    pub fn agent(self: anytype) @TypeOf(&self.main_agent) {
+        return &self.main_agent;
+    }
+
+    fn deinit(self: *FlushApp) void {
+        self.agent().session_persistence.deinit(self.alloc);
+        self.agent().session.deinit(self.alloc);
+        self.agent().worker.deinit(std.heap.c_allocator);
+        self.pacer.deinit(self.alloc);
+        self.emitted.deinit(self.alloc);
+    }
+
+    fn pacerCallbacks(self: *FlushApp) assistant_pacer.TickCallbacks {
+        return .{ .emit_ctx = self, .emit_fn = FlushApp.emit, .finish_ctx = self, .finish_fn = FlushApp.finish };
+    }
+
+    fn emit(ctx: *anyopaque, text: []const u8) anyerror!void {
+        const self: *FlushApp = @ptrCast(@alignCast(ctx));
+        self.emit_attempts += 1;
+        if (self.fail_emit) return error.BrokenPipe;
+        try self.emitted.appendSlice(self.alloc, text);
+    }
+
+    fn finish(ctx: *anyopaque, _: types.FinishedPrompt) anyerror!assistant_pacer.FinishResult {
+        const self: *FlushApp = @ptrCast(@alignCast(ctx));
+        self.commits += 1;
+        self.agent().worker.acknowledgeFinishCommitted();
+        if (self.fail_commit) return error.OutOfMemory;
+        return .committed;
+    }
+
+    /// The request of a report or of typed text, as the worker queues it.
+    fn queuedRequest(gpa: std.mem.Allocator, prompt: []const u8) !worker_runtime.QueuedPrompt {
+        return .{
+            .prompt = try gpa.dupe(u8, prompt),
+            .images = &.{},
+            .model = try gpa.dupe(u8, "test-model"),
+            .api_key = try gpa.dupe(u8, "test-key"),
+            .permission_mode = .auto,
+            .history = try gpa.alloc(types.HistoryTurn, 0),
+            .grants = try gpa.alloc(types.PermissionGrant, 0),
+        };
+    }
+
+    /// The pacer is still showing `shown` of a turn, and keeps that turn's
+    /// finish behind it, as an open prompt makes it.
+    fn pacerHoldsFinishedTurn(self: *FlushApp, shown: []const u8) !void {
+        try self.pacer.enqueue(self.alloc, shown);
+        try std.testing.expect(try Runtime(FlushApp).deferFinish(self, self.agent(), .{ .turn = finished_turn }));
+    }
+
+    /// The worker finished a turn that a report missed, and the loop took the
+    /// finish into its pacer, which a prompt keeps from showing it.
+    fn finishedTurnWithMailBehindOpenPrompt(self: *FlushApp, shown: []const u8) !void {
+        const gpa = std.heap.c_allocator;
+        const worker = &self.agent().worker;
+        worker.enableCommitGate();
+        worker.worker_processing = true;
+        worker.active_turn_id = 9;
+        worker.direct_steering_closed = true;
+        try worker.pushEvent(gpa, .{ .finish_prompt = .{ .turn = finished_turn } });
+        try worker.postMail(gpa, try queuedRequest(gpa, "a report"));
+        try std.testing.expect(worker.queued_prompts.items[0].delivery.isContinuation());
+        worker.finishProcessing();
+        self.dropWorkerEvents();
+        try self.pacerHoldsFinishedTurn(shown);
+    }
+
+    /// The loop took the worker's events, as its pass does before it hands a
+    /// finish to the pacer.
+    fn dropWorkerEvents(self: *FlushApp) void {
+        const gpa = std.heap.c_allocator;
+        var events = self.agent().worker.takeEvents();
+        for (events.items) |event| worker_runtime.freeWorkerEvent(gpa, event);
+        events.deinit(gpa);
+    }
+
+    /// The next turn's finish: the pacer's old text is gone, the worker has a
+    /// second finish, and the loop takes it into the pacer behind the prompt.
+    fn secondFinishBehindPacer(self: *FlushApp, shown: []const u8) !void {
+        self.pacer.clear(self.alloc);
+        try self.agent().worker.pushEvent(std.heap.c_allocator, .{ .finish_prompt = .{ .turn = finished_turn } });
+        self.dropWorkerEvents();
+        try self.pacerHoldsFinishedTurn(shown);
+    }
+};
+
+test "the loop flushes the pacer behind a prompt for held mail, and the commit releases the gate" {
+    var app: FlushApp = .{ .alloc = std.testing.allocator };
+    defer app.deinit();
+    const agent = app.agent();
+    try app.finishedTurnWithMailBehindOpenPrompt("still showing");
+    try std.testing.expect(agent.worker.commitGateWaitsForCommit());
+    try std.testing.expect((try agent.worker.tryTakeNextWork(std.heap.c_allocator)) == null);
+
+    Runtime(FlushApp).flushPacerForHeldMail(&app, agent, 0);
+
+    // The turn is shown and committed, once, and the mail may start.
+    try std.testing.expectEqualStrings("still showing", app.emitted.items);
+    try std.testing.expectEqual(@as(usize, 1), app.commits);
+    try std.testing.expect(app.pacer.deferred_turn == null);
+    try std.testing.expectEqual(@as(u32, 0), agent.worker.unacknowledged_finishes);
+    try std.testing.expect(!agent.worker.commitGateWaitsForCommit());
+    const work = (try agent.worker.tryTakeNextWork(std.heap.c_allocator)) orelse return error.TestExpectedReportToStart;
+    defer worker_runtime.freeWorkItem(std.heap.c_allocator, work);
+    try std.testing.expectEqualStrings("a report", work.prompt.prompt);
+
+    // A later pass finds nothing to flush.
+    Runtime(FlushApp).flushPacerForHeldMail(&app, agent, 0);
+    try std.testing.expectEqual(@as(usize, 1), app.commits);
+}
+
+test "the loop leaves a pacer alone unless it holds a finished turn the worker holds mail for" {
+    const gpa = std.heap.c_allocator;
+
+    // Text still being shown, and no finished turn: nothing waits for a commit.
+    {
+        var app: FlushApp = .{ .alloc = std.testing.allocator };
+        defer app.deinit();
+        const agent = app.agent();
+        try app.finishedTurnWithMailBehindOpenPrompt("first turn");
+        app.pacer.clear(app.alloc);
+        try app.pacer.enqueue(app.alloc, "text of a running turn");
+        Runtime(FlushApp).flushPacerForHeldMail(&app, agent, 0);
+        try std.testing.expectEqual(@as(usize, 0), app.emit_attempts);
+        try std.testing.expect(app.pacer.hasPending());
+    }
+
+    // A finished turn in the pacer, and a worker that holds no mail for it: a
+    // host that did not opt in, or no mail at all.
+    {
+        var app: FlushApp = .{ .alloc = std.testing.allocator };
+        defer app.deinit();
+        const agent = app.agent();
+        try app.pacerHoldsFinishedTurn("still showing");
+        Runtime(FlushApp).flushPacerForHeldMail(&app, agent, 0);
+        try std.testing.expectEqual(@as(usize, 0), app.emit_attempts);
+        try std.testing.expect(app.pacer.deferred_turn != null);
+
+        agent.worker.enableCommitGate();
+        try agent.worker.pushEvent(gpa, .{ .finish_prompt = .{ .turn = FlushApp.finished_turn } });
+        Runtime(FlushApp).flushPacerForHeldMail(&app, agent, 0);
+        try std.testing.expectEqual(@as(usize, 0), app.emit_attempts);
+    }
+
+    // A prompt the user typed heads the queue: the gate holds nothing.
+    {
+        var app: FlushApp = .{ .alloc = std.testing.allocator };
+        defer app.deinit();
+        const agent = app.agent();
+        agent.worker.enableCommitGate();
+        try agent.worker.pushEvent(gpa, .{ .finish_prompt = .{ .turn = FlushApp.finished_turn } });
+        try agent.worker.enqueuePrompt(gpa, try FlushApp.queuedRequest(gpa, "typed"));
+        try app.pacerHoldsFinishedTurn("still showing");
+        Runtime(FlushApp).flushPacerForHeldMail(&app, agent, 0);
+        try std.testing.expectEqual(@as(usize, 0), app.emit_attempts);
+        try std.testing.expect(app.pacer.deferred_turn != null);
+    }
+}
+
+test "a flush whose commit fails is not held against the next hold" {
+    var app: FlushApp = .{ .alloc = std.testing.allocator, .fail_commit = true };
+    defer app.deinit();
+    const agent = app.agent();
+    try app.finishedTurnWithMailBehindOpenPrompt("still showing");
+
+    // The commit acknowledges and fails inside the flush: the hold is over.
+    Runtime(FlushApp).flushPacerForHeldMail(&app, agent, 0);
+    try std.testing.expectEqual(@as(usize, 1), app.commits);
+    try std.testing.expectEqual(@as(u32, 0), agent.worker.unacknowledged_finishes);
+    try std.testing.expect(!agent.worker.commit_gate_flush_failed);
+
+    // The next finish holds the same mail again, and the loop flushes for it.
+    app.fail_commit = false;
+    try app.secondFinishBehindPacer("second");
+    try std.testing.expect(agent.worker.commitGateWaitsForCommit());
+    Runtime(FlushApp).flushPacerForHeldMail(&app, agent, 0);
+    try std.testing.expectEqual(@as(usize, 2), app.commits);
+    try std.testing.expectEqual(@as(u32, 0), agent.worker.unacknowledged_finishes);
+}
+
+test "the loop flushes the pacer behind a prompt for text the user typed that missed the turn" {
+    var app: FlushApp = .{ .alloc = std.testing.allocator };
+    defer app.deinit();
+    const agent = app.agent();
+    const gpa = std.heap.c_allocator;
+    const worker = &agent.worker;
+    worker.enableCommitGate();
+    worker.worker_processing = true;
+    worker.active_turn_id = 9;
+    // Typed while the turn ran, and not taken in before it ended.
+    try worker.admitInteractivePrompt(gpa, try FlushApp.queuedRequest(gpa, "typed while the turn ran"));
+    try worker.pushEvent(gpa, .{ .finish_prompt = .{ .turn = FlushApp.finished_turn } });
+    worker.finishProcessing();
+    try std.testing.expect(worker.queued_prompts.items[0].delivery.isContinuation());
+    var events = worker.takeEvents();
+    for (events.items) |event| worker_runtime.freeWorkerEvent(gpa, event);
+    events.deinit(gpa);
+    try app.pacerHoldsFinishedTurn("still showing");
+    try std.testing.expect(worker.commitGateWaitsForCommit());
+
+    Runtime(FlushApp).flushPacerForHeldMail(&app, agent, 0);
+
+    // The finished turn is shown and committed, and the typed text may start.
+    try std.testing.expectEqualStrings("still showing", app.emitted.items);
+    try std.testing.expectEqual(@as(usize, 1), app.commits);
+    try std.testing.expectEqual(@as(u32, 0), worker.unacknowledged_finishes);
+    const work = (try worker.tryTakeNextWork(gpa)) orelse return error.TestExpectedTextToStart;
+    defer worker_runtime.freeWorkItem(gpa, work);
+    try std.testing.expectEqualStrings("typed while the turn ran", work.prompt.prompt);
+}
+
+test "a flush that fails is logged once, keeps the finished turn, and is not tried again until the hold is over" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(root);
+    const trace_path = try std.Io.Dir.path.join(alloc, &.{ root, "flush-trace.log" });
+    defer alloc.free(trace_path);
+    debug_trace.resetForTest();
+    defer debug_trace.resetForTest();
+    try debug_trace.configureForTestWithScopes(alloc, trace_path, "worker");
+
+    var app: FlushApp = .{ .alloc = alloc, .fail_emit = true };
+    defer app.deinit();
+    const agent = app.agent();
+    try app.finishedTurnWithMailBehindOpenPrompt("still showing");
+
+    for (0..5) |_| Runtime(FlushApp).flushPacerForHeldMail(&app, agent, 0);
+    try std.testing.expectEqual(@as(usize, 1), app.emit_attempts);
+    try std.testing.expectEqual(@as(usize, 0), app.commits);
+    // The turn stays in the pacer for the loop's own pass, and the gate keeps holding.
+    try std.testing.expect(app.pacer.deferred_turn != null);
+    try std.testing.expectEqual(@as(u32, 1), agent.worker.unacknowledged_finishes);
+    try std.testing.expect(agent.worker.commit_gate_flush_failed);
+
+    // The hold ends, and a later hold is tried again.
+    agent.worker.acknowledgeFinishDropped("cancel");
+    try std.testing.expect(!agent.worker.commit_gate_flush_failed);
+    app.fail_emit = false;
+    try app.secondFinishBehindPacer("second");
+    Runtime(FlushApp).flushPacerForHeldMail(&app, agent, 0);
+    try std.testing.expectEqual(@as(usize, 1), app.commits);
+
+    debug_trace.shutdown();
+    var file = try std.Io.Dir.openFileAbsolute(io_mod.getIo(), trace_path, .{});
+    defer file.close(io_mod.getIo());
+    const trace = try io_mod.readFileToEnd(alloc, &file, 1024 * 1024);
+    defer alloc.free(trace);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, trace, "commit gate flush failed err=BrokenPipe"));
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, trace, "commit gate flushes the pacer behind a prompt for held mail"));
 }

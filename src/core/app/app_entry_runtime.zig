@@ -29,6 +29,7 @@ const mode_registry = @import("../modes/mode_registry.zig");
 const mcp_contract = @import("../mcp/mcp_contract.zig");
 const mcp_health = @import("../mcp/health.zig");
 const mcp_host = @import("../mcp_host/host.zig");
+const mcp_verbs = @import("../mcp_host/verbs.zig");
 const tool_set_contract = @import("../tooling/tool_set.zig");
 const update_target = @import("../upgrade/update_target.zig");
 const test_builtin_gateway = if (builtin.is_test)
@@ -165,10 +166,7 @@ fn runWithDeps(comptime App: type, alloc: Allocator, args: []const [:0]const u8,
 pub fn runBeforeInteractive(alloc: Allocator, args: []const [:0]const u8, cfg: Config) !BeforeInteractiveResult {
     const run_result = cli_surface.runIfRequested(alloc, args, cliSurfaceConfig(cfg)) catch |err| switch (err) {
         error.UnknownCliCommand => return .{ .exit = output_contracts.usage_exit_code },
-        else => {
-            tryWriteErrorMessage(.{}, err);
-            return .{ .exit = 1 };
-        },
+        else => return commandFailure(.{}, err),
     };
 
     return beforeInteractiveResultFromRunResult(alloc, run_result, benchEnabled());
@@ -177,10 +175,7 @@ pub fn runBeforeInteractive(alloc: Allocator, args: []const [:0]const u8, cfg: C
 fn runBeforeInteractiveWithDeps(alloc: Allocator, args: []const [:0]const u8, cfg: Config, deps: RunDeps) !BeforeInteractiveResult {
     const run_result = deps.run_if_requested(deps.cli_ctx, alloc, args, cliSurfaceConfig(cfg)) catch |err| switch (err) {
         error.UnknownCliCommand => return .{ .exit = output_contracts.usage_exit_code },
-        else => {
-            tryWriteErrorMessage(deps, err);
-            return .{ .exit = 1 };
-        },
+        else => return commandFailure(deps, err),
     };
 
     return beforeInteractiveResultFromRunResult(alloc, run_result, deps.getenv(deps.env_ctx, "FX_BENCH") != null);
@@ -245,8 +240,13 @@ fn initFailure(deps: RunDeps, launch: *cli_surface.InteractiveLaunch, alloc: All
             writeStderr(deps, "fx needs at least 5 terminal rows.\n");
             return .returned;
         },
-        error.RecordingStartFailed => {
-            writeStderr(deps, "fx: unable to start terminal recording.\n");
+        error.RecordingStartFailed,
+        error.RecordingDiskFull,
+        error.RecordingFileTooBig,
+        error.RecordingAccessDenied,
+        error.RecordingReadOnly,
+        => {
+            writeStderr(deps, recordingStartMessage(err));
             return .{ .exit = 1 };
         },
         error.NoRememberedSession => {
@@ -360,8 +360,19 @@ fn runInteractiveWithDeps(comptime App: type, comptime cooperative: bool, app: *
     }
 
     app.run() catch |err| {
+        // The terminal hung up: its input closed, or a frame write failed
+        // because it hung up (`error.TerminalHungUp` from the frame sink).
+        const hung_up = err == error.TerminalInputClosed or err == error.TerminalHungUp;
+        if (err == error.TerminalHungUp) {
+            debug_trace.logf("core", "interactive run ended: the terminal hung up during a frame write", .{});
+        }
+        // Before the terminal is released, which puts back SIGHUP's default
+        // action: a closed window with a turn running ends fx here.
+        if (comptime !cooperative and @hasDecl(App, "closeOnHangup")) {
+            if (hung_up) app.closeOnHangup();
+        }
         app.releaseTerminal();
-        if (err == error.TerminalInputClosed) {
+        if (hung_up) {
             app_needs_deinit = false;
             if (comptime cooperative) {
                 app.deinit();
@@ -384,12 +395,6 @@ fn runInteractiveWithDeps(comptime App: type, comptime cooperative: bool, app: *
         app.takeUpgradeRelaunchRequest()
     else
         null;
-    const resume_handoff_columns: u16 = if (comptime cooperative)
-        0
-    else if (comptime @hasDecl(App, "resumeHandoffColumns"))
-        app.resumeHandoffColumns()
-    else
-        0;
     var graceful_exit_sigint_guard = GracefulExitSigintGuard.install(
         !cooperative and relaunch_request == null,
     );
@@ -444,11 +449,7 @@ fn runInteractiveWithDeps(comptime App: type, comptime cooperative: bool, app: *
         defer handoff.deinit(alloc);
         var message_buffer: [512]u8 = undefined;
         const message = (if (comptime @hasDecl(App, "formatResumeHandoff"))
-            App.formatResumeHandoff(
-                &message_buffer,
-                handoff.session_id,
-                resume_handoff_columns,
-            )
+            App.formatResumeHandoff(&message_buffer, handoff.session_id)
         else
             formatResumeHandoff(&message_buffer, handoff.session_id)) catch return .returned;
         deps.write_stdout(deps.stdout_ctx, message) catch {};
@@ -477,11 +478,13 @@ fn writeUpgradeRelaunchFailure(
     err: std.process.ReplaceError,
     session_id: []const u8,
 ) void {
+    debug_trace.logf("core", "upgrade relaunch failed err={s}", .{@errorName(err)});
     var buffer: [768]u8 = undefined;
+    var words: [128]u8 = undefined;
     const message = std.mem.print(
         &buffer,
-        "fx: upgrade installed, but relaunch failed: {s}\nContinue session with: fx --resume {s}\n",
-        .{ @errorName(err), session_id },
+        "fx: upgrade installed, but relaunch failed: {s}\nResume this session with:\nfx --resume {s}\n",
+        .{ types.plainErrorText(@errorName(err), &words), session_id },
     ) catch "fx: upgrade installed, but relaunch failed; run `fx doctor`.\n";
     writeStderr(deps, message);
 }
@@ -551,11 +554,22 @@ fn writeRealStdout(_: ?*anyopaque, text: []const u8) !void {
 }
 
 fn formatResumeHandoff(buffer: []u8, session_id: []const u8) ![]const u8 {
-    return std.mem.print(buffer, "Continue session with: fx --resume {s}\n", .{session_id});
+    return std.mem.print(buffer, "Resume this session with:\nfx --resume {s}\n", .{session_id});
 }
 
+/// An error that ended the interactive session, in plain words
+/// (`types.plainErrorText`) unless fx has a message of its own for it.
 fn formatUnexpectedError(buffer: []u8, err: anyerror) ![]const u8 {
-    return std.mem.print(buffer, "fx: {s}\n", .{config_runtime.modelNotSelectedMessage(err) orelse @errorName(err)});
+    const alloc = std.heap.c_allocator;
+    if (config_runtime.configuredProviderMessage(alloc, err) catch null) |message| {
+        defer alloc.free(message);
+        return std.mem.print(buffer, "fx: {s}\n", .{message});
+    }
+    var words: [128]u8 = undefined;
+    const message = config_runtime.modelNotSelectedMessage(err) orelse
+        mcp_verbs.profileConfigNotice(err) orelse
+        types.plainErrorText(@errorName(err), &words);
+    return std.mem.print(buffer, "fx: {s}\n", .{message});
 }
 
 /// A v2 session that cannot be written at startup, in one sentence; null
@@ -570,8 +584,22 @@ fn v2StorageFaultMessage(err: anyerror) ?[]const u8 {
     };
 }
 
+/// Why a terminal recording asked for with FX_DEBUG_RECORD could not start,
+/// by the failure `record_tape.startFailure` named.
+fn recordingStartMessage(err: anyerror) []const u8 {
+    return switch (err) {
+        error.RecordingDiskFull => "fx: unable to start terminal recording: the disk is full. Free some space, or unset FX_DEBUG_RECORD.\n",
+        error.RecordingFileTooBig => "fx: unable to start terminal recording: a file-size limit was reached.\n",
+        error.RecordingAccessDenied => "fx: unable to start terminal recording: permission denied.\n",
+        error.RecordingReadOnly => "fx: unable to start terminal recording: the disk is read-only.\n",
+        else => "fx: unable to start terminal recording.\n",
+    };
+}
+
+/// The raw error name goes only to the trace.
 fn reportUnexpectedInteractiveError(deps: RunDeps, err: anyerror) void {
-    var buffer: [256]u8 = undefined;
+    debug_trace.logf("core", "interactive error err={s}", .{@errorName(err)});
+    var buffer: [1024]u8 = undefined;
     const message = deps.format_unexpected_error(&buffer, err) catch return;
     deps.write_stderr(deps.stderr_ctx, message) catch {};
 }
@@ -580,9 +608,36 @@ fn writeStderr(deps: RunDeps, text: []const u8) void {
     deps.write_stderr(deps.stderr_ctx, text) catch {};
 }
 
+/// The status a shell reports for a process SIGPIPE ended: 128 + 13.
+const output_reader_gone_exit_code: u8 = 141;
+
+/// How a command that ended on `err` exits. One whose output reader went
+/// away, as `head` does, ends quietly with SIGPIPE's status, as the commands
+/// that finish before fx's I/O starts do when SIGPIPE ends them.
+fn commandFailure(deps: RunDeps, err: anyerror) BeforeInteractiveResult {
+    if (err == error.OutputReaderGone) {
+        debug_trace.logf("core", "command ended after its output reader went away", .{});
+        return .{ .exit = output_reader_gone_exit_code };
+    }
+    tryWriteErrorMessage(deps, err);
+    return .{ .exit = 1 };
+}
+
+/// Reports an error that ended a command, such as `fx ask`, in plain words
+/// (`types.plainErrorText`). The raw name goes only to the trace.
 fn tryWriteErrorMessage(deps: RunDeps, err: anyerror) void {
+    debug_trace.logf("core", "command error err={s}", .{@errorName(err)});
+    const alloc = std.heap.c_allocator;
+    if (config_runtime.configuredProviderMessage(alloc, err) catch null) |message| {
+        defer alloc.free(message);
+        writeStderr(deps, "fx: ");
+        writeStderr(deps, message);
+        writeStderr(deps, "\n");
+        return;
+    }
+    var words: [128]u8 = undefined;
     writeStderr(deps, "fx: ");
-    writeStderr(deps, config_runtime.modelNotSelectedMessage(err) orelse @errorName(err));
+    writeStderr(deps, config_runtime.modelNotSelectedMessage(err) orelse types.plainErrorText(@errorName(err), &words));
     writeStderr(deps, "\n");
 }
 
@@ -688,6 +743,8 @@ fn expectEvents(expected: []const []const u8) !void {
 
 const TestCapture = struct {
     run_result: cli_surface.RunResult,
+    /// The error the command run returns in place of `run_result`.
+    cli_error: ?anyerror = null,
     cli_calls: usize = 0,
     seen_config: ?cli_surface.Config = null,
     stderr: std.Io.Writer.Allocating,
@@ -762,6 +819,7 @@ fn runIfRequestedForTest(ctx: ?*anyopaque, _: Allocator, _: []const [:0]const u8
     const capture: *TestCapture = @ptrCast(@alignCast(ctx.?));
     capture.cli_calls += 1;
     capture.seen_config = cfg;
+    if (capture.cli_error) |err| return err;
     return capture.run_result;
 }
 
@@ -869,6 +927,10 @@ const TestApp = struct {
             request.previous_revision_len = @intCast(revision.len);
         }
         return request;
+    }
+
+    pub fn closeOnHangup(_: *TestApp) void {
+        appendTestEvent("hangup-close");
     }
 
     fn releaseTerminal(self: *TestApp) void {
@@ -1033,7 +1095,7 @@ test "app entry writes exact resume handoff after interactive teardown" {
 
     try std.testing.expectEqual(RunOutcome.returned, outcome);
     try std.testing.expectEqualStrings(
-        "Continue session with: fx --resume session-123\n",
+        "Resume this session with:\nfx --resume session-123\n",
         capture.stdout.written(),
     );
     try std.testing.expectEqual(@as(usize, 1), capture.stdout_calls);
@@ -1073,7 +1135,7 @@ test "app entry bounds graceful-exit SIGINT suppression to handoff lifetime" {
 
     try std.testing.expectEqual(RunOutcome.returned, outcome);
     try std.testing.expectEqualStrings(
-        "Continue session with: fx --resume session-123\n",
+        "Resume this session with:\nfx --resume session-123\n",
         capture.stdout.written(),
     );
     try std.testing.expectEqual(@as(usize, 0), test_sigint_count.load(.seq_cst));
@@ -1108,12 +1170,12 @@ test "app entry relaunches only after teardown with the validated handoff" {
     try std.testing.expect(std.mem.find(
         u8,
         capture.stderr.written(),
-        "relaunch failed: InvalidExe",
+        "relaunch failed: invalid exe",
     ) != null);
     try std.testing.expect(std.mem.find(
         u8,
         capture.stderr.written(),
-        "fx --resume session-123",
+        "relaunch failed: invalid exe\nResume this session with:\nfx --resume session-123\n",
     ) != null);
     try expectEvents(&.{
         "init:none",
@@ -1196,6 +1258,36 @@ fn runWithOuterCleanup(comptime App: type, alloc: Allocator, args: []const [:0]c
     return runWithDeps(App, alloc, args, cfg, deps);
 }
 
+test "a command that ends on an error reports it in plain words" {
+    const alloc = std.testing.allocator;
+    const cases = [_]struct { err: anyerror, stderr: []const u8 }{
+        .{ .err = error.InvalidGatewaySseEvent, .stderr = "fx: unreadable reply\n" },
+        .{ .err = error.NoSpaceLeft, .stderr = "fx: the disk is full\n" },
+        .{ .err = error.ProviderRequestLimitReached, .stderr = "fx: provider request limit reached\n" },
+        .{ .err = error.OutputWriteFailed, .stderr = "fx: couldn't write the output\n" },
+    };
+    for (cases) |case| {
+        var capture = TestCapture.init(.{ .interactive = .{} });
+        defer capture.deinit();
+        capture.cli_error = case.err;
+
+        const outcome = try runWithDeps(TestApp, alloc, &.{"ask"}, testConfig(), capture.deps());
+        try std.testing.expectEqual(RunOutcome{ .exit = 1 }, outcome);
+        try std.testing.expectEqualStrings(case.stderr, capture.stderr.written());
+    }
+}
+
+test "a command whose output reader went away ends quietly with SIGPIPE's status" {
+    const alloc = std.testing.allocator;
+    var capture = TestCapture.init(.{ .interactive = .{} });
+    defer capture.deinit();
+    capture.cli_error = error.OutputReaderGone;
+
+    const outcome = try runWithDeps(TestApp, alloc, &.{"ask"}, testConfig(), capture.deps());
+    try std.testing.expectEqual(RunOutcome{ .exit = 141 }, outcome);
+    try std.testing.expectEqualStrings("", capture.stderr.written());
+}
+
 test "app entry reports unexpected init errors once and preserves identity" {
     const alloc = std.testing.allocator;
     var capture = TestCapture.init(.{ .interactive = .{} });
@@ -1204,9 +1296,33 @@ test "app entry reports unexpected init errors once and preserves identity" {
     capture.record_stderr_event = true;
 
     try std.testing.expectError(error.TestInitFailed, runWithDeps(TestApp, alloc, &.{}, testConfig(), capture.deps()));
-    try std.testing.expectEqualStrings("fx: TestInitFailed\n", capture.stderr.written());
+    try std.testing.expectEqualStrings("fx: test init failed\n", capture.stderr.written());
     try std.testing.expectEqual(@as(usize, 1), capture.stderr_calls);
     try expectEvents(&.{ "init:none", "stderr-attempt" });
+}
+
+test "app entry reports an error that ends startup in plain words, not its name" {
+    const alloc = std.testing.allocator;
+    var capture = TestCapture.init(.{ .interactive = .{} });
+    defer capture.deinit();
+    capture.init_error = error.UnknownHostName;
+
+    try std.testing.expectError(error.UnknownHostName, runWithDeps(TestApp, alloc, &.{}, testConfig(), capture.deps()));
+    try std.testing.expectEqualStrings("fx: cannot resolve host\n", capture.stderr.written());
+}
+
+test "app entry says what's wrong with ~/.fx/mcp.json instead of naming the error" {
+    const alloc = std.testing.allocator;
+    var capture = TestCapture.init(.{ .interactive = .{} });
+    defer capture.deinit();
+    capture.init_error = error.McpConfigLinkLoop;
+
+    try std.testing.expectError(error.McpConfigLinkLoop, runWithDeps(TestApp, alloc, &.{}, testConfig(), capture.deps()));
+    try std.testing.expectEqualStrings(
+        profile_paths.displayText("fx: ~/.fx/mcp.json is a link that loops or passes through too many links; replace it with a plain file\n"),
+        capture.stderr.written(),
+    );
+    try std.testing.expectEqual(@as(usize, 1), capture.stderr_calls);
 }
 
 test "app entry releases terminal before reporting worker start errors" {
@@ -1217,20 +1333,21 @@ test "app entry releases terminal before reporting worker start errors" {
     capture.record_stderr_event = true;
 
     try std.testing.expectError(error.TestWorkerStartFailed, runWithDeps(TestApp, alloc, &.{}, testConfig(), capture.deps()));
-    try std.testing.expectEqualStrings("fx: TestWorkerStartFailed\n", capture.stderr.written());
+    try std.testing.expectEqualStrings("fx: test worker start failed\n", capture.stderr.written());
     try std.testing.expectEqual(@as(usize, 1), capture.stderr_calls);
     try expectEvents(&.{ "init:none", "rebind-after-init", "auto-upgrade", "file-index", "worker-thread", "terminal-release", "stderr-attempt", "deinit" });
 }
 
 test "app entry releases terminal before reporting initial context failures exactly" {
     const alloc = std.testing.allocator;
-    const errors = [_]context_contract.ProviderError{
-        error.OutOfMemory,
-        error.NoSpaceLeft,
-        error.WriteFailed,
+    const cases = [_]struct { err: context_contract.ProviderError, stderr: []const u8 }{
+        .{ .err = error.OutOfMemory, .stderr = "fx: out of memory\n" },
+        .{ .err = error.NoSpaceLeft, .stderr = "fx: the disk is full\n" },
+        .{ .err = error.WriteFailed, .stderr = "fx: connection dropped\n" },
     };
 
-    for (errors) |expected_error| {
+    for (cases) |case| {
+        const expected_error = case.err;
         var capture = TestCapture.init(.{ .interactive = .{} });
         defer capture.deinit();
         capture.run_error = expected_error;
@@ -1240,13 +1357,7 @@ test "app entry releases terminal before reporting initial context failures exac
             expected_error,
             runWithDeps(TestApp, alloc, &.{}, testConfig(), capture.deps()),
         );
-        var expected_stderr_buf: [64]u8 = undefined;
-        const expected_stderr = try std.mem.print(
-            &expected_stderr_buf,
-            "fx: {s}\n",
-            .{@errorName(expected_error)},
-        );
-        try std.testing.expectEqualStrings(expected_stderr, capture.stderr.written());
+        try std.testing.expectEqualStrings(case.stderr, capture.stderr.written());
         try std.testing.expectEqual(@as(usize, 1), capture.stderr_calls);
         try expectEvents(&.{
             "init:none",
@@ -1271,7 +1382,7 @@ test "app entry reports run errors before deinit and outer cleanup" {
     capture.record_stderr_event = true;
 
     try std.testing.expectError(error.TestRunFailed, runWithOuterCleanup(TestApp, alloc, &.{}, testConfig(), capture.deps()));
-    try std.testing.expectEqualStrings("fx: TestRunFailed\n", capture.stderr.written());
+    try std.testing.expectEqualStrings("fx: test run failed\n", capture.stderr.written());
     try std.testing.expectEqual(@as(usize, 1), capture.stderr_calls);
     try std.testing.expectEqual(@as(usize, 0), capture.stdout_calls);
     try expectEvents(&.{ "init:none", "rebind-after-init", "auto-upgrade", "file-index", "worker-thread", "model-cache", "run", "terminal-release", "stderr-attempt", "deinit", "outer-defer" });
@@ -1297,6 +1408,8 @@ test "app entry treats terminal input closure as abnormal cleanup without stderr
     try std.testing.expectEqualStrings("", capture.stderr.written());
     try std.testing.expectEqual(@as(usize, 0), capture.stderr_calls);
     try std.testing.expectEqual(@as(usize, 0), capture.stdout_calls);
+    // The hang-up close comes before the terminal is released, while
+    // SIGHUP still reaches the closer.
     try expectEvents(&.{
         "init:none",
         "rebind-after-init",
@@ -1305,9 +1418,38 @@ test "app entry treats terminal input closure as abnormal cleanup without stderr
         "worker-thread",
         "model-cache",
         "run",
+        "hangup-close",
         "terminal-release",
         "deinit",
     });
+}
+
+test "app entry closes as a hang-up when a frame write finds the terminal hung up" {
+    const alloc = std.testing.allocator;
+    var capture = TestCapture.init(.{ .interactive = .{} });
+    defer capture.deinit();
+    capture.run_error = error.TerminalHungUp;
+    capture.record_stderr_event = true;
+
+    const outcome = try runWithDeps(TestApp, alloc, &.{}, testConfig(), capture.deps());
+
+    try std.testing.expectEqual(RunOutcome.returned, outcome);
+    try std.testing.expectEqualStrings("", capture.stderr.written());
+    try std.testing.expectEqual(@as(usize, 0), capture.stderr_calls);
+    try std.testing.expectEqual(@as(usize, 0), capture.stdout_calls);
+    try expectEvents(&.{ "init:none", "rebind-after-init", "auto-upgrade", "file-index", "worker-thread", "model-cache", "run", "hangup-close", "terminal-release", "deinit" });
+}
+
+test "app entry still reports a frame write that fails another way" {
+    const alloc = std.testing.allocator;
+    var capture = TestCapture.init(.{ .interactive = .{} });
+    defer capture.deinit();
+    capture.run_error = error.TerminalSyncRecoveryFailed;
+    capture.record_stderr_event = true;
+
+    try std.testing.expectError(error.TerminalSyncRecoveryFailed, runWithDeps(TestApp, alloc, &.{}, testConfig(), capture.deps()));
+    try std.testing.expectEqualStrings("fx: terminal sync recovery failed\n", capture.stderr.written());
+    try expectEvents(&.{ "init:none", "rebind-after-init", "auto-upgrade", "file-index", "worker-thread", "model-cache", "run", "terminal-release", "stderr-attempt", "deinit" });
 }
 
 test "app entry preserves run errors when fatal formatting fails" {
@@ -1461,6 +1603,32 @@ test "app entry names a v2 storage fault at startup, and v1 keeps the bare error
 
         try std.testing.expectEqual(@as(u8, 1), outcome.exit);
         try std.testing.expectEqualStrings(case.message, capture.stderr.written());
+    }
+}
+
+test "app entry says why a terminal recording could not start" {
+    const alloc = std.testing.allocator;
+    const cases = [_]struct {
+        init_error: anyerror,
+        message: []const u8,
+    }{
+        .{ .init_error = error.RecordingStartFailed, .message = "fx: unable to start terminal recording.\n" },
+        .{ .init_error = error.RecordingDiskFull, .message = "fx: unable to start terminal recording: the disk is full. Free some space, or unset FX_DEBUG_RECORD.\n" },
+        .{ .init_error = error.RecordingFileTooBig, .message = "fx: unable to start terminal recording: a file-size limit was reached.\n" },
+        .{ .init_error = error.RecordingAccessDenied, .message = "fx: unable to start terminal recording: permission denied.\n" },
+        .{ .init_error = error.RecordingReadOnly, .message = "fx: unable to start terminal recording: the disk is read-only.\n" },
+    };
+    for (cases) |case| {
+        var capture = TestCapture.init(.{ .interactive = .{} });
+        defer capture.deinit();
+        capture.init_error = case.init_error;
+        capture.fail_unexpected_format = true;
+
+        const outcome = try runWithDeps(TestApp, alloc, &.{}, testConfig(), capture.deps());
+
+        try std.testing.expectEqual(@as(u8, 1), outcome.exit);
+        try std.testing.expectEqualStrings(case.message, capture.stderr.written());
+        try std.testing.expectEqual(@as(usize, 1), capture.stderr_calls);
     }
 }
 

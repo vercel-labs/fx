@@ -19,8 +19,10 @@
 (* - Quit: /quit or Ctrl+C twice. It cancels the request first, as Esc     *)
 (*   does, so nothing resumes.                                             *)
 (* - Close: SIGHUP or SIGTERM, from a closed window, a logout, or a        *)
-(*   reboot. fx gives the module `closing`, saves the record it returns,   *)
-(*   which is marked clean, and exits.                                     *)
+(*   reboot. A closed window can reach fx as its terminal hanging up       *)
+(*   before SIGHUP, and closes fx the same way. fx gives the module        *)
+(*   `closing`, saves the record it returns, which is marked clean, and    *)
+(*   exits.                                                                *)
 (* - Kill: SIGKILL or a crash, at any moment.                              *)
 (*                                                                         *)
 (* Policy selects fx's behavior:                                           *)
@@ -377,10 +379,11 @@ Kill(p) ==
     /\ faults' = faults + 1
     /\ UNCHANGED <<turn, wall, fate, answered, stranded>>
 
-\* SIGHUP or SIGTERM. fx saves the running module's record marked clean in
-\* its turn; with no request running, or none of its turn written yet,
-\* nothing is saved. Today, and planted defect no_closing, die as a kill
-\* does. A close is not a death: `seen` stays.
+\* SIGHUP, SIGTERM, or a terminal that hangs up. fx saves the running
+\* module's record marked clean in its turn and leaves the turn open; it
+\* never ends the turn as cancelled. With no request running, or none of its
+\* turn written yet, nothing is saved. Today, and planted defect no_closing,
+\* die as a kill does. A close is not a death: `seen` stays.
 Close(p) ==
     LET saves == Proposed /\ Bug # "no_closing" /\ ModuleActive(p) /\ ~ps[p].cont IN
     /\ ps[p].pc # "off" /\ CanFault

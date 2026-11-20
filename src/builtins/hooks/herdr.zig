@@ -14,7 +14,8 @@ pub const State = enum { idle, working, blocked };
 // herdr protocol limits custom status to 32 bytes.
 const custom_status_max = 32;
 /// Maximum wait for herdr's one-line reply.
-const response_timeout = std.posix.timeval{ .sec = 0, .usec = 250_000 };
+/// How long fx waits for herdr's reply to a request.
+const response_wait_ms: i64 = 250;
 
 // Third-party reporters use the `custom:` source prefix.
 const source = "custom:fx";
@@ -30,6 +31,31 @@ const Request = union(enum) {
     clear_authority,
 };
 
+/// The last state reported and its status, so a caller that reports on every
+/// main-loop pass sends only changes.
+pub const LastReport = struct {
+    state: ?State = null,
+    status_buf: [custom_status_max]u8 = undefined,
+    status_len: ?usize = null,
+
+    /// Records `state` and `status`, already clamped, and returns whether
+    /// they differ from the last record.
+    pub fn changed(self: *LastReport, state: State, status: ?[]const u8) bool {
+        const last_status: ?[]const u8 = if (self.status_len) |len| self.status_buf[0..len] else null;
+        const same_status = if (status) |value|
+            last_status != null and std.mem.eql(u8, value, last_status.?)
+        else
+            last_status == null;
+        if (self.state == state and same_status) return false;
+        self.state = state;
+        if (status) |value| {
+            @memcpy(self.status_buf[0..value.len], value);
+            self.status_len = value.len;
+        } else self.status_len = null;
+        return true;
+    }
+};
+
 pub const Client = struct {
     enabled: bool = false,
     mutex: std.Io.Mutex = .init,
@@ -37,6 +63,8 @@ pub const Client = struct {
     socket_path: []u8 = &.{},
     pane_id: []u8 = &.{},
     next_id: u64 = 1,
+    /// Guarded by `mutex`.
+    last_report: LastReport = .{},
 
     pub fn shouldEnable(
         fx_herdr: ?[]const u8,
@@ -96,7 +124,27 @@ pub const Client = struct {
     /// Report a semantic lifecycle state. `custom_status` is a short (<=32 byte)
     /// activity label shown in herdr's UI; pass null to omit it.
     pub fn reportState(self: *Client, state: State, custom_status: ?[]const u8) void {
-        self.send(.{ .report = .{ .state = state, .custom_status = clampStatus(custom_status) } });
+        self.sendReport(state, clampStatus(custom_status), false);
+    }
+
+    /// Like `reportState`, but sends nothing when `state` and `custom_status`
+    /// match the last report. A report that fails to send still counts, so
+    /// a caller on every main-loop pass does not retry an absent herdr.
+    pub fn reportStateIfChanged(self: *Client, state: State, custom_status: ?[]const u8) void {
+        self.sendReport(state, clampStatus(custom_status), true);
+    }
+
+    fn sendReport(self: *Client, state: State, status: ?[]const u8, only_changes: bool) void {
+        if (comptime host_target.is_wasm) return;
+        if (!self.enabled) return;
+        const io = io_mod.getIo();
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        if (!self.last_report.changed(state, status) and only_changes) return;
+        const request: Request = .{ .report = .{ .state = state, .custom_status = status } };
+        self.sendLocked(request) catch |err| {
+            debug_trace.logf("herdr", "send failed kind={s} err={s}", .{ @tagName(request), @errorName(err) });
+        };
     }
 
     /// Report fx's session id so herdr can associate the pane with a resumable
@@ -150,7 +198,6 @@ pub const Client = struct {
         const io = io_mod.getIo();
         var stream = try self.connectLocked();
         defer stream.close(io);
-        applyResponseTimeout(stream);
 
         var buffer: [1024]u8 = undefined;
         var stream_writer = stream.writer(io, &buffer);
@@ -164,7 +211,7 @@ pub const Client = struct {
             .clear_authority => try writeClearAuthority(w, id, self.pane_id),
         }
         try w.flush();
-        drainResponse(stream);
+        drainResponse(stream.socket.handle);
         debug_trace.logf("herdr", "sent {s} pane_id={s}", .{ @tagName(request), self.pane_id });
     }
 
@@ -180,15 +227,6 @@ pub const Client = struct {
     }
 };
 
-fn applyResponseTimeout(stream: std.Io.net.Stream) void {
-    std.posix.setsockopt(
-        stream.socket.handle,
-        std.posix.SOL.SOCKET,
-        std.posix.SO.RCVTIMEO,
-        std.mem.asBytes(&response_timeout),
-    ) catch {};
-}
-
 fn clampStatus(custom_status: ?[]const u8) ?[]const u8 {
     const status = custom_status orelse return null;
     if (status.len == 0) return null;
@@ -197,12 +235,23 @@ fn clampStatus(custom_status: ?[]const u8) ?[]const u8 {
 
 /// Wait briefly for herdr's single-line response before closing. herdr applies
 /// each request as it reads it; waiting serializes rapid-fire reports so a
-/// later one cannot race ahead of an earlier one. Bounded by SO_RCVTIMEO so a
-/// hung peer cannot block forever.
-fn drainResponse(stream: std.Io.net.Stream) void {
+/// later one cannot race ahead of an earlier one. The wait polls the socket
+/// against a deadline and reads only what has arrived, so a herdr that never
+/// answers costs `response_wait_ms` and nothing more. A receive timeout on the
+/// socket would make `std.Io`'s reader panic on the EAGAIN it returns.
+fn drainResponse(socket: std.posix.socket_t) void {
+    const deadline = io_mod.milliTimestamp() + response_wait_ms;
     var buffer: [512]u8 = undefined;
-    var stream_reader = stream.reader(io_mod.getIo(), &buffer);
-    _ = stream_reader.interface.takeDelimiterInclusive('\n') catch {};
+    while (true) {
+        const remaining = deadline - io_mod.milliTimestamp();
+        if (remaining <= 0) return;
+        var fds = [_]std.posix.pollfd{.{ .fd = socket, .events = std.posix.POLL.IN, .revents = 0 }};
+        const ready = std.posix.poll(&fds, @intCast(remaining)) catch return;
+        if (ready == 0) return;
+        const count = std.posix.read(socket, &buffer) catch return;
+        if (count == 0) return;
+        if (std.mem.findScalar(u8, buffer[0..count], '\n') != null) return;
+    }
 }
 
 /// herdr's JSON-RPC requires the request id to be a string, not a number.
@@ -283,6 +332,31 @@ fn writeClearAuthority(w: *std.Io.Writer, id: u64, pane_id: []const u8) !void {
     try w.writeAll(",\"source\":");
     try jsonrpc.writeJsonStr(source, w);
     try w.writeAll("}}\n");
+}
+
+test "waiting for herdr's reply ends at its line, at a close, or at the deadline" {
+    if (comptime host_target.is_wasm) return;
+    var handles: [2]std.posix.fd_t = undefined;
+    if (std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM, 0, &handles) != 0) return error.SocketPairFailed;
+    defer _ = std.c.close(handles[0]);
+    const peer: std.Io.File = .{ .handle = handles[1], .flags = .{ .nonblocking = false } };
+
+    // A reply that has arrived ends the wait at once.
+    try peer.writeStreamingAll(io_mod.getIo(), "{\"id\":\"1\",\"result\":{}}\n");
+    var started = io_mod.milliTimestamp();
+    drainResponse(handles[0]);
+    try std.testing.expect(io_mod.milliTimestamp() - started < response_wait_ms);
+
+    // A herdr that never answers costs the deadline, and returns.
+    started = io_mod.milliTimestamp();
+    drainResponse(handles[0]);
+    try std.testing.expect(io_mod.milliTimestamp() - started >= response_wait_ms - 10);
+
+    // A herdr that hangs up ends it too.
+    _ = std.c.close(handles[1]);
+    started = io_mod.milliTimestamp();
+    drainResponse(handles[0]);
+    try std.testing.expect(io_mod.milliTimestamp() - started < response_wait_ms);
 }
 
 test "shouldEnable requires both socket path and pane id" {
@@ -383,6 +457,19 @@ test "report_agent_session serializes session identity" {
             "\"source\":\"custom:fx\",\"agent\":\"fx\",\"agent_session_id\":\"session-42\"}}\n",
         out.written(),
     );
+}
+
+test "a last report counts only a change of state or status" {
+    var last: LastReport = .{};
+    try std.testing.expect(last.changed(.idle, null));
+    try std.testing.expect(!last.changed(.idle, null));
+    try std.testing.expect(last.changed(.working, null));
+    try std.testing.expect(last.changed(.blocked, "permission"));
+    try std.testing.expect(!last.changed(.blocked, "permission"));
+    try std.testing.expect(last.changed(.blocked, "question"));
+    try std.testing.expect(last.changed(.blocked, null));
+    try std.testing.expect(last.changed(.blocked, "question"));
+    try std.testing.expect(last.changed(.idle, null));
 }
 
 test "clampStatus caps to 32 bytes and normalizes empty" {

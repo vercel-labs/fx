@@ -62,7 +62,9 @@ pub const Event = struct {
         /// A call ended. `answer` is set when the server answered, valid
         /// until the next `next`.
         /// `oversized`: a lost call's answer was over the message limit.
-        called: struct { call: Handle, outcome: Outcome, maybe_ran: bool, timed_out: bool, answer: ?tools.Call, oversized: bool = false },
+        /// `refused_bytes`, `refused_body`: the length of what fx could not read, for a `malformed`
+        /// call, and whether it was an HTTP body (else a line); see `server.Event.called`.
+        called: struct { call: Handle, outcome: Outcome, maybe_ran: bool, timed_out: bool, answer: ?tools.Call, oversized: bool = false, refused_bytes: u32 = 0, refused_body: bool = false },
         /// A call's server reported progress; `message` is terminal-safe and
         /// valid until the next `next`.
         progress: struct { call: Handle, progress: f64, total: ?f64, message: ?[]const u8 },
@@ -336,6 +338,20 @@ pub const Engine = struct {
         try (try e.ensureServer(try e.find(name))).signOut();
     }
 
+    /// Forgets the tokens a sign-in brought and the server refused: nothing
+    /// is revoked or saved.
+    pub fn discardLogin(e: *Engine, name: []const u8) Error!void {
+        try (try e.ensureServer(try e.find(name))).discardLogin();
+    }
+
+    /// The 401 server `name` gave to a request that carried its login's token, with the words its
+    /// challenge named, when the server has accepted nothing since: null when there is none. A
+    /// failed refresh after the 401 leaves it. Valid until the next call into the engine.
+    pub fn loginRejected(e: *Engine, name: []const u8) ?auth_client.Rejected {
+        const server = (e.find(name) catch return null).server orelse return null;
+        return server.loginRejection();
+    }
+
     /// What server `name` said to tell the model about it, from its
     /// last discover or initialize result; null when it said nothing. Valid
     /// until the next call into the engine.
@@ -351,12 +367,30 @@ pub const Engine = struct {
         return s.revoking();
     }
 
+    /// Server `name`'s `Server.revocationAnswer`; null when no server `name`
+    /// is running.
+    pub fn revocationAnswer(e: *Engine, name: []const u8) ?u16 {
+        const s = (e.find(name) catch return null).server orelse return null;
+        return s.revocationAnswer();
+    }
+
     /// Writes server `name`'s sign-in credential for the host to keep
     /// securely, and pass back in `Config.auth.saved`; false when there is
     /// none to keep. A `credential` event says when it changed.
     pub fn saveCredential(e: *Engine, name: []const u8, w: *std.Io.Writer) Error!bool {
         const s = (try e.find(name)).server orelse return false;
         return s.saveCredential(w);
+    }
+
+    /// Writes the credential server `name`'s next `signOut` revokes, as
+    /// `saveCredential` writes it: the one it holds, or, before it starts,
+    /// the one `restoreCredential` gave it. False when there is none.
+    pub fn writeSignOutCredential(e: *Engine, name: []const u8, w: *std.Io.Writer) Error!bool {
+        const slot = try e.find(name);
+        if (slot.server) |s| return s.saveCredential(w);
+        const saved = slot.config.auth.saved orelse return false;
+        try w.writeAll(saved);
+        return true;
     }
 
     /// Gives server `name` the credential `saveCredential` wrote, as
@@ -472,6 +506,8 @@ pub const Engine = struct {
                     .timed_out = c.timed_out,
                     .answer = c.answer,
                     .oversized = c.oversized,
+                    .refused_bytes = c.refused_bytes,
+                    .refused_body = c.refused_body,
                 } });
             },
             .input => |q| for (slot.calls.items) |x| if (x.sent != null and x.sent.? == q.handle) {

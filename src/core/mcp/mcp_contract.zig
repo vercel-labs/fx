@@ -163,7 +163,7 @@ pub const McpServerConfig = struct {
     scope: ConfigScope = .profile,
     required: bool = false,
     /// Advertise this server's tool schemas on every model turn instead of
-    /// loading them on demand through capability search.
+    /// offering them through toolbox.
     always_loaded: bool = false,
     /// Host-issued registration for a server the host serves over its own
     /// connection. Such a server speaks modern MCP through the runtime's

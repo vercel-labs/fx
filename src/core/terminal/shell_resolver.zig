@@ -185,13 +185,22 @@ pub fn profileShell(
 
 const captured_zsh_user_prelude = "\\builtin trap - TERM; ";
 
+/// A startup file can define a function named `builtin`, and zsh and bash run
+/// a function before a builtin of the same name, so every `\builtin` line fx
+/// adds would run the user's function instead. fx removes such a function
+/// before its own lines. The zsh test runs no command when there is no such
+/// function, so it can't fail under `errexit`; bash's `unset -f` succeeds
+/// either way.
+const zsh_unshadow_builtin = "(( ${+functions[builtin]} )) && \\unfunction builtin; ";
+const bash_unshadow_builtin = "\\unset -f builtin; ";
+
 /// zsh's `equals` option expands an unquoted word that starts with `=`, such
 /// as a `======` separator or the `==` in `[ a == b ]`, to the path of the
 /// command it names, and a word that names no command aborts the rest of the
 /// command line. Commands are written for POSIX shells, so every zsh launch
 /// turns the option off right before the command, after startup files or a
 /// snapshot replay have run.
-const zsh_command_prelude = "\\builtin unsetopt equals; ";
+const zsh_command_prelude = zsh_unshadow_builtin ++ "\\builtin unsetopt equals; ";
 
 pub fn capturedInvocation(
     alloc: Allocator,
@@ -220,7 +229,7 @@ pub fn capturedInvocation(
                 invocation.append("expand_aliases");
             }
             const effective_command = if (shellKind(path) == .zsh)
-                try std.mem.concat(alloc, u8, &.{ captured_zsh_user_prelude, zsh_command_prelude, command })
+                try std.mem.concat(alloc, u8, &.{ zsh_command_prelude, captured_zsh_user_prelude, command })
             else
                 command;
             invocation.setCommand(effective_command);
@@ -267,10 +276,20 @@ pub fn snapshotInvocation(
         .zsh => .{ "\\builtin exec 9>&2 2>/dev/null; ", "\\builtin exec 2>&9 9>&-; " },
         .bash => .{ "exec 9>&2 2>/dev/null; ", "\\builtin unset -f exec; exec 2>&9 9>&-; " },
     };
+    // bash 3.2, macOS's /bin/bash, sources a pipe only as far as the bytes it
+    // holds at that moment, about 64 KB, so a larger replay would lose its
+    // end. That bash reads the whole script with a command substitution and
+    // evaluates it. bash 4 and later read a pipe to its end.
+    const load_replay: []const u8 = switch (kind) {
+        .zsh => "\\builtin source /dev/fd/0; ",
+        .bash => "if (( BASH_VERSINFO[0] < 4 )); then \\builtin eval -- \"$(< /dev/fd/0)\"; " ++
+            "else \\builtin source /dev/fd/0; fi; ",
+    };
     var bootstrap: std.ArrayList(u8) = .empty;
     errdefer bootstrap.deinit(alloc);
     try bootstrap.appendSlice(alloc, park_stderr);
-    try bootstrap.appendSlice(alloc, "\\builtin source /dev/fd/0; __fx_snapshot_status=$?; ");
+    try bootstrap.appendSlice(alloc, load_replay);
+    try bootstrap.appendSlice(alloc, "__fx_snapshot_status=$?; ");
     try bootstrap.appendSlice(alloc, restore_stderr);
     try bootstrap.appendSlice(
         alloc,
@@ -324,6 +343,15 @@ pub const snapshot_marker_prefix = "FXSNAP:";
 // as Debian's and Ubuntu's global zshrc does, would otherwise make the
 // replayed `run-help () {` a parse error that stops the whole replay. The
 // captured `alias -L` lines then restore exactly the user's aliases.
+//
+// Completion functions start with `_`, a setup often has a thousand of them,
+// and a command never uses them, so the replay leaves them out. zsh autoloads
+// each one from a file of the same name, as compinit does for every
+// `#compdef` file, so a `_` function is left out only when
+// `functions_source` names no file or a file with the function's name. A `_`
+// helper that a startup file defines, such as the one a `pnpm` wrapper
+// calls, is replayed. zsh before 5.4 has no `functions_source`, so it leaves
+// out every `_` function.
 const zsh_capture_script =
     \\{
     \\\builtin zmodload zsh/parameter 2>/dev/null
@@ -335,7 +363,11 @@ const zsh_capture_script =
     \\\builtin print -r -- '\builtin unalias -a; \builtin unalias -as'
     \\\builtin typeset -p fpath
     \\for __fx_snapshot_name in ${(ko)functions}; do
-    \\  case $__fx_snapshot_name in (_*|prompt_*|__fx_snapshot_*) continue;; esac
+    \\  case $__fx_snapshot_name in (prompt_*|__fx_snapshot_*) continue;; esac
+    \\  if [[ $__fx_snapshot_name == _* ]]; then
+    \\    __fx_snapshot_file=${functions_source[$__fx_snapshot_name]-}
+    \\    if [[ -z $__fx_snapshot_file || ${__fx_snapshot_file:t} == "$__fx_snapshot_name" ]]; then continue; fi
+    \\  fi
     \\  \builtin functions -- $__fx_snapshot_name
     \\done
     \\\builtin alias -L
@@ -351,21 +383,35 @@ const zsh_capture_script =
     \\} 2>/dev/null
 ;
 
+// bash has no autoload. bash-completion and git's completion script define
+// their `_` functions in files whose path contains `completion`, so the
+// replay leaves out a `_` function only when `declare -F`, with `extdebug`
+// on, reports such a file; the name alone does not decide. Under `extdebug`
+// a DEBUG trap that fails skips the next command, so the trap is cleared
+// first. bash parses a function's patterns when it reads the definition, so
+// the replay sets options such as `extglob` before the functions that use
+// them.
 const bash_capture_script =
     \\{
+    \\\unset -f builtin
     \\\builtin printf 'FXSNAP:@NONCE@:ENV\0'
     \\/usr/bin/env -0
     \\\builtin printf 'FXSNAP:@NONCE@:NAMES\0'
     \\\builtin printf '%s\0' $(\builtin compgen -a) $(\builtin compgen -A function)
     \\\builtin printf 'FXSNAP:@NONCE@:REPLAY\0'
-    \\for __fx_snapshot_name in $(\builtin compgen -A function); do
-    \\  case $__fx_snapshot_name in _*|__fx_snapshot_*) continue;; esac
-    \\  \builtin declare -f -- "$__fx_snapshot_name"
-    \\done
-    \\\builtin alias -p
     \\for __fx_snapshot_name in extglob nullglob dotglob globstar nocaseglob failglob nocasematch globasciiranges; do
     \\  \builtin shopt -p "$__fx_snapshot_name" 2>/dev/null
     \\done
+    \\\builtin trap - DEBUG
+    \\\builtin shopt -s extdebug
+    \\__fx_snapshot_sources=$(\builtin declare -F $(\builtin compgen -A function))
+    \\\builtin shopt -u extdebug
+    \\while \builtin read -r __fx_snapshot_name __fx_snapshot_line __fx_snapshot_file; do
+    \\  case $__fx_snapshot_name in __fx_snapshot_*|'') continue;; esac
+    \\  case $__fx_snapshot_name in _*) case $__fx_snapshot_file in *completion*) continue;; esac;; esac
+    \\  \builtin declare -f -- "$__fx_snapshot_name"
+    \\done <<< "$__fx_snapshot_sources"
+    \\\builtin alias -p
     \\\builtin printf '\0FXSNAP:@NONCE@:END\0'
     \\} 2>/dev/null
 ;
@@ -436,7 +482,10 @@ pub fn buildBootstrap(
             "command-started",
         );
         try output.appendSlice(alloc, " || exit 125; ");
-        if (kind == .zsh) try output.appendSlice(alloc, zsh_command_prelude);
+        try output.appendSlice(alloc, switch (kind) {
+            .zsh => zsh_command_prelude,
+            .bash => bash_unshadow_builtin,
+        });
         try output.appendSlice(
             alloc,
             "builtin eval -- \"$fx_terminal_command\"; " ++
@@ -623,7 +672,7 @@ test "captured profiles use exact non-PTY argv" {
         "/bin/zsh",
         "-f",
         "-c",
-        "\\builtin unsetopt equals; printf clean",
+        "(( ${+functions[builtin]} )) && \\unfunction builtin; \\builtin unsetopt equals; printf clean",
     };
     try std.testing.expectEqual(expected_zsh_clean.len, zsh_clean.argv().len);
     for (&expected_zsh_clean, zsh_clean.argv()) |expected, actual| {
@@ -635,7 +684,7 @@ test "captured profiles use exact non-PTY argv" {
         "-l",
         "-i",
         "-c",
-        "\\builtin trap - TERM; \\builtin unsetopt equals; printf user",
+        "(( ${+functions[builtin]} )) && \\unfunction builtin; \\builtin unsetopt equals; \\builtin trap - TERM; printf user",
     };
     try std.testing.expectEqual(expected_zsh_user.len, zsh_user.argv().len);
     for (&expected_zsh_user, zsh_user.argv()) |expected, actual| {
@@ -650,7 +699,7 @@ test "captured invocation provider projection shell-quotes every argv word" {
     const invocation = try capturedInvocation(arena, .{ .clean = "/bin/zsh" }, "printf '%s' ok");
     const command = try formatInvocationCommand(arena, &invocation);
     try std.testing.expectEqualStrings(
-        "'/bin/zsh' '-f' '-c' '\\builtin unsetopt equals; printf '\"'\"'%s'\"'\"' ok'",
+        "'/bin/zsh' '-f' '-c' '(( ${+functions[builtin]} )) && \\unfunction builtin; \\builtin unsetopt equals; printf '\"'\"'%s'\"'\"' ok'",
         command,
     );
 }
@@ -660,7 +709,7 @@ test "snapshot script turns off zsh equals expansion after the replay" {
     defer std.testing.allocator.free(zsh);
     try std.testing.expectEqualStrings(
         "builtin setopt equals\n__fx_snapshot_restored=1\n" ++
-            "\\builtin unsetopt equals; \\builtin eval -- 'echo ======' </dev/null 2>&9 9>&-\n",
+            "(( ${+functions[builtin]} )) && \\unfunction builtin; \\builtin unsetopt equals; \\builtin eval -- 'echo ======' </dev/null 2>&9 9>&-\n",
         zsh,
     );
 
@@ -689,7 +738,8 @@ test "snapshot bootstrap hides replay errors and restores stderr afterwards" {
 
     const bash = try snapshotInvocation(arena, "/bin/bash", "marker");
     try std.testing.expectEqualStrings(
-        "exec 9>&2 2>/dev/null; \\builtin source /dev/fd/0; __fx_snapshot_status=$?; " ++
+        "exec 9>&2 2>/dev/null; if (( BASH_VERSINFO[0] < 4 )); then \\builtin eval -- \"$(< /dev/fd/0)\"; " ++
+            "else \\builtin source /dev/fd/0; fi; __fx_snapshot_status=$?; " ++
             "\\builtin unset -f exec; exec 2>&9 9>&-; " ++ tail,
         bash.argv()[bash.argv().len - 1],
     );
@@ -765,7 +815,7 @@ test "bootstrap quotes private paths and separates command completion" {
         std.mem.find(u8, command, "'command-started'") != null,
     );
     try std.testing.expect(
-        std.mem.find(u8, command, "|| exit 125; \\builtin unsetopt equals; builtin eval --") != null,
+        std.mem.find(u8, command, "|| exit 125; (( ${+functions[builtin]} )) && \\unfunction builtin; \\builtin unsetopt equals; builtin eval --") != null,
     );
     try std.testing.expect(
         std.mem.find(u8, command, "exit \"$fx_terminal_status\"") != null,
@@ -781,7 +831,7 @@ test "bootstrap quotes private paths and separates command completion" {
     );
     defer std.testing.allocator.free(bash_command);
     try std.testing.expect(
-        std.mem.find(u8, bash_command, "|| exit 125; builtin eval --") != null,
+        std.mem.find(u8, bash_command, "|| exit 125; \\unset -f builtin; builtin eval --") != null,
     );
     try std.testing.expect(std.mem.find(u8, bash_command, "unsetopt") == null);
 

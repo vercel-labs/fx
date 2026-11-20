@@ -6,6 +6,7 @@ pub const diff = @import("core/output/diff.zig");
 pub const interaction_state = @import("ui/footer/interaction_state.zig");
 pub const permission_request = @import("core/permissions/permission_request.zig");
 pub const transcript_blocks = @import("ui/render_engine/transcript_blocks.zig");
+pub const transcript_store = @import("ui/transcript/store.zig");
 pub const types = @import("core/shared/types.zig");
 pub const vt_emulator = @import("core/terminal/engine.zig");
 const file_index = @import("core/workspace/file_index.zig");

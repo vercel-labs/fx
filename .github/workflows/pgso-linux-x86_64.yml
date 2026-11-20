@@ -64,6 +64,20 @@ jobs:
           FX_PGSO_LLVM_BIN: ${{ steps.setup.outputs.llvm-bin }}
         run: python3 -m unittest discover -s scripts/pgso/tests -v
 
+      # As in ci.yml: the zsh user profile tests need zsh, and Ubuntu's global
+      # zshrc runs compinit, which fails without a terminal.
+      - name: Install zsh
+        run: |
+          command -v zsh >/dev/null || { sudo apt-get update -qq && sudo apt-get install -y -qq zsh; }
+          echo 'skip_global_compinit=1' | sudo tee -a /etc/zsh/zshenv >/dev/null
+
+      - name: Run the unit tests on transformed code
+        run: |
+          python3 -m scripts.pgso unit-tests \
+            --llvm-bin "${{ steps.setup.outputs.llvm-bin }}" \
+            --output-dir "$RUNNER_TEMP/fx-pgso-unit-tests" \
+            --target x86_64-linux
+
       - name: Install E2E dependencies
         run: bun install --frozen-lockfile
         working-directory: tests/e2e
@@ -90,5 +104,17 @@ jobs:
             ${{ runner.temp }}/fx-pgso/logs
             ${{ runner.temp }}/fx-pgso/measurements
             ${{ runner.temp }}/fx-pgso/candidate/fx
+          if-no-files-found: warn
+          retention-days: ${{ inputs.evidence-retention-days || 14 }}
+
+      # Its own artifact: upload-artifact roots an artifact at the deepest
+      # directory its paths share, and the release reads candidate/fx and
+      # manifest.json from the root of the evidence above.
+      - name: Upload unit test logs
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: pgso-linux-x86_64-unit-tests-${{ github.sha }}-attempt-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/fx-pgso-unit-tests/logs
           if-no-files-found: warn
           retention-days: ${{ inputs.evidence-retention-days || 14 }}

@@ -607,6 +607,11 @@ pub const PrepareResult = union(enum) {
     semantic_failure: []const u8,
 };
 
+/// What a failed edit may show of its target. Lines of the file go into the
+/// failure only when reading the file needs no approval, so a failed edit
+/// cannot reveal a file that the read rules protect.
+pub const EditFailureDetail = enum { plain, file_lines };
+
 pub const FileExecutionAuthorization = struct {
     input: FileMutationInput,
     policy_targets: PolicyEvaluatedFileTargets,
@@ -614,6 +619,7 @@ pub const FileExecutionAuthorization = struct {
     grant_offer: ?FileGrantOffer = null,
     approval_intent: ?FileApprovalIntent = null,
     read_disclosure_required: bool = false,
+    edit_failure_detail: EditFailureDetail = .plain,
 };
 
 fn sliceEql(comptime T: type, a: []const T, b: []const T) bool {

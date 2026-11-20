@@ -363,8 +363,14 @@ fn Helpers(comptime T: type) type {
             child: *const Desc,
             out: *anyopaque,
         ) Error!void {
-            var payload: @typeInfo(T).optional.child = undefined;
-            try parseInto(allocator, source, options, child, @ptrCast(&payload));
+            const Child = @typeInfo(T).optional.child;
+            var payload: Child = undefined;
+            // A number, enum, or string payload skips the dispatch in `parseInto`.
+            if (comptime isLeaf(Child)) {
+                try parseLeaf(allocator, source, options, child, @ptrCast(&payload));
+            } else {
+                try parseInto(allocator, source, options, child, @ptrCast(&payload));
+            }
             const value: *T = @ptrCast(@alignCast(out));
             value.* = payload;
         }
@@ -457,6 +463,9 @@ fn parseObject(
     if (.object_begin != try source.next()) return error.UnexpectedToken;
 
     var seen: std.bit_set.Static(max_fields) = .empty;
+    // fx writes fields in declaration order, so the next key is usually the
+    // field after the last one matched; try it before scanning.
+    var expected: usize = 0;
     while (true) {
         var name_token: ?Token = try source.nextAllocMax(allocator, .alloc_if_needed, options.max_value_len.?);
         const field_name = switch (name_token.?) {
@@ -465,8 +474,11 @@ fn parseObject(
             else => return error.UnexpectedToken,
         };
 
-        for (fields, 0..) |*field, i| {
-            if (!std.mem.eql(u8, field.name(object.names), field_name)) continue;
+        const hit = expected < fields.len and nameEql(fields[expected].name(object.names), field_name);
+        const start = if (hit) expected else 0;
+        for (fields[start..], start..) |*field, i| {
+            if (!(hit and i == start) and !nameEql(field.name(object.names), field_name)) continue;
+            expected = i + 1;
             // Free the name before parsing the value, as `std.json` does.
             freeAllocated(allocator, name_token.?);
             name_token = null;
@@ -485,7 +497,7 @@ fn parseObject(
                 .@"error" => return error.DuplicateField,
                 .use_last => {},
             };
-            try parseInto(allocator, source, options, field.desc, base + field.layout.offset);
+            try parseLeaf(allocator, source, options, field.desc, base + field.layout.offset);
             seen.set(i);
             break;
         } else {
@@ -505,6 +517,76 @@ fn parseObject(
         const size = field.layout.size;
         @memcpy((base + field.layout.offset)[0..size], bytes[0..size]);
     }
+}
+
+/// Parses one value, handling strings and scalars, most of what fx parses,
+/// without a call; anything else goes through `parseInto`.
+inline fn parseLeaf(
+    allocator: Allocator,
+    source: *Scanner,
+    options: *const json.ParseOptions,
+    desc: *const Desc,
+    out: *anyopaque,
+) Error!void {
+    switch (desc.*) {
+        .scalar => |parse| {
+            const token = try source.nextAllocMax(allocator, .alloc_if_needed, options.max_value_len.?);
+            defer freeAllocated(allocator, token);
+            const slice = switch (token) {
+                inline .number, .allocated_number, .string, .allocated_string => |slice| slice,
+                else => return error.UnexpectedToken,
+            };
+            try parse(slice, out);
+        },
+        .slice => |seq| {
+            if (seq.shape.bytes and try source.peekNextTokenType() == .string) {
+                // A mutable slice always gets its own copy.
+                const when: json.AllocWhen = if (seq.shape.mutable) .alloc_always else options.allocate.?;
+                const slice = switch (try source.nextAllocMax(allocator, when, options.max_value_len.?)) {
+                    inline .string, .allocated_string => |slice| slice,
+                    else => unreachable,
+                };
+                // `[]u8` and `[]const u8` share one layout.
+                const value: *[]const u8 = @ptrCast(@alignCast(out));
+                value.* = slice;
+                return;
+            }
+            try parseSlice(allocator, source, options, seq, out);
+        },
+        .optional => |optional| switch (try source.peekNextTokenType()) {
+            .null => {
+                _ = try source.next();
+                optional.set_null(out);
+            },
+            else => try optional.parse_some(allocator, source, options, optional.child, out),
+        },
+        else => try parseInto(allocator, source, options, desc, out),
+    }
+}
+
+fn isLeaf(comptime T: type) bool {
+    return switch (@typeInfo(T)) {
+        .int, .float => true,
+        .@"enum" => !std.meta.hasFn(T, "jsonParse"),
+        .pointer => |info| info.size == .slice and info.child == u8 and info.sentinel_ptr == null,
+        else => false,
+    };
+}
+
+/// `std.mem.eql` for field names, which are short: up to 16 bytes compare as
+/// two overlapping words instead of a byte loop.
+inline fn nameEql(a: []const u8, b: []const u8) bool {
+    if (a.len != b.len) return false;
+    const len = a.len;
+    if (len >= 8 and len <= 16) {
+        return std.mem.readInt(u64, a[0..8], .little) == std.mem.readInt(u64, b[0..8], .little) and
+            std.mem.readInt(u64, a[len - 8 ..][0..8], .little) == std.mem.readInt(u64, b[len - 8 ..][0..8], .little);
+    }
+    if (len >= 4 and len < 8) {
+        return std.mem.readInt(u32, a[0..4], .little) == std.mem.readInt(u32, b[0..4], .little) and
+            std.mem.readInt(u32, a[len - 4 ..][0..4], .little) == std.mem.readInt(u32, b[len - 4 ..][0..4], .little);
+    }
+    return std.mem.eql(u8, a, b);
 }
 
 fn parseSlice(
@@ -527,7 +609,7 @@ fn parseSlice(
                     else => {},
                 }
                 const item = try list.addOne(allocator);
-                try parseInto(allocator, source, options, seq.child, item);
+                try parseLeaf(allocator, source, options, seq.child, item);
             }
             const items = try list.toOwnedSlice(allocator);
             seq.set(out, items.ptr, list.len);
@@ -953,6 +1035,92 @@ fn expectSameParse(comptime T: type, input: []const u8, options: json.ParseOptio
 test "every document parses to the same value or error as std.json" {
     for (test_options) |options| {
         for (test_documents) |input| try expectSameParse(TestDoc, input, options);
+    }
+}
+
+const TestNames = struct {
+    a: u8 = 0,
+    ab: u8 = 0,
+    abc: u8 = 0,
+    abcd: u8 = 0,
+    abcde: u8 = 0,
+    abcdXfg: u8 = 0,
+    abcdYfg: u8 = 0,
+    abcdefgh: u8 = 0,
+    abcdefghXjklmno: u8 = 0,
+    abcdefghYjklmno: u8 = 0,
+    abcdefghijklmnopq: u8 = 0,
+    abcdefghijklmnopr: u8 = 0,
+};
+
+test "keys in any order, repeated, or unknown match std.json" {
+    // Names of every length class, pairs that differ in one middle byte, and
+    // keys out of declaration order, which the parser tries first.
+    const inputs = [_][]const u8{
+        \\{"a":1,"ab":2,"abc":3,"abcd":4,"abcde":5,"abcdXfg":6,"abcdYfg":7,"abcdefgh":8,"abcdefghXjklmno":9,"abcdefghYjklmno":10,"abcdefghijklmnopq":11,"abcdefghijklmnopr":12}
+        ,
+        \\{"abcdefghijklmnopr":12,"abcdefghijklmnopq":11,"abcdefghYjklmno":10,"abcdefghXjklmno":9,"abcdefgh":8,"abcdYfg":7,"abcdXfg":6,"abcde":5,"abcd":4,"abc":3,"ab":2,"a":1}
+        ,
+        \\{"abcdYfg":7,"a":1,"abcdefghYjklmno":10,"ab":2,"abcdXfg":6,"abcdefghijklmnopr":12}
+        ,
+        \\{"a":1,"a":2,"ab":3,"a":4}
+        ,
+        \\{"abcdXfg":1,"abcdYfg":2,"abcdXfg":3}
+        ,
+        \\{"a":1,"abcdZfg":2,"ab":3}
+        ,
+        \\{"abcdefghZjklmno":1,"abcdefghXjklmno":2}
+        ,
+        \\{"abcdefghijklmnops":1,"abcdefghijklmnopq":2}
+        ,
+        \\{"Abcd":1,"abcd":2,"abcdf":3,"b":4}
+        ,
+        \\{"abcdefghijklmnopr":1}
+        ,
+        \\{}
+        ,
+        \\{"ab\u0063":1,"abc":2}
+        ,
+    };
+    for (test_options) |options| {
+        for (inputs) |input| try expectSameParse(TestNames, input, options);
+    }
+}
+
+const TestLeaves = struct {
+    count: ?u64 = null,
+    ratio: ?f64 = null,
+    label: ?[]const u8 = null,
+    owned: []u8 = &.{},
+    color: ?TestColor = null,
+    list: []const []const u8 = &.{},
+};
+
+test "strings, numbers, and optionals parsed inline match std.json" {
+    const inputs = [_][]const u8{
+        \\{"count":7,"ratio":0.5,"label":"x","owned":"mutable","color":"blue","list":["a","b"]}
+        ,
+        \\{"count":null,"ratio":null,"label":null,"color":null}
+        ,
+        \\{"count":"7","ratio":"1e3","label":"esc\"aped\u00e9","owned":"\n"}
+        ,
+        \\{"count":-1}
+        ,
+        \\{"count":1.5}
+        ,
+        \\{"count":18446744073709551616}
+        ,
+        \\{"label":5}
+        ,
+        \\{"owned":[104,105]}
+        ,
+        \\{"color":7,"list":[]}
+        ,
+        \\{"list":["a",null]}
+        ,
+    };
+    for (test_options) |options| {
+        for (inputs) |input| try expectSameParse(TestLeaves, input, options);
     }
 }
 

@@ -387,14 +387,14 @@ describe("agent quality baseline matrix", () => {
   test("covers deferred MCP tool discovery", () => {
     const row = matrixRowById("mcp-deferred-tool-discovery");
 
-    expect(row?.expectedFirstTool.tools).toEqual(["capability_search"]);
-    expect(firstToolMatchesExpectation(row!, { name: "capability_search" })).toBe(true);
+    expect(row?.expectedFirstTool.tools).toEqual(["toolbox"]);
+    expect(firstToolMatchesExpectation(row!, { name: "toolbox" })).toBe(true);
     expect(firstToolMatchesExpectation(row!, { name: "mcp_select_tool" })).toBe(false);
     expect(forbiddenToolsUsed(row!, [
-      { name: "capability_search" },
+      { name: "toolbox" },
       { name: "web_search" },
       { name: "ask_user_question" },
     ])).toEqual(["web_search", "ask_user_question"]);
-    expect(row?.targetResult).toContain("exact-selects");
+    expect(row?.targetResult).toContain("runs it through toolbox");
   });
 });

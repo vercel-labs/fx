@@ -1,6 +1,7 @@
 const std = @import("std");
 const display_width = @import("display_width.zig");
 const text_utils = @import("text_utils.zig");
+const token_pass = @import("../gateway/token_pass.zig");
 
 const Allocator = std.mem.Allocator;
 const max_published_error_bytes: usize = 1024;
@@ -174,7 +175,37 @@ fn formatParsedHttpMessage(
     } else if (message) |message_text| {
         try out.writer.print(" · {s}", .{message_text});
     }
+    if (status_code == 403) {
+        if (message) |message_text| {
+            if (token_pass.deniedCause(message_text)) |cause| {
+                try out.writer.print(" · {s}", .{token_pass.deniedHint(cause)});
+            }
+        }
+    }
     return out.toOwnedSlice();
+}
+
+test "a Token Pass 403 names what to do next" {
+    const alloc = std.testing.allocator;
+    const used_up = try formatHttpErrorMessage(alloc, .forbidden,
+        \\{"error":{"message":"Your Vercel Token Pass credits are used up until your next billing cycle.","type":"no_providers_available"}}
+    );
+    defer alloc.free(used_up);
+    try std.testing.expect(std.mem.startsWith(u8, used_up, "API access denied · HTTP 403 · no_providers_available: Your Vercel Token Pass credits are used up until your next billing cycle. · This API key spends only Token Pass credit"));
+
+    const no_pass = try formatHttpErrorMessage(alloc, .forbidden,
+        \\{"error":{"message":"This model requires an active Vercel Token Pass.","type":"no_providers_available"}}
+    );
+    defer alloc.free(no_pass);
+    try std.testing.expect(std.mem.find(u8, no_pass, "with fx teams or /login") != null);
+    try std.testing.expect(std.mem.find(u8, no_pass, token_pass.dashboard_url) != null);
+
+    // The same text with another status is not a Token Pass denial.
+    const other_status = try formatHttpErrorMessage(alloc, .bad_request,
+        \\{"error":{"message":"Your Vercel Token Pass credits are used up until your next billing cycle.","type":"no_providers_available"}}
+    );
+    defer alloc.free(other_status);
+    try std.testing.expect(std.mem.find(u8, other_status, "spends only Token Pass") == null);
 }
 
 pub fn formatMarkedLine(alloc: Allocator, marker_prefix: []const u8, message: []const u8, cols: u16) ![]u8 {

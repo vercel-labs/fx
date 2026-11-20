@@ -1,14 +1,18 @@
 import { expect, test } from "bun:test";
+import { processAlive } from "./process-alive";
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
   appendFileSync,
   chmodSync,
+  closeSync,
   copyFileSync,
   cpSync,
   existsSync,
+  ftruncateSync,
   mkdirSync,
   mkdtempSync,
+  openSync,
   readFileSync,
   readdirSync,
   realpathSync,
@@ -35,13 +39,19 @@ import {
   TmuxSession,
   tmuxAvailable,
 } from "./tmux-helpers";
-import { childLines, childWork, compactionRecordPath, type LogLine, logLines, onlySessionId, rootSessionIds, savedSessionIds, sessionDir, storeRoot } from "./saved-sessions";
+import { ignoresFileModes } from "./file-modes";
+import { childLines, childWork, committedRootTurns, compactionRecordPath, type LogLine, logLines, onlySessionId, rootSessionIds, savedSessionIds, sessionDir, storeRoot, waitForRootTurnCommitted } from "./saved-sessions";
 
 // The session store: every `fx ask` entry and exit, the files it writes, and the faults a real disk and a real
 // crash produce: kills mid-stream and mid-tool, a torn tail, a flipped
 // byte, a second process, a read-only folder and a full disk.
 
 const TIMEOUT = 30_000;
+
+// A user that file modes do not hold back, such as root or one that holds
+// CAP_DAC_OVERRIDE, writes into a read-only folder, so the tests that need a
+// refused write skip for them.
+const fileModesIgnored = ignoresFileModes();
 
 type Fixture = { root: string; home: string; workspace: string };
 
@@ -169,6 +179,27 @@ async function waitForLog(fixture: Fixture, id: string, needle: string, timeoutM
   throw new Error(`log never contained ${needle}`);
 }
 
+/// Waits until session `id`'s log holds at least `count` `turn_committed`
+/// lines, so a test that sends several prompts knows the last one landed.
+async function waitForCommits(fixture: Fixture, id: string, count: number, timeoutMs = 10_000) {
+  const path = join(storeRoot(fixture.home), id, "log.jsonl");
+  const deadline = Date.now() + timeoutMs;
+  let seen = 0;
+  while (Date.now() < deadline) {
+    if (existsSync(path)) {
+      const text = readFileSync(path, "utf8");
+      seen = text
+        .slice(0, text.lastIndexOf("\n") + 1)
+        .split("\n")
+        .filter(Boolean)
+        .filter((line) => JSON.parse(line).kind === "turn_committed").length;
+      if (seen >= count) return;
+    }
+    await Bun.sleep(50);
+  }
+  throw new Error(`log held ${seen} turn_committed lines, not ${count}`);
+}
+
 /// Waits until the parent's log holds `children` child finishes, a commit
 /// after the last of them, and no open turn: a child's report starts a turn
 /// of its own or joins a running one, so the parent is idle only then.
@@ -185,9 +216,9 @@ async function waitForSettledChild(fixture: Fixture, id: string, children: numbe
   throw new Error(`the parent never settled after its child: ${kinds.join(",")}`);
 }
 
-function spawnAsk(fixture: Fixture, gateway: any, args: string[]) {
+function spawnAsk(fixture: Fixture, gateway: any, args: string[], cwd = fixture.workspace) {
   const child = spawn(FX_BIN, ["ask", "--json", "--auto", ...args], {
-    cwd: fixture.workspace,
+    cwd,
     env: { ...process.env, ...env(fixture, gateway) } as Record<string, string>,
     stdio: "ignore",
   });
@@ -278,6 +309,410 @@ async function ask(fixture: Fixture, gateway: any, args: string[]) {
   return result;
 }
 
+/// Runs git in the fixture's workspace with no user or system config.
+function fixtureGit(fixture: Fixture, args: string[], gitDir?: string): string {
+  const result = Bun.spawnSync(
+    ["git", "-c", "user.name=fixture", "-c", "user.email=fixture@example.invalid", ...(gitDir ? ["--git-dir", gitDir] : []), ...args],
+    { cwd: fixture.workspace, env: { HOME: fixture.home, GIT_CONFIG_NOSYSTEM: "1", PATH: process.env.PATH ?? "/usr/bin:/bin" } },
+  );
+  if (result.exitCode !== 0) throw new Error(`git ${args.join(" ")}: ${result.stderr.toString()}`);
+  return result.stdout.toString().replace(/\n+$/, "");
+}
+
+/// The `workspace_capture` items of a session's log, as their records (D98).
+function workspaceCaptures(fixture: Fixture, id: string): any[] {
+  const text = readFileSync(join(storeRoot(fixture.home), id, "log.jsonl"), "utf8");
+  return text
+    .split("\n")
+    .filter(Boolean)
+    .map((line) => JSON.parse(line))
+    .filter((line) => line.kind === "item" && line.type === "workspace_capture")
+    .map((line) => (typeof line.data === "string" ? JSON.parse(line.data) : line.data));
+}
+
+/// The one repository store under `~/.fx/captures`, beside retention's files.
+function captureStore(fixture: Fixture): string {
+  const captures = join(fixture.home, ".fx", "captures");
+  const stores = readdirSync(captures).filter((name) => /^[0-9a-f]{32}$/.test(name));
+  expect(stores.length).toBe(1);
+  return join(captures, stores[0]!, "store.git");
+}
+
+/// A workspace repository with a commit, a tracked edit, an untracked file
+/// and an untracked secret; returns its HEAD.
+function makeCaptureRepository(fixture: Fixture): string {
+  fixtureGit(fixture, ["init", "-q", "-b", "main"]);
+  writeFileSync(join(fixture.workspace, "a.txt"), "one\n");
+  fixtureGit(fixture, ["add", "a.txt"]);
+  fixtureGit(fixture, ["commit", "-q", "-m", "first"]);
+  writeFileSync(join(fixture.workspace, "a.txt"), "two\n");
+  writeFileSync(join(fixture.workspace, "new.txt"), "untracked\n");
+  writeFileSync(join(fixture.workspace, ".env"), "SECRET=1\n");
+  return fixtureGit(fixture, ["rev-parse", "HEAD"]);
+}
+
+function enableWorkspaceCapture(fixture: Fixture) {
+  mkdirSync(join(fixture.home, ".fx"), { recursive: true });
+  writeFileSync(join(fixture.home, ".fx", "settings.json"), JSON.stringify({ experimental: { workspace_capture: true } }));
+}
+
+/// Each turn left a start and an end record of the repository, the secret
+/// left out, and the end tree holding the uncommitted work in fx's store.
+function expectTurnCaptures(fixture: Fixture, id: string, head: string, turns: number) {
+  const records = workspaceCaptures(fixture, id);
+  expect(records.map((record) => record.phase)).toEqual(Array.from({ length: turns }, () => ["start", "end"]).flat());
+  for (const record of records) {
+    expect(record.status).toBe("partial");
+    expect(record.reason).toBe("sensitive");
+    expect(record.head).toBe(head);
+    expect(record.work_tree).toBe(fixture.workspace);
+  }
+  const store = captureStore(fixture);
+  const end = records.at(-1)!;
+  expect(fixtureGit(fixture, ["rev-parse", end.ref], store)).toBe(end.commit);
+  expect(fixtureGit(fixture, ["cat-file", "-p", `${end.tree}:a.txt`], store)).toBe("two");
+  expect(fixtureGit(fixture, ["ls-tree", "--name-only", end.tree], store).split("\n")).not.toContain(".env");
+}
+
+test("fx ask records the repository at each turn's start and end only with experimental.workspace_capture", async () => {
+  const fixture = createFixture("fx-v2-capture-");
+  fixtureGit(fixture, ["init", "-q", "-b", "main"]);
+  writeFileSync(join(fixture.workspace, "a.txt"), "one\n");
+  fixtureGit(fixture, ["add", "a.txt"]);
+  fixtureGit(fixture, ["commit", "-q", "-m", "first"]);
+  const head = fixtureGit(fixture, ["rev-parse", "HEAD"]);
+  writeFileSync(join(fixture.workspace, "a.txt"), "two\n");
+  writeFileSync(join(fixture.workspace, "new.txt"), "untracked\n");
+  writeFileSync(join(fixture.workspace, ".env"), "SECRET=1\n");
+  const indexBefore = readFileSync(join(fixture.workspace, ".git", "index"));
+  const refsBefore = fixtureGit(fixture, ["for-each-ref"]);
+  const gateway = startFakeGateway([fakeGatewayFinalText("CAPTURE_OFF"), fakeGatewayFinalText("CAPTURE_ON")]);
+  try {
+    // Off by default: no item and no store.
+    const off = await ask(fixture, gateway, ["Without captures."]);
+    expect(off.code).toBe(0);
+    expect(workspaceCaptures(fixture, JSON.parse(off.stdout).session_id)).toEqual([]);
+    expect(existsSync(join(fixture.home, ".fx", "captures"))).toBe(false);
+
+    writeFileSync(join(fixture.home, ".fx", "settings.json"), JSON.stringify({ experimental: { workspace_capture: true } }));
+    const on = await ask(fixture, gateway, ["With captures."]);
+    expect(on.code).toBe(0);
+    expect(on.stderr).toBe("");
+    expect(JSON.parse(on.stdout).output).toBe("CAPTURE_ON");
+    const id: string = JSON.parse(on.stdout).session_id;
+    const records = workspaceCaptures(fixture, id);
+    expect(records.map((record) => record.phase)).toEqual(["start", "end"]);
+    // The prompt reached the log before the start capture, so a kill
+    // during the capture keeps it.
+    const kinds = readFileSync(join(storeRoot(fixture.home), id, "log.jsonl"), "utf8")
+      .split("\n")
+      .filter(Boolean)
+      .map((line) => JSON.parse(line))
+      .filter((line) => line.kind === "item")
+      .map((line) => line.type);
+    expect(kinds.indexOf("user")).toBeGreaterThanOrEqual(0);
+    expect(kinds.indexOf("user")).toBeLessThan(kinds.indexOf("workspace_capture"));
+    for (const record of records) {
+      // The secret is left out and named, so the capture is partial.
+      expect(record.status).toBe("partial");
+      expect(record.reason).toBe("sensitive");
+      expect(record.head_state).toBe("commit");
+      expect(record.head).toBe(head);
+      expect(record.work_tree).toBe(fixture.workspace);
+      expect(record.excluded.by_reason.sensitive).toBe(1);
+      expect(record.excluded.sample[0].path).toBe(".env");
+    }
+    // The capture lives in fx's own store and holds the uncommitted work.
+    const store = captureStore(fixture);
+    const end = records[1]!;
+    expect(fixtureGit(fixture, ["rev-parse", end.ref], store)).toBe(end.commit);
+    expect(fixtureGit(fixture, ["cat-file", "-p", `${end.tree}:a.txt`], store)).toBe("two");
+    expect(fixtureGit(fixture, ["cat-file", "-p", `${end.tree}:new.txt`], store)).toBe("untracked");
+    expect(fixtureGit(fixture, ["ls-tree", "--name-only", end.tree], store).split("\n")).not.toContain(".env");
+    // The user's repository is untouched.
+    expect(readFileSync(join(fixture.workspace, ".git", "index")).equals(indexBefore)).toBe(true);
+    expect(fixtureGit(fixture, ["for-each-ref"])).toBe(refsBefore);
+    expect(fixtureGit(fixture, ["status", "--porcelain"]).split("\n").sort()).toEqual([" M a.txt", "?? .env", "?? new.txt"]);
+  } finally {
+    gateway.stop();
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+}, TIMEOUT);
+
+test("fx ask ignores experimental.workspace_capture in a project's .fx.json", async () => {
+  const fixture = createFixture("fx-v2-capture-project-");
+  fixtureGit(fixture, ["init", "-q", "-b", "main"]);
+  writeFileSync(join(fixture.workspace, "a.txt"), "one\n");
+  fixtureGit(fixture, ["add", "a.txt"]);
+  fixtureGit(fixture, ["commit", "-q", "-m", "first"]);
+  writeFileSync(join(fixture.workspace, "a.txt"), "two\n");
+  writeFileSync(join(fixture.workspace, ".env"), "SECRET=1\n");
+  // A project file holds committed defaults only; the profile owns this switch.
+  writeFileSync(join(fixture.workspace, ".fx.json"), JSON.stringify({ experimental: { workspace_capture: true } }));
+  const gateway = startFakeGateway([fakeGatewayFinalText("CAPTURE_PROJECT_OFF")]);
+  try {
+    const result = await ask(fixture, gateway, ["With a project setting."]);
+    expect(result.code).toBe(0);
+    expect(JSON.parse(result.stdout).output).toBe("CAPTURE_PROJECT_OFF");
+    expect(workspaceCaptures(fixture, JSON.parse(result.stdout).session_id)).toEqual([]);
+    expect(existsSync(join(fixture.home, ".fx", "captures"))).toBe(false);
+  } finally {
+    gateway.stop();
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+}, TIMEOUT);
+
+test("fx ask captures another repository a tool writes in before the write, with experimental.workspace_capture", async () => {
+  const fixture = createFixture("fx-v2-capture-reach-");
+  makeCaptureRepository(fixture);
+  enableWorkspaceCapture(fixture);
+  // A second repository outside the session's folder.
+  const other = join(fixture.root, "other");
+  mkdirSync(other, { recursive: true });
+  const otherGit = (...args: string[]) => {
+    const result = Bun.spawnSync(["git", "-c", "user.name=fixture", "-c", "user.email=fixture@example.invalid", ...args], {
+      cwd: other,
+      env: { HOME: fixture.home, GIT_CONFIG_NOSYSTEM: "1", PATH: process.env.PATH ?? "/usr/bin:/bin" },
+    });
+    if (result.exitCode !== 0) throw new Error(`git ${args.join(" ")}: ${result.stderr.toString()}`);
+    return result.stdout.toString().replace(/\n+$/, "");
+  };
+  otherGit("init", "-q", "-b", "main");
+  writeFileSync(join(other, "base.txt"), "base\n");
+  otherGit("add", "base.txt");
+  otherGit("commit", "-q", "-m", "base");
+  const target = join(other, "made.txt");
+  const gateway = startDynamicFakeGateway((body) => {
+    if (body.includes("reach-write")) return fakeGatewayFinalText("REACHED");
+    return fakeGatewayToolCall("reach-write", "write_file", { path: target, content: "made\n" });
+  }, { classifierDecision: "clear" });
+  try {
+    const result = await ask(fixture, gateway, ["Write in the other repository."]);
+    expect(result.code).toBe(0);
+    expect(JSON.parse(result.stdout).output).toContain("REACHED");
+    expect(readFileSync(target, "utf8")).toBe("made\n");
+    const records = workspaceCaptures(fixture, JSON.parse(result.stdout).session_id);
+    const otherRoot = realpathSync(other);
+    expect(records.map((record) => [record.phase, record.work_tree, record.trigger_tool])).toEqual([
+      ["start", fixture.workspace, null],
+      ["start", otherRoot, "write_file"],
+      ["end", fixture.workspace, null],
+      ["end", otherRoot, null],
+    ]);
+    // The other repository's start capture came before the write; its end
+    // capture holds the file.
+    const otherRecords = records.filter((record) => record.work_tree === otherRoot);
+    const captures = join(fixture.home, ".fx", "captures");
+    const store = readdirSync(captures)
+      .filter((name) => /^[0-9a-f]{32}$/.test(name))
+      .map((name) => join(captures, name, "store.git"))
+      .find((candidate) => Bun.spawnSync(["git", "--git-dir", candidate, "rev-parse", "-q", "--verify", otherRecords[0].ref]).exitCode === 0)!;
+    const names = (tree: string) => fixtureGit(fixture, ["ls-tree", "--name-only", tree], store).split("\n");
+    expect(names(otherRecords[0].tree)).toEqual(["base.txt"]);
+    expect(names(otherRecords[1].tree).sort()).toEqual(["base.txt", "made.txt"]);
+  } finally {
+    gateway.stop();
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+}, TIMEOUT);
+
+test("fx ask never captures a repository at the home folder that a tool writes in, with experimental.workspace_capture", async () => {
+  const fixture = createFixture("fx-v2-capture-home-");
+  makeCaptureRepository(fixture);
+  enableWorkspaceCapture(fixture);
+  // The home folder kept as a dotfiles repository.
+  const homeGit = (...args: string[]) => {
+    const result = Bun.spawnSync(["git", "-c", "user.name=fixture", "-c", "user.email=fixture@example.invalid", ...args], {
+      cwd: fixture.home,
+      env: { HOME: fixture.home, GIT_CONFIG_NOSYSTEM: "1", PATH: process.env.PATH ?? "/usr/bin:/bin" },
+    });
+    if (result.exitCode !== 0) throw new Error(`git ${args.join(" ")}: ${result.stderr.toString()}`);
+  };
+  homeGit("init", "-q", "-b", "main");
+  writeFileSync(join(fixture.home, ".profile"), "export A=1\n");
+  homeGit("add", ".profile");
+  homeGit("commit", "-q", "-m", "dotfiles");
+  const target = join(fixture.home, "notes.txt");
+  const trace = join(fixture.root, "home.trace.log");
+  const gateway = startDynamicFakeGateway((body) => {
+    if (body.includes("home-write")) return fakeGatewayFinalText("HOME_WRITTEN");
+    return fakeGatewayToolCall("home-write", "write_file", { path: target, content: "private\n" });
+  }, { classifierDecision: "clear" });
+  try {
+    const result = await runFx(["ask", "--json", "--auto", "Write a note in my home folder."], {
+      cwd: fixture.workspace,
+      env: { ...env(fixture, gateway), FX_TRACE_LOG: trace, FX_TRACE_SCOPES: "workspace" },
+      timeoutMs: TIMEOUT,
+    });
+    expect(result.code).toBe(0);
+    expect(JSON.parse(result.stdout).output).toContain("HOME_WRITTEN");
+    expect(readFileSync(target, "utf8")).toBe("private\n");
+    const records = workspaceCaptures(fixture, JSON.parse(result.stdout).session_id);
+    expect(records.map((record) => [record.phase, record.work_tree])).toEqual([
+      ["start", fixture.workspace],
+      ["end", fixture.workspace],
+    ]);
+    expect(readFileSync(trace, "utf8")).toMatch(/event=workspace_capture_reach_skipped session=\S+ tool=write_file reason=private_root/);
+  } finally {
+    gateway.stop();
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+}, TIMEOUT);
+
+test("fx ask never captures a home folder kept as a repository when the session works inside it, with experimental.workspace_capture", async () => {
+  const fixture = createFixture("fx-v2-capture-private-");
+  enableWorkspaceCapture(fixture);
+  // The home folder kept as a dotfiles repository, with a secret beside the
+  // dotfiles and fx's own profile in it.
+  const homeGit = (...args: string[]) => {
+    const result = Bun.spawnSync(["git", "-c", "user.name=fixture", "-c", "user.email=fixture@example.invalid", ...args], {
+      cwd: fixture.home,
+      env: { HOME: fixture.home, GIT_CONFIG_NOSYSTEM: "1", PATH: process.env.PATH ?? "/usr/bin:/bin" },
+    });
+    if (result.exitCode !== 0) throw new Error(`git ${args.join(" ")}: ${result.stderr.toString()}`);
+  };
+  homeGit("init", "-q", "-b", "main");
+  writeFileSync(join(fixture.home, ".profile"), "export A=1\n");
+  homeGit("add", ".profile");
+  homeGit("commit", "-q", "-m", "dotfiles");
+  mkdirSync(join(fixture.home, ".ssh"));
+  writeFileSync(join(fixture.home, ".ssh", "config"), "Host private-marker\n");
+  const notes = join(fixture.home, "notes");
+  mkdirSync(notes);
+  const trace = join(fixture.root, "private.trace.log");
+  const gateway = startFakeGateway([fakeGatewayFinalText("PRIVATE_HOME")]);
+  try {
+    const result = await runFx(["ask", "--json", "--auto", "Work in my notes."], {
+      cwd: notes,
+      env: { ...env(fixture, gateway), FX_TRACE_LOG: trace, FX_TRACE_SCOPES: "workspace" },
+      timeoutMs: TIMEOUT,
+    });
+    expect(result.code).toBe(0);
+    expect(JSON.parse(result.stdout).output).toContain("PRIVATE_HOME");
+    const records = workspaceCaptures(fixture, JSON.parse(result.stdout).session_id);
+    // Both phases are recorded as unavailable, and no tree is taken.
+    expect(records.map((record) => [record.phase, record.status, record.reason, record.tree ?? null])).toEqual([
+      ["start", "unavailable", "private_root", null],
+      ["end", "unavailable", "private_root", null],
+    ]);
+    const captures = join(fixture.home, ".fx", "captures");
+    const stores = existsSync(captures) ? readdirSync(captures).filter((name) => /^[0-9a-f]{32}$/.test(name)) : [];
+    expect(stores).toEqual([]);
+    expect(readFileSync(trace, "utf8")).toMatch(/event=workspace_capture_private session=\S+ reason=private_root/);
+  } finally {
+    gateway.stop();
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+}, TIMEOUT);
+
+test("fx ask leaves fx's profile folder out of a captured repository that holds it, with experimental.workspace_capture", async () => {
+  const fixture = createFixture("fx-v2-capture-profile-");
+  const head = makeCaptureRepository(fixture);
+  // fx's folder, `$FX_HOME`, inside the captured repository, holding the
+  // session's log with the prompt and the capture store itself.
+  const profile = join(fixture.workspace, ".fxprofile");
+  mkdirSync(profile, { recursive: true });
+  writeFileSync(join(profile, "settings.json"), JSON.stringify({ experimental: { workspace_capture: true } }));
+  const gateway = startFakeGateway([fakeGatewayFinalText("PROFILE_INSIDE")]);
+  try {
+    const result = await runFx(["ask", "--json", "--auto", "Profile marker prompt."], {
+      cwd: fixture.workspace,
+      env: { ...env(fixture, gateway), FX_HOME: profile },
+      timeoutMs: TIMEOUT,
+    });
+    expect(result.code).toBe(0);
+    const id: string = JSON.parse(result.stdout).session_id;
+    const log = readFileSync(join(profile, "sessions", "v2", id, "log.jsonl"), "utf8");
+    const records = log
+      .split("\n")
+      .filter(Boolean)
+      .map((line) => JSON.parse(line))
+      .filter((line) => line.kind === "item" && line.type === "workspace_capture")
+      .map((line) => (typeof line.data === "string" ? JSON.parse(line.data) : line.data));
+    expect(records.map((record) => [record.phase, record.status, record.reason])).toEqual([
+      ["start", "partial", "sensitive"],
+      ["end", "partial", "sensitive"],
+    ]);
+    const captures = join(profile, "captures");
+    const stores = readdirSync(captures).filter((name) => /^[0-9a-f]{32}$/.test(name));
+    expect(stores.length).toBe(1);
+    const store = join(captures, stores[0]!, "store.git");
+    const end = records[1]!;
+    expect(end.head).toBe(head);
+    const files = fixtureGit(fixture, ["ls-tree", "-r", "--name-only", end.tree], store).split("\n");
+    // The repository's own work is there; nothing of the profile is.
+    expect(files).toContain("a.txt");
+    expect(files).toContain("new.txt");
+    expect(files.filter((name) => name.startsWith(".fxprofile"))).toEqual([]);
+    // Only the untracked .env is excluded: the profile folder is never
+    // listed, so its files add no exclusions however many captures it holds.
+    expect(end.excluded.by_reason.sensitive).toBe(1);
+  } finally {
+    gateway.stop();
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+}, TIMEOUT);
+
+test("fx ask records a budget refusal and writes nothing while the captures folder is over its budget", async () => {
+  const fixture = createFixture("fx-v2-capture-budget-");
+  makeCaptureRepository(fixture);
+  enableWorkspaceCapture(fixture);
+  const gateway = startFakeGateway([fakeGatewayFinalText("WITHIN_BUDGET"), fakeGatewayFinalText("OVER_BUDGET")]);
+  try {
+    const first = await ask(fixture, gateway, ["Within the budget."]);
+    expect(first.code).toBe(0);
+    const firstRecords = workspaceCaptures(fixture, JSON.parse(first.stdout).session_id);
+    expect(firstRecords.map((record) => record.status)).toEqual(["partial", "partial"]);
+    const captures = join(fixture.home, ".fx", "captures");
+    const store = captureStore(fixture);
+    const refsBefore = fixtureGit(fixture, ["for-each-ref"], store);
+
+    // A sparse file beside the stores counts at its full size and takes no
+    // disk, so the profile is 6 GiB, over its 5 GiB budget. The start
+    // capture is refused at once and starts maintenance in the background;
+    // the end capture is refused while it runs or, once it has run, because
+    // the profile is still over.
+    const ballast = openSync(join(captures, "ballast"), "w");
+    ftruncateSync(ballast, 6 * 1024 ** 3);
+    closeSync(ballast);
+    const trace = join(fixture.root, "budget.trace.log");
+    const over = await runFx(["ask", "--json", "--auto", "Over the budget."], {
+      cwd: fixture.workspace,
+      env: { ...env(fixture, gateway), FX_TRACE_LOG: trace, FX_TRACE_SCOPES: "workspace" },
+      timeoutMs: TIMEOUT,
+    });
+    expect(over.code).toBe(0);
+    expect(over.stderr).toBe("");
+    expect(JSON.parse(over.stdout).output).toBe("OVER_BUDGET");
+    const records = workspaceCaptures(fixture, JSON.parse(over.stdout).session_id);
+    expect(records.map((record) => [record.phase, record.status, record.reason])).toEqual([
+      ["start", "unavailable", "budget"],
+      ["end", "unavailable", "budget"],
+    ]);
+    const traced = readFileSync(trace, "utf8");
+    expect(traced).toMatch(/event=workspace_capture_maintenance session=\S+ maintenance=started refusal=over_budget/);
+    // Maintenance evicts the earlier session, which is neither current nor
+    // open, in the background; fx ask lets it finish before it exits.
+    expect(refsBefore).not.toBe("");
+    const journalPath = join(captures, "evictions.jsonl");
+    const journalPhases = () =>
+      existsSync(journalPath)
+        ? readFileSync(journalPath, "utf8")
+            .trim()
+            .split("\n")
+            .filter(Boolean)
+            .map((line) => JSON.parse(line).phase)
+        : [];
+    for (let waited = 0; waited < 10_000 && journalPhases().length < 2; waited += 50) await Bun.sleep(50);
+    expect(journalPhases()).toEqual(["intent", "done"]);
+    expect(fixtureGit(fixture, ["for-each-ref"], store)).toBe("");
+    expect(traced).toMatch(/event=workspace_capture_maintenance_done admit=false refusal=over_budget used=\d+ maintained=true evicted=1/);
+  } finally {
+    gateway.stop();
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+}, TIMEOUT);
+
 test("fx ask saves to v2, resumes by id and by last, and never writes v1", async () => {
   const fixture = createFixture("fx-v2-ask-");
   const gateway = startFakeGateway([
@@ -294,12 +729,14 @@ test("fx ask saves to v2, resumes by id and by last, and never writes v1", async
     const id: string = first.session_id;
     expect(id.length).toBeGreaterThan(0);
     // The first turn saves the runtime context it captured right after its
-    // user message (D94).
+    // user message (D94), then the model call that answered it, at the
+    // start of its only step (D96).
     expect(shape(logLines(fixture.home, id))).toEqual([
       "session_created",
       "turn_started",
       "item:user",
       "item:runtime_context",
+      "item:model_call",
       "item:assistant",
       "item:turn_end",
       "turn_committed",
@@ -852,6 +1289,96 @@ test("a flipped byte inside the log stops resume and leaves the file as it was",
   }
 }, TIMEOUT * 3);
 
+test.skipIf(!tmuxAvailable())("a flipped byte in a turn the newest compaction kept stops resume and ACP load as damage, and recover still salvages it", async () => {
+  const fixture = createFixture("fx-v2-kept-flip-");
+  // Compaction's requests carry the whole conversation, so they get the
+  // newest turn's answer.
+  const gateway = replyToLatest([
+    ["Kept flip first request.", "KEPT_FLIP_FIRST"],
+    ["Kept flip second request.", "KEPT_FLIP_SECOND"],
+    ["Kept flip third request.", "KEPT_FLIP_THIRD"],
+    ["Kept flip after the recovery.", "KEPT_FLIP_RECOVERED"],
+  ]);
+  let client: AcpRpc | undefined;
+  try {
+    const app = await startApp(fixture, gateway, []);
+    for (const [prompt, answer] of [
+      ["Kept flip first request.", "KEPT_FLIP_FIRST"],
+      ["Kept flip second request.", "KEPT_FLIP_SECOND"],
+      ["Kept flip third request.", "KEPT_FLIP_THIRD"],
+    ]) {
+      await app.session.sendText(prompt!);
+      await scrollbackContains(app.session, answer!);
+      await app.session.waitForComposer(TIMEOUT);
+    }
+    const id = onlySessionId(fixture.home);
+    await app.session.sendText("/compact");
+    await waitForLog(fixture, id, '"kind":"compacted"', TIMEOUT);
+    await app.session.waitForPane((pane) => !/Compacting|Stopping compaction/.test(pane), TIMEOUT);
+    await app.session.waitForComposer(TIMEOUT);
+    await quitApp(app);
+
+    // The compaction kept turns, so a resume reads back from it to the start
+    // of the oldest one. One byte of that turn's prompt changes.
+    const lines = logLines(fixture.home, id) as any[];
+    const compaction = lines.findLast((line) => line.kind === "compacted");
+    const data = typeof compaction.data === "string" ? JSON.parse(compaction.data) : compaction.data;
+    const kept = data.keep_from_turn;
+    expect(typeof kept).toBe("number");
+    const path = join(storeRoot(fixture.home), id, "log.jsonl");
+    const raw = readFileSync(path, "utf8").split("\n");
+    const at = raw.findIndex((line) => {
+      if (!line) return false;
+      const parsed = JSON.parse(line);
+      return parsed.kind === "item" && parsed.type === "user" && parsed.turn === kept;
+    });
+    expect(at).toBeGreaterThan(0);
+    raw[at] = raw[at]!.replace("request.", "requast.");
+    const damaged = raw.join("\n");
+    writeFileSync(path, damaged);
+    const requests = gateway.requests.length;
+
+    // fx ask refuses it as a damaged session.
+    const asked = await ask(fixture, gateway, ["--resume", id, "Kept flip after the damage."]);
+    expect(asked.code).toBe(1);
+    expect(asked.stdout + asked.stderr).toContain("InvalidSessionFormat");
+
+    // The interactive app says what to do.
+    const resumed = await startApp(fixture, gateway, ["--resume", id], false);
+    // The pane's wrapper records fx's exit status as fx exits; tmux can end
+    // the session many seconds later.
+    await until(() => resumed.session.recordedExitStatus() !== null, "the app to exit");
+    await resumed.session.kill();
+    expect(readFileSync(resumed.stderrPath, "utf8")).toBe(
+      "fx: saved session is unreadable. Run `fx doctor`; if it is recoverable, use `fx session recover <id>`.\n",
+    );
+
+    // An ACP client hears the session couldn't be loaded, not that it is missing.
+    client = await AcpRpc.start(fixture, gateway);
+    const loaded = await client.request("session/load", { sessionId: id, cwd: fixture.workspace, mcpServers: [] });
+    expect(loaded.error?.message).toBe("Session could not be loaded");
+    expect(await client.close()).toBe(0);
+    client = undefined;
+
+    // Nothing was sent, and the damaged lines are left for recovery.
+    expect(gateway.requests.length).toBe(requests);
+    expect(readFileSync(path, "utf8").startsWith(damaged)).toBe(true);
+
+    // fx session recover still copies the good turns, and the copy resumes.
+    const result = await command(fixture, gateway, ["session", "recover", id, "--json"]);
+    expect(result.code).toBe(0);
+    const copy: string = JSON.parse(result.stdout).recovered_id;
+    expect(copy).not.toBe(id);
+    const after = await ask(fixture, gateway, ["--resume", copy, "Kept flip after the recovery."]);
+    expect(after.code).toBe(0);
+    expect(JSON.parse(after.stdout).output).toBe("KEPT_FLIP_RECOVERED");
+  } finally {
+    if (client) await client.kill();
+    gateway.stop();
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+}, TIMEOUT * 4);
+
 test("a blob that went missing stops resume as damage, not as a missing session", async () => {
   const fixture = createFixture("fx-v2-lost-blob-");
   const big = "LOST_BLOB_START " + "blob-body ".repeat(30_000) + "LOST_BLOB_END";
@@ -910,7 +1437,7 @@ test("a second process on an open session is refused and writes nothing", async 
   }
 }, TIMEOUT * 3);
 
-test("a read-only session folder fails cleanly and resumes once writable", async () => {
+test.skipIf(fileModesIgnored)("a read-only session folder fails cleanly and resumes once writable", async () => {
   const fixture = createFixture("fx-v2-readonly-");
   const gateway = startFakeGateway([
     fakeGatewayFinalText("BEFORE_READ_ONLY"),
@@ -1267,6 +1794,37 @@ function keepRunForOfflineCheck(fixture: Fixture, name: string, traces: string[]
   if (existsSync(storeRoot(fixture.home))) cpSync(storeRoot(fixture.home), join(kept, "sessions"), { recursive: true });
 }
 
+/// The line above the command that reopens a fork's source.
+const FORK_RESUME_LABEL = "Resume the original session with:";
+
+/// The pane once the fork notice has settled at its end: the label, the
+/// command alone on the next line, and a blank row above the composer, which
+/// holds `prompt`. A long replay draws in steps, so earlier frames can lack
+/// the blank row.
+async function waitForForkNotice(session: TmuxSession, source: string, prompt: string) {
+  return session.waitForPane((pane) => {
+    const lines = pane.split("\n");
+    const label = lines.lastIndexOf(FORK_RESUME_LABEL);
+    return label >= 0 && lines[label + 1] === `fx --resume ${source}` && lines[label + 2] === "" && composerContains(pane, prompt);
+  }, TIMEOUT);
+}
+
+/// Checks that the fork notice follows the replayed turns, the newest of
+/// which holds `lastReplayed`: the notice names the fork, then the label,
+/// then the command alone on its line, so selecting that line copies it.
+function expectForkNoticeAfterReplay(lines: string[], lastReplayed: string, title: string, source: string) {
+  const replayed = lines.findLastIndex((line) => line.includes(lastReplayed));
+  const notice = lines.lastIndexOf(`* session forked: ${title}`);
+  const label = lines.lastIndexOf(FORK_RESUME_LABEL);
+  expect(replayed).toBeGreaterThanOrEqual(0);
+  expect(notice).toBeGreaterThan(replayed);
+  expect(label).toBeGreaterThan(notice);
+  expect(lines[label + 1]).toBe(`fx --resume ${source}`);
+  // A blank row keeps the command off the input box below it.
+  expect(lines[label + 2]).toBe("");
+  expect(lines.some((line) => line.includes("original session fx --resume"))).toBe(false);
+}
+
 /// The fork menu's rows below the composer, each with whether it is selected.
 async function forkMenuRows(session: TmuxSession) {
   const lines = (await session.capturePaneEscapes()).split("\n");
@@ -1314,7 +1872,8 @@ test.skipIf(!tmuxAvailable())(forkTest, async () => {
     expect((await forkMenuRows(app.session)).map((row) => row.selected)).toEqual([false, true, false]);
     await app.session.sendKeys("Enter");
 
-    expect(await scrollbackContains(app.session, `original session fx --resume ${source}`)).toContain("* session forked: Fork source (fork)");
+    await waitForForkNotice(app.session, source, "Fork prompt two.");
+    expectForkNoticeAfterReplay((await app.session.captureFullScrollback()).split("\n"), "FORK_ONE", "Fork source (fork)", source);
     await app.session.waitForPane((pane) => composerContains(pane, "Fork prompt two.") && !pane.includes("enter fork"), TIMEOUT);
     const ids = savedSessionIds(fixture.home);
     expect(ids.length).toBe(2);
@@ -1335,6 +1894,10 @@ test.skipIf(!tmuxAvailable())(forkTest, async () => {
     await app.session.sendKeys("C-u");
     await app.session.sendText("A new second prompt in the fork.");
     await app.session.waitForText("FORK_NEW_SECOND", TIMEOUT);
+    // The next prompt follows the notice with one blank row between them.
+    const continued = (await app.session.captureFullScrollback()).split("\n");
+    const label = continued.lastIndexOf(FORK_RESUME_LABEL);
+    expect(continued.slice(label, label + 4)).toEqual([FORK_RESUME_LABEL, `fx --resume ${source}`, "", "┃ A new second prompt in the fork."]);
     await quitApp(app);
     expect(readFileSync(join(storeRoot(fixture.home), fork, "log.jsonl"), "utf8")).toContain("A new second prompt in the fork.");
     expect(readFileSync(sourcePath).equals(sourceAfterFork)).toBe(true);
@@ -1343,6 +1906,817 @@ test.skipIf(!tmuxAvailable())(forkTest, async () => {
     expectNoV1Sessions(fixture);
   } finally {
     keepRunForOfflineCheck(fixture, forkTest, [trace]);
+    gateway.stop();
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+}, TIMEOUT * 4);
+
+const forkBusyChildTest = "/fork switches to the fork while a subagent of the source is still working";
+test.skipIf(!tmuxAvailable())(forkBusyChildTest, async () => {
+  const fixture = createFixture("fx-v2-app-fork-busy-child-");
+  const trace = join(fixture.root, "fork-busy.trace.log");
+  const typed = ["Fork busy prompt one.", "Fork busy prompt two."];
+  const releases: Array<() => void> = [];
+  let childHeld = false;
+  const gateway = startDynamicFakeGateway((body) => {
+    // The subagent's request waits until the test ends, so it still works
+    // when the fork switches away from its parent.
+    if (isAppChildRequest(body, typed)) {
+      childHeld = true;
+      return new Promise<Response>((resolve) => releases.push(() => resolve(fakeGatewayFinalText("BUSY_CHILD_DONE"))));
+    }
+    if (isReportTurn(body)) return fakeGatewayFinalText("BUSY_PARENT_REPORTED");
+    if (body.includes("busy-delegate")) return fakeGatewayFinalText("BUSY_PARENT_SENT");
+    if (body.includes("Fork busy prompt two.")) {
+      return fakeGatewayToolCall("busy-delegate", "subagent", { request: { action: "message", agent: "sleeper", message: "Keep working on BUSY_TASK." } });
+    }
+    if (body.includes("Fork busy prompt one.")) return fakeGatewayFinalText("BUSY_ONE");
+    return fakeGatewayFinalText("UNEXPECTED_REQUEST");
+  }, { classifierDecision: "clear" });
+  let app: { session: TmuxSession; stderrPath: string } | undefined;
+  try {
+    app = await startApp(fixture, gateway, [], true, { FX_PERMISSION_MODE: "full-access", FX_TRACE: "1", FX_TRACE_LOG: trace });
+    await app.session.sendText("Fork busy prompt one.");
+    await app.session.waitForText("BUSY_ONE", TIMEOUT);
+    await app.session.waitForStableComposer();
+    await app.session.sendText("Fork busy prompt two.");
+    await scrollbackContains(app.session, "BUSY_PARENT_SENT");
+    await app.session.waitForPane(() => childHeld, TIMEOUT);
+    await app.session.waitForStableComposer();
+    const source = rootSessionIds(fixture.home)[0]!;
+
+    await app.session.sendText("/fork");
+    await app.session.waitForPane((pane) => pane.includes("enter fork"), TIMEOUT);
+    await app.session.sendKeys("Enter");
+    try {
+      await waitForForkNotice(app.session, source, "Fork busy prompt two.");
+    } catch (error) {
+      console.log(`<timeout> the fork never switched while the subagent worked; screen:\n${await app.session.capturePane()}`);
+      console.log(`trace tail:\n${existsSync(trace) ? readFileSync(trace, "utf8").split("\n").slice(-12).join("\n") : "(no trace)"}`);
+      throw error;
+    }
+  } finally {
+    for (const release of releases) release();
+    await app?.session.kill();
+    gateway.stop();
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+}, TIMEOUT * 4);
+
+/// Starts the app on a session whose subagent's request never answers, for
+/// `switchAway` to leave while the subagent still works. `after` is typed in
+/// the session the switch opens, and its answer shows the app still runs.
+async function switchAwayFromBusyChild(prefix: string, setup: string[], switchAway: (session: TmuxSession) => Promise<void>) {
+  const fixture = createFixture(prefix);
+  const after = "Busy sibling prompt after the switch.";
+  const typed = [...setup, "Busy sibling prompt delegate.", after];
+  const releases: Array<() => void> = [];
+  let childHeld = false;
+  const gateway = startDynamicFakeGateway((body) => {
+    if (isAppChildRequest(body, typed)) {
+      childHeld = true;
+      return new Promise<Response>((resolve) => releases.push(() => resolve(fakeGatewayFinalText("BUSY_CHILD_DONE"))));
+    }
+    if (isReportTurn(body)) return fakeGatewayFinalText("BUSY_PARENT_REPORTED");
+    if (body.includes(after)) return fakeGatewayFinalText("BUSY_AFTER_SWITCH");
+    if (body.includes("busy-sibling-delegate")) return fakeGatewayFinalText("BUSY_SIBLING_SENT");
+    if (body.includes("Busy sibling prompt delegate.")) {
+      return fakeGatewayToolCall("busy-sibling-delegate", "subagent", { request: { action: "message", agent: "sleeper", message: "Keep working on BUSY_TASK." } });
+    }
+    return fakeGatewayFinalText("BUSY_SETUP_ANSWER");
+  }, { classifierDecision: "clear" });
+  let app: { session: TmuxSession; stderrPath: string } | undefined;
+  try {
+    app = await startApp(fixture, gateway, [], true, { FX_PERMISSION_MODE: "full-access" });
+    for (const line of setup) {
+      await app.session.sendText(line);
+      await app.session.waitForStableComposer();
+    }
+    await app.session.sendText("Busy sibling prompt delegate.");
+    await scrollbackContains(app.session, "BUSY_SIBLING_SENT");
+    await app.session.waitForPane(() => childHeld, TIMEOUT);
+    await app.session.waitForStableComposer();
+    await switchAway(app.session);
+    await app.session.sendKeys("C-u");
+    await app.session.sendText(after);
+    try {
+      await scrollbackContains(app.session, "BUSY_AFTER_SWITCH");
+    } catch (error) {
+      console.log(`<timeout> the switch never finished while the subagent worked; screen:\n${await app.session.capturePane()}`);
+      throw error;
+    }
+  } finally {
+    for (const release of releases) release();
+    await app?.session.kill();
+    gateway.stop();
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+}
+
+test.skipIf(!tmuxAvailable())("/new starts a fresh session while a subagent of the old one is still working", async () => {
+  await switchAwayFromBusyChild("fx-v2-app-new-busy-child-", ["Busy sibling prompt one."], async (session) => {
+    await session.sendText("/new");
+  });
+}, TIMEOUT * 4);
+
+test.skipIf(!tmuxAvailable())("/resume opens another session while a subagent of the current one is still working", async () => {
+  await switchAwayFromBusyChild("fx-v2-app-resume-busy-child-", ["Busy sibling prompt one.", "/rename Busy resume target", "/new"], async (session) => {
+    await session.sendText("/resume");
+    await session.waitForPane((pane) => pane.includes("Busy resume target") && pane.includes("enter resume"), TIMEOUT);
+    await session.sendLiteralText("Busy resume");
+    await session.waitForPane((pane) => pane.includes("Busy resume target"), TIMEOUT);
+    await session.sendKeys("Enter");
+  });
+}, TIMEOUT * 4);
+
+/// The newest shell session id a request body names, from the shell tool's
+/// result of a command that was still running.
+function lastShellSessionId(body: string) {
+  return body.match(/shell-\d+/g)?.at(-1);
+}
+
+function processRunning(pattern: string) {
+  return Bun.spawnSync(["pgrep", "-f", pattern]).exitCode === 0;
+}
+
+test.skipIf(!tmuxAvailable())("/fork stops a subagent waiting on a long shell command and ends that command", async () => {
+  const fixture = createFixture("fx-v2-app-fork-shell-child-");
+  const command = "sleep 613";
+  const typed = ["Fork shell prompt one.", "Fork shell prompt two."];
+  let interactSent = false;
+  const gateway = startDynamicFakeGateway((body) => {
+    if (isAppChildRequest(body, typed)) {
+      if (body.includes("child-interact")) return fakeGatewayFinalText("SHELL_CHILD_DONE");
+      const session = body.includes("child-run") ? lastShellSessionId(body) : undefined;
+      if (session) {
+        interactSent = true;
+        return fakeGatewayToolCall("child-interact", "shell", { request: { action: "interact", session_id: session, yield_time_ms: 300_000 } });
+      }
+      return fakeShellRun("child-run", command, { yield_time_ms: 500 });
+    }
+    if (isReportTurn(body)) return fakeGatewayFinalText("SHELL_PARENT_REPORTED");
+    if (body.includes("shell-delegate")) return fakeGatewayFinalText("SHELL_PARENT_SENT");
+    if (body.includes("Fork shell prompt two.")) {
+      return fakeGatewayToolCall("shell-delegate", "subagent", { request: { action: "message", agent: "waiter", message: "Run the long command and wait for it." } });
+    }
+    if (body.includes("Fork shell prompt one.")) return fakeGatewayFinalText("SHELL_ONE");
+    return fakeGatewayFinalText("UNEXPECTED_REQUEST");
+  }, { classifierDecision: "clear" });
+  let app: { session: TmuxSession; stderrPath: string } | undefined;
+  try {
+    app = await startApp(fixture, gateway, [], true, { FX_PERMISSION_MODE: "full-access" });
+    await app.session.sendText("Fork shell prompt one.");
+    await app.session.waitForText("SHELL_ONE", TIMEOUT);
+    await app.session.waitForStableComposer();
+    await app.session.sendText("Fork shell prompt two.");
+    await scrollbackContains(app.session, "SHELL_PARENT_SENT");
+    await app.session.waitForPane(() => interactSent && processRunning(command), TIMEOUT);
+    // Paces the switch so the interact call is inside its wait.
+    await Bun.sleep(1000);
+    await app.session.waitForStableComposer();
+    const source = rootSessionIds(fixture.home)[0]!;
+
+    await app.session.sendText("/fork");
+    await app.session.waitForPane((pane) => pane.includes("enter fork"), TIMEOUT);
+    const started = Date.now();
+    await app.session.sendKeys("Enter");
+    try {
+      await app.session.waitForPane((pane) => {
+        const lines = pane.split("\n");
+        const label = lines.lastIndexOf(FORK_RESUME_LABEL);
+        return label >= 0 && lines[label + 1] === `fx --resume ${source}` && composerContains(pane, "Fork shell prompt two.");
+      }, 10_000);
+    } catch (error) {
+      console.log(`<timeout> the fork did not switch within 10 s while the subagent waited on its shell; screen:\n${await app.session.capturePane()}`);
+      throw error;
+    }
+    console.log(`METRIC switch_ms=${Date.now() - started}`);
+    await app.session.waitForPane(() => !processRunning(command), 10_000);
+  } finally {
+    await app?.session.kill();
+    Bun.spawnSync(["pkill", "-f", command]);
+    gateway.stop();
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+}, TIMEOUT * 4);
+
+test.skipIf(!tmuxAvailable())("a fork that stopped a working subagent leaves its source closed, resumable, and with no report turn", async () => {
+  const fixture = createFixture("fx-v2-app-fork-stopped-child-");
+  const typed = ["Fork stop prompt one.", "Fork stop prompt two.", "Back in the stopped source."];
+  const releases: Array<() => void> = [];
+  let childHeld = false;
+  let reportTurns = 0;
+  const gateway = startDynamicFakeGateway((body) => {
+    if (isAppChildRequest(body, typed)) {
+      childHeld = true;
+      return new Promise<Response>((resolve) => releases.push(() => resolve(fakeGatewayFinalText("STOP_CHILD_DONE"))));
+    }
+    if (isReportTurn(body)) {
+      reportTurns += 1;
+      return fakeGatewayFinalText("STOP_PARENT_REPORTED");
+    }
+    if (body.includes("Back in the stopped source.")) return fakeGatewayFinalText("STOP_SOURCE_ANSWER");
+    if (body.includes("stop-delegate")) return fakeGatewayFinalText("STOP_PARENT_SENT");
+    if (body.includes("Fork stop prompt two.")) {
+      return fakeGatewayToolCall("stop-delegate", "subagent", { request: { action: "message", agent: "sleeper", message: "Keep working on STOP_TASK." } });
+    }
+    if (body.includes("Fork stop prompt one.")) return fakeGatewayFinalText("STOP_ONE");
+    return fakeGatewayFinalText("UNEXPECTED_REQUEST");
+  }, { classifierDecision: "clear" });
+  let app: { session: TmuxSession; stderrPath: string } | undefined;
+  try {
+    app = await startApp(fixture, gateway, [], true, { FX_PERMISSION_MODE: "full-access" });
+    await app.session.sendText("Fork stop prompt one.");
+    await app.session.waitForText("STOP_ONE", TIMEOUT);
+    await app.session.waitForStableComposer();
+    await app.session.sendText("Fork stop prompt two.");
+    await scrollbackContains(app.session, "STOP_PARENT_SENT");
+    await app.session.waitForPane(() => childHeld, TIMEOUT);
+    await app.session.waitForStableComposer();
+    const source = rootSessionIds(fixture.home)[0]!;
+
+    await app.session.sendText("/fork");
+    await app.session.waitForPane((pane) => pane.includes("enter fork"), TIMEOUT);
+    await app.session.sendKeys("Enter");
+    try {
+      await waitForForkNotice(app.session, source, "Fork stop prompt two.");
+    } catch (error) {
+      console.log(`<timeout> the fork never switched while the subagent worked; screen:\n${await app.session.capturePane()}`);
+      throw error;
+    }
+    // The fork put the prompt back in the input box.
+    await app.session.sendKeys("C-u");
+    await quitApp(app);
+    app = undefined;
+
+    // The stopped work ends cancelled, and the source ends with its close.
+    const finishes = childLines(fixture.home, source).filter((line) => line.kind === "child_finished");
+    expect(finishes.map((line) => line.outcome)).toEqual(["cancelled"]);
+    expect(logLines(fixture.home, source).at(-1)!.kind).toBe("closed");
+
+    // The source resumes, answers, and starts no report turn.
+    app = await startApp(fixture, gateway, ["--resume", source]);
+    expect(await scrollbackContains(app.session, "STOP_PARENT_SENT")).toContain("STOP_PARENT_SENT");
+    await app.session.sendText("Back in the stopped source.");
+    await scrollbackContains(app.session, "STOP_SOURCE_ANSWER");
+    await app.session.waitForStableComposer();
+    await quitApp(app);
+    app = undefined;
+    expect(reportTurns).toBe(0);
+  } finally {
+    for (const release of releases) release();
+    await app?.session.kill();
+    gateway.stop();
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+}, TIMEOUT * 6);
+
+/// The newest message of a request.
+function lastMessage(body: string): any {
+  return (JSON.parse(body).prompt ?? []).at(-1);
+}
+
+/// The call a request answers, when its newest message is a tool result.
+function answeredCall(body: string): string | undefined {
+  const last = lastMessage(body);
+  if (last?.role !== "tool") return undefined;
+  return (last.content ?? []).find((part: any) => part.type === "tool-result")?.toolCallId;
+}
+
+/** `text` without the runtime context updates fx adds to the end of a user
+ * message, such as main's list of subagents, which quotes each one's task. */
+function withoutContextUpdates(text: string): string {
+  return text.replace(/\s*<fx-context-update>[\s\S]*?<\/fx-context-update>/g, "");
+}
+
+/// The text of a request's newest user message, without the runtime context
+/// updates fx adds.
+function latestUserText(body: string): string {
+  const latest = (JSON.parse(body).prompt ?? []).filter((item: any) => item.role === "user").at(-1)?.content ?? "";
+  return withoutContextUpdates(typeof latest === "string" ? latest : JSON.stringify(latest));
+}
+
+function delegate(call: string, agent: string, message: string) {
+  return fakeGatewayToolCall(call, "subagent", { request: { action: "message", agent, message } });
+}
+
+/// The fork menu's selected row, the first line of the selected prompt.
+async function forkMenuSelected(session: TmuxSession) {
+  const lines = (await session.capturePaneEscapes()).split("\n");
+  const plain = lines.map((line) => line.replace(/\x1b\[[0-9;]*m/g, ""));
+  const composer = plain.findLastIndex(isComposerLine);
+  for (let index = composer + 1; index < lines.length; index += 1) {
+    if (lines[index]!.includes("\x1b[1m")) return plain[index]!.trim();
+  }
+  return "";
+}
+
+/// Moves the fork menu up to the prompt that starts with `prefix`.
+async function selectForkPrompt(session: TmuxSession, prefix: string) {
+  for (let moves = 0; moves < 30; moves += 1) {
+    const selected = await forkMenuSelected(session);
+    if (selected.startsWith(prefix)) return;
+    await session.sendKeys("Up");
+    const deadline = Date.now() + 5_000;
+    while (Date.now() < deadline && (await forkMenuSelected(session)) === selected) await Bun.sleep(25);
+  }
+  throw new Error(`the fork menu never selected ${prefix}`);
+}
+
+const FORK_QUESTION = /Bring (\d+) subagents? into the fork\?/;
+const FORK_QUESTION_HINT = "enter yes     n or esc no";
+
+/// The child lines a session wrote itself: a fork's copied lines name its
+/// source's children.
+function ownChildLines(home: string, id: string) {
+  const lines = logLines(home, id) as any[];
+  const after = lines[0]?.forked_from?.seq ?? 0;
+  return childLines(home, id).filter((line) => line.seq > after);
+}
+
+/// Each saved session's log bytes, by id.
+function logBytes(fixture: Fixture) {
+  return new Map(savedSessionIds(fixture.home).map((id) => [id, readFileSync(join(storeRoot(fixture.home), id, "log.jsonl"))]));
+}
+
+test.skipIf(!tmuxAvailable())("a switch stops only a working subagent's task: back in its chat it is listed and takes new work with its old history", async () => {
+  const fixture = createFixture("fx-v2-app-switch-keeps-child-");
+  const typed = ["Keep prompt one.", "Keep prompt two.", "Keep prompt fresh.", "Keep prompt three."];
+  const releases: Array<() => void> = [];
+  const childBodies: string[] = [];
+  let held = false;
+  let reports = 0;
+  // The third work answers only once its turn has its final reply, so its
+  // report never joins that turn (see startChatWithSubagents).
+  let thirdDone = false;
+  const afterThird: (() => void)[] = [];
+  const gateway = startDynamicFakeGateway((body) => {
+    if (isAppChildRequest(body, typed)) {
+      childBodies.push(body);
+      const latest = latestUserText(body);
+      if (latest.includes("KEEPER_SECOND")) {
+        held = true;
+        return new Promise<Response>((resolve) => releases.push(() => resolve(fakeGatewayFinalText("KEEPER_SECOND_DONE"))));
+      }
+      if (latest.includes("KEEPER_THIRD")) {
+        if (thirdDone) return fakeGatewayFinalText("KEEPER_THIRD_DONE");
+        return new Promise<Response>((resolve) => afterThird.push(() => resolve(fakeGatewayFinalText("KEEPER_THIRD_DONE"))));
+      }
+      return fakeGatewayFinalText("KEEPER_FIRST_DONE");
+    }
+    if (isReportTurn(body)) {
+      reports += 1;
+      return fakeGatewayFinalText(`KEEP_REPORT_${reports}`);
+    }
+    const answered = answeredCall(body);
+    if (answered === "keep-one") return fakeGatewayFinalText("KEEP_PARENT_ONE");
+    if (answered === "keep-two") return fakeGatewayFinalText("KEEP_PARENT_TWO");
+    if (answered === "keep-three") {
+      thirdDone = true;
+      queueMicrotask(() => afterThird.splice(0).forEach((release) => release()));
+      return fakeGatewayFinalText("KEEP_PARENT_THREE");
+    }
+    const latest = latestUserText(body);
+    if (latest.includes("Keep prompt one.")) return delegate("keep-one", "keeper", "Work on KEEPER_FIRST.");
+    if (latest.includes("Keep prompt two.")) return delegate("keep-two", "keeper", "Work on KEEPER_SECOND.");
+    if (latest.includes("Keep prompt three.")) return delegate("keep-three", "keeper", "Work on KEEPER_THIRD.");
+    if (latest.includes("Keep prompt fresh.")) return fakeGatewayFinalText("KEEP_FRESH");
+    return fakeGatewayFinalText("UNEXPECTED_REQUEST");
+  }, { classifierDecision: "clear" });
+  let app: { session: TmuxSession; stderrPath: string } | undefined;
+  try {
+    app = await startApp(fixture, gateway, [], true, { FX_PERMISSION_MODE: "full-access" });
+    await app.session.sendText("Keep prompt one.");
+    await scrollbackContains(app.session, "KEEP_REPORT_1");
+    await app.session.waitForStableComposer();
+    await app.session.sendText("Keep prompt two.");
+    await scrollbackContains(app.session, "KEEP_PARENT_TWO");
+    await app.session.waitForPane(() => held, TIMEOUT);
+    await app.session.waitForStableComposer();
+    const source = rootSessionIds(fixture.home)[0]!;
+
+    await app.session.sendText("/new");
+    await app.session.waitForStableComposer();
+    await app.session.sendText("Keep prompt fresh.");
+    try {
+      await scrollbackContains(app.session, "KEEP_FRESH");
+    } catch (error) {
+      console.log(`<timeout> /new never finished while the subagent worked; screen:\n${await app.session.capturePane()}`);
+      throw error;
+    }
+    await app.session.waitForStableComposer();
+    await quitApp(app);
+    app = undefined;
+    // Only the running task stopped.
+    expect(childLines(fixture.home, source).filter((line) => line.kind === "child_finished").map((line) => line.outcome)).toEqual(["ok", "cancelled"]);
+
+    app = await startApp(fixture, gateway, ["--resume", source]);
+    await scrollbackContains(app.session, "KEEP_PARENT_TWO");
+    await app.session.sendText("/agents");
+    await app.session.waitForPane((pane) => pane.includes("keeper"), TIMEOUT);
+    await app.session.sendKeys("Escape");
+    await app.session.waitForStableComposer();
+    const before = reports;
+    await app.session.sendText("Keep prompt three.");
+    await scrollbackContains(app.session, "KEEP_PARENT_THREE");
+    // The same subagent took the new work, with its old history. Its request
+    // can come after the parent's reply.
+    await app.session.waitForPane(() => childBodies.some((body) => body.includes("KEEPER_THIRD")), TIMEOUT);
+    expect(childBodies.find((body) => body.includes("KEEPER_THIRD"))).toContain("KEEPER_FIRST_DONE");
+    expect(new Set(childLines(fixture.home, source).map((line) => line.child)).size).toBe(1);
+    await scrollbackContains(app.session, `KEEP_REPORT_${before + 1}`);
+    await app.session.waitForStableComposer();
+    await quitApp(app);
+    app = undefined;
+  } finally {
+    for (const release of releases) release();
+    await app?.session.kill();
+    gateway.stop();
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+}, TIMEOUT * 6);
+
+/// A chat with subagent `helper` made in its first turn and `late` made in its
+/// third, each with finished work, and a plain fourth prompt last.
+async function startChatWithSubagents(prefix: string) {
+  const fixture = createFixture(prefix);
+  const typed = ["Copy prompt one.", "Copy prompt two.", "Copy prompt three.", "Copy prompt four.", "Use the helper in the fork."];
+  const childBodies: string[] = [];
+  let reports = 0;
+  // A report that reaches the third turn while it still runs joins that
+  // turn's next request, which then reads as a report turn. So the third
+  // turn's subagents answer only once that turn has its final reply.
+  let thirdDone = false;
+  const afterThird: (() => void)[] = [];
+  const afterThirdTurn = (text: string) =>
+    thirdDone ? fakeGatewayFinalText(text) : new Promise<Response>((resolve) => afterThird.push(() => resolve(fakeGatewayFinalText(text))));
+  const gateway = startDynamicFakeGateway((body) => {
+    if (isAppChildRequest(body, typed)) {
+      childBodies.push(body);
+      const latest = latestUserText(body);
+      if (latest.includes("HELPER_FORK")) return fakeGatewayFinalText("HELPER_FORK_DONE");
+      if (latest.includes("HELPER_THREE")) return afterThirdTurn("HELPER_THREE_DONE");
+      if (latest.includes("LATE_TASK")) return afterThirdTurn("LATE_DONE");
+      return fakeGatewayFinalText("HELPER_ONE_DONE");
+    }
+    if (isReportTurn(body)) {
+      reports += 1;
+      return fakeGatewayFinalText(`COPY_REPORT_${reports}`);
+    }
+    const answered = answeredCall(body);
+    if (answered === "copy-one") return fakeGatewayFinalText("COPY_PARENT_ONE");
+    if (answered === "copy-three") return delegate("copy-late", "late", "Work on LATE_TASK.");
+    if (answered === "copy-late") {
+      thirdDone = true;
+      queueMicrotask(() => afterThird.splice(0).forEach((release) => release()));
+      return fakeGatewayFinalText("COPY_PARENT_THREE");
+    }
+    if (answered === "copy-fork") return fakeGatewayFinalText("COPY_PARENT_FORK");
+    const latest = latestUserText(body);
+    if (latest.includes("Copy prompt one.")) return delegate("copy-one", "helper", "Work on HELPER_ONE.");
+    if (latest.includes("Copy prompt two.")) return fakeGatewayFinalText("COPY_PARENT_TWO");
+    if (latest.includes("Copy prompt three.")) return delegate("copy-three", "helper", "Work on HELPER_THREE.");
+    if (latest.includes("Copy prompt four.")) return fakeGatewayFinalText("COPY_PARENT_FOUR");
+    if (latest.includes("Use the helper in the fork.")) return delegate("copy-fork", "helper", "Work on HELPER_FORK.");
+    return fakeGatewayFinalText("UNEXPECTED_REQUEST");
+  }, { classifierDecision: "clear" });
+  const app = await startApp(fixture, gateway, [], true, { FX_PERMISSION_MODE: "full-access" });
+  await app.session.sendText("Copy prompt one.");
+  await scrollbackContains(app.session, "COPY_REPORT_1");
+  await app.session.waitForStableComposer();
+  await app.session.sendText("Copy prompt two.");
+  await scrollbackContains(app.session, "COPY_PARENT_TWO");
+  await app.session.waitForStableComposer();
+  await app.session.sendText("Copy prompt three.");
+  await scrollbackContains(app.session, "COPY_PARENT_THREE");
+  const source = rootSessionIds(fixture.home)[0]!;
+  // Reports of work that ends together share one turn, so wait for the work.
+  await app.session.waitForPane(() => childLines(fixture.home, source).filter((line) => line.kind === "child_finished").length >= 3, TIMEOUT);
+  for (let seen = -1; seen !== reports; ) {
+    seen = reports;
+    await scrollbackContains(app.session, `COPY_REPORT_${seen}`);
+    await app.session.waitForStableComposer();
+  }
+  await app.session.sendText("Copy prompt four.");
+  await scrollbackContains(app.session, "COPY_PARENT_FOUR");
+  await app.session.waitForStableComposer();
+  return { fixture, gateway, app, source, childBodies };
+}
+
+test.skipIf(!tmuxAvailable())("/fork asks once and copies the subagents made before the fork point, with their history up to it", async () => {
+  const { fixture, gateway, app, source, childBodies } = await startChatWithSubagents("fx-v2-app-fork-copies-");
+  let open: { session: TmuxSession; stderrPath: string } | undefined = app;
+  try {
+    const sourceChildren = childLines(fixture.home, source).filter((line) => line.kind === "child_spawned").map((line) => line.child);
+    const helper = sourceChildren[0]!;
+    const before = logBytes(fixture);
+
+    await app.session.sendText("/fork");
+    await app.session.waitForPane((pane) => pane.includes("enter fork"), TIMEOUT);
+    await selectForkPrompt(app.session, "Copy prompt three.");
+    await app.session.sendKeys("Enter");
+    // Only helper existed before that prompt.
+    const asked = await app.session.waitForPane((pane) => FORK_QUESTION.test(pane) && pane.includes(FORK_QUESTION_HINT), TIMEOUT);
+    expect(asked.match(FORK_QUESTION)![1]).toBe("1");
+    expect(asked).toContain("Bring 1 subagent into the fork?");
+    await app.session.sendKeys("Enter");
+    await waitForForkNotice(app.session, source, "Copy prompt three.");
+
+    const fork = rootSessionIds(fixture.home).find((id) => id !== source)!;
+    const copies = ownChildLines(fixture.home, fork).filter((line) => line.kind === "child_spawned").map((line) => line.child);
+    expect(copies).toHaveLength(1);
+    const copy = copies[0]!;
+    expect(copy).not.toBe(helper);
+    const copyLog = logLines(fixture.home, copy) as any[];
+    expect(copyLog[0].role).toBe("child");
+    expect(copyLog[0].parent).toBe(fork);
+    expect(copyLog[0].forked_from.id).toBe(helper);
+    // The copy keeps what its source is for, which the agent list shows.
+    const sourcePurpose = childLines(fixture.home, source).find((line) => line.kind === "child_spawned" && line.child === helper)?.data.purpose;
+    expect(typeof sourcePurpose).toBe("string");
+    expect(ownChildLines(fixture.home, fork).find((line) => line.kind === "child_spawned")?.data.purpose).toBe(sourcePurpose);
+    const copyText = readFileSync(join(storeRoot(fixture.home), copy, "log.jsonl"), "utf8");
+    expect(copyText).toContain("HELPER_ONE_DONE");
+    expect(copyText).not.toContain("HELPER_THREE_DONE");
+
+    // The copy takes new work with its history up to the fork point.
+    await app.session.sendKeys("C-u");
+    await app.session.sendText("Use the helper in the fork.");
+    await scrollbackContains(app.session, "COPY_PARENT_FORK");
+    // The copy's request can come after the parent's reply.
+    await app.session.waitForPane(() => childBodies.some((body) => body.includes("HELPER_FORK")), TIMEOUT);
+    const forkBody = childBodies.find((body) => body.includes("HELPER_FORK"))!;
+    expect(forkBody).toContain("HELPER_ONE_DONE");
+    expect(forkBody).not.toContain("HELPER_THREE_DONE");
+    await app.session.waitForStableComposer();
+    await quitApp(app);
+    open = undefined;
+
+    // The source and its subagents kept every line they had.
+    for (const [id, bytes] of before) {
+      const after = readFileSync(join(storeRoot(fixture.home), id, "log.jsonl"));
+      expect(after.subarray(0, bytes.length).equals(bytes)).toBe(true);
+    }
+    expect(childLines(fixture.home, source).filter((line) => line.kind === "child_spawned").map((line) => line.child)).toEqual(sourceChildren);
+    for (const id of savedSessionIds(fixture.home)) expectWholeLog(fixture, id);
+  } finally {
+    await open?.session.kill();
+    gateway.stop();
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+}, TIMEOUT * 6);
+
+for (const [label, key] of [["n", "n"], ["Esc", "Escape"]] as const) {
+  test.skipIf(!tmuxAvailable())(`/fork forks without the subagents when the answer is ${label}`, async () => {
+    const { fixture, gateway, app, source } = await startChatWithSubagents(`fx-v2-app-fork-no-copies-${label.toLowerCase()}-`);
+    let open: { session: TmuxSession; stderrPath: string } | undefined = app;
+    try {
+      const sessions = savedSessionIds(fixture.home).length;
+      await app.session.sendText("/fork");
+      await app.session.waitForPane((pane) => pane.includes("enter fork"), TIMEOUT);
+      await app.session.sendKeys("Enter");
+      // The newest prompt, the fourth, comes after both subagents were made.
+      const asked = await app.session.waitForPane((pane) => FORK_QUESTION.test(pane), TIMEOUT);
+      expect(asked.match(FORK_QUESTION)![1]).toBe("2");
+      await app.session.sendKeys(key);
+      await waitForForkNotice(app.session, source, "Copy prompt four.");
+      const fork = rootSessionIds(fixture.home).find((id) => id !== source)!;
+      expect(ownChildLines(fixture.home, fork)).toEqual([]);
+      // Only the fork itself is new.
+      expect(savedSessionIds(fixture.home)).toHaveLength(sessions + 1);
+      await app.session.sendKeys("C-u");
+      await quitApp(app);
+      open = undefined;
+    } finally {
+      await open?.session.kill();
+      gateway.stop();
+      rmSync(fixture.root, { recursive: true, force: true });
+    }
+  }, TIMEOUT * 6);
+}
+
+test.skipIf(!tmuxAvailable())("/fork asks nothing when no subagent existed at the fork point", async () => {
+  const { fixture, gateway, app, source } = await startChatWithSubagents("fx-v2-app-fork-before-children-");
+  let open: { session: TmuxSession; stderrPath: string } | undefined = app;
+  try {
+    await app.session.sendText("/fork");
+    await app.session.waitForPane((pane) => pane.includes("enter fork"), TIMEOUT);
+    await selectForkPrompt(app.session, "Copy prompt one.");
+    await app.session.sendKeys("Enter");
+    const pane = await waitForForkNotice(app.session, source, "Copy prompt one.");
+    expect(pane).not.toMatch(FORK_QUESTION);
+    const fork = rootSessionIds(fixture.home).find((id) => id !== source)!;
+    expect(ownChildLines(fixture.home, fork)).toEqual([]);
+    await app.session.sendKeys("C-u");
+    await quitApp(app);
+    open = undefined;
+  } finally {
+    await open?.session.kill();
+    gateway.stop();
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+}, TIMEOUT * 6);
+
+test.skipIf(!tmuxAvailable())("a copy of a subagent whose turn runs across the fork point ends that turn there as cancelled", async () => {
+  const fixture = createFixture("fx-v2-app-fork-mid-turn-");
+  const typed = ["Long prompt one.", "Long prompt two."];
+  const releases: Array<() => void> = [];
+  let held = false;
+  const gateway = startDynamicFakeGateway((body) => {
+    if (isAppChildRequest(body, typed)) {
+      held = true;
+      return new Promise<Response>((resolve) => releases.push(() => resolve(fakeGatewayFinalText("LONG_CHILD_DONE"))));
+    }
+    if (isReportTurn(body)) return fakeGatewayFinalText("LONG_REPORT");
+    // The first turn ends once runner's turn is open, so the fork point
+    // falls inside it.
+    if (answeredCall(body) === "long-one") {
+      return (async () => {
+        while (!held) await Bun.sleep(10);
+        return fakeGatewayFinalText("LONG_PARENT_ONE");
+      })();
+    }
+    const latest = latestUserText(body);
+    if (latest.includes("Long prompt one.")) return delegate("long-one", "runner", "Work on LONG_TASK for a long time.");
+    if (latest.includes("Long prompt two.")) return fakeGatewayFinalText("LONG_PARENT_TWO");
+    return fakeGatewayFinalText("UNEXPECTED_REQUEST");
+  }, { classifierDecision: "clear" });
+  let app: { session: TmuxSession; stderrPath: string } | undefined;
+  try {
+    app = await startApp(fixture, gateway, [], true, { FX_PERMISSION_MODE: "full-access" });
+    await app.session.sendText("Long prompt one.");
+    await scrollbackContains(app.session, "LONG_PARENT_ONE");
+    await app.session.waitForPane(() => held, TIMEOUT);
+    await app.session.waitForStableComposer();
+    await app.session.sendText("Long prompt two.");
+    await scrollbackContains(app.session, "LONG_PARENT_TWO");
+    await app.session.waitForStableComposer();
+    const source = rootSessionIds(fixture.home)[0]!;
+    const runner = childLines(fixture.home, source)[0].child;
+
+    // The fork point ends the first turn, while runner's turn is open.
+    await app.session.sendText("/fork");
+    await app.session.waitForPane((pane) => pane.includes("enter fork"), TIMEOUT);
+    await selectForkPrompt(app.session, "Long prompt two.");
+    await app.session.sendKeys("Enter");
+    await app.session.waitForPane((pane) => pane.includes("Bring 1 subagent into the fork?"), TIMEOUT);
+    await app.session.sendKeys("y");
+    await waitForForkNotice(app.session, source, "Long prompt two.");
+
+    const fork = rootSessionIds(fixture.home).find((id) => id !== source)!;
+    const copy = ownChildLines(fixture.home, fork).find((line) => line.kind === "child_spawned")!.child;
+    const lines = logLines(fixture.home, copy) as any[];
+    expect(lines[0].forked_from.id).toBe(runner);
+    expect(JSON.stringify(lines)).toContain("LONG_TASK");
+    // The copy's open turn ends where the fork point cut it, then the copy closes.
+    expect(lines.slice(-2).map((line) => [line.kind, line.reason ?? null])).toEqual([["turn_interrupted", "cancel"], ["closed", null]]);
+    expect(lines.filter((line) => line.kind === "turn_started")).toHaveLength(1);
+    // The work the copy's turn had open ends in the fork as cancelled too.
+    expect(ownChildLines(fixture.home, fork).map((line) => [line.kind, line.outcome ?? null])).toEqual([["child_spawned", null], ["child_finished", "cancelled"]]);
+    await app.session.sendKeys("C-u");
+    await quitApp(app);
+    app = undefined;
+    for (const id of savedSessionIds(fixture.home)) expectWholeLog(fixture, id);
+  } finally {
+    for (const release of releases) release();
+    await app?.session.kill();
+    gateway.stop();
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+}, TIMEOUT * 6);
+
+test.skipIf(!tmuxAvailable())("a fork of a fork asks again at the fork's first prompt and copies the copy with its history", async () => {
+  const fixture = createFixture("fx-v2-app-fork-twice-");
+  const typed = ["Twice prompt one.", "Twice prompt two.", "Twice prompt three.", "Use the helper twice."];
+  const childBodies: string[] = [];
+  let reports = 0;
+  // A subagent answers only once the turn that sent it work has its final
+  // reply, so its report never joins that turn.
+  let sending = false;
+  const held: (() => void)[] = [];
+  const gateway = startDynamicFakeGateway((body) => {
+    if (isAppChildRequest(body, typed)) {
+      childBodies.push(body);
+      const reply = latestUserText(body).includes("HELPER_AGAIN") ? "TWICE_HELPER_AGAIN" : "TWICE_HELPER_ONE";
+      if (!sending) return fakeGatewayFinalText(reply);
+      return new Promise<Response>((resolve) => held.push(() => resolve(fakeGatewayFinalText(reply))));
+    }
+    if (isReportTurn(body)) {
+      reports += 1;
+      return fakeGatewayFinalText(`TWICE_REPORT_${reports}`);
+    }
+    const answered = answeredCall(body);
+    if (answered) {
+      sending = false;
+      queueMicrotask(() => held.splice(0).forEach((release) => release()));
+      return fakeGatewayFinalText(answered === "twice-one" ? "TWICE_PARENT_ONE" : "TWICE_PARENT_AGAIN");
+    }
+    const latest = latestUserText(body);
+    if (latest.includes("Twice prompt one.")) {
+      sending = true;
+      return delegate("twice-one", "helper", "Work on TWICE_ONE.");
+    }
+    if (latest.includes("Twice prompt two.")) return fakeGatewayFinalText("TWICE_PARENT_TWO");
+    if (latest.includes("Twice prompt three.")) return fakeGatewayFinalText("TWICE_PARENT_THREE");
+    if (latest.includes("Use the helper twice.")) {
+      sending = true;
+      return delegate("twice-again", "helper", "Work on HELPER_AGAIN.");
+    }
+    return fakeGatewayFinalText("UNEXPECTED_REQUEST");
+  }, { classifierDecision: "clear" });
+  let app: { session: TmuxSession; stderrPath: string } | undefined;
+  try {
+    app = await startApp(fixture, gateway, [], true, { FX_PERMISSION_MODE: "full-access" });
+    await app.session.sendText("Twice prompt one.");
+    await scrollbackContains(app.session, "TWICE_REPORT_1");
+    await app.session.waitForStableComposer();
+    await app.session.sendText("Twice prompt two.");
+    await scrollbackContains(app.session, "TWICE_PARENT_TWO");
+    await app.session.waitForStableComposer();
+    const source = rootSessionIds(fixture.home)[0]!;
+
+    // The first fork brings helper.
+    await app.session.sendText("/fork");
+    await app.session.waitForPane((pane) => pane.includes("enter fork"), TIMEOUT);
+    await selectForkPrompt(app.session, "Twice prompt two.");
+    await app.session.sendKeys("Enter");
+    await app.session.waitForPane((pane) => pane.includes("Bring 1 subagent into the fork?"), TIMEOUT);
+    await app.session.sendKeys("Enter");
+    await waitForForkNotice(app.session, source, "Twice prompt two.");
+    const first = rootSessionIds(fixture.home).find((id) => id !== source)!;
+    const firstCopy = ownChildLines(fixture.home, first).find((line) => line.kind === "child_spawned")!.child;
+    await app.session.sendKeys("C-u");
+    await app.session.sendText("Twice prompt three.");
+    await scrollbackContains(app.session, "TWICE_PARENT_THREE");
+    await app.session.waitForStableComposer();
+
+    // Forking the fork before its first own prompt falls in the history it
+    // copied, where its copy of helper already stood.
+    await app.session.sendText("/fork");
+    await app.session.waitForPane((pane) => pane.includes("enter fork"), TIMEOUT);
+    await selectForkPrompt(app.session, "Twice prompt three.");
+    await app.session.sendKeys("Enter");
+    await app.session.waitForPane((pane) => pane.includes("Bring 1 subagent into the fork?"), TIMEOUT);
+    await app.session.sendKeys("Enter");
+    await waitForForkNotice(app.session, first, "Twice prompt three.");
+    const second = rootSessionIds(fixture.home).find((id) => id !== source && id !== first)!;
+    const secondCopy = ownChildLines(fixture.home, second).find((line) => line.kind === "child_spawned")!.child;
+    const lines = logLines(fixture.home, secondCopy) as any[];
+    expect(lines[0].forked_from.id).toBe(firstCopy);
+    expect(JSON.stringify(lines)).toContain("TWICE_HELPER_ONE");
+
+    // The copy of the copy takes new work with helper's first answer in its history.
+    await app.session.sendKeys("C-u");
+    await app.session.sendText("Use the helper twice.");
+    await scrollbackContains(app.session, "TWICE_PARENT_AGAIN");
+    await app.session.waitForPane(() => childBodies.some((body) => body.includes("HELPER_AGAIN")), TIMEOUT);
+    expect(childBodies.find((body) => body.includes("HELPER_AGAIN"))).toContain("TWICE_HELPER_ONE");
+    await app.session.waitForPane(() => reports >= 2, TIMEOUT);
+    await scrollbackContains(app.session, "TWICE_REPORT_2");
+    await app.session.waitForStableComposer();
+    await quitApp(app);
+    app = undefined;
+    for (const id of savedSessionIds(fixture.home)) expectWholeLog(fixture, id);
+  } finally {
+    held.splice(0).forEach((release) => release());
+    await app?.session.kill();
+    gateway.stop();
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+}, TIMEOUT * 6);
+
+test.skipIf(!tmuxAvailable())("a fork of a long session ends with its notice and the source's resume command, in view", async () => {
+  const fixture = createFixture("fx-v2-app-long-fork-");
+  let longAnswer = "";
+  const gateway = startDynamicFakeGateway(async (body) => {
+    if (body.includes("Long fork prompt two.")) return fakeGatewayFinalText("LONG_FORK_TWO");
+    if (body.includes("Long fork prompt one.")) return fakeGatewayFinalText(longAnswer);
+    return fakeGatewayFinalText("UNEXPECTED_REQUEST");
+  });
+  try {
+    const app = await startApp(fixture, gateway, []);
+    // The first answer is longer than the pane keeps in scrollback, so a
+    // notice written above the replay would scroll out of reach.
+    const lines = Array.from({ length: app.session.historyLimit() + 200 }, (_, index) => `LONG_FORK_LINE_${String(index + 1).padStart(5, "0")}`);
+    const lastLine = lines.at(-1)!;
+    longAnswer = ["```text", ...lines, "```"].join("\n");
+    await app.session.sendText("Long fork prompt one.");
+    await app.session.waitForText(lastLine, TIMEOUT);
+    await app.session.waitForStableComposer();
+    await app.session.sendText("Long fork prompt two.");
+    await app.session.waitForText("LONG_FORK_TWO", TIMEOUT);
+    await app.session.waitForStableComposer();
+    const source = onlySessionId(fixture.home);
+
+    await app.session.sendText("/fork");
+    await app.session.waitForPane((pane) => pane.includes("enter fork"), TIMEOUT);
+    await app.session.sendKeys("Enter");
+    // The notice and the command are on screen, not only in the scrollback.
+    await waitForForkNotice(app.session, source, "Long fork prompt two.");
+    expectForkNoticeAfterReplay((await app.session.captureFullScrollback()).split("\n"), lastLine, "Long fork prompt one. (fork)", source);
+    await app.session.sendKeys("C-u");
+    await quitApp(app);
+  } finally {
     gateway.stop();
     rmSync(fixture.root, { recursive: true, force: true });
   }
@@ -1442,6 +2816,228 @@ class AcpRpc {
 function acpPrompt(text: string) {
   return { prompt: [{ type: "text", text }] };
 }
+
+test.skipIf(!tmuxAvailable())("the app records the repository at each turn's start and end with experimental.workspace_capture", async () => {
+  const fixture = createFixture("fx-v2-app-capture-");
+  const head = makeCaptureRepository(fixture);
+  enableWorkspaceCapture(fixture);
+  const gateway = replyToLatest([["Capture this app turn.", "APP_CAPTURED"]]);
+  const trace = join(fixture.root, "app-capture.trace.log");
+  try {
+    const app = await startApp(fixture, gateway, [], true, { FX_TRACE_LOG: trace, FX_TRACE_SCOPES: "workspace" });
+    await app.session.sendText("Capture this app turn.");
+    await app.session.waitForText("APP_CAPTURED", TIMEOUT);
+    const id = onlySessionId(fixture.home);
+    await waitForLog(fixture, id, "turn_committed");
+    await quitApp(app);
+    expectTurnCaptures(fixture, id, head, 1);
+    // The end capture ran on the agent's worker before the UI's commit,
+    // which only wrote what was held.
+    const text = readFileSync(trace, "utf8");
+    const ended = text.match(/event=workspace_capture_end session=\S+ reached=\d+ thread=(\d+)/);
+    const commit = text.match(/event=workspace_capture_commit session=\S+ held=(\w+) thread=(\d+)/);
+    expect(ended).not.toBeNull();
+    expect(commit).not.toBeNull();
+    expect(commit![1]).toBe("true");
+    expect(ended![1]).not.toBe(commit![2]);
+    expect(text.indexOf("event=workspace_capture_end")).toBeLessThan(text.indexOf("event=workspace_capture_commit"));
+  } finally {
+    gateway.stop();
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+}, TIMEOUT * 2);
+
+test.skipIf(!tmuxAvailable())("the app keeps a turn's start capture when a follow-up is sent while it runs, with experimental.workspace_capture", async () => {
+  const fixture = createFixture("fx-v2-app-capture-follow-up-");
+  makeCaptureRepository(fixture);
+  // Enough untracked files that the first capture takes a while.
+  mkdirSync(join(fixture.workspace, "bulk"));
+  for (let i = 0; i < 20_000; i += 1) writeFileSync(join(fixture.workspace, "bulk", `f${i}.txt`), `file ${i}\n`);
+  enableWorkspaceCapture(fixture);
+  const gateway = replyToLatest([
+    ["Capture this slow turn.", "SLOW_TURN_DONE"],
+    ["Follow-up during the capture.", "FOLLOW_UP_DONE"],
+  ]);
+  const trace = join(fixture.root, "app-capture-follow-up.trace.log");
+  const traceText = () => (existsSync(trace) ? readFileSync(trace, "utf8") : "");
+  try {
+    const app = await startApp(fixture, gateway, [], true, { FX_TRACE_LOG: trace, FX_TRACE_SCOPES: "workspace,worker" });
+    await app.session.sendText("Capture this slow turn.");
+    // The prompt is saved just before the start capture begins: the
+    // follow-up reaches the worker while that capture runs, and steering
+    // interrupts the model at once.
+    const started = Date.now();
+    let id: string | undefined;
+    while (Date.now() - started < TIMEOUT) {
+      const sessions = existsSync(storeRoot(fixture.home)) ? readdirSync(storeRoot(fixture.home)) : [];
+      id = sessions.find((name) => {
+        const log = join(storeRoot(fixture.home), name, "log.jsonl");
+        return existsSync(log) && readFileSync(log, "utf8").includes('"type":"user"');
+      });
+      if (id !== undefined) break;
+      await Bun.sleep(5);
+    }
+    expect(id).toBeDefined();
+    await app.session.sendText("Follow-up during the capture.");
+    await scrollbackContains(app.session, "FOLLOW_UP_DONE");
+    await waitForCommits(fixture, id!, 1, TIMEOUT);
+    await quitApp(app);
+    // The follow-up was admitted while the start capture ran.
+    const text = traceText();
+    const admitted = text.indexOf("steering_admission");
+    const startSaved = text.search(/event=workspace_capture session=\S+ phase=start /);
+    expect(admitted).toBeGreaterThan(-1);
+    expect(startSaved).toBeGreaterThan(admitted);
+    expect(text).not.toContain("event=workspace_capture_cancelled");
+    const records = workspaceCaptures(fixture, id!);
+    expect(records.length).toBeGreaterThan(0);
+    for (const record of records) expect(record.reason).not.toBe("cancelled");
+    expect(records[0].phase).toBe("start");
+    expect(records[0].commit).toMatch(/^[0-9a-f]{40}$/);
+  } finally {
+    gateway.stop();
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+}, TIMEOUT * 4);
+
+test.skipIf(!tmuxAvailable())("the app gives each turn only its own workspace_capture items when two prompts end while the first answer is still drawn", async () => {
+  const fixture = createFixture("fx-v2-app-capture-steer-");
+  makeCaptureRepository(fixture);
+  enableWorkspaceCapture(fixture);
+  // A long first answer keeps the UI drawing after the worker took its end
+  // capture. Each next prompt is sent as soon as the turn before begins its
+  // end capture, so it reaches the worker before the UI commits that turn,
+  // as steering or as an ordinary prompt by timing; both keep the ended
+  // turn's captures for its late commit.
+  const long = Array.from({ length: 30_000 }, (_, i) => `Line ${i} of a long answer drawn bit by bit.`).join("\n") + "\nFIRST_DRAWN";
+  const prompts: [string, string][] = [
+    ["First prompt while drawing.", long],
+    ["Second prompt while drawing.", "SECOND_DRAWN"],
+    ["Third prompt while drawing.", "THIRD_DRAWN"],
+  ];
+  const gateway = replyToLatest(prompts);
+  const trace = join(fixture.root, "app-capture-steer.trace.log");
+  const traceText = () => (existsSync(trace) ? readFileSync(trace, "utf8") : "");
+  const ending = () => traceText().match(/event=workspace_capture_end /g)?.length ?? 0;
+  try {
+    const app = await startApp(fixture, gateway, [], true, { FX_TRACE_LOG: trace, FX_TRACE_SCOPES: "workspace" });
+    for (const [index, [prompt]] of prompts.entries()) {
+      await app.session.sendText(prompt);
+      const started = Date.now();
+      while (ending() <= index && Date.now() - started < TIMEOUT) await Bun.sleep(5);
+      expect(ending()).toBeGreaterThan(index);
+    }
+    const id = onlySessionId(fixture.home);
+    await waitForCommits(fixture, id, 3, TIMEOUT * 2);
+    await quitApp(app);
+    // Every line, superseded turns included: the race can supersede the
+    // turn an answer streamed into.
+    const text = readFileSync(join(storeRoot(fixture.home), id, "log.jsonl"), "utf8");
+    const lines = text.slice(0, text.lastIndexOf("\n") + 1).split("\n").filter(Boolean).map((line) => JSON.parse(line));
+    const committed = new Set(lines.filter((line) => line.kind === "turn_committed").map((line) => line.turn));
+    expect(committed.size).toBe(3);
+    // The prompts take their start and end captures in order, and each
+    // capture's commit is unique, since it is a child of the one before.
+    const traced = traceText().split("\n");
+    const commitsOf = (phase: string) =>
+      traced.map((line) => line.match(new RegExp(`event=workspace_capture session=\\S+ phase=${phase} .* commit=(\\w+)`))?.[1]).filter((commit) => commit !== undefined);
+    const starts = commitsOf("start");
+    const ends = commitsOf("end");
+    expect(starts.length).toBe(3);
+    expect(ends.length).toBe(3);
+    expect(new Set([...starts, ...ends]).size).toBe(6);
+    // The first turn may hold none only when the third began, by its start
+    // capture, before the UI's first commit: the session keeps one ended
+    // turn, so the third then drops the first's captures.
+    const thirdStart = traced.findIndex((line) => line.includes(`commit=${starts[2]}`));
+    const firstCommit = traced.findIndex((line) => line.includes("event=workspace_capture_commit"));
+    const firstMayDrop = thirdStart < firstCommit;
+    for (const [index, [prompt]] of prompts.entries()) {
+      const user = lines.find((line) => line.kind === "item" && line.type === "user" && committed.has(line.turn) && JSON.stringify(line.data).includes(prompt));
+      expect(user).toBeDefined();
+      const records = lines
+        .filter((line) => line.kind === "item" && line.type === "workspace_capture" && line.turn === user.turn)
+        .map((line) => (typeof line.data === "string" ? JSON.parse(line.data) : line.data));
+      if (index === 0 && firstMayDrop && records.length === 0) continue;
+      // Its own start and end, never another turn's.
+      expect(records.map((record) => [record.phase, record.commit])).toEqual([
+        ["start", starts[index]],
+        ["end", ends[index]],
+      ]);
+    }
+  } finally {
+    gateway.stop();
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+}, TIMEOUT * 4);
+
+test.skipIf(!tmuxAvailable())("/fork gives the fork the source's workspace_capture refs without waiting for them", async () => {
+  const fixture = createFixture("fx-v2-app-capture-fork-");
+  makeCaptureRepository(fixture);
+  enableWorkspaceCapture(fixture);
+  const gateway = replyToLatest([
+    ["Fork capture one.", "FORK_CAPTURE_ONE"],
+    ["Fork capture two.", "FORK_CAPTURE_TWO"],
+  ]);
+  const trace = join(fixture.root, "app-capture-fork.trace.log");
+  const traceText = () => (existsSync(trace) ? readFileSync(trace, "utf8") : "");
+  try {
+    const app = await startApp(fixture, gateway, [], true, { FX_TRACE_LOG: trace, FX_TRACE_SCOPES: "workspace" });
+    for (const [prompt, answer] of [["Fork capture one.", "FORK_CAPTURE_ONE"], ["Fork capture two.", "FORK_CAPTURE_TWO"]]) {
+      await app.session.sendText(prompt!);
+      await app.session.waitForText(answer!, TIMEOUT);
+    }
+    const source = onlySessionId(fixture.home);
+    // The second turn's commit, not the first's: /fork waits for no turn.
+    await waitForCommits(fixture, source, 2, TIMEOUT);
+    await app.session.waitForStableComposer();
+    await app.session.sendText("/fork");
+    await app.session.waitForPane((pane) => pane.includes("enter fork"), TIMEOUT);
+    await app.session.sendKeys("Enter");
+    await waitForForkNotice(app.session, source, "Fork capture two.");
+    const fork = savedSessionIds(fixture.home).find((id) => id !== source)!;
+    expect(fork).toBeDefined();
+    const copiedLine = new RegExp(`event=workspace_capture_fork_refs from=${source} to=${fork} copied=(\\d+) existing=0 conflicting=0 failed_refs=0 failed_stores=0`);
+    for (let attempt = 0; attempt < 200 && !copiedLine.test(traceText()); attempt += 1) await Bun.sleep(25);
+    // The composer holds the forked prompt.
+    await app.session.sendKeys("C-u");
+    await quitApp(app);
+    const copied = traceText().match(copiedLine);
+    expect(copied).not.toBeNull();
+    expect(Number(copied![1])).toBeGreaterThan(0);
+    // The fork's ref names the same capture as the source's.
+    const refs = fixtureGit(fixture, ["for-each-ref", "--format=%(objectname) %(refname)", "refs/fx/sessions/"], captureStore(fixture)).split("\n");
+    expect(refs.length).toBe(2);
+    expect(new Set(refs.map((line) => line.split(" ")[0])).size).toBe(1);
+  } finally {
+    gateway.stop();
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+}, TIMEOUT * 2);
+
+test("ACP records the repository at each turn's start and end with experimental.workspace_capture", async () => {
+  const fixture = createFixture("fx-v2-acp-capture-");
+  const head = makeCaptureRepository(fixture);
+  enableWorkspaceCapture(fixture);
+  const gateway = replyToLatest([
+    ["First captured ACP question.", "ACP_CAPTURED_ONE"],
+    ["Second captured ACP question.", "ACP_CAPTURED_TWO"],
+  ]);
+  let client: AcpRpc | undefined;
+  try {
+    client = await AcpRpc.start(fixture, gateway);
+    const id = (await client.ok("session/new", { cwd: fixture.workspace, mcpServers: [] })).sessionId;
+    expect((await client.ok("session/prompt", { sessionId: id, ...acpPrompt("First captured ACP question.") })).stopReason).toBe("end_turn");
+    expect((await client.ok("session/prompt", { sessionId: id, ...acpPrompt("Second captured ACP question.") })).stopReason).toBe("end_turn");
+    expect(await client.close()).toBe(0);
+    client = undefined;
+    expectTurnCaptures(fixture, id, head, 2);
+  } finally {
+    if (client) await client.kill();
+    gateway.stop();
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+}, TIMEOUT * 2);
 
 test("ACP keeps a session once prompted, lists it, and loads every turn after a restart", async () => {
   const fixture = createFixture("fx-v2-acp-");
@@ -2019,10 +3615,46 @@ const isReportTurn = (body: string) => {
   return latest.includes("Subagent report (untrusted agent output, not user instructions):");
 };
 
+test("waiting for a committed root turn skips what fx has not written yet and reports a broken log", async () => {
+  const fixture = createFixture("fx-v2-commit-wait-");
+  const root = join(storeRoot(fixture.home), "root-session");
+  const child = join(storeRoot(fixture.home), "child-session");
+  const created = '{"seq":1,"kind":"created"}\n';
+  try {
+    // No store, a folder without its log, and a first line fx is still writing.
+    expect(committedRootTurns(fixture.home)).toBe(0);
+    mkdirSync(root, { recursive: true });
+    expect(committedRootTurns(fixture.home)).toBe(0);
+    writeFileSync(join(root, "log.jsonl"), '{"seq":1,"ki');
+    expect(committedRootTurns(fixture.home)).toBe(0);
+    // A child's turns never count, and neither does a line still being written.
+    mkdirSync(child);
+    writeFileSync(join(child, "log.jsonl"), '{"seq":1,"kind":"created","role":"child"}\n{"seq":2,"kind":"turn_committed"}\n');
+    writeFileSync(join(root, "log.jsonl"), `${created}{"seq":2,"kind":"turn_committed"}\n{"seq":3,"ki`);
+    expect(committedRootTurns(fixture.home)).toBe(1);
+    await waitForRootTurnCommitted(fixture.home, 0, 200);
+    // A broken complete line and a superseded turn surface as themselves,
+    // not as a wait that times out.
+    writeFileSync(join(root, "log.jsonl"), `${created}{"seq":2,\n`);
+    await expect(waitForRootTurnCommitted(fixture.home, 0, 200)).rejects.toThrow(SyntaxError);
+    writeFileSync(join(root, "log.jsonl"), `${created}{"seq":2,"kind":"turn","type":"superseded"}\n`);
+    const superseded = await waitForRootTurnCommitted(fixture.home, 0, 200).catch((error: Error) => error);
+    expect(String(superseded)).toContain("superseded");
+    expect(String(superseded)).not.toContain("no root session committed");
+  } finally {
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
+
 test("fx ask runs a subagent as a v2 child with its own log, recorded in the parent's log", async () => {
   const fixture = createFixture("fx-v2-subagent-run-");
-  const gateway = startDynamicFakeGateway((body) => {
-    if (isChildRequest(body)) return fakeGatewayFinalText("CHILD_ANSWER_5521");
+  const gateway = startDynamicFakeGateway(async (body) => {
+    if (isChildRequest(body)) {
+      // A report that arrives while the parent's first turn runs joins that
+      // turn, so the child answers only once that turn is saved.
+      await waitForRootTurnCommitted(fixture.home);
+      return fakeGatewayFinalText("CHILD_ANSWER_5521");
+    }
     if (isReportTurn(body)) {
       expect(body).toContain("CHILD_ANSWER_5521");
       return fakeGatewayFinalText("PARENT_DONE");
@@ -2131,6 +3763,219 @@ test("a named subagent keeps its id, history and instructions across fx ask runs
   }
 }, TIMEOUT * 3);
 
+/// Saves agent profile `name` in the `.fx/agents` of `folder`, which is a
+/// repository, or the fx home's parent for a profile of the user's own.
+function writeRepositoryProfile(folder: string, name: string, profile: object, prompt?: string) {
+  const dir = join(folder, ".fx", "agents", name);
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(join(dir, "profile.json"), JSON.stringify(profile));
+  if (prompt !== undefined) writeFileSync(join(dir, "prompt.md"), prompt);
+}
+
+/// `fx ask` run in `cwd`, such as another repository than the fixture's.
+function askIn(fixture: Fixture, gateway: any, cwd: string, args: string[]) {
+  return runFx(["ask", "--json", "--auto", ...args], { cwd, env: env(fixture, gateway), timeoutMs: TIMEOUT });
+}
+
+/// The tools a request offered the model, by name.
+const offeredTools = (body: string): string[] => (JSON.parse(body).tools ?? []).map((tool: { name: string }) => tool.name);
+
+/// Writes parent session `id`'s log again with `edit` applied to the data of each
+/// of its `child_spawned` lines, each line sealed with its CRC32C again. A
+/// snapshot would keep the old data, so the log must have none.
+function rewriteSpawnData(fixture: Fixture, id: string, edit: (data: Record<string, unknown>) => void) {
+  const path = join(storeRoot(fixture.home), id, "log.jsonl");
+  const marker = ',"crc":"';
+  const lines = readFileSync(path, "utf8").split("\n").filter(Boolean);
+  const sealed = lines.map((text) => {
+    const line = JSON.parse(text.slice(0, text.lastIndexOf(marker)) + "}");
+    expect(line.kind).not.toBe("snapshot");
+    if (line.kind !== "child_spawned") return text + "\n";
+    const data = typeof line.data === "string" ? JSON.parse(line.data) : line.data;
+    edit(data);
+    line.data = data;
+    const head = JSON.stringify(line).slice(0, -1);
+    return `${head}${marker}${crc32c(Buffer.from(head)).toString(16).padStart(8, "0")}"}\n`;
+  });
+  writeFileSync(path, sealed.join(""));
+}
+
+/// A request's latest user message, as text.
+const latestUserMessage = (body: string): string =>
+  JSON.stringify(JSON.parse(body).prompt?.filter((item: any) => item.role === "user").at(-1)?.content ?? "");
+
+/// A parent that starts the child `reviewer` in profile `reviewer` in its first
+/// round and sends it a second message in its next. Each request the child
+/// makes is kept in `childBodies`, and the text of each report the parent
+/// reads in `reports`.
+function reviewerGateway(round: { n: 1 | 2 }, childBodies: string[], reports: string[]) {
+  return startDynamicFakeGateway((body) => {
+    if (isChildRequest(body)) {
+      childBodies.push(body);
+      return fakeGatewayFinalText(`REVIEW_${childBodies.length}`);
+    }
+    if (isReportTurn(body)) {
+      reports.push(latestUserMessage(body));
+      return fakeGatewayFinalText(`REPORT_READ_${round.n}`);
+    }
+    const call = `delegate-${round.n}`;
+    if (body.includes(call)) return fakeGatewayFinalText(`DONE_${round.n}`);
+    return round.n === 1
+      ? fakeGatewayToolCall(call, "subagent", { request: { action: "message", agent: "reviewer", message: "Review round one.", profile: "reviewer" } })
+      : fakeGatewayToolCall(call, "subagent", { request: { action: "message", agent: "reviewer", message: "Review round two." } });
+  }, { classifierDecision: "clear" });
+}
+
+test("a subagent keeps the tools its profile gave it when its session is resumed in another repository", async () => {
+  const fixture = createFixture("fx-v2-subagent-profile-moved-");
+  const other = join(fixture.root, "other");
+  mkdirSync(other);
+  writeRepositoryProfile(fixture.workspace, "reviewer", { description: "Reads files", tools: ["read_file"] }, "PROMPT_FROM_REPOSITORY_A");
+  // The other repository has a profile of the same name that gives other tools.
+  writeRepositoryProfile(other, "reviewer", { description: "Searches files", tools: ["glob_files"] }, "PROMPT_FROM_REPOSITORY_B");
+  const round = { n: 1 as 1 | 2 };
+  const childBodies: string[] = [];
+  const gateway = reviewerGateway(round, childBodies, []);
+  try {
+    const first = await askIn(fixture, gateway, fixture.workspace, ["First review."]);
+    expect(first.code).toBe(0);
+    const id = JSON.parse(first.stdout).session_id;
+    round.n = 2;
+    const second = await askIn(fixture, gateway, other, ["--resume", id, "Second review."]);
+    expect(second.code).toBe(0);
+    expect(second.stderr).not.toContain("panic");
+
+    expect(childBodies).toHaveLength(2);
+    expect(offeredTools(childBodies[0]!)).toContain("read_file");
+    expect(offeredTools(childBodies[0]!)).not.toContain("glob_files");
+    // The child still has what it started with, not what the other repository's
+    // profile of its name gives.
+    expect(offeredTools(childBodies[1]!)).toEqual(offeredTools(childBodies[0]!));
+    expect(childBodies[1]).toContain("Review round one.");
+    // The prompt is not saved. A repository profile's prompt is read from the
+    // repository fx runs in, by the profile's name.
+    expect(childBodies[0]).toContain("PROMPT_FROM_REPOSITORY_A");
+    expect(childBodies[1]).toContain("PROMPT_FROM_REPOSITORY_B");
+    expect(childBodies[1]).not.toContain("PROMPT_FROM_REPOSITORY_A");
+    // The parent's log keeps what the profile set, on each of the child's spawns.
+    const lines = childLines(fixture.home, id).filter((line) => line.kind === "child_spawned");
+    expect(lines).toHaveLength(2);
+    for (const line of lines) {
+      expect(line.data.profile).toBe("reviewer");
+      expect(line.data.started_with).toEqual({ v: 1, from: "project", tools: ["read_file"] });
+    }
+    expectWholeLog(fixture, id);
+  } finally {
+    gateway.stop();
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+}, TIMEOUT * 3);
+
+test("a user's profile of the same name takes neither the prompt a subagent started with in a repository, nor its tools", async () => {
+  const fixture = createFixture("fx-v2-subagent-profile-shadowed-");
+  writeRepositoryProfile(fixture.workspace, "reviewer", { description: "Reads files", tools: ["read_file"] }, "PROMPT_FROM_REPOSITORY");
+  const round = { n: 1 as 1 | 2 };
+  const childBodies: string[] = [];
+  const gateway = reviewerGateway(round, childBodies, []);
+  try {
+    const first = await askIn(fixture, gateway, fixture.workspace, ["First review."]);
+    expect(first.code).toBe(0);
+    const id = JSON.parse(first.stdout).session_id;
+    expect(childBodies[0]).toContain("PROMPT_FROM_REPOSITORY");
+    // The user then saves a profile of the same name, which a lookup by name
+    // finds before the repository's.
+    writeRepositoryProfile(fixture.home, "reviewer", { description: "Searches files", tools: ["glob_files"] }, "PROMPT_FROM_HOME");
+    round.n = 2;
+    const second = await askIn(fixture, gateway, fixture.workspace, ["--resume", id, "Second review."]);
+    expect(second.code).toBe(0);
+    expect(second.stderr).not.toContain("panic");
+
+    expect(childBodies).toHaveLength(2);
+    expect(offeredTools(childBodies[1]!)).toEqual(offeredTools(childBodies[0]!));
+    expect(childBodies[1]).toContain("PROMPT_FROM_REPOSITORY");
+    expect(childBodies[1]).not.toContain("PROMPT_FROM_HOME");
+    expectWholeLog(fixture, id);
+  } finally {
+    gateway.stop();
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+}, TIMEOUT * 3);
+
+test("a subagent still runs after its session is resumed where its profile does not exist", async () => {
+  const fixture = createFixture("fx-v2-subagent-profile-gone-");
+  const other = join(fixture.root, "other");
+  mkdirSync(other);
+  writeRepositoryProfile(fixture.workspace, "reviewer", { description: "Reads files", tools: ["read_file"] });
+  const round = { n: 1 as 1 | 2 };
+  const childBodies: string[] = [];
+  const gateway = reviewerGateway(round, childBodies, []);
+  try {
+    const first = await askIn(fixture, gateway, fixture.workspace, ["First review."]);
+    expect(first.code).toBe(0);
+    const id = JSON.parse(first.stdout).session_id;
+    // The profile is gone from where the session is resumed.
+    rmSync(join(fixture.workspace, ".fx"), { recursive: true, force: true });
+    round.n = 2;
+    const second = await askIn(fixture, gateway, other, ["--resume", id, "Second review."]);
+    expect(second.code).toBe(0);
+    expect(second.stderr).not.toContain("panic");
+
+    expect(childBodies).toHaveLength(2);
+    expect(offeredTools(childBodies[1]!)).toEqual(offeredTools(childBodies[0]!));
+    expect(offeredTools(childBodies[1]!)).toContain("read_file");
+    const finished = childLines(fixture.home, id).filter((line) => line.kind === "child_finished");
+    expect(finished.map((line) => line.outcome)).toEqual(["ok", "ok"]);
+    expectWholeLog(fixture, id);
+  } finally {
+    gateway.stop();
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+}, TIMEOUT * 3);
+
+test("a subagent an earlier fx saved with only its profile's name fails with the profile named when the profile is gone", async () => {
+  const fixture = createFixture("fx-v2-subagent-profile-name-only-");
+  const other = join(fixture.root, "other");
+  mkdirSync(other);
+  writeRepositoryProfile(fixture.workspace, "reviewer", { description: "Reads files", tools: ["read_file"] });
+  const round = { n: 1 as 1 | 2 };
+  const childBodies: string[] = [];
+  const reports: string[] = [];
+  const gateway = reviewerGateway(round, childBodies, reports);
+  try {
+    const first = await askIn(fixture, gateway, fixture.workspace, ["First review."]);
+    expect(first.code).toBe(0);
+    const id = JSON.parse(first.stdout).session_id;
+    // An earlier fx saved the profile's name and nothing else of it.
+    rewriteSpawnData(fixture, id, (data) => {
+      delete data.started_with;
+    });
+    expect(childLines(fixture.home, id)[0].data.profile).toBe("reviewer");
+    expect(childLines(fixture.home, id)[0].data.started_with).toBeUndefined();
+    rmSync(join(fixture.workspace, ".fx"), { recursive: true, force: true });
+    round.n = 2;
+    const second = await askIn(fixture, gateway, other, ["--resume", id, "Second review."]);
+    expect(second.code).toBe(0);
+    expect(second.stderr).not.toContain("panic");
+
+    // The child never reached the model, and its parent is told which profile
+    // it could not load.
+    expect(childBodies).toHaveLength(1);
+    expect(reports).toHaveLength(2);
+    expect(reports[1]).toContain("profile_unavailable");
+    expect(reports[1]).toContain("no profile named 'reviewer'");
+    expect(reports[1]).not.toContain("AdmissionFailed");
+    // It says what works, and does not advise keeping a child that fails on
+    // every message.
+    expect(reports[1]).toContain("Restore the profile, or close this subagent and start a new one, which loses its conversation. Earlier tool calls may have completed");
+    expect(reports[1]).not.toContain("..");
+    expect(reports[1]).not.toContain("Keep it if related work may follow");
+    expectWholeLog(fixture, id);
+  } finally {
+    gateway.stop();
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+}, TIMEOUT * 3);
+
 test("a crash while a named subagent works records it interrupted, and its next message runs under its id with nothing of the lost work", async () => {
   const fixture = createFixture("fx-v2-subagent-lost-");
   let held: () => void = () => {};
@@ -2190,6 +4035,95 @@ test("a crash while a named subagent works records it interrupted, and its next 
   }
 }, TIMEOUT * 3);
 
+
+/// A subagent's own session holds a start and an end capture of each of its
+/// turns, beside its parent's.
+function expectChildCaptures(fixture: Fixture, parentId: string, head: string) {
+  const lines = childLines(fixture.home, parentId);
+  const childId = lines[0].child;
+  const records = workspaceCaptures(fixture, childId);
+  expect(records.map((record) => record.phase)).toEqual(["start", "end"]);
+  for (const record of records) {
+    expect(record.status).toBe("partial");
+    expect(record.reason).toBe("sensitive");
+    expect(record.head).toBe(head);
+  }
+  expect(workspaceCaptures(fixture, parentId).length).toBeGreaterThanOrEqual(2);
+  expectWholeLog(fixture, childId);
+}
+
+test("fx ask records a subagent's repository in its own session with experimental.workspace_capture", async () => {
+  const fixture = createFixture("fx-v2-subagent-capture-");
+  const head = makeCaptureRepository(fixture);
+  enableWorkspaceCapture(fixture);
+  const gateway = startDynamicFakeGateway((body) => {
+    if (isChildRequest(body)) return fakeGatewayFinalText("CHILD_CAPTURED");
+    if (isReportTurn(body)) return fakeGatewayFinalText("PARENT_DONE");
+    if (body.includes("delegate-capture")) return fakeGatewayFinalText("PARENT_SENT");
+    return fakeGatewayToolCall("delegate-capture", "subagent", { request: { action: "message", agent: "marker", message: "Report the child marker." } });
+  }, { classifierDecision: "clear" });
+  try {
+    const result = await ask(fixture, gateway, ["Delegate with captures."]);
+    expect(result.code).toBe(0);
+    expect(JSON.parse(result.stdout).output).toContain("PARENT_DONE");
+    expectChildCaptures(fixture, JSON.parse(result.stdout).session_id, head);
+  } finally {
+    gateway.stop();
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+}, TIMEOUT * 2);
+
+test.skipIf(!tmuxAvailable())("the app records a subagent's repository in its own session with experimental.workspace_capture", async () => {
+  const fixture = createFixture("fx-v2-app-subagent-capture-");
+  const head = makeCaptureRepository(fixture);
+  enableWorkspaceCapture(fixture);
+  const gateway = startDynamicFakeGateway((body) => {
+    if (isAppChildRequest(body, ["Delegate with captures from the app."])) return fakeGatewayFinalText("APP_CHILD_CAPTURED");
+    if (isReportTurn(body)) return fakeGatewayFinalText("APP_PARENT_DONE");
+    if (body.includes("app-delegate-capture")) return fakeGatewayFinalText("APP_PARENT_SENT");
+    return fakeGatewayToolCall("app-delegate-capture", "subagent", { request: { action: "message", agent: "reporter", message: "Report from the app child." } });
+  }, { classifierDecision: "clear" });
+  try {
+    const app = await startApp(fixture, gateway, [], true, { FX_PERMISSION_MODE: "auto" });
+    await app.session.sendText("Delegate with captures from the app.");
+    await scrollbackContains(app.session, "APP_PARENT_DONE");
+    await app.session.waitForComposer(TIMEOUT);
+    await quitApp(app);
+    const roots = rootSessionIds(fixture.home);
+    expect(roots).toHaveLength(1);
+    expectChildCaptures(fixture, roots[0]!, head);
+  } finally {
+    gateway.stop();
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+}, TIMEOUT * 3);
+
+test("ACP records a subagent's repository in its own session with experimental.workspace_capture", async () => {
+  const fixture = createFixture("fx-v2-acp-subagent-capture-");
+  const head = makeCaptureRepository(fixture);
+  enableWorkspaceCapture(fixture);
+  const gateway = startDynamicFakeGateway((body) => {
+    if (isChildRequest(body)) return fakeGatewayFinalText("ACP_CHILD_CAPTURED");
+    if (isReportTurn(body)) return fakeGatewayFinalText("ACP_PARENT_DONE");
+    if (body.includes("acp-delegate-capture")) return fakeGatewayFinalText("ACP_PARENT_SENT");
+    return fakeGatewayToolCall("acp-delegate-capture", "subagent", { request: { action: "message", agent: "reporter", message: "Report from the ACP child." } });
+  }, { classifierDecision: "clear" });
+  let client: AcpRpc | undefined;
+  try {
+    client = await AcpRpc.start(fixture, gateway);
+    const id = (await client.ok("session/new", { cwd: fixture.workspace, mcpServers: [] })).sessionId;
+    expect((await client.ok("session/prompt", { sessionId: id, ...acpPrompt("Delegate with captures over ACP.") })).stopReason).toBe("end_turn");
+    // The report starts the parent's next turn on its own; wait for it.
+    for (let attempt = 0; attempt < 100 && !JSON.stringify(logLines(fixture.home, id)).includes("ACP_PARENT_DONE"); attempt += 1) await Bun.sleep(100);
+    expect(await client.close()).toBe(0);
+    client = undefined;
+    expectChildCaptures(fixture, id, head);
+  } finally {
+    if (client) await client.kill();
+    gateway.stop();
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+}, TIMEOUT * 2);
 
 test.skipIf(!tmuxAvailable())("the interactive app runs a subagent on v2 and records it in the session's log", async () => {
   const fixture = createFixture("fx-v2-app-subagent-");
@@ -2487,6 +4421,605 @@ test("fx session reads a session another process holds, and reads past a torn ta
   }
 }, TIMEOUT * 3);
 
+/// `fx sessions --live --json [args]` from `cwd`: it succeeds, writes nothing
+/// on stderr, and names its shape.
+async function liveSessions(fixture: Fixture, gateway: any, args: string[] = [], cwd = fixture.workspace) {
+  const result = await command(fixture, gateway, ["sessions", "--live", "--json", ...args], cwd);
+  expect(result.stderr).toBe("");
+  expect(result.code).toBe(0);
+  const listed = JSON.parse(result.stdout);
+  expect(listed.kind).toBe("live_sessions");
+  expect(listed.count).toBe(listed.sessions.length);
+  return listed;
+}
+
+/// The saved root sessions that are not in `known`.
+function newRoots(fixture: Fixture, known: string[]): string[] {
+  return rootSessionIds(fixture.home).filter((id) => !known.includes(id));
+}
+
+/// The model a session's log saved with it, the newest `prefs` line's.
+function savedModel(fixture: Fixture, id: string): string {
+  const prefs = logLines(fixture.home, id).filter((line: any) => line.kind === "set" && line.key === "prefs");
+  return (prefs.at(-1) as any).value.model;
+}
+
+/// How long ago a session list says a session changed.
+const AGE_TEXT = /^(just now|\d+[mhd] ago)$/;
+
+/// The cells of one row of a session list's text, which two or more spaces separate.
+function tableCells(line: string): string[] {
+  return line === "" ? [] : line.split(/ {2,}/);
+}
+
+/// The logs of the sessions `ids`, to show a read wrote nothing.
+function logBytesOf(fixture: Fixture, ids: string[]) {
+  return ids.map((id) => readFileSync(join(storeRoot(fixture.home), id, "log.jsonl")));
+}
+
+test("fx sessions --live lists the sessions other fx processes hold, with their subagents, and drops a killed one", async () => {
+  const fixture = createFixture("fx-v2-live-");
+  mkdirSync(join(fixture.root, "other"));
+  const other = realpathSync(join(fixture.root, "other"));
+  let mainHeld = false;
+  let childHeld = false;
+  const gateway = startDynamicFakeGateway(async (body) => {
+    if (isChildRequest(body)) {
+      childHeld = true;
+      return new Promise<Response>(() => {});
+    }
+    if (body.includes("live-delegate")) return fakeGatewayFinalText("LIVE_SENT");
+    if (body.includes("Delegate the live review.")) {
+      return fakeGatewayToolCall("live-delegate", "subagent", { request: { action: "message", agent: "reviewer", message: "Review the live change." } });
+    }
+    if (body.includes("Hold the live turn.")) {
+      mainHeld = true;
+      return new Promise<Response>(() => {});
+    }
+    return fakeGatewayFinalText("LIVE_SAVED_ANSWER");
+  }, { classifierDecision: "clear" });
+  const holders: ReturnType<typeof spawnAsk>[] = [];
+  try {
+    // A saved session that no process holds is never live.
+    const saved = JSON.parse((await ask(fixture, gateway, ["A saved live question."])).stdout).session_id;
+    expect(await liveSessions(fixture, gateway)).toEqual({ kind: "live_sessions", count: 0, sessions: [] });
+    const none = await command(fixture, gateway, ["sessions", "--live"]);
+    expect(none.code).toBe(0);
+    expect(none.stderr).toBe("");
+    expect(none.stdout).toBe("No live sessions in this workspace.\n");
+
+    holders.push(spawnAsk(fixture, gateway, ["Hold the live turn."]));
+    await until(() => mainHeld, "the held turn");
+    const [working] = newRoots(fixture, [saved]);
+    await waitForLog(fixture, working!, "turn_started");
+    holders.push(spawnAsk(fixture, gateway, ["Delegate the live review."], other));
+    await until(() => childHeld, "the subagent's request");
+    const [delegating] = newRoots(fixture, [saved, working!]);
+    // The parent's turn ends with the receipt while its subagent works.
+    await waitForLog(fixture, delegating!, "turn_committed");
+    const childId = childLines(fixture.home, delegating!)[0].child;
+    const before = logBytesOf(fixture, [working!, delegating!, childId]);
+
+    // This workspace has one live session; the other workspace's is left out.
+    const here = await liveSessions(fixture, gateway);
+    expect(here.sessions).toEqual([{
+      id: working,
+      // A session in its first turn has no title yet.
+      title: "Untitled session",
+      workspace_root: fixture.workspace,
+      saved_model: savedModel(fixture, working!),
+      state: "working",
+      created_at_ms: expect.any(Number),
+      updated_at_ms: expect.any(Number),
+      agents: [],
+    }]);
+
+    const all = await liveSessions(fixture, gateway, ["--all"]);
+    expect(all.sessions.map((entry: any) => entry.id)).toEqual([delegating, working]);
+    expect(all.sessions[0]).toMatchObject({ workspace_root: other, state: "idle", title: "Delegate the live review." });
+    expect(all.sessions[0].agents).toEqual([
+      { name: "reviewer", address: `${delegating}/reviewer`, id: childId, state: "working", agents: [] },
+    ]);
+
+    const text = await command(fixture, gateway, ["sessions", "--live", "--all"]);
+    expect(text.code).toBe(0);
+    expect(text.stderr).toBe("");
+    const model = savedModel(fixture, working!);
+    expect(savedModel(fixture, delegating!)).toBe(model);
+    const lines = text.stdout.split("\n");
+    expect(lines.slice(0, 3)).toEqual(["2 live sessions in all workspaces  ·  1 working  ·  1 idle", `Model ${model}`, ""]);
+    // One row per session in columns, working ones first, each subagent in a tree below its session.
+    expect(lines.slice(3, 9).map(tableCells)).toEqual([
+      ["TITLE", "STATUS", "UPDATED", "SESSION ID", "WORKSPACE"],
+      ["Untitled session", "working", expect.stringMatching(AGE_TEXT), working, fixture.workspace],
+      [],
+      ["Delegate the live review.", "idle", expect.stringMatching(AGE_TEXT), delegating, other],
+      ["└─ reviewer", "working"],
+      [],
+    ]);
+    // Each session id starts where its column's head does.
+    const idColumn = lines[3]!.indexOf("SESSION ID");
+    expect(lines[4]!.indexOf(working!)).toBe(idColumn);
+    expect(lines[6]!.indexOf(delegating!)).toBe(idColumn);
+    expect(lines.slice(9)).toEqual([
+      "Read a session    fx session <session id> --tail 5",
+      "Read a subagent   fx session <session id>/<name> --tail 5",
+      "Every field       fx sessions --live --all --json",
+      "",
+    ]);
+
+    // Listing took no lock that stayed and wrote nothing.
+    expect(logBytesOf(fixture, [working!, delegating!, childId])).toEqual(before);
+
+    // A killed process frees its lock, so its session drops off on the next run.
+    holders[1]!.child.kill("SIGKILL");
+    await holders[1]!.exited;
+    expect((await liveSessions(fixture, gateway, ["--all"])).sessions.map((entry: any) => entry.id)).toEqual([working]);
+    holders[0]!.child.kill("SIGKILL");
+    await holders[0]!.exited;
+    expect(await liveSessions(fixture, gateway, ["--all"])).toEqual({ kind: "live_sessions", count: 0, sessions: [] });
+    // The saved listing is unchanged.
+    const listed = JSON.parse((await command(fixture, gateway, ["sessions", "--all", "--json"])).stdout);
+    expect(listed.kind).toBe("sessions");
+    expect(listed.sessions.map((entry: any) => entry.id).sort()).toEqual([saved, working, delegating].sort());
+  } finally {
+    for (const holder of holders) holder.child.kill("SIGKILL");
+    gateway.stop();
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+}, TIMEOUT * 3);
+
+test("fx session --tail prints the last turns of a held session under their own numbers, and writes nothing", async () => {
+  const fixture = createFixture("fx-v2-tail-");
+  let held = false;
+  const gateway = replyToLatest([
+    ["Tail turn one.", "TAIL_ANSWER_ONE"],
+    ["Tail turn two.", "TAIL_ANSWER_TWO"],
+    ["Tail turn three.", "TAIL_ANSWER_THREE"],
+    ["Tail turn held.", null],
+  ], () => (held = true));
+  let holder: ReturnType<typeof spawnAsk> | undefined;
+  try {
+    const id = JSON.parse((await ask(fixture, gateway, ["Tail turn one."])).stdout).session_id;
+    expect((await ask(fixture, gateway, ["--resume", id, "Tail turn two."])).code).toBe(0);
+    expect((await ask(fixture, gateway, ["--resume", id, "Tail turn three."])).code).toBe(0);
+    holder = spawnAsk(fixture, gateway, ["--resume", id, "Tail turn held."]);
+    await until(() => held, "the held turn");
+    const before = logBytesOf(fixture, [id]);
+
+    const text = await command(fixture, gateway, ["session", id, "--tail", "2"]);
+    expect(text.code).toBe(0);
+    expect(text.stderr).toBe("");
+    expect(text.stdout).toContain("history_len: 3\nfirst_turn: 2\n");
+    expect(text.stdout).toContain("[turn 2]");
+    expect(text.stdout).toContain("[turn 3]");
+    expect(text.stdout).not.toContain("[turn 1]");
+    expect(text.stdout).toContain("Tail turn two.");
+    expect(text.stdout).toContain("TAIL_ANSWER_THREE");
+    expect(text.stdout).not.toContain("Tail turn one.");
+    // The turn in progress is not saved as a turn yet.
+    expect(text.stdout).not.toContain("Tail turn held.");
+
+    const json = JSON.parse((await command(fixture, gateway, ["session", id, "--tail", "2", "--json"])).stdout);
+    expect(json.kind).toBe("session_detail");
+    expect(json.history_len).toBe(3);
+    expect(json.first_turn).toBe(2);
+    expect(json.history.map((turn: any) => turn.user.text)).toEqual(["Tail turn two.", "Tail turn three."]);
+    expect(json.history[1].assistant).toBe("TAIL_ANSWER_THREE");
+
+    // More than the session has prints all of it.
+    const wide = JSON.parse((await command(fixture, gateway, ["session", "--id", id, "--tail", "1000", "--json"])).stdout);
+    expect(wide.first_turn).toBe(1);
+    expect(wide.history).toHaveLength(3);
+    // `last` reads the newest session the same way.
+    const last = JSON.parse((await command(fixture, gateway, ["session", "last", "--tail", "1", "--json"])).stdout);
+    expect(last.id).toBe(id);
+    expect(last.history.map((turn: any) => turn.user.text)).toEqual(["Tail turn three."]);
+    // Without --tail the detail is as it was.
+    const whole = JSON.parse((await command(fixture, gateway, ["session", id, "--json"])).stdout);
+    expect(whole.history).toHaveLength(3);
+    expect(whole.first_turn).toBeUndefined();
+
+    expect(logBytesOf(fixture, [id])).toEqual(before);
+  } finally {
+    holder?.child.kill("SIGKILL");
+    gateway.stop();
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+}, TIMEOUT * 3);
+
+test("fx session shows saved control bytes as visible escapes, with --tail and without", async () => {
+  const fixture = createFixture("fx-v2-escape-");
+  const saved = "TITLE \x1b]0;owned\x07 CLEAR \x1b[2J\nSECOND\tLINE";
+  const gateway = replyToLatest([
+    ["Escape turn one.", "PLAIN_ANSWER"],
+    ["Escape turn two.", saved],
+  ]);
+  try {
+    const id = JSON.parse((await ask(fixture, gateway, ["Escape turn one."])).stdout).session_id;
+    expect((await ask(fixture, gateway, ["--resume", id, "Escape turn two."])).code).toBe(0);
+    for (const args of [["session", id], ["session", id, "--tail", "1"]]) {
+      const shown = await command(fixture, gateway, args);
+      expect(shown.code).toBe(0);
+      expect(shown.stderr).toBe("");
+      // The terminal gets no escape or bell, and lines and tabs stay.
+      expect(shown.stdout).not.toMatch(/[\x1b\x07]/);
+      expect(shown.stdout).toContain("TITLE \\x1b]0;owned\\x07 CLEAR \\x1b[2J\nSECOND\tLINE\n");
+    }
+    // JSON keeps the saved text as it is.
+    const json = JSON.parse((await command(fixture, gateway, ["session", id, "--tail", "1", "--json"])).stdout);
+    expect(json.history[0].assistant).toBe(saved);
+  } finally {
+    gateway.stop();
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+}, TIMEOUT * 2);
+
+test.skipIf(!tmuxAvailable())("fx sessions fits a terminal in color, and NO_COLOR, TERM=dumb, and a pipe get whole plain titles", async () => {
+  const fixture = createFixture("fx-v2-list-terminal-");
+  const prompt = "Plan the move of every saved session to the new store and check each one.";
+  const gateway = startFakeGateway([fakeGatewayFinalText("PLANNED")]);
+  const panes: TmuxSession[] = [];
+  const sgr = /\x1b\[[0-9;]*m/g;
+  // What `fx sessions` printed in a 60-column terminal with `extra` in its environment, with its escapes.
+  const inTerminal = async (extra: Record<string, string | undefined>) => {
+    const pane = await TmuxSession.create({
+      cmd: `${FX_BIN} sessions`,
+      cwd: fixture.workspace,
+      env: { ...env(fixture, gateway), NO_COLOR: undefined, ...extra },
+      width: 60,
+      remainOnExit: true,
+    });
+    panes.push(pane);
+    await pane.waitForText("Running now", TIMEOUT);
+    // Only the list, through its last line, and not what tmux shows after fx exits.
+    const lines = (await pane.capturePaneEscapes()).split("\n");
+    return lines.slice(0, lines.findIndex((line) => line.replace(sgr, "").startsWith("Running now")) + 1).join("\n");
+  };
+  try {
+    const id = JSON.parse((await ask(fixture, gateway, [prompt])).stdout).session_id;
+    const saved = JSON.parse((await command(fixture, gateway, ["sessions", "--json"])).stdout).sessions[0];
+    expect(saved.id).toBe(id);
+    // Wider than the 29 columns the title gets in this window.
+    const title: string = saved.title;
+    expect(title.length).toBeGreaterThan(29);
+
+    // A terminal that takes color gets color, and the title is cut so the row fits the window.
+    const styled = await inTerminal({});
+    expect(styled).toContain("\x1b[");
+    const rows = styled.replace(sgr, "").split("\n").map((line) => line.trimEnd());
+    const row = rows.find((line) => line.endsWith(id))!;
+    expect(row).toContain("…");
+    expect(row).not.toContain(title);
+    for (const line of rows) expect(line.length).toBeLessThanOrEqual(60);
+
+    // NO_COLOR, TERM=dumb, and a pipe get no color and the whole title.
+    for (const extra of [{ NO_COLOR: "1" }, { TERM: "dumb" }]) {
+      const plain = await inTerminal(extra);
+      expect(plain).not.toContain("\x1b[");
+      expect(plain).toContain(title);
+      expect(plain).not.toContain("…");
+    }
+    const piped = await command(fixture, gateway, ["sessions"]);
+    expect(piped.code).toBe(0);
+    expect(piped.stdout).not.toMatch(/[\x1b…]/);
+    expect(piped.stdout.split("\n").find((line) => line.includes(id))).toContain(title);
+  } finally {
+    for (const pane of panes) await pane.kill();
+    gateway.stop();
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+}, TIMEOUT * 4);
+
+test("fx session <id>/<agent> reads a subagent by the name its parent gave it", async () => {
+  const fixture = createFixture("fx-v2-agent-read-");
+  let round: 1 | 2 = 1;
+  const gateway = startDynamicFakeGateway((body) => {
+    if (isChildRequest(body)) return fakeGatewayFinalText(body.includes("Review round two.") ? "AGENT_REVIEW_TWO" : "AGENT_REVIEW_ONE");
+    if (isReportTurn(body)) return fakeGatewayFinalText(round === 1 ? "AGENT_REPORT_ONE" : "AGENT_REPORT_TWO");
+    const call = round === 1 ? "agent-one" : "agent-two";
+    if (body.includes(call)) return fakeGatewayFinalText(round === 1 ? "AGENT_SENT_ONE" : "AGENT_SENT_TWO");
+    return fakeGatewayToolCall(call, "subagent", { request: { action: "message", agent: "reviewer", message: round === 1 ? "Review round one." : "Review round two." } });
+  }, { classifierDecision: "clear" });
+  try {
+    const id = JSON.parse((await ask(fixture, gateway, ["First agent review."])).stdout).session_id;
+    round = 2;
+    expect((await ask(fixture, gateway, ["--resume", id, "Second agent review."])).code).toBe(0);
+    const childId = childLines(fixture.home, id)[0].child;
+    const before = logBytesOf(fixture, [id, childId]);
+
+    const whole = await command(fixture, gateway, ["session", `${id}/reviewer`, "--json"]);
+    expect(whole.code).toBe(0);
+    expect(whole.stderr).toBe("");
+    const detail = JSON.parse(whole.stdout);
+    expect(detail).toMatchObject({ kind: "session_detail", id: childId, address: `${id}/reviewer`, history_len: 2 });
+    expect(detail.history.map((turn: any) => turn.assistant)).toEqual(["AGENT_REVIEW_ONE", "AGENT_REVIEW_TWO"]);
+
+    const tail = JSON.parse((await command(fixture, gateway, ["session", `${id}/reviewer`, "--tail", "1", "--json"])).stdout);
+    expect(tail).toMatchObject({ id: childId, address: `${id}/reviewer`, history_len: 2, first_turn: 2 });
+    expect(tail.history.map((turn: any) => turn.assistant)).toEqual(["AGENT_REVIEW_TWO"]);
+    const text = await command(fixture, gateway, ["session", "--id", `${id}/reviewer`, "--tail", "1"]);
+    expect(text.code).toBe(0);
+    expect(text.stdout).toContain(`[session] ${childId}\naddress: ${id}/reviewer\n`);
+    expect(text.stdout).toContain("[turn 2]");
+    expect(text.stdout).toContain("AGENT_REVIEW_TWO");
+    expect(text.stdout).not.toContain("AGENT_REVIEW_ONE");
+
+    // An unknown name fails and names the agents the session has.
+    const unknown = await command(fixture, gateway, ["session", `${id}/nobody`, "--json"]);
+    expect(unknown.code).toBe(1);
+    expect(JSON.parse(unknown.stdout)).toMatchObject({ kind: "session", code: "AgentNotFound" });
+    expect(JSON.parse(unknown.stdout).error).toBe(`session ${id} has no agent named nobody; its agents: reviewer`);
+    const unknownText = await command(fixture, gateway, ["session", `${id}/nobody`]);
+    expect(unknownText.code).toBe(1);
+    expect(unknownText.stderr).toBe(`fx session: session ${id} has no agent named nobody; its agents: reviewer\n`);
+    const deeper = await command(fixture, gateway, ["session", `${id}/reviewer/helper`, "--json"]);
+    expect(deeper.code).toBe(1);
+    expect(JSON.parse(deeper.stdout).error).toBe(`session ${id}/reviewer has no agent named helper; it has no agents`);
+    // A part no subagent can have is named, with the rule it breaks.
+    const rule = 'agent names are lowercase letters, digits, "_", and "-", start with a letter or digit, and are at most 64 bytes';
+    for (const [target, message] of [
+      [`${id}/Reviewer`, `Reviewer is not an agent name; ${rule}`],
+      [`${id}/reviewer/x.y`, `x.y is not an agent name; ${rule}`],
+      [`${id}/`, `${id}/ has an empty agent name`],
+      [`${id}//reviewer`, `${id}//reviewer has an empty agent name`],
+      [`${id}/a/b/c/d/e`, `${id}/a/b/c/d/e goes more than 4 agents deep`],
+    ]) {
+      const bad = await command(fixture, gateway, ["session", target!, "--json"]);
+      expect(bad.code).toBe(1);
+      expect(JSON.parse(bad.stdout)).toMatchObject({ kind: "session", code: "InvalidAgentAddress", error: message });
+      const badText = await command(fixture, gateway, ["session", target!]);
+      expect(badText.code).toBe(1);
+      expect(badText.stderr).toBe(`fx session: ${message}\n`);
+    }
+    // A root that is not a session id is still an invalid session id.
+    const noRoot = await command(fixture, gateway, ["session", "/reviewer", "--json"]);
+    expect(noRoot.code).toBe(1);
+    expect(JSON.parse(noRoot.stdout).code).toBe("InvalidSessionId");
+    // A child is still reached only through its parent.
+    const direct = await command(fixture, gateway, ["session", childId, "--json"]);
+    expect(direct.code).toBe(1);
+    expect(JSON.parse(direct.stdout).code).toBe("SessionNotFound");
+
+    expect(logBytesOf(fixture, [id, childId])).toEqual(before);
+  } finally {
+    gateway.stop();
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+}, TIMEOUT * 3);
+
+test("fx sessions --live and fx session --tail refuse bad flags with exit 2", async () => {
+  const fixture = createFixture("fx-v2-live-flags-");
+  const gateway = startFakeGateway([fakeGatewayFinalText("FLAGS_ANSWER")]);
+  try {
+    const id = JSON.parse((await ask(fixture, gateway, ["A flags question."])).stdout).session_id;
+    for (const value of ["0", "1001", "abc", "-1"]) {
+      const bad = await command(fixture, gateway, ["session", id, "--tail", value]);
+      expect(bad.code).toBe(2);
+      expect(bad.stdout).toBe("");
+      expect(bad.stderr).toContain(`fx session: --tail takes a whole number from 1 to 1000, not ${value}\n`);
+      const json = await command(fixture, gateway, ["session", id, "--tail", value, "--json"]);
+      expect(json.code).toBe(2);
+      expect(json.stderr).toBe("");
+      expect(JSON.parse(json.stdout)).toMatchObject({ kind: "session", error: `--tail takes a whole number from 1 to 1000, not ${value}` });
+    }
+    const missing = await command(fixture, gateway, ["session", id, "--tail"]);
+    expect(missing.code).toBe(2);
+    expect(missing.stderr).toContain("--tail");
+    const recover = await command(fixture, gateway, ["session", "recover", id, "--tail", "1"]);
+    expect(recover.code).toBe(2);
+
+    for (const flags of [["--cursor", `v1:1:${id}`], ["--limit", "5"]]) {
+      const bad = await command(fixture, gateway, ["sessions", "--live", ...flags]);
+      expect(bad.code).toBe(2);
+      expect(bad.stdout).toBe("");
+      expect(bad.stderr).toContain(`fx sessions: --live lists every live session, so it takes no ${flags[0]}\n`);
+      const json = await command(fixture, gateway, ["sessions", ...flags, "--live", "--json"]);
+      expect(json.code).toBe(2);
+      expect(json.stderr).toBe("");
+      expect(JSON.parse(json.stdout)).toMatchObject({ kind: "sessions", error: `--live lists every live session, so it takes no ${flags[0]}` });
+    }
+
+    const sessionsHelp = await command(fixture, gateway, ["sessions", "--help"]);
+    expect(sessionsHelp.stdout).toContain("--live");
+    const sessionHelp = await command(fixture, gateway, ["session", "--help"]);
+    expect(sessionHelp.stdout).toContain("--tail <1-1000>");
+  } finally {
+    gateway.stop();
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+}, TIMEOUT * 2);
+
+test("fx sessions --live lists a live session whose log is damaged, skips a folder it cannot open, and keeps a subagent whose log is gone", async () => {
+  const fixture = createFixture("fx-v2-live-faults-");
+  let mainHeld = false;
+  let childHeld = false;
+  const gateway = startDynamicFakeGateway(async (body) => {
+    if (isChildRequest(body)) {
+      childHeld = true;
+      return new Promise<Response>(() => {});
+    }
+    if (body.includes("fault-delegate")) return fakeGatewayFinalText("FAULT_SENT");
+    if (body.includes("Delegate the fault review.")) {
+      return fakeGatewayToolCall("fault-delegate", "subagent", { request: { action: "message", agent: "checker", message: "Check the fault." } });
+    }
+    if (body.includes("Hold the damaged turn.")) {
+      mainHeld = true;
+      return new Promise<Response>(() => {});
+    }
+    return fakeGatewayFinalText("FAULT_SAVED_ANSWER");
+  }, { classifierDecision: "clear" });
+  const holders: ReturnType<typeof spawnAsk>[] = [];
+  const locked: string[] = [];
+  try {
+    const first = await ask(fixture, gateway, ["A damaged live question."]);
+    const damaged = JSON.parse(first.stdout).session_id;
+    const shut = JSON.parse((await ask(fixture, gateway, ["A shut folder question."])).stdout).session_id;
+    holders.push(spawnAsk(fixture, gateway, ["--resume", damaged, "Hold the damaged turn."]));
+    await until(() => mainHeld, "the held turn");
+    holders.push(spawnAsk(fixture, gateway, ["Delegate the fault review."]));
+    await until(() => childHeld, "the subagent's request");
+    const [delegating] = newRoots(fixture, [damaged, shut]);
+    await waitForLog(fixture, delegating!, "turn_committed");
+    const childId = childLines(fixture.home, delegating!)[0].child;
+
+    // A flipped byte inside the held session's log: it is still live, and
+    // its state can't be read.
+    flipMiddleByte(join(storeRoot(fixture.home), damaged, "log.jsonl"));
+    // A saved folder nobody can open is not live, and the scan goes on.
+    chmodSync(join(storeRoot(fixture.home), shut), 0o000);
+    locked.push(join(storeRoot(fixture.home), shut));
+    // A subagent whose own log is gone is still listed from its parent's.
+    rmSync(join(storeRoot(fixture.home), childId), { recursive: true, force: true });
+
+    const listed = await liveSessions(fixture, gateway);
+    const byId = new Map(listed.sessions.map((entry: any) => [entry.id, entry]));
+    expect([...byId.keys()].sort()).toEqual([damaged, delegating].sort());
+    expect(byId.get(damaged)).toMatchObject({ state: "unknown", saved_model: null, agents: [] });
+    expect((byId.get(delegating!) as any).agents).toEqual([
+      { name: "checker", address: `${delegating}/checker`, id: childId, state: "working", agents: [] },
+    ]);
+    // Reading the missing subagent fails as missing.
+    const gone = await command(fixture, gateway, ["session", `${delegating}/checker`, "--tail", "1", "--json"]);
+    expect(gone.code).toBe(1);
+    expect(JSON.parse(gone.stdout).code).toBe("SessionNotFound");
+  } finally {
+    for (const path of locked) chmodSync(path, 0o700);
+    for (const holder of holders) holder.child.kill("SIGKILL");
+    gateway.stop();
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+}, TIMEOUT * 3);
+
+/// The newest user text of a Gateway request.
+function latestUserPlainText(body: string): string {
+  const user = (JSON.parse(body).prompt ?? []).filter((message: any) => message.role === "user").at(-1);
+  if (!user) return "";
+  if (typeof user.content === "string") return user.content;
+  return (user.content ?? []).map((part: any) => (typeof part?.text === "string" ? part.text : "")).join("");
+}
+
+test("fx sessions --live leaves out a subagent its parent closed for good", async () => {
+  const fixture = createFixture("fx-v2-live-closed-");
+  let held = false;
+  const gateway = startDynamicFakeGateway(async (body) => {
+    if (isChildRequest(body)) return fakeGatewayFinalText(body.includes("Come back.") ? "GONER_BACK" : "CLOSED_CHILD_ANSWER");
+    if (isReportTurn(body)) return fakeGatewayFinalText("CLOSED_REPORT_READ");
+    const latest = latestUserPlainText(body);
+    if (latest.includes("Start the goner again.")) {
+      if (!body.includes("again-goner")) return fakeGatewayToolCall("again-goner", "subagent", { request: { action: "message", agent: "goner", message: "Come back." } });
+      return fakeGatewayFinalText("GONER_STARTED_AGAIN");
+    }
+    if (latest.includes("Start two helpers.")) {
+      if (!body.includes("start-keeper")) return fakeGatewayToolCall("start-keeper", "subagent", { request: { action: "message", agent: "keeper", message: "Keep going." } });
+      if (!body.includes("start-goner")) return fakeGatewayToolCall("start-goner", "subagent", { request: { action: "message", agent: "goner", message: "Finish and go." } });
+      return fakeGatewayFinalText("BOTH_SENT");
+    }
+    if (latest.includes("Close the goner.")) {
+      if (!body.includes("close-goner")) return fakeGatewayToolCall("close-goner", "subagent", { request: { action: "close", agent: "goner" } });
+      return fakeGatewayFinalText("GONER_CLOSED");
+    }
+    if (latest.includes("Hold the closed check.")) {
+      held = true;
+      return new Promise<Response>(() => {});
+    }
+    return fakeGatewayFinalText("CLOSED_UNEXPECTED");
+  }, { classifierDecision: "clear" });
+  let holder: ReturnType<typeof spawnAsk> | undefined;
+  try {
+    const id = JSON.parse((await ask(fixture, gateway, ["Start two helpers."])).stdout).session_id;
+    await waitForSettledChild(fixture, id, 2);
+    expect((await ask(fixture, gateway, ["--resume", id, "Close the goner."])).code).toBe(0);
+    const keeper = childLines(fixture.home, id).find((line) => line.data.agent === "keeper").child;
+    expect(childLines(fixture.home, id).some((line) => line.kind === "child_finished" && line.data.closed === true)).toBe(true);
+    holder = spawnAsk(fixture, gateway, ["--resume", id, "Hold the closed check."]);
+    await until(() => held, "the held turn");
+
+    const listed = await liveSessions(fixture, gateway);
+    expect(listed.sessions.map((entry: any) => entry.id)).toEqual([id]);
+    expect(listed.sessions[0].agents).toEqual([{ name: "keeper", address: `${id}/keeper`, id: keeper, state: "idle", agents: [] }]);
+    // A closed subagent still reads by its name: its turns stay saved.
+    const goner = await command(fixture, gateway, ["session", `${id}/goner`, "--tail", "1", "--json"]);
+    expect(goner.code).toBe(0);
+    expect(JSON.parse(goner.stdout).history.map((turn: any) => turn.assistant)).toEqual(["CLOSED_CHILD_ANSWER"]);
+    const closedGoner = JSON.parse(goner.stdout).id;
+
+    // A new subagent under the closed one's name takes the name: the list
+    // shows it, and the address reads it, not the closed one.
+    holder.child.kill("SIGKILL");
+    await holder.exited;
+    held = false;
+    // fx ask exits only after its subagent's report, so the work is done.
+    expect((await ask(fixture, gateway, ["--resume", id, "Start the goner again."])).code).toBe(0);
+    holder = spawnAsk(fixture, gateway, ["--resume", id, "Hold the closed check."]);
+    await until(() => held, "the second held turn");
+    const again = await liveSessions(fixture, gateway);
+    const agents = again.sessions[0].agents;
+    expect(agents.map((agent: any) => agent.name)).toEqual(["keeper", "goner"]);
+    const newGoner = agents[1].id;
+    expect(newGoner).not.toBe(closedGoner);
+    const read = JSON.parse((await command(fixture, gateway, ["session", `${id}/goner`, "--json"])).stdout);
+    expect(read.id).toBe(newGoner);
+    expect(read.history.map((turn: any) => turn.assistant)).toEqual(["GONER_BACK"]);
+  } finally {
+    holder?.child.kill("SIGKILL");
+    gateway.stop();
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+}, TIMEOUT * 3);
+
+test.skipIf(!tmuxAvailable())("fx sessions --live shows an interactive fx's subagent and that subagent's own subagent", async () => {
+  const fixture = createFixture("fx-v2-live-nested-");
+  let helperHeld = false;
+  const typed = ["Start the nested review."];
+  const gateway = startDynamicFakeGateway(async (body) => {
+    if (isAppChildRequest(body, typed)) {
+      if (body.includes('You are the subagent \\"helper\\"')) {
+        helperHeld = true;
+        return new Promise<Response>(() => {});
+      }
+      if (body.includes("lead-sub")) return fakeGatewayFinalText("LEAD_STARTED_HELPER");
+      return fakeGatewayToolCall("lead-sub", "subagent", { request: { action: "message", agent: "helper", message: "Help with the nested review." } });
+    }
+    if (isReportTurn(body)) return fakeGatewayFinalText("MAIN_READ_LEAD");
+    if (body.includes("main-sub")) return fakeGatewayFinalText("MAIN_SENT_LEAD");
+    return fakeGatewayToolCall("main-sub", "subagent", { request: { action: "message", agent: "lead", message: "Lead the nested review." } });
+  }, { classifierDecision: "clear" });
+  let app: { session: TmuxSession; stderrPath: string } | undefined;
+  try {
+    app = await startApp(fixture, gateway, [], true, { FX_PERMISSION_MODE: "auto" });
+    await app.session.sendText(typed[0]!);
+    await until(() => helperHeld, "the helper's request");
+    await scrollbackContains(app.session, "MAIN_READ_LEAD");
+    const [id] = rootSessionIds(fixture.home);
+    const leadId = childLines(fixture.home, id!).find((line) => line.data.agent === "lead").child;
+    const helperId = childLines(fixture.home, leadId).find((line) => line.data.agent === "helper").child;
+    await until(() => logLines(fixture.home, id!).filter((line) => line.kind === "turn_started").length === logLines(fixture.home, id!).filter((line) => line.kind === "turn_committed").length, "main's turns to end");
+
+    const listed = await liveSessions(fixture, gateway);
+    expect(listed.sessions.map((entry: any) => entry.id)).toEqual([id]);
+    expect(listed.sessions[0].state).toBe("idle");
+    expect(listed.sessions[0].agents).toEqual([{
+      name: "lead",
+      address: `${id}/lead`,
+      id: leadId,
+      state: "idle",
+      agents: [{ name: "helper", address: `${id}/lead/helper`, id: helperId, state: "working", agents: [] }],
+    }]);
+    const text = await command(fixture, gateway, ["sessions", "--live"]);
+    expect(text.stdout).toMatch(/\n└─ lead +idle\n   └─ helper +working\n/);
+    // The helper has no finished turn yet; lead has one.
+    const helper = JSON.parse((await command(fixture, gateway, ["session", `${id}/lead/helper`, "--tail", "1", "--json"])).stdout);
+    expect(helper).toMatchObject({ id: helperId, address: `${id}/lead/helper`, history_len: 0, history: [] });
+    const lead = JSON.parse((await command(fixture, gateway, ["session", `${id}/lead`, "--tail", "1", "--json"])).stdout);
+    expect(lead.history.map((turn: any) => turn.assistant)).toEqual(["LEAD_STARTED_HELPER"]);
+  } finally {
+    await app?.session.kill();
+    gateway.stop();
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+}, TIMEOUT * 3);
+
 test("fx session recover copies the good turns and side files of a damaged session, which stays as it was", async () => {
   const fixture = createFixture("fx-v2-recover-");
   const gateway = startFakeGateway([
@@ -2623,23 +5156,31 @@ test("doctor reports a damaged session and removes only old terminal and side fo
     // An old folder whose session exists is never an orphan.
     utimesSync(keptTerminal, twoDaysAgo, twoDaysAgo);
 
-    const result = await command(fixture, gateway, ["doctor", "--json"]);
-    expect(result.code).toBe(0);
+    const named = (checks: any[], name: string) => checks.filter((check) => check.name === name).map((check) => `${check.status}: ${check.detail}`);
+    // Without --fix, doctor names the old folders and removes nothing.
+    const looked = JSON.parse((await command(fixture, gateway, ["doctor", "--json"])).stdout).checks;
+    expect(named(looked, "session")).toEqual([
+      `warn: session ${damaged} has a damaged log; \`fx session recover ${damaged}\` copies its good turns`,
+      "warn: 2 old terminal or side folder(s) whose session is gone can be removed",
+    ]);
+    expect(existsSync(old)).toBe(true);
+    expect(existsSync(oldTerminal)).toBe(true);
+
+    const result = await command(fixture, gateway, ["doctor", "--json", "--fix"]);
     const checks: any[] = JSON.parse(result.stdout).checks;
-    const named = (name: string) => checks.filter((check) => check.name === name).map((check) => `${check.status}: ${check.detail}`);
-    expect(named("state")).toEqual(["ok: sessions ready"]);
-    expect(named("session")).toEqual([
+    expect(named(checks, "state")).toEqual(["ok: sessions ready"]);
+    expect(named(checks, "session")).toEqual([
       `warn: session ${damaged} has a damaged log; \`fx session recover ${damaged}\` copies its good turns`,
       "ok: removed 2 terminal or side folder(s) whose session is gone",
     ]);
-    expect(named("sessions")).toEqual([`ok: 2 saved session(s); latest=${damaged}`]);
+    expect(named(checks, "sessions")).toEqual([`ok: 2 saved session(s); latest=${damaged}`]);
     expect(existsSync(old)).toBe(false);
     expect(existsSync(oldTerminal)).toBe(false);
     expect(existsSync(young)).toBe(true);
     expect(existsSync(keptTerminal)).toBe(true);
     // Doctor reports damage and repairs nothing.
     expect(readFileSync(path)).toEqual(before);
-    const again = JSON.parse((await command(fixture, gateway, ["doctor", "--json"])).stdout).checks;
+    const again = JSON.parse((await command(fixture, gateway, ["doctor", "--json", "--fix"])).stdout).checks;
     expect(again.filter((check: any) => check.detail.includes("removed"))).toEqual([]);
 
   } finally {
@@ -2688,6 +5229,48 @@ test("doctor reports a session whose blob went missing, and recover copies the t
     expect(last).not.toContain("RECOVER_TURN_THREE");
     expect(readFileSync(logPath)).toEqual(before);
     expectWholeLog(fixture, copy);
+  } finally {
+    gateway.stop();
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+}, TIMEOUT * 3);
+
+test("plain doctor only checks that each blob is there, --deep reads it, and the time limit is reported", async () => {
+  const fixture = createFixture("fx-v2-doctor-deep-");
+  const big = "DEEP_BLOB_START " + "blob-body ".repeat(30_000) + "DEEP_BLOB_END";
+  const gateway = startFakeGateway([fakeGatewayFinalText(big), fakeGatewayFinalText("DEEP_TURN_TWO")]);
+  try {
+    const id = JSON.parse((await ask(fixture, gateway, ["Deep question one."])).stdout).session_id;
+    expect((await ask(fixture, gateway, ["--resume", id, "Deep question two."])).code).toBe(0);
+    const [name] = blobNames(fixture, id);
+    expect(name).toBeDefined();
+    // Other bytes under the blob's name: the file is there, but its hash no
+    // longer matches.
+    const blob = join(storeRoot(fixture.home), id, "blobs", name!);
+    const bytes = Buffer.from(readFileSync(blob));
+    bytes[bytes.length - 1] = bytes[bytes.length - 1]! ^ 1;
+    rmSync(blob);
+    writeFileSync(blob, bytes, { mode: 0o400 });
+    const damaged = `warn: session ${id} has a damaged log; \`fx session recover ${id}\` copies its good turns`;
+    const named = (checks: any[], name: string) => checks.filter((check) => check.name === name).map((check) => `${check.status}: ${check.detail}`);
+
+    const plain = await command(fixture, gateway, ["doctor", "--json"]);
+    expect(plain.stderr).toBe("");
+    expect(named(JSON.parse(plain.stdout).checks, "session")).toEqual([]);
+    const deep = await command(fixture, gateway, ["doctor", "--json", "--deep"]);
+    expect(deep.stderr).toBe("");
+    expect(named(JSON.parse(deep.stdout).checks, "session")).toEqual([damaged]);
+
+    // With a limit already over before the session check starts, plain
+    // doctor says what it did not check, and --deep, which has no limit,
+    // still checks it.
+    const limited = { cwd: fixture.workspace, env: { ...env(fixture, gateway), FX_TEST_DOCTOR_DEADLINE_MS: "0" }, timeoutMs: TIMEOUT };
+    const cut = JSON.parse((await runFx(["doctor", "--json"], limited)).stdout).checks;
+    expect(named(cut, "sessions")).toContain("ok: 1 of 1 session(s) were not checked to the end in doctor's 0 s limit; fx doctor --deep checks them all");
+    expect(named(cut, "session")).toEqual([]);
+    const whole = JSON.parse((await runFx(["doctor", "--json", "--deep"], limited)).stdout).checks;
+    expect(named(whole, "sessions").filter((line) => line.includes("not checked"))).toEqual([]);
+    expect(named(whole, "session")).toEqual([damaged]);
   } finally {
     gateway.stop();
     rmSync(fixture.root, { recursive: true, force: true });
@@ -2962,7 +5545,7 @@ test("a parent killed while a named child runs a tool records that work interrup
     child.kill("SIGKILL");
     await exited;
     // fx's own processes go with it.
-    await until(() => { try { process.kill(toolPid, 0); return false; } catch { return true; } }, "the child's tool to stop");
+    await until(() => !processAlive(toolPid), "the child's tool to stop");
 
     const last = await command(fixture, gateway, ["session", "last", "--json"]);
     expect(last.code).toBe(0);
@@ -3010,7 +5593,7 @@ test.skipIf(!tmuxAvailable())("the app talks to the user while a child runs, and
   writeFileSync(join(fixture.workspace, "after-child.txt"), "AFTER_CHILD_TOOL_OK");
   const gateway = startDynamicFakeGateway((raw) => {
     const body = JSON.parse(raw);
-    const latest = JSON.stringify(body.prompt?.filter((item: any) => item.role === "user").at(-1)?.content);
+    const latest = withoutContextUpdates(JSON.stringify(body.prompt?.filter((item: any) => item.role === "user").at(-1)?.content));
     if (latest.includes("STEERING_CHILD")) {
       childRequests++;
       return held.response;
@@ -3060,7 +5643,9 @@ test.skipIf(!tmuxAvailable())("the app talks to the user while a child runs, and
 
     held.release("HELD_CHILD_RESULT");
     const reported = await tui.waitForText("CHILD_COMPLETE", 10000);
-    expect(reported).toContain("Report from worker: completed (ctrl+o to view)");
+    // The report shows as a finished subagent row, not as the user's prompt.
+    expect(reported).toContain("worker finished");
+    expect(reported).not.toContain("Subagent report (untrusted");
     // The report's turn: its tool call, then its reply.
     expect(requests.filter((raw) => isReportTurn(raw) && raw.includes("HELD_CHILD_RESULT"))).toHaveLength(2);
     await until(() => childWork(fixture.home, parent).outcome === "ok", "the child's work to be recorded done");
@@ -3130,8 +5715,10 @@ async function appExit(fixture: Fixture, gateway: any, args: string[]) {
     stderrPath,
     remainOnExit: true,
   });
-  await until(() => session.paneStatus().dead === true, "the app to exit");
-  const status = session.paneStatus().status;
+  // The pane's wrapper records fx's exit status as fx exits; tmux can mark
+  // the pane dead many seconds later.
+  await until(() => session.recordedExitStatus() !== null, "the app to exit");
+  const status = session.recordedExitStatus();
   await session.kill();
   return { status, stderr: readFileSync(stderrPath, "utf8") };
 }
@@ -3199,7 +5786,7 @@ test("ACP killed between prompts loads with its last turn whole", async () => {
   }
 }, TIMEOUT * 3);
 
-test.skipIf(!tmuxAvailable())("the app refuses a damaged session, a busy one and a read-only one, and says which", async () => {
+test.skipIf(!tmuxAvailable() || fileModesIgnored)("the app refuses a damaged session, a busy one and a read-only one, and says which", async () => {
   const fixture = createFixture("fx-v2-app-faults-");
   const gateway = startDynamicFakeGateway(() => fakeGatewayFinalText("FAULT_ANSWER"));
   try {
@@ -3242,7 +5829,7 @@ test.skipIf(!tmuxAvailable())("the app refuses a damaged session, a busy one and
   }
 }, TIMEOUT * 5);
 
-test("ACP refuses a damaged or read-only session and leaves its log as it was", async () => {
+test.skipIf(fileModesIgnored)("ACP refuses a damaged or read-only session and leaves its log as it was", async () => {
   const fixture = createFixture("fx-v2-acp-faults-");
   const gateway = startDynamicFakeGateway(() => fakeGatewayFinalText("FAULT_ANSWER"));
   let client: AcpRpc | undefined;
@@ -3529,14 +6116,6 @@ test.skipIf(!tmuxAvailable())("a hosted terminal ends with an app crash, and the
     fakeGatewayFinalText("TTY_ENDED_REPORTED"),
   ]);
   const appEnv = { FX_PERMISSION_MODE: "full-access", SHELL: "/bin/sh" };
-  const alive = (pid: number) => {
-    try {
-      process.kill(pid, 0);
-      return true;
-    } catch {
-      return false;
-    }
-  };
   try {
     const app = await startApp(fixture, gateway, [], true, appEnv);
     await app.session.sendText("Start a terminal.");
@@ -3544,15 +6123,24 @@ test.skipIf(!tmuxAvailable())("a hosted terminal ends with an app crash, and the
     expect(shellId).toMatch(/^shell-[A-Za-z0-9_-]{22}$/);
     const id = onlySessionId(fixture.home);
     await waitForLog(fixture, id, "turn_committed");
-    const shellPid = Number(terminalRecords(fixture, id).find((record) => record.session_id === shellId)?.pid);
-    expect(alive(shellPid)).toBe(true);
+    // The run returned at once, so the record may not hold the shell's pid
+    // until the shell has started.
+    let shellPid = 0;
+    const pidDeadline = Date.now() + TIMEOUT;
+    while (Date.now() < pidDeadline) {
+      shellPid = Number(terminalRecords(fixture, id).find((record) => record.session_id === shellId)?.pid ?? 0);
+      if (shellPid > 0) break;
+      await Bun.sleep(10);
+    }
+    expect(shellPid).toBeGreaterThan(0);
+    expect(processAlive(shellPid)).toBe(true);
     Bun.spawnSync(["kill", "-9", String(app.session.processPid())]);
     await app.session.kill();
 
     // The terminal belonged to the crashed process and ended with it.
     const deadline = Date.now() + 2_000;
-    while (alive(shellPid) && Date.now() < deadline) await Bun.sleep(10);
-    expect(alive(shellPid)).toBe(false);
+    while (processAlive(shellPid) && Date.now() < deadline) await Bun.sleep(10);
+    expect(processAlive(shellPid)).toBe(false);
 
     const resumed = await startApp(fixture, gateway, ["--resume", id], true, appEnv);
     await resumed.session.sendText("Talk to the terminal, then stop it.");
@@ -3798,9 +6386,12 @@ const GRID_SAYS: Record<"damaged" | "denied" | "busy" | "full", Record<GridHost,
   damaged: { ask: /InvalidSessionFormat/, app: /saved session is unreadable/, acp: /^Session could not be loaded$/ },
   denied: { ask: /AccessDenied/, app: /permission denied|AccessDenied/, acp: /permission denied/ },
   busy: { ask: /SessionBusy/, app: /another fx process may be using this session/, acp: /^Session is busy$/ },
+  // The app's pattern leaves out the terminal recording's line, which names
+  // the same fault: a recording that started on the full disk is a leak from
+  // the environment, not the session's refusal this row checks.
   full: REAL_FULL_DISK
-    ? { ask: /NoSpaceLeft/, app: /NoSpaceLeft|the disk is full/, acp: /the disk is full/ }
-    : { ask: /FileTooBig/, app: /FileTooBig|a file-size limit was reached/, acp: /a file-size limit was reached/ },
+    ? { ask: /NoSpaceLeft/, app: /NoSpaceLeft|(?<!terminal recording: )the disk is full/, acp: /the disk is full/ }
+    : { ask: /FileTooBig/, app: /FileTooBig|(?<!terminal recording: )a file-size limit was reached/, acp: /a file-size limit was reached/ },
 };
 
 /// A first reply over the blob limit, so every base session has a blob.
@@ -3982,10 +6573,12 @@ async function gridEnter(entry: GridEntry, c: GridCase, gateway: any, token: str
         writeFileSync(cmd, `#!/bin/sh\ntrap '' XFSZ\nulimit -f ${limit}\nexec '${FX_BIN}' ${args}\n`, { mode: 0o700 });
       }
       const session = await TmuxSession.create({ cmd, cwd: c.fixture.workspace, env: { ...env(c.fixture, gateway), NO_COLOR: "1" }, stderrPath, remainOnExit: true });
-      // The pane stays after fx exits, so its end is the pane dying.
+      // The pane stays after fx exits, so its end is the exit status the
+      // pane's wrapper records; tmux can mark the pane dead many seconds later.
+      const exited = () => session.recordedExitStatus() !== null;
       const exit = async (what: string) => {
         const deadline = Date.now() + TIMEOUT;
-        while (!session.paneStatus().dead) {
+        while (!exited()) {
           if (Date.now() > deadline) throw new Error(`${entry}: the app did not exit ${what}`);
           await Bun.sleep(50);
         }
@@ -3994,12 +6587,12 @@ async function gridEnter(entry: GridEntry, c: GridCase, gateway: any, token: str
         // Either the composer shows or the app refuses and exits.
         let settled = false;
         const died = (async () => {
-          while (!settled && !session.paneStatus().dead) await Bun.sleep(50);
+          while (!settled && !exited()) await Bun.sleep(50);
           return "exited";
         })();
         let started = await Promise.race([session.waitForComposer(TIMEOUT).then(() => "composer", () => "neither"), died]);
         settled = true;
-        if (started === "neither" && session.paneStatus().dead) started = "exited";
+        if (started === "neither" && exited()) started = "exited";
         if (started === "exited") return { entered: false, said: readFileSync(stderrPath, "utf8") };
         if (started === "neither") throw new Error(`${entry}: the app neither showed its composer nor exited`);
         await session.waitForStableComposer(TIMEOUT, 300);
@@ -4256,13 +6849,13 @@ async function gridNewRow(entry: GridEntry) {
 }
 
 for (const entry of ["ask-new", "app-new", "acp-new"] as const) {
-  const define = gridHost(entry) === "app" ? test.skipIf(!tmuxAvailable()) : test;
+  const define = gridHost(entry) === "app" ? test.skipIf(!tmuxAvailable() || fileModesIgnored) : test.skipIf(fileModesIgnored);
   define(`fault grid: a new session by ${entry.slice(0, -4)}, with nothing wrong, a read-only folder and a full disk`, () => gridNewRow(entry), TIMEOUT * 6);
 }
 
 for (const exit of GRID_EXITS) {
   for (const entry of GRID_ENTRIES) {
-    const define = gridHost(entry) === "app" ? test.skipIf(!tmuxAvailable()) : test;
+    const define = gridHost(entry) === "app" ? test.skipIf(!tmuxAvailable() || fileModesIgnored) : test.skipIf(fileModesIgnored);
     define(`fault grid: a session ${exit}, entered by ${entry}, under every fault`, () => gridRow(exit, entry), TIMEOUT * 10);
   }
 }

@@ -14,7 +14,7 @@ pub const default_mode_id = "auto";
 pub const all = [_]ModeSpec{
     .{ .id = "auto", .name = "Auto", .description = "Check actions with an automatic safety review instead of asking", .permission_mode = .auto },
     .{ .id = "ask", .name = "Ask", .description = "Request permission before making any changes", .permission_mode = .ask },
-    .{ .id = "full-access", .name = "Full access", .description = "Run every action without asking, outside the sandbox", .permission_mode = .yolo },
+    .{ .id = "full-access", .name = "Full access", .description = "Run every action without fx permission checks", .permission_mode = .yolo },
 };
 
 pub const registry = mode_registry.Registry{

@@ -8,6 +8,7 @@
 
 const std = @import("std");
 const summarize = @import("summarize.zig");
+const progress = @import("progress.zig");
 const trace = @import("trace.zig");
 const model_capabilities = @import("../config/model_capabilities.zig");
 const model_provider = @import("../config/model_provider.zig");
@@ -32,6 +33,10 @@ pub const ModelCaller = struct {
     /// as the agent was about to send it, so the provider can reuse what it
     /// cached of it.
     sends_after_conversation: bool = false,
+    /// The model to retry the summary with when the conversation's model
+    /// cannot write it, chosen by the caller, such as a model the same plan
+    /// pays for. Null lets the compactor choose another model family.
+    fallback_model: ?[]const u8 = null,
 
     pub const VTable = struct {
         /// What `model` accepts.
@@ -55,11 +60,16 @@ pub const Call = struct {
     max_bytes: usize,
     cancel_flag: *std.atomic.Value(bool),
     trace_ctx: debug_trace.TraceContext,
+    /// Receives the reply's text as it arrives, so the notes can be
+    /// counted while the model writes them.
+    on_text: ?progress.TextSink = null,
 };
 
 pub const CallError = error{ Cancelled, OutOfMemory };
 
-pub const FailureReason = enum { transport, provider, tool_call, incomplete, truncated };
+/// `overflow`: the provider refused the request as longer than the model's
+/// context window.
+pub const FailureReason = enum { transport, provider, overflow, tool_call, incomplete, truncated };
 
 pub const Reply = union(enum) {
     /// Allocated with the `alloc` given to `send`.
@@ -95,6 +105,8 @@ pub const Summarizer = struct {
     trace_ctx: debug_trace.TraceContext,
     summaries: usize = 0,
     fallback_used: ?[]const u8 = null,
+    /// Receives each reply as it streams in.
+    on_text: ?progress.TextSink = null,
 
     pub fn model(self: *Summarizer) summarize.Model {
         return .{ .context = self, .summarize_fn = summarizeWith };
@@ -121,18 +133,25 @@ pub const Summarizer = struct {
             if (primary_error) |err| return err;
             return alloc.dupe(u8, "");
         }
-        const fallback = fallbackModel(prompt.model);
+        const fallback = self.caller.fallback_model orelse fallbackModel(prompt.model);
         trace.info(self.trace_ctx, .log, "fallback model={s} after={s}", .{
             fallback,
             if (primary_error) |err| @errorName(err) else "empty_summary",
         });
         self.fallback_used = fallback;
-        return self.ask(alloc, prompt, fallback);
+        return self.ask(alloc, prompt, fallback) catch |err| switch (err) {
+            error.Cancelled, error.OutOfMemory => err,
+            // A smaller request can still fit the conversation's own model.
+            else => if (primary_error != null and primary_error.? == error.SummaryTooLong) error.SummaryTooLong else err,
+        };
     }
 
     /// One summary request to `model_name`, at its lowest reasoning.
     fn ask(self: *Summarizer, alloc: Allocator, prompt: summarize.Prompt, model_name: []const u8) summarize.ModelError![]u8 {
         const caller = self.caller;
+        // Each reply starts on a line of its own, whatever the one before
+        // it left.
+        if (self.on_text) |sink| sink.write("\n");
         const reply = try caller.vtable.send(caller.context, alloc, .{
             .model = model_name,
             .reasoning = if (prompt.after_conversation) null else lowestReasoningEffort(caller.vtable.capabilities(caller.context, model_name)),
@@ -142,6 +161,7 @@ pub const Summarizer = struct {
             .max_bytes = max_summary_bytes,
             .cancel_flag = self.cancel_flag,
             .trace_ctx = self.trace_ctx,
+            .on_text = self.on_text,
         });
         const failure = switch (reply) {
             .text => |text| return text,
@@ -150,6 +170,10 @@ pub const Summarizer = struct {
         defer alloc.free(failure.detail);
         switch (failure.reason) {
             .transport, .provider => trace.failure(self.trace_ctx, .summary_transport_failed, "model={s} {s}", .{ model_name, failure.detail }),
+            .overflow => {
+                trace.failure(self.trace_ctx, .summary_too_long, "model={s} {s}", .{ model_name, failure.detail });
+                return error.SummaryTooLong;
+            },
             .tool_call => trace.failure(self.trace_ctx, .summary_tool_call_rejected, "model={s}", .{model_name}),
             .incomplete => {
                 trace.failure(self.trace_ctx, .summary_incomplete, "model={s} {s}", .{ model_name, failure.detail });
@@ -180,6 +204,8 @@ test "the fallback is another model family" {
 /// Answers from a script, recording what it was asked.
 const ScriptedCaller = struct {
     replies: []const ?[]const u8,
+    /// Which failed calls the provider refused as too long.
+    overflow: []const bool = &.{},
     calls: std.ArrayList(Call) = .empty,
 
     fn caller(self: *ScriptedCaller, provider: model_provider.ProviderId) ModelCaller {
@@ -201,8 +227,10 @@ const ScriptedCaller = struct {
     fn send(context: *anyopaque, alloc: Allocator, call: Call) CallError!Reply {
         const self: *ScriptedCaller = @ptrCast(@alignCast(context));
         try self.calls.append(std.testing.allocator, call);
-        const text = self.replies[self.calls.items.len - 1] orelse
-            return .{ .failed = .{ .reason = .provider, .detail = try alloc.dupe(u8, "kind=bad_request detail=refused") } };
+        const index = self.calls.items.len - 1;
+        const too_long = index < self.overflow.len and self.overflow[index];
+        const text = self.replies[index] orelse
+            return .{ .failed = .{ .reason = if (too_long) .overflow else .provider, .detail = try alloc.dupe(u8, "kind=bad_request detail=refused") } };
         return .{ .text = try alloc.dupe(u8, text) };
     }
 };
@@ -231,6 +259,48 @@ test "a failed or empty summary falls back to another family at its lowest reaso
     const summary_model = summarizer.model();
     try std.testing.expectError(error.ModelFailed, summary_model.summarize_fn(summary_model.context, std.testing.allocator, prompt));
     try std.testing.expectEqual(@as(usize, 1), direct.calls.items.len);
+}
+
+test "a refusal as too long outlasts the fallback's own failure" {
+    var cancel = std.atomic.Value(bool).init(false);
+    const prompt: summarize.Prompt = .{ .model = "anthropic/claude-opus-5.5", .system = "s", .user = "u" };
+    const cases = [_]struct { overflow: []const bool, replies: []const ?[]const u8, expected: ?summarize.ModelError }{
+        .{ .overflow = &.{ true, false }, .replies = &.{ null, null }, .expected = error.SummaryTooLong },
+        .{ .overflow = &.{ true, true }, .replies = &.{ null, null }, .expected = error.SummaryTooLong },
+        .{ .overflow = &.{ false, true }, .replies = &.{ null, null }, .expected = error.SummaryTooLong },
+        .{ .overflow = &.{ false, false }, .replies = &.{ null, null }, .expected = error.ModelFailed },
+        .{ .overflow = &.{true}, .replies = &.{ null, "summary" }, .expected = null },
+    };
+    for (cases) |case| {
+        var scripted: ScriptedCaller = .{ .replies = case.replies, .overflow = case.overflow };
+        defer scripted.calls.deinit(std.testing.allocator);
+        var summarizer: Summarizer = .{ .caller = scripted.caller(.gateway), .cancel_flag = &cancel, .trace_ctx = .{} };
+        const summary_model = summarizer.model();
+        if (case.expected) |expected| {
+            try std.testing.expectError(expected, summary_model.summarize_fn(summary_model.context, std.testing.allocator, prompt));
+        } else {
+            const text = try summary_model.summarize_fn(summary_model.context, std.testing.allocator, prompt);
+            defer std.testing.allocator.free(text);
+            try std.testing.expectEqualStrings("summary", text);
+        }
+        try std.testing.expectEqual(@as(usize, 2), scripted.calls.items.len);
+    }
+}
+
+test "a fallback the caller names replaces the compactor's choice" {
+    var cancel = std.atomic.Value(bool).init(false);
+    const prompt: summarize.Prompt = .{ .model = "anthropic/claude-opus-5.5", .system = "s", .user = "u" };
+    var scripted: ScriptedCaller = .{ .replies = &.{ null, "summary" } };
+    defer scripted.calls.deinit(std.testing.allocator);
+    var caller = scripted.caller(.gateway);
+    caller.fallback_model = "zai/glm-5.3";
+    var summarizer: Summarizer = .{ .caller = caller, .cancel_flag = &cancel, .trace_ctx = .{} };
+    const summary_model = summarizer.model();
+    const text = try summary_model.summarize_fn(summary_model.context, std.testing.allocator, prompt);
+    defer std.testing.allocator.free(text);
+    try std.testing.expectEqualStrings("summary", text);
+    try std.testing.expectEqualStrings("zai/glm-5.3", summarizer.fallback_used.?);
+    try std.testing.expectEqualStrings("zai/glm-5.3", scripted.calls.items[1].model);
 }
 
 test "a request after the conversation goes to its own model only, with the agent's settings" {

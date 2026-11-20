@@ -63,9 +63,10 @@ def read_lines(path, raw=False):
     return out
 
 
-def fork_records(lines, upto=None):
+def fork_records(lines, upto=None, timed=False):
     """[k, h] records of lines 2.. (those with seq <= `upto`), snapshots left
-    out: a fork encodes its copied snapshots again."""
+    out: a fork encodes its copied snapshots again. With `timed`, each also
+    has t, the line's time."""
     out = []
     for value, line in lines[1:]:
         if upto is not None and value.get("seq", 0) > upto:
@@ -73,19 +74,48 @@ def fork_records(lines, upto=None):
         kind = value.get("kind")
         if kind == "snapshot":
             continue
-        out.append({"k": TURN_KINDS.get(kind, kind), "h": hashlib.sha256(line).hexdigest()[:16]})
+        record = {"k": TURN_KINDS.get(kind, kind), "h": hashlib.sha256(line).hexdigest()[:16]}
+        if timed:
+            record["t"] = value.get("ts", 0)
+        out.append(record)
     return out
 
 
 def fork_target(lines, root):
-    """For a fork, its copied lines and its source's lines; else None."""
-    origin = lines[0][0].get("forked_from")
+    """For a fork, its copied lines, its source's lines, whether it is a
+    child's copy, and for a copy its next line and the fork point's time;
+    else None."""
+    created = lines[0][0]
+    origin = created.get("forked_from")
     if not origin:
         return None
     source = os.path.join(root, origin["id"], "log.jsonl")
     if not os.path.isfile(source):
         raise Unreadable(f"fork source {origin['id']} is not in this root")
-    return fork_records(lines, origin["seq"]), fork_records(read_lines(source, raw=True))
+    if created.get("role") != "child":
+        return fork_records(lines, origin["seq"]), fork_records(read_lines(source, raw=True)), False, [], 0
+    after = [{"k": TURN_KINDS.get(v.get("kind"), v.get("kind")), "r": v.get("reason", "none")}
+             for v, _ in lines[1:] if v.get("seq", 0) > origin["seq"] and v.get("kind") != "snapshot"][:1]
+    copied = fork_records(lines, origin["seq"], timed=True)
+    return copied, fork_records(read_lines(source, raw=True), timed=True), True, after, fork_point_ms(created, root)
+
+
+def fork_point_ms(created, root):
+    """A child copy's cut: the time of the fork point's line in the source
+    of the fork that owns the copy (D97)."""
+    parent = os.path.join(root, created.get("parent") or "", "log.jsonl")
+    if not os.path.isfile(parent):
+        raise Unreadable(f"child copy's parent {created.get('parent')} is not in this root")
+    origin = read_lines(parent)[0].get("forked_from")
+    if not origin:
+        raise Unreadable("a child copy's parent is not a fork")
+    source = os.path.join(root, origin["id"], "log.jsonl")
+    if not os.path.isfile(source):
+        raise Unreadable(f"fork source {origin['id']} is not in this root")
+    for value in read_lines(source):
+        if value.get("seq") == origin["seq"]:
+            return value.get("ts", 0)
+    raise Unreadable(f"fork source {origin['id']} has no line {origin['seq']}")
 
 
 def turn_target(lines):
@@ -176,10 +206,19 @@ def check_children(target, final):
     return run_tlc("SubagentsLog", specs, {"SavedChildren.tla": saved}, cfg)
 
 
-def check_fork(copied, source):
+def check_fork(copied, source, child=False, after=(), point=0):
+    if child:
+        # TLC's integers are 32-bit, and the check only orders times, so
+        # each time becomes its rank among them.
+        rank = {t: n for n, t in enumerate(sorted({r["t"] for r in copied + source} | {point}))}
+        copied = [{**r, "t": rank[r["t"]]} for r in copied]
+        source = [{**r, "t": rank[r["t"]]} for r in source]
+        point = rank[point]
+
     def seq(rs):
         return ", ".join(tla_record(r) for r in rs)
-    saved = f"---- MODULE SavedFork ----\nCopied == <<{seq(copied)}>>\nSource == <<{seq(source)}>>\n====\n"
+    saved = (f"---- MODULE SavedFork ----\nCopied == <<{seq(copied)}>>\nSource == <<{seq(source)}>>\n"
+             f"Child == {'TRUE' if child else 'FALSE'}\nAfter == <<{seq(after)}>>\nPoint == {point}\n====\n")
     cfg = "SPECIFICATION LogSpec\nINVARIANT NotWritten\n"
     verdict, _ = run_tlc("ForkLog", [os.path.join(HERE, "ForkLog.tla")], {"SavedFork.tla": saved}, cfg)
     return verdict, len(copied)
@@ -253,6 +292,19 @@ def selftest():
         ("fork: before the first turn", "fork", (src[:1], src), "ACCEPTED"),
         ("planted: a copied line differs from the source's", "fork", (src[:2] + [rec("item", "x"), src[3]], src), "REJECTED"),
         ("planted: the copy ends inside a turn", "fork", (src[:3], src), "REJECTED"),
+    ]
+    def timed(k, h, t):
+        return {"k": k, "h": h, "t": t}
+    kid = [timed("start", "a", 1), timed("item", "b", 2), timed("commit", "c", 3), timed("start", "d", 5), timed("item", "e", 6)]
+    cancel = [{"k": "interrupt", "r": "cancel"}]
+    cases += [
+        ("child copy: the child's lines to the fork point, at a turn's end", "fork", (kid[:3], kid, True, [], 4), "ACCEPTED"),
+        ("child copy: cut inside a turn, which the copy ends as cancelled (D97)", "fork", (kid[:4], kid, True, cancel, 5), "ACCEPTED"),
+        ("child copy: a line in the point's own ms written after the copy", "fork", (kid[:3], kid, True, [], 5), "ACCEPTED"),
+        ("planted: a child copy takes a line after the fork point", "fork", (kid[:4], kid, True, cancel, 4), "REJECTED"),
+        ("planted: a child copy stops before the fork point", "fork", (kid[:3], kid, True, [], 6), "REJECTED"),
+        ("planted: a child copy leaves its cut turn open", "fork", (kid[:4], kid, True, [], 5), "REJECTED"),
+        ("planted: a root fork ends inside a turn, as only a child copy may", "fork", (src[:3], src, False, [{"k": "interrupt", "r": "cancel"}], 0), "REJECTED"),
     ]
     bad = 0
 

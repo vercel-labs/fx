@@ -235,10 +235,29 @@ pub const TerminalValidationRetryState = struct {
     }
 };
 
+/// Model steps in a row in which the same shell call fails, with no file
+/// changed in between, before the turn ends. From the second identical
+/// failure on, the model is told not to retry unchanged
+/// (`appendToolResultContent` in tool_batch.zig), so the third means it
+/// ignored that.
+const max_unchanged_shell_failure_steps: u32 = 3;
+
+/// Ends a turn when the same shell call keeps failing while nothing changes.
+/// A shell call is the same when its arguments are. A step that changes a
+/// file starts every streak over, because rerunning a command after an edit
+/// is a new attempt, not a repeat
+/// (`tests/tla/shell_command/FailureStreak.tla` EditedRetryContinues,
+/// BlindLoopBounded).
 pub const ShellExecutionFailureRetryState = struct {
-    previous: std.ArrayList(TerminalValidationDigest) = .empty,
-    current: std.ArrayList(TerminalValidationDigest) = .empty,
-    stop_after_batch: bool = false,
+    const Streak = struct {
+        digest: TerminalValidationDigest,
+        steps: u32,
+    };
+
+    /// The previous step's failed shell calls, with their streaks.
+    previous: std.ArrayList(Streak) = .empty,
+    /// This step's failed shell calls; `steps` is set by `finishBatch`.
+    current: std.ArrayList(Streak) = .empty,
 
     pub fn deinit(self: *ShellExecutionFailureRetryState, alloc: Allocator) void {
         self.previous.deinit(alloc);
@@ -248,7 +267,6 @@ pub const ShellExecutionFailureRetryState = struct {
 
     pub fn beginBatch(self: *ShellExecutionFailureRetryState) void {
         self.current.clearRetainingCapacity();
-        self.stop_after_batch = false;
     }
 
     pub fn observe(
@@ -264,22 +282,34 @@ pub const ShellExecutionFailureRetryState = struct {
         hash.update("fx.shell-execution-failure.v1\x00");
         hash.update(call.arguments_json);
         const digest = hash.finalResult();
-        const decision = terminalValidationDigestDecision(
-            self.previous.items,
-            self.current.items,
-            digest,
-        );
-        if (decision.append_current) try self.current.append(alloc, digest);
-        self.stop_after_batch = self.stop_after_batch or decision.repeated;
+        if (findStreak(self.current.items, digest) != null) return;
+        try self.current.append(alloc, .{ .digest = digest, .steps = 0 });
     }
 
-    pub fn finishBatch(self: *ShellExecutionFailureRetryState) bool {
-        if (self.stop_after_batch) return true;
-        const previous = self.previous;
-        self.previous = self.current;
-        self.current = previous;
+    /// Ends the step and returns whether the turn should end. `files_changed`
+    /// is whether the step wrote or edited a file successfully.
+    pub fn finishBatch(self: *ShellExecutionFailureRetryState, files_changed: bool) bool {
+        var stop = false;
+        for (self.current.items) |*streak| {
+            const before: u32 = if (files_changed)
+                0
+            else if (findStreak(self.previous.items, streak.digest)) |previous|
+                previous.steps
+            else
+                0;
+            streak.steps = before +| 1;
+            stop = stop or streak.steps >= max_unchanged_shell_failure_steps;
+        }
+        std.mem.swap(std.ArrayList(Streak), &self.previous, &self.current);
         self.current.clearRetainingCapacity();
-        return false;
+        return stop;
+    }
+
+    fn findStreak(streaks: []const Streak, digest: TerminalValidationDigest) ?Streak {
+        for (streaks) |streak| {
+            if (std.mem.eql(u8, &streak.digest, &digest)) return streak;
+        }
+        return null;
     }
 };
 
@@ -510,7 +540,7 @@ test "shell request corrections stop after the complete repeated batch" {
     }
 }
 
-test "shell execution failures retain independent batch identities" {
+test "shell execution failures end the turn on the third unchanged step" {
     const alloc = std.testing.allocator;
     const first: ToolCall = .{
         .id = "first",
@@ -524,30 +554,47 @@ test "shell execution failures retain independent batch identities" {
     };
     const failed = ToolExecutionResult{
         .status = .failure,
-        .model_output = "session lost",
+        .model_output = "exit 1",
     };
     const succeeded = ToolExecutionResult{ .model_output = "ok" };
     var state: ShellExecutionFailureRetryState = .{};
     defer state.deinit(alloc);
 
-    state.beginBatch();
-    try state.observe(alloc, first, failed);
-    try state.observe(alloc, second, failed);
-    try std.testing.expect(!state.finishBatch());
-    state.beginBatch();
-    try state.observe(alloc, first, failed);
-    try state.observe(alloc, second, failed);
-    try std.testing.expect(state.finishBatch());
+    // The same call failing in three unchanged steps ends the turn.
+    for ([_]bool{ false, false, true }) |stops| {
+        state.beginBatch();
+        try state.observe(alloc, first, failed);
+        try state.observe(alloc, first, failed);
+        try std.testing.expectEqual(stops, state.finishBatch(false));
+    }
 
+    // A file change in a step starts the streak over: the failure in that
+    // step counts as the first.
     state.deinit(alloc);
-    state.beginBatch();
-    try state.observe(alloc, first, failed);
-    try state.observe(alloc, second, succeeded);
-    try std.testing.expect(!state.finishBatch());
-    state.beginBatch();
-    try state.observe(alloc, first, failed);
-    try state.observe(alloc, second, succeeded);
-    try std.testing.expect(state.finishBatch());
+    const steps = [_]struct { files_changed: bool, stops: bool }{
+        .{ .files_changed = false, .stops = false },
+        .{ .files_changed = true, .stops = false },
+        .{ .files_changed = false, .stops = false },
+        .{ .files_changed = false, .stops = true },
+        .{ .files_changed = true, .stops = false },
+    };
+    for (steps) |step| {
+        state.beginBatch();
+        try state.observe(alloc, first, failed);
+        try std.testing.expectEqual(step.stops, state.finishBatch(step.files_changed));
+    }
+
+    // Streaks are per call: a call that passes or doesn't run starts over.
+    state.deinit(alloc);
+    for ([_]bool{ true, false, true, true }) |second_fails| {
+        state.beginBatch();
+        try state.observe(alloc, first, failed);
+        try state.observe(alloc, second, if (second_fails) failed else succeeded);
+        _ = state.finishBatch(false);
+    }
+    try std.testing.expectEqual(@as(usize, 2), state.previous.items.len);
+    try std.testing.expectEqual(@as(u32, 4), state.previous.items[0].steps);
+    try std.testing.expectEqual(@as(u32, 2), state.previous.items[1].steps);
 }
 
 test "identical failure escalation counts exact repeats within one turn" {

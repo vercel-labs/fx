@@ -868,7 +868,6 @@ fn loadGeneration(
 /// config, so a listing built under one config is never reused under another.
 pub fn snapshotPath(alloc: Allocator, roots: []const []const u8) Allocator.Error!?[]const u8 {
     const home = io_mod.homeDir() orelse return null;
-    if (!std.Io.Dir.path.isAbsolute(home)) return null;
     var config_environment: [indexer.config_environment_names.len]?[]const u8 = undefined;
     for (indexer.config_environment_names, &config_environment) |name, *value| value.* = io_mod.getenv(name);
     return try snapshotPathIn(alloc, home, roots, &config_environment);

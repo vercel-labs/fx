@@ -252,7 +252,7 @@ try {
     });
   }
 
-  // Omitted model means the kernel default, not automatic Ultra model selection.
+  // Omitted model means the kernel default, not automatic Ultrafast model selection.
   // Neither an unsupported OpenAI model nor a priced non-OpenAI model can opt in.
   for (const [overrides, model] of [
     [{ ultrafast: true }, defaultModel],

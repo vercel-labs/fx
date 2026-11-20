@@ -268,7 +268,7 @@ const specs = [_]Spec{
     .{ .id = .model, .category = .agent, .label = "Model", .description = "Choose the model used for new turns" },
     .{ .id = .effort, .category = .agent, .label = "Reasoning effort", .description = "Control how much reasoning the model applies" },
     .{ .id = .fast_mode, .category = .agent, .label = "Fast mode", .description = "Use faster inference when the model supports it" },
-    .{ .id = .ultrafast_mode, .category = .agent, .label = "Ultra mode", .description = "Request the highest-speed mode when the model supports it" },
+    .{ .id = .ultrafast_mode, .category = .agent, .label = "Ultrafast mode", .description = "Request the highest-speed mode when the model supports it" },
     .{ .id = .permission_mode, .category = .agent, .label = "Permission mode", .description = "Choose when fx asks before taking actions" },
     .{ .id = .session_titles, .category = .agent, .label = "Session titles", .description = "Generate a short session title from the first prompt" },
     .{ .id = .sound_level, .category = .notifications, .label = "Sound level", .description = "Choose off, on, or max sounds and terminal bells" },

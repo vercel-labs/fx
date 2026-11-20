@@ -1,6 +1,7 @@
 // The WebAssembly host: WASI, fx's host imports, and starting an fx
 // WebAssembly module. Only the WebAssembly backends load it.
 import { CoreOutput, maxCoreMessageBytes } from "./core-output.js";
+import { retryAfterSeconds } from "./fetch-cleanup.js";
 import {
   cancelResponseBody,
   decoder,
@@ -350,6 +351,11 @@ function createRuntime(options) {
     if (immediate !== 0) return immediate;
     return raceWithTimeout(state.responseSettled.then(() => true), 50, false).then((ready) =>
       ready ? settled() : 0);
+  }
+
+  function streamRetryAfter(handle) {
+    const response = streams.get(handle)?.response;
+    return response ? retryAfterSeconds(response.headers) : -1;
   }
 
   function streamNext(handle, outPtr, outCap) {
@@ -930,6 +936,7 @@ function createRuntime(options) {
     fx_http_stream_status: new WebAssembly.Suspending(streamStatus),
     fx_http_stream_next: new WebAssembly.Suspending(streamNext),
     fx_http_stream_close(handle) { const state = streams.get(handle); state?.controller.abort(abortReason); streams.delete(handle); },
+    fx_http_stream_retry_after: streamRetryAfter,
     fx_http_request: new WebAssembly.Suspending(httpRequest),
     fx_host_tool_call: new WebAssembly.Suspending(hostToolCall),
     fx_journal_flush: new WebAssembly.Suspending(journalFlush),

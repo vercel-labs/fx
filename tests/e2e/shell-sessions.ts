@@ -321,16 +321,16 @@ export class Shell {
     }, "Fork");
   }
 
-  /// `/quit`, and the id the exit line named, or null when it named none.
-  /// A terminal too narrow for one row puts the command on the next one.
+  /// `/quit`, and the id the exit lines named, or null when they named none.
+  /// The command sits alone on the line under its label.
   async quit(): Promise<string | null> {
     await this.session.sendKeys("C-u");
     await this.session.sendText("/quit");
     await this.waitUntil(() => this.session.paneStatus().dead, "fx to exit");
-    const text = (await this.session.captureFullScrollback()).split("\n").map((line) => line.trim()).join("\n");
-    const named = [...text.matchAll(/^Continue session with:[ \n]fx --resume (\S+)$/gm)].map((match) => match[1]!);
-    if (named.length > 1) throw new Error(`the exit line named ${named.length} sessions: ${named}`);
-    if (named.length === 0 && text.includes("Continue session with:")) throw new Error(`an exit line fx printed did not parse:\n${text}`);
+    const text = await this.session.captureFullScrollback();
+    const named = [...text.matchAll(/^Resume this session with:\nfx --resume (\S+)$/gm)].map((match) => match[1]!);
+    if (named.length > 1) throw new Error(`the exit lines named ${named.length} sessions: ${named}`);
+    if (named.length === 0 && text.includes("Resume this session with:")) throw new Error(`an exit hint fx printed did not parse:\n${text}`);
     return named[0] ?? null;
   }
 

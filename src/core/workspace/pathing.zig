@@ -396,8 +396,8 @@ fn resolveBoundedFileTargetInput(
             .external_intent = true,
         },
         .home_relative => |relative| blk: {
+            // homeDir returns only an absolute path.
             const home = io_mod.homeDir() orelse return error.HomeNotSet;
-            if (home.len == 0 or !std.Io.Dir.path.isAbsolute(home)) return error.InvalidPath;
             break :blk .{
                 .absolute = try normalizeBaseRelativePathInto(scratch, home, relative),
                 .external_intent = true,
@@ -1283,6 +1283,58 @@ test "bounded resolver anchors existing explicit external target at parent" {
     try std.testing.expect(resolved.anchor_is_external);
     try std.testing.expectEqual(@as(usize, 1), resolved.relative_components.len);
     try std.testing.expectEqualStrings("file.txt", resolved.canonical_target_path[resolved.relative_components[0].start..resolved.relative_components[0].end]);
+}
+
+test "bounded resolver expands ~ under an absolute HOME and refuses a relative one" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    try tmp.dir.createDirPath(io_mod.getIo(), "home");
+    try writeTestFile(tmp.dir, "home/file.txt", "home");
+
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace);
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home);
+    const expected = try std.Io.Dir.path.join(arena, &.{ home, "file.txt" });
+
+    var environ = std.process.Environ.Map.init(alloc);
+    defer environ.deinit();
+    try environ.put("HOME", home);
+    io_mod.setEnvironMap(&environ);
+    defer io_mod.resetEnvironForTest();
+
+    var primary: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    var secondary: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    var components: [8]BoundedFileTargetComponent = undefined;
+
+    const resolved = try resolveFileMutationTargetBounded(
+        workspace,
+        "~/file.txt",
+        .existing,
+        &primary,
+        &secondary,
+        &components,
+    );
+    try std.testing.expectEqualStrings(expected, resolved.canonical_target_path);
+    try std.testing.expect(resolved.anchor_is_external);
+
+    // homeDir treats a relative HOME as unset, so `~` has no home to expand.
+    try environ.put("HOME", "relative/home");
+    try std.testing.expectError(error.HomeNotSet, resolveFileMutationTargetBounded(
+        workspace,
+        "~/file.txt",
+        .existing,
+        &primary,
+        &secondary,
+        &components,
+    ));
 }
 
 test "bounded resolver resolves missing external final target from existing parent" {
