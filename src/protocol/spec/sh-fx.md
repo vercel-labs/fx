@@ -70,7 +70,7 @@ After `initialize`, these rules apply to the connection:
 - A client calls an extension's methods only when fx's list names the extension. fx answers a method it doesn't support with the JSON-RPC error `-32601`, "Method not found".
 - Each side ignores the names it doesn't know in the other side's list.
 
-Each extension's section defines its capabilities, which `AgentCapabilitiesMeta` and `ClientCapabilitiesMeta` in `sh-fx.schema.json` also list. The steering section defines `sh.fx/promptDelivery` and `sh.fx/hostSteering`, the following section defines `sh.fx/logPosition` and `sh.fx/sessionClients`, and the status section defines `sh.fx/sessionState` and `sh.fx/listChanges`. The table in "Keys in use today" names two more that replace fields fx uses today, `sh.fx/hooks` and `sh.fx/hostTools`, which later sections define.
+Each extension's section defines its capabilities, which `AgentCapabilitiesMeta` and `ClientCapabilitiesMeta` in `sh-fx.schema.json` also list. The steering section defines `sh.fx/promptDelivery` and `sh.fx/hostSteering`, the following section defines `sh.fx/logPosition` and `sh.fx/sessionClients`, the status section defines `sh.fx/sessionState` and `sh.fx/listChanges`, and the subagents section defines `sh.fx/subagentPrompts`. The table in "Keys in use today" names two more that replace fields fx uses today, `sh.fx/hooks` and `sh.fx/hostTools`, which later sections define.
 
 ## Extensions
 
@@ -352,6 +352,48 @@ A client that lists `sh.fx/listChanges` receives `_sh.fx/session/list_changed`, 
 
 `tests/tla/acp/AcpSessionState.tla` models these rules, and TLC checks that a connection's view of a session's state is current whenever no state update is on its way, and that a list a connection holds is out of date only while a hint is on its way or after one arrived. Its `Today` configs show where fx breaks them now, and `tests/tla/drivers/acp/session_state/driver.ts` runs `fx acp` along the model.
 
+### Subagents
+
+fx follows ACP's [Subagent Sessions](https://agentclientprotocol.com/rfds/subagents) as written, with ACP's own names, for a client that lists `subagents` in `clientCapabilities`. A client that doesn't list it sees a subagent only through the parent session: the tool call that sent the subagent its work, and the report on that call.
+
+For a client that lists `subagents`:
+
+- fx sends a `subagent_update` in the parent session before any update of a child's work. It gives the child's own session id, its title and description, its `cwd`, and its state, as "Session status and list changes" defines states.
+- Every update of a child's work uses the child's session id, including its tool calls and its permission requests.
+- Each child's `capabilities` grants `cancel`. `session/cancel` with a child's id stops only that child's current work. The parent's tool call that waits for the child gets the child's cancelled result, and the parent's turn goes on. `session/cancel` of the parent stops its children's work as well.
+- A child's permission request goes to every client that has the parent session open, as "Permission requests" says. It stays with the child: when the child's work stops, fx cancels the request with `$/cancel_request`, and it never moves to the parent.
+- A child isn't in `session/list`, and a client doesn't load, resume, or close a child.
+
+When a client loads or resumes the parent, fx replays each child's `subagent_update` and history with the child's own session id, before the response. It doesn't send a recorded permission request again, but a request that still waits goes out as current, and fx sends each child's current state.
+
+#### Messages to a subagent
+
+ACP lets an Agent allow more on a child than `cancel`, child by child. fx allows a client to send a child messages, as fx's subagent view does: for a client that lists `sh.fx/subagentPrompts`, each child's `capabilities._meta` holds `sh.fx/prompt`. The client then sends `session/prompt` with the child's session id, and the message works as on any fx session:
+
+- While the child works, the message is a steer, as "Steering and queued prompts" says: it stops a reply the child is writing, waits for a tool the child runs, and runs as the child's next turn if the child's work ends before it takes the steer.
+- While the child is idle, the message starts the child's work.
+
+As in fx today, the child's report goes to the parent, where it joins the parent's turn as a steer, or runs as the parent's next turn.
+
+```json
+{
+  "jsonrpc": "2.0",
+  "method": "session/update",
+  "params": {
+    "sessionId": "sess_parent",
+    "update": {
+      "sessionUpdate": "subagent_update",
+      "sessionId": "sess_child1",
+      "title": "reviewer",
+      "state": { "state": "running" },
+      "capabilities": { "cancel": {}, "_meta": { "sh.fx/prompt": { "steer": {} } } }
+    }
+  }
+}
+```
+
+`tests/tla/acp/AcpSubagents.tla` models these rules, and TLC checks that a client reads a child's announcement before any of its work, that stopping a child leaves the parent's turn running, that a child's permission request ends with the child, and that no message to a child and no child's report is lost. Its `Today` configs show where fx breaks them now.
+
 ## Names in use today
 
 fx's ACP server names its additions today with a `libfx/` prefix, which doesn't follow ACP's extension rules, and its wasm build accepts `session/remove`, which ACP calls `session/delete`. Each one gets the new name in this table:
@@ -432,6 +474,7 @@ The keys and capabilities move with the method names, under the same rules: for 
 | `ClientId` | The id that fx gives a connection: `sh.fx/clientId`, `sh.fx/client`, and the `clientId` of a session client |
 | `SessionClient` | One entry of the list of clients that have a session open |
 | `ClientsUpdateParams` | The params of `_sh.fx/session/clients_update` |
+| `SubagentPrompt` | The value of `sh.fx/prompt` in a child's `capabilities._meta`: the deliveries the child accepts |
 | `SessionState` | The value of `sh.fx/state`: `running`, `requires_action`, or `idle` |
 | `SessionStateUpdate` | The `update` of `_sh.fx/session/state_update`, a part of ACP's `StateUpdate` |
 | `SessionStateUpdateParams` | The params of `_sh.fx/session/state_update` |
