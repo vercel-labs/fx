@@ -101,7 +101,7 @@ const shell_properties = [_]model_tool_schema.Property{
     .{ .name = "profile", .json_type = .string, .shape = &.{ .enum_values = &.{ "clean", "user" } }, .description = "For run: clean skips the user's startup files." },
     .{ .name = "shell", .json_type = .object, .shape = &.{ .object = &shell_executable_schema }, .description = "For run with tty=true: use this shell instead of the default." },
     .{ .name = "tty", .json_type = .boolean, .description = "For run: give the command a terminal, for interactive programs." },
-    .{ .name = "yield_time_ms", .json_type = .integer, .description = "For run and interact: how long to wait for output before returning. run waits up to 30000 (the default), interact up to 300000 (default 5000)." },
+    .{ .name = "yield_time_ms", .json_type = .integer, .description = "For run and interact: how long to wait for output before returning. run waits up to 300000 (default 30000), interact up to 300000 (default 5000). For a command you expect to run longer than 30000 ms, set yield_time_ms to a little more than its expected time." },
     .{ .name = "timeout_ms", .json_type = .integer, .description = "For run: kill the command after this long. Only when asked for a deadline." },
     .{ .name = "reload", .json_type = .boolean, .description = "For run: reload the user's startup files first, such as after installing a tool." },
     .{ .name = "session_id", .json_type = .string, .description = "For interact and stop." },
@@ -847,9 +847,9 @@ test "built-in model-facing tool contract stays byte exact" {
     const actual_hex = std.fmt.bytesToHex(hasher.finalResult(), .lower);
     try std.testing.expectEqualStrings(
         if (builtin.target.os.tag.isDarwin())
-            "a84217167d9345c518d346ab58d3e117b92ac636b5272af02720011c6aa99a99"
+            "ea5277eb767948a87e1164473dd53688b0cf67c57a7f6a24a3fd00a57cdc037d"
         else
-            "8b6048d8bf6145c7a37a2bc376d13d4b2cfae304b179a2bd1d2e464a138d87a1",
+            "70df6be8e9f7f5438385002ea392cda8f25a320eecc8a649f1a0d0fa5c681221",
         &actual_hex,
     );
 }
@@ -971,7 +971,8 @@ test "shell advertises only run interact and stop" {
         "Only when asked for a deadline",
         "Never rerun it",
         "check it is ready in that call",
-        "run waits up to 30000 (the default), interact up to 300000 (default 5000)",
+        "run waits up to 300000 (default 30000), interact up to 300000 (default 5000)",
+        "set yield_time_ms to a little more than its expected time",
         "run it with tty=true",
     }) |guidance| {
         try std.testing.expect(std.mem.find(u8, schema_json, guidance) != null);
