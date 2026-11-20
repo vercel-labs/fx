@@ -9,6 +9,7 @@ const journal = @import("../core/agent/runtime/journal.zig");
 const session_runtime = @import("../core/session/session.zig");
 const session_codec = @import("../core/session/session_codec.zig");
 const types = @import("../core/shared/types.zig");
+const agent_frame = @import("../core/shared/agent_frame.zig");
 const debug_trace = @import("../core/shared/debug_trace.zig");
 const session_adapter = @import("../core/session/session_adapter.zig");
 const checkpoint_codec = @import("../core/agent/runtime/checkpoint.zig");
@@ -501,7 +502,7 @@ fn dupePendingInputs(alloc: Allocator, inputs: []const journal.PendingInput) All
     for (inputs) |input| {
         const id = try alloc.dupe(u8, input.id);
         errdefer alloc.free(id);
-        owned[filled] = .{ .id = id, .text = try alloc.dupe(u8, input.text) };
+        owned[filled] = .{ .id = id, .text = try alloc.dupe(u8, input.text), .author = input.author };
         filled += 1;
     }
     return owned;
@@ -799,7 +800,9 @@ pub fn resumeCheckpoint(
     const after = view.execution.tool_steps.len;
     if (!yielded) steering[old.len] = .{ .text = @constCast(resume_notice), .after_tool_step_count = after };
     for (inputs, steering[old.len + notices ..]) |input, *entry| {
-        entry.* = .{ .text = input.text, .after_tool_step_count = after };
+        // Saved steering holds a frame as the model saw it.
+        const text = if (input.author == .agent) try agent_frame.agentMessage(scratch.allocator(), input.text) else input.text;
+        entry.* = .{ .text = text, .after_tool_step_count = after };
     }
     view.execution.steering = steering;
     view.consumed_provider_attempts = 0;
@@ -957,6 +960,22 @@ fn testProgress(alloc: Allocator) !session_codec.RecoveryCheckpoint {
         .max_provider_attempts = 3,
         .consumed_provider_attempts = 0,
     };
+}
+
+test "a resumed turn gives the model another agent's unplaced steer in its frame" {
+    const alloc = std.testing.allocator;
+    var progress = try testProgress(alloc);
+    defer progress.deinit(alloc);
+    const inputs = [_]journal.PendingInput{
+        .{ .id = @constCast("in_1"), .text = @constCast("use tabs") },
+        .{ .id = @constCast("in_2"), .text = @constCast("skip tests"), .author = .agent },
+    };
+    var resumed = try resumeCheckpoint(alloc, progress, &inputs, true);
+    defer resumed.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), resumed.execution.steering.len);
+    try std.testing.expectEqualStrings("use tabs", resumed.execution.steering[0].text);
+    try std.testing.expect(agent_frame.isAgentMessage(resumed.execution.steering[1].text));
+    try std.testing.expect(std.mem.find(u8, resumed.execution.steering[1].text, "skip tests") != null);
 }
 
 test "inputs taken for a request that never went out are not placed by the next turn" {

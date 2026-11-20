@@ -100,6 +100,7 @@ pub const Input = struct {
     id: []const u8,
     text: []const u8,
     kind: InputKind = .steer,
+    author: types.MessageAuthor = .user,
 };
 
 /// The open turn so far, before a model request, the inputs that request
@@ -167,6 +168,7 @@ pub const Event = union(EventType) {
 pub const PendingInput = struct {
     id: []u8,
     text: []u8,
+    author: types.MessageAuthor = .user,
 };
 
 /// Where the next event goes. A copy advances only when its caller stores
@@ -247,7 +249,14 @@ pub const Cursor = struct {
             },
             .input_accepted => |input| {
                 try writer.writeAll(",\"data\":");
-                try std.json.Stringify.value(.{ .id = input.id, .kind = @tagName(input.kind), .text = input.text }, .{}, writer);
+                // The user's input carries no author, so its record stays as
+                // it was and older fx reads it unchanged.
+                try std.json.Stringify.value(.{
+                    .id = input.id,
+                    .kind = @tagName(input.kind),
+                    .text = input.text,
+                    .author = if (input.author == .user) null else @as(?[]const u8, @tagName(input.author)),
+                }, .{ .emit_null_optional_fields = false }, writer);
             },
             .input_withdrawn => |id| {
                 try writer.writeAll(",\"data\":");
@@ -567,6 +576,7 @@ const InputState = struct {
     id: []const u8,
     text: []const u8,
     kind: InputKind,
+    author: types.MessageAuthor = .user,
     placed: bool = false,
     withdrawn: bool = false,
 
@@ -810,8 +820,12 @@ pub fn foldFrom(alloc: Allocator, events_json: []const u8, base: Base) LoadError
                     if (kind_value != .string) return error.InvalidJournal;
                     break :parsed_kind std.meta.stringToEnum(InputKind, kind_value.string) orelse return error.InvalidJournal;
                 } else .steer;
+                const author: types.MessageAuthor = if (data.object.get("author")) |author_value| parsed_author: {
+                    if (author_value != .string) return error.InvalidJournal;
+                    break :parsed_author std.meta.stringToEnum(types.MessageAuthor, author_value.string) orelse return error.InvalidJournal;
+                } else .user;
                 if (findInput(inputs.items, id) != null) return error.InvalidJournal;
-                try inputs.append(alloc, .{ .id = id, .text = text, .kind = kind });
+                try inputs.append(alloc, .{ .id = id, .text = text, .kind = kind, .author = author });
             },
             .input_withdrawn => {
                 const data = event.data orelse return error.InvalidJournal;
@@ -910,7 +924,7 @@ fn pendingInputsOf(alloc: Allocator, inputs: []const InputState, kind: InputKind
         if (!input.pending(kind)) continue;
         const id = try alloc.dupe(u8, input.id);
         errdefer alloc.free(id);
-        pending[filled] = .{ .id = id, .text = try alloc.dupe(u8, input.text) };
+        pending[filled] = .{ .id = id, .text = try alloc.dupe(u8, input.text), .author = input.author };
         filled += 1;
     }
     return pending;
@@ -1483,6 +1497,24 @@ test "a fold that runs out of memory frees what it built" {
 fn foldAndFree(alloc: Allocator, bytes: []const u8) !void {
     var folded = try fold(alloc, bytes);
     folded.deinit(alloc);
+}
+
+test "an accepted steer keeps its author, and the user's record names none" {
+    const alloc = std.testing.allocator;
+    var progress = try testProgress(alloc, "write it");
+    defer progress.deinit(alloc);
+    const bytes = try testJournal(alloc, &.{
+        .{ .turn_progress = .{ .checkpoint = progress } },
+        .{ .input_accepted = .{ .id = "in_1", .text = "use tabs" } },
+        .{ .input_accepted = .{ .id = "in_2", .text = "skip tests", .author = .agent } },
+    });
+    defer alloc.free(bytes);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, bytes, "\"author\""));
+    var folded = try fold(alloc, bytes);
+    defer folded.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), folded.pending_inputs.len);
+    try std.testing.expectEqual(types.MessageAuthor.user, folded.pending_inputs[0].author);
+    try std.testing.expectEqual(types.MessageAuthor.agent, folded.pending_inputs[1].author);
 }
 
 test "an accepted steer stays pending until a progress places it" {

@@ -970,6 +970,14 @@ function normalizeSteeringInput(input) {
   return text;
 }
 
+// Who wrote a steer, or the prompt a steer became: undefined for the user, or
+// "agent" for another agent, whose words the model never reads as the user's.
+function normalizeAuthor(author) {
+  if (author === undefined || author === "user") return undefined;
+  if (author === "agent") return author;
+  throw new TypeError('author must be "user" or "agent"');
+}
+
 // A tool set's shape, so a checkpoint can tell when the tools it continues
 // with changed since it was saved.
 function toolSchemaHash(descriptors) {
@@ -1683,7 +1691,7 @@ export async function createFxEngine(options = {}, defaultRuntimeFactory = undef
     }
     return named;
   }
-  const sendPrompt = (blocks, resuming = false, followUp = null, turnId = null, rerun = [], yieldAt = undefined, outputShown = false) => {
+  const sendPrompt = (blocks, resuming = false, followUp = null, turnId = null, rerun = [], yieldAt = undefined, outputShown = false, author = undefined) => {
     // A journaled turn given a time to stop at yields before its first model
     // request after it, keeping the turn open.
     const stopAt = journal && yieldAt !== undefined ? { yieldAt } : {};
@@ -1705,6 +1713,7 @@ export async function createFxEngine(options = {}, defaultRuntimeFactory = undef
     const fx = {
       ...(followUp ? { inputId: followUp.id, inputAccepted: followUp.accepted } : {}),
       ...((journal || options.hooks) && turnId ? { turnId } : {}),
+      ...(author ? { author } : {}),
       ...stopAt,
     };
     return request("session/prompt", { sessionId, prompt, ...(Object.keys(fx).length ? { _meta: { fx } } : {}) });
@@ -2089,7 +2098,8 @@ export async function createFxEngine(options = {}, defaultRuntimeFactory = undef
       if (update.sessionUpdate === "user_message_chunk" && update.content?.type === "text") {
         // A steer shows where it joined the turn, with the id it was sent with.
         const id = update._meta?.fx?.steering?.inputId;
-        return { type: "user_message", text: update.content.text, ...(typeof id === "string" ? { id } : {}) };
+        const author = update._meta?.fx?.steering?.author;
+        return { type: "user_message", text: update.content.text, ...(typeof id === "string" ? { id } : {}), ...(typeof author === "string" ? { author } : {}) };
       }
       if (update.sessionUpdate === "tool_call") {
         toolNames.set(update.toolCallId, update.name || update.toolName || update.title || "tool");
@@ -2123,9 +2133,9 @@ export async function createFxEngine(options = {}, defaultRuntimeFactory = undef
     return {
       id: rawTurn.id ?? null,
       cancel(cancelOptions) { rawTurn.cancel(cancelOptions); },
-      steer(input, id) {
+      steer(input, id, steerOptions) {
         if (id !== undefined && !validTurnId(id)) throw new TypeError(`steer id must be ${turnIdRule}`);
-        return rawTurn.steer(normalizeSteeringInput(input), id);
+        return rawTurn.steer(normalizeSteeringInput(input), id, normalizeAuthor(steerOptions?.author));
       },
       withdraw(id) { return rawTurn.withdraw(id); },
       [engineInternals]: rawTurn[engineInternals],
@@ -2201,6 +2211,7 @@ export async function createFxEngine(options = {}, defaultRuntimeFactory = undef
     if (signal !== undefined && (typeof signal?.addEventListener !== "function" || typeof signal?.removeEventListener !== "function")) throw new TypeError("prompt signal must be an AbortSignal");
     const yieldAt = promptOptions.yieldAt;
     if (yieldAt !== undefined && !(Number.isSafeInteger(yieldAt) && yieldAt > 0)) throw new TypeError("yieldAt must be a time in milliseconds since the epoch");
+    const author = normalizeAuthor(promptOptions.author);
     const queue = [];
     const waiters = [];
     let queuedBytes = 0;
@@ -2218,7 +2229,7 @@ export async function createFxEngine(options = {}, defaultRuntimeFactory = undef
     // This turn's steers: whether each reached the core, or was withdrawn first.
     const steers = new Map();
     const withdrawnSteer = (id) => Object.assign(new Error("steer was withdrawn"), { code: "FX_STEER_WITHDRAWN", id });
-    const startSteer = (id, text) => {
+    const startSteer = (id, text, author) => {
       if (finished || cancelled || activeTurn !== turn) {
         return Promise.reject(new Error("no prompt is running"));
       }
@@ -2235,12 +2246,12 @@ export async function createFxEngine(options = {}, defaultRuntimeFactory = undef
           local.sent = true;
           const accepted = () => (journal ? waitForInput(`accepted:${id}`) : Promise.resolve());
           if (typeof runtime.steer === "function") {
-            runtime.steer(text, id);
+            runtime.steer(text, id, author);
             // The web core accepts it when it takes it at the next boundary,
             // and shows where it joined the turn then.
             return accepted().then(() => ({ id }), (error) => (error?.code === "FX_STEER_WITHDRAWN" ? { id, withdrawn: true } : Promise.reject(error)));
           }
-          return request("libfx/steer", { sessionId, text, id }).then(accepted).then(() => ({ id }));
+          return request("libfx/steer", { sessionId, text, id, ...(author ? { author } : {}) }).then(accepted).then(() => ({ id }));
         } catch (error) {
           return Promise.reject(error);
         }
@@ -2295,8 +2306,8 @@ export async function createFxEngine(options = {}, defaultRuntimeFactory = undef
       },
       // Resolves `{ id }` once the steer is accepted: in a journaled session,
       // once its acceptance is stored. The promise carries `id` at once.
-      steer(text, id = `in_${crypto.randomUUID()}`) {
-        const steered = startSteer(id, text).then((value) => value ?? { id });
+      steer(text, id = `in_${crypto.randomUUID()}`, author = undefined) {
+        const steered = startSteer(id, text, author).then((value) => value ?? { id });
         steered.id = id;
         return steered;
       },
@@ -2412,10 +2423,10 @@ export async function createFxEngine(options = {}, defaultRuntimeFactory = undef
           resolvePromptStart = null;
           return { stopReason: "cancelled" };
         }
-        return sendPrompt(prepared, false, followUp, turn.id, [], yieldAt);
+        return sendPrompt(prepared, false, followUp, turn.id, [], yieldAt, false, author);
       });
     } else {
-      try { response = sendPrompt(prompt, resuming, followUp, turn.id, promptOptions[rerunCallIds] ?? [], yieldAt, promptOptions[resumeOutputShown] === true); } catch (error) { response = Promise.reject(error); }
+      try { response = sendPrompt(prompt, resuming, followUp, turn.id, promptOptions[rerunCallIds] ?? [], yieldAt, promptOptions[resumeOutputShown] === true, author); } catch (error) { response = Promise.reject(error); }
     }
     // Appends after a turn's first progress are lazy, so the turn runs ahead
     // of them, but its result waits until every record it wrote is stored:
