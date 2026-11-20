@@ -19,6 +19,7 @@ const provider_set = @import("../gateway/provider_set.zig");
 const host = @import("../hosts/host.zig");
 const host_target = @import("../hosts/target.zig");
 const io_mod = @import("../shared/io.zig");
+const crash_panic = @import("crash_panic.zig");
 const prompt_policy = @import("../config/prompt_policy.zig");
 const terminal_env = @import("../shared/terminal_env.zig");
 const vt_emulator = @import("../terminal/engine.zig");
@@ -318,6 +319,10 @@ fn runInteractiveWithDeps(comptime App: type, comptime cooperative: bool, app: *
     // NO_COLOR keeps the session and removes its colors. Set before
     // the session starts any other thread.
     if (terminal_env.noColor()) vt_emulator.colors_enabled = false;
+    // Before any thread starts: a panic saves its record at this path.
+    if (comptime !cooperative) {
+        if (io_mod.homeDir()) |home| crash_panic.prepare(home);
+    }
     app.* = App.init(alloc, launch, auth_mode) catch |first_err| fresh: {
         // An update relaunched a session that had no turn, which v2 never
         // saved (D2): the new build opens a fresh session instead (D81).
@@ -371,6 +376,13 @@ fn runInteractiveWithDeps(comptime App: type, comptime cooperative: bool, app: *
         if (comptime !cooperative and @hasDecl(App, "closeOnHangup")) {
             if (hung_up) app.closeOnHangup();
         }
+        // Saved before the terminal is released, while the renderer state the
+        // report reads is still the one that failed.
+        const crash_report_path: ?[]u8 = if (comptime !cooperative and @hasDecl(App, "writeCrashReport"))
+            (if (hung_up) null else app.writeCrashReport(err))
+        else
+            null;
+        defer if (crash_report_path) |path| app.alloc.free(path);
         app.releaseTerminal();
         if (hung_up) {
             app_needs_deinit = false;
@@ -387,6 +399,7 @@ fn runInteractiveWithDeps(comptime App: type, comptime cooperative: bool, app: *
             return .returned;
         }
         reportUnexpectedInteractiveError(deps, err);
+        if (crash_report_path) |path| reportCrashReportPath(deps, path);
         return err;
     };
     const relaunch_request: ?auto_upgrade.RelaunchRequest = if (comptime cooperative)
@@ -604,6 +617,17 @@ fn reportUnexpectedInteractiveError(deps: RunDeps, err: anyerror) void {
     deps.write_stderr(deps.stderr_ctx, message) catch {};
 }
 
+/// Says where the crash report was saved. A path too long for the buffer is
+/// not shown; the trace log records its length instead.
+fn reportCrashReportPath(deps: RunDeps, path: []const u8) void {
+    var buffer: [1024]u8 = undefined;
+    const message = std.mem.print(&buffer, "fx: crash report saved to {s}\n", .{path}) catch {
+        debug_trace.logf("core", "crash report path not shown: {d} bytes do not fit the message buffer", .{path.len});
+        return;
+    };
+    deps.write_stderr(deps.stderr_ctx, message) catch {};
+}
+
 fn writeStderr(deps: RunDeps, text: []const u8) void {
     deps.write_stderr(deps.stderr_ctx, text) catch {};
 }
@@ -761,6 +785,8 @@ const TestCapture = struct {
     stdout_calls: usize = 0,
     record_stderr_event: bool = false,
     record_stdout_event: bool = false,
+    /// The path `TestApp.writeCrashReport` returns; null means no report is saved.
+    crash_report_path: ?[]const u8 = null,
     resume_handoff_id: ?[]const u8 = null,
     shutdown_failure: ?anyerror = null,
     raise_sigint_during_deinit: bool = false,
@@ -875,6 +901,7 @@ fn startWorkerThreadForTest(ctx: ?*anyopaque, _: *anyopaque) !void {
 }
 
 const TestApp = struct {
+    alloc: Allocator = std.testing.allocator,
     main_agent: struct {} = .{},
     requested_resume: ?cli_surface.ResumeTarget = null,
     terminal_released: bool = false,
@@ -931,6 +958,13 @@ const TestApp = struct {
 
     pub fn closeOnHangup(_: *TestApp) void {
         appendTestEvent("hangup-close");
+    }
+
+    /// A copy of the capture's path, owned by the caller, when the test sets one.
+    pub fn writeCrashReport(self: *TestApp, _: anyerror) ?[]u8 {
+        const path = active_capture.?.crash_report_path orelse return null;
+        appendTestEvent("crash-report");
+        return self.alloc.dupe(u8, path) catch null;
     }
 
     fn releaseTerminal(self: *TestApp) void {
@@ -1386,6 +1420,51 @@ test "app entry reports run errors before deinit and outer cleanup" {
     try std.testing.expectEqual(@as(usize, 1), capture.stderr_calls);
     try std.testing.expectEqual(@as(usize, 0), capture.stdout_calls);
     try expectEvents(&.{ "init:none", "rebind-after-init", "auto-upgrade", "file-index", "worker-thread", "model-cache", "run", "terminal-release", "stderr-attempt", "deinit", "outer-defer" });
+}
+
+test "app entry saves a crash report before it releases the terminal and says where it is" {
+    const alloc = std.testing.allocator;
+    var capture = TestCapture.init(.{ .interactive = .{} });
+    defer capture.deinit();
+    capture.run_error = error.TestRunFailed;
+    capture.record_stderr_event = true;
+    capture.crash_report_path = "/Users/example/.fx/diagnostics/last-crash.jsonl";
+
+    try std.testing.expectError(error.TestRunFailed, runWithOuterCleanup(TestApp, alloc, &.{}, testConfig(), capture.deps()));
+    try std.testing.expectEqualStrings(
+        "fx: test run failed\nfx: crash report saved to /Users/example/.fx/diagnostics/last-crash.jsonl\n",
+        capture.stderr.written(),
+    );
+    try std.testing.expectEqual(@as(usize, 2), capture.stderr_calls);
+    try std.testing.expectEqual(@as(usize, 0), capture.stdout_calls);
+    try expectEvents(&.{ "init:none", "rebind-after-init", "auto-upgrade", "file-index", "worker-thread", "model-cache", "run", "crash-report", "terminal-release", "stderr-attempt", "stderr-attempt", "deinit", "outer-defer" });
+}
+
+test "app entry does not save a crash report for a hang-up" {
+    const alloc = std.testing.allocator;
+    var capture = TestCapture.init(.{ .interactive = .{} });
+    defer capture.deinit();
+    capture.run_error = error.TerminalInputClosed;
+    capture.record_stderr_event = true;
+    capture.crash_report_path = "/Users/example/.fx/diagnostics/last-crash.jsonl";
+
+    const outcome = try runWithDeps(TestApp, alloc, &.{}, testConfig(), capture.deps());
+
+    try std.testing.expectEqual(RunOutcome.returned, outcome);
+    try std.testing.expectEqualStrings("", capture.stderr.written());
+    try std.testing.expectEqual(@as(usize, 0), capture.stderr_calls);
+    try expectEvents(&.{
+        "init:none",
+        "rebind-after-init",
+        "auto-upgrade",
+        "file-index",
+        "worker-thread",
+        "model-cache",
+        "run",
+        "hangup-close",
+        "terminal-release",
+        "deinit",
+    });
 }
 
 test "app entry treats terminal input closure as abnormal cleanup without stderr" {
