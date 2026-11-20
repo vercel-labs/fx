@@ -38,6 +38,12 @@
 # when the copy dropped part of the turn, and the answer; a resume gives the
 # answer and the updates after it; a follower changes nothing. Its Today config
 # shows fx before the join, where a second connection's load is refused.
+# AcpSessionReaders: the two readers of one session, the owner's and a follower's:
+# a start claims the prompt slot and waits while a taken turn is joined, a reap
+# takes a finished turn out and joins it, and a close refuses new starts, unregisters,
+# waits for the uses, and frees. Its Today config shows
+# fx today, where two starts can both see an empty slot. The design (Rules TRUE)
+# is not landed yet, and the model says so at its top.
 # AcpJoinTrace: the real fx acp, with followers on its leader socket, run through
 # six plans and checked against AcpJoin. Its driver's --ci run requires every plan
 # ACCEPTED on the built binary; --model today is the control, REJECTED throughout.
@@ -71,6 +77,7 @@
 #   bun ../drivers/acp/shared_session/check-spec.ts
 #   bun ../drivers/acp/subagents/check-spec.ts
 #   bun ../drivers/acp/fork_rewind/check-spec.ts
+#   bun ../drivers/acp/session_readers/check-spec.ts
 #
 # With --ci it also runs every ../drivers/acp/*/driver.ts against
 # zig-out/bin/fx, as CI does; the planted bugs stay local, since they measure
@@ -157,6 +164,8 @@ MCAcpLeader MCAcpLeader -
 MCAcpLeader AcpLeaderToday temporal
 MCAcpJoin MCAcpJoin -
 MCAcpJoin AcpJoinToday temporal
+MCAcpSessionReaders MCAcpSessionReaders -
+MCAcpSessionReaders AcpSessionReadersToday AtMostOneWorker
 EOF
 
 if [ "$ci" = true ]; then
