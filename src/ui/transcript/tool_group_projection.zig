@@ -5471,6 +5471,38 @@ test "a failed call says what it tried, and why only when its turn ended on it" 
     try std.testing.expect(std.mem.find(u8, tiny_row, " · ") == null);
 }
 
+test "a toolbox run of a built-in tool reads as a direct call of it, by the tool core names its record for" {
+    const alloc = std.testing.allocator;
+    const turn_ended = TranscriptEntry{ .raw_bytes = .{ .id = 99, .bytes = "  2s", .class = .turn_summary } };
+    const Case = struct { status: []const u8, tool_name: []const u8, activity_kind: types.ToolActivityKind, arguments_json: ?[]const u8, outcome: types.ToolOutcomeKind, row: []const u8 };
+    const cases = [_]Case{
+        // A run that failed before it started has only its streamed row,
+        // which core names for the tool it runs, with no arguments.
+        .{ .status = "● Failed http://127.0.0.1/page\n", .tool_name = "web_fetch", .activity_kind = .read, .arguments_json = null, .outcome = .failed, .row = "● Couldn't fetch http://127.0.0.1/page" },
+        .{ .status = "● Failed zig release notes\n", .tool_name = "web_search", .activity_kind = .read, .arguments_json = null, .outcome = .failed, .row = "● Couldn't search zig release notes" },
+        // A run that started, live or on resume, has that tool's arguments.
+        .{ .status = "● Failed notes.txt\n", .tool_name = "read_file", .activity_kind = .read, .arguments_json = "{\"path\":\"notes.txt\"}", .outcome = .failed, .row = "● Couldn't read notes.txt" },
+        .{ .status = "● Read notes.txt\n", .tool_name = "read_file", .activity_kind = .read, .arguments_json = "{\"path\":\"notes.txt\"}", .outcome = .completed, .row = "● Read notes.txt" },
+        // An MCP tool's run keeps toolbox's record and reads as a direct
+        // call of that tool.
+        .{ .status = "● Failed mcp_fixture_echo\n", .tool_name = "toolbox", .activity_kind = .mcp, .arguments_json = "{\"run\":\"mcp_fixture_echo\",\"arguments\":{}}", .outcome = .failed, .row = "● Couldn't run mcp_fixture_echo" },
+    };
+    for (cases) |case| {
+        const entry = TranscriptEntry{ .raw_bytes = .{ .id = 1, .bytes = case.status, .class = .tool_status } };
+        const detail = ToolDetailRecord{
+            .entry_id = 1,
+            .tool_name = @constCast(case.tool_name),
+            .activity_kind = case.activity_kind,
+            .arguments_json = if (case.arguments_json) |value| @constCast(value) else null,
+            .outcome = case.outcome,
+        };
+        const text = try groupTextForTest(alloc, &.{ entry, turn_ended }, &.{detail});
+        defer alloc.free(text);
+        errdefer std.debug.print("group:\n{s}\n", .{text});
+        try std.testing.expectEqualStrings(case.row, firstLineForTest(text));
+    }
+}
+
 test "a failed call's mark and words take the failure style" {
     const alloc = std.testing.allocator;
     const style: SummaryStyle = .{ .text_style = "<text>", .reset_style = "<reset>", .failure_style = "<failure>" };

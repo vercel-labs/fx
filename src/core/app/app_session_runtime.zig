@@ -44,6 +44,7 @@ const command_output_content = @import("../tooling/command_output_content.zig");
 const tooling_presentation = @import("../tooling/tool_presentation.zig");
 const tool_args = @import("../tooling/tool_args.zig");
 const tool_dispatch = @import("../tooling/tool_dispatch.zig");
+const toolbox = @import("../tooling/toolbox.zig");
 const skill_contract = @import("../skills/skill_contract.zig");
 const skill_invocation = @import("../skills/skill_invocation.zig");
 const captured_command = @import("../tooling/captured_command.zig");
@@ -4138,16 +4139,24 @@ pub fn Runtime(comptime App: type) type {
             );
         }
 
+        /// The call a saved call shows as: for a toolbox run of a built-in
+        /// tool, the call fx ran for it, so its rows read after a resume as
+        /// they did live. Any other call as it is.
+        fn shownHistoricalCall(app: *App, agent: *AppAgent, arena: std.mem.Allocator, call: types.ToolCall) !types.ToolCall {
+            return try toolbox.shownBuiltinRun(arena, app.toolAdvertisementSet(agent).registry, call) orelse call;
+        }
+
         fn writeCancelledCommandPresentation(
             app: *App,
             agent: *AppAgent,
             sink: anytype,
-            call: types.ToolCall,
+            model_call: types.ToolCall,
             presentation: types.CancelledCommandPresentation,
             labels: *HistoricalSessionLabels,
         ) !void {
             var action_arena = std.heap.ArenaAllocator.init(app.alloc);
             defer mem_utils.deinit_arena(action_arena);
+            const call = try shownHistoricalCall(app, agent, action_arena.allocator(), model_call);
             const action = try app.describeToolActionDeniedWithAdvertised(
                 agent,
                 action_arena.allocator(),
@@ -4208,7 +4217,9 @@ pub fn Runtime(comptime App: type) type {
                         try writeBridgeCallRows(app, sink, execution.bridge_calls, call.id);
                         try writePermissionFeedback(sink, result.permission_feedback);
                     } else {
-                        try writeUnreportedToolStatus(app, sink, call);
+                        var shown_arena = std.heap.ArenaAllocator.init(app.alloc);
+                        defer shown_arena.deinit();
+                        try writeUnreportedToolStatus(app, sink, try shownHistoricalCall(app, agent, shown_arena.allocator(), call));
                         try writeBridgeCallRows(app, sink, execution.bridge_calls, call.id);
                     }
                 }
@@ -4331,7 +4342,7 @@ pub fn Runtime(comptime App: type) type {
             app: *App,
             agent: *AppAgent,
             sink: anytype,
-            call: types.ToolCall,
+            model_call: types.ToolCall,
             result: types.PersistedToolResult,
             labels: *HistoricalSessionLabels,
         ) !void {
@@ -4339,9 +4350,14 @@ pub fn Runtime(comptime App: type) type {
                 app.alloc,
                 app.toolAdvertisementSet(agent).registry,
                 labels.workspace_root,
-                call,
+                model_call,
                 result,
             );
+            // A toolbox run of a built-in tool shows as the call fx ran for
+            // it, as its rows did live.
+            var shown_arena = std.heap.ArenaAllocator.init(app.alloc);
+            defer shown_arena.deinit();
+            const call = try shownHistoricalCall(app, agent, shown_arena.allocator(), model_call);
             if (try writeAnsweredQuestionResult(app, sink, call, result)) return;
             if (try writeCommittedFilePresentation(app, agent, sink, call, result)) return;
 
@@ -7963,6 +7979,54 @@ test "resume projection stores reflow metadata after the session moved workspace
         }
     }
     try std.testing.expect(stored);
+}
+
+test "a saved toolbox run of a built-in tool replays as a direct call of it" {
+    const alloc = std.testing.allocator;
+    var app = try TestApp.init(alloc, "/workspace");
+    defer app.deinit();
+
+    var source_runtime: transcript_runtime.TranscriptRuntime = .{};
+    defer source_runtime.deinit(alloc);
+    var projection = try resume_projection.ResumeProjection.initEmpty(alloc, &source_runtime, 0, 1);
+    defer projection.deinit();
+    var labels = Runtime(TestApp).HistoricalSessionLabels{ .workspace_root = "/workspace" };
+    defer labels.deinit(app.alloc);
+    var sink = Runtime(TestApp).DetachedHistorySink(@TypeOf(projection)){
+        .app = &app,
+        .projection = &projection,
+        .labels = &labels,
+    };
+
+    // The session saves the call the model made, under toolbox.
+    var calls = [_]types.ToolCall{
+        .{ .id = "call_read", .name = "toolbox", .arguments_json = "{\"run\":\"read_file\",\"arguments\":{\"path\":\"notes.txt\"}}" },
+        .{ .id = "call_fetch", .name = "toolbox", .arguments_json = "{\"run\":\"web_fetch\",\"arguments\":{\"url\":\"http://127.0.0.1/page\"}}" },
+        .{ .id = "call_mcp", .name = "toolbox", .arguments_json = "{\"run\":\"mcp_fixture_echo\",\"arguments\":{}}" },
+    };
+    var results = [_]types.PersistedToolResult{
+        .{ .tool_call_id = @constCast("call_read"), .tool_name = @constCast("toolbox"), .status = .success, .output = @constCast("notes"), .output_bytes = 5, .stored_output_bytes = 5 },
+        .{ .tool_call_id = @constCast("call_fetch"), .tool_name = @constCast("toolbox"), .status = .failure, .output = @constCast("refused"), .output_bytes = 7, .stored_output_bytes = 7 },
+        .{ .tool_call_id = @constCast("call_mcp"), .tool_name = @constCast("toolbox"), .status = .success, .output = @constCast("echo"), .output_bytes = 4, .stored_output_bytes = 4 },
+    };
+    var steps = [_]types.ToolExecutionStep{.{ .tool_calls = calls[0..], .tool_results = results[0..] }};
+
+    try Runtime(TestApp).writeExecutionHistoryToSink(&app, (&app).agent(), &sink, .{ .tool_steps = steps[0..] }, &labels);
+
+    const Want = struct { name: []const u8, arguments: []const u8, kind: types.ToolActivityKind };
+    const wants = [_]Want{
+        .{ .name = "read_file", .arguments = "{\"path\":\"notes.txt\"}", .kind = .read },
+        .{ .name = "web_fetch", .arguments = "{\"url\":\"http://127.0.0.1/page\"}", .kind = .read },
+        // An MCP tool's run keeps toolbox's own record.
+        .{ .name = "toolbox", .arguments = calls[2].arguments_json, .kind = .mcp },
+    };
+    const details = projection.runtime.notebook.tool_details.items;
+    try std.testing.expectEqual(wants.len, details.len);
+    for (wants, details) |want, detail| {
+        try std.testing.expectEqualStrings(want.name, detail.tool_name);
+        try std.testing.expectEqualStrings(want.arguments, detail.arguments_json.?);
+        try std.testing.expectEqual(want.kind, detail.activity_kind.?);
+    }
 }
 
 test "execution replay renders persisted permission feedback after its tool result" {
