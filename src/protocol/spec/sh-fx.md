@@ -181,12 +181,18 @@ A host lists `sh.fx/hostSteering` in `clientCapabilities._meta` to receive `sh.f
 
 ### Following a session
 
-A session can be open on several connections at once, which ACP v2's [session setup](https://agentclientprotocol.com/protocol/v2/session-setup) allows an Agent to do. A client joins a session that another client runs with ACP's own methods, on a connection to the fx process that runs the session:
+A session can be open on several connections at once, which ACP v2's [session setup](https://agentclientprotocol.com/protocol/v2/session-setup) allows an Agent to do. A client joins a session that another connection of the same fx process has open, on a leader socket (see "Finding a session's leader"), with ACP's own methods:
 
-- `session/load` replays the whole session, then the updates that the running turn has sent so far, then live updates.
-- `session/resume` sends live updates from that point on.
+- `session/load` replays the saved turns, then the session's saved title when it has one, then the updates that the running turn has sent so far, then its answer.
+- `session/resume` sends only its answer.
 
-Each message that a load replays has a `messageId` made from its turn's number in the session log and its place in that turn, such as `turn-3-1`, so every load gives a saved message the same id. A message sent live keeps the id fx gave it then, which a load doesn't repeat. `tests/tla/acp/AcpFollow.tla` checks this as `StableIds`, and `tests/tla/drivers/acp/follow/driver.ts` checks it on fx.
+fx now does the joining and watching this section describes. A joined client can't change the session yet: its `session/prompt`, `session/cancel`, `session/set_mode` and `session/set_config_option` get error `-32600` with the message `This session is open on another connection; only that connection can change it.`, and fx keeps the session's own `systemPrompt` and hooks, not the joining request's, and traces any it ignores. fx doesn't send catch-up positions, other clients' prompts apart from steers, permission requests to other clients, or the client list yet. When the connection that opened the session closes it, fx closes it for every connection and cancels its running turn; when that connection's input ends, fx ends its turns as "Keeping turns after a disconnect" says and then closes its sessions. The joined clients then get `-32002` for the session.
+
+The running turn's replay holds the updates that its copy kept, in order. For a client that lists `sh.fx/turnProgress`, the turn's latest progress follows them. When fx kept only the start of the running turn's output, a notice comes before the answer: `fx kept only the start of this turn's output, so part of it isn't shown.` It is an ACP `info` notice for a client whose `clientCapabilities` lists `session.notices`, and an agent message for any other client. The copy keeps the running turn's updates up to 16 MiB; once it drops one, it keeps no later one.
+
+After its answer, the joined client gets each update of the session once, in order, with the same capability filter as its own sessions.
+
+A load gives each saved message a `messageId` made from its turn's number in the session log and its place in that turn, such as `turn-3-1`. So every load gives a saved message the same id, which can differ from the id the message had while it was live. A turn that the log gave no number gets random ids on replay, as a live message does. A message of the running turn keeps the id it had when it was live, in the running turn's replay too. `tests/tla/acp/AcpFollow.tla` checks the same id on every load as `StableIds`, and `tests/tla/drivers/acp/follow/driver.ts` checks it on fx.
 
 Joining needs no capability, so a client that knows only ACP can follow a session.
 
@@ -594,7 +600,7 @@ The leader of a session is the `fx acp` process that holds the session's lock: t
 
 The process makes its socket when it starts, in a new folder named `fx-leader-` and 16 hex characters, with mode `0700`, under `TMPDIR` when the socket's path stays at most 103 bytes, and under `/tmp` when it doesn't or when `TMPDIR` is unset or not an absolute path. It writes the line when a session becomes live, and empties the file before it releases the lock, so a normal exit leaves every lock it held empty and removes the socket and its folder. A process that is killed leaves its line and its folder behind; the next process that takes the lock replaces or empties the line. A process that can't make its socket runs without one and writes no line.
 
-The socket speaks newline-delimited JSON-RPC 2.0, as stdio does. It answers only `initialize`, with the same result as stdio and `_meta["sh.fx/leader"]`: the process's `pid` and the ids of the sessions it leads, `sessions`. Any other request gets `-32601`. Before it uses a line, a reader connects to its socket and checks that `sessions` lists the session: a socket that refuses the connection belongs to a process that is gone, and the session has no leader until another process takes its lock.
+The socket speaks newline-delimited JSON-RPC 2.0, as stdio does, and serves ACP as stdio does. A connection on the socket is a full ACP connection of the same process: it gets the same answers as stdio to the same requests, and it shares the process's store and session table, so a session it opens or joins is the one stdio sees. Its `initialize` answer is the stdio answer plus `_meta["sh.fx/leader"]`: the process's `pid` and the ids of the sessions it leads, `sessions`. Before it uses a line, a reader connects to its socket and checks that `sessions` lists the session: a socket that refuses the connection belongs to a process that is gone, and the session has no leader until another process takes its lock.
 
 `tests/tla/acp/AcpLeader.tla` checks which process a line names, when its socket answers, and when that process leads the session, and `tests/tla/drivers/acp/leader/driver.ts` checks the same on fx.
 

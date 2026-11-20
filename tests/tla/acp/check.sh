@@ -33,6 +33,15 @@
 # start still takes the lock and empties the record a dead holder left. Its
 # Today config shows fx acp before the record.
 #
+# AcpJoin: a second connection joins a session another connection of the same
+# process has open. Its load replays the saved turns, the running copy, a notice
+# when the copy dropped part of the turn, and the answer; a resume gives the
+# answer and the updates after it; a follower changes nothing. Its Today config
+# shows fx before the join, where a second connection's load is refused.
+# AcpJoinTrace: the real fx acp, with followers on its leader socket, run through
+# six plans and checked against AcpJoin. Its driver's --ci run requires every plan
+# ACCEPTED on the built binary; --model today is the control, REJECTED throughout.
+#
 # The planted bugs and the runs of the real `fx acp` binary are in
 # ../drivers/acp/:
 #   bun ../drivers/acp/permission_modes/check-spec.ts
@@ -55,6 +64,8 @@
 #   bun ../drivers/acp/disconnect/driver.ts   # a client that disconnects
 #   bun ../drivers/acp/leader/check-spec.ts
 #   bun ../drivers/acp/leader/driver.ts   # the real fx acp against AcpLeader
+#   bun ../drivers/acp/join/check-spec.ts
+#   bun ../drivers/acp/join/driver.ts   # the real fx acp with followers, against AcpJoinTrace
 #   bun ../drivers/acp/session_state/check-spec.ts
 #   bun ../drivers/acp/session_state/driver.ts   # today's fx acp; --model rules fails until the rules land
 #   bun ../drivers/acp/shared_session/check-spec.ts
@@ -144,6 +155,8 @@ MCAcpDisconnect AcpDisconnectToday-keep KeptTurnsComplete
 MCAcpDisconnect AcpDisconnectToday-wait NeverWaitsForGoneClient
 MCAcpLeader MCAcpLeader -
 MCAcpLeader AcpLeaderToday temporal
+MCAcpJoin MCAcpJoin -
+MCAcpJoin AcpJoinToday temporal
 EOF
 
 if [ "$ci" = true ]; then
