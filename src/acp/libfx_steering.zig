@@ -5,6 +5,7 @@ const std = @import("std");
 const debug_trace = @import("../core/shared/debug_trace.zig");
 const io_mod = @import("../core/shared/io.zig");
 const jsonrpc = @import("jsonrpc.zig");
+const connection = @import("connection.zig");
 const text_utils = @import("../core/shared/text_utils.zig");
 
 const Allocator = std.mem.Allocator;
@@ -31,6 +32,8 @@ const Entry = struct {
     /// The ACP `session/prompt` request that carried the text, answered when
     /// the turn that absorbed it ends. libfx steering carries no request.
     request_id: ?RequestId = null,
+    /// The connection that sent the steer. A withdrawal matches it with the request id.
+    from: connection.ConnectionId = connection.no_connection,
     /// The libfx input id a journaled session records the text under.
     input_id: ?[]u8 = null,
 };
@@ -55,6 +58,8 @@ pub fn validInputId(id: []const u8) bool {
 pub const Steer = struct {
     text: []u8,
     request_id: RequestId,
+    /// The connection that sent the steer. A withdrawal matches it with the request id.
+    from: connection.ConnectionId = connection.no_connection,
 
     pub fn deinit(self: Steer, alloc: Allocator) void {
         alloc.free(self.text);
@@ -62,20 +67,32 @@ pub const Steer = struct {
     }
 };
 
+/// An ACP request and the connection that sent it. Its answer goes to that connection.
+pub const Sender = struct {
+    id: RequestId,
+    from: connection.ConnectionId,
+};
+
+/// Frees the ids of `senders`. The caller frees the slice.
+pub fn freeSenders(alloc: Allocator, senders: []const Sender) void {
+    for (senders) |sender| freeRequestId(alloc, sender.id);
+}
+
 pub fn freeSteers(alloc: Allocator, steers: []const Steer) void {
     for (steers) |steer| steer.deinit(alloc);
 }
 
 /// Requests to answer when a turn ends. Allocated in the caller's allocator.
 pub const Finished = struct {
-    /// Steering the turn delivered to the model.
-    absorbed: []RequestId,
+    /// Steering the turn delivered to the model, each with the connection that sent it.
+    absorbed: []Sender,
     /// ACP steers still queued when the turn stopped taking input. They run
     /// as the next turn (src/protocol/spec/sh-fx.md, "Steers").
     untaken: []Steer,
 
     pub fn deinit(self: Finished, alloc: Allocator) void {
-        freeRequestIds(alloc, self.absorbed);
+        freeSenders(alloc, self.absorbed);
+        alloc.free(self.absorbed);
         freeSteers(alloc, self.untaken);
         alloc.free(self.untaken);
     }
@@ -97,7 +114,7 @@ pub const Phase = enum { reply, tools };
 pub const Runtime = struct {
     mutex: std.Io.Mutex = .init,
     messages: std.ArrayList(Entry) = .empty,
-    absorbed: std.ArrayList(RequestId) = .empty,
+    absorbed: std.ArrayList(Sender) = .empty,
     queued_bytes: usize = 0,
     accepting: bool = false,
     /// The current step and what it does; null before the first one.
@@ -325,13 +342,13 @@ pub const Runtime = struct {
     }
 
     pub fn enqueue(self: *Runtime, alloc: Allocator, text: []const u8) EnqueueError!void {
-        return self.enqueueRequest(alloc, text, null);
+        return self.enqueueRequest(alloc, text, null, connection.no_connection);
     }
 
     /// Queues a libfx input under `input_id`, which no queued entry may share.
     pub fn enqueueInput(self: *Runtime, alloc: Allocator, text: []const u8, input_id: []const u8) InputError!void {
         if (!validInputId(input_id)) return error.InvalidInputId;
-        return self.enqueueEntry(alloc, text, null, input_id);
+        return self.enqueueEntry(alloc, text, null, connection.no_connection, input_id);
     }
 
     /// Removes the queued input `input_id`. False when it is not queued: the
@@ -351,14 +368,15 @@ pub const Runtime = struct {
     }
 
     /// Queues text for the running turn. A supplied request ID is copied and
-    /// reported by `finishTurn`.
+    /// reported by `finishTurn`, with `from`, the connection that sent it.
     pub fn enqueueRequest(
         self: *Runtime,
         alloc: Allocator,
         text: []const u8,
         request_id: ?RequestId,
+        from: connection.ConnectionId,
     ) EnqueueError!void {
-        return self.enqueueEntry(alloc, text, request_id, null) catch |err| switch (err) {
+        return self.enqueueEntry(alloc, text, request_id, from, null) catch |err| switch (err) {
             // Only an input id can be invalid, and none is given here.
             error.InvalidInputId => unreachable,
             else => |other| other,
@@ -370,6 +388,7 @@ pub const Runtime = struct {
         alloc: Allocator,
         text: []const u8,
         request_id: ?RequestId,
+        from: connection.ConnectionId,
         input_id: ?[]const u8,
     ) InputError!void {
         if (text.len == 0) return error.EmptySteeringMessage;
@@ -395,7 +414,7 @@ pub const Runtime = struct {
         const owned_input = if (input_id) |id| try alloc.dupe(u8, id) else null;
         errdefer if (owned_input) |id| alloc.free(id);
         const owned_id = if (request_id) |id| try dupeRequestId(alloc, id) else null;
-        self.messages.appendAssumeCapacity(.{ .text = owned, .request_id = owned_id, .input_id = owned_input });
+        self.messages.appendAssumeCapacity(.{ .text = owned, .request_id = owned_id, .input_id = owned_input, .from = from });
         self.queued_bytes += owned.len;
     }
 
@@ -445,7 +464,7 @@ pub const Runtime = struct {
         for (self.messages.items) |entry| {
             backing.free(entry.text);
             if (entry.input_id) |id| backing.free(id);
-            if (entry.request_id) |id| self.absorbed.appendAssumeCapacity(id);
+            if (entry.request_id) |id| self.absorbed.appendAssumeCapacity(.{ .id = id, .from = entry.from });
         }
         self.messages.clearRetainingCapacity();
         self.queued_bytes = 0;
@@ -469,14 +488,14 @@ pub const Runtime = struct {
         for (self.messages.items) |entry| {
             if (entry.request_id != null) untaken_count += 1;
         }
-        const absorbed = try result_alloc.alloc(RequestId, self.absorbed.items.len);
+        const absorbed = try result_alloc.alloc(Sender, self.absorbed.items.len);
         errdefer result_alloc.free(absorbed);
         const untaken = try result_alloc.alloc(Steer, untaken_count);
         errdefer result_alloc.free(untaken);
         var copied_absorbed: usize = 0;
-        errdefer freeRequestIdItems(result_alloc, absorbed[0..copied_absorbed]);
-        for (self.absorbed.items, 0..) |id, index| {
-            absorbed[index] = try dupeRequestId(result_alloc, id);
+        errdefer freeSenders(result_alloc, absorbed[0..copied_absorbed]);
+        for (self.absorbed.items, 0..) |sender, index| {
+            absorbed[index] = .{ .id = try dupeRequestId(result_alloc, sender.id), .from = sender.from };
             copied_absorbed += 1;
         }
         var copied_untaken: usize = 0;
@@ -485,7 +504,7 @@ pub const Runtime = struct {
             const id = entry.request_id orelse continue;
             const text = try result_alloc.dupe(u8, entry.text);
             errdefer result_alloc.free(text);
-            untaken[copied_untaken] = .{ .text = text, .request_id = try dupeRequestId(result_alloc, id) };
+            untaken[copied_untaken] = .{ .text = text, .request_id = try dupeRequestId(result_alloc, id), .from = entry.from };
             copied_untaken += 1;
         }
         // The untaken steers live on in the caller's copies, so only the
@@ -504,14 +523,15 @@ pub const Runtime = struct {
         return .{ .absorbed = absorbed, .untaken = untaken };
     }
 
-    /// Removes the queued ACP steer that request `id` sent. False when it is
-    /// not queued: a turn took it, or it never arrived.
-    pub fn withdrawRequest(self: *Runtime, alloc: Allocator, id: RequestId) bool {
+    /// Removes the queued ACP steer that connection `from` sent with request `id`.
+    /// False when it is not queued from that connection: a turn took it, or it never
+    /// arrived.
+    pub fn withdrawRequest(self: *Runtime, alloc: Allocator, from: connection.ConnectionId, id: RequestId) bool {
         self.mutex.lockUncancelable(io_mod.getIo());
         defer self.mutex.unlock(io_mod.getIo());
         for (self.messages.items, 0..) |entry, index| {
             const queued = entry.request_id orelse continue;
-            if (!jsonrpc.requestIdsEqual(queued, id)) continue;
+            if (!connection.sameConnection(entry.from, from) or !jsonrpc.requestIdsEqual(queued, id)) continue;
             const removed = self.messages.orderedRemove(index);
             self.queued_bytes -= removed.text.len;
             freeEntry(alloc, removed);
@@ -543,7 +563,7 @@ pub const Runtime = struct {
         }
         for (self.messages.items) |entry| freeEntry(alloc, entry);
         self.messages.clearRetainingCapacity();
-        freeRequestIdItems(alloc, self.absorbed.items);
+        freeSenders(alloc, self.absorbed.items);
         self.absorbed.clearRetainingCapacity();
         self.queued_bytes = 0;
     }
@@ -575,15 +595,6 @@ fn freeEntry(alloc: Allocator, entry: Entry) void {
 
 const dupeRequestId = jsonrpc.dupeRequestId;
 const freeRequestId = jsonrpc.freeRequestId;
-
-fn freeRequestIdItems(alloc: Allocator, ids: []const RequestId) void {
-    for (ids) |id| freeRequestId(alloc, id);
-}
-
-fn freeRequestIds(alloc: Allocator, ids: []RequestId) void {
-    freeRequestIdItems(alloc, ids);
-    alloc.free(ids);
-}
 
 test "libfx steering runtime preserves order and releases drained storage" {
     const alloc = std.testing.allocator;
@@ -627,23 +638,23 @@ test "steering runtime reports absorbed and untaken prompt requests when a turn 
     var runtime: Runtime = .{};
     defer runtime.deinit(alloc);
 
-    try std.testing.expectError(error.SteeringNotActive, runtime.enqueueRequest(alloc, "early", .{ .integer = 1 }));
+    try std.testing.expectError(error.SteeringNotActive, runtime.enqueueRequest(alloc, "early", .{ .integer = 1 }, 1));
     runtime.open(alloc);
-    try runtime.enqueueRequest(alloc, "the other tab", .{ .string = "steer-1" });
+    try runtime.enqueueRequest(alloc, "the other tab", .{ .string = "steer-1" }, 1);
     const drained = try runtime.takeAll(alloc, alloc, false);
     defer freeDrained(alloc, drained);
     try std.testing.expectEqualStrings("the other tab", drained.texts[0]);
     try std.testing.expectEqualStrings("steer-1", drained.request_ids[0].?.string);
 
-    try runtime.enqueueRequest(alloc, "just summarize", .{ .integer = 7 });
+    try runtime.enqueueRequest(alloc, "just summarize", .{ .integer = 7 }, 1);
     const finished = try runtime.finishTurn(alloc, alloc, "test");
     defer finished.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 1), finished.absorbed.len);
-    try std.testing.expectEqualStrings("steer-1", finished.absorbed[0].string);
+    try std.testing.expectEqualStrings("steer-1", finished.absorbed[0].id.string);
     try std.testing.expectEqual(@as(usize, 1), finished.untaken.len);
     try std.testing.expectEqual(@as(i64, 7), finished.untaken[0].request_id.integer);
     try std.testing.expectEqualStrings("just summarize", finished.untaken[0].text);
-    try std.testing.expectError(error.SteeringNotActive, runtime.enqueueRequest(alloc, "late", .{ .integer = 8 }));
+    try std.testing.expectError(error.SteeringNotActive, runtime.enqueueRequest(alloc, "late", .{ .integer = 8 }, 1));
     try std.testing.expectEqual(@as(usize, 0), runtime.messages.items.len);
     try std.testing.expectEqual(@as(usize, 0), runtime.queued_bytes);
     try std.testing.expectEqual(@as(usize, 0), runtime.absorbed.items.len);
@@ -860,13 +871,13 @@ test "steering runtime withdraws a queued ACP steer by its request id, in order"
     var runtime: Runtime = .{};
     defer runtime.deinit(alloc);
     runtime.open(alloc);
-    try runtime.enqueueRequest(alloc, "first", .{ .integer = 1 });
-    try runtime.enqueueRequest(alloc, "second", .{ .string = "s2" });
-    try runtime.enqueueRequest(alloc, "third", .{ .integer = 3 });
+    try runtime.enqueueRequest(alloc, "first", .{ .integer = 1 }, 1);
+    try runtime.enqueueRequest(alloc, "second", .{ .string = "s2" }, 1);
+    try runtime.enqueueRequest(alloc, "third", .{ .integer = 3 }, 1);
 
-    try std.testing.expect(runtime.withdrawRequest(alloc, .{ .string = "s2" }));
-    try std.testing.expect(!runtime.withdrawRequest(alloc, .{ .string = "s2" }));
-    try std.testing.expect(!runtime.withdrawRequest(alloc, .{ .integer = 9 }));
+    try std.testing.expect(runtime.withdrawRequest(alloc, 1, .{ .string = "s2" }));
+    try std.testing.expect(!runtime.withdrawRequest(alloc, 1, .{ .string = "s2" }));
+    try std.testing.expect(!runtime.withdrawRequest(alloc, 1, .{ .integer = 9 }));
     try std.testing.expectEqual(@as(usize, "first".len + "third".len), runtime.queued_bytes);
 
     const finished = try runtime.finishTurn(alloc, alloc, "test");
@@ -882,11 +893,30 @@ test "steering runtime keeps a libfx input out of the untaken ACP steers" {
     defer runtime.deinit(alloc);
     runtime.open(alloc);
     try runtime.enqueueInput(alloc, "journaled", "in-1");
-    try runtime.enqueueRequest(alloc, "acp steer", .{ .integer = 2 });
+    try runtime.enqueueRequest(alloc, "acp steer", .{ .integer = 2 }, 1);
 
     const finished = try runtime.finishTurn(alloc, alloc, "test");
     defer finished.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 1), finished.untaken.len);
     try std.testing.expectEqualStrings("acp steer", finished.untaken[0].text);
     try std.testing.expectEqual(@as(usize, 0), runtime.messages.items.len);
+}
+
+test "a withdrawal from one connection leaves a queued steer with the same request id from another connection" {
+    const alloc = std.testing.allocator;
+    var runtime: Runtime = .{};
+    defer runtime.deinit(alloc);
+    runtime.open(alloc);
+    try runtime.enqueueRequest(alloc, "from a", .{ .integer = 5 }, 1);
+    try runtime.enqueueRequest(alloc, "from b", .{ .integer = 5 }, 2);
+
+    try std.testing.expect(runtime.withdrawRequest(alloc, 1, .{ .integer = 5 }));
+    try std.testing.expect(!runtime.withdrawRequest(alloc, 1, .{ .integer = 5 }));
+    try std.testing.expectEqual(@as(usize, "from b".len), runtime.queued_bytes);
+
+    const finished = try runtime.finishTurn(alloc, alloc, "test");
+    defer finished.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), finished.untaken.len);
+    try std.testing.expectEqualStrings("from b", finished.untaken[0].text);
+    try std.testing.expectEqual(@as(connection.ConnectionId, 2), finished.untaken[0].from);
 }

@@ -12,6 +12,7 @@ const std = @import("std");
 const io_mod = @import("../core/shared/io.zig");
 const jsonrpc = @import("jsonrpc.zig");
 const libfx_steering = @import("libfx_steering.zig");
+const connection = @import("connection.zig");
 
 const Allocator = std.mem.Allocator;
 const RequestId = jsonrpc.RequestId;
@@ -20,12 +21,19 @@ const Steer = libfx_steering.Steer;
 /// A session holds at most this many queued prompts.
 pub const max_queued_prompts: usize = 64;
 
+/// A queued prompt and the connection that sent it. A withdrawal matches the
+/// connection and the request id together. Owned by the line.
+pub const Queued = struct {
+    msg: jsonrpc.Message,
+    from: connection.ConnectionId = connection.no_connection,
+};
+
 /// What runs after a turn ends. Owned by the caller.
 pub const Next = union(enum) {
     /// The steers for the next turn, in order, run together as one turn.
     steers: std.ArrayList(Steer),
-    /// A queued prompt, as the client sent it.
-    prompt: jsonrpc.Message,
+    /// A queued prompt, as the client sent it, with the connection that sent it.
+    prompt: Queued,
 
     pub fn deinit(self: *Next, alloc: Allocator) void {
         switch (self.*) {
@@ -33,7 +41,7 @@ pub const Next = union(enum) {
                 libfx_steering.freeSteers(alloc, steers.items);
                 steers.deinit(alloc);
             },
-            .prompt => |*msg| jsonrpc.freeMessage(alloc, msg),
+            .prompt => |*queued| jsonrpc.freeMessage(alloc, &queued.msg),
         }
     }
 };
@@ -42,12 +50,12 @@ pub const Next = union(enum) {
 /// by the caller.
 pub const Drained = struct {
     late: std.ArrayList(Steer) = .empty,
-    queue: std.ArrayList(jsonrpc.Message) = .empty,
+    queue: std.ArrayList(Queued) = .empty,
 
     pub fn deinit(self: *Drained, alloc: Allocator) void {
         libfx_steering.freeSteers(alloc, self.late.items);
         self.late.deinit(alloc);
-        for (self.queue.items) |*msg| jsonrpc.freeMessage(alloc, msg);
+        for (self.queue.items) |*queued| jsonrpc.freeMessage(alloc, &queued.msg);
         self.queue.deinit(alloc);
     }
 };
@@ -58,8 +66,8 @@ pub const Line = struct {
     /// those it never took. They run together as the next turn.
     late: std.ArrayList(Steer) = .empty,
     late_bytes: usize = 0,
-    /// Queued prompts, in the order fx received them.
-    queue: std.ArrayList(jsonrpc.Message) = .empty,
+    /// Queued prompts, in the order fx received them, each with its sender.
+    queue: std.ArrayList(Queued) = .empty,
     /// A prompt worker runs and takes what the line holds when its turn
     /// ends. While false, a prompt that arrives starts a turn of its own.
     worker_running: bool = false,
@@ -86,6 +94,7 @@ pub const Line = struct {
         alloc: Allocator,
         text: []const u8,
         id: RequestId,
+        from: connection.ConnectionId,
     ) (Allocator.Error || error{SteeringQueueFull})!void {
         if (self.late.items.len >= libfx_steering.max_messages or
             self.late_bytes > libfx_steering.max_queued_bytes - text.len)
@@ -95,7 +104,7 @@ pub const Line = struct {
         try self.late.ensureUnusedCapacity(alloc, 1);
         const owned_text = try alloc.dupe(u8, text);
         errdefer alloc.free(owned_text);
-        self.late.appendAssumeCapacity(.{ .text = owned_text, .request_id = try jsonrpc.dupeRequestId(alloc, id) });
+        self.late.appendAssumeCapacity(.{ .text = owned_text, .request_id = try jsonrpc.dupeRequestId(alloc, id), .from = from });
         self.late_bytes += owned_text.len;
     }
 
@@ -113,9 +122,10 @@ pub const Line = struct {
         self: *Line,
         alloc: Allocator,
         msg: jsonrpc.Message,
+        from: connection.ConnectionId,
     ) (Allocator.Error || error{PromptQueueFull})!void {
         if (self.queue.items.len >= max_queued_prompts) return error.PromptQueueFull;
-        try self.queue.append(alloc, msg);
+        try self.queue.append(alloc, .{ .msg = msg, .from = from });
     }
 
     /// Takes what runs next: every late steer together, else the first
@@ -131,21 +141,21 @@ pub const Line = struct {
         return null;
     }
 
-    /// Removes the late steer or queued prompt that request `id` sent. False
-    /// when the line holds no such request.
-    pub fn withdrawLocked(self: *Line, alloc: Allocator, id: RequestId) bool {
+    /// Removes the late steer or queued prompt that connection `from` sent with
+    /// request `id`. False when the line holds no such request from that connection.
+    pub fn withdrawLocked(self: *Line, alloc: Allocator, from: connection.ConnectionId, id: RequestId) bool {
         for (self.late.items, 0..) |steer, index| {
-            if (!jsonrpc.requestIdsEqual(steer.request_id, id)) continue;
+            if (!connection.sameConnection(steer.from, from) or !jsonrpc.requestIdsEqual(steer.request_id, id)) continue;
             const removed = self.late.orderedRemove(index);
             self.late_bytes -= removed.text.len;
             removed.deinit(alloc);
             return true;
         }
         for (self.queue.items, 0..) |queued, index| {
-            const queued_id = queued.id orelse continue;
-            if (!jsonrpc.requestIdsEqual(queued_id, id)) continue;
+            const queued_id = queued.msg.id orelse continue;
+            if (!connection.sameConnection(queued.from, from) or !jsonrpc.requestIdsEqual(queued_id, id)) continue;
             var removed = self.queue.orderedRemove(index);
-            jsonrpc.freeMessage(alloc, &removed);
+            jsonrpc.freeMessage(alloc, &removed.msg);
             return true;
         }
         return false;
@@ -180,10 +190,10 @@ test "the next turn runs every late steer together, then each queued prompt in o
     var line: Line = .{};
     defer line.deinit(alloc);
 
-    try line.addQueuedLocked(alloc, try testPrompt(alloc, 10));
-    try line.addQueuedLocked(alloc, try testPrompt(alloc, 11));
-    try line.addLateLocked(alloc, "late one", .{ .integer = 1 });
-    try line.addLateLocked(alloc, "late two", .{ .string = "s2" });
+    try line.addQueuedLocked(alloc, try testPrompt(alloc, 10), 1);
+    try line.addQueuedLocked(alloc, try testPrompt(alloc, 11), 1);
+    try line.addLateLocked(alloc, "late one", .{ .integer = 1 }, 1);
+    try line.addLateLocked(alloc, "late two", .{ .string = "s2" }, 1);
 
     var first = line.takeNextLocked().?;
     defer first.deinit(alloc);
@@ -194,10 +204,10 @@ test "the next turn runs every late steer together, then each queued prompt in o
 
     var second = line.takeNextLocked().?;
     defer second.deinit(alloc);
-    try std.testing.expectEqual(@as(i64, 10), second.prompt.id.?.integer);
+    try std.testing.expectEqual(@as(i64, 10), second.prompt.msg.id.?.integer);
     var third = line.takeNextLocked().?;
     defer third.deinit(alloc);
-    try std.testing.expectEqual(@as(i64, 11), third.prompt.id.?.integer);
+    try std.testing.expectEqual(@as(i64, 11), third.prompt.msg.id.?.integer);
     try std.testing.expect(line.takeNextLocked() == null);
     try std.testing.expect(line.emptyLocked());
 }
@@ -206,7 +216,7 @@ test "steers a turn never took go ahead of the steers that arrived after it" {
     const alloc = std.testing.allocator;
     var line: Line = .{};
     defer line.deinit(alloc);
-    try line.addLateLocked(alloc, "after input closed", .{ .integer = 3 });
+    try line.addLateLocked(alloc, "after input closed", .{ .integer = 3 }, 1);
 
     const untaken = try alloc.alloc(Steer, 2);
     defer alloc.free(untaken);
@@ -227,25 +237,25 @@ test "a full line refuses the next queued prompt and the next late steer" {
     const alloc = std.testing.allocator;
     var line: Line = .{};
     defer line.deinit(alloc);
-    for (0..max_queued_prompts) |index| try line.addQueuedLocked(alloc, try testPrompt(alloc, @intCast(index)));
+    for (0..max_queued_prompts) |index| try line.addQueuedLocked(alloc, try testPrompt(alloc, @intCast(index)), 1);
     var overflow = try testPrompt(alloc, 99);
     defer jsonrpc.freeMessage(alloc, &overflow);
-    try std.testing.expectError(error.PromptQueueFull, line.addQueuedLocked(alloc, overflow));
+    try std.testing.expectError(error.PromptQueueFull, line.addQueuedLocked(alloc, overflow, 1));
 
-    for (0..libfx_steering.max_messages) |index| try line.addLateLocked(alloc, "x", .{ .integer = @intCast(index) });
-    try std.testing.expectError(error.SteeringQueueFull, line.addLateLocked(alloc, "x", .{ .integer = 99 }));
+    for (0..libfx_steering.max_messages) |index| try line.addLateLocked(alloc, "x", .{ .integer = @intCast(index) }, 1);
+    try std.testing.expectError(error.SteeringQueueFull, line.addLateLocked(alloc, "x", .{ .integer = 99 }, 1));
 }
 
 test "a late steer or queued prompt is withdrawn by its request id" {
     const alloc = std.testing.allocator;
     var line: Line = .{};
     defer line.deinit(alloc);
-    try line.addLateLocked(alloc, "steer", .{ .integer = 1 });
-    try line.addQueuedLocked(alloc, try testPrompt(alloc, 2));
+    try line.addLateLocked(alloc, "steer", .{ .integer = 1 }, 1);
+    try line.addQueuedLocked(alloc, try testPrompt(alloc, 2), 1);
 
-    try std.testing.expect(line.withdrawLocked(alloc, .{ .integer = 2 }));
-    try std.testing.expect(!line.withdrawLocked(alloc, .{ .integer = 2 }));
-    try std.testing.expect(line.withdrawLocked(alloc, .{ .integer = 1 }));
+    try std.testing.expect(line.withdrawLocked(alloc, 1, .{ .integer = 2 }));
+    try std.testing.expect(!line.withdrawLocked(alloc, 1, .{ .integer = 2 }));
+    try std.testing.expect(line.withdrawLocked(alloc, 1, .{ .integer = 1 }));
     try std.testing.expectEqual(@as(usize, 0), line.late_bytes);
     try std.testing.expect(line.emptyLocked());
 }
@@ -254,8 +264,8 @@ test "a closing session drains the whole line to answer it" {
     const alloc = std.testing.allocator;
     var line: Line = .{};
     defer line.deinit(alloc);
-    try line.addLateLocked(alloc, "steer", .{ .integer = 1 });
-    try line.addQueuedLocked(alloc, try testPrompt(alloc, 2));
+    try line.addLateLocked(alloc, "steer", .{ .integer = 1 }, 1);
+    try line.addQueuedLocked(alloc, try testPrompt(alloc, 2), 1);
 
     var drained = line.drainLocked();
     defer drained.deinit(alloc);
@@ -263,4 +273,37 @@ test "a closing session drains the whole line to answer it" {
     try std.testing.expectEqual(@as(usize, 1), drained.queue.items.len);
     try std.testing.expect(line.emptyLocked());
     try std.testing.expectEqual(@as(usize, 0), line.late_bytes);
+}
+
+test "a withdrawal from one connection leaves a late steer with the same request id from another connection" {
+    const alloc = std.testing.allocator;
+    var line: Line = .{};
+    defer line.deinit(alloc);
+    try line.addLateLocked(alloc, "from a", .{ .integer = 5 }, 1);
+    try line.addLateLocked(alloc, "from b", .{ .integer = 5 }, 2);
+
+    try std.testing.expect(line.withdrawLocked(alloc, 1, .{ .integer = 5 }));
+    try std.testing.expect(!line.withdrawLocked(alloc, 1, .{ .integer = 5 }));
+    try std.testing.expectEqual(@as(usize, 1), line.late.items.len);
+    try std.testing.expectEqualStrings("from b", line.late.items[0].text);
+    try std.testing.expectEqual(@as(usize, "from b".len), line.late_bytes);
+
+    try std.testing.expect(line.withdrawLocked(alloc, 2, .{ .integer = 5 }));
+    try std.testing.expect(line.emptyLocked());
+}
+
+test "a withdrawal from one connection leaves a queued prompt with the same request id from another connection" {
+    const alloc = std.testing.allocator;
+    var line: Line = .{};
+    defer line.deinit(alloc);
+    try line.addQueuedLocked(alloc, try testPrompt(alloc, 5), 1);
+    try line.addQueuedLocked(alloc, try testPrompt(alloc, 5), 2);
+
+    try std.testing.expect(line.withdrawLocked(alloc, 1, .{ .integer = 5 }));
+    try std.testing.expect(!line.withdrawLocked(alloc, 1, .{ .integer = 5 }));
+    try std.testing.expectEqual(@as(usize, 1), line.queue.items.len);
+    try std.testing.expectEqual(@as(connection.ConnectionId, 2), line.queue.items[0].from);
+
+    try std.testing.expect(line.withdrawLocked(alloc, 2, .{ .integer = 5 }));
+    try std.testing.expect(line.emptyLocked());
 }
