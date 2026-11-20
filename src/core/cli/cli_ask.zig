@@ -70,6 +70,7 @@ const command_replay_store = @import("../session/command_replay_store.zig");
 const session_codec = @import("../session/session_codec.zig");
 const session_store = @import("../session/session_store.zig");
 const session_adapter = @import("../session/session_adapter.zig");
+const turn_capture = @import("../workspace/turn_capture.zig");
 const session_child_store = @import("../session/session_child_store.zig");
 const skill_contract = @import("../skills/skill_contract.zig");
 const skill_runtime = @import("../skills/skill_runtime.zig");
@@ -81,6 +82,7 @@ const subagent_tool_host = @import("../subagent/tool_host.zig");
 const subagent_reports = @import("../subagent/reports.zig");
 const subagent_child_state = @import("../subagent/child_state.zig");
 const subagent_model_contract = @import("../subagent/model_contract.zig");
+const subagent_usage = @import("../subagent/usage_ledger.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const test_builtin_gateway = if (std_builtin.is_test)
     @import("../../builtins/gateway.zig")
@@ -307,6 +309,7 @@ fn runAskChild(
         .context_enabled = ctx.context_enabled,
         .project_context = ctx.modelVisibleProjectContext(),
         .lifecycle_view = ctx.lifecycle_view,
+        .workspace_capture = if (ctx.workspaceCaptureContext()) |context| .{ .home = context.home, .path = context.path } else null,
     }, turn, message, admission, cancel);
 }
 
@@ -334,8 +337,13 @@ pub const PromptRunResult = struct {
     auth_failure: ?auth_runtime.FailureSnapshot = null,
     recovery: ?types.RouteRecoveryStatus = null,
     usage: types.Usage = .{},
+    /// Owned. What each subagent that did work in the run used, in the order
+    /// each first ran; empty when none did. Not part of `usage`, which is
+    /// main's alone.
+    subagents: []subagent_usage.Entry = &.{},
 
     pub fn deinit(self: PromptRunResult, alloc: Allocator) void {
+        subagent_usage.freeEntries(alloc, self.subagents);
         alloc.free(self.assistant_output);
         if (self.final_output.len > 0) alloc.free(self.final_output);
         if (self.final_source.len > 0) alloc.free(self.final_source);
@@ -663,6 +671,10 @@ const AskContext = struct {
     /// A resumed v2 session's preferences; `model` borrows from here.
     v2_preferences: ?session_codec.DurableSessionPreferences = null,
     session_write_mutex: std.Io.Mutex = .init,
+    /// `experimental.workspace_capture`, from startup.
+    workspace_capture: bool = false,
+    /// This run's turn captures, when `workspace_capture` is on (D98).
+    turn_capture: turn_capture.TurnCapture = .{},
     requested_resume: ?ResumeTarget = null,
     seed_model: []const u8 = "",
     command_timeout_ms: ?usize = null,
@@ -700,6 +712,10 @@ const AskContext = struct {
     tool_call_records_mutex: std.Io.Mutex = .init,
     web_search_progress_mutex: std.Io.Mutex = .init,
     step_count: usize = 0,
+    /// The usage of every main turn that has ended. The agent keeps only the
+    /// running turn's, and each turn starts it over, so the run's total is
+    /// kept here (`takeTurnUsage`).
+    usage_total: types.Usage = .{},
     web_fetch_runtime: web_fetch_runtime.Runtime = web_fetch_runtime.Runtime.init(.{}),
     web_search_runtime: web_search_runtime.Runtime,
     capability_resolver: gateway_provider.CapabilityResolver = .{},
@@ -832,6 +848,9 @@ const AskContext = struct {
         self.terminal_client.deinit();
         self.workspace_access.deinit(self.alloc);
         self.worker.deinit(std.heap.c_allocator);
+        self.turn_capture.deinit();
+        // `fx ask` is the whole process: retention's maintenance ends here.
+        if (comptime turn_capture.supported) turn_capture.finishMaintenance();
         self.web_fetch_runtime.deinit(self.alloc);
         self.web_search_runtime.deinit();
         if (self.refreshed_credential) |*credential| credential.deinit(self.alloc);
@@ -894,12 +913,42 @@ const AskContext = struct {
         if (self.cancelFlag().load(.seq_cst)) return error.Cancelled;
     }
 
+    /// Adds the usage the turn that just ended reported to the run's total
+    /// and clears it, so a turn that ends before it starts one adds nothing
+    /// twice. Call it when each main turn ends, however it ends.
+    fn takeTurnUsage(self: *AskContext) void {
+        self.usage_total.add(self.session.agent.turn_usage);
+        self.session.agent.turn_usage = .{};
+    }
+
     fn processInterruptRequested(self: *const AskContext) bool {
         if (comptime supports_headless_interrupt) {
             return self.use_process_interrupt_flag and
                 headless_interrupt.cancel_requested.load(.seq_cst);
         }
         return false;
+    }
+
+    /// What a workspace capture needs, or null when captures are off or
+    /// the run saves no session. The run's cancel ends a capture early; a
+    /// subagent's report that interrupts the model does not.
+    fn workspaceCaptureContext(self: *AskContext) ?turn_capture.Context {
+        if (!self.workspace_capture) return null;
+        const v2 = self.v2 orelse return null;
+        const store = self.v2_store orelse return null;
+        return .{ .session = v2, .home = store.home, .path = self.workspace_root, .alloc = std.heap.c_allocator, .cancel = self.turnCancelFlag() };
+    }
+
+    /// The flag set only by a cancel that stops the run's turn, unlike
+    /// `cancelFlag`'s worker flag, which a subagent's report also sets to
+    /// interrupt the model.
+    fn turnCancelFlag(self: *AskContext) *std.atomic.Value(bool) {
+        if (comptime supports_headless_interrupt) {
+            if (self.use_process_interrupt_flag) {
+                return &headless_interrupt.cancel_requested;
+            }
+        }
+        return &self.worker.turn_cancel_requested;
     }
 
     /// The saved session's id.
@@ -995,6 +1044,8 @@ const AskContext = struct {
                 if (store.conversionProblem()) |problem| {
                     self.writeStderr("fx ask: the session can't be converted: ") catch {};
                     self.writeLine(problem) catch {};
+                    // Said in full: the caller adds no second line for it.
+                    if (err == error.InvalidSessionFormat) return error.SessionConversionRefused;
                 }
                 return err;
             }
@@ -1058,6 +1109,8 @@ const AskContext = struct {
         self.subagent_host.?.authority_resolver.toolbox_behind = &self.toolbox_behind;
         self.v2_children = children;
         self.subagent_host.?.report_sink = .{ .context = self, .post_fn = postAskReport };
+        // The result lists what each subagent that works in this run uses.
+        self.subagent_host.?.trackUsage();
         // What a restart left owed runs as this run's next turns.
         self.subagent_host.?.resumeReports(v2);
     }
@@ -1389,6 +1442,14 @@ fn runWithDeps(alloc: Allocator, args: []const [:0]const u8, cfg: Config, deps: 
     }) catch |err| {
         if (interrupt_scope.requested()) return headless_interrupt.exitCode();
         if (err == error.OutOfMemory) return err;
+        // The reason is on stderr already; JSON keeps the code it always had.
+        if (err == error.SessionConversionRefused) {
+            if (!options.json_output) return 1;
+            const json = try renderErrorJsonResult(alloc, @errorName(error.InvalidSessionFormat), 1);
+            defer alloc.free(json);
+            try deps.write_stdout(deps.stdout_ctx, json);
+            return 1;
+        }
         if (err == error.OneOffSessionNotResumable and !options.json_output) {
             try deps.write_stderr(
                 deps.stderr_ctx,
@@ -1697,6 +1758,7 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
         startup.notification_turn_end,
         startup.notification_attention_required,
     );
+    ctx.workspace_capture = startup.workspace_capture;
     ctx.session.setConversationLanguageFromUserMessage(owned_prompt);
     if (options.save_session) {
         try ctx.checkCancellation();
@@ -2032,10 +2094,16 @@ fn runAskTurn(
     // (`tests/tla/subagent/MainMail.tla` JoinsOpenTurn).
     const processing = marked or (ctx.subagent_host != null and ctx.worker.beginDirectProcessing(job.turn_id));
     defer if (processing) ctx.worker.finishProcessing();
-    options.deps.process_queued_prompt(&ctx.session.agent, deps, semantic_presentation, ctx.lifecycleContext(), config, job) catch |err| switch (err) {
+    const processed = options.deps.process_queued_prompt(&ctx.session.agent, deps, semantic_presentation, ctx.lifecycleContext(), config, job);
+    // The next turn starts the agent's usage over, so this one's is taken
+    // now, whether the turn ended well or not.
+    ctx.takeTurnUsage();
+    processed catch |err| switch (err) {
         error.NonInteractivePermissionRequired => {
             const assistant_output = try alloc.dupe(u8, ctx.assistant_output.items);
             errdefer alloc.free(assistant_output);
+            const subagents = try takeSubagentUsage(ctx, alloc);
+            errdefer subagent_usage.freeEntries(alloc, subagents);
             const tool_calls = try takeToolCallRecords(ctx, alloc);
             return .{
                 .exit_code = 1,
@@ -2043,7 +2111,8 @@ fn runAskTurn(
                 .interrupted = ctx.processInterruptRequested(),
                 .tool_calls = tool_calls,
                 .error_code = "NonInteractivePermissionRequired",
-                .usage = ctx.session.agent.turn_usage,
+                .usage = ctx.usage_total,
+                .subagents = subagents,
             };
         },
         else => {
@@ -2164,6 +2233,8 @@ fn takePromptRunResult(ctx: *AskContext, alloc: Allocator) !PromptRunResult {
     else
         try alloc.dupe(u8, "");
     errdefer if (session_id.len > 0) alloc.free(session_id);
+    const subagents = try takeSubagentUsage(ctx, alloc);
+    errdefer subagent_usage.freeEntries(alloc, subagents);
 
     const tool_calls = try takeToolCallRecords(ctx, alloc);
 
@@ -2183,8 +2254,18 @@ fn takePromptRunResult(ctx: *AskContext, alloc: Allocator) !PromptRunResult {
         .error_code = ctx.typed_error_code,
         .auth_failure = ctx.auth_failure,
         .recovery = ctx.last_recovery_status,
-        .usage = ctx.session.agent.turn_usage,
+        .usage = ctx.usage_total,
+        .subagents = subagents,
     };
+}
+
+/// What each subagent that did work in this run has used so far, a copy for
+/// the result. On a run that ends early a subagent may still be at work; it
+/// shows the replies it has finished. The caller owns the copy and frees it
+/// with `subagent_usage.freeEntries`, as `PromptRunResult.deinit` does.
+fn takeSubagentUsage(ctx: *AskContext, alloc: Allocator) ![]subagent_usage.Entry {
+    const tree = ctx.subagent_host orelse return &.{};
+    return tree.usageSnapshot(alloc);
 }
 
 fn takeToolCallRecords(ctx: *AskContext, alloc: Allocator) ![]ToolCallRecord {
@@ -2230,6 +2311,8 @@ fn agentRuntimeDeps(ctx: *AskContext) agent_runtime.AgentRuntimeDeps {
         .append_turn_piece = if (ctx.v2 != null) appendTurnPiece else null,
         .record_usage = if (ctx.v2 != null) recordUsage else null,
         .save_prompt_images = if (ctx.v2 != null) savePromptImages else null,
+        .start_workspace_capture = if (ctx.workspaceCaptureContext() != null) startWorkspaceCapture else null,
+        .reach_workspace = if (ctx.workspaceCaptureContext() != null) reachWorkspace else null,
         .propagate_grant = propagateGrant,
         .emit_event = emitEvent,
         .begin_route_recovery_request = beginRouteRecoveryRequest,
@@ -3132,15 +3215,23 @@ fn propagateHistoryTurn(raw_ctx: *anyopaque, turn: HistoryTurn) !void {
     var prepared = try ctx.session.prepareHistoryEntry(ctx.alloc, turn);
     var prepared_owned = true;
     defer if (prepared_owned) types.freeHistoryTurn(ctx.alloc, prepared);
+    // The repository as the turn left it, captured before the write lock.
+    if (ctx.workspaceCaptureContext()) |context| _ = ctx.turn_capture.end(context, &ctx.session_write_mutex);
     ctx.session_write_mutex.lockUncancelable(io_mod.getIo());
     defer ctx.session_write_mutex.unlock(io_mod.getIo());
     if (ctx.v2) |v2| {
         try v2.prepareTurn(&prepared);
-        v2.commitTurn(prepared, ctx.session.languageSnapshot()) catch |err| {
+        const capture_token = ctx.turn_capture.token();
+        const committed = if (capture_token) |token|
+            v2.commitTurnWithCaptures(prepared, ctx.session.languageSnapshot(), token)
+        else
+            v2.commitTurn(prepared, ctx.session.languageSnapshot());
+        committed catch |err| {
             // A failed write may still have reached the log: keep its images.
             if (session_adapter.writeMayHaveLanded(err)) ctx.prompt_snapshot_committed = true;
             return err;
         };
+        ctx.turn_capture.committed(capture_token);
         ctx.session.commitPreparedHistoryEntry(ctx.alloc, prepared);
         prepared_owned = false;
         ctx.prompt_snapshot_committed = true;
@@ -3206,6 +3297,21 @@ fn savePromptImages(raw_ctx: *anyopaque, alloc: std.mem.Allocator, images: []typ
     v2.savePromptImages(alloc, images) catch |err| {
         debug_trace.logf("session", "event=sessions_v2_prompt_images_inline session={s} err={s}", .{ v2.id(), @errorName(err) });
     };
+}
+
+fn startWorkspaceCapture(raw_ctx: *anyopaque, fresh: bool, step: agent_runtime.AgentRuntimeDeps.WorkspaceCaptureStep) void {
+    const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
+    const context = ctx.workspaceCaptureContext() orelse return;
+    switch (step) {
+        .begin => ctx.turn_capture.begin(context, fresh),
+        .capture => ctx.turn_capture.start(context, &ctx.session_write_mutex),
+    }
+}
+
+fn reachWorkspace(raw_ctx: *anyopaque, dir: []const u8, tool_name: []const u8) void {
+    const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
+    const context = ctx.workspaceCaptureContext() orelse return;
+    ctx.turn_capture.reach(context, dir, tool_name, &ctx.session_write_mutex);
 }
 
 fn propagateGrant(_: *anyopaque, _: []const u8, _: []const u8) !void {}
@@ -3809,7 +3915,7 @@ fn resolveAskSubagentAuthority(
         return error.HostAuthorityUnavailable;
     }
     const integrations = if (ctx.mcp_host) |h|
-        h.catalog.snapshotToolNames(alloc, ctx.permission_rules)
+        h.catalog.snapshotToolNames(alloc)
     else
         alloc.alloc([]u8, 0);
     const owned_integrations = integrations catch return error.OutOfMemory;
@@ -3818,7 +3924,7 @@ fn resolveAskSubagentAuthority(
         alloc.free(owned_integrations);
     }
     var mcp_view = if (ctx.mcp_host) |h|
-        try h.catalog.snapshotAccessView(alloc, root_id, root_id, ctx.permission_rules)
+        try h.catalog.snapshotAccessView(alloc, root_id, root_id)
     else
         null;
     defer if (mcp_view) |*view| view.deinit(alloc);
@@ -4174,15 +4280,29 @@ fn renderFinalJsonResult(alloc: Allocator, result: PromptRunResult) ![]u8 {
         }
         try out.writer.writeAll("}");
     }
-    try out.writer.writeAll("],\"usage\":{\"input_tokens\":");
-    try std.json.Stringify.value(result.usage.input_tokens, .{}, &out.writer);
-    try out.writer.writeAll(",\"output_tokens\":");
-    try std.json.Stringify.value(result.usage.output_tokens, .{}, &out.writer);
-    // Present only when the provider reports caching, so a missing count
-    // never reads as zero cached tokens.
-    if (result.usage.cache_read_tokens) |tokens| try out.writer.print(",\"cache_read_tokens\":{d}", .{tokens});
-    if (result.usage.cache_write_tokens) |tokens| try out.writer.print(",\"cache_write_tokens\":{d}", .{tokens});
-    try out.writer.writeAll("}");
+    try out.writer.writeAll("],\"usage\":");
+    try writeUsageJson(&out.writer, result.usage);
+    // Present only when a subagent did work, so a run without one prints the
+    // same JSON as before the field existed. `name` is null only for a child
+    // saved with no name (see `usage_ledger.Entry`).
+    if (result.subagents.len > 0) {
+        try out.writer.writeAll(",\"subagents\":[");
+        for (result.subagents, 0..) |entry, i| {
+            if (i > 0) try out.writer.writeByte(',');
+            try out.writer.writeAll("{\"name\":");
+            if (entry.name) |name| {
+                try std.json.Stringify.value(name, .{}, &out.writer);
+            } else {
+                try out.writer.writeAll("null");
+            }
+            try out.writer.writeAll(",\"id\":");
+            try std.json.Stringify.value(entry.id, .{}, &out.writer);
+            try out.writer.writeAll(",\"usage\":");
+            try writeUsageJson(&out.writer, entry.usage);
+            try out.writer.writeByte('}');
+        }
+        try out.writer.writeByte(']');
+    }
     if (result.error_code) |error_code| {
         try out.writer.writeAll(",\"error\":");
         try std.json.Stringify.value(error_code, .{}, &out.writer);
@@ -4198,6 +4318,20 @@ fn renderFinalJsonResult(alloc: Allocator, result: PromptRunResult) ![]u8 {
     }
     try out.writer.writeAll("}\n");
     return try out.toOwnedSlice();
+}
+
+/// The `usage` object of the result and of each of its `subagents`: one shape,
+/// so a count reads the same wherever it sits.
+fn writeUsageJson(writer: *std.Io.Writer, usage: types.Usage) !void {
+    try writer.writeAll("{\"input_tokens\":");
+    try std.json.Stringify.value(usage.input_tokens, .{}, writer);
+    try writer.writeAll(",\"output_tokens\":");
+    try std.json.Stringify.value(usage.output_tokens, .{}, writer);
+    // Present only when the provider reports caching, so a missing count
+    // never reads as zero cached tokens.
+    if (usage.cache_read_tokens) |tokens| try writer.print(",\"cache_read_tokens\":{d}", .{tokens});
+    if (usage.cache_write_tokens) |tokens| try writer.print(",\"cache_write_tokens\":{d}", .{tokens});
+    try writer.writeAll("}");
 }
 
 /// `exit_code` is the status the process exits with, so the JSON field and the
@@ -6089,6 +6223,43 @@ test "fx ask automatic review observes worker cancellation" {
     );
 }
 
+test "fx ask captures stop for the run's cancel, not for a subagent report that interrupts the model" {
+    const alloc = std.testing.allocator;
+    var stdout_capture: TestCapture = .{};
+    defer stdout_capture.deinit(alloc);
+    var stderr_capture: TestCapture = .{};
+    defer stderr_capture.deinit(alloc);
+    var ctx = AskContext.init(
+        alloc,
+        testConfig(),
+        testPromptRunDeps(&stdout_capture, &stderr_capture, testPresentKeyStartup),
+        "/tmp/workspace",
+    );
+    defer ctx.deinit();
+    try std.testing.expect(ctx.worker.beginDirectProcessing(41));
+    defer ctx.worker.finishProcessing();
+    // A report steered into the running turn interrupts the model only. The
+    // worker frees what it queues with `std.heap.c_allocator`.
+    const queue_alloc = std.heap.c_allocator;
+    try ctx.worker.admitInteractivePrompt(queue_alloc, .{
+        .prompt = try queue_alloc.dupe(u8, "report"),
+        .images = &.{},
+        .model = try queue_alloc.dupe(u8, "model"),
+        .api_key = try queue_alloc.dupe(u8, "key"),
+        .permission_mode = .auto,
+        .history = try queue_alloc.alloc(types.HistoryTurn, 0),
+        .grants = try queue_alloc.alloc(types.PermissionGrant, 0),
+    });
+    try std.testing.expect(ctx.cancelFlag().load(.seq_cst));
+    try std.testing.expect(!ctx.turnCancelFlag().load(.seq_cst));
+    ctx.worker.requestCancel();
+    try std.testing.expect(ctx.turnCancelFlag().load(.seq_cst));
+    if (comptime supports_headless_interrupt) {
+        ctx.use_process_interrupt_flag = true;
+        try std.testing.expectEqual(&headless_interrupt.cancel_requested, ctx.turnCancelFlag());
+    }
+}
+
 test "headless ask SIGINT sets process-lifetime cancellation storage" {
     if (comptime !supports_headless_interrupt) return error.SkipZigTest;
 
@@ -7742,6 +7913,128 @@ test "ask usage survives normal and typed error result capture" {
     }
 }
 
+/// A saved ask whose first two turns each leave a report to start the next
+/// turn, as a subagent's report does, and whose last turn ends as `ending`.
+const TestRunUsage = struct {
+    const Ending = enum { completed, read_failed, permission_required };
+    /// What each main turn reports. The second reports no cache count.
+    const turns = [_]types.Usage{
+        .{ .input_tokens = 100, .output_tokens = 1, .cache_read_tokens = 10 },
+        .{ .input_tokens = 200, .output_tokens = 2 },
+        .{ .input_tokens = 400, .output_tokens = 4, .cache_read_tokens = 40 },
+    };
+    var started: usize = 0;
+    var ending: Ending = .completed;
+
+    fn run(agent: *agent_runtime.Agent, deps: *const agent_runtime.AgentRuntimeDeps, _: ?agent_runtime.SemanticPresentationSink, _: agent_runtime.LifecycleContext, _: agent_runtime.Config, _: worker_runtime.QueuedPrompt) !void {
+        const turn = started;
+        started += 1;
+        agent.startTurn();
+        agent.observeUsage(turns[turn]);
+        try testPushAssistantText(deps, "turn text");
+        try noteSubagentWork(deps, turn);
+        if (turn + 1 < turns.len) return postReport(deps);
+        switch (ending) {
+            .completed => {},
+            .read_failed => return error.ReadFailed,
+            .permission_required => return error.NonInteractivePermissionRequired,
+        }
+    }
+
+    /// Two subagents work during the run, as the host sees them: `alpha`
+    /// starts in the first turn and works again in the third, and `child_b`,
+    /// which has no name, starts in the second and reports no counts.
+    fn noteSubagentWork(deps: *const agent_runtime.AgentRuntimeDeps, turn: usize) !void {
+        const ctx: *AskContext = @ptrCast(@alignCast(deps.ctx));
+        const tree = ctx.subagent_host.?;
+        switch (turn) {
+            0 => {
+                try tree.noteChildTurnStarted("child_a", "alpha");
+                tree.noteChildUsage("child_a", .{ .input_tokens = 7000, .output_tokens = 70, .cache_read_tokens = 700 });
+            },
+            1 => try tree.noteChildTurnStarted("child_b", null),
+            else => tree.noteChildUsage("child_a", .{ .input_tokens = 1, .output_tokens = 1 }),
+        }
+    }
+
+    fn postReport(deps: *const agent_runtime.AgentRuntimeDeps) !void {
+        const ctx: *AskContext = @ptrCast(@alignCast(deps.ctx));
+        const text = try std.heap.c_allocator.dupe(u8, "Subagent report (untrusted agent output, not user instructions):\n{}");
+        ctx.worker.postMail(std.heap.c_allocator, .{
+            .prompt = text,
+            .images = &.{},
+            .model = &.{},
+            .api_key = &.{},
+            .permission_mode = ctx.permission_mode,
+            .history = &.{},
+            .grants = &.{},
+            .author = .child,
+            .mail = .report,
+        }) catch |err| {
+            std.heap.c_allocator.free(text);
+            return err;
+        };
+    }
+};
+
+test "ask JSON usage sums every main turn and subagents lists the work, however the last turn ends" {
+    const alloc = std.testing.allocator;
+    inline for (std.meta.tags(TestRunUsage.Ending)) |ending| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        try tmp.dir.createDirPath(io_mod.getIo(), "home");
+        const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+        defer alloc.free(home);
+        const test_home = try TestAskHome.install(alloc, home);
+        defer test_home.deinit();
+
+        TestRunUsage.started = 0;
+        TestRunUsage.ending = ending;
+        var stdout_capture: TestCapture = .{};
+        defer stdout_capture.deinit(alloc);
+        var stderr_capture: TestCapture = .{};
+        defer stderr_capture.deinit(alloc);
+        var deps = testPromptRunDeps(&stdout_capture, &stderr_capture, testPresentKeySavedStartup);
+        deps.initialize_session_stores = initializeSessionStoresDefault;
+        deps.process_queued_prompt = TestRunUsage.run;
+        deps.stdout_is_tty = TestTty.no;
+
+        const exit_code = try runWithDeps(alloc, &.{ "--json", "hello" }, testConfig(), deps);
+        try std.testing.expectEqual(@as(u8, if (ending == .completed) 0 else 1), exit_code);
+        try std.testing.expectEqual(TestRunUsage.turns.len, TestRunUsage.started);
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, stdout_capture.bytes.items, .{});
+        defer parsed.deinit();
+        const usage = parsed.value.object.get("usage").?.object;
+        try std.testing.expectEqual(@as(i64, 700), usage.get("input_tokens").?.integer);
+        try std.testing.expectEqual(@as(i64, 7), usage.get("output_tokens").?.integer);
+        try std.testing.expectEqual(@as(i64, 50), usage.get("cache_read_tokens").?.integer);
+        try std.testing.expect(usage.get("cache_write_tokens") == null);
+        // `usage` stays main's alone; each subagent that worked is listed
+        // apart, in the order it first ran.
+        const subagents = parsed.value.object.get("subagents").?.array.items;
+        try std.testing.expectEqual(@as(usize, 2), subagents.len);
+        const alpha = subagents[0].object;
+        try std.testing.expectEqualStrings("alpha", alpha.get("name").?.string);
+        try std.testing.expectEqualStrings("child_a", alpha.get("id").?.string);
+        const alpha_usage = alpha.get("usage").?.object;
+        try std.testing.expectEqual(@as(i64, 7001), alpha_usage.get("input_tokens").?.integer);
+        try std.testing.expectEqual(@as(i64, 71), alpha_usage.get("output_tokens").?.integer);
+        try std.testing.expectEqual(@as(i64, 700), alpha_usage.get("cache_read_tokens").?.integer);
+        const unnamed = subagents[1].object;
+        try std.testing.expect(unnamed.get("name").? == .null);
+        try std.testing.expectEqualStrings("child_b", unnamed.get("id").?.string);
+        const unnamed_usage = unnamed.get("usage").?.object;
+        try std.testing.expect(unnamed_usage.get("input_tokens").? == .null);
+        try std.testing.expect(unnamed_usage.get("output_tokens").? == .null);
+        try std.testing.expect(unnamed_usage.get("cache_read_tokens") == null);
+        switch (ending) {
+            .completed => try std.testing.expect(parsed.value.object.get("error") == null),
+            .read_failed => try std.testing.expectEqualStrings("ReadFailed", parsed.value.object.get("error").?.string),
+            .permission_required => try std.testing.expectEqualStrings("NonInteractivePermissionRequired", parsed.value.object.get("error").?.string),
+        }
+    }
+}
+
 test "ask usage JSON distinguishes unavailable totals from reported zero" {
     const alloc = std.testing.allocator;
     const json = try renderFinalJsonResult(alloc, .{
@@ -7755,6 +8048,46 @@ test "ask usage JSON distinguishes unavailable totals from reported zero" {
     const usage = parsed.value.object.get("usage").?.object;
     try std.testing.expectEqual(@as(i64, 0), usage.get("input_tokens").?.integer);
     try std.testing.expect(usage.get("output_tokens").? == .null);
+}
+
+test "ask JSON lists each subagent with its own usage in the shape of the result's usage" {
+    const alloc = std.testing.allocator;
+    var alpha_id = "child_a".*;
+    var alpha_name = "alpha".*;
+    var other_id = "child_b".*;
+    var entries = [_]subagent_usage.Entry{
+        .{ .id = &alpha_id, .name = &alpha_name, .usage = .{ .input_tokens = 7000, .output_tokens = 70, .cache_read_tokens = 700, .cache_write_tokens = 0 } },
+        .{ .id = &other_id, .name = null },
+    };
+    const json = try renderFinalJsonResult(alloc, .{
+        .exit_code = 0,
+        .assistant_output = &.{},
+        .usage = .{ .input_tokens = 1, .output_tokens = 2 },
+        .subagents = &entries,
+    });
+    defer alloc.free(json);
+    try std.testing.expectEqualStrings(
+        "{\"output\":\"\",\"final_output\":\"\",\"exit_code\":0,\"model\":\"\",\"resolved_provider\":null,\"session_id\":\"\",\"steps\":0,\"tool_calls\":[]," ++
+            "\"usage\":{\"input_tokens\":1,\"output_tokens\":2}," ++
+            "\"subagents\":[{\"name\":\"alpha\",\"id\":\"child_a\",\"usage\":{\"input_tokens\":7000,\"output_tokens\":70,\"cache_read_tokens\":700,\"cache_write_tokens\":0}}," ++
+            "{\"name\":null,\"id\":\"child_b\",\"usage\":{\"input_tokens\":null,\"output_tokens\":null}}]}\n",
+        json,
+    );
+}
+
+test "ask JSON has no subagents field when no subagent worked" {
+    const alloc = std.testing.allocator;
+    const json = try renderFinalJsonResult(alloc, .{
+        .exit_code = 0,
+        .assistant_output = &.{},
+        .usage = .{ .input_tokens = 1, .output_tokens = 2 },
+    });
+    defer alloc.free(json);
+    try std.testing.expect(std.mem.find(u8, json, "subagents") == null);
+    try std.testing.expectEqualStrings(
+        "{\"output\":\"\",\"final_output\":\"\",\"exit_code\":0,\"model\":\"\",\"resolved_provider\":null,\"session_id\":\"\",\"steps\":0,\"tool_calls\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":2}}\n",
+        json,
+    );
 }
 
 test "render final JSON preserves shape escaping order and newline" {

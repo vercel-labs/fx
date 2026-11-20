@@ -3046,8 +3046,8 @@ fn parseToolResultWith(
             try exactObject(value, &(v4_keys.* ++ [_][]const u8{"tool_image_handle"}))
         else
             try exactObject(value, v4_keys), .extended = true },
-        // Version 11 changed only the execution's keys (D93).
-        10, 11 => blk: {
+        // Versions 11 (D93) and 12 (D94) changed only the execution's keys.
+        10, 11, 12 => blk: {
             const keys = v4_keys.* ++ [_][]const u8{"review_feedback"};
             break :blk .{ .object = if (value == .object and value.object.contains("tool_images"))
                 try exactObject(value, &(keys ++ [_][]const u8{"tool_images"}))
@@ -5054,6 +5054,31 @@ test "execution memory codec writes the runtime context only for the turn that c
         try std.testing.expectEqual(@as(usize, 2), execution.runtime_context.?.len);
         try std.testing.expectEqualStrings("b", execution.runtime_context.?[1]);
     }
+}
+
+test "version 12 execution memory reads its tool results (D94)" {
+    // The shape a browser terminal saves after one shell command. Version 12
+    // kept the tool result keys of version 11, so a saved session with a tool
+    // step must resume.
+    const alloc = std.testing.allocator;
+    const json =
+        \\{"schema_version":12,"tool_steps":[{"assistant":"Checking.","provider_replay":null,
+        \\"tool_calls":[{"id":"s1","name":"shell","arguments_json":"{\"action\":\"run\",\"command\":\"ls\"}","provider_result":null}],
+        \\"tool_results":[{"tool_call_id":"s1","tool_name":"shell","status":"success","output":"exit_code=0\n",
+        \\"output_handle":null,"preview":null,"output_bytes":12,"stored_output_bytes":12,"truncated":false,
+        \\"provider_native":false,"review_feedback":false,"created_at_ms":1,"permission_feedback":[],
+        \\"committed_file_presentation":null,"command_output_replay":null,"command_process_presentation":null,
+        \\"terminal_action_presentation":null}]}],
+        \\"files":[],"steering":[],"context_notes":[],"runtime_context":["<fx-turn-context>\n</fx-turn-context>"],"turn_summary":null}
+    ;
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, json, .{});
+    defer parsed.deinit();
+    const execution = try parseExecutionMemory(alloc, parsed.value);
+    defer session.freeExecutionMemory(alloc, execution);
+    try std.testing.expectEqual(@as(usize, 1), execution.tool_steps.len);
+    try std.testing.expectEqual(@as(usize, 1), execution.tool_steps[0].tool_results.len);
+    try std.testing.expectEqualStrings("exit_code=0\n", execution.tool_steps[0].tool_results[0].output);
+    try std.testing.expectEqual(@as(usize, 1), execution.runtime_context.?.len);
 }
 
 test "committed file presentation codec reads shipped and spilled shapes" {

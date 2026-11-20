@@ -3,29 +3,40 @@ const types = @import("../shared/types.zig");
 
 pub const StreamState = types.StreamState;
 const compaction_activity = @import("compaction_activity.zig");
+const turn_clock = @import("turn_clock.zig");
 const ActivityProjection = @import("activity_runtime.zig").ActivityProjection;
 
-/// Selects the display clock without changing the underlying turn or its accounting.
-pub fn compactionClock(stream: StreamState, operation: compaction_activity.Operation) StreamState {
-    return if (operation.origin == .manual)
-        .{ .turn_started_ms = operation.started_at_ms }
-    else
-        stream;
+/// A compaction's own clock, which starts at zero whatever started it. The
+/// turn clock holds still meanwhile (`syncWaitingClock`), so the turn goes on
+/// from the time it showed before compaction began.
+pub fn compactionClock(operation: compaction_activity.Operation) StreamState {
+    return .{ .turn_started_ms = turn_clock.compactionMarks(operation).started_ms };
+}
+
+/// How far a running compaction has come: nothing of the summary while it
+/// prepares, the share of its notes the model has written while it
+/// summarizes, and all of it while fx saves them
+/// (`tests/tla/turn_clock/TurnClock.tla` FullOnlyWhenSaving).
+fn compactionPercent(op: compaction_activity.Operation, stage: compaction_activity.Stage) u8 {
+    return switch (stage) {
+        .preparation => 0,
+        .summary => op.written_percent,
+        .publication => 100,
+    };
 }
 
 /// Borrows either static feedback or the caller's label buffer.
 pub fn compactionProjection(
     buf: []u8,
     snapshot: compaction_activity.Snapshot,
-    stream: StreamState,
     now_ms: i64,
 ) ActivityProjection {
     const op = snapshot.operation orelse return .none;
     if (!op.visible(now_ms)) return .none;
-    const label: []const u8 = switch (op.phase) {
-        .preparing => "• Preparing compaction",
-        .running => |stage| if (stage == .preparation) "• Preparing compaction" else "• Compacting",
-        .stopping => "• Stopping compaction",
+    const label: []const u8, const percent: ?u8 = switch (op.phase) {
+        .preparing => .{ "• Compacting", compactionPercent(op, .preparation) },
+        .running => |stage| .{ "• Compacting", compactionPercent(op, stage) },
+        .stopping => .{ "• Stopping compaction", null },
         .terminal => |feedback| return .{ .turn_thinking = .{
             .label = compactionFeedbackLabel(feedback),
             .tone = switch (feedback.outcome) {
@@ -37,8 +48,26 @@ pub fn compactionProjection(
     };
     var out: std.Io.Writer = .fixed(buf);
     out.writeAll(label) catch return .{ .turn_thinking = .{ .label = label } };
-    appendTurnElapsedSuffix(&out, compactionClock(stream, op), now_ms) catch {};
+    if (percent) |value| out.print(" {d}%", .{value}) catch return .{ .turn_thinking = .{ .label = label } };
+    appendTurnElapsedSuffix(&out, compactionClock(op), now_ms) catch return .{ .turn_thinking = .{ .label = out.buffered() } };
     return .{ .turn_thinking = .{ .label = out.buffered() } };
+}
+
+/// The transcript line a successful compaction leaves, with the time its row
+/// showed last, such as `Context compacted (2m10s)`. Null for any other
+/// outcome, and when `buf` cannot hold the whole line.
+pub fn compactionDoneNotice(buf: []u8, op: compaction_activity.Operation) ?[]const u8 {
+    const feedback = switch (op.phase) {
+        .terminal => |value| value,
+        .preparing, .running, .stopping => return null,
+    };
+    if (feedback.outcome != .succeeded) return null;
+    const seconds = turn_clock.seconds(turn_clock.compactionMarks(op), op.settled_at_ms) orelse return null;
+    var out: std.Io.Writer = .fixed(buf);
+    out.writeAll("Context compacted (") catch return null;
+    writeElapsed(&out, seconds) catch return null;
+    out.writeByte(')') catch return null;
+    return out.buffered();
 }
 
 fn compactionFeedbackLabel(feedback: compaction_activity.Feedback) []const u8 {
@@ -125,15 +154,13 @@ pub const activity_blink_half_period_ms: i64 = 500;
 /// One displayed second of an activity clock spans exactly one on/off blink
 /// period, so the marker relights when the seconds digit advances.
 pub const activity_clock_ms_per_second: i64 = 2 * activity_blink_half_period_ms;
+comptime {
+    // The turn and compaction clocks count seconds in `turn_clock.zig`.
+    std.debug.assert(activity_clock_ms_per_second == std.time.ms_per_s);
+}
 
-/// The instant the turn clock reads. While fx waits on user input the
-/// clock is frozen at the moment the wait began, so time spent on an approval
-/// or question never counts toward active work.
-fn turnClockNow(stream: StreamState, now_ms: i64) i64 {
-    if (stream.waiting_since_ms > 0 and stream.waiting_since_ms < now_ms) {
-        return stream.waiting_since_ms;
-    }
-    return now_ms;
+fn turnMarks(stream: StreamState) turn_clock.Marks {
+    return .{ .started_ms = stream.turn_started_ms, .waiting_since_ms = stream.waiting_since_ms };
 }
 
 /// Marker visibility locked to the elapsed counter's clock: on for the first
@@ -149,8 +176,7 @@ pub fn activityBlinkVisible(stream: StreamState, now_ms: i64) ?bool {
 }
 
 fn appendTurnElapsedSuffix(writer: *std.Io.Writer, stream: StreamState, now_ms: i64) !void {
-    if (stream.turn_started_ms <= 0 or now_ms < stream.turn_started_ms) return;
-    const seconds = @divTrunc(turnClockNow(stream, now_ms) - stream.turn_started_ms, activity_clock_ms_per_second);
+    const seconds = turn_clock.seconds(turnMarks(stream), now_ms) orelse return;
     try writer.writeAll(" (");
     try writeElapsed(writer, seconds);
     try writer.writeByte(')');
@@ -173,23 +199,15 @@ pub fn writeElapsed(writer: *std.Io.Writer, seconds: i64) !void {
     }
 }
 
-/// Tracks whether fx is waiting on user input (approval prompt or question)
-/// and keeps the turn clock honest: the clock freezes when the wait
-/// begins, and on resume the whole wait is excluded by shifting
-/// turn_started_ms forward. Call whenever the waiting state may have changed.
+/// Keeps the turn clock honest while the turn waits, on user input (an
+/// approval or a question) or on a compaction (`turn_clock.waits`): the clock
+/// freezes when the wait begins, and when it ends the whole wait is excluded
+/// by moving turn_started_ms forward. Call whenever the waiting state may
+/// have changed.
 pub fn syncWaitingClock(stream: *StreamState, waiting: bool, now_ms: i64) void {
-    if (waiting) {
-        if (stream.active and stream.waiting_since_ms == 0) {
-            stream.waiting_since_ms = now_ms;
-        }
-        return;
-    }
-    if (stream.waiting_since_ms == 0) return;
-    const waited = now_ms - stream.waiting_since_ms;
-    if (waited > 0 and stream.turn_started_ms > 0) {
-        stream.turn_started_ms += waited;
-    }
-    stream.waiting_since_ms = 0;
+    const marks = turn_clock.sync(turnMarks(stream.*), stream.active, waiting, now_ms);
+    stream.turn_started_ms = marks.started_ms;
+    stream.waiting_since_ms = marks.waiting_since_ms;
 }
 
 // Width of the "• " marker every other activity row carries.
@@ -289,50 +307,98 @@ pub fn appendTurnTokenSuffix(writer: *std.Io.Writer, stream: StreamState) !void 
     try appendTokenProgressSuffix(writer, stream.token_progress);
 }
 
-test "compaction projection preserves turn accounting and selects the origin clock" {
+test "every compaction counts its own time from zero and shows how much of the summary is written" {
     var state: compaction_activity.State = .{};
-    const stream: StreamState = .{
+    var buf: [256]u8 = undefined;
+    for ([_]compaction_activity.Origin{ .manual, .automatic, .provider_overflow }) |origin| {
+        const id = state.begin(origin, 1, 3_500);
+        try std.testing.expectEqualStrings("• Compacting 0% (0s)", compactionProjection(&buf, state.snapshot, 3_500).turn_thinking.label);
+        // A count that arrives before the summary starts is kept for it.
+        state.running(id, .summary);
+        try std.testing.expectEqualStrings("• Compacting 0% (0s)", compactionProjection(&buf, state.snapshot, 4_000).turn_thinking.label);
+        state.written(id, 66);
+        try std.testing.expectEqualStrings("• Compacting 66% (1m2s)", compactionProjection(&buf, state.snapshot, 65_500).turn_thinking.label);
+        // A lower count, from a fallback model or a follow-up, changes nothing.
+        state.written(id, 40);
+        try std.testing.expectEqualStrings("• Compacting 66% (1h0m0s)", compactionProjection(&buf, state.snapshot, 3_603_500).turn_thinking.label);
+        try std.testing.expectEqual(@as(?bool, false), activityBlinkVisible(compactionClock(state.snapshot.operation.?), 4_000));
+        try std.testing.expectEqual(@as(?bool, true), activityBlinkVisible(compactionClock(state.snapshot.operation.?), 4_500));
+        state.running(id, .publication);
+        try std.testing.expectEqualStrings("• Compacting 100% (2s)", compactionProjection(&buf, state.snapshot, 5_500).turn_thinking.label);
+        state.stopping(id);
+        try std.testing.expectEqualStrings("• Stopping compaction (2s)", compactionProjection(&buf, state.snapshot, 5_500).turn_thinking.label);
+        state.settle(id, .{ .outcome = .succeeded }, 5_500);
+        try std.testing.expect(compactionProjection(&buf, state.snapshot, 5_500) == .none);
+    }
+}
+
+test "the turn row goes on after a compaction from the time it showed before" {
+    var state: compaction_activity.State = .{};
+    var stream: StreamState = .{
         .active = true,
         .phase = .running,
-        .last_activity_kind = .read,
         .turn_started_ms = 1_000,
         .token_progress = .{ .input_tokens = 100, .output_tokens = 20 },
     };
     var buf: [256]u8 = undefined;
-    for ([_]compaction_activity.Origin{ .manual, .automatic, .provider_overflow }) |origin| {
-        const id = state.begin(origin, 1, 3_500);
-        state.running(id, .summary);
-        const projection = compactionProjection(&buf, state.snapshot, stream, 4_000);
-        try std.testing.expectEqualStrings(if (origin == .manual) "• Compacting (0s)" else "• Compacting (3s)", projection.turn_thinking.label);
-        try std.testing.expectEqual(@as(?bool, origin != .manual), activityBlinkVisible(compactionClock(stream, state.snapshot.operation.?), 4_000));
-        state.stopping(id);
-        try std.testing.expect(std.mem.startsWith(u8, compactionProjection(&buf, state.snapshot, stream, 4_000).turn_thinking.label, "• Stopping compaction"));
-        state.settle(id, .{ .outcome = .succeeded }, 4_000);
-        try std.testing.expect(compactionProjection(&buf, state.snapshot, stream, 4_000) == .none);
-    }
+    // 10m15s into the turn, a compaction starts and runs for 40 s.
+    const began = 1_000 + 615_000;
+    const id = state.begin(.automatic, 1, began);
+    syncWaitingClock(&stream, turn_clock.waits(false, state.snapshot), began);
+    state.running(id, .summary);
+    try std.testing.expectEqualStrings("• Compacting 0% (40s)", compactionProjection(&buf, state.snapshot, began + 40_000).turn_thinking.label);
+    state.settle(id, .{ .outcome = .succeeded, .publication = .committed }, began + 40_000);
+    syncWaitingClock(&stream, turn_clock.waits(false, state.snapshot), began + 40_000);
+    try std.testing.expectEqualStrings("• Running (10m15s) (↑100 ↓20)", buildTurnLabel(&buf, stream, began + 40_000).?);
+    try std.testing.expectEqualStrings("• Running (10m20s) (↑100 ↓20)", buildTurnLabel(&buf, stream, began + 45_000).?);
     try std.testing.expectEqual(@as(u64, 100), stream.token_progress.input_tokens);
-    try std.testing.expectEqualStrings("• Running (3s) (↑100 ↓20)", buildTurnLabel(&buf, .{
-        .phase = stream.phase,
-        .turn_started_ms = stream.turn_started_ms,
-        .token_progress = stream.token_progress,
-    }, 4_000).?);
+}
+
+test "a finished compaction leaves a line with its own time, only when it succeeded" {
+    var state: compaction_activity.State = .{};
+    var buf: [64]u8 = undefined;
+    const id = state.begin(.automatic, 1, 1_000);
+    try std.testing.expect(compactionDoneNotice(&buf, state.snapshot.operation.?) == null);
+    state.running(id, .summary);
+    try std.testing.expect(compactionDoneNotice(&buf, state.snapshot.operation.?) == null);
+    state.settle(id, .{ .outcome = .succeeded, .stage = .publication, .publication = .committed }, 131_400);
+    try std.testing.expectEqualStrings("Context compacted (2m10s)", compactionDoneNotice(&buf, state.snapshot.operation.?).?);
+    const quick = state.begin(.manual, null, 5_000);
+    state.settle(quick, .{ .outcome = .succeeded, .publication = .committed }, 5_400);
+    try std.testing.expectEqualStrings("Context compacted (0s)", compactionDoneNotice(&buf, state.snapshot.operation.?).?);
+    for ([_]compaction_activity.Feedback{
+        .{ .outcome = .no_op },
+        .{ .outcome = .busy },
+        .{ .outcome = .cancelled },
+        .{ .outcome = .failed, .stage = .summary },
+    }) |feedback| {
+        const other = state.begin(.manual, null, 6_000);
+        state.settle(other, feedback, 9_000);
+        try std.testing.expect(compactionDoneNotice(&buf, state.snapshot.operation.?) == null);
+    }
+    // A buffer too small for the line gives no line, not a cut one.
+    const long = state.begin(.automatic, 1, 1_000);
+    state.settle(long, .{ .outcome = .succeeded, .publication = .committed }, 131_000);
+    try std.testing.expect(compactionDoneNotice(&buf, state.snapshot.operation.?) != null);
+    var small: [10]u8 = undefined;
+    try std.testing.expect(compactionDoneNotice(&small, state.snapshot.operation.?) == null);
 }
 
 test "compaction terminal feedback is static scoped and publication honest" {
     var state: compaction_activity.State = .{};
     var buf: [256]u8 = undefined;
     const id = state.begin(.manual, null, 1_000);
-    try std.testing.expectEqualStrings("• Preparing compaction (0s)", compactionProjection(&buf, state.snapshot, .{}, 1_000).turn_thinking.label);
+    try std.testing.expectEqualStrings("• Compacting 0% (0s)", compactionProjection(&buf, state.snapshot, 1_000).turn_thinking.label);
     state.settle(id, .{ .outcome = .failed, .stage = .publication, .publication = .uncertain }, 1_500);
-    const failed = compactionProjection(&buf, state.snapshot, .{}, 9_000).turn_thinking;
+    const failed = compactionProjection(&buf, state.snapshot, 9_000).turn_thinking;
     try std.testing.expectEqual(ActivityProjection.Tone.danger, failed.tone);
     try std.testing.expectEqualStrings("Compaction could not confirm saved context. Reopen the session before retrying.", failed.label);
     try std.testing.expect(state.dismiss(id, state.snapshot.revision));
-    try std.testing.expect(compactionProjection(&buf, state.snapshot, .{}, 9_000) == .none);
+    try std.testing.expect(compactionProjection(&buf, state.snapshot, 9_000) == .none);
     const next = state.begin(.manual, null, 10_000);
     state.settle(next, .{ .outcome = .no_op }, 10_000);
-    try std.testing.expectEqual(ActivityProjection.Tone.neutral, compactionProjection(&buf, state.snapshot, .{}, 11_499).turn_thinking.tone);
-    try std.testing.expect(compactionProjection(&buf, state.snapshot, .{}, 11_500) == .none);
+    try std.testing.expectEqual(ActivityProjection.Tone.neutral, compactionProjection(&buf, state.snapshot, 11_499).turn_thinking.tone);
+    try std.testing.expect(compactionProjection(&buf, state.snapshot, 11_500) == .none);
 }
 
 test "subagent wait label preserves turn time and token accounting" {

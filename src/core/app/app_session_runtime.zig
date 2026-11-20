@@ -12,6 +12,7 @@ const model_provider = @import("../config/model_provider.zig");
 const assistant_presentation = @import("../agent/assistant_presentation.zig");
 const tool_admission = @import("../agent/runtime/tool_admission.zig");
 const tool_presentation = @import("../agent/runtime/tool_presentation.zig");
+const runtime_execution_memory = @import("../agent/runtime/execution_memory.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const mem_utils = @import("../shared/mem_utils.zig");
 const runtime_profile = @import("../hosts/runtime_profile.zig");
@@ -28,6 +29,7 @@ const input_completion_runtime = @import("input_completion_runtime.zig");
 const image_attachments = @import("../images/image_attachments.zig");
 const core_input_runtime = @import("../input/runtime.zig");
 const io_mod = @import("../shared/io.zig");
+const app_worker_runtime = @import("app_worker_runtime.zig");
 const list_window = @import("../shared/list_window.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const session_runtime = @import("../session/session.zig");
@@ -42,6 +44,7 @@ const command_output_content = @import("../tooling/command_output_content.zig");
 const tooling_presentation = @import("../tooling/tool_presentation.zig");
 const tool_args = @import("../tooling/tool_args.zig");
 const tool_dispatch = @import("../tooling/tool_dispatch.zig");
+const toolbox = @import("../tooling/toolbox.zig");
 const skill_contract = @import("../skills/skill_contract.zig");
 const skill_invocation = @import("../skills/skill_invocation.zig");
 const captured_command = @import("../tooling/captured_command.zig");
@@ -49,6 +52,7 @@ const tool_result_errors = @import("../tooling/tool_result_errors.zig");
 const session_display_metadata = @import("../session/session_display_metadata.zig");
 const session_title_generation = @import("../session/session_title_generation.zig");
 const session_adapter = @import("../session/session_adapter.zig");
+const turn_capture = @import("../workspace/turn_capture.zig");
 const session_store = @import("../session/session_store.zig");
 const session_catalog_cache = @import("../session/session_catalog_cache.zig");
 const session_summary_codec = @import("../session/session_summary_codec.zig");
@@ -70,6 +74,7 @@ const operation_control = @import("../mcp/operation_control.zig");
 const shell_runtime = @import("../../ui/shell_runtime.zig");
 const transcript_runtime = @import("../../ui/transcript/runtime.zig");
 const resume_projection = @import("../../ui/transcript/resume_projection.zig");
+const tool_group_projection = @import("../../ui/transcript/tool_group_projection.zig");
 const question_ui = @import("../../ui/footer/question_ui.zig");
 const render_input = @import("../../ui/footer/render_input.zig");
 const ui_input = @import("../../ui/input/runtime.zig");
@@ -632,10 +637,6 @@ pub fn Runtime(comptime App: type) type {
             enableSubagentHostV2(app, agent, v2);
         }
 
-        pub fn beginFreshPersistedSession(app: *App, agent: *AppAgent) !void {
-            return beginFresh(app, agent, .later, null);
-        }
-
         /// Starts the session an instance opens with. In a profile, it starts
         /// with and saves the profile's model and effort, so resuming it
         /// brings them back; `--model`, `--effort`, and `FX_MODEL` shape only
@@ -1090,7 +1091,7 @@ pub fn Runtime(comptime App: type) type {
 
         fn beginLiveSessionCancellation(app: *App, agent: *AppAgent) void {
             agent.worker.requestCancel();
-            app.pacer.clear(app.alloc);
+            app_worker_runtime.Runtime(App).clearPacer(app, agent, "session_switch");
             if (comptime @hasDecl(App, "clearPendingSubmissionForSessionTransition")) {
                 App.clearPendingSubmissionForSessionTransition(app, agent);
             } else {
@@ -1547,6 +1548,12 @@ pub fn Runtime(comptime App: type) type {
             errdefer if (fork_owned) fork.close();
             try app.prepareLiveSessionResume(agent);
             fork_owned = false;
+            // The fork is committed: it keeps the source's captures from
+            // retention (D98), copied off the UI thread. `copies` and the fork
+            // are read here, before the install takes the fork.
+            if (comptime turn_capture.supported) {
+                if (agent.session_persistence.workspace_capture) agent.session_persistence.startForkCaptureCopy(app.alloc, fork.store.home, source_id, fork, copies);
+            }
             try installResumedV2Session(app, agent, fork, .{ .fork = source_id });
             startResumedSessionWarmup(app);
             try app.finishLiveSessionResume();
@@ -1615,6 +1622,16 @@ pub fn Runtime(comptime App: type) type {
             return v2.saveRecovery(record);
         }
 
+        /// Saves the row of a call a command made through `fx mcp call` in
+        /// the open turn, so a resume shows it in its shell call's group
+        /// (D99). A session that is not saved keeps nothing.
+        pub fn saveBridgeCall(agent: *AppAgent, record: types.BridgeCallRecord) !void {
+            agent.session_persistence.write_mutex.lockUncancelable(io_mod.getIo());
+            defer agent.session_persistence.write_mutex.unlock(io_mod.getIo());
+            const v2 = agent.session_persistence.v2 orelse return;
+            try v2.saveBridgeCall(record);
+        }
+
         /// Record whether restored history references shell execution handles
         /// this process does not own. Registry membership, not the resume
         /// itself, decides staleness (see session_runtime.detectStaleShellHandles).
@@ -1641,6 +1658,8 @@ pub fn Runtime(comptime App: type) type {
             var resumed = try v2.durableState(app.alloc, app.workspace_root);
             defer resumed.deinit(app.alloc);
             agent.session_persistence.v2 = v2;
+            // A subagent captures its own turns as the first agent does (D98).
+            agent.session_persistence.workspace_capture = app.main_agent.session_persistence.workspace_capture;
             v2_owned = false;
             errdefer {
                 agent.session_persistence.v2 = null;
@@ -2100,7 +2119,34 @@ pub fn Runtime(comptime App: type) type {
         }
 
         pub fn appendHistoryTurn(app: *App, agent: *AppAgent, turn: types.HistoryTurn) !void {
-            _ = try appendHistoryTurnWithPendingPresentation(app, agent, turn, .strict, null);
+            _ = try appendHistoryTurnWithPendingPresentation(app, agent, turn, .strict, null, 0);
+        }
+
+        /// Tells the agent's worker that a finished turn is committed, or
+        /// failed to commit, so mail held for it may start the next turn
+        /// (`WorkerRuntime.acknowledgeFinishCommitted`). `committed` is the turn
+        /// added to the agent's history, null when there was none: the worker
+        /// adds it to mail that was posted after the turn finished and before
+        /// this commit (`WorkerRuntime.acknowledgeFinishCommittedTurn`).
+        fn acknowledgeFinishCommitted(
+            agent: *AppAgent,
+            committed: ?types.HistoryTurn,
+            ownership: ?types.SnapshotFileOwnership,
+        ) void {
+            if (comptime @hasField(AppAgent, "worker") and
+                @hasDecl(@TypeOf(agent.worker), "acknowledgeFinishCommitted"))
+            {
+                if (comptime @hasDecl(@TypeOf(agent.worker), "acknowledgeFinishCommittedTurn")) {
+                    if (committed) |turn| {
+                        // The worker's queue is allocated with `c_allocator`, by
+                        // `postAgentMessage` and by the worker threads, so the
+                        // turn is added with the same allocator.
+                        agent.worker.acknowledgeFinishCommittedTurn(std.heap.c_allocator, turn, ownership, agent.session.max_history_turns);
+                        return;
+                    }
+                }
+                agent.worker.acknowledgeFinishCommitted();
+            }
         }
 
         pub fn appendFinishedPrompt(
@@ -2108,17 +2154,20 @@ pub fn Runtime(comptime App: type) type {
             agent: *AppAgent,
             finished: types.FinishedPrompt,
         ) !void {
+            var committed: ?types.HistoryTurn = null;
+            defer acknowledgeFinishCommitted(agent, committed, finished.snapshot_file_ownership);
             var turn = finished.turn;
             if (finished.summary) |summary| {
                 types.setHistoryTurnSummary(&turn, summary);
             }
-            _ = try appendHistoryTurnWithPendingPresentation(
+            if (try appendHistoryTurnWithPendingPresentation(
                 app,
                 agent,
                 turn,
                 .finished_prompt,
                 finished.snapshot_file_ownership,
-            );
+                finished.capture_turn,
+            ) == .committed) committed = turn;
             if (comptime agents.hasAgentField(App, "child_run")) {
                 @import("app_agents_runtime.zig").Runtime(App).commitChildTurn(app, agent, finished);
             }
@@ -2135,6 +2184,7 @@ pub fn Runtime(comptime App: type) type {
                 turn,
                 .visual_epoch,
                 null,
+                0,
             );
         }
 
@@ -2143,13 +2193,20 @@ pub fn Runtime(comptime App: type) type {
             agent: *AppAgent,
             finished: types.FinishedPrompt,
         ) !HistoryAppendOutcome {
-            return appendHistoryTurnWithPendingPresentation(
+            const outcome = try appendHistoryTurnWithPendingPresentation(
                 app,
                 agent,
                 finished.turn,
                 .visual_epoch,
                 finished.snapshot_file_ownership,
+                finished.capture_turn,
             );
+            // An uncommitted turn stays with the pacer, which commits it later
+            // through `appendFinishedPrompt`.
+            if (outcome == .committed) {
+                acknowledgeFinishCommitted(agent, finished.turn, finished.snapshot_file_ownership);
+            }
+            return outcome;
         }
 
         const AppendHistoryMode = enum {
@@ -2167,21 +2224,24 @@ pub fn Runtime(comptime App: type) type {
             turn: types.HistoryTurn,
             mode: AppendHistoryMode,
             snapshot_file_ownership: ?types.SnapshotFileOwnership,
+            /// The turn's workspace capture token from its finished prompt
+            /// (`types.FinishedPrompt.capture_turn`); 0 commits no captures.
+            capture_turn: u64,
         ) !HistoryAppendOutcome {
             if (comptime !agents.hasAgentField(App, "session_persistence")) {
-                return appendHistoryTurnWithOutcome(app, agent, turn, mode, snapshot_file_ownership);
+                return appendHistoryTurnWithOutcome(app, agent, turn, mode, snapshot_file_ownership, capture_turn);
             }
             const interrupted = switch (turn) {
                 .interrupted => |entry| entry,
-                else => return appendHistoryTurnWithOutcome(app, agent, turn, mode, snapshot_file_ownership),
+                else => return appendHistoryTurnWithOutcome(app, agent, turn, mode, snapshot_file_ownership, capture_turn),
             };
             var pending = agent.session_persistence.pending_cancelled_command orelse {
-                return appendHistoryTurnWithOutcome(app, agent, turn, mode, snapshot_file_ownership);
+                return appendHistoryTurnWithOutcome(app, agent, turn, mode, snapshot_file_ownership, capture_turn);
             };
             agent.session_persistence.pending_cancelled_command = null;
             const call = interrupted.tool_call orelse {
                 pending.discard(app.alloc);
-                return appendHistoryTurnWithOutcome(app, agent, turn, mode, snapshot_file_ownership);
+                return appendHistoryTurnWithOutcome(app, agent, turn, mode, snapshot_file_ownership, capture_turn);
             };
             const is_command = try captured_command.isToolCall(
                 app.alloc,
@@ -2192,7 +2252,7 @@ pub fn Runtime(comptime App: type) type {
                 !std.mem.eql(u8, call.id, pending.lifecycle_id.call_id))
             {
                 pending.discard(app.alloc);
-                return appendHistoryTurnWithOutcome(app, agent, turn, mode, snapshot_file_ownership);
+                return appendHistoryTurnWithOutcome(app, agent, turn, mode, snapshot_file_ownership, capture_turn);
             }
             defer pending.discard(app.alloc);
 
@@ -2210,6 +2270,7 @@ pub fn Runtime(comptime App: type) type {
                     .{ .interrupted = enriched_interrupted },
                     mode,
                     snapshot_file_ownership,
+                    capture_turn,
                 );
             }
 
@@ -2218,7 +2279,7 @@ pub fn Runtime(comptime App: type) type {
                 .command_artifact_handle = pending.command_artifact_handle,
             };
             const enriched: types.HistoryTurn = .{ .interrupted = enriched_interrupted };
-            return appendHistoryTurnWithOutcome(app, agent, enriched, mode, snapshot_file_ownership);
+            return appendHistoryTurnWithOutcome(app, agent, enriched, mode, snapshot_file_ownership, capture_turn);
         }
 
         fn ensurePendingCancelledCommand(
@@ -2282,6 +2343,7 @@ pub fn Runtime(comptime App: type) type {
             turn: types.HistoryTurn,
             mode: AppendHistoryMode,
             snapshot_file_ownership: ?types.SnapshotFileOwnership,
+            capture_turn: u64,
         ) !HistoryAppendOutcome {
             var prepared = (if (comptime @hasDecl(@TypeOf(agent.session), "prepareHistoryEntry"))
                 agent.session.prepareHistoryEntry(app.alloc, turn)
@@ -2308,10 +2370,13 @@ pub fn Runtime(comptime App: type) type {
                 commitJsHostSnapshot(app, agent, "history_turn");
                 return .committed;
             }
+            // The turn's end capture was taken on its worker as the turn
+            // finished (`endWorkspaceCapture`); this commit, which may run on
+            // the UI thread, only writes what is held, and a retry reuses it.
             agent.session_persistence.write_mutex.lockUncancelable(io_mod.getIo());
             if (agent.session_persistence.v2) |v2| {
                 defer agent.session_persistence.write_mutex.unlock(io_mod.getIo());
-                if (try commitV2HistoryTurn(app, agent, v2, &prepared, mode)) |outcome| return outcome;
+                if (try commitV2HistoryTurn(app, agent, v2, &prepared, mode, capture_turn)) |outcome| return outcome;
                 if (comptime @hasDecl(@TypeOf(agent.session), "commitPreparedHistoryEntry")) {
                     agent.session.commitPreparedHistoryEntry(app.alloc, prepared);
                     prepared_owned = false;
@@ -2344,10 +2409,25 @@ pub fn Runtime(comptime App: type) type {
             v2: *session_adapter.Session,
             prepared: *types.HistoryTurn,
             mode: AppendHistoryMode,
+            capture_turn: u64,
         ) !?HistoryAppendOutcome {
             const failure: anyerror = saved: {
                 v2.prepareTurn(prepared) catch |err| break :saved err;
-                v2.commitTurn(prepared.*, agent.session.languageSnapshot()) catch |err| break :saved err;
+                const captures = &agent.session_persistence.turn_capture;
+                // The token the turn's finished prompt carried, never one
+                // asked of `captures`: a turn the UI commits late must not
+                // take a later turn's captures (D98). The session writes
+                // none when it no longer holds this token's.
+                const capture_token: ?session_adapter.Session.CaptureTurn = if (capture_turn != 0) @fromBackingInt(capture_turn) else null;
+                if (comptime turn_capture.supported) {
+                    if (agent.session_persistence.workspace_capture) debug_trace.logf("workspace", "event=workspace_capture_commit session={s} held={} thread={d}", .{ v2.id(), capture_token != null, std.Thread.getCurrentId() });
+                }
+                const committed = if (capture_token) |token|
+                    v2.commitTurnWithCaptures(prepared.*, agent.session.languageSnapshot(), token)
+                else
+                    v2.commitTurn(prepared.*, agent.session.languageSnapshot());
+                committed catch |err| break :saved err;
+                captures.committed(capture_token);
                 return null;
             };
             switch (mode) {
@@ -2388,6 +2468,53 @@ pub fn Runtime(comptime App: type) type {
             defer agent.session_persistence.write_mutex.unlock(io_mod.getIo());
             const v2 = agent.session_persistence.v2 orelse return;
             try v2.recordUsage(usage);
+        }
+
+        /// What a workspace capture of `agent`'s session needs, or null when
+        /// captures are off or the session is not saved.
+        fn workspaceCaptureContext(app: *App, agent: *AppAgent) ?turn_capture.Context {
+            if (comptime !@hasField(App, "workspace_root")) return null;
+            const persistence = &agent.session_persistence;
+            if (!persistence.workspace_capture) return null;
+            const v2 = persistence.v2 orelse return null;
+            // The session's own store: a subagent's agent has no `v2_store`.
+            return .{ .session = v2, .home = v2.store.home, .path = app.workspace_root, .alloc = std.heap.c_allocator, .cancel = captureCancelFlag(agent) };
+        }
+
+        /// The flag that ends `agent`'s workspace captures early: set by a
+        /// cancel that stops its turn, never by a steer or a subagent's report
+        /// that only interrupts the model (`WorkerRuntime.turn_cancel_requested`).
+        fn captureCancelFlag(agent: *AppAgent) ?*const std.atomic.Value(bool) {
+            if (comptime !@hasField(AppAgent, "worker") or !@hasField(@FieldType(AppAgent, "worker"), "turn_cancel_requested")) return null;
+            return &agent.worker.turn_cancel_requested;
+        }
+
+        /// `AgentRuntimeDeps.reach_workspace` on v2 (D98).
+        pub fn reachWorkspace(app: *App, agent: *AppAgent, dir: []const u8, tool_name: []const u8) void {
+            const context = workspaceCaptureContext(app, agent) orelse return;
+            agent.session_persistence.turn_capture.reach(context, dir, tool_name, &agent.session_persistence.write_mutex);
+        }
+
+        /// `AgentRuntimeDeps.start_workspace_capture` on v2 (D98).
+        pub fn startWorkspaceCapture(app: *App, agent: *AppAgent, fresh: bool, step: agent_runtime.AgentRuntimeDeps.WorkspaceCaptureStep) void {
+            const context = workspaceCaptureContext(app, agent) orelse return;
+            const captures = &agent.session_persistence.turn_capture;
+            switch (step) {
+                .begin => captures.begin(context, fresh),
+                .capture => captures.start(context, &agent.session_persistence.write_mutex),
+            }
+        }
+
+        /// The repository as the turn left it, taken on the agent's worker
+        /// as its turn finishes and before the finished prompt reaches the
+        /// UI, whose commit writes it (D98). Returns the turn's token, which
+        /// the finished prompt carries to that commit; null when captures
+        /// are off. A capture can take seconds, so it never runs on the UI
+        /// thread.
+        pub fn endWorkspaceCapture(app: *App, agent: *AppAgent) ?session_adapter.Session.CaptureTurn {
+            if (comptime !turn_capture.supported) return null;
+            const context = workspaceCaptureContext(app, agent) orelse return null;
+            return agent.session_persistence.turn_capture.end(context, &agent.session_persistence.write_mutex);
         }
 
         /// `AgentRuntimeDeps.save_prompt_images` on v2: the prompt's images
@@ -2886,11 +3013,22 @@ pub fn Runtime(comptime App: type) type {
         pub fn deinitPersistence(app: *App, agent: *AppAgent) void {
             closeWritableSession(app, agent);
             agent.session_persistence.deinit(app.alloc);
+            finishCaptureMaintenance(app, agent);
         }
 
         pub fn deinitPersistenceForProcessExit(app: *App, agent: *AppAgent) void {
             closeWritableSession(app, agent);
             agent.session_persistence.deinitForProcessExit(app.alloc);
+            finishCaptureMaintenance(app, agent);
+        }
+
+        /// Retention's maintenance ends with the app: the main agent's
+        /// persistence goes last, once every worker has stopped (D98). A
+        /// child agent closing leaves it running.
+        fn finishCaptureMaintenance(app: *App, agent: *AppAgent) void {
+            if (comptime !turn_capture.supported or !@hasField(App, "main_agent")) return;
+            if (agent != &app.main_agent) return;
+            turn_capture.finishMaintenance();
         }
 
         pub fn requestPersistenceShutdown(agent: *AppAgent) void {
@@ -3022,6 +3160,17 @@ pub fn Runtime(comptime App: type) type {
                 ) !void {
                     if (comptime @hasDecl(SinkApp, "attachHistoricalToolCallWithoutResult")) {
                         try self.app.attachHistoricalToolCallWithoutResult(entry_id, call);
+                    }
+                }
+
+                fn attachHistoricalBridgeCall(
+                    self: *Self,
+                    entry_id: u32,
+                    tool: []const u8,
+                    outcome: types.ToolOutcomeKind,
+                ) !void {
+                    if (comptime @hasDecl(SinkApp, "attachHistoricalBridgeCall")) {
+                        try self.app.attachHistoricalBridgeCall(entry_id, tool, outcome);
                     }
                 }
 
@@ -3226,7 +3375,7 @@ pub fn Runtime(comptime App: type) type {
                     if (try subagent_reports.row(self.projection.alloc, user)) |shown| {
                         defer shown.deinit(self.projection.alloc);
                         const entry_id = try self.projection.appendToolStatus(shown.outcome, shown.status);
-                        try self.projection.attachHistoricalToolDetail(entry_id, subagent_reports.Row.call, .subagent, shown.result(self.projection.created_at_ms));
+                        try self.projection.attachSubagentReportDetail(entry_id, subagent_reports.Row.call, shown.result(self.projection.created_at_ms));
                         return;
                     }
                     _ = try self.projection.appendUserTurn(user);
@@ -3324,6 +3473,15 @@ pub fn Runtime(comptime App: type) type {
                     try self.projection.attachHistoricalToolCallWithoutResult(entry_id, call);
                 }
 
+                fn attachHistoricalBridgeCall(
+                    self: *Self,
+                    entry_id: u32,
+                    tool: []const u8,
+                    outcome: types.ToolOutcomeKind,
+                ) !void {
+                    try self.projection.attachHistoricalBridgeCall(entry_id, tool, outcome);
+                }
+
                 fn attachHistoricalCommandOutput(self: *Self, entry_id: u32) void {
                     self.projection.attachHistoricalCommandOutput(entry_id);
                 }
@@ -3341,6 +3499,9 @@ pub fn Runtime(comptime App: type) type {
                         command_artifact_handle,
                         replayed_output,
                     );
+                    // The live row's command metadata, so the compact view
+                    // shows the command's short form, as it did live.
+                    try self.attachCommandDisplay(entry_id, call);
                 }
 
                 fn appendQuestionResolution(
@@ -3631,12 +3792,8 @@ pub fn Runtime(comptime App: type) type {
         pub fn pollTranscriptArchive(app: *App, agent: *AppAgent) !bool {
             if (comptime !@hasField(App, "shell") or !@hasDecl(App, "beginResumeProjection")) return false;
             const read = &agent.session_persistence.transcript_archive_read;
+            if (read.dropIfStale(app.shell.transcript_archive_generation)) return false;
             const task = read.completed() orelse return false;
-            if (task.request.generation != app.shell.transcript_archive_generation) {
-                debug_trace.logf("full_transcript_cache", "archive_read_dropped back={d} reason=stale turns={d}", .{ task.request.back, task.turns.items.len });
-                read.finish();
-                return false;
-            }
             const back = task.request.back;
             const outcome = advanceTranscriptArchiveReplay(app, agent, task) catch |err| {
                 read.finish();
@@ -3936,6 +4093,9 @@ pub fn Runtime(comptime App: type) type {
                         if (entry.cancelled_command) |presentation| {
                             try writeCancelledCommandPresentation(app, agent, sink, entry.tool_call.?, presentation, labels);
                         }
+                        if (entry.tool_call) |call| {
+                            try writeBridgeCallRows(app, sink, entry.execution.bridge_calls, call.id);
+                        }
                         switch (entry.terminal_reason) {
                             .cancelled => if (entry.cancelled_command == null and entry.cancellation_origin == .turn) {
                                 try sink.appendTurnCancellation();
@@ -3979,16 +4139,24 @@ pub fn Runtime(comptime App: type) type {
             );
         }
 
+        /// The call a saved call shows as: for a toolbox run of a built-in
+        /// tool, the call fx ran for it, so its rows read after a resume as
+        /// they did live. Any other call as it is.
+        fn shownHistoricalCall(app: *App, agent: *AppAgent, arena: std.mem.Allocator, call: types.ToolCall) !types.ToolCall {
+            return try toolbox.shownBuiltinRun(arena, app.toolAdvertisementSet(agent).registry, call) orelse call;
+        }
+
         fn writeCancelledCommandPresentation(
             app: *App,
             agent: *AppAgent,
             sink: anytype,
-            call: types.ToolCall,
+            model_call: types.ToolCall,
             presentation: types.CancelledCommandPresentation,
             labels: *HistoricalSessionLabels,
         ) !void {
             var action_arena = std.heap.ArenaAllocator.init(app.alloc);
             defer mem_utils.deinit_arena(action_arena);
+            const call = try shownHistoricalCall(app, agent, action_arena.allocator(), model_call);
             const action = try app.describeToolActionDeniedWithAdvertised(
                 agent,
                 action_arena.allocator(),
@@ -4046,9 +4214,13 @@ pub fn Runtime(comptime App: type) type {
                 for (step.tool_calls) |call| {
                     if (findPersistedToolResult(step.tool_results, call.id)) |result| {
                         try writeCompletedToolResult(app, agent, sink, call, result, labels);
+                        try writeBridgeCallRows(app, sink, execution.bridge_calls, call.id);
                         try writePermissionFeedback(sink, result.permission_feedback);
                     } else {
-                        try writeUnreportedToolStatus(app, sink, call);
+                        var shown_arena = std.heap.ArenaAllocator.init(app.alloc);
+                        defer shown_arena.deinit();
+                        try writeUnreportedToolStatus(app, sink, try shownHistoricalCall(app, agent, shown_arena.allocator(), call));
+                        try writeBridgeCallRows(app, sink, execution.bridge_calls, call.id);
                     }
                 }
 
@@ -4102,10 +4274,18 @@ pub fn Runtime(comptime App: type) type {
             return true;
         }
 
-        /// A saved steering entry as the message it was: the user's update,
-        /// or a subagent's report a boundary took, which draws as its card.
+        /// A saved steering entry as the message it was: the user's update, a
+        /// parent's steer as the words its parent wrote, which draw the same
+        /// way, or a subagent's report a boundary took, which draws as its card.
+        /// Every sink copies the text, so the turn borrows `text`.
         fn savedSteeringTurn(text: []u8) types.UserTurn {
-            return .{ .text = text, .author = if (agent_frame.isFrame(text)) .child else .user };
+            if (agent_frame.isFrame(text)) return .{ .text = text, .author = .child };
+            // The parent's words are the end of `text`, past its label, so the
+            // turn keeps the same `[]u8` slice of the saved text.
+            if (runtime_execution_memory.parentSteeringText(text)) |own| {
+                return .{ .text = text[text.len - own.len ..], .author = .user };
+            }
+            return .{ .text = text, .author = .user };
         }
 
         fn writePersistedSteeringAtBoundary(
@@ -4162,7 +4342,7 @@ pub fn Runtime(comptime App: type) type {
             app: *App,
             agent: *AppAgent,
             sink: anytype,
-            call: types.ToolCall,
+            model_call: types.ToolCall,
             result: types.PersistedToolResult,
             labels: *HistoricalSessionLabels,
         ) !void {
@@ -4170,9 +4350,14 @@ pub fn Runtime(comptime App: type) type {
                 app.alloc,
                 app.toolAdvertisementSet(agent).registry,
                 labels.workspace_root,
-                call,
+                model_call,
                 result,
             );
+            // A toolbox run of a built-in tool shows as the call fx ran for
+            // it, as its rows did live.
+            var shown_arena = std.heap.ArenaAllocator.init(app.alloc);
+            defer shown_arena.deinit();
+            const call = try shownHistoricalCall(app, agent, shown_arena.allocator(), model_call);
             if (try writeAnsweredQuestionResult(app, sink, call, result)) return;
             if (try writeCommittedFilePresentation(app, agent, sink, call, result)) return;
 
@@ -4646,6 +4831,25 @@ pub fn Runtime(comptime App: type) type {
             return sink.appendToolStatus(kind, status);
         }
 
+        /// Writes the row of each call that the command of shell call
+        /// `call_id` made through `fx mcp call`, as its live row ended, right
+        /// after the shell call's row, so the two share a group again (D99).
+        fn writeBridgeCallRows(
+            app: *App,
+            sink: anytype,
+            records: []const types.BridgeCallRecord,
+            call_id: []const u8,
+        ) !void {
+            for (records) |record| {
+                if (!std.mem.eql(u8, record.call_id, call_id)) continue;
+                const status = try tooling_presentation.bridgeCallRowSummary(app.alloc, record.tool, record.outcome);
+                defer app.alloc.free(status);
+                const kind = record.outcome.toolOutcome();
+                const entry_id = try writeCompletedToolStatus(sink, kind, status);
+                try sink.attachHistoricalBridgeCall(entry_id, record.tool, kind);
+            }
+        }
+
         fn writeSavedCommandOutput(sink: anytype, output: []const u8) !bool {
             var wrote = false;
             wrote = try writeCommandEnvelope(sink, output, "<stdout>\n", "\n</stdout>", .stdout) or wrote;
@@ -4903,7 +5107,7 @@ pub fn Runtime(comptime App: type) type {
             }
             const rules: types.PermissionRuleSet = if (comptime @hasField(App, "permission_engine")) app.permission_engine.rules else .{};
             var mcp_view: ?mcp_access.View = if (comptime @hasDecl(App, "snapshotMcpAccessView"))
-                try app.snapshotMcpAccessView(alloc, root_id, root_id, rules)
+                try app.snapshotMcpAccessView(alloc, root_id, root_id)
             else
                 null;
             defer if (mcp_view) |*view| view.deinit(alloc);
@@ -5018,12 +5222,7 @@ pub fn Runtime(comptime App: type) type {
                 alloc.free(integrations);
             }
             var mcp_view: ?mcp_access.View = if (comptime @hasDecl(App, "snapshotMcpAccessView"))
-                try app.snapshotMcpAccessView(
-                    alloc,
-                    root_id,
-                    root_id,
-                    app.permission_engine.rules,
-                )
+                try app.snapshotMcpAccessView(alloc, root_id, root_id)
             else
                 null;
             defer if (mcp_view) |*view| view.deinit(alloc);
@@ -5040,7 +5239,7 @@ pub fn Runtime(comptime App: type) type {
                 },
                 integrations,
                 if (comptime @hasField(App, "permission_engine")) app.permission_engine.rules else .{},
-                if (comptime @hasField(App, "permission_engine")) app_permission_runtime.Runtime(App).grantsOf(app, instance) else &.{},
+                if (comptime @hasField(App, "permission_engine")) app_permission_runtime.Runtime(App).grantsLocked(app, instance) else &.{},
                 permission_state,
                 if (mcp_view) |*view| view else null,
             );
@@ -5472,7 +5671,7 @@ test "session transition retires queued and running compaction only after worker
             worker: worker_runtime.WorkerRuntime = .{},
         } = .{},
         pacer: struct {
-            fn clear(_: *@This(), _: Allocator) void {}
+            pub fn clear(_: *@This(), _: Allocator) void {}
         } = .{},
 
         pub fn agent(self: anytype) @TypeOf(&self.main_agent) {
@@ -5575,10 +5774,36 @@ const FakeWorker = struct {
     fast_mode: bool = false,
     ultrafast_mode: bool = false,
     cancel_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    /// What the loop told the worker about the commit of a finished turn.
+    acknowledgements_without_turn: usize = 0,
+    acknowledgements_with_turn: usize = 0,
+    acknowledged_answer: ?[]const u8 = null,
+    acknowledged_ownership: bool = false,
+    acknowledged_history_limit: usize = 0,
 
     fn deinit(self: *FakeWorker, alloc: Allocator) void {
         self.model.deinit(alloc);
         self.* = .{};
+    }
+
+    pub fn acknowledgeFinishCommitted(self: *FakeWorker) void {
+        self.acknowledgements_without_turn += 1;
+    }
+
+    pub fn acknowledgeFinishCommittedTurn(
+        self: *FakeWorker,
+        _: Allocator,
+        turn: types.HistoryTurn,
+        ownership: ?types.SnapshotFileOwnership,
+        max_history_turns: usize,
+    ) void {
+        self.acknowledgements_with_turn += 1;
+        self.acknowledged_answer = switch (turn) {
+            .assistant => |entry| entry.assistant,
+            else => null,
+        };
+        self.acknowledged_ownership = ownership != null;
+        self.acknowledged_history_limit = max_history_turns;
     }
 
     pub fn isCancelRequested(self: *const FakeWorker) bool {
@@ -6572,7 +6797,7 @@ fn configureTestPreferences(app: *TestApp) !void {
 /// prompts would, with the preferences of a session saved earlier, and
 /// returns its id. Caller frees.
 fn writeSessionFixture(app: *TestApp, history: []const types.HistoryTurn) ![]u8 {
-    try Runtime(TestApp).beginFreshPersistedSession(app, app.agent());
+    try Runtime(TestApp).beginFresh(app, app.agent(), .later, null);
     const v2 = app.agent().session_persistence.v2.?;
     for (history) |turn| try v2.commitTurn(turn, session_runtime.ConversationLanguage.literal("en"));
     var model = "saved/model".*;
@@ -6586,7 +6811,7 @@ fn writeSessionFixture(app: *TestApp, history: []const types.HistoryTurn) ![]u8 
 /// (D44), returning the blob's name for the turn to name it by. Finish with
 /// `commitSessionFixture`.
 fn beginSessionWithBody(app: *TestApp, body: []const u8) !session_child_store.Blobs.Hash {
-    try Runtime(TestApp).beginFreshPersistedSession(app, app.agent());
+    try Runtime(TestApp).beginFresh(app, app.agent(), .later, null);
     const v2 = app.agent().session_persistence.v2.?;
     try v2.beginTurn();
     return (try v2.childCapability()).putBlob(body);
@@ -6660,7 +6885,7 @@ test "a fresh session clears usage counters without a durable store" {
     app.agent().total_output_tokens = 1_200;
     app.agent().total_web_search_requests = 3;
 
-    try Runtime(TestApp).beginFreshPersistedSession(&app, (&app).agent());
+    try Runtime(TestApp).beginFresh(&app, (&app).agent(), .later, null);
 
     try std.testing.expect(app.agent().session_persistence.v2 == null);
     try std.testing.expectEqual(@as(u64, 0), app.agent().total_input_tokens);
@@ -6686,7 +6911,7 @@ test "v2 ultrafast resume applies process overrides without persisting them" {
         app.agent().session_persistence.workspace_preferences.?.ultrafast_mode = baseline;
         app.agent().session_persistence.process_ultrafast_override = !baseline;
         try Runtime(TestApp).initializePersistence(&app, (&app).agent(), true);
-        try Runtime(TestApp).beginFreshPersistedSession(&app, (&app).agent());
+        try Runtime(TestApp).beginFresh(&app, (&app).agent(), .later, null);
         const v2 = app.agent().session_persistence.v2.?;
         try v2.commitTurn(.{ .assistant = .{
             .user = .{ .text = @constCast("saved request") },
@@ -6721,7 +6946,7 @@ test "/fork waits for the turn and a prompt, then opens on the newest prompt (D5
     defer app.deinit();
     try configureTestPreferences(&app);
     try Runtime(TestApp).initializePersistence(&app, (&app).agent(), true);
-    try Runtime(TestApp).beginFreshPersistedSession(&app, (&app).agent());
+    try Runtime(TestApp).beginFresh(&app, (&app).agent(), .later, null);
     try Runtime(TestApp).openForkMenu(&app, (&app).agent());
     try std.testing.expectEqualStrings("* session: nothing to fork yet", app.notices.last().?);
 
@@ -6763,7 +6988,7 @@ test "the startup session keeps its store, and the store's notice the app, after
             errdefer app.deinit();
             try configureTestPreferences(&app);
             try Runtime(TestApp).initializePersistence(&app, (&app).agent(), true);
-            try Runtime(TestApp).beginFreshPersistedSession(&app, (&app).agent());
+            try Runtime(TestApp).beginFresh(&app, (&app).agent(), .later, null);
             return app;
         }
     };
@@ -6780,7 +7005,7 @@ test "the startup session keeps its store, and the store's notice the app, after
     } }, types.ConversationLanguage.default());
 }
 
-test "beginFreshPersistedSession and enableSessionStores create per-session stores" {
+test "beginFresh and enableSessionStores create per-session stores" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -6799,7 +7024,7 @@ test "beginFreshPersistedSession and enableSessionStores create per-session stor
 
     try configureTestPreferences(&app);
     try Runtime(TestApp).initializePersistence(&app, (&app).agent(), true);
-    try Runtime(TestApp).beginFreshPersistedSession(&app, (&app).agent());
+    try Runtime(TestApp).beginFresh(&app, (&app).agent(), .later, null);
     try std.testing.expect(app.agent().session_persistence.v2 != null);
 
     Runtime(TestApp).enableSessionStores(&app, (&app).agent());
@@ -6841,7 +7066,7 @@ test "resume handoff suppresses a missing session and one with no saved turn" {
 
     try configureTestPreferences(&app);
     try Runtime(TestApp).initializePersistence(&app, (&app).agent(), true);
-    try Runtime(TestApp).beginFreshPersistedSession(&app, (&app).agent());
+    try Runtime(TestApp).beginFresh(&app, (&app).agent(), .later, null);
     const pristine_id = try alloc.dupe(u8, Runtime(TestApp).activeSessionId((&app).agent()).?);
     defer alloc.free(pristine_id);
     Runtime(TestApp).requestResumeHandoff((&app).agent());
@@ -6870,7 +7095,7 @@ test "resume handoff owns the exact non-pristine session id" {
     defer app.deinit();
     try configureTestPreferences(&app);
     try Runtime(TestApp).initializePersistence(&app, (&app).agent(), true);
-    try Runtime(TestApp).beginFreshPersistedSession(&app, (&app).agent());
+    try Runtime(TestApp).beginFresh(&app, (&app).agent(), .later, null);
     const turn = try session_runtime.makeAssistantTurn(alloc, "question", "answer");
     defer session_runtime.freeHistoryTurn(alloc, turn);
     try Runtime(TestApp).appendHistoryTurn(&app, (&app).agent(), turn);
@@ -6904,7 +7129,7 @@ test "resume handoff suppresses session id allocation failure" {
     defer app.deinit();
     try configureTestPreferences(&app);
     try Runtime(TestApp).initializePersistence(&app, (&app).agent(), true);
-    try Runtime(TestApp).beginFreshPersistedSession(&app, (&app).agent());
+    try Runtime(TestApp).beginFresh(&app, (&app).agent(), .later, null);
     const turn = try session_runtime.makeAssistantTurn(alloc, "question", "answer");
     defer session_runtime.freeHistoryTurn(alloc, turn);
     try Runtime(TestApp).appendHistoryTurn(&app, (&app).agent(), turn);
@@ -6937,7 +7162,7 @@ test "enableSessionStores replaces existing subagent host without leaking" {
 
     try configureTestPreferences(&app);
     try Runtime(TestApp).initializePersistence(&app, (&app).agent(), true);
-    try Runtime(TestApp).beginFreshPersistedSession(&app, (&app).agent());
+    try Runtime(TestApp).beginFresh(&app, (&app).agent(), .later, null);
 
     Runtime(TestApp).enableSessionStores(&app, (&app).agent());
     try std.testing.expect(app.agent().session_persistence.subagent_host != null);
@@ -6961,7 +7186,7 @@ test "interactive subagent host resolves current tools rules grants and integrat
     defer app.deinit();
     try configureTestPreferences(&app);
     try Runtime(TestApp).initializePersistence(&app, (&app).agent(), true);
-    try Runtime(TestApp).beginFreshPersistedSession(&app, (&app).agent());
+    try Runtime(TestApp).beginFresh(&app, (&app).agent(), .later, null);
     Runtime(TestApp).enableSessionStores(&app, (&app).agent());
     const host = app.agent().session_persistence.subagent_host.?;
     const root_id = app.agent().session_persistence.v2.?.id();
@@ -7049,6 +7274,126 @@ test "execution replay keeps an inline command preview when its stored output is
     try std.testing.expectEqual(@as(usize, 1), app.command_output_flush_count);
 }
 
+/// A step whose command made three calls through `fx mcp call`, two that
+/// worked and one that failed, then read a file, as a resume reads it.
+const BridgeReplayFixture = struct {
+    calls: [2]types.ToolCall = .{
+        .{ .id = "call_pages", .name = "run_command", .arguments_json = "{\"command\":\"sh pages.sh\"}" },
+        .{ .id = "call_read", .name = "read_file", .arguments_json = "{\"path\":\"notes.txt\"}" },
+    },
+    results: [2]types.PersistedToolResult = .{
+        .{
+            .tool_call_id = @constCast("call_pages"),
+            .tool_name = @constCast("run_command"),
+            .status = .success,
+            .output = @constCast("exit_code=0\n<stdout>\ncalls=3\n</stdout>\n"),
+            .output_bytes = 39,
+            .stored_output_bytes = 39,
+        },
+        .{
+            .tool_call_id = @constCast("call_read"),
+            .tool_name = @constCast("read_file"),
+            .status = .success,
+            .output = @constCast("notes"),
+            .output_bytes = 5,
+            .stored_output_bytes = 5,
+        },
+    },
+    bridge_calls: [4]types.BridgeCallRecord = .{
+        .{ .call_id = "call_pages", .request_id = "fx-mcp-call-1", .tool = "mcp_fixture_echo", .outcome = .completed },
+        .{ .call_id = "call_pages", .request_id = "fx-mcp-call-2", .tool = "mcp_fixture_echo", .outcome = .completed },
+        .{ .call_id = "call_pages", .request_id = "fx-mcp-call-3", .tool = "mcp_fixture_echo", .outcome = .failed },
+        // Its shell call is not in the turn, as after a compaction cut it.
+        .{ .call_id = "call_gone", .request_id = "fx-mcp-call-4", .tool = "mcp_fixture_echo", .outcome = .completed },
+    },
+    steps: [1]types.ToolExecutionStep = undefined,
+
+    fn execution(self: *BridgeReplayFixture) types.ExecutionMemory {
+        self.steps[0] = .{ .tool_calls = self.calls[0..], .tool_results = self.results[0..] };
+        return .{ .tool_steps = self.steps[0..], .bridge_calls = self.bridge_calls[0..] };
+    }
+};
+
+test "a resume shows each saved fx mcp call row right after its shell call's row, as it ended (D99)" {
+    const alloc = std.testing.allocator;
+    var app = try TestApp.init(alloc, "/workspace");
+    defer app.deinit();
+    var fixture: BridgeReplayFixture = .{};
+
+    try Runtime(TestApp).writeExecutionHistory(&app, (&app).agent(), fixture.execution());
+
+    const statuses = app.completed_tool_statuses.items;
+    errdefer for (statuses) |status| std.debug.print("row: {s}", .{status});
+    try std.testing.expectEqual(@as(usize, 5), statuses.len);
+    // The test app names every command row the same way.
+    try std.testing.expectEqualStrings("● Ran pwd\n", statuses[0]);
+    for (statuses[1..4], [_][]const u8{ "Ran MCP", "Ran MCP", "Failed" }) |status, label| {
+        const want = try tooling_presentation.formatToolActionValue(alloc, label, "mcp_fixture_echo");
+        defer alloc.free(want);
+        try std.testing.expectEqualStrings(want, std.mem.trimEnd(u8, status, "\n"));
+    }
+    try std.testing.expect(std.mem.startsWith(u8, statuses[4], "● Completed read_file"));
+    try std.testing.expectEqualSlices(
+        types.ToolOutcomeKind,
+        &.{ .completed, .completed, .completed, .failed, .completed },
+        app.completed_tool_outcomes.items,
+    );
+}
+
+test "a resumed fx mcp call row joins its shell call's group with no arguments or result (D99)" {
+    const alloc = std.testing.allocator;
+    var app = try TestApp.init(alloc, "/workspace");
+    defer app.deinit();
+    var source_runtime: transcript_runtime.TranscriptRuntime = .{};
+    defer source_runtime.deinit(alloc);
+    var projection = try resume_projection.ResumeProjection.initEmpty(alloc, &source_runtime, 0, 1);
+    defer projection.deinit();
+    var labels = Runtime(TestApp).HistoricalSessionLabels{ .workspace_root = app.workspace_root };
+    defer labels.deinit(app.alloc);
+    var sink = Runtime(TestApp).DetachedHistorySink(@TypeOf(projection)){
+        .app = &app,
+        .projection = &projection,
+        .labels = &labels,
+    };
+    var fixture: BridgeReplayFixture = .{};
+
+    try Runtime(TestApp).writeExecutionHistoryToSink(&app, (&app).agent(), &sink, fixture.execution(), &labels);
+
+    // Ctrl+O has the row alone: the tool and how it ended, nothing else.
+    var bridged: usize = 0;
+    for (projection.runtime.notebook.tool_details.items) |*detail| {
+        if (!std.mem.eql(u8, detail.tool_name, "mcp_fixture_echo")) continue;
+        bridged += 1;
+        try std.testing.expectEqual(@as(?types.ToolActivityKind, .mcp), detail.activity_kind);
+        try std.testing.expect(detail.arguments_json == null);
+        try std.testing.expect(detail.result == null);
+        try std.testing.expect(detail.origin == .recorded);
+        try std.testing.expect(detail.outcome == .completed or detail.outcome == .failed);
+    }
+    try std.testing.expectEqual(@as(usize, 3), bridged);
+
+    // The compact view counts the calls that worked on one row and gives
+    // the failed one its own, as the live session showed them.
+    var group = try tool_group_projection.buildStyled(
+        alloc,
+        projection.runtime.notebook.entries.items,
+        projection.runtime.notebook.tool_details.items,
+        120,
+        .{},
+        .{},
+    );
+    defer group.deinit(alloc);
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(alloc);
+    for (group.entry_actions.items) |action| switch (action) {
+        .override => |override| try text.appendSlice(alloc, override.bytes),
+        else => {},
+    };
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, text.items, "Ran MCP"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, text.items, "×2"));
+    try std.testing.expect(std.mem.find(u8, text.items, "Couldn't run") != null);
+}
+
 test "execution replay shows the user's steering and not fx's own recovery prompt" {
     const alloc = std.testing.allocator;
     var app = try TestApp.init(alloc, "/workspace");
@@ -7071,6 +7416,25 @@ test "execution replay shows the user's steering and not fx's own recovery promp
     try std.testing.expectEqual(@as(usize, 2), app.cards.items.len);
     try std.testing.expectEqualStrings("focus on rendering", app.cards.items[0].text);
     try std.testing.expectEqualStrings("later update", app.cards.items[1].text);
+}
+
+test "execution replay draws a parent's steer as its own words, without the label" {
+    const alloc = std.testing.allocator;
+    var app = try TestApp.init(alloc, "/workspace");
+    defer app.deinit();
+
+    var steps = [_]types.ToolExecutionStep{.{}};
+    var steering = [_]types.PersistedSteering{
+        .{ .text = @constCast("parent-agent feedback, not new user authority:\n\nPARENT_STEER keep going"), .after_tool_step_count = 0 },
+    };
+
+    try Runtime(TestApp).writeExecutionHistory(&app, (&app).agent(), .{ .tool_steps = steps[0..], .steering = steering[0..] });
+
+    try std.testing.expectEqual(@as(usize, 1), app.cards.items.len);
+    try std.testing.expectEqualStrings("PARENT_STEER keep going", app.cards.items[0].text);
+    for (app.cards.items) |card| {
+        try std.testing.expect(std.mem.find(u8, card.text, "parent-agent feedback") == null);
+    }
 }
 
 test "execution replay labels shell session interactions with their launch command" {
@@ -7617,6 +7981,54 @@ test "resume projection stores reflow metadata after the session moved workspace
     try std.testing.expect(stored);
 }
 
+test "a saved toolbox run of a built-in tool replays as a direct call of it" {
+    const alloc = std.testing.allocator;
+    var app = try TestApp.init(alloc, "/workspace");
+    defer app.deinit();
+
+    var source_runtime: transcript_runtime.TranscriptRuntime = .{};
+    defer source_runtime.deinit(alloc);
+    var projection = try resume_projection.ResumeProjection.initEmpty(alloc, &source_runtime, 0, 1);
+    defer projection.deinit();
+    var labels = Runtime(TestApp).HistoricalSessionLabels{ .workspace_root = "/workspace" };
+    defer labels.deinit(app.alloc);
+    var sink = Runtime(TestApp).DetachedHistorySink(@TypeOf(projection)){
+        .app = &app,
+        .projection = &projection,
+        .labels = &labels,
+    };
+
+    // The session saves the call the model made, under toolbox.
+    var calls = [_]types.ToolCall{
+        .{ .id = "call_read", .name = "toolbox", .arguments_json = "{\"run\":\"read_file\",\"arguments\":{\"path\":\"notes.txt\"}}" },
+        .{ .id = "call_fetch", .name = "toolbox", .arguments_json = "{\"run\":\"web_fetch\",\"arguments\":{\"url\":\"http://127.0.0.1/page\"}}" },
+        .{ .id = "call_mcp", .name = "toolbox", .arguments_json = "{\"run\":\"mcp_fixture_echo\",\"arguments\":{}}" },
+    };
+    var results = [_]types.PersistedToolResult{
+        .{ .tool_call_id = @constCast("call_read"), .tool_name = @constCast("toolbox"), .status = .success, .output = @constCast("notes"), .output_bytes = 5, .stored_output_bytes = 5 },
+        .{ .tool_call_id = @constCast("call_fetch"), .tool_name = @constCast("toolbox"), .status = .failure, .output = @constCast("refused"), .output_bytes = 7, .stored_output_bytes = 7 },
+        .{ .tool_call_id = @constCast("call_mcp"), .tool_name = @constCast("toolbox"), .status = .success, .output = @constCast("echo"), .output_bytes = 4, .stored_output_bytes = 4 },
+    };
+    var steps = [_]types.ToolExecutionStep{.{ .tool_calls = calls[0..], .tool_results = results[0..] }};
+
+    try Runtime(TestApp).writeExecutionHistoryToSink(&app, (&app).agent(), &sink, .{ .tool_steps = steps[0..] }, &labels);
+
+    const Want = struct { name: []const u8, arguments: []const u8, kind: types.ToolActivityKind };
+    const wants = [_]Want{
+        .{ .name = "read_file", .arguments = "{\"path\":\"notes.txt\"}", .kind = .read },
+        .{ .name = "web_fetch", .arguments = "{\"url\":\"http://127.0.0.1/page\"}", .kind = .read },
+        // An MCP tool's run keeps toolbox's own record.
+        .{ .name = "toolbox", .arguments = calls[2].arguments_json, .kind = .mcp },
+    };
+    const details = projection.runtime.notebook.tool_details.items;
+    try std.testing.expectEqual(wants.len, details.len);
+    for (wants, details) |want, detail| {
+        try std.testing.expectEqualStrings(want.name, detail.tool_name);
+        try std.testing.expectEqualStrings(want.arguments, detail.arguments_json.?);
+        try std.testing.expectEqual(want.kind, detail.activity_kind.?);
+    }
+}
+
 test "execution replay renders persisted permission feedback after its tool result" {
     const alloc = std.testing.allocator;
     var app = try TestApp.init(alloc, "/workspace");
@@ -7944,7 +8356,7 @@ test "historical command replay prefers tagged frames and preserves exit outcome
     defer app.deinit();
     try configureTestPreferences(&app);
     try Runtime(TestApp).initializePersistence(&app, (&app).agent(), true);
-    try Runtime(TestApp).beginFreshPersistedSession(&app, (&app).agent());
+    try Runtime(TestApp).beginFresh(&app, (&app).agent(), .later, null);
     // A body is stored only while its session is on disk (D44).
     try app.agent().session_persistence.v2.?.beginTurn();
     const capability = try app.agent().session_persistence.v2.?.childCapability();
@@ -8741,7 +9153,7 @@ test "a resumed session's subagent host finds abandoned child work interrupted" 
     defer app.deinit();
     try configureTestPreferences(&app);
     try Runtime(TestApp).initializePersistence(&app, (&app).agent(), true);
-    try Runtime(TestApp).beginFreshPersistedSession(&app, (&app).agent());
+    try Runtime(TestApp).beginFresh(&app, (&app).agent(), .later, null);
     const v2 = app.agent().session_persistence.v2.?;
     // Child lines need the parent on disk.
     try v2.commitTurn(.{ .assistant = .{
@@ -8803,7 +9215,7 @@ test "interactive session resume uses the live transition and shared restore pat
     } }};
     const saved_session_id = try writeSessionFixture(&app, &history);
     defer alloc.free(saved_session_id);
-    try Runtime(TestApp).beginFreshPersistedSession(&app, (&app).agent());
+    try Runtime(TestApp).beginFresh(&app, (&app).agent(), .later, null);
     try Runtime(TestApp).openSessionPicker(&app, (&app).agent());
     try std.testing.expect(app.agent().session_persistence.session_picker.isLoading());
     try waitForSessionPickerLoad(&app);
@@ -8841,7 +9253,7 @@ test "interactive session resume preserves the current writer when the target is
     defer app.deinit();
     try configureTestPreferences(&app);
     try Runtime(TestApp).initializePersistence(&app, (&app).agent(), true);
-    try Runtime(TestApp).beginFreshPersistedSession(&app, (&app).agent());
+    try Runtime(TestApp).beginFresh(&app, (&app).agent(), .later, null);
     const current_id = try alloc.dupe(
         u8,
         app.agent().session_persistence.v2.?.id(),
@@ -9144,7 +9556,7 @@ test "cancelled command presentation survives a persisted session restart" {
         defer app.deinit();
         try configureTestPreferences(&app);
         try Runtime(TestApp).initializePersistence(&app, (&app).agent(), true);
-        try Runtime(TestApp).beginFreshPersistedSession(&app, (&app).agent());
+        try Runtime(TestApp).beginFresh(&app, (&app).agent(), .later, null);
         // The turn is open on disk while its command runs (D44).
         try app.agent().session_persistence.v2.?.beginTurn();
         const capability = Runtime(TestApp).childCapability((&app).agent()) orelse
@@ -9271,7 +9683,7 @@ fn expectCancelledHistoryKeepsAuthoritativeReplay() !void {
     defer app.deinit();
     try configureTestPreferences(&app);
     try Runtime(TestApp).initializePersistence(&app, (&app).agent(), true);
-    try Runtime(TestApp).beginFreshPersistedSession(&app, (&app).agent());
+    try Runtime(TestApp).beginFresh(&app, (&app).agent(), .later, null);
     // The turn is open on disk while its command runs (D44).
     try app.agent().session_persistence.v2.?.beginTurn();
     const capability = Runtime(TestApp).childCapability((&app).agent()) orelse
@@ -9513,6 +9925,105 @@ test "zero-output cancelled command restores detail without an output block" {
     try std.testing.expectEqual(@as(usize, 1), app.historical_tool_detail_entry_ids.items.len);
 }
 
+test "a command cancelled before it printed anything keeps its row across a persisted session restart (D100)" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const paths = try testPaths(alloc, &tmp);
+    defer {
+        alloc.free(paths.home);
+        alloc.free(paths.workspace);
+    }
+    const home = try TestHome.install(alloc, paths.home);
+    defer home.deinit();
+    var session_id: ?[]u8 = null;
+    defer if (session_id) |id| alloc.free(id);
+
+    {
+        var app = try TestApp.init(alloc, paths.workspace);
+        defer app.deinit();
+        try configureTestPreferences(&app);
+        try Runtime(TestApp).initializePersistence(&app, (&app).agent(), true);
+        try Runtime(TestApp).beginFresh(&app, (&app).agent(), .later, null);
+        try app.agent().session_persistence.v2.?.beginTurn();
+        // The command printed nothing, so core keeps no replay, and its
+        // terminal names no artifact.
+        Runtime(TestApp).recordToolTerminal(
+            &app,
+            (&app).agent(),
+            .{ .terminal = .{
+                .id = .{ .turn_id = 7, .call_id = "silent-command" },
+                .outcome = .{ .kind = .cancelled, .summary = "Cancelled sleep 30" },
+            } },
+            true,
+        );
+        try Runtime(TestApp).appendHistoryTurn(&app, (&app).agent(), .{ .interrupted = .{
+            .user = .{ .text = @constCast("run the slow command") },
+            .tool_call = .{
+                .id = "silent-command",
+                .name = "shell",
+                .arguments_json = "{\"action\":\"run\",\"command\":\"sleep 30\"}",
+            },
+        } });
+        session_id = try alloc.dupe(u8, app.agent().session_persistence.v2.?.id());
+        Runtime(TestApp).finalizePersistence(&app, (&app).agent());
+    }
+
+    var resumed = try TestApp.init(alloc, paths.workspace);
+    defer resumed.deinit();
+    try configureTestPreferences(&resumed);
+    try Runtime(TestApp).initializePersistence(&resumed, (&resumed).agent(), true);
+    resumed.requested_resume = .{ .id = try alloc.dupe(u8, session_id.?) };
+    try Runtime(TestApp).resumeRequestedSession(&resumed, (&resumed).agent());
+
+    // The command's row comes back, with no output under it.
+    try std.testing.expectEqual(@as(usize, 1), resumed.cancelled_command_detail_count);
+    try std.testing.expect(!resumed.cancelled_command_replayed_output);
+    try std.testing.expect(resumed.cancelled_command_artifact_handle == null);
+    try std.testing.expectEqual(@as(usize, 0), resumed.command_output_flush_count);
+    try std.testing.expectEqualSlices(ReplayEvent, &.{.completed_tool_status}, resumed.replay_events.items);
+}
+
+test "a resumed cancelled command row has the live row's command metadata, for its short form" {
+    const alloc = std.testing.allocator;
+    var app = try TestApp.init(alloc, "/workspace");
+    defer app.deinit();
+    var source_runtime: transcript_runtime.TranscriptRuntime = .{};
+    defer source_runtime.deinit(alloc);
+    var projection = try resume_projection.ResumeProjection.initEmpty(alloc, &source_runtime, 0, 1);
+    defer projection.deinit();
+    var labels = Runtime(TestApp).HistoricalSessionLabels{ .workspace_root = app.workspace_root };
+    defer labels.deinit(app.alloc);
+    var sink = Runtime(TestApp).DetachedHistorySink(@TypeOf(projection)){
+        .app = &app,
+        .projection = &projection,
+        .labels = &labels,
+    };
+    const history = [_]types.HistoryTurn{.{ .interrupted = .{
+        .user = .{ .text = @constCast("cancel it") },
+        .tool_call = .{
+            .id = "cancelled-run",
+            .name = "shell",
+            .arguments_json = "{\"action\":\"run\",\"command\":\"touch .ready && sleep 30\"}",
+        },
+        .cancelled_command = .{},
+    } }};
+
+    try Runtime(TestApp).replayHistoryToSink(&app, (&app).agent(), &sink, &history, &labels);
+
+    // The same display and label the live row stores when the call starts,
+    // which the compact view needs to show `Cancelled touch, sleep`.
+    var cancelled_rows: usize = 0;
+    for (projection.runtime.notebook.tool_details.items) |*detail| {
+        const outcome = detail.outcome orelse continue;
+        if (outcome != .cancelled) continue;
+        cancelled_rows += 1;
+        try std.testing.expectEqualStrings("touch .ready && sleep 30", detail.command_display.?);
+        try std.testing.expectEqualStrings("Ran", detail.command_action_label.?);
+    }
+    try std.testing.expectEqual(@as(usize, 1), cancelled_rows);
+}
+
 test "cancelled command replay rejects unsafe handles without partial output" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -9528,7 +10039,7 @@ test "cancelled command replay rejects unsafe handles without partial output" {
     defer app.deinit();
     try configureTestPreferences(&app);
     try Runtime(TestApp).initializePersistence(&app, (&app).agent(), true);
-    try Runtime(TestApp).beginFreshPersistedSession(&app, (&app).agent());
+    try Runtime(TestApp).beginFresh(&app, (&app).agent(), .later, null);
 
     const unsafe_handles = [_][]const u8{
         "../escape.bin",
@@ -9576,7 +10087,7 @@ test "authoritative cancelled replay survives history insertion failure" {
     defer app.deinit();
     try configureTestPreferences(&app);
     try Runtime(TestApp).initializePersistence(&app, (&app).agent(), true);
-    try Runtime(TestApp).beginFreshPersistedSession(&app, (&app).agent());
+    try Runtime(TestApp).beginFresh(&app, (&app).agent(), .later, null);
     // The turn is open on disk while its command runs (D44).
     try app.agent().session_persistence.v2.?.beginTurn();
     const capability = Runtime(TestApp).childCapability((&app).agent()).?;
@@ -9640,7 +10151,7 @@ test "context checkpoint persists before releasing summarized model memory" {
     defer app.deinit();
     try configureTestPreferences(&app);
     try Runtime(TestApp).initializePersistence(&app, (&app).agent(), true);
-    try Runtime(TestApp).beginFreshPersistedSession(&app, (&app).agent());
+    try Runtime(TestApp).beginFresh(&app, (&app).agent(), .later, null);
 
     const first = try session_runtime.makeAssistantTurn(alloc, "first", "one");
     defer session_runtime.freeHistoryTurn(alloc, first);
@@ -9677,7 +10188,7 @@ test "handle-free conversation result is externalized before live commit" {
     defer app.deinit();
     try configureTestPreferences(&app);
     try Runtime(TestApp).initializePersistence(&app, (&app).agent(), true);
-    try Runtime(TestApp).beginFreshPersistedSession(&app, (&app).agent());
+    try Runtime(TestApp).beginFresh(&app, (&app).agent(), .later, null);
     var calls = [_]types.ToolCall{.{
         .id = "missing-artifact",
         .name = "shell",
@@ -9784,6 +10295,76 @@ test "appendFinishedPrompt transfers snapshot ownership after history acceptance
     try std.testing.expectEqual(@as(usize, 1), probe.transfers);
 }
 
+test "appendFinishedPrompt gives the worker the turn it committed, with its snapshot files and the history limit" {
+    const alloc = std.testing.allocator;
+    var app = try TestApp.init(alloc, "/tmp/workspace");
+    defer app.deinit();
+    var probe = SnapshotOwnershipProbe{};
+
+    try Runtime(TestApp).appendFinishedPrompt(&app, (&app).agent(), .{
+        .turn = .{ .assistant = .{
+            .user = .{ .text = @constCast("inspect") },
+            .assistant = @constCast("done"),
+        } },
+        .snapshot_file_ownership = probe.handle(),
+    });
+
+    const worker = &app.agent().worker;
+    try std.testing.expectEqual(@as(usize, 1), worker.acknowledgements_with_turn);
+    try std.testing.expectEqual(@as(usize, 0), worker.acknowledgements_without_turn);
+    try std.testing.expectEqualStrings("done", worker.acknowledged_answer.?);
+    try std.testing.expect(worker.acknowledged_ownership);
+    try std.testing.expectEqual(@as(usize, 8), worker.acknowledged_history_limit);
+}
+
+test "appendFinishedPrompt acknowledges a turn it could not commit without the turn" {
+    const alloc = testing_allocator.no_resize;
+    var app = try TestApp.init(alloc, "/tmp/workspace");
+    defer app.deinit();
+    var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
+    app.alloc = failing.allocator();
+    defer app.alloc = alloc;
+
+    try std.testing.expectError(
+        error.OutOfMemory,
+        Runtime(TestApp).appendFinishedPrompt(&app, (&app).agent(), .{
+            .turn = .{ .assistant = .{
+                .user = .{ .text = @constCast("inspect") },
+                .assistant = @constCast("done"),
+            } },
+        }),
+    );
+
+    // Nothing was added to history, so the worker is not told of a turn, and
+    // the mail it holds for the commit still goes on.
+    const worker = &app.agent().worker;
+    try std.testing.expectEqual(@as(usize, 0), worker.acknowledgements_with_turn);
+    try std.testing.expectEqual(@as(usize, 1), worker.acknowledgements_without_turn);
+}
+
+test "a visual epoch commit acknowledges with its turn, and one that did not commit acknowledges nothing" {
+    const alloc = testing_allocator.no_resize;
+    var app = try TestApp.init(alloc, "/tmp/workspace");
+    defer app.deinit();
+    const finished: types.FinishedPrompt = .{ .turn = .{ .assistant = .{
+        .user = .{ .text = @constCast("inspect") },
+        .assistant = @constCast("done"),
+    } } };
+
+    try std.testing.expectEqual(HistoryAppendOutcome.committed, try Runtime(TestApp).appendFinishedPromptForVisualEpoch(&app, (&app).agent(), finished));
+    const worker = &app.agent().worker;
+    try std.testing.expectEqual(@as(usize, 1), worker.acknowledgements_with_turn);
+    try std.testing.expectEqualStrings("done", worker.acknowledged_answer.?);
+
+    // The pacer keeps a turn that did not commit, and commits it later.
+    var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
+    app.alloc = failing.allocator();
+    defer app.alloc = alloc;
+    try std.testing.expectEqual(HistoryAppendOutcome.uncommitted, try Runtime(TestApp).appendFinishedPromptForVisualEpoch(&app, (&app).agent(), finished));
+    try std.testing.expectEqual(@as(usize, 1), worker.acknowledgements_with_turn);
+    try std.testing.expectEqual(@as(usize, 0), worker.acknowledgements_without_turn);
+}
+
 test "appendFinishedPrompt does not transfer snapshot ownership when history insertion fails" {
     const alloc = testing_allocator.no_resize;
     var app = try TestApp.init(alloc, "/tmp/workspace");
@@ -9830,7 +10411,7 @@ test "appendFinishedPrompt keeps the session alive when the turn cannot be saved
 
     try configureTestPreferences(&app);
     try Runtime(TestApp).initializePersistence(&app, (&app).agent(), true);
-    try Runtime(TestApp).beginFreshPersistedSession(&app, (&app).agent());
+    try Runtime(TestApp).beginFresh(&app, (&app).agent(), .later, null);
 
     // A finished turn whose file evidence carries an empty path: the
     // conversation validator rejects the write with InvalidConversationEvent.
@@ -9873,6 +10454,127 @@ test "appendFinishedPrompt keeps the session alive when the turn cannot be saved
     try std.testing.expectEqualStrings("next", restored.history[0].assistant.user.text);
 }
 
+/// Saves each workspace capture as a real item named by `label` and its
+/// phase, such as `A-start`, so a test can read which turn holds it.
+const CaptureLabelRecorder = struct {
+    var label: []const u8 = "";
+
+    fn record(context: turn_capture.Context, turn: session_adapter.Session.CaptureTurn, phase: @import("../workspace/capture_store.zig").Phase, lock: *std.Io.Mutex, trigger_tool: ?[]const u8, skip: ?@import("../workspace/workspace_capture.zig").Reason) void {
+        _ = .{ trigger_tool, skip };
+        var buf: [64]u8 = undefined;
+        const payload = std.mem.print(&buf, "{{\"capture\":\"{s}-{t}\"}}", .{ label, phase }) catch return;
+        lock.lockUncancelable(io_mod.getIo());
+        defer lock.unlock(io_mod.getIo());
+        _ = context.session.saveWorkspaceCapture(turn, payload, switch (phase) {
+            .start => .start,
+            .end => .end,
+        }) catch {};
+    }
+};
+
+test "the app commits each finished prompt with the capture token it carries, even when two turns end before the first commit" {
+    if (comptime !turn_capture.supported) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const paths = try testPaths(alloc, &tmp);
+    defer {
+        alloc.free(paths.home);
+        alloc.free(paths.workspace);
+    }
+    const home = try TestHome.install(alloc, paths.home);
+    defer home.deinit();
+    var app = try TestApp.init(alloc, paths.workspace);
+    defer app.deinit();
+    try configureTestPreferences(&app);
+    try Runtime(TestApp).initializePersistence(&app, (&app).agent(), true);
+    try Runtime(TestApp).beginFresh(&app, (&app).agent(), .later, null);
+    const persistence = &app.agent().session_persistence;
+    const v2 = persistence.v2.?;
+    const captures = &persistence.turn_capture;
+    captures.recorder = &CaptureLabelRecorder.record;
+    const context: turn_capture.Context = .{ .session = v2, .home = "/nonexistent-fx-test-home", .path = paths.workspace, .alloc = std.heap.c_allocator };
+
+    // Prompt A's answer is still paced when B arrives as steering after A's
+    // end capture, and C after B's, before the UI commits A. The worker sets
+    // each finished prompt's token from its end capture.
+    const prompts = [_][]const u8{ "A", "B", "C" };
+    var finished: [prompts.len]types.FinishedPrompt = undefined;
+    var turns: [prompts.len]types.HistoryTurn = undefined;
+    var made: usize = 0;
+    defer for (turns[0..made]) |turn| session_runtime.freeHistoryTurn(alloc, turn);
+    for (prompts, &finished, &turns, 0..) |name, *prompt, *turn, index| {
+        captures.begin(context, index == 0);
+        CaptureLabelRecorder.label = name;
+        captures.start(context, &persistence.write_mutex);
+        const token = captures.end(context, &persistence.write_mutex).?;
+        turn.* = try session_runtime.makeAssistantTurn(alloc, name, "ok");
+        made += 1;
+        prompt.* = .{ .turn = turn.*, .capture_turn = @backingInt(token) };
+    }
+    for (finished) |prompt| try Runtime(TestApp).appendFinishedPrompt(&app, (&app).agent(), prompt);
+
+    // A's captures were dropped when C began, so A's commit writes none;
+    // B and C each write their own, never the next turn's.
+    const log_path = try std.Io.Dir.path.join(alloc, &.{ v2.store.home, ".fx", "sessions", "v2", v2.id(), "log.jsonl" });
+    defer alloc.free(log_path);
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, log_path, alloc, .limited(1 << 20));
+    defer alloc.free(bytes);
+    var owner: [prompts.len]usize = @splat(0);
+    var committed: usize = 0;
+    var pending: [prompts.len]bool = @splat(false);
+    var lines = std.mem.splitScalar(u8, bytes, '\n');
+    while (lines.next()) |line| {
+        if (std.mem.find(u8, line, "turn_committed") != null) {
+            committed += 1;
+            for (&pending, &owner) |*held, *turn| if (held.*) {
+                turn.* = committed;
+                held.* = false;
+            };
+        } else if (std.mem.find(u8, line, "turn_interrupted") != null) {
+            pending = @splat(false);
+        } else if (std.mem.find(u8, line, "workspace_capture") != null) {
+            for (prompts, &pending) |name, *held| {
+                var needle_buf: [8]u8 = undefined;
+                if (std.mem.find(u8, line, try std.mem.print(&needle_buf, "{s}-", .{name})) != null) held.* = true;
+            }
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 3), committed);
+    try std.testing.expectEqual([_]usize{ 0, 2, 3 }, owner);
+}
+
+test "an app agent's captures stop for its cancel, not for a steer that interrupts the model" {
+    const App = struct {
+        main_agent: struct {
+            worker: worker_runtime.WorkerRuntime = .{},
+        } = .{},
+    };
+    const alloc = std.testing.allocator;
+    var app: App = .{};
+    const worker = &app.main_agent.worker;
+    defer worker.deinit(alloc);
+    const flag = Runtime(App).captureCancelFlag(&app.main_agent).?;
+    try std.testing.expect(worker.beginDirectProcessing(41));
+    // A follow-up typed during the start capture interrupts the model, but
+    // the capture keeps running.
+    try worker.admitInteractivePrompt(alloc, .{
+        .prompt = try alloc.dupe(u8, "follow-up"),
+        .images = &.{},
+        .model = try alloc.dupe(u8, "model"),
+        .api_key = try alloc.dupe(u8, "key"),
+        .permission_mode = .auto,
+        .history = try alloc.alloc(types.HistoryTurn, 0),
+        .grants = try alloc.alloc(types.PermissionGrant, 0),
+    });
+    try std.testing.expect(worker.isCancelRequested());
+    try std.testing.expect(!flag.load(.seq_cst));
+    // The user's Ctrl+C stops it.
+    worker.requestInteractiveCancel();
+    try std.testing.expect(flag.load(.seq_cst));
+    worker.finishProcessing();
+}
+
 test "visual epoch history append reports committed without persistence" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -9912,7 +10614,7 @@ test "appendHistoryTurn preserves canonical turns above the context limit" {
     try configureTestPreferences(&app);
     app.agent().session.max_history_turns = 2;
     try Runtime(TestApp).initializePersistence(&app, (&app).agent(), true);
-    try Runtime(TestApp).beginFreshPersistedSession(&app, (&app).agent());
+    try Runtime(TestApp).beginFresh(&app, (&app).agent(), .later, null);
 
     const users = [_][]const u8{ "one", "two", "three" };
     const assistants = [_][]const u8{ "first", "second", "third" };
@@ -9966,7 +10668,7 @@ test "session picker reopen keeps the loaded page visible while refreshing" {
     } }};
     const cached_session_id = try writeSessionFixture(&app, &history);
     defer alloc.free(cached_session_id);
-    try Runtime(TestApp).beginFreshPersistedSession(&app, (&app).agent());
+    try Runtime(TestApp).beginFresh(&app, (&app).agent(), .later, null);
 
     try Runtime(TestApp).openSessionPicker(&app, (&app).agent());
     try waitForSessionPickerLoad(&app);
@@ -10091,7 +10793,7 @@ test "session picker loads on demand and shares one catalog across workspace vie
     } }};
     const prewarmed_session_id = try writeSessionFixture(&app, &history);
     defer alloc.free(prewarmed_session_id);
-    try Runtime(TestApp).beginFreshPersistedSession(&app, (&app).agent());
+    try Runtime(TestApp).beginFresh(&app, (&app).agent(), .later, null);
 
     try std.testing.expect(!app.agent().session_persistence.session_picker_cache.ready);
     try std.testing.expect(app.agent().session_persistence.session_picker_load.task == null);
@@ -10129,7 +10831,7 @@ test "session picker reuses a held catalog after resize and workspace switch" {
         defer app.deinit();
         try configureTestPreferences(&app);
         try Runtime(TestApp).initializePersistence(&app, (&app).agent(), true);
-        try Runtime(TestApp).beginFreshPersistedSession(&app, (&app).agent());
+        try Runtime(TestApp).beginFresh(&app, (&app).agent(), .later, null);
         try app.input_runtime.edit_state.input.appendSlice(alloc, "saved");
 
         const loader = &app.agent().session_persistence.session_picker_load;
@@ -10202,7 +10904,7 @@ test "session picker keeps the visible scope when a stale catalog completes" {
     defer app.deinit();
     try configureTestPreferences(&app);
     try Runtime(TestApp).initializePersistence(&app, (&app).agent(), true);
-    try Runtime(TestApp).beginFreshPersistedSession(&app, (&app).agent());
+    try Runtime(TestApp).beginFresh(&app, (&app).agent(), .later, null);
 
     var all_catalog: session_catalog_cache.ActionableSessionCatalog = .{};
     defer all_catalog.deinit(catalog_alloc);
@@ -10292,7 +10994,7 @@ test "session picker current mode filters workspace and all mode includes every 
         alloc.free(try writeSessionFixture(&app_b, &history_b));
     }
 
-    try Runtime(TestApp).beginFreshPersistedSession(&app, (&app).agent());
+    try Runtime(TestApp).beginFresh(&app, (&app).agent(), .later, null);
     try Runtime(TestApp).openSessionPicker(&app, (&app).agent());
     try waitForSessionPickerLoad(&app);
     const picker = &app.agent().session_persistence.session_picker;
@@ -10466,7 +11168,7 @@ test "session picker discards a held stale request after cancellation and reopen
     } }};
     const reopened_session_id = try writeSessionFixture(&app, &history);
     defer alloc.free(reopened_session_id);
-    try Runtime(TestApp).beginFreshPersistedSession(&app, (&app).agent());
+    try Runtime(TestApp).beginFresh(&app, (&app).agent(), .later, null);
 
     var picker = &app.agent().session_persistence.session_picker;
     picker.active = true;
@@ -10536,7 +11238,7 @@ test "session picker source invalidation discards a finished catalog and pending
     defer app.deinit();
     try configureTestPreferences(&app);
     try Runtime(TestApp).initializePersistence(&app, (&app).agent(), true);
-    try Runtime(TestApp).beginFreshPersistedSession(&app, (&app).agent());
+    try Runtime(TestApp).beginFresh(&app, (&app).agent(), .later, null);
 
     const loader = &app.agent().session_persistence.session_picker_load;
     const active_id = app.agent().session_persistence.v2.?.id();
@@ -10570,7 +11272,7 @@ test "session picker reports worker failure when the shared stop flag is set" {
     defer app.deinit();
     try configureTestPreferences(&app);
     try Runtime(TestApp).initializePersistence(&app, (&app).agent(), true);
-    try Runtime(TestApp).beginFreshPersistedSession(&app, (&app).agent());
+    try Runtime(TestApp).beginFresh(&app, (&app).agent(), .later, null);
 
     const loader = &app.agent().session_persistence.session_picker_load;
     const generation = loader.allocateGeneration();
@@ -10727,7 +11429,7 @@ test "new session releases the old writer and replaces the subagent host" {
     defer app.deinit();
     try configureTestPreferences(&app);
     try Runtime(TestApp).initializePersistence(&app, (&app).agent(), true);
-    try Runtime(TestApp).beginFreshPersistedSession(&app, (&app).agent());
+    try Runtime(TestApp).beginFresh(&app, (&app).agent(), .later, null);
     Runtime(TestApp).enableSessionStores(&app, (&app).agent());
 
     const old_id = try alloc.dupe(
@@ -10735,7 +11437,7 @@ test "new session releases the old writer and replaces the subagent host" {
         app.agent().session_persistence.v2.?.id(),
     );
     defer alloc.free(old_id);
-    try Runtime(TestApp).beginFreshPersistedSession(&app, (&app).agent());
+    try Runtime(TestApp).beginFresh(&app, (&app).agent(), .later, null);
     Runtime(TestApp).enableSessionStores(&app, (&app).agent());
     try std.testing.expect(!std.mem.eql(
         u8,
@@ -10847,7 +11549,7 @@ test "renameActiveSession saves the title with the session" {
 
     try configureTestPreferences(&app);
     try Runtime(TestApp).initializePersistence(&app, (&app).agent(), true);
-    try Runtime(TestApp).beginFreshPersistedSession(&app, (&app).agent());
+    try Runtime(TestApp).beginFresh(&app, (&app).agent(), .later, null);
     Runtime(TestApp).enableSessionStores(&app, (&app).agent());
     const turn = try session_runtime.makeAssistantTurn(alloc, "question", "answer");
     defer session_runtime.freeHistoryTurn(alloc, turn);
@@ -11337,7 +12039,7 @@ test "a failed history delivery is kept for shutdown, and later turns still save
     defer app.deinit();
     try configureTestPreferences(&app);
     try Runtime(TestApp).initializePersistence(&app, (&app).agent(), true);
-    try Runtime(TestApp).beginFreshPersistedSession(&app, (&app).agent());
+    try Runtime(TestApp).beginFresh(&app, (&app).agent(), .later, null);
     Runtime(TestApp).recordShutdownFailure((&app).agent(), error.InputOutput);
     const turn = try session_runtime.makeAssistantTurn(alloc, "request", "answer");
     defer session_runtime.freeHistoryTurn(alloc, turn);
@@ -11347,4 +12049,62 @@ test "a failed history delivery is kept for shutdown, and later turns still save
     var restored = try reopenSaved(&app);
     defer restored.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 1), restored.history.len);
+}
+
+test "a live session switch drops the finishes it holds, so a later report is not held" {
+    const App = struct {
+        alloc: Allocator = std.heap.c_allocator,
+        main_agent: struct {
+            worker: worker_runtime.WorkerRuntime = .{},
+        } = .{},
+        pacer: @import("../../ui/assistant/pacer.zig").AssistantPacer = .{},
+
+        pub fn agent(self: anytype) @TypeOf(&self.main_agent) {
+            return &self.main_agent;
+        }
+    };
+    const alloc = std.testing.allocator;
+    var app: App = .{};
+    defer app.pacer.deinit(app.alloc);
+    defer app.agent().worker.deinit(alloc);
+    const worker = &app.agent().worker;
+    worker.enableCommitGate();
+
+    // Turn A's finish is in the pacer, and turn B's finish is still queued.
+    const turn: types.HistoryTurn = .{ .assistant = .{ .user = .{ .text = @constCast("prompt") }, .assistant = @constCast("answer") } };
+    try worker.pushEvent(alloc, .{ .finish_prompt = .{ .turn = turn } });
+    var taken = worker.takeEvents();
+    for (taken.items) |event| worker_runtime.freeWorkerEvent(alloc, event);
+    taken.deinit(alloc);
+    try app.pacer.enqueue(app.alloc, "still showing");
+    try std.testing.expect(try app.pacer.deferFinish(app.alloc, .{ .turn = turn }));
+    try worker.pushEvent(alloc, .{ .finish_prompt = .{ .turn = turn } });
+    try std.testing.expectEqual(@as(u32, 2), worker.unacknowledged_finishes);
+
+    // The switch cancels (and clears the pacer), then drops the queued events.
+    Runtime(App).beginLiveSessionCancellation(&app, (&app).agent());
+    try std.testing.expect(app.pacer.deferred_turn == null);
+    try std.testing.expectEqual(@as(u32, 1), worker.unacknowledged_finishes);
+    worker.discardEvents(alloc);
+    try std.testing.expectEqual(@as(u32, 0), worker.unacknowledged_finishes);
+
+    // The new session's first turn finishes and is committed, and a report missed it.
+    worker.worker_processing = true;
+    worker.active_turn_id = 9;
+    worker.direct_steering_closed = true;
+    try worker.pushEvent(alloc, .{ .finish_prompt = .{ .turn = turn } });
+    try worker.postMail(alloc, .{
+        .prompt = try alloc.dupe(u8, "a report"),
+        .images = &.{},
+        .model = try alloc.dupe(u8, "test-model"),
+        .api_key = try alloc.dupe(u8, "test-key"),
+        .permission_mode = .auto,
+        .history = try alloc.alloc(types.HistoryTurn, 0),
+        .grants = try alloc.alloc(types.PermissionGrant, 0),
+    });
+    worker.finishProcessing();
+    worker.acknowledgeFinishCommitted();
+    const work = (try worker.tryTakeNextWork(alloc)) orelse return error.TestExpectedReportToStart;
+    defer worker_runtime.freeWorkItem(alloc, work);
+    try std.testing.expectEqualStrings("a report", work.prompt.prompt);
 }
