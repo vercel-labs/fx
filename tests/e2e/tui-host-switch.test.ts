@@ -11,6 +11,7 @@ import {
   startDynamicFakeGateway,
   fakeGatewayFinalText,
   composerContains,
+  hasEmptyComposer,
   TmuxSession,
   tmuxAvailable,
 } from "./tmux-helpers";
@@ -1368,7 +1369,8 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         await showAgent(session, "reviewer");
         await session.waitForComposer(15_000);
         await session.sendText("SWITCH_JOINED_LINE tell main the deploy is off");
-        await session.waitForText("SWITCH_JOINED_LINE", 15_000);
+        // The composer empties only once fx has taken the line.
+        await session.waitForPane((pane) => pane.includes("SWITCH_JOINED_LINE") && hasEmptyComposer(pane), 15_000);
         release();
         await until(() => frames.joined !== undefined, 30_000);
       });

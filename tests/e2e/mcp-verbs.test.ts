@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { runFx } from "../evals/eval-helpers";
 import { logLines, onlySessionId } from "./saved-sessions";
-import { fakeGatewayFinalText, heldFakeGatewayFinalText, startDynamicFakeGateway, startFakeGateway, TmuxSession, tmuxAvailable } from "./tmux-helpers";
+import { fakeGatewayFinalText, hasEmptyComposer, heldFakeGatewayFinalText, startDynamicFakeGateway, startFakeGateway, TmuxSession, tmuxAvailable } from "./tmux-helpers";
 
 // `fx mcp`. Sign-in is covered in mcp-auth.test.ts.
 
@@ -743,7 +743,8 @@ describe("/mcp in the shell", () => {
       // While the turn runs, another fx removes the server and a prompt is sent.
       expect((await mcp(root, "remove", "slow")).code).toBe(0);
       await tui.sendText("second prompt");
-      await tui.waitForText("second prompt", 10_000);
+      // The composer empties only once fx has taken the prompt.
+      await tui.waitForPane((pane) => pane.includes("second prompt") && hasEmptyComposer(pane), 10_000);
       // A removed server stops within about 1.5 s; this one keeps running.
       for (let i = 0; i < 50; i++) {
         expect(isRunning(pid)).toBe(true);
