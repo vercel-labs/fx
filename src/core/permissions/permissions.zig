@@ -1113,6 +1113,13 @@ pub fn ruleDecisionForPermissionPattern(rules: types.PermissionRuleSet, permissi
     return evaluateRuleset(rules.rules, permission, pattern) orelse fallback;
 }
 
+/// The permission rules every MCP path uses for an agent running in `mode`: none in full access, the
+/// host's `rules` otherwise. Each reader passes the mode of the agent that uses the tool. The model is
+/// tests/tla/mcp_host/McpRules.tla (`FullAccessIgnoresRules`, `DenyHoldsOutside`, `PathsAgree`).
+pub fn mcpRules(mode: types.PermissionMode, rules: types.PermissionRuleSet) types.PermissionRuleSet {
+    return if (mode == .yolo) .{} else rules;
+}
+
 pub fn rulesDenyAllTargetsForPermission(rules: types.PermissionRuleSet, permission: []const u8) bool {
     return rulesDenyAllTargetsForPermissionAndTool(rules, permission, null);
 }
@@ -2375,6 +2382,22 @@ test "displayTargetForPolicy renders workspace-relative paths and command cwd" {
     const unknown = try displayTargetForPolicy(alloc, "/tmp/workspace", "/tmp/workspace/src/app.zig", .none);
     defer alloc.free(unknown);
     try std.testing.expectEqualStrings("/tmp/workspace/src/app.zig", unknown);
+}
+
+test "mcpRules gives no rules in full access and the host's rules in every other mode" {
+    var rules_buf = [_]types.PermissionRule{
+        .{ .permission = @constCast("mcp_fixture_echo"), .pattern = @constCast("*"), .action = .deny },
+    };
+    const rules: types.PermissionRuleSet = .{ .rules = rules_buf[0..] };
+
+    try std.testing.expectEqual(@as(usize, 0), mcpRules(.yolo, rules).rules.len);
+    for ([_]types.PermissionMode{ .ask, .auto }) |mode| {
+        const used = mcpRules(mode, rules);
+        try std.testing.expectEqual(@as(usize, 1), used.rules.len);
+        try std.testing.expect(rulesDenyAllTargetsForPermission(used, "mcp_fixture_echo"));
+    }
+    // Full access sees no denial of a tool the rules name.
+    try std.testing.expect(!rulesDenyAllTargetsForPermission(mcpRules(.yolo, rules), "mcp_fixture_echo"));
 }
 
 test "ruleDecisionForPermissionPattern matches direct inputs and fallback" {
