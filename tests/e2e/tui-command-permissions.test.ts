@@ -2257,10 +2257,7 @@ describe("effect-aware command permissions", () => {
         .filter(Boolean)
         .map((line) => JSON.parse(line) as { type: string; [field: string]: unknown });
 
-      // Screen rows wrap at the terminal's width, and each row is masked on
-      // its own, so a token that wraps across two rows is not covered here.
       for (const record of records) {
-        if (record.type === "renderer_state") continue;
         expect(JSON.stringify(record)).not.toContain("AAAAAA");
       }
 
@@ -2280,6 +2277,260 @@ describe("effect-aware command permissions", () => {
 
       expect(readFileSync(stderrPath, "utf8")).toBe("");
 
+      await activeSession.sendText("/quit");
+      expect(await activeSession.waitForSessionEnd()).toBe(true);
+      await activeSession.kill();
+      activeSession = null;
+    },
+    180_000,
+  );
+
+  test.skipIf(!tmuxAvailable())(
+    "TUI trace keeps no part of a secret that the screen wraps",
+    async () => {
+      const root = createIsolatedRoot();
+      const stderrPath = join(root.root, "stderr.log");
+      writeFileSync(stderrPath, "");
+      installClipboardFixture(root, "#!/bin/sh\nexit 1\n");
+      // Fake secrets wider than the 50-column screen, so fx wraps each one
+      // across rows: in command output, in prose, and in a table cell. Each
+      // place has its own secret, and each secret has its own letter, so no
+      // piece of one secret can match another place's value.
+      const token = "ghp_" + "A".repeat(80);
+      const bearer = "Bearer " + "D".repeat(80);
+      const assignment = "API_KEY=" + "E".repeat(80);
+      const proseToken = "sk-" + "B".repeat(80);
+      const tableToken = "github_pat_" + "C".repeat(80);
+      const runs = ["AAAAAA", "BBBBBB", "CCCCCC", "DDDDDD", "EEEEEE"];
+      const rootPrompt = "Run the wrapped secret fixture.";
+      const answer = [
+        `The token is ${proseToken} here.`,
+        "",
+        "| name | value |",
+        "| --- | --- |",
+        `| key | ${tableToken} |`,
+        "",
+        "wrapped secrets done",
+      ].join("\n");
+      const gateway = startDynamicFakeGateway(async (body) => {
+        if (!body.includes(rootPrompt)) return finalText("unexpected request");
+        if (!body.includes('"toolCallId":"trace_wrap_echo"')) {
+          return toolCall(
+            `echo '${token}'; echo 'Authorization: ${bearer}'; echo '${assignment}'`,
+            {},
+            "trace_wrap_echo",
+          );
+        }
+        return finalText(answer);
+      });
+
+      activeSession = await TmuxSession.create({
+        cmd: FX_BIN,
+        cwd: root.workspace,
+        env: gatewayEnv(root, gateway, {
+          PATH: hostilePath(root),
+          TMPDIR: root.root,
+          FX_PERMISSION_MODE: "yolo",
+          FX_TRACE: "0",
+          FX_TRACE_LOG: undefined,
+          FX_TRACE_STDERR: "0",
+        }),
+        stderrPath,
+        width: 50,
+        height: 40,
+      });
+      await activeSession.waitForComposer(TIMEOUT);
+      await activeSession.sendText(rootPrompt);
+      await activeSession.waitForText("wrapped secrets done", 120_000);
+      // The prose and the table are on screen in pieces: no row holds a whole
+      // secret. The command output is folded once the turn ends, and its
+      // entries keep the rows it was wrapped into.
+      const screen = await activeSession.capturePane();
+      expect(runs.some((run) => screen.includes(run))).toBe(true);
+      for (const secret of [token, bearer, assignment, proseToken, tableToken]) {
+        expect(screen).not.toContain(secret);
+      }
+
+      await activeSession.sendText("/trace");
+      await activeSession.waitForText(
+        process.platform === "darwin" ? "Clipboard copy failed" : "Trace saved at",
+        TIMEOUT,
+      );
+      const records = readFileSync(latestTraceReportPath(root.root), "utf8")
+        .split("\n")
+        .filter(Boolean)
+        .map((line) => JSON.parse(line) as { type: string; [field: string]: unknown });
+
+      const renderer = records.find((record) => record.type === "renderer_state") as
+        | { shadow_grid?: { visible_rows?: Array<{ row: number; text: string }> } }
+        | undefined;
+      const rows = renderer?.shadow_grid?.visible_rows ?? [];
+      expect(rows.length).toBeGreaterThan(0);
+      for (const run of runs) {
+        const leaks = rows.filter((row) => row.text.includes(run)).map((row) => row.text);
+        expect(leaks).toEqual([]);
+      }
+      for (const record of records) {
+        for (const run of runs) {
+          expect(JSON.stringify(record)).not.toContain(run);
+        }
+      }
+      // Ordinary screen text stays.
+      const shown = rows.map((row) => row.text).join("\n");
+      expect(shown).toContain("wrapped secrets done");
+      expect(shown).toContain("name");
+      expect(shown).toContain("The token is");
+
+      await activeSession.sendText("/quit");
+      expect(await activeSession.waitForSessionEnd()).toBe(true);
+      await activeSession.kill();
+      activeSession = null;
+    },
+    180_000,
+  );
+
+  test.skipIf(!tmuxAvailable())(
+    "TUI trace writes every screen row as redacted past 1024 secrets",
+    async () => {
+      const root = createIsolatedRoot();
+      const stderrPath = join(root.root, "stderr.log");
+      writeFileSync(stderrPath, "");
+      installClipboardFixture(root, "#!/bin/sh\nexit 1\n");
+      // More distinct secrets than the trace keeps (1024). Each is "ghp_" and
+      // 36 characters: the index in base 36, padded with A's, so none repeats.
+      const tokens = Array.from({ length: 1100 }, (_, index) =>
+        "ghp_" + index.toString(36).padStart(36, "A"),
+      );
+      const rootPrompt = "Print the many secrets fixture.";
+      const answer = [...tokens, "many secrets done"].join("\n");
+      const gateway = startDynamicFakeGateway(async (body) => {
+        if (!body.includes(rootPrompt)) return finalText("unexpected request");
+        return finalText(answer);
+      });
+
+      activeSession = await TmuxSession.create({
+        cmd: FX_BIN,
+        cwd: root.workspace,
+        env: gatewayEnv(root, gateway, {
+          PATH: hostilePath(root),
+          TMPDIR: root.root,
+          FX_PERMISSION_MODE: "yolo",
+          FX_TRACE: "0",
+          FX_TRACE_LOG: undefined,
+          FX_TRACE_STDERR: "0",
+        }),
+        stderrPath,
+        width: 80,
+        height: 30,
+      });
+      await activeSession.waitForComposer(TIMEOUT);
+      await activeSession.sendText(rootPrompt);
+      await activeSession.waitForText("many secrets done", 120_000);
+
+      await activeSession.sendText("/trace");
+      await activeSession.waitForText(
+        process.platform === "darwin" ? "Clipboard copy failed" : "Trace saved at",
+        TIMEOUT,
+      );
+      const records = readFileSync(latestTraceReportPath(root.root), "utf8")
+        .split("\n")
+        .filter(Boolean)
+        .map((line) => JSON.parse(line) as { type: string; [field: string]: unknown });
+
+      const renderer = records.find((record) => record.type === "renderer_state") as
+        | { shadow_grid?: { visible_rows?: Array<{ row: number; text: string }> } }
+        | undefined;
+      const rows = renderer?.shadow_grid?.visible_rows ?? [];
+      expect(rows.length).toBeGreaterThan(0);
+      expect(rows.filter((row) => row.text !== "[redacted]")).toEqual([]);
+
+      await activeSession.sendText("/quit");
+      expect(await activeSession.waitForSessionEnd()).toBe(true);
+      await activeSession.kill();
+      activeSession = null;
+    },
+    180_000,
+  );
+
+  test.skipIf(!tmuxAvailable())(
+    "TUI trace keeps no part of a secret in command output while the command runs",
+    async () => {
+      const root = createIsolatedRoot();
+      const stderrPath = join(root.root, "stderr.log");
+      writeFileSync(stderrPath, "");
+      installClipboardFixture(root, "#!/bin/sh\nexit 1\n");
+      // The command prints a token wider than the screen, then waits for the
+      // gate file this test creates after /trace, so /trace runs while its
+      // output is still live however slow the runner is.
+      const tail = "A".repeat(80);
+      const token = "ghp_" + tail;
+      const gate = join(root.workspace, "trace-go");
+      const rootPrompt = "Run the long secret command.";
+      const gateway = startDynamicFakeGateway(async (body) => {
+        if (!body.includes(rootPrompt)) return finalText("unexpected request");
+        if (!body.includes('"toolCallId":"trace_running_echo"')) {
+          return toolCall(
+            `echo '${token}'; while [ ! -e '${gate}' ]; do sleep 0.1; done`,
+            {},
+            "trace_running_echo",
+          );
+        }
+        return finalText("running done");
+      });
+
+      activeSession = await TmuxSession.create({
+        cmd: FX_BIN,
+        cwd: root.workspace,
+        env: gatewayEnv(root, gateway, {
+          PATH: hostilePath(root),
+          TMPDIR: root.root,
+          FX_PERMISSION_MODE: "yolo",
+          FX_TRACE: "0",
+          FX_TRACE_LOG: undefined,
+          FX_TRACE_STDERR: "0",
+        }),
+        stderrPath,
+        width: 50,
+        height: 40,
+      });
+      await activeSession.waitForComposer(TIMEOUT);
+      await activeSession.sendText(rootPrompt);
+      await activeSession.waitForText("AAAAAA", 120_000);
+
+      await activeSession.sendText("/trace");
+      await activeSession.waitForText(
+        process.platform === "darwin" ? "Clipboard copy failed" : "Trace saved at",
+        TIMEOUT,
+      );
+      const records = readFileSync(latestTraceReportPath(root.root), "utf8")
+        .split("\n")
+        .filter(Boolean)
+        .map((line) => JSON.parse(line) as { type: string; [field: string]: unknown });
+      for (const record of records) {
+        expect(JSON.stringify(record)).not.toContain("AAAAAA");
+      }
+
+      // A turn was live when /trace ran, and the call had no finished tool_call
+      // record yet. The trace has no record that names an in-flight call by its
+      // call_id, so the finished-call record is the one this checks is absent.
+      expect(
+        records.some(
+          (record) => record.type === "problem" && record.kind === "active_turn" && record.processing === true,
+        ),
+      ).toBe(true);
+      expect(
+        records.filter((record) => record.type === "tool_call" && record.call_id === "trace_running_echo"),
+      ).toEqual([]);
+      // The live output was on screen, and its rows are written as [redacted].
+      const renderer = records.find((record) => record.type === "renderer_state") as
+        | { shadow_grid?: { visible_rows?: Array<{ row: number; text: string }> } }
+        | undefined;
+      const rows = renderer?.shadow_grid?.visible_rows ?? [];
+      expect(rows.some((row) => row.text.includes("[redacted]"))).toBe(true);
+
+      // The checks above ran while the command waited, so let it finish now.
+      writeFileSync(gate, "");
+      await activeSession.waitForText("running done", 120_000);
       await activeSession.sendText("/quit");
       expect(await activeSession.waitForSessionEnd()).toBe(true);
       await activeSession.kill();
