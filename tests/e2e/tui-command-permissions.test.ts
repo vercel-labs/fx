@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
+import { processAlive } from "./process-alive";
 import {
   execFileSync,
   spawn as nodeSpawn,
@@ -3017,14 +3018,14 @@ describe("effect-aware command permissions", () => {
           expect(fixture.tcsetpgrp_attempted).toBe(false);
           expect(fixture.tcsetpgrp_succeeded).toBe(false);
           foregroundFxRow(ttyPath, binary);
-          process.kill(fixture.pid, 0);
+          expect(processAlive(fixture.pid)).toBe(true);
 
           // `exec` drops out of the short form; the script's name stays.
           await activeSession.waitForText("Running python3 terminal-session-fixture.py", TIMEOUT);
           await activeSession.sendLiteralText("q");
           await activeSession.waitForPane((pane) => pane.includes("┃ q"), TIMEOUT);
           foregroundFxRow(ttyPath, binary);
-          process.kill(fixture.pid, 0);
+          expect(processAlive(fixture.pid)).toBe(true);
           await activeSession.sendKeys("C-u");
         } finally {
           writeFileSync(releasePath, "release\n");
