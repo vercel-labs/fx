@@ -36,6 +36,7 @@ const authority_mod = @import("authority.zig");
 const tool_dispatch = @import("../tooling/tool_dispatch.zig");
 const tool_host = @import("tool_host.zig");
 const child_state = @import("child_state.zig");
+const turn_capture = @import("../workspace/turn_capture.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -74,6 +75,9 @@ pub const Config = struct {
     context_enabled: bool,
     project_context: []const u8 = "",
     lifecycle_view: hooks.RuntimeView = hooks.RuntimeView.empty(),
+    /// The parent's capture target while `experimental.workspace_capture` is
+    /// on; the child's own session receives its captures (D98).
+    workspace_capture: ?turn_capture.Target = null,
 };
 
 const Context = struct {
@@ -218,11 +222,16 @@ pub fn run(
         .subagent_id = trace_context.subagent_id,
     };
     defer if (context.refreshed_credential) |*credential| credential.deinit(turn.alloc);
+    turn.workspace_capture = config.workspace_capture;
+    turn.capture_cancel = cancel;
     turn.beginTurn() catch |err| {
         if (err == error.OutOfMemory) return error.OutOfMemory;
         turn.setFailureDiagnostic("turn_open_failed", @errorName(err));
         return error.ProviderFailed;
     };
+    // The child has done work in this run, whatever its replies report: the
+    // run's `subagents` result lists it (`usage_ledger.zig`).
+    if (turn.child_id) |child_id| try config.host.noteChildTurnStarted(child_id, turn.child_name);
     const history = turn.sessionRuntime().snapshotHistory(arena) catch return error.OutOfMemory;
     const prompt = worker_runtime.QueuedPrompt{
         .turn_id = trace_context.turn_id,
@@ -508,6 +517,8 @@ fn runtimeDeps(context: *Context) agent_runtime.AgentRuntimeDeps {
         .execute_tool_call = executeToolCall,
         .publish_committed_file_handoff = publishCommittedFileHandoff,
         .propagate_history_turn = propagateHistoryTurn,
+        .start_workspace_capture = if (context.turn.capturesWorkspace()) startWorkspaceCapture else null,
+        .reach_workspace = if (context.turn.capturesWorkspace()) reachWorkspace else null,
         .commit_context_compaction = .{ .commit = commitContextCompaction },
         .propagate_grant = discardGrant,
         .emit_event = emitLiveEvent,
@@ -516,6 +527,16 @@ fn runtimeDeps(context: *Context) agent_runtime.AgentRuntimeDeps {
         .report_usage = reportUsage,
         .record_usage = recordUsage,
     };
+}
+
+fn startWorkspaceCapture(raw: *anyopaque, fresh: bool, step: agent_runtime.AgentRuntimeDeps.WorkspaceCaptureStep) void {
+    const context: *Context = @ptrCast(@alignCast(raw));
+    context.turn.startWorkspaceCapture(fresh, step);
+}
+
+fn reachWorkspace(raw: *anyopaque, dir: []const u8, tool_name: []const u8) void {
+    const context: *Context = @ptrCast(@alignCast(raw));
+    context.turn.reachWorkspace(dir, tool_name);
 }
 
 fn availableModelCapabilities(raw: *anyopaque, model: []const u8) model_capabilities.Capabilities {
@@ -985,6 +1006,9 @@ fn reportUsage(raw: *anyopaque, usage: types.Usage) void {
 /// own (D92). The parent's total leaves the child's out.
 fn recordUsage(raw: *anyopaque, usage: types.Usage) !void {
     const context: *Context = @ptrCast(@alignCast(raw));
+    // The reply was billed whether or not it is saved, so the run's result
+    // counts it first (`usage_ledger.zig`).
+    if (context.turn.child_id) |child_id| context.config.host.noteChildUsage(child_id, usage);
     // A hosted run has no session here; its own agent saves its usage.
     const child = context.turn.child orelse return;
     try child.recordUsage(usage);

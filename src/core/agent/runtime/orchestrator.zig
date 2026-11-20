@@ -154,19 +154,18 @@ fn malformedToolCallFeedback(arena: Allocator, attempt: usize, tool_name: ?[]con
     );
 }
 
-/// What fx shows for a malformed tool call: that it asks the model again, or,
-/// once the feedback is spent, that the turn failed and the next step is the
-/// user's.
-fn malformedToolCallNotice(arena: Allocator, failed: bool) ![]const u8 {
-    if (!failed) return try arena.print(
-        "The model's tool call could not be read (provider reason: {s}). {s}",
-        .{ types.malformed_function_call_reason, malformed_tool_call_asking },
-    );
-    return try arena.print(
-        "The model's tool call could not be read {d} times in a row (provider reason: {s}). {s}",
-        .{ malformed_tool_call_max_feedbacks + 1, types.malformed_function_call_reason, empty_reply_follow_up },
-    );
-}
+/// What fx shows when it asks the model again after a malformed tool call.
+const malformed_tool_call_retry_notice = std.fmt.comptimePrint(
+    "The model's tool call could not be read (provider reason: {s}). {s}",
+    .{ types.malformed_function_call_reason, malformed_tool_call_asking },
+);
+
+/// What fx shows once the feedback is spent: the turn failed, and the next
+/// step is the user's.
+const malformed_tool_call_failed_notice = std.fmt.comptimePrint(
+    "The model's tool call could not be read {d} times in a row (provider reason: {s}). {s}",
+    .{ malformed_tool_call_max_feedbacks + 1, types.malformed_function_call_reason, empty_reply_follow_up },
+);
 
 /// The tool a malformed reply's call named, when it is one fx knows; a name
 /// the provider made up stays out of the feedback.
@@ -191,11 +190,11 @@ test "malformed tool call feedback names the tool, then asks for smaller calls" 
     );
     try std.testing.expectEqualStrings(
         "The model's tool call could not be read (provider reason: MALFORMED_FUNCTION_CALL). Asking it to try again.",
-        try malformedToolCallNotice(arena, false),
+        malformed_tool_call_retry_notice,
     );
     try std.testing.expectEqualStrings(
         "The model's tool call could not be read 3 times in a row (provider reason: MALFORMED_FUNCTION_CALL). Continue with a follow-up prompt if needed.",
-        try malformedToolCallNotice(arena, true),
+        malformed_tool_call_failed_notice,
     );
 }
 
@@ -4192,6 +4191,32 @@ fn checkpointToolState(
     };
 }
 
+/// Saves the turn's user message through `append_turn_piece` before its
+/// start capture (D98). A resumed turn is already on disk, so callers skip
+/// it. A failed write is traced and left to the turn's later writes, which
+/// write every piece the session lacks, and never fails the turn.
+fn persistPromptBeforeCapture(
+    deps: *const AgentRuntimeDeps,
+    finalization: *TurnFinalizationGuard,
+    job: QueuedPrompt,
+    current_turn_messages: []const ChatMessage,
+) void {
+    const append = deps.append_turn_piece orelse return;
+    var scratch = std.heap.ArenaAllocator.init(std.heap.c_allocator);
+    defer mem_utils.deinit_arena(scratch);
+    const arena = scratch.allocator();
+    const saved = saved: {
+        const execution = runtime_execution_memory.buildExecutionMemory(arena, current_turn_messages) catch |err| break :saved err;
+        const projected = finalization.persistedExecution(arena, execution) catch |err| break :saved err;
+        append(deps.ctx, .{
+            .user = .{ .text = @constCast(job.prompt), .images = job.images, .work_id = job.work_id, .author = job.author },
+            .execution = projected,
+        }) catch |err| break :saved err;
+        return;
+    };
+    debug_trace.logf("session", "event=prompt_before_capture_unsaved err={s}", .{@errorName(saved)});
+}
+
 /// Hands the model's tool calls to `append_turn_piece` before any of them
 /// runs (D28). Execution memory holds only finished exchanges, so the calls
 /// travel apart, in the form a finished step saves them, with the text of
@@ -5637,6 +5662,31 @@ fn loadJobCredential(
     return credential_renewal.load(deps, alloc, jobSignIn(job), mode, rejected_token, trace_ctx);
 }
 
+/// A request that waits for a sign-in asks the host about once a second for a
+/// stored login other than the one the provider refused: another fx process
+/// that signs in saves one, and the request then resends with it instead of
+/// waiting for its own sign-in or its next try (`tests/e2e/tui-auth-source-selection.test.ts`
+/// "a sign-in finished in one session continues another session waiting for it").
+const StoredSignInWatch = struct {
+    deps: *const AgentRuntimeDeps,
+    sign_in: credential_renewal.SignIn,
+    /// The caller's own copy: a host can free its key while it loads.
+    rejected: []const u8,
+    trace_ctx: TraceContext,
+
+    fn renewed(raw: *anyopaque) bool {
+        const self: *StoredSignInWatch = @ptrCast(@alignCast(raw));
+        const stored = credential_renewal.load(self.deps, std.heap.c_allocator, self.sign_in, .stored, self.rejected, self.trace_ctx) catch |err| {
+            debug_trace.eventf("gateway", "stored_sign_in_check_failed", self.trace_ctx, "err={s}", .{@errorName(err)});
+            return false;
+        };
+        const credential = stored orelse return false;
+        credential_renewal.free(std.heap.c_allocator, credential);
+        debug_trace.eventf("gateway", "stored_sign_in_found", self.trace_ctx, "source={s}", .{if (self.sign_in.source) |source| @tagName(source) else "none"});
+        return true;
+    }
+};
+
 fn jobSignIn(job: QueuedPrompt) credential_renewal.SignIn {
     return .{ .source = job.credential_source, .account_id = job.account_id };
 }
@@ -6694,6 +6744,17 @@ fn processQueuedPromptInner(
             job.images = images;
         }
     }
+    // The repository as the turn found it, before any request or tool
+    // (D98). The prompt reaches the session first: the capture can take
+    // seconds, and a process killed during it must keep the prompt.
+    if (deps.start_workspace_capture) |start| {
+        const fresh = !job.delivery.isSteering();
+        start(deps.ctx, fresh, .begin);
+        if (fresh and !resumed_request and job.recovery_checkpoint == null) {
+            persistPromptBeforeCapture(deps, finalization, job, within_turn_suffix.items);
+        }
+        start(deps.ctx, fresh, .capture);
+    }
 
     const current_user_message: ChatMessage = .{
         .role = .user,
@@ -7372,7 +7433,14 @@ const CompactionProgress = struct {
     before_summary: ?BeforeSummary,
 
     fn interface(self: *CompactionProgress) compactor.Progress {
-        return .{ .context = self, .report_fn = report };
+        return .{ .context = self, .report_fn = report, .written_fn = written };
+    }
+
+    fn written(context: *anyopaque, percent: u8) void {
+        const self: *CompactionProgress = @ptrCast(@alignCast(context));
+        const id = self.operation_id orelse return;
+        const effect = self.deps.compaction_activity orelse return;
+        if (effect.written) |write| write(self.deps.ctx, id, percent);
     }
 
     fn report(context: *anyopaque, step: compactor.Step) anyerror!void {
@@ -8702,6 +8770,7 @@ fn processQueuedPromptLoop(
                     };
                     defer summary_model.deinit();
                     var compaction_failure: ?compaction_activity.ErrorProvenance = null;
+                    const compaction_started_ms = io_mod.milliTimestamp();
                     const compaction_result = compactContext(arena, deps, .{
                         .activity_origin = if (overflow_pending) .provider_overflow else .automatic,
                         .failure_provenance = &compaction_failure,
@@ -8717,6 +8786,9 @@ fn processQueuedPromptLoop(
                             .trace_ctx = step_ctx,
                         },
                     });
+                    // The turn's duration leaves out the compaction, as its
+                    // live clock does.
+                    summary_accumulator.addCompaction(compaction_started_ms, io_mod.milliTimestamp());
                     // A summary request the provider rejected with 401 renewed
                     // the sign-in; the rest of the turn sends the renewed one.
                     // Taken first: renewing can free the credential the turn
@@ -9468,6 +9540,14 @@ fn processQueuedPromptLoop(
                         http_failure_notice_shown = true;
                         if (kind == .sign_in) auth_reason_shown = true;
                     }
+                    var stored_sign_in: StoredSignInWatch = undefined;
+                    const watched_rejected = if (kind == .sign_in) try std.heap.c_allocator.dupe(u8, active_api_key) else null;
+                    defer if (watched_rejected) |token| secret.zeroAndFree(std.heap.c_allocator, token);
+                    if (watched_rejected) |token| {
+                        stored_sign_in = .{ .deps = deps, .sign_in = jobSignIn(job), .rejected = token, .trace_ctx = step_ctx };
+                        request_recovery.sign_in_renewed = .{ .ctx = &stored_sign_in, .check = StoredSignInWatch.renewed };
+                    }
+                    defer request_recovery.sign_in_renewed = null;
                     switch (try waitForUser(&request_recovery, deps, kind)) {
                         .resend => {
                             stream_result.deinit(arena);
@@ -9744,12 +9824,12 @@ fn processQueuedPromptLoop(
                                 &summary_accumulator,
                                 stop_state,
                                 &finish_trace,
-                                try malformedToolCallNotice(arena, true),
+                                malformed_tool_call_failed_notice,
                                 "malformed_tool_call",
                             );
                             return;
                         }
-                        try deps.emit(.{ .text = .{ .operational = try malformedToolCallNotice(arena, false) } });
+                        try deps.emit(.{ .text = .{ .operational = malformed_tool_call_retry_notice } });
                         try deps.emit(.{ .text = .{ .operational = "\n" } });
                         // The feedback stays in the turn, so a later request
                         // in it still explains the earlier stall.
@@ -11103,7 +11183,7 @@ fn processQueuedPromptLoop(
                         parallel_call.id,
                         parallel_review_attempt_available,
                     );
-                    if (parallel_preserved_review_hold != null) {
+                    if (parallel_preserved_review_hold) |hold| {
                         debug_trace.eventf(
                             "permission",
                             "turn_permission_denial_preserved",
@@ -11111,6 +11191,7 @@ fn processQueuedPromptLoop(
                             "call_id={s} tool_name={s}",
                             .{ parallel_call.id, parallel_call.name },
                         );
+                        tooling_tool_admission.recordReusedReviewHold(parallel_call, hold, config.origin == .subagent);
                     }
                     const maybe_parallel_permission: ?command_admission.PermissionOutcome = if (parallel_preserved_review_hold) |outcome|
                         outcome
@@ -12088,6 +12169,10 @@ fn processQueuedPromptLoop(
                     .{ tool_call.id, tool_call.name },
                 );
             }
+            // The review hold decides the call only when nothing before it does.
+            if (live_target_failure == null and preserved_denial == null) {
+                if (preserved_review_hold) |hold| tooling_tool_admission.recordReusedReviewHold(execution_call, hold, config.origin == .subagent);
+            }
             const maybe_permission: ?command_admission.PermissionOutcome = if (live_target_failure) |failure|
                 .{ .tool_failure = failure }
             else if (effective_preserved_denial) |outcome|
@@ -12468,7 +12553,12 @@ fn processQueuedPromptLoop(
                 );
             }
 
-            if (decision == .always and live_authority == null) {
+            // An "always" answer keeps its grants whoever asked. A subagent's
+            // live authority reads its instance's grants at every call, so the
+            // grants kept here are what its next call, its siblings, and main
+            // find (`src/core/agent/runtime/tests/tool_flow.zig`, "a subagent's
+            // always approval of a command stores the session grant").
+            if (decision == .always) {
                 if (execution_authority == .file_mutation) {
                     const offer = execution_authority.file_mutation.grant_offer orelse
                         return error.MissingToolExecutionAuthority;
