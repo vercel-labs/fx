@@ -58,6 +58,7 @@ const host_attachments = @import("../core/hosts/host_attachments.zig");
 const image_attachments = @import("../core/images/image_attachments.zig");
 const libfx_steering = @import("libfx_steering.zig");
 const prompt_line = @import("prompt_line.zig");
+const connection = @import("connection.zig");
 const journal_events = @import("../core/agent/runtime/journal.zig");
 const libfx_journal = @import("libfx_journal.zig");
 const sh_fx = @import("sh_fx.zig");
@@ -401,15 +402,18 @@ const ActivePrompt = struct {
     session: *ActiveSessionState,
     alloc: Allocator,
     msg: jsonrpc.Message,
+    /// The connection that sent the prompt this turn runs; its answer goes there. A turn
+    /// of steers has no prompt of its own: each steer's answer goes to that steer's sender.
+    from: ConnectionId = no_connection,
     /// Mode and permission policy captured when the prompt was dispatched.
     /// Mid-turn mode changes apply to the next prompt, never the running one.
     mode: []const u8,
     permission_mode: types.PermissionMode,
-    /// The request ids of the steers that started the running turn together,
-    /// each answered with `next_turn`. Empty for a turn a prompt started.
+    /// The steers that started the running turn together, each with its sender,
+    /// answered with `next_turn`. Empty for a turn a prompt started.
     /// Owned by `alloc`. The worker replaces `msg` and these between turns
     /// while it holds the session's `waiting_prompts` mutex.
-    group_ids: []jsonrpc.RequestId = &.{},
+    group_ids: []libfx_steering.Sender = &.{},
     thread: if (host_target.is_wasm) void else std.Thread = if (host_target.is_wasm) {} else undefined,
     reapable: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 };
@@ -469,6 +473,8 @@ pub const ServerState = struct {
     alloc: Allocator,
     cfg: Config,
     writer: jsonrpc.Writer,
+    /// This connection's id, which its waiting input carries (see `ConnectionId`).
+    connection_id: ConnectionId = no_connection,
     initialized: bool = false,
     /// Selects fx's terminal or embedded base prompt for this connection.
     terminal_ui: bool = true,
@@ -1777,11 +1783,19 @@ const RunOptions = struct {
 const leader_supported = !host_target.is_wasm and (builtin.os.tag == .macos or builtin.os.tag == .linux);
 
 /// Whether a second connection can open a session of this process, so whether the
-/// follow code is compiled. A second connection exists only through the leader
-/// socket, which is served exactly where `leader_supported` holds, so the two
-/// gates are the same. WebAssembly has no socket and one connection; each follow-only
-/// entry returns at comptime when this is false, and the compiler drops its code.
-pub const follow_supported = leader_supported;
+/// follow code is compiled. Defined in `connection.zig`; each follow-only entry
+/// returns at comptime when it is false, and the compiler drops its code.
+pub const follow_supported = connection.follow_supported;
+
+comptime {
+    // A second connection exists only through the leader socket, so the two gates agree.
+    std.debug.assert(follow_supported == leader_supported);
+}
+
+const ConnectionId = connection.ConnectionId;
+const no_connection = connection.no_connection;
+const newConnectionId = connection.newConnectionId;
+const sameConnection = connection.sameConnection;
 
 pub fn run(alloc: Allocator, cfg: Config) !void {
     // One table for every connection this process serves. `runServer` closes its
@@ -1822,6 +1836,7 @@ fn runServer(
         .alloc = alloc,
         .cfg = cfg,
         .writer = writer_value,
+        .connection_id = newConnectionId(),
         .shared = options.shared,
         .leader_info = options.leader_info,
         .terminal_client = terminal_client_runtime.Runtime.init(
@@ -2595,20 +2610,24 @@ fn withdrawSessionRequest(
         session.waiting_prompts.lock();
         defer session.waiting_prompts.unlock();
         if (active.group_ids.len == 0) {
-            if (active.msg.id) |active_id| if (requestIdsEqual(active_id, requested)) break :outcome .stop_turn;
+            if (active.msg.id) |active_id| {
+                const same_connection = sameConnection(active.from, state.connection_id);
+                if (same_connection and requestIdsEqual(active_id, requested)) break :outcome .stop_turn;
+            }
         }
-        if (session.steering.withdrawRequest(state.alloc, requested) or
-            session.waiting_prompts.withdrawLocked(state.alloc, requested)) break :outcome .withdrawn;
+        if (session.steering.withdrawRequest(state.alloc, state.connection_id, requested) or
+            session.waiting_prompts.withdrawLocked(state.alloc, state.connection_id, requested)) break :outcome .withdrawn;
         break :outcome .none;
     };
     switch (outcome) {
         .stop_turn => handleCancel(state, session, true),
         .withdrawn => {
             debug_trace.logf("acp", "withdrew a prompt that hadn't run", .{});
-            state.writer.writeError(alloc, requested, .{
+            const answer: Answer = .{ .rpc_error = .{
                 .code = ErrorCode.request_cancelled,
                 .message = "Request cancelled",
-            }) catch |err| debug_trace.logf("acp", "failed to answer a withdrawn prompt err={s}", .{@errorName(err)});
+            } };
+            answerSender(session, alloc, state.connection_id, requested, .none, answer, answer) catch |err| debug_trace.logf("acp", "failed to answer a withdrawn prompt err={s}", .{@errorName(err)});
         },
         .none => return false,
     }
@@ -2778,10 +2797,10 @@ fn handleDeliveryPrompt(state: *ServerState, alloc: Allocator, msg: *const jsonr
         switch (delivery) {
             .none => break :result .in_progress,
             .steer => {
-                session.steering.enqueueRequest(state.alloc, text, msg.id) catch |err| switch (err) {
+                session.steering.enqueueRequest(state.alloc, text, msg.id, state.connection_id) catch |err| switch (err) {
                     error.SteeringNotActive => {
                         // The running turn stopped taking input: the steer runs next.
-                        line.addLateLocked(state.alloc, text, msg.id.?) catch |late_err| switch (late_err) {
+                        line.addLateLocked(state.alloc, text, msg.id.?, state.connection_id) catch |late_err| switch (late_err) {
                             error.OutOfMemory => return error.OutOfMemory,
                             error.SteeringQueueFull => break :result .{ .failed = .{
                                 .code = ErrorCode.invalid_request,
@@ -2808,7 +2827,7 @@ fn handleDeliveryPrompt(state: *ServerState, alloc: Allocator, msg: *const jsonr
                 break :result .{ .steered = session.steering.claimInterrupt(&session.cancel_flag) };
             },
             .queue => {
-                line.addQueuedLocked(state.alloc, queued.?) catch |err| switch (err) {
+                line.addQueuedLocked(state.alloc, queued.?, state.connection_id) catch |err| switch (err) {
                     error.OutOfMemory => return error.OutOfMemory,
                     error.PromptQueueFull => break :result .{ .failed = .{
                         .code = ErrorCode.invalid_request,
@@ -3457,6 +3476,7 @@ fn startPrompt(state: *ServerState, alloc: Allocator, msg: *const jsonrpc.Messag
         .session = session,
         .alloc = alloc,
         .msg = try cloneMessage(alloc, msg),
+        .from = state.connection_id,
         .mode = session.mode,
         .permission_mode = session.permission_mode,
     };
@@ -3693,12 +3713,14 @@ fn promptWorkerMain(active: *ActivePrompt) void {
 
         // The turn that just ended, answered below once the next one is chosen.
         var ended_msg = active.msg;
+        const ended_from = active.from;
         const ended_group = active.group_ids;
         defer {
             jsonrpc.freeMessage(active.alloc, &ended_msg);
-            freeRequestIds(active.alloc, ended_group);
+            freeSenderGroup(active.alloc, ended_group);
         }
         var cancelled_steers: []const libfx_steering.Steer = &.{};
+        var dropped_waiting: ?DroppedWaiting = null;
         const next = next: {
             const line = &session.waiting_prompts;
             line.lock();
@@ -3727,7 +3749,8 @@ fn promptWorkerMain(active: *ActivePrompt) void {
                     break :next waiting;
                 } else |err| {
                     debug_trace.logf("acp", "failed to start the next waiting turn err={s}", .{@errorName(err)});
-                    waiting.deinit(state.alloc);
+                    // Answered after the line unlocks: answering takes the audience lock.
+                    dropped_waiting = .{ .input = waiting, .err = err };
                 }
             };
             // The turn that ended owned `active.msg`; a withdrawal reads it
@@ -3739,8 +3762,12 @@ fn promptWorkerMain(active: *ActivePrompt) void {
             break :next null;
         };
 
-        publishTurnOutcome(active, ended_msg.id, ended_group, outcome, finished);
-        for (cancelled_steers) |steer| answerCancelled(state, steer.request_id);
+        publishTurnOutcome(active, ended_from, ended_msg.id, ended_group, outcome, finished);
+        for (cancelled_steers) |steer| answerCancelled(state, session, steer.from, steer.request_id);
+        if (dropped_waiting) |*dropped| {
+            answerDroppedWaiting(session, state.alloc, dropped);
+            dropped.input.deinit(state.alloc);
+        }
         if (next) |taken| {
             var waiting = taken;
             defer waiting.deinit(state.alloc);
@@ -3759,7 +3786,8 @@ fn promptWorkerMain(active: *ActivePrompt) void {
 fn startNextTurn(active: *ActivePrompt, session: *ActiveSessionState, waiting: *prompt_line.Next) !void {
     switch (waiting.*) {
         .prompt => |queued| {
-            active.msg = try cloneMessage(active.alloc, &queued);
+            active.msg = try cloneMessage(active.alloc, &queued.msg);
+            active.from = queued.from;
             active.group_ids = &.{};
         },
         .steers => |steers| {
@@ -3775,14 +3803,14 @@ fn startNextTurn(active: *ActivePrompt, session: *ActiveSessionState, waiting: *
                 try params.writer.writeByte('}');
             }
             try params.writer.writeAll("]}");
-            const ids = try active.alloc.alloc(jsonrpc.RequestId, steers.items.len);
+            const senders = try active.alloc.alloc(libfx_steering.Sender, steers.items.len);
             var copied: usize = 0;
             errdefer {
-                for (ids[0..copied]) |id| jsonrpc.freeRequestId(active.alloc, id);
-                active.alloc.free(ids);
+                for (senders[0..copied]) |sender| jsonrpc.freeRequestId(active.alloc, sender.id);
+                active.alloc.free(senders);
             }
-            for (steers.items, ids) |steer, *id| {
-                id.* = try jsonrpc.dupeRequestId(active.alloc, steer.request_id);
+            for (steers.items, senders) |steer, *sender| {
+                sender.* = .{ .id = try jsonrpc.dupeRequestId(active.alloc, steer.request_id), .from = steer.from };
                 copied += 1;
             }
             var msg: jsonrpc.Message = .{ .method = try active.alloc.dupe(u8, "session/prompt") };
@@ -3790,19 +3818,20 @@ fn startNextTurn(active: *ActivePrompt, session: *ActiveSessionState, waiting: *
             msg.id = try jsonrpc.dupeRequestId(active.alloc, steers.items[0].request_id);
             msg.params_raw = try params.toOwnedSlice();
             active.msg = msg;
-            active.group_ids = ids;
+            active.from = steers.items[0].from;
+            active.group_ids = senders;
         },
     }
 }
 
-fn freeRequestIds(alloc: Allocator, ids: []jsonrpc.RequestId) void {
-    for (ids) |id| jsonrpc.freeRequestId(alloc, id);
-    if (ids.len > 0) alloc.free(ids);
+fn freeSenderGroup(alloc: Allocator, senders: []libfx_steering.Sender) void {
+    libfx_steering.freeSenders(alloc, senders);
+    if (senders.len > 0) alloc.free(senders);
 }
 
 fn freeActivePrompt(active: *ActivePrompt) void {
     jsonrpc.freeMessage(active.alloc, &active.msg);
-    freeRequestIds(active.alloc, active.group_ids);
+    freeSenderGroup(active.alloc, active.group_ids);
     active.alloc.destroy(active);
 }
 
@@ -3901,62 +3930,94 @@ pub fn noteSteeringTool(active: *ActiveSessionState, call_id: []const u8, starte
 }
 
 /// Answers a turn that ended: the prompt that started it, or each steer that
-/// started it together (`next_turn`), and each steer it took (`absorbed`).
+/// started it together (`next_turn`), and each steer it took (`absorbed`). Each
+/// answer goes to the connection that sent its request, in the shape that
+/// connection lists.
 fn publishTurnOutcome(
     active: *ActivePrompt,
+    from: ConnectionId,
     owner: ?jsonrpc.RequestId,
-    group: []const jsonrpc.RequestId,
+    group: []const libfx_steering.Sender,
     outcome: prompt_handler.TerminalOutcome,
     finished: ?libfx_steering.Finished,
 ) void {
-    const lists_delivery = active.state.extensions.contains(.prompt_delivery);
     if (group.len == 0) {
-        publishPromptOutcome(active, owner, outcome) catch |err|
+        publishPromptOutcome(active, from, owner, outcome) catch |err|
             debug_trace.logf("acp", "failed to answer a prompt err={s}", .{@errorName(err)});
     }
-    for (group) |id| writeSteeringOutcome(active, id, outcome, if (lists_delivery) .next_turn else null) catch |err|
+    for (group) |sender| writeSteeringOutcome(active, sender, outcome, .next_turn) catch |err|
         debug_trace.logf("acp", "failed to answer a steer err={s}", .{@errorName(err)});
     const value = finished orelse return;
-    for (value.absorbed) |id| writeSteeringOutcome(active, id, outcome, if (lists_delivery) .absorbed else null) catch |err|
+    for (value.absorbed) |sender| writeSteeringOutcome(active, sender, outcome, .absorbed) catch |err|
         debug_trace.logf("acp", "failed to answer a steer err={s}", .{@errorName(err)});
 }
 
-fn publishPromptOutcome(active: *ActivePrompt, id: ?jsonrpc.RequestId, outcome: prompt_handler.TerminalOutcome) !void {
+fn publishPromptOutcome(active: *ActivePrompt, from: ConnectionId, id: ?jsonrpc.RequestId, outcome: prompt_handler.TerminalOutcome) !void {
     switch (outcome) {
         .stop_reason => |stop_reason| {
-            var response: std.Io.Writer.Allocating = .init(active.alloc);
-            defer response.deinit();
-            const usage = active.session.session_rt.agent.turn_usage;
-            try acp_types.writePromptResponseWithUsage(
-                &response.writer,
-                stop_reason,
-                usage,
-                active.session.turn_summary,
-                active.state.extensions.contains(.usage),
-            );
-            try active.state.writer.writeResponse(active.alloc, id, response.writer.buffered());
+            // Without `follow_supported` the owner is the only member, so only its own shape is built.
+            if (comptime !follow_supported) {
+                const body = try stopResponse(active, stop_reason, active.state.extensions.contains(.usage));
+                defer active.alloc.free(body);
+                return answerSender(active.session, active.alloc, from, id, .none, .{ .response = body }, .{ .response = body });
+            }
+            const with = try stopResponse(active, stop_reason, true);
+            defer active.alloc.free(with);
+            const without = try stopResponse(active, stop_reason, false);
+            defer active.alloc.free(without);
+            try answerSender(active.session, active.alloc, from, id, .{ .extension = .usage }, .{ .response = with }, .{ .response = without });
         },
-        .rpc_error => |rpc_error| {
-            try active.state.writer.writeError(active.alloc, id, rpc_error);
-        },
+        .rpc_error => |rpc_error| try answerSender(active.session, active.alloc, from, id, .none, .{ .rpc_error = rpc_error }, .{ .rpc_error = rpc_error }),
     }
+}
+
+/// The response to a turn's stop. `usage` says whether the member lists `.usage`,
+/// which adds the turn's timing as `_meta`. The caller frees the result.
+fn stopResponse(active: *ActivePrompt, stop_reason: acp_types.StopReason, usage: bool) ![]u8 {
+    var response: std.Io.Writer.Allocating = .init(active.alloc);
+    defer response.deinit();
+    try acp_types.writePromptResponseWithUsage(
+        &response.writer,
+        stop_reason,
+        active.session.session_rt.agent.turn_usage,
+        active.session.turn_summary,
+        usage,
+    );
+    return response.toOwnedSlice();
 }
 
 fn writeSteeringOutcome(
     active: *ActivePrompt,
-    id: jsonrpc.RequestId,
+    sender: libfx_steering.Sender,
     outcome: prompt_handler.TerminalOutcome,
-    delivery: ?acp_types.SteeringDelivery,
+    delivery: acp_types.SteeringDelivery,
 ) !void {
     switch (outcome) {
         .stop_reason => |stop_reason| {
-            var response: std.Io.Writer.Allocating = .init(active.alloc);
-            defer response.deinit();
-            try acp_types.writeSteeringPromptResponse(&response.writer, stop_reason, delivery);
-            try active.state.writer.writeResponse(active.alloc, id, response.written());
+            // Without `follow_supported` the owner is the only member: the delivery is in its response only when it lists `.prompt_delivery`.
+            if (comptime !follow_supported) {
+                const delivery_shown: ?acp_types.SteeringDelivery = if (active.state.extensions.contains(.prompt_delivery)) delivery else null;
+                const body = try steerResponse(active, stop_reason, delivery_shown);
+                defer active.alloc.free(body);
+                return answerSender(active.session, active.alloc, sender.from, sender.id, .none, .{ .response = body }, .{ .response = body });
+            }
+            // A member that lists `.prompt_delivery` takes the delivery; the others take the response without it.
+            const with = try steerResponse(active, stop_reason, delivery);
+            defer active.alloc.free(with);
+            const without = try steerResponse(active, stop_reason, null);
+            defer active.alloc.free(without);
+            try answerSender(active.session, active.alloc, sender.from, sender.id, .{ .extension = .prompt_delivery }, .{ .response = with }, .{ .response = without });
         },
-        .rpc_error => |rpc_error| try active.state.writer.writeError(active.alloc, id, rpc_error),
+        .rpc_error => |rpc_error| try answerSender(active.session, active.alloc, sender.from, sender.id, .none, .{ .rpc_error = rpc_error }, .{ .rpc_error = rpc_error }),
     }
+}
+
+/// The response to a steer's turn stop, with its delivery when given. The caller frees the result.
+fn steerResponse(active: *ActivePrompt, stop_reason: acp_types.StopReason, delivery: ?acp_types.SteeringDelivery) ![]u8 {
+    var response: std.Io.Writer.Allocating = .init(active.alloc);
+    defer response.deinit();
+    try acp_types.writeSteeringPromptResponse(&response.writer, stop_reason, delivery);
+    return response.toOwnedSlice();
 }
 
 /// Joins `session`'s worker once it marked itself reapable, or, with
@@ -4921,8 +4982,8 @@ pub fn cancelAndReapPrompt(state: *ServerState, session: *ActiveSessionState) vo
             break :drained session.waiting_prompts.drainLocked();
         };
         defer drained.deinit(state.alloc);
-        for (drained.late.items) |steer| answerCancelled(state, steer.request_id);
-        for (drained.queue.items) |queued| if (queued.id) |id| answerCancelled(state, id);
+        for (drained.late.items) |steer| answerCancelled(state, session, steer.from, steer.request_id);
+        for (drained.queue.items) |queued| if (queued.msg.id) |id| answerCancelled(state, session, queued.from, id);
     }
     handleCancel(state, session, true);
     reapSessionPrompt(session, true);
@@ -4931,12 +4992,117 @@ pub fn cancelAndReapPrompt(state: *ServerState, session: *ActiveSessionState) vo
     session.waiting_prompts.unlock();
 }
 
-/// Answers a prompt that never ran with `-32800`.
-fn answerCancelled(state: *ServerState, id: jsonrpc.RequestId) void {
-    state.writer.writeError(state.alloc, id, .{
+/// Answers a prompt that never ran with `-32800`, to the connection that sent it.
+fn answerCancelled(state: *ServerState, session: *ActiveSessionState, from: ConnectionId, id: jsonrpc.RequestId) void {
+    const answer: Answer = .{ .rpc_error = .{
         .code = ErrorCode.request_cancelled,
         .message = "Request cancelled",
-    }) catch |err| debug_trace.logf("acp", "failed to answer a prompt that never ran err={s}", .{@errorName(err)});
+    } };
+    answerSender(session, state.alloc, from, id, .none, answer, answer) catch |err| debug_trace.logf("acp", "failed to answer a prompt that never ran err={s}", .{@errorName(err)});
+}
+
+/// The answer to a client's prompt or steer: a response, or an error.
+const Answer = union(enum) {
+    response: []const u8,
+    rpc_error: jsonrpc.RpcError,
+};
+
+/// Input a turn never ran: the queued prompt or the steers that waited when the next
+/// turn failed to start, and the error that stopped it.
+const DroppedWaiting = struct {
+    input: prompt_line.Next,
+    err: anyerror,
+};
+
+/// Writes `answer` to the connection that sent request `id`: the owner, `session.server`,
+/// or the follower in `session.followers` with that connection id. A member that takes
+/// `need` gets `with`, the others get `without`. Without `follow_supported` there is one
+/// connection, the owner, and the caller built the owner's body, which both `with` and
+/// `without` hold: it goes straight to the owner's writer, and its error is returned.
+/// Otherwise the audience lock keeps the members still during the write. An error writing
+/// to a follower drops that follower, as `Audience.dropFollower` does, and is traced; the
+/// answer is lost and the turn goes on. An error writing to the owner is returned. A
+/// follower whose writer has stopped is dropped after its write, as `Audience.writeNotification`
+/// drops it, because its answer is lost too. When no member has the sender's id, the sender
+/// has left: nothing is written, and the drop is traced.
+fn answerSender(
+    session: *ActiveSessionState,
+    alloc: Allocator,
+    from: ConnectionId,
+    id: ?jsonrpc.RequestId,
+    need: RunningCopy.Need,
+    with: Answer,
+    without: Answer,
+) !void {
+    // Without `follow_supported` the owner is the only member, and the caller built its
+    // body into both `with` and `without`, so either one is the owner's.
+    if (comptime !follow_supported) return writeAnswer(&session.server.writer, alloc, id, if (memberTakes(session.server, need)) with else without);
+    var audience = lockAudience(session);
+    defer audience.unlock();
+    if (sameConnection(session.server.connection_id, from)) {
+        return writeAnswer(&session.server.writer, alloc, id, if (memberTakes(session.server, need)) with else without);
+    }
+    for (session.followers.items) |member| {
+        if (!sameConnection(member.connection_id, from)) continue;
+        writeAnswer(&member.writer, alloc, id, if (memberTakes(member, need)) with else without) catch |err| {
+            traceDroppedAnswer(session, id, "write_failed", err);
+            audience.dropFollower(member, "session/prompt", .{ .write_failed = err });
+            return;
+        };
+        if (Audience.memberStopped(member)) {
+            traceDroppedAnswer(session, id, "client_gone", null);
+            audience.dropFollower(member, "session/prompt", .client_gone);
+        }
+        return;
+    }
+    traceDroppedAnswer(session, id, "sender_left", null);
+}
+
+fn writeAnswer(writer: *jsonrpc.Writer, alloc: Allocator, id: ?jsonrpc.RequestId, answer: Answer) !void {
+    switch (answer) {
+        .response => |body| try writer.writeResponse(alloc, id, body),
+        .rpc_error => |rpc_error| try writer.writeError(alloc, id, rpc_error),
+    }
+}
+
+/// Answers the input a turn never ran, when the next turn failed to start: each queued
+/// prompt and steer goes to the connection that sent it, with `-32603` and the error
+/// name, the code a failed turn answers with. The caller frees `dropped`.
+fn answerDroppedWaiting(session: *ActiveSessionState, alloc: Allocator, dropped: *const DroppedWaiting) void {
+    switch (dropped.input) {
+        .steers => |steers| {
+            for (steers.items) |steer| answerWaitingInput(session, alloc, steer.from, steer.request_id, dropped.err);
+        },
+        .prompt => |queued| answerWaitingInput(session, alloc, queued.from, queued.msg.id, dropped.err),
+    }
+}
+
+fn answerWaitingInput(session: *ActiveSessionState, alloc: Allocator, from: ConnectionId, id: ?jsonrpc.RequestId, err: anyerror) void {
+    var buf: [32]u8 = undefined;
+    debug_trace.logf("acp", "event=waiting_input_dropped session={s} request={s} reason={s}", .{ session.session_id, requestText(id, &buf), @errorName(err) });
+    const answer: Answer = .{ .rpc_error = .{ .code = ErrorCode.internal_error, .message = @errorName(err) } };
+    answerSender(session, alloc, from, id, .none, answer, answer) catch |write_err|
+        debug_trace.logf("acp", "failed to answer waiting input err={s}", .{@errorName(write_err)});
+}
+
+/// A request id as a trace shows it: its number or text, `none` without one. `buf` holds a number.
+fn requestText(id: ?jsonrpc.RequestId, buf: []u8) []const u8 {
+    const request = id orelse return "none";
+    return switch (request) {
+        .integer => |value| std.mem.print(buf, "{d}", .{value}) catch "?",
+        .string => |text| text,
+        .null => "none",
+    };
+}
+
+/// Traces an answer that was not written. `reason` says why; `err` is the write error, if any.
+fn traceDroppedAnswer(session: *const ActiveSessionState, id: ?jsonrpc.RequestId, reason: []const u8, err: ?anyerror) void {
+    var buf: [32]u8 = undefined;
+    if (err) |value| {
+        debug_trace.logf("acp", "event=answer_dropped session={s} request={s} reason={s} err={s}", .{ session.session_id, requestText(id, &buf), reason, @errorName(value) });
+        return;
+    }
+    debug_trace.logf("acp", "event=answer_dropped session={s} request={s} reason={s}", .{ session.session_id, requestText(id, &buf), reason });
 }
 
 /// Handles `session/close`. Closing an open session stops its turn and closes it, and closing a
@@ -6539,4 +6705,299 @@ test "a session is in the shared table until it closes, and a follower is droppe
     const trace = try readTraceFile(alloc, trace_path);
     defer alloc.free(trace);
     try std.testing.expect(std.mem.find(u8, trace, "event=follower_dropped session=session_shared reason=session_closed") != null);
+}
+
+/// Captures the bytes one connection writes, for the answer tests.
+const AnswerWire = struct {
+    alloc: Allocator,
+    bytes: std.ArrayList(u8) = .empty,
+
+    fn write(raw: ?*anyopaque, frame: []const u8) anyerror!void {
+        const self: *AnswerWire = @ptrCast(@alignCast(raw.?));
+        try self.bytes.appendSlice(self.alloc, frame);
+    }
+
+    fn deinit(self: *AnswerWire) void {
+        self.bytes.deinit(self.alloc);
+    }
+};
+
+/// Opens a session on `owner` and lists `follower` as its member, so an answer
+/// can reach either connection.
+fn openAnswerSession(alloc: Allocator, owner: *ServerState, follower: *ServerState) !*ActiveSessionState {
+    owner.cfg.provider_set = @import("../core/gateway/provider_set.zig").gateway_only(test_builtin_gateway.provider_bundle);
+    const session = try openSession(owner, .{
+        .session_id = try alloc.dupe(u8, "session_answers"),
+        .model = try alloc.dupe(u8, "test-model"),
+        .mode = "normal",
+        .workspace_root = &.{},
+        .api_key = &.{},
+        .agent_step_limit = 4,
+        .max_tool_result_bytes = 1024 * 1024,
+        .fast_mode = false,
+        .effort = .auto,
+        .first_call_tool_choice = .auto,
+        .permission_mode = .ask,
+        .permission_rules = .{},
+        .session_rt = .{ .max_history_turns = 8 },
+        .cancel_flag = std.atomic.Value(bool).init(false),
+        .pending_prompt_id = null,
+    }, null);
+    try session.followers.append(alloc, follower);
+    return session;
+}
+
+/// A turn that a prompt sent by connection `from` started, as the worker holds it.
+fn answerTestPrompt(owner: *ServerState, session: *ActiveSessionState, from: ConnectionId) ActivePrompt {
+    return .{
+        .state = owner,
+        .session = session,
+        .alloc = owner.alloc,
+        .msg = .{ .method = "session/prompt", .id = .{ .integer = 7 } },
+        .from = from,
+        .mode = "normal",
+        .permission_mode = .ask,
+    };
+}
+
+test "a queued prompt's answer is written on the connection that sent it, not on the owner's" {
+    const alloc = std.testing.allocator;
+    var owner_wire = AnswerWire{ .alloc = alloc };
+    defer owner_wire.deinit();
+    var follower_wire = AnswerWire{ .alloc = alloc };
+    defer follower_wire.deinit();
+    const launch_root = try alloc.dupe(u8, "/tmp/workspace");
+    var state = ServerState{
+        .alloc = alloc,
+        .cfg = undefined,
+        .writer = jsonrpc.Writer.initCallback(&owner_wire, AnswerWire.write),
+        .launch = .{ .root = launch_root },
+        .connection_id = 1,
+    };
+    defer state.deinit();
+    var follower = ServerState{
+        .alloc = alloc,
+        .cfg = undefined,
+        .writer = jsonrpc.Writer.initCallback(&follower_wire, AnswerWire.write),
+        .connection_id = 2,
+    };
+    const session = try openAnswerSession(alloc, &state, &follower);
+    const owner_before = owner_wire.bytes.items.len;
+
+    var active = answerTestPrompt(&state, session, 2);
+    publishTurnOutcome(&active, 2, .{ .integer = 7 }, &.{}, .{ .stop_reason = .end_turn }, null);
+
+    try std.testing.expectEqual(owner_before, owner_wire.bytes.items.len);
+    try std.testing.expect(std.mem.find(u8, follower_wire.bytes.items, "\"id\":7") != null);
+}
+
+test "a steer's outcome is written on the connection that sent the steer" {
+    const alloc = std.testing.allocator;
+    var owner_wire = AnswerWire{ .alloc = alloc };
+    defer owner_wire.deinit();
+    var follower_wire = AnswerWire{ .alloc = alloc };
+    defer follower_wire.deinit();
+    const launch_root = try alloc.dupe(u8, "/tmp/workspace");
+    var state = ServerState{
+        .alloc = alloc,
+        .cfg = undefined,
+        .writer = jsonrpc.Writer.initCallback(&owner_wire, AnswerWire.write),
+        .launch = .{ .root = launch_root },
+        .connection_id = 1,
+    };
+    defer state.deinit();
+    var follower = ServerState{
+        .alloc = alloc,
+        .cfg = undefined,
+        .writer = jsonrpc.Writer.initCallback(&follower_wire, AnswerWire.write),
+        .connection_id = 2,
+    };
+    const session = try openAnswerSession(alloc, &state, &follower);
+    const owner_before = owner_wire.bytes.items.len;
+
+    var active = answerTestPrompt(&state, session, 1);
+    const steers = [_]libfx_steering.Sender{.{ .id = .{ .integer = 9 }, .from = 2 }};
+    publishTurnOutcome(&active, 1, null, &steers, .{ .stop_reason = .end_turn }, null);
+
+    try std.testing.expectEqual(owner_before, owner_wire.bytes.items.len);
+    try std.testing.expect(std.mem.find(u8, follower_wire.bytes.items, "\"id\":9") != null);
+}
+
+test "an answer to a connection that has left the session is dropped, and no connection gets it" {
+    const alloc = std.testing.allocator;
+    var owner_wire = AnswerWire{ .alloc = alloc };
+    defer owner_wire.deinit();
+    var follower_wire = AnswerWire{ .alloc = alloc };
+    defer follower_wire.deinit();
+    const launch_root = try alloc.dupe(u8, "/tmp/workspace");
+    var state = ServerState{
+        .alloc = alloc,
+        .cfg = undefined,
+        .writer = jsonrpc.Writer.initCallback(&owner_wire, AnswerWire.write),
+        .launch = .{ .root = launch_root },
+        .connection_id = 1,
+    };
+    defer state.deinit();
+    var follower = ServerState{
+        .alloc = alloc,
+        .cfg = undefined,
+        .writer = jsonrpc.Writer.initCallback(&follower_wire, AnswerWire.write),
+        .connection_id = 2,
+    };
+    const session = try openAnswerSession(alloc, &state, &follower);
+    const owner_before = owner_wire.bytes.items.len;
+    const follower_before = follower_wire.bytes.items.len;
+
+    // Connection 3 is not a member: it sent the prompt and then left.
+    var active = answerTestPrompt(&state, session, 3);
+    publishTurnOutcome(&active, 3, .{ .integer = 7 }, &.{}, .{ .stop_reason = .end_turn }, null);
+    answerCancelled(&state, session, 3, .{ .integer = 8 });
+
+    try std.testing.expectEqual(owner_before, owner_wire.bytes.items.len);
+    try std.testing.expectEqual(follower_before, follower_wire.bytes.items.len);
+}
+
+/// Refuses every write, as a follower whose client has gone does.
+fn refuseAnswer(_: ?*anyopaque, _: []const u8) anyerror!void {
+    return error.WriteFailed;
+}
+
+test "a follower that does not list usage gets its answer without the usage meta, while the owner's has it" {
+    const alloc = std.testing.allocator;
+    var owner_wire = AnswerWire{ .alloc = alloc };
+    defer owner_wire.deinit();
+    var follower_wire = AnswerWire{ .alloc = alloc };
+    defer follower_wire.deinit();
+    const launch_root = try alloc.dupe(u8, "/tmp/workspace");
+    var state = ServerState{
+        .alloc = alloc,
+        .cfg = undefined,
+        .writer = jsonrpc.Writer.initCallback(&owner_wire, AnswerWire.write),
+        .launch = .{ .root = launch_root },
+        .connection_id = 1,
+    };
+    defer state.deinit();
+    var follower = ServerState{
+        .alloc = alloc,
+        .cfg = undefined,
+        .writer = jsonrpc.Writer.initCallback(&follower_wire, AnswerWire.write),
+        .connection_id = 2,
+    };
+    const session = try openAnswerSession(alloc, &state, &follower);
+    state.extensions = sh_fx.Set.initMany(&.{.usage});
+    session.turn_summary = .{};
+
+    var owner_turn = answerTestPrompt(&state, session, 1);
+    publishTurnOutcome(&owner_turn, 1, .{ .integer = 7 }, &.{}, .{ .stop_reason = .end_turn }, null);
+    var follower_turn = answerTestPrompt(&state, session, 2);
+    publishTurnOutcome(&follower_turn, 2, .{ .integer = 8 }, &.{}, .{ .stop_reason = .end_turn }, null);
+
+    try std.testing.expect(std.mem.find(u8, owner_wire.bytes.items, "\"sh.fx/usage\"") != null);
+    try std.testing.expect(std.mem.find(u8, follower_wire.bytes.items, "\"id\":8") != null);
+    try std.testing.expect(std.mem.find(u8, follower_wire.bytes.items, "sh.fx/usage") == null);
+}
+
+test "a write that fails to a follower drops it and is traced, and the owner's turn still answers" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const folder = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(folder);
+    const trace_path = try std.Io.Dir.path.join(alloc, &.{ folder, "trace.log" });
+    defer alloc.free(trace_path);
+    debug_trace.resetForTest();
+    try debug_trace.configureForTest(alloc, trace_path);
+    defer debug_trace.resetForTest();
+
+    var owner_wire = AnswerWire{ .alloc = alloc };
+    defer owner_wire.deinit();
+    const launch_root = try alloc.dupe(u8, "/tmp/workspace");
+    var state = ServerState{
+        .alloc = alloc,
+        .cfg = undefined,
+        .writer = jsonrpc.Writer.initCallback(&owner_wire, AnswerWire.write),
+        .launch = .{ .root = launch_root },
+        .connection_id = 1,
+    };
+    defer state.deinit();
+    var follower = ServerState{
+        .alloc = alloc,
+        .cfg = undefined,
+        .writer = jsonrpc.Writer.initCallback(null, refuseAnswer),
+        .connection_id = 2,
+    };
+    const session = try openAnswerSession(alloc, &state, &follower);
+
+    var follower_turn = answerTestPrompt(&state, session, 2);
+    publishTurnOutcome(&follower_turn, 2, .{ .integer = 7 }, &.{}, .{ .stop_reason = .end_turn }, null);
+    try std.testing.expectEqual(@as(usize, 0), session.followers.items.len);
+
+    var owner_turn = answerTestPrompt(&state, session, 1);
+    publishTurnOutcome(&owner_turn, 1, .{ .integer = 8 }, &.{}, .{ .stop_reason = .end_turn }, null);
+    try std.testing.expect(std.mem.find(u8, owner_wire.bytes.items, "\"id\":8") != null);
+
+    const trace = try readTraceFile(alloc, trace_path);
+    defer alloc.free(trace);
+    try std.testing.expect(std.mem.find(u8, trace, "event=answer_dropped session=session_answers request=7 reason=write_failed err=") != null);
+    try std.testing.expect(std.mem.find(u8, trace, "event=follower_dropped session=session_answers") != null);
+}
+
+test "a next turn that fails to start answers each waiting prompt and steer with its error, on its sender's writer" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const folder = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(folder);
+    const trace_path = try std.Io.Dir.path.join(alloc, &.{ folder, "trace.log" });
+    defer alloc.free(trace_path);
+    debug_trace.resetForTest();
+    try debug_trace.configureForTest(alloc, trace_path);
+    defer debug_trace.resetForTest();
+
+    var owner_wire = AnswerWire{ .alloc = alloc };
+    defer owner_wire.deinit();
+    var follower_wire = AnswerWire{ .alloc = alloc };
+    defer follower_wire.deinit();
+    const launch_root = try alloc.dupe(u8, "/tmp/workspace");
+    var state = ServerState{
+        .alloc = alloc,
+        .cfg = undefined,
+        .writer = jsonrpc.Writer.initCallback(&owner_wire, AnswerWire.write),
+        .launch = .{ .root = launch_root },
+        .connection_id = 1,
+    };
+    defer state.deinit();
+    var follower = ServerState{
+        .alloc = alloc,
+        .cfg = undefined,
+        .writer = jsonrpc.Writer.initCallback(&follower_wire, AnswerWire.write),
+        .connection_id = 2,
+    };
+    const session = try openAnswerSession(alloc, &state, &follower);
+
+    // A follower's steer, waiting when the next turn failed to start.
+    var steers: std.ArrayList(libfx_steering.Steer) = .empty;
+    try steers.append(alloc, .{ .text = try alloc.dupe(u8, "steer"), .request_id = .{ .integer = 9 }, .from = 2 });
+    var dropped_steers: DroppedWaiting = .{ .input = .{ .steers = steers }, .err = error.OutOfMemory };
+    defer dropped_steers.input.deinit(alloc);
+
+    // The owner's queued prompt, waiting the same way.
+    const queued_source = jsonrpc.Message{ .id = .{ .integer = 10 }, .method = "session/prompt" };
+    const queued_msg = try cloneMessage(alloc, &queued_source);
+    var dropped_prompt: DroppedWaiting = .{ .input = .{ .prompt = .{ .msg = queued_msg, .from = 1 } }, .err = error.OutOfMemory };
+    defer dropped_prompt.input.deinit(alloc);
+
+    answerDroppedWaiting(session, alloc, &dropped_steers);
+    answerDroppedWaiting(session, alloc, &dropped_prompt);
+
+    try std.testing.expect(std.mem.find(u8, follower_wire.bytes.items, "\"id\":9") != null);
+    try std.testing.expect(std.mem.find(u8, follower_wire.bytes.items, "\"code\":-32603") != null);
+    try std.testing.expect(std.mem.find(u8, follower_wire.bytes.items, "OutOfMemory") != null);
+    try std.testing.expect(std.mem.find(u8, owner_wire.bytes.items, "\"id\":10") != null);
+    try std.testing.expect(std.mem.find(u8, owner_wire.bytes.items, "\"id\":9") == null);
+
+    const trace = try readTraceFile(alloc, trace_path);
+    defer alloc.free(trace);
+    try std.testing.expect(std.mem.find(u8, trace, "event=waiting_input_dropped session=session_answers request=9 reason=OutOfMemory") != null);
+    try std.testing.expect(std.mem.find(u8, trace, "event=waiting_input_dropped session=session_answers request=10 reason=OutOfMemory") != null);
 }
