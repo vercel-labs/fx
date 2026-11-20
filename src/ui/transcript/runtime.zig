@@ -7203,10 +7203,11 @@ pub const TranscriptRuntime = struct {
     /// and removes the entries it drops.
     pub fn syncTranscriptWindow(self: *TranscriptRuntime, alloc: Allocator) !void {
         const window = if (self.transcript_window) |*value| value else return;
-        var drops: std.ArrayList(u32) = .empty;
-        defer drops.deinit(alloc);
-        try window.sync(alloc, self.notebook.entries.items, &drops);
-        try self.applyTranscriptWindowDrops(alloc, window, drops.items);
+        // The window lists its drops in its own pending list, so a later failure
+        // loses none and the next sync tries them again.
+        const held = window.pending_drops.items.len;
+        try window.sync(alloc, self.notebook.entries.items, &window.pending_drops);
+        try self.applyTranscriptWindowDrops(alloc, window, window.pending_drops.items.len > held, "sync");
     }
 
     /// Sets whether the session writes a session log, enabling the window
@@ -7239,10 +7240,9 @@ pub const TranscriptRuntime = struct {
         // now two back.
         self.invalidateTranscriptArchive("compacted");
         const window = if (self.transcript_window) |*value| value else return;
-        var drops: std.ArrayList(u32) = .empty;
-        defer drops.deinit(alloc);
-        try window.compacted(alloc, self.notebook.entries.items, &drops);
-        try self.applyTranscriptWindowDrops(alloc, window, drops.items);
+        const held = window.pending_drops.items.len;
+        try window.compacted(alloc, self.notebook.entries.items, &window.pending_drops);
+        try self.applyTranscriptWindowDrops(alloc, window, window.pending_drops.items.len > held, "compacted");
     }
 
     /// Removes the dropped entries that are off screen. The main screen
@@ -7253,30 +7253,63 @@ pub const TranscriptRuntime = struct {
         self: *TranscriptRuntime,
         alloc: Allocator,
         window: *transcript_window_shell.Shell,
-        drops: []const u32,
+        dropped: bool,
+        kind: []const u8,
     ) !void {
         // The previous cycle left memory: "one back" now means it, not the
         // cycle before it.
-        if (drops.len > 0) self.invalidateTranscriptArchive("previous_cycle_dropped");
-        try window.pending_drops.appendSlice(alloc, drops);
+        if (dropped) self.invalidateTranscriptArchive("previous_cycle_dropped");
         if (window.pending_drops.items.len == 0) return;
         var hold = try self.transcriptWindowDropHold(alloc);
         defer hold.deinit(alloc);
+        _ = try self.dropPendingEntries(alloc, window, &hold, kind);
+    }
+
+    /// Drops the pending entries that `hold` does not hold. Every step that can
+    /// fail runs before `pending_drops` changes, and a failed drop puts back the
+    /// entries still in the notebook.
+    fn dropPendingEntries(
+        self: *TranscriptRuntime,
+        alloc: Allocator,
+        window: *transcript_window_shell.Shell,
+        hold: *const TranscriptWindowDropHold,
+        kind: []const u8,
+    ) !usize {
         var ready: std.ArrayList(u32) = .empty;
         defer ready.deinit(alloc);
-        var kept: usize = 0;
         for (window.pending_drops.items) |id| {
-            if (hold.holds(id)) {
-                window.pending_drops.items[kept] = id;
-                kept += 1;
-            } else {
-                try ready.append(alloc, id);
-            }
+            if (!hold.holds(id)) try ready.append(alloc, id);
         }
-        window.pending_drops.shrinkRetainingCapacity(kept);
-        try self.keepTurnsOfStayingSummaries(alloc, window, &ready);
+        const kept = window.pending_drops.items.len - ready.items.len;
         if (kept > 0) debug_trace.logf("transcript_window", "drop held entries={d} on screen", .{kept});
-        _ = try transcript_store.dropEntriesAtomic(self, alloc, ready.items);
+        try self.keepTurnsOfStayingSummaries(alloc, &ready);
+        if (ready.items.len == 0) return 0;
+
+        var going: transcript_store.EntryIdSet = .empty;
+        defer going.deinit(alloc);
+        try going.ensureTotalCapacity(alloc, @intCast(ready.items.len));
+        for (ready.items) |id| going.putAssumeCapacity(id, {});
+
+        var still_pending: usize = 0;
+        for (window.pending_drops.items) |id| {
+            if (going.contains(id)) continue;
+            window.pending_drops.items[still_pending] = id;
+            still_pending += 1;
+        }
+        window.pending_drops.shrinkRetainingCapacity(still_pending);
+
+        _ = transcript_store.dropEntriesAtomic(self, alloc, ready.items) catch |err| {
+            // Only entries still in the notebook go back: the store can remove some before it fails.
+            var restored: usize = 0;
+            for (self.notebook.entries.items) |entry| {
+                if (!going.contains(entry.id())) continue;
+                window.pending_drops.appendAssumeCapacity(entry.id());
+                restored += 1;
+            }
+            debug_trace.logf("transcript_window", "drop failed: kind={s} kept entries={d} pending reason={s}", .{ kind, restored, @errorName(err) });
+            return err;
+        };
+        return ready.items.len;
     }
 
     /// The screen is about to be cleared and replayed from the entries: the
@@ -7291,12 +7324,9 @@ pub const TranscriptRuntime = struct {
             debug_trace.logf("transcript_window", "screen cleared: keeping held drops entries={d} reason=resume_source_pending", .{window.pending_drops.items.len});
             return;
         }
-        var ready = window.pending_drops;
-        window.pending_drops = .empty;
-        defer ready.deinit(alloc);
-        try self.keepTurnsOfStayingSummaries(alloc, window, &ready);
-        debug_trace.logf("transcript_window", "screen cleared: releasing held drops entries={d}", .{ready.items.len});
-        _ = try transcript_store.dropEntriesAtomic(self, alloc, ready.items);
+        const hold: TranscriptWindowDropHold = .none;
+        const released = try self.dropPendingEntries(alloc, window, &hold, "screen_cleared");
+        debug_trace.logf("transcript_window", "screen cleared: releasing held drops entries={d}", .{released});
     }
 
     const TranscriptWindowDropHold = union(enum) {
@@ -7348,14 +7378,13 @@ pub const TranscriptRuntime = struct {
         return .{ .entries = set };
     }
 
-    /// Keeps pending, out of `ready`, every entry of each turn whose summary
-    /// stays, back to the turn's prompt. A turn summary recaps its turn from
-    /// the turn's entries (`tool_group_projection.recapTurnSummary`), so a
-    /// turn leaves only together with its summary.
+    /// Takes out of `ready` every entry of each turn whose summary stays, back
+    /// to the turn's prompt. A turn summary recaps its turn from the turn's
+    /// entries (`tool_group_projection.recapTurnSummary`), so a turn leaves only
+    /// together with its summary. The kept entries stay pending.
     fn keepTurnsOfStayingSummaries(
         self: *TranscriptRuntime,
         alloc: Allocator,
-        window: *transcript_window_shell.Shell,
         ready: *std.ArrayList(u32),
     ) !void {
         if (ready.items.len == 0) return;
@@ -7378,15 +7407,11 @@ pub const TranscriptRuntime = struct {
             }
         }
         if (keep.count() == 0) return;
-        try window.pending_drops.ensureUnusedCapacity(alloc, keep.count());
         var still: usize = 0;
         for (ready.items) |id| {
-            if (keep.contains(id)) {
-                window.pending_drops.appendAssumeCapacity(id);
-            } else {
-                ready.items[still] = id;
-                still += 1;
-            }
+            if (keep.contains(id)) continue;
+            ready.items[still] = id;
+            still += 1;
         }
         ready.shrinkRetainingCapacity(still);
         debug_trace.logf("transcript_window", "drop kept turn entries={d} for their summary", .{keep.count()});
