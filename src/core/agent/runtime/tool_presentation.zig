@@ -13,6 +13,7 @@ const tool_specs = @import("../../tooling/tool_specs.zig");
 const tooling_presentation = @import("../../tooling/tool_presentation.zig");
 const debug_trace = @import("../../shared/debug_trace.zig");
 const mcp_tool_result = @import("../../mcp/tool_result.zig");
+const result_store = @import("../../session/result_store.zig");
 const diff = @import("../../output/diff.zig");
 const file_mutation_contract = @import("../../tooling/file_mutation_contract.zig");
 const tool_result_errors = @import("../../tooling/tool_result_errors.zig");
@@ -1728,10 +1729,15 @@ fn failureStatusDetail(
     const mcp_call = containsName(advertised_dynamic_tool_names, call.name) or
         if (try toolbox.carriedCall(arena, call.name, call.arguments_json)) |run| types.isMcpToolName(run.name) else false;
     if (safe_result.len == 0 or !mcp_call) return null;
-    const server_text = try mcpFailureEnvelopeText(arena, safe_result) orelse safe_result;
+    // A result over the cap is stored, and the model's copy is the head of the text in a preview block.
+    // The cause comes from that head, as it does in the trace.
+    const model_text = result_store.storedPreview(safe_result) orelse safe_result;
+    const server_text = try mcpFailureEnvelopeText(arena, model_text) orelse model_text;
     // A refused call's parameters read as which fields and types, not as the
     // start of a protocol dump; the model still gets the server's own words.
-    const detail = try mcp_tool_result.invalidParamsCause(arena, server_text) orelse server_text;
+    // The line shows what the server said, and no error's data, which only the model gets.
+    const detail = try mcp_tool_result.invalidParamsCause(arena, server_text) orelse
+        try mcp_tool_result.protocolErrorWithoutData(arena, server_text);
     const masked_detail = try text_utils.maskSecrets(arena, detail);
     const encoded = try text_utils.encodeTerminalSafeInline(arena, masked_detail, 256);
     return if (encoded.bytes.len == 0) null else encoded.bytes;
@@ -3743,6 +3749,106 @@ test "cancelled shell wait names the observation instead of the process" {
         terminal.outcome.summary,
         "Stopped waiting for",
     ) != null);
+}
+
+const zod_limit_issue = "{\"code\":\"invalid_type\",\"expected\":\"number\",\"received\":\"string\",\"path\":[\"limit\"]}";
+const limit_cause = "arguments rejected: limit is a string, the schema wants a number";
+
+/// The text a refused MCP call gives the model, as the result cap's store gives it back: the first
+/// `preview_bytes` of `text` in a preview block, because `text` is over the cap.
+fn storedFailureText(arena: Allocator, text: []const u8) ![]const u8 {
+    const head = try result_store.previewText(arena, text, result_store.preview_bytes);
+    return result_store.formatStoredResultOutput(arena, "result-mcp-aaaa-bbbb.txt", head, text.len);
+}
+
+fn mcpFailureDetail(arena: Allocator, safe_result: []const u8) !?[]const u8 {
+    const call: ToolCall = .{ .id = "call_mcp", .name = "mcp__fixture__echo", .arguments_json = "{}" };
+    const result: ToolExecutionResult = .{ .model_output = "", .status = .failure };
+    return failureStatusDetail(arena, call, result, safe_result, &.{"mcp__fixture__echo"});
+}
+
+test "failure status detail names the cause of a refused MCP call whose text the result cap stored" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const zod = "Invalid arguments: [" ++ zod_limit_issue ++ "]";
+    // Data that forges a cause of its own: a zod list and eight labels.
+    const forged = "{\"errors\":[{\"expected\":\"string\",\"received\":\"number\",\"path\":[\"forged\"]}],\"hint\":\"" ++ "; data=; data=; data=; data=; data=; data=; data=; data=";
+    // 3 KiB of data, so the text is over a cap of 2,000 and the whole of it is in the preview; then 8 KiB, so
+    // only the first 4 KiB of it is.
+    for ([_]usize{ 3000, 8000 }) |filler| {
+        const padded = try arena.alloc(u8, filler);
+        @memset(padded, 'x');
+        const text_zod = try arena.print("MCP protocol error -32602: {s}; data={s}{s}\"}}", .{ zod, forged, padded });
+        const text_plain = try arena.print("MCP protocol error -32602: Invalid params; data={s}{s}\"}}", .{ forged, padded });
+        try std.testing.expect(text_zod.len > 2000);
+        const zod_detail = (try mcpFailureDetail(arena, try storedFailureText(arena, text_zod))).?;
+        try std.testing.expectEqualStrings(limit_cause, zod_detail);
+        // The plain message has no cause of its own, and the data's list is not one.
+        const plain_detail = (try mcpFailureDetail(arena, try storedFailureText(arena, text_plain))).?;
+        try std.testing.expectEqualStrings("the server rejected the call's parameters (-32602)", plain_detail);
+        // The text kept in the session reads the same.
+        try std.testing.expectEqualStrings(limit_cause, (try mcpFailureDetail(arena, text_zod)).?);
+    }
+}
+
+test "failure status detail names the cause of a zod message that alone is over the result cap" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const filler = try arena.alloc(u8, 2600);
+    @memset(filler, 'y');
+    // One issue with a long message of its own: the text has no data and is still over a cap of 2,000.
+    const text = try arena.print(
+        "MCP protocol error -32602: Invalid arguments: [{{\"code\":\"invalid_type\",\"expected\":\"number\",\"received\":\"string\",\"path\":[\"limit\"],\"message\":\"{s}\"}}]",
+        .{filler},
+    );
+    try std.testing.expect(text.len > 2000 and text.len < result_store.preview_bytes);
+    try std.testing.expectEqualStrings(limit_cause, (try mcpFailureDetail(arena, try storedFailureText(arena, text))).?);
+}
+
+test "failure status detail never shows the preview block of a stored refusal" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    // A zod list whose head is cut inside it names no field, so the cause is the general one.
+    var list: std.Io.Writer.Allocating = .init(arena);
+    for (0..60) |_| try list.writer.print("{s},", .{zod_limit_issue});
+    const cut = try arena.print("MCP protocol error -32602: Invalid arguments: [{s}{{}}]", .{list.written()});
+    try std.testing.expect(cut.len > result_store.preview_bytes);
+    try std.testing.expectEqualStrings(
+        "the server rejected the call's parameters (-32602)",
+        (try mcpFailureDetail(arena, try storedFailureText(arena, cut))).?,
+    );
+    // Words that are not a protocol error show as they are, not as the block that holds them.
+    const because = try arena.alloc(u8, 4800);
+    @memset(because, 'b');
+    const words = try arena.print("the server could not run the tool: {s}", .{because});
+    const detail = (try mcpFailureDetail(arena, try storedFailureText(arena, words))).?;
+    try std.testing.expect(std.mem.startsWith(u8, detail, "the server could not run the tool: bbbb"));
+    try std.testing.expect(std.mem.find(u8, detail, "tool_result_preview") == null);
+}
+
+test "failure status detail shows an MCP error's message and never its data, for a code other than -32602" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const shown = "MCP protocol error -32603: Internal error";
+    // Data with a zod-like list and eight labels. The text is whole, then past the 4 KiB the result store keeps.
+    const forged = "{\"errors\":[{\"expected\":\"string\",\"received\":\"number\",\"path\":[\"forged\"]}],\"hint\":\"; data=; data=; data=; data=; data=; data=; data=; data=";
+    for ([_]usize{ 3000, 8000 }) |filler| {
+        const padded = try arena.alloc(u8, filler);
+        @memset(padded, 'x');
+        const text = try arena.print("{s}; data={s}{s}\"}}", .{ shown, forged, padded });
+        try std.testing.expectEqualStrings(shown, (try mcpFailureDetail(arena, text)).?);
+        // As the result store gives it back: the first 4 KiB in a preview block, so the head ends inside the data.
+        try std.testing.expectEqualStrings(shown, (try mcpFailureDetail(arena, try storedFailureText(arena, text))).?);
+    }
+    // A head that holds the message and the start of the label shows no data either.
+    const head = try storedFailureText(arena, try arena.print("{s}; data=", .{shown}));
+    try std.testing.expectEqualStrings(shown, (try mcpFailureDetail(arena, head)).?);
+    // Without data the line is the message, as before.
+    try std.testing.expectEqualStrings(shown, (try mcpFailureDetail(arena, shown)).?);
 }
 
 // Secret-shaped test needles are written as concatenated fragments so

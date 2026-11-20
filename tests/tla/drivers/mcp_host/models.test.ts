@@ -17,9 +17,9 @@ test("TLC: every model's smoke and stress pass, every planted bug is caught, sta
   expect(results.filter((r) => r.verdict === "FAIL").map((r) => r.label)).toEqual([]);
   const count = (kind: string, verdict: string) => results.filter((r) => r.kind === kind && r.verdict === verdict).length;
   // SharedLogins, SubagentAccess, UrlRetry, MixedBuilds, StoreLockBudget,
-  // RefreshLease, ConfigEdit and McpRules joined the four.
-  expect(count("smoke", "PASS")).toBe(12);
-  expect(count("stress", "PASS")).toBe(12);
+  // RefreshLease, ErrorData, ConfigEdit and McpRules joined the four.
+  expect(count("smoke", "PASS")).toBe(13);
+  expect(count("stress", "PASS")).toBe(13);
   expect(count("mutant", "CAUGHT")).toBe(results.filter((r) => r.kind === "mutant").length);
   // Credentials' two findings and its repair witness became the code.
   // HostLifecycle's OneProcessPerServer did too: it
@@ -30,7 +30,8 @@ test("TLC: every model's smoke and stress pass, every planted bug is caught, sta
   // IndicatorClears. UrlRetry's finding is the code before the held call:
   // it ended the call at the -32042 error. HostLifecycle's AtMostOneOwner
   // became the code once a reload kept its host: its smoke and stress
-  // configs check it. McpRules' three are the code before the fix (each MCP
+  // configs check it. ErrorData's one is the code before the fix (a failed call's error data
+  // never reached the model). McpRules' three are the code before the fix (each MCP
   // path picked its rule set on its own, so in full access toolbox search and the
   // open of a small server ignored deny rules, and every other MCP path still
   // applied them). SignIn's five findings are fx before the check request
@@ -42,7 +43,7 @@ test("TLC: every model's smoke and stress pass, every planted bug is caught, sta
   // skips, a profile rewritten under a misspelled key) and the two designs fx
   // does not use for the check: its bounded load scan gives up on a big file,
   // and a dry run outside the lock does not see a change another fx makes.
-  expect(count("finding", "FINDING")).toBe(14);
+  expect(count("finding", "FINDING")).toBe(15);
   expect(count("repair", "PASS")).toBe(2);
 }, 1_800_000);
 
@@ -109,6 +110,22 @@ const controls: { name: string; module: string; constants: Record<string, never>
       { event: "answer", data: { q: 1 } }, { event: "delivered", data: { target: 2, from: 1 } },
     ],
     badAt: 4,
+  },
+  {
+    name: "error data", module: "ErrorData",
+    constants: { ObsCap: 8192, ObsMaxSize: 1_048_576, ObsMaxChar: 6, ObsCarry: "data" },
+    good: [
+      { event: "observed", data: { code: "invalid_params", kind: "text", size: 40, form: "whole", prefix: 40, extra: 0, marked: false, split: false, logged: false } },
+      // 10,002 bytes of escaped quotes: 4,095 of them, written with 4,095 more bytes, fill the cap with the quotes around them.
+      { event: "observed", data: { code: "invalid_params", kind: "text", size: 10002, form: "cut", prefix: 4095, extra: 4095, marked: true, split: false, logged: false } },
+      { event: "observed", data: { code: "url_required", kind: "text", size: 50, form: "none", prefix: 0, extra: 0, marked: false, split: false, logged: false } },
+    ],
+    // The same quotes cut by their raw bytes: 8,190 of them are 16,380 bytes once written, twice the cap.
+    bad: [
+      { event: "observed", data: { code: "invalid_params", kind: "text", size: 40, form: "whole", prefix: 40, extra: 0, marked: false, split: false, logged: false } },
+      { event: "observed", data: { code: "invalid_params", kind: "text", size: 10002, form: "cut", prefix: 8190, extra: 8190, marked: true, split: false, logged: false } },
+    ],
+    badAt: 1,
   },
   {
     name: "URL retry", module: "UrlRetry",

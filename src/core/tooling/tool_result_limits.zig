@@ -41,6 +41,11 @@ pub fn prepareModelOutput(
     )).model_output;
 }
 
+/// How the marker that `prepareModelOutputWithTruncation` ends a cut text with starts and ends.
+/// `src/core/mcp/tool_result.zig` finds the marker by them, so a cut text's cause line never reads it.
+pub const cut_marker_start = "\n... [tool result truncated for ";
+pub const cut_marker_end = " bytes]\n";
+
 pub fn prepareModelOutputWithTruncation(
     alloc: Allocator,
     tool_name: []const u8,
@@ -56,7 +61,7 @@ pub fn prepareModelOutputWithTruncation(
         .text = sanitized,
         .max_bytes = max_bytes,
         .marker = try scratch.print(
-            "\n... [tool result truncated for {s}: original {d} bytes; cap is {d} bytes]\n",
+            cut_marker_start ++ "{s}: original {d} bytes; cap is {d}" ++ cut_marker_end,
             .{ tool_name, sanitized.len, max_bytes },
         ),
         .trace_scope = "tool",
