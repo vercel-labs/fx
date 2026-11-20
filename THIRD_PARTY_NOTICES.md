@@ -2,6 +2,17 @@
 
 fx includes material from the following projects and data sources.
 
+## Agent Client Protocol
+
+`src/protocol/spec/acp/v1/` holds an unchanged copy of the version 1 schema files of the
+[Agent Client Protocol](https://github.com/agentclientprotocol/agent-client-protocol) at commit
+`7ec5185c18ca`. Only tests use the copy, and the fx binary does not include it.
+
+Copyright 2025 Zed Industries, Inc. and contributors
+
+Licensed under the Apache License, Version 2.0. The full license text is in
+`src/protocol/spec/acp/v1/LICENSE`.
+
 ## cuelume
 
 The embedded interface sounds are derived from the sound recipes in
