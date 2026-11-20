@@ -360,6 +360,9 @@ const AcpContext = struct {
     /// The compaction the turn runs, for ACP v1's compaction updates.
     compaction: ?LiveCompaction = null,
     next_compaction_operation: u64 = 1,
+    /// Committed edits' diffs, owned, each waiting for its call's completed
+    /// update (`publishDeferredToolCompletion`).
+    committed_diffs: std.ArrayList(CommittedDiff) = .empty,
     /// The MCP host a subagent's turn uses, read once with its mode under the
     /// authority lock, since a reload that keeps the subagent running may set
     /// the session's host. Null for a prompt's own context: a reload joins
@@ -417,6 +420,31 @@ const AcpContext = struct {
         self.progress.provider = null;
         if (self.progress_sent) |sent| self.alloc.free(sent);
         self.progress_sent = null;
+        for (self.committed_diffs.items) |diff| {
+            debug_trace.logf("acp", "dropped tool call diff call_id={s}: its call never got a completed update", .{diff.call_id});
+            diff.deinit(self.alloc);
+        }
+        self.committed_diffs.deinit(self.alloc);
+    }
+
+    /// Keeps a committed edit's diff until the call's completed update.
+    fn keepCommittedDiff(self: *AcpContext, call_id: []const u8, diff: acp_types.ToolDiff) !void {
+        const owned: CommittedDiff = .{
+            .call_id = try self.alloc.dupe(u8, call_id),
+            .path = try self.alloc.dupe(u8, diff.path),
+            .old_text = if (diff.old_text) |text| try self.alloc.dupe(u8, text) else null,
+            .new_text = try self.alloc.dupe(u8, diff.new_text),
+        };
+        errdefer owned.deinit(self.alloc);
+        try self.committed_diffs.append(self.alloc, owned);
+    }
+
+    /// The kept diff of `call_id`, which the caller then owns.
+    fn takeCommittedDiff(self: *AcpContext, call_id: []const u8) ?CommittedDiff {
+        for (self.committed_diffs.items, 0..) |diff, i| {
+            if (std.mem.eql(u8, diff.call_id, call_id)) return self.committed_diffs.orderedRemove(i);
+        }
+        return null;
     }
 
     /// `_sh.fx/session/turn_progress`, for a client that lists
@@ -654,9 +682,13 @@ const AcpContext = struct {
     }
 
     fn sendToolCallCompletedWithCommandResult(self: *AcpContext, tool_call_id: []const u8, result_text: ?[]const u8, command_result_json: ?[]const u8) !void {
+        try self.sendToolCallCompletedWithDiff(tool_call_id, null, result_text, command_result_json);
+    }
+
+    fn sendToolCallCompletedWithDiff(self: *AcpContext, tool_call_id: []const u8, diff: ?acp_types.ToolDiff, result_text: ?[]const u8, command_result_json: ?[]const u8) !void {
         var out: std.Io.Writer.Allocating = .init(self.alloc);
         defer out.deinit();
-        try acp_types.writeToolCallUpdateWithCommandResult(&out.writer, tool_call_id, .completed, result_text, command_result_json);
+        try acp_types.writeToolCallUpdateWithDiff(&out.writer, tool_call_id, .completed, diff, result_text, command_result_json);
         try self.sendUpdate(out.writer.buffered());
         self.markCardFinished(tool_call_id);
     }
@@ -2840,6 +2872,16 @@ fn requestAcpPermission(
     try jsonrpc.writeJsonStr(mapToolKind(call.name).jsonString(), &params.writer);
     try params.writer.writeAll(",\"status\":\"pending\",\"rawInput\":");
     try params.writer.writeAll(validated_arguments.written());
+    // An edit shows the change it asks to make.
+    if (request.file) |file| if (file.change) |change| if (fittingDiff(tool_call_id, .{
+        .path = change.path,
+        .old_text = change.old_text,
+        .new_text = change.new_text,
+    })) |diff| {
+        try params.writer.writeAll(",\"content\":[");
+        try acp_types.writeDiffContent(&params.writer, diff);
+        try params.writer.writeByte(']');
+    };
     try params.writer.writeAll("},\"options\":[");
     try writePermissionOption(&params.writer, "allow_once", "Allow once", "allow_once");
     try params.writer.writeByte(',');
@@ -3077,11 +3119,57 @@ fn completeToolCallTransport(
     return result;
 }
 
+/// A committed edit's diff, owned, for its call's completed update.
+const CommittedDiff = struct {
+    call_id: []u8,
+    path: []u8,
+    old_text: ?[]u8,
+    new_text: []u8,
+
+    fn view(self: CommittedDiff) acp_types.ToolDiff {
+        return .{ .path = self.path, .old_text = self.old_text, .new_text = self.new_text };
+    }
+
+    fn deinit(self: CommittedDiff, alloc: Allocator) void {
+        alloc.free(self.call_id);
+        alloc.free(self.path);
+        if (self.old_text) |text| alloc.free(text);
+        alloc.free(self.new_text);
+    }
+};
+
+/// The diff ACP's `diff` content can carry for `path`, or null, with the
+/// reason logged, when a side is too big or isn't UTF-8.
+fn fittingDiff(call_id: []const u8, diff: acp_types.ToolDiff) ?acp_types.ToolDiff {
+    if (acp_types.toolDiffFits(diff)) return diff;
+    debug_trace.logf("acp", "tool call diff left out call_id={s} old_bytes={d} new_bytes={d} limit={d}: a side is too big or not UTF-8", .{
+        call_id,
+        if (diff.old_text) |text| text.len else 0,
+        diff.new_text.len,
+        acp_types.max_tool_diff_side_bytes,
+    });
+    return null;
+}
+
+/// Keeps the committed file's diff for the call's completed update, which
+/// fx sends right after (`publishDeferredToolCompletion`). A handoff with no
+/// full view has no new text, so its call keeps only its text.
 fn publishCommittedFileHandoff(
-    _: *anyopaque,
-    _: file_mutation.CommittedFileHandoff,
+    raw_ctx: *anyopaque,
+    handoff: file_mutation.CommittedFileHandoff,
 ) agent_runtime.SecondaryPublicationReport {
-    return .{ .diff = .skipped, .tracker = .skipped };
+    const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
+    const view = handoff.full_view orelse return .{ .diff = .skipped, .tracker = .skipped };
+    const diff = fittingDiff(view.lifecycle_id.call_id, .{
+        .path = handoff.tracker.raw_path,
+        .old_text = handoff.tracker.previous_content,
+        .new_text = view.after_content,
+    }) orelse return .{ .diff = .skipped, .tracker = .skipped };
+    ctx.keepCommittedDiff(view.lifecycle_id.call_id, diff) catch |err| {
+        debug_trace.logf("acp", "tool call diff left out call_id={s} err={s}", .{ view.lifecycle_id.call_id, @errorName(err) });
+        return .{ .diff = .skipped, .tracker = .skipped };
+    };
+    return .{ .diff = .published, .tracker = .skipped };
 }
 
 fn publishDeferredToolCompletion(
@@ -3089,8 +3177,11 @@ fn publishDeferredToolCompletion(
     completion: agent_runtime.DeferredToolCompletion,
 ) agent_runtime.TransportPublicationOutcome {
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
-    ctx.sendToolCallCompletedWithCommandResult(
+    const diff = ctx.takeCommittedDiff(completion.transport_id);
+    defer if (diff) |value| value.deinit(ctx.alloc);
+    ctx.sendToolCallCompletedWithDiff(
         completion.transport_id,
+        if (diff) |value| value.view() else null,
         completion.content_text,
         completion.command_result_json,
     ) catch |err| {

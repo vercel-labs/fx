@@ -247,14 +247,66 @@ pub fn writeToolCallUpdateWithCommandResult(
     content_text: ?[]const u8,
     command_result_json: ?[]const u8,
 ) !void {
+    try writeToolCallUpdateWithDiff(w, tool_call_id, status, null, content_text, command_result_json);
+}
+
+/// A file a tool call changes, whole before and after, as ACP v1's `diff`
+/// tool call content. Borrowed.
+pub const ToolDiff = struct {
+    /// Absolute.
+    path: []const u8,
+    /// Null when the call creates the file.
+    old_text: ?[]const u8,
+    new_text: []const u8,
+};
+
+/// The most bytes each side of a diff may hold. A bigger file's call keeps
+/// only its text, so each message stays well under the 8 MiB frame limit.
+pub const max_tool_diff_side_bytes = 1 << 20;
+
+/// Whether `diff` can go to the client: each side within the limit, and
+/// UTF-8, as JSON text must be.
+pub fn toolDiffFits(diff: ToolDiff) bool {
+    if (diff.new_text.len > max_tool_diff_side_bytes or !std.unicode.utf8ValidateSlice(diff.new_text)) return false;
+    const old = diff.old_text orelse return true;
+    return old.len <= max_tool_diff_side_bytes and std.unicode.utf8ValidateSlice(old);
+}
+
+pub fn writeDiffContent(w: *std.Io.Writer, diff: ToolDiff) !void {
+    try w.writeAll("{\"type\":\"diff\",\"path\":");
+    try writeJsonStr(diff.path, w);
+    try w.writeAll(",\"oldText\":");
+    if (diff.old_text) |text| try writeJsonStr(text, w) else try w.writeAll("null");
+    try w.writeAll(",\"newText\":");
+    try writeJsonStr(diff.new_text, w);
+    try w.writeByte('}');
+}
+
+/// A `tool_call_update` whose content is `diff`, when given, and then the
+/// text. An update's content replaces the call's, so a call's last update
+/// carries its diff (`tests/tla/acp/AcpToolDiffs.tla` DiffKept).
+pub fn writeToolCallUpdateWithDiff(
+    w: *std.Io.Writer,
+    tool_call_id: []const u8,
+    status: ToolCallStatus,
+    diff: ?ToolDiff,
+    content_text: ?[]const u8,
+    command_result_json: ?[]const u8,
+) !void {
     try w.writeAll("{\"sessionUpdate\":\"tool_call_update\",\"toolCallId\":");
     try writeJsonStr(tool_call_id, w);
     try w.writeAll(",\"status\":");
     try writeJsonStr(status.jsonString(), w);
-    if (content_text) |text| {
-        try w.writeAll(",\"content\":[{\"type\":\"content\",\"content\":{\"type\":\"text\",\"text\":");
-        try writeJsonStr(text, w);
-        try w.writeAll("}}]");
+    if (diff != null or content_text != null) {
+        try w.writeAll(",\"content\":[");
+        if (diff) |value| try writeDiffContent(w, value);
+        if (content_text) |text| {
+            if (diff != null) try w.writeByte(',');
+            try w.writeAll("{\"type\":\"content\",\"content\":{\"type\":\"text\",\"text\":");
+            try writeJsonStr(text, w);
+            try w.writeAll("}}");
+        }
+        try w.writeByte(']');
     }
     if (command_result_json) |json| {
         try w.writeAll(",\"command_result\":");
@@ -910,4 +962,34 @@ test "writeCompactionUpdate writes ACP v1's compaction_update with no summary" {
     out.clearRetainingCapacity();
     try writeCompactionUpdate(&out.writer, try writeCompactionId(&id, 2), .failed, "Compaction failed.");
     try std.testing.expectEqualStrings("{\"sessionUpdate\":\"compaction_update\",\"compactionId\":\"compaction-2\",\"status\":\"failed\",\"error\":\"Compaction failed.\"}", out.written());
+}
+
+test "writeToolCallUpdateWithDiff puts the diff before the text, and null oldText for a new file" {
+    const alloc = std.testing.allocator;
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    try writeToolCallUpdateWithDiff(&out.writer, "call_1", .completed, .{ .path = "/work/a.txt", .old_text = "one\n", .new_text = "two\n" }, "Edited a.txt", null);
+    try std.testing.expectEqualStrings(
+        "{\"sessionUpdate\":\"tool_call_update\",\"toolCallId\":\"call_1\",\"status\":\"completed\",\"content\":[" ++
+            "{\"type\":\"diff\",\"path\":\"/work/a.txt\",\"oldText\":\"one\\n\",\"newText\":\"two\\n\"}," ++
+            "{\"type\":\"content\",\"content\":{\"type\":\"text\",\"text\":\"Edited a.txt\"}}]}",
+        out.written(),
+    );
+    out.clearRetainingCapacity();
+    try writeToolCallUpdateWithDiff(&out.writer, "call_2", .pending, .{ .path = "/work/new.txt", .old_text = null, .new_text = "x" }, null, null);
+    try std.testing.expectEqualStrings(
+        "{\"sessionUpdate\":\"tool_call_update\",\"toolCallId\":\"call_2\",\"status\":\"pending\",\"content\":[{\"type\":\"diff\",\"path\":\"/work/new.txt\",\"oldText\":null,\"newText\":\"x\"}]}",
+        out.written(),
+    );
+}
+
+test "toolDiffFits takes each side up to the limit, in UTF-8 only" {
+    const alloc = std.testing.allocator;
+    const big = try alloc.alloc(u8, max_tool_diff_side_bytes + 1);
+    defer alloc.free(big);
+    @memset(big, 'a');
+    try std.testing.expect(toolDiffFits(.{ .path = "/a", .old_text = null, .new_text = big[0..max_tool_diff_side_bytes] }));
+    try std.testing.expect(!toolDiffFits(.{ .path = "/a", .old_text = null, .new_text = big }));
+    try std.testing.expect(!toolDiffFits(.{ .path = "/a", .old_text = big, .new_text = "x" }));
+    try std.testing.expect(!toolDiffFits(.{ .path = "/a", .old_text = "\xff\xfe", .new_text = "x" }));
 }

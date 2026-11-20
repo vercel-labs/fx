@@ -12,7 +12,8 @@
 # defines them. AcpSessions: one connection holding many sessions, each with
 # its own turn and workspace. AcpTurnEvents: what a client hears of a
 # running turn: the sh.fx turn events it lists and ACP v1's compaction
-# updates. AcpFollow: following a session on several
+# updates. AcpToolDiffs: the diff an edit's tool call shows, before
+# approval and once it is committed. AcpFollow: following a session on several
 # connections and catching up by log position, which hasn't landed in
 # src/acp/ yet. AcpSessionState: session state, session/status, and list
 # change hints, likewise not landed. AcpSharedSession: what the clients of
@@ -81,6 +82,9 @@ MCAcpTurnEvents MCAcpTurnEvents -
 MCAcpTurnEvents MCAcpTurnEventsPlain -
 MCAcpTurnEvents MCAcpTurnEventsSome -
 MCAcpTurnEvents AcpTurnEventsToday Complete
+MCAcpToolDiffs MCAcpToolDiffs -
+MCAcpToolDiffs MCAcpToolDiffsAsk -
+MCAcpToolDiffs AcpToolDiffsToday Complete
 MCAcpSystemPrompt MCAcpSystemPrompt -
 MCAcpSystemPrompt AcpSystemPromptBefore-v1-refused V1Accepted
 MCAcpSystemPrompt AcpSystemPromptBefore-old-accepted OtherShapesRefused
