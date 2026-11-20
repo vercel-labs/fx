@@ -25,6 +25,13 @@ pub const Context = struct {
         if (registry.definitions.len != 1 or registry.definitions[0].auth != .none) {
             return error.InvalidConfiguredProvider;
         }
+        // The host owns the network: the engine cannot read the host's
+        // environment for a header, ask the server for its model list on a
+        // connection of its own, or bound the host's fetch.
+        const only = registry.definitions[0];
+        if (only.protocol != .@"openai-chat-completions" or only.headers.len != 0 or only.fetch_models or !std.meta.eql(only.timeouts, definitions.Timeouts{})) {
+            return error.InvalidConfiguredProvider;
+        }
         return .{ .transport = transport, .registry = registry };
     }
 
@@ -45,6 +52,8 @@ pub fn bundle(raw: ?*anyopaque, definition: *const definitions.Definition) provi
     const own = context.definition();
     if (!std.mem.eql(u8, &own.binding_identity(), &definition.binding_identity())) return .{};
     return .{
+        .capabilities = .{ .vision_fallback = own.vision_model != null, .vision_model = own.vision_model },
+        .title_model = own.title_model,
         .agent_stream = .{
             .context = context,
             .stream_fn = stream,
@@ -206,6 +215,14 @@ test "host chat completions context refuses settings it cannot honor" {
         \\"two":{"protocol":"openai-chat-completions","base_url":"https://b.example/v1","auth":{"type":"none"}}}
         ,
         \\{"keyed":{"protocol":"openai-chat-completions","base_url":"https://a.example/v1","auth":{"type":"bearer","env":"PROVIDER_KEY"}}}
+        ,
+        \\{"other":{"protocol":"openai-responses","base_url":"https://a.example/v1","auth":{"type":"none"}}}
+        ,
+        \\{"headed":{"protocol":"openai-chat-completions","base_url":"https://a.example/v1","auth":{"type":"none"},"headers":{"X-Org":{"env":"ORG"}}}}
+        ,
+        \\{"listed":{"protocol":"openai-chat-completions","base_url":"https://a.example/v1","auth":{"type":"none"},"fetch_models":true}}
+        ,
+        \\{"bounded":{"protocol":"openai-chat-completions","base_url":"https://a.example/v1","auth":{"type":"none"},"timeouts":{"stall_ms":1000}}}
     }) |json| {
         try std.testing.expectError(error.InvalidConfiguredProvider, Context.init(alloc, fake.transport(), json));
     }

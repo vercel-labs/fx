@@ -1807,7 +1807,9 @@ pub const SessionRuntime = struct {
     ) void {
         if (isCurrentCompactionCheckpoint(turn)) {
             self.disarmCacheWarming("history_compacted");
-            self.agent.clearHistory(alloc);
+            // The conversation goes on after compacting: it keeps its toolbox
+            // menu (`tests/tla/toolbox/Toolbox.tla` MenuFixed).
+            self.agent.dropHistory(alloc);
             self.unversioned_history_len = 0;
         }
         self.agent.history.appendAssumeCapacity(turn);
@@ -1821,7 +1823,7 @@ pub const SessionRuntime = struct {
     pub fn commitCompactedHistory(self: *SessionRuntime, alloc: Allocator, history: []HistoryTurn) void {
         const uncertain = self.unversioned_history_len != 0;
         self.disarmCacheWarming("history_compacted");
-        self.agent.clearHistory(alloc);
+        self.agent.dropHistory(alloc);
         self.agent.history.deinit(alloc);
         self.agent.history = std.ArrayList(HistoryTurn).fromOwnedSlice(history);
         self.agent.fresh = false;
@@ -2522,6 +2524,19 @@ fn restoredSteeringChatMessage(text: []const u8) core_types.ChatMessage {
         .restored_steering = true,
         .context_origin = if (text.len > 0 and !agent_frame.isFrame(text)) .user_turn else .ordinary,
     };
+}
+
+test "saved steering with a half marker comes back as the user's words, never as fx's message" {
+    for ([_][]const u8{
+        "<fx_recovery_prompt>\nnotice with no closing line",
+        "no opening line\n</fx_recovery_prompt>",
+        "<fx_recovery_prompt>\n</fx_recovery_prompt>x",
+    }) |text| {
+        const back = restoredSteeringChatMessage(text);
+        try std.testing.expect(back.restored_steering and !back.recovery_prompt);
+        try std.testing.expectEqualStrings(text, back.content.?);
+        try std.testing.expect(back.context_origin == .user_turn);
+    }
 }
 
 test "a recovery prompt a turn sent after its last step ends the saved turn as the turn sent it" {

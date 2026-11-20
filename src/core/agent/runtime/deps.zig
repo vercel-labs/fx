@@ -64,6 +64,8 @@ pub const CompactionActivityEffect = struct {
     begin: *const fn (ctx: *anyopaque, origin: compaction_activity.Origin, turn_id: ?u64) compaction_activity.OperationId,
     running: *const fn (ctx: *anyopaque, id: compaction_activity.OperationId, stage: compaction_activity.Stage) void,
     settle: *const fn (ctx: *anyopaque, id: compaction_activity.OperationId, feedback: compaction_activity.Feedback) void,
+    /// How much of the summary the model has written, from 1 to 99.
+    written: ?*const fn (ctx: *anyopaque, id: compaction_activity.OperationId, percent: u8) void = null,
 };
 
 pub const ContextCompactionCommitEffect = struct {
@@ -180,7 +182,23 @@ pub const DiffMarkerStyles = struct {
     removed: []const u8 = "",
 };
 
+/// A refreshed login for the request that asked for it. Every field is
+/// allocated with the allocator the hook was given, and the caller owns it;
+/// the caller zeroes `token` when it frees it.
+pub const RefreshedGatewayCredential = struct {
+    token: []u8,
+    /// The Vercel team the refreshed login sends. Null keeps the request's
+    /// team, which is what a host that refuses a team change during a request
+    /// returns.
+    gateway_team: ?[]u8 = null,
+    /// That team's slug, which fx shows the user.
+    gateway_team_label: ?[]u8 = null,
+};
+
 pub const AgentRuntimeDeps = struct {
+    /// The steps of `start_workspace_capture`.
+    pub const WorkspaceCaptureStep = enum { begin, capture };
+
     ctx: *anyopaque,
     observer: ?*observation.Observer = null,
     agent_stream_provider: agent_stream_provider.Provider = agent_stream_provider.unavailable_provider,
@@ -194,7 +212,8 @@ pub const AgentRuntimeDeps = struct {
     /// TUI and `fx ask`. The rules of each image's folder then reach the model
     /// the way a tool call's do: a note on the turn's own message, so the
     /// instructions stay as they were cached. Hosts whose images carry no
-    /// workspace path leave it false.
+    /// workspace path leave it false. Other attached files reach the model the
+    /// same way through the prompt's `attached_files`.
     image_folder_rules: bool = false,
     live_tool_authority: ?LiveToolAuthorityProvider = null,
     /// Samples host-owned root permission mode at an action boundary.
@@ -210,6 +229,17 @@ pub const AgentRuntimeDeps = struct {
         kind: worker_runtime.SteeringBoundaryKind,
     ) anyerror!worker_runtime.SteeringBoundaryResult = null,
     release_agent_terminal_lease: *const fn (ctx: *anyopaque, session_id: []const u8) anyerror!void = terminalLeaseCleanupUnavailable,
+    /// Whether turn `turn_id`, which ends interrupted, ends because the user
+    /// cancelled it rather than because steering ended it. Asked before the
+    /// turn is reported, since a prompt typed once it is reported can join
+    /// its ending as steering. Hosts without steering leave it unset.
+    turn_ends_by_explicit_cancel: ?*const fn (ctx: *anyopaque, turn_id: u64) bool = null,
+    /// Stops the commands that steering moved to the background during turn
+    /// `turn_id`, after the user cancelled it (`turn_ends_by_explicit_cancel`).
+    /// Called once the turn is reported, so a command that ignores SIGTERM
+    /// and takes seconds to stop does not hold the turn's end. Hosts without
+    /// steering leave it unset.
+    stop_steering_detached_commands: ?*const fn (ctx: *anyopaque, turn_id: u64) anyerror!void = null,
     append_runtime_context: *const fn (ctx: *anyopaque, arena: Allocator, messages: *std.ArrayList(ChatMessage)) anyerror!void,
     append_static_context: ?*const fn (ctx: *anyopaque, arena: Allocator, messages: *std.ArrayList(ChatMessage)) anyerror!void = null,
     validate_tool_call: ?*const fn (ctx: *anyopaque, arena: Allocator, call: ToolCall) anyerror!ToolCallValidationResult = null,
@@ -262,6 +292,20 @@ pub const AgentRuntimeDeps = struct {
     /// the caller's. An image the session cannot save keeps its bytes
     /// inline and gets no path.
     save_prompt_images: ?*const fn (ctx: *anyopaque, alloc: Allocator, images: []types.ImageAttachment) anyerror!void = null,
+    /// Captures the repository the session works in as the turn starts,
+    /// before any request or tool, when `experimental.workspace_capture` is
+    /// on (D98, `src/core/workspace/turn_capture.zig`). The runtime calls it
+    /// twice: `.begin` takes the turn's capture token, then, once the
+    /// user's prompt is saved through `append_turn_piece`, `.capture` takes
+    /// the start capture, which can take seconds, so a kill during it keeps
+    /// the prompt. `fresh` is false for a steering message inside the turn,
+    /// which keeps the turn's capture. It never fails the turn.
+    start_workspace_capture: ?*const fn (ctx: *anyopaque, fresh: bool, step: WorkspaceCaptureStep) void = null,
+    /// An admitted tool is about to act in `dir`: a command's working folder
+    /// or the folder of the file a mutation writes. Captures a repository the
+    /// turn had not reached yet before the action runs (D98). Never fails
+    /// the call.
+    reach_workspace: ?*const fn (ctx: *anyopaque, dir: []const u8, tool_name: []const u8) void = null,
     /// Confirms, without writing, that this process still owns the saved
     /// session after a main-model completion and before its tool calls run.
     /// Another process may have taken the session over.
@@ -277,6 +321,11 @@ pub const AgentRuntimeDeps = struct {
     /// Source-limit notices use a session-scoped deduplicating path when the
     /// host provides one; ordinary system notices remain unaffected.
     push_context_notice: ?*const fn (ctx: *anyopaque, text: []const u8) anyerror!void = null,
+    /// A notice the person should see once in a live session, however many
+    /// turns repeat its cause. The host shows it where they read the
+    /// transcript and drops a text it has already shown. Null: the host has
+    /// no session to remember it in, and the notice is not shown.
+    push_session_notice: ?*const fn (ctx: *anyopaque, text: []const u8) anyerror!void = null,
     push_route_recovery_status: *const fn (ctx: *anyopaque, status: types.RouteRecoveryStatus) anyerror!void = discardRouteRecoveryStatus,
     /// A new model request starts. A host that reports the last request's
     /// recovery, as `fx ask --json` does, forgets the previous request's
@@ -287,7 +336,9 @@ pub const AgentRuntimeDeps = struct {
     restore_failed_prompt: ?*const fn (ctx: *anyopaque, prompt: []const u8) anyerror!void = null,
     push_command_output_complete: *const fn (ctx: *anyopaque, lifecycle_id: ?types.ToolLifecycleId) anyerror!void,
     push_http_error: *const fn (ctx: *anyopaque, status: std.http.Status, detail: []const u8, credential_source: ?types.CredentialSource) anyerror!void,
-    refresh_gateway_credential: ?*const fn (ctx: *anyopaque, alloc: Allocator, source: types.CredentialSource, mode: CredentialRefreshMode, expected_account_id: ?[]const u8) anyerror!?[]u8 = null,
+    /// `rejected_token` is the access token the provider just answered 401
+    /// for, with `.force`; see `auth_runtime.refreshCredentialForAccount`.
+    refresh_gateway_credential: ?*const fn (ctx: *anyopaque, alloc: Allocator, source: types.CredentialSource, mode: CredentialRefreshMode, expected_account_id: ?[]const u8, rejected_token: ?[]const u8) anyerror!?RefreshedGatewayCredential = null,
     /// Asks the user what to do when the account is out of credits, and
     /// blocks until they answer. Only the TUI sets it.
     ask_out_of_credits: ?*const fn (ctx: *anyopaque) anyerror!OutOfCreditsChoice = null,
@@ -319,6 +370,7 @@ pub const AgentRuntimeDeps = struct {
     }
 
     pub fn executeToolCall(self: *const AgentRuntimeDeps, request: ToolExecutionRequest) !ToolExecutionResult {
+        if (self.reach_workspace) |reach| if (reachedDirectory(request.authority)) |dir| reach(self.ctx, dir, request.call.name);
         if (self.observer) |observer| observer.emit(.{ .tool_start = .{ .call = request.call } });
         var observed_request = request;
         observed_request.observer = self.observer orelse request.observer;
@@ -340,6 +392,28 @@ pub const AgentRuntimeDeps = struct {
     }
 };
 
+/// The folder an admitted action works in, from its typed authority: a
+/// command's resolved working folder, or the folder of a mutation's
+/// canonical target. Permission text is never parsed for a path (D98).
+fn reachedDirectory(authority: command_admission.ToolExecutionAuthority) ?[]const u8 {
+    return switch (authority) {
+        .run_command => |command| switch (command) {
+            .direct_only => |fingerprint| fingerprint.resolved_cwd,
+            .shell_allowed => |allowed| allowed.fingerprint.resolved_cwd,
+        },
+        .file_mutation => |mutation| std.Io.Dir.path.dirname(mutation.policy_targets.canonical_target_path),
+        .ordinary, .vision_paths => null,
+    };
+}
+
 fn terminalLeaseCleanupUnavailable(_: *anyopaque, _: []const u8) !void {
     return error.TerminalLeaseCleanupUnavailable;
+}
+
+test "a reached directory comes only from a command's or a mutation's typed authority" {
+    const fingerprint: command_admission.AdmissionFingerprint = .{ .command = "make", .resolved_cwd = "/repo/sub", .target_os = .linux };
+    try std.testing.expectEqualStrings("/repo/sub", reachedDirectory(.{ .run_command = .{ .direct_only = fingerprint } }).?);
+    try std.testing.expectEqualStrings("/repo/sub", reachedDirectory(.{ .run_command = .{ .shell_allowed = .{ .fingerprint = fingerprint, .source = .auto_mode } } }).?);
+    try std.testing.expect(reachedDirectory(.ordinary) == null);
+    try std.testing.expect(reachedDirectory(.{ .vision_paths = .{ .targets = &.{} } }) == null);
 }

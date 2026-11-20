@@ -37,7 +37,7 @@ if [ -z "$java" ]; then
     exit 2
 fi
 
-all="SessionLog TurnLifecycle WriterLock ResumeSnapshot Fork Subagents Catalog Lifecycle Wiring MoveSideFiles V1Conversion PromptImages"
+all="SessionLog TurnLifecycle WriterLock ResumeSnapshot Fork ForkChildren Subagents Catalog Lifecycle Wiring MoveSideFiles V1Conversion PromptImages"
 specs="${*:-$all}"
 # A new private folder per run for TLC state, so nothing planted in the temp
 # folder can redirect it. TLC prints to the terminal, so it is removed.

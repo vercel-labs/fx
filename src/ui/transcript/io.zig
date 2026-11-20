@@ -6,6 +6,7 @@
 // owners.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const io_mod = @import("../../core/shared/io.zig");
 const record_tape = @import("../../core/workspace/record_tape.zig");
 const types = @import("../../core/shared/types.zig");
@@ -38,6 +39,10 @@ pub fn disableShadowVt(shell: anytype) void {
     }
 }
 
+/// Writes `bytes` to the terminal. A write that fails because the terminal
+/// hung up reports `error.TerminalHungUp` (`terminalHungUp`), so the frame
+/// commit can close fx as a hang-up; every other failure reports its own
+/// error.
 pub fn writeFrameBytes(shell: anytype, metrics: *Metrics, bytes: []const u8) terminal_diff.FrameSinkWriteResult {
     var accepted_bytes: usize = 0;
     while (accepted_bytes < bytes.len) {
@@ -46,11 +51,32 @@ pub fn writeFrameBytes(shell: anytype, metrics: *Metrics, bytes: []const u8) ter
             &.{},
             &.{bytes[accepted_bytes..]},
             1,
-        ) catch |err| return recordPartialFrame(metrics, bytes[0..accepted_bytes], err);
+        ) catch |err| return recordPartialFrame(
+            metrics,
+            bytes[0..accepted_bytes],
+            if (terminalHungUp(shell.stdout_file, err)) error.TerminalHungUp else err,
+        );
         if (written == 0) return recordPartialFrame(metrics, bytes[0..accepted_bytes], error.NoProgress);
         accepted_bytes += written;
     }
     return recordCompleteFrame(metrics, bytes);
+}
+
+/// Whether a write to `file` failed with `err` because the terminal hung up,
+/// as when its window closed: the write failed with EIO, and the descriptor
+/// polls as hung up. Linux and macOS both report a pty whose other end closed
+/// with POLLHUP. Once the hang-up ends the terminal's session, macOS revokes
+/// the terminal, and the descriptor then polls POLLNVAL instead.
+fn terminalHungUp(file: std.Io.File, err: anyerror) bool {
+    if (comptime builtin.target.os.tag == .wasi) return false;
+    if (err != error.InputOutput) return false;
+    var fds = [_]std.posix.pollfd{.{
+        .fd = file.handle,
+        .events = std.posix.POLL.OUT,
+        .revents = 0,
+    }};
+    _ = std.posix.poll(&fds, 0) catch return false;
+    return (fds[0].revents & (std.posix.POLL.HUP | std.posix.POLL.NVAL)) != 0;
 }
 
 fn recordPartialFrame(metrics: *Metrics, accepted: []const u8, err: anyerror) terminal_diff.FrameSinkWriteResult {
@@ -118,6 +144,53 @@ test "standalone presentation bell is written without changing the shadow grid" 
     try std.testing.expectEqual(@as(usize, 1), try file.readPositionalAll(io_mod.getIo(), &bytes, 0));
     try std.testing.expectEqual(@as(u8, 0x07), bytes[0]);
     try std.testing.expectEqual(@as(u21, ' '), shadow.cellAt(1, 1).?.codepoint);
+}
+
+test "writeFrameBytes reports a terminal that hung up as a hang-up" {
+    const shell_runtime = @import("../shell_runtime.zig");
+    if (!shell_runtime.supports_test_pty) return error.SkipZigTest;
+    const FakeShell = struct { stdout_file: std.Io.File };
+
+    const pty = try shell_runtime.TestPty.open();
+    var master: ?std.Io.File = .{ .handle = pty.master, .flags = .{ .nonblocking = false } };
+    defer if (master) |file| file.close(io_mod.getIo());
+    const slave: std.Io.File = .{ .handle = pty.slave, .flags = .{ .nonblocking = false } };
+    defer slave.close(io_mod.getIo());
+
+    var shell = FakeShell{ .stdout_file = slave };
+    var metrics: Metrics = .{};
+    try std.testing.expect(writeFrameBytes(&shell, &metrics, "abc") == .complete);
+
+    // The window closes: its side of the pty goes away.
+    master.?.close(io_mod.getIo());
+    master = null;
+    switch (writeFrameBytes(&shell, &metrics, "abc")) {
+        .complete => return error.TestUnexpectedResult,
+        .partial => |partial| {
+            try std.testing.expectEqual(@as(usize, 0), partial.accepted_bytes);
+            try std.testing.expectEqual(error.TerminalHungUp, partial.err);
+        },
+    }
+}
+
+test "writeFrameBytes keeps the error of a write that fails another way" {
+    const FakeShell = struct { stdout_file: std.Io.File };
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    (try tmp.dir.createFile(std.testing.io, "read-only.log", .{})).close(io_mod.getIo());
+    const file = try tmp.dir.openFile(std.testing.io, "read-only.log", .{});
+    defer file.close(io_mod.getIo());
+
+    var shell = FakeShell{ .stdout_file = file };
+    var metrics: Metrics = .{};
+    switch (writeFrameBytes(&shell, &metrics, "abc")) {
+        .complete => return error.TestUnexpectedResult,
+        .partial => |partial| {
+            try std.testing.expectEqual(@as(usize, 0), partial.accepted_bytes);
+            try std.testing.expect(partial.err != error.TerminalHungUp);
+        },
+    }
 }
 
 test "enableShadowVt matches fx's no-autowrap terminal mode" {

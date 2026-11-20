@@ -40,6 +40,9 @@ const builtin = @import("builtin");
 const sm = @import("session_manager");
 /// A line boundary in a session log, for hosts that walk it.
 pub const LogCursor = sm.Cursor;
+/// The session manager's rule for a session id, for code that may not
+/// import the session manager itself.
+pub const validSessionId = sm.validId;
 const debug_trace = @import("../shared/debug_trace.zig");
 const write_test_controls = @import("write_test_controls.zig");
 const io_mod = @import("../shared/io.zig");
@@ -59,6 +62,7 @@ const session_store = @import("session_store.zig");
 const session_summary_codec = @import("session_summary_codec.zig");
 const v1_conversion = @import("v1_conversion.zig");
 const child_state = @import("../subagent/child_state.zig");
+const subagent_domain = @import("../subagent/domain.zig");
 const artifact_digest = @import("artifact_digest.zig");
 const session_permission_state = @import("../permissions/session_permission_state.zig");
 const model_provider = @import("../config/model_provider.zig");
@@ -83,6 +87,13 @@ fn openHome(home: []const u8) !io_mod.VerifiedDir {
 
 /// Pieces larger than this go to a blob; the line keeps a reference.
 const max_inline_piece_bytes: usize = 256 * 1024;
+/// A workspace capture always fits inline: one held for a turn not on disk
+/// yet could not go to a blob, which needs the turn on disk (D44, D98).
+const max_workspace_capture_bytes = max_inline_piece_bytes;
+/// The next capture turn token, shared by every Session of the process so a
+/// token from one never matches another's turn (D98). Starts at 1: 0 means
+/// no turn.
+var capture_turns: std.atomic.Value(u64) = .init(1);
 /// Lines per page when replaying history.
 const replay_page_lines: usize = 256;
 
@@ -306,13 +317,14 @@ pub const Store = struct {
         return complete;
     }
 
-    /// Removes folders outside the manager whose session is gone, except
-    /// young ones (D36, D45), in both roots.
-    fn sweepFiles(store: *Store, alloc: Allocator, report: *Doctor, now_ms: i64) !void {
-        for (outside_folders) |root_name| try store.sweepRoot(alloc, root_name, report, now_ms);
+    /// Finds folders outside the manager whose session is gone, except young
+    /// ones (D36, D45), in both roots, and counts or removes them as
+    /// `orphans` says.
+    fn sweepFiles(store: *Store, alloc: Allocator, report: *Doctor, now_ms: i64, orphans: OrphanSweep) !void {
+        for (outside_folders) |root_name| try store.sweepRoot(alloc, root_name, report, now_ms, orphans);
     }
 
-    fn sweepRoot(store: *Store, alloc: Allocator, root_name: []const u8, report: *Doctor, now_ms: i64) !void {
+    fn sweepRoot(store: *Store, alloc: Allocator, root_name: []const u8, report: *Doctor, now_ms: i64, orphans: OrphanSweep) !void {
         var files = try store.openProfileFolder(root_name) orelse return;
         defer files.close();
         var it = files.dir.iterate();
@@ -336,6 +348,10 @@ pub const Store = struct {
                 debug_trace.logf("session", "event=sessions_v2_orphan_files_young session={s} root={s}", .{ entry.name, root_name });
                 continue;
             }
+            if (orphans == .count) {
+                report.removable += 1;
+                continue;
+            }
             files.dir.deleteTree(io_mod.getIo(), entry.name) catch |err| {
                 debug_trace.logf("session", "event=sessions_v2_files_kept session={s} root={s} why=orphan err={s}", .{ entry.name, root_name, @errorName(err) });
                 report.kept += 1;
@@ -355,6 +371,50 @@ pub const Store = struct {
         var scratch = std.heap.ArenaAllocator.init(alloc);
         defer scratch.deinit();
         return try alloc.dupe(u8, try json_decode.parseFromSliceLeaky([]const u8, scratch.allocator(), raw, .{}));
+    }
+
+    /// Every saved session's id, children included, owned by `arena`; null
+    /// when the catalog cannot be read. Capture retention matches sessions
+    /// to their capture refs with it (D98). The catalog lists roots only,
+    /// so each session's children come from its folded state, as `peek`
+    /// reads it, down to the depth `Manager.delete` follows; a session
+    /// deleted meanwhile is skipped, and any other failure returns null.
+    pub fn sessionIds(store: *Store, arena: Allocator) ?[]const []const u8 {
+        var ids: std.ArrayList([]const u8) = .empty;
+        var cursor: ?sm.ListCursor = null;
+        while (true) {
+            var page = store.manager.list(arena, .all, cursor, 512) catch return null;
+            defer page.deinit();
+            for (page.items) |item| {
+                const id = arena.dupe(u8, item.id) catch return null;
+                ids.append(arena, id) catch return null;
+            }
+            cursor = page.next orelse break;
+        }
+        // Breadth first: each level's children follow the level before.
+        var level_start: usize = 0;
+        var depth: usize = 0;
+        while (level_start < ids.items.len and depth <= 8) : (depth += 1) {
+            const level_end = ids.items.len;
+            for (level_start..level_end) |index| {
+                var peeked = store.manager.peek(arena, ids.items[index]) catch |err| switch (err) {
+                    error.NotFound => continue,
+                    else => return null,
+                };
+                defer peeked.deinit(arena);
+                for (peeked.state.children.items) |child| {
+                    const id = arena.dupe(u8, child.id) catch return null;
+                    ids.append(arena, id) catch return null;
+                }
+            }
+            level_start = level_end;
+        }
+        return ids.items;
+    }
+
+    /// Whether another process has session `id` open; true when unsure.
+    pub fn sessionBusy(store: *Store, id: []const u8) bool {
+        return store.manager.isBusy(id) catch true;
     }
 
     /// A child's whole history, read without its lock: every turn, oldest
@@ -439,7 +499,8 @@ pub fn commandError(err: anyerror) CommandError {
         error.SessionRecoveryNotNeeded => error.SessionRecoveryNotNeeded,
         error.SessionRecoveryBoundaryInvalid, error.SessionRecoveryRequiresCurrentSchema => error.SessionRecoveryBoundaryInvalid,
         error.SessionRecoveryUnsupportedSchema => error.UnsupportedSessionSchema,
-        error.DurablePathUnsafe, error.SessionPathUnsafe => error.DurablePathUnsafe,
+        // A v1 file others can write, say: unsafe, not damaged.
+        error.DurablePathUnsafe, error.SessionPathUnsafe, error.PrivateStatePermissionsUnsupported => error.DurablePathUnsafe,
         error.HomeNotSet => error.HomeNotSet,
         error.OutOfMemory => error.OutOfMemory,
         error.Io, error.NoSpaceLeft, error.AccessDenied, error.ReadOnlyFileSystem, error.FileTooBig => blk: {
@@ -465,6 +526,25 @@ pub fn readSession(store: *Store, alloc: Allocator, id: []const u8) !Resumed {
     };
     defer peeked.deinit(alloc);
     if (peeked.role != .root) return error.SessionNotFound;
+    return detailOf(store, alloc, id, peeked);
+}
+
+/// A subagent's session, by its own id, as `readSession` reads a root's:
+/// without its lock (D37). `resolveAgent` finds the id from the names its
+/// parents gave it. Anything but a v2 child is `error.SessionNotFound`.
+/// Caller owns the result.
+pub fn readChild(store: *Store, alloc: Allocator, id: []const u8) !Resumed {
+    var peeked = store.manager.peek(alloc, id) catch |err| return switch (err) {
+        error.NotFound, error.InvalidArgument => error.SessionNotFound,
+        else => err,
+    };
+    defer peeked.deinit(alloc);
+    if (peeked.role != .child) return error.SessionNotFound;
+    return detailOf(store, alloc, id, peeked);
+}
+
+/// Every turn and setting of peeked session `id`, as `fx session` shows it.
+fn detailOf(store: *Store, alloc: Allocator, id: []const u8, peeked: sm.Peeked) !Resumed {
     var scratch = std.heap.ArenaAllocator.init(alloc);
     defer scratch.deinit();
     var restored = try settingsFrom(alloc, scratch.allocator(), peeked.state);
@@ -477,8 +557,15 @@ pub fn readSession(store: *Store, alloc: Allocator, id: []const u8) !Resumed {
 /// it (D61). Caller owns the result.
 fn readV1Session(store: *Store, alloc: Allocator, id: []const u8) !Resumed {
     store.problem = .{};
-    var detail = (v1_conversion.readDetail(alloc, store.home, id) catch |err| switch (err) {
-        error.OutOfMemory, error.SessionNotFound => return err,
+    var detail = (v1_conversion.readDetail(alloc, store.home, id, &store.problem) catch |err| switch (err) {
+        // A folder others can write, a symlink or a FIFO is unsafe, not
+        // damaged: recover refuses it the same way (D61).
+        error.OutOfMemory,
+        error.SessionNotFound,
+        error.PrivateStatePermissionsUnsupported,
+        error.DurablePathUnsafe,
+        error.SessionPathUnsafe,
+        => return err,
         else => return v1Unreadable(store, alloc, id, err),
     }) orelse return error.SessionNotFound;
     defer detail.summary.deinit(alloc);
@@ -604,6 +691,359 @@ fn countBefore(sorted: []const session_store.SessionSummary, summary: session_st
     return count;
 }
 
+// ---------------------------------------------------------------------------
+// Live sessions, and subagents by name
+
+/// How deep a live listing and an agent address follow subagents: fx nests
+/// two levels below a root, and this leaves room. A log that names a deeper
+/// chain, or a loop, stops here.
+const max_agent_depth = 4;
+
+/// Index rows read per page while scanning for live sessions. Each page
+/// loads the whole index again, so one page covers any common profile.
+const live_scan_page = 4096;
+
+/// Every root session in `workspace`, or in every workspace when it is null,
+/// that an fx process has open right now, newest first, each with its
+/// subagents (`tests/tla/session/LiveSessions.tla`). A session is live while
+/// a process holds its writer lock, which the kernel frees however the
+/// process ends. The scan tries each lock without waiting and lets a free
+/// one go at once (`isBusy`), then reads the live session's log without the
+/// lock (D37). It writes nothing. A session whose lock can't be tried is not
+/// live, and one whose log can't be read is listed as `unknown`; both are
+/// traced. The caller frees the list with `deinit`.
+pub fn listLive(store: *Store, alloc: Allocator, workspace: ?[]const u8) !session_store.LiveSessionList {
+    var list: session_store.LiveSessionList = .{ .arena = .init(alloc), .sessions = &.{} };
+    errdefer list.arena.deinit();
+    const arena = list.arena.allocator();
+    var sessions: std.ArrayList(session_store.LiveSession) = .empty;
+    var scratch = std.heap.ArenaAllocator.init(alloc);
+    defer scratch.deinit();
+    const filter: sm.Filter = if (workspace) |root| .{ .workspace = root } else .all;
+    var cursor: ?sm.ListCursor = null;
+    while (true) {
+        var page = try store.manager.list(alloc, filter, cursor, live_scan_page);
+        defer page.deinit();
+        for (page.items) |item| {
+            if (item.role != .root) continue;
+            const live = store.manager.isBusy(item.id) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => {
+                    debug_trace.logf("session", "event=live_probe_failed session={s} err={s}", .{ item.id, @errorName(err) });
+                    continue;
+                },
+            };
+            if (!live) continue;
+            _ = scratch.reset(.retain_capacity);
+            try sessions.append(arena, try liveSession(store, arena, scratch.allocator(), item));
+        }
+        cursor = page.next orelse break;
+    }
+    list.sessions = sessions.items;
+    return list;
+}
+
+/// Live root session `item`, read from its log into `arena`.
+fn liveSession(store: *Store, arena: Allocator, scratch: Allocator, item: sm.Summary) !session_store.LiveSession {
+    const summary = try summaryOf(arena, scratch, item);
+    const peeked = store.manager.peek(scratch, item.id) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => {
+            debug_trace.logf("session", "event=live_peek_failed session={s} err={s}", .{ item.id, @errorName(err) });
+            return .{ .summary = summary, .saved_model = null, .state = .unknown, .agents = &.{} };
+        },
+    };
+    return .{
+        .summary = summary,
+        .saved_model = savedModel(arena, peeked.state.prefs),
+        .state = if (peeked.state.open_turn != null) .working else .idle,
+        .agents = try liveAgents(store, arena, scratch, item.id, peeked.state.children.items, 1),
+    };
+}
+
+/// The model a session's `prefs` saved, copied into `arena`, or null when
+/// it can't be read.
+fn savedModel(arena: Allocator, prefs: ?[]const u8) ?[]const u8 {
+    const raw = prefs orelse return null;
+    const Saved = struct { model: ?[]const u8 = null };
+    const saved = json_decode.parseFromSliceLeaky(Saved, arena, raw, .{ .ignore_unknown_fields = true, .allocate = .alloc_always }) catch return null;
+    return saved.model;
+}
+
+/// A folded child as the subagent code reads it, borrowing `child`.
+fn foldedChild(child: sm.Child) Child {
+    return .{
+        .id = child.id,
+        .work_id = child.work_id,
+        .open = child.open,
+        .outcome = child.outcome,
+        .spawn_data = child.spawn_data,
+        .finish_data = child.finish_data,
+        .seq = child.seq,
+    };
+}
+
+/// The newest spawn in `children` that goes by `name`, closed for good or
+/// not, so a closed subagent's turns stay readable. Null when none does.
+fn newestNamed(scratch: Allocator, children: []const sm.Child, name: []const u8) ?sm.Child {
+    var best: ?sm.Child = null;
+    for (children) |child| {
+        const own = child_state.foldedName(scratch, foldedChild(child)) orelse continue;
+        if (!std.mem.eql(u8, own, name)) continue;
+        if (best == null or child.seq > best.?.seq) best = child;
+    }
+    return best;
+}
+
+/// Whether a spawn in `children` that goes by `name` and is not closed for
+/// good is newer than `seq`.
+fn newerOpenNamed(scratch: Allocator, children: []const sm.Child, name: []const u8, seq: u64) bool {
+    for (children) |child| {
+        if (child.seq <= seq) continue;
+        const entry = foldedChild(child);
+        if (child_state.foldedClosed(entry)) continue;
+        const own = child_state.foldedName(scratch, entry) orelse continue;
+        if (std.mem.eql(u8, own, name)) return true;
+    }
+    return false;
+}
+
+/// The subagents a live listing shows of one parent, whose folded children
+/// are `children`: each named one not closed for good, the newest spawn of
+/// each name, with its own below it down to `max_agent_depth`. Their
+/// addresses start with `parent`.
+fn liveAgents(store: *Store, arena: Allocator, scratch: Allocator, parent: []const u8, children: []const sm.Child, depth: usize) ![]const session_store.LiveAgent {
+    var agents: std.ArrayList(session_store.LiveAgent) = .empty;
+    for (children) |child| {
+        const entry = foldedChild(child);
+        if (child_state.foldedClosed(entry)) continue;
+        const name = child_state.foldedName(scratch, entry) orelse continue;
+        if (newerOpenNamed(scratch, children, name, child.seq)) continue;
+        const address = try std.mem.concat(arena, u8, &.{ parent, "/", name });
+        var nested: []const session_store.LiveAgent = &.{};
+        if (depth < max_agent_depth) {
+            if (store.manager.peek(scratch, child.id)) |peeked| {
+                nested = try liveAgents(store, arena, scratch, address, peeked.state.children.items, depth + 1);
+            } else |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => debug_trace.logf("session", "event=live_agent_peek_failed session={s} err={s}", .{ child.id, @errorName(err) }),
+            }
+        }
+        try agents.append(arena, .{
+            .name = try arena.dupe(u8, name),
+            .address = address,
+            .id = try arena.dupe(u8, child.id),
+            .state = if (child.open) .working else .idle,
+            .agents = nested,
+        });
+    }
+    return agents.items;
+}
+
+/// `<session-id>/<name>[/<name>...]`: a subagent by the names its parents
+/// gave it, below a root session. Borrows the text it was parsed from.
+pub const AgentAddress = struct {
+    root: []const u8,
+    names_buffer: [max_agent_depth][]const u8 = undefined,
+    depth: usize = 0,
+
+    fn names(address: *const AgentAddress) []const []const u8 {
+        return address.names_buffer[0..address.depth];
+    }
+};
+
+/// What `fx session <target>` names, before any session is read.
+pub const SessionTarget = union(enum) {
+    /// No `/`: a session id alone.
+    session,
+    agent: AgentAddress,
+    /// An address `fx session` cannot follow.
+    invalid: AddressProblem,
+};
+
+/// Why an agent address names no subagent, before any session is read.
+pub const AddressProblem = union(enum) {
+    /// The first part below the root that is not a name fx gives a
+    /// subagent; empty when the address has an empty part.
+    bad_name: []const u8,
+    /// More names than `max_agent_depth`.
+    too_deep,
+
+    /// The problem as `fx session` says it, quoting the part at fault or
+    /// `text`, the address, as a terminal can show it.
+    pub fn describe(problem: AddressProblem, writer: *std.Io.Writer, text: []const u8) std.Io.Writer.Error!void {
+        switch (problem) {
+            .bad_name => |name| if (name.len == 0)
+                try writer.print("{f} has an empty agent name", .{text_utils.terminalSafe(text)})
+            else
+                try writer.print(
+                    "{f} is not an agent name; agent names are lowercase letters, digits, \"_\", and \"-\", start with a letter or digit, and are at most {d} bytes",
+                    .{ text_utils.terminalSafe(name), subagent_domain.max_agent_name_bytes },
+                ),
+            .too_deep => try writer.print("{f} goes more than {d} agents deep", .{ text_utils.terminalSafe(text), max_agent_depth }),
+        }
+    }
+};
+
+/// Pure: what `text` names as a `fx session` target. Borrows `text`.
+/// `error.InvalidSessionId` when the part before the first `/` is not a
+/// session id.
+pub fn parseSessionTarget(text: []const u8) error{InvalidSessionId}!SessionTarget {
+    const slash = std.mem.findScalar(u8, text, '/') orelse return .session;
+    var address: AgentAddress = .{ .root = text[0..slash] };
+    session_store.validateSessionId(address.root) catch return error.InvalidSessionId;
+    var parts = std.mem.splitScalar(u8, text[slash + 1 ..], '/');
+    while (parts.next()) |name| {
+        if (address.depth == max_agent_depth) return .{ .invalid = .too_deep };
+        if (!subagent_domain.validAgentName(name)) return .{ .invalid = .{ .bad_name = name } };
+        address.names_buffer[address.depth] = name;
+        address.depth += 1;
+    }
+    return .{ .agent = address };
+}
+
+/// What an agent address names: the subagent's own session, or the first
+/// name no subagent of `parent` goes by, with the names its subagents do.
+/// Strings are borrowed from the arena `resolveAgent` was given.
+const AgentLookup = union(enum) {
+    found: []const u8,
+    missing: struct { parent: []const u8, name: []const u8, names: []const []const u8 },
+};
+
+/// Follows `address` from its root session down the names each parent gave
+/// its subagent, through each parent's log read without its lock (D37). A
+/// name two children took reaches the newer, closed for good or not, so a
+/// closed subagent's turns stay readable. A missing root, or one that is a
+/// child itself, is `error.SessionNotFound`.
+pub fn resolveAgent(store: *Store, arena: Allocator, address: AgentAddress) !AgentLookup {
+    // Only `parseSessionTarget` makes one, and it names at least one subagent.
+    std.debug.assert(address.depth >= 1);
+    var peeked = store.manager.peek(arena, address.root) catch |err| return switch (err) {
+        error.NotFound, error.InvalidArgument => error.SessionNotFound,
+        else => err,
+    };
+    if (peeked.role != .root) return error.SessionNotFound;
+    var parent: []const u8 = address.root;
+    for (address.names(), 0..) |name, index| {
+        const children = peeked.state.children.items;
+        const child = newestNamed(arena, children, name) orelse
+            return .{ .missing = .{ .parent = parent, .name = name, .names = try agentNames(arena, children) } };
+        if (index + 1 == address.depth) return .{ .found = child.id };
+        parent = try std.mem.concat(arena, u8, &.{ parent, "/", name });
+        peeked = store.manager.peek(arena, child.id) catch |err| return switch (err) {
+            error.NotFound, error.InvalidArgument => error.SessionNotFound,
+            else => err,
+        };
+    }
+    unreachable;
+}
+
+/// The names of the subagents in `children` that are not closed for good,
+/// each once, in the order they were first started.
+fn agentNames(arena: Allocator, children: []const sm.Child) ![]const []const u8 {
+    var out: std.ArrayList([]const u8) = .empty;
+    for (children) |child| {
+        const entry = foldedChild(child);
+        if (child_state.foldedClosed(entry)) continue;
+        const name = child_state.foldedName(arena, entry) orelse continue;
+        for (out.items) |known| {
+            if (std.mem.eql(u8, known, name)) break;
+        } else try out.append(arena, name);
+    }
+    return out.items;
+}
+
+test "a session target splits into its root and the names below it" {
+    const address = (try parseSessionTarget("abc123/reviewer/helper-2")).agent;
+    try std.testing.expectEqualStrings("abc123", address.root);
+    try std.testing.expectEqual(@as(usize, 2), address.names().len);
+    try std.testing.expectEqualStrings("reviewer", address.names()[0]);
+    try std.testing.expectEqualStrings("helper-2", address.names()[1]);
+    try std.testing.expectEqual(SessionTarget.session, try parseSessionTarget("abc123"));
+    // A part that is not a subagent name is named, an empty one as empty.
+    for ([_][2][]const u8{ .{ "abc123/Reviewer", "Reviewer" }, .{ "abc123/a b", "a b" }, .{ "abc123/reviewer/x.y", "x.y" }, .{ "abc123/", "" }, .{ "abc123//reviewer", "" } }) |case| {
+        try std.testing.expectEqualStrings(case[1], (try parseSessionTarget(case[0])).invalid.bad_name);
+    }
+    try std.testing.expectEqual(AddressProblem.too_deep, (try parseSessionTarget("abc123/a/b/c/d/e")).invalid);
+    // A root that is not a session id is not one.
+    for ([_][]const u8{ "/reviewer", "../x/reviewer", "a b/reviewer" }) |text| {
+        try std.testing.expectError(error.InvalidSessionId, parseSessionTarget(text));
+    }
+    // The deepest address it takes.
+    try std.testing.expectEqual(@as(usize, max_agent_depth), (try parseSessionTarget("abc123/a/b/c/d")).agent.depth);
+}
+
+test "an address problem names the part at fault and the rule" {
+    for ([_][2][]const u8{
+        .{ "abc123/Reviewer", "Reviewer is not an agent name; agent names are lowercase letters, digits, \"_\", and \"-\", start with a letter or digit, and are at most 64 bytes" },
+        .{ "abc123/reviewer/\x1b]0;x\x07", "\\x1b]0;x\\x07 is not an agent name; agent names are lowercase letters, digits, \"_\", and \"-\", start with a letter or digit, and are at most 64 bytes" },
+        .{ "abc123//reviewer", "abc123//reviewer has an empty agent name" },
+        .{ "abc123/a/b/c/d/e", "abc123/a/b/c/d/e goes more than 4 agents deep" },
+    }) |case| {
+        var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+        defer out.deinit();
+        try (try parseSessionTarget(case[0])).invalid.describe(&out.writer, case[0]);
+        try std.testing.expectEqualStrings(case[1], out.written());
+    }
+}
+
+test "an agent address parses or is refused on fuzzed bytes" {
+    try std.testing.fuzz({}, fuzzAgentAddress, .{
+        .corpus = &(@import("fuzz_seed").slices(.{
+            "abc123/reviewer",
+            "abc123/lead/helper",
+            "abc123",
+            "abc123//x",
+            "\xff/\x00",
+        }) ++ @import("fuzz_corpus").session_address.*),
+    });
+}
+
+fn fuzzAgentAddress(_: void, smith: *std.testing.Smith) anyerror!void {
+    var buffer: [512]u8 = undefined;
+    const bytes = buffer[0..@intCast(smith.slice(&buffer))];
+    const slash = std.mem.findScalar(u8, bytes, '/');
+    const target = parseSessionTarget(bytes) catch {
+        // Only a root that is not a session id is refused.
+        try std.testing.expect(slash != null);
+        try std.testing.expectError(error.InvalidSessionId, session_store.validateSessionId(bytes[0..slash.?]));
+        return;
+    };
+    const names = if (slash) |at| bytes[at + 1 ..] else {
+        try std.testing.expectEqual(SessionTarget.session, target);
+        return;
+    };
+    try session_store.validateSessionId(bytes[0..slash.?]);
+    switch (target) {
+        .session => return error.TestUnexpectedResult,
+        .invalid => |problem| switch (problem) {
+            .too_deep => try std.testing.expect(std.mem.count(u8, names, "/") >= max_agent_depth),
+            .bad_name => |name| {
+                // One of the parts, and the first that is not a subagent name.
+                try std.testing.expect(!subagent_domain.validAgentName(name));
+                var parts = std.mem.splitScalar(u8, names, '/');
+                while (parts.next()) |part| {
+                    if (part.ptr == name.ptr and part.len == name.len) break;
+                    try std.testing.expect(subagent_domain.validAgentName(part));
+                } else return error.TestUnexpectedResult;
+            },
+        },
+        .agent => |address| {
+            // A valid root and valid names that join back to the text.
+            try std.testing.expect(address.depth >= 1 and address.depth <= max_agent_depth);
+            var joined: std.ArrayList(u8) = .empty;
+            defer joined.deinit(std.testing.allocator);
+            try joined.appendSlice(std.testing.allocator, address.root);
+            for (address.names()) |name| {
+                try std.testing.expect(subagent_domain.validAgentName(name));
+                try joined.append(std.testing.allocator, '/');
+                try joined.appendSlice(std.testing.allocator, name);
+            }
+            try std.testing.expectEqualStrings(bytes, joined.items);
+        },
+    }
+}
+
 pub const Recovered = struct {
     id: []u8,
     /// Entries in the copy's history; a compaction summary counts as one.
@@ -671,8 +1111,18 @@ pub const Doctor = struct {
     checked: usize = 0,
     /// Checked sessions with a damaged line or a stale snapshot.
     damaged: std.ArrayList([]u8) = .empty,
+    /// Sessions within the limit whose check the caller's stop cut short or
+    /// never started, with no damage found in what was read.
+    unfinished: usize = 0,
+    /// The caller's stop ended the scan of the sessions an older fx saved,
+    /// so `unconverted`, `keeps_left_out`, and `kept_children` count only
+    /// the folders read before it.
+    v1_incomplete: bool = false,
     /// Side folders removed because their session is gone.
     removed: usize = 0,
+    /// Side folders whose session is gone that `fx doctor --fix` would
+    /// remove; counted only when the sweep does not remove.
+    removable: usize = 0,
     /// Side folders with no session that could not be removed.
     kept: usize = 0,
     /// Roots an older fx saved that v2 does not hold yet; each converts
@@ -712,12 +1162,61 @@ pub const Doctor = struct {
 /// turn has not created its log yet (D36).
 const orphan_min_age_ms: i64 = 24 * std.time.ms_per_hour;
 
-/// `fx doctor` on v2 (D36): verifies up to `limit` sessions and removes side
-/// folders whose session is gone. Rebuilds nothing. Caller owns the report.
-pub fn doctor(store: *Store, alloc: Allocator, limit: usize, now_ms: i64) !Doctor {
+/// What `fx doctor` does with a side folder whose session is gone.
+pub const OrphanSweep = enum {
+    /// Counts it as removable: plain `fx doctor`.
+    count,
+    /// Removes it: `fx doctor --fix`.
+    remove,
+};
+
+/// `fx doctor` on v2 (D36): verifies up to `limit` sessions and finds side
+/// folders whose session is gone, counting or removing them as `orphans`
+/// says. Rebuilds nothing. Caller owns the report.
+pub fn doctor(store: *Store, alloc: Allocator, limit: usize, now_ms: i64, orphans: OrphanSweep) !Doctor {
+    return doctorWith(store, alloc, .{ .limit = limit, .now_ms = now_ms, .orphans = orphans });
+}
+
+pub const DoctorOptions = struct {
+    /// The most sessions whose log is checked.
+    limit: usize,
+    now_ms: i64,
+    orphans: OrphanSweep,
+    /// `hash` reads every blob; `exists` only checks that each is a file.
+    blobs: @FieldType(sm.VerifyOptions, "blobs") = .hash,
+    /// When it says stop, the session being checked and the ones after it
+    /// are counted in `Doctor.unfinished`, not checked.
+    stop: ?sm.Stop = null,
+    /// Told before each session's check, with how many are done and how
+    /// many will be checked, so a long check can show where it is.
+    progress: ?Progress = null,
+
+    pub const Progress = struct {
+        context: *anyopaque,
+        report: *const fn (context: *anyopaque, done: usize, total: usize) void,
+    };
+
+    fn stopRequested(options: DoctorOptions) bool {
+        return sm.Stop.now(options.stop);
+    }
+
+    fn tell(options: DoctorOptions, done: usize, total: usize) void {
+        const progress = options.progress orelse return;
+        progress.report(progress.context, done, total);
+    }
+};
+
+/// `doctor`, with the blob check, stop, and progress `options` choose.
+pub fn doctorWith(store: *Store, alloc: Allocator, options: DoctorOptions) !Doctor {
     var report: Doctor = .{};
     errdefer report.deinit(alloc);
     var latest_ms: u64 = 0;
+    // The sessions to check, listed first so progress can say how many.
+    var to_check: std.ArrayList([]u8) = .empty;
+    defer {
+        for (to_check.items) |id| alloc.free(id);
+        to_check.deinit(alloc);
+    }
     var cursor: ?sm.ListCursor = null;
     while (true) {
         var page = try store.manager.list(alloc, .all, cursor, list_page_size);
@@ -731,33 +1230,59 @@ pub fn doctor(store: *Store, alloc: Allocator, limit: usize, now_ms: i64) !Docto
                 report.latest = id;
                 latest_ms = item.updated_ms;
             }
-            if (report.checked == limit) continue;
-            report.checked += 1;
-            const verified = store.manager.verify(item.id) catch |err| switch (err) {
-                error.NotFound => continue,
-                error.OutOfMemory => return error.OutOfMemory,
-                else => {
-                    debug_trace.logf("session", "event=sessions_v2_doctor_unreadable session={s} err={s}", .{ item.id, @errorName(err) });
-                    try report.damaged.append(alloc, try alloc.dupe(u8, item.id));
-                    continue;
-                },
-            };
-            if (verified.damaged_at != null or verified.bad_snapshots > 0 or verified.bad_blobs > 0) try report.damaged.append(alloc, try alloc.dupe(u8, item.id));
+            if (to_check.items.len == options.limit) continue;
+            try to_check.ensureUnusedCapacity(alloc, 1);
+            to_check.appendAssumeCapacity(try alloc.dupe(u8, item.id));
         }
         cursor = page.next orelse break;
     }
-    try doctorV1(store, alloc, &report, limit);
-    report.kept_children = try keptChildren(store, alloc);
+    for (to_check.items, 0..) |id, done| {
+        options.tell(done, to_check.items.len);
+        if (options.stopRequested()) {
+            report.unfinished += 1;
+            continue;
+        }
+        const verified = store.manager.verifyWith(id, .{ .blobs = options.blobs, .stop = options.stop }) catch |err| switch (err) {
+            error.NotFound => {
+                report.checked += 1;
+                continue;
+            },
+            error.OutOfMemory => return error.OutOfMemory,
+            else => {
+                report.checked += 1;
+                debug_trace.logf("session", "event=sessions_v2_doctor_unreadable session={s} err={s}", .{ id, @errorName(err) });
+                try report.damaged.append(alloc, try alloc.dupe(u8, id));
+                continue;
+            },
+        };
+        // What the check read before it stopped still reports damage.
+        const damaged = verified.damaged_at != null or verified.bad_snapshots > 0 or verified.bad_blobs > 0;
+        if (damaged) try report.damaged.append(alloc, try alloc.dupe(u8, id));
+        if (verified.stopped_at != null and !damaged) {
+            debug_trace.logf("session", "event=sessions_v2_doctor_stopped session={s} at={d}", .{ id, verified.stopped_at.? });
+            report.unfinished += 1;
+        } else report.checked += 1;
+    }
+    options.tell(to_check.items.len, to_check.items.len);
+    const limit = options.limit -| report.unfinished;
+    try doctorV1(store, alloc, &report, limit, options.stop);
+    var kept_complete = true;
+    report.kept_children = try keptChildrenUntil(store, alloc, options.stop, &kept_complete);
+    if (!kept_complete) report.v1_incomplete = true;
     for (report.kept_children) |child| report.keeps_left_out += @intFromBool(child.keeps);
-    try store.sweepFiles(alloc, &report, now_ms);
+    try store.sweepFiles(alloc, &report, options.now_ms, options.orphans);
     return report;
 }
 
 /// Counts the roots an older fx saved that v2 does not hold yet, and names
 /// each checked one that can't be converted with what `fx session recover`
 /// copies of it (D73). Reads only; a busy family is left out.
-fn doctorV1(store: *Store, alloc: Allocator, report: *Doctor, limit: usize) !void {
-    const roots = v1_conversion.rootIds(alloc, store.home) catch |err| switch (err) {
+fn doctorV1(store: *Store, alloc: Allocator, report: *Doctor, limit: usize, stop: ?sm.Stop) !void {
+    var complete = true;
+    defer if (!complete) {
+        report.v1_incomplete = true;
+    };
+    const roots = v1_conversion.rootIdsUntil(alloc, store.home, stop, &complete) catch |err| switch (err) {
         error.OutOfMemory => return err,
         else => {
             debug_trace.logf("session", "event=doctor_v1_unlisted err={s}", .{@errorName(err)});
@@ -769,6 +1294,10 @@ fn doctorV1(store: *Store, alloc: Allocator, report: *Doctor, limit: usize) !voi
         alloc.free(roots);
     }
     for (roots) |root| {
+        if (sm.Stop.now(stop)) {
+            complete = false;
+            break;
+        }
         if (store.manager.peek(alloc, root.id)) |peeked_value| {
             var peeked = peeked_value;
             defer peeked.deinit(alloc);
@@ -828,7 +1357,8 @@ fn checkV1(store: *Store, alloc: Allocator, root_id: []const u8) !?Doctor.Stuck 
         error.OutOfMemory => return err,
         error.SessionBusy, error.SessionNotFound => return null,
         error.InvalidSessionFormat => return try stuckRoot(alloc, root_id, store.problem.text(), .nothing),
-        else => return try stuckRoot(alloc, root_id, @errorName(err), .nothing),
+        // A member folder others can write: `problem` names it and its fix (D61).
+        else => return try stuckRoot(alloc, root_id, if (store.problem.len > 0) store.problem.text() else @errorName(err), .nothing),
     };
     defer locks.release();
     for (locks.members.items) |*locked| {
@@ -1004,6 +1534,17 @@ const BlobHost = struct {
         defer host.mutex.unlock(io);
         if (host.pending.items.len > 0) debug_trace.logf("session", "event=sessions_v2_blobs_unlisted session={s} count={d}", .{ host.id, host.pending.items.len });
         if (host.records_generation != host.records_written) debug_trace.logf("session", "event=sessions_v2_records_unlisted session={s} count={d}", .{ host.id, host.records_added.items.len });
+    }
+
+    /// A page of the session's log for a reader that holds the host: through
+    /// the open session, or through the process's manager once it closed.
+    /// A close waits for a read in flight, as it waits for a store.
+    fn readLog(host: *BlobHost, sa: Allocator, from_cursor: sm.From, direction: sm.Direction, limit: usize) !sm.Page {
+        const io = io_mod.getIo();
+        host.life.lockUncancelable(io);
+        defer host.life.unlock(io);
+        if (host.session) |handle| return handle.read(sa, from_cursor, direction, limit);
+        return host.store.manager.read(sa, host.id, from_cursor, direction, limit);
     }
 
     fn put(ctx: *anyopaque, bytes: []const u8) session_child_store.BlobError!Hash {
@@ -1267,6 +1808,27 @@ pub const Session = struct {
     /// The store deletes no blob of a live session, so an entry stays true,
     /// and every copy of a turn the host passes encodes its images alike.
     prompt_blobs: std.array_hash_map.String([]u8) = .empty,
+    /// The workspace captures of the current capture turn and of the ended
+    /// one waiting for its commit, each with its token, in the order saved
+    /// (D98). Each turn's stay until its `commitTurnWithCaptures` lands or
+    /// a later `beginCaptureTurn` drops them; a fresh turn after a
+    /// supersede writes its starts again.
+    captures: std.ArrayList(Capture) = .empty,
+    /// The token of the current capture turn (`CaptureTurn`), drawn from
+    /// `capture_turns`; 0 when no capture turn is open.
+    capture_turn: u64 = 0,
+    /// The token of a turn whose end capture was taken and whose commit
+    /// has not landed when the next turn began (`beginCaptureTurnKeeping`):
+    /// its captures stay held for its own commit. 0 when none waits; at
+    /// most one does.
+    ended_turn: u64 = 0,
+    /// The capture token whose turn is open on disk, set by the write that
+    /// opens it; 0 when that write belonged to no capture turn, such as a
+    /// commit of an earlier turn. Only this turn takes `captures` (D98).
+    turn_token: u64 = 0,
+    /// The open turn is one a failed turn left behind: the next write
+    /// closes it as superseded instead of continuing it (D98).
+    turn_stale: bool = false,
     turn_open: bool = false,
     /// Highest turn number started; the manager numbers turns the same way.
     last_turn: u64 = 0,
@@ -1571,10 +2133,18 @@ pub const Session = struct {
     pub fn close(self: *Session) void {
         // Before the close, which forgets whether the log is on disk.
         const was_saved = self.saved();
+        // A failed turn left open is closed as superseded, so readers drop it
+        // with its captures instead of keeping it as an interrupted turn (D98).
+        if (self.turn_open and self.turn_stale) {
+            self.mutex.lockUncancelable(io_mod.getIo());
+            defer self.mutex.unlock(io_mod.getIo());
+            self.supersedeOpenTurn("failed_turn") catch |err| debug_trace.logf("session", "event=sessions_v2_stale_turn_kept session={s} err={s}", .{ self.id(), @errorName(err) });
+        }
         self.host.detach();
         self.handle.close() catch |err| debug_trace.logf("session", "event=sessions_v2_close_failed session={s} err={s}", .{ self.id(), @errorName(err) });
         if (self.root) traceWiring("Close", self.id(), "", self.store.pid);
         if (self.turn_open) debug_trace.logf("session", "event=sessions_v2_turn_closed_open session={s} streamed={d}", .{ self.id(), self.streamed.items.len });
+        self.traceDroppedCaptures("closed");
         // Before `release`: the id lives in the handle.
         if (!was_saved) self.removeUnsavedFiles();
         self.handle.release();
@@ -1612,6 +2182,8 @@ pub const Session = struct {
             alloc.free(path);
         }
         self.prompt_blobs.deinit(alloc);
+        self.clearCaptures();
+        self.captures.deinit(alloc);
         self.turn_numbers.deinit(alloc);
         if (self.language) |value| alloc.free(value);
         if (self.instructions) |value| alloc.free(value);
@@ -1656,11 +2228,18 @@ pub const Session = struct {
     // -- turns ---------------------------------------------------------------
 
     /// Opens the turn on disk if it is not open yet, so a body stored for it
-    /// is a blob of a session on disk (D44). Caller holds the mutex.
-    fn openTurnLocked(self: *Session) !void {
-        if (self.turn_open) return;
-        _ = try self.write(&.{.turn_started});
-        self.startedTurn();
+    /// is a blob of a session on disk (D44). `opener` is the capture token
+    /// of the turn being opened, or 0 when it is not the current capture
+    /// turn's. Caller holds the mutex.
+    fn openTurnLocked(self: *Session, opener: u64) !void {
+        if (self.turn_open and !self.turn_stale) return;
+        if (self.turn_open) try self.supersedeOpenTurn("failed_turn");
+        var batch: std.ArrayList(sm.Event) = .empty;
+        defer batch.deinit(self.alloc);
+        try batch.append(self.alloc, .turn_started);
+        try self.appendHeldStarts(self.alloc, &batch, opener);
+        _ = try self.write(batch.items);
+        self.startedTurn(opener);
     }
 
     /// Opens the turn as its work starts. A subagent child streams nothing,
@@ -1670,7 +2249,7 @@ pub const Session = struct {
     pub fn beginTurn(self: *Session) !void {
         self.mutex.lockUncancelable(io_mod.getIo());
         defer self.mutex.unlock(io_mod.getIo());
-        try self.openTurnLocked();
+        try self.openTurnLocked(self.capture_turn);
     }
 
     /// Stores the turn's tool results and images as blobs and gives them
@@ -1686,7 +2265,9 @@ pub const Session = struct {
                 .interrupted => |entry| storesBodies(entry.execution),
                 .compacted_summary => false,
             };
-            if (stores) try self.openTurnLocked();
+            // The turn prepared may be an earlier one than the current capture
+            // turn's, so it opens with no captures.
+            if (stores) try self.openTurnLocked(0);
         }
         try session_log.externalizeConversationTurnResults(self.alloc, turn, try self.childCapability());
     }
@@ -1715,10 +2296,45 @@ pub const Session = struct {
     }
 
     /// Appends a finished turn: the pieces not streamed yet, then its end,
-    /// in one durable batch. `turn` must already be prepared.
+    /// in one durable batch. `turn` must already be prepared. Writes no
+    /// workspace capture and leaves the current capture turn as it is, so a
+    /// commit of an earlier turn, such as ACP's interrupted one, never takes
+    /// the next turn's captures: an open turn that holds another capture
+    /// token's written starts, with nothing streamed, is superseded rather
+    /// than continued (`othersOpenTurn`, D98).
     pub fn commitTurn(self: *Session, turn: types.HistoryTurn, language: types.ConversationLanguage) !void {
         self.mutex.lockUncancelable(io_mod.getIo());
         defer self.mutex.unlock(io_mod.getIo());
+        try self.commitTurnLocked(turn, language, 0);
+    }
+
+    /// Commits `turn` as `commitTurn` does, with the workspace captures of
+    /// `capture`, the turn's token: start captures not on disk yet and every
+    /// end capture join the closing batch, before `turn_committed` or
+    /// `turn_interrupted`. Once the batch lands the capture turn ends. A
+    /// failed commit keeps the captures, so a retry of the same turn with
+    /// the same token writes them once; the next `beginCaptureTurn` drops
+    /// them. The token may be the current one or the ended one a later turn
+    /// kept (`beginCaptureTurnKeeping`); each commit takes only its own
+    /// token's captures and never continues a turn another token opened
+    /// (`othersOpenTurn`). Any other token commits the turn without
+    /// captures (D98).
+    pub fn commitTurnWithCaptures(self: *Session, turn: types.HistoryTurn, language: types.ConversationLanguage, capture: CaptureTurn) !void {
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        const token = @backingInt(capture);
+        const held = token != 0 and (token == self.capture_turn or token == self.ended_turn);
+        if (!held) debug_trace.logf("session", "event=sessions_v2_workspace_captures_dropped session={s} reason=turn_closed held=0", .{self.id()});
+        try self.commitTurnLocked(turn, language, if (held) token else 0);
+        if (held) {
+            self.clearCapturesOf(token);
+            if (token == self.capture_turn) self.capture_turn = 0 else self.ended_turn = 0;
+        }
+    }
+
+    /// `owner` is the capture token whose captures the turn takes, current
+    /// or ended, or 0.
+    fn commitTurnLocked(self: *Session, turn: types.HistoryTurn, language: types.ConversationLanguage, owner: u64) !void {
         var arena = std.heap.ArenaAllocator.init(self.alloc);
         defer arena.deinit();
         const a = arena.allocator();
@@ -1733,9 +2349,21 @@ pub const Session = struct {
         const all = events.items;
         const encoded = try a.alloc([]u8, all.len);
         for (all, encoded) |piece, *bytes| bytes.* = try self.encodeEvent(a, piece);
+        if (self.othersOpenTurn(owner)) try self.supersedeOpenTurn("other_turn");
         const start = try self.streamedPrefix(encoded[0..pieces.len], .commit, countResults(pieces));
 
         var tail: std.ArrayList(sm.Event) = .empty;
+        if (owner != 0) {
+            // A turn already open, but not by this token, has not taken its
+            // starts yet; one opened by the batch below takes them first.
+            if (self.turn_open) for (self.captures.items) |capture| {
+                if (capture.turn == owner and capture.place == .start and !capture.written) try tail.append(a, .{ .item = capturePiece(capture.data) });
+            };
+            // End captures close the turn with it, in the order saved (D98).
+            for (self.captures.items) |capture| {
+                if (capture.turn == owner and capture.place == .end) try tail.append(a, .{ .item = capturePiece(capture.data) });
+            }
+        }
         switch (end) {
             .turn_completed => try tail.append(a, .turn_committed),
             .interrupted => |interruption| try tail.append(a, .{ .turn_interrupted = switch (interruption.reason) {
@@ -1759,17 +2387,50 @@ pub const Session = struct {
             null;
         if (derived_title) |title| try tail.append(a, .{ .set = .{ .key = .title, .value = try jsonString(a, title) } });
 
-        try self.writePieces(a, all[start..], encoded[start..], tail.items, openingAuthor(turn));
-        try self.turn_numbers.append(self.alloc, self.last_turn);
+        // Allocated first: once the batch lands, nothing here can fail and
+        // leave this side thinking the turn is still open.
+        try self.turn_numbers.ensureUnusedCapacity(self.alloc, 1);
+        const owned_language = if (language_changed) try self.alloc.dupe(u8, language_tag) else null;
+        errdefer if (owned_language) |owned| self.alloc.free(owned);
+
+        try self.writePieces(a, all[start..], encoded[start..], tail.items, openingAuthor(turn), owner);
+        self.turn_numbers.appendAssumeCapacity(self.last_turn);
         self.turn_open = false;
+        self.turn_token = 0;
         self.clearStreamed();
-        if (language_changed) {
-            const owned = try self.alloc.dupe(u8, language_tag);
+        if (owned_language) |owned| {
             if (self.language) |old| self.alloc.free(old);
             self.language = owned;
         }
         if (derived_title != null) self.titled = true;
         self.fresh = false;
+    }
+
+    /// Whether the open turn belongs to another capture token than `owner`,
+    /// a commit's token or 0, so the commit supersedes it instead of
+    /// continuing it, even when nothing streamed into it lets
+    /// `streamedPrefix` tell the turns apart. The supersede holds that
+    /// token's captures again, so its own turn writes them when it opens
+    /// afresh (D98).
+    ///
+    /// A commit with a token knows its turn: a turn another nonzero token
+    /// opened is never its own, as when a kept ended turn's late commit
+    /// finds the next turn open. A plain commit carries no token, so it may
+    /// be the open turn's own, committed without its captures. With pieces
+    /// streamed, their content decides. With none, continuing harms only a
+    /// turn holding its token's written captures, which the commit would
+    /// take, as when ACP commits an earlier turn after the next one opened
+    /// with its start; only that turn is superseded.
+    fn othersOpenTurn(self: *const Session, owner: u64) bool {
+        if (!self.turn_open or self.turn_stale) return false;
+        const token = self.turn_token;
+        if (token == 0 or token == owner) return false;
+        if (owner != 0) return true;
+        if (self.streamed.items.len != 0) return false;
+        for (self.captures.items) |capture| {
+            if (capture.turn == token and capture.written) return true;
+        }
+        return false;
     }
 
     /// Saves each prompt image of the turn as a blob named by its digest
@@ -1823,7 +2484,7 @@ pub const Session = struct {
     /// image stays inline and the prompt goes on.
     fn savePromptImageLocked(self: *Session, bytes: []const u8, digest: []const u8) ![]const u8 {
         // A blob needs the turn on disk (D44).
-        try self.openTurnLocked();
+        try self.openTurnLocked(self.capture_turn);
         const hash = try BlobHost.put(self.host, bytes);
         // The digest names the blob: bytes that do not match it are not
         // saved under it.
@@ -1897,7 +2558,7 @@ pub const Session = struct {
         var events: std.ArrayList(Event) = .empty;
         try events.append(a, .{ .user = .{ .text = user.text, .images = user.images, .work_id = user.work_id } });
         // A result's blob needs the turn on disk first (D44).
-        if (storesBodies(execution)) try self.openTurnLocked();
+        if (storesBodies(execution)) try self.openTurnLocked(self.capture_turn);
         // On a missing handle the list keeps the pieces before it.
         session_event.appendExecutionConversationEvents(a, &events, try self.withResultFiles(a, execution)) catch |err| switch (err) {
             error.ConversationArtifactRequired => {},
@@ -1912,7 +2573,7 @@ pub const Session = struct {
         var tail: std.ArrayList(sm.Event) = .empty;
         if (try self.recoveryItem(a, record)) |piece| try tail.append(a, .{ .item = piece });
         if (!self.turn_open or start < encoded.len) {
-            try self.writePieces(a, events.items[start..], encoded[start..], tail.items, user.author);
+            try self.writePieces(a, events.items[start..], encoded[start..], tail.items, user.author, self.capture_turn);
             try self.streamed.ensureUnusedCapacity(self.alloc, encoded.len - start);
             for (encoded[start..]) |bytes| self.streamed.appendAssumeCapacity(try self.alloc.dupe(u8, bytes));
         } else if (tail.items.len > 0) {
@@ -1927,13 +2588,190 @@ pub const Session = struct {
     pub fn saveRecovery(self: *Session, record: types.RecoveryRecordWrite) !bool {
         self.mutex.lockUncancelable(io_mod.getIo());
         defer self.mutex.unlock(io_mod.getIo());
-        if (!self.turn_open) return false;
+        // A failed turn left open is not the turn the record belongs to: the
+        // fresh turn's first write takes it (D98).
+        if (!self.turn_open or self.turn_stale) return false;
         var arena = std.heap.ArenaAllocator.init(self.alloc);
         defer arena.deinit();
         const a = arena.allocator();
         const piece = (try self.recoveryItem(a, record)) orelse return false;
         _ = try self.write(&.{.{ .item = piece }});
         return true;
+    }
+
+    /// Where a workspace capture goes in its turn (D98).
+    pub const CapturePlace = enum {
+        /// Written in the open turn now, or with the first write of a
+        /// turn not on disk yet.
+        start,
+        /// Held for `commitTurn`, which writes it in the turn's closing
+        /// batch, before `turn_committed` or `turn_interrupted`.
+        end,
+    };
+
+    /// A workspace capture: its payload, owned, the capture token of its
+    /// turn, and whether the open turn holds it on disk.
+    const Capture = struct { data: []u8, place: CapturePlace, turn: u64, written: bool = false };
+
+    /// The turn a workspace capture belongs to (D98), from
+    /// `beginCaptureTurn`. Good only for this Session, and only until that
+    /// turn's `commitTurnWithCaptures` lands or the next `beginCaptureTurn`.
+    pub const CaptureTurn = enum(u64) { _ };
+
+    /// Begins the captures of a new turn and returns its token. A host
+    /// calls it once as each turn starts, saves every capture of that turn
+    /// with the token, and commits the turn with `commitTurnWithCaptures`,
+    /// so one that arrives late is dropped instead of joining a later turn.
+    /// Whatever an earlier token still holds is dropped here, however that
+    /// turn ended, such as a failed commit with no retry or a `prepareTurn`
+    /// that failed (D98).
+    pub fn beginCaptureTurn(self: *Session) CaptureTurn {
+        return self.beginCaptureTurnKeeping(null);
+    }
+
+    /// `beginCaptureTurn`, except that `ended`, when it is the current token
+    /// and its turn's end capture is taken but its commit has not landed,
+    /// keeps its captures for that commit: in the app, a prompt sent while
+    /// the previous answer is still drawn begins its turn before the UI
+    /// commits the previous one. At most one ended turn waits, so one kept
+    /// before is dropped as superseded. A null or other `ended` drops every
+    /// earlier token's captures, as `beginCaptureTurn` does (D98).
+    pub fn beginCaptureTurnKeeping(self: *Session, ended: ?CaptureTurn) CaptureTurn {
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        const keep = if (ended) |token| self.capture_turn != 0 and @backingInt(token) == self.capture_turn else false;
+        self.dropCapturesOf(self.ended_turn, "superseded_token");
+        if (keep) {
+            debug_trace.logf("session", "event=sessions_v2_workspace_captures_kept session={s} reason=ended_turn", .{self.id()});
+            self.ended_turn = self.capture_turn;
+        } else {
+            self.ended_turn = 0;
+            self.dropCapturesOf(self.capture_turn, "superseded_token");
+        }
+        self.capture_turn = capture_turns.fetchAdd(1, .monotonic);
+        // A turn opened for no capture turn and still live is this turn,
+        // started before its token: an ACP prompt or a prompt image opens it
+        // first. When an ended turn is kept, it is that turn's instead: its
+        // `prepareTurn` opens it with no token just before its late commit,
+        // while this turn's writes before now carried the ended token. A turn
+        // an earlier token opened keeps that token.
+        if (self.turn_open and !self.turn_stale and self.turn_token == 0) self.turn_token = if (keep) self.ended_turn else self.capture_turn;
+        return @fromBackingInt(self.capture_turn);
+    }
+
+    const SaveWorkspaceCaptureError = error{
+        InvalidWorkspaceCapture,
+        WorkspaceCaptureTooLarge,
+        /// `turn` has ended: its `commitTurnWithCaptures` landed or a later
+        /// `beginCaptureTurn` replaced it.
+        WorkspaceCaptureTurnClosed,
+    } || sm.AppendError;
+
+    /// Saves `payload`, one repository's workspace capture for `turn`, as a
+    /// `workspace_capture` item outside the streamed pieces, so it never
+    /// supersedes the turn and never reaches the model's messages (D98).
+    /// `payload` is an encoded JSON object this does not interpret, at most
+    /// `max_workspace_capture_bytes`, without line breaks; the caller keeps
+    /// whatever phase it names in step with `place`. Returns true when it is
+    /// written now and false when it is held: an end until
+    /// `commitTurnWithCaptures`, a start until its turn's first write or that
+    /// commit. A crash or `close` before then loses what is held, and so
+    /// does the next `beginCaptureTurn`. A refused payload, a closed turn or
+    /// a failed write keeps nothing.
+    pub fn saveWorkspaceCapture(self: *Session, turn: CaptureTurn, payload: []const u8, place: CapturePlace) SaveWorkspaceCaptureError!bool {
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        const token = @backingInt(turn);
+        if (token == 0 or (token != self.capture_turn and token != self.ended_turn)) {
+            debug_trace.logf("session", "event=sessions_v2_workspace_captures_dropped session={s} reason=turn_closed held=1", .{self.id()});
+            return error.WorkspaceCaptureTurnClosed;
+        }
+        try checkWorkspaceCapture(self.alloc, payload);
+        try self.captures.ensureUnusedCapacity(self.alloc, 1);
+        const data = try self.alloc.dupe(u8, payload);
+        errdefer self.alloc.free(data);
+        // Only the turn this token opened takes it now: a failed turn left
+        // open waits for the fresh turn that replaces it, and a turn opened
+        // for an earlier commit never takes it.
+        const now = place == .start and self.turn_open and !self.turn_stale and self.turn_token == token;
+        if (now) _ = try self.write(&.{.{ .item = capturePiece(data) }});
+        self.captures.appendAssumeCapacity(.{ .data = data, .place = place, .turn = token, .written = now });
+        return now;
+    }
+
+    /// Appends the start captures of `opener`, a capture token, not on
+    /// disk yet to the write that opens its turn; `startedTurn` marks them
+    /// written once that write lands. Only that token's captures go.
+    fn appendHeldStarts(self: *const Session, a: Allocator, batch: *std.ArrayList(sm.Event), opener: u64) !void {
+        if (opener == 0) return;
+        for (self.captures.items) |capture| {
+            if (capture.turn == opener and capture.place == .start and !capture.written) try batch.append(a, .{ .item = capturePiece(capture.data) });
+        }
+    }
+
+    fn clearCaptures(self: *Session) void {
+        for (self.captures.items) |capture| self.alloc.free(capture.data);
+        self.captures.clearRetainingCapacity();
+    }
+
+    /// Forgets the captures of token `turn`, keeping the others in order.
+    fn clearCapturesOf(self: *Session, turn: u64) void {
+        var kept: usize = 0;
+        for (self.captures.items) |capture| {
+            if (capture.turn == turn) {
+                self.alloc.free(capture.data);
+            } else {
+                self.captures.items[kept] = capture;
+                kept += 1;
+            }
+        }
+        self.captures.shrinkRetainingCapacity(kept);
+    }
+
+    /// Forgets the captures of token `turn`, a turn that did not commit.
+    /// When the open turn is that turn's and holds some of them, it is the
+    /// failed turn, left open: the next write closes it as superseded
+    /// rather than adding to it, so readers drop it with its captures
+    /// (D98). Token 0 holds nothing.
+    fn dropCapturesOf(self: *Session, turn: u64, reason: []const u8) void {
+        if (turn == 0) return;
+        self.traceDroppedCapturesOf(turn, reason);
+        for (self.captures.items) |capture| {
+            if (capture.turn == turn and capture.written and self.turn_open and self.turn_token == turn) self.turn_stale = true;
+        }
+        self.clearCapturesOf(turn);
+    }
+
+    /// Names what a drop discards: captures held in memory, and captures
+    /// already in the open turn, which its supersede discards.
+    fn traceDroppedCaptures(self: *const Session, reason: []const u8) void {
+        self.traceDroppedCapturesOf(null, reason);
+    }
+
+    /// `traceDroppedCaptures` for token `turn`'s captures only, or every
+    /// token's when null.
+    fn traceDroppedCapturesOf(self: *const Session, turn: ?u64, reason: []const u8) void {
+        var held: usize = 0;
+        var written: usize = 0;
+        for (self.captures.items) |capture| {
+            if (turn) |token| if (capture.turn != token) continue;
+            if (capture.written) written += 1 else held += 1;
+        }
+        if (held + written > 0) debug_trace.logf("session", "event=sessions_v2_workspace_captures_dropped session={s} reason={s} held={d} written={d}", .{ self.id(), reason, held, written });
+    }
+
+    /// Saves a call a command made through `fx mcp call` in the open turn,
+    /// as it ends (`bridge_call_type`). The shell call that ran the command
+    /// is still running, so the turn is open; with none open, nothing is
+    /// written and the caller logs the row as dropped.
+    pub fn saveBridgeCall(self: *Session, record: types.BridgeCallRecord) !void {
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        if (!self.turn_open) return error.NoOpenTurn;
+        var arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        _ = try self.write(&.{.{ .item = .{ .type = bridge_call_type, .data = try encodeBridgeCall(a, record) } }});
     }
 
     fn recoveryItem(self: *Session, a: Allocator, record: types.RecoveryRecordWrite) !?sm.Piece {
@@ -2066,23 +2904,31 @@ pub const Session = struct {
     /// not open. When the user piece is among them and someone other than
     /// the user wrote it, an `author` item follows it, once: a stream writes
     /// each piece once, and a superseded turn is written afresh.
-    fn writePieces(self: *Session, a: Allocator, events: []const Event, encoded: []const []u8, tail: []const sm.Event, author: types.MessageAuthor) !void {
+    /// `opener` is the capture token of the turn written, as for
+    /// `openTurnLocked`.
+    fn writePieces(self: *Session, a: Allocator, events: []const Event, encoded: []const []u8, tail: []const sm.Event, author: types.MessageAuthor, opener: u64) !void {
         const reviews = try a.alloc(?[]u8, events.len);
         for (events, reviews) |event, *review| review.* = try encodeFileReview(a, event);
         var batch: std.ArrayList(sm.Event) = .empty;
         if (!self.turn_open) {
             try batch.append(a, .turn_started);
+            // Held start captures go with the line that starts the turn (D98).
+            try self.appendHeldStarts(a, &batch, opener);
             const needs_blob = for (encoded, reviews) |bytes, review| {
                 if (bytes.len > max_inline_piece_bytes) break true;
                 if (review) |data| if (data.len > max_inline_piece_bytes) break true;
             } else false;
             if (needs_blob) {
                 _ = try self.write(batch.items);
-                self.startedTurn();
+                self.startedTurn(opener);
                 batch.clearRetainingCapacity();
             }
         }
         for (events, encoded, reviews) |event, bytes, review| {
+            // Before the interruption, which ends the turn when replay reads it.
+            if (try encodeCancelledCommand(a, event)) |data| {
+                try batch.append(a, .{ .item = try self.itemAs(a, cancelled_command_type, data) });
+            }
             try batch.append(a, .{ .item = try self.item(a, std.meta.activeTag(event), bytes) });
             if (review) |data| try batch.append(a, .{ .item = try self.itemAs(a, file_review_type, data) });
             if (event == .user and author != .user) {
@@ -2095,12 +2941,22 @@ pub const Session = struct {
         try batch.appendSlice(a, tail);
         if (batch.items.len == 0) return;
         _ = try self.write(batch.items);
-        if (!self.turn_open) self.startedTurn();
+        if (!self.turn_open) self.startedTurn(opener);
     }
 
-    fn startedTurn(self: *Session) void {
+    /// A turn started on disk for `opener`; it holds that capture token's
+    /// starts (`appendHeldStarts`).
+    fn startedTurn(self: *Session, opener: u64) void {
         self.last_turn += 1;
         self.turn_open = true;
+        self.turn_token = opener;
+        if (opener != 0) self.markStartsWritten(opener);
+    }
+
+    fn markStartsWritten(self: *Session, opener: u64) void {
+        for (self.captures.items) |*capture| {
+            if (capture.turn == opener and capture.place == .start) capture.written = true;
+        }
     }
 
     // -- a conversion's import (D56) -----------------------------------------
@@ -2124,7 +2980,7 @@ pub const Session = struct {
             .interrupted => |entry| storesBodies(entry.execution),
             .compacted_summary => return error.InvalidConversationFrame,
         };
-        if (stores) try self.openTurnLocked();
+        if (stores) try self.openTurnLocked(0);
         try session_log.externalizeConversationTurnResults(a, &copy, try self.capabilityLocked());
         var events: std.ArrayList(Event) = .empty;
         try session_event.appendHistoryTurnConversationEvents(a, &events, copy);
@@ -2165,8 +3021,9 @@ pub const Session = struct {
             } },
             else => return error.InvalidConversationFrame,
         };
-        try self.writePieces(a, events, encoded, &.{end}, author);
+        try self.writePieces(a, events, encoded, &.{end}, author, 0);
         self.turn_open = false;
+        self.turn_token = 0;
     }
 
     /// Lets go of an import, published or not. A published one is opened
@@ -2184,6 +3041,8 @@ pub const Session = struct {
     /// the decision in the session trace, which the driver of
     /// `tests/tla/session/TurnStreamTrace.tla` replays.
     fn streamedPrefix(self: *Session, encoded: []const []u8, phase: StreamPhase, results: usize) !usize {
+        // A failed turn left open is never the one to continue (D98).
+        if (self.turn_open and self.turn_stale) try self.supersedeOpenTurn("failed_turn");
         const streamed = self.streamed.items;
         const held = if (self.turn_open) streamed.len else 0;
         const reparsed: ?usize = if (self.turn_open) reparsedPrefix(self.alloc, streamed, encoded) else 0;
@@ -2193,13 +3052,24 @@ pub const Session = struct {
         if (!self.turn_open) return 0;
         if (reparsed != null) return streamed.len;
         debug_trace.logf("session", "event=sessions_v2_stream_mismatch session={s} streamed={d} final={d} dropped=stale_turn", .{ self.id(), streamed.len, encoded.len });
+        try self.supersedeOpenTurn("stream_mismatch");
+        return 0;
+    }
+
+    /// Closes the open turn as superseded, which readers drop whole; the
+    /// next write starts the turn afresh, with its start captures again
+    /// (D98).
+    fn supersedeOpenTurn(self: *Session, reason: []const u8) !void {
+        debug_trace.logf("session", "event=sessions_v2_turn_superseded session={s} reason={s}", .{ self.id(), reason });
         _ = try self.write(&.{
             .{ .item = .{ .type = superseded_type, .data = "{}" } },
             .{ .turn_interrupted = .failed },
         });
         self.turn_open = false;
+        self.turn_stale = false;
+        self.turn_token = 0;
         self.clearStreamed();
-        return 0;
+        for (self.captures.items) |*capture| capture.written = false;
     }
 
     /// One piece as an item; a large one goes to a blob.
@@ -2246,7 +3116,9 @@ pub const Session = struct {
                 break;
             }
         }
-        if (keep_from == null and active_prefix and self.turn_open) {
+        // A failed turn left open is not the active turn: its fresh turn is
+        // not on disk yet (D98).
+        if (keep_from == null and active_prefix and self.turn_open and !self.turn_stale) {
             keep_from = self.last_turn;
             cut_turn = true;
         }
@@ -2308,6 +3180,20 @@ pub const Session = struct {
         var scratch = std.heap.ArenaAllocator.init(alloc);
         defer scratch.deinit();
         const state = try self.handle.state(scratch.allocator());
+        return childrenOf(alloc, &state);
+    }
+
+    /// The children this session had at the end of the turn before
+    /// `before_turn`, a `ForkPoint.turn`, each as its newest work stood
+    /// then: what `fork` can copy (D97). Free with `freeChildren`.
+    pub fn forkChildren(self: *Session, alloc: Allocator, before_turn: u64) ![]Child {
+        if (before_turn == 0) return error.InvalidForkPoint;
+        var state = try self.store.manager.stateAt(self.id(), .{ .turn = before_turn - 1 });
+        defer state.deinit(self.store.manager.gpa);
+        return childrenOf(alloc, &state);
+    }
+
+    fn childrenOf(alloc: Allocator, state: *const sm.State) ![]Child {
         const out = try alloc.alloc(Child, state.children.items.len);
         var built: usize = 0;
         errdefer {
@@ -2612,23 +3498,14 @@ pub const Session = struct {
         }
     }
 
-    /// `visitHistory` over one compaction cycle: the turns after the
-    /// compaction line at `start`, or from the log's start when null, up to
-    /// the next compaction line. A turn the next compaction splits is not
-    /// visited; the next cycle shows it whole (`cycleStart`). Returns true
-    /// when reading stopped at a damaged line, so turns are missing.
-    pub fn visitHistoryCycle(self: *Session, alloc: Allocator, start: ?sm.Cursor, visitor: anytype) !bool {
-        var sink: VisitorSink(@TypeOf(visitor), .end_cycle) = .{ .alloc = alloc, .visitor = visitor };
-        const from: sm.From = if (start) |cursor| .{ .at = try self.source().cycleStart(alloc, cursor) } else .start;
-        const skip_offset: ?u64 = if (start) |cursor| cursor.offset else null;
-        var damaged = false;
-        var replay_sink = ReplaySink.init(&sink);
-        replay_sink.damaged = &damaged;
-        replay(self.source(), alloc, alloc, from, skip_offset, replay_sink) catch |err| switch (err) {
-            error.CycleEnd => {},
-            else => |other| return other,
-        };
-        return damaged;
+    /// A reader of this session's log that another thread can keep after
+    /// this call returns, such as the one that reads a cycle for Ctrl+O.
+    /// Caller owns it; free it with `CycleReader.deinit` on any thread.
+    pub fn cycleReader(self: *Session, alloc: Allocator) !CycleReader {
+        const files_path = try alloc.dupe(u8, self.files_path);
+        errdefer alloc.free(files_path);
+        BlobHost.retain(self.host);
+        return .{ .alloc = alloc, .store = self.store, .host = self.host, .files_path = files_path };
     }
 
     /// This open's report lines, the first time it is asked, so the reports
@@ -2734,7 +3611,11 @@ pub const Session = struct {
         host: Host,
         /// The title the source shows; the fork gets it marked as a fork.
         title: ?[]const u8 = null,
+        /// The children the fork takes a copy of, from `forkChildren` (D97).
+        children: []const ChildCopy = &.{},
     };
+
+    pub const ChildCopy = sm.ChildCopy;
 
     /// A new session holding this one's log up to the end of the turn before
     /// `options.before_turn`, under a new id (D58). The manager copies the
@@ -2748,6 +3629,7 @@ pub const Session = struct {
             .at = .{ .turn = options.before_turn - 1 },
             .workspace = options.workspace,
             .host = options.host,
+            .children = options.children,
         });
         errdefer handle.release();
         const copy = try init(alloc, self.store, handle, false);
@@ -3125,6 +4007,9 @@ const Source = struct {
 
     fn readTo(src: Source, sa: Allocator, from: sm.From, direction: sm.Direction, limit: usize) !sm.Page {
         if (src.handle) |handle| return handle.read(sa, from, direction, limit);
+        // A `CycleReader` on another thread: through the host, which knows
+        // whether the session is still open.
+        if (src.host) |host| return host.readLog(sa, from, direction, limit);
         return src.store.manager.read(sa, src.id, from, direction, limit);
     }
 
@@ -3250,6 +4135,53 @@ const Source = struct {
         };
     }
 };
+
+/// A session's log as a background thread reads it (`Session.cycleReader`).
+/// It holds the session's blob host, so it reads through the open session
+/// while it is open and through the process's manager after it closes, as a
+/// background reader's capability does (D44). It never touches the
+/// `Session`, which may close and free while the reader works.
+pub const CycleReader = struct {
+    alloc: Allocator,
+    store: *Store,
+    host: *BlobHost,
+    files_path: []u8,
+
+    pub fn deinit(self: *CycleReader) void {
+        self.alloc.free(self.files_path);
+        BlobHost.release(self.host);
+        self.* = undefined;
+    }
+
+    fn source(self: *const CycleReader) Source {
+        return .{ .store = self.store, .id = self.host.id, .host = self.host, .files_path = self.files_path };
+    }
+
+    /// `visitHistory` over one compaction cycle: the turns after the
+    /// compaction line at `start`, or from the log's start when null, up to
+    /// the next compaction line. A turn the next compaction splits is not
+    /// visited; the next cycle shows it whole (`cycleStart`). Returns true
+    /// when reading stopped at a damaged line, so turns are missing.
+    pub fn visitHistoryCycle(self: *const CycleReader, alloc: Allocator, start: ?sm.Cursor, visitor: anytype) !bool {
+        return visitCycle(self.source(), alloc, start, visitor);
+    }
+};
+
+/// The turns of one compaction cycle from `src`, each handed to
+/// `visitor.append` and freed after it returns (`CycleReader.visitHistoryCycle`).
+fn visitCycle(src: Source, alloc: Allocator, start: ?sm.Cursor, visitor: anytype) !bool {
+    var sink: Session.VisitorSink(@TypeOf(visitor), .end_cycle) = .{ .alloc = alloc, .visitor = visitor };
+    const from: sm.From = if (start) |cursor| .{ .at = try src.cycleStart(alloc, cursor) } else .start;
+    const skip_offset: ?u64 = if (start) |cursor| cursor.offset else null;
+    var damaged = false;
+    var replay_sink = ReplaySink.init(&sink);
+    replay_sink.damaged = &damaged;
+    replay(src, alloc, alloc, from, skip_offset, replay_sink) catch |err| switch (err) {
+        error.CycleEnd => {},
+        else => |other| return other,
+    };
+    return damaged;
+}
 
 // ---------------------------------------------------------------------------
 // Converting v1 sessions (D55 to D61, `tests/tla/session_manager/V1Conversion.tla`)
@@ -3404,6 +4336,12 @@ const Conversion = struct {
             switch (err) {
                 error.SessionBusy => debug_trace.logf("convert", "action=Busy session={s}", .{root_id}),
                 error.InvalidSessionFormat => c.traceUnreadable(root_id, root_id),
+                // A member folder others can write, which `problem` names
+                // with its fix (D61): unreadable, as a damaged one is.
+                error.PrivateStatePermissionsUnsupported => {
+                    c.traceUnreadable(root_id, root_id);
+                    return error.InvalidSessionFormat;
+                },
                 // Another process converted it while this one waited, and
                 // removed its v1 folder once v2 held it (D61).
                 error.SessionNotFound => if (holdsV2(store, c.alloc, root_id)) return traceHeld(root_id),
@@ -3467,7 +4405,7 @@ const Conversion = struct {
         store.problem = .{};
         var v1 = try session_store.Store.initReadOnlyFromHome(c.alloc, store.home, "/");
         defer v1.deinit(c.alloc);
-        if (try v1_conversion.kindOf(&v1, c.alloc, root_id) != .root) return error.SessionNotFound;
+        if (try v1_conversion.kindOfRecorded(&v1, c.alloc, root_id, &store.problem) != .root) return error.SessionNotFound;
         var locks = try v1_conversion.lockFamily(c.alloc, &v1, root_id, 0, &store.problem);
         defer locks.release();
         const locked = &locks.members.items[0];
@@ -4130,10 +5068,8 @@ pub fn convertAll(store: *Store, alloc: Allocator) !ConvertReport {
     var reason: [v1_conversion.Problem.capacity]u8 = undefined;
     for (roots) |root| {
         const id = root.id;
-        if (root.unreadable) |why| {
-            try report.skip(alloc, id, "InvalidSessionFormat", why);
-            continue;
-        }
+        // A session v2 holds is converted, whatever its leftover v1 folder
+        // holds; `cleanLeftovers` keeps one it may not take (D61).
         if (store.manager.peek(alloc, id)) |peeked_value| {
             var peeked = peeked_value;
             defer peeked.deinit(alloc);
@@ -4145,6 +5081,10 @@ pub fn convertAll(store: *Store, alloc: Allocator) !ConvertReport {
                 try report.skip(alloc, id, "InvalidSessionFormat", std.mem.print(&reason, "the new store can't read its copy ({s})", .{@errorName(err)}) catch null);
                 continue;
             },
+        }
+        if (root.unreadable) |why| {
+            try report.skip(alloc, id, "InvalidSessionFormat", why);
+            continue;
         }
         var conversion: Conversion = .{ .store = store, .alloc = alloc, .host = .ask, .started = io_mod.nanoTimestamp() };
         defer conversion.deinit();
@@ -4211,7 +5151,13 @@ pub fn freeKeptChildren(alloc: Allocator, kept: []KeptChild) void {
 /// whose parent is gone or does not list it. Reads only. Caller owns the
 /// result; free it with `freeKeptChildren`.
 fn keptChildren(store: *Store, alloc: Allocator) ![]KeptChild {
-    const strays = v1_conversion.strayChildren(alloc, store.home) catch |err| switch (err) {
+    var complete = true;
+    return keptChildrenUntil(store, alloc, null, &complete);
+}
+
+/// `keptChildren`, ended early when `stop` says so; `complete` is then false.
+fn keptChildrenUntil(store: *Store, alloc: Allocator, stop: ?sm.Stop, complete: *bool) ![]KeptChild {
+    const strays = v1_conversion.strayChildren(alloc, store.home, stop, complete) catch |err| switch (err) {
         error.OutOfMemory => return err,
         else => {
             debug_trace.logf("convert", "action=ChildrenUnlisted err={s}", .{@errorName(err)});
@@ -4641,6 +5587,8 @@ noinline fn replay(
                     }
                     // The recovery module's record, which only a launch reads.
                     if (std.mem.eql(u8, piece.type, recovery_type)) continue;
+                    // A workspace capture, evidence beside the conversation (D98).
+                    if (std.mem.eql(u8, piece.type, workspace_capture_type)) continue;
                     const ta = turn_arena.allocator();
                     if (std.mem.eql(u8, piece.type, running_type)) {
                         // Kept for the whole turn: copies, not views of the page.
@@ -4655,6 +5603,14 @@ noinline fn replay(
                     }
                     if (std.mem.eql(u8, piece.type, file_review_type)) {
                         try attachFileReview(src, pa, &builder, piece);
+                        continue;
+                    }
+                    if (std.mem.eql(u8, piece.type, bridge_call_type)) {
+                        try attachBridgeCall(src, pa, &builder, piece);
+                        continue;
+                    }
+                    if (std.mem.eql(u8, piece.type, cancelled_command_type)) {
+                        try noteCancelledCommand(src, pa, &builder, piece);
                         continue;
                     }
                     if (std.mem.eql(u8, piece.type, author_type)) {
@@ -5113,6 +6069,121 @@ fn parseRecoveryRecord(data: []const u8) ?[32]u8 {
     var record: [32]u8 = undefined;
     _ = std.fmt.hexToBytes(&record, rest[0..64]) catch return null;
     return record;
+}
+
+/// One repository's workspace capture at a turn's start or end (D98): fx's
+/// own JSON object, which no reader of the conversation reads. Older
+/// builds drop the piece as an unknown item.
+const workspace_capture_type = "workspace_capture";
+
+fn capturePiece(data: []const u8) sm.Piece {
+    return .{ .type = workspace_capture_type, .data = data };
+}
+
+/// A payload the log can take as one inline item: a JSON object with no
+/// space around it, which the manager refuses, and no line break, which
+/// would split its line.
+fn checkWorkspaceCapture(alloc: Allocator, payload: []const u8) error{ OutOfMemory, InvalidWorkspaceCapture, WorkspaceCaptureTooLarge }!void {
+    if (payload.len > max_workspace_capture_bytes) return error.WorkspaceCaptureTooLarge;
+    if (payload.len < 2 or payload[0] != '{' or payload[payload.len - 1] != '}') return error.InvalidWorkspaceCapture;
+    if (std.mem.findAny(u8, payload, "\r\n") != null) return error.InvalidWorkspaceCapture;
+    if (!try std.json.validate(alloc, payload)) return error.InvalidWorkspaceCapture;
+}
+
+/// A call a command made through `fx mcp call`, saved in the open turn as it
+/// ends, while its shell call still runs. Its data is a
+/// `types.BridgeCallRecord`: the shell call's id, the request id, the tool's
+/// name, and how the call ended, never its arguments or its result. Replay
+/// gives it to the turn, and a resume shows its row in its shell call's
+/// group (D99). Older fx drops it as an unknown item.
+const bridge_call_type = "mcp_bridge_call";
+
+/// The `mcp_bridge_call` item data for `record`, owned by `a`.
+fn encodeBridgeCall(a: Allocator, record: types.BridgeCallRecord) ![]u8 {
+    if (!types.validBridgeCallRecord(record)) return error.InvalidBridgeCall;
+    var out: std.Io.Writer.Allocating = .init(a);
+    errdefer out.deinit();
+    try std.json.Stringify.value(record, .{}, &out.writer);
+    return try out.toOwnedSlice();
+}
+
+/// A bridge call's record from the log, or null when it can't be parsed or
+/// fails its checks, as a newer fx's outcome would. A newer fx's extra
+/// fields are ignored. Strings are in `arena`.
+fn decodeBridgeCall(arena: Allocator, data: []const u8) ?types.BridgeCallRecord {
+    const record = json_decode.parseFromSliceLeaky(types.BridgeCallRecord, arena, data, .{
+        .allocate = .alloc_always,
+        .ignore_unknown_fields = true,
+    }) catch return null;
+    return if (types.validBridgeCallRecord(record)) record else null;
+}
+
+/// Gives the turn the record an `mcp_bridge_call` item holds. One that can't
+/// be read is logged and left out: it only draws a row, so it never fails
+/// the session.
+fn attachBridgeCall(src: Source, a: Allocator, builder: *session_log.ConversationTurnBuilder, piece: sm.Body.Piece) !void {
+    const data = src.pieceData(a, piece) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => {
+            debug_trace.logf("session", "event=sessions_v2_bridge_call_unreadable session={s} err={s} dropped=bridge_call_row", .{ src.id, @errorName(err) });
+            return;
+        },
+    };
+    const record = decodeBridgeCall(a, data) orelse {
+        debug_trace.logf("session", "event=sessions_v2_bridge_call_invalid session={s} dropped=bridge_call_row", .{src.id});
+        return;
+    };
+    try builder.appendBridgeCall(record);
+}
+
+/// The item right before an `interruption` piece when the turn cancelled a
+/// command that saved no output, `{"call_id":…}`: the piece names neither a
+/// command replay nor an artifact, so only this says the command ran, and a
+/// resume shows its row (D100). Older fx versions reject an unknown field in
+/// the piece but skip an unknown item, so they read the turn as before.
+const cancelled_command_type = "cancelled_command";
+
+const CancelledCommandData = struct { call_id: []const u8 };
+
+/// The `cancelled_command` item data for `event`, or null when it needs
+/// none. The data is owned by `a`.
+fn encodeCancelledCommand(a: Allocator, event: Event) !?[]u8 {
+    const interruption = switch (event) {
+        .interrupted => |value| value,
+        else => return null,
+    };
+    const call_id = interruption.cancelled_command_call_id orelse return null;
+    if (call_id.len == 0 or call_id.len > session_event.max_conversation_identity_bytes) return error.InvalidConversationFrame;
+    var out: std.Io.Writer.Allocating = .init(a);
+    errdefer out.deinit();
+    try std.json.Stringify.value(CancelledCommandData{ .call_id = call_id }, .{}, &out.writer);
+    return try out.toOwnedSlice();
+}
+
+/// Gives the turn the cancelled command a `cancelled_command` item names.
+/// One that can't be read is logged and left out, and the turn reads as it
+/// did before the item existed.
+fn noteCancelledCommand(src: Source, a: Allocator, builder: *session_log.ConversationTurnBuilder, piece: sm.Body.Piece) !void {
+    const data = src.pieceData(a, piece) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => {
+            debug_trace.logf("session", "event=sessions_v2_cancelled_command_unreadable session={s} err={s} dropped=cancelled_command_row", .{ src.id, @errorName(err) });
+            return;
+        },
+    };
+    const call_id = decodeCancelledCommand(a, data) orelse {
+        debug_trace.logf("session", "event=sessions_v2_cancelled_command_invalid session={s} dropped=cancelled_command_row", .{src.id});
+        return;
+    };
+    try builder.noteCancelledCommand(call_id);
+}
+
+/// The call id a `cancelled_command` item's data names, or null when the
+/// data isn't one. Fields a newer fx adds are ignored.
+fn decodeCancelledCommand(a: Allocator, data: []const u8) ?[]const u8 {
+    const value = json_decode.parseFromSliceLeaky(CancelledCommandData, a, data, .{ .ignore_unknown_fields = true }) catch return null;
+    if (value.call_id.len == 0 or value.call_id.len > session_event.max_conversation_identity_bytes) return null;
+    return value.call_id;
 }
 
 /// An edit's full-diff rows, saved right after its `tool_result` item rather
@@ -5875,6 +6946,31 @@ test "a child opens under the id its parent names, and its parent folds its line
     try testing.expectEqual(@as(usize, 1), page.items.len);
 }
 
+test "capture retention's catalog lists a child beside its parent (D98)" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    const alloc = testing.allocator;
+    var model = "test-model".*;
+    const parent = try Session.create(alloc, &t.store, "/w", .ask, testSeed(&model));
+    defer parent.close();
+    try parent.commitTurn(assistantTurn("delegate this", "delegated"), types.ConversationLanguage.default());
+    const child_id = "1786460757753-kid";
+    try parent.appendChildLines(&.{.{ .spawned = .{ .child = child_id, .work_id = "w1" } }});
+    {
+        const child = try Session.openChild(alloc, &t.store, parent.id(), child_id, "/w", childSeed(&model, "Be brief."));
+        defer child.close();
+        try child.commitTurn(assistantTurn("task one", "done one"), types.ConversationLanguage.default());
+    }
+    // The session list holds the parent only; the catalog adds its child.
+    var ids_arena = std.heap.ArenaAllocator.init(alloc);
+    defer ids_arena.deinit();
+    const ids = t.store.sessionIds(ids_arena.allocator()).?;
+    try testing.expectEqual(@as(usize, 2), ids.len);
+    try testing.expectEqualStrings(parent.id(), ids[0]);
+    try testing.expectEqualStrings(child_id, ids[1]);
+}
+
 test "the manager guards child lines, and a child without a log reopens under its id (D22, D34)" {
     var t: TestHome = undefined;
     try t.init();
@@ -6237,6 +7333,1382 @@ test "a cleared record leaves the turn resumable without one" {
     try testing.expectEqual(@as(?[32]u8, null), found.record);
 }
 
+const capture_start_a = "{\"repo\":\"a\",\"phase\":\"start\"}";
+const capture_start_b = "{\"repo\":\"b\",\"phase\":\"start\"}";
+const capture_end_a = "{\"repo\":\"a\",\"phase\":\"end\"}";
+const capture_end_b = "{\"repo\":\"b\",\"phase\":\"end\"}";
+
+/// Session `id`'s turn lines in order, each as a short name: `capture
+/// <data>` for a workspace capture, `item <type>` for any other item, and
+/// the end lines with their reason. Settings, snapshots and `closed` are
+/// left out. `a` owns the list.
+fn turnLines(a: Allocator, manager: *sm.Manager, id: []const u8) ![]const []const u8 {
+    var page = try manager.read(testing.allocator, id, .start, .forward, 1000);
+    defer page.deinit();
+    var lines: std.ArrayList([]const u8) = .empty;
+    for (page.entries) |entry| {
+        const body = entry.body orelse continue;
+        const line: []const u8 = switch (body) {
+            .item => |piece| if (std.mem.eql(u8, piece.type, workspace_capture_type))
+                try a.print("capture {s}", .{piece.data})
+            else
+                try a.print("item {s}", .{piece.type}),
+            .turn_interrupted => |ended| try a.print("turn_interrupted {t}", .{ended.reason}),
+            .turn_started, .turn_committed => @tagName(body),
+            .session_created, .compacted, .set, .child_spawned, .child_finished, .snapshot, .closed => continue,
+        };
+        try lines.append(a, line);
+    }
+    return lines.items;
+}
+
+fn expectLines(expected: []const []const u8, actual: []const []const u8) !void {
+    const same = expected.len == actual.len and for (expected, actual) |want, got| {
+        if (!std.mem.eql(u8, want, got)) break false;
+    } else true;
+    if (same) return;
+    std.debug.print("expected lines:\n", .{});
+    for (expected) |line| std.debug.print("  {s}\n", .{line});
+    std.debug.print("actual lines:\n", .{});
+    for (actual) |line| std.debug.print("  {s}\n", .{line});
+    return error.TestExpectedEqual;
+}
+
+/// Saves a capture for `s`'s current capture turn, beginning one when none
+/// is open, as a host does at a turn's start.
+fn saveCapture(s: *Session, payload: []const u8, place: Session.CapturePlace) !bool {
+    const turn: Session.CaptureTurn = if (s.capture_turn == 0) s.beginCaptureTurn() else @fromBackingInt(s.capture_turn);
+    return s.saveWorkspaceCapture(turn, payload, place);
+}
+
+/// Commits `turn` with the current capture turn's token, as a host does
+/// for the turn it began, or plainly when no capture turn is open.
+fn commitCaptured(s: *Session, turn: types.HistoryTurn, language: types.ConversationLanguage) !void {
+    if (s.capture_turn == 0) return s.commitTurn(turn, language);
+    return s.commitTurnWithCaptures(turn, language, @fromBackingInt(s.capture_turn));
+}
+
+/// A finished turn whose one tool result has no stored body yet, so
+/// `prepareTurn` stores it and allocates for it.
+const TurnWithResult = struct {
+    calls: [1]types.ToolCall = .{.{ .id = "call-1", .name = "read_file", .arguments_json = "{}" }},
+    results: [1]types.PersistedToolResult = .{.{
+        .tool_call_id = @constCast("call-1"),
+        .tool_name = @constCast("read_file"),
+        .status = .success,
+        .output = @constCast("file body"),
+        .output_bytes = "file body".len,
+        .stored_output_bytes = "file body".len,
+    }},
+    steps: [1]types.ToolExecutionStep = undefined,
+
+    fn turn(self: *TurnWithResult, user: types.UserTurn) types.HistoryTurn {
+        self.steps = .{.{ .tool_calls = &self.calls, .tool_results = &self.results }};
+        return .{ .assistant = .{ .user = user, .assistant = @constCast("read"), .execution = .{ .tool_steps = &self.steps } } };
+    }
+};
+
+/// How many of `lines` are `capture <payload>`.
+fn countCaptureLines(lines: []const []const u8, payload: []const u8) usize {
+    var n: usize = 0;
+    for (lines) |line| {
+        if (std.mem.startsWith(u8, line, "capture ") and std.mem.eql(u8, line["capture ".len..], payload)) n += 1;
+    }
+    return n;
+}
+
+/// The lines of the newest turn: from its `turn_started` on.
+fn newestTurn(lines: []const []const u8) []const []const u8 {
+    var from: usize = 0;
+    for (lines, 0..) |line, i| {
+        if (std.mem.eql(u8, line, "turn_started")) from = i;
+    }
+    return lines[from..];
+}
+
+/// Fails unless `got` and `want` give the model the same messages: the same
+/// summaries, and each turn's pieces encoded alike.
+fn expectSameHistory(a: Allocator, want: []const types.HistoryTurn, got: []const types.HistoryTurn) !void {
+    try testing.expectEqual(want.len, got.len);
+    for (want, got) |want_turn, got_turn| {
+        if (want_turn == .compacted_summary) {
+            try testing.expectEqualStrings(want_turn.compacted_summary.summary, got_turn.compacted_summary.summary);
+            continue;
+        }
+        var want_events: std.ArrayList(Event) = .empty;
+        var got_events: std.ArrayList(Event) = .empty;
+        try session_event.appendHistoryTurnConversationEvents(a, &want_events, want_turn);
+        try session_event.appendHistoryTurnConversationEvents(a, &got_events, got_turn);
+        try testing.expectEqual(want_events.items.len, got_events.items.len);
+        for (want_events.items, got_events.items) |want_event, got_event| {
+            try testing.expectEqualStrings(try encodePiece(a, want_event), try encodePiece(a, got_event));
+        }
+    }
+}
+
+test "workspace capture: a failed commit with no retry loses its captures to the next turn's token, and the next turn never holds them" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var model = "m".*;
+    const language = types.ConversationLanguage.default();
+    const one: types.UserTurn = .{ .text = @constCast("one") };
+    const two: types.UserTurn = .{ .text = @constCast("two") };
+    // Fails each allocation of the commit in turn, until one commits. Every
+    // failure here comes before the batch reaches the log. A write that
+    // lands and still reports an I/O fault (`writeMayHaveLanded`) is not
+    // covered: fx builds the manager without the storage fault hooks its own
+    // tests use, and after such a fault the manager refuses further writes
+    // (D40), so no later turn could hold the failed turn's captures.
+    var extra: usize = 0;
+    var failures: usize = 0;
+    while (true) : (extra += 1) {
+        var failing = std.testing.FailingAllocator.init(testing_allocator.no_resize, .{});
+        const s = try Session.create(failing.allocator(), &t.store, "/w", .app, testSeed(&model));
+        defer s.close();
+        try testing.expect(!try saveCapture(s, capture_start_a, .start));
+        try s.appendProgress(one, .{}, .{});
+        try testing.expect(!try saveCapture(s, capture_end_a, .end));
+        failing.fail_index = failing.alloc_index + extra;
+        const result = commitCaptured(s, .{ .assistant = .{ .user = one, .assistant = @constCast("done") } }, language);
+        failing.fail_index = std.math.maxInt(usize);
+        const committed = if (result) |_| true else |err| blk: {
+            try testing.expectEqual(error.OutOfMemory, err);
+            failures += 1;
+            break :blk false;
+        };
+        // The host goes on with the same session, as `commitV2HistoryTurn`
+        // and ACP's prompt do after a failed save, and begins the next turn.
+        if (!committed) _ = s.beginCaptureTurn();
+        try s.appendProgress(two, .{}, .{});
+        try testing.expect(!try saveCapture(s, capture_end_b, .end));
+        try commitCaptured(s, .{ .assistant = .{ .user = two, .assistant = @constCast("ok") } }, language);
+        const lines = try turnLines(a, t.store.manager, s.id());
+        const newest = newestTurn(lines);
+        try testing.expectEqual(@as(usize, 0), countCaptureLines(newest, capture_start_a));
+        try testing.expectEqual(@as(usize, 0), countCaptureLines(newest, capture_end_a));
+        try testing.expectEqual(@as(usize, 1), countCaptureLines(newest, capture_end_b));
+        // The failed turn's captures are written at most once each, and its
+        // end only with a commit that landed.
+        try testing.expectEqual(@as(usize, 1), countCaptureLines(lines, capture_start_a));
+        try testing.expectEqual(@as(usize, @intFromBool(committed)), countCaptureLines(lines, capture_end_a));
+        if (committed) break;
+    }
+    try testing.expect(failures > 0);
+}
+
+test "workspace capture: a capture for a turn that has closed is dropped, never put in the next turn" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var model = "m".*;
+    const language = types.ConversationLanguage.default();
+    const s = try Session.create(testing.allocator, &t.store, "/w", .app, testSeed(&model));
+    defer s.close();
+    const first = s.beginCaptureTurn();
+    try s.appendProgress(.{ .text = @constCast("one") }, .{}, .{});
+    try testing.expect(try s.saveWorkspaceCapture(first, capture_start_a, .start));
+    try commitCaptured(s, assistantTurn("one", "1"), language);
+    // Late: its turn has closed.
+    try testing.expectError(error.WorkspaceCaptureTurnClosed, s.saveWorkspaceCapture(first, capture_end_a, .end));
+    try testing.expectError(error.WorkspaceCaptureTurnClosed, s.saveWorkspaceCapture(first, capture_start_b, .start));
+    try testing.expectEqual(@as(usize, 0), s.captures.items.len);
+
+    // The next turn's token, taken before the turn is on disk, stays good
+    // once it is.
+    const second = s.beginCaptureTurn();
+    try testing.expect(second != first);
+    try testing.expect(!try s.saveWorkspaceCapture(second, capture_start_b, .start));
+    try s.appendProgress(.{ .text = @constCast("two") }, .{}, .{});
+    try testing.expect(!try s.saveWorkspaceCapture(second, capture_end_b, .end));
+    try commitCaptured(s, assistantTurn("two", "2"), language);
+    try expectLines(&.{
+        "turn_started",
+        "item user",
+        "capture " ++ capture_start_a,
+        "item assistant",
+        "item turn_end",
+        "turn_committed",
+        "turn_started",
+        "capture " ++ capture_start_b,
+        "item user",
+        "item assistant",
+        "item turn_end",
+        "capture " ++ capture_end_b,
+        "turn_committed",
+    }, try turnLines(a, t.store.manager, s.id()));
+}
+
+test "workspace capture: an ended turn kept by the next keeps its captures for its own commit, and the next turn its own" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var model = "m".*;
+    const language = types.ConversationLanguage.default();
+    const s = try Session.create(testing.allocator, &t.store, "/w", .app, testSeed(&model));
+    defer s.close();
+    const first = s.beginCaptureTurn();
+    try testing.expect(!try s.saveWorkspaceCapture(first, capture_start_a, .start));
+    try testing.expect(!try s.saveWorkspaceCapture(first, capture_end_a, .end));
+    // The first turn's end is taken; the next begins before its commit.
+    const second = s.beginCaptureTurnKeeping(first);
+    try testing.expect(second != first);
+    try testing.expect(!try s.saveWorkspaceCapture(second, capture_start_b, .start));
+    // The second may even end before the UI commits the first.
+    try testing.expect(!try s.saveWorkspaceCapture(second, capture_end_b, .end));
+    try s.commitTurnWithCaptures(assistantTurn("one", "1"), language, first);
+    try s.commitTurnWithCaptures(assistantTurn("two", "2"), language, second);
+    try expectLines(&.{
+        "turn_started",
+        "capture " ++ capture_start_a,
+        "item user",
+        "item assistant",
+        "item turn_end",
+        "capture " ++ capture_end_a,
+        "turn_committed",
+        "turn_started",
+        "capture " ++ capture_start_b,
+        "item user",
+        "item assistant",
+        "item turn_end",
+        "capture " ++ capture_end_b,
+        "turn_committed",
+    }, try turnLines(a, t.store.manager, s.id()));
+    try testing.expectEqual(@as(usize, 0), s.captures.items.len);
+}
+
+test "workspace capture: in the app's order, a kept ended turn and the next each commit their own captures across supersedes" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var model = "m".*;
+    const language = types.ConversationLanguage.default();
+    const s = try Session.create(testing.allocator, &t.store, "/w", .app, testSeed(&model));
+    defer s.close();
+    const one: types.UserTurn = .{ .text = @constCast("one") };
+    const two: types.UserTurn = .{ .text = @constCast("two") };
+    const first = s.beginCaptureTurn();
+    try s.appendProgress(one, .{}, .{});
+    try testing.expect(try s.saveWorkspaceCapture(first, capture_start_a, .start));
+    try testing.expect(!try s.saveWorkspaceCapture(first, capture_end_a, .end));
+    // The next prompt begins while the UI still draws the first answer: its
+    // start waits, since the open turn is the first one's.
+    const second = s.beginCaptureTurnKeeping(first);
+    try testing.expect(!try s.saveWorkspaceCapture(second, capture_start_b, .start));
+    // Its stream replaces the first turn's open turn, then the UI's late
+    // commit of the first turn replaces the second's.
+    try s.appendProgress(two, .{}, .{});
+    try s.commitTurnWithCaptures(.{ .assistant = .{ .user = one, .assistant = @constCast("1") } }, language, first);
+    try s.appendProgress(two, .{}, .{});
+    try testing.expect(!try s.saveWorkspaceCapture(second, capture_end_b, .end));
+    try s.commitTurnWithCaptures(.{ .assistant = .{ .user = two, .assistant = @constCast("2") } }, language, second);
+    try expectLines(&.{
+        "turn_started",
+        "item user",
+        "capture " ++ capture_start_a,
+        "item superseded",
+        "turn_interrupted failed",
+        "turn_started",
+        "capture " ++ capture_start_b,
+        "item user",
+        "item superseded",
+        "turn_interrupted failed",
+        "turn_started",
+        "capture " ++ capture_start_a,
+        "item user",
+        "item assistant",
+        "item turn_end",
+        "capture " ++ capture_end_a,
+        "turn_committed",
+        "turn_started",
+        "capture " ++ capture_start_b,
+        "item user",
+        "item assistant",
+        "item turn_end",
+        "capture " ++ capture_end_b,
+        "turn_committed",
+    }, try turnLines(a, t.store.manager, s.id()));
+}
+
+test "workspace capture: at most one ended turn waits, so a third turn drops the oldest's captures" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var model = "m".*;
+    const language = types.ConversationLanguage.default();
+    const s = try Session.create(testing.allocator, &t.store, "/w", .app, testSeed(&model));
+    defer s.close();
+    const first = s.beginCaptureTurn();
+    _ = try s.saveWorkspaceCapture(first, capture_start_a, .start);
+    _ = try s.saveWorkspaceCapture(first, capture_end_a, .end);
+    const second = s.beginCaptureTurnKeeping(first);
+    _ = try s.saveWorkspaceCapture(second, capture_start_b, .start);
+    _ = try s.saveWorkspaceCapture(second, capture_end_b, .end);
+    const third = s.beginCaptureTurnKeeping(second);
+    try testing.expectError(error.WorkspaceCaptureTurnClosed, s.saveWorkspaceCapture(first, capture_end_a, .end));
+    try testing.expectEqual(@as(usize, 2), s.captures.items.len);
+    // The oldest commits without captures; the others keep theirs.
+    try s.commitTurnWithCaptures(assistantTurn("one", "1"), language, first);
+    try s.commitTurnWithCaptures(assistantTurn("two", "2"), language, second);
+    try s.commitTurnWithCaptures(assistantTurn("three", "3"), language, third);
+    const lines = try turnLines(a, t.store.manager, s.id());
+    try testing.expectEqual(@as(usize, 0), countCaptureLines(lines, capture_start_a));
+    try testing.expectEqual(@as(usize, 0), countCaptureLines(lines, capture_end_a));
+    try testing.expectEqual(@as(usize, 1), countCaptureLines(lines, capture_start_b));
+    try testing.expectEqual(@as(usize, 1), countCaptureLines(lines, capture_end_b));
+}
+
+test "workspace capture: a turn abandoned before its end is still dropped and superseded by the next" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var model = "m".*;
+    const language = types.ConversationLanguage.default();
+    const s = try Session.create(testing.allocator, &t.store, "/w", .app, testSeed(&model));
+    defer s.close();
+    const first = s.beginCaptureTurn();
+    try s.appendProgress(.{ .text = @constCast("one") }, .{}, .{});
+    try testing.expect(try s.saveWorkspaceCapture(first, capture_start_a, .start));
+    // No end was taken, so the host keeps nothing: the next turn drops the
+    // first's captures and its open turn is superseded.
+    const second = s.beginCaptureTurnKeeping(null);
+    try s.appendProgress(.{ .text = @constCast("two") }, .{}, .{});
+    _ = try s.saveWorkspaceCapture(second, capture_end_b, .end);
+    try s.commitTurnWithCaptures(assistantTurn("two", "2"), language, second);
+    try expectLines(&.{
+        "turn_started",
+        "item user",
+        "capture " ++ capture_start_a,
+        "item superseded",
+        "turn_interrupted failed",
+        "turn_started",
+        "item user",
+        "item assistant",
+        "item turn_end",
+        "capture " ++ capture_end_b,
+        "turn_committed",
+    }, try turnLines(a, t.store.manager, s.id()));
+}
+
+test "workspace capture: a failed commit of a turn opened without a stream never lends its turn to the next" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var model = "m".*;
+    const language = types.ConversationLanguage.default();
+    // As ACP opens a prompt's turn, or a subagent child's, which streams
+    // nothing: each allocation of the commit fails in turn, until one commits.
+    var extra: usize = 0;
+    var failures: usize = 0;
+    while (true) : (extra += 1) {
+        var failing = std.testing.FailingAllocator.init(testing_allocator.no_resize, .{});
+        const s = try Session.create(failing.allocator(), &t.store, "/w", .app, testSeed(&model));
+        defer s.close();
+        const first = s.beginCaptureTurn();
+        try testing.expect(!try s.saveWorkspaceCapture(first, capture_start_a, .start));
+        try s.beginTurn();
+        try testing.expect(!try s.saveWorkspaceCapture(first, capture_end_a, .end));
+        failing.fail_index = failing.alloc_index + extra;
+        const result = commitCaptured(s, assistantTurn("one", "1"), language);
+        failing.fail_index = std.math.maxInt(usize);
+        const committed = if (result) |_| true else |err| blk: {
+            try testing.expectEqual(error.OutOfMemory, err);
+            failures += 1;
+            break :blk false;
+        };
+        const second = s.beginCaptureTurn();
+        try s.beginTurn();
+        try testing.expect(try s.saveWorkspaceCapture(second, capture_start_b, .start));
+        try testing.expect(!try s.saveWorkspaceCapture(second, capture_end_b, .end));
+        try commitCaptured(s, assistantTurn("two", "2"), language);
+        const lines = try turnLines(a, t.store.manager, s.id());
+        try expectLines(&.{
+            "turn_started",
+            "capture " ++ capture_start_b,
+            "item user",
+            "item assistant",
+            "item turn_end",
+            "capture " ++ capture_end_b,
+            "turn_committed",
+        }, newestTurn(lines));
+        try testing.expectEqual(@as(usize, 1), countCaptureLines(lines, capture_start_a));
+        try testing.expectEqual(@as(usize, @intFromBool(committed)), countCaptureLines(lines, capture_end_a));
+        // The failed turn is left superseded, not open for the next one.
+        if (!committed) try testing.expectEqual(@as(usize, 1), try countItems(t.store.manager, s.id(), superseded_type));
+        if (committed) break;
+    }
+    try testing.expect(failures > 0);
+}
+
+test "workspace capture: a turn that never reaches commitTurn loses its held captures to the next turn's token" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var model = "m".*;
+    const language = types.ConversationLanguage.default();
+    for ([_]bool{ true, false }) |streams| {
+        var failing = std.testing.FailingAllocator.init(testing_allocator.no_resize, .{});
+        const s = try Session.create(failing.allocator(), &t.store, "/w", .app, testSeed(&model));
+        defer s.close();
+        const first = s.beginCaptureTurn();
+        const one: types.UserTurn = .{ .text = @constCast("one") };
+        if (streams) try s.appendProgress(one, .{}, .{}) else try s.beginTurn();
+        try testing.expect(try s.saveWorkspaceCapture(first, capture_start_a, .start));
+        try testing.expect(!try s.saveWorkspaceCapture(first, capture_end_a, .end));
+        // Storing the turn's tool result fails, so the host never commits it.
+        var with_result: TurnWithResult = .{};
+        var turn = with_result.turn(one);
+        failing.fail_index = failing.alloc_index;
+        try testing.expectError(error.OutOfMemory, s.prepareTurn(&turn));
+        failing.fail_index = std.math.maxInt(usize);
+        try testing.expect(with_result.results[0].output_handle == null);
+
+        const second = s.beginCaptureTurn();
+        try testing.expect(second != first);
+        try testing.expectError(error.WorkspaceCaptureTurnClosed, s.saveWorkspaceCapture(first, capture_end_a, .end));
+        const two: types.UserTurn = .{ .text = @constCast("two") };
+        if (streams) try s.appendProgress(two, .{}, .{}) else try s.beginTurn();
+        try testing.expect(!try s.saveWorkspaceCapture(second, capture_end_b, .end));
+        try commitCaptured(s, .{ .assistant = .{ .user = two, .assistant = @constCast("2") } }, language);
+        const lines = try turnLines(a, t.store.manager, s.id());
+        const newest = newestTurn(lines);
+        try testing.expectEqual(@as(usize, 0), countCaptureLines(newest, capture_start_a));
+        try testing.expectEqual(@as(usize, 1), countCaptureLines(newest, capture_end_b));
+        try testing.expectEqual(@as(usize, 1), countCaptureLines(lines, capture_start_a));
+        try testing.expectEqual(@as(usize, 0), countCaptureLines(lines, capture_end_a));
+        try testing.expectEqual(@as(usize, 1), try countItems(t.store.manager, s.id(), superseded_type));
+    }
+}
+
+test "workspace capture: a token never matches another Session's turn" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var model = "m".*;
+    const s = try Session.create(testing.allocator, &t.store, "/w", .app, testSeed(&model));
+    const other = try Session.create(testing.allocator, &t.store, "/w", .app, testSeed(&model));
+    defer other.close();
+    const mine = s.beginCaptureTurn();
+    const theirs = other.beginCaptureTurn();
+    try testing.expect(mine != theirs);
+    try testing.expectError(error.WorkspaceCaptureTurnClosed, other.saveWorkspaceCapture(mine, capture_start_a, .start));
+    try commitCaptured(s, assistantTurn("one", "1"), types.ConversationLanguage.default());
+    const id = try testing.allocator.dupe(u8, s.id());
+    defer testing.allocator.free(id);
+    s.close();
+    // Nor the turn of the object that reopens the same session.
+    const r = try Session.resumeSession(testing.allocator, &t.store, .{ .id = id }, "/w", .app);
+    defer r.close();
+    try testing.expectError(error.WorkspaceCaptureTurnClosed, r.saveWorkspaceCapture(mine, capture_start_a, .start));
+    const resumed = r.beginCaptureTurn();
+    try testing.expect(resumed != mine and resumed != theirs);
+    try testing.expect(!try r.saveWorkspaceCapture(resumed, capture_start_a, .start));
+}
+
+test "workspace capture: a compacted session gives the model the same messages as one without captures" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var model = "m".*;
+    const language = types.ConversationLanguage.default();
+    var ids: [2][]const u8 = undefined;
+    for ([_]bool{ true, false }, &ids) |with_captures, *id| {
+        const s = try Session.create(testing.allocator, &t.store, "/w", .app, testSeed(&model));
+        for ([_][]const u8{ "one", "two", "three" }) |prompt| {
+            if (with_captures) _ = try saveCapture(s, capture_start_a, .start);
+            try s.appendProgress(.{ .text = @constCast(prompt) }, .{}, .{});
+            if (with_captures) _ = try saveCapture(s, capture_end_a, .end);
+            try commitCaptured(s, assistantTurn(prompt, "ok"), language);
+        }
+        var summary = "turns one and two".*;
+        try s.commitCompaction(.{ .summary = &summary, .removed_turn_count = 2, .compaction_count = 1 }, false, .{ .turns = 2 });
+        // A turn after the compaction, and one a crash leaves open.
+        if (with_captures) _ = try saveCapture(s, capture_start_b, .start);
+        try s.appendProgress(.{ .text = @constCast("four") }, .{}, .{});
+        if (with_captures) _ = try saveCapture(s, capture_end_b, .end);
+        try commitCaptured(s, assistantTurn("four", "4"), language);
+        try s.appendProgress(.{ .text = @constCast("five") }, .{}, .{});
+        if (with_captures) try testing.expect(try saveCapture(s, capture_start_b, .start));
+        id.* = try a.dupe(u8, s.id());
+        crashSession(s);
+    }
+    try testing.expectEqual(@as(usize, 9), try countItems(t.store.manager, ids[0], workspace_capture_type));
+
+    var restored: [2]Restored = undefined;
+    for (ids, &restored) |id, *value| {
+        const r = try Session.resumeSession(testing.allocator, &t.store, .{ .id = id }, "/w", .app);
+        defer r.close();
+        value.* = try r.restore(testing.allocator);
+    }
+    defer for (&restored) |*value| value.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 4), restored[0].history.len);
+    try testing.expectEqualStrings("turns one and two", restored[0].history[0].compacted_summary.summary);
+    try testing.expectEqualStrings("five", restored[0].history[3].interrupted.user.text);
+    try expectSameHistory(a, restored[1].history, restored[0].history);
+}
+
+/// `{"x":"xx…x"}`, exactly `len` bytes long. `a` owns it.
+fn objectOfLength(a: Allocator, len: usize) ![]u8 {
+    const bytes = try a.alloc(u8, len);
+    @memset(bytes, 'x');
+    @memcpy(bytes[0..6], "{\"x\":\"");
+    @memcpy(bytes[len - 2 ..], "\"}");
+    return bytes;
+}
+
+/// Ends `s` as a killed process would: its lock and files let go with
+/// nothing more written, and what it held only in memory gone.
+fn crashSession(s: *Session) void {
+    s.host.detach();
+    s.handle.inner.abandon();
+    s.destroyInner();
+}
+
+test "workspace capture: a start in a turn already on disk is written at once and supersedes nothing" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var model = "m".*;
+    const s = try Session.create(testing.allocator, &t.store, "/w", .app, testSeed(&model));
+    defer s.close();
+    const user: types.UserTurn = .{ .text = @constCast("go") };
+    try s.appendProgress(user, .{}, .{});
+    try testing.expect(try saveCapture(s, capture_start_a, .start));
+    try expectLines(&.{ "turn_started", "item user", "capture " ++ capture_start_a }, try turnLines(a, t.store.manager, s.id()));
+    // The capture is no streamed piece: the next stream write and the
+    // commit add only their own pieces.
+    try s.appendProgress(user, .{}, .{});
+    try commitCaptured(s, .{ .assistant = .{ .user = user, .assistant = @constCast("done") } }, types.ConversationLanguage.default());
+    try expectLines(&.{
+        "turn_started",
+        "item user",
+        "capture " ++ capture_start_a,
+        "item assistant",
+        "item turn_end",
+        "turn_committed",
+    }, try turnLines(a, t.store.manager, s.id()));
+    try testing.expectEqual(@as(usize, 0), try countItems(t.store.manager, s.id(), superseded_type));
+}
+
+test "workspace capture: a start before the turn is on disk rides with the turn's first write" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var model = "m".*;
+
+    // The first stream write.
+    const s = try Session.create(testing.allocator, &t.store, "/w", .app, testSeed(&model));
+    defer s.close();
+    try testing.expect(!try saveCapture(s, capture_start_a, .start));
+    try testing.expect(!try saveCapture(s, capture_start_b, .start));
+    // Held in memory only: nothing is on disk yet.
+    try testing.expect(!s.saved());
+    try s.appendProgress(.{ .text = @constCast("go") }, .{}, .{});
+    try expectLines(&.{
+        "turn_started",
+        "capture " ++ capture_start_a,
+        "capture " ++ capture_start_b,
+        "item user",
+    }, try turnLines(a, t.store.manager, s.id()));
+
+    // A turn opened before its first piece, as a subagent child's or an ACP prompt's.
+    const opened = try Session.create(testing.allocator, &t.store, "/w", .app, testSeed(&model));
+    defer opened.close();
+    try testing.expect(!try saveCapture(opened, capture_start_a, .start));
+    try opened.beginTurn();
+    try expectLines(&.{ "turn_started", "capture " ++ capture_start_a }, try turnLines(a, t.store.manager, opened.id()));
+    // Written once: the stream that follows does not write it again.
+    try opened.appendProgress(.{ .text = @constCast("go") }, .{}, .{});
+    try expectLines(&.{ "turn_started", "capture " ++ capture_start_a, "item user" }, try turnLines(a, t.store.manager, opened.id()));
+}
+
+test "workspace capture: ends join the closing batch before turn_committed or turn_interrupted, in order" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var model = "m".*;
+    const s = try Session.create(testing.allocator, &t.store, "/w", .app, testSeed(&model));
+    defer s.close();
+    const language = types.ConversationLanguage.default();
+
+    // A committed turn with two repositories.
+    const user: types.UserTurn = .{ .text = @constCast("one") };
+    try s.appendProgress(user, .{}, .{});
+    try testing.expect(try saveCapture(s, capture_start_a, .start));
+    try testing.expect(try saveCapture(s, capture_start_b, .start));
+    try testing.expect(!try saveCapture(s, capture_end_a, .end));
+    try testing.expect(!try saveCapture(s, capture_end_b, .end));
+    // Ends wait for the close.
+    try testing.expectEqual(@as(usize, 2), try countItems(t.store.manager, s.id(), workspace_capture_type));
+    try commitCaptured(s, .{ .assistant = .{ .user = user, .assistant = @constCast("done") } }, language);
+
+    // A cancelled turn.
+    const next: types.UserTurn = .{ .text = @constCast("two") };
+    try s.appendProgress(next, .{}, .{});
+    try testing.expect(!try saveCapture(s, capture_end_a, .end));
+    try commitCaptured(s, .{ .interrupted = .{ .user = next, .terminal_reason = .cancelled } }, language);
+
+    // A turn never streamed, which its commit writes whole.
+    try testing.expect(!try saveCapture(s, capture_start_b, .start));
+    try testing.expect(!try saveCapture(s, capture_end_b, .end));
+    try commitCaptured(s, assistantTurn("three", "ok"), language);
+
+    try expectLines(&.{
+        "turn_started",
+        "item user",
+        "capture " ++ capture_start_a,
+        "capture " ++ capture_start_b,
+        "item assistant",
+        "item turn_end",
+        "capture " ++ capture_end_a,
+        "capture " ++ capture_end_b,
+        "turn_committed",
+        "turn_started",
+        "item user",
+        "item interruption",
+        "capture " ++ capture_end_a,
+        "turn_interrupted cancel",
+        "turn_started",
+        "capture " ++ capture_start_b,
+        "item user",
+        "item assistant",
+        "item turn_end",
+        "capture " ++ capture_end_b,
+        "turn_committed",
+    }, try turnLines(a, t.store.manager, s.id()));
+}
+
+test "workspace capture: a turn superseded for its own reasons writes its captures again in the fresh turn" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var model = "m".*;
+    const s = try Session.create(testing.allocator, &t.store, "/w", .app, testSeed(&model));
+    try s.appendProgress(.{ .text = @constCast("draft") }, .{}, .{});
+    try testing.expect(try saveCapture(s, capture_start_a, .start));
+    try testing.expect(!try saveCapture(s, capture_end_a, .end));
+    try commitCaptured(s, assistantTurn("final", "answer"), types.ConversationLanguage.default());
+    const id = try a.dupe(u8, s.id());
+    s.close();
+    try expectLines(&.{
+        "turn_started",
+        "item user",
+        "capture " ++ capture_start_a,
+        "item superseded",
+        "turn_interrupted failed",
+        "turn_started",
+        "capture " ++ capture_start_a,
+        "item user",
+        "item assistant",
+        "item turn_end",
+        "capture " ++ capture_end_a,
+        "turn_committed",
+    }, try turnLines(a, t.store.manager, id));
+
+    const r = try Session.resumeSession(testing.allocator, &t.store, .{ .id = id }, "/w", .app);
+    defer r.close();
+    var restored = try r.restore(testing.allocator);
+    defer restored.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 1), restored.history.len);
+    try testing.expectEqualStrings("final", restored.history[0].assistant.user.text);
+}
+
+test "workspace capture: a resumed session keeps its captures, and its history never shows them" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var model = "m".*;
+    const language = types.ConversationLanguage.default();
+    const s = try Session.create(testing.allocator, &t.store, "/w", .app, testSeed(&model));
+    const user: types.UserTurn = .{ .text = @constCast("go") };
+    try s.appendProgress(user, .{}, .{});
+    _ = try saveCapture(s, capture_start_a, .start);
+    _ = try saveCapture(s, capture_end_a, .end);
+    try commitCaptured(s, .{ .assistant = .{ .user = user, .assistant = @constCast("done") } }, language);
+    const id = try a.dupe(u8, s.id());
+    s.close();
+    // The same turn without captures, for the history it should give.
+    const plain = try Session.create(testing.allocator, &t.store, "/w", .app, testSeed(&model));
+    try plain.appendProgress(user, .{}, .{});
+    try commitCaptured(plain, .{ .assistant = .{ .user = user, .assistant = @constCast("done") } }, language);
+    const plain_id = try a.dupe(u8, plain.id());
+    plain.close();
+
+    const r = try Session.resumeSession(testing.allocator, &t.store, .{ .id = id }, "/w", .app);
+    defer r.close();
+    var restored = try r.restore(testing.allocator);
+    defer restored.deinit(testing.allocator);
+    const p = try Session.resumeSession(testing.allocator, &t.store, .{ .id = plain_id }, "/w", .app);
+    defer p.close();
+    var expected = try p.restore(testing.allocator);
+    defer expected.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 1), restored.history.len);
+    try testing.expectEqual(expected.history.len, restored.history.len);
+    // Each turn, as the model's messages are built from it, is the same.
+    var got: std.ArrayList(Event) = .empty;
+    var want: std.ArrayList(Event) = .empty;
+    try session_event.appendHistoryTurnConversationEvents(a, &got, restored.history[0]);
+    try session_event.appendHistoryTurnConversationEvents(a, &want, expected.history[0]);
+    try testing.expectEqual(want.items.len, got.items.len);
+    for (want.items, got.items) |want_event, got_event| {
+        try testing.expectEqualStrings(try encodePiece(a, want_event), try encodePiece(a, got_event));
+    }
+
+    // The resumed session goes on, and every capture stays where it was.
+    const again: types.UserTurn = .{ .text = @constCast("again") };
+    try r.appendProgress(again, .{}, .{});
+    try testing.expect(try saveCapture(r, capture_start_b, .start));
+    try commitCaptured(r, .{ .assistant = .{ .user = again, .assistant = @constCast("ok") } }, language);
+    try expectLines(&.{
+        "turn_started",
+        "item user",
+        "capture " ++ capture_start_a,
+        "item assistant",
+        "item turn_end",
+        "capture " ++ capture_end_a,
+        "turn_committed",
+        "turn_started",
+        "item user",
+        "capture " ++ capture_start_b,
+        "item assistant",
+        "item turn_end",
+        "turn_committed",
+    }, try turnLines(a, t.store.manager, id));
+}
+
+test "workspace capture: a fork keeps the captures of the turns it copies, and only those" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var model = "m".*;
+    const language = types.ConversationLanguage.default();
+    const s = try Session.create(testing.allocator, &t.store, "/w", .app, testSeed(&model));
+    defer s.close();
+    _ = try saveCapture(s, capture_start_a, .start);
+    _ = try saveCapture(s, capture_end_a, .end);
+    try commitCaptured(s, assistantTurn("first", "1"), language);
+    _ = try saveCapture(s, capture_start_b, .start);
+    _ = try saveCapture(s, capture_end_b, .end);
+    try commitCaptured(s, assistantTurn("second", "2"), language);
+    const source = try turnLines(a, t.store.manager, s.id());
+    const points = try s.forkPoints(testing.allocator);
+    defer Session.freeForkPoints(testing.allocator, points);
+    try testing.expectEqual(@as(usize, 2), points.len);
+
+    const copy = try s.fork(testing.allocator, .{ .before_turn = points[1].turn, .workspace = "/w", .host = .app });
+    defer copy.close();
+    const first_turn: []const []const u8 = &.{
+        "turn_started",
+        "capture " ++ capture_start_a,
+        "item user",
+        "item assistant",
+        "item turn_end",
+        "capture " ++ capture_end_a,
+        "turn_committed",
+    };
+    try expectLines(first_turn, try turnLines(a, t.store.manager, copy.id()));
+    var restored = try copy.restore(testing.allocator);
+    defer restored.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 1), restored.history.len);
+    try testing.expectEqualStrings("first", restored.history[0].assistant.user.text);
+
+    // The fork takes captures of its own; the source is untouched.
+    try testing.expect(!try saveCapture(copy, capture_start_b, .start));
+    try commitCaptured(copy, assistantTurn("other second", "2b"), language);
+    try expectLines(source, try turnLines(a, t.store.manager, s.id()));
+    try testing.expectEqual(@as(usize, 3), try countItems(t.store.manager, copy.id(), workspace_capture_type));
+}
+
+test "workspace capture: a reader that does not know the item type skips it" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // An older fx maps item types to pieces with `pieceKind` and leaves
+    // out a type it has no piece for (D17); this build has none for it either.
+    try testing.expectEqual(@as(?PieceKind, null), pieceKind(workspace_capture_type));
+    var model = "m".*;
+    const s = try Session.create(testing.allocator, &t.store, "/w", .app, testSeed(&model));
+    try commitCaptured(s, assistantTurn("first", "1"), types.ConversationLanguage.default());
+    // Items no reader of this build knows, written as a newer fx would,
+    // around the pieces of a turn.
+    const user_piece = try encodePiece(a, .{ .user = .{ .text = "second" } });
+    const end_piece = try encodePiece(a, .{ .turn_completed = .{} });
+    _ = try s.handle.append(&.{
+        .turn_started,
+        .{ .item = .{ .type = "workspace_capture_v9", .data = "{\"phase\":\"start\"}" } },
+        .{ .item = .{ .type = "user", .data = user_piece } },
+        .{ .item = .{ .type = "turn_end", .data = end_piece } },
+        .{ .item = .{ .type = "workspace_capture_v9", .data = "{\"phase\":\"end\"}" } },
+        .turn_committed,
+    });
+    const id = try a.dupe(u8, s.id());
+    s.close();
+    const r = try Session.resumeSession(testing.allocator, &t.store, .{ .id = id }, "/w", .app);
+    defer r.close();
+    var restored = try r.restore(testing.allocator);
+    defer restored.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 2), restored.history.len);
+    try testing.expectEqualStrings("second", restored.history[1].assistant.user.text);
+    try testing.expectEqualStrings("", restored.history[1].assistant.assistant);
+}
+
+test "workspace capture: a commit of an earlier turn never takes the captures of the turn begun after it" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var model = "m".*;
+    const language = types.ConversationLanguage.default();
+    // The arena owns the result handle `prepareTurn` gives the turn.
+    const s = try Session.create(a, &t.store, "/w", .app, testSeed(&model));
+    defer s.close();
+    // ACP commits the interrupted turn of the previous prompt once the next
+    // prompt has started (`src/acp/prompt.zig` `persistAcpHistoryTurn`).
+    const next = s.beginCaptureTurn();
+    try testing.expect(!try s.saveWorkspaceCapture(next, capture_start_b, .start));
+    try testing.expect(!try s.saveWorkspaceCapture(next, capture_end_b, .end));
+    var earlier = TurnWithResult{};
+    var turn = earlier.turn(.{ .text = @constCast("one") });
+    try s.prepareTurn(&turn);
+    try s.commitTurn(turn, language);
+    const first = try turnLines(a, t.store.manager, s.id());
+    try testing.expectEqual(@as(usize, 0), countCaptureLines(first, capture_start_b) + countCaptureLines(first, capture_end_b));
+    // The token is still the next turn's, and its captures go with it.
+    const two: types.UserTurn = .{ .text = @constCast("two") };
+    try s.appendProgress(two, .{}, .{});
+    try s.commitTurnWithCaptures(.{ .assistant = .{ .user = two, .assistant = @constCast("2") } }, language, next);
+    const newest = newestTurn(try turnLines(a, t.store.manager, s.id()));
+    try testing.expectEqual(@as(usize, 1), countCaptureLines(newest, capture_start_b));
+    try testing.expectEqual(@as(usize, 1), countCaptureLines(newest, capture_end_b));
+    try testing.expectEqual(@as(usize, 0), try countItems(t.store.manager, s.id(), superseded_type));
+}
+
+test "workspace capture: a plain commit of an earlier turn supersedes the next turn's open turn instead of taking its start" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var model = "m".*;
+    const language = types.ConversationLanguage.default();
+    const s = try Session.create(a, &t.store, "/w", .app, testSeed(&model));
+    defer s.close();
+    // ACP's next prompt opens its turn, with its start, before the previous
+    // prompt's interrupted turn is committed.
+    const next = s.beginCaptureTurn();
+    try testing.expect(!try s.saveWorkspaceCapture(next, capture_start_b, .start));
+    try s.beginTurn();
+    try s.commitTurn(assistantTurn("earlier", "e"), language);
+    // The next turn writes its start again in its own turn.
+    const two: types.UserTurn = .{ .text = @constCast("two") };
+    try s.appendProgress(two, .{}, .{});
+    try testing.expect(!try s.saveWorkspaceCapture(next, capture_end_b, .end));
+    try s.commitTurnWithCaptures(.{ .assistant = .{ .user = two, .assistant = @constCast("2") } }, language, next);
+    try expectLines(&.{
+        "turn_started",
+        "capture " ++ capture_start_b,
+        "item superseded",
+        "turn_interrupted failed",
+        "turn_started",
+        "item user",
+        "item assistant",
+        "item turn_end",
+        "turn_committed",
+        "turn_started",
+        "capture " ++ capture_start_b,
+        "item user",
+        "item assistant",
+        "item turn_end",
+        "capture " ++ capture_end_b,
+        "turn_committed",
+    }, try turnLines(a, t.store.manager, s.id()));
+}
+
+test "workspace capture: a late commit of a kept ended turn supersedes the next turn's open turn instead of taking its start" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var model = "m".*;
+    const language = types.ConversationLanguage.default();
+    const s = try Session.create(a, &t.store, "/w", .app, testSeed(&model));
+    defer s.close();
+    // The first turn ends with nothing on disk; the next begins, keeping it,
+    // and opens its own turn with its start before the first one commits.
+    const first = s.beginCaptureTurn();
+    try testing.expect(!try s.saveWorkspaceCapture(first, capture_end_a, .end));
+    const second = s.beginCaptureTurnKeeping(first);
+    try testing.expect(!try s.saveWorkspaceCapture(second, capture_start_b, .start));
+    try s.beginTurn();
+    try s.commitTurnWithCaptures(assistantTurn("one", "1"), language, first);
+    const two: types.UserTurn = .{ .text = @constCast("two") };
+    try s.appendProgress(two, .{}, .{});
+    try testing.expect(!try s.saveWorkspaceCapture(second, capture_end_b, .end));
+    try s.commitTurnWithCaptures(.{ .assistant = .{ .user = two, .assistant = @constCast("2") } }, language, second);
+    try expectLines(&.{
+        "turn_started",
+        "capture " ++ capture_start_b,
+        "item superseded",
+        "turn_interrupted failed",
+        "turn_started",
+        "item user",
+        "item assistant",
+        "item turn_end",
+        "capture " ++ capture_end_a,
+        "turn_committed",
+        "turn_started",
+        "capture " ++ capture_start_b,
+        "item user",
+        "item assistant",
+        "item turn_end",
+        "capture " ++ capture_end_b,
+        "turn_committed",
+    }, try turnLines(a, t.store.manager, s.id()));
+    try testing.expectEqual(@as(usize, 0), s.captures.items.len);
+}
+
+test "workspace capture: a turn prepareTurn opened for a kept ended turn stays that turn's, so the next turn's start waits" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var model = "m".*;
+    const language = types.ConversationLanguage.default();
+    // The arena owns the result handle `prepareTurn` gives the turn.
+    const s = try Session.create(a, &t.store, "/w", .app, testSeed(&model));
+    defer s.close();
+    // The UI prepares the first turn, which opens it with no token, and the
+    // next prompt begins, keeping it, before the UI's commit.
+    const first = s.beginCaptureTurn();
+    try testing.expect(!try s.saveWorkspaceCapture(first, capture_end_a, .end));
+    var with_result: TurnWithResult = .{};
+    var prepared = with_result.turn(.{ .text = @constCast("one") });
+    try s.prepareTurn(&prepared);
+    const second = s.beginCaptureTurnKeeping(first);
+    try testing.expect(!try s.saveWorkspaceCapture(second, capture_start_b, .start));
+    try s.commitTurnWithCaptures(prepared, language, first);
+    const two: types.UserTurn = .{ .text = @constCast("two") };
+    try s.appendProgress(two, .{}, .{});
+    try testing.expect(!try s.saveWorkspaceCapture(second, capture_end_b, .end));
+    try s.commitTurnWithCaptures(.{ .assistant = .{ .user = two, .assistant = @constCast("2") } }, language, second);
+    try expectLines(&.{
+        "turn_started",
+        "item user",
+        "item tool_call",
+        "item tool_result",
+        "item assistant",
+        "item turn_end",
+        "capture " ++ capture_end_a,
+        "turn_committed",
+        "turn_started",
+        "capture " ++ capture_start_b,
+        "item user",
+        "item assistant",
+        "item turn_end",
+        "capture " ++ capture_end_b,
+        "turn_committed",
+    }, try turnLines(a, t.store.manager, s.id()));
+    try testing.expectEqual(@as(usize, 0), s.captures.items.len);
+}
+
+test "workspace capture: a retried commit of the same turn writes its captures once and supersedes nothing" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var model = "m".*;
+    const language = types.ConversationLanguage.default();
+    const one: types.UserTurn = .{ .text = @constCast("one") };
+    var extra: usize = 0;
+    var failures: usize = 0;
+    while (true) : (extra += 1) {
+        var failing = std.testing.FailingAllocator.init(testing_allocator.no_resize, .{});
+        const s = try Session.create(failing.allocator(), &t.store, "/w", .app, testSeed(&model));
+        defer s.close();
+        const token = s.beginCaptureTurn();
+        try testing.expect(!try s.saveWorkspaceCapture(token, capture_start_a, .start));
+        try s.appendProgress(one, .{}, .{});
+        try testing.expect(!try s.saveWorkspaceCapture(token, capture_end_a, .end));
+        const final: types.HistoryTurn = .{ .assistant = .{ .user = one, .assistant = @constCast("done") } };
+        failing.fail_index = failing.alloc_index + extra;
+        const result = s.commitTurnWithCaptures(final, language, token);
+        failing.fail_index = std.math.maxInt(usize);
+        if (result) |_| {} else |err| {
+            try testing.expectEqual(error.OutOfMemory, err);
+            failures += 1;
+            // The TUI's pacer retries the same turn after a failed save.
+            try s.commitTurnWithCaptures(final, language, token);
+        }
+        const lines = try turnLines(a, t.store.manager, s.id());
+        try testing.expectEqual(@as(usize, 1), countCaptureLines(lines, capture_start_a));
+        try testing.expectEqual(@as(usize, 1), countCaptureLines(lines, capture_end_a));
+        try testing.expectEqual(@as(usize, 0), try countItems(t.store.manager, s.id(), superseded_type));
+        try testing.expectError(error.WorkspaceCaptureTurnClosed, s.saveWorkspaceCapture(token, capture_end_b, .end));
+        if (result) |_| break else |_| {}
+    }
+    try testing.expect(failures > 0);
+}
+
+/// Leaves `s` with a failed turn open: a start capture on disk, a commit
+/// that failed, and the next turn's token begun, which marks it stale.
+fn leaveStaleTurn(s: *Session, failing: *std.testing.FailingAllocator) !void {
+    const one: types.UserTurn = .{ .text = @constCast("one") };
+    var extra: usize = 0;
+    while (true) : (extra += 1) {
+        const token = s.beginCaptureTurn();
+        if (s.turn_open and s.turn_stale) return;
+        try testing.expect(!try s.saveWorkspaceCapture(token, capture_start_a, .start));
+        if (!s.turn_open) try s.appendProgress(one, .{}, .{});
+        failing.fail_index = failing.alloc_index + extra;
+        const result = s.commitTurnWithCaptures(.{ .assistant = .{ .user = one, .assistant = @constCast("done") } }, types.ConversationLanguage.default(), token);
+        failing.fail_index = std.math.maxInt(usize);
+        if (result) |_| return error.TestUnexpectedResult else |_| {}
+    }
+}
+
+test "workspace capture: a recovery record is not saved into a failed turn left open" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var model = "m".*;
+    var failing = std.testing.FailingAllocator.init(testing_allocator.no_resize, .{});
+    const s = try Session.create(failing.allocator(), &t.store, "/w", .app, testSeed(&model));
+    defer s.close();
+    try leaveStaleTurn(s, &failing);
+    // The host takes the record with the fresh turn's first write instead.
+    try testing.expect(!try s.saveRecovery(.{ .save = @splat(7) }));
+    try s.appendProgressWithRecord(.{ .text = @constCast("two") }, .{}, .{}, .{ .save = @splat(7) });
+    try testing.expectEqual(@as(usize, 1), try countItems(t.store.manager, s.id(), superseded_type));
+    try testing.expect(s.turn_open and !s.turn_stale);
+}
+
+test "workspace capture: close supersedes a failed turn left open, so readers drop it with its captures" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var model = "m".*;
+    var failing = std.testing.FailingAllocator.init(testing_allocator.no_resize, .{});
+    const s = try Session.create(failing.allocator(), &t.store, "/w", .app, testSeed(&model));
+    const id = try arena.allocator().dupe(u8, s.id());
+    leaveStaleTurn(s, &failing) catch |err| {
+        s.close();
+        return err;
+    };
+    s.close();
+    try testing.expectEqual(@as(usize, 1), try countItems(t.store.manager, id, superseded_type));
+}
+
+test "workspace capture: a start for the next token waits while an earlier token's turn is still open" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var model = "m".*;
+    const language = types.ConversationLanguage.default();
+    const s = try Session.create(testing.allocator, &t.store, "/w", .app, testSeed(&model));
+    defer s.close();
+    const one: types.UserTurn = .{ .text = @constCast("one") };
+    const two: types.UserTurn = .{ .text = @constCast("two") };
+    _ = s.beginCaptureTurn();
+    try s.appendProgress(one, .{}, .{});
+    // The next prompt begins before the earlier turn is committed.
+    const next = s.beginCaptureTurn();
+    try testing.expect(!try s.saveWorkspaceCapture(next, capture_start_b, .start));
+    try s.commitTurn(.{ .assistant = .{ .user = one, .assistant = @constCast("1") } }, language);
+    try testing.expectEqual(@as(usize, 0), countCaptureLines(try turnLines(a, t.store.manager, s.id()), capture_start_b));
+    try s.appendProgress(two, .{}, .{});
+    try s.commitTurnWithCaptures(.{ .assistant = .{ .user = two, .assistant = @constCast("2") } }, language, next);
+    try testing.expectEqual(@as(usize, 1), countCaptureLines(newestTurn(try turnLines(a, t.store.manager, s.id())), capture_start_b));
+}
+
+test "workspace capture: a start already in a committed turn never marks a later turn stale" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var model = "m".*;
+    const language = types.ConversationLanguage.default();
+    // The arena owns the result handle `prepareTurn` gives the turn.
+    const s = try Session.create(a, &t.store, "/w", .app, testSeed(&model));
+    defer s.close();
+    const one: types.UserTurn = .{ .text = @constCast("one") };
+    const token = s.beginCaptureTurn();
+    try testing.expect(!try s.saveWorkspaceCapture(token, capture_start_a, .start));
+    try s.appendProgress(one, .{}, .{});
+    // Committed without its token, the start stays in this turn.
+    try s.commitTurn(.{ .assistant = .{ .user = one, .assistant = @constCast("1") } }, language);
+    // An earlier turn's commit opens a turn for no capture turn.
+    var earlier = TurnWithResult{};
+    var turn = earlier.turn(.{ .text = @constCast("two") });
+    try s.prepareTurn(&turn);
+    _ = s.beginCaptureTurn();
+    try testing.expect(!s.turn_stale);
+    try s.commitTurn(turn, language);
+    try testing.expectEqual(@as(usize, 0), try countItems(t.store.manager, s.id(), superseded_type));
+}
+
+test "workspace capture: a compaction never keeps from a failed turn left open" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var model = "m".*;
+    var failing = std.testing.FailingAllocator.init(testing_allocator.no_resize, .{});
+    const s = try Session.create(failing.allocator(), &t.store, "/w", .app, testSeed(&model));
+    defer s.close();
+    try leaveStaleTurn(s, &failing);
+    // The cut falls in the active turn, whose fresh turn is not on disk.
+    var summary = "summary".*;
+    try s.commitCompaction(.{ .summary = &summary, .removed_turn_count = 0, .compaction_count = 1 }, true, .{ .turns = s.turn_numbers.items.len, .tool_steps = 1 });
+    try testing.expectEqual(@as(?u64, null), s.trim.turn);
+}
+
+test "workspace capture: a payload that is not one JSON object, or too large for a line, is refused" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var model = "m".*;
+    const s = try Session.create(testing.allocator, &t.store, "/w", .app, testSeed(&model));
+    defer s.close();
+    const invalid = [_][]const u8{
+        "",
+        "[1,2]",
+        "\"text\"",
+        "null",
+        "{",
+        "{}{}",
+        " {}",
+        "{} ",
+        // A raw line break would split the log line.
+        "{\n\"a\":1}",
+        "{\"a\":1}\r",
+        "{\"a\":\"\xff\"}",
+    };
+    for ([_]bool{ false, true }) |open| {
+        if (open) try s.appendProgress(.{ .text = @constCast("go") }, .{}, .{});
+        for (invalid) |payload| {
+            try testing.expectError(error.InvalidWorkspaceCapture, saveCapture(s, payload, .start));
+            try testing.expectError(error.InvalidWorkspaceCapture, saveCapture(s, payload, .end));
+        }
+    }
+    // The largest payload stays one inline item; one byte more is refused.
+    const largest = try objectOfLength(a, max_workspace_capture_bytes);
+    const too_large = try objectOfLength(a, max_workspace_capture_bytes + 1);
+    try testing.expectError(error.WorkspaceCaptureTooLarge, saveCapture(s, too_large, .start));
+    try testing.expectError(error.WorkspaceCaptureTooLarge, saveCapture(s, too_large, .end));
+    try testing.expectEqual(@as(usize, 0), s.captures.items.len);
+    try testing.expectEqual(@as(usize, 0), try countItems(t.store.manager, s.id(), workspace_capture_type));
+    try testing.expect(try saveCapture(s, largest, .start));
+    // Newest first; the manager may have put a snapshot after it.
+    var page = try t.store.manager.read(testing.allocator, s.id(), .end, .backward, 4);
+    defer page.deinit();
+    const piece = for (page.entries) |entry| {
+        const body = entry.body orelse continue;
+        if (body == .item) break body.item;
+    } else return error.TestUnexpectedResult;
+    try testing.expectEqualStrings(workspace_capture_type, piece.type);
+    try testing.expectEqualStrings(largest, piece.data);
+    try testing.expectEqual(@as(usize, 0), piece.blobs.len);
+}
+
+test "workspace capture: a crash between start and end leaves the start without an end or a made-up close" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var model = "m".*;
+    const s = try Session.create(testing.allocator, &t.store, "/w", .app, testSeed(&model));
+    try s.commitTurn(assistantTurn("first", "1"), types.ConversationLanguage.default());
+    try s.appendProgress(.{ .text = @constCast("second") }, .{}, .{});
+    try testing.expect(try saveCapture(s, capture_start_a, .start));
+    try testing.expect(!try saveCapture(s, capture_end_a, .end));
+    const id = try a.dupe(u8, s.id());
+    crashSession(s);
+
+    const r = try Session.resumeSession(testing.allocator, &t.store, .{ .id = id }, "/w", .app);
+    defer r.close();
+    try expectLines(&.{
+        "turn_started",
+        "item user",
+        "item assistant",
+        "item turn_end",
+        "turn_committed",
+        "turn_started",
+        "item user",
+        "capture " ++ capture_start_a,
+        "turn_interrupted crash",
+    }, try turnLines(a, t.store.manager, id));
+    var restored = try r.restore(testing.allocator);
+    defer restored.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 2), restored.history.len);
+    try testing.expectEqualStrings("second", restored.history[1].interrupted.user.text);
+}
+
+test "workspace capture: a start held for a turn not on disk is lost to a crash, and nothing stands in for it" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var model = "m".*;
+    const s = try Session.create(testing.allocator, &t.store, "/w", .app, testSeed(&model));
+    try s.commitTurn(assistantTurn("first", "1"), types.ConversationLanguage.default());
+    const before = try turnLines(a, t.store.manager, s.id());
+    // The window: held in memory until the turn's first write.
+    try testing.expect(!try saveCapture(s, capture_start_a, .start));
+    const id = try a.dupe(u8, s.id());
+    crashSession(s);
+
+    const r = try Session.resumeSession(testing.allocator, &t.store, .{ .id = id }, "/w", .app);
+    try expectLines(before, try turnLines(a, t.store.manager, id));
+    // A close drops what it holds the same way.
+    try testing.expect(!try saveCapture(r, capture_start_b, .start));
+    r.close();
+    try expectLines(before, try turnLines(a, t.store.manager, id));
+
+    // A new session that never reached the disk leaves nothing at all.
+    const fresh = try Session.create(testing.allocator, &t.store, "/w", .app, testSeed(&model));
+    try testing.expect(!try saveCapture(fresh, capture_start_a, .start));
+    const fresh_id = try a.dupe(u8, fresh.id());
+    crashSession(fresh);
+    try testing.expectError(error.NotFound, t.store.manager.read(testing.allocator, fresh_id, .start, .forward, 1));
+}
+
+test "workspace capture: running out of memory saves a capture whole or not at all" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var model = "m".*;
+    var failing = std.testing.FailingAllocator.init(testing_allocator.no_resize, .{});
+    const s = try Session.create(failing.allocator(), &t.store, "/w", .app, testSeed(&model));
+    defer s.close();
+    try s.commitTurn(assistantTurn("first", "1"), types.ConversationLanguage.default());
+    const Sweep = struct {
+        fn capture(f: *std.testing.FailingAllocator, session: *Session, payload: []const u8, place: Session.CapturePlace) !bool {
+            var extra: usize = 0;
+            while (true) : (extra += 1) {
+                const held = session.captures.items.len;
+                const on_disk = try countItems(session.store.manager, session.id(), workspace_capture_type);
+                f.fail_index = f.alloc_index + extra;
+                const result = saveCapture(session, payload, place);
+                f.fail_index = std.math.maxInt(usize);
+                if (result) |written| return written else |err| {
+                    try testing.expectEqual(error.OutOfMemory, err);
+                    try testing.expectEqual(held, session.captures.items.len);
+                    try testing.expectEqual(on_disk, try countItems(session.store.manager, session.id(), workspace_capture_type));
+                }
+            }
+        }
+
+        fn begin(f: *std.testing.FailingAllocator, session: *Session) !void {
+            var extra: usize = 0;
+            while (true) : (extra += 1) {
+                const on_disk = try countItems(session.store.manager, session.id(), workspace_capture_type);
+                f.fail_index = f.alloc_index + extra;
+                const result = session.beginTurn();
+                f.fail_index = std.math.maxInt(usize);
+                if (result) |_| return else |err| {
+                    try testing.expectEqual(error.OutOfMemory, err);
+                    try testing.expect(!session.turn_open);
+                    try testing.expectEqual(on_disk, try countItems(session.store.manager, session.id(), workspace_capture_type));
+                }
+            }
+        }
+    };
+    try testing.expect(!try Sweep.capture(&failing, s, capture_start_a, .start));
+    try Sweep.begin(&failing, s);
+    try testing.expect(try Sweep.capture(&failing, s, capture_start_b, .start));
+    try testing.expect(!try Sweep.capture(&failing, s, capture_end_a, .end));
+    try commitCaptured(s, assistantTurn("second", "2"), types.ConversationLanguage.default());
+    try expectLines(&.{
+        "turn_started",
+        "item user",
+        "item assistant",
+        "item turn_end",
+        "turn_committed",
+        "turn_started",
+        "capture " ++ capture_start_a,
+        "capture " ++ capture_start_b,
+        "item user",
+        "item assistant",
+        "item turn_end",
+        "capture " ++ capture_end_a,
+        "turn_committed",
+    }, try turnLines(a, t.store.manager, s.id()));
+    try testing.expectEqual(@as(usize, 0), s.captures.items.len);
+}
+
 test "a session with no interrupted turn has nothing to resume" {
     var t: TestHome = undefined;
     try t.init();
@@ -6569,15 +9041,78 @@ test "the history splits into compaction cycles that Ctrl+O reads one at a time"
     const older = (try s.previousCompactionCursor(testing.allocator, newest)).cursor.?;
     try testing.expect(older.offset < newest.offset);
     try testing.expectEqual(Session.PreviousCompaction{ .cursor = null }, try s.previousCompactionCursor(testing.allocator, older));
+    var cycles = try s.cycleReader(testing.allocator);
+    defer cycles.deinit();
     var visitor: Visitor = .{};
-    try testing.expect(!try s.visitHistoryCycle(testing.allocator, null, &visitor));
+    try testing.expect(!try cycles.visitHistoryCycle(testing.allocator, null, &visitor));
     try visitor.expectPrompts(&.{ "one", "two" });
-    try testing.expect(!try s.visitHistoryCycle(testing.allocator, older, &visitor));
+    try testing.expect(!try cycles.visitHistoryCycle(testing.allocator, older, &visitor));
     try visitor.expectPrompts(&.{"three"});
-    try testing.expect(!try s.visitHistoryCycle(testing.allocator, newest, &visitor));
+    try testing.expect(!try cycles.visitHistoryCycle(testing.allocator, newest, &visitor));
     try visitor.expectPrompts(&.{"four"});
     try testing.expect(!try s.visitHistorySinceCompaction(testing.allocator, &visitor));
     try visitor.expectPrompts(&.{"four"});
+}
+
+test "a cycle reader reads a compaction cycle on another thread, and after its session closes" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var model = "m".*;
+    const s = try Session.create(testing.allocator, &t.store, "/w", .ask, testSeed(&model));
+    var open = true;
+    defer if (open) s.close();
+    const language = types.ConversationLanguage.default();
+    try s.commitTurn(assistantTurn("one", "1"), language);
+    try s.commitTurn(assistantTurn("two", "2"), language);
+    var summary = "turns one and two".*;
+    try s.commitCompaction(.{ .summary = &summary, .removed_turn_count = 2, .compaction_count = 1 }, false, null);
+    try s.commitTurn(assistantTurn("three", "3"), language);
+    const newest = (try s.previousCompactionCursor(testing.allocator, null)).cursor.?;
+
+    const Visitor = struct {
+        prompts: std.ArrayList([]u8) = .empty,
+
+        pub fn append(self: *@This(), turn: types.HistoryTurn) !void {
+            try self.prompts.append(testing.allocator, try testing.allocator.dupe(u8, turn.assistant.user.text));
+        }
+
+        fn expectPrompts(self: *@This(), want: []const []const u8) !void {
+            defer {
+                for (self.prompts.items) |prompt| testing.allocator.free(prompt);
+                self.prompts.deinit(testing.allocator);
+                self.* = .{};
+            }
+            try testing.expectEqual(want.len, self.prompts.items.len);
+            for (self.prompts.items, want) |got, expected| try testing.expectEqualStrings(expected, got);
+        }
+    };
+    const Read = struct {
+        fn run(reader: *const CycleReader, visitor: *Visitor, damaged: *bool, failure: *?anyerror) void {
+            damaged.* = reader.visitHistoryCycle(testing.allocator, null, visitor) catch |err| {
+                failure.* = err;
+                return;
+            };
+        }
+    };
+    var reader = try s.cycleReader(testing.allocator);
+    defer reader.deinit();
+
+    // While the session is open, through its own log.
+    var visitor: Visitor = .{};
+    var damaged = true;
+    var failure: ?anyerror = null;
+    const thread = try std.Thread.spawn(.{}, Read.run, .{ &reader, &visitor, &damaged, &failure });
+    thread.join();
+    try testing.expectEqual(@as(?anyerror, null), failure);
+    try testing.expect(!damaged);
+    try visitor.expectPrompts(&.{ "one", "two" });
+
+    // The session closes under the reader, which reads on through the manager.
+    s.close();
+    open = false;
+    try testing.expect(!try reader.visitHistoryCycle(testing.allocator, newest, &visitor));
+    try visitor.expectPrompts(&.{"three"});
 }
 
 test "a damaged line in a compaction cycle shows that cycle's turns before it and says so" {
@@ -6633,14 +9168,16 @@ test "a damaged line in a compaction cycle shows that cycle's turns before it an
             for (self.prompts.items, want) |got, expected| try testing.expectEqualStrings(expected, got);
         }
     };
+    var cycles = try s.cycleReader(testing.allocator);
+    defer cycles.deinit();
     var visitor: Visitor = .{};
     // Forward, cycle 1 shows its turn before the damage and says the read
     // stopped there; the other cycles read whole.
-    try testing.expect(try s.visitHistoryCycle(testing.allocator, opens_one, &visitor));
+    try testing.expect(try cycles.visitHistoryCycle(testing.allocator, opens_one, &visitor));
     try visitor.expectPrompts(&.{"one-a"});
-    try testing.expect(!try s.visitHistoryCycle(testing.allocator, opens_two, &visitor));
+    try testing.expect(!try cycles.visitHistoryCycle(testing.allocator, opens_two, &visitor));
     try visitor.expectPrompts(&.{"two"});
-    try testing.expect(!try s.visitHistoryCycle(testing.allocator, null, &visitor));
+    try testing.expect(!try cycles.visitHistoryCycle(testing.allocator, null, &visitor));
     try visitor.expectPrompts(&.{"zero"});
     // Backward, the search across cycle 2 still finds the line opening it,
     // and the search across cycle 1 stops at the damage and says so instead
@@ -6760,9 +9297,11 @@ test "a compaction inside an open turn starts its display cycle at that turn's p
     // Ctrl+O: the cycle before leaves the split turn out, and the one the
     // compaction opens shows it whole.
     const compaction = (try r.previousCompactionCursor(testing.allocator, null)).cursor.?;
-    try testing.expect(!try r.visitHistoryCycle(testing.allocator, null, &visitor));
+    var cycles = try r.cycleReader(testing.allocator);
+    defer cycles.deinit();
+    try testing.expect(!try cycles.visitHistoryCycle(testing.allocator, null, &visitor));
     try visitor.expectPrompts(&.{"first"});
-    try testing.expect(!try r.visitHistoryCycle(testing.allocator, compaction, &visitor));
+    try testing.expect(!try cycles.visitHistoryCycle(testing.allocator, compaction, &visitor));
     try visitor.expectPrompts(&.{ "split", "after" });
 }
 
@@ -7532,6 +10071,143 @@ test "replay keeps a model call record a newer fx wrote and leaves out one it ca
     try testing.expect(decodeModelCall(a, "{\"at_ms\":1,\"provider\":\"gateway\",\"model\":\"m\",\"outcome\":\"exploded\"}") == null);
     try testing.expect(decodeModelCall(a, "{\"at_ms\":-1,\"provider\":\"gateway\",\"model\":\"m\"}") == null);
     try testing.expect(decodeModelCall(a, "not json") == null);
+}
+
+test "the calls a command made through fx mcp call come back on resume with their shell call, tool, and outcome only (D99)" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var model = "m".*;
+    const s = try Session.create(testing.allocator, &t.store, "/w", .ask, testSeed(&model));
+    var fixture: NoteTestSteps = .{};
+    fixture.init();
+    const user: types.UserTurn = .{ .text = @constCast("page through the list") };
+    // No turn is open before the first write, so there is nothing to save into.
+    try testing.expectError(error.NoOpenTurn, s.saveBridgeCall(.{ .call_id = "call-1", .request_id = "fx-mcp-call-0", .tool = "mcp_fixture_echo", .outcome = .completed }));
+    // The shell call is saved as running, then its command's calls end.
+    try s.appendProgress(user, .{}, .{ .calls = fixture.calls[0..1] });
+    const records = [_]types.BridgeCallRecord{
+        .{ .call_id = "call-1", .request_id = "fx-mcp-call-1", .tool = "mcp_fixture_echo", .outcome = .completed },
+        .{ .call_id = "call-1", .request_id = "fx-mcp-call-2", .tool = "mcp_fixture_echo", .outcome = .completed },
+        .{ .call_id = "call-1", .request_id = "fx-mcp-call-3", .tool = "mcp_fixture_echo", .outcome = .failed },
+    };
+    for (records) |record| try s.saveBridgeCall(record);
+    // A record a newer fx wrote with an outcome this one doesn't know.
+    _ = try s.write(&.{.{ .item = .{ .type = bridge_call_type, .data = "{\"call_id\":\"call-1\",\"request_id\":\"fx-mcp-call-4\",\"tool\":\"mcp_fixture_echo\",\"outcome\":\"retried\"}" } }});
+    try testing.expectError(error.InvalidBridgeCall, s.saveBridgeCall(.{ .call_id = "call-1", .request_id = "fx-mcp-call-5", .tool = "mcp_\x1b[2J", .outcome = .completed }));
+    try s.commitTurn(.{ .assistant = .{
+        .user = user,
+        .assistant = @constCast("done"),
+        .execution = .{ .tool_steps = fixture.steps[0..1] },
+    } }, types.ConversationLanguage.default());
+    try testing.expectError(error.NoOpenTurn, s.saveBridgeCall(records[0]));
+    const id = try testing.allocator.dupe(u8, s.id());
+    defer testing.allocator.free(id);
+    s.close();
+
+    const io = io_mod.getIo();
+    const log_path = try std.Io.Dir.path.join(testing.allocator, &.{ ".fx", "sessions", "v2", id, "log.jsonl" });
+    defer testing.allocator.free(log_path);
+    const bytes = try t.tmp.dir.readFileAlloc(io, log_path, testing.allocator, .limited(1 << 20));
+    defer testing.allocator.free(bytes);
+    // Each call is one line with exactly these four fields, outside the
+    // streamed pieces, so the turn was never rewritten.
+    try testing.expect(std.mem.find(u8, bytes, superseded_type) == null);
+    try testing.expectEqual(@as(usize, 4), std.mem.count(u8, bytes, "\"" ++ bridge_call_type ++ "\""));
+    try testing.expect(std.mem.find(u8, bytes, "\"data\":{\"call_id\":\"call-1\",\"request_id\":\"fx-mcp-call-1\",\"tool\":\"mcp_fixture_echo\",\"outcome\":\"completed\"}") != null);
+    try testing.expect(std.mem.find(u8, bytes, "fx-mcp-call-5") == null);
+
+    const r = try Session.resumeSession(testing.allocator, &t.store, .{ .id = id }, "/w", .ask);
+    defer r.close();
+    var restored = try r.restore(testing.allocator);
+    defer restored.deinit(testing.allocator);
+    const saved = restored.history[0].assistant.execution.bridge_calls;
+    try testing.expectEqual(records.len, saved.len);
+    for (records, saved) |want, got| {
+        try testing.expectEqualStrings(want.call_id, got.call_id);
+        try testing.expectEqualStrings(want.request_id, got.request_id);
+        try testing.expectEqualStrings(want.tool, got.tool);
+        try testing.expectEqual(want.outcome, got.outcome);
+    }
+    try testing.expectEqual(@as(usize, 1), restored.history[0].assistant.execution.tool_steps.len);
+}
+
+test "a command cancelled before it printed anything keeps its row on resume (D100)" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var model = "m".*;
+    const s = try Session.create(testing.allocator, &t.store, "/w", .ask, testSeed(&model));
+    const silent: types.ToolCall = .{ .id = "call-silent", .name = "shell", .arguments_json = "{\"command\":\"touch .ready && sleep 30\"}" };
+    const printed: types.ToolCall = .{ .id = "call-printed", .name = "shell", .arguments_json = "{\"command\":\"echo hi; sleep 30\"}" };
+    const lang = types.ConversationLanguage.default();
+    // A command that printed nothing, one whose output was kept, and a
+    // turn cancelled with no command.
+    try s.commitTurn(.{ .interrupted = .{ .user = .{ .text = @constCast("silent") }, .tool_call = silent, .cancelled_command = .{}, .terminal_reason = .cancelled } }, lang);
+    try s.commitTurn(.{ .interrupted = .{ .user = .{ .text = @constCast("printed") }, .tool_call = printed, .cancelled_command = .{ .command_artifact_handle = "fx-command-printed.log" }, .terminal_reason = .cancelled } }, lang);
+    try s.commitTurn(.{ .interrupted = .{ .user = .{ .text = @constCast("no command") }, .tool_call = printed, .terminal_reason = .cancelled } }, lang);
+    const id = try testing.allocator.dupe(u8, s.id());
+    defer testing.allocator.free(id);
+    s.close();
+
+    const io = io_mod.getIo();
+    const log_path = try std.Io.Dir.path.join(testing.allocator, &.{ ".fx", "sessions", "v2", id, "log.jsonl" });
+    defer testing.allocator.free(log_path);
+    const bytes = try t.tmp.dir.readFileAlloc(io, log_path, testing.allocator, .limited(1 << 20));
+    defer testing.allocator.free(bytes);
+    // Only the command with no saved output gets the item: its call id and
+    // nothing else, right before the interruption that ends its turn.
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, bytes, "\"" ++ cancelled_command_type ++ "\""));
+    const item_at = std.mem.find(u8, bytes, "\"type\":\"" ++ cancelled_command_type ++ "\",\"data\":{\"call_id\":\"call-silent\"},") orelse return error.TestExpectedItem;
+    const interruption_at = std.mem.find(u8, bytes, "\"type\":\"interruption\"") orelse return error.TestExpectedInterruption;
+    try testing.expect(item_at < interruption_at);
+    // Its own line, the one right before the interruption's.
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, bytes[item_at..interruption_at], "\n"));
+    try testing.expect(std.mem.find(u8, bytes, "\"interruption\",\"data\":{\"reason\":\"cancelled\",\"partial_text\":null,\"command_replay_ref\":null,\"command_replay_bytes\":null,\"command_artifact_ref\":null,") != null);
+    // The piece itself is the same bytes as before the item existed.
+    try testing.expect(std.mem.find(u8, bytes, "cancelled_command_call_id") == null);
+
+    const r = try Session.resumeSession(testing.allocator, &t.store, .{ .id = id }, "/w", .ask);
+    defer r.close();
+    var restored = try r.restore(testing.allocator);
+    defer restored.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 3), restored.history.len);
+    const kept = restored.history[0].interrupted.cancelled_command orelse return error.TestExpectedPresentation;
+    try testing.expect(kept.output_replay == null);
+    try testing.expect(kept.command_artifact_handle == null);
+    try testing.expectEqualStrings("call-silent", restored.history[0].interrupted.tool_call.?.id);
+    try testing.expectEqualStrings("fx-command-printed.log", restored.history[1].interrupted.cancelled_command.?.command_artifact_handle.?);
+    try testing.expect(restored.history[2].interrupted.cancelled_command == null);
+}
+
+test "replay reads a cancelled command item a newer fx wrote and leaves out one it can't read (D100)" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    try testing.expectEqualStrings("c", decodeCancelledCommand(a, "{\"call_id\":\"c\",\"exit_signal\":15}").?);
+    // An empty or missing call id, one too long, and bytes that aren't JSON.
+    try testing.expect(decodeCancelledCommand(a, "{\"call_id\":\"\"}") == null);
+    try testing.expect(decodeCancelledCommand(a, "{\"tool\":\"shell\"}") == null);
+    const long_id = try a.alloc(u8, session_event.max_conversation_identity_bytes + 1);
+    @memset(long_id, 'c');
+    try testing.expect(decodeCancelledCommand(a, try a.print("{{\"call_id\":\"{s}\"}}", .{long_id})) == null);
+    try testing.expect(decodeCancelledCommand(a, "not json") == null);
+}
+
+test "replay keeps a bridge call record a newer fx wrote and leaves out one it can't show" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const newer = decodeBridgeCall(a, "{\"call_id\":\"c\",\"request_id\":\"r\",\"tool\":\"mcp_s_t\",\"outcome\":\"cancelled\",\"elapsed_ms\":4}").?;
+    try testing.expectEqualStrings("mcp_s_t", newer.tool);
+    try testing.expectEqual(types.BridgeCallOutcome.cancelled, newer.outcome);
+    // An outcome this fx doesn't know, escape bytes, an empty name, a
+    // missing field, and bytes that aren't JSON.
+    try testing.expect(decodeBridgeCall(a, "{\"call_id\":\"c\",\"request_id\":\"r\",\"tool\":\"t\",\"outcome\":\"exploded\"}") == null);
+    try testing.expect(decodeBridgeCall(a, "{\"call_id\":\"c\",\"request_id\":\"r\",\"tool\":\"t\\u001b]0;x\\u0007\",\"outcome\":\"failed\"}") == null);
+    try testing.expect(decodeBridgeCall(a, "{\"call_id\":\"\",\"request_id\":\"r\",\"tool\":\"t\",\"outcome\":\"failed\"}") == null);
+    try testing.expect(decodeBridgeCall(a, "{\"call_id\":\"c\",\"tool\":\"t\",\"outcome\":\"failed\"}") == null);
+    try testing.expect(decodeBridgeCall(a, "not json") == null);
 }
 
 test "a compaction inside a turn drops the context notes it covers and keeps the later ones on resume (D93)" {
@@ -8746,6 +11422,16 @@ test "a prompt image the store does not save keeps its bytes inline and gets no 
     try testing.expectEqualStrings(images[1].snapshot_path.?, kept[1].snapshot_path.?);
 }
 
+/// Whether this process writes into `dir` whatever its mode, as root or a
+/// process with `CAP_DAC_OVERRIDE` does. A test of a refused write can't
+/// run then, so it skips.
+fn writesWhateverTheMode(dir: std.Io.Dir) bool {
+    const io = io_mod.getIo();
+    dir.writeFile(io, .{ .sub_path = ".mode-probe", .data = "" }) catch return false;
+    dir.deleteFile(io, ".mode-probe") catch {};
+    return true;
+}
+
 test "a turn the store cannot start keeps its prompt images inline and does not fail the prompt (D89)" {
     var t: TestHome = undefined;
     try t.init();
@@ -8764,10 +11450,11 @@ test "a turn the store cannot start keeps its prompt images inline and does not 
     // which a read-only store refuses.
     const io = io_mod.getIo();
     try std.Io.Dir.cwd().createDirPath(io, t.store.manager.root_path);
-    var root = try std.Io.Dir.openDirAbsolute(io, t.store.manager.root_path, .{});
+    var root = try std.Io.Dir.openDirAbsolute(io, t.store.manager.root_path, .{ .iterate = true });
     defer root.close(io);
-    root.setPermissions(io, .fromMode(0o500)) catch return error.SkipZigTest;
+    try root.setPermissions(io, .fromMode(0o500));
     defer root.setPermissions(io, .fromMode(0o700)) catch {};
+    if (writesWhateverTheMode(root)) return error.SkipZigTest;
     try s.savePromptImages(arena.allocator(), &images);
     try testing.expectEqual(@as(?[]u8, null), images[0].blob_path);
     try testing.expectEqualSlices(u8, &bytes, images[0].inline_data.?);
@@ -8932,6 +11619,25 @@ const V1Home = struct {
         var target = if (folder) |sub| try io_mod.openOrCreateVerifiedPrivateDir(&dir, sub) else null;
         defer if (target) |*value| value.close();
         try (if (target) |value| value.dir else dir.dir).writeFile(io_mod.getIo(), .{ .sub_path = name, .data = bytes, .flags = .{ .permissions = .fromMode(0o600) } });
+    }
+
+    /// Makes `ids`' v1 folders readable by others, as an old release left
+    /// them (D61): every folder 0755 and every file 0644, lock files too.
+    fn readableByOthers(v1: *V1Home, ids: []const []const u8) !void {
+        const io = io_mod.getIo();
+        const a = v1.arena.allocator();
+        for (ids) |id| {
+            var dir = try v1.t.tmp.dir.openDir(io, try v1.sessionPath(id, ""), .{ .iterate = true });
+            defer dir.close(io);
+            try dir.setPermissions(io, .fromMode(0o755));
+            var walker = try dir.walk(a);
+            defer walker.deinit();
+            while (try walker.next(io)) |entry| switch (entry.kind) {
+                .directory => try dir.setFilePermissions(io, entry.path, .fromMode(0o755), .{}),
+                .file => try dir.setFilePermissions(io, entry.path, .fromMode(0o644), .{}),
+                else => {},
+            };
+        }
     }
 
     /// v1's `session.json` of `id`. The arena's.
@@ -9207,9 +11913,9 @@ test "a v1 session's hosted terminal folders an old fx left readable by others c
     for ([_][]const u8{ "", "/state", "/proofs" }) |sub| {
         const path = try alloc.print("{s}/{s}{s}", .{ try v1.sessionPath(id, ""), terminal_dir_name, sub });
         defer alloc.free(path);
-        var dir = try t.tmp.dir.openDir(io, path, .{});
+        var dir = try t.tmp.dir.openDir(io, path, .{ .iterate = true });
         defer dir.close(io);
-        dir.setPermissions(io, .fromMode(0o755)) catch return error.SkipZigTest;
+        try dir.setPermissions(io, .fromMode(0o755));
     }
 
     const s = try openConverted(&t, id);
@@ -9261,7 +11967,7 @@ test "a v1 session whose hosted terminal state holds an entry the copy can't tak
     var again = try convertAll(&t.store, alloc);
     defer again.deinit(alloc);
     try testing.expect(V1Home.exists(&t, id));
-    var doctor_report = try doctor(&t.store, alloc, 64, 0);
+    var doctor_report = try doctor(&t.store, alloc, 64, 0, .count);
     defer doctor_report.deinit(alloc);
     try testing.expectEqual(@as(usize, 0), doctor_report.stuck.items.len);
     try testing.expectEqual(@as(usize, 0), doctor_report.unconverted);
@@ -9464,6 +12170,83 @@ test "recover salvages a damaged v1 session into a fresh v2 root and leaves its 
     try testing.expectError(error.SessionNotFound, recover(&t.store, alloc, "v1-none"));
 }
 
+test "recover on a v1 session an old fx left readable by others answers that none is needed, salvages a damaged one, and both convert (D61, D64)" {
+    const alloc = testing.allocator;
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var v1 = try V1Home.init(&t);
+    defer v1.deinit();
+    // A family: its root's `subagent` folder and every member's lock file
+    // are readable by others too.
+    const family = try v1.fixture("family", 3);
+    try v1.readableByOthers(family);
+    try testing.expectError(error.SessionRecoveryNotNeeded, recover(&t.store, alloc, family[0]));
+
+    // Two turns, then a torn line.
+    const torn = (try v1.fixture("cancelled", 1))[0];
+    const log = try V1Home.read(&t, try v1.sessionPath(torn, "events.jsonl"));
+    defer alloc.free(log);
+    const damaged = try std.mem.concat(alloc, u8, &.{ log, "{ not json\n" });
+    defer alloc.free(damaged);
+    try v1.put(torn, null, "events.jsonl", damaged);
+    try v1.readableByOthers(&.{torn});
+    var recovered = try recover(&t.store, alloc, torn);
+    defer recovered.deinit(alloc);
+    try testing.expectEqual(@as(usize, 2), recovered.history_len);
+    const after = try V1Home.read(&t, try v1.sessionPath(torn, "events.jsonl"));
+    defer alloc.free(after);
+    try testing.expectEqualStrings(damaged, after);
+    // The lock file keeps the mode it had.
+    const lock = try t.tmp.dir.statFile(io_mod.getIo(), try v1.sessionPath(torn, "session.lock"), .{ .follow_symlinks = false });
+    try testing.expectEqual(@as(u32, 0o644), @as(u32, @intCast(lock.permissions.toMode() & 0o777)));
+
+    const s = try openConverted(&t, family[0]);
+    s.close();
+    var copy = try t.store.manager.peek(alloc, family[0]);
+    defer copy.deinit(alloc);
+    try testing.expectEqual(sm.Role.root, copy.role);
+}
+
+test "recover on a v1 session whose lock file others can write says its storage is unsafe, not that it is corrupt" {
+    const alloc = testing.allocator;
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var v1 = try V1Home.init(&t);
+    defer v1.deinit();
+    const id = (try v1.fixture("plain", 1))[0];
+    try t.tmp.dir.setFilePermissions(io_mod.getIo(), try v1.sessionPath(id, "session.lock"), .fromMode(0o666), .{});
+    const err = if (recover(&t.store, alloc, id)) |recovered| {
+        var value = recovered;
+        value.deinit(alloc);
+        return error.TestUnexpectedResult;
+    } else |err| err;
+    try testing.expectEqual(error.DurablePathUnsafe, commandError(err));
+}
+
+test "a v1 family whose subagent folder others can write: recover refuses it as unsafe, conversion as unreadable, and every member keeps its v1 folder (D61)" {
+    const alloc = testing.allocator;
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var v1 = try V1Home.init(&t);
+    defer v1.deinit();
+    const family = try v1.fixture("family", 3);
+    try t.tmp.dir.setFilePermissions(io_mod.getIo(), try v1.sessionPath(family[0], "subagent"), .fromMode(0o777), .{});
+    const err = if (recover(&t.store, alloc, family[0])) |recovered| {
+        var value = recovered;
+        value.deinit(alloc);
+        return error.TestUnexpectedResult;
+    } else |err| err;
+    try testing.expectEqual(error.DurablePathUnsafe, commandError(err));
+    // Conversion reports it unreadable, as it does a damaged member.
+    try testing.expectError(error.InvalidSessionFormat, openConverted(&t, family[0]));
+    // Nothing was copied or removed: every member keeps its v1 folder.
+    for (family) |id| try testing.expect(V1Home.exists(&t, id));
+    try testing.expectError(error.NotFound, t.store.manager.peek(alloc, family[0]));
+}
+
 test "recover copies a v1 conversation without saved rules it can't read and leaves its v1 folder as it was (D72)" {
     const alloc = testing.allocator;
     var t: TestHome = undefined;
@@ -9490,6 +12273,101 @@ test "recover copies a v1 conversation without saved rules it can't read and lea
     }
 }
 
+test "doctor told to stop leaves no older-fx scan unfinished when no older fx saved anything" {
+    const alloc = testing.allocator;
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    const Always = struct {
+        fn requested(_: *anyopaque) bool {
+            return true;
+        }
+    };
+    var context: u8 = 0;
+    var report = try doctorWith(&t.store, alloc, .{
+        .limit = 64,
+        .now_ms = io_mod.milliTimestamp(),
+        .orphans = .count,
+        .blobs = .exists,
+        .stop = .{ .context = &context, .requested = Always.requested },
+    });
+    defer report.deinit(alloc);
+    try testing.expectEqual(@as(usize, 0), report.sessions);
+    try testing.expectEqual(@as(usize, 0), report.unfinished);
+    try testing.expect(!report.v1_incomplete);
+}
+
+test "doctor told to stop counts the sessions it did not finish, and reports its progress" {
+    const alloc = testing.allocator;
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var model = "m".*;
+    for ([_][]const u8{ "first", "second" }) |text| {
+        const s = try Session.create(alloc, &t.store, "/w", .app, testSeed(&model));
+        defer s.close();
+        try s.commitTurn(assistantTurn(text, "a"), types.ConversationLanguage.default());
+    }
+    var v1 = try V1Home.init(&t);
+    defer v1.deinit();
+    _ = try v1.fixture("plain", 2);
+
+    const Watch = struct {
+        stop: bool,
+        calls: [4][2]usize = undefined,
+        len: usize = 0,
+
+        fn requested(context: *anyopaque) bool {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            return self.stop;
+        }
+
+        fn report(context: *anyopaque, done: usize, total: usize) void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            if (self.len < self.calls.len) self.calls[self.len] = .{ done, total };
+            self.len += 1;
+        }
+    };
+
+    var stopped: Watch = .{ .stop = true };
+    var cut = try doctorWith(&t.store, alloc, .{
+        .limit = 64,
+        .now_ms = io_mod.milliTimestamp(),
+        .orphans = .count,
+        .blobs = .exists,
+        .stop = .{ .context = &stopped, .requested = Watch.requested },
+        .progress = .{ .context = &stopped, .report = Watch.report },
+    });
+    defer cut.deinit(alloc);
+    // However many of the older fx's sessions a read converted, the stop
+    // leaves every saved session unchecked and the older scan unfinished.
+    const total = cut.sessions;
+    try testing.expect(total >= 2);
+    try testing.expectEqual(@as(usize, 0), cut.checked);
+    try testing.expectEqual(total, cut.unfinished);
+    try testing.expect(cut.v1_incomplete);
+    try testing.expectEqual(@as(usize, 0), cut.damaged.items.len);
+    // Told before each session and once at the end.
+    try testing.expectEqual(total + 1, stopped.len);
+    for (stopped.calls[0..stopped.len], 0..) |call, done| try testing.expectEqualSlices(usize, &.{ done, total }, &call);
+
+    var running: Watch = .{ .stop = false };
+    var whole = try doctorWith(&t.store, alloc, .{
+        .limit = 64,
+        .now_ms = io_mod.milliTimestamp(),
+        .orphans = .count,
+        .blobs = .exists,
+        .stop = .{ .context = &running, .requested = Watch.requested },
+    });
+    defer whole.deinit(alloc);
+    // The limit's count covers the older fx's unconverted sessions too (D73).
+    try testing.expectEqual(whole.sessions + whole.unconverted, whole.checked);
+    try testing.expectEqual(@as(usize, 0), whole.unfinished);
+    try testing.expect(!whole.v1_incomplete);
+    try testing.expectEqual(@as(usize, 4), whole.sessions + whole.unconverted);
+    try testing.expectEqual(@as(usize, 0), whole.damaged.items.len);
+}
+
 test "doctor counts sessions an older fx saved and names each that can't be converted with what recover copies (D73)" {
     const alloc = testing.allocator;
     var t: TestHome = undefined;
@@ -9507,7 +12385,7 @@ test "doctor counts sessions an older fx saved and names each that can't be conv
     defer alloc.free(damaged);
     try v1.put(torn, null, "events.jsonl", damaged);
 
-    var report = try doctor(&t.store, alloc, 100, io_mod.milliTimestamp());
+    var report = try doctor(&t.store, alloc, 100, io_mod.milliTimestamp(), .count);
     defer report.deinit(alloc);
     try testing.expectEqual(@as(usize, 0), report.sessions);
     try testing.expectEqual(@as(usize, 5), report.unconverted);
@@ -10044,7 +12922,7 @@ test "fx sessions convert keeps a v1 subagent's own subagent as it is, and fx do
     try testing.expectEqual(before.count(), after.count());
     for (before.keys(), before.values()) |path, bytes| try testing.expectEqualStrings(bytes, after.get(path).?);
 
-    var doctor_report = try doctor(&t.store, alloc, 64, 0);
+    var doctor_report = try doctor(&t.store, alloc, 64, 0, .count);
     defer doctor_report.deinit(alloc);
     try testing.expectEqual(@as(usize, 1), doctor_report.kept_children.len);
     try testing.expectEqualStrings(family[2], doctor_report.kept_children[0].id);
@@ -10195,7 +13073,7 @@ test "fx doctor counts each v1 folder a family's conversion kept, a subagent's i
     try testing.expectEqual(@as(usize, 1), report.converted);
     try testing.expectEqual(@as(usize, 2), report.left_out.items.len);
     for (family) |id| try testing.expect(V1Home.exists(&t, id));
-    var doctor_report = try doctor(&t.store, alloc, 64, 0);
+    var doctor_report = try doctor(&t.store, alloc, 64, 0, .count);
     defer doctor_report.deinit(alloc);
     try testing.expectEqual(@as(usize, 2), doctor_report.keeps_left_out);
     // Each copy names what it left out and keeps no fingerprint, which an
@@ -10274,6 +13152,215 @@ test "fx sessions convert converts every v1 family, and counts what it skipped (
     plain.deinit(alloc);
 }
 
+test "a v1 session whose folder others can write is refused as unsafe by show, recover and conversion, and stays (D61)" {
+    const alloc = testing.allocator;
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var v1 = try V1Home.init(&t);
+    defer v1.deinit();
+    const ids = try v1.fixture("side", 1);
+    const id = ids[0];
+    for ([_]std.posix.mode_t{ 0o757, 0o775 }) |mode| {
+        try t.tmp.dir.setFilePermissions(io_mod.getIo(), try v1.sessionPath(id, ""), .fromMode(mode), .{});
+        if (readSession(&t.store, alloc, id)) |shown| {
+            var value = shown;
+            value.deinit(alloc);
+            return error.TestUnexpectedResult;
+        } else |err| try testing.expectEqual(error.DurablePathUnsafe, commandError(err));
+        if (recover(&t.store, alloc, id)) |recovered| {
+            var value = recovered;
+            value.deinit(alloc);
+            return error.TestUnexpectedResult;
+        } else |err| try testing.expectEqual(error.DurablePathUnsafe, commandError(err));
+        try testing.expectError(error.InvalidSessionFormat, openConverted(&t, id));
+        try expectUnsafeProblem(&t, "", id, "");
+        try testing.expect(V1Home.exists(&t, id));
+        try testing.expectError(error.NotFound, t.store.manager.peek(alloc, id));
+    }
+    // Readable by others only, it shows and converts (D61).
+    try t.tmp.dir.setFilePermissions(io_mod.getIo(), try v1.sessionPath(id, ""), .fromMode(0o755), .{});
+    var shown = try readSession(&t.store, alloc, id);
+    shown.deinit(alloc);
+    const s = try openConverted(&t, id);
+    s.close();
+    try testing.expect(!V1Home.exists(&t, id));
+}
+
+/// `t.store.problem` is exactly the reason fx gives when others can write
+/// `id`'s v1 folder, or `entry` in it, naming the subagent when `child` is
+/// set, with the command that makes the folder private (D61).
+fn expectUnsafeProblem(t: *TestHome, child: []const u8, id: []const u8, entry: []const u8) !void {
+    var buffer: [512]u8 = undefined;
+    const expected = try std.mem.print(&buffer, "{s}{s}{s}others can write {s}{s}, so its files may not be the ones fx saved; make it private with `chmod -R go-w ~/.fx/sessions/{s}`", .{
+        if (child.len > 0) "its subagent " else "",
+        child,
+        if (child.len > 0) ": " else "",
+        entry,
+        if (entry.len > 0) " in its folder" else "its folder",
+        id,
+    });
+    try testing.expectEqualStrings(expected, t.store.problem.text());
+}
+
+test "a v1 family whose subagent folder others can write is refused with the subagent, its folder and the fix, and stays (D61)" {
+    const alloc = testing.allocator;
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var v1 = try V1Home.init(&t);
+    defer v1.deinit();
+    const family = try v1.fixture("family", 3);
+    try t.tmp.dir.setFilePermissions(io_mod.getIo(), try v1.sessionPath(family[1], ""), .fromMode(0o757), .{});
+    if (recover(&t.store, alloc, family[0])) |recovered| {
+        var value = recovered;
+        value.deinit(alloc);
+        return error.TestUnexpectedResult;
+    } else |err| try testing.expectEqual(error.DurablePathUnsafe, commandError(err));
+    try testing.expectError(error.InvalidSessionFormat, openConverted(&t, family[0]));
+    try expectUnsafeProblem(&t, family[1], family[1], "");
+    var report = try convertAll(&t.store, alloc);
+    defer report.deinit(alloc);
+    try testing.expectEqual(@as(usize, 0), report.converted);
+    const root_reason = for (report.skipped.items) |skipped| {
+        if (std.mem.eql(u8, skipped.id, family[0])) break skipped.reason.?;
+    } else return error.TestUnexpectedResult;
+    try testing.expect(std.mem.startsWith(u8, root_reason, "its subagent "));
+    for (family) |id| try testing.expect(V1Home.exists(&t, id));
+    try testing.expectError(error.NotFound, t.store.manager.peek(alloc, family[0]));
+}
+
+test "a v1 family whose root's subagent folder others can write is refused, naming that folder and the fix (D61)" {
+    const alloc = testing.allocator;
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var v1 = try V1Home.init(&t);
+    defer v1.deinit();
+    const family = try v1.fixture("family", 3);
+    try t.tmp.dir.setFilePermissions(io_mod.getIo(), try v1.sessionPath(family[0], "subagent"), .fromMode(0o777), .{});
+    if (readSession(&t.store, alloc, family[0])) |shown| {
+        var value = shown;
+        value.deinit(alloc);
+        return error.TestUnexpectedResult;
+    } else |err| try testing.expectEqual(error.DurablePathUnsafe, commandError(err));
+    if (recover(&t.store, alloc, family[0])) |recovered| {
+        var value = recovered;
+        value.deinit(alloc);
+        return error.TestUnexpectedResult;
+    } else |err| try testing.expectEqual(error.DurablePathUnsafe, commandError(err));
+    // Conversion reports it unreadable, with the reason.
+    try testing.expectError(error.InvalidSessionFormat, openConverted(&t, family[0]));
+    try expectUnsafeProblem(&t, "", family[0], "subagent");
+    for (family) |id| try testing.expect(V1Home.exists(&t, id));
+}
+
+test "a v1 family whose children.json others can write is refused before it changes the family, naming the file (D61)" {
+    const alloc = testing.allocator;
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var v1 = try V1Home.init(&t);
+    defer v1.deinit();
+    const family = try v1.fixture("family", 3);
+    try t.tmp.dir.setFilePermissions(io_mod.getIo(), try v1.sessionPath(family[0], "subagent/children.json"), .fromMode(0o646), .{});
+    if (readSession(&t.store, alloc, family[0])) |shown| {
+        var value = shown;
+        value.deinit(alloc);
+        return error.TestUnexpectedResult;
+    } else |err| try testing.expectEqual(error.DurablePathUnsafe, commandError(err));
+    try expectUnsafeProblem(&t, "", family[0], "subagent/children.json");
+    if (recover(&t.store, alloc, family[0])) |recovered| {
+        var value = recovered;
+        value.deinit(alloc);
+        return error.TestUnexpectedResult;
+    } else |err| try testing.expectEqual(error.DurablePathUnsafe, commandError(err));
+    try expectUnsafeProblem(&t, "", family[0], "subagent/children.json");
+    try testing.expectError(error.InvalidSessionFormat, openConverted(&t, family[0]));
+    try expectUnsafeProblem(&t, "", family[0], "subagent/children.json");
+    for (family) |id| try testing.expect(V1Home.exists(&t, id));
+}
+
+test "a writable v1 entry's name reaches the reason terminal-safe, and a name too long to fit is left out, not cut (D61)" {
+    const io = io_mod.getIo();
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var v1 = try V1Home.init(&t);
+    defer v1.deinit();
+    const id = (try v1.fixture("side", 1))[0];
+    var folder = try t.tmp.dir.openDir(io, try v1.sessionPath(id, ""), .{ .iterate = true });
+    defer folder.close(io);
+    const hostile = "x\x1b]0;PWNED\x07\x1b[31mred";
+    folder.writeFile(io, .{ .sub_path = hostile, .data = "", .flags = .{ .permissions = .fromMode(0o666) } }) catch return error.SkipZigTest;
+    try folder.setFilePermissions(io, hostile, .fromMode(0o666), .{});
+    try testing.expectError(error.InvalidSessionFormat, openConverted(&t, id));
+    const text = t.store.problem.text();
+    try testing.expect(std.mem.findScalar(u8, text, 0x1b) == null);
+    try testing.expect(std.mem.findScalar(u8, text, 0x07) == null);
+    try testing.expect(std.mem.find(u8, text, "PWNED") != null);
+    var buffer: [256]u8 = undefined;
+    try testing.expect(std.mem.endsWith(u8, text, try std.mem.print(&buffer, "in its folder, so its files may not be the ones fx saved; make it private with `chmod -R go-w ~/.fx/sessions/{s}`", .{id})));
+    try folder.deleteFile(io, hostile);
+
+    // Each control byte is written as a four-byte escape, so this name's
+    // reason would not fit whole.
+    const long: [255]u8 = @splat(0x01);
+    folder.writeFile(io, .{ .sub_path = &long, .data = "" }) catch return error.SkipZigTest;
+    try folder.setFilePermissions(io, &long, .fromMode(0o666), .{});
+    try testing.expectError(error.InvalidSessionFormat, openConverted(&t, id));
+    try testing.expectEqualStrings(try std.mem.print(&buffer, "others can write something in its folder, so its files may not be the ones fx saved; make it private with `chmod -R go-w ~/.fx/sessions/{s}`", .{id}), t.store.problem.text());
+}
+
+test "a v1 session whose events file others can write is refused like a writable folder, naming the file (D61)" {
+    const alloc = testing.allocator;
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var v1 = try V1Home.init(&t);
+    defer v1.deinit();
+    const id = (try v1.fixture("side", 1))[0];
+    try t.tmp.dir.setFilePermissions(io_mod.getIo(), try v1.sessionPath(id, "events.jsonl"), .fromMode(0o646), .{});
+    if (readSession(&t.store, alloc, id)) |shown| {
+        var value = shown;
+        value.deinit(alloc);
+        return error.TestUnexpectedResult;
+    } else |err| try testing.expectEqual(error.DurablePathUnsafe, commandError(err));
+    if (recover(&t.store, alloc, id)) |recovered| {
+        var value = recovered;
+        value.deinit(alloc);
+        return error.TestUnexpectedResult;
+    } else |err| try testing.expectEqual(error.DurablePathUnsafe, commandError(err));
+    try testing.expectError(error.InvalidSessionFormat, openConverted(&t, id));
+    try expectUnsafeProblem(&t, "", id, "events.jsonl");
+    try testing.expect(V1Home.exists(&t, id));
+}
+
+test "a converted session whose v1 folder comes back writable by others is kept, not reported unreadable (D61)" {
+    const alloc = testing.allocator;
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var v1 = try V1Home.init(&t);
+    defer v1.deinit();
+    const id = (try v1.fixture("side", 1))[0];
+    const s = try openConverted(&t, id);
+    s.close();
+    try testing.expect(!V1Home.exists(&t, id));
+    // The v1 copy is back, and others can write it.
+    _ = try v1.fixture("side", 1);
+    try t.tmp.dir.setFilePermissions(io_mod.getIo(), try v1.sessionPath(id, ""), .fromMode(0o757), .{});
+    for (0..2) |_| {
+        var report = try convertAll(&t.store, alloc);
+        defer report.deinit(alloc);
+        try testing.expectEqual(@as(usize, 0), report.unreadable);
+        try testing.expectEqual(@as(usize, 0), report.skipped.items.len);
+    }
+    try testing.expect(V1Home.exists(&t, id));
+    var shown = try readSession(&t.store, alloc, id);
+    shown.deinit(alloc);
+}
+
 test "a v1 profile an old release left readable by others converts (D61)" {
     const alloc = testing.allocator;
     const io = io_mod.getIo();
@@ -10285,9 +13372,9 @@ test "a v1 profile an old release left readable by others converts (D61)" {
     const roots = try v1.fixture("plain", 1);
     const v1_open_id = roots[0];
     for ([_][]const u8{ ".fx", ".fx/sessions", try v1.sessionPath(v1_open_id, "") }) |path| {
-        var dir = try t.tmp.dir.openDir(io, path, .{});
+        var dir = try t.tmp.dir.openDir(io, path, .{ .iterate = true });
         defer dir.close(io);
-        dir.setPermissions(io, .fromMode(0o755)) catch return error.SkipZigTest;
+        try dir.setPermissions(io, .fromMode(0o755));
     }
     const s = try openConverted(&t, v1_open_id);
     defer s.close();
@@ -10474,7 +13561,7 @@ test "a child an earlier try published keeps its v1 folder when that try left a 
     try testing.expectEqualStrings(child, report.kept_children[0].id);
     try testing.expectEqualStrings("fx converted it already without logs/commands/replay.bin, so this folder keeps it", report.kept_children[0].reason);
     // fx doctor counts that folder, though its root's folder is gone.
-    var doctor_report = try doctor(&t.store, alloc, 64, 0);
+    var doctor_report = try doctor(&t.store, alloc, 64, 0, .count);
     defer doctor_report.deinit(alloc);
     try testing.expectEqual(@as(usize, 1), doctor_report.keeps_left_out);
 }
@@ -10670,10 +13757,11 @@ test "a new session never takes an id v1's folder could not be checked for (D61)
     defer t.deinit();
     const io = io_mod.getIo();
     try t.tmp.dir.createDirPath(io, ".fx/sessions");
-    var sessions = try t.tmp.dir.openDir(io, ".fx/sessions", .{});
+    var sessions = try t.tmp.dir.openDir(io, ".fx/sessions", .{ .iterate = true });
     defer sessions.close(io);
-    sessions.setPermissions(io, .fromMode(0o000)) catch return error.SkipZigTest;
+    try sessions.setPermissions(io, .fromMode(0o000));
     defer sessions.setPermissions(io, .fromMode(0o700)) catch {};
+    if (writesWhateverTheMode(sessions)) return error.SkipZigTest;
     var model = "m".*;
     try testing.expectError(error.SessionStoreUnavailable, Session.create(testing.allocator, &t.store, "/w", .ask, testSeed(&model)));
 }
@@ -10798,7 +13886,7 @@ test "a v1 side file larger than one v2 blob is left out and named, its v1 folde
     defer again.deinit(alloc);
     for (roots) |id| try testing.expect(V1Home.exists(&t, id));
     try testing.expectEqual(@as(u64, sm.max_blob_bytes + 1), (try t.tmp.dir.statFile(io, try v1.sessionPath(roots[1], "logs/commands/replay.bin"), .{})).size);
-    var doctor_report = try doctor(&t.store, alloc, 64, 0);
+    var doctor_report = try doctor(&t.store, alloc, 64, 0, .count);
     defer doctor_report.deinit(alloc);
     try testing.expectEqual(@as(usize, 2), doctor_report.keeps_left_out);
 }

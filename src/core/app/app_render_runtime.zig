@@ -503,7 +503,13 @@ pub fn Runtime(comptime App: type) type {
                 debug_trace.logf("theme", "theme_transcript_retint_failed err={s}", .{@errorName(err)});
                 return;
             };
-            app.pacer.rethemeInlineCode(light);
+            app.pacer.retintForTheme(app.alloc, prior_theme, target) catch |err| {
+                debug_trace.logf("theme", "theme_pending_retint_failed err={s} kept=old_colors", .{@errorName(err)});
+            };
+            // Each hidden agent keeps its own transcript and paced text.
+            if (comptime @hasField(App, "child_agents") and @hasField(App, "main_screen")) {
+                @import("app_agents_runtime.zig").Runtime(App).retintHiddenScreens(app, prior_theme, target);
+            }
             if (resolved_target) |resolved| {
                 ui_render.applyTheme(resolved, rgb);
             } else {
@@ -733,6 +739,10 @@ pub fn Runtime(comptime App: type) type {
                 app.hiddenAgentWaitingNote(waiting_note_buf)
             else
                 "";
+            const subagent_wait = if (comptime @hasDecl(App, "subagentWaitStatus"))
+                app.subagentWaitStatus()
+            else
+                @import("app_agents_runtime.zig").SubagentWait{};
             // Shares the buffer: the footer shows it only without a waiting note.
             const working_note: []const u8 = if (comptime @hasDecl(App, "hiddenAgentWorkingNote"))
                 (if (waiting_note.len == 0) app.hiddenAgentWorkingNote(waiting_note_buf) else "")
@@ -868,6 +878,8 @@ pub fn Runtime(comptime App: type) type {
                 .agent_label = if (comptime @hasDecl(App, "footerAgentLabel")) app.footerAgentLabel() else "",
                 .waiting_note = waiting_note,
                 .working_note = working_note,
+                .subagent_wait = subagent_wait.label,
+                .subagent_wait_since_ms = subagent_wait.since_ms,
                 .mcp_status = if (comptime @hasField(App, "mcp")) app.mcp.hostStatusText() else "",
                 .danger_status = if (yolo_warning_active)
                     app_permission_runtime.yolo_warning_text
@@ -1259,7 +1271,8 @@ pub fn Runtime(comptime App: type) type {
             );
             // A terminal reset clears the screen and replays the transcript,
             // so the entries the transcript window kept only because a row of
-            // theirs was on screen go before the replay.
+            // theirs was on screen go before the replay, unless the replay is
+            // a resumed transcript's first paint (`transcriptWindowScreenCleared`).
             if (comptime @hasDecl(@TypeOf(app.shell), "transcriptWindowScreenCleared")) {
                 if (app.shell.terminal_reset_pending) try app.shell.transcriptWindowScreenCleared(app.alloc);
             }
@@ -1716,6 +1729,14 @@ pub fn Runtime(comptime App: type) type {
                 pending_card.?.overlaps_flow_endpoint(prepared.cursor.cursor_col)
             else
                 false;
+            // A queued-message card took its separator from the shell's
+            // cursor, which a terminal reset puts back at 1,1 while this frame
+            // reprints a transcript that can end mid-row, as when a switch
+            // shows another agent. It starts below this frame's endpoint
+            // instead, so it never paints over the endpoint's row.
+            if (!pending_submission_card) if (pending_card) |*card| if (prepared_transcript) |*prepared| {
+                card.leading_advance_rows = pendingCardLeadingAdvanceRows(prepared.cursor.cursor_col);
+            };
             var pending_paint_ctx = if (pending_preview_overlaps_flow) null else if (pending_card) |card|
                 PendingCardPaintContext.init(
                     card,
@@ -2057,8 +2078,8 @@ pub fn Runtime(comptime App: type) type {
 
         // The open agent list takes the footer from the shown agent's
         // approval or question, so the list stays visible while it previews
-        // an agent that is waiting. The prompt itself is untouched and
-        // returns when the list closes.
+        // an agent that is waiting. The prompt itself is untouched and returns
+        // when the list closes.
         fn shownApproval(app: *const App, agent: *AppAgent) ?approval_prompt.Projection {
             if (agentsMenuActive(app)) return null;
             return agent.approval_prompt.projection();
@@ -3784,6 +3805,11 @@ const CoordinatorTestWorker = struct {
     cancel_requested: bool = false,
     cancel_continues_turn: bool = false,
     steering_messages: []const []const u8 = &.{},
+    compaction: @import("../output/compaction_activity.zig").State = .{},
+
+    pub fn compactionActivitySnapshot(self: *const @This()) @import("../output/compaction_activity.zig").Snapshot {
+        return self.compaction.snapshot;
+    }
 
     pub fn snapshotSteeringPresentation(
         self: *const @This(),
@@ -5661,6 +5687,68 @@ test "core.app_render_runtime roomy resume footer paints twenty VT session rows"
     try Runtime(CoordinatorTestApp).flushRequestedFrame(&app, (&app).agent());
     try std.testing.expect(!(try coordinatorGridContains(app.shell.shadow_vt.?.*, "Responsive session title")));
     try std.testing.expect(try coordinatorGridContains(app.shell.shadow_vt.?.*, "twenty-row transcript remains visible"));
+}
+
+test "core.app_render_runtime compaction row shows its count and its own clock in the VT, then the turn row goes on" {
+    const activity_status = @import("../output/activity_status.zig");
+    const turn_clock = @import("../output/turn_clock.zig");
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    for ([_]u16{ 120, 28 }) |cols| {
+        var file = try tmp.dir.createFile(std.testing.io, "compaction-row-vt.log", .{ .read = true });
+        defer file.close(io_mod.getIo());
+        var app = CoordinatorTestApp{
+            .alloc = alloc,
+            .shell = .{
+                .stdout_file = file,
+                .layout = .{
+                    .rows = 24,
+                    .cols = cols,
+                    .content_bottom = 20,
+                    .divider_top_row = 21,
+                    .input_row = 22,
+                    .divider_bottom_row = 23,
+                    .hint_row = 24,
+                },
+                .owned_top_row = 1,
+                .viewport_top_row = 1,
+            },
+        };
+        defer app.deinit();
+        try app.selected_model.appendSlice(alloc, "test-model");
+        try app.shell.initBacking(alloc);
+        try app.shell.enableShadowVt(alloc);
+        try app.shell.writeTranscript(alloc, &app.metrics, "earlier turn output\n", true);
+
+        // 10m15s into the turn a compaction began 12 s ago. Each mark sits
+        // 50 ms past a whole second, so the shown second holds for 950 ms.
+        var now = io_mod.milliTimestamp();
+        const began = now - 12_050;
+        app.agent().stream = .{ .active = true, .phase = .thinking, .turn_started_ms = began - 615_000 };
+        const id = app.agent().worker.compaction.begin(.automatic, 1, began);
+        app.agent().worker.compaction.running(id, .summary);
+        app.agent().worker.compaction.written(id, 66);
+        activity_status.syncWaitingClock(&app.agent().stream, turn_clock.waits(false, app.agent().worker.compactionActivitySnapshot()), began);
+        app.shell.render_requests.request(.footer);
+        try Runtime(CoordinatorTestApp).flushRequestedFrame(&app, (&app).agent());
+        const grid = app.shell.shadow_vt.?;
+        // The compaction's count and its own clock replace the turn row,
+        // whole even on a narrow row.
+        try std.testing.expect(try coordinatorGridContains(grid.*, "• Compacting 66% (12s)"));
+        try std.testing.expect(!(try coordinatorGridContains(grid.*, "Thinking")));
+        try std.testing.expect(try coordinatorGridContains(grid.*, "earlier turn output"));
+
+        // The compaction ends; syncState resumes the turn clock.
+        now = io_mod.milliTimestamp();
+        app.agent().worker.compaction.settle(id, .{ .outcome = .succeeded, .stage = .publication, .publication = .committed }, now);
+        activity_status.syncWaitingClock(&app.agent().stream, turn_clock.waits(false, app.agent().worker.compactionActivitySnapshot()), now);
+        app.shell.render_requests.request(.footer);
+        try Runtime(CoordinatorTestApp).flushRequestedFrame(&app, (&app).agent());
+        // The turn goes on from the 10m15s it showed when compaction began.
+        try std.testing.expect(try coordinatorGridContains(grid.*, "• Thinking (10m15s)"));
+        try std.testing.expect(!(try coordinatorGridContains(grid.*, "Compacting")));
+    }
 }
 
 test "core.app_render_runtime inline menus survive the VT size and resize matrix" {

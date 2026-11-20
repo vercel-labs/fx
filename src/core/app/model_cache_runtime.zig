@@ -1,11 +1,15 @@
 const std = @import("std");
 const testing_allocator = @import("../shared/testing_allocator.zig");
+const auth_runtime = @import("../auth/auth_runtime.zig");
+const stored_login_testing = @import("../auth/stored_login_testing.zig");
 const credentials = @import("../auth/credentials.zig");
 const secret = @import("../auth/secret.zig");
 const collections = @import("../shared/collections.zig");
 const model_catalog = @import("../gateway/model_catalog.zig");
 const model_catalog_metadata = @import("../gateway/model_catalog_metadata.zig");
 const model_capabilities = @import("../config/model_capabilities.zig");
+const token_pass_mod = @import("../gateway/token_pass.zig");
+const token_pass_team = @import("../gateway/token_pass_team.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const diagnostics = @import("../workspace/diagnostics.zig");
 const io_mod = @import("../shared/io.zig");
@@ -145,6 +149,75 @@ const OwnedCatalogAccess = struct {
     }
 };
 
+/// A warmup's copy of the shared sign-in it fetches with; it owns the account
+/// and team bytes.
+const OwnedSignIn = struct {
+    sign_in: auth_runtime.SharedSignIn,
+
+    fn init(alloc: Allocator, sign_in: auth_runtime.SharedSignIn) !OwnedSignIn {
+        var owned = sign_in;
+        owned.account_id = if (sign_in.account_id) |account| try alloc.dupe(u8, account) else null;
+        errdefer if (owned.account_id) |account| alloc.free(account);
+        owned.team = if (sign_in.team) |team| try alloc.dupe(u8, team) else null;
+        return .{ .sign_in = owned };
+    }
+
+    fn deinit(self: *OwnedSignIn, alloc: Allocator) void {
+        if (self.sign_in.account_id) |account| alloc.free(account);
+        if (self.sign_in.team) |team| alloc.free(team);
+        self.* = undefined;
+    }
+};
+
+/// Gives the model list's fetch the stored token of its shared sign-in, which
+/// another fx process may have refreshed since the app read it. It never
+/// refreshes the sign-in, and it owns every token it hands to the fetch until
+/// the fetch returns.
+const CatalogSignIn = struct {
+    alloc: Allocator,
+    sign_in: auth_runtime.SharedSignIn,
+    stored: ?credentials.Credential = null,
+    replacement: ?credentials.Credential = null,
+
+    /// The stored token when it differs from `current`
+    /// (tests/tla/session_title/SessionTitle.tla CatalogFirstSendUsesStore).
+    fn storedToken(self: *CatalogSignIn, current: []const u8) ?[]const u8 {
+        var credential = (auth_runtime.readStoredCredential(self.alloc, self.sign_in) catch |err| {
+            debug_trace.logf("catalog", "model catalog keeps its credential reason=stored_read_failed err={s}", .{@errorName(err)});
+            return null;
+        }) orelse return null;
+        if (std.mem.eql(u8, credential.token, current)) {
+            credential.deinit(self.alloc);
+            return null;
+        }
+        if (self.stored) |*old| old.deinit(self.alloc);
+        self.stored = credential;
+        return credential.token;
+    }
+
+    fn hook(self: *CatalogSignIn) model_catalog.RenewAfterRejection {
+        return .{ .context = self, .renew_fn = replace };
+    }
+
+    /// The stored token that replaced `rejected`, or null to fall back.
+    fn replace(context: *anyopaque, rejected: []const u8) ?[]const u8 {
+        const self: *CatalogSignIn = @ptrCast(@alignCast(context));
+        const credential = (auth_runtime.storedReplacement(self.alloc, self.sign_in, rejected) catch |err| {
+            debug_trace.logf("catalog", "model catalog falls back reason=stored_read_failed err={s}", .{@errorName(err)});
+            return null;
+        }) orelse return null;
+        if (self.replacement) |*old| old.deinit(self.alloc);
+        self.replacement = credential;
+        return credential.token;
+    }
+
+    fn deinit(self: *CatalogSignIn) void {
+        if (self.stored) |*credential| credential.deinit(self.alloc);
+        if (self.replacement) |*credential| credential.deinit(self.alloc);
+        self.* = undefined;
+    }
+};
+
 pub const ModelMenuLoadState = enum {
     loading,
     ready,
@@ -180,6 +253,8 @@ pub const ModelMenuItem = struct {
     id: []u8,
     provider: []const u8,
     capabilities: model_capabilities.Capabilities,
+    /// Whether the catalog marks this model as paid by the team's Token Pass.
+    token_pass: bool = false,
 
     fn deinit(self: ModelMenuItem, alloc: Allocator) void {
         alloc.free(self.id);
@@ -387,6 +462,11 @@ fn providerMatchesFilter(provider: []const u8, filter: ModelProviderFilter) bool
     return filter == .all or providerFilter(provider) == filter;
 }
 
+/// Whether the provider tab `filter` lists `item`, whatever is typed.
+pub fn modelProviderFilterKeeps(item: ModelMenuItem, filter: ModelProviderFilter) bool {
+    return providerMatchesFilter(item.provider, filter);
+}
+
 pub const Runtime = struct {
     const Self = @This();
 
@@ -415,6 +495,16 @@ pub const Runtime = struct {
     outcome: CatalogOutcome = .{},
     from_profile_settings: bool = false,
     menu: ModelMenu = .{},
+    /// Whether this credential's team has Token Pass: the answer fx saved
+    /// for the team, then the credits check, the provider that served its
+    /// requests, and Token Pass denials. It resets with the catalog, since
+    /// both belong to one credential and team, and every change is published
+    /// to `token_pass_team`. Main thread only, so the mutex does not guard
+    /// it.
+    token_pass: token_pass_mod.Tracker = .{},
+    /// Counts credential changes, so a credits reply that started for an
+    /// earlier credential does not speak for this one.
+    token_pass_epoch: u32 = 0,
 
     pub fn init(alloc: Allocator, models_path: []const u8) Self {
         return .{
@@ -430,25 +520,45 @@ pub const Runtime = struct {
         model_catalog.freeModelCatalog(self.alloc, &self.catalog);
     }
 
-    pub fn startWarmup(
+    fn startWarmup(
         self: *Self,
         provider: model_catalog.Provider,
         access: credentials.CatalogAccess,
         trigger: LoadTrigger,
     ) void {
+        self.startWarmupWithSharedSignIn(provider, access, trigger, null);
+    }
+
+    /// Starts a warmup for `access`. With a shared sign-in, the warmup fetches
+    /// with its stored token, and after a 401 tries once more with a stored
+    /// token that replaced the rejected one before it falls back to the public
+    /// list.
+    pub fn startWarmupWithSharedSignIn(
+        self: *Self,
+        provider: model_catalog.Provider,
+        access: credentials.CatalogAccess,
+        trigger: LoadTrigger,
+        shared_sign_in: ?auth_runtime.SharedSignIn,
+    ) void {
         self.from_profile_settings = provider.provider_id == .configured;
         if (!self.beginLoad(access, provider.refresh_interval_ms, trigger)) return;
 
-        const owned_access = OwnedCatalogAccess.init(self.alloc, access) catch {
-            self.completeFetch(.{ .failed = .{
-                .access = .init(access),
-                .anonymous_fallback_used = false,
-                .failure = .{ .category = .resource_exhausted },
-            } });
+        const failed_to_copy: model_catalog.FetchResult = .{ .failed = .{
+            .access = .init(access),
+            .anonymous_fallback_used = false,
+            .failure = .{ .category = .resource_exhausted },
+        } };
+        var owned_access = OwnedCatalogAccess.init(self.alloc, access) catch {
+            self.completeFetch(failed_to_copy);
             return;
         };
+        const owned_sign_in: ?OwnedSignIn = if (shared_sign_in) |value| OwnedSignIn.init(self.alloc, value) catch {
+            owned_access.deinit(self.alloc);
+            self.completeFetch(failed_to_copy);
+            return;
+        } else null;
 
-        const thread = std.Thread.spawn(.{}, preloadThreadMain, .{ self, provider, owned_access }) catch {
+        const thread = std.Thread.spawn(.{}, preloadThreadMain, .{ self, provider, owned_access, owned_sign_in }) catch {
             var failed_access = owned_access;
             const failure = model_catalog.FailedOutcome{
                 .access = .init(failed_access.access),
@@ -456,6 +566,10 @@ pub const Runtime = struct {
                 .failure = .{ .category = .runtime, .retryable = true },
             };
             failed_access.deinit(self.alloc);
+            if (owned_sign_in) |value| {
+                var failed_sign_in = value;
+                failed_sign_in.deinit(self.alloc);
+            }
             self.completeFetch(.{ .failed = failure });
             return;
         };
@@ -585,6 +699,38 @@ pub const Runtime = struct {
         self.requested_access = null;
         self.mutex.unlock(io_mod.getIo());
         self.cancel_requested.store(false, .seq_cst);
+        if (self.token_pass.status != .unknown) {
+            debug_trace.logf("catalog", "token pass status reset reason=credential_changed", .{});
+        }
+        self.token_pass = .{};
+        token_pass_team.clear();
+        self.token_pass_epoch +%= 1;
+    }
+
+    /// Starts this credential's status from the answer fx saved for its
+    /// team, before the credits check answers.
+    pub fn adoptSavedTokenPass(self: *Self, saved: ?token_pass_mod.Answer) void {
+        self.token_pass = token_pass_mod.Tracker.fromSaved(saved);
+        if (saved != null) debug_trace.logf("catalog", "token pass status={t} source=saved", .{self.token_pass.status});
+        token_pass_team.publishAnswer(saved, false);
+    }
+
+    /// Records what AI Gateway said about this team; `source` names how,
+    /// for the trace.
+    pub fn observeTokenPassAnswer(self: *Self, answer: token_pass_mod.Answer, source: []const u8) void {
+        // Published even when the status stays: an answer AI Gateway gives
+        // in this run outranks the catalog's marks from then on.
+        token_pass_team.publishAnswer(answer, !std.mem.eql(u8, source, token_pass_team.catalog_source));
+        const changed = switch (answer) {
+            .has_pass => self.token_pass.observeCredit(),
+            .no_pass => self.token_pass.observeNoPass(),
+        };
+        if (!changed) return;
+        debug_trace.logf("catalog", "token pass status={t} source={s}", .{ self.token_pass.status, source });
+    }
+
+    pub fn tokenPassStatus(self: *const Self) token_pass_mod.Status {
+        return self.token_pass.status;
     }
 
     pub fn resetForProviderChange(self: *Self) void {
@@ -614,6 +760,7 @@ pub const Runtime = struct {
         model_catalog.freeModelCatalog(self.alloc, &self.catalog);
         self.catalog = owned_catalog.*;
         owned_catalog.* = .empty;
+        token_pass_team.publishCatalog(self.catalog.items);
         self.outcome = .{ .loaded = .{
             .access = model_catalog.AccessMetadata.init(access),
         } };
@@ -842,15 +989,36 @@ pub const Runtime = struct {
         self: *Self,
         provider: model_catalog.Provider,
         owned_access: OwnedCatalogAccess,
+        owned_sign_in: ?OwnedSignIn,
     ) void {
         var access = owned_access;
         defer access.deinit(self.alloc);
+        var sign_in = owned_sign_in;
+        defer if (sign_in) |*value| value.deinit(self.alloc);
+
+        var fetch_access = access.access;
+        var stored: ?CatalogSignIn = null;
+        defer if (stored) |*active| active.deinit();
+        if (sign_in) |value| {
+            if (fetch_access.authorizationCredential()) |current| {
+                if (fetch_access.credentialSource() == value.sign_in.source) {
+                    stored = .{ .alloc = self.alloc, .sign_in = value.sign_in };
+                    if (stored) |*active| {
+                        if (active.storedToken(current)) |token| {
+                            debug_trace.logf("catalog", "model catalog uses the stored credential reason=newer", .{});
+                            fetch_access = fetch_access.withCredential(token);
+                        }
+                    }
+                }
+            }
+        }
 
         self.completeFetch(model_catalog.fetchWithPublicFallback(provider, self.alloc, .{
-            .access = access.access,
+            .access = fetch_access,
             .endpoint = self.models_path,
             .cancel_flag = &self.cancel_requested,
             .view = .picker,
+            .renew_after_rejection = if (stored) |*active| active.hook() else null,
         }));
     }
 
@@ -913,6 +1081,7 @@ pub const Runtime = struct {
                     model_catalog.freeModelCatalog(self.alloc, &self.catalog);
                     self.catalog = catalog;
                     self.outcome = .{ .loaded = loaded.provenance };
+                    token_pass_team.publishCatalog(self.catalog.items);
                 }
                 self.state = .ready;
                 return .{ .ready = .{
@@ -974,7 +1143,7 @@ pub const Runtime = struct {
                 // A retry runs behind the failed state; the picker shows it.
                 menu.load_state = if (self.fetch_in_flight) .loading else .failed;
             },
-            .ready => try hydrateMenuSnapshot(self.alloc, menu, self.catalog.items),
+            .ready => try hydrateMenuSnapshot(self.alloc, menu, self.catalog.items, self.token_pass.hasPass()),
         }
         menu.catalog_state = modelMenuCatalogState(self.outcome, self.from_profile_settings);
     }
@@ -1013,10 +1182,32 @@ fn modelMenuCatalogState(outcome: CatalogOutcome, from_profile_settings: bool) M
     };
 }
 
+fn appendMenuItem(alloc: Allocator, items: *std.ArrayList(ModelMenuItem), entry: model_catalog.ModelCatalogEntry) !void {
+    const id = try alloc.dupe(u8, entry.id);
+    const item: ModelMenuItem = .{
+        .id = id,
+        .provider = modelProvider(id),
+        .capabilities = model_capabilities.resolveCapabilities(
+            id,
+            model_catalog_metadata.fromCatalogEntry(entry),
+        ),
+        .token_pass = entry.token_pass,
+    };
+    items.append(alloc, item) catch |err| {
+        item.deinit(alloc);
+        return err;
+    };
+}
+
+/// Fills `menu` from `catalog`, in catalog order. With `token_pass_first`,
+/// for a team that has Token Pass, the models the catalog marks as paid by
+/// its Token Pass lead the list, in catalog order. A model that Fast mode on
+/// another listed model runs gets no row; see `model_catalog.foldsIntoFastMode`.
 fn hydrateMenuSnapshot(
     alloc: Allocator,
     menu: *ModelMenu,
     catalog: []const model_catalog.ModelCatalogEntry,
+    token_pass_first: bool,
 ) !void {
     var items: std.ArrayList(ModelMenuItem) = .empty;
     errdefer {
@@ -1025,23 +1216,16 @@ fn hydrateMenuSnapshot(
     }
     try items.ensureTotalCapacity(alloc, catalog.len);
 
+    if (token_pass_first) {
+        for (catalog) |entry| {
+            if (entry.token_pass and !model_catalog.foldsIntoFastMode(entry, catalog)) try appendMenuItem(alloc, &items, entry);
+        }
+    }
     for (catalog) |entry| {
-        const item = item: {
-            const id = try alloc.dupe(u8, entry.id);
-            errdefer alloc.free(id);
-            break :item ModelMenuItem{
-                .id = id,
-                .provider = modelProvider(id),
-                .capabilities = model_capabilities.resolveCapabilities(
-                    id,
-                    model_catalog_metadata.fromCatalogEntry(entry),
-                ),
-            };
-        };
-        items.append(alloc, item) catch |err| {
-            item.deinit(alloc);
-            return err;
-        };
+        if (token_pass_first and entry.token_pass) continue;
+        // Fast mode on the base model's row already selects this model.
+        if (model_catalog.foldsIntoFastMode(entry, catalog)) continue;
+        try appendMenuItem(alloc, &items, entry);
     }
 
     // A revalidated catalog replaces rows under an open menu; keep the
@@ -1558,6 +1742,100 @@ test "open model menu keeps its provider tab and selection when a revalidated ca
     try std.testing.expectEqual(@as(usize, 0), runtime.menu.window_start);
 }
 
+/// Lists `private/model` only for `accepted`, and `public/model` without a
+/// token. When `rotate_to` is set, the first authenticated fetch finds the
+/// login renewed by another fx process: the store gets that token, and the
+/// provider rejects the one sent.
+const SharedLoginCatalog = struct {
+    home: *stored_login_testing.StoredLoginHome,
+    accepted: []const u8,
+    rotate_to: ?[]const u8 = null,
+    sent: [3][32]u8 = undefined,
+    sent_len: [3]usize = .{ 0, 0, 0 },
+    calls: usize = 0,
+
+    fn fetch(raw: ?*anyopaque, alloc: Allocator, input: model_catalog.FetchInput) Allocator.Error!model_catalog.ProviderResult {
+        const self: *SharedLoginCatalog = @ptrCast(@alignCast(raw.?));
+        const token = input.access.authorizationCredential() orelse "";
+        std.debug.assert(self.calls < self.sent.len and token.len <= self.sent[0].len);
+        @memcpy(self.sent[self.calls][0..token.len], token);
+        self.sent_len[self.calls] = token.len;
+        self.calls += 1;
+        if (token.len == 0) return .{ .catalog = try testCatalog(alloc, "public/model") };
+        if (self.calls == 1) if (self.rotate_to) |rotated| self.home.store(rotated, "team-a", stored_login_testing.far_future_ms) catch unreachable;
+        if (std.mem.eql(u8, token, self.accepted)) return .{ .catalog = try testCatalog(alloc, "private/model") };
+        return .{ .failure = model_catalog.failureForHttpStatus(.unauthorized) };
+    }
+
+    fn provider(self: *SharedLoginCatalog) model_catalog.Provider {
+        return .{ .context = self, .fetch_fn = fetch };
+    }
+
+    fn sentToken(self: *const SharedLoginCatalog, index: usize) []const u8 {
+        return self.sent[index][0..self.sent_len[index]];
+    }
+};
+
+test "model cache fetches with the stored token of a shared sign-in and never refreshes it" {
+    const alloc = std.testing.allocator;
+    var home: stored_login_testing.StoredLoginHome = undefined;
+    try home.install(alloc);
+    defer home.deinit();
+    const access = credentials.catalogAccessForCredential(.fx_login, "launch-token", "team-a");
+    const sign_in: auth_runtime.SharedSignIn = .{ .source = .fx_login, .team = "team-a" };
+
+    // Another fx process refreshed the login after this one read it.
+    {
+        try home.store("other-fx-token", "team-a", stored_login_testing.far_future_ms);
+        var runtime = Runtime.init(alloc, "/v1/models");
+        defer runtime.deinit();
+        var catalog = SharedLoginCatalog{ .home = &home, .accepted = "other-fx-token" };
+        runtime.startWarmupWithSharedSignIn(catalog.provider(), access, .activity, sign_in);
+        try waitForWarmup(&runtime);
+        try std.testing.expectEqual(@as(usize, 1), catalog.calls);
+        try std.testing.expectEqualStrings("other-fx-token", catalog.sentToken(0));
+        try std.testing.expect(!runtime.outcome.loaded.?.anonymous_fallback_used);
+    }
+    // ...or between the read and the fetch: one more fetch with its token.
+    {
+        try home.store("read-token", "team-a", stored_login_testing.far_future_ms);
+        var runtime = Runtime.init(alloc, "/v1/models");
+        defer runtime.deinit();
+        var catalog = SharedLoginCatalog{ .home = &home, .accepted = "rotated-token", .rotate_to = "rotated-token" };
+        runtime.startWarmupWithSharedSignIn(catalog.provider(), access, .activity, sign_in);
+        try waitForWarmup(&runtime);
+        try std.testing.expectEqual(@as(usize, 2), catalog.calls);
+        try std.testing.expectEqualStrings("read-token", catalog.sentToken(0));
+        try std.testing.expectEqualStrings("rotated-token", catalog.sentToken(1));
+        try std.testing.expect(!runtime.outcome.loaded.?.anonymous_fallback_used);
+    }
+    // The store still holds the rejected token: the public list, with no
+    // refresh and no second authenticated fetch.
+    {
+        try home.store("revoked-token", "team-a", stored_login_testing.far_future_ms);
+        var runtime = Runtime.init(alloc, "/v1/models");
+        defer runtime.deinit();
+        var catalog = SharedLoginCatalog{ .home = &home, .accepted = "never" };
+        runtime.startWarmupWithSharedSignIn(catalog.provider(), access, .activity, sign_in);
+        try waitForWarmup(&runtime);
+        try std.testing.expectEqual(@as(usize, 2), catalog.calls);
+        try std.testing.expectEqualStrings("revoked-token", catalog.sentToken(0));
+        try std.testing.expectEqualStrings("", catalog.sentToken(1));
+        try std.testing.expect(runtime.outcome.loaded.?.anonymous_fallback_used);
+    }
+    // Another team's stored login is never sent.
+    {
+        try home.store("team-b-token", "team-b", stored_login_testing.far_future_ms);
+        var runtime = Runtime.init(alloc, "/v1/models");
+        defer runtime.deinit();
+        var catalog = SharedLoginCatalog{ .home = &home, .accepted = "launch-token" };
+        runtime.startWarmupWithSharedSignIn(catalog.provider(), access, .activity, sign_in);
+        try waitForWarmup(&runtime);
+        try std.testing.expectEqual(@as(usize, 1), catalog.calls);
+        try std.testing.expectEqualStrings("launch-token", catalog.sentToken(0));
+    }
+}
+
 test "model cache projects anonymous fallback provenance for 401 and 403" {
     for ([_]std.http.Status{ .unauthorized, .forbidden }) |status| {
         var runtime = Runtime.init(std.testing.allocator, "/v1/models");
@@ -1943,7 +2221,7 @@ test "model menu owns resolved catalog state and filters without changing catalo
         },
     };
     runtime.state = .ready;
-    try hydrateMenuSnapshot(alloc, &runtime.menu, &entries);
+    try hydrateMenuSnapshot(alloc, &runtime.menu, &entries, false);
     runtime.menu.active = true;
 
     try std.testing.expectEqual(ModelMenuLoadState.ready, runtime.menu.load_state);
@@ -1983,6 +2261,73 @@ test "model menu owns resolved catalog state and filters without changing catalo
     try std.testing.expectEqualStrings("standalone", selected);
 }
 
+test "model menu leaves out a fast variant that Fast mode on a listed model runs" {
+    const alloc = std.testing.allocator;
+    var runtime = Runtime.init(alloc, "/v1/models");
+    defer runtime.deinit();
+
+    const entries = [_]model_catalog.ModelCatalogEntry{
+        .{ .id = @constCast("anthropic/claude-opus-5"), .model_type = @constCast("language"), .supports_fast_mode = true },
+        .{
+            .id = @constCast("anthropic/claude-opus-5-fast"),
+            .model_type = @constCast("language"),
+            .fast_variant_of = @constCast("anthropic/claude-opus-5"),
+        },
+        .{ .id = @constCast("provider/plain"), .model_type = @constCast("language") },
+        .{
+            .id = @constCast("provider/plain-fast"),
+            .model_type = @constCast("language"),
+            .fast_variant_of = @constCast("provider/plain"),
+        },
+    };
+    runtime.state = .ready;
+    try hydrateMenuSnapshot(alloc, &runtime.menu, &entries, false);
+    runtime.menu.active = true;
+
+    // `provider/plain` has no Fast mode, so its variant is the only way to run fast.
+    try std.testing.expectEqual(@as(usize, 3), runtime.menu.filteredItemCount());
+    try std.testing.expectEqualStrings("anthropic/claude-opus-5", runtime.menu.itemAt(0).?.id);
+    try std.testing.expectEqualStrings("provider/plain", runtime.menu.itemAt(1).?.id);
+    try std.testing.expectEqualStrings("provider/plain-fast", runtime.menu.itemAt(2).?.id);
+
+    // A session that names the left-out model still finds it in the catalog.
+    try std.testing.expect(findCatalogModel(&entries, "anthropic/claude-opus-5-fast") != null);
+
+    // For a team with Token Pass, a variant the catalog marks as Token Pass
+    // stays out too, while its base keeps the Fast mode row.
+    var marked = entries;
+    marked[1].token_pass = true;
+    try hydrateMenuSnapshot(alloc, &runtime.menu, &marked, true);
+    try std.testing.expectEqual(@as(usize, 3), runtime.menu.filteredItemCount());
+    for (runtime.menu.items.items) |item| {
+        try std.testing.expect(!std.mem.eql(u8, item.id, "anthropic/claude-opus-5-fast"));
+    }
+}
+
+test "model menu leads with the models the catalog marks as Token Pass, for a team with Token Pass" {
+    const alloc = std.testing.allocator;
+    const entries = [_]model_catalog.ModelCatalogEntry{
+        .{ .id = @constCast("openai/gpt-6-sol"), .model_type = @constCast("language") },
+        .{ .id = @constCast("acme/new-pass-model"), .model_type = @constCast("language"), .token_pass = true },
+        .{ .id = @constCast("deepseek/deepseek-v4.1-flash"), .model_type = @constCast("language") },
+        .{ .id = @constCast("zai/glm-5.3"), .model_type = @constCast("language"), .token_pass = true },
+    };
+    var menu: ModelMenu = .{};
+    defer menu.deinit(alloc);
+
+    // The marks, not a list in fx, pick the models, in catalog order.
+    try hydrateMenuSnapshot(alloc, &menu, &entries, true);
+    const led = [_][]const u8{ "acme/new-pass-model", "zai/glm-5.3", "openai/gpt-6-sol", "deepseek/deepseek-v4.1-flash" };
+    for (led, menu.items.items) |id, item| {
+        try std.testing.expectEqualStrings(id, item.id);
+        try std.testing.expectEqual(std.mem.eql(u8, id, "acme/new-pass-model") or std.mem.eql(u8, id, "zai/glm-5.3"), item.token_pass);
+    }
+
+    // Without Token Pass the catalog order stands.
+    try hydrateMenuSnapshot(alloc, &menu, &entries, false);
+    for (entries, menu.items.items) |entry, item| try std.testing.expectEqualStrings(entry.id, item.id);
+}
+
 test "model menu ranks fuzzy matches below verbatim ones and keeps the selection" {
     const alloc = std.testing.allocator;
     const entries = [_]model_catalog.ModelCatalogEntry{
@@ -1993,7 +2338,7 @@ test "model menu ranks fuzzy matches below verbatim ones and keeps the selection
     };
     var menu: ModelMenu = .{};
     defer menu.deinit(alloc);
-    try hydrateMenuSnapshot(alloc, &menu, &entries);
+    try hydrateMenuSnapshot(alloc, &menu, &entries, false);
     menu.active = true;
 
     menu.setQuery("gpt5");
@@ -2017,7 +2362,7 @@ test "model menu ranks fuzzy matches below verbatim ones and keeps the selection
     const revalidated = [_]model_catalog.ModelCatalogEntry{
         .{ .id = @constCast("acme/gpt5-pro"), .model_type = @constCast("language") },
     } ++ entries;
-    try hydrateMenuSnapshot(alloc, &menu, &revalidated);
+    try hydrateMenuSnapshot(alloc, &menu, &revalidated, false);
     try std.testing.expectEqual(@as(usize, 2), menu.selected_index);
     try std.testing.expectEqualStrings("openai/gpt-5", menu.itemAt(menu.selected_index).?.id);
 }
@@ -2032,7 +2377,7 @@ test "a model's own name ranks it above longer ids that contain it" {
     };
     var menu: ModelMenu = .{};
     defer menu.deinit(alloc);
-    try hydrateMenuSnapshot(alloc, &menu, &entries);
+    try hydrateMenuSnapshot(alloc, &menu, &entries, false);
     menu.active = true;
 
     menu.setQuery("GPT-4o");
@@ -2089,7 +2434,7 @@ test "model menu provider navigation skips absent and redundant filters" {
     };
     var mixed: ModelMenu = .{};
     defer mixed.deinit(alloc);
-    try hydrateMenuSnapshot(alloc, &mixed, &mixed_entries);
+    try hydrateMenuSnapshot(alloc, &mixed, &mixed_entries, false);
     mixed.active = true;
 
     try std.testing.expect(mixed.moveProvider(1));
@@ -2105,7 +2450,7 @@ test "model menu provider navigation skips absent and redundant filters" {
     };
     var codex: ModelMenu = .{};
     defer codex.deinit(alloc);
-    try hydrateMenuSnapshot(alloc, &codex, &codex_entries);
+    try hydrateMenuSnapshot(alloc, &codex, &codex_entries, false);
     codex.active = true;
 
     try std.testing.expect(!codex.moveProvider(1));
@@ -2121,14 +2466,14 @@ test "model menu snapshot construction cleans every allocation failure" {
 
     var probe = std.testing.FailingAllocator.init(backing, .{});
     var menu: ModelMenu = .{};
-    try hydrateMenuSnapshot(probe.allocator(), &menu, &entries);
+    try hydrateMenuSnapshot(probe.allocator(), &menu, &entries, false);
     menu.deinit(probe.allocator());
     try std.testing.expectEqual(probe.allocated_bytes, probe.freed_bytes);
 
     for (0..probe.alloc_index) |fail_index| {
         var failing = std.testing.FailingAllocator.init(backing, .{ .fail_index = fail_index });
         var failed_menu: ModelMenu = .{};
-        if (hydrateMenuSnapshot(failing.allocator(), &failed_menu, &entries)) {
+        if (hydrateMenuSnapshot(failing.allocator(), &failed_menu, &entries, false)) {
             failed_menu.deinit(failing.allocator());
         } else |err| try std.testing.expectEqual(error.OutOfMemory, err);
         try std.testing.expect(failing.has_induced_failure);

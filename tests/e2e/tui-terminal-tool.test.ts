@@ -1,4 +1,5 @@
 import { afterEach, expect, test } from "bun:test";
+import { processAlive } from "./process-alive";
 import { execFileSync } from "node:child_process";
 import {
   existsSync,
@@ -182,15 +183,6 @@ function askEnv(
   };
 }
 
-function processAlive(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
 /** Pids of processes whose command line contains `fragment`. */
 function processesMatching(fragment: string, options: { exact?: boolean } = {}): number[] {
   const listing = execFileSync("ps", ["-axo", "pid=,command="], { encoding: "utf8" });
@@ -225,10 +217,15 @@ function terminalRecord(home: string, sessionId: string): Record<string, unknown
   return record;
 }
 
+/** The shell pid a record holds, or null while its terminal is still starting. */
+function pidOf(record: Record<string, unknown>): number | null {
+  const pid = Number(record.pid);
+  return Number.isInteger(pid) && pid > 0 ? pid : null;
+}
+
 /** The shell pid in a terminal record, or null before its launcher reports it. */
 function recordedPid(home: string, sessionId: string): number | null {
-  const pid = Number(terminalRecord(home, sessionId).pid);
-  return Number.isInteger(pid) && pid > 0 ? pid : null;
+  return pidOf(terminalRecord(home, sessionId));
 }
 
 /** A running handle can return before the launcher records the shell pid. */
@@ -311,8 +308,11 @@ test.skipIf(!tmuxAvailable())(
     expect(interactResult).toContain('\\"state\\":\\"completed\\"');
     expect(interactResult).toContain("CAPTURED_DONE");
     const scrollback = await active.captureFullScrollback();
-    expect(scrollback).toContain("Ran sleep 2; printf CAPTURED_DONE");
-    expect(scrollback).toContain("Observed sleep 2; printf CAPTURED_DONE");
+    // The run returned before the command ended, and its session's input
+    // joins its row, which shows the launch command's steps in short form
+    // with the session's latest state.
+    expect(scrollback).toContain("● Observed sleep, printf · 2 calls");
+    expect(scrollback).not.toContain("Still running sleep, printf");
     expect(scrollback).not.toContain(`Observed session ${sessionId}`);
     expect(scrollback).not.toContain("Using terminal");
     expect(scrollback).not.toContain("Used terminal");
@@ -367,7 +367,7 @@ test.skipIf(!tmuxAvailable())(
     await active.sendKeys("Enter");
     await active.waitForText("PHASE_TWO_READY", TIMEOUT);
     const scrollback = await active.captureFullScrollback();
-    expect(scrollback).toContain("Stopped printf HANDOFF_READY; sleep 30");
+    expect(scrollback).toContain("Stopped printf, sleep");
     expect(scrollback).not.toContain(`Stopped session ${sessionId}`);
     expect(toolResultEnvelope(
       gateway.requests[3]!.body,
@@ -434,15 +434,8 @@ test.skipIf(!tmuxAvailable())(
     const pid = Number(readFileSync(pidPath, "utf8"));
     expect(Number.isSafeInteger(pid) && pid > 0).toBe(true);
     const deadline = Date.now() + 3_000;
-    while (Date.now() < deadline) {
-      try {
-        process.kill(pid, 0);
-      } catch {
-        break;
-      }
-      await Bun.sleep(25);
-    }
-    expect(() => process.kill(pid, 0)).toThrow();
+    while (Date.now() < deadline && processAlive(pid)) await Bun.sleep(25);
+    expect(processAlive(pid)).toBe(false);
     expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
   },
   TIMEOUT,
@@ -687,16 +680,18 @@ test.skipIf(!tmuxAvailable())(
     const grid = await session.capturePaneGrid();
     const row = (prefix: string) =>
       grid.map((line) => line.trimEnd()).find((line) => line.startsWith(prefix));
-    expect(row("├ Ran ")).toBe(`├ Ran ${launchCommand}`);
-    expect(row("├ Observed ")).toBe(`├ Observed ${launchCommand}`);
-    expect(row("└ Stopped ")).toBe(`└ Stopped ${launchCommand}`);
+    // The run, the session's input, and its stop share one row with its
+    // latest state, so the row is the group's line.
+    expect(row("● Stopped ")).toBe("● Stopped echo, sleep · 3 calls ✓");
+    expect(row("├ Still running ")).toBeUndefined();
+    expect(row("├ Observed ")).toBeUndefined();
     expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
   },
   TIMEOUT,
 );
 
 test.skipIf(!tmuxAvailable())(
-  "Ctrl-O shows session launch commands in full while the main view trails them",
+  "Ctrl-O shows session launch commands in full while the main view shortens them",
   async () => {
     const fixture = createFixture("fx-shell-full-transcript-width-");
     const words = Array.from({ length: 30 }, (_, index) => `word${index}`).join(" ");
@@ -752,11 +747,11 @@ test.skipIf(!tmuxAvailable())(
     await session.waitForText("FULL_WIDTH_FLOW_DONE", TIMEOUT);
     await Bun.sleep(300);
 
-    // The main view keeps each row on one line and trails what does not fit.
+    // The main view shows the launch command's steps in short form. The
+    // run, the session's input, and its stop share one row, whose note stays.
     const mainRows = (await session.capturePaneGrid()).map((line) => line.trimEnd());
-    const mainObserved = mainRows.find((line) => line.startsWith("├ Observed "));
-    expect(mainObserved).toBeDefined();
-    expect(mainObserved).toEndWith("…");
+    const mainSession = mainRows.find((line) => line.startsWith("● Stopped "));
+    expect(mainSession).toBe("● Stopped echo, sleep · 3 calls ✓");
     expect(mainRows.join("\n")).not.toContain("FULL_LAUNCH_TAIL");
 
     // `interact` carries no command argument, so the Observed heading is the
@@ -802,7 +797,7 @@ test.skipIf(!tmuxAvailable())(
     await session.sendKeys("C-o");
     await session.waitForPane((pane) => !pane.includes("esc close · pgup/pgdn scroll"), TIMEOUT);
     const scrollback = await session.captureFullScrollback();
-    expect(scrollback).toContain("├ Observed echo word0");
+    expect(scrollback).toContain("● Stopped echo, sleep · 3 calls ✓");
     expect(scrollback).not.toContain("FULL_LAUNCH_TAIL");
     expect(scrollback).not.toContain("action: interact");
     expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
@@ -885,9 +880,11 @@ test.skipIf(!tmuxAvailable())(
     const grid = await session.capturePaneGrid();
     const row = (prefix: string) =>
       grid.map((line) => line.trimEnd()).find((line) => line.startsWith(prefix));
-    expect(row("├ Observed ")).toBe(`├ Observed ${launchCommand}`);
-    expect(row("├ Ran ")).toBe(`├ Ran ${launchCommand}`);
-    expect(row("└ Stopped ")).toBe(`└ Stopped ${launchCommand}`);
+    // The run, the session's input, and its stop share one row with its
+    // latest state, so the row is the group's line.
+    expect(row("● Stopped ")).toBe("● Stopped echo, sleep · 3 calls ✓");
+    expect(row("├ Still running ")).toBeUndefined();
+    expect(row("├ Observed ")).toBeUndefined();
     expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
   },
   TIMEOUT * 2,
@@ -1190,7 +1187,7 @@ test("fx ask exit ends its TTY terminal within one second", async () => {
     if (!processAlive(pid)) continue;
     await waitUntilGone([pid], Math.max(0, 1_000 - (Date.now() - exitedAt)));
   }
-  expect(processAlive(shellPid)).toBe(false);
+  if (shellPid !== null) expect(processAlive(shellPid)).toBe(false);
   expect(terminalRecord(fixture.home, sessionId).lifecycle).toBe("lost");
   expectNoTerminalHostDaemon(fixture);
   expect(readFileSync(fixture.tracePath, "utf8")).toContain(
@@ -1342,7 +1339,9 @@ test("the full terminal budget starts, refuses one more, and ends together at ex
 
   const records = terminalRecords(fixture.home);
   expect(records).toHaveLength(budget);
-  const shellPids = records.map((record) => Number(record.pid));
+  // A terminal still starting when fx exits has no shell pid yet; its
+  // command is still found by name below.
+  const shellPids = records.flatMap((record) => pidOf(record) ?? []);
   await waitUntilGone(
     [...shellPids, ...processesMatching("sleep 45.75")],
     Math.max(0, 1_500 - (Date.now() - exitedAt)),

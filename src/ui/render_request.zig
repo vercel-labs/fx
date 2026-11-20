@@ -234,10 +234,16 @@ pub const RenderRequestState = struct {
         self.frame_admission_block_depth -= 1;
     }
 
-    pub fn requestAnimationDue(self: *RenderRequestState, now_ms: i64) bool {
+    /// Whether `requestAnimationDue` would request a frame now, without
+    /// requesting one, so a caller can skip costly work between frames.
+    pub fn animationDue(self: *const RenderRequestState, now_ms: i64) bool {
         if (!self.animation_visible or self.animation_next_deadline_ms == 0) return false;
         if (now_ms < self.animation_next_deadline_ms) return false;
-        if (self.animation_candidate_in_flight or self.animation_candidate_len > 0) return false;
+        return !self.animation_candidate_in_flight and self.animation_candidate_len == 0;
+    }
+
+    pub fn requestAnimationDue(self: *RenderRequestState, now_ms: i64) bool {
+        if (!self.animationDue(now_ms)) return false;
 
         self.animation_candidates[0] = .{
             .generation = self.next_animation_generation,
@@ -380,6 +386,19 @@ test "compaction revisions request footer repaint without restarting animation" 
     state.observeCompactionRevision(2);
     try std.testing.expect(state.hasReason(.footer));
     try std.testing.expectEqual(@as(i64, 100), state.animation_next_deadline_ms);
+}
+
+test "animationDue answers what requestAnimationDue would do without requesting" {
+    var state: RenderRequestState = .{};
+    try std.testing.expect(!state.animationDue(1_000));
+    state.animation_visible = true;
+    state.animation_next_deadline_ms = 1_000;
+    try std.testing.expect(!state.animationDue(999));
+    try std.testing.expect(state.animationDue(1_000));
+    try std.testing.expect(!state.hasPending());
+    try std.testing.expect(state.requestAnimationDue(1_000));
+    // A candidate already waits for its frame.
+    try std.testing.expect(!state.animationDue(1_050));
 }
 
 test "render request state exposes the transaction operations" {

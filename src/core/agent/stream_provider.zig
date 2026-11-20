@@ -4,6 +4,7 @@ const testing_allocator = @import("../shared/testing_allocator.zig");
 const model_capabilities = @import("../config/model_capabilities.zig");
 const image_attachments = @import("../images/image_attachments.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
+const text_utils = @import("../shared/text_utils.zig");
 const types = @import("../shared/types.zig");
 const tool_dispatch = @import("../tooling/tool_dispatch.zig");
 const model_tool_schema = @import("../tooling/model_tool_schema.zig");
@@ -16,6 +17,9 @@ const Allocator = std.mem.Allocator;
 /// Transport parser callback shapes. Provider boundaries expose `EventSink`;
 /// concrete reducers may use these adapters internally.
 pub const StreamCallback = *const fn (ctx: *anyopaque, chunk: []const u8) void;
+/// A streamed tool call's id and its arguments so far, which may stop
+/// anywhere. Both are borrowed for the call only.
+pub const ToolInputProgressCallback = *const fn (ctx: *anyopaque, id: []const u8, arguments: []const u8) void;
 pub const ToolStartCallback = *const fn (
     ctx: *anyopaque,
     tool_id: []const u8,
@@ -35,6 +39,13 @@ pub const Event = union(enum) {
         arguments_json: ?[]const u8 = null,
     },
     tool_input_delta: []const u8,
+    /// The arguments a streamed tool call has so far, by its id, so a row
+    /// can name what the call is for before it is complete. Borrowed only
+    /// for synchronous event delivery.
+    tool_input_progress: struct {
+        id: []const u8,
+        arguments: []const u8,
+    },
 };
 
 pub const EventSink = struct {
@@ -58,6 +69,10 @@ pub const EventSink = struct {
 
     pub fn onToolInputChunk(context: *anyopaque, chunk: []const u8) void {
         fromContext(context).emit(.{ .tool_input_delta = chunk });
+    }
+
+    pub fn onToolInputProgress(context: *anyopaque, id: []const u8, arguments: []const u8) void {
+        fromContext(context).emit(.{ .tool_input_progress = .{ .id = id, .arguments = arguments } });
     }
 
     pub fn onToolStart(
@@ -518,6 +533,51 @@ pub const Failure = struct {
     http_status: ?std.http.Status = null,
     ownership: ResultOwnership = .borrowed,
 };
+
+/// Whether the provider refused the request as longer than the model's
+/// context window, in any family's wording.
+///
+/// The phrases match anywhere in the detail, because only OpenAI-style bodies
+/// carry `code: "context_length_exceeded"`. Gateway, Anthropic and xAI send
+/// only text, and a Gateway multi-attempt body holds it only under
+/// `providerAttempts[].error`. So a rare refusal for another cause that quotes
+/// one of these phrases counts as an overflow: the main request compacts once
+/// and retries, and the compactor sends up to three smaller requests.
+pub fn isContextOverflow(failure: Failure) bool {
+    if (failure.kind == .request_too_large) return true;
+    if (failure.kind != .invalid_request) return false;
+    const detail = failure.detail orelse return false;
+    inline for (.{
+        "context_length_exceeded",
+        "exceeds the context window",
+        "exceeded the context window",
+        "maximum context length",
+        "maximum prompt length",
+        "input is too long",
+        "prompt is too long",
+        "too many input tokens",
+    }) |needle| {
+        if (text_utils.containsIgnoreCase(detail, needle)) return true;
+    }
+    return false;
+}
+
+test "a context overflow is recognized in each family's words, and nothing else is" {
+    const overflows = [_][]const u8{
+        "{\"error\":{\"code\":\"context_length_exceeded\"}}",
+        "AI_APICallError: input exceeds the context window",
+        "This model's maximum prompt length is 1000000 but the request contains 1003383 tokens.",
+        "AI_APICallError: prompt is too long: 1077372 tokens > 1000000 maximum",
+        "This model's maximum context length is 128000 tokens.",
+    };
+    for (overflows) |detail| {
+        try std.testing.expect(isContextOverflow(.{ .kind = .invalid_request, .detail = @constCast(detail) }));
+    }
+    try std.testing.expect(isContextOverflow(.{ .kind = .request_too_large }));
+    try std.testing.expect(!isContextOverflow(.{ .kind = .invalid_request, .detail = @constCast("invalid tool schema") }));
+    try std.testing.expect(!isContextOverflow(.{ .kind = .invalid_request }));
+    try std.testing.expect(!isContextOverflow(.{ .kind = .rate_limited, .detail = @constCast("context_length_exceeded") }));
+}
 
 pub const Result = union(enum) {
     completed: Completed,
