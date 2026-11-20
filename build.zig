@@ -605,7 +605,7 @@ fn jsEngineModule(
         .files = &.{ "quickjs.c", "libregexp.c", "libunicode.c", "dtoa.c" },
         // A release build optimizes the C for size, which makes the engine
         // noticeably smaller for a few percent of speed.
-        .flags = if (optimize == .debug) &quickjs_flags else &(quickjs_flags ++ [_][]const u8{"-Os"}),
+        .flags = if (optimize == .debug) &quickjs_flags else &(quickjs_flags ++ quickjs_release_flags),
     });
     module.addImport("build_options", options.createModule());
     return module;
@@ -629,6 +629,16 @@ const quickjs_flags = [_][]const u8{
     "-fsanitize=function",
     "-fsanitize-trap=function",
     "-fno-sanitize-coverage=inline-8bit-counters,trace-cmp",
+};
+
+/// A release build compiles the engine's C for size and gives each function
+/// and object its own section, so the linker can drop the ones fx never
+/// reaches. Zig already leaves out the C's unwind tables in fx, whose module
+/// has none.
+const quickjs_release_flags = [_][]const u8{
+    "-Os",
+    "-ffunction-sections",
+    "-fdata-sections",
 };
 
 fn readAppVersion(b: *std.Build) []const u8 {
