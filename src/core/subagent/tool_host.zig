@@ -2007,12 +2007,14 @@ pub const Runtime = struct {
             const waiting = self.dropPendingLocked(child_id, "stopped");
             // The stopped turn's unread messages go with it, so they count
             // too, and so do the messages its slot keeps or carries into the
-            // next work (`tests/tla/subagent/StopMessage.tla` NoSilentLoss).
+            // next work, all in the owner's one step (`Owner.stop`,
+            // `tests/tla/subagent/StopMessage.tla` NoSilentLoss). A work that
+            // already ended is the other case: the slot keeps what the turn
+            // never took until the end hook, and `takeDropped` counts it.
             const unread = self.managed.stop(child_id);
             end_test_controls.holdInStop(child_id);
-            const held = self.managed.takeDropped(child_id);
-            if (unread) |count| break :blk .{ waiting + count + held, true };
-            break :blk .{ waiting + held, self.stopTurnWorkLocked(child_id) };
+            if (unread) |count| break :blk .{ waiting + count, true };
+            break :blk .{ waiting + self.managed.takeDropped(child_id), self.stopTurnWorkLocked(child_id) };
         };
         debug_trace.eventf("mailbox", "stop", .{}, "target={s} by=parent running={} dropped={d}", .{ child_id, stopped, dropped });
         const dropped_text = switch (dropped) {
@@ -2086,21 +2088,23 @@ pub const Runtime = struct {
                 self.noteUserDropLocked(child_id, dropped, true);
                 if (name) |value| self.noteUserClosedLocked(value);
             }
-            // The parent's close drops the closed turn's unread messages
-            // and counts them, as its stop does.
+            // The parent's close drops the closed turn's unread messages and
+            // the ones its slot keeps or carries into the next work, and counts
+            // them in the owner's one step, as its stop does. The user's close
+            // counts none of them.
             var unread: usize = 0;
+            var ended_turn = false;
             const stopped = switch (by) {
                 .parent => if (self.managed.stop(child_id)) |count| ended: {
                     unread = count;
+                    ended_turn = true;
                     break :ended true;
                 } else false,
                 .user => self.managed.closeByUser(child_id),
             } or self.stopTurnWorkLocked(child_id);
-            // So do the messages its slot keeps or carries into the next work.
-            // The user's close counts none of them.
             if (by == .parent) {
                 end_test_controls.holdInStop(child_id);
-                unread += self.managed.takeDropped(child_id);
+                if (!ended_turn) unread += self.managed.takeDropped(child_id);
             }
             self.closing.appendAssumeCapacity(.{ .id = owned });
             self.closed_unseen.appendAssumeCapacity(unseen);
