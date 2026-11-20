@@ -70,7 +70,7 @@ After `initialize`, these rules apply to the connection:
 - A client calls an extension's methods only when fx's list names the extension. fx answers a method it doesn't support with the JSON-RPC error `-32601`, "Method not found".
 - Each side ignores the names it doesn't know in the other side's list.
 
-Each extension's section adds its capability here, and to `AgentCapabilitiesMeta` and `ClientCapabilitiesMeta` in `sh-fx.schema.json`. No capability is defined yet.
+Each extension's section adds its capability here, and to `AgentCapabilitiesMeta` and `ClientCapabilitiesMeta` in `sh-fx.schema.json`. No capability is defined yet. The table in "Keys in use today" names three that replace fields fx uses today: `sh.fx/steering`, `sh.fx/hooks`, and `sh.fx/hostTools`.
 
 ## Extensions
 
@@ -110,7 +110,39 @@ fx's ACP server names its additions today with a `libfx/` prefix, which doesn't 
 
 For some releases after fx moves to the new names, fx also accepts the `libfx/*` names, and it sends a client the old names unless the client lists the extension's capability. `session/remove` moves to `session/delete` with no such period.
 
-The table of `_meta.fx` keys and their `sh.fx/` names is not written yet.
+## Keys in use today
+
+fx's ACP server puts its extra data under `_meta.fx.<key>` today, and it reads two fields of a custom `libfx` object at the root of `clientCapabilities`, which ACP forbids. Each one becomes an `sh.fx/` key or capability in this table, or goes away in favor of a standard ACP field:
+
+| Today | Where | New | Kind | What it carries |
+| --- | --- | --- | --- | --- |
+| `_meta.fx.steering` | `agentCapabilities` in the `initialize` response | `sh.fx/steering` | capability | fx accepts steering. Its value becomes `{}` in place of `true` |
+| `_meta.fx.steering` | the `session/prompt` response to a steer | `sh.fx/steeringDelivery` | `_meta` key | How the steer fared in the turn that received it: `absorbed` or `dropped` |
+| `_meta.fx.steering` | a `user_message_chunk` update that shows a steer | `sh.fx/steerInput` | `_meta` key | The steer's request id and input id |
+| `_meta.fx.steer` | `session/prompt` params | `sh.fx/steer` | `_meta` key | Makes a prompt sent during a running turn a steer. The steering section decides whether it stays |
+| `_meta.fx.hooksVersion` | the `session/new` and `session/load` responses | `sh.fx/hooks` | capability | That fx supports hooks, now listed in `agentCapabilities` |
+| `_meta.fx.hooks` | `session/new` params | `sh.fx/hooks` | `_meta` key | The client's hook settings, such as `captureContent` |
+| `_meta.fx.permissionMode` | each value of the `mode` config option | `sh.fx/permissionMode` | `_meta` key | The permission mode that the session mode applies, with fx's original names, such as `yolo` for full access |
+| `_meta.fx.modelResponseRecovery` | `session_info_update` | `sh.fx/modelResponseRecovery` | `_meta` key | A model request that an earlier fx process was running when it stopped, reported when the session loads |
+| `_meta.fx.toolCall` | `tool_call` updates | `sh.fx/toolCall` | `_meta` key | Whether the call is fx's own bookkeeping step, and the server and tool name of an MCP call |
+| `_meta.fx.alwaysLoaded` | each MCP server that a client supplies | `sh.fx/alwaysLoaded` | `_meta` key | Whether the server's tools stay advertised on every turn. The default is `true` |
+| `_meta.fx.profileMcpServers` | `session/new` params | `sh.fx/profileMcpServers` | `_meta` key | Whether fx also loads the MCP servers of the user's profile |
+| `_meta.fx.terminal` | `initialize` params | `sh.fx/terminalUi` | `_meta` key | Whether the client is a terminal UI, which picks fx's system prompt. The default is `true` |
+| `_meta.fx.attachment` | an image content block in `session/prompt` | `sh.fx/attachment` | `_meta` key | The id of the binary attachment that holds the image's bytes, in place of `data` |
+| `_meta.fx.stored` | an image content block in `session/prompt` | `sh.fx/storedImage` | `_meta` key | The name under which the host already stored the image |
+| `_meta.fx.continueRecovery` | `session/prompt` params | `sh.fx/continueRecovery` | `_meta` key | The prompt resumes an interrupted turn, so it may have no text |
+| `_meta.fx.freshOutput` | `session/prompt` params | `sh.fx/freshOutput` | `_meta` key | The host holds none of the resumed turn's earlier output, so the turn sends its saved reply again |
+| `_meta.fx.inputId` | `session/prompt` params | `sh.fx/inputId` | `_meta` key | The id of the follow-up that the prompt runs |
+| `_meta.fx.inputAccepted` | `session/prompt` params | `sh.fx/inputAccepted` | `_meta` key | Whether the host already recorded that follow-up as accepted |
+| `_meta.fx.turnId` | `session/prompt` params | `sh.fx/turnId` | `_meta` key | The host's id for the turn that the prompt starts |
+| `_meta.fx.rerun` | `session/prompt` params | `sh.fx/rerun` | `_meta` key | Tool calls that a crash left running, which the host asks fx to run again |
+| `_meta.fx.yieldAt` | `session/prompt` params | `sh.fx/yieldAt` | `_meta` key | The time, in milliseconds since the epoch, at which a journaled turn yields in place of its next model request |
+| `_meta.fx.systemPrompt` | `session/new` params | - | removed | A copy of `systemPrompt`. Clients send ACP's standard `systemPrompt` field |
+| `systemPromptMode` | `session/new` params, a custom field at the root | - | removed | How fx combines the system prompt with its own. ACP v1 puts it in `systemPrompt.mode` |
+| `clientCapabilities.libfx.tools` | the `initialize` request | `sh.fx/hostTools` | capability | The tools that the client runs for fx, as `{ "tools": [...] }` in the capability's value |
+| `clientCapabilities.libfx.instructions` | the `initialize` request | - | removed | Text that the client adds to fx's system prompt. The client sends it as ACP's standard `systemPrompt` in `append` mode on each session |
+
+The keys and capabilities move with the method names, under the same rules: for some releases fx also accepts the old forms, and it sends a client the old ones unless the client lists the extension's capability.
 
 ## Schema
 
