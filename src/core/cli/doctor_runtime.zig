@@ -357,7 +357,14 @@ fn appendClaudeCodeCheck(checks: *std.ArrayList(Check), alloc: Allocator) !void 
         try checks.append(alloc, .{ .name = "auth", .status = .fail, .detail = claude_code.not_installed_message, .fix = "install Claude Code, then run claude and sign in with /login" });
         return;
     }
-    if (status.signed_in == false) {
+    const signed_in = status.signed_in orelse {
+        // `claude auth status` failed or printed something fx can't read,
+        // such as on a version without it.
+        const detail = try alloc.print("Claude Code {s} is installed, but fx couldn't tell whether it is signed in", .{status.version orelse "(unknown version)"});
+        try checks.append(alloc, .{ .name = "auth", .status = .warn, .detail = detail, .owned_detail = detail, .fix = "run claude auth status, or run claude and sign in with /login" });
+        return;
+    };
+    if (!signed_in) {
         try checks.append(alloc, .{ .name = "auth", .status = .fail, .detail = claude_code.not_signed_in_message, .fix = "run claude and sign in with /login" });
         return;
     }

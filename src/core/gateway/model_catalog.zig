@@ -176,6 +176,10 @@ pub const Provider = struct {
     refresh_interval_ms: ?i64 = null,
     /// The fetch sets `FetchInput.connected` once its request has a connection.
     reports_connection: bool = false,
+    /// Asked before fx switches to the provider, for one that runs on a
+    /// program the user installs and signs in to themselves. May start
+    /// processes and wait for them, so it runs off the input loop.
+    readiness_fn: ?*const fn (?*anyopaque, Allocator) Allocator.Error!Readiness = null,
 
     /// Returns owned catalog entries; the caller frees them with `freeModelCatalog`.
     pub fn fetch(self: Provider, alloc: Allocator, input: FetchInput) Allocator.Error!ProviderResult {
@@ -187,6 +191,20 @@ pub const Provider = struct {
         const lookup = self.lookup_capabilities_fn orelse return null;
         return lookup(self.context, model);
     }
+
+    /// `.ready` when the provider has no `readiness_fn`.
+    pub fn readiness(self: Provider, alloc: Allocator) Allocator.Error!Readiness {
+        const check = self.readiness_fn orelse return .ready;
+        return check(self.context, alloc);
+    }
+};
+
+/// Whether a provider can take requests, as `Provider.readiness` reports it.
+pub const Readiness = union(enum) {
+    ready,
+    /// What the user must do first, such as install or sign in to the
+    /// provider's program. Static text.
+    unavailable: []const u8,
 };
 
 test "catalog capability lookup distinguishes unsupported and unknown without fetching" {

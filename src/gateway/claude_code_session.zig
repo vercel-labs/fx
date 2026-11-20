@@ -64,9 +64,12 @@ pub const not_signed_in_message =
 const registry = struct {
     var mutex: std.Io.Mutex = .init;
     var sessions: std.ArrayList(*Session) = .empty;
-    var exiting: bool = false;
-    /// Processes started and not yet stopped, so a program that never
-    /// started one exits without touching the registry.
+    /// Set once by `stopAll`; no process starts after it.
+    var exiting: std.atomic.Value(bool) = .init(false);
+    /// Processes starting or running, so a program that never started one
+    /// exits without touching the registry. A start counts itself before
+    /// it reads `exiting`, and `stopAll` sets `exiting` before it reads
+    /// this, so one of them always sees the other.
     var live: std.atomic.Value(usize) = .init(0);
     /// Every live process's private directory, so an exit that cannot wait
     /// for a step to end still removes it. The processes own the paths.
@@ -123,7 +126,9 @@ fn untrackDir(path: []const u8) void {
 /// from any thread. A process whose session is mid-step gets SIGTERM and is
 /// left to exit, and its directory is removed under it.
 pub fn stopAll() void {
-    const live = registry.live.load(.acquire);
+    // A start that comes after this sees `exiting` and doesn't run.
+    registry.exiting.store(true, .seq_cst);
+    const live = registry.live.load(.seq_cst);
     if (live == 0) return;
     debug_trace.logf("claude-code", "stop all live={d}", .{live});
     const io = io_mod.getIo();
@@ -131,8 +136,6 @@ pub fn stopAll() void {
     {
         registry.mutex.lockUncancelable(io);
         defer registry.mutex.unlock(io);
-        // A step that starts a process after this sees `exiting` and stops it.
-        registry.exiting = true;
         // The pids, not the sessions' processes: a step may be freeing one.
         for (registry.pids.items) |pid| signalGroup(pid, .TERM);
         sessions = gpa.dupe(*Session, registry.sessions.items) catch &.{};
@@ -363,8 +366,13 @@ const Proc = struct {
         return true;
     }
 
-    fn stderrText(self: *Proc) []const u8 {
-        return std.mem.trim(u8, self.stderr_tail[0..self.stderr_len], " \t\r\n");
+    /// A copy of the end of what the process wrote to stderr, owned by
+    /// `alloc`. The stderr reader may still be writing it.
+    fn stderrText(self: *Proc, alloc: Allocator) ![]u8 {
+        const io = io_mod.getIo();
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        return alloc.dupe(u8, std.mem.trim(u8, self.stderr_tail[0..self.stderr_len], " \t\r\n"));
     }
 
     /// Replaces the tools Claude Code sees. Tells it when they changed.
@@ -451,7 +459,7 @@ const Proc = struct {
         if (self.tools_json) |json| gpa.free(json);
         self.names.deinit(gpa);
         gpa.destroy(self);
-        _ = registry.live.fetchSub(1, .acq_rel);
+        _ = registry.live.fetchSub(1, .seq_cst);
     }
 };
 
@@ -608,9 +616,18 @@ const StartError = error{ ClaudeNotInstalled, ProcessGone, OutOfMemory } || anye
 /// which holds the system prompt, the MCP configuration, and the socket.
 fn startProcess(alloc: Allocator, launch: Launch) StartError!*Proc {
     const io = io_mod.getIo();
+    // Counted before its directory exists, so `stopAll` can't miss it.
+    _ = registry.live.fetchAdd(1, .seq_cst);
+    if (registry.exiting.load(.seq_cst)) {
+        _ = registry.live.fetchSub(1, .seq_cst);
+        return error.Exiting;
+    }
+    var started = false;
+    errdefer if (!started) {
+        _ = registry.live.fetchSub(1, .seq_cst);
+    };
     const proc = try gpa.create(Proc);
     proc.* = .{ .pid = 0, .stdin = null };
-    var started = false;
     errdefer if (!started) {
         if (proc.listener) |*listener| listener.deinit(io);
         if (proc.dir_path) |path| {
@@ -702,14 +719,14 @@ fn startProcess(alloc: Allocator, launch: Launch) StartError!*Proc {
     };
     proc.pid = child.id.?;
     proc.stdin = child.stdin;
+    // From here `destroy` uncounts it.
     started = true;
-    _ = registry.live.fetchAdd(1, .acq_rel);
     errdefer proc.destroy();
     {
         registry.mutex.lockUncancelable(io);
         defer registry.mutex.unlock(io);
-        // A process that starts after `stopAll` ran is stopped here.
-        if (registry.exiting) proc.signal(.TERM);
+        // A process that started while `stopAll` ran is stopped here.
+        if (registry.exiting.load(.seq_cst)) proc.signal(.TERM);
         try registry.pids.append(gpa, proc.pid);
     }
     proc.stdout_task = try io.concurrent(readStdout, .{ proc, child.stdout.? });
@@ -745,8 +762,11 @@ const Session = struct {
     step_lock: std.Io.Mutex = .init,
     last_used_ms: i64 = 0,
     proc: ?*Proc = null,
-    session_id: [36]u8 = undefined,
-    /// What the process has seen, as units of fx's history.
+    /// The Claude session the latest process ran; zeros before the first.
+    session_id: [36]u8 = @splat(0),
+    /// What the Claude session has seen, as units of fx's history. It is set
+    /// before anything is sent, so after a failed or cancelled step it
+    /// still covers what may have reached Claude Code.
     seen: std.ArrayList(wire.Unit) = .empty,
     /// Calls the process waits on.
     pending: std.ArrayList(Pending) = .empty,
@@ -931,7 +951,8 @@ fn attemptStep(alloc: Allocator, session: *Session, input: StepInput, admitted: 
     if (plan == null) {
         session.stopProcess();
         evictIdle(session);
-        var start = if (last) newStart() else startPlan(arena, request.messages, request_units, session.failed_resume);
+        const known: Known = .{ .session_id = session.session_id, .units = session.seen.items.len, .digest = wire.digest(session.seen.items) };
+        var start = if (last) newStart() else startPlan(arena, request.messages, request_units, session.failed_resume, known);
         session.session_id = start.session_id;
         session.proc = startProcess(arena, .{
             .program = input.program,
@@ -960,7 +981,6 @@ fn attemptStep(alloc: Allocator, session: *Session, input: StepInput, admitted: 
                 try wire.writeSeededPrompt(arena, &text.writer, request.messages[0..latest_from], request.messages[latest_from..]);
             }
             seed_text = text.written();
-            try session.setSeen(request_units);
             plan = null;
         }
     }
@@ -971,6 +991,8 @@ fn attemptStep(alloc: Allocator, session: *Session, input: StepInput, admitted: 
         try request.admission.admit();
         admitted.* = true;
     }
+    // Before sending, since a failed send may still reach Claude Code.
+    try session.setSeen(request_units);
     const sent = if (seed_text) |text|
         sendText(arena, proc, text)
     else
@@ -979,7 +1001,6 @@ fn attemptStep(alloc: Allocator, session: *Session, input: StepInput, admitted: 
         error.ProcessGone, error.BridgeGone => return lostProcess(alloc, session, last),
         else => return err,
     };
-    if (seed_text == null) try session.setSeen(request_units);
     request.delivery.markPossiblySent();
     return readStep(alloc, arena, session, request, last);
 }
@@ -991,15 +1012,28 @@ const StartPlan = struct {
     seen: usize,
 };
 
+/// Where a Claude session this fx process ran stands: the units it has
+/// seen, as `Session.seen` holds them.
+const Known = struct {
+    session_id: [36]u8,
+    units: usize,
+    digest: u64,
+};
+
 /// Chooses how a session without a usable process starts: resuming the
 /// Claude session the latest matching reply recorded, or a new one.
-fn startPlan(arena: Allocator, messages: []const types.ChatMessage, request_units: []const wire.Unit, skip: ?[36]u8) StartPlan {
+fn startPlan(arena: Allocator, messages: []const types.ChatMessage, request_units: []const wire.Unit, skip: ?[36]u8, known: Known) StartPlan {
     var index = messages.len;
     while (index > 0) {
         index -= 1;
         const replay = messages[index].provider_replay orelse continue;
         const record = wire.parseReplay(arena, replay.parts_json) orelse continue;
         if (skip) |id| if (std.mem.eql(u8, &id, record.session_id)) continue;
+        // A Claude session that went on past the reply, such as into a
+        // failed, cancelled, or undone turn, keeps that turn in its
+        // transcript: resuming it would give the model those messages twice.
+        if (std.mem.eql(u8, &known.session_id, record.session_id) and
+            (known.units != record.units or known.digest != record.digest)) continue;
         if (record.units > request_units.len) continue;
         if (wire.digest(request_units[0..record.units]) != record.digest) continue;
         const delta = wire.planDelta(request_units[0..record.units], request_units, &.{});
@@ -1149,7 +1183,7 @@ fn readStep(alloc: Allocator, arena: Allocator, session: *Session, request: stre
                 }
                 // It ended before it answered `--resume`.
                 if (session.resume_unconfirmed and !last) return resumeFailed(session);
-                const stderr_text = try arena.dupe(u8, proc.stderrText());
+                const stderr_text = try proc.stderrText(arena);
                 return .{ .done = try processFailure(alloc, session, if (stderr_text.len > 0) stderr_text else "Claude Code exited before it finished the step.") };
             },
             .bridge_closed => {
@@ -1413,11 +1447,14 @@ pub fn oneShot(alloc: Allocator, input: OneShot) anyerror!OneShotReply {
         const item = proc.next(poll_ms) orelse continue;
         defer item.deinit();
         switch (item) {
-            .stdout_closed => return .{ .failed = .{
-                .kind = .provider_error,
-                .detail = try alloc.print("Claude Code: {s}", .{if (proc.stderrText().len > 0) proc.stderrText() else "exited before it replied"}),
-                .ownership = .owned,
-            } },
+            .stdout_closed => {
+                const stderr_text = try proc.stderrText(arena);
+                return .{ .failed = .{
+                    .kind = .provider_error,
+                    .detail = try alloc.print("Claude Code: {s}", .{if (stderr_text.len > 0) stderr_text else "exited before it replied"}),
+                    .ownership = .owned,
+                } };
+            },
             .stdout => |text| {
                 const parsed = wire.parseStdoutLine(arena, text) catch continue;
                 switch (parsed) {
@@ -1482,15 +1519,22 @@ test "claude code: a start resumes the latest reply whose history still matches"
         .{ .role = .user, .content = "two" },
     };
     const request_units = try wire.units(arena, &messages);
-    const plan = startPlan(arena, &messages, request_units, null);
+    const unknown: Known = .{ .session_id = @splat(0), .units = 0, .digest = 0 };
+    const plan = startPlan(arena, &messages, request_units, null, unknown);
     try std.testing.expect(plan.resumed);
     try std.testing.expectEqualStrings(&id, &plan.session_id);
     try std.testing.expectEqual(@as(usize, 1), plan.seen);
 
     const rewritten = [_]types.ChatMessage{ .{ .role = .user, .content = "changed" }, messages[1], messages[2] };
     const rewritten_units = try wire.units(arena, &rewritten);
-    try std.testing.expect(!startPlan(arena, &rewritten, rewritten_units, null).resumed);
-    try std.testing.expect(!startPlan(arena, &messages, request_units, id).resumed);
+    try std.testing.expect(!startPlan(arena, &rewritten, rewritten_units, null, unknown).resumed);
+    try std.testing.expect(!startPlan(arena, &messages, request_units, id, unknown).resumed);
+
+    // This process ran the session: it resumes only where the reply left it.
+    const at_reply: Known = .{ .session_id = id, .units = first_units.len, .digest = wire.digest(first_units) };
+    try std.testing.expect(startPlan(arena, &messages, request_units, null, at_reply).resumed);
+    const past_reply: Known = .{ .session_id = id, .units = request_units.len, .digest = wire.digest(request_units) };
+    try std.testing.expect(!startPlan(arena, &messages, request_units, null, past_reply).resumed);
 }
 
 /// A fake `claude` for the tests below: it records its arguments in
@@ -1847,6 +1891,51 @@ test "claude code: a resume Claude Code can't find starts a new session in the s
     var lines = std.mem.splitScalar(u8, std.mem.trimEnd(u8, args, "\n"), '\n');
     try std.testing.expect(std.mem.find(u8, lines.next().?, "--resume " ++ &id) != null);
     try std.testing.expect(std.mem.find(u8, lines.next().?, "--session-id") != null);
+    try std.testing.expect(lines.next() == null);
+}
+
+test "claude code: a retry after a failed turn starts a new session instead of resuming it" {
+    const overloaded =
+        \\{"type":"stream_event","event":{"type":"message_start","message":{"usage":{"input_tokens":3}}},"parent_tool_use_id":null}
+        \\{"type":"assistant","message":{"content":[{"type":"text","text":"API Error: Overloaded"}]},"error":"overloaded","parent_tool_use_id":null}
+        \\{"type":"result","subtype":"success","is_error":true,"result":"API Error: Overloaded"}
+        \\
+    ;
+    var fake: FakeClaude = undefined;
+    try fake.init(overloaded);
+    defer fake.deinit();
+    const key = "claude-code-test-retry-failed-turn";
+    defer FakeClaude.stop(key) catch {};
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const first = [_]types.ChatMessage{.{ .role = .user, .content = "one" }};
+    const first_units = try wire.units(arena, &first);
+    const id = wire.formatSessionId(@splat(7));
+    const replay = try wire.writeReplay(arena, .{ .session_id = &id, .units = first_units.len, .digest = wire.digest(first_units) });
+    const source: @import("../core/config/model_provider.zig").ProviderSelection = .{ .provider = .claude_code, .model = "claude-haiku-5-5" };
+    const messages = [_]types.ChatMessage{
+        first[0],
+        .{ .role = .assistant, .content = "ok", .provider_replay = .{ .source = source, .parts_json = replay } },
+        .{ .role = .user, .content = "two" },
+    };
+    // fx retries the failed step with the same history. The resumed Claude
+    // session already holds "two", so the retry must not resume it.
+    for (0..2) |_| {
+        fake.delivery = .init();
+        var result = try agentStep(std.testing.allocator, .{ .request = fake.request(key, &messages, .{}), .effort = null, .program = fake.program });
+        defer result.deinit(std.testing.allocator);
+        try std.testing.expectEqual(stream_provider.FailureKind.unavailable, result.failed.kind);
+    }
+
+    const args = try fake.argsLog();
+    defer std.testing.allocator.free(args);
+    var lines = std.mem.splitScalar(u8, std.mem.trimEnd(u8, args, "\n"), '\n');
+    try std.testing.expect(std.mem.find(u8, lines.next().?, "--resume " ++ &id) != null);
+    const retry = lines.next().?;
+    try std.testing.expect(std.mem.find(u8, retry, "--resume") == null);
+    try std.testing.expect(std.mem.find(u8, retry, "--session-id") != null);
     try std.testing.expect(lines.next() == null);
 }
 

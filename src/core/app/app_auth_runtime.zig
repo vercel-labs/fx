@@ -280,7 +280,7 @@ pub fn Runtime(comptime App: type) type {
                     try writeAuthNotice(app, .{
                         .topic = "",
                         .tone = .warning,
-                        .body = "usage: /logout [vercel|codex|grok]",
+                        .body = "usage: /logout [vercel|codex|grok|claude-code]",
                     });
                     return;
                 };
@@ -1406,6 +1406,11 @@ pub fn Runtime(comptime App: type) type {
             const request = task.input.intent.provider;
             const target = request.target;
             const intent = request.origin;
+            if (task.unavailable) |text| {
+                debug_trace.logf("provider", "target not ready target={t}", .{target});
+                try app.writeDomainNotice(.{ .topic = "provider", .tone = .@"error", .body = text }, true);
+                return false;
+            }
             if (task.failure) |err| {
                 debug_trace.logf("provider", "preparation failed target={t} err={s}", .{ target, @errorName(err) });
                 if (task.credential == null and !hostManagesAuth(app)) {

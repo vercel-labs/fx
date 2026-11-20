@@ -20,10 +20,10 @@ const Writer = std.Io.Writer;
 /// The MCP server name Claude Code sees. Its tools reach the model as
 /// `mcp__fx__<name>`.
 pub const server_name = "fx";
-pub const tool_prefix = "mcp__" ++ server_name ++ "__";
+const tool_prefix = "mcp__" ++ server_name ++ "__";
 /// Claude's tool names allow letters, digits, `_`, and `-`, up to 64 bytes
 /// with the prefix.
-pub const max_wire_name_bytes = 64 - tool_prefix.len;
+const max_wire_name_bytes = 64 - tool_prefix.len;
 
 /// A tool name Claude called, without the MCP prefix: the name fx gave it
 /// in `tools/list`.
@@ -50,7 +50,7 @@ pub const ToolNames = struct {
     }
 
     /// Adds a copy of `name` and returns its wire name, owned by the map.
-    pub fn add(self: *ToolNames, alloc: Allocator, name: []const u8) ![]const u8 {
+    fn add(self: *ToolNames, alloc: Allocator, name: []const u8) ![]const u8 {
         var buf: [max_wire_name_bytes]u8 = undefined;
         const base_len = @min(name.len, max_wire_name_bytes);
         for (name[0..base_len], buf[0..base_len]) |byte, *out| {
@@ -182,11 +182,11 @@ test "claude code: stdin messages are single JSON lines" {
 // ---------------------------------------------------------------------------
 // The claude process's stdout
 
-pub const BlockKind = enum { text, thinking, tool_use, other };
+const BlockKind = enum { text, thinking, tool_use, other };
 
 /// What a Claude Code stream-json line means to a model step. Slices borrow
 /// the arena the line was parsed into.
-pub const StdoutLine = union(enum) {
+const StdoutLine = union(enum) {
     /// `system` `init`: the session and the model Claude Code resolved.
     init: struct { session_id: ?[]const u8, model: ?[]const u8 },
     message_start: struct { usage: Counts },
@@ -233,7 +233,7 @@ pub const Counts = struct {
     }
 };
 
-pub const ToolUse = struct {
+const ToolUse = struct {
     id: []const u8,
     name: []const u8,
     input_json: []const u8,
@@ -481,7 +481,7 @@ test "claude code: assistant messages carry tool input and errors" {
 // ---------------------------------------------------------------------------
 // The MCP bridge
 
-pub const McpIncoming = union(enum) {
+const McpIncoming = union(enum) {
     initialize: struct { id_json: []const u8, protocol_version: ?[]const u8 },
     tools_list: []const u8,
     tools_call: McpCall,
@@ -494,7 +494,7 @@ pub const McpIncoming = union(enum) {
     ignored,
 };
 
-pub const McpCall = struct {
+const McpCall = struct {
     /// The JSON-RPC id exactly as Claude Code sent it, serialized.
     id_json: []const u8,
     /// Claude's tool-use id, from `_meta`.
@@ -628,7 +628,7 @@ pub const Unit = struct {
 
     pub const Kind = enum(u8) { user, call, result };
 
-    pub fn same(self: Unit, other: Unit) bool {
+    fn same(self: Unit, other: Unit) bool {
         return self.kind == other.kind and self.hash == other.hash;
     }
 };
@@ -675,7 +675,7 @@ pub const DeltaPlan = union(enum) {
     diverged: Divergence,
 };
 
-pub const Divergence = enum {
+const Divergence = enum {
     /// The request drops or changes an entry the process already has.
     rewritten,
     /// The request answers fewer calls than are pending, or asks again with
@@ -885,7 +885,7 @@ test "claude code: a seeded prompt carries the transcript and the new request" {
 // ---------------------------------------------------------------------------
 // Replay: what a reply records so a later fx process can resume the session
 
-pub const Replay = struct {
+const Replay = struct {
     session_id: []const u8,
     /// How many units of the history Claude Code had seen, and their digest.
     units: usize,

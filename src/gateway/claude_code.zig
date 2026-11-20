@@ -157,7 +157,21 @@ pub const model_catalog_provider = model_catalog.Provider{
     .fetch_fn = fetchCatalog,
     .lookup_capabilities_fn = lookupCapabilities,
     .provider_id = .claude_code,
+    .readiness_fn = readiness,
 };
+
+/// Switching to Claude Code needs `claude` installed and signed in, as
+/// `fx provider claude-code` checks. A sign-in it can't read doesn't block.
+fn readiness(_: ?*anyopaque, alloc: Allocator) Allocator.Error!model_catalog.Readiness {
+    var status = probeStatus(alloc) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return .ready,
+    };
+    defer status.deinit(alloc);
+    if (!status.installed) return .{ .unavailable = not_installed_message };
+    if (status.signed_in == false) return .{ .unavailable = not_signed_in_message };
+    return .ready;
+}
 
 pub const cli_model_catalog_provider = gateway_provider.CliModelCatalogProvider{
     .fetch_fn = fetchCliModelCatalog,

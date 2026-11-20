@@ -1250,6 +1250,9 @@ pub const ProviderPreparation = struct {
     credential: ?credentials.Credential = null,
     catalog: ?model_catalog.ProviderResult = null,
     failure: ?anyerror = null,
+    /// Set when the target can't take requests yet (`model_catalog.Readiness`);
+    /// nothing else was prepared. Static text.
+    unavailable: ?[]const u8 = null,
 
     fn start(alloc: Allocator, runtime: *const Runtime, input: ProviderPreparationInput) !*ProviderPreparation {
         const self = try alloc.create(ProviderPreparation);
@@ -1276,6 +1279,20 @@ pub const ProviderPreparation = struct {
     fn run(self: *ProviderPreparation) void {
         defer self.done.store(true, .release);
         if (self.cancel_requested.load(.seq_cst)) return;
+        if (self.input.intent == .provider) {
+            const readiness = self.input.catalog_provider.readiness(self.alloc) catch |err| {
+                self.failure = err;
+                return;
+            };
+            switch (readiness) {
+                .ready => {},
+                .unavailable => |text| {
+                    self.unavailable = text;
+                    return;
+                },
+            }
+            if (self.cancel_requested.load(.seq_cst)) return;
+        }
         if (self.input.candidate) |candidate| {
             self.credential = candidate;
             self.input.candidate = null;
@@ -1370,6 +1387,32 @@ const PreparationTestCatalog = struct {
         return .{ .catalog = catalog };
     }
 };
+
+test "provider preparation stops at a target that can't take requests yet" {
+    const alloc = std.testing.allocator;
+    var runtime: Runtime = .{};
+    defer runtime.deinit(alloc);
+    const Unready = struct {
+        fn readiness(_: ?*anyopaque, _: Allocator) Allocator.Error!model_catalog.Readiness {
+            return .{ .unavailable = "Install the program first." };
+        }
+        fn fetch(_: ?*anyopaque, _: Allocator, _: model_catalog.FetchInput) Allocator.Error!model_catalog.ProviderResult {
+            return error.OutOfMemory;
+        }
+    };
+    try runtime.beginProviderPreparation(alloc, .{
+        .intent = .{ .provider = .{ .target = .claude_code, .allow_login = false, .origin = .manual } },
+        .catalog_provider = .{ .fetch_fn = Unready.fetch, .readiness_fn = Unready.readiness, .provider_id = .claude_code },
+        .models_path = "",
+    });
+    try waitForPreparationTest(&runtime.provider_preparation.?.done);
+    const prepared = runtime.takeProviderPreparation().?;
+    defer prepared.deinit();
+    try std.testing.expectEqualStrings("Install the program first.", prepared.unavailable.?);
+    try std.testing.expect(prepared.credential == null);
+    try std.testing.expect(prepared.catalog == null);
+    try std.testing.expect(prepared.failure == null);
+}
 
 fn waitForPreparationTest(flag: *const std.atomic.Value(bool)) !void {
     const deadline = io_mod.milliTimestamp() + 5000;

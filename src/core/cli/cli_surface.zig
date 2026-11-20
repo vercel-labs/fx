@@ -1314,12 +1314,17 @@ fn activateProviderSelectionFallible(
             return false;
         }
         if (caller == .provider_command) {
-            const line = try alloc.print("Using Claude Code {s}, signed in with {s}{s}{s}.\n", .{
-                status.version orelse "(unknown version)",
-                status.auth_method orelse "an unknown method",
-                if (status.subscription != null) ", plan " else "",
-                status.subscription orelse "",
-            });
+            const line = if (status.signed_in == null)
+                try alloc.print("Using Claude Code {s}. fx couldn't tell whether it is signed in; if requests fail, run `claude` and sign in with /login.\n", .{
+                    status.version orelse "(unknown version)",
+                })
+            else
+                try alloc.print("Using Claude Code {s}, signed in with {s}{s}{s}.\n", .{
+                    status.version orelse "(unknown version)",
+                    status.auth_method orelse "an unknown method",
+                    if (status.subscription != null) ", plan " else "",
+                    status.subscription orelse "",
+                });
             defer alloc.free(line);
             try writeStdout(deps, line);
         }
@@ -1697,7 +1702,7 @@ fn runNonInteractiveWithDeps(
         },
         .logout => |rest| {
             const maybe_login_provider = parseLoginProvider(rest) catch {
-                try writeStderr(deps, "usage: fx logout [vercel|codex|grok]\n");
+                try writeStderr(deps, "usage: fx logout [vercel|codex|grok|claude-code]\n");
                 return usage_failure;
             };
             if (cfg.auth_mode == .host_managed) {
