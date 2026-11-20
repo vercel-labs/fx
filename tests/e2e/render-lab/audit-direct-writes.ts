@@ -84,7 +84,7 @@ const allowlist: AllowRule[] = [
   rule("src/core/session/session_adapter.zig", "expectLines", /debug_print/, "tests", "test diagnostics"),
   rule("src/core/workspace/turn_capture.zig", "runGit", /debug_print/, "tests", "test diagnostics"),
   rule("src/core/app/trace_report.zig", "(?:parse|nth|fieldProblem|expectStartsWith|expectEndsWith|expectNotIn)", /debug_print/, "tests", "test diagnostics"),
-  rule("src/protocol/spec/schemas.zig", "(?:parseSpecFile|checkNameRow)", /debug_print/, "tests", "test diagnostics"),
+  rule("src/protocol/spec/schemas.zig", "(?:checkNameRow|checkRefs|parseSpecFile|tableValues)", /debug_print/, "tests", "test diagnostics"),
 ];
 
 function rule(
