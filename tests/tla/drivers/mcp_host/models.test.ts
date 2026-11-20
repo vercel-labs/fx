@@ -17,9 +17,9 @@ test("TLC: every model's smoke and stress pass, every planted bug is caught, sta
   expect(results.filter((r) => r.verdict === "FAIL").map((r) => r.label)).toEqual([]);
   const count = (kind: string, verdict: string) => results.filter((r) => r.kind === kind && r.verdict === verdict).length;
   // SharedLogins, SubagentAccess, UrlRetry, MixedBuilds, StoreLockBudget,
-  // RefreshLease, ErrorData, ConfigEdit and McpRules joined the four.
-  expect(count("smoke", "PASS")).toBe(13);
-  expect(count("stress", "PASS")).toBe(13);
+  // RefreshLease, ErrorData, ConfigEdit, McpRules and Connect joined the four.
+  expect(count("smoke", "PASS")).toBe(14);
+  expect(count("stress", "PASS")).toBe(14);
   expect(count("mutant", "CAUGHT")).toBe(results.filter((r) => r.kind === "mutant").length);
   // Credentials' two findings and its repair witness became the code.
   // HostLifecycle's OneProcessPerServer did too: it
@@ -31,7 +31,8 @@ test("TLC: every model's smoke and stress pass, every planted bug is caught, sta
   // it ended the call at the -32042 error. HostLifecycle's AtMostOneOwner
   // became the code once a reload kept its host: its smoke and stress
   // configs check it. ErrorData's one is the code before the fix (a failed call's error data
-  // never reached the model). McpRules' three are the code before the fix (each MCP
+  // never reached the model). Connect's two are std's retry of a connect after a stray signal: a connect the
+  // kernel was completing is reported failed, and a connecting socket gets a second connect. McpRules' three are the code before the fix (each MCP
   // path picked its rule set on its own, so in full access toolbox search and the
   // open of a small server ignored deny rules, and every other MCP path still
   // applied them). SignIn's five findings are fx before the check request
@@ -43,7 +44,7 @@ test("TLC: every model's smoke and stress pass, every planted bug is caught, sta
   // skips, a profile rewritten under a misspelled key) and the two designs fx
   // does not use for the check: its bounded load scan gives up on a big file,
   // and a dry run outside the lock does not see a change another fx makes.
-  expect(count("finding", "FINDING")).toBe(15);
+  expect(count("finding", "FINDING")).toBe(17);
   expect(count("repair", "PASS")).toBe(2);
 }, 1_800_000);
 
@@ -246,6 +247,19 @@ test("bridge control (refresh lease): going ahead behind a frozen holder on time
   expect(g.verdict).toBe("ACCEPTED");
   expect(b.verdict).toBe("VIOLATES");
   expect(b.broken?.sort()).toEqual(["GoAheadOnTime", "NoGoAheadPastLiveRefresher"]);
+}, 300_000);
+
+test("bridge control (connect): a stray signal that only ends a wait is ACCEPTED, and std's second connect after it VIOLATES", async () => {
+  const dir = join(artifacts, "bridge", "Connect");
+  const ev = (event: string, result?: string): TraceRecord => ({ event, data: result === undefined ? {} : { result } });
+  const good = [ev("start"), ev("intr"), ev("intr"), ev("done", "ok")];
+  // The second connect on the socket that was connecting: macOS answers ISCONN, and both systems fail it in std.
+  const bad = [ev("start"), ev("intr"), ev("reissue"), ev("done", "unexpected")];
+  const g = await checkTrace({ module: "Connect", records: good, constants: { ObsStd: false }, dir: join(dir, "good") });
+  const b = await checkTrace({ module: "Connect", records: bad, constants: { ObsStd: true }, dir: join(dir, "bad") });
+  expect(g.verdict).toBe("ACCEPTED");
+  expect(b.verdict).toBe("VIOLATES");
+  expect(b.broken?.sort()).toEqual(["NoFalseFailure", "NoReissue"]);
 }, 300_000);
 
 test("bridge control: an empty trace is INCONCLUSIVE, never a pass", async () => {
