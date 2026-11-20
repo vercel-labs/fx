@@ -1,7 +1,7 @@
 {
   "libfx": {
-    "packed": 4042000,
-    "unpacked": 11647000
+    "packed": 4730000,
+    "unpacked": 14267000
   },
   "fx-core.wasm": {
     "bytes": 2465000
