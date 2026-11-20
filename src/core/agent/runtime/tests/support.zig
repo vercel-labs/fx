@@ -485,6 +485,7 @@ pub const FakeAgentRuntimeDeps = struct {
     interactive_notices: std.ArrayList(types.SemanticNotice) = .empty,
     context_notices: std.ArrayList([]u8) = .empty,
     route_recovery_statuses: std.ArrayList(types.RouteRecoveryStatus) = .empty,
+    saved_route_recovery_statuses: std.ArrayList(types.RouteRecoveryStatus) = .empty,
     permission_names: std.ArrayList([]u8) = .empty,
     permission_call_ids: std.ArrayList([]u8) = .empty,
     permission_user_intent_contexts: std.ArrayList([]u8) = .empty,
@@ -719,6 +720,7 @@ pub const FakeAgentRuntimeDeps = struct {
         self.model_calls.deinit(self.alloc);
         freeStringList(self.alloc, &self.context_notices);
         self.route_recovery_statuses.deinit(self.alloc);
+        self.saved_route_recovery_statuses.deinit(self.alloc);
         freeStringList(self.alloc, &self.permission_names);
         freeStringList(self.alloc, &self.permission_call_ids);
         freeStringList(self.alloc, &self.permission_user_intent_contexts);
@@ -825,6 +827,7 @@ pub const FakeAgentRuntimeDeps = struct {
             .push_interactive_notice = if (self.enable_interactive_notices) interactiveNotice else null,
             .push_context_notice = contextNotice,
             .push_route_recovery_status = routeRecoveryStatus,
+            .save_route_recovery_status = savedRouteRecoveryStatus,
             .push_command_output_complete = commandOutputComplete,
             .push_http_error = httpError,
             .refresh_gateway_credential = refreshGatewayCredential,
@@ -1857,6 +1860,11 @@ pub const FakeAgentRuntimeDeps = struct {
         const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
         try self.context_notices.append(self.alloc, try self.alloc.dupe(u8, text));
         try self.record("context_notice:{s}", .{text});
+    }
+
+    fn savedRouteRecoveryStatus(raw: *anyopaque, status: types.RouteRecoveryStatus) !void {
+        const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
+        try self.saved_route_recovery_statuses.append(self.alloc, status);
     }
 
     fn routeRecoveryStatus(raw: *anyopaque, status: types.RouteRecoveryStatus) !void {

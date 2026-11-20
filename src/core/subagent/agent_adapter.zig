@@ -528,6 +528,7 @@ fn runtimeDeps(context: *Context) agent_runtime.AgentRuntimeDeps {
         .push_diff_block = pushLiveDiff,
         .push_system_notice = pushLiveNotice,
         .push_route_recovery_status = pushLiveRouteRecoveryStatus,
+        .save_route_recovery_status = saveRouteRecoveryStatus,
         .push_command_output_complete = pushLiveCommandOutputComplete,
         .push_http_error = captureHttpError,
         .refresh_gateway_credential = refreshGatewayCredential,
@@ -1020,6 +1021,15 @@ fn recordUsage(raw: *anyopaque, usage: types.Usage) !void {
     // A hosted run has no session here; its own agent saves its usage.
     const child = context.turn.child orelse return;
     try child.recordUsage(usage);
+}
+
+/// Saves a recovery status in the child's own log, as the root saves its
+/// own (`model_recovery`).
+fn saveRouteRecoveryStatus(raw: *anyopaque, status: types.RouteRecoveryStatus) !void {
+    const context: *Context = @ptrCast(@alignCast(raw));
+    // A hosted run has no session here; its own agent saves its statuses.
+    const child = context.turn.child orelse return;
+    try child.saveModelRecovery(status);
 }
 
 fn publishCommittedFileHandoff(_: *anyopaque, _: file_mutation.CommittedFileHandoff) agent_runtime.SecondaryPublicationReport {

@@ -310,7 +310,8 @@ manager:
   `context_note` (D93), `runtime_context` (D94), `model_call` (D96),
   `mcp_bridge_call` (D99), `cancelled_command` (D100), `turn_end` (files
   and turn summary), `interruption` (reason detail, partial text, command
-  refs, origin), `recovery`, `workspace_capture` (D98) and `continues`.
+  refs, origin), `recovery`, `model_recovery` (a model request's recovery
+  status, for reading the log), `workspace_capture` (D98) and `continues`.
 - **Recovery:** the agent loop's checkpoint becomes a small `recovery` item
   (cause, action, tool state, attempts, route, partial text). The pieces it
   used to copy are already in the log (D10).
