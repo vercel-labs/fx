@@ -1602,6 +1602,7 @@ fn buildCompactTranscriptProjectionInterruptible(
             .marker_style = user_message_card.promptMarkerStyle(),
             .text_style = ui_render.statusline_style,
             .reset_style = "\x1b[0m",
+            .failure_style = ui_render.failure_style,
         },
         self.command_output_render.styles,
         checkpoint,
