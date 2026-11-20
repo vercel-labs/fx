@@ -1766,6 +1766,15 @@ pub const StructuredError = struct {
     pub fn validate(self: StructuredError) error{InvalidSessionId}!void {
         if (self.session_id) |session_id| try validate_session_id(session_id);
     }
+
+    /// Whether the terminal client refused the request because it already
+    /// ran all the requests it allows at once, so the same request can run
+    /// again later. The host also reports its own store and monitor limits
+    /// as `capacity_exceeded`, but not retryable, and other retryable
+    /// failures, such as a lost session, do not go away on a retry.
+    pub fn isBusyRefusal(self: StructuredError) bool {
+        return self.code == .capacity_exceeded and self.retryable;
+    }
 };
 
 pub const SessionFacts = struct {
@@ -2243,6 +2252,15 @@ fn deinit_success_result(alloc: Allocator, result: *OwnedSuccessResult) void {
         .close => |value| deinit_session_facts(alloc, value.session),
     }
     result.* = undefined;
+}
+
+test "only a retryable capacity failure is a busy refusal" {
+    try std.testing.expect((StructuredError{ .action = .signal, .code = .capacity_exceeded, .retryable = true }).isBusyRefusal());
+    // The host's own store or monitor limit.
+    try std.testing.expect(!(StructuredError{ .action = .wait, .code = .capacity_exceeded }).isBusyRefusal());
+    // A lost host session is retryable for a wait, but not busy.
+    try std.testing.expect(!(StructuredError{ .action = .wait, .code = .session_lost, .retryable = true }).isBusyRefusal());
+    try std.testing.expect(!(StructuredError{ .action = .close, .code = .session_not_found }).isBusyRefusal());
 }
 
 test "action requests own every accepted action input" {

@@ -4,3 +4,6 @@
 /README.md @fazxes
 /CONTRIBUTING.md @fazxes
 /sdk/README.md @fazxes
+
+# Changes to the repository rules need the maintainer's approval (RULES.md R0.1).
+/RULES.md @fazxes

@@ -212,7 +212,11 @@ fn tildeStart(source: []const u8, index: usize, operators: []const u8) bool {
 /// Double-quoted spans interpolate in shell: `$name`, `${name}`, and `$(`
 /// take the keyword color while the rest keeps the string color.
 fn appendDoubleQuoted(alloc: Allocator, out: *std.ArrayList(u8), palette: Palette, text: []const u8, base: ?[]const u8) !void {
-    const inner_end = text.len - 1;
+    // A quote that never closes runs to the end of the line or the command
+    // (`quotedEnd`), so its last byte is text, not a closing quote to style
+    // apart, and may end a multi-byte character.
+    const closed = text.len >= 2 and text[text.len - 1] == '"';
+    const inner_end = if (closed) text.len - 1 else text.len;
     // The opening quote rides the first text chunk so the pair stays one span.
     var chunk_start: usize = 0;
     var i: usize = 1;
@@ -235,7 +239,7 @@ fn appendDoubleQuoted(alloc: Allocator, out: *std.ArrayList(u8), palette: Palett
         i += 1;
     }
     if (chunk_start < inner_end) try appendStyled(alloc, out, palette.string_style, text[chunk_start..inner_end], base);
-    try appendStyled(alloc, out, palette.string_style, text[inner_end..], base);
+    if (closed) try appendStyled(alloc, out, palette.string_style, text[inner_end..], base);
 }
 
 fn appendStyled(alloc: Allocator, out: *std.ArrayList(u8), style: []const u8, text: []const u8, base: ?[]const u8) !void {
@@ -750,6 +754,30 @@ test "double quotes interpolate variables inside the string color" {
     const single = try highlight(alloc, "echo '$USER'", languages.resolve("sh").?, .dark, null);
     defer alloc.free(single);
     try std.testing.expect(std.mem.find(u8, single, "\x1b[38;5;250m'$USER'\x1b[39m") != null);
+}
+
+test "an unclosed double quote keeps its last character whole" {
+    const alloc = std.testing.allocator;
+    // A closed quote keeps the output it always had: its content, then its
+    // closing quote, each in a string span.
+    const closed = try highlight(alloc, "echo \"caf\xc3\xa9\"", languages.resolve("sh").?, .dark, null);
+    defer alloc.free(closed);
+    try std.testing.expectEqualStrings("\x1b[38;5;252mecho\x1b[39m \x1b[38;5;250m\"caf\xc3\xa9\x1b[39m\x1b[38;5;250m\"\x1b[39m", closed);
+
+    // An unclosed quote runs to the end of the command, so its last character
+    // stays in one span.
+    const unclosed_source = "echo \"caf\xc3\xa9";
+    const unclosed = try highlight(alloc, unclosed_source, languages.resolve("sh").?, .dark, null);
+    defer alloc.free(unclosed);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(unclosed));
+    const unclosed_plain = try stripAnsi(alloc, unclosed);
+    defer alloc.free(unclosed_plain);
+    try std.testing.expectEqualStrings(unclosed_source, unclosed_plain);
+
+    try std.testing.expect(std.unicode.utf8ValidateSlice(closed));
+    const closed_plain = try stripAnsi(alloc, closed);
+    defer alloc.free(closed_plain);
+    try std.testing.expectEqualStrings("echo \"caf\xc3\xa9\"", closed_plain);
 }
 
 test "diff lines paint with the caller's marker colors" {
