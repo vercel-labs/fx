@@ -9,6 +9,7 @@ const input_limit_rejection = @import("../input/input_limit_rejection.zig");
 const question_ui = @import("../../ui/footer/question_ui.zig");
 const question_freeform_layout = @import("../../ui/footer/question_freeform_layout.zig");
 const input_interrupt_runtime = @import("input_interrupt_runtime.zig");
+const app_worker_runtime = @import("app_worker_runtime.zig");
 
 pub fn QuestionRuntime(comptime App: type) type {
     return struct {
@@ -75,7 +76,7 @@ pub fn QuestionRuntime(comptime App: type) type {
                     agent.worker.requestCancel();
                 }
             }
-            app.pacer.clear(app.alloc);
+            app_worker_runtime.Runtime(App).clearPacer(app, agent, "cancel_question");
             if (!route_recovery and !mcp_elicitation) try finalizeQuestionTranscript(app, agent, true);
             try agent.worker.submitQuestionBatchAnswer(std.heap.c_allocator, null, null);
             agent.question_prompt.discard(app.alloc, "cancelled");

@@ -197,19 +197,14 @@ pub fn toolReviewHeldJson(
         .review_caution, .review_evidence_incomplete, .review_unavailable => {},
         .user_denied, .auto_denied, .policy_denied, .permission_required => unreachable,
     }
-    const malformed_response = reason == .review_unavailable and
-        if (review_cause) |cause| cause.is_malformed_completion() else false;
     var out: std.Io.Writer.Allocating = .init(alloc);
     errdefer out.deinit();
     out.writer.writeAll("{\"error\":{\"type\":\"tool_review_held\",\"tool_name\":") catch
         return error.OutOfMemory;
     std.json.Stringify.value(tool_name, .{}, &out.writer) catch return error.OutOfMemory;
     out.writer.writeAll(",\"message\":") catch return error.OutOfMemory;
-    writeMaskedJsonString(
-        alloc,
-        &out.writer,
-        if (malformed_response) "Safety reviewer returned an invalid response; action held" else permissionDeniedMessage(tool_name, reason),
-    ) catch return error.OutOfMemory;
+    writeMaskedJsonString(alloc, &out.writer, heldMessage(tool_name, reason, review_cause)) catch
+        return error.OutOfMemory;
     out.writer.writeAll(",\"reason\":") catch return error.OutOfMemory;
     std.json.Stringify.value(@tagName(reason), .{}, &out.writer) catch
         return error.OutOfMemory;
@@ -226,16 +221,67 @@ pub fn toolReviewHeldJson(
         }
     }
     out.writer.writeAll(",\"suggestion\":") catch return error.OutOfMemory;
-    writeMaskedJsonString(
-        alloc,
-        &out.writer,
-        if (malformed_response)
-            "The action did not run because the reviewer did not return a valid decision. Continue with a different safe action or retry in a later turn."
-        else
-            permissionDeniedSuggestion(reason),
-    ) catch return error.OutOfMemory;
+    writeMaskedJsonString(alloc, &out.writer, heldSuggestion(reason, review_cause)) catch
+        return error.OutOfMemory;
     out.writer.writeAll("}}") catch return error.OutOfMemory;
     return try out.toOwnedSlice();
+}
+
+/// The one-line text form of a denied or held tool result, for callers that
+/// print a message instead of returning JSON, such as `fx mcp call`. It says
+/// what the agent would read in the JSON form: why the tool did not run, the
+/// reviewer's advice when there is any, and what to do next. Caller owns the
+/// returned slice.
+pub fn permissionDenialText(
+    alloc: Allocator,
+    tool_name: []const u8,
+    reason: types.ToolPermissionDenialReason,
+    advice: ?[]const u8,
+    review_cause: ?auto_classifier.InvalidReason,
+) Allocator.Error![]const u8 {
+    const held = switch (reason) {
+        .review_caution, .review_evidence_incomplete, .review_unavailable => true,
+        .user_denied, .auto_denied, .policy_denied, .permission_required => false,
+    };
+    const message = if (held) heldMessage(tool_name, reason, review_cause) else permissionDeniedMessage(tool_name, reason);
+    const suggestion = if (held) heldSuggestion(reason, review_cause) else permissionDeniedSuggestion(reason);
+    const text = if (advice != null and advice.?.len > 0)
+        try alloc.print("{s}: {s} {s}", .{ message, advice.?, suggestion })
+    else
+        try alloc.print("{s}. {s}", .{ message, suggestion });
+    const masked = text_utils.maskSecrets(alloc, text) catch {
+        alloc.free(text);
+        return error.OutOfMemory;
+    };
+    if (masked.ptr != text.ptr) alloc.free(text);
+    return masked;
+}
+
+/// Whether a held review failed because the reviewer's reply was malformed.
+fn heldByMalformedResponse(
+    reason: types.ToolPermissionDenialReason,
+    review_cause: ?auto_classifier.InvalidReason,
+) bool {
+    return reason == .review_unavailable and
+        if (review_cause) |cause| cause.is_malformed_completion() else false;
+}
+
+fn heldMessage(
+    tool_name: []const u8,
+    reason: types.ToolPermissionDenialReason,
+    review_cause: ?auto_classifier.InvalidReason,
+) []const u8 {
+    if (heldByMalformedResponse(reason, review_cause)) return "Safety reviewer returned an invalid response; action held";
+    return permissionDeniedMessage(tool_name, reason);
+}
+
+fn heldSuggestion(
+    reason: types.ToolPermissionDenialReason,
+    review_cause: ?auto_classifier.InvalidReason,
+) []const u8 {
+    if (heldByMalformedResponse(reason, review_cause))
+        return "The action did not run because the reviewer did not return a valid decision. Continue with a different safe action or retry in a later turn.";
+    return permissionDeniedSuggestion(reason);
 }
 
 fn permissionDeniedMessage(tool_name: []const u8, reason: types.ToolPermissionDenialReason) []const u8 {
@@ -641,6 +687,41 @@ test "review hold JSON preserves typed reasons apart from permission denial" {
     try std.testing.expect(toolPermissionDenialReason(
         "{\"error\":{\"type\":\"tool_permission_denied\",\"reason\":\"review_caution\"}}",
     ) == null);
+}
+
+test "denial text says why a tool did not run and what to change" {
+    const alloc = std.testing.allocator;
+    const Case = struct {
+        reason: types.ToolPermissionDenialReason,
+        advice: ?[]const u8 = null,
+        cause: ?auto_classifier.InvalidReason = null,
+        expected: []const u8,
+    };
+    const cases = [_]Case{
+        .{
+            .reason = .review_evidence_incomplete,
+            .expected = "Safety review evidence incomplete; action held. The action did not run because safety review could not inspect the complete exact action. Do not retry unchanged; reduce the action or supporting evidence to fit the review limits, or choose a materially different fully inspectable action.",
+        },
+        .{
+            .reason = .review_caution,
+            .advice = "The upload sends AKIA0123456789ABCDEF to an unknown host.",
+            .expected = "Action held after safety review: The upload sends [redacted] to an unknown host. The action did not run. Use the review advice to choose a materially different safe action, or explain why no safe path remains.",
+        },
+        .{
+            .reason = .review_unavailable,
+            .cause = .completion_text,
+            .expected = "Safety reviewer returned an invalid response; action held. The action did not run because the reviewer did not return a valid decision. Continue with a different safe action or retry in a later turn.",
+        },
+        .{
+            .reason = .policy_denied,
+            .expected = "Tool access was denied by configured policy. The tool did not run. Do not retry unchanged; explain the configured policy blocker or use an allowed alternative.",
+        },
+    };
+    for (cases) |case| {
+        const text = try permissionDenialText(alloc, "mcp_kit_execute", case.reason, case.advice, case.cause);
+        defer alloc.free(text);
+        try std.testing.expectEqualStrings(case.expected, text);
+    }
 }
 
 test "tool permission denied JSON explains policy and headless blockers" {

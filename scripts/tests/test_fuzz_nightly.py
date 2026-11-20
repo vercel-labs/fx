@@ -55,9 +55,11 @@ class FakeRunner:
         self.rounds = rounds
         self.bad_input = bad_input
         self.calls: list[list[str]] = []
+        self.timeouts: list[float] = []
 
     def __call__(self, command, cwd: pathlib.Path, timeout: float) -> Outcome:
         self.calls.append(list(command))
+        self.timeouts.append(timeout)
         if any(arg.startswith("--fuzz=") for arg in command):
             return self.rounds.pop(0)
         folder = cwd / "tests" / "fuzz" / "corpus" / TARGET.name
@@ -173,7 +175,7 @@ class FuzzTargetTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = pathlib.Path(tmp)
             ticks = iter([0, 10, 20, 30])
-            runner = FakeRunner([Outcome(CLEAN_ROUND, 0)] * 3)
+            runner = FakeRunner([Outcome(CLEAN_ROUND, 0)] * 4)
 
             result = fuzz_target(
                 TARGET, root, root / "out", budget=25, runner=runner, clock=lambda: next(ticks)
@@ -182,6 +184,31 @@ class FuzzTargetTests(unittest.TestCase):
             self.assertEqual("ok", result["status"])
             self.assertEqual(3, result["rounds"])
             self.assertEqual("ok", json.loads((root / "out" / "result.json").read_text())["status"])
+
+    def test_builds_first_so_no_round_waits_for_the_compiler(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            runner = FakeRunner([Outcome(CLEAN_ROUND, 0)] * 2)
+
+            fuzz_target(
+                TARGET, root, root / "out", budget=0, build_timeout=900, round_timeout=600,
+                runner=runner, clock=lambda: 0,
+            )
+
+            self.assertIn("--fuzz=1", runner.calls[0])
+            self.assertIn(f"--fuzz={TARGET.iterations}", runner.calls[1])
+            self.assertEqual([900, 600], runner.timeouts)
+
+    def test_a_build_that_runs_out_of_time_is_a_build_error_not_a_hang(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            runner = FakeRunner([Outcome("", None)])
+
+            result = fuzz_target(TARGET, root, root / "out", runner=runner, clock=lambda: 0)
+
+            self.assertEqual("build-error", result["status"])
+            self.assertEqual(0, result["rounds"])
+            self.assertEqual(1, len(runner.calls))
 
     def test_failure_writes_the_confirmed_reproducer(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -192,6 +219,8 @@ class FuzzTargetTests(unittest.TestCase):
             replay = FakeRunner([], bad_input=bad)
 
             def runner(command, cwd, timeout):
+                if "--fuzz=1" in command:
+                    return Outcome(CLEAN_ROUND, 0)
                 if any(arg.startswith("--fuzz=") for arg in command):
                     write_input_file(inputs / "in0", bad)
                     return Outcome(FAILED_ROUND, 0)
@@ -200,6 +229,7 @@ class FuzzTargetTests(unittest.TestCase):
             result = fuzz_target(TARGET, root, root / "out", runner=runner, clock=lambda: 0)
 
             self.assertEqual("failure", result["status"])
+            self.assertEqual(1, result["rounds"])
             self.assertEqual(bad, (root / "out" / result["reproducer"]).read_bytes())
 
     def test_stale_inputs_from_earlier_runs_are_removed_first(self) -> None:
@@ -213,7 +243,7 @@ class FuzzTargetTests(unittest.TestCase):
             corpus.mkdir()
 
             fuzz_target(
-                TARGET, root, root / "out", budget=0, runner=FakeRunner([Outcome(CLEAN_ROUND, 0)]), clock=lambda: 0
+                TARGET, root, root / "out", budget=0, runner=FakeRunner([Outcome(CLEAN_ROUND, 0)] * 2), clock=lambda: 0
             )
 
             self.assertEqual([corpus], list(inputs.iterdir()))
