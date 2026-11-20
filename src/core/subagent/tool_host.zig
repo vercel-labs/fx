@@ -7069,12 +7069,15 @@ test "a stop that lands between a turn's end and the slot finishing its work cou
 const EndInStop = struct {
     var before = TestHold{};
     var after = TestHold{};
+    /// How many times a stop or close ran the hook.
+    var entered = std.atomic.Value(u32).init(0);
 
     fn heldAt(_: []const u8, recorded: bool) void {
         if (recorded) after.once() else before.once();
     }
 
     fn inStop(_: []const u8) void {
+        _ = entered.fetchAdd(1, .seq_cst);
         before.release();
         after.waitHeld() catch std.debug.print("the slot's end was not recorded in time\n", .{});
     }
@@ -7082,6 +7085,7 @@ const EndInStop = struct {
     fn arm() void {
         before.reset();
         after.reset();
+        entered.store(0, .seq_cst);
         end_test_controls.test_hold_run = heldAt;
         end_test_controls.test_hold_stop = inStop;
     }
@@ -7101,12 +7105,16 @@ const EndInStop = struct {
 /// worker attaches: the hook lets the worker attach and waits until it has, so
 /// the attach runs right after the owner stopped the work.
 const AttachInStop = struct {
+    var entered = std.atomic.Value(u32).init(0);
+
     fn inStop(_: []const u8) void {
+        _ = entered.fetchAdd(1, .seq_cst);
         HeldStart.release();
         AttachedHold.first.waitHeld() catch std.debug.print("the work's worker did not attach in time\n", .{});
     }
 
     fn arm() void {
+        entered.store(0, .seq_cst);
         HeldStart.arm();
         AttachedHold.arm(0);
         end_test_controls.test_hold_stop = inStop;
@@ -7127,12 +7135,16 @@ const AttachInStop = struct {
 /// The same for a work the host chose that ends before its worker attaches: the
 /// hook lets the slot go on and waits until the work's end is recorded.
 const EndedInStop = struct {
+    var entered = std.atomic.Value(u32).init(0);
+
     fn inStop(_: []const u8) void {
+        _ = entered.fetchAdd(1, .seq_cst);
         PublishHeldTwice.first.release();
         HeldRecorded.waitHeld() catch std.debug.print("the work's end was not recorded in time\n", .{});
     }
 
     fn arm() void {
+        entered.store(0, .seq_cst);
         HeldRecorded.arm();
         end_test_controls.test_hold_stop = inStop;
     }
@@ -7174,6 +7186,8 @@ test "a stop whose turn's slot ends right after the owner stopped it counts the 
     try waitForSlotEnd(runtime, child_id);
     try expectAnswerHas(stopped, stopped_and_dropped);
     try std.testing.expect(std.mem.find(u8, again, "dropped") == null);
+    // Each stop let the slot go inside it.
+    try std.testing.expectEqual(@as(u32, 2), EndInStop.entered.load(.seq_cst));
     // The message never ran, and a stop owes no report.
     try std.testing.expectEqual(@as(usize, 1), fixture.runs.load(.seq_cst));
     try std.testing.expectEqual(@as(usize, 0), fixture.reportCount());
@@ -7198,6 +7212,7 @@ test "the parent's close whose turn's slot ends right after the owner stopped it
     EndInStop.release();
     try waitForSlotEnd(runtime, child_id);
     try expectAnswerHas(closed, closed_and_dropped);
+    try std.testing.expectEqual(@as(u32, 1), EndInStop.entered.load(.seq_cst));
     try std.testing.expectEqual(@as(usize, 1), fixture.runs.load(.seq_cst));
     var registry = try runtime.managed.state_store.load(alloc);
     defer registry.deinit(alloc);
@@ -7241,6 +7256,7 @@ test "a stop whose chosen work attaches right after the owner stopped it counts 
     try waitUntilQuiet(runtime);
     try std.testing.expectEqual(@as(usize, 1), fixture.begun.load(.seq_cst));
     try expectAnswerHas(stopped, stopped_and_dropped);
+    try std.testing.expectEqual(@as(u32, 1), AttachInStop.entered.load(.seq_cst));
 }
 
 test "the parent's close whose chosen work attaches right after the owner stopped it counts the message that waited for it" {
@@ -7262,6 +7278,7 @@ test "the parent's close whose chosen work attaches right after the owner stoppe
     try waitForSlotEnd(runtime, child_id);
     try std.testing.expectEqual(@as(usize, 1), fixture.begun.load(.seq_cst));
     try expectAnswerHas(closed, closed_and_dropped);
+    try std.testing.expectEqual(@as(u32, 1), AttachInStop.entered.load(.seq_cst));
 }
 
 /// A parent's stop or close of a work the host chose, whose bind to its agent
@@ -7279,6 +7296,7 @@ fn expectCountedWhenChosenWorkEnds(actor: Actor, expected: []const u8) !void {
     HeldRecorded.release();
     try cell.finish();
     try expectAnswerHas(cell.answers.items[0], expected);
+    try std.testing.expectEqual(@as(u32, 1), EndedInStop.entered.load(.seq_cst));
     // Only the first work's turn began.
     try std.testing.expectEqual(@as(usize, 1), cell.fixture.begun.load(.seq_cst));
 }
