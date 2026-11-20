@@ -496,6 +496,10 @@ pub const RenderContext = struct {
     waiting_note: []const u8 = "",
     /// What MCP has to say, after the notes above on the right.
     mcp_status: []const u8 = "",
+    /// The `/hook` command that runs, such as "Running /hook test… Esc twice stops it", shown with the other statuses.
+    hook_status: []const u8 = "",
+    /// A setting change that waits for its hooks, such as "Checking hooks for the permission mode… Esc twice stops it".
+    gate_status: []const u8 = "",
     /// Hidden subagents working, such as "1 subagent working", shown on the
     /// right only when nothing else is.
     working_note: []const u8 = "",

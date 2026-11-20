@@ -2,6 +2,7 @@ const std = @import("std");
 const agents = @import("../agents/agents.zig");
 const app_agents_runtime = @import("app_agents_runtime.zig");
 const testing_allocator = @import("../shared/testing_allocator.zig");
+const text_utils = @import("../shared/text_utils.zig");
 const skill_contract = @import("../skills/skill_contract.zig");
 const agent_runtime = @import("../agent/agent_runtime.zig");
 const tool_mcp_runtime = @import("../tooling/tool_mcp_runtime.zig");
@@ -373,6 +374,7 @@ pub fn Bindings(comptime App: type) type {
                 .push_tool_lifecycle = agentPushToolLifecycle,
                 .push_diff_block = agentPushDiffBlock,
                 .push_system_notice = agentPushSystemNotice,
+                .push_hook_notice = agentPushHookNotice,
                 .push_interactive_notice = agentPushInteractiveNotice,
                 .push_context_notice = agentPushContextNotice,
                 .push_session_notice = agentPushSessionNotice,
@@ -1400,6 +1402,20 @@ pub fn Bindings(comptime App: type) type {
             try app_worker_runtime.Runtime(App).pushSemanticNotice(app, agent, .{
                 .topic = "system",
                 .tone = .neutral,
+                .body = text,
+            });
+        }
+
+        fn agentPushHookNotice(ctx: *anyopaque, tone: agent_runtime.HookNoticeTone, text: []const u8) !void {
+            const agent: *AppAgent = @ptrCast(@alignCast(ctx));
+            const app = appOf(agent);
+            // The hook's text is escaped where the notice is built (user_hooks.zig), so it is safe to draw here (R4.6).
+            try app_worker_runtime.Runtime(App).pushSemanticNotice(app, agent, .{
+                .topic = "hooks",
+                .tone = switch (tone) {
+                    .neutral => .neutral,
+                    .warning => .warning,
+                },
                 .body = text,
             });
         }

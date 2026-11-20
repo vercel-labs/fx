@@ -5,6 +5,9 @@ const acp_runner = @import("../core/cli/acp_runner.zig");
 const config_runtime = @import("../core/config/config_runtime.zig");
 const io_mod = @import("../core/shared/io.zig");
 const host_target = @import("../core/hosts/target.zig");
+const hooks_host = @import("../core/hooks_host/hooks_host.zig");
+const runtime_user_hooks = @import("../core/agent/runtime/user_hooks.zig");
+const runtime_lifecycle = @import("../core/agent/runtime/lifecycle.zig");
 const jsonrpc = @import("jsonrpc.zig");
 const acp_types = @import("types.zig");
 const sessions = @import("sessions.zig");
@@ -326,6 +329,8 @@ const ActivePrompt = struct {
     reapable: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 };
 
+const UserHooksSlot = if (host_target.is_wasm) void else ?hooks_host.Runtime;
+
 pub const ServerState = struct {
     configured_providers: @import("../core/config/configured_provider.zig").Registry = .{},
     alloc: Allocator,
@@ -403,6 +408,10 @@ pub const ServerState = struct {
     web_search_runtime: web_search_runtime.Runtime = web_search_runtime.Runtime.init(.{}),
     lifecycle_runtime: hooks.Runtime = hooks.Runtime.init(std.heap.c_allocator),
     lifecycle_view: hooks.RuntimeView = hooks.RuntimeView.empty(),
+    /// The user's hooks runtime for this connection, or null when hooks are off or on Wasm.
+    user_hooks: UserHooksSlot = if (host_target.is_wasm) {} else null,
+    /// Set when the connection ends, so the sessions it closes report the reason exit.
+    ending: bool = false,
     host_tools: host_tool_runtime.Runtime = .{},
     host_instructions: []u8 = &.{},
     outbound_mutex: std.Io.Mutex = .init,
@@ -412,7 +421,17 @@ pub const ServerState = struct {
     legacy_url_mutex: std.Io.Mutex = .init,
     pending_legacy_urls: std.ArrayList(PendingLegacyUrl) = .empty,
 
+    /// The hooks runtime this connection owns, or null (also on Wasm, which runs none).
+    pub fn hooksRuntime(self: *ServerState) ?*runtime_lifecycle.UserHooksRuntime {
+        if (comptime host_target.is_wasm) {
+            return null;
+        } else {
+            return if (self.user_hooks) |*rt| rt else null;
+        }
+    }
+
     pub fn deinit(self: *ServerState) void {
+        self.ending = true;
         if (self.token_pass_run) |*check| check.finish(self.alloc, "shutdown");
         // Terminals end with this process. Ending them first also releases
         // an active prompt waiting on one.
@@ -455,6 +474,9 @@ pub const ServerState = struct {
         self.web_fetch_runtime.deinit(self.alloc);
         self.web_search_runtime.deinit();
         self.lifecycle_runtime.deinit();
+        if (comptime !host_target.is_wasm) {
+            if (self.user_hooks) |*rt| rt.deinit();
+        }
         self.host_tools.deinit();
         if (self.host_instructions.len > 0) self.alloc.free(self.host_instructions);
         self.capability_resolver.deinit(self.alloc);
@@ -918,6 +940,11 @@ fn dropQueuedMail(state: *ServerState, session_id: []const u8, scope: DropScope,
 
 fn destroyActiveSession(state: *ServerState) void {
     const active = if (state.active_session) |*session| session else return;
+    // Every ACP session end comes here, including a session that a new one replaces. The user's
+    // SessionEnd hooks see it while its id is still alive.
+    if (comptime !host_target.is_wasm) {
+        if (state.hooksRuntime()) |rt| rt.endSession(active.session_id, if (state.ending) "exit" else "other");
+    }
     if (active.title_task) |task| {
         debug_trace.logf("session", "event=title_generation_dropped reason=session_release", .{});
         task.destroy();
@@ -3140,6 +3167,18 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
     state.workspace_root = startup.takeWorkspaceRoot();
     state.workspace_access = startup.takeWorkspaceAccess();
 
+    if (comptime !host_target.is_wasm) {
+        if (state.user_hooks) |*old| old.deinit();
+        state.user_hooks = hooks_host.Runtime.init(std.heap.c_allocator, .{
+            .enabled = startup.experimental_hooks and !state.cfg.minimal_kernel,
+            .home = state.cfg.home_override orelse io_mod.homeDir(),
+            .workspace_root = state.workspace_root,
+        }) catch |err| blk: {
+            debug_trace.logf("hooks", "could not start hooks: {s}", .{@errorName(err)});
+            break :blk null;
+        };
+    }
+
     if (state.cfg.model_override) |override| {
         state.selected_model = try alloc.dupe(u8, override);
         alloc.free(startup.takeSelectedModel());
@@ -3856,44 +3895,60 @@ fn handleSetConfigOption(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Me
                 }
             }
         }
+        // A model change that a PreModelSwitch hook refuses leaves the session on its current model.
+        var model_arena = std.heap.ArenaAllocator.init(alloc);
+        defer model_arena.deinit();
+        const old_model = try model_arena.allocator().dupe(u8, session.model);
+        if (!std.mem.eql(u8, old_model, value)) {
+            const decision = modelSwitchDecision(state, model_arena.allocator(), alloc, session, old_model, value);
+            prompt_handler.sendSettingsHookNotices(state, alloc, session.session_id, decision.notices);
+            if (decision.refusal) |notice| {
+                return state.writer.writeError(alloc, msg.id, .{ .code = ErrorCode.invalid_params, .message = notice });
+            }
+        }
         // A subagent's turn reads the session's model route under this lock, from its own copy.
-        state.subagent_authority_mutex.lockUncancelable(io_mod.getIo());
-        defer state.subagent_authority_mutex.unlock(io_mod.getIo());
-        if (host_target.is_wasm) {
-            const next_model = alloc.dupe(u8, value) catch
+        const speeds_kept: anyerror!bool = blk: {
+            state.subagent_authority_mutex.lockUncancelable(io_mod.getIo());
+            defer state.subagent_authority_mutex.unlock(io_mod.getIo());
+            if (host_target.is_wasm) {
+                const next_model = alloc.dupe(u8, value) catch
+                    return state.writer.writeError(alloc, msg.id, .{
+                        .code = ErrorCode.internal_error,
+                        .message = "Failed to update session model",
+                    });
+                const previous_model = session.model;
+                session.model = next_model;
+                sessions.commitWasmSession(alloc, session) catch {
+                    session.model = previous_model;
+                    alloc.free(next_model);
+                    return state.writer.writeError(alloc, msg.id, .{
+                        .code = ErrorCode.internal_error,
+                        .message = "Failed to persist session model",
+                    });
+                };
+                alloc.free(previous_model);
+            } else commitActiveSessionModel(
+                alloc,
+                session,
+                value,
+            ) catch |err| {
                 return state.writer.writeError(alloc, msg.id, .{
-                    .code = ErrorCode.internal_error,
-                    .message = "Failed to update session model",
-                });
-            const previous_model = session.model;
-            session.model = next_model;
-            sessions.commitWasmSession(alloc, session) catch {
-                session.model = previous_model;
-                alloc.free(next_model);
-                return state.writer.writeError(alloc, msg.id, .{
-                    .code = ErrorCode.internal_error,
-                    .message = "Failed to persist session model",
+                    .code = if (err == error.InvalidDurableField)
+                        ErrorCode.invalid_params
+                    else
+                        ErrorCode.internal_error,
+                    .message = if (err == error.InvalidDurableField)
+                        "Invalid session model"
+                    else
+                        "Failed to persist session model",
                 });
             };
-            alloc.free(previous_model);
-        } else commitActiveSessionModel(
-            alloc,
-            session,
-            value,
-        ) catch |err| {
-            return state.writer.writeError(alloc, msg.id, .{
-                .code = if (err == error.InvalidDurableField)
-                    ErrorCode.invalid_params
-                else
-                    ErrorCode.internal_error,
-                .message = if (err == error.InvalidDurableField)
-                    "Invalid session model"
-                else
-                    "Failed to persist session model",
-            });
+            pointWebSearchAtSession(state);
+            break :blk dropUnsupportedSpeeds(state, alloc, msg, session);
         };
-        pointWebSearchAtSession(state);
-        if (!try dropUnsupportedSpeeds(state, alloc, msg, session)) return;
+        // The write succeeded: the model has changed, so the PostModelSwitch hooks hear of it.
+        if (!std.mem.eql(u8, old_model, value)) announceModelSwitch(state, alloc, session, old_model, value);
+        if (!try speeds_kept) return;
     } else if (std.mem.eql(u8, config_id, "provider")) {
         const parsed_provider = model_provider.parse(value) orelse
             return state.writer.writeError(alloc, msg.id, .{
@@ -4529,6 +4584,66 @@ pub fn applySessionMode(registry: mode_registry.Registry, session: *ActiveSessio
     return mode;
 }
 
+/// The lifecycle for a setting or model change on `session`, built the way a turn builds its own.
+pub fn connectionLifecycle(state: *ServerState, session: *ActiveSessionState, alloc: Allocator) runtime_lifecycle.LifecycleContext {
+    return .{
+        .view = state.lifecycle_view,
+        .scope = .{
+            .kind = .acp,
+            .workspace_root = session.workspace_root,
+            .session_id = session.session_id,
+        },
+        .outcome_allocator = alloc,
+        .user_hooks = state.hooksRuntime(),
+        .trust_required = true,
+        .libfx = state.cfg.minimal_kernel,
+    };
+}
+
+/// What the PreModelSwitch hooks decided for a model change on this connection, with their notices.
+/// Both live in `arena`. Wasm runs no hooks.
+fn modelSwitchDecision(
+    state: *ServerState,
+    arena: Allocator,
+    alloc: Allocator,
+    session: *ActiveSessionState,
+    old_model: []const u8,
+    new_model: []const u8,
+) runtime_user_hooks.ChangeDecision {
+    if (comptime host_target.is_wasm) return .{};
+    return runtime_user_hooks.preModelSwitch(connectionLifecycle(state, session, alloc), arena, old_model, new_model);
+}
+
+/// Tells the PostModelSwitch hooks that a model change on this connection was made.
+fn announceModelSwitch(state: *ServerState, alloc: Allocator, session: *ActiveSessionState, old_model: []const u8, new_model: []const u8) void {
+    if (comptime host_target.is_wasm) return;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const notices = runtime_user_hooks.postModelSwitch(connectionLifecycle(state, session, alloc), arena_state.allocator(), old_model, new_model);
+    prompt_handler.sendSettingsHookNotices(state, alloc, session.session_id, notices);
+}
+
+/// What the ConfigChange hooks decided for a permission-mode change on this connection, with their
+/// notices. Both live in `arena`. Wasm runs no hooks.
+fn permissionModeDecision(
+    state: *ServerState,
+    arena: Allocator,
+    alloc: Allocator,
+    session: *ActiveSessionState,
+    old: types.PermissionMode,
+    new: types.PermissionMode,
+) runtime_user_hooks.ChangeDecision {
+    if (comptime host_target.is_wasm) return .{};
+    return runtime_user_hooks.configChange(
+        connectionLifecycle(state, session, alloc),
+        arena,
+        "permissions",
+        "permission_mode",
+        permissions.permissionModeLabel(old),
+        permissions.permissionModeLabel(new),
+    );
+}
+
 /// Applies a client's mode choice to the active session and saves it as the
 /// profile's permission mode, like the CLI's /permissions. Writes an error
 /// and returns false for a mode the registry does not list.
@@ -4539,6 +4654,27 @@ fn selectSessionMode(
     session: *ActiveSessionState,
     id: []const u8,
 ) !bool {
+    // Naming the mode changes nothing, so an unknown or refused mode leaves the session as it was.
+    const spec = state.cfg.mode_registry.lookup(id) orelse {
+        try state.writer.writeError(alloc, msg.id, .{ .code = ErrorCode.invalid_params, .message = "Unknown mode" });
+        return false;
+    };
+    // The hook runs outside the authority mutex, so a slow hook never holds it.
+    const current = blk: {
+        state.subagent_authority_mutex.lockUncancelable(io_mod.getIo());
+        defer state.subagent_authority_mutex.unlock(io_mod.getIo());
+        break :blk session.permission_mode;
+    };
+    if (spec.permission_mode != current) {
+        var arena_state = std.heap.ArenaAllocator.init(alloc);
+        defer arena_state.deinit();
+        const decision = permissionModeDecision(state, arena_state.allocator(), alloc, session, current, spec.permission_mode);
+        prompt_handler.sendSettingsHookNotices(state, alloc, session.session_id, decision.notices);
+        if (decision.refusal) |notice| {
+            try state.writer.writeError(alloc, msg.id, .{ .code = ErrorCode.invalid_params, .message = notice });
+            return false;
+        }
+    }
     const applied = blk: {
         state.subagent_authority_mutex.lockUncancelable(io_mod.getIo());
         defer state.subagent_authority_mutex.unlock(io_mod.getIo());

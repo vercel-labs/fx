@@ -2,6 +2,7 @@ const std = @import("std");
 const skill_contract = @import("../skills/skill_contract.zig");
 const skill_invocation = @import("../skills/skill_invocation.zig");
 const agent_runtime = @import("../agent/agent_runtime.zig");
+const runtime_lifecycle = @import("../agent/runtime/lifecycle.zig");
 const worker_runtime = @import("../agent/worker_runtime.zig");
 const auth_runtime = @import("../auth/auth_runtime.zig");
 const credentials = @import("../auth/credentials.zig");
@@ -79,6 +80,10 @@ pub const Config = struct {
     /// The parent's capture target while `experimental.workspace_capture` is
     /// on; the child's own session receives its captures (D98).
     workspace_capture: ?turn_capture.Target = null,
+    /// The parent's hooks runtime, or null when hooks run nowhere on this surface.
+    user_hooks: ?*runtime_lifecycle.UserHooksRuntime = null,
+    /// Whether only hooks a person trusted may run here. Always true in production; the default is the safe value.
+    hooks_trust_required: bool = true,
 };
 
 const Context = struct {
@@ -323,6 +328,8 @@ pub fn run(
                 .subagent_id = trace_context.subagent_id,
             },
             .outcome_allocator = turn.alloc,
+            .user_hooks = config.user_hooks,
+            .trust_required = config.hooks_trust_required,
         },
         .{
             .system_prompt = child_system_prompt,

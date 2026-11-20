@@ -13,6 +13,9 @@ pub const PendingPhase = enum {
     awaiting_adoption,
     adopted,
     awaiting_auth,
+    /// The prompt is adopted and waits for a setting change's ConfigChange check to finish (R2.1). Nothing starts
+    /// until the check is applied, and the turn-start hold stays with the prompt.
+    awaiting_hook_check,
     queued,
 };
 

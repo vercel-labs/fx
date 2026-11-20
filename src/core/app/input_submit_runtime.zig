@@ -303,6 +303,20 @@ pub fn SubmitRuntime(comptime App: type) type {
                 };
                 pending = &agent.submission.pending.?;
             }
+            // A prompt that parked for a setting change's hook check continues once the check has finished. The gate
+            // clears its pending change only in `take`, and the finish applies the result before this runs (R2.1).
+            if (pending.phase == .awaiting_hook_check) {
+                if (holdsForHookCheck(app)) return;
+                pending.phase = .adopted;
+                debug_trace.eventf(
+                    "input",
+                    "pending_prompt_hook_check_released",
+                    .{ .turn_id = pending.draft.turn_id },
+                    "",
+                    .{},
+                );
+                app.shell.render_requests.request(.footer);
+            }
             if (pending.phase != .adopted) return;
 
             if (!pending.credential_admitted) {
@@ -363,6 +377,20 @@ pub fn SubmitRuntime(comptime App: type) type {
                 if (readiness == .pending) return;
             }
 
+            // A setting change waits for its hooks (R2.1). The prompt waits with it, and nothing starts. The turn-start hold
+            // stays with the prompt, so no turn begins before the check is applied.
+            if (holdsForHookCheck(app)) {
+                pending.phase = .awaiting_hook_check;
+                debug_trace.eventf(
+                    "input",
+                    "pending_prompt_awaiting_hook_check",
+                    .{ .turn_id = pending.draft.turn_id },
+                    "",
+                    .{},
+                );
+                app.shell.render_requests.request(.footer);
+                return;
+            }
             if (pending.draft.prompt.len > 0 and pending.draft.images.len == 0) {
                 recordAcceptedInput(app, pending.draft.prompt);
             }
@@ -634,7 +662,8 @@ pub fn SubmitRuntime(comptime App: type) type {
             if (comptime agents.hasAgentField(App, "submission")) {
                 if (agents.screenAgentOf(app).submission.compaction_pending and !pendingAuthRoutesLocalCommand(app, agents.screenAgentOf(app))) return;
                 if (agents.screenAgentOf(app).submission.pending) |pending| {
-                    const route_local_command = pending.phase == .awaiting_auth and
+                    // A held prompt, for a credential or a hook check, lets a local command run, as the credential hold does.
+                    const route_local_command = (pending.phase == .awaiting_auth or pending.phase == .awaiting_hook_check) and
                         pendingAuthRoutesLocalCommand(app, agents.screenAgentOf(app));
                     if (!route_local_command and
                         pending.phase == .awaiting_auth and
@@ -957,6 +986,13 @@ pub fn SubmitRuntime(comptime App: type) type {
         fn acceptedPromptNeedsImmediateFooter(_: *const App, agent: *const AppAgent) bool {
             if (comptime agents.hasAgentField(App, "stream")) return agent.stream.active;
             return true;
+        }
+
+        /// Whether a setting change waits for its ConfigChange check, so a submitted prompt waits too (R2.1). An App
+        /// without a hook gate never waits.
+        fn holdsForHookCheck(app: *App) bool {
+            if (comptime !@hasField(App, "hook_gate")) return false;
+            return app.hook_gate.isPending();
         }
 
         fn preflightPrompt(app: *App, agent: *AppAgent) !bool {
@@ -2063,6 +2099,25 @@ test "pending submission phase methods keep hold ownership explicit" {
     try std.testing.expectEqual(@as(u64, 41), pending.draft.turn_id);
     try std.testing.expectEqualStrings("use $review", pending.draft.prompt);
     try std.testing.expectEqual(@as(usize, 1), pending.draft.skill_display_spans.len);
+}
+
+test "a prompt parked for a hook check keeps its turn-start hold and cannot queue until adopted again" {
+    const alloc = std.testing.allocator;
+    var pending = PendingSubmission.init(try buildPendingPromptDraft(alloc, 42, "wait for the check", &.{}, &.{}));
+    defer pending.deinit(alloc);
+
+    try std.testing.expect(pending.markFrameCommitted());
+    try pending.markAdopted();
+    // The runtime parks an adopted prompt in this phase while a setting change waits for its hooks.
+    pending.phase = .awaiting_hook_check;
+    try std.testing.expect(pending.ownsTurnStartHold());
+    try std.testing.expect(!pending.markQueued());
+    try std.testing.expectError(error.InvalidPendingPhase, pending.markAdopted());
+
+    // Released after the check is applied, it queues like any adopted prompt.
+    pending.phase = .adopted;
+    try std.testing.expect(pending.markQueued());
+    try std.testing.expect(!pending.ownsTurnStartHold());
 }
 
 fn checkPendingDraftConstructionAllocationFailure(alloc: std.mem.Allocator) !void {

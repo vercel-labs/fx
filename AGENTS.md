@@ -84,6 +84,8 @@ Key rules:
 
 * `src/mcp/` is the MCP engine. Its files import only `std` and each other, and the host passes in `std.Io` and every other service through `src/mcp/host.zig`. fx connects to it through `src/core/mcp_host/`. `src/core/mcp/` holds the MCP types, config parsing, schema checks, search, and tool naming that the host, the tools, ACP, and the UI share.
 
+* `src/hooks/` is the hooks engine. It parses hook files, matches hooks to fx events, runs them through its host, and merges their answers into one outcome. Its files import only `std` and each other, the host passes in every service through `src/hooks/host.zig`, and outside code imports only its front door, `hooks.zig`. `scripts/check-hooks-boundary.sh` enforces this in CI.
+
 * `src/tools/` owns built-in tool implementations. Generic tool contracts and dispatch live in `src/core/tooling/`. Default tool specs are centralized in `src/core/tooling/tool_specs.zig` or `src/builtins/tools.zig`, not in individual tool files.
 
 * `src/ui/` owns terminal rendering, event loop, input, transcript. It must not own product state.

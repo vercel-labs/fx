@@ -581,6 +581,10 @@ pub fn composeHintRow(
         ctx.waiting_note
     else if (ctx.upgrade_status.len > 0)
         ctx.upgrade_status
+    else if (ctx.gate_status.len > 0)
+        ctx.gate_status
+    else if (ctx.hook_status.len > 0)
+        ctx.hook_status
     else if (ctx.mcp_status.len > 0)
         ctx.mcp_status
     else

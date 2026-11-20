@@ -143,30 +143,46 @@ export function normalizeModelChoice(options) {
   };
 }
 
+// Checks the observer given as `observe`, or as `hooks` (its deprecated name), and returns it
+// normalized, or undefined when neither is given. Error texts name the option the caller used.
+function normalizeObserve(options) {
+  if (options.observe !== undefined && options.hooks !== undefined) {
+    throw new TypeError("pass observe or hooks, not both; hooks is the old name of observe");
+  }
+  const name = options.observe === undefined ? "hooks" : "observe";
+  const observer = options.observe === undefined ? options.hooks : options.observe;
+  if (observer === undefined) return undefined;
+  if (!observer || typeof observer !== "object" || Array.isArray(observer) || typeof observer.onEvent !== "function") {
+    throw new TypeError(`${name} must be an object with onEvent()`);
+  }
+  if (observer.onError !== undefined && typeof observer.onError !== "function") throw new TypeError(`${name}.onError must be a function`);
+  if (observer.captureContent !== undefined && typeof observer.captureContent !== "boolean") throw new TypeError(`${name}.captureContent must be a boolean`);
+  const normalized = {
+    captureContent: observer.captureContent === true,
+    onEvent: observer.onEvent.bind(observer),
+    ...(observer.onError === undefined ? {} : { onError: observer.onError.bind(observer) }),
+    ...(observer.parent === undefined ? {} : { parent: { ...observer.parent } }),
+  };
+  if (normalized.parent !== undefined) {
+    for (const field of ["rootSessionId", "sessionId", "turnId", "callId"]) {
+      const id = normalized.parent[field];
+      if (typeof id !== "string" || id.length === 0 || id.length > 1024) throw new TypeError(`${name}.parent.${field} must be a bounded identity`);
+    }
+  }
+  return normalized;
+}
+
 export function normalizeAgentOptions(value) {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     throw new TypeError("createFxEngine() options must be an object");
   }
   const options = { ...value };
-  if (options.hooks !== undefined) {
-    const hooks = options.hooks;
-    if (!hooks || typeof hooks !== "object" || Array.isArray(hooks) || typeof hooks.onEvent !== "function") {
-      throw new TypeError("hooks must be an object with onEvent()");
-    }
-    if (hooks.onError !== undefined && typeof hooks.onError !== "function") throw new TypeError("hooks.onError must be a function");
-    if (hooks.captureContent !== undefined && typeof hooks.captureContent !== "boolean") throw new TypeError("hooks.captureContent must be a boolean");
-    options.hooks = {
-      captureContent: hooks.captureContent === true,
-      onEvent: hooks.onEvent.bind(hooks),
-      ...(hooks.onError === undefined ? {} : { onError: hooks.onError.bind(hooks) }),
-      ...(hooks.parent === undefined ? {} : { parent: { ...hooks.parent } }),
-    };
-    if (options.hooks.parent !== undefined) {
-      for (const name of ["rootSessionId", "sessionId", "turnId", "callId"]) {
-        if (typeof options.hooks.parent[name] !== "string" || options.hooks.parent[name].length === 0 || options.hooks.parent[name].length > 1024) throw new TypeError(`hooks.parent.${name} must be a bounded identity`);
-      }
-    }
-  }
+  // `observe` is the option's name. Both names normalize into the one `options.hooks` that the
+  // wire code reads, so the protocol with the core keeps its existing names.
+  const observer = normalizeObserve(options);
+  delete options.observe;
+  if (observer === undefined) delete options.hooks;
+  else options.hooks = observer;
   if (Object.hasOwn(options, "env")) {
     throw new TypeError("createFxEngine() does not accept env; pass apiKey and model directly");
   }

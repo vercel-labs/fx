@@ -820,6 +820,7 @@ for (const propagateCorrelation of [false, true]) {
     assert.ok(contexts[0].observation, "ending a descendant must retain another execution's scope");
     assert.equal(contexts[0].sessionId, "child-root");
     assert.equal(contexts[0].observation.childHooks().parent.sessionId, "child-root");
+    assert.deepEqual(contexts[0].observation.childObserve(), contexts[0].observation.childHooks());
     emit({
       type: "turn.end",
       executionId: "root-scope",
@@ -878,6 +879,37 @@ for (const propagateCorrelation of [false, true]) {
   assert.equal(await pending, accepted);
   assert.equal(calls, 1);
   assert.equal(eventsOf(events, "wait.end").length, 1);
+}
+
+// `observe` is the option's name. `hooks` still works and delivers the same events. Both names
+// together, and a bad `observe`, are refused with a message that names the option.
+{
+  const runWith = async (option) => {
+    const events = [];
+    const mock = gateway([answer("same events")]);
+    const engine = await createFxEngine({
+      ...base,
+      fetch: mock.fetch,
+      [option]: {
+        onEvent: (event) => {
+          events.push(event);
+        },
+      },
+    });
+    const result = (await drain(engine.prompt("observe me", { turnId: "observe-turn" }))).result;
+    assert.equal(result.stopReason, "end_turn");
+    return events.map((event) => event.type);
+  };
+  const observed = await runWith("observe");
+  assert.ok(observed.includes("turn.start"));
+  assert.deepEqual(await runWith("hooks"), observed);
+  await assert.rejects(
+    createFxEngine({ ...base, hooks: { onEvent() {} }, observe: { onEvent() {} } }),
+    new TypeError("pass observe or hooks, not both; hooks is the old name of observe"),
+  );
+  for (const observe of [null, {}, { onEvent: true }, { onEvent() {}, captureContent: "yes" }, { onEvent() {}, onError: true }]) {
+    await assert.rejects(createFxEngine({ ...base, observe }), /observe/);
+  }
 }
 
 for (const hooks of [

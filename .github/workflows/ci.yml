@@ -66,6 +66,9 @@ jobs:
       - name: Check recovery boundary
         run: ./scripts/check-recovery-boundary.sh
 
+      - name: Check hooks boundary
+        run: ./scripts/check-hooks-boundary.sh
+
       - name: Model-check request recovery
         run: |
           set -euo pipefail
@@ -85,6 +88,8 @@ jobs:
 
       - name: Model-check the compaction row's number
         run: TLA2TOOLS_JAR="$RUNNER_TEMP/tla2tools.jar" tests/tla/compaction_progress/check.sh
+      - name: Model-check one turn with user hooks and its planted bugs
+        run: TLA2TOOLS_JAR="$RUNNER_TEMP/tla2tools.jar" tests/tla/hooks/check.sh
 
       - name: Setup Bun
         uses: oven-sh/setup-bun@v2
@@ -1060,6 +1065,7 @@ jobs:
             benchmarks/startup.sh
             scripts/check-agents-boundary.sh
             scripts/check-compactor-boundary.sh
+            scripts/check-hooks-boundary.sh
             scripts/check-indexer-boundary.sh
             scripts/check-public-surface.sh
             scripts/check-recovery-boundary.sh

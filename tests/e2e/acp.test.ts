@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { EventEmitter } from "node:events";
 import { afterEach, describe, expect, test } from "bun:test";
-import { processAlive } from "./process-alive";
+import { processAlive, processGroupAlive } from "./process-alive";
 import { createConfiguredProviderFixture, completion as configuredCompletion, toolCompletion as configuredToolCompletion } from "./fixtures/chat-completions";
 import { spawn as nodeSpawn, type ChildProcess } from "node:child_process";
 import {
@@ -211,6 +211,17 @@ function tokenPassCreditsReply(hasPass: boolean) {
   return (url: URL) => url.pathname === "/coding-agent/v1/credits"
     ? Response.json({ balance: "5.00", token_pass: hasPass ? { remaining: "79.92906" } : null })
     : null;
+}
+
+// Trusts the workspace's project hooks, as a person does with `fx hook trust --all`. An ACP session
+// runs only trusted hooks, so a test that expects a hook to run trusts it before the session starts.
+async function trustProjectHooks(root: ReturnType<typeof createIsolatedRoot>) {
+  const result = await runFx(["hook", "trust", "--all"], {
+    cwd: root.workspace,
+    env: { HOME: root.home, AI_AGENT: undefined, FX_AUTO_UPGRADE: "0", FX_SOUND: "0" },
+    timeoutMs: TIMEOUT,
+  });
+  expect(result.code).toBe(0);
 }
 
 function fakeGatewayEnv(
@@ -740,6 +751,12 @@ class AcpClient {
 
   get closed(): boolean {
     return this._closed;
+  }
+
+  // The pid of the fx process this client started, for a test that signals it.
+  get processId(): number {
+    if (!this.proc.pid) throw new Error("fx acp has no process id");
+    return this.proc.pid;
   }
 
   setPermissionOption(optionId: "allow_once" | "allow_always" | "reject_once"): void {
@@ -3818,6 +3835,504 @@ describe("acp: model-independent", () => {
           httpFixture.stop();
           rmSync(root.root, { recursive: true, force: true });
         }
+      }
+    },
+    LIVE_TIMEOUT,
+  );
+
+  test(
+    "a failing hook reaches an editor that shows notices as an ACP v1 warning notice naming the hook",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-hook-notices-");
+      writeFileSync(join(root.home, ".fx", "settings.json"), JSON.stringify({ experimental: { hooks: true } }));
+      mkdirSync(join(root.workspace, ".fx"), { recursive: true });
+      writeFileSync(
+        join(root.workspace, ".fx", "hooks.json"),
+        JSON.stringify({
+          hooks: {
+            PostToolUse: [
+              {
+                matcher: "shell",
+                hooks: [{ type: "command", command: "echo 'hook broke' >&2; exit 1", id: "fail-open" }],
+              },
+            ],
+          },
+        }),
+      );
+      await trustProjectHooks(root);
+      const gateway = startFakeGateway([
+        fakeGatewayToolCall("call_hook_shell", "shell", { command: "echo hi" }),
+        finalText("hook notice complete"),
+      ]);
+      try {
+        client = await AcpClient.create({
+          cwd: root.workspace,
+          env: { ...fakeGatewayEnv(root, gateway) },
+          args: ["acp"],
+        });
+        await client.request("initialize", { protocolVersion: 1, clientCapabilities: { session: { notices: {} } } }, 1);
+        const created = (await client.request("session/new", { cwd: root.workspace, mcpServers: [] }, 2)) as any;
+        expect(created.error).toBeUndefined();
+        await client.readLine();
+        await client.request("session/set_mode", { modeId: "auto" }, 3);
+        const prompt = await runPrompt(client, "Run a shell command.", TIMEOUT);
+        expect(prompt.promptResult.result.stopReason).toBe("end_turn");
+        const updates = prompt.messages.map((message) => message.params?.update).filter(Boolean);
+        const failure = updates
+          .filter((update) => update.sessionUpdate === "notice")
+          .find((notice) => String(notice.title).includes("fail-open"));
+        expect(failure?.severity).toBe("warning");
+        expect(failure?.title).toContain("exited with code 1");
+        // The notice is a Session Notice, not agent text.
+        const texts = updates
+          .filter((update) => update.sessionUpdate === "agent_message_chunk")
+          .map((update) => update.content?.text ?? "");
+        expect(texts.join("")).not.toContain("fail-open");
+      } finally {
+        await client?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    LIVE_TIMEOUT,
+  );
+
+  test(
+    "a PreToolUse hook denies a shell call in an ACP session",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-hook-deny-");
+      writeFileSync(join(root.home, ".fx", "settings.json"), JSON.stringify({ experimental: { hooks: true } }));
+      mkdirSync(join(root.workspace, ".fx"), { recursive: true });
+      const marker = join(root.workspace, "acp-marker");
+      const hookRan = join(root.workspace, "acp-hook-ran");
+      writeFileSync(
+        join(root.workspace, ".fx", "hooks.json"),
+        JSON.stringify({
+          hooks: {
+            PreToolUse: [
+              {
+                matcher: "shell",
+                hooks: [{ type: "command", command: `touch '${hookRan}'; echo 'no shell over acp' >&2; exit 2` }],
+              },
+            ],
+          },
+        }),
+      );
+      await trustProjectHooks(root);
+      // full-access: no permission prompt or review, so only the hook can stop the call.
+      const gateway = startFakeGateway([
+        fakeGatewayToolCall("call_acp_deny", "shell", { command: `touch '${marker}'` }),
+        finalText("the shell call was refused"),
+      ]);
+      try {
+        client = await AcpClient.create({
+          cwd: root.workspace,
+          env: { ...fakeGatewayEnv(root, gateway), FX_SOUND: "0" },
+          args: ["acp"],
+        });
+        await client.request("initialize", { protocolVersion: 1, clientCapabilities: { session: { notices: {} } } }, 1);
+        const created = (await client.request("session/new", { cwd: root.workspace, mcpServers: [] }, 2)) as any;
+        expect(created.error).toBeUndefined();
+        await client.readLine();
+        await client.request("session/set_mode", { modeId: "full-access" }, 3);
+        const prompt = await runPrompt(client, "Create the marker with the shell tool.", TIMEOUT);
+        expect(prompt.promptResult.result.stopReason).toBe("end_turn");
+        expect(existsSync(hookRan)).toBe(true);
+        expect(existsSync(marker)).toBe(false);
+        const updates = prompt.messages.map((message) => message.params?.update).filter(Boolean);
+        const toolUpdates = updates.filter((update) => update.sessionUpdate === "tool_call_update" && update.toolCallId === "call_acp_deny");
+        expect(toolUpdates.at(-1)?.status).toBe("failed");
+        const notice = updates.find((update) => update.sessionUpdate === "notice" && String(update.title).includes("blocked shell: no shell over acp"));
+        expect(notice?.severity).toBe("warning");
+        expect(gateway.requests).toHaveLength(2);
+        expect(gateway.requests[1]!.body).toContain("no shell over acp");
+      } finally {
+        await client?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    LIVE_TIMEOUT,
+  );
+
+  test(
+    "an untrusted project PreToolUse hook does not run in an ACP session",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-hook-untrusted-");
+      writeFileSync(join(root.home, ".fx", "settings.json"), JSON.stringify({ experimental: { hooks: true } }));
+      mkdirSync(join(root.workspace, ".fx"), { recursive: true });
+      const marker = join(root.workspace, "acp-untrusted-marker");
+      const hookRan = join(root.workspace, "acp-untrusted-hook-ran");
+      writeFileSync(
+        join(root.workspace, ".fx", "hooks.json"),
+        JSON.stringify({
+          hooks: {
+            PreToolUse: [
+              {
+                matcher: "shell",
+                hooks: [{ type: "command", command: `touch '${hookRan}'; echo 'no shell over acp' >&2; exit 2` }],
+              },
+            ],
+          },
+        }),
+      );
+      // No trust step: the hook waits, so it does not run and the shell call goes ahead.
+      const gateway = startFakeGateway([
+        fakeGatewayToolCall("call_acp_untrusted", "shell", { command: `touch '${marker}'` }),
+        finalText("the shell call ran"),
+      ]);
+      try {
+        client = await AcpClient.create({
+          cwd: root.workspace,
+          env: { ...fakeGatewayEnv(root, gateway), FX_SOUND: "0" },
+          args: ["acp"],
+        });
+        await client.request("initialize", { protocolVersion: 1, clientCapabilities: { session: { notices: {} } } }, 1);
+        const created = (await client.request("session/new", { cwd: root.workspace, mcpServers: [] }, 2)) as any;
+        expect(created.error).toBeUndefined();
+        await client.readLine();
+        await client.request("session/set_mode", { modeId: "full-access" }, 3);
+        const prompt = await runPrompt(client, "Create the marker with the shell tool.", TIMEOUT);
+        expect(prompt.promptResult.result.stopReason).toBe("end_turn");
+        expect(existsSync(hookRan)).toBe(false);
+        expect(existsSync(marker)).toBe(true);
+        const updates = prompt.messages.map((message) => message.params?.update).filter(Boolean);
+        const toolUpdates = updates.filter(
+          (update) => update.sessionUpdate === "tool_call_update" && update.toolCallId === "call_acp_untrusted",
+        );
+        expect(toolUpdates.at(-1)?.status).toBe("completed");
+        expect(gateway.requests).toHaveLength(2);
+        expect(gateway.requests[1]!.body).not.toContain("no shell over acp");
+      } finally {
+        await client?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    LIVE_TIMEOUT,
+  );
+
+  test(
+    "a UserPromptSubmit hook can block a prompt in an ACP session",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-hook-block-");
+      writeFileSync(join(root.home, ".fx", "settings.json"), JSON.stringify({ experimental: { hooks: true } }));
+      mkdirSync(join(root.workspace, ".fx"), { recursive: true });
+      writeFileSync(
+        join(root.workspace, ".fx", "hooks.json"),
+        JSON.stringify({
+          hooks: {
+            UserPromptSubmit: [{ hooks: [{ type: "command", command: "echo 'blocked over acp' >&2; exit 2" }] }],
+          },
+        }),
+      );
+      await trustProjectHooks(root);
+      const gateway = startFakeGateway([finalText("never sent")]);
+      try {
+        client = await AcpClient.create({
+          cwd: root.workspace,
+          env: { ...fakeGatewayEnv(root, gateway), FX_SOUND: "0" },
+          args: ["acp"],
+        });
+        await client.request("initialize", { protocolVersion: 1, clientCapabilities: { session: { notices: {} } } }, 1);
+        const created = (await client.request("session/new", { cwd: root.workspace, mcpServers: [] }, 2)) as any;
+        expect(created.error).toBeUndefined();
+        await client.readLine();
+        const prompt = await runPrompt(client, "Say hello.", TIMEOUT);
+        expect(gateway.requests).toHaveLength(0);
+        const updates = prompt.messages.map((message) => message.params?.update).filter(Boolean);
+        const notice = updates.find((update) => update.sessionUpdate === "notice" && update.title === "A hook blocked this prompt: blocked over acp");
+        expect(notice?.severity).toBe("warning");
+        // The blocked turn answers as a refused prompt, not as a JSON-RPC error.
+        expect(prompt.promptResult.error).toBeUndefined();
+        expect(prompt.promptResult.result).toEqual({ stopReason: "refused", usage: {} });
+      } finally {
+        await client?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    LIVE_TIMEOUT,
+  );
+
+  test(
+    "a SessionStart hook adds context once in an ACP session",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-hook-start-");
+      writeFileSync(join(root.home, ".fx", "settings.json"), JSON.stringify({ experimental: { hooks: true } }));
+      mkdirSync(join(root.workspace, ".fx"), { recursive: true });
+      const countFile = join(root.workspace, "acp-start-count");
+      const output = JSON.stringify({
+        hookSpecificOutput: { hookEventName: "SessionStart", additionalContext: "ACP-START-5" },
+      });
+      writeFileSync(
+        join(root.workspace, ".fx", "hooks.json"),
+        JSON.stringify({
+          hooks: {
+            SessionStart: [{ hooks: [{ type: "command", command: `echo start >> '${countFile}'; printf '%s' '${output}'` }] }],
+          },
+        }),
+      );
+      await trustProjectHooks(root);
+      const gateway = startFakeGateway([finalText("first reply"), finalText("second reply")]);
+      try {
+        client = await AcpClient.create({
+          cwd: root.workspace,
+          env: { ...fakeGatewayEnv(root, gateway), FX_SOUND: "0" },
+          args: ["acp"],
+        });
+        await client.request("initialize", { protocolVersion: 1, clientCapabilities: { session: { notices: {} } } }, 1);
+        const created = (await client.request("session/new", { cwd: root.workspace, mcpServers: [] }, 2)) as any;
+        expect(created.error).toBeUndefined();
+        await client.readLine();
+        const first = await runPrompt(client, "First prompt.", TIMEOUT);
+        expect(first.promptResult.result.stopReason).toBe("end_turn");
+        const second = await runPrompt(client, "Second prompt.", TIMEOUT);
+        expect(second.promptResult.result.stopReason).toBe("end_turn");
+        expect(gateway.requests).toHaveLength(2);
+        for (const request of gateway.requests) expect(request.body).toContain("ACP-START-5");
+        expect(readFileSync(countFile, "utf8").split("\n").filter((line) => line.length > 0)).toHaveLength(1);
+      } finally {
+        await client?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    LIVE_TIMEOUT,
+  );
+
+  test(
+    "a ConfigChange hook refuses a mode change over ACP",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-hook-config-");
+      const settingsPath = join(root.home, ".fx", "settings.json");
+      writeFileSync(settingsPath, JSON.stringify({ experimental: { hooks: true }, permission_mode: "ask" }));
+      mkdirSync(join(root.workspace, ".fx"), { recursive: true });
+      writeFileSync(
+        join(root.workspace, ".fx", "hooks.json"),
+        JSON.stringify({
+          hooks: { ConfigChange: [{ hooks: [{ type: "command", command: "echo 'mode stays' >&2; exit 2" }] }] },
+        }),
+      );
+      await trustProjectHooks(root);
+      const gateway = startFakeGateway([finalText("unused")]);
+      try {
+        client = await AcpClient.create({
+          cwd: root.workspace,
+          env: { ...fakeGatewayEnv(root, gateway), FX_SOUND: "0" },
+          args: ["acp"],
+        });
+        await client.request("initialize", { protocolVersion: 1, clientCapabilities: { session: { notices: {} } } }, 1);
+        const created = (await client.request("session/new", { cwd: root.workspace, mcpServers: [] }, 2)) as any;
+        expect(created.error).toBeUndefined();
+        await client.readLine();
+        expect(created.result.modes.currentModeId).toBe("ask");
+        // The hook refuses the change; the answer is an invalid-params error with the hook's reason.
+        const refused = (await client.request("session/set_mode", { modeId: "auto" }, 3)) as any;
+        expect(refused.result).toBeUndefined();
+        expect(refused.error).toMatchObject({ code: -32602, message: "A hook refused this setting change: mode stays" });
+        // The mode stays: a new session reads the old mode, and the profile still holds it.
+        const after = (await client.request("session/new", { cwd: root.workspace, mcpServers: [] }, 4)) as any;
+        await client.readLine();
+        expect(after.result.modes.currentModeId).toBe("ask");
+        expect(JSON.parse(readFileSync(settingsPath, "utf8")).permission_mode).toBe("ask");
+      } finally {
+        await client?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    LIVE_TIMEOUT,
+  );
+
+  test(
+    "a cancel stops a running PreToolUse hook over ACP",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-hook-cancel-");
+      writeFileSync(join(root.home, ".fx", "settings.json"), JSON.stringify({ experimental: { hooks: true } }));
+      mkdirSync(join(root.workspace, ".fx"), { recursive: true });
+      const pidFile = join(root.workspace, "hook.pid");
+      const childPidFile = join(root.workspace, "child.pid");
+      const marker = join(root.workspace, "acp-cancel-marker");
+      // The hook starts a background child and waits for it. The cancel must end the hook and the child:
+      // the child is in the hook's process group, which fx kills (process.zig, the kill of -pid).
+      writeFileSync(
+        join(root.workspace, ".fx", "hooks.json"),
+        JSON.stringify({
+          hooks: {
+            PreToolUse: [
+              {
+                matcher: "shell",
+                hooks: [
+                  {
+                    type: "command",
+                    command: `sleep 30 & echo $! > '${childPidFile}'; echo $$ > '${pidFile}'; wait`,
+                    timeout: 60,
+                  },
+                ],
+              },
+            ],
+          },
+        }),
+      );
+      await trustProjectHooks(root);
+      // full-access: no permission prompt or review, so the running hook is the only thing the call waits on.
+      const gateway = startFakeGateway([
+        fakeGatewayToolCall("call_acp_cancel", "shell", { command: `touch '${marker}'` }),
+        finalText("never reached"),
+      ]);
+      try {
+        client = await AcpClient.create({
+          cwd: root.workspace,
+          env: { ...fakeGatewayEnv(root, gateway), FX_SOUND: "0" },
+          args: ["acp"],
+        });
+        await client.request("initialize", { protocolVersion: 1, clientCapabilities: { session: { notices: {} } } }, 1);
+        const created = (await client.request("session/new", { cwd: root.workspace, mcpServers: [] }, 2)) as any;
+        expect(created.error).toBeUndefined();
+        const sessionId = created.result.sessionId as string;
+        await client.readLine();
+        await client.request("session/set_mode", { modeId: "full-access" }, 3);
+
+        const promptId = 40;
+        sendPrompt(client, promptId, "Create the marker with the shell tool.");
+        // The hook writes its pid before it sleeps: wait for that file, not for a fixed time.
+        await waitForPath(pidFile, TIMEOUT);
+        const pid = Number(readFileSync(pidFile, "utf8").trim());
+        const childPid = Number(readFileSync(childPidFile, "utf8").trim());
+        expect(processAlive(pid)).toBe(true);
+        expect(processAlive(childPid)).toBe(true);
+
+        const cancelledAt = Date.now();
+        client.send({ jsonrpc: "2.0", method: "session/cancel", params: { sessionId } });
+        const response = await readResponse(client, promptId, TIMEOUT);
+        expect(Date.now() - cancelledAt).toBeLessThan(10_000);
+        expect(response.error).toBeUndefined();
+        expect(response.result.stopReason).toBe("cancelled");
+        // The hook process ends with the turn: poll for it, with a deadline.
+        await waitForCondition("the cancelled hook process to end", () => !processAlive(pid), 5_000);
+        await waitForCondition("the hook's background child to end", () => !processAlive(childPid), 5_000);
+        expect(existsSync(marker)).toBe(false);
+      } finally {
+        await client?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    LIVE_TIMEOUT,
+  );
+
+  test(
+    "a SIGTERM to fx acp ends a running PreToolUse hook and its process group",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-hook-signal-");
+      writeFileSync(join(root.home, ".fx", "settings.json"), JSON.stringify({ experimental: { hooks: true } }));
+      mkdirSync(join(root.workspace, ".fx"), { recursive: true });
+      const pidFile = join(root.workspace, "hook.pid");
+      const marker = join(root.workspace, "acp-signal-marker");
+      writeFileSync(
+        join(root.workspace, ".fx", "hooks.json"),
+        JSON.stringify({
+          hooks: {
+            PreToolUse: [
+              {
+                matcher: "shell",
+                hooks: [{ type: "command", command: `echo $$ > '${pidFile}'; exec sleep 30`, timeout: 60 }],
+              },
+            ],
+          },
+        }),
+      );
+      await trustProjectHooks(root);
+      const gateway = startFakeGateway([
+        fakeGatewayToolCall("call_acp_signal", "shell", { command: `touch '${marker}'` }),
+        finalText("never reached"),
+      ]);
+      try {
+        client = await AcpClient.create({
+          cwd: root.workspace,
+          env: { ...fakeGatewayEnv(root, gateway), FX_SOUND: "0" },
+          args: ["acp"],
+        });
+        await client.request("initialize", { protocolVersion: 1, clientCapabilities: { session: { notices: {} } } }, 1);
+        const created = (await client.request("session/new", { cwd: root.workspace, mcpServers: [] }, 2)) as any;
+        expect(created.error).toBeUndefined();
+        await client.readLine();
+        await client.request("session/set_mode", { modeId: "full-access" }, 3);
+
+        sendPrompt(client, 40, "Create the marker with the shell tool.");
+        // The hook writes its pid before it sleeps: wait for that file, with a deadline.
+        await waitForPath(pidFile, TIMEOUT);
+        const pid = Number(readFileSync(pidFile, "utf8").trim());
+        expect(processGroupAlive(pid)).toBe(true);
+
+        const fxPid = client.processId;
+        process.kill(fxPid, "SIGTERM");
+        await waitForCondition("fx acp to end", () => !processAlive(fxPid), 10_000);
+        await waitForCondition("the hook's process group to end", () => !processGroupAlive(pid), 5_000);
+        expect(existsSync(marker)).toBe(false);
+      } finally {
+        await client?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    LIVE_TIMEOUT,
+  );
+
+  test(
+    "a hook with unreadable output fails open over ACP",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-hook-open-");
+      writeFileSync(join(root.home, ".fx", "settings.json"), JSON.stringify({ experimental: { hooks: true } }));
+      mkdirSync(join(root.workspace, ".fx"), { recursive: true });
+      const marker = join(root.workspace, "acp-open-marker");
+      writeFileSync(
+        join(root.workspace, ".fx", "hooks.json"),
+        JSON.stringify({
+          hooks: {
+            // fx reads output that starts with `{` and ends with `}` as JSON (protocol.zig readOutput); this is
+            // JSON-shaped and not parseable, so it is unreadable output. Output without the closing brace is ignored.
+            PreToolUse: [{ matcher: "shell", hooks: [{ type: "command", command: "printf '%s' '{not json}'" }] }],
+          },
+        }),
+      );
+      await trustProjectHooks(root);
+      const gateway = startFakeGateway([
+        fakeGatewayToolCall("call_acp_open", "shell", { command: `touch '${marker}'` }),
+        finalText("the call went on"),
+      ]);
+      try {
+        client = await AcpClient.create({
+          cwd: root.workspace,
+          env: { ...fakeGatewayEnv(root, gateway), FX_SOUND: "0" },
+          args: ["acp"],
+        });
+        await client.request("initialize", { protocolVersion: 1, clientCapabilities: { session: { notices: {} } } }, 1);
+        const created = (await client.request("session/new", { cwd: root.workspace, mcpServers: [] }, 2)) as any;
+        expect(created.error).toBeUndefined();
+        await client.readLine();
+        await client.request("session/set_mode", { modeId: "full-access" }, 3);
+
+        const prompt = await runPrompt(client, "Create the marker with the shell tool.", TIMEOUT);
+        expect(prompt.promptResult.result.stopReason).toBe("end_turn");
+        // The unreadable answer does not stop the call: the marker exists and the call completed.
+        expect(existsSync(marker)).toBe(true);
+        const updates = prompt.messages.map((message) => message.params?.update).filter(Boolean);
+        const toolUpdates = updates.filter((update) => update.sessionUpdate === "tool_call_update" && update.toolCallId === "call_acp_open");
+        expect(toolUpdates.at(-1)?.status).toBe("completed");
+        const notice = updates.find(
+          (update) =>
+            update.sessionUpdate === "notice" &&
+            update.severity === "warning" &&
+            String(update.title).includes("returned output fx could not read"),
+        );
+        expect(notice).toBeDefined();
+        expect(gateway.requests).toHaveLength(2);
+      } finally {
+        await client?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
       }
     },
     LIVE_TIMEOUT,
