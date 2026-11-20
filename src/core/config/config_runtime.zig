@@ -354,6 +354,7 @@ pub fn selectProviderModel(
         .gateway => default_model,
         .codex => run_model orelse return error.CodexModelNotSelected,
         .grok => run_model orelse return error.GrokModelNotSelected,
+        .claude_code => run_model orelse model_provider.claude_code_default_model,
         .configured => run_model orelse return error.ConfiguredModelNotSelected,
     };
     return .{ .provider = provider, .model = model };
@@ -363,7 +364,7 @@ pub fn selectProviderModel(
 /// under "providers". `fx provider` and `fx ask --provider` both print it.
 pub fn unknownProviderMessage(alloc: Allocator, name: []const u8) ![]u8 {
     return alloc.print(
-        "unknown provider {s}; expected gateway, codex, grok, or a name under \"providers\" in {s}",
+        "unknown provider {s}; expected gateway, codex, grok, claude-code, or a name under \"providers\" in {s}",
         .{ name, profile_paths.displayText("~/.fx/settings.json") },
     );
 }

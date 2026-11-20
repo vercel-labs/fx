@@ -206,6 +206,8 @@ const headless_interrupt = if (supports_headless_interrupt) struct {
             }
             if (redeliver and cancel_requested.load(.seq_cst)) {
                 const signal: std.posix.SIG = @fromBackingInt(@intCast(requested_signal.load(.seq_cst)));
+                // The signal ends fx, so the usual exit cleanup runs first.
+                if (!std_builtin.is_test) if (app_lifecycle.close_hook) |hook| hook();
                 _ = std.c.raise(signal);
             }
             coordinator_active = false;
@@ -2152,8 +2154,9 @@ fn maybeStartAskTitleTask(
     } else provider_title_model;
     const agent_stream = bundle.agent_stream orelse return null;
     const excerpt = session_title_generation.promptExcerpt(prompt) orelse return null;
-    // A custom connection may need no key; its adapter checks the one it gets.
-    if (ctx.credential_source != .host_managed and ctx.credential_source != .configured and ctx.api_key.len == 0) return null;
+    // A custom connection may need no key; its adapter checks the one it
+    // gets. Claude Code keeps its own sign-in.
+    if (ctx.credential_source != .host_managed and ctx.credential_source != .configured and ctx.credential_source != .claude_code and ctx.api_key.len == 0) return null;
     const task = session_title_generation.Task.create(.{
         .session_id = session_id,
         .model = title_model,

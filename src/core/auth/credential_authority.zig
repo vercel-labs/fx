@@ -27,6 +27,7 @@ pub fn derive(
         .stored_key,
         .host_managed,
         .configured,
+        .claude_code,
         => hash.update("\x00slot\x00"),
         .chatgpt_subscription,
         .grok_subscription,

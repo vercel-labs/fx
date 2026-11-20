@@ -1011,6 +1011,41 @@ test(
 );
 
 test(
+  "fx logout claude-code keeps the fx login and points to Claude Code's own sign-out",
+  async () => {
+    const home = mkdtempSync(join(tmpdir(), "fx-auth-claude-code-logout-e2e-"));
+    const issuer = startFakeOAuth([ISSUER_A_ACCESS_TOKEN]);
+    writeFxLogin(home, issuer.issuerUrl);
+    const authPath = join(home, ".fx", "auth.json");
+    const saved = readFileSync(authPath, "utf8");
+
+    try {
+      const logout = await runFx(["logout", "claude-code"], {
+        env: {
+          HOME: home,
+          AI_GATEWAY_API_KEY: undefined,
+          VERCEL_OIDC_TOKEN: undefined,
+          FX_DISABLE_KEYCHAIN: "1",
+          FX_TEST_OAUTH_ISSUER_URL: issuer.issuerUrl,
+        },
+        timeoutMs: TIMEOUT,
+      });
+      expect(logout.code, described(logout)).toBe(0);
+      expect(logout.stdout).toBe(
+        "fx doesn't sign in to Claude, so there is nothing to sign out of here. To sign out of Claude Code, run `claude` and use /logout there.\n",
+      );
+      expect(logout.stderr).toBe("");
+      expect(readFileSync(authPath, "utf8")).toBe(saved);
+      expect(issuer.requests).toEqual([]);
+    } finally {
+      issuer.stop();
+      rmSync(home, { recursive: true, force: true });
+    }
+  },
+  TIMEOUT,
+);
+
+test(
   "OAuth sessions keep using their saved issuer when configuration changes",
   async () => {
     const home = mkdtempSync(join(tmpdir(), "fx-auth-saved-issuer-e2e-"));

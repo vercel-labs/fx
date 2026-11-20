@@ -186,6 +186,7 @@ pub fn Runtime(comptime App: type) type {
                         .gateway => credentials.missing_interactive_credential_message,
                         .codex => credentials.missing_chatgpt_interactive_credential_message,
                         .grok => credentials.missing_grok_interactive_credential_message,
+                        .claude_code => "Claude Code is unavailable. Install `claude` and sign in with /login there.",
                         .configured => "Configured provider authentication is unavailable. Check settings.json and its environment variable.",
                     },
                 }, true),
@@ -279,10 +280,14 @@ pub fn Runtime(comptime App: type) type {
                     try writeAuthNotice(app, .{
                         .topic = "",
                         .tone = .warning,
-                        .body = "usage: /logout [vercel|codex|grok]",
+                        .body = "usage: /logout [vercel|codex|grok|claude-code]",
                     });
                     return;
                 };
+            if (requested_provider != null and requested_provider.? == .claude_code) {
+                try writeAuthNotice(app, .{ .topic = "auth", .tone = .neutral, .body = credentials.claude_code_logout_message });
+                return;
+            }
             try app.flushBeforeBlockingExternalWork();
             const selected_provider: model_provider.ProviderId = if (comptime provider_runtime.supported(App))
                 provider_runtime.providerOf(app, agent)
@@ -1401,6 +1406,11 @@ pub fn Runtime(comptime App: type) type {
             const request = task.input.intent.provider;
             const target = request.target;
             const intent = request.origin;
+            if (task.unavailable) |text| {
+                debug_trace.logf("provider", "target not ready target={t}", .{target});
+                try app.writeDomainNotice(.{ .topic = "provider", .tone = .@"error", .body = text }, true);
+                return false;
+            }
             if (task.failure) |err| {
                 debug_trace.logf("provider", "preparation failed target={t} err={s}", .{ target, @errorName(err) });
                 if (task.credential == null and !hostManagesAuth(app)) {
@@ -1425,7 +1435,7 @@ pub fn Runtime(comptime App: type) type {
                     switch (target) {
                         .codex => try beginCodexSignInForProviderSwitch(app),
                         .grok => try beginGrokSignInForProviderSwitch(app),
-                        .gateway, .configured => {},
+                        .gateway, .claude_code, .configured => {},
                     }
                 }
                 if (target == .gateway or !request.allow_login) {
@@ -2168,6 +2178,7 @@ pub fn Runtime(comptime App: type) type {
                 .stored_key,
                 .host_managed,
                 .configured,
+                .claude_code,
                 => {},
             }
         }
@@ -2223,7 +2234,7 @@ pub fn Runtime(comptime App: type) type {
                 .fx_login => try beginSignIn(app, agent, false),
                 .chatgpt_subscription => try beginChatGptSignIn(app, agent),
                 .grok_subscription => try beginGrokSignIn(app, agent),
-                .vercel_oidc_token, .ai_gateway_api_key, .stored_key, .host_managed, .configured => {},
+                .vercel_oidc_token, .ai_gateway_api_key, .stored_key, .host_managed, .configured, .claude_code => {},
             }
         }
 
@@ -2601,7 +2612,7 @@ test "interactive subscription sign-in rejects active and queued work before OAu
             switch (provider) {
                 .codex => try Runtime(BusySignInApp).beginChatGptSignIn(&app, (&app).agent()),
                 .grok => try Runtime(BusySignInApp).beginGrokSignIn(&app, (&app).agent()),
-                .gateway, .configured => unreachable,
+                .gateway, .configured, .claude_code => unreachable,
             }
 
             try std.testing.expectEqual(@as(usize, 0), app.auth.start_count);

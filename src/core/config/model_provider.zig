@@ -3,10 +3,15 @@ const types = @import("../shared/types.zig");
 
 const configured_provider = @import("configured_provider.zig");
 
+/// The model the Claude Code provider uses until one is chosen. Claude Code
+/// resolves the id itself.
+pub const claude_code_default_model = "claude-opus-5-5";
+
 pub const ProviderId = union(enum) {
     gateway,
     codex,
     grok,
+    claude_code,
     configured: struct {
         bytes: [configured_provider.max_id_bytes]u8 = @splat(0),
         len: u8,
@@ -19,6 +24,7 @@ pub const ProviderId = union(enum) {
             .gateway => "gateway",
             .codex => "codex",
             .grok => "grok",
+            .claude_code => "claude-code",
             .configured => |*value| value.bytes[0..value.len],
         };
     }
@@ -110,6 +116,7 @@ pub fn parse(value: []const u8) ?ProviderId {
     if (std.ascii.eqlIgnoreCase(value, "gateway")) return .gateway;
     if (std.ascii.eqlIgnoreCase(value, "codex")) return .codex;
     if (std.ascii.eqlIgnoreCase(value, "grok")) return .grok;
+    if (std.ascii.eqlIgnoreCase(value, "claude-code")) return .claude_code;
     configured_provider.validate_id(value) catch return null;
     var result: ProviderId = .{ .configured = .{ .len = @intCast(value.len) } };
     @memcpy(result.configured.bytes[0..value.len], value);
@@ -138,10 +145,11 @@ pub fn authorizesCredential(provider: ProviderId, source: ?types.CredentialSourc
     const selected = source orelse return false;
     if (selected == .host_managed) return true;
     return switch (provider) {
-        .gateway => selected != .chatgpt_subscription and selected != .grok_subscription and selected != .configured,
+        .gateway => selected != .chatgpt_subscription and selected != .grok_subscription and selected != .configured and selected != .claude_code,
         .configured => selected == .configured,
         .codex => selected == .chatgpt_subscription,
         .grok => selected == .grok_subscription,
+        .claude_code => selected == .claude_code,
     };
 }
 
@@ -155,6 +163,9 @@ test "explicit providers authorize only their own credential origins" {
     try std.testing.expect(authorizesCredential(.grok, .grok_subscription));
     try std.testing.expect(!authorizesCredential(.grok, .chatgpt_subscription));
     try std.testing.expect(!authorizesCredential(.gateway, .grok_subscription));
+    try std.testing.expect(authorizesCredential(.claude_code, .claude_code));
+    try std.testing.expect(!authorizesCredential(.claude_code, .ai_gateway_api_key));
+    try std.testing.expect(!authorizesCredential(.gateway, .claude_code));
 }
 
 test "configured provider identity serializes its binding and rejects rebinding" {

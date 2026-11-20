@@ -600,6 +600,7 @@ fn providerLabel(provider: model_provider.ProviderId) []const u8 {
         .gateway => "AI Gateway",
         .codex => "ChatGPT",
         .grok => "Grok",
+        .claude_code => "Claude Code",
         .configured => "the configured provider",
     };
 }

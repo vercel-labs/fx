@@ -32,6 +32,7 @@ const doctor_probes = @import("doctor_probes.zig");
 const mcp_runtime = @import("../mcp_host/runtime.zig");
 const self_exe = @import("../shared/self_exe.zig");
 const gateway_provider = @import("../gateway/gateway_provider.zig");
+const claude_code = @import("../../gateway/claude_code.zig");
 const model_catalog = @import("../gateway/model_catalog.zig");
 const model_catalog_metadata = @import("../gateway/model_catalog_metadata.zig");
 const model_capabilities = @import("../config/model_capabilities.zig");
@@ -1227,6 +1228,7 @@ fn runProviderLogin(alloc: Allocator, cfg: Config, provider: model_provider.Prov
         .gateway => try login_flow.runLogin(alloc, cfg.gateway_provider.oauth_transport, cfg.url_opener),
         .codex => try chatgpt_oauth.runLogin(alloc, cfg.gateway_provider.oauth_transport, cfg.url_opener),
         .grok => try grok_oauth.runLogin(alloc, cfg.gateway_provider.oauth_transport, cfg.url_opener),
+        .claude_code => return error.ClaudeCodeSignsInItself,
         .configured => return error.ConfiguredProviderUsesEnvironmentAuth,
     }
 }
@@ -1241,6 +1243,7 @@ fn writeProviderLoginFailure(alloc: Allocator, deps: RunDeps, provider: model_pr
         return;
     }
     try writeProviderActivationError(alloc, deps, caller, switch (err) {
+        error.ClaudeCodeSignsInItself => "fx doesn't sign in to Claude; run `claude` and sign in with /login there, then run fx provider claude-code",
         error.ClientIdMissing => "missing FX_OAUTH_CLIENT_ID; configure the fx Vercel App client id first",
         error.AccessDenied, error.ChatGptAuthorizationFailed, error.GrokAuthorizationFailed => "authorization denied",
         error.ExpiredToken, error.LoginTimedOut, error.ChatGptLoginTimedOut, error.GrokLoginTimedOut => "authorization expired; run fx login again",
@@ -1297,6 +1300,35 @@ fn activateProviderSelectionFallible(
         if (caller == .provider_command) try writeStdout(deps, message);
         return true;
     }
+    if (target == .claude_code) {
+        // fx never signs in to Claude: the `claude` binary must already be
+        // installed and signed in, and fx only asks it.
+        var status = try claude_code.probeStatus(alloc);
+        defer status.deinit(alloc);
+        if (!status.installed) {
+            try writeProviderActivationError(alloc, deps, caller, claude_code.not_installed_message);
+            return false;
+        }
+        if (status.signed_in == false) {
+            try writeProviderActivationError(alloc, deps, caller, claude_code.not_signed_in_message);
+            return false;
+        }
+        if (caller == .provider_command) {
+            const line = if (status.signed_in == null)
+                try alloc.print("Using Claude Code {s}. fx couldn't tell whether it is signed in; if requests fail, run `claude` and sign in with /login.\n", .{
+                    status.version orelse "(unknown version)",
+                })
+            else
+                try alloc.print("Using Claude Code {s}, signed in with {s}{s}{s}.\n", .{
+                    status.version orelse "(unknown version)",
+                    status.auth_method orelse "an unknown method",
+                    if (status.subscription != null) ", plan " else "",
+                    status.subscription orelse "",
+                });
+            defer alloc.free(line);
+            try writeStdout(deps, line);
+        }
+    }
     const preferred_source = exact_source orelse settings.credential_source;
     var prepared_credential = if (cfg.auth_mode == .host_managed)
         null
@@ -1321,6 +1353,7 @@ fn activateProviderSelectionFallible(
             .gateway => "Gateway is already selected.\n",
             .codex => "Codex is already selected.\n",
             .grok => "Grok is already selected.\n",
+            .claude_code => "Claude Code is already selected.\n",
             .configured => "Configured provider is already selected.\n",
         });
         return true;
@@ -1354,6 +1387,7 @@ fn activateProviderSelectionFallible(
             switch (target) {
                 .codex => "Codex credential is unavailable",
                 .grok => "Grok credential is unavailable",
+                .claude_code => "Claude Code is unavailable",
                 .gateway => "configure a Gateway credential first",
                 .configured => "configure the provider auth environment variable first",
             },
@@ -1364,6 +1398,7 @@ fn activateProviderSelectionFallible(
         try writeProviderActivationError(alloc, deps, caller, switch (target) {
             .codex => "Codex model catalog is unavailable",
             .grok => "Grok model catalog is unavailable",
+            .claude_code => "Claude Code model list is unavailable",
             .gateway => "Gateway model catalog is unavailable",
             .configured => "Configured model catalog is unavailable",
         });
@@ -1437,13 +1472,14 @@ fn activateProviderSelectionFallible(
     if (performed_login) |provider| switch (provider) {
         .codex => try writeStdout(deps, "Signed in with Codex.\n"),
         .grok => try writeStdout(deps, "Signed in with Grok.\n"),
-        .gateway, .configured => unreachable,
+        .gateway, .claude_code, .configured => unreachable,
     };
     if (caller == .provider_command) {
         try writeStdout(deps, switch (target) {
             .gateway => "Provider set to Gateway.\n",
             .codex => "Provider set to Codex.\n",
             .grok => "Provider set to Grok.\n",
+            .claude_code => "Provider set to Claude Code.\n",
             .configured => "Provider set to configured connection.\n",
         });
     }
@@ -1659,13 +1695,14 @@ fn runNonInteractiveWithDeps(
                 .gateway => "Signed in to Vercel.\nAI Gateway access may still require billing or API setup for the selected account.\n",
                 .codex => "Signed in with Codex.\n",
                 .grok => "Signed in with Grok.\n",
+                .claude_code => unreachable,
                 .configured => "Configured providers use settings.json authentication.\n",
             });
             return .handled_success;
         },
         .logout => |rest| {
             const maybe_login_provider = parseLoginProvider(rest) catch {
-                try writeStderr(deps, "usage: fx logout [vercel|codex|grok]\n");
+                try writeStderr(deps, "usage: fx logout [vercel|codex|grok|claude-code]\n");
                 return usage_failure;
             };
             if (cfg.auth_mode == .host_managed) {
@@ -1675,6 +1712,10 @@ fn runNonInteractiveWithDeps(
             configureAuthCommandTrace(alloc);
             // Preserve the original `fx logout` behavior for scripts and users.
             const login_provider = maybe_login_provider orelse .gateway;
+            if (login_provider == .claude_code) {
+                try writeStdout(deps, credentials.claude_code_logout_message ++ "\n");
+                return .handled_success;
+            }
             if (login_provider == .codex) {
                 const wait_line: LogoutWaitLine = .{ .deps = deps, .text = LogoutWaitLine.codex };
                 const outcome = chatgpt_oauth.logout(alloc, cfg.gateway_provider.oauth_transport, wait_line.notice()) catch {
@@ -1822,7 +1863,7 @@ fn runNonInteractiveWithDeps(
                 return usage_failure;
             }
             const target = model_provider.parse(rest[0]) orelse {
-                try writeStderr(deps, "fx provider: expected gateway, codex, grok, or a configured name\n");
+                try writeStderr(deps, "fx provider: expected gateway, codex, grok, claude-code, or a configured name\n");
                 return usage_failure;
             };
             const activated = activateProviderSelection(alloc, cfg, deps, target, .provider_command, null) catch |err| switch (err) {
@@ -1885,6 +1926,18 @@ fn runNonInteractiveWithDeps(
             const fx_home = try profile_paths.activeRoot(alloc, io_mod.homeDir());
             defer if (fx_home) |path| alloc.free(path);
             snapshot.fx_home = fx_home;
+            var claude_status: claude_code.Status = .{};
+            defer claude_status.deinit(alloc);
+            if (startup.provider == .claude_code) {
+                claude_status = try claude_code.probeStatus(alloc);
+                snapshot.claude_code = .{
+                    .installed = claude_status.installed,
+                    .version = claude_status.version,
+                    .signed_in = claude_status.signed_in,
+                    .auth_method = claude_status.auth_method,
+                    .subscription = claude_status.subscription,
+                };
+            }
             if (opts.format == .json) {
                 try writeStatusJsonLine(alloc, deps, snapshot);
                 return .handled_success;
@@ -1977,6 +2030,7 @@ fn runNonInteractiveWithDeps(
                     .gateway => "fx models: Gateway model catalog is unavailable\n",
                     .codex => "fx models: Codex model catalog is unavailable\n",
                     .grok => "fx models: Grok model catalog is unavailable\n",
+                    .claude_code => "fx models: Claude Code model list is unavailable\n",
                     .configured => "fx models: Configured model catalog is unavailable\n",
                 });
                 return .handled_failure;
@@ -4099,7 +4153,7 @@ fn globalLaunchErrorMessage(err: anyerror) ?[]const u8 {
         error.InvalidProfileName => "--profile names use lowercase letters, digits, '-', or '_'",
         error.InvalidInstancesValue => "--instances takes a whole number of at least 1",
         error.InvalidEffortValue => "--effort value is not a valid reasoning effort",
-        error.InvalidProviderValue => "--provider accepts gateway, codex, grok, or a configured provider name",
+        error.InvalidProviderValue => "--provider accepts gateway, codex, grok, claude-code, or a configured provider name",
         error.InvalidProviderOrderValue => "--provider-order accepts comma-separated provider slugs (letters, digits, '-')",
         error.InvalidPermissionModeValue => "--permission-mode accepts ask, auto, or full-access",
         error.InvalidToolPlacementOverride => "--tool-placement takes <tool>=toolbox or <tool>=direct",
@@ -4438,6 +4492,9 @@ const DoctorProbes = struct {
             debug_trace.logf("doctor", "provider check skipped: startup state failed err={s}", .{@errorName(err)});
             return;
         };
+        // Claude Code's model list is built in, so fetching it confirms
+        // nothing; the local auth check asks `claude` itself instead.
+        if (startup.provider == .claude_code) return;
         var available = cfg.provider_set;
         available.definitions = startup.configured_providers.definitions;
         const catalog = available.select(startup.provider).cli_model_catalog orelse return;

@@ -6,6 +6,7 @@ const openai_codex_permission_reviewer = @import("../gateway/openai_codex_permis
 const xai_grok = @import("../gateway/xai_grok.zig");
 const xai_grok_models = @import("../gateway/xai_grok_models.zig");
 const xai_grok_permission_reviewer = @import("../gateway/xai_grok_permission_reviewer.zig");
+const claude_code = @import("../gateway/claude_code.zig");
 const provider_catalog = @import("../core/auth/provider_catalog.zig");
 const chat_completions = @import("../gateway/chat_completions.zig");
 const configured_provider = @import("../core/config/configured_provider.zig");
@@ -35,5 +36,14 @@ pub const native = provider_set.Set{
         .cli_model_catalog = xai_grok_models.cli_model_catalog_provider,
         .model_catalog = xai_grok_models.model_catalog_provider,
         .permission_reviewer = xai_grok_permission_reviewer.provider,
+    },
+    .claude_code = .{
+        .capabilities = claude_code.bundle_capabilities,
+        .presentation = provider_catalog.find(.claude_code),
+        .title_model = claude_code.title_model,
+        .agent_stream = claude_code.agent_stream_provider,
+        .cli_model_catalog = claude_code.cli_model_catalog_provider,
+        .model_catalog = claude_code.model_catalog_provider,
+        .permission_reviewer = claude_code.permission_reviewer,
     },
 };

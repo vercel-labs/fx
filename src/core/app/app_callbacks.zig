@@ -1482,6 +1482,7 @@ pub fn Bindings(comptime App: type) type {
                             .vercel_oidc_token, .ai_gateway_api_key, .stored_key => "Run /provider to repair this source.",
                             .host_managed => credentials.host_managed_auth_message,
                             .configured => "Check the configured provider auth environment variable.",
+                            .claude_code => "Run `claude` and sign in with /login there.",
                         },
                     },
                 )

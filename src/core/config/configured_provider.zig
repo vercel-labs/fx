@@ -294,7 +294,7 @@ pub fn failure_advice(err: anyerror) ?[]const u8 {
         error.InvalidAuth => "auth is {\"type\": \"none\"} or {\"type\": \"bearer\", \"env\": \"VARIABLE\"}",
         error.InvalidEnvironmentName => "a variable's name uses letters, digits, and _, and does not start with a digit",
         error.InvalidProviderId => "a connection's name starts with a letter and uses letters, digits, _, and -",
-        error.ReservedProviderId => "gateway, codex, and grok are fx's own providers; give the connection another name",
+        error.ReservedProviderId => "gateway, codex, grok, and claude-code are fx's own providers; give the connection another name",
         error.InvalidToolChoiceMode => "tool_choice_mode is omit or send",
         error.InvalidConnectionOption => "this is true or false",
         error.InvalidModelId => "a model id is text with no control characters and no spaces at either end",
@@ -698,7 +698,7 @@ pub fn validate_id(id: []const u8) error{ LimitExceeded, InvalidProviderId, Rese
     for (id) |byte| {
         if (!std.ascii.isAlphanumeric(byte) and byte != '_' and byte != '-') return error.InvalidProviderId;
     }
-    for ([_][]const u8{ "gateway", "codex", "grok" }) |reserved| {
+    for ([_][]const u8{ "gateway", "codex", "grok", "claude-code" }) |reserved| {
         if (std.ascii.eqlIgnoreCase(id, reserved)) return error.ReservedProviderId;
     }
 }
@@ -895,6 +895,7 @@ test "configured provider invalid schemas fail explicitly" {
         .{ .json = "{\"GATEWAY\":{}}", .err = error.ReservedProviderId },
         .{ .json = "{\"codex\":{}}", .err = error.ReservedProviderId },
         .{ .json = "{\"Grok\":{}}", .err = error.ReservedProviderId },
+        .{ .json = "{\"Claude-Code\":{}}", .err = error.ReservedProviderId },
         .{ .json = "{\"local\":null}", .err = error.InvalidObject },
         .{ .json = "{\"local\":{}}", .err = error.MissingField },
         .{ .json = "{\"local\":{\"protocol\":\"responses\"}}", .err = error.InvalidProtocol },

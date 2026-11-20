@@ -64,6 +64,8 @@ pub const CatalogAuthenticatedSource = enum {
     stored_key,
     chatgpt_subscription,
     grok_subscription,
+    /// The `claude` binary is signed in; its model list needs no token.
+    claude_code,
 
     fn credentialSource(self: CatalogAuthenticatedSource) Source {
         return switch (self) {
@@ -73,6 +75,7 @@ pub const CatalogAuthenticatedSource = enum {
             .stored_key => .stored_key,
             .chatgpt_subscription => .chatgpt_subscription,
             .grok_subscription => .grok_subscription,
+            .claude_code => .claude_code,
         };
     }
 };
@@ -234,6 +237,7 @@ pub fn catalogAccessForCredentialAndAccount(
         .chatgpt_subscription => .chatgpt_subscription,
         .grok_subscription => .grok_subscription,
         .host_managed => unreachable,
+        .claude_code => .claude_code,
         .configured => return .{ .public_only = .no_credential },
         .fx_login => blk: {
             const team = team_context orelse
@@ -280,6 +284,8 @@ pub const missing_grok_credential_message = "fx needs a Grok subscription login 
 pub const missing_grok_interactive_credential_message = "Grok needs a subscription login. Run /login, open Connections, then choose Grok subscription.";
 pub const unreadable_store_message = "fx could not read the stored API key from " ++ stored_key_backend_label ++ ". A key may be saved but unreadable. Set FX_TRACE_LOG for the failing step, or set AI_GATEWAY_API_KEY.";
 pub const host_managed_auth_message = "Authentication is managed by the host.";
+/// fx never signs in to Claude: Claude Code keeps its own sign-in.
+pub const claude_code_logout_message = "fx doesn't sign in to Claude, so there is nothing to sign out of here. To sign out of Claude Code, run `claude` and use /logout there.";
 
 test "public credential guidance spells fx lowercase" {
     try std.testing.expect(std.mem.startsWith(u8, missing_credential_message, "fx needs"));
@@ -558,6 +564,7 @@ pub fn loadSource(
         .stored_key => loadStoredKeyCredential(alloc, secret_store),
         .chatgpt_subscription => loadChatGptCredential(alloc, transport, .if_needed),
         .grok_subscription => loadGrokCredential(alloc, transport, .if_needed),
+        .claude_code => .{ .token = try alloc.dupe(u8, ""), .source = .claude_code },
         .host_managed, .configured => null,
     };
 }
@@ -612,6 +619,7 @@ pub fn sourceExists(
                 },
             };
         },
+        .claude_code => true,
         .host_managed, .configured => false,
     };
 }
@@ -636,6 +644,7 @@ pub fn sourcePresence(
             secret_store.presence(),
         .chatgpt_subscription => chatgpt_session.presence(),
         .grok_subscription => grok_session.presence(),
+        .claude_code => .present,
         .host_managed, .configured => .missing,
     };
 }
@@ -767,7 +776,7 @@ pub fn loadStoredSource(alloc: std.mem.Allocator, source: Source) !?Credential {
         .fx_login => loadStoredFxLoginCredential(alloc),
         .chatgpt_subscription => loadStoredChatGptCredential(alloc),
         .grok_subscription => loadStoredGrokCredential(alloc),
-        .vercel_oidc_token, .ai_gateway_api_key, .stored_key, .host_managed, .configured => null,
+        .vercel_oidc_token, .ai_gateway_api_key, .stored_key, .host_managed, .configured, .claude_code => null,
     };
 }
 
@@ -1006,6 +1015,7 @@ pub fn sourceLabel(source: Source) []const u8 {
         .grok_subscription => "Grok subscription",
         .host_managed => "host managed",
         .configured => "configured provider",
+        .claude_code => "Claude Code",
     };
 }
 

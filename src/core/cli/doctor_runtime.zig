@@ -1,6 +1,7 @@
 const std = @import("std");
 const profile_paths = @import("../shared/profile_paths.zig");
 const auth_runtime = @import("../auth/auth_runtime.zig");
+const claude_code = @import("../../gateway/claude_code.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const io_mod = @import("../shared/io.zig");
 const agent_steps = @import("../config/agent_steps.zig");
@@ -326,11 +327,13 @@ pub fn loginCommand(provider: model_provider.ProviderId) []const u8 {
         .gateway => "fx login",
         .codex => "fx login codex",
         .grok => "fx login grok",
+        .claude_code => "run claude and sign in with /login",
         .configured => profile_paths.displayText("check the connection's auth in ~/.fx/settings.json"),
     };
 }
 
 fn appendAuthCheck(checks: *std.ArrayList(Check), alloc: Allocator, auth: auth_runtime.StatusSnapshot, provider: model_provider.ProviderId) !void {
+    if (provider == .claude_code) return appendClaudeCodeCheck(checks, alloc);
     if (auth.missingHelp(.cli)) |help| {
         try checks.append(alloc, .{ .name = "auth", .status = .fail, .detail = help, .fix = loginCommand(provider) });
         return;
@@ -342,6 +345,35 @@ fn appendAuthCheck(checks: *std.ArrayList(Check), alloc: Allocator, auth: auth_r
         try checks.append(alloc, .{ .name = "auth", .status = .warn, .detail = detail, .owned_detail = detail, .fix = loginCommand(provider) });
         return;
     }
+    try appendCheckOwned(checks, alloc, "auth", .ok, detail);
+}
+
+/// Claude Code keeps its own sign-in, so the check asks the `claude` binary
+/// whether it is installed and signed in, and never reads its files.
+fn appendClaudeCodeCheck(checks: *std.ArrayList(Check), alloc: Allocator) !void {
+    var status = try claude_code.probeStatus(alloc);
+    defer status.deinit(alloc);
+    if (!status.installed) {
+        try checks.append(alloc, .{ .name = "auth", .status = .fail, .detail = claude_code.not_installed_message, .fix = "install Claude Code, then run claude and sign in with /login" });
+        return;
+    }
+    const signed_in = status.signed_in orelse {
+        // `claude auth status` failed or printed something fx can't read,
+        // such as on a version without it.
+        const detail = try alloc.print("Claude Code {s} is installed, but fx couldn't tell whether it is signed in", .{status.version orelse "(unknown version)"});
+        try checks.append(alloc, .{ .name = "auth", .status = .warn, .detail = detail, .owned_detail = detail, .fix = "run claude auth status, or run claude and sign in with /login" });
+        return;
+    };
+    if (!signed_in) {
+        try checks.append(alloc, .{ .name = "auth", .status = .fail, .detail = claude_code.not_signed_in_message, .fix = "run claude and sign in with /login" });
+        return;
+    }
+    const detail = try alloc.print("Claude Code {s}, signed in with {s}{s}{s}", .{
+        status.version orelse "(unknown version)",
+        status.auth_method orelse "an unknown method",
+        if (status.subscription != null) ", plan " else "",
+        status.subscription orelse "",
+    });
     try appendCheckOwned(checks, alloc, "auth", .ok, detail);
 }
 
