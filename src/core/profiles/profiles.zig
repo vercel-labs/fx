@@ -22,7 +22,7 @@ const Allocator = std.mem.Allocator;
 pub const max_name_bytes = 64;
 pub const max_settings_bytes = 64 * 1024;
 pub const max_prompt_bytes = 256 * 1024;
-const max_list_entry_bytes = 256;
+pub const max_list_entry_bytes = 256;
 
 pub const settings_file_name = "profile.json";
 pub const prompt_file_name = "prompt.md";
@@ -532,7 +532,8 @@ fn cloneEntry(alloc: Allocator, profile: Profile) Allocator.Error!Entry {
     return .{ .name = name, .description = description, .source = profile.source, .model = model, .effort = profile.effort, .tools = tools };
 }
 
-fn cloneNames(alloc: Allocator, names: []const []const u8) Allocator.Error![]const []const u8 {
+/// A copy of `names` that `alloc` owns, each name and the list itself.
+pub fn cloneNames(alloc: Allocator, names: []const []const u8) Allocator.Error![]const []const u8 {
     const out = try alloc.alloc([]const u8, names.len);
     var done: usize = 0;
     errdefer {
@@ -673,7 +674,9 @@ fn linkTestFile(dir: std.Io.Dir, target: []const u8, sub_path: []const u8) !void
     try dir.symLink(io_mod.getIo(), target, sub_path, .{ .is_directory = false });
 }
 
-fn writeTestFile(dir: std.Io.Dir, sub_path: []const u8, bytes: []const u8) !void {
+/// Saves `bytes` at `sub_path`, creating its folders. For tests, here and in
+/// other files.
+pub fn writeTestFile(dir: std.Io.Dir, sub_path: []const u8, bytes: []const u8) !void {
     if (std.Io.Dir.path.dirname(sub_path)) |parent| try dir.createDirPath(io_mod.getIo(), parent);
     var file = try dir.createFile(io_mod.getIo(), sub_path, .{});
     defer file.close(io_mod.getIo());
@@ -755,13 +758,21 @@ fn stringField(arena: Allocator, failure: *?[]const u8, name: []const u8, key: [
     return value.string;
 }
 
+/// The text of one entry of a `tools` or `mcp_servers` list: a non-empty string
+/// of at most `max_list_entry_bytes`, or null for anything else. A profile
+/// file and a saved copy of its lists (`started_with.zig`) both take entries
+/// by this rule.
+pub fn listEntry(value: std.json.Value) ?[]const u8 {
+    if (value != .string or value.string.len == 0 or value.string.len > max_list_entry_bytes) return null;
+    return value.string;
+}
+
 fn nameList(arena: Allocator, failure: *?[]const u8, name: []const u8, key: []const u8, value: std.json.Value) ParseError![]const []const u8 {
     if (value != .array) return fail(arena, failure, "profile '{s}': {s} must be a list of names", .{ name, key });
     const out = try arena.alloc([]const u8, value.array.items.len);
     for (value.array.items, out) |item, *slot| {
-        if (item != .string or item.string.len == 0 or item.string.len > max_list_entry_bytes)
+        slot.* = listEntry(item) orelse
             return fail(arena, failure, "profile '{s}': {s} must be a list of names", .{ name, key });
-        slot.* = item.string;
     }
     return out;
 }

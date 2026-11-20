@@ -91,7 +91,7 @@ async function buildSession(cycles: number, replyBytes: number) {
       log ||= join(sessionDir(home, onlySessionId(home)), "log.jsonl");
       await session.sendText("/compact");
       await waitFor(() => compactions(log) === n + 1, `compaction ${n + 1} in the log`);
-      await session.waitForPane((pane) => !/Preparing compaction|Compacting|Stopping compaction/.test(pane), TIMEOUT);
+      await session.waitForPane((pane) => !/Compacting|Stopping compaction/.test(pane), TIMEOUT);
       await session.waitForComposer(TIMEOUT);
     }
   }

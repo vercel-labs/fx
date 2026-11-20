@@ -241,6 +241,15 @@ pub const ResumeProjection = struct {
         );
     }
 
+    pub fn attachSubagentReportDetail(
+        self: *ResumeProjection,
+        entry_id: u32,
+        call: types.ToolCall,
+        result: types.PersistedToolResult,
+    ) !void {
+        try self.runtime.attachSubagentReportDetail(self.alloc, entry_id, call, result);
+    }
+
     pub fn setHistoricalToolCommandMetadata(
         self: *ResumeProjection,
         entry_id: u32,
@@ -287,6 +296,15 @@ pub const ResumeProjection = struct {
             activity_kind,
             result,
         );
+    }
+
+    pub fn attachHistoricalBridgeCall(
+        self: *ResumeProjection,
+        entry_id: u32,
+        tool: []const u8,
+        outcome: types.ToolOutcomeKind,
+    ) !void {
+        try self.runtime.attachHistoricalBridgeCall(self.alloc, entry_id, tool, outcome);
     }
 
     pub fn attachHistoricalToolCallWithoutResult(
