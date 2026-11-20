@@ -2154,8 +2154,9 @@ fn maybeStartAskTitleTask(
     } else provider_title_model;
     const agent_stream = bundle.agent_stream orelse return null;
     const excerpt = session_title_generation.promptExcerpt(prompt) orelse return null;
-    // A custom connection may need no key; its adapter checks the one it gets.
-    if (ctx.credential_source != .host_managed and ctx.credential_source != .configured and ctx.api_key.len == 0) return null;
+    // A custom connection may need no key; its adapter checks the one it
+    // gets. Claude Code keeps its own sign-in.
+    if (ctx.credential_source != .host_managed and ctx.credential_source != .configured and ctx.credential_source != .claude_code and ctx.api_key.len == 0) return null;
     const task = session_title_generation.Task.create(.{
         .session_id = session_id,
         .model = title_model,

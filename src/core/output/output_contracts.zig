@@ -749,7 +749,7 @@ fn countText(alloc: Allocator, count: usize) ![]const u8 {
 
 fn gatewayProviderConnected(auth: auth_runtime.StatusSnapshot) bool {
     const source = auth.active_source orelse return auth.gateway_connected;
-    return auth.gateway_connected or (source != .chatgpt_subscription and source != .grok_subscription and source != .configured);
+    return auth.gateway_connected or (source != .chatgpt_subscription and source != .grok_subscription and source != .configured and source != .claude_code);
 }
 
 fn chatGptProviderConnected(auth: auth_runtime.StatusSnapshot) bool {

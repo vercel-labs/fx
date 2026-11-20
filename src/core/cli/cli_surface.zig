@@ -1707,6 +1707,10 @@ fn runNonInteractiveWithDeps(
             configureAuthCommandTrace(alloc);
             // Preserve the original `fx logout` behavior for scripts and users.
             const login_provider = maybe_login_provider orelse .gateway;
+            if (login_provider == .claude_code) {
+                try writeStdout(deps, credentials.claude_code_logout_message ++ "\n");
+                return .handled_success;
+            }
             if (login_provider == .codex) {
                 const wait_line: LogoutWaitLine = .{ .deps = deps, .text = LogoutWaitLine.codex };
                 const outcome = chatgpt_oauth.logout(alloc, cfg.gateway_provider.oauth_transport, wait_line.notice()) catch {

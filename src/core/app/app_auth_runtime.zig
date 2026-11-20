@@ -284,6 +284,10 @@ pub fn Runtime(comptime App: type) type {
                     });
                     return;
                 };
+            if (requested_provider != null and requested_provider.? == .claude_code) {
+                try writeAuthNotice(app, .{ .topic = "auth", .tone = .neutral, .body = credentials.claude_code_logout_message });
+                return;
+            }
             try app.flushBeforeBlockingExternalWork();
             const selected_provider: model_provider.ProviderId = if (comptime provider_runtime.supported(App))
                 provider_runtime.providerOf(app, agent)

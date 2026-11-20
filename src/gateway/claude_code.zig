@@ -14,6 +14,7 @@
 //! process, and the status check.
 const std = @import("std");
 const io_mod = @import("../core/shared/io.zig");
+const json_decode = @import("../core/shared/json_decode.zig");
 const stream_provider = @import("../core/agent/stream_provider.zig");
 const model_catalog = @import("../core/gateway/model_catalog.zig");
 const gateway_provider = @import("../core/gateway/gateway_provider.zig");
@@ -34,7 +35,7 @@ pub const not_signed_in_message = session_runtime.not_signed_in_message;
 pub const stopAll = session_runtime.stopAll;
 
 /// The model a new selection starts with.
-pub const default_model = @import("../core/config/model_provider.zig").claude_code_default_model;
+const default_model = @import("../core/config/model_provider.zig").claude_code_default_model;
 /// Titles come from the smallest model, in a one-shot `claude -p`.
 pub const title_model = "claude-haiku-5-5";
 
@@ -42,7 +43,7 @@ const Model = struct { id: []const u8, name: []const u8 };
 
 /// The models Claude Code offers a subscription. Claude Code resolves each
 /// id itself, so this list only names them.
-pub const models = [_]Model{
+const models = [_]Model{
     .{ .id = "claude-opus-5-5", .name = "Claude Opus 5.5" },
     .{ .id = "claude-sonnet-5-5", .name = "Claude Sonnet 5.5" },
     .{ .id = "claude-haiku-5-5", .name = "Claude Haiku 5.5" },
@@ -70,7 +71,7 @@ fn projectReplay(_: Allocator, replay: ?types.ProviderReplay, _: []const types.T
 
 /// Whether `lease` is the one fx resolves for this provider, which holds no
 /// secret: Claude Code keeps its own sign-in.
-pub fn acceptsCredential(lease: types.CredentialLease) bool {
+fn acceptsCredential(lease: types.CredentialLease) bool {
     return lease.credentialSource() == .claude_code;
 }
 
@@ -162,7 +163,7 @@ pub const cli_model_catalog_provider = gateway_provider.CliModelCatalogProvider{
     .fetch_fn = fetchCliModelCatalog,
 };
 
-pub fn isKnownModel(id: []const u8) bool {
+fn isKnownModel(id: []const u8) bool {
     for (models) |model| if (std.mem.eql(u8, model.id, id)) return true;
     return false;
 }
@@ -294,7 +295,7 @@ fn sendReview(
     deadline: std.Io.Clock.Timestamp,
     cancel: *std.atomic.Value(bool),
 ) anyerror!classifier.TransportOutcome {
-    var parsed = std.json.parseFromSlice(ReviewPayload, alloc, payload, .{}) catch return .permanent_failure;
+    var parsed = json_decode.parseFromSlice(ReviewPayload, alloc, payload, .{}) catch return .permanent_failure;
     defer parsed.deinit();
     const reply = session_runtime.oneShot(alloc, .{
         .model = parsed.value.model,

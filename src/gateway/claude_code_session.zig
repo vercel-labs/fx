@@ -71,7 +71,33 @@ const registry = struct {
     /// Every live process's private directory, so an exit that cannot wait
     /// for a step to end still removes it. The processes own the paths.
     var dirs: std.ArrayList([]const u8) = .empty;
+    /// Every process started and not yet reaped. A pid leaves the list in the
+    /// same hold of the lock that reaps it, so `stopAll` never signals a pid
+    /// the system has given to another process.
+    var pids: std.ArrayList(posix.pid_t) = .empty;
 };
+
+/// Reaps `pid` when it has exited and forgets it. True once it has exited.
+fn reap(pid: posix.pid_t) bool {
+    const io = io_mod.getIo();
+    registry.mutex.lockUncancelable(io);
+    defer registry.mutex.unlock(io);
+    var status: c_int = 0;
+    const result = std.c.waitpid(pid, &status, std.c.W.NOHANG);
+    if (result != pid and result != -1) return false;
+    for (registry.pids.items, 0..) |item, index| {
+        if (item == pid) {
+            _ = registry.pids.swapRemove(index);
+            break;
+        }
+    }
+    return true;
+}
+
+/// Signals `pid`'s process group, or `pid` alone when it has none.
+fn signalGroup(pid: posix.pid_t, sig: posix.SIG) void {
+    posix.kill(-pid, sig) catch posix.kill(pid, sig) catch {};
+}
 
 fn trackDir(path: []const u8) !void {
     const io = io_mod.getIo();
@@ -107,9 +133,8 @@ pub fn stopAll() void {
         defer registry.mutex.unlock(io);
         // A step that starts a process after this sees `exiting` and stops it.
         registry.exiting = true;
-        for (registry.sessions.items) |session| {
-            if (session.proc) |proc| proc.signal(.TERM);
-        }
+        // The pids, not the sessions' processes: a step may be freeing one.
+        for (registry.pids.items) |pid| signalGroup(pid, .TERM);
         sessions = gpa.dupe(*Session, registry.sessions.items) catch &.{};
     }
     defer gpa.free(sessions);
@@ -198,27 +223,42 @@ const Incoming = union(enum) {
 
 const OwnedCall = struct {
     id_json: []u8,
+    /// Empty when Claude Code didn't name the tool use.
     tool_use_id: []u8,
+    /// The tool's name on the wire, without the MCP prefix.
+    name: []u8,
 
     fn deinit(self: OwnedCall) void {
         gpa.free(self.id_json);
         gpa.free(self.tool_use_id);
+        gpa.free(self.name);
+    }
+
+    /// Whether this call asks for the tool use `tool_use_id`, of the tool
+    /// `wire_name`. Claude Code names the tool use in `_meta`; for a version
+    /// that doesn't, calls of one tool take fx's results in the order Claude
+    /// Code made them.
+    fn asksFor(self: OwnedCall, tool_use_id: []const u8, wire_name: []const u8) bool {
+        if (self.tool_use_id.len > 0) return std.mem.eql(u8, self.tool_use_id, tool_use_id);
+        return std.mem.eql(u8, self.name, wire_name);
     }
 };
 
 /// A tool result fx has, kept until Claude Code asks for it.
 const Answer = struct {
     tool_use_id: []u8,
+    wire_name: []u8,
     text: []u8,
     is_error: bool,
 
     fn deinit(self: Answer) void {
         gpa.free(self.tool_use_id);
+        gpa.free(self.wire_name);
         gpa.free(self.text);
     }
 };
 
-pub const Launch = struct {
+const Launch = struct {
     /// The Claude Code program; tests name a fake one.
     program: []const u8 = "claude",
     model: []const u8,
@@ -226,8 +266,8 @@ pub const Launch = struct {
     system_prompt: []const u8,
     session_id: [36]u8,
     resume_session: bool,
-    /// Null for a process without fx's tools.
-    tools_json: ?[]const u8,
+    /// The tools Claude Code sees; null for a process without fx's tools.
+    functions: ?[]const function_tools.Function,
     /// A one-shot call: no session file, and the reply follows a schema
     /// when one is given.
     one_shot: bool = false,
@@ -258,10 +298,19 @@ const Proc = struct {
     tools_json: ?[]u8 = null,
     tools_hash: u64 = 0,
     names: wire.ToolNames = .{},
+    /// Set once the process is reaped. Only the step that holds the
+    /// session, or the start that owns the process, reads or sets it.
     exited: bool = false,
 
+    /// For the process's owner only, while it is not reaped.
     fn signal(self: *Proc, sig: posix.SIG) void {
-        posix.kill(-self.pid, sig) catch posix.kill(self.pid, sig) catch {};
+        signalGroup(self.pid, sig);
+    }
+
+    /// Whether the process has exited. Reaps it when it has.
+    fn hasExited(self: *Proc) bool {
+        if (!self.exited) self.exited = reap(self.pid);
+        return self.exited;
     }
 
     fn push(self: *Proc, item: Incoming) void {
@@ -322,24 +371,29 @@ const Proc = struct {
     fn setTools(self: *Proc, functions: []const function_tools.Function) !void {
         // The names outlive the step, so they and the list use `gpa`.
         var names: wire.ToolNames = .{};
-        errdefer names.deinit(gpa);
+        defer names.deinit(gpa);
         var out: std.Io.Writer.Allocating = .init(gpa);
         defer out.deinit();
         try wire.writeToolsList(gpa, &out.writer, functions, &names);
-        const hash = std.hash.Wyhash.hash(0, out.written());
+        // Two fx names can share a wire name, so the hash covers both.
+        var hasher = std.hash.Wyhash.init(0);
+        hasher.update(out.written());
+        for (names.fx.items) |name| {
+            hasher.update(name);
+            hasher.update(&.{0});
+        }
+        const hash = hasher.final();
         const io = io_mod.getIo();
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
-        if (self.tools_json != null and hash == self.tools_hash) {
-            names.deinit(gpa);
-            return;
-        }
+        if (self.tools_json != null and hash == self.tools_hash) return;
+        const json = try out.toOwnedSlice();
         const changed = self.tools_json != null;
         if (self.tools_json) |old| gpa.free(old);
-        self.tools_json = try out.toOwnedSlice();
+        self.tools_json = json;
         self.tools_hash = hash;
-        self.names.deinit(gpa);
-        self.names = names;
+        // The old names go with `names` when this returns.
+        std.mem.swap(wire.ToolNames, &self.names, &names);
         if (changed and self.conn != null) {
             var line: std.Io.Writer.Allocating = .init(gpa);
             defer line.deinit();
@@ -354,8 +408,7 @@ const Proc = struct {
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
         if (self.names.fxName(called)) |name| return alloc.dupe(u8, name);
-        const bare = if (std.mem.startsWith(u8, called, wire.tool_prefix)) called[wire.tool_prefix.len..] else called;
-        return alloc.dupe(u8, bare);
+        return alloc.dupe(u8, wire.bareToolName(called));
     }
 
     /// Stops the process and everything it started, and frees `self`.
@@ -365,21 +418,17 @@ const Proc = struct {
         self.stop.store(true, .release);
         if (self.stdin) |file| file.close(io);
         self.stdin = null;
-        if (!self.exited) {
+        if (!self.hasExited()) {
             self.signal(.TERM);
             const deadline = io_mod.milliTimestamp() + 2000;
-            while (true) {
-                var status: c_int = 0;
-                const result = std.c.waitpid(self.pid, &status, std.c.W.NOHANG);
-                if (result == self.pid or result == -1) break;
-                if (io_mod.milliTimestamp() > deadline) {
+            var killed = false;
+            while (!self.hasExited()) {
+                if (!killed and io_mod.milliTimestamp() > deadline) {
                     self.signal(.KILL);
-                    _ = std.c.waitpid(self.pid, &status, 0);
-                    break;
+                    killed = true;
                 }
-                io.sleep(.fromMilliseconds(20), .awake) catch {};
+                io_mod.sleep(20 * std.time.ns_per_ms);
             }
-            self.exited = true;
         }
         if (self.stdout_task) |*task| task.await(io);
         if (self.stderr_task) |*task| task.await(io);
@@ -531,11 +580,17 @@ fn handleBridgeLine(proc: *Proc, line: []const u8) void {
         .ping => |id| wire.writeResult(&reply.writer, id, "{}") catch return,
         .unknown_request => |id| wire.writeMethodNotFound(&reply.writer, id) catch return,
         .tools_call => |call| {
-            const owned: OwnedCall = .{
-                .id_json = gpa.dupe(u8, call.id_json) catch return,
-                .tool_use_id = gpa.dupe(u8, call.tool_use_id orelse "") catch return,
+            const id_json = gpa.dupe(u8, call.id_json) catch return;
+            const tool_use_id = gpa.dupe(u8, call.tool_use_id orelse "") catch {
+                gpa.free(id_json);
+                return;
             };
-            proc.push(.{ .call = owned });
+            const name = gpa.dupe(u8, call.name) catch {
+                gpa.free(id_json);
+                gpa.free(tool_use_id);
+                return;
+            };
+            proc.push(.{ .call = .{ .id_json = id_json, .tool_use_id = tool_use_id, .name = name } });
             return;
         },
         .cancelled => |id| {
@@ -547,7 +602,7 @@ fn handleBridgeLine(proc: *Proc, line: []const u8) void {
     _ = proc.writeBridge(reply.written());
 }
 
-pub const StartError = error{ ClaudeNotInstalled, ProcessGone, OutOfMemory } || anyerror;
+const StartError = error{ ClaudeNotInstalled, ProcessGone, OutOfMemory } || anyerror;
 
 /// Starts `claude` for `launch`. The process owns its private directory,
 /// which holds the system prompt, the MCP configuration, and the socket.
@@ -565,6 +620,7 @@ fn startProcess(alloc: Allocator, launch: Launch) StartError!*Proc {
         }
         if (proc.socket_path) |path| gpa.free(path);
         if (proc.tools_json) |json| gpa.free(json);
+        proc.names.deinit(gpa);
         gpa.destroy(proc);
     };
 
@@ -604,7 +660,7 @@ fn startProcess(alloc: Allocator, launch: Launch) StartError!*Proc {
         try argv.appendSlice(alloc, &.{ "--session-id", try alloc.dupe(u8, &launch.session_id) });
     }
 
-    if (launch.tools_json != null) {
+    if (launch.functions) |functions| {
         proc.socket_path = try gpa.print("{s}/s", .{proc.dir_path.?});
         const address = try std.Io.net.UnixAddress.init(proc.socket_path.?);
         proc.listener = try address.listen(io, .{});
@@ -621,8 +677,9 @@ fn startProcess(alloc: Allocator, launch: Launch) StartError!*Proc {
         const config_path = try alloc.print("{s}/mcp.json", .{proc.dir_path.?});
         try writePrivateFile(config_path, config.written());
         try argv.appendSlice(alloc, &.{ "--mcp-config", config_path, "--allowedTools", "mcp__" ++ wire.server_name });
-        proc.tools_json = try gpa.dupe(u8, launch.tools_json.?);
-        proc.tools_hash = std.hash.Wyhash.hash(0, launch.tools_json.?);
+        // The list and the names that map Claude's tool calls back to fx's
+        // tools, both ready before Claude Code can ask for them.
+        try proc.setTools(functions);
     }
 
     var env = try io_mod.cloneEnvironMap(alloc);
@@ -648,14 +705,16 @@ fn startProcess(alloc: Allocator, launch: Launch) StartError!*Proc {
     started = true;
     _ = registry.live.fetchAdd(1, .acq_rel);
     errdefer proc.destroy();
-    proc.stdout_task = try io.concurrent(readStdout, .{ proc, child.stdout.? });
-    proc.stderr_task = try io.concurrent(readStderr, .{ proc, child.stderr.? });
-    if (proc.listener != null) proc.bridge_task = try io.concurrent(serveBridge, .{proc});
     {
         registry.mutex.lockUncancelable(io);
         defer registry.mutex.unlock(io);
+        // A process that starts after `stopAll` ran is stopped here.
         if (registry.exiting) proc.signal(.TERM);
+        try registry.pids.append(gpa, proc.pid);
     }
+    proc.stdout_task = try io.concurrent(readStdout, .{ proc, child.stdout.? });
+    proc.stderr_task = try io.concurrent(readStderr, .{ proc, child.stderr.? });
+    if (proc.listener != null) proc.bridge_task = try io.concurrent(serveBridge, .{proc});
     return proc;
 }
 
@@ -671,7 +730,14 @@ fn writePrivateFile(path: []const u8, bytes: []const u8) !void {
 
 const Pending = struct {
     tool_use_id: []u8,
+    /// The tool's name on the wire, without the MCP prefix.
+    wire_name: []u8,
     hash: u64,
+
+    fn deinit(self: Pending) void {
+        gpa.free(self.tool_use_id);
+        gpa.free(self.wire_name);
+    }
 };
 
 const Session = struct {
@@ -701,7 +767,7 @@ const Session = struct {
     }
 
     fn clearCalls(self: *Session) void {
-        for (self.pending.items) |pending| gpa.free(pending.tool_use_id);
+        for (self.pending.items) |pending| pending.deinit();
         self.pending.clearRetainingCapacity();
         for (self.arrived.items) |call| call.deinit();
         self.arrived.clearRetainingCapacity();
@@ -721,35 +787,35 @@ const Session = struct {
     }
 
     /// Answers a call now when Claude Code is waiting on it, or keeps the
-    /// result until it asks.
-    fn answer(self: *Session, alloc: Allocator, tool_use_id: []const u8, text: []const u8, is_error: bool) !void {
-        const proc = self.proc.?;
+    /// result until it asks. `error.BridgeGone` when the answer can't reach
+    /// Claude Code.
+    fn answer(self: *Session, alloc: Allocator, pending: Pending, text: []const u8, is_error: bool) !void {
         for (self.arrived.items, 0..) |call, index| {
-            if (!std.mem.eql(u8, call.tool_use_id, tool_use_id)) continue;
-            var line: std.Io.Writer.Allocating = .init(alloc);
-            try wire.writeToolCallResult(&line.writer, call.id_json, text, is_error);
-            _ = proc.writeBridge(line.written());
+            if (!call.asksFor(pending.tool_use_id, pending.wire_name)) continue;
+            try writeAnswer(alloc, self.proc.?, call.id_json, text, is_error);
             call.deinit();
             _ = self.arrived.orderedRemove(index);
             return;
         }
-        const owned_id = try gpa.dupe(u8, tool_use_id);
+        const owned_id = try gpa.dupe(u8, pending.tool_use_id);
         errdefer gpa.free(owned_id);
+        const owned_name = try gpa.dupe(u8, pending.wire_name);
+        errdefer gpa.free(owned_name);
         const owned_text = try gpa.dupe(u8, text);
         errdefer gpa.free(owned_text);
-        try self.answers.append(gpa, .{ .tool_use_id = owned_id, .text = owned_text, .is_error = is_error });
+        try self.answers.append(gpa, .{ .tool_use_id = owned_id, .wire_name = owned_name, .text = owned_text, .is_error = is_error });
     }
 
     /// A `tools/call` came: answers it at once when fx has the result.
+    /// Takes `call`. `error.BridgeGone` when the answer can't reach Claude
+    /// Code.
     fn takeCall(self: *Session, alloc: Allocator, call: OwnedCall) !void {
         for (self.answers.items, 0..) |stored, index| {
-            if (!std.mem.eql(u8, stored.tool_use_id, call.tool_use_id)) continue;
-            var line: std.Io.Writer.Allocating = .init(alloc);
-            try wire.writeToolCallResult(&line.writer, call.id_json, stored.text, stored.is_error);
-            _ = self.proc.?.writeBridge(line.written());
+            if (!call.asksFor(stored.tool_use_id, stored.wire_name)) continue;
+            defer call.deinit();
+            try writeAnswer(alloc, self.proc.?, call.id_json, stored.text, stored.is_error);
             stored.deinit();
             _ = self.answers.orderedRemove(index);
-            call.deinit();
             return;
         }
         self.arrived.append(gpa, call) catch |err| {
@@ -768,35 +834,72 @@ const Session = struct {
     }
 };
 
+fn writeAnswer(alloc: Allocator, proc: *Proc, id_json: []const u8, text: []const u8, is_error: bool) !void {
+    var line: std.Io.Writer.Allocating = .init(alloc);
+    defer line.deinit();
+    try wire.writeToolCallResult(&line.writer, id_json, text, is_error);
+    if (!proc.writeBridge(line.written())) return error.BridgeGone;
+}
+
 // ---------------------------------------------------------------------------
 // Steps
 
-pub const StepInput = struct {
+const StepInput = struct {
     request: stream_provider.ModelRequest,
     effort: ?[]const u8,
     /// The Claude Code program; tests name a fake one.
     program: []const u8 = "claude",
 };
 
+/// What one try at a step came to.
+const Outcome = union(enum) {
+    done: stream_provider.Result,
+    /// The process couldn't take the request, and nothing reached the
+    /// model: a new Claude session takes it instead.
+    start_over,
+};
+
 /// One model step for an fx session's conversation.
 pub fn agentStep(alloc: Allocator, input: StepInput) anyerror!stream_provider.Result {
-    const request = input.request;
-    const session = try acquire(request.session_id orelse "");
+    const session = try acquire(input.request.session_id orelse "");
     defer release(session);
+    var admitted = false;
+    switch (try attemptStep(alloc, session, input, &admitted, false)) {
+        .done => |result| return result,
+        .start_over => {},
+    }
+    // A process that died while fx waited, or a `--resume` Claude Code
+    // couldn't continue, gives way to one new Claude session that gets the
+    // history as a transcript.
+    debug_trace.logf("claude-code", "starting over in a new Claude session", .{});
+    return switch (try attemptStep(alloc, session, input, &admitted, true)) {
+        .done => |result| result,
+        .start_over => unreachable,
+    };
+}
+
+/// One try at a step. `last` marks the second try, which starts a new
+/// Claude session and never starts over again.
+fn attemptStep(alloc: Allocator, session: *Session, input: StepInput, admitted: *bool, last: bool) anyerror!Outcome {
+    const request = input.request;
     var arena_state = std.heap.ArenaAllocator.init(alloc);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
     const functions = try function_tools.select_functions(arena, request.tools, request.tool_choice, request.vision_mode);
-    var tools_out: std.Io.Writer.Allocating = .init(arena);
-    var scratch_names: wire.ToolNames = .{};
-    try wire.writeToolsList(arena, &tools_out.writer, functions.items, &scratch_names);
     const system_prompt = try joinInstructions(arena, request.instructions);
     const config_hash = configHash(request.model, input.effort, system_prompt);
     const request_units = try wire.units(arena, request.messages);
 
+    // A process that exited while fx waited, such as one that crashed or was
+    // killed, can't take the request.
+    if (session.proc) |proc| if (proc.hasExited()) {
+        debug_trace.logf("claude-code", "claude exited between steps; starting it again", .{});
+        session.stopProcess();
+    };
+
     var plan: ?wire.DeltaPlan = null;
-    if (session.proc != null and !session.proc.?.exited) {
+    if (session.proc != null) {
         plan = wire.planDelta(session.seen.items, request_units, try session.pendingHashes(arena));
         if (plan.? == .diverged) {
             debug_trace.logf("claude-code", "history diverged reason={t}; starting over", .{plan.?.diverged});
@@ -817,9 +920,10 @@ pub fn agentStep(alloc: Allocator, input: StepInput) anyerror!stream_provider.Re
                 .system_prompt = system_prompt,
                 .session_id = session.session_id,
                 .resume_session = true,
-                .tools_json = tools_out.written(),
-            }) catch |err| return startFailure(alloc, request.admission, err);
+                .functions = functions.items,
+            }) catch |err| return .{ .done = try startFailure(alloc, if (admitted.*) null else request.admission, err) };
             session.config_hash = config_hash;
+            session.resume_unconfirmed = true;
         }
     }
 
@@ -827,7 +931,7 @@ pub fn agentStep(alloc: Allocator, input: StepInput) anyerror!stream_provider.Re
     if (plan == null) {
         session.stopProcess();
         evictIdle(session);
-        var start = startPlan(arena, request.messages, request_units, session.failed_resume);
+        var start = if (last) newStart() else startPlan(arena, request.messages, request_units, session.failed_resume);
         session.session_id = start.session_id;
         session.proc = startProcess(arena, .{
             .program = input.program,
@@ -836,8 +940,8 @@ pub fn agentStep(alloc: Allocator, input: StepInput) anyerror!stream_provider.Re
             .system_prompt = system_prompt,
             .session_id = start.session_id,
             .resume_session = start.resumed,
-            .tools_json = tools_out.written(),
-        }) catch |err| return startFailure(alloc, request.admission, err);
+            .functions = functions.items,
+        }) catch |err| return .{ .done = try startFailure(alloc, if (admitted.*) null else request.admission, err) };
         session.config_hash = config_hash;
         session.resume_unconfirmed = start.resumed;
         try session.setSeen(request_units[0..start.seen]);
@@ -863,17 +967,21 @@ pub fn agentStep(alloc: Allocator, input: StepInput) anyerror!stream_provider.Re
     const proc = session.proc.?;
     try proc.setTools(functions.items);
 
-    try request.admission.admit();
-    if (seed_text) |text| {
-        var line: std.Io.Writer.Allocating = .init(arena);
-        try wire.writeUserMessage(&line.writer, text);
-        proc.writeStdin(line.written()) catch return processFailure(alloc, session, "Claude Code stopped before it took the request.");
-    } else if (plan) |delta| {
-        try sendDelta(arena, session, request.messages, request_units, delta.extend);
-        try session.setSeen(request_units);
+    if (!admitted.*) {
+        try request.admission.admit();
+        admitted.* = true;
     }
+    const sent = if (seed_text) |text|
+        sendText(arena, proc, text)
+    else
+        sendDelta(arena, session, request.messages, request_units, plan.?.extend);
+    sent catch |err| switch (err) {
+        error.ProcessGone, error.BridgeGone => return lostProcess(alloc, session, last),
+        else => return err,
+    };
+    if (seed_text == null) try session.setSeen(request_units);
     request.delivery.markPossiblySent();
-    return readStep(alloc, arena, session, request);
+    return readStep(alloc, arena, session, request, last);
 }
 
 const StartPlan = struct {
@@ -900,6 +1008,10 @@ fn startPlan(arena: Allocator, messages: []const types.ChatMessage, request_unit
         @memcpy(&id, record.session_id);
         return .{ .session_id = id, .resumed = true, .seen = record.units };
     }
+    return newStart();
+}
+
+fn newStart() StartPlan {
     var bytes: [16]u8 = undefined;
     io_mod.getIo().random(&bytes);
     return .{ .session_id = wire.formatSessionId(bytes), .resumed = false, .seen = 0 };
@@ -912,6 +1024,8 @@ fn trailingUserStart(messages: []const types.ChatMessage) usize {
     return index;
 }
 
+/// Sends what a request adds to what the process has seen: user text, and
+/// the results of the calls Claude Code waits on.
 fn sendDelta(
     arena: Allocator,
     session: *Session,
@@ -920,46 +1034,73 @@ fn sendDelta(
     delta: @FieldType(wire.DeltaPlan, "extend"),
 ) !void {
     const proc = session.proc.?;
-    for (request_units[delta.first..delta.results_end]) |unit| {
-        const message = messages[unit.message_index];
-        for (session.pending.items, 0..) |pending, index| {
-            if (pending.hash != unit.hash) continue;
-            const failed = message.tool_result_status == .failure;
-            try session.answer(arena, pending.tool_use_id, message.content orelse "", failed);
-            gpa.free(pending.tool_use_id);
-            _ = session.pending.orderedRemove(index);
-            break;
-        }
-    }
-    // Calls fx answered with nothing, such as ones a cancel left unrun.
-    for (session.pending.items) |pending| {
-        try session.answer(arena, pending.tool_use_id, "This tool call was not run.", true);
-        gpa.free(pending.tool_use_id);
-    }
-    session.pending.clearRetainingCapacity();
-
     var first_user = messages.len;
     for (request_units[delta.results_end..]) |unit| first_user = @min(first_user, unit.message_index);
     if (first_user < messages.len) {
         var text: std.Io.Writer.Allocating = .init(arena);
         try wire.writeUserText(&text.writer, messages[first_user..]);
-        if (text.written().len > 0) {
-            var line: std.Io.Writer.Allocating = .init(arena);
-            try wire.writeUserMessage(&line.writer, text.written());
-            try proc.writeStdin(line.written());
-        }
+        // The text goes before the results. Claude Code holds what comes on
+        // stdin while it waits on tool calls and gives it to the model with
+        // their results, in the same turn, so the reply this step reads
+        // answers both.
+        if (text.written().len > 0) try sendText(arena, proc, text.written());
     }
+    for (session.pending.items) |pending| {
+        // A call fx answered with nothing, such as one a cancel left unrun.
+        var text: []const u8 = "This tool call was not run.";
+        var failed = true;
+        for (request_units[delta.first..delta.results_end]) |unit| {
+            if (unit.hash != pending.hash) continue;
+            const message = messages[unit.message_index];
+            text = message.content orelse "";
+            failed = message.tool_result_status == .failure;
+            break;
+        }
+        try session.answer(arena, pending, text, failed);
+    }
+    for (session.pending.items) |pending| pending.deinit();
+    session.pending.clearRetainingCapacity();
+}
+
+/// Sends `text` to the process as one user message.
+fn sendText(arena: Allocator, proc: *Proc, text: []const u8) !void {
+    var line: std.Io.Writer.Allocating = .init(arena);
+    try wire.writeUserMessage(&line.writer, text);
+    try proc.writeStdin(line.written());
+}
+
+/// The process went away before it took the request. A first try starts
+/// over; the last one fails.
+fn lostProcess(alloc: Allocator, session: *Session, last: bool) !Outcome {
+    if (last) return .{ .done = try processFailure(alloc, session, "Claude Code stopped before it took the request.") };
+    if (session.resume_unconfirmed) session.failed_resume = session.session_id;
+    session.stopProcess();
+    return .start_over;
+}
+
+/// Claude Code couldn't continue the session `--resume` named, such as one
+/// it keeps for another directory or has deleted. Nothing reached the model.
+fn resumeFailed(session: *Session) Outcome {
+    debug_trace.logf("claude-code", "claude could not resume session={s}", .{&session.session_id});
+    session.failed_resume = session.session_id;
+    session.stopProcess();
+    return .start_over;
 }
 
 const ToolBlock = struct {
     index: usize,
     id: []const u8,
     name: []const u8,
+    /// The name Claude Code calls the tool by, without the MCP prefix.
+    wire_name: []const u8,
     input: std.ArrayList(u8) = .empty,
 };
 
-/// Reads Claude Code's stream until the step ends.
-fn readStep(alloc: Allocator, arena: Allocator, session: *Session, request: stream_provider.ModelRequest) !stream_provider.Result {
+const bridge_closed_text = "Claude Code's connection to fx's tools closed.";
+
+/// Reads Claude Code's stream until the step ends. `last` is from
+/// `attemptStep`.
+fn readStep(alloc: Allocator, arena: Allocator, session: *Session, request: stream_provider.ModelRequest, last: bool) !Outcome {
     const proc = session.proc.?;
     const io = io_mod.getIo();
     var content: std.ArrayList(u8) = .empty;
@@ -995,20 +1136,25 @@ fn readStep(alloc: Allocator, arena: Allocator, session: *Session, request: stre
             .call, .stdout_closed, .bridge_closed => {},
         };
         switch (item) {
-            .call => |call| try session.takeCall(arena, call),
+            .call => |call| session.takeCall(arena, call) catch |err| switch (err) {
+                error.BridgeGone => return .{ .done = try processFailure(alloc, session, bridge_closed_text) },
+                else => return err,
+            },
             .cancelled => |id| session.dropArrived(id),
             .stdout_closed => {
-                proc.exited = isExited(proc.pid);
+                _ = proc.hasExited();
                 if (stop_error) |err| {
                     session.stopProcess();
                     return err;
                 }
+                // It ended before it answered `--resume`.
+                if (session.resume_unconfirmed and !last) return resumeFailed(session);
                 const stderr_text = try arena.dupe(u8, proc.stderrText());
-                return processFailure(alloc, session, if (stderr_text.len > 0) stderr_text else "Claude Code exited before it finished the step.");
+                return .{ .done = try processFailure(alloc, session, if (stderr_text.len > 0) stderr_text else "Claude Code exited before it finished the step.") };
             },
             .bridge_closed => {
                 if (session.pending.items.len > 0 or session.arrived.items.len > 0) {
-                    return processFailure(alloc, session, "Claude Code's connection to fx's tools closed.");
+                    return .{ .done = try processFailure(alloc, session, bridge_closed_text) };
                 }
             },
             .stdout => |line| {
@@ -1028,9 +1174,13 @@ fn readStep(alloc: Allocator, arena: Allocator, session: *Session, request: stre
                         inputs = .empty;
                     },
                     .block_start => |start| if (start.kind == .tool_use) {
+                        // The parsed line borrows `line`, which goes when
+                        // this item does.
                         const id = try arena.dupe(u8, start.tool_id orelse "");
-                        const name = try proc.fxToolName(arena, start.tool_name orelse "");
-                        try blocks.append(arena, .{ .index = start.index, .id = id, .name = name });
+                        const called = start.tool_name orelse "";
+                        const name = try proc.fxToolName(arena, called);
+                        const wire_name = try arena.dupe(u8, wire.bareToolName(called));
+                        try blocks.append(arena, .{ .index = start.index, .id = id, .name = name, .wire_name = wire_name });
                         if (stop_error == null) request.events.emit(.{ .tool_started = .{ .id = id, .name = name } });
                     },
                     .text_delta => |text| {
@@ -1047,28 +1197,23 @@ fn readStep(alloc: Allocator, arena: Allocator, session: *Session, request: stre
                     },
                     .message_delta => |delta| counts.merge(delta.usage),
                     .message_stop => if (blocks.items.len > 0 and stop_error == null and error_kind == null) {
-                        return toolStep(alloc, session, content.items, blocks.items, &inputs, counts);
+                        return .{ .done = try toolStep(alloc, session, content.items, blocks.items, &inputs, counts) };
                     },
                     .rate_limited => rate_limited = true,
                     .result => |result| {
                         if (stop_error) |err| return err;
                         if (result.is_error or error_kind != null) {
                             const class = wire.classifyFailure(error_kind, result.text);
-                            return turnFailure(alloc, session, class, result.text, rate_limited);
+                            if (class == .session_not_found and session.resume_unconfirmed and !last) return resumeFailed(session);
+                            return .{ .done = try turnFailure(alloc, session, class, result.text, rate_limited) };
                         }
-                        return finalStep(alloc, session, content.items, counts, result);
+                        return .{ .done = try finalStep(alloc, session, content.items, counts, result) };
                     },
                     .block_stop, .control_response, .other => {},
                 }
             },
         }
     }
-}
-
-fn isExited(pid: posix.pid_t) bool {
-    var status: c_int = 0;
-    const result = std.c.waitpid(pid, &status, std.c.W.NOHANG);
-    return result == pid or result == -1;
 }
 
 fn toolStep(
@@ -1099,12 +1244,12 @@ fn toolStep(
         filled += 1;
     }
     for (blocks) |block| {
-        const owned = try gpa.dupe(u8, block.id);
-        session.pending.append(gpa, .{ .tool_use_id = owned, .hash = wire.hashText(block.id) }) catch |err| {
-            gpa.free(owned);
-            return err;
-        };
         try session.seen.append(gpa, .{ .kind = .call, .hash = wire.hashText(block.id), .message_index = 0 });
+        const owned_id = try gpa.dupe(u8, block.id);
+        errdefer gpa.free(owned_id);
+        const owned_name = try gpa.dupe(u8, block.wire_name);
+        errdefer gpa.free(owned_name);
+        try session.pending.append(gpa, .{ .tool_use_id = owned_id, .wire_name = owned_name, .hash = wire.hashText(block.id) });
     }
     return .{ .completed = .{
         .completion = .{
@@ -1156,6 +1301,7 @@ fn turnFailure(alloc: Allocator, session: *Session, class: wire.FailureClass, te
         .billing => .forbidden,
         .invalid_request => .invalid_request,
         .overloaded => .unavailable,
+        .session_not_found => .provider_error,
         .other => if (rate_limited) .quota_exhausted else .provider_error,
     };
     const detail = switch (class) {
@@ -1211,7 +1357,7 @@ fn configHash(model: []const u8, effort: ?[]const u8, system_prompt: []const u8)
 // ---------------------------------------------------------------------------
 // One-shot calls
 
-pub const OneShot = struct {
+const OneShot = struct {
     /// The Claude Code program; tests name a fake one.
     program: []const u8 = "claude",
     model: []const u8,
@@ -1222,7 +1368,7 @@ pub const OneShot = struct {
     deadline: ?std.Io.Clock.Timestamp = null,
 };
 
-pub const OneShotReply = union(enum) {
+const OneShotReply = union(enum) {
     text: []u8,
     structured: []u8,
     failed: stream_provider.Failure,
@@ -1243,7 +1389,7 @@ pub fn oneShot(alloc: Allocator, input: OneShot) anyerror!OneShotReply {
         .system_prompt = input.system_prompt,
         .session_id = wire.formatSessionId(id_bytes),
         .resume_session = false,
-        .tools_json = null,
+        .functions = null,
         .one_shot = true,
         .json_schema = input.json_schema,
     }) catch |err| {
@@ -1347,9 +1493,12 @@ test "claude code: a start resumes the latest reply whose history still matches"
     try std.testing.expect(!startPlan(arena, &messages, request_units, id).resumed);
 }
 
-/// A fake `claude` for the tests below: it reads fx's first message, prints
-/// `events` as its stream-json output, then waits for its input to close
-/// like the real one.
+/// A fake `claude` for the tests below: it records its arguments in
+/// `args.log`, reads fx's first message, prints `events` as its stream-json
+/// output, then waits for its input to close like the real one. Started
+/// with `--resume` while `resume_events` is set, it prints those and exits
+/// with status 1 instead, as the real one does for a conversation it
+/// doesn't have.
 const FakeClaude = struct {
     tmp: std.testing.TmpDir,
     program: []u8,
@@ -1360,17 +1509,28 @@ const FakeClaude = struct {
     deltas: usize = 0,
 
     fn init(fake: *FakeClaude, events: []const u8) !void {
+        return fake.initResuming(events, null);
+    }
+
+    fn initResuming(fake: *FakeClaude, events: []const u8, resume_events: ?[]const u8) !void {
         const io = std.testing.io;
         fake.* = .{ .tmp = std.testing.tmpDir(.{}), .program = undefined };
         errdefer fake.tmp.cleanup();
         const root = try io_mod.dirRealpathAlloc(std.testing.allocator, fake.tmp.dir, ".");
         defer std.testing.allocator.free(root);
-        {
-            var file = try fake.tmp.dir.createFile(io, "events.jsonl", .{});
-            defer file.close(io);
-            try file.writeStreamingAll(io, events);
-        }
-        const script = try std.testing.allocator.print("#!/bin/sh\nread -r line\ncat '{s}/events.jsonl'\ncat >/dev/null\n", .{root});
+        try fake.tmp.dir.writeFile(io, .{ .sub_path = "events.jsonl", .data = events });
+        if (resume_events) |lines| try fake.tmp.dir.writeFile(io, .{ .sub_path = "resume.jsonl", .data = lines });
+        const script = try std.testing.allocator.print(
+            \\#!/bin/sh
+            \\echo "$*" >> '{0s}/args.log'
+            \\read -r line
+            \\for arg in "$@"; do
+            \\  if [ "$arg" = --resume ] && [ -f '{0s}/resume.jsonl' ]; then cat '{0s}/resume.jsonl'; exit 1; fi
+            \\done
+            \\cat '{0s}/events.jsonl'
+            \\cat >/dev/null
+            \\
+        , .{root});
         defer std.testing.allocator.free(script);
         {
             var file = try fake.tmp.dir.createFile(io, "claude", .{ .permissions = .fromMode(0o755) });
@@ -1378,6 +1538,11 @@ const FakeClaude = struct {
             try file.writeStreamingAll(io, script);
         }
         fake.program = try std.testing.allocator.print("{s}/claude", .{root});
+    }
+
+    /// The fake's arguments, one start per line. Owned by the caller.
+    fn argsLog(fake: *FakeClaude) ![]u8 {
+        return fake.tmp.dir.readFileAlloc(std.testing.io, "args.log", std.testing.allocator, .limited(64 * 1024));
     }
 
     fn deinit(fake: *FakeClaude) void {
@@ -1561,4 +1726,212 @@ test "claude code: a one-shot call returns the reply text" {
             return error.TestUnexpectedResult;
         },
     }
+}
+
+const hello_events =
+    \\{"type":"system","subtype":"init","session_id":"6f1c2a3b-4d5e-4f60-8a7b-9c0d1e2f3a4b"}
+    \\{"type":"stream_event","event":{"type":"message_start","message":{"usage":{"input_tokens":3}}},"parent_tool_use_id":null}
+    \\{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hello there."}},"parent_tool_use_id":null}
+    \\{"type":"stream_event","event":{"type":"message_stop"},"parent_tool_use_id":null}
+    \\{"type":"result","subtype":"success","is_error":false,"result":"Hello there.","stop_reason":"end_turn","session_id":"6f1c2a3b-4d5e-4f60-8a7b-9c0d1e2f3a4b"}
+    \\
+;
+
+test "claude code: a new process maps Claude's names for dotted tools back to fx's" {
+    const events =
+        \\{"type":"stream_event","event":{"type":"message_start","message":{"usage":{"input_tokens":3}}},"parent_tool_use_id":null}
+        \\{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_a","name":"mcp__fx__mcp_linear_list","input":{}}},"parent_tool_use_id":null}
+        \\{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_a","name":"mcp__fx__mcp_linear_list","input":{}}]},"parent_tool_use_id":null}
+        \\{"type":"stream_event","event":{"type":"message_stop"},"parent_tool_use_id":null}
+        \\
+    ;
+    var fake: FakeClaude = undefined;
+    try fake.init(events);
+    defer fake.deinit();
+    const key = "claude-code-test-dotted-tools";
+    defer FakeClaude.stop(key) catch {};
+
+    const functions = [_]model_tool_schema.FunctionSchema{.{ .name = "mcp.linear.list", .description = "Lists issues." }};
+    const messages = [_]types.ChatMessage{.{ .role = .user, .content = "List my issues." }};
+    var result = try agentStep(std.testing.allocator, .{
+        .request = fake.request(key, &messages, .{ .additional_functions = &functions }),
+        .effort = null,
+        .program = fake.program,
+    });
+    defer result.deinit(std.testing.allocator);
+
+    const calls = result.completed.completion.tool_calls;
+    try std.testing.expectEqual(@as(usize, 1), calls.len);
+    try std.testing.expectEqualStrings("mcp.linear.list", calls[0].name);
+}
+
+test "claude code: a process that died between steps is started again, resuming its session" {
+    var fake: FakeClaude = undefined;
+    try fake.init(hello_events);
+    defer fake.deinit();
+    const key = "claude-code-test-died-idle";
+    defer FakeClaude.stop(key) catch {};
+
+    const first = [_]types.ChatMessage{.{ .role = .user, .content = "Say hello." }};
+    var reply = try agentStep(std.testing.allocator, .{ .request = fake.request(key, &first, .{}), .effort = null, .program = fake.program });
+    defer reply.deinit(std.testing.allocator);
+
+    // Kill the process and wait until its output closes, as if it crashed
+    // while fx waited for the user.
+    {
+        const session = try acquire(key);
+        defer release(session);
+        const proc = session.proc.?;
+        proc.signal(.KILL);
+        const deadline = io_mod.milliTimestamp() + 5000;
+        while (io_mod.milliTimestamp() < deadline) : (io_mod.sleep(10 * std.time.ns_per_ms)) {
+            proc.mutex.lockUncancelable(std.testing.io);
+            defer proc.mutex.unlock(std.testing.io);
+            const closed = for (proc.queue.items) |item| {
+                if (item == .stdout_closed) break true;
+            } else false;
+            if (closed) break;
+        }
+    }
+
+    const source: @import("../core/config/model_provider.zig").ProviderSelection = .{ .provider = .claude_code, .model = "claude-haiku-5-5" };
+    const second = [_]types.ChatMessage{
+        first[0],
+        .{ .role = .assistant, .content = "Hello there.", .provider_replay = .{ .source = source, .parts_json = reply.completed.completion.provider_state_json.? } },
+        .{ .role = .user, .content = "Again." },
+    };
+    fake.delivery = .init();
+    var result = try agentStep(std.testing.allocator, .{ .request = fake.request(key, &second, .{}), .effort = null, .program = fake.program });
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualStrings("Hello there.", result.completed.completion.content.?);
+    const args = try fake.argsLog();
+    defer std.testing.allocator.free(args);
+    var lines = std.mem.splitScalar(u8, std.mem.trimEnd(u8, args, "\n"), '\n');
+    _ = lines.next();
+    try std.testing.expect(std.mem.find(u8, lines.next().?, "--resume " ++ fake_session) != null);
+    try std.testing.expect(lines.next() == null);
+}
+
+test "claude code: a resume Claude Code can't find starts a new session in the same step" {
+    const not_found =
+        \\{"type":"result","subtype":"error_during_execution","is_error":true,"num_turns":0,"stop_reason":null,"session_id":"6f1c2a3b-4d5e-4f60-8a7b-9c0d1e2f3a4b","errors":["No conversation found with session ID: 6f1c2a3b-4d5e-4f60-8a7b-9c0d1e2f3a4b"]}
+        \\
+    ;
+    var fake: FakeClaude = undefined;
+    try fake.initResuming(hello_events, not_found);
+    defer fake.deinit();
+    const key = "claude-code-test-resume-missing";
+    defer FakeClaude.stop(key) catch {};
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const first = [_]types.ChatMessage{.{ .role = .user, .content = "one" }};
+    const first_units = try wire.units(arena, &first);
+    const id = wire.formatSessionId(@splat(7));
+    const replay = try wire.writeReplay(arena, .{ .session_id = &id, .units = first_units.len, .digest = wire.digest(first_units) });
+    const source: @import("../core/config/model_provider.zig").ProviderSelection = .{ .provider = .claude_code, .model = "claude-haiku-5-5" };
+    const messages = [_]types.ChatMessage{
+        first[0],
+        .{ .role = .assistant, .content = "ok", .provider_replay = .{ .source = source, .parts_json = replay } },
+        .{ .role = .user, .content = "two" },
+    };
+    var result = try agentStep(std.testing.allocator, .{ .request = fake.request(key, &messages, .{}), .effort = null, .program = fake.program });
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualStrings("Hello there.", result.completed.completion.content.?);
+    try std.testing.expectEqual(@as(usize, 1), fake.admitted);
+    const args = try fake.argsLog();
+    defer std.testing.allocator.free(args);
+    var lines = std.mem.splitScalar(u8, std.mem.trimEnd(u8, args, "\n"), '\n');
+    try std.testing.expect(std.mem.find(u8, lines.next().?, "--resume " ++ &id) != null);
+    try std.testing.expect(std.mem.find(u8, lines.next().?, "--session-id") != null);
+    try std.testing.expect(lines.next() == null);
+}
+
+/// A session wired to one end of a socket pair in place of a bridge
+/// connection, for tests of how results meet `tools/call` requests.
+const BridgeTest = struct {
+    fds: [2]posix.socket_t,
+    proc: Proc,
+    session: Session,
+
+    fn init(self: *BridgeTest) !void {
+        self.fds = undefined;
+        if (std.c.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0, &self.fds) != 0) return error.SocketPairFailed;
+        self.proc = .{ .pid = 0, .stdin = null, .conn = self.fds[0] };
+        self.session = .{ .key = &.{} };
+        self.session.proc = &self.proc;
+    }
+
+    fn deinit(self: *BridgeTest) void {
+        self.session.clearCalls();
+        self.session.pending.deinit(gpa);
+        self.session.arrived.deinit(gpa);
+        self.session.answers.deinit(gpa);
+        if (self.proc.conn) |fd| _ = std.c.close(fd);
+        _ = std.c.close(self.fds[1]);
+    }
+
+    fn pending(tool_use_id: []const u8, wire_name: []const u8) Pending {
+        return .{ .tool_use_id = @constCast(tool_use_id), .wire_name = @constCast(wire_name), .hash = wire.hashText(tool_use_id) };
+    }
+
+    fn call(id_json: []const u8, tool_use_id: []const u8, name: []const u8) !OwnedCall {
+        return .{
+            .id_json = try gpa.dupe(u8, id_json),
+            .tool_use_id = try gpa.dupe(u8, tool_use_id),
+            .name = try gpa.dupe(u8, name),
+        };
+    }
+
+    /// What the session wrote to the bridge since the last read.
+    fn written(self: *BridgeTest, buffer: []u8) []const u8 {
+        const rc = std.c.recv(self.fds[1], buffer.ptr, buffer.len, std.c.MSG.DONTWAIT);
+        return if (rc > 0) buffer[0..@intCast(rc)] else "";
+    }
+};
+
+test "claude code: tool calls without a tool use id take results for their tool in order" {
+    var bridge: BridgeTest = undefined;
+    try bridge.init();
+    defer bridge.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var buffer: [4096]u8 = undefined;
+
+    try bridge.session.answer(arena, BridgeTest.pending("toolu_a", "read_file"), "alpha", false);
+    try bridge.session.answer(arena, BridgeTest.pending("toolu_b", "read_file"), "beta", false);
+    try bridge.session.takeCall(arena, try BridgeTest.call("7", "", "read_file"));
+    const first = bridge.written(&buffer);
+    try std.testing.expect(std.mem.find(u8, first, "\"id\":7,") != null);
+    try std.testing.expect(std.mem.find(u8, first, "alpha") != null);
+    try bridge.session.takeCall(arena, try BridgeTest.call("8", "", "read_file"));
+    try std.testing.expect(std.mem.find(u8, bridge.written(&buffer), "beta") != null);
+
+    // A call that comes first waits for its result.
+    try bridge.session.takeCall(arena, try BridgeTest.call("9", "", "grep_files"));
+    try std.testing.expectEqualStrings("", bridge.written(&buffer));
+    try bridge.session.answer(arena, BridgeTest.pending("toolu_c", "grep_files"), "gamma", false);
+    const late = bridge.written(&buffer);
+    try std.testing.expect(std.mem.find(u8, late, "\"id\":9,") != null);
+    try std.testing.expect(std.mem.find(u8, late, "gamma") != null);
+    try std.testing.expectEqual(@as(usize, 0), bridge.session.arrived.items.len);
+    try std.testing.expectEqual(@as(usize, 0), bridge.session.answers.items.len);
+}
+
+test "claude code: a result that can't reach Claude Code fails instead of waiting" {
+    var bridge: BridgeTest = undefined;
+    try bridge.init();
+    defer bridge.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    try bridge.session.answer(arena, BridgeTest.pending("toolu_a", "read_file"), "alpha", false);
+    _ = std.c.close(bridge.proc.conn.?);
+    bridge.proc.conn = null;
+    try std.testing.expectError(error.BridgeGone, bridge.session.takeCall(arena, try BridgeTest.call("7", "toolu_a", "read_file")));
 }

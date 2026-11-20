@@ -25,6 +25,12 @@ pub const tool_prefix = "mcp__" ++ server_name ++ "__";
 /// with the prefix.
 pub const max_wire_name_bytes = 64 - tool_prefix.len;
 
+/// A tool name Claude called, without the MCP prefix: the name fx gave it
+/// in `tools/list`.
+pub fn bareToolName(called: []const u8) []const u8 {
+    return if (std.mem.startsWith(u8, called, tool_prefix)) called[tool_prefix.len..] else called;
+}
+
 // ---------------------------------------------------------------------------
 // Tool names
 
@@ -32,17 +38,18 @@ pub const max_wire_name_bytes = 64 - tool_prefix.len;
 /// names, which Claude's tool names can't carry, so those get `_` in their
 /// place; a name that would collide gets a numeric suffix.
 pub const ToolNames = struct {
-    fx: std.ArrayList([]const u8) = .empty,
+    fx: std.ArrayList([]u8) = .empty,
     wire: std.ArrayList([]u8) = .empty,
 
     pub fn deinit(self: *ToolNames, alloc: Allocator) void {
         for (self.wire.items) |name| alloc.free(name);
+        for (self.fx.items) |name| alloc.free(name);
         self.wire.deinit(alloc);
         self.fx.deinit(alloc);
         self.* = .{};
     }
 
-    /// Adds `name`, borrowed until deinit, and returns its wire name.
+    /// Adds a copy of `name` and returns its wire name, owned by the map.
     pub fn add(self: *ToolNames, alloc: Allocator, name: []const u8) ![]const u8 {
         var buf: [max_wire_name_bytes]u8 = undefined;
         const base_len = @min(name.len, max_wire_name_bytes);
@@ -62,9 +69,12 @@ pub const ToolNames = struct {
         }
         const owned = try alloc.dupe(u8, candidate);
         errdefer alloc.free(owned);
-        try self.wire.append(alloc, owned);
-        errdefer _ = self.wire.pop();
-        try self.fx.append(alloc, name);
+        const fx_name = try alloc.dupe(u8, name);
+        errdefer alloc.free(fx_name);
+        try self.wire.ensureUnusedCapacity(alloc, 1);
+        try self.fx.ensureUnusedCapacity(alloc, 1);
+        self.wire.appendAssumeCapacity(owned);
+        self.fx.appendAssumeCapacity(fx_name);
         return owned;
     }
 
@@ -78,8 +88,7 @@ pub const ToolNames = struct {
     /// The fx name for a name Claude called, with or without the MCP
     /// prefix. Null for a tool fx never offered.
     pub fn fxName(self: *const ToolNames, called: []const u8) ?[]const u8 {
-        const bare = if (std.mem.startsWith(u8, called, tool_prefix)) called[tool_prefix.len..] else called;
-        const index = self.wireIndex(bare) orelse return null;
+        const index = self.wireIndex(bareToolName(called)) orelse return null;
         return self.fx.items[index];
     }
 };
@@ -95,6 +104,28 @@ test "claude code: tool names keep valid names and map dotted ones back" {
     try std.testing.expectEqualStrings("mcp.linear.list", names.fxName("mcp__fx__mcp_linear_list").?);
     try std.testing.expectEqualStrings("mcp_linear_list", names.fxName("mcp_linear_list_2").?);
     try std.testing.expect(names.fxName("mcp__fx__nope") == null);
+}
+
+test "claude code: tool names keep their own copy of fx's names" {
+    const alloc = std.testing.allocator;
+    var names: ToolNames = .{};
+    defer names.deinit(alloc);
+    // A request's tool names live only as long as its step.
+    const borrowed = try alloc.dupe(u8, "mcp.linear.list");
+    _ = try names.add(alloc, borrowed);
+    alloc.free(borrowed);
+    try std.testing.expectEqualStrings("mcp.linear.list", names.fxName("mcp__fx__mcp_linear_list").?);
+}
+
+test "claude code: tool names free what they hold when an add fails" {
+    try std.testing.checkAllAllocationFailures(@import("../core/shared/testing_allocator.zig").no_resize, addTwoNames, .{});
+}
+
+fn addTwoNames(alloc: Allocator) !void {
+    var names: ToolNames = .{};
+    defer names.deinit(alloc);
+    _ = try names.add(alloc, "read_file");
+    _ = try names.add(alloc, "mcp.linear.list");
 }
 
 /// Writes the MCP `tools/list` result for `functions` and records their
@@ -223,6 +254,15 @@ fn stringField(object: std.json.ObjectMap, key: []const u8) ?[]const u8 {
     return if (value == .string) value.string else null;
 }
 
+fn firstError(object: std.json.ObjectMap) ?[]const u8 {
+    const value = object.get("errors") orelse return null;
+    if (value != .array) return null;
+    for (value.array.items) |item| {
+        if (item == .string and item.string.len > 0) return item.string;
+    }
+    return null;
+}
+
 fn objectField(object: std.json.ObjectMap, key: []const u8) ?std.json.ObjectMap {
     const value = object.get(key) orelse return null;
     return if (value == .object) value.object else null;
@@ -276,10 +316,12 @@ pub fn parseStdoutLine(arena: Allocator, line: []const u8) !StdoutLine {
             structured = try std.json.Stringify.valueAlloc(arena, output, .{});
         };
         const is_error = if (root.get("is_error")) |flag| flag == .bool and flag.bool else false;
+        // A turn that failed before it ran, such as a `--resume` with no
+        // conversation, says why in `errors` instead of `result`.
         return .{ .result = .{
             .is_error = is_error,
             .subtype = stringField(root, "subtype"),
-            .text = stringField(root, "result"),
+            .text = stringField(root, "result") orelse firstError(root),
             .stop_reason = stringField(root, "stop_reason"),
             .session_id = stringField(root, "session_id"),
             .structured_json = structured,
@@ -421,6 +463,10 @@ test "claude code: assistant messages carry tool input and errors" {
     );
     try std.testing.expect(result.result.is_error);
     try std.testing.expectEqualStrings("Not logged in · Please run /login", result.result.text.?);
+    const unresumed = try parseStdoutLine(arena,
+        \\{"type":"result","subtype":"error_during_execution","is_error":true,"num_turns":0,"stop_reason":null,"session_id":"s","errors":["No conversation found with session ID: s"]}
+    );
+    try std.testing.expectEqualStrings("No conversation found with session ID: s", unresumed.result.text.?);
     const limited = try parseStdoutLine(arena,
         \\{"type":"rate_limit_event","rate_limit_info":{"status":"rejected","resetsAt":1794726000}}
     );
@@ -922,6 +968,8 @@ pub const FailureClass = enum {
     billing,
     invalid_request,
     overloaded,
+    /// `--resume` named a conversation Claude Code doesn't have.
+    session_not_found,
     other,
 };
 
@@ -938,6 +986,7 @@ pub fn classifyFailure(error_kind: ?[]const u8, text: ?[]const u8) FailureClass 
     const detail = text orelse return .other;
     if (std.mem.find(u8, detail, "Not logged in") != null or std.mem.find(u8, detail, "/login") != null) return .not_signed_in;
     if (std.mem.find(u8, detail, "hit your limit") != null or std.mem.find(u8, detail, "usage limit") != null) return .usage_limit;
+    if (std.mem.find(u8, detail, "No conversation found") != null) return .session_not_found;
     return .other;
 }
 
@@ -947,4 +996,5 @@ test "claude code: failures are classified from the error kind first" {
     try std.testing.expectEqual(FailureClass.usage_limit, classifyFailure("rate_limit", "anything"));
     try std.testing.expectEqual(FailureClass.usage_limit, classifyFailure(null, "You've hit your limit · resets 5pm"));
     try std.testing.expectEqual(FailureClass.other, classifyFailure("unknown", "boom"));
+    try std.testing.expectEqual(FailureClass.session_not_found, classifyFailure(null, "No conversation found with session ID: x"));
 }
