@@ -7171,14 +7171,18 @@ pub const TranscriptRuntime = struct {
         var line_buf: [128]u8 = undefined;
         const line = formatTurnSummaryLine(&line_buf, summary);
         const entry = try alloc.print("{s}{s}{s}\n", .{ ui_render.dim_style, line, ui_render.reset_style });
-        errdefer alloc.free(entry);
-        const entry_id = try transcript_store.appendRawBytesEntryClassifiedAt(
+        // The notebook owns `entry` once the append succeeds, so only a failed
+        // append frees it.
+        const entry_id = transcript_store.appendRawBytesEntryClassifiedAt(
             self,
             alloc,
             entry,
             .turn_summary,
             if (summary.completed_at_ms > 0) summary.completed_at_ms else io_mod.milliTimestamp(),
-        );
+        ) catch |err| {
+            alloc.free(entry);
+            return err;
+        };
         self.markTranscriptContentDirtyFrom(entry_id);
         try self.syncTranscriptWindow(alloc);
         return entry_id;
@@ -7270,6 +7274,7 @@ pub const TranscriptRuntime = struct {
             }
         }
         window.pending_drops.shrinkRetainingCapacity(kept);
+        try self.keepTurnsOfStayingSummaries(alloc, window, &ready);
         if (kept > 0) debug_trace.logf("transcript_window", "drop held entries={d} on screen", .{kept});
         _ = try transcript_store.dropEntriesAtomic(self, alloc, ready.items);
     }
@@ -7289,6 +7294,7 @@ pub const TranscriptRuntime = struct {
         var ready = window.pending_drops;
         window.pending_drops = .empty;
         defer ready.deinit(alloc);
+        try self.keepTurnsOfStayingSummaries(alloc, window, &ready);
         debug_trace.logf("transcript_window", "screen cleared: releasing held drops entries={d}", .{ready.items.len});
         _ = try transcript_store.dropEntriesAtomic(self, alloc, ready.items);
     }
@@ -7340,6 +7346,50 @@ pub const TranscriptRuntime = struct {
             if (owner) |id| try set.put(alloc, id, {});
         }
         return .{ .entries = set };
+    }
+
+    /// Keeps pending, out of `ready`, every entry of each turn whose summary
+    /// stays, back to the turn's prompt. A turn summary recaps its turn from
+    /// the turn's entries (`tool_group_projection.recapTurnSummary`), so a
+    /// turn leaves only together with its summary.
+    fn keepTurnsOfStayingSummaries(
+        self: *TranscriptRuntime,
+        alloc: Allocator,
+        window: *transcript_window_shell.Shell,
+        ready: *std.ArrayList(u32),
+    ) !void {
+        if (ready.items.len == 0) return;
+        var leaving: std.AutoHashMapUnmanaged(u32, void) = .empty;
+        defer leaving.deinit(alloc);
+        for (ready.items) |id| try leaving.put(alloc, id, {});
+        var keep: std.AutoHashMapUnmanaged(u32, void) = .empty;
+        defer keep.deinit(alloc);
+        const entries = self.notebook.entries.items;
+        for (entries, 0..) |entry, index| {
+            const raw = switch (entry) {
+                .raw_bytes => |value| value,
+                else => continue,
+            };
+            if (raw.class != .turn_summary or leaving.contains(raw.id)) continue;
+            var start = tool_group_projection.turnSummaryTurnStart(entries, index);
+            if (start > 0 and std.meta.activeTag(entries[start - 1]) == .user_turn) start -= 1;
+            for (entries[start..index]) |held| {
+                if (leaving.contains(held.id())) try keep.put(alloc, held.id(), {});
+            }
+        }
+        if (keep.count() == 0) return;
+        try window.pending_drops.ensureUnusedCapacity(alloc, keep.count());
+        var still: usize = 0;
+        for (ready.items) |id| {
+            if (keep.contains(id)) {
+                window.pending_drops.appendAssumeCapacity(id);
+            } else {
+                ready.items[still] = id;
+                still += 1;
+            }
+        }
+        ready.shrinkRetainingCapacity(still);
+        debug_trace.logf("transcript_window", "drop kept turn entries={d} for their summary", .{keep.count()});
     }
 
     /// Swap the bytes of the `raw_bytes` entry with `entry_id` to a dup of

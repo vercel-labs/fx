@@ -62,6 +62,7 @@ else
     struct {};
 const tool_presentation = @import("../tooling/tool_presentation.zig");
 const tool_runtime = @import("../tooling/tool_runtime.zig");
+const toolbox = @import("../tooling/toolbox.zig");
 const skill_invocation = @import("../skills/skill_invocation.zig");
 const web_fetch_runtime = @import("../tooling/web_fetch_runtime.zig");
 const web_search_runtime = @import("../tooling/web_search_runtime.zig");
@@ -1758,11 +1759,14 @@ const ToolActionState = enum { active, completed, denied };
 fn formatToolAction(
     ctx: tool_runtime.Context,
     arena: Allocator,
-    call: ToolCall,
+    model_call: ToolCall,
     display_target: ?[]const u8,
     state: ToolActionState,
     denied_label: ?[]const u8,
 ) ![]const u8 {
+    // A toolbox run of a built-in tool reads as a direct call of that tool,
+    // as a saved call does on resume and the call fx runs for it does live.
+    const call = try toolbox.shownBuiltinRun(arena, ctx.tool_registry, model_call) orelse model_call;
     if (std.mem.eql(u8, call.name, "web_search") or tool_presentation.isProviderSearchAlias(call.name)) {
         return formatWebSearchAction(arena, call, state, denied_label);
     }
@@ -2974,6 +2978,54 @@ test "app agent runtime formats registered tool labels from context registry" {
     const completed = try app.describeToolActionCompleted(app.agent(), arena, call);
     try std.testing.expect(std.mem.find(u8, completed, "Custom ran") != null);
     try std.testing.expect(std.mem.find(u8, completed, "registry value") != null);
+}
+
+test "a toolbox run of a built-in tool reads as a direct call of it in every state" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var app = try FakeApp.init(alloc);
+    defer app.deinit();
+    app.tool_registry = test_builtin_tools.registry;
+
+    const cases = [_]struct { name: []const u8, arguments: []const u8, active: []const u8, completed: []const u8, value: []const u8 }{
+        .{ .name = "web_fetch", .arguments = "{\"url\":\"https://example.com/page\"}", .active = "Fetching", .completed = "Fetched", .value = "https://example.com/page" },
+        .{ .name = "web_search", .arguments = "{\"query\":\"zig release notes\"}", .active = "Searching", .completed = "Searched", .value = "zig release notes" },
+        .{ .name = "read_file", .arguments = "{\"path\":\"notes.txt\"}", .active = "Reading", .completed = "Read", .value = "notes.txt" },
+        .{ .name = "glob_files", .arguments = "{\"pattern\":\"*.md\"}", .active = "Matching", .completed = "Matched", .value = "*.md" },
+        .{ .name = "shell", .arguments = "{\"action\":\"run\",\"command\":\"zig build\"}", .active = "Running", .completed = "Ran", .value = "build" },
+    };
+    for (cases) |case| {
+        const direct: ToolCall = .{ .id = "direct", .name = case.name, .arguments_json = case.arguments };
+        const run: ToolCall = .{
+            .id = "run",
+            .name = "toolbox",
+            .arguments_json = try arena.print("{{\"run\":\"{s}\",\"arguments\":{s}}}", .{ case.name, case.arguments }),
+        };
+        const active = try app.describeToolAction(app.agent(), arena, run);
+        try std.testing.expectEqualStrings(try app.describeToolAction(app.agent(), arena, direct), active);
+        try std.testing.expect(std.mem.startsWith(u8, active, try arena.print("● {s}\x1b[0m", .{case.active})));
+        try std.testing.expect(std.mem.find(u8, active, case.value) != null);
+        const completed = try app.describeToolActionCompleted(app.agent(), arena, run);
+        try std.testing.expectEqualStrings(try app.describeToolActionCompleted(app.agent(), arena, direct), completed);
+        try std.testing.expect(std.mem.startsWith(u8, completed, try arena.print("● {s}\x1b[0m", .{case.completed})));
+        for ([_][]const u8{ "Failed", "Denied", "Cancelled" }) |label| {
+            const stopped = try app.describeToolActionDenied(app.agent(), arena, run, label);
+            try std.testing.expectEqualStrings(try app.describeToolActionDenied(app.agent(), arena, direct, label), stopped);
+            try std.testing.expect(std.mem.find(u8, stopped, case.value) != null);
+        }
+    }
+
+    // An MCP tool's run reads as a direct call of it already, and a name fx
+    // doesn't hold keeps toolbox's own row, which names it.
+    const mcp: ToolCall = .{ .id = "mcp", .name = "toolbox", .arguments_json = "{\"run\":\"mcp_fixture_echo\",\"arguments\":{}}" };
+    try std.testing.expectEqualStrings("● Running MCP\x1b[0m \x1b[38;5;245mmcp_fixture_echo\x1b[0m", try app.describeToolAction(app.agent(), arena, mcp));
+    try std.testing.expectEqualStrings("● Ran MCP\x1b[0m \x1b[38;5;245mmcp_fixture_echo\x1b[0m", try app.describeToolActionCompleted(app.agent(), arena, mcp));
+    const unknown: ToolCall = .{ .id = "unknown", .name = "toolbox", .arguments_json = "{\"run\":\"no_such_tool\",\"arguments\":{}}" };
+    try std.testing.expectEqualStrings("● Running\x1b[0m \x1b[38;5;245mno_such_tool\x1b[0m", try app.describeToolAction(app.agent(), arena, unknown));
+    try std.testing.expectEqualStrings("● Failed\x1b[0m \x1b[38;5;245mno_such_tool\x1b[0m", try app.describeToolActionDenied(app.agent(), arena, unknown, "Failed"));
 }
 
 test "app agent runtime bounds a large multiline run command activity" {
