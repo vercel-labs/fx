@@ -87,6 +87,15 @@
     "repair": []
   },
   {
+    "module": "ErrorData",
+    "smoke": "ErrorData.cfg",
+    "stress": "ErrorData.stress.cfg",
+    "findings": [
+      { "config": "ErrorData.findings.cfg", "invariant": "ErrorDataReachesModel" }
+    ],
+    "repair": []
+  },
+  {
     "module": "ConfigEdit",
     "smoke": "ConfigEdit.cfg",
     "stress": "ConfigEdit.stress.cfg",

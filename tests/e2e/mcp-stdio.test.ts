@@ -116,6 +116,16 @@ type RootOptions = {
     | "refused_reply";
   startupTimeoutMs?: number;
   protocolErrorMessage?: string;
+  /** The JSON the invalid_params fixture sends as its error's `data`. */
+  protocolErrorData?: unknown;
+  /** The size of a `data` member the invalid_params fixture builds. */
+  protocolErrorDataBytes?: number;
+  /** The code the invalid_params fixture sends. */
+  protocolErrorCode?: number;
+  /** Sets `max_tool_result_bytes` in the workspace's `.fx.json`, the cap on the text a tool result gives the model. */
+  resultCapBytes?: number;
+  /** How the invalid_params fixture breaks its reply: "pieces" or "cut". */
+  protocolErrorFault?: "pieces" | "cut";
   /** Nests JSON `depth` levels deep at `site` in the legacy fixture's reply or tool list (see the fixture). */
   deep?: { site: string; depth: number; shape?: "object" | "array" | "mixed"; fault?: "cut" };
   /** The text a `tool_failure` server's error carries, or a `tool_protocol_error` server's message, in place of its plain two lines. */
@@ -175,6 +185,9 @@ function createRoot(
     : [process.execPath, scriptPath];
   mkdirSync(join(home, ".fx"), { recursive: true });
   mkdirSync(workspace, { recursive: true });
+  if (options.resultCapBytes !== undefined) {
+    writeFileSync(join(workspace, ".fx.json"), JSON.stringify({ max_tool_result_bytes: options.resultCapBytes }));
+  }
   writeFileSync(
     join(home, ".fx", "settings.json"),
     JSON.stringify({}),
@@ -203,6 +216,12 @@ function createRoot(
             FX_MCP_MODE: options.mode ?? "normal",
             FX_MCP_IMAGE_PATH: options.image ? imagePath : undefined,
             FX_MCP_PROTOCOL_ERROR_MESSAGE: options.protocolErrorMessage,
+            FX_MCP_PROTOCOL_ERROR_DATA: options.protocolErrorData === undefined
+              ? undefined
+              : JSON.stringify(options.protocolErrorData),
+            FX_MCP_PROTOCOL_ERROR_DATA_BYTES: options.protocolErrorDataBytes?.toString(),
+            FX_MCP_PROTOCOL_ERROR_CODE: options.protocolErrorCode?.toString(),
+            FX_MCP_PROTOCOL_ERROR_FAULT: options.protocolErrorFault,
             FX_MCP_DEEP_SITE: options.deep?.site,
             FX_MCP_DEEP_DEPTH: options.deep?.depth.toString(),
             FX_MCP_DEEP_SHAPE: options.deep?.shape,
@@ -2709,6 +2728,235 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"`,
       await tui.kill();
       tui = null;
       await expectFixtureProcessesExited(wire);
+    },
+    45_000,
+  );
+
+  // The text a failed MCP call gives the model, from the fake gateway's request that carries it.
+  function modelTextOf(body: string | undefined, needle: string): string {
+    const found: string[] = [];
+    const walk = (value: unknown) => {
+      if (typeof value === "string") {
+        if (value.includes(needle)) found.push(value);
+      } else if (Array.isArray(value)) value.forEach(walk);
+      else if (value && typeof value === "object") Object.values(value).forEach(walk);
+    };
+    walk(JSON.parse(body ?? "null"));
+    expect(found.length).toBeGreaterThan(0);
+    return found.at(-1)!;
+  }
+
+  // A 2025 server, as Datadog's is: a 2026 server's -32602 on a call makes fx negotiate the protocol again.
+  // Returns the model's text for the failed call, the trace log (every scope) and standard error fx wrote meanwhile,
+  // and what the TUI showed. With `report`, it also runs /trace and returns the report fx wrote, as text and records.
+  async function refusedCall(label: string, options: RootOptions, finalText: string, report = false) {
+    const root = createRoot(label, LEGACY_FIXTURE, { mode: "invalid_params", legacyVersion: "2025-06-18", ...options });
+    const activeGateway = startToolGateway(finalText);
+    gateway = activeGateway;
+    const stderrPath = join(root.root, "stderr.log");
+    const traceLog = join(root.root, "trace.log");
+    tui = await TmuxSession.create({
+      isolated: true,
+      cwd: root.workspace,
+      width: 120,
+      height: 32,
+      stderrPath,
+      // No scope list: the trace log gets every scope. /trace writes its report to TMPDIR.
+      env: { ...fixtureEnv(root, activeGateway), FX_TRACE_LOG: traceLog, FX_TRACE_SCOPES: undefined, TMPDIR: root.root },
+    });
+    await tui.waitForComposer(15_000);
+    await tui.sendText("Call the MCP fixture with a typed argument.");
+    await tui.waitForText(finalText, 25_000);
+    const body = activeGateway.requests.at(-1)?.body;
+    const screen = await tui.captureFullScrollback();
+    let traced: { records: Array<Record<string, unknown>>; calls: Array<Record<string, unknown>> } | null = null;
+    if (report) {
+      const before = new Set(traceReportNames(root.root));
+      await tui.sendText("/trace");
+      const written = await waitForNewTraceReport(root.root, before);
+      traced = { records: written.records, calls: written.all("tool_call") as Array<Record<string, unknown>> };
+    }
+    const wire = readWire(root.wireLogPath);
+    expect(wire.filter((entry) => entry.message.method === "tools/call")).toHaveLength(1);
+    await tui.kill();
+    tui = null;
+    await expectFixtureProcessesExited(wire);
+    const logs = (existsSync(traceLog) ? readFileSync(traceLog, "utf8") : "") + readFileSync(stderrPath, "utf8");
+    return { body, logs, screen, traced, text: () => modelTextOf(body, "MCP protocol error") };
+  }
+
+  test.skipIf(!tmuxAvailable())(
+    "the model gets the details a server gives with a rejected call, after the server's message",
+    async () => {
+      const data = { errors: [{ path: ["limit"], expected: "number", received: "string" }] };
+      const call = await refusedCall("tui-invalid-params-data", { protocolErrorData: data }, "Rejected arguments data complete.");
+      const text = call.text();
+      expect(text).toContain("validating /properties/limit");
+      expect(text).toContain(`; data=${JSON.stringify(data)}`);
+    },
+    45_000,
+  );
+
+  test.skipIf(!tmuxAvailable())(
+    "the model gets a bounded cut of a huge error data, with a marker",
+    async () => {
+      const text = (await refusedCall("tui-invalid-params-huge-data", { protocolErrorDataBytes: 300_000 }, "Huge data complete.")).text();
+      expect(text).toContain("; data=");
+      expect(text).toContain("truncated");
+      expect(text.length).toBeLessThan(16 * 1024);
+    },
+    45_000,
+  );
+
+  test.skipIf(!tmuxAvailable())(
+    "the model gets a bounded cut of a huge error data a server sends in pieces",
+    async () => {
+      const text = (await refusedCall(
+        "tui-invalid-params-pieces",
+        { protocolErrorDataBytes: 300_000, protocolErrorFault: "pieces" },
+        "Pieces complete.",
+      )).text();
+      expect(text).toContain("; data=");
+      expect(text).toContain("truncated");
+      expect(text.length).toBeLessThan(16 * 1024);
+    },
+    45_000,
+  );
+
+  test.skipIf(!tmuxAvailable())(
+    "the model's text for a rejected call stays the server's message when the server gives no data",
+    async () => {
+      const text = (await refusedCall("tui-invalid-params-no-data", {}, "No data complete.")).text();
+      expect(text).toContain("validating /properties/limit");
+      expect(text).not.toContain("data=");
+      expect(text.startsWith("MCP protocol error -32602: validating")).toBe(true);
+    },
+    45_000,
+  );
+
+  test.skipIf(!tmuxAvailable())(
+    "the model's text leaves out a null data and the data of a -32042 that lists no URL",
+    async () => {
+      const nothing = (await refusedCall("tui-invalid-params-null-data", { protocolErrorData: null }, "Null data complete.")).text();
+      expect(nothing).not.toContain("data=");
+      // A -32042 whose list holds no URL: nothing for the user to open, so the model gets what it got before.
+      const url = (await refusedCall(
+        "tui-invalid-params-url-data",
+        { protocolErrorCode: -32042, protocolErrorData: { elicitations: [] } },
+        "Url data complete.",
+      )).text();
+      expect(url).toContain("MCP protocol error -32042:");
+      expect(url).not.toContain("data=");
+    },
+    90_000,
+  );
+
+  test.skipIf(!tmuxAvailable())(
+    "the model gets the data of an error with a code other than -32602",
+    async () => {
+      const other = (await refusedCall(
+        "tui-invalid-params-other-code",
+        { protocolErrorCode: -32603, protocolErrorData: { trace: "t-7" } },
+        "Other code complete.",
+      )).text();
+      expect(other).toContain("MCP protocol error -32603:");
+      expect(other).toContain('; data={"trace":"t-7"}');
+    },
+    45_000,
+  );
+
+  test.skipIf(!tmuxAvailable())(
+    "an error's data never reaches a trace, a log line, the trace report or the cause line",
+    async () => {
+      const marker = "leak-marker-7f3a91c2";
+      // Data that tries to forge the cause line: a zod-like list of its own, and eight labels like the one fx
+      // writes before the data. It is long enough that the text is past 8 KiB, so the trace report reads a
+      // 4 KiB head of it, and still whole for the model.
+      const issues = [{ expected: "string", received: "number", path: [marker] }];
+      const hint = `${"; data=".repeat(8)}${marker}`;
+      const fill = 8150 - JSON.stringify({ errors: issues, hint }).length;
+      const data = { errors: issues, hint: hint + "x".repeat(fill) };
+      const cases = [
+        // A zod message keeps its own cause. The data's list used to take it in the 4 KiB head the report reads.
+        ["zod", `Invalid arguments: ${JSON.stringify([{ expected: "number", received: "string", path: ["limit"] }])}`, "arguments rejected: limit is a string, the schema wants a number"],
+        // A plain message has no cause of its own. The data's list used to give it one.
+        ["plain", "Invalid params", "the server rejected the call's parameters (-32602)"],
+        // Any other code has no cause line: the line is the server's message, as it is without data, and no data.
+        ["other-code", "Internal error", null],
+      ] as const;
+      for (const [kind, message, cause] of cases) {
+        const logged = await refusedCall(
+          `tui-invalid-params-log-${kind}`,
+          { protocolErrorMessage: message, protocolErrorData: data, ...(cause === null ? { protocolErrorCode: -32603 } : {}) },
+          `Log ${kind} complete.`,
+          true,
+        );
+        const text = logged.text();
+        expect(text.length).toBeGreaterThan(8 * 1024);
+        expect(text).toContain(`; data=${JSON.stringify(data)}`);
+        // The data words are nowhere but the model's text: not in a trace or log line, stderr, or what the TUI
+        // showed. The report /trace wrote holds the failed call's result, which is that text, and the word is in
+        // no other field of it: the cause is the server's message's and nothing of the data.
+        expect({ kind, found: logged.logs.includes(marker) }).toEqual({ kind, found: false });
+        expect({ kind, found: logged.screen.includes(marker) }).toEqual({ kind, found: false });
+        expect(logged.screen).toContain(`Couldn't run ${TOOL_NAME} · ${cause ?? `MCP protocol error -32603: ${message}`}`);
+        expect({ kind, shown: logged.screen.includes("data=") }).toEqual({ kind, shown: false });
+        const reportFields: string[] = [];
+        const walk = (value: unknown, path: string) => {
+          if (typeof value === "string") {
+            if (value.includes(marker)) reportFields.push(path);
+          } else if (Array.isArray(value)) value.forEach((item) => walk(item, path));
+          else if (value && typeof value === "object") for (const [key, item] of Object.entries(value)) walk(item, `${path}.${key}`);
+        };
+        for (const record of logged.traced!.records) walk(record, String(record.type));
+        expect(reportFields.length).toBeGreaterThan(0);
+        expect(reportFields.every((field) => field === "tool_call.result" || field === "failed_tool_call.result")).toBe(true);
+        expect({ kind, causes: logged.traced!.calls.filter((call) => (cause === null ? call.cause !== undefined : call.cause === cause)).length }).toEqual({ kind, causes: cause === null ? 0 : 1 });
+      }
+    },
+    120_000,
+  );
+
+  test.skipIf(!tmuxAvailable())(
+    "a project that sets max_tool_result_bytes below a refused call's error text still sees the cause",
+    async () => {
+      // The error text is over the cap, so the result store keeps it outside the session, and the model gets
+      // the first 4 KiB of it in a preview block. The cause on the TUI line comes from that head.
+      const marker = "cap-marker-4d2e18b0";
+      const issue = { code: "invalid_type", expected: "number", received: "string", path: ["limit"] };
+      const data = {
+        errors: [{ expected: "string", received: "number", path: [marker] }],
+        hint: `${"; data=".repeat(8)}${marker}`,
+        filler: "x".repeat(3000),
+      };
+      const cases = [
+        ["zod", { protocolErrorMessage: `Invalid arguments: ${JSON.stringify([issue])}`, protocolErrorData: data }, "arguments rejected: limit is a string, the schema wants a number"],
+        ["plain", { protocolErrorMessage: "Invalid params", protocolErrorData: data }, "the server rejected the call's parameters (-32602)"],
+        // The message alone is over the cap, with no data: the same gap was in the code before data was kept.
+        ["long-message", { protocolErrorMessage: `Invalid arguments: ${JSON.stringify([{ ...issue, message: "y".repeat(2600) }])}` }, "arguments rejected: limit is a string, the schema wants a number"],
+        // Any other code shows the server's message, and none of the data the stored text holds.
+        ["other-code", { protocolErrorMessage: "Internal error", protocolErrorCode: -32603, protocolErrorData: data }, "MCP protocol error -32603: Internal error"],
+      ] as const;
+      for (const [kind, options, cause] of cases) {
+        const call = await refusedCall(`tui-invalid-params-cap-${kind}`, { ...options, resultCapBytes: 2000 }, `Cap ${kind} complete.`);
+        // The cap stored the text, so the case is not passing for want of the block.
+        expect({ kind, stored: call.body?.includes("<tool_result_preview handle=") }).toEqual({ kind, stored: true });
+        expect(call.screen).toContain(`Couldn't run ${TOOL_NAME} · ${cause}`);
+        expect({ kind, shown: call.screen.includes("tool_result_preview") }).toEqual({ kind, shown: false });
+        expect({ kind, shown: call.screen.includes("data=") }).toEqual({ kind, shown: false });
+        expect({ kind, found: call.screen.includes(marker) || call.logs.includes(marker) }).toEqual({ kind, found: false });
+      }
+    },
+    120_000,
+  );
+
+  test.skipIf(!tmuxAvailable())(
+    "a reply that is cut off leaves the model no error data and writes none to a log",
+    async () => {
+      const marker = "leak-marker-7f3a91c2";
+      const broken = await refusedCall("tui-invalid-params-cut", { protocolErrorData: { detail: marker }, protocolErrorFault: "cut" }, "Cut complete.");
+      expect(broken.logs).not.toContain(marker);
+      expect(JSON.stringify(broken.body)).not.toContain(marker);
     },
     45_000,
   );
