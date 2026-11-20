@@ -257,7 +257,13 @@ The `TLA+ subagent and session-write models` job takes a few minutes and runs it
 - The models in `tests/tla/subagent/`, the session-write and live sessions models in `tests/tla/session/`, or their drivers in `tests/tla/drivers/subagent/`, `tests/tla/drivers/session/write.test.ts`, and `tests/tla/drivers/session/live.test.ts`
 - The shared code in `tests/tla/lib/` and `tests/tla/drivers/lib/`, or the helpers those drivers load: `tests/e2e/tmux-helpers.ts` and `tests/evals/eval-helpers.ts`
 
-All four run when the change touches `build.zig`, `build.zig.zon`, or `.github/workflows/ci.yml`, and on every push to `main`. When the detector can't read the change, `Build & Test` fails instead of passing.
+The `TLA+ ACP models and drivers` job takes about 5 minutes and runs its checks when the change touches:
+
+- `src/acp/`
+- The models in `tests/tla/acp/` or their drivers in `tests/tla/drivers/acp/`
+- The code those drivers share: `tests/tla/drivers/lib/` and `tests/tla/lib/`, or the fake Gateway they load from `tests/e2e/tmux-helpers.ts`
+
+All five run when the change touches `build.zig`, `build.zig.zon`, or `.github/workflows/ci.yml`, and on every push to `main`. When the detector can't read the change, `Build & Test` fails instead of passing.
 
 Other workflows and benchmark jobs also report on pull requests, such as the `Examples` workflow when `examples/` changes and the `Shell command overhead` benchmark. Only the five checks above are required to merge, but look into any check that fails. Two of the others need more explanation:
 

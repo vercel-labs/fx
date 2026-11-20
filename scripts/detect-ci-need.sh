@@ -39,15 +39,21 @@
 # helpers the drivers load: tests/e2e/tmux-helpers.ts and
 # tests/evals/eval-helpers.ts.
 #
-# All four run when the change touches build.zig, build.zig.zon,
+# acp: the TLA+ ACP models and drivers job model-checks tests/tla/acp/ and
+# drives the built fx acp along those models. A pull request runs it only when
+# it touches src/acp/, those models, their drivers in tests/tla/drivers/acp/,
+# the code they share: tests/tla/drivers/lib/ and tests/tla/lib/, or the fake
+# Gateway the drivers load from tests/e2e/tmux-helpers.ts.
+#
+# All five run when the change touches build.zig, build.zig.zon,
 # .github/workflows/ci.yml, or this script. A change to shared code the checks
 # also run, such as the agent loop, is checked by the run on main. Set
 # CI_NEED_REQUESTED to a reason to force every check.
 #
-# Writes libfx, mcp, transcript_window, and subagent, each true or false, to
-# $GITHUB_OUTPUT and the reasons to $GITHUB_STEP_SUMMARY when those files are
-# set. Exits non-zero when either revision cannot be read, so the checks fail
-# instead of passing without having looked at the change.
+# Writes libfx, mcp, transcript_window, subagent, and acp, each true or false,
+# to $GITHUB_OUTPUT and the reasons to $GITHUB_STEP_SUMMARY when those files
+# are set. Exits non-zero when either revision cannot be read, so the checks
+# fail instead of passing without having looked at the change.
 set -euo pipefail
 
 if [ "$#" -ne 2 ]; then
@@ -62,10 +68,12 @@ libfx=false
 mcp=false
 transcript_window=false
 subagent=false
+acp=false
 libfx_reasons=()
 mcp_reasons=()
 transcript_window_reasons=()
 subagent_reasons=()
+acp_reasons=()
 
 require_libfx() {
   libfx=true
@@ -87,11 +95,17 @@ require_subagent() {
   subagent_reasons+=("$1")
 }
 
+require_acp() {
+  acp=true
+  acp_reasons+=("$1")
+}
+
 require_all() {
   require_libfx "$1"
   require_mcp "$1"
   require_transcript_window "$1"
   require_subagent "$1"
+  require_acp "$1"
 }
 
 for revision in "$base" "$head"; do
@@ -125,10 +139,13 @@ while IFS= read -r path; do
     # *.mjs pattern below would take these folders' .mjs files too.
     tests/tla/drivers/mcp/* | tests/tla/drivers/mcp_host/*)
       require_mcp "$path: MCP driver changed" ;;
+    tests/tla/drivers/acp/*)
+      require_acp "$path: ACP driver changed" ;;
     tests/tla/drivers/lib/*)
       require_mcp "$path: shared driver code changed"
       require_transcript_window "$path: shared driver code changed"
-      require_subagent "$path: shared driver code changed" ;;
+      require_subagent "$path: shared driver code changed"
+      require_acp "$path: shared driver code changed" ;;
     tests/tla/drivers/subagent/* | tests/tla/drivers/session/write.test.ts | tests/tla/drivers/session/live.test.ts)
       require_subagent "$path: subagent, session-write, or live sessions driver changed" ;;
     tests/tla/drivers/transcript_window/*)
@@ -143,7 +160,10 @@ while IFS= read -r path; do
       fi ;;
     src/napi_*.zig | src/wasm_core_main.zig)
       require_libfx "$path: libfx entry point changed" ;;
-    src/acp/* | src/core/hosts/* | src/core/session_manager/*)
+    src/acp/*)
+      require_libfx "$path: code libfx owns changed"
+      require_acp "$path: ACP code changed" ;;
+    src/core/hosts/* | src/core/session_manager/*)
       require_libfx "$path: code libfx owns changed" ;;
     src/mcp/* | src/core/mcp_host/* | src/core/mcp/*)
       require_mcp "$path: MCP code changed" ;;
@@ -157,9 +177,16 @@ while IFS= read -r path; do
       require_subagent "$path: subagent or session-write code changed" ;;
     tests/tla/subagent/* | tests/tla/session/SessionWrite* | tests/tla/session/session-write* | tests/tla/session/LiveSessions* | tests/tla/session/live-*)
       require_subagent "$path: subagent, session-write, or live sessions model changed" ;;
+    tests/tla/acp/*)
+      require_acp "$path: ACP model changed" ;;
     tests/tla/lib/*)
-      require_subagent "$path: shared model-check code changed" ;;
-    tests/e2e/tmux-helpers.ts | tests/evals/eval-helpers.ts)
+      require_subagent "$path: shared model-check code changed"
+      require_acp "$path: shared TLC script changed" ;;
+    tests/e2e/tmux-helpers.ts)
+      require_mcp "$path: a file the MCP drivers load changed"
+      require_subagent "$path: a file the subagent drivers load changed"
+      require_acp "$path: a file the ACP drivers load changed" ;;
+    tests/evals/eval-helpers.ts)
       require_mcp "$path: a file the MCP drivers load changed"
       require_subagent "$path: a file the subagent drivers load changed" ;;
     tests/e2e/fixtures/mcp-* | tests/e2e/render-lab/tape.ts)
@@ -196,6 +223,7 @@ report libfx "$libfx" ${libfx_reasons[@]+"${libfx_reasons[@]}"}
 report MCP "$mcp" ${mcp_reasons[@]+"${mcp_reasons[@]}"}
 report "transcript window" "$transcript_window" ${transcript_window_reasons[@]+"${transcript_window_reasons[@]}"}
 report "subagent and session-write" "$subagent" ${subagent_reasons[@]+"${subagent_reasons[@]}"}
+report ACP "$acp" ${acp_reasons[@]+"${acp_reasons[@]}"}
 
 if [ -n "${GITHUB_OUTPUT:-}" ]; then
   {
@@ -203,5 +231,6 @@ if [ -n "${GITHUB_OUTPUT:-}" ]; then
     printf 'mcp=%s\n' "$mcp"
     printf 'transcript_window=%s\n' "$transcript_window"
     printf 'subagent=%s\n' "$subagent"
+    printf 'acp=%s\n' "$acp"
   } >>"$GITHUB_OUTPUT"
 fi
