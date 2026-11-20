@@ -1,6 +1,8 @@
 #!/bin/sh
 # Model-check the durable libfx protocol models (sdk/durable/) with TLC.
-# Every spec must pass.
+# Every spec must pass. Resumption-each and Resumption-moved hold resume
+# notice rules that are wrong (#1584 and #1615), and each must break the
+# property named on its line.
 #
 # Every spec is bounded (MaxEvents, MaxCrashes, finite sets), so terminal
 # states are expected at the bound; -deadlock keeps TLC from reporting them.
@@ -24,5 +26,7 @@ ParallelBatch ParallelBatch - -deadlock
 Fencing Fencing - -deadlock
 Inbox Inbox - -deadlock
 Resumption Resumption - -deadlock
+Resumption Resumption-each AtMostOneNotice -deadlock
+Resumption Resumption-moved SavedOnlyGrows -deadlock
 SnapshotTail SnapshotTail - -deadlock
 EOF
