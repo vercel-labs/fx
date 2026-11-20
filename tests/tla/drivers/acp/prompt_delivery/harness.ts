@@ -78,6 +78,9 @@ export class Acp {
     return answer;
   }
 
+  /// The id of the request sent last.
+  get lastRequestId(): number { return this.nextId - 1; }
+
   notify(method: string, params: Record<string, unknown>) {
     this.log({ dir: "out", method, params });
     this.write({ jsonrpc: "2.0", method, params });
@@ -192,8 +195,17 @@ export class Fixture {
 
   /// How many steers fx has queued so far, from its trace log.
   queuedSteers(): number {
+    return this.traceLines("queued steering prompt");
+  }
+
+  /// How many prompts fx has queued for turns of their own, from its trace log.
+  queuedPrompts(): number {
+    return this.traceLines("queued prompt for a turn of its own");
+  }
+
+  private traceLines(needle: string): number {
     if (!existsSync(this.traceLog)) return 0;
-    return readFileSync(this.traceLog, "utf8").split("\n").filter((line) => line.includes("queued steering prompt")).length;
+    return readFileSync(this.traceLog, "utf8").split("\n").filter((line) => line.includes(needle)).length;
   }
 
   async start(init: Record<string, unknown> = { protocolVersion: 1 }): Promise<Acp> {

@@ -23,6 +23,8 @@ StepFor(o) ==
       [] o.act = "stop_input" -> StopInput
       [] o.act = "finish"     -> Finish
       [] o.act = "cancel"     -> Cancel
+      [] o.act = "withdraw"   -> Withdraw(o.msg)
+      [] o.act = "close"      -> Close
       [] OTHER                -> FALSE
 
 Checked(o) ==

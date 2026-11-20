@@ -3,14 +3,12 @@
 // whether each run is a behavior of tests/tla/acp/AcpPromptDelivery.tla.
 //
 //   bun tests/tla/drivers/acp/prompt_delivery/driver.ts                 # after zig build
-//   bun tests/tla/drivers/acp/prompt_delivery/driver.ts --model rules   # the baseline
+//   bun tests/tla/drivers/acp/prompt_delivery/driver.ts --model today   # the baseline
 //
-// fx's ACP path takes a steer as `sh.fx/delivery` "steer" from a client that
-// lists `sh.fx/promptDelivery`, but the sh.fx rules for steers and queued
-// prompts have not landed in src/acp/ yet. --model today (the default) checks
-// fx's ACP path now; every plan must match it. --model rules checks the sh.fx
-// rules against the same build, and the plans that exercise a rule today's
-// path breaks must fail it, until the rules land.
+// --model rules (the default) checks the sh.fx rules for steers and queued
+// prompts, which fx's ACP path follows; every plan must match them. --model
+// today checks the model of fx's ACP path before the rules landed, which the
+// plans that exercise a rule must now fail.
 //
 // The fake Gateway holds every model reply after its first text piece until
 // the driver ends it, with a shell tool call that waits for the driver or with
@@ -33,7 +31,9 @@ type Step =
   | { op: "tool" }               // the held reply ends with a tool call, which runs
   | { op: "tool_end" }           // the tool ends, and the turn's next request arrives
   | { op: "final" }              // the held reply ends with final text, and the turn ends
-  | { op: "cancel" };            // session/cancel
+  | { op: "cancel" }             // session/cancel
+  | { op: "withdraw"; msg: Label } // $/cancel_request for a prompt that hasn't run
+  | { op: "close" };             // session/close
 type Plan = { name: string; steps: Step[] };
 
 const send = (msg: Label): Step => ({ op: "send", msg });
@@ -41,16 +41,21 @@ const TOOL: Step = { op: "tool" };
 const TOOL_END: Step = { op: "tool_end" };
 const FINAL: Step = { op: "final" };
 const CANCEL: Step = { op: "cancel" };
+const CLOSE: Step = { op: "close" };
+const withdraw = (msg: Label): Step => ({ op: "withdraw", msg });
 
 const PLANS: Plan[] = [
   { name: "t1-steer-joins-after-tool", steps: [send("P"), send("S1"), TOOL, TOOL_END, FINAL] },
   { name: "t2-steer-continues-at-reply-end", steps: [send("P"), send("S1"), FINAL] },
-  { name: "t3-stop-during-tool", steps: [send("P"), TOOL, send("S1"), CANCEL] },
-  { name: "t4-refusals", steps: [send("P"), send("M"), send("I"), send("Q1"), FINAL] },
+  { name: "t3-stop-during-tool", steps: [send("P"), TOOL, send("S1"), CANCEL, FINAL] },
+  { name: "t4-refusals", steps: [send("P"), send("M"), send("I"), send("Q1"), FINAL, FINAL] },
   { name: "t5-two-steers", steps: [send("P"), send("S1"), TOOL, send("S2"), TOOL_END, FINAL] },
-  { name: "t6-steer-starts-a-turn", steps: [send("S1"), send("Q1"), FINAL] },
+  { name: "t6-steer-starts-a-turn", steps: [send("S1"), send("Q1"), FINAL, FINAL] },
   { name: "t7-stop-while-streaming", steps: [send("P"), send("S1"), CANCEL] },
   { name: "t8-second-turn", steps: [send("P"), FINAL, send("Q1"), send("S1"), TOOL, TOOL_END, FINAL] },
+  { name: "t9-withdraw", steps: [send("P"), TOOL, send("S1"), send("Q1"), withdraw("S1"), withdraw("Q1"), TOOL_END, FINAL] },
+  { name: "t10-close", steps: [send("P"), TOOL, send("S1"), send("Q1"), CLOSE] },
+  { name: "t11-stopped-steers-run-together", steps: [send("P"), TOOL, send("S1"), send("S2"), send("Q1"), CANCEL, FINAL, FINAL] },
 ];
 
 const KIND: Record<Label, "plain" | "steer" | "queue"> = { P: "plain", M: "plain", S1: "steer", S2: "steer", I: "steer", Q1: "queue", Q2: "queue" };
@@ -61,7 +66,6 @@ function promptParams(sessionId: string, label: Label): Record<string, unknown> 
     ? [{ type: "image", mimeType: "image/png", data: "iVBORw0KGgo=" }]
     : [{ type: "text", text: `${marker(label)} please` }];
   const kind = KIND[label];
-  // fx lists only the steer delivery today, so it refuses a queued one.
   const meta = kind === "plain" ? undefined : { "sh.fx/delivery": kind };
   return { sessionId, prompt, ...(meta ? { _meta: meta } : {}) };
 }
@@ -81,8 +85,10 @@ async function runPlan(plan: Plan, dir: string) {
   const observations: Observation[] = [];
   const answers: Record<string, Answer> = {};
   const outstanding = new Map<string, Promise<void>>();
+  const requestIds = new Map<string, number>();
   const finished = new Set<string>();   // labels of turns that have ended
   let running = false;
+  let phase: "gen" | "tool" = "gen";    // the running turn: streaming a reply, or running a tool
   let holdIndex = 0;                    // the held reply of the running request
   let error: string | null = null;
 
@@ -101,12 +107,22 @@ async function runPlan(plan: Plan, dir: string) {
     await waitFor(`model request ${count}`, () => fixture.holds.length >= count);
     holdIndex = count;
   };
-  /// Waits for every prompt still open to get its answer.
-  const settle = async () => {
-    const open = [...outstanding.keys()];
-    const timeout = new Promise<never>((_, reject) => setTimeout(() => reject(new Error(`no answer within 30 s for ${open.filter((label) => answers[label] === undefined).join(", ")}`)), 30_000));
-    await Promise.race([Promise.all([...outstanding.values()]), timeout]);
-    outstanding.clear();
+  const answered = (labels: string[]) => labels.every((label) => answers[label] !== undefined);
+  /// Prompts fx holds that no turn has answered: they run next.
+  const pending = () => [...outstanding.keys()].filter((label) => answers[label] === undefined);
+  /// After a turn ends with `ctx`: the next turn starts with what waits, or
+  /// nothing runs. Returns the next turn's prompts to check, or undefined.
+  const startNext = async (ctx: string[], requests: number): Promise<string[] | undefined> => {
+    for (const label of ctx) finished.add(label);
+    for (const label of [...outstanding.keys()]) if (answers[label] !== undefined) outstanding.delete(label);
+    if (pending().length === 0) {
+      running = false;
+      return undefined;
+    }
+    await waitForRequest(Math.max(requests + 1, fixture.holds.length));
+    running = true;
+    phase = "gen";
+    return currentCtx();
   };
 
   try {
@@ -119,35 +135,44 @@ async function runPlan(plan: Plan, dir: string) {
     for (const step of plan.steps) {
       if (step.op === "send") {
         const label = step.msg;
-        const queuedBefore = fixture.queuedSteers();
+        const requests = fixture.holds.length;
+        const steersBefore = fixture.queuedSteers();
+        const promptsBefore = fixture.queuedPrompts();
         let settled = false;
-        const pending = acp.request("session/prompt", promptParams(sessionId, label)).then((response) => {
+        const pendingAnswer = acp.request("session/prompt", promptParams(sessionId, label)).then((response) => {
           answers[label] = answerOf(response);
           settled = true;
         });
-        outstanding.set(label, pending);
+        requestIds.set(label, acp.lastRequestId);
+        outstanding.set(label, pendingAnswer);
         if (!running) {
           // No turn runs: the prompt starts one.
-          await waitForRequest(fixture.holds.length + 1);
+          await waitForRequest(requests + 1);
           running = true;
-          observe("send", label, { answers: true, ctx: currentCtx() });
+          phase = "gen";
+        } else if (KIND[label] === "steer" && label !== "I" && phase === "gen") {
+          // The steer cuts the streaming reply short; the turn's next request holds it.
+          await waitFor(`fx to take ${label}`, () => settled || fixture.holds.length > requests);
+          if (!settled) await waitForRequest(requests + 1);
+        } else if (KIND[label] === "queue") {
+          await waitFor(`fx to queue ${label}`, () => settled || fixture.queuedPrompts() > promptsBefore);
         } else {
-          // Mid-turn: fx either answers at once or queues the steer. The turn
-          // holds what its latest model request holds: today a steer joins
-          // only the turn's next request.
-          await waitFor(`fx to take ${label}`, () => settled || fixture.queuedSteers() > queuedBefore);
-          if (settled) outstanding.delete(label);
-          observe("send", label, { answers: true, ctx: currentCtx() });
+          // fx answers at once, or the steer waits for the turn's next request.
+          await waitFor(`fx to take ${label}`, () => settled || fixture.queuedSteers() > steersBefore);
         }
+        if (settled) outstanding.delete(label);
+        observe("send", label, { answers: true, ctx: currentCtx() });
       } else if (step.op === "tool") {
         fixture.holds[holdIndex - 1]!.end("tool");
         const files = fixture.toolFiles(fixture.toolCount);
         await waitFor("the tool to start", () => existsSync(files.started));
+        phase = "tool";
         observe("stream_end");
         observe("tool_call");
       } else if (step.op === "tool_end") {
         writeFileSync(fixture.toolFiles(fixture.toolCount).go, "");
         await waitForRequest(fixture.holds.length + 1);
+        phase = "gen";
         observe("tool_end", "none", { ctx: currentCtx() });
       } else if (step.op === "final") {
         // End the held reply with final text. If steers wait, fx goes on with
@@ -157,29 +182,51 @@ async function runPlan(plan: Plan, dir: string) {
           const requests = fixture.holds.length;
           const ctx = currentCtx();
           fixture.holds[holdIndex - 1]!.end("final");
-          const outcome = await waitFor("the turn to end or go on", () =>
-            fixture.holds.length > requests ? "continued" : [...outstanding.keys()].every((label) => answers[label] !== undefined) ? "ended" : null);
+          // A turn that ended answers its prompts before the next turn's
+          // request; one that goes on sends a request and answers nothing.
+          let seenRequestAt = 0;
+          const outcome = await waitFor("the turn to end or go on", () => {
+            if (answered(ctx)) return "ended";
+            if (fixture.holds.length > requests) {
+              seenRequestAt ||= Date.now();
+              if (Date.now() - seenRequestAt > 500) return "continued";
+            }
+            return null;
+          });
           observe("stream_end");
           if (outcome === "continued") {
             await waitForRequest(requests + 1);
             observe("reply_end", "none", { ctx: currentCtx() });
             continue;
           }
-          outstanding.clear();
-          running = false;
-          for (const label of ctx) finished.add(label);
           observe("reply_end");
           observe("stop_input");
-          observe("finish", "none", { answers: true });
+          const next = await startNext(ctx, requests);
+          observe("finish", "none", next === undefined ? { answers: true } : { answers: true, ctx: next });
           break;
         }
+      } else if (step.op === "cancel") {
+        const ctx = currentCtx();
+        const requests = fixture.holds.length;
+        acp.notify("session/cancel", { sessionId });
+        await waitFor("the stopped turn's answers", () => answered(ctx));
+        const next = await startNext(ctx, requests);
+        observe("cancel", "none", next === undefined ? { answers: true } : { answers: true, ctx: next });
+      } else if (step.op === "withdraw") {
+        const label = step.msg;
+        acp.notify("$/cancel_request", { requestId: requestIds.get(label) });
+        await waitFor(`${label} to be withdrawn`, () => answers[label] !== undefined);
+        outstanding.delete(label);
+        observe("withdraw", label, { answers: true });
       } else {
         const ctx = currentCtx();
-        acp.notify("session/cancel", { sessionId });
-        await settle();
-        running = false;
+        const closed = await acp.request("session/close", { sessionId });
+        if (closed.error) throw new Error(`session/close failed: ${JSON.stringify(closed.error)}`);
+        await waitFor("every prompt's answer", () => answered([...outstanding.keys()]));
+        outstanding.clear();
         for (const label of ctx) finished.add(label);
-        observe("cancel", "none", { answers: true });
+        running = false;
+        observe("close", "none", { answers: true });
       }
     }
   } catch (caught) {
@@ -201,6 +248,7 @@ function boundsOf(plan: Plan, rules: boolean): Bounds {
     msgs,
     maxTools: plan.steps.filter((step) => step.op === "tool").length,
     maxCancels: plan.steps.filter((step) => step.op === "cancel").length,
+    allowClose: plan.steps.some((step) => step.op === "close"),
   };
 }
 
@@ -256,7 +304,7 @@ function git(...args: string[]): string {
 
 async function main() {
   if (!existsSync(binary)) throw new Error(`missing ${binary}; run zig build first or set FX_BIN`);
-  const model = argValue("--model") ?? "today";
+  const model = argValue("--model") ?? "rules";
   if (model !== "today" && model !== "rules") throw new Error(`--model must be today or rules, not ${model}`);
   const rules = model === "rules";
   const only = argValue("--only");
@@ -288,11 +336,11 @@ async function main() {
   const controls = [];
   if (!rules) {
     const synthetic = syntheticTrace();
-    const bounds: Bounds = { rules: false, msgs: ["P", "S1"], maxTools: 0, maxCancels: 0 };
+    const bounds: Bounds = { rules: false, msgs: ["P", "S1"], maxTools: 0, maxCancels: 0, allowClose: false };
     controls.push({ name: "synthetic-conforming", expect: "ACCEPTED", got: (await validate(synthetic, join(reportDir, "controls", "synthetic-conforming"), bounds)).verdict });
     controls.push({ name: "synthetic-tampered", expect: "REJECTED", got: (await validate(tamper(synthetic)!, join(reportDir, "controls", "synthetic-tampered"), bounds)).verdict });
   }
-  controls.push({ name: "empty-trace", expect: "TOOL_ERROR", got: (await validate([], join(reportDir, "controls", "empty-trace"), { rules, msgs: ["P"], maxTools: 0, maxCancels: 0 })).verdict });
+  controls.push({ name: "empty-trace", expect: "TOOL_ERROR", got: (await validate([], join(reportDir, "controls", "empty-trace"), { rules, msgs: ["P"], maxTools: 0, maxCancels: 0, allowClose: false })).verdict });
   const firstAccepted = results.find((result) => result.verdict === "ACCEPTED");
   if (firstAccepted) {
     const plan = PLANS.find((candidate) => candidate.name === firstAccepted.name)!;
