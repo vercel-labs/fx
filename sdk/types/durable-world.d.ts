@@ -23,6 +23,16 @@ export interface World {
     getChunks(runId: string, name: string, options?: { limit?: number; cursor?: string }): unknown;
     getInfo(runId: string, name: string): unknown;
   };
+  /**
+   * What the World supports. With `experimental_queueHold`, a prompt that runs in the request that took it (see
+   * `WorldOptions.runInRequest`) is sent with `experimental_hold`, for `WorldOptions.holdConsumerGroup` or
+   * `holdFunction`, and run through the result's `experimental_hold.consume()` when its `status` is `"held"`.
+   */
+  readonly capabilities?: {
+    readonly experimental_queueHold?: boolean;
+    readonly inBandFence?: boolean;
+  };
+  /** Sends a message. A send with `experimental_hold` resolves with a `QueueResult` (see `QueueHoldResult`). */
   queue(queueName: string, message: unknown, options?: unknown): unknown;
   createQueueHandler(prefix: string, handler: (message: unknown, meta: any) => Promise<unknown>): (request: Request) => Promise<Response>;
   /** A World with `registerHandler` delivers to the agent in its process; any other delivers over HTTP to `agent.wakeHandler()`. */
@@ -32,6 +42,30 @@ export interface World {
   createRunId?(options?: Readonly<Record<string, unknown>>): string;
   start?(): unknown;
   close?(): unknown;
+}
+
+/**
+ * What a send that asked for a hold (`experimental_hold`) learns of it: the queue holds the message for the sender,
+ * which runs it with `consume(handler)`, or it does not, and the queue delivers it. Absent when the World ignored the
+ * hold, which also means the queue delivers it.
+ */
+export type QueueHoldResult =
+  | {
+    readonly status: "held";
+    readonly messageId: string;
+    readonly leaseExpiresAt: Date;
+    consume(handler: (message: unknown, meta: any) => Promise<unknown>): Promise<void>;
+    release(delaySeconds?: number): Promise<void>;
+  }
+  | {
+    readonly status: "not_held";
+    readonly reason: "unsupported" | "deferred" | "lost" | "coalesced" | "concurrency_limited" | "duplicate" | "error";
+  };
+
+/** What a World's `queue()` resolves with. */
+export interface QueueResult {
+  readonly messageId: string | null;
+  readonly experimental_hold?: QueueHoldResult;
 }
 
 /** A lease as `alive()` sees it: the fields `holderInfo()` returned when it was taken, beside libfx's own. */
@@ -63,11 +97,29 @@ export type WorldOptions = {
    */
   queueLeases?: boolean;
   /**
-   * With `queueLeases`: a prompt runs in the request that took it when no worker holds the session, and the queue keeps
-   * the prompt as a backstop it delivers only after that request's deadline. The request's lease names the backstop, so
-   * if the request died, the backstop takes the session over. Default true with `queueLeases`.
+   * With `queueLeases`: a prompt runs in the request that took it when no worker holds the session. On a World with
+   * `capabilities.experimental_queueHold`, given `holdConsumerGroup` or `holdFunction`, the request sends the prompt asking the queue to hold it and runs it as the
+   * message's first delivery, whose lease the queue renews while it runs; a prompt the queue does not hold, the queue
+   * delivers. On any other World, the queue keeps the prompt as a backstop it delivers only after that request's
+   * deadline. Either way the request's lease names the message, so if the request died, the queue's next delivery of it
+   * takes the session over. Default true with `queueLeases`.
    */
   runInRequest?: boolean;
+  /**
+   * With `runInRequest`: the consumer group of the route the queue delivers libfx's messages to. On a World with
+   * `capabilities.experimental_queueHold`, a prompt the request runs is held for this group, so a hold the request lets
+   * lapse is delivered to that route. Without it, or `holdFunction`, no prompt is held, and the queue keeps a backstop.
+   * Not with `holdFunction`.
+   */
+  holdConsumerGroup?: string;
+  /**
+   * With `runInRequest`: the wake route's key under `functions` in vercel.json, such as `"app/api/libfx/route.js"`.
+   * Vercel names its `queue/v2beta` trigger's consumer group after it, and the hold is taken for that group. Not with
+   * `holdConsumerGroup`.
+   */
+  holdFunction?: string;
+  /** With `holdFunction`: the name of the Vercel service the wake route belongs to, when it belongs to one. */
+  holdService?: string;
   /** Keeps the request alive until `work`, a turn it runs after its response, settles, such as Vercel's `waitUntil` or Next's `after()`. */
   waitUntil?(work: Promise<void>): void;
   /** Without liveness, how long a lease lasts after its worker took or last renewed it; renewed every third of that. At least 1000. Default 15000. */
