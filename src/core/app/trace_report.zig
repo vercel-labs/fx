@@ -1849,6 +1849,19 @@ fn writeAutoReviewFields(r: *Records, review: *const diagnostics.AutoReview) !vo
     try r.text("origin", @tagName(review.origin));
     try r.boolean("reused", review.reused);
     if (!review.reused) try r.number("elapsed_ms", review.elapsed_ms);
+    // Each send to the reviewer, so a held review shows whether a timeout
+    // was retried and how long each try took.
+    const attempts = review.attempts();
+    if (attempts.len > 0) {
+        try r.beginArray("attempts");
+        for (attempts) |attempt| {
+            try r.beginItem();
+            try r.text("result", @tagName(attempt.result));
+            try r.number("elapsed_ms", attempt.elapsed_ms);
+            try r.endItem();
+        }
+        try r.endArray();
+    }
     try r.text("call_id", review.callId());
     try r.optionalText("action_kind", review.actionKind());
     try writeToolPayload(r, "action", review.action(), review.action_len, review.action_total_bytes);
@@ -4970,6 +4983,45 @@ test "trace auto reviews keep holds and recent reviews with their action and rat
     // A recent review that did not clear carries its detail too.
     try std.testing.expectEqualStrings("call_held", try testString(try trace.nth("auto_review", 1), "call_id"));
     try std.testing.expectEqual(@as(i64, 300), try testInt(try trace.nth("auto_review", 1), "action_bytes"));
+}
+
+test "a review record lists each send to the reviewer" {
+    diagnostics.resetSession();
+    defer diagnostics.resetSession();
+    const sends = [_]diagnostics.AutoReviewAttempt{
+        .{ .result = .timed_out, .elapsed_ms = 30_001 },
+        .{ .result = .answered, .elapsed_ms = 900 },
+    };
+    diagnostics.recordAutoReview(.{
+        .outcome = .clear,
+        .elapsed_ms = 30_901,
+        .call_id = "call_retried",
+        .tool_name = "shell",
+        .attempts = &sends,
+        .at_ms = 1_700_000_000_000,
+    });
+    diagnostics.recordAutoReview(.{
+        .outcome = .clear,
+        .call_id = "call_no_sends",
+        .tool_name = "shell",
+        .at_ms = 1_700_000_000_001,
+    });
+    const w = try TestWriter.create();
+    defer w.destroy();
+    try writeAutoReviews(&w.records);
+    var trace = try w.trace();
+    defer trace.deinit();
+
+    const retried = try trace.nth("auto_review", 0);
+    try std.testing.expectEqualStrings("call_retried", try testString(retried, "call_id"));
+    const items = retried.get("attempts").?.array.items;
+    try std.testing.expectEqual(@as(usize, 2), items.len);
+    try std.testing.expectEqualStrings("timed_out", try testString(items[0].object, "result"));
+    try std.testing.expectEqual(@as(i64, 30_001), try testInt(items[0].object, "elapsed_ms"));
+    try std.testing.expectEqualStrings("answered", try testString(items[1].object, "result"));
+    // A review with no recorded sends writes no list.
+    const plain = try trace.nth("auto_review", 1);
+    try std.testing.expect(plain.get("attempts") == null);
 }
 
 test "trace git record says when fx won't run git or the folder is not a repository" {

@@ -71,8 +71,13 @@ pub fn inspectInput(ctx: Context, session_id: []const u8) !InputReview {
             else => return error.InvalidTerminalResult,
         },
     };
-    if (!std.mem.eql(u8, value.session.session_id, session_id) or
-        value.session.lifecycle != .running) return error.TerminalNotReady;
+    if (!std.mem.eql(u8, value.session.session_id, session_id)) return error.TerminalNotReady;
+    switch (value.session.lifecycle) {
+        .running => {},
+        .starting => return error.TerminalNotReady,
+        // Input can no longer reach a session that has ended.
+        .exited, .lost, .closed => return error.TerminalSessionEnded,
+    }
     const command = value.command orelse return error.TerminalCommandUnavailable;
     const owned_id = try ctx.alloc.dupe(u8, session_id);
     errdefer ctx.alloc.free(owned_id);
