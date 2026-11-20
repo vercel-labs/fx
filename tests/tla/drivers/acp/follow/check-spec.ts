@@ -2,8 +2,10 @@
 // each mutant must violate the property it names, checked alone, which shows
 // that property catches that mistake. The rules have not landed in src/acp/
 // yet, and following needs a session open on two connections, which needs
-// the leader's socket, so there is no driver of fx here; the model's Today
-// configs, in tests/tla/acp/check.sh, show fx now.
+// the leader's socket, so driver.ts checks only what fx does now on one
+// connection: session/new, prompts, restarts and session/load, with
+// replayed message ids that come from the log. The model's Today configs, in
+// tests/tla/acp/check.sh, show fx now.
 //
 //   bun tests/tla/drivers/acp/follow/check-spec.ts
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
@@ -44,8 +46,15 @@ const MUTANTS: Mutant[] = [
   {
     id: "replay-new-ids",
     note: "a replayed message gets a new id, as today",
-    from: `id |-> IF Rules THEN turns[k] ELSE -1`,
+    from: `id |-> IF IdRules THEN turns[k] ELSE -1`,
     to: `id |-> -1`,
+    expect: "StableIds",
+  },
+  {
+    id: "replay-ids-from-order",
+    note: "a replayed message's id comes from its place in this replay, not in the log, so a load after a position or a compaction gives other ids",
+    from: `id |-> IF IdRules THEN turns[k] ELSE -1`,
+    to: `id |-> IF IdRules THEN k ELSE -1`,
     expect: "StableIds",
   },
   {
@@ -94,6 +103,7 @@ function targetCfg(target: string): string {
   return [
     "CONSTANTS",
     "    Rules = TRUE",
+    "    IdRules = TRUE",
     "    Conns <- MCConns",
     "    Folders <- MCFolders",
     "    MaxTurns = 3",

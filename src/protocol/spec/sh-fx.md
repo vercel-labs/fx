@@ -182,6 +182,8 @@ A session can be open on several connections at once, which ACP v2's [session se
 - `session/load` replays the whole session, then the updates that the running turn has sent so far, then live updates.
 - `session/resume` sends live updates from that point on.
 
+Each message that a load replays has a `messageId` made from its turn's number in the session log and its place in that turn, such as `turn-3-1`, so every load gives a saved message the same id. A message sent live keeps the id fx gave it then, which a load doesn't repeat. `tests/tla/acp/AcpFollow.tla` checks this as `StableIds`, and `tests/tla/drivers/acp/follow/driver.ts` checks it on fx.
+
 Joining needs no capability, so a client that knows only ACP can follow a session.
 
 While the session is open on another connection, fx keeps the session's `cwd`, `additionalDirectories`, and `mcpServers`, and doesn't use the ones in the joining client's request. The response's `_meta` gives the session's folder as `sh.fx/cwd`. A `systemPrompt` in the request applies as on any load or resume: a prompt that differs from the session's replaces it from the next turn, for every client.

@@ -3420,10 +3420,14 @@ pub const Session = struct {
             turns: usize = 0,
             compactions: usize = 0,
 
-            fn turn(sink: *@This(), value: types.HistoryTurn, _: ?u64) !void {
+            fn turn(sink: *@This(), value: types.HistoryTurn, number: ?u64) !void {
                 defer types.freeHistoryTurn(sink.alloc, value);
                 sink.turns += 1;
-                try sink.visitor.append(value);
+                if (comptime @hasDecl(@typeInfo(Visitor).pointer.child, "appendNumbered")) {
+                    try sink.visitor.appendNumbered(value, number);
+                } else {
+                    try sink.visitor.append(value);
+                }
             }
 
             fn summary(sink: *@This(), _: []const u8) !void {

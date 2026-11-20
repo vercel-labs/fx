@@ -646,7 +646,7 @@ pub fn handleLoadWasmSession(state: *server.ServerState, alloc: Allocator, msg: 
     if (server.findSession(state, session_id)) |active| {
         var sources: runtime_tool_presentation.ReplayedSavedOutputSources = .{};
         defer sources.deinit(alloc);
-        for (active.session_rt.agent.history.items) |turn| try sendHistoryTurnAsUpdates(state, active, alloc, &sources, turn);
+        for (active.session_rt.agent.history.items, 0..) |turn, index| try sendHistoryTurnAsUpdates(state, active, alloc, &sources, turn, index + 1);
         try sendSessionInfoUpdate(state, active, alloc, active.prompt == null);
         return writeLoadSessionResponse(state, alloc, msg, active, observer_hooks);
     }
@@ -706,7 +706,7 @@ pub fn handleLoadWasmSession(state: *server.ServerState, alloc: Allocator, msg: 
     session_rt_owned = false;
     var sources: runtime_tool_presentation.ReplayedSavedOutputSources = .{};
     defer sources.deinit(alloc);
-    for (session.session_rt.agent.history.items) |turn| try sendHistoryTurnAsUpdates(state, session, alloc, &sources, turn);
+    for (session.session_rt.agent.history.items, 0..) |turn, index| try sendHistoryTurnAsUpdates(state, session, alloc, &sources, turn, index + 1);
     try sendSessionInfoUpdate(state, session, alloc, true);
     try writeLoadSessionResponse(state, alloc, msg, session, observer_hooks);
 }
@@ -1449,7 +1449,10 @@ const ConversionNotice = struct {
 
     fn emit(context: ?*anyopaque, text: []const u8) void {
         const notice: *ConversionNotice = @ptrCast(@alignCast(context.?));
-        sendAgentHistoryChunk(notice.state, notice.alloc, notice.session_id, text) catch |err|
+        // Not a saved message of any turn, so it keeps fx's random id, as a
+        // live message does.
+        var ids: ReplayIds = .{ .turn = null };
+        sendAgentHistoryChunk(notice.state, notice.alloc, notice.session_id, &ids, text) catch |err|
             debug_trace.logf("acp", "event=conversion_notice_dropped err={s}", .{@errorName(err)});
     }
 };
@@ -1680,12 +1683,13 @@ fn sendActiveHistoryUpdates(
             alloc: Allocator,
             sources: *runtime_tool_presentation.ReplayedSavedOutputSources,
 
-            pub fn append(self: *@This(), turn: types.HistoryTurn) !void {
-                try sendHistoryTurnAsUpdates(self.state, self.session, self.alloc, self.sources, turn);
+            pub fn appendNumbered(self: *@This(), turn: types.HistoryTurn, number: ?u64) !void {
+                if (number == null) debug_trace.logf("acp", "history replay turn has no log number; its messages get random ids", .{});
+                try sendHistoryTurnAsUpdates(self.state, self.session, self.alloc, self.sources, turn, number);
             }
 
             /// A saved session's log keeps each compaction in its place
-            /// among the turns, as a summary `append` never sees.
+            /// among the turns, as a summary `appendNumbered` never sees.
             pub fn compaction(self: *@This(), number: usize) !void {
                 try sendCompactionHistory(self.state, self.alloc, self.session.session_id, number);
             }
@@ -1693,8 +1697,43 @@ fn sendActiveHistoryUpdates(
         var visitor = Visitor{ .state = state, .session = active, .alloc = alloc, .sources = sources };
         return v2.visitHistory(alloc, &visitor);
     }
-    for (active.session_rt.agent.history.items) |turn| {
-        try sendHistoryTurnAsUpdates(state, active, alloc, sources, turn);
+    for (active.session_rt.agent.history.items, 0..) |turn, index| {
+        try sendHistoryTurnAsUpdates(state, active, alloc, sources, turn, index + 1);
+    }
+}
+
+/// Gives each replayed message of one turn its id, `turn-{n}-{k}`: the
+/// turn's number in the session log and the message's place in the turn's
+/// replay, so every load gives a saved message the same id. A turn the
+/// log gave no number gets fx's random ids, as a live message does. An id is
+/// valid until the next `take`.
+const ReplayIds = struct {
+    turn: ?u64,
+    next: usize = 0,
+    buffer: acp_types.ReplayMessageIdBuffer = undefined,
+    random: acp_types.MessageIdBuffer = undefined,
+
+    fn take(self: *ReplayIds) []const u8 {
+        defer self.next += 1;
+        if (self.turn) |turn| return acp_types.writeReplayMessageId(&self.buffer, turn, self.next);
+        return acp_types.generateMessageId(&self.random);
+    }
+};
+
+test "a replayed message takes its turn and place as its id" {
+    var ids: ReplayIds = .{ .turn = 7 };
+    try std.testing.expectEqualStrings("turn-7-0", ids.take());
+    try std.testing.expectEqualStrings("turn-7-1", ids.take());
+
+    // A turn the log gave no number keeps fx's random ids, one per message.
+    var unnumbered: ReplayIds = .{ .turn = null };
+    var first: acp_types.MessageIdBuffer = undefined;
+    @memcpy(&first, unnumbered.take());
+    var second: acp_types.MessageIdBuffer = undefined;
+    @memcpy(&second, unnumbered.take());
+    try std.testing.expect(!std.mem.eql(u8, &first, &second));
+    for ([_]*const acp_types.MessageIdBuffer{ &first, &second }) |id| {
+        for (id) |c| try std.testing.expect((c >= '0' and c <= '9') or (c >= 'a' and c <= 'f'));
     }
 }
 
@@ -1704,28 +1743,31 @@ fn sendHistoryTurnAsUpdates(
     alloc: Allocator,
     sources: *runtime_tool_presentation.ReplayedSavedOutputSources,
     turn: types.HistoryTurn,
+    number: ?u64,
 ) !void {
+    var ids: ReplayIds = .{ .turn = number };
     const session_id = session.session_id;
     switch (turn) {
-        .assistant => |assistant| try sendUserHistoryTurn(state, alloc, session_id, assistant.user),
-        .interrupted => |interrupted| try sendUserHistoryTurn(state, alloc, session_id, interrupted.user),
+        .assistant => |assistant| try sendUserHistoryTurn(state, alloc, session_id, &ids, assistant.user),
+        .interrupted => |interrupted| try sendUserHistoryTurn(state, alloc, session_id, &ids, interrupted.user),
         .compacted_summary => |summary| return sendCompactionHistory(state, alloc, session_id, summary.compaction_count),
     }
 
     switch (turn) {
         .assistant => |assistant| {
-            try sendExecutionHistory(state, session, alloc, sources, assistant.execution);
-            try sendAgentHistoryChunk(state, alloc, session_id, assistant.assistant);
+            try sendExecutionHistory(state, session, alloc, sources, &ids, assistant.execution);
+            try sendAgentHistoryChunk(state, alloc, session_id, &ids, assistant.assistant);
         },
         .interrupted => |i| {
-            try sendExecutionHistory(state, session, alloc, sources, i.execution);
+            try sendExecutionHistory(state, session, alloc, sources, &ids, i.execution);
             if (i.assistant) |assistant| {
-                if (assistant.len > 0) try sendAgentHistoryChunk(state, alloc, session_id, assistant);
+                if (assistant.len > 0) try sendAgentHistoryChunk(state, alloc, session_id, &ids, assistant);
             }
             try sendAgentHistoryChunk(
                 state,
                 alloc,
                 session_id,
+                &ids,
                 session_runtime.interruptedTurnNotice(i).body,
             );
         },
@@ -1737,12 +1779,13 @@ fn sendUserHistoryTurn(
     state: *server.ServerState,
     alloc: Allocator,
     session_id: []const u8,
+    ids: *ReplayIds,
     user: types.UserTurn,
 ) !void {
     // A turn the terminal app sent to resume an interrupted request replays
     // as the line it showed, not as fx's note to the model.
     if (std.mem.eql(u8, user.text, session_runtime.resumed_request_prompt)) {
-        return sendAgentHistoryChunk(state, alloc, session_id, session_runtime.resumed_request_notice.body);
+        return sendAgentHistoryChunk(state, alloc, session_id, ids, session_runtime.resumed_request_notice.body);
     }
     // A turn a subagent's report or message started is not the user's
     // words, so it never replays as theirs; the agent's reply still does.
@@ -1750,8 +1793,7 @@ fn sendUserHistoryTurn(
         debug_trace.logf("acp", "history replay skipped non-user prompt author={s} bytes={d}", .{ @tagName(user.author), user.text.len });
         return;
     }
-    var message_id: acp_types.MessageIdBuffer = undefined;
-    const stable_message_id = acp_types.generateMessageId(&message_id);
+    const stable_message_id = ids.take();
     if (user.text.len > 0) {
         try sendUserHistoryChunk(state, alloc, session_id, stable_message_id, user.text);
     }
@@ -1815,6 +1857,7 @@ fn sendExecutionHistory(
     session: *server.ActiveSessionState,
     alloc: Allocator,
     sources: *runtime_tool_presentation.ReplayedSavedOutputSources,
+    ids: *ReplayIds,
     execution: types.ExecutionMemory,
 ) !void {
     if (execution.isEmpty()) return;
@@ -1840,7 +1883,7 @@ fn sendExecutionHistory(
     };
     for (frames) |frame| {
         switch (frame) {
-            .assistant_text => |text| try sendAgentHistoryChunk(state, alloc, session_id, text),
+            .assistant_text => |text| try sendAgentHistoryChunk(state, alloc, session_id, ids, text),
             .steering_text => |text| {
                 // A subagent's report a boundary took is not the user's
                 // message, so it isn't replayed as one.
@@ -1853,7 +1896,7 @@ fn sendExecutionHistory(
                     debug_trace.logf("acp", "event=history_steering_skipped reason=recovery_prompt bytes={d}", .{text.len});
                     continue;
                 }
-                try sendSteeringHistoryChunk(state, alloc, session_id, text);
+                try sendSteeringHistoryChunk(state, alloc, session_id, ids, text);
             },
             .tool_call => |call| try sendHistoryToolCall(state, alloc, session_id, call),
         }
@@ -2071,8 +2114,7 @@ fn sendHistoryToolCall(
 
 /// Replays absorbed steering. The original request ID is not persisted, so the
 /// frame carries a null `requestId`.
-fn sendSteeringHistoryChunk(state: *server.ServerState, alloc: Allocator, session_id: []const u8, text: []const u8) !void {
-    var message_id: acp_types.MessageIdBuffer = undefined;
+fn sendSteeringHistoryChunk(state: *server.ServerState, alloc: Allocator, session_id: []const u8, ids: *ReplayIds, text: []const u8) !void {
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
     try out.writer.writeAll("{\"sessionId\":");
@@ -2080,7 +2122,7 @@ fn sendSteeringHistoryChunk(state: *server.ServerState, alloc: Allocator, sessio
     try out.writer.writeAll(",\"update\":");
     try acp_types.writeSteeringUserMessageChunk(
         &out.writer,
-        acp_types.generateMessageId(&message_id),
+        ids.take(),
         text,
         null,
         null,
@@ -2106,8 +2148,7 @@ fn sendCompactionHistory(state: *server.ServerState, alloc: Allocator, session_i
     try state.writer.writeNotification(alloc, "session/update", out.writer.buffered());
 }
 
-fn sendAgentHistoryChunk(state: *server.ServerState, alloc: Allocator, session_id: []const u8, text: []const u8) !void {
-    var message_id: acp_types.MessageIdBuffer = undefined;
+fn sendAgentHistoryChunk(state: *server.ServerState, alloc: Allocator, session_id: []const u8, ids: *ReplayIds, text: []const u8) !void {
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
     try out.writer.writeAll("{\"sessionId\":");
@@ -2115,7 +2156,7 @@ fn sendAgentHistoryChunk(state: *server.ServerState, alloc: Allocator, session_i
     try out.writer.writeAll(",\"update\":");
     try acp_types.writeAgentMessageChunk(
         &out.writer,
-        acp_types.generateMessageId(&message_id),
+        ids.take(),
         text,
     );
     try out.writer.writeAll("}");
@@ -2986,7 +3027,7 @@ fn sendTestHistoryTurn(state: *server.ServerState, alloc: Allocator, session_id:
     var sources: runtime_tool_presentation.ReplayedSavedOutputSources = .{};
     defer sources.deinit(alloc);
     var session = testReplaySession(state, session_id);
-    return sendHistoryTurnAsUpdates(state, &session, alloc, &sources, turn);
+    return sendHistoryTurnAsUpdates(state, &session, alloc, &sources, turn, null);
 }
 
 test "execution replay titles reads with the call whose saved output they read" {
@@ -3081,12 +3122,12 @@ test "ACP load titles a read with the call from an earlier turn" {
         .user = .{ .text = @constCast("run the tests") },
         .assistant = @constCast("done"),
         .execution = .{ .tool_steps = run_steps[0..] },
-    } });
+    } }, null);
     try sendHistoryTurnAsUpdates(&state, &replay_session, arena, &sources, .{ .assistant = .{
         .user = .{ .text = @constCast("find the failure") },
         .assistant = @constCast("found it"),
         .execution = .{ .tool_steps = read_steps[0..] },
-    } });
+    } }, null);
 
     const captured = try readCaptured(&capture, alloc);
     defer alloc.free(captured);
