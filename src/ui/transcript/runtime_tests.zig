@@ -10601,6 +10601,80 @@ test "recorded user prompt card preserves a committed anchor after a non-prefix 
     );
 }
 
+test "a frame between the on-screen history offset and the logical offset commits without a rewind" {
+    const alloc = std.testing.allocator;
+    // A footer shrink leaves the committed anchor at logical offset 30 while
+    // the screen shows 27. The 38-row flow tails into this 10-row area, so the
+    // next frame's target is 28: between the two offsets.
+    var runtime = TranscriptRuntime{
+        .layout = transcriptTestLayout(60, 14, 10),
+        .owned_top_row = 1,
+    };
+    defer runtime.deinit(alloc);
+
+    const flow = try makeLongPastePrompt(alloc, 36);
+    defer alloc.free(flow);
+    try installStableAnchorForTest(&runtime, alloc, flow, testSelection(30), 30, 12, 1, 73);
+    switch (runtime.transcript_commit_state) {
+        .stable => |*anchor| {
+            anchor.history_visual_offset = 27;
+            anchor.total_visual_rows = 38;
+            anchor.normal_buffer_recovery_pending = true;
+        },
+        .invalid, .recovering => return error.TestExpectedStableTranscript,
+    }
+    try expectStableNormalBufferRecoveryForTest(&runtime, 27);
+
+    var source = try testSource(alloc, flow, runtime.layout.cols);
+    defer source.deinit(alloc);
+    var prepared = try prepareTestSourceForCurrentArea(&runtime, alloc, &source);
+    defer prepared.deinit(alloc);
+    const facts = runtime.planTranscriptScrollForFrame(&prepared, false, false);
+    try std.testing.expect(facts.source_compatible);
+    try std.testing.expect(!facts.geometry_rebase);
+    try std.testing.expectEqual(@as(u32, 28), facts.target_visual_offset);
+
+    const scroll_plan = render_engine.frame_scroll_plan.merge(
+        runtime.layout.rows,
+        runtime.owned_top_row,
+        0,
+        facts.planned_rows,
+    );
+    var plan = testPaintPlan(&runtime, prepared.selection);
+    var transition = try runtime.finalizeTranscriptTransitionForFrame(
+        alloc,
+        &source,
+        &prepared,
+        render_engine.frame_layout.CommittedLayoutSnapshot.fromPaintPlan(plan),
+        &plan,
+        scroll_plan,
+        false,
+        false,
+    );
+    defer transition.deinit(alloc);
+    runtime.consumeFrameScrollCommit(alloc, scroll_plan, .{
+        .bytes_written = 1,
+        .changed_cells = 1,
+        .full_repaint = true,
+        .terminal_scroll_rows_committed = scroll_plan.terminal_scroll_rows,
+        .document_append_committed = !transition.document_append.isEmpty(),
+        .committed_cursor_row = transition.cursor_row,
+        .committed_cursor_col = transition.cursor_col,
+        .shadow_state = .committed,
+        .next_invalidation = render_engine.paint_plan.FrameInvalidationSet.empty(),
+    }, &transition);
+
+    try std.testing.expectEqual(
+        transcript_runtime.TranscriptCommitDiagnosticState.stable,
+        runtime.transcriptCommitDiagnostic().state,
+    );
+    try std.testing.expectEqual(
+        @as(u32, 28),
+        try stableHistoryVisualOffsetForTest(&runtime),
+    );
+    try std.testing.expect(!runtime.normalBufferRecoveryPending());
+}
+
 test "recorded transcript append preserves an authoritative committed anchor" {
     const alloc = std.testing.allocator;
     var runtime = TranscriptRuntime{
