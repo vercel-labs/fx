@@ -87,6 +87,30 @@
     "repair": []
   },
   {
+    "module": "ConfigEdit",
+    "smoke": "ConfigEdit.cfg",
+    "stress": "ConfigEdit.stress.cfg",
+    "findings": [
+      {
+        "config": "ConfigEdit.findings.cfg",
+        "invariant": "AddedIsLoaded"
+      },
+      {
+        "config": "ConfigEdit.findings-key.cfg",
+        "invariant": "NoRewriteOfMisspelled"
+      },
+      {
+        "config": "ConfigEdit.findings-bounded.cfg",
+        "invariant": "NoRewriteOfMisspelled"
+      },
+      {
+        "config": "ConfigEdit.findings-dryrun.cfg",
+        "invariant": "NoRewriteOfMisspelled"
+      }
+    ],
+    "repair": []
+  },
+  {
     "module": "McpRules",
     "smoke": "McpRules.cfg",
     "stress": "McpRules.stress.cfg",

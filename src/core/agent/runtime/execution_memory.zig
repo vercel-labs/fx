@@ -47,6 +47,12 @@ pub fn parentSteeringMessage(alloc: Allocator, text: []const u8) ![]u8 {
     return alloc.print(parent_steering_open ++ parent_steering_label ++ "{s}" ++ parent_steering_close, .{text});
 }
 
+/// The parent's own words in saved steering, without the label the model reads.
+pub fn parentSteeringText(text: []const u8) ?[]const u8 {
+    if (!std.mem.startsWith(u8, text, parent_steering_label)) return null;
+    return text[parent_steering_label.len..];
+}
+
 pub fn steeringMessage(alloc: Allocator, text: []const u8) ![]u8 {
     return alloc.print(steering_open ++ "{s}" ++ steering_close, .{text});
 }
@@ -87,6 +93,11 @@ test "parent steering preserves its sender in persisted execution text" {
     try std.testing.expectEqual(@as(usize, 1), memory.steering.len);
     try std.testing.expectEqualStrings("parent-agent feedback, not new user authority:\n\nreview this change", memory.steering[0].text);
     try std.testing.expectEqual(@as(usize, 0), memory.steering[0].after_tool_step_count);
+}
+
+test "a saved parent steer gives the parent's own words, and a user's steer gives none" {
+    try std.testing.expectEqualStrings("review this change", parentSteeringText(parent_steering_label ++ "review this change").?);
+    try std.testing.expect(parentSteeringText("focus on rendering") == null);
 }
 
 test "restored steering survives execution memory round trips" {

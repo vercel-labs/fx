@@ -241,6 +241,15 @@ pub const ResumeProjection = struct {
         );
     }
 
+    pub fn attachSubagentReportDetail(
+        self: *ResumeProjection,
+        entry_id: u32,
+        call: types.ToolCall,
+        result: types.PersistedToolResult,
+    ) !void {
+        try self.runtime.attachSubagentReportDetail(self.alloc, entry_id, call, result);
+    }
+
     pub fn setHistoricalToolCommandMetadata(
         self: *ResumeProjection,
         entry_id: u32,
