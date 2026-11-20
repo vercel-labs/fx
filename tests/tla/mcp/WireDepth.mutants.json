@@ -1,0 +1,38 @@
+[
+  {
+    "description": "The depth limit is removed: every message the engine hands over is accepted",
+    "old": "    ELSE IF Accepts(e, d) THEN \"accepted\"",
+    "new": "    ELSE IF TRUE THEN \"accepted\"",
+    "invariant": "PastLimitRefused"
+  },
+  {
+    "description": "The limit is above the stack less a writer's wrapper (255, with a wrapper of 2)",
+    "old": "Bound == Limit",
+    "new": "Bound == Capacity - 1",
+    "invariant": "NoWriterOverflow"
+  },
+  {
+    "description": "A writer is added with a wrapper of 130 levels",
+    "old": "bridge |-> 2]\nSkips",
+    "new": "bridge |-> 130]\nSkips",
+    "invariant": "NoWriterOverflow"
+  },
+  {
+    "description": "One entry point, the listed tool, skips the check",
+    "old": "Skips == {}",
+    "new": "Skips == {\"tool\"}",
+    "invariant": "PastLimitRefused"
+  },
+  {
+    "description": "The limit is off by one the low way: a message at the limit is refused",
+    "old": "Accepts(e, d) == e \\in Skips \\/ d <= Bound",
+    "new": "Accepts(e, d) == e \\in Skips \\/ d < Bound",
+    "invariant": "AcceptedUpToLimit"
+  },
+  {
+    "description": "The limit is off by one the high way: a message one level past it is accepted",
+    "old": "Accepts(e, d) == e \\in Skips \\/ d <= Bound",
+    "new": "Accepts(e, d) == e \\in Skips \\/ d <= Bound + 1",
+    "invariant": "PastLimitRefused"
+  }
+]

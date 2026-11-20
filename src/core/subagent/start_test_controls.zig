@@ -16,6 +16,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const build_options = @import("build_options");
 const io_mod = @import("../shared/io.zig");
+const end_test_controls = @import("end_test_controls.zig");
 
 const private_file_permissions = std.Io.File.Permissions.fromMode(0o600);
 const max_hold_ms = 60_000;
@@ -39,7 +40,7 @@ pub var test_wait_limit_ms: if (builtin.is_test) ?u64 else void = if (builtin.is
 pub fn armed() bool {
     if (comptime build_options.libfx) return false;
     if (builtin.is_test) return test_hold != null;
-    return io_mod.getenv("FX_TEST_SUBAGENT_START_HELD") != null and io_mod.getenv("FX_TEST_SUBAGENT_START_RELEASE") != null;
+    return end_test_controls.holdFiles("FX_TEST_SUBAGENT_START_HELD", "FX_TEST_SUBAGENT_START_RELEASE") != null;
 }
 
 /// Called by the slot of `child_id` once the work's turn is built, before its
@@ -50,18 +51,17 @@ pub fn holdStart(child_id: []const u8, cancel: *const std.atomic.Value(bool)) vo
         if (test_hold) |hold| hold(child_id);
         return;
     }
-    const held = io_mod.getenv("FX_TEST_SUBAGENT_START_HELD") orelse return;
-    const release = io_mod.getenv("FX_TEST_SUBAGENT_START_RELEASE") orelse return;
+    const files = end_test_controls.holdFiles("FX_TEST_SUBAGENT_START_HELD", "FX_TEST_SUBAGENT_START_RELEASE") orelse return;
     const n = holds.fetchAdd(1, .seq_cst) + 1;
     var marker_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    const marker = std.mem.print(&marker_buf, "{s}.{d}", .{ held, n }) catch return;
+    const marker = std.mem.print(&marker_buf, "{s}.{d}", .{ files.held, n }) catch return;
     var own_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    const own_release = std.mem.print(&own_buf, "{s}.{d}", .{ release, n }) catch return;
+    const own_release = std.mem.print(&own_buf, "{s}.{d}", .{ files.release, n }) catch return;
     var contents_buf: [256]u8 = undefined;
     const contents = std.mem.print(&contents_buf, "start child={s}", .{child_id}) catch return;
     writeMarker(marker, contents) catch return;
     const deadline = io_mod.milliTimestamp() + max_hold_ms;
-    while (!cancel.load(.seq_cst) and !pathExists(release) and !pathExists(own_release) and io_mod.milliTimestamp() < deadline) {
+    while (!cancel.load(.seq_cst) and !pathExists(files.release) and !pathExists(own_release) and io_mod.milliTimestamp() < deadline) {
         io_mod.sleep(std.time.ns_per_ms);
     }
 }
