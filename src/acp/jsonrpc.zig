@@ -2,6 +2,7 @@ const std = @import("std");
 const testing_allocator = @import("../core/shared/testing_allocator.zig");
 const io_mod = @import("../core/shared/io.zig");
 const host_target = @import("../core/hosts/target.zig");
+const debug_trace = @import("../core/shared/debug_trace.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -218,6 +219,11 @@ pub const Writer = struct {
     mutex: std.Io.Mutex = .init,
     stdout: std.Io.File,
     callback: ?Callback = null,
+    /// Set once a write fails because the client closed its end
+    /// (`error.BrokenPipe`). Later notifications are dropped, so a turn that
+    /// goes on after its client left doesn't fail on them; requests and
+    /// responses still fail, so whoever waits on them stops waiting.
+    dropping: bool = false,
 
     const Frame = union(enum) {
         response: struct {
@@ -310,21 +316,21 @@ pub const Writer = struct {
         try self.writeFrame(alloc, .{ .response = .{
             .id = id,
             .result_json = result_json,
-        } });
+        } }, false);
     }
 
     pub fn writeError(self: *Writer, alloc: Allocator, id: ?RequestId, err: RpcError) !void {
         try self.writeFrame(alloc, .{ .error_response = .{
             .id = id,
             .err = err,
-        } });
+        } }, false);
     }
 
     pub fn writeNotification(self: *Writer, alloc: Allocator, method: []const u8, params_json: []const u8) !void {
         try self.writeFrame(alloc, .{ .notification = .{
             .method = method,
             .params_json = params_json,
-        } });
+        } }, true);
     }
 
     pub fn writeRequest(self: *Writer, alloc: Allocator, id: RequestId, method: []const u8, params_json: []const u8) !void {
@@ -332,10 +338,10 @@ pub const Writer = struct {
             .id = id,
             .method = method,
             .params_json = params_json,
-        } });
+        } }, false);
     }
 
-    fn writeFrame(self: *Writer, alloc: Allocator, frame: Frame) !void {
+    fn writeFrame(self: *Writer, alloc: Allocator, frame: Frame, notification: bool) !void {
         var out: std.Io.Writer.Allocating = .init(alloc);
         defer out.deinit();
 
@@ -347,11 +353,26 @@ pub const Writer = struct {
         const io = io_mod.getIo();
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
-        if (self.callback) |callback| {
-            try callback.write_fn(callback.context, slice);
-        } else {
-            try self.stdout.writeStreamingAll(io, slice);
+        if (self.dropping) {
+            if (notification) return;
+            return error.BrokenPipe;
         }
+        if (self.callback) |callback| {
+            callback.write_fn(callback.context, slice) catch |err| return self.writeFailed(err, notification);
+        } else {
+            self.stdout.writeStreamingAll(io, slice) catch |err| return self.writeFailed(err, notification);
+        }
+    }
+
+    /// Handles a failed write while `writeFrame` holds the mutex. Only a closed
+    /// client (`error.BrokenPipe`) turns dropping on, and only a notification
+    /// is then dropped without an error; every other error stays as it is.
+    fn writeFailed(self: *Writer, err: anyerror, notification: bool) !void {
+        if (err != error.BrokenPipe) return err;
+        self.dropping = true;
+        debug_trace.logf("acp", "event=client_output_closed dropping=later_notifications", .{});
+        if (notification) return;
+        return err;
     }
 
     pub fn writeId(w: *std.Io.Writer, id: ?RequestId) !void {
@@ -815,6 +836,45 @@ test "Writer keeps each frame on one line when caller JSON has line breaks" {
         defer alloc.free(actual_json);
         try std.testing.expectEqualStrings(expected_json, actual_json);
     }
+}
+
+const ClosingClient = struct {
+    calls: usize = 0,
+    failure: anyerror,
+
+    fn write(raw: ?*anyopaque, frame: []const u8) !void {
+        _ = frame;
+        const self: *@This() = @ptrCast(@alignCast(raw.?));
+        self.calls += 1;
+        return self.failure;
+    }
+};
+
+test "Writer drops notifications once the client closes its end, and fails requests" {
+    const alloc = std.testing.allocator;
+    var client: ClosingClient = .{ .failure = error.BrokenPipe };
+    var writer = Writer.initCallback(&client, ClosingClient.write);
+
+    // The first write finds the client gone: the notification is dropped, not failed.
+    try writer.writeNotification(alloc, "session/update", "{}");
+    try std.testing.expect(writer.dropping);
+    try std.testing.expectEqual(@as(usize, 1), client.calls);
+
+    // Later notifications are not written; requests and responses still fail.
+    try writer.writeNotification(alloc, "session/update", "{}");
+    try std.testing.expectError(error.BrokenPipe, writer.writeRequest(alloc, .{ .integer = 1 }, "session/request_permission", "{}"));
+    try std.testing.expectError(error.BrokenPipe, writer.writeResponse(alloc, .{ .integer = 2 }, "{}"));
+    try std.testing.expectEqual(@as(usize, 1), client.calls);
+}
+
+test "Writer keeps a write error other than a closed client" {
+    const alloc = std.testing.allocator;
+    var client: ClosingClient = .{ .failure = error.InputOutput };
+    var writer = Writer.initCallback(&client, ClosingClient.write);
+
+    try std.testing.expectError(error.InputOutput, writer.writeNotification(alloc, "session/update", "{}"));
+    try std.testing.expect(!writer.dropping);
+    try std.testing.expectEqual(@as(usize, 1), client.calls);
 }
 
 test "ACP frames stay one parseable line and read the same however they are split" {

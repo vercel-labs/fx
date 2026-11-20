@@ -45,7 +45,8 @@
         "sh.fx/turnProgress": { "$ref": "#/$defs/Capability" },
         "sh.fx/modelCalls": { "$ref": "#/$defs/Capability" },
         "sh.fx/usage": { "$ref": "#/$defs/Capability" },
-        "sh.fx/commandResult": { "$ref": "#/$defs/Capability" }
+        "sh.fx/commandResult": { "$ref": "#/$defs/Capability" },
+        "sh.fx/keepTurnOnDisconnect": { "$ref": "#/$defs/Capability" }
       },
       "patternProperties": {
         "^sh\\.fx/": { "$ref": "#/$defs/Capability" }
@@ -74,7 +75,8 @@
         "sh.fx/turnProgress": { "$ref": "#/$defs/Capability" },
         "sh.fx/modelCalls": { "$ref": "#/$defs/Capability" },
         "sh.fx/usage": { "$ref": "#/$defs/Capability" },
-        "sh.fx/commandResult": { "$ref": "#/$defs/Capability" }
+        "sh.fx/commandResult": { "$ref": "#/$defs/Capability" },
+        "sh.fx/keepTurnOnDisconnect": { "$ref": "#/$defs/Capability" }
       },
       "patternProperties": {
         "^sh\\.fx/": { "$ref": "#/$defs/Capability" }

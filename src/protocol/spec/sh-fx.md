@@ -71,7 +71,7 @@ After `initialize`, these rules apply to the connection:
 - Each side ignores the names it doesn't know in the other side's list.
 - A request that would make fx send a client an extension's messages, such as `_sh.fx/journal/open` or a session's hook settings, fails with `-32602` when that client doesn't list the extension.
 
-Each extension's section defines its capabilities, which `AgentCapabilitiesMeta` and `ClientCapabilitiesMeta` in `sh-fx.schema.json` also list. The steering section defines `sh.fx/promptDelivery` and `sh.fx/hostSteering`, the following section defines `sh.fx/logPosition` and `sh.fx/sessionClients`, the status section defines `sh.fx/sessionState` and `sh.fx/listChanges`, the subagents section defines `sh.fx/subagentPrompts`, the fork section defines `sh.fx/fork` and `sh.fx/rewind`, the turn diff section defines `sh.fx/turnDiff`, the turn events section defines `sh.fx/turnProgress`, `sh.fx/modelCalls`, and `sh.fx/usage`, the sections for a host define `sh.fx/journal`, `sh.fx/hooks`, and `sh.fx/hostTools`, and the section on details defines `sh.fx/toolCall`, `sh.fx/permissionMode`, and `sh.fx/modelResponseRecovery`.
+Each extension's section defines its capabilities, which `AgentCapabilitiesMeta` and `ClientCapabilitiesMeta` in `sh-fx.schema.json` also list. The steering section defines `sh.fx/promptDelivery` and `sh.fx/hostSteering`, the following section defines `sh.fx/logPosition` and `sh.fx/sessionClients`, the status section defines `sh.fx/sessionState` and `sh.fx/listChanges`, the subagents section defines `sh.fx/subagentPrompts`, the fork section defines `sh.fx/fork` and `sh.fx/rewind`, the turn diff section defines `sh.fx/turnDiff`, the turn events section defines `sh.fx/turnProgress`, `sh.fx/modelCalls`, and `sh.fx/usage`, the section on keeping turns after a disconnect defines `sh.fx/keepTurnOnDisconnect`, the sections for a host define `sh.fx/journal`, `sh.fx/hooks`, and `sh.fx/hostTools`, and the section on details defines `sh.fx/toolCall`, `sh.fx/permissionMode`, and `sh.fx/modelResponseRecovery`.
 
 ## Extensions
 
@@ -86,6 +86,7 @@ Each extension gets its own section here when it is written.
 | Fork and rewind | A new session copied from another, whole or up to a prompt, and the removal of the turns from a prompt on | [`session/fork`](https://agentclientprotocol.com/rfds/session-fork) for fork, and none for rewind |
 | Turn diff | The combined file changes of one turn | None |
 | Turn events | A turn's progress, its model calls, and how long it ran | None; the turn's tokens use ACP's unstable `usage` field |
+| Keeping turns after a disconnect | Running turns and their queued prompts that finish after the client's input ends, for a client that lists `sh.fx/keepTurnOnDisconnect` | None |
 | A host's journal, hooks, and tools | What fx's SDK needs to keep a session's journal itself, observe a turn, and run its own tools | None |
 | Details on standard messages | Which tool calls are fx's own steps, the permission mode of each session mode, and the state of a model request that an earlier fx left running | None |
 
@@ -573,6 +574,14 @@ The `session/prompt` response carries the turn's tokens in `usage`, the field th
 fx also sends ACP v1's compaction updates, to a client that lists ACP's `session.compaction` capability, and no compaction updates to other clients. Once a compaction of a session's context starts its summary, fx sends `compaction_update` with `in_progress`. When it ends, fx sends one more `compaction_update` with the same `compactionId`: `completed`, `failed` with the error, or `cancelled`. The updates carry no `summary`, because the summary fx keeps is written for the model and fx's terminal doesn't show it either. A compaction that ends before its summary starts, such as one that finds nothing to compact, sends nothing unless it failed. A load replays each saved compaction as one `completed` update, in its place in the history.
 
 A turn's notifications from this extension, and its compaction updates, reach the client before the turn's `session/prompt` response, in the order the loop reported them. `tests/tla/acp/AcpTurnEvents.tla` models these rules, and TLC checks that a client receives only the parts it lists, every reported event of those parts, each compaction's `in_progress` before its one end and nothing after it, and all of it before the response.
+
+### Keeping turns after a disconnect
+
+A client that lists `sh.fx/keepTurnOnDisconnect` keeps its sessions' running turns when its input ends: each turn finishes and is saved, the prompts it queued run after it, and fx exits once no turn runs and no prompt waits. fx lists the capability for every client. A client that doesn't list it keeps fx's usual behavior: when its input ends, fx stops its running turns and saves each one as interrupted, and the prompts it queued still run.
+
+Once a client's input ends, fx never waits for it: a permission request is denied at once, an SDK host tool and an MCP server's question get an error result, and the turn goes on. A session whose host keeps its journal (`sh.fx/journal`) can't save without that host, so its turn stops at its next journal flush. fx keeps writing updates until a write fails, so a client that closed only its input still reads them.
+
+`tests/tla/acp/AcpDisconnect.tla` checks the rules for running turns, queued prompts and permission requests, and `tests/tla/drivers/acp/disconnect/driver.ts` checks them on fx.
 
 ### A host's journal
 

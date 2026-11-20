@@ -197,6 +197,11 @@ pub const OutboundResponse = struct {
     result_json: ?[]u8 = null,
     error_json: ?[]u8 = null,
     cancelled: bool = false,
+    /// The client can't answer: its input has ended. It is not a cancel, so
+    /// `cancelled` stays false and a caller sees a request with no result: a
+    /// permission request is denied, and a host tool or an elicitation gets an
+    /// error result, while the turn goes on.
+    no_client: bool = false,
 
     pub fn deinit(self: *OutboundResponse, alloc: Allocator) void {
         if (self.result_json) |value| alloc.free(value);
@@ -496,6 +501,9 @@ pub const ServerState = struct {
     outbound_cond: std.Io.Condition = .init,
     next_outbound_request_id: u64 = 1,
     pending_outbound: std.AutoHashMapUnmanaged(u64, PendingOutbound) = .empty,
+    /// Set when the client's input ends. Guarded by `outbound_mutex`; once it
+    /// is set, `beginOutboundRequest` refuses new requests to the client.
+    input_ended: bool = false,
     legacy_url_mutex: std.Io.Mutex = .init,
     pending_legacy_urls: std.ArrayList(PendingLegacyUrl) = .empty,
 
@@ -1409,10 +1417,15 @@ pub fn runWithTransport(
         };
         if (state.terminate_connection) break;
     }
-    // Release any prompt thread parked on a pending approval before
-    // state.deinit() joins it, or shutdown deadlocks.
-    for (state.sessions.items) |session| handleCancel(&state, session, false);
-    cancelPendingOutbound(&state, null, false);
+    // A client that listed sh.fx/keepTurnOnDisconnect keeps its running
+    // turns: they finish and are saved, and state.deinit() joins them and the
+    // queued prompts. Any other client's turns stop first, as before, so their
+    // waiting requests end as cancels. Then the client can't answer any more,
+    // so end what fx still waits on and refuse new requests.
+    if (!state.extensions.contains(.keep_turn_on_disconnect)) {
+        for (state.sessions.items) |session| handleCancel(&state, session, false);
+    }
+    endClientInput(&state);
 }
 
 fn shouldRespondToMessage(msg: *const jsonrpc.Message) bool {
@@ -1471,6 +1484,8 @@ fn parsePermissionDecision(root: std.json.Value) ?types.ToolPermissionDecision {
 pub fn beginOutboundRequest(state: *ServerState, owner: ?*const ActiveSessionState, kind: OutboundKind) !?u64 {
     state.outbound_mutex.lockUncancelable(io_mod.getIo());
     defer state.outbound_mutex.unlock(io_mod.getIo());
+    // The client's input has ended, so no answer can arrive.
+    if (state.input_ended) return null;
     if (state.next_outbound_request_id > @as(u64, @intCast(std.math.maxInt(i64)))) return null;
     var owned: usize = 0;
     var pending = state.pending_outbound.valueIterator();
@@ -1482,6 +1497,14 @@ pub fn beginOutboundRequest(state: *ServerState, owner: ?*const ActiveSessionSta
     state.next_outbound_request_id += 1;
     try state.pending_outbound.put(state.alloc, id, .{ .kind = kind, .owner = owner });
     return id;
+}
+
+/// Whether the client's input has ended (`endClientInput`), so a request to
+/// it can't get an answer.
+pub fn clientInputEnded(state: *ServerState) bool {
+    state.outbound_mutex.lockUncancelable(io_mod.getIo());
+    defer state.outbound_mutex.unlock(io_mod.getIo());
+    return state.input_ended;
 }
 
 pub fn awaitOutboundResponse(state: *ServerState, id: u64, kind: OutboundKind) ?OutboundResponse {
@@ -1570,6 +1593,21 @@ fn cancelPendingOutbound(state: *ServerState, owner: ?*const ActiveSessionState,
 
     if (!notify_client) return;
     for (cancelled_ids[0..cancelled_count]) |id| publishRequestCancellation(state, id);
+}
+
+/// Ends the client's input: every request fx waits on gets the `no_client`
+/// result, and later requests are refused, so no turn waits for an answer
+/// that can't arrive.
+fn endClientInput(state: *ServerState) void {
+    state.outbound_mutex.lockUncancelable(io_mod.getIo());
+    defer state.outbound_mutex.unlock(io_mod.getIo());
+    state.input_ended = true;
+    var pending = state.pending_outbound.iterator();
+    while (pending.next()) |entry| {
+        if (entry.value_ptr.response != null) continue;
+        entry.value_ptr.response = .{ .no_client = true };
+    }
+    state.outbound_cond.broadcast(io_mod.getIo());
 }
 
 fn publishRequestCancellation(state: *ServerState, id: u64) void {
@@ -1830,6 +1868,7 @@ pub fn beginPermissionRequest(state: *ServerState, owner: ?*const ActiveSessionS
 pub fn awaitPermissionDecision(state: *ServerState, id: u64) types.ToolPermissionDecision {
     var response = awaitOutboundResponse(state, id, .permission) orelse return .deny;
     defer response.deinit(state.alloc);
+    if (response.no_client) debug_trace.logf("acp", "event=permission_denied reason=client_input_ended", .{});
     if (response.cancelled or response.error_json != null) return .deny;
     const raw = response.result_json orelse return .deny;
     const parsed = std.json.parseFromSlice(std.json.Value, state.alloc, raw, .{}) catch return .deny;
@@ -3819,7 +3858,7 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
 /// tools. Every build sends hooks, tool call identities, permission modes,
 /// model recovery, and turn events to a client that lists them.
 fn agentExtensions(minimal_kernel: bool) sh_fx.Set {
-    var set: sh_fx.Set = .initMany(&.{ .hooks, .tool_call, .permission_mode, .model_response_recovery, .turn_progress, .model_calls, .usage, .command_result });
+    var set: sh_fx.Set = .initMany(&.{ .hooks, .tool_call, .permission_mode, .model_response_recovery, .turn_progress, .model_calls, .usage, .command_result, .keep_turn_on_disconnect });
     if (minimal_kernel) {
         set.setUnion(.initMany(&.{ .host_steering, .journal, .host_tools }));
     } else if (!host_target.is_wasm) {
@@ -5409,6 +5448,25 @@ test "ACP outbound waiters resolve to deny on cancellation" {
     cancelPermissionRequest(&state, second);
     try std.testing.expectEqual(types.ToolPermissionDecision.deny, awaitPermissionDecision(&state, second));
     try std.testing.expect(capture.saw_request_cancellation);
+}
+
+test "ACP client input end gives a pending request no client and refuses new ones" {
+    const alloc = std.testing.allocator;
+    var state = ServerState{
+        .alloc = alloc,
+        .cfg = undefined,
+        .writer = jsonrpc.Writer.init(),
+    };
+    defer state.pending_outbound.deinit(alloc);
+
+    const id = (try beginOutboundRequest(&state, null, .elicitation)).?;
+    endClientInput(&state);
+
+    var response = awaitOutboundResponse(&state, id, .elicitation) orelse return error.TestExpectedEqual;
+    defer response.deinit(alloc);
+    try std.testing.expect(!response.cancelled);
+    try std.testing.expect(response.no_client);
+    try std.testing.expect((try beginOutboundRequest(&state, null, .elicitation)) == null);
 }
 
 test "ACP outbound responses correlate out of order and ignore unknown ids" {
