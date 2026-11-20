@@ -29,6 +29,9 @@
 (*                from its recovery checkpoint and streams a new turn      *)
 (*   Faults       a later rebuild gives a streamed result other content,   *)
 (*                or loses one                                             *)
+(*   FailedCommits a commit fails and the host goes on to its next turn,   *)
+(*                which marks the open turn stale (D98): the next write    *)
+(*                closes it as superseded and writes the turn afresh       *)
 (*                                                                         *)
 (* Mutant selects the design. "none" is fx as it is; "restamp" is fx       *)
 (* before results kept their stamps; the rest are planted bugs.            *)
@@ -36,14 +39,15 @@
 (***************************************************************************)
 EXTENDS Naturals, Sequences, FiniteSets
 
-CONSTANTS Calls, MaxBuilds, MissedPaths, Compactions, Recovery, Faults, Mutant
+CONSTANTS Calls, MaxBuilds, MissedPaths, Compactions, Recovery, Faults,
+          FailedCommits, Mutant
 
 Mutants == {"none", "restamp", "lose_on_recover", "share_stamp", "bytes_only",
-            "loose_compare", "mix_on_mismatch", "prefix_only"}
+            "loose_compare", "mix_on_mismatch", "prefix_only", "continue_stale"}
 
 ASSUME Mutant \in Mutants
 ASSUME MaxBuilds \in Nat
-ASSUME {MissedPaths, Compactions, Recovery, Faults} \subseteq BOOLEAN
+ASSUME {MissedPaths, Compactions, Recovery, Faults, FailedCommits} \subseteq BOOLEAN
 
 None == "none"
 
@@ -66,11 +70,13 @@ VARIABLES
   unexplained,\* of those, closed with no fault and no compaction behind it
   reparsed,   \* streamed pieces of stamped results samePiece had to parse
   anyParsed,  \* streamed pieces of any result samePiece had to parse
-  last        \* what the last stream or commit decided
+  last,       \* what the last stream or commit decided
+  stale,      \* the open turn is one a failed commit left behind (D98)
+  failedAt    \* the log's length when a failed commit left its turn, or 0
 
 vars == <<done, cut, changed, dropped, builds, streamed, open, log, committed,
           final, birthOf, stampedAt, recovered, shifted, supersedes,
-          unexplained, reparsed, anyParsed, last>>
+          unexplained, reparsed, anyParsed, last, stale, failedAt>>
 
 Range(s) == {s[i] : i \in DOMAIN s}
 
@@ -122,16 +128,22 @@ Stands(b) ==
 
 Mixes == Mutant = "mix_on_mismatch"
 
+(* Whether the next write continues the open turn: a stale one is closed   *)
+(* as superseded first (`streamedPrefix`, `openTurnLocked`).               *)
+Live == open /\ (~stale \/ Mutant = "continue_stale")
+Closing == open /\ ~Live
+
 After(b) == SubSeq(b, Len(streamed) + 1, Len(b))
 NewPieces(b) == IF Len(streamed) <= Len(b) THEN After(b) ELSE <<>>
 
 Held(b) ==
-  IF ~open THEN b
+  IF ~Live THEN b
   ELSE IF Stands(b) \/ Mixes THEN streamed \o NewPieces(b)
   ELSE b
 
 Lines(b) ==
-  IF ~open THEN AsLines(b)
+  IF Closing THEN <<Superseded>> \o AsLines(b)
+  ELSE IF ~open THEN AsLines(b)
   ELSE IF Stands(b) \/ Mixes THEN AsLines(NewPieces(b))
   ELSE <<Superseded>> \o AsLines(b)
 
@@ -144,11 +156,13 @@ Parsed(b) ==
 StampedParsed(b) ==
   {i \in Parsed(b) : \E r \in Range(done) : r.call = b[i].call /\ r.stamped}
 
+(* A stale turn's supersede is explained by its failed commit, so it is    *)
+(* counted apart from a stream that differed.                              *)
 Decide(b, phase) ==
-  LET stands     == ~open \/ Stands(b)
+  LET stands     == ~Live \/ Stands(b)
       supersede  == ~stands /\ ~Mixes
-      count      == IF open /\ Stands(b) THEN Cardinality(Parsed(b)) ELSE 0
-      stampedOne == IF open /\ Stands(b) THEN Cardinality(StampedParsed(b)) ELSE 0
+      count      == IF Live /\ Stands(b) THEN Cardinality(Parsed(b)) ELSE 0
+      stampedOne == IF Live /\ Stands(b) THEN Cardinality(StampedParsed(b)) ELSE 0
   IN /\ supersedes' = supersedes + (IF supersede THEN 1 ELSE 0)
      /\ unexplained' = unexplained + (IF supersede /\ Faultless /\ ~shifted THEN 1 ELSE 0)
      /\ reparsed' = reparsed + stampedOne
@@ -176,6 +190,8 @@ Init ==
   /\ reparsed = 0
   /\ anyParsed = 0
   /\ last = Decision(None, TRUE, 0, 0)
+  /\ stale = FALSE
+  /\ failedAt = 0
 
 (* `tool_batch.zig`: a call finishes and its result enters the turn, with  *)
 (* the time it was made, or, on a missed path, without one.                *)
@@ -193,7 +209,7 @@ RunTool(c, stamped) ==
   /\ stampedAt' = IF stamped THEN stampedAt \cup {c} ELSE stampedAt
   /\ UNCHANGED <<cut, changed, dropped, builds, streamed, open, log, committed,
                  final, recovered, shifted, supersedes, unexplained, reparsed,
-                 anyParsed, last>>
+                 anyParsed, last, stale, failedAt>>
 
 (* Compaction takes the first k results of the view out of it. *)
 Compact(k) ==
@@ -204,7 +220,7 @@ Compact(k) ==
   /\ shifted' = TRUE
   /\ UNCHANGED <<done, changed, dropped, builds, streamed, open, log, committed,
                  final, birthOf, stampedAt, recovered, supersedes, unexplained,
-                 reparsed, anyParsed, last>>
+                 reparsed, anyParsed, last, stale, failedAt>>
 
 (* fx stops mid-turn and resumes from the recovery checkpoint, which holds *)
 (* the last rebuild; `appendExecutionMemoryChatMessages` gives each result *)
@@ -226,8 +242,9 @@ Recover ==
   /\ open' = FALSE
   /\ streamed' = <<>>
   /\ log' = log \o <<Interrupted>>
+  /\ stale' = FALSE
   /\ UNCHANGED <<changed, builds, committed, final, birthOf, stampedAt, shifted,
-                 supersedes, unexplained, reparsed, anyParsed, last>>
+                 supersedes, unexplained, reparsed, anyParsed, last, failedAt>>
 
 (* A later rebuild gives a streamed result other content. *)
 Change(c) ==
@@ -238,7 +255,7 @@ Change(c) ==
   /\ changed' = {c}
   /\ UNCHANGED <<done, cut, dropped, builds, streamed, open, log, committed,
                  final, birthOf, stampedAt, recovered, shifted, supersedes,
-                 unexplained, reparsed, anyParsed, last>>
+                 unexplained, reparsed, anyParsed, last, stale, failedAt>>
 
 (* A later rebuild no longer has a streamed result, so the rest shift. *)
 Drop(c) ==
@@ -249,7 +266,7 @@ Drop(c) ==
   /\ dropped' = {c}
   /\ UNCHANGED <<done, cut, changed, builds, streamed, open, log, committed,
                  final, birthOf, stampedAt, recovered, shifted, supersedes,
-                 unexplained, reparsed, anyParsed, last>>
+                 unexplained, reparsed, anyParsed, last, stale, failedAt>>
 
 (* `appendProgress`: the turn so far, before the next model request. *)
 Stream ==
@@ -261,8 +278,9 @@ Stream ==
         /\ streamed' = Held(b)
         /\ Decide(b, "stream")
   /\ open' = TRUE
+  /\ stale' = (Mutant = "continue_stale" /\ stale)
   /\ UNCHANGED <<done, cut, changed, dropped, committed, final, birthOf,
-                 stampedAt, recovered>>
+                 stampedAt, recovered, failedAt>>
 
 (* `commitTurn`: the finished turn, its end in the same batch. *)
 Commit ==
@@ -276,7 +294,24 @@ Commit ==
   /\ streamed' = <<>>
   /\ committed' = TRUE
   /\ open' = FALSE
-  /\ UNCHANGED <<done, cut, changed, dropped, birthOf, stampedAt, recovered>>
+  /\ stale' = FALSE
+  /\ UNCHANGED <<done, cut, changed, dropped, birthOf, stampedAt, recovered, failedAt>>
+
+(* A commit fails before its batch reaches the log, and the host goes on:  *)
+(* `beginCaptureTurn` drops the failed turn's captures and, since the open *)
+(* turn holds a start capture, marks it stale. A retry with the same token *)
+(* is `Commit` itself and supersedes nothing.                              *)
+FailCommit ==
+  /\ FailedCommits
+  /\ ~committed
+  /\ open
+  /\ ~stale
+  /\ failedAt = 0
+  /\ stale' = TRUE
+  /\ failedAt' = Len(log)
+  /\ UNCHANGED <<done, cut, changed, dropped, builds, streamed, open, log,
+                 committed, final, birthOf, stampedAt, recovered, shifted,
+                 supersedes, unexplained, reparsed, anyParsed, last>>
 
 Next ==
   \/ \E c \in Calls, stamped \in BOOLEAN : RunTool(c, stamped)
@@ -285,6 +320,7 @@ Next ==
   \/ Recover
   \/ Stream
   \/ Commit
+  \/ FailCommit
 
 Spec == Init /\ [][Next]_vars
 
@@ -318,7 +354,9 @@ TypeOK ==
        \/ log[i].kind = "piece" /\ log[i].piece \in Pieces
        \/ log[i].kind \in {"superseded", "interrupted", "end"} /\ log[i].piece = NoPiece
   /\ stampedAt \subseteq Calls
-  /\ {supersedes, unexplained, reparsed, anyParsed} \subseteq Nat
+  /\ {supersedes, unexplained, reparsed, anyParsed, failedAt} \subseteq Nat
+  /\ stale \in BOOLEAN
+  /\ stale => open
 
 (* The committed turn holds the final rebuild's calls and content, and     *)
 (* nothing a stale stream left.                                            *)
@@ -334,6 +372,14 @@ SupersedeExplained == unexplained = 0
 
 (* No rebuild needs samePiece's parser for a result that kept its stamp. *)
 NoReparseOfStamped == reparsed = 0
+
+(* A turn a failed commit left behind is never continued: every piece      *)
+(* written after the failure follows a superseded or interrupted mark.     *)
+StaleTurnNeverContinues ==
+  failedAt > 0 =>
+    \A i \in (failedAt + 1)..Len(log) :
+      log[i].kind = "piece" =>
+        \E j \in (failedAt + 1)..(i - 1) : log[j].kind \in {"superseded", "interrupted"}
 
 (* Every piece in the log carries a stamp made for its own call. *)
 StampIsOwn ==
@@ -353,5 +399,6 @@ NeverSuperseded == supersedes = 0
 NeverCommittedWhole == ~(committed /\ Len(final) = Cardinality(Calls) /\ builds >= 3)
 NeverCommittedAfterCut == ~(committed /\ cut > 0 /\ Len(final) > 0)
 NeverCommittedAfterRecovery == ~(committed /\ recovered /\ Len(final) > 0)
+NeverCommittedAfterFailure == ~(committed /\ failedAt > 0)
 MissedPathsNeverParse == anyParsed = 0
 =============================================================================

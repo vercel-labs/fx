@@ -21,28 +21,11 @@ import {
   TmuxSession,
   tmuxAvailable,
 } from "./tmux-helpers";
+import { ignoresFileModes } from "./file-modes";
 
 const SKIP = !tmuxAvailable() || !HAS_API_KEY;
 const SKIP_TMUX = !tmuxAvailable();
 const TIMEOUT = 30_000;
-
-/// Whether this process can write into a folder whose mode forbids it, as root
-/// or a sandbox that holds every capability can.
-function ignoresFileModes(): boolean {
-  const probe = mkdtempSync(join(tmpdir(), "fx-e2e-mode-probe-"));
-  try {
-    chmodSync(probe, 0o500);
-    try {
-      writeFileSync(join(probe, "probe"), "");
-      return true;
-    } catch {
-      return false;
-    }
-  } finally {
-    chmodSync(probe, 0o700);
-    rmSync(probe, { recursive: true, force: true });
-  }
-}
 
 /// Whether `chflags` can make a file immutable here, as macOS can and Linux
 /// cannot without root.
