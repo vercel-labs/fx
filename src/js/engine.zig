@@ -5,8 +5,9 @@
 //! The engine is fx's fork of quickjs-ng in `quickjs/`; `quickjs/FORK.md`
 //! records where it came from and what fx changed. Programs get only the
 //! ECMAScript built-ins: no `std` or `os` module, files, network, processes,
-//! or timers. Outside code imports only this file, and the module imports
-//! only the standard library and its own files.
+//! or timers. `newContext` also leaves out the built-ins code mode doesn't
+//! need. Outside code imports only this file, and the module imports only
+//! the standard library and its own files.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -84,10 +85,12 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, source: []const u8, limits: Limit
     qjs.JS_UpdateStackTop(rt);
     qjs.JS_SetMaxStackSize(rt, limits.stack_bytes);
 
+    qjs.JS_SetModuleLoaderFunc(rt, null, refuseImport, null);
+
     var deadline: Deadline = .start(io, limits.time_ms);
     qjs.JS_SetInterruptHandler(rt, Deadline.onInterrupt, &deadline);
 
-    const ctx = qjs.JS_NewContext(rt) orelse return error.OutOfMemory;
+    const ctx = try newContext(rt);
     defer qjs.JS_FreeContext(ctx);
 
     const completion = qjs.JS_Eval(ctx, program.ptr, program.len, "<program>", qjs.eval_type_global);
@@ -132,6 +135,93 @@ fn settle(gpa: std.mem.Allocator, rt: *qjs.Runtime, ctx: *qjs.Context, completio
         else => try returnedJson(gpa, ctx, completion),
     };
 }
+
+/// A context with the built-ins code mode keeps. It leaves out Proxy,
+/// WeakRef and FinalizationRegistry, and the typed arrays along with
+/// ArrayBuffer, SharedArrayBuffer, Atomics, and DataView, none of which the
+/// models' programs used. `cut_prelude` then makes those names throw an
+/// error that says so, and swaps in stand-ins for `eval` and the Function
+/// constructors that throw when called.
+fn newContext(rt: *qjs.Runtime) error{OutOfMemory}!*qjs.Context {
+    const ctx = qjs.JS_NewContextRaw(rt) orelse return error.OutOfMemory;
+    errdefer qjs.JS_FreeContext(ctx);
+    const groups = [_]*const fn (*qjs.Context) callconv(.c) c_int{
+        qjs.JS_AddIntrinsicBaseObjects,
+        qjs.JS_AddIntrinsicDate,
+        // The compiler every program needs, not the global `eval`.
+        qjs.JS_AddIntrinsicEval,
+        qjs.JS_AddIntrinsicRegExp,
+        qjs.JS_AddIntrinsicJSON,
+        qjs.JS_AddIntrinsicMapSet,
+        qjs.JS_AddIntrinsicPromise,
+        qjs.JS_AddIntrinsicAToB,
+        qjs.JS_AddPerformance,
+    };
+    for (groups) |add| if (add(ctx) != 0) return error.OutOfMemory;
+
+    const done = qjs.JS_Eval(ctx, cut_prelude, cut_prelude.len, "<code mode>", qjs.eval_type_global);
+    defer qjs.JS_FreeValue(ctx, done);
+    if (done.isException()) {
+        // The prelude throws nothing of its own, so only memory can fail it.
+        qjs.JS_FreeValue(ctx, qjs.JS_GetException(ctx));
+        return error.OutOfMemory;
+    }
+    return ctx;
+}
+
+/// Every `import()` fails: code mode has no modules to load.
+fn refuseImport(ctx: ?*qjs.Context, _: [*:0]const u8, _: ?*anyopaque) callconv(.c) ?*qjs.ModuleDef {
+    _ = qjs.JS_ThrowTypeError(ctx.?, "import() is not available in code mode");
+    return null;
+}
+
+/// Runs before each program. Reading a cut name throws. `eval` and each
+/// Function constructor become stand-ins, so a program can still use
+/// `instanceof Function`, `typeof eval`, or `fn.constructor.name`, but calling
+/// one throws instead of compiling code. A program can't undo it: the
+/// properties it defines are neither writable nor configurable, and no other
+/// path reaches the real constructors. Direct `eval(...)` compiles code only
+/// when the callee is the real `eval`, which QuickJS keeps out of reach.
+const cut_prelude =
+    \\(() => {
+    \\  "use strict";
+    \\  const fixed = (value) => ({ value, writable: false, enumerable: false, configurable: false });
+    \\  const functionPrototypes = [
+    \\    Function.prototype,
+    \\    Object.getPrototypeOf(async function () {}),
+    \\    Object.getPrototypeOf(function* () {}),
+    \\    Object.getPrototypeOf(async function* () {}),
+    \\  ];
+    \\  for (const prototype of functionPrototypes) {
+    \\    const name = prototype.constructor.name;
+    \\    const standIn = {
+    \\      [name]: function (body) {
+    \\        throw new TypeError("The " + name + " constructor is not available in code mode");
+    \\      },
+    \\    }[name];
+    \\    Object.defineProperty(standIn, "prototype", fixed(prototype));
+    \\    Object.defineProperty(prototype, "constructor", fixed(standIn));
+    \\  }
+    \\  Object.defineProperty(globalThis, "Function", fixed(Function.prototype.constructor));
+    \\  const evalStandIn = {
+    \\    eval(code) { throw new TypeError("eval is not available in code mode"); },
+    \\  }.eval;
+    \\  Object.defineProperty(globalThis, "eval", fixed(evalStandIn));
+    \\  const unavailable = (name) => ({
+    \\    get() { throw new TypeError(name + " is not available in code mode"); },
+    \\    enumerable: false,
+    \\    configurable: false,
+    \\  });
+    \\  const names = [
+    \\    "Proxy", "WeakRef", "FinalizationRegistry",
+    \\    "ArrayBuffer", "SharedArrayBuffer", "Atomics", "DataView",
+    \\    "Int8Array", "Uint8Array", "Uint8ClampedArray", "Int16Array", "Uint16Array",
+    \\    "Int32Array", "Uint32Array", "Float16Array", "Float32Array", "Float64Array",
+    \\    "BigInt64Array", "BigUint64Array",
+    \\  ];
+    \\  for (const name of names) Object.defineProperty(globalThis, name, unavailable(name));
+    \\})();
+;
 
 /// The program as the body of an async arrow function, NUL-terminated as
 /// `JS_Eval` requires. The body starts on the first line, so error positions
@@ -382,11 +472,11 @@ test "the heap limit stops the program, and the program cannot catch it" {
         \\}
     , small);
     try expectThrew("InternalError: out of memory",
-        \\try { new ArrayBuffer(1 << 30); } finally { return 'finally ran'; }
+        \\try { new Array(2 ** 28).fill(0); } finally { return 'finally ran'; }
     , .{});
     // Ordinary errors stay catchable.
     try expectReturned("\"caught RangeError\"",
-        \\try { new ArrayBuffer(-1); } catch (e) { return 'caught ' + e.name; }
+        \\try { 'x'.repeat(-1); } catch (e) { return 'caught ' + e.name; }
     , .{});
 }
 
@@ -399,7 +489,151 @@ test "deep recursion and deep nesting throw instead of overflowing the stack" {
         \\return JSON.stringify(v).length;
     , .{depth}), .{});
     try expectThrew("Error", std.fmt.comptimePrint("return new RegExp('('.repeat({d}) + 'a' + ')'.repeat({d})).test('a');", .{ depth, depth }), .{});
-    try expectThrew("Error", std.fmt.comptimePrint("return eval('('.repeat({d}) + '1' + ')'.repeat({d}));", .{ depth, depth }), .{});
+    // Code mode has no `eval`, so the nesting goes in the program's own text.
+    var nested: std.ArrayList(u8) = .empty;
+    defer nested.deinit(testing.allocator);
+    try nested.appendSlice(testing.allocator, "return ");
+    try nested.appendNTimes(testing.allocator, '(', depth);
+    try nested.append(testing.allocator, '1');
+    try nested.appendNTimes(testing.allocator, ')', depth);
+    try expectThrew("RangeError: Maximum call stack size exceeded", nested.items, .{});
+}
+
+test "built-ins cut from code mode throw an error that names them" {
+    try expectReturned("[]",
+        \\const cut = [
+        \\  "Proxy", "WeakRef", "FinalizationRegistry",
+        \\  "ArrayBuffer", "SharedArrayBuffer", "Atomics", "DataView",
+        \\  "Int8Array", "Uint8Array", "Uint8ClampedArray", "Int16Array", "Uint16Array",
+        \\  "Int32Array", "Uint32Array", "Float16Array", "Float32Array", "Float64Array",
+        \\  "BigInt64Array", "BigUint64Array",
+        \\];
+        \\const wrong = [];
+        \\for (const name of cut) {
+        \\  try { globalThis[name]; wrong.push(name + " was reachable"); }
+        \\  catch (e) {
+        \\    if (!(e instanceof TypeError) || e.message !== name + " is not available in code mode") wrong.push(name + ": " + e);
+        \\  }
+        \\}
+        \\return wrong;
+    , .{});
+    try expectThrew("TypeError: Proxy is not available in code mode", "return new Proxy({}, {});", .{});
+    try expectThrew("TypeError: Uint8Array is not available in code mode", "return new Uint8Array(4).length;", .{});
+    // Even `typeof` reads the name, so it throws too.
+    try expectThrew("TypeError: Proxy is not available in code mode", "return typeof Proxy;", .{});
+}
+
+test "no path reaches eval or the Function constructors" {
+    const blocked = [_][]const u8{
+        "return eval('1 + 1');",
+        "return (0, eval)('1 + 1');",
+        "return new Function('return 1')();",
+        "return (function () {}).constructor('return 1')();",
+        "return (async function () {}).constructor('return 1');",
+        "return (function* () {}).constructor('yield 1');",
+        "return (async function* () {}).constructor('yield 1');",
+        "return Reflect.getPrototypeOf(() => 0).constructor('return 1');",
+        "return Object.getOwnPropertyDescriptor(Function.prototype, 'constructor').value('return 1');",
+        "return Reflect.construct(Function, ['return 1'])();",
+        "return Function.prototype.constructor.call(null, 'return 1')();",
+    };
+    for (blocked) |source| try expectThrew("is not available in code mode", source, .{});
+    try expectThrew("TypeError: The Function constructor is not available in code mode", "return Function('return 1');", .{});
+    try expectThrew("TypeError: The AsyncFunction constructor is not available in code mode", "return (async () => {}).constructor('return 1');", .{});
+    try expectThrew("TypeError: eval is not available in code mode", "return eval('1 + 1');", .{});
+    // The program can't take the blocks back down.
+    try expectThrew("TypeError", "Object.defineProperty(globalThis, 'eval', { value: (s) => s });", .{});
+    try expectThrew("TypeError", "'use strict'; delete globalThis.Proxy;", .{});
+    try expectThrew("TypeError", "Object.defineProperty(Function.prototype, 'constructor', { value: 1 });", .{});
+}
+
+test "programs can still name eval and the Function constructors" {
+    try expectReturned("[true,true,\"Function\",\"AsyncFunction\",\"GeneratorFunction\",\"AsyncGeneratorFunction\",\"call\",\"function\",\"function\",1,true,[3,4,5]]",
+        \\const f = function (a) { return this.k + a; };
+        \\return [
+        \\  (() => 1) instanceof Function,
+        \\  (() => 1).constructor === Function,
+        \\  (() => 1).constructor.name,
+        \\  (async () => 1).constructor.name,
+        \\  (function* () {}).constructor.name,
+        \\  (async function* () {}).constructor.name,
+        \\  Function.prototype.call.name,
+        \\  typeof eval,
+        \\  typeof Function,
+        \\  Function.length,
+        \\  Object.getPrototypeOf(async () => 1) === (async () => 1).constructor.prototype,
+        \\  [f.call({ k: 1 }, 2), f.apply({ k: 1 }, [3]), f.bind({ k: 1 })(4)],
+        \\];
+    , .{});
+}
+
+test "code mode keeps the built-ins programs use" {
+    try expectReturned("[\"function\",\"a,b\",3,\"x1\",true,\"18446744073709551616\",\"aGk=\",\"hi\",\"2026\",\"number\",[\"a\",1],\"y\",\"function\",\"symbol\"]",
+        \\const set = new Set(["a", "b", "a"]);
+        \\const map = new Map([["k", 3]]);
+        \\const weak = new WeakMap([[{}, 1]]);
+        \\const groups = "x1".match(/(?<letter>[a-z])(?<digit>\d)/u).groups;
+        \\return [
+        \\  typeof Promise.all,
+        \\  [...set].join(","),
+        \\  map.get("k"),
+        \\  groups.letter + groups.digit,
+        \\  weak instanceof WeakMap,
+        \\  String(2n ** 64n),
+        \\  btoa("hi"),
+        \\  atob("aGk="),
+        \\  new Date(Date.UTC(2026, 0, 1)).toISOString().slice(0, 4),
+        \\  typeof performance.now(),
+        \\  Object.entries({ a: 1 })[0],
+        \\  JSON.parse('{"x":"y"}').x,
+        \\  typeof Math.max,
+        \\  typeof Symbol.iterator,
+        \\];
+    , .{});
+}
+
+test "the models' eval programs run with the cut built-ins" {
+    // Stand-ins for what the `execute` tool will provide: the tools the
+    // programs call, with results shaped like the real ones, and `console`.
+    const fake_tools =
+        \\const console = { log() {} };
+        \\const tools = {
+        \\  read_file: async ({ path }) => path.endsWith(".json") ? JSON.stringify({ name: "svc", port: 8080, owner: "infra" }) : "line one\nTODO: two\nline three",
+        \\  glob_files: async () => "services/a/service.json\nservices/b/service.json",
+        \\  write_file: async () => "written",
+        \\  shell: async () => "ok",
+        \\  mcp_tracker_get_issue: async ({ id }) => JSON.stringify({ id, status: "blocked", priority: "P0", comments: [] }),
+        \\  mcp_tracker_search_logs: async () => "ERROR payment-gateway timeout\nINFO ok",
+        \\};
+        \\
+    ;
+    var programs = std.mem.splitSequence(u8, @embedFile("testdata/eval_programs.js"), "\n// ----\n");
+    var count: usize = 0;
+    while (programs.next()) |program| {
+        count += 1;
+        const source = try std.mem.concat(testing.allocator, u8, &.{ fake_tools, program });
+        defer testing.allocator.free(source);
+        const outcome = try run(testing.allocator, testing.io, source, .{ .time_ms = 5_000 });
+        defer outcome.deinit(testing.allocator);
+        switch (outcome) {
+            .returned => {},
+            .threw => |text| {
+                // Programs may trip on the stand-in data, but never on a cut.
+                if (std.mem.find(u8, text, "not available in code mode") != null or
+                    std.mem.find(u8, text, "Maximum call stack size exceeded") != null or
+                    std.mem.startsWith(u8, text, "ReferenceError"))
+                {
+                    std.debug.print("program {d} hit a cut:\n{s}\n", .{ count, text });
+                    return error.TestUnexpectedResult;
+                }
+            },
+            .timed_out, .unsettled => {
+                std.debug.print("program {d}: {s}\n", .{ count, @tagName(outcome) });
+                return error.TestUnexpectedResult;
+            },
+        }
+    }
+    try testing.expectEqual(@as(usize, 30), count);
 }
 
 test "built-ins that call back into JavaScript fit in the default stack" {
@@ -419,6 +653,11 @@ test "built-ins that call back into JavaScript fit in the default stack" {
         \\function down(n) {{ return n === 0 ? 0 : 1 + down(n - 1); }}
         \\return down({d});
     , .{depth}), .{});
+}
+
+test "import() is refused with an error that says so" {
+    try expectThrew("TypeError: import() is not available in code mode", "return await import('fs');", .{});
+    try expectThrew("SyntaxError", "import fs from 'fs';", .{});
 }
 
 test "each run starts from a fresh runtime" {
