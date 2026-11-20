@@ -13,18 +13,6 @@ pub fn compactionClock(operation: compaction_activity.Operation) StreamState {
     return .{ .turn_started_ms = turn_clock.compactionMarks(operation).started_ms };
 }
 
-/// How far a running compaction has come: nothing of the summary while it
-/// prepares, the share of its notes the model has written while it
-/// summarizes, and all of it while fx saves them
-/// (`tests/tla/turn_clock/TurnClock.tla` FullOnlyWhenSaving).
-fn compactionPercent(op: compaction_activity.Operation, stage: compaction_activity.Stage) u8 {
-    return switch (stage) {
-        .preparation => 0,
-        .summary => op.written_percent,
-        .publication => 100,
-    };
-}
-
 /// Borrows either static feedback or the caller's label buffer.
 pub fn compactionProjection(
     buf: []u8,
@@ -34,8 +22,7 @@ pub fn compactionProjection(
     const op = snapshot.operation orelse return .none;
     if (!op.visible(now_ms)) return .none;
     const label: []const u8, const percent: ?u8 = switch (op.phase) {
-        .preparing => .{ "• Compacting", compactionPercent(op, .preparation) },
-        .running => |stage| .{ "• Compacting", compactionPercent(op, stage) },
+        .preparing, .running => .{ "• Compacting", op.percent(now_ms) },
         .stopping => .{ "• Stopping compaction", null },
         .terminal => |feedback| return .{ .turn_thinking = .{
             .label = compactionFeedbackLabel(feedback),
@@ -316,10 +303,10 @@ test "every compaction counts its own time from zero and shows how much of the s
         // A count that arrives before the summary starts is kept for it.
         state.running(id, .summary);
         try std.testing.expectEqualStrings("• Compacting 0% (0s)", compactionProjection(&buf, state.snapshot, 4_000).turn_thinking.label);
-        state.written(id, 66);
+        state.written(id, 66, 65_500);
         try std.testing.expectEqualStrings("• Compacting 66% (1m2s)", compactionProjection(&buf, state.snapshot, 65_500).turn_thinking.label);
         // A lower count, from a fallback model or a follow-up, changes nothing.
-        state.written(id, 40);
+        state.written(id, 40, 3_603_500);
         try std.testing.expectEqualStrings("• Compacting 66% (1h0m0s)", compactionProjection(&buf, state.snapshot, 3_603_500).turn_thinking.label);
         try std.testing.expectEqual(@as(?bool, false), activityBlinkVisible(compactionClock(state.snapshot.operation.?), 4_000));
         try std.testing.expectEqual(@as(?bool, true), activityBlinkVisible(compactionClock(state.snapshot.operation.?), 4_500));
@@ -330,6 +317,21 @@ test "every compaction counts its own time from zero and shows how much of the s
         state.settle(id, .{ .outcome = .succeeded }, 5_500);
         try std.testing.expect(compactionProjection(&buf, state.snapshot, 5_500) == .none);
     }
+}
+
+test "the compaction row moves while the model reads and goes on to 99% as the notes arrive" {
+    var state: compaction_activity.State = .{};
+    var buf: [256]u8 = undefined;
+    const id = state.begin(.automatic, 1, 1_000);
+    state.running(id, .summary);
+    state.asked(id, 1_000);
+    try std.testing.expectEqualStrings("• Compacting 0% (0s)", compactionProjection(&buf, state.snapshot, 1_000).turn_thinking.label);
+    try std.testing.expectEqualStrings("• Compacting 7% (10s)", compactionProjection(&buf, state.snapshot, 11_000).turn_thinking.label);
+    try std.testing.expectEqualStrings("• Compacting 23% (53s)", compactionProjection(&buf, state.snapshot, 54_000).turn_thinking.label);
+    state.written(id, 50, 126_000);
+    try std.testing.expectEqualStrings("• Compacting 66% (2m5s)", compactionProjection(&buf, state.snapshot, 126_000).turn_thinking.label);
+    state.written(id, 99, 250_000);
+    try std.testing.expectEqualStrings("• Compacting 99% (4m9s)", compactionProjection(&buf, state.snapshot, 250_000).turn_thinking.label);
 }
 
 test "the turn row goes on after a compaction from the time it showed before" {

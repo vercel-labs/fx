@@ -106,6 +106,8 @@ pub const Progress = struct {
     /// How much of the summary the model has written, from 1 to 99, each
     /// time it goes up while the summary streams in.
     written_fn: ?*const fn (context: *anyopaque, percent: u8) void = null,
+    /// A summary request is about to be sent; called before each one.
+    asked_fn: ?*const fn (context: *anyopaque) void = null,
 
     fn report(self: ?Progress, step: Step) !void {
         if (self) |reported| try reported.report_fn(reported.context, step);
@@ -209,7 +211,7 @@ pub fn compact(alloc: Allocator, request: Request) !?Result {
     if (turns.len == 0) return error.NothingToCompact;
     var counter: progress.Counter = .{};
     if (request.progress) |reported| if (reported.written_fn) |written| {
-        counter.sink = .{ .context = reported.context, .written_fn = written };
+        counter.sink = .{ .context = reported.context, .written_fn = written, .asked_fn = reported.asked_fn };
     };
     const counts = counter.sink != null;
     var summarizer: model.Summarizer = .{
