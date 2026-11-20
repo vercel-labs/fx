@@ -913,6 +913,71 @@ describe("cli: status", () => {
   );
 
   test(
+    "status, status --json and doctor name why fx skips a plain-http server of .mcp.json that is not local",
+    async () => {
+      const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-e2e-mcp-url-reason-")));
+      const gateway = startFakeGateway([]);
+      try {
+        const home = join(root, "home");
+        const workspace = join(root, "workspace");
+        mkdirSync(join(home, ".fx"), { recursive: true, mode: 0o700 });
+        mkdirSync(workspace);
+        writeFileSync(
+          join(workspace, ".mcp.json"),
+          JSON.stringify({
+            mcpServers: {
+              web: { type: "http", url: "http://example.com/mcp" },
+              odd: { type: "http", url: "not a url" },
+            },
+          }) + "\n",
+        );
+        const env = {
+          HOME: home,
+          AI_GATEWAY_API_KEY: "mcp-url-reason-key",
+          VERCEL_OIDC_TOKEN: undefined,
+          FX_DISABLE_KEYCHAIN: "1",
+          FX_AUTO_UPGRADE: "0",
+          FX_MODEL: FAKE_GATEWAY_MODEL,
+          FX_TEST_GATEWAY_CHAT_URL: gateway.chatUrl,
+          FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+        };
+        const statusText = await runFx(["status"], { cwd: workspace, env });
+        const statusJson = await runFx(["status", "--json"], { cwd: workspace, env });
+        const doctorText = await runFx(["doctor"], { cwd: workspace, env });
+        const doctorJson = await runFx(["doctor", "--json"], { cwd: workspace, env });
+
+        // The reason is the URL's own, so a person knows what to change. Another URL fault keeps the generic words.
+        const web = ".mcp.json server 'web' was skipped: fx uses plain http only for localhost, 127.0.0.1 and [::1]; use https.";
+        const odd = ".mcp.json server 'odd' was skipped: its \"url\" isn't valid.";
+        const fix = "\n               fix: fix .mcp.json, then run fx doctor again\n";
+
+        expect(statusText.code, statusText.stderr).toBe(0);
+        expect(statusText.stdout).toContain(`[status] mcp_configuration_issue=${web}\n`);
+        expect(statusText.stdout).toContain(`[status] mcp_configuration_issue=${odd}\n`);
+
+        expect(statusJson.code, statusJson.stderr).toBe(0);
+        expect(JSON.parse(statusJson.stdout).mcp.configuration_issues).toEqual([web, odd]);
+
+        expect(doctorText.code, doctorText.stderr).toBe(1);
+        expect(doctorText.stdout).toContain(`  \u2717 mcp_config ${web}${fix}`);
+        expect(doctorText.stdout).toContain(`  \u2717 mcp_config ${odd}${fix}`);
+
+        const doctorChecks = JSON.parse(doctorJson.stdout);
+        expect(doctorJson.code, doctorJson.stderr).toBe(1);
+        expect(doctorChecks.mcp.configuration_issues).toEqual([web, odd]);
+        expect(
+          doctorChecks.checks.filter((check: { name: string }) => check.name === "mcp_config").map((check: { detail: string }) => check.detail),
+        ).toEqual([web, odd]);
+        expect(gateway.requestCount()).toBe(0);
+      } finally {
+        gateway.stop();
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
     "doctor names unknown settings keys while status stays quiet",
     async () => {
       const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-e2e-unknown-settings-")));

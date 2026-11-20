@@ -567,7 +567,10 @@ pub fn presentation(args: std.json.ObjectMap) ?tool_dispatch.CallPresentation {
         return skill_impl.presentation(args);
     }
     if (args.get("run")) |value| if (value == .string) {
-        // An MCP tool's row reads as a direct call of it does.
+        // An MCP tool's row reads as a direct call of it does. A built-in
+        // tool's rows show the call fx runs for it instead
+        // (`src/core/tooling/toolbox.zig` shownBuiltinRun), so "Running"
+        // names a tool fx doesn't hold.
         const mcp = core_types.isMcpToolName(value.string);
         return .{
             .activity_kind = if (mcp) .mcp else .write,

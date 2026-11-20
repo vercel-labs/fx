@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { afterEach, describe, expect, test } from "bun:test";
+import { processAlive } from "./process-alive";
 import { createConfiguredProviderFixture, completion as configuredCompletion, toolCompletion as configuredToolCompletion } from "./fixtures/chat-completions";
 import { spawn as nodeSpawn, type ChildProcess } from "node:child_process";
 import {
@@ -137,15 +138,6 @@ async function expectHttpCallCancelled(
     () => fixture.cancelledCalls === 1,
     5_000,
   );
-}
-
-function processAlive(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch {
-    return false;
-  }
 }
 
 async function expectMcpProcessExited(pidPath: string): Promise<void> {
