@@ -49,8 +49,32 @@
   },
   {
     "description": "A refusal that names an error is read as a passing failure, so the tokens are kept and the dead refresh token is sent again (Slack's HTTP-200 ok:false)",
-    "old": "    /\\ held' = FALSE\n    /\\ refreshable' = FALSE\n    /\\ inflight' = 0\n    /\\ req' = [k \\in Keys |-> IF req[k].phase = \"waiting\" THEN [req[k] EXCEPT !.phase = \"needs_sign_in\"] ELSE req[k]]\n    /\\ UNCHANGED <<gen, rt, valid, serverRt, usedRt, sends, rejectedG>>",
+    "old": "    /\\ held' = FALSE\n    /\\ refreshable' = FALSE\n    /\\ inflight' = 0\n    /\\ req' = [k \\in Keys |-> IF req[k].phase = \"waiting\" THEN [req[k] EXCEPT !.phase = \"needs_sign_in\", !.why = \"refresh_refused\"] ELSE req[k]]\n    /\\ UNCHANGED <<gen, rt, valid, serverRt, usedRt, sends, rejectedG>>",
     "new": "    /\\ inflight' = 0\n    /\\ req' = [k \\in Keys |-> IF req[k].phase = \"waiting\" THEN [req[k] EXCEPT !.phase = \"failed\"] ELSE req[k]]\n    /\\ UNCHANGED <<gen, held, refreshable, rt, valid, serverRt, usedRt, sends, rejectedG>>",
     "invariant": "NoDeadRefresh"
+  },
+  {
+    "description": "A second rejection ends needing sign-in without a reason (fx before the fix: the refusal is lost)",
+    "old": "![k].phase = \"needs_sign_in\", ![k].why = \"refused\"]",
+    "new": "![k].phase = \"needs_sign_in\"]",
+    "invariant": "RefusalNamed"
+  },
+  {
+    "description": "A request rejected with the token it carried is reported as one that carried none",
+    "old": "![k].why = IF req[k].g = 0 THEN \"no_token\" ELSE \"refused\"]",
+    "new": "![k].why = \"no_token\"]",
+    "invariant": "NoTokenMeansNoneRejected"
+  },
+  {
+    "description": "A refused refresh is reported as a refused token",
+    "old": "!.why = \"refresh_refused\"]",
+    "new": "!.why = \"refused\"]",
+    "invariant": "RefusedMeansTokenRejected"
+  },
+  {
+    "description": "A request that carried no token is reported as refused",
+    "old": "![k].why = IF req[k].g = 0 THEN \"no_token\" ELSE \"refused\"]",
+    "new": "![k].why = \"refused\"]",
+    "invariant": "RefusedMeansTokenRejected"
   }
 ]

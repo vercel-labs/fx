@@ -32,13 +32,15 @@ This describes the code on `6bb36a928` (`origin/main` when this workspace was ma
 | Subagent lifecycle | `src/core/subagent/child_state.zig`, at most `max_children = 256` (`:17`) | A subagent's shell call is its own owner, with that subagent's access (this change) |
 | The bridge's admission state | `mcp_call.State` (this change) | One writer: the bridge's shell thread |
 | Request arguments and results | The bridge shell, by request id | Never in the core, never in session JSON |
+| A call's row once it ended: the shell call's id, the request id, the tool's name, and the outcome | The TUI's session log, as an `mcp_bridge_call` item in the open turn (this change) | Saved so a resume shows the row; never the arguments or the result (`tests/tla/session_manager/system-design.md` D99) |
 
 ## Contracts and formats it touches
 
 - **`CallOptions`** (`tool_mcp_runtime.zig:74-85`) carries the cancel flag, the input responder for server questions, the observer, and `access`. A bridge call fills the same fields.
 - **Timeouts** come from the MCP contract: startup 30 s and operation 60 s (`src/core/mcp/mcp_contract.zig:5-6`). A call that times out ends as a failure, so the core needs no clock.
 - **Drop logging** goes through `debug_trace.logf` (`src/core/shared/debug_trace.zig:77`), as the repository's rule on dropped user state requires.
-- **New protocol** (this design): one JSON request line per connection with a version, from the `fx mcp call` client to the session's bridge socket, and one framed reply. No saved format changes.
+- **New protocol** (this design): one JSON request line per connection with a version, from the `fx mcp call` client to the session's bridge socket, and one framed reply.
+- **New saved item** (this change): the TUI saves each call's row as an `mcp_bridge_call` item in the session log, which an older fx skips (D17, D99). No other saved format changes.
 
 ## Callers and constraints
 
