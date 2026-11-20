@@ -145,6 +145,15 @@
       "type": "string",
       "minLength": 1
     },
+    "Leader": {
+      "description": "The value of sh.fx/leader in the `_meta` of the `initialize` response that a leader socket answers: the pid of the fx acp process, and the ids of the sessions it leads.",
+      "type": "object",
+      "properties": {
+        "pid": { "type": "integer" },
+        "sessions": { "type": "array", "items": { "type": "string" } }
+      },
+      "required": ["pid", "sessions"]
+    },
     "SessionClient": {
       "description": "One client that has the session open: its id, and the `clientInfo` it sent at `initialize`, which follows ACP's `Implementation`.",
       "type": "object",

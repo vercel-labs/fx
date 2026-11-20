@@ -3,6 +3,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { processAlive } from "./process-alive";
 import { createConfiguredProviderFixture, completion as configuredCompletion, toolCompletion as configuredToolCompletion } from "./fixtures/chat-completions";
 import { spawn as nodeSpawn, type ChildProcess } from "node:child_process";
+import { createConnection } from "node:net";
 import {
   chmodSync,
   existsSync,
@@ -17,7 +18,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { isAbsolute, join } from "node:path";
+import { dirname, isAbsolute, join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { FX_BIN, HAS_API_KEY, REPO_ROOT, runFx, providerVersionTestEnv } from "../evals/eval-helpers";
 import {
@@ -754,6 +755,11 @@ class AcpClient {
 
   get closed(): boolean {
     return this._closed;
+  }
+
+  /// The pid of this client's fx acp process.
+  get pid(): number | undefined {
+    return this.proc.pid;
   }
 
   setPermissionOption(optionId: "allow_once" | "allow_always" | "reject_once"): void {
@@ -1844,6 +1850,79 @@ async function runMcpToolPrompt(
   ).toContain(expectedResult);
 }
 
+
+/// Sends one JSON-RPC request to a leader socket and returns its reply line.
+function leaderRequest(socketPath: string, request: object): Promise<any> {
+  return new Promise((resolve, reject) => {
+    const socket = createConnection({ path: socketPath });
+    let reply = "";
+    socket.setEncoding("utf8");
+    socket.on("connect", () => socket.write(`${JSON.stringify(request)}\n`));
+    socket.on("data", (chunk: string) => {
+      reply += chunk;
+      const end = reply.indexOf("\n");
+      if (end === -1) return;
+      socket.destroy();
+      resolve(JSON.parse(reply.slice(0, end)));
+    });
+    socket.on("error", reject);
+    socket.on("close", () => reject(new Error(`leader socket ${socketPath} closed before it replied`)));
+  });
+}
+
+/// Whether a leader socket accepts a connection.
+function leaderAnswers(socketPath: string): Promise<boolean> {
+  return new Promise((resolve) => {
+    const socket = createConnection({ path: socketPath });
+    socket.on("connect", () => {
+      socket.destroy();
+      resolve(true);
+    });
+    socket.on("error", () => resolve(false));
+  });
+}
+
+/// Connects to a leader socket, writes one `initialize` line, and destroys the
+/// connection at once, without reading the answer. It resolves when the
+/// connection is open, so the leader has accepted nothing yet but the client
+/// has already left.
+function leaveBeforeAnswer(socketPath: string): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const socket = createConnection({ path: socketPath });
+    socket.on("error", reject);
+    socket.on("connect", () => {
+      socket.write(`${JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: 1 } })}\n`);
+      socket.destroy();
+      resolve();
+    });
+  });
+}
+
+/// The bytes fx wrote into one session's lock file.
+function sessionLock(home: string, sessionId: string): string {
+  return readFileSync(join(sessionDir(home, sessionId), "lock"), "utf8");
+}
+
+/// The environment of an fx acp whose leader socket goes under `tmp`.
+function leaderEnv(
+  root: ReturnType<typeof createShortIsolatedRoot>,
+  gateway: ReturnType<typeof startFakeGateway>,
+  tmp = root.root,
+) {
+  return { ...fakeGatewayEnv(root, gateway), TMPDIR: tmp };
+}
+
+/// Starts a session on `client` and sends it one plain prompt. The prompt
+/// publishes the session, which takes its lock.
+async function publishLedSession(client: AcpClient, text: string) {
+  const initialized = (await client.request("initialize", { protocolVersion: 1 }, 1)) as any;
+  const created = (await client.request("session/new", { mcpServers: [] }, 2)) as any;
+  await client.readLine(); // consume the session/update notification
+  const sessionId = created.result.sessionId as string;
+  const { promptResult } = await runPrompt(client, text, TIMEOUT);
+  expect(promptResult.result.stopReason).toBe("end_turn");
+  return { initialized, sessionId };
+}
 
 describe("acp: model-independent", () => {
   test("response waits continue across an internal read slice timeout", async () => {
@@ -14650,6 +14729,216 @@ describe("acp: model-independent", () => {
         heldReply.resolve(finalText("FIRST_DONE"));
         expect(await client.waitForExit(TIMEOUT)).toBe(0);
         expect(existsSync(target)).toBe(false);
+        expect(client.stderr).toBe("");
+      } finally {
+        await client?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "a session's lock names the socket of the fx acp that leads it",
+    async () => {
+      const root = createShortIsolatedRoot("fx-acp-leader-lock-");
+      const gateway = startFakeGateway([finalText("LEADER_LOCK_DONE")]);
+      try {
+        client = await AcpClient.create({ cwd: root.workspace, env: leaderEnv(root, gateway) });
+        const { initialized, sessionId } = await publishLedSession(client, "LEADER_LOCK_PROMPT");
+
+        const lock = sessionLock(root.home, sessionId);
+        expect(lock.endsWith("\n")).toBe(true);
+        expect(lock.trimEnd().includes("\n")).toBe(false);
+        const record = JSON.parse(lock);
+        expect(record.pid).toBe(client.pid);
+        expect(record.socket.startsWith(`${root.root}/fx-leader-`)).toBe(true);
+
+        const reply = await leaderRequest(record.socket, {
+          jsonrpc: "2.0",
+          id: 1,
+          method: "initialize",
+          params: { protocolVersion: 1 },
+        });
+        expect(reply.result._meta["sh.fx/leader"]).toEqual({ pid: client.pid, sessions: [sessionId] });
+        expect(reply.result.agentCapabilities).toEqual(initialized.result.agentCapabilities);
+        expect(client.stderr).toBe("");
+      } finally {
+        await client?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "the leader socket answers only initialize",
+    async () => {
+      const root = createShortIsolatedRoot("fx-acp-leader-only-");
+      const gateway = startFakeGateway([finalText("LEADER_ONLY_DONE")]);
+      try {
+        client = await AcpClient.create({ cwd: root.workspace, env: leaderEnv(root, gateway) });
+        const { sessionId } = await publishLedSession(client, "LEADER_ONLY_PROMPT");
+        const record = JSON.parse(sessionLock(root.home, sessionId));
+
+        const refused = await leaderRequest(record.socket, {
+          jsonrpc: "2.0",
+          id: 2,
+          method: "session/new",
+          params: { mcpServers: [] },
+        });
+        expect(refused.error.code).toBe(-32601);
+        expect(refused.result).toBeUndefined();
+
+        const answered = await leaderRequest(record.socket, {
+          jsonrpc: "2.0",
+          id: 3,
+          method: "initialize",
+          params: { protocolVersion: 1 },
+        });
+        expect(answered.result._meta["sh.fx/leader"].pid).toBe(client.pid);
+        expect(client.stderr).toBe("");
+      } finally {
+        await client?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "fx acp empties its session locks and removes its leader socket when it exits",
+    async () => {
+      const root = createShortIsolatedRoot("fx-acp-leader-exit-");
+      const gateway = startFakeGateway([finalText("LEADER_EXIT_DONE")]);
+      try {
+        client = await AcpClient.create({ cwd: root.workspace, env: leaderEnv(root, gateway) });
+        const { sessionId } = await publishLedSession(client, "LEADER_EXIT_PROMPT");
+        const record = JSON.parse(sessionLock(root.home, sessionId));
+        expect(existsSync(dirname(record.socket))).toBe(true);
+
+        client.endStdin();
+        expect(await client.waitForExit(TIMEOUT)).toBe(0);
+        expect(sessionLock(root.home, sessionId)).toBe("");
+        expect(existsSync(dirname(record.socket))).toBe(false);
+        expect(client.stderr).toBe("");
+      } finally {
+        await client?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "after fx acp is killed, the next fx acp that loads the session records its own socket",
+    async () => {
+      const root = createShortIsolatedRoot("fx-acp-leader-kill-");
+      const gateway = startFakeGateway([finalText("BEFORE_KILL_DONE")]);
+      const gatewayAfter = startFakeGateway([]);
+      let second: AcpClient | undefined;
+      try {
+        client = await AcpClient.create({ cwd: root.workspace, env: leaderEnv(root, gateway) });
+        const { sessionId } = await publishLedSession(client, "BEFORE_KILL_PROMPT");
+        const dead = JSON.parse(sessionLock(root.home, sessionId));
+        if (client.pid === undefined) throw new Error("fx acp has no pid");
+        process.kill(client.pid, "SIGKILL");
+        await waitForCondition("the killed fx acp to exit", () => client.closed);
+
+        // Nothing clears a record when fx dies: the lock still names the dead
+        // process and its socket, and no one listens on that socket now.
+        expect(JSON.parse(sessionLock(root.home, sessionId))).toEqual(dead);
+        expect(await leaderAnswers(dead.socket)).toBe(false);
+
+        second = await AcpClient.create({ cwd: root.workspace, env: leaderEnv(root, gatewayAfter) });
+        await second.request("initialize", { protocolVersion: 1 }, 1);
+        const loaded = (await second.request(
+          "session/load",
+          { sessionId, cwd: root.workspace, mcpServers: [] },
+          2,
+        )) as any;
+        expect(loaded.error).toBeUndefined();
+
+        const record = JSON.parse(sessionLock(root.home, sessionId));
+        expect(record.pid).toBe(second.pid);
+        expect(record.socket).not.toBe(dead.socket);
+        const reply = await leaderRequest(record.socket, {
+          jsonrpc: "2.0",
+          id: 1,
+          method: "initialize",
+          params: { protocolVersion: 1 },
+        });
+        expect(reply.result._meta["sh.fx/leader"].sessions).toEqual([sessionId]);
+        expect(second.stderr).toBe("");
+      } finally {
+        await second?.close();
+        await client?.close();
+        gateway.stop();
+        gatewayAfter.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "a TMPDIR too long for a socket path puts the socket under /tmp",
+    async () => {
+      const root = createShortIsolatedRoot("fx-acp-leader-long-");
+      const longTmp = join(root.root, "t".repeat(64));
+      mkdirSync(longTmp);
+      const gateway = startFakeGateway([finalText("LONG_TMP_DONE")]);
+      let socketFolder = "";
+      try {
+        client = await AcpClient.create({ cwd: root.workspace, env: leaderEnv(root, gateway, longTmp) });
+        const { sessionId } = await publishLedSession(client, "LONG_TMP_PROMPT");
+        const record = JSON.parse(sessionLock(root.home, sessionId));
+        socketFolder = dirname(record.socket);
+        expect(record.socket.startsWith("/tmp/fx-leader-")).toBe(true);
+        expect(await leaderAnswers(record.socket)).toBe(true);
+
+        client.endStdin();
+        expect(await client.waitForExit(TIMEOUT)).toBe(0);
+        expect(existsSync(socketFolder)).toBe(false);
+        expect(client.stderr).toBe("");
+      } finally {
+        await client?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+        if (socketFolder !== "") rmSync(socketFolder, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "the leader socket keeps serving after clients leave before their answer",
+    async () => {
+      const root = createShortIsolatedRoot("fx-acp-leader-leave-");
+      const gateway = startFakeGateway([finalText("LEADER_LEAVE_DONE")]);
+      try {
+        client = await AcpClient.create({ cwd: root.workspace, env: leaderEnv(root, gateway) });
+        const { sessionId } = await publishLedSession(client, "LEADER_LEAVE_PROMPT");
+        const record = JSON.parse(sessionLock(root.home, sessionId));
+
+        for (let i = 0; i < 20; i++) await leaveBeforeAnswer(record.socket);
+        await new Promise((resolve) => setTimeout(resolve, 500));
+
+        const reply = await leaderRequest(record.socket, {
+          jsonrpc: "2.0",
+          id: 1,
+          method: "initialize",
+          params: { protocolVersion: 1 },
+        });
+        expect(reply.result._meta["sh.fx/leader"].pid).toBe(client.pid);
+        expect(client.closed).toBe(false);
+
+        client.endStdin();
+        expect(await client.waitForExit(TIMEOUT)).toBe(0);
         expect(client.stderr).toBe("");
       } finally {
         await client?.close();

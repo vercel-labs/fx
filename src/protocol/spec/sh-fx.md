@@ -87,6 +87,7 @@ Each extension gets its own section here when it is written.
 | Turn diff | The combined file changes of one turn | None |
 | Turn events | A turn's progress, its model calls, and how long it ran | None; the turn's tokens use ACP's unstable `usage` field |
 | Keeping turns after a disconnect | Running turns and their queued prompts that finish after the client's input ends, for a client that lists `sh.fx/keepTurnOnDisconnect` | None |
+| Finding a session's leader | The lock record that names the fx acp process holding a session, and that process's leader socket | None |
 | A host's journal, hooks, and tools | What fx's SDK needs to keep a session's journal itself, observe a turn, and run its own tools | None |
 | Details on standard messages | Which tool calls are fx's own steps, the permission mode of each session mode, and the state of a model request that an earlier fx left running | None |
 
@@ -583,6 +584,20 @@ Once a client's input ends, fx never waits for it: a permission request is denie
 
 `tests/tla/acp/AcpDisconnect.tla` checks the rules for running turns, queued prompts and permission requests, and `tests/tla/drivers/acp/disconnect/driver.ts` checks them on fx.
 
+### Finding a session's leader
+
+The leader of a session is the `fx acp` process that holds the session's lock: the file `lock` in the session's folder under `~/.fx/sessions/v2/`. Once a session is live in a native `fx acp` that serves a leader socket, the file holds one JSON line with the path of that socket and the process's pid:
+
+```json
+{"socket":"/tmp/fx-leader-0123456789abcdef/s","pid":4242}
+```
+
+The process makes its socket when it starts, in a new folder named `fx-leader-` and 16 hex characters, with mode `0700`, under `TMPDIR` when the socket's path stays at most 103 bytes, and under `/tmp` when it doesn't or when `TMPDIR` is unset or not an absolute path. It writes the line when a session becomes live, and empties the file before it releases the lock, so a normal exit leaves every lock it held empty and removes the socket and its folder. A process that is killed leaves its line and its folder behind; the next process that takes the lock replaces or empties the line. A process that can't make its socket runs without one and writes no line.
+
+The socket speaks newline-delimited JSON-RPC 2.0, as stdio does. It answers only `initialize`, with the same result as stdio and `_meta["sh.fx/leader"]`: the process's `pid` and the ids of the sessions it leads, `sessions`. Any other request gets `-32601`. Before it uses a line, a reader connects to its socket and checks that `sessions` lists the session: a socket that refuses the connection belongs to a process that is gone, and the session has no leader until another process takes its lock.
+
+`tests/tla/acp/AcpLeader.tla` checks which process a line names, when its socket answers, and when that process leads the session, and `tests/tla/drivers/acp/leader/driver.ts` checks the same on fx.
+
 ### A host's journal
 
 A host that keeps a session's journal itself, such as fx's SDK, uses these methods. fx lists the `sh.fx/journal` capability for them, and a host lists it to receive the journal's messages:
@@ -742,6 +757,7 @@ The keys and capabilities moved with the method names: fx reads and sends only t
 | `ReplayFrom` | The value of `sh.fx/replayFrom` |
 | `Replay` | The value of `sh.fx/replay`: `after_position` or `full` |
 | `ClientId` | The id that fx gives a connection: `sh.fx/clientId`, `sh.fx/client`, and the `clientId` of a session client |
+| `Leader` | The value of `sh.fx/leader` in the `_meta` of the `initialize` response that a leader socket answers: the pid of the `fx acp` process, and the ids of the sessions it leads |
 | `SessionClient` | One entry of the list of clients that have a session open |
 | `ClientsUpdateParams` | The params of `_sh.fx/session/clients_update` |
 | `SubagentPrompt` | The value of `sh.fx/prompt` in a child's `capabilities._meta`: the deliveries the child accepts |

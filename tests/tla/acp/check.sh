@@ -28,6 +28,10 @@
 # AcpDisconnect: a client that disconnects: a client that lists
 # sh.fx/keepTurnOnDisconnect keeps its turns, any other's running turn stops,
 # and fx never waits for the gone client.
+# AcpLeader: the lock of a session names its holder and the holder's leader
+# socket, so another fx acp can find the holder. A process whose socket cannot
+# start still takes the lock and empties the record a dead holder left. Its
+# Today config shows fx acp before the record.
 #
 # The planted bugs and the runs of the real `fx acp` binary are in
 # ../drivers/acp/:
@@ -49,6 +53,8 @@
 #   bun ../drivers/acp/config_turn/driver.ts   # set_config_option during a turn
 #   bun ../drivers/acp/disconnect/check-spec.ts
 #   bun ../drivers/acp/disconnect/driver.ts   # a client that disconnects
+#   bun ../drivers/acp/leader/check-spec.ts
+#   bun ../drivers/acp/leader/driver.ts   # the real fx acp against AcpLeader
 #   bun ../drivers/acp/session_state/check-spec.ts
 #   bun ../drivers/acp/session_state/driver.ts   # today's fx acp; --model rules fails until the rules land
 #   bun ../drivers/acp/shared_session/check-spec.ts
@@ -136,6 +142,8 @@ MCAcpDisconnect MCAcpDisconnect -
 MCAcpDisconnect MCAcpDisconnectPlain -
 MCAcpDisconnect AcpDisconnectToday-keep KeptTurnsComplete
 MCAcpDisconnect AcpDisconnectToday-wait NeverWaitsForGoneClient
+MCAcpLeader MCAcpLeader -
+MCAcpLeader AcpLeaderToday temporal
 EOF
 
 if [ "$ci" = true ]; then

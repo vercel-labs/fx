@@ -39,6 +39,11 @@ pub const Options = struct {
     /// The index is rewritten with one line per id past this size, once at
     /// least half its lines are stale.
     index_compact_bytes: u64 = 1 << 20,
+    /// The bytes written into the lock of each session this env makes live
+    /// (opened for writing, published, or forked), so another process can find
+    /// the holder. The owner keeps them alive while the env lives. Null clears
+    /// any record a holder that died left behind.
+    leader_record: ?[]const u8 = null,
 };
 
 /// What every Session of one manager shares. Owned by L4; outlives them.
@@ -49,6 +54,9 @@ pub const Env = struct {
     root: storage.Dir,
     options: Options = .{},
     diagnostics: ?diag.Sink = null,
+    /// The sessions this env leads, kept by the manager that owns the env. Null
+    /// for an env that keeps no listing.
+    leading: ?*Leading = null,
     observer: if (hooks) ?Observer else void = if (hooks) null else {},
     catalog_observer: if (hooks) ?CatalogObserver else void = if (hooks) null else {},
     planted: if (hooks) trace.Planted else void = if (hooks) .none else {},
@@ -69,6 +77,63 @@ pub const Env = struct {
         return if (hooks) env.planted == bug else false;
     }
 };
+
+/// The sessions one env leads: each id whose lock holds the env's leader
+/// record. Only a session that becomes live while `Options.leader_record` is
+/// set is listed. Guarded by `mutex`; the ids are owned by the env's `gpa`.
+pub const Leading = struct {
+    mutex: std.Io.Mutex = .init,
+    ids: std.ArrayList([]u8) = .empty,
+
+    fn add(l: *Leading, gpa: std.mem.Allocator, io: std.Io, id: []const u8) std.mem.Allocator.Error!void {
+        l.mutex.lockUncancelable(io);
+        defer l.mutex.unlock(io);
+        const owned = try gpa.dupe(u8, id);
+        errdefer gpa.free(owned);
+        try l.ids.append(gpa, owned);
+    }
+
+    fn remove(l: *Leading, gpa: std.mem.Allocator, io: std.Io, id: []const u8) void {
+        l.mutex.lockUncancelable(io);
+        defer l.mutex.unlock(io);
+        for (l.ids.items, 0..) |listed, index| {
+            if (!std.mem.eql(u8, listed, id)) continue;
+            gpa.free(l.ids.swapRemove(index));
+            return;
+        }
+    }
+
+    /// Copies the listed ids under the lock. The caller frees each id and the
+    /// slice.
+    pub fn copyIds(l: *Leading, alloc: std.mem.Allocator, io: std.Io) error{OutOfMemory}![][]u8 {
+        l.mutex.lockUncancelable(io);
+        defer l.mutex.unlock(io);
+        const out = try alloc.alloc([]u8, l.ids.items.len);
+        var copied: usize = 0;
+        errdefer {
+            for (out[0..copied]) |id| alloc.free(id);
+            alloc.free(out);
+        }
+        for (l.ids.items, out) |listed, *slot| {
+            slot.* = try alloc.dupe(u8, listed);
+            copied += 1;
+        }
+        return out;
+    }
+
+    /// Frees the listed ids. Called once every session of the env is released.
+    pub fn deinit(l: *Leading, gpa: std.mem.Allocator) void {
+        for (l.ids.items) |id| gpa.free(id);
+        l.ids.deinit(gpa);
+    }
+};
+
+/// Writes a leader record over the start of a lock and cuts the lock to the
+/// record's length, so no part of an earlier holder's content remains.
+fn writeLeaderRecord(s: storage.Storage, lock: storage.File, bytes: []const u8) storage.Error!void {
+    try s.writeAt(lock, bytes, 0);
+    try s.setLength(lock, @as(u64, bytes.len));
+}
 
 /// Hooks only: what the Session just did, for the spec tracers in tests.
 pub const Observed = union(enum) {
@@ -159,6 +224,9 @@ const Live = struct {
     dir: storage.Dir,
     log: Log,
     lock: storage.File,
+    /// Whether `lock` may hold content this session must empty before it is
+    /// released: a record it wrote, or a failed attempt to empty the lock.
+    leader: bool = false,
 };
 
 const Phase = union(enum) {
@@ -475,6 +543,7 @@ pub const Session = struct {
             return err;
         };
         session.phase = .{ .live = live };
+        session.leadLive();
         session.written_seq.store(io, session.state.last_seq);
         session.setSyncFile(live.log.file, session.state.last_seq);
         try session.maybeSnapshot(&session.phase.live, &.{}, session.updated_ms);
@@ -531,6 +600,7 @@ pub const Session = struct {
             });
         }
         session.phase = .{ .live = live };
+        session.leadLive();
         session.wrote(ts);
         session.held.clearAndFree(gpa);
         session.held_lines = 0;
@@ -955,10 +1025,75 @@ pub const Session = struct {
         }
     }
 
+    /// Puts the lock of a session that just became live in its final state: this
+    /// env's leader record, listed for as long as it is written, or else empty.
+    /// Whatever a dead holder left is replaced or emptied, so it never outlives
+    /// the new holder. A failure keeps the session open and is reported through
+    /// `diag` once per failure: `leader_record_not_written` when the record is
+    /// missing, `leader_record_not_cleared` when the lock could not be emptied.
+    fn leadLive(session: *Session) void {
+        const env = session.env;
+        const live = switch (session.phase) {
+            .live => |*l| l,
+            else => return,
+        };
+        const io = env.s.io;
+        const listed_id = session.identity.id;
+        const bytes = env.options.leader_record orelse {
+            live.leader = !session.emptyLock(live.lock);
+            return;
+        };
+        if (env.leading) |leading| {
+            leading.add(env.gpa, io, listed_id) catch {
+                session.reportLeader(.leader_record_not_written);
+                live.leader = !session.emptyLock(live.lock);
+                return;
+            };
+        }
+        // Set before the write, so `release` also empties a partly written lock.
+        live.leader = true;
+        writeLeaderRecord(env.s, live.lock, bytes) catch {
+            session.reportLeader(.leader_record_not_written);
+            if (env.leading) |leading| leading.remove(env.gpa, io, listed_id);
+            live.leader = !session.emptyLock(live.lock);
+        };
+    }
+
+    /// Empties a lock this session holds, and returns whether it is empty now.
+    /// A failed length read or cut is reported as `leader_record_not_cleared`.
+    fn emptyLock(session: *Session, lock: storage.File) bool {
+        const s = session.env.s;
+        const length = s.length(lock) catch {
+            session.reportLeader(.leader_record_not_cleared);
+            return false;
+        };
+        if (length == 0) return true;
+        s.setLength(lock, 0) catch {
+            session.reportLeader(.leader_record_not_cleared);
+            return false;
+        };
+        return true;
+    }
+
+    /// Empties the lock of a live session before it is released, and unlists
+    /// the session. `emptyLock` reports a failure, and the lock then keeps its
+    /// content until the next holder empties or replaces it.
+    fn clearLeaderRecord(session: *Session, lock: storage.File) void {
+        const env = session.env;
+        _ = session.emptyLock(lock);
+        if (env.leading) |leading| leading.remove(env.gpa, env.s.io, session.identity.id);
+    }
+
+    /// Reports a leader-record failure through `diag`, once per failure.
+    fn reportLeader(session: *Session, kind: diag.Kind) void {
+        diag.report(session.env.diagnostics, .{ .kind = kind, .session_id = session.identity.id });
+    }
+
     fn release(session: *Session, live: Live) void {
         const s = session.env.s;
         session.setSyncFile(null, session.synced_seq);
         var log = live.log;
+        if (live.leader) session.clearLeaderRecord(live.lock);
         s.unlock(live.lock);
         session.observe(.unlocked);
         s.closeFile(live.lock);
@@ -1199,6 +1334,7 @@ pub fn openResume(env: *const Env, options: ResumeOptions) OpenError!*Session {
             else => |io_err| storage.ioFault(io_err),
         };
     };
+    session.leadLive();
     return session;
 }
 
@@ -1862,6 +1998,7 @@ pub fn openForkWithChildren(env: *const Env, options: ForkOptions, children: []c
     defer if (blobs) |b| s.closeDir(b);
     const live = session.stage(blobs) catch |err| return forkError(err);
     session.phase = .{ .live = live };
+    session.leadLive();
     session.wrote(created);
     session.written_seq.store(session.env.s.io, seq);
     session.setSyncFile(live.log.file, seq);
@@ -1941,6 +2078,7 @@ fn openChildCopy(env: *const Env, options: ChildCopyOptions) ForkError!*Session 
     defer if (blobs) |b| s.closeDir(b);
     const live = session.stage(blobs) catch |err| return forkError(err);
     session.phase = .{ .live = live };
+    session.leadLive();
     session.wrote(created);
     session.written_seq.store(session.env.s.io, seq);
     session.setSyncFile(live.log.file, seq);
@@ -2532,6 +2670,7 @@ const session_tests = struct {
         fault: if (hooks) Fault else void,
         recorder: diag.Recorder,
         env: session_mod.Env,
+        leading: Leading = .{},
         /// Set by `crash`: a crash closes written files unsynced by definition.
         crashed: bool = false,
 
@@ -2541,12 +2680,14 @@ const session_tests = struct {
             t.tmp = testing.tmpDir(.{ .iterate = true });
             t.recorder = .{ .gpa = gpa, .io = io };
             if (hooks) t.fault = .init(gpa, io, 1);
+            t.leading = .{};
             t.env = .{
                 .gpa = gpa,
                 .s = if (hooks) .{ .io = io, .fault = &t.fault } else .{ .io = io },
                 .root = .{ .handle = t.tmp.dir },
                 .options = options,
                 .diagnostics = t.recorder.sink(),
+                .leading = &t.leading,
             };
         }
 
@@ -2556,6 +2697,7 @@ const session_tests = struct {
                 if (!t.crashed) testing.expectEqual(@as(usize, 0), t.fault.closed_unsynced) catch @panic("a written file was closed unsynced");
                 t.fault.deinit();
             }
+            t.leading.deinit(gpa);
             t.recorder.deinit();
             t.tmp.cleanup();
         }
@@ -3030,6 +3172,36 @@ const session_tests = struct {
         try testing.expectError(error.AccessDenied, n.append(&.{ .turn_started, item }));
         try testing.expectError(error.AccessDenied, n.append(&.{.turn_started}));
         try closeAndDestroy(n);
+    }
+
+    test "a failed leader record write is reported once, and the session stays open with an empty lock" {
+        if (!hooks) return error.SkipZigTest;
+        var t: TestEnv = undefined;
+        t.init(.{});
+        defer t.deinit();
+
+        const s = try newRoot(&t);
+        _ = try s.append(&.{ .turn_started, item, .turn_committed });
+        const id = try gpa.dupe(u8, s.id());
+        defer gpa.free(id);
+        try closeAndDestroy(s);
+
+        // Set after the close, so the next write is the record's: a clean
+        // resume of the same workspace writes nothing before it becomes live.
+        t.env.options.leader_record = "{\"socket\":\"/tmp/fx-leader/t/s\",\"pid\":3}\n";
+        t.fault.next_write = .{ .keep = 0, .then = .fail };
+        const r = try resumeRoot(&t, id);
+        try testing.expectEqual(@as(usize, 1), t.recorder.count(.leader_record_not_written));
+        try testing.expectEqual(@as(usize, 0), t.recorder.count(.leader_record_not_cleared));
+
+        const dir = try t.env.s.openDir(t.env.root, id);
+        defer t.env.s.closeDir(dir);
+        const lock = try t.env.s.openFile(dir, "lock", .read_only);
+        defer t.env.s.closeFile(lock);
+        try testing.expectEqual(@as(u64, 0), try t.env.s.length(lock));
+
+        _ = try r.append(&.{ .turn_started, item });
+        try closeAndDestroy(r);
     }
 
     // ---------------------------------------------------------------------------
