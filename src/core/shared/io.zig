@@ -641,16 +641,25 @@ pub const FileRead = union(enum) {
 /// before any byte is read. A symbolic link is followed, as the crash and
 /// shutdown readers did before. An allocation failure reads as unreadable.
 pub fn readRegularFile(alloc: std.mem.Allocator, path: []const u8, max_bytes: usize) FileRead {
-    var path_z: [std.Io.Dir.max_path_bytes:0]u8 = undefined;
-    if (path.len >= path_z.len) return .unreadable;
-    @memcpy(path_z[0..path.len], path);
-    path_z[path.len] = 0;
-    // O_NONBLOCK makes the open of a FIFO return at once. It does not change how
-    // a regular file reads.
-    const fd = std.c.open(&path_z, .{ .ACCMODE = .RDONLY, .NONBLOCK = true, .CLOEXEC = true });
-    if (fd < 0) return if (std.posix.errno(fd) == .NOENT) .missing else .unreadable;
     const zio = getIo();
-    var file: std.Io.File = .{ .handle = fd, .flags = .{ .nonblocking = true } };
+    var file: std.Io.File = if (comptime builtin.target.os.tag == .wasi) blk: {
+        // WASI has no POSIX open flags, so this uses the std Io open, as the readers
+        // did before the FIFO check. WASI has no FIFOs to block on.
+        break :blk std.Io.Dir.openFileAbsolute(zio, path, .{}) catch |err| return switch (err) {
+            error.FileNotFound => .missing,
+            else => .unreadable,
+        };
+    } else blk: {
+        var path_z: [std.Io.Dir.max_path_bytes:0]u8 = undefined;
+        if (path.len >= path_z.len) return .unreadable;
+        @memcpy(path_z[0..path.len], path);
+        path_z[path.len] = 0;
+        // O_NONBLOCK makes the open of a FIFO return at once. It does not change how
+        // a regular file reads.
+        const fd = std.c.open(&path_z, .{ .ACCMODE = .RDONLY, .NONBLOCK = true, .CLOEXEC = true });
+        if (fd < 0) return if (std.posix.errno(fd) == .NOENT) .missing else .unreadable;
+        break :blk .{ .handle = fd, .flags = .{ .nonblocking = true } };
+    };
     defer file.close(zio);
     const stat = file.stat(zio) catch return .unreadable;
     if (stat.kind != .file) return .unreadable;
