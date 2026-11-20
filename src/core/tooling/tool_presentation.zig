@@ -8,6 +8,7 @@ const text_utils = @import("../shared/text_utils.zig");
 const shared_theme = @import("../shared/theme.zig");
 const tool_args = @import("tool_args.zig");
 const tool_dispatch = @import("tool_dispatch.zig");
+const toolbox = @import("toolbox.zig");
 const terminal_contracts = @import("../terminal/contracts.zig");
 const terminal_client_runtime = @import("../terminal/client.zig");
 const terminal_ui_projection = @import("../terminal/ui_projection.zig");
@@ -181,6 +182,35 @@ pub fn subagentStreamedAgent(json: []const u8) ?[]const u8 {
     return streamedStringField(json, "agent", 1, 2);
 }
 
+/// The value a builtin call's row names, read from its arguments while they
+/// still stream in: the top-level string its label kind names, such as a
+/// read's `path` or a web search's `query`. Null until that value is a
+/// complete string, for one with an escape in it, and for the kinds whose
+/// value is not such a string: a shell call's `action` and `command`, and
+/// what `toolbox` and `subagent` calls name, which have their own readers.
+/// The result is a slice of `json`.
+pub fn streamedLabelValue(kind: tool_dispatch.LabelArgKind, json: []const u8) ?[]const u8 {
+    return streamedStringField(json, streamedLabelKey(kind) orelse return null, 1, 1);
+}
+
+/// The value a toolbox run of a builtin tool's row names, read from the
+/// run's `arguments` while they still stream in, as `streamedLabelValue`
+/// reads a direct call's: the string `kind` names in that object, such as
+/// the `url` a web fetch reads. Null as there, and for arguments written as
+/// JSON text, whose quotes are escapes. The result is a slice of `json`.
+pub fn streamedRunLabelValue(kind: tool_dispatch.LabelArgKind, json: []const u8) ?[]const u8 {
+    return streamedStringFieldIn(json, "arguments", streamedLabelKey(kind) orelse return null, 2, 2);
+}
+
+/// The argument whose string value a row of `kind` names, or null for the
+/// kinds whose value is not such a string.
+fn streamedLabelKey(kind: tool_dispatch.LabelArgKind) ?[]const u8 {
+    return switch (kind) {
+        .none, .action, .command, .session_id, .open, .run, .search => null,
+        .name, .path, .pattern, .url, .description, .source, .resource, .query, .server, .selector => @tagName(kind),
+    };
+}
+
 /// What a `toolbox` call does, read from its arguments while they still
 /// stream in: the first of its own `run`, `search`, and `open` keys whose
 /// value is a whole string, with no escape in it, as a JSON object with that
@@ -201,17 +231,30 @@ pub fn toolboxStreamedAction(alloc: std.mem.Allocator, json: []const u8) !?[]con
 /// that value is a complete string, and for one with an escape in it, which
 /// a row would show wrongly. The result is a slice of `json`.
 fn streamedStringField(json: []const u8, key: []const u8, min_depth: usize, max_depth: usize) ?[]const u8 {
+    return streamedStringFieldIn(json, null, key, min_depth, max_depth);
+}
+
+/// `streamedStringField`, with `key` only counted inside the object that is
+/// the value of the top-level key `parent` when one is given, so a depth of
+/// 2 is that object's own keys.
+fn streamedStringFieldIn(json: []const u8, parent: ?[]const u8, key: []const u8, min_depth: usize, max_depth: usize) ?[]const u8 {
     // Each open object or array, so a key is known from a value.
     var containers: [8]u8 = undefined;
     var depth: usize = 0;
     var expect_key = false;
     var after_key = false;
+    // Whether the value being read is the top-level `parent`'s, and whether
+    // the read is inside that object.
+    var after_parent = false;
+    var in_parent = parent == null;
     var i: usize = 0;
     while (i < json.len) {
         const byte = json[i];
         switch (byte) {
             '{', '[' => {
                 if (depth == containers.len) return null;
+                if (after_parent and byte == '{') in_parent = true;
+                after_parent = false;
                 containers[depth] = byte;
                 depth += 1;
                 expect_key = byte == '{';
@@ -221,13 +264,16 @@ fn streamedStringField(json: []const u8, key: []const u8, min_depth: usize, max_
             '}', ']' => {
                 if (depth == 0) return null;
                 depth -= 1;
+                if (parent != null and depth < 2) in_parent = false;
                 expect_key = false;
                 after_key = false;
+                after_parent = false;
                 i += 1;
             },
             ',' => {
                 expect_key = depth > 0 and containers[depth - 1] == '{';
                 after_key = false;
+                after_parent = false;
                 i += 1;
             },
             '"' => {
@@ -247,16 +293,19 @@ fn streamedStringField(json: []const u8, key: []const u8, min_depth: usize, max_
                 i = end + 1;
                 if (expect_key) {
                     expect_key = false;
-                    after_key = !escaped and depth >= min_depth and depth <= max_depth and std.mem.eql(u8, text, key);
+                    after_key = !escaped and in_parent and depth >= min_depth and depth <= max_depth and std.mem.eql(u8, text, key);
+                    after_parent = if (parent) |name| !escaped and depth == 1 and std.mem.eql(u8, text, name) else false;
                 } else {
                     if (after_key) return if (escaped or text.len == 0) null else text;
                     after_key = false;
+                    after_parent = false;
                 }
             },
             ':', ' ', '\t', '\n', '\r' => i += 1,
             else => {
                 // A number or literal is no name.
                 after_key = false;
+                after_parent = false;
                 i += 1;
             },
         }
@@ -289,6 +338,41 @@ test "a streaming toolbox call names its action once its whole value arrives" {
             try std.testing.expect(got == null);
         }
     }
+}
+
+test "a streaming toolbox run names its tool's target once that whole value arrives in its arguments" {
+    const Kind = tool_dispatch.LabelArgKind;
+    const cases = [_]struct { kind: Kind = .url, json: []const u8, value: ?[]const u8 }{
+        .{ .json = "{\"run\":\"web_fetch\",", .value = null },
+        .{ .json = "{\"run\":\"web_fetch\",\"arguments\":{\"url\":\"http://127.0.0.1/pa", .value = null },
+        .{ .json = "{\"run\":\"web_fetch\",\"arguments\":{\"url\":\"http://127.0.0.1/page\"", .value = "http://127.0.0.1/page" },
+        .{ .json = "{\"run\":\"web_fetch\",\"arguments\": {\"max_bytes\":10, \"url\" : \"http://127.0.0.1/page\"}}", .value = "http://127.0.0.1/page" },
+        .{ .kind = .query, .json = "{\"arguments\":{\"query\":\"zig release notes\"},\"run\":\"web_sea", .value = "zig release notes" },
+        // A value with an escape in it would read wrongly, and arguments
+        // written as JSON text are all escapes, so the row waits.
+        .{ .kind = .path, .json = "{\"run\":\"read_file\",\"arguments\":{\"path\":\"a\\\"b\"", .value = null },
+        .{ .kind = .path, .json = "{\"run\":\"read_file\",\"arguments\":\"{\\\"path\\\":\\\"notes.txt\\\"}\"", .value = null },
+        // Only the run's own arguments count: not the call's own keys, not
+        // another object, and not one nested in its arguments.
+        .{ .json = "{\"url\":\"http://a/top\",\"run\":\"web_fetch\",\"arguments\":{\"u", .value = null },
+        .{ .json = "{\"other\":{\"url\":\"http://a/other\"},\"run\":\"web_fetch\"", .value = null },
+        .{ .json = "{\"run\":\"web_fetch\",\"arguments\":{\"headers\":{\"url\":\"http://a/deep\"},\"u", .value = null },
+        .{ .json = "{\"run\":\"web_fetch\",\"arguments\":{\"headers\":{\"url\":\"http://a/deep\"},\"url\":\"http://a/own\"", .value = "http://a/own" },
+        // A kind whose value is not such a string never names one.
+        .{ .kind = .command, .json = "{\"run\":\"shell\",\"arguments\":{\"command\":\"ls\"", .value = null },
+    };
+    for (cases) |case| {
+        errdefer std.debug.print("json: {s}\n", .{case.json});
+        const got = streamedRunLabelValue(case.kind, case.json);
+        if (case.value) |want| {
+            try std.testing.expectEqualStrings(want, got orelse return error.TestExpectedEqual);
+        } else {
+            try std.testing.expect(got == null);
+        }
+    }
+    // A direct call's reader still reads only the call's own keys.
+    try std.testing.expect(streamedLabelValue(.url, "{\"run\":\"web_fetch\",\"arguments\":{\"url\":\"http://127.0.0.1/page\"") == null);
+    try std.testing.expectEqualStrings("http://a/top", streamedLabelValue(.url, "{\"url\":\"http://a/top\",\"arguments\":{\"url\":\"x\"").?);
 }
 
 test "a streaming subagent call names its agent once the whole name arrives" {
@@ -1046,7 +1130,10 @@ pub fn bridgeCallRowSummary(alloc: Allocator, tool: []const u8, outcome: types.B
 
 /// The caller owns the returned allocation and must free it with `alloc`.
 pub fn formatPlainAction(alloc: Allocator, input: ToolActionInput) ![]const u8 {
-    const call = input.call;
+    var shown_state = std.heap.ArenaAllocator.init(alloc);
+    defer shown_state.deinit();
+    // A toolbox run of a built-in tool reads as a direct call of that tool.
+    const call = try toolbox.shownBuiltinRun(shown_state.allocator(), input.tool_registry, input.call) orelse input.call;
     if (input.tool_registry.lookup(call.name) != null) {
         if (try formatSubagentPlainAction(alloc, call, .active)) |line| return line;
     }
@@ -1694,6 +1781,24 @@ test "tool presentation preserves plain action fallbacks" {
 
     for (cases) |case| {
         const label = try formatPlainAction(alloc, .{ .tool_registry = test_tool_registry, .call = case.call });
+        defer alloc.free(label);
+        try std.testing.expectEqualStrings(case.expected, label);
+    }
+}
+
+test "a plain action of a toolbox run of a built-in tool reads as a direct call of it" {
+    const alloc = std.testing.allocator;
+    const registry = test_builtin_tools.registry;
+    const cases = [_]struct { arguments_json: []const u8, expected: []const u8 }{
+        .{ .arguments_json = "{\"run\":\"web_fetch\",\"arguments\":{\"url\":\"https://example.com/page\"}}", .expected = "Fetching https://example.com/page" },
+        .{ .arguments_json = "{\"run\":\"web_search\",\"arguments\":{\"query\":\"zig release notes\"}}", .expected = "Searching zig release notes" },
+        .{ .arguments_json = "{\"run\":\"read_file\",\"arguments\":{\"path\":\"notes.txt\"}}", .expected = "Reading notes.txt" },
+        // An MCP tool's run, and a name fx doesn't hold, keep toolbox's row.
+        .{ .arguments_json = "{\"run\":\"mcp_fixture_echo\",\"arguments\":{}}", .expected = "Running MCP mcp_fixture_echo" },
+        .{ .arguments_json = "{\"run\":\"no_such_tool\",\"arguments\":{}}", .expected = "Running no_such_tool" },
+    };
+    for (cases) |case| {
+        const label = try formatPlainAction(alloc, .{ .tool_registry = registry, .call = .{ .id = "run", .name = "toolbox", .arguments_json = case.arguments_json } });
         defer alloc.free(label);
         try std.testing.expectEqualStrings(case.expected, label);
     }

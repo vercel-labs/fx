@@ -611,6 +611,44 @@ fn fuzzEscapedStrings(_: void, smith: *testing.Smith) !void {
         }
     }
 
+    // The length of a string. A form that limits a string to as many code points as `std.json` decodes from the
+    // server's string takes that string, and refuses a string one code point longer or shorter. The answer the
+    // script made is taken exactly when it decodes to that many code points.
+    const limit = std.unicode.utf8CountCodepoints(want) catch unreachable;
+    var longer: std.ArrayList(u8) = .empty;
+    try longer.appendSlice(arena, server.items[0 .. server.items.len - 1]);
+    try longer.appendSlice(arena, "a\"");
+    var shorter: std.ArrayList(u8) = .empty;
+    try appendSpelled(arena, &shorter, server_points[0 .. count - 1], &script);
+    const lengths = try arena.print(
+        "{{\"message\":\"m\",\"requestedSchema\":{{\"type\":\"object\",\"properties\":{{\"c\":{{\"type\":\"string\",\"minLength\":{d},\"maxLength\":{d}}}}}}}}}",
+        .{ limit, limit },
+    );
+    var length_form: mcp.elicitation.Form = .{};
+    const length_request = mcp.elicitation.parse(lengths, &length_form) catch {
+        std.debug.print("the engine could not read a form whose string has a length of {d}\n", .{limit});
+        return error.TestUnexpectedResult;
+    };
+    for ([_]struct { token: []const u8, points: usize }{
+        .{ .token = server.items, .points = limit },
+        .{ .token = longer.items, .points = limit + 1 },
+        .{ .token = shorter.items, .points = limit - 1 },
+        .{ .token = answer.items, .points = try std.unicode.utf8CountCodepoints(got) },
+    }) |candidate| {
+        const text = try arena.print("{{\"c\":{s}}}", .{candidate.token});
+        const taken = if (mcp.elicitation.check(length_request.mode, &length_form, .{ .action = .accept, .content = text })) true else |_| false;
+        if (taken != (candidate.points == limit)) {
+            std.debug.print("the engine {s} a string of {d} code points where {d} are allowed: server wrote {s}, the string was {s}\n", .{
+                if (taken) "accepted" else "refused",
+                candidate.points,
+                limit,
+                server.items,
+                candidate.token,
+            });
+            return error.TestUnexpectedResult;
+        }
+    }
+
     const properties = switch (place) {
         0 => try arena.print("{{{s}:{{\"type\":\"boolean\"}}}}", .{server.items}),
         1 => try arena.print("{{\"c\":{{\"type\":\"string\",\"enum\":[{s},\"zz\"]}}}}", .{server.items}),
@@ -641,7 +679,7 @@ fn fuzzEscapedStrings(_: void, smith: *testing.Smith) !void {
     }
 }
 
-test "the engine's equality of a form's strings and an answer's matches std.json's decoded equality" {
+test "the engine's equality and length limits of a form's strings and an answer's match std.json's decoded strings" {
     try testing.fuzz({}, fuzzEscapedStrings, .{
         .corpus = &(.{""} ++ @import("fuzz_corpus").mcp_elicitation_escapes.*),
     });
