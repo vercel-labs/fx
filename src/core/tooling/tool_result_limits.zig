@@ -1,6 +1,7 @@
 const std = @import("std");
 const debug_trace = @import("../shared/debug_trace.zig");
 const text_utils = @import("../shared/text_utils.zig");
+const tool_result_cut_marker = @import("../shared/tool_result_cut_marker.zig");
 const types = @import("../shared/types.zig");
 const Allocator = std.mem.Allocator;
 
@@ -41,11 +42,6 @@ pub fn prepareModelOutput(
     )).model_output;
 }
 
-/// How the marker that `prepareModelOutputWithTruncation` ends a cut text with starts and ends.
-/// `src/core/mcp/tool_result.zig` finds the marker by them, so a cut text's cause line never reads it.
-pub const cut_marker_start = "\n... [tool result truncated for ";
-pub const cut_marker_end = " bytes]\n";
-
 pub fn prepareModelOutputWithTruncation(
     alloc: Allocator,
     tool_name: []const u8,
@@ -61,7 +57,7 @@ pub fn prepareModelOutputWithTruncation(
         .text = sanitized,
         .max_bytes = max_bytes,
         .marker = try scratch.print(
-            cut_marker_start ++ "{s}: original {d} bytes; cap is {d}" ++ cut_marker_end,
+            tool_result_cut_marker.cut_marker_start ++ "{s}: original {d} bytes; cap is {d}" ++ tool_result_cut_marker.cut_marker_end,
             .{ tool_name, sanitized.len, max_bytes },
         ),
         .trace_scope = "tool",
@@ -189,7 +185,7 @@ test "prepareModelOutput caps chatty output with explicit marker" {
     defer alloc.free(@constCast(output));
 
     try std.testing.expect(output.len <= 128);
-    try std.testing.expect(std.mem.find(u8, output, "... [tool result truncated for grep_files: original 256 bytes; cap is 128 bytes]") != null);
+    try std.testing.expect(std.mem.find(u8, output, tool_result_cut_marker.cut_marker_start ++ "grep_files: original 256 bytes; cap is 128" ++ tool_result_cut_marker.cut_marker_end) != null);
 }
 
 test "prepareModelOutput keeps complete codepoints at the cap" {
@@ -199,7 +195,7 @@ test "prepareModelOutput keeps complete codepoints at the cap" {
         const output = try prepareModelOutput(alloc, "grep_files", text, cap);
         defer alloc.free(@constCast(output));
         try std.testing.expect(output.len <= cap);
-        const marker_start = std.mem.find(u8, output, "\n... [tool result truncated").?;
+        const marker_start = std.mem.find(u8, output, tool_result_cut_marker.cut_marker_start).?;
         const prefix = output[0..marker_start];
         try std.testing.expect(std.unicode.utf8ValidateSlice(prefix));
         try std.testing.expect(std.mem.endsWith(u8, prefix, "\xc3\xa9"));
