@@ -70,6 +70,17 @@ pub const AdmissionFingerprint = struct {
     }
 };
 
+/// Whether a run at `placement` and `profile` keeps the placement that
+/// `fingerprint` admitted. The rest of the context is checked where the run
+/// is routed, so a cwd that resolves to another path here does not refuse it.
+pub fn keepsPlacement(
+    fingerprint: AdmissionFingerprint,
+    placement: command_environment.Placement,
+    profile: ?[]const u8,
+) bool {
+    return fingerprint.placement == placement and sameProfile(fingerprint.placement_profile, profile);
+}
+
 /// A null profile is the profile named `default`, so the two match.
 fn sameProfile(a: ?[]const u8, b: ?[]const u8) bool {
     return std.mem.eql(u8, a orelse "default", b orelse "default");
