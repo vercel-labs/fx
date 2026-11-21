@@ -352,6 +352,51 @@ pub fn shouldCreateResumeHandoff(state: ResumeHandoffState) bool {
         (!state.is_pristine or state.intent == .upgrade_requested);
 }
 
+/// How a replayed interrupted turn ends on screen.
+const InterruptedTurnEnd = enum { none, cancellation, notice };
+
+/// The line that ends `entry` in a replay: a cancel shows as cancelled, a
+/// failure or a crash as its notice. A turn that yielded for an upgrade's
+/// restart shows none, since the turn that continues it says so
+/// (`session.continued_turn_notice`).
+fn interruptedTurnEnd(entry: types.InterruptedHistoryTurn) InterruptedTurnEnd {
+    if (entry.yielded) return .none;
+    return switch (entry.terminal_reason) {
+        .cancelled => if (entry.cancelled_command == null and entry.cancellation_origin == .turn) .cancellation else .none,
+        .failed => .notice,
+    };
+}
+
+/// The checkpoint that continues a turn which yielded between steps, as
+/// libfx continues one (`libfx_journal.resumeCheckpoint` with `yielded`):
+/// its prompt and finished steps, no partial reply, nothing sent yet, and
+/// no tool evidence, so the resend strategy adds no text and the model
+/// reads no note. Owned by `alloc`; the caller calls `deinit`.
+fn yieldedTurnCheckpoint(
+    alloc: Allocator,
+    entry: types.InterruptedHistoryTurn,
+    provider: model_provider.ProviderId,
+    model: []const u8,
+) !session_codec.RecoveryCheckpoint {
+    const view: session_codec.RecoveryCheckpoint = .{
+        .turn_id = debug_trace.nextTurnId(),
+        .user = entry.user,
+        .assistant_source = @constCast(""),
+        .execution = entry.execution,
+        .cause = .network_interrupted,
+        .action = .retrying_request,
+        .tool_state = .none,
+        .authority = .{ .provider = provider, .model = @constCast(model) },
+        .requested_fast_mode = false,
+        .fast_mode = false,
+        // As the agent loop saves it: no cap of its own.
+        .max_provider_attempts = std.math.maxInt(u16) + 1,
+        .consumed_provider_attempts = 0,
+        .outstanding_reservation = false,
+    };
+    return view.dupe(alloc);
+}
+
 test "resume handoff policy requires requested durable non-pristine state" {
     const cases = [_]struct {
         state: ResumeHandoffState,
@@ -402,6 +447,34 @@ test "resume handoff policy requires requested durable non-pristine state" {
     for (cases) |case| {
         try std.testing.expectEqual(case.expected, shouldCreateResumeHandoff(case.state));
     }
+}
+
+test "a yielded turn's checkpoint holds its prompt and steps and nothing sent" {
+    const alloc = std.testing.allocator;
+    const entry: types.InterruptedHistoryTurn = .{
+        .user = .{ .text = @constCast("work") },
+        .terminal_reason = .cancelled,
+    };
+    var checkpoint = try yieldedTurnCheckpoint(alloc, entry, .gateway, "test/model");
+    defer checkpoint.deinit(alloc);
+    try std.testing.expectEqualStrings("work", checkpoint.user.text);
+    try std.testing.expectEqualStrings("", checkpoint.assistant_source);
+    try std.testing.expectEqualStrings("test/model", checkpoint.authority.model);
+    try std.testing.expectEqual(session_codec.RecoveryToolState.none, checkpoint.tool_state);
+    try std.testing.expect(!checkpoint.outstanding_reservation);
+    try std.testing.expectEqual(@as(usize, 0), checkpoint.consumed_provider_attempts);
+}
+
+test "a replayed turn that yielded for an upgrade ends with no cancelled line" {
+    const yielded: types.InterruptedHistoryTurn = .{ .user = .{ .text = @constCast("go") }, .stopped_by_exit = true, .yielded = true };
+    try std.testing.expectEqual(InterruptedTurnEnd.none, interruptedTurnEnd(yielded));
+    // A closed, crashed, or cancelled turn without the marker keeps its line.
+    const closed: types.InterruptedHistoryTurn = .{ .user = .{ .text = @constCast("go") }, .stopped_by_exit = true };
+    try std.testing.expectEqual(InterruptedTurnEnd.cancellation, interruptedTurnEnd(closed));
+    const crashed: types.InterruptedHistoryTurn = .{ .user = .{ .text = @constCast("go") }, .terminal_reason = .failed, .stopped_by_exit = true };
+    try std.testing.expectEqual(InterruptedTurnEnd.notice, interruptedTurnEnd(crashed));
+    const compaction: types.InterruptedHistoryTurn = .{ .user = .{ .text = @constCast("go") }, .cancellation_origin = .compaction };
+    try std.testing.expectEqual(InterruptedTurnEnd.none, interruptedTurnEnd(compaction));
 }
 
 /// Owns `session_id`; callers must release it with `deinit`.
@@ -1592,6 +1665,7 @@ pub fn Runtime(comptime App: type) type {
         /// close ended it (`tests/tla/recovery/Resume.tla` AutoResumes).
         fn noteInterruptedRequest(agent: *AppAgent, v2: *session_adapter.Session) void {
             agent.session_persistence.pending_request_resume = null;
+            agent.session_persistence.pending_resume_yielded = false;
             const found = (v2.interruptedRequest() catch |err| {
                 debug_trace.logf("recovery", "event=resume_check_failed err={s}", .{@errorName(err)});
                 return;
@@ -1599,7 +1673,8 @@ pub fn Runtime(comptime App: type) type {
             const now_ms = io_mod.milliTimestamp();
             const stale = resumeIsStale(now_ms, found.saved_ms);
             agent.session_persistence.pending_request_resume = .{ .record = found.record, .stale = stale };
-            debug_trace.logf("recovery", "event=resume_pending record={} stale={} saved_ms={d} now_ms={d}", .{ found.record != null, stale, found.saved_ms, now_ms });
+            agent.session_persistence.pending_resume_yielded = found.yielded;
+            debug_trace.logf("recovery", "event=resume_pending record={} stale={} yielded={} saved_ms={d} now_ms={d}", .{ found.record != null, stale, found.yielded, found.saved_ms, now_ms });
         }
 
         /// Sends the noted request again, as a turn whose prompt is fx's note
@@ -1609,9 +1684,51 @@ pub fn Runtime(comptime App: type) type {
             if (comptime !@hasDecl(App, "queueResumedRequest")) return;
             const resumed = agent.session_persistence.pending_request_resume orelse return;
             agent.session_persistence.pending_request_resume = null;
+            const yielded = agent.session_persistence.pending_resume_yielded;
+            agent.session_persistence.pending_resume_yielded = false;
+            // A turn that stopped for an upgrade's restart goes on as the
+            // same turn, with no note to the model; if it cannot, the note
+            // resume still sends the request again.
+            if (yielded) {
+                if (continueYieldedTurn(app, agent, resumed)) return else |err| {
+                    debug_trace.logf("recovery", "event=yield_continue_failed err={s} fallback=resume_note", .{@errorName(err)});
+                }
+            }
             _ = app.queueResumedRequest(agent, session_runtime.resumed_request_prompt, resumed) catch |err| {
                 debug_trace.logf("recovery", "event=resume_dropped reason=queue_failed err={s}", .{@errorName(err)});
             };
+        }
+
+        /// Continues the turn that yielded for an upgrade's restart, which
+        /// the resume left as the history's newest turn: takes it out of the
+        /// history and queues a turn that goes on from its pieces. The
+        /// session's next turn then says it continues the yielded one, so a
+        /// later replay drops that one (`session_adapter.Session.setContinuesYielded`).
+        fn continueYieldedTurn(app: *App, agent: *AppAgent, resumed: types.RecoveryResume) !void {
+            if (comptime !@hasDecl(App, "queueYieldedTurn")) return error.YieldedTurnUnsupported;
+            const v2 = agent.session_persistence.v2 orelse return error.SessionPersistenceUnavailable;
+            const taken = agent.session.takeNewestTurn() orelse return error.YieldedTurnMissing;
+            var taken_owned_elsewhere = false;
+            errdefer if (!taken_owned_elsewhere) agent.session.returnNewestTurn(taken);
+            const entry = switch (taken.turn) {
+                .interrupted => |value| value,
+                else => return error.YieldedTurnMissing,
+            };
+            var checkpoint = try yieldedTurnCheckpoint(
+                app.alloc,
+                entry,
+                provider_runtime.providerOf(app, agent),
+                provider_runtime.modelOf(app, agent),
+            );
+            defer checkpoint.deinit(app.alloc);
+            v2.setContinuesYielded(true);
+            app.queueYieldedTurn(agent, &checkpoint, resumed) catch |err| {
+                v2.setContinuesYielded(false);
+                return err;
+            };
+            taken_owned_elsewhere = true;
+            debug_trace.logf("recovery", "event=yield_continued tool_steps={d}", .{entry.execution.tool_steps.len});
+            types.freeHistoryTurn(app.alloc, taken.turn);
         }
 
         /// `AgentRuntimeDeps.save_recovery_record` on v2.
@@ -1630,6 +1747,14 @@ pub fn Runtime(comptime App: type) type {
             defer agent.session_persistence.write_mutex.unlock(io_mod.getIo());
             const v2 = agent.session_persistence.v2 orelse return;
             try v2.saveBridgeCall(record);
+        }
+
+        /// `AgentRuntimeDeps.mark_turn_yielded` on v2.
+        pub fn markTurnYielded(agent: *AppAgent) !void {
+            agent.session_persistence.write_mutex.lockUncancelable(io_mod.getIo());
+            defer agent.session_persistence.write_mutex.unlock(io_mod.getIo());
+            const v2 = agent.session_persistence.v2 orelse return;
+            if (!try v2.markYielded()) debug_trace.logf("recovery", "event=turn_yield_unmarked reason=no_open_turn", .{});
         }
 
         /// Record whether restored history references shell execution handles
@@ -4096,11 +4221,10 @@ pub fn Runtime(comptime App: type) type {
                         if (entry.tool_call) |call| {
                             try writeBridgeCallRows(app, sink, entry.execution.bridge_calls, call.id);
                         }
-                        switch (entry.terminal_reason) {
-                            .cancelled => if (entry.cancelled_command == null and entry.cancellation_origin == .turn) {
-                                try sink.appendTurnCancellation();
-                            },
-                            .failed => try sink.appendNotice(
+                        switch (interruptedTurnEnd(entry)) {
+                            .none => {},
+                            .cancellation => try sink.appendTurnCancellation(),
+                            .notice => try sink.appendNotice(
                                 session_runtime.interruptedTurnNotice(entry),
                             ),
                         }

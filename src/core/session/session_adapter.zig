@@ -1832,6 +1832,9 @@ pub const Session = struct {
     turn_open: bool = false,
     /// Highest turn number started; the manager numbers turns the same way.
     last_turn: u64 = 0,
+    /// The next turn this session opens continues the turn that yielded
+    /// before it: its first item says so. Cleared once that turn starts.
+    continues_yielded: bool = false,
     /// The v2 turn behind each of fx's history turns, in order; null for a
     /// compacted summary.
     turn_numbers: std.ArrayList(?u64) = .empty,
@@ -2230,13 +2233,15 @@ pub const Session = struct {
     /// Opens the turn on disk if it is not open yet, so a body stored for it
     /// is a blob of a session on disk (D44). `opener` is the capture token
     /// of the turn being opened, or 0 when it is not the current capture
-    /// turn's. Caller holds the mutex.
+    /// turn's. A turn that continues a yielded one starts with its marker,
+    /// before any held start capture. Caller holds the mutex.
     fn openTurnLocked(self: *Session, opener: u64) !void {
         if (self.turn_open and !self.turn_stale) return;
         if (self.turn_open) try self.supersedeOpenTurn("failed_turn");
         var batch: std.ArrayList(sm.Event) = .empty;
         defer batch.deinit(self.alloc);
         try batch.append(self.alloc, .turn_started);
+        if (self.continues_yielded) try batch.append(self.alloc, continuedItem());
         try self.appendHeldStarts(self.alloc, &batch, opener);
         _ = try self.write(batch.items);
         self.startedTurn(opener);
@@ -2774,6 +2779,27 @@ pub const Session = struct {
         _ = try self.write(&.{.{ .item = .{ .type = bridge_call_type, .data = try encodeBridgeCall(a, record) } }});
     }
 
+    /// Marks the open turn as one that stopped between steps for an
+    /// upgrade's restart, after its record was saved clean. The next launch
+    /// continues it as the same turn (`interruptedRequest`). Returns false
+    /// when no turn is open, or when the open turn is a failed one left open
+    /// (D98), which writes nothing.
+    pub fn markYielded(self: *Session) !bool {
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        if (!self.turn_open or self.turn_stale) return false;
+        _ = try self.write(&.{.{ .item = .{ .type = yielded_type, .data = "{}" } }});
+        return true;
+    }
+
+    /// Says whether the next turn this session opens continues the turn
+    /// that yielded before it (`continues_yielded`).
+    pub fn setContinuesYielded(self: *Session, value: bool) void {
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        self.continues_yielded = value;
+    }
+
     fn recoveryItem(self: *Session, a: Allocator, record: types.RecoveryRecordWrite) !?sm.Piece {
         const bytes: []u8 = switch (record) {
             .keep => return null,
@@ -2799,6 +2825,7 @@ pub const Session = struct {
         var found: InterruptedRequest = .{ .record = null, .saved_ms = 0 };
         var record_seen = false;
         var has_prompt = false;
+        var newest_item = true;
         var from: sm.From = .end;
         scan: while (true) {
             var page = try self.source().readTo(self.alloc, from, .backward, replay_page_lines);
@@ -2808,6 +2835,10 @@ pub const Session = struct {
                 switch (body) {
                     .turn_started => |started| if (started.turn == ended.turn) break :scan,
                     .item => |piece| {
+                        if (newest_item) {
+                            newest_item = false;
+                            found.yielded = std.mem.eql(u8, piece.type, yielded_type);
+                        }
                         if (found.saved_ms == 0) found.saved_ms = entry.ts_ms;
                         if (std.mem.eql(u8, piece.type, itemType(.turn_completed).?)) return null;
                         if (std.mem.eql(u8, piece.type, itemType(.user).?)) has_prompt = true;
@@ -2830,6 +2861,9 @@ pub const Session = struct {
         /// `ts` of the line that saved the record, or of the turn's newest
         /// piece when no record was saved.
         saved_ms: u64,
+        /// The turn's newest item is the yield marker: it stopped between
+        /// steps for an upgrade's restart, and continues as the same turn.
+        yielded: bool = false,
     };
 
     /// The step whose calls are running: its calls in their saved form, and
@@ -2912,6 +2946,7 @@ pub const Session = struct {
         var batch: std.ArrayList(sm.Event) = .empty;
         if (!self.turn_open) {
             try batch.append(a, .turn_started);
+            if (self.continues_yielded) try batch.append(a, continuedItem());
             // Held start captures go with the line that starts the turn (D98).
             try self.appendHeldStarts(a, &batch, opener);
             const needs_blob = for (encoded, reviews) |bytes, review| {
@@ -2950,6 +2985,7 @@ pub const Session = struct {
         self.last_turn += 1;
         self.turn_open = true;
         self.turn_token = opener;
+        self.continues_yielded = false;
         if (opener != 0) self.markStartsWritten(opener);
     }
 
@@ -2957,6 +2993,10 @@ pub const Session = struct {
         for (self.captures.items) |*capture| {
             if (capture.turn == opener and capture.place == .start) capture.written = true;
         }
+    }
+
+    fn continuedItem() sm.Event {
+        return .{ .item = .{ .type = continued_type, .data = "{}" } };
     }
 
     // -- a conversion's import (D56) -----------------------------------------
@@ -5537,6 +5577,20 @@ const ReplaySink = struct {
     }
 };
 
+/// A turn that stopped for an upgrade's restart, which `replay` holds until
+/// the next turn shows whether it continues it.
+const HeldTurn = struct {
+    turn: types.HistoryTurn,
+    number: u64,
+};
+
+/// Hands `held` to `sink`, which takes it even on failure, and clears it.
+fn sinkHeld(sink: ReplaySink, held: *?HeldTurn) !void {
+    const value = held.* orelse return;
+    held.* = null;
+    try sink.turn(value.turn, value.number);
+}
+
 noinline fn replay(
     src: Source,
     alloc: Allocator,
@@ -5551,6 +5605,12 @@ noinline fn replay(
     defer builder.deinit();
     var interrupted_item = false;
     var superseded = false;
+    // The open turn's newest item is the yield marker, and the open turn
+    // started with the marker that it continues a yielded one.
+    var yield_item = false;
+    var continues = false;
+    var held: ?HeldTurn = null;
+    defer if (held) |value| types.freeHistoryTurn(alloc, value.turn);
     var piece_arena = std.heap.ArenaAllocator.init(alloc);
     defer piece_arena.deinit();
     // The open turn's calls saved as running, and the call ids its pieces
@@ -5575,12 +5635,33 @@ noinline fn replay(
                 .turn_started => {
                     interrupted_item = false;
                     superseded = false;
+                    yield_item = false;
+                    continues = false;
                     _ = turn_arena.reset(.retain_capacity);
                     running = .empty;
                     represented = .empty;
                     running_text = null;
                 },
                 .item => |piece| {
+                    if (std.mem.eql(u8, piece.type, yielded_type)) {
+                        yield_item = true;
+                        continue;
+                    }
+                    if (std.mem.eql(u8, piece.type, continued_type)) {
+                        continues = true;
+                        continue;
+                    }
+                    // A record decides nothing: one saved after the marker
+                    // leaves it standing, and one the next turn saves before
+                    // its prompt, as a resume that asks first can, says
+                    // nothing of what that turn continues.
+                    const is_record = std.mem.eql(u8, piece.type, recovery_type);
+                    if (!is_record) yield_item = false;
+                    // The next turn's first piece is not its prompt: the held
+                    // turn was not continued. Its workspace captures, which its
+                    // first line carries before the prompt (D98), say nothing.
+                    const is_capture = std.mem.eql(u8, piece.type, workspace_capture_type);
+                    if (held != null and !is_record and !is_capture and !std.mem.eql(u8, piece.type, itemType(.user).?)) try sinkHeld(sink, &held);
                     if (std.mem.eql(u8, piece.type, superseded_type)) {
                         superseded = true;
                         continue;
@@ -5627,7 +5708,15 @@ noinline fn replay(
                     // The builder copies what it keeps, as it does for v1's
                     // reader, so strings may point into the page.
                     if (kind == .user) {
-                        try builder.begin(try src.withMovedImages(pa, try src.decodeUser(pa, data)));
+                        const user = try src.withMovedImages(pa, try src.decodeUser(pa, data));
+                        if (held) |value| {
+                            if (continues and std.mem.eql(u8, value.turn.interrupted.user.text, user.text)) {
+                                debug_trace.logf("session", "event=sessions_v2_replay_yielded session={s} turn={d} dropped=yielded_turn reason=continued", .{ src.id, value.number });
+                                types.freeHistoryTurn(alloc, value.turn);
+                                held = null;
+                            } else try sinkHeld(sink, &held);
+                        }
+                        try builder.begin(user);
                         // Its line says when it was sent, for Ctrl+O.
                         builder.user.?.sent_at_ms = std.math.cast(i64, entry.ts_ms) orelse 0;
                         continue;
@@ -5679,6 +5768,7 @@ noinline fn replay(
                         continue;
                     }
                     if (interrupted_item or builder.isIdle()) continue;
+                    try sinkHeld(sink, &held);
                     var turn = try builder.finishInterrupted(.{ .reason = switch (ended.reason) {
                         .cancel, .closed => .cancelled,
                         .failed, .crash => .failed,
@@ -5692,9 +5782,21 @@ noinline fn replay(
                         return err;
                     };
                     if (answered > 0) debug_trace.logf("session", "event=sessions_v2_replay_unfinished_tools session={s} turn={d} calls={d}", .{ src.id, ended.turn, answered });
-                    try sink.turn(try presentStoredResults(src, alloc, turn), ended.turn);
+                    var shown = try presentStoredResults(src, alloc, turn);
+                    // A turn that stopped for an upgrade's restart waits for
+                    // the next turn: one that continues it repeats its pieces.
+                    // If none does, it shows as stopped, not as cancelled.
+                    if (yield_item and (ended.reason == .closed or ended.reason == .crash)) {
+                        shown.interrupted.yielded = true;
+                        held = .{ .turn = shown, .number = ended.turn };
+                    } else {
+                        try sink.turn(shown, ended.turn);
+                    }
                 },
-                .compacted => |line| try sink.summary(line.data),
+                .compacted => |line| {
+                    try sinkHeld(sink, &held);
+                    try sink.summary(line.data);
+                },
                 .session_created, .turn_committed, .set, .child_spawned, .child_finished, .snapshot, .closed => {},
             }
         }
@@ -5706,6 +5808,7 @@ noinline fn replay(
         }
         from = .{ .at = page.next orelse break };
     }
+    try sinkHeld(sink, &held);
     if (!builder.isIdle()) debug_trace.logf("session", "event=sessions_v2_replay_open_turn session={s} dropped=unfinished_pieces", .{src.id});
 }
 
@@ -5994,6 +6097,13 @@ fn resumeError(err: sm.OpenError, target: Target) ResumeError {
 /// Item type of a turn closed because its streamed pieces did not match
 /// the final turn; resume drops that turn.
 const superseded_type = "superseded";
+/// The last item of a turn that stopped between steps for an upgrade's
+/// restart: the next launch continues it as the same turn
+/// (`tests/tla/recovery/Resume.tla` Relaunch).
+const yielded_type = "turn_yielded";
+/// The first item of the turn that continues a yielded one; replay then
+/// drops the yielded turn, whose pieces this turn repeats.
+const continued_type = "turn_continued";
 /// A tool call saved before it runs (D28); its data is a `tool_call` piece.
 /// The item after a turn's user piece when someone other than the user
 /// wrote that message, such as a subagent's report that woke its parent.
@@ -7360,6 +7470,185 @@ fn turnLines(a: Allocator, manager: *sm.Manager, id: []const u8) ![]const []cons
         try lines.append(a, line);
     }
     return lines.items;
+}
+
+test "a yielded turn is found as yielded, and a later piece clears it" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var model = "m".*;
+    const s = try Session.create(testing.allocator, &t.store, "/w", .app, testSeed(&model));
+    const user: types.UserTurn = .{ .text = @constCast("work") };
+    // Nothing is open yet, so nothing is marked.
+    try testing.expect(!try s.markYielded());
+    try s.appendProgressWithRecord(user, .{}, .{}, .{ .save = @splat(0x55) });
+    try testing.expect(try s.saveRecovery(.{ .save = @splat(0x66) }));
+    try testing.expect(try s.markYielded());
+    const id = try testing.allocator.dupe(u8, s.id());
+    defer testing.allocator.free(id);
+    s.close();
+
+    const r = try Session.resumeSession(testing.allocator, &t.store, .{ .id = id }, "/w", .app);
+    const found = (try r.interruptedRequest()).?;
+    try testing.expect(found.yielded);
+    try testing.expectEqual(@as([32]u8, @splat(0x66)), found.record.?);
+    r.close();
+
+    // A turn that went on after the marker did not stop there.
+    const s2 = try Session.create(testing.allocator, &t.store, "/w", .app, testSeed(&model));
+    try s2.appendProgress(user, .{}, .{});
+    try testing.expect(try s2.markYielded());
+    try testing.expect(try s2.saveRecovery(.{ .save = @splat(0x77) }));
+    const id2 = try testing.allocator.dupe(u8, s2.id());
+    defer testing.allocator.free(id2);
+    s2.close();
+    const r2 = try Session.resumeSession(testing.allocator, &t.store, .{ .id = id2 }, "/w", .app);
+    defer r2.close();
+    try testing.expect(!(try r2.interruptedRequest()).?.yielded);
+}
+
+test "a continuing turn starts with its marker, once" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var model = "m".*;
+    const s = try Session.create(testing.allocator, &t.store, "/w", .app, testSeed(&model));
+    defer s.close();
+    s.setContinuesYielded(true);
+    try s.appendProgress(.{ .text = @constCast("work") }, .{}, .{});
+    try testing.expect(!s.continues_yielded);
+    try s.commitTurn(.{ .assistant = .{ .user = .{ .text = @constCast("work") }, .assistant = @constCast("done") } }, types.ConversationLanguage.default());
+    try s.appendProgress(.{ .text = @constCast("next") }, .{}, .{});
+    try testing.expectEqual(@as(usize, 1), try countItems(t.store.manager, s.id(), continued_type));
+}
+
+test "a yielded newest turn comes back whole on resume" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var model = "m".*;
+    const s = try Session.create(testing.allocator, &t.store, "/w", .app, testSeed(&model));
+    try s.appendProgress(.{ .text = @constCast("work") }, .{}, .{});
+    try testing.expect(try s.markYielded());
+    const id = try testing.allocator.dupe(u8, s.id());
+    defer testing.allocator.free(id);
+    s.close();
+
+    const r = try Session.resumeSession(testing.allocator, &t.store, .{ .id = id }, "/w", .app);
+    defer r.close();
+    var restored = try r.restore(testing.allocator);
+    defer restored.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 1), restored.history.len);
+    try testing.expectEqualStrings("work", restored.history[0].interrupted.user.text);
+    try testing.expect(restored.history[0].interrupted.yielded);
+}
+
+test "the turn that continues a yielded one takes its place on resume" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var model = "m".*;
+    const s = try Session.create(testing.allocator, &t.store, "/w", .app, testSeed(&model));
+    try s.appendProgress(.{ .text = @constCast("work") }, .{}, .{});
+    try testing.expect(try s.markYielded());
+    const id = try testing.allocator.dupe(u8, s.id());
+    defer testing.allocator.free(id);
+    s.close();
+
+    const c = try Session.resumeSession(testing.allocator, &t.store, .{ .id = id }, "/w", .app);
+    c.setContinuesYielded(true);
+    try c.appendProgress(.{ .text = @constCast("work") }, .{}, .{});
+    try c.commitTurn(.{ .assistant = .{ .user = .{ .text = @constCast("work") }, .assistant = @constCast("done") } }, types.ConversationLanguage.default());
+    c.close();
+
+    const r = try Session.resumeSession(testing.allocator, &t.store, .{ .id = id }, "/w", .app);
+    defer r.close();
+    var restored = try r.restore(testing.allocator);
+    defer restored.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 1), restored.history.len);
+    try testing.expectEqualStrings("work", restored.history[0].assistant.user.text);
+}
+
+test "a continuing turn's start capture does not bring the yielded turn back (D98)" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var model = "m".*;
+    const s = try Session.create(testing.allocator, &t.store, "/w", .app, testSeed(&model));
+    try s.appendProgress(.{ .text = @constCast("work") }, .{}, .{});
+    try testing.expect(try s.markYielded());
+    const id = try testing.allocator.dupe(u8, s.id());
+    defer testing.allocator.free(id);
+    s.close();
+
+    const c = try Session.resumeSession(testing.allocator, &t.store, .{ .id = id }, "/w", .app);
+    c.setContinuesYielded(true);
+    // Held: the turn is not open yet, so the capture goes with its first line.
+    try testing.expect(!try saveCapture(c, capture_start_a, .start));
+    try c.appendProgress(.{ .text = @constCast("work") }, .{}, .{});
+    try commitCaptured(c, .{ .assistant = .{ .user = .{ .text = @constCast("work") }, .assistant = @constCast("done") } }, types.ConversationLanguage.default());
+    c.close();
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    // The continuing turn: its marker, then its start capture, before its prompt.
+    const newest = newestTurn(try turnLines(arena.allocator(), t.store.manager, id));
+    try expectLines(&.{ "turn_started", "item turn_continued", "capture " ++ capture_start_a }, newest[0..@min(3, newest.len)]);
+
+    const r = try Session.resumeSession(testing.allocator, &t.store, .{ .id = id }, "/w", .app);
+    defer r.close();
+    var restored = try r.restore(testing.allocator);
+    defer restored.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 1), restored.history.len);
+    try testing.expectEqualStrings("work", restored.history[0].assistant.user.text);
+}
+
+test "a yielded turn stays when the next turn is another prompt" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var model = "m".*;
+    const s = try Session.create(testing.allocator, &t.store, "/w", .app, testSeed(&model));
+    try s.appendProgress(.{ .text = @constCast("work") }, .{}, .{});
+    try testing.expect(try s.markYielded());
+    const id = try testing.allocator.dupe(u8, s.id());
+    defer testing.allocator.free(id);
+    s.close();
+
+    // Even a turn marked as continuing keeps it when its prompt differs.
+    const c = try Session.resumeSession(testing.allocator, &t.store, .{ .id = id }, "/w", .app);
+    c.setContinuesYielded(true);
+    try c.commitTurn(.{ .assistant = .{ .user = .{ .text = @constCast("other") }, .assistant = @constCast("done") } }, types.ConversationLanguage.default());
+    c.close();
+
+    const r = try Session.resumeSession(testing.allocator, &t.store, .{ .id = id }, "/w", .app);
+    defer r.close();
+    var restored = try r.restore(testing.allocator);
+    defer restored.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 2), restored.history.len);
+    try testing.expectEqualStrings("work", restored.history[0].interrupted.user.text);
+    try testing.expect(restored.history[0].interrupted.yielded);
+    try testing.expectEqualStrings("other", restored.history[1].assistant.user.text);
+}
+
+test "a closed turn without the yield marker does not come back as yielded" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var model = "m".*;
+    const s = try Session.create(testing.allocator, &t.store, "/w", .app, testSeed(&model));
+    try s.appendProgress(.{ .text = @constCast("work") }, .{}, .{});
+    const id = try testing.allocator.dupe(u8, s.id());
+    defer testing.allocator.free(id);
+    s.close();
+
+    const r = try Session.resumeSession(testing.allocator, &t.store, .{ .id = id }, "/w", .app);
+    defer r.close();
+    var restored = try r.restore(testing.allocator);
+    defer restored.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 1), restored.history.len);
+    try testing.expect(restored.history[0].interrupted.stopped_by_exit);
+    try testing.expect(!restored.history[0].interrupted.yielded);
 }
 
 fn expectLines(expected: []const []const u8, actual: []const []const u8) !void {

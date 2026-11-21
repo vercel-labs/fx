@@ -25,6 +25,7 @@ const max_poll_ticks: u32 = 400;
 const Op = struct {
     op: []const u8,
     @"resume": bool = false,
+    continues: bool = false,
     name: []const u8 = "",
     kind: []const u8 = "",
 };
@@ -183,7 +184,7 @@ fn run(lab: *Lab, op: Op, result: *Result) void {
         lab.* = .{};
     } else if (is(op.op, "start")) {
         const resume_from = if (op.@"resume") lab.disk else null;
-        result.plan = planOut(lab.step(.{ .start = .{ .resume_from = resume_from } }));
+        result.plan = planOut(lab.step(.{ .start = .{ .resume_from = resume_from, .continues = op.continues } }));
     } else if (is(op.op, "event")) {
         const event = eventNamed(op.name) orelse {
             result.@"error" = "unknown event";

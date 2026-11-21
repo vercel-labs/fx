@@ -676,6 +676,8 @@ pub const FakeAgentRuntimeDeps = struct {
     recovery_record_clears: usize = 0,
     /// The turn has pieces on disk, so a save between sends lands.
     recovery_turn_written: bool = true,
+    /// How many times the turn was marked as yielded (`mark_turn_yielded`).
+    turn_yielded_marks: usize = 0,
     /// Returned by every session writer check; null confirms the writer.
     session_writer_error: ?anyerror = null,
     session_writer_checks: usize = 0,
@@ -830,6 +832,7 @@ pub const FakeAgentRuntimeDeps = struct {
             .refresh_gateway_credential = refreshGatewayCredential,
             .ask_out_of_credits = askOutOfCredits,
             .save_recovery_record = if (self.enable_recovery_record) saveRecoveryRecord else null,
+            .mark_turn_yielded = markTurnYielded,
             .available_model_capabilities = availableModelCapabilities,
             .resolve_model_capabilities = resolveModelCapabilities,
             .model_catalog_failure = catalogFailure,
@@ -1033,6 +1036,11 @@ pub const FakeAgentRuntimeDeps = struct {
             },
         }
         return true;
+    }
+
+    fn markTurnYielded(raw: *anyopaque) !void {
+        const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
+        self.turn_yielded_marks += 1;
     }
 
     fn askOutOfCredits(raw: *anyopaque) !runtime_deps.OutOfCreditsChoice {

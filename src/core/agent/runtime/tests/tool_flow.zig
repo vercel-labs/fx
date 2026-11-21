@@ -32,6 +32,7 @@ const runtime_tool_batch = @import("../tool_batch.zig");
 const runtime_tool_contracts = @import("../tool_contracts.zig");
 const runtime_tool_presentation = @import("../tool_presentation.zig");
 const runtime_telemetry = @import("../telemetry.zig");
+const recovery = @import("../../../recovery/recovery.zig");
 const command_admission = @import("../../../permissions/command_admission.zig");
 const permission_auto_classifier = @import("../../../permissions/auto_classifier.zig");
 const permissions = @import("../../../permissions/permissions.zig");
@@ -692,6 +693,136 @@ test "tool execution result propagates inner search usage exactly once" {
     try std.testing.expectEqual(@as(u64, 12), hooks.inner_usages.items[0].input_tokens);
     try std.testing.expectEqual(@as(u64, 34), hooks.inner_usages.items[0].output_tokens);
     try std.testing.expectEqual(@as(u32, 2), hooks.inner_usages.items[0].web_search_requests);
+}
+
+test "a turn asked to yield stops at its next step boundary after the first request" {
+    const alloc = std.testing.allocator;
+    const calls = [_]ToolCall{toolCall("call_search", "web_search", "{\"query\":\"current news\"}")};
+    const completions = [_]FakeCompletion{
+        .{ .tool_calls = &calls },
+        .{ .content = "final" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var fixture = PromptFixture{};
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    hooks.enable_recovery_record = true;
+    hooks.exec_plans = &.{.{ .result = .{ .model_output = "search output" } }};
+    // Set before the turn starts: the first request still goes out.
+    var yield_flag = std.atomic.Value(bool).init(true);
+    var config = fixture.config();
+    config.yield_flag = &yield_flag;
+
+    try std.testing.expectError(error.TurnYielded, runFakePrompt(&gateway, &hooks, config, fixture.job()));
+
+    // One request went out; the tool ran; the second request never did.
+    try std.testing.expectEqual(@as(usize, 1), gateway.request_bodies.items.len);
+    try std.testing.expectEqual(@as(usize, 1), hooks.turn_yielded_marks);
+    // The record the yield left resumes without counting a death.
+    var probe: recovery.State = .{};
+    const plan = recovery.step(&probe, .{ .start = .{ .resume_from = hooks.recovery_record.? } }, 0);
+    try std.testing.expect(plan.send != null);
+    try std.testing.expectEqual(@as(u8, 0), probe.abrupt_deaths);
+}
+
+test "a yielded turn is traced as yielded, not as an HTTP error" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(root);
+    const trace_path = try std.Io.Dir.path.join(alloc, &.{ root, "trace.log" });
+    defer alloc.free(trace_path);
+
+    debug_trace.resetForTest();
+    try debug_trace.configureForTest(alloc, trace_path);
+    defer debug_trace.resetForTest();
+
+    const calls = [_]ToolCall{toolCall("call_search", "web_search", "{\"query\":\"current news\"}")};
+    const completions = [_]FakeCompletion{
+        .{ .tool_calls = &calls },
+        .{ .content = "final" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var fixture = PromptFixture{};
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    hooks.enable_recovery_record = true;
+    hooks.exec_plans = &.{.{ .result = .{ .model_output = "search output" } }};
+    // Set before the turn starts: the first request still goes out.
+    var yield_flag = std.atomic.Value(bool).init(true);
+    var config = fixture.config();
+    config.yield_flag = &yield_flag;
+
+    try std.testing.expectError(error.TurnYielded, runFakePrompt(&gateway, &hooks, config, fixture.job()));
+
+    debug_trace.resetForTest();
+    const trace = try readTraceFile(alloc, trace_path, 1 << 20);
+    defer alloc.free(trace);
+    try std.testing.expect(std.mem.find(u8, trace, "outcome_kind=yielded") != null);
+    try std.testing.expect(std.mem.find(u8, trace, "outcome_kind=http_error") == null);
+}
+
+test "a turn whose flag stays clear never yields" {
+    const alloc = std.testing.allocator;
+    const calls = [_]ToolCall{toolCall("call_search", "web_search", "{\"query\":\"current news\"}")};
+    const completions = [_]FakeCompletion{
+        .{ .tool_calls = &calls },
+        .{ .content = "final" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var fixture = PromptFixture{};
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    hooks.exec_plans = &.{.{ .result = .{ .model_output = "search output" } }};
+    var yield_flag = std.atomic.Value(bool).init(false);
+    var config = fixture.config();
+    config.yield_flag = &yield_flag;
+
+    try runFakePrompt(&gateway, &hooks, config, fixture.job());
+
+    try std.testing.expectEqual(@as(usize, 2), gateway.request_bodies.items.len);
+    try std.testing.expectEqual(@as(usize, 0), hooks.turn_yielded_marks);
+}
+
+test "a turn that continues a yielded one sends the user's own message, not the resume note" {
+    const alloc = std.testing.allocator;
+    const completions = [_]FakeCompletion{.{ .content = "final" }};
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var fixture = PromptFixture{};
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    var job = fixture.job();
+    job.recovery_resume = .{};
+    job.continues_yielded_turn = true;
+
+    try runFakePrompt(&gateway, &hooks, fixture.config(), job);
+
+    try std.testing.expectEqual(@as(usize, 1), gateway.request_bodies.items.len);
+    const body = gateway.request_bodies.items[0];
+    try std.testing.expect(std.mem.find(u8, body, "user prompt") != null);
+    try std.testing.expect(std.mem.find(u8, body, "session_resumed") == null);
+}
+
+test "a resumed request that continues no yielded turn sends the resume note" {
+    const alloc = std.testing.allocator;
+    const completions = [_]FakeCompletion{.{ .content = "final" }};
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var fixture = PromptFixture{};
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    var job = fixture.job();
+    job.recovery_resume = .{};
+
+    try runFakePrompt(&gateway, &hooks, fixture.config(), job);
+
+    try std.testing.expectEqual(@as(usize, 1), gateway.request_bodies.items.len);
+    try std.testing.expect(std.mem.find(u8, gateway.request_bodies.items[0], "session_resumed") != null);
 }
 
 test "processQueuedPrompt presents invalid registered call without running it" {

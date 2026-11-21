@@ -173,7 +173,7 @@ pub const RequestRecovery = struct {
         if (self.deps.begin_route_recovery_request) |begin| begin(self.deps.ctx);
         if (self.deps.save_recovery_record != null) register(self);
         const from = resumed orelse Resume{};
-        return self.event(.{ .start = .{ .fast = fast, .resume_from = from.record, .stale = from.stale } });
+        return self.event(.{ .start = .{ .fast = fast, .resume_from = from.record, .stale = from.stale, .continues = from.continues } });
     }
 
     /// The record for the write just before a send: the module's save for
@@ -252,6 +252,16 @@ pub const RequestRecovery = struct {
         self.closed = true;
         debug_trace.eventf("recovery", "closed", self.trace_ctx, "record_written={}", .{written});
         return written;
+    }
+
+    /// The turn stops before this request's send, between steps, for an
+    /// upgrade's restart: saves the clean record `closing` returns, as
+    /// SIGTERM does, so the next launch continues the request without
+    /// counting a death (`tests/tla/recovery/Resume.tla` Relaunch,
+    /// NoFalseCrashQuestion). Nothing replaces that record afterwards.
+    /// Returns whether it was written. Called on the request's own thread.
+    pub fn closeForYield(self: *RequestRecovery) bool {
+        return self.close();
     }
 
     /// Reports a failed send. Returns the send the module asks for at once,
@@ -1141,6 +1151,31 @@ test "closing saves a clean record that resumes without a death, and nothing rep
     // Ended requests are not closed.
     try std.testing.expectEqual(@as(usize, 0), RequestRecovery.closeActive());
 
+    var probe: recovery.State = .{};
+    const plan = recovery.step(&probe, .{ .start = .{ .resume_from = fake.recovery_record.? } }, 0);
+    try std.testing.expect(plan.send != null);
+    try std.testing.expectEqual(@as(u8, 0), probe.abrupt_deaths);
+}
+
+test "a yield saves a clean record that resumes without a death" {
+    var fake = recordingFake();
+    defer fake.deinit();
+    const deps = fake.deps();
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    {
+        var request = RequestRecovery.init(&deps, &cancel_flag, .{});
+        defer request.deinit();
+        _ = (try request.start(false, null)).?;
+        // The write before the send carries the send's record.
+        try std.testing.expect(request.sendRecord() == .save);
+        try std.testing.expect(request.closeForYield());
+        const saved = fake.recovery_record.?;
+        // Once closed, nothing writes over the clean record.
+        try std.testing.expect(!request.closeForYield());
+        try std.testing.expect(request.sendRecord() == .keep);
+        try std.testing.expectEqual(@as(usize, 0), RequestRecovery.closeActive());
+        try std.testing.expectEqual(saved, fake.recovery_record.?);
+    }
     var probe: recovery.State = .{};
     const plan = recovery.step(&probe, .{ .start = .{ .resume_from = fake.recovery_record.? } }, 0);
     try std.testing.expect(plan.send != null);

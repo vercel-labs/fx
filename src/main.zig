@@ -911,10 +911,31 @@ const App = struct {
         return AgentsAppRuntime.busiest(self);
     }
 
-    /// An agent other than the one on screen that an upgrade's restart
-    /// would stop. Its name may use `buf`.
-    pub fn busyAgentElsewhere(self: *App, buf: []u8) ?app_agents_runtime.BusyAgent {
-        return AgentsAppRuntime.busyAgentElsewhere(self, buf);
+    /// An agent other than the one on screen that waits for the user, which
+    /// an upgrade's restart must not stop. Its name may use `buf`.
+    pub fn needsUserElsewhere(self: *App, buf: []u8) ?app_agents_runtime.BusyAgent {
+        return AgentsAppRuntime.needsUserElsewhere(self, buf);
+    }
+
+    /// Asks the running turns of the main agent and other instances to stop
+    /// at their next step boundary, for an upgrade's restart. Subagents keep
+    /// working.
+    pub fn requestTurnYields(self: *App) void {
+        AgentsAppRuntime.requestYields(self);
+    }
+
+    /// Whether any agent's turn still runs, which an upgrade's restart waits for.
+    pub fn anyTurnRunning(self: *App) bool {
+        return AgentsAppRuntime.anyTurnRunning(self);
+    }
+
+    pub fn anySubagentWorking(self: *App) bool {
+        return AgentsAppRuntime.anySubagentWorking(self);
+    }
+
+    /// Logs the queued work fx drops as it exits for an upgrade's restart.
+    pub fn logHeldWorkForRestart(self: *App) void {
+        AgentsAppRuntime.logHeldWork(self);
     }
 
     /// `agent`'s turn needs the user: an approval or a question.
@@ -1531,6 +1552,10 @@ const App = struct {
     /// unfinished. `note` is what the model reads; the transcript shows a
     /// resume line instead of a user card.
     pub fn queueResumedRequest(self: *App, agent: *agents.Agent, note: []const u8, resumed: types.RecoveryResume) !bool {
+        // The turn's project instructions, as a prompt the user sends gets
+        // them (`enqueuePromptWithSkillBindings`): this runs in a fresh
+        // process, whose context snapshot is still empty.
+        try AgentAppRuntime.refreshProjectContext(self, agent);
         var queued = try self.snapshotPrompt(agent, note, &.{}, null, null, 0, false);
         errdefer releaseUnadmittedPrompt(agent, queued);
         queued.recovery_resume = resumed;
@@ -1541,6 +1566,33 @@ const App = struct {
             app_callbacks.Bindings(App).worker_tool_lifecycle_presenter(agent),
         );
         return true;
+    }
+
+    /// Queues the turn that continues one a previous fx process stopped
+    /// between steps for an upgrade's restart. It goes on from `checkpoint`
+    /// as the same turn, so the model reads no note; the transcript shows the
+    /// resume line instead of a user card. `resumed` lets the recovery module
+    /// ask first after two deaths or a day (`tests/tla/recovery/Resume.tla`).
+    pub fn queueYieldedTurn(
+        self: *App,
+        agent: *agents.Agent,
+        checkpoint: *const session_codec.RecoveryCheckpoint,
+        resumed: types.RecoveryResume,
+    ) !void {
+        // The same project instructions the turn sent before the restart, so
+        // the prompt before each signed thinking block is unchanged. This runs
+        // in a fresh process, whose context snapshot is still empty.
+        try AgentAppRuntime.refreshProjectContext(self, agent);
+        var queued = try self.snapshotPrompt(agent, checkpoint.user.text, &.{}, checkpoint, null, 0, false);
+        errdefer releaseUnadmittedPrompt(agent, queued);
+        queued.recovery_resume = resumed;
+        queued.continues_yielded_turn = true;
+        try agent.worker.enqueuePrompt(std.heap.c_allocator, queued);
+        WorkerAppRuntime.syncState(
+            self,
+            agent,
+            app_callbacks.Bindings(App).worker_tool_lifecycle_presenter(agent),
+        );
     }
 
     pub fn resumeSelectedSession(self: *App, agent: *agents.Agent) !bool {
@@ -2158,6 +2210,13 @@ const App = struct {
         // Until the worker takes it, a message still holds its place.
         var place_held = mail == .message;
         defer if (place_held) agent.worker.releaseAgentMessage();
+        // A new process has no project instructions until its first user
+        // turn; a report turn gathers them, so it sends the same ones.
+        // A failed read must not lose the report: the turn goes out
+        // without them, as before.
+        AgentAppRuntime.ensureProjectContext(self, agent) catch |err| {
+            debug_trace.logf("context", "message turn has no project instructions err={s}", .{@errorName(err)});
+        };
         var prompt = try self.snapshotPrompt(agent, text, &.{}, null, &.{}, debug_trace.nextTurnId(), false);
         var owned = true;
         defer if (owned) worker_runtime.freeQueuedPrompt(std.heap.c_allocator, prompt);
@@ -5410,6 +5469,7 @@ test {
     _ = @import("core/mcp_host/login_words.zig");
     _ = @import("core/mcp/tool_lookup.zig");
     _ = @import("core/recovery/recovery.zig");
+    _ = @import("core/quiesce/quiesce.zig");
     _ = @import("napi_fetch_state.zig");
     _ = @import("core/config/model_provider.zig");
     _ = @import("core/config/configured_provider.zig");
@@ -5725,7 +5785,7 @@ test "the busiest agent wins herdr's state: an approval over work, work over idl
     app.main_agent.worker.worker_processing = false;
 }
 
-test "an upgrade sees the agents its restart would stop, but not the one on screen" {
+test "an upgrade waits for agents that need the user, stops instances between steps, and lets subagents finish" {
     const alloc = std.testing.allocator;
     var app = App{ .alloc = alloc };
     defer app.shell.deinit(alloc);
@@ -5737,33 +5797,40 @@ test "an upgrade sees the agents its restart would stop, but not the one on scre
     const Busiest = app_agents_runtime.Busiest;
     var buf: [32]u8 = undefined;
     const reviewer = try addTestChildAgent(&app, "reviewer");
-    try std.testing.expect(runtime.busyAgentElsewhere(&app, &buf) == null);
+    const second = try addTestChildAgent(&app, "second");
+    second.agent.role = .instance;
+    try std.testing.expect(runtime.needsUserElsewhere(&app, &buf) == null);
+    try std.testing.expect(!runtime.anyTurnRunning(&app));
 
-    // Main is on screen, so the upgrade's own checks cover its turn.
+    // A working agent does not stop the upgrade: it stops between steps.
     app.main_agent.worker.worker_processing = true;
-    try std.testing.expect(runtime.busyAgentElsewhere(&app, &buf) == null);
+    try std.testing.expect(runtime.needsUserElsewhere(&app, &buf) == null);
+    try std.testing.expect(runtime.anyTurnRunning(&app));
     app.main_agent.worker.worker_processing = false;
-
     reviewer.agent.worker.worker_processing = true;
-    const working = runtime.busyAgentElsewhere(&app, &buf).?;
-    try std.testing.expectEqualStrings("reviewer", working.name);
-    try std.testing.expectEqual(Busiest.working, working.doing);
+    try std.testing.expect(runtime.anySubagentWorking(&app));
+    try std.testing.expect(runtime.needsUserElsewhere(&app, &buf) == null);
+    try std.testing.expect(runtime.anyTurnRunning(&app));
     reviewer.agent.worker.worker_processing = false;
+    try std.testing.expect(!runtime.anySubagentWorking(&app));
+    try std.testing.expect(!runtime.anyTurnRunning(&app));
 
+    // One that waits for the user does, by name.
     try std.testing.expect(try reviewer.agent.approval_prompt.syncRequest(alloc, .{ .label = "shell.run npm test" }));
-    try std.testing.expectEqual(Busiest.needs_approval, runtime.busyAgentElsewhere(&app, &buf).?.doing);
+    const waiting = runtime.needsUserElsewhere(&app, &buf).?;
+    try std.testing.expectEqualStrings("reviewer", waiting.name);
+    try std.testing.expectEqual(Busiest.needs_approval, waiting.doing);
+    // On its own screen, the upgrade's own checks cover it.
+    app.agent_on_screen = reviewer;
+    try std.testing.expect(runtime.needsUserElsewhere(&app, &buf) == null);
+    app.agent_on_screen = null;
     reviewer.agent.approval_prompt.clear(alloc);
 
-    // On the reviewer's screen, main's turn counts and the reviewer's own
-    // does not.
-    app.agent_on_screen = reviewer;
-    defer app.agent_on_screen = null;
-    reviewer.agent.worker.worker_processing = true;
-    try std.testing.expect(runtime.busyAgentElsewhere(&app, &buf) == null);
-    app.main_agent.worker.worker_processing = true;
-    try std.testing.expectEqualStrings("main", runtime.busyAgentElsewhere(&app, &buf).?.name);
-    app.main_agent.worker.worker_processing = false;
-    reviewer.agent.worker.worker_processing = false;
+    // A yield reaches main and the other instances, never a subagent.
+    runtime.requestYields(&app);
+    try std.testing.expect(app.main_agent.worker.yield_requested.load(.seq_cst));
+    try std.testing.expect(second.agent.worker.yield_requested.load(.seq_cst));
+    try std.testing.expect(!reviewer.agent.worker.yield_requested.load(.seq_cst));
 }
 
 /// How many session approvals `agent` has, read as a thread other than the

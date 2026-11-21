@@ -1077,6 +1077,9 @@ pub const Persistence = struct {
     /// The request the resumed session's newest turn left unfinished, which
     /// `startPendingResume` sends again once the worker runs.
     pending_request_resume: ?types.RecoveryResume = null,
+    /// The noted request's turn stopped between steps for an upgrade's
+    /// restart: `startPendingResume` continues it as the same turn.
+    pending_resume_yielded: bool = false,
     /// Plain `fx` checks, once its first frame is on screen, whether the
     /// session `fx -c` opens left a turn unfinished.
     interrupted_turn_hint_pending: bool = false,
@@ -1090,7 +1093,7 @@ pub const Persistence = struct {
     /// in a static release-binary template.
     pub fn initInto(storage: *Persistence) void {
         comptime {
-            if (@typeInfo(Persistence).@"struct".field_names.len != 36) {
+            if (@typeInfo(Persistence).@"struct".field_names.len != 37) {
                 @compileError("update Persistence.initInto for the changed field set");
             }
         }
@@ -1127,6 +1130,7 @@ pub const Persistence = struct {
         storage.pending_live_session_policy = null;
         storage.pending_live_session_wait = null;
         storage.pending_request_resume = null;
+        storage.pending_resume_yielded = false;
         storage.interrupted_turn_hint_pending = false;
         storage.shutdown_failure = null;
         storage.v2_store = null;

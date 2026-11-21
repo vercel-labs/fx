@@ -153,6 +153,14 @@ pub const resumed_request_notice: core_types.SemanticNotice = .{
     .body = "Resuming the interrupted request",
 };
 
+/// What the transcript shows, in place of `resumed_request_notice`, when a
+/// turn that stopped for an upgrade's restart goes on after it.
+pub const continued_turn_notice: core_types.SemanticNotice = .{
+    .topic = "upgrade",
+    .tone = .neutral,
+    .body = "continuing the turn after the upgrade",
+};
+
 pub fn projectSnapshotLocator(buffer: []u8, path: []const u8) ![]const u8 {
     if (!std.Io.Dir.path.isAbsolute(path)) return path;
     return std.mem.print(buffer, "images/{s}", .{std.Io.Dir.path.basename(path)});
@@ -1728,10 +1736,39 @@ pub const SessionRuntime = struct {
         };
     }
 
+    /// The newest turn, taken out of the history (`takeNewestTurn`), and
+    /// whether it was loaded without writer provenance.
+    pub const TakenTurn = struct {
+        turn: HistoryTurn,
+        unversioned: bool,
+    };
+
     pub fn clearHistory(self: *SessionRuntime, alloc: Allocator) void {
         self.disarmCacheWarming("history_cleared");
         self.agent.clearHistory(alloc);
         self.unversioned_history_len = 0;
+    }
+
+    /// Takes the newest turn out of the history, for a turn that continues
+    /// it in its place. The caller owns the turn: it frees it with
+    /// `freeHistoryTurn`, or gives it back with `returnNewestTurn`. Null when
+    /// the history is empty.
+    pub fn takeNewestTurn(self: *SessionRuntime) ?TakenTurn {
+        const turn = self.agent.history.pop() orelse return null;
+        const len = self.agent.history.items.len;
+        const unversioned = self.unversioned_history_len > len;
+        // The turn that takes its place is this process's own.
+        self.unversioned_history_len = @min(self.unversioned_history_len, len);
+        self.disarmCacheWarming("history_turn_taken");
+        return .{ .turn = turn, .unversioned = unversioned };
+    }
+
+    /// Puts back the turn `takeNewestTurn` took, when what was to continue
+    /// it could not start. Only right after the take: nothing may have been
+    /// appended since, so the history still has room for it.
+    pub fn returnNewestTurn(self: *SessionRuntime, taken: TakenTurn) void {
+        self.agent.history.appendAssumeCapacity(taken.turn);
+        if (taken.unversioned) self.unversioned_history_len = self.agent.history.items.len;
     }
 
     pub fn historyLen(self: *const SessionRuntime) usize {
@@ -5003,4 +5040,29 @@ test "a resume closed before it ran anything stays out of every later request" {
     var found_caveat = false;
     for (texts) |text| found_caveat = found_caveat or std.mem.eql(u8, text, resumed_request_prompt);
     try std.testing.expect(found_caveat);
+}
+
+test "the newest turn can be taken out and given back" {
+    const alloc = std.testing.allocator;
+    var runtime = SessionRuntime.init(8);
+    defer runtime.deinit(alloc);
+    try runtime.appendAssistantHistoryTurn(alloc, "first", "one");
+    try runtime.appendAssistantHistoryTurn(alloc, "second", "two");
+    runtime.unversioned_history_len = 2;
+
+    const taken = runtime.takeNewestTurn().?;
+    try std.testing.expectEqual(@as(usize, 1), runtime.historyLen());
+    try std.testing.expect(taken.unversioned);
+    try std.testing.expectEqual(@as(usize, 1), runtime.unversionedHistoryEnd());
+    try std.testing.expectEqualStrings("second", taken.turn.assistant.user.text);
+
+    runtime.returnNewestTurn(taken);
+    try std.testing.expectEqual(@as(usize, 2), runtime.historyLen());
+    try std.testing.expectEqual(@as(usize, 2), runtime.unversionedHistoryEnd());
+
+    const again = runtime.takeNewestTurn().?;
+    freeHistoryTurn(alloc, again.turn);
+    const first = runtime.takeNewestTurn().?;
+    freeHistoryTurn(alloc, first.turn);
+    try std.testing.expect(runtime.takeNewestTurn() == null);
 }

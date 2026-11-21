@@ -26,7 +26,7 @@ import { REPO_ROOT, TLA_ROOT, outDir, runTlc } from "../lib/tlc";
 type Model = Record<string, any>;
 type Edge = { to: string; label: string };
 type Graph = { states: Map<string, Model>; next: Map<string, Edge[]>; init: string };
-type Op = Record<string, unknown>;
+type Op = Record<string, unknown> & { continues?: boolean };
 type Result = {
   plan: { save: boolean; send: { compact: boolean; no_fast: boolean } | null; status: { kind: string; need: string | null } | null; finish: string | null } | null;
   state: { phase: string; need: string | null; attempt: number; deaths: number; clean: boolean; flowing: boolean };
@@ -39,7 +39,7 @@ type Walk = { steps: Step[] };
 const MaxAttempt = 3; // Recovery.tla MaxAttempt
 const Active = new Set(["working", "waiting", "need_user"]);
 // Steps after which the model has a send on the wire, when it has one.
-const Sends = new Set(["Init", "TimerFires", "SignInPoll", "UserActs", "Relaunch"]);
+const Sends = new Set(["Init", "TimerFires", "SignInPoll", "UserActs", "Relaunch", "Continue"]);
 
 function flag(name: string): boolean {
   return process.argv.includes(name);
@@ -150,6 +150,8 @@ function opsFor(label: string, s: Model): Op[] {
     case "Crash": return [{ op: "exit" }];
     case "Close": return [{ op: "event", name: "closing" }, { op: "exit" }];
     case "Relaunch": return [{ op: "start", resume: true }];
+    case "Yield": return [{ op: "event", name: "closing" }, { op: "exit" }];
+    case "Continue": return [{ op: "start", resume: true, continues: true }];
     case "UserCancels": return [{ op: "event", name: "user_cancel" }];
     case "UserActs": return [{ op: "event", name: "user_continue" }];
     case "NetDown": case "NetUp": case "GatewayBreak": case "GatewayHeal": case "NeedUserFault":
@@ -278,7 +280,7 @@ function check(walks: Walk[], graph: Graph, results: Result[], tamper: boolean):
       expect("send planned", Sends.has(step.label) && t.inflight, sent);
 
       // The status line, which a new process starts without.
-      if (step.label === "Init" || step.label === "Relaunch") shown = "clear";
+      if (step.label === "Init" || step.label === "Relaunch" || step.label === "Continue") shown = "clear";
       for (const result of own) if (result.plan?.status) shown = result.plan.status.kind;
       if (!t.alive) shown = "none";
       expect("status", t.status, shown);
@@ -297,7 +299,7 @@ function check(walks: Walk[], graph: Graph, results: Result[], tamper: boolean):
       expect("abrupt deaths", t.seenDeaths, Math.min(real.deaths, options.faults));
       // A relaunch that asks first asks about the crash loop, unless the
       // request was already waiting for the user.
-      if (step.label === "Relaunch" && t.phase === "need_user" && s.phase !== "need_user") {
+      if ((step.label === "Relaunch" || step.label === "Continue") && t.phase === "need_user" && s.phase !== "need_user") {
         expect("need", "crash_loop", real.need);
       }
     });
@@ -365,6 +367,11 @@ if (options.selfCheck) {
       name: "forgets its crashes when the user signs in",
       target: "if (state.need == .crash_loop) state.abrupt_deaths = 0;",
       planted: "state.abrupt_deaths = 0;",
+    },
+    {
+      name: "shows a turn it continues after a restart as a retry",
+      target: "    if (start.continues) return sendPlanned(state, now_ms);\n",
+      planted: "",
     },
   ];
   let mutantsCaught = true;

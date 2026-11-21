@@ -1692,7 +1692,7 @@ pub const Runtime = struct {
                     "A report or message arrived. It starts your next turn once this one ends, so end your turn to read it.",
                 .subagents = waited_for,
             }),
-            .nudged => self.encodeManaged(alloc, .{ .ok = true, .result = "A subagent's turn ended without a report. Call status to see where things stand, or wait again.", .subagents = waited_for }),
+            .nudged => self.encodeManaged(alloc, .{ .ok = true, .result = nudgedWaitResult(worker.yield_requested.load(.seq_cst)), .subagents = waited_for }),
             .stopped => error.Cancelled,
         };
     }
@@ -3027,6 +3027,24 @@ fn callTool(runtime: *Runtime, arena: Allocator, input: model_contract.RequestIn
         .caller_worker = worker,
     });
     return result.body;
+}
+
+/// What a `wait` that a nudge ended returns: a subagent's turn ended without
+/// a report, or fx asked the caller's turn to stop for an upgrade's restart
+/// while its subagents keep working (`WorkerRuntime.requestYield`).
+fn nudgedWaitResult(restarting: bool) []const u8 {
+    return if (restarting)
+        "fx is restarting for an upgrade, so this wait ends here. The subagents keep working, and their reports arrive after the restart."
+    else
+        "A subagent's turn ended without a report. Call status to see where things stand, or wait again.";
+}
+
+test "a wait that the upgrade's restart ends says the reports come after it" {
+    try std.testing.expect(std.mem.find(u8, nudgedWaitResult(true), "reports arrive after the restart") != null);
+    try std.testing.expectEqualStrings(
+        "A subagent's turn ended without a report. Call status to see where things stand, or wait again.",
+        nudgedWaitResult(false),
+    );
 }
 
 fn waitForRuns(fixture: *MailboxFixture, count: usize) !void {

@@ -14,6 +14,7 @@
 #   never-ask           a request that crashes fx resumes forever          CrashLoopAsks
 #   hot-retry           resending at once after a failure                  NoHotRetry
 #   send-without-save   a retry sent without saving the record first       SaveBeforeSend
+#   yield-retry-status  a continued turn shown as a retry ("attempt 2")    NoFalseAlarm
 #
 # RecoveryTimed.tla adds a discrete clock. recovery-timed.cfg must pass, and
 # each of its mutations plants one defect:
@@ -22,7 +23,8 @@
 #   frozen-countdown    the countdown stops changing every second          StatusFresh
 #   no-handoff          a retry status left over a model thinking quietly  HandsOff
 #
-# Resume.tla models the app around the module across process exits.
+# Resume.tla models the app around the module across process exits,
+# including the restart Ctrl+G makes for an upgrade.
 # resume.cfg and resume-deep.cfg are the design and must pass;
 # resume-today.cfg is fx before it, which leaves an interrupted request for
 # the user (AutoResumes). Each resume-mutation-*.cfg plants one defect:
@@ -35,6 +37,8 @@
 #   resume-cancelled    a turn the user cancelled sent again               CancelNeverResumes
 #   ignore-age          a day-old request sent again without asking        OldAsks
 #   no-lock             a second fx resuming a session another holds       OneWorker
+#   yield-unclean       an upgrade's restart saved as a death              NoFalseCrashQuestion
+#   yield-first         a turn stopped for a restart before it is logged   YieldContinues
 #
 # Needs Java 11+ and tla2tools.jar, as ../README.md describes.
 #
@@ -54,6 +58,7 @@ Recovery recovery-deep -
 Recovery recovery-mutation-stall-stop NeverGivesUp
 Recovery recovery-mutation-no-wake temporal
 Recovery recovery-mutation-stale-socket NoFalseAlarm
+Recovery recovery-mutation-yield-retry-status NoFalseAlarm
 Recovery recovery-mutation-frozen-status StatusHonest
 Recovery recovery-mutation-no-closing ResumesAfterClose
 Recovery recovery-mutation-never-ask CrashLoopAsks
@@ -78,4 +83,6 @@ Resume resume-mutation-resume-answered DoneNeverResent
 Resume resume-mutation-resume-cancelled CancelNeverResumes
 Resume resume-mutation-ignore-age OldAsks
 Resume resume-mutation-no-lock OneWorker
+Resume resume-mutation-yield-unclean NoFalseCrashQuestion
+Resume resume-mutation-yield-first YieldContinues
 EOF

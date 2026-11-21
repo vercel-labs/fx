@@ -1208,6 +1208,16 @@ pub fn Runtime(comptime App: type) type {
             }
         }
 
+        /// Gathers the project context only when the agent has none yet,
+        /// as for a subagent's report that starts the first turn after a
+        /// relaunch or a resume. In a running session the turn keeps the
+        /// instructions of the last user turn, so a report never changes
+        /// the prompt before earlier signed thinking blocks.
+        pub fn ensureProjectContext(app: *App, agent: *AppAgent) context_contract.ProviderError!void {
+            if (agent.context_snapshot.contribution != null) return;
+            try refreshProjectContext(app, agent);
+        }
+
         pub fn fetchModelIds(
             app: *App,
             provider: model_catalog.Provider,
@@ -1733,6 +1743,7 @@ pub fn Runtime(comptime App: type) type {
                 .cancel_flag = &agent.worker.worker_cancel_requested,
                 .recovery_continue_flag = &agent.worker.recovery_continue_requested,
                 .recovery_sign_in_closed_flag = &agent.worker.recovery_sign_in_closed,
+                .yield_flag = &agent.worker.yield_requested,
                 .review_enabled = false,
                 .fast_mode = job.agent_settings.fast_mode,
                 .ultrafast_mode = job.agent_settings.ultrafast_mode,
@@ -3139,6 +3150,31 @@ test "app agent runtime refreshes enabled project context through registry" {
     try std.testing.expectEqualStrings("fresh context notice", app.context_notices.items);
     try std.testing.expectEqual(types.NoticeTone.warning, app.context_notice_tone.?);
     try std.testing.expectEqual(types.NoticeVisibility.full_only, app.context_notice_visibility.?);
+}
+
+test "app agent runtime gathers project context for a report turn only when it has none" {
+    const alloc = std.testing.allocator;
+    refresh_gather_calls = 0;
+    var app = RefreshContextApp{
+        .alloc = alloc,
+        .context_enabled = true,
+        .context_registry = fresh_context_registry,
+        .main_agent = .{ .context_snapshot = try makeTestContextSnapshot(alloc, "test.kept_context", "kept context") },
+    };
+    defer app.deinit();
+
+    // A running session keeps the instructions of its last user turn.
+    try Runtime(RefreshContextApp).ensureProjectContext(&app, (&app).agent());
+    try std.testing.expectEqual(@as(usize, 0), refresh_gather_calls);
+    const kept = app.agent().context_snapshot.contribution orelse return error.TestExpectedEqual;
+    try std.testing.expectEqualStrings("kept context", kept.content);
+
+    // A new process has none yet, so the turn gathers them.
+    app.agent().context_snapshot.deinit(alloc);
+    try Runtime(RefreshContextApp).ensureProjectContext(&app, (&app).agent());
+    try std.testing.expectEqual(@as(usize, 1), refresh_gather_calls);
+    const gathered = app.agent().context_snapshot.contribution orelse return error.TestExpectedEqual;
+    try std.testing.expectEqualStrings("fresh:/tmp/workspace", gathered.content);
 }
 
 const TestHostWorkspace = struct {

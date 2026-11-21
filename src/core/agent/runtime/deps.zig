@@ -276,6 +276,11 @@ pub const AgentRuntimeDeps = struct {
     /// pieces on disk yet. Null on hosts that never resume a request, which
     /// keep no record.
     save_recovery_record: ?*const fn (ctx: *anyopaque, record: types.RecoveryRecordWrite) anyerror!bool = null,
+    /// Marks the open turn as one that stopped between steps for its host,
+    /// after its record was saved clean, so the next launch continues it as
+    /// the same turn (`tests/tla/recovery/Resume.tla` Relaunch). Null on
+    /// hosts that never stop a turn this way.
+    mark_turn_yielded: ?*const fn (ctx: *anyopaque) anyerror!void = null,
     /// Called once with each main-model completion's provider usage, as soon
     /// as it arrives, so a saved session keeps the usage of every reply even
     /// when the turn never ends. A failure is traced and never fails the turn.
