@@ -3008,6 +3008,42 @@ test "capture store: dirty worktree matches the user's git, restores byte for by
     try testing.expectEqualStrings(before, try repos.userState(repo));
 }
 
+test "capture store: an untracked package folder past the file limit leaves the user's own new files in the tree" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const repos = try TestRepos.init(arena_state.allocator(), tmp.dir);
+    defer repos.deinit();
+    // A new project that installed packages before it had a `.gitignore`.
+    try repos.initRepo("repo");
+    try repos.write("repo/README.md", "readme\n");
+    _ = try repos.gitIn("repo", &.{ "add", "-A" });
+    try repos.commit("repo", "base");
+    var file: usize = 0;
+    while (file < 5) : (file += 1) {
+        try repos.write(try repos.arena.print("repo/node_modules/pkg/f{d}.js", .{file}), "module.exports = 1;\n");
+    }
+    try repos.write("repo/package.json", "{}\n");
+    try repos.write("repo/src/index.ts", "export {};\n");
+    const repo = try repos.repository("repo");
+
+    const outcome = try capture(repos.arena, repos.request(repo, "s", .{ .untracked_count = 4 }));
+    const tree = try expectStored(outcome);
+    try testing.expectEqual(Status.partial, outcome.status);
+    try testing.expectEqual(policy.Reason.file_limit, outcome.reason.?);
+    try testing.expectEqualStrings("{}", try repos.storedFile(repo, tree, "package.json"));
+    try testing.expectEqualStrings("export {};", try repos.storedFile(repo, tree, "src/index.ts"));
+    try testing.expect(try repos.treeHas(repo, tree, "README.md"));
+    // The two places left go to the package folder, in path order.
+    try testing.expect(try repos.treeHas(repo, tree, "node_modules/pkg/f0.js"));
+    try testing.expect(try repos.treeHas(repo, tree, "node_modules/pkg/f1.js"));
+    for ([_][]const u8{ "node_modules/pkg/f2.js", "node_modules/pkg/f3.js", "node_modules/pkg/f4.js" }) |path| {
+        try testing.expect(!try repos.treeHas(repo, tree, path));
+        try expectExcluded(outcome, path, .file_limit);
+    }
+}
+
 test "capture store: successive captures chain on the session ref and follow the worktree" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
