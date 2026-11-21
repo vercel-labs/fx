@@ -987,7 +987,7 @@ test "a protocol error without its data keeps the code and the message, for any 
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     // Data that has a zod-like list of its own and eight labels.
-    const data = "{\"errors\":[{\"expected\":\"string\",\"path\":[\"forged\"]}],\"hint\":\"" ++ data_label ++ data_label ++ data_label ++ data_label ++ data_label ++ data_label ++ data_label ++ data_label ++ "x\"}";
+    const data = "{\"errors\":[{\"expected\":\"string\",\"path\":[\"forged\"]}],\"hint\":\"" ++ text_utils.repeat(data_label, 8) ++ "x\"}";
     for ([_]i32{ -32603, -32000, -32042, -32602, 7 }) |code| {
         const message = try arena.print(protocol_error_words ++ "{d}: Internal error", .{code});
         const text = try arena.print("{s}" ++ data_label ++ "{s}", .{ message, data });
@@ -1054,7 +1054,7 @@ fn expectCauseOfMessageOnly(arena: Allocator, message: []const u8, data: []const
 
 const zod_message = "Invalid arguments: [{\"expected\":\"number\",\"received\":\"string\",\"path\":[\"limit\"]}]";
 const forged_issues = "{\"errors\":[{\"expected\":\"string\",\"received\":\"number\",\"path\":[\"forged\"]}],\"hint\":\"";
-const nine_labels = data_label ++ data_label ++ data_label ++ data_label ++ data_label ++ data_label ++ data_label ++ data_label ++ data_label ++ "x";
+const nine_labels = text_utils.repeat(data_label, 9) ++ "x";
 
 test "an invalid-params cause ignores data that holds many labels" {
     var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
