@@ -6,7 +6,7 @@ import { chmodSync, existsSync, mkdirSync, readFileSync, realpathSync, symlinkSy
 import { writeChatGptLogin, writeGrokLogin } from "./usage-fakes";
 import { createConfiguredProviderFixture } from "./fixtures/chat-completions";
 import { join } from "node:path";
-import { cleanupIsolatedTestHome, createIsolatedTestHome, FX_BIN } from "../evals/eval-helpers";
+import { cleanupIsolatedTestHome, createIsolatedTestHome, FX_BIN, providerVersionTestEnv } from "../evals/eval-helpers";
 import { TmuxSession, tmuxAvailable } from "./tmux-helpers";
 
 const MODEL = "fake/doctor-model";
@@ -65,9 +65,6 @@ function env(r: Root, extra: Record<string, string | undefined> = {}): Record<st
     FX_SOUND: "0",
     FX_DISABLE_KEYCHAIN: "1",
     FX_MODEL: MODEL,
-    // Fixed client versions, so a ChatGPT or Grok check never looks up a release on the network.
-    FX_TEST_CODEX_CLIENT_VERSION: "0.153.0",
-    FX_TEST_GROK_CLIENT_VERSION: "1.0.6",
     ...extra,
   };
   return Object.fromEntries(Object.entries(merged).filter(([, v]) => v !== undefined)) as Record<string, string>;
@@ -91,7 +88,7 @@ function problemsWithoutFix(stdout: string): string[] {
 
 async function doctor(r: Root, environment: Record<string, string>, args: string[] = [], cwd = r.workspace) {
   const started = performance.now();
-  const proc = Bun.spawn([FX_BIN, "doctor", ...args], { env: environment, cwd, stdout: "pipe", stderr: "pipe" });
+  const proc = Bun.spawn([FX_BIN, "doctor", ...args], { env: providerVersionTestEnv(environment), cwd, stdout: "pipe", stderr: "pipe" });
   const killer = setTimeout(() => proc.kill("SIGKILL"), 30_000);
   const [stdout, stderr, code] = await Promise.all([
     new Response(proc.stdout).text(),
