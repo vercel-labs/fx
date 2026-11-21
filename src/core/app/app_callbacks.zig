@@ -376,6 +376,7 @@ pub fn Bindings(comptime App: type) type {
                 .push_context_notice = agentPushContextNotice,
                 .push_session_notice = agentPushSessionNotice,
                 .push_route_recovery_status = agentPushRouteRecoveryStatus,
+                .save_route_recovery_status = agentSaveRouteRecoveryStatus,
                 .restore_failed_prompt = agentRestoreFailedPrompt,
                 .push_command_output_complete = agentPushCommandOutputComplete,
                 .push_http_error = agentPushHttpError,
@@ -1436,6 +1437,12 @@ pub fn Bindings(comptime App: type) type {
             const agent: *AppAgent = @ptrCast(@alignCast(ctx));
             const app = appOf(agent);
             try app_worker_runtime.Runtime(App).pushEvent(app, agent, .{ .route_recovery_status = status });
+        }
+
+        fn agentSaveRouteRecoveryStatus(ctx: *anyopaque, status: types.RouteRecoveryStatus) !void {
+            if (comptime !agents.hasAgentField(App, "session_persistence")) return;
+            const agent: *AppAgent = @ptrCast(@alignCast(ctx));
+            try app_session_runtime.Runtime(App).saveModelRecovery(agent, status);
         }
 
         fn agentRestoreFailedPrompt(ctx: *anyopaque, prompt: []const u8) !void {

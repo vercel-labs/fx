@@ -7403,6 +7403,82 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     }
   }, 45_000);
 
+  test("a subagent's retried model request leaves its recovery timeline in the child's own log", async () => {
+    const root = createFixtureRoot("usage-subagent-recovery");
+    const finish = (unified: string, input: number, cacheRead: number, output: number) => ({
+      type: "finish",
+      finishReason: { unified, raw: unified },
+      usage: { inputTokens: { total: input, cacheRead }, outputTokens: { total: output } },
+    });
+    // The child's requests are the ones whose tools lack `subagent`. Its first
+    // fails with a 503, and its retry gets the reply.
+    let childRequests = 0;
+    const gateway = startDynamicFakeGateway((body) => {
+      if (!body.includes('"name":"subagent"')) {
+        childRequests += 1;
+        if (childRequests === 1) return unavailableResponse("1");
+        return fakeGatewaySse([{ type: "text-delta", id: "child_answer", delta: "CHILD_DONE" }, finish("stop", 7000, 700, 70)]);
+      }
+      // The child's report reaches the parent as a turn of its own, or joins
+      // the turn that is still running, so the reply that carries it ends the
+      // run either way.
+      if (body.includes("Subagent report")) {
+        return fakeGatewaySse([{ type: "text-delta", id: "parent_answer", delta: "PARENT_DONE" }, finish("stop", 200, 20, 2)]);
+      }
+      if (hasCurrentToolResult(body, "usage_child")) {
+        return fakeGatewaySse([{ type: "text-delta", id: "parent_wait", delta: "PARENT_WAITING" }, finish("stop", 0, 0, 0)]);
+      }
+      return fakeGatewaySse([
+        { type: "tool-call", toolCallId: "usage_child", toolName: "subagent", input: { request: { action: "message", agent: "usage", message: "Reply CHILD_DONE." } } },
+        finish("tool-calls", 100, 10, 1),
+      ]);
+    }, {
+      classifierDecision: "clear",
+      models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
+    });
+
+    try {
+      const result = await runFx(["ask", "--yolo", "--json", "--", "Delegate the usage task."], {
+        cwd: root.workspace,
+        env: fixtureEnv(root, gateway, join(root.root, "trace.log")),
+        timeoutMs: 30_000,
+      });
+      expect(result.code).toBe(0);
+      expect(parseAskJson(result.stdout).final_output).toBe("PARENT_DONE");
+      const [parent] = rootSessionIds(root.home);
+      const children = savedSessionIds(root.home).filter((id) => id !== parent);
+      expect(children.length).toBe(1);
+
+      // The child's log: waiting, then its retry, then the recovered outcome,
+      // all inside its turn.
+      const childLines = logLines(root.home, children[0]!) as Array<any>;
+      const started = childLines.find((line) => line.kind === "turn_started");
+      const committed = childLines.find((line) => line.kind === "turn_committed");
+      const timeline = childLines
+        .filter((line) => line.kind === "item" && line.type === "model_recovery")
+        .map((line) => ({
+          seq: line.seq as number,
+          status: typeof line.data === "string" ? JSON.parse(line.data) : line.data,
+        }));
+      expect(timeline.map((entry) => entry.status.state)).toEqual(["waiting", "retrying", "recovered"]);
+      expect(timeline.map((entry) => entry.status.attempt)).toEqual([1, 2, 2]);
+      for (const entry of timeline) {
+        expect(entry.status.cause).toBe("server");
+        expect(entry.seq).toBeGreaterThan(started!.seq);
+        expect(entry.seq).toBeLessThan(committed!.seq);
+      }
+      for (const entry of timeline.slice(0, -1)) expect(typeof entry.status.message).toBe("string");
+      expect(timeline.at(-1)!.status).not.toHaveProperty("message");
+
+      // The parent's requests never failed, so its own log has no recovery item.
+      const parentLines = logLines(root.home, parent!) as Array<any>;
+      expect(parentLines.filter((line) => line.kind === "item" && line.type === "model_recovery")).toEqual([]);
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 45_000);
+
   // `usage` in fx ask's JSON is the run's, not its last turn's: the turn that
   // sends work and the turn its report starts both count. The gateway holds
   // the subagent's reply until main's first turn has ended, so the report
@@ -13267,6 +13343,65 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       expect(result.stderr).toMatch(/^\[notice\] Gateway error · retrying · attempt 13$/m);
       // No attempt count is ever shown as a fraction of a limit.
       expect(result.stderr).not.toMatch(/attempt \d+\//);
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test("a retried model request leaves its recovery timeline in the session log", async () => {
+    const root = createFixtureRoot("recovery-timeline");
+    const tracePath = join(root.root, "trace.log");
+    const responses = [
+      unavailableResponse("1"),
+      unavailableResponse("1"),
+      fakeGatewayFinalText("Recovered with a timeline."),
+    ];
+    const gateway = startGateway(() =>
+      responses.shift() ?? new Response("unexpected request", { status: 500 })
+    );
+    try {
+      const result = await runFx(
+        ["ask", "--json", "--auto", "Recover with a timeline."],
+        {
+          cwd: root.workspace,
+          env: fixtureEnv(root, gateway, tracePath),
+          timeoutMs: 20_000,
+        },
+      );
+      const json = parseAskJson(result.stdout);
+
+      expect(result.code).toBe(0);
+      expect(json.output).toBe("Recovered with a timeline.");
+      expect(json.recovery).toEqual({ state: "recovered", attempt: 3, cause: "server" });
+
+      // One `model_recovery` item per change of state, inside the open turn.
+      const lines = logLines(root.home, onlySessionId(root.home)) as Array<any>;
+      const started = lines.find((line) => line.kind === "turn_started");
+      const committed = lines.find((line) => line.kind === "turn_committed");
+      const timeline = lines
+        .filter((line) => line.kind === "item" && line.type === "model_recovery")
+        .map((line) => ({
+          seq: line.seq as number,
+          status: typeof line.data === "string" ? JSON.parse(line.data) : line.data,
+        }));
+      expect(timeline.map((entry) => entry.status.state)).toEqual([
+        "waiting",
+        "retrying",
+        "waiting",
+        "retrying",
+        "recovered",
+      ]);
+      expect(timeline.map((entry) => entry.status.attempt)).toEqual([1, 2, 2, 3, 3]);
+      for (const entry of timeline) {
+        expect(entry.status.cause).toBe("server");
+        expect(entry.seq).toBeGreaterThan(started!.seq);
+        expect(entry.seq).toBeLessThan(committed!.seq);
+      }
+      // Waits and retries carry fx's status text. The recovered status has none.
+      for (const entry of timeline.slice(0, -1)) expect(typeof entry.status.message).toBe("string");
+      expect(timeline.at(-1)!.status).not.toHaveProperty("message");
+      expect(timeline.at(-1)!.status).toEqual(json.recovery);
     } finally {
       gateway.stop();
       rmSync(root.root, { recursive: true, force: true });
