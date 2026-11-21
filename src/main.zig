@@ -33,6 +33,7 @@ const input_full_transcript_runtime = @import("core/app/input_full_transcript_ru
 const input_submit_runtime = @import("core/app/input_submit_runtime.zig");
 const core_input_runtime = @import("core/input/runtime.zig");
 const app_bootstrap_runtime = @import("core/app/app_bootstrap_runtime.zig");
+const sandbox_policy = @import("core/sandbox/policy.zig");
 const app_notification_runtime = @import("core/app/app_notification_runtime.zig");
 const app_permission_runtime = @import("core/app/app_permission_runtime.zig");
 const app_process_runtime = @import("core/app/app_process_runtime.zig");
@@ -618,6 +619,10 @@ const App = struct {
     /// `app_agents_runtime`.
     child_handoffs: app_agents_runtime.Handoffs = .{},
     shell: TranscriptRuntime = .{},
+    /// The sandbox policy for shell commands, loaded at startup when
+    /// `experimental.sandbox_execution` is on. Null when it is off, or when the
+    /// load ran out of memory. Destroyed at teardown, after the agents.
+    sandbox_policy: ?*sandbox_policy.Policy = null,
     pacer: assistant_pacer.AssistantPacer = .{},
 
     terminal_client: terminal_client_runtime.Runtime = .{},
@@ -1112,6 +1117,9 @@ const App = struct {
         self.terminal_input_runtime.deinit(self.alloc);
         self.shell.deinit(self.alloc);
         AgentsAppRuntime.deinitChildren(self);
+        // Every agent and worker that could place a command has ended, so the policy can go.
+        if (self.sandbox_policy) |loaded| loaded.destroy();
+        self.sandbox_policy = null;
         self.instances.deinit(self.alloc);
         self.pacer.deinit(self.alloc);
         main_agent.session_title.deinit(self.alloc);
@@ -5562,6 +5570,9 @@ test {
     _ = @import("core/shell_command/command_effect.zig");
     _ = @import("core/shell_command/safe_git.zig");
     _ = @import("core/execution/router.zig");
+    _ = @import("core/sandbox/config.zig");
+    _ = @import("core/sandbox/launch.zig");
+    _ = @import("core/sandbox/policy.zig");
     _ = @import("core/execution/command_runner.zig");
     _ = @import("core/permissions/direct_command.zig");
     _ = @import("core/permissions/auto_classifier.zig");
@@ -5622,6 +5633,7 @@ test {
     _ = @import("core/app/input_approval_runtime.zig");
     _ = @import("acp/sessions.zig");
     _ = @import("core/shared/text_utils.zig");
+    _ = @import("core/shared/wildcard.zig");
     _ = @import("core/shared/testing_listener.zig");
     _ = @import("core/tooling/tool_projection.zig");
     _ = @import("core/tooling/tool_dispatch.zig");

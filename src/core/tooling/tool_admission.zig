@@ -27,6 +27,7 @@ const tool_args = @import("tool_args.zig");
 const tool_dispatch = @import("tool_dispatch.zig");
 const tool_mcp_runtime = @import("tool_mcp_runtime.zig");
 const tool_presentation = @import("tool_presentation.zig");
+const sandbox_policy = @import("../sandbox/policy.zig");
 const test_builtin_tools = if (builtin.is_test)
     @import("../../builtins/tools.zig")
 else
@@ -86,6 +87,9 @@ pub const Input = struct {
     auto_classifier: permission_auto_classifier.Classifier = .disabled(),
     terminal_review_context: ?terminal_managed_observer.Context = null,
     host_sandbox_default: HostSandboxDefault = .none,
+    /// The sandbox policy for shell commands. Null when sandbox execution is
+    /// off, and then every command runs here, as before.
+    sandbox_policy: ?*const sandbox_policy.Policy = null,
 };
 
 fn registeredTool(input: Input, name: []const u8) ?*const tool_dispatch.Tool {
@@ -1491,6 +1495,10 @@ fn requestPermissionOutcomeResolved(
     }
     const is_mcp_tool = isAvailableDynamicTool(input, call.name);
     const command_call = try isRunCommandCall(input, arena, call);
+    // A refusal comes before any permission step, so nothing is asked and nothing runs.
+    if (command_call) {
+        if (try commandCallRefusal(input, arena, call)) |text| return .{ .tool_failure = text };
+    }
     if (!toolHasPermissionContract(input, call.name) and
         !is_mcp_tool and
         !command_call)
@@ -2332,13 +2340,130 @@ pub fn runCommandContext(
         .workspace_clean => .workspace_clean,
         .native => try nativeCommandEnvironment(arena, args, execution_mode),
     };
+    const placed = try placeShellCommand(
+        input.sandbox_policy,
+        arena,
+        input.workspace_root,
+        command,
+        tool.captured_command_host == .native,
+    );
     return .{
         .command = command,
         .resolved_cwd = cwd,
         .target_os = builtin.target.os.tag,
         .environment = environment_value,
         .execution_mode = execution_mode,
+        .placement = placed.placement,
+        .placement_profile = placed.profile,
+        .sandbox = placed.launch,
     };
+}
+
+pub const PlaceError = sandbox_policy.PlaceError;
+
+/// Every refusal fx gives a shell run before it starts begins with this text.
+pub const refusal_prefix = "fx did not run this command: ";
+
+/// The refusal for a placed run whose approved placement changed before it started.
+pub const placement_changed_refusal = refusal_prefix ++
+    "its sandbox placement changed after it was approved. Request it again.";
+
+const tty_sandbox_reason = "a tty=true command cannot run in a sandbox. Run it without tty, or change the rule in ~/.fx/sandbox/config.json.";
+const invalid_config_suffix = " Fix ~/.fx/sandbox/config.json, or turn off experimental.sandbox_execution.";
+
+/// Where a shell command runs. Without a policy, and for a host that runs its
+/// own commands (`native` false), the command runs here.
+pub fn placeShellCommand(
+    sandbox: ?*const sandbox_policy.Policy,
+    arena: Allocator,
+    workspace_root: []const u8,
+    command: []const u8,
+    native: bool,
+) sandbox_policy.PlaceError!sandbox_policy.Placed {
+    if (!native) return .{ .placement = .local };
+    const active = sandbox orelse return .{ .placement = .local };
+    return active.place(arena, workspace_root, command);
+}
+
+/// The refusal text for a shell run that fx must not start, or null when it may
+/// start. `tty` is whether the call asks for a terminal, and `native` is whether
+/// this host runs the command itself.
+pub fn shellRunRefusal(
+    arena: Allocator,
+    sandbox: ?*const sandbox_policy.Policy,
+    workspace_root: []const u8,
+    command: []const u8,
+    tty: bool,
+    native: bool,
+) Allocator.Error!?[]const u8 {
+    const active = sandbox orelse return null;
+    const placed = placeShellCommand(sandbox, arena, workspace_root, command, native) catch |err| {
+        return try placeErrorText(arena, active, err, tty);
+    };
+    if (tty and placed.placement != .local) return refusal_prefix ++ tty_sandbox_reason;
+    return null;
+}
+
+/// The refusal text for a placement error from `sandbox`. A terminal cannot
+/// run in a sandbox, so a tty command that cannot be placed gets that reason.
+pub fn placeErrorText(
+    arena: Allocator,
+    sandbox: *const sandbox_policy.Policy,
+    err: sandbox_policy.PlaceError,
+    tty: bool,
+) Allocator.Error![]const u8 {
+    switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.SandboxConfigInvalid => return try arena.print(
+            "{s}{s}{s}",
+            .{ refusal_prefix, sandbox.message(), invalid_config_suffix },
+        ),
+        error.SandboxProviderUnavailable => {
+            if (tty) return refusal_prefix ++ tty_sandbox_reason;
+            return try arena.print(
+                "{s}the sandbox provider cannot be used: {s}",
+                .{ refusal_prefix, sandbox.message() },
+            );
+        },
+    }
+}
+
+/// The command as admission approved it, with the placement and launch that
+/// the policy gives it now. Null when they differ from the approved fingerprint,
+/// so the caller must refuse the run instead of starting it.
+pub fn placementAsApproved(
+    sandbox: ?*const sandbox_policy.Policy,
+    arena: Allocator,
+    workspace_root: []const u8,
+    approved: command_admission.AdmissionFingerprint,
+    command_ctx: command_admission.CommandContext,
+    native: bool,
+) sandbox_policy.PlaceError!?command_admission.CommandContext {
+    const placed = try placeShellCommand(sandbox, arena, workspace_root, command_ctx.command, native);
+    var placed_ctx = command_ctx;
+    placed_ctx.placement = placed.placement;
+    placed_ctx.placement_profile = placed.profile;
+    placed_ctx.sandbox = placed.launch;
+    if (!approved.matches(placed_ctx)) return null;
+    return placed_ctx;
+}
+
+/// Refuses a shell run that fx must not start: a tty run in a sandbox, or any run
+/// while the sandbox config is invalid or its provider cannot run.
+fn commandCallRefusal(input: Input, arena: Allocator, call: ToolCall) !?[]const u8 {
+    const active = input.sandbox_policy orelse return null;
+    const tool = registeredTool(input, call.name) orelse return null;
+    const args = try tool_args.parseToolArgsObject(arena, call.arguments_json);
+    const command = try tool_args.requiredStringArg(args, "command");
+    const tty = tool_args.optionalBoolArg(args, "tty") orelse false;
+    return shellRunRefusal(
+        arena,
+        active,
+        input.workspace_root,
+        command,
+        tty,
+        tool.captured_command_host == .native,
+    );
 }
 
 fn nativeCommandEnvironment(
@@ -2382,6 +2507,30 @@ fn explicitTtyShell(
     } };
 }
 
+/// The command identity in a session permission key. A local command keeps
+/// the key it had before placements existed, so saved session rules still
+/// match it. The placement is the outermost prefix.
+fn commandStateIdentity(
+    arena: Allocator,
+    command: command_admission.CommandContext,
+) ![]const u8 {
+    const identity = switch (command.execution_mode) {
+        .captured => command.command,
+        .tty => try command_environment.ttyPermissionCommandIdentity(
+            arena,
+            command.environment,
+            command.command,
+        ),
+    };
+    if (command.placement == .local) return identity;
+    return command_environment.placementPermissionCommandIdentity(
+        arena,
+        command.placement,
+        command.placement_profile,
+        identity,
+    );
+}
+
 pub fn permissionStateKeyForCall(
     input: Input,
     arena: Allocator,
@@ -2392,14 +2541,7 @@ pub fn permissionStateKeyForCall(
     }
     if (try isRunCommandCall(input, arena, call)) {
         const command = try runCommandContext(input, arena, call);
-        const command_identity = switch (command.execution_mode) {
-            .captured => command.command,
-            .tty => try command_environment.ttyPermissionCommandIdentity(
-                arena,
-                command.environment,
-                command.command,
-            ),
-        };
+        const command_identity = try commandStateIdentity(arena, command);
         return session_permission_state.commandKeyV2(
             arena,
             command_identity,
@@ -2431,18 +2573,27 @@ fn commandPermissionIdentityForContext(
     arena: Allocator,
     command: command_admission.CommandContext,
 ) ![]const u8 {
-    return switch (command.execution_mode) {
-        .captured => command_environment.permissionCommandIdentity(
+    const identity = switch (command.execution_mode) {
+        .captured => try command_environment.permissionCommandIdentity(
             arena,
             command.environment,
             command.command,
         ),
-        .tty => command_environment.ttyPermissionCommandIdentity(
+        .tty => try command_environment.ttyPermissionCommandIdentity(
             arena,
             command.environment,
             command.command,
         ),
     };
+    // The placement is the outermost prefix, so
+    // `commandFromPermissionIdentity` strips it first.
+    if (command.placement == .local) return identity;
+    return command_environment.placementPermissionCommandIdentity(
+        arena,
+        command.placement,
+        command.placement_profile,
+        identity,
+    );
 }
 
 pub const PreparedPermissionStateAction = struct {
@@ -6875,4 +7026,271 @@ test "automatic trusted-root overwrite preserves configured read disclosure revi
 
     try std.testing.expectEqual(@as(usize, 1), fake.calls);
     try std.testing.expectEqual(ToolPermissionDecision.once, outcome.decision);
+}
+
+test "command grant identity wraps the placement outermost" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const local: command_admission.CommandContext = .{ .command = "zig build test", .resolved_cwd = "/repo", .target_os = .linux };
+    try std.testing.expectEqualStrings("zig build test", try commandPermissionIdentityForContext(arena, local));
+
+    var workspace = local;
+    workspace.placement = .workspace;
+    const workspace_identity = try commandPermissionIdentityForContext(arena, workspace);
+    try std.testing.expect(std.mem.startsWith(u8, workspace_identity, "@fx-placement:workspace:"));
+    try std.testing.expectEqualStrings("zig build test", command_environment.commandFromPermissionIdentity(workspace_identity));
+
+    var tty_isolated = local;
+    tty_isolated.execution_mode = .tty;
+    tty_isolated.placement = .isolated;
+    tty_isolated.placement_profile = "media";
+    const tty_identity = try commandPermissionIdentityForContext(arena, tty_isolated);
+    try std.testing.expect(std.mem.startsWith(u8, tty_identity, "@fx-placement:isolated/media:@fx-shell-mode:tty:"));
+    try std.testing.expectEqualStrings("zig build test", command_environment.commandFromPermissionIdentity(tty_identity));
+}
+
+test "session command keys keep local keys and bind sandbox placements" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const local: command_admission.CommandContext = .{ .command = "zig build test", .resolved_cwd = "/repo", .target_os = .linux };
+    try std.testing.expectEqualStrings("zig build test", try commandStateIdentity(arena, local));
+
+    var local_tty = local;
+    local_tty.execution_mode = .tty;
+    local_tty.environment = .{ .clean = "/bin/zsh" };
+    try std.testing.expectEqualStrings(
+        try command_environment.ttyPermissionCommandIdentity(arena, local_tty.environment, local_tty.command),
+        try commandStateIdentity(arena, local_tty),
+    );
+
+    var workspace = local;
+    workspace.placement = .workspace;
+    try std.testing.expectEqualStrings("@fx-placement:workspace:zig build test", try commandStateIdentity(arena, workspace));
+
+    var isolated_tty = local_tty;
+    isolated_tty.placement = .isolated;
+    isolated_tty.placement_profile = "media";
+    try std.testing.expect(std.mem.startsWith(
+        u8,
+        try commandStateIdentity(arena, isolated_tty),
+        "@fx-placement:isolated/media:@fx-shell-mode:tty:",
+    ));
+
+    var isolated_captured = local;
+    isolated_captured.placement = .isolated;
+    isolated_captured.placement_profile = "media";
+    try std.testing.expectEqualStrings("@fx-placement:isolated/media:zig build test", try commandStateIdentity(arena, isolated_captured));
+}
+
+/// Creates the test fx home under `dir` and returns its absolute path. With
+/// `provider_ready`, the home holds an executable provider named `fake-cli`.
+fn sandboxTestHome(arena: Allocator, dir: std.Io.Dir, provider_ready: bool) ![]const u8 {
+    try dir.createDirPath(io_mod.getIo(), "fxhome/sandbox");
+    if (provider_ready) {
+        try dir.writeFile(io_mod.getIo(), .{
+            .sub_path = "fxhome/fake-cli",
+            .data = "#!/bin/sh\n",
+            .flags = .{ .permissions = .fromMode(0o700) },
+        });
+    }
+    return io_mod.dirRealpathAlloc(arena, dir, "fxhome");
+}
+
+/// Writes `config_text` as the test home's sandbox config and loads its policy.
+fn loadSandboxTestPolicy(
+    alloc: Allocator,
+    dir: std.Io.Dir,
+    fx_home: []const u8,
+    config_text: []const u8,
+) !*sandbox_policy.Policy {
+    try dir.writeFile(io_mod.getIo(), .{ .sub_path = "fxhome/sandbox/config.json", .data = config_text });
+    return sandbox_policy.load(alloc, fx_home, "/Users/example", null);
+}
+
+fn shellRunCall(arena: Allocator, command: []const u8, tty: bool) !ToolCall {
+    return .{
+        .id = "shell-run",
+        .name = "shell",
+        .arguments_json = try arena.print("{{\"action\":\"run\",\"command\":\"{s}\",\"tty\":{}}}", .{ command, tty }),
+    };
+}
+
+test "shell placement follows the sandbox rules and leaves other commands local" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const fx_home = try sandboxTestHome(arena, tmp.dir, true);
+    const config = try arena.print(
+        "{{\"provider\":[\"{s}/fake-cli\"],\"profiles\":{{\"media\":[\"--gpu\"]}}," ++
+            "\"rules\":[{{\"command\":\"zig build*\",\"placement\":\"workspace\"}}," ++
+            "{{\"command\":\"convert *\",\"placement\":\"isolated:media\"}}]}}",
+        .{fx_home},
+    );
+    const policy = try loadSandboxTestPolicy(std.testing.allocator, tmp.dir, fx_home, config);
+    defer policy.destroy();
+    var worker: WorkerRuntime = .{};
+    defer worker.deinit(std.testing.allocator);
+    var input = testInputWithClassifier(&worker, permission_auto_classifier.Classifier.disabled());
+    input.workspace_root = "/Users/example/repo";
+    input.sandbox_policy = policy;
+
+    const build = try runCommandContext(input, arena, try shellRunCall(arena, "zig build test", false));
+    try std.testing.expectEqual(command_environment.Placement.workspace, build.placement);
+    try std.testing.expectEqual(@as(?[]const u8, null), build.placement_profile);
+    const build_launch = build.sandbox orelse return error.TestExpectedLaunch;
+    try std.testing.expectEqualStrings("/Users/example/repo", build_launch.workspace_root);
+
+    const convert = try runCommandContext(input, arena, try shellRunCall(arena, "convert a.png b.jpg", false));
+    try std.testing.expectEqual(command_environment.Placement.isolated, convert.placement);
+    try std.testing.expectEqualStrings("media", convert.placement_profile.?);
+
+    const local = try runCommandContext(input, arena, try shellRunCall(arena, "ls", false));
+    try std.testing.expectEqual(command_environment.Placement.local, local.placement);
+    try std.testing.expectEqual(@as(?[]const u8, null), local.placement_profile);
+    try std.testing.expect(local.sandbox == null);
+}
+
+test "an invalid sandbox config refuses a local shell run with its diagnostic" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const fx_home = try sandboxTestHome(arena, tmp.dir, false);
+    const policy = try loadSandboxTestPolicy(
+        std.testing.allocator,
+        tmp.dir,
+        fx_home,
+        "{\"rules\":[{\"command\":\"ls\",\"placement\":\"sandbox\"}]}",
+    );
+    defer policy.destroy();
+    var worker: WorkerRuntime = .{};
+    defer worker.deinit(std.testing.allocator);
+    var input = testInputWithClassifier(&worker, permission_auto_classifier.Classifier.disabled());
+    input.sandbox_policy = policy;
+
+    const outcome = try requestPermissionOutcome(input, arena, try shellRunCall(arena, "ls", false), .ask, &.{});
+    const text = outcome.tool_failure orelse return error.TestExpectedRefusal;
+    try std.testing.expect(std.mem.startsWith(u8, text, refusal_prefix));
+    try std.testing.expect(std.mem.find(u8, text, "rules[0].placement: unknown placement \"sandbox\"") != null);
+    try std.testing.expect(std.mem.endsWith(
+        u8,
+        text,
+        " Fix ~/.fx/sandbox/config.json, or turn off experimental.sandbox_execution.",
+    ));
+    try std.testing.expect(outcome.execution_authority == null);
+}
+
+test "a placed shell run is refused when its provider cannot run, and a local run is not" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const fx_home = try sandboxTestHome(arena, tmp.dir, false);
+    const config = try arena.print(
+        "{{\"provider\":[\"{s}/no-such-cli\"],\"rules\":[{{\"command\":\"zig build*\",\"placement\":\"workspace\"}}]}}",
+        .{fx_home},
+    );
+    const policy = try loadSandboxTestPolicy(std.testing.allocator, tmp.dir, fx_home, config);
+    defer policy.destroy();
+    var worker: WorkerRuntime = .{};
+    defer worker.deinit(std.testing.allocator);
+    var input = testInputWithClassifier(&worker, permission_auto_classifier.Classifier.disabled());
+    input.sandbox_policy = policy;
+
+    const placed = try requestPermissionOutcome(input, arena, try shellRunCall(arena, "zig build test", false), .ask, &.{});
+    const text = placed.tool_failure orelse return error.TestExpectedRefusal;
+    try std.testing.expect(std.mem.startsWith(u8, text, refusal_prefix ++ "the sandbox provider cannot be used: "));
+    try std.testing.expect(std.mem.find(u8, text, "is not an executable file") != null);
+
+    const local = try requestPermissionOutcome(input, arena, try shellRunCall(arena, "ls", false), .ask, &.{});
+    try std.testing.expectEqual(@as(?[]const u8, null), local.tool_failure);
+}
+
+test "a tty shell run that the rules place in a sandbox is refused before any prompt" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const fx_home = try sandboxTestHome(arena, tmp.dir, true);
+    const config = try arena.print(
+        "{{\"provider\":[\"{s}/fake-cli\"],\"rules\":[{{\"command\":\"zig build*\",\"placement\":\"workspace\"}}]}}",
+        .{fx_home},
+    );
+    const policy = try loadSandboxTestPolicy(std.testing.allocator, tmp.dir, fx_home, config);
+    defer policy.destroy();
+    var worker: WorkerRuntime = .{};
+    defer worker.deinit(std.testing.allocator);
+    var input = testInputWithClassifier(&worker, permission_auto_classifier.Classifier.disabled());
+    input.sandbox_policy = policy;
+
+    const outcome = try requestPermissionOutcome(input, arena, try shellRunCall(arena, "zig build test", true), .ask, &.{});
+    const text = outcome.tool_failure orelse return error.TestExpectedRefusal;
+    try std.testing.expectEqualStrings(
+        refusal_prefix ++ "a tty=true command cannot run in a sandbox. Run it without tty, or change the rule in ~/.fx/sandbox/config.json.",
+        text,
+    );
+    try std.testing.expect(outcome.execution_authority == null);
+}
+
+test "without a sandbox policy every shell run stays local, as before" {
+    var worker: WorkerRuntime = .{};
+    defer worker.deinit(std.testing.allocator);
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var input = testInputWithClassifier(&worker, permission_auto_classifier.Classifier.disabled());
+    input.workspace_root = "/Users/example/repo";
+    const call = try shellRunCall(arena, "zig build test", false);
+
+    const context = try runCommandContext(input, arena, call);
+    try std.testing.expectEqual(command_environment.Placement.local, context.placement);
+    try std.testing.expectEqual(@as(?[]const u8, null), context.placement_profile);
+    try std.testing.expect(context.sandbox == null);
+
+    const outcome = try requestPermissionOutcome(input, arena, call, .ask, &.{});
+    try std.testing.expectEqual(@as(?[]const u8, null), outcome.tool_failure);
+}
+
+test "a shell run keeps its approved placement only while the policy still gives it" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const fx_home = try sandboxTestHome(arena, tmp.dir, true);
+    const config = try arena.print(
+        "{{\"provider\":[\"{s}/fake-cli\"],\"rules\":[{{\"command\":\"zig build*\",\"placement\":\"workspace\"}}]}}",
+        .{fx_home},
+    );
+    const policy = try loadSandboxTestPolicy(std.testing.allocator, tmp.dir, fx_home, config);
+    defer policy.destroy();
+    var worker: WorkerRuntime = .{};
+    defer worker.deinit(std.testing.allocator);
+    var input = testInputWithClassifier(&worker, permission_auto_classifier.Classifier.disabled());
+    input.workspace_root = "/Users/example/repo";
+    input.sandbox_policy = policy;
+
+    const approved = try runCommandContext(input, arena, try shellRunCall(arena, "zig build test", false));
+    const fingerprint = command_admission.AdmissionFingerprint.init(approved);
+    var unplaced = approved;
+    unplaced.placement = .local;
+    unplaced.placement_profile = null;
+    unplaced.sandbox = null;
+
+    const same = (try placementAsApproved(policy, arena, input.workspace_root, fingerprint, unplaced, true)) orelse
+        return error.TestExpectedPlacement;
+    try std.testing.expectEqual(command_environment.Placement.workspace, same.placement);
+    try std.testing.expect(same.sandbox != null);
+
+    // Sandbox execution turned off after approval: the run is refused, not run here.
+    try std.testing.expect((try placementAsApproved(null, arena, input.workspace_root, fingerprint, unplaced, true)) == null);
 }

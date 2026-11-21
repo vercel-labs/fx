@@ -400,6 +400,7 @@ pub fn Runtime(comptime App: type) type {
                 provider_set.Bundle.Capabilities{};
             var ctx: tool_runtime.Context = .{
                 .workspace_root = workspace.root,
+                .sandbox_policy = if (comptime @hasField(App, "sandbox_policy")) app.sandbox_policy else null,
                 .access_scope = workspace.access_scope,
                 .ignored_list_entries = ignored_list_entries,
                 .max_list_entries = max_list_entries,
