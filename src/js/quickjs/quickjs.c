@@ -31965,8 +31965,6 @@ static JSValue js_dynamic_import(JSContext *ctx, JSValueConst specifier,
     JSValue attributes_obj = JS_UNDEFINED;
     JSValue args[5];
 
-    /* fx loads no modules, so the module code stays out of its build. */
-    return JS_ThrowTypeError(ctx, "import() is not available in code mode");
     basename = JS_GetScriptOrModuleName(ctx, 0);
     if (basename == JS_ATOM_NULL)
         basename_val = JS_NULL;
@@ -32036,6 +32034,11 @@ static JSValue js_dynamic_import(JSContext *ctx, JSValueConst specifier,
             attributes_obj = JS_UNDEFINED;
         }
     }
+
+    /* fx loads no modules, so the module code stays out of its build. The
+       promise rejects, as it does for an import that fails to load. */
+    JS_ThrowTypeError(ctx, "import() is not available in code mode");
+    goto exception;
 
     args[0] = resolving_funcs[0];
     args[1] = resolving_funcs[1];
