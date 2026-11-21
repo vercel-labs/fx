@@ -34,5 +34,23 @@
     "old": "            ELSE /\\ ent' = [ent EXCEPT ![f][n] = NoEntry]",
     "new": "            ELSE /\\ ent' = [ent EXCEPT ![f] = [m \\in Names |-> IF ent[f][m] = ent[f][n] THEN NoEntry ELSE ent[f][m]]]",
     "invariant": "OthersKept"
+  },
+  {
+    "description": "A remove of a name that only the misspelled key holds gives no hint: it says only that no server has the name",
+    "old": "       THEN /\\ last' = IF HintFor(f, n) THEN \"hinted\" ELSE \"missing\"",
+    "new": "       THEN /\\ last' = \"missing\"",
+    "invariant": "HintMatchesHeldName"
+  },
+  {
+    "description": "A remove gives the hint for every name it can't find, whether or not the misspelled key holds it",
+    "old": "       THEN /\\ last' = IF HintFor(f, n) THEN \"hinted\" ELSE \"missing\"",
+    "new": "       THEN /\\ last' = \"hinted\"",
+    "invariant": "HintMatchesHeldName"
+  },
+  {
+    "description": "A remove of a name that only the misspelled key holds takes it out of that key and writes the profile",
+    "old": "       THEN /\\ last' = IF HintFor(f, n) THEN \"hinted\" ELSE \"missing\"\n            /\\ heldHit' = HintFor(f, n)\n            /\\ same' = TRUE\n            /\\ others' = TRUE\n            /\\ UNCHANGED <<st, ent, added, wroteTypo>>",
+    "new": "       THEN /\\ last' = IF HintFor(f, n) THEN \"removed\" ELSE \"missing\"\n            /\\ heldHit' = FALSE\n            /\\ same' = ~HintFor(f, n)\n            /\\ others' = TRUE\n            /\\ wroteTypo' = (wroteTypo \\/ HintFor(f, n))\n            /\\ UNCHANGED <<st, ent, added>>",
+    "invariant": "NoRewriteOfMisspelled"
   }
 ]

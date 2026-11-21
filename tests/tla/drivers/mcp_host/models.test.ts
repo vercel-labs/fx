@@ -164,14 +164,14 @@ const controls: { name: string; module: string; constants: Record<string, never>
     name: "config edit", module: "ConfigEdit",
     constants: { ObsNames: ["a"], ObsClasses: ["ok", "bad", "auth"], ObsChecked: true, ObsKeyScan: "complete", ObsGuardRemove: true, ObsAtomic: true },
     good: [
-      { event: "init", data: { profile: { st: "ok", typo: false, both: false, big: false, ent: { a: "none" } }, project: { st: "absent", typo: false, both: false, big: false, ent: { a: "none" } } } },
+      { event: "init", data: { profile: { st: "ok", typo: "no-typo", both: false, big: false, ent: { a: "none" } }, project: { st: "absent", typo: "no-typo", both: false, big: false, ent: { a: "none" } } } },
       { event: "add", data: { file: "profile", name: "a", class: "bad", outcome: "refused", same: true } },
       { event: "add", data: { file: "profile", name: "a", class: "ok", outcome: "added", same: false } },
       { event: "list", data: { file: "profile", loaded: ["a"] } },
     ],
     // An add of an entry the reader skips that says "Added": the model refuses it.
     bad: [
-      { event: "init", data: { profile: { st: "ok", typo: false, both: false, big: false, ent: { a: "none" } }, project: { st: "absent", typo: false, both: false, big: false, ent: { a: "none" } } } },
+      { event: "init", data: { profile: { st: "ok", typo: "no-typo", both: false, big: false, ent: { a: "none" } }, project: { st: "absent", typo: "no-typo", both: false, big: false, ent: { a: "none" } } } },
       { event: "add", data: { file: "profile", name: "a", class: "bad", outcome: "added", same: false } },
     ],
     badAt: 1,
