@@ -57,7 +57,7 @@ pub fn prepareModelOutputWithTruncation(
         .text = sanitized,
         .max_bytes = max_bytes,
         .marker = try scratch.print(
-            tool_result_cut_marker.cut_marker_start ++ "{s}: original {d} bytes; cap is {d}" ++ tool_result_cut_marker.cut_marker_end,
+            tool_result_cut_marker.cut_marker_format,
             .{ tool_name, sanitized.len, max_bytes },
         ),
         .trace_scope = "tool",

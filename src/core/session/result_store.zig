@@ -641,7 +641,7 @@ pub fn deleteManaged(
 
 fn cappedInlineOutput(alloc: Allocator, tool_name: []const u8, text: []const u8, max_bytes: usize) ![]u8 {
     const marker = try alloc.print(
-        tool_result_cut_marker.cut_marker_start ++ "{s}: original {d} bytes; cap is {d}" ++ tool_result_cut_marker.cut_marker_end,
+        tool_result_cut_marker.cut_marker_format,
         .{ tool_name, text.len, max_bytes },
     );
     defer alloc.free(marker);
