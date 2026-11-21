@@ -306,14 +306,20 @@ update_continue() {
   work="$1"
   keep_work=1
   patch="$(head -1 "$work/pending")"
-  while IFS= read -r file; do
-    if grep -qE '^(<<<<<<<|>>>>>>>)( |$)' "$work/repo/$file"; then
-      echo "$work/repo/$file still has conflict markers; resolve them, then run update --continue again" >&2
-      exit 1
-    fi
-  done < <(files)
-  in_repo add -A
-  record_patch "$patch"
+  if [[ -n "$patch" && "$(in_repo log -1 --format=%s)" == "$(basename "$patch")" ]]; then
+    # An earlier continue recorded this patch and stopped before moving on.
+    tail -n +2 "$work/pending" > "$work/pending.next"
+    mv "$work/pending.next" "$work/pending"
+  else
+    while IFS= read -r file; do
+      if grep -qE '^(<<<<<<<|>>>>>>>)( |$)' "$work/repo/$file"; then
+        echo "$work/repo/$file still has conflict markers; resolve them, then run update --continue again" >&2
+        exit 1
+      fi
+    done < <(files)
+    in_repo add -A
+    record_patch "$patch"
+  fi
   apply_pending
   finish
 }

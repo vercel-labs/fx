@@ -212,6 +212,19 @@ holds "update --continue removes the work folder" test ! -e "$kept"
 expect "update --continue refuses a folder it did not make" 2 "is not an update stopped at a conflict" $fork update --continue "$root"
 
 fresh
+edit 's/^int b = 2;$/int b = 22;/' engine.c
+$fork save second-change >/dev/null
+expect "update stops at a patch that conflicts, again" 1 "0001-first-change.patch does not apply to v3" $fork update v3
+kept="$(printf '%s\n' "$out" | sed -n 's/^  scripts\/quickjs-fork.sh update --continue //p')"
+engine 1000 2 30 > "$kept/repo/engine.c"
+awk '{ print } /^    in_repo commit -q -m "\$name"$/ { print "    exit 99" }' $fork > scripts/stop-after-record.sh
+chmod +x scripts/stop-after-record.sh
+expect "a continue stopped right after recording its patch" 99 "" scripts/stop-after-record.sh update --continue "$kept"
+expect "update --continue again moves on without dropping that patch" 0 "$src is now v3 plus the patches" $fork update --continue "$kept"
+holds "the recorded patch is kept" test -s "$src/patches/0001-first-change.patch"
+expect "check passes after the retried continue" 0 "$src is v3 plus 2 patches" $fork check
+
+fresh
 expect "update drops a patch the release already has" 0 "v4 already has the change in $src/patches/0001-first-change.patch" $fork update v4
 holds "the dropped patch's file is gone" test ! -e "$src/patches/0001-first-change.patch"
 expect "check passes with no patches left" 0 "$src is v4 plus 0 patches" $fork check
