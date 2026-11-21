@@ -62,10 +62,17 @@ fi
 
 work=""
 keep_work=0
+download=""
 cleanup() {
+  # A download still running when the script stops would outlive it.
+  if [[ -n "$download" ]]; then kill "$download" 2>/dev/null || true; fi
   if [[ -n "$work" && "$keep_work" == 0 ]]; then rm -rf "$work"; fi
 }
 trap cleanup EXIT
+# Without these, bash waits out a download when interrupted; with them, wait
+# returns, and the exit trap stops the download.
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 sha256() {
   if command -v sha256sum >/dev/null; then
@@ -96,10 +103,15 @@ in_repo() {
 # though not the archive's compressed bytes, so callers check the files.
 fetch() {
   local url="$upstream/archive/$2.tar.gz"
-  if ! curl -fsSL --connect-timeout 30 --max-time 300 --retry 3 -o "$work/$1.tar.gz" "$url"; then
+  # curl runs in the background so that stopping the script stops it too.
+  curl -fsSL --connect-timeout 30 --max-time 300 --retry 3 -o "$work/$1.tar.gz" "$url" &
+  download=$!
+  if ! wait "$download"; then
+    download=""
     echo "could not download $url" >&2
     exit 1
   fi
+  download=""
   mkdir "$work/$1"
   tar -xzf "$work/$1.tar.gz" -C "$work/$1" --strip-components 1
 }
