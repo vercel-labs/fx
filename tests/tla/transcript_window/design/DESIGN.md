@@ -48,12 +48,14 @@ current code.
   live block, a summary or cancellation ends the turn, anything else arrives
   final. A turn summary confirms the save: the app commits the turn to the
   log before it appends the summary.
-- fx runs `drop` through `dropEntriesAtomic`, the commit and rebase the
-  byte cap used before the window replaced it; it never removes a pinned
-  entry. An entry with a row still on screen is held
-  (`applyTranscriptWindowDrops`) until it scrolls into terminal history or a
-  resize clears the screen, because the painter repaints the live area from
-  the entries. A resumed transcript holds every entry until a frame has
+- fx runs `drop` through `dropEntriesAtomic`, the commit and rebase the byte
+  cap used before the window replaced it; it never removes a pinned entry.
+  An entry with a row still on screen is held (`applyTranscriptWindowDrops`)
+  until it scrolls into terminal history or a resize clears the screen,
+  because the painter repaints the live area from the entries. An entry of a
+  turn whose summary stays is held too, back to the turn's prompt, also when
+  a resize clears the screen, because the summary's recap counts the turn's
+  tool calls. A resumed transcript holds every entry until a frame has
   repainted it from the entries: its first paint is the prepared resume
   flow, so the reset before that paint keeps them, and the paint leaves no
   commit anchor to tell which rows are on screen. A transcript that another
@@ -71,9 +73,12 @@ current code.
   compaction, then Compacted.
 - Ctrl+O does not run `ctrlo_*`, `read_log` or `log_read_*`: it pages by
   entries, 256 to a page. Its newest pages show the held cycle together with
-  the one before it, read from the log when Ctrl+O opens (or from memory while
-  the window still holds it); older cycles page in one whole cycle per log
-  read, one held at a time, and nothing is read while Ctrl+O is closed. The
+  the one before it (or with the window's copy while the window still holds
+  it), which a background thread reads from the log between turns, or when
+  Ctrl+O opens before that read. While Ctrl+O is closed only what the newest
+  page shows of that cycle stays in memory, at most one page, until a
+  compaction, resume, or drop makes it stale. Older cycles page in one whole
+  cycle per log read, one held at a time, and only while Ctrl+O is open. The
   model's Ctrl+O laws hold for the model
   and the core; on the binary, `binary-to-spec.ts` checks what the user sees
   (every prompt once, in order) and the retention steps.

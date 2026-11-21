@@ -312,6 +312,8 @@ export function heldFakeGatewayFinalText() {
   let timer: ReturnType<typeof setInterval> | undefined;
   let response: Response | undefined;
   let pendingText: string | undefined;
+  // Parts sent before fx opened the stream, in order.
+  const pendingParts: string[] = [];
 
   const stopTimer = () => {
     if (timer) clearInterval(timer);
@@ -343,6 +345,16 @@ export function heldFakeGatewayFinalText() {
     ));
     close();
   };
+  // Streams `text` as one more piece of the reply and keeps the rest held.
+  const send = (text: string) => {
+    if (closed) return;
+    const frame = `data: ${JSON.stringify({ type: "text-delta", id: "answer_1", delta: text })}\n\n`;
+    if (!controller) {
+      pendingParts.push(frame);
+      return;
+    }
+    controller.enqueue(encoder.encode(frame));
+  };
   const createResponse = () => new Response(
     new ReadableStream<Uint8Array>({
       start(value) {
@@ -356,6 +368,7 @@ export function heldFakeGatewayFinalText() {
         };
         keepAlive();
         timer = setInterval(keepAlive, 50);
+        for (const frame of pendingParts.splice(0)) value.enqueue(encoder.encode(frame));
         if (pendingText !== undefined) finish(pendingText);
       },
       cancel() {
@@ -370,6 +383,7 @@ export function heldFakeGatewayFinalText() {
       response ??= createResponse();
       return response;
     },
+    send,
     release: finish,
     dispose: close,
   };
@@ -388,6 +402,9 @@ export type FakeGatewayTitleResponse =
 export type FakeGatewayModel = {
   id: string;
   type?: string;
+  // AI Gateway marks a model the team's Token Pass pays for, only for a team
+  // with an active pass.
+  token_pass?: boolean;
   owned_by?: string;
   released?: number;
   tags?: string[];
@@ -403,6 +420,7 @@ export type FakeGatewayModel = {
     type: string;
     [key: string]: unknown;
   }>;
+  fast_variant_of?: string;
 };
 
 export type FakeGatewayModelRequest = {
@@ -581,6 +599,29 @@ export function startFakeGateway(
   }, options);
 }
 
+// The Token Pass models of a coding-agent catalog as AI Gateway sends them: a
+// team with an active pass gets `token_pass: true` on each, and any other team
+// gets the same models without the mark.
+export function tokenPassCatalog(hasPass: boolean): FakeGatewayModel[] {
+  return [
+    { id: FAKE_GATEWAY_MODEL, type: "language", tags: ["tool-use"] },
+    ...["moonshotai/kimi-k3", "zai/glm-5.3", "zai/glm-5.3-flash", "deepseek/deepseek-v4.1-flash"].map((id) => ({
+      id,
+      type: "language",
+      tags: ["tool-use"],
+      ...(hasPass ? { token_pass: true } : {}),
+    })),
+  ];
+}
+
+// fx asks AI Gateway's credits endpoint whether the team has Token Pass. With
+// no fake gateway, that request would reach the real AI Gateway, so it goes to
+// a closed loopback port, where it fails at once.
+export function localCreditsEnv(env: Record<string, string | undefined>): Record<string, string | undefined> {
+  if (env.FX_GATEWAY_BASE_URL || env.FX_TEST_GATEWAY_CREDITS_URL) return env;
+  return { ...env, FX_TEST_GATEWAY_CREDITS_URL: "http://127.0.0.1:9/coding-agent/v1/credits" };
+}
+
 // Same server and classifier handling as startFakeGateway, but every
 // completion request is answered by the supplied callback instead of a
 // finite queue. For suites that replay one response indefinitely or switch
@@ -689,7 +730,7 @@ export class TmuxSession {
       isolated = false,
       socketName,
     } = opts ?? {};
-    const env = providerVersionTestEnv(requestedEnv);
+    const env = localCreditsEnv(providerVersionTestEnv(requestedEnv));
 
     if (
       minimumHistoryLines !== undefined &&

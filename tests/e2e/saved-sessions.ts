@@ -45,7 +45,7 @@ export function savedText(home: string, id: string): string {
   return [readFileSync(join(dir, "log.jsonl"), "utf8"), ...readdirSync(blobs).map((name) => readFileSync(join(blobs, name), "utf8"))].join("\n");
 }
 
-export type LogLine = { seq: number; kind: string; type?: string; reason?: string; key?: string };
+export type LogLine = { seq: number; kind: string; role?: string; type?: string; reason?: string; key?: string };
 
 /// Every complete line of a session's log. A line fx is still appending is
 /// left out, so a test may read the log while fx runs.
@@ -100,17 +100,36 @@ export function rootSessionIds(home: string): string[] {
   });
 }
 
-/// How many turns the saved root sessions have committed. A session fx is
-/// still creating counts as none yet.
+/// Whether `error` says fx has not created a file yet.
+function notCreatedYet(error: unknown): boolean {
+  return (error as NodeJS.ErrnoException | undefined)?.code === "ENOENT";
+}
+
+/// How many turns the saved root sessions have committed. A store, folder,
+/// or log fx has not created yet, and a first line it is still writing,
+/// count as none yet. Any other error, such as a broken complete line or a
+/// superseded turn, is thrown.
 export function committedRootTurns(home: string): number {
+  let ids: string[];
   try {
-    return rootSessionIds(home).reduce(
-      (sum, id) => sum + logLines(home, id).filter((line) => line.kind === "turn_committed").length,
-      0,
-    );
-  } catch {
-    return 0;
+    ids = savedSessionIds(home);
+  } catch (error) {
+    if (notCreatedYet(error)) return 0;
+    throw error;
   }
+  let sum = 0;
+  for (const id of ids) {
+    let first: LogLine | undefined;
+    try {
+      first = readLog(home, id)[0];
+    } catch (error) {
+      if (notCreatedYet(error)) continue;
+      throw error;
+    }
+    if (!first || first.role === "child") continue;
+    sum += logLines(home, id).filter((line) => line.kind === "turn_committed").length;
+  }
+  return sum;
 }
 
 /// Waits until the saved root sessions hold more than `after` committed
@@ -125,6 +144,43 @@ export async function waitForRootTurnCommitted(home: string, after = 0, timeoutM
     await Bun.sleep(20);
   }
   throw new Error(`no root session committed more than ${after} turns`);
+}
+
+/// Holds a fake child's answer until the parent has saved the turn that sent
+/// its message. A report that arrives while that turn still runs joins it
+/// (`postMail` in `src/core/agent/worker_runtime.zig`), and the receipt would
+/// get no request of its own, so a test's request counts and its reading of
+/// the report would depend on which side is faster.
+export function holdChildAnswer(home: string) {
+  let committedBefore = 0;
+  // A wait that fails is kept and answered with an error response, so fx sees
+  // a failed request and `runFx` ends it normally; the test throws the kept
+  // error after the run. Thrown out of the gateway's handler, it would fail
+  // the test at once and leave fx running.
+  let failed: unknown;
+  return {
+    /// Before the message that starts a child: it waits for a turn past the
+    /// ones saved now.
+    mark() {
+      committedBefore = committedRootTurns(home);
+    },
+    /// Undefined once the parent has saved its turn; an error response when it never does.
+    async wait(): Promise<Response | undefined> {
+      if (failed === undefined) {
+        try {
+          await waitForRootTurnCommitted(home, committedBefore);
+          return undefined;
+        } catch (error) {
+          failed = error;
+        }
+      }
+      return new Response("the parent's turn was not saved", { status: 500 });
+    },
+    /// After the run: throws a wait that failed.
+    check() {
+      if (failed !== undefined) throw failed;
+    },
+  };
 }
 
 /// The parent's lines about its children, with fx's data parsed.

@@ -64,6 +64,8 @@ pub const CompactionActivityEffect = struct {
     begin: *const fn (ctx: *anyopaque, origin: compaction_activity.Origin, turn_id: ?u64) compaction_activity.OperationId,
     running: *const fn (ctx: *anyopaque, id: compaction_activity.OperationId, stage: compaction_activity.Stage) void,
     settle: *const fn (ctx: *anyopaque, id: compaction_activity.OperationId, feedback: compaction_activity.Feedback) void,
+    /// How much of the summary the model has written, from 1 to 99.
+    written: ?*const fn (ctx: *anyopaque, id: compaction_activity.OperationId, percent: u8) void = null,
 };
 
 pub const ContextCompactionCommitEffect = struct {
@@ -194,6 +196,9 @@ pub const RefreshedGatewayCredential = struct {
 };
 
 pub const AgentRuntimeDeps = struct {
+    /// The steps of `start_workspace_capture`.
+    pub const WorkspaceCaptureStep = enum { begin, capture };
+
     ctx: *anyopaque,
     observer: ?*observation.Observer = null,
     agent_stream_provider: agent_stream_provider.Provider = agent_stream_provider.unavailable_provider,
@@ -224,10 +229,16 @@ pub const AgentRuntimeDeps = struct {
         kind: worker_runtime.SteeringBoundaryKind,
     ) anyerror!worker_runtime.SteeringBoundaryResult = null,
     release_agent_terminal_lease: *const fn (ctx: *anyopaque, session_id: []const u8) anyerror!void = terminalLeaseCleanupUnavailable,
-    /// Called when turn `turn_id` ends interrupted, before it is reported.
-    /// When the user cancelled the turn, the host stops the commands that
-    /// steering moved to the background during it; a turn that steering
-    /// ended keeps them. Hosts without steering leave it unset.
+    /// Whether turn `turn_id`, which ends interrupted, ends because the user
+    /// cancelled it rather than because steering ended it. Asked before the
+    /// turn is reported, since a prompt typed once it is reported can join
+    /// its ending as steering. Hosts without steering leave it unset.
+    turn_ends_by_explicit_cancel: ?*const fn (ctx: *anyopaque, turn_id: u64) bool = null,
+    /// Stops the commands that steering moved to the background during turn
+    /// `turn_id`, after the user cancelled it (`turn_ends_by_explicit_cancel`).
+    /// Called once the turn is reported, so a command that ignores SIGTERM
+    /// and takes seconds to stop does not hold the turn's end. Hosts without
+    /// steering leave it unset.
     stop_steering_detached_commands: ?*const fn (ctx: *anyopaque, turn_id: u64) anyerror!void = null,
     append_runtime_context: *const fn (ctx: *anyopaque, arena: Allocator, messages: *std.ArrayList(ChatMessage)) anyerror!void,
     append_static_context: ?*const fn (ctx: *anyopaque, arena: Allocator, messages: *std.ArrayList(ChatMessage)) anyerror!void = null,
@@ -281,6 +292,20 @@ pub const AgentRuntimeDeps = struct {
     /// the caller's. An image the session cannot save keeps its bytes
     /// inline and gets no path.
     save_prompt_images: ?*const fn (ctx: *anyopaque, alloc: Allocator, images: []types.ImageAttachment) anyerror!void = null,
+    /// Captures the repository the session works in as the turn starts,
+    /// before any request or tool, when `experimental.workspace_capture` is
+    /// on (D98, `src/core/workspace/turn_capture.zig`). The runtime calls it
+    /// twice: `.begin` takes the turn's capture token, then, once the
+    /// user's prompt is saved through `append_turn_piece`, `.capture` takes
+    /// the start capture, which can take seconds, so a kill during it keeps
+    /// the prompt. `fresh` is false for a steering message inside the turn,
+    /// which keeps the turn's capture. It never fails the turn.
+    start_workspace_capture: ?*const fn (ctx: *anyopaque, fresh: bool, step: WorkspaceCaptureStep) void = null,
+    /// An admitted tool is about to act in `dir`: a command's working folder
+    /// or the folder of the file a mutation writes. Captures a repository the
+    /// turn had not reached yet before the action runs (D98). Never fails
+    /// the call.
+    reach_workspace: ?*const fn (ctx: *anyopaque, dir: []const u8, tool_name: []const u8) void = null,
     /// Confirms, without writing, that this process still owns the saved
     /// session after a main-model completion and before its tool calls run.
     /// Another process may have taken the session over.
@@ -345,6 +370,7 @@ pub const AgentRuntimeDeps = struct {
     }
 
     pub fn executeToolCall(self: *const AgentRuntimeDeps, request: ToolExecutionRequest) !ToolExecutionResult {
+        if (self.reach_workspace) |reach| if (reachedDirectory(request.authority)) |dir| reach(self.ctx, dir, request.call.name);
         if (self.observer) |observer| observer.emit(.{ .tool_start = .{ .call = request.call } });
         var observed_request = request;
         observed_request.observer = self.observer orelse request.observer;
@@ -366,6 +392,28 @@ pub const AgentRuntimeDeps = struct {
     }
 };
 
+/// The folder an admitted action works in, from its typed authority: a
+/// command's resolved working folder, or the folder of a mutation's
+/// canonical target. Permission text is never parsed for a path (D98).
+fn reachedDirectory(authority: command_admission.ToolExecutionAuthority) ?[]const u8 {
+    return switch (authority) {
+        .run_command => |command| switch (command) {
+            .direct_only => |fingerprint| fingerprint.resolved_cwd,
+            .shell_allowed => |allowed| allowed.fingerprint.resolved_cwd,
+        },
+        .file_mutation => |mutation| std.Io.Dir.path.dirname(mutation.policy_targets.canonical_target_path),
+        .ordinary, .vision_paths => null,
+    };
+}
+
 fn terminalLeaseCleanupUnavailable(_: *anyopaque, _: []const u8) !void {
     return error.TerminalLeaseCleanupUnavailable;
+}
+
+test "a reached directory comes only from a command's or a mutation's typed authority" {
+    const fingerprint: command_admission.AdmissionFingerprint = .{ .command = "make", .resolved_cwd = "/repo/sub", .target_os = .linux };
+    try std.testing.expectEqualStrings("/repo/sub", reachedDirectory(.{ .run_command = .{ .direct_only = fingerprint } }).?);
+    try std.testing.expectEqualStrings("/repo/sub", reachedDirectory(.{ .run_command = .{ .shell_allowed = .{ .fingerprint = fingerprint, .source = .auto_mode } } }).?);
+    try std.testing.expect(reachedDirectory(.ordinary) == null);
+    try std.testing.expect(reachedDirectory(.{ .vision_paths = .{ .targets = &.{} } }) == null);
 }

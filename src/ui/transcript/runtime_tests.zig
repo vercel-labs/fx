@@ -12581,12 +12581,14 @@ test "current compact projection groups tool rows without mutating entries" {
     const entry_count = runtime.notebook.entries.items.len;
     var compact = try runtime.prepareTranscriptSource(alloc, null);
     defer compact.deinit(alloc);
+    // The failed edit is not a command, so its row says only that it failed,
+    // in the failure style, and the header does not count it.
     try std.testing.expect(std.mem.find(
         u8,
         compact.bytes,
-        "\x1b[38;5;255m●\x1b[0m \x1b[38;5;245m2 tool calls · 1 read · 1 edit · 1 failed\x1b[0m\n" ++
+        "\x1b[38;5;255m●\x1b[0m \x1b[38;5;245mRead a file\x1b[0m\n" ++
             "\x1b[38;5;245m├ Read file\x1b[0m\n" ++
-            "\x1b[38;5;245m└ Edit failed\x1b[0m",
+            "\x1b[38;5;245m└ \x1b[38;5;245mEdit failed\x1b[0m\x1b[38;5;245m\x1b[0m",
     ) != null);
     try std.testing.expectEqual(entry_count, runtime.notebook.entries.items.len);
 }
@@ -12601,9 +12603,9 @@ test "current compact projection finalizes tool groups from turn finished fallba
         fallback_disposition: ?transcript_blocks.ToolFallbackDisposition,
         summary_text: []const u8,
     }{
-        .{ .call_id = "unreported", .provisional = false, .turn_outcome = .completed, .detail_outcome = .completed, .fallback_disposition = .completion_unreported, .summary_text = "1 tool call · 1 read · 1 unreported" },
-        .{ .call_id = "not-executed", .provisional = true, .turn_outcome = .completed, .detail_outcome = .completed, .fallback_disposition = .not_executed, .summary_text = "1 tool call · 1 read · 1 not executed" },
-        .{ .call_id = "interrupted", .provisional = false, .turn_outcome = .interrupted, .detail_outcome = .cancelled, .fallback_disposition = null, .summary_text = "1 cancelled" },
+        .{ .call_id = "unreported", .provisional = false, .turn_outcome = .completed, .detail_outcome = .completed, .fallback_disposition = .completion_unreported, .summary_text = "Tool completion was not reported" },
+        .{ .call_id = "not-executed", .provisional = true, .turn_outcome = .completed, .detail_outcome = .completed, .fallback_disposition = .not_executed, .summary_text = "Tool was not executed" },
+        .{ .call_id = "interrupted", .provisional = false, .turn_outcome = .interrupted, .detail_outcome = .cancelled, .fallback_disposition = null, .summary_text = "Tool cancelled" },
         .{ .call_id = "failed", .provisional = false, .turn_outcome = .failed, .detail_outcome = .failed, .fallback_disposition = null, .summary_text = "Tool failed" },
     };
 
@@ -14497,7 +14499,7 @@ fn checkLateTerminalFallbackAllocationFailuresImpl(alloc: Allocator) !void {
         );
         var compact = try runtime.prepareTranscriptSource(std.testing.allocator, null);
         defer compact.deinit(std.testing.allocator);
-        try std.testing.expect(std.mem.find(u8, compact.bytes, "1 not executed") != null);
+        try std.testing.expect(std.mem.find(u8, compact.bytes, "Tool was not executed") != null);
         return err;
     };
 
@@ -14512,7 +14514,7 @@ fn checkLateTerminalFallbackAllocationFailuresImpl(alloc: Allocator) !void {
     try std.testing.expect(detail.fallback_disposition == null);
     var compact = try runtime.prepareTranscriptSource(std.testing.allocator, null);
     defer compact.deinit(std.testing.allocator);
-    try std.testing.expect(std.mem.find(u8, compact.bytes, "1 not executed") == null);
+    try std.testing.expect(std.mem.find(u8, compact.bytes, "Tool was not executed") == null);
     try std.testing.expect(std.mem.find(u8, compact.bytes, "Late completion") != null);
 }
 
@@ -16218,6 +16220,29 @@ test "recorded tool finality does not depend on the current turn watermark" {
     }
 }
 
+test "a provisional call's detail is streaming until the call starts" {
+    const alloc = std.testing.allocator;
+    var runtime = TranscriptRuntime{ .layout = transcriptTestLayout(88, 24, 20) };
+    defer runtime.deinit(alloc);
+    const id = types.ToolLifecycleId{ .turn_id = 1, .call_id = "streaming-read" };
+    _ = try runtime.applyToolLifecycle(alloc, .{ .provisional = .{
+        .id = id,
+        .presentation_group_id = null,
+        .tool_name = "read_file",
+        .activity_kind = .read,
+    } });
+    try std.testing.expectEqual(@as(usize, 1), runtime.notebook.tool_details.items.len);
+    try std.testing.expect(runtime.notebook.tool_details.items[0].streaming);
+    _ = try runtime.applyToolLifecycle(alloc, .{ .authoritative_started = .{
+        .id = id,
+        .reconciles_provisional_call_id = null,
+        .tool_name = "read_file",
+        .activity_kind = .read,
+    } });
+    try std.testing.expectEqual(@as(usize, 1), runtime.notebook.tool_details.items.len);
+    try std.testing.expect(!runtime.notebook.tool_details.items[0].streaming);
+}
+
 test "recorded tool finality stays independent of a live turn with the same number" {
     const alloc = std.testing.allocator;
     var runtime = TranscriptRuntime{ .layout = transcriptTestLayout(88, 24, 20) };
@@ -16356,12 +16381,12 @@ test "finality candidates anchor a fully grouped turn at its newest rendered gro
     try std.testing.expect(source.finality.mutation_pin_start == null);
 
     const group_a_header = try alloc.print(
-        "{s}●\x1b[0m {s}3 tool calls · 3 read\x1b[0m",
+        "{s}●\x1b[0m {s}Read files\x1b[0m",
         .{ user_message_card.promptMarkerStyle(), ui_render.statusline_style },
     );
     defer alloc.free(group_a_header);
     const group_b_header = try alloc.print(
-        "{s}●\x1b[0m {s}1 tool call · 1 read\x1b[0m",
+        "{s}●\x1b[0m {s}Read finality fixture\x1b[0m",
         .{ user_message_card.promptMarkerStyle(), ui_render.statusline_style },
     );
     defer alloc.free(group_b_header);
@@ -16397,7 +16422,7 @@ test "finality candidates keep a mixed legacy turn at its earliest rendered tool
     try std.testing.expect(source.finality.mutation_pin_start == null);
 
     const group_a_header = try alloc.print(
-        "{s}●\x1b[0m {s}1 tool call · 1 read\x1b[0m",
+        "{s}●\x1b[0m {s}Read finality fixture\x1b[0m",
         .{ user_message_card.promptMarkerStyle(), ui_render.statusline_style },
     );
     defer alloc.free(group_a_header);
@@ -16533,6 +16558,56 @@ test "retint rewrites custom theme colors on a variant flip" {
     try std.testing.expect(std.mem.find(u8, muted, "\x1b[38;5;89mMuted row") != null);
     try std.testing.expect(std.mem.find(u8, muted, "\x1b[38;5;90mKeyword row") != null);
     try std.testing.expect(std.mem.find(u8, muted, "\x1b[38;5;201muser output") != null);
+}
+
+test "retint rewrites inline code and links inside table cells" {
+    const alloc = std.testing.allocator;
+    const assistant_presentation = @import("../../core/agent/assistant_presentation.zig");
+    var runtime = TranscriptRuntime{
+        .layout = transcriptTestLayout(80, 14, 10),
+        .owned_top_row = 1,
+    };
+    defer runtime.deinit(alloc);
+    try runtime.enableShadowVt(alloc);
+
+    var custom_dark = shared_theme.fx_dark;
+    custom_dark.name = "probe-dark";
+    custom_dark.inline_code_open = "\x1b[38;2;136;192;208m";
+    custom_dark.link_style = "\x1b[38;2;129;161;193m";
+    var custom_light = shared_theme.fx_light;
+    custom_light.name = "probe-light";
+    custom_light.inline_code_open = "\x1b[38;2;23;108;116m";
+    custom_light.link_style = "\x1b[38;2;0;100;176m";
+
+    // The table renders its cells in the theme active when it finishes.
+    const previous = shared_theme.current();
+    shared_theme.activate(custom_dark);
+    assistant_presentation.applyTheme(custom_dark);
+    defer {
+        shared_theme.activate(previous);
+        assistant_presentation.applyTheme(previous);
+    }
+    var table = try assistant_presentation.parseTablePayload(
+        alloc,
+        "| Command | Docs |\n" ++
+            "|---------|------|\n" ++
+            "| `zig build` | [guide](https://example.com/guide) |\n",
+    );
+    _ = runtime.appendAssistantTableOwned(alloc, table) catch |err| {
+        table.deinit(alloc);
+        return err;
+    };
+    const drawn = runtime.notebook.transcript.items;
+    try std.testing.expect(std.mem.find(u8, drawn, "\x1b[38;2;136;192;208mzig build") != null);
+    try std.testing.expect(std.mem.find(u8, drawn, "\x1b[38;2;129;161;193m") != null);
+
+    try runtime.retintEntriesForTheme(alloc, custom_dark, custom_light);
+
+    const retinted = runtime.notebook.transcript.items;
+    try std.testing.expect(std.mem.find(u8, retinted, "\x1b[38;2;23;108;116mzig build") != null);
+    try std.testing.expect(std.mem.find(u8, retinted, "\x1b[38;2;0;100;176m") != null);
+    try std.testing.expect(std.mem.find(u8, retinted, "136;192;208") == null);
+    try std.testing.expect(std.mem.find(u8, retinted, "129;161;193") == null);
 }
 
 test "rewrite publication keeps the frozen prefix when a finished turn holds a hidden notice" {

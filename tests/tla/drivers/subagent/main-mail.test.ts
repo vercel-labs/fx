@@ -373,6 +373,7 @@ async function checkTrace(observations: Obs[], dir: string): Promise<{ verdict: 
     `  Mail = {${(posts > 0 ? Array.from({ length: posts }, (_, i) => `m${i + 1}`) : ["m1"]).map(str).join(", ")}}`,
     `  MaxTurns = ${Math.max(1, turns)}`,
     "  Joins = TRUE",
+    "  Commits = FALSE",
     `  Bug = "none"`,
     "INVARIANTS",
     "  NotAllMatched",

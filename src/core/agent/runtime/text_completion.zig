@@ -12,6 +12,7 @@ const compactor = @import("../../compactor/compactor.zig");
 const model_capabilities = @import("../../config/model_capabilities.zig");
 const model_provider = @import("../../config/model_provider.zig");
 const token_pass = @import("../../gateway/token_pass.zig");
+const token_pass_team = @import("../../gateway/token_pass_team.zig");
 const debug_trace = @import("../../shared/debug_trace.zig");
 const text_utils = @import("../../shared/text_utils.zig");
 const types = @import("../../shared/types.zig");
@@ -37,6 +38,8 @@ pub const Request = struct {
     /// Longest text kept; a longer reply counts as truncated.
     max_bytes: usize,
     trace_ctx: debug_trace.TraceContext,
+    /// Receives the text kept, chunk by chunk, as it arrives.
+    on_text: ?compactor.TextSink = null,
     system: []const u8,
     user: []const u8,
     /// When set, `user` follows this request's messages, sent with its
@@ -94,7 +97,7 @@ pub fn complete(alloc: Allocator, request: Request) Error!Outcome {
         break :joined all;
     } else &alone;
     defer if (conversation != null) alloc.free(messages);
-    var capture = StreamCapture{ .alloc = alloc, .max_bytes = request.max_bytes };
+    var capture = StreamCapture{ .alloc = alloc, .max_bytes = request.max_bytes, .on_text = request.on_text };
     defer capture.deinit();
     var delivery = runtime_gateway_step.DeliveryCertainty.init();
     var attempt_evidence: agent_stream_provider.AttemptEvidence = .{};
@@ -197,6 +200,7 @@ const StreamCapture = struct {
     saw_content: bool = false,
     saw_tool_call: bool = false,
     failed: bool = false,
+    on_text: ?compactor.TextSink = null,
 
     fn deinit(self: *StreamCapture) void {
         self.text.deinit(self.alloc);
@@ -206,7 +210,9 @@ const StreamCapture = struct {
         self.saw_content = self.saw_content or chunk.len > 0;
         self.observed_bytes +|= chunk.len;
         const room = self.max_bytes -| self.text.items.len;
-        try self.text.appendSlice(self.alloc, chunk[0..@min(chunk.len, room)]);
+        const kept = chunk[0..@min(chunk.len, room)];
+        try self.text.appendSlice(self.alloc, kept);
+        if (self.on_text) |sink| if (kept.len > 0) sink.write(kept);
     }
 };
 
@@ -287,8 +293,9 @@ pub const CompactorCaller = struct {
             .provider = self.provider,
             .credential_source = self.credential_source,
             .sends_after_conversation = self.conversation != null,
-            // A Token Pass conversation retries its summary on Token Pass.
-            .fallback_model = if (self.provider == .gateway) token_pass.compactionFallback(self.model) else null,
+            // A Token Pass conversation of a team with Token Pass retries its
+            // summary on Token Pass.
+            .fallback_model = if (self.provider == .gateway) token_pass_team.compactionFallback(self.model) else null,
         };
     }
 
@@ -325,6 +332,7 @@ pub const CompactorCaller = struct {
             .max_output_tokens = if (own) self.max_output_tokens else model_capabilities.requestOutputTokens(self.capabilities_fn(self.capabilities_context, call.model)),
             .max_bytes = call.max_bytes,
             .trace_ctx = call.trace_ctx,
+            .on_text = call.on_text,
             .system = call.system,
             .user = call.user,
             .conversation = conversation,

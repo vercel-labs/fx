@@ -1,4 +1,5 @@
 import { expect, test } from "bun:test";
+import { processAlive } from "./process-alive";
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
@@ -241,6 +242,24 @@ async function waitForCondition(
     await Bun.sleep(50);
   }
   throw new Error(`Timed out waiting for ${description}.`);
+}
+
+/// Waits until session `id`'s log holds its interrupted turn. fx traces
+/// `event=interrupt_persisted` when the agent worker builds that turn, and
+/// saves it a little later, when the app thread handles the worker's finish
+/// event (`finish` in `src/core/agent/runtime/finalization.zig`). The
+/// `turn_interrupted` record is the last one that save writes, after the
+/// turn's items and the blobs they name.
+async function waitForSavedInterruptedTurn(
+  home: string,
+  id: string,
+  timeout = TIMEOUT,
+): Promise<void> {
+  await waitForCondition(
+    () => logLines(home, id).some((line) => line.kind === "turn_interrupted"),
+    `session ${id} to save its interrupted turn (a turn_interrupted record in its log)`,
+    timeout,
+  );
 }
 
 async function waitForPersistedSessionMarker(
@@ -1228,8 +1247,8 @@ printf '${trailingMarker}   '
       await active.waitForComposer(TIMEOUT);
       await active.sendText("Run the prepared command.");
       const compact = await waitForScrollback(active, doneMarker);
-      expect(compact).toContain("● 1 tool call · 1 command");
-      expect(compact).toContain("└ Ran ./command-output-controls.sh");
+      // The group's only call is its header, marked with the result.
+      expect(compact).toContain("● Ran ./command-output-controls.sh ✓");
       expect(compact).not.toContain(`│ ${ansiMarker}`);
       expect(compact).not.toContain(`│ ${crMarker}`);
       expect(compact).not.toContain("│ TAB");
@@ -1616,8 +1635,10 @@ test.skipIf(!tmuxAvailable())(
       await active.waitForComposer(TIMEOUT);
       await active.sendText("Run the prepared watcher and stop it.");
       const live = await waitForScrollback(active, "SESSION_LABEL_DONE");
-      expect(live).toContain("Still running cat <<'EOF' launch marker line EOF sleep 300");
-      expect(live).toContain("Observed cat <<'EOF'");
+      // The launch returned while its command ran on, and the session's input
+      // and its stop join its row, which shows the latest state.
+      expect(live).toContain("● Stopped cat, sleep · 3 calls");
+      expect(live).not.toContain("Still running cat, sleep");
       expect(live).not.toContain("Observed shell-1");
 
       await active.sendText("/quit");
@@ -1635,9 +1656,8 @@ test.skipIf(!tmuxAvailable())(
         height: 30,
       });
       const resumed = await waitForScrollback(active, "SESSION_LABEL_DONE");
-      expect(resumed).toContain("Still running cat <<'EOF' launch marker line EOF sleep 300");
-      expect(resumed).toContain("Observed cat <<'EOF'");
-      expect(resumed).toContain("Stopped cat <<'EOF'");
+      expect(resumed).toContain("● Stopped cat, sleep · 3 calls");
+      expect(resumed).not.toContain("Still running cat, sleep");
       expect(resumed).not.toContain("Observed shell-1");
       expect(resumed).not.toContain("Stopped shell-1");
       expect(resumedGateway.requests).toHaveLength(0);
@@ -1857,7 +1877,7 @@ test.skipIf(!tmuxAvailable())(
       await active.waitForComposer(TIMEOUT);
       await active.sendText("Run the prepared command.");
       const compact = await waitForScrollback(active, "FULL_CTRL_O_DONE");
-      expect(compact).toContain("● 1 tool call · 1 command");
+      expect(compact).toMatch(/^● Ran awk .*✓$/m);
       expect(compact).not.toContain("lines more (ctrl+o to view)");
       expect(compact).not.toContain(tailMarker);
       await active.waitForPane(
@@ -1937,7 +1957,8 @@ test.skipIf(!tmuxAvailable())(
       await active.waitForText(tailMarker, TIMEOUT);
 
       await active.sendKeys("C-o");
-      await active.waitForText("● 1 tool call · 1 command", TIMEOUT);
+      // Only the compact view recaps the turn.
+      await active.waitForText("Ran 1 command · ", TIMEOUT);
       const restored = await active.capturePane();
       const restoredScrollback = await active.captureFullScrollback();
       expect(restored).not.toContain("lines more (ctrl+o to view)");
@@ -2015,7 +2036,7 @@ test.skipIf(!tmuxAvailable())(
       await active.waitForComposer(TIMEOUT);
       await active.sendText("Run the prepared cap-crossing command.");
       const compact = await waitForScrollback(active, finalMarker, timeout);
-      expect(compact).toContain("● 1 tool call · 1 command");
+      expect(compact).toContain("● Ran awk, printf, sleep +1 more ✓");
       expect(compact).not.toContain("lines more (ctrl+o to view)");
       expect(compact).not.toContain(stdoutTail);
       expect(compact).not.toContain(stderrTail);
@@ -2383,6 +2404,7 @@ while :; do :; done
       expect(beforePlain).not.toContain(tailMarker);
 
       const sessionId = sessionIdFromHome(home);
+      await waitForSavedInterruptedTurn(home, sessionId, timeout);
       const replays = commandReplays(home, sessionId);
       expect(replays).toHaveLength(1);
       const replayName = replays[0]!.name;
@@ -2590,6 +2612,7 @@ while :; do :; done
       expect(countOccurrences(compact, headMarker)).toBe(0);
       expect(compact).not.toContain(tailMarker);
       const sessionId = sessionIdFromHome(home);
+      await waitForSavedInterruptedTurn(home, sessionId, timeout);
       const replays = commandReplays(home, sessionId);
       expect(replays).toHaveLength(1);
       expect(statSync(replays[0]!.path).size).toBeGreaterThan(0);
@@ -2673,7 +2696,8 @@ test.skipIf(!tmuxAvailable())(
     const finalMarker = "ORDER_REPRO_DONE";
     const prompt =
       "Use the shell tool to run exactly pwd and no other commands. Then reply with the completion marker.";
-    const statusLine = "└ Ran pwd";
+    // The group's only call is its header, marked with the result.
+    const statusLine = "● Ran pwd ✓";
     const outputLine = workspace;
     const reviewOutputPrefix = workspace.slice(0, 56);
     const visibleLinearText = (text: string): string =>
@@ -3118,7 +3142,8 @@ test.skipIf(!tmuxAvailable())(
       });
       await active.waitForComposer(TIMEOUT);
       await active.sendText("Run the prepared Ctrl-O cancellation check.");
-      await active.waitForText(streamMarker, TIMEOUT);
+      // The running row shows the inline script's steps in short form.
+      await active.waitForText("Running printf, sleep", TIMEOUT);
 
       await active.sendKeys("C-o");
       await active.waitForText("esc close · pgup/pgdn scroll", TIMEOUT);
@@ -3185,7 +3210,8 @@ test.skipIf(!tmuxAvailable())(
       });
       await active.waitForComposer(TIMEOUT);
       await active.sendText("Run the prepared command.");
-      await active.waitForText("Running sh -c", TIMEOUT);
+      // The inline script shows its steps in short form.
+      await active.waitForText("Running printf, sleep, printf", TIMEOUT);
 
       await active.sendKeys("C-o");
       await active.waitForText(tailMarker, TIMEOUT);
@@ -3259,7 +3285,7 @@ test.skipIf(!tmuxAvailable())(
       await active.sendText("Run the prepared streaming command.");
       await active.waitForPane(
         (pane) =>
-          pane.includes("Running zsh -lc") &&
+          pane.includes("Running printf, sleep, printf") &&
           !pane.includes(`${lineMarker} 001`),
         TIMEOUT,
       );
@@ -3424,7 +3450,7 @@ test.skipIf(!tmuxAvailable())(
       await active.sendText("Run the prepared streaming command.");
       await active.waitForPane(
         (pane) =>
-          pane.includes("Running zsh -lc") &&
+          pane.includes("Running printf, sleep, printf") &&
           !pane.includes(`${commandMarker} 00005`),
         TIMEOUT,
       );
@@ -3512,7 +3538,8 @@ test.skipIf(!tmuxAvailable())(
       });
       await active.waitForComposer(TIMEOUT);
       await active.sendText("Run the prepared command and ask the prepared question.");
-      await active.waitForText(commandMarker, TIMEOUT);
+      // The command's row shows its inline script's steps in short form.
+      await active.waitForText("printf, sleep", TIMEOUT);
       await active.sendKeys("C-o");
       await active.waitForText(questionMarker, TIMEOUT);
 
@@ -4276,7 +4303,9 @@ test.skipIf(!tmuxAvailable())(
       await active.waitForText("Would you like to run the following command?", actionTimeout);
       await active.sendKeys("1");
       await active.sendKeys("Enter");
-      await active.waitForText("CTRL_O_HANDOFF_FIRST_RUNNING", actionTimeout);
+      // The first command's row appears when it starts, with the steps of its
+      // inline script in short form.
+      await active.waitForText("Running touch, printf, sleep +1 more", actionTimeout);
       const beforeHandoff = await active.captureFullScrollback();
       expect(countOccurrences(beforeHandoff, bulletMarker)).toBe(1);
       expect(countOccurrences(beforeHandoff, codeMarker)).toBe(1);
@@ -4472,7 +4501,7 @@ test.skipIf(!tmuxAvailable())(
       await active.sendKeys("Enter");
       await active.waitForPane(
         (pane) =>
-          pane.includes("Running sh -c") &&
+          pane.includes("Running printf, sleep, printf") &&
           !pane.includes(`${streamPrefix}004`),
         TIMEOUT,
       );
@@ -4574,7 +4603,7 @@ test.skipIf(!tmuxAvailable())(
       );
       const afterFileRejection = await active.waitForPane(
         (pane) =>
-          pane.includes("Ran sh -c") &&
+          pane.includes("Ran printf, sleep, printf") &&
           !pane.includes("Apply this change?"),
         TIMEOUT,
       );
@@ -5056,10 +5085,12 @@ test.skipIf(!tmuxAvailable())(
     let active: TmuxSession | null = null;
 
     function expectDeferredPresentation(scrollback: string): void {
-      expect(scrollback).toContain("1 failed");
+      // The failure control ran last, and the deferred call does not count.
+      expect(scrollback).toContain("● Ran commands, read a file ✗");
       expect(scrollback).not.toContain("command not run");
       expect(scrollback).not.toContain("1 deferred");
-      expect(scrollback).toContain(`Reading project instructions before continuing: ${command}`);
+      // The hold for project instructions gets no row in the compact view.
+      expect(scrollback).not.toContain("Reading project instructions before continuing");
       expect(scrollback).not.toContain("Not executed");
       expect(scrollback).not.toContain("├ terminal");
       expect(scrollback).not.toContain("└ terminal");
@@ -5067,9 +5098,10 @@ test.skipIf(!tmuxAvailable())(
       expect(scrollback).not.toContain("└ read_file");
       expect(scrollback).not.toContain("● Failed nested/input.txt");
       expect(scrollback).not.toContain(`● Failed ${command}`);
-      expect(scrollback).toContain("Read nested/input.txt");
+      expect(scrollback).toContain("Read input.txt");
       expect(scrollback).toContain(`Ran ${command}`);
-      expect(scrollback).toContain(`Exited 7 ${failureCommand}`);
+      // The failure control's steps show in short form; `exit` drops out.
+      expect(scrollback).toContain("Exited 7 printf");
       expect(scrollback).not.toContain("│ exit code 7");
     }
 
@@ -7428,8 +7460,7 @@ printf '${stdoutTail2}\\n'
     let active: TmuxSession | null = null;
 
     function expectCompactCommandOutput(pane: string): void {
-      expect(pane).toContain("● 1 tool call · 1 command");
-      expect(pane).toContain("Ran ./resume-command-output.sh");
+      expect(pane).toContain("● Ran ./resume-command-output.sh ✓");
       expect(pane).not.toContain("lines more (ctrl+o to view)");
       expect(pane).not.toContain(firstMarker);
       expect(pane).not.toContain("RESUME_COMMAND_TAIL");
@@ -8537,6 +8568,153 @@ test.skipIf(!tmuxAvailable())(
   120_000,
 );
 
+/// The compact view's tool rows and cancellation lines on `screen`.
+function compactToolRows(screen: string): string[] {
+  return stripAnsi(screen)
+    .split("\n")
+    .map((line) => line.trimEnd())
+    .filter((line) => /^\s*[●├└▪] /.test(line));
+}
+
+/// The notice under a cancelled command, which names no command.
+const CANCELLED_COMMAND_NOTICE = "▪ Cancelled · What can fx do differently?";
+
+/// Checks that Ctrl+O shows `command` in full, then closes it.
+async function expectFullTranscriptShows(session: TmuxSession, command: string, timeout: number) {
+  await session.sendKeys("C-o");
+  expect(stripAnsi(await session.waitForText(command, timeout))).toContain(`Cancelled ${command}`);
+  await session.sendKeys("Escape");
+  await session.waitForComposer(timeout);
+}
+
+const cancelledRowCases = [
+  {
+    name: "a lone command cancelled before it printed anything",
+    command: "touch .cancel-ready && sleep 60",
+    before: [] as string[],
+    row: "● Cancelled touch, sleep",
+    printed: false,
+  },
+  {
+    name: "a lone command cancelled after it printed",
+    command: "echo CANCEL_PRINTED; touch .cancel-ready; sleep 60",
+    before: [] as string[],
+    row: "● Cancelled echo, touch, sleep",
+    printed: true,
+  },
+  {
+    name: "a silent command cancelled after another command ran",
+    command: "touch .cancel-ready && sleep 60",
+    before: ["echo FIRST_STEP_DONE"],
+    row: "└ Cancelled touch, sleep",
+    printed: false,
+  },
+];
+
+for (const scenario of cancelledRowCases) {
+  test.skipIf(!tmuxAvailable())(
+    `${scenario.name} reads the same after resume, by its short name`,
+    async () => {
+      const timeout = 60_000;
+      const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-cancelled-row-resume-")));
+      const home = join(root, "home");
+      const workspace = join(root, "workspace");
+      const tracePath = join(root, "trace.log");
+      const readyPath = join(workspace, ".cancel-ready");
+      mkdirSync(join(home, ".fx"), { recursive: true });
+      mkdirSync(workspace);
+      writeFileSync(
+        join(home, ".fx", "settings.json"),
+        JSON.stringify({ sandbox: "none", permission_mode: "auto", permission: {} }),
+      );
+      const initialGateway = startFakeGateway([
+        ...scenario.before.map((command, index) => fakeShellRun(`cancelled-row-before-${index}`, command)),
+        fakeShellRun("cancelled-row-command", scenario.command),
+      ]);
+      const resumedGateway = startFakeGateway([]);
+      let active: TmuxSession | null = null;
+      let passed = false;
+      try {
+        active = await TmuxSession.create({
+          cmd: FX_BIN,
+          cwd: realpathSync(workspace),
+          env: { ...gatewayEnv(home, initialGateway), FX_TRACE_LOG: tracePath, FX_TRACE_SCOPES: "session,interrupt" },
+          width: 100,
+          height: 32,
+        });
+        await active.waitForComposer(TIMEOUT);
+        await active.sendText("Run the commands.");
+        await waitForCondition(() => existsSync(readyPath), "the command's readiness file", timeout);
+        await active.sendInterruptEscapePair(timeout);
+        const live = compactToolRows(await waitForScrollback(active, "What can fx do differently?", timeout));
+        await waitForCondition(
+          () => existsSync(tracePath) && readFileSync(tracePath, "utf8").includes("event=interrupt_persisted"),
+          "the interrupted turn on disk",
+          timeout,
+        );
+        await expectFullTranscriptShows(active, scenario.command, timeout);
+        await active.sendText("/quit");
+        expect(await active.waitForSessionEnd()).toBe(true);
+        await active.kill();
+        active = null;
+
+        // The live row shows the command's short name, and the notice under
+        // it names no command, so no line holds the full one.
+        expect(live).toContain(scenario.row);
+        expect(live.filter((line) => line.startsWith("▪"))).toEqual([CANCELLED_COMMAND_NOTICE]);
+        expect(live.join("\n")).not.toContain(scenario.command);
+
+        const items = savedItems(home, onlySessionId(home));
+
+        active = await TmuxSession.create({
+          cmd: `${FX_BIN} --resume last`,
+          cwd: realpathSync(workspace),
+          env: gatewayEnv(home, resumedGateway),
+          width: 100,
+          height: 32,
+        });
+        await active.waitForComposer(TIMEOUT);
+        const resumed = compactToolRows(await waitForScrollback(active, "What can fx do differently?", timeout));
+        expect(resumed).toEqual(live);
+        expect(resumed.filter((line) => line.startsWith("▪"))).toEqual([CANCELLED_COMMAND_NOTICE]);
+        expect(resumed.join("\n")).not.toContain(scenario.command);
+        await expectFullTranscriptShows(active, scenario.command, timeout);
+        expect(resumedGateway.requests).toHaveLength(0);
+
+        // The saved turn named the command's output when it printed, and
+        // saved the cancelled command item when it didn't.
+        const interruption = items.find((item) => item.interruption)!.interruption;
+        const marker = items.filter((item) => item.cancelled_command);
+        if (scenario.printed) {
+          expect(interruption.command_replay_ref).toEqual(expect.any(String));
+          expect(marker).toEqual([]);
+        } else {
+          expect(interruption.command_replay_ref).toBeNull();
+          expect(marker).toEqual([{ cancelled_command: { call_id: "cancelled-row-command" } }]);
+        }
+        passed = true;
+      } finally {
+        if (active) {
+          if (!passed) {
+            try {
+              writeFileSync(join(root, "failure-scrollback.txt"), await active.captureFullScrollback());
+            } catch {}
+          }
+          await active.kill();
+        }
+        initialGateway.stop();
+        resumedGateway.stop();
+        if (passed) {
+          rmSync(root, { recursive: true, force: true });
+        } else {
+          console.error(`retained cancelled row resume artifacts at ${root}`);
+        }
+      }
+    },
+    120_000,
+  );
+}
+
 test.skipIf(!tmuxAvailable())(
   "latest and picker resume preserve conversations beside incomplete session creation",
   async () => {
@@ -8641,14 +8819,18 @@ test.skipIf(!tmuxAvailable())(
       const historyPath = logOf(home, sessionId);
       const before = readFileSync(historyPath, "utf8");
       await active.sendText("/compact");
-      // Success is silent; publication, not a transcript notice, gates resume.
+      // Publication, not the transcript line, gates resume.
       await waitForCondition(() => readFileSync(historyPath, "utf8").includes('"kind":"compacted"'), "durable context checkpoint");
-      await active.waitForPane((pane) => hasEmptyComposer(pane) && !/Preparing compaction|Compacting|Stopping compaction/.test(pane), TIMEOUT);
+      // The success line arrives as a queued notice just after the row clears.
+      await active.waitForPane((pane) =>
+        hasEmptyComposer(pane) &&
+        !/Compacting|Stopping compaction/.test(pane) &&
+        /Context compacted \((?:\d+h)?(?:\d+m)?\d+s\)/.test(pane), TIMEOUT);
       const compacted = readFileSync(historyPath, "utf8");
       expect(compacted.startsWith(before)).toBe(true);
       const records = compacted.trim().split("\n").map((line) => JSON.parse(line));
       expect(records.filter((record) => record.kind === "compacted")).toHaveLength(1);
-      expect(await active.captureFullScrollback()).not.toContain("Context compacted.");
+      expect(await active.captureFullScrollback()).toMatch(/Context compacted \((?:\d+h)?(?:\d+m)?\d+s\)/);
       // Plain turns have nothing to summarize, but the earlier message may set
       // a rule, so the one model call files it; the checkpoint keeps the
       // earlier message and reply word for word.
@@ -9065,13 +9247,15 @@ test.skipIf(!tmuxAvailable())("resumed command rows reclip to live width after t
     const scrollback = await waitForScrollback(active, "RECLIP_MOVED_REPLY");
     // The replayed row abbreviates against the live workspace and reclips to
     // the live width instead of keeping the frozen compact-bound marker.
-    const row = scrollback.split("\n").find((line) => line.includes("Still running cd ./alpha"));
+    // The launch and its observe share one session row, which is the group's
+    // header and shows the launch command's steps in short form.
+    const row = scrollback.split("\n").find((line) => line.includes("Observed printf"));
     expect(row).toBeDefined();
-    expect(row!).toContain(tail);
+    expect(row!).toContain(" · 2 calls");
     expect(row!).not.toContain("...");
     // Session-action rows resolve the launch command through the live root
     // instead of falling back to the raw session id.
-    expect(scrollback).toContain("Observed cd ./alpha");
+    expect(scrollback).toContain("Observed printf");
     expect(scrollback).not.toContain("Observed shell-1");
     await active.sendText("/quit");
     expect(await active.waitForSessionEnd(TIMEOUT)).toBe(true);
@@ -9128,14 +9312,7 @@ async function endFx(session: TmuxSession, signal: "SIGKILL" | "SIGHUP") {
   const pid = session.processPid();
   process.kill(pid, signal);
   const deadline = Date.now() + 10_000;
-  while (Date.now() < deadline) {
-    try {
-      process.kill(pid, 0);
-    } catch {
-      break;
-    }
-    await Bun.sleep(25);
-  }
+  while (Date.now() < deadline && processAlive(pid)) await Bun.sleep(25);
   await session.kill();
 }
 

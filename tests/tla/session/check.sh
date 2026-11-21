@@ -71,11 +71,13 @@ TurnStream stream-mutant-bytes-only SupersedeExplained
 TurnStream stream-mutant-loose-compare CommitIsFinal
 TurnStream stream-mutant-mix CommitIsFinal
 TurnStream stream-mutant-prefix-only CommitIsFinal
+TurnStream stream-mutant-continue-stale StaleTurnNeverContinues
 TurnStream stream-witness-supersede NeverSuperseded
 TurnStream stream-witness-commit NeverCommittedWhole
 TurnStream stream-witness-compaction NeverCommittedAfterCut
 TurnStream stream-witness-recovery NeverCommittedAfterRecovery
 TurnStream stream-witness-missed-path MissedPathsNeverParse
+TurnStream stream-witness-failed-commit NeverCommittedAfterFailure
 TurnStream stream-simulate simulate $sim
 TurnStream stream-simulate-before simulate $sim
 SessionWrite session-write -

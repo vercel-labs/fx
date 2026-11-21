@@ -13,6 +13,8 @@ const discoveryMethodNotFound = process.env.FX_MCP_LEGACY_DISCOVERY_METHOD_NOT_F
 const discoveryInvalidParams = process.env.FX_MCP_LEGACY_DISCOVERY_INVALID_PARAMS === "1";
 const rejectNewerInitialize = process.env.FX_MCP_LEGACY_REJECT_NEWER_INITIALIZE === "1";
 const draft7Pattern = process.env.FX_MCP_DRAFT7_PATTERN;
+const rawFormSchema = process.env.FX_MCP_RAW_FORM_SCHEMA;
+const rawFormSchemaMark = "raw-form-schema-mark";
 const elicitationUrl = process.env.FX_MCP_ELICITATION_URL ?? "https://example.test/authorize";
 const urlRequiredOperation = process.env.FX_MCP_URL_REQUIRED_OPERATION ?? "tools";
 let buffer = Buffer.alloc(0);
@@ -42,8 +44,76 @@ if (startupFailure) {
   else setTimeout(fail, 400);
 }
 
+// FX_MCP_ESCAPE_KEYS=mode,url: write each of these keys with one \uXXXX escape (mode becomes m\u006fde) in every
+// message this server sends. The bytes still mean the same key to any JSON reader that decodes keys.
+const escapedKeys = (process.env.FX_MCP_ESCAPE_KEYS ?? "").split(",").filter(Boolean);
+function writeEscapedKeys(line) {
+  for (const key of escapedKeys) {
+    const escaped = `${key[0]}\\u${key.charCodeAt(1).toString(16).padStart(4, "0")}${key.slice(2)}`;
+    line = line.replaceAll(`"${key}":`, `"${escaped}":`);
+  }
+  return line;
+}
+
 function send(message) {
-  process.stdout.write(`${JSON.stringify(message)}\n`);
+  let line = writeEscapedKeys(JSON.stringify(message));
+  // A form schema given as raw JSON text goes out as written, with its escapes.
+  if (rawFormSchema !== undefined) line = line.replace(`"${rawFormSchemaMark}"`, () => rawFormSchema);
+  process.stdout.write(`${line}\n`);
+}
+
+// FX_MCP_MODE=refused_reply: each tools/call follows its entry in FX_MCP_REFUSED's `calls`, a JSON
+// array of { bad, then, slowMs, progressEveryMs }. `bad` first writes a line fx refuses and cannot
+// attach to a call: "utf8_last" (bytes that are not UTF-8, the id after them), "deep_last" (JSON
+// nested past the engine's limit, the id last), "garbage" (a line with no JSON, as a notification
+// the server mangled would be), "cut" (a reply cut in the middle) or "duplicate_escaped" (the id first,
+// then `result` twice, the second time written `r\u0065sult`, which JSON reads as the same name). `then` is "silent" (nothing
+// more), "exit" (the server exits), or by default the valid reply, `slowMs` later, with progress
+// for the call's own token every `progressEveryMs` until then.
+const refused = JSON.parse(process.env.FX_MCP_REFUSED ?? "{}");
+let refusedCalls = 0;
+
+function writeRaw(...parts) {
+  process.stdout.write(Buffer.concat(parts.map((part) => (Buffer.isBuffer(part) ? part : Buffer.from(part)))));
+}
+
+function refusedLine(id, bad) {
+  switch (bad) {
+    case "utf8_last":
+      return [
+        '{"jsonrpc":"2.0","result":{"content":[{"type":"text","text":"x',
+        Buffer.from([0xff, 0xfe]),
+        `"}]},"id":${id}}\n`,
+      ];
+    case "deep_last":
+      return [`{"jsonrpc":"2.0","result":{"content":[],"structuredContent":${'{"a":'.repeat(3000)}1${"}".repeat(3000)}},"id":${id}}\n`];
+    case "garbage":
+      return [`${"x".repeat(80)}\n`];
+    case "duplicate_escaped":
+      return [`{"jsonrpc":"2.0","id":${id},"result":{"content":[]},"r\\u0065sult":{"content":[]}}\n`];
+    case "cut":
+      return [`{"jsonrpc":"2.0","id":${id},"result":{"content":[{"type":"te\n`];
+    default:
+      return [];
+  }
+}
+
+function handleRefusedReply(message, spec) {
+  const token = message.params?._meta?.progressToken;
+  writeRaw(...refusedLine(message.id, spec.bad));
+  if (spec.then === "silent") return;
+  if (spec.then === "exit") {
+    setTimeout(() => process.exit(0), 50);
+    return;
+  }
+  let progress = 0;
+  const timer = spec.progressEveryMs
+    ? setInterval(() => send({ jsonrpc: "2.0", method: "notifications/progress", params: { progressToken: token, progress: ++progress } }), spec.progressEveryMs)
+    : undefined;
+  setTimeout(() => {
+    clearInterval(timer);
+    send({ jsonrpc: "2.0", id: message.id, result: { content: [{ type: "text", text: resultText }] } });
+  }, spec.slowMs ?? 0);
 }
 
 function log(message) {
@@ -182,10 +252,13 @@ function handle(message) {
   log(message);
 
   if (pendingToolCall && message.id === "legacy-elicitation") {
-    if (message.jsonrpc !== "2.0" || message.result?.action !== "accept") process.exit(8);
-    const answer = message.result?.content?.choice;
-    if (legacyVersion === "2025-06-18" && answer !== "legacy-alpha-choice") process.exit(9);
-    if (legacyVersion === "2025-11-25" && answer !== "legacyvalid") process.exit(10);
+    // With a raw form schema the answer is whatever the test gave: the wire log has it.
+    if (rawFormSchema === undefined) {
+      if (message.jsonrpc !== "2.0" || message.result?.action !== "accept") process.exit(8);
+      const answer = message.result?.content?.choice;
+      if (legacyVersion === "2025-06-18" && answer !== "legacy-alpha-choice") process.exit(9);
+      if (legacyVersion === "2025-11-25" && answer !== "legacyvalid") process.exit(10);
+    }
     const call = pendingToolCall;
     pendingToolCall = null;
     send({
@@ -273,8 +346,12 @@ function handle(message) {
       // own version and never asks for one.
       const asksForUrl = (mode === "url_required_error" || mode === "url_required_multiple") &&
         legacyVersion === "2025-11-25";
+      // FX_MCP_ALLOW_FORM_ONLY=1 lets a client that declares forms and no URLs connect, to see what fx
+      // does with a URL question it cannot take.
+      const formOnly = process.env.FX_MCP_ALLOW_FORM_ONLY === "1" && capability?.form != null;
       if (
         (mode === "direct_form" || asksForUrl) &&
+        !formOnly &&
         (capability?.form == null || capability?.url == null)
       ) process.exit(7);
     }
@@ -302,6 +379,10 @@ function handle(message) {
   if (message.method === "notifications/initialized") return;
   if (message.method === "tools/list") {
     toolsListCalls += 1;
+    if (deepSite().startsWith("tool_")) {
+      sendDeepToolList(message);
+      return;
+    }
     send({
       jsonrpc: "2.0",
       id: message.id,
@@ -406,21 +487,69 @@ function handle(message) {
     return;
   }
   if (message.method === "tools/call") {
+    if (deepSite() !== "" && !deepSite().startsWith("tool_")) {
+      sendDeepResult(message);
+      return;
+    }
+    if (mode === "refused_reply") {
+      refusedCalls += 1;
+      handleRefusedReply(message, refused.calls?.[refusedCalls - 1] ?? {});
+      return;
+    }
     if (mode === "invalid_params") {
       // A server built on the Go MCP SDK refuses arguments of the wrong type
       // with -32602, in its validator's words, then the tool's schema, as
       // Datadog's server does.
-      send({
+      // A server may explain a refusal in the error's data: FX_MCP_PROTOCOL_ERROR_DATA is
+      // its JSON, FX_MCP_PROTOCOL_ERROR_DATA_BYTES is a data member of about that size,
+      // and FX_MCP_PROTOCOL_ERROR_CODE is the code. FX_MCP_PROTOCOL_ERROR_FAULT breaks the
+      // reply: "pieces" writes it in small chunks, and "cut" stops in the middle of it.
+      const dataBytes = process.env.FX_MCP_PROTOCOL_ERROR_DATA_BYTES;
+      const dataText = process.env.FX_MCP_PROTOCOL_ERROR_DATA;
+      const reply = {
         jsonrpc: "2.0",
         id: message.id,
         error: {
-          code: -32602,
-          message: 'validating "arguments": validating root: validating /properties/limit: ' +
-            'type: "40" has type "string", want "number"\n\n' +
-            'Full input schema for tool "echo":\n' +
-            '{"type":"object","properties":{"limit":{"type":"number"}}}',
+          code: Number(process.env.FX_MCP_PROTOCOL_ERROR_CODE ?? -32602),
+          // FX_MCP_PROTOCOL_ERROR_MESSAGE replaces the whole message.
+          message: process.env.FX_MCP_PROTOCOL_ERROR_MESSAGE ??
+            ('validating "arguments": validating root: validating /properties/limit: ' +
+              'type: "40" has type "string", want "number"\n\n' +
+              'Full input schema for tool "echo":\n' +
+              '{"type":"object","properties":{"limit":{"type":"number"}}}'),
+          ...(dataBytes
+            ? { data: { detail: "d".repeat(Number(dataBytes)) } }
+            : dataText
+            ? { data: JSON.parse(dataText) }
+            : {}),
         },
-      });
+      };
+      const fault = process.env.FX_MCP_PROTOCOL_ERROR_FAULT;
+      // FX_MCP_PROTOCOL_ERROR_DATA_RAW is the data's text, written as it is, spaces and all.
+      const rawData = process.env.FX_MCP_PROTOCOL_ERROR_DATA_RAW;
+      if (rawData !== undefined) {
+        reply.error.data = "@@RAW@@";
+        process.stdout.write(JSON.stringify(reply).replace('"@@RAW@@"', () => rawData) + "\n");
+        return;
+      }
+      if (!fault) {
+        send(reply);
+        return;
+      }
+      const line = JSON.stringify(reply);
+      if (fault === "cut") {
+        process.stdout.write(line.slice(0, Math.floor(line.length / 2)), () => process.exit(0));
+      } else {
+        // "pieces": 1,000 bytes at a time, with a breath between them.
+        let sent = 0;
+        const next = () => {
+          if (sent >= line.length) return process.stdout.write("\n");
+          process.stdout.write(line.slice(sent, sent + 1000));
+          sent += 1000;
+          setTimeout(next, 1);
+        };
+        next();
+      }
       return;
     }
     if (mode === "draft7_schema" && draft7Pattern && !new RegExp(draft7Pattern, "u").test(message.params?.arguments?.text)) {
@@ -435,7 +564,9 @@ function handle(message) {
         jsonrpc: "2.0",
         id: "legacy-elicitation",
         method: "elicitation/create",
-        params: legacyVersion === "2025-06-18"
+        params: rawFormSchema !== undefined
+          ? { mode: "form", message: "Fill in the form", requestedSchema: rawFormSchemaMark }
+          : legacyVersion === "2025-06-18"
           ? {
               message: "Choose a legacy value",
               requestedSchema: {
@@ -520,3 +651,82 @@ process.stdin.on("data", (chunk) => {
     if (line.length > 0) handle(JSON.parse(line));
   }
 });
+
+// FX_MCP_DEEP_SITE nests JSON at one place, for the depth limit on a server's JSON. FX_MCP_DEEP_DEPTH is the
+// nesting depth of the root value fx checks (the result for the result sites, the tool object for the tool
+// sites), FX_MCP_DEEP_SHAPE is object (the default), array or mixed. Sites: structured, content_meta,
+// content_annotations, error_data, tool_meta, tool_annotations, tool_icons.
+function deepSite() {
+  return process.env.FX_MCP_DEEP_SITE ?? "";
+}
+
+/** A value with exactly `depth` containers inside one another, and 1 at the bottom. */
+function deepValue(depth, objectRoot) {
+  const shape = process.env.FX_MCP_DEEP_SHAPE ?? "object";
+  let text = "1";
+  for (let level = 1; level <= depth; level += 1) {
+    const fromRoot = depth - level;
+    const object = shape === "object" || (shape === "mixed" && fromRoot % 2 === 0) || (objectRoot && fromRoot === 0);
+    text = object ? `{"a":${text}}` : `[${text}]`;
+  }
+  return text;
+}
+
+function sendDeepText(message, replacements) {
+  let text = JSON.stringify(message);
+  for (const [marker, value] of Object.entries(replacements)) text = text.replace(`"${marker}"`, () => value);
+  if (process.env.FX_MCP_DEEP_FAULT === "cut") {
+    // The reply stops in the middle of the nesting, as a server that dies while writing it.
+    process.stdout.write(text.slice(0, Math.floor(text.length / 2)), () => process.exit(0));
+    return;
+  }
+  process.stdout.write(`${text}\n`);
+}
+
+function sendDeepToolList(message) {
+  const site = deepSite();
+  const depth = Number(process.env.FX_MCP_DEEP_DEPTH ?? "0");
+  const deep = {
+    name: "deep",
+    description: "A tool whose listing is nested deeper than fx accepts",
+    inputSchema: { type: "object", properties: { text: { type: "string" } } },
+  };
+  if (site === "tool_meta") deep._meta = "@@DEEP@@";
+  if (site === "tool_annotations") deep.annotations = { x: "@@DEEP@@" };
+  if (site === "tool_icons") deep.icons = [{ src: "https://example.test/icon.png", x: "@@DEEP@@" }];
+  // The tool object is one level, and the field's own wrapper levels come out of the depth.
+  const inner = site === "tool_meta" ? depth - 1 : site === "tool_annotations" ? depth - 2 : depth - 3;
+  const good = {
+    name: currentToolName,
+    description: "Echo text through the legacy MCP fixture",
+    inputSchema: { type: "object", properties: { text: { type: "string" } }, required: ["text"] },
+  };
+  sendDeepText({ jsonrpc: "2.0", id: message.id, result: { tools: [good, deep] } }, { "@@DEEP@@": deepValue(inner, site === "tool_meta") });
+}
+
+function sendDeepResult(message) {
+  const site = deepSite();
+  const depth = Number(process.env.FX_MCP_DEEP_DEPTH ?? "0");
+  if (site === "error_data") {
+    sendDeepText(
+      { jsonrpc: "2.0", id: message.id, error: { code: -32602, message: "bad", data: "@@DEEP@@" } },
+      { "@@DEEP@@": deepValue(depth, false) },
+    );
+    return;
+  }
+  const result = { content: [{ type: "text", text: `${resultText}:${message.params?.arguments?.text ?? ""}` }] };
+  let inner = depth;
+  if (site === "structured") {
+    result.structuredContent = "@@DEEP@@";
+    inner = depth - 1;
+  }
+  if (site === "content_meta") {
+    result.content[0]._meta = "@@DEEP@@";
+    inner = depth - 3;
+  }
+  if (site === "content_annotations") {
+    result.content[0].annotations = { x: "@@DEEP@@" };
+    inner = depth - 4;
+  }
+  sendDeepText({ jsonrpc: "2.0", id: message.id, result }, { "@@DEEP@@": deepValue(inner, site === "structured" || site === "content_meta") });
+}
