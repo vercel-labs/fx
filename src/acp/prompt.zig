@@ -569,14 +569,14 @@ const AcpContext = struct {
         try self.sendUpdate(out.writer.buffered());
     }
 
-    fn sendToolCallProgressText(self: *AcpContext, tool_call_id: []const u8, text: ?[]const u8) !void {
+    fn sendToolCallText(self: *AcpContext, tool_call_id: []const u8, status: ?acp_types.ToolCallStatus, text: ?[]const u8) !void {
         const plain = if (text) |value| try stripAnsiAlloc(self.alloc, value) else null;
         defer if (plain) |value| if (text) |original| {
             if (value.ptr != original.ptr) self.alloc.free(value);
         };
         var out: std.Io.Writer.Allocating = .init(self.alloc);
         defer out.deinit();
-        try acp_types.writeToolCallUpdate(&out.writer, tool_call_id, .in_progress, plain);
+        try acp_types.writeToolCallUpdate(&out.writer, tool_call_id, status, plain);
         try self.sendUpdate(out.writer.buffered());
     }
 
@@ -2889,7 +2889,7 @@ fn executeToolCall(
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
 
     const acp_id = ctx.sendToolCallPending(request.call_allocator, request.call) catch "call_unknown";
-    ctx.sendToolCallProgressText(acp_id, null) catch {};
+    ctx.sendToolCallText(acp_id, .in_progress, null) catch {};
 
     var tool_ctx = ctx.toolContext();
     var elicitation_responder = AcpElicitationResponderContext{
@@ -3784,12 +3784,13 @@ fn formatToolExecutionError(_: *anyopaque, arena: Allocator, tool_name: []const 
 fn onCommandOutputChunk(raw_ctx: *anyopaque, lifecycle_id: ?types.ToolLifecycleId, _: command_output_content.Stream, chunk: []const u8) !void {
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
     const id = lifecycle_id orelse return;
-    try ctx.sendToolCallProgressText(id.call_id, chunk);
+    // Output can arrive after the shell tool yielded its session and completed.
+    try ctx.sendToolCallText(id.call_id, null, chunk);
 }
 
 fn onMcpProgress(raw_ctx: *anyopaque, lifecycle_id: types.ToolLifecycleId, text: []const u8) void {
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
-    ctx.sendToolCallProgressText(lifecycle_id.call_id, text) catch |err| {
+    ctx.sendToolCallText(lifecycle_id.call_id, .in_progress, text) catch |err| {
         debug_trace.logf("mcp", "failed to publish ACP MCP progress err={s}", .{@errorName(err)});
     };
 }
