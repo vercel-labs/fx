@@ -346,7 +346,7 @@ const JsonNoticeLog = struct {
             debug_trace.logf("ask", "dropped {s} notice from fx ask --json: the {d}-notice limit is full", .{ topic, max_count });
             return;
         }
-        const kept = cutUtf8(text, max_text_bytes);
+        const kept = text_utils.utf8PrefixByBytes(text, max_text_bytes);
         if (kept.len < text.len) {
             debug_trace.logf("ask", "cut {s} notice for fx ask --json from {d} to {d} bytes", .{ topic, text.len, kept.len });
         }
@@ -367,14 +367,6 @@ const JsonNoticeLog = struct {
         self.items.deinit(alloc);
     }
 };
-
-/// Cuts `text` to at most `max_bytes`, backing up so the cut never splits a character.
-fn cutUtf8(text: []const u8, max_bytes: usize) []const u8 {
-    if (text.len <= max_bytes) return text;
-    var end = max_bytes;
-    while (end > 0 and (text[end] & 0xC0) == 0x80) end -= 1;
-    return text[0..end];
-}
 
 fn freeJsonNoticeTexts(alloc: Allocator, notices: []const JsonNotice) void {
     for (notices) |notice| alloc.free(notice.text);

@@ -31,7 +31,8 @@ pub const Context = struct {
     /// Whether `experimental.hooks` is on. `fx hook list` says so; `test` runs hooks either way.
     hooks_enabled: bool,
     /// Whether this process is fx's own agent (`AI_AGENT=fx`), which may not trust or disable a hook.
-    /// The CLI fills it from the environment; the TUI passes false.
+    /// The CLI reads it from the environment when it starts; the TUI's `/hook` job reads it on the UI thread
+    /// when the job is created.
     agent_is_fx: bool,
     /// Stops the hooks of `test` when set, as Esc does in the TUI. The CLI passes null: its signal handler ends the hook groups (R3.9).
     cancel: ?*const std.atomic.Value(bool) = null,
@@ -115,7 +116,6 @@ fn requestsJson(args: []const [:0]const u8) bool {
     return false;
 }
 
-/// The words after `fx hook`: `list` (or `ls`), or `show ID`, each with `--json` when asked.
 /// What `fx hook trust` names: one hook by id, or every hook that waits for trust.
 const HookTrust = union(enum) { id: []const u8, all };
 
@@ -131,6 +131,11 @@ const HookTest = struct {
 /// What `fx hook log` shows: how many recent runs.
 const HookLog = struct { limit: usize };
 
+/// The seven verbs of `fx hook`, in the order the usage names them. The `/hook` job and the typo suggestion read it.
+pub const verb_words = [_][]const u8{ "list", "show", "trust", "enable", "disable", "test", "log" };
+
+/// The words after `fx hook`: `list` (or `ls`), `show ID`, `trust`, `enable`, `disable`, `test`, or `log`,
+/// each with `--json` when asked.
 const HookOptions = struct {
     command: union(enum) {
         list,
@@ -235,7 +240,7 @@ fn firstHookWord(args: []const [:0]const u8) ?[]const u8 {
 /// The closest hook word to `word`, for a typo; null when none is close.
 pub fn hookWordSuggestion(word: []const u8) ?[]const u8 {
     if (word.len == 0) return null;
-    for ([_][]const u8{ "list", "show" }) |candidate| {
+    for (verb_words) |candidate| {
         if (fuzzy_match.match(word, &.{.{ .text = candidate }}) != null) return candidate;
     }
     return null;
@@ -256,7 +261,7 @@ fn hookOutputKind(args: []const [:0]const u8) []const u8 {
 /// The text of a `fx hook` usage error. The caller adds the `fx hook: ` prefix in text.
 fn hookUsageMessage(alloc: Allocator, args: []const [:0]const u8, err: anyerror) ![]u8 {
     return switch (err) {
-        error.HookNeedsCommand => alloc.dupe(u8, "needs a command: list or show ID"),
+        error.HookNeedsCommand => alloc.dupe(u8, "needs a command: list, show, trust, enable, disable, test, or log"),
         error.UnknownHookCommand => blk: {
             const word = firstHookWord(args) orelse "";
             if (hookWordSuggestion(word)) |suggestion| {
@@ -289,7 +294,6 @@ fn hookCommandText(arena: Allocator, command: anytype) ![]const u8 {
     };
 }
 
-/// One loaded hook as the CLI reports it. Strings point into `loaded` or into `arena`.
 /// The status `fx hook list` shows for hook `index`. `fx status` and `fx doctor` count with it too.
 fn hookStatus(loaded: *const hooks_host.loader.Snapshot, index: usize) output_contracts.HookStatus {
     if (loaded.disabled[index]) return .disabled;
@@ -297,6 +301,7 @@ fn hookStatus(loaded: *const hooks_host.loader.Snapshot, index: usize) output_co
     return .waiting;
 }
 
+/// One loaded hook as the CLI reports it. Strings point into `loaded` or into `arena`.
 fn hookRow(arena: Allocator, loaded: *const hooks_host.loader.Snapshot, index: usize) !output_contracts.HookRow {
     const hook = loaded.hooks[index];
     return .{

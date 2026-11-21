@@ -317,7 +317,7 @@ const Parser = struct {
             '(' => return self.parseGroup(),
             '[' => return self.parseClass(),
             '\\' => return self.parseEscape(),
-            '*', '+', '?', '|', ')' => return error.InvalidMatcher,
+            '*', '+', '?', '|', ')', '{', '}' => return error.InvalidMatcher,
             else => {
                 self.index += 1;
                 return self.node(.{ .literal = c });
@@ -355,7 +355,8 @@ const Parser = struct {
         return self.node(.{ .class = index });
     }
 
-    /// Reads one escape sequence and returns the byte or the set it stands for.
+    /// Reads one escape sequence and returns the byte or the set it stands for. An escaped letter or
+    /// digit other than the classes above is invalid, so `\b`, `\n`, and `\1` never match as letters.
     fn readEscape(self: *Parser) CompileError!ClassItem {
         if (self.index + 1 >= self.pattern.len) return error.InvalidMatcher;
         const c = self.pattern[self.index + 1];
@@ -367,7 +368,10 @@ const Parser = struct {
             'D' => .{ .set = complement(digitSet()) },
             'W' => .{ .set = complement(wordSet()) },
             'S' => .{ .set = complement(spaceSet()) },
-            else => .{ .byte = c },
+            else => blk: {
+                if (std.ascii.isAlphanumeric(c)) return error.InvalidMatcher;
+                break :blk .{ .byte = c };
+            },
         };
     }
 
@@ -665,7 +669,26 @@ test "classes and escapes" {
     try expectMatches(alloc, "\\w\\s\\W", "a !", true);
     try expectMatches(alloc, "a\\.b", "a.b", true);
     try expectMatches(alloc, "a\\.b", "axb", false);
-    try expectMatches(alloc, "a{2}", "a{2}", true);
+    try expectMatches(alloc, "a\\{2\\}", "a{2}", true);
+}
+
+test "escaped punctuation is literal, and a letter, digit, or brace that is not escaped as a class is invalid" {
+    const alloc = std.testing.allocator;
+    try expectMatches(alloc, "a\\|b", "a|b", true);
+    try expectMatches(alloc, "a\\(b\\)", "a(b)", true);
+    try expectMatches(alloc, "a\\\\b", "a\\b", true);
+    try expectMatches(alloc, "a\\/b", "a/b", true);
+    try expectMatches(alloc, "a\\-b", "a-b", true);
+    try expectMatches(alloc, "\\d+", "x42", true);
+    try expectInvalid(alloc, "\\b");
+    try expectInvalid(alloc, "\\B");
+    try expectInvalid(alloc, "\\n");
+    try expectInvalid(alloc, "\\t");
+    try expectInvalid(alloc, "\\1");
+    try expectInvalid(alloc, "a{2}");
+    try expectInvalid(alloc, "a{");
+    try expectInvalid(alloc, "}");
+    try expectInvalid(alloc, "[\\b]");
 }
 
 test "an invalid pattern is rejected" {

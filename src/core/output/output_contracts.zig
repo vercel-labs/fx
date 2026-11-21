@@ -313,10 +313,10 @@ fn writeHookLogTable(arena: Allocator, w: *std.Io.Writer, entries: []const HookL
         var time_buf: [19]u8 = undefined;
         cells[row] = .{
             try arena.dupe(u8, formatLogTime(&time_buf, entry.time_ms)),
-            entry.event,
+            try safeCell(arena, entry.event),
             try safeCell(arena, entry.match orelse "-"),
             try arena.print("{d}", .{entry.ran}),
-            entry.decision,
+            try safeCell(arena, entry.decision),
             try safeCell(arena, entry.decided_by orelse "-"),
         };
     }
@@ -5723,6 +5723,30 @@ test "hook text escapes control bytes from the hook's own text in each text rend
     defer alloc.free(log_text);
     try std.testing.expect(std.mem.findScalar(u8, log_text, 0x1b) == null);
     try std.testing.expect(std.mem.find(u8, log_text, "reason: no") != null);
+}
+
+test "hook log table escapes control bytes in the event and decision cells" {
+    const alloc = std.testing.allocator;
+    const esc = "\x1b[31m";
+
+    const entry: HookLogEntry = .{
+        .time_ms = 1700000000000,
+        .event = "PreTool" ++ esc,
+        .match = null,
+        .surface = "ask",
+        .session_id = null,
+        .ran = 1,
+        .decision = "deny" ++ esc,
+        .decided_by = null,
+        .reason = null,
+        .notices = 0,
+    };
+    const log: HookLogSnapshot = .{ .file = "/fixture/logs/hooks.jsonl", .entries = &.{entry} };
+    const text = try log.render(alloc, .text);
+    defer alloc.free(text);
+    try std.testing.expect(std.mem.findScalar(u8, text, 0x1b) == null);
+    try std.testing.expect(std.mem.find(u8, text, "PreTool\\x1b") != null);
+    try std.testing.expect(std.mem.find(u8, text, "deny\\x1b") != null);
 }
 
 test "hook test writes a PreToolUse input as JSON and a prompt rewrite as a string" {

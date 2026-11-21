@@ -1,21 +1,19 @@
-//! The `/hook` verbs off the UI thread. A `/hook` command starts one job: a thread that runs
+//! The `/hook` verbs off the UI thread. A `/hook` command starts one job: an `std.Io` task that runs
 //! `hook_verbs.run` on its own copies of the arguments, the home folder, and the workspace, and keeps
 //! what it prints. The tick takes the finished job and shows its lines as the verbs always did. One job
 //! runs at a time. Only `/hook test` can be stopped: it runs hooks, and Esc sets the flag its hooks poll,
 //! so they stop within one poll (R2.1, R2.4). The App owns the job: it starts it, takes its output, and
-//! cancels and joins it on shutdown (R3.9, PR #57 lesson 2).
+//! cancels and awaits it on shutdown (R3.9, PR #57 lesson 2).
 
 const std = @import("std");
 const builtin = @import("builtin");
 const hook_verbs = @import("../cli/hook_verbs.zig");
 const io_mod = @import("../shared/io.zig");
 const profile_paths = @import("../shared/profile_paths.zig");
+const hooks_host = @import("../hooks_host/hooks_host.zig");
 
 /// The most bytes the footer's working line holds.
 const status_max = 96;
-
-/// The verbs `/hook` runs. `list` is the default, as `/hook` alone lists the hooks.
-const verb_names = [_][]const u8{ "test", "list", "show", "log", "trust", "enable", "disable" };
 
 /// The one verb Esc can stop: it runs hooks, which the cancel flag reaches.
 const cancelable_verb = "test";
@@ -30,6 +28,8 @@ pub const Output = struct {
 const Job = struct {
     cancelable: bool,
     hooks_enabled: bool,
+    /// Whether the job starts inside fx's own agent, which may not trust or disable a hook. Read on the UI thread.
+    agent_is_fx: bool,
     home: ?[]u8,
     workspace_root: []u8,
     words: []const [:0]const u8,
@@ -37,12 +37,13 @@ const Job = struct {
     err: std.Io.Writer.Allocating,
     /// Set by Esc. The hooks of `test` poll it, so it is an atomic.
     cancel: std.atomic.Value(bool) = .init(false),
-    /// Set by the job's thread when it returns. The UI thread reads the output only after this is set.
+    /// Set by the job's task when it returns. The UI thread reads the output only after this is set.
     done: std.atomic.Value(bool) = .init(false),
-    thread: ?std.Thread = null,
+    /// The task that runs the verbs. `finish` and `deinit` await it.
+    future: ?std.Io.Future(void) = null,
 
     /// Copies everything the job reads, so the caller's buffers may go away. The job owns the copies.
-    fn create(a: std.mem.Allocator, home: ?[]const u8, workspace_root: []const u8, hooks_enabled: bool, words: []const [:0]const u8) !*Job {
+    fn create(a: std.mem.Allocator, home: ?[]const u8, workspace_root: []const u8, hooks_enabled: bool, agent_is_fx: bool, words: []const [:0]const u8) !*Job {
         const words_copy = try copyWords(a, words);
         errdefer freeWords(a, words_copy);
         const home_copy: ?[]u8 = if (home) |text| try a.dupe(u8, text) else null;
@@ -53,6 +54,7 @@ const Job = struct {
         job.* = .{
             .cancelable = words.len > 0 and std.mem.eql(u8, words[0], cancelable_verb),
             .hooks_enabled = hooks_enabled,
+            .agent_is_fx = agent_is_fx,
             .home = home_copy,
             .workspace_root = root_copy,
             .words = words_copy,
@@ -62,7 +64,7 @@ const Job = struct {
         return job;
     }
 
-    /// The job's thread: the verbs print into the job, then `done` tells the UI thread it may read them.
+    /// The job's task: the verbs print into the job, then `done` tells the UI thread it may read them.
     fn run(self: *Job) void {
         defer self.done.store(true, .release);
         _ = hook_verbs.run(.{
@@ -72,7 +74,7 @@ const Job = struct {
             .home = self.home,
             .workspace_root = self.workspace_root,
             .hooks_enabled = self.hooks_enabled,
-            .agent_is_fx = false,
+            .agent_is_fx = self.agent_is_fx,
             .cancel = &self.cancel,
         }, self.words);
     }
@@ -110,7 +112,7 @@ fn freeWords(a: std.mem.Allocator, words: []const [:0]const u8) void {
 /// The verb the first word names, when `/hook` knows it. `list` when there are no words; "" for anything else.
 fn verbNameOf(words: []const [:0]const u8) []const u8 {
     if (words.len == 0) return "list";
-    for (verb_names) |name| {
+    for (hook_verbs.verb_words) |name| {
         if (std.mem.eql(u8, words[0], name)) return name;
     }
     return "";
@@ -123,14 +125,16 @@ pub const State = struct {
     status_buf: [status_max]u8 = undefined,
     status_len: usize = 0,
 
-    /// Starts `/hook` with `words` (the arguments after `hook`) on a new thread. `words` is copied.
+    /// Starts `/hook` with `words` (the arguments after `hook`) as an `std.Io` task. `words` is copied.
     /// Returns error.HookJobBusy while another job runs; the caller shows a notice and starts nothing.
     pub fn start(self: *State, home: ?[]const u8, workspace_root: []const u8, hooks_enabled: bool, words: []const [:0]const u8) !void {
         if (comptime builtin.single_threaded) return error.ThreadsUnsupported;
         if (self.job != null) return error.HookJobBusy;
-        const job = try Job.create(std.heap.c_allocator, home, workspace_root, hooks_enabled, words);
+        // Read here, on the UI thread, so the job carries the answer the process gives: AI_AGENT=fx means fx's own agent.
+        const agent_is_fx = hooks_host.trust.refusedForAgent(io_mod.getenv("AI_AGENT"));
+        const job = try Job.create(std.heap.c_allocator, home, workspace_root, hooks_enabled, agent_is_fx, words);
         errdefer job.destroy();
-        job.thread = try std.Thread.spawn(.{}, Job.run, .{job});
+        job.future = try io_mod.getIo().concurrent(Job.run, .{job});
         self.job = job;
         self.setStatus(words, job.cancelable);
     }
@@ -183,16 +187,16 @@ pub const State = struct {
         };
     }
 
-    /// Joins the job, frees it, and clears the working line. Call it after the output has been shown.
+    /// Awaits the job, frees it, and clears the working line. Call it after the output has been shown.
     pub fn finish(self: *State) void {
         const job = self.job orelse return;
-        if (job.thread) |thread| thread.join();
+        if (job.future) |*future| future.await(io_mod.getIo());
         self.job = null;
         self.status_len = 0;
         job.destroy();
     }
 
-    /// Shutdown: cancels a running job and joins it. Cancel stops the hooks within one poll, so exit waits on them only briefly.
+    /// Shutdown: cancels a running job and awaits it. Cancel stops the hooks within one poll, so exit waits on them only briefly.
     /// `trust` cannot be cancelled and may wait up to its lock deadline.
     pub fn deinit(self: *State) void {
         const job = self.job orelse return;
@@ -271,6 +275,44 @@ test "a second /hook job is refused while one runs, and Esc twice stops only a t
     const output = try waitFinished(&state);
     try testing.expect(output.cancelled);
     state.finish();
+}
+
+test "a /hook trust job started inside fx's own agent is refused, and one started outside it runs" {
+    const alloc = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(home);
+    const trust_words = [_][:0]const u8{ "trust", "--all" };
+
+    // The environment of fx's own agent: AI_AGENT=fx. The job reads it when it is created.
+    var agent_env = std.process.Environ.Map.init(alloc);
+    defer agent_env.deinit();
+    try agent_env.put("AI_AGENT", "fx");
+    io_mod.setEnvironMap(&agent_env);
+    defer io_mod.resetEnvironForTest();
+    {
+        var state: State = .{};
+        defer state.deinit();
+        try state.start(home, home, false, &trust_words);
+        const output = try waitFinished(&state);
+        try testing.expect(std.mem.find(u8, output.out, "needs a person") != null or std.mem.find(u8, output.err, "needs a person") != null);
+        state.finish();
+    }
+
+    // Outside fx's own agent the same words run, and the refusal is absent.
+    var person_env = std.process.Environ.Map.init(alloc);
+    defer person_env.deinit();
+    io_mod.setEnvironMap(&person_env);
+    {
+        var state: State = .{};
+        defer state.deinit();
+        try state.start(home, home, false, &trust_words);
+        const output = try waitFinished(&state);
+        try testing.expect(std.mem.find(u8, output.out, "needs a person") == null);
+        try testing.expect(std.mem.find(u8, output.err, "needs a person") == null);
+        state.finish();
+    }
 }
 
 test "cancel does nothing to a /hook job that Esc cannot stop" {

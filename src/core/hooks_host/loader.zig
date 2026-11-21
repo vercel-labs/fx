@@ -652,6 +652,20 @@ test "an id another file used is skipped" {
     try std.testing.expect(std.mem.find(u8, snapshot.problems[0].message, "is also used in") != null);
 }
 
+test "a matcher the matcher language does not know is a problem that names it, and its hook does not load" {
+    const alloc = std.testing.allocator;
+    var fixture = try Fixture.init(alloc);
+    defer fixture.deinit(alloc);
+    try writeProfile(alloc, &fixture, "{\"hooks\":{\"PreToolUse\":[{\"matcher\":\"\\\\b\",\"hooks\":[{\"type\":\"command\",\"command\":\"./p.sh\"}]},{\"matcher\":\"Bash\",\"hooks\":[{\"type\":\"command\",\"command\":\"./q.sh\"}]}]}}");
+
+    var snapshot = try load(alloc, .{ .home = fixture.home, .workspace_root = fixture.workspace });
+    defer snapshot.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 1), snapshot.hooks.len);
+    try std.testing.expectEqualStrings("Bash", snapshot.hooks[0].matcher_text);
+    try std.testing.expect(findProblem(&snapshot, "matcher \"\\b\" is not valid"));
+}
+
 test "a hook's script is watched and its digest follows the content" {
     const alloc = std.testing.allocator;
     var fixture = try Fixture.init(alloc);

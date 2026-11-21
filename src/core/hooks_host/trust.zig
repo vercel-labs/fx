@@ -335,7 +335,8 @@ pub const max_named_files = 64;
 /// A word that is only the target of an output redirect (`>`, `>>`, `2>`, `&>`, `>|`, `>&`) is not
 /// named: the command writes that file and does not run it. An input redirect target is named, since
 /// `sh < script.sh` runs the file. A file that the command also names outside a redirect target is
-/// named, through that other word.
+/// named, through that other word. A word with no `/` is named when the hook's working directory, the
+/// workspace root, holds it as a regular file, so `sh check.sh` names `check.sh`.
 pub fn namedFiles(
     alloc: std.mem.Allocator,
     command: hooks.config.Command,
@@ -376,7 +377,18 @@ pub fn namedFiles(
         const maybe = try substitute(alloc, raw, workspace_root, home);
         const word = maybe orelse continue;
         if (std.mem.findScalar(u8, word, '/') == null) {
+            // The hook runs in the workspace root, so `check.sh` is that file. A program found on the
+            // PATH is not in the workspace and is not named.
+            const in_workspace = std.Io.Dir.path.join(alloc, &.{ workspace_root, word }) catch |err| {
+                alloc.free(word);
+                return err;
+            };
             alloc.free(word);
+            if (isRegularFile(in_workspace)) {
+                try appendOwned(alloc, &candidates, in_workspace);
+            } else {
+                alloc.free(in_workspace);
+            }
             continue;
         }
         const absolute = std.Io.Dir.path.isAbsolute(word);
@@ -424,6 +436,12 @@ pub fn namedFiles(
     return .{ .files = try result.toOwnedSlice(alloc), .dropped = dropped };
 }
 
+/// Whether `path` is a regular file now. A directory, a missing path, or a file of another kind is not.
+fn isRegularFile(file_path: []const u8) bool {
+    const stat = std.Io.Dir.cwd().statFile(io_mod.getIo(), file_path, .{}) catch return false;
+    return stat.kind == .file;
+}
+
 fn lessThanPath(_: void, left: []u8, right: []u8) bool {
     return std.mem.lessThan(u8, left, right);
 }
@@ -437,7 +455,13 @@ fn appendOwned(alloc: std.mem.Allocator, list: *std.ArrayList([]u8), text: []u8)
 
 /// Splits a shell command into words and copies each into `owned`. `redirect_targets` gets one flag per
 /// word: true for the word after an output redirect (`>`, `>>`, `2>`, `&>`, `>|`, `>&`). An input redirect
-/// (`<`) and every other word leave the flag false.
+/// (`<`) and every other word leave the flag false. Quotes group a word, and the quote characters are
+/// removed: text inside single quotes is literal up to the next single quote, and text inside double quotes
+/// is literal up to the next unescaped double quote, where `\"` and `\\` stand for `"` and `\`. Outside
+/// quotes a backslash takes the next character as written. White space and operators inside quotes stay in
+/// the word. An unclosed quote takes the rest of the text as one word, so the command names more files, not fewer.
+const ShellQuote = enum { none, single, double };
+
 fn splitShellWords(
     alloc: std.mem.Allocator,
     words: *std.ArrayList([]const u8),
@@ -451,9 +475,38 @@ fn splitShellWords(
     // separator clears it, so a word after `;`, `(`, or a pipe is a command word and is named.
     var output_next = false;
     var previous: u8 = 0;
+    var quote: ShellQuote = .none;
+    var index: usize = 0;
 
-    for (text) |c| {
+    while (index < text.len) : (index += 1) {
+        const c = text[index];
+        switch (quote) {
+            .single => {
+                if (c == '\'') quote = .none else try current.append(alloc, c);
+                continue;
+            },
+            .double => {
+                if (c == '"') {
+                    quote = .none;
+                } else if (c == '\\' and index + 1 < text.len and (text[index + 1] == '"' or text[index + 1] == '\\')) {
+                    index += 1;
+                    try current.append(alloc, text[index]);
+                } else {
+                    try current.append(alloc, c);
+                }
+                continue;
+            },
+            .none => {},
+        }
         switch (c) {
+            '\'' => quote = .single,
+            '"' => quote = .double,
+            '\\' => {
+                if (index + 1 < text.len) {
+                    index += 1;
+                    try current.append(alloc, text[index]);
+                }
+            },
             ' ', '\t' => try finishShellWord(alloc, words, redirect_targets, owned, &current, &output_next),
             '\n', ';', '(', ')', '`' => {
                 try finishShellWord(alloc, words, redirect_targets, owned, &current, &output_next);
@@ -503,13 +556,7 @@ fn keepWord(
     owned: *std.ArrayList([]u8),
     raw: []const u8,
 ) std.mem.Allocator.Error!void {
-    var clean: std.ArrayList(u8) = .empty;
-    errdefer clean.deinit(alloc);
-    for (raw) |c| {
-        if (c == '\'' or c == '"') continue;
-        try clean.append(alloc, c);
-    }
-    try appendOwned(alloc, owned, try clean.toOwnedSlice(alloc));
+    try appendOwned(alloc, owned, try alloc.dupe(u8, raw));
     try words.append(alloc, owned.items[owned.items.len - 1]);
 }
 
@@ -758,7 +805,7 @@ test "a trust file that is not what fx wrote is refused" {
     const file_path = try std.Io.Dir.path.join(alloc, &.{ root, "hooks-trust.json" });
     defer alloc.free(file_path);
 
-    try writeFixture(alloc, file_path, "{not json");
+    try writeFixture(alloc, file_path, "{not json}");
     try std.testing.expectError(error.TrustFileInvalid, load(alloc, file_path));
 
     try writeFixture(alloc, file_path, "{\"version\":2,\"trusted\":[]}");
@@ -968,6 +1015,93 @@ test "a run that writes another file names only the file it runs" {
     defer named.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 1), named.files.len);
     try std.testing.expectEqualStrings("/w/hook.py", named.files[0]);
+}
+
+test "a quoted path with a space is one word, named, and its digest follows the file" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace/My Hooks");
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace);
+    const script = try std.Io.Dir.path.join(alloc, &.{ workspace, "My Hooks", "check.sh" });
+    defer alloc.free(script);
+    try writeFixture(alloc, script, "echo 1");
+
+    const text = "{\"hooks\":{\"PreToolUse\":[{\"hooks\":[{\"type\":\"command\",\"command\":\"sh \\\"./My Hooks/check.sh\\\"\"}]}]}}";
+    var project_file = try hooks.config.parse(alloc, text, .{ .layer = .project });
+    defer project_file.deinit(alloc);
+    const hook = &project_file.hooks[0];
+    var named = try namedFiles(alloc, hook.command, workspace, null);
+    defer named.deinit(alloc);
+    try expectNamed(alloc, named, workspace, &.{"My Hooks/check.sh"}, 0);
+
+    const first = try digest(alloc, hook, workspace, named.files);
+    try writeFixture(alloc, script, "echo 2");
+    const changed = try digest(alloc, hook, workspace, named.files);
+    try std.testing.expect(!std.mem.eql(u8, &first, &changed));
+}
+
+test "a bare script name names the file in the workspace, and a change to it needs trust again" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace);
+    const script = try std.Io.Dir.path.join(alloc, &.{ workspace, "check.sh" });
+    defer alloc.free(script);
+    try writeFixture(alloc, script, "echo 1");
+
+    const text = "{\"hooks\":{\"PreToolUse\":[{\"hooks\":[{\"type\":\"command\",\"command\":\"sh check.sh\"}]}]}}";
+    var project_file = try hooks.config.parse(alloc, text, .{ .layer = .project });
+    defer project_file.deinit(alloc);
+    const hook = &project_file.hooks[0];
+    var named = try namedFiles(alloc, hook.command, workspace, null);
+    defer named.deinit(alloc);
+    try expectNamed(alloc, named, workspace, &.{"check.sh"}, 0);
+
+    const first = try digest(alloc, hook, workspace, named.files);
+    try writeFixture(alloc, script, "echo 2");
+    const changed = try digest(alloc, hook, workspace, named.files);
+    try std.testing.expect(!std.mem.eql(u8, &first, &changed));
+}
+
+test "a bare word names nothing unless the workspace holds it as a regular file" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace/lib");
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace);
+
+    // `python3` and `hook.py` are not in the workspace, and `lib` is a directory: none is named.
+    var named = try namedFiles(alloc, shellCommand("python3 hook.py lib"), workspace, null);
+    defer named.deinit(alloc);
+    try expectNamed(alloc, named, workspace, &.{}, 0);
+}
+
+test "quotes keep white space and operators in a word, and an unclosed quote takes the rest of the text" {
+    const alloc = std.testing.allocator;
+    {
+        var named = try namedFiles(alloc, shellCommand("sh './a b.sh' > out.txt"), "/w", null);
+        defer named.deinit(alloc);
+        try expectNamed(alloc, named, "/w", &.{"a b.sh"}, 0);
+    }
+    {
+        // The `;` inside the quotes is part of the word, so only `/w/c.sh` is a separate word.
+        var named = try namedFiles(alloc, shellCommand("echo \"a;b\" /w/c.sh"), "/w", null);
+        defer named.deinit(alloc);
+        try std.testing.expectEqual(@as(usize, 1), named.files.len);
+        try std.testing.expectEqualStrings("/w/c.sh", named.files[0]);
+    }
+    {
+        // The quote never closes, so `/w/x y.sh` is the whole rest of the text, one word.
+        var named = try namedFiles(alloc, shellCommand("sh \"/w/x y.sh"), "/w", null);
+        defer named.deinit(alloc);
+        try std.testing.expectEqual(@as(usize, 1), named.files.len);
+        try std.testing.expectEqualStrings("/w/x y.sh", named.files[0]);
+    }
 }
 
 test "a hook that appends to a log keeps its trust after a run changes the log" {

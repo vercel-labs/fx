@@ -2925,7 +2925,7 @@ test "fx hook with a malformed settings file treats hooks as off, names the prob
     try tmp.dir.createDirPath(io_mod.getIo(), ".fx");
     const settings_path = try std.Io.Dir.path.join(alloc, &.{ home, ".fx", "settings.json" });
     defer alloc.free(settings_path);
-    try io_mod.writeFileAtomic(alloc, settings_path, "{not json");
+    try io_mod.writeFileAtomic(alloc, settings_path, "{not json}");
 
     var environ = std.process.Environ.Map.init(alloc);
     defer environ.deinit();
@@ -2964,6 +2964,13 @@ test "fx hook reads list, ls, and show with --json" {
     try std.testing.expectError(error.TooManyHookArgs, hook_verbs.parseHookArgs(&.{ "list", "extra" }));
     try std.testing.expectError(error.InvalidHookFlag, hook_verbs.parseHookArgs(&.{ "list", "--nope" }));
     try std.testing.expectEqualStrings("list", hook_verbs.hookWordSuggestion("lst").?);
+    try std.testing.expect(hook_verbs.hookWordSuggestion("frob") == null);
+}
+
+test "a typo of any hook verb suggests that verb" {
+    try std.testing.expectEqualStrings("test", hook_verbs.hookWordSuggestion("tet").?);
+    try std.testing.expectEqualStrings("log", hook_verbs.hookWordSuggestion("lg").?);
+    try std.testing.expectEqualStrings("disable", hook_verbs.hookWordSuggestion("dsable").?);
     try std.testing.expect(hook_verbs.hookWordSuggestion("frob") == null);
 }
 
