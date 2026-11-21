@@ -197,6 +197,10 @@ fn render_owned_protocol_error(
     );
 }
 
+/// The words every protocol error text starts with, before its code: this file writes them in
+/// `write_protocol_diagnostic`, and reads them in `invalid_params_prefix` and `protocolErrorWithoutData`.
+const protocol_error_words = "MCP protocol error ";
+
 fn write_protocol_diagnostic(
     scratch: Allocator,
     writer: *std.Io.Writer,
@@ -204,7 +208,7 @@ fn write_protocol_diagnostic(
     message: []const u8,
     data_json: ?[]const u8,
 ) !void {
-    try writer.print("MCP protocol error {d}: ", .{code});
+    try writer.print(protocol_error_words ++ "{d}: ", .{code});
     const safe_message = try text_utils.sanitizeModelText(scratch, message);
     try writer.writeAll(safe_message);
     if (data_json) |data| {
@@ -214,7 +218,7 @@ fn write_protocol_diagnostic(
     }
 }
 
-const invalid_params_prefix = "MCP protocol error -32602: ";
+const invalid_params_prefix = protocol_error_words ++ "-32602: ";
 const max_cause_fields = 3;
 const max_cause_bytes = 240;
 
@@ -243,15 +247,14 @@ pub fn invalidParamsCause(arena: Allocator, text: []const u8) Allocator.Error!?[
 
 const data_label = "; data=";
 
-/// `text` without the data of a protocol error: the words of `write_protocol_diagnostic`, `MCP protocol error
-/// <code>: ` and the server's message, for any code, and none of the `; data=` and the data after it (see
+/// `text` without the data of a protocol error: the words of `write_protocol_diagnostic`, `protocol_error_words`
+/// and `<code>: `, and the server's message, for any code, and none of the `; data=` and the data after it (see
 /// `withoutData`). Text that does not start with those words comes back as it is. A line that shows what the
 /// server said, and not what it sent for the model, reads this.
 /// (`tests/e2e/mcp-stdio.test.ts` "an error's data never reaches a trace, a log line, the trace report or the cause line")
 pub fn protocolErrorWithoutData(arena: Allocator, text: []const u8) Allocator.Error![]const u8 {
-    const words = "MCP protocol error ";
-    if (!std.mem.startsWith(u8, text, words)) return text;
-    const code_start = words.len;
+    if (!std.mem.startsWith(u8, text, protocol_error_words)) return text;
+    const code_start = protocol_error_words.len;
     var at = code_start;
     if (at < text.len and text[at] == '-') at += 1;
     const digits_start = at;
@@ -854,57 +857,57 @@ fn expectCause(text: []const u8, expected: ?[]const u8) !void {
 
 test "a -32602 in the Go SDK's words names each rejected field and type" {
     try expectCause(
-        "MCP protocol error -32602: validating \"arguments\": validating root: validating /properties/limit: type: \"40\" has type \"string\", want \"number\"\n\nFull input schema for tool \"search\":\n{\"type\":\"object\"}",
+        protocol_error_words ++ "-32602: validating \"arguments\": validating root: validating /properties/limit: type: \"40\" has type \"string\", want \"number\"\n\nFull input schema for tool \"search\":\n{\"type\":\"object\"}",
         "arguments rejected: limit is a string, the schema wants a number",
     );
     try expectCause(
-        "MCP protocol error -32602: validating /properties/filter/properties/env: type: 1 has type \"integer\", want \"string\"",
+        protocol_error_words ++ "-32602: validating /properties/filter/properties/env: type: 1 has type \"integer\", want \"string\"",
         "arguments rejected: filter.env is an integer, the schema wants a string",
     );
     try expectCause(
-        "MCP protocol error -32602: validating /properties/queries: type: [\"a\"] has type \"string\", want \"array\"\nvalidating /properties/verbose: type: \"true\" has type \"string\", want \"boolean\"",
+        protocol_error_words ++ "-32602: validating /properties/queries: type: [\"a\"] has type \"string\", want \"array\"\nvalidating /properties/verbose: type: \"true\" has type \"string\", want \"boolean\"",
         "arguments rejected: queries is a string, the schema wants an array; verbose is a string, the schema wants a boolean",
     );
     try expectCause(
-        "MCP protocol error -32602: validating /properties/id: type: \"x\" has type \"string\", want [\"integer\",\"null\"]",
+        protocol_error_words ++ "-32602: validating /properties/id: type: \"x\" has type \"string\", want [\"integer\",\"null\"]",
         "arguments rejected: id is a string, the schema wants [\"integer\",\"null\"]",
     );
     try expectCause(
-        "MCP protocol error -32602: validating /properties/a: type: 1 has type \"integer\", want \"string\"\nvalidating /properties/b: type: 1 has type \"integer\", want \"string\"\nvalidating /properties/c: type: 1 has type \"integer\", want \"string\"\nvalidating /properties/d: type: 1 has type \"integer\", want \"string\"",
+        protocol_error_words ++ "-32602: validating /properties/a: type: 1 has type \"integer\", want \"string\"\nvalidating /properties/b: type: 1 has type \"integer\", want \"string\"\nvalidating /properties/c: type: 1 has type \"integer\", want \"string\"\nvalidating /properties/d: type: 1 has type \"integer\", want \"string\"",
         "arguments rejected: a is an integer, the schema wants a string; b is an integer, the schema wants a string; c is an integer, the schema wants a string; and more",
     );
 }
 
 test "a -32602 as the TypeScript SDK's zod issues names each path and type" {
     try expectCause(
-        "MCP protocol error -32602: MCP error -32602: Invalid arguments for tool search: [\n  {\n    \"code\": \"invalid_type\",\n    \"expected\": \"number\",\n    \"received\": \"string\",\n    \"path\": [\n      \"limit\"\n    ],\n    \"message\": \"Expected number, received string\"\n  }\n]",
+        protocol_error_words ++ "-32602: MCP error -32602: Invalid arguments for tool search: [\n  {\n    \"code\": \"invalid_type\",\n    \"expected\": \"number\",\n    \"received\": \"string\",\n    \"path\": [\n      \"limit\"\n    ],\n    \"message\": \"Expected number, received string\"\n  }\n]",
         "arguments rejected: limit is a string, the schema wants a number",
     );
     try expectCause(
-        "MCP protocol error -32602: Invalid arguments: [{\"code\":\"invalid_type\",\"expected\":\"boolean\",\"path\":[\"options\",\"verbose\"]},{\"code\":\"invalid_type\",\"expected\":\"string\",\"received\":\"number\",\"path\":[\"queries\",0]}]",
+        protocol_error_words ++ "-32602: Invalid arguments: [{\"code\":\"invalid_type\",\"expected\":\"boolean\",\"path\":[\"options\",\"verbose\"]},{\"code\":\"invalid_type\",\"expected\":\"string\",\"received\":\"number\",\"path\":[\"queries\",0]}]",
         "arguments rejected: options.verbose must be a boolean; queries[0] is a number, the schema wants a string",
     );
     try expectCause(
-        "MCP protocol error -32602: Invalid arguments: [{\"code\":\"invalid_type\",\"expected\":\"object\",\"received\":\"string\",\"path\":[]}]",
+        protocol_error_words ++ "-32602: Invalid arguments: [{\"code\":\"invalid_type\",\"expected\":\"object\",\"received\":\"string\",\"path\":[]}]",
         "arguments rejected: the arguments object is a string, the schema wants an object",
     );
 }
 
 test "a -32602 fx can't read says the server refused the parameters" {
     const general = "the server rejected the call's parameters (-32602)";
-    try expectCause("MCP protocol error -32602: Unknown tool: nope", general);
-    try expectCause("MCP protocol error -32602: ", general);
-    try expectCause("MCP protocol error -32602: Invalid arguments: [not json]", general);
-    try expectCause("MCP protocol error -32602: Invalid arguments: [{\"code\":\"custom\",\"path\":[\"x\"]}]", general);
+    try expectCause(protocol_error_words ++ "-32602: Unknown tool: nope", general);
+    try expectCause(protocol_error_words ++ "-32602: ", general);
+    try expectCause(protocol_error_words ++ "-32602: Invalid arguments: [not json]", general);
+    try expectCause(protocol_error_words ++ "-32602: Invalid arguments: [{\"code\":\"custom\",\"path\":[\"x\"]}]", general);
     // The trace keeps the start of a long result, which can cut a line short.
-    try expectCause("MCP protocol error -32602: validating /properties/limit: type: \"40\" has ty", general);
+    try expectCause(protocol_error_words ++ "-32602: validating /properties/limit: type: \"40\" has ty", general);
 }
 
 test "only a -32602 gets a cause, so other failures keep their text" {
-    try expectCause("MCP protocol error -32603: internal error", null);
-    try expectCause("MCP protocol error -32000: validating /properties/limit: type: \"40\" has type \"string\", want \"number\"", null);
-    try expectCause("MCP protocol error -326020: Unknown tool", null);
-    try expectCause("tool said: MCP protocol error -32602: Unknown tool", null);
+    try expectCause(protocol_error_words ++ "-32603: internal error", null);
+    try expectCause(protocol_error_words ++ "-32000: validating /properties/limit: type: \"40\" has type \"string\", want \"number\"", null);
+    try expectCause(protocol_error_words ++ "-326020: Unknown tool", null);
+    try expectCause("tool said: " ++ protocol_error_words ++ "-32602: Unknown tool", null);
     try expectCause("Invalid input: labels require at least one item", null);
     try expectCause("", null);
 }
@@ -912,24 +915,24 @@ test "only a -32602 gets a cause, so other failures keep their text" {
 test "an invalid-params cause leaves out what the server wrote after the type and masks secrets" {
     const token = "ghp_" ++ text_utils.repeat("a", 36);
     try expectCause(
-        "MCP protocol error -32602: validating /properties/limit: type: \"40\" has type \"string\", want \"number\" token=" ++ token,
+        protocol_error_words ++ "-32602: validating /properties/limit: type: \"40\" has type \"string\", want \"number\" token=" ++ token,
         "arguments rejected: limit is a string, the schema wants a number",
     );
     try expectCause(
-        "MCP protocol error -32602: validating /properties/id: type: \"x\" has type \"string\", want [\"integer\",\"null\"] (see " ++ token ++ ")",
+        protocol_error_words ++ "-32602: validating /properties/id: type: \"x\" has type \"string\", want [\"integer\",\"null\"] (see " ++ token ++ ")",
         "arguments rejected: id is a string, the schema wants [\"integer\",\"null\"]",
     );
     try expectCause(
-        "MCP protocol error -32602: validating /properties/limit: type: \"40\" has type \"string\", want number, see " ++ token,
+        protocol_error_words ++ "-32602: validating /properties/limit: type: \"40\" has type \"string\", want number, see " ++ token,
         "arguments rejected: limit is a string, the schema wants a number",
     );
-    try expectCause("MCP protocol error -32602: validating /properties/limit: type: \"40\" has type \"string\", want \"number", "the server rejected the call's parameters (-32602)");
+    try expectCause(protocol_error_words ++ "-32602: validating /properties/limit: type: \"40\" has type \"string\", want \"number", "the server rejected the call's parameters (-32602)");
     try expectCause(
-        "MCP protocol error -32602: validating /properties/" ++ token ++ ": type: 1 has type \"integer\", want \"string\"",
+        protocol_error_words ++ "-32602: validating /properties/" ++ token ++ ": type: 1 has type \"integer\", want \"string\"",
         "arguments rejected: [redacted] is an integer, the schema wants a string",
     );
     try expectCause(
-        "MCP protocol error -32602: [{\"code\":\"invalid_type\",\"expected\":\"number\",\"received\":\"string\",\"path\":[\"" ++ token ++ "\"]}]",
+        protocol_error_words ++ "-32602: [{\"code\":\"invalid_type\",\"expected\":\"number\",\"received\":\"string\",\"path\":[\"" ++ token ++ "\"]}]",
         "arguments rejected: [redacted] is a string, the schema wants a number",
     );
 }
@@ -941,11 +944,11 @@ test "an invalid-params cause stays one terminal-safe line within its bound" {
     const long_field = try arena.alloc(u8, 1000);
     @memset(long_field, 'f');
     const hostile = [_][]const u8{
-        "MCP protocol error -32602: validating /properties/a\x1b[2Jb: type: 1 has type \"integer\", want \"string\"",
-        "MCP protocol error -32602: validating /properties/a\rb: type: 1 has type \"\x07integer\", want \"str\x00ing\"",
-        try arena.print("MCP protocol error -32602: validating /properties/{s}: type: 1 has type \"integer\", want \"string\"", .{long_field}),
-        "MCP protocol error -32602: Invalid arguments: [{\"expected\":\"number\\u001b[31m\",\"received\":\"string\",\"path\":[\"a\\nb\"]}]",
-        "MCP protocol error -32602: Unknown tool \xff\xfe",
+        protocol_error_words ++ "-32602: validating /properties/a\x1b[2Jb: type: 1 has type \"integer\", want \"string\"",
+        protocol_error_words ++ "-32602: validating /properties/a\rb: type: 1 has type \"\x07integer\", want \"str\x00ing\"",
+        try arena.print(protocol_error_words ++ "-32602: validating /properties/{s}: type: 1 has type \"integer\", want \"string\"", .{long_field}),
+        protocol_error_words ++ "-32602: Invalid arguments: [{\"expected\":\"number\\u001b[31m\",\"received\":\"string\",\"path\":[\"a\\nb\"]}]",
+        protocol_error_words ++ "-32602: Unknown tool \xff\xfe",
     };
     for (hostile) |text| {
         const cause = (try invalidParamsCause(arena, text)).?;
@@ -958,8 +961,8 @@ test "an invalid-params cause reads the server's message only, not the data writ
     var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    const go = "MCP protocol error -32602: validating \"arguments\": validating root: validating /properties/limit: type: \"40\" has type \"string\", want \"number\"";
-    const zod = "MCP protocol error -32602: Invalid arguments: [{\"expected\":\"number\",\"received\":\"string\",\"path\":[\"limit\"]}]";
+    const go = protocol_error_words ++ "-32602: validating \"arguments\": validating root: validating /properties/limit: type: \"40\" has type \"string\", want \"number\"";
+    const zod = protocol_error_words ++ "-32602: Invalid arguments: [{\"expected\":\"number\",\"received\":\"string\",\"path\":[\"limit\"]}]";
     // The data holds its own list of issues, and text that looks like the Go validator's lines.
     const data = "; data={\"errors\":[{\"path\":[\"other\"],\"expected\":\"string\"}],\"hint\":\"validating /properties/forged: type: \\\"1\\\" has type \\\"string\\\", want \\\"number\\\"\"}";
     for ([_][]const u8{ go, zod }) |message| {
@@ -973,7 +976,7 @@ test "an invalid-params cause reads the server's message only, not the data writ
     const cut = (try invalidParamsCause(arena, try arena.print("{s}; data={{\"errors\":[{{\"pa", .{go}))).?;
     try std.testing.expectEqualStrings(plain_go, cut);
     // A message that says `; data=` itself keeps what follows it, since nothing JSON ends the text.
-    const says = (try invalidParamsCause(arena, "MCP protocol error -32602: validating /properties/limit: type: \"1\" has type \"string\", want \"number\"; data=none")).?;
+    const says = (try invalidParamsCause(arena, protocol_error_words ++ "-32602: validating /properties/limit: type: \"1\" has type \"string\", want \"number\"; data=none")).?;
     try std.testing.expect(std.mem.find(u8, says, "limit") != null);
 }
 
@@ -984,7 +987,7 @@ test "a protocol error without its data keeps the code and the message, for any 
     // Data that has a zod-like list of its own and eight labels.
     const data = "{\"errors\":[{\"expected\":\"string\",\"path\":[\"forged\"]}],\"hint\":\"; data=; data=; data=; data=; data=; data=; data=; data=x\"}";
     for ([_]i32{ -32603, -32000, -32042, -32602, 7 }) |code| {
-        const message = try arena.print("MCP protocol error {d}: Internal error", .{code});
+        const message = try arena.print(protocol_error_words ++ "{d}: Internal error", .{code});
         const text = try arena.print("{s}; data={s}", .{ message, data });
         // The whole text, and every head of it from the label on (the trace report reads one, and the result cap cuts one).
         const first = message.len + "; data=".len;
@@ -1000,13 +1003,13 @@ test "a protocol error without its data keeps the code and the message, for any 
     }
     // Without data, and without the words of a protocol error, the text comes back as it is.
     for ([_][]const u8{
-        "MCP protocol error -32603: Internal error",
-        "MCP protocol error -32603: ",
+        protocol_error_words ++ "-32603: Internal error",
+        protocol_error_words ++ "-32603: ",
         "something else; data={\"a\":1}",
-        "MCP protocol error x: Internal error; data={\"a\":1}",
-        "MCP protocol error -: Internal error; data={\"a\":1}",
-        "MCP protocol error -32603 Internal error; data={\"a\":1}",
-        "MCP protocol error ",
+        protocol_error_words ++ "x: Internal error; data={\"a\":1}",
+        protocol_error_words ++ "-: Internal error; data={\"a\":1}",
+        protocol_error_words ++ "-32603 Internal error; data={\"a\":1}",
+        protocol_error_words,
         "",
     }) |text| {
         const same = try protocolErrorWithoutData(arena, text);
@@ -1016,8 +1019,8 @@ test "a protocol error without its data keeps the code and the message, for any 
     // A message that says `; data=` itself stays whole while no JSON follows it; the data is what follows the one
     // that does.
     try std.testing.expectEqualStrings(
-        "MCP protocol error -32603: tried; data=none",
-        try protocolErrorWithoutData(arena, "MCP protocol error -32603: tried; data=none; data={\"a\":1}"),
+        protocol_error_words ++ "-32603: tried; data=none",
+        try protocolErrorWithoutData(arena, protocol_error_words ++ "-32603: tried; data=none; data={\"a\":1}"),
     );
 }
 
@@ -1114,7 +1117,7 @@ fn invalidParamsCauseAllocationFailures(alloc: Allocator) !void {
     defer arena_state.deinit();
     _ = try invalidParamsCause(
         arena_state.allocator(),
-        "MCP protocol error -32602: Invalid arguments: [{\"expected\":\"number\",\"received\":\"string\",\"path\":[\"limit\"]},{\"expected\":\"array\",\"path\":[\"queries\",0]}]",
+        protocol_error_words ++ "-32602: Invalid arguments: [{\"expected\":\"number\",\"received\":\"string\",\"path\":[\"limit\"]},{\"expected\":\"array\",\"path\":[\"queries\",0]}]",
     );
 }
 
@@ -1167,6 +1170,26 @@ test "an invalid-params cause reports running out of memory even when memory com
         var once: FailOnceAllocator = .{ .backing = std.testing.allocator, .fail_index = fail_index };
         try std.testing.expectError(error.OutOfMemory, invalidParamsCauseAllocationFailures(once.allocator()));
         try std.testing.expect(once.failed);
+    }
+}
+
+test "the readers of a protocol error's words follow what write_protocol_diagnostic writes" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    for ([_]i64{ -32602, -32603, -32601, -32000 }) |code| {
+        for ([_]?[]const u8{ null, "{\"a\":1}" }) |data| {
+            var out: std.Io.Writer.Allocating = .init(arena);
+            try write_protocol_diagnostic(arena, &out.writer, code, "Invalid params", data);
+            const text = out.written();
+            // The message and no data, whatever the code, and whether or not the server gave data.
+            try std.testing.expectEqualStrings(
+                try arena.print(protocol_error_words ++ "{d}: Invalid params", .{code}),
+                try protocolErrorWithoutData(arena, text),
+            );
+            // A cause for -32602 only.
+            try std.testing.expectEqual(code == -32602, (try invalidParamsCause(arena, text)) != null);
+        }
     }
 }
 

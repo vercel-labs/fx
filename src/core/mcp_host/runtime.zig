@@ -3833,6 +3833,57 @@ const ErrorDataScript = struct {
     }
 };
 
+/// The whitespace JSON allows between tokens, as one byte of the script picks it. The first is none.
+const json_gaps = [_][]const u8{ "", " ", "\t", "\n", "\r", " \r\n\t" };
+
+/// `string`, a JSON string literal, as the one value of a JSON text of shape 2 (the string alone), 3 (an object) or
+/// 4 (an array), with insignificant whitespace in every place JSON allows it: around the text, after the brackets,
+/// around `:` and `,`. With `second` the object and the array hold one more value, so a `,` is written. The strings keep
+/// their own spaces. The script picks each gap in the order the text is written.
+fn spacedErrorData(a: Allocator, script: *ErrorDataScript, shape: u8, string: []const u8, second: bool) ![]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    try out.appendSlice(a, json_gaps[script.next() % json_gaps.len]);
+    switch (shape) {
+        2 => try out.appendSlice(a, string),
+        3 => {
+            try out.append(a, '{');
+            try out.appendSlice(a, json_gaps[script.next() % json_gaps.len]);
+            try out.appendSlice(a, "\"detail\"");
+            try out.appendSlice(a, json_gaps[script.next() % json_gaps.len]);
+            try out.append(a, ':');
+            try out.appendSlice(a, json_gaps[script.next() % json_gaps.len]);
+            try out.appendSlice(a, string);
+            if (second) {
+                try out.appendSlice(a, json_gaps[script.next() % json_gaps.len]);
+                try out.append(a, ',');
+                try out.appendSlice(a, json_gaps[script.next() % json_gaps.len]);
+                try out.appendSlice(a, "\"a\"");
+                try out.appendSlice(a, json_gaps[script.next() % json_gaps.len]);
+                try out.append(a, ':');
+                try out.appendSlice(a, json_gaps[script.next() % json_gaps.len]);
+                try out.append(a, '0');
+            }
+            try out.appendSlice(a, json_gaps[script.next() % json_gaps.len]);
+            try out.append(a, '}');
+        },
+        else => {
+            try out.append(a, '[');
+            try out.appendSlice(a, json_gaps[script.next() % json_gaps.len]);
+            try out.appendSlice(a, string);
+            if (second) {
+                try out.appendSlice(a, json_gaps[script.next() % json_gaps.len]);
+                try out.append(a, ',');
+                try out.appendSlice(a, json_gaps[script.next() % json_gaps.len]);
+                try out.append(a, '0');
+            }
+            try out.appendSlice(a, json_gaps[script.next() % json_gaps.len]);
+            try out.append(a, ']');
+        },
+    }
+    try out.appendSlice(a, json_gaps[script.next() % json_gaps.len]);
+    return out.items;
+}
+
 fn fuzzErrorData(_: void, smith: *testing.Smith) !void {
     var buffer: [64]u8 = undefined;
     const len = smith.slice(&buffer);
@@ -3848,7 +3899,8 @@ fn fuzzErrorData(_: void, smith: *testing.Smith) !void {
     };
     const shape = script.next() % 6;
     const mode = script.next() % 4;
-    // Shapes 2 to 4 are valid JSON around one string; shape 5 is bytes of one class, which no JSON holds.
+    // Shapes 2 to 4 are valid JSON around one string, with whitespace between its tokens (see `spacedErrorData`);
+    // shape 5 is bytes of one class, which no JSON holds.
     // A valid string is made of letters, or of one class of bytes that it must write with escapes.
     const near_cap: usize = if (shape == 5) data_cap / 2 else data_cap;
     var target: usize = switch (mode) {
@@ -3874,12 +3926,13 @@ fn fuzzErrorData(_: void, smith: *testing.Smith) !void {
         } else try text.appendSlice(a, unit);
     }
     const string = try std.json.Stringify.valueAlloc(a, text.items, .{});
+    // The script's bytes after these are the whitespace; past its end they read as none, so a saved input without them
+    // is the compact JSON it was.
+    const second = script.next() % 2 == 1;
     const data: ?[]const u8 = switch (shape) {
         0 => null,
         1 => "null",
-        2 => string,
-        3 => try a.print("{{\"detail\":{s}}}", .{string}),
-        4 => try a.print("[{s}]", .{string}),
+        2, 3, 4 => try spacedErrorData(a, &script, shape, string, second),
         else => text.items,
     };
 
@@ -3897,7 +3950,8 @@ fn fuzzErrorData(_: void, smith: *testing.Smith) !void {
     }
     const raw = data.?;
     // What the host should read, worked out without `compactText`: the data must be JSON, and the model
-    // sees it with no spaces. Nothing here is a number, whose writing `std.json` changes.
+    // sees it with no spaces outside its strings, though the server wrote spaces, tabs and line breaks between
+    // the tokens. The only number is 0, which `std.json` writes as it is.
     var source: []const u8 = raw;
     if (raw.len <= data_parse_max) {
         if (!try std.json.validate(a, raw)) {
