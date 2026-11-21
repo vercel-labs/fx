@@ -19,8 +19,10 @@
 (*   when the turn's end finishes. A load gets a tail from the copy while  *)
 (*   the copy holds it.                                                    *)
 (* - A joined connection that closes the session, or ends, leaves the      *)
-(*   audience. A follower's change to the session is refused or ignored,   *)
-(*   and changes nothing.                                                  *)
+(*   audience. A follower's mode or config request is refused and changes  *)
+(*   nothing; its systemPrompt or hooks change is ignored.                 *)
+(*   A follower's prompt is not here. It enters the session's one input    *)
+(*   order (sh-fx.md, Following a session); this spec does not model it.   *)
 (* - With Rules = FALSE (fx before the join), a second connection's        *)
 (*   load is refused as busy, so no connection joins.                      *)
 (*                                                                         *)
@@ -223,10 +225,13 @@ Close(j) ==
     /\ closedLen' = [closedLen EXCEPT ![j] = Len(got[j])]
     /\ UNCHANGED <<turn, phase, sent, runItems, copy, dropped, log, owner, got, mark, skip, early, changed>>
 
-\* A joined connection sends the session a change: a prompt, a mode, a config
-\* option, or a systemPrompt or hooks. The change is refused or ignored, and
-\* changes nothing (server.zig:3541, requireParsedSessionTarget;
-\* sessions.zig:809, traceIgnoredFollowerChanges).
+\* A joined connection sends the session a mode or a config option. fx refuses
+\* each one, and it changes nothing (server.zig:3959,
+\* requireParsedSessionTarget). A joined connection's systemPrompt or hooks
+\* change is ignored and changes nothing (sessions.zig:811,
+\* traceIgnoredFollowerChanges). A follower's prompt is not a change here: it
+\* enters the session's one input order (sh-fx.md, "Following a session"),
+\* which this spec does not model.
 FollowerChange(j) ==
     /\ Audience(j)
     /\ changed' = changed

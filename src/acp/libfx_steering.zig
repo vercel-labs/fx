@@ -540,6 +540,40 @@ pub const Runtime = struct {
         return false;
     }
 
+    /// Moves every queued ACP steer that connection `from` sent into `out`, in queue
+    /// order, for the caller to answer or drop. A steer a turn took is no longer
+    /// queued, so it stays with the turn. Nothing moves when `out` cannot grow.
+    pub fn takeRequestsFrom(
+        self: *Runtime,
+        alloc: Allocator,
+        from: connection.ConnectionId,
+        out: *std.ArrayList(Steer),
+    ) Allocator.Error!void {
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        var count: usize = 0;
+        for (self.messages.items) |entry| {
+            if (entry.request_id != null and connection.sameConnection(entry.from, from)) count += 1;
+        }
+        try out.ensureUnusedCapacity(alloc, count);
+        var index: usize = 0;
+        while (index < self.messages.items.len) {
+            const entry = self.messages.items[index];
+            if (entry.request_id == null or !connection.sameConnection(entry.from, from)) {
+                index += 1;
+                continue;
+            }
+            const removed = self.messages.orderedRemove(index);
+            self.queued_bytes -= removed.text.len;
+            if (removed.input_id) |id| alloc.free(id);
+            out.appendAssumeCapacity(.{
+                .text = removed.text,
+                .request_id = removed.request_id.?,
+                .from = removed.from,
+            });
+        }
+    }
+
     pub fn close(self: *Runtime, alloc: Allocator, reason: []const u8) void {
         self.mutex.lockUncancelable(io_mod.getIo());
         defer self.mutex.unlock(io_mod.getIo());

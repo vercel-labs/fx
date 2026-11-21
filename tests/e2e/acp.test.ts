@@ -15215,7 +15215,9 @@ describe("acp: model-independent", () => {
           code: -32600,
           message: "This session is open on another connection; only that connection can change it.",
         };
-        expect(run.result.prompt.error).toEqual(refusal);
+        // A follower's prompt reaches the owner's turn. This one finds the turn running, so
+        // it gets the answer a running turn gives any prompt, and the model is not called.
+        expect(run.result.prompt.error).toEqual({ code: -32600, message: "Prompt already in progress" });
         expect(run.result.mode.error).toEqual(refusal);
         expect(run.result.reloaded.result.modes.currentModeId).toBe("auto");
 

@@ -647,7 +647,7 @@ pub fn handleLoadWasmSession(state: *server.ServerState, alloc: Allocator, msg: 
         var sources: runtime_tool_presentation.ReplayedSavedOutputSources = .{};
         defer sources.deinit(alloc);
         for (active.session_rt.agent.history.items, 0..) |turn, index| try sendHistoryTurnAsUpdates(state, active, alloc, &sources, turn, index + 1);
-        try sendSessionInfoUpdate(state, active, alloc, active.prompt == null);
+        try sendSessionInfoUpdate(state, active, alloc, !server.sessionPromptRunning(active));
         return writeLoadSessionResponse(state, alloc, msg, active, observer_hooks);
     }
 
@@ -1087,6 +1087,28 @@ fn handleRestoreSession(
     try writeLoadSessionResponse(state, alloc, msg, session, observer_hooks);
 }
 
+/// What `changeClientSystemPromptWhenIdle` did with a changed client system prompt.
+const SystemPromptChange = union(enum) {
+    applied,
+    in_progress,
+    save_failed: anyerror,
+};
+
+/// Stores a changed client system prompt unless a turn holds the session's slot. The
+/// check and the store share one hold of the line lock, so a turn cannot start between
+/// them. The save runs under that hold too, so a reader that waits for the lock also
+/// waits for the save. A stored prompt takes `text`; the other outcomes leave it with
+/// the caller.
+fn changeClientSystemPromptWhenIdle(state: *server.ServerState, session: *server.ActiveSessionState, text: []u8) SystemPromptChange {
+    session.waiting_prompts.lock();
+    defer session.waiting_prompts.unlock();
+    if (session.prompt != null) return .in_progress;
+    if (session.v2) |v2| v2.setClientPrompt(text) catch |err| return .{ .save_failed = err };
+    if (session.client_system_prompt.len > 0) state.alloc.free(session.client_system_prompt);
+    session.client_system_prompt = text;
+    return .applied;
+}
+
 /// `session/load` or `session/resume` of a session open on this connection
 /// reuses it: its turn, mode, and subagents keep running, and load replays
 /// its saved history again. The open session keeps its workspace, so a
@@ -1128,23 +1150,24 @@ fn reuseOpenSession(
         });
     };
     if (requested_system_prompt.*) |text| if (!std.mem.eql(u8, text, session.client_system_prompt)) {
-        if (session.prompt != null) return state.writer.writeError(alloc, msg.id, .{
-            .code = ErrorCode.invalid_request,
-            .message = "Prompt already in progress",
-        });
-        if (session.v2) |v2| v2.setClientPrompt(text) catch |err| {
-            debug_trace.logf("acp", "failed to persist client system prompt err={s}", .{@errorName(err)});
-            return state.writer.writeError(alloc, msg.id, .{
-                .code = ErrorCode.internal_error,
-                .message = "Failed to save the client system prompt",
-            });
-        };
-        if (session.client_system_prompt.len > 0) state.alloc.free(session.client_system_prompt);
-        session.client_system_prompt = text;
-        requested_system_prompt.* = null;
+        switch (changeClientSystemPromptWhenIdle(state, session, text)) {
+            .applied => requested_system_prompt.* = null,
+            .in_progress => return state.writer.writeError(alloc, msg.id, .{
+                .code = ErrorCode.invalid_request,
+                .message = "Prompt already in progress",
+            }),
+            .save_failed => |err| {
+                debug_trace.logf("acp", "failed to persist client system prompt err={s}", .{@errorName(err)});
+                return state.writer.writeError(alloc, msg.id, .{
+                    .code = ErrorCode.internal_error,
+                    .message = "Failed to save the client system prompt",
+                });
+            },
+        }
     };
     // History in memory changes as a turn runs; the saved history doesn't.
-    if (kind.replaysHistory() and session.v2 == null and session.prompt != null) {
+    // A stale answer here is harmless: the replay below checks again under the line lock.
+    if (kind.replaysHistory() and session.v2 == null and server.sessionPromptRunning(session)) {
         return state.writer.writeError(alloc, msg.id, .{
             .code = ErrorCode.invalid_request,
             .message = "Prompt already in progress",
@@ -1199,8 +1222,15 @@ fn reuseOpenSession(
     // A session whose host did not build when it opened gets one now, as
     // every reload gave it before.
     if (session.subagent_host == null) server.enableSubagentHost(session);
-    if (kind.replaysHistory()) try sendActiveHistoryUpdates(state, session, alloc, &sources);
-    try sendSessionInfoUpdate(state, session, alloc, session.prompt == null);
+    if (kind.replaysHistory()) {
+        // A turn may have started since the check above, so the replay checks again.
+        const replayed = try replayHistoryIfIdle(state, session, alloc, &sources);
+        if (!replayed) return state.writer.writeError(alloc, msg.id, .{
+            .code = ErrorCode.invalid_request,
+            .message = "Prompt already in progress",
+        });
+    }
+    try sendSessionInfoUpdate(state, session, alloc, !server.sessionPromptRunning(session));
     return writeLoadSessionResponse(state, alloc, msg, session, observer_hooks);
 }
 
@@ -1785,6 +1815,25 @@ fn parseListCursor(raw: []const u8) !session_store.ResumableSessionContinuation 
     if (updated_at_ms < 0 or fields.next() != null) return error.InvalidParams;
     session_store.validateSessionId(id) catch return error.InvalidParams;
     return .{ .updated_at_ms = updated_at_ms, .id = id };
+}
+
+/// Replays the session's history to the client. A saved history (v2) is never written
+/// by a turn, so it replays without the line lock. An in-memory history changes while a
+/// turn runs, so it is read only when no turn holds the slot. The check and the read
+/// share one hold of the line lock, which keeps a turn from starting in between. The
+/// replay writes to the client under that hold, so a reader that waits for the lock
+/// also waits for the replay. Returns false, without replaying, when a turn holds the
+/// slot.
+fn replayHistoryIfIdle(state: *server.ServerState, session: *server.ActiveSessionState, alloc: Allocator, sources: *runtime_tool_presentation.ReplayedSavedOutputSources) !bool {
+    if (session.v2 != null) {
+        try sendActiveHistoryUpdates(state, session, alloc, sources);
+        return true;
+    }
+    session.waiting_prompts.lock();
+    defer session.waiting_prompts.unlock();
+    if (session.prompt != null) return false;
+    try sendActiveHistoryUpdates(state, session, alloc, sources);
+    return true;
 }
 
 fn sendActiveHistoryUpdates(
@@ -4344,7 +4393,7 @@ test "a repeat session/load of a followed session replays again and adds no seco
     try expectOccurrences(owner_frames.bytes.items, "after repeat", 1);
 }
 
-test "a follower's prompt, set_mode, cancel and set_config_option get -32600, and the owner's session is unchanged" {
+test "a follower's set_mode and set_config_option get -32600, and the owner's session is unchanged" {
     const alloc = std.testing.allocator;
     var owner_frames = JoinFrames{ .alloc = alloc };
     defer owner_frames.deinit();
@@ -4370,12 +4419,7 @@ test "a follower's prompt, set_mode, cancel and set_config_option get -32600, an
     const owner_bytes_before = owner_frames.bytes.items.len;
     const joiner_bytes_before = joiner_frames.bytes.items.len;
 
-    var prompt_msg = jsonrpc.Message{
-        .id = .{ .integer = 10 },
-        .method = "session/prompt",
-        .params_raw = "{\"sessionId\":\"session_joined\",\"prompt\":[{\"type\":\"text\",\"text\":\"change it\"}]}",
-    };
-    try server.dispatch(&joiner, alloc, &prompt_msg);
+    // A joined client's prompt is accepted, so it is not sent here. Its cancel is answered, not refused.
     var mode_msg = jsonrpc.Message{
         .id = .{ .integer = 11 },
         .method = "session/set_mode",
@@ -4396,10 +4440,42 @@ test "a follower's prompt, set_mode, cancel and set_config_option get -32600, an
     try server.dispatch(&joiner, alloc, &config_msg);
 
     const refused = joiner_frames.bytes.items[joiner_bytes_before..];
-    try expectOccurrences(refused, "\"code\":-32600", 4);
-    try expectOccurrences(refused, "This session is open on another connection; only that connection can change it.", 4);
+    try expectOccurrences(refused, "\"code\":-32600", 2);
+    try expectOccurrences(refused, "This session is open on another connection; only that connection can change it.", 2);
+    try std.testing.expect(std.mem.find(u8, refused, "\"id\":12,\"result\":null") != null);
     try std.testing.expectEqual(owner_bytes_before, owner_frames.bytes.items.len);
     try std.testing.expectEqualStrings(mode_before, session.mode);
     try std.testing.expect(session.prompt == null);
     try std.testing.expectEqual(@as(usize, 1), session.followers.items.len);
+}
+
+test "a client that joins while a prompt's turn runs gets the prompt once, in the replay" {
+    const alloc = std.testing.allocator;
+    var owner_frames = JoinFrames{ .alloc = alloc };
+    defer owner_frames.deinit();
+    var joiner_frames = JoinFrames{ .alloc = alloc };
+    defer joiner_frames.deinit();
+    var shared: server.SharedSessions = .{};
+    defer shared.deinit(alloc);
+    var owner = try joinTestState(alloc, &shared, &owner_frames, "/tmp/workspace");
+    defer owner.deinit();
+    owner.connection_id = 1;
+    const session = try openJoinSession(&owner);
+
+    // The owner's prompt starts its turn before anyone joins. Its client gets no copy.
+    try server.announcePromptTurn(session, owner.connection_id, alloc, "joined-prompt", "JOINED_PROMPT", &.{});
+    try expectOccurrences(owner_frames.bytes.items, "JOINED_PROMPT", 0);
+
+    var joiner = try joinTestState(alloc, &shared, &joiner_frames, "/tmp/elsewhere");
+    defer joiner.deinit();
+    joiner.connection_id = 2;
+    var load_msg = jsonrpc.Message{
+        .id = .{ .integer = 2 },
+        .method = "session/load",
+        .params_raw = "{\"sessionId\":\"session_joined\",\"mcpServers\":[]}",
+    };
+    try handleLoadSession(&joiner, alloc, &load_msg);
+    joiner.initialized = true;
+    try expectOccurrences(joiner_frames.bytes.items, "JOINED_PROMPT", 1);
+    try expectOccurrences(joiner_frames.bytes.items, "user_message_chunk", 1);
 }

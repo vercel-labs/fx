@@ -1299,12 +1299,15 @@ const TurnSignIn = struct {
 /// dispatch. Mid-turn session/set_mode changes only affect later prompts.
 /// `usage_total` gets the usage of every turn the prompt runs, its own and
 /// each report turn after it, as each ends: the response reports the whole
-/// prompt's usage (`publishPromptOutcome` in `server.zig`).
+/// prompt's usage (`publishPromptOutcome` in `server.zig`). `prompt_sender` is the
+/// connection that sent the prompt; the other clients are told of it as the turn
+/// starts. Null when the turn's input is shown another way (a steer group).
 pub fn handlePrompt(
     state: *server.ServerState,
     session: *server.ActiveSessionState,
     alloc: Allocator,
     msg: *jsonrpc.Message,
+    prompt_sender: ?server.ConnectionId,
     captured_mode: []const u8,
     captured_permission_mode: PermissionMode,
     usage_total: *types.Usage,
@@ -1527,6 +1530,17 @@ pub fn handlePrompt(
         session.session_write_mutex.lockUncancelable(io_mod.getIo());
         defer session.session_write_mutex.unlock(io_mod.getIo());
         try v2.beginTurn();
+    }
+    // The other clients learn of the prompt as the turn starts. A steer group passes
+    // no sender: its steers are shown as they join the turn.
+    if (comptime server.follow_supported) {
+        if (prompt_sender) |sender| {
+            var message_id_storage: acp_types.MessageIdBuffer = undefined;
+            const message_id = acp_types.generateMessageId(&message_id_storage);
+            server.announcePromptTurn(session, sender, alloc, message_id, prompt_text, prompt_input.images) catch |err| {
+                debug_trace.logf("acp", "dropped the prompt for the other clients err={s}", .{@errorName(err)});
+            };
+        }
     }
 
     var tool_projection = try state.cfg.mode_registry.buildModelToolProjection(alloc, activeToolSet(state), captured_mode, .{
@@ -6255,7 +6269,7 @@ test "ACP prompt propagates context provider errors before pending prompt state"
         AcpContextRegistryFixture.gather_error = expected_error;
         try std.testing.expectError(
             expected_error,
-            handlePrompt(&state, server.firstSession(&state).?, alloc, &msg, "code", .ask, &usage),
+            handlePrompt(&state, server.firstSession(&state).?, alloc, &msg, null, "code", .ask, &usage),
         );
         try std.testing.expectEqual(@as(usize, 1), AcpContextRegistryFixture.gather_calls);
         try std.testing.expect(server.firstSession(&state).?.pending_prompt_id == null);

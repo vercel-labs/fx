@@ -13,6 +13,7 @@ const io_mod = @import("../core/shared/io.zig");
 const jsonrpc = @import("jsonrpc.zig");
 const libfx_steering = @import("libfx_steering.zig");
 const connection = @import("connection.zig");
+const prompt_test_controls = @import("prompt_test_controls.zig");
 
 const Allocator = std.mem.Allocator;
 const RequestId = jsonrpc.RequestId;
@@ -73,6 +74,12 @@ pub const Line = struct {
     worker_running: bool = false,
     /// The session is closing: its worker starts nothing more.
     closing: bool = false,
+    /// A finished turn is taken out of the slot and joined outside the lock.
+    /// While this is set, a claim, a delivery and another reap wait
+    /// (AcpSessionReaders `joining`).
+    joining: bool = false,
+    /// Wakes the waiters when a join ends and when a close begins.
+    joining_done: std.Io.Condition = .init,
 
     pub fn lock(self: *Line) void {
         self.mutex.lockUncancelable(io_mod.getIo());
@@ -80,6 +87,22 @@ pub const Line = struct {
 
     pub fn unlock(self: *Line) void {
         self.mutex.unlock(io_mod.getIo());
+    }
+
+    /// Waits while a taken turn is being joined. With `stop_when_closing`, a
+    /// closing session stops waiting, so its claim refuses at once. The wait
+    /// releases the lock while it sleeps. The caller holds the lock.
+    pub fn waitWhileJoiningLocked(self: *Line, stop_when_closing: bool) void {
+        while (self.joining and !(stop_when_closing and self.closing)) {
+            prompt_test_controls.noteJoinWaiting();
+            self.joining_done.waitUncancelable(io_mod.getIo(), &self.mutex);
+        }
+    }
+
+    /// Wakes the waiters after a join ends or a close begins. The caller holds
+    /// the lock.
+    pub fn wakeWaitersLocked(self: *Line) void {
+        self.joining_done.broadcast(io_mod.getIo());
     }
 
     /// Whether nothing waits.
@@ -159,6 +182,43 @@ pub const Line = struct {
             return true;
         }
         return false;
+    }
+
+    /// Moves every late steer and queued prompt that connection `from` sent into a
+    /// `Drained`, each in line order, for the caller to answer or drop. Nothing moves
+    /// when the allocation fails, and the line keeps the other connections' input.
+    pub fn takeFromLocked(self: *Line, alloc: Allocator, from: connection.ConnectionId) Allocator.Error!Drained {
+        var late_count: usize = 0;
+        for (self.late.items) |steer| {
+            if (connection.sameConnection(steer.from, from)) late_count += 1;
+        }
+        var queue_count: usize = 0;
+        for (self.queue.items) |queued| {
+            if (connection.sameConnection(queued.from, from)) queue_count += 1;
+        }
+        var drained: Drained = .{};
+        errdefer drained.deinit(alloc);
+        try drained.late.ensureUnusedCapacity(alloc, late_count);
+        try drained.queue.ensureUnusedCapacity(alloc, queue_count);
+        var index: usize = 0;
+        while (index < self.late.items.len) {
+            if (!connection.sameConnection(self.late.items[index].from, from)) {
+                index += 1;
+                continue;
+            }
+            const removed = self.late.orderedRemove(index);
+            self.late_bytes -= removed.text.len;
+            drained.late.appendAssumeCapacity(removed);
+        }
+        index = 0;
+        while (index < self.queue.items.len) {
+            if (!connection.sameConnection(self.queue.items[index].from, from)) {
+                index += 1;
+                continue;
+            }
+            drained.queue.appendAssumeCapacity(self.queue.orderedRemove(index));
+        }
+        return drained;
     }
 
     /// Takes everything the line holds, for a closing session to answer.
