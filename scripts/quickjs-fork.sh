@@ -129,6 +129,20 @@ copy_files() {
   done < <(files)
 }
 
+# A patch changes one of the release's files, so a file the release does not
+# have cannot be saved as one; each command stops on it before anything else.
+only_release_files() {
+  local names file status=0
+  names="$(recorded | cut -d' ' -f2)"
+  while IFS= read -r file; do
+    if ! grep -qxF -- "$file" <<< "$names"; then
+      echo "$dir/$file is not one of $release's files in $fork. Patches change the release's files, so keep a file of fx's own outside $dir." >&2
+      status=1
+    fi
+  done < <(files)
+  if [[ "$status" != 0 ]]; then exit 1; fi
+}
+
 # folder_matches: takes the patches off a copy of the folder, newest first,
 # and checks the result against the release's recorded files. git apply takes
 # a patch off only where its lines are unchanged, so a change in a patch's
@@ -137,12 +151,7 @@ folder_matches() {
   local status=0 hash file patch
   mkdir "$work/back"
   git init -q "$work/back"
-  recorded | cut -d' ' -f2 > "$work/names"
   while IFS= read -r file; do
-    if ! grep -qxF -- "$file" "$work/names"; then
-      echo "$dir/$file is not one of $release's files in $fork" >&2
-      status=1
-    fi
     cp "$dir/$file" "$work/back/$file"
   done < <(files)
   while IFS= read -r patch; do
@@ -279,6 +288,7 @@ update_start() {
     echo "usage: scripts/quickjs-fork.sh update REF, with REF a release tag or a full commit" >&2
     exit 2
   fi
+  only_release_files
   ref_commit="$(resolve "$ref")"
   if [[ -z "$ref_commit" ]]; then
     echo "quickjs-ng has no tag $ref" >&2
@@ -338,6 +348,7 @@ update_continue() {
 
 case "${1:-}" in
   check)
+    only_release_files
     work="$(mktemp -d)"
     if ! folder_matches; then
       echo "Save each change to the folder with scripts/quickjs-fork.sh save NAME, or, if an update stopped while writing it, restore it with git checkout -- $dir." >&2
@@ -352,6 +363,7 @@ case "${1:-}" in
       echo "usage: scripts/quickjs-fork.sh save NAME, with NAME in lowercase words joined by hyphens" >&2
       exit 2
     fi
+    only_release_files
     work="$(mktemp -d)"
     start_repo
     apply_patches

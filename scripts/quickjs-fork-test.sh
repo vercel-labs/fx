@@ -162,6 +162,9 @@ expect "save refuses a download that does not match FORK.md" 1 "engine.c at $v1_
 fresh
 touch "$src/extra.h"
 expect "check fails on a file the release does not have" 1 "$src/extra.h is not one of v1's files" $fork check
+expect "save refuses a file the release does not have and says where it goes" 1 "keep a file of fx's own outside $src" $fork save extra-header
+holds "save wrote no patch for it" test ! -e "$src/patches/0002-extra-header.patch"
+expect "update refuses a file the release does not have" 1 "keep a file of fx's own outside $src" $fork update v2
 
 fresh
 edit "s/^| Commit | \`.*\` |\$/| Commit | \`$(printf '%040d' 0)\` |/" FORK.md
