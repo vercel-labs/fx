@@ -12,7 +12,7 @@ pub const ProcessRequest = struct {
     argv: []const []const u8,
     stdin: []const u8,
     cwd: []const u8,
-    /// Added to the host's clean base environment; on a name clash these win.
+    /// Applied last, over a copy of the host's own environment that already has AI_AGENT set; on a name clash these values win.
     env: []const EnvVar,
     timeout_ms: u32,
     stdout_limit: usize,

@@ -104,7 +104,7 @@ const status_line_child_descriptions = [_][]const u8{
 };
 const experimental_children = [_][]const u8{ "hooks", "workspace_capture" };
 const experimental_child_descriptions = [_][]const u8{
-    "Run hooks from hook files; the interactive shell runs only hooks you trust",
+    "Run hooks from hook files; fx runs only hooks you trust",
     "Record the repository's state at each turn's start and end in the session, for evals",
 };
 const retired_description = "No longer used; fx ignores it";

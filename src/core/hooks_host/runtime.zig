@@ -99,10 +99,10 @@ pub const Runtime = struct {
     pending_notes: std.ArrayList(PendingNote) = .empty,
     /// The answers InstructionsLoaded hooks gave, one per session and path. Changes only under `mutex`.
     instruction_decisions: std.ArrayList(InstructionDecision) = .empty,
-    /// Background runs from `dispatchDetached` that have not finished. Changes only under `mutex`.
+    /// Background runs from `dispatchDetached` that have not finished, for the cap. Changes only under `mutex`.
     detached_running: usize = 0,
-    /// Signaled when a background run finishes, so `deinit` can wait for the last one.
-    detached_done: std.Io.Condition = .init,
+    /// Every background run from `dispatchDetached`. `waitDetached` awaits it, so `deinit` waits for the last one.
+    detached_group: std.Io.Group = .init,
     /// Set when `deinit` begins. A background run that sees it stops at once, so exit does not wait out its timeout.
     exiting: std.atomic.Value(bool) = .init(false),
     /// The awake-clock time this runtime's exit SessionEnd hooks must finish by. Zero until the first exit sets it.
@@ -135,7 +135,11 @@ pub const Runtime = struct {
 
     pub fn deinit(self: *Runtime) void {
         // Exit stays fast (R2.5): background runs stop at once, and the SessionEnd hooks run under a budget.
+        // `exiting` is set under `mutex`, the lock `dispatchDetached` holds while it starts a run, so no run starts after this.
+        const io = io_mod.getIo();
+        self.mutex.lockUncancelable(io);
         self.exiting.store(true, .release);
+        self.mutex.unlock(io);
         // A background run still reads this runtime, so wait for it before anything is freed.
         self.waitDetached();
         self.endOpenSessions();
@@ -356,27 +360,28 @@ pub const Runtime = struct {
         };
     }
 
-    /// Runs the hooks for an observe-only event on a new thread and returns at once. The
+    /// Runs the hooks for an observe-only event as a background `std.Io` task and returns at once. The
     /// outcome is not used; its notices are traced. `deinit` waits for every run started here.
     pub fn dispatchDetached(self: *Runtime, ev: hooks.Event, trust_required: bool) void {
         if (!self.wants(ev.name, ev.match_value, trust_required)) return;
         const label = ev.name.fileName();
 
-        // The slot is taken under the mutex before any other work, so two calls cannot both pass the cap.
-        // It is counted before the thread starts, so `deinit` cannot miss it.
+        // The exit check, the cap, and the group call share one lock hold. `deinit` sets `exiting` under the same
+        // lock before it awaits the group, so every run this call starts is one that `deinit` waits for.
         const io = io_mod.getIo();
         self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        if (self.exiting.load(.acquire)) {
+            debug_trace.logf("hooks", "dropped background {s} hooks: the runtime is exiting", .{label});
+            return;
+        }
         if (self.detached_running >= max_detached_runs) {
-            self.mutex.unlock(io);
             debug_trace.logf("hooks", "dropped kind=background hook run event={s} bytes={d} reason=too many running", .{ label, eventBytes(ev) });
             return;
         }
-        self.detached_running += 1;
-        self.mutex.unlock(io);
 
         // The job copies every string the event borrows, so the caller's buffers may go away.
         const job = self.alloc.create(DetachedJob) catch {
-            self.releaseDetachedSlot(io);
             debug_trace.logf("hooks", "dropped background {s} hooks: out of memory", .{label});
             return;
         };
@@ -384,36 +389,27 @@ pub const Runtime = struct {
         job.event = copyEvent(job.arena.allocator(), ev) catch {
             job.arena.deinit();
             self.alloc.destroy(job);
-            self.releaseDetachedSlot(io);
             debug_trace.logf("hooks", "dropped background {s} hooks: out of memory", .{label});
             return;
         };
         job.trust_required = trust_required;
 
-        const thread = std.Thread.spawn(.{}, detachedMain, .{ self, job }) catch |err| {
+        // The count is taken before the task starts, so the cap sees this run. A task that cannot start is
+        // dropped the way a failed spawn was: its copies are freed, and the run is traced.
+        self.detached_running += 1;
+        self.detached_group.concurrent(io, detachedMain, .{ self, job }) catch |err| {
+            self.detached_running -= 1;
             job.arena.deinit();
             self.alloc.destroy(job);
-            self.releaseDetachedSlot(io);
             debug_trace.logf("hooks", "dropped background {s} hooks: {s}", .{ label, @errorName(err) });
             return;
         };
-        thread.detach();
-    }
-
-    /// Gives back a slot that `dispatchDetached` took and did not use, because no run started.
-    fn releaseDetachedSlot(self: *Runtime, io: std.Io) void {
-        self.mutex.lockUncancelable(io);
-        defer self.mutex.unlock(io);
-        self.detached_running -= 1;
-        self.detached_done.broadcast(io);
     }
 
     /// Waits until every background run started by `dispatchDetached` has finished.
     pub fn waitDetached(self: *Runtime) void {
-        const io = io_mod.getIo();
-        self.mutex.lockUncancelable(io);
-        defer self.mutex.unlock(io);
-        while (self.detached_running != 0) self.detached_done.waitUncancelable(io, &self.mutex);
+        // Only a task that is itself cancelled gets error.Canceled from `await`, and this caller is never one.
+        self.detached_group.await(io_mod.getIo()) catch {};
     }
 
     /// Keeps `note` for the session's next turn only. It works whether or not the session has had a
@@ -922,7 +918,6 @@ fn detachedMain(self: *Runtime, job: *DetachedJob) void {
         self.alloc.destroy(job);
         self.mutex.lockUncancelable(io);
         self.detached_running -= 1;
-        self.detached_done.broadcast(io);
         self.mutex.unlock(io);
     }
 

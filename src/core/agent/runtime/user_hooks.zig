@@ -390,7 +390,6 @@ pub const TurnHooks = struct {
         return self.wants(self.stopEvent(), null);
     }
 
-    /// The event a finished reply is checked with: SubagentStop in a subagent turn, else Stop.
     /// Runs the user's SessionStart hooks (SubagentStart in a subagent turn) the first time this
     /// session has a turn in this process, and keeps their context for the session.
     pub fn sessionStart(self: *TurnHooks, arena: std.mem.Allocator, resumed: bool) void {
@@ -484,6 +483,7 @@ pub const TurnHooks = struct {
         };
     }
 
+    /// The event a finished reply is checked with: SubagentStop in a subagent turn, else Stop.
     fn stopEvent(self: *const TurnHooks) hooks_engine.EventName {
         return if (self.surface == .subagent) .subagent_stop else .stop;
     }
@@ -857,7 +857,6 @@ fn toolResponseValue(arena: std.mem.Allocator, output: []const u8) hooks_engine.
     return .{ .json = output };
 }
 
-/// The note the model reads when a PermissionDenied hook allowed one retry of `tool`.
 /// Runs the user's Notification hooks in the background when fx needs the person: a permission
 /// prompt, a question, or a route-recovery choice. The caller does not wait; the runtime's
 /// `deinit` waits for the run.
@@ -1144,9 +1143,9 @@ fn dupeOptional(arena: std.mem.Allocator, text: ?[]const u8) std.mem.Allocator.E
 
 /// Runs one ConfigChange or PreModelSwitch decision on a thread, so the UI thread never waits for a hook (R2.1).
 /// The hook adapter owns it. `start` copies the event into the gate's own arena, so the caller may reuse its buffers.
-/// `requestCancel` sets the flag the hooks poll (R2.4). `take` returns the result once the thread has finished, and
-/// never waits for it. A gate cancelled while its thread still runs stays open until the thread ends, and the next
-/// `take` frees it. `deinit` cancels and joins a gate that is still open, for exit (R3.9).
+/// `requestCancel` sets the flag the hooks poll (R2.4). `take` returns the result once the task has finished, and
+/// never waits for it. A gate cancelled while its task still runs stays open until the task ends, and the next
+/// `take` frees it. `deinit` cancels and awaits a gate that is still open, for exit (R3.9).
 pub const HookGate = struct {
     alloc: std.mem.Allocator,
     current: ?*Job = null,
@@ -1180,7 +1179,8 @@ pub const HookGate = struct {
         decision: ChangeDecision = .{},
         cancel: std.atomic.Value(bool) = .init(false),
         done: std.atomic.Value(bool) = .init(false),
-        thread: ?std.Thread = null,
+        /// The task that runs `run`. `take` and `deinit` await it.
+        future: ?std.Io.Future(void) = null,
 
         fn run(self: *Job) void {
             defer self.done.store(true, .release);
@@ -1188,7 +1188,7 @@ pub const HookGate = struct {
         }
     };
 
-    /// Starts the decision on a thread. `runtime` must outlive the gate: `take` or `deinit` must run before the runtime
+    /// Starts the decision as an `std.Io` task. `runtime` must outlive the gate: `take` or `deinit` must run before the runtime
     /// is freed. Returns error.HookGateBusy while another gate is open.
     pub fn start(self: *HookGate, runtime: *runtime_lifecycle.UserHooksRuntime, kind: ChangeKind, event: hooks_engine.Event, trust_required: bool) !void {
         if (self.current != null) return error.HookGateBusy;
@@ -1197,16 +1197,16 @@ pub const HookGate = struct {
         job.* = .{ .runtime = runtime, .kind = kind, .trust_required = trust_required, .arena = std.heap.ArenaAllocator.init(self.alloc) };
         errdefer job.arena.deinit();
         job.event = try copyEvent(job.arena.allocator(), event);
-        job.thread = try std.Thread.spawn(.{}, Job.run, .{job});
+        job.future = try io_mod.getIo().concurrent(Job.run, .{job});
         self.current = job;
     }
 
-    /// The finished gate's result, or null while its thread still runs or no gate is open. It joins the thread only
-    /// once the thread has finished, so this never waits on a hook.
+    /// The finished gate's result, or null while its task still runs or no gate is open. It awaits the task only
+    /// once the task has finished, so this never waits on a hook.
     pub fn take(self: *HookGate) ?Result {
         const job = self.current orelse return null;
         if (!job.done.load(.acquire)) return null;
-        if (job.thread) |thread| thread.join();
+        if (job.future) |*future| future.await(io_mod.getIo());
         self.current = null;
         const outcome: Outcome = if (job.cancel.load(.acquire)) .cancelled else if (job.decision.refusal != null) .refused else .allowed;
         var context = job.decision.context;
@@ -1238,11 +1238,11 @@ pub const HookGate = struct {
         return self.current != null;
     }
 
-    /// Cancels and joins an open gate, then frees it. The hooks stop within one poll, so exit does not wait on them.
+    /// Cancels and awaits an open gate, then frees it. The hooks stop within one poll, so exit does not wait on them.
     pub fn deinit(self: *HookGate) void {
         const job = self.current orelse return;
         job.cancel.store(true, .seq_cst);
-        if (job.thread) |thread| thread.join();
+        if (job.future) |*future| future.await(io_mod.getIo());
         job.arena.deinit();
         self.alloc.destroy(job);
         self.current = null;
@@ -1328,6 +1328,7 @@ pub fn beginPostModelSwitch(gate: *HookGate, lifecycle: runtime_lifecycle.Lifecy
     return true;
 }
 
+/// The note the model reads when a PermissionDenied hook allowed one retry of `tool`.
 pub fn deniedRetryNote(arena: std.mem.Allocator, tool: []const u8) ![]u8 {
     return frameContext(arena, "PermissionDenied", tool, "A user hook allows one retry of this denied call. Try it again only if a change makes it safe.");
 }
@@ -1365,7 +1366,6 @@ fn surfaceOf(lifecycle: runtime_lifecycle.LifecycleContext) hooks_engine.Surface
     };
 }
 
-/// What the user reads for one notice. Allocated with `arena`.
 /// What a ConfigChange or PreModelSwitch hook decided, and the notices its hooks gave. The refusal
 /// and the notices are allocated with the call's arena.
 pub const ChangeDecision = struct {
@@ -1401,6 +1401,7 @@ fn decidedNotices(arena: std.mem.Allocator, notices: []const hooks_engine.answer
 
 /// The text a person reads for a hook notice. Hook text is escaped here, where the notice is built (R4.6),
 /// so every consumer (the screen, `fx ask`, ACP) gets safe text and must not escape it again.
+/// Allocated with `arena`.
 fn noticeText(arena: std.mem.Allocator, notice: hooks_engine.answer.Notice) std.mem.Allocator.Error![]u8 {
     return switch (notice.kind) {
         .message => arena.print("Hook {f}: {f}", .{ text_utils.terminalSafe(notice.hook_id), text_utils.terminalSafe(notice.text) }),
@@ -2919,6 +2920,36 @@ test "requestCancel stops the hooks, and take returns cancelled once they are go
     try std.testing.expectEqual(HookGate.Outcome.cancelled, result.outcome);
     try std.testing.expect(result.refusal == null);
     try std.testing.expect(groupGone(pid));
+}
+
+test "deinit stops an open gate's hooks, so a late write never happens" {
+    const alloc = std.testing.allocator;
+    var fixture = try HookFixtures.init(alloc);
+    defer fixture.deinit(alloc);
+    const pid_path = try std.Io.Dir.path.join(alloc, &.{ fixture.workspace, "gate.pid" });
+    defer alloc.free(pid_path);
+    // The hook writes late.txt only when its sleep ends, so the file exists only if deinit let the hook run on.
+    const command = try std.mem.concat(alloc, u8, &.{ "echo $$ > '", pid_path, "'; sleep 30; echo late > '", fixture.workspace, "/late.txt'" });
+    defer alloc.free(command);
+    const text = try std.mem.concat(alloc, u8, &.{
+        "{\"hooks\":{\"ConfigChange\":[{\"hooks\":[{\"type\":\"command\",\"command\":\"",
+        command,
+        "\"}]}]}}",
+    });
+    defer alloc.free(text);
+    try writeHookFile(alloc, &fixture, text);
+    var runtime = try startRuntime(alloc, &fixture);
+    defer runtime.deinit();
+    var gate: HookGate = .{ .alloc = alloc };
+    defer gate.deinit();
+    const fields = [_]hooks_engine.Field{.{ .key = "source", .value = .{ .string = "settings" } }};
+
+    try gate.start(&runtime, .setting, settingEvent(&fixture, "settings", &fields), false);
+    _ = try waitForPidFile(alloc, pid_path);
+    gate.deinit();
+    // The check is the late write. The group kill reaches the hook's sleep, so no write happens. Group membership
+    // is not checked: a killed grandchild stays a zombie until init reaps it, so `groupGone` can read false.
+    try std.testing.expectError(error.FileNotFound, fixture.tmp.dir.openFile(io_mod.getIo(), "workspace/late.txt", .{}));
 }
 
 test "a second gate is refused while one is open, and the first one still finishes" {
