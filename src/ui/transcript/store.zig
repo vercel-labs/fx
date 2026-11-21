@@ -692,16 +692,15 @@ fn hasCommittedRetentionSource(self: anytype) bool {
 /// Removes the entries the transcript window dropped (`transcript_window_shell.zig`),
 /// with the same cleanup the byte-cap retention runs after it prunes. Ids no
 /// longer present are skipped; a pinned entry is never removed.
+/// The drop runs on a copy and commits only when every step succeeds, so a failed allocation leaves the transcript and its entries as they were.
 pub fn dropEntriesAtomic(self: anytype, alloc: Allocator, ids: []const u32) !bool {
     if (ids.len == 0) return false;
     if (comptime @hasField(@TypeOf(self.*), "transcript_commit_state")) {
-        if (hasCommittedRetentionSource(self)) {
-            var shadow = try cloneRecordedMutationState(self, alloc);
-            defer shadow.deinit(alloc);
-            const changed = try dropEntries(&shadow, alloc, ids);
-            if (changed) try commitAuthoritativeRecordedMutationState(self, &shadow, alloc, "transcript_window_drop", .preserve_same_epoch);
-            return changed;
-        }
+        var shadow = try cloneRecordedMutationState(self, alloc);
+        defer shadow.deinit(alloc);
+        const changed = try dropEntries(&shadow, alloc, ids);
+        if (changed) try commitAuthoritativeRecordedMutationState(self, &shadow, alloc, "transcript_window_drop", .preserve_same_epoch);
+        return changed;
     }
     return dropEntries(self, alloc, ids);
 }
