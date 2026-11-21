@@ -896,9 +896,16 @@ for (const propagateCorrelation of [false, true]) {
         },
       },
     });
-    const result = (await drain(engine.prompt("observe me", { turnId: "observe-turn" }))).result;
-    assert.equal(result.stopReason, "end_turn");
-    return events.map((event) => event.type);
+    let types;
+    try {
+      const result = (await drain(engine.prompt("observe me", { turnId: "observe-turn" }))).result;
+      assert.equal(result.stopReason, "end_turn");
+      types = events.map((event) => event.type);
+    } finally {
+      // An open engine keeps its native core, and so this process, alive: every run closes its engine.
+      await engine.close();
+    }
+    return types;
   };
   const observed = await runWith("observe");
   assert.ok(observed.includes("turn.start"));
