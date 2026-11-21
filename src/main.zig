@@ -5419,6 +5419,7 @@ test {
     _ = provider_runtime;
     _ = @import("acp/prompt.zig");
     _ = @import("acp/server.zig");
+    _ = @import("acp/prompt_test_controls.zig");
     _ = @import("acp/libfx_hooks.zig");
     _ = @import("acp/types.zig");
     _ = @import("core/mcp_host/model.zig");
@@ -5597,6 +5598,7 @@ test {
     _ = @import("core/session/prompt_history_store.zig");
     _ = @import("core/app/prompt_history_runtime.zig");
     _ = @import("core/session/web_fetch_artifacts.zig");
+    _ = @import("core/session/write_test_controls.zig");
     _ = @import("core/skills/skill_runtime.zig");
     _ = @import("core/subagent/domain.zig");
     _ = @import("core/subagent/child_state.zig");
@@ -5607,6 +5609,8 @@ test {
     _ = @import("core/subagent/authority.zig");
     _ = @import("core/subagent/approval_registry.zig");
     _ = @import("core/subagent/reports.zig");
+    _ = @import("core/subagent/end_test_controls.zig");
+    _ = @import("core/subagent/start_test_controls.zig");
     _ = @import("core/shared/agent_frame.zig");
     _ = @import("core/terminal/contracts.zig");
     _ = @import("core/terminal/operation.zig");
