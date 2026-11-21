@@ -87,6 +87,15 @@
     "repair": []
   },
   {
+    "module": "ErrorData",
+    "smoke": "ErrorData.cfg",
+    "stress": "ErrorData.stress.cfg",
+    "findings": [
+      { "config": "ErrorData.findings.cfg", "invariant": "ErrorDataReachesModel" }
+    ],
+    "repair": []
+  },
+  {
     "module": "ConfigEdit",
     "smoke": "ConfigEdit.cfg",
     "stress": "ConfigEdit.stress.cfg",
@@ -118,6 +127,16 @@
       { "config": "McpRules.findings.cfg", "invariant": "FullAccessIgnoresRules" },
       { "config": "McpRules.findings-paths.cfg", "invariant": "PathsAgree" },
       { "config": "McpRules.findings-integrations.cfg", "invariant": "FullAccessIgnoresRules" }
+    ],
+    "repair": []
+  },
+  {
+    "module": "Connect",
+    "smoke": "Connect.cfg",
+    "stress": "Connect.stress.cfg",
+    "findings": [
+      { "config": "Connect.findings.cfg", "invariant": "NoFalseFailure" },
+      { "config": "Connect.findings-reissue.cfg", "invariant": "NoReissue" }
     ],
     "repair": []
   }

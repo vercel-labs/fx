@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { EventEmitter } from "node:events";
 import { spawn as nodeSpawn, type ChildProcess } from "node:child_process";
 import {
   mkdirSync,
@@ -10,6 +11,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { FX_BIN, runFx } from "../evals/eval-helpers";
+import { LineQueue } from "./line-queue";
 import { savedText } from "./saved-sessions";
 import { fakeGatewayTitleDefault, TITLE_GENERATION_MARKER } from "./tmux-helpers";
 
@@ -110,6 +112,7 @@ function startFakeGateway(
 
 function createIsolatedRoot(args: {
   webFetchPermission?: PermissionAction;
+  permission?: Record<string, unknown>;
 } = {}) {
   const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-web-fetch-e2e-")));
   const home = join(root, "home");
@@ -121,7 +124,8 @@ function createIsolatedRoot(args: {
   if (args.webFetchPermission) {
     permission.web_fetch = { "domain:example.com": args.webFetchPermission };
   }
-  writeFileSync(join(home, ".fx", "settings.json"), JSON.stringify({ permission }));
+  const settings = { permission: args.permission ?? permission };
+  writeFileSync(join(home, ".fx", "settings.json"), JSON.stringify(settings));
   return { root, home, workspace: realpathSync(workspace) };
 }
 
@@ -200,8 +204,7 @@ function expectNoFetchProgress(text: string) {
 
 class AcpClient {
   private buffer = "";
-  private lines: string[] = [];
-  private waiters: Array<(line: string) => void> = [];
+  private queue = new LineQueue();
   private closed = false;
   private activeSessionId: string | null = null;
 
@@ -212,9 +215,7 @@ class AcpClient {
       this.buffer = parts.pop() ?? "";
       for (const line of parts) {
         if (!line.trim()) continue;
-        const waiter = this.waiters.shift();
-        if (waiter) waiter(line);
-        else this.lines.push(line);
+        this.queue.push(line);
       }
     });
     proc.on("close", () => {
@@ -256,18 +257,7 @@ class AcpClient {
   }
 
   async readLine(timeoutMs = TIMEOUT): Promise<any> {
-    const line = await new Promise<string>((resolve, reject) => {
-      const buffered = this.lines.shift();
-      if (buffered) {
-        resolve(buffered);
-        return;
-      }
-      const timer = setTimeout(() => reject(new Error("ACP read timeout")), timeoutMs);
-      this.waiters.push((value) => {
-        clearTimeout(timer);
-        resolve(value);
-      });
-    });
+    const line = await this.queue.next(timeoutMs, () => new Error("ACP read timeout"));
     return JSON.parse(line);
   }
 
@@ -618,4 +608,52 @@ describe("web_fetch Gateway fixture", () => {
     TIMEOUT,
   );
 
+  for (const [name, permission] of [
+    ["ACP wildcard deny refuses web_fetch before any target request", { "*": "deny" }],
+    ["ACP web_fetch deny refuses every host before any target request", { web_fetch: "deny" }],
+  ] as const) {
+    test(
+      name,
+      async () => {
+        const root = createIsolatedRoot({ permission });
+        const gateway = startFakeGateway([
+          outerWebFetchCall(),
+          outerText("ACP fetch denial handled"),
+        ]);
+        const client = AcpClient.create(root.workspace, fakeGatewayEnv(root, gateway));
+        try {
+          await startAcpCodeSession(client);
+          const messages = await runAcpPrompt(client, "Issue denied web_fetch.");
+          const updates = JSON.stringify(messages);
+
+          expect(gateway.requests).toHaveLength(2);
+          expect(gateway.requests[1].body).toContain("policy_denied");
+          expect(updates).not.toContain("Fetching ");
+          expect(updates).not.toContain("Converting ");
+          expect(updates).not.toContain("Extracting ");
+        } finally {
+          await client.close();
+          gateway.stop();
+          rmSync(root.root, { recursive: true, force: true });
+        }
+      },
+      TIMEOUT,
+    );
+  }
+
+});
+
+describe("the ACP test client's reader", () => {
+  test("a read that timed out does not take the next line", async () => {
+    // A stand-in for `fx acp`: no fx runs.
+    const proc = Object.assign(new EventEmitter(), {
+      stdout: new EventEmitter(),
+      stderr: new EventEmitter(),
+      stdin: { write() {} },
+    });
+    const client = new (AcpClient as any)(proc);
+    await expect(client.readLine(30)).rejects.toThrow("ACP read timeout");
+    proc.stdout.emit("data", Buffer.from(`${JSON.stringify({ id: 7, result: {} })}\n`));
+    expect(await client.readLine(500)).toEqual({ id: 7, result: {} });
+  });
 });

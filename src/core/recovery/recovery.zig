@@ -10,8 +10,10 @@
 //! finishes it any other way. Every failure waits instead: for time, or for
 //! the user when only they can fix it (`tests/tla/recovery/Recovery.tla`
 //! NeverGivesUp, Heals). A wait for a sign-in also resends now and then on
-//! its own, since a login can work again without the user (SignInPoll).
-//! Comments below name the model property that pins each rule.
+//! its own, since a login can work again without the user (SignInPoll). A
+//! reply the content filter blocks is resent at once a few times before the
+//! request needs the user (FilterBounded). Comments below name the model
+//! property that pins each rule.
 //!
 //! Outside code imports only this file, and this file imports only `std`.
 //! `scripts/check-recovery-boundary.sh` enforces both in CI.
@@ -176,7 +178,8 @@ pub const State = struct {
     attempt: u16 = 0,
     /// The most recent failure, which the status line names.
     cause: ?Failure.Kind = null,
-    /// Consecutive failures of `streak_kind`; offline never counts.
+    /// Consecutive failures of `streak_kind`; offline never counts. A
+    /// content filter's blocks count here too.
     streak: u8 = 0,
     streak_kind: ?Failure.Kind = null,
     backoff_step: u8 = 0,
@@ -217,7 +220,7 @@ const Flags = packed struct(u8) {
     unused: u5 = 0,
 };
 
-const RetryLabel = enum { after_failure, compacting, resuming, after_sign_in, after_user };
+const RetryLabel = enum { after_failure, compacting, resuming, after_sign_in, after_user, after_content_filter };
 
 // Policy.
 
@@ -244,6 +247,9 @@ const handoff_ms: u64 = 2_000;
 pub const escalate_after: u8 = 3;
 /// Abrupt in-flight deaths before asking the user once.
 const crash_loop_after: u8 = 2;
+/// Resends of a blocked reply in a row before the request needs the user
+/// (`tests/tla/recovery/Recovery.tla` FilterBounded).
+const content_filter_resends: u8 = 3;
 /// How long a wait for a sign-in lasts before the module resends by itself.
 /// Long, so a login that stays bad costs one refused request every few
 /// minutes (`tests/tla/recovery/RecoveryTimed.tla` PollBounded, PollWaits).
@@ -350,7 +356,7 @@ fn onFailed(state: *State, failure: Failure, now_ms: u64) Plan {
         else
             askSignIn(state, now_ms),
         .quota => askUser(state, .quota, now_ms),
-        .content_filter => askUser(state, .content_filter, now_ms),
+        .content_filter => resendAfterContentFilter(state, now_ms),
     };
 }
 
@@ -406,6 +412,10 @@ fn onUserContinue(state: *State, now_ms: u64) Plan {
         return .{};
     }
     if (state.phase != .need_user) return .{};
+    // The user's answer starts the content filter's count over, so the
+    // blocks after it get `content_filter_resends` resends again
+    // (`tests/tla/recovery/Recovery.tla` AnswerGivesResends).
+    if (state.streak_kind == .content_filter) state.streak = 0;
     const label: RetryLabel = if (state.need) |need| switch (need) {
         .crash_loop, .stale => .resuming,
         .sign_in => .after_sign_in,
@@ -563,6 +573,22 @@ fn poll(state: *State, now_ms: u64) Plan {
     };
 }
 
+/// The filter does not block every try, so the module resends a blocked
+/// request unchanged at once, as a user's Enter would, up to
+/// `content_filter_resends` times in a row. The block after those needs the
+/// user: a host that can ask lets them rephrase, and one that cannot ends
+/// the turn. The streak counts the blocks: any other failure that counts
+/// toward a streak starts it over, offline leaves it as it was, and the
+/// user's answer starts it over too, so the blocks after it get the resends
+/// again (`tests/tla/recovery/Recovery.tla` FilterBounded).
+fn resendAfterContentFilter(state: *State, now_ms: u64) Plan {
+    noteStreak(state, .content_filter);
+    if (state.streak > content_filter_resends) return askUser(state, .content_filter, now_ms);
+    state.cause = .content_filter;
+    state.retry_label = .after_content_filter;
+    return sendNow(state, now_ms, .{});
+}
+
 fn resendAfterSignIn(state: *State, now_ms: u64) Plan {
     state.need = null;
     state.retry_label = .after_sign_in;
@@ -644,6 +670,11 @@ fn retryingStatus(state: *const State) Status {
         .resuming => textOf("Resuming the interrupted request · attempt {d}", .{state.attempt}),
         .after_sign_in => textOf("Signed in · retrying · attempt {d}", .{state.attempt}),
         .after_user => textOf("Retrying · attempt {d}", .{state.attempt}),
+        // 46 columns, so it needs no short form.
+        .after_content_filter => textOf("Blocked by the content filter · retrying ({d}/{d})", .{
+            state.streak,
+            content_filter_resends,
+        }),
         .after_failure => if (state.cause == .server and state.flags.no_fast)
             textOf("Gateway error · retrying without Fast · attempt {d}", .{state.attempt})
         else
@@ -1259,7 +1290,9 @@ test "the sign-in fx opened closing resends once and keeps the sign-in status" {
     for ([_]Failure.Kind{ .quota, .rejected, .content_filter }) |kind| {
         var asked: State = .{};
         _ = startNew(&asked, 0, false);
-        _ = fail(&asked, kind, 1_000);
+        // A block asks only after its resends.
+        const fails: usize = if (kind == .content_filter) content_filter_resends + 1 else 1;
+        for (0..fails) |_| _ = fail(&asked, kind, 1_000);
         try testing.expectEqual(Plan{}, step(&asked, .sign_in_closed, 2_000));
         // Their waits never resend by themselves.
         try testing.expectEqual(Plan{}, step(&asked, .tick, 10_000_000));
@@ -1509,7 +1542,7 @@ test "a death while waiting is not a crash loop" {
 test "a request waiting for the user resumes waiting" {
     var state: State = .{};
     _ = startNew(&state, 0, false);
-    const record = fail(&state, .content_filter, 1_000).save.?;
+    const record = blockTimes(&state, content_filter_resends + 1, 1_000).save.?;
     state = .{};
     const resumed = step(&state, .{ .start = .{ .resume_from = record } }, 10);
     try testing.expect(resumed.send == null);
@@ -1624,6 +1657,121 @@ test "the same events at the same times produce the same plans" {
     }
 }
 
+/// Blocks the request `blocks` times in a row from `now_ms`, 500 ms apart.
+fn blockTimes(state: *State, blocks: usize, now_ms: u64) Plan {
+    var plan: Plan = .{};
+    for (0..blocks) |index| plan = fail(state, .content_filter, now_ms + 500 * index);
+    return plan;
+}
+
+test "a blocked reply is resent at once three times, then the request needs the user" {
+    var state: State = .{};
+    _ = startNew(&state, 0, false);
+    var now_ms: u64 = 1_000;
+    for (1..content_filter_resends + 1) |count| {
+        const resend = fail(&state, .content_filter, now_ms);
+        // At once, with its save, and no wait first.
+        try testing.expect(resend.save != null);
+        try testing.expectEqual(Send{}, resend.send.?);
+        try testing.expectEqual(Phase.sending, state.phase);
+        try testing.expectEqual(Status.Kind.retrying, resend.status.?.kind);
+        var expected: [64]u8 = undefined;
+        try testing.expectEqualStrings(
+            try std.mem.print(&expected, "Blocked by the content filter · retrying ({d}/3)", .{count}),
+            resend.status.?.text.slice(),
+        );
+        try testing.expect(columns(resend.status.?.text.slice()) <= short_columns);
+        try testing.expectEqual(@as(u16, @intCast(count + 1)), state.attempt);
+        now_ms += 500;
+    }
+    const asked = fail(&state, .content_filter, now_ms);
+    try testing.expect(asked.send == null);
+    try testing.expectEqual(Status.Kind.need_user, asked.status.?.kind);
+    try testing.expectEqual(Status.Need.content_filter, asked.status.?.need.?);
+    try testing.expectEqualStrings("Blocked by the content filter · press Esc and rephrase", asked.status.?.text.slice());
+    try testing.expectEqual(Phase.need_user, state.phase);
+    try testing.expectEqual(@as(u16, 4), state.attempt);
+    // Nothing resends it after that but the user.
+    try testing.expectEqual(Plan{}, step(&state, .tick, now_ms + 10_000_000));
+}
+
+test "after the user continues, the blocks after it get the resends again" {
+    var state: State = .{};
+    _ = startNew(&state, 0, false);
+    _ = blockTimes(&state, content_filter_resends + 1, 1_000);
+    try testing.expectEqual(Phase.need_user, state.phase);
+    const resent = step(&state, .user_continue, 10_000);
+    try testing.expectEqualStrings("Retrying · attempt 5", resent.status.?.text.slice());
+    // Enter starts the count over, so its blocks are resent at once again.
+    var now_ms: u64 = 11_000;
+    for (1..content_filter_resends + 1) |count| {
+        const resend = fail(&state, .content_filter, now_ms);
+        try testing.expect(resend.send != null);
+        try testing.expectEqual(@as(u8, @intCast(count)), state.streak);
+        now_ms += 500;
+    }
+    // The block after those asks again.
+    const asked = fail(&state, .content_filter, now_ms);
+    try testing.expect(asked.send == null);
+    try testing.expectEqual(Status.Need.content_filter, asked.status.?.need.?);
+    // An answer to the user's next resend finishes the request.
+    _ = step(&state, .user_continue, now_ms + 1_000);
+    try testing.expectEqual(Finish.succeeded, step(&state, .succeeded, now_ms + 2_000).finish.?);
+}
+
+test "a request that gets an answer after two blocks finishes" {
+    var state: State = .{};
+    _ = startNew(&state, 0, false);
+    const second = blockTimes(&state, 2, 1_000);
+    try testing.expectEqualStrings("Blocked by the content filter · retrying (2/3)", second.status.?.text.slice());
+    try testing.expectEqual(Status.Kind.clear, step(&state, .responding, 2_500).status.?.kind);
+    const done = step(&state, .succeeded, 3_000);
+    try testing.expectEqual(Finish.succeeded, done.finish.?);
+    try testing.expectEqual(Phase.idle, state.phase);
+    // The next request starts with every resend again.
+    _ = startNew(&state, 4_000, false);
+    try testing.expect(fail(&state, .content_filter, 5_000).send != null);
+    try testing.expectEqual(@as(u8, 1), state.streak);
+}
+
+test "another failure between blocks starts the content-filter count over, and offline does not" {
+    var state: State = .{};
+    _ = startNew(&state, 0, false);
+    _ = blockTimes(&state, 2, 1_000);
+    // A dropped connection follows its own rule: a wait, then a resend.
+    const dropped = fail(&state, .dropped, 3_000);
+    try testing.expect(dropped.send == null);
+    try testing.expectEqual(Status.Kind.waiting, dropped.status.?.kind);
+    var now_ms = tickUntilSend(&state, 3_000).at_ms;
+    // It used none of the three resends, and gave back the two spent.
+    for (1..content_filter_resends + 1) |count| {
+        const resend = fail(&state, .content_filter, now_ms);
+        try testing.expect(resend.send != null);
+        try testing.expectEqual(@as(u8, @intCast(count)), state.streak);
+        now_ms += 100;
+    }
+    // Offline counts toward no streak, so the count goes on past it.
+    _ = fail(&state, .offline, now_ms);
+    now_ms = tickUntilSend(&state, now_ms).at_ms;
+    try testing.expectEqual(@as(u8, content_filter_resends), state.streak);
+    try testing.expect(fail(&state, .content_filter, now_ms).send == null);
+    try testing.expectEqual(Status.Need.content_filter, state.need.?);
+}
+
+test "a resumed request keeps its run of blocks" {
+    var state: State = .{};
+    _ = startNew(&state, 0, false);
+    const record = fail(&state, .content_filter, 1_000).save.?;
+    // The record keeps its 32 bytes and its layout.
+    try testing.expectEqual(@as(usize, 32), record.len);
+    try testing.expect(decode(record) != null);
+    var resumed: State = .{};
+    try testing.expect(step(&resumed, .{ .start = .{ .resume_from = record } }, 10).send != null);
+    // The saved streak carries over: this is the second block in a row.
+    const resend = fail(&resumed, .content_filter, 20);
+    try testing.expectEqualStrings("Blocked by the content filter · retrying (2/3)", resend.status.?.text.slice());
+}
+
 // Simulation: random hosts that follow fx's side of the contract, with
 // junk events mixed in, checked against the rules after every step.
 
@@ -1690,7 +1838,19 @@ const SimHost = struct {
                         host.transient_failure_ms = host.now_ms;
                     }
                 },
-                .too_long, .rejected, .sign_in, .quota, .content_filter => {},
+                // A block resends at once, a bounded number of times in a
+                // row, and then asks.
+                .content_filter => {
+                    try testing.expectEqual(@as(?Failure.Kind, .content_filter), host.state.streak_kind);
+                    if (host.state.streak <= content_filter_resends) {
+                        try testing.expect(plan.send != null);
+                        try testing.expectEqual(Status.Kind.retrying, plan.status.?.kind);
+                    } else {
+                        try testing.expect(plan.send == null);
+                        try testing.expectEqual(Status.Need.content_filter, plan.status.?.need.?);
+                    }
+                },
+                .too_long, .rejected, .sign_in, .quota => {},
             }
         }
         if (plan.send != null and event == .tick) {

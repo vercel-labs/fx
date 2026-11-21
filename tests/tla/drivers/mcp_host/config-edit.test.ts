@@ -34,6 +34,8 @@ interface Spec {
   ent?: Partial<Record<string, Cls>>;
   /** The profile's misspelled servers key: after the real one, after 70 other keys, or holding 64 entries that aren't servers first. */
   typo?: "key" | "last" | "wide";
+  /** The server the misspelled key holds: a name of NAMES, or (by default) one that isn't. */
+  holds?: string;
   both?: boolean;
   /** Over 64 top-level keys, with no misspelled key. */
   big?: boolean;
@@ -47,8 +49,8 @@ function documentOf(spec: Spec): Record<string, unknown> {
   if (spec.big || spec.typo === "last") Object.assign(doc, fillers(70));
   doc.mcpServers = servers;
   if (spec.both) doc.mcp = {};
-  if (spec.typo === "key" || spec.typo === "last") doc.mcp_servers = { z: { command: "x" } };
-  if (spec.typo === "wide") doc.servers = { ...Object.fromEntries(Array.from({ length: 64 }, (_, i) => [`n${i}`, i])), real: { command: "y" } };
+  if (spec.typo === "key" || spec.typo === "last") doc.mcp_servers = { [spec.holds ?? "z"]: { command: "x" } };
+  if (spec.typo === "wide") doc.servers = { ...Object.fromEntries(Array.from({ length: 64 }, (_, i) => [`n${i}`, i])), [spec.holds ?? "real"]: { command: "y" } };
   return doc;
 }
 
@@ -63,7 +65,8 @@ class Scenario {
     this.paths = { profile: join(this.f.home, ".fx", "mcp.json"), project: join(this.f.workspace, ".mcp.json") };
     const model = (file: File, spec: Spec) => ({
       st: spec.st,
-      typo: file === "profile" && !!spec.typo,
+      // What the misspelled key holds, as the model says it: nothing, a server of NAMES, or another one.
+      typo: file === "profile" && spec.typo ? (spec.holds && NAMES.includes(spec.holds) ? spec.holds : "other") : "no-typo",
       both: file === "profile" && !!spec.both,
       big: file === "profile" && (!!spec.big || spec.typo === "last" || spec.typo === "wide"),
       ent: Object.fromEntries(NAMES.map((n) => [n, spec.ent?.[n] ?? "none"])),
@@ -89,8 +92,10 @@ class Scenario {
   async remove(file: File, name: string) {
     const before = sha(this.paths[file]);
     const ran = await this.run(["mcp", "remove", file === "project" ? "--project" : "--global", name]);
-    const outcome = ran.stdout.startsWith("Removed ") ? "removed" : ran.stderr.startsWith("Couldn't remove ") ? "refused" : ran.stderr.startsWith("No MCP server named ") ? "missing" : `unexpected: ${ran.stdout}${ran.stderr}`;
+    const outcome = ran.stdout.startsWith("Removed ") ? "removed" : ran.stderr.startsWith("Couldn't remove ") ? "refused" : ran.stderr.startsWith("No MCP server named ") ? (ran.stderr.trimEnd().includes("\n") ? "hinted" : "missing") : `unexpected: ${ran.stdout}${ran.stderr}`;
     expect(outcome === "removed" ? ran.code === 0 : ran.code === 1).toBe(true);
+    // The hint is one more line, and it names the file and the key.
+    if (outcome === "hinted") expect(ran.stderr.trimEnd().split("\n")[1]).toMatch(/^\S+ is in ~\/\.fx\/mcp\.json, but the key (that starts with )?"[^"]*"/);
     this.records.push({ event: "remove", data: { file, name, outcome, same: sha(this.paths[file]) === before } });
     return ran;
   }
@@ -112,7 +117,8 @@ class Scenario {
     const doc = !replaces && existsSync(path) ? (JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown>) : {};
     const write = () => writeFileSync(path, JSON.stringify(doc));
     switch (kind) {
-      case "typo_appears": doc.mcp_servers = { z: { command: "x" } }; write(); break;
+      // The key holds the server `name` when that is one of NAMES, and a server that isn't one of them otherwise.
+      case "typo_appears": doc.mcp_servers = { [NAMES.includes(name) ? name : "z"]: { command: "x" } }; write(); break;
       case "typo_fixed": for (const key of ["mcp_servers", "servers"]) delete doc[key]; write(); break;
       case "grows": Object.assign(doc, fillers(70)); write(); break;
       case "both_appear": doc.mcp = {}; write(); break;
@@ -211,7 +217,7 @@ test("a profile whose servers key looks misspelled is never rewritten by add or 
 test("a misspelled key that appears between two commands, with no lock taken, is found by the next one", async () => {
   const s = new Scenario("config-edit-typo-between", { st: "ok", ent: { a: "ok" } }, NONE);
   await s.add("profile", "b", "ok");
-  s.tamper("typo_appears", "profile");
+  s.tamper("typo_appears", "profile", "z");
   await s.add("profile", "c", "ok");
   await s.remove("profile", "b");
   s.tamper("typo_fixed", "profile");
@@ -238,6 +244,45 @@ test("a misspelled key whose first 64 entries aren't servers is found", async ()
   await s.add("profile", "b", "ok");
   await s.list("profile");
   await s.verify();
+}, 240_000);
+
+test("a name that only the misspelled key holds gets a hint with the key, a name nowhere gets none, and neither command touches the file", async () => {
+  const s = new Scenario("config-edit-typo-hint", { st: "ok", ent: { a: "ok" }, typo: "key", holds: "b" }, NONE);
+  const bytes = () => readFileSync(s.paths.profile, "utf8");
+  const before = bytes();
+  const hinted = await s.remove("profile", "b");
+  expect(hinted.code).toBe(1);
+  expect(hinted.stdout).toBe("");
+  expect(hinted.stderr.split("\n")[0]).toBe("No MCP server named b in ~/.fx/mcp.json.");
+  expect(hinted.stderr.split("\n")[1]).toContain('b is in ~/.fx/mcp.json, but the key "mcp_servers" looks like a misspelling of "mcpServers"');
+  // An entry of the real key is refused, as before; a name that is nowhere is only "No MCP server named".
+  await s.remove("profile", "a");
+  const nowhere = await s.remove("profile", "c");
+  expect(nowhere.stderr).toBe("No MCP server named c in ~/.fx/mcp.json.\n");
+  expect(bytes()).toBe(before);
+  // The key is fixed by hand: the name is a plain miss. A key that appears between two commands is found by the next one.
+  s.tamper("typo_fixed", "profile");
+  const plain = await s.remove("profile", "b");
+  expect(plain.stderr).toBe("No MCP server named b in ~/.fx/mcp.json.\n");
+  s.tamper("typo_appears", "profile", "c");
+  const again = await s.remove("profile", "c");
+  expect(again.code).toBe(1);
+  expect(again.stderr.split("\n")[1]).toContain('c is in ~/.fx/mcp.json, but the key "mcp_servers"');
+  await s.list("profile");
+  await s.verify();
+}, 240_000);
+
+test("the hint reads every key, though fx's load scan gives up on that file: a misspelled key after 70 others, or after 64 entries that aren't servers", async () => {
+  for (const typo of ["last", "wide"] as const) {
+    const s = new Scenario(`config-edit-typo-hint-${typo}`, { st: "ok", ent: { a: "ok" }, typo, holds: "b" }, NONE);
+    const before = readFileSync(s.paths.profile, "utf8");
+    const hinted = await s.remove("profile", "b");
+    expect(hinted.code).toBe(1);
+    expect(hinted.stderr.split("\n")[1]).toContain("b is in ~/.fx/mcp.json, but the key ");
+    expect(readFileSync(s.paths.profile, "utf8")).toBe(before);
+    await s.list("profile");
+    await s.verify();
+  }
 }, 240_000);
 
 // ---- edges ----
@@ -311,9 +356,10 @@ test("fault: twenty fx processes adding at once each keep their entry, and the e
 }, 240_000);
 
 // How many adds a kill must end for the test to say anything about a kill mid-add, and how many adds it may make
-// to get there.
+// to get there. Under 16 busy loops on 8 CPUs it took 40 to 98 adds to end 5, so the limit leaves room for a runner
+// that is slower still.
 const KILLS_AT_LEAST = 5;
-const ADDS_AT_MOST = 120;
+const ADDS_AT_MOST = 240;
 
 test("crash: a kill at any moment of an add leaves the profile as it was or as the add made it, and the next fx takes the lock", async () => {
   const s = new Scenario("config-edit-crash", { st: "ok", ent: { a: "ok" } }, NONE);

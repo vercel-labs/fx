@@ -713,7 +713,7 @@ pub const Runtime = struct {
         alloc: Allocator,
         input: StartCapturedInput,
     ) !PreparedSnapshot {
-        if (input.yield_time_ms > contract.max_yield_time_ms) {
+        if (input.yield_time_ms > contract.max_wait_ceiling_ms) {
             return error.InvalidYieldTime;
         }
         const admission = try self.admitCaptured(input);
@@ -744,9 +744,18 @@ pub const Runtime = struct {
         const started_ms = io_mod.milliTimestamp();
         const yield_grace_ms = if (input.tool_yield_flag != null) steerYieldGraceMs() else 0;
         const zio = io_mod.getIo();
+        // The wait ends at its yield, or when the command reaches the quiet
+        // limit after the wait saw it under it, as an `interact` wait does
+        // (`quiet_notice.poll`).
+        const limit_ms = quietLimitMs();
+        entry.mutex.lockUncancelable(zio);
+        var quiet_wait = quiet_notice.beginWait(started_ms, entry.last_output_ms, input.yield_time_ms, limit_ms);
+        entry.mutex.unlock(zio);
+        var quiet_crossed = false;
         while (true) {
             entry.mutex.lockUncancelable(zio);
             const terminal = entry.isTerminal();
+            const last_output_ms = entry.last_output_ms;
             entry.mutex.unlock(zio);
             if (terminal) break;
             if (input.cancel_flag) |flag| {
@@ -769,10 +778,20 @@ pub const Runtime = struct {
                 debug_trace.logf("managed-execution", "run yielded for steering execution={s} elapsed_ms={d}", .{ entry.execution_id, elapsed });
                 break;
             }
+            if (!held) {
+                const step = quiet_notice.poll(quiet_wait, now_ms, last_output_ms, limit_ms);
+                quiet_wait = step.wait;
+                if (step.end == .quiet) {
+                    quiet_crossed = true;
+                    break;
+                }
+            }
             io_mod.sleep(10 * std.time.ns_per_ms);
         }
 
-        const prepared = try self.prepareSnapshot(alloc, entry.execution_id);
+        var prepared = try self.prepareSnapshot(alloc, entry.execution_id);
+        // A command that ended as the wait crossed is no crossing.
+        if (quiet_crossed) prepared.snapshot.quiet_crossed = prepared.snapshot.quiet_notice;
         entry.mutex.lockUncancelable(zio);
         if (!entry.isTerminal()) entry.published_running = true;
         entry.mutex.unlock(zio);

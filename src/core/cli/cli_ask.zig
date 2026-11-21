@@ -726,10 +726,11 @@ const AskContext = struct {
     image_snapshot_temp_dir: ?[]u8 = null,
     prompt_snapshot_committed: bool = false,
     last_recovery_status: ?types.RouteRecoveryStatus = null,
-    /// The recovery status kind last printed as a notice. fx ask cannot
-    /// redraw a line, so it prints a module status only when its kind
-    /// changes, not on every one-second refresh.
+    /// The recovery status kind and attempt last printed as a notice. fx
+    /// ask cannot redraw a line, so it prints a module status only when its
+    /// kind or attempt changes, not on every one-second refresh.
     last_recovery_notice_kind: ?types.RouteRecoveryStatus.Kind = null,
+    last_recovery_notice_attempt: usize = 0,
 
     fn init(alloc: Allocator, cfg: Config, deps: RunDeps, workspace_root: []const u8) AskContext {
         const lifecycle_runtime = hooks.Runtime.init(alloc);
@@ -3628,8 +3629,10 @@ fn pushRouteRecoveryStatus(raw_ctx: *anyopaque, status: types.RouteRecoveryStatu
     ctx.last_recovery_status = status;
     const notice = switch (status.kind) {
         .waiting, .retrying, .need_user => notice: {
-            const changed = ctx.last_recovery_notice_kind != status.kind;
+            const changed = ctx.last_recovery_notice_kind != status.kind or
+                ctx.last_recovery_notice_attempt != status.attempt;
             ctx.last_recovery_notice_kind = status.kind;
+            ctx.last_recovery_notice_attempt = status.attempt;
             break :notice changed and ctx.output_mode != .quiet;
         },
         // The success or the error itself is the notice; --json reports how
@@ -8152,8 +8155,9 @@ test "render final JSON reports the successful recovery attempt" {
 
     const json = try renderFinalJsonResult(alloc, result);
     defer alloc.free(json);
-    // The module shape (decision 38): `recovered` carries only the attempt,
-    // with no message, budget, or delay fields.
+    // The module shape (decision 38): `recovered` carries the attempt and,
+    // when a send failed, the cause. This status has no failure, so it
+    // carries only the attempt, with no message, budget, or delay fields.
     try std.testing.expect(std.mem.find(u8, json, ",\"recovery\":{\"state\":\"recovered\",\"attempt\":3}}") != null);
 }
 
@@ -9117,7 +9121,7 @@ test "fx ask JSON recovery keeps stdout structured and reports progress on stder
     try std.testing.expectEqualStrings("recovered", recovery.get("state").?.string);
     try std.testing.expectEqual(@as(i64, 2), recovery.get("attempt").?.integer);
     try std.testing.expect(recovery.get("message") == null);
-    // A host that cannot redraw prints a status only when its kind changes.
+    // A host that cannot redraw prints a status only when its kind or attempt changes.
     try std.testing.expectEqualStrings(
         "[notice] Offline · next try in 2s · 0s\n[notice] Offline · retrying · attempt 2 · 2s\n",
         stderr_capture.bytes.items,

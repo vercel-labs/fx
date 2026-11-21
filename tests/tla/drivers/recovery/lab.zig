@@ -47,6 +47,8 @@ const StateOut = struct {
     deaths: u8,
     clean: bool,
     flowing: bool,
+    streak: u8,
+    streak_kind: ?[]const u8,
 };
 
 const DiskOut = struct {
@@ -126,6 +128,8 @@ fn stateOut(state: *const recovery.State) StateOut {
         .deaths = state.abrupt_deaths,
         .clean = state.flags.clean_exit,
         .flowing = state.flowing,
+        .streak = state.streak,
+        .streak_kind = if (state.streak_kind) |kind| @tagName(kind) else null,
     };
 }
 
@@ -203,6 +207,11 @@ fn run(lab: *Lab, op: Op, result: *Result) void {
         result.plan = planOut(lab.poll());
     } else if (is(op.op, "handoff")) {
         result.plan = planOut(lab.handOff());
+    } else if (is(op.op, "abandon")) {
+        // fx ends a request nobody can answer on its own error. That host
+        // keeps no record, so nothing is left to resume.
+        lab.state = .{};
+        lab.disk = null;
     } else if (is(op.op, "exit")) {
         // The process ends, by a crash or after `closing`; the record stays.
         lab.state = .{};

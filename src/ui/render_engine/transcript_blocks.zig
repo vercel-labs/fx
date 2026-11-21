@@ -1016,7 +1016,7 @@ pub fn renderTableForTranscript(
 
 /// A wrapped column keeps at least this many cells, or its natural width when
 /// narrower, so its text stays legible and every two-cell rune still fits.
-const table_min_column_width: usize = 3;
+pub const table_min_column_width: usize = 3;
 
 const TableColumnMeasure = struct {
     /// Width of the widest cell laid out on one line.

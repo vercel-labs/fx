@@ -912,6 +912,14 @@ fn defines(c: Context, arena: Allocator, file: config_file.File, path: []const u
     return config_file.has(arena, file, text, name);
 }
 
+/// What follows "No MCP server named NAME": the profile `text` has a server by that name under a key that
+/// looks like a misspelling of its servers key, so fx doesn't read it. The words of the key and the fix are
+/// the refusal's, which `add` and an edit of that profile give. Null when no such key holds the name.
+fn misspelledKeyHint(arena: Allocator, text: []const u8, name: []const u8) !?[]const u8 {
+    const key = (try project_config.misspelledKeyHolding(arena, text, name)) orelse return null;
+    return try arena.print("{s} is in {s}, but {s}.", .{ try safe(arena, name), fileLabel(.profile), try refusalWords(arena, .{ .misspelled = key }) });
+}
+
 fn remove(c: Context, arena: Allocator, name: []const u8, only: ?config_file.File) !u8 {
     const p = try paths(c, arena);
     const in_profile = (only == null or only == .profile) and try defines(c, arena, .profile, p.profile, name);
@@ -923,6 +931,12 @@ fn remove(c: Context, arena: Allocator, name: []const u8, only: ?config_file.Fil
     if (!in_profile and !in_project) {
         const where = if (only) |f| fileLabel(f) else profile_paths.displayText("~/.fx/mcp.json or .mcp.json");
         try c.err.print("No MCP server named {s} in {s}.\n", .{ try safe(arena, name), where });
+        // The profile may list the name under a servers key that fx doesn't read: say so, and write nothing.
+        if (only == null or only == .profile) {
+            if (try config_file.read(arena, p.profile)) |text| {
+                if (try misspelledKeyHint(arena, text, name)) |hint| try c.err.print("{s}\n", .{hint});
+            }
+        }
         return 1;
     }
     const file: config_file.File = if (in_profile) .profile else .project;
@@ -1492,6 +1506,32 @@ test "list lines up its columns and keeps hostile names inert" {
         \\{"servers":[{"name":"context7","source":"profile","file":"/h/.fx/mcp.json","transport":"http","status":"ready","error":null,"tools":2}]}
         \\
     , json.written());
+}
+
+test "a name that only a misspelled key holds gets a line with the key and the fix, and no other name does" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const text = "{\"mcpServers\":{\"a\":{\"command\":\"x\"}},\"mcp_servers\":{\"b\":{\"command\":\"y\"}}}";
+    try testing.expectEqualStrings(
+        "b is in ~/.fx/mcp.json, but the key \"mcp_servers\" looks like a misspelling of \"mcpServers\", so fx doesn't read it. Move its servers into \"mcpServers\", then delete \"mcp_servers\", and run the command again.",
+        (try misspelledKeyHint(arena, text, "b")) orelse return error.TestExpectedHint,
+    );
+    try testing.expect(try misspelledKeyHint(arena, text, "a") == null);
+    try testing.expect(try misspelledKeyHint(arena, text, "c") == null);
+    // The name is the person's text: made terminal-safe, as every other message does.
+    const odd = "{\"mcp_servers\":{\"x\\u001b[2J\":{\"command\":\"y\"}}}";
+    const hint = (try misspelledKeyHint(arena, odd, "x\x1b[2J")) orelse return error.TestExpectedHint;
+    try testing.expect(std.mem.find(u8, hint, "\x1b") == null);
+    // A key too long to show whole is named by how it starts, and the words end by saying to run the command again.
+    var long: std.ArrayList(u8) = .empty;
+    try long.appendSlice(arena, "{\"mcp_servers");
+    for (0..70) |_| try long.appendSlice(arena, "\u{e9}");
+    try long.appendSlice(arena, "\":{\"b\":{\"command\":\"y\"}}}");
+    const cut = (try misspelledKeyHint(arena, long.items, "b")) orelse return error.TestExpectedHint;
+    try testing.expect(std.unicode.utf8ValidateSlice(cut));
+    try testing.expect(std.mem.startsWith(u8, cut, "b is in ~/.fx/mcp.json, but the key that starts with \"mcp_servers"));
+    try testing.expect(std.mem.endsWith(u8, cut, "then delete that key, and run the command again."));
 }
 
 test "a refused add names a misspelled key by how it starts when it is too long to show whole, in words that end by saying to run the command again" {

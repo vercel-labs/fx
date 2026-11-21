@@ -15,6 +15,11 @@
 #   hot-retry           resending at once after a failure                  NoHotRetry
 #   send-without-save   a retry sent without saving the record first       SaveBeforeSend
 #   yield-retry-status  a continued turn shown as a retry ("attempt 2")    NoFalseAlarm
+#   filter-unbounded    every blocked reply resent, without a bound        FilterBounded
+#   filter-asks-early   the first blocked reply asks, with no resend       FilterBounded
+#   cannot-ask-resends  fx ask resends a request that needs the user       CannotAskEnds
+#   asking-host-resends the TUI resends without the user's answer          AskingHostWaits
+#   filter-answer-keeps-count  the user's answer keeps the blocks' count  AnswerGivesResends
 #
 # RecoveryTimed.tla adds a discrete clock. recovery-timed.cfg must pass, and
 # each of its mutations plants one defect:
@@ -66,6 +71,11 @@ Recovery recovery-mutation-hot-retry NoHotRetry
 Recovery recovery-mutation-send-without-save SaveBeforeSend
 Recovery recovery-mutation-poll-reopens StatusHonest
 Recovery recovery-mutation-poll-drop-reasks PollKeepsSignIn
+Recovery recovery-mutation-filter-unbounded FilterBounded
+Recovery recovery-mutation-filter-asks-early FilterBounded
+Recovery recovery-mutation-cannot-ask-resends CannotAskEnds
+Recovery recovery-mutation-asking-host-resends AskingHostWaits
+Recovery recovery-mutation-filter-answer-keeps-count AnswerGivesResends
 RecoveryTimed recovery-timed -
 RecoveryTimed recovery-mutation-unbounded-wait WaitBounded
 RecoveryTimed recovery-mutation-frozen-countdown StatusFresh
