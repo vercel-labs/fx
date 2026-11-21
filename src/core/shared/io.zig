@@ -504,6 +504,19 @@ pub fn getenv(key: []const u8) ?[]const u8 {
     return null;
 }
 
+/// The value of `key` when it is an absolute path, else null. A test control
+/// reads its file path with this: the absolute file calls take no other kind,
+/// and a relative path would crash fx or put a file in the workspace.
+pub fn getenvAbsolutePath(key: []const u8) ?[]const u8 {
+    return absolutePath(getenv(key));
+}
+
+/// `value` when it is an absolute path, else null.
+pub fn absolutePath(value: ?[]const u8) ?[]const u8 {
+    const path = value orelse return null;
+    return if (std.Io.Dir.path.isAbsolute(path)) path else null;
+}
+
 /// The environment array libc holds now, valid only until the process next
 /// changes its environment.
 fn liveLibcEnviron() ?RawEnviron {
@@ -1543,6 +1556,15 @@ test "libc environment lookups follow a host that grows the environment" {
     var cloned = try cloneEnvironMap(std.testing.allocator);
     defer cloned.deinit();
     try std.testing.expectEqualStrings("live", cloned.get("FX_IO_LIVE_ENV_150").?);
+}
+
+test "only an absolute path counts as a path from the environment" {
+    try std.testing.expectEqualStrings("/tmp/held", absolutePath("/tmp/held").?);
+    try std.testing.expect(absolutePath(null) == null);
+    try std.testing.expect(absolutePath("") == null);
+    try std.testing.expect(absolutePath("held") == null);
+    try std.testing.expect(absolutePath("./held") == null);
+    try std.testing.expect(absolutePath("../held") == null);
 }
 
 test "readFileToEnd: file under cap returns full content" {
