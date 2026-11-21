@@ -442,7 +442,7 @@ pub const StoreReady = struct {
 };
 
 /// The paths that set a store command's config context.
-pub const StoreScope = struct {
+const StoreScope = struct {
     git_dir: []const u8,
     index_file: []const u8,
     work_tree: []const u8,
@@ -2354,6 +2354,35 @@ test "safe git store commands for a scoped store list its hooks once, and anothe
     _ = try other.ok(.{ .read_tree = head });
     try std.testing.expectEqual(@as(usize, 2), try listings.count(calls, repo.arena));
     try std.testing.expectEqual(@as(usize, 0), try repo.runs());
+}
+
+test "safe git scoped store handle matches only the store with the same git dir, index and worktree" {
+    const store: Store = .{
+        .git_dir = "/s/store.git",
+        .index_file = "/s/index",
+        .work_tree = "/w",
+        .scratch_dir = "/s/scratch",
+    };
+    const scoped: StoreReady = .{
+        .executable = "/usr/bin/git",
+        .scope = .{ .git_dir = "/s/store.git", .index_file = "/s/index", .work_tree = "/w" },
+    };
+    try std.testing.expect(scoped.scopedTo(store));
+
+    var other_git_dir = store;
+    other_git_dir.git_dir = "/t/store.git";
+    try std.testing.expect(!scoped.scopedTo(other_git_dir));
+
+    var other_index = store;
+    other_index.index_file = "/t/index";
+    try std.testing.expect(!scoped.scopedTo(other_index));
+
+    var other_work_tree = store;
+    other_work_tree.work_tree = "/t";
+    try std.testing.expect(!scoped.scopedTo(other_work_tree));
+
+    const unscoped: StoreReady = .{ .executable = "/usr/bin/git" };
+    try std.testing.expect(!unscoped.scopedTo(store));
 }
 
 test "safe git capture store stops a slow trusted filter at its deadline" {
