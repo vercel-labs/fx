@@ -8614,7 +8614,10 @@ test "a message counted by the parent's stop is not counted again by the user's 
     fixture.release.set(io_mod.getIo());
     try waitForSlotEnd(runtime, child_id);
     try std.testing.expectEqual(@as(usize, 1), fixture.runs.load(.seq_cst));
-    try std.testing.expect(!fixture.linger_timed_out.load(.seq_cst));
+    if (fixture.linger_timed_out.load(.seq_cst)) {
+        std.debug.print("the lingering turn was not released within 10 s\n", .{});
+        return error.LingerNotReleasedWithin10s;
+    }
 }
 
 /// A hold after each of the first two works recorded its end, before the host's
@@ -9805,7 +9808,7 @@ fn runAccountCell(scenario: Scenario, hosted_path: bool, in_stop: bool, plan: Pl
     // A lingering turn that was never released waited out its 10 s and failed.
     // Every other cell of the window would wait as long, so the table stops
     // there, as it does for a cell it cannot drive.
-    if (cell.fixture.linger_timed_out.load(.seq_cst)) return error.LingerNeverReleased;
+    if (cell.fixture.linger_timed_out.load(.seq_cst)) return error.LingerNotReleasedWithin10s;
     const as_on_main = accountAsOnMain(plan, scenario, hosted_path);
     const ledger = cell.tally();
     const verdict = accountVerdict(ledger, as_on_main);
