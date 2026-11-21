@@ -1625,12 +1625,10 @@ pub const Runtime = struct {
         defer work.deinit(self.alloc);
         const posted = self.finishTurnWork(work, outcome, reply);
         if (end_test_controls.settleArmed()) end_test_controls.holdBeforeSettle(child_id);
-        // Defers run last-declared first: the lock below is released, then a
-        // closing child's close is written, then the owner's `wait` is nudged,
-        // so the child's busy flag is clear and its close is written by then
-        // (`nudgeWaiter`).
-        defer if (!posted) self.nudgeWaiter();
-        defer _ = self.settleClose(child_id);
+        // Runs after the lock below is released: a closing child's close is
+        // written, then the owner's `wait` is nudged, so the child's busy
+        // flag is clear and its close is written by then (`nudgeWaiter`).
+        defer self.settleCloseThenNudge(child_id, !posted);
         // A message the slot could not start is ended and reported with the
         // lock released, and the next one waiting is tried.
         while (self.startPendingAfterTurn(child_id)) |failed| {
@@ -1650,6 +1648,17 @@ pub const Runtime = struct {
             defer self.admission_mutex.unlock(io_mod.getIo());
             self.forgetCallLocked(failed.work_id);
         }
+    }
+
+    /// The last step of a user's turn's end: writes the child's close when
+    /// it is closing, then nudges the owner's `wait` when `nudge` is set.
+    /// When another thread is writing that close, the nudge is left to it,
+    /// and it sends it once its write returns (`settleCloseFor`), so the
+    /// wait is never nudged ahead of the write.
+    fn settleCloseThenNudge(self: *Runtime, child_id: []const u8, nudge: bool) void {
+        end_test_controls.holdBeforeCloseSettle(child_id);
+        if (self.settleCloseFor(child_id, nudge) == .left) return;
+        if (nudge) self.nudgeWaiter();
     }
 
     /// A message waiting for the child whose slot could not start, now ended
@@ -2301,16 +2310,37 @@ pub const Runtime = struct {
     /// failed, which leaves the child listed again, as before its close, and
     /// is traced.
     fn settleClose(self: *Runtime, child_id: []const u8) bool {
+        return self.settleCloseFor(child_id, false) != .failed;
+    }
+
+    /// How `settleCloseFor` left a child's close.
+    const Settled = enum {
+        /// Nothing was left to write, or this thread wrote the close.
+        settled,
+        /// This thread's write failed.
+        failed,
+        /// Another thread is writing it.
+        left,
+    };
+
+    /// `settleClose`, for a caller that owes the owner's `wait` a nudge
+    /// (`nudge_owed`): when another thread is writing the close, that
+    /// thread is told to send the nudge after its write returns
+    /// (`Closing.nudge_after`), under the same lock that reads the mark.
+    fn settleCloseFor(self: *Runtime, child_id: []const u8, nudge_owed: bool) Settled {
         const work_id = blk: {
             self.admission_mutex.lockUncancelable(io_mod.getIo());
             defer self.admission_mutex.unlock(io_mod.getIo());
-            const index = self.closingIndexLocked(child_id) orelse return true;
+            const index = self.closingIndexLocked(child_id) orelse return .settled;
             const entry = &self.closing.items[index];
-            if (entry.settling) return true;
-            if (self.isBusyLocked(child_id) or self.inTurnWorkLocked(child_id)) return true;
+            if (entry.settling) {
+                if (nudge_owed) entry.nudge_after = true;
+                return .left;
+            }
+            if (self.isBusyLocked(child_id) or self.inTurnWorkLocked(child_id)) return .settled;
             const id = self.alloc.print(close_work_prefix ++ "{s}", .{entry.id}) catch |err| {
-                self.finishCloseLocked(child_id, err);
-                return false;
+                _ = self.finishCloseLocked(child_id, err);
+                return .failed;
             };
             entry.settling = true;
             break :blk id;
@@ -2327,31 +2357,42 @@ pub const Runtime = struct {
             break :blk null;
         };
         self.finishClose(owned, failure);
-        if (failure != null) return false;
+        if (failure != null) return .failed;
         debug_trace.eventf("mailbox", "closed", .{}, "child={s}", .{owned});
         self.managed.forgetFeedback(owned);
-        return true;
+        return .settled;
     }
 
     /// The end of a close, written or not: the child stops being closing. A
     /// close that couldn't be written leaves the child, so the app, if it
     /// hasn't yet, keeps its agent too.
     fn finishClose(self: *Runtime, child_id: []const u8, failure: ?anyerror) void {
-        self.admission_mutex.lockUncancelable(io_mod.getIo());
-        defer self.admission_mutex.unlock(io_mod.getIo());
-        self.finishCloseLocked(child_id, failure);
+        const nudge_after = blk: {
+            self.admission_mutex.lockUncancelable(io_mod.getIo());
+            defer self.admission_mutex.unlock(io_mod.getIo());
+            break :blk self.finishCloseLocked(child_id, failure);
+        };
+        // A user's turn that ended meanwhile left its nudge to this write.
+        if (nudge_after) self.nudgeWaiter();
     }
 
-    fn finishCloseLocked(self: *Runtime, child_id: []const u8, failure: ?anyerror) void {
+    /// Returns whether a turn's end left its nudge to this write.
+    fn finishCloseLocked(self: *Runtime, child_id: []const u8, failure: ?anyerror) bool {
         if (failure) |err| debug_trace.logf("mailbox", "close not written child={s} err={s}", .{ child_id, @errorName(err) });
-        if (self.closingIndexLocked(child_id)) |index| self.alloc.free(self.closing.swapRemove(index).id);
-        if (failure == null) return;
+        var nudge_after = false;
+        if (self.closingIndexLocked(child_id)) |index| {
+            const removed = self.closing.swapRemove(index);
+            nudge_after = removed.nudge_after;
+            self.alloc.free(removed.id);
+        }
+        if (failure == null) return nudge_after;
         for (self.closed_unseen.items, 0..) |id, index| {
             if (!std.mem.eql(u8, id, child_id)) continue;
             self.alloc.free(self.closed_unseen.orderedRemove(index));
             break;
         }
         if (self.closed_unseen.items.len == 0) self.closed_waiting.store(false, .release);
+        return nudge_after;
     }
 
     /// `message{agent: "parent"}`: a child of this host writes to the
@@ -6133,6 +6174,76 @@ test "a user's turn on a closing subagent writes the close before it nudges main
     try std.testing.expect(!registryLists(gap.runtime, child_id));
 }
 
+/// A hold at `end_test_controls.test_hold_close_settle`: the end of a user's
+/// turn, once it has cleared the child's busy flag, waits here before it
+/// settles the close.
+const HeldCloseSettle = HeldAt(end_test_controls, "test_hold_close_settle");
+
+/// A hold at the write of a close, after the close marks the child as being
+/// written (`close_test_controls.test_hold`).
+const HeldCloseWrite = HeldAt(close_test_controls, "test_hold");
+
+/// Closes `child_id` as its parent on the calling thread, for a test that lands
+/// a close from another thread. A thread cannot return an error, so a failed
+/// close leaves `closed` false, and the test asserts it.
+fn closeChildOnThread(runtime: *Runtime, child_id: []const u8, closed: *bool) void {
+    closed.* = (runtime.closeChild(child_id, .parent) catch return) != null;
+}
+
+test "a close that lands as a user's turn ends is written before main's wait is nudged" {
+    var gap: GapFixture = undefined;
+    try gap.init(.{ .armed = false });
+    defer gap.deinit();
+
+    const child_id = try gap.finishFirstWork();
+    const work_id = gap.runtime.beginUserWork(std.testing.allocator, child_id, null).?;
+    defer std.testing.allocator.free(work_id);
+    // Main's wait is registered, as `waitForMail` registers it first, so a
+    // nudge sets the worker's flag and stays set.
+    gap.runtime.setWaiter(&gap.worker);
+    defer gap.runtime.setWaiter(null);
+    HeldCloseSettle.arm();
+    defer HeldCloseSettle.clear();
+    HeldCloseWrite.arm();
+    defer HeldCloseWrite.clear();
+
+    const ender = try std.Thread.spawn(.{}, endUserWorkOnThread, .{ gap.runtime, child_id, work_id, child_state.Outcome.cancelled });
+    var ender_joined = false;
+    defer if (!ender_joined) {
+        HeldCloseSettle.release();
+        ender.join();
+    };
+    // The end has cleared the child's busy flag and is held before it settles.
+    try HeldCloseSettle.waitHeld();
+
+    // A close that lands now finds the child idle, so it settles the close
+    // itself, and that thread is held in the write.
+    var closed = false;
+    const closer = try std.Thread.spawn(.{}, closeChildOnThread, .{ gap.runtime, child_id, &closed });
+    var closer_joined = false;
+    defer if (!closer_joined) {
+        HeldCloseWrite.release();
+        closer.join();
+    };
+    try HeldCloseWrite.waitHeld();
+
+    // The end goes on while the close is still held in its write.
+    HeldCloseSettle.release();
+    ender.join();
+    ender_joined = true;
+    const nudged_while_write_held = nudgeSet(&gap.worker);
+    try std.testing.expect(!nudged_while_write_held);
+    try std.testing.expect(registryLists(gap.runtime, child_id));
+
+    // The write goes on: the close is written, and then main's wait is nudged.
+    HeldCloseWrite.release();
+    closer.join();
+    closer_joined = true;
+    try std.testing.expect(closed);
+    try std.testing.expect(!registryLists(gap.runtime, child_id));
+    try std.testing.expect(nudgeSet(&gap.worker));
+}
+
 test "rebinding a moved host context moves its report sink too" {
     const alloc = std.testing.allocator;
     var parent: child_state.TestParent = undefined;
@@ -7279,6 +7390,10 @@ const Closing = struct {
     id: []u8,
     /// Whether a thread is writing its close, so no other writes it too.
     settling: bool = false,
+    /// Whether the thread writing the close nudges the owner's `wait`
+    /// once its write returns: a user's turn that ended meanwhile found
+    /// the close being written and left its own nudge to that thread.
+    nudge_after: bool = false,
 };
 
 /// What names a close's work in the log; the child's id follows.
