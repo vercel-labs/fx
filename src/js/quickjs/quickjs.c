@@ -81,7 +81,8 @@
 #define __extension__
 #endif
 
-#ifndef NDEBUG
+/* fx never sets dump flags, so it builds the engine without the dump code. */
+#if 0
 #define ENABLE_DUMPS
 #endif
 
@@ -31203,6 +31204,8 @@ static JSValue js_module_ns_autoinit(JSContext *ctx, JSObject *p, JSAtom atom,
                                      void *opaque)
 {
     JSModuleDef *m = opaque;
+    /* fx loads no modules. */
+    return JS_ThrowTypeError(ctx, "modules are not available in code mode");
     return JS_GetModuleNamespace(ctx, m);
 }
 
@@ -32033,6 +32036,11 @@ static JSValue js_dynamic_import(JSContext *ctx, JSValueConst specifier,
             attributes_obj = JS_UNDEFINED;
         }
     }
+
+    /* fx loads no modules, so the module code stays out of its build. The
+       promise rejects, as it does for an import that fails to load. */
+    JS_ThrowTypeError(ctx, "import() is not available in code mode");
+    goto exception;
 
     args[0] = resolving_funcs[0];
     args[1] = resolving_funcs[1];
@@ -38184,6 +38192,9 @@ static JSValue JS_EvalFunctionInternal(JSContext *ctx, JSValue fun_obj,
         ret_val = JS_CallFree(ctx, fun_obj, this_obj, 0, NULL);
     } else if (tag == JS_TAG_MODULE) {
         JSModuleDef *m;
+        /* fx loads no modules. */
+        JS_FreeValue(ctx, fun_obj);
+        return JS_ThrowTypeError(ctx, "modules are not available in code mode");
         m = JS_VALUE_GET_PTR(fun_obj);
         /* the module refcount should be >= 2 */
         JS_FreeValue(ctx, fun_obj);
@@ -38247,6 +38258,8 @@ static JSValue __JS_EvalInternal(JSContext *ctx, JSValueConst this_obj,
         var_refs = NULL;
         is_strict_mode = (flags & JS_EVAL_FLAG_STRICT) != 0;
         if (eval_type == JS_EVAL_TYPE_MODULE) {
+            /* fx loads no modules. */
+            return JS_ThrowSyntaxError(ctx, "modules are not available in code mode");
             JSAtom module_name = JS_NewAtom(ctx, filename);
             if (module_name == JS_ATOM_NULL)
                 return JS_EXCEPTION;
@@ -40484,6 +40497,8 @@ static JSValue JS_ReadObjectRec(BCReaderState *s)
         no_allow_bytecode:
             return JS_ThrowSyntaxError(ctx, "no bytecode allowed");
         }
+        /* fx loads no modules. */
+        return JS_ThrowSyntaxError(ctx, "modules are not available in code mode");
         obj = JS_ReadModule(s);
         break;
     case BC_TAG_OBJECT:

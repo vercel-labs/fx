@@ -1,0 +1,14 @@
+diff --git a/quickjs.c b/quickjs.c
+index b563594..b5786ef 100644
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -81,7 +81,8 @@
+ #define __extension__
+ #endif
+ 
+-#ifndef NDEBUG
++/* fx never sets dump flags, so it builds the engine without the dump code. */
++#if 0
+ #define ENABLE_DUMPS
+ #endif
+ 

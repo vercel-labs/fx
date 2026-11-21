@@ -670,6 +670,8 @@ test "built-ins that grow buffers through QuickJS's allocator keep the function-
 
 test "import() is refused with an error that says so" {
     try expectThrew("TypeError: import() is not available in code mode", "return await import('fs');", .{});
+    // import() returns a promise that rejects, as the spec says, so .catch sees the error.
+    try expectReturned("\"caught: import() is not available in code mode\"", "return await import('fs').catch((e) => 'caught: ' + e.message);", .{});
     try expectThrew("SyntaxError", "import fs from 'fs';", .{});
 }
 
