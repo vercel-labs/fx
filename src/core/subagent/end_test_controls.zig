@@ -132,10 +132,10 @@ pub fn holdFiles(held_var: []const u8, release_var: []const u8) ?HoldFiles {
 }
 
 fn usableHoldFiles(held: ?[]const u8, release: ?[]const u8) ?HoldFiles {
-    const held_path = held orelse return null;
-    const release_path = release orelse return null;
-    if (!std.Io.Dir.path.isAbsolute(held_path) or !std.Io.Dir.path.isAbsolute(release_path)) return null;
-    return .{ .held = held_path, .release = release_path };
+    return .{
+        .held = io_mod.absolutePath(held) orelse return null,
+        .release = io_mod.absolutePath(release) orelse return null,
+    };
 }
 
 /// Writes `<held>.<n>` with the text `fmt` makes, for the n-th hold counted

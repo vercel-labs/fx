@@ -15368,10 +15368,10 @@ test("a wait that starts as a subagent's work ends with nothing to report still 
 
 // A test hold reads its two file paths from the environment and takes only
 // absolute ones: a relative path is ignored, as if the hold were not set. Main
-// starts subagent `worker`, whose first turn is held until main stops it, so the
-// run reaches the start hold, the stopped-end hold, and the settle hold, each set
-// to relative paths. fx must neither crash nor write a marker file into the
-// workspace.
+// starts subagent `worker`, stops it, and closes it, so the run reaches the
+// start, stopped-end, settle, publish, and close holds, each set to a relative
+// path; the session-write hold is set too, though this run does not reach it.
+// fx must neither crash nor write a marker file into the workspace.
 test("a test hold set to a relative path is ignored", async () => {
   const root = createFixtureRoot("relative-hold-paths");
   const held = heldFakeGatewayFinalText();
@@ -15383,7 +15383,8 @@ test("a test hold set to a relative path is ignored", async () => {
       childRequests++;
       return held.response;
     }
-    if (raw.includes("relhold-stop")) return fakeGatewayFinalText("RELHOLD_MAIN_DONE");
+    if (raw.includes("relhold-close")) return fakeGatewayFinalText("RELHOLD_MAIN_DONE");
+    if (raw.includes("relhold-stop")) return fakeGatewayToolCall("relhold-close", "subagent", { request: { action: "close", agent: "worker" } });
     if (raw.includes("relhold-start")) {
       await waitUntil(() => childRequests > 0, 20_000);
       return fakeGatewayToolCall("relhold-stop", "subagent", { request: { action: "stop", agent: "worker" } });
@@ -15393,7 +15394,7 @@ test("a test hold set to a relative path is ignored", async () => {
     });
   }, { models: [{ id: MODEL, type: "language", tags: ["tool-use"] }] });
   try {
-    const result = await runFx(["ask", "--json", "--full-access", "Start the worker, then stop it."], {
+    const result = await runFx(["ask", "--json", "--full-access", "Start the worker, stop it, then close it."], {
       cwd: root.workspace,
       env: {
         ...fixtureEnv(root, gateway, join(root.root, "trace.log")),
@@ -15404,6 +15405,12 @@ test("a test hold set to a relative path is ignored", async () => {
         FX_TEST_SUBAGENT_END_RELEASE: "relative-end-release",
         FX_TEST_SUBAGENT_SETTLE_HELD: "relative-settle-held",
         FX_TEST_SUBAGENT_SETTLE_RELEASE: "relative-settle-release",
+        FX_TEST_SUBAGENT_PUBLISH_HELD: "relative-publish-held",
+        FX_TEST_SUBAGENT_PUBLISH_RELEASE: "relative-publish-release",
+        FX_TEST_SUBAGENT_CLOSE_HELD: "relative-close-held",
+        FX_TEST_SUBAGENT_CLOSE_RELEASE: "relative-close-release",
+        FX_TEST_SESSION_WRITE_HELD: "relative-session-write-held",
+        FX_TEST_SESSION_WRITE_RELEASE: "relative-session-write-release",
       },
       timeoutMs: 30_000,
     });
