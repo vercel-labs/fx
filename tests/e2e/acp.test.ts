@@ -1166,6 +1166,51 @@ for (const [name, finalText] of [
   }, 45000);
 }
 
+test("ACP shell output after a yielded call does not reopen its card", async () => {
+  const gate = Promise.withResolvers<void>();
+  const signal = Bun.serve({ hostname: "127.0.0.1", port: 0, async fetch() {
+    await gate.promise;
+    return new Response("LATE_STDOUT");
+  } });
+  const fixture = createConfiguredProviderFixture(body => {
+    const results = body.messages.filter((message: any) => message.role === "tool");
+    if (results.length === 0) return configuredToolCompletion(body.model, "shell", { request: {
+      action: "run", yield_time_ms: 1, command: `node -e "fetch('http://127.0.0.1:${signal.port}/').then(r=>r.text()).then(console.log)"`,
+    } }, "call_split");
+    if (results.length === 1) {
+      const session = JSON.stringify(results[0].content).match(/shell-\d+/)?.[0];
+      if (!session) throw new Error("expected a yielded shell session");
+      gate.resolve();
+      return configuredToolCompletion(body.model, "shell", { request: {
+        action: "interact", session_id: session, yield_time_ms: 5000,
+      } }, "call_collect");
+    }
+    return configuredCompletion(body.model, "done");
+  });
+  let client: AcpClient | undefined;
+  try {
+    client = await AcpClient.create({ cwd: fixture.workspace, env: fixture.env });
+    await client.request("initialize", { protocolVersion: 1 }, 1);
+    await client.request("session/new", { cwd: fixture.workspace, mcpServers: [] }, 2);
+    await client.request("session/set_mode", { modeId: "full-access" }, 3);
+    const result = await runPrompt(client, "Run the split probe.", TIMEOUT);
+    expect(result.promptResult.result.stopReason).toBe("end_turn");
+    const updates = result.messages.map((message: any) => message.params?.update);
+    const split = updates.filter((u: any) => u?.toolCallId === "call_split");
+    const end = split.findIndex((u: any) => u.status === "completed");
+    expect(end).toBeGreaterThan(-1);
+    const tail = split.slice(end + 1);
+    expect(tail.some((u: any) => JSON.stringify(u.content).includes("LATE_STDOUT"))).toBe(true);
+    expect(tail.every((u: any) => u.status === undefined)).toBe(true);
+    expect(updates.some((u: any) => u?.toolCallId === "call_collect" && u.status === "completed" && JSON.stringify(u.content).includes("LATE_STDOUT"))).toBe(true);
+  } finally {
+    gate.resolve();
+    await client?.close();
+    signal.stop(true);
+    fixture.close();
+  }
+}, 45000);
+
 test("ACP shell completed and replayed updates show the command output", async () => {
   const fixture = createConfiguredProviderFixture(body => body.messages.some((message: any) => message.role === "tool")
     ? configuredCompletion(body.model, "done")
