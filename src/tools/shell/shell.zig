@@ -347,7 +347,7 @@ fn defaultYieldTime(action: Action) u32 {
 /// returns its session_id for the next interact.
 fn boundedYieldTime(action: Action, requested_ms: u32) u32 {
     return switch (action) {
-        .run => @min(requested_ms, managed_contract.max_yield_time_ms),
+        .run => @min(requested_ms, managed_contract.max_wait_ceiling_ms),
         .interact => @min(requested_ms, managed_contract.max_wait_ceiling_ms),
         .stop => requested_ms,
     };
@@ -697,7 +697,7 @@ pub fn call(
 ) tool_dispatch.DispatchError!tool_dispatch.ToolResult {
     const input = erased.as(OwnedInput).value;
     return switch (input.action) {
-        .run => callRun(ctx, input),
+        .run => callRun(ctx, runInputFor(ctx, input)),
         .interact => callInteract(ctx, input),
         .stop => callStop(ctx, input),
     };
@@ -885,6 +885,24 @@ fn noteSteeringYield(
 fn withoutSteeringYield(ctx: tool_dispatch.DispatchContext, yield_time_ms: u32) tool_dispatch.DispatchContext {
     var result = ctx;
     if (yield_time_ms == 0) result.tool_yield_flag = null;
+    return result;
+}
+
+/// The wait a `run` gets on this host. ACP steering does not end a running
+/// command's wait (it never raises `tool_yield_flag`), so on `fx acp` a
+/// run keeps the 30 s cap that bounds how long a steer waits behind it.
+/// The terminal ends the wait when the user steers, and `fx ask` has no
+/// steering, so both keep the longer wait.
+fn runYieldTimeFor(role: terminal_contracts.TransportRole, requested_ms: u32) u32 {
+    return switch (role) {
+        .acp => @min(requested_ms, managed_contract.max_yield_time_ms),
+        .interactive, .headless => requested_ms,
+    };
+}
+
+fn runInputFor(ctx: tool_dispatch.DispatchContext, input: Input) Input {
+    var result = input;
+    result.yield_time_ms = runYieldTimeFor(ctx.terminal_transport_role, input.yield_time_ms);
     return result;
 }
 
@@ -3165,8 +3183,8 @@ test "shell caps a wait over the action limit instead of refusing the call" {
     const alloc = std.testing.allocator;
     const ctx = tool_dispatch.DispatchContext{ .allocator = alloc };
     const cases = [_]struct { args: []const u8, expected_ms: u32 }{
-        .{ .args = "{\"action\":\"run\",\"command\":\"true\",\"yield_time_ms\":30001}", .expected_ms = managed_contract.max_yield_time_ms },
-        .{ .args = "{\"action\":\"run\",\"command\":\"true\",\"yield_time_ms\":300000}", .expected_ms = managed_contract.max_yield_time_ms },
+        .{ .args = "{\"action\":\"run\",\"command\":\"true\",\"yield_time_ms\":120000}", .expected_ms = 120_000 },
+        .{ .args = "{\"action\":\"run\",\"command\":\"true\",\"yield_time_ms\":300001}", .expected_ms = managed_contract.max_wait_ceiling_ms },
         .{ .args = "{\"action\":\"run\",\"command\":\"true\",\"yield_time_ms\":1000}", .expected_ms = 1_000 },
         .{ .args = "{\"action\":\"interact\",\"session_id\":\"shell-1\",\"yield_time_ms\":300001}", .expected_ms = managed_contract.max_wait_ceiling_ms },
         .{ .args = "{\"action\":\"interact\",\"session_id\":\"shell-1\",\"yield_time_ms\":45000}", .expected_ms = 45_000 },
@@ -3183,6 +3201,14 @@ test "shell caps a wait over the action limit instead of refusing the call" {
             },
         }
     }
+}
+
+test "a run keeps the 30 s wait on fx acp and the longer wait elsewhere" {
+    try std.testing.expectEqual(@as(u32, 30_000), runYieldTimeFor(.acp, 120_000));
+    try std.testing.expectEqual(@as(u32, 20_000), runYieldTimeFor(.acp, 20_000));
+    try std.testing.expectEqual(@as(u32, 0), runYieldTimeFor(.acp, 0));
+    try std.testing.expectEqual(@as(u32, 120_000), runYieldTimeFor(.headless, 120_000));
+    try std.testing.expectEqual(@as(u32, 300_000), runYieldTimeFor(.interactive, 300_000));
 }
 
 test "shell decoder rejects removed handoff and legacy actions" {

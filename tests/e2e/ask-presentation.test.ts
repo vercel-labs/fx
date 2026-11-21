@@ -317,6 +317,32 @@ describe("fx ask presentation", () => {
     ).toEqual([]);
   }, TIMEOUT);
 
+  test("a shell run returns a 35-second command as completed when it waits 45 seconds", async () => {
+    const root = createRoot();
+    const gateway = startFakeGateway([
+      fakeGatewayToolCall("shell-slow", "shell", {
+        request: { action: "run", command: "sleep 35; printf waited-done", yield_time_ms: 45_000 },
+      }),
+      fakeGatewayFinalText("Slow command verified.\n"),
+    ]);
+    gateways.push(gateway);
+
+    const result = await runFx(["ask", "--json", "--yolo", "--no-save", "Run the slow fixture."], {
+      cwd: root.workspace,
+      env: { ...gatewayEnv(root.home, gateway), FX_SOUND: "0" },
+      timeoutMs: 150_000,
+    });
+
+    expect(result.code).toBe(0);
+    expect(gateway.requests).toHaveLength(2);
+    // The follow-up request carries the shell result as JSON text, so its
+    // quotes arrive escaped.
+    const followUp = gateway.requests[1]!.body;
+    expect(followUp).toContain("waited-done");
+    expect(followUp).toContain(JSON.stringify('"state":"completed"').slice(1, -1));
+    expect(followUp).not.toContain(JSON.stringify('"state":"running"').slice(1, -1));
+  }, 150_000);
+
   test("redirected and JSON stdout preserve raw assistant Markdown", async () => {
     const root = createRoot();
     const rawGateway = startFakeGateway([fakeGatewayFinalText(MARKDOWN)]);

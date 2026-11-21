@@ -6669,6 +6669,39 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     );
   }, 60_000);
 
+  test("a quiet shell command ends a long run at the quiet limit and asks the model to check it", async () => {
+    const arrivals: number[] = [];
+    let sessionId = "";
+    await runQuietFixture(
+      "shell-quiet-long-run",
+      ["ask", "--json", "--yolo", "--no-save", "Run the long quiet command fixture."],
+      [
+        () => {
+          arrivals[0] = Date.now();
+          return fakeShellRun("shell_quiet_long_run", "sleep 30", { profile: "clean", yield_time_ms: 20_000 });
+        },
+        (body) => {
+          arrivals[1] = Date.now();
+          // The run ends when the quiet time crosses the limit, long before
+          // its 20 second yield.
+          expect(arrivals[1]! - arrivals[0]!).toBeLessThan(10_000);
+          const crossed = shellResult(body, "shell_quiet_long_run");
+          expect(crossed.state).toBe("running");
+          expect(crossed.quiet_ms!).toBeGreaterThanOrEqual(QUIET_LIMIT_MS);
+          expect(crossed.quiet_notice).toContain("still working or has hung");
+          sessionId = crossed.session_id ?? "";
+          return shellStop("shell_quiet_long_run_stop", sessionId);
+        },
+        (body) => {
+          const stopped = shellResult(body, "shell_quiet_long_run_stop");
+          expect(stopped.state).toBe("stopped");
+          return fakeGatewayFinalText("Quiet run checked.");
+        },
+      ],
+      "Quiet run checked.",
+    );
+  }, 60_000);
+
   test("a quiet shell command's limit restarts at new output", async () => {
     let resetSession = "";
     await runQuietFixture(
