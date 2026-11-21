@@ -13624,7 +13624,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     }
   });
 
-  test("content filter does not retry or offer route recovery", async () => {
+  test("content filter resends three times, then ends the turn as before", async () => {
     const root = createFixtureRoot("content-filter-terminal");
     const tracePath = join(root.root, "trace.log");
     const gateway = startGateway(() => contentFilterResponse());
@@ -13643,18 +13643,61 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       expect(result.code).toBe(1);
       expect(json.exit_code).toBe(1);
       expect(json.error).toBe("ModelError");
-      expect(json.usage).toEqual({ input_tokens: 7, output_tokens: 11 });
       expect(result.signal).toBeNull();
       expect(result.timedOut).toBe(false);
+      expect(json.recovery?.state).toBe("failed");
       expect(json.recovery?.message).toContain(
         "⚠ blocked · content_filter · content filter",
       );
-      expect(gateway.requestCount()).toBe(1);
-      expect(result.stderr).toBe("");
+      // Three resends at once, then the fourth block ends the turn.
+      expect(gateway.requestCount()).toBe(4);
+      // Each resend is a new attempt, so each prints its own notice.
+      for (const count of [1, 2, 3]) {
+        expect(result.stderr).toContain(`[notice] Blocked by the content filter · retrying (${count}/3)\n`);
+      }
+      expect(trace.split("event=content_filter_resend").length - 1).toBe(3);
+      // fx ask cannot answer a question, so it never shows one.
+      expect(result.stderr).not.toContain("press Esc");
       expect(trace).toContain("event=route_failure");
       expect(trace).toContain("finish_reason=content-filter");
-      expect(trace).toContain("retry=false");
       expect(trace).not.toContain("event=route_recovery_decision");
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  });
+
+  test("content filter blocks twice, then the resend's answer finishes the turn", async () => {
+    const root = createFixtureRoot("content-filter-recovered");
+    const tracePath = join(root.root, "trace.log");
+    const responses = [
+      contentFilterResponse(),
+      contentFilterResponse(),
+      fakeGatewayFinalText("ALLOWED_AFTER_TWO_BLOCKS"),
+    ];
+    const gateway = startGateway(() =>
+      responses.shift() ?? new Response("unexpected request", { status: 500 })
+    );
+    try {
+      const result = await runFx(
+        ["ask", "--json", "--auto", "--no-save", "Trigger content filter fixture."],
+        {
+          cwd: root.workspace,
+          env: fixtureEnv(root, gateway, tracePath),
+          timeoutMs: 15_000,
+        },
+      );
+      const json = parseAskJson(result.stdout);
+      const trace = readFileSync(tracePath, "utf8");
+
+      expect(result.code).toBe(0);
+      expect(json.exit_code).toBe(0);
+      expect(json.error ?? null).toBeNull();
+      expect(json.final_output).toBe("ALLOWED_AFTER_TWO_BLOCKS");
+      expect(json.recovery).toEqual({ state: "recovered", attempt: 3 });
+      expect(gateway.requestCount()).toBe(3);
+      expect(trace.split("event=content_filter_resend").length - 1).toBe(2);
+      expect(result.stderr).not.toContain("press Esc");
     } finally {
       gateway.stop();
       rmSync(root.root, { recursive: true, force: true });

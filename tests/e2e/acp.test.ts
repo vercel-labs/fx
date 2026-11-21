@@ -9037,11 +9037,17 @@ describe("acp: model-independent", () => {
     async () => {
       const root = createIsolatedRoot("fx-acp-terminal-failure-");
       const boundary = createPromptTerminalBoundary(root.root);
+      // The provider ends the stream with an error fx must not resend, so
+      // the prompt fails.
       const gateway = startFakeGateway([
         fakeGatewaySse([
           {
+            type: "error",
+            error: { code: "invalid_request_error", message: "rejected request fixture" },
+          },
+          {
             type: "finish",
-            finishReason: { unified: "content-filter", raw: "content_filter" },
+            finishReason: { unified: "error", raw: "provider_error" },
           },
         ]),
       ]);
@@ -9078,6 +9084,66 @@ describe("acp: model-independent", () => {
         expect(client.stderr).toBe("");
       } finally {
         releasePromptBoundary(boundary);
+        await client?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "content filter that blocks every resend ends the prompt as refused and leaves the server usable",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-content-filter-refused-");
+      // fx resends a blocked reply three times; the fourth block ends the
+      // prompt as refused and asks the user to change the request.
+      const gateway = startFakeGateway(
+        Array.from({ length: 4 }, () =>
+          fakeGatewaySse([
+            {
+              type: "finish",
+              finishReason: { unified: "content-filter", raw: "content_filter" },
+            },
+          ])
+        ),
+      );
+      try {
+        client = await AcpClient.create({
+          cwd: root.workspace,
+          env: fakeGatewayEnv(root, gateway),
+        });
+        await startAutoSession(client);
+        sendPrompt(client, 97, "Return the blocked fixture.");
+
+        const messages: any[] = [];
+        let response: any = null;
+        while (!response) {
+          const message = await client.readLine(TIMEOUT) as any;
+          if (message.id === 97) {
+            response = message;
+          } else {
+            messages.push(message);
+          }
+        }
+
+        expect(response.error).toBeUndefined();
+        expect(response.result.stopReason).toBe("refused");
+        const texts = messages
+          .filter((message) =>
+            message.method === "session/update" &&
+            message.params?.update?.sessionUpdate === "agent_message_chunk"
+          )
+          .map((message) => message.params.update.content.text);
+        expect(texts).toContain("Blocked by the content filter. Change your request and send it again.");
+        expect(gateway.requests).toHaveLength(4);
+
+        client.send({ jsonrpc: "2.0", id: 98, method: "session/list", params: {} });
+        const listed = await readResponse(client, 98);
+        expect(listed.error).toBeUndefined();
+        expect(Array.isArray(listed.result.sessions)).toBe(true);
+        expect(client.stderr).toBe("");
+      } finally {
         await client?.close();
         gateway.stop();
         rmSync(root.root, { recursive: true, force: true });
