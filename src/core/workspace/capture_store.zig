@@ -741,15 +741,35 @@ const Run = struct {
         return CatchUp.parse(buf[0..n]);
     }
 
-    /// Records how far the capture index got. A progress file that cannot be
-    /// written only makes a later capture add more paths in batches.
+    /// Records how far the capture index got. The text goes to a new file
+    /// that is renamed over the progress file, so a symlink or FIFO at that
+    /// path is replaced, never written through or waited on. A progress file
+    /// that cannot be written only makes a later capture add more paths in
+    /// batches.
     fn recordCatchUp(self: *Run, progress: CatchUp) void {
         var buf: [64]u8 = undefined;
         const text = std.mem.print(&buf, "{d} {d}\n", .{ progress.done, progress.batch }) catch return;
-        std.Io.Dir.cwd().writeFile(self.io, .{ .sub_path = self.progress_file, .data = text, .flags = .{ .permissions = .fromMode(0o600) } }) catch |err| {
+        const temporary = self.arena.print("{s}.tmp-{d}", .{ self.progress_file, io_mod.nanoTimestamp() }) catch return;
+        std.Io.Dir.cwd().writeFile(self.io, .{ .sub_path = temporary, .data = text, .flags = .{ .permissions = .fromMode(0o600) } }) catch |err| {
             keepCancel(self.io, err);
+            removeTemporaryProgress(self.io, temporary);
+            debug_trace.logf("workspace", "event=workspace_capture_index_progress_unsaved err={s}", .{@errorName(err)});
+            return;
+        };
+        std.Io.Dir.renameAbsolute(temporary, self.progress_file, self.io) catch |err| {
+            keepCancel(self.io, err);
+            removeTemporaryProgress(self.io, temporary);
             debug_trace.logf("workspace", "event=workspace_capture_index_progress_unsaved err={s}", .{@errorName(err)});
         };
+    }
+
+    /// Deletes a progress temporary that a failed write left. The delete runs
+    /// even once the capture is cancelled; the cancel stays for the next step.
+    fn removeTemporaryProgress(io: std.Io, path: []const u8) void {
+        const protection = io.swapCancelProtection(.blocked);
+        defer _ = io.swapCancelProtection(protection);
+        // Nothing to report: the progress file still holds the old count.
+        std.Io.Dir.deleteFileAbsolute(io, path) catch {};
     }
 
     /// Ends catching up: the capture index holds every path.
@@ -5230,6 +5250,36 @@ test "capture store: a capture index that is gone drops the progress of the one 
     _ = try expectComplete(try repos.captureRepo(repo, "s"));
     try testing.expectEqual(@as(usize, 0), test_hooks.index_batched_paths);
     try testing.expect((try catchUpCount(repos, repo)) == null);
+}
+
+test "capture store: a progress file that is a symlink is replaced, and the file it names is left alone" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const repos = try TestRepos.init(arena_state.allocator(), tmp.dir);
+    defer repos.deinit();
+    defer resetIndexHooks();
+    try repos.makeShapes("repo");
+    const repo = try repos.repository("repo");
+    _ = try expectComplete(try repos.captureRepo(repo, "s"));
+    const root = try io_mod.dirRealpathAlloc(repos.arena, tmp.dir, ".");
+    const outside = try std.Io.Dir.path.join(repos.arena, &.{ root, "outside.txt" });
+    try TestRepos.writeAbsolute(outside, "outside\n");
+    const progress = try progressPath(repos, repo);
+    try std.Io.Dir.cwd().symLink(testing.io, outside, progress, .{});
+    test_hooks.index_pass_timeouts = 1;
+    try expectNotStored(try repos.captureRepo(repo, "s"));
+    try testing.expectEqualStrings("outside\n", try TestRepos.readAbsolute(repos.arena, outside));
+    const stat = try std.Io.Dir.cwd().statFile(testing.io, progress, .{ .follow_symlinks = false });
+    try testing.expectEqual(std.Io.File.Kind.file, stat.kind);
+    try testing.expectEqual(@as(std.posix.mode_t, 0o600), stat.permissions.toMode() & 0o777);
+    try testing.expectEqual(CatchUp{ .done = 0, .batch = index_batch_paths }, (try catchUpOf(repos, repo)).?);
+    // The temporary file is renamed away, so none is left in the worktree folder.
+    var worktree = try std.Io.Dir.openDirAbsolute(testing.io, std.Io.Dir.path.dirname(progress).?, .{ .iterate = true });
+    defer worktree.close(testing.io);
+    var entries = worktree.iterate();
+    while (try entries.next(testing.io)) |entry| try testing.expect(!std.mem.startsWith(u8, entry.name, "index.progress.tmp-"));
 }
 
 test "capture store: the temporary files of a pack a killed git left are removed once stale" {
