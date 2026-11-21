@@ -625,6 +625,9 @@ fn reportCrashReportPath(deps: RunDeps, path: []const u8) void {
         debug_trace.logf("core", "crash report path not shown: {d} bytes do not fit the message buffer", .{path.len});
         return;
     };
+    // Ignored on purpose: the report is saved before this line runs, and this line
+    // only says where it is. If stderr is closed or broken, nothing else can tell the
+    // user, and the run returns its error next.
     deps.write_stderr(deps.stderr_ctx, message) catch {};
 }
 

@@ -10,8 +10,8 @@
 //!
 //! The handler can run on any thread and in any state, so it does not allocate
 //! or take a lock. `prepare` computes the paths at startup. The handler creates
-//! the `diagnostics` folder when it is missing, private to the user. A call that
-//! fails is ignored.
+//! the fx folder and the `diagnostics` folder when they are missing, both private
+//! to the user. A call that fails is ignored.
 //! The renderer event ring is not saved, because reading it needs a blocking
 //! lock that the handler does not take. Segfaults do not reach this handler:
 //! `std.debug` prints them and aborts on its own.
@@ -34,6 +34,8 @@ const record_buf_bytes = 8192;
 const path_max_bytes = 1024;
 const not_utf8_note = "panic message is not valid UTF-8";
 
+/// The fx folder's path (`~/.fx` by default), with a zero after it. `prepare` sets it.
+var fx_dir_buf: [path_max_bytes:0]u8 = undefined;
 /// The diagnostics folder's path, with a zero after it. `prepare` sets it.
 var dir_buf: [path_max_bytes:0]u8 = undefined;
 /// The crash file's path, with a zero after it. `prepare` sets it.
@@ -50,16 +52,19 @@ var handling: std.atomic.Value(bool) = .init(false);
 /// Storage for the record, so the handler needs no stack space for it.
 var record_buf: [record_buf_bytes]u8 = undefined;
 
-/// Computes the diagnostics folder, the crash file's path, and the temporary
-/// file's path under `home`, in the folder that `trace_report.zig` reads
+/// Computes the fx folder, the diagnostics folder, the crash file's path, and the
+/// temporary file's path under `home`, in the folder that `trace_report.zig` reads
 /// `last-crash.jsonl` from. It allocates nothing, does no file I/O, and creates
 /// no folder. A path that does not fit leaves no path set, so the handler writes
 /// no record.
 pub fn prepare(home: []const u8) void {
     path_len = 0;
-    const dir_len = printPath(&dir_buf, "{s}/{s}/{s}", .{
+    const fx_len = printPath(&fx_dir_buf, "{s}/{s}", .{
         profile_paths.rootParent(home),
         profile_paths.rootName(),
+    }) orelse return;
+    const dir_len = printPath(&dir_buf, "{s}/{s}", .{
+        fx_dir_buf[0..fx_len],
         profile_paths.diagnostics_dir_name,
     }) orelse return;
     const dir = dir_buf[0..dir_len];
@@ -90,13 +95,14 @@ pub fn handle(msg: []const u8, first_trace_addr: ?usize) noreturn {
 }
 
 /// Writes the record to the temporary file, then renames it over the crash file.
-/// Every error is ignored, because the panic must still reach
-/// `std.debug.defaultPanic`.
+/// Creates the fx folder and the diagnostics folder when they are missing. Every
+/// error is ignored, because the panic must still reach `std.debug.defaultPanic`.
 fn saveRecord(msg: []const u8) void {
     if (path_len == 0) return;
-    // Creates the diagnostics folder, private to the user, when it is missing.
-    // The result is not checked: "already exists" is expected, and any other
-    // failure shows up in the open below.
+    // Creates the fx folder, then the diagnostics folder, both private to the user,
+    // when they are missing. The results are not checked: "already exists" is
+    // expected, and any other failure shows up in the open below.
+    _ = std.c.mkdir(&fx_dir_buf, 0o700);
     _ = std.c.mkdir(&dir_buf, 0o700);
     const record = formatRecord(
         &record_buf,
@@ -108,9 +114,14 @@ fn saveRecord(msg: []const u8) void {
     if (record.len == 0) return;
     // The record goes to the temporary file first. The rename replaces the crash
     // file in one step, and only after every byte is written, so a failed write
-    // leaves the last saved record in place. The temporary file is created private
-    // to the user, and a symbolic link at its path is refused.
-    const fd = std.c.open(&tmp_path_buf, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true, .NOFOLLOW = true }, @as(c_uint, 0o600));
+    // leaves the last saved record in place. Any file already at the temporary path
+    // is removed first, so a planted FIFO or an old file of any mode is never reused.
+    // The unlink result is not checked: when nothing is there, it fails, as expected.
+    // The open must then create a new file, private to the user. A symbolic link, or
+    // anything else still in the way, makes the open fail, and the save is skipped
+    // without blocking.
+    _ = std.c.unlink(&tmp_path_buf);
+    const fd = std.c.open(&tmp_path_buf, .{ .ACCMODE = .WRONLY, .CREAT = true, .EXCL = true, .NOFOLLOW = true, .NONBLOCK = true }, @as(c_uint, 0o600));
     if (fd < 0) return;
     const written = writeAll(fd, record);
     // The record reaches the disk before the rename makes it the crash file. The
@@ -339,6 +350,72 @@ test "crash panic keeps the last record when the temporary file cannot be writte
     const bytes = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, path_buf[0..path_len], std.testing.allocator, .limited(64 * 1024));
     defer std.testing.allocator.free(bytes);
     try std.testing.expectEqualStrings("last saved record\n", bytes);
+}
+
+test "crash panic saves the record when a FIFO sits at the temporary path" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, ".fx/diagnostics");
+    const home = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, ".");
+    defer std.testing.allocator.free(home);
+    defer path_len = 0;
+
+    prepare(home);
+    // A FIFO with no reader. Opening it for writing would block the handler forever.
+    const fifo_c = struct {
+        extern "c" fn mkfifo(path: [*:0]const u8, mode: std.c.mode_t) c_int;
+    };
+    try std.testing.expectEqual(@as(c_int, 0), fifo_c.mkfifo(&tmp_path_buf, 0o600));
+    saveRecord("saved past a fifo");
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, path_buf[0..path_len], std.testing.allocator, .limited(64 * 1024));
+    defer std.testing.allocator.free(bytes);
+    try std.testing.expect(std.mem.find(u8, bytes, "saved past a fifo") != null);
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().openFile(std.testing.io, std.mem.sliceTo(&tmp_path_buf, 0), .{}));
+}
+
+test "crash panic saves a private file over a leftover file of another mode" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, ".fx/diagnostics");
+    const home = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, ".");
+    defer std.testing.allocator.free(home);
+    defer path_len = 0;
+
+    prepare(home);
+    // A file that fx did not create, at the temporary path.
+    const leftover = try std.fmt.allocPrint(std.testing.allocator, ".fx/diagnostics/last-crash.jsonl.{d}.tmp", .{std.c.getpid()});
+    defer std.testing.allocator.free(leftover);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = leftover, .data = "stale\n" });
+    // chmod ignores the umask, so the leftover file is 0644 even under a strict umask.
+    if (std.c.chmod(&tmp_path_buf, 0o644) != 0) return error.TestChmodFailed;
+    const before = try std.Io.Dir.cwd().statFile(std.testing.io, std.mem.sliceTo(&tmp_path_buf, 0), .{});
+    try std.testing.expectEqual(@as(std.posix.mode_t, 0o644), before.permissions.toMode() & 0o777);
+
+    saveRecord("saved over a leftover file");
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, path_buf[0..path_len], std.testing.allocator, .limited(64 * 1024));
+    defer std.testing.allocator.free(bytes);
+    try std.testing.expect(std.mem.find(u8, bytes, "saved over a leftover file") != null);
+    const saved = try std.Io.Dir.cwd().statFile(std.testing.io, path_buf[0..path_len], .{});
+    try std.testing.expectEqual(@as(std.posix.mode_t, 0o600), saved.permissions.toMode() & 0o777);
+}
+
+test "crash panic creates the fx folder and the diagnostics folder when both are missing" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, ".");
+    defer std.testing.allocator.free(home);
+    defer path_len = 0;
+
+    prepare(home);
+    saveRecord("no fx folder at all");
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, path_buf[0..path_len], std.testing.allocator, .limited(64 * 1024));
+    defer std.testing.allocator.free(bytes);
+    try std.testing.expect(std.mem.find(u8, bytes, "no fx folder at all") != null);
+    for ([_][]const u8{ std.mem.sliceTo(&fx_dir_buf, 0), std.mem.sliceTo(&dir_buf, 0) }) |folder| {
+        const st = try std.Io.Dir.cwd().statFile(std.testing.io, folder, .{});
+        try std.testing.expect(st.kind == .directory);
+        try std.testing.expectEqual(@as(std.posix.mode_t, 0o700), st.permissions.toMode() & 0o777);
+    }
 }
 
 test "crash panic prepare sets no path when the crash file path is too long" {
