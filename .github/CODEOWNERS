@@ -7,3 +7,7 @@
 
 # Changes to the repository rules need the maintainer's approval (RULES.md R0.1).
 /RULES.md @fazxes
+
+# Exceptions to the size rules, and the PGSO size ceilings they record, need
+# the maintainer's approval (RULES.md R6.18 and R6.19).
+/scripts/size_rules_baseline.json @fazxes

@@ -333,7 +333,7 @@ Do not run the complete deterministic test suite locally as the default developm
 
 After the focused checks pass, create a clean checkpoint commit, push the non-`main` feature branch, and open a draft PR immediately. Linux is the gate for every change because most fx behavior is identical on every platform:
 
-* `.github/workflows/ci.yml` runs on Linux x86_64. It checks formatting, the PGSO corpus, the public surface, and the agents, compactor, indexer, and recovery boundaries, model-checks request recovery, the empty-reply nudge, and the malformed tool call feedback, runs the ReleaseSafe unit tests, runs the E2E files in four weighted shards plus the MCP conformance baseline, and qualifies the SDK packages. A failed E2E file is retried once. A file that passes only on retry gets a warning annotation; investigate it as a possible race. `Build & Test` fails when any SDK job fails.
+* `.github/workflows/ci.yml` runs on Linux x86_64. It checks formatting, the PGSO corpus, the public surface, the agents, compactor, indexer, and recovery boundaries, and the size rules in `RULES.md` section 6, model-checks request recovery, the empty-reply nudge, and the malformed tool call feedback, runs the ReleaseSafe unit tests, runs the E2E files in four weighted shards plus the MCP conformance baseline, and qualifies the SDK packages. A failed E2E file is retried once. A file that passes only on retry gets a warning annotation; investigate it as a possible race. `Build & Test` fails when any SDK job fails.
 * `.github/workflows/binary-size.yml` builds each release target on its native runner, reports the size change, and smoke-tests every target's binary. See **Binary Size Observability**.
 * `.github/workflows/bench.yml` enforces the startup latency budget. See **Benchmarks**.
 
@@ -434,9 +434,13 @@ push to `main` builds and caches that commit's binaries, so a pull request
 based on it restores its base binary instead of building it. Pull requests
 never save that cache.
 
-Each platform check is informational. An increase of at least 52,429 bytes
-(0.050000 MiB) emits a warning and retains that platform's binaries for
-investigation, but does not reject the pull request. Investigate notable
+An increase of at least 52,429 bytes (0.050000 MiB) emits a warning and
+retains that platform's binaries for investigation. Only the macOS arm64 check
+can fail on size: when the `__TEXT,__text` section grows by 16 KB or more, it
+fails until the description has a `## Size` section that says what
+the growth buys, and from 50 KB it also needs the `size: approved` label from
+@fazxes (`RULES.md` R6.18). The check reads the description and labels when it
+runs, so rerun the job after you edit them. Investigate notable
 unexplained growth before changing the threshold. The full macOS arm64, Linux
 arm64, and Linux x86_64 PGSO release qualifications remain authoritative for the
 production ceilings (7.250 MiB for macOS arm64, 7.500 MiB for Linux arm64, and

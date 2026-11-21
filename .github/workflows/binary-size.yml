@@ -16,6 +16,8 @@ concurrency:
 
 permissions:
   contents: read
+  # The size rule check reads the pull request's description and labels.
+  pull-requests: read
 
 jobs:
   compare:
@@ -227,3 +229,27 @@ jobs:
             ${{ runner.temp }}/fx-binary-size-evidence/head-fx
           compression-level: 0
           retention-days: 7
+
+      - name: Check the size rule for growth (RULES.md R6.18)
+        if: github.event_name == 'pull_request' && matrix.name == 'macos-aarch64'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          evidence_dir="$RUNNER_TEMP/fx-binary-size-evidence"
+          # A rerun keeps the original event, so read the description and
+          # labels as they are now.
+          gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER" > "$evidence_dir/pull-request.json"
+          python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["body"] or "")' \
+            "$evidence_dir/pull-request.json" > "$evidence_dir/pull-request-body.md"
+          labels="$(python3 -c 'import json, sys; print(",".join(l["name"] for l in json.load(open(sys.argv[1]))["labels"]))' \
+            "$evidence_dir/pull-request.json")"
+          approved_by="$(gh api --paginate "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/events" \
+            --jq '.[] | select(.event == "labeled" and .label.name == "size: approved") | .actor.login' | tail -n 1)"
+          python3 -m scripts.check_size_rules size-gate \
+            --report "$evidence_dir/report.json" \
+            --body-file "$evidence_dir/pull-request-body.md" \
+            --labels "$labels" \
+            --approved-by "$approved_by"

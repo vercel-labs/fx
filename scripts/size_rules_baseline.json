@@ -1,0 +1,758 @@
+{
+  "ceilings": {
+    "aarch64-linux": 7.5,
+    "aarch64-macos": 7.25,
+    "x86_64-linux": 9.5
+  },
+  "long_functions": {
+    "src/acp/prompt.zig::handlePrompt": 367,
+    "src/acp/server.zig::handleSetConfigOption": 348,
+    "src/core/agent/runtime/orchestrator.zig::processQueuedPromptInner": 367,
+    "src/core/agent/runtime/orchestrator.zig::processQueuedPromptLoop": 5574,
+    "src/core/app/app_bootstrap_runtime.zig::bootstrapWithDeps": 356,
+    "src/core/app/app_render_runtime.zig::footerContext": 355,
+    "src/core/app/app_render_runtime.zig::renderFrameAttempt": 657,
+    "src/core/app/app_worker_runtime.zig::drainEvents": 459,
+    "src/core/cli/cli_ask.zig::runPromptInternal": 458,
+    "src/core/cli/cli_surface.zig::runNonInteractiveWithDeps": 872,
+    "src/gateway/client.zig::consumeSseStreamTraced": 541,
+    "src/gateway/client.zig::runFallible": 321,
+    "src/gateway/client.zig::streamGatewayCompletionCoreWithOptions": 382,
+    "src/ui/footer/paint_plan.zig::composeFooterFrame": 403,
+    "src/ui/footer/surface_frame.zig::buildFooterSurfaceProjection": 359,
+    "src/ui/input/escape_parser.zig::consumeInputEscapeByteWithMouse": 384,
+    "src/ui/transcript/painter.zig::prepareTranscriptSurfacePaintInternal": 563,
+    "src/ui/transcript/runtime.zig::consumeTranscriptTransitionWithCommit": 312,
+    "src/ui/transcript/runtime.zig::planTranscriptScrollForFrameUnfiltered": 380,
+    "src/ui/transcript/runtime.zig::sealTranscriptTransition": 478,
+    "src/ui/transcript/source_preparation.zig::prepareTranscriptSourceInternal": 343
+  },
+  "inline_fns": {
+    "src/core/agent/runtime/tool_contracts.zig": 1,
+    "src/core/agent/stream_provider.zig": 1,
+    "src/core/agents/agents.zig": 1,
+    "src/core/cli/cli_ask.zig": 2,
+    "src/core/compactor/trace.zig": 1,
+    "src/core/gateway/gateway_provider.zig": 1,
+    "src/core/indexer/wildmatch.zig": 1,
+    "src/core/mcp/project_config.zig": 2,
+    "src/core/session/session_event.zig": 2,
+    "src/core/session/session_projection.zig": 1,
+    "src/core/session/session_replay.zig": 1,
+    "src/core/shared/json_decode.zig": 2,
+    "src/core/shared/lexical_relevance.zig": 1,
+    "src/core/shared/text_utils.zig": 1,
+    "src/core/terminal/engine.zig": 1,
+    "src/core/terminal/native_session.zig": 1,
+    "src/core/terminal/operation.zig": 1,
+    "src/core/terminal/store.zig": 2,
+    "src/core/workspace/file_index.zig": 2,
+    "src/mcp/io/trace.zig": 1,
+    "src/mcp/server.zig": 1,
+    "src/ui/footer/model_menu_presentation.zig": 1
+  },
+  "std_generic": {
+    "src/core/app/host_record.zig": 1,
+    "src/core/session/session_adapter.zig": 3,
+    "src/core/shell_command/command_effect.zig": 1,
+    "src/core/subagent/child_state.zig": 3,
+    "src/core/workspace/file_index.zig": 1,
+    "src/ui/transcript/tool_group_projection.zig": 2,
+    "src/usage/cache.zig": 1
+  },
+  "trace_loops": {
+    "src/acp/libfx_journal.zig": 3,
+    "src/acp/prompt.zig": 5,
+    "src/acp/server.zig": 2,
+    "src/acp/sessions.zig": 6,
+    "src/builtins/hooks/herdr.zig": 1,
+    "src/builtins/hooks/notifications.zig": 1,
+    "src/builtins/mcp.zig": 2,
+    "src/core/agent/runtime/execution_memory.zig": 1,
+    "src/core/agent/runtime/finalization.zig": 1,
+    "src/core/agent/runtime/orchestrator.zig": 91,
+    "src/core/agent/runtime/request_recovery.zig": 1,
+    "src/core/agent/runtime/telemetry.zig": 1,
+    "src/core/agent/runtime/tool_batch.zig": 4,
+    "src/core/agent/runtime/vision_executor.zig": 2,
+    "src/core/agent/stream_provider.zig": 1,
+    "src/core/agent/worker_runtime.zig": 8,
+    "src/core/app/app_agents_runtime.zig": 8,
+    "src/core/app/app_instances_runtime.zig": 2,
+    "src/core/app/app_mcp_runtime.zig": 2,
+    "src/core/app/app_profile_runtime.zig": 1,
+    "src/core/app/app_worker_runtime.zig": 8,
+    "src/core/app/host_record.zig": 3,
+    "src/core/app/model_cache_runtime.zig": 3,
+    "src/core/app/token_pass_check.zig": 2,
+    "src/core/auth/auth_runtime.zig": 2,
+    "src/core/auth/login_flow.zig": 1,
+    "src/core/auth/pending_revocation.zig": 7,
+    "src/core/auth/session_presence.zig": 1,
+    "src/core/cli/cli_ask.zig": 1,
+    "src/core/cli/doctor_probes.zig": 5,
+    "src/core/config/config_runtime.zig": 1,
+    "src/core/config/settings_store.zig": 4,
+    "src/core/execution/command_runner.zig": 8,
+    "src/core/execution/managed_execution.zig": 3,
+    "src/core/gateway/gateway_provider.zig": 2,
+    "src/core/gateway/token_pass_team.zig": 1,
+    "src/core/images/image_attachments.zig": 2,
+    "src/core/indexer/indexer.zig": 1,
+    "src/core/indexer/scan.zig": 2,
+    "src/core/input/kill_ring.zig": 2,
+    "src/core/input/registered_entities.zig": 4,
+    "src/core/mcp_host/mcp_call_bridge.zig": 7,
+    "src/core/mcp_host/model.zig": 3,
+    "src/core/mcp_host/runtime.zig": 9,
+    "src/core/permissions/auto_classifier.zig": 4,
+    "src/core/permissions/direct_command.zig": 4,
+    "src/core/session/session_adapter.zig": 40,
+    "src/core/session/session_log.zig": 1,
+    "src/core/session/session_title_generation.zig": 1,
+    "src/core/session/v1_conversion.zig": 6,
+    "src/core/shared/http_pool.zig": 1,
+    "src/core/shared/leased_lock.zig": 2,
+    "src/core/shared/text_utils.zig": 1,
+    "src/core/shared/theme.zig": 1,
+    "src/core/skills/skill_runtime.zig": 5,
+    "src/core/subagent/child_state.zig": 1,
+    "src/core/subagent/managed_owner.zig": 3,
+    "src/core/subagent/tool_host.zig": 13,
+    "src/core/terminal/native_session.zig": 2,
+    "src/core/terminal/shell_snapshot.zig": 5,
+    "src/core/terminal/store.zig": 1,
+    "src/core/tooling/tool_runtime.zig": 1,
+    "src/core/upgrade/auto_upgrade.zig": 2,
+    "src/core/workspace/capture_retention.zig": 5,
+    "src/core/workspace/capture_store.zig": 2,
+    "src/core/workspace/file_index.zig": 5,
+    "src/core/workspace/turn_capture.zig": 1,
+    "src/gateway/chat_completions.zig": 1,
+    "src/gateway/client.zig": 31,
+    "src/tools/shell/shell.zig": 12,
+    "src/ui/assistant/pacer.zig": 2,
+    "src/ui/footer/surface_invalidation.zig": 1,
+    "src/ui/render_engine/frame_fixed_point.zig": 1,
+    "src/ui/shell_runtime.zig": 1,
+    "src/ui/transcript/source_preparation.zig": 1,
+    "src/ui/transcript/store.zig": 1
+  },
+  "same_bodies": [
+    [
+      "src/acp/prompt.zig::acpAwakeMillis",
+      "src/acp/server.zig::serverAwakeMillis",
+      "src/core/app/app_agent_runtime.zig::currentAwakeMillis",
+      "src/core/cli/cli_ask.zig::askAwakeMillis"
+    ],
+    [
+      "src/acp/prompt.zig::context",
+      "src/core/cli/cli_ask.zig::context"
+    ],
+    [
+      "src/acp/prompt.zig::dynamicMcpToolAvailable",
+      "src/core/cli/cli_ask.zig::dynamicMcpToolAvailable"
+    ],
+    [
+      "src/acp/prompt.zig::testPermissionRuleSet",
+      "src/core/cli/cli_ask.zig::testPermissionRuleSet",
+      "src/core/permissions/permissions.zig::ownedRuleSet"
+    ],
+    [
+      "src/acp/prompt_test_controls.zig::writeMarker",
+      "src/core/session/write_test_controls.zig::writeMarker",
+      "src/core/subagent/close_test_controls.zig::writeMarker",
+      "src/core/subagent/end_test_controls.zig::writeMarker",
+      "src/core/subagent/publish_test_controls.zig::writeMarker",
+      "src/core/subagent/start_test_controls.zig::writeMarker"
+    ],
+    [
+      "src/acp/server.zig::parseConfigBool",
+      "src/core/app/app_commands.zig::parseOnOff",
+      "src/ui/render_engine/ui_observer.zig::parseArmBool"
+    ],
+    [
+      "src/acp/sessions.zig::deinit",
+      "src/builtins/gateway.zig::deinit",
+      "src/builtins/mcp.zig::deinit#2",
+      "src/core/app/app_lifecycle.zig::deinit#3",
+      "src/core/app/app_runtime_setup.zig::deinit#2",
+      "src/core/app/app_session_runtime.zig::deinit#5",
+      "src/core/app/model_cache_runtime.zig::deinit#7",
+      "src/core/auth/credentials.zig::deinit#2",
+      "src/core/cli/cli_ask.zig::deinit#8",
+      "src/core/config/config_runtime.zig::deinit#11",
+      "src/core/session/session_commands.zig::deinit#5",
+      "src/core/skills/skill_runtime.zig::deinit#20",
+      "src/core/workspace/workspace_commands.zig::deinit#4",
+      "src/gateway/client.zig::deinit#12",
+      "src/gateway/xai_grok.zig::deinit#3",
+      "src/gateway/xai_grok_models.zig::deinit#3"
+    ],
+    [
+      "src/builtins/gateway.zig::deadlineAfterMs",
+      "src/core/permissions/auto_classifier.zig::reviewAttemptDeadline"
+    ],
+    [
+      "src/builtins/gateway.zig::install",
+      "src/gateway/client.zig::install"
+    ],
+    [
+      "src/builtins/mcp.zig::install",
+      "src/core/app/app_runtime_setup.zig::install",
+      "src/core/app/app_session_runtime.zig::install",
+      "src/core/config/config_runtime.zig::install"
+    ],
+    [
+      "src/builtins/mcp.zig::writeTempFile",
+      "src/core/app/app_commands.zig::writeTempSkillFile",
+      "src/core/app/app_runtime_setup.zig::writeTempFile"
+    ],
+    [
+      "src/builtins/skills.zig::homeFromSkillsDir",
+      "src/core/skills/skill_invocation.zig::homeFromSkillsDir"
+    ],
+    [
+      "src/builtins/skills.zig::readAbsoluteFile",
+      "src/core/execution/command_runner.zig::readAbsoluteFile",
+      "src/core/skills/skill_runtime.zig::readAbsoluteFile",
+      "src/core/workspace/statusline_identity.zig::readSmallFile"
+    ],
+    [
+      "src/builtins/skills.zig::writeTempFile",
+      "src/core/skills/skill_runtime.zig::writeTempFile"
+    ],
+    [
+      "src/core/agent/execution_memory.zig::freeTransientFileEvidence",
+      "src/core/session/session_json.zig::freeParsedFileEvidence",
+      "src/core/shared/types.zig::freeFileEvidence"
+    ],
+    [
+      "src/core/agent/presentation/block_render.zig::writeFootnoteDefinitionMarker",
+      "src/core/agent/presentation/inline_render.zig::writeFootnoteMarker"
+    ],
+    [
+      "src/core/agent/question_prompt.zig::syncTestQuestion",
+      "src/ui/footer/input_presentation.zig::syncHintTestQuestion"
+    ],
+    [
+      "src/core/agent/runtime/journal.zig::replacesHistory",
+      "src/core/session/session.zig::isCurrentCompactionCheckpoint"
+    ],
+    [
+      "src/core/agent/runtime/tool_admission.zig::permissionDeniedStatusLabel",
+      "src/core/tooling/tool_result_errors.zig::permissionDeniedSuggestion"
+    ],
+    [
+      "src/core/agent/tool_preparation.zig::isAdvertisedDynamic",
+      "src/tools/shell/shell.zig::containsFieldName"
+    ],
+    [
+      "src/core/agent/worker_runtime.zig::deinit#2",
+      "src/core/app/app_render_runtime.zig::deinit"
+    ],
+    [
+      "src/core/agent/worker_runtime.zig::deinit#4",
+      "src/core/app/app_worker_runtime.zig::deinit#2"
+    ],
+    [
+      "src/core/agent/worker_runtime.zig::handle",
+      "src/core/app/app_session_runtime.zig::handle"
+    ],
+    [
+      "src/core/app/app_callbacks.zig::appendReplaceableTranscriptLine",
+      "src/core/app/app_callbacks.zig::appendReplaceableTranscriptLine#2",
+      "src/core/app/app_worker_runtime.zig::appendReplaceableTranscriptLine"
+    ],
+    [
+      "src/core/app/app_callbacks.zig::appendReplaceableTranscriptLineSilent",
+      "src/core/app/app_callbacks.zig::appendReplaceableTranscriptLineSilent#2",
+      "src/core/app/app_worker_runtime.zig::appendReplaceableTranscriptLineSilent"
+    ],
+    [
+      "src/core/app/app_callbacks.zig::pushEvent",
+      "src/core/app/app_worker_runtime.zig::pushEvent#2"
+    ],
+    [
+      "src/core/app/app_callbacks.zig::replaceTrailingTranscriptLine",
+      "src/core/app/app_callbacks.zig::replaceTrailingTranscriptLine#2",
+      "src/core/app/app_worker_runtime.zig::replaceTrailingTranscriptLine"
+    ],
+    [
+      "src/core/app/app_callbacks.zig::replaceTrailingTranscriptLineSilent",
+      "src/core/app/app_callbacks.zig::replaceTrailingTranscriptLineSilent#2",
+      "src/core/app/app_worker_runtime.zig::replaceTrailingTranscriptLineSilent"
+    ],
+    [
+      "src/core/app/app_input_runtime.zig::clearPendingImages#3",
+      "src/core/app/app_input_runtime.zig::clearPendingImages#4",
+      "src/core/images/image_commands.zig::clearPendingImages"
+    ],
+    [
+      "src/core/app/app_input_runtime.zig::moveAuthPickerIfActive",
+      "src/core/app/input_completion_runtime.zig::routeAuthPickerMove"
+    ],
+    [
+      "src/core/app/app_input_runtime.zig::readTraceFileForTest",
+      "src/core/input/paste_framing.zig::readTraceFileForTest",
+      "src/ui/input/runtime.zig::readTraceFileForTest"
+    ],
+    [
+      "src/core/app/app_input_runtime.zig::resolvedModelCapabilities",
+      "src/core/session/session_commands.zig::resolvedModelCapabilities"
+    ],
+    [
+      "src/core/app/app_input_runtime.zig::setGatewayControls",
+      "src/core/session/session_commands.zig::setGatewayControls"
+    ],
+    [
+      "src/core/app/app_input_runtime.zig::writeTestImage",
+      "src/core/images/image_commands.zig::writeTestImage"
+    ],
+    [
+      "src/core/app/app_lifecycle.zig::loadAgentStepLimit",
+      "src/core/cli/doctor_runtime.zig::resolveAgentStepLimit"
+    ],
+    [
+      "src/core/app/app_lifecycle.zig::writeFixtureFile",
+      "src/core/config/config_runtime.zig::writeFixtureFile",
+      "src/core/config/settings_store.zig::writeStoreFixture",
+      "src/core/session/session_commands.zig::writeFixtureFile",
+      "src/core/workspace/workspace_commands.zig::writeFixtureFile"
+    ],
+    [
+      "src/core/app/app_render_runtime.zig::fixedPointTestInput",
+      "src/ui/render_engine/frame_fixed_point.zig::fixedPointTestInput"
+    ],
+    [
+      "src/core/app/app_session_runtime.zig::prepareHistoricalQuestionResolution",
+      "src/main.zig::prepareHistoricalQuestionResolution"
+    ],
+    [
+      "src/core/app/app_session_runtime.zig::record",
+      "src/core/workspace/turn_capture.zig::record#3"
+    ],
+    [
+      "src/core/app/app_session_runtime.zig::terminalTitle#2",
+      "src/core/session/session_commands.zig::terminalTitle"
+    ],
+    [
+      "src/core/app/input_completion_runtime.zig::setModelComposerText",
+      "src/core/app/provider_picker_runtime.zig::setComposerText"
+    ],
+    [
+      "src/core/app/input_selection_runtime.zig::deinit",
+      "src/core/input/composer_deletion.zig::deinit",
+      "src/core/input/composer_line_continuation.zig::deinit",
+      "src/core/input/composer_selection.zig::deinit",
+      "src/core/input/composer_skill_binding.zig::deinit",
+      "src/core/input/composer_text_replacement.zig::deinit#2",
+      "src/core/input/composer_undo.zig::deinit"
+    ],
+    [
+      "src/core/app/input_selection_runtime.zig::selection",
+      "src/core/input/composer_selection.zig::state",
+      "src/core/input/composer_skill_binding.zig::state"
+    ],
+    [
+      "src/core/app/input_selection_runtime.zig::undo",
+      "src/core/input/composer_text_replacement.zig::state",
+      "src/core/input/composer_undo.zig::state"
+    ],
+    [
+      "src/core/app/session_persistence.zig::takeCompleted",
+      "src/ui/transcript/full_transcript_worker.zig::takeCompleted",
+      "src/ui/transcript/full_transcript_worker.zig::takeCompleted#2"
+    ],
+    [
+      "src/core/auth/auth_runtime.zig::renderJson",
+      "src/core/execution/command_contract.zig::toJson",
+      "src/core/output/output_contracts.zig::renderJson#14",
+      "src/core/output/output_contracts.zig::renderJson#5"
+    ],
+    [
+      "src/core/auth/chatgpt_oauth.zig::deinit",
+      "src/core/auth/grok_oauth.zig::deinit"
+    ],
+    [
+      "src/core/auth/chatgpt_oauth.zig::deinit#3",
+      "src/core/auth/grok_oauth.zig::deinit#4"
+    ],
+    [
+      "src/core/auth/chatgpt_oauth.zig::deinitBrowserLoginContext",
+      "src/core/auth/grok_oauth.zig::deinitBrowserLoginContext"
+    ],
+    [
+      "src/core/auth/chatgpt_oauth.zig::exchangeAuthorizationCodeForRedirectWithBounds",
+      "src/core/auth/grok_oauth.zig::exchangeAuthorizationCodeForRedirectWithBounds"
+    ],
+    [
+      "src/core/auth/chatgpt_oauth.zig::finishCallback",
+      "src/core/auth/grok_oauth.zig::finishCallback"
+    ],
+    [
+      "src/core/auth/login_flow.zig::deinit#9",
+      "src/gateway/client.zig::deinit#9",
+      "src/gateway/xai_grok.zig::deinit#2",
+      "src/gateway/xai_grok_models.zig::deinit#2"
+    ],
+    [
+      "src/core/auth/login_flow.zig::disable",
+      "src/core/cli/cli_surface.zig::disable"
+    ],
+    [
+      "src/core/auth/login_flow.zig::vminIndex",
+      "src/ui/shell_runtime.zig::vminIndex"
+    ],
+    [
+      "src/core/auth/login_flow.zig::vtimeIndex",
+      "src/ui/shell_runtime.zig::vtimeIndex"
+    ],
+    [
+      "src/core/cli/cli_replay.zig::readTestFile",
+      "src/core/upgrade/upgrade_helpers.zig::readAbsoluteFile",
+      "src/core/workspace/change_tracker.zig::readAbsolute",
+      "src/core/workspace/record_tape.zig::readFile",
+      "src/tools/filesystem/read_file.zig::readAbsolute"
+    ],
+    [
+      "src/core/cli/cli_replay.zig::testPath",
+      "src/core/workspace/change_tracker.zig::tmpPath",
+      "src/core/workspace/record_tape.zig::tapePath"
+    ],
+    [
+      "src/core/cli/cli_replay.zig::writeTestFile",
+      "src/core/workspace/change_tracker.zig::writeAbsolute"
+    ],
+    [
+      "src/core/compactor/compactor.zig::deinit",
+      "src/core/compactor/summarize.zig::deinit"
+    ],
+    [
+      "src/core/compactor/trace.zig::failureCount",
+      "src/core/workspace/model_catalog_metrics.zig::failureCount"
+    ],
+    [
+      "src/core/compactor/trace.zig::reset",
+      "src/core/workspace/model_catalog_metrics.zig::reset"
+    ],
+    [
+      "src/core/compactor/trace.zig::snapshot",
+      "src/core/workspace/model_catalog_metrics.zig::snapshot"
+    ],
+    [
+      "src/core/compactor/trace.zig::snapshot#2",
+      "src/core/workspace/model_catalog_metrics.zig::snapshot#2",
+      "src/core/workspace/render_metrics.zig::snapshot#2"
+    ],
+    [
+      "src/core/compactor/trace.zig::snapshotFailures",
+      "src/core/workspace/model_catalog_metrics.zig::snapshotFailures"
+    ],
+    [
+      "src/core/config/config_runtime.zig::expectPermissionRule",
+      "src/core/session/session_commands.zig::expectRule"
+    ],
+    [
+      "src/core/config/config_runtime.zig::normalizeWorkspaceRoot",
+      "src/core/session/session_store_paths.zig::normalizeWorkspaceRoot"
+    ],
+    [
+      "src/core/config/config_runtime.zig::pathHasDotDotComponent",
+      "src/core/skills/skill_runtime.zig::pathContainsDotDot"
+    ],
+    [
+      "src/core/execution/command_runner.zig::onChunk#3",
+      "src/core/tooling/tool_runtime.zig::onChunk#2"
+    ],
+    [
+      "src/core/execution/process_tree.zig::closeFd",
+      "src/core/shared/darwin_process_spawn.zig::close_fd"
+    ],
+    [
+      "src/core/images/image_attachments.zig::findById",
+      "src/core/session/session.zig::image_attachment_for_id"
+    ],
+    [
+      "src/core/images/image_attachments.zig::makeVisionRegularFileBlocking",
+      "src/core/shared/io.zig::makeFileBlocking"
+    ],
+    [
+      "src/core/images/image_attachments.zig::testSha256Hex",
+      "src/core/session/session_codec.zig::imageNameOf"
+    ],
+    [
+      "src/core/images/image_route.zig::corpusOf",
+      "src/ui/transcript/transcript_window_fuzz.zig::corpusOf"
+    ],
+    [
+      "src/core/indexer/snapshot.zig::writeInt",
+      "src/core/session/session_relationship_index_codec.zig::writeInt"
+    ],
+    [
+      "src/core/mcp/access_policy.zig::hashU64",
+      "src/core/subagent/authority.zig::hashU64",
+      "src/core/terminal/store.zig::hash_u64"
+    ],
+    [
+      "src/core/mcp/mcp_contract.zig::freeHttpHeaders",
+      "src/core/mcp/project_config.zig::freeHttpHeaders"
+    ],
+    [
+      "src/core/mcp/mcp_contract.zig::freeOwnedStrings",
+      "src/core/mcp/project_config.zig::freeOwnedStrings"
+    ],
+    [
+      "src/core/mcp_host/mcp_call.zig::run",
+      "src/ui/transcript/transcript_window.zig::run"
+    ],
+    [
+      "src/core/permissions/approval_prompt.zig::approvalFileRequest",
+      "src/ui/footer/surface_frame.zig::surfaceTestApprovalFileRequest"
+    ],
+    [
+      "src/core/permissions/approval_prompt.zig::approvalPreview",
+      "src/core/permissions/permission_request.zig::samplePreview"
+    ],
+    [
+      "src/core/permissions/permissions.zig::authorityEnd",
+      "src/tools/web/url_policy.zig::authorityEnd"
+    ],
+    [
+      "src/core/permissions/permissions.zig::freeGrants",
+      "src/core/shared/types.zig::freePermissionGrantSlice"
+    ],
+    [
+      "src/core/permissions/session_permission_state.zig::writeIdentityField",
+      "src/core/tooling/tool_admission.zig::writeIdentityField"
+    ],
+    [
+      "src/core/session/session_codec.zig::checkNonObjectInterruptedAllocationFailures",
+      "src/core/session/session_json.zig::checkNonObjectLegacyInterruptedAllocationFailures"
+    ],
+    [
+      "src/core/session/session_codec.zig::freeToken",
+      "src/core/session/session_json.zig::freeToken"
+    ],
+    [
+      "src/core/session/session_codec.zig::readI64",
+      "src/core/session/session_json.zig::readI64Token"
+    ],
+    [
+      "src/core/session/session_codec.zig::readStringOwned",
+      "src/core/session/session_json.zig::readStringOwned"
+    ],
+    [
+      "src/core/session/session_codec.zig::readU64",
+      "src/core/session/session_json.zig::readU64Token"
+    ],
+    [
+      "src/core/session/session_codec.zig::requireBool",
+      "src/core/session/session_json.zig::requireBool"
+    ],
+    [
+      "src/core/session/session_codec.zig::requireString",
+      "src/core/session/session_json.zig::requireString"
+    ],
+    [
+      "src/core/session/session_event.zig::deinit",
+      "src/core/session/session_projection.zig::deinit"
+    ],
+    [
+      "src/core/session_manager/catalog.zig::slot",
+      "src/core/session_manager/session.zig::slot",
+      "src/core/session_manager/session.zig::slot#2"
+    ],
+    [
+      "src/core/shared/display_width.zig::trimBreakWhitespace",
+      "src/core/shared/gateway_error_format.zig::trimBreakWhitespace"
+    ],
+    [
+      "src/core/shared/gateway_error_format.zig::jsonKindName",
+      "src/gateway/vercel_protocol.zig::jsonKindName"
+    ],
+    [
+      "src/core/shell_command/command_effect.zig::isNetworkCommand",
+      "src/core/tooling/command_policy.zig::is_pattern_matcher"
+    ],
+    [
+      "src/core/skills/skill_invocation.zig::setTestHome",
+      "src/core/tooling/tool_runtime.zig::setTestHome"
+    ],
+    [
+      "src/core/subagent/child_state.zig::cloneStrings",
+      "src/core/subagent/domain.zig::cloneStrings",
+      "src/core/subagent/tool_host.zig::cloneStrings"
+    ],
+    [
+      "src/core/subagent/close_test_controls.zig::holdWrite",
+      "src/core/subagent/publish_test_controls.zig::holdPublish"
+    ],
+    [
+      "src/core/terminal/managed_observer.zig::statusFromOutcome",
+      "src/tools/shell/shell.zig::statusFromOutcome"
+    ],
+    [
+      "src/core/terminal/native_session.zig::deinit#4",
+      "src/core/terminal/store.zig::deinit#14"
+    ],
+    [
+      "src/core/tooling/tool_args.zig::optionalStringArg",
+      "src/core/tooling/tool_dispatch.zig::optionalStringArg"
+    ],
+    [
+      "src/core/tooling/tool_dispatch.zig::mcpViewChanged",
+      "src/core/tooling/tool_runtime.zig::mcpAccessChanged"
+    ],
+    [
+      "src/core/workspace/auto_review_metrics.zig::copyInto",
+      "src/core/workspace/network_metrics.zig::keepPrefix"
+    ],
+    [
+      "src/core/workspace/grep_search.zig::runGitForTest",
+      "src/tools/filesystem/glob_files.zig::runGitForTest"
+    ],
+    [
+      "src/core/workspace/grep_search.zig::writeTempFile",
+      "src/tools/filesystem/glob_files.zig::writeTempFile",
+      "src/tools/filesystem/grep_files.zig::writeTempFile"
+    ],
+    [
+      "src/core/workspace/network_metrics.zig::lifetimeStats",
+      "src/core/workspace/tool_call_metrics.zig::lifetimeStats"
+    ],
+    [
+      "src/core/workspace/network_metrics.zig::snapshot",
+      "src/core/workspace/tool_call_metrics.zig::snapshot"
+    ],
+    [
+      "src/core/workspace/network_metrics.zig::snapshotFailures",
+      "src/core/workspace/tool_call_metrics.zig::snapshotFailures"
+    ],
+    [
+      "src/gateway/anthropic_messages_protocol.zig::test_provider",
+      "src/gateway/chat_completions_protocol.zig::test_provider"
+    ],
+    [
+      "src/gateway/anthropic_messages_protocol.zig::test_request",
+      "src/gateway/chat_completions_protocol.zig::test_request"
+    ],
+    [
+      "src/gateway/anthropic_messages_protocol.zig::test_tool_request",
+      "src/gateway/chat_completions_protocol.zig::test_tool_request"
+    ],
+    [
+      "src/gateway/anthropic_messages_protocol.zig::validate_history",
+      "src/gateway/chat_completions_protocol.zig::validate_history"
+    ],
+    [
+      "src/gateway/client.zig::writeLoopbackGatewayBytes",
+      "src/gateway/xai_grok.zig::writeTestBytes"
+    ],
+    [
+      "src/gateway/host_openai_codex.zig::provider",
+      "src/gateway/host_xai_grok.zig::provider"
+    ],
+    [
+      "src/gateway/openai_codex_models.zig::fetchCliModelCatalog",
+      "src/gateway/xai_grok_models.zig::fetchCliModelCatalog"
+    ],
+    [
+      "src/mcp/core/catalog.zig::push",
+      "src/mcp/core/era.zig::push",
+      "src/mcp/core/http_modern.zig::push",
+      "src/mcp/core/request.zig::push",
+      "src/mcp/core/stdio_conn.zig::push"
+    ],
+    [
+      "src/tools/agent/ask_user_question.zig::inputDeinit",
+      "src/tools/agent/subagent.zig::inputDeinit",
+      "src/tools/capabilities/toolbox.zig::inputDeinit",
+      "src/tools/filesystem/edit_file.zig::inputDeinit",
+      "src/tools/filesystem/glob_files.zig::inputDeinit",
+      "src/tools/filesystem/grep_files.zig::inputDeinit",
+      "src/tools/filesystem/read_file.zig::inputDeinit",
+      "src/tools/filesystem/write_file.zig::inputDeinit",
+      "src/tools/session/read_tool_result.zig::inputDeinit",
+      "src/tools/skills/install_skill.zig::inputDeinit",
+      "src/tools/skills/skill.zig::inputDeinit",
+      "src/tools/web/fetch_args.zig::inputDeinit",
+      "src/tools/web/search_args.zig::inputDeinit"
+    ],
+    [
+      "src/tools/filesystem/glob_files.zig::countEmittedResultLines",
+      "src/tools/filesystem/grep_files.zig::countEmittedResultLines"
+    ],
+    [
+      "src/tools/filesystem/glob_files.zig::expectDecodeFailure",
+      "src/tools/filesystem/grep_files.zig::expectDecodeFailure"
+    ],
+    [
+      "src/tools/skills/install_skill.zig::expectDecodeFailure",
+      "src/tools/skills/skill.zig::expectDecodeFailure"
+    ],
+    [
+      "src/tools/web/fetch.zig::expectDecodeFailure",
+      "src/tools/web/search.zig::expectDecodeFailure"
+    ],
+    [
+      "src/ui/approval_screen.zig::decimalDigits",
+      "src/ui/footer/approval_ui.zig::decimalDigits"
+    ],
+    [
+      "src/ui/footer/help_menu_presentation.zig::appendHeaderTitle",
+      "src/ui/footer/model_menu_presentation.zig::appendHeaderTitle",
+      "src/ui/footer/resume_menu_presentation.zig::appendHeaderTitle",
+      "src/ui/footer/settings_menu_presentation.zig::appendHeaderTitle",
+      "src/ui/footer/skills_menu_presentation.zig::appendHeaderTitle"
+    ],
+    [
+      "src/ui/footer/help_menu_presentation.zig::cloneClippedRow",
+      "src/ui/footer/settings_menu_presentation.zig::cloneClipped"
+    ],
+    [
+      "src/ui/footer/model_menu_presentation.zig::cloneClippedRow",
+      "src/ui/footer/skills_menu_presentation.zig::cloneClippedRow"
+    ],
+    [
+      "src/ui/footer/surface_frame.zig::surfaceHasInvalidation",
+      "src/ui/footer/surface_invalidation.zig::surfaceHasInvalidation"
+    ],
+    [
+      "src/ui/render_engine/frame_builder.zig::testPlan",
+      "src/ui/render_engine/frame_retention.zig::testPlan"
+    ],
+    [
+      "src/ui/render_engine/frame_layout.zig::clampOwnedTop",
+      "src/ui/render_engine/frame_scroll_plan.zig::normalizeOwnedTop"
+    ],
+    [
+      "src/ui/terminal/cursor_probe.zig::consumeDeferredInputDispatch",
+      "src/ui/terminal/theme_monitor.zig::consumeDeferredInputDispatch"
+    ],
+    [
+      "src/ui/terminal/cursor_probe.zig::forwardByte",
+      "src/ui/terminal/theme_monitor.zig::forwardByte"
+    ],
+    [
+      "src/ui/terminal/cursor_probe.zig::takeDeferredByte",
+      "src/ui/terminal/theme_monitor.zig::takeDeferredByte"
+    ],
+    [
+      "src/ui/transcript/source_preparation.zig::cappedTailStart",
+      "src/ui/transcript/store.zig::cappedTailStart"
+    ]
+  ],
+  "test_hooks": [
+    "FX_TEST_AI_GATEWAY_API_KEY",
+    "FX_TEST_C04_STREAM_ANSI_OSC8_FIXTURE",
+    "FX_TEST_SHELL_PARITY_ALL_SHELLS",
+    "FX_TEST_SNAPSHOT_MARKER",
+    "FX_TEST_TERMINAL_BACKEND_CLEANUP_DELAY_MS",
+    "FX_TEST_TERMINAL_COMMAND_BOUNDARY_DELAY_MS",
+    "FX_TEST_TERMINAL_FAIL_CANCELLATION_OPEN",
+    "FX_TEST_TERMINAL_FAIL_SIGNAL_STAGE",
+    "FX_TEST_TERMINAL_WRITE_BARRIER_PATH",
+    "FX_TEST_TERMINAL_WRITE_DELAY_MS"
+  ]
+}

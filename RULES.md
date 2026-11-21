@@ -64,6 +64,23 @@ Every change to fx keeps these rules. They win over `AGENTS.md`. Cite the IDs in
 - **R6.3** Do the smallest change that solves the problem. No daemon, setting, layer, or helper for a need that does not exist yet. Name limits and durations as constants with their unit.
 - **R6.4** Code explains itself through names and types. A comment says only what the code cannot show: why a rule holds, who owns returned memory, why a `catch {}` is safe, or which test or model pins the behavior.
 - **R6.5** When one caller needs different behavior from a shared helper, add a focused helper. Widen the shared helper only when the new behavior is right for every caller, and then delete the old variants.
+- **R6.6** A trace line marks a state change, a failure, or a decision. Never trace per byte, line, frame, or item. A trace call inside a loop says in a `// trace:` comment why the loop is bounded, such as once per retry. Log values the code already has; never compute or format a value only to log it. (`python3 -m scripts.check_size_rules`)
+- **R6.7** A check for whether tracing, metrics, or a test hook is on is one atomic load: no lock, no allocation, and no formatting.
+- **R6.8** Choose a behavior with a runtime value, such as a `bool` or an enum, not with `anytype` or a `comptime` parameter, unless the types differ. Each comptime variant compiles the whole function again.
+- **R6.9** Use `inline fn`, `inline for`, and `inline else` only when the types require it or a benchmark shows the speed. (`check_size_rules` for `inline fn`)
+- **R6.10** Sort with `sort_utils` and parse typed JSON with `json_decode` wherever they can be imported. (`check_size_rules`)
+- **R6.11** Keep a function under 300 lines. When a function has many exits, put its function-wide `defer`s in a small wrapper so each cleanup runs at one exit. (`check_size_rules`)
+- **R6.12** Pass a large struct by pointer. Return a large result through a pointer or a handle, not inside a large error union.
+- **R6.13** Size a fixed buffer to what it holds. Keep variable-length text outside the struct, with a total cap in bytes, not a cap per slot.
+- **R6.14** Reuse an existing error name when its meaning fits. Each new name adds to the binary's error name table.
+- **R6.15** Look for an existing helper before you write one. Never copy a function into another file: import it, or move it to a module both files can import. A copy stays only where R1.8 keeps the modules apart. (`check_size_rules`)
+- **R6.16** A new provider, protocol, or front door reuses the existing client, codec, and turn code, and adds only what differs.
+- **R6.17** Build similar output rows from data and one formatter, not one `print` with its own format string for each row.
+- **R6.18** A PR that grows the macOS arm64 `__text` section by 16 KB or more has a `## Size` section in its description that says what the growth buys. Growth of 50 KB or more also needs the `size: approved` label from @fazxes. (`Binary Size` job)
+- **R6.19** Raising a release ceiling needs @fazxes's approval and a growth report that names what grew. (`check_size_rules`, CODEOWNERS)
+- **R6.20** Measure a size claim on a release-shape build, such as a PGSO candidate or a replay of its pipeline, not on a debug build or an estimate from debug info.
+- **R6.21** A test hook (`FX_TEST_*`) ships in fx only when an E2E file, a TLA+ driver, an eval, or a PGSO scenario sets it. A hook that only unit tests use stays behind `builtin.is_test`. (`check_size_rules`)
+- **R6.22** `scripts/size_rules_baseline.json` records the findings that predate R6.6 to R6.21, and the current ceilings. A new entry or a higher count needs @fazxes's approval. A fix may leave its entry for him to lower. (CODEOWNERS)
 
 ## 7. Tests
 
