@@ -19,8 +19,14 @@ import { world } from "./world.mjs";
  * `leaseMs` after its last renewal rather than when the queue's hold runs
  * out. A worker stops `reserveMs` before its function's deadline, and the
  * next invocation continues the turn.
+ *
+ * With `holdFunction`, the wake route's key under `functions` in
+ * vercel.json, or `holdConsumerGroup`, its trigger's consumer group, a
+ * prompt the request runs is held for it by the queue as its message's
+ * first delivery, where Vercel's World supports that. Otherwise the queue
+ * keeps a backstop until after the request's deadline.
  */
-export function vercel({ reserveMs, leaseMs } = {}) {
+export function vercel({ reserveMs, leaseMs, holdFunction, holdService, holdConsumerGroup } = {}) {
   return world(() => createWorld(), {
     name: "vercel",
     // The deployment's own AI Gateway credential, fresh for each request.
@@ -35,5 +41,10 @@ export function vercel({ reserveMs, leaseMs } = {}) {
     pollMs: 1000,
     reserveMs,
     leaseMs,
+    // The wake route's consumer group, so the queue can hold a prompt for
+    // the request that took it.
+    holdFunction,
+    holdService,
+    holdConsumerGroup,
   });
 }

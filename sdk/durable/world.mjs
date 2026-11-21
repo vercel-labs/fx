@@ -4,6 +4,24 @@
 
 const durabilityTag = Symbol.for("libfx.durability");
 
+// The consumer group Vercel subscribes a vercel.json `queue/v2beta` trigger
+// with: its `functions` key, after its service's name and "~" when it has
+// one, with "_" as "__", "/" as "_S", "." as "_D", letters, digits and "-"
+// kept, and any other character as "_" and its code in hex. A copy of
+// `vercelTriggerConsumerGroup` in `@workflow/world-vercel`.
+function vercelTriggerConsumerGroup(pattern, service) {
+  const name = service === undefined ? pattern : `${service}~${pattern}`;
+  let group = "";
+  for (const char of name) {
+    if (char === "_") group += "__";
+    else if (char === "/") group += "_S";
+    else if (char === ".") group += "_D";
+    else if (/^[A-Za-z0-9-]$/.test(char)) group += char;
+    else group += `_${char.charCodeAt(0).toString(16).toUpperCase().padStart(2, "0")}`;
+  }
+  return group;
+}
+
 /**
  * `source` is the World, or a function that creates it. libfx starts and
  * closes a World it creates. A World passed in stays the app's: the app
@@ -23,10 +41,25 @@ const durabilityTag = Symbol.for("libfx.durability");
  *   which message and which delivery of it each handler call carries. A
  *   worker with no deadline renews its lease all the same.
  * - `runInRequest`: with `queueLeases`, a prompt runs in the request that
- *   took it when no worker holds the session, saving a queue hop. The queue
- *   keeps the prompt as a backstop it delivers only after that request's
- *   deadline, and the request's lease names it, so if the request died the
- *   backstop takes the session over. Default true with `queueLeases`.
+ *   took it when no worker holds the session, saving a queue hop. On a World
+ *   whose queue holds a message for its sender
+ *   (`capabilities.experimental_queueHold`), given `holdConsumerGroup` or
+ *   `holdFunction`, the request sends the prompt
+ *   asking for a hold and runs it as the message's first delivery, whose
+ *   lease the queue renews while it runs; a prompt the queue does not hold,
+ *   the queue delivers. On any other World, the queue keeps the prompt as a
+ *   backstop it delivers only after that request's deadline. Either way the
+ *   request's lease names the message, so if the request died the queue's
+ *   next delivery of it takes the session over. Default true with
+ *   `queueLeases`.
+ * - `holdConsumerGroup`: the consumer group of the route the queue delivers
+ *   libfx's messages to, which a hold is taken for, so a hold the request
+ *   lets lapse is delivered to that route. Without it, or `holdFunction`,
+ *   no prompt is held, and the queue keeps a backstop.
+ * - `holdFunction`: that route's key under `functions` in vercel.json, such
+ *   as "app/api/libfx/route.js", from which Vercel names its trigger's
+ *   consumer group, with `holdService` its service's name, when it has one.
+ *   Not with `holdConsumerGroup`.
  * - `waitUntil(work)`: keeps the request alive until `work`, a turn it runs
  *   after its response, settles, as Vercel's `waitUntil` or Next's `after()`.
  * - `leaseMs`: how long a lease lasts after it was taken or last renewed,
@@ -46,7 +79,7 @@ export function world(source, options = {}) {
   const owned = typeof source === "function";
   if (!owned && !(source && typeof source === "object")) throw new TypeError("world() takes a World or a function that creates one");
   if (!options || typeof options !== "object" || Array.isArray(options)) throw new TypeError("world() options must be an object");
-  const { name = "world", store = name, livenessKnown = false, queueLeases = false, runInRequest = queueLeases, waitUntil, queueDurable = false, pollMs, leaseMs, maxDurationMs, reserveMs, alive, holderInfo, gatewayKey } = options;
+  const { name = "world", store = name, livenessKnown = false, queueLeases = false, runInRequest = queueLeases, waitUntil, queueDurable = false, pollMs, leaseMs, maxDurationMs, reserveMs, alive, holderInfo, gatewayKey, holdConsumerGroup, holdFunction, holdService } = options;
   if (typeof name !== "string" || name.length === 0) throw new TypeError("world() name must be a non-empty string");
   if (typeof store !== "string" || store.length === 0) throw new TypeError(`${name}() store must be a non-empty string`);
   for (const [key, value] of Object.entries({ livenessKnown, queueLeases, runInRequest, queueDurable })) {
@@ -65,6 +98,14 @@ export function world(source, options = {}) {
   // Only the backstop's own message coming back continues a turn a dead
   // request ran.
   if (runInRequest && !queueLeases) throw new TypeError(`${name}() runInRequest needs queueLeases`);
+  for (const [key, value] of Object.entries({ holdConsumerGroup, holdFunction, holdService })) {
+    if (value !== undefined && !(typeof value === "string" && value.length > 0)) throw new TypeError(`${name}() ${key} must be a non-empty string`);
+  }
+  if (holdConsumerGroup !== undefined && holdFunction !== undefined) throw new TypeError(`${name}() takes holdConsumerGroup or holdFunction, not both`);
+  if (holdService !== undefined && holdFunction === undefined) throw new TypeError(`${name}() holdService needs holdFunction`);
+  const holdGroup = holdFunction === undefined ? holdConsumerGroup : vercelTriggerConsumerGroup(holdFunction, holdService);
+  // Only a prompt the request runs is held.
+  if (holdGroup !== undefined && !runInRequest) throw new TypeError(`${name}() ${holdFunction === undefined ? "holdConsumerGroup" : "holdFunction"} needs runInRequest`);
   return {
     [durabilityTag]: true,
     name,
@@ -83,5 +124,6 @@ export function world(source, options = {}) {
     ...(holderInfo === undefined ? {} : { holderInfo }),
     ...(gatewayKey === undefined ? {} : { gatewayKey }),
     ...(waitUntil === undefined ? {} : { waitUntil }),
+    ...(holdGroup === undefined ? {} : { holdConsumerGroup: holdGroup }),
   };
 }
