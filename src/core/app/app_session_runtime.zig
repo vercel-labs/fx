@@ -2984,6 +2984,7 @@ pub fn Runtime(comptime App: type) type {
         }
 
         pub fn finalizePersistenceWithResumeHandoff(app: *App, agent: *AppAgent) ?ResumeHandoff {
+            endHookedSession(app, agent);
             return closeWritableSessionWithResumeHandoff(app, agent);
         }
 
@@ -4973,7 +4974,20 @@ pub fn Runtime(comptime App: type) type {
             try sink.appendAssistantText("\n");
         }
 
+        /// Ends the writable session in the user's hooks runtime before it closes. Every close goes through
+        /// this or `finalizePersistenceWithResumeHandoff`, so each session ends once.
+        fn endHookedSession(app: *App, agent: *AppAgent) void {
+            if (comptime !host_target.is_wasm and @hasField(App, "user_hooks")) {
+                if (agent.session_persistence.v2) |v2| {
+                    // A close while fx exits reports exit; any other close reports other.
+                    const exiting = if (comptime @hasField(App, "should_exit")) app.should_exit else false;
+                    if (app.user_hooks) |*rt| rt.endSession(v2.id(), if (exiting) "exit" else "other");
+                }
+            }
+        }
+
         fn closeWritableSession(app: *App, agent: *AppAgent) void {
+            endHookedSession(app, agent);
             agent.session_persistence.resume_handoff_intent = .none;
             _ = closeWritableSessionWithResumeHandoff(app, agent);
         }

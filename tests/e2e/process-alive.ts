@@ -14,3 +14,15 @@ export function processAlive(pid: number): boolean {
     return false;
   }
 }
+
+// Whether any process in the group `pid` leads still runs. A hook that fx starts leads its own group, so its
+// pid is the group id. A pid that is not a number throws, as `processAlive` does.
+export function processGroupAlive(pid: number): boolean {
+  if (!Number.isSafeInteger(pid) || pid <= 0) throw new Error(`not a process id: ${pid}`);
+  try {
+    process.kill(-pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}

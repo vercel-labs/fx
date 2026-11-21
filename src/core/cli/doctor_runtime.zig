@@ -17,6 +17,8 @@ const safe_git = @import("../shell_command/safe_git.zig");
 const command_lex = @import("../shell_command/command_lex.zig");
 const skill_contract = @import("../skills/skill_contract.zig");
 const app_runtime_setup = @import("../app/app_runtime_setup.zig");
+const hook_verbs = @import("hook_verbs.zig");
+const output_contracts = @import("../output/output_contracts.zig");
 
 const Allocator = std.mem.Allocator;
 const default_session_diagnostics_limit: usize = 64;
@@ -65,10 +67,14 @@ pub const Snapshot = struct {
     }
 };
 
+/// Reads the hooks of a workspace for doctor's hooks check. Tests stand in for it, so they never read a real profile.
+pub const HookSummaryFn = *const fn (Allocator, bool, []const u8, []const u8) anyerror!output_contracts.HooksSummary;
+
 const CollectOptions = struct {
     version: []const u8 = "",
     channel: []const u8 = "",
     skill_root_policy: skill_contract.RootPolicy = .{ .managed_root_source = null },
+    summarize_hooks: HookSummaryFn = hook_verbs.loadSummary,
 };
 
 /// The checks that read only this machine, except the saved sessions, which
@@ -122,6 +128,14 @@ pub fn collect(
         try appendMcpConfigCheck(&checks, alloc, mcp_config_diagnostic);
         try appendMcpIssueChecks(&checks, alloc, mcp_issues);
         try appendAuthCheck(&checks, alloc, snapshot.auth, snapshot.provider);
+        try appendCheckOwnedStaticFix(
+            &checks,
+            alloc,
+            "hooks",
+            .warn,
+            try alloc.dupe(u8, "not checked: the settings could not be read, so whether hooks run is unknown"),
+            profile_paths.displayText("fix ~/.fx/settings.json, then run fx doctor again"),
+        );
         try appendConfigLoadFailureCheck(&checks, alloc, "startup", "failed to resolve startup settings", err);
         snapshot.in_git_repository = try appendGitCheck(&checks, alloc, snapshot.workspace_root);
         try appendSkillChecks(&checks, alloc, snapshot.workspace_root, options.skill_root_policy);
@@ -146,6 +160,7 @@ pub fn collect(
     try appendMcpConfigCheck(&checks, alloc, mcp_config_diagnostic);
     try appendMcpIssueChecks(&checks, alloc, mcp_issues);
     try appendAuthCheck(&checks, alloc, snapshot.auth, snapshot.provider);
+    try appendHooksCheck(&checks, alloc, detailed.settings.experimental_hooks orelse false, snapshot.workspace_root, options.summarize_hooks);
     const selection = config_runtime.selectProviderModel(
         default_model,
         &detailed.settings,
@@ -714,6 +729,55 @@ fn appendCheckOwned(checks: *std.ArrayList(Check), alloc: Allocator, name: []con
     });
 }
 
+const hook_list_hint = "Run fx hook list for details.";
+
+/// The `hooks` check: ok when hooks are off, or when the hook files load with no problem and the
+/// trust file is not refused. Otherwise it warns and names each problem. It never fails doctor.
+fn appendHooksCheck(
+    checks: *std.ArrayList(Check),
+    alloc: Allocator,
+    enabled: bool,
+    workspace_root: []const u8,
+    summarize: HookSummaryFn,
+) !void {
+    if (!enabled) return appendCheck(checks, alloc, "hooks", .ok, "experimental.hooks is off, so no hook runs");
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const home = io_mod.homeDir() orelse {
+        return appendCheckOwnedStaticFix(checks, alloc, "hooks", .warn, try alloc.dupe(u8, "could not read the hook files: no home folder"), hook_list_hint);
+    };
+    const summary = summarize(arena, enabled, home, workspace_root) catch |err| {
+        debug_trace.logf("hooks", "doctor did not read the hooks: {s}", .{@errorName(err)});
+        const detail = try alloc.print("could not read the hook files: {s}", .{@errorName(err)});
+        return appendCheckOwnedStaticFix(checks, alloc, "hooks", .warn, detail, hook_list_hint);
+    };
+    if (!summary.trust_refused and summary.problems.len == 0) {
+        const detail = if (summary.count == 0)
+            try alloc.dupe(u8, "no hooks for this workspace")
+        else
+            try alloc.print("{d} hook{s}: {d} trusted, {d} waiting for trust", .{
+                summary.count,
+                if (summary.count == 1) "" else "s",
+                summary.trusted,
+                summary.waiting,
+            });
+        return appendCheckOwned(checks, alloc, "hooks", .ok, detail);
+    }
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    if (summary.trust_refused) try out.writer.writeAll("the trust file was refused, so no hook runs");
+    for (summary.problems) |problem| {
+        if (out.written().len > 0) try out.writer.writeAll("; ");
+        if (problem.where.len == 0) {
+            try out.writer.print("{s}: {s}", .{ problem.file, problem.message });
+        } else {
+            try out.writer.print("{s} ({s}): {s}", .{ problem.file, problem.where, problem.message });
+        }
+    }
+    return appendCheckOwnedStaticFix(checks, alloc, "hooks", .warn, try out.toOwnedSlice(), hook_list_hint);
+}
+
 fn appendMcpConfigCheck(
     checks: *std.ArrayList(Check),
     alloc: Allocator,
@@ -955,6 +1019,64 @@ test "session count check preserves empty and latest details" {
     try std.testing.expectEqualStrings("sessions", checks.items[1].name);
     try std.testing.expectEqual(CheckStatus.ok, checks.items[1].status);
     try std.testing.expectEqualStrings("2 saved session(s); latest=session-2", checks.items[1].detail);
+}
+
+/// Runs the hooks check, with hooks on, in a workspace whose `.fx/hooks.json` is `hooks_text`.
+/// The HOME folder is a temporary one, with no hook file of its own.
+fn runHooksCheck(alloc: Allocator, hooks_text: []const u8) !std.ArrayList(Check) {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(home);
+    var environ = std.process.Environ.Map.init(alloc);
+    defer environ.deinit();
+    try environ.put("HOME", home);
+    io_mod.setEnvironMap(&environ);
+    defer io_mod.resetEnvironForTest();
+
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace/.fx");
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace);
+    const hooks_file = try std.Io.Dir.path.join(alloc, &.{ workspace, ".fx", "hooks.json" });
+    defer alloc.free(hooks_file);
+    try io_mod.writeFileAtomic(alloc, hooks_file, hooks_text);
+
+    var checks: std.ArrayList(Check) = .empty;
+    errdefer {
+        for (checks.items) |*entry| entry.deinit(alloc);
+        checks.deinit(alloc);
+    }
+    try appendHooksCheck(&checks, alloc, true, workspace, hook_verbs.loadSummary);
+    return checks;
+}
+
+test "doctor's hooks check is ok with hooks that load and have no problem" {
+    const alloc = std.testing.allocator;
+    var checks = try runHooksCheck(
+        alloc,
+        "{\"hooks\":{\"PreToolUse\":[{\"matcher\":\"shell\",\"hooks\":[{\"type\":\"command\",\"command\":\"true\",\"id\":\"guard\"}]}]}}",
+    );
+    defer {
+        for (checks.items) |*entry| entry.deinit(alloc);
+        checks.deinit(alloc);
+    }
+    try std.testing.expectEqual(@as(usize, 1), checks.items.len);
+    try std.testing.expectEqualStrings("hooks", checks.items[0].name);
+    try std.testing.expectEqual(CheckStatus.ok, checks.items[0].status);
+    try std.testing.expectEqualStrings("1 hook: 0 trusted, 1 waiting for trust", checks.items[0].detail);
+}
+
+test "doctor's hooks check warns with each problem and its file, and gives the hint" {
+    const alloc = std.testing.allocator;
+    var checks = try runHooksCheck(alloc, "{\"hooks\":{\"Nope\":[{\"hooks\":[{\"type\":\"command\",\"command\":\"true\"}]}]}}");
+    defer {
+        for (checks.items) |*entry| entry.deinit(alloc);
+        checks.deinit(alloc);
+    }
+    try std.testing.expectEqual(@as(usize, 1), checks.items.len);
+    try std.testing.expectEqual(CheckStatus.warn, checks.items[0].status);
+    try std.testing.expect(std.mem.find(u8, checks.items[0].detail, "(hooks.Nope): unknown event \"Nope\"") != null);
+    try std.testing.expectEqualStrings("Run fx hook list for details.", checks.items[0].fix.?);
 }
 
 test "doctor startup check fails when the provider has no model to run" {

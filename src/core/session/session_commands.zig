@@ -4,9 +4,13 @@ const agents = @import("../agents/agents.zig");
 const build_options = @import("build_options");
 const app_permission_runtime = @import("../app/app_permission_runtime.zig");
 const app_session_runtime = @import("../app/app_session_runtime.zig");
+const app_agent_runtime = @import("../app/app_agent_runtime.zig");
+const app_hook_gate_runtime = @import("../app/app_hook_gate_runtime.zig");
+const runtime_user_hooks = @import("../agent/runtime/user_hooks.zig");
 const auth_runtime = @import("../auth/auth_runtime.zig");
 const collections = @import("../shared/collections.zig");
 const config_runtime = @import("../config/config_runtime.zig");
+const settings_catalog = @import("../config/settings_catalog.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const fuzzy_match = @import("../shared/fuzzy_match.zig");
 const host = @import("../hosts/host.zig");
@@ -443,11 +447,11 @@ pub fn Commands(comptime App: type) type {
                     return;
                 }
                 if (std.ascii.eqlIgnoreCase(split.word, "on")) {
-                    try saveStartupScrollbackSetting(app, true);
+                    try setStartupScrollback(app, true);
                     return;
                 }
                 if (std.ascii.eqlIgnoreCase(split.word, "off")) {
-                    try saveStartupScrollbackSetting(app, false);
+                    try setStartupScrollback(app, false);
                     return;
                 }
                 try writeSettingsUsage(app);
@@ -460,7 +464,7 @@ pub fn Commands(comptime App: type) type {
             };
             defer settings.deinit(app.alloc);
 
-            try saveStartupScrollbackSetting(app, !(settings.startup_scrollback orelse true));
+            try setStartupScrollback(app, !(settings.startup_scrollback orelse true));
         }
 
         pub fn handleModel(app: *App, agent: *AppAgent, query: []const u8) !void {
@@ -479,22 +483,18 @@ pub fn Commands(comptime App: type) type {
         /// the usage.
         pub fn handlePermissions(app: *App, agent: *AppAgent, rest: []const u8) !void {
             if (config_runtime.parsePermissionMode(rest)) |mode| {
-                try app_permission_runtime.Runtime(App).selectMode(app, agent, mode);
-                try app.writeDomainNotice(.{
-                    .topic = "permissions",
-                    .tone = if (mode == .yolo) .warning else .neutral,
-                    .body = switch (mode) {
-                        .ask => "mode set to ask",
-                        .auto => "mode set to auto",
-                        .yolo => "mode set to full access",
-                    },
-                }, true);
+                // A refused mode is not set or saved, so no "mode set" notice follows. A pending one prints its notice
+                // when a hook's answer applies it (app_permission_runtime.finishGatedChange).
+                if (try app_permission_runtime.Runtime(App).trySelectMode(app, agent, mode, .typed) == .applied) {
+                    try app_permission_runtime.Runtime(App).writeModeNotice(app, mode);
+                }
                 return;
             }
 
             if (std.ascii.eqlIgnoreCase(rest, "reset")) {
-                try app_permission_runtime.Runtime(App).reset(app, agent);
-                try app.writeDomainNotice(.{ .topic = "permissions", .tone = .neutral, .body = "permissions reset to ask, session grants cleared" }, true);
+                if (try app_permission_runtime.Runtime(App).tryReset(app, agent, .typed) == .applied) {
+                    try app_permission_runtime.Runtime(App).writeResetNotice(app);
+                }
                 return;
             }
 
@@ -552,7 +552,19 @@ pub fn Commands(comptime App: type) type {
 
         pub fn handleHistory(app: *App, rest: []const u8) !void {
             const trimmed = std.mem.trim(u8, rest, " \t");
-            if (std.ascii.eqlIgnoreCase(trimmed, "off")) {
+            // on or off changes the setting; any other argument does not, so it asks no hook.
+            const requested: ?bool = if (std.ascii.eqlIgnoreCase(trimmed, "off")) false else if (std.ascii.eqlIgnoreCase(trimmed, "on")) true else null;
+            if (requested) |enabled| {
+                if (enabled != app.prompt_history.enabled and try app_agent_runtime.holdOnOffSetting(app, .prompt_history, enabled)) return;
+                try applyHistoryNow(app, enabled);
+                return;
+            }
+            try app.writeDomainNotice(.{ .topic = "history", .tone = .@"error", .body = "prompt history options: on, off" }, true);
+        }
+
+        /// The prompt history setting itself, once no hook holds it: turns history on or off and saves the choice.
+        pub fn applyHistoryNow(app: *App, enabled: bool) !void {
+            if (!enabled) {
                 app.prompt_history.disable();
                 var attempt = config_runtime.attemptUserPreferences(
                     app.alloc,
@@ -582,7 +594,7 @@ pub fn Commands(comptime App: type) type {
                 return;
             }
 
-            if (std.ascii.eqlIgnoreCase(trimmed, "on")) {
+            if (enabled) {
                 var attempt = config_runtime.attemptUserPreferences(
                     app.alloc,
                     .{ .prompt_history_enabled = true },
@@ -614,8 +626,6 @@ pub fn Commands(comptime App: type) type {
                 }
                 return;
             }
-
-            try app.writeDomainNotice(.{ .topic = "history", .tone = .@"error", .body = "prompt history options: on, off" }, true);
         }
 
         fn writeAllowlistUsage(app: *App) !void {
@@ -804,7 +814,7 @@ pub fn Commands(comptime App: type) type {
         }
 
         pub fn toggleFast(app: *App, agent: *AppAgent) !void {
-            try toggleFastForModel(app, agent, provider_runtime.modelOf(app, agent), true);
+            try setFastMode(app, agent, !app.fast_mode);
         }
 
         /// `/fast` toggles; `/fast on` and `/fast off` set the mode and are
@@ -812,13 +822,8 @@ pub fn Commands(comptime App: type) type {
         pub fn handleFast(app: *App, agent: *AppAgent, rest: []const u8) !void {
             const command = std.mem.trim(u8, rest, " \t");
             if (command.len == 0) return toggleFast(app, agent);
-            if (std.ascii.eqlIgnoreCase(command, "on")) {
-                if (app.fast_mode) return applyFastMode(app, agent, true, true, true);
-                return toggleFast(app, agent);
-            }
-            if (std.ascii.eqlIgnoreCase(command, "off")) {
-                return applyFastMode(app, agent, false, true, true);
-            }
+            if (std.ascii.eqlIgnoreCase(command, "on")) return setFastMode(app, agent, true);
+            if (std.ascii.eqlIgnoreCase(command, "off")) return setFastMode(app, agent, false);
             try app.writeDomainNotice(.{
                 .topic = "",
                 .tone = .@"error",
@@ -832,14 +837,8 @@ pub fn Commands(comptime App: type) type {
                 try writeUltrafastStatus(app, agent);
                 return;
             }
-            if (std.ascii.eqlIgnoreCase(command, "on")) {
-                try applyUltrafastMode(app, agent, true, true, true);
-                return;
-            }
-            if (std.ascii.eqlIgnoreCase(command, "off")) {
-                try applyUltrafastMode(app, agent, false, true, true);
-                return;
-            }
+            if (std.ascii.eqlIgnoreCase(command, "on")) return setUltrafastMode(app, agent, true);
+            if (std.ascii.eqlIgnoreCase(command, "off")) return setUltrafastMode(app, agent, false);
             try app.writeDomainNotice(.{
                 .topic = "",
                 .tone = .@"error",
@@ -855,24 +854,54 @@ pub fn Commands(comptime App: type) type {
             }, true);
         }
 
-        fn toggleFastForModel(app: *App, agent: *AppAgent, model: []const u8, announce: bool) !void {
-            if (app.fast_mode) {
-                try applyFastMode(app, agent, false, announce, true);
-                return;
-            }
-            if (!model_capabilities.resolveForApp(App, app, model).supports_fast_mode) {
-                if (announce) {
-                    try app.writeDomainNotice(.{
-                        .topic = "fast",
-                        .tone = .neutral,
-                        .body = "This model does not come with a fast mode.",
-                    }, true);
-                }
-                app.shell.render_requests.request(.footer);
-                return;
-            }
+        /// Sets fast mode as `/fast` does. A change asks ConfigChange first (R2.1), and turning fast mode on needs a model
+        /// that supports it. A value that already matches applies at once, as before.
+        pub fn setFastMode(app: *App, agent: *AppAgent, enabled: bool) !void {
+            if (enabled == app.fast_mode) return applyFastMode(app, agent, enabled, true, true);
+            if (!try fastModeReachable(app, agent, enabled)) return;
+            if (try app_agent_runtime.holdConfigChange(app, agent, app_agent_runtime.onOffSettingChange(.fast_mode, enabled))) return;
+            try applyFastChange(app, agent, enabled);
+        }
 
-            try applyFastMode(app, agent, !app.fast_mode, announce, true);
+        /// The fast mode apply step, once no hook holds it. `setFastMode` calls it after its check, and so does the
+        /// settings gate's finish.
+        pub fn applyFastChange(app: *App, agent: *AppAgent, enabled: bool) !void {
+            if (!try fastModeReachable(app, agent, enabled)) return;
+            try applyFastMode(app, agent, enabled, true, true);
+        }
+
+        /// Whether fast mode can turn to `enabled` on the agent's model. Only turning it on needs support, and a model
+        /// without it gets a notice.
+        fn fastModeReachable(app: *App, agent: *AppAgent, enabled: bool) !bool {
+            if (!enabled) return true;
+            if (model_capabilities.resolveForApp(App, app, provider_runtime.modelOf(app, agent)).supports_fast_mode) return true;
+            try app.writeDomainNotice(.{
+                .topic = "fast",
+                .tone = .neutral,
+                .body = "This model does not come with a fast mode.",
+            }, true);
+            app.shell.render_requests.request(.footer);
+            return false;
+        }
+
+        /// Sets ultrafast mode as `/ultrafast on|off` does. A change asks ConfigChange first (R2.1). A model without
+        /// ultrafast mode gets applyUltrafastMode's notice and no check, because nothing changes.
+        pub fn setUltrafastMode(app: *App, agent: *AppAgent, enabled: bool) !void {
+            if (enabled != agent.worker.agent_turn_settings.ultrafast_mode and ultrafastReachable(app, agent, enabled)) {
+                if (try app_agent_runtime.holdConfigChange(app, agent, app_agent_runtime.onOffSettingChange(.ultrafast_mode, enabled))) return;
+            }
+            try applyUltrafastChange(app, agent, enabled);
+        }
+
+        /// The ultrafast mode apply step, once no hook holds it. `setUltrafastMode` calls it after its check, and so does
+        /// the settings gate's finish.
+        pub fn applyUltrafastChange(app: *App, agent: *AppAgent, enabled: bool) !void {
+            try applyUltrafastMode(app, agent, enabled, true, true);
+        }
+
+        fn ultrafastReachable(app: *App, agent: *AppAgent, enabled: bool) bool {
+            if (!enabled) return true;
+            return model_capabilities.resolveForApp(App, app, provider_runtime.modelOf(app, agent)).supports_ultrafast_mode;
         }
 
         fn applyFastMode(app: *App, agent: *AppAgent, enabled: bool, announce: bool, persist: bool) !void {
@@ -1002,6 +1031,29 @@ pub fn Commands(comptime App: type) type {
             none,
         };
 
+        /// Holds an effort change for its ConfigChange hooks (R2.1). True when it must not apply now: a hook refused it or
+        /// its check waits, or the check could not start. Compares labels, since a ReasoningEffort holds a name. `pick` is a
+        /// model pick whose model changes once the effort is allowed.
+        fn holdEffortChange(
+            app: *App,
+            agent: *AppAgent,
+            effort: types.ReasoningEffort,
+            feedback: app_hook_gate_runtime.SettingFeedback,
+            pick: ?app_hook_gate_runtime.PickedModel,
+        ) !bool {
+            if (std.mem.eql(u8, effort.label(), agent.effort.label())) return false;
+            return app_agent_runtime.holdConfigChange(app, agent, .{
+                .setting = .effort,
+                .source = "effort",
+                .old_value = agent.effort.label(),
+                .new_value = effort.label(),
+                .value = effort.label(),
+                .effort = effort,
+                .feedback = feedback,
+                .picked = pick,
+            });
+        }
+
         fn applyEffort(app: *App, agent: *AppAgent, effort: types.ReasoningEffort, report: EffortReport, persist: bool) !void {
             agent.effort = effort;
             agent.worker.syncQueuedPromptEffort(agent.effort);
@@ -1032,12 +1084,26 @@ pub fn Commands(comptime App: type) type {
         }
 
         pub fn selectEffortFromSettings(app: *App, agent: *AppAgent, effort: types.ReasoningEffort) !void {
+            if (try holdEffortChange(app, agent, effort, .saved, null)) return;
             try applyEffort(app, agent, effort, .saved, true);
         }
 
         /// Applies `effort` to `agent`'s model, saves it, and names it.
         pub fn selectEffort(app: *App, agent: *AppAgent, effort: types.ReasoningEffort) !void {
+            if (try holdEffortChange(app, agent, effort, .named, null)) return;
             try applyEffort(app, agent, effort, .named, true);
+        }
+
+        /// The effort apply step after its hooks allowed it: applies and saves `effort` as the synchronous path does,
+        /// reported as `feedback` says.
+        pub fn applyEffortChange(app: *App, agent: *AppAgent, effort: types.ReasoningEffort, feedback: app_hook_gate_runtime.SettingFeedback) !void {
+            const report: EffortReport = switch (feedback) {
+                .saved => .saved,
+                .named => .named,
+                .none => .none,
+                .announce, .silent => unreachable,
+            };
+            try applyEffort(app, agent, effort, report, true);
         }
 
         /// Ctrl+T: moves `agent`'s model to the next effort in the cycle
@@ -1055,6 +1121,7 @@ pub fn Commands(comptime App: type) type {
                 try writeNoEffortLevelsNotice(app, model, "ctrl+t");
                 return;
             };
+            if (try holdEffortChange(app, agent, next, .none, null)) return;
             try applyEffort(app, agent, next, .none, true);
         }
 
@@ -1122,29 +1189,61 @@ pub fn Commands(comptime App: type) type {
             fast_mode: bool,
             ultrafast_mode: bool,
         ) !void {
-            try setResolvedModelRuntime(app, agent, model);
-            settleStartModel(app);
-            var patch = app_session_runtime.SessionPreferencePatch{
-                .provider = provider_runtime.providerOf(app, agent),
-                .model = model,
-            };
+            // A refused effort refuses the whole pick, so the model stays as it was too. The effort is checked first, and the
+            // model changes with it: from the effort's finish when a hook asks, or here when none does (R2.1).
+            const picked = model_capabilities.resolveForApp(App, app, model);
+            const pick: app_hook_gate_runtime.PickedModel = .{ .model = model, .fast_mode = fast_mode, .ultrafast_mode = ultrafast_mode };
+            if (picked.reasoning_efforts.len > 0 and try holdEffortChange(app, agent, effort, .none, pick)) return;
+            try continuePickedModel(app, agent, pick, effort);
+        }
+
+        /// The speed a picker pick sets, as `finishPickerChoice` applies it: ultrafast wins over fast, and only a model that
+        /// offers a speed gets it.
+        fn pickedSpeed(app: *App, model: []const u8, fast_mode: bool, ultrafast_mode: bool) struct { fast: bool, ultrafast: bool } {
             const capabilities = model_capabilities.resolveForApp(App, app, model);
-            if (capabilities.reasoning_efforts.len > 0) {
-                try applyEffort(app, agent, effort, .none, false);
-                patch.effort = effort;
-            }
-            const selected_ultrafast_mode = capabilities.supports_ultrafast_mode and ultrafast_mode;
-            const selected_fast_mode = capabilities.supports_fast_mode and fast_mode and !selected_ultrafast_mode;
-            if (selected_fast_mode != app.fast_mode) {
-                try applyFastMode(app, agent, selected_fast_mode, false, false);
-            }
-            if (selected_ultrafast_mode != agent.worker.agent_turn_settings.ultrafast_mode) {
-                try applyUltrafastMode(app, agent, selected_ultrafast_mode, false, false);
-            }
-            patch.fast_mode = app.fast_mode;
-            patch.ultrafast_mode = agent.worker.agent_turn_settings.ultrafast_mode;
-            try announceModelSelection(app, agent);
-            try persistPreferenceTargets(app, agent, patch, "model picker", false);
+            const ultrafast = capabilities.supports_ultrafast_mode and ultrafast_mode;
+            return .{ .fast = capabilities.supports_fast_mode and fast_mode and !ultrafast, .ultrafast = ultrafast };
+        }
+
+        /// The speed a pick changes, for its ConfigChange check, or null when the pick keeps both speeds. A change that
+        /// turns a speed on is named first, so a pick is checked as the speed it chooses.
+        const PickedSpeedChange = struct { setting: settings_catalog.SettingId, enabled: bool };
+
+        fn pickedSpeedChange(app: *App, agent: *AppAgent, pick: app_hook_gate_runtime.PickedModel) ?PickedSpeedChange {
+            const speed = pickedSpeed(app, pick.model, pick.fast_mode, pick.ultrafast_mode);
+            const ultrafast_now = agent.worker.agent_turn_settings.ultrafast_mode;
+            if (speed.ultrafast and !ultrafast_now) return .{ .setting = .ultrafast_mode, .enabled = true };
+            if (speed.fast and !app.fast_mode) return .{ .setting = .fast_mode, .enabled = true };
+            if (ultrafast_now and !speed.ultrafast) return .{ .setting = .ultrafast_mode, .enabled = false };
+            if (app.fast_mode and !speed.fast) return .{ .setting = .fast_mode, .enabled = false };
+            return null;
+        }
+
+        /// Holds a picker pick's speed change for its ConfigChange check (R2.1). True when the pick must wait.
+        fn holdPickedSpeed(app: *App, agent: *AppAgent, pick: app_hook_gate_runtime.PickedModel, effort: types.ReasoningEffort) !bool {
+            const change = pickedSpeedChange(app, agent, pick) orelse return false;
+            var setting = app_agent_runtime.onOffSettingChange(change.setting, change.enabled);
+            setting.effort = effort;
+            setting.picked = pick;
+            return app_agent_runtime.holdConfigChange(app, agent, setting);
+        }
+
+        /// The steps of a picker pick after its effort, once the effort's check allows it or none asks: the speed's check,
+        /// then the model (R2.1). A half-applied pick never shows: the speed and the effort apply with the model.
+        pub fn continuePickedModel(app: *App, agent: *AppAgent, pick: app_hook_gate_runtime.PickedModel, effort: types.ReasoningEffort) !void {
+            if (try holdPickedSpeed(app, agent, pick, effort)) return;
+            try startPickedModel(app, agent, pick, effort);
+        }
+
+        /// Changes the model to a picker pick's model, with the pick's effort and speed. Runs once every check that asks
+        /// has allowed the pick.
+        pub fn startPickedModel(app: *App, agent: *AppAgent, pick: app_hook_gate_runtime.PickedModel, effort: types.ReasoningEffort) !void {
+            try startModelChange(app, agent, .{
+                .from = provider_runtime.modelOf(app, agent),
+                .to = pick.model,
+                .announce = false,
+                .picker = .{ .effort = effort, .fast_mode = pick.fast_mode, .ultrafast_mode = pick.ultrafast_mode },
+            });
         }
 
         fn permissionWorkspaceRoot(
@@ -1296,7 +1395,30 @@ pub fn Commands(comptime App: type) type {
             try app.writeDomainNotice(.{ .topic = "settings", .tone = .neutral, .body = msg }, true);
         }
 
-        fn saveStartupScrollbackSetting(app: *App, enabled: bool) !void {
+        /// Sets the startup-scrollback setting as `/settings startup-scrollback` does: a change asks ConfigChange first (R2.1).
+        fn setStartupScrollback(app: *App, enabled: bool) !void {
+            if (try holdStartupScrollback(app, enabled)) return;
+            try saveStartupScrollbackSetting(app, enabled);
+        }
+
+        /// Holds a startup-scrollback change whose saved value differs, for its ConfigChange check (R2.1). True when it must
+        /// not apply now. The settings menu and the typed command both ask through here.
+        pub fn holdStartupScrollback(app: *App, enabled: bool) !bool {
+            if (savedStartupScrollback(app)) |saved| {
+                if (saved == enabled) return false;
+            }
+            return app_agent_runtime.holdOnOffSetting(app, .startup_scrollback, enabled);
+        }
+
+        /// The saved startup-scrollback value. Null when the settings cannot be read, so a change then asks its hooks.
+        fn savedStartupScrollback(app: *App) ?bool {
+            var settings = config_runtime.loadMergedSettings(app.alloc, app.workspace_root) catch return null;
+            defer settings.deinit(app.alloc);
+            return settings.startup_scrollback orelse true;
+        }
+
+        /// Saves the startup-scrollback setting and reports the commit. Runs once no hook holds the change.
+        pub fn saveStartupScrollbackSetting(app: *App, enabled: bool) !void {
             var attempt = config_runtime.attemptUserPreferences(
                 app.alloc,
                 .{ .startup_scrollback = enabled },
@@ -1389,28 +1511,12 @@ pub fn Commands(comptime App: type) type {
         }
 
         fn setResolvedModel(app: *App, agent: *AppAgent, resolved: []const u8, announce: bool) !void {
-            const model_changed = !std.mem.eql(u8, provider_runtime.modelOf(app, agent), resolved);
-            try setResolvedModelRuntime(app, agent, resolved);
-            settleStartModel(app);
-            if (model_changed and app.fast_mode) {
-                try applyFastMode(app, agent, false, false, false);
-            }
-            if (model_changed and agent.worker.agent_turn_settings.ultrafast_mode) {
-                try applyUltrafastMode(app, agent, false, false, false);
-            }
-            if (announce) try announceModelSelection(app, agent);
-            try persistPreferenceTargets(
-                app,
-                agent,
-                .{
-                    .provider = provider_runtime.providerOf(app, agent),
-                    .model = resolved,
-                    .fast_mode = app.fast_mode,
-                    .ultrafast_mode = agent.worker.agent_turn_settings.ultrafast_mode,
-                },
-                "model",
-                !announce,
-            );
+            try startModelChange(app, agent, .{
+                .from = provider_runtime.modelOf(app, agent),
+                .to = resolved,
+                .announce = announce,
+                .picker = null,
+            });
         }
 
         /// Whether a `/fast` or `/ultrafast` change is saved. Each saves the
@@ -1492,7 +1598,125 @@ pub fn Commands(comptime App: type) type {
             }
         }
 
-        fn setResolvedModelRuntime(app: *App, agent: *AppAgent, resolved: []const u8) !void {
+        /// Changes the model: at once when no trusted PreModelSwitch hook would run, and otherwise on the hook gate, which
+        /// the tick finishes (R2.1). A busy gate, or a gate that cannot start, refuses the change with a notice (R4.2).
+        fn startModelChange(app: *App, agent: *AppAgent, change: app_hook_gate_runtime.ModelChange) !void {
+            if (comptime !@hasField(App, "hook_gate")) return applyModelChange(app, agent, change);
+            if (std.mem.eql(u8, change.from, change.to)) return applyModelChange(app, agent, change);
+            const lifecycle = app_agent_runtime.Runtime(App).lifecycleContext(app, agent);
+            const session_id = app_session_runtime.Runtime(App).activeSessionId(agent);
+            const started = app.hook_gate.begin(lifecycle, .{ .model = change }, @intFromPtr(agent), session_id) catch |err| {
+                switch (err) {
+                    error.HookGateBusy => app_permission_runtime.Runtime(App).writeChangeNotice(app, "A hook check is still running. Press Esc twice to stop it."),
+                    else => {
+                        debug_trace.logf("hooks", "refused the model change: its hook check could not start: {s}", .{@errorName(err)});
+                        app_permission_runtime.Runtime(App).writeChangeNotice(app, "The model change was refused: its hook check could not start.");
+                    },
+                }
+                return;
+            };
+            if (!started) try applyModelChange(app, agent, change);
+        }
+
+        /// The model change itself and what follows it, once no hook refuses it: replaces the model, starts the
+        /// PostModelSwitch check, then finishes what the change asked for. A picker change sets its effort and speed; a
+        /// typed change prints its announcement. Both save the choice. Runs on the UI thread.
+        fn applyModelChange(app: *App, agent: *AppAgent, change: app_hook_gate_runtime.ModelChange) !void {
+            var arena_state = std.heap.ArenaAllocator.init(app.alloc);
+            defer arena_state.deinit();
+            // Copied before the change: replacing the model frees the text it was holding.
+            const previous = try arena_state.allocator().dupe(u8, change.from);
+            const model_changed = !std.mem.eql(u8, provider_runtime.modelOf(app, agent), change.to);
+            try applyResolvedModel(app, agent, change.to);
+            if (model_changed) app_agent_runtime.announceModelSwitch(app, agent, previous, change.to);
+            settleStartModel(app);
+            if (change.picker) |choice| return finishPickerChoice(app, agent, change.to, choice);
+            if (model_changed and app.fast_mode) {
+                try applyFastMode(app, agent, false, false, false);
+            }
+            if (model_changed and agent.worker.agent_turn_settings.ultrafast_mode) {
+                try applyUltrafastMode(app, agent, false, false, false);
+            }
+            if (change.announce) try announceModelSelection(app, agent);
+            try persistPreferenceTargets(
+                app,
+                agent,
+                .{
+                    .provider = provider_runtime.providerOf(app, agent),
+                    .model = change.to,
+                    .fast_mode = app.fast_mode,
+                    .ultrafast_mode = agent.worker.agent_turn_settings.ultrafast_mode,
+                },
+                "model",
+                !change.announce,
+            );
+        }
+
+        /// The model picker's steps once its model applies: the effort it chose, the speed, the announcement, and the saved choice.
+        fn finishPickerChoice(app: *App, agent: *AppAgent, model: []const u8, choice: app_hook_gate_runtime.PickerChoice) !void {
+            var patch = app_session_runtime.SessionPreferencePatch{
+                .provider = provider_runtime.providerOf(app, agent),
+                .model = model,
+            };
+            const capabilities = model_capabilities.resolveForApp(App, app, model);
+            if (capabilities.reasoning_efforts.len > 0) {
+                try applyEffort(app, agent, choice.effort, .none, false);
+                patch.effort = choice.effort;
+            }
+            const speed = pickedSpeed(app, model, choice.fast_mode, choice.ultrafast_mode);
+            if (speed.fast != app.fast_mode) {
+                try applyFastMode(app, agent, speed.fast, false, false);
+            }
+            if (speed.ultrafast != agent.worker.agent_turn_settings.ultrafast_mode) {
+                try applyUltrafastMode(app, agent, speed.ultrafast, false, false);
+            }
+            patch.fast_mode = app.fast_mode;
+            patch.ultrafast_mode = agent.worker.agent_turn_settings.ultrafast_mode;
+            try announceModelSelection(app, agent);
+            try persistPreferenceTargets(app, agent, patch, "model picker", false);
+        }
+
+        /// Applies or shows a finished PreModelSwitch check (R2.1). The model changes only when the screen and its session
+        /// are the ones it was made for, and no hook refused it.
+        pub fn finishGatedModelChange(app: *App, taken: *app_hook_gate_runtime.Taken) !void {
+            if (!app_agent_runtime.gatedTargetIsCurrent(app, taken)) {
+                debug_trace.logf("hooks", "dropped the model change: the screen or the session changed while its hook check ran", .{});
+                app_permission_runtime.Runtime(App).writeChangeNotice(app, "The model change was dropped: the session changed while its hooks ran.");
+                return;
+            }
+            switch (taken.result.outcome) {
+                .allowed => {},
+                .refused => app_permission_runtime.Runtime(App).writeChangeNotice(app, taken.result.refusal orelse "A hook refused the model change."),
+                .cancelled => app_permission_runtime.Runtime(App).writeChangeNotice(app, "The model change was cancelled. Its hooks were stopped."),
+            }
+            app_agent_runtime.showHookNotices(app, taken.result.notices, "PreModelSwitch");
+            if (taken.result.outcome != .allowed) return;
+            switch (taken.change) {
+                .model => |change| try applyModelChange(app, agents.screenAgentOf(app), change),
+                .permission_mode, .setting, .model_switched => unreachable,
+            }
+        }
+
+        /// Shows a finished PostModelSwitch check (R2.1): its notices, and its context for the session's next turn. A
+        /// changed screen or session drops it, with a trace. A cancelled check keeps no context.
+        pub fn finishObservedSwitch(app: *App, taken: *app_hook_gate_runtime.Taken) void {
+            if (!app_agent_runtime.gatedTargetIsCurrent(app, taken)) {
+                debug_trace.logf("hooks", "dropped the PostModelSwitch result: the screen or the session changed while its hooks ran", .{});
+                return;
+            }
+            if (taken.result.outcome == .cancelled) {
+                app_permission_runtime.Runtime(App).writeChangeNotice(app, "The model switch hooks were stopped.");
+                return;
+            }
+            app_agent_runtime.showHookNotices(app, taken.result.notices, "PostModelSwitch");
+            const framed = taken.result.context orelse return;
+            const hooks_runtime = app_agent_runtime.Runtime(App).lifecycleContext(app, agents.screenAgentOf(app)).user_hooks orelse return;
+            runtime_user_hooks.queueObservedContext(hooks_runtime, taken.session_id, framed);
+        }
+
+        /// The model change itself, with no hook asked or announced: replaces the model, syncs the
+        /// queued prompt, saves the choice, and retitles the terminal.
+        fn applyResolvedModel(app: *App, agent: *AppAgent, resolved: []const u8) !void {
             if (!std.mem.eql(u8, provider_runtime.modelOf(app, agent), resolved)) {
                 try provider_runtime.replaceModel(app, resolved);
             }
@@ -1512,7 +1736,8 @@ pub fn Commands(comptime App: type) type {
         /// notice and without saving either: the model a new session starts
         /// on for its team (`src/core/app/token_pass_check.zig`).
         pub fn adoptStartModel(app: *App, agent: *AppAgent, model: []const u8, fast_mode: bool) !void {
-            try setResolvedModelRuntime(app, agent, model);
+            // Not asked of the hooks or announced: the token-pass start model is picked for the person.
+            try applyResolvedModel(app, agent, model);
             if (app.fast_mode != fast_mode) try applyFastMode(app, agent, fast_mode, false, false);
         }
 
@@ -2171,7 +2396,7 @@ const FakeApp = struct {
         self.* = undefined;
     }
 
-    fn writeDomainNotice(self: *FakeApp, notice: types.SemanticNotice, _: bool) !void {
+    pub fn writeDomainNotice(self: *FakeApp, notice: types.SemanticNotice, _: bool) !void {
         self.semantic_write_count += 1;
         self.last_tone = notice.tone;
         const rendered = if (notice.topic.len > 0)

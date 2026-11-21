@@ -228,7 +228,7 @@ fn buildPendingCardProjection(
     const pending = agents.screenAgentOf(app).submission.pending orelse return null;
     switch (pending.phase) {
         .awaiting_frame, .awaiting_adoption => {},
-        .adopted, .awaiting_auth, .queued => return null,
+        .adopted, .awaiting_auth, .awaiting_hook_check, .queued => return null,
     }
 
     const spans = pending.draft.skill_display_spans;
@@ -287,7 +287,8 @@ fn buildPendingCardProjection(
 fn pendingPromptActivityVisible(app: anytype) bool {
     if (comptime !agents.hasAgentField(@TypeOf(app.*), "submission")) return false;
     const pending = agents.screenAgentOf(app).submission.pending orelse return false;
-    return pending.phase != .awaiting_auth;
+    // A held prompt shows its own state: the credential or the hook check's working line.
+    return pending.phase != .awaiting_auth and pending.phase != .awaiting_hook_check;
 }
 
 fn buildPendingSteeringCardProjection(
@@ -881,6 +882,8 @@ pub fn Runtime(comptime App: type) type {
                 .subagent_wait = subagent_wait.label,
                 .subagent_wait_since_ms = subagent_wait.since_ms,
                 .mcp_status = if (comptime @hasField(App, "mcp")) app.mcp.hostStatusText() else "",
+                .hook_status = if (comptime @hasField(App, "hook_job")) app.hook_job.statusText() else "",
+                .gate_status = if (comptime @hasField(App, "hook_gate")) app.hook_gate.statusText() else "",
                 .danger_status = if (yolo_warning_active)
                     app_permission_runtime.yolo_warning_text
                 else

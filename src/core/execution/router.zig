@@ -178,6 +178,7 @@ test "router keeps direct grammar on the safer route for every shell source" {
         .auto_mode,
         .auto_classifier,
         .yolo,
+        .hook,
     };
     for (sources) |source| {
         var route = try prepareAuthorizedRoute(

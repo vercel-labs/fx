@@ -14,7 +14,11 @@ const code_highlight_languages = @import("../agent/presentation/code_highlight_l
 const app_callbacks = @import("app_callbacks.zig");
 const runtime_profile = @import("../hosts/runtime_profile.zig");
 const host = @import("../hosts/host.zig");
+const host_target = @import("../hosts/target.zig");
+const runtime_lifecycle = @import("../agent/runtime/lifecycle.zig");
+const runtime_user_hooks = @import("../agent/runtime/user_hooks.zig");
 const app_permission_runtime = @import("app_permission_runtime.zig");
+const app_hook_gate_runtime = @import("app_hook_gate_runtime.zig");
 const app_session_runtime = @import("app_session_runtime.zig");
 const provider_runtime = @import("provider_runtime.zig");
 const app_worker_runtime = @import("app_worker_runtime.zig");
@@ -24,6 +28,7 @@ const change_tracker = @import("../workspace/change_tracker.zig");
 const file_mutation_contract = @import("../tooling/file_mutation_contract.zig");
 const hooks = @import("../hooks/hooks.zig");
 const io_mod = @import("../shared/io.zig");
+const settings_catalog = @import("../config/settings_catalog.zig");
 const testing_allocator = @import("../shared/testing_allocator.zig");
 const mcp_elicitation_interaction = @import("../mcp/elicitation_interaction.zig");
 const permission_gate = @import("../permissions/permission_gate.zig");
@@ -77,6 +82,106 @@ const PermissionGrant = types.PermissionGrant;
 const PermissionMode = types.PermissionMode;
 const ToolCall = types.ToolCall;
 const ToolPermissionDecision = types.ToolPermissionDecision;
+
+/// Holds a setting change for its ConfigChange hooks (R2.1, R4.2). True when the change must not apply now: its check
+/// waits, or the check could not start (a notice says so). False when no trusted hook would run for it: the caller
+/// applies the change now. A refusal arrives when the check finishes (`finishGatedSetting`). An App without a hook gate
+/// never asks. The gate copies the change, so its strings may go away once this returns.
+pub fn holdConfigChange(app: anytype, agent: anytype, change: app_hook_gate_runtime.SettingChange) !bool {
+    if (comptime !@hasField(@TypeOf(app.*), "hook_gate")) return false;
+    const lifecycle = Runtime(@TypeOf(app.*)).lifecycleContext(app, agent);
+    const session_id = app_session_runtime.Runtime(@TypeOf(app.*)).activeSessionId(agent);
+    const started = app.hook_gate.begin(lifecycle, .{ .setting = change }, @intFromPtr(agent), session_id) catch |err| {
+        switch (err) {
+            error.HookGateBusy => app_permission_runtime.Runtime(@TypeOf(app.*)).writeChangeNotice(app, "A hook check is still running. Press Esc twice to stop it."),
+            else => {
+                debug_trace.logf("hooks", "refused the setting change: its hook check could not start: {s}", .{@errorName(err)});
+                app_permission_runtime.Runtime(@TypeOf(app.*)).writeChangeNotice(app, "The setting change was refused: its hook check could not start.");
+            },
+        }
+        return true;
+    };
+    return started;
+}
+
+/// `holdConfigChange` for the screen agent, which the settings, statusline, sound, and history commands act on. The guard
+/// comes first, so an App without a hook gate never reaches `screenAgentOf`.
+pub fn holdScreenConfigChange(app: anytype, change: app_hook_gate_runtime.SettingChange) !bool {
+    if (comptime !@hasField(@TypeOf(app.*), "hook_gate")) return false;
+    return holdConfigChange(app, agents.screenAgentOf(app), change);
+}
+
+/// The text an on/off setting shows when it is `enabled`, and the text it had before it changed to `enabled`.
+pub fn onOffText(enabled: bool) []const u8 {
+    return if (enabled) "on" else "off";
+}
+
+pub fn previousOnOff(enabled: bool) []const u8 {
+    return if (enabled) "off" else "on";
+}
+
+/// The ConfigChange fields of an on/off setting turning to `enabled`. Its text is static, so the change borrows nothing.
+/// A caller that adds to it (a picker pick's effort or model) sets those fields itself.
+pub fn onOffSettingChange(setting: settings_catalog.SettingId, enabled: bool) app_hook_gate_runtime.SettingChange {
+    const text = onOffText(enabled);
+    return .{
+        .setting = setting,
+        .source = "settings",
+        .old_value = previousOnOff(enabled),
+        .new_value = text,
+        .value = text,
+    };
+}
+
+/// Holds an on/off change of a screen setting for its ConfigChange hooks (R2.1). True when it must not apply now. The
+/// settings menu, the typed settings commands, and the picker's speed all ask through this one shape.
+pub fn holdOnOffSetting(app: anytype, setting: settings_catalog.SettingId, enabled: bool) !bool {
+    return holdScreenConfigChange(app, onOffSettingChange(setting, enabled));
+}
+
+/// Shows the notices of a settings or model hook, each under the `hooks` topic with its tone. A
+/// notice that cannot be shown is traced; the change's decision stands either way.
+pub fn showHookNotices(app: anytype, notices: []const runtime_user_hooks.HookNotice, change: []const u8) void {
+    for (notices) |notice| {
+        app.writeDomainNotice(.{
+            .topic = "hooks",
+            .tone = switch (notice.tone) {
+                .neutral => .neutral,
+                .warning => .warning,
+            },
+            .body = notice.text,
+        }, true) catch |err| {
+            debug_trace.logf("hooks", "dropped {s} hook notice: tone={s} bytes={d}: {s}", .{ change, @tagName(notice.tone), notice.text.len, @errorName(err) });
+        };
+    }
+}
+
+/// Starts the PostModelSwitch check for a model change that already applied, on the hook gate (R2.1). Its notices show
+/// when the check ends, and its context waits for the session's next turn. The gate is idle here, because the model
+/// change either applied with no check pending or finished its own check first. An App without a hook gate never asks.
+pub fn announceModelSwitch(app: anytype, agent: anytype, old_model: []const u8, new_model: []const u8) void {
+    if (comptime !@hasField(@TypeOf(app.*), "hook_gate")) return;
+    const lifecycle = Runtime(@TypeOf(app.*)).lifecycleContext(app, agent);
+    const session_id = app_session_runtime.Runtime(@TypeOf(app.*)).activeSessionId(agent);
+    const change: app_hook_gate_runtime.Change = .{ .model_switched = .{ .from = old_model, .to = new_model } };
+    _ = app.hook_gate.begin(lifecycle, change, @intFromPtr(agent), session_id) catch |err| {
+        debug_trace.logf("hooks", "could not start the PostModelSwitch check: {s}", .{@errorName(err)});
+        return;
+    };
+}
+
+/// Whether a finished hook check still targets the screen agent and its session. A check that does not is dropped.
+pub fn gatedTargetIsCurrent(app: anytype, taken: *const app_hook_gate_runtime.Taken) bool {
+    const agent = agents.screenAgentOf(app);
+    return app_hook_gate_runtime.isCurrentTarget(taken, @intFromPtr(agent), app_session_runtime.Runtime(@TypeOf(app.*)).activeSessionId(agent));
+}
+
+/// The instruction filter state for a context gather on this agent: the lifecycle that the user's
+/// InstructionsLoaded hooks run with. An App without user hooks gets no filter.
+pub fn instructionFilterState(app: anytype, agent: anytype) runtime_user_hooks.InstructionFilterState {
+    if (comptime !@hasField(@TypeOf(app.*), "user_hooks")) return .{};
+    return .{ .lifecycle = Runtime(@TypeOf(app.*)).lifecycleContext(app, agent) };
+}
 
 pub fn Runtime(comptime App: type) type {
     return struct {
@@ -1180,9 +1285,11 @@ pub fn Runtime(comptime App: type) type {
             if (!app.context_enabled) return;
 
             const workspace = turnWorkspace(app);
+            var instructions = instructionFilterState(app, agent);
             agent.context_snapshot = app.contextRegistry().gatherDefaultSnapshot(app.alloc, .{
                 .workspace_root = workspace.root,
                 .access_scope = workspace.access_scope,
+                .instruction_filter = instructions.filter(),
                 .context_limits = if (comptime @hasField(App, "context_limits")) app.context_limits else .{},
             }) catch |err| {
                 debug_trace.logf("context", "gather failed err={s}", .{@errorName(err)});
@@ -1402,9 +1509,21 @@ pub fn Runtime(comptime App: type) type {
                 .renewal_deps = &deps,
             };
             defer summary_model.deinit();
+            var user_hooks = runtime_user_hooks.TurnHooks.init(lifecycleContext(app, agent), &deps, job.turn_id, null);
+            user_hooks.mode = app_permission_runtime.Runtime(App).livePermissionSnapshot(app, agent).mode;
+            const pre_compact = user_hooks.preCompact(arena, "manual");
+            if (pre_compact.blocked_notice) |notice| {
+                deps.pushHookNotice(.warning, notice) catch |err| {
+                    debug_trace.logf("hooks", "compaction block notice dropped: {s}", .{@errorName(err)});
+                };
+                // Settled as a compaction with nothing to do, the same as when the compactor finds nothing.
+                agent.worker.settleCompactionActivity(operation_id, .{ .outcome = .no_op });
+                return;
+            }
             const result = agent_runtime.compactContext(arena, &deps, .{
                 .operation_id = operation_id,
                 .activity_origin = .manual,
+                .instructions = pre_compact.instructions,
                 .compactor = .{
                     .history = job.history,
                     .append_messages = session_runtime.appendHistoryChatMessages,
@@ -1418,10 +1537,11 @@ pub fn Runtime(comptime App: type) type {
                 if (err == error.Cancelled and agent.worker.worker_cancel_requested.load(.seq_cst)) return;
                 return @as(anyerror!void, err);
             };
+            if (result) |value| user_hooks.postCompact(arena, "manual", value.cut.turns, value.model_text.len);
             if (result == null) agent.worker.settleCompactionActivity(operation_id, .{ .outcome = .no_op });
         }
 
-        fn lifecycleContext(app: *App, agent: *AppAgent) agent_runtime.LifecycleContext {
+        pub fn lifecycleContext(app: *App, agent: *AppAgent) agent_runtime.LifecycleContext {
             if (childRun(agent)) |run| return .{
                 .view = app.lifecycle_view,
                 .scope = .{
@@ -1431,6 +1551,8 @@ pub fn Runtime(comptime App: type) type {
                     .subagent_id = run.subagent_id,
                 },
                 .outcome_allocator = app.alloc,
+                .user_hooks = userHooks(app),
+                .trust_required = true,
             };
             return .{
                 .view = app.lifecycle_view,
@@ -1443,7 +1565,20 @@ pub fn Runtime(comptime App: type) type {
                         null,
                 },
                 .outcome_allocator = app.alloc,
+                .user_hooks = userHooks(app),
+                .trust_required = true,
             };
+        }
+
+        /// The app's hooks runtime, or null when this build or host has none.
+        fn userHooks(app: *App) ?*runtime_lifecycle.UserHooksRuntime {
+            if (comptime host_target.is_wasm) {
+                return null;
+            } else if (comptime @hasField(App, "user_hooks")) {
+                return if (app.user_hooks) |*rt| rt else null;
+            } else {
+                return null;
+            }
         }
 
         /// Binds a child's run to the child's own agent, started on first use,

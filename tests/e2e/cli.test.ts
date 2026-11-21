@@ -5374,7 +5374,7 @@ describe("cli: ask success", () => {
         expect(jsonResult.code).toBe(1);
         expect(jsonResult.stderr).toBe("");
         expect(jsonResult.stdout).toBe(
-          '{"output":"","final_output":"","exit_code":1,"model":"","resolved_provider":null,"session_id":"","steps":0,"tool_calls":[],"usage":{"input_tokens":null,"output_tokens":null},"error":"PromptResourceLimitExceeded"}\n',
+          '{"output":"","final_output":"","exit_code":1,"model":"","resolved_provider":null,"session_id":"","steps":0,"tool_calls":[],"usage":{"input_tokens":null,"output_tokens":null},"error":"PromptResourceLimitExceeded","notices":[]}\n',
         );
       } finally {
         cleanupIsolatedTestHome(home);

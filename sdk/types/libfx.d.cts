@@ -144,7 +144,7 @@ export interface FxToolContext {
   sessionId: string;
   /** The JSON passed as `context` to the `session()` call whose prompt or steer started the turn. */
   context?: JsonValue;
-  /** Present when hooks are installed. Observe host-owned input waits and child engines. */
+  /** Present when `observe` is installed. Observes host-owned input waits and child engines. */
   observation?: FxToolObservation;
 }
 
@@ -168,7 +168,9 @@ export interface FxToolObservation {
   wait<T>(request: FxWaitRequest, run: () => FxWaitResponse<T> | Promise<FxWaitResponse<T>>): Promise<FxWaitResponse<T>>;
   /** Used by the MCP adapter to bind a remote call to this tool invocation. */
   mcp<T>(identity: { server: string | null; tool: string; correlationId?: string | undefined }, run: (request: { correlationId: string | undefined }) => T | Promise<T>): Promise<T>;
-  /** Install these hooks on a host-created child engine to retain the parent tool relationship. */
+  /** Pass this as `observe` to a host-created child engine to retain the parent tool relationship. */
+  childObserve(): FxObserve;
+  /** @deprecated Use `childObserve()`. */
   childHooks(): FxHooks;
 }
 
@@ -335,8 +337,8 @@ export type FxAgentEvent = FxEngineEvent | FxSessionEvent;
 // Options shared by agents and engines
 
 /** Semantic observation, independent of diagnostics, UI events, permissions, and tracing libraries. */
-export interface FxHooks {
-  /** Parent of a host-created child engine. Normally supplied by `context.observation.childHooks()`. */
+export interface FxObserve {
+  /** Parent of a host-created child engine. Normally supplied by `context.observation.childObserve()`. */
   parent?: { rootSessionId: string; sessionId: string; turnId: string; callId: string };
   /** Include bounded messages, instructions, tool arguments/results, and schemas. Default false. */
   captureContent?: boolean;
@@ -345,6 +347,9 @@ export interface FxHooks {
   /** Receives callback throws and rejected promises. Errors here are contained too. */
   onError?(error: unknown): void | Promise<void>;
 }
+
+/** @deprecated Use `FxObserve`. `hooks` is the old name of the `observe` option. */
+export type FxHooks = FxObserve;
 
 /** An authoritative model call identity, with no provider replay or credentials. */
 export interface FxHookToolCall {
@@ -434,8 +439,10 @@ export type FxHookEvent = FxHookEnvelope & (
 
 /** Options `createFxAgent()` and `createFxEngine()` share. */
 export interface FxSharedOptions<Event> {
-  /** Host-owned instrumentation of native and Wasm execution. Disabled by default. */
-  hooks?: FxHooks;
+  /** Host-owned observation of native and Wasm execution. Disabled by default. */
+  observe?: FxObserve;
+  /** @deprecated Use `observe`. It has the same shape and behavior. */
+  hooks?: FxObserve;
   /** The complete host-owned system context, up to 64 KiB of UTF-8. An array is joined with blank lines. */
   instructions?: string | readonly string[];
   tools?: FxTools;

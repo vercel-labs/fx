@@ -21,6 +21,7 @@ const record_tape = @import("../workspace/record_tape.zig");
 const statusline_identity = @import("../workspace/statusline_identity.zig");
 const shared_io = @import("../shared/io.zig");
 const mcp_host = @import("../mcp_host/host.zig");
+const hooks_host = @import("../hooks_host/hooks_host.zig");
 const permissions = @import("../permissions/permissions.zig");
 const skill_contract = @import("../skills/skill_contract.zig");
 const skill_runtime = @import("../skills/skill_runtime.zig");
@@ -631,6 +632,16 @@ pub fn Runtime(comptime App: type) type {
                     startup.notification_attention_required,
                     startup.notification_max,
                 );
+            }
+            if (comptime @hasField(App, "user_hooks") and !host_target.is_wasm) {
+                app.user_hooks = hooks_host.Runtime.init(std.heap.c_allocator, .{
+                    .enabled = startup.experimental_hooks,
+                    .home = shared_io.homeDir(),
+                    .workspace_root = app.workspace_root,
+                }) catch |err| blk: {
+                    debug_trace.logf("hooks", "could not start hooks: {s}", .{@errorName(err)});
+                    break :blk null;
+                };
             }
             try deps.initialize_persistence(
                 app,

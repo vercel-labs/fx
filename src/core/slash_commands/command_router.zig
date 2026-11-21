@@ -30,6 +30,7 @@ pub const ParsedCommand = union(enum) {
     usage,
     undo,
     mcp: []const u8,
+    hook: []const u8,
     skills: []const u8,
     copy,
     feedback,
@@ -76,6 +77,7 @@ pub const CommandHandlers = struct {
     show_usage: *const fn (ctx: *anyopaque) anyerror!void,
     undo_last: *const fn (ctx: *anyopaque) anyerror!void,
     handle_mcp: *const fn (ctx: *anyopaque, rest: []const u8) anyerror!void,
+    handle_hook: *const fn (ctx: *anyopaque, rest: []const u8) anyerror!void,
     handle_skills: *const fn (ctx: *anyopaque, rest: []const u8) anyerror!void,
     copy_last: *const fn (ctx: *anyopaque) anyerror!void,
     submit_feedback: *const fn (ctx: *anyopaque) anyerror!void,
@@ -126,6 +128,7 @@ fn parsedCommand(kind: SlashKind, payload: []const u8) ParsedCommand {
         .usage => .usage,
         .undo => .undo,
         .mcp => .{ .mcp = payload },
+        .hook => .{ .hook = payload },
         .skills => .{ .skills = payload },
         .copy => .copy,
         .feedback => .feedback,
@@ -196,6 +199,7 @@ pub fn route(registry: SlashRegistry, handlers: *const CommandHandlers, cmd: []c
         .usage => try handlers.show_usage(handlers.ctx),
         .undo => try handlers.undo_last(handlers.ctx),
         .mcp => |rest| try handlers.handle_mcp(handlers.ctx, rest),
+        .hook => |rest| try handlers.handle_hook(handlers.ctx, rest),
         .skills => |rest| try handlers.handle_skills(handlers.ctx, rest),
         .copy => try handlers.copy_last(handlers.ctx),
         .feedback => try handlers.submit_feedback(handlers.ctx),
@@ -304,6 +308,17 @@ test "parse extracts image commands" {
     }
     switch (parse(testSlashRegistry(), "/images clear")) {
         .images => |rest| try std.testing.expectEqualStrings("clear", rest),
+        else => return error.TestExpectedEqual,
+    }
+}
+
+test "parse routes hook and its alias to the hook command" {
+    switch (parse(testSlashRegistry(), "/hook")) {
+        .hook => |rest| try std.testing.expectEqualStrings("", rest),
+        else => return error.TestExpectedEqual,
+    }
+    switch (parse(testSlashRegistry(), "/hooks trust lint")) {
+        .hook => |rest| try std.testing.expectEqualStrings("trust lint", rest),
         else => return error.TestExpectedEqual,
     }
 }
@@ -539,6 +554,7 @@ fn testHandlers(ctx: *TestContext) CommandHandlers {
         .show_usage = unexpectedNoPayload,
         .undo_last = unexpectedNoPayload,
         .handle_mcp = unexpectedPayload,
+        .handle_hook = unexpectedPayload,
         .handle_skills = unexpectedPayload,
         .copy_last = unexpectedNoPayload,
         .submit_feedback = unexpectedNoPayload,

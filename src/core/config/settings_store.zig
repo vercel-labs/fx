@@ -117,6 +117,7 @@ pub const UserSettingsPatch = struct {
     notification_turn_end: ?bool = null,
     notification_attention_required: ?bool = null,
     notification_max: ?bool = null,
+    experimental_hooks: ?bool = null,
     /// `light`, `dark`, or a theme file name under ~/.fx/themes.
     theme: ?[]const u8 = null,
     auto_upgrade: ?bool = null,
@@ -153,6 +154,7 @@ pub const UserSettingsPatch = struct {
             self.notification_turn_end == null and
             self.notification_attention_required == null and
             self.notification_max == null and
+            self.experimental_hooks == null and
             self.theme == null and
             self.auto_upgrade == null and
             self.max_agent_steps == null and
@@ -1293,6 +1295,17 @@ fn applyUserPatchToRoot(
             break :blk root.object.getPtr("prompt_history").?;
         };
         application.changed = try putBool(arena, &prompt_history.object, "enabled", enabled) or application.changed;
+    }
+
+    if (patch.experimental_hooks) |enabled| {
+        var experimental = if (root.object.getPtr("experimental")) |value| blk: {
+            if (value.* != .object) return error.InvalidSettingsFormat;
+            break :blk value;
+        } else blk: {
+            try root.object.put(arena, "experimental", .{ .object = .empty });
+            break :blk root.object.getPtr("experimental").?;
+        };
+        application.changed = try putBool(arena, &experimental.object, "hooks", enabled) or application.changed;
     }
 
     if (patch.statusline_item) |item_patch| {
@@ -2528,6 +2541,7 @@ test "user patch writes user preferences at top level" {
         .statusline_item = .{ .item = .context, .enabled = true },
         .notification_turn_end = true,
         .notification_attention_required = false,
+        .experimental_hooks = true,
     });
     defer outcome.deinit(alloc);
 
@@ -2548,6 +2562,7 @@ test "user patch writes user preferences at top level" {
     try std.testing.expect(std.mem.find(u8, bytes, "\"prompt_history\":{\"enabled\":false}") != null);
     try std.testing.expect(std.mem.find(u8, bytes, "\"status_line\":{\"context\":true}") != null);
     try std.testing.expect(std.mem.find(u8, bytes, "\"sound\":{\"turn_end\":true,\"attention_required\":false}") != null);
+    try std.testing.expect(std.mem.find(u8, bytes, "\"experimental\":{\"hooks\":true}") != null);
     try std.testing.expect(std.mem.find(u8, bytes, "statusLine") == null);
     try std.testing.expect(std.mem.find(u8, bytes, "notifications") == null);
     try std.testing.expect(std.mem.find(u8, bytes, "\"future\":{\"nested\":7}") != null);
@@ -2760,6 +2775,44 @@ test "notification user patch preserves sibling fields and valid workspace overr
     try std.testing.expectEqual(false, workspace_notifications.get("turn_end").?.bool);
     try std.testing.expectEqual(false, workspace_notifications.get("attention_required").?.bool);
     try std.testing.expectEqual(@as(i64, 8), workspace_notifications.get("future").?.integer);
+}
+
+test "experimental user patch writes the switch and removes it on unset" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try writeStoreFixture(tmp.dir, "home/.fx/settings.json", "{\"experimental\":{\"future\":1}}\n");
+
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home);
+    var store = try Store.initFromHome(alloc, home, .writable);
+    defer store.deinit(alloc);
+
+    var outcome = try store.applyUserPatch(alloc, .{ .experimental_hooks = true });
+    defer outcome.deinit(alloc);
+    try std.testing.expect(outcome == .committed);
+    try std.testing.expectEqual(@as(usize, 0), outcome.committed.cleanup.fields_removed);
+
+    const bytes = try store.readPrimaryForTest(alloc);
+    defer alloc.free(bytes);
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, bytes, .{});
+    defer parsed.deinit();
+    const experimental = parsed.value.object.get("experimental").?.object;
+    try std.testing.expectEqual(true, experimental.get("hooks").?.bool);
+    try std.testing.expectEqual(@as(i64, 1), experimental.get("future").?.integer);
+
+    var removed = try store.applyUserPatch(alloc, .{ .remove = "experimental.hooks" });
+    defer removed.deinit(alloc);
+    try std.testing.expect(removed == .committed);
+
+    const after = try store.readPrimaryForTest(alloc);
+    defer alloc.free(after);
+    const after_parsed = try std.json.parseFromSlice(std.json.Value, alloc, after, .{});
+    defer after_parsed.deinit();
+    const after_experimental = after_parsed.value.object.get("experimental").?.object;
+    try std.testing.expect(after_experimental.get("hooks") == null);
+    try std.testing.expectEqual(@as(i64, 1), after_experimental.get("future").?.integer);
 }
 
 test "user patch snapshots and removes legacy workspace copies" {

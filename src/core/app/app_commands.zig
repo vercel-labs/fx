@@ -4,6 +4,8 @@ const agents = @import("../agents/agents.zig");
 const runtime_profile = @import("../hosts/runtime_profile.zig");
 const app_permission_runtime = @import("app_permission_runtime.zig");
 const app_session_runtime = @import("app_session_runtime.zig");
+const app_agent_runtime = @import("app_agent_runtime.zig");
+const app_hook_gate_runtime = @import("app_hook_gate_runtime.zig");
 const session_display_metadata = @import("../session/session_display_metadata.zig");
 const app_bootstrap_runtime = @import("app_bootstrap_runtime.zig");
 const io_mod = @import("../shared/io.zig");
@@ -37,12 +39,18 @@ const skill_runtime = @import("../skills/skill_runtime.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const trace_report = @import("trace_report.zig");
 const session_commands = @import("../session/session_commands.zig");
+// The on/off helpers the settings menu, the statusline, and the typed commands share (app_agent_runtime.zig).
+const onOffText = app_agent_runtime.onOffText;
+const previousOnOff = app_agent_runtime.previousOnOff;
+const holdOnOffSetting = app_agent_runtime.holdOnOffSetting;
 const info_panel = @import("../input/info_panel.zig");
 const usage = @import("../../usage/usage.zig");
 const usage_host = @import("usage_host.zig");
 const types = @import("../shared/types.zig");
 const worker_runtime = @import("../agent/worker_runtime.zig");
 const transcript_runtime = @import("../../ui/transcript/runtime.zig");
+const hook_verbs = @import("../cli/hook_verbs.zig");
+const command_lex = @import("../shell_command/command_lex.zig");
 const test_builtin_skills = if (@import("builtin").is_test)
     @import("../../builtins/skills.zig")
 else
@@ -305,6 +313,7 @@ pub fn Handlers(comptime App: type) type {
                 .show_usage = commandShowUsage,
                 .undo_last = commandUndoLast,
                 .handle_mcp = commandHandleMcp,
+                .handle_hook = commandHandleHook,
                 .handle_skills = commandHandleSkills,
                 .copy_last = commandCopyLast,
                 .submit_feedback = commandSubmitFeedback,
@@ -339,6 +348,34 @@ pub fn Handlers(comptime App: type) type {
             if (comptime agents.hasAgentField(App, "session_persistence")) {
                 agent.session_persistence.session_picker.active = false;
             }
+        }
+
+        /// Applies or shows a finished hook check (R2.1). Each kind finishes where its change is applied. The tick calls it,
+        /// after the `/hook` job.
+        pub fn collectHookGateFacts(app: *App) !void {
+            if (comptime !@hasField(App, "hook_gate")) return;
+            var taken = app.hook_gate.take() orelse return;
+            defer taken.deinit();
+            switch (taken.change) {
+                .permission_mode => try app_permission_runtime.Runtime(App).finishGatedChange(app, &taken),
+                .setting => try finishGatedSetting(app, &taken),
+                .model => try session_commands.Commands(App).finishGatedModelChange(app, &taken),
+                .model_switched => session_commands.Commands(App).finishObservedSwitch(app, &taken),
+            }
+            app.shell.render_requests.request(.footer);
+        }
+
+        /// Shows what a finished `/hook` job printed, as the verbs always printed it in the transcript. The tick calls it.
+        pub fn collectHookVerbFacts(app: *App) !void {
+            if (comptime !@hasField(App, "hook_job")) return;
+            const output = app.hook_job.finished() orelse return;
+            defer app.hook_job.finish();
+            try writeHookNotices(app, output.out, .neutral);
+            try writeHookNotices(app, output.err, .warning);
+            if (output.cancelled) {
+                try app.writeDomainNotice(.{ .topic = "hook", .tone = .warning, .body = "/hook test was cancelled. Its hooks were stopped." }, true);
+            }
+            app.shell.render_requests.request(.footer);
         }
 
         pub fn collectMcpHostFacts(app: *App, agent: *AppAgent) !void {
@@ -962,6 +999,77 @@ pub fn Handlers(comptime App: type) type {
                 .tone = .neutral,
                 .body = msg,
             }, true);
+        }
+
+        fn commandHandleHook(ctx: *anyopaque, rest: []const u8) !void {
+            if (comptime !@hasField(App, "user_hooks")) return;
+            const app: *App = @ptrCast(@alignCast(ctx));
+            if (comptime !runtime_profile.allows(App, .hooks)) {
+                try app.writeDomainNotice(.{
+                    .topic = "hook",
+                    .tone = .warning,
+                    .body = "Hooks are unavailable in this host.",
+                }, true);
+                return;
+            }
+            try runHookVerbs(app, rest);
+        }
+
+        /// Runs the `fx hook` verbs, the same code the CLI runs, and shows what they print in the transcript:
+        /// each stdout line as a neutral notice, each stderr line as a warning. `/hook` alone lists the hooks.
+        fn runHookVerbs(app: *App, rest: []const u8) !void {
+            const alloc = app.alloc;
+            var argv = command_lex.tokenize_argv(alloc, std.mem.trim(u8, rest, " \t")) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => {
+                    try app.writeDomainNotice(.{
+                        .topic = "hook",
+                        .tone = .warning,
+                        .body = "/hook: that command line has an unmatched quote or a character fx doesn't take here.",
+                    }, true);
+                    return;
+                },
+            };
+            defer argv.deinit(alloc);
+            const words = try alloc.alloc([:0]const u8, argv.tokens.len);
+            defer alloc.free(words);
+            var copied: usize = 0;
+            defer for (words[0..copied]) |word| alloc.free(word);
+            for (argv.tokens, words) |token, *word| {
+                const copy = try alloc.allocSentinel(u8, token.value.len, 0);
+                @memcpy(copy, token.value);
+                word.* = copy;
+                copied += 1;
+            }
+            const list_words = [_][:0]const u8{"list"};
+            const run_words: []const [:0]const u8 = if (words.len == 0) &list_words else words;
+
+            // The verbs run on their own thread, and the tick shows what they print (collectHookVerbFacts).
+            if (app.hook_job.running()) {
+                const body = if (app.hook_job.cancelable())
+                    "/hook test is still running. Press Esc twice to stop it."
+                else
+                    "A /hook command is still running. Wait for it to finish.";
+                try app.writeDomainNotice(.{ .topic = "hook", .tone = .warning, .body = body }, true);
+                return;
+            }
+            try app.hook_job.start(io_mod.homeDir(), app.workspace_root, hooksEnabled(app), run_words);
+            app.shell.render_requests.request(.footer);
+        }
+
+        /// Whether this app runs hooks: the `experimental.hooks` setting that `fx hook list` reads.
+        fn hooksEnabled(app: *App) bool {
+            if (app.user_hooks) |*hooks_runtime| return hooks_runtime.enabled;
+            return false;
+        }
+
+        /// Shows each non-empty line of a `/hook` result as one notice in the transcript.
+        fn writeHookNotices(app: *App, text: []const u8, tone: types.NoticeTone) !void {
+            var lines = std.mem.splitScalar(u8, text, '\n');
+            while (lines.next()) |line| {
+                if (line.len == 0) continue;
+                try app.writeDomainNotice(.{ .topic = "hook", .tone = tone, .body = line }, true);
+            }
         }
 
         fn commandHandleMcp(ctx: *anyopaque, rest: []const u8) !void {
@@ -1769,6 +1877,15 @@ fn statuslineItemForSetting(setting: settings_catalog.SettingId) ?config_runtime
     };
 }
 
+/// The setting a statusline item is.
+fn statuslineSetting(item: config_runtime.StatuslineItem) settings_catalog.SettingId {
+    return switch (item) {
+        .context => .statusline_context,
+        .session => .statusline_session,
+        .workspace => .statusline_workspace,
+    };
+}
+
 fn statuslineItemEnabled(app: anytype, item: config_runtime.StatuslineItem) bool {
     const App = @TypeOf(app.*);
     return switch (item) {
@@ -1800,6 +1917,23 @@ fn applyStatuslineItem(
     enabled: bool,
     feedback: StatuslineFeedback,
 ) !void {
+    // Every statusline write passes here, so one check covers the settings menu and the command.
+    if (enabled != statuslineItemEnabled(app, item)) {
+        const text = onOffText(enabled);
+        if (try app_agent_runtime.holdScreenConfigChange(app, .{
+            .setting = statuslineSetting(item),
+            .source = "settings",
+            .old_value = previousOnOff(enabled),
+            .new_value = text,
+            .value = text,
+            .feedback = if (feedback == .silent) .silent else .announce,
+        })) return;
+    }
+    try applyStatuslineItemNow(app, item, enabled, feedback);
+}
+
+/// The statusline write itself, once no hook holds it: sets the item, saves it, and reports it as `feedback` says.
+fn applyStatuslineItemNow(app: anytype, item: config_runtime.StatuslineItem, enabled: bool, feedback: StatuslineFeedback) !void {
     const runtime_changed = assignStatuslineItem(app, item, enabled);
     const patch: config_runtime.UserSettingsPatch = .{
         .statusline_item = .{ .item = item, .enabled = enabled },
@@ -1883,6 +2017,24 @@ fn handleNotificationsCommand(app: anytype, rest: []const u8) !void {
     const runtime_changed = sound_on != current.turn_end or
         sound_on != current.attention_required or
         max != current.max;
+    // Only a change to the sound levels asks the hooks. The old level is the one the preferences show.
+    const previous: SoundLevel = if (!current.turn_end) .off else if (current.max) .max else .on;
+    if (runtime_changed and try app_agent_runtime.holdScreenConfigChange(app, .{
+        .setting = .sound_level,
+        .source = "settings",
+        .old_value = @tagName(previous),
+        .new_value = @tagName(level),
+        .value = @tagName(level),
+    })) return;
+    try applySoundLevelNow(app, level);
+}
+
+/// The sound level itself, once no hook holds it: sets the notification preferences, saves them, and names the level.
+fn applySoundLevelNow(app: anytype, level: SoundLevel) !void {
+    const sound_on = level != .off;
+    const max = level == .max;
+    const current = app.notificationPreferences();
+    const runtime_changed = sound_on != current.turn_end or sound_on != current.attention_required or max != current.max;
     app.setNotificationPreferences(sound_on, sound_on, max);
 
     const patch: config_runtime.UserSettingsPatch = .{
@@ -2010,50 +2162,18 @@ pub fn applySettingsCatalogChange(app: anytype, change: settings_catalog.Change)
         },
         .collapse_tool_calls => {
             const enabled = parseOnOff(change.value) orelse return error.InvalidSettingsCatalogValue;
-            const runtime_changed = enabled != app.shell.collapse_tool_calls;
-            if (runtime_changed) {
-                app.shell.collapse_tool_calls = enabled;
-                app.shell.markTranscriptStructureDirty();
-                app.shell.render_requests.request(.transcript);
-            }
-            try persistUserPreferences(
-                app,
-                "collapse tool calls",
-                .{ .collapse_tool_calls = enabled },
-                runtime_changed,
-            );
+            if (enabled != app.shell.collapse_tool_calls and try holdOnOffSetting(app, change.setting, enabled)) return;
+            try applyCollapseToolCallsNow(app, enabled);
         },
         .slash_menu_categories => {
             const enabled = parseOnOff(change.value) orelse return error.InvalidSettingsCatalogValue;
-            const runtime_changed = enabled != app.input_runtime.slash_menu_categories;
-            if (runtime_changed) {
-                app.input_runtime.slash_menu_categories = enabled;
-                app.shell.render_requests.request(.footer);
-            }
-            try persistUserPreferences(
-                app,
-                "slash menu categories",
-                .{ .slash_menu_categories = enabled },
-                runtime_changed,
-            );
+            if (enabled != app.input_runtime.slash_menu_categories and try holdOnOffSetting(app, change.setting, enabled)) return;
+            try applySlashMenuCategoriesNow(app, enabled);
         },
         .session_titles => {
             const enabled = parseOnOff(change.value) orelse return error.InvalidSettingsCatalogValue;
-            const ChangeApp = @TypeOf(app.*);
-            const current = if (comptime @hasField(ChangeApp, "session_title_generation"))
-                app.session_title_generation
-            else
-                true;
-            const runtime_changed = enabled != current;
-            if (comptime @hasField(ChangeApp, "session_title_generation")) {
-                if (runtime_changed) app.session_title_generation = enabled;
-            }
-            try persistUserPreferences(
-                app,
-                "session titles",
-                .{ .session_titles = enabled },
-                runtime_changed,
-            );
+            if (enabled != sessionTitlesEnabled(app) and try holdOnOffSetting(app, change.setting, enabled)) return;
+            try applySessionTitlesNow(app, enabled);
         },
         .effort => {
             const effort = types.ReasoningEffort.parseDisplayLabel(change.value) orelse
@@ -2072,31 +2192,131 @@ pub fn applySettingsCatalogChange(app: anytype, change: settings_catalog.Change)
         },
         .fast_mode => {
             const enabled = parseOnOff(change.value) orelse return error.InvalidSettingsCatalogValue;
-            if (enabled != app.fast_mode) try session_commands.Commands(@TypeOf(app.*)).toggleFast(app, agents.screenAgentOf(app));
+            try session_commands.Commands(@TypeOf(app.*)).setFastMode(app, agents.screenAgentOf(app), enabled);
         },
         .ultrafast_mode => {
             const enabled = parseOnOff(change.value) orelse return error.InvalidSettingsCatalogValue;
-            if (enabled != agents.screenAgentOf(app).worker.agent_turn_settings.ultrafast_mode) {
-                try session_commands.Commands(@TypeOf(app.*)).handleUltrafast(
-                    app,
-                    agents.screenAgentOf(app),
-                    if (enabled) "on" else "off",
-                );
-            }
+            try session_commands.Commands(@TypeOf(app.*)).setUltrafastMode(app, agents.screenAgentOf(app), enabled);
         },
         .permission_mode => try session_commands.Commands(@TypeOf(app.*)).handlePermissions(app, agents.screenAgentOf(app), change.value),
         .sound_level => try handleNotificationsCommand(app, change.value),
         .startup_scrollback => {
             const enabled = parseOnOff(change.value) orelse return error.InvalidSettingsCatalogValue;
-            try session_commands.Commands(@TypeOf(app.*)).handleSettings(
-                app,
-                if (enabled) "startup-scrollback on" else "startup-scrollback off",
-            );
-            var settings = config_runtime.loadMergedSettings(app.alloc, app.workspace_root) catch return;
-            defer settings.deinit(app.alloc);
-            app.input_runtime.settings_menu.startup_scrollback = settings.startup_scrollback orelse true;
+            if (try session_commands.Commands(@TypeOf(app.*)).holdStartupScrollback(app, enabled)) return;
+            try applyStartupScrollbackNow(app, enabled);
         },
         .prompt_history => try session_commands.Commands(@TypeOf(app.*)).handleHistory(app, change.value),
+    }
+}
+
+fn onOffValue(value: []const u8) !bool {
+    return parseOnOff(value) orelse error.InvalidSettingsCatalogValue;
+}
+
+// The apply step of each on/off setting, once no hook holds it. The synchronous path and the gate's finish both call these.
+
+fn applyCollapseToolCallsNow(app: anytype, enabled: bool) !void {
+    const runtime_changed = enabled != app.shell.collapse_tool_calls;
+    if (runtime_changed) {
+        app.shell.collapse_tool_calls = enabled;
+        app.shell.markTranscriptStructureDirty();
+        app.shell.render_requests.request(.transcript);
+    }
+    try persistUserPreferences(app, "collapse tool calls", .{ .collapse_tool_calls = enabled }, runtime_changed);
+}
+
+fn applySlashMenuCategoriesNow(app: anytype, enabled: bool) !void {
+    const runtime_changed = enabled != app.input_runtime.slash_menu_categories;
+    if (runtime_changed) {
+        app.input_runtime.slash_menu_categories = enabled;
+        app.shell.render_requests.request(.footer);
+    }
+    try persistUserPreferences(app, "slash menu categories", .{ .slash_menu_categories = enabled }, runtime_changed);
+}
+
+/// Whether session titles are on. An App without that setting always titles its sessions.
+fn sessionTitlesEnabled(app: anytype) bool {
+    if (comptime @hasField(@TypeOf(app.*), "session_title_generation")) return app.session_title_generation;
+    return true;
+}
+
+fn applySessionTitlesNow(app: anytype, enabled: bool) !void {
+    const runtime_changed = enabled != sessionTitlesEnabled(app);
+    if (comptime @hasField(@TypeOf(app.*), "session_title_generation")) {
+        if (runtime_changed) app.session_title_generation = enabled;
+    }
+    try persistUserPreferences(app, "session titles", .{ .session_titles = enabled }, runtime_changed);
+}
+
+fn applyFastSettingNow(app: anytype, enabled: bool) !void {
+    if (enabled != app.fast_mode) try session_commands.Commands(@TypeOf(app.*)).applyFastChange(app, agents.screenAgentOf(app), enabled);
+}
+
+fn applyUltrafastSettingNow(app: anytype, enabled: bool) !void {
+    if (enabled != agents.screenAgentOf(app).worker.agent_turn_settings.ultrafast_mode) {
+        try session_commands.Commands(@TypeOf(app.*)).applyUltrafastChange(app, agents.screenAgentOf(app), enabled);
+    }
+}
+
+fn applyStartupScrollbackNow(app: anytype, enabled: bool) !void {
+    try session_commands.Commands(@TypeOf(app.*)).saveStartupScrollbackSetting(app, enabled);
+    var settings = config_runtime.loadMergedSettings(app.alloc, app.workspace_root) catch return;
+    defer settings.deinit(app.alloc);
+    app.input_runtime.settings_menu.startup_scrollback = settings.startup_scrollback orelse true;
+}
+
+/// Applies or shows a finished ConfigChange check for a setting (R2.1). The setting applies only when the screen and its
+/// session are the ones it was made for and no hook refused it. A model pick's effort, once allowed, changes its model too.
+pub fn finishGatedSetting(app: anytype, taken: *app_hook_gate_runtime.Taken) !void {
+    const Notices = app_permission_runtime.Runtime(@TypeOf(app.*));
+    if (!app_agent_runtime.gatedTargetIsCurrent(app, taken)) {
+        debug_trace.logf("hooks", "dropped the setting change: the screen or the session changed while its hook check ran", .{});
+        Notices.writeChangeNotice(app, "The setting change was dropped: the session changed while its hooks ran.");
+        return;
+    }
+    switch (taken.result.outcome) {
+        .allowed => {},
+        .refused => Notices.writeChangeNotice(app, taken.result.refusal orelse "A hook refused this setting change."),
+        .cancelled => Notices.writeChangeNotice(app, "The setting change was cancelled. Its hooks were stopped."),
+    }
+    app_agent_runtime.showHookNotices(app, taken.result.notices, "ConfigChange");
+    if (taken.result.outcome != .allowed) return;
+    const change = taken.change.setting;
+    if (change.picked) |pick| {
+        // An effort check continues the pick to its speed check and then the model. A speed check goes straight to the model.
+        const effort = change.effort orelse return error.MissingPickedEffort;
+        if (change.setting == .effort) {
+            return session_commands.Commands(@TypeOf(app.*)).continuePickedModel(app, agents.screenAgentOf(app), pick, effort);
+        }
+        return session_commands.Commands(@TypeOf(app.*)).startPickedModel(app, agents.screenAgentOf(app), pick, effort);
+    }
+    try applySettingFromGate(app, change);
+}
+
+/// The apply step of a setting after its hooks allowed it: the same steps the synchronous path takes.
+fn applySettingFromGate(app: anytype, change: app_hook_gate_runtime.SettingChange) !void {
+    switch (change.setting) {
+        .statusline_context, .statusline_session, .statusline_workspace => try applyStatuslineItemNow(
+            app,
+            statuslineItemForSetting(change.setting).?,
+            try onOffValue(change.value),
+            if (change.feedback == .silent) .silent else .announce,
+        ),
+        .sound_level => try applySoundLevelNow(app, parseSoundLevel(change.value) orelse return error.InvalidSettingsCatalogValue),
+        .collapse_tool_calls => try applyCollapseToolCallsNow(app, try onOffValue(change.value)),
+        .slash_menu_categories => try applySlashMenuCategoriesNow(app, try onOffValue(change.value)),
+        .session_titles => try applySessionTitlesNow(app, try onOffValue(change.value)),
+        .fast_mode => try applyFastSettingNow(app, try onOffValue(change.value)),
+        .ultrafast_mode => try applyUltrafastSettingNow(app, try onOffValue(change.value)),
+        .startup_scrollback => try applyStartupScrollbackNow(app, try onOffValue(change.value)),
+        .prompt_history => try session_commands.Commands(@TypeOf(app.*)).applyHistoryNow(app, try onOffValue(change.value)),
+        .effort => try session_commands.Commands(@TypeOf(app.*)).applyEffortChange(
+            app,
+            agents.screenAgentOf(app),
+            change.effort orelse return error.MissingEffort,
+            change.feedback,
+        ),
+        .permission_mode, .model => unreachable,
     }
 }
 

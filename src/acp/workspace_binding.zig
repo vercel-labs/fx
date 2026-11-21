@@ -9,6 +9,7 @@
 
 const std = @import("std");
 const server = @import("server.zig");
+const host_target = @import("../core/hosts/target.zig");
 const app_runtime_setup = @import("../core/app/app_runtime_setup.zig");
 const builtin_skills = @import("../builtins/skills.zig");
 const config_runtime = @import("../core/config/config_runtime.zig");
@@ -130,6 +131,11 @@ pub fn commit(state: *server.ServerState, binding: *Binding) Allocator.Error!voi
     if (state.workspace_root.len > 0) state.alloc.free(state.workspace_root);
     state.workspace_root = binding.root;
     binding.root = &.{};
+    if (comptime !host_target.is_wasm) {
+        if (state.user_hooks) |*rt| rt.setWorkspace(state.workspace_root) catch |err| {
+            debug_trace.logf("hooks", "could not move hooks to the new workspace: {s}", .{@errorName(err)});
+        };
+    }
     state.workspace_access.deinit(state.alloc);
     state.workspace_access = binding.access;
     binding.access = .{};

@@ -134,6 +134,44 @@ pub const replay_options = [_]command_specs.OptionDoc{
     json_option,
 };
 
+/// `fx hook` options for list, show, enable, and disable: `--json` only.
+pub const hook_options = [_]command_specs.OptionDoc{json_option};
+
+/// `--all` for `fx hook trust`: every hook that waits for trust.
+const hook_all_option = command_specs.OptionDoc{ .flag = "--all", .description = "Trust every hook that waits for trust" };
+
+/// `fx hook trust` options.
+const hook_trust_options = [_]command_specs.OptionDoc{ json_option, hook_all_option };
+
+/// `--match <value>` for `fx hook test`: the tool name, trigger, or other value hooks match on.
+const hook_match_option = command_specs.OptionDoc{ .flag = "--match <value>", .description = "Tool name, trigger, or other value the hooks match on" };
+
+/// `--input <json>` for `fx hook test`: a JSON object whose keys become the event's fields.
+const hook_input_option = command_specs.OptionDoc{ .flag = "--input <json>", .description = "JSON object whose keys become the event's fields" };
+
+/// `fx hook test` options.
+const hook_test_options = [_]command_specs.OptionDoc{ hook_match_option, hook_input_option, json_option };
+
+/// `--limit <n>` for `fx hook log`: how many recent runs to show.
+const hook_limit_option = command_specs.OptionDoc{ .flag = "--limit <n>", .description = "Most recent runs to show, at least 1 (default 20)" };
+
+/// `fx hook log` options.
+const hook_log_options = [_]command_specs.OptionDoc{ hook_limit_option, json_option };
+
+/// Every flag the `fx hook` parser reads. Each subcommand offers only its own.
+pub const hook_parse_options = [_]command_specs.OptionDoc{ json_option, hook_all_option, hook_match_option, hook_input_option, hook_limit_option };
+
+/// `fx hook` subcommands. `ls` names the list action and is not listed.
+const hook_subcommands = [_]command_specs.SubcommandDoc{
+    .{ .usage = "list", .description = "List the hooks for this workspace and whether each runs", .options = &hook_options },
+    .{ .usage = "show ID", .description = "Show one hook: its event, matcher, command, file, and trust", .options = &hook_options },
+    .{ .usage = "trust ID", .description = "Trust a hook so it runs; --all trusts every hook waiting for trust", .options = &hook_trust_options },
+    .{ .usage = "enable ID", .description = "Let a disabled hook run again in this workspace", .options = &hook_options },
+    .{ .usage = "disable ID", .description = "Stop a hook from running in this workspace", .options = &hook_options },
+    .{ .usage = "test EVENT", .description = "Run the hooks for an event on a sample input and show what they answered; the hook commands really run", .options = &hook_test_options },
+    .{ .usage = "log", .description = "Show the most recent hook runs: the event, how many hooks ran, and what they decided", .options = &hook_log_options },
+};
+
 /// `fx mcp list` options; `fx mcp --help` shows them in its usage line.
 const mcp_subcommands = [_]command_specs.SubcommandDoc{
     .{ .usage = "list", .description = "List configured servers; never connects", .options = &mcp_list_options },
@@ -344,6 +382,14 @@ pub const top_level_specs = [_]TopLevelSpec{
         .subcommands = &mcp_subcommands,
     },
     .{
+        .kind = .hook,
+        .token = "hook",
+        .aliases = &.{"hooks"},
+        .usage = "hook <command> ...",
+        .summary = "List, show, trust, enable, and disable hooks without opening the interactive shell",
+        .subcommands = &hook_subcommands,
+    },
+    .{
         .kind = .models,
         .token = "models",
         .usage = "models [ls] [--json]",
@@ -523,6 +569,7 @@ pub const top_level_help_groups = [_]TopLevelHelpGroup{
         .{ .kind = .status, .usage = "status" },
         .{ .kind = .doctor, .usage = "doctor" },
         .{ .kind = .mcp, .usage = "mcp <command> ..." },
+        .{ .kind = .hook, .usage = "hook <command> ..." },
         .{ .kind = .slack, .usage = "slack <install|status|refresh>" },
         .{ .kind = .permissions, .usage = "permissions" },
         .{ .kind = .workspace, .usage = "workspace" },
@@ -745,6 +792,7 @@ pub const slash_specs = [_]SlashSpec{
     .{ .kind = .allowlist, .command = "/allowlist", .help_entry = "/allowlist [view [effective|workspace|global]|[workspace|global] add|remove|reset ...]", .completion_description = "manage trusted commands, tools, and URLs", .presentation_category = .security, .show_in_welcome = true, .has_args = true, .accepts_payload = true },
     .{ .kind = .undo, .command = "/undo", .help_entry = "/undo", .completion_description = "undo the latest tracked file operation", .presentation_category = .session },
     .{ .kind = .mcp, .command = "/mcp", .help_entry = "/mcp [list|show|add|remove|login|logout|approve|reject]", .completion_description = "manage MCP servers and their logins", .presentation_category = .extensions, .has_args = true, .accepts_payload = true },
+    .{ .kind = .hook, .command = "/hook", .aliases = &.{"/hooks"}, .help_entry = "/hook [list|show|trust|enable|disable|test|log]", .completion_description = "list, trust, and test hooks", .presentation_category = .extensions, .has_args = true, .accepts_payload = true },
     .{ .kind = .skills, .command = "/skills", .help_entry = "/skills [list|add|install|show|create|remove|path] [name|url|path] ($ opens skill search)", .completion_description = "browse and manage skills", .presentation_category = .extensions, .has_args = true, .accepts_payload = true },
     .{ .kind = .copy, .command = "/copy", .help_entry = "/copy", .completion_description = "copy the last assistant response", .presentation_category = .session },
     .{ .kind = .feedback, .command = "/feedback", .help_entry = "/feedback", .completion_description = "open the fx feedback form", .presentation_category = .product, .show_in_welcome = true },
@@ -859,6 +907,7 @@ test "built-in slash commands register exact active order" {
         "/allowlist",
         "/undo",
         "/mcp",
+        "/hook",
         "/skills",
         "/copy",
         "/feedback",
