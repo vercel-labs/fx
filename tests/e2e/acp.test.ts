@@ -11678,6 +11678,56 @@ describe("acp: model-independent", () => {
   );
 
   test(
+    "ACP rejects a Codex subagent model missing from the catalog before running it",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-codex-subagent-model-");
+      const callId = "acp_codex_subagent_model";
+      const model = "fixture-missing-model";
+      let toolOutput = "";
+      const gateway = startFakeGateway([]);
+      const codex = startAcpFakeCodex({
+        route(body) {
+          const toolResult = codexLatestToolResult(body);
+          if (toolResult?.callId === callId) {
+            toolOutput = toolResult.output;
+            return codexFinalText("ACP_CODEX_PARENT_DONE");
+          }
+          if (!body.includes('"name":"subagent"')) return codexFinalText("child done");
+          return codexToolCall(callId, "subagent", {
+            request: { action: "message", agent: "helper", model, message: "Reply with the single word done." },
+          });
+        },
+      });
+      try {
+        writeSeededAcpChatGptLogin(root.home, codex.accessToken);
+        client = await AcpClient.create({
+          cwd: root.workspace,
+          env: {
+            ...fakeGatewayEnv(root, gateway),
+            FX_TEST_OPENAI_CODEX_RESPONSES_URL: codex.responsesUrl,
+            FX_TEST_OPENAI_CODEX_MODELS_URL: codex.modelsUrl,
+          },
+        });
+        await startAutoSession(client);
+        await client.request("session/set_config_option", { configId: "provider", value: "codex" }, 4);
+
+        const result = await runPrompt(client, "Delegate one reply.", TIMEOUT);
+        expect(result.promptResult.result.stopReason).toBe("end_turn");
+        expect(JSON.parse(toolOutput)).toMatchObject({ ok: false, error_code: "unknown_model" });
+        expect(toolOutput).toContain(model);
+        expect(codex.requests.map(({ body }) => JSON.parse(body).model)).not.toContain(model);
+        expect(client.stderr).toBe("");
+      } finally {
+        await client?.close();
+        gateway.stop();
+        codex.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
     "ACP report turn sends the sign-in its first turn refreshed",
     async () => {
       const root = createIsolatedRoot("fx-acp-report-refreshed-sign-in-");
@@ -11687,7 +11737,7 @@ describe("acp: model-independent", () => {
         if (body.includes("Subagent report (untrusted agent output")) return codexFinalText("ACP_REFRESHED_REPORT_TURN");
         if (codexLatestToolResult(body)?.callId === callId) return codexFinalText("ACP_REFRESHED_PARENT_DONE");
         return codexToolCall(callId, "subagent", {
-          request: { action: "message", agent: "helper", message: "Reply with the single word done." },
+          request: { action: "message", agent: "helper", model: "gpt-5.4-mini", message: "Reply with the single word done." },
         });
       };
       const gateway = startFakeGateway([]);
@@ -11712,6 +11762,7 @@ describe("acp: model-independent", () => {
         expect(result.promptResult.result.stopReason).toBe("end_turn");
         expect(JSON.stringify(result.messages)).toContain("ACP_REFRESHED_REPORT_TURN");
         expect(codex.tokenRequests).toHaveLength(1);
+        expect(codex.requests.map(({ body }) => JSON.parse(body).model)).toContain("gpt-5.4-mini");
         const parent = codex.requests.filter((request) => request.body.includes('"name":"subagent"'));
         expect(parent[0]!.authorization).toBe(`Bearer ${codex.accessToken}`);
         const report = parent.find((request) => request.body.includes("Subagent report (untrusted agent output"));
