@@ -32,6 +32,11 @@ var state: State = .{};
 var next_turn_id = std.atomic.Value(u64).init(1);
 var next_step_id = std.atomic.Value(u64).init(1);
 var next_subagent_id = std.atomic.Value(u64).init(1);
+// wasm32 has no 64-bit atomics, and both WebAssembly builds are
+// single-threaded (build.zig), so WASI counts ids in plain integers.
+var next_turn_id_wasi: u64 = 1;
+var next_step_id_wasi: u64 = 1;
+var next_subagent_id_wasi: u64 = 1;
 
 pub fn configureFromEnv(alloc: Allocator, workspace_root: []const u8) void {
     const options = loadOptionsFromEnv(alloc, workspace_root) catch return;
@@ -60,18 +65,24 @@ pub fn activeLogPath() ?[]const u8 {
 }
 
 pub fn nextTurnId() u64 {
-    if (comptime @import("builtin").target.os.tag == .wasi) return 1;
+    if (comptime @import("builtin").target.os.tag == .wasi) return takeWasiId(&next_turn_id_wasi);
     return next_turn_id.fetchAdd(1, .seq_cst);
 }
 
 pub fn nextStepId() u64 {
-    if (comptime @import("builtin").target.os.tag == .wasi) return 1;
+    if (comptime @import("builtin").target.os.tag == .wasi) return takeWasiId(&next_step_id_wasi);
     return next_step_id.fetchAdd(1, .seq_cst);
 }
 
 pub fn nextSubagentId() u64 {
-    if (comptime @import("builtin").target.os.tag == .wasi) return 1;
+    if (comptime @import("builtin").target.os.tag == .wasi) return takeWasiId(&next_subagent_id_wasi);
     return next_subagent_id.fetchAdd(1, .seq_cst);
+}
+
+fn takeWasiId(counter: *u64) u64 {
+    const id = counter.*;
+    counter.* += 1;
+    return id;
 }
 
 pub fn logf(scope: []const u8, comptime fmt: []const u8, args: anytype) void {
@@ -317,6 +328,9 @@ pub fn resetForTest() void {
     next_turn_id.store(1, .seq_cst);
     next_step_id.store(1, .seq_cst);
     next_subagent_id.store(1, .seq_cst);
+    next_turn_id_wasi = 1;
+    next_step_id_wasi = 1;
+    next_subagent_id_wasi = 1;
 }
 
 pub fn configureForTest(alloc: Allocator, path: []const u8) !void {
@@ -590,8 +604,11 @@ test "trace id generators reset for tests" {
     try std.testing.expectEqual(@as(u64, 1), nextTurnId());
     try std.testing.expectEqual(@as(u64, 2), nextTurnId());
     try std.testing.expectEqual(@as(u64, 1), nextStepId());
+    try std.testing.expectEqual(@as(u64, 1), takeWasiId(&next_step_id_wasi));
+    try std.testing.expectEqual(@as(u64, 2), takeWasiId(&next_step_id_wasi));
     resetForTest();
     try std.testing.expectEqual(@as(u64, 1), nextTurnId());
+    try std.testing.expectEqual(@as(u64, 1), takeWasiId(&next_step_id_wasi));
 }
 
 test "redactedJsonPreview reports shape without values" {

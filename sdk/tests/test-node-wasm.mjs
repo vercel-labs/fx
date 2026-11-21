@@ -13,6 +13,7 @@ const termScripts = [
   "test-term-features.mjs",
   "test-term-history.mjs",
   "test-term-workspace.mjs",
+  "test-term-tool-groups.mjs",
   "test-term-agents-md.mjs",
   "test-term-usage.mjs",
 ];
