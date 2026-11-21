@@ -127,6 +127,44 @@ pub const Added = struct {
 
 pub const AddError = wire.DecodeError || std.mem.Allocator.Error;
 
+/// Why fx refused the server's answer to `tools/list`. The set is closed, and `words` gives each its fixed
+/// words, so nothing the server wrote reaches a screen: the host shows them beside a server's status.
+pub const Refusal = enum {
+    /// A JSON-RPC error reply.
+    error_reply,
+    /// A result that is not `complete`, such as `input_required`.
+    not_complete,
+    /// A field of the result is written twice, plain or escaped.
+    repeated_field,
+    /// `tools` is no array.
+    tools_not_a_list,
+    /// The list is nested past what fx reads.
+    too_deep,
+    /// Anything else that is no tool list.
+    unreadable,
+
+    pub fn words(refusal: Refusal) []const u8 {
+        return switch (refusal) {
+            .error_reply => "the server answered the list with an error",
+            .not_complete => "the server's answer was not a finished list",
+            .repeated_field => "a field is written twice",
+            .tools_not_a_list => "\"tools\" is not a list",
+            .too_deep => "the list is nested too deeply",
+            .unreadable => "the answer is not a readable tool list",
+        };
+    }
+};
+
+/// The refusal for a page that `parsePage` or `Store.addPage` could not read.
+pub fn refusalOf(err: wire.DecodeError) Refusal {
+    return switch (err) {
+        error.DuplicateField => .repeated_field,
+        error.NotAnArray => .tools_not_a_list,
+        error.TooDeep => .too_deep,
+        else => .unreadable,
+    };
+}
+
 /// The tool list of one server: the current list, the one being gathered by
 /// a running listing, and the cursor for its next page. The effects of
 /// `core/catalog.zig` say which method to call.
@@ -279,6 +317,40 @@ pub fn suggestsChangedList(call: Call) bool {
 }
 
 const testing = std.testing;
+
+fn refusalOfPage(store: *Store, result: []const u8) !?Refusal {
+    const page = parsePage(result) catch |err| return refusalOf(err);
+    _ = store.addPage(testing.allocator, page) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => |decode| return refusalOf(decode),
+    };
+    return null;
+}
+
+test "a page fx refuses has one of the fixed reasons, whatever the server wrote" {
+    var store: Store = .{};
+    defer store.deinit(testing.allocator);
+    // `tools` that is no list, a field written twice (plain and escaped), a list with a missing `tools`, and text that is no JSON.
+    const cases = [_]struct { []const u8, Refusal }{
+        .{ "{\"tools\":7}", .tools_not_a_list },
+        .{ "{\"tools\":[],\"tools\":[]}", .repeated_field },
+        .{ "{\"tools\":[],\"t\\u006fols\":[]}", .repeated_field },
+        .{ "{\"nextCursor\":null}", .unreadable },
+        .{ "not json", .unreadable },
+        .{ "[]", .unreadable },
+    };
+    for (cases) |case| {
+        const refusal = try refusalOfPage(&store, case[0]);
+        try testing.expectEqual(case[1], refusal.?);
+    }
+    // Every reason has words, and none carries a byte a screen could misread.
+    for (std.enums.values(Refusal)) |refusal| {
+        const words = refusal.words();
+        try testing.expect(words.len > 0 and words.len < 64);
+        for (words) |byte| try testing.expect(byte >= ' ' and byte < 0x7f);
+    }
+    try testing.expectEqual(Refusal.too_deep, refusalOf(error.TooDeep));
+}
 
 test "reads a page: tools, an opaque cursor, and the TTL" {
     const page = try parsePage("{\"tools\":[],\"nextCursor\":\"\",\"ttlMs\":300000}");

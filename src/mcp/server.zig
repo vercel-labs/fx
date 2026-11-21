@@ -311,6 +311,8 @@ pub const Server = struct {
     note: [note_max + 3]u8 = undefined,
     /// What the last page added, for the warning about dropped tools.
     last_added: tools.Added = .{},
+    /// Why the last page fx refused was refused. It means something only while `catalog.refused` holds.
+    list_refusal: tools.Refusal = .error_reply,
 
     // A 2025 session.
     legacy: ?http_legacy.Session = null,
@@ -411,6 +413,12 @@ pub const Server = struct {
 
     pub fn toolList(r: *const Server) *const tools.List {
         return &r.store.current;
+    }
+
+    /// Why fx refused the last list the server answered, in the fixed words of `tools.Refusal`; null when it
+    /// did not. A list that is accepted, and a new process, clear it. An older accepted list is still `toolList`.
+    pub fn listRefusal(r: *const Server) ?[]const u8 {
+        return if (r.catalog.refused) r.list_refusal.words() else null;
     }
 
     /// Starts era detection. Over HTTP the endpoint is the "process".
@@ -1323,14 +1331,31 @@ pub const Server = struct {
 
     fn pageEvent(r: *Server, body: @FieldType(wire.Response, "body")) Error!catalog.Event {
         switch (body) {
-            .failure => |f| return if (f.code == wire.code.invalid_params and r.catalog.pending == .next) .invalid_cursor else .page_failed,
+            .failure => |f| {
+                // A second invalid cursor, after the restart, is a refusal too.
+                r.list_refusal = .error_reply;
+                return if (f.code == wire.code.invalid_params and r.catalog.pending == .next) .invalid_cursor else .page_refused;
+            },
             .result => |res| {
-                if (res.kind != .complete) return .page_failed;
-                const page = tools.parsePage(res.raw) catch return .page_failed;
+                if (res.kind != .complete) {
+                    r.list_refusal = .not_complete;
+                    return .page_refused;
+                }
+                const page = tools.parsePage(res.raw) catch |err| {
+                    r.list_refusal = tools.refusalOf(err);
+                    return .page_refused;
+                };
                 // `x-mcp-header` is a 2026 annotation: a 2025 server's tools
                 // keep theirs unchecked, as nothing projects them.
                 r.store.check_headers = !r.legacyEra();
-                const added = r.store.addPage(r.gpa, page) catch return .page_failed;
+                const added = r.store.addPage(r.gpa, page) catch |err| switch (err) {
+                    // Running out of memory says nothing about what the server sent.
+                    error.OutOfMemory => return .page_failed,
+                    else => |decode| {
+                        r.list_refusal = tools.refusalOf(decode);
+                        return .page_refused;
+                    },
+                };
                 r.last_added = added;
                 return .{ .page_received = .{ .more = page.next_cursor != null, .ttl_ms = page.ttl_ms, .now_ms = r.now() } };
             },

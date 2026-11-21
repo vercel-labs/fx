@@ -271,7 +271,7 @@ fn runState(s: anytype) @TypeOf(s) {
 /// The status fact on a server's screen. Its tool count is beside its
 /// tools' heading and its login is in its choices, so neither repeats here.
 fn statusFact(arena: Allocator, s: menu.Row) ![]const u8 {
-    if (s.status.state == .ready and !s.status.needs_login) return "ready";
+    if (s.status.state == .ready and !s.status.needs_login and s.status.tools_error == null) return "ready";
     return verbs.statusText(arena, runState(s.status));
 }
 
@@ -672,6 +672,11 @@ test "the list says how a server runs; its login shows on its screen" {
     var ready = testStatus("ready", .ready);
     ready.tools = 3;
     try testing.expectEqualStrings("ready", try statusFact(arena.allocator(), .{ .status = ready }));
+    // A ready server whose newest tool list fx refused says so on its screen, and in its row.
+    ready.tools_error = "a field is written twice";
+    try testing.expectEqualStrings("ready, 3 tools, newer list refused", try statusFact(arena.allocator(), .{ .status = ready }));
+    ready.tools = 0;
+    try testing.expectEqualStrings("ready, tool list refused", try statusFact(arena.allocator(), .{ .status = ready }));
 }
 
 test "a server's screen: facts, choices with their commands, then tools" {

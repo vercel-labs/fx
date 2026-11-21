@@ -84,6 +84,9 @@ pub const Status = struct {
     version: ?[]const u8,
     tools: usize,
     last_error: ?[]const u8,
+    /// Why fx refused the last list the server answered (`Server.listRefusal`), in fixed words; null
+    /// when it did not. It is no failure of the server: `phase` and `last_error` do not change.
+    list_refusal: ?[]const u8 = null,
     /// How the last process ended, and the last stdout line that answered
     /// nothing since the server was last ready, until it starts again.
     exit: ?process.Exit,
@@ -213,6 +216,7 @@ pub const Engine = struct {
             .version = if (slot.server) |s| s.protocolVersion() else null,
             .tools = if (slot.server) |s| s.toolList().len() else 0,
             .last_error = slot.last_error,
+            .list_refusal = if (slot.server) |s| s.listRefusal() else null,
             .exit = if (slot.server) |s| s.exitStatus() else null,
             .stray_line = if (slot.server) |s| s.strayLine() else null,
         };

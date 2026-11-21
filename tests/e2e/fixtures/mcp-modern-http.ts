@@ -36,6 +36,7 @@ export type ModernHttpMode =
   | "features_public"
   | "features_stale_read"
   | "features_ttl_expiry"
+  | "list_refused"
   | "mrtr_form"
   | "legacy_session_required"
   | "legacy_json_session_required"
@@ -398,6 +399,13 @@ export function startModernMcpHttpFixture(
           cursor: message.params?.cursor,
           sentAtMs: performance.now(),
         });
+      }
+      if (mode === "list_refused" && message.method === "tools/list") {
+        // `tools` written twice, the second with an escape: fx refuses the list.
+        return new Response(
+          `{"jsonrpc":"2.0","id":${message.id},"result":{"resultType":"complete","tools":[],"t\\u006fols":[]}}`,
+          { headers: { "content-type": "application/json" } },
+        );
       }
       if (
         mode === "bad_request_result" &&
