@@ -69,6 +69,9 @@ jobs:
       - name: Check the JavaScript engine against its release
         run: ./scripts/quickjs-fork.sh check
 
+      - name: Test the JavaScript engine's patch script
+        run: ./scripts/quickjs-fork-test.sh
+
       - name: Model-check request recovery
         run: |
           set -euo pipefail
@@ -1062,6 +1065,8 @@ jobs:
             scripts/check-recovery-boundary.sh
             scripts/detect-ci-need.sh
             scripts/detect-macos-need.sh
+            scripts/quickjs-fork-test.sh
+            scripts/quickjs-fork.sh
             scripts/smoke-binary.sh
             tests/e2e/ci-run-files.sh
           )
