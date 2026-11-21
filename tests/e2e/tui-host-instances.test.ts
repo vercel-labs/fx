@@ -2472,14 +2472,6 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
           if (latest.includes("INST_ROW_TASK")) return text("inst_rows", rowReply);
           return echoMarker(body);
         };
-        const until = async (what: string, condition: () => boolean, ms = 60_000) => {
-          const deadline = Date.now() + ms;
-          while (!condition()) {
-            if (Date.now() > deadline) throw new Error(`timed out waiting for ${what}`);
-            await Bun.sleep(50);
-          }
-        };
-
         // Main saves a turn. Instance 2 saves its rows, then opens a request
         // the gateway holds open, and fx quits with that request unfinished.
         await withHost(respond, { remainOnExit: true, reuse: { home, workspace } }, async ({ session }) => {
@@ -2491,10 +2483,10 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
           await session.waitForText("INST-ROW-0300", 60_000);
           await session.waitForComposer(15_000);
           await session.sendText("INST_FOLLOW keep this request open");
-          await until("the held request to reach the gateway", () => followHeld);
+          await waitUntil("the held request to reach the gateway", () => followHeld, 60_000, session);
           // A crash leaves the request unfinished, so the next --resume sends it again.
           process.kill(session.processPid(), "SIGKILL");
-          await until("fx to exit after SIGKILL", () => session.paneStatus().dead, 15_000);
+          await waitUntil("fx to exit after SIGKILL", () => session.paneStatus().dead, 15_000, session);
         });
         const mainId = sessionHolding(home, "DONE_MAIN_FIRST")!;
         const instanceId = sessionHolding(home, "INST-ROW-0300")!;
@@ -2506,7 +2498,7 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
         await withHost(respond, { args: `--resume ${mainId}`, reuse: { home, workspace } }, async ({ session }) => {
           await session.waitForPane((pane) => pane.includes("DONE_MAIN_FIRST"), 30_000);
           await session.waitForComposer(15_000);
-          await until("the restored instance to save its new rows", () => sessionHolding(home, news.at(-1)!) === instanceId, 120_000);
+          await waitUntil("the restored instance to save its new rows", () => sessionHolding(home, news.at(-1)!) === instanceId, 120_000, session);
           await switchAgent(session, 2);
           await session.waitForStableScrollback((scrollback) => scrollback.includes(news.at(-1)!), 30_000);
           const scrollback = await session.captureFullScrollback();
