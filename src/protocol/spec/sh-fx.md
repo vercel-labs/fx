@@ -159,8 +159,8 @@ The response to a steer arrives when the turn that took it ends. It carries that
 #### Stopping and withdrawing
 
 - `session/cancel` stops only the running turn. The steers that the turn didn't take and the queued prompts still run after it.
-- A client withdraws a steer or a queued prompt that hasn't run yet with `$/cancel_request` and the prompt's request id. fx answers the prompt with `-32800`, "Request cancelled". A steer that a turn has taken can't be withdrawn.
-- `session/close` answers each steer and queued prompt that hasn't run with `-32800`.
+- A client withdraws its own steer or queued prompt that hasn't run yet with `$/cancel_request` and the prompt's request id. fx answers the prompt with `-32800`, "Request cancelled". A steer that a turn has taken can't be withdrawn.
+- `session/close` answers each steer and queued prompt that hasn't run with `-32800`. A joined client's `session/close` answers only its own.
 
 ACP v2's rule for [prompts during active work](https://agentclientprotocol.com/protocol/v2/prompt-lifecycle) differs on one point: there, `session/cancel` also answers the prompts that haven't run with `-32800`. ACP v1 has no such rule. fx revisits this point when it moves to ACP v2.
 
@@ -186,9 +186,9 @@ A session can be open on several connections at once, which ACP v2's [session se
 - `session/load` replays the saved turns, then the session's saved title when it has one, then the updates that the running turn has sent so far, then its answer.
 - `session/resume` sends only its answer.
 
-fx now does the joining and watching this section describes. A joined client can't change the session yet: its `session/prompt`, `session/cancel`, `session/set_mode` and `session/set_config_option` get error `-32600` with the message `This session is open on another connection; only that connection can change it.`, and fx keeps the session's own `systemPrompt` and hooks, not the joining request's, and traces any it ignores. fx doesn't send catch-up positions, other clients' prompts apart from steers, permission requests to other clients, or the client list yet. When the connection that opened the session closes it, fx closes it for every connection and cancels its running turn; when that connection's input ends, fx ends its turns as "Keeping turns after a disconnect" says and then closes its sessions. The joined clients then get `-32002` for the session.
+fx does the joining and watching this section describes, and it takes input from every client. A joined client's `session/prompt`, `session/cancel`, steers and queued prompts take part in the session's one order (see "Steering and queued prompts"), and each answer goes to the connection that sent its request. A joined client's `session/set_mode` and `session/set_config_option` still get error `-32600` with the message `This session is open on another connection; only that connection can change it.` A `systemPrompt` in a joining request applies from the next turn, and fx ignores that request's hooks and traces them. When the connection that opened the session closes it with `session/close`, fx closes it for every connection and cancels its running turn, and a joined client's next request for that session gets `-32002`. When that connection's input ends, fx ends its turns as "Keeping turns after a disconnect" says and then closes its sessions. fx doesn't yet send catch-up positions (`sh.fx/logPosition` and `sh.fx/replayFrom`), the sender's `sh.fx/client` in each chunk's `_meta`, permission requests to other clients (they go only to the connection that runs the turn), a turn-end notice to the other clients (only the prompt's sender gets the stop reason), or the client list.
 
-The running turn's replay holds the updates that its copy kept, in order. For a client that lists `sh.fx/turnProgress`, the turn's latest progress follows them. When fx kept only the start of the running turn's output, a notice comes before the answer: `fx kept only the start of this turn's output, so part of it isn't shown.` It is an ACP `info` notice for a client whose `clientCapabilities` lists `session.notices`, and an agent message for any other client. The copy keeps the running turn's updates up to 16 MiB; once it drops one, it keeps no later one.
+A load's replay of the running turn holds the updates that its copy kept, in order. For a client that lists `sh.fx/turnProgress`, the turn's latest progress follows them. When fx kept only the start of the running turn's output, a notice comes before the answer: `fx kept only the start of this turn's output, so part of it isn't shown.` It is an ACP `info` notice for a client whose `clientCapabilities` lists `session.notices`, and an agent message for any other client. The copy keeps the running turn's updates up to 16 MiB; once it drops one, it keeps no later one.
 
 After its answer, the joined client gets each update of the session once, in order, with the same capability filter as its own sessions.
 
@@ -200,7 +200,7 @@ While the session is open on another connection, fx keeps the session's `cwd`, `
 
 Every client of a session may send prompts. A prompt that arrives while a turn runs follows "Steering and queued prompts", and fx keeps one order for the input of all clients.
 
-`session/close` closes the session on the calling connection only. While the session is open on another connection, it stays open there, and a running turn goes on. A connection that closes acts the same way.
+A joined client's `session/close` closes the session on that connection only. The session stays open on the connection that opened it, and a running turn goes on. A joined client whose connection ends leaves the session the same way.
 
 #### Catching up
 

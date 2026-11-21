@@ -260,7 +260,7 @@ class Run {
   /// nothing did. With no `next`, a request that arrives now is unmatched.
   async afterFinish(next: Req | null) {
     if (next) {
-      const arrived = await settle(() => this.fixture.holds.length > this.recorded, 10_000);
+      const arrived = await settle(() => this.fixture.holds.length > this.recorded, WAIT_MS);
       if (arrived) {
         this.observations.push({ op: "started", r: next, v: sysOf(this.fixture.holds[this.recorded]!.body) });
         this.recorded += 1;

@@ -1,9 +1,10 @@
 ------------------------- MODULE AcpSharedSession -------------------------
 (***************************************************************************)
-(* The clients of one shared session in the sh.fx extension to ACP: the   *)
+(* The clients of one shared session in the sh.fx extension to ACP: the    *)
 (* "Prompts from other clients", "Permission requests", "Stopping a turn", *)
 (* and "Who is connected" parts of "Following a session" in                *)
-(* src/protocol/spec/sh-fx.md, which haven't landed in src/acp/ yet.       *)
+(* src/protocol/spec/sh-fx.md. The prompt and stop parts are built in      *)
+(* src/acp/. The permission and client-list parts are not built yet.       *)
 (*                                                                         *)
 (* One session, a few connections that open and close it. fx writes each  *)
 (* connection's messages in order, and the client reads them later (Read): *)
