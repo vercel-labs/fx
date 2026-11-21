@@ -13694,7 +13694,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       expect(json.exit_code).toBe(0);
       expect(json.error ?? null).toBeNull();
       expect(json.final_output).toBe("ALLOWED_AFTER_TWO_BLOCKS");
-      expect(json.recovery).toEqual({ state: "recovered", attempt: 3 });
+      expect(json.recovery).toEqual({ state: "recovered", attempt: 3, cause: "content_filter" });
       expect(gateway.requestCount()).toBe(3);
       expect(trace.split("event=content_filter_resend").length - 1).toBe(2);
       expect(result.stderr).not.toContain("press Esc");
