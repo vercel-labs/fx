@@ -13,7 +13,8 @@ pub const version = "0.0.17";
 /// default handler.
 pub const panic = if (builtin.is_test) std.debug.FullPanic(std.debug.defaultPanic) else std.debug.FullPanic(crash_panic.handle);
 /// Zig's segfault handler calls this override. It saves the crash record and then
-/// calls Zig's default handler, which prints and aborts. Test builds keep that
+/// calls Zig's default handler, which prints the signal and its address, adds a
+/// stack trace only in builds with debug info, and aborts. Test builds keep that
 /// default handler.
 pub const debug = struct {
     pub const handleSegfault = if (builtin.is_test) std.debug.defaultHandleSegfault else crash_panic.handleSegfault;

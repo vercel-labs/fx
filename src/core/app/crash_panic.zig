@@ -17,7 +17,8 @@
 //! handler first, because fx exports its own C `main` and Zig's start code does
 //! not attach it. That handler calls `root.debug.handleSegfault`, which
 //! `main.zig` sets to `handleSegfault` here. It covers SIGSEGV, SIGBUS, SIGILL,
-//! and SIGFPE, and ends in `std.debug.defaultHandleSegfault`, which prints.
+//! and SIGFPE, and ends in `std.debug.defaultHandleSegfault`, which prints the
+//! signal and its address, then a stack trace only in builds with debug info.
 
 const std = @import("std");
 const build_options = @import("build_options");
@@ -100,8 +101,8 @@ pub fn handle(msg: []const u8, first_trace_addr: ?usize) noreturn {
 /// Zig's segfault handler calls this through `root.debug.handleSegfault`, which
 /// `main.zig` sets to this function. It shares `handling` with `handle`, so the
 /// first crash of either kind saves its record, and a later one skips the save.
-/// Then it calls Zig's default handler, which prints the signal's name and a
-/// stack trace, and aborts.
+/// Then it calls Zig's default handler, which prints the signal's name and its
+/// address, then a stack trace only in builds with debug info, and aborts.
 pub fn handleSegfault(addr: ?usize, name: []const u8, opt_ctx: ?std.debug.CpuContextPtr) noreturn {
     if (!handling.swap(true, .seq_cst)) saveRecord("signal", segfaultMessage(&segfault_msg_buf, addr, name));
     std.debug.defaultHandleSegfault(addr, name, opt_ctx);
@@ -380,16 +381,22 @@ test "crash panic keeps the last record when the temporary file cannot be writte
     try std.testing.expectEqualStrings("last saved record\n", bytes);
 }
 
+/// Formats a signal record for `name` at `addr`, or with no address when `addr` is
+/// null, and returns its `fatal_error` line. The record's buffers come from `arena`,
+/// so the returned object stays valid while the arena lives.
+fn signalFatal(arena: std.mem.Allocator, addr: ?usize, name: []const u8) !std.json.ObjectMap {
+    const msg_buf = try arena.alloc(u8, segfault_msg_bytes);
+    const buf = try arena.alloc(u8, record_buf_bytes);
+    const record = formatRecord(buf, "0.0.17", "abc1234", 1_700_000_000_123, "signal", segfaultMessage(msg_buf, addr, name));
+    var lines = std.mem.splitScalar(u8, std.mem.trimEnd(u8, record, "\n"), '\n');
+    _ = try parseRecordLine(arena, lines.next().?);
+    return parseRecordLine(arena, lines.next().?);
+}
+
 test "crash panic record for a signal has error signal and the address in its message" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var msg_buf: [segfault_msg_bytes]u8 = undefined;
-    var buf: [record_buf_bytes]u8 = undefined;
-    const msg = segfaultMessage(&msg_buf, 0x1234, "Segmentation fault");
-    const record = formatRecord(&buf, "0.0.17", "abc1234", 1_700_000_000_123, "signal", msg);
-    var lines = std.mem.splitScalar(u8, std.mem.trimEnd(u8, record, "\n"), '\n');
-    _ = try parseRecordLine(arena.allocator(), lines.next().?);
-    const fatal = try parseRecordLine(arena.allocator(), lines.next().?);
+    const fatal = try signalFatal(arena.allocator(), 0x1234, "Segmentation fault");
     try std.testing.expectEqualStrings("signal", fatal.get("error").?.string);
     try std.testing.expectEqualStrings("Segmentation fault at address 0x1234", fatal.get("message").?.string);
 }
@@ -397,13 +404,7 @@ test "crash panic record for a signal has error signal and the address in its me
 test "crash panic record for a signal without an address says so" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var msg_buf: [segfault_msg_bytes]u8 = undefined;
-    var buf: [record_buf_bytes]u8 = undefined;
-    const msg = segfaultMessage(&msg_buf, null, "General protection exception");
-    const record = formatRecord(&buf, "0.0.17", "abc1234", 1_700_000_000_123, "signal", msg);
-    var lines = std.mem.splitScalar(u8, std.mem.trimEnd(u8, record, "\n"), '\n');
-    _ = try parseRecordLine(arena.allocator(), lines.next().?);
-    const fatal = try parseRecordLine(arena.allocator(), lines.next().?);
+    const fatal = try signalFatal(arena.allocator(), null, "General protection exception");
     try std.testing.expectEqualStrings("signal", fatal.get("error").?.string);
     try std.testing.expectEqualStrings("General protection exception (no address available)", fatal.get("message").?.string);
 }
