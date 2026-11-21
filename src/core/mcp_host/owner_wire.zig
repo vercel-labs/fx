@@ -12,12 +12,14 @@
 const std = @import("std");
 const mcp = @import("../../mcp/mcp.zig");
 const share_key = @import("share_key.zig");
+const text_utils = @import("../shared/text_utils.zig");
 
 const Allocator = std.mem.Allocator;
 
 /// The protocol this build speaks. Another version gets another socket and
 /// another lock file, so an older and a newer fx never misread each other.
-pub const version: u32 = 1;
+/// Version 2 carries server-provided JSON as JSON strings, not values.
+pub const version: u32 = 2;
 
 /// A frame is at most the engine's message limit plus 64 KiB for the envelope
 /// and its fields.
@@ -81,13 +83,14 @@ pub const ClientMessage = union(enum) {
 pub const OwnerMessage = union(enum) {
     welcome: struct { owner: u32 },
     phase: struct { key: share_key.Key, phase: mcp.engine.Phase },
-    /// The key's tool list as the engine holds it: raw tool JSON objects.
+    /// The key's tool list as the engine holds it: a JSON array of raw tool
+    /// objects, carried as text.
     tools: struct { key: share_key.Key, ok: bool, fresh: bool, needs_auth: bool, tools: []const u8 = "[]" },
     /// How one of this client's calls ended; `answer` is the `tools.Call`
-    /// JSON, or null when the call ended without one.
+    /// JSON text, or null when the call ended without one.
     called: struct { id: u32, outcome: mcp.engine.Outcome, maybe_ran: bool, timed_out: bool, oversized: bool = false, answer: ?[]const u8 = null, refused_bytes: u32 = 0, refused_body: bool = false },
     progress: struct { id: u32, progress: f64, total: ?f64 = null, message: ?[]const u8 = null },
-    /// The call's 2026 input requests, as the `mrtr.Request` list JSON.
+    /// The call's 2026 input requests, as the `mrtr.Request` list's JSON text.
     input: struct { id: u32, requests: []const u8 },
     /// A 2025 question, which names no call.
     /// `required`: listed in a call's -32042 error, so nothing is sent back.
@@ -153,7 +156,7 @@ pub fn decode(arena: Allocator, json: []const u8) DecodeError!Message {
         return .{ .client = try clientMessage(arena, object, tag) };
     }
     if (std.meta.stringToEnum(std.meta.Tag(OwnerMessage), kind)) |tag| {
-        return .{ .owner = try ownerMessage(arena, object, tag) };
+        return .{ .owner = try ownerMessage(object, tag) };
     }
     return error.Malformed;
 }
@@ -323,22 +326,22 @@ fn clientMessage(arena: Allocator, object: std.json.ObjectMap, tag: std.meta.Tag
             .key = try keyField(object, "key"),
             .id = try u32Field(object, "id"),
             .tool = try text(object, "tool"),
-            .arguments = try optionalRaw(arena, object, "arguments"),
+            .arguments = try optionalRaw(object, "arguments"),
         } },
         .cancel => .{ .cancel = .{ .id = try u32Field(object, "id") } },
-        .respond => .{ .respond = .{ .id = try u32Field(object, "id"), .values = try rawField(arena, object, "values") } },
+        .respond => .{ .respond = .{ .id = try u32Field(object, "id"), .values = try rawField(object, "values") } },
         .answer => .{ .answer = .{
             .key = try keyField(object, "key"),
             .slot = @intCast(try u32Field(object, "slot")),
             .n = try u32Field(object, "n"),
             .action = std.meta.stringToEnum(mcp.elicitation.Action, try text(object, "action")) orelse return error.Malformed,
-            .content = try optionalRaw(arena, object, "content"),
+            .content = try optionalRaw(object, "content"),
         } },
         .bye => .bye,
     };
 }
 
-fn ownerMessage(arena: Allocator, object: std.json.ObjectMap, tag: std.meta.Tag(OwnerMessage)) DecodeError!OwnerMessage {
+fn ownerMessage(object: std.json.ObjectMap, tag: std.meta.Tag(OwnerMessage)) DecodeError!OwnerMessage {
     return switch (tag) {
         .welcome => .{ .welcome = .{ .owner = try u32Field(object, "owner") } },
         .phase => .{ .phase = .{ .key = try keyField(object, "key"), .phase = try enumField(mcp.engine.Phase, object, "phase") } },
@@ -347,7 +350,7 @@ fn ownerMessage(arena: Allocator, object: std.json.ObjectMap, tag: std.meta.Tag(
             .ok = try boolField(object, "ok"),
             .fresh = try boolField(object, "fresh"),
             .needs_auth = try boolField(object, "needs_auth"),
-            .tools = try rawField(arena, object, "tools"),
+            .tools = try rawField(object, "tools"),
         } },
         .called => .{ .called = .{
             .id = try u32Field(object, "id"),
@@ -355,7 +358,7 @@ fn ownerMessage(arena: Allocator, object: std.json.ObjectMap, tag: std.meta.Tag(
             .maybe_ran = try boolField(object, "maybe_ran"),
             .timed_out = try boolField(object, "timed_out"),
             .oversized = try boolField(object, "oversized"),
-            .answer = try optionalRaw(arena, object, "answer"),
+            .answer = try optionalRaw(object, "answer"),
             .refused_bytes = try u32FieldDefault(object, "refused_bytes", 0),
             .refused_body = try boolFieldDefault(object, "refused_body", false),
         } },
@@ -365,12 +368,12 @@ fn ownerMessage(arena: Allocator, object: std.json.ObjectMap, tag: std.meta.Tag(
             .total = try optionalFloatField(object, "total"),
             .message = try optionalText(object, "message"),
         } },
-        .input => .{ .input = .{ .id = try u32Field(object, "id"), .requests = try rawField(arena, object, "requests") } },
+        .input => .{ .input = .{ .id = try u32Field(object, "id"), .requests = try rawField(object, "requests") } },
         .question => .{ .question = .{
             .key = try keyField(object, "key"),
             .slot = @intCast(try u32Field(object, "slot")),
             .n = try u32Field(object, "n"),
-            .params = try rawField(arena, object, "params"),
+            .params = try rawField(object, "params"),
             .version = try optionalText(object, "version"),
             .required = try boolFieldDefault(object, "required", false),
         } },
@@ -518,16 +521,13 @@ fn keyField(object: std.json.ObjectMap, key: []const u8) DecodeError!share_key.K
     return out;
 }
 
-fn rawField(arena: Allocator, object: std.json.ObjectMap, key: []const u8) DecodeError![]const u8 {
-    const value = object.get(key) orelse return error.Malformed;
-    var out: std.Io.Writer.Allocating = .init(arena);
-    std.json.Stringify.value(value, .{}, &out.writer) catch return error.OutOfMemory;
-    return out.written();
+/// A field that holds server-provided JSON, which the frame carries as text.
+fn rawField(object: std.json.ObjectMap, key: []const u8) DecodeError![]const u8 {
+    return text(object, key);
 }
 
-fn optionalRaw(arena: Allocator, object: std.json.ObjectMap, key: []const u8) DecodeError!?[]const u8 {
-    if (object.get(key) == null) return null;
-    return try rawField(arena, object, key);
+fn optionalRaw(object: std.json.ObjectMap, key: []const u8) DecodeError!?[]const u8 {
+    return optionalText(object, key);
 }
 
 fn textField(writer: *std.Io.Writer, comptime key: []const u8, value: []const u8) std.Io.Writer.Error!void {
@@ -535,9 +535,11 @@ fn textField(writer: *std.Io.Writer, comptime key: []const u8, value: []const u8
     try std.json.Stringify.value(value, .{}, writer);
 }
 
+/// Server-provided JSON travels as a JSON string, never as a value, so a
+/// deeply nested tool or answer is copied and never walked by whatever reads
+/// the frame (`src/core/mcp/server_json_depth.zig`).
 fn raw(writer: *std.Io.Writer, comptime key: []const u8, json: []const u8) std.Io.Writer.Error!void {
-    try writer.writeAll(",\"" ++ key ++ "\":");
-    try writer.writeAll(json);
+    try textField(writer, key, json);
 }
 
 fn bytes(writer: *std.Io.Writer, comptime key: []const u8, value: *const share_key.Key) std.Io.Writer.Error!void {
@@ -659,6 +661,33 @@ test "every owner message round-trips" {
     try testing.expectEqual(@as(?u8, null), signalled.status.exit_code);
 }
 
+test "server JSON nested 3000 levels deep crosses the wire as text" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const key: share_key.Key = "ffeeddccbbaa99887766554433221100".*;
+    // A server may list a tool, answer a call, or ask a question with JSON
+    // nested past any limit fx keeps. The frame copies it, so reading the
+    // frame never walks its levels; no writer here aborts on its depth
+    // (`src/core/mcp/server_json_depth.zig`).
+    const nested = text_utils.repeat("[", 3000) ++ text_utils.repeat("]", 3000);
+    const deep = try a.print("{{\"name\":\"deep\",\"_meta\":{s}}}", .{nested[0..]});
+    const page = try a.print("[{s}]", .{deep});
+
+    const tools = try expectOwner(a, .{ .tools = .{ .key = key, .ok = true, .fresh = true, .needs_auth = false, .tools = page } });
+    try testing.expectEqualStrings(page, tools.tools.tools);
+
+    const called = try expectOwner(a, .{ .called = .{ .id = 4, .outcome = .result, .maybe_ran = false, .timed_out = false, .answer = deep } });
+    try testing.expectEqualStrings(deep, called.called.answer.?);
+
+    const question = try expectOwner(a, .{ .question = .{ .key = key, .slot = 1, .n = 2, .params = deep } });
+    try testing.expectEqualStrings(deep, question.question.params);
+
+    // A session's own JSON, sent the other way, is text too.
+    const call = try expectClient(a, .{ .call = .{ .key = key, .id = 9, .tool = "echo", .arguments = deep } });
+    try testing.expectEqualStrings(deep, call.call.arguments.?);
+}
+
 test "a truncated frame, an overlong length, bad JSON, an unknown type, and another version are refused" {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
@@ -674,10 +703,10 @@ test "a truncated frame, an overlong length, bad JSON, an unknown type, and anot
     try testing.expectError(error.Malformed, decode(a, ""));
     try testing.expectError(error.Malformed, decode(a, "not json"));
     try testing.expectError(error.Malformed, decode(a, "[]"));
-    try testing.expectError(error.Malformed, decode(a, "{\"v\":1}"));
-    try testing.expectError(error.Malformed, decode(a, "{\"v\":1,\"t\":\"nope\"}"));
-    try testing.expectError(error.UnsupportedVersion, decode(a, "{\"v\":2,\"t\":\"bye\"}"));
-    try testing.expectError(error.Malformed, decode(a, "{\"v\":1,\"t\":\"call\",\"key\":\"short\",\"id\":1,\"tool\":\"t\"}"));
-    try testing.expectError(error.Malformed, decode(a, "{\"v\":1,\"t\":\"call\",\"key\":\"00112233445566778899aabbccddeeff\",\"id\":-1,\"tool\":\"t\"}"));
-    try testing.expectError(error.Malformed, decode(a, "{\"v\":1,\"t\":\"phase\",\"key\":\"00112233445566778899aabbccddeeff\",\"phase\":\"sleeping\"}"));
+    try testing.expectError(error.Malformed, decode(a, try a.print("{{\"v\":{d}}}", .{version})));
+    try testing.expectError(error.Malformed, decode(a, try a.print("{{\"v\":{d},\"t\":\"nope\"}}", .{version})));
+    try testing.expectError(error.UnsupportedVersion, decode(a, try a.print("{{\"v\":{d},\"t\":\"bye\"}}", .{version + 1})));
+    try testing.expectError(error.Malformed, decode(a, try a.print("{{\"v\":{d},\"t\":\"call\",\"key\":\"short\",\"id\":1,\"tool\":\"t\"}}", .{version})));
+    try testing.expectError(error.Malformed, decode(a, try a.print("{{\"v\":{d},\"t\":\"call\",\"key\":\"00112233445566778899aabbccddeeff\",\"id\":-1,\"tool\":\"t\"}}", .{version})));
+    try testing.expectError(error.Malformed, decode(a, try a.print("{{\"v\":{d},\"t\":\"phase\",\"key\":\"00112233445566778899aabbccddeeff\",\"phase\":\"sleeping\"}}", .{version})));
 }

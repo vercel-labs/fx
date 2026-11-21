@@ -651,6 +651,13 @@ fn stepEngineEvent(owner: *Owner, state: *core.State, engine_value: *engine.Engi
     _ = scratch.reset(.retain_capacity);
     const a = scratch.allocator();
     const key = keyFromName(event.server) orelse return;
+    // What the clients know about the server goes out first: a phase or a
+    // listing frame ends a session's waiting request, and that session builds
+    // its failure text from this status, so the status must be there before
+    // the frame that reads it.
+    var status_output: core.Output = .{};
+    core.step(state, .{ .engine_status = .{ .key = key } }, &status_output);
+    apply(owner, state, engine_value, scratch, status_output.effects());
     var core_event: ?core.Event = null;
     switch (event.kind) {
         .phase => |phase| core_event = .{ .engine_phase = .{ .key = key, .phase = phase } },
@@ -704,10 +711,6 @@ fn stepEngineEvent(owner: *Owner, state: *core.State, engine_value: *engine.Engi
         core.step(state, e, &output);
         apply(owner, state, engine_value, scratch, output.effects());
     }
-    // Every event refreshes what the clients know about the server.
-    var status_output: core.Output = .{};
-    core.step(state, .{ .engine_status = .{ .key = key } }, &status_output);
-    apply(owner, state, engine_value, scratch, status_output.effects());
 }
 
 fn requestsJson(a: Allocator, requests: []const mcp.mrtr.Request) []const u8 {
@@ -1208,4 +1211,64 @@ test "a registered client hears connecting and ready before the tool list" {
         }
     }
     return error.NoToolsFrame;
+}
+
+test "a failing server's status reaches a client before the phase frame that ends its wait" {
+    const alloc = testing.allocator;
+    const home = try shortHome(alloc);
+    defer removeHome(alloc, home);
+    var stop = std.atomic.Value(bool).init(false);
+    const thread = try std.Thread.spawn(.{}, serveThread, .{ testing.io, alloc, home, &stop });
+    var joined = false;
+    defer if (!joined) {
+        stop.store(true, .release);
+        thread.join();
+    };
+    const path = try socketPath(alloc, home);
+    defer alloc.free(path);
+    try waitForSocket(path);
+
+    var client = try TestClient.connect(path);
+    defer client.close();
+    try client.send(.{ .hello = .{ .pid = 1 } });
+    try client.send(.{
+        .register = .{
+            .key = test_key,
+            // A server that exits at once: the session waiting on it ends its
+            // request on the phase frame, with the failure text it was told.
+            .config = .{ .argv = &.{ "sh", "-c", "exit 7" }, .timeouts = .{ .start_ms = 15_000 } },
+            .ask_form = false,
+            .ask_url = false,
+        },
+    });
+    try client.send(.{ .need = .{ .key = test_key } });
+    var arena: std.heap.ArenaAllocator = .init(alloc);
+    defer arena.deinit();
+    var status_seen = false;
+    const deadline = std.Io.Clock.awake.now(testing.io).toMilliseconds() + 20_000;
+    while (std.Io.Clock.awake.now(testing.io).toMilliseconds() < deadline) {
+        const message = client.receive(arena.allocator(), 500) catch |err| switch (err) {
+            error.Timeout => continue,
+            else => return err,
+        };
+        switch (message) {
+            .owner => |owner| switch (owner) {
+                .status => |status| {
+                    if (std.mem.eql(u8, &status.key, &test_key) and status.last_error != null and status.exit_code != null) status_seen = true;
+                },
+                .phase => |phase| {
+                    if (phase.phase != .backoff and phase.phase != .failed) continue;
+                    try testing.expect(status_seen);
+                    client.close();
+                    stop.store(true, .release);
+                    thread.join();
+                    joined = true;
+                    return;
+                },
+                else => {},
+            },
+            .client => {},
+        }
+    }
+    return error.NoFailedPhaseFrame;
 }

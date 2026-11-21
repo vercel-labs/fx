@@ -2787,7 +2787,7 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"`,
   // A 2025 server, as Datadog's is: a 2026 server's -32602 on a call makes fx negotiate the protocol again.
   // Returns the model's text for the failed call, the trace log (every scope) and standard error fx wrote meanwhile,
   // and what the TUI showed. With `report`, it also runs /trace and returns the report fx wrote, as text and records.
-  async function refusedCall(label: string, options: RootOptions, finalText: string, report = false) {
+  async function refusedCall(label: string, options: RootOptions, finalText: string, report = false, rowText?: string) {
     const root = createRoot(label, LEGACY_FIXTURE, { mode: "invalid_params", legacyVersion: "2025-06-18", ...options });
     const activeGateway = startToolGateway(finalText);
     gateway = activeGateway;
@@ -2805,6 +2805,9 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"`,
     await tui.waitForComposer(15_000);
     await tui.sendText("Call the MCP fixture with a typed argument.");
     await tui.waitForText(finalText, 25_000);
+    // A failed call's row takes its cause one frame after the reply text, and
+    // the capture below must not land between the two.
+    if (rowText) await tui.waitForText(rowText, 10_000);
     const body = activeGateway.requests.at(-1)?.body;
     const screen = await tui.captureFullScrollback();
     let traced: { records: Array<Record<string, unknown>>; calls: Array<Record<string, unknown>> } | null = null;
@@ -2923,11 +2926,13 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"`,
         ["other-code", "Internal error", null],
       ] as const;
       for (const [kind, message, cause] of cases) {
+        const rowText = `Couldn't run ${TOOL_NAME} · ${cause ?? `MCP protocol error -32603: ${message}`}`;
         const logged = await refusedCall(
           `tui-invalid-params-log-${kind}`,
           { protocolErrorMessage: message, protocolErrorData: data, ...(cause === null ? { protocolErrorCode: -32603 } : {}) },
           `Log ${kind} complete.`,
           true,
+          rowText,
         );
         const text = logged.text();
         expect(text.length).toBeGreaterThan(8 * 1024);
