@@ -2444,7 +2444,7 @@ pub fn placementAsApproved(
     placed_ctx.placement = placed.placement;
     placed_ctx.placement_profile = placed.profile;
     placed_ctx.sandbox = placed.launch;
-    if (!approved.matches(placed_ctx)) return null;
+    if (!command_admission.keepsPlacement(approved, placed.placement, placed.profile)) return null;
     return placed_ctx;
 }
 
@@ -7293,4 +7293,24 @@ test "a shell run keeps its approved placement only while the policy still gives
 
     // Sandbox execution turned off after approval: the run is refused, not run here.
     try std.testing.expect((try placementAsApproved(null, arena, input.workspace_root, fingerprint, unplaced, true)) == null);
+}
+
+test "a run keeps its approved placement when its cwd resolves to another path" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    // On macOS /tmp resolves to /private/tmp, so the run's cwd can differ
+    // from the one admission saw; the router checks the rest of the context.
+    const approved: command_admission.CommandContext = .{
+        .command = "sleep 2; printf done",
+        .resolved_cwd = "/tmp",
+        .target_os = builtin.target.os.tag,
+    };
+    var run = approved;
+    run.resolved_cwd = "/private/tmp";
+
+    const kept = (try placementAsApproved(null, arena, "/tmp", .init(approved), run, true)) orelse
+        return error.TestExpectedPlacement;
+    try std.testing.expectEqual(command_environment.Placement.local, kept.placement);
+    try std.testing.expectEqualStrings("/private/tmp", kept.resolved_cwd);
 }
