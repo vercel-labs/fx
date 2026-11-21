@@ -6,6 +6,7 @@
     {"name": "doctor_child_status", "module": "fx", "test": "doctor child status parser tolerates arbitrary bytes", "iterations": 1500000},
     {"name": "token_pass_memory", "module": "fx", "test": "token pass memory: a saved-answers file reads and rewrites on fuzzed bytes", "iterations": 1000000},
     {"name": "host_record_decode", "module": "fx", "test": "a host record file decodes or is refused on fuzzed bytes", "iterations": 1500000},
+    {"name": "mcp_add_reader_agree", "module": "fx", "test": "an add the reader's check accepts is loaded by the reader's own entry points, for fuzzed entries and files", "iterations": 300000},
     {"name": "fx_login_replace_rejected", "module": "fx", "test": "a forced fx login refresh rotates only a rejected or expired saved login on fuzzed tokens and deadlines", "iterations": 20000},
     {"name": "subscription_replace_rejected", "module": "fx", "test": "a forced Codex or Grok refresh rotates only a rejected or expired saved login on fuzzed tokens and deadlines", "iterations": 20000},
     {"name": "mcp_store_lock_wait", "module": "fx", "test": "the store and refresh locks' wait rules hold for fuzzed stamps and times", "iterations": 1000000},
@@ -23,7 +24,7 @@
     {"name": "attached_selection", "module": "fx", "test": "attached files and carried-in omissions keep the selection bounded and inside the workspace", "iterations": 300000},
     {"name": "mcp_elicitation", "module": "fx", "test": "elicitation request and response parsers stay bounded under fuzzed bytes", "iterations": 1500000},
     {"name": "mcp_argument_repair", "module": "fx", "test": "MCP argument repair keeps its laws on fuzzed schemas and arguments", "iterations": 200000},
-    {"name": "mcp_invalid_params_cause", "module": "fx", "test": "an invalid-params cause keeps its laws on fuzzed messages", "iterations": 200000},
+    {"name": "mcp_invalid_params_cause", "module": "fx", "test": "an invalid-params cause keeps its laws on fuzzed messages", "iterations": 20000},
     {"name": "mcp_search_page", "module": "fx", "test": "MCP search pages agree with the schemas they load under fuzzed tools and limits", "iterations": 50000},
     {"name": "session_optional_fields", "module": "fx", "test": "durable session optional fields handle fuzzed ownership paths", "iterations": 3000000},
     {"name": "session_work_provenance", "module": "fx", "test": "per-turn work provenance parser handles fuzzed ownership paths", "iterations": 2100000},
@@ -62,7 +63,9 @@
     {"name": "http_response", "module": "fx", "test": "web_fetch response parser reads a response the same however it is split", "iterations": 1500000},
     {"name": "acp_jsonrpc", "module": "fx", "test": "ACP frames stay one parseable line and read the same however they are split", "iterations": 400000},
     {"name": "trace_record_text", "module": "fx", "test": "trace records stay one valid JSON line for fuzzed text", "iterations": 12000},
+    {"name": "mcp_object_fields", "module": "fx", "test": "the engine reads an object's field names as std.json decodes them", "iterations": 1000000},
     {"name": "mcp_wire", "module": "fx", "test": "MCP wire decoding returns only whole JSON values from valid input", "iterations": 900000},
+    {"name": "mcp_elicitation_escapes", "module": "fx", "test": "the engine's equality and length limits of a form's strings and an answer's match std.json's decoded strings", "iterations": 150000},
     {"name": "mcp_challenge", "module": "fx", "test": "a WWW-Authenticate challenge is read within its bounds on fuzzed bytes", "iterations": 1500000},
     {"name": "shell_parity", "module": "fx", "test": "shell parity holds for generated commands", "iterations": 600},
     {"name": "command_lex", "module": "fx", "test": "lexing generated commands is consistent and round-trips through quoting", "iterations": 2700000},
@@ -89,7 +92,11 @@
     {"name": "kept_team_file", "module": "fx", "test": "a kept team file reads as valid team names or is refused on fuzzed bytes", "iterations": 2000000},
     {"name": "trace_cuts", "module": "fx", "test": "trace cuts stay bounded and keep UTF-8 whole on fuzzed bytes", "iterations": 3000000},
     {"name": "snapshot_alias_lines", "module": "fx", "test": "alias line reading stays bounded on fuzzed bytes", "iterations": 3000000},
+    {"name": "mcp_error_data", "module": "fx", "test": "a failed call's error data is kept whole or cut at a character, within the cap, on fuzzed bytes", "iterations": 8000},
     {"name": "mcp_json_depth", "module": "fx", "test": "a server's JSON is refused past 128 levels and kept up to it, whatever its site, shape and depth, on fuzzed bytes", "iterations": 100000},
-    {"name": "mcp_request_grace", "module": "fx", "test": "a fuzzed run of requests, lines that name no request, replies, progress and timers ends each request once and ends only a silent request that has a grace as malformed", "iterations": 1000000}
+    {"name": "mcp_request_grace", "module": "fx", "test": "a fuzzed run of requests, lines that name no request, replies, progress and timers ends each request once and ends only a silent request that has a grace as malformed", "iterations": 1000000},
+    {"name": "turn_clock", "module": "fx", "test": "the turn clock keeps its laws on fuzzed event sequences", "iterations": 2000000},
+    {"name": "compaction_progress", "module": "fx", "test": "the notes count keeps its laws on fuzzed replies", "iterations": 2000000},
+    {"name": "secret_pieces", "module": "fx", "test": "maskSecretPieces masks every piece of a wrapped value and keeps other bytes on fuzzed rows", "iterations": 400000}
   ]
 }

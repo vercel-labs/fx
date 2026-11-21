@@ -13,6 +13,7 @@ const tool_specs = @import("../../tooling/tool_specs.zig");
 const tooling_presentation = @import("../../tooling/tool_presentation.zig");
 const debug_trace = @import("../../shared/debug_trace.zig");
 const mcp_tool_result = @import("../../mcp/tool_result.zig");
+const result_store = @import("../../session/result_store.zig");
 const diff = @import("../../output/diff.zig");
 const file_mutation_contract = @import("../../tooling/file_mutation_contract.zig");
 const tool_result_errors = @import("../../tooling/tool_result_errors.zig");
@@ -161,8 +162,15 @@ pub const ProvisionalToolStatuses = struct {
         const is_toolbox = std.mem.eql(u8, tool_name, toolbox.tool_name);
         var observed_label = if (is_toolbox) null else label_value;
         var observed_kind = activity_kind;
+        var shown_tool_name = tool_name;
         const argument_label: ?[]const u8 = if (is_toolbox) resource: {
             const json = arguments_json orelse break :resource null;
+            if (try toolboxBuiltinRunRow(scratch.allocator(), hooks.tool_registry, json, &buf)) |row| {
+                observed_label = row.label_value;
+                observed_kind = row.activity_kind;
+                shown_tool_name = row.tool_name;
+                break :resource row.label;
+            }
             // While the arguments stream in they do not parse yet, but the
             // action and the whole name after it already say what the call
             // does, so its row does not read as a bare "Using" until they end.
@@ -187,8 +195,18 @@ pub const ProvisionalToolStatuses = struct {
         if (is_subagent) {
             observed_label = tooling_presentation.subagentStreamedAgent(arguments_json orelse "") orelse self.trackedLabel(tool_id);
         }
+        // Any other builtin call's row names its target, such as the file a
+        // read opens, once that value streams in.
+        const builtin = hooks.tool_registry.lookup(tool_name);
+        const streamed_value = if (builtin) |spec| if (!is_toolbox and !is_subagent and observed_label == null)
+            tooling_presentation.streamedLabelValue(spec.label_arg_kind, arguments_json orelse "")
+        else
+            null else null;
+        if (streamed_value) |value| observed_label = value;
         const shown_label = if (is_subagent and observed_label != null)
             (try text_utils.encodeTerminalSafe(scratch.allocator(), observed_label.?, 64)).bytes
+        else if (streamed_value) |value|
+            (try text_utils.encodeTerminalSafe(scratch.allocator(), value, 240)).bytes
         else
             observed_label;
         const label = argument_label orelse try formatProvisionalProgressLabel(&buf, action_label, shown_label);
@@ -212,7 +230,7 @@ pub const ProvisionalToolStatuses = struct {
             .provisional = .{
                 .id = .{ .turn_id = turn_id, .call_id = tool_id },
                 .presentation_group_id = self.presentation_group_id,
-                .tool_name = tool_name,
+                .tool_name = shown_tool_name,
                 .activity_kind = observed_kind,
             },
         }) catch |err| {
@@ -230,9 +248,11 @@ pub const ProvisionalToolStatuses = struct {
     /// Names a streaming call's row as soon as its arguments so far say what
     /// it is for, while the rest of the call streams in: the subagent a
     /// `subagent` call is for once its whole name is in, so the row reads
-    /// `Managing reviewer`, and what a `toolbox` call runs, searches, or
-    /// opens once that whole value is in, so the row reads
-    /// `Running glob_files`. A row already named stays as it is.
+    /// `Managing reviewer`, and what a `toolbox` call searches or opens
+    /// once that whole value is in, so the row reads `Opening fixture`. A
+    /// toolbox run of a builtin tool waits, hidden, until that tool's own
+    /// target is in too, so the row reads `Matching *.md` as a direct
+    /// glob_files call does. A row already named stays as it is.
     pub fn observeArguments(
         self: *ProvisionalToolStatuses,
         hooks: *const AgentRuntimeDeps,
@@ -249,7 +269,10 @@ pub const ProvisionalToolStatuses = struct {
         } else if (std.mem.eql(u8, status.tool_name, toolbox.tool_name)) {
             const action = try tooling_presentation.toolboxStreamedAction(alloc, arguments) orelse return;
             alloc.free(action);
-        } else return;
+        } else {
+            const spec = hooks.tool_registry.lookup(status.tool_name) orelse return;
+            if (tooling_presentation.streamedLabelValue(spec.label_arg_kind, arguments) == null) return;
+        }
         const metadata = switch (preflight(hooks.tool_registry, status.tool_name) orelse return) {
             .ineligible => return,
             .eligible => |metadata| metadata,
@@ -516,7 +539,8 @@ pub const ProvisionalToolStatuses = struct {
     ) !void {
         while (self.tracked.items.len > 0) {
             const status = &self.tracked.items[self.tracked.items.len - 1];
-            if (self.hasTerminal(status.id)) {
+            // A hidden call has no row to settle.
+            if (self.hasTerminal(status.id) or !status.shown) {
                 self.forget(alloc, status.id);
                 continue;
             }
@@ -561,7 +585,8 @@ pub const ProvisionalToolStatuses = struct {
                 hooks.tool_registry,
                 status.tool_name,
             )) continue;
-            if (self.hasTerminal(status.id)) {
+            // A hidden call has no row to settle.
+            if (self.hasTerminal(status.id) or !status.shown) {
                 self.forget(alloc, status.id);
                 continue;
             }
@@ -803,6 +828,71 @@ pub fn activityKindForCall(
 ) types.ToolActivityKind {
     if (tooling_presentation.isProviderSearchAlias(call.name)) return .read;
     return tool_dispatch.toolActivityKindForCall(alloc, registry, call);
+}
+
+/// How a streaming toolbox call's row reads when it runs a built-in tool.
+const BuiltinRunRow = struct {
+    /// The tool it runs, which the row is for.
+    tool_name: []const u8,
+    activity_kind: types.ToolActivityKind,
+    /// The row's text, or null while the row stays hidden.
+    label: ?[]const u8,
+    /// What the row names, so it is not named again as more arguments
+    /// arrive. Null while the row waits for the tool's target.
+    label_value: ?[]const u8,
+};
+
+/// The row of a streaming toolbox call whose arguments so far, whole or
+/// still streaming in, run a built-in tool (`toolbox.shownBuiltinRun`). It
+/// reads as a direct call of that tool does once that call names its
+/// target: the tool's verb and the target in the run's `arguments`, as in
+/// `Fetching https://example.com/page`. Until both the tool and its target
+/// are in, and for a tool whose direct call shows no row while it streams,
+/// the row stays hidden, so it never reads as a bare verb, and the call's
+/// own start shows it. Null for any other toolbox call. The label is
+/// written into `buf`.
+fn toolboxBuiltinRunRow(
+    scratch: Allocator,
+    registry: tool_dispatch.Registry,
+    arguments_json: []const u8,
+    buf: []u8,
+) !?BuiltinRunRow {
+    // While the arguments stream in, only the run's tool may be whole.
+    const whole = if (tool_args.parseToolArgsObject(scratch, arguments_json)) |_| true else |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => false,
+    };
+    const source = if (whole)
+        arguments_json
+    else
+        (try tooling_presentation.toolboxStreamedAction(scratch, arguments_json)) orelse return null;
+    const shown = (try toolbox.shownBuiltinRun(scratch, registry, .{ .id = "", .name = toolbox.tool_name, .arguments_json = source })) orelse return null;
+    const spec = registry.lookup(shown.name) orelse return null;
+    switch (ProvisionalToolStatuses.preflight(registry, shown.name) orelse return null) {
+        .ineligible => return .{ .tool_name = shown.name, .activity_kind = spec.activity_kind, .label = null, .label_value = shown.name },
+        .eligible => {},
+    }
+    // The target comes from the whole arguments once they parse, as the
+    // call's start names it, and from the run's arguments while they stream
+    // in, as a direct call's row reads its own.
+    var action_label = spec.action_label;
+    var activity_kind = spec.activity_kind;
+    const target: ?[]const u8 = if (whole) parsed: {
+        const args = tool_args.parseToolArgsObject(scratch, shown.arguments_json) catch break :parsed null;
+        const presentation = tool_dispatch.presentationForArgs(spec.*, args);
+        action_label = presentation.action_label;
+        activity_kind = presentation.activity_kind;
+        break :parsed tool_dispatch.presentationLabelValue(presentation, args);
+    } else tooling_presentation.streamedRunLabelValue(spec.label_arg_kind, arguments_json);
+    const value = target orelse "";
+    if (value.len == 0) return .{ .tool_name = shown.name, .activity_kind = activity_kind, .label = null, .label_value = null };
+    const encoded = try text_utils.encodeTerminalSafe(scratch, value, 240);
+    return .{
+        .tool_name = shown.name,
+        .activity_kind = activity_kind,
+        .label = try formatProvisionalProgressLabel(buf, action_label, encoded.bytes),
+        .label_value = value,
+    };
 }
 
 fn formatProvisionalProgressLabel(
@@ -1639,10 +1729,15 @@ fn failureStatusDetail(
     const mcp_call = containsName(advertised_dynamic_tool_names, call.name) or
         if (try toolbox.carriedCall(arena, call.name, call.arguments_json)) |run| types.isMcpToolName(run.name) else false;
     if (safe_result.len == 0 or !mcp_call) return null;
-    const server_text = try mcpFailureEnvelopeText(arena, safe_result) orelse safe_result;
+    // A result over the cap is stored, and the model's copy is the head of the text in a preview block.
+    // The cause comes from that head, as it does in the trace.
+    const model_text = result_store.storedPreview(safe_result) orelse safe_result;
+    const server_text = try mcpFailureEnvelopeText(arena, model_text) orelse model_text;
     // A refused call's parameters read as which fields and types, not as the
     // start of a protocol dump; the model still gets the server's own words.
-    const detail = try mcp_tool_result.invalidParamsCause(arena, server_text) orelse server_text;
+    // The line shows what the server said, and no error's data, which only the model gets.
+    const detail = try mcp_tool_result.invalidParamsCause(arena, server_text) orelse
+        try mcp_tool_result.protocolErrorWithoutData(arena, server_text);
     const masked_detail = try text_utils.maskSecrets(arena, detail);
     const encoded = try text_utils.encodeTerminalSafeInline(arena, masked_detail, 256);
     return if (encoded.bytes.len == 0) null else encoded.bytes;
@@ -2174,18 +2269,37 @@ test "provisional toolbox labels read as what the call opens, runs, or searches"
     // The stream's hint is the first string in the arguments, which may name
     // what a run runs or what a search looks for, so it never labels the row.
     // The action and its whole value label it as soon as they stream in.
-    const cases = [_]struct { arguments_json: ?[]const u8, label: []const u8, value: ?[]const u8 = null }{
-        .{ .arguments_json = null, .label = "Using" },
-        .{ .arguments_json = "{\"run\":\"glob", .label = "Using" },
-        .{ .arguments_json = "{}", .label = "Using" },
-        .{ .arguments_json = "{\"run\":\"glob_files\",\"argu", .label = "Running", .value = "glob_files" },
+    const Case = struct {
+        arguments_json: ?[]const u8,
+        label: []const u8,
+        value: ?[]const u8 = null,
+        /// The tool the row is for, when it differs from toolbox.
+        tool_name: []const u8 = toolbox.tool_name,
+        /// The call shows no row yet.
+        hidden: bool = false,
+    };
+    const cases = [_]Case{
+        .{ .arguments_json = null, .label = "Using", .hidden = true },
+        .{ .arguments_json = "{\"run\":\"glob", .label = "Using", .hidden = true },
+        .{ .arguments_json = "{}", .label = "Using", .hidden = true },
+        // A run of a built-in tool reads as a direct call of it once that
+        // call would name its target, and shows no row before then, so it
+        // never reads as a bare verb.
+        .{ .arguments_json = "{\"run\":\"glob_files\",\"argu", .label = "Matching", .hidden = true },
+        .{ .arguments_json = "{\"run\":\"read_file\",\"arguments\":{\"path\":\"no", .label = "Reading", .hidden = true },
+        .{ .arguments_json = "{\"run\":\"read_file\",\"arguments\":{\"path\":\"a\\\"b\"", .label = "Reading", .hidden = true },
+        .{ .arguments_json = "{\"run\":\"read_file\",\"arguments\":{\"path\":\"notes.txt\",\"off", .label = "Reading", .value = "notes.txt", .tool_name = "read_file" },
+        .{ .arguments_json = "{\"run\":\"read_file\",\"arguments\":{}}", .label = "Reading", .hidden = true },
         .{ .arguments_json = "{\"run\":\"mcp_fixture_echo\",\"arguments\":{\"te", .label = tooling_presentation.mcp_running_label, .value = "mcp_fixture_echo" },
+        // A name fx doesn't hold keeps toolbox's own row, which names it.
+        .{ .arguments_json = "{\"run\":\"no_such_tool\",\"argu", .label = "Running", .value = "no_such_tool" },
         .{ .arguments_json = "{\"search\":\"list files\"", .label = "Searching toolbox", .value = "list files" },
         .{ .arguments_json = "{\"open\":\"fixture\",\"res", .label = "Opening", .value = "fixture" },
         // A streamed skill location reads as the skill's name, never the
         // opaque location.
         .{ .arguments_json = "{\"open\":\"skill:0123456789abcdef:6/ste-english\",\"res", .label = "Opening", .value = "ste-english" },
-        .{ .arguments_json = "{\"run\":\"glob_files\",\"arguments\":{\"pattern\":\"*.md\"}}", .label = "Running", .value = "glob_files" },
+        .{ .arguments_json = "{\"run\":\"glob_files\",\"arguments\":{\"pattern\":\"*.md\"}}", .label = "Matching", .value = "*.md", .tool_name = "glob_files" },
+        .{ .arguments_json = "{\"run\":\"read_file\",\"arguments\":\"{\\\"path\\\":\\\"notes.txt\\\"}\"}", .label = "Reading", .value = "notes.txt", .tool_name = "read_file" },
         .{ .arguments_json = "{\"run\":\"mcp_fixture_echo\",\"arguments\":{}}", .label = tooling_presentation.mcp_running_label, .value = "mcp_fixture_echo" },
         .{ .arguments_json = "{\"search\":\"list files\"}", .label = "Searching toolbox", .value = "list files" },
         .{ .arguments_json = "{\"open\":\"fixture\"}", .label = "Opening", .value = "fixture" },
@@ -2200,13 +2314,17 @@ test "provisional toolbox labels read as what the call opens, runs, or searches"
         var statuses = ProvisionalToolStatuses{};
         defer statuses.deinit(alloc);
         try statuses.publish(&hooks, alloc, 7, "toolbox_1", toolbox.tool_name, .read, eligibleActionLabel(toolbox.tool_name), "glob_files", case.arguments_json);
-        // A call that names nothing yet shows no row, so no bare "Using".
-        if (std.mem.eql(u8, case.label, "Using")) {
+        errdefer std.debug.print("arguments: {?s}\n", .{case.arguments_json});
+        // A call that names nothing yet shows no row, so no bare "Using",
+        // and it stays unnamed, so more arguments can name it.
+        if (case.hidden) {
             try std.testing.expectEqual(@as(usize, 0), capture.events.items.len);
             try std.testing.expect(!statuses.has("toolbox_1"));
+            try std.testing.expect(statuses.tracked.items[0].label_value == null);
             continue;
         }
         try std.testing.expectEqual(@as(usize, 2), capture.events.items.len);
+        try std.testing.expectEqualStrings(case.tool_name, capture.events.items[0].provisional.tool_name.?);
         var expected_buf: [512]u8 = undefined;
         const expected = try formatProvisionalProgressLabel(&expected_buf, case.label, case.value);
         try std.testing.expectEqualStrings(expected, capture.events.items[1].progress.text);
@@ -2218,7 +2336,87 @@ test "provisional toolbox labels read as what the call opens, runs, or searches"
     }
 }
 
-test "a streaming toolbox call's row names what it runs once that name arrives, and keeps it" {
+test "a streaming toolbox run of a built-in tool shows a row only when a direct call of it would" {
+    const alloc = std.testing.allocator;
+    // A direct write, edit, question, or shell call shows no row while its
+    // arguments stream in, so a toolbox run of one shows none either, and
+    // the call's own start shows it.
+    for ([_][]const u8{
+        "{\"run\":\"write_file\",\"argu",
+        "{\"run\":\"edit_file\",\"arguments\":{\"path\":\"a.txt\"}}",
+        "{\"run\":\"ask_user_question\",\"argu",
+        "{\"run\":\"shell\",\"arguments\":{\"action\":\"run\",\"command\":\"ls\"}}",
+    }) |arguments_json| {
+        var capture = ProvisionalStatusTestCapture{ .alloc = alloc };
+        defer capture.deinit();
+        const hooks = capture.hooks();
+        var statuses = ProvisionalToolStatuses{};
+        defer statuses.deinit(alloc);
+        const kind = activityKind(hooks.tool_registry, toolbox.tool_name);
+        const action = eligibleActionLabel(toolbox.tool_name);
+        try statuses.publish(&hooks, alloc, 7, "toolbox_1", toolbox.tool_name, kind, action, null, arguments_json);
+        try std.testing.expectEqual(@as(usize, 0), capture.events.items.len);
+        try std.testing.expect(!statuses.has("toolbox_1"));
+        // More arguments name nothing new, so the row stays hidden.
+        try statuses.observeArguments(&hooks, alloc, 7, "toolbox_1", arguments_json);
+        try std.testing.expectEqual(@as(usize, 0), capture.events.items.len);
+        // A stream that ends early settles no row it never showed.
+        var arena_state = std.heap.ArenaAllocator.init(alloc);
+        defer arena_state.deinit();
+        if (std.mem.find(u8, arguments_json, "write_file") != null) {
+            try statuses.finishUnmatchedRecoveryStarts(&hooks, alloc, arena_state.allocator(), 7, &.{});
+        } else {
+            try statuses.finishTrackedCancelled(&hooks, alloc, arena_state.allocator(), 7);
+        }
+        try std.testing.expectEqual(@as(usize, 0), capture.events.items.len);
+        try std.testing.expectEqual(@as(usize, 0), statuses.tracked.items.len);
+    }
+}
+
+test "a streaming builtin call's row names its target once that value arrives, and keeps it" {
+    const alloc = std.testing.allocator;
+    const cases = [_]struct {
+        tool: []const u8,
+        partial: []const u8,
+        named: ?[]const u8,
+        value: []const u8 = "",
+    }{
+        .{ .tool = "read_file", .partial = "{\"pa", .named = "{\"path\":\"src/main.zig\",\"off", .value = "src/main.zig" },
+        .{ .tool = "glob_files", .partial = "{\"pattern\":\"*.m", .named = "{\"pattern\":\"*.md\"", .value = "*.md" },
+        // A value with an escape in it would read wrongly, so the row waits
+        // for the call.
+        .{ .tool = "read_file", .partial = "{\"path\":\"a\\\"b", .named = null },
+    };
+    for (cases) |case| {
+        var capture = ProvisionalStatusTestCapture{ .alloc = alloc };
+        defer capture.deinit();
+        const hooks = capture.hooks();
+        var statuses = ProvisionalToolStatuses{};
+        defer statuses.deinit(alloc);
+        errdefer std.debug.print("tool: {s}\n", .{case.tool});
+        const action = eligibleActionLabel(case.tool);
+        try statuses.publish(&hooks, alloc, 7, "call_1", case.tool, activityKind(hooks.tool_registry, case.tool), action, null, null);
+        try std.testing.expectEqual(@as(usize, 2), capture.events.items.len);
+        var bare_buf: [512]u8 = undefined;
+        try std.testing.expectEqualStrings(try formatProvisionalProgressLabel(&bare_buf, action, null), capture.events.items[1].progress.text);
+        // Part of the value is not yet a value.
+        try statuses.observeArguments(&hooks, alloc, 7, "call_1", case.partial);
+        try std.testing.expectEqual(@as(usize, 2), capture.events.items.len);
+        const named = case.named orelse continue;
+        try statuses.observeArguments(&hooks, alloc, 7, "call_1", named);
+        try std.testing.expectEqual(@as(usize, 4), capture.events.items.len);
+        try std.testing.expectEqualStrings("call_1", capture.events.items[2].provisional.id.call_id);
+        var named_buf: [512]u8 = undefined;
+        try std.testing.expectEqualStrings(try formatProvisionalProgressLabel(&named_buf, action, case.value), capture.events.items[3].progress.text);
+        // The rest of the arguments stream in without another publication.
+        const more = try std.mem.concat(alloc, u8, &.{ named, "\"" });
+        defer alloc.free(more);
+        try statuses.observeArguments(&hooks, alloc, 7, "call_1", more);
+        try std.testing.expectEqual(@as(usize, 4), capture.events.items.len);
+    }
+}
+
+test "a streaming toolbox run's row shows once its tool and that tool's target arrive, and keeps it" {
     const alloc = std.testing.allocator;
     var capture = ProvisionalStatusTestCapture{ .alloc = alloc };
     defer capture.deinit();
@@ -2228,22 +2426,36 @@ test "a streaming toolbox call's row names what it runs once that name arrives, 
     const kind = activityKind(hooks.tool_registry, toolbox.tool_name);
     const action = eligibleActionLabel(toolbox.tool_name);
     var named_buf: [512]u8 = undefined;
-    const named = try formatProvisionalProgressLabel(&named_buf, "Running", "glob_files");
+    // It reads as a direct glob_files call does once that call names its
+    // pattern.
+    const named = try formatProvisionalProgressLabel(&named_buf, "Matching", "*.md");
 
-    // The call shows no row until its arguments name what it does.
+    // The call shows no row until its arguments name the tool it runs and
+    // that tool's target.
     try statuses.publish(&hooks, alloc, 7, "toolbox_1", toolbox.tool_name, kind, action, null, null);
     try std.testing.expectEqual(@as(usize, 0), capture.events.items.len);
     try std.testing.expect(!statuses.has("toolbox_1"));
-    // Part of the name is not yet a name.
-    try statuses.observeArguments(&hooks, alloc, 7, "toolbox_1", "{\"run\":\"glob");
-    try std.testing.expectEqual(@as(usize, 0), capture.events.items.len);
-    try statuses.observeArguments(&hooks, alloc, 7, "toolbox_1", "{\"run\":\"glob_files\",");
+    for ([_][]const u8{
+        // Part of the name is not yet a name.
+        "{\"run\":\"glob",
+        // The tool alone would read as a bare verb.
+        "{\"run\":\"glob_files\",",
+        "{\"run\":\"glob_files\",\"arguments\":{\"pat",
+        "{\"run\":\"glob_files\",\"arguments\":{\"pattern\":\"*.m",
+    }) |arguments| {
+        try statuses.observeArguments(&hooks, alloc, 7, "toolbox_1", arguments);
+        try std.testing.expectEqual(@as(usize, 0), capture.events.items.len);
+    }
+    try statuses.observeArguments(&hooks, alloc, 7, "toolbox_1", "{\"run\":\"glob_files\",\"arguments\":{\"pattern\":\"*.md\"");
     try std.testing.expectEqual(@as(usize, 2), capture.events.items.len);
     try std.testing.expectEqualStrings("toolbox_1", capture.events.items[0].provisional.id.call_id);
+    try std.testing.expectEqualStrings("glob_files", capture.events.items[0].provisional.tool_name.?);
+    try std.testing.expectEqual(types.ToolActivityKind.list, capture.events.items[0].provisional.activity_kind);
     try std.testing.expectEqualStrings(named, capture.events.items[1].progress.text);
     try std.testing.expect(statuses.has("toolbox_1"));
     // The rest of the call streams in without another publication.
-    try statuses.observeArguments(&hooks, alloc, 7, "toolbox_1", "{\"run\":\"glob_files\",\"arguments\":{\"pat");
+    try statuses.observeArguments(&hooks, alloc, 7, "toolbox_1", "{\"run\":\"glob_files\",\"arguments\":{\"pattern\":\"*.md\",\"pa");
+    try statuses.observeArguments(&hooks, alloc, 7, "toolbox_1", "{\"run\":\"glob_files\",\"arguments\":{\"pattern\":\"*.md\"}}");
     try std.testing.expectEqual(@as(usize, 2), capture.events.items.len);
 
     // A search with no words yet may list one server's tools, so it waits.
@@ -2251,6 +2463,40 @@ test "a streaming toolbox call's row names what it runs once that name arrives, 
     const before = capture.events.items.len;
     try statuses.observeArguments(&hooks, alloc, 7, "toolbox_2", "{\"search\":\"\",\"server\":\"sl");
     try std.testing.expectEqual(before, capture.events.items.len);
+}
+
+test "a toolbox run streamed byte by byte never reads as a bare verb and names its tool's target once" {
+    const alloc = std.testing.allocator;
+    const tools = [_]tool_dispatch.Tool{ test_builtin_tools.toolbox, test_builtin_tools.web_fetch, test_builtin_tools.web_search, test_builtin_tools.read_file };
+    const registry: tool_dispatch.Registry = .{ .tools = &tools };
+    const cases = [_]struct { call: []const u8, tool: []const u8, label: []const u8, value: []const u8 }{
+        .{ .call = "{\"run\":\"web_fetch\",\"arguments\":{\"url\":\"http://127.0.0.1/page\"}}", .tool = "web_fetch", .label = "Fetching", .value = "http://127.0.0.1/page" },
+        .{ .call = "{\"run\":\"web_search\",\"arguments\":{\"query\":\"zig release notes\"}}", .tool = "web_search", .label = "Searching", .value = "zig release notes" },
+        .{ .call = "{\"arguments\":{\"path\":\"notes.txt\"},\"run\":\"read_file\"}", .tool = "read_file", .label = "Reading", .value = "notes.txt" },
+    };
+    for (cases) |case| {
+        errdefer std.debug.print("call: {s}\n", .{case.call});
+        var capture = ProvisionalStatusTestCapture{ .alloc = alloc, .tool_registry = registry };
+        defer capture.deinit();
+        const hooks = capture.hooks();
+        var statuses = ProvisionalToolStatuses{};
+        defer statuses.deinit(alloc);
+        const metadata = (ProvisionalToolStatuses.preflight(registry, toolbox.tool_name).?).eligible;
+        try statuses.publish(&hooks, alloc, 7, "toolbox_1", toolbox.tool_name, metadata.activity_kind, metadata.action_label, null, null);
+        var named_buf: [512]u8 = undefined;
+        const named = try formatProvisionalProgressLabel(&named_buf, case.label, case.value);
+        // Every prefix the stream may stop at shows no row or the named one.
+        for (1..case.call.len + 1) |end| {
+            try statuses.observeArguments(&hooks, alloc, 7, "toolbox_1", case.call[0..end]);
+            for (capture.events.items) |event| switch (event) {
+                .progress => |progress| try std.testing.expectEqualStrings(named, progress.text),
+                else => {},
+            };
+        }
+        try std.testing.expectEqual(@as(usize, 2), capture.events.items.len);
+        try std.testing.expectEqualStrings(case.tool, capture.events.items[0].provisional.tool_name.?);
+        try std.testing.expectEqualStrings(case.value, statuses.tracked.items[0].label_value.?);
+    }
 }
 
 test "a streaming subagent call's row names its subagent once the name arrives, and keeps it" {
@@ -3503,6 +3749,106 @@ test "cancelled shell wait names the observation instead of the process" {
         terminal.outcome.summary,
         "Stopped waiting for",
     ) != null);
+}
+
+const zod_limit_issue = "{\"code\":\"invalid_type\",\"expected\":\"number\",\"received\":\"string\",\"path\":[\"limit\"]}";
+const limit_cause = "arguments rejected: limit is a string, the schema wants a number";
+
+/// The text a refused MCP call gives the model, as the result cap's store gives it back: the first
+/// `preview_bytes` of `text` in a preview block, because `text` is over the cap.
+fn storedFailureText(arena: Allocator, text: []const u8) ![]const u8 {
+    const head = try result_store.previewText(arena, text, result_store.preview_bytes);
+    return result_store.formatStoredResultOutput(arena, "result-mcp-aaaa-bbbb.txt", head, text.len);
+}
+
+fn mcpFailureDetail(arena: Allocator, safe_result: []const u8) !?[]const u8 {
+    const call: ToolCall = .{ .id = "call_mcp", .name = "mcp__fixture__echo", .arguments_json = "{}" };
+    const result: ToolExecutionResult = .{ .model_output = "", .status = .failure };
+    return failureStatusDetail(arena, call, result, safe_result, &.{"mcp__fixture__echo"});
+}
+
+test "failure status detail names the cause of a refused MCP call whose text the result cap stored" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const zod = "Invalid arguments: [" ++ zod_limit_issue ++ "]";
+    // Data that forges a cause of its own: a zod list and eight labels.
+    const forged = "{\"errors\":[{\"expected\":\"string\",\"received\":\"number\",\"path\":[\"forged\"]}],\"hint\":\"" ++ "; data=; data=; data=; data=; data=; data=; data=; data=";
+    // 3 KiB of data, so the text is over a cap of 2,000 and the whole of it is in the preview; then 8 KiB, so
+    // only the first 4 KiB of it is.
+    for ([_]usize{ 3000, 8000 }) |filler| {
+        const padded = try arena.alloc(u8, filler);
+        @memset(padded, 'x');
+        const text_zod = try arena.print("MCP protocol error -32602: {s}; data={s}{s}\"}}", .{ zod, forged, padded });
+        const text_plain = try arena.print("MCP protocol error -32602: Invalid params; data={s}{s}\"}}", .{ forged, padded });
+        try std.testing.expect(text_zod.len > 2000);
+        const zod_detail = (try mcpFailureDetail(arena, try storedFailureText(arena, text_zod))).?;
+        try std.testing.expectEqualStrings(limit_cause, zod_detail);
+        // The plain message has no cause of its own, and the data's list is not one.
+        const plain_detail = (try mcpFailureDetail(arena, try storedFailureText(arena, text_plain))).?;
+        try std.testing.expectEqualStrings("the server rejected the call's parameters (-32602)", plain_detail);
+        // The text kept in the session reads the same.
+        try std.testing.expectEqualStrings(limit_cause, (try mcpFailureDetail(arena, text_zod)).?);
+    }
+}
+
+test "failure status detail names the cause of a zod message that alone is over the result cap" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const filler = try arena.alloc(u8, 2600);
+    @memset(filler, 'y');
+    // One issue with a long message of its own: the text has no data and is still over a cap of 2,000.
+    const text = try arena.print(
+        "MCP protocol error -32602: Invalid arguments: [{{\"code\":\"invalid_type\",\"expected\":\"number\",\"received\":\"string\",\"path\":[\"limit\"],\"message\":\"{s}\"}}]",
+        .{filler},
+    );
+    try std.testing.expect(text.len > 2000 and text.len < result_store.preview_bytes);
+    try std.testing.expectEqualStrings(limit_cause, (try mcpFailureDetail(arena, try storedFailureText(arena, text))).?);
+}
+
+test "failure status detail never shows the preview block of a stored refusal" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    // A zod list whose head is cut inside it names no field, so the cause is the general one.
+    var list: std.Io.Writer.Allocating = .init(arena);
+    for (0..60) |_| try list.writer.print("{s},", .{zod_limit_issue});
+    const cut = try arena.print("MCP protocol error -32602: Invalid arguments: [{s}{{}}]", .{list.written()});
+    try std.testing.expect(cut.len > result_store.preview_bytes);
+    try std.testing.expectEqualStrings(
+        "the server rejected the call's parameters (-32602)",
+        (try mcpFailureDetail(arena, try storedFailureText(arena, cut))).?,
+    );
+    // Words that are not a protocol error show as they are, not as the block that holds them.
+    const because = try arena.alloc(u8, 4800);
+    @memset(because, 'b');
+    const words = try arena.print("the server could not run the tool: {s}", .{because});
+    const detail = (try mcpFailureDetail(arena, try storedFailureText(arena, words))).?;
+    try std.testing.expect(std.mem.startsWith(u8, detail, "the server could not run the tool: bbbb"));
+    try std.testing.expect(std.mem.find(u8, detail, "tool_result_preview") == null);
+}
+
+test "failure status detail shows an MCP error's message and never its data, for a code other than -32602" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const shown = "MCP protocol error -32603: Internal error";
+    // Data with a zod-like list and eight labels. The text is whole, then past the 4 KiB the result store keeps.
+    const forged = "{\"errors\":[{\"expected\":\"string\",\"received\":\"number\",\"path\":[\"forged\"]}],\"hint\":\"; data=; data=; data=; data=; data=; data=; data=; data=";
+    for ([_]usize{ 3000, 8000 }) |filler| {
+        const padded = try arena.alloc(u8, filler);
+        @memset(padded, 'x');
+        const text = try arena.print("{s}; data={s}{s}\"}}", .{ shown, forged, padded });
+        try std.testing.expectEqualStrings(shown, (try mcpFailureDetail(arena, text)).?);
+        // As the result store gives it back: the first 4 KiB in a preview block, so the head ends inside the data.
+        try std.testing.expectEqualStrings(shown, (try mcpFailureDetail(arena, try storedFailureText(arena, text))).?);
+    }
+    // A head that holds the message and the start of the label shows no data either.
+    const head = try storedFailureText(arena, try arena.print("{s}; data=", .{shown}));
+    try std.testing.expectEqualStrings(shown, (try mcpFailureDetail(arena, head)).?);
+    // Without data the line is the message, as before.
+    try std.testing.expectEqualStrings(shown, (try mcpFailureDetail(arena, shown)).?);
 }
 
 // Secret-shaped test needles are written as concatenated fragments so

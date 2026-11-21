@@ -70,6 +70,7 @@ const command_replay_store = @import("../session/command_replay_store.zig");
 const session_codec = @import("../session/session_codec.zig");
 const session_store = @import("../session/session_store.zig");
 const session_adapter = @import("../session/session_adapter.zig");
+const turn_capture = @import("../workspace/turn_capture.zig");
 const session_child_store = @import("../session/session_child_store.zig");
 const skill_contract = @import("../skills/skill_contract.zig");
 const skill_runtime = @import("../skills/skill_runtime.zig");
@@ -308,6 +309,7 @@ fn runAskChild(
         .context_enabled = ctx.context_enabled,
         .project_context = ctx.modelVisibleProjectContext(),
         .lifecycle_view = ctx.lifecycle_view,
+        .workspace_capture = if (ctx.workspaceCaptureContext()) |context| .{ .home = context.home, .path = context.path } else null,
     }, turn, message, admission, cancel);
 }
 
@@ -669,6 +671,10 @@ const AskContext = struct {
     /// A resumed v2 session's preferences; `model` borrows from here.
     v2_preferences: ?session_codec.DurableSessionPreferences = null,
     session_write_mutex: std.Io.Mutex = .init,
+    /// `experimental.workspace_capture`, from startup.
+    workspace_capture: bool = false,
+    /// This run's turn captures, when `workspace_capture` is on (D98).
+    turn_capture: turn_capture.TurnCapture = .{},
     requested_resume: ?ResumeTarget = null,
     seed_model: []const u8 = "",
     command_timeout_ms: ?usize = null,
@@ -720,10 +726,11 @@ const AskContext = struct {
     image_snapshot_temp_dir: ?[]u8 = null,
     prompt_snapshot_committed: bool = false,
     last_recovery_status: ?types.RouteRecoveryStatus = null,
-    /// The recovery status kind last printed as a notice. fx ask cannot
-    /// redraw a line, so it prints a module status only when its kind
-    /// changes, not on every one-second refresh.
+    /// The recovery status kind and attempt last printed as a notice. fx
+    /// ask cannot redraw a line, so it prints a module status only when its
+    /// kind or attempt changes, not on every one-second refresh.
     last_recovery_notice_kind: ?types.RouteRecoveryStatus.Kind = null,
+    last_recovery_notice_attempt: usize = 0,
 
     fn init(alloc: Allocator, cfg: Config, deps: RunDeps, workspace_root: []const u8) AskContext {
         const lifecycle_runtime = hooks.Runtime.init(alloc);
@@ -842,6 +849,9 @@ const AskContext = struct {
         self.terminal_client.deinit();
         self.workspace_access.deinit(self.alloc);
         self.worker.deinit(std.heap.c_allocator);
+        self.turn_capture.deinit();
+        // `fx ask` is the whole process: retention's maintenance ends here.
+        if (comptime turn_capture.supported) turn_capture.finishMaintenance();
         self.web_fetch_runtime.deinit(self.alloc);
         self.web_search_runtime.deinit();
         if (self.refreshed_credential) |*credential| credential.deinit(self.alloc);
@@ -918,6 +928,28 @@ const AskContext = struct {
                 headless_interrupt.cancel_requested.load(.seq_cst);
         }
         return false;
+    }
+
+    /// What a workspace capture needs, or null when captures are off or
+    /// the run saves no session. The run's cancel ends a capture early; a
+    /// subagent's report that interrupts the model does not.
+    fn workspaceCaptureContext(self: *AskContext) ?turn_capture.Context {
+        if (!self.workspace_capture) return null;
+        const v2 = self.v2 orelse return null;
+        const store = self.v2_store orelse return null;
+        return .{ .session = v2, .home = store.home, .path = self.workspace_root, .alloc = std.heap.c_allocator, .cancel = self.turnCancelFlag() };
+    }
+
+    /// The flag set only by a cancel that stops the run's turn, unlike
+    /// `cancelFlag`'s worker flag, which a subagent's report also sets to
+    /// interrupt the model.
+    fn turnCancelFlag(self: *AskContext) *std.atomic.Value(bool) {
+        if (comptime supports_headless_interrupt) {
+            if (self.use_process_interrupt_flag) {
+                return &headless_interrupt.cancel_requested;
+            }
+        }
+        return &self.worker.turn_cancel_requested;
     }
 
     /// The saved session's id.
@@ -1727,6 +1759,7 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
         startup.notification_turn_end,
         startup.notification_attention_required,
     );
+    ctx.workspace_capture = startup.workspace_capture;
     ctx.session.setConversationLanguageFromUserMessage(owned_prompt);
     if (options.save_session) {
         try ctx.checkCancellation();
@@ -2279,6 +2312,8 @@ fn agentRuntimeDeps(ctx: *AskContext) agent_runtime.AgentRuntimeDeps {
         .append_turn_piece = if (ctx.v2 != null) appendTurnPiece else null,
         .record_usage = if (ctx.v2 != null) recordUsage else null,
         .save_prompt_images = if (ctx.v2 != null) savePromptImages else null,
+        .start_workspace_capture = if (ctx.workspaceCaptureContext() != null) startWorkspaceCapture else null,
+        .reach_workspace = if (ctx.workspaceCaptureContext() != null) reachWorkspace else null,
         .propagate_grant = propagateGrant,
         .push_event = pushEvent,
         .push_text = pushText,
@@ -3190,15 +3225,23 @@ fn propagateHistoryTurn(raw_ctx: *anyopaque, turn: HistoryTurn) !void {
     var prepared = try ctx.session.prepareHistoryEntry(ctx.alloc, turn);
     var prepared_owned = true;
     defer if (prepared_owned) types.freeHistoryTurn(ctx.alloc, prepared);
+    // The repository as the turn left it, captured before the write lock.
+    if (ctx.workspaceCaptureContext()) |context| _ = ctx.turn_capture.end(context, &ctx.session_write_mutex);
     ctx.session_write_mutex.lockUncancelable(io_mod.getIo());
     defer ctx.session_write_mutex.unlock(io_mod.getIo());
     if (ctx.v2) |v2| {
         try v2.prepareTurn(&prepared);
-        v2.commitTurn(prepared, ctx.session.languageSnapshot()) catch |err| {
+        const capture_token = ctx.turn_capture.token();
+        const committed = if (capture_token) |token|
+            v2.commitTurnWithCaptures(prepared, ctx.session.languageSnapshot(), token)
+        else
+            v2.commitTurn(prepared, ctx.session.languageSnapshot());
+        committed catch |err| {
             // A failed write may still have reached the log: keep its images.
             if (session_adapter.writeMayHaveLanded(err)) ctx.prompt_snapshot_committed = true;
             return err;
         };
+        ctx.turn_capture.committed(capture_token);
         ctx.session.commitPreparedHistoryEntry(ctx.alloc, prepared);
         prepared_owned = false;
         ctx.prompt_snapshot_committed = true;
@@ -3264,6 +3307,21 @@ fn savePromptImages(raw_ctx: *anyopaque, alloc: std.mem.Allocator, images: []typ
     v2.savePromptImages(alloc, images) catch |err| {
         debug_trace.logf("session", "event=sessions_v2_prompt_images_inline session={s} err={s}", .{ v2.id(), @errorName(err) });
     };
+}
+
+fn startWorkspaceCapture(raw_ctx: *anyopaque, fresh: bool, step: agent_runtime.AgentRuntimeDeps.WorkspaceCaptureStep) void {
+    const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
+    const context = ctx.workspaceCaptureContext() orelse return;
+    switch (step) {
+        .begin => ctx.turn_capture.begin(context, fresh),
+        .capture => ctx.turn_capture.start(context, &ctx.session_write_mutex),
+    }
+}
+
+fn reachWorkspace(raw_ctx: *anyopaque, dir: []const u8, tool_name: []const u8) void {
+    const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
+    const context = ctx.workspaceCaptureContext() orelse return;
+    ctx.turn_capture.reach(context, dir, tool_name, &ctx.session_write_mutex);
 }
 
 fn propagateGrant(_: *anyopaque, _: []const u8, _: []const u8) !void {}
@@ -3571,8 +3629,10 @@ fn pushRouteRecoveryStatus(raw_ctx: *anyopaque, status: types.RouteRecoveryStatu
     ctx.last_recovery_status = status;
     const notice = switch (status.kind) {
         .waiting, .retrying, .need_user => notice: {
-            const changed = ctx.last_recovery_notice_kind != status.kind;
+            const changed = ctx.last_recovery_notice_kind != status.kind or
+                ctx.last_recovery_notice_attempt != status.attempt;
             ctx.last_recovery_notice_kind = status.kind;
+            ctx.last_recovery_notice_attempt = status.attempt;
             break :notice changed and ctx.output_mode != .quiet;
         },
         // The success or the error itself is the notice; --json reports how
@@ -6169,6 +6229,43 @@ test "fx ask automatic review observes worker cancellation" {
         error.Cancelled,
         requestToolPermissionOutcomeWithRequest(&ctx, arena_state.allocator(), call, review_turn.context(), .auto, &.{}, null, null, &.{}, null),
     );
+}
+
+test "fx ask captures stop for the run's cancel, not for a subagent report that interrupts the model" {
+    const alloc = std.testing.allocator;
+    var stdout_capture: TestCapture = .{};
+    defer stdout_capture.deinit(alloc);
+    var stderr_capture: TestCapture = .{};
+    defer stderr_capture.deinit(alloc);
+    var ctx = AskContext.init(
+        alloc,
+        testConfig(),
+        testPromptRunDeps(&stdout_capture, &stderr_capture, testPresentKeyStartup),
+        "/tmp/workspace",
+    );
+    defer ctx.deinit();
+    try std.testing.expect(ctx.worker.beginDirectProcessing(41));
+    defer ctx.worker.finishProcessing();
+    // A report steered into the running turn interrupts the model only. The
+    // worker frees what it queues with `std.heap.c_allocator`.
+    const queue_alloc = std.heap.c_allocator;
+    try ctx.worker.admitInteractivePrompt(queue_alloc, .{
+        .prompt = try queue_alloc.dupe(u8, "report"),
+        .images = &.{},
+        .model = try queue_alloc.dupe(u8, "model"),
+        .api_key = try queue_alloc.dupe(u8, "key"),
+        .permission_mode = .auto,
+        .history = try queue_alloc.alloc(types.HistoryTurn, 0),
+        .grants = try queue_alloc.alloc(types.PermissionGrant, 0),
+    });
+    try std.testing.expect(ctx.cancelFlag().load(.seq_cst));
+    try std.testing.expect(!ctx.turnCancelFlag().load(.seq_cst));
+    ctx.worker.requestCancel();
+    try std.testing.expect(ctx.turnCancelFlag().load(.seq_cst));
+    if (comptime supports_headless_interrupt) {
+        ctx.use_process_interrupt_flag = true;
+        try std.testing.expectEqual(&headless_interrupt.cancel_requested, ctx.turnCancelFlag());
+    }
 }
 
 test "headless ask SIGINT sets process-lifetime cancellation storage" {
@@ -9023,7 +9120,7 @@ test "fx ask JSON recovery keeps stdout structured and reports progress on stder
     try std.testing.expectEqualStrings("recovered", recovery.get("state").?.string);
     try std.testing.expectEqual(@as(i64, 2), recovery.get("attempt").?.integer);
     try std.testing.expect(recovery.get("message") == null);
-    // A host that cannot redraw prints a status only when its kind changes.
+    // A host that cannot redraw prints a status only when its kind or attempt changes.
     try std.testing.expectEqualStrings(
         "[notice] Offline · next try in 2s · 0s\n[notice] Offline · retrying · attempt 2 · 2s\n",
         stderr_capture.bytes.items,

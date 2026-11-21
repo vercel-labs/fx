@@ -2979,6 +2979,69 @@ fn preparedCallApplicableTargetsFresh(
     };
 }
 
+/// A target that did not exist when the step was prepared and that brings no
+/// new scoped instructions is safe to run, so a read after an earlier write in
+/// the same step is not skipped (test "same-batch read of a file an earlier
+/// call created runs when no scoped instructions apply" in
+/// src/core/agent/runtime/tests/tool_flow.zig). Returns true only when the
+/// call prepared as `.legacy_target_resolution` resolves now and the registry
+/// has nothing new to deliver for it. The call keeps its legacy preparation,
+/// so execution still classifies it.
+fn lateResolvedCallMayRun(
+    arena: Allocator,
+    deps: *const AgentRuntimeDeps,
+    config: Config,
+    context_delivery_state: *const context_contract.DeliveryState,
+    step_ctx: TraceContext,
+    tool_call: ToolCall,
+    maybe_preparation: ?tool_preparation.Result,
+) !bool {
+    const context_registry = deps.context_registry orelse return false;
+    const preparation = maybe_preparation orelse return false;
+    const stale_candidate = switch (preparation) {
+        .terminal => return false,
+        .candidate => |*candidate| candidate,
+    };
+    const late_targets = (try tool_preparation.lateResolvedApplicableTargets(
+        arena,
+        tool_call,
+        deps.tool_registry,
+        config.workspace_root,
+        config.access_scope,
+        stale_candidate,
+    )) orelse return false;
+    // The probe is only a question to the registry.
+    var resolved_candidate: tool_preparation.Candidate = .{
+        .kind = .registered,
+        .applicable_targets = late_targets,
+    };
+    defer resolved_candidate.deinit(arena);
+    if (try candidateHasApplicableContextDelta(
+        arena,
+        context_registry,
+        config,
+        context_delivery_state,
+        resolved_candidate,
+    )) {
+        debug_trace.eventf(
+            "tool",
+            "applicable_targets_resolved_with_scope",
+            step_ctx,
+            "call_id={s} name={s} targets={d}",
+            .{ tool_call.id, tool_call.name, late_targets.len },
+        );
+        return false;
+    }
+    debug_trace.eventf(
+        "tool",
+        "applicable_targets_resolved",
+        step_ctx,
+        "call_id={s} name={s} targets={d}",
+        .{ tool_call.id, tool_call.name, late_targets.len },
+    );
+    return true;
+}
+
 fn parallelApplicableTargetsFresh(
     arena: Allocator,
     deps: *const AgentRuntimeDeps,
@@ -4188,6 +4251,32 @@ fn checkpointToolState(
         // reconciles instead of searching again.
         .repeatable, .uncertain => .uncertain,
     };
+}
+
+/// Saves the turn's user message through `append_turn_piece` before its
+/// start capture (D98). A resumed turn is already on disk, so callers skip
+/// it. A failed write is traced and left to the turn's later writes, which
+/// write every piece the session lacks, and never fails the turn.
+fn persistPromptBeforeCapture(
+    deps: *const AgentRuntimeDeps,
+    finalization: *TurnFinalizationGuard,
+    job: QueuedPrompt,
+    current_turn_messages: []const ChatMessage,
+) void {
+    const append = deps.append_turn_piece orelse return;
+    var scratch = std.heap.ArenaAllocator.init(std.heap.c_allocator);
+    defer mem_utils.deinit_arena(scratch);
+    const arena = scratch.allocator();
+    const saved = saved: {
+        const execution = runtime_execution_memory.buildExecutionMemory(arena, current_turn_messages) catch |err| break :saved err;
+        const projected = finalization.persistedExecution(arena, execution) catch |err| break :saved err;
+        append(deps.ctx, .{
+            .user = .{ .text = @constCast(job.prompt), .images = job.images, .work_id = job.work_id, .author = job.author },
+            .execution = projected,
+        }) catch |err| break :saved err;
+        return;
+    };
+    debug_trace.logf("session", "event=prompt_before_capture_unsaved err={s}", .{@errorName(saved)});
 }
 
 /// Hands the model's tool calls to `append_turn_piece` before any of them
@@ -6722,6 +6811,17 @@ fn processQueuedPromptInner(
             job.images = images;
         }
     }
+    // The repository as the turn found it, before any request or tool
+    // (D98). The prompt reaches the session first: the capture can take
+    // seconds, and a process killed during it must keep the prompt.
+    if (deps.start_workspace_capture) |start| {
+        const fresh = !job.delivery.isSteering();
+        start(deps.ctx, fresh, .begin);
+        if (fresh and !resumed_request and job.recovery_checkpoint == null) {
+            persistPromptBeforeCapture(deps, finalization, job, within_turn_suffix.items);
+        }
+        start(deps.ctx, fresh, .capture);
+    }
 
     const current_user_message: ChatMessage = .{
         .role = .user,
@@ -7400,7 +7500,14 @@ const CompactionProgress = struct {
     before_summary: ?BeforeSummary,
 
     fn interface(self: *CompactionProgress) compactor.Progress {
-        return .{ .context = self, .report_fn = report };
+        return .{ .context = self, .report_fn = report, .written_fn = written };
+    }
+
+    fn written(context: *anyopaque, percent: u8) void {
+        const self: *CompactionProgress = @ptrCast(@alignCast(context));
+        const id = self.operation_id orelse return;
+        const effect = self.deps.compaction_activity orelse return;
+        if (effect.written) |write| write(self.deps.ctx, id, percent);
     }
 
     fn report(context: *anyopaque, step: compactor.Step) anyerror!void {
@@ -8732,6 +8839,7 @@ fn processQueuedPromptLoop(
                     };
                     defer summary_model.deinit();
                     var compaction_failure: ?compaction_activity.ErrorProvenance = null;
+                    const compaction_started_ms = io_mod.milliTimestamp();
                     const compaction_result = compactContext(arena, deps, .{
                         .activity_origin = if (overflow_pending) .provider_overflow else .automatic,
                         .failure_provenance = &compaction_failure,
@@ -8747,6 +8855,9 @@ fn processQueuedPromptLoop(
                             .trace_ctx = step_ctx,
                         },
                     });
+                    // The turn's duration leaves out the compaction, as its
+                    // live clock does.
+                    summary_accumulator.addCompaction(compaction_started_ms, io_mod.milliTimestamp());
                     // A summary request the provider rejected with 401 renewed
                     // the sign-in; the rest of the turn sends the renewed one.
                     // Taken first: renewing can free the credential the turn
@@ -9677,8 +9788,9 @@ fn processQueuedPromptLoop(
                     attempt_disposition == .provider_failure))
             {
                 // A response cut short or ended by a provider error waits and
-                // resends through the recovery module. Content-filter and
-                // non-retryable endings keep their terminal path below.
+                // resends through the recovery module, and so does a content
+                // filter's block until the module needs the user. Endings it
+                // does not resend keep their terminal path below.
                 const finish_reason = attempt_completion.finish_reason;
                 const failure_cause = attempt_completion.provider_failure_cause;
                 const content_filtered = attempt_disposition == .provider_failure and
@@ -9697,25 +9809,31 @@ fn processQueuedPromptLoop(
                     if (content_filtered) "content_filter" else types.ModelFailureDiagnostic.defaultTextForCause(cause),
                 );
                 attempt_failure_diagnostic = diagnostic;
-                // A content filter waits for the user on a host that can ask,
-                // and ends the turn elsewhere, as other non-retryable endings do.
+                // The module resends a content filter's block at once a few
+                // times. Then a host that can ask waits for the user, and
+                // elsewhere the turn ends as other non-retryable endings do.
                 const failure_kind: ?runtime_request_recovery.Failure.Kind = if (content_filtered)
-                    (if (request_recovery.canAskUser()) .content_filter else null)
+                    .content_filter
                 else if (failure_cause == .non_retryable)
                     null
                 else
                     runtime_request_recovery.failureKind(cause);
                 const retryable = failure_kind != null and !config.cancel_flag.load(.seq_cst);
                 const retries = retryable;
-                if (attempt_disposition == .provider_failure or
-                    failure_cause == .gateway_stream_timeout)
+                // The send that failed, for its trace.
+                const failed_attempt = request_recovery.attempt();
+                // A block's trace waits for the module's answer below, so
+                // its `retry` says whether the module resends it.
+                if ((attempt_disposition == .provider_failure or
+                    failure_cause == .gateway_stream_timeout) and
+                    !(content_filtered and retries))
                 {
                     traceRouteFailure(
                         step_ctx,
                         job.model,
                         gateway_model,
                         attempt_fast_mode,
-                        request_recovery.attempt(),
+                        failed_attempt,
                         attempt_completion,
                         &stream_ctx,
                         retries,
@@ -9810,7 +9928,7 @@ fn processQueuedPromptLoop(
                         continue;
                     }
                 }
-                if (retries) {
+                if (retries) retry: {
                     const failure_tool_evidence = settledAttemptToolEvidence(
                         deps.tool_registry,
                         preserved_tool_evidence,
@@ -9818,8 +9936,31 @@ fn processQueuedPromptLoop(
                         attempt_disposition,
                         &stream_ctx,
                     );
-                    _ = try request_recovery.failed(.{ .kind = failure_kind.? });
-                    if (try request_recovery.waitForSend() != null) {
+                    // Only a content filter's block gets a send back at once;
+                    // every other failure here waits.
+                    const resend_now = try request_recovery.failed(.{ .kind = failure_kind.? }) != null;
+                    if (content_filtered) traceRouteFailure(
+                        step_ctx,
+                        job.model,
+                        gateway_model,
+                        attempt_fast_mode,
+                        failed_attempt,
+                        attempt_completion,
+                        &stream_ctx,
+                        resend_now,
+                    );
+                    if (resend_now) {
+                        debug_trace.eventf("agent", "content_filter_resend", step_ctx, "attempt={d} model={s}", .{
+                            request_recovery.attempt(),
+                            gateway_model,
+                        });
+                    }
+                    // Past its resends, the module needs the user. A host
+                    // that can ask waits for them below; on one that cannot,
+                    // the turn ends on the content-filter error further
+                    // down, as it did before the resends.
+                    if (content_filtered and !resend_now and !request_recovery.canAskUser()) break :retry;
+                    if (resend_now or try request_recovery.waitForSend() != null) {
                         preserved_tool_evidence = failure_tool_evidence;
                         recovery_strategy = resend_strategy.select(.possibly_sent, failure_tool_evidence);
                         recovery_cause = cause;
@@ -11969,7 +12110,29 @@ fn processQueuedPromptLoop(
                 }
             else
                 true;
-            if (!applicable_targets_fresh) {
+            const applicable_targets_resolved_late = if (applicable_targets_fresh)
+                false
+            else
+                lateResolvedCallMayRun(
+                    arena,
+                    deps,
+                    config,
+                    &context_delivery_state,
+                    step_ctx,
+                    tool_call,
+                    preparation_batch.preparations[tool_call_index],
+                ) catch |err| {
+                    return settleFailedContextGate(
+                        deps,
+                        &stream_ctx.provisional_statuses,
+                        stream_ctx.alloc,
+                        turn_id,
+                        effective_tool_calls[tool_call_index..],
+                        advertised_dynamic_tool_names,
+                        err,
+                    );
+                };
+            if (!applicable_targets_fresh and !applicable_targets_resolved_late) {
                 try appendNotExecutedToolResult(
                     deps,
                     &stream_ctx.provisional_statuses,

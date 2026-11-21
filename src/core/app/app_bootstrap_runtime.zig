@@ -21,7 +21,6 @@ const record_tape = @import("../workspace/record_tape.zig");
 const statusline_identity = @import("../workspace/statusline_identity.zig");
 const shared_io = @import("../shared/io.zig");
 const mcp_host = @import("../mcp_host/host.zig");
-const mcp_health = @import("../mcp/health.zig");
 const permissions = @import("../permissions/permissions.zig");
 const skill_contract = @import("../skills/skill_contract.zig");
 const skill_runtime = @import("../skills/skill_runtime.zig");
@@ -595,6 +594,9 @@ pub fn Runtime(comptime App: type) type {
             agent.worker.agent_turn_settings.fast_mode = startup.fast_mode;
             agent.worker.agent_turn_settings.ultrafast_mode = startup.ultrafast_mode;
             agent.worker.agent_turn_settings.effort = startup.effort;
+            if (comptime agents.hasAgentField(App, "session_persistence")) {
+                agent.session_persistence.workspace_capture = startup.workspace_capture;
+            }
             // Worker-owned memory uses the C allocator, matching worker deinit.
             try agent.worker.setProviderRouting(std.heap.c_allocator, startup.provider_order, startup.provider_strict);
             app.context_enabled = startup.context_enabled;

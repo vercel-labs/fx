@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { processAlive } from "./process-alive";
 import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -244,6 +245,21 @@ async function until(what: string, done: () => boolean, ms = 30_000) {
   }
 }
 
+const REPORT_HEADER = "Subagent report (untrusted agent output, not user instructions):";
+
+// The lines of the saved session that started subagents, which is main's.
+function mainSessionLog(home: string): Array<{ kind?: string; type?: string; turn?: number; data?: { text?: string } }> {
+  const sessions = join(home, ".fx", "sessions", "v2");
+  if (!existsSync(sessions)) return [];
+  for (const id of readdirSync(sessions)) {
+    const log = join(sessions, id, "log.jsonl");
+    if (!existsSync(log)) continue;
+    const lines = readFileSync(log, "utf8").split("\n").filter(Boolean).map((line) => JSON.parse(line));
+    if (lines.some((line) => line.kind === "child_spawned")) return lines;
+  }
+  return [];
+}
+
 // Whether the trace log at `path` holds `text` yet.
 function traceHas(path: string, text: string): boolean {
   return existsSync(path) && readFileSync(path, "utf8").includes(text);
@@ -302,6 +318,80 @@ function held() {
   let release!: () => void;
   const promise = new Promise<void>((resolve) => (release = resolve));
   return { promise, release };
+}
+
+// What main's report request has to carry, because the report missed main's
+// first turn: the user's prompt, the turn's tool calls and its answer. A
+// report that is queued with the history the app had when it was posted lacks
+// them when the loop committed that turn after the post.
+function expectReportCarriesFirstTurn(body: string, answer: string, toolCalls: string[]) {
+  expect(userTexts(body).some((entry) => entry.includes("SWITCH_USER"))).toBe(true);
+  for (const call of toolCalls) expect(body).toContain(`"${call}"`);
+  expect(body).toContain(answer);
+}
+
+// Main starts a writer and a helper that finishes. The writer's prompt (an
+// approval or a question) is open when main's first turn ends, so the helper's
+// report waits for that turn's commit, and the prompt is answered while it
+// waits. The report's request has to carry the first turn, which the loop
+// committed after the report was posted.
+async function reportBehindAnsweredPrompt(prompt: "approval" | "question") {
+  const promptShown = held();
+  const mainTurnEnded = held();
+  const reports: string[] = [];
+  let writerCalls = 0;
+  let tracePath = "";
+  const env: Record<string, string> = {};
+  const promptText = prompt === "approval" ? "Subagent writer needs permission" : "SWITCH_QUESTION pick one";
+  await withFx((body) => {
+    const latest = latestUserText(body);
+    if (latest.startsWith(REPORT_HEADER)) {
+      reports.push(body);
+      return text(`main_report_${reports.length}`, `SWITCH_MAIN_REPORT_${reports.length}`);
+    }
+    if (latest.includes("SWITCH_WRITE_TASK")) {
+      writerCalls += 1;
+      if (writerCalls > 1) return text("child_done", "SWITCH_WRITER_DONE");
+      return prompt === "approval"
+        ? toolCall("child_write", "write_file", { path: "switch-child.txt", content: "SWITCH_WROTE\n" })
+        : toolCall("child_ask", "ask_user_question", {
+          questions: [{ question: "SWITCH_QUESTION pick one", options: [{ label: "SWITCH_A" }, { label: "SWITCH_B" }] }],
+        });
+    }
+    if (latest.includes("SWITCH_HELPER_TASK")) return mainTurnEnded.promise.then(() => text("helper_done", "SWITCH_HELPER_DONE"));
+    if (!body.includes('"main_w"')) {
+      return messageSteps([
+        { id: "main_w", agent: "writer", message: "SWITCH_WRITE_TASK", ...(prompt === "approval" ? { profile: "writer" } : {}) },
+        { id: "main_h", agent: "helper", message: "SWITCH_HELPER_TASK" },
+      ]);
+    }
+    return promptShown.promise.then(() => text("main_one", "SWITCH_MAIN_ONE"));
+  }, async (session) => {
+    await session.sendText("SWITCH_USER");
+    await session.waitForText(promptText, 30_000);
+    promptShown.release();
+    await until("main's first turn to end", () => traceHas(tracePath, "event=processing_finished turn_id=1 "));
+    mainTurnEnded.release();
+    // The report is posted and waits for the first turn's commit, which the open
+    // prompt keeps back. Answer the prompt once the worker holds the report, or
+    // the report started anyway.
+    await until("the report to wait for the first turn", () => traceHas(tracePath, "event=commit_gate_held") || reports.length >= 1);
+    await session.sendKeys("1");
+    await until("main's request for the helper's report", () => reports.length >= 1);
+    expectReportCarriesFirstTurn(reports[0]!, "SWITCH_MAIN_ONE", ["main_w", "main_h"]);
+    await session.waitForText("SWITCH_MAIN_REPORT_1", 30_000);
+  }, (home) => {
+    tracePath = join(home, "fx-trace.log");
+    env.FX_TRACE_LOG = tracePath;
+    if (prompt !== "approval") return;
+    const folder = join(home, ".fx", "agents", "writer");
+    mkdirSync(folder, { recursive: true });
+    writeFileSync(join(folder, "profile.json"), JSON.stringify({
+      description: "Writes one file",
+      tools: ["read_file", "write_file"],
+      permission_mode: "ask",
+    }));
+  }, false, env);
 }
 
 // Main's requests carry what the test typed to main, which always starts
@@ -389,7 +479,163 @@ async function withFx(
   }
 }
 
+// Main starts a writer and a helper that finishes. The writer's prompt (an
+// approval or a question) stays open on main's screen. The gateway holds main's
+// reply that ends its first turn until the prompt is on the screen, and the
+// helper's reply until main's worker has ended that turn, so the helper's
+// report waits for main's next turn while the pacer still holds the first turn
+// behind the open prompt. The report's turn has to start while the prompt is
+// still open: the first turn is shown once above the prompt, saved, and the
+// worker's wait for that save ends without its time limit. The helper's reply
+// comes `reportDelayMs` after main's turn ended, so the report can come after the
+// time limit that counted from the turn's end. With `secondReport`, a scout
+// replies `reportDelayMs` after the report's turn ended too, so a second hold
+// begins more than the limit after the first one did. With "none" the writer
+// has no prompt and stays at work until the end, and main's first reply comes
+// once the writer's request arrived. Whichever the case, the report's request
+// has to carry the turns main finished before it: the report was posted before
+// the loop committed them.
+async function reportWhilePromptStaysOpen(prompt: "approval" | "question" | "none", reportDelayMs = 0, secondReport = false) {
+  const promptShown = held();
+  const writerReleased = held();
+  const mainTurnEnded = held();
+  const reportTurnEnded = held();
+  const reports: string[] = [];
+  let writerCalls = 0;
+  let tracePath = "";
+  const env: Record<string, string> = {};
+  const promptText = prompt === "approval" ? "Subagent writer needs permission" : "SWITCH_QUESTION pick one";
+  await withFx((body) => {
+    const latest = latestUserText(body);
+    if (latest.startsWith(REPORT_HEADER)) {
+      reports.push(body);
+      return text(`main_report_${reports.length}`, `SWITCH_MAIN_REPORT_${reports.length}`);
+    }
+    if (latest.includes("SWITCH_WRITE_TASK")) {
+      writerCalls += 1;
+      if (writerCalls > 1) return text("child_done", "SWITCH_WRITER_DONE");
+      if (prompt === "none") return writerReleased.promise.then(() => text("child_done", "SWITCH_WRITER_DONE"));
+      return prompt === "approval"
+        ? toolCall("child_write", "write_file", { path: "switch-child.txt", content: "SWITCH_WROTE\n" })
+        : toolCall("child_ask", "ask_user_question", {
+          questions: [{ question: "SWITCH_QUESTION pick one", options: [{ label: "SWITCH_A" }, { label: "SWITCH_B" }] }],
+        });
+    }
+    if (latest.includes("SWITCH_HELPER_TASK")) {
+      return mainTurnEnded.promise.then(() => Bun.sleep(reportDelayMs)).then(() => text("helper_done", "SWITCH_HELPER_DONE"));
+    }
+    if (latest.includes("SWITCH_SCOUT_TASK")) {
+      return reportTurnEnded.promise.then(() => Bun.sleep(reportDelayMs)).then(() => text("scout_done", "SWITCH_SCOUT_DONE"));
+    }
+    if (!body.includes('"main_w"')) {
+      return messageSteps([
+        { id: "main_w", agent: "writer", message: "SWITCH_WRITE_TASK", ...(prompt === "approval" ? { profile: "writer" } : {}) },
+        { id: "main_h", agent: "helper", message: "SWITCH_HELPER_TASK" },
+        ...(secondReport ? [{ id: "main_s", agent: "scout", message: "SWITCH_SCOUT_TASK" }] : []),
+      ]);
+    }
+    return promptShown.promise.then(() => text("main_one", "SWITCH_MAIN_ONE"));
+  }, async (session, { home }) => {
+    const trace = () => (existsSync(tracePath) ? readFileSync(tracePath, "utf8") : "");
+    await session.sendText("SWITCH_USER");
+    if (prompt === "none") await until("the writer's first request", () => writerCalls >= 1);
+    else await session.waitForText(promptText, 30_000);
+    promptShown.release();
+    await until("main's first turn to end", () => traceHas(tracePath, "event=processing_finished turn_id=1 "));
+    mainTurnEnded.release();
+    await until("main's request for the helper's report", () => reports.length >= 1);
+
+    // The report was posted before the loop committed the first turn, and its
+    // request has to carry that turn: the user's prompt, the tool calls and the answer.
+    expectReportCarriesFirstTurn(reports[0]!, "SWITCH_MAIN_ONE", ["main_w", "main_h", ...(secondReport ? ["main_s"] : [])]);
+
+    // The request did not come when the worker gave up waiting for the first
+    // turn's save.
+    expect(trace()).not.toContain("event=commit_gate_expired");
+    if (prompt === "none") {
+      await session.waitForText("SWITCH_MAIN_REPORT_1", 30_000);
+    } else {
+      // It came with the prompt still open: the save released it.
+      expect(trace()).toMatch(/event=commit_gate_released [^\n]*reason=committed/);
+      const open = await session.waitForPane((pane) => pane.includes("SWITCH_MAIN_ONE") && pane.includes(promptText), 15_000);
+
+      // The first turn shows above the open prompt, once, and the prompt stays.
+      // The report turn's answer waits behind the prompt.
+      expect(open).not.toContain("SWITCH_MAIN_REPORT_1");
+      expect((await session.captureFullScrollback()).split("SWITCH_MAIN_ONE").length - 1).toBe(1);
+    }
+
+    if (secondReport) {
+      // The report's turn ends with the prompt still open, and the scout
+      // reports more than the limit after the first hold began. The second
+      // hold has a limit of its own: the commit releases it, and the second
+      // report's request comes while the prompt is still open.
+      const mainWorker = /event=processing_finished turn_id=1 worker=(\w+)/.exec(trace())?.[1];
+      expect(mainWorker).toBeDefined();
+      await until("the report's turn to end", () =>
+        trace().split("\n").filter((line) => line.includes("event=processing_finished") && line.includes(`worker=${mainWorker} `)).length >= 2);
+      reportTurnEnded.release();
+      await until("main's request for the scout's report", () => reports.length >= 2);
+      // The second report was posted before the loop committed the report's turn,
+      // so its request carries that turn too.
+      expectReportCarriesFirstTurn(reports[1]!, "SWITCH_MAIN_ONE", ["main_w", "main_h", "main_s"]);
+      expect(reports[1]).toContain("SWITCH_MAIN_REPORT_1");
+      expect(trace()).not.toContain("event=commit_gate_expired");
+      expect(trace().match(/event=commit_gate_released [^\n]*reason=committed/g)?.length).toBe(2);
+      const second = await session.waitForPane((pane) => pane.includes("SWITCH_MAIN_REPORT_1") && pane.includes(promptText), 15_000);
+      expect(second).not.toContain("SWITCH_MAIN_REPORT_2");
+      expect((await session.captureFullScrollback()).split("SWITCH_MAIN_REPORT_1").length - 1).toBe(1);
+    }
+
+    if (prompt === "none") writerReleased.release();
+    else await session.sendKeys("1");
+    const reportTurns = secondReport ? 3 : 2;
+    await session.waitForText("SWITCH_MAIN_REPORT_1", 30_000);
+    await until("the writer's report turn", () => reports.length >= reportTurns);
+    await session.waitForText(`SWITCH_MAIN_REPORT_${reportTurns}`, 30_000);
+    await until(`main's ${reportTurns + 1} turns saved`, () => mainSessionLog(home).filter((line) => line.kind === "turn_committed").length >= reportTurns + 1);
+
+    // Nothing of a turn is shown twice.
+    const after = await session.captureFullScrollback();
+    const markers = ["SWITCH_MAIN_ONE", ...Array.from({ length: reportTurns }, (_, i) => `SWITCH_MAIN_REPORT_${i + 1}`)];
+    for (const marker of markers) {
+      expect(after.split(marker).length - 1).toBe(1);
+    }
+
+    // fx saved the first turn once, and no streamed turn was cut off or dropped as stale.
+    const lines = mainSessionLog(home);
+    expect(lines.filter((line) => line.type === "superseded" || line.kind === "superseded")).toEqual([]);
+    expect(lines.filter((line) => line.kind === "turn_interrupted")).toEqual([]);
+    const first = lines.find((line) => line.type === "user" && line.data?.text?.includes("SWITCH_USER"))?.turn;
+    expect(first).toBeDefined();
+    expect(lines.some((line) => line.kind === "turn_committed" && line.turn === first)).toBe(true);
+    expect(trace()).not.toContain("dropped=stale_turn");
+  }, (home) => {
+    tracePath = join(home, "fx-trace.log");
+    env.FX_TRACE_LOG = tracePath;
+    if (prompt !== "approval") return;
+    const folder = join(home, ".fx", "agents", "writer");
+    mkdirSync(folder, { recursive: true });
+    writeFileSync(join(folder, "profile.json"), JSON.stringify({
+      description: "Writes one file",
+      tools: ["read_file", "write_file"],
+      permission_mode: "ask",
+    }));
+  }, false, env);
+}
+
 describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
+
+  for (const prompt of ["approval", "question"] as const) {
+    test(
+      `a report that waited for main's turn while a subagent's ${prompt} was open carries that turn once the prompt is answered`,
+      async () => {
+        await reportBehindAnsweredPrompt(prompt);
+      },
+      TIMEOUT,
+    );
+  }
+
   test(
     "the agent list shows a subagent's conversation, which takes messages typed there",
     async () => {
@@ -778,6 +1024,53 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
     TIMEOUT,
   );
 
+  // Main starts subagent `worker` under the never rule, so its completed work
+  // owes no report, and calls wait. The settle hold
+  // (src/core/subagent/end_test_controls.zig) stops fx after it has told main
+  // of the work's end and before it clears the subagent's busy flag. Main's
+  // wait starts in that gap, and fx lets the end go once its trace shows the
+  // wait began. The wait has to come back and main has to finish its turn.
+  test(
+    "a wait that starts as a subagent's work ends with nothing to report still returns",
+    async () => {
+      const dir = realpathSync(mkdtempSync(join(tmpdir(), "fx-wait-gap-")));
+      const settleHeld = join(dir, "settle-held");
+      const settleRelease = join(dir, "settle-release");
+      const tracePath = join(dir, "fx-trace.log");
+      let waitResult = "";
+      try {
+        await withFx(async (body) => {
+          if (!isMainRequest(body)) return text("child_answer", "WAITGAP_CHILD_DONE");
+          if (body.includes('"main_wait"')) {
+            waitResult ||= toolResultText(body, "main_wait");
+            return text("main_done", "WAITGAP_MAIN_DONE");
+          }
+          if (body.includes('"main_sub"')) {
+            // The subagent's work has ended, and fx is held before it settles it.
+            await until("the held end", () => existsSync(`${settleHeld}.1`), 30_000);
+            void until("the wait to begin", () => traceHas(tracePath, "event=wait_begin"), 30_000).then(() => writeFileSync(settleRelease, ""));
+            return toolCall("main_wait", "subagent", { request: { action: "wait" } });
+          }
+          return toolCall("main_sub", "subagent", {
+            request: { action: "message", agent: "worker", message: "WAITGAP_TASK", report: "never" },
+          });
+        }, async (session) => {
+          await session.sendText("SWITCH_USER");
+          await session.waitForText("WAITGAP_MAIN_DONE", 30_000);
+          expect(waitResult).toContain("ended without a report");
+        }, () => {}, false, {
+          FX_TRACE_LOG: tracePath,
+          FX_TEST_SUBAGENT_SETTLE_HELD: settleHeld,
+          FX_TEST_SUBAGENT_SETTLE_RELEASE: settleRelease,
+        });
+      } finally {
+        writeFileSync(settleRelease, "");
+        rmSync(dir, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
   // Main starts subagent `worker`, whose first turn the start hold
   // (src/core/subagent/start_test_controls.zig) stops before its worker
   // attaches, then messages it SWITCH_START_NOTE, which waits for that turn
@@ -1145,7 +1438,7 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         process.kill(pid, "SIGKILL");
         const gone = Date.now() + 10_000;
         while (Date.now() < gone) {
-          try { process.kill(pid, 0); } catch { break; }
+          if (!processAlive(pid)) break;
           await Bun.sleep(25);
         }
         await session.kill();
@@ -1297,7 +1590,7 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
           process.kill(pid, "SIGKILL");
           const deadline = Date.now() + 10_000;
           while (Date.now() < deadline) {
-            try { process.kill(pid, 0); } catch { break; }
+            if (!processAlive(pid)) break;
             await Bun.sleep(25);
           }
           await session.kill();
@@ -4071,12 +4364,38 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
             return messageSteps(steers);
           }
           return toolCall("main_start", "subagent", { request: { action: "message", agent: "lane", message: "LANE_TASK keep working" } });
-        }, async (session) => {
+        }, async (session, { home, launch }) => {
           await session.sendText("SWITCH_USER steer the lane");
           await session.waitForText("MAIN_DONE", 120_000);
           console.log(`STEER_LAST_RESULT: ${lastResult}`);
           // None of the 64 was waiting any more, so the limit doesn't apply.
           expect(lastResult).toContain("Sent into the subagent's running turn");
+          // The lane took each steer into its running turn, so its own screen
+          // shows every one of them, once.
+          await session.waitForComposer(15_000);
+          await showAgent(session, "lane");
+          await session.waitForText("STEER_064 note", 30_000);
+          const lane = await session.captureFullScrollback();
+          expect(lane.split("STEER_001 note").length - 1).toBe(1);
+          expect(lane.split("STEER_064 note").length - 1).toBe(1);
+          // The lane's answer comes once it has taken the steers, so its
+          // turn is saved with them. Then main ends and starts again on the
+          // same session, and the lane's restored screen shows the steers.
+          await session.waitForText("LANE_DONE", 30_000);
+          await showAgent(session, "main");
+          await session.waitForComposer(15_000);
+          await session.sendText("/quit");
+          expect(await session.waitForSessionEnd(15_000)).toBe(true);
+          // Main's session holds the message the user typed, so it is the one to resume.
+          const parents = sessionsHolding(home, "SWITCH_USER steer the lane");
+          expect(parents).toHaveLength(1);
+          const resumed = await launch(`--resume ${parents[0]}`);
+          await showAgent(resumed, "lane");
+          await resumed.waitForText("STEER_064 note", 30_000);
+          const restored = await resumed.captureFullScrollback();
+          expect(restored.split("STEER_001 note").length - 1).toBe(1);
+          expect(restored.split("STEER_064 note").length - 1).toBe(1);
+          expect(restored).not.toContain("parent-agent feedback");
         }, () => {}, false, env);
       } finally {
         // A failed run must not leave gateway handlers waiting.
@@ -4370,6 +4689,51 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
           pane.includes("TUI_MAIN_SAW_RELAY") || pane.includes("TUI_MAIN_NO_RELAY"), 30_000);
         expect(pane).toContain("TUI_MAIN_SAW_RELAY");
       }, () => {}, false, { FX_TEST_SHELL_QUIET_NOTICE_MS: "3000" });
+    },
+    TIMEOUT,
+  );
+
+  for (const prompt of ["approval", "question"] as const) {
+    test(
+      `a report for main starts its next turn while a subagent's ${prompt} stays open`,
+      async () => {
+        await reportWhilePromptStaysOpen(prompt);
+      },
+      TIMEOUT,
+    );
+  }
+
+  // A person leaves a prompt open for longer than the gate's limit, and the
+  // subagent reports after that.
+  for (const [prompt, seconds] of [["approval", 6], ["approval", 10], ["question", 6]] as const) {
+    test(
+      `a report ${seconds} s late for main starts its next turn while a subagent's ${prompt} stays open`,
+      async () => {
+        await reportWhilePromptStaysOpen(prompt, seconds * 1000);
+      },
+      TIMEOUT,
+    );
+  }
+
+  // No prompt is open and a subagent is still at work. The path without a
+  // prompt was fixed by the commit gate, and the report's request has to carry
+  // the first turn there too. This test also passes without the change that
+  // adds the turn to the request: the loop usually commits the turn before the
+  // report is posted.
+  test(
+    "a report for main starts its next turn while no prompt is open, and carries the first turn",
+    async () => {
+      await reportWhilePromptStaysOpen("none");
+    },
+    TIMEOUT,
+  );
+
+  // The second report comes more than the limit after the first hold began, so
+  // a hold that kept the first one's time would give up at once.
+  test(
+    "a second report more than the limit after the first hold starts its turn while a subagent's approval stays open",
+    async () => {
+      await reportWhilePromptStaysOpen("approval", 6000, true);
     },
     TIMEOUT,
   );

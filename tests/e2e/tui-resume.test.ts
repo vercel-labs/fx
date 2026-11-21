@@ -1,4 +1,5 @@
 import { expect, test } from "bun:test";
+import { processAlive } from "./process-alive";
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
@@ -241,6 +242,24 @@ async function waitForCondition(
     await Bun.sleep(50);
   }
   throw new Error(`Timed out waiting for ${description}.`);
+}
+
+/// Waits until session `id`'s log holds its interrupted turn. fx traces
+/// `event=interrupt_persisted` when the agent worker builds that turn, and
+/// saves it a little later, when the app thread handles the worker's finish
+/// event (`finish` in `src/core/agent/runtime/finalization.zig`). The
+/// `turn_interrupted` record is the last one that save writes, after the
+/// turn's items and the blobs they name.
+async function waitForSavedInterruptedTurn(
+  home: string,
+  id: string,
+  timeout = TIMEOUT,
+): Promise<void> {
+  await waitForCondition(
+    () => logLines(home, id).some((line) => line.kind === "turn_interrupted"),
+    `session ${id} to save its interrupted turn (a turn_interrupted record in its log)`,
+    timeout,
+  );
 }
 
 async function waitForPersistedSessionMarker(
@@ -2385,6 +2404,7 @@ while :; do :; done
       expect(beforePlain).not.toContain(tailMarker);
 
       const sessionId = sessionIdFromHome(home);
+      await waitForSavedInterruptedTurn(home, sessionId, timeout);
       const replays = commandReplays(home, sessionId);
       expect(replays).toHaveLength(1);
       const replayName = replays[0]!.name;
@@ -2592,6 +2612,7 @@ while :; do :; done
       expect(countOccurrences(compact, headMarker)).toBe(0);
       expect(compact).not.toContain(tailMarker);
       const sessionId = sessionIdFromHome(home);
+      await waitForSavedInterruptedTurn(home, sessionId, timeout);
       const replays = commandReplays(home, sessionId);
       expect(replays).toHaveLength(1);
       expect(statSync(replays[0]!.path).size).toBeGreaterThan(0);
@@ -8798,14 +8819,18 @@ test.skipIf(!tmuxAvailable())(
       const historyPath = logOf(home, sessionId);
       const before = readFileSync(historyPath, "utf8");
       await active.sendText("/compact");
-      // Success is silent; publication, not a transcript notice, gates resume.
+      // Publication, not the transcript line, gates resume.
       await waitForCondition(() => readFileSync(historyPath, "utf8").includes('"kind":"compacted"'), "durable context checkpoint");
-      await active.waitForPane((pane) => hasEmptyComposer(pane) && !/Preparing compaction|Compacting|Stopping compaction/.test(pane), TIMEOUT);
+      // The success line arrives as a queued notice just after the row clears.
+      await active.waitForPane((pane) =>
+        hasEmptyComposer(pane) &&
+        !/Compacting|Stopping compaction/.test(pane) &&
+        /Context compacted \((?:\d+h)?(?:\d+m)?\d+s\)/.test(pane), TIMEOUT);
       const compacted = readFileSync(historyPath, "utf8");
       expect(compacted.startsWith(before)).toBe(true);
       const records = compacted.trim().split("\n").map((line) => JSON.parse(line));
       expect(records.filter((record) => record.kind === "compacted")).toHaveLength(1);
-      expect(await active.captureFullScrollback()).not.toContain("Context compacted.");
+      expect(await active.captureFullScrollback()).toMatch(/Context compacted \((?:\d+h)?(?:\d+m)?\d+s\)/);
       // Plain turns have nothing to summarize, but the earlier message may set
       // a rule, so the one model call files it; the checkpoint keeps the
       // earlier message and reply word for word.
@@ -9287,14 +9312,7 @@ async function endFx(session: TmuxSession, signal: "SIGKILL" | "SIGHUP") {
   const pid = session.processPid();
   process.kill(pid, signal);
   const deadline = Date.now() + 10_000;
-  while (Date.now() < deadline) {
-    try {
-      process.kill(pid, 0);
-    } catch {
-      break;
-    }
-    await Bun.sleep(25);
-  }
+  while (Date.now() < deadline && processAlive(pid)) await Bun.sleep(25);
   await session.kill();
 }
 

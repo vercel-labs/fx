@@ -17,9 +17,9 @@ test("TLC: every model's smoke and stress pass, every planted bug is caught, sta
   expect(results.filter((r) => r.verdict === "FAIL").map((r) => r.label)).toEqual([]);
   const count = (kind: string, verdict: string) => results.filter((r) => r.kind === kind && r.verdict === verdict).length;
   // SharedLogins, SubagentAccess, UrlRetry, MixedBuilds, StoreLockBudget,
-  // RefreshLease and McpRules joined the four.
-  expect(count("smoke", "PASS")).toBe(11);
-  expect(count("stress", "PASS")).toBe(11);
+  // RefreshLease, ErrorData, ConfigEdit, McpRules and Connect joined the four.
+  expect(count("smoke", "PASS")).toBe(14);
+  expect(count("stress", "PASS")).toBe(14);
   expect(count("mutant", "CAUGHT")).toBe(results.filter((r) => r.kind === "mutant").length);
   // Credentials' two findings and its repair witness became the code.
   // HostLifecycle's OneProcessPerServer did too: it
@@ -30,7 +30,9 @@ test("TLC: every model's smoke and stress pass, every planted bug is caught, sta
   // IndicatorClears. UrlRetry's finding is the code before the held call:
   // it ended the call at the -32042 error. HostLifecycle's AtMostOneOwner
   // became the code once a reload kept its host: its smoke and stress
-  // configs check it. McpRules' three are the code before the fix (each MCP
+  // configs check it. ErrorData's one is the code before the fix (a failed call's error data
+  // never reached the model). Connect's two are std's retry of a connect after a stray signal: a connect the
+  // kernel was completing is reported failed, and a connecting socket gets a second connect. McpRules' three are the code before the fix (each MCP
   // path picked its rule set on its own, so in full access toolbox search and the
   // open of a small server ignored deny rules, and every other MCP path still
   // applied them). SignIn's five findings are fx before the check request
@@ -38,7 +40,11 @@ test("TLC: every model's smoke and stress pass, every planted bug is caught, sta
   // saved, a refused login another fx takes), the branch for an unreadable
   // store answering a sign-in's check request first, and a failed refresh after a
   // 401 read as a check that couldn't be made; its repair witness is the code.
-  expect(count("finding", "FINDING")).toBe(10);
+  // ConfigEdit's four are the code before the reader check (a save the reader
+  // skips, a profile rewritten under a misspelled key) and the two designs fx
+  // does not use for the check: its bounded load scan gives up on a big file,
+  // and a dry run outside the lock does not see a change another fx makes.
+  expect(count("finding", "FINDING")).toBe(17);
   expect(count("repair", "PASS")).toBe(2);
 }, 1_800_000);
 
@@ -107,6 +113,22 @@ const controls: { name: string; module: string; constants: Record<string, never>
     badAt: 4,
   },
   {
+    name: "error data", module: "ErrorData",
+    constants: { ObsCap: 8192, ObsMaxSize: 1_048_576, ObsMaxChar: 6, ObsCarry: "data" },
+    good: [
+      { event: "observed", data: { code: "invalid_params", kind: "text", size: 40, form: "whole", prefix: 40, extra: 0, marked: false, split: false, logged: false } },
+      // 10,002 bytes of escaped quotes: 4,095 of them, written with 4,095 more bytes, fill the cap with the quotes around them.
+      { event: "observed", data: { code: "invalid_params", kind: "text", size: 10002, form: "cut", prefix: 4095, extra: 4095, marked: true, split: false, logged: false } },
+      { event: "observed", data: { code: "url_required", kind: "text", size: 50, form: "none", prefix: 0, extra: 0, marked: false, split: false, logged: false } },
+    ],
+    // The same quotes cut by their raw bytes: 8,190 of them are 16,380 bytes once written, twice the cap.
+    bad: [
+      { event: "observed", data: { code: "invalid_params", kind: "text", size: 40, form: "whole", prefix: 40, extra: 0, marked: false, split: false, logged: false } },
+      { event: "observed", data: { code: "invalid_params", kind: "text", size: 10002, form: "cut", prefix: 8190, extra: 8190, marked: true, split: false, logged: false } },
+    ],
+    badAt: 1,
+  },
+  {
     name: "URL retry", module: "UrlRetry",
     constants: { ObsUrls: 2, ObsSlots: 4, ObsMaxCalls: 2, ObsGuard: true },
     good: [
@@ -137,6 +159,22 @@ const controls: { name: string; module: string; constants: Record<string, never>
       { event: "run", data: { cmd: "signin" } }, { event: "observe", data: { v2kind: "v2", v2: true, v3: false } },
     ],
     badAt: 2,
+  },
+  {
+    name: "config edit", module: "ConfigEdit",
+    constants: { ObsNames: ["a"], ObsClasses: ["ok", "bad", "auth"], ObsChecked: true, ObsKeyScan: "complete", ObsGuardRemove: true, ObsAtomic: true },
+    good: [
+      { event: "init", data: { profile: { st: "ok", typo: "no-typo", both: false, big: false, ent: { a: "none" } }, project: { st: "absent", typo: "no-typo", both: false, big: false, ent: { a: "none" } } } },
+      { event: "add", data: { file: "profile", name: "a", class: "bad", outcome: "refused", same: true } },
+      { event: "add", data: { file: "profile", name: "a", class: "ok", outcome: "added", same: false } },
+      { event: "list", data: { file: "profile", loaded: ["a"] } },
+    ],
+    // An add of an entry the reader skips that says "Added": the model refuses it.
+    bad: [
+      { event: "init", data: { profile: { st: "ok", typo: "no-typo", both: false, big: false, ent: { a: "none" } }, project: { st: "absent", typo: "no-typo", both: false, big: false, ent: { a: "none" } } } },
+      { event: "add", data: { file: "profile", name: "a", class: "bad", outcome: "added", same: false } },
+    ],
+    badAt: 1,
   },
   {
     name: "MCP rules", module: "McpRules",
@@ -209,6 +247,19 @@ test("bridge control (refresh lease): going ahead behind a frozen holder on time
   expect(g.verdict).toBe("ACCEPTED");
   expect(b.verdict).toBe("VIOLATES");
   expect(b.broken?.sort()).toEqual(["GoAheadOnTime", "NoGoAheadPastLiveRefresher"]);
+}, 300_000);
+
+test("bridge control (connect): a stray signal that only ends a wait is ACCEPTED, and std's second connect after it VIOLATES", async () => {
+  const dir = join(artifacts, "bridge", "Connect");
+  const ev = (event: string, result?: string): TraceRecord => ({ event, data: result === undefined ? {} : { result } });
+  const good = [ev("start"), ev("intr"), ev("intr"), ev("done", "ok")];
+  // The second connect on the socket that was connecting: macOS answers ISCONN, and both systems fail it in std.
+  const bad = [ev("start"), ev("intr"), ev("reissue"), ev("done", "unexpected")];
+  const g = await checkTrace({ module: "Connect", records: good, constants: { ObsStd: false }, dir: join(dir, "good") });
+  const b = await checkTrace({ module: "Connect", records: bad, constants: { ObsStd: true }, dir: join(dir, "bad") });
+  expect(g.verdict).toBe("ACCEPTED");
+  expect(b.verdict).toBe("VIOLATES");
+  expect(b.broken?.sort()).toEqual(["NoFalseFailure", "NoReissue"]);
 }, 300_000);
 
 test("bridge control: an empty trace is INCONCLUSIVE, never a pass", async () => {
