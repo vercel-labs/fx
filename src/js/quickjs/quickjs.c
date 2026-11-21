@@ -31204,6 +31204,8 @@ static JSValue js_module_ns_autoinit(JSContext *ctx, JSObject *p, JSAtom atom,
                                      void *opaque)
 {
     JSModuleDef *m = opaque;
+    /* fx loads no modules. */
+    return JS_ThrowTypeError(ctx, "modules are not available in code mode");
     return JS_GetModuleNamespace(ctx, m);
 }
 
