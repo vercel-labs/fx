@@ -766,10 +766,23 @@ pub const WorkerRuntime = struct {
         self.compaction_presentation.running(id, stage);
     }
 
+    pub fn askedCompactionActivity(self: *WorkerRuntime, id: compaction_activity.OperationId) void {
+        self.worker_mutex.lockUncancelable(io_mod.getIo());
+        defer self.worker_mutex.unlock(io_mod.getIo());
+        self.compaction_presentation.asked(id, io_mod.milliTimestamp());
+    }
+
+    /// The UI's tick hands the compaction row the time.
+    pub fn observeCompactionActivity(self: *WorkerRuntime, now_ms: i64) void {
+        self.worker_mutex.lockUncancelable(io_mod.getIo());
+        defer self.worker_mutex.unlock(io_mod.getIo());
+        self.compaction_presentation.observed(now_ms);
+    }
+
     pub fn writtenCompactionActivity(self: *WorkerRuntime, id: compaction_activity.OperationId, percent: u8) void {
         self.worker_mutex.lockUncancelable(io_mod.getIo());
         defer self.worker_mutex.unlock(io_mod.getIo());
-        self.compaction_presentation.written(id, percent);
+        self.compaction_presentation.written(id, percent, io_mod.milliTimestamp());
     }
 
     pub fn settleCompactionActivity(self: *WorkerRuntime, id: compaction_activity.OperationId, feedback: compaction_activity.Feedback) void {
@@ -3972,13 +3985,13 @@ test "a reader never sees the summary's count fall while the worker writes it" {
     var last: u8 = 0;
     var reads: usize = 0;
     while (last < 99) : (reads += 1) {
-        const now = runtime.compactionActivitySnapshot().operation.?.written_percent;
+        const now = runtime.compactionActivitySnapshot().operation.?.progress.notes;
         try std.testing.expect(now >= last);
         try std.testing.expect(now <= 99);
         last = now;
     }
     thread.join();
-    try std.testing.expectEqual(@as(u8, 99), runtime.compactionActivitySnapshot().operation.?.written_percent);
+    try std.testing.expectEqual(@as(u8, 99), runtime.compactionActivitySnapshot().operation.?.progress.notes);
     try std.testing.expect(reads > 0);
 }
 

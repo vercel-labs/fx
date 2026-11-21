@@ -3309,15 +3309,18 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
   );
 
   test(
-    "content filter waits for the user and one Esc ends the turn",
+    "content filter resends three times, then waits for the user and one Esc ends the turn",
     async () => {
       const { queuedGateway, stderrPath } = await launchRouteRecoveryTui(
         "fx-tui-route-content-filter-",
-        [contentFilterResponse()],
+        Array.from({ length: 4 }, () => contentFilterResponse()),
       );
 
       await session!.sendText("Trigger content filter.");
-      await session!.waitForText("Blocked by the content filter", TIMEOUT);
+      // Both the full and the short question end in "rephrase".
+      await session!.waitForText("rephrase", TIMEOUT);
+      // The question came after three automatic resends.
+      expect(queuedGateway.requests.length).toBe(4);
       // A request that waits for the user ends on one Esc, not two.
       await session!.sendKeys("Escape");
       await session!.waitForPane(
@@ -3327,7 +3330,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       await session!.waitForComposer(TIMEOUT);
       const scrollback = await session!.captureFullScrollback();
 
-      expect(queuedGateway.requests.length).toBe(1);
+      expect(queuedGateway.requests.length).toBe(4);
       expect(scrollback).not.toContain("Try again later");
       expect(scrollback).not.toContain("request failed");
       expect(readFileSync(stderrPath, "utf8")).toBe("");

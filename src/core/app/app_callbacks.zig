@@ -341,6 +341,7 @@ pub fn Bindings(comptime App: type) type {
                     .running = runCompactionActivity,
                     .settle = settleCompactionActivity,
                     .written = if (comptime @hasDecl(@TypeOf(agent.worker), "writtenCompactionActivity")) writtenCompactionActivity else null,
+                    .asked = if (comptime @hasDecl(@TypeOf(agent.worker), "askedCompactionActivity")) askedCompactionActivity else null,
                 } else null,
                 .append_turn_piece = if (comptime agents.hasAgentField(App, "session_persistence"))
                     if (agent.session_persistence.v2 != null) agentAppendTurnPiece else null
@@ -376,6 +377,7 @@ pub fn Bindings(comptime App: type) type {
                 .push_context_notice = agentPushContextNotice,
                 .push_session_notice = agentPushSessionNotice,
                 .push_route_recovery_status = agentPushRouteRecoveryStatus,
+                .save_route_recovery_status = agentSaveRouteRecoveryStatus,
                 .restore_failed_prompt = agentRestoreFailedPrompt,
                 .push_command_output_complete = agentPushCommandOutputComplete,
                 .push_http_error = agentPushHttpError,
@@ -1210,6 +1212,11 @@ pub fn Bindings(comptime App: type) type {
             agent.worker.runCompactionActivity(id, stage);
         }
 
+        fn askedCompactionActivity(ctx: *anyopaque, id: compaction_activity.OperationId) void {
+            const agent: *AppAgent = @ptrCast(@alignCast(ctx));
+            agent.worker.askedCompactionActivity(id);
+        }
+
         fn writtenCompactionActivity(ctx: *anyopaque, id: compaction_activity.OperationId, percent: u8) void {
             const agent: *AppAgent = @ptrCast(@alignCast(ctx));
             agent.worker.writtenCompactionActivity(id, percent);
@@ -1436,6 +1443,12 @@ pub fn Bindings(comptime App: type) type {
             const agent: *AppAgent = @ptrCast(@alignCast(ctx));
             const app = appOf(agent);
             try app_worker_runtime.Runtime(App).pushEvent(app, agent, .{ .route_recovery_status = status });
+        }
+
+        fn agentSaveRouteRecoveryStatus(ctx: *anyopaque, status: types.RouteRecoveryStatus) !void {
+            if (comptime !agents.hasAgentField(App, "session_persistence")) return;
+            const agent: *AppAgent = @ptrCast(@alignCast(ctx));
+            try app_session_runtime.Runtime(App).saveModelRecovery(agent, status);
         }
 
         fn agentRestoreFailedPrompt(ctx: *anyopaque, prompt: []const u8) !void {

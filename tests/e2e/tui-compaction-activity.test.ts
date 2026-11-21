@@ -378,7 +378,7 @@ describe.skipIf(!tmuxAvailable())("tui: compaction activity", () => {
     }, 120_000);
   }
 
-  test("manual: the row shows the percentage of the summary written so far", async () => {
+  test("manual: the row moves while the model reads, then counts the summary as it is written", async () => {
     const f = await fixture("manual", "success");
     let passed = false;
     try {
@@ -394,15 +394,27 @@ describe.skipIf(!tmuxAvailable())("tui: compaction activity", () => {
         seen.push(value);
         return value;
       };
-      // Nothing of the summary has arrived while the model reads.
-      await terminal.waitForPane((pane) => record(pane) === 0, 10_000);
-      // Two of the sections the model must write arrive; the rest is held.
+      // The reply is held, so nothing of the summary has arrived. The row
+      // moves all the same: the request earns a share of the row for its wait.
+      await terminal.waitForPane((pane) => (record(pane) ?? 0) >= 2, 15_000);
+      const waited = seen.at(-1)!;
+      // A wait earns less than half of the row.
+      expect(waited).toBeLessThan(50);
+      // Two of the five sections arrive; the rest is held. They are a third
+      // of the notes, far more than a wait of this length can earn.
       f.summaryHold.send("Rules:\nnone\n\nDecisions:\nnone\n\n");
+      const counted = await terminal.waitForPane((pane) => (record(pane) ?? 0) >= waited + 20, 10_000);
+      const count = seen.at(-1)!;
+      expect(count).toBeLessThan(100);
+      // Once its notes arrive, only notes move the row: its clock runs on
+      // for three seconds and the count holds.
+      const since = clockSeconds(COMPACTION_CLOCK.exec(counted)![2]!);
       await terminal.waitForPane((pane) => {
-        const value = record(pane);
-        return value !== null && value > 0;
-      }, 10_000);
-      expect(seen.at(-1)!).toBeLessThan(100);
+        const row = COMPACTION_CLOCK.exec(pane);
+        if (row === null) return false;
+        expect(record(pane)).toBe(count);
+        return clockSeconds(row[2]!) >= since + 3;
+      }, 15_000);
       f.summaryHold.release(HANDOFF);
       await until(() => f.durable() > 0, "acknowledged checkpoint");
       await terminal.waitForPane((pane) => {
@@ -430,9 +442,11 @@ describe.skipIf(!tmuxAvailable())("tui: compaction activity", () => {
         if (row) seen.push(Number(row[1]));
         return row ? Number(row[1]) : null;
       };
-      await terminal.waitForPane((pane) => record(pane) === 0, 10_000);
+      // The row is up while the reply is held.
+      await terminal.waitForPane((pane) => record(pane) !== null, 10_000);
       f.summaryHold.send("Rules:\nnone\n\nDecisions:\nnone\n\n");
-      await terminal.waitForPane((pane) => (record(pane) ?? 0) > 0, 10_000);
+      // The two sections are counted: a wait this short earns far less.
+      await terminal.waitForPane((pane) => (record(pane) ?? 0) >= 20, 10_000);
       const before = seen.at(-1)!;
       // The stream ends before the reply is finished; fx asks another model.
       f.summaryHold.dispose();

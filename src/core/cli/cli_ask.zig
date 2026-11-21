@@ -726,10 +726,11 @@ const AskContext = struct {
     image_snapshot_temp_dir: ?[]u8 = null,
     prompt_snapshot_committed: bool = false,
     last_recovery_status: ?types.RouteRecoveryStatus = null,
-    /// The recovery status kind last printed as a notice. fx ask cannot
-    /// redraw a line, so it prints a module status only when its kind
-    /// changes, not on every one-second refresh.
+    /// The recovery status kind and attempt last printed as a notice. fx
+    /// ask cannot redraw a line, so it prints a module status only when its
+    /// kind or attempt changes, not on every one-second refresh.
     last_recovery_notice_kind: ?types.RouteRecoveryStatus.Kind = null,
+    last_recovery_notice_attempt: usize = 0,
 
     fn init(alloc: Allocator, cfg: Config, deps: RunDeps, workspace_root: []const u8) AskContext {
         const lifecycle_runtime = hooks.Runtime.init(alloc);
@@ -2309,6 +2310,7 @@ fn agentRuntimeDeps(ctx: *AskContext) agent_runtime.AgentRuntimeDeps {
         .propagate_history_turn = propagateHistoryTurn,
         .commit_context_compaction = .{ .commit = commitContextCompaction },
         .append_turn_piece = if (ctx.v2 != null) appendTurnPiece else null,
+        .save_route_recovery_status = if (ctx.v2 != null) saveRouteRecoveryStatus else null,
         .record_usage = if (ctx.v2 != null) recordUsage else null,
         .save_prompt_images = if (ctx.v2 != null) savePromptImages else null,
         .start_workspace_capture = if (ctx.workspaceCaptureContext() != null) startWorkspaceCapture else null,
@@ -3295,6 +3297,16 @@ fn recordUsage(raw_ctx: *anyopaque, usage: types.Usage) !void {
     try v2.recordUsage(usage);
 }
 
+/// `AgentRuntimeDeps.save_route_recovery_status` on v2: a recovery status
+/// reaches the session log as a `model_recovery` item.
+fn saveRouteRecoveryStatus(raw_ctx: *anyopaque, status: types.RouteRecoveryStatus) !void {
+    const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
+    ctx.session_write_mutex.lockUncancelable(io_mod.getIo());
+    defer ctx.session_write_mutex.unlock(io_mod.getIo());
+    const v2 = ctx.v2 orelse return;
+    try v2.saveModelRecovery(status);
+}
+
 /// The prompt's images become the session's blobs before its first request
 /// (D89). A failure leaves the rest inline, with no path, as the adapter
 /// does for one image the store refuses.
@@ -3628,8 +3640,10 @@ fn pushRouteRecoveryStatus(raw_ctx: *anyopaque, status: types.RouteRecoveryStatu
     ctx.last_recovery_status = status;
     const notice = switch (status.kind) {
         .waiting, .retrying, .need_user => notice: {
-            const changed = ctx.last_recovery_notice_kind != status.kind;
+            const changed = ctx.last_recovery_notice_kind != status.kind or
+                ctx.last_recovery_notice_attempt != status.attempt;
             ctx.last_recovery_notice_kind = status.kind;
+            ctx.last_recovery_notice_attempt = status.attempt;
             break :notice changed and ctx.output_mode != .quiet;
         },
         // The success or the error itself is the notice; --json reports how
@@ -8152,8 +8166,9 @@ test "render final JSON reports the successful recovery attempt" {
 
     const json = try renderFinalJsonResult(alloc, result);
     defer alloc.free(json);
-    // The module shape (decision 38): `recovered` carries only the attempt,
-    // with no message, budget, or delay fields.
+    // The module shape (decision 38): `recovered` carries the attempt and,
+    // when a send failed, the cause. This status has no failure, so it
+    // carries only the attempt, with no message, budget, or delay fields.
     try std.testing.expect(std.mem.find(u8, json, ",\"recovery\":{\"state\":\"recovered\",\"attempt\":3}}") != null);
 }
 
@@ -9117,7 +9132,7 @@ test "fx ask JSON recovery keeps stdout structured and reports progress on stder
     try std.testing.expectEqualStrings("recovered", recovery.get("state").?.string);
     try std.testing.expectEqual(@as(i64, 2), recovery.get("attempt").?.integer);
     try std.testing.expect(recovery.get("message") == null);
-    // A host that cannot redraw prints a status only when its kind changes.
+    // A host that cannot redraw prints a status only when its kind or attempt changes.
     try std.testing.expectEqualStrings(
         "[notice] Offline · next try in 2s · 0s\n[notice] Offline · retrying · attempt 2 · 2s\n",
         stderr_capture.bytes.items,

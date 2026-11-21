@@ -19,6 +19,17 @@
 (* sign-in status, so fx never opens a second sign-in for it. Quota       *)
 (* trouble asks without resending; recovery.zig's own tests pin that.     *)
 (*                                                                         *)
+(* The provider's content filter may block the request's reply. On every *)
+(* host the module resends the blocked request at once, up to             *)
+(* FilterResends times in a row, and the next block needs the user         *)
+(* (FilterBounded). The interactive app then waits for the user            *)
+(* (AskingHostWaits). A host that cannot ask (`unattended`), such as       *)
+(* `fx ask`, ACP, a subagent, or libfx, has nobody to answer, so fx ends   *)
+(* the turn on its own error (HostEnds, CannotAskEnds). Such a host keeps  *)
+(* no record and never resumes a request, and the turn loop ends a sign-in *)
+(* or quota failure there before the module hears of it, so this model     *)
+(* gives it neither process deaths nor that trouble.                       *)
+(*                                                                         *)
 (* The turn loop routes each request's network, gateway, and rate-limit    *)
 (* failures through the module, and fx saves the module's record with the  *)
 (* session, so a closed window or a crash resumes on the next launch       *)
@@ -40,6 +51,8 @@ CONSTANTS
 Bugs == {"none", "stall_stop", "no_wake", "stale_socket", "frozen_status",
          "no_closing", "never_ask", "hot_retry", "send_without_save",
          "poll_reopens", "poll_drop_reasks",
+         "filter_unbounded", "filter_asks_early", "cannot_ask_resends",
+         "asking_host_resends", "filter_answer_keeps_count",
          \* Planted in RecoveryTimed.tla.
          "unbounded_wait", "frozen_countdown", "no_handoff", "poll_hot",
          "never_poll"}
@@ -48,12 +61,18 @@ ASSUME /\ MaxFaults \in Nat /\ Ladder \in 1..4 /\ Bug \in Bugs
 
 Min(a, b) == IF a < b THEN a ELSE b
 
-Phases   == {"working", "waiting", "need_user", "done_ok", "done_cancel", "stopped"}
+\* done_failed: fx ended the turn on its own error, because the request
+\* needs the user on a host that cannot ask.
+Phases   == {"working", "waiting", "need_user", "done_ok", "done_cancel",
+             "done_failed", "stopped"}
 Active   == {"working", "waiting", "need_user"}
 Terminal == Phases \ Active
-Statuses == {"clear", "waiting", "retrying", "need_user", "stopped", "none"}
-Alarms   == {"waiting", "retrying", "need_user", "stopped"}
+\* failed: fx's own terminal status, which replaces the module's.
+Statuses == {"clear", "waiting", "retrying", "need_user", "stopped", "failed",
+             "none"}
+Alarms   == {"waiting", "retrying", "need_user", "stopped", "failed"}
 MaxAttempt == 3   \* attempts saturate here; status only distinguishes 1 from >1
+FilterResends == 3   \* recovery.zig content_filter_resends
 
 VARIABLES
     phase,          \* the request's phase inside the module
@@ -62,7 +81,7 @@ VARIABLES
     flowing,        \* the current send's response has started (`responding`)
     attempt,        \* sends for this request (saturating)
     sameFail,       \* consecutive counted failures (offline is not counted)
-    lastSendWaited, \* the latest send came after a wait, a relaunch, or the user
+    lastSendWaited, \* the latest send came after a wait, a relaunch, the user, or a block
     savedInflight,  \* the saved record says a send is outstanding
     savedClean,     \* the saved record was written by `closing`
     seenDeaths,     \* abrupt in-flight deaths the module counted from records
@@ -75,11 +94,18 @@ VARIABLES
     alive,          \* the fx process is running
     cancelled,      \* the user pressed Esc or quit fx
     askedSignIn,    \* the module waits for a sign-in, so it resends now and then
-    polling         \* the send on the wire is such a resend (SignInPoll)
+    polling,        \* the send on the wire is such a resend (SignInPoll)
+    unattended,     \* the host cannot ask the user (request_recovery.zig canAskUser)
+    filterRun,      \* blocks in a row the module counted (its streak)
+    blocked         \* world: the content filter blocks the request's reply
 
 vars == <<phase, status, inflight, flowing, attempt, sameFail, lastSendWaited,
           savedInflight, savedClean, seenDeaths, deaths, cleanExit, net,
-          gateway, needUser, faults, alive, cancelled, askedSignIn, polling>>
+          gateway, needUser, faults, alive, cancelled, askedSignIn, polling,
+          unattended, filterRun, blocked>>
+
+\* The variables only the content filter's steps change.
+filterVars == <<unattended, filterRun, blocked>>
 
 TypeOK ==
     /\ phase \in Phases
@@ -102,8 +128,11 @@ TypeOK ==
     /\ cancelled \in BOOLEAN
     /\ askedSignIn \in BOOLEAN
     /\ polling \in BOOLEAN
+    /\ unattended \in BOOLEAN
+    /\ filterRun \in 0..(FilterResends + 1)
+    /\ blocked \in BOOLEAN
 
-\* start(null): the plan is save, send .{}.
+\* start(null): the plan is save, send .{}. Either kind of host.
 Init ==
     /\ phase = "working"
     /\ status = "clear"
@@ -125,6 +154,9 @@ Init ==
     /\ cancelled = FALSE
     /\ askedSignIn = FALSE
     /\ polling = FALSE
+    /\ unattended \in BOOLEAN
+    /\ filterRun = 0
+    /\ blocked = FALSE
 
 -----------------------------------------------------------------------------
 (* Plan fragments. Each sets phase, status, inflight, flowing, attempt,    *)
@@ -132,7 +164,9 @@ Init ==
 (* every other variable.                                                   *)
 
 \* save, send, status. `waited` records whether time passed (or fx was
-\* relaunched, or the user acted) since the previous failure.
+\* relaunched, or the user acted) since the previous failure. A block's
+\* resend counts as waited too: a block is no transient failure, and no
+\* wait changes what the filter decides (FilterBounded bounds it).
 SendNow(waited) ==
     /\ phase' = "working"
     /\ inflight' = TRUE
@@ -151,17 +185,20 @@ SendNow(waited) ==
 \* on a broken gateway, waits for the sign-in again with its start kept
 \* (recovery.zig onFailed), so fx opens no second sign-in. Planted defect
 \* poll_drop_reasks: it waits as an ordinary retry instead, and the next
-\* sign-in failure opens a second sign-in.
+\* sign-in failure opens a second sign-in. A counted failure ends a run of
+\* content-filter blocks, since the module's streak now counts its kind
+\* (recovery.zig noteStreak); offline and a sign-in wait leave the run.
 OnFail(kind) ==
     /\ polling' = FALSE
     /\ IF kind = "need_user" \/ (polling /\ Bug # "poll_drop_reasks")
        THEN /\ phase' = "need_user" /\ status' = "need_user"
             /\ inflight' = FALSE /\ flowing' = FALSE /\ savedInflight' = FALSE
             /\ askedSignIn' = TRUE
-            /\ UNCHANGED <<attempt, sameFail, lastSendWaited>>
+            /\ UNCHANGED <<attempt, sameFail, lastSendWaited, filterRun>>
        ELSE LET counted  == kind # "offline"
                 nextFail == IF counted THEN Min(sameFail + 1, Ladder) ELSE sameFail
             IN /\ sameFail' = nextFail
+               /\ filterRun' = IF counted THEN 0 ELSE filterRun
                /\ askedSignIn' = FALSE
                /\ IF Bug = "hot_retry"
                      \* Planted defect: resend at once, without waiting.
@@ -182,7 +219,7 @@ OnSuccess ==
     /\ phase' = "done_ok" /\ status' = "clear"
     /\ inflight' = FALSE /\ flowing' = FALSE /\ savedInflight' = FALSE
     /\ askedSignIn' = FALSE /\ polling' = FALSE
-    /\ UNCHANGED <<attempt, sameFail, lastSendWaited>>
+    /\ UNCHANGED <<attempt, sameFail, lastSendWaited, filterRun>>
 
 -----------------------------------------------------------------------------
 (* The request on the wire.                                                *)
@@ -197,6 +234,7 @@ Responding ==
     /\ UNCHANGED <<phase, inflight, attempt, sameFail, lastSendWaited,
                    savedInflight, savedClean, seenDeaths, deaths, cleanExit,
                    net, gateway, needUser, faults, alive, cancelled>>
+    /\ UNCHANGED filterVars
 
 \* `tick` after a resend has shown its retry status for the hand-off time
 \* (recovery.zig handoff_ms): fx's thinking row takes the status line back
@@ -209,17 +247,44 @@ HandOff ==
                    savedInflight, savedClean, seenDeaths, deaths, cleanExit,
                    net, gateway, needUser, faults, alive, cancelled,
                    askedSignIn, polling>>
+    /\ UNCHANGED filterVars
 
 \* The gateway answers according to the world. These failures follow from
-\* conditions already counted as faults. A complete answer needs `responding`.
+\* conditions already counted as faults. A complete answer needs `responding`,
+\* and a reply the filter blocks is Blocked instead.
 Respond ==
     /\ alive /\ inflight
     /\ CASE net = "down"         -> OnFail("offline")
          [] needUser             -> OnFail("need_user")
          [] gateway = "broken"   -> OnFail("server")
-         [] OTHER                -> flowing /\ OnSuccess
+         [] OTHER                -> flowing /\ ~blocked /\ OnSuccess
     /\ UNCHANGED <<savedClean, seenDeaths, deaths, cleanExit, net, gateway,
-                   needUser, faults, alive, cancelled>>
+                   needUser, faults, alive, cancelled, unattended, blocked>>
+
+\* The provider answers, and its content filter blocks the reply (`failed`
+\* with content_filter). On every host the module resends at once while the
+\* run of blocks is at most FilterResends long, and the next block needs the
+\* user (recovery.zig resendAfterContentFilter). The run is the module's
+\* streak, so a streak of another kind ends it, and the user's answer starts
+\* it over (UserActs), so the blocks after that answer resend again. Planted
+\* defects: filter_unbounded resends every block, and filter_asks_early
+\* asks at the first block, as fx did before.
+Blocked ==
+    /\ alive /\ inflight /\ blocked
+    /\ net = "up" /\ ~needUser /\ gateway = "ok"
+    /\ LET run   == Min(filterRun + 1, FilterResends + 1)
+           limit == IF Bug = "filter_asks_early" THEN 0 ELSE FilterResends
+       IN /\ filterRun' = run
+          /\ sameFail' = 0
+          /\ IF run <= limit \/ Bug = "filter_unbounded"
+                THEN SendNow(TRUE)
+                ELSE /\ phase' = "need_user" /\ status' = "need_user"
+                     /\ inflight' = FALSE /\ flowing' = FALSE
+                     /\ savedInflight' = FALSE
+                     /\ askedSignIn' = FALSE /\ polling' = FALSE
+                     /\ UNCHANGED <<attempt, lastSendWaited>>
+    /\ UNCHANGED <<savedClean, seenDeaths, deaths, cleanExit, net, gateway,
+                   needUser, faults, alive, cancelled, unattended, blocked>>
 
 \* A fresh transient disruption kills the in-flight send.
 Drop ==
@@ -227,7 +292,7 @@ Drop ==
     /\ faults' = faults + 1
     /\ OnFail("dropped")
     /\ UNCHANGED <<savedClean, seenDeaths, deaths, cleanExit, net, gateway,
-                   needUser, alive, cancelled>>
+                   needUser, alive, cancelled, unattended, blocked>>
 
 \* Planted defect: on a healthy world, the transport reports a dead pooled
 \* connection instead of retrying it silently on a fresh one.
@@ -237,7 +302,7 @@ StaleSocket ==
     /\ net = "up" /\ gateway = "ok" /\ ~needUser
     /\ OnFail("dropped")
     /\ UNCHANGED <<savedClean, seenDeaths, deaths, cleanExit, net, gateway,
-                   needUser, faults, alive, cancelled>>
+                   needUser, faults, alive, cancelled, unattended, blocked>>
 
 \* `tick` reaches the deadline: save, send, status retrying.
 TimerFires ==
@@ -246,6 +311,7 @@ TimerFires ==
     /\ SendNow(TRUE)
     /\ UNCHANGED <<sameFail, savedClean, seenDeaths, deaths, cleanExit, net,
                    gateway, needUser, faults, alive, cancelled>>
+    /\ UNCHANGED filterVars
 
 \* While the module waits for a sign-in, it resends after a long wait
 \* (recovery.zig sign_in_poll_ms), or at once when the sign-in fx opened
@@ -265,6 +331,7 @@ SignInPoll ==
     /\ polling' = TRUE
     /\ UNCHANGED <<askedSignIn, sameFail, savedClean, seenDeaths, deaths,
                    cleanExit, net, gateway, needUser, faults, alive, cancelled>>
+    /\ UNCHANGED filterVars
 
 -----------------------------------------------------------------------------
 (* The world.                                                              *)
@@ -276,6 +343,7 @@ NetDown ==
                    lastSendWaited, savedInflight, savedClean, seenDeaths,
                    deaths, cleanExit, gateway, needUser, alive, cancelled,
                    askedSignIn, polling>>
+    /\ UNCHANGED filterVars
 
 NetUp ==
     /\ net = "down"
@@ -284,6 +352,7 @@ NetUp ==
                    lastSendWaited, savedInflight, savedClean, seenDeaths,
                    deaths, cleanExit, gateway, needUser, faults, alive,
                    cancelled, askedSignIn, polling>>
+    /\ UNCHANGED filterVars
 
 GatewayBreak ==
     /\ gateway = "ok" /\ faults < MaxFaults
@@ -292,6 +361,7 @@ GatewayBreak ==
                    lastSendWaited, savedInflight, savedClean, seenDeaths,
                    deaths, cleanExit, net, needUser, alive, cancelled,
                    askedSignIn, polling>>
+    /\ UNCHANGED filterVars
 
 GatewayHeal ==
     /\ gateway = "broken"
@@ -300,14 +370,18 @@ GatewayHeal ==
                    lastSendWaited, savedInflight, savedClean, seenDeaths,
                    deaths, cleanExit, net, needUser, faults, alive, cancelled,
                    askedSignIn, polling>>
+    /\ UNCHANGED filterVars
 
+\* Sign-in or quota trouble. On a host that cannot ask, the turn loop ends
+\* the turn on it before the module hears, so only the other host has it.
 NeedUserFault ==
-    /\ ~needUser /\ faults < MaxFaults
+    /\ ~needUser /\ ~unattended /\ faults < MaxFaults
     /\ needUser' = TRUE /\ faults' = faults + 1
     /\ UNCHANGED <<phase, status, inflight, flowing, attempt, sameFail,
                    lastSendWaited, savedInflight, savedClean, seenDeaths,
                    deaths, cleanExit, net, gateway, alive, cancelled,
                    askedSignIn, polling>>
+    /\ UNCHANGED filterVars
 
 \* The trouble goes away without the user: the gateway stops refusing the
 \* login, or another fx process signs in. Only a resend finds out.
@@ -318,14 +392,35 @@ TroubleClears ==
                    lastSendWaited, savedInflight, savedClean, seenDeaths,
                    deaths, cleanExit, net, gateway, faults, alive, cancelled,
                    askedSignIn, polling>>
+    /\ UNCHANGED filterVars
+
+\* The content filter starts blocking the request's reply.
+FilterFault ==
+    /\ ~blocked /\ faults < MaxFaults
+    /\ blocked' = TRUE /\ faults' = faults + 1
+    /\ UNCHANGED <<phase, status, inflight, flowing, attempt, sameFail,
+                   lastSendWaited, savedInflight, savedClean, seenDeaths,
+                   deaths, cleanExit, net, gateway, needUser, alive, cancelled,
+                   askedSignIn, polling, unattended, filterRun>>
+
+\* The filter lets a try through: it does not decide the same way every time.
+\* Only a resend finds out.
+FilterClears ==
+    /\ blocked
+    /\ blocked' = FALSE
+    /\ UNCHANGED <<phase, status, inflight, flowing, attempt, sameFail,
+                   lastSendWaited, savedInflight, savedClean, seenDeaths,
+                   deaths, cleanExit, net, gateway, needUser, faults, alive,
+                   cancelled, askedSignIn, polling, unattended, filterRun>>
 
 -----------------------------------------------------------------------------
 (* Process death and relaunch. The saved record survives; the in-flight    *)
-(* send and the screen do not.                                             *)
+(* send and the screen do not. Only a host that can ask keeps the record   *)
+(* and resumes a request.                                                  *)
 
 \* A crash: no event reaches the module.
 Crash ==
-    /\ alive /\ phase \in Active /\ faults < MaxFaults
+    /\ alive /\ ~unattended /\ phase \in Active /\ faults < MaxFaults
     /\ faults' = faults + 1
     /\ alive' = FALSE
     /\ cleanExit' = FALSE
@@ -335,10 +430,11 @@ Crash ==
     /\ UNCHANGED <<phase, attempt, sameFail, lastSendWaited, savedInflight,
                    savedClean, seenDeaths, net, gateway, needUser, cancelled,
                    askedSignIn>>
+    /\ UNCHANGED filterVars
 
 \* SIGHUP or SIGTERM: fx sends `closing` and saves the plan before exiting.
 Close ==
-    /\ alive /\ phase \in Active /\ faults < MaxFaults
+    /\ alive /\ ~unattended /\ phase \in Active /\ faults < MaxFaults
     /\ faults' = faults + 1
     /\ alive' = FALSE
     /\ cleanExit' = TRUE
@@ -349,9 +445,11 @@ Close ==
     /\ UNCHANGED <<phase, attempt, sameFail, lastSendWaited, savedInflight,
                    seenDeaths, deaths, net, gateway, needUser, cancelled,
                    askedSignIn>>
+    /\ UNCHANGED filterVars
 
 \* start(record). An abrupt death with a send in flight counts toward the
 \* crash-loop guard; the second one asks the user once. Otherwise: save, send.
+\* The record keeps the run of blocks; the host passes its own kind again.
 Relaunch ==
     /\ ~alive /\ phase \in Active
     /\ alive' = TRUE
@@ -373,11 +471,13 @@ Relaunch ==
                 ELSE SendNow(TRUE)
     /\ UNCHANGED <<sameFail, deaths, cleanExit, net, gateway, needUser,
                    faults, cancelled>>
+    /\ UNCHANGED filterVars
 
 -----------------------------------------------------------------------------
-(* The user.                                                               *)
+(* The user, and fx's own end of a request nobody can answer.              *)
 
-\* `user_cancel`: Esc, or quitting fx. The only way to end without success.
+\* `user_cancel`: Esc, or quitting fx. The only way to end without success
+\* on a host that can ask.
 UserCancels ==
     /\ alive /\ phase \in Active
     /\ phase' = "done_cancel" /\ status' = "clear" /\ cancelled' = TRUE
@@ -385,20 +485,53 @@ UserCancels ==
     /\ askedSignIn' = FALSE /\ polling' = FALSE
     /\ UNCHANGED <<attempt, sameFail, lastSendWaited, savedClean, seenDeaths,
                    deaths, cleanExit, net, gateway, needUser, faults, alive>>
+    /\ UNCHANGED filterVars
 
-\* `user_continue`: Enter or a successful /login after fixing what was asked.
-\* Only answering the crash-loop question starts the death count over
-\* (recovery.zig onUserContinue): a sign-in says nothing about crashes. Two
-\* counted deaths while waiting for the user mean the crash-loop question.
+\* `user_continue`: Enter or a successful /login after fixing what was asked,
+\* such as a rephrased request after a block. Only a host that can ask has a
+\* user to answer; planted defect cannot_ask_resends resends on one that
+\* cannot, as if it had. Only answering the crash-loop question starts the death
+\* count over (recovery.zig onUserContinue): a sign-in says nothing about
+\* crashes. Two counted deaths while waiting for the user mean the
+\* crash-loop question.
+\* The answer also starts the content filter's run of blocks over
+\* (recovery.zig onUserContinue); planted defect filter_answer_keeps_count
+\* keeps it, as fx did before, so a block after the answer asks at once.
 UserActs ==
     LET loop == seenDeaths >= 2 IN
-    /\ alive /\ phase = "need_user"
+    /\ alive /\ (~unattended \/ Bug = "cannot_ask_resends") /\ phase = "need_user"
     /\ needUser' = FALSE
+    /\ blocked' = FALSE
     /\ seenDeaths' = IF loop THEN 0 ELSE seenDeaths
     /\ deaths' = IF loop THEN 0 ELSE deaths
+    /\ filterRun' = IF Bug = "filter_answer_keeps_count" THEN filterRun ELSE 0
     /\ SendNow(TRUE)
     /\ UNCHANGED <<sameFail, savedClean, cleanExit, net, gateway, faults,
-                   alive, cancelled>>
+                   alive, cancelled, unattended>>
+
+\* The request needs the user on a host that cannot ask, which happens only
+\* after the content filter's last allowed block: fx ends the turn on its
+\* own content-filter error, as it did before the resends
+\* (orchestrator.zig), and that error replaces the module's question on the
+\* status line. Such a host keeps no record.
+HostEnds ==
+    /\ alive /\ unattended /\ phase = "need_user"
+    /\ phase' = "done_failed" /\ status' = "failed"
+    /\ UNCHANGED <<inflight, flowing, attempt, sameFail, lastSendWaited,
+                   savedInflight, savedClean, seenDeaths, deaths, cleanExit,
+                   net, gateway, needUser, faults, alive, cancelled,
+                   askedSignIn, polling>>
+    /\ UNCHANGED filterVars
+
+\* Planted defect asking_host_resends: a host that can ask resends a request
+\* that waits for the user after a block without the user's answer.
+HostResends ==
+    /\ Bug = "asking_host_resends"
+    /\ alive /\ ~unattended /\ phase = "need_user" /\ ~askedSignIn
+    /\ SendNow(TRUE)
+    /\ UNCHANGED <<sameFail, savedClean, seenDeaths, deaths, cleanExit, net,
+                   gateway, needUser, faults, alive, cancelled>>
+    /\ UNCHANGED filterVars
 
 \* A finished request stays finished.
 Finished ==
@@ -406,36 +539,38 @@ Finished ==
     /\ UNCHANGED vars
 
 Next ==
-    \/ Responding \/ HandOff \/ Respond \/ Drop \/ StaleSocket \/ TimerFires
-    \/ SignInPoll
+    \/ Responding \/ HandOff \/ Respond \/ Blocked \/ Drop \/ StaleSocket
+    \/ TimerFires \/ SignInPoll
     \/ NetDown \/ NetUp \/ GatewayBreak \/ GatewayHeal \/ NeedUserFault
-    \/ TroubleClears
+    \/ TroubleClears \/ FilterFault \/ FilterClears
     \/ Crash \/ Close \/ Relaunch
-    \/ UserCancels \/ UserActs
+    \/ UserCancels \/ UserActs \/ HostEnds \/ HostResends
     \/ Finished
 
 \* Time passes, answers arrive, the world heals, fx gets relaunched, and the
 \* user eventually does what was asked. Faults, deaths and Esc are never forced.
 \* A sign-in wait's own resends take the request out of need_user now and
 \* then, so the user's answer is strongly fair: a user who keeps being asked
-\* answers at last.
+\* answers at last. A filter that keeps blocking never clears by force.
 Fairness ==
-    /\ WF_vars(Responding) /\ WF_vars(Respond) /\ WF_vars(TimerFires)
-    /\ WF_vars(Relaunch) /\ SF_vars(UserActs)
-    /\ WF_vars(NetUp) /\ WF_vars(GatewayHeal)
+    /\ WF_vars(Responding) /\ WF_vars(Respond) /\ WF_vars(Blocked)
+    /\ WF_vars(TimerFires) /\ WF_vars(Relaunch) /\ SF_vars(UserActs)
+    /\ WF_vars(HostEnds) /\ WF_vars(NetUp) /\ WF_vars(GatewayHeal)
 
 Spec == Init /\ [][Next]_vars /\ Fairness
 
 -----------------------------------------------------------------------------
 (* The rules the module and fx keep together.                             *)
 
-\* Only Esc or quitting ends a request without success.
+\* Only Esc or quitting ends a request without success, except on a host
+\* that cannot ask, where fx ends one that needs the user on its own error.
 NeverGivesUp ==
     /\ phase # "stopped"
     /\ (phase = "done_cancel" => cancelled)
+    /\ (phase = "done_failed" => unattended)
 
 \* Once disruptions stop, every request finishes.
-Heals == <>(phase \in {"done_ok", "done_cancel"})
+Heals == <>(phase \in {"done_ok", "done_cancel", "done_failed"})
 
 \* On a world that never misbehaved, nothing alarming is shown.
 NoFalseAlarm == (status \in Alarms) => faults > 0
@@ -465,15 +600,42 @@ CrashLoopAsks ==
 \* A retry after a transient failure always waits first.
 NoHotRetry == lastSendWaited
 
-\* A sign-in wait's own resend that fails, for any reason, waits for the
-\* sign-in again: one request opens one sign-in. A crash, an answer, or Esc
-\* ends the resend another way.
+\* A sign-in wait's own resend that fails on the way, for any reason, waits
+\* for the sign-in again: one request opens one sign-in. A crash, an
+\* answer, or Esc ends the resend another way, and so does a block, which is
+\* an answer: the login worked, and the request asks about the block.
 PollKeepsSignIn ==
-    [][(polling /\ inflight /\ alive' /\ ~inflight' /\ phase' \notin Terminal)
+    [][(polling /\ inflight /\ ~Blocked /\ alive' /\ ~inflight'
+          /\ phase' \notin Terminal)
          => (phase' = "need_user" /\ askedSignIn')]_vars
 
 \* Every send comes with a save, so the record always knows
 \* whether a send is outstanding.
 SaveBeforeSend == alive => (savedInflight = inflight)
+
+\* On every host, a block resends at once while fewer than FilterResends
+\* blocks came before it in a row, so at most FilterResends resends follow
+\* blocks in a row, and the next block needs the user.
+FilterBounded ==
+    [][Blocked =>
+         IF filterRun < FilterResends
+            THEN inflight' /\ filterRun' = filterRun + 1
+            ELSE phase' = "need_user" /\ ~inflight']_vars
+
+\* The user's answer starts the content filter's run of blocks over, so the
+\* blocks after it get FilterResends resends again.
+AnswerGivesResends == [][UserActs => filterRun' = 0]_vars
+
+\* A host that can ask waits for the user: only the user's answer, Esc, or a
+\* sign-in wait's own resend takes the request out of need_user.
+AskingHostWaits ==
+    [][(alive /\ ~unattended /\ phase = "need_user" /\ phase' # "need_user")
+         => (UserActs \/ UserCancels \/ SignInPoll)]_vars
+
+\* A host that cannot ask ends a request that needs the user, on fx's own
+\* error or by Esc, and never sends it again (Heals says it does end).
+CannotAskEnds ==
+    [][(alive /\ unattended /\ phase = "need_user" /\ phase' # "need_user")
+         => phase' \in {"done_failed", "done_cancel"}]_vars
 
 =============================================================================

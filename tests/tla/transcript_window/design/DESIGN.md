@@ -52,7 +52,9 @@ current code.
   cap used before the window replaced it; it never removes a pinned entry.
   An entry with a row still on screen is held (`applyTranscriptWindowDrops`)
   until it scrolls into terminal history or a resize clears the screen,
-  because the painter repaints the live area from the entries. An entry of a
+  because the painter repaints the live area from the entries. A failed store
+  drop keeps the entries still in the notebook pending, and the next sync tries
+  them again (`dropPendingEntries`). An entry of a
   turn whose summary stays is held too, back to the turn's prompt, also when
   a resize clears the screen, because the summary's recap counts the turn's
   tool calls. A resumed transcript holds every entry until a frame has

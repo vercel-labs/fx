@@ -2237,13 +2237,13 @@ describe("acp: model-independent", () => {
         expect(result.promptResult.result.stopReason).toBe("end_turn");
         expect(gateway.requests).toHaveLength(4);
         const allUpdates = JSON.stringify(result.messages);
-        // The module's status shape, then a `recovered` that carries only the
-        // attempt that succeeded.
+        // The module's status shape, then a `recovered` that carries the
+        // attempt that succeeded and the last failure.
         expect(allUpdates).toMatch(
-          /"modelResponseRecovery":\{"state":"waiting","attempt":1,"message":"Connection lost · next try in 1s · attempt 1"\}/,
+          /"modelResponseRecovery":\{"state":"waiting","attempt":1,"cause":"dropped","message":"Connection lost · next try in 1s · attempt 1"\}/,
         );
         expect(allUpdates).toContain(
-          '"modelResponseRecovery":{"state":"recovered","attempt":4}',
+          '"modelResponseRecovery":{"state":"recovered","attempt":4,"cause":"server"}',
         );
         // The partial streamed once, then the full replacement (which carries
         // the partial as its prefix) streamed once.
@@ -2256,6 +2256,17 @@ describe("acp: model-independent", () => {
         );
         expect(gateway.requests[3]!.body).not.toContain(partialText);
         expect(client.stderr).toBe("");
+        // The session log keeps the recovery as a timeline; its last status is the outcome.
+        const [sessionId] = savedSessionIds(root.home);
+        const timeline = logLines(root.home, sessionId!).filter(
+          (line: any) => line.kind === "item" && line.type === "model_recovery",
+        ) as any[];
+        const last = timeline.at(-1);
+        expect(typeof last?.data === "string" ? JSON.parse(last.data) : last?.data).toEqual({
+          state: "recovered",
+          attempt: 4,
+          cause: "server",
+        });
       } finally {
         await client?.close();
         gateway.stop();
@@ -9037,11 +9048,17 @@ describe("acp: model-independent", () => {
     async () => {
       const root = createIsolatedRoot("fx-acp-terminal-failure-");
       const boundary = createPromptTerminalBoundary(root.root);
+      // The provider ends the stream with an error fx must not resend, so
+      // the prompt fails.
       const gateway = startFakeGateway([
         fakeGatewaySse([
           {
+            type: "error",
+            error: { code: "invalid_request_error", message: "rejected request fixture" },
+          },
+          {
             type: "finish",
-            finishReason: { unified: "content-filter", raw: "content_filter" },
+            finishReason: { unified: "error", raw: "provider_error" },
           },
         ]),
       ]);
@@ -9078,6 +9095,66 @@ describe("acp: model-independent", () => {
         expect(client.stderr).toBe("");
       } finally {
         releasePromptBoundary(boundary);
+        await client?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "content filter that blocks every resend ends the prompt as refused and leaves the server usable",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-content-filter-refused-");
+      // fx resends a blocked reply three times; the fourth block ends the
+      // prompt as refused and asks the user to change the request.
+      const gateway = startFakeGateway(
+        Array.from({ length: 4 }, () =>
+          fakeGatewaySse([
+            {
+              type: "finish",
+              finishReason: { unified: "content-filter", raw: "content_filter" },
+            },
+          ])
+        ),
+      );
+      try {
+        client = await AcpClient.create({
+          cwd: root.workspace,
+          env: fakeGatewayEnv(root, gateway),
+        });
+        await startAutoSession(client);
+        sendPrompt(client, 97, "Return the blocked fixture.");
+
+        const messages: any[] = [];
+        let response: any = null;
+        while (!response) {
+          const message = await client.readLine(TIMEOUT) as any;
+          if (message.id === 97) {
+            response = message;
+          } else {
+            messages.push(message);
+          }
+        }
+
+        expect(response.error).toBeUndefined();
+        expect(response.result.stopReason).toBe("refused");
+        const texts = messages
+          .filter((message) =>
+            message.method === "session/update" &&
+            message.params?.update?.sessionUpdate === "agent_message_chunk"
+          )
+          .map((message) => message.params.update.content.text);
+        expect(texts).toContain("Blocked by the content filter. Change your request and send it again.");
+        expect(gateway.requests).toHaveLength(4);
+
+        client.send({ jsonrpc: "2.0", id: 98, method: "session/list", params: {} });
+        const listed = await readResponse(client, 98);
+        expect(listed.error).toBeUndefined();
+        expect(Array.isArray(listed.result.sessions)).toBe(true);
+        expect(client.stderr).toBe("");
+      } finally {
         await client?.close();
         gateway.stop();
         rmSync(root.root, { recursive: true, force: true });

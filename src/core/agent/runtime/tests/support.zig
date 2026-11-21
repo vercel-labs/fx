@@ -485,6 +485,7 @@ pub const FakeAgentRuntimeDeps = struct {
     interactive_notices: std.ArrayList(types.SemanticNotice) = .empty,
     context_notices: std.ArrayList([]u8) = .empty,
     route_recovery_statuses: std.ArrayList(types.RouteRecoveryStatus) = .empty,
+    saved_route_recovery_statuses: std.ArrayList(types.RouteRecoveryStatus) = .empty,
     permission_names: std.ArrayList([]u8) = .empty,
     permission_call_ids: std.ArrayList([]u8) = .empty,
     permission_user_intent_contexts: std.ArrayList([]u8) = .empty,
@@ -551,6 +552,9 @@ pub const FakeAgentRuntimeDeps = struct {
     swap_link_on_execute_name: ?[]const u8 = null,
     swap_link_on_execute: ?[]const u8 = null,
     swap_link_target_on_execute: ?[]const u8 = null,
+    create_file_on_execute_name: ?[]const u8 = null,
+    create_file_on_execute_path: ?[]const u8 = null,
+    create_file_on_execute_content: []const u8 = "",
     static_context_text: ?[]const u8 = null,
     runtime_context_text: ?[]const u8 = null,
     runtime_context_texts: []const []const u8 = &.{},
@@ -719,6 +723,7 @@ pub const FakeAgentRuntimeDeps = struct {
         self.model_calls.deinit(self.alloc);
         freeStringList(self.alloc, &self.context_notices);
         self.route_recovery_statuses.deinit(self.alloc);
+        self.saved_route_recovery_statuses.deinit(self.alloc);
         freeStringList(self.alloc, &self.permission_names);
         freeStringList(self.alloc, &self.permission_call_ids);
         freeStringList(self.alloc, &self.permission_user_intent_contexts);
@@ -825,6 +830,7 @@ pub const FakeAgentRuntimeDeps = struct {
             .push_interactive_notice = if (self.enable_interactive_notices) interactiveNotice else null,
             .push_context_notice = contextNotice,
             .push_route_recovery_status = routeRecoveryStatus,
+            .save_route_recovery_status = savedRouteRecoveryStatus,
             .push_command_output_complete = commandOutputComplete,
             .push_http_error = httpError,
             .refresh_gateway_credential = refreshGatewayCredential,
@@ -1492,6 +1498,8 @@ pub const FakeAgentRuntimeDeps = struct {
         var should_return_ordinary_cancel = false;
         var swap_link: ?[]const u8 = null;
         var swap_target: ?[]const u8 = null;
+        var create_file: ?[]const u8 = null;
+        var create_content: []const u8 = "";
         {
             self.execute_mutex.lockUncancelable(io_mod.getIo());
             defer self.execute_mutex.unlock(io_mod.getIo());
@@ -1583,6 +1591,15 @@ pub const FakeAgentRuntimeDeps = struct {
                     self.swap_link_target_on_execute = null;
                 }
             }
+            if (self.create_file_on_execute_name) |name| {
+                if (std.mem.eql(u8, name, call.name)) {
+                    create_file = self.create_file_on_execute_path;
+                    create_content = self.create_file_on_execute_content;
+                    self.create_file_on_execute_name = null;
+                    self.create_file_on_execute_path = null;
+                    self.create_file_on_execute_content = "";
+                }
+            }
         }
 
         if (swap_link) |link| {
@@ -1590,6 +1607,11 @@ pub const FakeAgentRuntimeDeps = struct {
             var cwd = std.Io.Dir.cwd();
             cwd.deleteFile(io_mod.getIo(), link) catch {};
             try cwd.symLink(io_mod.getIo(), target, link, .{ .is_directory = true });
+        }
+        if (create_file) |path| {
+            var file = try std.Io.Dir.cwd().createFile(io_mod.getIo(), path, .{});
+            defer file.close(io_mod.getIo());
+            try file.writeStreamingAll(io_mod.getIo(), create_content);
         }
         if (should_return_ordinary_cancel) return error.Cancelled;
         if (should_cancel) {
@@ -1857,6 +1879,11 @@ pub const FakeAgentRuntimeDeps = struct {
         const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
         try self.context_notices.append(self.alloc, try self.alloc.dupe(u8, text));
         try self.record("context_notice:{s}", .{text});
+    }
+
+    fn savedRouteRecoveryStatus(raw: *anyopaque, status: types.RouteRecoveryStatus) !void {
+        const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
+        try self.saved_route_recovery_statuses.append(self.alloc, status);
     }
 
     fn routeRecoveryStatus(raw: *anyopaque, status: types.RouteRecoveryStatus) !void {

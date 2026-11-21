@@ -536,6 +536,102 @@ test "a failed allocation when a turn summary is added frees its bytes once" {
     try std.testing.expect(induced_failures > 0);
 }
 
+test "a failed allocation when a turn summary is added keeps the window in step with the transcript" {
+    // A summary whose sync fails partway leaves the window in step with the
+    // entries, so the next sync brings both to the same state.
+    const backing = testing_allocator.no_resize;
+    var induced_failures: usize = 0;
+    var fail_after: usize = 0;
+    while (true) : (fail_after += 1) {
+        var failing = std.testing.FailingAllocator.init(backing, .{});
+        const alloc = failing.allocator();
+        var runtime = testRuntime(alloc);
+        defer runtime.deinit(alloc);
+        var metrics: types.Metrics = .{};
+        try runtime.enableTranscriptWindow(alloc, true);
+
+        // A turn that is split by a compaction and ends before any frame
+        // commits, so the commit state is invalid when its summary is appended.
+        const prompt = try alloc.dupe(u8, "OOM_PROMPT");
+        defer alloc.free(prompt);
+        _ = try runtime.writeUserPromptCard(alloc, &metrics, .{ .text = prompt }, false, &.{});
+        try readFiles(alloc, &runtime, &metrics, &.{ "a.txt", "b.txt" });
+        try runtime.transcriptWindowCompacted(alloc);
+        try readFiles(alloc, &runtime, &metrics, &.{ "d.txt", "e.txt" });
+        _ = try runtime.appendAssistantTurnEntry(alloc);
+        _ = try runtime.streamAssistantChunk(alloc, &metrics, "OOM_ANSWER\n");
+        // The window reports the turn's entries before the summary is appended.
+        try runtime.syncTranscriptWindow(alloc);
+        try expectReportedEntriesHeld(&runtime);
+        try std.testing.expect(runtime.transcript_commit_state == .invalid);
+
+        failing.fail_index = failing.alloc_index + fail_after;
+        const result = runtime.appendTurnSummaryEntry(alloc, .{ .turn_duration_ms = 1200 });
+        const induced = failing.has_induced_failure;
+        failing.fail_index = std.math.maxInt(usize);
+        if (!induced) {
+            _ = try result;
+            try expectWindowMatchesEntries(&runtime);
+            break;
+        }
+        induced_failures += 1;
+        // The caller's error is not checked here: the window must match the entries after it either way.
+        _ = result catch {};
+        try expectReportedEntriesHeld(&runtime);
+        try runtime.syncTranscriptWindow(alloc);
+        try expectWindowMatchesEntries(&runtime);
+    }
+    try std.testing.expect(induced_failures > 0);
+}
+
+test "a failed allocation when the screen clears keeps every held drop" {
+    // A screen clear that fails keeps each held drop either in the window's
+    // pending list or out of the entries, so none is lost.
+    const backing = testing_allocator.no_resize;
+    var induced_failures: usize = 0;
+    var fail_after: usize = 0;
+    while (true) : (fail_after += 1) {
+        var failing = std.testing.FailingAllocator.init(backing, .{});
+        const alloc = failing.allocator();
+        var runtime = testRuntime(alloc);
+        defer runtime.deinit(alloc);
+        var metrics: types.Metrics = .{};
+        try runtime.enableTranscriptWindow(alloc, true);
+        try runTurn(alloc, &runtime, &metrics, "HELD_PROMPT", "HELD_ANSWER\n");
+        try commitStableFrame(alloc, &runtime);
+        // The closed cycle is held in `pending_drops` while its rows are on screen.
+        try runtime.transcriptWindowCompacted(alloc);
+        try runTurn(alloc, &runtime, &metrics, "NEXT_PROMPT", "NEXT_ANSWER\n");
+        const window = &runtime.transcript_window.?;
+        try std.testing.expect(window.pending_drops.items.len > 0);
+        const pending_before = try alloc.dupe(u32, window.pending_drops.items);
+        defer alloc.free(pending_before);
+
+        failing.fail_index = failing.alloc_index + fail_after;
+        const result = runtime.transcriptWindowScreenCleared(alloc);
+        const induced = failing.has_induced_failure;
+        failing.fail_index = std.math.maxInt(usize);
+        if (!induced) {
+            try result;
+            try std.testing.expectEqual(@as(usize, 0), window.pending_drops.items.len);
+            try expectWindowMatchesEntries(&runtime);
+            break;
+        }
+        induced_failures += 1;
+        // The caller's error is not checked here: every held drop must still be accounted for either way.
+        _ = result catch {};
+        try expectWindowMatchesEntries(&runtime);
+        for (pending_before) |id| {
+            const still_held = std.mem.findScalar(u32, window.pending_drops.items, id) != null;
+            const in_notebook = for (runtime.notebook.entries.items) |entry| {
+                if (entry.id() == id) break true;
+            } else false;
+            try std.testing.expect(still_held or !in_notebook);
+        }
+    }
+    try std.testing.expect(induced_failures > 0);
+}
+
 test "a cleared transcript starts the transcript window over" {
     const alloc = std.testing.allocator;
     var runtime = testRuntime(alloc);
