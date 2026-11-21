@@ -1,5 +1,5 @@
 diff --git a/quickjs.c b/quickjs.c
-index b563594..b5786ef 100644
+index 5f24c44..3c032ed 100644
 --- a/quickjs.c
 +++ b/quickjs.c
 @@ -81,7 +81,8 @@

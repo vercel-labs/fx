@@ -1,8 +1,8 @@
 diff --git a/quickjs.c b/quickjs.c
-index 8cbc85e..b563594 100644
+index c71765e..5f24c44 100644
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -43083,6 +43083,8 @@ static int JS_CopySubArray(JSContext *ctx,
+@@ -43286,6 +43286,8 @@ static int JS_CopySubArray(JSContext *ctx,
      }
  
      for (i = 0; i < count; ) {
@@ -11,7 +11,7 @@ index 8cbc85e..b563594 100644
          if (dir < 0) {
              from = from_pos + count - i - 1;
              to = to_pos + count - i - 1;
-@@ -43506,6 +43508,8 @@ static JSValue js_array_concat(JSContext *ctx, JSValueConst this_val,
+@@ -43709,6 +43711,8 @@ static JSValue js_array_concat(JSContext *ctx, JSValueConst this_val,
                  goto exception;
              }
              for (k = 0; k < len; k++, n++) {
@@ -20,7 +20,7 @@ index 8cbc85e..b563594 100644
                  res = JS_TryGetPropertyInt64(ctx, e, k, &val);
                  if (res < 0)
                      goto exception;
-@@ -44153,6 +44157,8 @@ static JSValue js_array_join(JSContext *ctx, JSValueConst this_val,
+@@ -44357,6 +44361,8 @@ static JSValue js_array_join(JSContext *ctx, JSValueConst this_val,
      string_buffer_init(ctx, b, 0);
  
      for(i = 0; i < n; i++) {
@@ -29,7 +29,7 @@ index 8cbc85e..b563594 100644
          if (i > 0) {
              if (c >= 0) {
                  string_buffer_putc8(b, c);
-@@ -44331,6 +44337,8 @@ static JSValue js_array_reverse(JSContext *ctx, JSValueConst this_val,
+@@ -44535,6 +44541,8 @@ static JSValue js_array_reverse(JSContext *ctx, JSValueConst this_val,
      }
  
      for (l = 0, h = len - 1; l < h; l++, h--) {
@@ -38,7 +38,7 @@ index 8cbc85e..b563594 100644
          l_present = JS_TryGetPropertyInt64(ctx, obj, l, &lval);
          if (l_present < 0)
              goto exception;
-@@ -44485,6 +44493,8 @@ static JSValue js_array_slice(JSContext *ctx, JSValueConst this_val,
+@@ -44689,6 +44697,8 @@ static JSValue js_array_slice(JSContext *ctx, JSValueConst this_val,
      }
      /* Copy the remaining elements if any (handle case of inherited properties) */
      for (; k < final; k++, n++) {
@@ -47,7 +47,7 @@ index 8cbc85e..b563594 100644
          kPresent = JS_TryGetPropertyInt64(ctx, obj, k, &val);
          if (kPresent < 0)
              goto exception;
-@@ -44654,6 +44664,8 @@ static int64_t JS_FlattenIntoArray(JSContext *ctx, JSValueConst target,
+@@ -44858,6 +44868,8 @@ static int64_t JS_FlattenIntoArray(JSContext *ctx, JSValueConst target,
      }
  
      for (sourceIndex = 0; sourceIndex < sourceLen; sourceIndex++) {
@@ -56,7 +56,7 @@ index 8cbc85e..b563594 100644
          present = JS_TryGetPropertyInt64(ctx, source, sourceIndex, &element);
          if (present < 0)
              return -1;
-@@ -44837,6 +44849,8 @@ static JSValue js_array_sort(JSContext *ctx, JSValueConst this_val,
+@@ -45041,6 +45053,8 @@ static JSValue js_array_sort(JSContext *ctx, JSValueConst this_val,
  
      /* XXX: should special case fast arrays */
      for (i = 0; i < len; i++) {
@@ -65,7 +65,7 @@ index 8cbc85e..b563594 100644
          if (pos >= array_size) {
              size_t new_size;
              ValueSlot *new_array;
-@@ -44884,6 +44898,8 @@ static JSValue js_array_sort(JSContext *ctx, JSValueConst this_val,
+@@ -45088,6 +45102,8 @@ static JSValue js_array_sort(JSContext *ctx, JSValueConst this_val,
              goto fail;
      }
      for (; i < len; i++) {
@@ -74,7 +74,7 @@ index 8cbc85e..b563594 100644
          if (JS_DeletePropertyInt64(ctx, obj, i, JS_PROP_THROW) < 0)
              goto fail;
      }
-@@ -47115,6 +47131,8 @@ static JSValue js_string_raw(JSContext *ctx, JSValueConst this_val,
+@@ -47319,6 +47335,8 @@ static JSValue js_string_raw(JSContext *ctx, JSValueConst this_val,
          goto exception;
  
      for (i = 0; i < n; i++) {
@@ -83,7 +83,7 @@ index 8cbc85e..b563594 100644
          val = JS_ToStringFree(ctx, JS_GetPropertyInt64(ctx, raw, i));
          if (JS_IsException(val))
              goto exception;
-@@ -51679,6 +51710,8 @@ static int js_json_to_str(JSContext *ctx, JSONStringifyContext *jsc,
+@@ -51880,6 +51898,8 @@ static int js_json_to_str(JSContext *ctx, JSONStringifyContext *jsc,
                  goto exception;
              string_buffer_putc8(jsc->b, '[');
              for(i = 0; i < len; i++) {
@@ -92,7 +92,7 @@ index 8cbc85e..b563594 100644
                  if (i > 0)
                      string_buffer_putc8(jsc->b, ',');
                  string_buffer_concat_value(jsc->b, sep);
-@@ -51836,6 +51869,8 @@ JSValue JS_JSONStringify(JSContext *ctx, JSValueConst obj,
+@@ -52037,6 +52057,8 @@ JSValue JS_JSONStringify(JSContext *ctx, JSValueConst obj,
                  goto exception;
              for (i = j = 0; i < n; i++) {
                  JSValue present;
