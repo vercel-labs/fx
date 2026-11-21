@@ -148,6 +148,7 @@ expect "check downloads nothing" 0 "$src is v1 plus 1 patches" env QUICKJS_FORK_
 fresh
 echo 'int d = 4;' >> "$src/engine.c"
 expect "check fails on an edit beside the patch's lines" 1 "$src/engine.c differs from v1 plus the patches" $fork check
+holds "check says to save the change or restore the folder" grep -q "save NAME, or, if an update stopped" <<< "$out"
 
 fresh
 edit 's/^int a = 10;$/int a = 11;/' engine.c
@@ -184,9 +185,15 @@ expect "check passes on the updated folder" 0 "$src is v2 plus 1 patches" $fork 
 
 fresh
 echo 'int d = 4;' >> "$src/engine.c"
-expect "update refuses a folder with an unsaved change" 1 "save NAME before updating" $fork update v2
+expect "update refuses a folder with an unsaved change" 1 "Save a change you made with scripts/quickjs-fork.sh save NAME" $fork update v2
 holds "update leaves that folder as it was" grep -qx 'int d = 4;' "$src/engine.c"
 holds "update leaves FORK.md on the old release" grep -qF "| Release | \`v1\` |" "$src/FORK.md"
+
+fresh
+g -C "$up" show "$v2_sha:engine.c" > "$src/engine.c"
+expect "update after one that stopped while writing says how to restore" 1 "restore it with git checkout -- $src" $fork update v2
+git checkout -q -- "$src"
+expect "update runs again once the folder is restored" 0 "$src is now v2 plus the patches" $fork update v2
 
 fresh
 edit 's/^int b = 2;$/int b = 22;/' engine.c

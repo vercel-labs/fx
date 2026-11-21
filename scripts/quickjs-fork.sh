@@ -228,7 +228,8 @@ apply_pending() {
 }
 
 # Writes the new release's files, the patches recorded against it, and its
-# name, commit, and file hashes in FORK.md.
+# name, commit, and file hashes in FORK.md. A stop part way leaves a folder
+# that check rejects; git checkout restores it, and the update runs again.
 finish() {
   local ref ref_commit file patch name
   ref="$(sed -n 1p "$work/target")"
@@ -273,7 +274,7 @@ update_start() {
   fi
   work="$(mktemp -d)"
   if ! folder_matches; then
-    echo "Save the changes in $dir with scripts/quickjs-fork.sh save NAME before updating." >&2
+    echo "Save a change you made with scripts/quickjs-fork.sh save NAME, or, if an update stopped while writing $dir, restore it with git checkout -- $dir. Then run the update again." >&2
     exit 1
   fi
   start_repo
@@ -321,7 +322,7 @@ case "${1:-}" in
   check)
     work="$(mktemp -d)"
     if ! folder_matches; then
-      echo "Save each change to the folder with: scripts/quickjs-fork.sh save NAME" >&2
+      echo "Save each change to the folder with scripts/quickjs-fork.sh save NAME, or, if an update stopped while writing it, restore it with git checkout -- $dir." >&2
       exit 1
     fi
     echo "$dir is $release plus $(patch_files | wc -l | tr -d ' ') patches"
