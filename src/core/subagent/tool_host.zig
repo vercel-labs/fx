@@ -3060,7 +3060,6 @@ const MailboxFixture = struct {
         if (self.linger and cancel.load(.seq_cst)) {
             self.release.waitTimeout(io_mod.getIo(), .{ .duration = .{ .clock = .awake, .raw = .fromSeconds(10) } }) catch {
                 self.linger_timed_out.store(true, .seq_cst);
-                std.debug.print("a lingering turn was not released within 10 s\n", .{});
                 return error.ProviderFailed;
             };
         }
