@@ -3836,51 +3836,57 @@ const ErrorDataScript = struct {
 /// The whitespace JSON allows between tokens, as one byte of the script picks it. The first is none.
 const json_gaps = [_][]const u8{ "", " ", "\t", "\n", "\r", " \r\n\t" };
 
+/// One gap of whitespace, picked by the next byte of the script.
+fn appendGap(a: Allocator, out: *std.ArrayList(u8), script: *ErrorDataScript) !void {
+    try out.appendSlice(a, json_gaps[script.next() % json_gaps.len]);
+}
+
+/// What `second` adds after the first value: a gap, `,`, a gap, then, for an object, the member's name `"a"`, a gap,
+/// `:` and a gap, and then the value `0`. The script picks the gaps in that order.
+fn appendSecondValue(a: Allocator, out: *std.ArrayList(u8), script: *ErrorDataScript, object: bool) !void {
+    try appendGap(a, out, script);
+    try out.append(a, ',');
+    try appendGap(a, out, script);
+    if (object) {
+        try out.appendSlice(a, "\"a\"");
+        try appendGap(a, out, script);
+        try out.append(a, ':');
+        try appendGap(a, out, script);
+    }
+    try out.append(a, '0');
+}
+
 /// `string`, a JSON string literal, as the one value of a JSON text of shape 2 (the string alone), 3 (an object) or
 /// 4 (an array), with insignificant whitespace in every place JSON allows it: around the text, after the brackets,
 /// around `:` and `,`. With `second` the object and the array hold one more value, so a `,` is written. The strings keep
 /// their own spaces. The script picks each gap in the order the text is written.
 fn spacedErrorData(a: Allocator, script: *ErrorDataScript, shape: u8, string: []const u8, second: bool) ![]const u8 {
     var out: std.ArrayList(u8) = .empty;
-    try out.appendSlice(a, json_gaps[script.next() % json_gaps.len]);
+    try appendGap(a, &out, script);
     switch (shape) {
         2 => try out.appendSlice(a, string),
         3 => {
             try out.append(a, '{');
-            try out.appendSlice(a, json_gaps[script.next() % json_gaps.len]);
+            try appendGap(a, &out, script);
             try out.appendSlice(a, "\"detail\"");
-            try out.appendSlice(a, json_gaps[script.next() % json_gaps.len]);
+            try appendGap(a, &out, script);
             try out.append(a, ':');
-            try out.appendSlice(a, json_gaps[script.next() % json_gaps.len]);
+            try appendGap(a, &out, script);
             try out.appendSlice(a, string);
-            if (second) {
-                try out.appendSlice(a, json_gaps[script.next() % json_gaps.len]);
-                try out.append(a, ',');
-                try out.appendSlice(a, json_gaps[script.next() % json_gaps.len]);
-                try out.appendSlice(a, "\"a\"");
-                try out.appendSlice(a, json_gaps[script.next() % json_gaps.len]);
-                try out.append(a, ':');
-                try out.appendSlice(a, json_gaps[script.next() % json_gaps.len]);
-                try out.append(a, '0');
-            }
-            try out.appendSlice(a, json_gaps[script.next() % json_gaps.len]);
+            if (second) try appendSecondValue(a, &out, script, true);
+            try appendGap(a, &out, script);
             try out.append(a, '}');
         },
         else => {
             try out.append(a, '[');
-            try out.appendSlice(a, json_gaps[script.next() % json_gaps.len]);
+            try appendGap(a, &out, script);
             try out.appendSlice(a, string);
-            if (second) {
-                try out.appendSlice(a, json_gaps[script.next() % json_gaps.len]);
-                try out.append(a, ',');
-                try out.appendSlice(a, json_gaps[script.next() % json_gaps.len]);
-                try out.append(a, '0');
-            }
-            try out.appendSlice(a, json_gaps[script.next() % json_gaps.len]);
+            if (second) try appendSecondValue(a, &out, script, false);
+            try appendGap(a, &out, script);
             try out.append(a, ']');
         },
     }
-    try out.appendSlice(a, json_gaps[script.next() % json_gaps.len]);
+    try appendGap(a, &out, script);
     return out.items;
 }
 
