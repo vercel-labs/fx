@@ -2954,18 +2954,23 @@ pub fn Runtime(comptime App: type) type {
         }
 
         /// Builds the view of a subagent's first run in this process from its
-        /// saved conversation. A child that is not on screen gives up its
-        /// frozen resume flow, so its first show paints the entries.
+        /// saved conversation. Its frozen resume flow goes in
+        /// `releaseHiddenResumeFlow`.
         pub fn buildFirstRunView(app: *App, agent: *agents.Agent, child: *ChildAgent) !void {
             const history = agent.session.agent.history.items;
             try buildView(app, agent, history);
             child.view_built = true;
             debug_trace.eventf("host", "agent_view_rebuilt", .{}, "agent={s} turns={d}", .{ child.id, history.len });
+            releaseHiddenResumeFlow(app, child, "hidden_first_run");
+        }
+
+        /// Releases a child's frozen resume flow when it is not on screen, so its first
+        /// show paints its entries. Runs inside `visit`, where `app.shell` holds the child's
+        /// slot: a hidden child writes its next turn there, and the frozen flow misses those rows.
+        pub fn releaseHiddenResumeFlow(app: *App, child: *ChildAgent, reason: []const u8) void {
             if (app.agent_on_screen != child) {
-                // The worker writes this run's turn right after, while the child
-                // is hidden. The frozen flow would miss those rows at the first show.
                 const released = app.shell.releaseUnpaintedResumeSource(app.alloc);
-                if (released > 0) debug_trace.logf("host", "resume flow released before first show agent={s} bytes={d} reason=hidden_first_run", .{ child.id, released });
+                if (released > 0) debug_trace.logf("host", "resume flow released before first show agent={s} bytes={d} reason={s}", .{ child.id, released, reason });
             }
         }
 

@@ -8606,8 +8606,6 @@ test "a hidden subagent's first run builds its view without a stale resume flow"
     };
     try App.AgentsAppRuntime.visit(&app, child, child, Body.run);
 
-    // The child's slot holds its saved turn, and no frozen flow is left to
-    // paint at its first show.
     const view = &child.screen.transcript.notebook;
     var saw_task = false;
     for (view.entries.items) |entry| switch (entry) {

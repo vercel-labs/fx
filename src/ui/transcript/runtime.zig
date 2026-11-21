@@ -2261,6 +2261,7 @@ test "an unpainted resume flow is released, and a painted transcript keeps its f
     } };
     try std.testing.expectEqual(@as(usize, 0), painted.releaseUnpaintedResumeSource(alloc));
     try std.testing.expect(painted.notebook.pending_resume_source != null);
+    try std.testing.expect(!painted.unpainted_resume_hold);
 
     var unpainted = TranscriptRuntime{ .layout = testLayoutWithRows(8) };
     unpainted.layout.cols = 40;
@@ -2273,6 +2274,7 @@ test "an unpainted resume flow is released, and a painted transcript keeps its f
     try std.testing.expect(unpainted.transcript_commit_state == .invalid);
     try std.testing.expectEqual(@as(usize, flow.len), unpainted.releaseUnpaintedResumeSource(alloc));
     try std.testing.expect(unpainted.notebook.pending_resume_source == null);
+    try std.testing.expect(unpainted.unpainted_resume_hold);
 }
 
 const PendingBuildProbe = struct {
@@ -4781,6 +4783,7 @@ const transcript_slot_fields = [_][:0]const u8{
     "publication_projection_invalid",
     "transcript_band_dirty",
     "has_painted_transcript",
+    "unpainted_resume_hold",
     "resume_handoff_repaint_pending",
     "last_visible_transcript_top_row",
     "last_visible_transcript_start_line",
@@ -5042,6 +5045,10 @@ pub const TranscriptRuntime = struct {
     /// shell rows before the renderer has had a chance to respect
     /// `viewport_top_row`.
     has_painted_transcript: bool = false,
+    /// Set when a resume flow is released before the transcript's first
+    /// paint. Until that paint, the transcript keeps the window drops that
+    /// the flow would have kept.
+    unpainted_resume_hold: bool = false,
     /// The last stable frame handed a resumed transcript's flow to the commit
     /// anchor and invalidated it, so the rows it painted are on screen with
     /// no anchor until the next stable frame. The transcript window holds
@@ -5187,10 +5194,14 @@ pub const TranscriptRuntime = struct {
     /// A resume flow installed into a transcript that is not on screen goes
     /// stale when the transcript gets new entries before its first show, so
     /// its owner releases it and the first show paints from the entries. A
-    /// transcript that has painted keeps its flow.
+    /// transcript that has painted keeps its flow. A release of bytes sets
+    /// `unpainted_resume_hold`, which keeps the window's drops until the
+    /// first paint.
     pub fn releaseUnpaintedResumeSource(self: *TranscriptRuntime, alloc: Allocator) usize {
         if (self.transcript_commit_state != .invalid) return 0;
-        return self.releasePendingResumeSource(alloc);
+        const released = self.releasePendingResumeSource(alloc);
+        if (released > 0) self.unpainted_resume_hold = true;
+        return released;
     }
 
     pub fn pendingResumeFlow(self: *const TranscriptRuntime) []const u8 {
@@ -5257,6 +5268,7 @@ pub const TranscriptRuntime = struct {
     pub fn resetPaintedTranscriptView(self: *TranscriptRuntime, top_row: ?u16) void {
         self.pending_scroll_compact = false;
         self.has_painted_transcript = false;
+        self.unpainted_resume_hold = false;
         self.last_visible_transcript_top_row = top_row orelse self.owned_top_row;
         self.last_visible_transcript_start_line = 0;
         self.last_visible_transcript_partial_skip_rows = 0;
@@ -7334,11 +7346,18 @@ pub const TranscriptRuntime = struct {
     /// held cycle. A resumed transcript not painted yet is the exception: the
     /// clear replays its prepared flow, which still shows the cycle before
     /// the newest compaction, so those entries stay until they scroll off.
+    /// A transcript whose resume flow was released before its first paint is
+    /// the same exception until that paint: its replay runs from the entries,
+    /// which still hold the cycle.
     pub fn transcriptWindowScreenCleared(self: *TranscriptRuntime, alloc: Allocator) !void {
         const window = if (self.transcript_window) |*value| value else return;
         if (window.pending_drops.items.len == 0) return;
         if (self.notebook.pending_resume_source != null) {
             debug_trace.logf("transcript_window", "screen cleared: keeping held drops entries={d} reason=resume_source_pending", .{window.pending_drops.items.len});
+            return;
+        }
+        if (self.unpainted_resume_hold) {
+            debug_trace.logf("transcript_window", "screen cleared: keeping held drops entries={d} reason=unpainted_resume", .{window.pending_drops.items.len});
             return;
         }
         var ready = window.pending_drops;
@@ -7375,8 +7394,9 @@ pub const TranscriptRuntime = struct {
         if (self.fullTranscriptActive()) return .all;
         // A resumed transcript not painted yet, or painted and handed off
         // with no anchor yet: everything it holds is on screen or about to
-        // be.
-        if (self.notebook.pending_resume_source != null or self.resume_handoff_repaint_pending) return .all;
+        // be. A resume flow released before the first paint holds the same
+        // drops until that paint (`unpainted_resume_hold`).
+        if (self.notebook.pending_resume_source != null or self.resume_handoff_repaint_pending or self.unpainted_resume_hold) return .all;
         const history = switch (self.transcript_commit_state) {
             .invalid => return .none,
             .stable => |anchor| anchor.history_visual_offset,
@@ -11214,6 +11234,7 @@ pub const TranscriptRuntime = struct {
             if (target_has_content and !self.has_painted_transcript) {
                 self.has_painted_transcript = true;
             }
+            if (target_has_content) self.unpainted_resume_hold = false;
 
             previous_state.deinit(alloc);
             previous_cache.deinit(alloc);

@@ -3276,15 +3276,17 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         await resumed.waitForText("SWITCH_MAIN_ONE", 30_000);
         await resumed.sendText("SWITCH_USER ROW_FOLLOWUP send the reviewer a follow-up");
         await resumed.waitForText("SWITCH_MAIN_TWO", 60_000);
-        // The switch happens while the follow-up's shell call is still running.
         await until("the follow-up's shell call to be served", () => slowCallServed, 90_000);
         await showAgent(resumed, "reviewer");
         await resumed.waitForPane((pane) => pane.includes("\u2503 FOLLOW-L01") && !pane.includes(LIST_HINT), 20_000);
+        // The follow-up's answer comes only after its shell call returns, so
+        // this pane shows the switch made while the call still ran. The call's
+        // command text contains SLOW-DONE, so that marker cannot show absence.
+        expect(await resumed.capturePane()).not.toContain("FOLLOWUP_DONE");
         await resumed.waitForStableScrollback((scrollback) => scrollback.includes("FOLLOW-L12"), 30_000);
 
         const scrollback = await resumed.captureFullScrollback();
         const lost = [...rowMarkers, ...followMarkers].filter((marker) => !scrollback.includes(marker));
-        // On failure, the message lists every lost marker in one line.
         expect({ lost: lost.join(" ") }).toEqual({ lost: "" });
       });
     },
