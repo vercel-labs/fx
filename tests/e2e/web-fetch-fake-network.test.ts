@@ -112,6 +112,7 @@ function startFakeGateway(
 
 function createIsolatedRoot(args: {
   webFetchPermission?: PermissionAction;
+  permission?: Record<string, unknown>;
 } = {}) {
   const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-web-fetch-e2e-")));
   const home = join(root, "home");
@@ -123,7 +124,8 @@ function createIsolatedRoot(args: {
   if (args.webFetchPermission) {
     permission.web_fetch = { "domain:example.com": args.webFetchPermission };
   }
-  writeFileSync(join(home, ".fx", "settings.json"), JSON.stringify({ permission }));
+  const settings = { permission: args.permission ?? permission };
+  writeFileSync(join(home, ".fx", "settings.json"), JSON.stringify(settings));
   return { root, home, workspace: realpathSync(workspace) };
 }
 
@@ -605,6 +607,39 @@ describe("web_fetch Gateway fixture", () => {
     },
     TIMEOUT,
   );
+
+  for (const [name, permission] of [
+    ["ACP wildcard deny refuses web_fetch before any target request", { "*": "deny" }],
+    ["ACP web_fetch deny refuses every host before any target request", { web_fetch: "deny" }],
+  ] as const) {
+    test(
+      name,
+      async () => {
+        const root = createIsolatedRoot({ permission });
+        const gateway = startFakeGateway([
+          outerWebFetchCall(),
+          outerText("ACP fetch denial handled"),
+        ]);
+        const client = AcpClient.create(root.workspace, fakeGatewayEnv(root, gateway));
+        try {
+          await startAcpCodeSession(client);
+          const messages = await runAcpPrompt(client, "Issue denied web_fetch.");
+          const updates = JSON.stringify(messages);
+
+          expect(gateway.requests).toHaveLength(2);
+          expect(gateway.requests[1].body).toContain("policy_denied");
+          expect(updates).not.toContain("Fetching ");
+          expect(updates).not.toContain("Converting ");
+          expect(updates).not.toContain("Extracting ");
+        } finally {
+          await client.close();
+          gateway.stop();
+          rmSync(root.root, { recursive: true, force: true });
+        }
+      },
+      TIMEOUT,
+    );
+  }
 
 });
 
