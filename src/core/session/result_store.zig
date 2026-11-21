@@ -1081,7 +1081,7 @@ test "inline cap and stored preview keep complete codepoints" {
     for ([_]usize{ 128, 129 }) |cap| {
         const prepared = try prepare(alloc, null, "call/2", "grep_files", inline_text.len, inline_text, cap);
         defer alloc.free(prepared.model_output);
-        const marker_start = std.mem.find(u8, prepared.model_output, tool_result_cut_marker.cut_marker_start).?;
+        const marker_start = std.mem.find(u8, prepared.model_output, "\n... [tool result truncated").?;
         const prefix = prepared.model_output[0..marker_start];
         try std.testing.expect(std.unicode.utf8ValidateSlice(prefix));
         try std.testing.expect(std.mem.endsWith(u8, prefix, "\xc3\xa9"));

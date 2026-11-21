@@ -185,7 +185,7 @@ test "prepareModelOutput caps chatty output with explicit marker" {
     defer alloc.free(@constCast(output));
 
     try std.testing.expect(output.len <= 128);
-    try std.testing.expect(std.mem.find(u8, output, tool_result_cut_marker.cut_marker_start ++ "grep_files: original 256 bytes; cap is 128" ++ tool_result_cut_marker.cut_marker_end) != null);
+    try std.testing.expect(std.mem.find(u8, output, "... [tool result truncated for grep_files: original 256 bytes; cap is 128 bytes]") != null);
 }
 
 test "prepareModelOutput keeps complete codepoints at the cap" {
@@ -195,7 +195,7 @@ test "prepareModelOutput keeps complete codepoints at the cap" {
         const output = try prepareModelOutput(alloc, "grep_files", text, cap);
         defer alloc.free(@constCast(output));
         try std.testing.expect(output.len <= cap);
-        const marker_start = std.mem.find(u8, output, tool_result_cut_marker.cut_marker_start).?;
+        const marker_start = std.mem.find(u8, output, "\n... [tool result truncated").?;
         const prefix = output[0..marker_start];
         try std.testing.expect(std.unicode.utf8ValidateSlice(prefix));
         try std.testing.expect(std.mem.endsWith(u8, prefix, "\xc3\xa9"));
