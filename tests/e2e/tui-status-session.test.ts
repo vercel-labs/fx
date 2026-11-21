@@ -7,7 +7,10 @@
 // resume, and the wiring trace's record of each session opened.
 // tests/tla/drivers/session/ runs the same shell along the ShellSession model.
 import { expect, test } from "bun:test";
+import { readdirSync, readFileSync, statSync } from "node:fs";
+import { join } from "node:path";
 import { runFx } from "../evals/eval-helpers";
+import { contentText, parseGatewayRequest } from "./conditional-guidance-oracle";
 import { Profile } from "./shell-sessions";
 import { closedAsBefore, lastTranscriptRow, panelSession, showsStatusPanel, type StatusReport } from "./info-panel";
 import { tmuxAvailable } from "./tmux-helpers";
@@ -81,6 +84,75 @@ scenario("a new session is unsaved until its first prompt, and its id is the one
   expect(await again.quit()).toBe(id);
   expectReport(again.reports()[0]!, id, true);
   expect(again.stderrText()).toBe("");
+});
+
+scenario("--no-save keeps context in memory without changing saved sessions or prompt history", async (profile) => {
+  profile.settings({ session_titles: false });
+  const saved = await profile.launch();
+  const savedId = saved.current()!;
+  expect(savedId).toMatch(SESSION_ID);
+  const savedPrompt = "A prompt in the saved session.";
+  const savedAnswer = "SAVED_SESSION_ANSWER";
+  await saved.prompt(savedPrompt, savedAnswer);
+  expect(await saved.quit()).toBe(savedId);
+  expect(profile.disk()).toEqual({ [savedId]: 1 });
+
+  const profileDir = join(profile.home, ".fx");
+  const historyPath = join(profileDir, "history.jsonl");
+  const sessionsPath = join(profileDir, "sessions");
+  const sessionSnapshot = () => readdirSync(sessionsPath, { recursive: true }).sort().map((relative) => {
+    const path = join(sessionsPath, relative);
+    return [relative, statSync(path).isDirectory() ? null : readFileSync(path)];
+  });
+  const savedFiles = sessionSnapshot();
+  const savedHistory = readFileSync(historyPath, "utf8");
+  expect(savedHistory).toContain(savedPrompt);
+  const expectUnchanged = () => {
+    expect(sessionSnapshot()).toEqual(savedFiles);
+    expect(readFileSync(historyPath, "utf8")).toBe(savedHistory);
+  };
+
+  const shell = await profile.launch({ args: ["--no-save"] });
+  await shell.session.waitForText("Not saved: this session cannot be resumed.", TIMEOUT);
+  await shell.session.waitForText(" · ephemeral", TIMEOUT);
+  const firstPrompt = "Remember the code word juniper.";
+  const firstAnswer = "JUNIPER_NOTED";
+  const secondPrompt = "What was the code word?";
+  const requestStart = profile.gateway.requests.length;
+  const turn = await shell.begin(firstPrompt);
+  expectUnchanged();
+  await turn.release(firstAnswer);
+  await shell.prompt(secondPrompt, "JUNIPER_RECALLED");
+  expect(profile.gateway.requests).toHaveLength(requestStart + 2);
+  const conversation = (turnIndex: number) => parseGatewayRequest(profile.gateway.requests[requestStart + turnIndex]!.body)
+    .prompt?.filter(({ role }) => role === "user" || role === "assistant")
+    .map(({ role, content }) => [role, contentText(content)]);
+  expect(conversation(1)).toEqual([
+    ["user", firstPrompt],
+    ["assistant", firstAnswer],
+    ["user", secondPrompt],
+  ]);
+  expectUnchanged();
+
+  await shell.session.sendText("/resume");
+  await shell.session.waitForText("Cannot resume a session in a launch started with --no-save.", TIMEOUT);
+  await shell.command("/new");
+  const newPrompt = "A prompt after starting over.";
+  await shell.prompt(newPrompt, "FRESH_UNSAVED_ANSWER");
+  expect(profile.gateway.requests).toHaveLength(requestStart + 3);
+  expect(conversation(2)).toEqual([["user", newPrompt]]);
+  expectUnchanged();
+  expect(await shell.quit()).toBeNull();
+  expect(shell.session.paneStatus().status).toBe(0);
+  expect(shell.stderrText()).toBe("");
+  expectUnchanged();
+
+  // --continue must still pick the old saved session, not either unsaved conversation.
+  const continued = await profile.launch({ args: ["--continue"] });
+  await continued.session.waitForText(savedAnswer, TIMEOUT);
+  expect(continued.current()).toBe(savedId);
+  expect(await continued.quit()).toBe(savedId);
+  expect(continued.stderrText()).toBe("");
 });
 
 scenario("/new and /clear open fresh sessions, and one never prompted leaves nothing to resume", async (profile) => {

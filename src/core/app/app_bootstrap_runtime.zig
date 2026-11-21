@@ -513,15 +513,20 @@ pub fn Runtime(comptime App: type) type {
                     };
                 }
             }
+            const no_save = app_session_runtime.Runtime(App).isNoSave(app);
             var prompt_history_unavailable = false;
             if (comptime @hasField(App, "prompt_history")) {
-                prompt_history_unavailable =
-                    (try app.prompt_history.initialize(
-                        app.alloc,
-                        shared_io.homeDir(),
-                        startup.prompt_history_enabled,
-                        startup.prompt_history_store_allowed,
-                    )) == .unavailable;
+                if (no_save) {
+                    app.prompt_history.enabled = false;
+                } else {
+                    prompt_history_unavailable =
+                        (try app.prompt_history.initialize(
+                            app.alloc,
+                            shared_io.homeDir(),
+                            startup.prompt_history_enabled,
+                            startup.prompt_history_store_allowed,
+                        )) == .unavailable;
+                }
             }
 
             var selected_model = startup.takeSelectedModel();
@@ -671,6 +676,11 @@ pub fn Runtime(comptime App: type) type {
                     },
                 );
                 try app.writeTranscriptClassified(welcome_message, true, .welcome);
+                if (no_save) try app.writeDomainNotice(.{
+                    .topic = "session",
+                    .tone = .information,
+                    .body = "Not saved: this session cannot be resumed.",
+                }, true);
                 // Fresh sessions only: on resume the transcript must stay
                 // empty until the deferred session load replays history.
                 try writeSessionAssemblyNotice(app, agent, startup.provider.label());

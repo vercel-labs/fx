@@ -608,11 +608,20 @@ pub fn Runtime(comptime App: type) type {
                 debug_trace.logf("convert", "action=NoticeDropped err={s}", .{@errorName(write_err)});
         }
 
+        /// This launch never opens a conversation store, including after `/new`.
+        pub fn isNoSave(app: *const App) bool {
+            return if (comptime @hasField(App, "no_save")) app.no_save else false;
+        }
+
         pub fn initializePersistence(
             app: *App,
             agent: *AppAgent,
             required: bool,
         ) !void {
+            if (isNoSave(app)) {
+                if (required) return error.SessionPersistenceUnavailable;
+                return;
+            }
             if (comptime !runtime_profile.allows(App, .durable_sessions)) return;
             const opened = session_adapter.Store.openFromEnv(app.alloc) catch |err| {
                 if (required) return err;
@@ -1797,6 +1806,11 @@ pub fn Runtime(comptime App: type) type {
         }
 
         fn openSessionPickerWithScope(app: *App, agent: *AppAgent, scope: SessionPickerScope) !void {
+            if (isNoSave(app)) return app.writeDomainNotice(.{
+                .topic = "session",
+                .tone = .warning,
+                .body = "Cannot resume a session in a launch started with --no-save.",
+            }, true);
             if (agent.stream.active) {
                 try app.writeDomainNotice(.{
                     .topic = "session",

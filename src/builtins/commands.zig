@@ -225,6 +225,9 @@ fn agentRunOptions(comptime scope: []const u8, comptime provider_order: Provider
 const agent_run_usage_base = "[--permission-mode <mode>|--ask|--auto|--full-access] [--provider <name>] [--model <id>] [--effort <level>] [--fast|--no-fast] [--ultrafast|--no-ultrafast]";
 const agent_run_usage = agent_run_usage_base ++ " [--provider-order <a,b,...>] [--provider-strict|--no-provider-strict]";
 
+const save_option: command_specs.OptionDoc = .{ .flag = "--save", .description = "Save the interactive session" };
+const no_save_option: command_specs.OptionDoc = .{ .flag = "--no-save", .description = "Do not save the session; incompatible with --resume" };
+
 pub const ask_options = agentRunOptions("this request", .with_provider_order) ++ [_]command_specs.OptionDoc{
     .{ .flag = "--image PATH", .description = "Attach an image file; repeat for multiple images" },
     .{ .flag = "--system TEXT", .description = "Replace the built-in system prompt for this request" },
@@ -233,7 +236,7 @@ pub const ask_options = agentRunOptions("this request", .with_provider_order) ++
     .{ .flag = "--prompt-permissions", .description = "Prompt for Y/N permission approval when stdin is a TTY" },
     .{ .flag = "--timeout <seconds>", .description = "Time limit for each shell command the agent runs" },
     .{ .flag = "--config <key=value>", .description = "Override a setting for this request, with the keys fx config set takes; repeatable" },
-    .{ .flag = "--no-save", .description = "Do not save the session; incompatible with --resume" },
+    no_save_option,
     .{ .flag = "--no-color", .description = "Render TTY output without colors or hyperlinks; NO_COLOR or TERM=dumb also turns color off" },
     .{ .flag = "--resume <last|<id>>", .description = "Continue the last session or a session by id" },
     .{ .flag = "--resume-id <id>", .description = "Continue a session by exact id", .replacement = "use --resume <id>" },
@@ -565,6 +568,8 @@ pub const launch_options = launch_wide_options ++ [_]command_specs.OptionDoc{
     .{ .flag = "--yolo", .description = "" },
     .{ .flag = "--profile <name>", .description = "" },
     .{ .flag = "--instances <n>", .description = "" },
+    save_option,
+    no_save_option,
 };
 
 /// `usage: fx [--context-limit <spec>] ... <command>`, from `launch_options`,
@@ -647,6 +652,10 @@ pub const top_level_flags = [_]TopLevelFlag{
     .{
         .usage = "--ask, --auto, --full-access",
         .description = "Shortcuts for each permission mode; --yolo means --full-access",
+    },
+    .{
+        .usage = save_option.flag ++ ", " ++ no_save_option.flag,
+        .description = "Save the interactive session (default) or start without saving; --no-save cannot be used to resume a session",
     },
     .{
         .usage = "-c, --continue",
