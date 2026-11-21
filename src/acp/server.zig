@@ -5,6 +5,7 @@ const acp_runner = @import("../core/cli/acp_runner.zig");
 const config_runtime = @import("../core/config/config_runtime.zig");
 const io_mod = @import("../core/shared/io.zig");
 const host_target = @import("../core/hosts/target.zig");
+const sandbox_policy = if (host_target.is_wasm) struct {} else @import("../core/sandbox/policy.zig");
 const jsonrpc = @import("jsonrpc.zig");
 const acp_types = @import("types.zig");
 const sessions = @import("sessions.zig");
@@ -377,6 +378,9 @@ pub const ServerState = struct {
     cache_warming: bool = true,
     /// `experimental.workspace_capture`, from startup.
     workspace_capture: bool = false,
+    /// The sandbox policy, loaded when `experimental.sandbox_execution` is on.
+    /// Host only: the WASM core runs no sandbox.
+    sandbox_policy: if (host_target.is_wasm) void else ?*sandbox_policy.Policy = if (host_target.is_wasm) {} else null,
     active_session: ?ActiveSessionState = null,
     active_prompt: ?*ActivePrompt = null,
     subagent_authority_mutex: std.Io.Mutex = .init,
@@ -438,6 +442,11 @@ pub const ServerState = struct {
         if (comptime !host_target.is_wasm) mcp_host.waitRetired();
         // Retention's maintenance, if one runs, ends with the server.
         if (comptime turn_capture.supported) turn_capture.finishMaintenance();
+        // The prompts, subagents, and worker that could place a command have ended.
+        if (comptime !host_target.is_wasm) {
+            if (self.sandbox_policy) |loaded| loaded.destroy();
+            self.sandbox_policy = null;
+        }
         if (self.sessions_v2) |*store| store.deinit(self.alloc);
         self.workspace_access.deinit(self.alloc);
         if (self.workspace_root.len > 0) self.alloc.free(self.workspace_root);
@@ -3241,6 +3250,9 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
     state.session_titles = startup.session_title_generation;
     state.cache_warming = startup.cache_warming;
     state.workspace_capture = startup.workspace_capture;
+    if (comptime !host_target.is_wasm) {
+        if (startup.sandbox_execution) state.sandbox_policy = sandbox_policy.loadForProcess(state.alloc);
+    }
 
     if (comptime !host_target.is_wasm) {
         if (!state.cfg.minimal_kernel) {

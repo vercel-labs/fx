@@ -20,6 +20,7 @@ const shell_resolver = @import("../../core/terminal/shell_resolver.zig");
 const shell_snapshot = @import("../../core/terminal/shell_snapshot.zig");
 const sort_utils = @import("../../core/shared/sort_utils.zig");
 const terminal_contracts = @import("../../core/terminal/contracts.zig");
+const tool_admission = @import("../../core/tooling/tool_admission.zig");
 const tool_args = @import("../../core/tooling/tool_args.zig");
 const tool_dispatch = @import("../../core/tooling/tool_dispatch.zig");
 const tool_result_limits = @import("../../core/tooling/tool_result_limits.zig");
@@ -740,6 +741,23 @@ fn callRun(
             .{@errorName(err)},
         ) };
     };
+    // The run keeps the placement that admission approved. A placement the
+    // policy now gives differently refuses the run before anything starts.
+    const placed_ctx = (tool_admission.placementAsApproved(
+        ctx.sandbox_policy,
+        request_arena,
+        ctx.workspace_root,
+        managed_execution.admittedFingerprint(authority),
+        .{
+            .command = command,
+            .resolved_cwd = cwd,
+            .target_os = builtin.target.os.tag,
+            .environment = environment,
+        },
+        true,
+    ) catch |err| return placementFailure(ctx, err)) orelse return .{
+        .failure = try ctx.allocator.dupe(u8, tool_admission.placement_changed_refusal),
+    };
     var execution_id_buffer: [64]u8 = undefined;
     const execution_id = runtime.generatedId(&execution_id_buffer) catch |err|
         return runtimeFailure(ctx, err);
@@ -759,6 +777,7 @@ fn callRun(
         .cwd = cwd,
         .environment = environment,
         .authority = authority,
+        .sandbox = placed_ctx.sandbox,
         .extra_environment = if (bridge_registration) |registration| registration.environment() else &.{},
         .yield_hold = if (bridge_registration) |registration| &registration.hold else null,
         .max_output_bytes = ctx.max_command_output_bytes,
@@ -1245,10 +1264,45 @@ const ParsedTerminalExecution = struct {
     }
 };
 
+/// The refusal for a placement the policy gave a run that failed to place.
+fn placementFailure(
+    ctx: tool_dispatch.DispatchContext,
+    err: tool_admission.PlaceError,
+) tool_dispatch.DispatchError!tool_dispatch.ToolResult {
+    const sandbox = ctx.sandbox_policy orelse return unavailable(ctx);
+    var arena_state = std.heap.ArenaAllocator.init(ctx.allocator);
+    defer mem_utils.deinit_arena(arena_state);
+    const text = try tool_admission.placeErrorText(arena_state.allocator(), sandbox, err, false);
+    return .{ .failure = try ctx.allocator.dupe(u8, text) };
+}
+
+/// Refuses a tty run that the sandbox rules place in a sandbox, and every run
+/// while the sandbox config is invalid, before anything starts.
+fn sandboxRefusal(
+    ctx: tool_dispatch.DispatchContext,
+    command: []const u8,
+) tool_dispatch.DispatchError!?tool_dispatch.ToolResult {
+    const sandbox = ctx.sandbox_policy orelse return null;
+    var arena_state = std.heap.ArenaAllocator.init(ctx.allocator);
+    defer mem_utils.deinit_arena(arena_state);
+    const text = (try tool_admission.shellRunRefusal(
+        arena_state.allocator(),
+        sandbox,
+        ctx.workspace_root,
+        command,
+        true,
+        true,
+    )) orelse return null;
+    return .{ .failure = try ctx.allocator.dupe(u8, text) };
+}
+
 fn callTtyRun(
     ctx: tool_dispatch.DispatchContext,
     input: Input,
 ) tool_dispatch.DispatchError!tool_dispatch.ToolResult {
+    if (input.command) |command| {
+        if (try sandboxRefusal(ctx, command)) |refusal| return refusal;
+    }
     const runtime = ctx.managed_executions orelse return unavailable(ctx);
     const owner = ctx.session_child_capability orelse return unavailable(ctx);
     const durable_session_id = ctx.terminal_owner_session_id orelse return unavailable(ctx);

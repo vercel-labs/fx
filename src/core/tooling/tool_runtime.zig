@@ -33,6 +33,7 @@ const glob_pattern = @import("../workspace/glob_pattern.zig");
 const permission_prompter = @import("../permissions/permission_prompter.zig");
 const permission_request = @import("../permissions/permission_request.zig");
 const command_admission = @import("../permissions/command_admission.zig");
+const sandbox_policy = @import("../sandbox/policy.zig");
 const pathing = @import("../workspace/pathing.zig");
 const execution_router = @import("../execution/router.zig");
 const skill_runtime = @import("../skills/skill_runtime.zig");
@@ -267,6 +268,8 @@ pub const Context = struct {
     on_web_fetch_progress: ?tool_dispatch.WebFetchProgressFn = null,
     workspace_executor: ?js_host_workspace.Executor = null,
     host_sandbox_default: tool_admission.HostSandboxDefault = .none,
+    /// The sandbox policy for shell commands. Null when sandbox execution is off.
+    sandbox_policy: ?*const sandbox_policy.Policy = null,
     model_capability_resolver: ?model_capabilities.Resolver = null,
     model_override_resolver: ?subagent_tool_host.ModelOverrideResolver = null,
     /// False when running outside an interactive TUI (e.g. ACP). Tools
@@ -306,6 +309,7 @@ pub const Context = struct {
             .auto_classifier = self.admissionAutoClassifier(),
             .terminal_review_context = self.terminalReviewContext(),
             .host_sandbox_default = self.host_sandbox_default,
+            .sandbox_policy = self.sandbox_policy,
         };
         if (self.permission_state_override != null) {
             input.session_permission_state_provider = null;
@@ -1916,6 +1920,7 @@ fn typedDispatchContext(ctx: Context, arena: Allocator) tool_dispatch.DispatchCo
     return .{
         .allocator = arena,
         .observer = ctx.observer,
+        .sandbox_policy = ctx.sandbox_policy,
         .permission_mode = ctx.permission_mode,
         .workspace_root = ctx.workspace_root,
         .access_scope = ctx.access_scope,
@@ -2325,12 +2330,21 @@ fn toolRunCommand(
 ) !ToolExecutionResult {
     const command = request.command;
     const cwd = request.resolved_cwd;
-    const command_ctx = command_admission.CommandContext{
-        .command = command,
-        .resolved_cwd = cwd,
-        .target_os = builtin.target.os.tag,
-        .environment = request.environment,
-    };
+    // The run keeps the placement its authority approved. A changed placement
+    // refuses the run, and a placed run gets its launch from the policy.
+    const command_ctx = (try tool_admission.placementAsApproved(
+        ctx.sandbox_policy,
+        arena,
+        ctx.workspace_root,
+        managed_execution.admittedFingerprint(authority),
+        .{
+            .command = command,
+            .resolved_cwd = cwd,
+            .target_os = builtin.target.os.tag,
+            .environment = request.environment,
+        },
+        std.meta.activeTag(request.environment) != .workspace_clean,
+    )) orelse return error.CommandAdmissionChanged;
     const timeout = try effectiveCommandTimeout(
         request.timeout_ms,
         ctx.command_timeout_ms,

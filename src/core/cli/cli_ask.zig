@@ -99,6 +99,7 @@ const tool_mcp_runtime = @import("../tooling/tool_mcp_runtime.zig");
 const tool_presentation = @import("../tooling/tool_presentation.zig");
 const tool_result_errors = @import("../tooling/tool_result_errors.zig");
 const tool_runtime = @import("../tooling/tool_runtime.zig");
+const sandbox_policy = @import("../sandbox/policy.zig");
 const tool_set_contract = @import("../tooling/tool_set.zig");
 const tool_specs = @import("../tooling/tool_specs.zig");
 const web_fetch_runtime = @import("../tooling/web_fetch_runtime.zig");
@@ -673,6 +674,8 @@ const AskContext = struct {
     session_write_mutex: std.Io.Mutex = .init,
     /// `experimental.workspace_capture`, from startup.
     workspace_capture: bool = false,
+    /// The sandbox policy, loaded when `experimental.sandbox_execution` is on.
+    sandbox_policy: ?*sandbox_policy.Policy = null,
     /// This run's turn captures, when `workspace_capture` is on (D98).
     turn_capture: turn_capture.TurnCapture = .{},
     requested_resume: ?ResumeTarget = null,
@@ -848,6 +851,9 @@ const AskContext = struct {
         self.terminal_client.deinit();
         self.workspace_access.deinit(self.alloc);
         self.worker.deinit(std.heap.c_allocator);
+        // The subagents and the worker that could place a command have ended.
+        if (self.sandbox_policy) |loaded| loaded.destroy();
+        self.sandbox_policy = null;
         self.turn_capture.deinit();
         // `fx ask` is the whole process: retention's maintenance ends here.
         if (comptime turn_capture.supported) turn_capture.finishMaintenance();
@@ -1129,6 +1135,7 @@ const AskContext = struct {
         }
         var tc: tool_runtime.Context = .{
             .workspace_root = self.workspace_root,
+            .sandbox_policy = self.sandbox_policy,
             .access_scope = self.workspace_access.scope(self.workspace_root),
             .ignored_list_entries = self.cfg.ignored_list_entries,
             .max_list_entries = self.cfg.max_list_entries,
@@ -1759,6 +1766,7 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
         startup.notification_attention_required,
     );
     ctx.workspace_capture = startup.workspace_capture;
+    if (startup.sandbox_execution) ctx.sandbox_policy = sandbox_policy.loadForProcess(alloc);
     ctx.session.setConversationLanguageFromUserMessage(owned_prompt);
     if (options.save_session) {
         try ctx.checkCancellation();
