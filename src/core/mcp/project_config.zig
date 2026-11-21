@@ -652,12 +652,27 @@ fn holdsServers(value: std.json.Value) bool {
     return false;
 }
 
+/// Whether a server map has an entry named `name` with a server's shape.
+fn holdsServerNamed(value: std.json.Value, name: []const u8) bool {
+    if (value != .object) return false;
+    const entry = value.object.get(name) orelse return false;
+    return serverEntryShape(entry);
+}
+
 /// The first top-level key of the profile `text` that looks like a misspelling
 /// of its servers key, or null. It reads every key and every entry, unlike the
 /// scan fx runs as it loads the file (`scanSuspiciousProfileKeys`), which gives
 /// up on a big file: an edit must not miss a key because the file is big.
 /// Null for text that isn't a JSON object.
 pub fn misspelledKey(alloc: Allocator, text: []const u8) Allocator.Error!?MisspelledKey {
+    return misspelledKeyHolding(alloc, text, null);
+}
+
+/// `misspelledKey`, for the first such key that holds a server named `name` (a
+/// server's shape, as the scan reads it), when there is a `name`. The scan, the key
+/// limit and the cut are `misspelledKey`'s. `fx mcp remove` uses it to say where a
+/// name it can't find is, and it writes nothing.
+pub fn misspelledKeyHolding(alloc: Allocator, text: []const u8, name: ?[]const u8) Allocator.Error!?MisspelledKey {
     var parsed = std.json.parseFromSlice(std.json.Value, alloc, text, .{}) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return null,
@@ -670,6 +685,7 @@ pub fn misspelledKey(alloc: Allocator, text: []const u8) Allocator.Error!?Misspe
         const key = entry.key_ptr.*;
         if (std.mem.eql(u8, key, "mcp") or std.mem.eql(u8, key, "mcpServers")) continue;
         if (!isSuspiciousNormalizedKey(key) or !holdsServers(entry.value_ptr.*)) continue;
+        if (name) |wanted| if (!holdsServerNamed(entry.value_ptr.*, wanted)) continue;
         return MisspelledKey.init(key, object.contains("mcp"));
     }
     return null;
@@ -1259,6 +1275,40 @@ test "entryProblemIn names why the reader skips an entry, and holds back none fo
     try std.testing.expectEqual(EntryProblem.url_insecure, (try entryProblemIn(alloc, false, text, "insecure")).?);
     // Not in the file at all.
     try std.testing.expectEqual(EntryProblem.other, (try entryProblemIn(alloc, true, text, "nope")).?);
+}
+
+test "misspelledKeyHolding finds the misspelled key that holds a server by that name, and no other" {
+    const alloc = std.testing.allocator;
+    const text =
+        \\{"mcpServers":{"a":{"command":"x"}},"servers":{"note":1,"c":{"command":"z"}},"mcp_servers":{"b":{"url":"https://b.example/mcp"},"d":7}}
+    ;
+    // Each name is found under the key that holds it; the first key that holds none of them is not the answer.
+    try std.testing.expectEqualStrings("mcp_servers", (try misspelledKeyHolding(alloc, text, "b")).?.key());
+    try std.testing.expectEqualStrings("servers", (try misspelledKeyHolding(alloc, text, "c")).?.key());
+    // A name that is in the real key, in no key, or under a misspelled key as something that is not a server, is not.
+    try std.testing.expect(try misspelledKeyHolding(alloc, text, "a") == null);
+    try std.testing.expect(try misspelledKeyHolding(alloc, text, "nope") == null);
+    try std.testing.expect(try misspelledKeyHolding(alloc, text, "d") == null);
+    try std.testing.expect(try misspelledKeyHolding(alloc, text, "note") == null);
+    // Without a name it is `misspelledKey`.
+    try std.testing.expectEqualStrings((try misspelledKey(alloc, text)).?.key(), (try misspelledKeyHolding(alloc, text, null)).?.key());
+    // Keys and names are read as `std.json` decodes them, so an escape does not hide either.
+    const escaped =
+        \\{"mcp\u005fservers":{"b\u0062":{"command":"y"}}}
+    ;
+    try std.testing.expectEqualStrings("mcp_servers", (try misspelledKeyHolding(alloc, escaped, "bb")).?.key());
+    // The key's bound and its cut are the scan's: a key longer than the bound is named by how it starts.
+    var long: std.ArrayList(u8) = .empty;
+    defer long.deinit(alloc);
+    try long.appendSlice(alloc, "{\"mcp_servers");
+    for (0..70) |_| try long.appendSlice(alloc, "\u{e9}");
+    try long.appendSlice(alloc, "\":{\"b\":{\"command\":\"y\"}}}");
+    const found = (try misspelledKeyHolding(alloc, long.items, "b")).?;
+    try std.testing.expect(found.cut);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(found.key()));
+    // Text that is not an object, or not JSON, holds nothing.
+    try std.testing.expect(try misspelledKeyHolding(alloc, "[1]", "b") == null);
+    try std.testing.expect(try misspelledKeyHolding(alloc, "{ nope", "b") == null);
 }
 
 test "misspelledKey reads every key and entry, and the load scan gives the same key a note" {

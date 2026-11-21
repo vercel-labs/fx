@@ -1215,18 +1215,96 @@ describe("fx mcp add and remove refuse what fx would skip", () => {
     await refused(withMcp, ["a"], fixFor("mcp_servers", "mcp"), "~/.fx/mcp.json", "remove", "a");
   }, 120_000);
 
-  test("guard: remove of a name that is only under the misspelled key, or in .mcp.json, behaves as before", async () => {
+  // The line after "No MCP server named ...": the profile does list the name, under a key that fx doesn't read.
+  const listedUnder = (name: string, why: string) => `${name} is in ~/.fx/mcp.json, but ${why}.\n`;
+
+  test("remove of a name that only the misspelled key holds says so, names the key and the fix, and leaves the file as it was", async () => {
     const root = fresh({ mcpServers: { a: { command: "x" } }, servers: { b: { command: "y" } } }, { mcpServers: { p: { command: "z" } } });
     const before = readFileSync(root.profilePath, "utf8");
+    const fix = fixFor("servers", "mcpServers");
     const missing = await mcp(root, "remove", "b");
     expect(missing.code).toBe(1);
-    expect(missing.stderr).toBe("No MCP server named b in ~/.fx/mcp.json or .mcp.json.\n");
+    expect(missing.stdout).toBe("");
+    expect(missing.stderr).toBe(`No MCP server named b in ~/.fx/mcp.json or .mcp.json.\n${listedUnder("b", fix)}`);
     expect(readFileSync(root.profilePath, "utf8")).toBe(before);
-    // A project server has no misspelled-key check: .mcp.json is not scanned.
+    // --global looks only in the profile, and says so as before; --project looks only in .mcp.json, which has no misspelled-key check.
+    const global = await mcp(root, "remove", "--global", "b");
+    expect(global.code).toBe(1);
+    expect(global.stderr).toBe(`No MCP server named b in ~/.fx/mcp.json.\n${listedUnder("b", fix)}`);
+    const project = await mcp(root, "remove", "--project", "b");
+    expect(project.code).toBe(1);
+    expect(project.stderr).toBe("No MCP server named b in .mcp.json.\n");
+    expect(readFileSync(root.profilePath, "utf8")).toBe(before);
+    // The real key is "mcp" when the profile has it.
+    const withMcp = fresh({ mcp: { a: { command: "x" } }, mcp_servers: { b: { command: "y" } } });
+    const withMcpBefore = readFileSync(withMcp.profilePath, "utf8");
+    const named = await mcp(withMcp, "remove", "b");
+    expect(named.code).toBe(1);
+    expect(named.stderr).toBe(`No MCP server named b in ~/.fx/mcp.json or .mcp.json.\n${listedUnder("b", fixFor("mcp_servers", "mcp"))}`);
+    expect(readFileSync(withMcp.profilePath, "utf8")).toBe(withMcpBefore);
+    // Once the servers are moved and the key is gone, the name is where fx reads it, and the same command removes it.
+    writeFileSync(withMcp.profilePath, JSON.stringify({ mcp: { a: { command: "x" }, b: { command: "y" } } }));
+    const fixed = await mcp(withMcp, "remove", "b");
+    expect(fixed.code).toBe(0);
+    expect(fixed.stdout).toBe("Removed b from ~/.fx/mcp.json.\n");
+  }, 120_000);
+
+  test("guard: remove of a project server leaves the profile as it was, and a name in neither file gets no hint", async () => {
+    const root = fresh({ mcpServers: { a: { command: "x" } }, servers: { b: { command: "y" } } }, { mcpServers: { p: { command: "z" } } });
+    const before = readFileSync(root.profilePath, "utf8");
     const project = await mcp(root, "remove", "p");
     expect(project.code).toBe(0);
     expect(project.stdout).toBe("Removed p from .mcp.json.\n");
     expect(readFileSync(root.profilePath, "utf8")).toBe(before);
+    const none = await mcp(root, "remove", "nope");
+    expect(none.code).toBe(1);
+    expect(none.stderr).toBe("No MCP server named nope in ~/.fx/mcp.json or .mcp.json.\n");
+    expect(readFileSync(root.profilePath, "utf8")).toBe(before);
+  }, 120_000);
+
+  test("the hint finds the name as the reader does: under a key or name written with an escape, under a key too long to show whole, and only when the name is a server there", async () => {
+    // "mcp\u005fservers" is the key mcp_servers, and "b\u0062" the name bb, as JSON reads them.
+    const escaped = fresh('{"mcpServers":{"a":{"command":"x"}},"mcp\\u005fservers":{"b\\u0062":{"command":"y"}}}');
+    const escapedBefore = bytesOf(escaped.profilePath);
+    const found = await mcp(escaped, "remove", "bb");
+    expect(found.code).toBe(1);
+    expect(found.stderr).toBe(`No MCP server named bb in ~/.fx/mcp.json or .mcp.json.\n${listedUnder("bb", fixFor("mcp_servers", "mcpServers"))}`);
+    expect(bytesOf(escaped.profilePath)).toBe(escapedBefore);
+
+    // 11 + 140 bytes: a cut at 128 bytes lands inside a character, so the key is named by how it starts.
+    const wide = "mcp_servers" + "\u00e9".repeat(70);
+    const long = fresh({ mcpServers: { a: { command: "x" } }, [wide]: { b: { command: "y" } } });
+    const longBefore = bytesOf(long.profilePath);
+    const cut = await mcp(long, "remove", "b");
+    expect(cut.code).toBe(1);
+    expect(cut.stdout).toBe("");
+    const lines = cut.stderr.split("\n");
+    expect(lines[0]).toBe("No MCP server named b in ~/.fx/mcp.json or .mcp.json.");
+    expect(cut.stderr).not.toContain("\ufffd");
+    expect(cut.stderr).not.toContain("\\xc3");
+    expect(lines[1]).toContain('b is in ~/.fx/mcp.json, but the key that starts with "mcp_servers\u00e9');
+    expect(lines[1]).not.toContain('the key "mcp_servers');
+    expect(lines[1]).toContain(`" looks like a misspelling of "mcpServers", so fx doesn't read it. Move its servers into "mcpServers", then delete that key, and run the command again.`);
+    const quoted = lines[1].slice(lines[1].indexOf('starts with "') + 'starts with "'.length, lines[1].indexOf('" looks like'));
+    expect(wide.startsWith(quoted)).toBe(true);
+    expect(bytesOf(long.profilePath)).toBe(longBefore);
+
+    // No hint where the name is not a server of a misspelled key: not in it, in a key that is not a misspelling,
+    // or in it as something that is not a server. The first line is the one it always was.
+    const plain = "No MCP server named b in ~/.fx/mcp.json or .mcp.json.\n";
+    for (const profile of [
+      { mcpServers: { a: { command: "x" } }, servers: { c: { command: "y" } } },
+      { mcpServers: { a: { command: "x" } }, notes: { b: { command: "y" } } },
+      { mcpServers: { a: { command: "x" } }, servers: { b: 1, c: { command: "y" } } },
+      { mcpServers: { a: { command: "x" } }, servers: { b: 1 } },
+    ]) {
+      const root = fresh(profile);
+      const before = bytesOf(root.profilePath);
+      const ran = await mcp(root, "remove", "b");
+      expect(ran.code).toBe(1);
+      expect(ran.stderr).toBe(plain);
+      expect(bytesOf(root.profilePath)).toBe(before);
+    }
   }, 120_000);
 
   test("the edit check reads every key: a misspelled key after 64 others, or after 64 entries that aren't servers, is found", async () => {
