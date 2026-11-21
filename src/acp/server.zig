@@ -4051,6 +4051,38 @@ pub fn sessionPromptRunning(session: *ActiveSessionState) bool {
     return session.prompt != null;
 }
 
+/// Copies the session's client system prompt for a turn. The caller holds
+/// `settings_mutex`. A turn takes this copy when it starts, so a prompt that a load
+/// changes while the turn runs does not reach that turn (`TurnSettings.capture`).
+pub fn dupClientSystemPromptLocked(alloc: Allocator, session: *const ActiveSessionState) ![]u8 {
+    return alloc.dupe(u8, session.client_system_prompt);
+}
+
+/// Test only: claims the session's slot for a prompt, as a prompt that starts a turn
+/// does, without starting its worker. `releaseTurnForTest` gives the claim back.
+pub fn claimTurnForTest(state: *ServerState, alloc: Allocator, session: *ActiveSessionState) !void {
+    if (comptime !builtin.is_test) return error.TestOnly;
+    const msg = jsonrpc.Message{ .id = .{ .integer = 1 }, .method = "session/prompt" };
+    switch (try decideSessionPrompt(state, alloc, &msg, session)) {
+        .claimed => {},
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+/// Test only: gives back the claim that `claimTurnForTest` made.
+pub fn releaseTurnForTest(session: *ActiveSessionState) void {
+    if (comptime !builtin.is_test) return;
+    session.waiting_prompts.lock();
+    const turn = session.prompt orelse {
+        session.waiting_prompts.unlock();
+        return;
+    };
+    session.prompt = null;
+    session.waiting_prompts.worker_running = false;
+    session.waiting_prompts.unlock();
+    freeActivePrompt(turn);
+}
+
 /// Whether a request that waits for a prompt arrives while one runs: the
 /// prompt of the session it names, or, where the connection holds one
 /// session, any prompt. A request for another session, or one that names

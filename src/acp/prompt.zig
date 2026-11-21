@@ -266,6 +266,9 @@ const TurnSettings = struct {
     fast_mode: bool,
     ultrafast_mode: bool,
     effort: types.ReasoningEffort,
+    /// The client's system prompt as the turn started with it. A prompt a load sets
+    /// while the turn runs applies from the next turn.
+    client_system_prompt: []u8,
 
     /// The caller holds `session.settings_mutex`.
     fn capture(alloc: Allocator, session: *const server.ActiveSessionState) !TurnSettings {
@@ -277,6 +280,8 @@ const TurnSettings = struct {
         errdefer if (account_id) |id| alloc.free(id);
         const gateway_team: ?[]u8 = if (session.gateway_team) |team| try alloc.dupe(u8, team) else null;
         errdefer if (gateway_team) |team| alloc.free(team);
+        const client_system_prompt = try server.dupClientSystemPromptLocked(alloc, session);
+        errdefer alloc.free(client_system_prompt);
         return .{
             .model = model,
             .provider = session.provider,
@@ -287,10 +292,12 @@ const TurnSettings = struct {
             .fast_mode = session.fast_mode,
             .ultrafast_mode = session.ultrafast_mode,
             .effort = session.effort,
+            .client_system_prompt = client_system_prompt,
         };
     }
 
     fn deinit(self: *TurnSettings, alloc: Allocator) void {
+        alloc.free(self.client_system_prompt);
         alloc.free(self.model);
         if (self.api_key.len > 0) secret.zeroAndFree(alloc, self.api_key);
         if (self.account_id) |id| alloc.free(id);
@@ -1559,7 +1566,7 @@ pub fn handlePrompt(
 
     var skill_catalog = session.workspace.skills.acquireCatalog();
     defer skill_catalog.deinit();
-    const host_instructions = try client_instructions.compose(alloc, session.client_system_prompt);
+    const host_instructions = try client_instructions.compose(alloc, turn_settings.client_system_prompt);
     defer alloc.free(host_instructions);
     for (session.workspace.context_snapshot.notices) |notice| try pushContextNotice(@ptrCast(&ctx), notice);
 
