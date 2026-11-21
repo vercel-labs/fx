@@ -3056,7 +3056,7 @@ test "trace last crash record reads back a crash panic record" {
     const w = try TestWriter.create();
     defer w.destroy();
     var buf: [8192]u8 = undefined;
-    const record = crash_panic.formatRecord(&buf, "9.9.9", "abc1234", 1_700_000_000_123, "index out of bounds");
+    const record = crash_panic.formatRecord(&buf, "9.9.9", "abc1234", 1_700_000_000_123, "panic", "index out of bounds");
     try writeLastCrash(&w.records, record, crash_test_now_ms);
     var trace = try w.trace();
     defer trace.deinit();
@@ -3073,11 +3073,26 @@ test "trace last crash record reads back a crash panic record" {
     try std.testing.expectEqual(@as(usize, 2), trace.count("last_crash_record"));
 }
 
+test "trace last crash record reads a signal record as recorded" {
+    var buf: [8192]u8 = undefined;
+    const record = crash_panic.formatRecord(&buf, "9.9.9", "abc1234", 1_700_000_000_123, "signal", "Segmentation fault at address 0x1234");
+    const w = try TestWriter.create();
+    defer w.destroy();
+    try writeLastCrash(&w.records, record, crash_test_now_ms);
+    var trace = try w.trace();
+    defer trace.deinit();
+    const crash = try trace.one("last_crash");
+    try std.testing.expectEqualStrings("recorded", try testString(crash, "status"));
+    try std.testing.expectEqualStrings("signal", try testString(crash, "error"));
+    try std.testing.expectEqualStrings("Segmentation fault at address 0x1234", try testString(crash, "message"));
+    try std.testing.expectEqual(@as(usize, 2), trace.count("last_crash_record"));
+}
+
 test "trace last crash record masks a secret in the panic message in both places" {
     const w = try TestWriter.create();
     defer w.destroy();
     var buf: [8192]u8 = undefined;
-    const record = crash_panic.formatRecord(&buf, "9.9.9", "abc1234", 1_700_000_000_123, "panic with AI_GATEWAY_API_KEY=abcdefghijklmnop inside");
+    const record = crash_panic.formatRecord(&buf, "9.9.9", "abc1234", 1_700_000_000_123, "panic", "panic with AI_GATEWAY_API_KEY=abcdefghijklmnop inside");
     try writeLastCrash(&w.records, record, crash_test_now_ms);
     var trace = try w.trace();
     defer trace.deinit();
@@ -3091,7 +3106,7 @@ test "trace last crash record masks a secret in the panic message in both places
 
 test "trace last crash record names the time of the crash it includes" {
     var buf: [8192]u8 = undefined;
-    const timed = crash_panic.formatRecord(&buf, "9.9.9", "abc1234", 1_700_000_000_123, "boom");
+    const timed = crash_panic.formatRecord(&buf, "9.9.9", "abc1234", 1_700_000_000_123, "panic", "boom");
     const w = try TestWriter.create();
     defer w.destroy();
     try writeLastCrash(&w.records, timed, crash_test_now_ms);
@@ -3103,7 +3118,7 @@ test "trace last crash record names the time of the crash it includes" {
     try std.testing.expect(none.records.included_crash == null);
 
     // A crash saved without a usable time is not shown: its status says so.
-    const untimed = crash_panic.formatRecord(&buf, "9.9.9", "abc1234", -5, "no clock");
+    const untimed = crash_panic.formatRecord(&buf, "9.9.9", "abc1234", -5, "panic", "no clock");
     const no_time = try TestWriter.create();
     defer no_time.destroy();
     try writeLastCrash(&no_time.records, untimed, crash_test_now_ms);
@@ -3134,7 +3149,7 @@ test "trace last crash read refuses a FIFO and reads a regular file" {
     try std.testing.expectEqualStrings("unreadable", try testString(try blocked_trace.one("last_crash"), "status"));
 
     var buf: [8192]u8 = undefined;
-    const record = crash_panic.formatRecord(&buf, "9.9.9", "abc1234", 1_700_000_000_123, "boom");
+    const record = crash_panic.formatRecord(&buf, "9.9.9", "abc1234", 1_700_000_000_123, "panic", "boom");
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "normal-crash.jsonl", .data = record });
     const normal = try std.Io.Dir.path.join(a, &.{ dir, "normal-crash.jsonl" });
     const recorded = try TestWriter.create();
@@ -3154,7 +3169,7 @@ test "trace time to the minute reads as a UTC clock time" {
 test "trace last crash record shows a crash one hour old" {
     var buf: [8192]u8 = undefined;
     const crash_at = crash_test_now_ms - 60 * 60 * 1000;
-    const record = crash_panic.formatRecord(&buf, "9.9.9", "abc1234", crash_at, "boom");
+    const record = crash_panic.formatRecord(&buf, "9.9.9", "abc1234", crash_at, "panic", "boom");
     const w = try TestWriter.create();
     defer w.destroy();
     try writeLastCrash(&w.records, record, crash_test_now_ms);
@@ -3169,7 +3184,7 @@ test "trace last crash record shows a crash one hour old" {
 test "trace last crash record leaves out a crash 25 hours old and its records" {
     var buf: [8192]u8 = undefined;
     const crash_at = crash_test_now_ms - 25 * 60 * 60 * 1000;
-    const record = crash_panic.formatRecord(&buf, "9.9.9", "abc1234", crash_at, "boom");
+    const record = crash_panic.formatRecord(&buf, "9.9.9", "abc1234", crash_at, "panic", "boom");
     const w = try TestWriter.create();
     defer w.destroy();
     try writeLastCrash(&w.records, record, crash_test_now_ms);
@@ -3186,7 +3201,7 @@ test "trace last crash record leaves out a crash 25 hours old and its records" {
 
 test "trace last crash record names an undated crash as undated" {
     var buf: [8192]u8 = undefined;
-    const record = crash_panic.formatRecord(&buf, "9.9.9", "abc1234", -5, "no clock");
+    const record = crash_panic.formatRecord(&buf, "9.9.9", "abc1234", -5, "panic", "no clock");
     const w = try TestWriter.create();
     defer w.destroy();
     try writeLastCrash(&w.records, record, crash_test_now_ms);
@@ -3203,7 +3218,7 @@ test "trace last crash record names an undated crash as undated" {
 test "trace last crash record leaves out a crash ten minutes in the future" {
     var buf: [8192]u8 = undefined;
     const crash_at = crash_test_now_ms + 10 * 60 * 1000;
-    const record = crash_panic.formatRecord(&buf, "9.9.9", "abc1234", crash_at, "boom");
+    const record = crash_panic.formatRecord(&buf, "9.9.9", "abc1234", crash_at, "panic", "boom");
     const w = try TestWriter.create();
     defer w.destroy();
     try writeLastCrash(&w.records, record, crash_test_now_ms);
@@ -3225,7 +3240,7 @@ test "trace last crash record window is 24 hours back and 5 minutes ahead" {
     };
     for (cases) |case| {
         var buf: [8192]u8 = undefined;
-        const record = crash_panic.formatRecord(&buf, "9.9.9", "abc1234", case.at_ms, "boom");
+        const record = crash_panic.formatRecord(&buf, "9.9.9", "abc1234", case.at_ms, "panic", "boom");
         const w = try TestWriter.create();
         defer w.destroy();
         try writeLastCrash(&w.records, record, crash_test_now_ms);

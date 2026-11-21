@@ -2760,6 +2760,71 @@ describe("effect-aware command permissions", () => {
   );
 
   test.skipIf(!tmuxAvailable())(
+    "TUI trace keeps a segfault as a crash report that the next /trace shows",
+    async () => {
+      const root = createIsolatedRoot();
+      const gateway = startFakeGateway([]);
+      const stderrPath = join(root.root, "segfault-stderr.log");
+      installClipboardFixture(root, "#!/bin/sh\nexit 1\n");
+      writeFileSync(stderrPath, "");
+      const tmpDir = join(root.root, "trace-tmp");
+      mkdirSync(tmpDir);
+      const start = () =>
+        TmuxSession.create({
+          cmd: FX_BIN,
+          cwd: root.workspace,
+          env: gatewayEnv(root, gateway, { PATH: hostilePath(root), TMPDIR: tmpDir }),
+          stderrPath,
+          width: 120,
+          height: 40,
+        });
+
+      // The signal goes to the one process the tmux pane runs, found the way the
+      // other terminal tests find it. The check first confirms that process is fx.
+      activeSession = await start();
+      await activeSession.waitForComposer(TIMEOUT);
+      const fxPid = activeSession.processPid();
+      expect(
+        execFileSync("ps", ["-ww", "-o", "args=", "-p", String(fxPid)], { encoding: "utf8" }),
+      ).toContain(FX_BIN);
+      process.kill(fxPid, "SIGSEGV");
+      expect(await activeSession.waitForSessionEnd(TIMEOUT)).toBe(true);
+      await activeSession.kill();
+      activeSession = null;
+
+      // Zig's default output still names the signal before the process aborts.
+      expect(readFileSync(stderrPath, "utf8")).toContain("Segmentation fault");
+      const crashPath = join(root.home, ".fx", "diagnostics", "last-crash.jsonl");
+      expect(statSync(crashPath).mode & 0o777).toBe(0o600);
+      const lines = readFileSync(crashPath, "utf8")
+        .trim()
+        .split("\n")
+        .map((line) => JSON.parse(line) as Record<string, unknown>);
+      expect(lines[0]).toMatchObject({ type: "fx_trace" });
+      expect(lines[1]).toMatchObject({
+        type: "fatal_error",
+        error: "signal",
+        message: expect.stringMatching(/^Segmentation fault/),
+      });
+
+      activeSession = await start();
+      await activeSession.waitForComposer(TIMEOUT);
+      await activeSession.sendText("/trace");
+      const report = await waitForNewTraceReport(tmpDir);
+      expect(report.one("last_crash")).toMatchObject({
+        status: "recorded",
+        error: "signal",
+        message: expect.stringMatching(/^Segmentation fault/),
+      });
+      await activeSession.sendText("/quit");
+      expect(await activeSession.waitForSessionEnd()).toBe(true);
+      await activeSession.kill();
+      activeSession = null;
+    },
+    TIMEOUT,
+  );
+
+  test.skipIf(!tmuxAvailable())(
     "TUI feedback opens fx.sh without creating a trace or touching the clipboard",
     async () => {
       const root = createIsolatedRoot();
