@@ -9652,7 +9652,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         );
         expect(json.exit_code).toBe(0);
         expect(json.output).toBe(expectedOutput);
-        expect(json.recovery).toEqual({ state: "recovered", attempt: 2 });
+        expect(json.recovery).toEqual({ state: "recovered", attempt: 2, cause: "dropped" });
         expect(connections).toBe(3);
         expect(requests).toBe(1);
         expect(socketFailure).toBeUndefined();
@@ -12975,7 +12975,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       expect(existsSync(sentinelPath)).toBe(false);
       expect(gateway.requestCount()).toBe(2);
       expect(result.stderr).toMatch(/^\[notice\] Gateway error · next try in 1s · attempt 1$/m);
-      expect(json.recovery).toEqual({ state: "recovered", attempt: 2 });
+      expect(json.recovery).toEqual({ state: "recovered", attempt: 2, cause: "server" });
       expect(trace).toContain("termination cause=valid_finish finish_reason=error");
       expect(trace).toContain("event=route_failure");
       expect(trace).toContain("retry=true");
@@ -13110,7 +13110,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       expect(result.signal).toBeNull();
       expect(result.timedOut).toBe(false);
       expect(json.output).not.toContain("⚠ API error");
-      expect(json.recovery).toEqual({ state: "recovered", attempt: 3 });
+      expect(json.recovery).toEqual({ state: "recovered", attempt: 3, cause: "server" });
       expect(result.stderr).toMatch(/^\[notice\] Gateway error · next try in 1s · attempt 1$/m);
       expect(result.stderr).toMatch(/^\[notice\] Gateway error · retrying · attempt 3$/m);
       expect(result.stderr).not.toContain("route failure");
@@ -13155,7 +13155,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       expect(json.output).toBe("Recovered after the gateway stream timeout.");
       expect(gateway.requestCount()).toBe(3);
       // Each timeout is one counted send; nothing probes the connection.
-      expect(json.recovery).toEqual({ state: "recovered", attempt: 3 });
+      expect(json.recovery).toEqual({ state: "recovered", attempt: 3, cause: "dropped" });
       expect(result.stderr).toMatch(/^\[notice\] Connection lost · next try in 1s · attempt 1$/m);
       expect(result.stderr).toMatch(/^\[notice\] Connection lost · next try in 2s · attempt 2$/m);
       expect(trace).toContain("event=route_failure");
@@ -13192,7 +13192,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       expect(json.exit_code).toBe(0);
       expect(json.output).toBe("Recovered after the finish-only timeout.");
       expect(gateway.requestCount()).toBe(3);
-      expect(json.recovery).toEqual({ state: "recovered", attempt: 3 });
+      expect(json.recovery).toEqual({ state: "recovered", attempt: 3, cause: "dropped" });
       expect(result.stderr).toMatch(/^\[notice\] Connection lost · next try in 1s · attempt 1$/m);
       expect(trace).toContain("event=route_failure");
       expect(trace).toContain("http_status=200");
@@ -13229,7 +13229,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       expect(json.exit_code).toBe(0);
       expect(json.output).toBe("Recovered beyond the old budget.");
       expect(gateway.requestCount()).toBe(13);
-      expect(json.recovery).toEqual({ state: "recovered", attempt: 13 });
+      expect(json.recovery).toEqual({ state: "recovered", attempt: 13, cause: "server" });
       expect(result.stderr).toMatch(/^\[notice\] Gateway error · next try in 1s · attempt 1$/m);
       expect(result.stderr).toMatch(/^\[notice\] Gateway error · retrying · attempt 13$/m);
       // No attempt count is ever shown as a fraction of a limit.
@@ -13274,7 +13274,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       expect(result.code).toBe(0);
       expect(recovered.output).toBe(finalText);
       expect(recovered.final_output).toBe(finalText);
-      expect(recovered.recovery).toEqual({ state: "recovered", attempt: 11 });
+      expect(recovered.recovery).toEqual({ state: "recovered", attempt: 11, cause: "server" });
       expect(gateway.requestCount()).toBe(11);
       expect(gateway.requests[10]!.body).not.toContain(partialText);
       expectOnlyLeadingSystemMessages(gateway.requests[10]!.body);
@@ -13694,7 +13694,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       expect(json.exit_code).toBe(0);
       expect(json.error ?? null).toBeNull();
       expect(json.final_output).toBe("ALLOWED_AFTER_TWO_BLOCKS");
-      expect(json.recovery).toEqual({ state: "recovered", attempt: 3 });
+      expect(json.recovery).toEqual({ state: "recovered", attempt: 3, cause: "content_filter" });
       expect(gateway.requestCount()).toBe(3);
       expect(trace.split("event=content_filter_resend").length - 1).toBe(2);
       expect(result.stderr).not.toContain("press Esc");
@@ -13854,7 +13854,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
 
       expect(result.code).toBe(0);
       expect(json.output).toBe("Answered after the upstream cut.");
-      expect(json.recovery).toEqual({ state: "recovered", attempt: 2 });
+      expect(json.recovery).toEqual({ state: "recovered", attempt: 2, cause: "server" });
       expect(gateway.requestCount()).toBe(2);
       expect(result.stderr).toMatch(/^\[notice\] Gateway error · next try in 1s · attempt 1$/m);
     } finally {
@@ -14006,7 +14006,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       expect(json.exit_code).toBe(0);
       expect(json.output).toBe("Finished on the fourth send.");
       expect(gateway.requestCount()).toBe(4);
-      expect(json.recovery).toEqual({ state: "recovered", attempt: 4 });
+      expect(json.recovery).toEqual({ state: "recovered", attempt: 4, cause: "dropped" });
       expect(result.stderr).not.toContain("kept failing");
       expect(trace).toContain("termination cause=done_without_finish");
     } finally {
@@ -14041,7 +14041,8 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       expect(result.code).toBe(1);
       expect(gateway.requestCount()).toBe(2);
       // Not the `retrying` the request showed before the error.
-      expect(json.recovery).toEqual({ state: "failed", attempt: 2 });
+      // cause names the last failure fx retried, the 503; the 400 that ended the request reaches the result its usual way.
+      expect(json.recovery).toEqual({ state: "failed", attempt: 2, cause: "server" });
       expect(result.stderr).toContain("bad request body");
     } finally {
       gateway.stop();
@@ -14168,7 +14169,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         expect(json.error).toBeUndefined();
         expect(json.output).toBe(recoveredText);
         expect(json.tool_calls).toEqual([]);
-        expect(json.recovery).toEqual({ state: "recovered", attempt: 2 });
+        expect(json.recovery).toEqual({ state: "recovered", attempt: 2, cause: "dropped" });
       } finally {
         gateway.stop();
         rmSync(root.root, { recursive: true, force: true });

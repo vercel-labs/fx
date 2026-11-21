@@ -8155,8 +8155,9 @@ test "render final JSON reports the successful recovery attempt" {
 
     const json = try renderFinalJsonResult(alloc, result);
     defer alloc.free(json);
-    // The module shape (decision 38): `recovered` carries only the attempt,
-    // with no message, budget, or delay fields.
+    // The module shape (decision 38): `recovered` carries the attempt and,
+    // when a send failed, the cause. This status has no failure, so it
+    // carries only the attempt, with no message, budget, or delay fields.
     try std.testing.expect(std.mem.find(u8, json, ",\"recovery\":{\"state\":\"recovered\",\"attempt\":3}}") != null);
 }
 
