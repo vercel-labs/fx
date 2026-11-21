@@ -776,8 +776,15 @@ pub const Runtime = struct {
                         // The work ended while this message waited for the lock,
                         // and nothing keeps the child busy any more: admit the
                         // message again, so it starts a work rather than waiting
-                        // for a turn no end will start.
-                        if (turned_away and pass == 0 and !self.isBusyLocked(target.child_id) and !self.inTurnWorkLocked(target.child_id)) continue :admit;
+                        // for a turn no end will start. When the second pass
+                        // finds the same, the registry shows a work that nothing
+                        // runs, so no end will start what waits for this child:
+                        // the message is refused, not queued.
+                        if (turned_away and !self.isBusyLocked(target.child_id) and !self.inTurnWorkLocked(target.child_id)) {
+                            if (pass == 0) continue :admit;
+                            debug_trace.eventf("mailbox", "message_refused_unstartable", .{}, "child={s} work_id={s}", .{ target.child_id, target.work_id });
+                            return self.refuse(alloc, .state_unavailable);
+                        }
                         // It waits, and starts the child's next turn.
                         self.queuePendingLocked(target.child_id, agent, operation_id, fingerprint, request.*, profiled, resolved_model) catch |err| {
                             if (err == error.QueueFull) return self.refuse(alloc, .{ .queue_full = .subagent });
@@ -5124,6 +5131,70 @@ test "a user's turn whose work fails to open at any allocation leaves its subage
     // The call allocates in more places than the few that matter; a sweep that
     // ended at once would prove nothing.
     try std.testing.expect(at > 3);
+}
+
+/// One try of the sweep below: a user's turn is open on `reviewer`, one message
+/// of main waits for it, and that message's start fails. The `fail_at`-th
+/// allocation of the turn's end fails. Main then sends one more message, which
+/// must run or be refused, and never be answered as waiting. Returns whether
+/// the allocation failed; counts in `sent` and `refused` the tries of each kind.
+fn sweepUserTurnEnd(fail_at: usize, sent: *usize, refused: *usize) !bool {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var parent: child_state.TestParent = undefined;
+    try parent.init(alloc);
+    defer parent.deinit();
+    var fixture = MailboxFixture{};
+    defer fixture.deinit();
+    const runtime = try mailboxRuntime(alloc, &fixture, &parent);
+    var faulted: FaultedHost = undefined;
+    faulted.install(runtime);
+    defer faulted.deinit();
+    _ = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "first" } }, "call-0", null);
+    try waitUntilQuiet(runtime);
+    const child_id = try reviewerId(runtime, arena);
+    const work_id = runtime.beginUserWork(alloc, child_id, null).?;
+    defer alloc.free(work_id);
+    const queued = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "waiting" } }, "call-1", null);
+    try expectBodyHas(queued, "is busy");
+
+    start_test_controls.test_fail_spawn = true;
+    faulted.arm(fail_at);
+    runtime.endUserWork(child_id, work_id, .completed, "");
+    faulted.disarm();
+    start_test_controls.test_fail_spawn = false;
+    try waitUntilQuiet(runtime);
+    if (!faulted.fault.fired) return false;
+
+    const where = try alloc.print("allocation {d} of the end of a user's turn", .{fail_at});
+    defer alloc.free(where);
+    const runs_before = fixture.runs.load(.seq_cst);
+    const next = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "next" } }, "call-2", null);
+    try expectAt(where, "not answered as waiting", if (std.mem.find(u8, next, "is busy") == null) "not answered as waiting" else next);
+    if (std.mem.find(u8, next, "Sent to reviewer") != null) {
+        sent.* += 1;
+        try waitUntilQuiet(runtime);
+        const ran = fixture.runs.load(.seq_cst) - runs_before;
+        try expectAt(where, "the message ran once", if (ran == 1) "the message ran once" else "the message did not run");
+    } else {
+        refused.* += 1;
+        try expectAt(where, "refused as state_unavailable", if (std.mem.find(u8, next, "\"error_code\":\"state_unavailable\"") != null) "refused as state_unavailable" else next);
+    }
+    return true;
+}
+
+test "a message sent after the user's turn could not be ended runs or is refused, at any allocation" {
+    var at: usize = 0;
+    var sent: usize = 0;
+    var refused: usize = 0;
+    while (try sweepUserTurnEnd(at, &sent, &refused)) : (at += 1) {}
+    // The end allocates in more places than the few that matter, and each
+    // kind of answer must occur, so the sweep is not vacuous.
+    try std.testing.expect(at > 0);
+    try std.testing.expect(refused > 0);
+    try std.testing.expect(sent > 0);
 }
 
 test "an early-ended work names each file it changed once, without reads or failed changes" {
