@@ -330,6 +330,8 @@ test "the compaction row moves while the model reads and goes on to 99% as the n
     try std.testing.expectEqualStrings("• Compacting 7% (10s)", compactionProjection(&buf, state.snapshot, 11_000).turn_thinking.label);
     state.observed(54_000);
     try std.testing.expectEqualStrings("• Compacting 23% (53s)", compactionProjection(&buf, state.snapshot, 54_000).turn_thinking.label);
+    // The tick goes on handing in the time while the model reads.
+    state.observed(114_000);
     state.written(id, 50, 126_000);
     try std.testing.expectEqualStrings("• Compacting 66% (2m5s)", compactionProjection(&buf, state.snapshot, 126_000).turn_thinking.label);
     state.written(id, 99, 250_000);

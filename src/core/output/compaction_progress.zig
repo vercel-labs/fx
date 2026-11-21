@@ -9,11 +9,13 @@
 //! and stays under half of that room, so the row moves while the model reads
 //! without claiming notes that were not written.
 //!
-//! This module reads no clock and allocates nothing. Every time is handed in,
-//! and only time that passed forward counts as waiting, so a system clock set
-//! back takes nothing from the number. The number is read from the state
-//! alone. `tests/tla/compaction_progress/CompactionProgress.tla` models it,
-//! and `tests/tla/drivers/compaction_progress/driver.ts` walks it along the
+//! This module reads no clock and allocates nothing. Every time is handed in.
+//! Only time that passed forward counts as waiting, in steps of at most
+//! `longest_step_ms`, so a system clock set back takes nothing from the
+//! number, and a clock set forward, or a sleep, adds nothing to it. The
+//! number is read from the state alone.
+//! `tests/tla/compaction_progress/CompactionProgress.tla` models it, and
+//! `tests/tla/drivers/compaction_progress/driver.ts` walks it along the
 //! model.
 
 const std = @import("std");
@@ -31,6 +33,11 @@ const share_scale: u64 = 10_000;
 const wait_half_ms: u64 = 60_000;
 /// A longer wait earns no more, which keeps the wait in a `u32`.
 const longest_wait_ms: u64 = 24 * std.time.ms_per_hour;
+/// The longest step between two times the row is handed that counts as
+/// waiting. The UI's tick hands in the time far more often than this, so a
+/// longer step is a sleep or a system clock set forward, and it earns
+/// nothing.
+const longest_step_ms: u64 = 60 * std.time.ms_per_s;
 
 pub const Progress = struct {
     /// What the row showed when the request in flight was sent, in
@@ -49,13 +56,16 @@ pub const Progress = struct {
     seen_ms: i64 = 0,
 
     /// The row is handed the time. Only time that passed forward since the
-    /// time before counts as waiting, so a system clock set back takes
-    /// nothing from the number (CountNeverFalls), and the wait goes on from
-    /// the new time.
+    /// time before counts as waiting, and only in a step of at most
+    /// `longest_step_ms`. So a system clock set back takes nothing from the
+    /// number (CountNeverFalls), a clock set forward or a sleep adds nothing
+    /// to it (JumpEarnsNothing), and the wait goes on from the new time.
     pub fn observed(self: *Progress, now_ms: i64) void {
         if (self.waiting and now_ms > self.seen_ms) {
             const passed: u64 = @intCast(now_ms -| self.seen_ms);
-            self.waited_ms = @intCast(@min(self.waited_ms + passed, longest_wait_ms));
+            if (passed <= longest_step_ms) {
+                self.waited_ms = @intCast(@min(self.waited_ms + passed, longest_wait_ms));
+            }
         }
         self.seen_ms = now_ms;
     }
@@ -107,6 +117,13 @@ pub const Progress = struct {
     }
 };
 
+/// Hands the row the time up to `until_ms` in steps that count as waiting,
+/// as the UI's tick does.
+fn tick(progress: *Progress, until_ms: i64) void {
+    const step: i64 = @intCast(longest_step_ms);
+    while (progress.seen_ms < until_ms) progress.observed(@min(progress.seen_ms + step, until_ms));
+}
+
 test "with no wait the row shows the notes' own count" {
     var progress: Progress = .{};
     for (0..100) |count| {
@@ -137,7 +154,7 @@ test "the row moves while the first request waits, and a wait earns less than ha
         .{ .now_ms = 1_000 + 400 * 24 * std.time.ms_per_hour, .shown = 49 },
     };
     for (steps) |step| {
-        progress.observed(step.now_ms);
+        tick(&progress, step.now_ms);
         try std.testing.expectEqual(step.shown, progress.shown());
     }
 }
@@ -146,6 +163,7 @@ test "the notes fill what the wait left, and the wait stops earning once they ar
     var progress: Progress = .{};
     progress.asked(1_000);
     // 125 s of reading, then the first note.
+    tick(&progress, 126_000);
     try std.testing.expect(progress.written(1, 126_000));
     try std.testing.expectEqual(@as(u8, 34), progress.shown());
     // Time alone no longer moves the row.
@@ -193,6 +211,29 @@ test "a system clock set back takes nothing from the number, and the wait goes o
     // The notes arrive at a time before the request's own.
     try std.testing.expect(progress.written(99, 500));
     try std.testing.expectEqual(@as(u8, 99), progress.shown());
+}
+
+test "a clock set forward, or a sleep, adds nothing to the number, and the wait goes on from the new time" {
+    var progress: Progress = .{};
+    progress.asked(1_000);
+    progress.observed(54_000);
+    try std.testing.expectEqual(@as(u8, 23), progress.shown());
+    // The machine sleeps for two hours, or the clock is set forward.
+    const woke = 54_000 + 2 * std.time.ms_per_hour;
+    progress.observed(woke);
+    try std.testing.expectEqual(@as(u8, 23), progress.shown());
+    // Seven more seconds make the wait 60 s.
+    progress.observed(woke + 7_000);
+    try std.testing.expectEqual(@as(u8, 24), progress.shown());
+    // The longest step that counts, and the first that does not.
+    var counted: Progress = .{};
+    counted.asked(1_000);
+    counted.observed(61_000);
+    try std.testing.expectEqual(@as(u8, 24), counted.shown());
+    var skipped: Progress = .{};
+    skipped.asked(1_000);
+    skipped.observed(61_001);
+    try std.testing.expectEqual(@as(u8, 0), skipped.shown());
 }
 
 test "the row never falls and never passes 99, whatever arrives and whichever way the clock goes" {

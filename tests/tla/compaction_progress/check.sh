@@ -13,6 +13,7 @@
 #   compaction-progress-mutation-no-cap      the row reaches 100% before saving              FullOnlyWhenSaving
 #   compaction-progress-mutation-keeps-old   a new compaction keeps the last one's numbers   StartsClean
 #   compaction-progress-mutation-clock-back  a clock set back takes the wait back            CountNeverFalls
+#   compaction-progress-mutation-jump-counts a clock set forward counts as waiting           JumpEarnsNothing
 #
 # Then run the driver, which walks src/core/output/compaction_progress.zig
 # along the model's graph:
@@ -40,4 +41,5 @@ CompactionProgress compaction-progress-mutation-unbounded WaitIsBounded
 CompactionProgress compaction-progress-mutation-no-cap FullOnlyWhenSaving
 CompactionProgress compaction-progress-mutation-keeps-old StartsClean
 CompactionProgress compaction-progress-mutation-clock-back CountNeverFalls
+CompactionProgress compaction-progress-mutation-jump-counts JumpEarnsNothing
 VERDICTS

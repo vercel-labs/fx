@@ -6,12 +6,13 @@
 // code can tell apart, along a shortest path, and then follows seeded random
 // paths. Each model step becomes an event for lab.zig, which runs the real
 // code at the model's time in milliseconds, also when the model sets its
-// clock back. After every step the number the code's row shows, its phase,
+// clock back or forward. After every step the number the code's row shows,
+// its phase,
 // and the marks behind the number must match the model's next state. Each
 // model tick is 20,000 ms, so the code's arithmetic gives the model's whole
 // numbers.
 //
-// --self-check plants eight defects, one line each, in copies of the code
+// --self-check plants nine defects, one line each, in copies of the code
 // and requires the walks to reject every copy, then requires a wrong
 // expectation to be rejected too.
 //
@@ -155,6 +156,7 @@ function opsFor(label: string, s: Model, t: Model): Op[] {
     case "Settle": return [{ op: "settle", now }];
     case "Tick": return [{ op: "read", now }];
     case "ClockBack": return [{ op: "read", now }];
+    case "ClockJump": return [{ op: "read", now }];
     default: throw new Error(`no mapping for model action ${label}`);
   }
 }
@@ -357,6 +359,12 @@ if (options.selfCheck) {
       file: "compaction_progress.zig",
       target: "self.seen_ms = now_ms;",
       planted: "if (self.waiting and now_ms < self.seen_ms) self.waited_ms -|= @as(u32, @intCast(self.seen_ms - now_ms)); self.seen_ms = now_ms;",
+    },
+    {
+      name: "counts a clock set forward as waiting",
+      file: "compaction_progress.zig",
+      target: "if (passed <= longest_step_ms) {",
+      planted: "if (passed <= longest_wait_ms) {",
     },
     {
       name: "shows less than 100% while fx saves",

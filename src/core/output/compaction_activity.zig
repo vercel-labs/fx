@@ -308,6 +308,9 @@ test "the row's number moves while a request waits and is 100 only while saving"
     // A system clock set back takes nothing from the number.
     state.observed(2_000);
     try std.testing.expectEqual(@as(?u8, 23), state.snapshot.operation.?.percent());
+    // A sleep, or a system clock set forward, adds nothing to it.
+    state.observed(2_000 + 2 * std.time.ms_per_hour);
+    try std.testing.expectEqual(@as(?u8, 23), state.snapshot.operation.?.percent());
     try std.testing.expectEqual(revision, state.snapshot.revision);
     state.written(id, 99, 126_000);
     try std.testing.expectEqual(@as(?u8, 99), state.snapshot.operation.?.percent());

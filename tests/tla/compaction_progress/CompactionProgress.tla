@@ -13,13 +13,15 @@
 (*                                                                         *)
 (* The row is handed the time: by the worker with each request and each    *)
 (* rise of the count, and by the UI's tick. Only time that passed forward  *)
-(* counts as waiting, so the system clock can be set back without taking   *)
-(* anything from the number. The number is read from the state alone.      *)
+(* counts as waiting, and only in a step of at most LongestStep. So the    *)
+(* system clock can be set back without taking anything from the number,   *)
+(* and a clock set forward, or a sleep, adds nothing to it. The number is  *)
+(* read from the state alone.                                              *)
 (*                                                                         *)
 (* The arithmetic gives the code's own whole numbers: the row counts in    *)
 (* hundredths of a percent up to Top, and a share is in ten-thousandths.   *)
-(* Time counts ticks of 20 seconds and starts at 1. WaitHalf is 3 ticks,   *)
-(* the code's 60 seconds.                                                  *)
+(* Time counts ticks of 20 seconds and starts at 1. WaitHalf and           *)
+(* LongestStep are 3 ticks each, the code's 60 seconds.                    *)
 (*                                                                         *)
 (* Bug plants one defect for the configs that must fail:                   *)
 (*   today       a waiting request earns nothing (fx before the change)    *)
@@ -30,6 +32,7 @@
 (*   no_cap      the row can reach 100% before saving                      *)
 (*   keeps_old   a new compaction starts from the last one's numbers       *)
 (*   clock_back  a clock set back takes the wait back with it              *)
+(*   jump_counts a clock set forward, or a sleep, counts as waiting        *)
 (***************************************************************************)
 EXTENDS Integers
 
@@ -42,6 +45,7 @@ CONSTANTS
 All == 99         \* compaction_progress.all_notes
 Scale == 10000    \* share_scale
 WaitHalf == 3     \* wait_half_ms, in ticks
+LongestStep == 3  \* longest_step_ms, in ticks
 SteadyWait == 10  \* ticks: the first 200 seconds of a wait
 Top == IF Bug = "no_cap" THEN 10000 ELSE All * 100
 WaitShare == IF Bug = "unbounded" THEN Scale ELSE 5000
@@ -50,7 +54,7 @@ ASSUME MaxTime \in 2..11
 ASSUME MaxBacks \in 0..2
 ASSUME Levels \subseteq 1..All
 ASSUME Bug \in {"none", "today", "ask_resets", "no_rebase", "thaw", "unbounded", "no_cap", "keeps_old",
-                 "clock_back"}
+                 "clock_back", "jump_counts"}
 
 Phases == {"none", "preparation", "summary", "publication"}
 
@@ -62,7 +66,7 @@ Counting(p) == p \in {"preparation", "summary", "publication"}
 MaxWait == MaxTime * (MaxBacks + 1)
 
 VARIABLES
-    now,      \* the system clock, in ticks; it can be set back
+    now,      \* the system clock, in ticks; it can be set back or forward
     phase,    \* the compaction on the row; "none" shows no row
     floor,    \* Progress.floor
     base,     \* Progress.base
@@ -117,9 +121,11 @@ ShownPct ==
       [] OTHER -> 0
 
 \* Progress.observed: the wait after the row is handed the time t. Only time
-\* that passed forward since the time before counts.
+\* that passed forward since the time before counts, and only in a step of at
+\* most LongestStep: a longer step is a clock set forward or a sleep.
 WaitedAt(t) ==
-    IF waiting /\ t > seen THEN waited + (t - seen)
+    IF waiting /\ t > seen /\ (t - seen <= LongestStep \/ Bug = "jump_counts")
+      THEN waited + (t - seen)
     ELSE IF Bug = "clock_back" /\ waiting /\ t < seen
            THEN (IF waited > seen - t THEN waited - (seen - t) ELSE 0)
            ELSE waited
@@ -215,6 +221,15 @@ ClockBack ==
     /\ UNCHANGED <<phase, floor, base, notes, waiting>>
     /\ row' = ShownPct'
 
+\* The system clock is set forward, or the machine sleeps, for longer than
+\* LongestStep, and the UI's tick hands the new time to the row.
+ClockJump ==
+    /\ \E t \in (now + LongestStep + 1)..MaxTime :
+        /\ now' = t
+        /\ Observe(t)
+    /\ UNCHANGED <<phase, floor, base, notes, waiting, backs>>
+    /\ row' = ShownPct'
+
 Next ==
     \/ Begin
     \/ Summarize
@@ -224,6 +239,7 @@ Next ==
     \/ Settle
     \/ Tick
     \/ ClockBack
+    \/ ClockJump
 
 Spec == Init /\ [][Next]_vars
 
@@ -232,6 +248,10 @@ Spec == Init /\ [][Next]_vars
 \* While the row shows a number it never goes down, whichever way the clock
 \* goes.
 CountNeverFalls == [][Counting(phase) /\ Counting(phase') => ShownPct' >= ShownPct]_vars
+
+\* A step longer than LongestStep earns nothing: a clock set forward, or a
+\* sleep, leaves the number where it was.
+JumpEarnsNothing == [][now' > now + LongestStep => Value' = Value]_vars
 
 \* The row is not stuck while the model reads: for the first 200 seconds that
 \* the first request waits, the number rises with every 20 seconds.
