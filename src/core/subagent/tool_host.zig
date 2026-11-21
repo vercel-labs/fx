@@ -2072,11 +2072,14 @@ pub const Runtime = struct {
             const waiting = self.dropPendingLocked(child_id, "stopped");
             // The stopped turn's unread messages go with it, so they count
             // too, and so do the messages its slot keeps or carries into the
-            // next work (`tests/tla/subagent/StopMessage.tla` NoSilentLoss).
+            // next work, all in the owner's one step (`Owner.stop`,
+            // `tests/tla/subagent/StopMessage.tla` NoSilentLoss). A work that
+            // already ended is the other case: the slot keeps what the turn
+            // never took until the end hook, and `takeDropped` counts it.
             const unread = self.managed.stop(child_id);
-            const held = self.managed.takeDropped(child_id);
-            if (unread) |count| break :blk .{ waiting + count + held, true };
-            break :blk .{ waiting + held, self.stopTurnWorkLocked(child_id) };
+            end_test_controls.holdInStop(child_id);
+            if (unread) |count| break :blk .{ waiting + count, true };
+            break :blk .{ waiting + self.managed.takeDropped(child_id), self.stopTurnWorkLocked(child_id) };
         };
         debug_trace.eventf("mailbox", "stop", .{}, "target={s} by=parent running={} dropped={d}", .{ child_id, stopped, dropped });
         const dropped_text = switch (dropped) {
@@ -2150,19 +2153,24 @@ pub const Runtime = struct {
                 self.noteUserDropLocked(child_id, dropped, true);
                 if (name) |value| self.noteUserClosedLocked(value);
             }
-            // The parent's close drops the closed turn's unread messages
-            // and counts them, as its stop does.
+            // The parent's close drops the closed turn's unread messages and
+            // the ones its slot keeps or carries into the next work, and counts
+            // them in the owner's one step, as its stop does. The user's close
+            // counts none of them.
             var unread: usize = 0;
+            var ended_turn = false;
             const stopped = switch (by) {
                 .parent => if (self.managed.stop(child_id)) |count| ended: {
                     unread = count;
+                    ended_turn = true;
                     break :ended true;
                 } else false,
                 .user => self.managed.closeByUser(child_id),
             } or self.stopTurnWorkLocked(child_id);
-            // So do the messages its slot keeps or carries into the next work.
-            // The user's close counts none of them.
-            if (by == .parent) unread += self.managed.takeDropped(child_id);
+            if (by == .parent) {
+                end_test_controls.holdInStop(child_id);
+                if (!ended_turn) unread += self.managed.takeDropped(child_id);
+            }
             self.closing.appendAssumeCapacity(.{ .id = owned });
             self.closed_unseen.appendAssumeCapacity(unseen);
             self.closed_waiting.store(true, .release);
@@ -2937,8 +2945,11 @@ const MailboxFixture = struct {
     /// While set, the first run fails once released.
     fail_first: bool = false,
     /// While set, a cancelled run stays in its turn until `release`, so a
-    /// stop meets a turn that is still winding down.
+    /// stop meets a turn that is still winding down. It waits at most 10 s: a
+    /// run that was never released fails and sets `linger_timed_out`, which the
+    /// tests that use `linger` check.
     linger: bool = false,
+    linger_timed_out: std.atomic.Value(bool) = .init(false),
     /// While set, each run saves an empty reply.
     empty_reply: bool = false,
     /// While set, the sink takes no report, as when its owner is gone.
@@ -3046,7 +3057,12 @@ const MailboxFixture = struct {
         const run_number = self.runs.fetchAdd(1, .seq_cst) + 1;
         self.ask(worker, message.content);
         while (self.hold and !self.release.isSet() and !cancel.load(.seq_cst)) io_mod.sleep(std.time.ns_per_ms);
-        if (self.linger and cancel.load(.seq_cst)) self.release.waitUncancelable(io_mod.getIo());
+        if (self.linger and cancel.load(.seq_cst)) {
+            self.release.waitTimeout(io_mod.getIo(), .{ .duration = .{ .clock = .awake, .raw = .fromSeconds(10) } }) catch {
+                self.linger_timed_out.store(true, .seq_cst);
+                return error.ProviderFailed;
+            };
+        }
         if (cancel.load(.seq_cst)) return error.Cancelled;
         if (self.fail_first and run_number == 1) return error.ProviderFailed;
         if (turn.isHosted()) return .completed;
@@ -8100,6 +8116,281 @@ test "a stop that lands between a turn's end and the slot finishing its work cou
     try std.testing.expect(registry.findPersistent("reviewer").?.active == null);
 }
 
+/// What a stop hook did. A hook counts itself as entered only once the wait it
+/// makes for the slot has succeeded. A wait that ran out is counted apart and
+/// says what it waited for, so a test or cell that checks both fails when the
+/// slot never went on, and does not read on as if it had.
+const InStopCount = struct {
+    entered: std.atomic.Value(u32) = .init(0),
+    timed_out: std.atomic.Value(u32) = .init(0),
+
+    fn reset(self: *InStopCount) void {
+        self.entered.store(0, .seq_cst);
+        self.timed_out.store(0, .seq_cst);
+    }
+
+    /// Notes how a hook's wait for `what` ended.
+    fn note(self: *InStopCount, waited: anyerror!void, what: []const u8) void {
+        waited catch {
+            _ = self.timed_out.fetchAdd(1, .seq_cst);
+            std.debug.print("a stop's hook waited 10 s and {s}\n", .{what});
+            return;
+        };
+        _ = self.entered.fetchAdd(1, .seq_cst);
+    }
+
+    /// Fails unless no wait ran out and the hook was entered `expected` times.
+    fn expectEntered(self: *InStopCount, expected: u32) !void {
+        try std.testing.expectEqual(@as(u32, 0), self.timed_out.load(.seq_cst));
+        try std.testing.expectEqual(expected, self.entered.load(.seq_cst));
+    }
+};
+
+/// The slot's end and the host's hold in a parent's stop or close
+/// (`end_test_controls.test_hold_stop`): the slot waits after its turn ended and
+/// before it records the end, and again once it has. From its hook the stop or
+/// close lets the slot go and waits until the end is recorded, so the end runs
+/// right after the owner stopped the turn.
+const EndInStop = struct {
+    var before = TestHold{};
+    var after = TestHold{};
+    var count = InStopCount{};
+
+    fn heldAt(_: []const u8, recorded: bool) void {
+        if (recorded) after.once() else before.once();
+    }
+
+    fn inStop(_: []const u8) void {
+        before.release();
+        count.note(after.waitHeld(), "the slot's end was not recorded");
+    }
+
+    fn arm() void {
+        before.reset();
+        after.reset();
+        count.reset();
+        end_test_controls.test_hold_run = heldAt;
+        end_test_controls.test_hold_stop = inStop;
+    }
+
+    fn clear() void {
+        end_test_controls.test_hold_run = null;
+        end_test_controls.test_hold_stop = null;
+    }
+
+    fn release() void {
+        before.release();
+        after.release();
+    }
+};
+
+/// The same for a work the slot starts or the host chose, held before its
+/// worker attaches: the hook lets the worker attach and waits until it has, so
+/// the attach runs right after the owner stopped the work.
+const AttachInStop = struct {
+    var count = InStopCount{};
+
+    fn inStop(_: []const u8) void {
+        HeldStart.release();
+        count.note(AttachedHold.first.waitHeld(), "the work's worker did not attach");
+    }
+
+    fn arm() void {
+        count.reset();
+        HeldStart.arm();
+        AttachedHold.arm(0);
+        end_test_controls.test_hold_stop = inStop;
+    }
+
+    fn clear() void {
+        HeldStart.clear();
+        fixture_run_hook = null;
+        end_test_controls.test_hold_stop = null;
+    }
+
+    fn release() void {
+        HeldStart.release();
+        AttachedHold.release();
+    }
+};
+
+/// The same for a work the host chose that ends before its worker attaches: the
+/// hook lets the slot go on and waits until the work's end is recorded.
+const EndedInStop = struct {
+    var count = InStopCount{};
+
+    fn inStop(_: []const u8) void {
+        PublishHeldTwice.first.release();
+        count.note(HeldRecorded.waitHeld(), "the work's end was not recorded");
+    }
+
+    fn arm() void {
+        count.reset();
+        HeldRecorded.arm();
+        end_test_controls.test_hold_stop = inStop;
+    }
+
+    fn clear() void {
+        end_test_controls.test_hold_run = null;
+        end_test_controls.test_hold_stop = null;
+    }
+};
+
+/// Fails with the answer in the output when it lacks `expected`.
+fn expectAnswerHas(answer: []const u8, expected: []const u8) !void {
+    if (std.mem.find(u8, answer, expected) != null) return;
+    std.debug.print("expected the answer to hold: {s}\nthe answer: {s}\n", .{ expected, answer });
+    return error.TestExpectedEqual;
+}
+
+const stopped_and_dropped = "Stopped reviewer: its turn ended, and the message waiting for it was dropped.";
+const closed_and_dropped = "Closed reviewer, ending its turn. The message waiting for it was dropped. A later message to reviewer starts a new one.";
+
+test "a stop whose turn's slot ends right after the owner stopped it counts the message the turn never took" {
+    EndInStop.arm();
+    defer EndInStop.clear();
+    var t: StopFixture = undefined;
+    try t.init(.{ .hold = true, .steerable = true });
+    defer t.deinit();
+    const arena = t.arena();
+    const runtime = t.runtime;
+    const fixture = &t.fixture;
+    defer EndInStop.release();
+
+    try Leftovers.endFirstWorkUnread(runtime, fixture, arena);
+    try EndInStop.before.waitHeld();
+    const child_id = try reviewerId(runtime, arena);
+    const stopped = try callTool(runtime, arena, .{ .stop = .{ .agent = "reviewer" } }, "call-3", null);
+    // A second stop of the same end counts nothing more.
+    const again = try callTool(runtime, arena, .{ .stop = .{ .agent = "reviewer" } }, "call-4", null);
+    EndInStop.release();
+    try waitForSlotEnd(runtime, child_id);
+    try expectAnswerHas(stopped, stopped_and_dropped);
+    try std.testing.expect(std.mem.find(u8, again, "dropped") == null);
+    // Each stop let the slot go inside it, and the slot's end was recorded
+    // there, in time.
+    try EndInStop.count.expectEntered(2);
+    // The message never ran, and a stop owes no report.
+    try std.testing.expectEqual(@as(usize, 1), fixture.runs.load(.seq_cst));
+    try std.testing.expectEqual(@as(usize, 0), fixture.reportCount());
+}
+
+test "the parent's close whose turn's slot ends right after the owner stopped it counts the message the turn never took" {
+    EndInStop.arm();
+    defer EndInStop.clear();
+    var t: StopFixture = undefined;
+    try t.init(.{ .hold = true, .steerable = true });
+    defer t.deinit();
+    const alloc = std.testing.allocator;
+    const arena = t.arena();
+    const runtime = t.runtime;
+    const fixture = &t.fixture;
+    defer EndInStop.release();
+
+    try Leftovers.endFirstWorkUnread(runtime, fixture, arena);
+    try EndInStop.before.waitHeld();
+    const child_id = try reviewerId(runtime, arena);
+    const closed = try callTool(runtime, arena, .{ .close = .{ .agent = "reviewer" } }, "call-3", null);
+    EndInStop.release();
+    try waitForSlotEnd(runtime, child_id);
+    try expectAnswerHas(closed, closed_and_dropped);
+    try EndInStop.count.expectEntered(1);
+    try std.testing.expectEqual(@as(usize, 1), fixture.runs.load(.seq_cst));
+    var registry = try runtime.managed.state_store.load(alloc);
+    defer registry.deinit(alloc);
+    try std.testing.expect(registry.findById(child_id) == null);
+}
+
+/// A work the host chose from the message that waited for the user's turn is
+/// held before its worker attaches; the hook in the stop or close lets it
+/// attach.
+fn heldChosenWork(t: *StopFixture, child_id: *[]const u8, work_id: *[]u8) !void {
+    const alloc = std.testing.allocator;
+    const arena = t.arena();
+    const runtime = t.runtime;
+    _ = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "working" } }, "call-1", null);
+    try waitUntilQuiet(runtime);
+    child_id.* = try reviewerId(runtime, arena);
+    work_id.* = runtime.beginUserWork(alloc, child_id.*, null).?;
+    const queued = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "after the user" } }, "call-2", null);
+    try std.testing.expect(std.mem.find(u8, queued, "is busy") != null);
+    AttachInStop.arm();
+    runtime.endUserWork(child_id.*, work_id.*, .completed, "");
+    try HeldStart.waitHeld();
+}
+
+test "a stop whose chosen work attaches right after the owner stopped it counts the message that waited for it" {
+    defer AttachInStop.clear();
+    var t: StopFixture = undefined;
+    try t.init(.{});
+    defer t.deinit();
+    const alloc = std.testing.allocator;
+    const runtime = t.runtime;
+    const fixture = &t.fixture;
+    var child_id: []const u8 = undefined;
+    var work_id: []u8 = undefined;
+    try heldChosenWork(&t, &child_id, &work_id);
+    defer alloc.free(work_id);
+    defer AttachInStop.release();
+
+    const stopped = try callTool(runtime, t.arena(), .{ .stop = .{ .agent = "reviewer" } }, "call-3", null);
+    AttachInStop.release();
+    try waitUntilQuiet(runtime);
+    try std.testing.expectEqual(@as(usize, 1), fixture.begun.load(.seq_cst));
+    try expectAnswerHas(stopped, stopped_and_dropped);
+    try AttachInStop.count.expectEntered(1);
+}
+
+test "the parent's close whose chosen work attaches right after the owner stopped it counts the message that waited for it" {
+    defer AttachInStop.clear();
+    var t: StopFixture = undefined;
+    try t.init(.{});
+    defer t.deinit();
+    const alloc = std.testing.allocator;
+    const runtime = t.runtime;
+    const fixture = &t.fixture;
+    var child_id: []const u8 = undefined;
+    var work_id: []u8 = undefined;
+    try heldChosenWork(&t, &child_id, &work_id);
+    defer alloc.free(work_id);
+    defer AttachInStop.release();
+
+    const closed = try callTool(runtime, t.arena(), .{ .close = .{ .agent = "reviewer" } }, "call-3", null);
+    AttachInStop.release();
+    try waitForSlotEnd(runtime, child_id);
+    try std.testing.expectEqual(@as(usize, 1), fixture.begun.load(.seq_cst));
+    try expectAnswerHas(closed, closed_and_dropped);
+    try AttachInStop.count.expectEntered(1);
+}
+
+/// A parent's stop or close of a work the host chose, whose bind to its agent
+/// then ends it before its worker attaches, the end recorded right after the
+/// owner stopped the work.
+fn expectCountedWhenChosenWorkEnds(actor: Actor, expected: []const u8) !void {
+    defer EndedInStop.clear();
+    var cell: AccountCell = undefined;
+    try cell.init(.next_one_failed, true, false);
+    defer cell.deinit();
+    try cell.reach();
+    EndedInStop.arm();
+    defer HeldRecorded.release();
+    try cell.act(actor, 1);
+    HeldRecorded.release();
+    try cell.finish();
+    try expectAnswerHas(cell.answers.items[0], expected);
+    try EndedInStop.count.expectEntered(1);
+    // Only the first work's turn began.
+    try std.testing.expectEqual(@as(usize, 1), cell.fixture.begun.load(.seq_cst));
+}
+
+test "a stop whose chosen work ends before it attaches right after the owner stopped it counts the message that waited for it" {
+    try expectCountedWhenChosenWorkEnds(.parent_stop, stopped_and_dropped);
+}
+
+test "the parent's close whose chosen work ends before it attaches right after the owner stopped it counts the message that waited for it" {
+    try expectCountedWhenChosenWorkEnds(.parent_close, closed_and_dropped);
+}
+
 test "the parent's close that lands as the next work is installed drops it, and it never begins" {
     PublishHold.arm();
     defer PublishHold.clear();
@@ -8323,6 +8614,10 @@ test "a message counted by the parent's stop is not counted again by the user's 
     fixture.release.set(io_mod.getIo());
     try waitForSlotEnd(runtime, child_id);
     try std.testing.expectEqual(@as(usize, 1), fixture.runs.load(.seq_cst));
+    if (fixture.linger_timed_out.load(.seq_cst)) {
+        std.debug.print("the lingering turn was not released within 10 s\n", .{});
+        return error.LingerNotReleasedWithin10s;
+    }
 }
 
 /// A hold after each of the first two works recorded its end, before the host's
@@ -8720,7 +9015,25 @@ test "a stop after the next work began does not count its message" {
 const Actor = enum { parent_stop, parent_close, user_close, user_stop };
 
 /// One action, or two in a row, at one window.
-const Plan = struct { first: Actor, second: ?Actor = null };
+const Plan = struct {
+    first: Actor,
+    second: ?Actor = null,
+
+    /// Whether a parent's stop or close is one of the actions.
+    fn hasParent(self: Plan) bool {
+        return self.first == .parent_stop or self.first == .parent_close or
+            self.second == Actor.parent_stop or self.second == Actor.parent_close;
+    }
+
+    /// Whether a parent's stop or close meets a child that is still open, and
+    /// so runs the hook inside the stop. Every plan with one does, but the
+    /// user's close and then the parent's: the second close finds the child
+    /// already closing and returns before the hook.
+    fn reachesStopHook(self: Plan) bool {
+        if (self.first == .user_close and self.second == Actor.parent_close) return false;
+        return self.hasParent();
+    }
+};
 
 /// The pairs that end in a user's stop are not run: the app calls
 /// `Runtime.userStopped` only while a turn runs, and no turn runs after a stop
@@ -8809,6 +9122,28 @@ const Scenario = enum {
             .next_two_cancelled,
             => true,
             else => false,
+        };
+    }
+
+    /// The windows that also run with the slot let go inside a parent's stop or
+    /// close, right after the owner stopped the work: its end runs, its worker
+    /// attaches, or the work ends before it attaches, as the window is.
+    fn holdsInStop(self: Scenario) bool {
+        return switch (self) {
+            .returned_kept, .starting_one, .next_one_failed => true,
+            else => false,
+        };
+    }
+
+    /// The paths of those cells. A cancelled hosted work ends at its bind and
+    /// never attaches, so the window where the worker attaches runs on the plain
+    /// path only, and the one where the work ends before it attaches on the
+    /// hosted path only.
+    fn inStopPaths(self: Scenario) []const bool {
+        return switch (self) {
+            .starting_one => &.{false},
+            .next_one_failed => &.{true},
+            else => &.{ false, true },
         };
     }
 
@@ -8947,12 +9282,15 @@ const AccountCell = struct {
     fixture: MailboxFixture,
     runtime: *Runtime,
     scenario: Scenario,
+    /// Whether a parent's stop or close lets the slot go inside it, right after
+    /// the owner stopped the work (`end_test_controls.test_hold_stop`).
+    in_stop: bool,
     child_id: []const u8 = "",
     user_work: ?[]u8 = null,
     /// What each stop's and close's answer said, in order.
     answers: std.ArrayList([]const u8) = .empty,
 
-    fn init(self: *AccountCell, scenario: Scenario, hosted_path: bool) !void {
+    fn init(self: *AccountCell, scenario: Scenario, hosted_path: bool, in_stop: bool) !void {
         const alloc = std.testing.allocator;
         const hosted = scenario.hosted() or hosted_path;
         self.* = .{
@@ -8963,12 +9301,22 @@ const AccountCell = struct {
             .fixture = .{
                 .hold = scenario.holdsFirstWork(),
                 .steerable = scenario.steerable(),
+                // A cancelled turn of `running_unread` stays in its run until the
+                // cell lets it go, so a second action meets a turn that is still
+                // ending, with its worker attached and the message unread. Left to
+                // return at once, it ended within a millisecond of the first
+                // action, and whether the second one met the turn, a detached
+                // worker or an ended work depended on the timing. Those orders
+                // have cells of their own: `returned_kept`, `recorded_kept`, and
+                // the same windows with the slot let go inside the stop.
+                .linger = scenario == .running_unread,
                 .hosted = if (hosted) &self.hosted_worker else null,
                 .bind_honors_cancel = hosted,
                 .fail_first = scenario == .recorded_kept_failed_first or scenario == .gap_next_failed_first,
             },
             .runtime = undefined,
             .scenario = scenario,
+            .in_stop = in_stop,
         };
         errdefer self.arena_state.deinit();
         errdefer self.hosted_worker.deinit(alloc);
@@ -9005,7 +9353,8 @@ const AccountCell = struct {
     fn armHolds(self: *AccountCell) void {
         switch (self.scenario) {
             .running_unread => {},
-            .returned_clean, .returned_kept, .returned_failed => RunHeld.arm(),
+            .returned_kept => if (self.in_stop) EndInStop.arm() else RunHeld.arm(),
+            .returned_clean, .returned_failed => RunHeld.arm(),
             .returned_cancelled => {
                 RunHeld.arm();
                 PublishHeldTwice.arm();
@@ -9018,15 +9367,47 @@ const AccountCell = struct {
             .gap_idle, .gap_after_failed, .gap_after_cancelled, .next_one, .next_two, .next_one_failed, .next_two_failed, .next_one_cancelled, .next_two_cancelled => PublishHeldTwice.arm(),
             // Armed once the first work has ended, so the hold meets the slot
             // the waiting message starts and not the first one.
-            .starting_one, .starting_two => {},
+            .starting_one, .starting_two => if (self.in_stop) {
+                AttachedHold.arm(1);
+                AttachInStop.count.reset();
+                end_test_controls.test_hold_stop = AttachInStop.inStop;
+            },
             .recorded_kept_failed_first => RecordedHeld.arm(),
             .gap_next_failed_first => PublishHeldTwice.arm(),
             .attached_not_begun => AttachedHold.arm(0),
             .next_attached_not_begun => AttachedHold.arm(1),
         }
+        if (self.in_stop and self.scenario == .next_one_failed) {
+            EndedInStop.count.reset();
+            end_test_controls.test_hold_stop = EndedInStop.inStop;
+        }
     }
 
-    fn releaseHolds(_: *AccountCell) void {
+    /// What the hook inside the stop did in this cell's window.
+    fn stopCount(self: *AccountCell) *InStopCount {
+        return switch (self.scenario) {
+            .returned_kept => &EndInStop.count,
+            .starting_one, .starting_two => &AttachInStop.count,
+            .next_one_failed => &EndedInStop.count,
+            else => unreachable,
+        };
+    }
+
+    /// Whether the slot went on inside the stop, in time: no wait of the hook
+    /// ran out, and the hook was entered exactly when a stop or close of the
+    /// plan meets the open child.
+    fn stopHeld(self: *AccountCell, plan: Plan) bool {
+        const count = self.stopCount();
+        if (count.timed_out.load(.seq_cst) != 0) return false;
+        const entered = count.entered.load(.seq_cst);
+        return if (plan.reachesStopHook()) entered > 0 else entered == 0;
+    }
+
+    fn releaseHolds(self: *AccountCell) void {
+        // A lingering turn leaves only when released.
+        self.fixture.release.set(io_mod.getIo());
+        EndInStop.release();
+        HeldRecorded.release();
         RunHeld.release();
         RecordedHeld.release();
         PublishHeldTwice.release();
@@ -9077,7 +9458,7 @@ const AccountCell = struct {
             },
             .returned_kept => {
                 try Leftovers.endFirstWorkUnread(self.runtime, fixture, self.arena());
-                try RunHeld.first.waitHeld();
+                if (self.in_stop) try EndInStop.before.waitHeld() else try RunHeld.first.waitHeld();
             },
             .returned_failed => {
                 try self.firstWorkWithWaiting(false);
@@ -9158,6 +9539,9 @@ const AccountCell = struct {
                 fixture.bind_fails.store(true, .seq_cst);
                 fixture.release.set(io_mod.getIo());
                 try PublishHeldTwice.first.waitHeld();
+                // Armed now, so it holds the end of the work the host chose and
+                // not the first one's.
+                if (self.in_stop) HeldRecorded.arm();
             },
             .next_one_cancelled, .next_two_cancelled => {
                 try self.firstWorkWithWaiting(self.scenario == .next_two_cancelled);
@@ -9306,6 +9690,7 @@ fn clearAccountHooks() void {
     fixture_run_hook = null;
     start_test_controls.test_wait_limit_ms = null;
     end_test_controls.test_hold_run = null;
+    end_test_controls.test_hold_stop = null;
     publish_test_controls.test_hold = null;
     start_test_controls.test_hold = null;
 }
@@ -9399,10 +9784,11 @@ fn accountAsOnMain(plan: Plan, scenario: Scenario, hosted_path: bool) bool {
     };
 }
 
-fn accountCellName(buf: []u8, scenario: Scenario, hosted_path: bool, plan: Plan, as_on_main: bool) []const u8 {
-    return std.mem.print(buf, "{s}{s} / {s}{s}{s}{s}", .{
+fn accountCellName(buf: []u8, scenario: Scenario, hosted_path: bool, in_stop: bool, plan: Plan, as_on_main: bool) []const u8 {
+    return std.mem.print(buf, "{s}{s}{s} / {s}{s}{s}{s}", .{
         @tagName(scenario),
         if (hosted_path and !scenario.hosted()) " (hosted)" else "",
+        if (in_stop) " (the slot let go inside the stop)" else "",
         @tagName(plan.first),
         if (plan.second != null) " then " else "",
         if (plan.second) |second| @tagName(second) else "",
@@ -9411,21 +9797,32 @@ fn accountCellName(buf: []u8, scenario: Scenario, hosted_path: bool, plan: Plan,
 }
 
 /// Runs one cell. False when it breaks a rule, after printing what main reads.
-fn runAccountCell(scenario: Scenario, hosted_path: bool, plan: Plan) !bool {
+fn runAccountCell(scenario: Scenario, hosted_path: bool, in_stop: bool, plan: Plan) !bool {
     var cell: AccountCell = undefined;
-    try cell.init(scenario, hosted_path);
+    try cell.init(scenario, hosted_path, in_stop);
     defer cell.deinit();
     try cell.reach();
     try cell.act(plan.first, 1);
     if (plan.second) |second| try cell.act(second, 2);
     try cell.finish();
+    // A lingering turn that was never released waited out its 10 s and failed.
+    // Every other cell of the window would wait as long, so the table stops
+    // there, as it does for a cell it cannot drive.
+    if (cell.fixture.linger_timed_out.load(.seq_cst)) return error.LingerNotReleasedWithin10s;
     const as_on_main = accountAsOnMain(plan, scenario, hosted_path);
     const ledger = cell.tally();
     const verdict = accountVerdict(ledger, as_on_main);
-    if (verdict == .ok) return true;
     var buf: [160]u8 = undefined;
-    cell.print(accountCellName(&buf, scenario, hosted_path, plan, as_on_main), ledger, verdict);
-    return false;
+    const name = accountCellName(&buf, scenario, hosted_path, in_stop, plan, as_on_main);
+    // A stop that read on before the slot went on proves nothing about the
+    // order the cell is there for, whatever the verdict says.
+    const slot_went_on = !in_stop or cell.stopHeld(plan);
+    if (!slot_went_on) {
+        const count = cell.stopCount();
+        std.debug.print("\nTABLE {s}: the slot did not go on inside the stop: the hook went on {d} times and {d} of its waits ran out\n", .{ name, count.entered.load(.seq_cst), count.timed_out.load(.seq_cst) });
+    }
+    if (verdict != .ok) cell.print(name, ledger, verdict);
+    return verdict == .ok and slot_went_on;
 }
 
 test "every message main sends has one account in every window of a subagent's slot, for each stop and close" {
@@ -9436,17 +9833,25 @@ test "every message main sends has one account in every window of a subagent's s
         // reply, and on the hosted path, where the child's agent runs the turn
         // as the app's children do; a window that needs the hosted path only
         // runs there.
-        const paths: []const bool = if (scenario.hosted()) &.{true} else &.{ false, true };
-        for (paths) |hosted_path| {
-            for (table_plans) |plan| {
-                cells += 1;
-                const held = runAccountCell(scenario, hosted_path, plan) catch |err| {
-                    var buf: [160]u8 = undefined;
-                    std.debug.print("\nTABLE {s}: the cell could not be driven ({s}); the rest of its window is skipped\n", .{ accountCellName(&buf, scenario, hosted_path, plan, false), @errorName(err) });
-                    broken += 1;
-                    break;
-                };
-                if (!held) broken += 1;
+        // Some windows run again with the slot let go inside the parent's stop or
+        // close, right after the owner stopped the work, for the plans that have
+        // one: the owner's count and the flag it sets are one step, so the slot's
+        // end or attach runs before it or after it, and never between.
+        for ([_]bool{ false, true }) |in_stop| {
+            if (in_stop and !scenario.holdsInStop()) continue;
+            const paths: []const bool = if (in_stop) scenario.inStopPaths() else if (scenario.hosted()) &.{true} else &.{ false, true };
+            for (paths) |hosted_path| {
+                for (table_plans) |plan| {
+                    if (in_stop and !plan.hasParent()) continue;
+                    cells += 1;
+                    const held = runAccountCell(scenario, hosted_path, in_stop, plan) catch |err| {
+                        var buf: [160]u8 = undefined;
+                        std.debug.print("\nTABLE {s}: the cell could not be driven ({s}); the rest of its window is skipped\n", .{ accountCellName(&buf, scenario, hosted_path, in_stop, plan, false), @errorName(err) });
+                        broken += 1;
+                        break;
+                    };
+                    if (!held) broken += 1;
+                }
             }
         }
     }

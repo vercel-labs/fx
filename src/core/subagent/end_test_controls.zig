@@ -107,6 +107,21 @@ pub fn holdAfterRun(child_id: []const u8, recorded: bool) void {
     }
 }
 
+/// Test builds only: an inline test sets it to hold the host in a parent's stop
+/// or close of a child, after the owner stopped the child's turn and before the
+/// host reads what the stop dropped, so the slot's end can run first. No file
+/// control sets it.
+pub var test_hold_stop: if (builtin.is_test) ?*const fn (child_id: []const u8) void else void = if (builtin.is_test) null else {};
+
+/// Called by the host for `child_id` in a parent's stop or close, once the
+/// owner stopped the turn.
+pub fn holdInStop(child_id: []const u8) void {
+    if (comptime build_options.libfx) return;
+    if (builtin.is_test) {
+        if (test_hold_stop) |hold| hold(child_id);
+    }
+}
+
 /// The two paths of a hold's file controls.
 pub const HoldFiles = struct { held: []const u8, release: []const u8 };
 
@@ -180,4 +195,10 @@ test "a hold is armed only when both of its paths are absolute" {
     try std.testing.expect(usableHoldFiles("/tmp/held", "release") == null);
     try std.testing.expect(usableHoldFiles("./held", "../release") == null);
     try std.testing.expect(usableHoldFiles("", "") == null);
+}
+
+test "a test build holds a parent's stop only through its hook" {
+    // Without a hook the host's call returns at once.
+    try std.testing.expect(test_hold_stop == null);
+    holdInStop("child");
 }
