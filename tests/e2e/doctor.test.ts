@@ -65,6 +65,9 @@ function env(r: Root, extra: Record<string, string | undefined> = {}): Record<st
     FX_SOUND: "0",
     FX_DISABLE_KEYCHAIN: "1",
     FX_MODEL: MODEL,
+    // Fixed client versions, so a ChatGPT or Grok check never looks up a release on the network.
+    FX_TEST_CODEX_CLIENT_VERSION: "0.153.0",
+    FX_TEST_GROK_CLIENT_VERSION: "1.0.6",
     ...extra,
   };
   return Object.fromEntries(Object.entries(merged).filter(([, v]) => v !== undefined)) as Record<string, string>;
