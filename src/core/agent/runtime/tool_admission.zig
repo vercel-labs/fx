@@ -115,6 +115,33 @@ pub const TurnReviewCache = struct {
         }
     }
 
+    /// Lends this cache to a call, such as `execute`, whose own tool calls
+    /// are reviewed during its execution. `alloc` lives for the turn.
+    pub fn ledger(self: *TurnReviewCache, alloc: Allocator) runtime_tool_contracts.ReviewLedger {
+        return .{
+            .context = self,
+            .allocator = alloc,
+            .cached_fn = ledgerCached,
+            .attempt_available_fn = ledgerAttemptAvailable,
+            .remember_fn = ledgerRemember,
+        };
+    }
+
+    fn ledgerCached(context: *anyopaque, call: ToolCall) ?command_admission.PermissionOutcome {
+        const self: *TurnReviewCache = @ptrCast(@alignCast(context));
+        return self.cached(call);
+    }
+
+    fn ledgerAttemptAvailable(context: *anyopaque, call: ToolCall) bool {
+        const self: *TurnReviewCache = @ptrCast(@alignCast(context));
+        return self.reviewAttemptAvailable(call);
+    }
+
+    fn ledgerRemember(context: *anyopaque, alloc: Allocator, call: ToolCall, outcome: command_admission.PermissionOutcome) Allocator.Error!void {
+        const self: *TurnReviewCache = @ptrCast(@alignCast(context));
+        return self.remember(alloc, call, outcome);
+    }
+
     pub fn reviewAttemptAvailable(self: *const TurnReviewCache, call: ToolCall) bool {
         if (self.unavailable_budget_exhausted) return false;
         const exact_id = permissionActionId(call);

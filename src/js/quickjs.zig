@@ -34,6 +34,10 @@ pub const Value = extern struct {
         return value.tagOf() == tag_undefined;
     }
 
+    pub fn isSymbol(value: Value) bool {
+        return value.tagOf() == tag_symbol;
+    }
+
     pub fn isString(value: Value) bool {
         const tag = value.tagOf();
         return tag == tag_string or tag == tag_string_rope;
@@ -46,6 +50,7 @@ comptime {
     std.debug.assert(@sizeOf(Value) == 16);
 }
 
+const tag_symbol: i32 = -8;
 const tag_string: i32 = -7;
 const tag_string_rope: i32 = -6;
 const tag_undefined: i32 = 3;
@@ -53,6 +58,41 @@ const tag_exception: i32 = 6;
 
 /// `JS_UNDEFINED`.
 pub const undefined_value: Value = .{ .u = .{ .uint64 = 0 }, .tag = tag_undefined };
+/// `JS_EXCEPTION`: what a native function returns once an exception is
+/// pending.
+pub const exception_value: Value = .{ .u = .{ .uint64 = 0 }, .tag = tag_exception };
+
+/// `JSCFunction`. `argv` holds `argc` values, borrowed for the call.
+pub const CFunction = fn (ctx: ?*Context, this_val: Value, argc: c_int, argv: ?[*]const Value) callconv(.c) Value;
+/// `JSCFunctionData`: a `CFunction` that also gets the values it was made
+/// with.
+pub const CFunctionData = fn (ctx: ?*Context, this_val: Value, argc: c_int, argv: ?[*]const Value, magic: c_int, func_data: ?[*]const Value) callconv(.c) Value;
+
+pub const Atom = u32;
+pub const ClassId = u32;
+
+/// `JSClassExoticMethods`. fx sets only `get_property`; the others keep
+/// QuickJS's ordinary behavior.
+pub const ClassExoticMethods = extern struct {
+    get_own_property: ?*const anyopaque = null,
+    get_own_property_names: ?*const anyopaque = null,
+    delete_property: ?*const anyopaque = null,
+    define_own_property: ?*const anyopaque = null,
+    has_property: ?*const anyopaque = null,
+    get_property: ?*const fn (ctx: ?*Context, obj: Value, atom: Atom, receiver: Value) callconv(.c) Value = null,
+    set_property: ?*const anyopaque = null,
+};
+
+/// `JSClassDef`.
+pub const ClassDef = extern struct {
+    class_name: [*:0]const u8,
+    finalizer: ?*const anyopaque = null,
+    gc_mark: ?*const anyopaque = null,
+    call: ?*const anyopaque = null,
+    exotic: ?*const ClassExoticMethods = null,
+};
+/// `JS_CFUNC_generic`.
+pub const cfunc_generic: c_int = 0;
 
 /// `JSMallocFunctions`. `opaque` is the pointer passed to `JS_NewRuntime2`.
 pub const MallocFunctions = extern struct {
@@ -127,3 +167,21 @@ pub extern fn JS_FreeCString(ctx: *Context, ptr: [*]const u8) void;
 pub extern fn JS_FreeValue(ctx: *Context, v: Value) void;
 pub extern fn JS_IsError(val: Value) bool;
 pub extern fn JS_GetPropertyStr(ctx: *Context, this_obj: Value, prop: [*:0]const u8) Value;
+/// Takes ownership of `val`. Returns -1 with an exception pending on failure.
+pub extern fn JS_SetPropertyStr(ctx: *Context, this_obj: Value, prop: [*:0]const u8, val: Value) c_int;
+pub extern fn JS_GetGlobalObject(ctx: *Context) Value;
+pub extern fn JS_NewCFunction2(ctx: *Context, func: *const CFunction, name: [*:0]const u8, length: c_int, cproto: c_int, magic: c_int) Value;
+pub extern fn JS_NewStringLen(ctx: *Context, str: [*]const u8, len: usize) Value;
+pub extern fn JS_NewError(ctx: *Context) Value;
+/// Takes ownership of `obj` and returns `exception_value`.
+pub extern fn JS_Throw(ctx: *Context, obj: Value) Value;
+pub extern fn JS_ThrowRangeError(ctx: *Context, fmt: [*:0]const u8, ...) Value;
+pub extern fn JS_ThrowInternalError(ctx: *Context, fmt: [*:0]const u8, ...) Value;
+pub extern fn JS_SetContextOpaque(ctx: *Context, @"opaque": ?*anyopaque) void;
+/// Allocates an id from `rt` when `pclass_id` points to 0.
+pub extern fn JS_NewClassID(rt: *Runtime, pclass_id: *ClassId) ClassId;
+pub extern fn JS_NewClass(rt: *Runtime, class_id: ClassId, class_def: *const ClassDef) c_int;
+pub extern fn JS_NewObjectClass(ctx: *Context, class_id: ClassId) Value;
+pub extern fn JS_AtomToValue(ctx: *Context, atom: Atom) Value;
+pub extern fn JS_NewCFunctionData(ctx: *Context, func: *const CFunctionData, length: c_int, magic: c_int, data_len: c_int, data: [*]const Value) Value;
+pub extern fn JS_GetContextOpaque(ctx: *Context) ?*anyopaque;

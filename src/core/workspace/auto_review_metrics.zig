@@ -45,7 +45,7 @@ pub const Outcome = enum(u8) {
     @"error",
 };
 
-pub const Origin = enum(u8) { root, subagent };
+pub const Origin = enum(u8) { root, subagent, code_mode };
 
 /// The reviewer's risk, or `none` when it gave no decision.
 pub const Risk = enum(u8) { none, low, medium, high, critical };

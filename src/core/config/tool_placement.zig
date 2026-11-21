@@ -19,9 +19,10 @@ pub const Placement = enum {
     }
 };
 
-/// The built-in tools whose placement can change. Three kinds keep theirs:
-/// toolbox itself; the tools it replaces (`toolbox.replaced`); and vision,
-/// which fx calls by name while attached images wait.
+/// The built-in tools whose placement can change. Four kinds keep theirs:
+/// toolbox itself; the tools it replaces (`toolbox.replaced`); vision, which
+/// fx calls by name while attached images wait; and execute, which only the
+/// experimental code mode offers, for programs that call the other tools.
 pub const Tool = enum {
     glob_files,
     grep_files,
