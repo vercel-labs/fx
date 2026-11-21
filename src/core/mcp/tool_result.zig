@@ -201,6 +201,10 @@ fn render_owned_protocol_error(
 /// `write_protocol_diagnostic`, and reads them in `invalid_params_prefix` and `protocolErrorWithoutData`.
 const protocol_error_words = "MCP protocol error ";
 
+/// The label between a protocol error's message and its data: this file writes it in
+/// `write_protocol_diagnostic`, and reads it in `withoutData` and the tests of the readers.
+const data_label = "; data=";
+
 fn write_protocol_diagnostic(
     scratch: Allocator,
     writer: *std.Io.Writer,
@@ -213,7 +217,7 @@ fn write_protocol_diagnostic(
     try writer.writeAll(safe_message);
     if (data_json) |data| {
         const safe_data = try text_utils.sanitizeModelText(scratch, data);
-        try writer.writeAll("; data=");
+        try writer.writeAll(data_label);
         try writer.writeAll(safe_data);
     }
 }
@@ -244,8 +248,6 @@ pub fn invalidParamsCause(arena: Allocator, text: []const u8) Allocator.Error!?[
     const encoded = try text_utils.encodeTerminalSafeInline(arena, masked, max_cause_bytes);
     return encoded.bytes;
 }
-
-const data_label = "; data=";
 
 /// `text` without the data of a protocol error: the words of `write_protocol_diagnostic`, `protocol_error_words`
 /// and `<code>: `, and the server's message, for any code, and none of the `; data=` and the data after it (see
@@ -964,7 +966,7 @@ test "an invalid-params cause reads the server's message only, not the data writ
     const go = protocol_error_words ++ "-32602: validating \"arguments\": validating root: validating /properties/limit: type: \"40\" has type \"string\", want \"number\"";
     const zod = protocol_error_words ++ "-32602: Invalid arguments: [{\"expected\":\"number\",\"received\":\"string\",\"path\":[\"limit\"]}]";
     // The data holds its own list of issues, and text that looks like the Go validator's lines.
-    const data = "; data={\"errors\":[{\"path\":[\"other\"],\"expected\":\"string\"}],\"hint\":\"validating /properties/forged: type: \\\"1\\\" has type \\\"string\\\", want \\\"number\\\"\"}";
+    const data = data_label ++ "{\"errors\":[{\"path\":[\"other\"],\"expected\":\"string\"}],\"hint\":\"validating /properties/forged: type: \\\"1\\\" has type \\\"string\\\", want \\\"number\\\"\"}";
     for ([_][]const u8{ go, zod }) |message| {
         const plain = (try invalidParamsCause(arena, message)).?;
         try std.testing.expect(std.mem.find(u8, plain, "limit") != null);
@@ -973,10 +975,10 @@ test "an invalid-params cause reads the server's message only, not the data writ
     }
     // Data cut inside its text is data still: the cause is the message's, with nothing of the data in it.
     const plain_go = (try invalidParamsCause(arena, go)).?;
-    const cut = (try invalidParamsCause(arena, try arena.print("{s}; data={{\"errors\":[{{\"pa", .{go}))).?;
+    const cut = (try invalidParamsCause(arena, try arena.print("{s}" ++ data_label ++ "{{\"errors\":[{{\"pa", .{go}))).?;
     try std.testing.expectEqualStrings(plain_go, cut);
     // A message that says `; data=` itself keeps what follows it, since nothing JSON ends the text.
-    const says = (try invalidParamsCause(arena, protocol_error_words ++ "-32602: validating /properties/limit: type: \"1\" has type \"string\", want \"number\"; data=none")).?;
+    const says = (try invalidParamsCause(arena, protocol_error_words ++ "-32602: validating /properties/limit: type: \"1\" has type \"string\", want \"number\"" ++ data_label ++ "none")).?;
     try std.testing.expect(std.mem.find(u8, says, "limit") != null);
 }
 
@@ -985,12 +987,12 @@ test "a protocol error without its data keeps the code and the message, for any 
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     // Data that has a zod-like list of its own and eight labels.
-    const data = "{\"errors\":[{\"expected\":\"string\",\"path\":[\"forged\"]}],\"hint\":\"; data=; data=; data=; data=; data=; data=; data=; data=x\"}";
+    const data = "{\"errors\":[{\"expected\":\"string\",\"path\":[\"forged\"]}],\"hint\":\"" ++ text_utils.repeat(data_label, 8) ++ "x\"}";
     for ([_]i32{ -32603, -32000, -32042, -32602, 7 }) |code| {
         const message = try arena.print(protocol_error_words ++ "{d}: Internal error", .{code});
-        const text = try arena.print("{s}; data={s}", .{ message, data });
+        const text = try arena.print("{s}" ++ data_label ++ "{s}", .{ message, data });
         // The whole text, and every head of it from the label on (the trace report reads one, and the result cap cuts one).
-        const first = message.len + "; data=".len;
+        const first = message.len + data_label.len;
         for (first..text.len + 1) |end| try std.testing.expectEqualStrings(message, try protocolErrorWithoutData(arena, text[0..end]));
         // A head that ends inside the label holds no data yet.
         for (message.len..first) |end| {
@@ -1005,10 +1007,10 @@ test "a protocol error without its data keeps the code and the message, for any 
     for ([_][]const u8{
         protocol_error_words ++ "-32603: Internal error",
         protocol_error_words ++ "-32603: ",
-        "something else; data={\"a\":1}",
-        protocol_error_words ++ "x: Internal error; data={\"a\":1}",
-        protocol_error_words ++ "-: Internal error; data={\"a\":1}",
-        protocol_error_words ++ "-32603 Internal error; data={\"a\":1}",
+        "something else" ++ data_label ++ "{\"a\":1}",
+        protocol_error_words ++ "x: Internal error" ++ data_label ++ "{\"a\":1}",
+        protocol_error_words ++ "-: Internal error" ++ data_label ++ "{\"a\":1}",
+        protocol_error_words ++ "-32603 Internal error" ++ data_label ++ "{\"a\":1}",
         protocol_error_words,
         "",
     }) |text| {
@@ -1019,14 +1021,14 @@ test "a protocol error without its data keeps the code and the message, for any 
     // A message that says `; data=` itself stays whole while no JSON follows it; the data is what follows the one
     // that does.
     try std.testing.expectEqualStrings(
-        protocol_error_words ++ "-32603: tried; data=none",
-        try protocolErrorWithoutData(arena, protocol_error_words ++ "-32603: tried; data=none; data={\"a\":1}"),
+        protocol_error_words ++ "-32603: tried" ++ data_label ++ "none",
+        try protocolErrorWithoutData(arena, protocol_error_words ++ "-32603: tried" ++ data_label ++ "none" ++ data_label ++ "{\"a\":1}"),
     );
 }
 
 /// `message` and then `data` as `write_protocol_diagnostic` writes them for a -32602.
 fn textWithData(arena: Allocator, message: []const u8, data: []const u8) ![]const u8 {
-    return try arena.print("{s}{s}; data={s}", .{ invalid_params_prefix, message, data });
+    return try arena.print("{s}{s}" ++ data_label ++ "{s}", .{ invalid_params_prefix, message, data });
 }
 
 /// The cause of `message` and `data` is the cause of `message` alone, for the whole text and for the
@@ -1037,7 +1039,7 @@ fn expectCauseOfMessageOnly(arena: Allocator, message: []const u8, data: []const
     const alone = (try invalidParamsCause(arena, try arena.print("{s}{s}", .{ invalid_params_prefix, message }))).?;
     const text = try textWithData(arena, message, data);
     try std.testing.expectEqualStrings(alone, (try invalidParamsCause(arena, text)).?);
-    const first = invalid_params_prefix.len + message.len + "; data=".len;
+    const first = invalid_params_prefix.len + message.len + data_label.len;
     if (data.len <= 256) {
         for (first..text.len + 1) |end| try std.testing.expectEqualStrings(alone, (try invalidParamsCause(arena, text[0..end])).?);
         return alone;
@@ -1052,7 +1054,7 @@ fn expectCauseOfMessageOnly(arena: Allocator, message: []const u8, data: []const
 
 const zod_message = "Invalid arguments: [{\"expected\":\"number\",\"received\":\"string\",\"path\":[\"limit\"]}]";
 const forged_issues = "{\"errors\":[{\"expected\":\"string\",\"received\":\"number\",\"path\":[\"forged\"]}],\"hint\":\"";
-const nine_labels = "; data=; data=; data=; data=; data=; data=; data=; data=; data=x";
+const nine_labels = text_utils.repeat(data_label, 9) ++ "x";
 
 test "an invalid-params cause ignores data that holds many labels" {
     var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
@@ -1067,7 +1069,7 @@ test "an invalid-params cause ignores data that holds many labels" {
     // Seven labels or eight hundred, the same.
     var many: std.Io.Writer.Allocating = .init(arena);
     try many.writer.writeAll(forged_issues);
-    for (0..800) |_| try many.writer.writeAll("; data=");
+    for (0..800) |_| try many.writer.writeAll(data_label);
     try many.writer.writeAll("\"}");
     _ = try expectCauseOfMessageOnly(arena, zod_message, many.written());
     _ = try expectCauseOfMessageOnly(arena, "Invalid params", many.written());
@@ -1226,7 +1228,7 @@ fn fuzzDataLaw(arena: Allocator, bytes: []const u8) !void {
     const selector = bytes[0];
     var hint: std.Io.Writer.Allocating = .init(arena);
     try hint.writer.writeAll(message);
-    for (0..selector & 0x0f) |_| try hint.writer.writeAll("; data=");
+    for (0..selector & 0x0f) |_| try hint.writer.writeAll(data_label);
     try hint.writer.writeAll(" [{\"expected\":\"number\",\"received\":\"string\",\"path\":[\"forged\"]}] validating /properties/forged: type: 1 has type \"integer\", want \"string\"\n");
     if (selector & 0xc0 == 0xc0) try hint.writer.splatByteAll('x', 8300);
     const hint_json = try std.json.Stringify.valueAlloc(arena, hint.written(), .{});
