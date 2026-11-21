@@ -2,15 +2,16 @@
 // through the compaction_activity.State that owns it) along its model,
 // tests/tla/compaction_progress/CompactionProgress.tla.
 //
-// TLC writes the model's state graph. The driver walks to every edge, along
-// a shortest path, and then follows seeded random paths. Each model step
-// becomes an event for lab.zig, which runs the real code at the model's time
-// in milliseconds. After every step the number the code's row shows, its
-// phase, and the marks behind the number must match the model's next state.
-// Each model tick is 20,000 ms, so the code's arithmetic gives the model's
-// whole numbers.
+// TLC writes the model's state graph. The driver walks to every edge the
+// code can tell apart, along a shortest path, and then follows seeded random
+// paths. Each model step becomes an event for lab.zig, which runs the real
+// code at the model's time in milliseconds, also when the model sets its
+// clock back. After every step the number the code's row shows, its phase,
+// and the marks behind the number must match the model's next state. Each
+// model tick is 20,000 ms, so the code's arithmetic gives the model's whole
+// numbers.
 //
-// --self-check plants seven defects, one line each, in copies of the code
+// --self-check plants eight defects, one line each, in copies of the code
 // and requires the walks to reject every copy, then requires a wrong
 // expectation to be rejected too.
 //
@@ -36,15 +37,17 @@ type Result = {
   floor: number;
   base: number;
   notes: number;
-  asked_ms: number;
-  answered_ms: number;
+  waiting: boolean;
+  waited_ms: number;
+  seen_ms: number;
   error: string | null;
 };
 type Step = { label: string; from: string; to: string; ops: Op[] };
 type Walk = { steps: Step[] };
 
 // The driver's model: CompactionProgress.tla constants for the graph it walks.
-const MaxTime = 6;
+const MaxTime = 5;
+const MaxBacks = 1;
 const TICK_MS = 20_000;
 const LEVELS = [33, 66, 99];
 
@@ -100,7 +103,7 @@ function buildLab(moduleSource: string, out: string, name: string): string {
 
 async function loadGraph(out: string): Promise<Graph> {
   const dir = join(out, "graph");
-  const cfg = ["INIT Init", "NEXT Next", "CONSTANTS", `    MaxTime = ${MaxTime}`, `    Levels = {${LEVELS.join(", ")}}`, `    Bug = "none"`, ""].join("\n");
+  const cfg = ["INIT Init", "NEXT Next", "CONSTANTS", `    MaxTime = ${MaxTime}`, `    MaxBacks = ${MaxBacks}`, `    Levels = {${LEVELS.join(", ")}}`, `    Bug = "none"`, ""].join("\n");
   mkdirSync(dir, { recursive: true });
   writeFileSync(join(dir, "Driver.cfg"), cfg);
   const run = await runTlc(dir, "CompactionProgress", "Driver.cfg", ["CompactionProgress.tla"], join(TLA_ROOT, "compaction_progress"),
@@ -135,9 +138,10 @@ async function loadGraph(out: string): Promise<Graph> {
   return { states, next, init };
 }
 
-// The model has no ghost variables: the code can tell every state apart.
+// What the code can see of a model state: everything but the count of times
+// the clock was set back, which only bounds the model.
 const codeView = (s: Model) =>
-  JSON.stringify([s.now, s.phase, s.floor, s.base, s.notes, s.asked, s.answered, s.row]);
+  JSON.stringify([s.now, s.phase, s.floor, s.base, s.notes, s.waiting, s.waited, s.seen, s.row]);
 
 // The operations one model step becomes, at the model's time in ms.
 function opsFor(label: string, s: Model, t: Model): Op[] {
@@ -150,6 +154,7 @@ function opsFor(label: string, s: Model, t: Model): Op[] {
     case "Save": return [{ op: "save", now }];
     case "Settle": return [{ op: "settle", now }];
     case "Tick": return [{ op: "read", now }];
+    case "ClockBack": return [{ op: "read", now }];
     default: throw new Error(`no mapping for model action ${label}`);
   }
 }
@@ -273,8 +278,9 @@ function check(walks: Walk[], graph: Graph, results: Result[], tamper: boolean):
         expect("floor", t.floor, real.floor);
         expect("base", t.base, real.base);
         expect("notes", t.notes, real.notes);
-        expect("asked mark", t.asked * TICK_MS, real.asked_ms);
-        expect("answered mark", t.answered * TICK_MS, real.answered_ms);
+        expect("waiting", t.waiting, real.waiting);
+        expect("wait", t.waited * TICK_MS, real.waited_ms);
+        expect("time seen", t.seen * TICK_MS, real.seen_ms);
       }
     });
   });
@@ -325,14 +331,14 @@ if (options.selfCheck) {
     {
       name: "keeps crediting the wait after the notes arrive",
       file: "compaction_progress.zig",
-      target: "const until = if (self.answered_ms > 0) self.answered_ms else now_ms;",
-      planted: "const until = if (self.answered_ms < 0) self.answered_ms else now_ms;",
+      target: "self.waiting = false;",
+      planted: "self.waiting = self.waiting;",
     },
     {
       name: "starts a new request from zero",
       file: "compaction_progress.zig",
-      target: "self.floor = self.value(now_ms);",
-      planted: "self.floor = self.value(now_ms) * 0;",
+      target: "self.floor = self.value();",
+      planted: "self.floor = self.value() * 0;",
     },
     {
       name: "counts notes the row already shows at a new request",
@@ -343,14 +349,20 @@ if (options.selfCheck) {
     {
       name: "shows 100% before saving",
       file: "compaction_progress.zig",
-      target: "const top_hundredths: u64 = 9_900;",
+      target: "const top_hundredths: u64 = @as(u64, all_notes) * 100;",
       planted: "const top_hundredths: u64 = 10_000;",
+    },
+    {
+      name: "gives the wait back when the clock is set back",
+      file: "compaction_progress.zig",
+      target: "self.seen_ms = now_ms;",
+      planted: "if (self.waiting and now_ms < self.seen_ms) self.waited_ms -|= @as(u32, @intCast(self.seen_ms - now_ms)); self.seen_ms = now_ms;",
     },
     {
       name: "shows less than 100% while fx saves",
       file: "compaction_activity.zig",
       target: ".publication => 100,",
-      planted: ".publication => self.progress.shown(now_ms),",
+      planted: ".publication => self.progress.shown(),",
     },
   ];
   let mutantsCaught = true;

@@ -22,7 +22,7 @@ pub fn compactionProjection(
     const op = snapshot.operation orelse return .none;
     if (!op.visible(now_ms)) return .none;
     const label: []const u8, const percent: ?u8 = switch (op.phase) {
-        .preparing, .running => .{ "• Compacting", op.percent(now_ms) },
+        .preparing, .running => .{ "• Compacting", op.percent() },
         .stopping => .{ "• Stopping compaction", null },
         .terminal => |feedback| return .{ .turn_thinking = .{
             .label = compactionFeedbackLabel(feedback),
@@ -326,7 +326,9 @@ test "the compaction row moves while the model reads and goes on to 99% as the n
     state.running(id, .summary);
     state.asked(id, 1_000);
     try std.testing.expectEqualStrings("• Compacting 0% (0s)", compactionProjection(&buf, state.snapshot, 1_000).turn_thinking.label);
+    state.observed(11_000);
     try std.testing.expectEqualStrings("• Compacting 7% (10s)", compactionProjection(&buf, state.snapshot, 11_000).turn_thinking.label);
+    state.observed(54_000);
     try std.testing.expectEqualStrings("• Compacting 23% (53s)", compactionProjection(&buf, state.snapshot, 54_000).turn_thinking.label);
     state.written(id, 50, 126_000);
     try std.testing.expectEqualStrings("• Compacting 66% (2m5s)", compactionProjection(&buf, state.snapshot, 126_000).turn_thinking.label);

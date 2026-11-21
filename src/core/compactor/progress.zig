@@ -30,8 +30,9 @@ pub const TextSink = struct {
     }
 };
 
-/// Receives the count, from 1 to 99, each time it goes up. It never sees
-/// 100: the notes are not done until fx has read and saved them.
+/// Receives the share of the notes written, from 1 to 100, each time it
+/// goes up. The row that shows it holds it below 100% until fx has saved
+/// the notes.
 pub const Sink = struct {
     context: *anyopaque,
     written_fn: *const fn (context: *anyopaque, percent: u8) void,
@@ -50,9 +51,6 @@ const line_start_bytes = 64;
 
 /// A tool call's weight in the count; see `Counter.percent`.
 const call_weight = 3;
-
-/// The highest count before the notes are saved.
-pub const most_before_saved = 99;
 
 pub const Counter = struct {
     sink: ?Sink = null,
@@ -144,7 +142,7 @@ pub const Counter = struct {
         if (self.sink) |sink| sink.written_fn(sink.context, now);
     }
 
-    /// The share of the notes written so far, from 0 to 99. A call's line is
+    /// The share of the notes written so far, from 0 to 100. A call's line is
     /// short and a section holds many entries: in a large compaction the
     /// sections are about a quarter of the notes. So a call weighs
     /// `call_weight`, and the sections together weigh as much as a third of
@@ -153,7 +151,7 @@ pub const Counter = struct {
         const calls = self.total_tools * call_weight;
         const sections = @max(self.total_sections * call_weight, self.total_tools);
         const done = (self.tools_before + self.covered_count) * call_weight + sections * self.seen_count / self.total_sections;
-        return @intCast(@min(most_before_saved, done * 100 / (calls + sections)));
+        return @intCast(done * 100 / (calls + sections));
     }
 
     fn endLine(self: *Counter) void {
@@ -269,9 +267,9 @@ test "each tool call noted and each section begun is one step" {
     counter.feed("- **T4**: fixed it\n\nRules:\nnone\n\n## Facts\nF1 (T1): x\n");
     try testing.expectEqual(@as(u8, 66), counter.percent());
     counter.feed("Decisions:\nnone\n\nStatus:\nS1: y\n\nOpen:\nnone");
-    // Everything is written, but the notes are not saved yet.
-    try testing.expectEqual(@as(u8, 99), counter.percent());
-    try testing.expectEqualSlices(u8, &.{ 11, 33, 66, 99 }, reports.values[0..reports.len]);
+    // Every call is noted and every section begun.
+    try testing.expectEqual(@as(u8, 100), counter.percent());
+    try testing.expectEqualSlices(u8, &.{ 11, 33, 66, 100 }, reports.values[0..reports.len]);
 }
 
 test "a chunk can end anywhere, even inside an ID or a dash" {
@@ -285,7 +283,7 @@ test "a chunk can end anywhere, even inside an ID or a dash" {
         counter.feed(sample_notes[split..]);
         try testing.expectEqual(whole.percent(), counter.percent());
     }
-    try testing.expectEqual(@as(u8, 99), whole.percent());
+    try testing.expectEqual(@as(u8, 100), whole.percent());
 }
 
 test "a range is clipped to the part's calls, and a call noted twice counts once" {
@@ -384,7 +382,7 @@ test "a compaction in two parts counts every call, and only the last part's sect
     counter.feed("T5: e\nRules:\nnone\n");
     try testing.expectEqual(@as(u8, 54), counter.percent());
     counter.feed("T6: f\nFacts:\nDecisions:\nStatus:\nOpen:\n");
-    try testing.expectEqual(@as(u8, 99), counter.percent());
+    try testing.expectEqual(@as(u8, 100), counter.percent());
 }
 
 test "a part with more calls than counted at the start never lowers the count" {
@@ -439,7 +437,7 @@ test "ten thousand calls, one byte at a time" {
     counter.sink = reports.sink();
     for (text.items) |byte| counter.feed(&.{byte});
     try testing.expectEqual(@as(usize, tools), counter.covered_count);
-    try testing.expectEqual(@as(u8, 99), counter.percent());
+    try testing.expectEqual(@as(u8, 100), counter.percent());
     // Reported only when the count went up, never once per byte: 75 times
     // for the calls, a percent at a time, and once for each of the five
     // sections.
@@ -458,7 +456,7 @@ test "in a large compaction the sections weigh a quarter of the notes" {
         .{ .heading = "Decisions:\n", .percent = 87 },
         .{ .heading = "Status:\n", .percent = 91 },
         .{ .heading = "Open:\n", .percent = 95 },
-        .{ .heading = "Earlier:\n", .percent = 99 },
+        .{ .heading = "Earlier:\n", .percent = 100 },
     };
     for (steps) |step| {
         counter.feed(step.heading);

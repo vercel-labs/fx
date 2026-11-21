@@ -80,12 +80,12 @@ pub const Operation = struct {
     /// the summary has come while the model works on it, and 100 while fx
     /// saves it (`tests/tla/compaction_progress/CompactionProgress.tla`
     /// FullOnlyWhenSaving). Null when the row shows no number.
-    pub fn percent(self: Operation, now_ms: i64) ?u8 {
+    pub fn percent(self: Operation) ?u8 {
         return switch (self.phase) {
             .preparing => 0,
             .running => |step| switch (step) {
                 .preparation => 0,
-                .summary => self.progress.shown(now_ms),
+                .summary => self.progress.shown(),
                 .publication => 100,
             },
             .stopping, .terminal => null,
@@ -137,6 +137,15 @@ pub const State = struct {
         if (!op.active()) return;
         op.progress.asked(now_ms);
         self.snapshot.revision += 1;
+    }
+
+    /// The UI's tick hands in the time, which moves the number while a
+    /// summary request waits. It raises no revision, since the row's clock
+    /// redraws it.
+    pub fn observed(self: *State, now_ms: i64) void {
+        const op = if (self.snapshot.operation) |*value| value else return;
+        if (!op.active()) return;
+        op.progress.observed(now_ms);
     }
 
     /// The notes' count rose. Only a higher count replaces a lower one, and
@@ -287,20 +296,31 @@ test "the summary's count only goes up, and only for the compaction still runnin
 test "the row's number moves while a request waits and is 100 only while saving" {
     var state: State = .{};
     const id = state.begin(.manual, null, 1_000);
-    try std.testing.expectEqual(@as(?u8, 0), state.snapshot.operation.?.percent(50_000));
+    state.observed(1_000);
+    try std.testing.expectEqual(@as(?u8, 0), state.snapshot.operation.?.percent());
     state.running(id, .summary);
     state.asked(id, 1_000);
-    try std.testing.expectEqual(@as(?u8, 0), state.snapshot.operation.?.percent(1_000));
-    try std.testing.expectEqual(@as(?u8, 23), state.snapshot.operation.?.percent(54_000));
-    state.written(id, 99, 126_000);
-    try std.testing.expectEqual(@as(?u8, 99), state.snapshot.operation.?.percent(126_000));
-    state.running(id, .publication);
-    try std.testing.expectEqual(@as(?u8, 100), state.snapshot.operation.?.percent(126_000));
-    state.stopping(id);
-    try std.testing.expectEqual(@as(?u8, null), state.snapshot.operation.?.percent(126_000));
-    // A request for a compaction that ended changes nothing.
-    state.settle(id, .{ .outcome = .succeeded }, 127_000);
+    try std.testing.expectEqual(@as(?u8, 0), state.snapshot.operation.?.percent());
+    // The tick hands in the time. It moves the number and raises no revision.
     const revision = state.snapshot.revision;
-    state.asked(id, 128_000);
+    state.observed(54_000);
+    try std.testing.expectEqual(@as(?u8, 23), state.snapshot.operation.?.percent());
+    // A system clock set back takes nothing from the number.
+    state.observed(2_000);
+    try std.testing.expectEqual(@as(?u8, 23), state.snapshot.operation.?.percent());
     try std.testing.expectEqual(revision, state.snapshot.revision);
+    state.written(id, 99, 126_000);
+    try std.testing.expectEqual(@as(?u8, 99), state.snapshot.operation.?.percent());
+    state.running(id, .publication);
+    try std.testing.expectEqual(@as(?u8, 100), state.snapshot.operation.?.percent());
+    state.stopping(id);
+    try std.testing.expectEqual(@as(?u8, null), state.snapshot.operation.?.percent());
+    // A request or a tick for a compaction that ended changes nothing.
+    state.settle(id, .{ .outcome = .succeeded }, 127_000);
+    const settled = state.snapshot.revision;
+    const kept = state.snapshot.operation.?.progress;
+    state.asked(id, 128_000);
+    state.observed(900_000);
+    try std.testing.expectEqual(settled, state.snapshot.revision);
+    try std.testing.expectEqual(kept, state.snapshot.operation.?.progress);
 }

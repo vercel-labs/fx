@@ -4,9 +4,10 @@
 //! by its first argument and writes one JSON result per operation to the
 //! file named by its second.
 //!
-//! The lab plays the worker's part and knows nothing about the model: it
-//! applies each event at the time the driver names, and after every
-//! operation it reports the number the row shows and the marks behind it.
+//! The lab plays the worker's part and the UI tick's, and knows nothing about
+//! the model: it applies each event at the time the driver names, hands the
+//! row the time on each `read` as the tick does, and after every operation
+//! reports the number the row shows and the marks behind it.
 const std = @import("std");
 const compaction_activity = @import("compaction_activity");
 
@@ -19,14 +20,15 @@ const Op = struct {
 const Result = struct {
     /// The model's name for the phase: `none` without a row.
     phase: []const u8,
-    /// Operation.percent at the operation's time; null without a number.
+    /// Operation.percent after the operation; null without a number.
     row: ?u8,
     /// Operation.progress of the operation on the row; zeros without one.
     floor: u16 = 0,
     base: u8 = 0,
     notes: u8 = 0,
-    asked_ms: i64 = 0,
-    answered_ms: i64 = 0,
+    waiting: bool = false,
+    waited_ms: u32 = 0,
+    seen_ms: i64 = 0,
     @"error": ?[]const u8 = null,
 };
 
@@ -70,7 +72,10 @@ fn run(lab: *Lab, op: Op, result: *Result) void {
         lab.activity.running(lab.id orelse return, .publication);
     } else if (is(op.op, "settle")) {
         lab.activity.settle(lab.id orelse return, .{ .outcome = .succeeded, .stage = .publication, .publication = .committed }, lab.now);
-    } else if (!is(op.op, "read")) {
+    } else if (is(op.op, "read")) {
+        // The UI's tick hands the row the time.
+        lab.activity.observed(lab.now);
+    } else {
         result.@"error" = "unknown op";
     }
 }
@@ -78,12 +83,13 @@ fn run(lab: *Lab, op: Op, result: *Result) void {
 fn report(lab: *const Lab, result: *Result) void {
     result.phase = phaseName(lab);
     const op = lab.activity.snapshot.operation orelse return;
-    result.row = if (op.active()) op.percent(lab.now) else null;
+    result.row = if (op.active()) op.percent() else null;
     result.floor = op.progress.floor;
     result.base = op.progress.base;
     result.notes = op.progress.notes;
-    result.asked_ms = op.progress.asked_ms;
-    result.answered_ms = op.progress.answered_ms;
+    result.waiting = op.progress.waiting;
+    result.waited_ms = op.progress.waited_ms;
+    result.seen_ms = op.progress.seen_ms;
 }
 
 pub fn main(init: std.process.Init) !void {

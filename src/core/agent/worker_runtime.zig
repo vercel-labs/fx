@@ -772,6 +772,13 @@ pub const WorkerRuntime = struct {
         self.compaction_presentation.asked(id, io_mod.milliTimestamp());
     }
 
+    /// The UI's tick hands the compaction row the time.
+    pub fn observeCompactionActivity(self: *WorkerRuntime, now_ms: i64) void {
+        self.worker_mutex.lockUncancelable(io_mod.getIo());
+        defer self.worker_mutex.unlock(io_mod.getIo());
+        self.compaction_presentation.observed(now_ms);
+    }
+
     pub fn writtenCompactionActivity(self: *WorkerRuntime, id: compaction_activity.OperationId, percent: u8) void {
         self.worker_mutex.lockUncancelable(io_mod.getIo());
         defer self.worker_mutex.unlock(io_mod.getIo());

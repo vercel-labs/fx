@@ -7740,7 +7740,7 @@ test "compaction activity transaction settles only after publication and preserv
             try std.testing.expectEqual(compaction_activity.Stage.summary, self.worker.compactionActivitySnapshot().operation.?.phase.running);
             // The request was announced before it was sent, so the row
             // counts its wait.
-            try std.testing.expect(self.worker.compactionActivitySnapshot().operation.?.progress.asked_ms > 0);
+            try std.testing.expect(self.worker.compactionActivitySnapshot().operation.?.progress.waiting);
             if (self.provider_error) |err| return err;
             try request.admission.admit();
             request.delivery.markPossiblySent();
