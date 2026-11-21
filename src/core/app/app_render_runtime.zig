@@ -5728,7 +5728,7 @@ test "core.app_render_runtime compaction row shows its count and its own clock i
         app.agent().stream = .{ .active = true, .phase = .thinking, .turn_started_ms = began - 615_000 };
         const id = app.agent().worker.compaction.begin(.automatic, 1, began);
         app.agent().worker.compaction.running(id, .summary);
-        app.agent().worker.compaction.written(id, 66);
+        app.agent().worker.compaction.written(id, 66, now);
         activity_status.syncWaitingClock(&app.agent().stream, turn_clock.waits(false, app.agent().worker.compactionActivitySnapshot()), began);
         app.shell.render_requests.request(.footer);
         try Runtime(CoordinatorTestApp).flushRequestedFrame(&app, (&app).agent());
