@@ -196,6 +196,28 @@ fn promptExecutionFailure(err: anyerror) anyerror!TerminalOutcome {
     };
 }
 
+/// Sent to the client when the content filter blocked a reply and every
+/// resend of it.
+const content_filter_refusal_text = "Blocked by the content filter. Change your request and send it again.";
+
+/// Whether a prompt that failed with `err` ends as refused: the content
+/// filter blocked the reply and every resend of it, so `fx acp` lets the
+/// user change the request, as the terminal does. libfx (`minimal_kernel`)
+/// keeps the failed turn (`tests/e2e/acp.test.ts` "content filter that
+/// blocks every resend ends the prompt as refused and leaves the server usable").
+fn refusesAfterContentFilter(err: anyerror, content_filter_blocked: bool, minimal_kernel: bool) bool {
+    return err == error.ModelError and content_filter_blocked and !minimal_kernel;
+}
+
+test "ACP refuses a prompt the content filter kept blocking only on fx acp" {
+    try std.testing.expect(refusesAfterContentFilter(error.ModelError, true, false));
+    // libfx keeps the failed turn.
+    try std.testing.expect(!refusesAfterContentFilter(error.ModelError, true, true));
+    // A ModelError without the content filter's status is another failure.
+    try std.testing.expect(!refusesAfterContentFilter(error.ModelError, false, false));
+    try std.testing.expect(!refusesAfterContentFilter(error.OutOfMemory, true, false));
+}
+
 /// Where an announced tool-call card stands. A card is open until ACP sends
 /// its final update; a provider-executed search waits for its terminal
 /// lifecycle event instead of a tool result.
@@ -326,6 +348,9 @@ const AcpContext = struct {
     message_id: acp_types.MessageIdBuffer = undefined,
     message_kind: ?AgentMessageKind = null,
     stop_reason: acp_types.StopReason = .end_turn,
+    /// The request ended on fx's content-filter status: the filter blocked
+    /// the reply and every resend of it.
+    content_filter_blocked: bool = false,
     auto_classifier: permission_auto_classifier.Classifier =
         permission_auto_classifier.Classifier.disabled(),
     /// Mode and permission policy captured at prompt dispatch so mid-turn
@@ -455,6 +480,14 @@ const AcpContext = struct {
         defer out.deinit();
         try acp_types.writeModelRecoveryInfoUpdate(&out.writer, null);
         try self.sendUpdate(out.writer.buffered());
+    }
+
+    /// Ends the prompt as refused and tells the user to change the request.
+    fn refuseAfterContentFilter(self: *AcpContext) void {
+        self.stop_reason = .refused;
+        self.sendAgentText(self.operationalMessageId(), content_filter_refusal_text) catch |err| {
+            debug_trace.logf("acp", "content filter refusal text not sent err={s}", .{@errorName(err)});
+        };
     }
 
     fn mcpToolIdentity(self: *AcpContext, arena: Allocator, name: []const u8) ?catalog_state.ToolIdentity {
@@ -1451,6 +1484,14 @@ pub fn handlePrompt(
             commitCancelledJournalTurn(alloc, state.alloc, session, &prompt_input) catch |commit_err| {
                 debug_trace.logf("session", "event=libfx_journal_interrupted_commit_failed err={s}", .{@errorName(commit_err)});
             };
+        } else if (refusesAfterContentFilter(err, ctx.content_filter_blocked, state.cfg.minimal_kernel)) {
+            // The turn ends as a failed one does, but the client gets a
+            // refusal it can show instead of an error.
+            ctx.refuseAfterContentFilter();
+            endJournalTurn(alloc, state.alloc, session) catch |end_err| {
+                debug_trace.logf("session", "event=libfx_journal_turn_end_failed err={s} turn_err={s}", .{ @errorName(end_err), @errorName(err) });
+            };
+            return .{ .stop_reason = .refused };
         } else {
             // The turn's own failure is the one to report.
             endJournalTurn(alloc, state.alloc, session) catch |end_err| {
@@ -3402,6 +3443,10 @@ fn runReportTurns(
                 ctx.stop_reason = .refused;
                 return null;
             }
+            if (refusesAfterContentFilter(err, ctx.content_filter_blocked, state.cfg.minimal_kernel)) {
+                ctx.refuseAfterContentFilter();
+                return null;
+            }
             if (err == error.Cancelled and session.cancel_flag.load(.seq_cst)) return null;
             return try promptExecutionFailure(err);
         };
@@ -3676,6 +3721,7 @@ fn pushRouteRecoveryStatus(
     status: types.RouteRecoveryStatus,
 ) !void {
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
+    if (status.kind == .content_filter) ctx.content_filter_blocked = true;
     try ctx.sendModelRecoveryStatus(status);
 }
 

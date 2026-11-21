@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { processAlive as isProcessAlive } from "./process-alive";
 import { createServer, type AddressInfo, type Socket } from "node:net";
 import {
   chmodSync,
@@ -33,7 +34,7 @@ import {
 } from "./conditional-guidance-oracle";
 import { expectPermissionModeContext } from "./permission-mode-context";
 import { completion as configuredCompletion, createConfiguredProviderFixture } from "./fixtures/chat-completions";
-import { childLines, childWork, committedRootTurns, compactionRecordPath, copyV1Fixture, logLines, logLinesAfterCompaction, onlySessionId, rootSessionIds, savedSession, savedSessionIds, savedToolCallIds, savedText, savedToolResults, sessionDir, waitForRootTurnCommitted, withoutConversionNotice } from "./saved-sessions";
+import { childLines, childWork, committedRootTurns, compactionRecordPath, copyV1Fixture, holdChildAnswer, logLines, logLinesAfterCompaction, onlySessionId, rootSessionIds, savedSession, savedSessionIds, savedToolCallIds, savedText, savedToolResults, sessionDir, waitForRootTurnCommitted, withoutConversionNotice } from "./saved-sessions";
 import { stdoutFrames } from "./render-lab/tape";
 import {
   fakeGatewayFinalText,
@@ -1142,15 +1143,6 @@ process.stdin.on("data", (chunk) => {
     }),
   );
   return { callLogPath, pidPath, readyPath };
-}
-
-function isProcessAlive(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch {
-    return false;
-  }
 }
 
 // Whether a pid a fixture recorded names one process other than this runner.
@@ -4385,7 +4377,7 @@ describe("gateway stream lifecycle", () => {
     }
   });
 
-  test("OS filesystem access denial reaches the next gateway request", async () => {
+  test.skipIf(ignoresFileModes())("OS filesystem access denial reaches the next gateway request", async () => {
     const root = createFixtureRoot("os-filesystem-access-denial");
     const tracePath = join(root.root, "trace.log");
     const blockedPath = join(root.root, "blocked");
@@ -10734,7 +10726,10 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     let parentId = "";
     let childBlobs = "";
     let failureObserved = false;
-    const scripted = startDynamicFakeGateway((body) => {
+    // Each child answers only once the parent has saved the turn that sent its
+    // message, so its report starts the next turn instead of joining that one.
+    const hold = holdChildAnswer(root.home);
+    const scripted = startDynamicFakeGateway(async (body) => {
       if (["delegate", "followup"].some((id) => hasCurrentToolResult(body, id))) return fakeGatewayFinalText("SUBAGENT_SENT");
       // Each report starts the parent's next turn.
       if (latestUserIsReport(body) && latestUserText(body).includes("CHILD_RECOVERED")) {
@@ -10754,6 +10749,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         expect(JSON.stringify(childLines(root.home, parentId).at(-1).data)).toContain(fault.cause);
         failureObserved = true;
         fault.restore(childBlobs);
+        hold.mark();
         return fakeGatewayToolCall("followup", "subagent", {
           request: { action: "message", agent: "reporter", message: nextTask },
         });
@@ -10763,9 +10759,15 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
           request: { action: "message", agent: "reporter", message: childTask },
         });
       }
-      if (body.includes(nextTask)) return fakeGatewayFinalText("CHILD_RECOVERED");
+      if (body.includes(nextTask)) {
+        const refused = await hold.wait();
+        if (refused) return refused;
+        return fakeGatewayFinalText("CHILD_RECOVERED");
+      }
       if (body.includes(childTask)) {
         childRequests++;
+        const refused = await hold.wait();
+        if (refused) return refused;
         if (hasCurrentToolResult(body, "child_effect")) {
           expect(readFileSync(marker, "utf8")).toBe("EFFECT_ONCE\n");
           // Breaking the child's blobs folder makes its turn fail after its
@@ -10785,6 +10787,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         env: { ...fixtureEnv(root, scripted, ""), FX_TRACE_LOG: undefined, FX_TRACE: undefined, FX_TRACE_SCOPES: undefined },
         timeoutMs: 15_000,
       });
+      hold.check();
       expect(result.code).toBe(0);
       expect(failureObserved).toBe(true);
       expect(parseAskJson(result.stdout).output).toContain("SUBAGENT_FAILURE_REPORTED");
@@ -10822,7 +10825,10 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     let failedCause = "";
     let childRequests = 0;
     let markerAtFailure: string | null = null;
-    const gateway = startDynamicFakeGateway((body) => {
+    // Each child answers only once the parent has saved the turn that sent its
+    // message, so its report starts the next turn instead of joining that one.
+    const hold = holdChildAnswer(root.home);
+    const gateway = startDynamicFakeGateway(async (body) => {
       if (["http_delegate", "http_followup"].some((id) => hasCurrentToolResult(body, id))) return fakeGatewayFinalText("SUBAGENT_HTTP_SENT");
       if (latestUserIsReport(body) && latestUserText(body).includes("CHILD_RECOVERED")) {
         recovered = latestUserText(body);
@@ -10833,6 +10839,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         parentId = rootSessionIds(root.home)[0]!;
         failedWork = childWork(root.home, parentId);
         failedCause = JSON.stringify(childLines(root.home, parentId).at(-1).data);
+        hold.mark();
         return withEffect
           ? fakeGatewayToolCall("http_followup", "subagent", { request: { action: "message", agent: "reporter", message: followupTask } })
           : fakeGatewayFinalText("SUBAGENT_HTTP_OBSERVED");
@@ -10844,10 +10851,14 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       }
       if (body.includes(followupTask)) {
         childRequests++;
+        const refused = await hold.wait();
+        if (refused) return refused;
         return fakeGatewayFinalText("CHILD_RECOVERED");
       }
       if (body.includes(task)) {
         childRequests++;
+        const refused = await hold.wait();
+        if (refused) return refused;
         if (withEffect && childRequests === 1) return fakeShellRun("http_effect", "printf 'EFFECT_ONCE\\n' >> effect.txt");
         markerAtFailure = existsSync(marker) ? readFileSync(marker, "utf8") : null;
         return new Response(JSON.stringify({ error: { message: "Fixture access rejected" } }), {
@@ -10862,6 +10873,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         env: { ...fixtureEnv(root, gateway, ""), FX_TRACE_LOG: undefined, FX_TRACE: undefined, FX_TRACE_SCOPES: undefined },
         timeoutMs: 15_000,
       });
+      hold.check();
       expect(run.code).toBe(0);
       expect(run.timedOut).toBe(false);
       // The failure arrives as the child's report, with its cause.
@@ -10906,7 +10918,10 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     const reports: Record<keyof typeof tasks, string[]> = { ok: [], failed: [] };
     let delegation: keyof typeof tasks = "ok";
     let childRequests = 0;
-    const gateway = startDynamicFakeGateway((body) => {
+    // Each child answers only once its run's parent has saved its turn, so the
+    // report starts the next turn and the receipt gets a request of its own.
+    const hold = holdChildAnswer(root.home);
+    const gateway = startDynamicFakeGateway(async (body) => {
       if (latestUserIsReport(body)) {
         reports[delegation].push(latestUserText(body));
         return fakeGatewayFinalText("REPLAY_REPORT_SEEN");
@@ -10923,10 +10938,14 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       const asked = withoutContextUpdates(contentText(prompt[lastUser]?.content));
       if (asked.includes(tasks.ok)) {
         childRequests++;
+        const refused = await hold.wait();
+        if (refused) return refused;
         return fakeGatewayFinalText("REPLAY_CHILD_DONE");
       }
       if (asked.includes(tasks.failed)) {
         childRequests++;
+        const refused = await hold.wait();
+        if (refused) return refused;
         return new Response(JSON.stringify({ error: { message: "Fixture access rejected" } }), {
           status: 401, headers: { "content-type": "application/json" },
         });
@@ -10939,7 +10958,9 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       // resumed session is answered without another worker or report.
       for (const outcome of ["ok", "failed"] as const) {
         delegation = outcome;
+        hold.mark();
         const first = await runFx(["ask", "--json", "--auto", `Run the ${outcome} delegation.`], { cwd: root.workspace, env, timeoutMs: 10_000 });
+        hold.check();
         expect(first.code).toBe(0);
         const sessionId = parseAskJson(first.stdout).session_id;
         const repeat = await runFx(["ask", "--json", "--auto", "--resume", sessionId, "Observe that same delegation again."], { cwd: root.workspace, env, timeoutMs: 10_000 });
@@ -11117,7 +11138,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       }
       const answer = (id: string) => String(JSON.parse(results[id]!).result);
       // The first subagent starts with no other: its answer is as before.
-      expect(answer("idle_first")).toBe("Sent to first, which works on it now. Its report arrives on its own when the work ends; keep working or end your turn.");
+      expect(answer("idle_first")).toBe("Sent to first, which works on it now. Do not call wait. Do any other work you have, then end your turn with a short status. Its report starts your next turn when the work ends.");
       // A new subagent's start names the idle one.
       expect(answer("idle_second")).toContain("second is new and starts with no history.");
       expect(answer("idle_second")).toContain(`Idle subagents, each with its own context:\n- first: ${tasks.first}\n`);
@@ -11126,7 +11147,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       expect(answer("idle_third")).toContain(`Idle subagents, each with its own context:\n- first: ${tasks.first}\nGive related work`);
       expect(answer("idle_third")).not.toContain("- second");
       // A message to a subagent that exists starts its turn and names none.
-      expect(answer("idle_again")).toBe("Sent to first, which works on it now. Its report arrives on its own when the work ends; keep working or end your turn.");
+      expect(answer("idle_again")).toBe("Sent to first, which works on it now. Do not call wait. Do any other work you have, then end your turn with a short status. Its report starts your next turn when the work ends.");
       // Every report of a finished work says its subagent is idle now.
       expect(reports.map((report) => report.agent).sort()).toEqual(["first", "first", "second", "third"]);
       for (const report of reports) {
@@ -13603,7 +13624,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     }
   });
 
-  test("content filter does not retry or offer route recovery", async () => {
+  test("content filter resends three times, then ends the turn as before", async () => {
     const root = createFixtureRoot("content-filter-terminal");
     const tracePath = join(root.root, "trace.log");
     const gateway = startGateway(() => contentFilterResponse());
@@ -13622,18 +13643,61 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       expect(result.code).toBe(1);
       expect(json.exit_code).toBe(1);
       expect(json.error).toBe("ModelError");
-      expect(json.usage).toEqual({ input_tokens: 7, output_tokens: 11 });
       expect(result.signal).toBeNull();
       expect(result.timedOut).toBe(false);
+      expect(json.recovery?.state).toBe("failed");
       expect(json.recovery?.message).toContain(
         "⚠ blocked · content_filter · content filter",
       );
-      expect(gateway.requestCount()).toBe(1);
-      expect(result.stderr).toBe("");
+      // Three resends at once, then the fourth block ends the turn.
+      expect(gateway.requestCount()).toBe(4);
+      // Each resend is a new attempt, so each prints its own notice.
+      for (const count of [1, 2, 3]) {
+        expect(result.stderr).toContain(`[notice] Blocked by the content filter · retrying (${count}/3)\n`);
+      }
+      expect(trace.split("event=content_filter_resend").length - 1).toBe(3);
+      // fx ask cannot answer a question, so it never shows one.
+      expect(result.stderr).not.toContain("press Esc");
       expect(trace).toContain("event=route_failure");
       expect(trace).toContain("finish_reason=content-filter");
-      expect(trace).toContain("retry=false");
       expect(trace).not.toContain("event=route_recovery_decision");
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  });
+
+  test("content filter blocks twice, then the resend's answer finishes the turn", async () => {
+    const root = createFixtureRoot("content-filter-recovered");
+    const tracePath = join(root.root, "trace.log");
+    const responses = [
+      contentFilterResponse(),
+      contentFilterResponse(),
+      fakeGatewayFinalText("ALLOWED_AFTER_TWO_BLOCKS"),
+    ];
+    const gateway = startGateway(() =>
+      responses.shift() ?? new Response("unexpected request", { status: 500 })
+    );
+    try {
+      const result = await runFx(
+        ["ask", "--json", "--auto", "--no-save", "Trigger content filter fixture."],
+        {
+          cwd: root.workspace,
+          env: fixtureEnv(root, gateway, tracePath),
+          timeoutMs: 15_000,
+        },
+      );
+      const json = parseAskJson(result.stdout);
+      const trace = readFileSync(tracePath, "utf8");
+
+      expect(result.code).toBe(0);
+      expect(json.exit_code).toBe(0);
+      expect(json.error ?? null).toBeNull();
+      expect(json.final_output).toBe("ALLOWED_AFTER_TWO_BLOCKS");
+      expect(json.recovery).toEqual({ state: "recovered", attempt: 3 });
+      expect(gateway.requestCount()).toBe(3);
+      expect(trace.split("event=content_filter_resend").length - 1).toBe(2);
+      expect(result.stderr).not.toContain("press Esc");
     } finally {
       gateway.stop();
       rmSync(root.root, { recursive: true, force: true });
@@ -15499,6 +15563,65 @@ test("fx told to quit while a message waits for a subagent's start exits at once
   expect(run.quitMs).toBeLessThan(5_000);
   expect(run.stderr).not.toContain("panic");
   expect(run.exit).toBe(143);
+}, 90_000);
+
+// Main messages subagent `reviewer`, and the start control
+// (src/core/subagent/start_test_controls.zig, FX_TEST_SUBAGENT_START_FAIL)
+// fails that first start after its work is saved. fx answers that the start
+// failed and the subagent is idle; main then sends the message again, which
+// starts a work, and its report ends the ask.
+test("a subagent whose start failed is idle and takes the next message", async () => {
+  const root = createFixtureRoot("subagent-start-failed");
+  const tracePath = join(root.root, "trace.log");
+  const state = { firstAnswer: "", secondAnswer: "", firstRan: false, nextRequests: 0 };
+  const gateway = startDynamicFakeGateway((raw) => {
+    const body = JSON.parse(raw);
+    const latest = JSON.stringify(body.prompt?.filter((item: any) => item.role === "user").at(-1)?.content ?? "");
+    if (latest.includes(REPORT_HEADER)) return fakeGatewayFinalText("STARTFAIL_REPORT_SEEN");
+    if (raw.includes("startfail-second")) {
+      state.secondAnswer = toolResultText(raw, "startfail-second");
+      return fakeGatewayFinalText("STARTFAIL_MAIN_SENT");
+    }
+    if (raw.includes("startfail-first")) {
+      state.firstAnswer = toolResultText(raw, "startfail-first");
+      return fakeGatewayToolCall("startfail-second", "subagent", { request: { action: "message", agent: "reviewer", message: "STARTFAIL_NEXT" } });
+    }
+    if (latest.includes("STARTFAIL_NEXT")) {
+      state.nextRequests++;
+      return fakeGatewayFinalText("STARTFAIL_CHILD_DONE");
+    }
+    if (latest.includes("STARTFAIL_FIRST")) {
+      state.firstRan = true;
+      return fakeGatewayFinalText("STARTFAIL_FIRST_RAN");
+    }
+    return fakeGatewayToolCall("startfail-first", "subagent", { request: { action: "message", agent: "reviewer", message: "STARTFAIL_FIRST" } });
+  }, { models: [{ id: MODEL, type: "language", tags: ["tool-use"] }] });
+  try {
+    const result = await runFx(["ask", "--json", "--full-access", "Message the reviewer, and again if it did not start."], {
+      cwd: root.workspace,
+      env: { ...fixtureEnv(root, gateway, tracePath), FX_SOUND: "0", FX_TRACE_SCOPES: "mailbox,subagent,tool", FX_TEST_SUBAGENT_START_FAIL: "1" },
+      timeoutMs: 60_000,
+    });
+    expect(result.code).toBe(0);
+    expect(result.stderr).not.toContain("panic");
+    // The first answer says the start failed, and that the subagent is idle.
+    expect(state.firstAnswer).toContain("start_failed");
+    expect(state.firstAnswer).toContain("reviewer did not start: fx could not start a thread for it. Your message did not run. reviewer is idle");
+    // The second message started a work that ran; the first never did.
+    expect(state.secondAnswer).toContain("Sent to reviewer");
+    expect(state.firstRan).toBe(false);
+    expect(state.nextRequests).toBe(1);
+    expect(parseAskJson(result.stdout).output).toContain("STARTFAIL_REPORT_SEEN");
+    expect(readFileSync(tracePath, "utf8")).toContain("event=start_failed");
+    // The parent's log ends the first work as failed and the second as ok.
+    const parentId = rootSessionIds(root.home)[0]!;
+    const finished = childLines(root.home, parentId).filter((line) => line.kind === "child_finished");
+    expect(finished.map((line) => line.outcome)).toEqual(["failed", "ok"]);
+    expect(JSON.stringify(finished[0].data)).toContain("start_failed: ThreadSpawnFailed");
+  } finally {
+    gateway.stop();
+    rmSync(root.root, { recursive: true, force: true });
+  }
 }, 90_000);
 
 // A subagent's shell command that goes quiet past the quiet notice's limit

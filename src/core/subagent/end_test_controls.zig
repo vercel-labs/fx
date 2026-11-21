@@ -84,6 +84,44 @@ pub fn holdBeforeSettle(child_id: []const u8) void {
     holdOnFiles(&settle_holds, files, "settle child={s}", .{child_id});
 }
 
+/// Test builds only: an inline test sets it to hold a slot at the end of a
+/// work that its turn has finished, where a stop or close can land while the
+/// slot still keeps the messages the turn never took. It is called twice for
+/// each work: with `recorded` false after the turn ended and before the slot
+/// records the end, and with it true after the end is recorded and before the
+/// host's end hook runs. No file control sets it.
+pub var test_hold_run: if (builtin.is_test) ?*const fn (child_id: []const u8, recorded: bool) void else void = if (builtin.is_test) null else {};
+
+/// Whether an inline test holds the slot there.
+pub fn runArmed() bool {
+    if (comptime build_options.libfx) return false;
+    if (builtin.is_test) return test_hold_run != null;
+    return false;
+}
+
+/// Called by the slot of `child_id` at the two points `test_hold_run` names.
+pub fn holdAfterRun(child_id: []const u8, recorded: bool) void {
+    if (comptime build_options.libfx) return;
+    if (builtin.is_test) {
+        if (test_hold_run) |hold| hold(child_id, recorded);
+    }
+}
+
+/// Test builds only: an inline test sets it to hold the host in a parent's stop
+/// or close of a child, after the owner stopped the child's turn and before the
+/// host reads what the stop dropped, so the slot's end can run first. No file
+/// control sets it.
+pub var test_hold_stop: if (builtin.is_test) ?*const fn (child_id: []const u8) void else void = if (builtin.is_test) null else {};
+
+/// Called by the host for `child_id` in a parent's stop or close, once the
+/// owner stopped the turn.
+pub fn holdInStop(child_id: []const u8) void {
+    if (comptime build_options.libfx) return;
+    if (builtin.is_test) {
+        if (test_hold_stop) |hold| hold(child_id);
+    }
+}
+
 /// The two paths of a hold's file controls.
 pub const HoldFiles = struct { held: []const u8, release: []const u8 };
 
@@ -157,4 +195,10 @@ test "a hold is armed only when both of its paths are absolute" {
     try std.testing.expect(usableHoldFiles("/tmp/held", "release") == null);
     try std.testing.expect(usableHoldFiles("./held", "../release") == null);
     try std.testing.expect(usableHoldFiles("", "") == null);
+}
+
+test "a test build holds a parent's stop only through its hook" {
+    // Without a hook the host's call returns at once.
+    try std.testing.expect(test_hold_stop == null);
+    holdInStop("child");
 }

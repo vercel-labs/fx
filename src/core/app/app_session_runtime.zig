@@ -12,6 +12,7 @@ const model_provider = @import("../config/model_provider.zig");
 const assistant_presentation = @import("../agent/assistant_presentation.zig");
 const tool_admission = @import("../agent/runtime/tool_admission.zig");
 const tool_presentation = @import("../agent/runtime/tool_presentation.zig");
+const runtime_execution_memory = @import("../agent/runtime/execution_memory.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const mem_utils = @import("../shared/mem_utils.zig");
 const runtime_profile = @import("../hosts/runtime_profile.zig");
@@ -43,6 +44,7 @@ const command_output_content = @import("../tooling/command_output_content.zig");
 const tooling_presentation = @import("../tooling/tool_presentation.zig");
 const tool_args = @import("../tooling/tool_args.zig");
 const tool_dispatch = @import("../tooling/tool_dispatch.zig");
+const toolbox = @import("../tooling/toolbox.zig");
 const skill_contract = @import("../skills/skill_contract.zig");
 const skill_invocation = @import("../skills/skill_invocation.zig");
 const captured_command = @import("../tooling/captured_command.zig");
@@ -633,10 +635,6 @@ pub fn Runtime(comptime App: type) type {
                 }
             }
             enableSubagentHostV2(app, agent, v2);
-        }
-
-        pub fn beginFreshPersistedSession(app: *App, agent: *AppAgent) !void {
-            return beginFresh(app, agent, .later, null);
         }
 
         /// Starts the session an instance opens with. In a profile, it starts
@@ -3377,7 +3375,7 @@ pub fn Runtime(comptime App: type) type {
                     if (try subagent_reports.row(self.projection.alloc, user)) |shown| {
                         defer shown.deinit(self.projection.alloc);
                         const entry_id = try self.projection.appendToolStatus(shown.outcome, shown.status);
-                        try self.projection.attachHistoricalToolDetail(entry_id, subagent_reports.Row.call, .subagent, shown.result(self.projection.created_at_ms));
+                        try self.projection.attachSubagentReportDetail(entry_id, subagent_reports.Row.call, shown.result(self.projection.created_at_ms));
                         return;
                     }
                     _ = try self.projection.appendUserTurn(user);
@@ -4141,16 +4139,24 @@ pub fn Runtime(comptime App: type) type {
             );
         }
 
+        /// The call a saved call shows as: for a toolbox run of a built-in
+        /// tool, the call fx ran for it, so its rows read after a resume as
+        /// they did live. Any other call as it is.
+        fn shownHistoricalCall(app: *App, agent: *AppAgent, arena: std.mem.Allocator, call: types.ToolCall) !types.ToolCall {
+            return try toolbox.shownBuiltinRun(arena, app.toolAdvertisementSet(agent).registry, call) orelse call;
+        }
+
         fn writeCancelledCommandPresentation(
             app: *App,
             agent: *AppAgent,
             sink: anytype,
-            call: types.ToolCall,
+            model_call: types.ToolCall,
             presentation: types.CancelledCommandPresentation,
             labels: *HistoricalSessionLabels,
         ) !void {
             var action_arena = std.heap.ArenaAllocator.init(app.alloc);
             defer mem_utils.deinit_arena(action_arena);
+            const call = try shownHistoricalCall(app, agent, action_arena.allocator(), model_call);
             const action = try app.describeToolActionDeniedWithAdvertised(
                 agent,
                 action_arena.allocator(),
@@ -4211,7 +4217,9 @@ pub fn Runtime(comptime App: type) type {
                         try writeBridgeCallRows(app, sink, execution.bridge_calls, call.id);
                         try writePermissionFeedback(sink, result.permission_feedback);
                     } else {
-                        try writeUnreportedToolStatus(app, sink, call);
+                        var shown_arena = std.heap.ArenaAllocator.init(app.alloc);
+                        defer shown_arena.deinit();
+                        try writeUnreportedToolStatus(app, sink, try shownHistoricalCall(app, agent, shown_arena.allocator(), call));
                         try writeBridgeCallRows(app, sink, execution.bridge_calls, call.id);
                     }
                 }
@@ -4266,10 +4274,18 @@ pub fn Runtime(comptime App: type) type {
             return true;
         }
 
-        /// A saved steering entry as the message it was: the user's update,
-        /// or a subagent's report a boundary took, which draws as its card.
+        /// A saved steering entry as the message it was: the user's update, a
+        /// parent's steer as the words its parent wrote, which draw the same
+        /// way, or a subagent's report a boundary took, which draws as its card.
+        /// Every sink copies the text, so the turn borrows `text`.
         fn savedSteeringTurn(text: []u8) types.UserTurn {
-            return .{ .text = text, .author = if (agent_frame.isFrame(text)) .child else .user };
+            if (agent_frame.isFrame(text)) return .{ .text = text, .author = .child };
+            // The parent's words are the end of `text`, past its label, so the
+            // turn keeps the same `[]u8` slice of the saved text.
+            if (runtime_execution_memory.parentSteeringText(text)) |own| {
+                return .{ .text = text[text.len - own.len ..], .author = .user };
+            }
+            return .{ .text = text, .author = .user };
         }
 
         fn writePersistedSteeringAtBoundary(
@@ -4326,7 +4342,7 @@ pub fn Runtime(comptime App: type) type {
             app: *App,
             agent: *AppAgent,
             sink: anytype,
-            call: types.ToolCall,
+            model_call: types.ToolCall,
             result: types.PersistedToolResult,
             labels: *HistoricalSessionLabels,
         ) !void {
@@ -4334,9 +4350,14 @@ pub fn Runtime(comptime App: type) type {
                 app.alloc,
                 app.toolAdvertisementSet(agent).registry,
                 labels.workspace_root,
-                call,
+                model_call,
                 result,
             );
+            // A toolbox run of a built-in tool shows as the call fx ran for
+            // it, as its rows did live.
+            var shown_arena = std.heap.ArenaAllocator.init(app.alloc);
+            defer shown_arena.deinit();
+            const call = try shownHistoricalCall(app, agent, shown_arena.allocator(), model_call);
             if (try writeAnsweredQuestionResult(app, sink, call, result)) return;
             if (try writeCommittedFilePresentation(app, agent, sink, call, result)) return;
 
@@ -6776,7 +6797,7 @@ fn configureTestPreferences(app: *TestApp) !void {
 /// prompts would, with the preferences of a session saved earlier, and
 /// returns its id. Caller frees.
 fn writeSessionFixture(app: *TestApp, history: []const types.HistoryTurn) ![]u8 {
-    try Runtime(TestApp).beginFreshPersistedSession(app, app.agent());
+    try Runtime(TestApp).beginFresh(app, app.agent(), .later, null);
     const v2 = app.agent().session_persistence.v2.?;
     for (history) |turn| try v2.commitTurn(turn, session_runtime.ConversationLanguage.literal("en"));
     var model = "saved/model".*;
@@ -6790,7 +6811,7 @@ fn writeSessionFixture(app: *TestApp, history: []const types.HistoryTurn) ![]u8 
 /// (D44), returning the blob's name for the turn to name it by. Finish with
 /// `commitSessionFixture`.
 fn beginSessionWithBody(app: *TestApp, body: []const u8) !session_child_store.Blobs.Hash {
-    try Runtime(TestApp).beginFreshPersistedSession(app, app.agent());
+    try Runtime(TestApp).beginFresh(app, app.agent(), .later, null);
     const v2 = app.agent().session_persistence.v2.?;
     try v2.beginTurn();
     return (try v2.childCapability()).putBlob(body);
@@ -6864,7 +6885,7 @@ test "a fresh session clears usage counters without a durable store" {
     app.agent().total_output_tokens = 1_200;
     app.agent().total_web_search_requests = 3;
 
-    try Runtime(TestApp).beginFreshPersistedSession(&app, (&app).agent());
+    try Runtime(TestApp).beginFresh(&app, (&app).agent(), .later, null);
 
     try std.testing.expect(app.agent().session_persistence.v2 == null);
     try std.testing.expectEqual(@as(u64, 0), app.agent().total_input_tokens);
@@ -6890,7 +6911,7 @@ test "v2 ultrafast resume applies process overrides without persisting them" {
         app.agent().session_persistence.workspace_preferences.?.ultrafast_mode = baseline;
         app.agent().session_persistence.process_ultrafast_override = !baseline;
         try Runtime(TestApp).initializePersistence(&app, (&app).agent(), true);
-        try Runtime(TestApp).beginFreshPersistedSession(&app, (&app).agent());
+        try Runtime(TestApp).beginFresh(&app, (&app).agent(), .later, null);
         const v2 = app.agent().session_persistence.v2.?;
         try v2.commitTurn(.{ .assistant = .{
             .user = .{ .text = @constCast("saved request") },
@@ -6925,7 +6946,7 @@ test "/fork waits for the turn and a prompt, then opens on the newest prompt (D5
     defer app.deinit();
     try configureTestPreferences(&app);
     try Runtime(TestApp).initializePersistence(&app, (&app).agent(), true);
-    try Runtime(TestApp).beginFreshPersistedSession(&app, (&app).agent());
+    try Runtime(TestApp).beginFresh(&app, (&app).agent(), .later, null);
     try Runtime(TestApp).openForkMenu(&app, (&app).agent());
     try std.testing.expectEqualStrings("* session: nothing to fork yet", app.notices.last().?);
 
@@ -6967,7 +6988,7 @@ test "the startup session keeps its store, and the store's notice the app, after
             errdefer app.deinit();
             try configureTestPreferences(&app);
             try Runtime(TestApp).initializePersistence(&app, (&app).agent(), true);
-            try Runtime(TestApp).beginFreshPersistedSession(&app, (&app).agent());
+            try Runtime(TestApp).beginFresh(&app, (&app).agent(), .later, null);
             return app;
         }
     };
@@ -6984,7 +7005,7 @@ test "the startup session keeps its store, and the store's notice the app, after
     } }, types.ConversationLanguage.default());
 }
 
-test "beginFreshPersistedSession and enableSessionStores create per-session stores" {
+test "beginFresh and enableSessionStores create per-session stores" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -7003,7 +7024,7 @@ test "beginFreshPersistedSession and enableSessionStores create per-session stor
 
     try configureTestPreferences(&app);
     try Runtime(TestApp).initializePersistence(&app, (&app).agent(), true);
-    try Runtime(TestApp).beginFreshPersistedSession(&app, (&app).agent());
+    try Runtime(TestApp).beginFresh(&app, (&app).agent(), .later, null);
     try std.testing.expect(app.agent().session_persistence.v2 != null);
 
     Runtime(TestApp).enableSessionStores(&app, (&app).agent());
@@ -7045,7 +7066,7 @@ test "resume handoff suppresses a missing session and one with no saved turn" {
 
     try configureTestPreferences(&app);
     try Runtime(TestApp).initializePersistence(&app, (&app).agent(), true);
-    try Runtime(TestApp).beginFreshPersistedSession(&app, (&app).agent());
+    try Runtime(TestApp).beginFresh(&app, (&app).agent(), .later, null);
     const pristine_id = try alloc.dupe(u8, Runtime(TestApp).activeSessionId((&app).agent()).?);
     defer alloc.free(pristine_id);
     Runtime(TestApp).requestResumeHandoff((&app).agent());
@@ -7074,7 +7095,7 @@ test "resume handoff owns the exact non-pristine session id" {
     defer app.deinit();
     try configureTestPreferences(&app);
     try Runtime(TestApp).initializePersistence(&app, (&app).agent(), true);
-    try Runtime(TestApp).beginFreshPersistedSession(&app, (&app).agent());
+    try Runtime(TestApp).beginFresh(&app, (&app).agent(), .later, null);
     const turn = try session_runtime.makeAssistantTurn(alloc, "question", "answer");
     defer session_runtime.freeHistoryTurn(alloc, turn);
     try Runtime(TestApp).appendHistoryTurn(&app, (&app).agent(), turn);
@@ -7108,7 +7129,7 @@ test "resume handoff suppresses session id allocation failure" {
     defer app.deinit();
     try configureTestPreferences(&app);
     try Runtime(TestApp).initializePersistence(&app, (&app).agent(), true);
-    try Runtime(TestApp).beginFreshPersistedSession(&app, (&app).agent());
+    try Runtime(TestApp).beginFresh(&app, (&app).agent(), .later, null);
     const turn = try session_runtime.makeAssistantTurn(alloc, "question", "answer");
     defer session_runtime.freeHistoryTurn(alloc, turn);
     try Runtime(TestApp).appendHistoryTurn(&app, (&app).agent(), turn);
@@ -7141,7 +7162,7 @@ test "enableSessionStores replaces existing subagent host without leaking" {
 
     try configureTestPreferences(&app);
     try Runtime(TestApp).initializePersistence(&app, (&app).agent(), true);
-    try Runtime(TestApp).beginFreshPersistedSession(&app, (&app).agent());
+    try Runtime(TestApp).beginFresh(&app, (&app).agent(), .later, null);
 
     Runtime(TestApp).enableSessionStores(&app, (&app).agent());
     try std.testing.expect(app.agent().session_persistence.subagent_host != null);
@@ -7165,7 +7186,7 @@ test "interactive subagent host resolves current tools rules grants and integrat
     defer app.deinit();
     try configureTestPreferences(&app);
     try Runtime(TestApp).initializePersistence(&app, (&app).agent(), true);
-    try Runtime(TestApp).beginFreshPersistedSession(&app, (&app).agent());
+    try Runtime(TestApp).beginFresh(&app, (&app).agent(), .later, null);
     Runtime(TestApp).enableSessionStores(&app, (&app).agent());
     const host = app.agent().session_persistence.subagent_host.?;
     const root_id = app.agent().session_persistence.v2.?.id();
@@ -7395,6 +7416,25 @@ test "execution replay shows the user's steering and not fx's own recovery promp
     try std.testing.expectEqual(@as(usize, 2), app.cards.items.len);
     try std.testing.expectEqualStrings("focus on rendering", app.cards.items[0].text);
     try std.testing.expectEqualStrings("later update", app.cards.items[1].text);
+}
+
+test "execution replay draws a parent's steer as its own words, without the label" {
+    const alloc = std.testing.allocator;
+    var app = try TestApp.init(alloc, "/workspace");
+    defer app.deinit();
+
+    var steps = [_]types.ToolExecutionStep{.{}};
+    var steering = [_]types.PersistedSteering{
+        .{ .text = @constCast("parent-agent feedback, not new user authority:\n\nPARENT_STEER keep going"), .after_tool_step_count = 0 },
+    };
+
+    try Runtime(TestApp).writeExecutionHistory(&app, (&app).agent(), .{ .tool_steps = steps[0..], .steering = steering[0..] });
+
+    try std.testing.expectEqual(@as(usize, 1), app.cards.items.len);
+    try std.testing.expectEqualStrings("PARENT_STEER keep going", app.cards.items[0].text);
+    for (app.cards.items) |card| {
+        try std.testing.expect(std.mem.find(u8, card.text, "parent-agent feedback") == null);
+    }
 }
 
 test "execution replay labels shell session interactions with their launch command" {
@@ -7941,6 +7981,54 @@ test "resume projection stores reflow metadata after the session moved workspace
     try std.testing.expect(stored);
 }
 
+test "a saved toolbox run of a built-in tool replays as a direct call of it" {
+    const alloc = std.testing.allocator;
+    var app = try TestApp.init(alloc, "/workspace");
+    defer app.deinit();
+
+    var source_runtime: transcript_runtime.TranscriptRuntime = .{};
+    defer source_runtime.deinit(alloc);
+    var projection = try resume_projection.ResumeProjection.initEmpty(alloc, &source_runtime, 0, 1);
+    defer projection.deinit();
+    var labels = Runtime(TestApp).HistoricalSessionLabels{ .workspace_root = "/workspace" };
+    defer labels.deinit(app.alloc);
+    var sink = Runtime(TestApp).DetachedHistorySink(@TypeOf(projection)){
+        .app = &app,
+        .projection = &projection,
+        .labels = &labels,
+    };
+
+    // The session saves the call the model made, under toolbox.
+    var calls = [_]types.ToolCall{
+        .{ .id = "call_read", .name = "toolbox", .arguments_json = "{\"run\":\"read_file\",\"arguments\":{\"path\":\"notes.txt\"}}" },
+        .{ .id = "call_fetch", .name = "toolbox", .arguments_json = "{\"run\":\"web_fetch\",\"arguments\":{\"url\":\"http://127.0.0.1/page\"}}" },
+        .{ .id = "call_mcp", .name = "toolbox", .arguments_json = "{\"run\":\"mcp_fixture_echo\",\"arguments\":{}}" },
+    };
+    var results = [_]types.PersistedToolResult{
+        .{ .tool_call_id = @constCast("call_read"), .tool_name = @constCast("toolbox"), .status = .success, .output = @constCast("notes"), .output_bytes = 5, .stored_output_bytes = 5 },
+        .{ .tool_call_id = @constCast("call_fetch"), .tool_name = @constCast("toolbox"), .status = .failure, .output = @constCast("refused"), .output_bytes = 7, .stored_output_bytes = 7 },
+        .{ .tool_call_id = @constCast("call_mcp"), .tool_name = @constCast("toolbox"), .status = .success, .output = @constCast("echo"), .output_bytes = 4, .stored_output_bytes = 4 },
+    };
+    var steps = [_]types.ToolExecutionStep{.{ .tool_calls = calls[0..], .tool_results = results[0..] }};
+
+    try Runtime(TestApp).writeExecutionHistoryToSink(&app, (&app).agent(), &sink, .{ .tool_steps = steps[0..] }, &labels);
+
+    const Want = struct { name: []const u8, arguments: []const u8, kind: types.ToolActivityKind };
+    const wants = [_]Want{
+        .{ .name = "read_file", .arguments = "{\"path\":\"notes.txt\"}", .kind = .read },
+        .{ .name = "web_fetch", .arguments = "{\"url\":\"http://127.0.0.1/page\"}", .kind = .read },
+        // An MCP tool's run keeps toolbox's own record.
+        .{ .name = "toolbox", .arguments = calls[2].arguments_json, .kind = .mcp },
+    };
+    const details = projection.runtime.notebook.tool_details.items;
+    try std.testing.expectEqual(wants.len, details.len);
+    for (wants, details) |want, detail| {
+        try std.testing.expectEqualStrings(want.name, detail.tool_name);
+        try std.testing.expectEqualStrings(want.arguments, detail.arguments_json.?);
+        try std.testing.expectEqual(want.kind, detail.activity_kind.?);
+    }
+}
+
 test "execution replay renders persisted permission feedback after its tool result" {
     const alloc = std.testing.allocator;
     var app = try TestApp.init(alloc, "/workspace");
@@ -8268,7 +8356,7 @@ test "historical command replay prefers tagged frames and preserves exit outcome
     defer app.deinit();
     try configureTestPreferences(&app);
     try Runtime(TestApp).initializePersistence(&app, (&app).agent(), true);
-    try Runtime(TestApp).beginFreshPersistedSession(&app, (&app).agent());
+    try Runtime(TestApp).beginFresh(&app, (&app).agent(), .later, null);
     // A body is stored only while its session is on disk (D44).
     try app.agent().session_persistence.v2.?.beginTurn();
     const capability = try app.agent().session_persistence.v2.?.childCapability();
@@ -9065,7 +9153,7 @@ test "a resumed session's subagent host finds abandoned child work interrupted" 
     defer app.deinit();
     try configureTestPreferences(&app);
     try Runtime(TestApp).initializePersistence(&app, (&app).agent(), true);
-    try Runtime(TestApp).beginFreshPersistedSession(&app, (&app).agent());
+    try Runtime(TestApp).beginFresh(&app, (&app).agent(), .later, null);
     const v2 = app.agent().session_persistence.v2.?;
     // Child lines need the parent on disk.
     try v2.commitTurn(.{ .assistant = .{
@@ -9127,7 +9215,7 @@ test "interactive session resume uses the live transition and shared restore pat
     } }};
     const saved_session_id = try writeSessionFixture(&app, &history);
     defer alloc.free(saved_session_id);
-    try Runtime(TestApp).beginFreshPersistedSession(&app, (&app).agent());
+    try Runtime(TestApp).beginFresh(&app, (&app).agent(), .later, null);
     try Runtime(TestApp).openSessionPicker(&app, (&app).agent());
     try std.testing.expect(app.agent().session_persistence.session_picker.isLoading());
     try waitForSessionPickerLoad(&app);
@@ -9165,7 +9253,7 @@ test "interactive session resume preserves the current writer when the target is
     defer app.deinit();
     try configureTestPreferences(&app);
     try Runtime(TestApp).initializePersistence(&app, (&app).agent(), true);
-    try Runtime(TestApp).beginFreshPersistedSession(&app, (&app).agent());
+    try Runtime(TestApp).beginFresh(&app, (&app).agent(), .later, null);
     const current_id = try alloc.dupe(
         u8,
         app.agent().session_persistence.v2.?.id(),
@@ -9468,7 +9556,7 @@ test "cancelled command presentation survives a persisted session restart" {
         defer app.deinit();
         try configureTestPreferences(&app);
         try Runtime(TestApp).initializePersistence(&app, (&app).agent(), true);
-        try Runtime(TestApp).beginFreshPersistedSession(&app, (&app).agent());
+        try Runtime(TestApp).beginFresh(&app, (&app).agent(), .later, null);
         // The turn is open on disk while its command runs (D44).
         try app.agent().session_persistence.v2.?.beginTurn();
         const capability = Runtime(TestApp).childCapability((&app).agent()) orelse
@@ -9595,7 +9683,7 @@ fn expectCancelledHistoryKeepsAuthoritativeReplay() !void {
     defer app.deinit();
     try configureTestPreferences(&app);
     try Runtime(TestApp).initializePersistence(&app, (&app).agent(), true);
-    try Runtime(TestApp).beginFreshPersistedSession(&app, (&app).agent());
+    try Runtime(TestApp).beginFresh(&app, (&app).agent(), .later, null);
     // The turn is open on disk while its command runs (D44).
     try app.agent().session_persistence.v2.?.beginTurn();
     const capability = Runtime(TestApp).childCapability((&app).agent()) orelse
@@ -9856,7 +9944,7 @@ test "a command cancelled before it printed anything keeps its row across a pers
         defer app.deinit();
         try configureTestPreferences(&app);
         try Runtime(TestApp).initializePersistence(&app, (&app).agent(), true);
-        try Runtime(TestApp).beginFreshPersistedSession(&app, (&app).agent());
+        try Runtime(TestApp).beginFresh(&app, (&app).agent(), .later, null);
         try app.agent().session_persistence.v2.?.beginTurn();
         // The command printed nothing, so core keeps no replay, and its
         // terminal names no artifact.
@@ -9951,7 +10039,7 @@ test "cancelled command replay rejects unsafe handles without partial output" {
     defer app.deinit();
     try configureTestPreferences(&app);
     try Runtime(TestApp).initializePersistence(&app, (&app).agent(), true);
-    try Runtime(TestApp).beginFreshPersistedSession(&app, (&app).agent());
+    try Runtime(TestApp).beginFresh(&app, (&app).agent(), .later, null);
 
     const unsafe_handles = [_][]const u8{
         "../escape.bin",
@@ -9999,7 +10087,7 @@ test "authoritative cancelled replay survives history insertion failure" {
     defer app.deinit();
     try configureTestPreferences(&app);
     try Runtime(TestApp).initializePersistence(&app, (&app).agent(), true);
-    try Runtime(TestApp).beginFreshPersistedSession(&app, (&app).agent());
+    try Runtime(TestApp).beginFresh(&app, (&app).agent(), .later, null);
     // The turn is open on disk while its command runs (D44).
     try app.agent().session_persistence.v2.?.beginTurn();
     const capability = Runtime(TestApp).childCapability((&app).agent()).?;
@@ -10063,7 +10151,7 @@ test "context checkpoint persists before releasing summarized model memory" {
     defer app.deinit();
     try configureTestPreferences(&app);
     try Runtime(TestApp).initializePersistence(&app, (&app).agent(), true);
-    try Runtime(TestApp).beginFreshPersistedSession(&app, (&app).agent());
+    try Runtime(TestApp).beginFresh(&app, (&app).agent(), .later, null);
 
     const first = try session_runtime.makeAssistantTurn(alloc, "first", "one");
     defer session_runtime.freeHistoryTurn(alloc, first);
@@ -10100,7 +10188,7 @@ test "handle-free conversation result is externalized before live commit" {
     defer app.deinit();
     try configureTestPreferences(&app);
     try Runtime(TestApp).initializePersistence(&app, (&app).agent(), true);
-    try Runtime(TestApp).beginFreshPersistedSession(&app, (&app).agent());
+    try Runtime(TestApp).beginFresh(&app, (&app).agent(), .later, null);
     var calls = [_]types.ToolCall{.{
         .id = "missing-artifact",
         .name = "shell",
@@ -10323,7 +10411,7 @@ test "appendFinishedPrompt keeps the session alive when the turn cannot be saved
 
     try configureTestPreferences(&app);
     try Runtime(TestApp).initializePersistence(&app, (&app).agent(), true);
-    try Runtime(TestApp).beginFreshPersistedSession(&app, (&app).agent());
+    try Runtime(TestApp).beginFresh(&app, (&app).agent(), .later, null);
 
     // A finished turn whose file evidence carries an empty path: the
     // conversation validator rejects the write with InvalidConversationEvent.
@@ -10400,7 +10488,7 @@ test "the app commits each finished prompt with the capture token it carries, ev
     defer app.deinit();
     try configureTestPreferences(&app);
     try Runtime(TestApp).initializePersistence(&app, (&app).agent(), true);
-    try Runtime(TestApp).beginFreshPersistedSession(&app, (&app).agent());
+    try Runtime(TestApp).beginFresh(&app, (&app).agent(), .later, null);
     const persistence = &app.agent().session_persistence;
     const v2 = persistence.v2.?;
     const captures = &persistence.turn_capture;
@@ -10526,7 +10614,7 @@ test "appendHistoryTurn preserves canonical turns above the context limit" {
     try configureTestPreferences(&app);
     app.agent().session.max_history_turns = 2;
     try Runtime(TestApp).initializePersistence(&app, (&app).agent(), true);
-    try Runtime(TestApp).beginFreshPersistedSession(&app, (&app).agent());
+    try Runtime(TestApp).beginFresh(&app, (&app).agent(), .later, null);
 
     const users = [_][]const u8{ "one", "two", "three" };
     const assistants = [_][]const u8{ "first", "second", "third" };
@@ -10580,7 +10668,7 @@ test "session picker reopen keeps the loaded page visible while refreshing" {
     } }};
     const cached_session_id = try writeSessionFixture(&app, &history);
     defer alloc.free(cached_session_id);
-    try Runtime(TestApp).beginFreshPersistedSession(&app, (&app).agent());
+    try Runtime(TestApp).beginFresh(&app, (&app).agent(), .later, null);
 
     try Runtime(TestApp).openSessionPicker(&app, (&app).agent());
     try waitForSessionPickerLoad(&app);
@@ -10705,7 +10793,7 @@ test "session picker loads on demand and shares one catalog across workspace vie
     } }};
     const prewarmed_session_id = try writeSessionFixture(&app, &history);
     defer alloc.free(prewarmed_session_id);
-    try Runtime(TestApp).beginFreshPersistedSession(&app, (&app).agent());
+    try Runtime(TestApp).beginFresh(&app, (&app).agent(), .later, null);
 
     try std.testing.expect(!app.agent().session_persistence.session_picker_cache.ready);
     try std.testing.expect(app.agent().session_persistence.session_picker_load.task == null);
@@ -10743,7 +10831,7 @@ test "session picker reuses a held catalog after resize and workspace switch" {
         defer app.deinit();
         try configureTestPreferences(&app);
         try Runtime(TestApp).initializePersistence(&app, (&app).agent(), true);
-        try Runtime(TestApp).beginFreshPersistedSession(&app, (&app).agent());
+        try Runtime(TestApp).beginFresh(&app, (&app).agent(), .later, null);
         try app.input_runtime.edit_state.input.appendSlice(alloc, "saved");
 
         const loader = &app.agent().session_persistence.session_picker_load;
@@ -10816,7 +10904,7 @@ test "session picker keeps the visible scope when a stale catalog completes" {
     defer app.deinit();
     try configureTestPreferences(&app);
     try Runtime(TestApp).initializePersistence(&app, (&app).agent(), true);
-    try Runtime(TestApp).beginFreshPersistedSession(&app, (&app).agent());
+    try Runtime(TestApp).beginFresh(&app, (&app).agent(), .later, null);
 
     var all_catalog: session_catalog_cache.ActionableSessionCatalog = .{};
     defer all_catalog.deinit(catalog_alloc);
@@ -10906,7 +10994,7 @@ test "session picker current mode filters workspace and all mode includes every 
         alloc.free(try writeSessionFixture(&app_b, &history_b));
     }
 
-    try Runtime(TestApp).beginFreshPersistedSession(&app, (&app).agent());
+    try Runtime(TestApp).beginFresh(&app, (&app).agent(), .later, null);
     try Runtime(TestApp).openSessionPicker(&app, (&app).agent());
     try waitForSessionPickerLoad(&app);
     const picker = &app.agent().session_persistence.session_picker;
@@ -11080,7 +11168,7 @@ test "session picker discards a held stale request after cancellation and reopen
     } }};
     const reopened_session_id = try writeSessionFixture(&app, &history);
     defer alloc.free(reopened_session_id);
-    try Runtime(TestApp).beginFreshPersistedSession(&app, (&app).agent());
+    try Runtime(TestApp).beginFresh(&app, (&app).agent(), .later, null);
 
     var picker = &app.agent().session_persistence.session_picker;
     picker.active = true;
@@ -11150,7 +11238,7 @@ test "session picker source invalidation discards a finished catalog and pending
     defer app.deinit();
     try configureTestPreferences(&app);
     try Runtime(TestApp).initializePersistence(&app, (&app).agent(), true);
-    try Runtime(TestApp).beginFreshPersistedSession(&app, (&app).agent());
+    try Runtime(TestApp).beginFresh(&app, (&app).agent(), .later, null);
 
     const loader = &app.agent().session_persistence.session_picker_load;
     const active_id = app.agent().session_persistence.v2.?.id();
@@ -11184,7 +11272,7 @@ test "session picker reports worker failure when the shared stop flag is set" {
     defer app.deinit();
     try configureTestPreferences(&app);
     try Runtime(TestApp).initializePersistence(&app, (&app).agent(), true);
-    try Runtime(TestApp).beginFreshPersistedSession(&app, (&app).agent());
+    try Runtime(TestApp).beginFresh(&app, (&app).agent(), .later, null);
 
     const loader = &app.agent().session_persistence.session_picker_load;
     const generation = loader.allocateGeneration();
@@ -11341,7 +11429,7 @@ test "new session releases the old writer and replaces the subagent host" {
     defer app.deinit();
     try configureTestPreferences(&app);
     try Runtime(TestApp).initializePersistence(&app, (&app).agent(), true);
-    try Runtime(TestApp).beginFreshPersistedSession(&app, (&app).agent());
+    try Runtime(TestApp).beginFresh(&app, (&app).agent(), .later, null);
     Runtime(TestApp).enableSessionStores(&app, (&app).agent());
 
     const old_id = try alloc.dupe(
@@ -11349,7 +11437,7 @@ test "new session releases the old writer and replaces the subagent host" {
         app.agent().session_persistence.v2.?.id(),
     );
     defer alloc.free(old_id);
-    try Runtime(TestApp).beginFreshPersistedSession(&app, (&app).agent());
+    try Runtime(TestApp).beginFresh(&app, (&app).agent(), .later, null);
     Runtime(TestApp).enableSessionStores(&app, (&app).agent());
     try std.testing.expect(!std.mem.eql(
         u8,
@@ -11461,7 +11549,7 @@ test "renameActiveSession saves the title with the session" {
 
     try configureTestPreferences(&app);
     try Runtime(TestApp).initializePersistence(&app, (&app).agent(), true);
-    try Runtime(TestApp).beginFreshPersistedSession(&app, (&app).agent());
+    try Runtime(TestApp).beginFresh(&app, (&app).agent(), .later, null);
     Runtime(TestApp).enableSessionStores(&app, (&app).agent());
     const turn = try session_runtime.makeAssistantTurn(alloc, "question", "answer");
     defer session_runtime.freeHistoryTurn(alloc, turn);
@@ -11951,7 +12039,7 @@ test "a failed history delivery is kept for shutdown, and later turns still save
     defer app.deinit();
     try configureTestPreferences(&app);
     try Runtime(TestApp).initializePersistence(&app, (&app).agent(), true);
-    try Runtime(TestApp).beginFreshPersistedSession(&app, (&app).agent());
+    try Runtime(TestApp).beginFresh(&app, (&app).agent(), .later, null);
     Runtime(TestApp).recordShutdownFailure((&app).agent(), error.InputOutput);
     const turn = try session_runtime.makeAssistantTurn(alloc, "request", "answer");
     defer session_runtime.freeHistoryTurn(alloc, turn);

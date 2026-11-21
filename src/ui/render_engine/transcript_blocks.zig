@@ -69,10 +69,17 @@ pub const ToolDetailRecord = struct {
     command_output_replay: ?types.CommandOutputReplay = null,
     command_process_presentation: ?types.CommandProcessPresentation = null,
     outcome: ?types.ToolOutcomeKind = null,
+    /// Whether the call's arguments still stream in, before the call
+    /// itself starts.
+    streaming: bool = false,
     fallback_disposition: ?ToolFallbackDisposition = null,
     lifecycle_id: ?types.ToolLifecycleId = null,
     presentation_group_id: ?types.ToolPresentationGroupId = null,
     command_output_entry_id: ?u32 = null,
+    /// Whether the row shows a subagent's report or message to main
+    /// (src/core/subagent/reports.zig, Row), not a call main made. Its call
+    /// has no id, so only this mark tells the two apart.
+    subagent_report: bool = false,
 
     pub fn isCapturedCommand(self: ToolDetailRecord) bool {
         // Hand-built details and restored records may predate the explicit
@@ -1009,7 +1016,7 @@ pub fn renderTableForTranscript(
 
 /// A wrapped column keeps at least this many cells, or its natural width when
 /// narrower, so its text stays legible and every two-cell rune still fits.
-const table_min_column_width: usize = 3;
+pub const table_min_column_width: usize = 3;
 
 const TableColumnMeasure = struct {
     /// Width of the widest cell laid out on one line.

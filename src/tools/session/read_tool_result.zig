@@ -57,31 +57,37 @@ pub fn decode(ctx: tool_dispatch.DispatchContext, args_json: []const u8) tool_di
     }
     const handle = decoder.requiredString(args, "handle") catch |err| return .{ .failure = try decoder.takeFailure(err) };
 
-    const input = try ctx.allocator.create(Input);
-    errdefer ctx.allocator.destroy(input);
-    input.* = .{ .handle = try ctx.allocator.dupe(u8, handle) };
-    errdefer input.deinit(ctx.allocator);
-
+    // Check the selector fields before allocating the input, so a rejected
+    // call leaves nothing to free.
+    var start_byte: ?usize = null;
     if (args.get("start_byte")) |value| {
-        const start_byte = parsePositiveInteger(value) orelse {
+        const parsed_start = parsePositiveInteger(value) orelse {
             return .{ .failure = try ctx.allocator.dupe(u8, "read_tool_result field \"start_byte\" must be a positive integer") };
         };
-        input.selector.range.start_byte = @intCast(start_byte);
+        start_byte = @intCast(parsed_start);
     }
+    var byte_count: ?usize = null;
     if (args.get("byte_count")) |value| {
-        const byte_count = parsePositiveInteger(value) orelse {
+        const parsed_count = parsePositiveInteger(value) orelse {
             return .{ .failure = try ctx.allocator.dupe(u8, "read_tool_result field \"byte_count\" must be a positive integer") };
         };
-        input.selector.range.byte_count = @intCast(@min(byte_count, result_store.read_max_bytes));
+        byte_count = @intCast(@min(parsed_count, result_store.read_max_bytes));
     }
+    var query: ?[]const u8 = null;
     if (args.get("query")) |value| {
         if (value != .string) {
             return .{ .failure = try ctx.allocator.dupe(u8, "read_tool_result field \"query\" must be a string") };
         }
-        if (value.string.len > 0) {
-            input.selector = .{ .query = try ctx.allocator.dupe(u8, value.string) };
-        }
+        if (value.string.len > 0) query = value.string;
     }
+
+    const input = try ctx.allocator.create(Input);
+    errdefer ctx.allocator.destroy(input);
+    input.* = .{ .handle = try ctx.allocator.dupe(u8, handle) };
+    errdefer input.deinit(ctx.allocator);
+    if (start_byte) |value| input.selector.range.start_byte = value;
+    if (byte_count) |value| input.selector.range.byte_count = value;
+    if (query) |value| input.selector = .{ .query = try ctx.allocator.dupe(u8, value) };
 
     return .{ .input = .{ .ptr = input, .deinit_fn = inputDeinit } };
 }
@@ -297,6 +303,28 @@ test "read_tool_result decodes range and query inputs" {
         .query => |query| try std.testing.expectEqualStrings("needle", query),
         .range => return error.TestUnexpectedDecodeFailure,
         .search => return error.TestUnexpectedDecodeFailure,
+    }
+}
+
+test "read_tool_result rejects bad range and query fields without leaking" {
+    const alloc = std.testing.allocator;
+    const cases = [_]struct { args: []const u8, message: []const u8 }{
+        .{ .args = "{\"handle\":\"h.txt\",\"start_byte\":0}", .message = "read_tool_result field \"start_byte\" must be a positive integer" },
+        .{ .args = "{\"handle\":\"h.txt\",\"byte_count\":-1}", .message = "read_tool_result field \"byte_count\" must be a positive integer" },
+        .{ .args = "{\"handle\":\"h.txt\",\"query\":7}", .message = "read_tool_result field \"query\" must be a string" },
+    };
+    for (cases) |case| {
+        const decoded = try decode(.{ .allocator = alloc }, case.args);
+        switch (decoded) {
+            .input => |input| {
+                input.deinit(alloc);
+                return error.TestUnexpectedResult;
+            },
+            .failure => |failure| {
+                defer alloc.free(failure);
+                try std.testing.expectEqualStrings(case.message, failure);
+            },
+        }
     }
 }
 

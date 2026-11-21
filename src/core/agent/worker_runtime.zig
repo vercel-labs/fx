@@ -1805,14 +1805,13 @@ pub const WorkerRuntime = struct {
             if (prompt.delivery.activeTurnId() != turn_id) continue;
             messages[copied] = .{ .text = try result_alloc.dupe(u8, prompt.prompt), .author = prompt.author };
             copied += 1;
-            if (prompt.steering_receipt == null) {
-                const text = try alloc.dupe(u8, prompt.prompt);
-                events[event_count] = if (prompt.author == .child)
-                    .{ .append_agent_message = text }
-                else
-                    .{ .append_user_feedback = text };
-                event_count += 1;
-            }
+            // Every steer the turn takes gets its card, a parent's too, so the screen shows what the model read.
+            const text = try alloc.dupe(u8, prompt.prompt);
+            events[event_count] = if (prompt.author == .child)
+                .{ .append_agent_message = text }
+            else
+                .{ .append_user_feedback = text };
+            event_count += 1;
         }
         try self.worker_events.ensureUnusedCapacity(alloc, event_count);
         for (events[0..event_count]) |event| self.worker_events.appendAssumeCapacity(event);
@@ -5352,11 +5351,32 @@ test "direct steering applies at the boundary without cancellation and seals bef
     const boundary = try runtime.takeSteeringBoundaryInto(alloc, output.allocator(), 41, .finalizing);
     try std.testing.expectEqualStrings("review feedback", boundary.continue_turn[0].text);
     try std.testing.expectEqual(SteeringDelivery.applied, receipt.state.load(.seq_cst));
-    try std.testing.expectEqual(@as(usize, 0), runtime.worker_events.items.len);
+    try std.testing.expectEqual(@as(usize, 1), runtime.worker_events.items.len);
+    try std.testing.expectEqualStrings("review feedback", runtime.worker_events.items[0].append_user_feedback);
     try std.testing.expect((try runtime.takeSteeringBoundary(alloc, 41, .finalizing)) == .none);
     const late = try makePrompt(alloc, "too late", "model");
     defer freeQueuedPrompt(alloc, late);
     try std.testing.expect(!try runtime.admitActiveSteering(alloc, late));
+    try std.testing.expectEqual(@as(usize, 0), runtime.queuedPromptCount());
+}
+
+test "a parent's steer that a boundary takes shows as feedback with its raw text" {
+    const alloc = std.testing.allocator;
+    var receipt = SteeringReceipt{};
+    var runtime = WorkerRuntime{};
+    defer runtime.deinit(alloc);
+    try std.testing.expect(runtime.beginDirectProcessing(41));
+    var prompt = try makePrompt(alloc, "parent steer", "model");
+    prompt.author = .parent;
+    prompt.steering_receipt = &receipt;
+    try std.testing.expect(try runtime.admitActiveSteering(alloc, prompt));
+    var output = std.heap.ArenaAllocator.init(alloc);
+    defer output.deinit();
+    const boundary = try runtime.takeSteeringBoundaryInto(alloc, output.allocator(), 41, .model);
+    try std.testing.expectEqualStrings("parent steer", boundary.continue_turn[0].text);
+    try std.testing.expectEqual(SteeringDelivery.applied, receipt.state.load(.seq_cst));
+    try std.testing.expectEqual(@as(usize, 1), runtime.worker_events.items.len);
+    try std.testing.expectEqualStrings("parent steer", runtime.worker_events.items[0].append_user_feedback);
     try std.testing.expectEqual(@as(usize, 0), runtime.queuedPromptCount());
 }
 

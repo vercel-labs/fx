@@ -1110,8 +1110,18 @@ fn checkNestedCall(ctx: Context, arena: Allocator, call: ToolCall, mcp: ?tool_mc
     };
     const outcome = try tool_admission.requestPermissionOutcome(check.admissionInput(), arena, call, ctx.permission_mode, ctx.session_grants);
     if (!outcome.decision.isDenied() and outcome.tool_failure == null) return .{ .allow = check };
-    return .{ .deny = outcome.tool_failure orelse outcome.feedback orelse
-        try arena.print("Permission to run {f} was not granted ({s}).", .{ text_utils.terminalSafe(call.name), @tagName(outcome.decision) }) };
+    if (outcome.tool_failure orelse outcome.feedback) |message| return .{ .deny = message };
+    // Say why, as a direct call would: a held review's reason and advice tell
+    // the calling command what to change, such as an action too large to
+    // review in full.
+    const reason = outcome.denial_reason orelse outcome.decision.denialReason() orelse .user_denied;
+    return .{ .deny = try tool_result_errors.permissionDenialText(
+        arena,
+        call.name,
+        reason,
+        if (outcome.auto_review_result) |result| result.rationale else null,
+        outcome.auto_review_failure,
+    ) };
 }
 
 /// Lends this tool call's permission check and execution to `toolbox {run}`

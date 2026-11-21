@@ -146,6 +146,43 @@ export async function waitForRootTurnCommitted(home: string, after = 0, timeoutM
   throw new Error(`no root session committed more than ${after} turns`);
 }
 
+/// Holds a fake child's answer until the parent has saved the turn that sent
+/// its message. A report that arrives while that turn still runs joins it
+/// (`postMail` in `src/core/agent/worker_runtime.zig`), and the receipt would
+/// get no request of its own, so a test's request counts and its reading of
+/// the report would depend on which side is faster.
+export function holdChildAnswer(home: string) {
+  let committedBefore = 0;
+  // A wait that fails is kept and answered with an error response, so fx sees
+  // a failed request and `runFx` ends it normally; the test throws the kept
+  // error after the run. Thrown out of the gateway's handler, it would fail
+  // the test at once and leave fx running.
+  let failed: unknown;
+  return {
+    /// Before the message that starts a child: it waits for a turn past the
+    /// ones saved now.
+    mark() {
+      committedBefore = committedRootTurns(home);
+    },
+    /// Undefined once the parent has saved its turn; an error response when it never does.
+    async wait(): Promise<Response | undefined> {
+      if (failed === undefined) {
+        try {
+          await waitForRootTurnCommitted(home, committedBefore);
+          return undefined;
+        } catch (error) {
+          failed = error;
+        }
+      }
+      return new Response("the parent's turn was not saved", { status: 500 });
+    },
+    /// After the run: throws a wait that failed.
+    check() {
+      if (failed !== undefined) throw failed;
+    },
+  };
+}
+
 /// The parent's lines about its children, with fx's data parsed.
 export function childLines(home: string, id: string): any[] {
   return (readLog(home, id) as any[])
