@@ -217,9 +217,10 @@ fn startLocked(io: std.Io) !void {
 /// leaves the loop to its safety poll, so it is only logged.
 fn wakeAcceptLoop(write_end: posix.fd_t) void {
     const byte = [1]u8{0};
-    if (std.c.write(write_end, &byte, 1) != 1) {
-        debug_trace.logf("mcp-call", "bridge wake not written; the accept loop ends at its safety poll", .{});
-    }
+    const rc = std.c.write(write_end, &byte, 1);
+    if (rc == 1) return;
+    const reason = if (rc < 0) @tagName(std.posix.errno(rc)) else "short write";
+    debug_trace.logf("mcp-call", "bridge wake not written err={s}; the accept loop ends at its safety poll", .{reason});
 }
 
 fn closeWake(wake: [2]posix.fd_t) void {
