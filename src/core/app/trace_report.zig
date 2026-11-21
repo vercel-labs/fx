@@ -68,7 +68,7 @@
 //!   `detail`}, for the newest 3 failures.
 //! - `last_shutdown`: `status` (`recorded`, `none`, or `unreadable`),
 //!   `total_ms`, `recorded_at`, and `stages`, a list of {`name`, `step_ms`}.
-//! - `last_crash`: `status` (`recorded`, `none`, or `unreadable`), the crash
+//! - `last_crash`: `status` (`recorded`, `none`, `too_large`, `unreadable`, `stale`, `future`, or `undated`), the crash
 //!   report that `writeCrashReport` saved. `none` also covers a file that
 //!   cannot be read. When `recorded`: `error` and `message` (from the
 //!   `fatal_error` record), `at` and `at_ms`, `fx_version` and `git_commit`
@@ -1057,7 +1057,7 @@ fn writeLastShutdown(r: *Records, contents: ?[]const u8) !void {
 }
 
 /// The most bytes of the saved crash report that `readLastCrashReport` reads.
-/// A longer file reads as none.
+/// A longer file reads as `too_large`.
 const last_crash_max_bytes = 16 * 1024 * 1024;
 
 /// The crash report that `writeCrashReport` saved, read for the /trace report.
@@ -1076,12 +1076,13 @@ fn readLastCrashReportAt(alloc: std.mem.Allocator, path: []const u8) io_mod.File
 }
 
 /// Writes the last-crash section for a read of the saved report. A report that
-/// cannot be read as a regular file is `unreadable`; a missing or too large one
-/// is `none`.
+/// cannot be read as a regular file is `unreadable`; one over the cap is
+/// `too_large`; a missing one is `none`.
 fn writeLastCrashRead(r: *Records, read: io_mod.FileRead, now_ms: i64) !void {
     switch (read) {
         .bytes => |bytes| try writeLastCrash(r, bytes, now_ms),
-        .missing, .too_large => try writeLastCrash(r, null, now_ms),
+        .missing => try writeLastCrash(r, null, now_ms),
+        .too_large => try writeLastCrashStatus(r, "too_large"),
         .unreadable => try writeLastCrashStatus(r, "unreadable"),
     }
 }
@@ -1113,7 +1114,7 @@ fn writeLastCrash(r: *Records, contents: ?[]const u8, now_ms: i64) !void {
     }
     const head = recordOfType(header, "fx_trace") orelse return writeLastCrashStatus(r, "unreadable");
     const crash = recordOfType(fatal, "fatal_error") orelse return writeLastCrashStatus(r, "unreadable");
-    const crash_at_ms = crashTimeMs(head, crash);
+    const crash_at_ms = crashTimeMs(crash);
     const known_at_ms = knownTime(crash_at_ms);
     const check = checkCrashReport(crash_at_ms, now_ms);
     if (check != .current) {
@@ -1175,13 +1176,12 @@ fn checkCrashReport(crash_at_ms: ?i64, now_ms: i64) CrashReportCheck {
     return .current;
 }
 
-/// The time of a saved crash: the `fatal_error` line's `at_ms` when that key is
-/// present, else the header's `written_at_ms`. Null when the value is not a whole
-/// number.
-fn crashTimeMs(head: std.json.ObjectMap, crash: std.json.ObjectMap) ?i64 {
-    if (crash.get("at_ms")) |value| return if (value == .integer) value.integer else null;
-    const written = head.get("written_at_ms") orelse return null;
-    return if (written == .integer) written.integer else null;
+/// The time of a saved crash: the `fatal_error` line's `at_ms`. Null when the key
+/// is missing or its value is not a whole number. Both writers set `at` and
+/// `at_ms` together, so a report without `at_ms` has no time.
+fn crashTimeMs(crash: std.json.ObjectMap) ?i64 {
+    const value = crash.get("at_ms") orelse return null;
+    return if (value == .integer) value.integer else null;
 }
 
 /// `ms` when `formatUtc` can write it, or null when it is unknown or outside
@@ -2639,9 +2639,10 @@ fn stripAnsiEscapes(alloc: std.mem.Allocator, input: []const u8) ![]u8 {
 }
 
 /// Writes the end of the debug trace log at `path`; nothing when it cannot be
-/// read or is empty.
+/// read or is empty. The open refuses a FIFO before any read, so `/trace` never
+/// waits for a writer that is not there.
 fn writeTraceLog(r: *Records, path: []const u8) !void {
-    var file = std.Io.Dir.openFileAbsolute(io_mod.getIo(), path, .{}) catch return;
+    var file = io_mod.openExistingReadOnlyRegularFile(std.Io.Dir.cwd(), path, .follow) catch return;
     defer file.close(io_mod.getIo());
     const stat = file.stat(io_mod.getIo()) catch return;
     const total_size: usize = @intCast(stat.size);
@@ -3235,15 +3236,62 @@ test "trace last crash record window is 24 hours back and 5 minutes ahead" {
     }
 }
 
-test "trace last crash record reads the header time when the crash line has none" {
+test "trace last crash record is undated when the crash line has no at_ms" {
     const fatal = "{\"type\":\"fatal_error\",\"error\":\"panic\",\"message\":\"boom\"}\n";
     const w = try TestWriter.create();
     defer w.destroy();
     try writeLastCrash(&w.records, crash_test_header ++ fatal, crash_test_now_ms);
     var trace = try w.trace();
     defer trace.deinit();
-    try std.testing.expectEqualStrings("recorded", try testString(try trace.one("last_crash"), "status"));
-    try std.testing.expectEqual(@as(?i64, 1_700_000_000_000), w.records.included_crash.?.at_ms);
+    try std.testing.expectEqualStrings("undated", try testString(try trace.one("last_crash"), "status"));
+    try std.testing.expect(w.records.included_crash == null);
+}
+
+test "trace last crash read reports a file over the cap as too_large" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, ".");
+    defer std.testing.allocator.free(dir);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const big = try std.testing.allocator.alloc(u8, last_crash_max_bytes + 1);
+    defer std.testing.allocator.free(big);
+    @memset(big, 'x');
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "big-crash.jsonl", .data = big });
+    const path = try std.Io.Dir.path.join(a, &.{ dir, "big-crash.jsonl" });
+    const w = try TestWriter.create();
+    defer w.destroy();
+    try writeLastCrashRead(&w.records, readLastCrashReportAt(a, path), crash_test_now_ms);
+    var trace = try w.trace();
+    defer trace.deinit();
+    try std.testing.expectEqualStrings("too_large", try testString(try trace.one("last_crash"), "status"));
+    try std.testing.expectEqual(@as(usize, 0), trace.count("last_crash_record"));
+}
+
+test "trace log read refuses a FIFO at its path and writes no trace log" {
+    const fifo_c = struct {
+        extern "c" fn mkfifo(path: [*:0]const u8, mode: std.c.mode_t) c_int;
+    };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, ".");
+    defer std.testing.allocator.free(dir);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const fifo = try std.Io.Dir.path.join(a, &.{ dir, "trace.log" });
+    const fifo_z = try a.allocSentinel(u8, fifo.len, 0);
+    @memcpy(fifo_z, fifo);
+    try std.testing.expectEqual(@as(c_int, 0), fifo_c.mkfifo(fifo_z, 0o600));
+    const w = try TestWriter.create();
+    defer w.destroy();
+    try writeTraceLog(&w.records, fifo);
+    var trace = try w.trace();
+    defer trace.deinit();
+    try std.testing.expectEqual(@as(usize, 0), trace.count("trace_log"));
 }
 
 test "trace times leave out unknown values" {

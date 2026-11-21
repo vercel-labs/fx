@@ -383,7 +383,7 @@ test "crash panic saves a private file over a leftover file of another mode" {
 
     prepare(home);
     // A file that fx did not create, at the temporary path.
-    const leftover = try std.fmt.allocPrint(std.testing.allocator, ".fx/diagnostics/last-crash.jsonl.{d}.tmp", .{std.c.getpid()});
+    const leftover = try std.testing.allocator.print(".fx/diagnostics/last-crash.jsonl.{d}.tmp", .{std.c.getpid()});
     defer std.testing.allocator.free(leftover);
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = leftover, .data = "stale\n" });
     // chmod ignores the umask, so the leftover file is 0644 even under a strict umask.

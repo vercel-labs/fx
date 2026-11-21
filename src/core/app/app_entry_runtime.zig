@@ -355,8 +355,16 @@ fn runInteractiveWithDeps(comptime App: type, comptime cooperative: bool, app: *
         if (@hasDecl(App, "startAutoUpgrade")) app.startAutoUpgrade();
         if (@hasDecl(App, "startFileIndex")) app.startFileIndex();
         startWorkerThread(App, app, deps) catch |err| {
+            // Saved before the terminal is released, as the run error path below
+            // does. A hang-up leaves no one to tell, so it saves nothing.
+            const crash_report_path: ?[]u8 = if (comptime @hasDecl(App, "writeCrashReport"))
+                (if (isTerminalHangUp(err)) null else app.writeCrashReport(err))
+            else
+                null;
+            defer if (crash_report_path) |path| app.alloc.free(path);
             app.releaseTerminal();
             reportUnexpectedInteractiveError(deps, err);
+            if (crash_report_path) |path| reportCrashReportPath(deps, path);
             return err;
         };
         if (@hasDecl(App, "launchStartupInstances")) app.launchStartupInstances();
@@ -367,7 +375,7 @@ fn runInteractiveWithDeps(comptime App: type, comptime cooperative: bool, app: *
     app.run() catch |err| {
         // The terminal hung up: its input closed, or a frame write failed
         // because it hung up (`error.TerminalHungUp` from the frame sink).
-        const hung_up = err == error.TerminalInputClosed or err == error.TerminalHungUp;
+        const hung_up = isTerminalHangUp(err);
         if (err == error.TerminalHungUp) {
             debug_trace.logf("core", "interactive run ended: the terminal hung up during a frame write", .{});
         }
@@ -615,6 +623,11 @@ fn reportUnexpectedInteractiveError(deps: RunDeps, err: anyerror) void {
     var buffer: [1024]u8 = undefined;
     const message = deps.format_unexpected_error(&buffer, err) catch return;
     deps.write_stderr(deps.stderr_ctx, message) catch {};
+}
+
+/// The error a closed terminal leaves: nobody is left to read a crash report.
+fn isTerminalHangUp(err: anyerror) bool {
+    return err == error.TerminalInputClosed or err == error.TerminalHungUp;
 }
 
 /// Says where the crash report was saved. A path too long for the buffer is
@@ -1372,6 +1385,36 @@ test "app entry releases terminal before reporting worker start errors" {
     try std.testing.expectError(error.TestWorkerStartFailed, runWithDeps(TestApp, alloc, &.{}, testConfig(), capture.deps()));
     try std.testing.expectEqualStrings("fx: test worker start failed\n", capture.stderr.written());
     try std.testing.expectEqual(@as(usize, 1), capture.stderr_calls);
+    try expectEvents(&.{ "init:none", "rebind-after-init", "auto-upgrade", "file-index", "worker-thread", "terminal-release", "stderr-attempt", "deinit" });
+}
+
+test "app entry saves a crash report when a worker thread fails to start, before it releases the terminal" {
+    const alloc = std.testing.allocator;
+    var capture = TestCapture.init(.{ .interactive = .{} });
+    defer capture.deinit();
+    capture.worker_error = error.TestWorkerStartFailed;
+    capture.record_stderr_event = true;
+    capture.crash_report_path = "/Users/example/.fx/diagnostics/last-crash.jsonl";
+
+    try std.testing.expectError(error.TestWorkerStartFailed, runWithDeps(TestApp, alloc, &.{}, testConfig(), capture.deps()));
+    try std.testing.expectEqualStrings(
+        "fx: test worker start failed\nfx: crash report saved to /Users/example/.fx/diagnostics/last-crash.jsonl\n",
+        capture.stderr.written(),
+    );
+    try std.testing.expectEqual(@as(usize, 2), capture.stderr_calls);
+    try expectEvents(&.{ "init:none", "rebind-after-init", "auto-upgrade", "file-index", "worker-thread", "crash-report", "terminal-release", "stderr-attempt", "stderr-attempt", "deinit" });
+}
+
+test "app entry does not save a crash report when a worker start hits a hang-up" {
+    const alloc = std.testing.allocator;
+    var capture = TestCapture.init(.{ .interactive = .{} });
+    defer capture.deinit();
+    capture.worker_error = error.TerminalInputClosed;
+    capture.record_stderr_event = true;
+    capture.crash_report_path = "/Users/example/.fx/diagnostics/last-crash.jsonl";
+
+    try std.testing.expectError(error.TerminalInputClosed, runWithDeps(TestApp, alloc, &.{}, testConfig(), capture.deps()));
+    try std.testing.expect(std.mem.find(u8, capture.stderr.written(), "crash report") == null);
     try expectEvents(&.{ "init:none", "rebind-after-init", "auto-upgrade", "file-index", "worker-thread", "terminal-release", "stderr-attempt", "deinit" });
 }
 
