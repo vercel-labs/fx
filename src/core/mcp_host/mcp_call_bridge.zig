@@ -39,6 +39,9 @@ const gpa = std.heap.c_allocator;
 /// Connections served at once; more are closed unread.
 const max_connections = 64;
 const poll_ms = 100;
+/// The accept loop's wait when no wake byte comes. A stop always writes one,
+/// so this bounds only a wake that is lost.
+const accept_safety_poll_ms = 1000;
 /// How long a client may take to send its request line.
 const request_deadline_ms: i64 = 10_000;
 
@@ -110,6 +113,11 @@ const Bridge = struct {
     live: std.ArrayList(*Live) = .empty,
     next_owner: u32 = 1,
     connections: u32 = 0,
+    /// The pipe that ends the accept loop's wait: read end, then write end.
+    /// It lives as long as the listener, and `closeListenerLocked` closes it.
+    wake: ?[2]posix.fd_t = null,
+    /// Passes of the accept loop's wait in this run. A test waits for one.
+    accept_waits: u32 = 0,
 };
 
 var bridge: Bridge = .{};
@@ -254,15 +262,16 @@ fn finishLocked(io: std.Io, registration: *Registration) void {
         applyLocked(mcp_call.step(bridge.state, .stopped));
         bridge.phase = .stopping;
         bridge.stop.store(true, .release);
+        if (bridge.wake) |wake| wakeAcceptLoop(wake[1]);
         accept_task = bridge.accept_task;
         bridge.accept_task = null;
     }
     bridge.mutex.unlock(io);
     gpa.destroy(registration);
     if (!last) return;
-    // The accept loop sees `stop` within a poll; after it ends nothing adds
-    // a connection. No owner is left, so the connections still open are
-    // unadmitted ones; cancelling ends their wait for a request line.
+    // The wake byte ends the accept loop's wait at once. No owner is left, so
+    // the connections still open are unadmitted ones; cancelling ends their
+    // wait for a request line.
     if (accept_task) |*task| task.await(io);
     bridge.connection_tasks.cancel(io);
     bridge.mutex.lockUncancelable(io);
@@ -301,10 +310,16 @@ fn startLocked(io: std.Io) !void {
     const address = try std.Io.net.UnixAddress.init(socket_path);
     var listener = try address.listen(io, .{});
     errdefer listener.deinit(io);
+    // Close-on-exec, so the commands fx starts do not inherit the wake pipe.
+    const wake = try std.Io.Threaded.pipe2(.{ .CLOEXEC = true });
+    errdefer closeWake(wake);
     bridge.listener = listener;
+    bridge.wake = wake;
+    bridge.accept_waits = 0;
     bridge.stop.store(false, .release);
     bridge.accept_task = std.Io.concurrent(io, acceptLoop, .{}) catch |err| {
         bridge.listener = null;
+        bridge.wake = null;
         std.Io.Dir.cwd().deleteFile(io, socket_path) catch {};
         return err;
     };
@@ -318,9 +333,26 @@ fn startLocked(io: std.Io) !void {
     debug_trace.logf("mcp-call", "bridge listening socket={s}", .{socket_path});
 }
 
+/// Writes the byte that ends the accept loop's wait. Each run has its own pipe,
+/// so the one byte never fills it and the write does not block. A failed write
+/// leaves the loop to its safety poll, so it is only logged.
+fn wakeAcceptLoop(write_end: posix.fd_t) void {
+    const byte = [1]u8{0};
+    if (std.c.write(write_end, &byte, 1) != 1) {
+        debug_trace.logf("mcp-call", "bridge wake not written; the accept loop ends at its safety poll", .{});
+    }
+}
+
+fn closeWake(wake: [2]posix.fd_t) void {
+    _ = std.c.close(wake[0]);
+    _ = std.c.close(wake[1]);
+}
+
 fn closeListenerLocked(io: std.Io) void {
     if (bridge.listener) |*listener| listener.deinit(io);
     bridge.listener = null;
+    if (bridge.wake) |wake| closeWake(wake);
+    bridge.wake = null;
     if (bridge.socket_path) |path| {
         std.Io.Dir.cwd().deleteFile(io, path) catch |err| debug_trace.logf("mcp-call", "bridge socket not removed err={s}", .{@errorName(err)});
         gpa.free(path);
@@ -367,12 +399,21 @@ fn step(event: mcp_call.Event) mcp_call.Output {
 fn acceptLoop() void {
     const io = io_mod.getIo();
     const listener = &bridge.listener.?;
+    const wake_read = bridge.wake.?[0];
     while (!bridge.stop.load(.acquire)) {
-        var fds = [_]posix.pollfd{.{ .fd = listener.socket.handle, .events = posix.POLL.IN, .revents = 0 }};
-        const ready = posix.poll(&fds, poll_ms) catch |err| {
+        bridge.mutex.lockUncancelable(io);
+        bridge.accept_waits += 1;
+        bridge.changed.broadcast(io);
+        bridge.mutex.unlock(io);
+        var fds = [_]posix.pollfd{
+            .{ .fd = listener.socket.handle, .events = posix.POLL.IN, .revents = 0 },
+            .{ .fd = wake_read, .events = posix.POLL.IN, .revents = 0 },
+        };
+        const ready = posix.poll(&fds, accept_safety_poll_ms) catch |err| {
             debug_trace.logf("mcp-call", "bridge accept loop ended err={s}", .{@errorName(err)});
             return;
         };
+        if (fds[1].revents != 0) return;
         if (ready == 0) continue;
         const stream = listener.accept(io) catch |err| {
             debug_trace.logf("mcp-call", "bridge accept failed err={s}", .{@errorName(err)});
@@ -962,6 +1003,23 @@ test "the bridge removes its socket after the last shell call" {
     try std.Io.Dir.cwd().access(io, socket_path, .{});
     unregister(second);
     try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(io, socket_path, .{}));
+}
+
+test "the bridge ends its accept loop when it stops, not at the loop's safety poll" {
+    if (!supported) return error.SkipZigTest;
+    const io = std.testing.io;
+    var tool: FakeTool = .{};
+    const registration = try register(tool.capability());
+    // Wait until the loop has begun its wait, so the stop below is the one
+    // that would sit out a full poll. The loop counts each pass and broadcasts.
+    bridge.mutex.lockUncancelable(io);
+    while (bridge.accept_waits == 0) bridge.changed.waitUncancelable(io, &bridge.mutex);
+    bridge.mutex.unlock(io);
+    const started = io_mod.milliTimestamp();
+    unregister(registration);
+    // Without the wake byte this stop waits out accept_safety_poll_ms (1000 ms),
+    // so the bound is half of it.
+    try std.testing.expect(io_mod.milliTimestamp() - started < 500);
 }
 
 test "the bridge stops at once, and ends a silent client's connection with it" {
