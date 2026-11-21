@@ -7237,6 +7237,91 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
   );
 
   test(
+    "reads of more of two saved files share one row that names each file",
+    async () => {
+      root = realpathSync(mkdtempSync(join(tmpdir(), "fx-read-more-rows-")));
+      const home = join(root, "home");
+      const workspace = join(root, "workspace");
+      const stderrPath = join(root, "stderr.log");
+      mkdirSync(join(home, ".fx"), { recursive: true });
+      writeFileSync(join(home, ".fx", "settings.json"), "{}");
+      // Long absolute paths, which the row once cut before the file names.
+      const folder = join(workspace, "notes", "command-line-shape-reference-material", "skills", "fx-cli-shape");
+      mkdirSync(join(folder, "references"), { recursive: true });
+      const skill = join(folder, "SKILL.md");
+      const rules = join(folder, "references", "rules.md");
+      // Large enough that fx saves each read behind a handle.
+      const text = (tag: string) => `${Array.from({ length: 3000 }, (_, index) => `${tag}_LINE_${String(index).padStart(5, "0")} of the reference text`).join("\n")}\n`;
+      writeFileSync(skill, text("SKILL"));
+      writeFileSync(rules, text("RULES"));
+      const finalText = "READ_MORE_ROWS_FINISHED";
+
+      const readGateway = startDynamicFakeGateway((body) => {
+        const request = JSON.parse(body) as { prompt: Array<{ role: string; content: unknown }> };
+        const parts = request.prompt.flatMap((message) =>
+          Array.isArray(message.content) ? message.content : [],
+        ) as Array<Record<string, unknown>>;
+        const output = (callId: string): string | null => {
+          const part = parts.find((candidate) => candidate.type === "tool-result" && candidate.toolCallId === callId);
+          return part ? contentText(part.output) : null;
+        };
+        if (output("more_skill") !== null && output("more_rules") !== null) return fakeGatewayFinalText(finalText);
+        const skillRead = output("read_skill");
+        const rulesRead = output("read_rules");
+        if (skillRead === null || rulesRead === null) {
+          return fakeGatewaySse([
+            { type: "tool-call", toolCallId: "read_skill", toolName: "read_file", input: { path: skill } },
+            { type: "tool-call", toolCallId: "read_rules", toolName: "read_file", input: { path: rules } },
+            { type: "finish", finishReason: { unified: "tool-calls", raw: "tool-calls" } },
+          ]);
+        }
+        const handleOf = (result: string) => result.match(/result-[A-Za-z0-9_.-]+?\.txt/)?.[0] ?? null;
+        const skillHandle = handleOf(skillRead);
+        const rulesHandle = handleOf(rulesRead);
+        if (!skillHandle || !rulesHandle) return new Response("missing saved read handle", { status: 500 });
+        return fakeGatewaySse([
+          { type: "tool-call", toolCallId: "more_skill", toolName: "read_tool_result", input: { request: { handle: skillHandle, start_byte: 4096, byte_count: 1024 } } },
+          { type: "tool-call", toolCallId: "more_rules", toolName: "read_tool_result", input: { request: { handle: rulesHandle, start_byte: 4096, byte_count: 1024 } } },
+          { type: "finish", finishReason: { unified: "tool-calls", raw: "tool-calls" } },
+        ]);
+      }, { classifierDecision: "clear" });
+      gateway = readGateway;
+      session = await TmuxSession.create({
+        cwd: workspace,
+        width: 110,
+        height: 35,
+        stderrPath,
+        env: {
+          HOME: home,
+          AI_GATEWAY_API_KEY: "fake-read-more-rows-key",
+          VERCEL_OIDC_TOKEN: undefined,
+          FX_DISABLE_KEYCHAIN: "1",
+          FX_SOUND: "0",
+          FX_AUTO_UPGRADE: "0",
+          FX_PERMISSION_MODE: "auto",
+          FX_GATEWAY_BASE_URL: readGateway.baseUrl,
+          FX_GATEWAY_CHAT_URL: readGateway.chatUrl,
+          FX_TEST_GATEWAY_CHAT_URL: readGateway.chatUrl,
+          FX_MODEL: MODEL,
+        },
+      });
+
+      await session.waitForComposer(TIMEOUT);
+      await session.sendText("Read both reference files, then read more of each.");
+      await session.waitForText(finalText, TIMEOUT);
+      const lines = (await session.captureFullScrollback()).split("\n").map((line) => line.trim());
+
+      // One row names both files by name; it neither repeats the full path,
+      // cut at the same place on both rows, nor says the group searched.
+      expect(lines.some((line) => /^[●├└] Read more output from SKILL\.md, rules\.md$/.test(line))).toBe(true);
+      expect(lines.filter((line) => line.includes("Read more output from /"))).toEqual([]);
+      expect(lines.filter((line) => /^● .*[Ss]earched/.test(line))).toEqual([]);
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+    },
+    TIMEOUT * 2,
+  );
+
+  test(
     "separate provider messages render as separate paragraphs",
     async () => {
       root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-message-phases-")));
