@@ -19,8 +19,8 @@
   },
   {
     "description": "Waiting calls stay behind when their server is ready",
-    "old": "    /\\ call' = [c \\in Calls |-> IF c \\in Waiting(s) THEN \"sent\" ELSE call[c]]\n    /\\ retry' = [retry EXCEPT ![s] = FALSE]\n    /\\ asked' = [asked EXCEPT ![s] = FALSE]\n    /\\ UNCHANGED <<attempts, ended, allowed, cause, host, stayed, dropped>>",
-    "new": "    /\\ retry' = [retry EXCEPT ![s] = FALSE]\n    /\\ asked' = [asked EXCEPT ![s] = FALSE]\n    /\\ UNCHANGED <<attempts, call, ended, allowed, cause, host, stayed, dropped>>",
+    "old": "    /\\ call' = [c \\in Calls |-> IF c \\in Waiting(s) THEN \"sent\" ELSE call[c]]\n    /\\ retry' = [retry EXCEPT ![s] = FALSE]\n    /\\ asked' = [asked EXCEPT ![s] = FALSE]\n    /\\ kept' = [kept EXCEPT ![s] = FALSE]\n    /\\ UNCHANGED <<attempts, ended, allowed, cause, host, stayed, dropped, armed>>",
+    "new": "    /\\ retry' = [retry EXCEPT ![s] = FALSE]\n    /\\ asked' = [asked EXCEPT ![s] = FALSE]\n    /\\ kept' = [kept EXCEPT ![s] = FALSE]\n    /\\ UNCHANGED <<attempts, call, ended, allowed, cause, host, stayed, dropped, armed>>",
     "invariant": "StatusConsistent"
   },
   {
@@ -91,8 +91,8 @@
   },
   {
     "description": "A server's tries start over the moment it is up, so one that dies after every start loops",
-    "old": "    /\\ retry' = [retry EXCEPT ![s] = FALSE]\n    /\\ asked' = [asked EXCEPT ![s] = FALSE]\n    /\\ UNCHANGED <<attempts, ended, allowed, cause, host, stayed, dropped>>",
-    "new": "    /\\ retry' = [retry EXCEPT ![s] = FALSE]\n    /\\ asked' = [asked EXCEPT ![s] = FALSE]\n    /\\ attempts' = [attempts EXCEPT ![s] = 0]\n    /\\ UNCHANGED <<ended, allowed, cause, host, stayed, dropped>>",
+    "old": "    /\\ retry' = [retry EXCEPT ![s] = FALSE]\n    /\\ asked' = [asked EXCEPT ![s] = FALSE]\n    /\\ kept' = [kept EXCEPT ![s] = FALSE]\n    /\\ UNCHANGED <<attempts, ended, allowed, cause, host, stayed, dropped, armed>>",
+    "new": "    /\\ retry' = [retry EXCEPT ![s] = FALSE]\n    /\\ asked' = [asked EXCEPT ![s] = FALSE]\n    /\\ kept' = [kept EXCEPT ![s] = FALSE]\n    /\\ attempts' = [attempts EXCEPT ![s] = 0]\n    /\\ UNCHANGED <<ended, allowed, cause, host, stayed, dropped, armed>>",
     "invariant": "StayedBeforeFreshTries"
   },
   {
@@ -112,5 +112,19 @@
     "old": "       /\\ call' = [c \\in Calls |-> IF c \\in Sent(s) \\/ c \\in Waiting(s) THEN \"done\" ELSE call[c]]\n       /\\ ended' = [c \\in Calls |-> IF c \\in Sent(s) THEN \"lost\"\n                                    ELSE IF c \\in Waiting(s) THEN \"failed\" ELSE ended[c]]",
     "new": "       /\\ call' = [c \\in Calls |-> IF c \\in Sent(s) \\/ (gaveUp /\\ c \\in Waiting(s)) THEN \"done\" ELSE call[c]]\n       /\\ ended' = [c \\in Calls |-> IF c \\in Sent(s) THEN \"lost\"\n                                    ELSE IF gaveUp /\\ c \\in Waiting(s) THEN \"failed\" ELSE ended[c]]",
     "property": "WaitsForOneStart"
+  },
+  {
+    "description": "An idle stop with a call in flight cuts the call",
+    "old": "    /\\ IF phase[s] = \"ready\" /\\ Quiet(s) /\\ attempts[s] = 0\n       THEN /\\ phase' = [phase EXCEPT ![s] = \"idle\"]\n            /\\ retry' = [retry EXCEPT ![s] = FALSE]\n            /\\ kept' = [kept EXCEPT ![s] = TRUE]\n            /\\ UNCHANGED <<attempts, need, call, ended, allowed, cause, host, stayed, dropped, asked>>",
+    "new": "    /\\ IF phase[s] = \"ready\" /\\ attempts[s] = 0\n       THEN /\\ phase' = [phase EXCEPT ![s] = \"idle\"]\n            /\\ retry' = [retry EXCEPT ![s] = FALSE]\n            /\\ kept' = [kept EXCEPT ![s] = TRUE]\n            /\\ call' = [c \\in Calls |-> IF Owner(c) = s THEN \"done\" ELSE call[c]]\n            /\\ ended' = [c \\in Calls |-> IF Owner(c) = s THEN \"cut\" ELSE ended[c]]\n            /\\ UNCHANGED <<attempts, need, allowed, cause, host, stayed, dropped, asked>>",
+    "invariant": "IdleEndsNothing",
+    "config": "Engine.idle.cfg"
+  },
+  {
+    "description": "An idle stop without the try check stops a server with no try left",
+    "old": "    /\\ IF phase[s] = \"ready\" /\\ Quiet(s) /\\ attempts[s] = 0",
+    "new": "    /\\ IF phase[s] = \"ready\" /\\ Quiet(s)",
+    "property": "EveryCallEnds",
+    "config": "Engine.idle.cfg"
   }
 ]

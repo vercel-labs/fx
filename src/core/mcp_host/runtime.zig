@@ -27,6 +27,8 @@ const elicitation = @import("../mcp/elicitation.zig");
 const tool_mcp_runtime = @import("../tooling/tool_mcp_runtime.zig");
 const json_decode = @import("../shared/json_decode.zig");
 const json_depth = @import("../shared/json_depth.zig");
+const shared_servers = @import("shared_servers.zig");
+const share_key = @import("share_key.zig");
 
 const Allocator = std.mem.Allocator;
 const engine = mcp.engine;
@@ -224,7 +226,29 @@ pub const Options = struct {
     /// The surface takes slash commands, as fx's shell does, so the model
     /// tells the user to sign in with `/mcp login NAME`, not in a terminal.
     slash_commands: bool = false,
+    /// How long a server may hold nothing before it stops; 0 never.
+    idle_ms: u32 = 0,
+    /// Sharing MCP servers with other fx sessions through one owner process.
+    /// Null runs every server here, as before.
+    share: ?Share = null,
 };
+
+/// Where this session's shared servers come from.
+pub const Share = struct {
+    /// The profile's folder: `~/.fx`, or `$FX_HOME`.
+    fx_home: []const u8,
+    /// Whether this session may start an owner; a test serves one instead.
+    spawn_owner: bool = true,
+};
+
+/// The gate's limits for an idle limit: a server quiet for that long has
+/// stayed up, so a limit below `stable_ms` lowers it too, and an idle stop
+/// never waits on it (`tests/tla/mcp/Engine.tla` IdleFire).
+fn gateFor(idle_ms: u32) @FieldType(mcp.engine.Options, "gate") {
+    var gate: @FieldType(mcp.engine.Options, "gate") = .{ .idle_ms = idle_ms };
+    if (idle_ms != 0) gate.stable_ms = @min(gate.stable_ms, idle_ms);
+    return gate;
+}
 
 pub const Error = Allocator.Error || error{
     UnknownServer,
@@ -444,6 +468,9 @@ pub const Runtime = struct {
     /// read it under `mutex` (`servers`).
     resolved: config.Resolved,
     engine: engine.Engine,
+    /// Owner thread only: this session's shared servers and their owner
+    /// connection (`shared_servers.zig`); null runs every server here.
+    shared: ?shared_servers.Shared = null,
     /// Per server in `resolved.servers`; owner thread only. `gpa`'s, as are
     /// `ids` and `tools_epochs`, each replaced by a reload.
     flags: []Flags,
@@ -562,9 +589,14 @@ pub const Runtime = struct {
         const arena = r.arena.allocator();
         var scratch: std.heap.ArenaAllocator = .init(gpa);
         defer scratch.deinit();
-        const resolved = try config.resolve(scratch.allocator(), configs, inherited, r.options.workspace_root);
+        const resolved = try config.resolve(scratch.allocator(), configs, inherited, r.options.workspace_root, io_mod.homeDir());
         const n = resolved.servers.len;
-        r.resolved = .{ .servers = try config.keepServers(arena, resolved.servers, &.{}), .engine = &.{}, .engine_server = try arena.dupe(usize, resolved.engine_server) };
+        const routing = r.options.share != null;
+        // With sharing, the runtime keeps every engine config: a shared
+        // server registers it with the owner, and one that cannot share runs
+        // from it here.
+        const kept_engine: []mcp.engine.Config = if (routing) try config.keepEngineConfigs(arena, resolved.engine) else try arena.alloc(mcp.engine.Config, 0);
+        r.resolved = .{ .servers = try config.keepServers(arena, resolved.servers, &.{}), .shared = try arena.dupe(bool, resolved.shared), .engine = &.{}, .engine_server = &.{} };
         r.flags = try gpa.alloc(Flags, n);
         errdefer gpa.free(r.flags);
         for (r.flags) |*f| f.* = .{};
@@ -574,10 +606,54 @@ pub const Runtime = struct {
         r.tools_epochs = try gpa.alloc(std.atomic.Value(u64), n);
         errdefer gpa.free(r.tools_epochs);
         for (r.tools_epochs) |*e| e.* = .init(0);
-        // The engine copies what it keeps, so the rest of the config goes.
+        // A shared server registers its config with the owner, which runs it.
+        // No owner at all leaves every server running here, as before.
+        if (r.options.share) |share| {
+            // The runtime keeps its copy of the folder: the caller's string
+            // is only read while this returns.
+            r.options.share = .{ .fx_home = try arena.dupe(u8, share.fx_home), .spawn_owner = share.spawn_owner };
+            r.shared = shared_servers.Shared.init(.{
+                .io = io,
+                .gpa = gpa,
+                .fx_home = r.options.share.?.fx_home,
+                .spawn_owner = share.spawn_owner,
+                .ask_form = options.questions.form,
+                .ask_url = options.questions.url,
+                .wake = .{ .context = r, .wake = wakeEngine },
+            }) catch |err| blk: {
+                debug_trace.logf("mcp", "MCP servers run in this session reason={s}", .{@errorName(err)});
+                break :blk null;
+            };
+        }
+        errdefer if (r.shared) |*s| s.deinit();
+        if (r.shared) |*s| for (kept_engine, resolved.engine_server) |c, i| {
+            if (!resolved.shared[i]) continue;
+            try s.add(r.resolved.servers[i].name, c);
+        };
+        // The engine copies what it keeps, so the rest of the config goes. A
+        // shared server stays out of it, and its config is kept until a
+        // reload moves it in.
+        var local_engine: std.ArrayList(mcp.engine.Config) = .empty;
+        defer local_engine.deinit(scratch.allocator());
+        var local_servers: std.ArrayList(usize) = .empty;
+        defer local_servers.deinit(scratch.allocator());
+        if (routing) {
+            const on_owner = r.shared != null;
+            for (kept_engine, resolved.engine_server) |c, i| {
+                if (on_owner and resolved.shared[i]) continue;
+                try local_engine.append(scratch.allocator(), c);
+                try local_servers.append(scratch.allocator(), i);
+            }
+            r.resolved.engine = try arena.dupe(mcp.engine.Config, local_engine.items);
+            r.resolved.engine_server = try arena.dupe(usize, local_servers.items);
+        } else {
+            try local_engine.appendSlice(scratch.allocator(), resolved.engine);
+            r.resolved.engine_server = try arena.dupe(usize, resolved.engine_server);
+        }
         try r.engine.init(io, gpa, .{ .context = r, .allow = allow, .log = log }, .{
             .client = .{ .info = .{ .name = "fx", .version = options.client_version }, .capabilities = declaredCapabilities(options.questions) },
-        }, resolved.engine);
+            .gate = gateFor(options.idle_ms),
+        }, local_engine.items);
         errdefer r.engine.deinit();
         try r.publish();
         r.thread = try std.Thread.spawn(.{}, run, .{r});
@@ -899,6 +975,11 @@ pub const Runtime = struct {
             if (event) |e| r.onEvent(e) catch |err| {
                 debug_trace.logf("mcp", "MCP event handling failed server={s} err={s}", .{ e.server, @errorName(err) });
             };
+            // The shared servers' events come from the owner, in the shape
+            // the engine's do, so `onEvent` handles both.
+            if (r.shared) |*s| while (s.take()) |e| {
+                r.onEvent(e) catch |err| debug_trace.logf("mcp", "MCP shared event handling failed server={s} err={s}", .{ e.server, @errorName(err) });
+            };
             r.expireLogins();
             r.endLogouts();
             r.retryRefreshes();
@@ -998,7 +1079,7 @@ pub const Runtime = struct {
                 // Between tries too, it waits for the next start, and a
                 // failed start ends it with the reason, as a call waits.
                 try r.tool_waiters.ensureUnusedCapacity(r.gpa, 1);
-                try r.engine.needTools(r.resolved.servers[i].name);
+                try r.needToolsOf(r.resolved.servers[i].name);
                 r.tool_waiters.appendAssumeCapacity(.{ .server = i, .request = req });
             },
             .pick_up => {
@@ -1008,7 +1089,7 @@ pub const Runtime = struct {
                 r.finish(req, .ok);
             },
             .need => |name| {
-                if (r.engineServer(name) != null) r.engine.needTools(name) catch |err| {
+                if (r.engineServer(name) != null) r.needToolsOf(name) catch |err| {
                     debug_trace.logf("mcp", "MCP tool list not started server={s} err={s}", .{ name, @errorName(err) });
                 };
                 r.finish(req, .ok);
@@ -1032,7 +1113,7 @@ pub const Runtime = struct {
                 }
                 var it = r.calls.iterator();
                 while (it.next()) |entry| if (entry.value_ptr.* == target) {
-                    try r.engine.cancel(entry.key_ptr.*);
+                    try r.cancelCall(entry.key_ptr.*);
                     break;
                 };
                 // A call held for its URLs ends here.
@@ -1072,11 +1153,11 @@ pub const Runtime = struct {
                 switch (a.pending.reply) {
                     .input => |input| {
                         const values = if (a.json) |json| inputValues(scratch.allocator(), json, input.keys) else null;
-                        if (values) |v| r.engine.respond(input.call, v) catch |err| {
+                        if (values) |v| r.respondCall(input.call, v) catch |err| {
                             debug_trace.logf("mcp", "MCP answer not sent server={s} err={s}", .{ name, @errorName(err) });
                         } else {
                             if (r.calls.get(input.call)) |asking| asking.declined = true;
-                            r.engine.cancel(input.call) catch {};
+                            r.cancelCall(input.call) catch {};
                         }
                     },
                     .elicit => |id| {
@@ -1088,7 +1169,7 @@ pub const Runtime = struct {
                             return;
                         }
                         const answer = elicitAnswer(scratch.allocator(), a.json) orelse mcp.elicitation.Answer{ .action = .decline };
-                        r.engine.answerElicitation(name, id, answer) catch |err| {
+                        r.answerOn(name, id, answer) catch |err| {
                             debug_trace.logf("mcp", "MCP elicitation answer not sent server={s} err={s}", .{ name, @errorName(err) });
                         };
                     },
@@ -1102,7 +1183,7 @@ pub const Runtime = struct {
                         };
                         // Nothing goes back to the server: accept is consent, and
                         // the engine waits for each completion.
-                        for (held.urls.items) |need| if (!need.dropped) r.engine.answerElicitation(name, need.id, .{ .action = action }) catch |err| {
+                        for (held.urls.items) |need| if (!need.dropped) r.answerOn(name, need.id, .{ .action = action }) catch |err| {
                             debug_trace.logf("mcp", "MCP elicitation answer not sent server={s} err={s}", .{ name, @errorName(err) });
                         };
                         held.url_phase = .none;
@@ -1200,6 +1281,8 @@ pub const Runtime = struct {
     fn startLogin(r: *Runtime, req: *Request, name: []const u8, open_browser: bool) !void {
         const i = r.engineServer(name) orelse return r.finish(req, .{ .failed = if (r.serverIndex(name) == null) error.UnknownServer else error.Held });
         const s = r.resolved.servers[i];
+        // Only HTTP servers sign in, and a shared server is stdio.
+        if (r.shared) |*shared| std.debug.assert(!shared.has(s.name));
         if (s.transport != .http) return r.finish(req, .{ .failed = error.NotHttp });
         // The sign-in already under way is the one asked for. Ending it would
         // close the port its browser comes back to while the engine keeps its
@@ -1489,35 +1572,30 @@ pub const Runtime = struct {
                 req.note = .{ .progress = p.progress, .total = p.total, .message = message };
             },
             .input => |q| {
-                const req = r.calls.get(q.call) orelse return r.engine.cancel(q.call);
+                const req = r.calls.get(q.call) orelse return r.cancelCall(q.call);
                 if (req.asker == null) {
-                    // Nobody can answer: each question is answered cancel,
-                    // dismissed without a choice, and the server goes on.
-                    const elicitations = for (q.requests) |request| {
-                        if (request.kind != .elicitation) break false;
-                    } else true;
-                    if (elicitations) {
-                        debug_trace.logf("mcp", "MCP input request answered cancel server={s} reason=no question UI", .{event.server});
-                        const values = try r.gpa.alloc([]const u8, q.requests.len);
-                        defer r.gpa.free(values);
-                        @memset(values, cancel_answer);
-                        return r.engine.respond(q.call, values);
-                    }
+                    // Nobody can answer, so the call ends as one fx could not
+                    // give input to: a cancel answer would let the server go on
+                    // with nothing the user chose. A shared server runs in an
+                    // owner that declares every question UI its sessions can
+                    // show, so this is also how a session without a UI answers
+                    // a request it could not have made itself.
                     debug_trace.logf("mcp", "MCP input request declined server={s} reason=no question UI", .{event.server});
                     req.declined = true;
-                    return r.engine.cancel(q.call);
+                    return r.cancelCall(q.call);
                 }
                 var pending = r.inputQuestion(i, q.call, q.requests) catch |err| {
-                    try r.engine.cancel(q.call);
+                    try r.cancelCall(q.call);
                     return err;
                 };
                 if (!r.offer(req, pending)) {
                     pending.deinit(r.gpa);
                     req.declined = true;
-                    try r.engine.cancel(q.call);
+                    try r.cancelCall(q.call);
                 }
             },
             .server => |s| try r.onServer(i, event.server, s),
+            .stopped_idle => debug_trace.logf("mcp", "MCP server stopped while idle server={s} idle_ms={d}", .{ event.server, r.options.idle_ms }),
         }
     }
 
@@ -1572,7 +1650,7 @@ pub const Runtime = struct {
                     if (try r.pickUpLogin(i)) {
                         debug_trace.logf("mcp", "MCP saved login read again server={s} reason=the store wasn't read at the start", .{name});
                         r.flags[i].relisting = true;
-                        return r.engine.needTools(name);
+                        return r.needToolsOf(name);
                     }
                     if (r.store_unread) |err| {
                         r.flags[i].needs_login = true;
@@ -1625,7 +1703,7 @@ pub const Runtime = struct {
                 l.confirming = true;
                 l.deadline_ms = r.nowMs() + confirm_wait_ms;
                 // A list kept from an earlier login would answer without asking.
-                r.engine.reconnect(name) catch |err| {
+                r.reconnectOf(name) catch |err| {
                     debug_trace.logf("mcp", "MCP login check not sent server={s} err={s}", .{ name, @errorName(err) });
                     try r.concludeSignIn(i, .unchecked);
                 };
@@ -1660,13 +1738,13 @@ pub const Runtime = struct {
                     const cancel: mcp.elicitation.Answer = .{ .action = .cancel };
                     const req = r.callAsking(name) orelse {
                         debug_trace.logf("mcp", "MCP elicitation answered cancel server={s} reason=no call can ask", .{name});
-                        return r.engine.answerElicitation(name, x.id, cancel);
+                        return r.answerOn(name, x.id, cancel);
                     };
                     const json = try r.gpa.print("{{\"elicitation\":{{\"method\":\"elicitation/create\",\"params\":{s}}}}}", .{x.params});
                     var pending: Pending = .{ .name = r.resolved.servers[i].name, .server = r.ids[i], .json = json, .version = r.versionCopy(i), .reply = .{ .elicit = x.id } };
                     if (!r.offer(req, pending)) {
                         pending.deinit(r.gpa);
-                        return r.engine.answerElicitation(name, x.id, cancel);
+                        return r.answerOn(name, x.id, cancel);
                     }
                 }
                 try r.holdUrl(i, x.id.slot, x.params);
@@ -1823,7 +1901,7 @@ pub const Runtime = struct {
         const name = r.resolved.servers[req.url_server].name;
         for (req.urls.items) |need| {
             // One still shown is dismissed; the engine refuses the rest.
-            if (!need.dropped and !need.seen) r.engine.answerElicitation(name, need.id, .{ .action = .cancel }) catch {};
+            if (!need.dropped and !need.seen) r.answerOn(name, need.id, .{ .action = .cancel }) catch {};
             r.gpa.free(need.params);
         }
         req.urls.clearAndFree(r.gpa);
@@ -1851,7 +1929,7 @@ pub const Runtime = struct {
         const c = req.kind.call;
         // Room first: a call the engine took must have its waiter.
         try r.calls.ensureUnusedCapacity(r.gpa, 1);
-        const handle_ = try r.engine.call(r.resolved.servers[i].name, c.tool, c.arguments);
+        const handle_ = try r.callOnServer(r.resolved.servers[i].name, c.tool, c.arguments);
         if (req.observation) |call_| call_.engineRequest(handle_);
         r.calls.putAssumeCapacity(handle_, req);
     }
@@ -1866,7 +1944,7 @@ pub const Runtime = struct {
                 continue;
             }
             _ = r.required.orderedRemove(k);
-            r.engine.answerElicitation(r.resolved.servers[i].name, q.need.id, .{ .action = .cancel }) catch {};
+            r.answerOn(r.resolved.servers[i].name, q.need.id, .{ .action = .cancel }) catch {};
             r.gpa.free(q.need.params);
         }
     }
@@ -1942,15 +2020,77 @@ pub const Runtime = struct {
         var scratch: std.heap.ArenaAllocator = .init(r.gpa);
         defer scratch.deinit();
         const s = scratch.allocator();
-        const next = try config.resolve(s, configs, inherited, r.options.workspace_root);
+        const next = try config.resolve(s, configs, inherited, r.options.workspace_root, io_mod.homeDir());
         const n = next.servers.len;
+        const routing = r.options.share != null and r.shared != null;
         // What a caller reads after the reload: the servers, and which kept running.
         const arena = r.arena.allocator();
         const kept_servers = try config.keepServers(arena, next.servers, r.resolved.servers);
-        const engine_server = try arena.dupe(usize, next.engine_server);
+        const shared = try arena.dupe(bool, next.shared);
+        // With sharing, the runtime keeps the configs the local engine runs,
+        // and each shared server's own config goes to the owner.
+        const kept_next_engine: []mcp.engine.Config = if (routing) try config.keepEngineConfigs(arena, next.engine) else &.{};
         const kept = try arena.alloc(bool, n);
         @memset(kept, false);
-        for (next.engine, next.engine_server) |c, j| kept[j] = r.engine.keeps(c);
+        const kept_shared = try s.alloc(bool, n);
+        @memset(kept_shared, false);
+        var dropped = false;
+        // The configs the local engine takes after the reload, and the server
+        // each of its slots runs.
+        var local_configs: std.ArrayList(mcp.engine.Config) = .empty;
+        defer local_configs.deinit(s);
+        var local_servers: std.ArrayList(usize) = .empty;
+        defer local_servers.deinit(s);
+        if (routing) {
+            const sh = &r.shared.?;
+            // A shared server keeps its slot while its name and launch config
+            // are the same.
+            for (next.servers, 0..) |server, j| {
+                if (!next.shared[j]) continue;
+                const key = sh.keyOf(server.name) orelse continue;
+                const c = kept_next_engine[std.mem.findScalar(usize, next.engine_server, j) orelse continue];
+                if (std.mem.eql(u8, &key, &share_key.of(c))) kept_shared[j] = true;
+            }
+            // Any other slot goes: its key changed, it was removed, or it is
+            // no longer shared. Its calls end as cancelled through the
+            // adapter, a tool list asked of it is asked again, and the owner
+            // drops this session from the key, so a server no other session
+            // holds stops now.
+            var k: usize = sh.slots.items.len;
+            while (k > 0) {
+                k -= 1;
+                const slot = sh.slots.items[k];
+                var keep = false;
+                for (next.servers, kept_shared) |server, keep_now| {
+                    if (keep_now and std.mem.eql(u8, server.name, slot.name)) keep = true;
+                }
+                if (keep) continue;
+                if (r.serverIndex(slot.name)) |old| {
+                    r.requeueToolWaiters(old);
+                    r.endServerQuestions(old);
+                }
+                dropped = true;
+                sh.remove(slot.name);
+            }
+            for (kept_next_engine, next.engine_server) |c, j| {
+                if (next.shared[j]) continue;
+                try local_configs.append(s, c);
+                try local_servers.append(s, j);
+            }
+            for (kept_next_engine, next.engine_server) |c, j| kept[j] = if (next.shared[j]) kept_shared[j] else r.engine.keeps(c);
+            // A shared server that had no slot, or lost it, registers again
+            // here; registering with the owner waits for its first use.
+            for (kept_next_engine, next.engine_server) |c, j| {
+                if (!next.shared[j] or kept_shared[j]) continue;
+                try sh.add(kept_servers[j].name, c);
+            }
+        } else {
+            try local_configs.appendSlice(s, next.engine);
+            try local_servers.appendSlice(s, next.engine_server);
+            for (next.engine, next.engine_server) |c, j| kept[j] = r.engine.keeps(c);
+        }
+        const engine_server = try arena.dupe(usize, local_servers.items);
+        const engine_configs: []mcp.engine.Config = if (routing) try arena.dupe(mcp.engine.Config, local_configs.items) else &.{};
         // Each new server's old index, and each old one's new index, for the
         // servers that keep running as they were.
         const from = try s.alloc(?usize, n);
@@ -1972,19 +2112,18 @@ pub const Runtime = struct {
             epoch.* = .init(if (f) |i| r.tools_epochs[i].load(.acquire) else 0);
         }
 
-        var dropped = false;
         for (r.resolved.engine_server) |i| if (to[i] == null) {
             dropped = true;
             r.dropServer(i, next.servers);
         };
         // The engine copies what it keeps; the rest goes with `scratch`.
-        try r.engine.reload(next.engine);
+        try r.engine.reload(local_configs.items);
         r.moveServers(to);
         r.mutex.lockUncancelable(r.io);
         const old_flags = r.flags;
         const old_ids = r.ids;
         const old_epochs = r.tools_epochs;
-        r.resolved = .{ .servers = kept_servers, .engine = &.{}, .engine_server = engine_server };
+        r.resolved = .{ .servers = kept_servers, .shared = shared, .engine = engine_configs, .engine_server = engine_server };
         r.flags = flags;
         r.ids = ids;
         r.tools_epochs = epochs;
@@ -1994,14 +2133,38 @@ pub const Runtime = struct {
         r.gpa.free(old_ids);
         r.gpa.free(old_epochs);
         var added: usize = 0;
-        for (engine_server) |j| if (from[j] == null) {
-            added += 1;
-            r.adoptSaved(j);
-        };
+        if (routing) {
+            for (from, next.servers) |f, server| {
+                if (f == null and server.held == null) added += 1;
+            }
+        } else {
+            for (next.engine_server) |j| {
+                if (from[j] == null) added += 1;
+            }
+        }
+        for (engine_server) |j| if (from[j] == null) r.adoptSaved(j);
         var same: usize = 0;
         for (kept) |k| same += @intFromBool(k);
         debug_trace.logf("mcp", "MCP config reloaded servers={d} kept={d} fresh={d} dropped={s}", .{ n, same, added, if (dropped) "yes" else "no" });
         return .{ .kept = kept, .dropped = dropped };
+    }
+
+    /// A tool list asked of server `i` is asked again: whatever has its name
+    /// after the reload answers, in the engine or in the owner.
+    fn requeueToolWaiters(r: *Runtime, i: usize) void {
+        var k: usize = 0;
+        while (k < r.tool_waiters.items.len) {
+            const w = r.tool_waiters.items[k];
+            if (w.server != i) {
+                k += 1;
+                continue;
+            }
+            _ = r.tool_waiters.swapRemove(k);
+            r.mutex.lockUncancelable(r.io);
+            const queued = if (r.queue.append(r.gpa, w.request)) |_| true else |_| false;
+            r.mutex.unlock(r.io);
+            if (queued) r.engine.wake() else r.finish(w.request, .{ .failed = error.OutOfMemory });
+        }
     }
 
     /// Old server `i` doesn't run on as it was: removed, held back, or
@@ -2019,24 +2182,12 @@ pub const Runtime = struct {
             _ = r.calls.remove(waiting.handle);
             r.finish(waiting.request, .{ .call = .{ .ended = .{
                 .outcome = .cancelled,
-                .maybe_ran = r.engine.callSent(waiting.handle),
+                .maybe_ran = r.callSentOf(waiting.handle),
                 .timed_out = false,
                 .why = "the MCP config changed, and fx stopped the server",
             } } });
         }
-        var k: usize = 0;
-        while (k < r.tool_waiters.items.len) {
-            const w = r.tool_waiters.items[k];
-            if (w.server != i) {
-                k += 1;
-                continue;
-            }
-            _ = r.tool_waiters.swapRemove(k);
-            r.mutex.lockUncancelable(r.io);
-            const queued = if (r.queue.append(r.gpa, w.request)) |_| true else |_| false;
-            r.mutex.unlock(r.io);
-            if (queued) r.engine.wake() else r.finish(w.request, .{ .failed = error.OutOfMemory });
-        }
+        r.requeueToolWaiters(i);
         if (r.loginFor(i) != null) {
             var buf: [320]u8 = undefined;
             const reason = if (successor != null and successor.?.held == null)
@@ -2046,7 +2197,7 @@ pub const Runtime = struct {
             r.notify(.{ .sign_in_failed = .{ .server = name, .reason = reason } });
             r.endLogin(i);
         }
-        k = 0;
+        var k: usize = 0;
         while (k < r.logouts.items.len) {
             const l = r.logouts.items[k];
             if (l.server != i) {
@@ -2057,7 +2208,13 @@ pub const Runtime = struct {
             r.endLogout(l, false);
         }
         r.endRefresh(i);
-        k = 0;
+        r.endServerQuestions(i);
+    }
+
+    /// Server `i` is gone: a call it held for its 2025 URLs ends, and the URL
+    /// questions it left end with it.
+    fn endServerQuestions(r: *Runtime, i: usize) void {
+        var k: usize = 0;
         while (k < r.held.items.len) {
             const req = r.held.items[k];
             if (req.url_server != i) {
@@ -2146,6 +2303,12 @@ pub const Runtime = struct {
             r.notify(.{ .sign_in_failed = .{ .server = name, .reason = reason } });
             r.endLogin(server);
         }
+        // A shared call still waiting ends as cancelled: the owner is told,
+        // and its request ends as a stopped one, like a local call's.
+        if (r.shared) |*s| {
+            var waiting = r.calls.iterator();
+            while (waiting.next()) |entry| if (s.owns(entry.key_ptr.*)) s.cancel(entry.key_ptr.*);
+        }
         var it = r.calls.valueIterator();
         while (it.next()) |req| r.finish(req.*, .{ .failed = error.Stopped });
         r.calls.clearRetainingCapacity();
@@ -2161,6 +2324,8 @@ pub const Runtime = struct {
         // Requests queued after the last drain.
         _ = r.drain();
         r.flush();
+        // Before the engine: the adapter's reader thread wakes it.
+        if (r.shared) |*s| s.deinit();
         r.engine.deinit();
     }
 
@@ -2183,8 +2348,7 @@ pub const Runtime = struct {
                 };
                 continue;
             }
-            const k = std.mem.findScalar(usize, r.resolved.engine_server, i).?;
-            const st = r.engine.status(k);
+            const st = r.statusOf(i) orelse continue;
             o.state = switch (st.phase) {
                 .idle => .idle,
                 .connecting => .connecting,
@@ -2200,20 +2364,25 @@ pub const Runtime = struct {
                 .failed, .retrying => try r.failureText(a, i),
                 else => null,
             };
-            o.needs_login = r.flags[i].needs_login;
-            o.signed_in = r.flags[i].signed_in;
-            o.signing_in = r.loginFor(i) != null;
-            if (try r.unreadText(a, i)) |why| {
-                o.state = .failed;
-                o.needs_login = false;
-                o.last_error = why;
+            // A shared server runs in the owner, which keeps no sign-in state
+            // for this session: a login there belongs to no session.
+            const on_owner = if (r.shared) |*sh| sh.has(s.name) else false;
+            if (!on_owner) {
+                o.needs_login = r.flags[i].needs_login;
+                o.signed_in = r.flags[i].signed_in;
+                o.signing_in = r.loginFor(i) != null;
+                if (try r.unreadText(a, i)) |why| {
+                    o.state = .failed;
+                    o.needs_login = false;
+                    o.last_error = why;
+                }
+                if (o.needs_login) {
+                    o.reason = try login_words.copy(a, r.flags[i].login.view());
+                    // A refused login is what `last_error` says, for every surface that shows it.
+                    if (try login_words.errorText(a, s.name, o.reason)) |text| o.last_error = text;
+                }
             }
-            if (o.needs_login) {
-                o.reason = try login_words.copy(a, r.flags[i].login.view());
-                // A refused login is what `last_error` says, for every surface that shows it.
-                if (try login_words.errorText(a, s.name, o.reason)) |text| o.last_error = text;
-            }
-            if (r.engine.instructions(s.name)) |t| o.instructions = try a.dupe(u8, t);
+            if (r.instructionsOf(s.name)) |t| o.instructions = try a.dupe(u8, t);
         }
         r.mutex.lockUncancelable(r.io);
         defer r.mutex.unlock(r.io);
@@ -2305,8 +2474,7 @@ pub const Runtime = struct {
     }
 
     fn versionCopy(r: *Runtime, i: usize) ?[]u8 {
-        const k = std.mem.findScalar(usize, r.resolved.engine_server, i) orelse return null;
-        const version = r.engine.status(k).version orelse return null;
+        const version = (r.statusOf(i) orelse return null).version orelse return null;
         return r.gpa.dupe(u8, version) catch null;
     }
 
@@ -2323,6 +2491,122 @@ pub const Runtime = struct {
     fn engineServer(r: *const Runtime, name: []const u8) ?usize {
         const i = r.serverIndex(name) orelse return null;
         return if (r.resolved.servers[i].held == null) i else null;
+    }
+
+    // ---- which side runs a server ----
+    //
+    // A shared server runs in the owner (`shared_servers.zig`), not in this
+    // runtime's engine, so every engine call it can reach goes through one of
+    // these and is sent there instead.
+
+    fn needToolsOf(r: *Runtime, name: []const u8) (engine.Error || shared_servers.Error)!void {
+        if (r.shared) |*s| if (s.has(name)) {
+            s.needTools(name) catch |err| {
+                if (err != error.SharingUnavailable) return err;
+                try r.runHere(name);
+                return r.engine.needTools(name);
+            };
+            return;
+        };
+        return r.engine.needTools(name);
+    }
+
+    fn toolListOf(r: *Runtime, name: []const u8) engine.Error!*const mcp.tools.List {
+        if (r.shared) |*s| if (s.has(name)) return s.toolList(name);
+        return r.engine.toolList(name);
+    }
+
+    fn callOnServer(r: *Runtime, name: []const u8, tool: []const u8, arguments: ?[]const u8) (engine.Error || shared_servers.Error)!engine.Handle {
+        if (r.shared) |*s| if (s.has(name)) {
+            const handle_ = s.call(name, tool, arguments) catch |err| {
+                if (err != error.SharingUnavailable) return err;
+                try r.runHere(name);
+                return r.engine.call(name, tool, arguments);
+            };
+            return handle_;
+        };
+        return r.engine.call(name, tool, arguments);
+    }
+
+    fn callSentOf(r: *Runtime, handle_: engine.Handle) bool {
+        if (r.shared) |*s| if (s.owns(handle_)) return s.callSent(handle_);
+        return r.engine.callSent(handle_);
+    }
+
+    fn cancelCall(r: *Runtime, handle_: engine.Handle) engine.Error!void {
+        if (r.shared) |*s| if (s.owns(handle_)) return s.cancel(handle_);
+        return r.engine.cancel(handle_);
+    }
+
+    fn respondCall(r: *Runtime, handle_: engine.Handle, values: []const []const u8) (engine.Error || shared_servers.Error)!void {
+        if (r.shared) |*s| if (s.owns(handle_)) return s.respond(r.gpa, handle_, values);
+        return r.engine.respond(handle_, values);
+    }
+
+    fn answerOn(r: *Runtime, name: []const u8, id: mcp.core.elicitation.Id, answer: mcp.elicitation.Answer) engine.Error!void {
+        if (r.shared) |*s| if (s.has(name)) return s.answerElicitation(name, id, answer);
+        return r.engine.answerElicitation(name, id, answer);
+    }
+
+    /// A server's status, from whichever side runs it; null when this runtime
+    /// runs neither (a server held back before it starts).
+    fn statusOf(r: *Runtime, i: usize) ?engine.Status {
+        const name = r.resolved.servers[i].name;
+        if (r.shared) |*s| if (s.has(name)) return s.status(name);
+        const k = std.mem.findScalar(usize, r.resolved.engine_server, i) orelse return null;
+        return r.engine.status(k);
+    }
+
+    fn stderrTailOf(r: *Runtime, i: usize, out: *[mcp.stdio.tail_max]u8) ?[]const u8 {
+        const name = r.resolved.servers[i].name;
+        if (r.shared) |*s| if (s.has(name)) return s.stderrTail(name, out);
+        const k = std.mem.findScalar(usize, r.resolved.engine_server, i) orelse return null;
+        return r.engine.stderrTail(k, out);
+    }
+
+    fn instructionsOf(r: *Runtime, name: []const u8) ?[]const u8 {
+        if (r.shared) |*s| if (s.has(name)) return s.instructions(name);
+        return r.engine.instructions(name);
+    }
+
+    fn reconnectOf(r: *Runtime, name: []const u8) (engine.Error || shared_servers.Error)!void {
+        if (r.shared) |*s| if (s.has(name)) return s.reconnect(name);
+        return r.engine.reconnect(name);
+    }
+
+    fn disconnectOf(r: *Runtime, name: []const u8) engine.Error!void {
+        if (r.shared) |*s| if (s.has(name)) return s.disconnect(name);
+        return r.engine.disconnect(name);
+    }
+
+    /// The owner cannot run server `name` after all: it moves into this
+    /// session's engine with the config it registered, and stays there until
+    /// the next reload. The request that met the failure then runs here, so
+    /// its caller never sees the owner's.
+    fn runHere(r: *Runtime, name: []const u8) !void {
+        const s = if (r.shared) |*sh| sh else return error.SharingUnavailable;
+        const config_ = s.configOf(name) orelse return error.SharingUnavailable;
+        const i = r.serverIndex(name) orelse return error.SharingUnavailable;
+        var configs: std.ArrayList(mcp.engine.Config) = .empty;
+        defer configs.deinit(r.gpa);
+        try configs.appendSlice(r.gpa, r.resolved.engine);
+        try configs.append(r.gpa, config_);
+        var server_indexes: std.ArrayList(usize) = .empty;
+        defer server_indexes.deinit(r.gpa);
+        try server_indexes.appendSlice(r.gpa, r.resolved.engine_server);
+        try server_indexes.append(r.gpa, i);
+        // The engine copies what it keeps, so a reload that fails changes
+        // nothing here and the slot stays for the next try.
+        try r.engine.reload(configs.items);
+        _ = s.remove(name);
+        const arena = r.arena.allocator();
+        const engine_configs = try arena.dupe(mcp.engine.Config, configs.items);
+        const engine_servers = try arena.dupe(usize, server_indexes.items);
+        r.mutex.lockUncancelable(r.io);
+        r.resolved.engine = engine_configs;
+        r.resolved.engine_server = engine_servers;
+        r.mutex.unlock(r.io);
+        debug_trace.logf("mcp", "MCP server runs in this session server={s} reason=owner unavailable", .{name});
     }
 
     /// Ends the waits for server `i`'s tools: with the reason it failed, or
@@ -2345,12 +2629,11 @@ pub const Runtime = struct {
         }
     }
 
-    fn enginePhase(r: *const Runtime, i: usize) ?engine.Phase {
-        const k = std.mem.findScalar(usize, r.resolved.engine_server, i) orelse return null;
-        return r.engine.status(k).phase;
+    fn enginePhase(r: *Runtime, i: usize) ?engine.Phase {
+        return if (r.statusOf(i)) |st| st.phase else null;
     }
 
-    fn lastError(r: *const Runtime, alloc: Allocator, i: usize) Allocator.Error![]u8 {
+    fn lastError(r: *Runtime, alloc: Allocator, i: usize) Allocator.Error![]u8 {
         if (try r.unreadText(alloc, i)) |why| return why;
         return (try r.failureText(alloc, i)) orelse try alloc.dupe(u8, "the server is unavailable");
     }
@@ -2372,12 +2655,11 @@ pub const Runtime = struct {
     /// Why server `i` is down, in `alloc`, with what its process said when
     /// it ran over stdio: how it ended, the stdout line it wrote instead of
     /// MCP, and its last stderr lines. Null with no failure.
-    fn failureText(r: *const Runtime, alloc: Allocator, i: usize) Allocator.Error!?[]u8 {
-        const k = std.mem.findScalar(usize, r.resolved.engine_server, i) orelse return null;
-        const st = r.engine.status(k);
+    fn failureText(r: *Runtime, alloc: Allocator, i: usize) Allocator.Error!?[]u8 {
+        const st = r.statusOf(i) orelse return null;
         const why = st.last_error orelse return null;
         var tail_buf: [mcp.stdio.tail_max]u8 = undefined;
-        const tail = r.engine.stderrTail(k, &tail_buf);
+        const tail = r.stderrTailOf(i, &tail_buf);
         var out: std.Io.Writer.Allocating = .init(alloc);
         errdefer out.deinit();
         writeFailure(&out.writer, why, st.exit, st.stray_line, tail) catch return error.OutOfMemory;
@@ -2402,7 +2684,7 @@ pub const Runtime = struct {
     }
 
     fn copyTools(r: *Runtime, alloc: Allocator, name: []const u8) Allocator.Error![]Tool {
-        const list = r.engine.toolList(name) catch return &.{};
+        const list = r.toolListOf(name) catch return &.{};
         const out = try alloc.alloc(Tool, list.len());
         for (out, 0..) |*t, k| {
             const tool = list.get(k);
@@ -2416,6 +2698,8 @@ pub const Runtime = struct {
     /// and so is a server signing in here.
     fn pickUpLogin(r: *Runtime, i: usize) !bool {
         const s = r.resolved.servers[i];
+        // Only HTTP servers sign in, and a shared server is stdio.
+        if (r.shared) |*shared| std.debug.assert(!shared.has(s.name));
         if (s.transport != .http or s.held != null or r.loginFor(i) != null) return false;
         if (!try r.takeSaved(i)) return false;
         // A new login was just refused: the saved login back in use is the one from before it.
@@ -2626,6 +2910,12 @@ pub const Runtime = struct {
     }
 };
 
+/// Wakes the runtime's owner thread when the owner client has a frame.
+fn wakeEngine(context: *anyopaque) void {
+    const r: *Runtime = @ptrCast(@alignCast(context));
+    r.engine.wake();
+}
+
 /// The client capabilities that declare `questions`.
 fn declaredCapabilities(questions: elicitation.Capabilities) []const u8 {
     if (questions.form and questions.url) return "{\"elicitation\":{\"form\":{},\"url\":{}}}";
@@ -2721,10 +3011,6 @@ fn describeFailure(why: []const u8) []const u8 {
     for (known) |entry| if (std.mem.eql(u8, entry[0], why)) return entry[1];
     return why;
 }
-
-/// An elicitation's answer when nobody can give one: dismissed without a
-/// choice.
-const cancel_answer = "{\"action\":\"cancel\"}";
 
 /// The answers to a call's input requests, in the order of `keys` (JSON
 /// string tokens); null when one is missing or the answers aren't an object.
@@ -2916,6 +3202,42 @@ test {
 const testing = std.testing;
 
 const Fixture = @import("fake_server.zig").Fixture;
+const owner = @import("owner.zig");
+
+/// A short fx home for a shared server test: the owner's socket path must fit
+/// a Unix address.
+fn sharedHome(tag: []const u8) ![]u8 {
+    const path = try testing.allocator.print("/tmp/fx-rt-shared-{s}-{d}", .{ tag, std.c.getpid() });
+    std.Io.Dir.cwd().deleteTree(testing.io, path) catch {};
+    try std.Io.Dir.cwd().createDir(testing.io, path, .fromMode(0o700));
+    return path;
+}
+
+fn freeSharedHome(home: []u8) void {
+    std.Io.Dir.cwd().deleteTree(testing.io, home) catch {};
+    testing.allocator.free(home);
+}
+
+fn serveOwner(io: std.Io, gpa: Allocator, home: []const u8, stop: *std.atomic.Value(bool)) void {
+    owner.serve(io, gpa, home, stop) catch {};
+}
+
+/// Waits until an owner answers on `home`'s socket.
+fn waitForOwner(home: []const u8) !void {
+    const path = try std.Io.Dir.path.join(testing.allocator, &.{ home, owner.run_dir_name, owner.socket_name });
+    defer testing.allocator.free(path);
+    const deadline = std.Io.Clock.awake.now(testing.io).toMilliseconds() + 5_000;
+    while (std.Io.Clock.awake.now(testing.io).toMilliseconds() < deadline) {
+        const address = std.Io.net.UnixAddress.init(path) catch return error.OwnerSocketNeverAppeared;
+        if (address.connect(testing.io)) |stream| {
+            stream.close(testing.io);
+            return;
+        } else |_| {
+            try testing.io.sleep(.fromMilliseconds(20), .awake);
+        }
+    }
+    return error.OwnerSocketNeverAppeared;
+}
 
 test "tools and calls go through the owner thread, from several threads at once" {
     var f: Fixture = undefined;
@@ -3148,6 +3470,88 @@ fn pidOf(r: *Runtime, a: Allocator, name: []const u8) ![]const u8 {
     const at = std.mem.find(u8, result.result.content, "pid=") orelse return error.TestUnexpectedResult;
     const digits = result.result.content[at + 4 ..];
     return digits[0 .. std.mem.findNone(u8, digits, "0123456789") orelse digits.len];
+}
+
+/// Whether process `pid` still runs; the engine reaps its servers, so an
+/// exited one is gone.
+fn running(pid: std.posix.pid_t) !bool {
+    std.posix.kill(pid, @fromBackingInt(@intCast(0))) catch |err| switch (err) {
+        error.ProcessNotFound => return false,
+        else => return err,
+    };
+    return true;
+}
+
+test "an idle server stops, a tool list comes from the kept list, and the next call starts it again" {
+    var f: Fixture = undefined;
+    try f.init();
+    defer f.deinit();
+    const configs = [_]mcp_contract.McpServerConfig{.{ .name = "fake", .command = f.server }};
+    var options = f.options();
+    options.idle_ms = 300;
+    var r: Runtime = undefined;
+    try r.start(testing.allocator, testing.io, &configs, &f.inherited, options);
+    defer r.deinit();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try testing.expectEqual(@as(usize, 1), (try r.tools(a, "fake", null)).tools.len);
+    const first = try std.fmt.parseInt(std.posix.pid_t, try pidOf(&r, a, "fake"), 10);
+    // Idle for 300 ms, then the stop: stdin closes and the fake exits.
+    const deadline = std.Io.Clock.awake.now(testing.io).toMilliseconds() + 5_000;
+    while (try running(first)) {
+        if (std.Io.Clock.awake.now(testing.io).toMilliseconds() > deadline) return error.IdleServerStillRunning;
+        try testing.io.sleep(.fromMilliseconds(20), .awake);
+    }
+    try testing.expectEqual(State.idle, (try r.statuses(a))[0].state);
+
+    // A toolbox search asks for every server's tools: the kept list answers,
+    // and nothing starts.
+    try testing.expectEqual(@as(usize, 1), (try r.tools(a, "fake", null)).tools.len);
+    try testing.expectEqual(State.idle, (try r.statuses(a))[0].state);
+
+    // The next call starts a new process and gets its answer.
+    const second = try std.fmt.parseInt(std.posix.pid_t, try pidOf(&r, a, "fake"), 10);
+    try testing.expect(second != first);
+    try testing.expectEqual(State.ready, (try r.statuses(a))[0].state);
+}
+
+test "a call in flight keeps an idle server up" {
+    var f: Fixture = undefined;
+    try f.init();
+    defer f.deinit();
+    const configs = [_]mcp_contract.McpServerConfig{.{ .name = "fake", .command = f.server }};
+    var options = f.options();
+    options.idle_ms = 300;
+    var r: Runtime = undefined;
+    try r.start(testing.allocator, testing.io, &configs, &f.inherited, options);
+    defer r.deinit();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const pid = try std.fmt.parseInt(std.posix.pid_t, try pidOf(&r, a, "fake"), 10);
+
+    // The fake never answers a call that mentions "slow".
+    const Caller = struct {
+        fn run(runtime: *Runtime, cancel: *std.atomic.Value(bool), out: *?engine.Outcome) void {
+            var ca: std.heap.ArenaAllocator = .init(testing.allocator);
+            defer ca.deinit();
+            const result = runtime.call(ca.allocator(), "fake", "echo", "{\"text\":\"slow\"}", cancel, null) catch return;
+            if (result == .ended) out.* = result.ended.outcome;
+        }
+    };
+    var cancel: std.atomic.Value(bool) = .init(false);
+    var outcome: ?engine.Outcome = null;
+    const caller = try std.Thread.spawn(.{}, Caller.run, .{ &r, &cancel, &outcome });
+    // Well past the idle limit, with the call in flight the whole time.
+    try testing.io.sleep(.fromMilliseconds(1500), .awake);
+    try testing.expect(try running(pid));
+    try testing.expectEqual(State.ready, (try r.statuses(a))[0].state);
+
+    cancel.store(true, .release);
+    caller.join();
+    try testing.expectEqual(@as(?engine.Outcome, .cancelled), outcome);
 }
 
 test "a reload keeps a server whose config is the same on its process, and restarts the changed ones" {
@@ -4048,4 +4452,315 @@ test "a failed call's error data is kept whole or cut at a character, within the
     try std.testing.fuzz({}, fuzzErrorData, .{
         .corpus = &(.{""} ++ @import("fuzz_corpus").mcp_error_data.*),
     });
+}
+
+test "a shared server's status comes from the owner" {
+    var f: Fixture = undefined;
+    try f.init();
+    defer f.deinit();
+    const home = try sharedHome("status");
+    defer freeSharedHome(home);
+    var stop = std.atomic.Value(bool).init(false);
+    const served = try std.Thread.spawn(.{}, serveOwner, .{ testing.io, testing.allocator, home, &stop });
+    defer {
+        stop.store(true, .release);
+        served.join();
+    }
+    try waitForOwner(home);
+
+    const configs = [_]mcp_contract.McpServerConfig{.{ .name = "fake", .command = f.server }};
+    var options = f.options();
+    options.share = .{ .fx_home = home, .spawn_owner = false };
+    var r: Runtime = undefined;
+    try r.start(testing.allocator, testing.io, &configs, &f.inherited, options);
+    defer r.deinit();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const listed = try r.tools(a, "fake", null);
+    try testing.expectEqual(@as(usize, 1), listed.tools.len);
+    const listed_status = (try r.statuses(a))[0];
+    try testing.expectEqual(State.ready, listed_status.state);
+    try testing.expectEqual(@as(usize, 1), listed_status.tools);
+    try testing.expectEqualStrings("2025-11-25", listed_status.version.?);
+    try testing.expect(!listed_status.needs_login and !listed_status.signed_in and !listed_status.signing_in);
+}
+
+test "a reload that changes a shared server's env ends this session's call on it, and the next call works" {
+    var f: Fixture = undefined;
+    try f.init();
+    defer f.deinit();
+    const home = try sharedHome("reload");
+    defer freeSharedHome(home);
+    var stop = std.atomic.Value(bool).init(false);
+    const served = try std.Thread.spawn(.{}, serveOwner, .{ testing.io, testing.allocator, home, &stop });
+    defer {
+        stop.store(true, .release);
+        served.join();
+    }
+    try waitForOwner(home);
+
+    var one = [_]mcp_contract.McpEnvVar{.{ .key = @constCast("MODE"), .value = @constCast("one") }};
+    var two = [_]mcp_contract.McpEnvVar{.{ .key = @constCast("MODE"), .value = @constCast("two") }};
+    const before = [_]mcp_contract.McpServerConfig{.{ .name = "fake", .command = f.server, .env = &one }};
+    var options = f.options();
+    options.share = .{ .fx_home = home, .spawn_owner = false };
+    var r: Runtime = undefined;
+    try r.start(testing.allocator, testing.io, &before, &f.inherited, options);
+    defer r.deinit();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try testing.expectEqual(@as(usize, 1), (try r.tools(a, "fake", null)).tools.len);
+
+    const Caller = struct {
+        fn run(runtime: *Runtime, out: *?CallResult) void {
+            var ca: std.heap.ArenaAllocator = .init(testing.allocator);
+            defer ca.deinit();
+            out.* = runtime.call(ca.allocator(), "fake", "echo", "{\"text\":\"slow\"}", null, null) catch null;
+        }
+    };
+    var first: ?CallResult = null;
+    const caller = try std.Thread.spawn(.{}, Caller.run, .{ &r, &first });
+    // The owner has the call: it went out after the listing.
+    try testing.io.sleep(.fromMilliseconds(300), .awake);
+
+    const after = [_]mcp_contract.McpServerConfig{.{ .name = "fake", .command = f.server, .env = &two }};
+    const done = try r.reload(&after, &f.inherited);
+    caller.join();
+    const ended = first orelse return error.NoCallResult;
+    try testing.expect(ended == .ended and ended.ended.outcome == .cancelled);
+    try testing.expect(!done.kept[0]);
+
+    // The new key starts its own server, and answers.
+    const pid = try pidOf(&r, a, "fake");
+    try testing.expect(pid.len > 0);
+    try testing.expectEqual(State.ready, (try r.statuses(a))[0].state);
+}
+
+test "a shared server runs in this session when no owner can start" {
+    var f: Fixture = undefined;
+    try f.init();
+    defer f.deinit();
+    // The owner's socket path must fit a Unix address; this home cannot.
+    const home = "/tmp/xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx/home";
+    const configs = [_]mcp_contract.McpServerConfig{.{ .name = "fake", .command = f.server }};
+    var options = f.options();
+    options.share = .{ .fx_home = home };
+    var r: Runtime = undefined;
+    try r.start(testing.allocator, testing.io, &configs, &f.inherited, options);
+    defer r.deinit();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // The adapter refused this home at start, so every server runs here.
+    try testing.expect(r.shared == null);
+    try testing.expectEqual(@as(usize, 1), (try r.tools(a, "fake", null)).tools.len);
+    const pid = try pidOf(&r, a, "fake");
+    try testing.expect(pid.len > 0);
+    const status = (try r.statuses(a))[0];
+    try testing.expectEqual(State.ready, status.state);
+    try testing.expectEqual(@as(usize, 1), status.tools);
+}
+
+test "a shared server runs in this session when no owner answers" {
+    var f: Fixture = undefined;
+    try f.init();
+    defer f.deinit();
+    const home = try sharedHome("nobody");
+    defer freeSharedHome(home);
+    const configs = [_]mcp_contract.McpServerConfig{.{ .name = "fake", .command = f.server }};
+    var options = f.options();
+    options.share = .{ .fx_home = home, .spawn_owner = false };
+    var r: Runtime = undefined;
+    try r.start(testing.allocator, testing.io, &configs, &f.inherited, options);
+    defer r.deinit();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // The first call waits for an owner that never comes, then answers here.
+    const pid = try pidOf(&r, a, "fake");
+    try testing.expect(pid.len > 0);
+    try testing.expectEqual(State.ready, (try r.statuses(a))[0].state);
+    // The adapter is still there; the server's slot moved into this session.
+    try testing.expect(r.shared != null and !r.shared.?.has("fake"));
+}
+
+/// Waits until a runtime's only server reads ready, or fails.
+fn waitReady(r: *Runtime, a: Allocator) !void {
+    const deadline = std.Io.Clock.awake.now(testing.io).toMilliseconds() + 2_000;
+    while (std.Io.Clock.awake.now(testing.io).toMilliseconds() < deadline) {
+        if ((try r.statuses(a))[0].state == .ready) return;
+        try testing.io.sleep(.fromMilliseconds(20), .awake);
+    }
+    return error.ServerNeverReady;
+}
+
+test "two runtimes share one server through one owner, and one leaving keeps the other's call working" {
+    var f: Fixture = undefined;
+    try f.init();
+    defer f.deinit();
+    const home = try sharedHome("pair");
+    defer freeSharedHome(home);
+    var stop = std.atomic.Value(bool).init(false);
+    const served = try std.Thread.spawn(.{}, serveOwner, .{ testing.io, testing.allocator, home, &stop });
+    defer {
+        stop.store(true, .release);
+        served.join();
+    }
+    try waitForOwner(home);
+
+    const configs = [_]mcp_contract.McpServerConfig{.{ .name = "fake", .command = f.server }};
+    var options = f.options();
+    options.share = .{ .fx_home = home, .spawn_owner = false };
+    var first: Runtime = undefined;
+    try first.start(testing.allocator, testing.io, &configs, &f.inherited, options);
+    var first_up = true;
+    defer if (first_up) first.deinit();
+    var second: Runtime = undefined;
+    try second.start(testing.allocator, testing.io, &configs, &f.inherited, options);
+    defer second.deinit();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const first_pid = try pidOf(&first, a, "fake");
+    const second_pid = try pidOf(&second, a, "fake");
+    try testing.expectEqualStrings(first_pid, second_pid);
+    const pid = try std.fmt.parseInt(std.posix.pid_t, first_pid, 10);
+
+    const Caller = struct {
+        fn run(runtime: *Runtime, cancel: *std.atomic.Value(bool), out: *?engine.Outcome) void {
+            var ca: std.heap.ArenaAllocator = .init(testing.allocator);
+            defer ca.deinit();
+            const result = runtime.call(ca.allocator(), "fake", "echo", "{\"text\":\"slow\"}", cancel, null) catch return;
+            if (result == .ended) out.* = result.ended.outcome;
+        }
+    };
+    var cancel = std.atomic.Value(bool).init(false);
+    var outcome: ?engine.Outcome = null;
+    const caller = try std.Thread.spawn(.{}, Caller.run, .{ &second, &cancel, &outcome });
+    try testing.io.sleep(.fromMilliseconds(300), .awake);
+
+    // The second session hears where the server already is when it joins.
+    try waitReady(&second, a);
+    // The first session leaves; the second still holds the server.
+    first.deinit();
+    first_up = false;
+    try testing.expect(try running(pid));
+    try waitReady(&second, a);
+
+    cancel.store(true, .release);
+    caller.join();
+    try testing.expectEqual(@as(?engine.Outcome, .cancelled), outcome);
+    try testing.expect(try running(pid));
+}
+
+test "an owner that dies ends a call in flight as lost, and the next call starts a new owner" {
+    var f: Fixture = undefined;
+    try f.init();
+    defer f.deinit();
+    const home = try sharedHome("orphan");
+    defer freeSharedHome(home);
+    var stop = std.atomic.Value(bool).init(false);
+    var served: ?std.Thread = try std.Thread.spawn(.{}, serveOwner, .{ testing.io, testing.allocator, home, &stop });
+    defer {
+        stop.store(true, .release);
+        if (served) |thread| thread.join();
+    }
+    try waitForOwner(home);
+
+    const configs = [_]mcp_contract.McpServerConfig{.{ .name = "fake", .command = f.server }};
+    var options = f.options();
+    options.share = .{ .fx_home = home, .spawn_owner = false };
+    var r: Runtime = undefined;
+    try r.start(testing.allocator, testing.io, &configs, &f.inherited, options);
+    defer r.deinit();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const first_pid = try pidOf(&r, a, "fake");
+
+    const Caller = struct {
+        fn run(runtime: *Runtime, out: *?CallResult) void {
+            var ca: std.heap.ArenaAllocator = .init(testing.allocator);
+            defer ca.deinit();
+            out.* = runtime.call(ca.allocator(), "fake", "echo", "{\"text\":\"slow\"}", null, null) catch null;
+        }
+    };
+    var in_flight: ?CallResult = null;
+    const caller = try std.Thread.spawn(.{}, Caller.run, .{ &r, &in_flight });
+    try testing.io.sleep(.fromMilliseconds(300), .awake);
+
+    // The owner dies under the call: what it was running may have run.
+    stop.store(true, .release);
+    served.?.join();
+    served = null;
+    caller.join();
+    const ended = in_flight orelse return error.NoCallResult;
+    try testing.expect(ended == .ended and ended.ended.maybe_ran);
+
+    // The next call starts a new owner, with a new server.
+    stop.store(false, .release);
+    served = try std.Thread.spawn(.{}, serveOwner, .{ testing.io, testing.allocator, home, &stop });
+    try waitForOwner(home);
+    const second_pid = try pidOf(&r, a, "fake");
+    try testing.expect(!std.mem.eql(u8, first_pid, second_pid));
+}
+
+test "deinit while a shared call waits ends it and returns" {
+    var f: Fixture = undefined;
+    try f.init();
+    defer f.deinit();
+    const home = try sharedHome("leaving");
+    defer freeSharedHome(home);
+    var stop = std.atomic.Value(bool).init(false);
+    const served = try std.Thread.spawn(.{}, serveOwner, .{ testing.io, testing.allocator, home, &stop });
+    defer {
+        stop.store(true, .release);
+        served.join();
+    }
+    try waitForOwner(home);
+
+    const configs = [_]mcp_contract.McpServerConfig{.{ .name = "fake", .command = f.server }};
+    var options = f.options();
+    options.share = .{ .fx_home = home, .spawn_owner = false };
+    var r: Runtime = undefined;
+    try r.start(testing.allocator, testing.io, &configs, &f.inherited, options);
+    var up = true;
+    defer if (up) r.deinit();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    _ = try pidOf(&r, arena.allocator(), "fake");
+
+    const Waiter = struct {
+        fn run(runtime: *Runtime, err_out: *?Error, outcome: *?engine.Outcome) void {
+            var ca: std.heap.ArenaAllocator = .init(testing.allocator);
+            defer ca.deinit();
+            const result = runtime.call(ca.allocator(), "fake", "echo", "{\"text\":\"slow\"}", null, null) catch |err| {
+                err_out.* = err;
+                return;
+            };
+            if (result == .ended) outcome.* = result.ended.outcome;
+        }
+    };
+    var err_out: ?Error = null;
+    var outcome: ?engine.Outcome = null;
+    const waiter = try std.Thread.spawn(.{}, Waiter.run, .{ &r, &err_out, &outcome });
+    try testing.io.sleep(.fromMilliseconds(300), .awake);
+
+    const started = std.Io.Clock.awake.now(testing.io).toMilliseconds();
+    r.deinit();
+    up = false;
+    const took = std.Io.Clock.awake.now(testing.io).toMilliseconds() - started;
+    waiter.join();
+    try testing.expect(took < 5_000);
+    if (outcome) |how| {
+        try testing.expectEqual(engine.Outcome.cancelled, how);
+    } else if (err_out) |err| {
+        try testing.expect(err == error.Stopped or err == error.Cancelled);
+    } else return error.TheCallNeverEnded;
 }

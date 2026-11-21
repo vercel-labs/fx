@@ -46,7 +46,8 @@
   },
   {
     "module": "Engine",
-    "unit": "U12"
+    "unit": "U12",
+    "also": ["Engine.idle.cfg"]
   },
   {
     "module": "Backpressure",

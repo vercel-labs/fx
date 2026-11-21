@@ -4,13 +4,16 @@
 \*
 \* Mapping from the Zig core (src/mcp/core/engine.zig):
 \*   - Records ask, need, cancel, drop, connect, up, down, backoff_over,
-\*     stable, and answer are the model's actions for the one server. Calls are numbered
+\*     stable, idle, and answer are the model's actions for the one server. Calls are numbered
 \*     from 1 in the order asked, and n is the model's c.
 \*   - Each record carries the server's state after the step: phase (0 idle,
 \*     1 connecting, 2 ready, 3 backoff, 4 failed), attempts, need, how many
 \*     calls wait and how many are in flight, n's state (0 none,
 \*     1 waiting, 2 sent, 3 done), and whether it starts again by itself.
 \*   - A record marked ignored is accepted only where nothing changes.
+\*   - Arming the idle timer is hidden state: the code arms it inside up,
+\*     answer, and stable, so a trace shows no arming step and the model may
+\*     arm without spending a record.
 \*   - MaxAttempts comes from the scenario (ObsMaxAttempts), the engine's
 \*     limit, which every record also carries as `max`; a planted control
 \*     gives a wrong one. MaxHost is the number of drop records.
@@ -40,6 +43,7 @@ Step(r) ==
          [] r.event = "down" -> Down(1)
          [] r.event = "backoff_over" -> BackoffOver(1)
          [] r.event = "stable" -> Stable(1)
+         [] r.event = "idle" -> IdleFire(1)
          [] r.event = "answer" -> Answer(n)
          [] OTHER -> FALSE
 
@@ -59,9 +63,12 @@ TraceInit ==
 TraceNext ==
     /\ i < Len(ObsTrace)
     /\ LET r == ObsTrace[i + 1]
-       IN /\ IF r.data.ignored THEN UNCHANGED vars ELSE Step(r)
-          /\ Matches(r)
-    /\ i' = i + 1
+       IN \/ \* Hidden arming, as the code does inside up, answer, and stable.
+             /\ IdleArm(1)
+             /\ i' = i
+          \/ /\ IF r.data.ignored THEN UNCHANGED vars ELSE Step(r)
+             /\ Matches(r)
+             /\ i' = i + 1
 
 \* Sentinel: violated exactly when every observed step has been matched.
 NotDone == i < Len(ObsTrace)

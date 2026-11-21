@@ -92,6 +92,7 @@ VERIFICATION_E2E_TESTS = (
     "yolo-permission-mode.test.ts",
     "doctor.test.ts",
     "tui-custom-connection-errors.test.ts",
+    "mcp-shared.test.ts",
 )
 
 EXCLUDED_E2E_TESTS = (

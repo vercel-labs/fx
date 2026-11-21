@@ -112,6 +112,7 @@ pub const EntryProblem = enum {
     env,
     bearer_token_env,
     enabled,
+    shared,
     required,
     startup_timeout_ms,
     operation_timeout_ms,
@@ -167,6 +168,7 @@ fn entryProblem(err: anyerror) EntryProblem {
         error.McpConfigInvalidEnvironment => .env,
         error.McpConfigInvalidBearerEnvironment => .bearer_token_env,
         error.McpConfigInvalidEnabled => .enabled,
+        error.McpConfigInvalidShared => .shared,
         error.McpConfigInvalidRequired => .required,
         error.McpConfigInvalidStartupTimeout => .startup_timeout_ms,
         error.McpConfigInvalidOperationTimeout => .operation_timeout_ms,
@@ -1481,6 +1483,12 @@ fn parseServerEntry(
         if (field == .bool) field.bool else return failServerConfig(error.McpConfigInvalidEnabled)
     else
         true;
+    // One copy of a stdio server for every session whose config matches;
+    // a server that keeps state per client says false.
+    const shared = if (object.get("shared")) |field|
+        if (field == .bool) field.bool else return failServerConfig(error.McpConfigInvalidShared)
+    else
+        true;
     const configured_required = if (object.get("required")) |field|
         if (field == .bool) field.bool else return failServerConfig(error.McpConfigInvalidRequired)
     else
@@ -1527,6 +1535,7 @@ fn parseServerEntry(
             .auth = auth,
             .allow_stored_credentials = policy.allow_stored_credentials,
             .enabled = enabled,
+            .shared = shared,
             .workspace_admission = policy.workspace_admission,
             .startup_timeout_ms = timeouts.startup_ms,
             .operation_timeout_ms = timeouts.operation_ms,
@@ -1560,6 +1569,7 @@ fn parseServerEntry(
         .args = command.args,
         .env = env,
         .enabled = enabled,
+        .shared = shared,
         .workspace_admission = policy.workspace_admission,
         .startup_timeout_ms = timeouts.startup_ms,
         .operation_timeout_ms = timeouts.operation_ms,
@@ -2538,4 +2548,32 @@ test "a project entry fx can't read says why in words" {
         defer alloc.free(said);
         try std.testing.expectEqualStrings(words, said);
     }
+}
+
+test "a server reads \"shared\": false, and a value that isn't a bool says so" {
+    const alloc = std.testing.allocator;
+    var result = try parseWorkspaceJson(alloc,
+        \\{"mcpServers":{"own":{"command":"node","shared":false},"odd":{"command":"node","shared":"no"}}}
+    , .workspace, .{});
+    defer result.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), result.configs.items.len);
+    try std.testing.expect(!result.configs.items[0].shared);
+    try std.testing.expectEqual(@as(usize, 1), result.diagnostics.items.len);
+    const said = try renderWorkspaceDiagnostic(alloc, result.diagnostics.items[0]);
+    defer alloc.free(said);
+    try std.testing.expectEqualStrings(".mcp.json server 'odd' was skipped: its \"shared\" isn't valid.", said);
+    // A profile server with the same value fails outright, as its other fields do.
+    try std.testing.expectError(
+        error.McpConfigInvalidShared,
+        parseProfileJson(alloc, "{\"mcp\":{\"odd\":{\"command\":[\"node\"],\"shared\":\"no\"}}}"),
+    );
+}
+
+test "a profile server defaults to shared" {
+    const alloc = std.testing.allocator;
+    var result = try parseProfileDocument(alloc, "{\"mcp\":{\"default\":{\"command\":[\"node\"]},\"own\":{\"command\":[\"node\"],\"shared\":false}}}");
+    defer result.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), result.configs.items.len);
+    try std.testing.expect(result.configs.items[0].shared);
+    try std.testing.expect(!result.configs.items[1].shared);
 }

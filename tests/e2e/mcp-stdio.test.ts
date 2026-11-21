@@ -987,6 +987,40 @@ describe("modern MCP stdio compatibility", () => {
     await expectFixtureProcessesExited(readWire(root.wireLogPath));
   }, 25_000);
 
+  test("an idle stdio server stops and the next call starts it again", async () => {
+    const root = createRoot("idle-restart", MODERN_FIXTURE);
+    gateway = startFakeGateway([
+      fakeGatewayToolCall("select_mcp", "toolbox", { open: TOOL_NAME }),
+      fakeGatewayToolCall("call_mcp", "toolbox", { run: TOOL_NAME, arguments: { text: "first" } }),
+      // The model waits longer than the idle limit before its second call, so
+      // the server stops in the gap.
+      async () => {
+        await Bun.sleep(2_000);
+        return fakeGatewayToolCall("call_mcp2", "toolbox", { run: TOOL_NAME, arguments: { text: "second" } });
+      },
+      fakeGatewayFinalText("IDLE_RESTART_DONE"),
+    ], { models: [{ id: MODEL, type: "language", tags: ["tool-use"] }] });
+    const result = await runFx(
+      ["ask", "--json", "--auto", "--no-save", "Use the stdio MCP echo tool twice."],
+      {
+        cwd: root.workspace,
+        env: { ...fixtureEnv(root, gateway), FX_TEST_MCP_IDLE_MS: "300" },
+        timeoutMs: 30_000,
+      },
+    );
+    expect(result.code, result.stderr || result.stdout).toBe(0);
+    expect(JSON.parse(result.stdout).output).toContain("IDLE_RESTART_DONE");
+    const wire = readWire(root.wireLogPath);
+    const calls = wire.filter((entry) => entry.message.method === "tools/call");
+    expect(calls).toHaveLength(2);
+    const [first, second] = calls.map((entry) => entry.pid);
+    expect(second).not.toBe(first);
+    // The idle stop ended the first process, and the second call started a
+    // new one.
+    await expectProcessesExited([first]);
+    await expectFixtureProcessesExited(wire);
+  }, 40_000);
+
   for (const matchingPath of [false, true]) {
     test.skipIf(process.platform === "win32" || !tmuxAvailable())(
       `MCP slash add preserves scoped arguments with ${matchingPath ? "a matching" : "no matching"} local path`,
@@ -2239,7 +2273,11 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"`,
         for (const entry of wire) {
           const meta = entry.message.params?._meta as Record<string, unknown>;
           expect(meta["io.modelcontextprotocol/protocolVersion"]).toBe("2026-07-28");
-          expect(meta["io.modelcontextprotocol/clientCapabilities"]).toEqual({});
+          // A shared server runs in one owner for every session that wants
+          // it, so it hears the union of their question UIs. fx ask shows
+          // none itself, and a question it cannot show is declined.
+          const capabilities = meta["io.modelcontextprotocol/clientCapabilities"] as Record<string, unknown>;
+          expect(Object.keys(capabilities)).toEqual(["elicitation"]);
         }
       } else {
         expect(new Set(wire.map((entry) => entry.pid)).size).toBe(1);

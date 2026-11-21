@@ -43,7 +43,7 @@ interface Line {
 }
 type Log = { dir: string; line: string }[];
 /** One line of the trace every machine writes. */
-type Step = { machine: string; inst: string; event: string; from: string; to: string; data?: { id?: number; progress?: number; outcome?: string } };
+type Step = { machine: string; inst: string; event: string; from: string; to: string; data?: { id?: number; progress?: number; outcome?: string; ignored?: boolean } };
 type Machine = "engine" | "stdio" | "request" | "era" | "catalog" | "subscription" | "elicitation" | { mrtr: string };
 
 interface EngineCase {
@@ -351,6 +351,22 @@ export const scenarios: Scenario[] = [
     script: ["tools a", "expect a.tools.ok", "drain 300"],
     machines: { a: [...BASE, "catalog", "subscription"] },
     check: (lines, logs) => first(same(status(lines, "b")?.phase, "idle", "b's phase"), expectThat(logs.b.length === 0, "b's process saw something"), expectThat(!tags(lines).some((t) => t.startsWith("b.")), "b said something")),
+  }),
+  engineScenario({
+    name: "u12-idle-restart",
+    description: "A server nothing used for its idle limit stops without a failure, and the next call starts a new process and is answered",
+    servers: { a: { rules: modern() } },
+    // The runtime lowers a stable limit above the idle one, so both are 300 ms.
+    labFlags: ["--no-listen", "--stable-ms", "300", "--idle-ms", "300"],
+    script: ["call a echo", "expect a.called.1.result", "drain 1500", "call a echo", "expect a.called.2.result 10000"],
+    machines: { a: BASE },
+    check: (lines, logs, trace) =>
+      first(
+        expectThat(trace.some((t) => t.machine === "engine" && t.inst === "a" && t.event === "idle" && t.data?.ignored === false), "no idle stop in the engine trace"),
+        same(received(logs.a, "server/discover").length, 2, "processes started"),
+        expectThat(event(lines, "a.stopped_idle") !== undefined, "the host never heard the idle stop"),
+        same(event(lines, "a.called.2")?.answer, '[{"type":"text","text":"fine"}]', "the second call's answer"),
+      ),
   }),
   engineScenario({
     name: "u12-denied",

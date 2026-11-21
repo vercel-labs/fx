@@ -26,9 +26,19 @@
 \* last went down, and whether the host waits for an answer to its tool list
 \* need. Whatever clears a need answers it: a listing, a refusal once the
 \* server gave up, or a disconnect, which refuses it too.
+\*
+\* Idle stop: a ready server with nothing in flight arms its idle timer
+\* (IdleArm); a later call does not disarm it. When the timer fires
+\* (IdleFire), the gate stops the server, back to idle with no failure and
+\* no retry, so the next need or call starts it again (LazyConnect).
+\* IdleEndsNothing: an idle stop ends no call; "cut" marks a call it did.
+\* A server stopped by idle keeps its last tool list (kept): a need is
+\* answered from that list at once, so it starts nothing, and the list is
+\* dropped when the server starts or goes down. IdleStop FALSE is the engine
+\* without the idle stop: nothing arms and nothing fires.
 EXTENDS Naturals, FiniteSets
 
-CONSTANTS Servers, Calls, Owner(_), MaxAttempts, MaxHost
+CONSTANTS Servers, Calls, Owner(_), MaxAttempts, MaxHost, IdleStop
 
 ASSUME MaxAttempts \in Nat \ {0} /\ MaxHost \in Nat /\ \A c \in Calls: Owner(c) \in Servers
 
@@ -36,15 +46,17 @@ Phases == {"idle", "connecting", "ready", "backoff", "failed"}
 CallStates == {"none", "waiting", "sent", "done"}
 \* How a call ended: refused by the host, its server gave up, the host
 \* cancelled it or dropped its server, the server answered, or its process died.
-Ends == {"none", "denied", "failed", "cancelled", "answered", "lost"}
+Ends == {"none", "denied", "failed", "cancelled", "answered", "lost", "cut"}
 
 VARIABLES phase, attempts, need, call, ended, allowed, cause, host,
     retry,   \* [Servers -> BOOLEAN]: down by a failure, it starts again by itself
     stayed,  \* ghost: [Servers -> BOOLEAN], it stayed up since it last started
     dropped, \* ghost: [Servers -> BOOLEAN], the host dropped it since it last went down
-    asked    \* ghost: [Servers -> BOOLEAN], the host waits for an answer to its tool list need
+    asked,   \* ghost: [Servers -> BOOLEAN], the host waits for an answer to its tool list need
+    armed,   \* [Servers -> BOOLEAN]: its idle timer runs
+    kept     \* [Servers -> BOOLEAN]: stopped by idle, it still answers a need from its last list
 
-vars == <<phase, attempts, need, call, ended, allowed, cause, host, retry, stayed, dropped, asked>>
+vars == <<phase, attempts, need, call, ended, allowed, cause, host, retry, stayed, dropped, asked, armed, kept>>
 
 Waiting(s) == {c \in Calls: Owner(c) = s /\ call[c] = "waiting"}
 Sent(s) == {c \in Calls: Owner(c) = s /\ call[c] = "sent"}
@@ -63,6 +75,8 @@ TypeOK ==
     /\ stayed \in [Servers -> BOOLEAN]
     /\ dropped \in [Servers -> BOOLEAN]
     /\ asked \in [Servers -> BOOLEAN]
+    /\ armed \in [Servers -> BOOLEAN]
+    /\ kept \in [Servers -> BOOLEAN]
 
 Init ==
     /\ phase = [s \in Servers |-> "idle"]
@@ -77,6 +91,8 @@ Init ==
     /\ stayed = [s \in Servers |-> FALSE]
     /\ dropped = [s \in Servers |-> FALSE]
     /\ asked = [s \in Servers |-> FALSE]
+    /\ armed = [s \in Servers |-> FALSE]
+    /\ kept = [s \in Servers |-> FALSE]
 
 \* ---- The host ----
 
@@ -92,16 +108,18 @@ Ask(c, ok) ==
               ELSE IF phase[s] = "ready" THEN "sent" ELSE "waiting"]
        /\ ended' = [ended EXCEPT ![c] =
               IF ~ok THEN "denied" ELSE IF phase[s] = "failed" THEN "failed" ELSE "none"]
-    /\ UNCHANGED <<phase, attempts, need, cause, host, retry, stayed, dropped, asked>>
+    /\ UNCHANGED <<phase, attempts, need, cause, host, retry, stayed, dropped, asked, armed, kept>>
 
 \* The host needs the tool list. A ready server lists at once (the catalog
-\* answers every need, U05); a failed one says so at once.
+\* answers every need, U05); a failed one says so at once. A server stopped
+\* by idle answers from the list it kept, so the need starts nothing.
 Need(s) ==
     /\ ~need[s]
     /\ phase[s] \notin {"ready", "failed"}
+    /\ ~kept[s]
     /\ need' = [need EXCEPT ![s] = TRUE]
     /\ asked' = [asked EXCEPT ![s] = TRUE]
-    /\ UNCHANGED <<phase, attempts, call, ended, allowed, cause, host, retry, stayed, dropped>>
+    /\ UNCHANGED <<phase, attempts, call, ended, allowed, cause, host, retry, stayed, dropped, armed, kept>>
 
 \* A waiting call is cancelled before it went out. One in flight is the
 \* server's to end (U02).
@@ -109,7 +127,7 @@ Cancel(c) ==
     /\ call[c] = "waiting"
     /\ call' = [call EXCEPT ![c] = "done"]
     /\ ended' = [ended EXCEPT ![c] = "cancelled"]
-    /\ UNCHANGED <<phase, attempts, need, allowed, cause, host, retry, stayed, dropped, asked>>
+    /\ UNCHANGED <<phase, attempts, need, allowed, cause, host, retry, stayed, dropped, asked, armed, kept>>
 
 \* The host drops a server's link and its tries in a row. Reconnect keeps what
 \* waits for it, which starts it again; disconnect ends that too. Either way
@@ -127,6 +145,8 @@ Drop(s, keep) ==
     /\ dropped' = [dropped EXCEPT ![s] = TRUE]
     \* Disconnect refuses a waiting tool list need.
     /\ asked' = [asked EXCEPT ![s] = asked[s] /\ keep]
+    /\ armed' = [armed EXCEPT ![s] = FALSE]
+    /\ kept' = [kept EXCEPT ![s] = FALSE]
     /\ UNCHANGED <<allowed, cause, stayed>>
 
 \* ---- The link ----
@@ -141,7 +161,7 @@ Connect(s) ==
     /\ attempts' = [attempts EXCEPT ![s] = @ + 1]
     /\ cause' = [cause EXCEPT ![s] = Demand(s) \/ retry[s]]
     /\ stayed' = [stayed EXCEPT ![s] = FALSE]
-    /\ UNCHANGED <<need, call, ended, allowed, host, retry, dropped, asked>>
+    /\ UNCHANGED <<need, call, ended, allowed, host, retry, dropped, asked, armed, kept>>
 
 \* Ready: the tool list need goes to the server, and every waiting call goes
 \* out. Its tries in a row start over only once it stays up (Stable).
@@ -152,14 +172,15 @@ Up(s) ==
     /\ call' = [c \in Calls |-> IF c \in Waiting(s) THEN "sent" ELSE call[c]]
     /\ retry' = [retry EXCEPT ![s] = FALSE]
     /\ asked' = [asked EXCEPT ![s] = FALSE]
-    /\ UNCHANGED <<attempts, ended, allowed, cause, host, stayed, dropped>>
+    /\ kept' = [kept EXCEPT ![s] = FALSE]
+    /\ UNCHANGED <<attempts, ended, allowed, cause, host, stayed, dropped, armed>>
 
 \* It stayed up: its tries in a row start over.
 Stable(s) ==
     /\ phase[s] = "ready" /\ attempts[s] > 0
     /\ attempts' = [attempts EXCEPT ![s] = 0]
     /\ stayed' = [stayed EXCEPT ![s] = TRUE]
-    /\ UNCHANGED <<phase, need, call, ended, allowed, cause, host, retry, dropped, asked>>
+    /\ UNCHANGED <<phase, need, call, ended, allowed, cause, host, retry, dropped, asked, armed, kept>>
 
 \* The start or the link failed. The calls in flight are lost, and the calls
 \* waiting for that start fail with it: a call waits for one start, and later
@@ -176,24 +197,57 @@ Down(s) ==
        /\ retry' = [retry EXCEPT ![s] = ~gaveUp]
        /\ asked' = [asked EXCEPT ![s] = asked[s] /\ ~gaveUp]
     /\ dropped' = [dropped EXCEPT ![s] = FALSE]
+    /\ armed' = [armed EXCEPT ![s] = FALSE]
+    /\ kept' = [kept EXCEPT ![s] = FALSE]
     /\ UNCHANGED <<attempts, allowed, cause, host, stayed>>
 
 BackoffOver(s) ==
     /\ phase[s] = "backoff"
     /\ phase' = [phase EXCEPT ![s] = "idle"]
-    /\ UNCHANGED <<attempts, need, call, ended, allowed, cause, host, retry, stayed, dropped, asked>>
+    /\ UNCHANGED <<attempts, need, call, ended, allowed, cause, host, retry, stayed, dropped, asked, armed, kept>>
 
 \* The server answers a call in flight.
 Answer(c) ==
     /\ call[c] = "sent"
     /\ call' = [call EXCEPT ![c] = "done"]
     /\ ended' = [ended EXCEPT ![c] = "answered"]
-    /\ UNCHANGED <<phase, attempts, need, allowed, cause, host, retry, stayed, dropped, asked>>
+    /\ UNCHANGED <<phase, attempts, need, allowed, cause, host, retry, stayed, dropped, asked, armed, kept>>
+
+\* ---- The idle timer ----
+
+Quiet(s) == Sent(s) = {} /\ Waiting(s) = {} /\ ~need[s]
+
+\* A ready server with nothing in flight arms its idle timer. A config without
+\* the idle stop (IdleStop FALSE, as fx had before it) never arms or fires.
+IdleArm(s) ==
+    /\ IdleStop
+    /\ phase[s] = "ready" /\ Quiet(s) /\ ~armed[s]
+    /\ armed' = [armed EXCEPT ![s] = TRUE]
+    /\ UNCHANGED <<phase, attempts, need, call, ended, allowed, cause, host, retry, stayed, dropped, asked, kept>>
+
+\* The timer fires. The gate looks again, at fire time, on the thread that
+\* takes the calls: a server still ready with nothing in flight, that stayed
+\* up (its tries in a row started over), stops, back to idle, not failed,
+\* with no retry, and keeps its last tool list for the next need; otherwise
+\* the fire changes nothing, and the timer is armed again once the server is
+\* quiet. Without "stayed up", one that came up on its last try could stop
+\* with no try left, and a call would wait for ever.
+IdleFire(s) ==
+    /\ IdleStop
+    /\ armed[s]
+    /\ armed' = [armed EXCEPT ![s] = FALSE]
+    /\ IF phase[s] = "ready" /\ Quiet(s) /\ attempts[s] = 0
+       THEN /\ phase' = [phase EXCEPT ![s] = "idle"]
+            /\ retry' = [retry EXCEPT ![s] = FALSE]
+            /\ kept' = [kept EXCEPT ![s] = TRUE]
+            /\ UNCHANGED <<attempts, need, call, ended, allowed, cause, host, stayed, dropped, asked>>
+       ELSE /\ UNCHANGED <<phase, attempts, need, call, ended, allowed, cause, host, retry, stayed, dropped, asked, kept>>
 
 Next ==
     \/ \E c \in Calls, ok \in BOOLEAN: Ask(c, ok)
     \/ \E c \in Calls: Cancel(c) \/ Answer(c)
     \/ \E s \in Servers: Need(s) \/ Connect(s) \/ Up(s) \/ Down(s) \/ BackoffOver(s) \/ Stable(s)
+    \/ \E s \in Servers: IdleArm(s) \/ IdleFire(s)
     \/ \E s \in Servers, keep \in BOOLEAN: Drop(s, keep)
 
 Fairness ==
@@ -204,12 +258,17 @@ Spec == Init /\ [][Next]_vars /\ Fairness
 
 \* Owners for the configs: calls 1 and 2 to server 1, call 3 (and 4) to server 2.
 SmokeOwner(c) == IF c <= 2 THEN 1 ELSE 2
+\* One server, for the idle config: every call goes to it.
+IdleOwner(c) == 1
 
 \* ---- Invariants ----
 
 \* SEC-01: nothing reaches a server without the host's permission.
 PermissionBeforeCall ==
     \A c \in Calls: (call[c] \in {"waiting", "sent"} \/ ended[c] \in {"answered", "lost"}) => allowed[c]
+
+\* An idle stop ends no call.
+IdleEndsNothing == \A c \in Calls: ended[c] # "cut"
 
 \* A refused call never waits or goes out.
 DeniedEndsThere == \A c \in Calls: ended[c] = "denied" => call[c] = "done" /\ ~allowed[c]

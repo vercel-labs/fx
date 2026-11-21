@@ -26,6 +26,8 @@ pub const Config = struct {
     max_attempts: u8 = 8,
     /// How long a server stays up before its tries start over.
     stable_ms: u32 = 60_000,
+    /// How long a ready server may hold nothing before it stops; 0 never.
+    idle_ms: u32 = 0,
 };
 
 pub const Event = union(enum) {
@@ -44,6 +46,8 @@ pub const Event = union(enum) {
     backoff_over,
     /// The server has been ready for `stable_ms`.
     stable,
+    /// The idle timer fired.
+    idle_over,
     /// The server ended a call in flight, however it ended.
     answered: Handle,
 };
@@ -68,6 +72,10 @@ pub const Effect = union(enum) {
     arm_stable: u32,
     /// Stop the server's link. What was in flight on it ended with `end`.
     teardown,
+    /// Stop the server if it still holds nothing after this long.
+    arm_idle: u32,
+    /// Answer the tool list need with the list kept from before an idle stop.
+    list_kept,
 };
 
 /// The model's state of one server after a step, for the trace.
@@ -117,6 +125,8 @@ pub const Gate = struct {
     need: bool = false,
     /// Down by a failure: it starts again by itself once its backoff is over.
     retry: bool = false,
+    /// Stopped by idle: its last tool list still answers a need.
+    kept: bool = false,
     calls: [max_calls]Call = @splat(.{}),
     /// The number of the last call asked.
     last: u32 = 0,
@@ -143,6 +153,7 @@ pub const Gate = struct {
             },
             .need => {
                 out.action = "need";
+                if (s.phase == .idle and s.kept) return ignoreWith(out, .list_kept);
                 switch (s.phase) {
                     // The model's Need isn't enabled here: nothing changes.
                     .ready => return ignoreWith(out, .list),
@@ -174,6 +185,7 @@ pub const Gate = struct {
                 if (s.need and !d.keep) out.emit(.refuse_need);
                 s.need = s.need and d.keep;
                 s.retry = false;
+                s.kept = false;
                 s.connect(out);
             },
             .up => {
@@ -181,7 +193,11 @@ pub const Gate = struct {
                 if (s.phase != .connecting) return ignore(out);
                 s.phase = .ready;
                 s.retry = false;
-                if (s.need) out.emit(.list);
+                // One that stopped by idle lists again, so a tool list that
+                // changed while it was stopped reaches the catalog.
+                const relist = s.kept;
+                s.kept = false;
+                if (s.need or relist) out.emit(.list);
                 s.need = false;
                 for (&s.calls) |*c| if (c.used and !c.sent) {
                     c.sent = true;
@@ -189,12 +205,14 @@ pub const Gate = struct {
                 };
                 // Its tries start over only once it stays up.
                 out.emit(.{ .arm_stable = s.config.stable_ms });
+                s.armIdle(out);
             },
             .down => {
                 out.action = "down";
                 if (s.phase != .connecting and s.phase != .ready) return ignore(out);
                 const gave_up = s.attempts >= s.config.max_attempts;
                 s.retry = !gave_up;
+                s.kept = false;
                 // A call waits for one start: it fails with this one, and
                 // later tries are for later calls.
                 for (&s.calls) |*c| if (c.used) {
@@ -220,6 +238,19 @@ pub const Gate = struct {
                 out.action = "stable";
                 if (s.phase != .ready or s.attempts == 0) return ignore(out);
                 s.attempts = 0;
+                s.armIdle(out);
+            },
+            // Decided at fire time, on the thread that takes the calls: a
+            // call that came after the timer was armed keeps it up
+            // (`tests/tla/mcp/Engine.tla` IdleEndsNothing). One that hasn't
+            // stayed up keeps its tries and waits for `stable`.
+            .idle_over => {
+                out.action = "idle";
+                if (s.phase != .ready or !s.quiet() or s.attempts != 0) return ignore(out);
+                out.emit(.teardown);
+                s.phase = .idle;
+                s.retry = false;
+                s.kept = true;
             },
             .answered => |handle| {
                 out.action = "answer";
@@ -227,8 +258,19 @@ pub const Gate = struct {
                 out.n = c.n;
                 if (!c.sent) return ignore(out);
                 c.* = .{};
+                if (s.phase == .ready) s.armIdle(out);
             },
         }
+    }
+
+    fn quiet(s: *const Gate) bool {
+        if (s.need) return false;
+        for (s.calls) |c| if (c.used) return false;
+        return true;
+    }
+
+    fn armIdle(s: *const Gate, out: *Output) void {
+        if (s.config.idle_ms > 0 and s.quiet()) out.emit(.{ .arm_idle = s.config.idle_ms });
     }
 
     /// The model's Connect, when it is enabled: an idle server that something
@@ -340,6 +382,8 @@ const World = struct {
             .end => |e| if (e.end == .denied) try testing.expect(event == .asked and !event.asked.allowed),
             .list => try testing.expect(s.phase == .ready),
             .refuse_need => try testing.expect(s.phase == .failed or (event == .drop and !event.drop.keep)),
+            // An idle stop keeps the list it had for the next need.
+            .list_kept => try testing.expect(s.phase == .idle and s.kept),
             else => {},
         };
         try testing.expect(s.attempts <= s.config.max_attempts);
@@ -384,6 +428,23 @@ const World = struct {
                     try testing.expect(refused);
                 }
             },
+            // IdleEndsNothing: an idle stop ends no call. It stops the server
+            // only when it held nothing before the step and had stayed up, and
+            // leaves it ready to start again (`tests/tla/mcp/Engine.tla`
+            // IdleFire).
+            .idle_over => {
+                var tore = false;
+                for (out.effects()) |effect| {
+                    try testing.expect(std.meta.activeTag(effect) != .end);
+                    tore = tore or effect == .teardown;
+                }
+                if (tore) try testing.expect(before.phase == .ready and before.quiet() and before.attempts == 0);
+                if (!out.ignored) {
+                    try testing.expectEqual(Phase.idle, s.phase);
+                    try testing.expect(!s.retry);
+                    try testing.expect(s.kept);
+                }
+            },
             else => {},
         }
     }
@@ -401,6 +462,7 @@ const alphabet = [_]Event{
     .down,
     .backoff_over,
     .stable,
+    .idle_over,
     .{ .answered = 1 },
     .{ .answered = 2 },
 };
@@ -425,18 +487,18 @@ fn find2(s: *const Gate, handle: Handle) bool {
 }
 
 test "every event sequence to depth 6 keeps the model's invariants" {
-    try walk(.init(.{ .max_attempts = 2 }), .{}, 6);
+    try walk(.init(.{ .max_attempts = 2, .idle_ms = 1000 }), .{}, 6);
 }
 
 test "random long sequences keep the model's invariants, past max_calls" {
     var prng: std.Random.DefaultPrng = .init(0x12);
     const random = prng.random();
     for (0..200) |_| {
-        var s: Gate = .init(.{ .max_attempts = 3 });
+        var s: Gate = .init(.{ .max_attempts = 3, .idle_ms = 1000 });
         var w: World = .{};
         var handle: Handle = 1;
         for (0..300) |_| {
-            const event: Event = switch (random.uintLessThan(u8, 10)) {
+            const event: Event = switch (random.uintLessThan(u8, 11)) {
                 0 => blk: {
                     handle += 1;
                     break :blk .{ .asked = .{ .call = handle, .allowed = random.boolean() } };
@@ -448,6 +510,7 @@ test "random long sequences keep the model's invariants, past max_calls" {
                 5 => .down,
                 6 => .backoff_over,
                 7 => .stable,
+                8 => .idle_over,
                 else => .{ .answered = random.uintAtMost(Handle, handle) },
             };
             const before = s;
@@ -583,4 +646,59 @@ test "disconnect ends everything; reconnect keeps what waits and starts again" {
     out = try run(&s, .{ .drop = .{ .keep = false } });
     try testing.expectEqualSlices(Effect, &.{ .teardown, .{ .end = .{ .call = 2, .end = .cancelled } } }, out.effects());
     try testing.expectEqual(Phase.idle, s.phase);
+}
+
+test "an idle timer that fires during a call, or before the server stayed up, stops nothing" {
+    // A call that came after the timer was armed keeps the server up
+    // (`tests/tla/mcp/Engine.tla` IdleEndsNothing).
+    var s: Gate = .init(.{ .idle_ms = 1000 });
+    _ = try run(&s, .{ .asked = .{ .call = 1, .allowed = true } });
+    _ = try run(&s, .up);
+    var out = try run(&s, .idle_over);
+    try testing.expect(out.ignored);
+    try testing.expectEqual(@as(usize, 0), out.effect_count);
+    try testing.expectEqual(Phase.ready, s.phase);
+
+    // One that came up on its last try keeps its tries and waits for `stable`,
+    // so a need can still start it.
+    var t: Gate = .init(.{ .max_attempts = 1, .idle_ms = 1000 });
+    _ = try run(&t, .need);
+    _ = try run(&t, .up);
+    out = try run(&t, .idle_over);
+    try testing.expect(out.ignored);
+    try testing.expectEqual(Phase.ready, t.phase);
+}
+
+test "an idle stop returns the server to idle with its list kept, and a need answers from that list" {
+    var s: Gate = .init(.{ .idle_ms = 1000 });
+    _ = try run(&s, .need);
+    _ = try run(&s, .up);
+    // Only a server that stayed up stops, so its tries start over first.
+    _ = try run(&s, .stable);
+    var out = try run(&s, .idle_over);
+    try testing.expectEqualSlices(Effect, &.{.teardown}, out.effects());
+    try testing.expectEqual(Phase.idle, s.phase);
+    try testing.expect(!s.retry);
+    try testing.expect(s.kept);
+    out = try run(&s, .need);
+    try testing.expect(out.ignored);
+    try testing.expectEqualSlices(Effect, &.{.list_kept}, out.effects());
+    try testing.expectEqual(Phase.idle, s.phase);
+    try testing.expect(s.kept);
+}
+
+test "a server that stopped by idle lists its tools again when the next call starts it" {
+    var s: Gate = .init(.{ .idle_ms = 1000 });
+    _ = try run(&s, .need);
+    _ = try run(&s, .up);
+    _ = try run(&s, .stable);
+    _ = try run(&s, .idle_over);
+    // The need comes from the kept list, and starts nothing.
+    _ = try run(&s, .need);
+    try testing.expectEqual(Phase.idle, s.phase);
+    _ = try run(&s, .{ .asked = .{ .call = 1, .allowed = true } });
+    try testing.expectEqual(Phase.connecting, s.phase);
+    const out = try run(&s, .up);
+    try testing.expectEqualSlices(Effect, &.{ .list, .{ .send = 1 }, .{ .arm_stable = 60_000 } }, out.effects());
+    try testing.expect(!s.kept);
 }

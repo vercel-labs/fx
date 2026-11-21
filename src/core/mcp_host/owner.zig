@@ -1,0 +1,1211 @@
+//! The MCP owner process: one per profile, running every shared server once
+//! for all fx sessions (`tests/tla/mcp_host/SharedServers.tla`). It is started
+//! detached as `fx --fx-internal-mcp-owner <fx_home>` (`run`), or on a thread
+//! by a test (`serve`).
+//!
+//! It takes an advisory lock under `<fx_home>/run`, and a second owner that
+//! finds the lock taken exits at once. Holding it, it listens on a private
+//! socket and runs one `owner_core.zig` route table and one `mcp.engine` with
+//! the idle gate, one slot per share key. A reader thread turns each client's
+//! frames into events and a writer thread drains a bounded queue per client.
+//! When its last client leaves, the route table disconnects the server of
+//! every key it alone held, and 500 ms later the owner exits: close the
+//! listening socket, delete the socket file, then release the lock. SIGTERM
+//! and the `stop` flag end it the same way, and the engine's deinit stops
+//! every server it still runs.
+const std = @import("std");
+const io_mod = @import("../shared/io.zig");
+const debug_trace = @import("../shared/debug_trace.zig");
+const mcp = @import("../../mcp/mcp.zig");
+const core = @import("owner_core.zig");
+const wire = @import("owner_wire.zig");
+const idle_control = @import("idle_control.zig");
+
+const Allocator = std.mem.Allocator;
+const engine = mcp.engine;
+
+/// The internal mode's flag; exactly one argument follows it, fx's home.
+pub const mode = "--fx-internal-mcp-owner";
+pub const run_dir_name = "run";
+pub const socket_name = "mcp-owner-v1.sock";
+pub const lock_name = "mcp-owner-v1.lock";
+/// How long the owner waits for a client to reconnect after the last one left.
+pub const exit_grace_ms: i64 = 500;
+const poll_ms = 20;
+
+pub fn isModeRaw(raw_args: []const [*:0]const u8) bool {
+    return raw_args.len == 3 and std.mem.eql(u8, std.mem.sliceTo(raw_args[1], 0), mode);
+}
+
+var signal_stop = std.atomic.Value(bool).init(false);
+
+fn onSignal(_: std.posix.SIG) callconv(.c) void {
+    signal_stop.store(true, .release);
+}
+
+fn installSignals() void {
+    const action: std.posix.Sigaction = .{
+        .handler = .{ .handler = onSignal },
+        .mask = std.posix.sigemptyset(),
+        .flags = 0,
+    };
+    std.posix.sigaction(std.posix.SIG.TERM, &action, null);
+    std.posix.sigaction(std.posix.SIG.INT, &action, null);
+}
+
+/// The process entry. It detaches from the session that started it, never
+/// pins a repository's directory, and serves until it is stopped.
+pub fn run(alloc: Allocator, fx_home: []const u8) !void {
+    _ = std.c.setsid();
+    // The owner must not hold a repo's directory after its last session ends.
+    _ = std.c.chdir("/");
+    installSignals();
+    var stop = std.atomic.Value(bool).init(false);
+    serve(io_mod.getIo(), alloc, fx_home, &stop) catch |err| switch (err) {
+        // Another owner is alive, or still exiting and holding the lock.
+        error.LockBusy => return,
+        else => return err,
+    };
+}
+
+/// A frame a reader keeps until its event is stepped; strings it carries are
+/// owned, because the frame's arena goes before the owner thread reads them.
+const ShellEvent = union(enum) {
+    core: core.Event,
+    call: struct { client: core.ClientId, id: u32, key: core.Key, tool: []u8, arguments: ?[]u8 },
+    respond: struct { client: core.ClientId, id: u32, values: []u8 },
+    answer: struct { client: core.ClientId, key: core.Key, slot: u8, n: u32, action: mcp.elicitation.Action, content: ?[]u8 },
+
+    fn event(e: *const ShellEvent) core.Event {
+        return switch (e.*) {
+            .core => |only| only,
+            .call => |call| .{ .call = .{ .client = call.client, .id = call.id, .key = call.key, .tool = call.tool, .arguments = call.arguments } },
+            .respond => |respond| .{ .respond = .{ .client = respond.client, .id = respond.id, .values = respond.values } },
+            .answer => |answer| .{ .answer = .{ .client = answer.client, .key = answer.key, .slot = answer.slot, .n = answer.n, .action = answer.action, .content = answer.content } },
+        };
+    }
+
+    fn deinit(e: *ShellEvent, gpa: Allocator) void {
+        switch (e.*) {
+            .core => {},
+            .call => |call| {
+                gpa.free(call.tool);
+                if (call.arguments) |arguments| gpa.free(arguments);
+            },
+            .respond => |respond| gpa.free(respond.values),
+            .answer => |answer| if (answer.content) |content| gpa.free(content),
+        }
+        e.* = undefined;
+    }
+};
+
+const Connection = struct {
+    owner: *Owner,
+    id: core.ClientId,
+    stream: std.Io.net.Stream,
+    mutex: std.Io.Mutex = .init,
+    changed: std.Io.Condition = .init,
+    queue: std.ArrayList([]u8) = .empty,
+    queued_bytes: usize = 0,
+    closed: bool = false,
+    /// The descriptor is closed: its writer closed it, so it must not be
+    /// shut down or closed again.
+    socket_closed: bool = false,
+    /// Set once, so the route table hears about the close once.
+    gone: bool = false,
+    writer: ?std.Thread = null,
+    reader: ?std.Thread = null,
+};
+
+const Owner = struct {
+    io: std.Io,
+    gpa: Allocator,
+    stop: *std.atomic.Value(bool),
+    mutex: std.Io.Mutex = .init,
+    events: std.ArrayList(ShellEvent) = .empty,
+    connections: [core.max_clients]?*Connection = @splat(null),
+    next_client: u32 = 1,
+    open: u32 = 0,
+    last_open_ms: i64 = 0,
+    /// Each registered key's config, owned here until the owner exits.
+    configs: std.StringHashMapUnmanaged(OwnedConfig) = .empty,
+    /// The engine's configs, in slot order. Their strings live in
+    /// `engine_arena`, because the scratch arena that builds one is reset
+    /// before the next event.
+    engine_configs: std.ArrayList(engine.Config) = .empty,
+    engine_arena: std.heap.ArenaAllocator,
+
+    fn stopping(o: *Owner) bool {
+        return o.stop.load(.acquire) or signal_stop.load(.acquire);
+    }
+
+    fn now(o: *const Owner) i64 {
+        _ = o;
+        return std.Io.Clock.awake.now(io_mod.getIo()).toMilliseconds();
+    }
+
+    fn push(o: *Owner, event: ShellEvent) void {
+        o.mutex.lockUncancelable(o.io);
+        defer o.mutex.unlock(o.io);
+        o.events.append(o.gpa, event) catch {
+            var dropped = event;
+            dropped.deinit(o.gpa);
+            debug_trace.logf("mcp-owner", "owner event dropped reason=out of memory", .{});
+        };
+    }
+
+    fn takeEvents(o: *Owner, into: *std.ArrayList(ShellEvent)) void {
+        o.mutex.lockUncancelable(o.io);
+        defer o.mutex.unlock(o.io);
+        const taken = o.events;
+        o.events = into.*;
+        into.* = taken;
+    }
+
+    fn connectionOf(o: *Owner, id: core.ClientId) ?*Connection {
+        const index = @backingInt(id);
+        if (index == 0 or index > core.max_clients) return null;
+        o.mutex.lockUncancelable(o.io);
+        defer o.mutex.unlock(o.io);
+        return o.connections[index - 1];
+    }
+
+    fn addConnection(o: *Owner, stream: std.Io.net.Stream) !void {
+        o.mutex.lockUncancelable(o.io);
+        if (o.next_client > core.max_clients) {
+            o.mutex.unlock(o.io);
+            return error.TooManyClients;
+        }
+        const id: core.ClientId = @fromBackingInt(o.next_client);
+        o.next_client += 1;
+        const conn = try o.gpa.create(Connection);
+        conn.* = .{ .owner = o, .id = id, .stream = stream };
+        o.connections[@backingInt(id) - 1] = conn;
+        o.open += 1;
+        o.last_open_ms = o.now();
+        o.mutex.unlock(o.io);
+        // A client checks the wire version before it says anything else, so
+        // the owner names itself first.
+        if (wire.encode(o.gpa, wire.OwnerMessage{ .welcome = .{ .owner = @intCast(std.c.getpid()) } })) |frame| {
+            o.enqueue(conn, frame);
+        } else |_| {}
+        errdefer o.disconnect(conn);
+        conn.reader = try std.Thread.spawn(.{}, readerLoop, .{conn});
+        conn.writer = try std.Thread.spawn(.{}, writerLoop, .{conn});
+    }
+
+    /// Marks the connection closed, tells the route table once, and wakes its
+    /// writer so it can end and close the socket.
+    fn disconnect(o: *Owner, conn: *Connection) void {
+        var tell = false;
+        conn.mutex.lockUncancelable(o.io);
+        if (!conn.gone) {
+            conn.gone = true;
+            tell = true;
+        }
+        conn.closed = true;
+        conn.changed.broadcast(o.io);
+        conn.mutex.unlock(o.io);
+        if (!tell) return;
+        o.push(.{ .core = .{ .gone = conn.id } });
+        o.mutex.lockUncancelable(o.io);
+        o.open -|= 1;
+        o.last_open_ms = o.now();
+        o.mutex.unlock(o.io);
+    }
+
+    fn enqueue(o: *Owner, conn: *Connection, frame: []u8) void {
+        conn.mutex.lockUncancelable(o.io);
+        const over = conn.queued_bytes + frame.len > 2 * wire.max_frame_bytes;
+        if (conn.closed or over) {
+            if (!conn.closed and over) debug_trace.logf("mcp-owner", "owner client disconnected reason=write queue over its cap", .{});
+            conn.closed = true;
+            conn.changed.broadcast(o.io);
+            conn.mutex.unlock(o.io);
+            o.gpa.free(frame);
+            if (over and !conn.gone) o.disconnect(conn);
+            return;
+        }
+        conn.queue.append(o.gpa, frame) catch {
+            conn.mutex.unlock(o.io);
+            o.gpa.free(frame);
+            return;
+        };
+        conn.queued_bytes += frame.len;
+        conn.changed.signal(o.io);
+        conn.mutex.unlock(o.io);
+    }
+
+    fn closeAll(o: *Owner) void {
+        for (o.connections) |maybe| {
+            const conn = maybe orelse continue;
+            conn.mutex.lockUncancelable(o.io);
+            const open = !conn.socket_closed;
+            conn.socket_closed = true;
+            conn.closed = true;
+            conn.changed.broadcast(o.io);
+            conn.mutex.unlock(o.io);
+            if (open) conn.stream.shutdown(o.io, .both) catch {};
+            if (conn.reader) |thread| thread.join();
+            if (conn.writer) |thread| thread.join();
+            for (conn.queue.items) |frame| o.gpa.free(frame);
+            conn.queue.deinit(o.gpa);
+            o.gpa.destroy(conn);
+        }
+        o.connections = @splat(null);
+    }
+
+    /// Stops every connection's socket, so a reader blocked in `read` returns
+    /// and a writer's next write fails: the threads can then be joined.
+    fn shutdownAll(o: *Owner) void {
+        for (o.connections) |maybe| {
+            const conn = maybe orelse continue;
+            conn.mutex.lockUncancelable(o.io);
+            const open = !conn.socket_closed;
+            if (open) conn.socket_closed = true;
+            conn.mutex.unlock(o.io);
+            if (open) conn.stream.shutdown(o.io, .both) catch {};
+        }
+    }
+};
+
+/// A registered server's config, owned by the owner process.
+const OwnedConfig = struct {
+    argv: [][]u8,
+    env: [][2][]u8,
+    cwd: ?[]u8,
+    timeouts: ?wire.ServerConfig.Timeouts,
+    auth: struct {
+        client_id: ?[]u8 = null,
+        client_secret: ?[]u8 = null,
+        client_metadata_url: ?[]u8 = null,
+        resource: ?[]u8 = null,
+        scopes: ?[]u8 = null,
+        client_name: []u8,
+    },
+
+    fn deinit(c: *OwnedConfig, gpa: Allocator) void {
+        for (c.argv) |arg| gpa.free(arg);
+        gpa.free(c.argv);
+        for (c.env) |pair| {
+            gpa.free(pair[0]);
+            gpa.free(pair[1]);
+        }
+        gpa.free(c.env);
+        if (c.cwd) |cwd| gpa.free(cwd);
+        inline for (.{ "client_id", "client_secret", "client_metadata_url", "resource", "scopes" }) |field| {
+            if (@field(c.auth, field)) |value| gpa.free(value);
+        }
+        gpa.free(c.auth.client_name);
+        c.* = undefined;
+    }
+};
+
+fn ownConfig(gpa: Allocator, config: wire.ServerConfig) Allocator.Error!OwnedConfig {
+    var owned: OwnedConfig = .{
+        .argv = &.{},
+        .env = &.{},
+        .cwd = null,
+        .timeouts = config.timeouts,
+        .auth = .{ .client_name = &.{} },
+    };
+    errdefer owned.deinit(gpa);
+    owned.argv = try gpa.alloc([]u8, config.argv.len);
+    for (config.argv, owned.argv) |arg, *copy| copy.* = try gpa.dupe(u8, arg);
+    owned.env = try gpa.alloc([2][]u8, config.env.len);
+    for (config.env, owned.env) |entry, *pair| {
+        pair.* = .{ try gpa.dupe(u8, entry.name), try gpa.dupe(u8, entry.value) };
+    }
+    if (config.cwd) |cwd| owned.cwd = try gpa.dupe(u8, cwd);
+    inline for (.{ "client_id", "client_secret", "client_metadata_url", "resource", "scopes" }) |field| {
+        if (@field(config.auth, field)) |value| @field(owned.auth, field) = try gpa.dupe(u8, value);
+    }
+    owned.auth.client_name = try gpa.dupe(u8, config.auth.client_name);
+    return owned;
+}
+
+fn engineConfig(arena: Allocator, key: core.Key, config: *const OwnedConfig) Allocator.Error!engine.Config {
+    const argv = try arena.alloc([]const u8, config.argv.len);
+    for (config.argv, argv) |arg, *copy| copy.* = arg;
+    const map = try arena.create(std.process.Environ.Map);
+    map.* = .init(arena);
+    for (config.env) |pair| try map.put(pair[0], pair[1]);
+    var auth: @FieldType(engine.Config, "auth") = .{ .client_name = config.auth.client_name };
+    inline for (.{ "client_id", "client_secret", "client_metadata_url", "resource", "scopes" }) |field| {
+        @field(auth, field) = @field(config.auth, field);
+    }
+    const timeouts: ?mcp.core.request.Timeouts = if (config.timeouts) |t| .{
+        .start_ms = t.start_ms,
+        .idle_ms = t.idle_ms,
+        .hard_ms = t.hard_ms,
+        .reset_idle_on_progress = t.reset_idle_on_progress,
+        .refresh_ms = t.refresh_ms,
+        .refused_ms = t.refused_ms,
+    } else null;
+    return .{
+        .name = try arena.dupe(u8, &key),
+        .transport = .{ .stdio = .{ .argv = argv, .environ_map = map, .cwd = config.cwd } },
+        .auth = auth,
+        .timeouts = timeouts,
+    };
+}
+
+fn gate() @FieldType(engine.Options, "gate") {
+    var config: @FieldType(engine.Options, "gate") = .{ .idle_ms = idle_control.idleMs() };
+    if (config.idle_ms != 0) config.stable_ms = @min(config.stable_ms, config.idle_ms);
+    return config;
+}
+
+fn allowAll(_: *anyopaque, _: []const u8, _: []const u8, _: ?[]const u8) bool {
+    return true;
+}
+
+fn logStderr(_: *anyopaque, server: []const u8, line: []const u8) void {
+    // The `mcp` scope, as the session's own server log uses: the servers run
+    // here now, and a person tracing MCP should see them wherever they run.
+    debug_trace.logf("mcp", "MCP server stderr server={s} line={s}", .{ server, line[0..@min(line.len, 512)] });
+}
+
+fn keyFromName(name: []const u8) ?core.Key {
+    if (name.len != 32) return null;
+    var key: core.Key = undefined;
+    @memcpy(&key, name);
+    return key;
+}
+
+fn slotOf(owner: *Owner, key: core.Key) ?usize {
+    for (owner.engine_configs.items, 0..) |config, index| {
+        if (std.mem.eql(u8, config.name, &key)) return index;
+    }
+    return null;
+}
+
+fn rememberConfig(owner: *Owner, key: core.Key, config: wire.ServerConfig) void {
+    if (owner.configs.contains(&key)) return;
+    const owned = ownConfig(owner.gpa, config) catch {
+        debug_trace.logf("mcp-owner", "owner config dropped reason=out of memory", .{});
+        return;
+    };
+    const name = owner.gpa.dupe(u8, &key) catch {
+        var copy = owned;
+        copy.deinit(owner.gpa);
+        return;
+    };
+    owner.configs.put(owner.gpa, name, owned) catch {
+        owner.gpa.free(name);
+        var copy = owned;
+        copy.deinit(owner.gpa);
+    };
+}
+
+/// Serves until the last client has been gone for `exit_grace_ms` or `stop`
+/// is set. `error.LockBusy` means another owner holds the lock.
+pub fn serve(io: std.Io, gpa: Allocator, fx_home: []const u8, stop: *std.atomic.Value(bool)) !void {
+    const run_dir = try std.Io.Dir.path.join(gpa, &.{ fx_home, run_dir_name });
+    defer gpa.free(run_dir);
+    std.Io.Dir.cwd().createDir(io, run_dir, .fromMode(0o700)) catch |err| switch (err) {
+        error.PathAlreadyExists => {},
+        else => return err,
+    };
+    var dir: io_mod.VerifiedDir = .{ .dir = try std.Io.Dir.openDirAbsolute(io, run_dir, .{ .iterate = true }) };
+    defer dir.close();
+    var held = io_mod.acquireTimedAdvisoryLock(&dir, lock_name, 0) catch |err| switch (err) {
+        error.LockBusy => return error.LockBusy,
+        else => return err,
+    };
+    defer held.release();
+
+    const socket_path = try std.Io.Dir.path.join(gpa, &.{ run_dir, socket_name });
+    defer gpa.free(socket_path);
+    std.Io.Dir.cwd().deleteFile(io, socket_path) catch {};
+    var address = try std.Io.net.UnixAddress.init(socket_path);
+    var listener = try address.listen(io, .{});
+    var listening = true;
+    defer if (listening) listener.deinit(io);
+    std.Io.Dir.cwd().setFilePermissions(io, socket_path, .fromMode(0o600), .{ .follow_symlinks = false }) catch {};
+
+    var owner: Owner = .{ .io = io, .gpa = gpa, .stop = stop, .engine_arena = .init(gpa) };
+    defer owner.engine_arena.deinit();
+    owner.last_open_ms = owner.now();
+    const loop = std.Thread.spawn(.{}, ownerLoop, .{&owner}) catch |err| {
+        listener.deinit(io);
+        listening = false;
+        std.Io.Dir.cwd().deleteFile(io, socket_path) catch {};
+        return err;
+    };
+
+    while (!owner.stopping()) {
+        var fds = [_]std.posix.pollfd{.{ .fd = listener.socket.handle, .events = std.posix.POLL.IN, .revents = 0 }};
+        const ready = std.posix.poll(&fds, poll_ms) catch 0;
+        if (ready == 0) continue;
+        const stream = listener.accept(io) catch |err| {
+            if (owner.stopping()) break;
+            debug_trace.logf("mcp-owner", "owner accept failed err={s}", .{@errorName(err)});
+            continue;
+        };
+        owner.addConnection(stream) catch |err| {
+            debug_trace.logf("mcp-owner", "owner connection refused err={s}", .{@errorName(err)});
+            stream.close(io);
+        };
+    }
+
+    // The order is fixed: the listening socket closes, every connection's
+    // socket is shut down so its reader returns and its writer stops, their
+    // threads are joined, the owner loop ends (and with it the engine, which
+    // stops every server), the socket file goes, and the lock is released as
+    // this function returns.
+    listener.deinit(io);
+    listening = false;
+    owner.shutdownAll();
+    owner.stop.store(true, .release);
+    loop.join();
+    owner.closeAll();
+    std.Io.Dir.cwd().deleteFile(io, socket_path) catch {};
+    var iterator = owner.configs.iterator();
+    while (iterator.next()) |entry| {
+        gpa.free(entry.key_ptr.*);
+        entry.value_ptr.deinit(gpa);
+    }
+    owner.configs.deinit(gpa);
+    owner.engine_configs.deinit(gpa);
+    owner.events.deinit(gpa);
+}
+
+fn ownerLoop(owner: *Owner) void {
+    const io = owner.io;
+    const gpa = owner.gpa;
+    var engine_value: engine.Engine = undefined;
+    engine_value.init(io, gpa, .{ .context = owner, .allow = allowAll, .log = logStderr }, .{
+        .client = .{ .info = .{ .name = "fx", .version = "owner" }, .capabilities = "{\"elicitation\":{\"form\":{},\"url\":{}}}" },
+        .gate = gate(),
+    }, &.{}) catch |err| {
+        debug_trace.logf("mcp-owner", "owner engine did not start err={s}", .{@errorName(err)});
+        owner.stop.store(true, .release);
+        return;
+    };
+    defer engine_value.deinit();
+    var state: core.State = .{};
+    var taken: std.ArrayList(ShellEvent) = .empty;
+    defer taken.deinit(gpa);
+    var scratch: std.heap.ArenaAllocator = .init(gpa);
+    defer scratch.deinit();
+    while (!owner.stopping()) {
+        // Effects can push events too (`issued`, `issue_failed`); they are
+        // stepped before the engine is read, so a call never looks orphaned.
+        while (true) {
+            taken.clearRetainingCapacity();
+            owner.takeEvents(&taken);
+            if (taken.items.len == 0) break;
+            for (taken.items) |*shell_event| {
+                const event = shell_event.event();
+                var output: core.Output = .{};
+                core.step(&state, event, &output);
+                _ = scratch.reset(.retain_capacity);
+                apply(owner, &state, &engine_value, &scratch, output.effects());
+                shell_event.deinit(gpa);
+            }
+        }
+        if (engine_value.next(poll_ms)) |maybe| {
+            if (maybe) |event| {
+                stepEngineEvent(owner, &state, &engine_value, &scratch, event);
+            }
+        } else |err| {
+            debug_trace.logf("mcp-owner", "owner engine step failed err={s}", .{@errorName(err)});
+        }
+        owner.mutex.lockUncancelable(io);
+        const open = owner.open;
+        const last = owner.last_open_ms;
+        owner.mutex.unlock(io);
+        if (open == 0 and owner.now() - last >= exit_grace_ms) owner.stop.store(true, .release);
+    }
+}
+
+fn apply(owner: *Owner, state: *core.State, engine_value: *engine.Engine, scratch: *std.heap.ArenaAllocator, effects: []const core.Effect) void {
+    const a = scratch.allocator();
+    for (effects) |effect| switch (effect) {
+        .send => |send| {
+            const conn = owner.connectionOf(send.to) orelse {
+                continue;
+            };
+            const frame = wire.encode(owner.gpa, send.message) catch |err| {
+                debug_trace.logf("mcp-owner", "owner frame not built err={s}", .{@errorName(err)});
+                continue;
+            };
+            owner.enqueue(conn, frame);
+        },
+        .broadcast => |broadcast| {
+            const clients = core.clientsOf(state, broadcast.key) orelse continue;
+            var index: usize = 0;
+            while (index < core.max_clients) : (index += 1) {
+                if (!clients.isSet(index)) continue;
+                const id: core.ClientId = @fromBackingInt(@as(u32, @intCast(index + 1)));
+                const conn = owner.connectionOf(id) orelse continue;
+                const message = broadcastMessage(owner, engine_value, a, broadcast.key, broadcast.what) orelse continue;
+                const frame = wire.encode(owner.gpa, message) catch continue;
+                owner.enqueue(conn, frame);
+            }
+        },
+        .register_slot => |slot| {
+            const config = owner.configs.getPtr(&slot.key) orelse continue;
+            if (slotOf(owner, slot.key) != null) continue;
+            const built = engineConfig(owner.engine_arena.allocator(), slot.key, config) catch continue;
+            owner.engine_configs.append(owner.gpa, built) catch continue;
+            engine_value.reload(owner.engine_configs.items) catch |err| {
+                debug_trace.logf("mcp-owner", "owner server not registered err={s}", .{@errorName(err)});
+            };
+        },
+        .need => |need| {
+            engine_value.needTools(&need.key) catch |err| {
+                debug_trace.logf("mcp-owner", "owner tool list not started err={s}", .{@errorName(err)});
+            };
+        },
+        .call => |call| {
+            const handle = engine_value.call(&call.key, call.tool, call.arguments) catch |err| {
+                debug_trace.logf("mcp-owner", "owner call not issued err={s}", .{@errorName(err)});
+                owner.push(.{ .core = .{ .issue_failed = .{ .call = call.call } } });
+                continue;
+            };
+            owner.push(.{ .core = .{ .issued = .{ .call = call.call, .handle = handle } } });
+        },
+        .cancel => |cancel| {
+            engine_value.cancel(cancel.handle) catch {};
+        },
+        .respond => |respond| {
+            const values = std.json.parseFromSliceLeaky([]const []const u8, a, respond.values, .{}) catch continue;
+            engine_value.respond(respond.handle, values) catch {};
+        },
+        .answer => |answer| engine_value.answerElicitation(&answer.key, .{ .slot = answer.slot, .n = answer.n }, .{ .action = answer.action, .content = answer.content }) catch |err| {
+            debug_trace.logf("mcp-owner", "owner answer not sent err={s}", .{@errorName(err)});
+        },
+        .disconnect => |disconnect| {
+            engine_value.disconnect(&disconnect.key) catch |err| {
+                debug_trace.logf("mcp-owner", "owner server not disconnected err={s}", .{@errorName(err)});
+            };
+        },
+        .refuse => |refuse| {
+            const conn = owner.connectionOf(refuse.to) orelse continue;
+            debug_trace.logf("mcp-owner", "owner client refused reason={s}", .{@tagName(refuse.reason)});
+            owner.disconnect(conn);
+        },
+        .log => |log| debug_trace.logf("mcp-owner", "owner dropped user state what={s} client={?d}", .{ @tagName(log.what), if (log.client) |c| @backingInt(c) else null }),
+    };
+}
+
+fn broadcastMessage(owner: *Owner, engine_value: *engine.Engine, a: Allocator, key: core.Key, what: core.Broadcast) ?wire.OwnerMessage {
+    return switch (what) {
+        .phase => |phase| .{ .phase = .{ .key = key, .phase = phase } },
+        .tools => |tools| .{ .tools = .{ .key = key, .ok = tools.ok, .fresh = tools.fresh, .needs_auth = tools.needs_auth, .tools = toolsJson(owner, engine_value, a, key) } },
+        .status => statusMessage(owner, engine_value, a, key) orelse return null,
+        .stopped_idle => .{ .stopped_idle = .{ .key = key } },
+        .elicitation_complete => |slot| .{ .elicitation_complete = .{ .key = key, .slot = slot } },
+        .elicit_withdrawn => |slot| .{ .elicit_withdrawn = .{ .key = key, .slot = slot } },
+    };
+}
+
+fn statusMessage(owner: *Owner, engine_value: *engine.Engine, a: Allocator, key: core.Key) ?wire.OwnerMessage {
+    // A status asked for before the engine has the slot (registration, before
+    // the first need) has nothing to say; a made-up idle phase would overwrite
+    // the phase the phases before it told the client.
+    const index = slotOf(owner, key) orelse {
+        debug_trace.logf("mcp-owner", "owner status dropped reason=no engine slot yet", .{});
+        return null;
+    };
+    const status = engine_value.status(index);
+    var tail_buf: [mcp.stdio.tail_max]u8 = undefined;
+    const tail = engine_value.stderrTail(index, &tail_buf);
+    return .{ .status = .{
+        .key = key,
+        .phase = status.phase,
+        .version = if (status.version) |v| a.dupe(u8, v) catch null else null,
+        .last_error = if (status.last_error) |e| a.dupe(u8, e) catch null else null,
+        .stderr_tail = if (tail) |t| a.dupe(u8, t) catch null else null,
+        .instructions = if (engine_value.instructions(&key)) |text| a.dupe(u8, text) catch null else null,
+        .exit_code = if (status.exit) |e| (switch (e) {
+            .code => |c| c,
+            .signal => null,
+        }) else null,
+        .exit_signal = if (status.exit) |e| (switch (e) {
+            .signal => |n| n,
+            .code => null,
+        }) else null,
+        .stray_line = if (status.stray_line) |line| a.dupe(u8, line) catch null else null,
+    } };
+}
+
+fn toolsJson(owner: *Owner, engine_value: *engine.Engine, a: Allocator, key: core.Key) []const u8 {
+    _ = owner;
+    const list = engine_value.toolList(&key) catch return "[]";
+    var out: std.ArrayList(u8) = .empty;
+    out.append(a, '[') catch return "[]";
+    for (0..list.len()) |i| {
+        if (i > 0) out.append(a, ',') catch return "[]";
+        out.appendSlice(a, list.get(i).raw) catch return "[]";
+    }
+    out.append(a, ']') catch return "[]";
+    return out.items;
+}
+
+/// One engine event, stepped and applied in the same iteration so the strings
+/// it borrows from the engine stay valid.
+fn stepEngineEvent(owner: *Owner, state: *core.State, engine_value: *engine.Engine, scratch: *std.heap.ArenaAllocator, event: engine.Event) void {
+    _ = scratch.reset(.retain_capacity);
+    const a = scratch.allocator();
+    const key = keyFromName(event.server) orelse return;
+    var core_event: ?core.Event = null;
+    switch (event.kind) {
+        .phase => |phase| core_event = .{ .engine_phase = .{ .key = key, .phase = phase } },
+        .called => |called| {
+            var answer: ?[]const u8 = null;
+            if (called.answer) |call| {
+                var out: std.Io.Writer.Allocating = .init(a);
+                std.json.Stringify.value(call, .{}, &out.writer) catch {};
+                answer = out.written();
+            }
+            core_event = .{ .engine_called = .{
+                .handle = called.call,
+                .outcome = called.outcome,
+                .maybe_ran = called.maybe_ran,
+                .timed_out = called.timed_out,
+                .oversized = called.oversized,
+                .answer = answer,
+                .refused_bytes = called.refused_bytes,
+                .refused_body = called.refused_body,
+            } };
+        },
+        .progress => |progress| core_event = .{ .engine_progress = .{
+            .handle = progress.call,
+            .progress = progress.progress,
+            .total = progress.total,
+            .message = if (progress.message) |message| a.dupe(u8, message) catch null else null,
+        } },
+        .input => |input| core_event = .{ .engine_input = .{ .handle = input.call, .requests = requestsJson(a, input.requests) } },
+        .server => |server| switch (server) {
+            .tools => |tools| core_event = .{ .engine_tools = .{ .key = key, .ok = tools.ok, .fresh = tools.fresh, .needs_auth = tools.needs_auth } },
+            .elicit => |elicit| {
+                const version = if (slotOf(owner, key)) |index| engine_value.status(index).version else null;
+                core_event = .{ .engine_question = .{
+                    .key = key,
+                    .slot = elicit.id.slot,
+                    .n = elicit.id.n,
+                    .kind = if (std.mem.find(u8, elicit.params, "\"mode\":\"url\"") != null) .url else .form,
+                    .params = a.dupe(u8, elicit.params) catch return,
+                    .version = if (version) |v| a.dupe(u8, v) catch null else null,
+                    .required = elicit.required,
+                } };
+            },
+            .elicitation_complete => |slot| core_event = .{ .engine_elicitation_complete = .{ .key = key, .slot = slot } },
+            .elicit_withdrawn => |slot| core_event = .{ .engine_elicitation_withdrawn = .{ .key = key, .slot = slot } },
+            else => {},
+        },
+        .stopped_idle => core_event = .{ .engine_stopped_idle = .{ .key = key } },
+    }
+    if (core_event) |e| {
+        var output: core.Output = .{};
+        core.step(state, e, &output);
+        apply(owner, state, engine_value, scratch, output.effects());
+    }
+    // Every event refreshes what the clients know about the server.
+    var status_output: core.Output = .{};
+    core.step(state, .{ .engine_status = .{ .key = key } }, &status_output);
+    apply(owner, state, engine_value, scratch, status_output.effects());
+}
+
+fn requestsJson(a: Allocator, requests: []const mcp.mrtr.Request) []const u8 {
+    // The whole request, so the session reads back what the server wrote: its
+    // key, kind, params, and request object.
+    var out: std.Io.Writer.Allocating = .init(a);
+    std.json.Stringify.value(requests, .{}, &out.writer) catch return "[]";
+    return out.written();
+}
+
+fn readerLoop(conn: *Connection) void {
+    const owner = conn.owner;
+    var header: [wire.header_bytes]u8 = undefined;
+    while (true) {
+        readExact(conn, &header) catch return owner.disconnect(conn);
+        const length = wire.readLength(&header) catch return owner.disconnect(conn);
+        const payload = owner.gpa.alloc(u8, length) catch return owner.disconnect(conn);
+        defer owner.gpa.free(payload);
+        readExact(conn, payload) catch return owner.disconnect(conn);
+        var arena = std.heap.ArenaAllocator.init(owner.gpa);
+        defer arena.deinit();
+        const message = wire.decode(arena.allocator(), payload) catch return owner.disconnect(conn);
+        switch (message) {
+            .client => |client| switch (client) {
+                .hello => owner.push(.{ .core = .{ .hello = conn.id } }),
+                .register => |register| {
+                    rememberConfig(owner, register.key, register.config);
+                    owner.push(.{ .core = .{ .registered = .{ .client = conn.id, .key = register.key, .ask_form = register.ask_form, .ask_url = register.ask_url } } });
+                },
+                .need => |need| owner.push(.{ .core = .{ .need = .{ .client = conn.id, .key = need.key } } }),
+                .unregister => |left| owner.push(.{ .core = .{ .unregister = .{ .client = conn.id, .key = left.key } } }),
+                .call => |call| {
+                    const tool = owner.gpa.dupe(u8, call.tool) catch return owner.disconnect(conn);
+                    const arguments = if (call.arguments) |args| owner.gpa.dupe(u8, args) catch {
+                        owner.gpa.free(tool);
+                        return owner.disconnect(conn);
+                    } else null;
+                    owner.push(.{ .call = .{ .client = conn.id, .id = call.id, .key = call.key, .tool = tool, .arguments = arguments } });
+                },
+                .cancel => |cancel| owner.push(.{ .core = .{ .cancel = .{ .client = conn.id, .id = cancel.id } } }),
+                .respond => |respond| {
+                    const values = owner.gpa.dupe(u8, respond.values) catch return owner.disconnect(conn);
+                    owner.push(.{ .respond = .{ .client = conn.id, .id = respond.id, .values = values } });
+                },
+                .answer => |answer| {
+                    const content = if (answer.content) |text| owner.gpa.dupe(u8, text) catch return owner.disconnect(conn) else null;
+                    owner.push(.{ .answer = .{ .client = conn.id, .key = answer.key, .slot = answer.slot, .n = answer.n, .action = answer.action, .content = content } });
+                },
+                .bye => {
+                    owner.push(.{ .core = .{ .bye = conn.id } });
+                    return owner.disconnect(conn);
+                },
+            },
+            // The owner's messages are not for it.
+            .owner => return owner.disconnect(conn),
+        }
+    }
+}
+
+fn writerLoop(conn: *Connection) void {
+    const owner = conn.owner;
+    const io = owner.io;
+    while (true) {
+        conn.mutex.lockUncancelable(io);
+        while (conn.queue.items.len == 0 and !conn.closed) conn.changed.waitUncancelable(io, &conn.mutex);
+        if (conn.queue.items.len == 0 and conn.closed) {
+            conn.mutex.unlock(io);
+            break;
+        }
+        const frame = conn.queue.orderedRemove(0);
+        conn.queued_bytes -= frame.len;
+        conn.mutex.unlock(io);
+        defer owner.gpa.free(frame);
+        writeAll(conn, frame) catch {
+            owner.disconnect(conn);
+            break;
+        };
+    }
+    conn.mutex.lockUncancelable(io);
+    conn.socket_closed = true;
+    conn.mutex.unlock(io);
+    conn.stream.close(io);
+}
+
+fn readExact(conn: *Connection, buffer: []u8) !void {
+    const io = conn.owner.io;
+    var read: usize = 0;
+    while (read < buffer.len) {
+        const n = std.posix.read(conn.stream.socket.handle, buffer[read..]) catch |err| switch (err) {
+            error.WouldBlock => continue,
+            else => return err,
+        };
+        if (n == 0) return error.Closed;
+        read += n;
+    }
+    _ = io;
+}
+
+fn writeAll(conn: *Connection, bytes: []const u8) !void {
+    var written: usize = 0;
+    while (written < bytes.len) {
+        const rc = std.c.write(conn.stream.socket.handle, bytes[written..].ptr, bytes.len - written);
+        if (rc < 0) {
+            const errno = std.posix.errno(rc);
+            if (errno == .INTR or errno == .AGAIN) continue;
+            return error.WriteFailed;
+        }
+        if (rc == 0) return error.Closed;
+        written += @intCast(rc);
+    }
+}
+
+const testing = std.testing;
+const fake_server = @import("fake_server.zig");
+
+const test_key: core.Key = "00112233445566778899aabbccddeeff".*;
+
+fn socketPath(alloc: Allocator, home: []const u8) ![]u8 {
+    return std.Io.Dir.path.join(alloc, &.{ home, run_dir_name, socket_name });
+}
+
+fn serveThread(io: std.Io, gpa: Allocator, home: []const u8, stop: *std.atomic.Value(bool)) void {
+    serve(io, gpa, home, stop) catch |err| {
+        debug_trace.logf("mcp-owner", "test owner ended err={s}", .{@errorName(err)});
+    };
+}
+
+const TestClient = struct {
+    stream: std.Io.net.Stream,
+    closed: bool = false,
+    next: u32 = 1,
+
+    fn connect(path: []const u8) !TestClient {
+        const address = try std.Io.net.UnixAddress.init(path);
+        return .{ .stream = try address.connect(testing.io) };
+    }
+
+    fn send(c: *TestClient, message: wire.ClientMessage) !void {
+        const frame = try wire.encode(testing.allocator, message);
+        defer testing.allocator.free(frame);
+        try writeAllFd(c.stream.socket.handle, frame);
+    }
+
+    /// The next frame, skipping the welcome the owner opens with.
+    fn receive(c: *TestClient, arena: Allocator, timeout_ms: i64) !wire.Message {
+        const deadline = std.Io.Clock.awake.now(testing.io).toMilliseconds() + timeout_ms;
+        while (true) {
+            const left = deadline - std.Io.Clock.awake.now(testing.io).toMilliseconds();
+            if (left <= 0) return error.Timeout;
+            var fds = [_]std.posix.pollfd{.{ .fd = c.stream.socket.handle, .events = std.posix.POLL.IN, .revents = 0 }};
+            const ready = try std.posix.poll(&fds, @intCast(@min(left, 50)));
+            if (ready == 0) continue;
+            break;
+        }
+        var header: [wire.header_bytes]u8 = undefined;
+        try readExactFd(c.stream.socket.handle, &header);
+        const length = try wire.readLength(&header);
+        const payload = try arena.alloc(u8, length);
+        try readExactFd(c.stream.socket.handle, payload);
+        return try wire.decode(arena, payload);
+    }
+
+    /// The first `called` for call `id`, skipping other frames.
+    fn called(c: *TestClient, arena: Allocator, id: u32, timeout_ms: i64) !wire.OwnerMessage {
+        const deadline = std.Io.Clock.awake.now(testing.io).toMilliseconds() + timeout_ms;
+        while (true) {
+            const left = deadline - std.Io.Clock.awake.now(testing.io).toMilliseconds();
+            if (left <= 0) return error.Timeout;
+            const message = c.receive(arena, left) catch |err| return err;
+            switch (message) {
+                .owner => |owner| switch (owner) {
+                    .called => |call| if (call.id == id) return owner,
+                    .welcome => continue,
+                    else => {},
+                },
+                .client => return error.UnexpectedMessage,
+            }
+        }
+    }
+
+    fn close(c: *TestClient) void {
+        if (c.closed) return;
+        c.closed = true;
+        c.stream.close(testing.io);
+    }
+};
+
+fn readExactFd(fd: std.posix.socket_t, buffer: []u8) !void {
+    var read: usize = 0;
+    while (read < buffer.len) {
+        const n = std.posix.read(fd, buffer[read..]) catch |err| switch (err) {
+            error.WouldBlock => continue,
+            else => return err,
+        };
+        if (n == 0) return error.Closed;
+        read += n;
+    }
+}
+
+fn writeAllFd(fd: std.posix.socket_t, bytes: []const u8) !void {
+    var written: usize = 0;
+    while (written < bytes.len) {
+        const rc = std.c.write(fd, bytes[written..].ptr, bytes.len - written);
+        if (rc < 0) {
+            const errno = std.posix.errno(rc);
+            if (errno == .INTR or errno == .AGAIN) continue;
+            return error.WriteFailed;
+        }
+        if (rc == 0) return error.Closed;
+        written += @intCast(rc);
+    }
+}
+
+var home_count = std.atomic.Value(u32).init(0);
+
+/// A short fx home, because a Unix socket path is limited to 103 bytes and a
+/// test's tmpDir path is longer than that.
+fn shortHome(alloc: Allocator) ![]u8 {
+    const n = home_count.fetchAdd(1, .monotonic);
+    const path = try alloc.print("/tmp/fx-owner-test-{d}-{d}", .{ std.c.getpid(), n });
+    std.Io.Dir.cwd().deleteTree(testing.io, path) catch {};
+    try std.Io.Dir.cwd().createDir(testing.io, path, .fromMode(0o700));
+    return path;
+}
+
+fn removeHome(alloc: Allocator, path: []u8) void {
+    std.Io.Dir.cwd().deleteTree(testing.io, path) catch {};
+    alloc.free(path);
+}
+
+fn waitForSocket(path: []const u8) !void {
+    const deadline = std.Io.Clock.awake.now(testing.io).toMilliseconds() + 5_000;
+    while (std.Io.Clock.awake.now(testing.io).toMilliseconds() < deadline) {
+        const address = std.Io.net.UnixAddress.init(path) catch |err| return err;
+        if (address.connect(testing.io)) |stream| {
+            stream.close(testing.io);
+            return;
+        } else |_| {
+            testing.io.sleep(.fromMilliseconds(20), .awake) catch {};
+        }
+    }
+    return error.SocketNeverAppeared;
+}
+
+fn pidFromAnswer(answer: []const u8) !std.posix.pid_t {
+    const at = std.mem.find(u8, answer, "pid=") orelse return error.NoPid;
+    const digits = answer[at + 4 ..];
+    const end = std.mem.findNone(u8, digits, "0123456789") orelse digits.len;
+    return std.fmt.parseInt(std.posix.pid_t, digits[0..end], 10);
+}
+
+fn running(pid: std.posix.pid_t) !bool {
+    std.posix.kill(pid, @fromBackingInt(@intCast(0))) catch |err| switch (err) {
+        error.ProcessNotFound => return false,
+        else => return err,
+    };
+    return true;
+}
+
+fn registerFor(c: *TestClient, server: []const u8) !void {
+    try c.send(.{ .hello = .{ .pid = 1 } });
+    try c.send(.{ .register = .{
+        .key = test_key,
+        .config = .{ .argv = &.{server}, .timeouts = .{ .start_ms = 15_000 } },
+        .ask_form = true,
+        .ask_url = true,
+    } });
+}
+
+test "two clients registered for one key share one server process" {
+    const alloc = testing.allocator;
+    const home = try shortHome(alloc);
+    defer removeHome(alloc, home);
+    var fixture: fake_server.Fixture = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    var stop = std.atomic.Value(bool).init(false);
+    const thread = try std.Thread.spawn(.{}, serveThread, .{ testing.io, alloc, home, &stop });
+    var joined = false;
+    defer if (!joined) {
+        stop.store(true, .release);
+        thread.join();
+    };
+    const path = try socketPath(alloc, home);
+    defer alloc.free(path);
+    try waitForSocket(path);
+
+    var first = try TestClient.connect(path);
+    defer first.close();
+    var second = try TestClient.connect(path);
+    defer second.close();
+    try registerFor(&first, fixture.server);
+    try registerFor(&second, fixture.server);
+    var arena: std.heap.ArenaAllocator = .init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // Let both registrations arrive before the calls, so they share the slot.
+    testing.io.sleep(.fromMilliseconds(100), .awake) catch {};
+    try first.send(.{ .call = .{ .key = test_key, .id = first.next, .tool = "echo", .arguments = "{\"text\":\"pid\"}" } });
+    const one = try first.called(a, first.next, 10_000);
+    try second.send(.{ .call = .{ .key = test_key, .id = 1, .tool = "echo", .arguments = "{\"text\":\"pid\"}" } });
+    const two = try second.called(a, 1, 10_000);
+    const first_pid = try pidFromAnswer(one.called.answer.?);
+    const second_pid = try pidFromAnswer(two.called.answer.?);
+    try testing.expectEqual(first_pid, second_pid);
+
+    // Leaving: close both, stop the owner.
+    first.close();
+    second.close();
+    stop.store(true, .release);
+    thread.join();
+    joined = true;
+}
+
+test "a client that leaves during a slow call does not end the other client's call" {
+    const alloc = testing.allocator;
+    const home = try shortHome(alloc);
+    defer removeHome(alloc, home);
+    var fixture: fake_server.Fixture = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    var stop = std.atomic.Value(bool).init(false);
+    const thread = try std.Thread.spawn(.{}, serveThread, .{ testing.io, alloc, home, &stop });
+    var joined = false;
+    defer if (!joined) {
+        stop.store(true, .release);
+        thread.join();
+    };
+    const path = try socketPath(alloc, home);
+    defer alloc.free(path);
+    try waitForSocket(path);
+
+    var caller = try TestClient.connect(path);
+    defer caller.close();
+    var leaving = try TestClient.connect(path);
+    try registerFor(&caller, fixture.server);
+    try registerFor(&leaving, fixture.server);
+    testing.io.sleep(.fromMilliseconds(100), .awake) catch {};
+    // The fake never answers a call that mentions "slow".
+    try caller.send(.{ .call = .{ .key = test_key, .id = 1, .tool = "echo", .arguments = "{\"text\":\"slow\"}" } });
+    testing.io.sleep(.fromMilliseconds(200), .awake) catch {};
+    leaving.close();
+    var arena: std.heap.ArenaAllocator = .init(alloc);
+    defer arena.deinit();
+    // Nothing ended the caller's call.
+    _ = caller.called(arena.allocator(), 1, 400) catch |err| switch (err) {
+        error.Timeout => {},
+        else => return err,
+    };
+    // It ends when its own caller cancels it.
+    try caller.send(.{ .cancel = .{ .id = 1 } });
+    const ended = try caller.called(arena.allocator(), 1, 5_000);
+    try testing.expectEqual(engine.Outcome.cancelled, ended.called.outcome);
+
+    caller.close();
+    stop.store(true, .release);
+    thread.join();
+    joined = true;
+}
+
+test "a server stops when its last client leaves, and the owner returns" {
+    const alloc = testing.allocator;
+    const home = try shortHome(alloc);
+    defer removeHome(alloc, home);
+    var fixture: fake_server.Fixture = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    var stop = std.atomic.Value(bool).init(false);
+    const thread = try std.Thread.spawn(.{}, serveThread, .{ testing.io, alloc, home, &stop });
+    const path = try socketPath(alloc, home);
+    defer alloc.free(path);
+    try waitForSocket(path);
+
+    var client = try TestClient.connect(path);
+    try registerFor(&client, fixture.server);
+    var arena: std.heap.ArenaAllocator = .init(alloc);
+    defer arena.deinit();
+    try client.send(.{ .call = .{ .key = test_key, .id = 1, .tool = "echo", .arguments = "{\"text\":\"pid\"}" } });
+    const called = try client.called(arena.allocator(), 1, 10_000);
+    const pid = try pidFromAnswer(called.called.answer.?);
+
+    // The session says goodbye; the owner disconnects the key and stops the server.
+    try client.send(.bye);
+    client.close();
+    const deadline = std.Io.Clock.awake.now(testing.io).toMilliseconds() + 5_000;
+    while (try running(pid)) {
+        if (std.Io.Clock.awake.now(testing.io).toMilliseconds() > deadline) return error.ServerStillRunning;
+        testing.io.sleep(.fromMilliseconds(20), .awake) catch {};
+    }
+    const before = std.Io.Clock.awake.now(testing.io).toMilliseconds();
+    thread.join();
+    try testing.expect(std.Io.Clock.awake.now(testing.io).toMilliseconds() - before <= 2_000);
+}
+
+test "a second owner on one fx home returns at once with the lock busy" {
+    const alloc = testing.allocator;
+    const home = try shortHome(alloc);
+    defer removeHome(alloc, home);
+    var stop = std.atomic.Value(bool).init(false);
+    const thread = try std.Thread.spawn(.{}, serveThread, .{ testing.io, alloc, home, &stop });
+    var joined = false;
+    defer if (!joined) {
+        stop.store(true, .release);
+        thread.join();
+    };
+    const path = try socketPath(alloc, home);
+    defer alloc.free(path);
+    try waitForSocket(path);
+
+    var second = std.atomic.Value(bool).init(false);
+    const started = std.Io.Clock.awake.now(testing.io).toMilliseconds();
+    try testing.expectError(error.LockBusy, serve(testing.io, alloc, home, &second));
+    try testing.expect(std.Io.Clock.awake.now(testing.io).toMilliseconds() - started < 1_000);
+
+    stop.store(true, .release);
+    thread.join();
+    joined = true;
+}
+
+test "stopping the owner with a connected client returns within 2 s, and the client sees the connection end" {
+    const alloc = testing.allocator;
+    const home = try shortHome(alloc);
+    defer removeHome(alloc, home);
+    var stop = std.atomic.Value(bool).init(false);
+    const thread = try std.Thread.spawn(.{}, serveThread, .{ testing.io, alloc, home, &stop });
+    const path = try socketPath(alloc, home);
+    defer alloc.free(path);
+    try waitForSocket(path);
+    var client = try TestClient.connect(path);
+    // The owner closes its side of this socket below, so close the raw
+    // descriptor rather than asking the io to close an already ended stream.
+    defer _ = std.c.close(client.stream.socket.handle);
+    try client.send(.{ .hello = .{ .pid = 1 } });
+    var arena: std.heap.ArenaAllocator = .init(alloc);
+    defer arena.deinit();
+    // The welcome, so the owner has taken this connection.
+    _ = try client.receive(arena.allocator(), 5_000);
+
+    const started = std.Io.Clock.awake.now(testing.io).toMilliseconds();
+    stop.store(true, .release);
+    thread.join();
+    try testing.expect(std.Io.Clock.awake.now(testing.io).toMilliseconds() - started <= 2_000);
+    // The client's side ended: its next read returns zero.
+    var byte: [1]u8 = undefined;
+    try testing.expectEqual(0, try std.posix.read(client.stream.socket.handle, &byte));
+}
+
+test "a registered client hears connecting and ready before the tool list" {
+    const alloc = testing.allocator;
+    const home = try shortHome(alloc);
+    defer removeHome(alloc, home);
+    var fixture: fake_server.Fixture = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    var stop = std.atomic.Value(bool).init(false);
+    const thread = try std.Thread.spawn(.{}, serveThread, .{ testing.io, alloc, home, &stop });
+    var joined = false;
+    defer if (!joined) {
+        stop.store(true, .release);
+        thread.join();
+    };
+    const path = try socketPath(alloc, home);
+    defer alloc.free(path);
+    try waitForSocket(path);
+
+    var client = try TestClient.connect(path);
+    defer client.close();
+    try registerFor(&client, fixture.server);
+    try client.send(.{ .need = .{ .key = test_key } });
+    var arena: std.heap.ArenaAllocator = .init(alloc);
+    defer arena.deinit();
+    var saw_connecting = false;
+    var saw_ready = false;
+    const deadline = std.Io.Clock.awake.now(testing.io).toMilliseconds() + 10_000;
+    while (std.Io.Clock.awake.now(testing.io).toMilliseconds() < deadline) {
+        const message = client.receive(arena.allocator(), 200) catch |err| switch (err) {
+            error.Timeout => continue,
+            else => return err,
+        };
+        switch (message) {
+            .owner => |owner| switch (owner) {
+                .phase => |phase| {
+                    if (phase.phase == .connecting) saw_connecting = true;
+                    if (phase.phase == .ready) saw_ready = true;
+                },
+                .tools => {
+                    try testing.expect(saw_connecting);
+                    try testing.expect(saw_ready);
+                    client.close();
+                    stop.store(true, .release);
+                    thread.join();
+                    joined = true;
+                    return;
+                },
+                else => {},
+            },
+            .client => {},
+        }
+    }
+    return error.NoToolsFrame;
+}
