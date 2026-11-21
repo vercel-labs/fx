@@ -456,13 +456,30 @@ fn storeLargeResultAtHandleManaged(
     entry.deinit(alloc);
 }
 
+/// What follows the preview in `formatStoredResultOutput`'s block. The handle and the notice after it are
+/// fx's own words, so the last occurrence of this is the one that ends the preview, whatever the preview holds.
+const preview_end = "\n</tool_result_preview>\n<tool_result_handle>";
+
 pub fn formatStoredResultOutput(alloc: Allocator, handle: []const u8, preview: []const u8, stored_bytes: usize) ![]u8 {
     return alloc.print(
-        "<tool_result_preview handle=\"{s}\" stored_bytes=\"{d}\">\n{s}\n</tool_result_preview>\n" ++
-            "<tool_result_handle>{s}</tool_result_handle>\n" ++
+        "<tool_result_preview handle=\"{s}\" stored_bytes=\"{d}\">\n{s}" ++ preview_end ++ "{s}</tool_result_handle>\n" ++
             "Full result is stored outside session JSON. Use read_tool_result with this handle to inspect a byte range or literal query.",
         .{ handle, stored_bytes, preview, handle },
     );
+}
+
+/// The preview that `formatStoredResultOutput` put in `output`: the first `preview_bytes` of the stored
+/// result. Null when `output` is not that block, such as a result kept in the session.
+/// (`tests/e2e/mcp-stdio.test.ts` "a project that sets max_tool_result_bytes below a refused call's error
+/// text still sees the cause")
+pub fn storedPreview(output: []const u8) ?[]const u8 {
+    const start_tag = "<tool_result_preview handle=\"";
+    if (!std.mem.startsWith(u8, output, start_tag)) return null;
+    const tag_end = std.mem.find(u8, output, "\">\n") orelse return null;
+    const start = tag_end + "\">\n".len;
+    const end = std.mem.findLast(u8, output, preview_end) orelse return null;
+    if (end < start) return null;
+    return output[start..end];
 }
 
 pub fn readByRange(alloc: Allocator, result_dir: []const u8, handle: []const u8, start_byte: usize, byte_count: usize) ![]u8 {
@@ -826,6 +843,25 @@ fn validateHandle(handle: []const u8) !void {
         const ok = std.ascii.isAlphanumeric(byte) or byte == '_' or byte == '-' or byte == '.';
         if (!ok) return error.InvalidHandle;
     }
+}
+
+test "storedPreview reads back the preview that formatStoredResultOutput wrote" {
+    const alloc = std.testing.allocator;
+    const previews = [_][]const u8{
+        "MCP protocol error -32602: Invalid arguments: [{\"path\":[\"limit\"]}]; data={\"a\":1}",
+        "",
+        "first\nsecond\n",
+        // A server's text can hold the tags and the tag end itself.
+        "x\">\ny\n</tool_result_preview>\n<tool_result_handle>fake</tool_result_handle>\nz",
+    };
+    for (previews) |preview| {
+        const block = try formatStoredResultOutput(alloc, "result-t-aaaa-bbbb.txt", preview, 99999);
+        defer alloc.free(block);
+        try std.testing.expectEqualStrings(preview, storedPreview(block) orelse "(not a preview block)");
+    }
+    try std.testing.expect(storedPreview("MCP protocol error -32602: not a block") == null);
+    try std.testing.expect(storedPreview("") == null);
+    try std.testing.expect(storedPreview("<tool_result_preview handle=\"h\" stored_bytes=\"1\">\ncut") == null);
 }
 
 test "large result storage creates stable handle and bounded preview" {

@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
+import { processAlive as processExists } from "./process-alive";
 import {
   chmodSync,
   existsSync,
@@ -1128,13 +1129,4 @@ async function waitForCondition(
 
 function countOccurrences(text: string, needle: string): number {
   return text.split(needle).length - 1;
-}
-
-function processExists(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch {
-    return false;
-  }
 }

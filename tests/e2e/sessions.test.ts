@@ -1,4 +1,5 @@
 import { expect, test } from "bun:test";
+import { processAlive } from "./process-alive";
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
@@ -38,6 +39,7 @@ import {
   TmuxSession,
   tmuxAvailable,
 } from "./tmux-helpers";
+import { ignoresFileModes } from "./file-modes";
 import { childLines, childWork, committedRootTurns, compactionRecordPath, type LogLine, logLines, onlySessionId, rootSessionIds, savedSessionIds, sessionDir, storeRoot, waitForRootTurnCommitted } from "./saved-sessions";
 
 // The session store: every `fx ask` entry and exit, the files it writes, and the faults a real disk and a real
@@ -45,6 +47,11 @@ import { childLines, childWork, committedRootTurns, compactionRecordPath, type L
 // byte, a second process, a read-only folder and a full disk.
 
 const TIMEOUT = 30_000;
+
+// A user that file modes do not hold back, such as root or one that holds
+// CAP_DAC_OVERRIDE, writes into a read-only folder, so the tests that need a
+// refused write skip for them.
+const fileModesIgnored = ignoresFileModes();
 
 type Fixture = { root: string; home: string; workspace: string };
 
@@ -1430,7 +1437,7 @@ test("a second process on an open session is refused and writes nothing", async 
   }
 }, TIMEOUT * 3);
 
-test("a read-only session folder fails cleanly and resumes once writable", async () => {
+test.skipIf(fileModesIgnored)("a read-only session folder fails cleanly and resumes once writable", async () => {
   const fixture = createFixture("fx-v2-readonly-");
   const gateway = startFakeGateway([
     fakeGatewayFinalText("BEFORE_READ_ONLY"),
@@ -5538,7 +5545,7 @@ test("a parent killed while a named child runs a tool records that work interrup
     child.kill("SIGKILL");
     await exited;
     // fx's own processes go with it.
-    await until(() => { try { process.kill(toolPid, 0); return false; } catch { return true; } }, "the child's tool to stop");
+    await until(() => !processAlive(toolPid), "the child's tool to stop");
 
     const last = await command(fixture, gateway, ["session", "last", "--json"]);
     expect(last.code).toBe(0);
@@ -5779,7 +5786,7 @@ test("ACP killed between prompts loads with its last turn whole", async () => {
   }
 }, TIMEOUT * 3);
 
-test.skipIf(!tmuxAvailable())("the app refuses a damaged session, a busy one and a read-only one, and says which", async () => {
+test.skipIf(!tmuxAvailable() || fileModesIgnored)("the app refuses a damaged session, a busy one and a read-only one, and says which", async () => {
   const fixture = createFixture("fx-v2-app-faults-");
   const gateway = startDynamicFakeGateway(() => fakeGatewayFinalText("FAULT_ANSWER"));
   try {
@@ -5822,7 +5829,7 @@ test.skipIf(!tmuxAvailable())("the app refuses a damaged session, a busy one and
   }
 }, TIMEOUT * 5);
 
-test("ACP refuses a damaged or read-only session and leaves its log as it was", async () => {
+test.skipIf(fileModesIgnored)("ACP refuses a damaged or read-only session and leaves its log as it was", async () => {
   const fixture = createFixture("fx-v2-acp-faults-");
   const gateway = startDynamicFakeGateway(() => fakeGatewayFinalText("FAULT_ANSWER"));
   let client: AcpRpc | undefined;
@@ -6109,17 +6116,6 @@ test.skipIf(!tmuxAvailable())("a hosted terminal ends with an app crash, and the
     fakeGatewayFinalText("TTY_ENDED_REPORTED"),
   ]);
   const appEnv = { FX_PERMISSION_MODE: "full-access", SHELL: "/bin/sh" };
-  const alive = (pid: number) => {
-    // Signal 0 to pid 0 or below reaches a whole process group, which is
-    // always alive, so only a real pid can be checked.
-    if (!(pid > 0)) throw new Error(`not a process id: ${pid}`);
-    try {
-      process.kill(pid, 0);
-      return true;
-    } catch {
-      return false;
-    }
-  };
   try {
     const app = await startApp(fixture, gateway, [], true, appEnv);
     await app.session.sendText("Start a terminal.");
@@ -6137,14 +6133,14 @@ test.skipIf(!tmuxAvailable())("a hosted terminal ends with an app crash, and the
       await Bun.sleep(10);
     }
     expect(shellPid).toBeGreaterThan(0);
-    expect(alive(shellPid)).toBe(true);
+    expect(processAlive(shellPid)).toBe(true);
     Bun.spawnSync(["kill", "-9", String(app.session.processPid())]);
     await app.session.kill();
 
     // The terminal belonged to the crashed process and ended with it.
     const deadline = Date.now() + 2_000;
-    while (alive(shellPid) && Date.now() < deadline) await Bun.sleep(10);
-    expect(alive(shellPid)).toBe(false);
+    while (processAlive(shellPid) && Date.now() < deadline) await Bun.sleep(10);
+    expect(processAlive(shellPid)).toBe(false);
 
     const resumed = await startApp(fixture, gateway, ["--resume", id], true, appEnv);
     await resumed.session.sendText("Talk to the terminal, then stop it.");
@@ -6853,13 +6849,13 @@ async function gridNewRow(entry: GridEntry) {
 }
 
 for (const entry of ["ask-new", "app-new", "acp-new"] as const) {
-  const define = gridHost(entry) === "app" ? test.skipIf(!tmuxAvailable()) : test;
+  const define = gridHost(entry) === "app" ? test.skipIf(!tmuxAvailable() || fileModesIgnored) : test.skipIf(fileModesIgnored);
   define(`fault grid: a new session by ${entry.slice(0, -4)}, with nothing wrong, a read-only folder and a full disk`, () => gridNewRow(entry), TIMEOUT * 6);
 }
 
 for (const exit of GRID_EXITS) {
   for (const entry of GRID_ENTRIES) {
-    const define = gridHost(entry) === "app" ? test.skipIf(!tmuxAvailable()) : test;
+    const define = gridHost(entry) === "app" ? test.skipIf(!tmuxAvailable() || fileModesIgnored) : test.skipIf(fileModesIgnored);
     define(`fault grid: a session ${exit}, entered by ${entry}, under every fault`, () => gridRow(exit, entry), TIMEOUT * 10);
   }
 }

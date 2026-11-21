@@ -1,5 +1,7 @@
 import { createHash } from "node:crypto";
+import { EventEmitter } from "node:events";
 import { afterEach, describe, expect, test } from "bun:test";
+import { processAlive } from "./process-alive";
 import { createConfiguredProviderFixture, completion as configuredCompletion, toolCompletion as configuredToolCompletion } from "./fixtures/chat-completions";
 import { spawn as nodeSpawn, type ChildProcess } from "node:child_process";
 import {
@@ -27,10 +29,12 @@ import {
   serializedToolNames,
   toolShapesWithoutDescriptions,
 } from "./conditional-guidance-oracle";
+import { LineQueue } from "./line-queue";
 import { expectPermissionModeContext } from "./permission-mode-context";
 import { paddedPng, pngPixelSize, solidPng } from "./fixtures/image-encoding";
 import { childLines, childWork, copyV1Fixture, logLines, savedSessionIds, savedText, sessionDir } from "./saved-sessions";
 import { bearer, rotateFxLogin, startFakeIssuer, storedFxLoginToken, unauthorized, writeFxLogin } from "./fx-login-fakes";
+import { ignoresFileModes } from "./file-modes";
 import {
   canonicalSubagentIdForStore,
   FAKE_GATEWAY_MODEL,
@@ -136,15 +140,6 @@ async function expectHttpCallCancelled(
     () => fixture.cancelledCalls === 1,
     5_000,
   );
-}
-
-function processAlive(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch {
-    return false;
-  }
 }
 
 async function expectMcpProcessExited(pidPath: string): Promise<void> {
@@ -675,8 +670,7 @@ class AcpReadTimeoutError extends Error {
 class AcpClient {
   private proc: ChildProcess;
   private buffer: string = "";
-  private lines: string[] = [];
-  private waiters: Array<(line: string) => void> = [];
+  private queue = new LineQueue();
   private _closed = false;
   private _stderrChunks: Buffer[] = [];
   private activeSessionId: string | null = null;
@@ -700,11 +694,7 @@ class AcpClient {
       for (const line of parts) {
         if (line.trim()) {
           this.rawLines.push(line);
-          if (this.waiters.length > 0) {
-            this.waiters.shift()!(line);
-          } else {
-            this.lines.push(line);
-          }
+          this.queue.push(line);
         }
       }
     });
@@ -770,7 +760,7 @@ class AcpClient {
   }
 
   drainBufferedMessages(): any[] {
-    return this.lines.splice(0).map((line) => JSON.parse(line));
+    return this.queue.drain().map((line) => JSON.parse(line));
   }
 
   send(msg: object): void {
@@ -811,17 +801,7 @@ class AcpClient {
   }
 
   async readLine(timeoutMs = 10_000): Promise<object> {
-    const line = await new Promise<string>((resolve, reject) => {
-      if (this.lines.length > 0) {
-        resolve(this.lines.shift()!);
-        return;
-      }
-      const timer = setTimeout(() => reject(new AcpReadTimeoutError()), timeoutMs);
-      this.waiters.push((l) => {
-        clearTimeout(timer);
-        resolve(l);
-      });
-    });
+    const line = await this.queue.next(timeoutMs, () => new AcpReadTimeoutError());
     const message = JSON.parse(line) as any;
     if (typeof message.id === "number" || typeof message.id === "string") {
       if (this.pendingNewSessions.delete(message.id)) {
@@ -4405,6 +4385,225 @@ describe("acp: model-independent", () => {
     },
     LIVE_TIMEOUT,
   );
+
+  // ---- the test client's reader ----
+  //
+  // A read that times out must leave nothing behind: the next line goes to the next read. Each
+  // test starts a client on a stand-in for `fx acp`, so no fx runs.
+  function fakeAcpProcess() {
+    const proc = Object.assign(new EventEmitter(), {
+      stdout: new EventEmitter(),
+      stderr: new EventEmitter(),
+      stdin: { write() {} },
+    });
+    return {
+      proc: proc as unknown as ChildProcess,
+      write: (message: object) => { proc.stdout.emit("data", Buffer.from(`${JSON.stringify(message)}\n`)); },
+    };
+  }
+
+  test("a read that timed out does not take the next line", async () => {
+    const fake = fakeAcpProcess();
+    const client = new AcpClient(fake.proc);
+    await expect(client.readLine(30)).rejects.toBeInstanceOf(AcpReadTimeoutError);
+    fake.write({ jsonrpc: "2.0", id: 7, result: { late: true } });
+    expect(await client.readLine(500)).toEqual({ jsonrpc: "2.0", id: 7, result: { late: true } });
+  });
+
+  test("two reads time out one after the other, then one line arrives: the third read gets it, once", async () => {
+    const fake = fakeAcpProcess();
+    const client = new AcpClient(fake.proc);
+    for (let attempt = 0; attempt < 2; attempt++) {
+      await expect(client.readLine(20)).rejects.toBeInstanceOf(AcpReadTimeoutError);
+    }
+    fake.write({ id: 1 });
+    expect(await client.readLine(500)).toEqual({ id: 1 });
+    await expect(client.readLine(50)).rejects.toBeInstanceOf(AcpReadTimeoutError);
+  });
+
+  test("lines that were queued before a read starts come back in order, with no wait", async () => {
+    const fake = fakeAcpProcess();
+    const client = new AcpClient(fake.proc);
+    fake.write({ id: 1 });
+    fake.write({ id: 2 });
+    expect(await client.readLine(20)).toEqual({ id: 1 });
+    expect(await client.readLine(20)).toEqual({ id: 2 });
+  });
+
+  test("a read that gets its line in time leaves no timer that takes a later line", async () => {
+    const fake = fakeAcpProcess();
+    const client = new AcpClient(fake.proc);
+    const first = client.readLine(80);
+    fake.write({ id: 1 });
+    expect(await first).toEqual({ id: 1 });
+    await Bun.sleep(150);
+    fake.write({ id: 2 });
+    expect(await client.readLine(500)).toEqual({ id: 2 });
+  });
+
+  test("a reader that retries after each short timeout, as readResponse does after 3 s, still gets a reply that comes later", async () => {
+    const fake = fakeAcpProcess();
+    const client = new AcpClient(fake.proc);
+    setTimeout(() => fake.write({ jsonrpc: "2.0", id: 42, result: { ok: true } }), 250);
+    const until = Date.now() + 2_000;
+    let reply: any = null;
+    while (reply === null && Date.now() < until) {
+      try {
+        reply = await client.readLine(20);
+      } catch (err) {
+        if (err instanceof AcpReadTimeoutError) continue;
+        throw err;
+      }
+    }
+    expect(reply?.result).toEqual({ ok: true });
+  });
+
+  // ---- MCP calls through ACP end as they do through fx ask ----
+  //
+  // A profile server (the session opts in with _meta.fx.profileMcpServers) can carry short
+  // timeouts, which a server named in session/new cannot. The server's mode is a fixture mode.
+  function writeProfileServer(
+    root: ReturnType<typeof createIsolatedRoot>,
+    environment: Record<string, string>,
+    timeouts: { operation_timeout_ms?: number; startup_timeout_ms?: number },
+  ) {
+    writeFileSync(
+      join(root.home, ".fx", "mcp.json"),
+      JSON.stringify({
+        mcp: {
+          fixture: { type: "local", command: [process.execPath, MCP_STDIO_FIXTURE], environment, ...timeouts },
+        },
+      }),
+    );
+  }
+
+  const ECHO_SCRIPT = () => [
+    fakeGatewayToolCall("select", "toolbox", { open: MCP_TOOL_NAME }),
+    fakeGatewayToolCall("call", "toolbox", { run: MCP_TOOL_NAME, arguments: { text: "hi" } }),
+    finalText("MCP call finished"),
+  ];
+
+  test("ACP gives the model the same words as fx ask, to the byte, when an MCP server never answers a call, a tool list or initialize or sends a reply fx cannot read, and ends at the server's timeout", async () => {
+    const scenarios = [
+      { name: "a call the server never answers", mode: "stall_operation", words: "did not answer within its operation timeout" },
+      { name: "a reply fx cannot read", mode: "unreadable_operation", words: "did not answer within its operation timeout" },
+      { name: "a tools/list the server never answers", mode: "stall_list", words: "is unavailable" },
+      { name: "an initialize the server never answers", mode: "stall_startup", words: "refused or never answered fx's initialize" },
+    ];
+    const timeouts = { operation_timeout_ms: 3_000, startup_timeout_ms: 4_000 };
+    const ran = await Promise.all(scenarios.map(async (scenario) => {
+      const viaAcp = async () => {
+        const root = createIsolatedRoot("fx-acp-parity-");
+        writeProfileServer(root, { FX_MCP_MODE: scenario.mode }, timeouts);
+        const gateway = startFakeGateway(ECHO_SCRIPT());
+        let acp: AcpClient | undefined;
+        const started = Date.now();
+        try {
+          acp = await AcpClient.create({ cwd: root.workspace, env: fakeGatewayEnv(root, gateway) });
+          await acp.request("initialize", { protocolVersion: 1 }, 1);
+          const created = await acp.request("session/new", {
+            cwd: root.workspace,
+            mcpServers: [],
+            _meta: { fx: { profileMcpServers: true } },
+          }, 2) as any;
+          expect(created.error).toBeUndefined();
+          await acp.readLine();
+          await acp.request("session/set_mode", { modeId: "auto" }, 3);
+          const prompt = await runPrompt(acp, "Call the fixture's echo tool.", TIMEOUT);
+          return {
+            stop: prompt.promptResult.result.stopReason,
+            // A turn that made fewer than three model requests ends with no words, which the checks below report.
+            text: gateway.requests.length >= 3 ? acpToolResultText(gateway.requests[2]!.body, "call") : "",
+            seconds: (Date.now() - started) / 1000,
+          };
+        } finally {
+          await acp?.close();
+          gateway.stop();
+          rmSync(root.root, { recursive: true, force: true });
+        }
+      };
+      const viaAsk = async () => {
+        const root = createIsolatedRoot("fx-ask-parity-");
+        writeProfileServer(root, { FX_MCP_MODE: scenario.mode }, timeouts);
+        const gateway = startFakeGateway(ECHO_SCRIPT());
+        const started = Date.now();
+        try {
+          const result = await runFx(
+            ["ask", "--json", "--auto", "--no-save", "Call the fixture's echo tool."],
+            { cwd: root.workspace, env: fakeGatewayEnv(root, gateway), timeoutMs: 60_000 },
+          );
+          return {
+            code: result.code,
+            text: gateway.requests.length >= 3 ? acpToolResultText(gateway.requests[2]!.body, "call") : "",
+            seconds: (Date.now() - started) / 1000,
+          };
+        } finally {
+          gateway.stop();
+          rmSync(root.root, { recursive: true, force: true });
+        }
+      };
+      const [acp, ask] = await Promise.all([viaAcp(), viaAsk()]);
+      return { scenario, acp, ask };
+    }));
+    for (const { scenario, acp, ask } of ran) {
+      const what = scenario.name;
+      expect({ what, stop: acp.stop, askCode: ask.code }).toEqual({ what, stop: "end_turn", askCode: 0 });
+      expect({ what, text: acp.text }).toEqual({ what, text: expect.stringContaining(scenario.words) });
+      // The same words as fx ask, to the byte.
+      expect({ what, text: acp.text }).toEqual({ what, text: ask.text });
+      // Ended by the short timers, not left waiting for the 5 minute default.
+      expect({ what, acpSeconds: acp.seconds < 25, askSeconds: ask.seconds < 25 }).toEqual({ what, acpSeconds: true, askSeconds: true });
+    }
+  }, 90_000);
+
+  test("session/cancel and session/close end an MCP call that waits, at once, and fx tells the server", async () => {
+    const ways = ["session/cancel", "session/close"] as const;
+    const ran = await Promise.all(ways.map(async (way) => {
+      const root = createIsolatedRoot("fx-acp-cancel-");
+      const wire = join(root.root, "wire.log");
+      // The default operation timeout, 5 minutes: only the client's message can end the call.
+      writeProfileServer(root, { FX_MCP_MODE: "stall_operation", FX_MCP_WIRE_LOG: wire }, {});
+      const gateway = startFakeGateway(ECHO_SCRIPT());
+      let acp: AcpClient | undefined;
+      try {
+        acp = await AcpClient.create({ cwd: root.workspace, env: fakeGatewayEnv(root, gateway) });
+        await acp.request("initialize", { protocolVersion: 1 }, 1);
+        const created = await acp.request("session/new", {
+          cwd: root.workspace,
+          mcpServers: [],
+          _meta: { fx: { profileMcpServers: true } },
+        }, 2) as any;
+        const sessionId = created.result.sessionId as string;
+        await acp.readLine();
+        await acp.request("session/set_mode", { modeId: "auto" }, 3);
+        const promptId = 5100;
+        sendPrompt(acp, promptId, "Call the fixture's echo tool.");
+        const wired = () => existsSync(wire)
+          ? readFileSync(wire, "utf8").split("\n").filter(Boolean).map((line) => JSON.parse(line).message as any)
+          : [];
+        await waitForCondition("the server to hold a tools/call", () => wired().some((m) => m.method === "tools/call"), TIMEOUT);
+        const sent = Date.now();
+        if (way === "session/cancel") acp.send({ jsonrpc: "2.0", method: "session/cancel", params: { sessionId } });
+        else acp.send({ jsonrpc: "2.0", id: 5101, method: "session/close", params: { sessionId } });
+        const response = await readResponse(acp, promptId, 20_000);
+        const seconds = (Date.now() - sent) / 1000;
+        await waitForCondition("notifications/cancelled", () => wired().some((m) => m.method === "notifications/cancelled"), 5_000);
+        const messages = wired();
+        const call = messages.find((m) => m.method === "tools/call");
+        const cancelled = messages.find((m) => m.method === "notifications/cancelled");
+        return { way, stop: response.result?.stopReason, seconds, callId: call?.id, cancelledId: cancelled?.params?.requestId };
+      } finally {
+        await acp?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    }));
+    for (const run of ran) {
+      expect({ way: run.way, stop: run.stop, fast: run.seconds < 10 }).toEqual({ way: run.way, stop: "cancelled", fast: true });
+      expect({ way: run.way, callId: typeof run.callId }).toEqual({ way: run.way, callId: "number" });
+      expect({ way: run.way, cancelledId: run.cancelledId }).toEqual({ way: run.way, cancelledId: run.callId });
+    }
+  }, 90_000);
 
   test(
     "ACP includes profile MCP servers only when the session opts in",
@@ -8849,11 +9048,17 @@ describe("acp: model-independent", () => {
     async () => {
       const root = createIsolatedRoot("fx-acp-terminal-failure-");
       const boundary = createPromptTerminalBoundary(root.root);
+      // The provider ends the stream with an error fx must not resend, so
+      // the prompt fails.
       const gateway = startFakeGateway([
         fakeGatewaySse([
           {
+            type: "error",
+            error: { code: "invalid_request_error", message: "rejected request fixture" },
+          },
+          {
             type: "finish",
-            finishReason: { unified: "content-filter", raw: "content_filter" },
+            finishReason: { unified: "error", raw: "provider_error" },
           },
         ]),
       ]);
@@ -8890,6 +9095,66 @@ describe("acp: model-independent", () => {
         expect(client.stderr).toBe("");
       } finally {
         releasePromptBoundary(boundary);
+        await client?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "content filter that blocks every resend ends the prompt as refused and leaves the server usable",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-content-filter-refused-");
+      // fx resends a blocked reply three times; the fourth block ends the
+      // prompt as refused and asks the user to change the request.
+      const gateway = startFakeGateway(
+        Array.from({ length: 4 }, () =>
+          fakeGatewaySse([
+            {
+              type: "finish",
+              finishReason: { unified: "content-filter", raw: "content_filter" },
+            },
+          ])
+        ),
+      );
+      try {
+        client = await AcpClient.create({
+          cwd: root.workspace,
+          env: fakeGatewayEnv(root, gateway),
+        });
+        await startAutoSession(client);
+        sendPrompt(client, 97, "Return the blocked fixture.");
+
+        const messages: any[] = [];
+        let response: any = null;
+        while (!response) {
+          const message = await client.readLine(TIMEOUT) as any;
+          if (message.id === 97) {
+            response = message;
+          } else {
+            messages.push(message);
+          }
+        }
+
+        expect(response.error).toBeUndefined();
+        expect(response.result.stopReason).toBe("refused");
+        const texts = messages
+          .filter((message) =>
+            message.method === "session/update" &&
+            message.params?.update?.sessionUpdate === "agent_message_chunk"
+          )
+          .map((message) => message.params.update.content.text);
+        expect(texts).toContain("Blocked by the content filter. Change your request and send it again.");
+        expect(gateway.requests).toHaveLength(4);
+
+        client.send({ jsonrpc: "2.0", id: 98, method: "session/list", params: {} });
+        const listed = await readResponse(client, 98);
+        expect(listed.error).toBeUndefined();
+        expect(Array.isArray(listed.result.sessions)).toBe(true);
+        expect(client.stderr).toBe("");
+      } finally {
         await client?.close();
         gateway.stop();
         rmSync(root.root, { recursive: true, force: true });
@@ -10896,10 +11161,9 @@ describe("acp: model-independent", () => {
     TIMEOUT,
   );
 
-  test(
+  test.skipIf(ignoresFileModes())(
     "an attached folder whose rule file cannot be read is reported in the note, not in the instructions",
     async () => {
-      if (process.getuid?.() === 0) return; // A file mode does not stop root.
       const root = createIsolatedRoot("fx-acp-attached-unreadable-");
       const docs = join(root.workspace, "docs");
       mkdirSync(docs, { recursive: true });

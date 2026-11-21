@@ -282,6 +282,33 @@ pub const ReviewRequest = struct {
     prior_tool_results: PriorToolResults = .{},
     targets: []const permissions.PermissionCallTarget,
     action: Action,
+    /// When set, each send this review makes is added here in order, so
+    /// `/trace` can show every try.
+    attempt_log: ?*AttemptLog = null,
+};
+
+/// The sends one review made, in order: each send's result and how long it
+/// took. A review and its confirming second review share one log.
+pub const AttemptLog = struct {
+    pub const capacity: usize = 6;
+    pub const Result = enum { answered, malformed, timed_out, transient_failure, permanent_failure, call_failed, cancelled };
+    pub const Attempt = struct { result: AttemptLog.Result, elapsed_ms: u32 };
+
+    items: [capacity]Attempt = undefined,
+    len: u8 = 0,
+
+    /// Adds one send that started at `started_ms`. Sends past `capacity` are
+    /// not kept.
+    pub fn add(self: *AttemptLog, result: AttemptLog.Result, started_ms: i64) void {
+        if (self.len >= capacity) return;
+        const elapsed = io_mod.milliTimestamp() - started_ms;
+        self.items[self.len] = .{ .result = result, .elapsed_ms = @intCast(std.math.clamp(elapsed, 0, std.math.maxInt(u32))) };
+        self.len += 1;
+    }
+
+    pub fn slice(self: *const AttemptLog) []const Attempt {
+        return self.items[0..self.len];
+    }
 };
 
 pub const OwnedCompletion = struct {
@@ -592,6 +619,7 @@ pub const Reviewer = struct {
         var recovery_available = true;
         var transport_retry_available = true;
         var attempt: u8 = 1;
+        const attempt_log = prompt.request.attempt_log;
         var send_deadline = deadline;
         while (true) {
             checkBudget(send_deadline, cancel_flag) catch |err| return constructionFailure(err);
@@ -600,6 +628,7 @@ pub const Reviewer = struct {
                 "event=auto_review_send attempt={d} max_attempts=3 target_call_id={s}",
                 .{ attempt, review_turn.target_call_id },
             );
+            const send_started_ms = io_mod.milliTimestamp();
             const observed = if (review_turn.observer) |observer| observer.beginModelWithSchemas(.{
                 .model = self.model,
                 .instructions = prompt.instructions,
@@ -618,6 +647,7 @@ pub const Reviewer = struct {
                 break :failed switch (err) {
                     error.OutOfMemory, error.Cancelled => return err,
                     else => {
+                        if (attempt_log) |log| log.add(.call_failed, send_started_ms);
                         if (!transport_retry_available) return .{ .invalid = .transport_call_failed };
                         transport_retry_available = false;
                         attempt += 1;
@@ -636,8 +666,12 @@ pub const Reviewer = struct {
                 else => .{ .id = call.id, .error_name = @tagName(transport_outcome), .cancelled = transport_outcome == .cancelled },
             } });
             switch (transport_outcome) {
-                .cancelled => return error.Cancelled,
+                .cancelled => {
+                    if (attempt_log) |log| log.add(.cancelled, send_started_ms);
+                    return error.Cancelled;
+                },
                 .timed_out, .transient_failure => {
+                    if (attempt_log) |log| log.add(if (transport_outcome == .timed_out) .timed_out else .transient_failure, send_started_ms);
                     // One retry with a fresh deadline; permanent failures and
                     // cancellation are never retried.
                     const reason: InvalidReason = if (transport_outcome == .timed_out)
@@ -654,11 +688,15 @@ pub const Reviewer = struct {
                         .{ @tagName(reason), review_turn.target_call_id },
                     );
                 },
-                .permanent_failure => return .{ .invalid = .transport_permanent },
+                .permanent_failure => {
+                    if (attempt_log) |log| log.add(.permanent_failure, send_started_ms);
+                    return .{ .invalid = .transport_permanent };
+                },
                 .completion => |*owned| {
                     defer owned.deinit(alloc);
                     checkBudget(send_deadline, cancel_flag) catch |err| return constructionFailure(err);
                     const parsed = try parseCompletion(alloc, owned.completion);
+                    if (attempt_log) |log| log.add(if (parsed == .invalid and parsed.invalid.is_malformed_completion()) .malformed else .answered, send_started_ms);
                     if (!recovery_available or parsed != .invalid or !parsed.invalid.is_malformed_completion()) {
                         return switch (quotes) {
                             .checked => self.requireCautionProof(alloc, parsed, owned.completion, prompt.request, prompt.trusted_root_context),
@@ -2560,6 +2598,37 @@ test "a proven caution holds only when a second review confirms it" {
         try std.testing.expectEqual(case.sends, fixture.sends);
         if (case.rationale) |rationale| try std.testing.expectEqualStrings(rationale, outcome.valid.rationale);
     }
+}
+
+test "a review logs each send so /trace can show a retried timeout" {
+    const Fixture = struct {
+        sends: usize = 0,
+        calls: [1]types.ToolCall = undefined,
+
+        fn send(raw: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: std.Io.Clock.Timestamp, _: *std.atomic.Value(bool)) !TransportOutcome {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.sends += 1;
+            if (self.sends == 1) return .timed_out;
+            self.calls = .{.{ .id = "review", .name = tool_name, .arguments_json = "{\"decision\":\"clear\"}" }};
+            return .{ .completion = .{ .completion = .{ .tool_calls = &self.calls } } };
+        }
+    };
+    var fixture = Fixture{};
+    const reviewer = Reviewer.withTransport(.{
+        .context = &fixture,
+        .send_fn = Fixture.send,
+        .build_fn = buildTestReviewPayload,
+    }, null, 1000);
+    var log: AttemptLog = .{};
+    var request = ProofFixture.request;
+    request.attempt_log = &log;
+    var outcome = try reviewer.review(std.testing.allocator, request);
+    defer outcome.deinit(std.testing.allocator);
+    try std.testing.expect(outcome == .valid);
+    try std.testing.expectEqual(Decision.clear, outcome.valid.decision);
+    try std.testing.expectEqual(@as(usize, 2), log.slice().len);
+    try std.testing.expectEqual(AttemptLog.Result.timed_out, log.slice()[0].result);
+    try std.testing.expectEqual(AttemptLog.Result.answered, log.slice()[1].result);
 }
 
 test "a reviewer without quotable answers keeps its bare caution" {

@@ -21,6 +21,16 @@ pub const max_action_len: usize = 240;
 /// Bytes kept of the reviewer's rationale.
 pub const max_rationale_len: usize = 1024;
 
+/// Sends kept for one review: a review and its confirming second review,
+/// each with one transport retry and one format retry.
+pub const max_attempts: usize = 6;
+
+/// What one send to the reviewer returned.
+pub const AttemptResult = enum(u8) { answered, malformed, timed_out, transient_failure, permanent_failure, call_failed, cancelled };
+
+/// One send to the reviewer: its result and how long it took.
+pub const Attempt = struct { result: AttemptResult, elapsed_ms: u32 };
+
 pub const Outcome = enum(u8) {
     /// The reviewer cleared the action, and fx ran it.
     clear,
@@ -62,6 +72,8 @@ pub const Review = struct {
     rationale_buf: [max_rationale_len]u8 = @splat(0),
     rationale_len: u16 = 0,
     rationale_total_bytes: u32 = 0,
+    attempts_buf: [max_attempts]Attempt = @splat(.{ .result = .answered, .elapsed_ms = 0 }),
+    attempts_len: u8 = 0,
 
     pub fn callId(self: *const Review) []const u8 {
         return self.call_id_buf[0..self.call_id_len];
@@ -90,6 +102,11 @@ pub const Review = struct {
     pub fn rationale(self: *const Review) []const u8 {
         return self.rationale_buf[0..self.rationale_len];
     }
+
+    /// The sends this review made, in order.
+    pub fn attempts(self: *const Review) []const Attempt {
+        return self.attempts_buf[0..self.attempts_len];
+    }
 };
 
 pub const Record = struct {
@@ -104,6 +121,7 @@ pub const Record = struct {
     action: []const u8 = "",
     reason: []const u8 = "",
     rationale: []const u8 = "",
+    attempts: []const Attempt = &.{},
     at_ms: i64,
 };
 
@@ -185,6 +203,9 @@ fn fill(slot: *Review, input: Record) void {
     slot.reason_len = @intCast(copyInto(&slot.reason_buf, input.reason));
     slot.action_len = @intCast(copySecretSafe(&slot.action_buf, input.action));
     slot.rationale_len = @intCast(copySecretSafe(&slot.rationale_buf, input.rationale));
+    const kept = @min(input.attempts.len, max_attempts);
+    @memcpy(slot.attempts_buf[0..kept], input.attempts[0..kept]);
+    slot.attempts_len = @intCast(kept);
 }
 
 /// Records one review. A review that did not clear also goes to the held
@@ -570,4 +591,30 @@ fn reviewIsWhole(review: *const Review) bool {
     const seq = std.fmt.parseInt(usize, id[dash + 1 ..], 10) catch return false;
     const want: Outcome = if (seq % 4 == 0) .caution else .clear;
     return review.outcome == want and review.at_ms == @as(i64, @intCast(seq));
+}
+
+test "a review keeps its sends in order, up to the limit" {
+    reset();
+    defer reset();
+
+    var sends: [max_attempts + 2]Attempt = undefined;
+    for (&sends, 0..) |*send, index| send.* = .{
+        .result = if (index == 0) .timed_out else .answered,
+        .elapsed_ms = @intCast(index * 10),
+    };
+    record(.{
+        .outcome = .clear,
+        .call_id = "call_attempts",
+        .tool_name = "shell",
+        .attempts = &sends,
+        .at_ms = 1,
+    });
+    const snapshots = try snapshotsForTest();
+    defer freeForTest(snapshots);
+    try testing.expectEqual(@as(usize, 1), snapshots.recent.len);
+    const review = &snapshots.recent[0];
+    const kept = review.attempts();
+    try testing.expectEqual(@as(usize, max_attempts), kept.len);
+    try testing.expectEqual(AttemptResult.timed_out, kept[0].result);
+    try testing.expectEqual(@as(u32, (max_attempts - 1) * 10), kept[kept.len - 1].elapsed_ms);
 }

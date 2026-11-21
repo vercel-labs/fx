@@ -250,6 +250,8 @@ function handle(message) {
     }
     return;
   }
+  // stall_list: discovery and initialize are answered, tools/list never is.
+  if (mode === "stall_list" && message.method === "tools/list") return;
   if (
     (mode === "stall_startup" || stallRecovery) &&
     ["server/discover", "initialize", "tools/list"].includes(message.method)
@@ -661,6 +663,11 @@ function handle(message) {
   }
   if (message.method === "tools/call") {
     if (mode === "stall_operation") return;
+    // unreadable_operation: a line that is no JSON-RPC at all, and no answer.
+    if (mode === "unreadable_operation") {
+      process.stdout.write("this line is not JSON-RPC at all\n");
+      return;
+    }
     if (mode === "typed_arguments") {
       const args = message.params?.arguments ?? {};
       const mismatch = typedArgumentMismatch(args);

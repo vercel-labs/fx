@@ -193,7 +193,7 @@ const subagent_description =
 // take, and the test below keeps these properties in step with it. The
 // decoder also owns every length limit, so the schema does not repeat them.
 const subagent_properties = [_]model_tool_schema.Property{
-    .{ .name = "action", .json_type = .string, .shape = &.{ .enum_values = &.{ "message", "wait", "status", "stop", "close" } } },
+    .{ .name = "action", .json_type = .string, .shape = &.{ .enum_values = &.{ "message", "wait", "status", "stop", "close" } }, .description = "wait blocks you, and the user cannot talk to you meanwhile. When nothing is left to do but wait, end your turn with a short status instead: each report starts your next turn. A subagent may still wait, since the end of its turn sends its report." },
     .{ .name = "agent", .json_type = .string, .description = "For message, stop, and close, optional for status: a lowercase name. As a subagent, \"parent\" is the agent that started you." },
     .{ .name = "message", .json_type = .string, .description = "For message: its task, or a message for its turn." },
     .{ .name = "instructions", .json_type = .string, .description = "For message: system instructions for this child." },
@@ -847,9 +847,9 @@ test "built-in model-facing tool contract stays byte exact" {
     const actual_hex = std.fmt.bytesToHex(hasher.finalResult(), .lower);
     try std.testing.expectEqualStrings(
         if (builtin.target.os.tag.isDarwin())
-            "a84217167d9345c518d346ab58d3e117b92ac636b5272af02720011c6aa99a99"
+            "9c7b6d1880a16dcd7cd402248777e32abbaf2c19fa3e1efca703cc126a41f981"
         else
-            "8b6048d8bf6145c7a37a2bc376d13d4b2cfae304b179a2bd1d2e464a138d87a1",
+            "b513f047679790d2bce997522fd05b39ae7c9b4296004d488273d65505d19f05",
         &actual_hex,
     );
 }

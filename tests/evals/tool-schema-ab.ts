@@ -1120,6 +1120,35 @@ export const TASKS: Task[] = [
     prompt: () => "Create a persistent subagent named notes-helper and ask it to count the TODO lines in docs/notes.md. Report its answer.",
     check: (c) => ok(used(c, "subagent").some((s) => !s.error && s.input?.agent === "notes-helper") && numberIn(c.output, 3), "named child answered 3"),
   },
+  // Main has nothing to do while its subagents work. fx ask finishes only once
+  // they are quiet, and each report starts main's next turn, so main should end
+  // its turn rather than block in wait.
+  {
+    id: "subagent-idle",
+    tool: "subagent",
+    timeoutSec: 420,
+    prompt: () =>
+      "Start two subagents that work at the same time. Ask the one named alpha to run `sleep 45; echo ALPHA-7341` in the shell and report the word it prints. Ask the one named beta to run `sleep 45; echo BETA-5926` in the shell and report the word it prints. When both have reported, tell me both words.",
+    check: (c) => {
+      const waits = used(c, "subagent").filter((s) => s.input?.action === "wait").length;
+      const words = has(c.output, "ALPHA-7341", "BETA-5926");
+      return ok(waits === 0 && words, `waits=${waits} words=${words}`);
+    },
+  },
+  // Main has its own work while a subagent runs: it should do it, then end its
+  // turn instead of waiting for the report.
+  {
+    id: "subagent-side-work",
+    tool: "subagent",
+    timeoutSec: 420,
+    prompt: () =>
+      "Start a subagent named slowpoke and ask it to run `sleep 60; echo SLOW-8812` in the shell and report the word it prints. While it works, count the TODO lines in docs/notes.md yourself. Then tell me the count and slowpoke's word.",
+    check: (c) => {
+      const waits = used(c, "subagent").filter((s) => s.input?.action === "wait").length;
+      const answers = numberIn(c.output, 3) && has(c.output, "SLOW-8812");
+      return ok(waits === 0 && answers, `waits=${waits} answers=${answers}`);
+    },
+  },
   {
     id: "skill-use",
     tool: "skill",
