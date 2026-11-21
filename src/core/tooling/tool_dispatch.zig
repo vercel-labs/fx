@@ -4,6 +4,7 @@ const observation = @import("../agent/runtime/observation.zig");
 const testing_allocator = @import("../shared/testing_allocator.zig");
 const skill_contract = @import("../skills/skill_contract.zig");
 const command_admission = @import("../permissions/command_admission.zig");
+const sandbox_policy = @import("../sandbox/policy.zig");
 const core_permissions = @import("../permissions/permissions.zig");
 const core_types = @import("../shared/types.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
@@ -251,6 +252,8 @@ pub const DispatchContext = struct {
     permission_mode: permission_gate.PermissionMode = .ask,
     permission_decider: ?PermissionDecider = null,
     execution_authority: ?command_admission.ToolExecutionAuthority = null,
+    /// The sandbox policy a shell run is placed with. Null runs every command here.
+    sandbox_policy: ?*const sandbox_policy.Policy = null,
     workspace_root: []const u8 = "",
     access_scope: ?workspace_access.AccessScope = null,
     ignored_list_entries: []const []const u8 = &default_ignored_list_entries,

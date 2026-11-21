@@ -8,6 +8,7 @@ const command_runner = @import("command_runner.zig");
 const contract = @import("managed_execution_contract.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const execution_router = @import("router.zig");
+const sandbox_launch = @import("../sandbox/launch.zig");
 const io_mod = @import("../shared/io.zig");
 const types = @import("../shared/types.zig");
 const command_replay_store = @import("../session/command_replay_store.zig");
@@ -69,6 +70,9 @@ pub const StartCapturedInput = struct {
     cwd: []const u8,
     environment: command_environment.Environment,
     authority: command_admission.CommandExecutionAuthority,
+    /// The provider launch of a placed command, from the policy. Borrowed for
+    /// the call; the entry keeps its own copy. Null for a local command.
+    sandbox: ?*const sandbox_launch.Launch = null,
     max_output_bytes: usize,
     timeout_ms: ?usize,
     command_artifact_dir: ?[]const u8,
@@ -306,12 +310,7 @@ const Entry = struct {
             try owned.dupe(u8, path)
         else
             null;
-        const command_ctx = command_admission.CommandContext{
-            .command = command,
-            .resolved_cwd = cwd,
-            .target_os = builtin.target.os.tag,
-            .environment = environment,
-        };
+        const command_ctx = try entryCommandContext(owned, input, command, cwd, environment);
         const authority = rebindAuthority(input.authority, command_ctx);
         var route = try execution_router.prepareAuthorizedRoute(
             owned,
@@ -1800,6 +1799,71 @@ fn dupeEnvironment(
     };
 }
 
+/// The fingerprint that an admitted command authority approved.
+pub fn admittedFingerprint(
+    authority: command_admission.CommandExecutionAuthority,
+) command_admission.AdmissionFingerprint {
+    return switch (authority) {
+        .direct_only => |fingerprint| fingerprint,
+        .shell_allowed => |shell| shell.fingerprint,
+    };
+}
+
+/// The context an entry runs with. A placed command keeps the placement that
+/// admission approved, and its launch is copied into `owned`, because the entry
+/// outlives the request that admitted it. A placed command without a launch
+/// keeps its placement, so the router refuses it instead of running it here.
+fn entryCommandContext(
+    owned: Allocator,
+    input: StartCapturedInput,
+    command: []const u8,
+    cwd: []const u8,
+    environment: command_environment.Environment,
+) !command_admission.CommandContext {
+    var command_ctx: command_admission.CommandContext = .{
+        .command = command,
+        .resolved_cwd = cwd,
+        .target_os = builtin.target.os.tag,
+        .environment = environment,
+    };
+    const approved = admittedFingerprint(input.authority);
+    if (approved.placement == .local) return command_ctx;
+    command_ctx.placement = approved.placement;
+    if (approved.placement_profile) |name| {
+        command_ctx.placement_profile = try owned.dupe(u8, name);
+    }
+    if (input.sandbox) |source| command_ctx.sandbox = try dupeLaunch(owned, source);
+    return command_ctx;
+}
+
+fn dupeLaunch(alloc: Allocator, source: *const sandbox_launch.Launch) !*const sandbox_launch.Launch {
+    const copy = try alloc.create(sandbox_launch.Launch);
+    copy.* = .{
+        .provider = try dupeStrings(alloc, source.provider),
+        .provider_args = try dupeStrings(alloc, source.provider_args),
+        .state_dir = try alloc.dupe(u8, source.state_dir),
+        .workspace_root = try alloc.dupe(u8, source.workspace_root),
+        .env = try dupeStrings(alloc, source.env),
+        .profiles = try dupeProfiles(alloc, source.profiles),
+        .grace_ms = source.grace_ms,
+    };
+    return copy;
+}
+
+fn dupeStrings(alloc: Allocator, items: []const []const u8) ![]const []const u8 {
+    const out = try alloc.alloc([]const u8, items.len);
+    for (items, out) |item, *slot| slot.* = try alloc.dupe(u8, item);
+    return out;
+}
+
+fn dupeProfiles(alloc: Allocator, items: []const sandbox_launch.Profile) ![]const sandbox_launch.Profile {
+    const out = try alloc.alloc(sandbox_launch.Profile, items.len);
+    for (items, out) |item, *slot| {
+        slot.* = .{ .name = try alloc.dupe(u8, item.name), .args = try dupeStrings(alloc, item.args) };
+    }
+    return out;
+}
+
 fn rebindAuthority(
     authority: command_admission.CommandExecutionAuthority,
     command_ctx: command_admission.CommandContext,
@@ -2845,4 +2909,103 @@ test "terminal output keeps its head and tail through restore, refresh, and deli
     try std.testing.expectEqualStrings("gh", next.snapshot.output_delta);
     try std.testing.expect(!next.snapshot.output_truncated);
     try runtime.commitDelivery(next.snapshot.execution_id, next.reservation_id);
+}
+
+test "a managed rebuild keeps a placed command's placement, profile, and launch" {
+    var owned_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer owned_state.deinit();
+    const owned = owned_state.allocator();
+
+    const provider = [_][]const u8{"/opt/fx/vercel.sh"};
+    const provider_args = [_][]const u8{ "--scope", "team" };
+    const env = [_][]const u8{"CI_TOKEN_1"};
+    const media_args = [_][]const u8{"--gpu"};
+    const profiles = [_]sandbox_launch.Profile{.{ .name = "media", .args = &media_args }};
+    const launch_value: sandbox_launch.Launch = .{
+        .provider = &provider,
+        .provider_args = &provider_args,
+        .state_dir = "/Users/example/.fx/sandbox/state",
+        .workspace_root = "/Users/example/repo",
+        .env = &env,
+        .profiles = &profiles,
+        .grace_ms = 2500,
+    };
+    const admitted: command_admission.CommandContext = .{
+        .command = "convert a b",
+        .resolved_cwd = "/Users/example/repo",
+        .target_os = builtin.target.os.tag,
+        .placement = .isolated,
+        .placement_profile = "media",
+        .sandbox = &launch_value,
+    };
+    const authority: command_admission.CommandExecutionAuthority = .{ .shell_allowed = .{
+        .fingerprint = .init(admitted),
+        .source = .yolo,
+    } };
+    const input: StartCapturedInput = .{
+        .execution_id = "placed",
+        .command = "convert a b",
+        .cwd = "/Users/example/repo",
+        .environment = .legacy,
+        .authority = authority,
+        .sandbox = &launch_value,
+        .max_output_bytes = 1024,
+        .timeout_ms = null,
+        .command_artifact_dir = null,
+    };
+
+    const rebuilt = try entryCommandContext(owned, input, input.command, input.cwd, input.environment);
+    try std.testing.expectEqual(command_environment.Placement.isolated, rebuilt.placement);
+    try std.testing.expectEqualStrings("media", rebuilt.placement_profile.?);
+    const run = rebuilt.sandbox orelse return error.TestExpectedLaunch;
+    try std.testing.expect(run != &launch_value);
+    try std.testing.expectEqualStrings("/opt/fx/vercel.sh", run.provider[0]);
+    try std.testing.expectEqualStrings("team", run.provider_args[1]);
+    try std.testing.expectEqualStrings("/Users/example/.fx/sandbox/state", run.state_dir);
+    try std.testing.expectEqualStrings("/Users/example/repo", run.workspace_root);
+    try std.testing.expectEqualStrings("CI_TOKEN_1", run.env[0]);
+    try std.testing.expectEqualStrings("media", run.profiles[0].name);
+    try std.testing.expectEqualStrings("--gpu", run.profiles[0].args[0]);
+    try std.testing.expectEqual(@as(u32, 2500), run.grace_ms);
+
+    // The rebuilt context matches the admitted fingerprint, so the route keeps the
+    // placement and runs the provider invocation.
+    try std.testing.expect(admittedFingerprint(authority).matches(rebuilt));
+    const route = try execution_router.prepareAuthorizedRoute(owned, rebuilt, rebindAuthority(authority, rebuilt));
+    try std.testing.expect(route == .approved_shell);
+    const run_command = route.approved_shell.run_command orelse return error.TestExpectedInvocation;
+    try std.testing.expect(std.mem.find(u8, run_command, "--profile media --gpu -- 'convert a b'") != null);
+}
+
+test "a managed rebuild without a launch refuses a placed command instead of running it here" {
+    var owned_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer owned_state.deinit();
+    const owned = owned_state.allocator();
+    const admitted: command_admission.CommandContext = .{
+        .command = "zig build test",
+        .resolved_cwd = "/Users/example/repo",
+        .target_os = builtin.target.os.tag,
+        .placement = .workspace,
+    };
+    const authority: command_admission.CommandExecutionAuthority = .{ .shell_allowed = .{
+        .fingerprint = .init(admitted),
+        .source = .yolo,
+    } };
+    const input: StartCapturedInput = .{
+        .execution_id = "placed-no-launch",
+        .command = "zig build test",
+        .cwd = "/Users/example/repo",
+        .environment = .legacy,
+        .authority = authority,
+        .max_output_bytes = 1024,
+        .timeout_ms = null,
+        .command_artifact_dir = null,
+    };
+    const rebuilt = try entryCommandContext(owned, input, input.command, input.cwd, input.environment);
+    try std.testing.expectEqual(command_environment.Placement.workspace, rebuilt.placement);
+    try std.testing.expect(rebuilt.sandbox == null);
+    try std.testing.expectError(
+        error.SandboxUnavailable,
+        execution_router.prepareAuthorizedRoute(owned, rebuilt, rebindAuthority(authority, rebuilt)),
+    );
 }

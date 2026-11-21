@@ -40,6 +40,10 @@ pub const Config = struct {
     /// Shell snapshot epoch of the remembered grant that admitted a `user`
     /// profile command, or null when it was not admitted by a grant.
     shell_grant_epoch: ?u64 = null,
+    /// How long a stop waits after SIGTERM before SIGKILL, in milliseconds and
+    /// positive. Null keeps the built-in grace, 700 ms. The parent's own
+    /// escalation waits 100 ms longer.
+    termination_grace_ms: ?i64 = null,
     /// Variables added to the command's environment after `AI_AGENT`,
     /// such as the `fx mcp call` bridge's address. Borrowed for the run.
     extra_environment: []const EnvironmentVariable = &.{},
@@ -104,6 +108,9 @@ const foreground_session_release_byte: u8 = 0x06;
 const foreground_session_setup_timeout_ms: i64 = 5000;
 const foreground_target_termination_grace_ms: i64 = 700;
 const foreground_target_cleanup_wait_ms: i64 = 250;
+/// The parent waits this much longer than the supervisor's grace before it
+/// sends SIGKILL itself, so the supervisor's own SIGKILL comes first.
+const parent_termination_escalation_margin_ms: i64 = 100;
 /// How long `finishDetachedSession` waits after closing the lifeline. The
 /// supervisor's own cleanup ends within its termination grace and cleanup
 /// wait; the rest is margin.
@@ -163,6 +170,49 @@ fn readForegroundSessionInputExact(buffer: []u8) !void {
     }
 }
 
+/// What the foreground supervisor's control argument carries: the deadline
+/// (null for none) and the stop grace after SIGTERM.
+const ForegroundSessionControl = struct {
+    deadline_ms: ?i64,
+    termination_grace_ms: i64,
+};
+
+/// Parses `<deadline|none>` or `<deadline|none>:<grace_ms>`. Without a grace the
+/// supervisor uses `foreground_target_termination_grace_ms`.
+fn parseForegroundSessionControl(text: []const u8) !ForegroundSessionControl {
+    const colon = std.mem.findScalar(u8, text, ':');
+    const deadline_text = if (colon) |index| text[0..index] else text;
+    const deadline_ms: ?i64 = if (std.mem.eql(u8, deadline_text, "none"))
+        null
+    else
+        std.fmt.parseInt(i64, deadline_text, 10) catch
+            return error.InvalidForegroundSessionInvocation;
+    const termination_grace_ms: i64 = if (colon) |index| blk: {
+        const grace = std.fmt.parseInt(i64, text[index + 1 ..], 10) catch
+            return error.InvalidForegroundSessionInvocation;
+        if (grace <= 0) return error.InvalidForegroundSessionInvocation;
+        break :blk grace;
+    } else foreground_target_termination_grace_ms;
+    return .{ .deadline_ms = deadline_ms, .termination_grace_ms = termination_grace_ms };
+}
+
+/// Writes the control argument that `parseForegroundSessionControl` reads. A
+/// null grace writes the deadline alone, so the supervisor keeps its built-in
+/// grace.
+fn formatForegroundSessionControl(
+    scratch: Allocator,
+    deadline_ms: ?i64,
+    termination_grace_ms: ?i64,
+) ![]const u8 {
+    const deadline_text = if (deadline_ms) |value|
+        try scratch.print("{d}", .{value})
+    else
+        "none";
+    const grace = termination_grace_ms orelse return deadline_text;
+    if (grace <= 0) return error.InvalidTerminationGrace;
+    return scratch.print("{s}:{d}", .{ deadline_text, grace });
+}
+
 pub fn runForegroundSessionBootstrap(args: []const [:0]const u8) !void {
     if (comptime !supports_foreground_session) {
         return error.OperationUnsupported;
@@ -170,11 +220,8 @@ pub fn runForegroundSessionBootstrap(args: []const [:0]const u8) !void {
     if (!isForegroundSessionInvocation(args) or args.len < 3) {
         return error.InvalidForegroundSessionInvocation;
     }
-    const deadline_ms = if (std.mem.eql(u8, args[1], "none"))
-        null
-    else
-        std.fmt.parseInt(i64, args[1], 10) catch
-            return error.InvalidForegroundSessionInvocation;
+    const supervisor_control = try parseForegroundSessionControl(args[1]);
+    const deadline_ms = supervisor_control.deadline_ms;
     const command_session = std.c.setsid();
     if (command_session == -1) return error.ForegroundSessionSetupFailed;
 
@@ -294,6 +341,7 @@ pub fn runForegroundSessionBootstrap(args: []const [:0]const u8) !void {
         if (process_witness) |*witness| witness else null,
         deadline_ms,
         command_session,
+        supervisor_control.termination_grace_ms,
     ) catch |err| {
         target.kill(zio);
         writeForegroundSessionReplaceFailure(failure_nonce, err);
@@ -357,12 +405,13 @@ fn decideForegroundTerminationAction(
     termination_started_ms: ?i64,
     forced: bool,
     now_ms: i64,
+    termination_grace_ms: i64,
 ) ForegroundTerminationAction {
     if (forced or request == .none) return .none;
     if (request == .force) return .force;
     const started_ms = termination_started_ms orelse return .begin_graceful;
     if (now_ms >= started_ms and
-        now_ms - started_ms >= foreground_target_termination_grace_ms)
+        now_ms - started_ms >= termination_grace_ms)
     {
         return .force;
     }
@@ -506,6 +555,7 @@ fn waitForForegroundTarget(
     process_witness: ?*const process_tree.DarwinProcessWitness,
     deadline_ms: ?i64,
     command_session: std.posix.pid_t,
+    termination_grace_ms: i64,
 ) !std.process.Child.Term {
     const target_pid = target.id orelse return error.ForegroundTargetMissing;
     var descendants = try process_tree.Tracker.init(std.heap.page_allocator);
@@ -553,6 +603,7 @@ fn waitForForegroundTarget(
             now_ms,
             &termination_started_ms,
             &forced,
+            termination_grace_ms,
         );
 
         if (waiter.isReady()) {
@@ -565,6 +616,7 @@ fn waitForForegroundTarget(
                 io_mod.milliTimestamp(),
                 &termination_started_ms,
                 &forced,
+                termination_grace_ms,
             );
             if (termination_started_ms) |started_ms| {
                 try waitForForegroundTargetDescendants(
@@ -572,6 +624,7 @@ fn waitForForegroundTarget(
                     target_pid,
                     started_ms,
                     &forced,
+                    termination_grace_ms,
                 );
                 return term;
             }
@@ -670,12 +723,14 @@ fn advanceForegroundTargetTermination(
     now_ms: i64,
     termination_started_ms: *?i64,
     forced: *bool,
+    termination_grace_ms: i64,
 ) void {
     switch (decideForegroundTerminationAction(
         request,
         termination_started_ms.*,
         forced.*,
         now_ms,
+        termination_grace_ms,
     )) {
         .none => {},
         .begin_graceful => {
@@ -703,13 +758,14 @@ fn waitForForegroundTargetDescendants(
     target_pid: std.posix.pid_t,
     termination_started_ms: i64,
     forced: *bool,
+    termination_grace_ms: i64,
 ) !void {
     var empty_scans: u8 = 0;
     while (true) {
         try refreshForegroundTargetTree(descendants, target_pid);
         const now_ms = io_mod.milliTimestamp();
         if (!forced.* and
-            now_ms - termination_started_ms >= foreground_target_termination_grace_ms)
+            now_ms - termination_started_ms >= termination_grace_ms)
         {
             forced.* = true;
             forceKillForegroundTargetDescendants(descendants);
@@ -725,7 +781,7 @@ fn waitForForegroundTargetDescendants(
         }
         if (forced.* and
             now_ms - termination_started_ms >=
-                foreground_target_termination_grace_ms + foreground_target_cleanup_wait_ms)
+                termination_grace_ms + foreground_target_cleanup_wait_ms)
         {
             return;
         }
@@ -1614,11 +1670,12 @@ fn executeProcessWithDetachedSession(
     try helper_argv.append(scratch, foreground_session_token);
     const deadline_ms = ExecutionControl.init(cfg).deadlineMs();
     const supervisor_deadline_ms = foreground_supervisor_fallback_deadline_ms(deadline_ms);
-    const deadline_text = if (supervisor_deadline_ms) |value|
-        try scratch.print("{d}", .{value})
-    else
-        "none";
-    try helper_argv.append(scratch, deadline_text);
+    const control_text = try formatForegroundSessionControl(
+        scratch,
+        supervisor_deadline_ms,
+        cfg.termination_grace_ms,
+    );
+    try helper_argv.append(scratch, control_text);
     try helper_argv.appendSlice(scratch, argv);
 
     const started_ms = io_mod.milliTimestamp();
@@ -3951,6 +4008,14 @@ fn mapTerminationError(
     };
 }
 
+/// How long the parent waits after SIGTERM before it sends SIGKILL itself. It
+/// is the supervisor's grace plus a margin, so the supervisor's SIGKILL comes
+/// first. Null keeps the built-in grace, which gives 800 ms.
+fn parentTerminationEscalationMs(cfg: Config) i64 {
+    return (cfg.termination_grace_ms orelse foreground_target_termination_grace_ms) +
+        parent_termination_escalation_margin_ms;
+}
+
 fn updateTerminationSignal(
     observer: *ProcessObserver,
     process_group_id: ?std.posix.pid_t,
@@ -4004,7 +4069,7 @@ fn updateTerminationSignal(
         if (!force_kill_sent.*) {
             // A force request (process exit) escalates a cooperative stop
             // that is still inside its grace window.
-            const grace_expired = now_ms - sent_ms >= 800;
+            const grace_expired = now_ms - sent_ms >= parentTerminationEscalationMs(cfg);
             if (grace_expired or cancelRequested(cfg.force_cancel_flag)) {
                 try observer.signal(process_group_id, termination_protocol, .force);
                 debug_trace.logf(
@@ -5663,27 +5728,27 @@ test "foreground force cleanup preserves the supervisor" {
 test "foreground force request dominates graceful termination" {
     try std.testing.expectEqual(
         ForegroundTerminationAction.none,
-        decideForegroundTerminationAction(.none, null, false, 1000),
+        decideForegroundTerminationAction(.none, null, false, 1000, foreground_target_termination_grace_ms),
     );
     try std.testing.expectEqual(
         ForegroundTerminationAction.begin_graceful,
-        decideForegroundTerminationAction(.graceful, null, false, 1000),
+        decideForegroundTerminationAction(.graceful, null, false, 1000, foreground_target_termination_grace_ms),
     );
     try std.testing.expectEqual(
         ForegroundTerminationAction.none,
-        decideForegroundTerminationAction(.graceful, 1000, false, 1699),
+        decideForegroundTerminationAction(.graceful, 1000, false, 1699, foreground_target_termination_grace_ms),
     );
     try std.testing.expectEqual(
         ForegroundTerminationAction.force,
-        decideForegroundTerminationAction(.graceful, 1000, false, 1700),
+        decideForegroundTerminationAction(.graceful, 1000, false, 1700, foreground_target_termination_grace_ms),
     );
     try std.testing.expectEqual(
         ForegroundTerminationAction.force,
-        decideForegroundTerminationAction(.force, 1000, false, 1001),
+        decideForegroundTerminationAction(.force, 1000, false, 1001, foreground_target_termination_grace_ms),
     );
     try std.testing.expectEqual(
         ForegroundTerminationAction.none,
-        decideForegroundTerminationAction(.force, 1000, true, 2000),
+        decideForegroundTerminationAction(.force, 1000, true, 2000, foreground_target_termination_grace_ms),
     );
 
     try std.testing.expectEqual(
@@ -5721,6 +5786,80 @@ test "termination result follows the delivered signal source" {
         TerminationSource.cancelled,
         reconcileForegroundTerminationSource(.cancelled, 1700, 2000),
     );
+}
+
+test "foreground session control carries an optional termination grace" {
+    const plain = try parseForegroundSessionControl("1000");
+    try std.testing.expectEqual(@as(?i64, 1000), plain.deadline_ms);
+    try std.testing.expectEqual(foreground_target_termination_grace_ms, plain.termination_grace_ms);
+
+    const none = try parseForegroundSessionControl("none");
+    try std.testing.expectEqual(@as(?i64, null), none.deadline_ms);
+    try std.testing.expectEqual(foreground_target_termination_grace_ms, none.termination_grace_ms);
+
+    const graced = try parseForegroundSessionControl("1000:2500");
+    try std.testing.expectEqual(@as(?i64, 1000), graced.deadline_ms);
+    try std.testing.expectEqual(@as(i64, 2500), graced.termination_grace_ms);
+
+    const none_graced = try parseForegroundSessionControl("none:1500");
+    try std.testing.expectEqual(@as(?i64, null), none_graced.deadline_ms);
+    try std.testing.expectEqual(@as(i64, 1500), none_graced.termination_grace_ms);
+
+    for ([_][]const u8{ "", "x", "none:", "1000:", "none:abc", "1000:0", "1000:-5" }) |bad| {
+        try std.testing.expectError(
+            error.InvalidForegroundSessionInvocation,
+            parseForegroundSessionControl(bad),
+        );
+    }
+}
+
+test "foreground session control writes the form the supervisor reads" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    try std.testing.expectEqualStrings("none", try formatForegroundSessionControl(arena, null, null));
+    try std.testing.expectEqualStrings("1000", try formatForegroundSessionControl(arena, 1000, null));
+    try std.testing.expectEqualStrings("1000:2500", try formatForegroundSessionControl(arena, 1000, 2500));
+    try std.testing.expectEqualStrings("none:1500", try formatForegroundSessionControl(arena, null, 1500));
+    try std.testing.expectError(
+        error.InvalidTerminationGrace,
+        formatForegroundSessionControl(arena, 1000, 0),
+    );
+}
+
+test "foreground termination honors a custom stop grace" {
+    // With a 1500 ms grace, SIGKILL moves from 1700 ms to 2500 ms after SIGTERM.
+    try std.testing.expectEqual(
+        ForegroundTerminationAction.none,
+        decideForegroundTerminationAction(.graceful, 1000, false, 2499, 1500),
+    );
+    try std.testing.expectEqual(
+        ForegroundTerminationAction.force,
+        decideForegroundTerminationAction(.graceful, 1000, false, 2500, 1500),
+    );
+    try std.testing.expectEqual(
+        ForegroundTerminationAction.begin_graceful,
+        decideForegroundTerminationAction(.graceful, null, false, 1000, 1500),
+    );
+}
+
+test "a null termination grace keeps the 700 ms supervisor and 800 ms parent graces" {
+    const default_config: Config = .{ .max_command_output_bytes = 1 };
+    try std.testing.expectEqual(@as(i64, 800), parentTerminationEscalationMs(default_config));
+
+    const plain = try parseForegroundSessionControl("1000");
+    try std.testing.expectEqual(@as(i64, 700), plain.termination_grace_ms);
+    try std.testing.expectEqual(
+        ForegroundTerminationAction.none,
+        decideForegroundTerminationAction(.graceful, 1000, false, 1699, plain.termination_grace_ms),
+    );
+    try std.testing.expectEqual(
+        ForegroundTerminationAction.force,
+        decideForegroundTerminationAction(.graceful, 1000, false, 1700, plain.termination_grace_ms),
+    );
+
+    const custom: Config = .{ .max_command_output_bytes = 1, .termination_grace_ms = 1500 };
+    try std.testing.expectEqual(@as(i64, 1600), parentTerminationEscalationMs(custom));
 }
 
 test "forced termination settlement expires only after its deadline" {

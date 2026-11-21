@@ -633,6 +633,7 @@ const AcpContext = struct {
         var tc: tool_runtime.Context = .{
             .observer = self.observer,
             .workspace_root = self.state.workspace_root,
+            .sandbox_policy = if (comptime !host_target.is_wasm) self.state.sandbox_policy else null,
             .access_scope = self.state.workspace_access.scope(self.state.workspace_root),
             .ignored_list_entries = self.state.cfg.ignored_list_entries,
             .max_list_entries = self.state.cfg.max_list_entries,
