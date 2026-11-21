@@ -1,15 +1,57 @@
 const std = @import("std");
 const app_permission_runtime = @import("app_permission_runtime.zig");
 const provider_runtime = @import("provider_runtime.zig");
+const config_runtime = @import("../config/config_runtime.zig");
 const js_host_config_store = @import("../config/js_host_config_store.zig");
 const mode_registry = @import("../modes/mode_registry.zig");
 const runtime_profile = @import("../hosts/runtime_profile.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
+const io_mod = @import("../shared/io.zig");
 const session_codec = @import("../session/session_codec.zig");
 const types = @import("../shared/types.zig");
 
 const Allocator = std.mem.Allocator;
 const PermissionMode = types.PermissionMode;
+
+/// What a user preferences write did for an app's runtime profile.
+pub const UserPreferenceAttempt = union(enum) {
+    /// The profile keeps preferences in its JS host's config store and has
+    /// no settings file, so nothing was written and nothing failed.
+    host_owned,
+    outcome: config_runtime.CommitOutcome,
+    failure: config_runtime.CommitFailure,
+
+    pub fn deinit(self: *UserPreferenceAttempt, alloc: Allocator) void {
+        switch (self.*) {
+            .host_owned => {},
+            .outcome => |*outcome| outcome.deinit(alloc),
+            .failure => |*failure| failure.deinit(alloc),
+        }
+        self.* = undefined;
+    }
+};
+
+/// Saves user preferences for an app of type `App`. A JS host profile keeps
+/// them in the host's config store and has no settings file, so it returns
+/// `.host_owned` without looking for a home, even when the host passes HOME
+/// (`tests/tla/host_config/HostPreferences.tla` HostProfileQuiet,
+/// HostNeverTouchesHome). Other profiles write ~/.fx/settings.json.
+pub fn attemptUserPreferences(
+    comptime App: type,
+    alloc: Allocator,
+    patch: config_runtime.UserSettingsPatch,
+) UserPreferenceAttempt {
+    if (comptime runtime_profile.allows(App, .js_host_config)) {
+        // The host store keeps only the model and the permission mode; any
+        // other preference lasts for this process alone.
+        debug_trace.logf("host_config", "user_settings_write_skipped reason=host_owned", .{});
+        return .host_owned;
+    }
+    return switch (config_runtime.attemptUserPreferences(alloc, patch)) {
+        .outcome => |outcome| .{ .outcome = outcome },
+        .failure => |failure| .{ .failure = failure },
+    };
+}
 
 pub fn Runtime(comptime App: type) type {
     return struct {
@@ -88,6 +130,38 @@ fn configIdForPermissionMode(mode: PermissionMode) []const u8 {
         .ask => "ask",
         .yolo => "full-access",
     };
+}
+
+test "a js-host profile owns user preferences and leaves the settings file alone" {
+    const io = io_mod.getIo();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "home/.fx");
+    const home = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "home");
+    defer std.testing.allocator.free(home);
+    // A host that passes HOME must not make fx write there either.
+    var environ = std.process.Environ.Map.init(std.testing.allocator);
+    defer environ.deinit();
+    try environ.put("HOME", home);
+    io_mod.setEnvironMap(&environ);
+    defer io_mod.resetEnvironForTest();
+
+    const HostApp = struct {
+        pub const host_profile = runtime_profile.wasm;
+    };
+    const NativeApp = struct {
+        pub const host_profile = runtime_profile.native;
+    };
+
+    var hosted = attemptUserPreferences(HostApp, std.testing.allocator, .{ .startup_scrollback = false });
+    defer hosted.deinit(std.testing.allocator);
+    try std.testing.expect(hosted == .host_owned);
+    try std.testing.expectError(error.FileNotFound, tmp.dir.access(io, "home/.fx/settings.json", .{}));
+
+    var native = attemptUserPreferences(NativeApp, std.testing.allocator, .{ .startup_scrollback = false });
+    defer native.deinit(std.testing.allocator);
+    try std.testing.expect(native == .outcome);
+    try tmp.dir.access(io, "home/.fx/settings.json", .{});
 }
 
 test "host config maps permission modes to restorable product modes" {

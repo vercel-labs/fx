@@ -2,6 +2,7 @@ const std = @import("std");
 const profile_paths = @import("../shared/profile_paths.zig");
 const agents = @import("../agents/agents.zig");
 const runtime_profile = @import("../hosts/runtime_profile.zig");
+const app_host_config_runtime = @import("app_host_config_runtime.zig");
 const app_permission_runtime = @import("app_permission_runtime.zig");
 const app_session_runtime = @import("app_session_runtime.zig");
 const session_display_metadata = @import("../session/session_display_metadata.zig");
@@ -90,9 +91,10 @@ fn persistUserPreferences(
     patch: config_runtime.UserSettingsPatch,
     runtime_changed: bool,
 ) !void {
-    var attempt = config_runtime.attemptUserPreferences(app.alloc, patch);
+    var attempt = app_host_config_runtime.attemptUserPreferences(@TypeOf(app.*), app.alloc, patch);
     defer attempt.deinit(app.alloc);
     switch (attempt) {
+        .host_owned => {},
         .failure => |failure| try session_commands.reportUserSettingsFailure(
             app,
             label,
@@ -1890,9 +1892,10 @@ fn handleNotificationsCommand(app: anytype, rest: []const u8) !void {
         .notification_attention_required = sound_on,
         .notification_max = max,
     };
-    var attempt = config_runtime.attemptUserPreferences(app.alloc, patch);
+    var attempt = app_host_config_runtime.attemptUserPreferences(@TypeOf(app.*), app.alloc, patch);
     defer attempt.deinit(app.alloc);
     switch (attempt) {
+        .host_owned => {},
         .failure => |failure| try session_commands.reportUserSettingsFailure(
             app,
             "sound",
@@ -1984,7 +1987,7 @@ fn persistUserPreferencesSilently(
     patch: config_runtime.UserSettingsPatch,
     runtime_changed: bool,
 ) !void {
-    var attempt = config_runtime.attemptUserPreferences(app.alloc, patch);
+    var attempt = app_host_config_runtime.attemptUserPreferences(@TypeOf(app.*), app.alloc, patch);
     defer attempt.deinit(app.alloc);
     switch (attempt) {
         .failure => |failure| try session_commands.reportUserSettingsFailure(
@@ -1994,7 +1997,7 @@ fn persistUserPreferencesSilently(
             failure.cleanup,
             runtime_changed,
         ),
-        .outcome => {},
+        .outcome, .host_owned => {},
     }
 }
 
