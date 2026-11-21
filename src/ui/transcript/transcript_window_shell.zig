@@ -83,20 +83,22 @@ pub const Shell = struct {
     /// first of them.
     pub fn resumed(self: *Shell, alloc: Allocator, entries: []const TranscriptEntry) !void {
         self.reset(alloc);
+        var ignored: std.ArrayList(u32) = .empty;
+        defer ignored.deinit(alloc);
+        // A failed reserve leaves the window empty, so the next sync reports the resumed entries again.
         try self.finished.ensureTotalCapacity(alloc, entries.len);
+        try ignored.ensureTotalCapacity(alloc, entries.len);
         for (entries) |entry| {
             self.finished.appendAssumeCapacity(entry.id());
             self.seen_through = @max(self.seen_through, entry.id());
         }
-        var ignored: std.ArrayList(u32) = .empty;
-        defer ignored.deinit(alloc);
-        try self.apply(alloc, .{ .resumed = .{
+        self.apply(.{ .resumed = .{
             .cycle = 0,
             .cycle_first = 0,
             .next_seq = @intCast(entries.len),
         } }, &ignored);
         // The resume path painted the held entries already.
-        while (self.state.reprinting) try self.apply(alloc, .reprint_tick, &ignored);
+        while (self.state.reprinting) self.apply(.reprint_tick, &ignored);
     }
 
     /// Reports the live blocks that finished and the entries not reported
@@ -107,13 +109,23 @@ pub const Shell = struct {
         entries: []const TranscriptEntry,
         drops: *std.ArrayList(u32),
     ) !void {
-        try self.finishUnpinned(alloc, entries, drops);
+        var new_entries: usize = 0;
+        for (entries) |entry| {
+            if (entry.id() > self.seen_through) new_entries += 1;
+        }
+        const can_finish = new_entries + self.state.live.len;
+        // Each live block and each new entry finishes at most once in a sync, and a
+        // drop only moves finished blocks, so these reserves cover every append below.
+        // A failed reserve returns before the shell changes.
+        try self.finished.ensureUnusedCapacity(alloc, can_finish);
+        try drops.ensureUnusedCapacity(alloc, self.finished.items.len + can_finish);
+        self.finishUnpinned(entries, drops);
         var highest = self.seen_through;
         for (entries) |entry| {
             const id = entry.id();
             if (id <= self.seen_through) continue;
             highest = @max(highest, id);
-            try self.report(alloc, entry, drops);
+            self.report(entry, drops);
         }
         self.seen_through = highest;
     }
@@ -127,16 +139,15 @@ pub const Shell = struct {
         drops: *std.ArrayList(u32),
     ) !void {
         try self.sync(alloc, entries, drops);
-        try self.apply(alloc, .compacted, drops);
+        self.apply(.compacted, drops);
     }
 
     /// Finishes the live blocks whose entry is gone or no longer pinned.
     fn finishUnpinned(
         self: *Shell,
-        alloc: Allocator,
         entries: []const TranscriptEntry,
         drops: *std.ArrayList(u32),
-    ) !void {
+    ) void {
         if (self.state.live.len == 0) return;
         var still_live: [core.max_live]bool = @splat(false);
         const live = self.state.live.items();
@@ -153,20 +164,20 @@ pub const Shell = struct {
             done[count] = id;
             count += 1;
         }
-        for (done[0..count]) |id| try self.apply(alloc, .{ .block_finished = id }, drops);
+        for (done[0..count]) |id| self.apply(.{ .block_finished = id }, drops);
     }
 
-    fn report(self: *Shell, alloc: Allocator, entry: TranscriptEntry, drops: *std.ArrayList(u32)) !void {
+    fn report(self: *Shell, entry: TranscriptEntry, drops: *std.ArrayList(u32)) void {
         const id = entry.id();
-        if (entry == .user_turn and !self.state.turn_open) try self.apply(alloc, .turn_started, drops);
+        if (entry == .user_turn and !self.state.turn_open) self.apply(.turn_started, drops);
         if (turnEnd(entry)) |end| {
             while (self.state.live.len > 0) {
-                try self.apply(alloc, .{ .block_finished = self.state.live.ids[0] }, drops);
+                self.apply(.{ .block_finished = self.state.live.ids[0] }, drops);
             }
-            try self.apply(alloc, .{ .block_finished = id }, drops);
-            if (self.state.turn_open) try self.apply(alloc, .turn_ended, drops);
+            self.apply(.{ .block_finished = id }, drops);
+            if (self.state.turn_open) self.apply(.turn_ended, drops);
             if (end == .summary and self.saved()) {
-                try self.apply(alloc, .{ .saved_through = self.state.next_seq }, drops);
+                self.apply(.{ .saved_through = self.state.next_seq }, drops);
             }
             return;
         }
@@ -180,31 +191,31 @@ pub const Shell = struct {
             // A full live set: the block counts as arrived final.
             traceRejected(.{ .block_opened = id }, out.rejected.?);
         }
-        try self.apply(alloc, .{ .block_finished = id }, drops);
+        self.apply(.{ .block_finished = id }, drops);
     }
 
-    fn apply(self: *Shell, alloc: Allocator, event: core.Event, drops: *std.ArrayList(u32)) !void {
+    fn apply(self: *Shell, event: core.Event, drops: *std.ArrayList(u32)) void {
         const out = core.step(self.state, event);
         if (out.rejected) |why| {
             traceRejected(event, why);
             return;
         }
-        if (event == .block_finished) try self.finished.append(alloc, @intCast(event.block_finished));
+        if (event == .block_finished) self.finished.appendAssumeCapacity(@intCast(event.block_finished));
         self.state = out.state;
         trace(event, out.effect);
         if (out.effect) |effect| switch (effect) {
-            .drop => |range| try self.drop(alloc, range, drops),
+            .drop => |range| self.drop(range, drops),
             .paint_final, .repaint_block, .reprint_begin, .reprint_slice, .repaint_live, .ctrlo_show, .read_log => {},
         };
         // Block `base + i` is `finished.items[i]`, through the core's last block.
         std.debug.assert(self.state.next_seq == self.base + self.finished.items.len);
     }
 
-    fn drop(self: *Shell, alloc: Allocator, range: core.Range, drops: *std.ArrayList(u32)) !void {
+    fn drop(self: *Shell, range: core.Range, drops: *std.ArrayList(u32)) void {
         // The core drops from the oldest held block, which is `base`.
         std.debug.assert(range.from == self.base and range.to <= self.base + self.finished.items.len);
         const count = range.to - range.from;
-        try drops.appendSlice(alloc, self.finished.items[0..count]);
+        drops.appendSliceAssumeCapacity(self.finished.items[0..count]);
         const rest = self.finished.items[count..];
         std.mem.copyForwards(u32, self.finished.items[0..rest.len], rest);
         self.finished.shrinkRetainingCapacity(rest.len);
@@ -270,6 +281,7 @@ fn describeEffect(buf: []u8, effect: core.Effect) []const u8 {
 // Tests
 
 const testing = std.testing;
+const testing_allocator = @import("../../core/shared/testing_allocator.zig");
 
 fn rawEntry(id: u32, class: transcript_blocks.RawEntryClass, pinned: bool) TranscriptEntry {
     return .{ .raw_bytes = .{ .id = id, .bytes = "line\n", .class = class, .lifecycle_pinned = pinned } };
@@ -327,6 +339,116 @@ test "the transcript window shell drops a compaction's closed cycle at the next 
     try testing.expectEqualSlices(u32, &.{ 1, 2, 3, 4 }, drops.items);
     try testing.expectEqualSlices(u32, &.{ 5, 6, 7 }, shell.finished.items);
     try testing.expectEqual(@as(core.Seq, 4), shell.base);
+}
+
+test "a failed allocation in a sync leaves the transcript window shell as it was" {
+    // A sync that fails partway leaves the window as it was. The sync that does
+    // not fail drops the closed cycle.
+    var induced_failures: usize = 0;
+    var fail_after: usize = 0;
+    while (true) : (fail_after += 1) {
+        var failing = std.testing.FailingAllocator.init(testing_allocator.no_resize, .{});
+        const alloc = failing.allocator();
+        var shell = Shell.init(true);
+        defer shell.deinit(alloc);
+        var drops: std.ArrayList(u32) = .empty;
+        defer drops.deinit(alloc);
+        var entries: std.ArrayList(TranscriptEntry) = .empty;
+        defer entries.deinit(alloc);
+        try entries.appendSlice(alloc, &.{ user(1), rawEntry(2, .tool_status, false), rawEntry(3, .turn_summary, false) });
+        try shell.sync(alloc, entries.items, &drops);
+        // The next turn compacts mid-turn while a tool line is still pinned.
+        try entries.appendSlice(alloc, &.{ user(4), rawEntry(5, .tool_status, true) });
+        try shell.compacted(alloc, entries.items, &drops);
+        try testing.expectEqual(@as(usize, 0), drops.items.len);
+        try entries.append(alloc, notice(6));
+        entries.items[4] = rawEntry(5, .tool_status, false);
+        try entries.append(alloc, rawEntry(7, .turn_summary, false));
+
+        // The final sync must allocate, so the sweep reaches both reserves.
+        shell.finished.shrinkAndFree(alloc, shell.finished.items.len);
+        drops.clearAndFree(alloc);
+        const finished_before = try alloc.dupe(u32, shell.finished.items);
+        defer alloc.free(finished_before);
+        const pending_before = try alloc.dupe(u32, shell.pending_drops.items);
+        defer alloc.free(pending_before);
+        const seen_before = shell.seen_through;
+        const base_before = shell.base;
+        const state_before = shell.state;
+
+        failing.fail_index = failing.alloc_index + fail_after;
+        const result = shell.sync(alloc, entries.items, &drops);
+        const induced = failing.has_induced_failure;
+        failing.fail_index = std.math.maxInt(usize);
+        if (!induced) {
+            try result;
+            try testing.expectEqualSlices(u32, &.{ 1, 2, 3, 4 }, drops.items);
+            try testing.expectEqualSlices(u32, &.{ 5, 6, 7 }, shell.finished.items);
+            try testing.expectEqual(@as(core.Seq, 4), shell.base);
+            break;
+        }
+        induced_failures += 1;
+        try testing.expectError(error.OutOfMemory, result);
+        try testing.expectEqualSlices(u32, finished_before, shell.finished.items);
+        try testing.expectEqualSlices(u32, pending_before, shell.pending_drops.items);
+        try testing.expectEqual(seen_before, shell.seen_through);
+        try testing.expectEqual(base_before, shell.base);
+        // The live ids past `len` are undefined, so the core state is compared through `abstract`.
+        try testing.expectEqualDeep(core.abstract(&state_before), core.abstract(&shell.state));
+        try testing.expectEqualSlices(core.BlockId, state_before.live.items(), shell.state.live.items());
+        try testing.expectEqual(@as(usize, 0), drops.items.len);
+    }
+    try testing.expect(induced_failures > 0);
+}
+
+test "a failed allocation in a resume leaves the transcript window shell empty" {
+    // A resume that fails leaves an empty window, so the next sync reports the
+    // resumed entries again.
+    var induced_failures: usize = 0;
+    var fail_after: usize = 0;
+    while (true) : (fail_after += 1) {
+        var failing = std.testing.FailingAllocator.init(testing_allocator.no_resize, .{});
+        const alloc = failing.allocator();
+        var shell = Shell.init(true);
+        defer shell.deinit(alloc);
+        var drops: std.ArrayList(u32) = .empty;
+        defer drops.deinit(alloc);
+        var entries: std.ArrayList(TranscriptEntry) = .empty;
+        defer entries.deinit(alloc);
+        try entries.appendSlice(alloc, &.{ user(1), rawEntry(2, .tool_status, false), rawEntry(3, .turn_summary, false) });
+        try shell.sync(alloc, entries.items, &drops);
+        try entries.appendSlice(alloc, &.{ user(4), rawEntry(5, .tool_status, true) });
+        try shell.compacted(alloc, entries.items, &drops);
+        try entries.append(alloc, notice(6));
+        entries.items[4] = rawEntry(5, .tool_status, false);
+        try entries.append(alloc, rawEntry(7, .turn_summary, false));
+        try shell.sync(alloc, entries.items, &drops);
+
+        var resumed_entries: std.ArrayList(TranscriptEntry) = .empty;
+        defer resumed_entries.deinit(alloc);
+        try resumed_entries.appendSlice(alloc, &.{ user(10), rawEntry(11, .tool_status, false), rawEntry(12, .turn_summary, false), notice(13) });
+        shell.finished.shrinkAndFree(alloc, shell.finished.items.len);
+
+        failing.fail_index = failing.alloc_index + fail_after;
+        const result = shell.resumed(alloc, resumed_entries.items);
+        const induced = failing.has_induced_failure;
+        failing.fail_index = std.math.maxInt(usize);
+        if (!induced) {
+            try result;
+            try testing.expectEqualSlices(u32, &.{ 10, 11, 12, 13 }, shell.finished.items);
+            try testing.expectEqual(@as(u32, 13), shell.seen_through);
+            break;
+        }
+        induced_failures += 1;
+        try testing.expectError(error.OutOfMemory, result);
+        try testing.expectEqual(@as(usize, 0), shell.finished.items.len);
+        try testing.expectEqual(@as(usize, 0), shell.pending_drops.items.len);
+        try testing.expectEqual(@as(u32, 0), shell.seen_through);
+        try testing.expectEqual(@as(core.Seq, 0), shell.base);
+        try shell.sync(alloc, resumed_entries.items, &drops);
+        try testing.expectEqualSlices(u32, &.{ 10, 11, 12, 13 }, shell.finished.items);
+    }
+    try testing.expect(induced_failures > 0);
 }
 
 test "the transcript window shell drops at the turn end of an unsaved session without a save" {
