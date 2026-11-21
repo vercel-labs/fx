@@ -3237,13 +3237,14 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         .map((marker, index) => `${marker} ${index === 0 ? "FOLLOWUP_TASK keep the second batch running." : "follow-up line."}`)
         .join("\n");
       let slowCallServed = false;
+      let gateFile = "";
       await withFx(async (body) => {
         if (!isMainRequest(body)) {
           if (latestUserText(body).includes("FOLLOWUP_TASK")) {
             if (body.includes('"follow_slow"')) return text("follow_done", "FOLLOWUP_DONE");
             slowCallServed = true;
             return toolCall("follow_slow", "shell", {
-              request: { action: "run", command: "sleep 25; echo SLOW-DONE", yield_time_ms: 30_000 },
+              request: { action: "run", command: `while [ ! -e '${gateFile}' ]; do sleep 0.1; done; echo SLOW-DONE`, yield_time_ms: 120_000 },
             });
           }
           return text("row_done", rowReply);
@@ -3262,7 +3263,8 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
           });
         }
         return text("main_one", "SWITCH_MAIN_ONE");
-      }, async (session, { home, launch }) => {
+      }, async (session, { home, launch, workspace }) => {
+        gateFile = join(workspace, "reviewer-slow-gate");
         await session.sendText("SWITCH_USER ROW_START start the reviewer");
         await session.waitForText("SWITCH_MAIN_ONE", 60_000);
         // The resume must see the whole first turn, so wait until its last row is saved.
@@ -3279,10 +3281,12 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         await until("the follow-up's shell call to be served", () => slowCallServed, 90_000);
         await showAgent(resumed, "reviewer");
         await resumed.waitForPane((pane) => pane.includes("\u2503 FOLLOW-L01") && !pane.includes(LIST_HINT), 20_000);
-        // The follow-up's answer comes only after its shell call returns, so
-        // this pane shows the switch made while the call still ran. The call's
-        // command text contains SLOW-DONE, so that marker cannot show absence.
+        // The follow-up's answer comes only after its shell call returns. The call
+        // waits for a gate file that this test creates after this check, so the
+        // pane shows the switch made while the call still ran. The call's command
+        // text contains SLOW-DONE, so that marker cannot show absence.
         expect(await resumed.capturePane()).not.toContain("FOLLOWUP_DONE");
+        writeFileSync(gateFile, "");
         await resumed.waitForStableScrollback((scrollback) => scrollback.includes("FOLLOW-L12"), 30_000);
 
         const scrollback = await resumed.captureFullScrollback();
