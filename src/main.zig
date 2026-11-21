@@ -8585,6 +8585,68 @@ test "a subagent's view is rebuilt from its saved conversation without touching 
     try std.testing.expectEqualStrings("SCREEN_DIM", app.shell.command_output_render.styles.dim_style);
 }
 
+test "a hidden subagent's first run builds its view without a stale resume flow" {
+    const alloc = std.testing.allocator;
+    var app = App{ .alloc = alloc };
+    defer app.shell.deinit(alloc);
+    defer app.pacer.deinit(alloc);
+    defer App.AgentsAppRuntime.deinitChildren(&app);
+    const child = try addTestChildAgent(&app, "child-1");
+    defer child.agent.session.agent.history.deinit(alloc);
+    try child.agent.session.agent.history.append(alloc, .{ .interrupted = .{
+        .user = .{ .text = @constCast("EARLIER_TASK") },
+        .assistant = @constCast("EARLIER_ANSWER"),
+    } });
+    try app.shell.notebook.transcript.appendSlice(alloc, "main text\n");
+
+    const Body = struct {
+        fn run(target: *app_agents_runtime.ChildAgent, a: *App, agent: *agents.Agent) anyerror!void {
+            try App.AgentsAppRuntime.buildFirstRunView(a, agent, target);
+        }
+    };
+    try App.AgentsAppRuntime.visit(&app, child, child, Body.run);
+
+    // The child's slot holds its saved turn, and no frozen flow is left to
+    // paint at its first show.
+    const view = &child.screen.transcript.notebook;
+    var saw_task = false;
+    for (view.entries.items) |entry| switch (entry) {
+        .user_turn => |user| saw_task = saw_task or std.mem.eql(u8, user.turn.text, "EARLIER_TASK"),
+        else => {},
+    };
+    try std.testing.expect(saw_task);
+    try std.testing.expect(view.pending_resume_source == null);
+    try std.testing.expect(child.view_built);
+    try std.testing.expectEqualStrings("main text\n", app.shell.notebook.transcript.items);
+}
+
+test "a subagent on screen keeps its resume flow for its first paint" {
+    const alloc = std.testing.allocator;
+    var app = App{ .alloc = alloc };
+    defer app.shell.deinit(alloc);
+    defer app.pacer.deinit(alloc);
+    defer App.AgentsAppRuntime.deinitChildren(&app);
+    const child = try addTestChildAgent(&app, "child-1");
+    defer child.agent.session.agent.history.deinit(alloc);
+    try child.agent.session.agent.history.append(alloc, .{ .interrupted = .{
+        .user = .{ .text = @constCast("EARLIER_TASK") },
+        .assistant = @constCast("EARLIER_ANSWER"),
+    } });
+    try app.shell.notebook.transcript.appendSlice(alloc, "main text\n");
+    app.agent_on_screen = child;
+
+    const Body = struct {
+        fn run(target: *app_agents_runtime.ChildAgent, a: *App, agent: *agents.Agent) anyerror!void {
+            try App.AgentsAppRuntime.buildFirstRunView(a, agent, target);
+        }
+    };
+    try App.AgentsAppRuntime.visit(&app, child, child, Body.run);
+
+    const view = &child.screen.transcript.notebook;
+    try std.testing.expect(view.pending_resume_source != null);
+    try std.testing.expect(child.view_built);
+}
+
 test "a theme change rewrites hidden agents' transcripts and paced text" {
     const alloc = std.testing.allocator;
     const shared_theme = @import("core/shared/theme.zig");

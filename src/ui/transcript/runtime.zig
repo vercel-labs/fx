@@ -2234,6 +2234,47 @@ test "cached compact transcript preserves pending resume flow" {
     try std.testing.expect(std.mem.find(u8, source.bytes, "full resume history") != null);
 }
 
+test "an unpainted resume flow is released, and a painted transcript keeps its flow" {
+    const alloc = std.testing.allocator;
+    const flow = "resume row\n";
+
+    var painted = TranscriptRuntime{ .layout = testLayoutWithRows(8) };
+    painted.layout.cols = 40;
+    defer painted.deinit(alloc);
+    painted.notebook.pending_resume_source = try source_preparation.prepareFullTranscriptViewportSource(
+        &painted,
+        alloc,
+        try alloc.dupe(u8, flow),
+    );
+    painted.transcript_commit_state = .{ .stable = .{
+        .flow = try alloc.dupe(u8, flow),
+        .visual_offset = 0,
+        .history_visual_offset = 0,
+        .total_visual_rows = 1,
+        .selection = .{ .start_line = 0, .top_row = 1, .bottom_row = 1, .partial_skip_rows = 0, .line_count = 1 },
+        .cursor_row = 2,
+        .cursor_col = 1,
+        .occupied_last_row = 1,
+        .occupied_last_row_blank = false,
+        .layout_id = 1,
+        .flow_boundaries = .{ .replay = .{ .offset = 0, .cols = 40, .cursor_col = 1, .pending_wrap = false } },
+    } };
+    try std.testing.expectEqual(@as(usize, 0), painted.releaseUnpaintedResumeSource(alloc));
+    try std.testing.expect(painted.notebook.pending_resume_source != null);
+
+    var unpainted = TranscriptRuntime{ .layout = testLayoutWithRows(8) };
+    unpainted.layout.cols = 40;
+    defer unpainted.deinit(alloc);
+    unpainted.notebook.pending_resume_source = try source_preparation.prepareFullTranscriptViewportSource(
+        &unpainted,
+        alloc,
+        try alloc.dupe(u8, flow),
+    );
+    try std.testing.expect(unpainted.transcript_commit_state == .invalid);
+    try std.testing.expectEqual(@as(usize, flow.len), unpainted.releaseUnpaintedResumeSource(alloc));
+    try std.testing.expect(unpainted.notebook.pending_resume_source == null);
+}
+
 const PendingBuildProbe = struct {
     polls: usize = 0,
     pending_after: ?usize = null,
@@ -5141,6 +5182,15 @@ pub const TranscriptRuntime = struct {
         source.deinit(alloc);
         self.notebook.pending_resume_source = null;
         return released_bytes;
+    }
+
+    /// A resume flow installed into a transcript that is not on screen goes
+    /// stale when the transcript gets new entries before its first show, so
+    /// its owner releases it and the first show paints from the entries. A
+    /// transcript that has painted keeps its flow.
+    pub fn releaseUnpaintedResumeSource(self: *TranscriptRuntime, alloc: Allocator) usize {
+        if (self.transcript_commit_state != .invalid) return 0;
+        return self.releasePendingResumeSource(alloc);
     }
 
     pub fn pendingResumeFlow(self: *const TranscriptRuntime) []const u8 {

@@ -2953,17 +2953,28 @@ pub fn Runtime(comptime App: type) type {
             debug_trace.eventf("host", "child_session_opened", .{}, "agent={s} turns={d}", .{ child.id, agent.session.agent.history.items.len });
         }
 
+        /// Builds the view of a subagent's first run in this process from its
+        /// saved conversation. A child that is not on screen gives up its
+        /// frozen resume flow, so its first show paints the entries.
+        pub fn buildFirstRunView(app: *App, agent: *agents.Agent, child: *ChildAgent) !void {
+            const history = agent.session.agent.history.items;
+            try buildView(app, agent, history);
+            child.view_built = true;
+            debug_trace.eventf("host", "agent_view_rebuilt", .{}, "agent={s} turns={d}", .{ child.id, history.len });
+            if (app.agent_on_screen != child) {
+                // The worker writes this run's turn right after, while the child
+                // is hidden. The frozen flow would miss those rows at the first show.
+                const released = app.shell.releaseUnpaintedResumeSource(app.alloc);
+                if (released > 0) debug_trace.logf("host", "resume flow released before first show agent={s} bytes={d} reason=hidden_first_run", .{ child.id, released });
+            }
+        }
+
         fn startInContext(start: Start, app: *App, agent: *agents.Agent) anyerror!void {
             const post = start.post;
             if (!start.child.session_attached) try attachSession(app, agent, start.child);
             // The child's own session holds its conversation. The first
             // run in this process shows it, after a restart too.
-            if (!start.child.view_built) {
-                const history = agent.session.agent.history.items;
-                try buildView(app, agent, history);
-                start.child.view_built = true;
-                debug_trace.eventf("host", "agent_view_rebuilt", .{}, "agent={s} turns={d}", .{ start.child.id, history.len });
-            }
+            if (!start.child.view_built) try buildFirstRunView(app, agent, start.child);
             // The worker writes the message's card when its turn begins. The
             // turn carries main's work id, so it is saved with it.
             agent.prompt_work_id = start.child.agent.child_run.?.work_id;
