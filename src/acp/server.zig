@@ -934,8 +934,9 @@ fn destroyActiveSession(state: *ServerState) void {
         if (active.mcp_host) |h| h.destroy();
     }
     active.session_rt.deinit(state.alloc);
-    if (active.v2) |v2| v2.close();
+    // Before the session closes: a start capture still running uses it.
     active.turn_capture.deinit();
+    if (active.v2) |v2| v2.close();
     if (active.wasm_state) |*wasm_state| wasm_state.deinit(state.alloc);
     if (active.wasm_revision) |revision| state.alloc.free(revision);
     state.active_session = null;

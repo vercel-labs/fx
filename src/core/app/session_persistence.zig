@@ -1184,10 +1184,11 @@ pub const Persistence = struct {
             children.deinit();
             alloc.destroy(children);
         }
+        // Before the session closes: a start capture still running uses it.
+        self.turn_capture.deinit();
         if (self.v2) |v2| v2.close();
         for (self.fork_copies.items) |copy| copy.finish();
         self.fork_copies.deinit(alloc);
-        self.turn_capture.deinit();
         if (self.workspace_preferences) |*preferences| preferences.deinit(alloc);
         if (self.session_preferences) |*preferences| preferences.deinit(alloc);
         if (self.next_session_preferences) |*preferences| preferences.deinit(alloc);

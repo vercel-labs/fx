@@ -2497,11 +2497,13 @@ pub fn Runtime(comptime App: type) type {
 
         /// `AgentRuntimeDeps.start_workspace_capture` on v2 (D98).
         pub fn startWorkspaceCapture(app: *App, agent: *AppAgent, fresh: bool, step: agent_runtime.AgentRuntimeDeps.WorkspaceCaptureStep) void {
-            const context = workspaceCaptureContext(app, agent) orelse return;
             const captures = &agent.session_persistence.turn_capture;
+            if (step == .settle) return captures.settle();
+            const context = workspaceCaptureContext(app, agent) orelse return;
             switch (step) {
                 .begin => captures.begin(context, fresh),
                 .capture => captures.start(context, &agent.session_persistence.write_mutex),
+                .settle => unreachable,
             }
         }
 

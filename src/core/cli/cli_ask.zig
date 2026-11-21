@@ -3310,10 +3310,12 @@ fn savePromptImages(raw_ctx: *anyopaque, alloc: std.mem.Allocator, images: []typ
 
 fn startWorkspaceCapture(raw_ctx: *anyopaque, fresh: bool, step: agent_runtime.AgentRuntimeDeps.WorkspaceCaptureStep) void {
     const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
+    if (step == .settle) return ctx.turn_capture.settle();
     const context = ctx.workspaceCaptureContext() orelse return;
     switch (step) {
         .begin => ctx.turn_capture.begin(context, fresh),
         .capture => ctx.turn_capture.start(context, &ctx.session_write_mutex),
+        .settle => unreachable,
     }
 }
 

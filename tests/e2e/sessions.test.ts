@@ -2880,7 +2880,10 @@ test.skipIf(!tmuxAvailable())("the app keeps a turn's start capture when a follo
     expect(id).toBeDefined();
     await app.session.sendText("Follow-up during the capture.");
     await scrollbackContains(app.session, "FOLLOW_UP_DONE");
-    await waitForCommits(fixture, id!, 1, TIMEOUT);
+    // The follow-up's own turn commits too before the app quits: its start
+    // capture runs beside its reply, and quitting cancels a capture that
+    // is still running.
+    await waitForCommits(fixture, id!, 2, TIMEOUT);
     await quitApp(app);
     // The follow-up was admitted while the start capture ran.
     const text = traceText();
