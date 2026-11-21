@@ -86,6 +86,8 @@ const allowlist: AllowRule[] = [
   rule("src/core/app/trace_report.zig", "(?:parse|nth|fieldProblem|expectStartsWith|expectEndsWith|expectNotIn)", /debug_print/, "tests", "test diagnostics"),
   rule("src/js/engine.zig", "(?:expectReturned|expectThrew)", /debug_print/, "tests", "test diagnostics"),
   rule("src/js/engine.zig", "fuzzJson", /debug_print/, "tests", "fuzz diagnostics"),
+  rule("src/core/code_mode/sandbox.zig", "runChild", /stdio_acquisition/, "subprocess_protocol_transport", "code-mode sandbox frames to its parent"),
+  rule("src/core/code_mode/sandbox.zig", "runForTest", /debug_print/, "tests", "test diagnostics"),
 ];
 
 function rule(
