@@ -1686,6 +1686,11 @@ pub fn Runtime(comptime App: type) type {
             agent.session_persistence.pending_request_resume = null;
             const yielded = agent.session_persistence.pending_resume_yielded;
             agent.session_persistence.pending_resume_yielded = false;
+            // The resume reads the project instructions and the session from
+            // disk. It runs once the resumed session's first frame is on
+            // screen (`commitStartupResumeReplayAnchor`), so nothing is read
+            // before the first paint (RULES.md R2.2).
+            debug_trace.logf("recovery", "event=resume_start yielded={}", .{yielded});
             // A turn that stopped for an upgrade's restart goes on as the
             // same turn, with no note to the model; if it cannot, the note
             // resume still sends the request again.
@@ -1696,7 +1701,18 @@ pub fn Runtime(comptime App: type) type {
             }
             _ = app.queueResumedRequest(agent, session_runtime.resumed_request_prompt, resumed) catch |err| {
                 debug_trace.logf("recovery", "event=resume_dropped reason=queue_failed err={s}", .{@errorName(err)});
+                noteResumeDropped(app, err);
             };
+        }
+
+        /// Says in a notice that the interrupted request was not sent again.
+        /// Its turn's work stays in the session, so a message goes on from it.
+        fn noteResumeDropped(app: *App, err: anyerror) void {
+            if (comptime !@hasDecl(App, "writeDomainNotice")) return;
+            var buffer: [256]u8 = undefined;
+            const body = std.mem.print(&buffer, "fx could not send the interrupted request again ({s}). The turn's work is saved; send a message to go on from it.", .{@errorName(err)}) catch "fx could not send the interrupted request again. The turn's work is saved; send a message to go on from it.";
+            app.writeDomainNotice(.{ .topic = "session", .tone = .@"error", .body = body }, true) catch |write_err|
+                debug_trace.logf("recovery", "event=resume_drop_notice_failed err={s}", .{@errorName(write_err)});
         }
 
         /// Continues the turn that yielded for an upgrade's restart, which
@@ -1749,12 +1765,14 @@ pub fn Runtime(comptime App: type) type {
             try v2.saveBridgeCall(record);
         }
 
-        /// `AgentRuntimeDeps.mark_turn_yielded` on v2.
+        /// `AgentRuntimeDeps.mark_turn_yielded` on v2. A marker the session
+        /// does not write, with no open turn, is an error, so the yield's
+        /// trace says the turn was not marked.
         pub fn markTurnYielded(agent: *AppAgent) !void {
             agent.session_persistence.write_mutex.lockUncancelable(io_mod.getIo());
             defer agent.session_persistence.write_mutex.unlock(io_mod.getIo());
-            const v2 = agent.session_persistence.v2 orelse return;
-            if (!try v2.markYielded()) debug_trace.logf("recovery", "event=turn_yield_unmarked reason=no_open_turn", .{});
+            const v2 = agent.session_persistence.v2 orelse return error.NoSession;
+            if (!try v2.markYielded()) return error.NoOpenTurn;
         }
 
         /// Saves a model request's recovery status in the open turn as a
@@ -6078,12 +6096,20 @@ const TestApp = struct {
         authority_mutex: std.Io.Mutex = .init,
     } = .{},
     mcp_tool_names: std.ArrayList([]u8) = .empty,
+    resume_queue_count: usize = 0,
+    resume_queue_error: ?anyerror = null,
 
     fn init(alloc: Allocator, workspace_root: []const u8) !TestApp {
         return .{
             .alloc = alloc,
             .workspace_root = try alloc.dupe(u8, workspace_root),
         };
+    }
+
+    pub fn queueResumedRequest(self: *TestApp, _: anytype, _: []const u8, _: types.RecoveryResume) !bool {
+        self.resume_queue_count += 1;
+        if (self.resume_queue_error) |err| return err;
+        return true;
     }
 
     fn toolAdvertisementSet(_: *const TestApp, _: anytype) tool_set_contract.ToolSet {
@@ -6555,6 +6581,22 @@ test "js-host resume restores transcript context preferences and revision" {
         "revision-1",
         app.agent().session_persistence.js_host_session.?.revision.?,
     );
+}
+
+test "a resumed request that cannot be queued says so in a notice" {
+    const alloc = std.testing.allocator;
+    var app = try TestApp.init(alloc, "/workspace");
+    defer app.deinit();
+    (&app).agent().session_persistence.pending_request_resume = .{};
+    app.resume_queue_error = error.AccessDenied;
+
+    Runtime(TestApp).startPendingResume(&app, (&app).agent());
+
+    try std.testing.expectEqual(@as(usize, 1), app.resume_queue_count);
+    try std.testing.expectEqual(@as(usize, 1), app.notices.items.len);
+    try std.testing.expect(std.mem.find(u8, app.notices.items[0], "could not send the interrupted request again") != null);
+    try std.testing.expect(std.mem.find(u8, app.notices.items[0], "AccessDenied") != null);
+    try std.testing.expect((&app).agent().session_persistence.pending_request_resume == null);
 }
 
 test "js-host compaction store failure preserves live history and revision" {

@@ -540,6 +540,8 @@ pub const FakeAgentRuntimeDeps = struct {
     exec_plans: []const FakeExecPlan = &.{},
     execute_delegate: ?ExecuteDelegate = null,
     exec_index: usize = 0,
+    /// Set to true when a tool runs, as Ctrl+G during a step does.
+    set_on_exec: ?*std.atomic.Value(bool) = null,
     successful_effect_count: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
     execute_timeout_started_ms: std.ArrayList(?i64) = .empty,
     permission_target: []const u8 = "/tmp/workspace/file.txt",
@@ -682,6 +684,10 @@ pub const FakeAgentRuntimeDeps = struct {
     recovery_turn_written: bool = true,
     /// How many times the turn was marked as yielded (`mark_turn_yielded`).
     turn_yielded_marks: usize = 0,
+    /// The host marks a yielded turn; false is a host that saves no session.
+    enable_turn_yield_marks: bool = true,
+    /// Returned by `mark_turn_yielded` instead of marking.
+    turn_yield_mark_error: ?anyerror = null,
     /// Returned by every session writer check; null confirms the writer.
     session_writer_error: ?anyerror = null,
     session_writer_checks: usize = 0,
@@ -838,7 +844,7 @@ pub const FakeAgentRuntimeDeps = struct {
             .refresh_gateway_credential = refreshGatewayCredential,
             .ask_out_of_credits = askOutOfCredits,
             .save_recovery_record = if (self.enable_recovery_record) saveRecoveryRecord else null,
-            .mark_turn_yielded = markTurnYielded,
+            .mark_turn_yielded = if (self.enable_turn_yield_marks) markTurnYielded else null,
             .available_model_capabilities = availableModelCapabilities,
             .resolve_model_capabilities = resolveModelCapabilities,
             .model_catalog_failure = catalogFailure,
@@ -1046,6 +1052,7 @@ pub const FakeAgentRuntimeDeps = struct {
 
     fn markTurnYielded(raw: *anyopaque) !void {
         const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
+        if (self.turn_yield_mark_error) |err| return err;
         self.turn_yielded_marks += 1;
     }
 
@@ -1578,6 +1585,7 @@ pub const FakeAgentRuntimeDeps = struct {
             else
                 .{ .result = .{ .model_output = "ok" } };
             self.exec_index += 1;
+            if (self.set_on_exec) |flag| flag.store(true, .seq_cst);
             should_cancel = (self.cancel_on_execute_index == null or
                 self.cancel_on_execute_index.? == execution_index) and if (self.cancel_on_execute != null)
                 if (self.cancel_on_execute_name) |name|

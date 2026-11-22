@@ -4543,12 +4543,39 @@ fn persistFinalReplyCheckpoint(
     );
 }
 
+/// Whether a turn asked to stop for its host's restart can stop here: its
+/// request's record is in the session log, and the host marks the turn
+/// as yielded, so the next launch continues it. A host that saves no
+/// session has neither, so its turn goes on to its end, as a turn on a
+/// provider other than the gateway does. The first refused stop of a turn
+/// writes a trace line that says why; the next boundary asks again.
+fn canStopForRestart(
+    deps: *const AgentRuntimeDeps,
+    request_recovery: *runtime_request_recovery.RequestRecovery,
+    skip_traced: *bool,
+    trace_ctx: TraceContext,
+) bool {
+    const reason: []const u8 = if (deps.mark_turn_yielded == null)
+        "no_turn_marker"
+    else if (!request_recovery.recordSaved())
+        "no_saved_record"
+    else
+        return true;
+    if (!skip_traced.*) {
+        skip_traced.* = true;
+        debug_trace.eventf("agent", "turn_yield_skipped", trace_ctx, "reason={s}", .{reason});
+    }
+    return false;
+}
+
 /// Stops the turn between steps for its host. The request's record is saved
 /// marked clean, as a closing fx saves it, so the next launch resumes it
 /// without counting a death, and the session marks the turn as yielded, so
 /// the launch continues it as the same turn (`tests/tla/recovery/Resume.tla`
-/// Relaunch, NoFalseCrashQuestion). A marker that cannot be saved only means
-/// the next launch resumes the turn with a note, so it never fails the yield.
+/// Relaunch, NoFalseCrashQuestion). Only a turn `canStopForRestart` allows
+/// gets here. The clean record is then the turn's newest item and the request
+/// is closed, so a marker that cannot be written leaves a turn the next launch
+/// resumes from that record, with the resume note: nothing is lost.
 fn yieldTurn(
     deps: *const AgentRuntimeDeps,
     request_recovery: *runtime_request_recovery.RequestRecovery,
@@ -8190,6 +8217,7 @@ fn processQueuedPromptLoop(
     // Whether this prompt has sent a request yet, for a host that stops the
     // turn between steps (`src/core/quiesce/`).
     var turn_quiesce: quiesce.State = .{};
+    var yield_skip_traced = false;
     // The session sends one runtime context ahead of the history; a change
     // joins the conversation instead (D94).
     var runtime_context = try runtime_context_state.State.init(
@@ -9039,12 +9067,15 @@ fn processQueuedPromptLoop(
             // The turn is saved and its request is next: a host that asked
             // the turn to stop, as Ctrl+G does, gets it here, once the
             // prompt has sent its first request. Only the gateway path saves
-            // the turn before its send, so only it stops here.
+            // the turn before its send, so only it stops here, and only when
+            // the next launch can continue it (`canStopForRestart`); any
+            // other turn goes on, and the restart waits for it to end.
+            const stop_requested = if (config.yield_flag) |flag| flag.load(.seq_cst) else false;
             if (job.provider == .gateway and quiesce.step(&turn_quiesce, .{ .boundary = .{
                 .now_ms = io_mod.milliTimestamp(),
-                .stop_requested = if (config.yield_flag) |flag| flag.load(.seq_cst) else false,
+                .stop_requested = stop_requested,
                 .kind = if (recovery_cause == .compaction_prepared) .compaction else .request,
-            } }) == .yield) {
+            } }) == .yield and canStopForRestart(deps, &request_recovery, &yield_skip_traced, step_ctx)) {
                 yieldTurn(deps, &request_recovery, step_ctx);
                 return error.TurnYielded;
             }

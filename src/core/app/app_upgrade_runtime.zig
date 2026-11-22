@@ -77,7 +77,8 @@ pub fn Runtime(comptime App: type) type {
             requestFooterRender(app);
         }
 
-        /// Text, a paste, or images in the composer, which exiting would lose.
+        /// Text, a paste, or images in the composer, or a prompt sent but not
+        /// yet started, which exiting would lose.
         fn draftPending(app: *App) bool {
             if (comptime @hasField(App, "input_runtime")) {
                 if (app.input_runtime.paste.active()) return true;
@@ -85,6 +86,25 @@ pub fn Runtime(comptime App: type) type {
             }
             if (comptime @hasDecl(App, "screenAgent") and agents.hasAgentField(App, "pending_images")) {
                 if (app.screenAgent().pending_images.items.len > 0) return true;
+            }
+            // Ctrl+G refuses while one is pending (`upgradeUnavailableNotice`)
+            // and the wait holds new text in the composer, so this only guards
+            // the exit.
+            if (submissionPending(app)) return true;
+            return false;
+        }
+
+        /// A prompt sent but not yet started by its agent's worker, on main
+        /// or another instance (`submission.pending`, every phase): it waits
+        /// for a frame, for sign-in, or for the worker to take it, and lives
+        /// only in memory until then.
+        fn submissionPending(app: *App) bool {
+            if (comptime !agents.hasAgentField(App, "submission")) return false;
+            if (app.main_agent.submission.pending != null) return true;
+            if (comptime @hasField(App, "child_agents")) {
+                for (app.child_agents.items) |child| {
+                    if (child.agent.role == .instance and child.agent.submission.pending != null) return true;
+                }
             }
             return false;
         }
@@ -244,6 +264,9 @@ pub fn Runtime(comptime App: type) type {
             if (comptime agents.hasAgentField(App, "pending_images")) {
                 if (agent.pending_images.items.len > 0) return "submit or clear pending images before upgrading";
             }
+            // The worker holds its queue while it yields, so a sent prompt
+            // that has not started would wait there until fx exits.
+            if (submissionPending(app)) return "upgrade is unavailable while a sent prompt waits to go out";
             if (comptime @hasField(App, "terminal_input_runtime")) {
                 if (app.terminal_input_runtime.hasPendingTerminalAction()) return "finish the key sequence before upgrading";
             }
@@ -345,6 +368,7 @@ const TestApp = struct {
     main_agent: struct {
         worker: TestWorker = .{},
         stream: struct { active: bool = false } = .{},
+        submission: struct { pending: ?u8 = null } = .{},
     } = .{},
     input_runtime: TestInputRuntime = .{},
     terminal_input_runtime: TestTerminalInputRuntime = .{},
@@ -714,6 +738,50 @@ test "app_upgrade_runtime asks running turns to yield and exits once they stop" 
     try std.testing.expect(app.should_exit);
     try std.testing.expect(!app.upgrader.restart_waits);
     try std.testing.expectEqual(@as(usize, 1), app.held_work_logs);
+}
+
+test "app_upgrade_runtime holds the restart while a sent prompt waits for sign-in" {
+    var app = TestApp{ .alloc = std.testing.allocator };
+    defer app.deinit();
+    app.upgrader.state = .ready;
+    app.turn_running = true;
+    app.main_agent.stream.active = true;
+    var deps_state = TestDepsState{};
+
+    const outcome = try Runtime(TestApp).applyReadyUpgradeWithDeps(&app, (&app).agent(), deps_state.deps());
+    try std.testing.expectEqual(ApplyOutcome.waiting, outcome);
+
+    // The turn stopped, but a prompt sent while sign-in is pending holds the exit.
+    app.turn_running = false;
+    app.main_agent.submission.pending = 1;
+    Runtime(TestApp).collectUpgradeFacts(&app);
+    try std.testing.expect(!app.should_exit);
+
+    app.main_agent.submission.pending = null;
+    Runtime(TestApp).collectUpgradeFacts(&app);
+    try std.testing.expect(app.should_exit);
+}
+
+test "app_upgrade_runtime refuses while a sent prompt waits to go out" {
+    var app = TestApp{ .alloc = std.testing.allocator };
+    defer app.deinit();
+    app.upgrader.state = .ready;
+    app.main_agent.submission.pending = 1;
+    var deps_state = TestDepsState{};
+
+    const outcome = try Runtime(TestApp).applyReadyUpgradeWithDeps(&app, (&app).agent(), deps_state.deps());
+    try std.testing.expectEqual(ApplyOutcome.unavailable, outcome);
+    try std.testing.expect(std.mem.find(u8, app.notices.items, "while a sent prompt waits to go out") != null);
+    try std.testing.expectEqual(@as(usize, 0), deps_state.path_count);
+    try std.testing.expectEqual(@as(usize, 0), app.yield_request_count);
+    try std.testing.expect(!app.should_exit);
+
+    // Once the prompt has gone out, Ctrl+G relaunches at once, as with no turn.
+    app.main_agent.submission.pending = null;
+    const again = try Runtime(TestApp).applyReadyUpgradeWithDeps(&app, (&app).agent(), deps_state.deps());
+    try std.testing.expectEqual(ApplyOutcome.relaunch_requested, again);
+    try std.testing.expectEqual(@as(usize, 0), app.yield_request_count);
+    try std.testing.expect(app.should_exit);
 }
 
 test "app_upgrade_runtime says the restart also waits for working subagents" {

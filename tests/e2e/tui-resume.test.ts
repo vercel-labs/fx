@@ -6569,6 +6569,8 @@ test.skipIf(!tmuxAvailable())(
     const installDir = join(root, "install");
     const stderrPath = join(root, "stderr.log");
     const argvLogPath = join(root, "upgrade-argv.log");
+    // The relaunched fx appends its lines to the same file.
+    const tracePath = join(root, "resume-trace.log");
     mkdirSync(home);
     mkdirSync(workspace, { recursive: true });
     mkdirSync(installDir);
@@ -6634,6 +6636,8 @@ test.skipIf(!tmuxAvailable())(
           FX_MODEL: "anthropic/claude-fable-5.2",
           FX_AUTO_UPGRADE: "1",
           FX_TEST_UPGRADE_BASE_URL: release.baseUrl,
+          FX_TRACE_LOG: tracePath,
+          FX_TRACE_SCOPES: "session,recovery",
         },
         stderrPath,
         width: 110,
@@ -6670,6 +6674,14 @@ test.skipIf(!tmuxAvailable())(
         expect(request.body).toContain("AGENTS_RULE_MARKER_5521");
       }
       expect(second.filter((message) => message.role === "system").length).toBe(first.filter((message) => message.role === "system").length);
+      // The resume starts once the resumed session's first frame is on
+      // screen, so nothing reads the project instructions before the first
+      // paint (RULES.md R2.2).
+      const trace = readFileSync(tracePath, "utf8");
+      const painted = trace.indexOf("resume historical flow committed");
+      const started = trace.indexOf("event=resume_start");
+      expect(painted).toBeGreaterThanOrEqual(0);
+      expect(started).toBeGreaterThan(painted);
 
       await active.sendText("/quit");
       expect(await active.waitForSessionEnd()).toBe(true);
@@ -10119,13 +10131,14 @@ async function launchFx(
   gateway: ReturnType<typeof startFakeGateway>,
   args: string,
   name: string,
+  extraEnv: Record<string, string> = {},
 ) {
   const stderrPath = join(fixture.root, `${name}-stderr.log`);
   writeFileSync(stderrPath, "");
   const session = await TmuxSession.create({
     cmd: `${FX_BIN} ${args}`.trim(),
     cwd: fixture.workspace,
-    env: gatewayEnv(fixture.home, gateway),
+    env: { ...gatewayEnv(fixture.home, gateway), ...extraEnv },
     stderrPath,
     width: 100,
     height: 32,
@@ -10228,7 +10241,11 @@ test.skipIf(!tmuxAvailable())(
       active = null;
 
       const before = gateway.requests.length;
-      const second = await launchFx(fixture, gateway, "-c", "second");
+      const tracePath = join(fixture.root, "second-trace.log");
+      const second = await launchFx(fixture, gateway, "-c", "second", {
+        FX_TRACE_LOG: tracePath,
+        FX_TRACE_SCOPES: "session,recovery",
+      });
       active = second.session;
       await active.waitForText("RESUMED_RULES_7311", TIMEOUT);
 
@@ -10253,6 +10270,14 @@ test.skipIf(!tmuxAvailable())(
       expect(rulesOf(resumed!.body)).toEqual(rulesOf(killed!.body));
       await active.waitForComposer(TIMEOUT);
       expect(readFileSync(second.stderrPath, "utf8")).toBe("");
+      // The resume starts once the resumed session's first frame is on
+      // screen, so nothing reads the project instructions before the first
+      // paint (RULES.md R2.2).
+      const trace = readFileSync(tracePath, "utf8");
+      const painted = trace.indexOf("resume historical flow committed");
+      const started = trace.indexOf("event=resume_start");
+      expect(painted).toBeGreaterThanOrEqual(0);
+      expect(started).toBeGreaterThan(painted);
     } finally {
       await active?.kill();
       gateway.stop();

@@ -268,6 +268,17 @@ pub const RequestRecovery = struct {
         return self.close();
     }
 
+    /// Whether this request's record is in the session log, so a turn
+    /// stopped before its send can be resumed from it after a restart.
+    /// False on hosts that keep no record. Called on the request's own
+    /// thread.
+    pub fn recordSaved(self: *RequestRecovery) bool {
+        const io = io_mod.getIo();
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        return !self.closed and self.record_live;
+    }
+
     /// Reports a failed send. Returns the send the module asks for at once,
     /// which only compaction and a sign-in failure the user already answered
     /// do. Any other kind makes the module wait or ask the user; the caller
@@ -1332,6 +1343,33 @@ test "a yield saves a clean record that resumes without a death" {
     const plan = recovery.step(&probe, .{ .start = .{ .resume_from = fake.recovery_record.? } }, 0);
     try std.testing.expect(plan.send != null);
     try std.testing.expectEqual(@as(u8, 0), probe.abrupt_deaths);
+}
+
+test "a request reports its record saved from its send until it is closed" {
+    var fake = recordingFake();
+    defer fake.deinit();
+    const deps = fake.deps();
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    {
+        var request = RequestRecovery.init(&deps, &cancel_flag, .{});
+        defer request.deinit();
+        _ = (try request.start(false, null)).?;
+        try std.testing.expect(!request.recordSaved());
+        try std.testing.expect(request.sendRecord() == .save);
+        try std.testing.expect(request.recordSaved());
+        try std.testing.expect(request.closeForYield());
+        try std.testing.expect(!request.recordSaved());
+    }
+
+    // A host that keeps no record saves nothing with the send.
+    var no_record = support.FakeAgentRuntimeDeps.init(std.testing.allocator);
+    defer no_record.deinit();
+    const no_record_deps = no_record.deps();
+    var no_record_request = RequestRecovery.init(&no_record_deps, &cancel_flag, .{});
+    defer no_record_request.deinit();
+    _ = (try no_record_request.start(false, null)).?;
+    try std.testing.expect(no_record_request.sendRecord() == .keep);
+    try std.testing.expect(!no_record_request.recordSaved());
 }
 
 test "closing saves a clean record for every request in flight" {

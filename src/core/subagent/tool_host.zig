@@ -2380,7 +2380,11 @@ pub const Runtime = struct {
             .child_id = options.caller_id,
             .text = text,
             .user_typed = typed,
-        } }) catch |err| return self.refuse(alloc, if (err == error.QueueFull) .{ .queue_full = .parent } else .{ .no_parent = .unreachable_now });
+        } }) catch |err| return self.refuse(alloc, switch (err) {
+            error.QueueFull => .{ .queue_full = .parent },
+            error.ReceiverRestarting => .{ .no_parent = .restarting },
+            else => .{ .no_parent = .unreachable_now },
+        });
         debug_trace.eventf("mailbox", "post", .{}, "from={s} to={s} typed={d}", .{ options.caller_id, if (from_root) "owners_parent" else self.ownerName(), typed.len });
         return self.encodeManaged(alloc, .{ .ok = true, .result = "Sent to your parent. It arrives as your message, never as the user's." });
     }
@@ -6227,6 +6231,11 @@ fn postFull(_: ?*anyopaque, _: *Runtime, _: Delivery) PostReportError!void {
     return error.QueueFull;
 }
 
+/// A sink whose receiver stops its turn for fx's restart.
+fn postRestarting(_: ?*anyopaque, _: *Runtime, _: Delivery) PostReportError!void {
+    return error.ReceiverRestarting;
+}
+
 /// A sink that posts into a real worker queue, as the app's, `fx ask`'s and
 /// ACP's do, so the cap on messages is that queue's own.
 fn postToWorker(raw: ?*anyopaque, _: *Runtime, delivery: Delivery) PostReportError!void {
@@ -6294,6 +6303,10 @@ test "every refusal the host returns tells the model what happened and what to d
     try checkRefusalSentence(&problems, "the parent is gone", "no_parent", try callTool(runtime, arena, .{ .message = .{ .agent = "parent", .message = "done" } }, "call-10", null));
     runtime.report_sink = .{ .context = null, .post_fn = postFull };
     try checkRefusalSentence(&problems, "the parent's queue is full", "queue_full", try callTool(runtime, arena, .{ .message = .{ .agent = "parent", .message = "done" } }, "call-11", null));
+    runtime.report_sink = .{ .context = null, .post_fn = postRestarting };
+    const restarting = try callTool(runtime, arena, .{ .message = .{ .agent = "parent", .message = "done" } }, "call-11r", null);
+    try checkRefusalSentence(&problems, "the parent restarts for an upgrade", "no_parent", restarting);
+    if (std.mem.find(u8, restarting, "restarting for an upgrade") == null) try problems.print(alloc, "the parent restarts for an upgrade: the refusal does not name the restart: {s}\n", .{restarting});
     runtime.report_sink = sink;
 
     // A subagent that is being closed.
