@@ -778,8 +778,15 @@ pub const Runtime = struct {
                         // The work ended while this message waited for the lock,
                         // and nothing keeps the child busy any more: admit the
                         // message again, so it starts a work rather than waiting
-                        // for a turn no end will start.
-                        if (turned_away and pass == 0 and !self.isBusyLocked(target.child_id) and !self.inTurnWorkLocked(target.child_id)) continue :admit;
+                        // for a turn no end will start. When the second pass
+                        // finds the same, the registry shows a work that nothing
+                        // runs, so no end will start what waits for this child:
+                        // the message is refused, not queued.
+                        if (turned_away and !self.isBusyLocked(target.child_id) and !self.inTurnWorkLocked(target.child_id)) {
+                            if (pass == 0) continue :admit;
+                            debug_trace.eventf("mailbox", "message_refused_unstartable", .{}, "child={s} work_id={s}", .{ target.child_id, target.work_id });
+                            return self.refuse(alloc, .state_unavailable);
+                        }
                         // It waits, and starts the child's next turn.
                         self.queuePendingLocked(target.child_id, agent, operation_id, fingerprint, request.*, profiled, resolved_model) catch |err| {
                             if (err == error.QueueFull) return self.refuse(alloc, .{ .queue_full = .subagent });
@@ -1823,6 +1830,10 @@ pub const Runtime = struct {
         interrupted,
         finished,
         idle,
+        /// The registry holds a work for the child that nothing runs, because
+        /// an end could not be recorded. Messages to it are refused until a
+        /// restart clears it.
+        refusing,
 
         fn label(self: ChildState) []const u8 {
             return switch (self) {
@@ -1832,6 +1843,7 @@ pub const Runtime = struct {
                 .interrupted => "interrupted",
                 .finished => "finished",
                 .idle => "idle",
+                .refusing => "refuses messages until fx restarts",
             };
         }
 
@@ -1847,7 +1859,7 @@ pub const Runtime = struct {
                 .fresh => self.label(),
                 .kept => switch (self) {
                     inline .awaiting_approval, .awaiting_answer => |state| comptime state.label() ++ " when this turn started",
-                    .working, .interrupted, .finished, .idle => self.label(),
+                    .working, .interrupted, .finished, .idle, .refusing => self.label(),
                 },
             };
         }
@@ -1877,6 +1889,11 @@ pub const Runtime = struct {
     /// Under `admission_mutex`. `waits` is what `userWaitsLocked` returned
     /// while the lock was held.
     fn childStateLocked(self: *const Runtime, child: child_state.Child, waits: []const managed_owner.Owner.UserWaiting) ChildState {
+        // The registry holds a work that nothing runs: an end could not be
+        // recorded. Nothing starts or ends it, and its messages are refused,
+        // until a restart clears it.
+        const open = child.phase == .running or child.phase == .awaiting_approval;
+        if (open and !self.isBusyLocked(child.id) and !self.inTurnWorkLocked(child.id)) return .refusing;
         if (child.phase == .awaiting_approval) return .awaiting_approval;
         if (self.isBusyLocked(child.id)) {
             // A wait counts only while the child works, so one a turn's end
@@ -5022,13 +5039,20 @@ fn sweepUnrecorded(fail_at: usize, stuck: *usize) !bool {
     try expectBodyHas(closed_again, "\"error_code\":\"close_not_saved\"");
     const after_close = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "after the close" } }, "call-3c", null);
     try expectBodyHas(after_close, "\"error_code\":\"state_unavailable\"");
+    const where = try alloc.print("allocation {d} of a start whose end was not recorded", .{fail_at});
+    defer alloc.free(where);
+    const status = try callTool(runtime, arena, .{ .status = .{ .agent = "reviewer" } }, "call-3f", null);
+    try expectAt(where, "reviewer: refuses messages until fx restarts", if (std.mem.find(u8, status, "reviewer: refuses messages until fx restarts") != null) "reviewer: refuses messages until fx restarts" else status);
+    const note = (try runtime.teamNote(alloc, 0)).?;
+    defer alloc.free(note);
+    try expectAt(where, "\n- reviewer: refuses messages until fx restarts", if (std.mem.find(u8, note, "\n- reviewer: refuses messages until fx restarts") != null) "\n- reviewer: refuses messages until fx restarts" else note);
     // The answer tells main to send the work to a subagent with another name.
     // That works with the stuck child present: the new subagent starts, runs
-    // and reports, and status lists both. What status calls `reviewer` is not
-    // checked here: `childStateLocked` reads a child that the registry holds
-    // as running, with no slot, as idle.
+    // and reports, and status lists both. The status row of `reviewer` is
+    // checked above, while it is still stuck.
     const other = try callTool(runtime, arena, .{ .message = .{ .agent = "helper", .message = "do it instead" } }, "call-3d", null);
     try expectBodyHas(other, "Sent to helper");
+    try expectAt(where, "the started answer does not list reviewer as idle", if (std.mem.find(u8, other, "\n- reviewer") == null) "the started answer does not list reviewer as idle" else other);
     try waitUntilQuiet(runtime);
     var helper_reports: usize = 0;
     for (fixture.reports.items) |line| {
@@ -5144,6 +5168,79 @@ test "a user's turn whose work fails to open at any allocation leaves its subage
     // The call allocates in more places than the few that matter; a sweep that
     // ended at once would prove nothing.
     try std.testing.expect(at > 3);
+}
+
+/// One try of the sweep below: a user's turn is open on `reviewer`, one message
+/// of main waits for it, and that message's start fails. The `fail_at`-th
+/// allocation of the turn's end fails. Main then sends one more message, which
+/// must run or be refused, and never be answered as waiting. Returns whether
+/// the allocation failed; counts in `sent` and `refused` the tries of each kind.
+fn sweepUserTurnEnd(fail_at: usize, sent: *usize, refused: *usize) !bool {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var parent: child_state.TestParent = undefined;
+    try parent.init(alloc);
+    defer parent.deinit();
+    var fixture = MailboxFixture{};
+    defer fixture.deinit();
+    const runtime = try mailboxRuntime(alloc, &fixture, &parent);
+    var faulted: FaultedHost = undefined;
+    faulted.install(runtime);
+    defer faulted.deinit();
+    _ = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "first" } }, "call-0", null);
+    try waitUntilQuiet(runtime);
+    const child_id = try reviewerId(runtime, arena);
+    const work_id = runtime.beginUserWork(alloc, child_id, null).?;
+    defer alloc.free(work_id);
+    const queued = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "waiting" } }, "call-1", null);
+    try expectBodyHas(queued, "is busy");
+
+    start_test_controls.test_fail_spawn = true;
+    faulted.arm(fail_at);
+    runtime.endUserWork(child_id, work_id, .completed, "");
+    faulted.disarm();
+    start_test_controls.test_fail_spawn = false;
+    try waitUntilQuiet(runtime);
+    if (!faulted.fault.fired) return false;
+
+    const where = try alloc.print("allocation {d} of the end of a user's turn", .{fail_at});
+    defer alloc.free(where);
+    const runs_before = fixture.runs.load(.seq_cst);
+    const next = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "next" } }, "call-2", null);
+    try expectAt(where, "not answered as waiting", if (std.mem.find(u8, next, "is busy") == null) "not answered as waiting" else next);
+    if (std.mem.find(u8, next, "Sent to reviewer") != null) {
+        sent.* += 1;
+        try waitUntilQuiet(runtime);
+        const ran = fixture.runs.load(.seq_cst) - runs_before;
+        try expectAt(where, "the message ran once", if (ran == 1) "the message ran once" else "the message did not run");
+    } else {
+        refused.* += 1;
+        try expectAt(where, "refused as state_unavailable", if (std.mem.find(u8, next, "\"error_code\":\"state_unavailable\"") != null) "refused as state_unavailable" else next);
+        const status = try callTool(runtime, arena, .{ .status = .{ .agent = "reviewer" } }, "call-3", null);
+        try expectAt(where, "reviewer: refuses messages until fx restarts", if (std.mem.find(u8, status, "reviewer: refuses messages until fx restarts") != null) "reviewer: refuses messages until fx restarts" else status);
+    }
+    return true;
+}
+
+test "a message sent after the user's turn could not be ended runs or is refused, at any allocation" {
+    var trace: GapTrace = undefined;
+    try trace.init(std.testing.allocator);
+    defer trace.deinit(std.testing.allocator);
+    var at: usize = 0;
+    var sent: usize = 0;
+    var refused: usize = 0;
+    while (try sweepUserTurnEnd(at, &sent, &refused)) : (at += 1) {}
+    // The end allocates in more places than the few that matter, and each
+    // kind of answer must occur, so the sweep is not vacuous.
+    try std.testing.expect(at > 0);
+    try std.testing.expect(refused > 0);
+    try std.testing.expect(sent > 0);
+    // The refusal of a message that nothing can start writes its trace line.
+    // The older unavailable answer writes none, so one line over the sweep
+    // shows the new refusal ran.
+    try std.testing.expect(trace.has("event=message_refused_unstartable"));
 }
 
 test "an early-ended work names each file it changed once, without reads or failed changes" {
@@ -6799,7 +6896,7 @@ test "a turn the user typed on a hosted subagent's screen shows its wait too" {
     try expectHas(ended, "reviewer: idle");
 }
 
-/// The team note for rows in every state `Runtime.ChildState` has, as a note
+/// The team note for rows in every state `Runtime.ChildState` has but `refusing`, as a note
 /// of `kind` says them: a waiting row with no last outcome, one with an
 /// outcome, then rows that do not wait, with the fourth past the limit.
 fn teamNoteForEveryState(alloc: Allocator, kind: Runtime.NoteKind) ![]u8 {

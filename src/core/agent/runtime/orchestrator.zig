@@ -7529,7 +7529,14 @@ const CompactionProgress = struct {
     before_summary: ?BeforeSummary,
 
     fn interface(self: *CompactionProgress) compactor.Progress {
-        return .{ .context = self, .report_fn = report, .written_fn = written };
+        return .{ .context = self, .report_fn = report, .written_fn = written, .asked_fn = asked };
+    }
+
+    fn asked(context: *anyopaque) void {
+        const self: *CompactionProgress = @ptrCast(@alignCast(context));
+        const id = self.operation_id orelse return;
+        const effect = self.deps.compaction_activity orelse return;
+        if (effect.asked) |ask| ask(self.deps.ctx, id);
     }
 
     fn written(context: *anyopaque, percent: u8) void {
@@ -7804,6 +7811,9 @@ test "compaction activity transaction settles only after publication and preserv
         fn running(raw: *anyopaque, id: compaction_activity.OperationId, stage: compaction_activity.Stage) void {
             from(raw).worker.runCompactionActivity(id, stage);
         }
+        fn asked(raw: *anyopaque, id: compaction_activity.OperationId) void {
+            from(raw).worker.askedCompactionActivity(id);
+        }
         fn settle(raw: *anyopaque, id: compaction_activity.OperationId, feedback: compaction_activity.Feedback) void {
             const self = from(raw);
             if (feedback.outcome == .succeeded) std.debug.assert(self.acknowledged);
@@ -7820,6 +7830,9 @@ test "compaction activity transaction settles only after publication and preserv
         fn stream(raw: ?*anyopaque, _: Allocator, request: agent_stream_provider.ModelRequest) !agent_stream_provider.Result {
             const self: *@This() = @ptrCast(@alignCast(raw.?));
             try std.testing.expectEqual(compaction_activity.Stage.summary, self.worker.compactionActivitySnapshot().operation.?.phase.running);
+            // The request was announced before it was sent, so the row
+            // counts its wait.
+            try std.testing.expect(self.worker.compactionActivitySnapshot().operation.?.progress.waiting);
             if (self.provider_error) |err| return err;
             try request.admission.admit();
             request.delivery.markPossiblySent();
@@ -7851,7 +7864,7 @@ test "compaction activity transaction settles only after publication and preserv
         deps.agent_stream_provider = gateway.provider();
         deps.agent_stream_provider.context = &host;
         deps.agent_stream_provider.stream_fn = Host.stream;
-        deps.compaction_activity = .{ .begin = Host.begin, .running = Host.running, .settle = Host.settle };
+        deps.compaction_activity = .{ .begin = Host.begin, .running = Host.running, .settle = Host.settle, .asked = Host.asked };
         deps.commit_context_compaction = .{ .commit = Host.commit };
         deps.push_interactive_notice = null;
         var tmp = std.testing.tmpDir(.{});

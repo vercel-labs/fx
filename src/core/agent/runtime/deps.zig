@@ -64,8 +64,10 @@ pub const CompactionActivityEffect = struct {
     begin: *const fn (ctx: *anyopaque, origin: compaction_activity.Origin, turn_id: ?u64) compaction_activity.OperationId,
     running: *const fn (ctx: *anyopaque, id: compaction_activity.OperationId, stage: compaction_activity.Stage) void,
     settle: *const fn (ctx: *anyopaque, id: compaction_activity.OperationId, feedback: compaction_activity.Feedback) void,
-    /// How much of the summary the model has written, from 1 to 99.
+    /// How much of the summary the model has written, from 1 to 100. The row holds it below 100% until fx saves.
     written: ?*const fn (ctx: *anyopaque, id: compaction_activity.OperationId, percent: u8) void = null,
+    /// A summary request is about to be sent; the row counts its wait.
+    asked: ?*const fn (ctx: *anyopaque, id: compaction_activity.OperationId) void = null,
 };
 
 pub const ContextCompactionCommitEffect = struct {
@@ -332,6 +334,11 @@ pub const AgentRuntimeDeps = struct {
     /// no session to remember it in, and the notice is not shown.
     push_session_notice: ?*const fn (ctx: *anyopaque, text: []const u8) anyerror!void = null,
     push_route_recovery_status: *const fn (ctx: *anyopaque, status: types.RouteRecoveryStatus) anyerror!void = discardRouteRecoveryStatus,
+    /// Saves a recovery status in the session log's open turn, as a
+    /// `model_recovery` item. `RequestRecovery` calls it when the status's
+    /// kind or attempt changes, and for the request's outcome. Null: the host
+    /// keeps no session log.
+    save_route_recovery_status: ?*const fn (ctx: *anyopaque, status: types.RouteRecoveryStatus) anyerror!void = null,
     /// A new model request starts. A host that reports the last request's
     /// recovery, as `fx ask --json` does, forgets the previous request's
     /// here. Null: the host keeps no per-request report.

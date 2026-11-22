@@ -10655,8 +10655,11 @@ function tearLogAt(home: string, id: string, index: number): any {
   return JSON.parse(line);
 }
 
-function logLineCount(home: string, id: string): number {
-  return readFileSync(logOf(home, id), "utf8").split("\n").filter(Boolean).length;
+/// The index of session `id`'s newest `recovery` line: the latest save.
+/// A `model_recovery` status line may follow it.
+function lastRecoveryLine(home: string, id: string): number {
+  const lines = readFileSync(logOf(home, id), "utf8").split("\n").filter(Boolean).map((line) => JSON.parse(line));
+  return lines.findLastIndex((line: any) => line.kind === "item" && line.type === "recovery");
 }
 
 test.skipIf(!tmuxAvailable())(
@@ -10681,11 +10684,12 @@ test.skipIf(!tmuxAvailable())(
       await endFx(active, "SIGKILL");
       active = null;
 
-      // The retry's save is the last line: the crash cuts it in half.
+      // The crash cuts the retry's save in half, so nothing after it, such as
+      // its status line, was written.
       const records = savedRecords(fixture.home, id);
       expect(records.at(-2)?.phase).toBe(2);
       expect(records.at(-1)).toMatchObject({ phase: 1, attempt: 2 });
-      const torn = tearLogAt(fixture.home, id, logLineCount(fixture.home, id) - 1);
+      const torn = tearLogAt(fixture.home, id, lastRecoveryLine(fixture.home, id));
       expect(torn).toMatchObject({ kind: "item", type: "recovery" });
 
       active = (await launchFx(fixture, gateway, "-c", "second")).session;
@@ -10728,10 +10732,11 @@ test.skipIf(!tmuxAvailable())(
       await endFx(active, "SIGKILL");
       active = null;
 
-      // The wait's save is the last line: the crash cuts it in half, so the
-      // save before it, the first send's, is what the next launch reads.
+      // The crash cuts the wait's save in half, so nothing after it, such as
+      // its status line, was written, and the save before it, the first send's,
+      // is what the next launch reads.
       expect(savedRecords(fixture.home, id).at(-2)).toMatchObject({ phase: 1, attempt: 1, deaths: 0 });
-      const torn = tearLogAt(fixture.home, id, logLineCount(fixture.home, id) - 1);
+      const torn = tearLogAt(fixture.home, id, lastRecoveryLine(fixture.home, id));
       expect(torn).toMatchObject({ kind: "item", type: "recovery" });
 
       active = (await launchFx(fixture, gateway, "-c", "second")).session;

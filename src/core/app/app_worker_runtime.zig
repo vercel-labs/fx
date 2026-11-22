@@ -1049,6 +1049,9 @@ pub fn Runtime(comptime App: type) type {
             presenter: activity_runtime.LifecyclePresenter,
             now_ms: i64,
         ) bool {
+            // The compaction row's number moves with the time handed in here,
+            // before this frame reads it.
+            if (comptime @hasDecl(@TypeOf(agent.worker), "observeCompactionActivity")) agent.worker.observeCompactionActivity(now_ms);
             const compaction: @import("../output/compaction_activity.zig").Snapshot = if (comptime @hasDecl(@TypeOf(agent.worker), "compactionActivitySnapshot")) agent.worker.compactionActivitySnapshot() else .{};
             app.shell.render_requests.observeCompactionRevision(compaction.revision);
             if (comptime @hasDecl(@TypeOf(agent.worker), "expireCompactionActivity")) {

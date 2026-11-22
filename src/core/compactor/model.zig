@@ -150,8 +150,11 @@ pub const Summarizer = struct {
     fn ask(self: *Summarizer, alloc: Allocator, prompt: summarize.Prompt, model_name: []const u8) summarize.ModelError![]u8 {
         const caller = self.caller;
         // Each reply starts on a line of its own, whatever the one before
-        // it left.
-        if (self.on_text) |sink| sink.write("\n");
+        // it left, and the row counts each request's wait from here.
+        if (self.on_text) |sink| {
+            sink.write("\n");
+            sink.asked();
+        }
         const reply = try caller.vtable.send(caller.context, alloc, .{
             .model = model_name,
             .reasoning = if (prompt.after_conversation) null else lowestReasoningEffort(caller.vtable.capabilities(caller.context, model_name)),
@@ -259,6 +262,32 @@ test "a failed or empty summary falls back to another family at its lowest reaso
     const summary_model = summarizer.model();
     try std.testing.expectError(error.ModelFailed, summary_model.summarize_fn(summary_model.context, std.testing.allocator, prompt));
     try std.testing.expectEqual(@as(usize, 1), direct.calls.items.len);
+}
+
+test "every summary request is announced before it is sent, the fallback's too" {
+    var cancel = std.atomic.Value(bool).init(false);
+    const prompt: summarize.Prompt = .{ .model = "anthropic/claude-opus-5.5", .system = "s", .user = "u" };
+    const Told = struct {
+        asked: usize = 0,
+
+        fn written(_: *anyopaque, _: u8) void {}
+
+        fn requestSent(context: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            self.asked += 1;
+        }
+    };
+    var told: Told = .{};
+    var counter: progress.Counter = .{ .sink = .{ .context = &told, .written_fn = Told.written, .asked_fn = Told.requestSent } };
+    var scripted: ScriptedCaller = .{ .replies = &.{ null, "summary" } };
+    defer scripted.calls.deinit(std.testing.allocator);
+    var summarizer: Summarizer = .{ .caller = scripted.caller(.gateway), .cancel_flag = &cancel, .trace_ctx = .{}, .on_text = counter.textSink() };
+    const summary_model = summarizer.model();
+    const text = try summary_model.summarize_fn(summary_model.context, std.testing.allocator, prompt);
+    defer std.testing.allocator.free(text);
+    try std.testing.expectEqual(@as(usize, 2), scripted.calls.items.len);
+    // The first model's request and the fallback's.
+    try std.testing.expectEqual(@as(usize, 2), told.asked);
 }
 
 test "a refusal as too long outlasts the fallback's own failure" {

@@ -6,7 +6,7 @@ import { chmodSync, existsSync, mkdirSync, readFileSync, realpathSync, symlinkSy
 import { writeChatGptLogin, writeGrokLogin } from "./usage-fakes";
 import { createConfiguredProviderFixture } from "./fixtures/chat-completions";
 import { join } from "node:path";
-import { cleanupIsolatedTestHome, createIsolatedTestHome, FX_BIN } from "../evals/eval-helpers";
+import { cleanupIsolatedTestHome, createIsolatedTestHome, FX_BIN, providerVersionTestEnv } from "../evals/eval-helpers";
 import { TmuxSession, tmuxAvailable } from "./tmux-helpers";
 
 const MODEL = "fake/doctor-model";
@@ -88,7 +88,7 @@ function problemsWithoutFix(stdout: string): string[] {
 
 async function doctor(r: Root, environment: Record<string, string>, args: string[] = [], cwd = r.workspace) {
   const started = performance.now();
-  const proc = Bun.spawn([FX_BIN, "doctor", ...args], { env: environment, cwd, stdout: "pipe", stderr: "pipe" });
+  const proc = Bun.spawn([FX_BIN, "doctor", ...args], { env: providerVersionTestEnv(environment), cwd, stdout: "pipe", stderr: "pipe" });
   const killer = setTimeout(() => proc.kill("SIGKILL"), 30_000);
   const [stdout, stderr, code] = await Promise.all([
     new Response(proc.stdout).text(),
