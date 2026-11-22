@@ -229,9 +229,6 @@ pub const StatuslineItems = struct {
 /// upstream, so this only bounds pathological single-word titles.
 const max_session_title_cells: usize = 32;
 
-/// Room for one 4-byte code point per title cell, plus the cut marker.
-const max_session_title_bytes = max_session_title_cells * 4 + title_cut_marker.len;
-
 /// A model id as the status line names it: without its provider, and
 /// a Claude model as "opus 4-7". May use `out`.
 pub fn compactModelLabel(model: []const u8, out: []u8) []const u8 {
@@ -280,6 +277,61 @@ fn appendStatusSegment(out: []u8, end: *usize, segment: []const u8) void {
     }
     @memcpy(out[end.* .. end.* + segment.len], segment);
     end.* += segment.len;
+}
+
+/// Appends a session title's kept prefix as a status segment. The prefix stops
+/// at `max_session_title_cells` cells, counted by `display_width.displayUnitAt`
+/// so no byte budget can cut it early. A unit whose first code point
+/// `droppedFromTitle` refuses is skipped whole. A unit that starts with a kept
+/// code point keeps every code point it holds: the only multi-code-point units
+/// are joined emoji and variation sequences, and neither can hold a dropped
+/// code point. A combining mark after a dropped code point is its own unit and
+/// stays, because `displayUnitAt` never folds it into the code point before
+/// it. Invalid UTF-8 is skipped byte by byte. Appends nothing when no code
+/// point is kept or the segment does not fit, as `appendStatusSegment` does.
+fn appendTitleSegment(out: []u8, end: *usize, title: []const u8) void {
+    const sep = " · ";
+    const sep_len = if (end.* > 0) sep.len else 0;
+    const start = end.*;
+    if (start + sep_len > out.len) return;
+    if (sep_len > 0) {
+        @memcpy(out[start .. start + sep.len], sep);
+        end.* += sep.len;
+    }
+
+    var width: usize = 0;
+    var index: usize = 0;
+    while (index < title.len) {
+        const sequence_len = std.unicode.utf8ByteSequenceLength(title[index]) catch {
+            index += 1;
+            continue;
+        };
+        if (title.len - index < sequence_len) break;
+        const codepoint = display_width.decodeUtf8Sequence(title[index .. index + sequence_len]) catch {
+            index += 1;
+            continue;
+        };
+        const unit = display_width.displayUnitAt(title, index);
+        if (unit.byte_len == 0) break;
+        if (!std.unicode.utf8ValidateSlice(title[index .. index + unit.byte_len])) {
+            index += 1;
+            continue;
+        }
+        if (droppedFromTitle(codepoint)) {
+            index += unit.byte_len;
+            continue;
+        }
+        if (width + unit.cell_width > max_session_title_cells) break;
+        if (end.* + unit.byte_len > out.len) {
+            end.* = start;
+            return;
+        }
+        @memcpy(out[end.* .. end.* + unit.byte_len], title[index .. index + unit.byte_len]);
+        end.* += unit.byte_len;
+        width += unit.cell_width;
+        index += unit.byte_len;
+    }
+    if (end.* == start + sep_len) end.* = start;
 }
 
 const statusline_separator = " · ";
@@ -430,9 +482,7 @@ fn appendSessionStatusSegments(
         appendStatusSegment(out, end, "⚡︎");
     }
     if (statusline.session_title) |title| {
-        var title_buffer: [max_session_title_bytes]u8 = undefined;
-        const sanitized = appendSanitizedTitle(title, &title_buffer);
-        appendStatusSegment(out, end, display_width.prefixByWidth(sanitized, max_session_title_cells));
+        appendTitleSegment(out, end, title);
     }
     if (statusline.context_used > 0) {
         if (statusline.context_total) |total| {
@@ -1324,4 +1374,60 @@ test "buildSessionStatusLine drops bidi controls from the session title and keep
     try std.testing.expect(std.mem.find(u8, line, "\u{0085}") == null);
     try std.testing.expect(std.mem.find(u8, line, joined) != null);
     try std.testing.expect(std.mem.find(u8, line, persian) != null);
+}
+
+test "buildSessionStatusLine drops a bidi mark from a joined-emoji title without cutting it" {
+    var buf: [512]u8 = undefined;
+    const family = "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}";
+    const families = text_utils.repeat(family, 20);
+    const expected = display_width.prefixByWidth(families, max_session_title_cells);
+    const line = buildSessionStatusLine(
+        "openai/gpt-5",
+        types.ReasoningEffort.literal("high"),
+        false,
+        .{ .session_title = "\u{202e}" ++ families },
+        600,
+        &buf,
+    );
+    try std.testing.expectEqual(@as(usize, 16 * family.len), expected.len);
+    try std.testing.expectEqual(max_session_title_cells, display_width.visibleWidth(expected));
+    try std.testing.expect(std.mem.startsWith(u8, line, "gpt-5 · "));
+    try std.testing.expectEqualStrings(expected, line["gpt-5 · ".len..]);
+    try std.testing.expect(std.mem.find(u8, line, "...") == null);
+    try std.testing.expect(!std.mem.endsWith(u8, line, "\u{200D}"));
+}
+
+test "buildSessionStatusLine counts kept cells when a dropped separator sits in the prefix" {
+    var buf: [256]u8 = undefined;
+    // U+2028 is one raw cell and no kept cell. The combining marks after "a"
+    // take no cells but 200 bytes, so a cut by bytes loses cells before 32.
+    const marks = text_utils.repeat("\u{0301}", 100);
+    const raw = "\u{2028}a" ++ marks ++ text_utils.repeat("x", 40);
+    const filtered = "a" ++ marks ++ text_utils.repeat("x", 40);
+    const expected = display_width.prefixByWidth(filtered, max_session_title_cells);
+    const line = buildSessionStatusLine(
+        "openai/gpt-5",
+        types.ReasoningEffort.literal("high"),
+        false,
+        .{ .session_title = raw },
+        300,
+        &buf,
+    );
+    try std.testing.expectEqual(max_session_title_cells, display_width.visibleWidth(expected));
+    try std.testing.expect(std.mem.startsWith(u8, line, "gpt-5 · "));
+    try std.testing.expectEqualStrings(expected, line["gpt-5 · ".len..]);
+    try std.testing.expect(std.mem.find(u8, line, "\u{2028}") == null);
+
+    // A combining mark after a dropped mark is its own unit, so it stays; only
+    // a unit whose first code point is dropped is skipped whole.
+    var combining_buf: [64]u8 = undefined;
+    const combining = buildSessionStatusLine(
+        "openai/gpt-5",
+        types.ReasoningEffort.literal("high"),
+        false,
+        .{ .session_title = "\u{202e}\u{0301}x" },
+        64,
+        &combining_buf,
+    );
+    try std.testing.expectEqualStrings("gpt-5 · \u{0301}x", combining);
 }
