@@ -1057,11 +1057,33 @@ pub const Runtime = struct {
 
     /// `workEnded` after the owner was told of `end`: settles the child and
     /// returns whether its slot has a next work. `posted` is set when a turn
-    /// work finished here posts to the owner too.
-    fn settleEnd(self: *Runtime, end: managed_owner.WorkEnd, posted: *bool) bool {
+    /// work finished here posts to the owner too. A waiting message that could
+    /// not be saved as a work is reported here too, and the child is settled
+    /// again.
+    fn settleEnd(self: *Runtime, first: managed_owner.WorkEnd, posted: *bool) bool {
+        var end = first;
+        while (true) {
+            const dropped = switch (self.settleEndOnce(end, posted)) {
+                .idle => return false,
+                .next => return true,
+                .dropped => |failed| failed,
+            };
+            // The owner was told this message waits, so it hears that it
+            // could not start. The report goes with the lock released, and
+            // the child is settled again: a close, a turn, or another message
+            // may have come meanwhile.
+            defer dropped.deinit(self.alloc);
+            if (self.reportFailedStart(end.child_id, dropped)) posted.* = true;
+            // The first pass queued the leftovers.
+            end.leftovers = &.{};
+        }
+    }
+
+    /// One pass of `settleEnd`: settles the child once for `end`.
+    fn settleEndOnce(self: *Runtime, end: managed_owner.WorkEnd, posted: *bool) SlotNext {
         if (self.endClosingWork(end)) {
             _ = self.settleClose(end.child_id);
-            return false;
+            return .idle;
         }
         var ended = blk: {
             self.admission_mutex.lockUncancelable(io_mod.getIo());
@@ -1074,7 +1096,7 @@ pub const Runtime = struct {
                 // parent's next message waits for it.
                 .opened => {
                     self.managed.markEnding(end.child_id);
-                    return false;
+                    return .idle;
                 },
                 .ended => |work| break :blk work,
             }
@@ -1089,17 +1111,34 @@ pub const Runtime = struct {
         return self.nextOrIdleLocked(end.child_id);
     }
 
+    /// What `nextOrIdleLocked` did for a child whose work ended.
+    const SlotNext = union(enum) {
+        /// Nothing waits: the child is idle and its slot ends.
+        idle,
+        /// The slot has a next work.
+        next,
+        /// The next waiting message could not be saved as a work. The child
+        /// stays busy: the caller reports it with the lock released, then
+        /// settles the child again.
+        dropped: FailedStart,
+    };
+
     /// Makes the parent's next message waiting for `child_id` the slot's
-    /// next work, or else marks the child idle.
-    fn nextOrIdleLocked(self: *Runtime, child_id: []const u8) bool {
-        const messages = self.startNextPendingLocked(child_id);
-        if (messages > 0) {
-            self.managed.markNext(child_id, messages);
-            return true;
+    /// next work, or else marks the child idle. A message that could not be
+    /// saved as a work is returned for the caller to report.
+    fn nextOrIdleLocked(self: *Runtime, child_id: []const u8) SlotNext {
+        switch (self.startNextPendingLocked(child_id)) {
+            .saved => |messages| {
+                self.managed.markNext(child_id, messages);
+                return .next;
+            },
+            .dropped => |dropped| return .{ .dropped = dropped },
+            .none => {
+                self.clearBusyLocked(child_id);
+                self.managed.markEnding(child_id);
+                return .idle;
+            },
         }
-        self.clearBusyLocked(child_id);
-        self.managed.markEnding(child_id);
-        return false;
     }
 
     /// Queues the parent's messages the ended turn never took ahead of the
@@ -1292,7 +1331,7 @@ pub const Runtime = struct {
                 dropped.count,
             }) catch "")
         else
-            self.reportOutput(a, end) catch "";
+            self.reportOutput(a, end) catch (if (end.start_failure != null) start_failed_report_fallback else "");
         const agent = self.childName(a, end.child_id) catch end.child_id;
         const idle = !notice and self.idleAfterEnd(a, end);
         sink.post(self, .{ .report = .{
@@ -1346,7 +1385,9 @@ pub const Runtime = struct {
             defer lock.release();
             facts.open = if (self.managed.state_store.load(a)) |loaded| open: {
                 var registry = loaded;
-                break :open registry.findById(end.child_id) != null;
+                const child = registry.findById(end.child_id) orelse break :open false;
+                facts.holds_work = end.start_failure != null and child.active != null;
+                break :open true;
             } else |err| unread: {
                 debug_trace.eventf("mailbox", "idle_unknown", .{}, "child={s} work_id={s} err={s}", .{ end.child_id, end.work_id, @errorName(err) });
                 break :unread false;
@@ -1360,7 +1401,7 @@ pub const Runtime = struct {
     /// ended, with any text it had written.
     fn reportOutput(self: *Runtime, a: Allocator, end: managed_owner.WorkEnd) ![]const u8 {
         // A work that never began has no reply, and nothing it changed.
-        if (end.start_failure) |cause| return startFailedReport(a, cause, end.start_messages);
+        if (end.start_failure) |cause| return startFailedReport(a, cause, end.start_messages, end.start_held);
         const saved = if (end.reply) |reply|
             reply
         else
@@ -1405,25 +1446,38 @@ pub const Runtime = struct {
         return (try self.managed.state_store.closedName(a, child_id)) orelse child_id;
     }
 
+    /// What became of the next message waiting for a child.
+    const NextStart = union(enum) {
+        /// Nothing waits for the child.
+        none,
+        /// It is saved as the child's next work, which carries this many of
+        /// the parent's messages.
+        saved: usize,
+        /// It could not be saved as a work, so it never ran. The caller
+        /// reports it to the owner as a failed start, with the lock released.
+        dropped: FailedStart,
+    };
+
     /// Makes the next message waiting for `child_id` its next work, which
-    /// the child's slot runs at once. Returns how many of the parent's
-    /// messages the work carries, or 0 when none waits or it could not be
-    /// started, which drops it.
-    fn startNextPendingLocked(self: *Runtime, child_id: []const u8) usize {
+    /// the child's slot runs at once. Returns `.saved` with how many of the
+    /// parent's messages the work carries, `.none` when none waits, or
+    /// `.dropped` when it could not be saved as a work (`dropStart`).
+    fn startNextPendingLocked(self: *Runtime, child_id: []const u8) NextStart {
         const index = for (self.pending.items, 0..) |item, i| {
             if (std.mem.eql(u8, item.child_id, child_id)) break i;
-        } else return 0;
+        } else return .none;
         var item = self.pending.orderedRemove(index);
         defer item.deinit(self.alloc);
         const messages = 1 + self.absorbPendingLocked(&item, index);
+        if (start_test_controls.nextWorkFails()) return self.dropStart(&item, error.OutOfMemory, messages);
         var lock = self.managed.state_store.acquireLock();
         defer lock.release();
-        var registry = self.managed.state_store.load(self.alloc) catch |err| return self.dropStart(item, err);
+        var registry = self.managed.state_store.load(self.alloc) catch |err| return self.dropStart(&item, err, messages);
         defer registry.deinit(self.alloc);
-        _ = registry.startPersistentWork(self.alloc, item.agent, null, item.work) catch |err| return self.dropStart(item, err);
-        self.managed.state_store.save(self.alloc, registry) catch |err| return self.dropStart(item, err);
+        _ = registry.startPersistentWork(self.alloc, item.agent, null, item.work) catch |err| return self.dropStart(&item, err, messages);
+        self.managed.state_store.save(self.alloc, registry) catch |err| return self.dropStart(&item, err, messages);
         debug_trace.eventf("mailbox", "next_turn", .{}, "child={s} work_id={s}", .{ child_id, item.work.id });
-        return messages;
+        return .{ .saved = messages };
     }
 
     /// The messages waiting for `head`'s child behind it join the turn it
@@ -1634,19 +1688,7 @@ pub const Runtime = struct {
         while (self.startPendingAfterTurn(child_id)) |failed| {
             defer failed.deinit(self.alloc);
             start_test_controls.failedStartEnded(child_id);
-            _ = self.deliverEnd(.{
-                .child_id = child_id,
-                .work_id = failed.work_id,
-                .outcome = .failed,
-                .failure = execution.failureDiagnosticValue("start_failed", @errorName(failed.err)),
-                .report_owed = failed.report_owed,
-                .end = failed.end,
-                .start_failure = startCauseText(failed.err),
-                .start_messages = failed.messages,
-            });
-            self.admission_mutex.lockUncancelable(io_mod.getIo());
-            defer self.admission_mutex.unlock(io_mod.getIo());
-            self.forgetCallLocked(failed.work_id);
+            _ = self.reportFailedStart(child_id, failed);
         }
     }
 
@@ -1661,8 +1703,9 @@ pub const Runtime = struct {
         if (nudge) self.nudgeWaiter();
     }
 
-    /// A message waiting for the child whose slot could not start, now ended
-    /// as a failed work. `work_id` is owned by the caller.
+    /// A waiting message for the child that never ran: a work that was saved
+    /// and ended as failed, or a message that could not be saved as a work at
+    /// all. `work_id` is owned by the caller.
     const FailedStart = struct {
         work_id: []u8,
         report_owed: bool,
@@ -1677,11 +1720,31 @@ pub const Runtime = struct {
         }
     };
 
+    /// Tells the owner of `failed` as a failed work whose messages never ran,
+    /// and forgets the call that sent it. Call with no lock held. True when
+    /// the sink took the report.
+    fn reportFailedStart(self: *Runtime, child_id: []const u8, failed: FailedStart) bool {
+        const posted = self.deliverEnd(.{
+            .child_id = child_id,
+            .work_id = failed.work_id,
+            .outcome = .failed,
+            .failure = execution.failureDiagnosticValue("start_failed", @errorName(failed.err)),
+            .report_owed = failed.report_owed,
+            .end = failed.end,
+            .start_failure = startCauseText(failed.err),
+            .start_messages = failed.messages,
+            .start_held = failed.err == error.ChildBusy,
+        });
+        self.forgetCall(failed.work_id);
+        return posted;
+    }
+
     /// Starts the next message waiting for `child_id` as a slot's work, after
     /// the turn the user or a child's report started has ended. Null when
     /// that is done, or nothing waits, which leaves the child idle. One that
-    /// could not start is ended as failed, which the caller reports: the
-    /// parent was told it was queued, so it must not vanish.
+    /// could not start is ended as failed, and one that could not be saved as
+    /// a work is returned as failed without a work. The caller reports either:
+    /// the parent was told it was queued, so it must not vanish.
     fn startPendingAfterTurn(self: *Runtime, child_id: []const u8) ?FailedStart {
         self.admission_mutex.lockUncancelable(io_mod.getIo());
         defer self.admission_mutex.unlock(io_mod.getIo());
@@ -1694,11 +1757,16 @@ pub const Runtime = struct {
             self.clearBusyLocked(child_id);
             return null;
         }
-        const messages = self.startNextPendingLocked(child_id);
-        if (messages == 0) {
-            self.clearBusyLocked(child_id);
-            return null;
-        }
+        const messages = switch (self.startNextPendingLocked(child_id)) {
+            .none => {
+                self.clearBusyLocked(child_id);
+                return null;
+            },
+            // It was never saved, so there is no work to end. Busy stays set:
+            // the next waiting message, if any, starts now.
+            .dropped => |dropped| return dropped,
+            .saved => |count| count,
+        };
         _ = self.managed.start(child_id, messages) catch |err| {
             debug_trace.eventf("mailbox", "start_failed", .{}, "child={s} error={s} messages={d}", .{ child_id, @errorName(err), messages });
             const ended = self.managed.endUnstarted(child_id, null, err, true) orelse {
@@ -1732,11 +1800,22 @@ pub const Runtime = struct {
         });
     }
 
-    /// Drops a message that could not be made a work: it carries no messages.
-    fn dropStart(self: *Runtime, item: Pending, err: anyerror) usize {
-        debug_trace.eventf("mailbox", "dropped", .{}, "child={s} work_id={s} reason={s}", .{ item.child_id, item.work.id, @errorName(err) });
-        self.forgetCallLocked(item.work.id);
-        return 0;
+    /// A waiting message that could not be made a work. It is not dropped in
+    /// silence: its facts go to the caller, which reports it as a failed
+    /// start. The call that sent it stays remembered until then, so the
+    /// report names it.
+    fn dropStart(self: *Runtime, item: *Pending, err: anyerror, messages: usize) NextStart {
+        debug_trace.eventf("mailbox", "dropped", .{}, "child={s} work_id={s} reason={s} messages={d}", .{ item.child_id, item.work.id, @errorName(err), messages });
+        // The id moves to the caller, so nothing is allocated here.
+        const work_id = item.work.id;
+        item.work.id = &.{};
+        return .{ .dropped = .{
+            .work_id = work_id,
+            .report_owed = !self.managed.treeClosed(),
+            .end = .{ .started_by = item.work.started_by },
+            .err = err,
+            .messages = messages,
+        } };
     }
 
     /// `wait`: blocks on the caller's own worker until a report or message
@@ -3294,6 +3373,47 @@ test "a message to a busy subagent waits and runs as its next work, in order" {
     try std.testing.expect(std.mem.startsWith(u8, fixture.reports.items[1], "reviewer call-2 "));
     // Nothing is left remembered once both works ended.
     try std.testing.expectEqual(@as(usize, 0), runtime.work_calls.items.len);
+}
+
+// Main was told that its message waits for the subagent's work. When the
+// message cannot become the subagent's next work, main must hear that it
+// failed: it never ran, and the subagent is idle.
+test "a message that waited for a subagent's work and could not be saved as its next work is reported as failed" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var parent: child_state.TestParent = undefined;
+    try parent.init(alloc);
+    defer parent.deinit();
+    var fixture = MailboxFixture{ .hold = true };
+    defer fixture.deinit();
+    const runtime = try mailboxRuntime(alloc, &fixture, &parent);
+    defer runtime.deinit();
+
+    _ = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "first" } }, "call-1", null);
+    try waitForRuns(&fixture, 1);
+    const queued = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "second" } }, "call-2", null);
+    try std.testing.expect(std.mem.find(u8, queued, "is busy") != null);
+    start_test_controls.test_fail_next_work = true;
+    defer start_test_controls.test_fail_next_work = false;
+    fixture.release.set(io_mod.getIo());
+    try waitUntilQuiet(runtime);
+    start_test_controls.test_fail_next_work = false;
+    try std.testing.expectEqual(@as(usize, 1), fixture.runs.load(.seq_cst));
+    try std.testing.expectEqual(@as(usize, 2), fixture.reportCount());
+    try std.testing.expect(std.mem.endsWith(u8, fixture.reports.items[0], "DONE first"));
+    try std.testing.expect(std.mem.startsWith(u8, fixture.reports.items[1], "reviewer call-2 "));
+    try std.testing.expect(std.mem.find(u8, fixture.reports.items[1], "failed") != null);
+    try std.testing.expect(std.mem.find(u8, fixture.reports.items[1], "could not start the work your message made: fx ran out of memory. It never ran.") != null);
+    try std.testing.expect(fixture.idles.items[1]);
+    try std.testing.expectEqual(@as(usize, 0), runtime.work_calls.items.len);
+    const status = try callTool(runtime, arena, .{ .status = .{ .agent = "reviewer" } }, "call-3", null);
+    try std.testing.expect(std.mem.find(u8, status, "reviewer: idle") != null);
+    const third = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "third" } }, "call-4", null);
+    try expectBodyHas(third, "Sent to reviewer");
+    try waitUntilQuiet(runtime);
+    try std.testing.expectEqual(@as(usize, 2), fixture.runs.load(.seq_cst));
 }
 
 test "the roster names the open subagents, and the working ones while they work" {
@@ -5193,10 +5313,17 @@ test "a user's turn whose work fails to open at any allocation leaves its subage
 
 /// One try of the sweep below: a user's turn is open on `reviewer`, one message
 /// of main waits for it, and that message's start fails. The `fail_at`-th
-/// allocation of the turn's end fails. Main then sends one more message, which
-/// must run or be refused, and never be answered as waiting. Returns whether
-/// the allocation failed; counts in `sent` and `refused` the tries of each kind.
-fn sweepUserTurnEnd(fail_at: usize, sent: *usize, refused: *usize) !bool {
+/// allocation of the turn's end fails. Once the turn has ended, the waiting
+/// message's account must be there: main was told it could not start, or its
+/// work is still recorded as the subagent's active work. Where main was told,
+/// a subagent that still holds a work is not reported idle. Main then sends
+/// one more message, which must run or be refused, and never be answered as
+/// waiting. Returns whether the allocation failed; counts in `sent` and
+/// `refused` the tries of each kind, in `reported` the tries where main was
+/// told the waiting message could not start, and in `plain` the tries where
+/// that report had the fallback text. Where the subagent still holds a work,
+/// that report says to call `status`; where it holds none, it does not.
+fn sweepUserTurnEnd(fail_at: usize, sent: *usize, refused: *usize, reported: *usize, plain: *usize) !bool {
     const alloc = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(alloc);
     defer arena_state.deinit();
@@ -5228,6 +5355,47 @@ fn sweepUserTurnEnd(fail_at: usize, sent: *usize, refused: *usize) !bool {
 
     const where = try alloc.print("allocation {d} of the end of a user's turn", .{fail_at});
     defer alloc.free(where);
+    // The waiting message's account, now that the turn has ended: main was
+    // told it could not start, or its work is still recorded as the
+    // subagent's active work. A message's work id starts `fxop:` and a user's
+    // turn's `fxuser:`, so a user's turn recorded in its place is no account.
+    var told_failed = false;
+    var told_index: usize = 0;
+    for (fixture.reports.items, 0..) |line, index| {
+        if (std.mem.find(u8, line, "could not start the work") != null) {
+            told_failed = true;
+            told_index = index;
+            if (std.mem.find(u8, line, "could not start the work you sent it") != null) plain.* += 1;
+        }
+    }
+    if (told_failed) reported.* += 1;
+    const active_prefix: []const u8 = blk: {
+        var lock = runtime.managed.state_store.acquireLock();
+        defer lock.release();
+        var registry = try runtime.managed.state_store.load(arena);
+        const child = registry.findPersistent("reviewer") orelse break :blk "gone";
+        const active = child.active orelse break :blk "none";
+        if (std.mem.startsWith(u8, active.id, "fxop:")) break :blk "fxop:";
+        if (std.mem.startsWith(u8, active.id, "fxuser:")) break :blk "fxuser:";
+        break :blk "other";
+    };
+    if (!told_failed) try expectAt(where, "the waiting message is reported, or its work is still recorded", if (std.mem.eql(u8, active_prefix, "fxop:")) "the waiting message is reported, or its work is still recorded" else active_prefix);
+    if (told_failed and !std.mem.eql(u8, active_prefix, "none")) {
+        const idle = fixture.idles.items[told_index];
+        try expectAt(where, "the report does not call a subagent that still holds a work idle", if (idle) "the report calls it idle" else "the report does not call a subagent that still holds a work idle");
+        const line = fixture.reports.items[told_index];
+        if (std.mem.find(u8, line, "could not start the work you sent it") == null) {
+            const says_status = std.mem.find(u8, line, "Call status before you send the message again.") != null;
+            try expectAt(where, "the report says to call status before the message is sent again", if (says_status) "the report says to call status before the message is sent again" else line);
+        }
+    }
+    if (told_failed and std.mem.eql(u8, active_prefix, "none")) {
+        const line = fixture.reports.items[told_index];
+        if (std.mem.find(u8, line, "could not start the work you sent it") == null) {
+            const says_status = std.mem.find(u8, line, "Call status before you send") != null;
+            try expectAt(where, "the report does not say to call status", if (says_status) line else "the report does not say to call status");
+        }
+    }
     const runs_before = fixture.runs.load(.seq_cst);
     const next = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "next" } }, "call-2", null);
     try expectAt(where, "not answered as waiting", if (std.mem.find(u8, next, "is busy") == null) "not answered as waiting" else next);
@@ -5252,12 +5420,18 @@ test "a message sent after the user's turn could not be ended runs or is refused
     var at: usize = 0;
     var sent: usize = 0;
     var refused: usize = 0;
-    while (try sweepUserTurnEnd(at, &sent, &refused)) : (at += 1) {}
+    var reported: usize = 0;
+    var plain: usize = 0;
+    while (try sweepUserTurnEnd(at, &sent, &refused, &reported, &plain)) : (at += 1) {}
     // The end allocates in more places than the few that matter, and each
     // kind of answer must occur, so the sweep is not vacuous.
     try std.testing.expect(at > 0);
     try std.testing.expect(refused > 0);
     try std.testing.expect(sent > 0);
+    try std.testing.expect(reported > 0);
+    // The fallback text is what main reads where the report's text cannot be
+    // built, so the sweep reaches it: an allocation of that report fails.
+    try std.testing.expect(plain > 0);
     // The refusal of a message that nothing can start writes its trace line.
     // The older unavailable answer writes none, so one line over the sweep
     // shows the new refusal ran.
@@ -7436,6 +7610,7 @@ fn startCauseText(err: anyerror) []const u8 {
         error.ThreadSpawnFailed => "fx could not start a thread for it",
         error.OutOfMemory => "fx ran out of memory",
         error.OwnerClosed => "fx is closing",
+        error.ChildBusy => "its record still holds an earlier work",
         else => @errorName(err),
     };
 }
@@ -7462,11 +7637,21 @@ fn startFailedStuckResult(buf: []u8, agent: []const u8, cause: []const u8) []con
 /// A report's text for a work whose slot could not start: its messages never
 /// ran, one or the `messages` that joined it. It does not say whether the
 /// subagent is idle, which the host reads after it builds this text, and the
-/// report's `next` says when it is. Allocated in `a`.
-fn startFailedReport(a: Allocator, cause: []const u8, messages: usize) ![]const u8 {
-    if (messages > 1) return a.print("The subagent could not start the work your {d} messages made: {s}. They never ran. Send them again if they are still needed.", .{ messages, cause });
+/// report's `next` says when it is. When `held`, the last sentence says to call
+/// `status` before the message is sent again, because the subagent's record
+/// still holds an earlier work. Allocated in `a`.
+fn startFailedReport(a: Allocator, cause: []const u8, messages: usize, held: bool) ![]const u8 {
+    if (messages > 1) {
+        if (held) return a.print("The subagent could not start the work your {d} messages made: {s}. They never ran. Call status before you send them again.", .{ messages, cause });
+        return a.print("The subagent could not start the work your {d} messages made: {s}. They never ran. Send them again if they are still needed.", .{ messages, cause });
+    }
+    if (held) return a.print("The subagent could not start the work your message made: {s}. It never ran. Call status before you send the message again.", .{cause});
     return a.print("The subagent could not start the work your message made: {s}. It never ran. Send the message again if it is still needed.", .{cause});
 }
+
+/// A failed start's report when fx cannot build `startFailedReport`'s text: it
+/// names no cause and no count, and is true for any of them.
+const start_failed_report_fallback = "The subagent could not start the work you sent it. It never ran. Call status before you send it again.";
 
 /// What decides whether a child is idle once its work's report goes
 /// (`Runtime.idleAfterEnd`).
@@ -7487,9 +7672,12 @@ const IdleFacts = struct {
     /// Every later message to the child fails the same way, as when its
     /// profile cannot be loaded, so there is nothing to keep it for.
     unusable: bool = false,
+    /// The report says a message could not start, and the registry still
+    /// holds an earlier work for the child, so messages to it are refused.
+    holds_work: bool = false,
 
     fn idle(self: IdleFacts) bool {
-        return self.open and !self.leftovers and !self.user_closed and !self.closing and !self.waiting and !self.turn_waiting and !self.unusable;
+        return self.open and !self.leftovers and !self.user_closed and !self.closing and !self.waiting and !self.turn_waiting and !self.unusable and !self.holds_work;
     }
 };
 
@@ -7502,6 +7690,7 @@ test "a child is idle after its report only when nothing starts its next turn or
     try std.testing.expect(!(IdleFacts{ .open = true, .waiting = true }).idle());
     try std.testing.expect(!(IdleFacts{ .open = true, .turn_waiting = true }).idle());
     try std.testing.expect(!(IdleFacts{ .open = true, .unusable = true }).idle());
+    try std.testing.expect(!(IdleFacts{ .open = true, .holds_work = true }).idle());
 }
 
 /// An idle subagent a new subagent's start names, with what it is for.

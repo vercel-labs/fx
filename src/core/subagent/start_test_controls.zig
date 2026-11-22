@@ -54,6 +54,19 @@ pub fn spawnFails() bool {
     return failed_starts.fetchAdd(1, .seq_cst) < limit;
 }
 
+/// Test builds only: while an inline test sets it, the host cannot save a
+/// waiting message as its subagent's next work, as when the registry cannot be
+/// written. No file control sets it.
+pub var test_fail_next_work: if (builtin.is_test) bool else void = if (builtin.is_test) false else {};
+
+/// Whether the waiting message that is about to be saved as a subagent's next
+/// work fails to be saved instead.
+pub fn nextWorkFails() bool {
+    if (comptime build_options.libfx) return false;
+    if (builtin.is_test) return test_fail_next_work;
+    return false;
+}
+
 /// Test builds only: an inline test sets it to run code where a waiting
 /// message's failed start has been ended and its report is not yet built, as a
 /// close of the child can land there.
@@ -141,4 +154,12 @@ test "a test build holds a work's start and sets the wait limit only through its
     test_fail_spawn = true;
     defer test_fail_spawn = false;
     try std.testing.expect(spawnFails());
+}
+
+test "a test build fails the save of a waiting message's work only through its hook" {
+    // Without a hook the save is not failed.
+    try std.testing.expect(!nextWorkFails());
+    test_fail_next_work = true;
+    defer test_fail_next_work = false;
+    try std.testing.expect(nextWorkFails());
 }
