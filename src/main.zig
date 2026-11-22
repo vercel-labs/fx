@@ -3898,7 +3898,7 @@ fn mainC(c_argc: c_int, c_argv: [*][*:0]c_char, c_envp: [*:null]?[*:0]c_char) !v
         // The servers run here now, so a session's trace asks this process
         // for them; it starts in the session's directory.
         debug_trace.configureFromEnv(processAllocator(), ".");
-        try mcp_owner.run(processAllocator(), std.mem.sliceTo(raw_args[2], 0));
+        try mcp_owner.run(processAllocator(), std.mem.sliceTo(raw_args[2], 0), build_options.app_version);
         return;
     }
 

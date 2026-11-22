@@ -26,7 +26,7 @@ type Root = {
   pid: string;
 };
 
-type WireEntry = { pid: number; message: { method?: string } };
+type WireEntry = { pid: number; message: { method?: string; params?: { _meta?: Record<string, unknown> } } };
 
 let cleanupRoot: string | null = null;
 let gateways: Gateway[] = [];
@@ -238,6 +238,12 @@ describe("shared MCP servers", () => {
     expect(new Set(calls.map((call) => call.pid)).size).toBe(1);
     // One owner ran both sessions, from start to end.
     expect(seenOwners).toHaveLength(1);
+    // The server runs under the owner, and hears the same client a session's
+    // own copy sends: fx, with the version this binary prints. The 2026 first
+    // request carries it in its metadata; `initialize` is the legacy fallback.
+    const version = (await runFx(["--version"])).stdout.trim();
+    const discover = readWire(root.wire).find((entry) => entry.message.method === "server/discover");
+    expect(discover?.message.params?._meta?.["io.modelcontextprotocol/clientInfo"]).toEqual({ name: "fx", version });
 
     // Both sessions are gone: the server stops and the owner exits.
     await expectExited([serverPid!, ...seenOwners]);

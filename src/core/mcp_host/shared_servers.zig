@@ -640,7 +640,7 @@ fn shortHome(alloc: Allocator, tag: []const u8) ![]u8 {
 fn serveOnThread(io: std.Io, gpa: Allocator, home: []const u8, stop: *std.atomic.Value(bool)) void {
     // An owner that ends with an error is what a test's stop asks for; the
     // test fails on the state it checks, not on this thread.
-    owner.serve(io, gpa, home, stop) catch {};
+    owner.serve(io, gpa, home, stop, owner.test_client_version) catch {};
 }
 
 fn waitForSocket(alloc: Allocator, home: []const u8) ![]u8 {

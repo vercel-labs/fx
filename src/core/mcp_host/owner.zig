@@ -60,13 +60,13 @@ fn installSignals() void {
 
 /// The process entry. It detaches from the session that started it, never
 /// pins a repository's directory, and serves until it is stopped.
-pub fn run(alloc: Allocator, fx_home: []const u8) !void {
+pub fn run(alloc: Allocator, fx_home: []const u8, client_version: []const u8) !void {
     _ = std.c.setsid();
     // The owner must not hold a repo's directory after its last session ends.
     _ = std.c.chdir("/");
     installSignals();
     var stop = std.atomic.Value(bool).init(false);
-    serve(io_mod.getIo(), alloc, fx_home, &stop) catch |err| switch (err) {
+    serve(io_mod.getIo(), alloc, fx_home, &stop, client_version) catch |err| switch (err) {
         // Another owner is alive, or still exiting and holding the lock.
         error.LockBusy => return,
         else => return err,
@@ -134,6 +134,9 @@ const Owner = struct {
     io: std.Io,
     gpa: Allocator,
     stop: *std.atomic.Value(bool),
+    /// The fx version every server this owner runs is told, the one a session
+    /// that runs its own copy sends, so sharing changes nothing a server sees.
+    client_version: []const u8,
     mutex: std.Io.Mutex = .init,
     events: std.ArrayList(ShellEvent) = .empty,
     connections: [core.max_clients]?*Connection = @splat(null),
@@ -495,7 +498,7 @@ fn rememberConfig(owner: *Owner, key: core.Key, config: wire.ServerConfig) void 
 
 /// Serves until the last client has been gone for `exit_grace_ms` or `stop`
 /// is set. `error.LockBusy` means another owner holds the lock.
-pub fn serve(io: std.Io, gpa: Allocator, fx_home: []const u8, stop: *std.atomic.Value(bool)) !void {
+pub fn serve(io: std.Io, gpa: Allocator, fx_home: []const u8, stop: *std.atomic.Value(bool), client_version: []const u8) !void {
     const run_dir = try std.Io.Dir.path.join(gpa, &.{ fx_home, run_dir_name });
     defer gpa.free(run_dir);
     std.Io.Dir.cwd().createDir(io, run_dir, .fromMode(0o700)) catch |err| switch (err) {
@@ -525,7 +528,7 @@ pub fn serve(io: std.Io, gpa: Allocator, fx_home: []const u8, stop: *std.atomic.
         debug_trace.logf("mcp-owner", "owner socket not private reason=set mode err={s}", .{@errorName(err)});
     };
 
-    var owner: Owner = .{ .io = io, .gpa = gpa, .stop = stop, .engine_arena = .init(gpa) };
+    var owner: Owner = .{ .io = io, .gpa = gpa, .stop = stop, .client_version = client_version, .engine_arena = .init(gpa) };
     defer owner.engine_arena.deinit();
     owner.last_open_ms = owner.now();
     var loop = io.concurrent(ownerLoopTask, .{&owner}) catch |err| {
@@ -584,7 +587,7 @@ fn ownerLoop(owner: *Owner) void {
     const gpa = owner.gpa;
     var engine_value: engine.Engine = undefined;
     engine_value.init(io, gpa, .{ .context = owner, .allow = allowAll, .log = logStderr }, .{
-        .client = .{ .info = .{ .name = "fx", .version = "owner" }, .capabilities = "{\"elicitation\":{\"form\":{},\"url\":{}}}" },
+        .client = .{ .info = .{ .name = "fx", .version = owner.client_version }, .capabilities = "{\"elicitation\":{\"form\":{},\"url\":{}}}" },
         .gate = mcp.core.engine.limitsFor(idle_control.idleMs()),
     }, &.{}) catch |err| {
         debug_trace.logf("mcp-owner", "owner engine did not start err={s}", .{@errorName(err)});
@@ -1029,13 +1032,15 @@ const testing = std.testing;
 const fake_server = @import("fake_server.zig");
 
 const test_key: core.Key = "00112233445566778899aabbccddeeff".*;
+/// What a test owner tells every server it runs, in place of the fx version.
+pub const test_client_version = "0.0.0-test";
 
 fn socketPath(alloc: Allocator, home: []const u8) ![]u8 {
     return std.Io.Dir.path.join(alloc, &.{ home, run_dir_name, socket_name });
 }
 
 fn serveThread(io: std.Io, gpa: Allocator, home: []const u8, stop: *std.atomic.Value(bool)) void {
-    serve(io, gpa, home, stop) catch |err| {
+    serve(io, gpa, home, stop, test_client_version) catch |err| {
         debug_trace.logf("mcp-owner", "test owner ended err={s}", .{@errorName(err)});
     };
 }
@@ -1286,7 +1291,7 @@ test "an owner takes 300 connections in turn and still serves a new one" {
 test "the event list's cap drops the frame and closes the connection that sent it" {
     const alloc = testing.allocator;
     var stop = std.atomic.Value(bool).init(false);
-    var owner: Owner = .{ .io = testing.io, .gpa = alloc, .stop = &stop, .engine_arena = .init(alloc) };
+    var owner: Owner = .{ .io = testing.io, .gpa = alloc, .stop = &stop, .client_version = test_client_version, .engine_arena = .init(alloc) };
     defer owner.engine_arena.deinit();
     defer {
         for (owner.events.items) |*event| event.deinit(alloc);
@@ -1455,7 +1460,7 @@ test "a second owner on one fx home returns at once with the lock busy" {
 
     var second = std.atomic.Value(bool).init(false);
     const started = std.Io.Clock.awake.now(testing.io).toMilliseconds();
-    try testing.expectError(error.LockBusy, serve(testing.io, alloc, home, &second));
+    try testing.expectError(error.LockBusy, serve(testing.io, alloc, home, &second, test_client_version));
     try testing.expect(std.Io.Clock.awake.now(testing.io).toMilliseconds() - started < 1_000);
 
     stop.store(true, .release);
