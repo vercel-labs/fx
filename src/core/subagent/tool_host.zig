@@ -1325,15 +1325,21 @@ pub const Runtime = struct {
         defer arena.deinit();
         const a = arena.allocator();
         const notice = end.work_id.len == 0;
+        // A report reads the child's facts once, before its text. A work whose
+        // start failed says to call status while the registry still holds a
+        // work for the child: the same read that decides `idle`.
+        const facts: IdleFacts = if (notice) .{} else self.idleFactsAfterEnd(a, end);
+        var reported = end;
+        reported.start_held = end.start_held or facts.holds_work;
         const output = if (notice)
             (a.print("The user {s} it, and {d} of your messages waiting for it were dropped.", .{
                 if (dropped.closed) "closed" else "stopped",
                 dropped.count,
             }) catch "")
         else
-            self.reportOutput(a, end) catch (if (end.start_failure != null) start_failed_report_fallback else "");
+            self.reportOutput(a, reported) catch (if (end.start_failure != null) start_failed_report_fallback else "");
         const agent = self.childName(a, end.child_id) catch end.child_id;
-        const idle = !notice and self.idleAfterEnd(a, end);
+        const idle = !notice and facts.idle();
         sink.post(self, .{ .report = .{
             .agent = agent,
             .child_id = end.child_id,
@@ -1370,6 +1376,12 @@ pub const Runtime = struct {
     /// a waiting message counts (`tests/tla/subagent/StopMessage.tla`
     /// IdleNoteHonest).
     fn idleAfterEnd(self: *Runtime, a: Allocator, end: managed_owner.WorkEnd) bool {
+        return self.idleFactsAfterEnd(a, end).idle();
+    }
+
+    /// The facts `idleAfterEnd` decides on, read in one pass. A report reads
+    /// them before its text, so the text and the idle flag come from one read.
+    fn idleFactsAfterEnd(self: *Runtime, a: Allocator, end: managed_owner.WorkEnd) IdleFacts {
         const facts: IdleFacts = blk: {
             self.admission_mutex.lockUncancelable(io_mod.getIo());
             defer self.admission_mutex.unlock(io_mod.getIo());
@@ -1394,7 +1406,7 @@ pub const Runtime = struct {
             };
             break :blk facts;
         };
-        return facts.idle();
+        return facts;
     }
 
     /// What a report says about the work: the child's reply, or how it
@@ -5426,7 +5438,8 @@ test "a user's turn whose work fails to open at any allocation leaves its subage
 }
 
 /// One try of the sweep below: a user's turn is open on `reviewer`, one message
-/// of main waits for it, and that message's start fails. The `fail_at`-th
+/// of main waits for it, and that message's start fails (with `fail_save`, its
+/// save to the registry fails instead). The `fail_at`-th
 /// allocation of the turn's end fails. Once the turn has ended, the waiting
 /// message's account must be there: main was told it could not start, or its
 /// work is still recorded as the subagent's active work. Where main was told,
@@ -5437,7 +5450,7 @@ test "a user's turn whose work fails to open at any allocation leaves its subage
 /// told the waiting message could not start, and in `plain` the tries where
 /// that report had the fallback text. Where the subagent still holds a work,
 /// that report says to call `status`; where it holds none, it does not.
-fn sweepUserTurnEnd(fail_at: usize, sent: *usize, refused: *usize, reported: *usize, plain: *usize) !bool {
+fn sweepUserTurnEnd(fail_at: usize, fail_save: bool, sent: *usize, refused: *usize, reported: *usize, plain: *usize) !bool {
     const alloc = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(alloc);
     defer arena_state.deinit();
@@ -5460,10 +5473,12 @@ fn sweepUserTurnEnd(fail_at: usize, sent: *usize, refused: *usize, reported: *us
     try expectBodyHas(queued, "is busy");
 
     start_test_controls.test_fail_spawn = true;
+    start_test_controls.test_fail_next_work = fail_save;
     faulted.arm(fail_at);
     runtime.endUserWork(child_id, work_id, .completed, "");
     faulted.disarm();
     start_test_controls.test_fail_spawn = false;
+    start_test_controls.test_fail_next_work = false;
     try waitUntilQuiet(runtime);
     if (!faulted.fault.fired) return false;
 
@@ -5536,7 +5551,7 @@ test "a message sent after the user's turn could not be ended runs or is refused
     var refused: usize = 0;
     var reported: usize = 0;
     var plain: usize = 0;
-    while (try sweepUserTurnEnd(at, &sent, &refused, &reported, &plain)) : (at += 1) {}
+    while (try sweepUserTurnEnd(at, false, &sent, &refused, &reported, &plain)) : (at += 1) {}
     // The end allocates in more places than the few that matter, and each
     // kind of answer must occur, so the sweep is not vacuous.
     try std.testing.expect(at > 0);
@@ -5550,6 +5565,19 @@ test "a message sent after the user's turn could not be ended runs or is refused
     // The older unavailable answer writes none, so one line over the sweep
     // shows the new refusal ran.
     try std.testing.expect(trace.has("event=message_refused_unstartable"));
+}
+
+test "a failed start's report points to status whenever the subagent's record still holds a work" {
+    var at: usize = 0;
+    var sent: usize = 0;
+    var refused: usize = 0;
+    var reported: usize = 0;
+    var plain: usize = 0;
+    while (try sweepUserTurnEnd(at, true, &sent, &refused, &reported, &plain)) : (at += 1) {}
+    // The sweep must reach an allocation that holds a work, and a report that
+    // main reads, or its checks are vacuous.
+    try std.testing.expect(at > 0);
+    try std.testing.expect(reported > 0);
 }
 
 test "an early-ended work names each file it changed once, without reads or failed changes" {
