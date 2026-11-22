@@ -3,6 +3,7 @@ const testing_allocator = @import("../shared/testing_allocator.zig");
 const image_data = @import("../images/image_data.zig");
 const io_mod = @import("../shared/io.zig");
 const text_utils = @import("../shared/text_utils.zig");
+const tool_result_cut_marker = @import("../shared/tool_result_cut_marker.zig");
 const types = @import("../shared/types.zig");
 const artifact_digest = @import("artifact_digest.zig");
 const session_child_store = @import("session_child_store.zig");
@@ -640,7 +641,7 @@ pub fn deleteManaged(
 
 fn cappedInlineOutput(alloc: Allocator, tool_name: []const u8, text: []const u8, max_bytes: usize) ![]u8 {
     const marker = try alloc.print(
-        "\n... [tool result truncated for {s}: original {d} bytes; cap is {d} bytes]\n",
+        tool_result_cut_marker.cut_marker_format,
         .{ tool_name, text.len, max_bytes },
     );
     defer alloc.free(marker);
@@ -1061,6 +1062,16 @@ test "saved preparation externalizes small results" {
     defer alloc.free(stored);
     try std.testing.expect(std.mem.find(u8, stored, "total_bytes=\"4\"") != null);
     try std.testing.expect(std.mem.find(u8, stored, "\ndone\n") != null);
+}
+
+test "a capped inline result ends with the cut marker written from its shared words" {
+    const alloc = std.testing.allocator;
+    const text = text_utils.repeat("x", 300);
+    const capped = try cappedInlineOutput(alloc, "grep_files", text, 128);
+    defer alloc.free(capped);
+    const marker = tool_result_cut_marker.cut_marker_start ++ "grep_files: original 300 bytes; cap is 128" ++ tool_result_cut_marker.cut_marker_end;
+    try std.testing.expect(std.mem.endsWith(u8, capped, marker));
+    try std.testing.expect(capped.len <= 128);
 }
 
 test "inline cap and stored preview keep complete codepoints" {
