@@ -1071,6 +1071,68 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
     TIMEOUT,
   );
 
+  // The settle hold stops fx after it has told main that the subagent's work
+  // ended, and before it settles the subagent. Main's next message waits for
+  // the subagent in that window. The user's close drops that message after
+  // the subagent's last report, so main must still get the notice.
+  test(
+    "the user's close of a subagent whose report is already out still tells main what it dropped",
+    async () => {
+      const dir = realpathSync(mkdtempSync(join(tmpdir(), "fx-close-gap-")));
+      const settleHeld = join(dir, "settle-held");
+      const settleRelease = join(dir, "settle-release");
+      let childCalls = 0;
+      let moreResult = "";
+      try {
+        await withFx(async (body) => {
+          if (!isMainRequest(body)) {
+            childCalls += 1;
+            return text("child_answer", "CLOSEGAP_CHILD_DONE");
+          }
+          if (body.includes("The user closed it, and 1 of your messages waiting for it were dropped.")) {
+            return text("main_saw", "CLOSEGAP_MAIN_SAW_NOTICE");
+          }
+          if (!body.includes('"main_sub"')) {
+            return toolCall("main_sub", "subagent", { request: { action: "message", agent: "worker", message: "CLOSEGAP_TASK" } });
+          }
+          if (!body.includes('"main_more"')) {
+            // The worker's work has ended and its report is out; fx is held before it settles.
+            await until("the held end", () => existsSync(`${settleHeld}.1`), 30_000);
+            return toolCall("main_more", "subagent", { request: { action: "message", agent: "worker", message: "CLOSEGAP_MORE" } });
+          }
+          moreResult ||= toolResultText(body, "main_more");
+          return text("main_wait", "CLOSEGAP_MAIN_WAITING");
+        }, async (session) => {
+          await session.sendText("SWITCH_USER");
+          await session.waitForText("CLOSEGAP_MAIN_WAITING", 60_000);
+          expect(moreResult).toContain("is busy");
+          // Down opens the agent list on main's row, and the next Down selects worker.
+          await session.sendKeys("Down");
+          await session.waitForText("esc back", 10_000);
+          await session.sendKeys("Down");
+          await session.waitForText("enter switch     delete close     esc back", 10_000);
+          await session.sendKeys("DC");
+          await session.waitForText("press delete again to close this subagent", 10_000);
+          await session.sendKeys("DC");
+          await session.waitForPane((pane) => !subagentRow("worker").test(pane) && pane.includes("esc back"), 15_000);
+          await session.sendKeys("Escape");
+          await session.waitForPane((pane) => !pane.includes("esc back"), 10_000);
+          writeFileSync(settleRelease, "");
+          await session.waitForText("CLOSEGAP_MAIN_SAW_NOTICE", 30_000);
+          // The waiting message never ran: the worker made its one request.
+          expect(childCalls).toBe(1);
+        }, () => {}, false, {
+          FX_TEST_SUBAGENT_SETTLE_HELD: settleHeld,
+          FX_TEST_SUBAGENT_SETTLE_RELEASE: settleRelease,
+        });
+      } finally {
+        writeFileSync(settleRelease, "");
+        rmSync(dir, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
   // Main starts subagent `worker`, whose first turn the start hold
   // (src/core/subagent/start_test_controls.zig) stops before its worker
   // attaches, then messages it SWITCH_START_NOTE, which waits for that turn
