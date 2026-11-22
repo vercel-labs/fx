@@ -1981,6 +1981,21 @@ class LeaderSocketClient {
     this.socket.destroy();
   }
 
+  /// Whether the socket has closed or failed.
+  get isClosed(): boolean {
+    return this.closed;
+  }
+
+  /// Answers a request the leader sent, such as session/request_permission.
+  respond(id: number | string, result: object): void {
+    this.socket.write(`${JSON.stringify({ jsonrpc: "2.0", id, result })}\n`);
+  }
+
+  /// Stops reading the socket, so the leader's writes to it wait until they time out.
+  pauseReads(): void {
+    this.socket.pause();
+  }
+
   private async until(predicate: () => boolean, label: string, timeoutMs: number): Promise<void> {
     const deadline = Date.now() + timeoutMs;
     while (!predicate()) {
@@ -15701,6 +15716,443 @@ describe("acp: model-independent", () => {
         follower?.close();
         await owner?.close();
         gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  /// The permission requests a client has read, in order.
+  function permissionRequests(client: AcpClient): any[] {
+    return parsedLines(client).filter((message) => message.method === "session/request_permission");
+  }
+
+  /// Whether a message is the permission request for tool call `toolCallId`.
+  function permissionFor(toolCallId: string): (message: any) => boolean {
+    return (message) => message.method === "session/request_permission" && message.params?.toolCall?.toolCallId === toolCallId;
+  }
+
+  test(
+    "the opener's session/close is answered and leaves the session open for a follower, whose next prompt runs",
+    async () => {
+      const root = createShortIsolatedRoot("fx-acp-stays-open-close-");
+      const gateway = startFakeGateway([finalText("TURN_ONE"), finalText("FOLLOWER_REPLY")]);
+      let owner: AcpClient | undefined;
+      let follower: LeaderSocketClient | undefined;
+      try {
+        const started = await ownerWithSession(root, gateway);
+        owner = started.owner;
+        follower = await followSession(started.socket, started.sessionId, root);
+
+        const closed = (await owner.request("session/close", { sessionId: started.sessionId }, 20)) as any;
+        expect(closed.error).toBeUndefined();
+        expect(closed.result).toEqual({});
+
+        const answer = await follower.request("session/prompt", {
+          sessionId: started.sessionId,
+          prompt: [{ type: "text", text: "FOLLOWER_AFTER_CLOSE" }],
+        });
+        expect(answer.answer.error).toBeUndefined();
+        expect(answer.answer.result.stopReason).toBe("end_turn");
+        expect(gateway.requests.some((request) => request.body.includes("FOLLOWER_AFTER_CLOSE"))).toBe(true);
+        await follower.waitForMessage(agentChunk("FOLLOWER_REPLY"), "the follower's reply");
+        expect(owner.stderr).toBe("");
+      } finally {
+        follower?.close();
+        await owner?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "the opener's input ending without keep leaves fx acp running for a follower, whose prompt runs, and fx acp exits 0 when that follower leaves",
+    async () => {
+      const root = createShortIsolatedRoot("fx-acp-stays-open-stdin-");
+      const gateway = startFakeGateway([finalText("TURN_ONE"), finalText("FOLLOWER_REPLY")]);
+      let owner: AcpClient | undefined;
+      let follower: LeaderSocketClient | undefined;
+      try {
+        const started = await ownerWithSession(root, gateway);
+        owner = started.owner;
+        follower = await followSession(started.socket, started.sessionId, root);
+
+        owner.endStdin();
+        const answer = await follower.request("session/prompt", {
+          sessionId: started.sessionId,
+          prompt: [{ type: "text", text: "FOLLOWER_AFTER_OPENER_LEFT" }],
+        });
+        expect(answer.answer.error).toBeUndefined();
+        expect(answer.answer.result.stopReason).toBe("end_turn");
+        expect(owner.isRunning()).toBe(true);
+
+        follower.close();
+        expect(await owner.waitForExit(TIMEOUT)).toBe(0);
+        expect(owner.stderr).toBe("");
+      } finally {
+        follower?.close();
+        await owner?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "a turn the opener keeps after its input ends finishes for a follower, and is saved as completed",
+    async () => {
+      const root = createShortIsolatedRoot("fx-acp-stays-open-keep-");
+      const heldReply = deferred<Response>();
+      const gateway = startFakeGateway([finalText("TURN_ONE"), () => heldReply.promise]);
+      const gatewayAfter = startFakeGateway([]);
+      let owner: AcpClient | undefined;
+      let follower: LeaderSocketClient | undefined;
+      let reloaded: AcpClient | undefined;
+      try {
+        owner = await AcpClient.create({ cwd: root.workspace, env: leaderEnv(root, gateway) });
+        const sessionId = await startSessionListing(owner, {
+          _meta: { ...Object.fromEntries(FX_EXTENSIONS.map((name) => [name, {}])), "sh.fx/keepTurnOnDisconnect": {} },
+        });
+        expect((await runPrompt(owner, "TURN_ONE_PROMPT", TIMEOUT)).promptResult.result.stopReason).toBe("end_turn");
+        const record = JSON.parse(sessionLock(root.home, sessionId)) as { socket: string };
+        follower = await followSession(record.socket, sessionId, root);
+
+        sendPrompt(owner, 10, "KEPT_RUNNING_PROMPT");
+        await waitForCondition("the held model reply", () => gateway.requests.length === 2, TIMEOUT);
+        owner.endStdin();
+        heldReply.resolve(finalText("KEPT_TURN_END"));
+        await follower.waitForMessage(agentChunk("KEPT_TURN_END"), "the kept turn's last text");
+        follower.close();
+        expect(await owner.waitForExit(TIMEOUT)).toBe(0);
+        expect(owner.stderr).toBe("");
+
+        reloaded = await AcpClient.create({ cwd: root.workspace, env: leaderEnv(root, gatewayAfter) });
+        await reloaded.request("initialize", { protocolVersion: 1 }, 1);
+        const loaded = (await reloaded.request("session/load", { sessionId, cwd: root.workspace, mcpServers: [] }, 2)) as any;
+        expect(loaded.error).toBeUndefined();
+        const replayed = agentMessageText(parsedLines(reloaded));
+        expect(replayed).toContain("KEPT_TURN_END");
+        for (const notice of ["cancelled", "interrupted", "fx stopped before this turn finished"]) {
+          expect(replayed).not.toContain(notice);
+        }
+      } finally {
+        follower?.close();
+        await owner?.close();
+        await reloaded?.close();
+        heldReply.resolve(finalText("UNUSED"));
+        gateway.stop();
+        gatewayAfter.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "a permission request still open when the opener leaves goes to the follower, which answers it, and the turn goes on",
+    async () => {
+      const root = createShortIsolatedRoot("fx-acp-stays-open-perm-");
+      const gateway = startFakeGateway([
+        finalText("TURN_ONE"),
+        fakeGatewayToolCall("perm_1", "write_file", { path: "perm_target.txt", content: "PERM_WRITTEN\n" }),
+        finalText("PERM_DONE"),
+      ]);
+      let owner: AcpClient | undefined;
+      let follower: LeaderSocketClient | undefined;
+      try {
+        const started = await ownerWithSession(root, gateway);
+        owner = started.owner;
+        const mode = (await owner.request("session/set_mode", { sessionId: started.sessionId, modeId: "ask" }, 21)) as any;
+        expect(mode.error).toBeUndefined();
+        follower = await followSession(started.socket, started.sessionId, root);
+
+        // The owner's own reads answer permission requests, so this test never reads the owner.
+        sendPrompt(owner, 10, "WRITE_PROMPT");
+        await waitForCondition("the opener's permission request", () => permissionRequests(owner!).length === 1, TIMEOUT);
+        owner.endStdin();
+
+        await follower.waitForMessage(permissionFor("perm_1"), "the permission request for perm_1");
+        const asked = follower.received.find(permissionFor("perm_1"));
+        follower.respond(asked.id, { outcome: { outcome: "selected", optionId: "allow_once" } });
+        await follower.waitForMessage(agentChunk("PERM_DONE"), "the turn's last text");
+        expect(readFileSync(join(root.workspace, "perm_target.txt"), "utf8")).toBe("PERM_WRITTEN\n");
+        expect(follower.received.filter(permissionFor("perm_1"))).toHaveLength(1);
+      } finally {
+        follower?.close();
+        await owner?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "a prompt the opener queued behind its turn never runs once the opener leaves while a follower remains",
+    async () => {
+      const root = createShortIsolatedRoot("fx-acp-stays-open-queue-");
+      const heldReply = deferred<Response>();
+      // Two spare replies let a wrongly run queued prompt finish, so the check fails on its request, not on a hang.
+      const gateway = startFakeGateway([
+        finalText("TURN_ONE"),
+        () => heldReply.promise,
+        finalText("NO_QUEUED_REPLY"),
+        finalText("FOLLOWER_AFTER_LEAVE"),
+      ]);
+      let owner: AcpClient | undefined;
+      let follower: LeaderSocketClient | undefined;
+      try {
+        const started = await ownerWithSession(root, gateway);
+        owner = started.owner;
+        follower = await followSession(started.socket, started.sessionId, root);
+
+        sendPrompt(owner, 10, "RUNNING_PROMPT");
+        await waitForCondition("the held model reply", () => gateway.requests.length === 2, TIMEOUT);
+        owner.send({
+          jsonrpc: "2.0",
+          id: 11,
+          method: "session/prompt",
+          params: { sessionId: started.sessionId, prompt: [{ type: "text", text: "QUEUED_PROMPT_TEXT" }], _meta: { "sh.fx/delivery": "queue" } },
+        });
+        // A request the owner sends after the queued prompt is answered once the queue has taken it.
+        const barrier = (await owner.request("session/set_mode", { sessionId: started.sessionId, modeId: "auto" }, 12)) as any;
+        expect(barrier.error).toBeUndefined();
+
+        owner.endStdin();
+        heldReply.resolve(finalText("RUNNING_DONE"));
+        // The follower's own queued prompt runs after the running turn, behind any prompt the opener left in the queue.
+        const after = await follower.request("session/prompt", {
+          sessionId: started.sessionId,
+          prompt: [{ type: "text", text: "FOLLOWER_AFTER_LEAVE" }],
+          _meta: { "sh.fx/delivery": "queue" },
+        });
+        expect(after.answer.error).toBeUndefined();
+        expect(after.answer.result.stopReason).toBe("end_turn");
+        expect(gateway.requests.some((request) => request.body.includes("QUEUED_PROMPT_TEXT"))).toBe(false);
+        expect(gateway.requests).toHaveLength(3);
+        expect(gateway.requests[2]!.body.includes("FOLLOWER_AFTER_LEAVE")).toBe(true);
+      } finally {
+        follower?.close();
+        await owner?.close();
+        heldReply.resolve(finalText("UNUSED"));
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "after the opener leaves, the first follower's session/set_mode is accepted and a later follower's is refused",
+    async () => {
+      const root = createShortIsolatedRoot("fx-acp-stays-open-main-mode-");
+      const gateway = startFakeGateway([finalText("TURN_ONE")]);
+      let owner: AcpClient | undefined;
+      let first: LeaderSocketClient | undefined;
+      let second: LeaderSocketClient | undefined;
+      try {
+        const started = await ownerWithSession(root, gateway);
+        owner = started.owner;
+        first = await followSession(started.socket, started.sessionId, root);
+        second = await followSession(started.socket, started.sessionId, root);
+
+        owner.endStdin();
+        const accepted = await first.request("session/set_mode", { sessionId: started.sessionId, modeId: "plan" });
+        expect(accepted.answer.error).toBeUndefined();
+        const refused = await second.request("session/set_mode", { sessionId: started.sessionId, modeId: "plan" });
+        expect(refused.answer.error).toEqual({
+          code: -32600,
+          message: "This session is open on another connection; only that connection can change it.",
+        });
+      } finally {
+        first?.close();
+        second?.close();
+        await owner?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "with two followers, the first to join gets the permission request still open when the opener leaves, and the second gets none",
+    async () => {
+      const root = createShortIsolatedRoot("fx-acp-stays-open-two-");
+      const gateway = startFakeGateway([
+        finalText("TURN_ONE"),
+        fakeGatewayToolCall("perm_2", "write_file", { path: "two_target.txt", content: "TWO_WRITTEN\n" }),
+        finalText("TWO_DONE"),
+      ]);
+      let owner: AcpClient | undefined;
+      let first: LeaderSocketClient | undefined;
+      let second: LeaderSocketClient | undefined;
+      try {
+        const started = await ownerWithSession(root, gateway);
+        owner = started.owner;
+        const mode = (await owner.request("session/set_mode", { sessionId: started.sessionId, modeId: "ask" }, 21)) as any;
+        expect(mode.error).toBeUndefined();
+        first = await followSession(started.socket, started.sessionId, root);
+        second = await followSession(started.socket, started.sessionId, root);
+
+        sendPrompt(owner, 10, "WRITE_PROMPT");
+        await waitForCondition("the opener's permission request", () => permissionRequests(owner!).length === 1, TIMEOUT);
+        owner.endStdin();
+
+        await first.waitForMessage(permissionFor("perm_2"), "the permission request for perm_2");
+        const asked = first.received.find(permissionFor("perm_2"));
+        first.respond(asked.id, { outcome: { outcome: "selected", optionId: "allow_once" } });
+        await first.waitForMessage(agentChunk("TWO_DONE"), "the turn's last text");
+        expect(second.received.some((message) => message.method === "session/request_permission")).toBe(false);
+        expect(readFileSync(join(root.workspace, "two_target.txt"), "utf8")).toBe("TWO_WRITTEN\n");
+      } finally {
+        first?.close();
+        second?.close();
+        await owner?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "the last client's session/close during a running turn, after stdin ended, cancels the turn and fx acp exits 0",
+    async () => {
+      const root = createShortIsolatedRoot("fx-acp-stays-open-last-close-");
+      const ownerLeft = deferred<void>();
+      const heldReply = deferred<Response>();
+      const encoder = new TextEncoder();
+      const textEvent = (delta: string) =>
+        encoder.encode(`data: ${JSON.stringify({ type: "text-delta", id: "held_text", delta })}\n\n`);
+      // The reply streams text, then waits. It streams more text only after the opener's input has ended,
+      // and it finishes only when the test releases it, so the turn is still running when the follower closes.
+      const streamed = new Response(
+        new ReadableStream<Uint8Array>({
+          async start(controller) {
+            controller.enqueue(textEvent("BEFORE_OWNER_LEFT"));
+            await ownerLeft.promise;
+            controller.enqueue(textEvent("AFTER_OWNER_LEFT"));
+            await heldReply.promise;
+            controller.close();
+          },
+        }),
+        { headers: { "content-type": "text/event-stream" } },
+      );
+      const gateway = startFakeGateway([finalText("TURN_ONE"), () => streamed]);
+      let owner: AcpClient | undefined;
+      let follower: LeaderSocketClient | undefined;
+      try {
+        const started = await ownerWithSession(root, gateway);
+        owner = started.owner;
+        follower = await followSession(started.socket, started.sessionId, root);
+
+        sendPrompt(owner, 10, "RUNNING_PROMPT");
+        await waitForCondition("the held model reply", () => gateway.requests.length === 2, TIMEOUT);
+        await follower.waitForMessage(agentChunk("BEFORE_OWNER_LEFT"), "the running text before the opener left");
+        owner.endStdin();
+        ownerLeft.resolve(undefined);
+        // The running turn goes on after the opener left: its later text reaches the follower.
+        await follower.waitForMessage(agentChunk("AFTER_OWNER_LEFT"), "the running text after the opener left");
+
+        const closed = await follower.request("session/close", { sessionId: started.sessionId });
+        expect(closed.answer.error).toBeUndefined();
+        expect(closed.answer.result).toEqual({});
+        // The reply stays held, so fx can exit only once the close has cancelled the turn.
+        expect(await owner.waitForExit(TIMEOUT)).toBe(0);
+        expect(owner.stderr).toBe("");
+        expect(gateway.requests).toHaveLength(2);
+      } finally {
+        follower?.close();
+        await owner?.close();
+        heldReply.resolve(finalText("UNUSED"));
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "a main client that stops reading its socket is treated as gone, and the next client gets the turn's next permission request",
+    async () => {
+      const root = createShortIsolatedRoot("fx-acp-stays-open-stall-");
+      const heldReply = deferred<Response>();
+      // 4 MiB of text fills a socket that is not read, then the turn asks for a permission.
+      const stall = fakeGatewaySse([
+        ...Array.from({ length: 64 }, () => ({ type: "text-delta", id: "stall_text", delta: "S".repeat(64 * 1024) })),
+        { type: "tool-call", toolCallId: "perm_9", toolName: "write_file", input: { path: "stall_target.txt", content: "STALL_WRITTEN\n" } },
+        { type: "finish", finishReason: { unified: "tool-calls", raw: "tool-calls" } },
+      ]);
+      const gateway = startFakeGateway([finalText("TURN_ONE"), () => heldReply.promise, finalText("STALL_DONE")]);
+      let owner: AcpClient | undefined;
+      let stalled: LeaderSocketClient | undefined;
+      let next: LeaderSocketClient | undefined;
+      try {
+        const started = await ownerWithSession(root, gateway);
+        owner = started.owner;
+        const mode = (await owner.request("session/set_mode", { sessionId: started.sessionId, modeId: "ask" }, 21)) as any;
+        expect(mode.error).toBeUndefined();
+        stalled = await followSession(started.socket, started.sessionId, root);
+        next = await followSession(started.socket, started.sessionId, root);
+
+        sendPrompt(owner, 10, "STALL_PROMPT");
+        await waitForCondition("the held model reply", () => gateway.requests.length === 2, TIMEOUT);
+        owner.endStdin();
+        // The stalled client is the main now. It reads nothing from here on.
+        stalled.pauseReads();
+        heldReply.resolve(stall);
+
+        await next.waitForMessage(permissionFor("perm_9"), "the permission request for perm_9");
+        const asked = next.received.find(permissionFor("perm_9"));
+        next.respond(asked.id, { outcome: { outcome: "selected", optionId: "allow_once" } });
+        await next.waitForMessage(agentChunk("STALL_DONE"), "the turn's last text");
+        expect(readFileSync(join(root.workspace, "stall_target.txt"), "utf8")).toBe("STALL_WRITTEN\n");
+      } finally {
+        stalled?.close();
+        next?.close();
+        await owner?.close();
+        heldReply.resolve(finalText("UNUSED"));
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "after fx acp is killed with a follower attached, the follower's socket closes and a new fx acp opens the session",
+    async () => {
+      const root = createShortIsolatedRoot("fx-acp-stays-open-crash-");
+      const gateway = startFakeGateway([finalText("TURN_ONE")]);
+      const gatewayAfter = startFakeGateway([]);
+      let owner: AcpClient | undefined;
+      let follower: LeaderSocketClient | undefined;
+      let second: AcpClient | undefined;
+      try {
+        const started = await ownerWithSession(root, gateway);
+        owner = started.owner;
+        follower = await followSession(started.socket, started.sessionId, root);
+
+        if (owner.pid === undefined) throw new Error("fx acp has no pid");
+        process.kill(owner.pid, "SIGKILL");
+        await waitForCondition("the follower's socket to close", () => follower!.isClosed, TIMEOUT);
+
+        second = await AcpClient.create({ cwd: root.workspace, env: leaderEnv(root, gatewayAfter) });
+        await second.request("initialize", { protocolVersion: 1 }, 1);
+        const loaded = (await second.request("session/load", { sessionId: started.sessionId, cwd: root.workspace, mcpServers: [] }, 2)) as any;
+        expect(loaded.error).toBeUndefined();
+        expect(JSON.parse(sessionLock(root.home, started.sessionId)).pid).toBe(second.pid);
+        expect(second.stderr).toBe("");
+      } finally {
+        follower?.close();
+        await second?.close();
+        await owner?.close();
+        gateway.stop();
+        gatewayAfter.stop();
         rmSync(root.root, { recursive: true, force: true });
       }
     },

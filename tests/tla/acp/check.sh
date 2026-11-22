@@ -57,6 +57,16 @@
 # six plans and checked against AcpJoin. Its driver's --ci run requires every plan
 # ACCEPTED on the built binary; --model today is the control, REJECTED throughout.
 #
+# AcpSessionStaysOpen: one session with three clients, O (the stdio connection
+# and the opener) and two leader-socket followers, through join, close, input
+# end, prompts, cancel, permission requests, mode changes, a crash, and the
+# process exit. Design A hands the owner pointer to the oldest follower, and
+# design B keeps process-owned members in join order. The current config is the
+# code at 3710141de6, where the owner's leave closes the session for every
+# client. Each current-* config breaks one rule, each mutant-* config plants one
+# bug that its named invariant must catch, and the simulate-* configs run random
+# behaviors. Ideal has no crash and no input end.
+#
 # The planted bugs and the runs of the real `fx acp` binary are in
 # ../drivers/acp/:
 #   bun ../drivers/acp/permission_modes/check-spec.ts
@@ -179,6 +189,27 @@ MCAcpSessionReaders MCAcpSessionReaders -
 MCAcpSessionReaders AcpSessionReadersToday AtMostOneWorker
 MCAcpSharedInput MCAcpSharedInput -
 MCAcpSharedInput AcpSharedInputToday temporal
+AcpSessionStaysOpen current-stays-open StaysOpenWhileMember
+AcpSessionStaysOpen current-one-main OneMainInJoinOrder
+AcpSessionStaysOpen current-denied DeniedOnlyWhenNoMember
+AcpSessionStaysOpen design-a -
+AcpSessionStaysOpen design-b -
+AcpSessionStaysOpen mutant-a-captured NoDanglingClient
+AcpSessionStaysOpen mutant-a-newest OneMainInJoinOrder
+AcpSessionStaysOpen mutant-a-free NoDanglingClient
+AcpSessionStaysOpen mutant-a-close-cancels-others LeaveAffectsOnlyOwnInput
+AcpSessionStaysOpen mutant-b-free NoDanglingClient
+AcpSessionStaysOpen mutant-b-free-freed SessionFreedWhenIdle
+AcpSessionStaysOpen mutant-b-exit-early NoExitWhileServing
+AcpSessionStaysOpen mutant-b-join-withdraws LastKeepQueueRuns
+AcpSessionStaysOpen mutant-close-cancels-others LeaveAffectsOnlyOwnInput
+AcpSessionStaysOpen mutant-leave-keeps-queue LeftInputNeverRuns
+AcpSessionStaysOpen mutant-mode-any MainChangesModeOnly
+AcpSessionStaysOpen mutant-last-no-cancel LastLeaverRule
+AcpSessionStaysOpen simulate-ideal-a simulate -simulate num=20000 -depth 20 -seed 1
+AcpSessionStaysOpen simulate-nonideal-a simulate -simulate num=20000 -depth 20 -seed 1
+AcpSessionStaysOpen simulate-ideal-b simulate -simulate num=20000 -depth 20 -seed 1
+AcpSessionStaysOpen simulate-nonideal-b simulate -simulate num=20000 -depth 20 -seed 1
 EOF
 
 if [ "$ci" = true ]; then
