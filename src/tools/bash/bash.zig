@@ -286,13 +286,17 @@ fn finish(
 ) tool_dispatch.DispatchError!tool_dispatch.ToolResult {
     const budget = @max(ctx.max_tool_result_bytes, min_result_bytes);
     const body = formatResult(ctx.allocator, prepared.snapshot, budget) catch |err| {
-        runtime.cancelDelivery(prepared.snapshot.execution_id, prepared.reservation_id) catch {};
+        runtime.cancelDelivery(prepared.snapshot.execution_id, prepared.reservation_id) catch |cancel_err| {
+            debug_trace.logf("bash", "delivery cancel failed after a format error err={s}", .{@errorName(cancel_err)});
+        };
         if (err == error.OutOfMemory) return error.OutOfMemory;
         return failureText(ctx, "bash result is unavailable");
     };
     handoffPreparedDelivery(ctx, runtime, prepared.reservation_id) catch {
         ctx.allocator.free(body);
-        runtime.cancelDelivery(prepared.snapshot.execution_id, prepared.reservation_id) catch {};
+        runtime.cancelDelivery(prepared.snapshot.execution_id, prepared.reservation_id) catch |err| {
+            debug_trace.logf("bash", "delivery cancel failed after a commit failure err={s}", .{@errorName(err)});
+        };
         return failureText(ctx, "bash result commit failed");
     };
     return if (snapshotFailed(prepared.snapshot))

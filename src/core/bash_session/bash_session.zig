@@ -139,6 +139,7 @@ fn writeScript(io: std.Io, dir: []const u8, script: []const u8) !void {
 /// Deletes `dir` and everything in it. A failed delete is ignored because the
 /// caller is already failing or ending, and nothing here can report it.
 fn removeTree(io: std.Io, dir: []const u8) void {
+    // Safe to ignore: the folder is 0o700 and no program reads it after the session ends.
     std.Io.Dir.cwd().deleteTree(io, dir) catch {};
 }
 
