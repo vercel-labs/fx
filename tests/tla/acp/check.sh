@@ -38,6 +38,21 @@
 # when the copy dropped part of the turn, and the answer; a resume gives the
 # answer and the updates after it; a follower changes nothing. Its Today config
 # shows fx before the join, where a second connection's load is refused.
+# AcpSessionReaders: the two readers of one session, the owner's and a follower's:
+# a start claims the prompt slot and waits while a taken turn is joined, a reap
+# takes a finished turn out and joins it, and a close refuses new starts, unregisters,
+# waits for the uses, and frees. Its Today config shows
+# fx today, where two starts can both see an empty slot. The design (Rules TRUE)
+# is not landed yet, and the model says so at its top.
+# AcpSharedInput: two clients on one session, the owner and a follower, and the
+# input each one sends: prompts with delivery none, steer or queue, cancels,
+# and a follower's load, close, and disconnect. One order serves all clients,
+# each answer goes to its sender at most once, a prompt's chunk goes to the
+# other clients, a leaving follower's waiting input is withdrawn, and a running
+# turn keeps the system prompt it started with, a new turn uses the current one,
+# and no cancel from a client that may send one is ignored. Its Today config shows fx before
+# the follower's input, where a follower only watches, and it must violate
+# FollowerPromptRuns.
 # AcpJoinTrace: the real fx acp, with followers on its leader socket, run through
 # six plans and checked against AcpJoin. Its driver's --ci run requires every plan
 # ACCEPTED on the built binary; --model today is the control, REJECTED throughout.
@@ -71,6 +86,9 @@
 #   bun ../drivers/acp/shared_session/check-spec.ts
 #   bun ../drivers/acp/subagents/check-spec.ts
 #   bun ../drivers/acp/fork_rewind/check-spec.ts
+#   bun ../drivers/acp/session_readers/check-spec.ts
+#   bun ../drivers/acp/shared_input/check-spec.ts
+#   bun ../drivers/acp/shared_input/driver.ts   # the real fx acp with a follower's input, against AcpSharedInputTrace
 #
 # With --ci it also runs every ../drivers/acp/*/driver.ts against
 # zig-out/bin/fx, as CI does; the planted bugs stay local, since they measure
@@ -157,6 +175,10 @@ MCAcpLeader MCAcpLeader -
 MCAcpLeader AcpLeaderToday temporal
 MCAcpJoin MCAcpJoin -
 MCAcpJoin AcpJoinToday temporal
+MCAcpSessionReaders MCAcpSessionReaders -
+MCAcpSessionReaders AcpSessionReadersToday AtMostOneWorker
+MCAcpSharedInput MCAcpSharedInput -
+MCAcpSharedInput AcpSharedInputToday temporal
 EOF
 
 if [ "$ci" = true ]; then

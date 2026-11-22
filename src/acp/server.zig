@@ -59,6 +59,7 @@ const host_attachments = @import("../core/hosts/host_attachments.zig");
 const image_attachments = @import("../core/images/image_attachments.zig");
 const libfx_steering = @import("libfx_steering.zig");
 const prompt_line = @import("prompt_line.zig");
+const connection = @import("connection.zig");
 const journal_events = @import("../core/agent/runtime/journal.zig");
 const libfx_journal = @import("libfx_journal.zig");
 const sh_fx = @import("sh_fx.zig");
@@ -375,6 +376,10 @@ pub const ActiveSessionState = struct {
     /// The steers for the next turn and the queued prompts, which wait for
     /// the running turn to end.
     waiting_prompts: prompt_line.Line = .{},
+    /// Uses of this session that `SharedSessions.retain` took. A close waits for
+    /// them to end. Guarded by the shared table's `mutex`.
+    uses: usize = 0,
+    uses_done: std.Io.Condition = .init,
     /// Set when the host passed a journal; every state change is sent to it.
     journal: ?libfx_journal.Journal = null,
     /// Images the host staged from its store for the journal it opens next.
@@ -413,15 +418,18 @@ const ActivePrompt = struct {
     session: *ActiveSessionState,
     alloc: Allocator,
     msg: jsonrpc.Message,
+    /// The connection that sent the prompt this turn runs; its answer goes there. A turn
+    /// of steers has no prompt of its own: each steer's answer goes to that steer's sender.
+    from: ConnectionId = no_connection,
     /// Mode and permission policy captured when the prompt was dispatched.
     /// Mid-turn mode changes apply to the next prompt, never the running one.
     mode: []const u8,
     permission_mode: types.PermissionMode,
-    /// The request ids of the steers that started the running turn together,
-    /// each answered with `next_turn`. Empty for a turn a prompt started.
+    /// The steers that started the running turn together, each with its sender,
+    /// answered with `next_turn`. Empty for a turn a prompt started.
     /// Owned by `alloc`. The worker replaces `msg` and these between turns
     /// while it holds the session's `waiting_prompts` mutex.
-    group_ids: []jsonrpc.RequestId = &.{},
+    group_ids: []libfx_steering.Sender = &.{},
     /// The usage of every turn the prompt ran, its own and each report turn
     /// after it. The response reports it. Written by the prompt's own thread.
     usage: types.Usage = .{},
@@ -436,21 +444,21 @@ const ActivePrompt = struct {
 /// `run` makes one table for the process.
 ///
 /// Lock order: `mutex`, then a session's `session_write_mutex`, then its
-/// `audience_mutex`, then a writer's lock. `destroySession` takes `mutex` by
-/// itself and releases it before it takes a session's `audience_mutex`.
+/// `audience_mutex`, then a writer's lock. `startClose` takes `mutex` for each
+/// of its steps, and never holds it while it takes a session's `audience_mutex`.
 pub const SharedSessions = struct {
     mutex: std.Io.Mutex = .init,
     sessions: std.ArrayList(*ActiveSessionState) = .empty,
 
-    /// Adds `session`. `unregister` removes it when the session is destroyed.
+    /// Adds `session`. `unregister` removes it when the session starts to close.
     pub fn register(self: *SharedSessions, alloc: Allocator, session: *ActiveSessionState) Allocator.Error!void {
         self.mutex.lockUncancelable(io_mod.getIo());
         defer self.mutex.unlock(io_mod.getIo());
         try self.sessions.append(alloc, session);
     }
 
-    /// Removes `session` if it is listed. `destroySession` calls this before the
-    /// session is freed, so no connection can find a freed session.
+    /// Removes `session` if it is listed. `startClose` calls this before the close
+    /// waits for the session's uses, so no connection can take a new use.
     pub fn unregister(self: *SharedSessions, session: *ActiveSessionState) void {
         self.mutex.lockUncancelable(io_mod.getIo());
         defer self.mutex.unlock(io_mod.getIo());
@@ -469,6 +477,40 @@ pub const SharedSessions = struct {
         return null;
     }
 
+    /// Takes a use of the session that `session_id` names, when the table lists it.
+    /// The use keeps the session from being freed until `release`. A close takes the
+    /// session out of the table first, so no use starts after it, and then waits for
+    /// the uses that are held (AcpSessionReaders Retains). Null when no listed session
+    /// has that id.
+    fn retain(self: *SharedSessions, session_id: []const u8) ?*ActiveSessionState {
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        const session = self.findLocked(session_id) orelse return null;
+        session.uses += 1;
+        return session;
+    }
+
+    /// Ends a use that `retain` took. The release that ends the last use wakes the
+    /// close that waits for it (AcpSessionReaders Release).
+    fn release(self: *SharedSessions, session: *ActiveSessionState) void {
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        std.debug.assert(session.uses > 0);
+        session.uses -= 1;
+        if (session.uses == 0) session.uses_done.broadcast(io_mod.getIo());
+    }
+
+    /// Waits until no use of `session` is held (AcpSessionReaders CloseWait). The
+    /// caller has taken the session out of the table, so no new use can start.
+    fn waitNoUses(self: *SharedSessions, session: *ActiveSessionState) void {
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        while (session.uses > 0) {
+            prompt_test_controls.noteUsesWaiting();
+            session.uses_done.waitUncancelable(io_mod.getIo(), &self.mutex);
+        }
+    }
+
     /// Frees the table. The stdio entry closes its sessions before it calls
     /// this, so a session still listed here is traced, not silently dropped.
     pub fn deinit(self: *SharedSessions, alloc: Allocator) void {
@@ -484,6 +526,8 @@ pub const ServerState = struct {
     alloc: Allocator,
     cfg: Config,
     writer: jsonrpc.Writer,
+    /// This connection's id, which its waiting input carries (see `ConnectionId`).
+    connection_id: ConnectionId = no_connection,
     initialized: bool = false,
     /// Selects fx's terminal or embedded base prompt for this connection.
     terminal_ui: bool = true,
@@ -604,7 +648,7 @@ pub const ServerState = struct {
         // before anything it owns is freed: no session may keep a pointer to it.
         if (comptime follow_supported) {
             for (self.following.items) |session_id| {
-                detachFollower(self, session_id, "connection_end");
+                detachFollower(self, session_id, .left);
                 self.alloc.free(session_id);
             }
         }
@@ -1174,6 +1218,8 @@ pub const Audience = struct {
             if (index < self.next_follower) self.next_follower -= 1;
             break;
         }
+        // The member can no longer hear the session, so its waiting input leaves with it.
+        withdrawFollowerInput(member, self.session, .left);
         switch (reason) {
             .write_failed => |err| debug_trace.logf(
                 "acp",
@@ -1219,6 +1265,9 @@ pub const RunningCopy = struct {
         notices,
         /// A member takes `with` when `ServerState.sendsSteerInput` holds.
         steer_input,
+        /// A member takes `with` unless it is `sender`, the connection that sent the
+        /// prompt, which sees its own prompt in its own client.
+        except_sender: ConnectionId,
     };
 
     pub const Entry = struct {
@@ -1343,6 +1392,7 @@ fn memberTakes(member: *const ServerState, need: RunningCopy.Need) bool {
         .extension => |extension| member.extensions.contains(extension),
         .notices => member.client_notices,
         .steer_input => member.sendsSteerInput(),
+        .except_sender => |sender| !connection.sameConnection(member.connection_id, sender),
     };
 }
 
@@ -1466,6 +1516,7 @@ fn freeSessionCredential(alloc: Allocator, session: *ActiveSessionState) void {
 /// its subagents, frees it, and removes it from the open sessions. Every
 /// other session runs on (`tests/tla/acp/AcpSessions.tla` OthersUntouched).
 pub fn closeSession(state: *ServerState, session: *ActiveSessionState) void {
+    startClose(state, session);
     cancelAndReapPrompt(state, session);
     clearPendingLegacyUrls(state, session);
     disableSubagentHost(session);
@@ -1490,6 +1541,7 @@ pub fn closeSessionsBeforeOpen(state: *ServerState) void {
     if (holdsOneSession(state)) {
         while (state.sessions.items.len > 0) {
             const session = state.sessions.items[0];
+            startClose(state, session);
             cancelAndReapPrompt(state, session);
             stopSubagentsForSwitch(session);
             closeSession(state, session);
@@ -1519,6 +1571,66 @@ pub fn replayRunningCopy(member: *ServerState, alloc: Allocator, session: *Activ
         if (copy.progress) |params| try member.writer.writeNotification(alloc, sh_fx.method.session_turn_progress, params);
     }
     if (copy.dropped > 0) try writePartialCopyNotice(member, alloc, session.session_id);
+}
+
+/// Sends a prompt that starts a turn to every client that has the session open,
+/// except `sender`, the client that sent it. The update is the text, then each
+/// image, under one message id, built as a load replays a saved prompt
+/// (`sendUserHistoryTurn` in sessions.zig), so the bytes match. The updates also
+/// go into the running copy, so a client that joins later gets them once, in its
+/// replay. Nothing is sent where `follow_supported` does not hold: there the owner
+/// is the only client, and it sent the prompt. The caller holds no lock.
+pub fn announcePromptTurn(
+    session: *ActiveSessionState,
+    sender: ConnectionId,
+    alloc: Allocator,
+    message_id: []const u8,
+    text: []const u8,
+    images: []const types.ImageAttachment,
+) !void {
+    if (comptime !follow_supported) return;
+    if (text.len == 0 and images.len == 0) return;
+    var audience = lockAudience(session);
+    defer audience.unlock();
+    if (text.len > 0) {
+        var update: std.Io.Writer.Allocating = .init(alloc);
+        defer update.deinit();
+        try acp_types.writeUserMessageChunk(&update.writer, message_id, text);
+        try deliverPromptUpdate(&audience, alloc, sender, session.session_id, update.writer.buffered());
+    }
+    for (images) |attachment| {
+        var snapshot = image_attachments.loadVerifiedSnapshot(alloc, attachment, .{}) catch |err| {
+            if (err == error.OutOfMemory) return err;
+            debug_trace.logf("acp", "prompt image unavailable id={d} err={s}", .{ attachment.id, @errorName(err) });
+            var unavailable: [96]u8 = undefined;
+            const notice = try std.mem.print(&unavailable, "Image #{d} unavailable", .{attachment.id});
+            var update: std.Io.Writer.Allocating = .init(alloc);
+            defer update.deinit();
+            try acp_types.writeUserMessageChunk(&update.writer, message_id, notice);
+            try deliverPromptUpdate(&audience, alloc, sender, session.session_id, update.writer.buffered());
+            continue;
+        };
+        defer snapshot.deinit(alloc);
+        var update: std.Io.Writer.Allocating = .init(alloc);
+        defer update.deinit();
+        try acp_types.writeUserImageChunk(&update.writer, message_id, snapshot.media_type, snapshot.bytes);
+        try deliverPromptUpdate(&audience, alloc, sender, session.session_id, update.writer.buffered());
+    }
+}
+
+/// Sends one `session/update` built from `update` to every member but `sender`, and
+/// records it in the running copy. The caller holds the audience.
+fn deliverPromptUpdate(
+    audience: *Audience,
+    alloc: Allocator,
+    sender: ConnectionId,
+    session_id: []const u8,
+    update: []const u8,
+) !void {
+    var params: std.Io.Writer.Allocating = .init(alloc);
+    defer params.deinit();
+    try acp_types.writeSessionUpdate(&params.writer, session_id, update);
+    try audience.deliver(alloc, "session/update", .{ .except_sender = sender }, params.writer.buffered(), null);
 }
 
 /// Writes the partial-copy notice to `member`: an ACP notice when its client
@@ -1592,13 +1704,26 @@ pub fn forgetFollowing(state: *ServerState, session_id: []const u8) void {
     }
 }
 
+/// Why a connection stops following a session. `closed`: it closed the session and
+/// still hears its answers. `left`: its connection ended or its writes failed, so
+/// it hears nothing more.
+pub const FollowerLeave = enum { closed, left };
+
 /// Ends `state`'s follow of `session_id`: removes `state` from the session's
-/// followers when the session is still in the table. A session that has left the
-/// table already dropped its followers, so there is nothing left to remove.
-pub fn detachFollower(state: *ServerState, session_id: []const u8, reason: []const u8) void {
+/// followers when the session is still in the table, and withdraws the input it
+/// still has waiting (`withdrawFollowerInput`). A session that has left the table
+/// already dropped its followers, and its line was drained when it closed, so there
+/// is nothing left to withdraw.
+pub fn detachFollower(state: *ServerState, session_id: []const u8, leave: FollowerLeave) void {
     // A follower can exist only where `follow_supported` holds.
     if (comptime !follow_supported) return;
-    debug_trace.logf("acp", "event=follower_detached session={s} reason={s}", .{ session_id, reason });
+    debug_trace.logf("acp", "event=follower_detached session={s} reason={s}", .{
+        session_id,
+        switch (leave) {
+            .closed => "close",
+            .left => "connection_end",
+        },
+    });
     const shared = state.shared orelse return;
     shared.mutex.lockUncancelable(io_mod.getIo());
     defer shared.mutex.unlock(io_mod.getIo());
@@ -1606,6 +1731,71 @@ pub fn detachFollower(state: *ServerState, session_id: []const u8, reason: []con
     session.audience_mutex.lockUncancelable(io_mod.getIo());
     defer session.audience_mutex.unlock(io_mod.getIo());
     _ = removeFollowerLocked(session, state);
+    withdrawFollowerInput(state, session, leave);
+}
+
+/// Withdraws the input that a following connection still has waiting: its late
+/// steers, its queued prompts, and its steers that the running turn has not taken.
+/// A steer a turn took stays with the turn. Each withdrawn entry is traced. For a
+/// `closed` follower, which is still connected, each withdrawn prompt and steer gets
+/// the cancelled answer that the owner's close gives its drained input, and the
+/// answers are written before the close's own answer. A follower that `left` gets no
+/// write.
+///
+/// The caller holds the session's audience lock. This takes the line lock inside it,
+/// and the steering runtime's lock inside that. Nothing takes the line lock and then
+/// the audience or shared lock: the line lock's sections call neither, and the
+/// subagent authority lock's sections reach neither, so this order cannot cycle.
+fn withdrawFollowerInput(state: *ServerState, session: *ActiveSessionState, leave: FollowerLeave) void {
+    // A follower can exist only where `follow_supported` holds.
+    if (comptime !follow_supported) return;
+    var taken: prompt_line.Drained = .{};
+    defer taken.deinit(state.alloc);
+    {
+        session.waiting_prompts.lock();
+        defer session.waiting_prompts.unlock();
+        // Both moves allocate before they remove anything, so a failure leaves that
+        // part of the input where it was, and it is traced.
+        taken = session.waiting_prompts.takeFromLocked(state.alloc, state.connection_id) catch |err| {
+            debug_trace.logf("acp", "event=waiting_input_kept session={s} reason=out_of_memory err={s}", .{ session.session_id, @errorName(err) });
+            return;
+        };
+        session.steering.takeRequestsFrom(state.alloc, state.connection_id, &taken.late) catch |err| {
+            debug_trace.logf("acp", "event=waiting_input_kept session={s} reason=out_of_memory err={s}", .{ session.session_id, @errorName(err) });
+        };
+    }
+    for (taken.late.items) |steer| {
+        traceWaitingInputDropped(session, steer.request_id, leave);
+        if (leave == .closed) writeCancelledAnswer(state, steer.request_id);
+    }
+    for (taken.queue.items) |queued| {
+        traceWaitingInputDropped(session, queued.msg.id, leave);
+        if (leave == .closed) if (queued.msg.id) |id| writeCancelledAnswer(state, id);
+    }
+}
+
+/// Writes the cancelled answer to `state`'s own connection, the answer the owner's
+/// close gives input it drains (`answerCancelled`): `-32800`, "Request cancelled".
+fn writeCancelledAnswer(state: *ServerState, id: jsonrpc.RequestId) void {
+    const answer: Answer = .{ .rpc_error = .{
+        .code = ErrorCode.request_cancelled,
+        .message = "Request cancelled",
+    } };
+    writeAnswer(&state.writer, state.alloc, id, answer) catch |err| debug_trace.logf("acp", "failed to answer withdrawn input err={s}", .{@errorName(err)});
+}
+
+/// Traces one waiting input that a follower's leave withdraws. The reason says
+/// whether the follower closed the session or left.
+fn traceWaitingInputDropped(session: *const ActiveSessionState, id: ?jsonrpc.RequestId, leave: FollowerLeave) void {
+    var buf: [32]u8 = undefined;
+    debug_trace.logf("acp", "event=waiting_input_dropped session={s} request={s} reason={s}", .{
+        session.session_id,
+        requestText(id, &buf),
+        switch (leave) {
+            .closed => "follower_closed",
+            .left => "follower_left",
+        },
+    });
 }
 
 /// Drops the followers of `active` as its session closes. A follower belongs to
@@ -1668,8 +1858,6 @@ fn dropQueuedMail(session: *ActiveSessionState, reason: []const u8) void {
 }
 
 fn destroySession(state: *ServerState, active: *ActiveSessionState) void {
-    // The table lets go first, so no connection can find the session once it starts to be freed.
-    if (comptime follow_supported) if (state.shared) |shared| shared.unregister(active);
     dropFollowersAtClose(active);
     if (active.title_task) |task| {
         debug_trace.logf("session", "event=title_generation_dropped reason=session_release", .{});
@@ -1927,11 +2115,19 @@ const RunOptions = struct {
 const leader_supported = !host_target.is_wasm and (builtin.os.tag == .macos or builtin.os.tag == .linux);
 
 /// Whether a second connection can open a session of this process, so whether the
-/// follow code is compiled. A second connection exists only through the leader
-/// socket, which is served exactly where `leader_supported` holds, so the two
-/// gates are the same. WebAssembly has no socket and one connection; each follow-only
-/// entry returns at comptime when this is false, and the compiler drops its code.
-pub const follow_supported = leader_supported;
+/// follow code is compiled. Defined in `connection.zig`; each follow-only entry
+/// returns at comptime when it is false, and the compiler drops its code.
+pub const follow_supported = connection.follow_supported;
+
+comptime {
+    // A second connection exists only through the leader socket, so the two gates agree.
+    std.debug.assert(follow_supported == leader_supported);
+}
+
+pub const ConnectionId = connection.ConnectionId;
+const no_connection = connection.no_connection;
+const newConnectionId = connection.newConnectionId;
+const sameConnection = connection.sameConnection;
 
 pub fn run(alloc: Allocator, cfg: Config) !void {
     // One table for every connection this process serves. `runServer` closes its
@@ -1972,6 +2168,7 @@ fn runServer(
         .alloc = alloc,
         .cfg = cfg,
         .writer = writer_value,
+        .connection_id = newConnectionId(),
         .shared = options.shared,
         .leader_info = options.leader_info,
         .terminal_client = terminal_client_runtime.Runtime.init(
@@ -2595,6 +2792,8 @@ fn dispatchNotification(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Mes
         .session_cancel => {
             if (notificationTargetSession(state, alloc, msg.params_raw)) |session| {
                 handleCancel(state, session, true);
+            } else {
+                _ = try cancelFollowedSession(state, alloc, false, null, msg.params_raw);
             }
         },
         .mcp_message => {
@@ -2624,6 +2823,7 @@ pub fn dispatch(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message) !v
     }
 
     if (method == .session_cancel) {
+        if (try cancelFollowedSession(state, alloc, true, msg.id, msg.params_raw)) return;
         const session = (try requireSessionTarget(state, alloc, msg)) orelse return;
         handleCancel(state, session, true);
         return state.writer.writeResponse(alloc, msg.id, "null");
@@ -2637,9 +2837,10 @@ pub fn dispatch(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message) !v
     }
 
     if (method == .session_prompt) {
+        if (try promptFromFollower(state, alloc, msg)) return;
         const session = (try requireSessionTarget(state, alloc, msg)) orelse return;
-        if (session.prompt != null) return handleDeliveryPrompt(state, alloc, msg, session);
-        return startPrompt(state, alloc, msg, session);
+        // AcpSessionReaders BeginRequest: the decision is made under the line lock.
+        return handleSessionPrompt(state, alloc, msg, session);
     }
 
     if (method.waitsForActivePrompt() and promptBusy(state, alloc, msg)) {
@@ -2729,6 +2930,17 @@ fn handleRequestCancellation(
     for (state.sessions.items) |session| {
         if (withdrawSessionRequest(state, alloc, session, requested)) return;
     }
+    // A follower's own waiting input and its own running prompt are in the sessions it
+    // follows. Each one is held while it is checked, and only this connection's
+    // entries match, so a follower stops only a turn that its own prompt started.
+    if (comptime follow_supported) {
+        const shared = state.shared orelse return;
+        for (state.following.items) |session_id| {
+            const session = shared.retain(session_id) orelse continue;
+            defer shared.release(session);
+            if (withdrawSessionRequest(state, alloc, session, requested)) return;
+        }
+    }
 }
 
 /// Handles `$/cancel_request` for `session`: its running turn's own prompt
@@ -2740,25 +2952,31 @@ fn withdrawSessionRequest(
     session: *ActiveSessionState,
     requested: jsonrpc.RequestId,
 ) bool {
-    const active = session.prompt orelse return false;
     const outcome: enum { stop_turn, withdrawn, none } = outcome: {
+        // AcpSessionReaders WithdrawLocked: the slot and the turn it holds are read
+        // under the line lock, so a reap cannot free the turn while this reads it.
         session.waiting_prompts.lock();
         defer session.waiting_prompts.unlock();
+        const active = session.prompt orelse break :outcome .none;
         if (active.group_ids.len == 0) {
-            if (active.msg.id) |active_id| if (requestIdsEqual(active_id, requested)) break :outcome .stop_turn;
+            if (active.msg.id) |active_id| {
+                const same_connection = sameConnection(active.from, state.connection_id);
+                if (same_connection and requestIdsEqual(active_id, requested)) break :outcome .stop_turn;
+            }
         }
-        if (session.steering.withdrawRequest(state.alloc, requested) or
-            session.waiting_prompts.withdrawLocked(state.alloc, requested)) break :outcome .withdrawn;
+        if (session.steering.withdrawRequest(state.alloc, state.connection_id, requested) or
+            session.waiting_prompts.withdrawLocked(state.alloc, state.connection_id, requested)) break :outcome .withdrawn;
         break :outcome .none;
     };
     switch (outcome) {
-        .stop_turn => handleCancel(state, session, true),
+        .stop_turn => handleCancel(session.server, session, true),
         .withdrawn => {
             debug_trace.logf("acp", "withdrew a prompt that hadn't run", .{});
-            state.writer.writeError(alloc, requested, .{
+            const answer: Answer = .{ .rpc_error = .{
                 .code = ErrorCode.request_cancelled,
                 .message = "Request cancelled",
-            }) catch |err| debug_trace.logf("acp", "failed to answer a withdrawn prompt err={s}", .{@errorName(err)});
+            } };
+            answerSender(session, alloc, state.connection_id, requested, .none, answer, answer) catch |err| debug_trace.logf("acp", "failed to answer a withdrawn prompt err={s}", .{@errorName(err)});
         },
         .none => return false,
     }
@@ -2878,114 +3096,328 @@ fn writePromptInProgress(state: *ServerState, alloc: Allocator, id: ?jsonrpc.Req
 /// `sh.fx/delivery`.
 const Delivery = enum { none, steer, queue };
 
-/// Handles a `session/prompt` that arrives while a turn runs
-/// (src/protocol/spec/sh-fx.md, "Steering and queued prompts"): a steer joins
-/// the running turn, or the next one once that turn stops taking input; a
+/// What a running turn did with a `session/prompt` delivered into it.
+const DeliveryOutcome = union(enum) {
+    in_progress,
+    /// A steer that joined the running turn: its text length, and whether it
+    /// cut a streaming reply short.
+    steered: struct { bytes: usize, interrupts_reply: bool },
+    /// A steer that waits for the next turn, with its text length.
+    late: usize,
+    queued,
+    failed: jsonrpc.RpcError,
+};
+
+/// What `decideSessionPrompt` decided for one `session/prompt`.
+const PromptDecision = union(enum) {
+    /// The session is closing, so the prompt starts no turn.
+    refused,
+    /// The prompt claimed the session's turn. The caller starts its thread.
+    claimed: *ActivePrompt,
+    /// A running turn took the prompt. The caller answers it.
+    delivered: DeliveryOutcome,
+};
+
+/// Handles a `session/prompt`. A prompt that arrives while a turn runs
+/// (src/protocol/spec/sh-fx.md, "Steering and queued prompts") joins it: a steer
+/// joins the running turn, or the next one once that turn stops taking input; a
 /// queued prompt waits for a turn of its own; and a prompt with no delivery
 /// fails with `-32600`. A prompt that arrives once the worker has found
 /// nothing waiting starts its own turn. Answers come when their turns end.
-fn handleDeliveryPrompt(state: *ServerState, alloc: Allocator, msg: *const jsonrpc.Message, session: *ActiveSessionState) !void {
-    // libfx kernel hosts steer through `_sh.fx/session/steer`.
-    if (state.cfg.minimal_kernel) return writePromptInProgress(state, alloc, msg.id);
-    const params = msg.params_raw orelse return writePromptInProgress(state, alloc, msg.id);
-    const parsed = std.json.parseFromSlice(std.json.Value, alloc, params, .{}) catch
-        return writePromptInProgress(state, alloc, msg.id);
+/// `decideSessionPrompt` makes the decision under the line lock. The answer and
+/// the thread start come after the unlock.
+fn handleSessionPrompt(state: *ServerState, alloc: Allocator, msg: *const jsonrpc.Message, session: *ActiveSessionState) !void {
+    switch (try decideSessionPrompt(state, alloc, msg, session)) {
+        .refused => return answerSessionRefused(state, alloc, msg.id, session.session_id),
+        .claimed => |active| return startClaimedTurn(session, active),
+        .delivered => |outcome| return answerDelivery(state, alloc, msg, outcome),
+    }
+}
+
+/// A `session/prompt` on a session this connection follows. The session is
+/// kept for the request (`SharedSessions.retain`, released after it), so a close waits for
+/// the request. The prompt then takes the owner's path with this connection as its sender.
+/// Returns false when the session is not followed here, so the owner's path applies.
+fn promptFromFollower(state: *ServerState, alloc: Allocator, msg: *const jsonrpc.Message) !bool {
+    if (comptime !follow_supported) return false;
+    const raw = msg.params_raw orelse return false;
+    const parsed = std.json.parseFromSlice(std.json.Value, alloc, raw, .{}) catch return false;
     defer parsed.deinit();
-    if (parsed.value != .object) return writePromptInProgress(state, alloc, msg.id);
+    const session_id = requestedSessionId(parsed.value) orelse return false;
+    if (!followsSession(state, session_id)) return false;
+    const shared = state.shared orelse return false;
+    const session = shared.retain(session_id) orelse {
+        // The owner has closed the session, or is closing it: this follow is over.
+        forgetFollowing(state, session_id);
+        try answerSessionRefused(state, alloc, msg.id, session_id);
+        return true;
+    };
+    defer shared.release(session);
+    try handleSessionPrompt(state, alloc, msg, session);
+    return true;
+}
+
+/// A `session/cancel` on a session this connection follows. Any client that has the
+/// session open may stop its running turn, whichever client sent the prompt (sh-fx.md,
+/// "Stopping a turn"). The cancel runs in the owner's state, because the requests the
+/// turn waits for live on the owner's connection, so the owner's client gets
+/// `$/cancel_request` for them, as its own cancel gives. The session is kept for the
+/// cancel (`SharedSessions.retain`, released after it). A request (`reply`) gets the
+/// answer the owner's cancel gets, or `-32002` when the owner has closed the session.
+/// Returns false when the session is not followed here, so the owner's path applies.
+fn cancelFollowedSession(
+    state: *ServerState,
+    alloc: Allocator,
+    reply: bool,
+    request_id: ?jsonrpc.RequestId,
+    params: ?[]const u8,
+) !bool {
+    if (comptime !follow_supported) return false;
+    const raw = params orelse return false;
+    const parsed = std.json.parseFromSlice(std.json.Value, alloc, raw, .{}) catch return false;
+    defer parsed.deinit();
+    const session_id = requestedSessionId(parsed.value) orelse return false;
+    if (!followsSession(state, session_id)) return false;
+    const shared = state.shared orelse return false;
+    if (shared.retain(session_id)) |session| {
+        defer shared.release(session);
+        handleCancel(session.server, session, true);
+        if (reply) try state.writer.writeResponse(alloc, request_id, "null");
+        return true;
+    }
+    // The owner has closed the session, or is closing it: this follow is over.
+    forgetFollowing(state, session_id);
+    if (reply) try answerSessionRefused(state, alloc, request_id, session_id);
+    return true;
+}
+
+/// Answers a `session/prompt` that reached a closing or closed session. No turn starts, and
+/// the request gets the same not-found answer as a session that is not open
+/// (`writeSessionTargetError`).
+fn answerSessionRefused(state: *ServerState, alloc: Allocator, id: ?jsonrpc.RequestId, session_id: []const u8) !void {
+    return state.writer.writeError(alloc, id, jsonrpc.sessionNotFound("No active session", session_id));
+}
+
+/// Decides one `session/prompt` for the session's line. Each decision is made in
+/// one hold of the line lock. A finished turn in the slot is reaped first, and
+/// then the decision is made again.
+fn decideSessionPrompt(state: *ServerState, alloc: Allocator, msg: *const jsonrpc.Message, session: *ActiveSessionState) !PromptDecision {
+    while (true) {
+        const line = &session.waiting_prompts;
+        prompt_test_controls.noteDecisionCheck();
+        line.lock();
+        const decided = decideLocked(state, alloc, msg, session) catch |err| {
+            line.unlock();
+            return err;
+        };
+        line.unlock();
+        if (decided) |decision| return decision;
+        debug_trace.logf("acp", "prompt arrived after the worker found nothing waiting; starting a turn", .{});
+        reapSessionPrompt(session, true);
+    }
+}
+
+/// The decision of `decideSessionPrompt`, made with the line lock held. Null when
+/// the slot holds a finished turn: the caller reaps it and decides again.
+fn decideLocked(state: *ServerState, alloc: Allocator, msg: *const jsonrpc.Message, session: *ActiveSessionState) !?PromptDecision {
+    const line = &session.waiting_prompts;
+    // A claim, a delivery and a reap wait while a taken turn is being joined. A
+    // closing session stops waiting, and refuses.
+    const was_joining = line.joining;
+    line.waitWhileJoiningLocked(true);
+    if (was_joining) prompt_test_controls.noteJoinPassed();
+    // AcpSessionReaders ClaimRefuse: a closing session starts nothing.
+    if (line.closing) return .refused;
+    // AcpSessionReaders ClaimNew: the slot is empty, so this prompt starts the turn.
+    if (session.prompt == null) return .{ .claimed = try claimTurnLocked(state, alloc, msg, session) };
+    // The prompt finds a turn in the slot, so it is read as a delivery. The reads
+    // below answer a bad delivery even when the turn has already ended, as before.
+    // libfx kernel hosts steer through `_sh.fx/session/steer`.
+    if (state.cfg.minimal_kernel) return deliveredDecision(.in_progress);
+    const params = msg.params_raw orelse return deliveredDecision(.in_progress);
+    const parsed = std.json.parseFromSlice(std.json.Value, alloc, params, .{}) catch return deliveredDecision(.in_progress);
+    defer parsed.deinit();
+    if (parsed.value != .object) return deliveredDecision(.in_progress);
     const delivery: Delivery = if (acp_types.metaField(parsed.value.object, "sh.fx/delivery")) |value| delivery: {
         if (value == .string and std.mem.eql(u8, value.string, "steer")) break :delivery .steer;
         if (value == .string and std.mem.eql(u8, value.string, "queue")) break :delivery .queue;
-        return state.writer.writeError(alloc, msg.id, .{
+        return deliveredDecision(.{ .failed = .{
             .code = ErrorCode.invalid_params,
             .message = "sh.fx/delivery must be \"steer\" or \"queue\"",
-        });
+        } });
     } else .none;
-    const line = &session.waiting_prompts;
-
     const text: []u8 = if (delivery == .steer) steeringPromptText(alloc, parsed.value.object) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
-        error.UnsupportedSteeringContent => return state.writer.writeError(alloc, msg.id, .{
+        error.UnsupportedSteeringContent => return deliveredDecision(.{ .failed = .{
             .code = ErrorCode.invalid_params,
             .message = "Steering prompts accept text content blocks only",
-        }),
+        } }),
     } else &.{};
     defer if (delivery == .steer) alloc.free(text);
     var queued: ?jsonrpc.Message = if (delivery == .queue) try cloneMessage(state.alloc, msg) else null;
     defer if (queued) |*copy| jsonrpc.freeMessage(state.alloc, copy);
-
-    const result: union(enum) {
-        /// The turn ended and the worker takes nothing more: start a turn.
-        start,
-        in_progress,
-        steered: bool,
-        late,
-        queued,
-        failed: jsonrpc.RpcError,
-    } = result: {
-        line.lock();
-        defer line.unlock();
-        if (!line.worker_running) break :result .start;
-        switch (delivery) {
-            .none => break :result .in_progress,
-            .steer => {
-                session.steering.enqueueRequest(state.alloc, text, msg.id) catch |err| switch (err) {
-                    error.SteeringNotActive => {
-                        // The running turn stopped taking input: the steer runs next.
-                        line.addLateLocked(state.alloc, text, msg.id.?) catch |late_err| switch (late_err) {
-                            error.OutOfMemory => return error.OutOfMemory,
-                            error.SteeringQueueFull => break :result .{ .failed = .{
-                                .code = ErrorCode.invalid_request,
-                                .message = "Steering queue is full",
-                            } },
-                        };
-                        break :result .late;
-                    },
-                    error.OutOfMemory => return error.OutOfMemory,
-                    error.EmptySteeringMessage => break :result .{ .failed = .{
-                        .code = ErrorCode.invalid_params,
-                        .message = "Steering prompt text cannot be empty",
-                    } },
-                    error.SteeringMessageTooLarge => break :result .{ .failed = .{
-                        .code = ErrorCode.invalid_params,
-                        .message = "Steering prompt text exceeds the 64 KiB limit",
-                    } },
-                    error.SteeringQueueFull => break :result .{ .failed = .{
-                        .code = ErrorCode.invalid_request,
-                        .message = "Steering queue is full",
-                    } },
-                };
-                // A steer cuts a streaming reply short, as in the fx CLI.
-                break :result .{ .steered = session.steering.claimInterrupt(&session.cancel_flag) };
-            },
-            .queue => {
-                line.addQueuedLocked(state.alloc, queued.?) catch |err| switch (err) {
-                    error.OutOfMemory => return error.OutOfMemory,
-                    error.PromptQueueFull => break :result .{ .failed = .{
-                        .code = ErrorCode.invalid_request,
-                        .message = "Prompt queue is full",
-                    } },
-                };
-                queued = null;
-                break :result .queued;
-            },
-        }
+    // AcpSessionReaders ClaimReap: a finished turn is reaped first, then the prompt is decided again.
+    if (!line.worker_running) return null;
+    // AcpSessionReaders ClaimDeliver: a running turn takes the prompt.
+    const outcome: DeliveryOutcome = switch (delivery) {
+        .none => .in_progress,
+        .steer => try deliverSteerLocked(state, session, msg.id, text),
+        .queue => try deliverQueueLocked(state, session, &queued),
     };
-    switch (result) {
-        .start => {
-            debug_trace.logf("acp", "prompt arrived after the worker found nothing waiting; starting a turn", .{});
-            reapSessionPrompt(session, true);
-            return startPrompt(state, alloc, msg, session);
-        },
+    return deliveredDecision(outcome);
+}
+
+fn deliveredDecision(outcome: DeliveryOutcome) ?PromptDecision {
+    return .{ .delivered = outcome };
+}
+
+/// Makes the session's turn for a claimed prompt (AcpSessionReaders ClaimNew).
+/// The turn runs on the owner (`session.server`), and its answers go to the sender's
+/// connection. The caller holds the line lock. The turn goes into the slot, and
+/// `worker_running` is set in the same hold, so no other prompt can see an empty
+/// slot with no turn. The thread starts later, outside the lock
+/// (`startClaimedTurn`).
+fn claimTurnLocked(state: *ServerState, alloc: Allocator, msg: *const jsonrpc.Message, session: *ActiveSessionState) !*ActivePrompt {
+    const active = try alloc.create(ActivePrompt);
+    errdefer alloc.destroy(active);
+    active.* = .{
+        .state = session.server,
+        .session = session,
+        .alloc = alloc,
+        .msg = try cloneMessage(alloc, msg),
+        .from = state.connection_id,
+        .mode = session.mode,
+        .permission_mode = session.permission_mode,
+    };
+    errdefer jsonrpc.freeMessage(alloc, &active.msg);
+    session.turn_cancel.store(false, .seq_cst);
+    session.cancel_flag.store(false, .seq_cst);
+    session.steering.open(state.alloc);
+    session.waiting_prompts.worker_running = true;
+    // WebAssembly has no thread: `startClaimedTurn` runs the turn inline, and the
+    // slot stays empty there.
+    if (comptime !host_target.is_wasm) session.prompt = active;
+    return active;
+}
+
+/// Starts the thread of a claimed turn, outside the line lock. A failed spawn
+/// gives the claim back under the lock, so the session holds no turn and no
+/// worker.
+fn startClaimedTurn(session: *ActiveSessionState, active: *ActivePrompt) !void {
+    if (comptime host_target.is_wasm) {
+        promptWorkerMain(active);
+        freeActivePrompt(active);
+        return;
+    }
+    // AcpSessionReaders Spawn: the worker runs outside the lock.
+    const spawned = if (prompt_test_controls.takeSpawnFailure()) error.SystemResources else std.Thread.spawn(.{}, promptWorkerMain, .{active});
+    active.thread = spawned catch |err| {
+        // AcpSessionReaders SpawnFail: the claim is given back under the lock. The steers the
+        // runtime took between the claim and this spawn belong to the turn that never starts,
+        // so they leave with it, and each is answered once the line is unlocked.
+        const alloc = active.alloc;
+        const collected: ?libfx_steering.Finished = collected: {
+            session.waiting_prompts.lock();
+            defer session.waiting_prompts.unlock();
+            session.prompt = null;
+            session.waiting_prompts.worker_running = false;
+            break :collected session.steering.finishTurn(alloc, alloc, "spawn_failed") catch |finish_err| {
+                // The steers stay in the runtime when collection fails, so this failure is traced.
+                debug_trace.logf("acp", "failed to collect the steers of a turn that did not start err={s}", .{@errorName(finish_err)});
+                break :collected null;
+            };
+        };
+        freeActivePrompt(active);
+        if (collected) |finished| {
+            defer finished.deinit(alloc);
+            answerSpawnFailedSteers(session, alloc, finished.untaken, err);
+        }
+        return err;
+    };
+}
+
+/// Answers the steers that a claimed turn left in the runtime when its worker did not start.
+/// Each goes to the connection that sent it, with `-32603` and the spawn error's name: the
+/// answer `answerDroppedWaiting` gives input of a turn that could not start. Each one is
+/// traced. Answering takes the audience lock, so the caller holds no line lock.
+fn answerSpawnFailedSteers(session: *ActiveSessionState, alloc: Allocator, steers: []const libfx_steering.Steer, err: anyerror) void {
+    for (steers) |steer| {
+        var buf: [32]u8 = undefined;
+        debug_trace.logf("acp", "event=waiting_input_dropped session={s} request={s} reason=spawn_failed", .{ session.session_id, requestText(steer.request_id, &buf) });
+        const answer: Answer = .{ .rpc_error = .{
+            .code = ErrorCode.internal_error,
+            .message = @errorName(err),
+        } };
+        answerSender(session, alloc, steer.from, steer.request_id, .none, answer, answer) catch |write_err| debug_trace.logf("acp", "failed to answer waiting input err={s}", .{@errorName(write_err)});
+    }
+}
+
+/// Answers a `session/prompt` that a running turn took, and logs what happened.
+fn answerDelivery(state: *ServerState, alloc: Allocator, msg: *const jsonrpc.Message, outcome: DeliveryOutcome) !void {
+    switch (outcome) {
         .in_progress => return writePromptInProgress(state, alloc, msg.id),
-        .steered => |interrupted| debug_trace.logf(
+        .steered => |steered| debug_trace.logf(
             "acp",
             "queued steering prompt bytes={d} interrupts_reply={}",
-            .{ text.len, interrupted },
+            .{ steered.bytes, steered.interrupts_reply },
         ),
-        .late => debug_trace.logf("acp", "steering prompt waits for the next turn bytes={d}", .{text.len}),
+        .late => |bytes| debug_trace.logf("acp", "steering prompt waits for the next turn bytes={d}", .{bytes}),
         .queued => debug_trace.logf("acp", "queued prompt for a turn of its own", .{}),
         .failed => |rpc_error| return state.writer.writeError(alloc, msg.id, rpc_error),
     }
+}
+
+/// Joins a steer to the running turn, or to the next one once that turn stops
+/// taking input. The caller holds the line lock.
+fn deliverSteerLocked(state: *ServerState, session: *ActiveSessionState, id: ?jsonrpc.RequestId, text: []const u8) !DeliveryOutcome {
+    const line = &session.waiting_prompts;
+    // AcpSessionReaders Deliver: the steer touches the session, not a turn it holds.
+    session.steering.enqueueRequest(state.alloc, text, id, state.connection_id) catch |err| switch (err) {
+        error.SteeringNotActive => {
+            // The running turn stopped taking input: the steer runs next.
+            line.addLateLocked(state.alloc, text, id.?, state.connection_id) catch |late_err| switch (late_err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.SteeringQueueFull => return .{ .failed = .{
+                    .code = ErrorCode.invalid_request,
+                    .message = "Steering queue is full",
+                } },
+            };
+            return .{ .late = text.len };
+        },
+        error.OutOfMemory => return error.OutOfMemory,
+        error.EmptySteeringMessage => return .{ .failed = .{
+            .code = ErrorCode.invalid_params,
+            .message = "Steering prompt text cannot be empty",
+        } },
+        error.SteeringMessageTooLarge => return .{ .failed = .{
+            .code = ErrorCode.invalid_params,
+            .message = "Steering prompt text exceeds the 64 KiB limit",
+        } },
+        error.SteeringQueueFull => return .{ .failed = .{
+            .code = ErrorCode.invalid_request,
+            .message = "Steering queue is full",
+        } },
+    };
+    // A steer cuts a streaming reply short, as in the fx CLI.
+    return .{ .steered = .{
+        .bytes = text.len,
+        .interrupts_reply = session.steering.claimInterrupt(&session.cancel_flag),
+    } };
+}
+
+/// Queues a prompt for a turn of its own. The caller holds the line lock. The
+/// line takes the copy, and `queued` is cleared once it does.
+fn deliverQueueLocked(state: *ServerState, session: *ActiveSessionState, queued: *?jsonrpc.Message) !DeliveryOutcome {
+    // AcpSessionReaders Deliver: the queued prompt touches the session, not a turn it holds.
+    session.waiting_prompts.addQueuedLocked(state.alloc, queued.*.?, state.connection_id) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.PromptQueueFull => return .{ .failed = .{
+            .code = ErrorCode.invalid_request,
+            .message = "Prompt queue is full",
+        } },
+    };
+    queued.* = null;
+    return .queued;
 }
 
 /// Joins the text blocks of a steering prompt. Caller owns the result.
@@ -3598,42 +4030,6 @@ fn handleKernelSteer(
     try state.writer.writeResponse(alloc, msg.id, "null");
 }
 
-fn startPrompt(state: *ServerState, alloc: Allocator, msg: *const jsonrpc.Message, session: *ActiveSessionState) !void {
-    std.debug.assert(session.prompt == null);
-    const active = try alloc.create(ActivePrompt);
-    errdefer alloc.destroy(active);
-    active.* = .{
-        .state = state,
-        .session = session,
-        .alloc = alloc,
-        .msg = try cloneMessage(alloc, msg),
-        .mode = session.mode,
-        .permission_mode = session.permission_mode,
-    };
-    errdefer jsonrpc.freeMessage(alloc, &active.msg);
-
-    {
-        session.waiting_prompts.lock();
-        defer session.waiting_prompts.unlock();
-        session.turn_cancel.store(false, .seq_cst);
-        session.cancel_flag.store(false, .seq_cst);
-        session.steering.open(state.alloc);
-        session.waiting_prompts.worker_running = true;
-    }
-    if (comptime host_target.is_wasm) {
-        promptWorkerMain(active);
-        freeActivePrompt(active);
-    } else {
-        active.thread = std.Thread.spawn(.{}, promptWorkerMain, .{active}) catch |err| {
-            session.waiting_prompts.lock();
-            session.waiting_prompts.worker_running = false;
-            session.waiting_prompts.unlock();
-            return err;
-        };
-        session.prompt = active;
-    }
-}
-
 fn parsedSessionTargetDecision(state: *const ServerState, root: std.json.Value) SessionTargetDecision {
     const supplied = if (root == .object) root.object.get("sessionId") else null;
     return decideSessionTarget(state.sessions.items.len, parsedSessionTarget(state, root) != null, supplied);
@@ -3645,20 +4041,63 @@ fn parsedSessionTarget(state: *const ServerState, root: std.json.Value) ?*Active
     return findSession(state, requested);
 }
 
+/// Whether the session's prompt slot holds a turn: one that runs, or one that has
+/// ended and is not yet reaped. Another reader can reap the turn that the slot
+/// names, so the slot is read under the line lock. A caller that acts on the answer
+/// more than once checks again under the lock.
+pub fn sessionPromptRunning(session: *ActiveSessionState) bool {
+    session.waiting_prompts.lock();
+    defer session.waiting_prompts.unlock();
+    return session.prompt != null;
+}
+
+/// Copies the session's client system prompt for a turn. The caller holds
+/// `settings_mutex`. A turn takes this copy when it starts, so a prompt that a load
+/// changes while the turn runs does not reach that turn (`TurnSettings.capture`).
+pub fn dupClientSystemPromptLocked(alloc: Allocator, session: *const ActiveSessionState) ![]u8 {
+    return alloc.dupe(u8, session.client_system_prompt);
+}
+
+/// Test only: claims the session's slot for a prompt, as a prompt that starts a turn
+/// does, without starting its worker. `releaseTurnForTest` gives the claim back.
+pub fn claimTurnForTest(state: *ServerState, alloc: Allocator, session: *ActiveSessionState) !void {
+    if (comptime !builtin.is_test) return error.TestOnly;
+    const msg = jsonrpc.Message{ .id = .{ .integer = 1 }, .method = "session/prompt" };
+    switch (try decideSessionPrompt(state, alloc, &msg, session)) {
+        .claimed => {},
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+/// Test only: gives back the claim that `claimTurnForTest` made.
+pub fn releaseTurnForTest(session: *ActiveSessionState) void {
+    if (comptime !builtin.is_test) return;
+    session.waiting_prompts.lock();
+    const turn = session.prompt orelse {
+        session.waiting_prompts.unlock();
+        return;
+    };
+    session.prompt = null;
+    session.waiting_prompts.worker_running = false;
+    session.waiting_prompts.unlock();
+    freeActivePrompt(turn);
+}
+
 /// Whether a request that waits for a prompt arrives while one runs: the
 /// prompt of the session it names, or, where the connection holds one
 /// session, any prompt. A request for another session, or one that names
 /// none on `fx acp`, goes on (`tests/tla/acp/AcpSessions.tla` OthersUntouched).
 fn promptBusy(state: *ServerState, alloc: Allocator, msg: *const jsonrpc.Message) bool {
     if (holdsOneSession(state)) {
-        for (state.sessions.items) |session| if (session.prompt != null) return true;
+        // A stale answer only refuses the request as busy.
+        for (state.sessions.items) |session| if (sessionPromptRunning(session)) return true;
         return false;
     }
     const raw = msg.params_raw orelse return false;
     const parsed = std.json.parseFromSlice(std.json.Value, alloc, raw, .{}) catch return false;
     defer parsed.deinit();
     const session = parsedSessionTarget(state, parsed.value) orelse return false;
-    return session.prompt != null;
+    return sessionPromptRunning(session);
 }
 
 /// Answers a request whose `sessionId` is not the open session. A missing or malformed id is
@@ -3732,9 +4171,10 @@ fn requireParsedSessionTarget(
 ) !?*ActiveSessionState {
     const decision = parsedSessionTargetDecision(state, root);
     if (decision == .exact) return parsedSessionTarget(state, root).?;
-    // A follower changes nothing: the connection that owns the session does. This is the one
-    // lookup that the session-scoped handlers share (prompt, cancel, set_mode, set_config_option),
-    // so checking the follow here covers each of them.
+    // A follower changes nothing: the connection that owns the session does. A follower's prompt
+    // and cancel never reach this lookup (promptFromFollower and cancelFollowedSession handle
+    // them). The lookup refuses the other session-scoped requests a follower can send: set_mode
+    // and set_config_option.
     if (comptime follow_supported) {
         if (requestedSessionId(root)) |requested| {
             if (followedElsewhere(state, requested)) {
@@ -3747,7 +4187,10 @@ fn requireParsedSessionTarget(
     return null;
 }
 
-/// The answer to a change request from a connection that only follows the session.
+/// The answer to a change request from a connection that only follows the session. Still
+/// refused: `session/set_mode` and `session/set_config_option`, because a follower's mode and
+/// config changes are not allowed yet. A follower's `session/prompt` and `session/cancel` are
+/// accepted.
 const follower_refusal = "This session is open on another connection; only that connection can change it.";
 
 /// Whether `session_id` is a session this connection follows and another
@@ -3822,6 +4265,7 @@ fn promptWorkerMain(active: *ActivePrompt) void {
             session,
             active.alloc,
             &active.msg,
+            if (active.group_ids.len == 0) active.from else null,
             mode,
             permission_mode,
             &active.usage,
@@ -3845,12 +4289,14 @@ fn promptWorkerMain(active: *ActivePrompt) void {
 
         // The turn that just ended, answered below once the next one is chosen.
         var ended_msg = active.msg;
+        const ended_from = active.from;
         const ended_group = active.group_ids;
         defer {
             jsonrpc.freeMessage(active.alloc, &ended_msg);
-            freeRequestIds(active.alloc, ended_group);
+            freeSenderGroup(active.alloc, ended_group);
         }
         var cancelled_steers: []const libfx_steering.Steer = &.{};
+        var dropped_waiting: ?DroppedWaiting = null;
         const next = next: {
             const line = &session.waiting_prompts;
             line.lock();
@@ -3880,7 +4326,8 @@ fn promptWorkerMain(active: *ActivePrompt) void {
                     break :next waiting;
                 } else |err| {
                     debug_trace.logf("acp", "failed to start the next waiting turn err={s}", .{@errorName(err)});
-                    waiting.deinit(state.alloc);
+                    // Answered after the line unlocks: answering takes the audience lock.
+                    dropped_waiting = .{ .input = waiting, .err = err };
                 }
             };
             // The turn that ended owned `active.msg`; a withdrawal reads it
@@ -3888,12 +4335,18 @@ fn promptWorkerMain(active: *ActivePrompt) void {
             active.msg = .{};
             active.group_ids = &.{};
             line.worker_running = false;
+            // AcpSessionReaders WorkerEnd: the worker is reapable here. Its last answers
+            // follow in publishTurnOutcome, so a second turn waits for the join.
             active.reapable.store(true, .seq_cst);
             break :next null;
         };
 
-        publishTurnOutcome(active, ended_msg.id, ended_group, outcome, finished);
-        for (cancelled_steers) |steer| answerCancelled(state, steer.request_id);
+        publishTurnOutcome(active, ended_from, ended_msg.id, ended_group, outcome, finished);
+        for (cancelled_steers) |steer| answerCancelled(state, session, steer.from, steer.request_id);
+        if (dropped_waiting) |*dropped| {
+            answerDroppedWaiting(session, state.alloc, dropped);
+            dropped.input.deinit(state.alloc);
+        }
         if (next) |taken| {
             var waiting = taken;
             defer waiting.deinit(state.alloc);
@@ -3914,7 +4367,8 @@ fn promptWorkerMain(active: *ActivePrompt) void {
 fn startNextTurn(active: *ActivePrompt, session: *ActiveSessionState, waiting: *prompt_line.Next) !void {
     switch (waiting.*) {
         .prompt => |queued| {
-            active.msg = try cloneMessage(active.alloc, &queued);
+            active.msg = try cloneMessage(active.alloc, &queued.msg);
+            active.from = queued.from;
             active.group_ids = &.{};
         },
         .steers => |steers| {
@@ -3930,14 +4384,14 @@ fn startNextTurn(active: *ActivePrompt, session: *ActiveSessionState, waiting: *
                 try params.writer.writeByte('}');
             }
             try params.writer.writeAll("]}");
-            const ids = try active.alloc.alloc(jsonrpc.RequestId, steers.items.len);
+            const senders = try active.alloc.alloc(libfx_steering.Sender, steers.items.len);
             var copied: usize = 0;
             errdefer {
-                for (ids[0..copied]) |id| jsonrpc.freeRequestId(active.alloc, id);
-                active.alloc.free(ids);
+                for (senders[0..copied]) |sender| jsonrpc.freeRequestId(active.alloc, sender.id);
+                active.alloc.free(senders);
             }
-            for (steers.items, ids) |steer, *id| {
-                id.* = try jsonrpc.dupeRequestId(active.alloc, steer.request_id);
+            for (steers.items, senders) |steer, *sender| {
+                sender.* = .{ .id = try jsonrpc.dupeRequestId(active.alloc, steer.request_id), .from = steer.from };
                 copied += 1;
             }
             var msg: jsonrpc.Message = .{ .method = try active.alloc.dupe(u8, "session/prompt") };
@@ -3945,19 +4399,20 @@ fn startNextTurn(active: *ActivePrompt, session: *ActiveSessionState, waiting: *
             msg.id = try jsonrpc.dupeRequestId(active.alloc, steers.items[0].request_id);
             msg.params_raw = try params.toOwnedSlice();
             active.msg = msg;
-            active.group_ids = ids;
+            active.from = steers.items[0].from;
+            active.group_ids = senders;
         },
     }
 }
 
-fn freeRequestIds(alloc: Allocator, ids: []jsonrpc.RequestId) void {
-    for (ids) |id| jsonrpc.freeRequestId(alloc, id);
-    if (ids.len > 0) alloc.free(ids);
+fn freeSenderGroup(alloc: Allocator, senders: []libfx_steering.Sender) void {
+    libfx_steering.freeSenders(alloc, senders);
+    if (senders.len > 0) alloc.free(senders);
 }
 
 fn freeActivePrompt(active: *ActivePrompt) void {
     jsonrpc.freeMessage(active.alloc, &active.msg);
-    freeRequestIds(active.alloc, active.group_ids);
+    freeSenderGroup(active.alloc, active.group_ids);
     active.alloc.destroy(active);
 }
 
@@ -4056,74 +4511,130 @@ pub fn noteSteeringTool(active: *ActiveSessionState, call_id: []const u8, starte
 }
 
 /// Answers a turn that ended: the prompt that started it, or each steer that
-/// started it together (`next_turn`), and each steer it took (`absorbed`).
+/// started it together (`next_turn`), and each steer it took (`absorbed`). Each
+/// answer goes to the connection that sent its request, in the shape that
+/// connection lists.
 fn publishTurnOutcome(
     active: *ActivePrompt,
+    from: ConnectionId,
     owner: ?jsonrpc.RequestId,
-    group: []const jsonrpc.RequestId,
+    group: []const libfx_steering.Sender,
     outcome: prompt_handler.TerminalOutcome,
     finished: ?libfx_steering.Finished,
 ) void {
-    const lists_delivery = active.state.extensions.contains(.prompt_delivery);
     if (group.len == 0) {
-        publishPromptOutcome(active, owner, outcome) catch |err|
+        publishPromptOutcome(active, from, owner, outcome) catch |err|
             debug_trace.logf("acp", "failed to answer a prompt err={s}", .{@errorName(err)});
     }
-    for (group) |id| writeSteeringOutcome(active, id, outcome, if (lists_delivery) .next_turn else null) catch |err|
+    for (group) |sender| writeSteeringOutcome(active, sender, outcome, .next_turn) catch |err|
         debug_trace.logf("acp", "failed to answer a steer err={s}", .{@errorName(err)});
     const value = finished orelse return;
-    for (value.absorbed) |id| writeSteeringOutcome(active, id, outcome, if (lists_delivery) .absorbed else null) catch |err|
+    for (value.absorbed) |sender| writeSteeringOutcome(active, sender, outcome, .absorbed) catch |err|
         debug_trace.logf("acp", "failed to answer a steer err={s}", .{@errorName(err)});
 }
 
-fn publishPromptOutcome(active: *ActivePrompt, id: ?jsonrpc.RequestId, outcome: prompt_handler.TerminalOutcome) !void {
+fn publishPromptOutcome(active: *ActivePrompt, from: ConnectionId, id: ?jsonrpc.RequestId, outcome: prompt_handler.TerminalOutcome) !void {
     switch (outcome) {
         .stop_reason => |stop_reason| {
-            var response: std.Io.Writer.Allocating = .init(active.alloc);
-            defer response.deinit();
-            try acp_types.writePromptResponseWithUsage(
-                &response.writer,
-                stop_reason,
-                active.usage,
-                active.session.turn_summary,
-                active.state.extensions.contains(.usage),
-            );
-            try active.state.writer.writeResponse(active.alloc, id, response.writer.buffered());
+            // Without `follow_supported` the owner is the only member, so only its own shape is built.
+            if (comptime !follow_supported) {
+                const body = try stopResponse(active, stop_reason, active.state.extensions.contains(.usage));
+                defer active.alloc.free(body);
+                return answerSender(active.session, active.alloc, from, id, .none, .{ .response = body }, .{ .response = body });
+            }
+            const with = try stopResponse(active, stop_reason, true);
+            defer active.alloc.free(with);
+            const without = try stopResponse(active, stop_reason, false);
+            defer active.alloc.free(without);
+            try answerSender(active.session, active.alloc, from, id, .{ .extension = .usage }, .{ .response = with }, .{ .response = without });
         },
-        .rpc_error => |rpc_error| {
-            try active.state.writer.writeError(active.alloc, id, rpc_error);
-        },
+        .rpc_error => |rpc_error| try answerSender(active.session, active.alloc, from, id, .none, .{ .rpc_error = rpc_error }, .{ .rpc_error = rpc_error }),
     }
+}
+
+/// The response to a turn's stop. `usage` says whether the member lists `.usage`,
+/// which adds the turn's timing as `_meta`. The usage reported is the prompt's sum
+/// over its turns (`active.usage`). The caller frees the result.
+fn stopResponse(active: *ActivePrompt, stop_reason: acp_types.StopReason, usage: bool) ![]u8 {
+    var response: std.Io.Writer.Allocating = .init(active.alloc);
+    defer response.deinit();
+    try acp_types.writePromptResponseWithUsage(
+        &response.writer,
+        stop_reason,
+        active.usage,
+        active.session.turn_summary,
+        usage,
+    );
+    return response.toOwnedSlice();
 }
 
 fn writeSteeringOutcome(
     active: *ActivePrompt,
-    id: jsonrpc.RequestId,
+    sender: libfx_steering.Sender,
     outcome: prompt_handler.TerminalOutcome,
-    delivery: ?acp_types.SteeringDelivery,
+    delivery: acp_types.SteeringDelivery,
 ) !void {
     switch (outcome) {
         .stop_reason => |stop_reason| {
-            var response: std.Io.Writer.Allocating = .init(active.alloc);
-            defer response.deinit();
-            try acp_types.writeSteeringPromptResponse(&response.writer, stop_reason, delivery);
-            try active.state.writer.writeResponse(active.alloc, id, response.written());
+            // Without `follow_supported` the owner is the only member: the delivery is in its response only when it lists `.prompt_delivery`.
+            if (comptime !follow_supported) {
+                const delivery_shown: ?acp_types.SteeringDelivery = if (active.state.extensions.contains(.prompt_delivery)) delivery else null;
+                const body = try steerResponse(active, stop_reason, delivery_shown);
+                defer active.alloc.free(body);
+                return answerSender(active.session, active.alloc, sender.from, sender.id, .none, .{ .response = body }, .{ .response = body });
+            }
+            // A member that lists `.prompt_delivery` takes the delivery; the others take the response without it.
+            const with = try steerResponse(active, stop_reason, delivery);
+            defer active.alloc.free(with);
+            const without = try steerResponse(active, stop_reason, null);
+            defer active.alloc.free(without);
+            try answerSender(active.session, active.alloc, sender.from, sender.id, .{ .extension = .prompt_delivery }, .{ .response = with }, .{ .response = without });
         },
-        .rpc_error => |rpc_error| try active.state.writer.writeError(active.alloc, id, rpc_error),
+        .rpc_error => |rpc_error| try answerSender(active.session, active.alloc, sender.from, sender.id, .none, .{ .rpc_error = rpc_error }, .{ .rpc_error = rpc_error }),
     }
 }
 
-/// Joins `session`'s worker once it marked itself reapable, or, with
-/// `wait`, as soon as it ends.
+/// The response to a steer's turn stop, with its delivery when given. The caller frees the result.
+fn steerResponse(active: *ActivePrompt, stop_reason: acp_types.StopReason, delivery: ?acp_types.SteeringDelivery) ![]u8 {
+    var response: std.Io.Writer.Allocating = .init(active.alloc);
+    defer response.deinit();
+    try acp_types.writeSteeringPromptResponse(&response.writer, stop_reason, delivery);
+    return response.toOwnedSlice();
+}
+
+/// Reaps the session's turn. Under the line lock it takes the turn out of the
+/// slot and marks it joining (AcpSessionReaders ReapTake). Outside the lock it
+/// joins the thread and frees the turn (JoinOwn, FreeOwn), then clears joining and
+/// wakes the waiters. A reap that finds a join under way waits for it, so no turn
+/// is joined twice. `wait` reaps a turn that is still running (a close); otherwise
+/// only a finished turn is taken.
 fn reapSessionPrompt(session: *ActiveSessionState, wait: bool) void {
-    if (!host_target.is_wasm) {
+    if (comptime host_target.is_wasm) return;
+    const line = &session.waiting_prompts;
+    const active = taken: {
+        line.lock();
+        defer line.unlock();
+        const was_joining = line.joining;
+        line.waitWhileJoiningLocked(false);
+        if (was_joining) prompt_test_controls.noteJoinPassed();
+        // AcpSessionReaders ReapRetry: the slot is empty, so there is nothing to reap.
         const active = session.prompt orelse return;
         if (!wait and !active.reapable.load(.seq_cst)) return;
-        prompt_test_controls.noteReapBeforeJoin();
-        active.thread.join();
-        freeActivePrompt(active);
+        // AcpSessionReaders ReapTake: the turn leaves the slot, and joining marks it taken.
         session.prompt = null;
-    }
+        line.joining = true;
+        break :taken active;
+    };
+    prompt_test_controls.noteReapBeforeJoin();
+    // AcpSessionReaders JoinOwn: the join runs outside the lock.
+    active.thread.join();
+    // AcpSessionReaders FreeOwn: the free runs outside the lock; then joining is
+    // cleared under the lock, and the waiters wake.
+    freeActivePrompt(active);
+    line.lock();
+    line.joining = false;
+    line.wakeWaitersLocked();
+    line.unlock();
 }
 
 /// Joins the worker of every session whose turns ended.
@@ -5057,8 +5568,13 @@ test "ACP keeps its model catalog when a due refresh cannot connect" {
 /// session's turn runs on (`tests/tla/acp/AcpSessions.tla` OthersUntouched).
 fn handleCancel(state: *ServerState, session: *ActiveSessionState, notify_client: bool) void {
     debug_trace.eventf("interrupt", "cancel_requested", .{}, "source=acp active_tool_known=false", .{});
-    session.turn_cancel.store(true, .seq_cst);
     session.waiting_prompts.lock();
+    // The flag is set under the line lock, together with the cancel. A claim
+    // takes the same lock, so this cancel either lands before the claim, which
+    // then clears the flag, or after it, which stops that turn. If the flag were
+    // set before the lock, a claim could run in between and the cancel would
+    // stop the next turn.
+    session.turn_cancel.store(true, .seq_cst);
     session.steering.cancelForUser(&session.cancel_flag);
     session.waiting_prompts.unlock();
     // A prompt waiting for its subagents' reports stops waiting.
@@ -5067,33 +5583,165 @@ fn handleCancel(state: *ServerState, session: *ActiveSessionState, notify_client
     clearPendingLegacyUrls(state, session);
 }
 
+/// The first steps of a close (AcpSessionReaders BeginClose, CloseDetach and
+/// CloseWait). The session starts closing, leaves the shared table so that no
+/// connection can take a use of it, and waits until the uses that other connections
+/// hold end. Callers run it before they stop the turn, so no request starts work on
+/// the session in between. A second call finds nothing left to do.
+fn startClose(state: *ServerState, session: *ActiveSessionState) void {
+    beginClose(session);
+    if (comptime follow_supported) {
+        if (state.shared) |shared| {
+            shared.unregister(session);
+            prompt_test_controls.noteCloseBeforeUseWait();
+            shared.waitNoUses(session);
+            prompt_test_controls.noteCloseAfterUseWait();
+        }
+    }
+}
+
+/// Begins a close (AcpSessionReaders BeginClose), under the line lock. From here
+/// no prompt starts a turn, and a claim that waits for a join wakes and is
+/// refused. `startClose` calls it first.
+fn beginClose(session: *ActiveSessionState) void {
+    session.waiting_prompts.lock();
+    defer session.waiting_prompts.unlock();
+    session.waiting_prompts.closing = true;
+    session.waiting_prompts.wakeWaitersLocked();
+}
+
 /// Stops the running turn and waits for it, answering every steer and queued
-/// prompt that hasn't run with `-32800`, as `session/close` does.
+/// prompt that hasn't run with `-32800`, as `session/close` does. The caller has
+/// begun the close (`startClose`), so the line takes nothing new while this runs.
 pub fn cancelAndReapPrompt(state: *ServerState, session: *ActiveSessionState) void {
     {
         var drained = drained: {
             session.waiting_prompts.lock();
             defer session.waiting_prompts.unlock();
-            session.waiting_prompts.closing = true;
             break :drained session.waiting_prompts.drainLocked();
         };
         defer drained.deinit(state.alloc);
-        for (drained.late.items) |steer| answerCancelled(state, steer.request_id);
-        for (drained.queue.items) |queued| if (queued.id) |id| answerCancelled(state, id);
+        for (drained.late.items) |steer| answerCancelled(state, session, steer.from, steer.request_id);
+        for (drained.queue.items) |queued| if (queued.msg.id) |id| answerCancelled(state, session, queued.from, id);
     }
+    // AcpSessionReaders CloseCancel: the cancel stops the turn under the line lock.
     handleCancel(state, session, true);
+    // AcpSessionReaders CloseTakeSlot, CloseJoin and CloseFreeT: the reap takes the
+    // turn, joins it, and frees it.
     reapSessionPrompt(session, true);
-    session.waiting_prompts.lock();
-    session.waiting_prompts.closing = false;
-    session.waiting_prompts.unlock();
 }
 
-/// Answers a prompt that never ran with `-32800`.
-fn answerCancelled(state: *ServerState, id: jsonrpc.RequestId) void {
-    state.writer.writeError(state.alloc, id, .{
+/// Answers a prompt that never ran with `-32800`, to the connection that sent it.
+fn answerCancelled(state: *ServerState, session: *ActiveSessionState, from: ConnectionId, id: jsonrpc.RequestId) void {
+    const answer: Answer = .{ .rpc_error = .{
         .code = ErrorCode.request_cancelled,
         .message = "Request cancelled",
-    }) catch |err| debug_trace.logf("acp", "failed to answer a prompt that never ran err={s}", .{@errorName(err)});
+    } };
+    answerSender(session, state.alloc, from, id, .none, answer, answer) catch |err| debug_trace.logf("acp", "failed to answer a prompt that never ran err={s}", .{@errorName(err)});
+}
+
+/// The answer to a client's prompt or steer: a response, or an error.
+const Answer = union(enum) {
+    response: []const u8,
+    rpc_error: jsonrpc.RpcError,
+};
+
+/// Input a turn never ran: the queued prompt or the steers that waited when the next
+/// turn failed to start, and the error that stopped it.
+const DroppedWaiting = struct {
+    input: prompt_line.Next,
+    err: anyerror,
+};
+
+/// Writes `answer` to the connection that sent request `id`: the owner, `session.server`,
+/// or the follower in `session.followers` with that connection id. A member that takes
+/// `need` gets `with`, the others get `without`. Without `follow_supported` there is one
+/// connection, the owner, and the caller built the owner's body, which both `with` and
+/// `without` hold: it goes straight to the owner's writer, and its error is returned.
+/// Otherwise the audience lock keeps the members still during the write. An error writing
+/// to a follower drops that follower, as `Audience.dropFollower` does, and is traced; the
+/// answer is lost and the turn goes on. An error writing to the owner is returned. A
+/// follower whose writer has stopped is dropped after its write, as `Audience.writeNotification`
+/// drops it, because its answer is lost too. When no member has the sender's id, the sender
+/// has left: nothing is written, and the drop is traced.
+fn answerSender(
+    session: *ActiveSessionState,
+    alloc: Allocator,
+    from: ConnectionId,
+    id: ?jsonrpc.RequestId,
+    need: RunningCopy.Need,
+    with: Answer,
+    without: Answer,
+) !void {
+    // Without `follow_supported` the owner is the only member, and the caller built its
+    // body into both `with` and `without`, so either one is the owner's.
+    if (comptime !follow_supported) return writeAnswer(&session.server.writer, alloc, id, if (memberTakes(session.server, need)) with else without);
+    var audience = lockAudience(session);
+    defer audience.unlock();
+    if (sameConnection(session.server.connection_id, from)) {
+        return writeAnswer(&session.server.writer, alloc, id, if (memberTakes(session.server, need)) with else without);
+    }
+    for (session.followers.items) |member| {
+        if (!sameConnection(member.connection_id, from)) continue;
+        writeAnswer(&member.writer, alloc, id, if (memberTakes(member, need)) with else without) catch |err| {
+            traceDroppedAnswer(session, id, "write_failed", err);
+            audience.dropFollower(member, "session/prompt", .{ .write_failed = err });
+            return;
+        };
+        if (Audience.memberStopped(member)) {
+            traceDroppedAnswer(session, id, "client_gone", null);
+            audience.dropFollower(member, "session/prompt", .client_gone);
+        }
+        return;
+    }
+    traceDroppedAnswer(session, id, "sender_left", null);
+}
+
+fn writeAnswer(writer: *jsonrpc.Writer, alloc: Allocator, id: ?jsonrpc.RequestId, answer: Answer) !void {
+    switch (answer) {
+        .response => |body| try writer.writeResponse(alloc, id, body),
+        .rpc_error => |rpc_error| try writer.writeError(alloc, id, rpc_error),
+    }
+}
+
+/// Answers the input a turn never ran, when the next turn failed to start: each queued
+/// prompt and steer goes to the connection that sent it, with `-32603` and the error
+/// name, the code a failed turn answers with. The caller frees `dropped`.
+fn answerDroppedWaiting(session: *ActiveSessionState, alloc: Allocator, dropped: *const DroppedWaiting) void {
+    switch (dropped.input) {
+        .steers => |steers| {
+            for (steers.items) |steer| answerWaitingInput(session, alloc, steer.from, steer.request_id, dropped.err);
+        },
+        .prompt => |queued| answerWaitingInput(session, alloc, queued.from, queued.msg.id, dropped.err),
+    }
+}
+
+fn answerWaitingInput(session: *ActiveSessionState, alloc: Allocator, from: ConnectionId, id: ?jsonrpc.RequestId, err: anyerror) void {
+    var buf: [32]u8 = undefined;
+    debug_trace.logf("acp", "event=waiting_input_dropped session={s} request={s} reason={s}", .{ session.session_id, requestText(id, &buf), @errorName(err) });
+    const answer: Answer = .{ .rpc_error = .{ .code = ErrorCode.internal_error, .message = @errorName(err) } };
+    answerSender(session, alloc, from, id, .none, answer, answer) catch |write_err|
+        debug_trace.logf("acp", "failed to answer waiting input err={s}", .{@errorName(write_err)});
+}
+
+/// A request id as a trace shows it: its number or text, `none` without one. `buf` holds a number.
+fn requestText(id: ?jsonrpc.RequestId, buf: []u8) []const u8 {
+    const request = id orelse return "none";
+    return switch (request) {
+        .integer => |value| std.mem.print(buf, "{d}", .{value}) catch "?",
+        .string => |text| text,
+        .null => "none",
+    };
+}
+
+/// Traces an answer that was not written. `reason` says why; `err` is the write error, if any.
+fn traceDroppedAnswer(session: *const ActiveSessionState, id: ?jsonrpc.RequestId, reason: []const u8, err: ?anyerror) void {
+    var buf: [32]u8 = undefined;
+    if (err) |value| {
+        debug_trace.logf("acp", "event=answer_dropped session={s} request={s} reason={s} err={s}", .{ session.session_id, requestText(id, &buf), reason, @errorName(value) });
+        return;
+    }
+    debug_trace.logf("acp", "event=answer_dropped session={s} request={s} reason={s}", .{ session.session_id, requestText(id, &buf), reason });
 }
 
 /// Handles `session/close`. Closing an open session stops its turn and closes it, and closing a
@@ -5125,7 +5773,7 @@ pub fn handleCloseSession(state: *ServerState, alloc: Allocator, msg: *jsonrpc.M
     // A session this connection follows is detached, not closed: its owner keeps it open.
     if (comptime follow_supported) {
         if (followsSession(state, session_id)) {
-            detachFollower(state, session_id, "close");
+            detachFollower(state, session_id, .closed);
             forgetFollowing(state, session_id);
             return state.writer.writeResponse(alloc, msg.id, "{}");
         }
@@ -5133,6 +5781,7 @@ pub fn handleCloseSession(state: *ServerState, alloc: Allocator, msg: *jsonrpc.M
     // Closing is idempotent in ACP v1: a session that isn't open, or doesn't exist, closes with the
     // same empty result, and every open session stays open.
     const session = findSession(state, session_id) orelse return state.writer.writeResponse(alloc, msg.id, "{}");
+    startClose(state, session);
     cancelAndReapPrompt(state, session);
     stopSubagentsForSwitch(session);
     closeSession(state, session);
@@ -6818,4 +7467,1837 @@ test "a session is in the shared table until it closes, and a follower is droppe
     const trace = try readTraceFile(alloc, trace_path);
     defer alloc.free(trace);
     try std.testing.expect(std.mem.find(u8, trace, "event=follower_dropped session=session_shared reason=session_closed") != null);
+}
+
+/// Captures the bytes one connection writes, for the answer tests.
+const AnswerWire = struct {
+    alloc: Allocator,
+    bytes: std.ArrayList(u8) = .empty,
+
+    fn write(raw: ?*anyopaque, frame: []const u8) anyerror!void {
+        const self: *AnswerWire = @ptrCast(@alignCast(raw.?));
+        try self.bytes.appendSlice(self.alloc, frame);
+    }
+
+    fn deinit(self: *AnswerWire) void {
+        self.bytes.deinit(self.alloc);
+    }
+};
+
+/// Opens a session on `owner` and lists `follower` as its member, so an answer
+/// can reach either connection.
+fn openAnswerSession(alloc: Allocator, owner: *ServerState, follower: *ServerState) !*ActiveSessionState {
+    owner.cfg.provider_set = @import("../core/gateway/provider_set.zig").gateway_only(test_builtin_gateway.provider_bundle);
+    const session = try openSession(owner, .{
+        .session_id = try alloc.dupe(u8, "session_answers"),
+        .model = try alloc.dupe(u8, "test-model"),
+        .mode = "normal",
+        .workspace_root = &.{},
+        .api_key = &.{},
+        .agent_step_limit = 4,
+        .max_tool_result_bytes = 1024 * 1024,
+        .fast_mode = false,
+        .effort = .auto,
+        .first_call_tool_choice = .auto,
+        .permission_mode = .ask,
+        .permission_rules = .{},
+        .session_rt = .{ .max_history_turns = 8 },
+        .cancel_flag = std.atomic.Value(bool).init(false),
+        .pending_prompt_id = null,
+    }, null);
+    try session.followers.append(alloc, follower);
+    return session;
+}
+
+/// A turn that a prompt sent by connection `from` started, as the worker holds it.
+fn answerTestPrompt(owner: *ServerState, session: *ActiveSessionState, from: ConnectionId) ActivePrompt {
+    return .{
+        .state = owner,
+        .session = session,
+        .alloc = owner.alloc,
+        .msg = .{ .method = "session/prompt", .id = .{ .integer = 7 } },
+        .from = from,
+        .mode = "normal",
+        .permission_mode = .ask,
+    };
+}
+
+test "a queued prompt's answer is written on the connection that sent it, not on the owner's" {
+    const alloc = std.testing.allocator;
+    var owner_wire = AnswerWire{ .alloc = alloc };
+    defer owner_wire.deinit();
+    var follower_wire = AnswerWire{ .alloc = alloc };
+    defer follower_wire.deinit();
+    const launch_root = try alloc.dupe(u8, "/tmp/workspace");
+    var state = ServerState{
+        .alloc = alloc,
+        .cfg = undefined,
+        .writer = jsonrpc.Writer.initCallback(&owner_wire, AnswerWire.write),
+        .launch = .{ .root = launch_root },
+        .connection_id = 1,
+    };
+    defer state.deinit();
+    var follower = ServerState{
+        .alloc = alloc,
+        .cfg = undefined,
+        .writer = jsonrpc.Writer.initCallback(&follower_wire, AnswerWire.write),
+        .connection_id = 2,
+    };
+    const session = try openAnswerSession(alloc, &state, &follower);
+    const owner_before = owner_wire.bytes.items.len;
+
+    var active = answerTestPrompt(&state, session, 2);
+    publishTurnOutcome(&active, 2, .{ .integer = 7 }, &.{}, .{ .stop_reason = .end_turn }, null);
+
+    try std.testing.expectEqual(owner_before, owner_wire.bytes.items.len);
+    try std.testing.expect(std.mem.find(u8, follower_wire.bytes.items, "\"id\":7") != null);
+}
+
+test "a steer's outcome is written on the connection that sent the steer" {
+    const alloc = std.testing.allocator;
+    var owner_wire = AnswerWire{ .alloc = alloc };
+    defer owner_wire.deinit();
+    var follower_wire = AnswerWire{ .alloc = alloc };
+    defer follower_wire.deinit();
+    const launch_root = try alloc.dupe(u8, "/tmp/workspace");
+    var state = ServerState{
+        .alloc = alloc,
+        .cfg = undefined,
+        .writer = jsonrpc.Writer.initCallback(&owner_wire, AnswerWire.write),
+        .launch = .{ .root = launch_root },
+        .connection_id = 1,
+    };
+    defer state.deinit();
+    var follower = ServerState{
+        .alloc = alloc,
+        .cfg = undefined,
+        .writer = jsonrpc.Writer.initCallback(&follower_wire, AnswerWire.write),
+        .connection_id = 2,
+    };
+    const session = try openAnswerSession(alloc, &state, &follower);
+    const owner_before = owner_wire.bytes.items.len;
+
+    var active = answerTestPrompt(&state, session, 1);
+    const steers = [_]libfx_steering.Sender{.{ .id = .{ .integer = 9 }, .from = 2 }};
+    publishTurnOutcome(&active, 1, null, &steers, .{ .stop_reason = .end_turn }, null);
+
+    try std.testing.expectEqual(owner_before, owner_wire.bytes.items.len);
+    try std.testing.expect(std.mem.find(u8, follower_wire.bytes.items, "\"id\":9") != null);
+}
+
+test "an answer to a connection that has left the session is dropped, and no connection gets it" {
+    const alloc = std.testing.allocator;
+    var owner_wire = AnswerWire{ .alloc = alloc };
+    defer owner_wire.deinit();
+    var follower_wire = AnswerWire{ .alloc = alloc };
+    defer follower_wire.deinit();
+    const launch_root = try alloc.dupe(u8, "/tmp/workspace");
+    var state = ServerState{
+        .alloc = alloc,
+        .cfg = undefined,
+        .writer = jsonrpc.Writer.initCallback(&owner_wire, AnswerWire.write),
+        .launch = .{ .root = launch_root },
+        .connection_id = 1,
+    };
+    defer state.deinit();
+    var follower = ServerState{
+        .alloc = alloc,
+        .cfg = undefined,
+        .writer = jsonrpc.Writer.initCallback(&follower_wire, AnswerWire.write),
+        .connection_id = 2,
+    };
+    const session = try openAnswerSession(alloc, &state, &follower);
+    const owner_before = owner_wire.bytes.items.len;
+    const follower_before = follower_wire.bytes.items.len;
+
+    // Connection 3 is not a member: it sent the prompt and then left.
+    var active = answerTestPrompt(&state, session, 3);
+    publishTurnOutcome(&active, 3, .{ .integer = 7 }, &.{}, .{ .stop_reason = .end_turn }, null);
+    answerCancelled(&state, session, 3, .{ .integer = 8 });
+
+    try std.testing.expectEqual(owner_before, owner_wire.bytes.items.len);
+    try std.testing.expectEqual(follower_before, follower_wire.bytes.items.len);
+}
+
+/// Refuses every write, as a follower whose client has gone does.
+fn refuseAnswer(_: ?*anyopaque, _: []const u8) anyerror!void {
+    return error.WriteFailed;
+}
+
+test "a follower that does not list usage gets its answer without the usage meta, while the owner's has it" {
+    const alloc = std.testing.allocator;
+    var owner_wire = AnswerWire{ .alloc = alloc };
+    defer owner_wire.deinit();
+    var follower_wire = AnswerWire{ .alloc = alloc };
+    defer follower_wire.deinit();
+    const launch_root = try alloc.dupe(u8, "/tmp/workspace");
+    var state = ServerState{
+        .alloc = alloc,
+        .cfg = undefined,
+        .writer = jsonrpc.Writer.initCallback(&owner_wire, AnswerWire.write),
+        .launch = .{ .root = launch_root },
+        .connection_id = 1,
+    };
+    defer state.deinit();
+    var follower = ServerState{
+        .alloc = alloc,
+        .cfg = undefined,
+        .writer = jsonrpc.Writer.initCallback(&follower_wire, AnswerWire.write),
+        .connection_id = 2,
+    };
+    const session = try openAnswerSession(alloc, &state, &follower);
+    state.extensions = sh_fx.Set.initMany(&.{.usage});
+    session.turn_summary = .{};
+
+    var owner_turn = answerTestPrompt(&state, session, 1);
+    publishTurnOutcome(&owner_turn, 1, .{ .integer = 7 }, &.{}, .{ .stop_reason = .end_turn }, null);
+    var follower_turn = answerTestPrompt(&state, session, 2);
+    publishTurnOutcome(&follower_turn, 2, .{ .integer = 8 }, &.{}, .{ .stop_reason = .end_turn }, null);
+
+    try std.testing.expect(std.mem.find(u8, owner_wire.bytes.items, "\"sh.fx/usage\"") != null);
+    try std.testing.expect(std.mem.find(u8, follower_wire.bytes.items, "\"id\":8") != null);
+    try std.testing.expect(std.mem.find(u8, follower_wire.bytes.items, "sh.fx/usage") == null);
+}
+
+test "a write that fails to a follower drops it and is traced, and the owner's turn still answers" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const folder = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(folder);
+    const trace_path = try std.Io.Dir.path.join(alloc, &.{ folder, "trace.log" });
+    defer alloc.free(trace_path);
+    debug_trace.resetForTest();
+    try debug_trace.configureForTest(alloc, trace_path);
+    defer debug_trace.resetForTest();
+
+    var owner_wire = AnswerWire{ .alloc = alloc };
+    defer owner_wire.deinit();
+    const launch_root = try alloc.dupe(u8, "/tmp/workspace");
+    var state = ServerState{
+        .alloc = alloc,
+        .cfg = undefined,
+        .writer = jsonrpc.Writer.initCallback(&owner_wire, AnswerWire.write),
+        .launch = .{ .root = launch_root },
+        .connection_id = 1,
+    };
+    defer state.deinit();
+    var follower = ServerState{
+        .alloc = alloc,
+        .cfg = undefined,
+        .writer = jsonrpc.Writer.initCallback(null, refuseAnswer),
+        .connection_id = 2,
+    };
+    const session = try openAnswerSession(alloc, &state, &follower);
+
+    var follower_turn = answerTestPrompt(&state, session, 2);
+    publishTurnOutcome(&follower_turn, 2, .{ .integer = 7 }, &.{}, .{ .stop_reason = .end_turn }, null);
+    try std.testing.expectEqual(@as(usize, 0), session.followers.items.len);
+
+    var owner_turn = answerTestPrompt(&state, session, 1);
+    publishTurnOutcome(&owner_turn, 1, .{ .integer = 8 }, &.{}, .{ .stop_reason = .end_turn }, null);
+    try std.testing.expect(std.mem.find(u8, owner_wire.bytes.items, "\"id\":8") != null);
+
+    const trace = try readTraceFile(alloc, trace_path);
+    defer alloc.free(trace);
+    try std.testing.expect(std.mem.find(u8, trace, "event=answer_dropped session=session_answers request=7 reason=write_failed err=") != null);
+    try std.testing.expect(std.mem.find(u8, trace, "event=follower_dropped session=session_answers") != null);
+}
+
+test "a next turn that fails to start answers each waiting prompt and steer with its error, on its sender's writer" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const folder = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(folder);
+    const trace_path = try std.Io.Dir.path.join(alloc, &.{ folder, "trace.log" });
+    defer alloc.free(trace_path);
+    debug_trace.resetForTest();
+    try debug_trace.configureForTest(alloc, trace_path);
+    defer debug_trace.resetForTest();
+
+    var owner_wire = AnswerWire{ .alloc = alloc };
+    defer owner_wire.deinit();
+    var follower_wire = AnswerWire{ .alloc = alloc };
+    defer follower_wire.deinit();
+    const launch_root = try alloc.dupe(u8, "/tmp/workspace");
+    var state = ServerState{
+        .alloc = alloc,
+        .cfg = undefined,
+        .writer = jsonrpc.Writer.initCallback(&owner_wire, AnswerWire.write),
+        .launch = .{ .root = launch_root },
+        .connection_id = 1,
+    };
+    defer state.deinit();
+    var follower = ServerState{
+        .alloc = alloc,
+        .cfg = undefined,
+        .writer = jsonrpc.Writer.initCallback(&follower_wire, AnswerWire.write),
+        .connection_id = 2,
+    };
+    const session = try openAnswerSession(alloc, &state, &follower);
+
+    // A follower's steer, waiting when the next turn failed to start.
+    var steers: std.ArrayList(libfx_steering.Steer) = .empty;
+    try steers.append(alloc, .{ .text = try alloc.dupe(u8, "steer"), .request_id = .{ .integer = 9 }, .from = 2 });
+    var dropped_steers: DroppedWaiting = .{ .input = .{ .steers = steers }, .err = error.OutOfMemory };
+    defer dropped_steers.input.deinit(alloc);
+
+    // The owner's queued prompt, waiting the same way.
+    const queued_source = jsonrpc.Message{ .id = .{ .integer = 10 }, .method = "session/prompt" };
+    const queued_msg = try cloneMessage(alloc, &queued_source);
+    var dropped_prompt: DroppedWaiting = .{ .input = .{ .prompt = .{ .msg = queued_msg, .from = 1 } }, .err = error.OutOfMemory };
+    defer dropped_prompt.input.deinit(alloc);
+
+    answerDroppedWaiting(session, alloc, &dropped_steers);
+    answerDroppedWaiting(session, alloc, &dropped_prompt);
+
+    try std.testing.expect(std.mem.find(u8, follower_wire.bytes.items, "\"id\":9") != null);
+    try std.testing.expect(std.mem.find(u8, follower_wire.bytes.items, "\"code\":-32603") != null);
+    try std.testing.expect(std.mem.find(u8, follower_wire.bytes.items, "OutOfMemory") != null);
+    try std.testing.expect(std.mem.find(u8, owner_wire.bytes.items, "\"id\":10") != null);
+    try std.testing.expect(std.mem.find(u8, owner_wire.bytes.items, "\"id\":9") == null);
+
+    const trace = try readTraceFile(alloc, trace_path);
+    defer alloc.free(trace);
+    try std.testing.expect(std.mem.find(u8, trace, "event=waiting_input_dropped session=session_answers request=9 reason=OutOfMemory") != null);
+    try std.testing.expect(std.mem.find(u8, trace, "event=waiting_input_dropped session=session_answers request=10 reason=OutOfMemory") != null);
+}
+
+/// A `session/prompt` as a client sends it, for the session tests below.
+const session_prompt_params = "{\"sessionId\":\"session_answers\",\"prompt\":[{\"type\":\"text\",\"text\":\"hi\"}]}";
+
+fn sessionPromptTestMessage(id: i64) jsonrpc.Message {
+    return .{ .id = .{ .integer = id }, .method = "session/prompt", .params_raw = session_prompt_params };
+}
+
+/// A turn's worker as the line sees it. It ends the turn and marks it reapable, then
+/// waits in its tail (`pauseAfterTerminalWrite`) when the test gates it.
+const ParkedTurn = struct {
+    line: *prompt_line.Line,
+    active: *ActivePrompt,
+    reapable_gate: ?*prompt_test_controls.Gate = null,
+    finished: std.atomic.Value(bool) = .init(false),
+
+    fn run(self: *ParkedTurn) void {
+        self.line.lock();
+        self.line.worker_running = false;
+        self.active.reapable.store(true, .seq_cst);
+        self.line.unlock();
+        if (self.reapable_gate) |gate| gate.mark();
+        prompt_test_controls.pauseAfterTerminalWrite();
+        self.finished.store(true, .seq_cst);
+    }
+};
+
+/// One `session/prompt` decided on its own thread, as `decideSessionPrompt` sees it.
+const DecisionCall = struct {
+    state: *ServerState,
+    alloc: Allocator,
+    msg: *const jsonrpc.Message,
+    session: *ActiveSessionState,
+    decision: ?PromptDecision = null,
+    failure: ?anyerror = null,
+    done: std.atomic.Value(bool) = .init(false),
+    /// Marked when the decision returns, if set. A claim that waited has passed its wait, and a
+    /// claim that did not wait has settled at once, so a test that waits on either gate ends.
+    settled: ?*prompt_test_controls.Gate = null,
+    passed: ?*prompt_test_controls.Gate = null,
+
+    fn run(self: *DecisionCall) void {
+        defer {
+            if (self.settled) |gate| gate.mark();
+            if (self.passed) |gate| gate.mark();
+        }
+        if (decideSessionPrompt(self.state, self.alloc, self.msg, self.session)) |decision| {
+            self.decision = decision;
+        } else |err| {
+            self.failure = err;
+        }
+        self.done.store(true, .seq_cst);
+    }
+};
+
+/// One reap of the session's turn, on its own thread.
+const ReapCall = struct {
+    session: *ActiveSessionState,
+    done: std.atomic.Value(bool) = .init(false),
+
+    fn run(self: *ReapCall) void {
+        reapSessionPrompt(self.session, false);
+        self.done.store(true, .seq_cst);
+    }
+};
+
+/// One close of a session, on its own thread.
+const CloseCall = struct {
+    state: *ServerState,
+    session: *ActiveSessionState,
+    done: std.atomic.Value(bool) = .init(false),
+
+    fn run(self: *CloseCall) void {
+        closeSession(self.state, self.session);
+        self.done.store(true, .seq_cst);
+    }
+};
+
+/// Joins a test thread that was started, and forgets it, so it is joined once.
+fn joinIfStarted(thread: *?std.Thread) void {
+    if (thread.*) |running| running.join();
+    thread.* = null;
+}
+
+/// Gives back a turn that a test's claim took. The test starts no thread for it.
+fn giveBackClaim(session: *ActiveSessionState, turn: *ActivePrompt) void {
+    session.waiting_prompts.lock();
+    if (session.prompt == turn) session.prompt = null;
+    session.waiting_prompts.worker_running = false;
+    session.waiting_prompts.unlock();
+    freeActivePrompt(turn);
+}
+
+test "a prompt that arrives after the close has begun is refused, and starts no turn" {
+    const alloc = std.testing.allocator;
+    var owner_wire = AnswerWire{ .alloc = alloc };
+    defer owner_wire.deinit();
+    var follower_wire = AnswerWire{ .alloc = alloc };
+    defer follower_wire.deinit();
+    const launch_root = try alloc.dupe(u8, "/tmp/workspace");
+    var state = ServerState{
+        .alloc = alloc,
+        .cfg = undefined,
+        .writer = jsonrpc.Writer.initCallback(&owner_wire, AnswerWire.write),
+        .launch = .{ .root = launch_root },
+        .connection_id = 1,
+    };
+    defer state.deinit();
+    var follower = ServerState{
+        .alloc = alloc,
+        .cfg = undefined,
+        .writer = jsonrpc.Writer.initCallback(&follower_wire, AnswerWire.write),
+        .connection_id = 2,
+    };
+    const session = try openAnswerSession(alloc, &state, &follower);
+
+    beginClose(session);
+    const msg = sessionPromptTestMessage(7);
+    // The decision alone: a claim here would start a worker that a test cannot run,
+    // so a claimed turn is given back instead.
+    switch (try decideSessionPrompt(&state, alloc, &msg, session)) {
+        .refused => try answerSessionRefused(&state, alloc, msg.id, session.session_id),
+        .claimed => |turn| {
+            giveBackClaim(session, turn);
+            return error.TestUnexpectedResult;
+        },
+        .delivered => return error.TestUnexpectedResult,
+    }
+
+    try std.testing.expect(session.prompt == null);
+    try std.testing.expect(!session.waiting_prompts.worker_running);
+    try std.testing.expect(std.mem.find(u8, owner_wire.bytes.items, "\"code\":-32002") != null);
+}
+
+test "a claim waits while a finished turn is being joined, and claims the slot only after the join" {
+    const alloc = std.testing.allocator;
+    var owner_wire = AnswerWire{ .alloc = alloc };
+    defer owner_wire.deinit();
+    var follower_wire = AnswerWire{ .alloc = alloc };
+    defer follower_wire.deinit();
+    const launch_root = try alloc.dupe(u8, "/tmp/workspace");
+    var state = ServerState{
+        .alloc = alloc,
+        .cfg = undefined,
+        .writer = jsonrpc.Writer.initCallback(&owner_wire, AnswerWire.write),
+        .launch = .{ .root = launch_root },
+        .connection_id = 1,
+    };
+    defer state.deinit();
+    var follower = ServerState{
+        .alloc = alloc,
+        .cfg = undefined,
+        .writer = jsonrpc.Writer.initCallback(&follower_wire, AnswerWire.write),
+        .connection_id = 2,
+    };
+    const session = try openAnswerSession(alloc, &state, &follower);
+    const line = &session.waiting_prompts;
+
+    var tail_gate = prompt_test_controls.Gate{};
+    var reap_gate = prompt_test_controls.Gate{};
+    var join_settled = prompt_test_controls.Gate{};
+    var join_passed = prompt_test_controls.Gate{};
+    prompt_test_controls.tail_gate = &tail_gate;
+    prompt_test_controls.reap_gate = &reap_gate;
+    prompt_test_controls.join_settled = &join_settled;
+    prompt_test_controls.join_passed = &join_passed;
+    defer {
+        prompt_test_controls.tail_gate = null;
+        prompt_test_controls.reap_gate = null;
+        prompt_test_controls.join_settled = null;
+        prompt_test_controls.join_passed = null;
+    }
+
+    // The first turn has ended: its worker is reapable, and it parks in its tail.
+    const first_msg = sessionPromptTestMessage(1);
+    const first = try alloc.create(ActivePrompt);
+    first.* = .{
+        .state = &state,
+        .session = session,
+        .alloc = alloc,
+        .msg = try cloneMessage(alloc, &first_msg),
+        .from = state.connection_id,
+        .mode = session.mode,
+        .permission_mode = session.permission_mode,
+    };
+    line.lock();
+    session.prompt = first;
+    line.worker_running = true;
+    line.unlock();
+    var parked = ParkedTurn{ .line = line, .active = first };
+    first.thread = try std.Thread.spawn(.{}, ParkedTurn.run, .{&parked});
+    tail_gate.awaitReached();
+
+    const reaper_msg = sessionPromptTestMessage(2);
+    const waiter_msg = sessionPromptTestMessage(3);
+    var reaper = DecisionCall{ .state = &state, .alloc = alloc, .msg = &reaper_msg, .session = session };
+    // A claim that does not wait marks both gates when it returns, so a bypass of the join wait
+    // fails the assertion below and does not leave the test waiting on `join_settled`.
+    var waiter = DecisionCall{ .state = &state, .alloc = alloc, .msg = &waiter_msg, .session = session, .settled = &join_settled, .passed = &join_passed };
+    var reaper_thread: ?std.Thread = null;
+    var waiter_thread: ?std.Thread = null;
+    // Runs last: both requests end, and a claim the test took is given back.
+    defer {
+        joinIfStarted(&waiter_thread);
+        joinIfStarted(&reaper_thread);
+        for ([_]*const DecisionCall{ &reaper, &waiter }) |call| {
+            if (call.decision) |decision| switch (decision) {
+                .claimed => |turn| giveBackClaim(session, turn),
+                else => {},
+            };
+        }
+    }
+    // Runs first on a failure, so the parked threads can end.
+    defer {
+        reap_gate.release();
+        tail_gate.release();
+    }
+
+    // The first request reaps the turn: it takes the turn out of the slot, marks it
+    // joining, and parks before the join.
+    reaper_thread = try std.Thread.spawn(.{}, DecisionCall.run, .{&reaper});
+    reap_gate.awaitReached();
+    line.lock();
+    const taken = session.prompt == null and line.joining;
+    line.unlock();
+    try std.testing.expect(taken);
+
+    // A second request arrives during the join. The join cannot end while the parked
+    // tail is held, so the second request cannot have decided yet.
+    waiter_thread = try std.Thread.spawn(.{}, DecisionCall.run, .{&waiter});
+    reap_gate.release();
+    // The claim has settled: it waits for the join, or it has passed its wait.
+    join_settled.awaitReached();
+    try std.testing.expect(!join_passed.hasReached());
+    tail_gate.release();
+    joinIfStarted(&reaper_thread);
+    joinIfStarted(&waiter_thread);
+
+    try std.testing.expect(parked.finished.load(.seq_cst));
+    var claims: usize = 0;
+    var delivered: usize = 0;
+    for ([_]*const DecisionCall{ &reaper, &waiter }) |call| {
+        if (call.failure) |err| return err;
+        switch (call.decision orelse return error.TestUnexpectedResult) {
+            .claimed => claims += 1,
+            .delivered => |outcome| switch (outcome) {
+                .in_progress => delivered += 1,
+                else => return error.TestUnexpectedResult,
+            },
+            .refused => return error.TestUnexpectedResult,
+        }
+    }
+    // Exactly one request claims the turn, and the other is delivered into it.
+    try std.testing.expectEqual(@as(usize, 1), claims);
+    try std.testing.expectEqual(@as(usize, 1), delivered);
+}
+
+test "a reap that finds a join under way waits for it, and joins nothing once the turn is taken" {
+    const alloc = std.testing.allocator;
+    var owner_wire = AnswerWire{ .alloc = alloc };
+    defer owner_wire.deinit();
+    var follower_wire = AnswerWire{ .alloc = alloc };
+    defer follower_wire.deinit();
+    const launch_root = try alloc.dupe(u8, "/tmp/workspace");
+    var state = ServerState{
+        .alloc = alloc,
+        .cfg = undefined,
+        .writer = jsonrpc.Writer.initCallback(&owner_wire, AnswerWire.write),
+        .launch = .{ .root = launch_root },
+        .connection_id = 1,
+    };
+    defer state.deinit();
+    var follower = ServerState{
+        .alloc = alloc,
+        .cfg = undefined,
+        .writer = jsonrpc.Writer.initCallback(&follower_wire, AnswerWire.write),
+        .connection_id = 2,
+    };
+    const session = try openAnswerSession(alloc, &state, &follower);
+    const line = &session.waiting_prompts;
+
+    var reap_gate = prompt_test_controls.Gate{};
+    var ready = prompt_test_controls.Gate{};
+    var join_settled = prompt_test_controls.Gate{};
+    var join_passed = prompt_test_controls.Gate{};
+    prompt_test_controls.reap_gate = &reap_gate;
+    prompt_test_controls.join_settled = &join_settled;
+    prompt_test_controls.join_passed = &join_passed;
+    defer {
+        prompt_test_controls.reap_gate = null;
+        prompt_test_controls.join_settled = null;
+        prompt_test_controls.join_passed = null;
+    }
+
+    // A turn whose worker has ended, so the turn is reapable.
+    const first_msg = sessionPromptTestMessage(1);
+    const first = try alloc.create(ActivePrompt);
+    first.* = .{
+        .state = &state,
+        .session = session,
+        .alloc = alloc,
+        .msg = try cloneMessage(alloc, &first_msg),
+        .from = state.connection_id,
+        .mode = session.mode,
+        .permission_mode = session.permission_mode,
+    };
+    line.lock();
+    session.prompt = first;
+    line.worker_running = true;
+    line.unlock();
+    var ended = ParkedTurn{ .line = line, .active = first, .reapable_gate = &ready };
+    first.thread = try std.Thread.spawn(.{}, ParkedTurn.run, .{&ended});
+    ready.awaitReached();
+
+    var first_reap = ReapCall{ .session = session };
+    var second_reap = ReapCall{ .session = session };
+    var first_thread: ?std.Thread = null;
+    var second_thread: ?std.Thread = null;
+    // Runs last: both reaps end before the test does.
+    defer {
+        joinIfStarted(&second_thread);
+        joinIfStarted(&first_thread);
+    }
+    // Runs first on a failure, so a parked reap can end.
+    defer reap_gate.release();
+
+    // The first reap takes the turn and parks before its join.
+    first_thread = try std.Thread.spawn(.{}, ReapCall.run, .{&first_reap});
+    reap_gate.awaitReached();
+    second_thread = try std.Thread.spawn(.{}, ReapCall.run, .{&second_reap});
+    // The second reap has settled: it waits for the join, or it has passed its wait.
+    join_settled.awaitReached();
+    try std.testing.expect(!join_passed.hasReached());
+    reap_gate.release();
+    joinIfStarted(&first_thread);
+    joinIfStarted(&second_thread);
+
+    try std.testing.expect(second_reap.done.load(.seq_cst));
+    try std.testing.expect(session.prompt == null);
+    try std.testing.expect(!line.joining);
+    try std.testing.expect(ended.finished.load(.seq_cst));
+}
+
+test "a close waits while a follower holds a use, and frees the session only after the release" {
+    const alloc = std.testing.allocator;
+    var owner_wire = AnswerWire{ .alloc = alloc };
+    defer owner_wire.deinit();
+    var follower_wire = AnswerWire{ .alloc = alloc };
+    defer follower_wire.deinit();
+    var shared: SharedSessions = .{};
+    defer shared.deinit(alloc);
+    const launch_root = try alloc.dupe(u8, "/tmp/workspace");
+    var state = ServerState{
+        .alloc = alloc,
+        .cfg = undefined,
+        .writer = jsonrpc.Writer.initCallback(&owner_wire, AnswerWire.write),
+        .launch = .{ .root = launch_root },
+        .connection_id = 1,
+        .shared = &shared,
+    };
+    defer state.deinit();
+    var follower = ServerState{
+        .alloc = alloc,
+        .cfg = undefined,
+        .writer = jsonrpc.Writer.initCallback(&follower_wire, AnswerWire.write),
+        .connection_id = 2,
+    };
+    const session = try openAnswerSession(alloc, &state, &follower);
+
+    // A follower takes a use while the session is still listed.
+    const held = shared.retain(session.session_id) orelse return error.TestUnexpectedResult;
+    var held_live = true;
+    var detached = prompt_test_controls.Gate{};
+    var uses_ended = prompt_test_controls.Gate{};
+    var uses_settled = prompt_test_controls.Gate{};
+    var uses_passed = prompt_test_controls.Gate{};
+    prompt_test_controls.close_detached_gate = &detached;
+    prompt_test_controls.close_uses_gate = &uses_ended;
+    prompt_test_controls.uses_settled = &uses_settled;
+    prompt_test_controls.uses_passed = &uses_passed;
+    defer {
+        prompt_test_controls.close_detached_gate = null;
+        prompt_test_controls.close_uses_gate = null;
+        prompt_test_controls.uses_settled = null;
+        prompt_test_controls.uses_passed = null;
+    }
+    var closer = CloseCall{ .state = &state, .session = session };
+    var closer_thread: ?std.Thread = null;
+    // Runs last: the close ends before the test does.
+    defer joinIfStarted(&closer_thread);
+    // Runs second: a use the test still holds is given back, so the close can end.
+    defer if (held_live) shared.release(held);
+    // Runs first on a failure: a close parked at a gate goes on.
+    defer {
+        detached.release();
+        uses_ended.release();
+    }
+
+    closer_thread = try std.Thread.spawn(.{}, CloseCall.run, .{&closer});
+    // The session has left the table, and the close is about to wait for the held use.
+    detached.awaitReached();
+    detached.release();
+    // The close settles in its wait for the held use. It must not pass that wait.
+    uses_settled.awaitReached();
+    try std.testing.expect(!uses_passed.hasReached());
+    try std.testing.expect(!closer.done.load(.seq_cst));
+
+    shared.release(held);
+    held_live = false;
+    // With the use released, the close passes the wait and parks before it frees the
+    // session.
+    uses_ended.awaitReached();
+    try std.testing.expect(!closer.done.load(.seq_cst));
+    uses_ended.release();
+    joinIfStarted(&closer_thread);
+    try std.testing.expect(closer.done.load(.seq_cst));
+}
+
+test "after a close has taken the session out of the table, retain finds nothing" {
+    const alloc = std.testing.allocator;
+    var owner_wire = AnswerWire{ .alloc = alloc };
+    defer owner_wire.deinit();
+    var follower_wire = AnswerWire{ .alloc = alloc };
+    defer follower_wire.deinit();
+    var shared: SharedSessions = .{};
+    defer shared.deinit(alloc);
+    const launch_root = try alloc.dupe(u8, "/tmp/workspace");
+    var state = ServerState{
+        .alloc = alloc,
+        .cfg = undefined,
+        .writer = jsonrpc.Writer.initCallback(&owner_wire, AnswerWire.write),
+        .launch = .{ .root = launch_root },
+        .connection_id = 1,
+        .shared = &shared,
+    };
+    defer state.deinit();
+    var follower = ServerState{
+        .alloc = alloc,
+        .cfg = undefined,
+        .writer = jsonrpc.Writer.initCallback(&follower_wire, AnswerWire.write),
+        .connection_id = 2,
+    };
+    const session = try openAnswerSession(alloc, &state, &follower);
+
+    var detached = prompt_test_controls.Gate{};
+    prompt_test_controls.close_detached_gate = &detached;
+    defer prompt_test_controls.close_detached_gate = null;
+    var closer = CloseCall{ .state = &state, .session = session };
+    var closer_thread: ?std.Thread = null;
+    // Runs last: the close ends before the test does.
+    defer joinIfStarted(&closer_thread);
+    // Runs first on a failure: a close parked at the gate goes on.
+    defer detached.release();
+
+    closer_thread = try std.Thread.spawn(.{}, CloseCall.run, .{&closer});
+    detached.awaitReached();
+    // The close has taken the session out of the table, so no follower can take a use.
+    if (shared.retain(session.session_id)) |found| {
+        // Give the use back, so the close can end, and then fail.
+        shared.release(found);
+        return error.TestUnexpectedResult;
+    }
+    detached.release();
+    joinIfStarted(&closer_thread);
+    try std.testing.expect(closer.done.load(.seq_cst));
+}
+
+/// A `session/prompt` that queues behind a running turn (`sh.fx/delivery` = queue).
+const queue_session_prompt_params = "{\"sessionId\":\"session_answers\",\"prompt\":[{\"type\":\"text\",\"text\":\"later\"}],\"_meta\":{\"sh.fx/delivery\":\"queue\"}}";
+/// A `session/prompt` that steers a running turn (`sh.fx/delivery` = steer).
+const steer_session_prompt_params = "{\"sessionId\":\"session_answers\",\"prompt\":[{\"type\":\"text\",\"text\":\"now\"}],\"_meta\":{\"sh.fx/delivery\":\"steer\"}}";
+
+fn queuedTestMessage(id: i64) jsonrpc.Message {
+    return .{ .id = .{ .integer = id }, .method = "session/prompt", .params_raw = queue_session_prompt_params };
+}
+
+fn steerTestMessage(id: i64) jsonrpc.Message {
+    return .{ .id = .{ .integer = id }, .method = "session/prompt", .params_raw = steer_session_prompt_params };
+}
+
+/// Whether a prompt's decision claimed the session's turn.
+fn isClaim(decision: PromptDecision) bool {
+    return switch (decision) {
+        .claimed => true,
+        else => false,
+    };
+}
+
+/// Gives back the turns that decisions claimed in a test, so no test leaves a turn in a session.
+fn giveBackClaims(session: *ActiveSessionState, calls: []const *const DecisionCall) void {
+    for (calls) |call| {
+        if (call.decision) |decision| switch (decision) {
+            .claimed => |turn| giveBackClaim(session, turn),
+            else => {},
+        };
+    }
+}
+
+test "a follower's prompt on an idle session starts a turn that runs on the owner's state, and its answer goes to the follower only" {
+    const alloc = std.testing.allocator;
+    var owner_wire = AnswerWire{ .alloc = alloc };
+    defer owner_wire.deinit();
+    var follower_wire = AnswerWire{ .alloc = alloc };
+    defer follower_wire.deinit();
+    var shared: SharedSessions = .{};
+    defer shared.deinit(alloc);
+    const launch_root = try alloc.dupe(u8, "/tmp/workspace");
+    var state = ServerState{
+        .alloc = alloc,
+        .cfg = undefined,
+        .writer = jsonrpc.Writer.initCallback(&owner_wire, AnswerWire.write),
+        .launch = .{ .root = launch_root },
+        .connection_id = 1,
+        .shared = &shared,
+    };
+    defer state.deinit();
+    state.cfg.minimal_kernel = false;
+    var follower = ServerState{
+        .alloc = alloc,
+        .cfg = undefined,
+        .writer = jsonrpc.Writer.initCallback(&follower_wire, AnswerWire.write),
+        .connection_id = 2,
+        .shared = &shared,
+    };
+    follower.cfg.minimal_kernel = false;
+    const session = try openAnswerSession(alloc, &state, &follower);
+    const owner_before = owner_wire.bytes.items.len;
+
+    // The follower's prompt finds the session idle, so it claims the turn. No thread starts here.
+    const msg = sessionPromptTestMessage(4);
+    var turn: ?*ActivePrompt = null;
+    defer if (turn) |claimed| giveBackClaim(session, claimed);
+    switch (try decideSessionPrompt(&follower, alloc, &msg, session)) {
+        .claimed => |claimed| turn = claimed,
+        else => return error.TestUnexpectedResult,
+    }
+    const won = turn orelse return error.TestUnexpectedResult;
+
+    // The turn runs on the owner's state, and its answer goes to the follower's connection.
+    try std.testing.expect(won.state == &state);
+    try std.testing.expectEqual(@as(ConnectionId, 2), won.from);
+    publishTurnOutcome(won, 2, .{ .integer = 4 }, &.{}, .{ .stop_reason = .end_turn }, null);
+    try std.testing.expectEqual(owner_before, owner_wire.bytes.items.len);
+    try std.testing.expect(std.mem.find(u8, follower_wire.bytes.items, "\"id\":4") != null);
+}
+
+test "a follower's queued prompt and steer, sent while the owner's turn runs, are delivered, and the steer's answer goes to the follower" {
+    const alloc = std.testing.allocator;
+    var owner_wire = AnswerWire{ .alloc = alloc };
+    defer owner_wire.deinit();
+    var follower_wire = AnswerWire{ .alloc = alloc };
+    defer follower_wire.deinit();
+    var shared: SharedSessions = .{};
+    defer shared.deinit(alloc);
+    const launch_root = try alloc.dupe(u8, "/tmp/workspace");
+    var state = ServerState{
+        .alloc = alloc,
+        .cfg = undefined,
+        .writer = jsonrpc.Writer.initCallback(&owner_wire, AnswerWire.write),
+        .launch = .{ .root = launch_root },
+        .connection_id = 1,
+        .shared = &shared,
+    };
+    defer state.deinit();
+    state.cfg.minimal_kernel = false;
+    var follower = ServerState{
+        .alloc = alloc,
+        .cfg = undefined,
+        .writer = jsonrpc.Writer.initCallback(&follower_wire, AnswerWire.write),
+        .connection_id = 2,
+        .shared = &shared,
+    };
+    follower.cfg.minimal_kernel = false;
+    const session = try openAnswerSession(alloc, &state, &follower);
+
+    // The owner's prompt claims the turn, which runs until the test ends it.
+    const owner_msg = sessionPromptTestMessage(1);
+    var turn: ?*ActivePrompt = null;
+    defer if (turn) |running| giveBackClaim(session, running);
+    switch (try decideSessionPrompt(&state, alloc, &owner_msg, session)) {
+        .claimed => |running| turn = running,
+        else => return error.TestUnexpectedResult,
+    }
+    const running = turn orelse return error.TestUnexpectedResult;
+    const owner_before = owner_wire.bytes.items.len;
+
+    // The follower queues a prompt and steers the running turn.
+    const queue_msg = queuedTestMessage(6);
+    switch (try decideSessionPrompt(&follower, alloc, &queue_msg, session)) {
+        .delivered => |outcome| switch (outcome) {
+            .queued => {},
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    const steer_msg = steerTestMessage(7);
+    switch (try decideSessionPrompt(&follower, alloc, &steer_msg, session)) {
+        .delivered => |outcome| switch (outcome) {
+            .steered => {},
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    // Neither prompt reaches the owner, and the queued prompt waits under the follower's connection.
+    try std.testing.expectEqual(owner_before, owner_wire.bytes.items.len);
+    {
+        const line = &session.waiting_prompts;
+        line.lock();
+        defer line.unlock();
+        try std.testing.expectEqual(@as(usize, 1), line.queue.items.len);
+        try std.testing.expectEqual(@as(ConnectionId, 2), line.queue.items[0].from);
+    }
+
+    // The turn ends and answers the steer on the follower's writer, and not on the owner's.
+    const steers = [_]libfx_steering.Sender{.{ .id = .{ .integer = 7 }, .from = 2 }};
+    publishTurnOutcome(running, 1, .{ .integer = 1 }, &steers, .{ .stop_reason = .end_turn }, null);
+    try std.testing.expect(std.mem.find(u8, follower_wire.bytes.items, "\"id\":7") != null);
+    try std.testing.expectEqual(owner_before, owner_wire.bytes.items.len);
+
+    // With the turn given back, closing the session answers the queued prompt on the follower's writer.
+    giveBackClaim(session, running);
+    turn = null;
+    cancelAndReapPrompt(&state, session);
+    try std.testing.expect(std.mem.find(u8, follower_wire.bytes.items, "\"id\":6") != null);
+}
+
+test "a follower's $/cancel_request withdraws its own queued prompt, and not the owner's prompt with the same request id" {
+    const alloc = std.testing.allocator;
+    var owner_wire = AnswerWire{ .alloc = alloc };
+    defer owner_wire.deinit();
+    var follower_wire = AnswerWire{ .alloc = alloc };
+    defer follower_wire.deinit();
+    var shared: SharedSessions = .{};
+    defer shared.deinit(alloc);
+    const launch_root = try alloc.dupe(u8, "/tmp/workspace");
+    var state = ServerState{
+        .alloc = alloc,
+        .cfg = undefined,
+        .writer = jsonrpc.Writer.initCallback(&owner_wire, AnswerWire.write),
+        .launch = .{ .root = launch_root },
+        .connection_id = 1,
+        .shared = &shared,
+    };
+    defer state.deinit();
+    state.cfg.minimal_kernel = false;
+    var follower = ServerState{
+        .alloc = alloc,
+        .cfg = undefined,
+        .writer = jsonrpc.Writer.initCallback(&follower_wire, AnswerWire.write),
+        .connection_id = 2,
+        .shared = &shared,
+    };
+    follower.cfg.minimal_kernel = false;
+    const session = try openAnswerSession(alloc, &state, &follower);
+    // The follower's list buffer is freed last (defers run in reverse), after the entry is forgotten.
+    defer follower.following.deinit(alloc);
+    _ = try recordFollowing(&follower, "session_answers");
+    defer forgetFollowing(&follower, "session_answers");
+
+    // The owner's turn runs. The owner and the follower each queue a prompt with request id 5.
+    const owner_turn_msg = sessionPromptTestMessage(1);
+    var turn: ?*ActivePrompt = null;
+    defer if (turn) |running| giveBackClaim(session, running);
+    switch (try decideSessionPrompt(&state, alloc, &owner_turn_msg, session)) {
+        .claimed => |running| turn = running,
+        else => return error.TestUnexpectedResult,
+    }
+    const running = turn orelse return error.TestUnexpectedResult;
+    const owner_queued = queuedTestMessage(5);
+    switch (try decideSessionPrompt(&state, alloc, &owner_queued, session)) {
+        .delivered => |outcome| switch (outcome) {
+            .queued => {},
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    const follower_queued = queuedTestMessage(5);
+    switch (try decideSessionPrompt(&follower, alloc, &follower_queued, session)) {
+        .delivered => |outcome| switch (outcome) {
+            .queued => {},
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    const owner_before = owner_wire.bytes.items.len;
+
+    // The follower cancels request 5.
+    handleRequestCancellation(&follower, alloc, "{\"requestId\":5}");
+
+    // Only the owner's queued prompt remains, and the follower alone got the cancel answer.
+    {
+        const line = &session.waiting_prompts;
+        line.lock();
+        defer line.unlock();
+        try std.testing.expectEqual(@as(usize, 1), line.queue.items.len);
+        try std.testing.expectEqual(@as(ConnectionId, 1), line.queue.items[0].from);
+    }
+    try std.testing.expect(std.mem.find(u8, follower_wire.bytes.items, "\"id\":5") != null);
+    try std.testing.expect(std.mem.find(u8, follower_wire.bytes.items, "-32800") != null);
+    try std.testing.expectEqual(owner_before, owner_wire.bytes.items.len);
+
+    giveBackClaim(session, running);
+    turn = null;
+}
+
+test "two prompts that arrive together on an idle session start one turn, and the other is delivered into it" {
+    const alloc = std.testing.allocator;
+    var owner_wire = AnswerWire{ .alloc = alloc };
+    defer owner_wire.deinit();
+    var follower_wire = AnswerWire{ .alloc = alloc };
+    defer follower_wire.deinit();
+    var shared: SharedSessions = .{};
+    defer shared.deinit(alloc);
+    const launch_root = try alloc.dupe(u8, "/tmp/workspace");
+    var state = ServerState{
+        .alloc = alloc,
+        .cfg = undefined,
+        .writer = jsonrpc.Writer.initCallback(&owner_wire, AnswerWire.write),
+        .launch = .{ .root = launch_root },
+        .connection_id = 1,
+        .shared = &shared,
+    };
+    defer state.deinit();
+    state.cfg.minimal_kernel = false;
+    var follower = ServerState{
+        .alloc = alloc,
+        .cfg = undefined,
+        .writer = jsonrpc.Writer.initCallback(&follower_wire, AnswerWire.write),
+        .connection_id = 2,
+        .shared = &shared,
+    };
+    follower.cfg.minimal_kernel = false;
+    const session = try openAnswerSession(alloc, &state, &follower);
+
+    // Each prompt decides on its own thread. The owner's parks before the line lock, so the
+    // follower's decides while it waits, and both see an idle slot.
+    const owner_msg = sessionPromptTestMessage(1);
+    const follower_msg = sessionPromptTestMessage(2);
+    var owner_call = DecisionCall{ .state = &state, .alloc = alloc, .msg = &owner_msg, .session = session };
+    var follower_call = DecisionCall{ .state = &follower, .alloc = alloc, .msg = &follower_msg, .session = session };
+    const calls = [_]*const DecisionCall{ &owner_call, &follower_call };
+    var owner_thread: ?std.Thread = null;
+    var follower_thread: ?std.Thread = null;
+    var gate = prompt_test_controls.Gate{};
+    prompt_test_controls.decision_gate = &gate;
+    defer prompt_test_controls.decision_gate = null;
+    // Runs last, after the threads end: every turn a decision claimed is given back.
+    defer giveBackClaims(session, &calls);
+    defer joinIfStarted(&follower_thread);
+    defer joinIfStarted(&owner_thread);
+    // Runs first on a failure, so a parked prompt can go on and the threads can end.
+    defer gate.release();
+
+    owner_thread = try std.Thread.spawn(.{}, DecisionCall.run, .{&owner_call});
+    gate.awaitReached();
+    follower_thread = try std.Thread.spawn(.{}, DecisionCall.run, .{&follower_call});
+    joinIfStarted(&follower_thread);
+    gate.release();
+    joinIfStarted(&owner_thread);
+
+    if (owner_call.failure) |err| return err;
+    if (follower_call.failure) |err| return err;
+    const owner_decision = owner_call.decision orelse return error.TestUnexpectedResult;
+    const follower_decision = follower_call.decision orelse return error.TestUnexpectedResult;
+
+    // Exactly one of the two claims the turn, and the claimed turn runs on the owner's state.
+    const owner_claims = isClaim(owner_decision);
+    try std.testing.expect(owner_claims != isClaim(follower_decision));
+    const winner = if (owner_claims) owner_decision else follower_decision;
+    const won = switch (winner) {
+        .claimed => |turn| turn,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expect(won.state == &state);
+
+    // The other prompt is delivered into that turn, and gets the delivery path's answer on its own writer.
+    const loser_state: *ServerState = if (owner_claims) &follower else &state;
+    const loser_msg: *const jsonrpc.Message = if (owner_claims) &follower_msg else &owner_msg;
+    const loser_decision = if (owner_claims) follower_decision else owner_decision;
+    switch (loser_decision) {
+        .delivered => |outcome| try answerDelivery(loser_state, alloc, loser_msg, outcome),
+        else => return error.TestUnexpectedResult,
+    }
+    const loser_wire = if (owner_claims) &follower_wire else &owner_wire;
+    try std.testing.expect(std.mem.find(u8, loser_wire.bytes.items, "\"code\":-32600") != null);
+}
+
+test "a follower's $/cancel_request with its own running prompt's id stops that turn, and the follower gets the cancelled answer" {
+    const alloc = std.testing.allocator;
+    var owner_wire = AnswerWire{ .alloc = alloc };
+    defer owner_wire.deinit();
+    var follower_wire = AnswerWire{ .alloc = alloc };
+    defer follower_wire.deinit();
+    var shared: SharedSessions = .{};
+    defer shared.deinit(alloc);
+    const launch_root = try alloc.dupe(u8, "/tmp/workspace");
+    var state = ServerState{
+        .alloc = alloc,
+        .cfg = undefined,
+        .writer = jsonrpc.Writer.initCallback(&owner_wire, AnswerWire.write),
+        .launch = .{ .root = launch_root },
+        .connection_id = 1,
+        .shared = &shared,
+    };
+    defer state.deinit();
+    state.cfg.minimal_kernel = false;
+    var follower = ServerState{
+        .alloc = alloc,
+        .cfg = undefined,
+        .writer = jsonrpc.Writer.initCallback(&follower_wire, AnswerWire.write),
+        .connection_id = 2,
+        .shared = &shared,
+    };
+    follower.cfg.minimal_kernel = false;
+    const session = try openAnswerSession(alloc, &state, &follower);
+    // The list buffer is freed last (defers run in reverse), after the entry is forgotten.
+    defer follower.following.deinit(alloc);
+    _ = try recordFollowing(&follower, "session_answers");
+    defer forgetFollowing(&follower, "session_answers");
+
+    // The follower's own prompt starts the turn, with request id 4.
+    const msg = sessionPromptTestMessage(4);
+    var turn: ?*ActivePrompt = null;
+    defer if (turn) |claimed| giveBackClaim(session, claimed);
+    switch (try decideSessionPrompt(&follower, alloc, &msg, session)) {
+        .claimed => |claimed| turn = claimed,
+        else => return error.TestUnexpectedResult,
+    }
+    const running = turn orelse return error.TestUnexpectedResult;
+    const owner_before = owner_wire.bytes.items.len;
+
+    // The follower cancels request 4, the prompt its own connection started.
+    handleRequestCancellation(&follower, alloc, "{\"requestId\":4}");
+    try std.testing.expect(session.turn_cancel.load(.seq_cst));
+
+    // The turn ends with the cancelled answer, which goes to the follower and not to the owner.
+    publishTurnOutcome(running, 2, .{ .integer = 4 }, &.{}, .{ .stop_reason = .cancelled }, null);
+    try std.testing.expect(std.mem.find(u8, follower_wire.bytes.items, "\"id\":4") != null);
+    try std.testing.expect(std.mem.find(u8, follower_wire.bytes.items, "\"stopReason\":\"cancelled\"") != null);
+    try std.testing.expectEqual(owner_before, owner_wire.bytes.items.len);
+
+    giveBackClaim(session, running);
+    turn = null;
+}
+
+test "a follower's $/cancel_request with the same request id number as the owner's running prompt does not stop the owner's turn" {
+    const alloc = std.testing.allocator;
+    var owner_wire = AnswerWire{ .alloc = alloc };
+    defer owner_wire.deinit();
+    var follower_wire = AnswerWire{ .alloc = alloc };
+    defer follower_wire.deinit();
+    var shared: SharedSessions = .{};
+    defer shared.deinit(alloc);
+    const launch_root = try alloc.dupe(u8, "/tmp/workspace");
+    var state = ServerState{
+        .alloc = alloc,
+        .cfg = undefined,
+        .writer = jsonrpc.Writer.initCallback(&owner_wire, AnswerWire.write),
+        .launch = .{ .root = launch_root },
+        .connection_id = 1,
+        .shared = &shared,
+    };
+    defer state.deinit();
+    state.cfg.minimal_kernel = false;
+    var follower = ServerState{
+        .alloc = alloc,
+        .cfg = undefined,
+        .writer = jsonrpc.Writer.initCallback(&follower_wire, AnswerWire.write),
+        .connection_id = 2,
+        .shared = &shared,
+    };
+    follower.cfg.minimal_kernel = false;
+    const session = try openAnswerSession(alloc, &state, &follower);
+    // The list buffer is freed last (defers run in reverse), after the entry is forgotten.
+    defer follower.following.deinit(alloc);
+    _ = try recordFollowing(&follower, "session_answers");
+    defer forgetFollowing(&follower, "session_answers");
+
+    // The owner's prompt starts the turn, with request id 1.
+    const owner_msg = sessionPromptTestMessage(1);
+    var turn: ?*ActivePrompt = null;
+    defer if (turn) |claimed| giveBackClaim(session, claimed);
+    switch (try decideSessionPrompt(&state, alloc, &owner_msg, session)) {
+        .claimed => |claimed| turn = claimed,
+        else => return error.TestUnexpectedResult,
+    }
+    const running = turn orelse return error.TestUnexpectedResult;
+    const owner_before = owner_wire.bytes.items.len;
+    const follower_before = follower_wire.bytes.items.len;
+
+    // The follower cancels request 1, a number its own connection never sent. The owner's
+    // turn is not the follower's, so nothing stops, and nothing is answered.
+    handleRequestCancellation(&follower, alloc, "{\"requestId\":1}");
+    try std.testing.expect(!session.turn_cancel.load(.seq_cst));
+    try std.testing.expect(session.prompt == running);
+    try std.testing.expectEqual(owner_before, owner_wire.bytes.items.len);
+    try std.testing.expectEqual(follower_before, follower_wire.bytes.items.len);
+
+    giveBackClaim(session, running);
+    turn = null;
+}
+
+/// Two connections of one process: the owner, which opened the session `session_answers`,
+/// and a follower that joined it. The follower's cancel tests share this setup.
+const CancelPair = struct {
+    owner_wire: AnswerWire,
+    follower_wire: AnswerWire,
+    shared: SharedSessions = .{},
+    state: ServerState,
+    follower: ServerState,
+    session: *ActiveSessionState,
+
+    fn open(self: *CancelPair, alloc: Allocator) !void {
+        self.shared = .{};
+        self.owner_wire = .{ .alloc = alloc };
+        self.follower_wire = .{ .alloc = alloc };
+        self.state = .{
+            .alloc = alloc,
+            .cfg = undefined,
+            .writer = jsonrpc.Writer.initCallback(&self.owner_wire, AnswerWire.write),
+            .launch = .{ .root = try alloc.dupe(u8, "/tmp/workspace") },
+            .connection_id = 1,
+            .shared = &self.shared,
+        };
+        self.state.cfg.minimal_kernel = false;
+        self.follower = .{
+            .alloc = alloc,
+            .cfg = undefined,
+            .writer = jsonrpc.Writer.initCallback(&self.follower_wire, AnswerWire.write),
+            .connection_id = 2,
+            .shared = &self.shared,
+            .initialized = true,
+        };
+        self.follower.cfg.minimal_kernel = false;
+        self.session = try openAnswerSession(alloc, &self.state, &self.follower);
+        _ = try recordFollowing(&self.follower, "session_answers");
+    }
+
+    fn close(self: *CancelPair, alloc: Allocator) void {
+        forgetFollowing(&self.follower, "session_answers");
+        self.follower.following.deinit(alloc);
+        self.state.deinit();
+        self.shared.deinit(alloc);
+        self.follower_wire.deinit();
+        self.owner_wire.deinit();
+    }
+};
+
+test "a follower's session/cancel request stops the owner's running turn, and the prompt's answer goes to its sender" {
+    const alloc = std.testing.allocator;
+    var pair: CancelPair = undefined;
+    try pair.open(alloc);
+    defer pair.close(alloc);
+
+    // The owner's prompt starts the turn, with request id 1.
+    const owner_msg = sessionPromptTestMessage(1);
+    var turn: ?*ActivePrompt = null;
+    defer if (turn) |claimed| giveBackClaim(pair.session, claimed);
+    switch (try decideSessionPrompt(&pair.state, alloc, &owner_msg, pair.session)) {
+        .claimed => |claimed| turn = claimed,
+        else => return error.TestUnexpectedResult,
+    }
+    const running = turn orelse return error.TestUnexpectedResult;
+    const owner_before = pair.owner_wire.bytes.items.len;
+
+    // The follower cancels with a request of its own, and gets the answer the owner's cancel gets.
+    var cancel_msg = jsonrpc.Message{
+        .id = .{ .integer = 9 },
+        .method = "session/cancel",
+        .params_raw = "{\"sessionId\":\"session_answers\"}",
+    };
+    try dispatch(&pair.follower, alloc, &cancel_msg);
+    try std.testing.expect(pair.session.turn_cancel.load(.seq_cst));
+    try std.testing.expect(std.mem.find(u8, pair.follower_wire.bytes.items, "\"id\":9") != null);
+    try std.testing.expect(std.mem.find(u8, pair.follower_wire.bytes.items, "\"result\":null") != null);
+    try std.testing.expectEqual(owner_before, pair.owner_wire.bytes.items.len);
+
+    // The turn ends cancelled. The prompt's sender, the owner, gets the cancelled answer.
+    const follower_before = pair.follower_wire.bytes.items.len;
+    publishTurnOutcome(running, 1, .{ .integer = 1 }, &.{}, .{ .stop_reason = .cancelled }, null);
+    try std.testing.expect(std.mem.find(u8, pair.owner_wire.bytes.items, "\"stopReason\":\"cancelled\"") != null);
+    try std.testing.expectEqual(follower_before, pair.follower_wire.bytes.items.len);
+
+    giveBackClaim(pair.session, running);
+    turn = null;
+}
+
+test "a follower's session/cancel sends $/cancel_request to the owner's client for the permission request the turn waits for" {
+    const alloc = std.testing.allocator;
+    var pair: CancelPair = undefined;
+    try pair.open(alloc);
+    defer pair.close(alloc);
+
+    // The owner's turn runs, and it waits for the client's answer to a permission request.
+    const owner_msg = sessionPromptTestMessage(1);
+    var turn: ?*ActivePrompt = null;
+    defer if (turn) |claimed| giveBackClaim(pair.session, claimed);
+    switch (try decideSessionPrompt(&pair.state, alloc, &owner_msg, pair.session)) {
+        .claimed => |claimed| turn = claimed,
+        else => return error.TestUnexpectedResult,
+    }
+    const running = turn orelse return error.TestUnexpectedResult;
+    const permission = beginPermissionRequest(&pair.state, pair.session) orelse return error.TestUnexpectedResult;
+
+    // The follower cancels. The owner's client is told to cancel the permission request.
+    var cancel_msg = jsonrpc.Message{
+        .id = .{ .integer = 9 },
+        .method = "session/cancel",
+        .params_raw = "{\"sessionId\":\"session_answers\"}",
+    };
+    try dispatch(&pair.follower, alloc, &cancel_msg);
+    var needle_buf: [40]u8 = undefined;
+    const needle = try std.fmt.bufPrint(&needle_buf, "\"requestId\":{d}", .{permission});
+    try std.testing.expect(std.mem.find(u8, pair.owner_wire.bytes.items, "\"method\":\"$/cancel_request\"") != null);
+    try std.testing.expect(std.mem.find(u8, pair.owner_wire.bytes.items, needle) != null);
+
+    // The request ends as cancelled, so the wait ends with a denial.
+    try std.testing.expectEqual(types.ToolPermissionDecision.deny, awaitPermissionDecision(&pair.state, permission));
+
+    giveBackClaim(pair.session, running);
+    turn = null;
+}
+
+test "a follower's session/cancel notification stops the owner's running turn, and gets no answer" {
+    const alloc = std.testing.allocator;
+    var pair: CancelPair = undefined;
+    try pair.open(alloc);
+    defer pair.close(alloc);
+
+    const owner_msg = sessionPromptTestMessage(1);
+    var turn: ?*ActivePrompt = null;
+    defer if (turn) |claimed| giveBackClaim(pair.session, claimed);
+    switch (try decideSessionPrompt(&pair.state, alloc, &owner_msg, pair.session)) {
+        .claimed => |claimed| turn = claimed,
+        else => return error.TestUnexpectedResult,
+    }
+    const running = turn orelse return error.TestUnexpectedResult;
+    const owner_before = pair.owner_wire.bytes.items.len;
+    const follower_before = pair.follower_wire.bytes.items.len;
+
+    // A notification has no id, so the follower gets nothing back, and the turn stops.
+    var cancel_note = jsonrpc.Message{
+        .id = null,
+        .method = "session/cancel",
+        .params_raw = "{\"sessionId\":\"session_answers\"}",
+    };
+    try dispatchNotification(&pair.follower, alloc, &cancel_note);
+    try std.testing.expect(pair.session.turn_cancel.load(.seq_cst));
+    try std.testing.expectEqual(follower_before, pair.follower_wire.bytes.items.len);
+    try std.testing.expectEqual(owner_before, pair.owner_wire.bytes.items.len);
+
+    giveBackClaim(pair.session, running);
+    turn = null;
+}
+
+test "a session/cancel for a session this connection neither owns nor follows gets -32002 and stops nothing" {
+    const alloc = std.testing.allocator;
+    var pair: CancelPair = undefined;
+    try pair.open(alloc);
+    defer pair.close(alloc);
+
+    // A third connection of the process, which neither opened nor follows the session.
+    var stranger_wire = AnswerWire{ .alloc = alloc };
+    defer stranger_wire.deinit();
+    var stranger = ServerState{
+        .alloc = alloc,
+        .cfg = undefined,
+        .writer = jsonrpc.Writer.initCallback(&stranger_wire, AnswerWire.write),
+        .connection_id = 3,
+        .shared = &pair.shared,
+        .initialized = true,
+    };
+    stranger.cfg.minimal_kernel = false;
+
+    var cancel_msg = jsonrpc.Message{
+        .id = .{ .integer = 4 },
+        .method = "session/cancel",
+        .params_raw = "{\"sessionId\":\"session_answers\"}",
+    };
+    try dispatch(&stranger, alloc, &cancel_msg);
+    try std.testing.expect(std.mem.find(u8, stranger_wire.bytes.items, "\"code\":-32002") != null);
+    try std.testing.expect(std.mem.find(u8, stranger_wire.bytes.items, "No active session") != null);
+    try std.testing.expect(!pair.session.turn_cancel.load(.seq_cst));
+}
+
+test "a follower's cancel on an idle session does not stop the next turn" {
+    const alloc = std.testing.allocator;
+    var pair: CancelPair = undefined;
+    try pair.open(alloc);
+    defer pair.close(alloc);
+
+    // The cancel arrives while no turn runs. It sets the flag, and the follower gets its answer.
+    var cancel_msg = jsonrpc.Message{
+        .id = .{ .integer = 9 },
+        .method = "session/cancel",
+        .params_raw = "{\"sessionId\":\"session_answers\"}",
+    };
+    try dispatch(&pair.follower, alloc, &cancel_msg);
+    try std.testing.expect(pair.session.turn_cancel.load(.seq_cst));
+    try std.testing.expect(std.mem.find(u8, pair.follower_wire.bytes.items, "\"id\":9,\"result\":null") != null);
+
+    // The owner's next prompt claims the turn. The claim clears both flags, so the cancel does not reach it.
+    const owner_msg = sessionPromptTestMessage(1);
+    var turn: ?*ActivePrompt = null;
+    defer if (turn) |claimed| giveBackClaim(pair.session, claimed);
+    switch (try decideSessionPrompt(&pair.state, alloc, &owner_msg, pair.session)) {
+        .claimed => |claimed| turn = claimed,
+        else => return error.TestUnexpectedResult,
+    }
+    const running = turn orelse return error.TestUnexpectedResult;
+    try std.testing.expect(!pair.session.turn_cancel.load(.seq_cst));
+    try std.testing.expect(!pair.session.cancel_flag.load(.seq_cst));
+
+    // The turn ends normally, and its sender, the owner, gets end_turn.
+    publishTurnOutcome(running, 1, .{ .integer = 1 }, &.{}, .{ .stop_reason = .end_turn }, null);
+    try std.testing.expect(std.mem.find(u8, pair.owner_wire.bytes.items, "\"stopReason\":\"end_turn\"") != null);
+
+    giveBackClaim(pair.session, running);
+    turn = null;
+}
+
+/// Runs `handleCancel` on its own thread, so a test can hold the line lock while
+/// the cancel waits for it.
+const CancelCall = struct {
+    state: *ServerState,
+    session: *ActiveSessionState,
+
+    fn run(self: *CancelCall) void {
+        handleCancel(self.state, self.session, true);
+    }
+};
+
+test "a cancel that waits for a claim stops that turn, and both flags agree" {
+    const alloc = std.testing.allocator;
+    var pair: CancelPair = undefined;
+    try pair.open(alloc);
+    defer pair.close(alloc);
+
+    // A claim works under the line lock, so this test takes the lock too, and the
+    // cancel starts on another thread and waits for it.
+    const owner_msg = sessionPromptTestMessage(1);
+    pair.session.waiting_prompts.lock();
+    var call = CancelCall{ .state = &pair.state, .session = pair.session };
+    const thread = try std.Thread.spawn(.{}, CancelCall.run, .{&call});
+
+    // Before the fix, the cancel sets its flag before it waits for the lock, so the
+    // flag appears at once. After the fix it stays unset until the lock is free.
+    // The cancel thread waits for the lock, so after the fix the flag stays unset for the whole
+    // wait. Before the fix it is set at once, so 250 ms is enough to see it.
+    const deadline = io_mod.milliTimestamp() + 250;
+    while (!pair.session.turn_cancel.load(.seq_cst) and io_mod.milliTimestamp() < deadline) {
+        io_mod.sleep(std.time.ns_per_ms);
+    }
+
+    const claimed = claimTurnLocked(&pair.state, alloc, &owner_msg, pair.session) catch |err| {
+        pair.session.waiting_prompts.unlock();
+        thread.join();
+        return err;
+    };
+    pair.session.waiting_prompts.unlock();
+    thread.join();
+    defer giveBackClaim(pair.session, claimed);
+
+    // The claim ran first, so the cancel stops that turn and sets both flags. Before
+    // the fix, the claim cleared the early flag and the cancel set only the other one.
+    try std.testing.expect(pair.session.turn_cancel.load(.seq_cst));
+    try std.testing.expect(pair.session.cancel_flag.load(.seq_cst));
+}
+
+test "the owner's prompt reaches the follower's client as its turn starts, and the owner's client gets no copy" {
+    const alloc = std.testing.allocator;
+    var pair: CancelPair = undefined;
+    try pair.open(alloc);
+    defer pair.close(alloc);
+
+    const msg = sessionPromptTestMessage(1);
+    var turn: ?*ActivePrompt = null;
+    defer if (turn) |claimed| giveBackClaim(pair.session, claimed);
+    switch (try decideSessionPrompt(&pair.state, alloc, &msg, pair.session)) {
+        .claimed => |claimed| turn = claimed,
+        else => return error.TestUnexpectedResult,
+    }
+    const running = turn orelse return error.TestUnexpectedResult;
+
+    try announcePromptTurn(pair.session, pair.state.connection_id, alloc, "prompt-owner", "OWNER_PROMPT", &.{});
+    try std.testing.expect(std.mem.find(u8, pair.follower_wire.bytes.items, "\"user_message_chunk\"") != null);
+    try std.testing.expect(std.mem.find(u8, pair.follower_wire.bytes.items, "OWNER_PROMPT") != null);
+    try std.testing.expect(std.mem.find(u8, pair.owner_wire.bytes.items, "user_message_chunk") == null);
+
+    giveBackClaim(pair.session, running);
+    turn = null;
+}
+
+test "a follower's prompt reaches the owner's client as its turn starts, and the follower's client gets no copy" {
+    const alloc = std.testing.allocator;
+    var pair: CancelPair = undefined;
+    try pair.open(alloc);
+    defer pair.close(alloc);
+
+    const msg = sessionPromptTestMessage(4);
+    var turn: ?*ActivePrompt = null;
+    defer if (turn) |claimed| giveBackClaim(pair.session, claimed);
+    switch (try decideSessionPrompt(&pair.follower, alloc, &msg, pair.session)) {
+        .claimed => |claimed| turn = claimed,
+        else => return error.TestUnexpectedResult,
+    }
+    const running = turn orelse return error.TestUnexpectedResult;
+
+    try announcePromptTurn(pair.session, pair.follower.connection_id, alloc, "prompt-follower", "FOLLOWER_PROMPT", &.{});
+    try std.testing.expect(std.mem.find(u8, pair.owner_wire.bytes.items, "\"user_message_chunk\"") != null);
+    try std.testing.expect(std.mem.find(u8, pair.owner_wire.bytes.items, "FOLLOWER_PROMPT") != null);
+    try std.testing.expect(std.mem.find(u8, pair.follower_wire.bytes.items, "user_message_chunk") == null);
+
+    giveBackClaim(pair.session, running);
+    turn = null;
+}
+
+test "a follower's prompt queued behind the owner's turn reaches the owner's client when its turn starts, not when it is queued" {
+    const alloc = std.testing.allocator;
+    var pair: CancelPair = undefined;
+    try pair.open(alloc);
+    defer pair.close(alloc);
+
+    const owner_msg = sessionPromptTestMessage(1);
+    var turn: ?*ActivePrompt = null;
+    defer if (turn) |claimed| giveBackClaim(pair.session, claimed);
+    switch (try decideSessionPrompt(&pair.state, alloc, &owner_msg, pair.session)) {
+        .claimed => |claimed| turn = claimed,
+        else => return error.TestUnexpectedResult,
+    }
+    const running = turn orelse return error.TestUnexpectedResult;
+
+    // The follower's prompt waits behind the owner's turn. Queueing sends nothing.
+    const follower_msg = jsonrpc.Message{ .id = .{ .integer = 4 }, .method = "session/prompt", .params_raw = queue_session_prompt_params };
+    switch (try decideSessionPrompt(&pair.follower, alloc, &follower_msg, pair.session)) {
+        .delivered => |outcome| switch (outcome) {
+            .queued => {},
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    try std.testing.expect(std.mem.find(u8, pair.owner_wire.bytes.items, "user_message_chunk") == null);
+    try std.testing.expect(std.mem.find(u8, pair.follower_wire.bytes.items, "user_message_chunk") == null);
+
+    // The owner's turn ends, and the queued prompt is taken to run next, as the worker does.
+    var taken = blk: {
+        pair.session.waiting_prompts.lock();
+        defer pair.session.waiting_prompts.unlock();
+        break :blk pair.session.waiting_prompts.takeNextLocked() orelse return error.TestUnexpectedResult;
+    };
+    defer taken.deinit(alloc);
+    var ended = running.msg;
+    running.msg = .{};
+    defer jsonrpc.freeMessage(alloc, &ended);
+    try startNextTurn(running, pair.session, &taken);
+    try std.testing.expect(std.mem.find(u8, pair.owner_wire.bytes.items, "user_message_chunk") == null);
+
+    // The queued prompt's turn starts: the owner's client gets its text, and the follower's
+    // client gets none.
+    try announcePromptTurn(pair.session, running.from, alloc, "prompt-queued", "QUEUED_PROMPT", &.{});
+    try std.testing.expect(std.mem.find(u8, pair.owner_wire.bytes.items, "QUEUED_PROMPT") != null);
+    try std.testing.expect(std.mem.find(u8, pair.follower_wire.bytes.items, "user_message_chunk") == null);
+
+    giveBackClaim(pair.session, running);
+    turn = null;
+}
+
+test "an image in a prompt reaches the other client as a replay sends it" {
+    const alloc = std.testing.allocator;
+    var pair: CancelPair = undefined;
+    try pair.open(alloc);
+    defer pair.close(alloc);
+
+    const png = "\x89PNG\r\n\x1a\nimage-bytes";
+    const image = try image_attachments.captureInlineImageBytesInMemory(alloc, 1, "image/png", png);
+    defer types.freeImageAttachment(alloc, image);
+    const images = [_]types.ImageAttachment{image};
+    try announcePromptTurn(pair.session, pair.follower.connection_id, alloc, "prompt-image", "", &images);
+
+    var expected: std.Io.Writer.Allocating = .init(alloc);
+    defer expected.deinit();
+    try acp_types.writeUserImageChunk(&expected.writer, "prompt-image", "image/png", png);
+    try std.testing.expect(std.mem.find(u8, pair.owner_wire.bytes.items, expected.writer.buffered()) != null);
+    try std.testing.expect(std.mem.find(u8, pair.follower_wire.bytes.items, "user_message_chunk") == null);
+}
+
+/// How many times `needle` occurs in `haystack`.
+fn countText(haystack: []const u8, needle: []const u8) usize {
+    var count: usize = 0;
+    var rest = haystack;
+    while (std.mem.find(u8, rest, needle)) |at| {
+        count += 1;
+        rest = rest[at + needle.len ..];
+    }
+    return count;
+}
+
+test "a follower's session/close withdraws its waiting input, answers it cancelled before its close answer, and leaves the owner's queued prompt" {
+    const alloc = std.testing.allocator;
+    var pair: CancelPair = undefined;
+    try pair.open(alloc);
+    defer pair.close(alloc);
+
+    // The owner's turn runs, and its claim opens the steering runtime to take input.
+    const owner_msg = sessionPromptTestMessage(1);
+    var turn: ?*ActivePrompt = null;
+    defer if (turn) |claimed| giveBackClaim(pair.session, claimed);
+    switch (try decideSessionPrompt(&pair.state, alloc, &owner_msg, pair.session)) {
+        .claimed => |claimed| turn = claimed,
+        else => return error.TestUnexpectedResult,
+    }
+
+    // While the turn takes input, the follower's steer waits in the steering runtime.
+    const steer_msg = jsonrpc.Message{ .id = .{ .integer = 6 }, .method = "session/prompt", .params_raw = steer_session_prompt_params };
+    switch (try decideSessionPrompt(&pair.follower, alloc, &steer_msg, pair.session)) {
+        .delivered => |outcome| switch (outcome) {
+            .steered => {},
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    // The turn stops taking input, as `finishTurn` leaves the runtime. The follower's next
+    // steer waits on the line as a late steer.
+    pair.session.steering.accepting = false;
+    const late_msg = jsonrpc.Message{ .id = .{ .integer = 7 }, .method = "session/prompt", .params_raw = steer_session_prompt_params };
+    switch (try decideSessionPrompt(&pair.follower, alloc, &late_msg, pair.session)) {
+        .delivered => |outcome| switch (outcome) {
+            .late => {},
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    // Both connections queue a prompt with request id 4. The owner's must survive the
+    // follower's close.
+    const owner_queued = jsonrpc.Message{ .id = .{ .integer = 4 }, .method = "session/prompt", .params_raw = queue_session_prompt_params };
+    switch (try decideSessionPrompt(&pair.state, alloc, &owner_queued, pair.session)) {
+        .delivered => |outcome| switch (outcome) {
+            .queued => {},
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    const follower_queued = jsonrpc.Message{ .id = .{ .integer = 4 }, .method = "session/prompt", .params_raw = queue_session_prompt_params };
+    switch (try decideSessionPrompt(&pair.follower, alloc, &follower_queued, pair.session)) {
+        .delivered => |outcome| switch (outcome) {
+            .queued => {},
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    // The follower closes the session. Its withdrawn input is answered before its close answer.
+    var close_msg = jsonrpc.Message{ .id = .{ .integer = 9 }, .method = "session/close", .params_raw = "{\"sessionId\":\"session_answers\"}" };
+    try handleCloseSession(&pair.follower, alloc, &close_msg);
+
+    // The owner's queued prompt stays, with its sender and request id. The owner hears nothing.
+    pair.session.waiting_prompts.lock();
+    defer pair.session.waiting_prompts.unlock();
+    try std.testing.expectEqual(@as(usize, 1), pair.session.waiting_prompts.queue.items.len);
+    try std.testing.expectEqual(pair.state.connection_id, pair.session.waiting_prompts.queue.items[0].from);
+    try std.testing.expectEqual(@as(i64, 4), pair.session.waiting_prompts.queue.items[0].msg.id.?.integer);
+    try std.testing.expectEqual(@as(usize, 0), pair.session.waiting_prompts.late.items.len);
+    try std.testing.expectEqual(@as(usize, 0), pair.session.steering.messages.items.len);
+    try std.testing.expect(std.mem.find(u8, pair.owner_wire.bytes.items, "Request cancelled") == null);
+    try std.testing.expect(!followsSession(&pair.follower, "session_answers"));
+
+    // Each withdrawn steer and prompt gets exactly one cancelled answer on the follower's
+    // writer, and all of them come before the close's answer. Their order among themselves
+    // is not part of the contract.
+    const wire = pair.follower_wire.bytes.items;
+    const at_close = std.mem.find(u8, wire, "\"id\":9") orelse return error.TestUnexpectedResult;
+    const needles = [_][]const u8{
+        "\"id\":6,\"error\":{\"code\":-32800,\"message\":\"Request cancelled\"}",
+        "\"id\":7,\"error\":{\"code\":-32800,\"message\":\"Request cancelled\"}",
+        "\"id\":4,\"error\":{\"code\":-32800,\"message\":\"Request cancelled\"}",
+    };
+    for (needles) |needle| {
+        try std.testing.expectEqual(@as(usize, 1), countText(wire, needle));
+        const at = std.mem.find(u8, wire, needle) orelse return error.TestUnexpectedResult;
+        try std.testing.expect(at < at_close);
+    }
+    try std.testing.expect(std.mem.find(u8, wire[at_close..], "\"result\":{}") != null);
+    try std.testing.expectEqual(@as(usize, 3), countText(wire, "\"code\":-32800"));
+}
+
+test "a follower's disconnect withdraws its queued prompt with no write, and the trace names it" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const folder = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(folder);
+    const trace_path = try std.Io.Dir.path.join(alloc, &.{ folder, "trace.log" });
+    defer alloc.free(trace_path);
+    debug_trace.resetForTest();
+    try debug_trace.configureForTest(alloc, trace_path);
+    defer debug_trace.resetForTest();
+
+    var pair: CancelPair = undefined;
+    try pair.open(alloc);
+    defer pair.close(alloc);
+
+    const owner_msg = sessionPromptTestMessage(1);
+    var turn: ?*ActivePrompt = null;
+    defer if (turn) |claimed| giveBackClaim(pair.session, claimed);
+    switch (try decideSessionPrompt(&pair.state, alloc, &owner_msg, pair.session)) {
+        .claimed => |claimed| turn = claimed,
+        else => return error.TestUnexpectedResult,
+    }
+
+    const queued_msg = jsonrpc.Message{ .id = .{ .integer = 4 }, .method = "session/prompt", .params_raw = queue_session_prompt_params };
+    switch (try decideSessionPrompt(&pair.follower, alloc, &queued_msg, pair.session)) {
+        .delivered => |outcome| switch (outcome) {
+            .queued => {},
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    // The follower's connection ends. Its deinit leaves each session it follows the same way.
+    detachFollower(&pair.follower, "session_answers", .left);
+
+    // Nothing reaches the follower, and its queued prompt is gone.
+    try std.testing.expectEqual(@as(usize, 0), pair.follower_wire.bytes.items.len);
+    pair.session.waiting_prompts.lock();
+    const queued_after = pair.session.waiting_prompts.queue.items.len;
+    pair.session.waiting_prompts.unlock();
+    try std.testing.expectEqual(@as(usize, 0), queued_after);
+
+    const trace = try readTraceFile(alloc, trace_path);
+    defer alloc.free(trace);
+    try std.testing.expect(std.mem.find(u8, trace, "event=waiting_input_dropped session=session_answers request=4 reason=follower_left") != null);
+}
+
+test "a follower that leaves while its own prompt's turn runs: the turn goes on, and its answer is dropped and traced" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const folder = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(folder);
+    const trace_path = try std.Io.Dir.path.join(alloc, &.{ folder, "trace.log" });
+    defer alloc.free(trace_path);
+    debug_trace.resetForTest();
+    try debug_trace.configureForTest(alloc, trace_path);
+    defer debug_trace.resetForTest();
+
+    var pair: CancelPair = undefined;
+    try pair.open(alloc);
+    defer pair.close(alloc);
+
+    // The follower's own prompt starts the turn.
+    const follower_msg = sessionPromptTestMessage(3);
+    var turn: ?*ActivePrompt = null;
+    defer if (turn) |claimed| giveBackClaim(pair.session, claimed);
+    switch (try decideSessionPrompt(&pair.follower, alloc, &follower_msg, pair.session)) {
+        .claimed => |claimed| turn = claimed,
+        else => return error.TestUnexpectedResult,
+    }
+    const running = turn orelse return error.TestUnexpectedResult;
+
+    // The follower closes the session while its turn runs.
+    var close_msg = jsonrpc.Message{ .id = .{ .integer = 9 }, .method = "session/close", .params_raw = "{\"sessionId\":\"session_answers\"}" };
+    try handleCloseSession(&pair.follower, alloc, &close_msg);
+
+    // The turn goes on: it still holds the slot, and its worker still runs.
+    pair.session.waiting_prompts.lock();
+    const still_running = pair.session.prompt == running and pair.session.waiting_prompts.worker_running;
+    pair.session.waiting_prompts.unlock();
+    try std.testing.expect(still_running);
+
+    // The turn ends. Its answer has no member to reach, so it is dropped and traced.
+    publishTurnOutcome(running, pair.follower.connection_id, .{ .integer = 3 }, &.{}, .{ .stop_reason = .end_turn }, null);
+    try std.testing.expect(std.mem.find(u8, pair.follower_wire.bytes.items, "stopReason") == null);
+
+    const trace = try readTraceFile(alloc, trace_path);
+    defer alloc.free(trace);
+    try std.testing.expect(std.mem.find(u8, trace, "event=answer_dropped session=session_answers request=3 reason=sender_left") != null);
+}
+
+test "a steer that waits for a turn whose worker cannot start is answered to its sender, and traced" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const folder = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(folder);
+    const trace_path = try std.Io.Dir.path.join(alloc, &.{ folder, "trace.log" });
+    defer alloc.free(trace_path);
+    debug_trace.resetForTest();
+    try debug_trace.configureForTest(alloc, trace_path);
+    defer debug_trace.resetForTest();
+
+    var pair: CancelPair = undefined;
+    try pair.open(alloc);
+    defer pair.close(alloc);
+
+    // The owner's prompt is claimed, and the claim opens the steering runtime. No worker runs yet.
+    const owner_msg = sessionPromptTestMessage(1);
+    var claimed: ?*ActivePrompt = null;
+    defer if (claimed) |claim| giveBackClaim(pair.session, claim);
+    switch (try decideSessionPrompt(&pair.state, alloc, &owner_msg, pair.session)) {
+        .claimed => |claim| claimed = claim,
+        else => return error.TestUnexpectedResult,
+    }
+
+    // In the gap before the worker starts, the follower's steer joins the runtime.
+    const steer_msg = jsonrpc.Message{ .id = .{ .integer = 6 }, .method = "session/prompt", .params_raw = steer_session_prompt_params };
+    switch (try decideSessionPrompt(&pair.follower, alloc, &steer_msg, pair.session)) {
+        .delivered => |outcome| switch (outcome) {
+            .steered => {},
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    // The spawn fails. startClaimedTurn takes the claim whether or not the spawn works, so
+    // the test stops holding it before the call.
+    const claim = claimed orelse return error.TestUnexpectedResult;
+    claimed = null;
+    prompt_test_controls.fail_next_spawn = true;
+    try std.testing.expectError(error.SystemResources, startClaimedTurn(pair.session, claim));
+
+    // The claim is given back, and the runtime holds no steer.
+    pair.session.waiting_prompts.lock();
+    const given_back = pair.session.prompt == null and !pair.session.waiting_prompts.worker_running;
+    pair.session.waiting_prompts.unlock();
+    try std.testing.expect(given_back);
+    try std.testing.expectEqual(@as(usize, 0), pair.session.steering.messages.items.len);
+
+    // The follower gets the spawn error for its steer, once. The owner's writer gets nothing
+    // from this path, and the trace names the steer.
+    try std.testing.expectEqual(@as(usize, 1), countText(pair.follower_wire.bytes.items, "\"id\":6,\"error\":{\"code\":-32603,\"message\":\"SystemResources\"}"));
+    try std.testing.expectEqual(@as(usize, 0), pair.owner_wire.bytes.items.len);
+    const trace = try readTraceFile(alloc, trace_path);
+    defer alloc.free(trace);
+    try std.testing.expect(std.mem.find(u8, trace, "event=waiting_input_dropped session=session_answers request=6 reason=spawn_failed") != null);
 }

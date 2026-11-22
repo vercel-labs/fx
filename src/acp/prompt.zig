@@ -266,6 +266,9 @@ const TurnSettings = struct {
     fast_mode: bool,
     ultrafast_mode: bool,
     effort: types.ReasoningEffort,
+    /// The client's system prompt as the turn started with it. A prompt a load sets
+    /// while the turn runs applies from the next turn.
+    client_system_prompt: []u8,
 
     /// The caller holds `session.settings_mutex`.
     fn capture(alloc: Allocator, session: *const server.ActiveSessionState) !TurnSettings {
@@ -277,6 +280,8 @@ const TurnSettings = struct {
         errdefer if (account_id) |id| alloc.free(id);
         const gateway_team: ?[]u8 = if (session.gateway_team) |team| try alloc.dupe(u8, team) else null;
         errdefer if (gateway_team) |team| alloc.free(team);
+        const client_system_prompt = try server.dupClientSystemPromptLocked(alloc, session);
+        errdefer alloc.free(client_system_prompt);
         return .{
             .model = model,
             .provider = session.provider,
@@ -287,10 +292,12 @@ const TurnSettings = struct {
             .fast_mode = session.fast_mode,
             .ultrafast_mode = session.ultrafast_mode,
             .effort = session.effort,
+            .client_system_prompt = client_system_prompt,
         };
     }
 
     fn deinit(self: *TurnSettings, alloc: Allocator) void {
+        alloc.free(self.client_system_prompt);
         alloc.free(self.model);
         if (self.api_key.len > 0) secret.zeroAndFree(alloc, self.api_key);
         if (self.account_id) |id| alloc.free(id);
@@ -1299,12 +1306,15 @@ const TurnSignIn = struct {
 /// dispatch. Mid-turn session/set_mode changes only affect later prompts.
 /// `usage_total` gets the usage of every turn the prompt runs, its own and
 /// each report turn after it, as each ends: the response reports the whole
-/// prompt's usage (`publishPromptOutcome` in `server.zig`).
+/// prompt's usage (`publishPromptOutcome` in `server.zig`). `prompt_sender` is the
+/// connection that sent the prompt; the other clients are told of it as the turn
+/// starts. Null when the turn's input is shown another way (a steer group).
 pub fn handlePrompt(
     state: *server.ServerState,
     session: *server.ActiveSessionState,
     alloc: Allocator,
     msg: *jsonrpc.Message,
+    prompt_sender: ?server.ConnectionId,
     captured_mode: []const u8,
     captured_permission_mode: PermissionMode,
     usage_total: *types.Usage,
@@ -1528,6 +1538,17 @@ pub fn handlePrompt(
         defer session.session_write_mutex.unlock(io_mod.getIo());
         try v2.beginTurn();
     }
+    // The other clients learn of the prompt as the turn starts. A steer group passes
+    // no sender: its steers are shown as they join the turn.
+    if (comptime server.follow_supported) {
+        if (prompt_sender) |sender| {
+            var message_id_storage: acp_types.MessageIdBuffer = undefined;
+            const message_id = acp_types.generateMessageId(&message_id_storage);
+            server.announcePromptTurn(session, sender, alloc, message_id, prompt_text, prompt_input.images) catch |err| {
+                debug_trace.logf("acp", "dropped the prompt for the other clients err={s}", .{@errorName(err)});
+            };
+        }
+    }
 
     var tool_projection = try state.cfg.mode_registry.buildModelToolProjection(alloc, activeToolSet(state), captured_mode, .{
         .permission_mode = captured_permission_mode,
@@ -1545,7 +1566,7 @@ pub fn handlePrompt(
 
     var skill_catalog = session.workspace.skills.acquireCatalog();
     defer skill_catalog.deinit();
-    const host_instructions = try client_instructions.compose(alloc, session.client_system_prompt);
+    const host_instructions = try client_instructions.compose(alloc, turn_settings.client_system_prompt);
     defer alloc.free(host_instructions);
     for (session.workspace.context_snapshot.notices) |notice| try pushContextNotice(@ptrCast(&ctx), notice);
 
@@ -6255,7 +6276,7 @@ test "ACP prompt propagates context provider errors before pending prompt state"
         AcpContextRegistryFixture.gather_error = expected_error;
         try std.testing.expectError(
             expected_error,
-            handlePrompt(&state, server.firstSession(&state).?, alloc, &msg, "code", .ask, &usage),
+            handlePrompt(&state, server.firstSession(&state).?, alloc, &msg, null, "code", .ask, &usage),
         );
         try std.testing.expectEqual(@as(usize, 1), AcpContextRegistryFixture.gather_calls);
         try std.testing.expect(server.firstSession(&state).?.pending_prompt_id == null);

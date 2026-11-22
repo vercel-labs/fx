@@ -19,19 +19,24 @@
 (*   when the turn's end finishes. A load gets a tail from the copy while  *)
 (*   the copy holds it.                                                    *)
 (* - A joined connection that closes the session, or ends, leaves the      *)
-(*   audience. A follower's change to the session is refused or ignored,   *)
-(*   and changes nothing.                                                  *)
+(*   audience. A follower's mode or config request is refused and changes  *)
+(*   nothing; its hooks change is ignored. Its systemPrompt applies from    *)
+(*   the next turn, as an owner's does; AcpSystemPrompt models that.        *)
+(*   A follower's prompt is not here. It enters the session's one input    *)
+(*   order (sh-fx.md, Following a session); this spec does not model it.   *)
 (* - With Rules = FALSE (fx before the join), a second connection's        *)
 (*   load is refused as busy, so no connection joins.                      *)
 (*                                                                         *)
-(* One tail item stands for a turn's title and usage updates, which the    *)
-(* code sends one after the other (prompt.zig:1552-1553). The usage update *)
-(* may be absent. The model counts one unit per update. fx counts bytes    *)
-(* against the copy's limit. Every joiner takes every kept update; the     *)
-(* per-connection capability filter is outside this model. The join's      *)
-(* saved-title update is not modelled. A repeat load and a load after a    *)
-(* close are not modelled. A load replays a saved turn's messages without  *)
-(* its tail (sessions.zig:1791), so a joiner gets no earlier tail.         *)
+(* One tail item stands for a turn's title and usage updates. The title is *)
+(* sent by sendSessionInfoUpdate (sessions.zig), and the usage update is   *)
+(* built in types.zig. The usage update may be absent: prompt.zig sends    *)
+(* none for a turn whose completions report no tokens. The model counts    *)
+(* one unit per update. fx counts bytes against the copy's limit. Every    *)
+(* joiner takes every kept update; the per-connection capability filter is *)
+(* outside this model. The join's saved-title update is not modelled. A    *)
+(* repeat load and a load after a close are not modelled. A load replays a *)
+(* saved turn's messages without its tail (sendHistoryTurnAsUpdates in     *)
+(* sessions.zig), so a joiner gets no earlier tail.                        *)
 (***************************************************************************)
 EXTENDS Naturals, Sequences
 
@@ -223,10 +228,14 @@ Close(j) ==
     /\ closedLen' = [closedLen EXCEPT ![j] = Len(got[j])]
     /\ UNCHANGED <<turn, phase, sent, runItems, copy, dropped, log, owner, got, mark, skip, early, changed>>
 
-\* A joined connection sends the session a change: a prompt, a mode, a config
-\* option, or a systemPrompt or hooks. The change is refused or ignored, and
-\* changes nothing (server.zig:3541, requireParsedSessionTarget;
-\* sessions.zig:809, traceIgnoredFollowerChanges).
+\* A joined connection sends the session a mode or a config option. fx refuses
+\* each one, and it changes nothing (server.zig:3959,
+\* requireParsedSessionTarget). A joined connection's hooks change is ignored
+\* and changes nothing (sessions.zig:813, traceIgnoredFollowerHooks). Its
+\* systemPrompt is not modeled here: it applies from the next turn
+\* (sessions.zig:802, commitClientSystemPrompt). A follower's prompt is not a
+\* change here: it enters the session's one input order (sh-fx.md, "Following
+\* a session"), which this spec does not model.
 FollowerChange(j) ==
     /\ Audience(j)
     /\ changed' = changed
@@ -285,8 +294,10 @@ AnswerFirst == \A j \in Joiners : ~early[j]
 \* Forbids a closed connection that gets anything after it closed.
 ClosedGetsNothing == \A j \in Joiners : joiner[j] = "closed" => Len(got[j]) = closedLen[j]
 
-\* Forbids a follower's change from altering the session.
-FollowerChangesNothing == ~changed
+\* A follower's refused mode or config request, and its ignored hooks, change
+\* nothing. Its system prompt applies from the next turn and is outside this
+\* property.
+RefusedFollowerChangeChangesNothing == ~changed
 
 \* Forbids a running copy that holds more updates than its limit.
 CopyBounded == Len(copy) <= Limit

@@ -93,7 +93,7 @@ const PLANS: Plan[] = [
     },
   },
   {
-    name: "follower-prompt",
+    name: "follower-change",
     expect: { rules: "ACCEPTED", today: "REJECTED" },
     run: async (r) => {
       await r.turn(1);
@@ -101,7 +101,7 @@ const PLANS: Plan[] = [
       await r.waitOwnerText(2, 1);
       await r.waitGatewayRequests(3);
       await r.join("j1", "session/load");
-      await r.followerPrompt("j1");
+      await r.followerChange("j1");
       await r.releaseHeld();
       await r.waitOwnerAnswer(2);
       await r.waitFollowerText("j1", 2, 2);
@@ -308,18 +308,24 @@ class Run {
     this.observations.push(closed ? { op: "close", who } : { op: "close_failed", who });
   }
 
-  /// Sends the follower a prompt for the session and records fx's answer, which
-  /// must be the refusal to change a session another connection has open.
-  async followerPrompt(who: Joiner) {
+  /// Sends the follower the two changes that stay refused while it follows the
+  /// session: a mode change and a config change. Each answer is recorded: fx's
+  /// refusal to change a session another connection has open, or anything else.
+  /// A follower's prompt is not sent here. It enters the session's one input order
+  /// (sh-fx.md, "Following a session"), which this model does not cover.
+  async followerChange(who: Joiner) {
     const follower = this.followers.get(who);
     if (!follower) return;
-    this.drain();
-    const { answer } = await follower.client.request("session/prompt", {
-      sessionId: this.sessionId,
-      prompt: [{ type: "text", text: "FOLLOWER_PROMPT" }],
-    });
-    const refused = answer.error?.code === -32600 && answer.error?.message === REFUSAL;
-    this.observations.push(refused ? { op: "change_refused", who } : { op: "change_other", who });
+    const changes: Array<[string, Record<string, unknown>]> = [
+      ["session/set_mode", { sessionId: this.sessionId, modeId: "plan" }],
+      ["session/set_config_option", { sessionId: this.sessionId, configId: "model", value: "test/other" }],
+    ];
+    for (const [method, params] of changes) {
+      this.drain();
+      const { answer } = await follower.client.request(method, params);
+      const refused = answer.error?.code === -32600 && answer.error?.message === REFUSAL;
+      this.observations.push(refused ? { op: "change_refused", who } : { op: "change_other", who });
+    }
   }
 
   /// After fx exits: every message the owner received, then each joined

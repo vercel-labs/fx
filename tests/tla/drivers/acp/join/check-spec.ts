@@ -121,7 +121,7 @@ const MUTANTS: Mutant[] = [
     id: "follower-change-accepted",
     note: "a follower's change to the session is applied",
     replacements: [{ from: String.raw`    /\ changed' = changed`, to: String.raw`    /\ changed' = TRUE` }],
-    expect: "FollowerChangesNothing",
+    expect: "RefusedFollowerChangeChangesNothing",
   },
   {
     id: "closed-still-listed",

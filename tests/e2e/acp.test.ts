@@ -1959,6 +1959,18 @@ class LeaderSocketClient {
     return { answer, before: this.received.slice(start, this.received.indexOf(answer)) };
   }
 
+  /// Sends one request and returns its id, without waiting for the answer.
+  start(method: string, params: object): number {
+    const id = this.nextId++;
+    this.socket.write(`${JSON.stringify({ jsonrpc: "2.0", id, method, params })}\n`);
+    return id;
+  }
+
+  /// Sends one notification, which has no id and gets no answer.
+  notify(method: string, params: object): void {
+    this.socket.write(`${JSON.stringify({ jsonrpc: "2.0", method, params })}\n`);
+  }
+
   /// Waits until a message that `predicate` accepts has arrived.
   waitForMessage(predicate: (message: any) => boolean, label: string, timeoutMs = TIMEOUT): Promise<void> {
     return this.until(() => this.received.some(predicate), label, timeoutMs);
@@ -2105,14 +2117,89 @@ function leaderEnv(
 
 /// Starts a session on `client` and sends it one plain prompt. The prompt
 /// publishes the session, which takes its lock.
-async function publishLedSession(client: AcpClient, text: string) {
+async function publishLedSession(client: AcpClient, text: string, sessionParams: object = {}) {
   const initialized = (await client.request("initialize", { protocolVersion: 1 }, 1)) as any;
-  const created = (await client.request("session/new", { mcpServers: [] }, 2)) as any;
+  const created = (await client.request("session/new", { mcpServers: [], ...sessionParams }, 2)) as any;
   await client.readLine(); // consume the session/update notification
   const sessionId = created.result.sessionId as string;
   const { promptResult } = await runPrompt(client, text, TIMEOUT);
   expect(promptResult.result.stopReason).toBe("end_turn");
   return { initialized, sessionId };
+}
+
+/// The lines an AcpClient has read, parsed, in order.
+function parsedLines(client: AcpClient): any[] {
+  return client.rawLines.map((line) => JSON.parse(line));
+}
+
+/// Whether a message is the user message chunk `text`.
+function isUserChunk(message: any, text: string): boolean {
+  return (
+    message.method === "session/update" &&
+    message.params?.update?.sessionUpdate === "user_message_chunk" &&
+    message.params.update.content?.text === text
+  );
+}
+
+/// The text of each user message chunk in `messages`, in order.
+function userChunkTexts(messages: any[]): string[] {
+  return messages
+    .filter((message) => message.method === "session/update" && message.params?.update?.sessionUpdate === "user_message_chunk")
+    .map((message) => message.params.update.content?.text ?? "");
+}
+
+/// The user message chunk `text` in `messages`, or undefined.
+function steerChunk(messages: any[], text: string): any {
+  return messages.find((message) => isUserChunk(message, text));
+}
+
+/// The answer to request `id` in `messages`, or undefined.
+function answerTo(messages: any[], id: number): any {
+  return messages.find((message) => message.id === id && (message.result !== undefined || message.error !== undefined));
+}
+
+/// The text of the system messages in a model request body.
+function modelSystemText(body: string): string {
+  return acpGatewayRequest(body).prompt
+    .filter((message) => message.role === "system")
+    .map((message) => acpContentText(message.content))
+    .join("\n");
+}
+
+/// Connects a follower to a session's leader socket and loads the session there.
+async function followSession(
+  socket: string,
+  sessionId: string,
+  root: ReturnType<typeof createShortIsolatedRoot>,
+): Promise<LeaderSocketClient> {
+  const follower = await LeaderSocketClient.connect(socket);
+  await follower.request("initialize", { protocolVersion: 1, clientCapabilities: fxClientCapabilities });
+  const loaded = await follower.request("session/load", { sessionId, cwd: root.workspace, mcpServers: [] });
+  expect(loaded.answer.error).toBeUndefined();
+  return follower;
+}
+
+/// Starts an owner fx acp on its own connection and publishes a session with one plain turn.
+async function ownerWithSession(
+  root: ReturnType<typeof createShortIsolatedRoot>,
+  gateway: ReturnType<typeof startFakeGateway>,
+  sessionParams: object = {},
+) {
+  const owner = await AcpClient.create({ cwd: root.workspace, env: leaderEnv(root, gateway) });
+  const { sessionId } = await publishLedSession(owner, "TURN_ONE_PROMPT", sessionParams);
+  const record = JSON.parse(sessionLock(root.home, sessionId)) as { socket: string };
+  return { owner, sessionId, socket: record.socket };
+}
+
+/// Sends a prompt without delivery, which a running turn refuses. The answer comes
+/// after every line the follower sent before it, so once it arrives, an earlier steer
+/// or queued prompt has reached the session.
+async function expectRefusedWhileRunning(follower: LeaderSocketClient, sessionId: string): Promise<void> {
+  const refused = await follower.request("session/prompt", {
+    sessionId,
+    prompt: [{ type: "text", text: "REFUSED_PROMPT" }],
+  });
+  expect(refused.answer.error).toEqual({ code: -32600, message: "Prompt already in progress" });
 }
 
 describe("acp: model-independent", () => {
@@ -15215,7 +15302,9 @@ describe("acp: model-independent", () => {
           code: -32600,
           message: "This session is open on another connection; only that connection can change it.",
         };
-        expect(run.result.prompt.error).toEqual(refusal);
+        // A follower's prompt reaches the owner's turn. This one finds the turn running, so
+        // it gets the answer a running turn gives any prompt, and the model is not called.
+        expect(run.result.prompt.error).toEqual({ code: -32600, message: "Prompt already in progress" });
         expect(run.result.mode.error).toEqual(refusal);
         expect(run.result.reloaded.result.modes.currentModeId).toBe("auto");
 
@@ -15302,6 +15391,316 @@ describe("acp: model-independent", () => {
         expect(run.owner).toEqual(baseline);
       } finally {
         follower?.close();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "a follower's prompt runs a turn when no turn runs: the owner sees the prompt and the turn, and gets no answer for it",
+    async () => {
+      const root = createShortIsolatedRoot("fx-acp-follow-prompt-");
+      const gateway = startFakeGateway([finalText("TURN_ONE"), finalText("FOLLOWER_REPLY")]);
+      let owner: AcpClient | undefined;
+      let follower: LeaderSocketClient | undefined;
+      try {
+        const started = await ownerWithSession(root, gateway);
+        owner = started.owner;
+        follower = await followSession(started.socket, started.sessionId, root);
+
+        const answer = await follower.request("session/prompt", {
+          sessionId: started.sessionId,
+          prompt: [{ type: "text", text: "FOLLOWER_PROMPT" }],
+        });
+        expect(answer.answer.error).toBeUndefined();
+        expect(answer.answer.result.stopReason).toBe("end_turn");
+
+        // The owner sees the prompt as a user message and the turn's text, and no answer to the follower's request.
+        await waitForCondition(
+          "the owner's turn text",
+          () => agentMessageText(parsedLines(owner!)).includes("FOLLOWER_REPLY"),
+          TIMEOUT,
+        );
+        const ownerMessages = parsedLines(owner);
+        expect(userChunkTexts(ownerMessages)).toEqual(["FOLLOWER_PROMPT"]);
+        expect(answerTo(ownerMessages, answer.answer.id)).toBeUndefined();
+        // The follower's own prompt is not sent back to it.
+        expect(userChunkTexts(follower.received)).not.toContain("FOLLOWER_PROMPT");
+        expect(gateway.requests).toHaveLength(2);
+        expect(gateway.requests[1]!.body).toContain("FOLLOWER_PROMPT");
+        expect(owner.stderr).toBe("");
+      } finally {
+        follower?.close();
+        await owner?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "a follower's queued prompt runs after the owner's turn, and the owner sees it when it runs",
+    async () => {
+      const root = createShortIsolatedRoot("fx-acp-follow-queue-");
+      const running = deferred<void>();
+      const runningReply = deferred<Response>();
+      const gateway = startFakeGateway([
+        finalText("TURN_ONE"),
+        () => {
+          running.resolve();
+          return runningReply.promise;
+        },
+        finalText("QUEUED_REPLY"),
+      ]);
+      let owner: AcpClient | undefined;
+      let follower: LeaderSocketClient | undefined;
+      try {
+        const started = await ownerWithSession(root, gateway);
+        owner = started.owner;
+        follower = await followSession(started.socket, started.sessionId, root);
+        sendPrompt(owner, 10, "RUNNING_PROMPT");
+        await running.promise;
+
+        const queuedId = follower.start("session/prompt", {
+          sessionId: started.sessionId,
+          prompt: [{ type: "text", text: "QUEUED_FOLLOWER_PROMPT" }],
+          _meta: { "sh.fx/delivery": "queue" },
+        });
+        // A prompt without delivery is refused while the turn runs. Its answer comes after the
+        // queued prompt reached the session, so this also shows that the queued prompt waits.
+        await expectRefusedWhileRunning(follower, started.sessionId);
+        expect(userChunkTexts(parsedLines(owner))).not.toContain("QUEUED_FOLLOWER_PROMPT");
+        expect(gateway.requests).toHaveLength(2);
+
+        runningReply.resolve(finalText("RUNNING_DONE"));
+        expect((await readResponse(owner, 10)).result.stopReason).toBe("end_turn");
+        await follower.waitForMessage(
+          (message) => message.id === queuedId && message.result !== undefined,
+          "the queued prompt's answer",
+          TIMEOUT,
+        );
+        expect(answerTo(follower.received, queuedId).result.stopReason).toBe("end_turn");
+
+        // The owner sees the queued prompt only after the running turn's answer.
+        const ownerMessages = parsedLines(owner);
+        const queuedChunk = ownerMessages.findIndex((message) => isUserChunk(message, "QUEUED_FOLLOWER_PROMPT"));
+        expect(queuedChunk).toBeGreaterThan(ownerMessages.findIndex((message) => message.id === 10));
+        expect(userChunkTexts(follower.received)).not.toContain("QUEUED_FOLLOWER_PROMPT");
+        expect(gateway.requests).toHaveLength(3);
+        expect(gateway.requests[1]!.body).not.toContain("QUEUED_FOLLOWER_PROMPT");
+        expect(gateway.requests[2]!.body).toContain("QUEUED_FOLLOWER_PROMPT");
+        expect(owner.stderr).toBe("");
+      } finally {
+        follower?.close();
+        await owner?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "a follower's steer joins the owner's running turn, and every client sees the steer",
+    async () => {
+      const root = createShortIsolatedRoot("fx-acp-follow-steer-");
+      const running = deferred<void>();
+      const runningReply = deferred<Response>();
+      const gateway = startFakeGateway([
+        finalText("TURN_ONE"),
+        () => {
+          running.resolve();
+          return runningReply.promise;
+        },
+        finalText("STEER_REPLY"),
+      ]);
+      let owner: AcpClient | undefined;
+      let follower: LeaderSocketClient | undefined;
+      try {
+        const started = await ownerWithSession(root, gateway);
+        owner = started.owner;
+        follower = await followSession(started.socket, started.sessionId, root);
+        sendPrompt(owner, 10, "RUNNING_PROMPT");
+        await running.promise;
+
+        const steerId = follower.start("session/prompt", {
+          sessionId: started.sessionId,
+          prompt: [{ type: "text", text: "FOLLOWER_STEER" }],
+          _meta: { "sh.fx/delivery": "steer" },
+        });
+        await expectRefusedWhileRunning(follower, started.sessionId);
+
+        runningReply.resolve(finalText("RUNNING_DONE"));
+        expect((await readResponse(owner, 10)).result.stopReason).toBe("end_turn");
+        await follower.waitForMessage(
+          (message) => message.id === steerId && message.result !== undefined,
+          "the steer's answer",
+          TIMEOUT,
+        );
+        // The steer's answer comes when the turn that took it ends.
+        const steerAnswer = answerTo(follower.received, steerId);
+        expect(steerAnswer.result.stopReason).toBe("end_turn");
+        expect(steerAnswer.result._meta["sh.fx/steeringDelivery"]).toBe("absorbed");
+        // Every client gets the steer's chunk, the follower included, with the steer's request id.
+        expect(steerChunk(parsedLines(owner), "FOLLOWER_STEER")?.params.update._meta["sh.fx/steerInput"].requestId).toBe(steerId);
+        expect(steerChunk(follower.received, "FOLLOWER_STEER")?.params.update._meta["sh.fx/steerInput"].requestId).toBe(steerId);
+        expect(gateway.requests).toHaveLength(3);
+        expect(gateway.requests[2]!.body).toContain("FOLLOWER_STEER");
+        expect(owner.stderr).toBe("");
+      } finally {
+        follower?.close();
+        await owner?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "a follower's session/cancel stops the owner's running turn",
+    async () => {
+      const root = createShortIsolatedRoot("fx-acp-follow-cancel-");
+      const running = deferred<void>();
+      const neverReply = deferred<Response>();
+      const gateway = startFakeGateway([
+        finalText("TURN_ONE"),
+        () => {
+          running.resolve();
+          return neverReply.promise;
+        },
+      ]);
+      let owner: AcpClient | undefined;
+      let follower: LeaderSocketClient | undefined;
+      try {
+        const started = await ownerWithSession(root, gateway);
+        owner = started.owner;
+        follower = await followSession(started.socket, started.sessionId, root);
+        sendPrompt(owner, 10, "RUNNING_PROMPT");
+        await running.promise;
+
+        follower.notify("session/cancel", { sessionId: started.sessionId });
+        const answer = await readResponse(owner, 10);
+        expect(answer.error).toBeUndefined();
+        expect(answer.result.stopReason).toBe("cancelled");
+        expect(owner.stderr).toBe("");
+      } finally {
+        follower?.close();
+        await owner?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "a follower that queued a prompt and disconnects leaves the owner's turn running and drops its queued prompt",
+    async () => {
+      const root = createShortIsolatedRoot("fx-acp-follow-leave-");
+      const running = deferred<void>();
+      const runningReply = deferred<Response>();
+      const gateway = startFakeGateway([
+        finalText("TURN_ONE"),
+        () => {
+          running.resolve();
+          return runningReply.promise;
+        },
+      ]);
+      let owner: AcpClient | undefined;
+      let follower: LeaderSocketClient | undefined;
+      try {
+        const started = await ownerWithSession(root, gateway);
+        owner = started.owner;
+        follower = await followSession(started.socket, started.sessionId, root);
+        sendPrompt(owner, 10, "RUNNING_PROMPT");
+        await running.promise;
+
+        follower.start("session/prompt", {
+          sessionId: started.sessionId,
+          prompt: [{ type: "text", text: "QUEUED_FROM_LEAVER" }],
+          _meta: { "sh.fx/delivery": "queue" },
+        });
+        await expectRefusedWhileRunning(follower, started.sessionId);
+        follower.close();
+        // Lets the disconnect reach the session before the running turn ends.
+        await Bun.sleep(300);
+
+        runningReply.resolve(finalText("RUNNING_DONE"));
+        expect((await readResponse(owner, 10)).result.stopReason).toBe("end_turn");
+        // A queued prompt that was kept would start right after the turn; this wait lets it show.
+        await Bun.sleep(1_000);
+        expect(gateway.requests).toHaveLength(2);
+        expect(gateway.requests.some((request) => request.body.includes("QUEUED_FROM_LEAVER"))).toBe(false);
+        expect(userChunkTexts(parsedLines(owner))).not.toContain("QUEUED_FROM_LEAVER");
+        expect(owner.stderr).toBe("");
+      } finally {
+        follower?.close();
+        await owner?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "a follower's load with a new system prompt during the owner's turn applies from the next turn",
+    async () => {
+      const root = createShortIsolatedRoot("fx-acp-follow-system-");
+      writeFileSync(join(root.workspace, "notes.md"), "held notes\n");
+      const running = deferred<void>();
+      const runningReply = deferred<Response>();
+      const gateway = startFakeGateway([
+        finalText("TURN_ONE"),
+        () => {
+          running.resolve();
+          return runningReply.promise;
+        },
+        finalText("RUNNING_DONE"),
+        finalText("NEXT_REPLY"),
+      ]);
+      let owner: AcpClient | undefined;
+      let follower: LeaderSocketClient | undefined;
+      try {
+        const started = await ownerWithSession(root, gateway, {
+          systemPrompt: { mode: "append", content: [{ type: "text", text: "OLD_SYSTEM_PROMPT" }] },
+        });
+        owner = started.owner;
+        sendPrompt(owner, 10, "RUNNING_PROMPT");
+        await running.promise;
+
+        // A follower loads the session with a new prompt while the first model request of the turn is held.
+        follower = await followSession(started.socket, started.sessionId, root);
+        const loaded = await follower.request("session/load", {
+          sessionId: started.sessionId,
+          cwd: root.workspace,
+          mcpServers: [],
+          systemPrompt: { mode: "append", content: [{ type: "text", text: "NEW_SYSTEM_PROMPT" }] },
+        });
+        expect(loaded.answer.error).toBeUndefined();
+
+        // The held reply is a read_file call, so the turn asks the model again after the load.
+        runningReply.resolve(
+          fakeGatewaySerializedToolCall("running_read_1", "read_file", JSON.stringify({ path: "notes.md" }), "RUNNING_SO_FAR"),
+        );
+        expect((await readResponse(owner, 10)).result.stopReason).toBe("end_turn");
+        sendPrompt(owner, 11, "NEXT_PROMPT");
+        expect((await readResponse(owner, 11)).result.stopReason).toBe("end_turn");
+
+        // Requests: the first model request, the turn's request after the load, then the next turn.
+        expect(modelSystemText(gateway.requests[1]!.body)).toContain("OLD_SYSTEM_PROMPT");
+        expect(modelSystemText(gateway.requests[2]!.body)).toContain("OLD_SYSTEM_PROMPT");
+        expect(modelSystemText(gateway.requests[2]!.body)).not.toContain("NEW_SYSTEM_PROMPT");
+        expect(modelSystemText(gateway.requests[3]!.body)).toContain("NEW_SYSTEM_PROMPT");
+        expect(modelSystemText(gateway.requests[3]!.body)).not.toContain("OLD_SYSTEM_PROMPT");
+        expect(owner.stderr).toBe("");
+      } finally {
+        follower?.close();
+        await owner?.close();
+        gateway.stop();
         rmSync(root.root, { recursive: true, force: true });
       }
     },

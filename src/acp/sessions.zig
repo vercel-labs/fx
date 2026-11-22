@@ -8,6 +8,7 @@ const mem_utils = @import("../core/shared/mem_utils.zig");
 const text_utils = @import("../core/shared/text_utils.zig");
 const jsonrpc = @import("jsonrpc.zig");
 const libfx_hooks = @import("libfx_hooks.zig");
+const sh_fx = @import("sh_fx.zig");
 const acp_types = @import("types.zig");
 const mcp_servers = @import("mcp_servers.zig");
 const client_instructions = @import("client_instructions.zig");
@@ -647,7 +648,7 @@ pub fn handleLoadWasmSession(state: *server.ServerState, alloc: Allocator, msg: 
         var sources: runtime_tool_presentation.ReplayedSavedOutputSources = .{};
         defer sources.deinit(alloc);
         for (active.session_rt.agent.history.items, 0..) |turn, index| try sendHistoryTurnAsUpdates(state, active, alloc, &sources, turn, index + 1);
-        try sendSessionInfoUpdate(state, active, alloc, active.prompt == null);
+        try sendSessionInfoUpdate(state, active, alloc, !server.sessionPromptRunning(active));
         return writeLoadSessionResponse(state, alloc, msg, active, observer_hooks);
     }
 
@@ -776,8 +777,8 @@ pub fn handleResumeSession(state: *server.ServerState, alloc: Allocator, msg: *j
 /// The answer is built under `shared.mutex`, which keeps the session alive. The
 /// join writes it after the replay and before it lists the connection, so a
 /// follower's answer always comes before its first live update (`joinSession`).
-/// The request's `systemPrompt` and hooks are traced and not applied: a follower
-/// only watches the session, and only its owner changes the session's settings.
+/// The request's `systemPrompt` applies as it does on a load of an open session, from the
+/// next turn. Its hooks are traced and not applied: a follower only watches the session.
 fn followSharedSession(
     state: *server.ServerState,
     alloc: Allocator,
@@ -798,7 +799,18 @@ fn followSharedSession(
         return false;
     };
     if (session.server == state) return false;
-    traceIgnoredFollowerChanges(session, requested_system_prompt, observer_hooks);
+    if (requested_system_prompt) |text| switch (commitClientSystemPrompt(session, text)) {
+        .unchanged, .applied => {},
+        .save_failed => |err| {
+            debug_trace.logf("acp", "failed to persist client system prompt err={s}", .{@errorName(err)});
+            try state.writer.writeError(alloc, msg.id, .{
+                .code = ErrorCode.internal_error,
+                .message = "Failed to save the client system prompt",
+            });
+            return true;
+        },
+    };
+    traceIgnoredFollowerHooks(session, observer_hooks);
     // Built before the join takes `session_write_mutex`: building takes `settings_mutex`, which comes first in the lock order.
     const answer = try buildSessionAnswer(state, alloc, session, session.workspace_root);
     defer alloc.free(answer);
@@ -806,19 +818,9 @@ fn followSharedSession(
     return true;
 }
 
-/// Traces the `systemPrompt` and hooks of a join request that a follower does not
-/// apply. The prompt is traced only when it differs from the session's own.
-fn traceIgnoredFollowerChanges(
-    session: *server.ActiveSessionState,
-    requested_system_prompt: ?[]const u8,
-    observer_hooks: ?libfx_hooks.Config,
-) void {
-    if (requested_system_prompt) |text| {
-        session.settings_mutex.lockUncancelable(io_mod.getIo());
-        const differs = !std.mem.eql(u8, session.client_system_prompt, text);
-        session.settings_mutex.unlock(io_mod.getIo());
-        if (differs) debug_trace.logf("acp", "event=follower_change_ignored session={s} field=systemPrompt", .{session.session_id});
-    }
+/// Traces the hooks of a join request that a follower does not apply: a follower only
+/// watches the session, so it never changes the session's hooks.
+fn traceIgnoredFollowerHooks(session: *server.ActiveSessionState, observer_hooks: ?libfx_hooks.Config) void {
     if (observer_hooks != null) debug_trace.logf("acp", "event=follower_change_ignored session={s} field=hooks", .{session.session_id});
 }
 
@@ -1087,6 +1089,40 @@ fn handleRestoreSession(
     try writeLoadSessionResponse(state, alloc, msg, session, observer_hooks);
 }
 
+/// What `commitClientSystemPrompt` did with a client system prompt.
+const ClientPromptCommit = union(enum) {
+    /// The session already had this prompt, so nothing was written.
+    unchanged,
+    applied,
+    save_failed: anyerror,
+};
+
+/// Stores `text` as the session's client system prompt, from the next turn, whether or
+/// not a turn runs. The caller keeps `text`. Both locks are held until the field is set,
+/// so two loads cannot leave the saved prompt and the live one different. A turn copies
+/// the field under `settings_mutex`, so a running turn keeps the prompt it started with.
+/// The line lock is not taken. The field is owned by the owner's allocator, which frees it.
+fn commitClientSystemPrompt(session: *server.ActiveSessionState, text: []const u8) ClientPromptCommit {
+    const io = io_mod.getIo();
+    // Settings come first, then the write lock. Every other path takes them in this
+    // order (the comment on `settings_mutex` in server.zig says so). Taking the write
+    // lock first would let two threads each hold one lock and wait for the other.
+    session.settings_mutex.lockUncancelable(io);
+    defer session.settings_mutex.unlock(io);
+    session.session_write_mutex.lockUncancelable(io);
+    defer session.session_write_mutex.unlock(io);
+    if (std.mem.eql(u8, session.client_system_prompt, text)) return .unchanged;
+    const owner_alloc = session.server.alloc;
+    const owned = owner_alloc.dupe(u8, text) catch |err| return .{ .save_failed = err };
+    if (session.v2) |v2| v2.setClientPrompt(text) catch |err| {
+        owner_alloc.free(owned);
+        return .{ .save_failed = err };
+    };
+    if (session.client_system_prompt.len > 0) owner_alloc.free(session.client_system_prompt);
+    session.client_system_prompt = owned;
+    return .applied;
+}
+
 /// `session/load` or `session/resume` of a session open on this connection
 /// reuses it: its turn, mode, and subagents keep running, and load replays
 /// its saved history again. The open session keeps its workspace, so a
@@ -1127,24 +1163,19 @@ fn reuseOpenSession(
             .message = "Session is open in another workspace",
         });
     };
-    if (requested_system_prompt.*) |text| if (!std.mem.eql(u8, text, session.client_system_prompt)) {
-        if (session.prompt != null) return state.writer.writeError(alloc, msg.id, .{
-            .code = ErrorCode.invalid_request,
-            .message = "Prompt already in progress",
-        });
-        if (session.v2) |v2| v2.setClientPrompt(text) catch |err| {
+    if (requested_system_prompt.*) |text| switch (commitClientSystemPrompt(session, text)) {
+        .unchanged, .applied => {},
+        .save_failed => |err| {
             debug_trace.logf("acp", "failed to persist client system prompt err={s}", .{@errorName(err)});
             return state.writer.writeError(alloc, msg.id, .{
                 .code = ErrorCode.internal_error,
                 .message = "Failed to save the client system prompt",
             });
-        };
-        if (session.client_system_prompt.len > 0) state.alloc.free(session.client_system_prompt);
-        session.client_system_prompt = text;
-        requested_system_prompt.* = null;
+        },
     };
     // History in memory changes as a turn runs; the saved history doesn't.
-    if (kind.replaysHistory() and session.v2 == null and session.prompt != null) {
+    // A stale answer here is harmless: the replay below checks again under the line lock.
+    if (kind.replaysHistory() and session.v2 == null and server.sessionPromptRunning(session)) {
         return state.writer.writeError(alloc, msg.id, .{
             .code = ErrorCode.invalid_request,
             .message = "Prompt already in progress",
@@ -1199,8 +1230,15 @@ fn reuseOpenSession(
     // A session whose host did not build when it opened gets one now, as
     // every reload gave it before.
     if (session.subagent_host == null) server.enableSubagentHost(session);
-    if (kind.replaysHistory()) try sendActiveHistoryUpdates(state, session, alloc, &sources);
-    try sendSessionInfoUpdate(state, session, alloc, session.prompt == null);
+    if (kind.replaysHistory()) {
+        // A turn may have started since the check above, so the replay checks again.
+        const replayed = try replayHistoryIfIdle(state, session, alloc, &sources);
+        if (!replayed) return state.writer.writeError(alloc, msg.id, .{
+            .code = ErrorCode.invalid_request,
+            .message = "Prompt already in progress",
+        });
+    }
+    try sendSessionInfoUpdate(state, session, alloc, !server.sessionPromptRunning(session));
     return writeLoadSessionResponse(state, alloc, msg, session, observer_hooks);
 }
 
@@ -1785,6 +1823,25 @@ fn parseListCursor(raw: []const u8) !session_store.ResumableSessionContinuation 
     if (updated_at_ms < 0 or fields.next() != null) return error.InvalidParams;
     session_store.validateSessionId(id) catch return error.InvalidParams;
     return .{ .updated_at_ms = updated_at_ms, .id = id };
+}
+
+/// Replays the session's history to the client. A saved history (v2) is never written
+/// by a turn, so it replays without the line lock. An in-memory history changes while a
+/// turn runs, so it is read only when no turn holds the slot. The check and the read
+/// share one hold of the line lock, which keeps a turn from starting in between. The
+/// replay writes to the client under that hold, so a reader that waits for the lock
+/// also waits for the replay. Returns false, without replaying, when a turn holds the
+/// slot.
+fn replayHistoryIfIdle(state: *server.ServerState, session: *server.ActiveSessionState, alloc: Allocator, sources: *runtime_tool_presentation.ReplayedSavedOutputSources) !bool {
+    if (session.v2 != null) {
+        try sendActiveHistoryUpdates(state, session, alloc, sources);
+        return true;
+    }
+    session.waiting_prompts.lock();
+    defer session.waiting_prompts.unlock();
+    if (session.prompt != null) return false;
+    try sendActiveHistoryUpdates(state, session, alloc, sources);
+    return true;
 }
 
 fn sendActiveHistoryUpdates(
@@ -4344,7 +4401,7 @@ test "a repeat session/load of a followed session replays again and adds no seco
     try expectOccurrences(owner_frames.bytes.items, "after repeat", 1);
 }
 
-test "a follower's prompt, set_mode, cancel and set_config_option get -32600, and the owner's session is unchanged" {
+test "a follower's set_mode and set_config_option get -32600, and the owner's session is unchanged" {
     const alloc = std.testing.allocator;
     var owner_frames = JoinFrames{ .alloc = alloc };
     defer owner_frames.deinit();
@@ -4370,12 +4427,7 @@ test "a follower's prompt, set_mode, cancel and set_config_option get -32600, an
     const owner_bytes_before = owner_frames.bytes.items.len;
     const joiner_bytes_before = joiner_frames.bytes.items.len;
 
-    var prompt_msg = jsonrpc.Message{
-        .id = .{ .integer = 10 },
-        .method = "session/prompt",
-        .params_raw = "{\"sessionId\":\"session_joined\",\"prompt\":[{\"type\":\"text\",\"text\":\"change it\"}]}",
-    };
-    try server.dispatch(&joiner, alloc, &prompt_msg);
+    // A joined client's prompt is accepted, so it is not sent here. Its cancel is answered, not refused.
     var mode_msg = jsonrpc.Message{
         .id = .{ .integer = 11 },
         .method = "session/set_mode",
@@ -4396,10 +4448,268 @@ test "a follower's prompt, set_mode, cancel and set_config_option get -32600, an
     try server.dispatch(&joiner, alloc, &config_msg);
 
     const refused = joiner_frames.bytes.items[joiner_bytes_before..];
-    try expectOccurrences(refused, "\"code\":-32600", 4);
-    try expectOccurrences(refused, "This session is open on another connection; only that connection can change it.", 4);
+    try expectOccurrences(refused, "\"code\":-32600", 2);
+    try expectOccurrences(refused, "This session is open on another connection; only that connection can change it.", 2);
+    try std.testing.expect(std.mem.find(u8, refused, "\"id\":12,\"result\":null") != null);
     try std.testing.expectEqual(owner_bytes_before, owner_frames.bytes.items.len);
     try std.testing.expectEqualStrings(mode_before, session.mode);
     try std.testing.expect(session.prompt == null);
     try std.testing.expectEqual(@as(usize, 1), session.followers.items.len);
+}
+
+test "a client that joins while a prompt's turn runs gets the prompt once, in the replay" {
+    const alloc = std.testing.allocator;
+    var owner_frames = JoinFrames{ .alloc = alloc };
+    defer owner_frames.deinit();
+    var joiner_frames = JoinFrames{ .alloc = alloc };
+    defer joiner_frames.deinit();
+    var shared: server.SharedSessions = .{};
+    defer shared.deinit(alloc);
+    var owner = try joinTestState(alloc, &shared, &owner_frames, "/tmp/workspace");
+    defer owner.deinit();
+    owner.connection_id = 1;
+    const session = try openJoinSession(&owner);
+
+    // The owner's prompt starts its turn before anyone joins. Its client gets no copy.
+    try server.announcePromptTurn(session, owner.connection_id, alloc, "joined-prompt", "JOINED_PROMPT", &.{});
+    try expectOccurrences(owner_frames.bytes.items, "JOINED_PROMPT", 0);
+
+    var joiner = try joinTestState(alloc, &shared, &joiner_frames, "/tmp/elsewhere");
+    defer joiner.deinit();
+    joiner.connection_id = 2;
+    var load_msg = jsonrpc.Message{
+        .id = .{ .integer = 2 },
+        .method = "session/load",
+        .params_raw = "{\"sessionId\":\"session_joined\",\"mcpServers\":[]}",
+    };
+    try handleLoadSession(&joiner, alloc, &load_msg);
+    joiner.initialized = true;
+    try expectOccurrences(joiner_frames.bytes.items, "JOINED_PROMPT", 1);
+    try expectOccurrences(joiner_frames.bytes.items, "user_message_chunk", 1);
+}
+
+/// `session/new` params that send `text` as the client's system prompt.
+fn newParamsWithPrompt(alloc: Allocator, text: []const u8) ![]u8 {
+    return alloc.print("{{\"mcpServers\":[],\"systemPrompt\":{{\"mode\":\"append\",\"content\":[{{\"type\":\"text\",\"text\":\"{s}\"}}]}}}}", .{text});
+}
+
+/// `session/load` params that name the session and send `text` as its system prompt.
+fn loadParamsWithPrompt(alloc: Allocator, session_id: []const u8, text: []const u8) ![]u8 {
+    return alloc.print("{{\"sessionId\":\"{s}\",\"mcpServers\":[],\"systemPrompt\":{{\"mode\":\"append\",\"content\":[{{\"type\":\"text\",\"text\":\"{s}\"}}]}}}}", .{ session_id, text });
+}
+
+/// The system prompt a turn starting now would take.
+fn turnPromptCopy(alloc: Allocator, session: *server.ActiveSessionState) ![]u8 {
+    session.settings_mutex.lockUncancelable(io_mod.getIo());
+    defer session.settings_mutex.unlock(io_mod.getIo());
+    return server.dupClientSystemPromptLocked(alloc, session);
+}
+
+fn readTraceText(alloc: Allocator, trace_path: []const u8) ![]u8 {
+    var file = try std.Io.Dir.openFileAbsolute(io_mod.getIo(), trace_path, .{});
+    defer file.close(io_mod.getIo());
+    var read_buf: [1024]u8 = undefined;
+    var reader = file.reader(io_mod.getIo(), &read_buf);
+    return reader.interface.allocRemaining(alloc, std.Io.Limit.limited(64 * 1024));
+}
+
+test "the owner's load with a new system prompt during a turn is answered, and the turn keeps the prompt it started with" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    const home_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home_path);
+    const workspace_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace_path);
+    const test_home = try AcpSessionTestHome.install(alloc, home_path);
+    defer test_home.deinit();
+    var capture = try tmp.dir.createFile(io_mod.getIo(), "acp-output.jsonl", .{ .read = true });
+    defer capture.close(io_mod.getIo());
+    var state = try initAcpSessionTestState(arena, workspace_path, capture);
+    defer state.deinit();
+    state.sessions_v2 = try session_adapter.Store.open(arena, home_path);
+    var frames = JoinFrames{ .alloc = alloc };
+    defer frames.deinit();
+    state.writer = jsonrpc.Writer.initCallback(&frames, JoinFrames.write);
+
+    const created_params = try newParamsWithPrompt(alloc, "OLD_CLIENT_PROMPT");
+    defer alloc.free(created_params);
+    var new_msg = jsonrpc.Message{ .id = .{ .integer = 1 }, .method = "session/new", .params_raw = created_params };
+    try handleNewSession(&state, arena, &new_msg);
+    const active = server.firstSession(&state).?;
+
+    // The turn takes its copy of the prompt as it starts, then runs.
+    const turn_prompt = try turnPromptCopy(alloc, active);
+    defer alloc.free(turn_prompt);
+    try server.claimTurnForTest(&state, alloc, active);
+    defer server.releaseTurnForTest(active);
+
+    // The owner loads the session with a new prompt while the turn runs.
+    const load_params = try loadParamsWithPrompt(alloc, active.session_id, "NEW_CLIENT_PROMPT");
+    defer alloc.free(load_params);
+    var load_msg = jsonrpc.Message{ .id = .{ .integer = 2 }, .method = "session/load", .params_raw = load_params };
+    try handleLoadSession(&state, arena, &load_msg);
+    try std.testing.expect(std.mem.find(u8, frames.bytes.items, "\"id\":2,\"result\"") != null);
+    try std.testing.expect(std.mem.find(u8, frames.bytes.items, "\"code\":-32600") == null);
+
+    // The running turn keeps the prompt it started with.
+    try std.testing.expect(std.mem.find(u8, turn_prompt, "OLD_CLIENT_PROMPT") != null);
+    try std.testing.expect(std.mem.find(u8, turn_prompt, "NEW_CLIENT_PROMPT") == null);
+
+    // The next turn takes the new one.
+    const next_prompt = try turnPromptCopy(alloc, active);
+    defer alloc.free(next_prompt);
+    try std.testing.expect(std.mem.find(u8, next_prompt, "NEW_CLIENT_PROMPT") != null);
+    try std.testing.expect(std.mem.find(u8, next_prompt, "OLD_CLIENT_PROMPT") == null);
+}
+
+test "a joined client's load with a new system prompt during the owner's turn is answered, and the joined turn keeps its prompt" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    const home_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home_path);
+    const workspace_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace_path);
+    const test_home = try AcpSessionTestHome.install(alloc, home_path);
+    defer test_home.deinit();
+    var capture = try tmp.dir.createFile(io_mod.getIo(), "acp-output.jsonl", .{ .read = true });
+    defer capture.close(io_mod.getIo());
+    // The owner's state grows the table with its arena, so the table frees with it.
+    var shared: server.SharedSessions = .{};
+    defer shared.deinit(arena);
+    var state = try initAcpSessionTestState(arena, workspace_path, capture);
+    defer state.deinit();
+    state.shared = &shared;
+    state.sessions_v2 = try session_adapter.Store.open(arena, home_path);
+    var owner_frames = JoinFrames{ .alloc = alloc };
+    defer owner_frames.deinit();
+    state.writer = jsonrpc.Writer.initCallback(&owner_frames, JoinFrames.write);
+
+    const created_params = try newParamsWithPrompt(alloc, "OLD_CLIENT_PROMPT");
+    defer alloc.free(created_params);
+    var new_msg = jsonrpc.Message{ .id = .{ .integer = 1 }, .method = "session/new", .params_raw = created_params };
+    try handleNewSession(&state, arena, &new_msg);
+    const active = server.firstSession(&state).?;
+
+    const turn_prompt = try turnPromptCopy(alloc, active);
+    defer alloc.free(turn_prompt);
+    try server.claimTurnForTest(&state, alloc, active);
+    defer server.releaseTurnForTest(active);
+
+    // A second connection loads the session with a new prompt while the owner's turn runs.
+    var joiner_frames = JoinFrames{ .alloc = alloc };
+    defer joiner_frames.deinit();
+    var joiner = try joinTestState(alloc, &shared, &joiner_frames, workspace_path);
+    defer joiner.deinit();
+    joiner.connection_id = 2;
+    const load_params = try loadParamsWithPrompt(alloc, active.session_id, "NEW_CLIENT_PROMPT");
+    defer alloc.free(load_params);
+    var load_msg = jsonrpc.Message{ .id = .{ .integer = 2 }, .method = "session/load", .params_raw = load_params };
+    try handleLoadSession(&joiner, arena, &load_msg);
+    try std.testing.expect(std.mem.find(u8, joiner_frames.bytes.items, "\"sh.fx/cwd\"") != null);
+    try std.testing.expect(std.mem.find(u8, joiner_frames.bytes.items, "\"code\":-32600") == null);
+
+    try std.testing.expect(std.mem.find(u8, turn_prompt, "OLD_CLIENT_PROMPT") != null);
+    const next_prompt = try turnPromptCopy(alloc, active);
+    defer alloc.free(next_prompt);
+    try std.testing.expect(std.mem.find(u8, next_prompt, "NEW_CLIENT_PROMPT") != null);
+}
+
+test "a changed client system prompt is saved with its session, and a restore reads the saved one" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    const home_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home_path);
+    const workspace_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace_path);
+    const test_home = try AcpSessionTestHome.install(alloc, home_path);
+    defer test_home.deinit();
+    var capture = try tmp.dir.createFile(io_mod.getIo(), "acp-output.jsonl", .{ .read = true });
+    defer capture.close(io_mod.getIo());
+    var state = try initAcpSessionTestState(arena, workspace_path, capture);
+    defer state.deinit();
+    state.sessions_v2 = try session_adapter.Store.open(arena, home_path);
+    var frames = JoinFrames{ .alloc = alloc };
+    defer frames.deinit();
+    state.writer = jsonrpc.Writer.initCallback(&frames, JoinFrames.write);
+
+    const created_params = try newParamsWithPrompt(alloc, "OLD_CLIENT_PROMPT");
+    defer alloc.free(created_params);
+    var new_msg = jsonrpc.Message{ .id = .{ .integer = 1 }, .method = "session/new", .params_raw = created_params };
+    try handleNewSession(&state, arena, &new_msg);
+    const active = server.firstSession(&state).?;
+
+    const load_params = try loadParamsWithPrompt(alloc, active.session_id, "NEW_CLIENT_PROMPT");
+    defer alloc.free(load_params);
+    var load_msg = jsonrpc.Message{ .id = .{ .integer = 2 }, .method = "session/load", .params_raw = load_params };
+    try handleLoadSession(&state, arena, &load_msg);
+    try std.testing.expect(std.mem.find(u8, frames.bytes.items, "\"id\":2,\"result\"") != null);
+
+    // A restore reads the prompt from the saved session, as a fresh open does.
+    const saved = try restoredClientSystemPrompt(alloc, active.v2.?);
+    defer alloc.free(saved);
+    try std.testing.expect(std.mem.find(u8, saved, "NEW_CLIENT_PROMPT") != null);
+    try std.testing.expect(std.mem.find(u8, saved, "OLD_CLIENT_PROMPT") == null);
+}
+
+test "a joined client's hooks are traced and not applied, while its system prompt applies" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const folder = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(folder);
+    const trace_path = try std.Io.Dir.path.join(alloc, &.{ folder, "trace.log" });
+    defer alloc.free(trace_path);
+    debug_trace.resetForTest();
+    try debug_trace.configureForTest(alloc, trace_path);
+    defer debug_trace.resetForTest();
+
+    var shared: server.SharedSessions = .{};
+    defer shared.deinit(alloc);
+    var owner_frames = JoinFrames{ .alloc = alloc };
+    defer owner_frames.deinit();
+    var owner = try joinTestState(alloc, &shared, &owner_frames, "/tmp/workspace");
+    defer owner.deinit();
+    owner.connection_id = 1;
+    const session = try openJoinSession(&owner);
+
+    var joiner_frames = JoinFrames{ .alloc = alloc };
+    defer joiner_frames.deinit();
+    var joiner = try joinTestState(alloc, &shared, &joiner_frames, "/tmp/elsewhere");
+    defer joiner.deinit();
+    joiner.connection_id = 2;
+    joiner.extensions = sh_fx.Set.initMany(&.{.hooks});
+    var load_msg = jsonrpc.Message{
+        .id = .{ .integer = 2 },
+        .method = "session/load",
+        .params_raw = "{\"sessionId\":\"session_joined\",\"mcpServers\":[],\"systemPrompt\":{\"mode\":\"append\",\"content\":[{\"type\":\"text\",\"text\":\"JOINED_CLIENT_PROMPT\"}]},\"_meta\":{\"sh.fx/hooks\":{\"captureContent\":true}}}",
+    };
+    try handleLoadSession(&joiner, alloc, &load_msg);
+
+    // The hooks are traced and the session keeps none; the prompt applies.
+    const trace = try readTraceText(alloc, trace_path);
+    defer alloc.free(trace);
+    try std.testing.expect(std.mem.find(u8, trace, "event=follower_change_ignored session=session_joined field=hooks") != null);
+    try std.testing.expect(std.mem.find(u8, trace, "field=systemPrompt") == null);
+    try std.testing.expect(session.observer_hooks == null);
+    const applied = try turnPromptCopy(alloc, session);
+    defer alloc.free(applied);
+    try std.testing.expect(std.mem.find(u8, applied, "JOINED_CLIENT_PROMPT") != null);
 }
