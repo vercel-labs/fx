@@ -6480,11 +6480,16 @@ describe("acp: model-independent", () => {
         expect(calls[1]?.params?.requestState).toBe("opaque");
         expect(calls[1]?.params?.name).toBe(calls[0]?.params?.name);
         expect(calls[1]?.params?.arguments).toEqual(calls[0]?.params?.arguments);
-        // The server is shared between sessions, so it hears the union of
-        // their question UIs: this editor's form, and URL as well.
-        expect(calls[1]?.params?._meta?.[
+        // A shared server hears the union of its sessions' question UIs: the
+        // owner declares form and URL. A session that runs its own copy, as on
+        // a home whose owner socket path is too long, declares only what this
+        // editor did: form.
+        expect([
+          { elicitation: { form: {} } },
+          { elicitation: { form: {}, url: {} } },
+        ]).toContainEqual(calls[1]?.params?._meta?.[
           "io.modelcontextprotocol/clientCapabilities"
-        ]).toMatchObject({ elicitation: { form: {} } });
+        ]);
       } finally {
         await client?.close();
         if (existsSync(pidPath)) await expectMcpProcessExited(pidPath);
@@ -6733,9 +6738,14 @@ describe("acp: model-independent", () => {
           confirm: { action: "accept", content: { confirmed: true } },
         });
         expect(calls[1]?.params?.requestState).toBe("opaque");
-        // A shared server hears the union of its sessions' question UIs.
-        expect(calls[1]?.params?._meta?.["io.modelcontextprotocol/clientCapabilities"])
-          .toMatchObject({ elicitation: { form: {} } });
+        // A shared server hears the union of its sessions' question UIs, which
+        // the owner declares as form and URL. A session that runs its own copy,
+        // as on a home whose owner socket path is too long, declares only what
+        // this editor did: form.
+        expect([
+          { elicitation: { form: {} } },
+          { elicitation: { form: {}, url: {} } },
+        ]).toContainEqual(calls[1]?.params?._meta?.["io.modelcontextprotocol/clientCapabilities"]);
       } finally {
         await client?.close();
         if (existsSync(pidPath)) await expectMcpProcessExited(pidPath);
