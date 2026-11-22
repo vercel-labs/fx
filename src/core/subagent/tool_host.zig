@@ -137,7 +137,9 @@ pub const Delivery = union(enum) {
 /// `QueueFull`: the receiving agent's queue already holds
 /// `agent_frame.queue_cap` messages from other agents. Only a message is
 /// refused this way, never a report.
-pub const PostReportError = error{ OutOfMemory, AgentGone, QueueFull };
+/// `ReceiverRestarting`: the receiving agent stops its turn for fx's restart
+/// and takes no message before fx exits; the sender puts it in its report.
+pub const PostReportError = error{ OutOfMemory, AgentGone, QueueFull, ReceiverRestarting };
 
 pub const ProgressSink = struct {
     context: *anyopaque,

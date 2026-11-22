@@ -1263,6 +1263,11 @@ pub const WorkerRuntime = struct {
         if (reserved and self.reserved_agent_messages > 0) self.reserved_agent_messages -= 1;
         if (self.finalization_failure != null) return error.TurnFinalizationDeliveryFailed;
         if (self.worker_stop_requested) return error.WorkerStopped;
+        // An agent that stops its turn for fx's restart takes no message
+        // before fx exits, and nothing saves a message across the restart
+        // (a report stays owed in its child's log), so the caller tells
+        // the user what was dropped.
+        if (queued.mail == .message and self.yield_requested.load(.seq_cst)) return error.ReceiverRestarting;
         if (!reserved and queued.mail == .message and self.agentMessageCountLocked() >= agent_frame.queue_cap) {
             return error.QueueFull;
         }
@@ -6817,6 +6822,30 @@ test "another agent's messages past the cap are refused, and reports never are" 
     runtime.releaseAgentMessage();
     try std.testing.expect(runtime.reserveAgentMessage());
     try std.testing.expectEqual(@as(usize, 2), runtime.queuedPromptCount());
+}
+
+test "a message to an agent that stops for fx's restart is refused, and a report still waits" {
+    const alloc = std.testing.allocator;
+    var runtime = WorkerRuntime{};
+    defer runtime.deinit(alloc);
+    runtime.worker_processing = true;
+    runtime.active_turn_id = 9;
+
+    runtime.requestYield();
+    // The message's place was held before the yield.
+    try std.testing.expect(runtime.reserveAgentMessage());
+    var message = try makePrompt(alloc, "a message", "model");
+    message.mail = .message;
+    try std.testing.expectError(error.ReceiverRestarting, runtime.postReservedMail(alloc, message));
+    freeQueuedPrompt(alloc, message);
+    try std.testing.expectEqual(@as(usize, 0), runtime.queuedPromptCount());
+    try std.testing.expectEqual(@as(usize, 0), runtime.reserved_agent_messages);
+
+    // A report still queues: it stays owed in its child's log and comes again after the restart.
+    var report = try makePrompt(alloc, "a report", "model");
+    report.mail = .report;
+    try runtime.postMail(alloc, report);
+    try std.testing.expectEqual(@as(usize, 1), runtime.queuedPromptCount());
 }
 
 test "a user's stop drops other agents' messages waiting in the queue, and keeps reports and the user's prompts" {

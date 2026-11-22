@@ -119,6 +119,19 @@ pub fn Runtime(comptime App: type) type {
                 }
             }
 
+            // Main and other instances hold their queued work while they
+            // yield, and the restart drops it with the process, so a queue
+            // elsewhere refuses as the one on screen does.
+            if (comptime @hasDecl(App, "queuedWorkElsewhere")) {
+                var queue_name_buf: [32]u8 = undefined;
+                if (app.queuedWorkElsewhere(&queue_name_buf)) |name| {
+                    const notice = try app.alloc.print("upgrade is unavailable while {s} has queued prompts", .{name});
+                    defer app.alloc.free(notice);
+                    try writeUpgradeNotice(app, .neutral, notice);
+                    return .unavailable;
+                }
+            }
+
             if (!autoUpgradeEnabled(app)) {
                 try writeUpgradeNotice(app, .neutral, "auto-upgrade is disabled");
                 return .not_ready;
@@ -346,6 +359,7 @@ const TestApp = struct {
     prepare_error: ?anyerror = null,
     relaunch_error: ?error{NameTooLong} = null,
     needs_user_elsewhere: ?app_agents_runtime.BusyAgent = null,
+    queued_elsewhere: ?[]const u8 = null,
     turn_running: bool = false,
     subagent_working: bool = false,
     yield_request_count: usize = 0,
@@ -377,6 +391,10 @@ const TestApp = struct {
         return self.needs_user_elsewhere;
     }
 
+    pub fn queuedWorkElsewhere(self: *TestApp, _: []u8) ?[]const u8 {
+        return self.queued_elsewhere;
+    }
+
     pub fn anyTurnRunning(self: *TestApp) bool {
         return self.turn_running;
     }
@@ -398,6 +416,28 @@ const TestApp = struct {
     }
 
     pub fn agent(self: anytype) @TypeOf(&self.main_agent) {
+        return &self.main_agent;
+    }
+};
+
+/// An app that cannot stop its turns between steps: it has no restart wait,
+/// so Ctrl+G still refuses while a response streams.
+const StreamOnlyApp = struct {
+    alloc: std.mem.Allocator,
+    main_agent: struct {
+        stream: struct { active: bool = false } = .{},
+    } = .{},
+    notices: std.ArrayList(u8) = .empty,
+
+    fn prepareResumeHandoffForUpgrade(_: *StreamOnlyApp, _: anytype) !void {}
+    fn requestUpgradeRelaunch(_: *StreamOnlyApp, _: []const u8) !void {}
+    fn requestResumeHandoffForUpgrade(_: *StreamOnlyApp, _: anytype) void {}
+
+    fn writeDomainNotice(self: *StreamOnlyApp, notice: types.SemanticNotice, _: bool) !void {
+        try self.notices.appendSlice(self.alloc, notice.body);
+    }
+
+    pub fn agent(self: *StreamOnlyApp) @TypeOf(&self.main_agent) {
         return &self.main_agent;
     }
 };
@@ -437,6 +477,25 @@ test "app_upgrade_runtime refuses while another agent needs the user, and names 
 
     try std.testing.expectEqual(ApplyOutcome.unavailable, outcome);
     try std.testing.expectEqualStrings("upgrade is unavailable while reviewer needs approval", app.notices.items);
+    try std.testing.expectEqual(@as(usize, 0), app.prepare_count);
+    try std.testing.expectEqual(@as(usize, 0), deps_state.path_count);
+    try std.testing.expect(!app.should_exit);
+}
+
+test "app_upgrade_runtime refuses while another instance has queued prompts, and names it" {
+    var app = TestApp{ .alloc = std.testing.allocator };
+    defer app.deinit();
+    app.upgrader.state = .ready;
+    // A turn runs, so without the refusal fx would ask it to yield.
+    app.turn_running = true;
+    app.queued_elsewhere = "fx 2";
+    var deps_state = TestDepsState{};
+    const outcome = try Runtime(TestApp).applyReadyUpgradeWithDeps(&app, (&app).agent(), deps_state.deps());
+
+    try std.testing.expectEqual(ApplyOutcome.unavailable, outcome);
+    try std.testing.expectEqualStrings("upgrade is unavailable while fx 2 has queued prompts", app.notices.items);
+    try std.testing.expectEqual(@as(usize, 0), app.yield_request_count);
+    try std.testing.expect(!app.upgrader.restart_waits);
     try std.testing.expectEqual(@as(usize, 0), app.prepare_count);
     try std.testing.expectEqual(@as(usize, 0), deps_state.path_count);
     try std.testing.expect(!app.should_exit);
@@ -599,6 +658,18 @@ test "app_upgrade_runtime rejects busy app state before reload" {
     try std.testing.expectEqual(ApplyOutcome.unavailable, composer_outcome);
     try std.testing.expectEqual(@as(usize, 0), composer_deps.path_count);
     try std.testing.expect(std.mem.find(u8, composer_app.notices.items, "current prompt") != null);
+}
+
+test "app_upgrade_runtime still refuses while a response streams in an app that cannot stop turns between steps" {
+    var stream_app = StreamOnlyApp{ .alloc = std.testing.allocator };
+    defer stream_app.notices.deinit(std.testing.allocator);
+    stream_app.agent().stream.active = true;
+    var stream_deps = TestDepsState{};
+
+    const stream_outcome = try Runtime(StreamOnlyApp).applyReadyUpgradeWithDeps(&stream_app, (&stream_app).agent(), stream_deps.deps());
+    try std.testing.expectEqual(ApplyOutcome.unavailable, stream_outcome);
+    try std.testing.expectEqual(@as(usize, 0), stream_deps.path_count);
+    try std.testing.expect(std.mem.find(u8, stream_app.notices.items, "response finishes") != null);
 }
 
 test "app_upgrade_runtime asks running turns to yield and exits once they stop" {

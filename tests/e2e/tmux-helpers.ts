@@ -635,17 +635,26 @@ export function startDynamicFakeGateway(
 
 // Serves a fake update channel whose "new" artifact is a wrapper script that
 // logs its argv to argvLogPath and execs the real FX_BIN, so upgrade relaunch
-// tests can drive the handoff without shipping a second binary.
+// tests can drive the handoff without shipping a second binary. The relaunched
+// fx, which the fake upgrade installs, runs with `relaunchEnv`'s variables,
+// such as its own FX_RECORD tape.
 export function startUpgradeServer(
   root: string,
   argvLogPath: string,
   options: {
     revision?: string;
+    relaunchEnv?: Record<string, string>;
   } = {},
 ): { baseUrl: string; stop: () => void } {
   const artifactDir = join(root, "release-artifact");
   const wrapperPath = join(artifactDir, "fx");
   const archivePath = join(root, "fx.tar.gz");
+  const relaunchExports = Object.entries(options.relaunchEnv ?? {})
+    .map(([name, value]) => {
+      if (!/^[A-Z_][A-Z0-9_]*$/.test(name)) throw new Error(`relaunchEnv name ${name} is not a shell variable name`);
+      return `export ${name}=${shellQuote(value)}\n`;
+    })
+    .join("");
   mkdirSync(artifactDir);
   const script = `#!/bin/sh
 {
@@ -655,7 +664,7 @@ export function startUpgradeServer(
   done
   printf '\\n'
 } >> ${shellQuote(argvLogPath)}
-exec ${shellQuote(FX_BIN)} "$@"
+${relaunchExports}exec ${shellQuote(FX_BIN)} "$@"
 `;
   writeFileSync(wrapperPath, script);
   chmodSync(wrapperPath, 0o755);

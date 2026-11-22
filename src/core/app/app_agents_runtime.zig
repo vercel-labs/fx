@@ -1682,6 +1682,23 @@ pub fn Runtime(comptime App: type) type {
             return null;
         }
 
+        /// The first open agent other than the one on screen whose queued
+        /// work an upgrade's restart would drop: main or another instance,
+        /// which hold their queues while they yield (`requestYields`). A
+        /// subagent's queue runs, and the restart waits for it
+        /// (`anyTurnRunning`). Null when none holds any. Its name may use
+        /// `buf`. Main loop only.
+        pub fn queuedWorkElsewhere(app: *App, buf: []u8) ?[]const u8 {
+            if (app.agent_on_screen != null and firstOpen(app) and app.main_agent.worker.queuedPromptCount() > 0) {
+                return noteName(app, null, buf);
+            }
+            for (app.child_agents.items) |child| {
+                if (child == app.agent_on_screen or child.agent.role != .instance) continue;
+                if (child.agent.worker.queuedPromptCount() > 0) return noteName(app, child, buf);
+            }
+            return null;
+        }
+
         /// Asks the running turns of the main agent and of other instances
         /// to stop at their next step boundary, and holds their queued work,
         /// for an upgrade's restart (`WorkerRuntime.requestYield`). Subagents
@@ -1730,9 +1747,11 @@ pub fn Runtime(comptime App: type) type {
         }
 
         /// Logs the work each agent still holds as fx exits for an upgrade's
-        /// restart: queued prompts and messages no turn took. Reports owed to
-        /// a parent are saved in the child's log and come again after the
-        /// restart; anything else is dropped with the process.
+        /// restart. After Ctrl+G's checks only reports can be here: queued
+        /// work refuses Ctrl+G (`queuedWorkElsewhere`), a prompt sent during
+        /// the wait stays in the composer, and a message is refused
+        /// (`reserveMessagePlace`, `WorkerRuntime.postMailWith`). Each report
+        /// stays owed in its child's log and comes again after the restart.
         pub fn logHeldWork(app: *App) void {
             var name_buf: [32]u8 = undefined;
             const main_queued = app.main_agent.worker.queuedPromptCount();
@@ -2841,6 +2860,10 @@ pub fn Runtime(comptime App: type) type {
                 defer app.permission_state.authority_mutex.unlock(io_mod.getIo());
                 break :blk receiverOf(app, host, from_owner) orelse return error.AgentGone;
             };
+            // An agent that stops its turn for fx's restart takes no message
+            // before fx exits, and nothing saves one across it, so the
+            // sender hears at once and puts it in its report, which is kept.
+            if (receiver.worker.yield_requested.load(.seq_cst)) return error.ReceiverRestarting;
             // The receiver outlives the sender's call: a tree closes its
             // subagents' threads before the agents that started them.
             if (!receiver.worker.reserveAgentMessage()) return error.QueueFull;
@@ -2891,8 +2914,24 @@ pub fn Runtime(comptime App: type) type {
                 },
             };
             defer app.alloc.free(text);
-            try app.postAgentMessage(target, text, .child, if (message) .message else .report);
+            app.postAgentMessage(target, text, .child, if (message) .message else .report) catch |err| {
+                // A message that came after its receiver began to stop for
+                // fx's restart is not kept across it.
+                if (err == error.ReceiverRestarting) try noteMessageDroppedForRestart(app, sender, text.len);
+                return err;
+            };
             debug_trace.eventf("host", "child_delivery_posted", .{}, "child={s} work_id={s} kind={s}", .{ post.child_id, post.work_id, @tagName(post.kind) });
+        }
+
+        /// Tells the user that a subagent's message came while fx waits to
+        /// restart and that fx restarts without it. The trace names its
+        /// size, never its text.
+        fn noteMessageDroppedForRestart(app: *App, sender: []const u8, bytes: usize) !void {
+            debug_trace.logf("upgrade", "event=held_work_dropped kind=message bytes={d} reason=upgrade_restart", .{bytes});
+            if (comptime !@hasDecl(App, "writeDomainNotice")) return;
+            const body = try app.alloc.print("a message from {s} came while fx waits to restart, so fx restarts without it", .{sender});
+            defer app.alloc.free(body);
+            try app.writeDomainNotice(.{ .topic = "upgrade", .tone = .neutral, .body = body }, true);
         }
 
         /// Takes every waiting hand-off. Runs on the main loop each pass,
