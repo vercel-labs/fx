@@ -1058,14 +1058,20 @@ pub const Runtime = struct {
     /// `workEnded` after the owner was told of `end`: settles the child and
     /// returns whether its slot has a next work. `posted` is set when a turn
     /// work finished here posts to the owner too. A waiting message that could
-    /// not be saved as a work is reported here too, and the child is settled
-    /// again.
+    /// not be saved as a work, and a leftover of `end` that could not be queued
+    /// again, are reported here too, and the child is settled again.
     fn settleEnd(self: *Runtime, first: managed_owner.WorkEnd, posted: *bool) bool {
         var end = first;
         while (true) {
-            const dropped = switch (self.settleEndOnce(end, posted)) {
+            var drops: LeftoverDrops = .{};
+            const dropped = switch (self.settleEndOnce(end, posted, &drops)) {
                 .idle => return false,
                 .next => return true,
+                .leftovers_dropped => {
+                    if (self.reportDroppedLeftovers(end, drops)) posted.* = true;
+                    end.leftovers = &.{};
+                    continue;
+                },
                 .dropped => |failed| failed,
             };
             // The owner was told this message waits, so it hears that it
@@ -1079,8 +1085,10 @@ pub const Runtime = struct {
         }
     }
 
-    /// One pass of `settleEnd`: settles the child once for `end`.
-    fn settleEndOnce(self: *Runtime, end: managed_owner.WorkEnd, posted: *bool) SlotNext {
+    /// One pass of `settleEnd`: settles the child once for `end`. A leftover of
+    /// `end` that could not be queued again is noted in `drops`, and the pass
+    /// returns before it settles the child, so the caller reports it first.
+    fn settleEndOnce(self: *Runtime, end: managed_owner.WorkEnd, posted: *bool, drops: *LeftoverDrops) SlotNext {
         if (self.endClosingWork(end)) {
             _ = self.settleClose(end.child_id);
             return .idle;
@@ -1089,7 +1097,8 @@ pub const Runtime = struct {
             self.admission_mutex.lockUncancelable(io_mod.getIo());
             defer self.admission_mutex.unlock(io_mod.getIo());
             self.forgetCallLocked(end.work_id);
-            self.queueLeftoversLocked(end);
+            self.queueLeftoversLocked(end, drops);
+            if (drops.any()) return .leftovers_dropped;
             switch (self.openWaitingTurnWorkLocked(end.child_id)) {
                 .none => return self.nextOrIdleLocked(end.child_id),
                 // The turn that began meanwhile keeps the child busy; the
@@ -1121,6 +1130,29 @@ pub const Runtime = struct {
         /// stays busy: the caller reports it with the lock released, then
         /// settles the child again.
         dropped: FailedStart,
+        /// Some leftovers of the ended work could not be queued again, as
+        /// `LeftoverDrops` records. The child stays busy: the caller reports
+        /// them with the lock released, then settles the child again.
+        leftovers_dropped,
+    };
+
+    /// The leftovers of an ended work that could not be queued again, by
+    /// their index in `WorkEnd.leftovers`. Filled under the lock with no
+    /// allocation: the drop is an out-of-memory one.
+    const LeftoverDrops = struct {
+        mask: u64 = 0,
+        /// Drops at an index the mask cannot hold. They are logged, not reported.
+        beyond: usize = 0,
+
+        fn note(self: *LeftoverDrops, index: usize) void {
+            if (index < 64) self.mask |= @as(u64, 1) << @intCast(index) else self.beyond += 1;
+        }
+        fn any(self: LeftoverDrops) bool {
+            return self.mask != 0 or self.beyond != 0;
+        }
+        fn has(self: LeftoverDrops, index: usize) bool {
+            return index < 64 and (self.mask >> @intCast(index)) & 1 == 1;
+        }
     };
 
     /// Makes the parent's next message waiting for `child_id` the slot's
@@ -1143,7 +1175,7 @@ pub const Runtime = struct {
 
     /// Queues the parent's messages the ended turn never took ahead of the
     /// others waiting, so the child's next work takes them.
-    fn queueLeftoversLocked(self: *Runtime, end: managed_owner.WorkEnd) void {
+    fn queueLeftoversLocked(self: *Runtime, end: managed_owner.WorkEnd, drops: *LeftoverDrops) void {
         if (end.leftovers.len == 0) return;
         // A stop or close that came after the slot kept them counted them as
         // dropped, so none may start a work.
@@ -1161,13 +1193,15 @@ pub const Runtime = struct {
             at = index;
             break;
         };
-        for (end.leftovers) |work| {
+        for (end.leftovers, 0..) |work, index| {
             const queued = for (self.pending.items) |item| {
                 if (std.mem.eql(u8, item.work.id, work.id)) break true;
             } else false;
             if (queued) continue;
-            self.insertPendingLocked(at, end.child_id, name, work) catch |err| {
+            const inserted: anyerror!void = if (start_test_controls.leftoverInsertFails(index)) error.OutOfMemory else self.insertPendingLocked(at, end.child_id, name, work);
+            inserted catch |err| {
                 debug_trace.eventf("mailbox", "dropped", .{}, "child={s} work_id={s} reason={s}", .{ end.child_id, work.id, @errorName(err) });
+                drops.note(index);
                 continue;
             };
             at += 1;
@@ -1751,6 +1785,29 @@ pub const Runtime = struct {
         // was never saved is gone with this line.
         if (!posted or !failed.report_owed) debug_trace.logf("mailbox", "failed start not reported child={s} work_id={s} messages={d} error={s} owed={} saved={}: its messages never ran", .{ child_id, failed.work_id, failed.messages, @errorName(failed.err), failed.report_owed, failed.saved });
         self.forgetCall(failed.work_id);
+        return posted;
+    }
+
+    /// Tells the owner of each leftover of `end` that could not be queued
+    /// again, as a failed start: the owner was told the message joined the
+    /// turn, and it never ran. Call with no lock held. True when the sink
+    /// took a report.
+    fn reportDroppedLeftovers(self: *Runtime, end: managed_owner.WorkEnd, drops: LeftoverDrops) bool {
+        var posted = false;
+        const owed = !self.managed.treeClosed();
+        for (end.leftovers, 0..) |work, index| {
+            if (!drops.has(index)) continue;
+            // The id is the slot's, borrowed for the hook: nothing is freed here.
+            if (self.reportFailedStart(end.child_id, .{
+                .work_id = work.id,
+                .report_owed = owed,
+                .end = .{ .started_by = .parent },
+                .err = error.OutOfMemory,
+                .messages = 1,
+                .saved = false,
+            })) posted = true;
+        }
+        if (drops.beyond > 0) debug_trace.logf("mailbox", "leftovers dropped unreported child={s} count={d}: they could not be queued again and never ran", .{ end.child_id, drops.beyond });
         return posted;
     }
 
@@ -3770,6 +3827,83 @@ test "a parent's message that joined a turn that failed runs as the child's next
     try std.testing.expectEqual(@as(usize, 2), fixture.reportCount());
     try std.testing.expect(std.mem.find(u8, fixture.reports.items[0], " failed ") != null);
     try std.testing.expect(std.mem.endsWith(u8, fixture.reports.items[1], " completed DONE also this"));
+}
+
+// Main was told the message joined the turn. When the host cannot queue it
+// again, main must hear that it never ran, as a failed start does.
+test "a message that joined a turn and could not be queued again is reported as failed" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var parent: child_state.TestParent = undefined;
+    try parent.init(alloc);
+    defer parent.deinit();
+    var fixture = MailboxFixture{ .hold = true, .steerable = true, .fail_first = true };
+    defer fixture.deinit();
+    const runtime = try mailboxRuntime(alloc, &fixture, &parent);
+    defer runtime.deinit();
+
+    _ = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "working" } }, "call-1", null);
+    try waitForRuns(&fixture, 1);
+    const joined = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "also this" } }, "call-2", null);
+    try std.testing.expect(std.mem.find(u8, joined, "Sent into the subagent's running turn") != null);
+    start_test_controls.test_fail_leftover_at = 0;
+    defer start_test_controls.test_fail_leftover_at = null;
+    fixture.release.set(io_mod.getIo());
+    try waitUntilQuiet(runtime);
+
+    // The turn failed without reading the message, and the message could not
+    // be queued again: it never ran, and the report says so.
+    try std.testing.expectEqual(@as(usize, 1), fixture.runs.load(.seq_cst));
+    var failed_report = false;
+    for (fixture.reports.items) |line| {
+        if (std.mem.find(u8, line, "could not start the work your message made: fx ran out of memory. It never ran. Send the message again if it is still needed.") != null and std.mem.find(u8, line, " failed ") != null) failed_report = true;
+    }
+    try std.testing.expect(failed_report);
+    const status = try callTool(runtime, arena, .{ .status = .{ .agent = "reviewer" } }, "call-3", null);
+    try expectBodyHas(status, "reviewer: idle");
+    const again = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "again" } }, "call-4", null);
+    try expectBodyHas(again, "Sent to reviewer");
+    try waitUntilQuiet(runtime);
+    try std.testing.expectEqual(@as(usize, 2), fixture.runs.load(.seq_cst));
+}
+
+// Two messages joined the turn and only the second cannot be queued again: the
+// first runs as the next work, and only the second is reported as failed.
+test "only the leftover that could not be queued again is reported as failed" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var parent: child_state.TestParent = undefined;
+    try parent.init(alloc);
+    defer parent.deinit();
+    var fixture = MailboxFixture{ .hold = true, .steerable = true, .fail_first = true };
+    defer fixture.deinit();
+    const runtime = try mailboxRuntime(alloc, &fixture, &parent);
+    defer runtime.deinit();
+
+    _ = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "working" } }, "call-1", null);
+    try waitForRuns(&fixture, 1);
+    const first = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "first steer" } }, "call-2", null);
+    try std.testing.expect(std.mem.find(u8, first, "Sent into the subagent's running turn") != null);
+    const second = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "second steer" } }, "call-3", null);
+    try std.testing.expect(std.mem.find(u8, second, "Sent into the subagent's running turn") != null);
+    start_test_controls.test_fail_leftover_at = 1;
+    defer start_test_controls.test_fail_leftover_at = null;
+    fixture.release.set(io_mod.getIo());
+    try waitUntilQuiet(runtime);
+
+    var failed_reports: usize = 0;
+    var ran_first = false;
+    for (fixture.reports.items) |line| {
+        if (std.mem.find(u8, line, "could not start the work") != null) failed_reports += 1;
+        if (std.mem.endsWith(u8, line, " completed DONE first steer")) ran_first = true;
+    }
+    try std.testing.expectEqual(@as(usize, 1), failed_reports);
+    try std.testing.expect(ran_first);
+    try std.testing.expectEqual(@as(usize, 2), fixture.runs.load(.seq_cst));
 }
 
 test "the parent's stop drops a message that joined the turn it stops" {

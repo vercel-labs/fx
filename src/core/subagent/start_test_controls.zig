@@ -67,6 +67,18 @@ pub fn nextWorkFails() bool {
     return false;
 }
 
+/// Test builds only: an inline test sets it to the index of a leftover message
+/// that the host cannot queue again, as when it runs out of memory. No file
+/// control sets it.
+pub var test_fail_leftover_at: if (builtin.is_test) ?usize else void = if (builtin.is_test) null else {};
+
+/// Whether the leftover at `index` of an ended work fails to be queued again.
+pub fn leftoverInsertFails(index: usize) bool {
+    if (comptime build_options.libfx) return false;
+    if (builtin.is_test) return if (test_fail_leftover_at) |at| at == index else false;
+    return false;
+}
+
 /// Test builds only: an inline test sets it to run code where a waiting
 /// message's failed start has been ended and its report is not yet built, as a
 /// close of the child can land there.
@@ -162,4 +174,13 @@ test "a test build fails the save of a waiting message's work only through its h
     test_fail_next_work = true;
     defer test_fail_next_work = false;
     try std.testing.expect(nextWorkFails());
+}
+
+test "a test build fails the queueing of a leftover message only through its hook" {
+    // Without a hook no leftover fails to be queued, and the hook names one index.
+    try std.testing.expect(!leftoverInsertFails(0));
+    test_fail_leftover_at = 1;
+    defer test_fail_leftover_at = null;
+    try std.testing.expect(!leftoverInsertFails(0));
+    try std.testing.expect(leftoverInsertFails(1));
 }
