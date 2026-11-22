@@ -350,6 +350,23 @@ pub const CompactorCaller = struct {
         }
         conversation.provider_options.compaction = kind;
         conversation.provider_options.ultrafast = false;
+        // Another fx process may have renewed the sign-in since the compaction
+        // read it: one more send with the renewed credential, as `send` does.
+        var attempt = try self.providerCompactionAttempt(alloc, call, conversation);
+        if (attempt == .unauthorized and try self.renewCredential(call.trace_ctx)) {
+            attempt = try self.providerCompactionAttempt(alloc, call, conversation);
+        }
+        return switch (attempt) {
+            .reply => |reply| reply,
+            .unauthorized => providerFailed(alloc, .provider, "kind=unauthorized", .{}),
+        };
+    }
+
+    /// One provider compaction request: the provider's reply, or a 401 the
+    /// sign-in can be renewed for.
+    const ProviderAttempt = union(enum) { reply: compactor.ProviderReply, unauthorized };
+
+    fn providerCompactionAttempt(self: *CompactorCaller, alloc: Allocator, call: compactor.ProviderCall, conversation: agent_stream_provider.RequestData) compactor.CallError!ProviderAttempt {
         var capture = StreamCapture{ .alloc = alloc, .max_bytes = types.ProviderReplay.max_bytes };
         defer capture.deinit();
         var delivery = runtime_gateway_step.DeliveryCertainty.init();
@@ -396,29 +413,32 @@ pub const CompactorCaller = struct {
             return switch (err) {
                 error.Cancelled => error.Cancelled,
                 error.OutOfMemory => error.OutOfMemory,
-                else => providerFailed(alloc, .transport, "err={s}", .{@errorName(err)}),
+                else => ProviderAttempt{ .reply = try providerFailed(alloc, .transport, "err={s}", .{@errorName(err)}) },
             };
         };
         defer streamed.deinit(alloc);
         if (self.model_calls) |sink| sink.record(model_call_record.ofResult(sink.provider, self.model, .compaction, started_ms, io_mod.milliTimestamp(), &streamed, call.cancel_flag.load(.seq_cst)));
         if (call.cancel_flag.load(.seq_cst)) return error.Cancelled;
         const completion = switch (streamed) {
-            .failed => |failure| return providerFailed(alloc, .provider, "kind={s}", .{@tagName(failure.kind)}),
+            .failed => |failure| {
+                if (failure.kind == .unauthorized) return .unauthorized;
+                return .{ .reply = try providerFailed(alloc, .provider, "kind={s}", .{@tagName(failure.kind)}) };
+            },
             .completed => |completed| completed.completion,
         };
         if (capture.failed) return error.OutOfMemory;
-        if (capture.saw_tool_call or completion.tool_calls.len > 0) return providerFailed(alloc, .tool_call, "", .{});
+        if (capture.saw_tool_call or completion.tool_calls.len > 0) return .{ .reply = try providerFailed(alloc, .tool_call, "", .{}) };
         // Anthropic ends a compaction with its own stop reason, which reads
         // as `other`; OpenAI's ends as a normal stop.
         if (completion.finish_reason != .stop and completion.finish_reason != .other) {
-            return providerFailed(alloc, .incomplete, "finish_reason={s}", .{if (completion.finish_reason) |reason| @tagName(reason) else "missing"});
+            return .{ .reply = try providerFailed(alloc, .incomplete, "finish_reason={s}", .{if (completion.finish_reason) |reason| @tagName(reason) else "missing"}) };
         }
-        const parts = completion.provider_state_json orelse return providerFailed(alloc, .provider, "kind=no_block", .{});
-        if (!self.stream_provider.holdsCompactionBlock(alloc, parts)) return providerFailed(alloc, .provider, "kind=no_block parts_bytes={d}", .{parts.len});
+        const parts = completion.provider_state_json orelse return .{ .reply = try providerFailed(alloc, .provider, "kind=no_block", .{}) };
+        if (!self.stream_provider.holdsCompactionBlock(alloc, parts)) return .{ .reply = try providerFailed(alloc, .provider, "kind=no_block parts_bytes={d}", .{parts.len}) };
         const text = completion.content orelse "";
-        if (!std.unicode.utf8ValidateSlice(text)) return providerFailed(alloc, .truncated, "bytes={d}", .{text.len});
+        if (!std.unicode.utf8ValidateSlice(text)) return .{ .reply = try providerFailed(alloc, .truncated, "bytes={d}", .{text.len}) };
         compactor.traceLog(false, "provider compaction block model={s} text_bytes={d} parts_bytes={d} input_tokens={any} cache_read_tokens={any}", .{ self.model, text.len, parts.len, completion.usage.input_tokens, completion.usage.cache_read_tokens });
-        return .{ .block = .{ .provider = try alloc.dupe(u8, self.provider.label()), .text = try alloc.dupe(u8, text), .parts_json = try alloc.dupe(u8, parts) } };
+        return .{ .reply = .{ .block = .{ .provider = try alloc.dupe(u8, self.provider.label()), .text = try alloc.dupe(u8, text), .parts_json = try alloc.dupe(u8, parts) } } };
     }
 
     fn capabilities(context: *anyopaque, model: []const u8) model_capabilities.Capabilities {
@@ -804,4 +824,104 @@ test "a compaction request rejected with 401 is sent once more with the sign-in 
     }
     try testing.expectEqual(@as(usize, 3), fake.sends);
     try testing.expectEqualSlices(runtime_deps.CredentialRefreshMode, &.{.reload}, hooks.credential_refresh_modes.items);
+}
+
+test "a provider compaction request rejected with 401 is sent once more with the sign-in renewed" {
+    const testing = std.testing;
+    const support = @import("tests/support.zig");
+    const Fake = struct {
+        sends: usize = 0,
+        last_key: [32]u8 = undefined,
+        last_key_len: usize = 0,
+
+        fn stream(raw: ?*anyopaque, alloc: Allocator, request: agent_stream_provider.ModelRequest) !runtime_gateway_step.StreamResult {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            try request.admission.admit();
+            const key = request.credential.secret().?;
+            @memcpy(self.last_key[0..key.len], key);
+            self.last_key_len = key.len;
+            self.sends += 1;
+            if (std.mem.eql(u8, key, "launch-key")) return .{ .failed = .{
+                .kind = .unauthorized,
+                .http_status = .unauthorized,
+                .detail = try alloc.dupe(u8, "{\"error\":\"expired\"}"),
+                .ownership = .owned,
+            } };
+            return .{ .completed = .{
+                .completion = .{
+                    .content = try alloc.dupe(u8, "block summary"),
+                    .finish_reason = .stop,
+                    .provider_state_json = try alloc.dupe(u8, "[{\"type\":\"text\"}]"),
+                },
+                .ownership = .owned,
+            } };
+        }
+
+        fn capabilities(_: *anyopaque, _: []const u8) model_capabilities.Capabilities {
+            return .{};
+        }
+
+        fn providerCompaction(_: []const u8) ?model_capabilities.ProviderCompaction {
+            return .anthropic;
+        }
+
+        fn holdsBlock(_: Allocator, _: []const u8) bool {
+            return true;
+        }
+    };
+    const Case = struct { tokens: []const []const u8, sends: usize, block: bool };
+    const cases = [_]Case{
+        // Another fx renewed the sign-in: the block comes back on its token.
+        .{ .tokens = &.{"stored-key"}, .sends = 2, .block = true },
+        // Nothing to renew to: the 401 stands, and fx writes its own summary.
+        .{ .tokens = &.{}, .sends = 1, .block = false },
+    };
+    const instructions = [_]types.ChatMessage{.{ .role = .system, .content = "the agent's instructions" }};
+    const history = [_]types.ChatMessage{ .{ .role = .user, .content = "fix the build" }, .{ .role = .assistant, .content = "Fixed." } };
+    var cancel = std.atomic.Value(bool).init(false);
+    for (cases) |case| {
+        var fake: Fake = .{};
+        var hooks = support.FakeAgentRuntimeDeps.init(testing.allocator);
+        defer hooks.deinit();
+        hooks.credential_refresh_tokens = case.tokens;
+        const deps = hooks.deps();
+        var summary_model: CompactorCaller = .{
+            .stream_provider = .{
+                .context = &fake,
+                .stream_fn = Fake.stream,
+                .provider_compaction_fn = Fake.providerCompaction,
+                .holds_compaction_block_fn = Fake.holdsBlock,
+            },
+            .provider = .gateway,
+            .model = "m",
+            .api_key = "launch-key",
+            .credential_source = .fx_login,
+            .retry_count = 0,
+            .capabilities_context = &fake,
+            .capabilities_fn = Fake.capabilities,
+            .renewal_deps = &deps,
+            .conversation = .{ .model = "m", .instructions = &instructions, .messages = &history, .tools = .{ .advertised_names = &.{"shell"} }, .tool_choice = .auto, .provider_options = .{} },
+        };
+        defer summary_model.deinit();
+        const caller = summary_model.caller();
+        const reply = try caller.vtable.compact_with_provider.?(caller.context, testing.allocator, .{ .older = null, .cancel_flag = &cancel, .trace_ctx = .{} });
+        try testing.expectEqual(case.sends, fake.sends);
+        switch (reply) {
+            .block => |block| {
+                defer {
+                    testing.allocator.free(block.provider);
+                    testing.allocator.free(block.text);
+                    testing.allocator.free(block.parts_json);
+                }
+                try testing.expect(case.block);
+                try testing.expectEqualStrings("block summary", block.text);
+                try testing.expectEqualStrings("stored-key", fake.last_key[0..fake.last_key_len]);
+            },
+            .failed => |failure| {
+                defer testing.allocator.free(failure.detail);
+                try testing.expect(!case.block);
+                try testing.expectEqualStrings("kind=unauthorized", failure.detail);
+            },
+        }
+    }
 }

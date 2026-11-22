@@ -322,6 +322,9 @@ fn compactWithProvider(
         break :older messages.items;
     };
     trace.info(trace_ctx, .provider_start, "model={s} path=provider_block whole={} older_messages={any}", .{ caller.model, older == null, if (older) |messages| messages.len else null });
+    // The row moves while the provider writes its block, as it does while a
+    // summary request waits (`src/core/output/compaction_progress.zig`).
+    if (request.progress) |reported| if (reported.asked_fn) |asked| asked(reported.context);
     const reply = try caller.vtable.compact_with_provider.?(caller.context, out, .{ .older = older, .cancel_flag = request.cancel_flag, .trace_ctx = trace_ctx });
     const block = switch (reply) {
         .block => |block| block,
