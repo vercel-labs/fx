@@ -16,6 +16,8 @@ const FAKE = join(import.meta.dir, "../fakes/stdio.ts");
 const FAKE_HTTP = join(import.meta.dir, "../fakes/http.ts");
 const WITH_SERVER = join(import.meta.dir, "../with-server.ts");
 const MODERN = "2026-07-28";
+// The engine's default lost_limit (src/mcp/core/engine.zig), as ObsLostLimit.
+const LOST_LIMIT = 2;
 const LEGACY = "2025-11-25";
 
 // ---- fake servers ----
@@ -89,7 +91,7 @@ function engineScenario(c: EngineCase): Scenario {
       const remote = `${server}.remote`;
       if (m === "engine") {
         const control = c.control?.server === server ? c.control : undefined;
-        traces.push({ machine: "engine", instance: server, specDir: "tests/tla/mcp", wrapper: "EngineTrace", verdict: control ? "REJECTED" : "ACCEPTED", constants: { ObsMaxAttempts: control?.maxAttempts ?? attempts } });
+        traces.push({ machine: "engine", instance: server, specDir: "tests/tla/mcp", wrapper: "EngineTrace", verdict: control ? "REJECTED" : "ACCEPTED", constants: { ObsMaxAttempts: control?.maxAttempts ?? attempts, ObsLostLimit: LOST_LIMIT } });
       } else if (m === "stdio") traces.push({ machine: "stdio", instance: `${server}.stdio`, specDir: "tests/tla/mcp", wrapper: "StdioConnTrace", verdict: "ACCEPTED", constants: { ObsMaxAttempts: 255 } });
       else if (m === "request") traces.push({ machine: "request", instance: remote, specDir: "tests/tla/mcp", wrapper: "RequestTrace", verdict: "ACCEPTED" });
       else if (m === "era") traces.push({ machine: "era", instance: remote, specDir: "tests/tla/mcp", wrapper: "EraTrace", verdict: "ACCEPTED", constants: { ObsPreferredCount: 1 } });
@@ -589,6 +591,73 @@ export const scenarios: Scenario[] = [
         same(event(lines, "h.called.1")?.answer, '[{"type":"text","text":"from h"}]', "h's answer"),
         same([status(lines, "h")?.phase, status(lines, "a")?.phase], ["ready", "ready"], "phases"),
       ),
+  }),
+  engineScenario({
+    name: "u12-http-lost-restart",
+    description: "Two HTTP calls whose answer streams break are lost in a row: the engine drops the link, so the third call detects the server again and is answered",
+    http: {
+      name: "h",
+      rules: [
+        { method: "server/discover", result: { resultType: "complete", supportedVersions: [MODERN], capabilities: { tools: {} } } },
+        { method: "tools/list", result: { resultType: "complete", tools: [tool("echo")] } },
+        { method: "tools/call", sse: true, drop: true, times: 2 },
+        { method: "tools/call", result: { resultType: "complete", content: [{ type: "text", text: "third" }] } },
+      ],
+    },
+    servers: {},
+    labFlags: ["--no-listen"],
+    script: ["tools h", "expect h.phase.ready 5000", "call h echo", "expect h.called.1.lost 10000", "call h echo", "expect h.called.2.lost 10000", "call h echo", "expect h.called.3.result 10000", "status"],
+    machines: { h: ["engine", "request", "era", "catalog"] },
+    check: (lines, logs) => {
+      // The link restarts: the second detection goes out after the second call's stream broke, and call 3 goes out on the new link.
+      const raw = logs.h as unknown as { t: number; dir: string; body?: string }[];
+      const posts = raw.filter((l) => l.dir === "in" && l.body).map((l) => ({ t: l.t, ...JSON.parse(l.body!) }));
+      const detections = posts.filter((m) => m.method === "server/discover");
+      const calls = posts.filter((m) => m.method === "tools/call");
+      const restarted = detections.length === 2 && calls.length === 3 && detections[1].t > calls[1].t;
+      return first(
+        same(calls.length, 3, "tools/call posts"),
+        same(detections.length, 2, "server/discover posts"),
+        restarted ? null : "the second detection did not come after the second lost call",
+        same(event(lines, "h.called.3")?.answer, '[{"type":"text","text":"third"}]', "the third call's answer"),
+      );
+    },
+  }),
+  engineScenario({
+    name: "u12-http-lost-restart-while-listing",
+    description: "A tool list still loading when two HTTP calls are lost is failed by the restart, so the next tool request lists again on the new link, and a third call is answered",
+    http: {
+      name: "h",
+      rules: [
+        { method: "server/discover", result: { resultType: "complete", supportedVersions: [MODERN], capabilities: { tools: {} } } },
+        { method: "tools/list", result: { resultType: "complete", tools: [tool("echo")] }, delayMs: 3000, times: 1 },
+        { method: "tools/list", result: { resultType: "complete", tools: [tool("echo")] } },
+        { method: "tools/call", sse: true, drop: true, times: 2 },
+        { method: "tools/call", result: { resultType: "complete", content: [{ type: "text", text: "third" }] } },
+      ],
+    },
+    servers: {},
+    labFlags: ["--no-listen"],
+    script: ["tools h", "expect h.phase.ready 5000", "call h echo", "expect h.called.1.lost 10000", "call h echo", "expect h.called.2.lost 10000", "expect h.tools.fail 10000", "tools h", "expect h.tools.ok 10000", "call h echo", "expect h.called.3.result 10000", "status"],
+    machines: { h: ["engine", "request", "era", "catalog"] },
+    check: (lines, logs) => {
+      // The restart: the second detection and the second tool list both go out after the second lost call.
+      const raw = logs.h as unknown as { t: number; dir: string; body?: string }[];
+      const posts = raw.filter((l) => l.dir === "in" && l.body).map((l) => ({ t: l.t, ...JSON.parse(l.body!) }));
+      const detections = posts.filter((m) => m.method === "server/discover");
+      const listings = posts.filter((m) => m.method === "tools/list");
+      const calls = posts.filter((m) => m.method === "tools/call");
+      const restarted = detections.length === 2 && calls.length === 3 && detections[1].t > calls[1].t;
+      const relisted = listings.length === 2 && calls.length === 3 && listings[1].t > calls[1].t;
+      return first(
+        same(calls.length, 3, "tools/call posts"),
+        same(detections.length, 2, "server/discover posts"),
+        same(listings.length, 2, "tools/list posts"),
+        restarted ? null : "the second detection did not come after the second lost call",
+        relisted ? null : "the second tool list did not come after the second lost call",
+        same(event(lines, "h.called.3")?.answer, '[{"type":"text","text":"third"}]', "the third call's answer"),
+      );
+    },
   }),
   engineScenario({
     name: "u12-http-initialized-timeout",
