@@ -2851,7 +2851,9 @@ pub const Session = struct {
                 switch (body) {
                     .turn_started => |started| if (started.turn == ended.turn) break :scan,
                     .item => |piece| {
-                        if (newest_item) {
+                        // A request's recovery status says nothing of how the
+                        // turn ended, so a yield marker before one still counts.
+                        if (newest_item and !std.mem.eql(u8, piece.type, model_recovery_type)) {
                             newest_item = false;
                             found.yielded = std.mem.eql(u8, piece.type, yielded_type);
                         }
@@ -5670,8 +5672,10 @@ noinline fn replay(
                     // A record decides nothing: one saved after the marker
                     // leaves it standing, and one the next turn saves before
                     // its prompt, as a resume that asks first can, says
-                    // nothing of what that turn continues.
-                    const is_record = std.mem.eql(u8, piece.type, recovery_type);
+                    // nothing of what that turn continues. A request's recovery
+                    // status (`saveModelRecovery`) decides nothing either.
+                    const is_record = std.mem.eql(u8, piece.type, recovery_type) or
+                        std.mem.eql(u8, piece.type, model_recovery_type);
                     if (!is_record) yield_item = false;
                     // The next turn's first piece is not its prompt: the held
                     // turn was not continued. Its workspace captures, which its
@@ -7564,6 +7568,29 @@ test "a yielded newest turn comes back whole on resume" {
     defer restored.deinit(testing.allocator);
     try testing.expectEqual(@as(usize, 1), restored.history.len);
     try testing.expectEqualStrings("work", restored.history[0].interrupted.user.text);
+    try testing.expect(restored.history[0].interrupted.yielded);
+}
+
+test "a recovery status saved after the yield marker leaves the turn yielded" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var model = "m".*;
+    const s = try Session.create(testing.allocator, &t.store, "/w", .app, testSeed(&model));
+    try s.appendProgress(.{ .text = @constCast("work") }, .{}, .{});
+    try testing.expect(try s.markYielded());
+    try s.saveModelRecovery(.{ .kind = .failed, .attempt = 1, .failure = .rate_limited });
+    const id = try testing.allocator.dupe(u8, s.id());
+    defer testing.allocator.free(id);
+    s.close();
+
+    const r = try Session.resumeSession(testing.allocator, &t.store, .{ .id = id }, "/w", .app);
+    defer r.close();
+    const found = (try r.interruptedRequest()) orelse return error.TestExpectedInterruptedRequest;
+    try testing.expect(found.yielded);
+    var restored = try r.restore(testing.allocator);
+    defer restored.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 1), restored.history.len);
     try testing.expect(restored.history[0].interrupted.yielded);
 }
 
