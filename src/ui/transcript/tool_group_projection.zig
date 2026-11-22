@@ -1183,6 +1183,103 @@ fn isSessionFollowUp(scratch: std.mem.Allocator, record: *const ToolDetailRecord
     return std.mem.eql(u8, action, "interact") or std.mem.eql(u8, action, "stop");
 }
 
+/// Core's labels for a shell check, an `interact` call that sends no input:
+/// one while it runs and one once it came back (sessionPresentation in
+/// src/tools/shell/shell.zig).
+const check_running_label = "Waiting for";
+const check_returned_label = "Observed";
+/// What a check row says once its turn ended with its command still running.
+const check_waited_label = "Waited for";
+
+/// Whether a shell call checks on a session's command without sending it
+/// input.
+fn isSessionCheck(scratch: std.mem.Allocator, record: *const ToolDetailRecord) bool {
+    const action = storyArgString(scratch, record, "action") orelse return false;
+    return std.mem.eql(u8, action, "interact") and storyArgString(scratch, record, "chars") == null;
+}
+
+/// Whether the turn of the call at `status_index` has ended: its summary or
+/// cancellation notice, or a later turn's, follows the call.
+fn turnEndedAfter(entries: []const TranscriptEntry, status_index: usize) bool {
+    for (entries[status_index + 1 ..]) |entry| switch (entry) {
+        .raw_bytes => |raw| if (raw.class == .turn_summary or raw.class == .turn_cancellation) return true,
+        else => {},
+    };
+    return false;
+}
+
+/// `phrase`, the status of a row whose latest call is a check that came back,
+/// with its command's state in place of the check's own `Observed`, which
+/// core writes both while the command runs on and once it passed: `Ran` once
+/// the check found it ended, `Waited for` once the turn ended with it still
+/// running, and `Waiting for` until then, as while a check runs, so the row
+/// keeps one verb while its command runs. Null for any other row, and for a
+/// check whose status says how the command ended, such as `Exited 1`.
+fn checkRowPhrase(scratch: std.mem.Allocator, row: *const StoryRow, phrase: []const u8) !?[]const u8 {
+    const record = row.detail orelse return null;
+    if (record.outcome != .completed or !isSessionCheck(scratch, record)) return null;
+    const own_label = check_returned_label ++ " ";
+    if (!std.mem.startsWith(u8, phrase, own_label)) return null;
+    const label = if (record.check_found_command_ended) "Ran" else if (row.turn_ended) check_waited_label else check_running_label;
+    return try std.mem.concat(scratch, u8, &.{ label, " ", phrase[own_label.len..] });
+}
+
+test "a command check row keeps one verb while its command runs" {
+    const alloc = std.testing.allocator;
+    var run = storyCommandDetail(1, "{\"action\":\"run\",\"command\":\"fx-cloud run zig build test\"}", 0, null);
+    run.command_process_presentation = null;
+    run.command_display = @constCast("fx-cloud run zig build test");
+    var check = storyCommandDetail(2, "{\"action\":\"interact\",\"session_id\":\"shell-4\"}", 0, null);
+    check.command_process_presentation = null;
+    check.command_display = run.command_display;
+    check.command_action_label = @constCast(check_returned_label);
+    var entries = [_]TranscriptEntry{
+        .{ .raw_bytes = .{ .id = 1, .bytes = "● Still running fx-cloud run zig build test\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 2, .bytes = "● Observed fx-cloud run zig build test\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 3, .bytes = "  2m 4s\n", .class = .turn_summary } },
+    };
+    const Case = struct {
+        name: []const u8,
+        status: []const u8,
+        outcome: ?types.ToolOutcomeKind = .completed,
+        ended: bool = false,
+        exit_code: ?i64 = null,
+        turn_ended: bool = false,
+        want: []const u8,
+    };
+    const cases = [_]Case{
+        // The run alone, before any check, keeps core's label.
+        .{ .name = "run", .status = "", .want = "● Still running fx-cloud run zig build test" },
+        .{ .name = "check running", .status = "● Waiting for fx-cloud run zig build test\n", .outcome = null, .want = "● Waiting for fx-cloud run zig build test · 2 calls" },
+        .{ .name = "check back", .status = "● Observed fx-cloud run zig build test\n", .want = "● Waiting for fx-cloud run zig build test · 2 calls" },
+        .{ .name = "turn ended", .status = "● Observed fx-cloud run zig build test\n", .turn_ended = true, .want = "● Waited for fx-cloud run zig build test · 2 calls" },
+        .{ .name = "passed", .status = "● Observed fx-cloud run zig build test\n", .ended = true, .turn_ended = true, .want = "● Ran fx-cloud run zig build test · 2 calls ✓" },
+        .{ .name = "failed", .status = "● Exited 1 fx-cloud run zig build test\n", .outcome = .failed, .ended = true, .exit_code = 1, .want = "● Exited 1 fx-cloud run zig build test · 2 calls" },
+    };
+    for (cases) |case| {
+        entries[1].raw_bytes.bytes = case.status;
+        check.outcome = case.outcome;
+        check.check_found_command_ended = case.ended;
+        check.command_process_presentation = if (case.exit_code) |code| .{ .exit_code = code } else null;
+        const shown: []const TranscriptEntry = if (case.status.len == 0) entries[0..1] else if (case.turn_ended) entries[0..] else entries[0..2];
+        const text = try groupTextForTest(alloc, shown, &.{ run, check });
+        defer alloc.free(text);
+        errdefer std.debug.print("{s}:\n{s}\n", .{ case.name, text });
+        try std.testing.expectEqualStrings(case.want, firstLineForTest(text));
+    }
+
+    // Input sent to the session keeps its own label.
+    entries[1].raw_bytes.bytes = "● Sent input to fx-cloud run zig build test\n";
+    check.arguments_json = @constCast("{\"action\":\"interact\",\"session_id\":\"shell-4\",\"chars\":\"y\\n\"}");
+    check.outcome = .completed;
+    check.check_found_command_ended = false;
+    check.command_process_presentation = null;
+    const sent = try groupTextForTest(alloc, entries[0..2], &.{ run, check });
+    defer alloc.free(sent);
+    errdefer std.debug.print("sent:\n{s}\n", .{sent});
+    try std.testing.expectEqualStrings("● Sent input to fx-cloud run zig build test · 2 calls ✓", std.mem.trim(u8, sent, "\n"));
+}
+
 fn isProviderSearchName(name: []const u8) bool {
     return std.mem.eql(u8, name, "web_search_preview") or std.mem.eql(u8, name, "google_search");
 }
@@ -1559,6 +1656,12 @@ const StoryRow = struct {
     /// The row's latest call that returned while its command ran on, which
     /// the first later call to its session joins; null when none did.
     background: ?*const ToolDetailRecord = null,
+    /// The command the run that started the row's session sent, when the
+    /// row's latest call is a later call to that session (sessionLaunchCommand).
+    launch_command: ?[]const u8 = null,
+    /// Whether the turn of the row's latest call ended, when that call is a
+    /// shell check (checkRowPhrase).
+    turn_ended: bool = false,
 };
 
 /// The name a call adds to a `.read` or `.search` row: the file's path, or
@@ -1652,6 +1755,89 @@ fn saysNothingYet(scratch: std.mem.Allocator, entry: TranscriptEntry, record: *c
     if (!record.streaming or record.outcome != null or storyHasArgs(record)) return false;
     const phrase = std.mem.trim(u8, try entryStatus(scratch, entry) orelse return false, " ");
     return phrase.len > 0 and std.mem.findScalar(u8, phrase, ' ') == null;
+}
+
+/// Whether a started call has not said what it does yet: its status is still
+/// the bare tool name, such as "edit_file" or "shell", that the transcript
+/// writes when a call starts (lifecycleStartLine in
+/// src/ui/transcript/runtime.zig), until core's first status line arrives.
+fn awaitsStatus(scratch: std.mem.Allocator, entry: TranscriptEntry, record: *const ToolDetailRecord) !bool {
+    if (record.outcome != null) return false;
+    const phrase = try entryStatus(scratch, entry) orelse return false;
+    return std.mem.eql(u8, phrase, record.tool_name);
+}
+
+test "a started call that still reads as its tool's name has no row and leaves its row as it was" {
+    const alloc = std.testing.allocator;
+    const edit_args = "{\"path\":\"/w/src/tool_host.zig\",\"old_string\":\"a\",\"new_string\":\"b\"}";
+    const grep_args = "{\"action\":\"run\",\"command\":\"grep -n wait src/tool_host.zig\"}";
+    // A second edit of the file starts before core names it: the edit row
+    // keeps its name, and counts the edit once core does.
+    {
+        var entries = [_]TranscriptEntry{
+            .{ .raw_bytes = .{ .id = 1, .bytes = "● Ran grep\n", .class = .tool_status } },
+            .{ .raw_bytes = .{ .id = 2, .bytes = "● Editing /w/src/tool_host.zig\n", .class = .tool_status } },
+            .{ .raw_bytes = .{ .id = 3, .bytes = "● edit_file\x1b[0m\n", .class = .tool_status } },
+        };
+        const details = [_]ToolDetailRecord{
+            storyCommandDetail(1, grep_args, 0, null),
+            .{ .entry_id = 2, .tool_name = @constCast("edit_file"), .activity_kind = .edit, .arguments_json = @constCast(edit_args) },
+            .{ .entry_id = 3, .tool_name = @constCast("edit_file"), .activity_kind = .edit, .arguments_json = @constCast(edit_args) },
+        };
+        const text = try groupTextForTest(alloc, &entries, &details);
+        defer alloc.free(text);
+        errdefer std.debug.print("edit:\n{s}\n", .{text});
+        try std.testing.expect(std.mem.find(u8, text, "edit_file") == null);
+        try std.testing.expect(std.mem.endsWith(u8, std.mem.trimEnd(u8, text, "\n"), "└ Editing tool_host.zig"));
+
+        entries[2].raw_bytes.bytes = "● Editing /w/src/tool_host.zig\n";
+        const named = try groupTextForTest(alloc, &entries, &details);
+        defer alloc.free(named);
+        errdefer std.debug.print("named edit:\n{s}\n", .{named});
+        try std.testing.expect(std.mem.endsWith(u8, std.mem.trimEnd(u8, named, "\n"), "└ Editing tool_host.zig · 2 edits"));
+    }
+    // A write that has not said what it writes adds no row.
+    {
+        const entries = [_]TranscriptEntry{
+            .{ .raw_bytes = .{ .id = 1, .bytes = "● Wrote /tmp/commit-msg.txt +9\n", .class = .tool_status } },
+            .{ .raw_bytes = .{ .id = 2, .bytes = "● write_file\x1b[0m\n", .class = .tool_status } },
+        };
+        const details = [_]ToolDetailRecord{
+            .{ .entry_id = 1, .tool_name = @constCast("write_file"), .activity_kind = .write, .arguments_json = @constCast("{\"path\":\"/tmp/commit-msg.txt\"}"), .outcome = .completed },
+            .{ .entry_id = 2, .tool_name = @constCast("write_file"), .activity_kind = .write, .arguments_json = @constCast("{\"path\":\"/tmp/pr-body.md\"}") },
+        };
+        const text = try groupTextForTest(alloc, &entries, &details);
+        defer alloc.free(text);
+        errdefer std.debug.print("write:\n{s}\n", .{text});
+        try std.testing.expect(std.mem.find(u8, text, "write_file") == null);
+        const row = std.mem.trim(u8, text, "\n");
+        try std.testing.expect(std.mem.findScalar(u8, row, '\n') == null);
+        try std.testing.expect(std.mem.startsWith(u8, row, "● Wrote ") and std.mem.endsWith(u8, row, "commit-msg.txt +9"));
+    }
+    // A command call alone has no row until its command is known, and one
+    // to a session leaves that session's row as it was.
+    {
+        const send_args = "{\"action\":\"interact\",\"session_id\":\"shell-7\",\"chars\":\"y\\n\"}";
+        const check_args = "{\"action\":\"interact\",\"session_id\":\"shell-7\"}";
+        const entries = [_]TranscriptEntry{
+            .{ .raw_bytes = .{ .id = 1, .bytes = "● Sent input to fx-cloud run zig build\n", .class = .tool_status } },
+            .{ .raw_bytes = .{ .id = 2, .bytes = "● shell\x1b[0m\n", .class = .tool_status } },
+        };
+        var send = storyCommandDetail(1, send_args, 0, null);
+        send.command_process_presentation = null;
+        send.command_display = @constCast("fx-cloud run zig build");
+        const check: ToolDetailRecord = .{ .entry_id = 2, .tool_name = @constCast("shell"), .activity_kind = .command, .arguments_json = @constCast(check_args), .command_display = @constCast("fx-cloud run zig build") };
+        const lone = try groupTextForTest(alloc, entries[1..], &.{check});
+        defer alloc.free(lone);
+        errdefer std.debug.print("lone:\n{s}\n", .{lone});
+        try std.testing.expectEqualStrings("", std.mem.trim(u8, lone, "\n"));
+
+        const joined = try groupTextForTest(alloc, &entries, &.{ send, check });
+        defer alloc.free(joined);
+        errdefer std.debug.print("joined:\n{s}\n", .{joined});
+        try std.testing.expect(std.mem.find(u8, joined, "shell") == null);
+        try std.testing.expectEqualStrings("● Sent input to fx-cloud run zig build ✓", std.mem.trim(u8, joined, "\n"));
+    }
 }
 
 /// The row a running call that does not have the arguments its row depends
@@ -2422,6 +2608,12 @@ fn collectStoryRows(
         // runs once they load shows instead, so the hold gets no row; Ctrl+O
         // still shows it.
         if (detail) |record| if (record.outcome == .deferred) continue;
+        // A call that has not said what it does yet has no row, and the row
+        // it joins keeps its latest status until it does.
+        if (detail) |record| if (try awaitsStatus(scratch, entry, record)) {
+            try unshown.put(scratch, entry_id, {});
+            continue :calls;
+        };
         const identity = try moreOutputIdentity(scratch, entry, detail, details, output_sources, try streamingSubagentIdentity(scratch, entry, detail, try streamingToolboxIdentity(scratch, entry, detail, try storyIdentity(scratch, detail))));
         // A call whose arguments have not arrived yet waits in the row it
         // will most likely join, and shows once they arrive.
@@ -2497,7 +2689,75 @@ fn collectStoryRows(
             if (std.mem.eql(u8, detail.?.tool_name, "write_file")) target.writes += 1;
         }
     }
+    for (rows.items) |*row| {
+        row.launch_command = sessionLaunchCommand(scratch, details, row.detail);
+        if (row.detail) |record| if (isSessionCheck(scratch, record)) {
+            row.turn_ended = turnEndedAfter(entries, row.status_index);
+        };
+    }
     return rows;
+}
+
+/// The command the run that started a session sent, for a later call to that
+/// session. Such a call has no `command` argument, and its display folds the
+/// command onto one line, where a here-document's body no longer lexes as
+/// one, so its row's short form reads the run's command. Null when no earlier
+/// run in `details` shows the same command.
+fn sessionLaunchCommand(scratch: std.mem.Allocator, details: []const ToolDetailRecord, follow_up: ?*const ToolDetailRecord) ?[]const u8 {
+    const record = follow_up orelse return null;
+    if (!isSessionFollowUp(scratch, record)) return null;
+    const display = record.command_display orelse return null;
+    var index = details.len;
+    while (index > 0) {
+        index -= 1;
+        const run = &details[index];
+        if (run.entry_id >= record.entry_id or isSessionFollowUp(scratch, run)) continue;
+        const run_display = run.command_display orelse continue;
+        if (std.mem.eql(u8, run_display, display)) return storyArgString(scratch, run, "command");
+    }
+    return null;
+}
+
+test "a session's row shortens the command its run sent, not the display folded onto one line" {
+    const alloc = std.testing.allocator;
+    const command =
+        \\python3 - <<'EOF'
+        \\s = open("/tmp/followup-unit.sh").read()
+        \\old_wait = '''if mode == "old-wait-text":
+        \\    p = "src/core/subagent/tool_host.zig"
+        \\'''
+        \\note = '''it's still running'''
+        \\print(old_wait in s, note)
+        \\EOF
+    ;
+    // Core folds each line break and the indent after it into one space.
+    const folded = "python3 - <<'EOF' s = open(\"/tmp/followup-unit.sh\").read() old_wait = '''if mode == \"old-wait-text\": p = \"src/core/subagent/tool_host.zig\" ''' note = '''it's still running''' print(old_wait in s, note) EOF";
+    const run_args = try alloc.print("{{\"action\":\"run\",\"command\":{f}}}", .{std.json.fmt(command, .{})});
+    defer alloc.free(run_args);
+    var run = storyCommandDetail(1, run_args, 0, null);
+    run.command_process_presentation = null;
+    run.command_display = @constCast(folded);
+    const check: ToolDetailRecord = .{
+        .entry_id = 2,
+        .tool_name = @constCast("shell"),
+        .activity_kind = .command,
+        .arguments_json = @constCast("{\"action\":\"interact\",\"session_id\":\"shell-31\"}"),
+        .command_display = @constCast(folded),
+    };
+    // The check runs in a later group than the run that started the session.
+    const entries = [_]TranscriptEntry{
+        .{ .raw_bytes = .{ .id = 2, .bytes = "● Waiting for " ++ folded ++ "\n", .class = .tool_status } },
+    };
+    const text = try groupTextForTest(alloc, &entries, &.{ run, check });
+    defer alloc.free(text);
+    errdefer std.debug.print("check:\n{s}\n", .{text});
+    try std.testing.expectEqualStrings("● Waiting for python3", std.mem.trim(u8, text, "\n"));
+
+    // With no run in the transcript, the row keeps its display.
+    const alone = try groupTextForTest(alloc, &entries, &.{check});
+    defer alloc.free(alone);
+    errdefer std.debug.print("alone:\n{s}\n", .{alone});
+    try std.testing.expect(std.mem.startsWith(u8, std.mem.trim(u8, alone, "\n"), "● Waiting for python3 - <<"));
 }
 
 /// The latest row with a run that returned while its command went on, for a
@@ -2552,7 +2812,8 @@ const StoryRowText = struct {
 fn storyRowText(scratch: std.mem.Allocator, row: *const StoryRow, style: SummaryStyle, cols: u16) !StoryRowText {
     if (rowListsNames(row)) return nameListRowText(scratch, row, cols);
     if (row.identity.kind == .commands) {
-        const label = try commandRowLabel(scratch, row.entry, row.detail) orelse "Ran ";
+        const own_label = try commandRowLabel(scratch, row.entry, row.detail) orelse "Ran ";
+        const label = try checkRowPhrase(scratch, row, own_label) orelse own_label;
         var steps = try combinedCommandSteps(scratch, row.combined.items);
         var display = try std.mem.concat(scratch, u8, &.{ label, try formatShortCommand(scratch, steps, style.text_style) });
         // A narrow row leaves out its oldest steps first, so the newest stays
@@ -2574,7 +2835,7 @@ fn storyRowText(scratch: std.mem.Allocator, row: *const StoryRow, style: Summary
     // call the model got wrong, and leaves why to Ctrl+O, unless the turn
     // ended on it, as for any failure a turn ends on.
     if (row.detail) |record| if (shellCallNeverRan(scratch, record)) {
-        const command = storyArgString(scratch, record, "command") orelse record.command_display orelse record.tool_name;
+        const command = storyArgString(scratch, record, "command") orelse row.launch_command orelse record.command_display orelse record.tool_name;
         const short = try shortCommand(scratch, command) orelse try terminalSafeText(scratch, command);
         const phrase = try inFailureStyle(scratch, try std.mem.concat(scratch, u8, &.{ "Couldn't run ", short }), style);
         const reason = if (row.ends_turn) try neverRanReason(scratch, record) orelse "" else "";
@@ -2582,7 +2843,8 @@ fn storyRowText(scratch: std.mem.Allocator, row: *const StoryRow, style: Summary
     };
     const split_failure = splitFailedPhrase(status_phrase, row.detail);
     const raw_phrase = if (split_failure) |split| split.row else status_phrase;
-    const full_phrase = try reprojectTruncatedCommandPhrase(scratch, raw_phrase, row.detail) orelse raw_phrase;
+    const reprojected_phrase = try reprojectTruncatedCommandPhrase(scratch, raw_phrase, row.detail) orelse raw_phrase;
+    const full_phrase = try checkRowPhrase(scratch, row, reprojected_phrase) orelse reprojected_phrase;
     const agent_phrase = if (row.detail) |record| try subagentRowPhrase(scratch, full_phrase, record) else null;
     const named_phrase = if (try moreOutputRowPhrase(scratch, full_phrase, row)) |more|
         more
@@ -2592,7 +2854,7 @@ fn storyRowText(scratch: std.mem.Allocator, row: *const StoryRow, style: Summary
         edit
     else if (agent_phrase) |agent|
         agent
-    else if (try shortenCommandPhrase(scratch, full_phrase, row.detail, style.text_style)) |short|
+    else if (try shortenCommandPhrase(scratch, full_phrase, row.detail, row.launch_command, style.text_style)) |short|
         short
     else
         try highlightCommandPhrase(scratch, full_phrase, row.detail, style.text_style) orelse full_phrase;
@@ -2656,12 +2918,15 @@ fn countNote(scratch: std.mem.Allocator, before: []const u8, count: usize, after
     return out.toOwnedSlice();
 }
 
-/// A phrase that still says the call is running, such as the status line
-/// `fx ask` prints when a command starts and never rewrites, or core's
-/// "Still running" for a run that returned before its command ended.
+/// A phrase that says its command has not ended, such as the status line
+/// `fx ask` prints when a command starts and never rewrites, core's
+/// "Still running" for a run that returned before its command ended, or a
+/// check row's "Waiting for" and "Waited for".
 fn phraseShowsProgress(phrase: []const u8) bool {
     return std.mem.startsWith(u8, phrase, "Running ") or
-        std.mem.startsWith(u8, phrase, still_running_label ++ " ");
+        std.mem.startsWith(u8, phrase, still_running_label ++ " ") or
+        std.mem.startsWith(u8, phrase, check_running_label ++ " ") or
+        std.mem.startsWith(u8, phrase, check_waited_label ++ " ");
 }
 
 /// Whether a row's own status already says it failed, as an old record with
@@ -3952,12 +4217,15 @@ fn withoutHereDocBodies(scratch: std.mem.Allocator, command: []const u8) std.mem
 
 /// Replaces the command a command row ends with by its short form, so a long
 /// command does not fill the row, and colors each step. `base_style` is the
-/// row's text style, as for highlightCommandPhrase. The full command stays in
-/// Ctrl+O and in approval prompts. Null when the row keeps its full command.
+/// row's text style, as for highlightCommandPhrase. `launch_command` is the
+/// command a session's run sent, for a later call to the session. The full
+/// command stays in Ctrl+O and in approval prompts. Null when the row keeps
+/// its full command.
 fn shortenCommandPhrase(
     scratch: std.mem.Allocator,
     phrase: []const u8,
     detail: ?*const ToolDetailRecord,
+    launch_command: ?[]const u8,
     base_style: []const u8,
 ) !?[]const u8 {
     const record = detail orelse return null;
@@ -3969,7 +4237,7 @@ fn shortenCommandPhrase(
     // Lex the command as the model sent it. The display folds its lines into
     // one, which would turn a comment line into a comment over the whole
     // command.
-    const source = storyArgString(scratch, record, "command") orelse display;
+    const source = storyArgString(scratch, record, "command") orelse launch_command orelse display;
     const short = try shortCommandSteps(scratch, source, display) orelse return null;
     return try std.mem.concat(scratch, u8, &.{ label, try formatShortCommand(scratch, short, base_style) });
 }
@@ -8935,6 +9203,7 @@ test "a run that returns while its command goes on stays on the row it joined, a
     run.command_process_presentation = null;
     run.command_display = @constCast("sh loop.sh");
     var observe = storyCommandDetail(3, "{\"action\":\"interact\",\"session_id\":\"shell-9\"}", 0, null);
+    observe.command_process_presentation = null;
     observe.command_display = @constCast("sh loop.sh");
     var stop = storyCommandDetail(4, "{\"action\":\"stop\",\"session_id\":\"shell-9\"}", 0, null);
     stop.command_display = @constCast("sh loop.sh");
@@ -8946,8 +9215,9 @@ test "a run that returns while its command goes on stays on the row it joined, a
     };
     const details = [_]ToolDetailRecord{ first, run, observe, stop };
     // At each step the group is one line: the run joins the row that ran,
-    // and its session's calls join it in turn.
-    const wants = [_][]const u8{ "● Still running printf, sh", "● Observed printf, sh", "● Stopped printf, sh" };
+    // and its session's calls join it in turn. A check that came back while
+    // the command runs on reads as one still waiting.
+    const wants = [_][]const u8{ "● Still running printf, sh", "● Waiting for printf, sh", "● Stopped printf, sh" };
     for (wants, 2..) |want, count| {
         const text = try groupTextForTest(alloc, entries[0..count], details[0..count]);
         defer alloc.free(text);
@@ -9409,6 +9679,7 @@ test "a session's input finds its run after a quick command joined the run's row
     quick.outcome = null;
     quick.command_process_presentation = null;
     var observe = storyCommandDetail(4, "{\"action\":\"interact\",\"session_id\":\"shell-9\"}", 0, null);
+    observe.command_process_presentation = null;
     observe.command_display = @constCast("sh loop.sh");
     const entries = [_]TranscriptEntry{
         .{ .raw_bytes = .{ .id = 1, .bytes = "● Ran printf a\n", .class = .tool_status } },
@@ -9420,10 +9691,11 @@ test "a session's input finds its run after a quick command joined the run's row
     defer alloc.free(text);
     errdefer std.debug.print("group:\n{s}\n", .{text});
     // The quick command, still running, joins the row; the input to the
-    // session still finds the run in it, so it gets no row of its own.
+    // session still finds the run in it, so it gets no row of its own. The
+    // check came back while the command runs on, so the row still waits.
     const trimmed = std.mem.trim(u8, text, "\n");
     try std.testing.expect(std.mem.findScalar(u8, trimmed, '\n') == null);
-    try std.testing.expect(std.mem.startsWith(u8, trimmed, "● Observed printf, sh"));
+    try std.testing.expect(std.mem.startsWith(u8, trimmed, "● Waiting for printf, sh"));
 }
 
 test "a command with a here-document shows its steps, whatever the document says" {

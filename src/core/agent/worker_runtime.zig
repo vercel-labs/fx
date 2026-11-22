@@ -5227,6 +5227,7 @@ pub fn dupeToolLifecycleEvent(
                 .result = result,
                 .result_memory = result_memory,
                 .command_artifact_handle = command_artifact_handle,
+                .check_found_command_ended = terminal.check_found_command_ended,
             } };
         },
         .turn_finished => |finished| .{ .turn_finished = finished },
