@@ -1,4 +1,4 @@
-//! Saves a crash record when fx panics, so `/trace` can show it as `last_crash`.
+//! Saves a crash record when fx panics or takes a segfault, so `/trace` can show it as `last_crash`.
 //!
 //! When a panic or a segfault starts, the handler writes two JSON lines to
 //! `~/.fx/diagnostics/last-crash.jsonl.<pid>.tmp`, syncs it to disk, and renames
@@ -29,7 +29,7 @@ const text_utils = @import("../shared/text_utils.zig");
 const trace_report = @import("trace_report.zig");
 const writeJsonStr = @import("../../acp/jsonrpc.zig").writeJsonStr;
 
-/// The most bytes of a panic message that the record keeps. Escaping can make
+/// The most bytes of a message that the record keeps. Escaping can make
 /// the kept text up to six times longer, which still fits `record_buf_bytes`.
 const max_message_bytes = 512;
 /// Holds both lines at the longest kept message, with room for long version
@@ -51,7 +51,7 @@ var path_buf: [path_max_bytes:0]u8 = undefined;
 var tmp_path_buf: [path_max_bytes:0]u8 = undefined;
 /// Zero means no path is set, so the handler writes no record.
 var path_len: usize = 0;
-/// Set by the first panic. A panic that finds it set skips the save.
+/// Set by the first crash, panic or segfault. A crash that finds it set skips the save.
 var handling: std.atomic.Value(bool) = .init(false);
 /// Storage for the record, so the handler needs no stack space for it.
 var record_buf: [record_buf_bytes]u8 = undefined;
@@ -89,14 +89,14 @@ fn printPath(buf: *[path_max_bytes:0]u8, comptime fmt: []const u8, args: anytype
     return text.len;
 }
 
-/// Called once a full crash report is saved. A panic that comes later in this
+/// Called once a full crash report is saved. A crash that comes later in this
 /// process, such as one during shutdown, then skips its save, so it does not
-/// replace the full report with the short panic record. It still prints and aborts.
+/// replace the full report with the short crash record. It still prints and aborts.
 pub fn noteReportSaved() void {
     handling.store(true, .seq_cst);
 }
 
-/// Whether this panic may save its record: only the first one may.
+/// Whether this crash may save its record: only the first one may.
 fn claimSave() bool {
     return !handling.swap(true, .seq_cst);
 }
@@ -116,15 +116,43 @@ pub fn handle(msg: []const u8, first_trace_addr: ?usize) noreturn {
 /// Then it calls Zig's default handler, which prints the signal's name and its
 /// address, then a stack trace only in builds with debug info, and aborts.
 pub fn handleSegfault(addr: ?usize, name: []const u8, opt_ctx: ?std.debug.CpuContextPtr) noreturn {
-    if (claimSave()) saveRecord("signal", segfaultMessage(&segfault_msg_buf, addr, name));
+    if (claimSave()) saveRecord("signal", segfaultMessage(&segfault_msg_buf, addr, name, opt_ctx));
     std.debug.defaultHandleSegfault(addr, name, opt_ctx);
 }
 
-/// The message of a segfault record, in the words Zig's default handler prints.
-/// Formats into `buf`, so the handler does not allocate.
-fn segfaultMessage(buf: []u8, addr: ?usize, name: []const u8) []const u8 {
-    if (addr) |a| return std.mem.print(buf, "{s} at address 0x{x}", .{ name, a }) catch name;
-    return std.mem.print(buf, "{s} (no address available)", .{name}) catch name;
+/// The message of a segfault record: the words Zig's default handler prints, then
+/// the program counter when the handler has the CPU context. The counter is an
+/// offset from `handleSegfault`, so an unstripped build of the same commit maps
+/// it to a line. Formats into `buf`, so the handler does not allocate.
+fn segfaultMessage(buf: []u8, addr: ?usize, name: []const u8, opt_ctx: ?std.debug.CpuContextPtr) []const u8 {
+    return formatSegfault(buf, addr, name, contextPc(opt_ctx)) catch name;
+}
+
+/// Zig's `CpuContextPtr` is `noreturn` where it has no CPU context, so the
+/// program counter is read only where that type exists.
+const has_cpu_context = std.debug.CpuContextPtr != noreturn;
+
+fn contextPc(opt_ctx: ?std.debug.CpuContextPtr) ?usize {
+    if (comptime !has_cpu_context) return null;
+    const ctx = opt_ctx orelse return null;
+    return ctx.getPc();
+}
+
+/// Formats a segfault message into `buf`. `addr` and `pc` may each be null.
+fn formatSegfault(buf: []u8, addr: ?usize, name: []const u8, pc: ?usize) ![]const u8 {
+    // A signal that `kill` sent has no fault address. Zig reads `si_addr` for
+    // every `si_code` and does not pass `si_code`, so for such a signal the
+    // address printed here is the sender's pid and uid, not a fault address.
+    const base = @intFromPtr(&handleSegfault);
+    if (pc) |p| {
+        const forward = p >= base;
+        const distance = if (forward) p - base else base - p;
+        const sign: []const u8 = if (forward) "+" else "-";
+        if (addr) |a| return std.mem.print(buf, "{s} at address 0x{x} (pc 0x{x}, handleSegfault{s}0x{x})", .{ name, a, p, sign, distance });
+        return std.mem.print(buf, "{s} (no address available, pc 0x{x}, handleSegfault{s}0x{x})", .{ name, p, sign, distance });
+    }
+    if (addr) |a| return std.mem.print(buf, "{s} at address 0x{x}", .{ name, a });
+    return std.mem.print(buf, "{s} (no address available)", .{name});
 }
 
 /// Holds a segfault message. Its longest name is "General protection exception".
@@ -399,7 +427,7 @@ test "crash panic keeps the last record when the temporary file cannot be writte
 fn signalFatal(arena: std.mem.Allocator, addr: ?usize, name: []const u8) !std.json.ObjectMap {
     const msg_buf = try arena.alloc(u8, segfault_msg_bytes);
     const buf = try arena.alloc(u8, record_buf_bytes);
-    const record = formatRecord(buf, "0.0.17", "abc1234", 1_700_000_000_123, "signal", segfaultMessage(msg_buf, addr, name));
+    const record = formatRecord(buf, "0.0.17", "abc1234", 1_700_000_000_123, "signal", segfaultMessage(msg_buf, addr, name, null));
     var lines = std.mem.splitScalar(u8, std.mem.trimEnd(u8, record, "\n"), '\n');
     _ = try parseRecordLine(arena, lines.next().?);
     return parseRecordLine(arena, lines.next().?);
@@ -419,6 +447,45 @@ test "crash panic record for a signal without an address says so" {
     const fatal = try signalFatal(arena.allocator(), null, "General protection exception");
     try std.testing.expectEqualStrings("signal", fatal.get("error").?.string);
     try std.testing.expectEqualStrings("General protection exception (no address available)", fatal.get("message").?.string);
+}
+
+test "crash panic segfault message names the program counter when the handler has the CPU context" {
+    if (comptime !has_cpu_context) return error.SkipZigTest;
+    const Context = @typeInfo(std.debug.CpuContextPtr).pointer.child;
+    const ctx: Context = std.mem.zeroes(Context);
+    var buf: [segfault_msg_bytes]u8 = undefined;
+    const message = segfaultMessage(&buf, 0x1234, "Segmentation fault", &ctx);
+    var expected_buf: [segfault_msg_bytes]u8 = undefined;
+    const expected = try std.fmt.bufPrint(
+        &expected_buf,
+        "Segmentation fault at address 0x1234 (pc 0x0, handleSegfault-0x{x})",
+        .{@intFromPtr(&handleSegfault)},
+    );
+    try std.testing.expectEqualStrings(expected, message);
+}
+
+test "crash panic segfault message without a CPU context has no program counter" {
+    var buf: [segfault_msg_bytes]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "Segmentation fault at address 0x1234",
+        segfaultMessage(&buf, 0x1234, "Segmentation fault", null),
+    );
+}
+
+test "crash panic segfault message gives the program counter as a signed offset from handleSegfault" {
+    var buf: [segfault_msg_bytes]u8 = undefined;
+    const base = @intFromPtr(&handleSegfault);
+    const after = try formatSegfault(&buf, null, "Segmentation fault", base + 0x40);
+    try std.testing.expect(std.mem.endsWith(u8, after, "handleSegfault+0x40)"));
+    const before = try formatSegfault(&buf, null, "Segmentation fault", base - 0x20);
+    try std.testing.expect(std.mem.endsWith(u8, before, "handleSegfault-0x20)"));
+}
+
+test "crash panic segfault message fits the longest name and two full addresses" {
+    var buf: [segfault_msg_bytes]u8 = undefined;
+    const message = try formatSegfault(&buf, std.math.maxInt(usize), "General protection exception", std.math.maxInt(usize));
+    try std.testing.expect(std.mem.startsWith(u8, message, "General protection exception at address 0xffffffffffffffff"));
+    try std.testing.expect(std.mem.indexOf(u8, message, "(pc 0xffffffffffffffff, handleSegfault+0x") != null);
 }
 
 test "crash panic saves the record when a FIFO sits at the temporary path" {

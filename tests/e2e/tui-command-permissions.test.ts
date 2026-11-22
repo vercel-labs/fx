@@ -2789,6 +2789,8 @@ describe("effect-aware command permissions", () => {
       ).toContain(FX_BIN);
       process.kill(fxPid, "SIGSEGV");
       expect(await activeSession.waitForSessionEnd(TIMEOUT)).toBe(true);
+      // Zig's handler ends in abort(), so fx exits with 128 + SIGABRT (6).
+      expect(activeSession.recordedExitStatus()).toBe(134);
       await activeSession.kill();
       activeSession = null;
 
