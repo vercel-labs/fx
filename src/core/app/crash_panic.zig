@@ -153,7 +153,8 @@ fn contextPc(opt_ctx: ?std.debug.CpuContextPtr) ?usize {
 fn formatSegfault(buf: []u8, addr: ?usize, name: []const u8, pc: ?usize) ![]const u8 {
     // A signal that `kill` sent has no fault address. Zig reads `si_addr` for
     // every `si_code` and does not pass `si_code`, so for such a signal the
-    // address printed here is the sender's pid and uid, not a fault address.
+    // address printed here is not a fault address: the sender's pid and uid on
+    // Linux, and zero on macOS.
     const base = @intFromPtr(&handleSegfault);
     if (pc) |p| {
         const forward = p >= base;
