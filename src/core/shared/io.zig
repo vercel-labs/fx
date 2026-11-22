@@ -945,11 +945,20 @@ const LockFileMode = enum {
     owner_writable,
 };
 
+/// The group and other write bits.
+const others_write_bits = 0o022;
+
 /// Whether a group or other write bit is set: the one rule for state an
 /// older fx release left readable by others, which fx reads only while no
 /// one else can change it (D61 in `tests/tla/session_manager/system-design.md`).
 pub fn othersCanWrite(permissions: std.Io.File.Permissions) bool {
-    return permissions.toMode() & 0o022 != 0;
+    return permissions.toMode() & others_write_bits != 0;
+}
+
+/// `permissions` with the bits `othersCanWrite` checks cleared.
+pub fn withoutOthersWrite(permissions: std.Io.File.Permissions) std.Io.File.Permissions {
+    const mode = permissions.toMode();
+    return .fromMode(mode & ~@as(@TypeOf(mode), others_write_bits));
 }
 
 /// A regular file only its owner can write, though others may read it.
