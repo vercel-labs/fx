@@ -2584,6 +2584,42 @@ test "a recovery prompt a turn sent after its last step ends the saved turn as t
     try std.testing.expectEqualStrings("later update", user_only.items[2].content.?);
 }
 
+test "a turn-start context message restores as one recovery prompt right after the prompt" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const saved = try recovery_prompt.saved(arena, "CTX-MARK-7");
+    var steering = [_]core_types.PersistedSteering{.{ .text = saved, .after_tool_step_count = 0 }};
+
+    var messages: std.ArrayList(core_types.ChatMessage) = .empty;
+    try messages.append(arena, .{ .role = .user, .content = "Say hello." });
+    try appendExecutionMemoryChatMessages(arena, &messages, .{ .steering = &steering });
+
+    try std.testing.expectEqual(@as(usize, 2), messages.items.len);
+    try std.testing.expectEqualStrings("Say hello.", messages.items[0].content.?);
+    try std.testing.expect(messages.items[1].recovery_prompt);
+    try std.testing.expectEqualStrings("CTX-MARK-7", messages.items[1].content.?);
+}
+
+test "a turn-start context note restores before the context message" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const saved = try recovery_prompt.saved(arena, "CTX-MARK-7");
+    var steering = [_]core_types.PersistedSteering{.{ .text = saved, .after_tool_step_count = 0 }};
+    var notes = [_]core_types.PersistedContextNote{.{ .text = @constCast("NOTE-MARK"), .after_tool_step_count = 0 }};
+
+    var messages: std.ArrayList(core_types.ChatMessage) = .empty;
+    try messages.append(arena, .{ .role = .user, .content = "Say hello." });
+    try appendExecutionMemoryChatMessages(arena, &messages, .{ .steering = &steering, .context_notes = &notes });
+
+    try std.testing.expectEqual(@as(usize, 3), messages.items.len);
+    try std.testing.expect(messages.items[1].context_note);
+    try std.testing.expectEqualStrings("NOTE-MARK", messages.items[1].content.?);
+    try std.testing.expect(messages.items[2].recovery_prompt);
+    try std.testing.expectEqualStrings("CTX-MARK-7", messages.items[2].content.?);
+}
+
 test "a restored subagent frame is never the user's text" {
     const report = agent_frame.report_header ++ "{\"child_id\":\"c1\",\"work_id\":\"w1\"}\n";
     try std.testing.expect(restoredSteeringChatMessage(report).context_origin == .ordinary);

@@ -42,6 +42,7 @@
 #   note-after-take      the idle note is decided after the next turn took the
 #                        waiting messages, so it says idle while a turn starts   IdleNoteHonest
 #   names-busy           a new subagent's start names every other open one      NamesTheIdle
+#   no-cap               a subagent's turn is continued past the hook's cap     ContinueCapped
 #
 # stop-message-before-idle.cfg and -before-names.cfg are fx before the idle
 # note: no report says its subagent is idle, and no start names any.
@@ -180,6 +181,7 @@ StopMessage stop-message-before-idle IdleNoteHonest
 StopMessage stop-message-before-names NamesTheIdle
 StopMessage stop-message-mutation-note-after-take IdleNoteHonest
 StopMessage stop-message-mutation-names-busy NamesTheIdle
+StopMessage stop-message-mutation-no-cap ContinueCapped
 MainMail main-mail -
 MainMail main-mail-acp -
 MainMail main-mail-today JoinsOpenTurn

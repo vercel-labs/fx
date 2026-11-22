@@ -9,6 +9,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const hook_verbs = @import("../cli/hook_verbs.zig");
 const io_mod = @import("../shared/io.zig");
+const testing_listener = @import("../shared/testing_listener.zig");
 const profile_paths = @import("../shared/profile_paths.zig");
 const hooks_host = @import("../hooks_host/hooks_host.zig");
 
@@ -209,15 +210,11 @@ pub const State = struct {
 
 const testing = std.testing;
 
-/// Polls `finished` until the job ends. A job that never ends fails the test.
+/// Waits for the job to end, then reads its output. A job that never ends fails the test.
 fn waitFinished(state: *State) !Output {
-    const io = io_mod.getIo();
-    const deadline = std.Io.Clock.awake.now(io).toMilliseconds() + 5000;
-    while (std.Io.Clock.awake.now(io).toMilliseconds() < deadline) {
-        if (state.finished()) |output| return output;
-        io_mod.sleep(5 * std.time.ns_per_ms);
-    }
-    return error.JobDidNotFinish;
+    const job = state.job orelse return error.JobDidNotFinish;
+    if (!testing_listener.waitFor(&job.done, 5000)) return error.JobDidNotFinish;
+    return state.finished() orelse error.JobDidNotFinish;
 }
 
 /// Writes the profile hooks file under `home` (the file `hook list` and `hook test` read).

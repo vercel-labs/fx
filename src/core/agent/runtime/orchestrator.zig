@@ -221,6 +221,14 @@ fn appendContinuationPrompt(
     try within_turn_suffix.append(arena, .{ .role = .user, .content = prompt, .recovery_prompt = true });
 }
 
+/// The text of the turn's one fx-own message after the prompt: the hook context, then the PostModelSwitch
+/// notes, joined by a blank line. Null when neither has text.
+fn turnStartContext(arena: Allocator, context: ?[]const u8, notes: ?[]const u8) !?[]const u8 {
+    const first = context orelse return notes;
+    const second = notes orelse return first;
+    return try arena.print("{s}\n\n{s}", .{ first, second });
+}
+
 const ignored_effort_notice =
     "Effort {s} is not available for {s}, so it is not sent.";
 /// Only a custom connection offers a level through its settings, so only its
@@ -6943,6 +6951,11 @@ fn processQueuedPromptInner(
             job.images = images;
         }
     }
+    // Hook context and PostModelSwitch notes reach the model as one fx-own message after the prompt, saved as
+    // steering at this boundary so the next request starts with it.
+    if (try turnStartContext(arena, prompt_context, turn_hooks.takeSessionNotes(arena))) |text| {
+        try within_turn_suffix.append(arena, .{ .role = .user, .content = text, .recovery_prompt = true });
+    }
     // The repository as the turn found it, before any tool (D98). The
     // prompt reaches the session first, so a process killed during the
     // capture keeps it; the capture then runs beside the first request, and
@@ -6961,7 +6974,7 @@ fn processQueuedPromptInner(
     // closes.
     defer if (deps.start_workspace_capture) |start| start(deps.ctx, false, .settle);
 
-    var current_user_message: ChatMessage = .{
+    const current_user_message: ChatMessage = .{
         .role = .user,
         .content = if (job.delivery.isContinuation())
             try framedMessage(arena, job.author, job.prompt)
@@ -6971,15 +6984,6 @@ fn processQueuedPromptInner(
             job.prompt,
         .images = job.images,
     };
-
-    // Added context joins only the model's copy of this message; the saved prompt text is unchanged.
-    if (prompt_context) |framed| {
-        current_user_message.content = try arena.print("{s}\n\n{s}", .{ current_user_message.content.?, framed });
-    }
-    // Notes that PostModelSwitch queued for this session reach its next turn only, once, after the prompt context.
-    if (turn_hooks.takeSessionNotes(arena)) |notes| {
-        current_user_message.content = try arena.print("{s}\n\n{s}", .{ current_user_message.content.?, notes });
-    }
 
     var stop_state = CommonStopState{};
     processQueuedPromptLoop(

@@ -29,6 +29,8 @@
 (*   "rerun_after_crash"  a resume runs an interrupted call again          *)
 (*   "run_needs_open"     a run fails unless its entry was opened in the   *)
 (*                        conversation, so compaction strands a tool       *)
+(*   "hook_overrides_deny"  a hook's allow is checked before a configured  *)
+(*                        deny, so a call the deny covers runs             *)
 (***************************************************************************)
 EXTENDS Naturals, Sequences
 
@@ -48,6 +50,33 @@ InitMenu == Entries
 Ids == 1..MaxIds
 None == 0
 
+\* The PreToolUse hook's answer for a call: none, allow, ask, or deny.
+HookAnswers == {"none", "allow", "ask", "deny"}
+
+\* The sources of a run's permission decision. The first six allow the call.
+\* full_access is the full-access mode, which the policy documents as bypassing
+\* configured rules (AGENTS.md: "Full access bypasses fx permission policy").
+Sources == {"full_access", "rule_allow", "grant", "hook_allow", "reviewer_allow", "prompt_yes",
+            "rule_deny", "hook_deny", "reviewer_deny", "prompt_no"}
+AllowSources == {"full_access", "rule_allow", "grant", "hook_allow", "reviewer_allow", "prompt_yes"}
+
+\* The sources a call can get, given its hook answer, whether a configured deny
+\* covers it, and whether the session is in full access. The order follows the
+\* code: a hook deny is refused before admission (user_hooks.zig:707-719); full
+\* access approves before the configured rules unless a hook asks
+\* (tool_admission.zig:1574-1582); a configured deny refuses (:1594-1596); a hook
+\* allow approves without the reviewer or the prompt (:1686-1692); a hook ask
+\* prompts the person (:1635-1654). Configured asks and remembered session
+\* approvals are not modeled.
+Decide(hook, covered, full) ==
+    IF hook = "deny" THEN {"hook_deny"}
+    ELSE IF full /\ hook # "ask" THEN {"full_access"}
+    ELSE IF Bug = "hook_overrides_deny" /\ hook = "allow" THEN {"hook_allow"}
+    ELSE IF covered THEN {"rule_deny"}
+    ELSE IF hook = "allow" THEN {"hook_allow"}
+    ELSE IF hook = "ask" THEN {"prompt_yes", "prompt_no"}
+    ELSE {"rule_allow", "grant", "reviewer_allow", "reviewer_deny", "prompt_yes", "prompt_no"}
+
 VARIABLES
     tools,      \* the tools fx sends
     menu,       \* the menu fx sends
@@ -57,18 +86,22 @@ VARIABLES
     avail,      \* which entries the catalog can serve now
     executed,   \* how many times each run id reached the real tool
     admitted,   \* run ids whose permission check allowed them
+    coveredRan, \* a call a configured deny covers has run without full access
+    askFull,    \* a hook's ask was answered by full access
     pending,    \* the run id in flight, or None
     pendingTool,
     nextId,
     actions
 
-vars == <<tools, menu, conv, reqs, epoch, avail, executed, admitted, pending, pendingTool, nextId, actions>>
+vars == <<tools, menu, conv, reqs, epoch, avail, executed, admitted, coveredRan, askFull, pending, pendingTool, nextId, actions>>
 
 TypeOK ==
     /\ epoch \in Nat
     /\ avail \in [Entries -> BOOLEAN]
     /\ executed \in [Ids -> Nat]
     /\ admitted \subseteq Ids
+    /\ coveredRan \in BOOLEAN
+    /\ askFull \in BOOLEAN
     /\ pending \in Ids \cup {None}
     /\ pendingTool \in Runnable \cup {"none"}
     /\ nextId \in 1..(MaxIds + 1)
@@ -83,6 +116,8 @@ Init ==
     /\ avail = [e \in Entries |-> TRUE]
     /\ executed = [i \in Ids |-> 0]
     /\ admitted = {}
+    /\ coveredRan = FALSE
+    /\ askFull = FALSE
     /\ pending = None
     /\ pendingTool = "none"
     /\ nextId = 1
@@ -97,7 +132,7 @@ OpenedIn(e, c) == \E i \in DOMAIN c : c[i].k = "opened" /\ c[i].e = e
 Send ==
     /\ Step /\ Idle
     /\ reqs' = Append(reqs, [tools |-> tools, menu |-> menu, conv |-> conv, epoch |-> epoch, avail |-> avail])
-    /\ UNCHANGED <<tools, menu, conv, epoch, avail, executed, admitted, pending, pendingTool, nextId>>
+    /\ UNCHANGED <<tools, menu, conv, epoch, avail, executed, admitted, coveredRan, askFull, pending, pendingTool, nextId>>
 
 \* toolbox {open: e}: the entry's text, or why it can't be opened, goes at
 \* the end of the conversation.
@@ -107,19 +142,26 @@ Open(e) ==
     /\ conv' = conv \o << [k |-> "open", e |-> e],
                          [k |-> IF avail[e] THEN "opened" ELSE "unavailable", e |-> e] >>
     /\ tools' = IF Bug = "append_tool" /\ e = "server" THEN Append(tools, "echo") ELSE tools
-    /\ UNCHANGED <<menu, reqs, epoch, avail, executed, admitted, pending, pendingTool, nextId>>
+    /\ UNCHANGED <<menu, reqs, epoch, avail, executed, admitted, coveredRan, askFull, pending, pendingTool, nextId>>
 
 \* toolbox {run: t}, or a call of t by its own name: both take this path.
-\* allow is the permission decision on the real tool.
-Run(t, allow) ==
+\* hook is the PreToolUse answer, covered says a configured deny covers the call,
+\* full says the session is in full access, and src is the decision (see Decide).
+\* A call the hook denies is refused here as a source. It never reaches the tool
+\* and is never admitted, the same as any other refusal. coveredRan and askFull
+\* record what a run did, for the properties below.
+Run(t, hook, covered, full, src) ==
     /\ Step /\ Idle
     /\ nextId <= MaxIds
     /\ LET id == nextId
-           passes == allow \/ Bug = "skip_admission"
+           allowed == src \in AllowSources
+           passes == allowed \/ Bug = "skip_admission"
            opened == Bug # "run_needs_open" \/ OpenedIn(Owner(t), conv)
            runs == passes /\ avail[Owner(t)] /\ opened
        IN /\ nextId' = nextId + 1
-          /\ admitted' = IF allow THEN admitted \cup {id} ELSE admitted
+          /\ admitted' = IF allowed THEN admitted \cup {id} ELSE admitted
+          /\ coveredRan' = (coveredRan \/ (runs /\ covered /\ src # "full_access"))
+          /\ askFull' = (askFull \/ (runs /\ hook = "ask" /\ src = "full_access"))
           /\ executed' = IF runs THEN [executed EXCEPT ![id] = @ + 1] ELSE executed
           /\ pending' = IF runs THEN id ELSE None
           /\ pendingTool' = IF runs THEN t ELSE "none"
@@ -127,7 +169,7 @@ Run(t, allow) ==
           /\ conv' = IF runs THEN conv
                      ELSE conv \o << [k |-> "run", t |-> t, id |-> id],
                                      [k |-> "result", id |-> id, ok |-> FALSE,
-                                      allowed |-> allow, avail |-> avail[Owner(t)]] >>
+                                      allowed |-> allowed, avail |-> avail[Owner(t)]] >>
     /\ tools' = IF Bug = "append_tool" THEN Append(tools, t) ELSE tools
     /\ UNCHANGED <<menu, reqs, epoch, avail>>
 
@@ -138,7 +180,7 @@ Finish ==
                          [k |-> "result", id |-> pending, ok |-> TRUE, allowed |-> TRUE, avail |-> TRUE] >>
     /\ pending' = None
     /\ pendingTool' = "none"
-    /\ UNCHANGED <<tools, menu, reqs, epoch, avail, executed, admitted, nextId, actions>>
+    /\ UNCHANGED <<tools, menu, reqs, epoch, avail, executed, admitted, coveredRan, askFull, nextId, actions>>
 
 \* fx dies while the real tool runs; the next process records the call as
 \* interrupted and never runs it again.
@@ -150,13 +192,13 @@ CrashAndResume ==
     /\ menu' = IF Bug = "menu_from_live" THEN {e \in Entries : avail[e]} ELSE menu
     /\ pending' = None
     /\ pendingTool' = "none"
-    /\ UNCHANGED <<tools, reqs, epoch, avail, admitted, nextId, actions>>
+    /\ UNCHANGED <<tools, reqs, epoch, avail, admitted, coveredRan, askFull, nextId, actions>>
 
 \* A resume with nothing in flight rebuilds the tools and the menu.
 Resume ==
     /\ Step /\ Idle
     /\ menu' = IF Bug = "menu_from_live" THEN {e \in Entries : avail[e]} ELSE menu
-    /\ UNCHANGED <<tools, conv, reqs, epoch, avail, executed, admitted, pending, pendingTool, nextId>>
+    /\ UNCHANGED <<tools, conv, reqs, epoch, avail, executed, admitted, coveredRan, askFull, pending, pendingTool, nextId>>
 
 \* A server or custom tool goes down or comes back. fx tells the model in a
 \* note at the end of the conversation.
@@ -167,7 +209,7 @@ CatalogChange(e) ==
     /\ menu' = IF Bug = "live_menu"
                    THEN IF avail[e] THEN menu \ {e} ELSE menu \cup {e}
                    ELSE menu
-    /\ UNCHANGED <<tools, reqs, epoch, executed, admitted, pending, pendingTool, nextId>>
+    /\ UNCHANGED <<tools, reqs, epoch, executed, admitted, coveredRan, askFull, pending, pendingTool, nextId>>
 
 \* Compaction replaces the conversation with a summary. The conversation
 \* keeps its menu: compaction is not a new conversation. The notes went with
@@ -181,7 +223,7 @@ Compact ==
                 THEN << >>
                 ELSE << [k |-> "state", up |-> avail] >>
     /\ epoch' = epoch + 1
-    /\ UNCHANGED <<tools, reqs, avail, executed, admitted, pending, pendingTool, nextId>>
+    /\ UNCHANGED <<tools, reqs, avail, executed, admitted, coveredRan, askFull, pending, pendingTool, nextId>>
 
 \* The run's bound is spent and nothing is in flight: the behavior ends.
 Done ==
@@ -191,7 +233,8 @@ Done ==
 Next ==
     \/ Send
     \/ \E e \in Entries : Open(e)
-    \/ \E t \in Runnable, a \in BOOLEAN : Run(t, a)
+    \/ \E t \in Runnable, h \in HookAnswers, c \in BOOLEAN, f \in BOOLEAN :
+           \E s \in Decide(h, c, f) : Run(t, h, c, f, s)
     \/ Finish
     \/ CrashAndResume
     \/ Resume
@@ -243,4 +286,13 @@ AtMostOnce == \A id \in Ids : executed[id] <= 1
 RunWorksWhenAllowed ==
     \A i \in DOMAIN conv :
         (conv[i].k = "result" /\ conv[i].allowed /\ conv[i].avail) => conv[i].ok
+
+\* A call that a configured deny covers never runs, unless the session is in
+\* full access, which the policy documents as bypassing configured rules.
+ConfiguredDenyWins == ~coveredRan
+
+\* A hook's ask never reaches full access: the call falls through to the
+\* configured rules and the prompt (tool_admission.zig:1574-1582).
+HookAskNeverFullAccess == ~askFull
+
 =============================================================================

@@ -5,6 +5,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const hooks = @import("../../hooks/hooks.zig");
 const io_mod = @import("../shared/io.zig");
+const test_signal = @import("test_signal.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const live_groups = @import("live_groups.zig");
 
@@ -182,9 +183,9 @@ pub fn run(
     };
 }
 
-/// Writes every byte a hook asked for, then closes its stdin. A hook that exits
-/// without reading makes the write fail, which is not an error here.
+/// Writes every byte a hook asked for, then closes its stdin.
 fn writeInput(io: std.Io, file: std.Io.File, stdin: []const u8) void {
+    // A hook that exits without reading makes this write fail. Its exit status decides the outcome.
     file.writeStreamingAll(io, stdin) catch {};
     file.close(io);
 }
@@ -289,6 +290,7 @@ fn watchExit(
             },
         }
         const wait_ms = @min(poll_ms, deadline - now);
+        // Nothing signals this loop: the cancel flag is a plain atomic, and Child.wait has no timeout, so poll.
         io_mod.sleep(@as(u64, @intCast(wait_ms)) * std.time.ns_per_ms);
     }
 }
@@ -394,24 +396,35 @@ fn freeResult(alloc: std.mem.Allocator, result: hooks.host.ProcessResult) void {
     }
 }
 
-/// How often `cancelWhenStarted` checks for the hook's pid file, and how long it waits for it.
-const started_check_ms = 5;
+/// How long a cancel test waits for its hook's pid line before it sets the cancel flag anyway.
 const started_deadline_ms = 5000;
 
-/// Sets `flag` once the hook has written `pid_path`, which its script does before anything
-/// else. It checks for the file every `started_check_ms`, and stops waiting after
-/// `started_deadline_ms`, so a hook that never starts cannot hang the test.
-fn cancelWhenStarted(flag: *std.atomic.Value(bool), pid_path: []const u8) void {
-    const io = io_mod.getIo();
-    const deadline = std.Io.Clock.awake.now(io).toMilliseconds() + started_deadline_ms;
-    while (std.Io.Clock.awake.now(io).toMilliseconds() < deadline) {
-        if (std.Io.Dir.openFileAbsolute(io, pid_path, .{})) |file| {
-            file.close(io);
-            break;
-        } else |_| {}
-        io_mod.sleep(started_check_ms * std.time.ns_per_ms);
-    }
-    flag.store(true, .release);
+/// What a cancel test's canceller learns from its hook: the flag it sets, the signal it waits on, and the
+/// hook's pid once a valid line arrives (null otherwise).
+const StartWatch = struct {
+    flag: *std.atomic.Value(bool),
+    signal: *test_signal.Signal,
+    pid: ?std.posix.pid_t = null,
+};
+
+/// Sets `watch.flag` once the hook has written its pid to `watch.signal`, which its script does before anything
+/// else, and keeps that pid in `watch.pid`. It waits up to `started_deadline_ms`, so a hook that never starts
+/// cannot hang the test.
+fn cancelWhenSignaled(watch: *StartWatch) void {
+    var buf: [64]u8 = undefined;
+    const line = watch.signal.waitLine(&buf, started_deadline_ms) catch {
+        // A timeout sets the flag too, so the test ends even when the hook never starts.
+        watch.flag.store(true, .release);
+        return;
+    };
+    watch.pid = parsePid(line);
+    watch.flag.store(true, .release);
+}
+
+/// The pid on a hook's line, or null when the line is not a positive integer.
+fn parsePid(line: []const u8) ?std.posix.pid_t {
+    const pid = std.fmt.parseInt(std.posix.pid_t, std.mem.trim(u8, line, " \n"), 10) catch return null;
+    return if (pid > 0) pid else null;
 }
 
 test "a hook reads its input and both streams come back" {
@@ -541,12 +554,13 @@ test "a hook is stopped when it is cancelled while running" {
     defer tmp.cleanup();
     const dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(dir);
-    const pid_path = try alloc.print("{s}/pid", .{dir});
-    defer alloc.free(pid_path);
-    const script = try alloc.print("echo $$ > '{s}'; exec sleep 5", .{pid_path});
+    var pid_signal = try test_signal.Signal.create(alloc, dir, "pid");
+    defer pid_signal.deinit(alloc);
+    const script = try alloc.print("echo $$ > '{s}'; exec sleep 5", .{pid_signal.path});
     defer alloc.free(script);
     var flag = std.atomic.Value(bool).init(false);
-    const canceller = try std.Thread.spawn(.{}, cancelWhenStarted, .{ &flag, pid_path });
+    var watch: StartWatch = .{ .flag = &flag, .signal = &pid_signal };
+    const canceller = try std.Thread.spawn(.{}, cancelWhenSignaled, .{&watch});
     defer canceller.join();
 
     const started = io_mod.milliTimestamp();
@@ -565,6 +579,7 @@ test "a hook is stopped when it is cancelled while running" {
 
     try std.testing.expect(result == .cancelled);
     try std.testing.expect(elapsed < 3000);
+    try std.testing.expect(watch.pid != null);
 }
 
 /// Runs a hook that writes its pid to `pid` in `dir`, closes its output, and then sleeps 5 s.
@@ -646,12 +661,13 @@ test "a hook run frees its group slot on success, on timeout, and on cancel" {
     defer tmp.cleanup();
     const dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(dir);
-    const pid_path = try alloc.print("{s}/pid", .{dir});
-    defer alloc.free(pid_path);
-    const script = try alloc.print("echo $$ > '{s}'; exec sleep 30", .{pid_path});
+    var pid_signal = try test_signal.Signal.create(alloc, dir, "pid");
+    defer pid_signal.deinit(alloc);
+    const script = try alloc.print("echo $$ > '{s}'; exec sleep 30", .{pid_signal.path});
     defer alloc.free(script);
     var flag = std.atomic.Value(bool).init(false);
-    const canceller = try std.Thread.spawn(.{}, cancelWhenStarted, .{ &flag, pid_path });
+    var watch: StartWatch = .{ .flag = &flag, .signal = &pid_signal };
+    const canceller = try std.Thread.spawn(.{}, cancelWhenSignaled, .{&watch});
     defer canceller.join();
     const cancelled = try run(alloc, io, &env, .{
         .argv = &.{ "/bin/sh", "-c", script },
@@ -664,6 +680,7 @@ test "a hook run frees its group slot on success, on timeout, and on cancel" {
         .cancel = &flag,
     });
     try std.testing.expect(cancelled == .cancelled);
+    try std.testing.expect(watch.pid != null);
     try std.testing.expectEqual(before, live_groups.liveCount());
 }
 
@@ -736,9 +753,10 @@ test "a hook that closes its output is stopped by a cancel" {
     const dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(dir);
     var flag = std.atomic.Value(bool).init(false);
-    const pid_path = try alloc.print("{s}/pid", .{dir});
-    defer alloc.free(pid_path);
-    const canceller = try std.Thread.spawn(.{}, cancelWhenStarted, .{ &flag, pid_path });
+    var pid_signal = try test_signal.Signal.create(alloc, dir, "pid");
+    defer pid_signal.deinit(alloc);
+    var watch: StartWatch = .{ .flag = &flag, .signal = &pid_signal };
+    const canceller = try std.Thread.spawn(.{}, cancelWhenSignaled, .{&watch});
     defer canceller.join();
 
     const started = io_mod.milliTimestamp();
@@ -748,7 +766,8 @@ test "a hook that closes its output is stopped by a cancel" {
 
     try std.testing.expect(result == .cancelled);
     try std.testing.expect(elapsed < 2000);
-    try std.testing.expect(groupGone(try hookGroup(alloc, io, tmp.dir)));
+    try std.testing.expect(watch.pid != null);
+    try std.testing.expect(groupGone(watch.pid.?));
 }
 
 test "a hook that closes its output and exits at once keeps its exit code" {

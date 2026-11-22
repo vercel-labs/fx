@@ -4,6 +4,7 @@ import { existsSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSyn
 import { join } from "node:path";
 import { cleanupIsolatedTestHome, createIsolatedTestHome, FX_BIN, runFx } from "../evals/eval-helpers";
 import { processGroupAlive } from "./process-alive";
+import { childExited, makeFifo, pidWritten, untilChange, untilWritersGone } from "./hooks-helpers";
 import { waitForRootTurnCommitted } from "./saved-sessions";
 import {
   FAKE_GATEWAY_MODEL,
@@ -385,6 +386,28 @@ describe("fx ask with hooks", () => {
     expect(bodies[0]).toContain(CONTEXT_MARK);
   });
 
+  test("a UserPromptSubmit context stays in the resumed turn's request, right after the prompt", async () => {
+    const root = createRoot({ experimental: { hooks: true } });
+    writeProjectHooks(root, addContextHooks());
+
+    // `ask` defaults to --no-save, which leaves no session to resume, so this run saves.
+    const first = await ask(root, "Say hello.", [fakeGatewayFinalText("hello")], ["--yolo"]);
+    expect(first.result.code, first.result.stderr).toBe(0);
+    const sessionId = (JSON.parse(first.result.stdout.trim()) as { session_id: string }).session_id;
+    const live = JSON.parse(first.bodies[first.bodies.length - 1]!) as { prompt: unknown[] };
+
+    const resumed = await ask(root, "And now?", [fakeGatewayFinalText("again")], ["--yolo", "--resume", sessionId]);
+    expect(resumed.result.code, resumed.result.stderr).toBe(0);
+    expect(resumed.bodies.length).toBe(1);
+    const next = JSON.parse(resumed.bodies[0]!) as { prompt: unknown[] };
+
+    // Provider prompt caching depends on the resumed request starting with exactly the bytes the live turn last sent.
+    const livePrompt = live.prompt.map((message) => JSON.stringify(message));
+    const nextPrompt = next.prompt.map((message) => JSON.stringify(message));
+    expect(livePrompt.join("")).toContain(CONTEXT_MARK);
+    expect(nextPrompt.slice(0, livePrompt.length)).toEqual(livePrompt);
+  });
+
   test("a UserPromptSubmit hook can block the prompt", async () => {
     const root = createRoot({ experimental: { hooks: true } });
     writeProjectHooks(root, blockPromptHooks());
@@ -560,27 +583,6 @@ function spawnAsk(root: Root, prompt: string, gateway: ReturnType<typeof startFa
   });
 }
 
-// Resolves true once the process has exited, and false when it has not exited by the deadline.
-function exitedWithin(child: ChildProcess, timeoutMs: number): Promise<boolean> {
-  if (child.exitCode !== null || child.signalCode !== null) return Promise.resolve(true);
-  return new Promise((resolve) => {
-    const timer = setTimeout(() => resolve(false), timeoutMs);
-    child.once("exit", () => {
-      clearTimeout(timer);
-      resolve(true);
-    });
-  });
-}
-
-async function waitFor(label: string, condition: () => boolean, timeoutMs: number): Promise<void> {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    if (condition()) return;
-    await Bun.sleep(20);
-  }
-  throw new Error(`timed out waiting for ${label}`);
-}
-
 // SIGHUP to fx ask ends fx and the hook's process group with it. A hang-up has no turn to cancel, so it does
 // not go through the interrupt that INT and TERM use.
 describe("fx ask hang-up with hooks", () => {
@@ -589,12 +591,14 @@ describe("fx ask hang-up with hooks", () => {
     async () => {
       const root = createRoot({ experimental: { hooks: true } });
       const pidFile = join(root.workspace, "hook.pid");
+      const fifo = join(root.workspace, "hook.fifo");
+      makeFifo(fifo);
       writeProjectHooks(root, {
         hooks: {
           PreToolUse: [
             {
               matcher: "shell",
-              hooks: [{ type: "command", id: "sleepy", command: `echo $$ > '${pidFile}'; exec sleep 600` }],
+              hooks: [{ type: "command", id: "sleepy", command: `exec 3> '${fifo}'; echo $$ > '${pidFile}'; exec sleep 600` }],
             },
           ],
         },
@@ -604,17 +608,19 @@ describe("fx ask hang-up with hooks", () => {
         fakeShellRun("shell_hup_1", `touch '${root.marker}'`),
         fakeGatewayFinalText("unused"),
       ]);
+      // The hook writes its pid before it sleeps, and it holds the FIFO open until its last process exits.
+      const hookGone = untilWritersGone(fifo);
       const child = spawnAsk(root, "Create the marker with the shell tool.", gateway);
-      const fxExited = exitedWithin(child, TIMEOUT);
+      const fxExited = childExited(child);
       try {
-        // The hook writes its pid before it sleeps, so the pid file is the signal that the hook runs.
-        await waitFor("the hook's pid file", () => existsSync(pidFile), TIMEOUT);
+        await untilChange(root.workspace, () => pidWritten(pidFile));
         const pid = Number(readFileSync(pidFile, "utf8").trim());
         expect(processGroupAlive(pid)).toBe(true);
 
         child.kill("SIGHUP");
         expect(await fxExited).toBe(true);
-        await waitFor("the hook's process group to end", () => !processGroupAlive(pid), 5_000);
+        // Each process the hook started holds the FIFO open, so end of file means all have exited (a group check races the exit).
+        expect(await hookGone).toBe(true);
         expect(existsSync(root.marker)).toBe(false);
       } finally {
         if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");

@@ -11,6 +11,7 @@ const trust = @import("trust.zig");
 const profile_paths = @import("../shared/profile_paths.zig");
 const process = @import("process.zig");
 const live_groups = @import("live_groups.zig");
+const test_signal = @import("test_signal.zig");
 
 pub const Options = struct {
     /// The `experimental.hooks` setting. When false, fx reads no hook file and only builtins run.
@@ -1841,29 +1842,21 @@ test "a background run past the cap does not start, and the earlier runs still f
     try std.testing.expectEqual(max_detached_runs, lines);
 }
 
-/// How long a test waits for a hook to write its pid file, and how often it looks. The hook writes that
-/// file before anything else, so the file is the signal that the hook is running.
-const hook_start_check_ms = 5;
+/// How long a test waits for a hook to write its pid. The hook writes it before anything else, so the
+/// write is the signal that the hook is running.
 const hook_start_deadline_ms = 5000;
 /// The longest an exit may take in the tests below. Each of their hooks sleeps 30 s, so this is far below that.
 const exit_limit_ms = 5000;
 
-/// The pid that a hook wrote to `path` with `echo $$ > path`. Gives up after `hook_start_deadline_ms`, so a
+/// The pid that a hook wrote to `signal` with `echo $$ > path`. Gives up after `hook_start_deadline_ms`, so a
 /// hook that never starts fails the test instead of hanging it.
-fn waitForHookPid(alloc: std.mem.Allocator, path: []const u8) !std.posix.pid_t {
-    const io = io_mod.getIo();
-    const deadline = std.Io.Clock.awake.now(io).toMilliseconds() + hook_start_deadline_ms;
-    while (std.Io.Clock.awake.now(io).toMilliseconds() < deadline) {
-        if (std.Io.Dir.openFileAbsolute(io, path, .{})) |opened| {
-            var file = opened;
-            defer file.close(io);
-            const text = try io_mod.readFileToEnd(alloc, &file, 64);
-            defer alloc.free(text);
-            if (std.fmt.parseInt(std.posix.pid_t, std.mem.trim(u8, text, " \n"), 10)) |pid| return pid else |_| {}
-        } else |_| {}
-        io_mod.sleep(hook_start_check_ms * std.time.ns_per_ms);
-    }
-    return error.HookDidNotStart;
+fn waitForHookPid(signal: *test_signal.Signal) !std.posix.pid_t {
+    var buf: [64]u8 = undefined;
+    const line = signal.waitLine(&buf, hook_start_deadline_ms) catch |err| switch (err) {
+        error.Timeout => return error.HookDidNotStart,
+        else => return err,
+    };
+    return std.fmt.parseInt(std.posix.pid_t, std.mem.trim(u8, line, " \n"), 10);
 }
 
 /// Whether a process group has no members left, by the kernel's answer to signal 0 (the same check as process.zig's `groupGone`).
@@ -1890,9 +1883,9 @@ test "deinit stops a background run at once, and its group is gone" {
     const io = io_mod.getIo();
     var fixture = try Fixture.init(alloc);
     defer fixture.deinit(alloc);
-    const pid_path = try std.Io.Dir.path.join(alloc, &.{ fixture.workspace, "background.pid" });
-    defer alloc.free(pid_path);
-    const command = try std.mem.concat(alloc, u8, &.{ "echo $$ > '", pid_path, "'; exec sleep 30" });
+    var pid_signal = try test_signal.Signal.create(alloc, fixture.workspace, "background.pid");
+    defer pid_signal.deinit(alloc);
+    const command = try std.mem.concat(alloc, u8, &.{ "echo $$ > '", pid_signal.path, "'; exec sleep 30" });
     defer alloc.free(command);
     const text = try std.mem.concat(alloc, u8, &.{
         "{\"hooks\":{\"Notification\":[{\"hooks\":[{\"type\":\"command\",\"command\":\"",
@@ -1917,7 +1910,7 @@ test "deinit stops a background run at once, and its group is gone" {
         .fields = &fields,
     };
     runtime.dispatchDetached(ev, false);
-    const pid = try waitForHookPid(alloc, pid_path);
+    const pid = try waitForHookPid(&pid_signal);
 
     const started = std.Io.Clock.awake.now(io).toMilliseconds();
     runtime.deinit();
@@ -1933,9 +1926,9 @@ test "a SessionEnd hook that outlives the exit budget is stopped at it, and its 
     const io = io_mod.getIo();
     var fixture = try Fixture.init(alloc);
     defer fixture.deinit(alloc);
-    const pid_path = try std.Io.Dir.path.join(alloc, &.{ fixture.workspace, "session_end.pid" });
-    defer alloc.free(pid_path);
-    try writeSleepingSessionEnd(alloc, &fixture, pid_path);
+    var pid_signal = try test_signal.Signal.create(alloc, fixture.workspace, "session_end.pid");
+    defer pid_signal.deinit(alloc);
+    try writeSleepingSessionEnd(alloc, &fixture, pid_signal.path);
 
     var runtime = try Runtime.init(alloc, .{ .enabled = true, .home = fixture.home, .workspace_root = fixture.workspace });
     runtime.refresh();
@@ -1945,7 +1938,7 @@ test "a SessionEnd hook that outlives the exit budget is stopped at it, and its 
     runtime.deinit();
     const elapsed = std.Io.Clock.awake.now(io).toMilliseconds() - started;
 
-    const pid = try waitForHookPid(alloc, pid_path);
+    const pid = try waitForHookPid(&pid_signal);
     try std.testing.expect(elapsed < exit_limit_ms);
     try std.testing.expect(groupGone(pid));
 }
@@ -1955,9 +1948,9 @@ test "endSession with reason exit runs its SessionEnd hook under the same budget
     const io = io_mod.getIo();
     var fixture = try Fixture.init(alloc);
     defer fixture.deinit(alloc);
-    const pid_path = try std.Io.Dir.path.join(alloc, &.{ fixture.workspace, "session_end_exit.pid" });
-    defer alloc.free(pid_path);
-    try writeSleepingSessionEnd(alloc, &fixture, pid_path);
+    var pid_signal = try test_signal.Signal.create(alloc, fixture.workspace, "session_end_exit.pid");
+    defer pid_signal.deinit(alloc);
+    try writeSleepingSessionEnd(alloc, &fixture, pid_signal.path);
 
     var runtime = try Runtime.init(alloc, .{ .enabled = true, .home = fixture.home, .workspace_root = fixture.workspace });
     defer runtime.deinit();
@@ -1967,7 +1960,7 @@ test "endSession with reason exit runs its SessionEnd hook under the same budget
     runtime.endSession("s-6", "exit");
     const elapsed = std.Io.Clock.awake.now(io).toMilliseconds() - started;
 
-    const pid = try waitForHookPid(alloc, pid_path);
+    const pid = try waitForHookPid(&pid_signal);
     try std.testing.expect(elapsed < exit_limit_ms);
     try std.testing.expect(groupGone(pid));
 }
@@ -1977,9 +1970,9 @@ test "endSession with reason other returns at once, and deinit stops its Session
     const io = io_mod.getIo();
     var fixture = try Fixture.init(alloc);
     defer fixture.deinit(alloc);
-    const pid_path = try std.Io.Dir.path.join(alloc, &.{ fixture.workspace, "switch_session_end.pid" });
-    defer alloc.free(pid_path);
-    try writeSleepingSessionEnd(alloc, &fixture, pid_path);
+    var pid_signal = try test_signal.Signal.create(alloc, fixture.workspace, "switch_session_end.pid");
+    defer pid_signal.deinit(alloc);
+    try writeSleepingSessionEnd(alloc, &fixture, pid_signal.path);
 
     var runtime = try Runtime.init(alloc, .{ .enabled = true, .home = fixture.home, .workspace_root = fixture.workspace });
     var runtime_live = true;
@@ -1994,7 +1987,7 @@ test "endSession with reason other returns at once, and deinit stops its Session
     try std.testing.expect(switch_elapsed < exit_limit_ms);
 
     // The hook does run: it writes its pid, then sleeps, so its group is alive when the switch has returned.
-    const pid = try waitForHookPid(alloc, pid_path);
+    const pid = try waitForHookPid(&pid_signal);
     try std.testing.expect(!groupGone(pid));
 
     // Exit cancels the background run at once, and the hook's group is gone.
@@ -2014,9 +2007,9 @@ test "exit SessionEnd runs of one runtime share one budget, not one budget each"
     const io = io_mod.getIo();
     var fixture = try Fixture.init(alloc);
     defer fixture.deinit(alloc);
-    const pid_path = try std.Io.Dir.path.join(alloc, &.{ fixture.workspace, "shared_budget.pid" });
-    defer alloc.free(pid_path);
-    try writeSleepingSessionEnd(alloc, &fixture, pid_path);
+    var pid_signal = try test_signal.Signal.create(alloc, fixture.workspace, "shared_budget.pid");
+    defer pid_signal.deinit(alloc);
+    try writeSleepingSessionEnd(alloc, &fixture, pid_signal.path);
 
     var runtime = try Runtime.init(alloc, .{ .enabled = true, .home = fixture.home, .workspace_root = fixture.workspace });
     defer runtime.deinit();
@@ -2029,7 +2022,7 @@ test "exit SessionEnd runs of one runtime share one budget, not one budget each"
     runtime.endSession("s-8", "exit");
     const elapsed = std.Io.Clock.awake.now(io).toMilliseconds() - started;
 
-    const pid = try waitForHookPid(alloc, pid_path);
+    const pid = try waitForHookPid(&pid_signal);
     try std.testing.expect(elapsed < session_end_exit_budget_ms + exit_budget_margin_ms);
     try std.testing.expect(groupGone(pid));
 }

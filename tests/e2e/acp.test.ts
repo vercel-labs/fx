@@ -4145,6 +4145,246 @@ describe("acp: model-independent", () => {
     LIVE_TIMEOUT,
   );
 
+  // A fake model that offers Fast (a toggle), Ultrafast (an OpenAI service tier), and two effort levels, so a change reaches its hooks.
+  function changeModels() {
+    return {
+      models: [
+        {
+          id: FAKE_GATEWAY_MODEL,
+          type: "language",
+          owned_by: "openai",
+          tags: ["tool-use"],
+          fast_options: [{ type: "toggle" }],
+          reasoning_options: [{ type: "effort", values: ["low", "high"] }],
+          pricing: {
+            input: "0.000001",
+            output: "0.000002",
+            service_tiers: { ultrafast: { input: "0.1", output: "0.2" } },
+          },
+        },
+      ],
+    };
+  }
+
+  // A trusted ConfigChange hook that copies the fields it receives to `inputFile`, then runs `answer`.
+  function writeConfigChangeHooks(root: { home: string; workspace: string }, inputFile: string, answer: string) {
+    writeFileSync(join(root.home, ".fx", "settings.json"), JSON.stringify({ experimental: { hooks: true } }));
+    mkdirSync(join(root.workspace, ".fx"), { recursive: true });
+    writeFileSync(
+      join(root.workspace, ".fx", "hooks.json"),
+      JSON.stringify({
+        hooks: { ConfigChange: [{ hooks: [{ type: "command", command: `cat > '${inputFile}'; ${answer}` }] }] },
+      }),
+    );
+  }
+
+  // The effort option's current label, from a `configOptions` list.
+  function effortValue(options: any[]): string {
+    return options.find((o) => o.id === "effort").currentValue;
+  }
+
+  test(
+    "a ConfigChange hook refuses fast mode over ACP, and the session keeps it off",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-hook-fast-");
+      const hookInput = join(root.workspace, "fast-config-change.json");
+      writeConfigChangeHooks(root, hookInput, "echo 'fast stays off' >&2; exit 2");
+      await trustProjectHooks(root);
+      const gateway = startFakeGateway([finalText("unused")], changeModels());
+      try {
+        client = await AcpClient.create({
+          cwd: root.workspace,
+          env: { ...fakeGatewayEnv(root, gateway), FX_SOUND: "0" },
+          args: ["acp"],
+        });
+        await client.request("initialize", { protocolVersion: 1, clientCapabilities: { session: { notices: {} } } }, 1);
+        const created = (await client.request("session/new", { cwd: root.workspace, mcpServers: [] }, 2)) as any;
+        expect(created.error).toBeUndefined();
+        // The hook refuses: an invalid-params error with its reason, and the change does not apply.
+        const refused = (await client.request("session/set_config_option", { configId: "fast", value: "true" }, 3)) as any;
+        expect(refused.result).toBeUndefined();
+        expect(refused.error).toMatchObject({ code: -32602, message: "A hook refused this setting change: fast stays off" });
+        // The hook received the fields the TUI sends for /fast.
+        expect(JSON.parse(readFileSync(hookInput, "utf8"))).toMatchObject({
+          source: "settings",
+          key: "fast_mode",
+          old_value: "off",
+          new_value: "on",
+        });
+        // Read the session's options back: fast mode is still off.
+        const read = (await client.request("session/set_config_option", { configId: "model", value: FAKE_GATEWAY_MODEL }, 4)) as any;
+        expect(read.error).toBeUndefined();
+        expect(read.result.configOptions.find((o: any) => o.id === "fast").currentValue).toBe("false");
+      } finally {
+        await client?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    LIVE_TIMEOUT,
+  );
+
+  test(
+    "an allowing ConfigChange hook lets ACP turn fast mode on, with the TUI's fields",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-hook-fast-allow-");
+      const hookInput = join(root.workspace, "fast-config-change.json");
+      writeConfigChangeHooks(root, hookInput, "exit 0");
+      await trustProjectHooks(root);
+      const gateway = startFakeGateway([finalText("unused")], changeModels());
+      try {
+        client = await AcpClient.create({
+          cwd: root.workspace,
+          env: { ...fakeGatewayEnv(root, gateway), FX_SOUND: "0" },
+          args: ["acp"],
+        });
+        await client.request("initialize", { protocolVersion: 1, clientCapabilities: { session: { notices: {} } } }, 1);
+        const created = (await client.request("session/new", { cwd: root.workspace, mcpServers: [] }, 2)) as any;
+        expect(created.error).toBeUndefined();
+        const changed = (await client.request("session/set_config_option", { configId: "fast", value: "true" }, 3)) as any;
+        expect(changed.error).toBeUndefined();
+        expect(changed.result.configOptions.find((o: any) => o.id === "fast").currentValue).toBe("true");
+        expect(JSON.parse(readFileSync(hookInput, "utf8"))).toMatchObject({
+          source: "settings",
+          key: "fast_mode",
+          old_value: "off",
+          new_value: "on",
+        });
+      } finally {
+        await client?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    LIVE_TIMEOUT,
+  );
+
+  test(
+    "a ConfigChange hook refuses ultrafast mode over ACP, and the session keeps it off",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-hook-ultrafast-");
+      const hookInput = join(root.workspace, "ultrafast-config-change.json");
+      writeConfigChangeHooks(root, hookInput, "echo 'ultrafast stays off' >&2; exit 2");
+      await trustProjectHooks(root);
+      const gateway = startFakeGateway([finalText("unused")], changeModels());
+      try {
+        client = await AcpClient.create({
+          cwd: root.workspace,
+          env: { ...fakeGatewayEnv(root, gateway), FX_SOUND: "0" },
+          args: ["acp"],
+        });
+        await client.request("initialize", { protocolVersion: 1, clientCapabilities: { session: { notices: {} } } }, 1);
+        const created = (await client.request("session/new", { cwd: root.workspace, mcpServers: [] }, 2)) as any;
+        expect(created.error).toBeUndefined();
+        const refused = (await client.request("session/set_config_option", { configId: "ultrafast", value: "true" }, 3)) as any;
+        expect(refused.result).toBeUndefined();
+        expect(refused.error).toMatchObject({
+          code: -32602,
+          message: "A hook refused this setting change: ultrafast stays off",
+        });
+        expect(JSON.parse(readFileSync(hookInput, "utf8"))).toMatchObject({
+          source: "settings",
+          key: "ultrafast_mode",
+          old_value: "off",
+          new_value: "on",
+        });
+        const read = (await client.request("session/set_config_option", { configId: "model", value: FAKE_GATEWAY_MODEL }, 4)) as any;
+        expect(read.error).toBeUndefined();
+        expect(read.result.configOptions.find((o: any) => o.id === "ultrafast").currentValue).toBe("false");
+      } finally {
+        await client?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    LIVE_TIMEOUT,
+  );
+
+  test(
+    "a ConfigChange hook refuses an effort change over ACP, and the session keeps its effort",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-hook-effort-");
+      const hookInput = join(root.workspace, "effort-config-change.json");
+      writeConfigChangeHooks(root, hookInput, "echo 'effort stays' >&2; exit 2");
+      await trustProjectHooks(root);
+      const gateway = startFakeGateway([finalText("unused")], changeModels());
+      try {
+        client = await AcpClient.create({
+          cwd: root.workspace,
+          env: { ...fakeGatewayEnv(root, gateway), FX_SOUND: "0" },
+          args: ["acp"],
+        });
+        await client.request("initialize", { protocolVersion: 1, clientCapabilities: { session: { notices: {} } } }, 1);
+        const created = (await client.request("session/new", { cwd: root.workspace, mcpServers: [] }, 2)) as any;
+        expect(created.error).toBeUndefined();
+        await client.readLine();
+        // A model request returns the options, so it shows the effort the session has now.
+        const initial = (await client.request("session/set_config_option", { configId: "model", value: FAKE_GATEWAY_MODEL }, 3)) as any;
+        expect(initial.error).toBeUndefined();
+        const before = effortValue(initial.result.configOptions);
+        expect(before).not.toBe("high");
+        // The hook refuses: an invalid-params error with its reason, and the effort does not change.
+        const refused = (await client.request("session/set_config_option", { configId: "effort", value: "high" }, 4)) as any;
+        expect(refused.result).toBeUndefined();
+        expect(refused.error).toMatchObject({ code: -32602, message: "A hook refused this setting change: effort stays" });
+        // The hook received the fields the TUI sends for /effort.
+        expect(JSON.parse(readFileSync(hookInput, "utf8"))).toMatchObject({
+          source: "effort",
+          key: "effort",
+          old_value: before,
+          new_value: "high",
+        });
+        const read = (await client.request("session/set_config_option", { configId: "model", value: FAKE_GATEWAY_MODEL }, 5)) as any;
+        expect(read.error).toBeUndefined();
+        expect(effortValue(read.result.configOptions)).toBe(before);
+      } finally {
+        await client?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    LIVE_TIMEOUT,
+  );
+
+  test(
+    "an allowing ConfigChange hook lets ACP change the effort, with the TUI's fields",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-hook-effort-allow-");
+      const hookInput = join(root.workspace, "effort-config-change.json");
+      writeConfigChangeHooks(root, hookInput, "exit 0");
+      await trustProjectHooks(root);
+      const gateway = startFakeGateway([finalText("unused")], changeModels());
+      try {
+        client = await AcpClient.create({
+          cwd: root.workspace,
+          env: { ...fakeGatewayEnv(root, gateway), FX_SOUND: "0" },
+          args: ["acp"],
+        });
+        await client.request("initialize", { protocolVersion: 1, clientCapabilities: { session: { notices: {} } } }, 1);
+        const created = (await client.request("session/new", { cwd: root.workspace, mcpServers: [] }, 2)) as any;
+        expect(created.error).toBeUndefined();
+        await client.readLine();
+        const initial = (await client.request("session/set_config_option", { configId: "model", value: FAKE_GATEWAY_MODEL }, 3)) as any;
+        expect(initial.error).toBeUndefined();
+        const before = effortValue(initial.result.configOptions);
+        const changed = (await client.request("session/set_config_option", { configId: "effort", value: "high" }, 4)) as any;
+        expect(changed.error).toBeUndefined();
+        expect(effortValue(changed.result.configOptions)).toBe("high");
+        expect(JSON.parse(readFileSync(hookInput, "utf8"))).toMatchObject({
+          source: "effort",
+          key: "effort",
+          old_value: before,
+          new_value: "high",
+        });
+      } finally {
+        await client?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    LIVE_TIMEOUT,
+  );
+
   test(
     "a cancel stops a running PreToolUse hook over ACP",
     async () => {

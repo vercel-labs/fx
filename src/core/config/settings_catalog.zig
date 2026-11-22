@@ -40,6 +40,9 @@ pub const SettingId = enum {
     prompt_history,
 };
 
+/// The ConfigChange source of an effort change, which the TUI and ACP both send.
+pub const effort_change_source = "effort";
+
 pub const Spec = struct {
     id: SettingId,
     category: Category,

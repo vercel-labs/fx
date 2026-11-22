@@ -17,6 +17,7 @@ import {
   TmuxSession,
   tmuxAvailable,
 } from "./tmux-helpers";
+import { makeFifo, pidWritten, untilChange, untilWritersGone } from "./hooks-helpers";
 
 const TIMEOUT = 60_000;
 const TEST_TIMEOUT = 150_000;
@@ -270,16 +271,6 @@ async function stopTurn(session: TmuxSession): Promise<void> {
   await session.waitForComposer(TIMEOUT);
 }
 
-// Polls until `condition` holds; fails with `label` at the deadline.
-async function waitUntil(label: string, condition: () => boolean, timeoutMs = 10_000): Promise<void> {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    if (condition()) return;
-    await Bun.sleep(20);
-  }
-  throw new Error(`timed out waiting for ${label}`);
-}
-
 // A subagent's requests carry none of the text the person typed to main, and the parent's always
 // do, so the two tell apart (as sessions.test.ts does for the app).
 function isAppChildRequest(body: string, typed: string[]): boolean {
@@ -312,7 +303,7 @@ test.skipIf(!tmuxAvailable())(
     await stopTurn(session);
 
     // The Interrupt hook runs once, after the stop, and its line lands in the workspace.
-    await waitUntil("the Interrupt hook's line", () => existsSync(log), TIMEOUT);
+    await untilChange(fixture.workspace, () => existsSync(log) && readFileSync(log, "utf8").endsWith("\n"));
     expect(readFileSync(log, "utf8").split("\n").filter((line) => line.length > 0)).toHaveLength(1);
   },
   TEST_TIMEOUT,
@@ -325,6 +316,8 @@ test.skipIf(!tmuxAvailable())(
     const pidFile = join(fixture.workspace, "hook.pid");
     const childPidFile = join(fixture.workspace, "child.pid");
     const marker = join(fixture.workspace, "tui-stop-marker");
+    const fifo = join(fixture.workspace, "hook.fifo");
+    makeFifo(fifo);
     // The hook starts a background child, then waits for it: the stop must end both.
     writeProjectHooks(fixture, {
       hooks: {
@@ -335,7 +328,7 @@ test.skipIf(!tmuxAvailable())(
               {
                 type: "command",
                 id: "tree",
-                command: `sleep 30 & echo $! > '${childPidFile}'; echo $$ > '${pidFile}'; wait`,
+                command: `exec 3> '${fifo}'; sleep 30 & echo $! > '${childPidFile}'; echo $$ > '${pidFile}'; wait`,
                 timeout: 60,
               },
             ],
@@ -350,17 +343,19 @@ test.skipIf(!tmuxAvailable())(
     ]);
     const { session } = current;
 
+    // The reader must be open before the hook opens the FIFO's write end.
+    const hookGone = untilWritersGone(fifo);
     await session.sendText("Run the guarded command.");
     // The hook writes the child's pid, then its own, before it waits: wait for its own file.
-    await waitUntil("the hook's pid file", () => existsSync(pidFile), TIMEOUT);
+    await untilChange(fixture.workspace, () => pidWritten(pidFile));
     const pid = Number(readFileSync(pidFile, "utf8").trim());
     const childPid = Number(readFileSync(childPidFile, "utf8").trim());
     expect(processAlive(pid)).toBe(true);
     expect(processAlive(childPid)).toBe(true);
 
     await stopTurn(session);
-    await waitUntil("the stopped hook to end", () => !processAlive(pid), 5_000);
-    await waitUntil("the hook's child to end", () => !processAlive(childPid), 5_000);
+    // Each process the hook started holds the FIFO open, so end of file means all have exited (a group check races the exit).
+    expect(await hookGone).toBe(true);
     // The call the hook guarded never ran.
     expect(existsSync(marker)).toBe(false);
   },
@@ -373,13 +368,15 @@ test.skipIf(!tmuxAvailable())(
     const fixture = makeFixture();
     const pidFile = join(fixture.workspace, "hook.pid");
     const marker = join(fixture.workspace, "tui-signal-marker");
+    const fifo = join(fixture.workspace, "hook.fifo");
+    makeFifo(fifo);
     // The hook writes its pid before it sleeps: the pid file is the signal that the hook runs.
     writeProjectHooks(fixture, {
       hooks: {
         PreToolUse: [
           {
             matcher: "shell",
-            hooks: [{ type: "command", id: "sleepy", command: `echo $$ > '${pidFile}'; exec sleep 30`, timeout: 60 }],
+            hooks: [{ type: "command", id: "sleepy", command: `exec 3> '${fifo}'; echo $$ > '${pidFile}'; exec sleep 30`, timeout: 60 }],
           },
         ],
       },
@@ -391,14 +388,17 @@ test.skipIf(!tmuxAvailable())(
     ]);
     const { session } = current;
 
+    // The reader must be open before the hook opens the FIFO's write end.
+    const hookGone = untilWritersGone(fifo);
     await session.sendText("Run the guarded command.");
-    await waitUntil("the hook's pid file", () => existsSync(pidFile), TIMEOUT);
+    await untilChange(fixture.workspace, () => pidWritten(pidFile));
     const pid = Number(readFileSync(pidFile, "utf8").trim());
     expect(processGroupAlive(pid)).toBe(true);
 
     // The signal goes to the fx process itself. Its close path stops the hook group before fx ends (R3.9).
     process.kill(session.processPid(), "SIGTERM");
-    await waitUntil("the hook's process group to end", () => !processGroupAlive(pid), 5_000);
+    // Each process the hook started holds the FIFO open, so end of file means all have exited (a group check races the exit).
+    expect(await hookGone).toBe(true);
     // The call the hook guarded never ran.
     expect(existsSync(marker)).toBe(false);
   },
@@ -406,31 +406,35 @@ test.skipIf(!tmuxAvailable())(
 );
 
 // A trusted hook that writes its pid, then sleeps: `/hook test` runs it and waits, so the TUI can be tried while it runs.
-function sleepingHookFixture(): { fixture: Fixture; pidFile: string } {
+function sleepingHookFixture(): { fixture: Fixture; pidFile: string; fifo: string } {
   const fixture = makeFixture();
   const pidFile = join(fixture.workspace, "hook.pid");
+  const fifo = join(fixture.workspace, "hook.fifo");
+  makeFifo(fifo);
   writeProjectHooks(fixture, {
     hooks: {
       PreToolUse: [
         {
           matcher: "shell",
-          hooks: [{ type: "command", id: "sleepy", command: `echo $$ > '${pidFile}'; exec sleep 30`, timeout: 60 }],
+          hooks: [{ type: "command", id: "sleepy", command: `exec 3> '${fifo}'; echo $$ > '${pidFile}'; exec sleep 30`, timeout: 60 }],
         },
       ],
     },
   });
-  return { fixture, pidFile };
+  return { fixture, pidFile, fifo };
 }
 
 test.skipIf(!tmuxAvailable())(
   "typing still shows in the composer while a /hook test runs its hook",
   async () => {
-    const { fixture, pidFile } = sleepingHookFixture();
+    const { fixture, pidFile, fifo } = sleepingHookFixture();
     await trust(fixture, "sleepy");
     const { session } = await launch(fixture, [fakeGatewayFinalText("unused")]);
 
+    // The reader must be open before the hook opens the FIFO's write end.
+    const hookGone = untilWritersGone(fifo);
     await session.sendText("/hook test PreToolUse --match shell");
-    await waitUntil("the hook's pid file", () => existsSync(pidFile), TIMEOUT);
+    await untilChange(fixture.workspace, () => pidWritten(pidFile));
     const pid = Number(readFileSync(pidFile, "utf8").trim());
     await session.waitForText("Running /hook test", 5_000);
 
@@ -443,7 +447,8 @@ test.skipIf(!tmuxAvailable())(
     await session.sendKeys("Escape");
     await session.waitForText("esc again to interrupt", 5_000);
     await session.sendKeys("Escape");
-    await waitUntil("the hook's process group to end", () => !processGroupAlive(pid), 5_000);
+    // Each process the hook started holds the FIFO open, so end of file means all have exited (a group check races the exit).
+    expect(await hookGone).toBe(true);
   },
   TEST_TIMEOUT,
 );
@@ -451,12 +456,14 @@ test.skipIf(!tmuxAvailable())(
 test.skipIf(!tmuxAvailable())(
   "Esc twice stops a running /hook test: its hook group ends and the transcript says it was cancelled",
   async () => {
-    const { fixture, pidFile } = sleepingHookFixture();
+    const { fixture, pidFile, fifo } = sleepingHookFixture();
     await trust(fixture, "sleepy");
     const { session } = await launch(fixture, [fakeGatewayFinalText("unused")]);
 
+    // The reader must be open before the hook opens the FIFO's write end.
+    const hookGone = untilWritersGone(fifo);
     await session.sendText("/hook test PreToolUse --match shell");
-    await waitUntil("the hook's pid file", () => existsSync(pidFile), TIMEOUT);
+    await untilChange(fixture.workspace, () => pidWritten(pidFile));
     const pid = Number(readFileSync(pidFile, "utf8").trim());
     expect(processGroupAlive(pid)).toBe(true);
 
@@ -464,7 +471,8 @@ test.skipIf(!tmuxAvailable())(
     await session.sendKeys("Escape");
     await session.waitForText("esc again to interrupt", 5_000);
     await session.sendKeys("Escape");
-    await waitUntil("the hook's process group to end", () => !processGroupAlive(pid), 5_000);
+    // Each process the hook started holds the FIFO open, so end of file means all have exited (a group check races the exit).
+    expect(await hookGone).toBe(true);
     await session.waitForText("/hook test was cancelled", 5_000);
   },
   TEST_TIMEOUT,
@@ -518,13 +526,17 @@ test.skipIf(!tmuxAvailable())(
   async () => {
     const fixture = makeFixture();
     const pidFile = join(fixture.workspace, "config-hook.pid");
-    writeProjectHooks(fixture, configChangeHooks("sleepy", `echo $$ > '${pidFile}'; exec sleep 30`));
+    const fifo = join(fixture.workspace, "hook.fifo");
+    makeFifo(fifo);
+    writeProjectHooks(fixture, configChangeHooks("sleepy", `exec 3> '${fifo}'; echo $$ > '${pidFile}'; exec sleep 30`));
     await trust(fixture, "sleepy");
     const { session } = await launch(fixture, [fakeGatewayFinalText("unused")]);
     await session.waitForText("full access ·", TIMEOUT);
 
+    // The reader must be open before the hook opens the FIFO's write end.
+    const hookGone = untilWritersGone(fifo);
     await session.sendKeys("BTab");
-    await waitUntil("the hook's pid file", () => existsSync(pidFile), TIMEOUT);
+    await untilChange(fixture.workspace, () => pidWritten(pidFile));
     const pid = Number(readFileSync(pidFile, "utf8").trim());
     expect(processGroupAlive(pid)).toBe(true);
 
@@ -532,7 +544,8 @@ test.skipIf(!tmuxAvailable())(
     await session.sendKeys("Escape");
     await session.waitForText("esc again to interrupt", 5_000);
     await session.sendKeys("Escape");
-    await waitUntil("the hook's process group to end", () => !processGroupAlive(pid), 5_000);
+    // Each process the hook started holds the FIFO open, so end of file means all have exited (a group check races the exit).
+    expect(await hookGone).toBe(true);
     await session.waitForText("The permission mode change was cancelled", 5_000);
     expect(await session.capturePane()).toContain("full access ·");
   },
@@ -650,13 +663,17 @@ test.skipIf(!tmuxAvailable())(
   async () => {
     const fixture = makeFixture();
     const pidFile = join(fixture.workspace, "model-hook.pid");
-    writeProjectHooks(fixture, eventHooks("PreModelSwitch", "model-sleepy", `echo $$ > '${pidFile}'; exec sleep 30`));
+    const fifo = join(fixture.workspace, "hook.fifo");
+    makeFifo(fifo);
+    writeProjectHooks(fixture, eventHooks("PreModelSwitch", "model-sleepy", `exec 3> '${fifo}'; echo $$ > '${pidFile}'; exec sleep 30`));
     await trust(fixture, "model-sleepy");
     const { session } = await launchSwitchable(fixture, [fakeGatewayFinalText("unused")]);
     await session.waitForText("full access ·", TIMEOUT);
 
+    // The reader must be open before the hook opens the FIFO's write end.
+    const hookGone = untilWritersGone(fifo);
     await runModelSwitch(session);
-    await waitUntil("the hook's pid file", () => existsSync(pidFile), TIMEOUT);
+    await untilChange(fixture.workspace, () => pidWritten(pidFile));
     const pid = Number(readFileSync(pidFile, "utf8").trim());
     expect(processGroupAlive(pid)).toBe(true);
 
@@ -664,7 +681,8 @@ test.skipIf(!tmuxAvailable())(
     await session.sendKeys("Escape");
     await session.waitForText("esc again to interrupt", 5_000);
     await session.sendKeys("Escape");
-    await waitUntil("the hook's process group to end", () => !processGroupAlive(pid), 5_000);
+    // Each process the hook started holds the FIFO open, so end of file means all have exited (a group check races the exit).
+    expect(await hookGone).toBe(true);
     await session.waitForText("The model change was cancelled. Its hooks were stopped.", 5_000);
     expect(await session.capturePane()).not.toContain(`Switched to ${SWITCH_MODEL}`);
   },
@@ -758,7 +776,9 @@ test.skipIf(!tmuxAvailable())(
 
     // The hook allows the change once its gate file exists.
     writeFileSync(gate, "");
-    await waitUntil("the prompt history setting to be saved", () => promptHistoryDisabled(fixture), 10_000);
+    // The commit writes this line after the file is saved, so the line is the signal (R7.3).
+    await session.waitForText("history: saved to global settings", TIMEOUT);
+    expect(promptHistoryDisabled(fixture)).toBe(true);
   },
   TEST_TIMEOUT,
 );
@@ -797,24 +817,9 @@ function requestSpeed(body: string): string | undefined {
   return (JSON.parse(body) as { providerOptions?: { gateway?: { speed?: string } } }).providerOptions?.gateway?.speed;
 }
 
-// Waits until a file exists. The hook writes it, so the file is the signal.
-async function waitForFile(path: string, timeoutMs = TIMEOUT): Promise<void> {
-  const started = Date.now();
-  while (Date.now() - started < timeoutMs) {
-    if (existsSync(path)) return;
-    await Bun.sleep(25);
-  }
-  throw new Error(`Timed out waiting for file: ${path}`);
-}
-
-// Waits until fx has written a trace line that contains `needle`. The trace is the signal, so the test does not sleep.
-async function waitForTraceLine(tracePath: string, needle: string, timeoutMs = TIMEOUT): Promise<void> {
-  const started = Date.now();
-  while (Date.now() - started < timeoutMs) {
-    if (existsSync(tracePath) && readFileSync(tracePath, "utf8").includes(needle)) return;
-    await Bun.sleep(25);
-  }
-  throw new Error(`Timed out waiting for trace line: ${needle}`);
+// Whether fx's trace file holds `needle` yet. A held prompt shows no text of its own, so fx's trace line is its signal.
+function traced(path: string, needle: string): boolean {
+  return existsSync(path) && readFileSync(path, "utf8").includes(needle);
 }
 
 test.skipIf(!tmuxAvailable())(
@@ -870,7 +875,7 @@ test.skipIf(!tmuxAvailable())(
     await session.sendText("/fast");
     await session.waitForText("Checking hooks for the setting change", 5_000);
     await session.sendText("held prompt waits for the check");
-    await waitForTraceLine(trace, "pending_prompt_awaiting_hook_check");
+    await untilChange(fixture.root, () => traced(trace, "pending_prompt_awaiting_hook_check"));
     // The prompt stays on screen and nothing reaches the gateway while the check waits.
     expect(await session.capturePane()).toContain("held prompt waits for the check");
     // A second submit while one is held stays in the composer, as a held credential submit keeps its text (R2.1).
@@ -905,7 +910,7 @@ test.skipIf(!tmuxAvailable())(
     await session.sendText("/fast");
     await session.waitForText("Checking hooks for the setting change", 5_000);
     await session.sendText("held prompt is sent without fast");
-    await waitForTraceLine(trace, "pending_prompt_awaiting_hook_check");
+    await untilChange(fixture.root, () => traced(trace, "pending_prompt_awaiting_hook_check"));
     expect(gateway.requestCount()).toBe(0);
 
     writeFileSync(gate, "");
@@ -934,13 +939,13 @@ test.skipIf(!tmuxAvailable())(
     await session.sendText("/fast");
     await session.waitForText("Checking hooks for the setting change", 5_000);
     await session.sendText("held prompt is sent after Esc");
-    await waitForTraceLine(trace, "pending_prompt_awaiting_hook_check");
+    await untilChange(fixture.root, () => traced(trace, "pending_prompt_awaiting_hook_check"));
     expect(gateway.requestCount()).toBe(0);
 
     // Stopping active work takes two Esc presses inside the gesture window: the first arms, the second stops (the same
     // policy as a running turn). The prompt is not dropped: it is sent with the setting as it was.
     await session.sendKeys("Escape");
-    await waitForTraceLine(trace, "esc_interrupt_armed");
+    await session.waitForText("esc again to interrupt", TIMEOUT);
     await session.sendKeys("Escape");
     await session.waitForText("The setting change was cancelled. Its hooks were stopped.", TIMEOUT);
     await session.waitForText("held answer", TIMEOUT);
@@ -975,7 +980,7 @@ test.skipIf(!tmuxAvailable())(
     expect(existsSync(marker)).toBe(false);
 
     writeFileSync(gate, "");
-    await waitForFile(marker);
+    await untilChange(fixture.workspace, () => existsSync(marker));
   },
   TEST_TIMEOUT,
 );

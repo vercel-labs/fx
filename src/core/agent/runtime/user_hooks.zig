@@ -11,6 +11,7 @@ const debug_trace = @import("../../shared/debug_trace.zig");
 const host_target = @import("../../hosts/target.zig");
 const old_hooks = @import("../../hooks/hooks.zig");
 const io_mod = @import("../../shared/io.zig");
+const testing_listener = @import("../../shared/testing_listener.zig");
 const profile_paths = @import("../../shared/profile_paths.zig");
 const permission_auto_classifier = @import("../../permissions/auto_classifier.zig");
 const runtime_tool_batch = @import("tool_batch.zig");
@@ -2743,36 +2744,24 @@ test "a PreModelSwitch hook refuses a model change" {
     try std.testing.expectEqualStrings("A hook refused the model change: pinned", notice);
 }
 
-/// Gate tests wait for a decision or a pid file with a deadline, and poll at a short interval (R7.3).
+/// Gate tests wait for a decision or a pid with a deadline, and never sleep (R7.3).
 const gate_wait_ms = 5000;
-const gate_check_ms = 5;
 
-/// Polls `gate.take` until the decision finishes. A gate that never finishes fails the test.
+/// Waits for the gate's check to finish, then takes its decision. A gate that never finishes fails the test.
 fn waitForGate(gate: *HookGate) !HookGate.Result {
-    const io = io_mod.getIo();
-    const deadline = std.Io.Clock.awake.now(io).toMilliseconds() + gate_wait_ms;
-    while (std.Io.Clock.awake.now(io).toMilliseconds() < deadline) {
-        if (gate.take()) |result| return result;
-        io_mod.sleep(gate_check_ms * std.time.ns_per_ms);
-    }
-    return error.GateTimedOut;
+    const job = gate.current orelse return error.GateTimedOut;
+    if (!testing_listener.waitFor(&job.done, gate_wait_ms)) return error.GateTimedOut;
+    return gate.take() orelse error.GateTimedOut;
 }
 
-/// The pid a hook wrote with `echo $$ > path`, once the file holds one. The hook writes it before it sleeps.
-fn waitForPidFile(alloc: std.mem.Allocator, path: []const u8) !std.posix.pid_t {
-    const io = io_mod.getIo();
-    const deadline = std.Io.Clock.awake.now(io).toMilliseconds() + gate_wait_ms;
-    while (std.Io.Clock.awake.now(io).toMilliseconds() < deadline) {
-        if (std.Io.Dir.openFileAbsolute(io, path, .{})) |opened| {
-            var file = opened;
-            defer file.close(io);
-            const text = try io_mod.readFileToEnd(alloc, &file, 64);
-            defer alloc.free(text);
-            if (std.fmt.parseInt(std.posix.pid_t, std.mem.trim(u8, text, " \n"), 10)) |pid| return pid else |_| {}
-        } else |_| {}
-        io_mod.sleep(gate_check_ms * std.time.ns_per_ms);
-    }
-    return error.HookDidNotStart;
+/// The pid a hook wrote to `signal` with `echo $$ > path`. The hook writes it before it sleeps.
+fn waitForPid(signal: *hooks_host.test_signal.Signal) !std.posix.pid_t {
+    var buf: [64]u8 = undefined;
+    const line = signal.waitLine(&buf, gate_wait_ms) catch |err| switch (err) {
+        error.Timeout => return error.HookDidNotStart,
+        else => return err,
+    };
+    return std.fmt.parseInt(std.posix.pid_t, std.mem.trim(u8, line, " \n"), 10);
 }
 
 /// Whether a process group has no members left, by the kernel's answer to signal 0.
@@ -2895,9 +2884,9 @@ test "requestCancel stops the hooks, and take returns cancelled once they are go
     const alloc = std.testing.allocator;
     var fixture = try HookFixtures.init(alloc);
     defer fixture.deinit(alloc);
-    const pid_path = try std.Io.Dir.path.join(alloc, &.{ fixture.workspace, "gate.pid" });
-    defer alloc.free(pid_path);
-    const command = try std.mem.concat(alloc, u8, &.{ "echo $$ > '", pid_path, "'; exec sleep 30" });
+    var pid_signal = try hooks_host.test_signal.Signal.create(alloc, fixture.workspace, "gate.pid");
+    defer pid_signal.deinit(alloc);
+    const command = try std.mem.concat(alloc, u8, &.{ "echo $$ > '", pid_signal.path, "'; exec sleep 30" });
     defer alloc.free(command);
     const text = try std.mem.concat(alloc, u8, &.{
         "{\"hooks\":{\"ConfigChange\":[{\"hooks\":[{\"type\":\"command\",\"command\":\"",
@@ -2913,7 +2902,7 @@ test "requestCancel stops the hooks, and take returns cancelled once they are go
     const fields = [_]hooks_engine.Field{.{ .key = "source", .value = .{ .string = "settings" } }};
 
     try gate.start(&runtime, .setting, settingEvent(&fixture, "settings", &fields), false);
-    const pid = try waitForPidFile(alloc, pid_path);
+    const pid = try waitForPid(&pid_signal);
     try std.testing.expect(gate.requestCancel());
     var result = try waitForGate(&gate);
     defer result.deinit();
@@ -2926,10 +2915,10 @@ test "deinit stops an open gate's hooks, so a late write never happens" {
     const alloc = std.testing.allocator;
     var fixture = try HookFixtures.init(alloc);
     defer fixture.deinit(alloc);
-    const pid_path = try std.Io.Dir.path.join(alloc, &.{ fixture.workspace, "gate.pid" });
-    defer alloc.free(pid_path);
+    var pid_signal = try hooks_host.test_signal.Signal.create(alloc, fixture.workspace, "gate.pid");
+    defer pid_signal.deinit(alloc);
     // The hook writes late.txt only when its sleep ends, so the file exists only if deinit let the hook run on.
-    const command = try std.mem.concat(alloc, u8, &.{ "echo $$ > '", pid_path, "'; sleep 30; echo late > '", fixture.workspace, "/late.txt'" });
+    const command = try std.mem.concat(alloc, u8, &.{ "echo $$ > '", pid_signal.path, "'; sleep 30; echo late > '", fixture.workspace, "/late.txt'" });
     defer alloc.free(command);
     const text = try std.mem.concat(alloc, u8, &.{
         "{\"hooks\":{\"ConfigChange\":[{\"hooks\":[{\"type\":\"command\",\"command\":\"",
@@ -2945,7 +2934,7 @@ test "deinit stops an open gate's hooks, so a late write never happens" {
     const fields = [_]hooks_engine.Field{.{ .key = "source", .value = .{ .string = "settings" } }};
 
     try gate.start(&runtime, .setting, settingEvent(&fixture, "settings", &fields), false);
-    _ = try waitForPidFile(alloc, pid_path);
+    _ = try waitForPid(&pid_signal);
     gate.deinit();
     // The check is the late write. The group kill reaches the hook's sleep, so no write happens. Group membership
     // is not checked: a killed grandchild stays a zombie until init reaps it, so `groupGone` can read false.

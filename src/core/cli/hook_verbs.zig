@@ -1053,18 +1053,13 @@ const TuiLikeRun = struct {
     }
 };
 
-/// Waits until `path` exists, with a deadline. The hook writes that file before it sleeps, so it is the signal that the run is in progress.
-fn waitForFile(io: std.Io, path: []const u8) !void {
-    const deadline = std.Io.Clock.awake.now(io).toMilliseconds() + 5000;
-    while (std.Io.Clock.awake.now(io).toMilliseconds() < deadline) {
-        if (std.Io.Dir.openFileAbsolute(io, path, .{})) |file| {
-            var opened = file;
-            opened.close(io);
-            return;
-        } else |_| {}
-        io_mod.sleep(5 * std.time.ns_per_ms);
-    }
-    return error.HookDidNotStart;
+/// Waits until the hook writes its line to `signal`, which it does before it sleeps, so the run is in progress.
+fn waitForHookStart(signal: *hooks_host.test_signal.Signal) !void {
+    var buf: [64]u8 = undefined;
+    _ = signal.waitLine(&buf, 5000) catch |err| switch (err) {
+        error.Timeout => return error.HookDidNotStart,
+        else => return err,
+    };
 }
 
 test "a /hook test run the way the TUI job runs it leaves the SIGTERM handler alone" {
@@ -1074,9 +1069,9 @@ test "a /hook test run the way the TUI job runs it leaves the SIGTERM handler al
     defer tmp.cleanup();
     const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(home);
-    const pid_path = try std.Io.Dir.path.join(alloc, &.{ home, "hook.pid" });
-    defer alloc.free(pid_path);
-    const command = try std.mem.concat(alloc, u8, &.{ "echo $$ > '", pid_path, "'; exec sleep 30" });
+    var pid_signal = try hooks_host.test_signal.Signal.create(alloc, home, "hook.pid");
+    defer pid_signal.deinit(alloc);
+    const command = try std.mem.concat(alloc, u8, &.{ "echo $$ > '", pid_signal.path, "'; exec sleep 30" });
     defer alloc.free(command);
     const text = try std.mem.concat(alloc, u8, &.{
         "{\"hooks\":{\"PreToolUse\":[{\"matcher\":\"shell\",\"hooks\":[{\"type\":\"command\",\"id\":\"sleepy\",\"command\":\"",
@@ -1097,7 +1092,7 @@ test "a /hook test run the way the TUI job runs it leaves the SIGTERM handler al
     defer job.out.deinit();
     defer job.err.deinit();
     var thread = try std.Thread.spawn(.{}, TuiLikeRun.go, .{&job});
-    const started = waitForFile(io, pid_path);
+    const started = waitForHookStart(&pid_signal);
     // Read the disposition while the hook runs, then stop the run and join it on every path.
     var during: std.posix.Sigaction = undefined;
     std.posix.sigaction(std.posix.SIG.TERM, null, &during);

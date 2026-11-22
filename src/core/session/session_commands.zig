@@ -1044,7 +1044,7 @@ pub fn Commands(comptime App: type) type {
             if (std.mem.eql(u8, effort.label(), agent.effort.label())) return false;
             return app_agent_runtime.holdConfigChange(app, agent, .{
                 .setting = .effort,
-                .source = "effort",
+                .source = settings_catalog.effort_change_source,
                 .old_value = agent.effort.label(),
                 .new_value = effort.label(),
                 .value = effort.label(),

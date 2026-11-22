@@ -3,6 +3,7 @@
 
 pub const trust = @import("trust.zig");
 pub const loader = @import("loader.zig");
+pub const test_signal = @import("test_signal.zig");
 pub const Runtime = @import("runtime.zig").Runtime;
 pub const logPath = @import("runtime.zig").logPath;
 pub const oldLogPath = @import("runtime.zig").oldLogPath;
@@ -22,4 +23,5 @@ test {
     _ = @import("trust.zig");
     _ = @import("loader.zig");
     _ = @import("runtime.zig");
+    _ = @import("test_signal.zig");
 }

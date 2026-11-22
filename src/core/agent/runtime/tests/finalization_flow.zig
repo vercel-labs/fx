@@ -1287,8 +1287,14 @@ test "a PostModelSwitch note reaches the next turn once" {
     var fixture = PromptFixture{};
     try runFakePromptWithLifecycle(&gateway, &deps, fixture.config(), fixture.job(), lifecycle);
     try expectBodyContains(&gateway, 0, "the new model is faster");
-    try runFakePromptWithLifecycle(&gateway, &deps, fixture.config(), fixture.job(), lifecycle);
-    try expectBodyNotContains(&gateway, 1, "the new model is faster");
+    // Turn two starts from turn one's saved turn, as a resumed session does.
+    var follow_job = fixture.job();
+    follow_job.history = deps.history_turns.items;
+    try runFakePromptWithLifecycle(&gateway, &deps, fixture.config(), follow_job, lifecycle);
+    // The note is saved with turn one as steering, so turn two's request carries it from history, once.
+    // Its context is not queued again.
+    try expectBodyContains(&gateway, 1, "the new model is faster");
+    try std.testing.expectEqual(@as(usize, 1), countNeedle(gateway.request_bodies.items[1], "the new model is faster"));
 }
 
 /// Asks for one more turn only while the check is not already a continuation.

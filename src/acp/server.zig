@@ -15,6 +15,8 @@ const prompt_handler = @import("prompt.zig");
 const prompt_test_controls = @import("prompt_test_controls.zig");
 const app_lifecycle = @import("../core/app/app_lifecycle.zig");
 const app_runtime_setup = @import("../core/app/app_runtime_setup.zig");
+const app_agent_runtime = @import("../core/app/app_agent_runtime.zig");
+const settings_catalog = @import("../core/config/settings_catalog.zig");
 const compactor = @import("../core/compactor/compactor.zig");
 const builtin_skills = @import("../builtins/skills.zig");
 const builtin_tools = @import("../builtins/tools.zig");
@@ -4099,6 +4101,7 @@ fn handleSetConfigOption(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Me
                 .code = ErrorCode.invalid_params,
                 .message = "Ultrafast mode must be true or false",
             });
+        if (!try speedChangeAllowed(state, alloc, msg, session, .ultrafast_mode, ultrafast)) return;
         state.subagent_authority_mutex.lockUncancelable(io_mod.getIo());
         defer state.subagent_authority_mutex.unlock(io_mod.getIo());
         if (!try applyActiveSessionUltrafast(state, alloc, msg, session, ultrafast)) return;
@@ -4112,6 +4115,7 @@ fn handleSetConfigOption(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Me
                 .code = ErrorCode.invalid_params,
                 .message = "Fast mode must be true or false",
             });
+        if (!try speedChangeAllowed(state, alloc, msg, session, .fast_mode, fast)) return;
         state.subagent_authority_mutex.lockUncancelable(io_mod.getIo());
         defer state.subagent_authority_mutex.unlock(io_mod.getIo());
         if (!try applyActiveSessionFast(state, alloc, msg, session, fast)) return;
@@ -4136,6 +4140,7 @@ fn handleSetConfigOption(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Me
                 .message = "Reasoning effort is not available for the active model",
             });
         }
+        if (!try effortChangeAllowed(state, alloc, msg, session, effort)) return;
         state.subagent_authority_mutex.lockUncancelable(io_mod.getIo());
         defer state.subagent_authority_mutex.unlock(io_mod.getIo());
         commitActiveSessionEffort(alloc, session, effort) catch {
@@ -4322,29 +4327,40 @@ fn applyActiveSessionUltrafast(
     ultrafast: bool,
 ) !bool {
     if (ultrafast) {
-        const bundle = state.cfg.provider_set.select(session.provider);
-        const capabilities = state.capability_resolver.available(
-            session.model,
-            bundle.fallbackModelCapabilities(session.model),
-        );
-        const rejection = try ultrafastOverrideRejection(alloc, session.provider, capabilities, session.model);
-        if (rejection) |message| {
-            defer alloc.free(message);
-            try state.writer.writeError(alloc, msg.id, .{
-                .code = ErrorCode.invalid_params,
-                .message = message,
-                .data = .{
-                    .code = "LIBFX_MODEL_UNSUPPORTED_ULTRAFAST",
-                    .model = session.model,
-                    .capability = "ultrafast",
-                },
-            });
-            return false;
-        }
+        if (!try requireUltrafastSupport(state, alloc, msg, session)) return false;
         // Fast and Ultrafast are exclusive, as in the CLI.
         if (session.fast_mode and !try storeSessionFast(state, alloc, msg, session, false)) return false;
     }
     return storeSessionUltrafast(state, alloc, msg, session, ultrafast);
+}
+
+/// Writes the model's error and returns false when the active model has no Ultrafast lane; true otherwise.
+fn requireUltrafastSupport(
+    state: *ServerState,
+    alloc: Allocator,
+    msg: *jsonrpc.Message,
+    session: *ActiveSessionState,
+) !bool {
+    const bundle = state.cfg.provider_set.select(session.provider);
+    const capabilities = state.capability_resolver.available(
+        session.model,
+        bundle.fallbackModelCapabilities(session.model),
+    );
+    const rejection = try ultrafastOverrideRejection(alloc, session.provider, capabilities, session.model);
+    if (rejection) |message| {
+        defer alloc.free(message);
+        try state.writer.writeError(alloc, msg.id, .{
+            .code = ErrorCode.invalid_params,
+            .message = message,
+            .data = .{
+                .code = "LIBFX_MODEL_UNSUPPORTED_ULTRAFAST",
+                .model = session.model,
+                .capability = "ultrafast",
+            },
+        });
+        return false;
+    }
+    return true;
 }
 
 /// Saves the session's ultrafast preference without admission checks.
@@ -4381,23 +4397,32 @@ fn applyActiveSessionFast(
     fast: bool,
 ) !bool {
     if (fast) {
-        if (!activeSessionCapabilities(state, session).supports_fast_mode) {
-            const message = try alloc.print("Fast mode is not available for model \"{s}\"", .{session.model});
-            defer alloc.free(message);
-            try state.writer.writeError(alloc, msg.id, .{
-                .code = ErrorCode.invalid_params,
-                .message = message,
-                .data = .{
-                    .code = "LIBFX_MODEL_UNSUPPORTED_FAST",
-                    .model = session.model,
-                    .capability = "fast",
-                },
-            });
-            return false;
-        }
+        if (!try requireFastSupport(state, alloc, msg, session)) return false;
         if (session.ultrafast_mode and !try storeSessionUltrafast(state, alloc, msg, session, false)) return false;
     }
     return storeSessionFast(state, alloc, msg, session, fast);
+}
+
+/// Writes the model's error and returns false when the active model has no Fast lane; true otherwise.
+fn requireFastSupport(
+    state: *ServerState,
+    alloc: Allocator,
+    msg: *jsonrpc.Message,
+    session: *ActiveSessionState,
+) !bool {
+    if (activeSessionCapabilities(state, session).supports_fast_mode) return true;
+    const message = try alloc.print("Fast mode is not available for model \"{s}\"", .{session.model});
+    defer alloc.free(message);
+    try state.writer.writeError(alloc, msg.id, .{
+        .code = ErrorCode.invalid_params,
+        .message = message,
+        .data = .{
+            .code = "LIBFX_MODEL_UNSUPPORTED_FAST",
+            .model = session.model,
+            .capability = "fast",
+        },
+    });
+    return false;
 }
 
 /// Saves the session's fast preference without admission checks.
@@ -4490,6 +4515,7 @@ fn dropUnsupportedSpeeds(
     msg: *jsonrpc.Message,
     session: *ActiveSessionState,
 ) !bool {
+    // The model switch's PreModelSwitch check already decided this change, so it asks no ConfigChange of its own.
     const kept = speedSupportedBy(
         .{ .fast = session.fast_mode, .ultrafast = session.ultrafast_mode },
         session.provider,
@@ -4524,6 +4550,28 @@ test "ACP ultrafast disable applies to volatile SDK sessions without a durable s
     try std.testing.expect(!active.ultrafast_mode);
     try std.testing.expect(state.configured_ultrafast_mode);
     try std.testing.expectEqual(@as(?bool, true), state.process_ultrafast_override);
+}
+
+test "ACP Fast and Ultrafast changes send the TUI's ConfigChange fields" {
+    const fast_on = speedHookFields(.fast_mode, true);
+    try std.testing.expectEqualStrings("settings", fast_on.source);
+    try std.testing.expectEqualStrings("fast_mode", fast_on.key);
+    try std.testing.expectEqualStrings("off", fast_on.old_value);
+    try std.testing.expectEqualStrings("on", fast_on.new_value);
+
+    const ultrafast_off = speedHookFields(.ultrafast_mode, false);
+    try std.testing.expectEqualStrings("settings", ultrafast_off.source);
+    try std.testing.expectEqualStrings("ultrafast_mode", ultrafast_off.key);
+    try std.testing.expectEqualStrings("on", ultrafast_off.old_value);
+    try std.testing.expectEqualStrings("off", ultrafast_off.new_value);
+}
+
+test "ACP effort changes send the TUI's ConfigChange fields" {
+    const fields = effortHookFields("auto", "high");
+    try std.testing.expectEqualStrings("effort", fields.source);
+    try std.testing.expectEqualStrings("effort", fields.key);
+    try std.testing.expectEqualStrings("auto", fields.old_value);
+    try std.testing.expectEqualStrings("high", fields.new_value);
 }
 
 fn commitActiveSessionUltrafast(
@@ -4642,6 +4690,144 @@ fn permissionModeDecision(
         permissions.permissionModeLabel(old),
         permissions.permissionModeLabel(new),
     );
+}
+
+/// The ConfigChange fields of one setting change, as the hook receives them.
+const SettingHookFields = struct {
+    source: []const u8,
+    key: []const u8,
+    old_value: []const u8,
+    new_value: []const u8,
+};
+
+/// The ConfigChange fields of a Fast or Ultrafast change, the same ones the TUI sends: the
+/// `onOffSettingChange` of app_agent_runtime, with the setting's enum name as the key.
+fn speedHookFields(setting: settings_catalog.SettingId, enabled: bool) SettingHookFields {
+    const change = app_agent_runtime.onOffSettingChange(setting, enabled);
+    return .{
+        .source = change.source,
+        .key = @tagName(change.setting),
+        .old_value = change.old_value,
+        .new_value = change.new_value,
+    };
+}
+
+/// What the ConfigChange hooks decided for a setting change on this connection, with their notices.
+/// Both live in `arena`. Wasm runs no hooks.
+fn settingChangeDecision(
+    state: *ServerState,
+    arena: Allocator,
+    alloc: Allocator,
+    session: *ActiveSessionState,
+    fields: SettingHookFields,
+) runtime_user_hooks.ChangeDecision {
+    if (comptime host_target.is_wasm) return .{};
+    return runtime_user_hooks.configChange(
+        connectionLifecycle(state, session, alloc),
+        arena,
+        fields.source,
+        fields.key,
+        fields.old_value,
+        fields.new_value,
+    );
+}
+
+fn speedValue(session: *const ActiveSessionState, setting: settings_catalog.SettingId) bool {
+    return switch (setting) {
+        .fast_mode => session.fast_mode,
+        .ultrafast_mode => session.ultrafast_mode,
+        else => unreachable,
+    };
+}
+
+/// Asks the ConfigChange hooks before a Fast or Ultrafast change, as the TUI does. A value the
+/// session already has asks nothing. Turning a lane on first needs the model's support, as in the
+/// TUI. Writes the refusal and returns false when a hook refused the change, which then stays as it
+/// was. The hook runs outside the authority mutex, so a slow hook never holds it.
+fn speedChangeAllowed(
+    state: *ServerState,
+    alloc: Allocator,
+    msg: *jsonrpc.Message,
+    session: *ActiveSessionState,
+    setting: settings_catalog.SettingId,
+    enabled: bool,
+) !bool {
+    const current = blk: {
+        state.subagent_authority_mutex.lockUncancelable(io_mod.getIo());
+        defer state.subagent_authority_mutex.unlock(io_mod.getIo());
+        break :blk speedValue(session, setting);
+    };
+    if (enabled == current) return true;
+    if (enabled and !try speedSupported(state, alloc, msg, session, setting)) return false;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const decision = settingChangeDecision(state, arena_state.allocator(), alloc, session, speedHookFields(setting, enabled));
+    prompt_handler.sendSettingsHookNotices(state, alloc, session.session_id, decision.notices);
+    if (decision.refusal) |notice| {
+        try state.writer.writeError(alloc, msg.id, .{ .code = ErrorCode.invalid_params, .message = notice });
+        return false;
+    }
+    return true;
+}
+
+/// Whether the active model can turn the lane on. Writes the model's error and returns false when not.
+fn speedSupported(
+    state: *ServerState,
+    alloc: Allocator,
+    msg: *jsonrpc.Message,
+    session: *ActiveSessionState,
+    setting: settings_catalog.SettingId,
+) !bool {
+    return switch (setting) {
+        .fast_mode => requireFastSupport(state, alloc, msg, session),
+        .ultrafast_mode => requireUltrafastSupport(state, alloc, msg, session),
+        else => unreachable,
+    };
+}
+
+/// The ConfigChange fields of an effort change, the same ones the TUI sends: source "effort", the
+/// setting's enum name as the key, and the labels of the old and new effort.
+fn effortHookFields(old_label: []const u8, new_label: []const u8) SettingHookFields {
+    return .{
+        .source = settings_catalog.effort_change_source,
+        .key = @tagName(settings_catalog.SettingId.effort),
+        .old_value = old_label,
+        .new_value = new_label,
+    };
+}
+
+/// Asks the ConfigChange hooks before an effort change, as the TUI does. An effort with the same label
+/// as the session's asks nothing. The model's support check runs first, as in the TUI. Writes the
+/// refusal and returns false when a hook refused the change, which then stays as it was. Like
+/// speedChangeAllowed, the value is read under the authority mutex, and the hook runs outside it.
+fn effortChangeAllowed(
+    state: *ServerState,
+    alloc: Allocator,
+    msg: *jsonrpc.Message,
+    session: *ActiveSessionState,
+    effort: types.ReasoningEffort,
+) !bool {
+    const current = blk: {
+        state.subagent_authority_mutex.lockUncancelable(io_mod.getIo());
+        defer state.subagent_authority_mutex.unlock(io_mod.getIo());
+        break :blk session.effort;
+    };
+    if (std.mem.eql(u8, effort.label(), current.label())) return true;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const decision = settingChangeDecision(
+        state,
+        arena_state.allocator(),
+        alloc,
+        session,
+        effortHookFields(current.label(), effort.label()),
+    );
+    prompt_handler.sendSettingsHookNotices(state, alloc, session.session_id, decision.notices);
+    if (decision.refusal) |notice| {
+        try state.writer.writeError(alloc, msg.id, .{ .code = ErrorCode.invalid_params, .message = notice });
+        return false;
+    }
+    return true;
 }
 
 /// Applies a client's mode choice to the active session and saves it as the

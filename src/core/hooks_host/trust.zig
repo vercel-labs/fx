@@ -205,6 +205,7 @@ pub fn lockWriters(alloc: std.mem.Allocator, file_path: []const u8, wait_ms: u32
             if (err != error.WouldBlock) return err;
         }
         if (std.Io.Clock.awake.now(io).toMilliseconds() >= deadline) return error.TrustFileBusy;
+        // Another process holds this lock, and File.lock blocks with no timeout, so retry until the deadline.
         io_mod.sleep(lock_retry_ms * std.time.ns_per_ms);
     }
 }

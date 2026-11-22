@@ -96,6 +96,8 @@
 (* no report says its subagent is idle and no start names any.             *)
 (* "gap_blind" is fx with the gap: a stop or close in it answers as for a    *)
 (* running turn but acts on nothing, so the next turn runs on.             *)
+(* "no_cap" removes the cap on SubagentStop continuations, so a finished   *)
+(* turn can be continued past three times; ContinueCapped catches it.      *)
 (***************************************************************************)
 EXTENDS Naturals, Sequences, FiniteSets
 
@@ -104,7 +106,7 @@ CONSTANTS Subs, MsgsPer, MaxSteps, MaxStops, Bug
 Bugs == {"none", "today", "refuse_ending", "no_order", "uncounted",
          "join_user_ending", "read_after_stop", "drop_waiting_at_end",
          "queue_closing", "unmark_early", "start_next_turn",
-         "before_idle", "note_after_take", "names_busy", "gap_blind"}
+         "before_idle", "note_after_take", "names_busy", "gap_blind", "no_cap"}
 \* The defects of the kept and carried messages, beside `Bugs`.
 KeptBugs == {"leftover_gap", "leftover_uncounted", "close_leaves_kept",
              "gap_uncounted", "stale_unstarted", "recount"}
@@ -127,7 +129,7 @@ Ops == {"none", "step", "send", "stop", "close", "user_stop", "read",
 
 \* The phases and ops of the kept messages, beside `Phases` and `Ops`.
 AllPhases == Phases \cup {"ended"}
-AllOps == Ops \cup {"fail", "hook", "fail_start"}
+AllOps == Ops \cup {"fail", "hook", "fail_start", "continue"}
 
 Range(sq) == {sq[k] : k \in DOMAIN sq}
 RemoveAt(sq, i) == [k \in 1..(Len(sq) - 1) |-> IF k < i THEN sq[k] ELSE sq[k + 1]]
@@ -156,6 +158,7 @@ VARIABLES
     refusedOpen,  \* messages refused although their subagent was not closing
     coverBroken,  \* a stop dropped a message written after it in its step
     lateStart,    \* messages sent to a starting turn that fx held for a later one
+    conts,        \* [Subs -> Nat]: continuations the subagent's current turn took (SubagentStop)
     last,         \* the last action, which a trace of fx matches
     note,         \* what the last end told main (Notes)
     named,        \* the subagents the last message named as idle
@@ -164,12 +167,17 @@ VARIABLES
 
 idleVars == <<note, named, noteWrong, namedWrong>>
 
+\* The continuations of a subagent's running turn. It is zero whenever the
+\* subagent is not running, so states that differ only in a finished turn's
+\* count are one state (ContinueOnlyRunning).
+turnVars == <<conts>>
+
 \* What most actions leave alone.
 heldVars == <<startq, stoppedQ, kept>>
 
 vars == <<phase, unread, waitq, startq, kept, read, dropped, stoppedQ, toldDropped, told, sent,
           stops, steps, step, covered, refusedOpen, coverBroken, lateStart, last,
-          note, named, noteWrong, namedWrong>>
+          note, named, noteWrong, namedWrong, conts>>
 
 Init ==
     /\ phase = [s \in Subs |-> "absent"]
@@ -195,6 +203,7 @@ Init ==
     /\ named = {}
     /\ noteWrong = FALSE
     /\ namedWrong = FALSE
+    /\ conts = [s \in Subs |-> 0]
 
 -----------------------------------------------------------------------------
 (* Main writes its next step once the last one has run.                    *)
@@ -233,6 +242,7 @@ NewStep ==
                    refusedOpen, coverBroken, lateStart>>
     /\ UNCHANGED heldVars
     /\ UNCHANGED idleVars
+    /\ UNCHANGED turnVars
 
 -----------------------------------------------------------------------------
 (* One call of the step runs. Calls to one subagent wait for the earlier   *)
@@ -254,6 +264,18 @@ Marked(s) == phase[s] \in {"closing", "writing"}
 
 \* A phase without the gap: the state the host's choice leaves to the world.
 Plain(p) == IF p = "gap_idle" THEN "idle" ELSE IF p = "gap_next" THEN "starting" ELSE p
+
+\* SubagentStop keeps a finished turn going at most this many times
+\* (`subagent_stop_continuations`, src/hooks/limits.zig:15). The cap is checked
+\* before the hook starts (user_hooks.zig:366).
+MaxConts == 3
+
+\* fx's agent step limit for a turn. 0 is unbounded, the default
+\* (src/core/config/agent_steps.zig:3). A continuation needs a step left:
+\* `allowsStep(limit, completed)` is `limit == 0 or completed < limit`
+\* (agent_steps.zig:23-25), with the continuation as the turn's next step.
+TurnStepLimit == 0
+StepLeft(s) == TurnStepLimit = 0 \/ conts[s] + 1 < TurnStepLimit
 
 \* A message to it is queued, and goes with the close. fx never does: a
 \* closing subagent refuses it. unmark_early is fx before settleClose kept
@@ -323,6 +345,7 @@ DoSend(c) ==
         m == c.msg
     IN
     /\ UNCHANGED heldVars
+    /\ UNCHANGED turnVars
     /\ \/ /\ phase[s] \in {"absent", "idle"}
           /\ phase' = [phase EXCEPT ![s] = "starting"]
           /\ read' = read \cup {m}
@@ -364,16 +387,19 @@ DoStop(c) ==
        /\ last' = Event("stop", s, NoMsg, "stopped", 0)
        /\ UNCHANGED <<phase, waitq, dropped, toldDropped, coverBroken>>
        /\ UNCHANGED heldVars
+       /\ UNCHANGED turnVars
     \/ /\ phase[s] = "absent"
        /\ last' = Event("stop", s, NoMsg, "unavailable", 0)
        /\ UNCHANGED <<phase, waitq, dropped, toldDropped, coverBroken>>
        /\ UNCHANGED heldVars
+       /\ UNCHANGED turnVars
     \* The work ended and none follows: nothing to stop (Owner.stop finds the
     \* slot ended). Only the planted defect answers as for a running turn.
     \/ /\ phase[s] = "gap_idle"
        /\ last' = Event("stop", s, NoMsg, IF Bug = "gap_blind" THEN "stopped" ELSE "idle", 0)
        /\ UNCHANGED <<phase, waitq, dropped, toldDropped, coverBroken>>
        /\ UNCHANGED heldVars
+       /\ UNCHANGED turnVars
     \/ /\ phase[s] \notin {"closing", "writing", "absent", "gap_idle"}
        /\ phase' = [phase EXCEPT ![s] = IF @ \in {"starting", "running"} \/ (@ = "gap_next" /\ Bug # "gap_blind")
                                          THEN "ending_parent" ELSE @]
@@ -389,6 +415,7 @@ DoStop(c) ==
        /\ last' = Event("stop", s, NoMsg,
                         IF phase[s] \in {"starting", "running", "gap_next"} \cup Endings THEN "stopped" ELSE "idle",
                         Cardinality(counted))
+       /\ conts' = [conts EXCEPT ![s] = 0]
 
 DoClose(c) ==
     LET s == c.sub
@@ -406,12 +433,14 @@ DoClose(c) ==
           /\ last' = Event("close", s, NoMsg, "unavailable", 0)
           /\ UNCHANGED <<phase, waitq, unread, dropped, toldDropped>>
           /\ UNCHANGED heldVars
+          /\ UNCHANGED turnVars
        \* A second close while the first is ending: fx answers closed and
        \* drops nothing more (`closeChild` in tool_host.zig).
        \/ /\ Marked(s)
           /\ last' = Event("close", s, NoMsg, "closed", 0)
           /\ UNCHANGED <<phase, waitq, unread, dropped, toldDropped>>
           /\ UNCHANGED heldVars
+          /\ UNCHANGED turnVars
        \/ /\ phase[s] \notin {"closing", "writing", "absent"}
           \* A work that ended with none next closes as an idle one; the
           \* planted defect leaves the gap alone.
@@ -426,6 +455,7 @@ DoClose(c) ==
           /\ toldDropped' = toldDropped \cup counted
           /\ stoppedQ' = stoppedQ \cup lost
           /\ last' = Event("close", s, NoMsg, "closed", Cardinality(counted))
+          /\ conts' = [conts EXCEPT ![s] = 0]
 
 Exec ==
     \E i \in 1..Len(step) :
@@ -460,6 +490,7 @@ UserStop(s) ==
     /\ UNCHANGED <<unread, read, told, sent, steps, step, covered, refusedOpen, coverBroken, lateStart>>
     /\ UNCHANGED heldVars
     /\ UNCHANGED idleVars
+    /\ conts' = [conts EXCEPT ![s] = 0]
 
 \* A starting turn's worker begins: it takes messages from now on.
 Begin(s) ==
@@ -468,6 +499,7 @@ Begin(s) ==
     /\ read' = read \cup startq[s]
     /\ startq' = [startq EXCEPT ![s] = {}]
     /\ last' = Event("begin", s, NoMsg, "none", 0)
+    /\ conts' = [conts EXCEPT ![s] = 0]
     /\ UNCHANGED <<unread, waitq, kept, dropped, stoppedQ, toldDropped, told, sent, stops, steps,
                    step, covered, refusedOpen, coverBroken, lateStart>>
     /\ UNCHANGED idleVars
@@ -484,6 +516,7 @@ Read(s) ==
                    step, covered, refusedOpen, coverBroken, lateStart>>
     /\ UNCHANGED heldVars
     /\ UNCHANGED idleVars
+    /\ UNCHANGED turnVars
 
 \* What fx tells main when `s`'s work ends: no report when main stopped or
 \* closed it, and otherwise a report that says `s` is idle when no message
@@ -503,6 +536,7 @@ Noted(s, reports, after) ==
     /\ noteWrong' = (noteWrong \/
          IF reports THEN (note' = "idle") # (after = "idle") ELSE note' # "none")
     /\ UNCHANGED <<named, namedWrong>>
+    /\ UNCHANGED turnVars
 
 \* The running turn ends on its own; waiting messages start the next one. With
 \* `gap`, the slot has not gone on yet: the host has chosen, but the next turn
@@ -521,6 +555,7 @@ FinishWith(s, gap) ==
     /\ Noted(s, TRUE, Plain(phase'[s]))
     /\ UNCHANGED <<unread, kept, read, dropped, stoppedQ, toldDropped, told, sent, stops, steps, step,
                    covered, refusedOpen, coverBroken, lateStart>>
+    /\ conts' = [conts EXCEPT ![s] = 0]
 
 Finish(s) == FinishWith(s, FALSE)
 FinishInGap(s) == FinishWith(s, TRUE)
@@ -535,6 +570,7 @@ Publish(s) ==
                    step, covered, refusedOpen, coverBroken, lateStart>>
     /\ UNCHANGED heldVars
     /\ UNCHANGED idleVars
+    /\ UNCHANGED turnVars
 
 \* The stopped turn ends: its unread messages go, and the waiting ones start
 \* the next turn. A closed subagent's work ends, and its close is written
@@ -566,6 +602,7 @@ EndStoppedWith(s, gap) ==
     /\ Noted(s, phase[s] = "ending_user", Plain(phase'[s]))
     /\ UNCHANGED <<toldDropped, stoppedQ, kept, read, told, sent, stops, steps, step, covered,
                    refusedOpen, coverBroken, lateStart>>
+    /\ UNCHANGED turnVars
 
 EndStopped(s) == EndStoppedWith(s, FALSE)
 EndStoppedInGap(s) == EndStoppedWith(s, TRUE)
@@ -584,6 +621,7 @@ Fail(s) ==
     /\ UNCHANGED <<waitq, startq, stoppedQ, read, dropped, toldDropped, told, sent, stops, steps,
                    step, covered, refusedOpen, coverBroken, lateStart>>
     /\ UNCHANGED idleVars
+    /\ conts' = [conts EXCEPT ![s] = 0]
 
 \* The work the host chose for the slot fails before its worker begins, as a
 \* failed bind to its agent does. Its failed report tells main that its
@@ -601,6 +639,7 @@ FailStart(s) ==
     /\ UNCHANGED <<unread, waitq, kept, stoppedQ, read, told, sent, stops, steps,
                    step, covered, refusedOpen, coverBroken, lateStart>>
     /\ UNCHANGED idleVars
+    /\ UNCHANGED turnVars
 
 \* The end hook of an ended turn queues the kept messages ahead of the
 \* waiting ones as the next work (`queueLeftoversLocked`, once
@@ -618,6 +657,25 @@ Hook(s) ==
     /\ Noted(s, TRUE, Plain(phase'[s]))
     /\ UNCHANGED <<unread, read, dropped, stoppedQ, toldDropped, told, sent, stops, steps, step,
                    covered, refusedOpen, coverBroken, lateStart>>
+    /\ UNCHANGED turnVars
+
+\* A SubagentStop hook keeps a finished turn going. It asks at the point where the
+\* turn would end on its own, with no steering queued: a queued steering message
+\* continues the turn first (orchestrator.zig:10599, 10746-10748). The cap has room,
+\* and a step is left (user_hooks.zig:366, orchestrator.zig:10746, agent_steps.zig:23).
+\* The turn is still running, so a message joins it, and it ends by Finish or a stop.
+\* Bug = "no_cap" removes the cap.
+ContinueStep(s) ==
+    /\ phase[s] = "running"
+    /\ unread[s] = {}
+    /\ waitq[s] = <<>>
+    /\ (Bug = "no_cap" \/ conts[s] < MaxConts) /\ StepLeft(s)
+    /\ conts' = [conts EXCEPT ![s] = @ + 1]
+    /\ last' = Event("continue", s, NoMsg, "none", 0)
+    /\ UNCHANGED <<phase, unread, waitq, read, dropped, toldDropped, told, sent, stops, steps,
+                   step, covered, refusedOpen, coverBroken, lateStart>>
+    /\ UNCHANGED heldVars
+    /\ UNCHANGED idleVars
 
 \* A closed subagent's close is written once nothing of it runs: the registry
 \* drops it, and a new one may take the name (Runtime.settleClose).
@@ -629,6 +687,7 @@ WriteClose(s) ==
                    step, covered, refusedOpen, coverBroken, lateStart>>
     /\ UNCHANGED heldVars
     /\ UNCHANGED idleVars
+    /\ UNCHANGED turnVars
 
 Next ==
     \/ NewStep
@@ -636,6 +695,7 @@ Next ==
     \/ \E s \in Subs : UserStop(s) \/ Begin(s) \/ Read(s) \/ Finish(s) \/ EndStopped(s)
                        \/ WriteClose(s) \/ FinishInGap(s) \/ EndStoppedInGap(s) \/ Publish(s)
     \/ \E s \in Subs : Fail(s) \/ Hook(s) \/ FailStart(s)
+    \/ \E s \in Subs : ContinueStep(s)
 
 Spec == Init /\ [][Next]_vars
 
@@ -662,6 +722,7 @@ TypeOK ==
     /\ named \subseteq Subs
     /\ noteWrong \in BOOLEAN
     /\ namedWrong \in BOOLEAN
+    /\ conts \in [Subs -> Nat]
 
 \* Main hears of every message fx throws away.
 NoSilentLoss == dropped \subseteq toldDropped
@@ -737,4 +798,12 @@ NamesTheIdle == ~namedWrong
 Accounted ==
     (step = <<>> /\ \A s \in Subs : phase[s] \in {"absent", "idle"}) =>
         \A m \in sent : m \in read \cup toldDropped \/ told[m] = "refused"
+
+\* A subagent's turn takes at most MaxConts continuations, whatever its SubagentStop
+\* hook answers: the cap is checked before the hook starts.
+ContinueCapped == \A s \in Subs : conts[s] <= MaxConts
+
+\* A subagent that is not running has no continuations counted: every action that
+\* ends a running turn resets its count.
+ContinueOnlyRunning == \A s \in Subs : phase[s] # "running" => conts[s] = 0
 =============================================================================

@@ -4,6 +4,7 @@ import { chmodSync, existsSync, mkdirSync, readFileSync, realpathSync, statSync,
 import { join } from "node:path";
 import { cleanupIsolatedTestHome, createIsolatedTestHome, FX_BIN, runFx } from "../evals/eval-helpers";
 import { processGroupAlive } from "./process-alive";
+import { childExited, makeFifo, pidWritten, untilChange, untilWritersGone } from "./hooks-helpers";
 
 // `fx hook`, run against the built binary. Each test has its own HOME, with a profile folder and a
 // workspace inside it. The person runs the commands unless a test sets AI_AGENT=fx, so AI_AGENT is
@@ -88,27 +89,6 @@ function startFx(root: Root, args: string[], options: { ignoreInt?: boolean } = 
 // The number of lines in a file, or 0 while the file does not exist.
 function lineCount(path: string): number {
   return existsSync(path) ? readFileSync(path, "utf8").split("\n").filter((line) => line.length > 0).length : 0;
-}
-
-// Resolves true once the process has exited, and false when it has not exited by the deadline.
-function exitedWithin(child: ChildProcess, timeoutMs: number): Promise<boolean> {
-  if (child.exitCode !== null || child.signalCode !== null) return Promise.resolve(true);
-  return new Promise((resolve) => {
-    const timer = setTimeout(() => resolve(false), timeoutMs);
-    child.once("exit", () => {
-      clearTimeout(timer);
-      resolve(true);
-    });
-  });
-}
-
-async function waitFor(label: string, condition: () => boolean, timeoutMs: number): Promise<void> {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    if (condition()) return;
-    await Bun.sleep(20);
-  }
-  throw new Error(`timed out waiting for ${label}`);
 }
 
 const statusRow = (id: string, status: string) => new RegExp(`^${id}\\s+PreToolUse\\s+shell\\s+${status}\\s`, "m");
@@ -422,6 +402,8 @@ describe("fx hook", () => {
     async () => {
       const root = createRoot();
       const pidFile = join(root.workspace, "hook.pid");
+      const fifo = join(root.workspace, "hook.fifo");
+      makeFifo(fifo);
       writeFileSync(
         join(root.workspace, ".fx", "hooks.json"),
         JSON.stringify({
@@ -429,7 +411,7 @@ describe("fx hook", () => {
             PreToolUse: [
               {
                 matcher: "shell",
-                hooks: [{ type: "command", id: "sleepy", command: `echo $$ > '${pidFile}'; exec sleep 30`, timeout: 60 }],
+                hooks: [{ type: "command", id: "sleepy", command: `exec 3> '${fifo}'; echo $$ > '${pidFile}'; exec sleep 30`, timeout: 60 }],
               },
             ],
           },
@@ -437,17 +419,19 @@ describe("fx hook", () => {
       );
       expect((await hook(root, ["hook", "trust", "sleepy"])).code).toBe(0);
 
-      // The hook writes its pid before it sleeps, so the pid file is the signal that the hook runs.
+      // The hook writes its pid before it sleeps, and it holds the FIFO open until its last process exits.
+      const hookGone = untilWritersGone(fifo);
       const child = startFx(root, testArgs());
-      const fxExited = exitedWithin(child, 15_000);
+      const fxExited = childExited(child);
       try {
-        await waitFor("the hook's pid file", () => existsSync(pidFile), 15_000);
+        await untilChange(root.workspace, () => pidWritten(pidFile));
         const pid = Number(readFileSync(pidFile, "utf8").trim());
         expect(processGroupAlive(pid)).toBe(true);
 
         child.kill("SIGINT");
         expect(await fxExited).toBe(true);
-        await waitFor("the hook's process group to end", () => !processGroupAlive(pid), 5_000);
+        // Each process the hook started holds the FIFO open, so end of file means all have exited (a group check races the exit).
+        expect(await hookGone).toBe(true);
       } finally {
         if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
       }
@@ -463,6 +447,8 @@ describe("fx hook", () => {
       const root = createRoot();
       const pidFile = join(root.workspace, "hook.pid");
       const beatFile = join(root.workspace, "hook.beat");
+      const fifo = join(root.workspace, "hook.fifo");
+      makeFifo(fifo);
       writeFileSync(
         join(root.workspace, ".fx", "hooks.json"),
         JSON.stringify({
@@ -474,7 +460,7 @@ describe("fx hook", () => {
                   {
                     type: "command",
                     id: "beating",
-                    command: `echo $$ > '${pidFile}'; while :; do echo beat >> '${beatFile}'; sleep 0.05; done`,
+                    command: `exec 3> '${fifo}'; echo $$ > '${pidFile}'; while :; do echo beat >> '${beatFile}'; sleep 0.05; done`,
                     timeout: 60,
                   },
                 ],
@@ -484,24 +470,26 @@ describe("fx hook", () => {
         }),
       );
 
+      const hookGone = untilWritersGone(fifo);
       const child = startFx(root, testArgs(), { ignoreInt: true });
-      const fxExited = exitedWithin(child, 30_000);
+      const fxExited = childExited(child);
       try {
-        await waitFor("the hook's pid file", () => existsSync(pidFile), 15_000);
+        await untilChange(root.workspace, () => pidWritten(pidFile));
         const pid = Number(readFileSync(pidFile, "utf8").trim());
-        await waitFor("the hook's first beat", () => lineCount(beatFile) >= 1, 15_000);
+        await untilChange(root.workspace, () => lineCount(beatFile) >= 1);
 
         const beats = lineCount(beatFile);
         child.kill("SIGINT");
         // The hook keeps beating after the SIGINT, so fx neither stopped the hook nor exited.
-        await waitFor("the hook to beat after SIGINT", () => lineCount(beatFile) >= beats + 3, 10_000);
+        await untilChange(root.workspace, () => lineCount(beatFile) >= beats + 3);
         expect(child.exitCode).toBeNull();
         expect(child.signalCode).toBeNull();
         expect(processGroupAlive(pid)).toBe(true);
 
         child.kill("SIGTERM");
         expect(await fxExited).toBe(true);
-        await waitFor("the hook's process group to end", () => !processGroupAlive(pid), 5_000);
+        // Each process the hook started holds the FIFO open, so end of file means all have exited (a group check races the exit).
+        expect(await hookGone).toBe(true);
       } finally {
         if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
       }

@@ -8,9 +8,13 @@
 # design fx implements: a tool's notice joins once its step's results and
 # feedback are in, the notice and a Stop hook's message are marked as fx's own
 # steering so the save keeps them, and a boundary's notes join before the
-# steering the last step ended with.
+# steering the last step ended with. A UserPromptSubmit hook's context is fx's own
+# steering too: it joins the first request, and the save keeps it at boundary 0.
 # saved-turn-today.cfg is fx before a boundary's notes joined ahead of that
 # steering, where a changed runtime context joined after it (NotesFirst).
+# saved-turn-hook-context-today.cfg is fx before the turn-start context was
+# marked: the context joined the prompt with no marker, so the save drops it and
+# the next turn's request does not start with the last one (NextExtendsLast).
 # saved-turn-double-trail.cfg is a known limit, not a defect: when a reply adds
 # a second steering message to a tail the last request already carried, a note
 # joins ahead of the carried one, so that one request differs from the one
@@ -43,6 +47,7 @@ cd "$(dirname "$0")"
 tlc_verdicts "$@" <<'VERDICTS'
 SavedTurn saved-turn -
 SavedTurn saved-turn-today NotesFirst
+SavedTurn saved-turn-hook-context-today NextExtendsLast
 SavedTurn saved-turn-double-trail RequestsExtend
 SavedTurn saved-turn-mutation-notice-inline ResultsTogether
 SavedTurn saved-turn-mutation-notice-plain NothingDropped

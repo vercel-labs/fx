@@ -162,6 +162,19 @@ test "a subagent's report a boundary took is saved whole and replayed as it was"
     try std.testing.expectEqualStrings(report, replayed[0].content.?);
 }
 
+test "a turn-start context message is saved as steering before any step" {
+    const alloc = std.testing.allocator;
+    const messages = [_]types.ChatMessage{.{ .role = .user, .content = "CTX-MARK-7", .recovery_prompt = true }};
+    const memory = try buildExecutionMemory(alloc, &messages);
+    defer types.freeExecutionMemory(alloc, memory);
+    try std.testing.expectEqual(@as(usize, 1), memory.steering.len);
+    try std.testing.expectEqual(@as(usize, 0), memory.steering[0].after_tool_step_count);
+    try std.testing.expect(memory.steering[0].assistant_prefix == null);
+    const expected = try recovery_prompt.saved(alloc, "CTX-MARK-7");
+    defer alloc.free(expected);
+    try std.testing.expectEqualStrings(expected, memory.steering[0].text);
+}
+
 test "parent steering preserves its sender in persisted execution text" {
     const alloc = std.testing.allocator;
     const message = try parentSteeringMessage(alloc, "review this change");

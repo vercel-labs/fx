@@ -10,6 +10,7 @@ const user_hooks = @import("../agent/runtime/user_hooks.zig");
 const types = @import("../shared/types.zig");
 const settings_catalog = @import("../config/settings_catalog.zig");
 const io_mod = @import("../shared/io.zig");
+const testing_listener = @import("../shared/testing_listener.zig");
 const hooks_view = @import("../hooks/hooks.zig");
 const profile_paths = @import("../shared/profile_paths.zig");
 const hooks_host = @import("../hooks_host/hooks_host.zig");
@@ -280,15 +281,11 @@ fn autoChange() Change {
     return .{ .permission_mode = .{ .old = .ask, .target = .auto, .reset = false, .typed = false } };
 }
 
-/// Polls `take` until the check finishes. A check that never finishes fails the test.
+/// Waits for the check to finish, then takes it. A check that never finishes fails the test.
 fn waitTaken(state: *State) !Taken {
-    const io = io_mod.getIo();
-    const deadline = std.Io.Clock.awake.now(io).toMilliseconds() + 5000;
-    while (std.Io.Clock.awake.now(io).toMilliseconds() < deadline) {
-        if (state.take()) |taken| return taken;
-        io_mod.sleep(5 * std.time.ns_per_ms);
-    }
-    return error.CheckDidNotFinish;
+    const job = state.gate.current orelse return error.CheckDidNotFinish;
+    if (!testing_listener.waitFor(&job.done, 5000)) return error.CheckDidNotFinish;
+    return state.take() orelse error.CheckDidNotFinish;
 }
 
 /// Writes the profile hooks file under `home` and starts a runtime on it, with a PATH for the hooks' shell.
