@@ -25,6 +25,7 @@ const skill_runtime = @import("../skills/skill_runtime.zig");
 const types = @import("../shared/types.zig");
 const file_index = @import("../workspace/file_index.zig");
 const statusline_identity = @import("../workspace/statusline_identity.zig");
+const diagnostics = @import("../workspace/diagnostics.zig");
 const activity_runtime = @import("../output/activity_runtime.zig");
 const transcript_presentation = @import("../output/transcript_presentation.zig");
 const event_loop = @import("../../ui/event_loop.zig");
@@ -1014,6 +1015,11 @@ pub fn Runtime(comptime App: type) type {
                         render_requests.visibleAnimationPhase(),
                         render_requests.animation_next_deadline_ms,
                     },
+                );
+                diagnostics.recordRenderEvent(
+                    .commit,
+                    "frame_error err={s} reasons={s} pending_reasons={d}",
+                    .{ @errorName(err), reason_names, render_requests.pendingReasonCount() },
                 );
                 return err;
             };
@@ -3518,6 +3524,8 @@ test "core.app_render_runtime requested-frame flush preserves work injected duri
 }
 
 test "core.app_render_runtime requested-frame flush restores preparation errors" {
+    diagnostics.resetForTest();
+    defer diagnostics.resetForTest();
     var app = CoordinatorFaultTestApp{
         .fault = .preparation_error,
         .injected_reason = .modal,
@@ -3533,6 +3541,16 @@ test "core.app_render_runtime requested-frame flush restores preparation errors"
         error.TestPreparationFailure,
         Runtime(CoordinatorFaultTestApp).flushRequestedFrame(&app, (&app).agent()),
     );
+
+    var render_events: [8]diagnostics.RenderEvent = undefined;
+    const render_event_count = diagnostics.snapshotRenderEvents(&render_events);
+    var found_frame_error = false;
+    for (render_events[0..render_event_count]) |*event| {
+        if (std.mem.startsWith(u8, event.detail(), "frame_error err=TestPreparationFailure")) {
+            found_frame_error = true;
+        }
+    }
+    try std.testing.expect(found_frame_error);
 
     try std.testing.expectEqual(@as(usize, 1), app.attempts);
     try std.testing.expect(app.shell.render_requests.hasReason(.footer));
