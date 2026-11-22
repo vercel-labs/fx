@@ -4787,6 +4787,15 @@ test "processQueuedPrompt traces why stale controls are omitted" {
     try std.testing.expect(std.mem.find(u8, trace, "reasoning=unsupported_or_missing") != null);
     try std.testing.expect(std.mem.find(u8, trace, "fast=unsupported_or_missing") != null);
 
+    // The Gateway drops an effort its catalog does not list, and says so once,
+    // through the same session notice a custom connection uses. Only a custom
+    // connection's settings can add a level, so the Gateway text has no hint.
+    try std.testing.expectEqual(@as(usize, 1), hooks.session_notices.items.len);
+    try std.testing.expectEqualStrings(
+        "Effort stale-tier is not available for provider/no-live-controls, so it is not sent.",
+        hooks.session_notices.items[0],
+    );
+
     // A reachable catalog that simply lacks fast metadata stays quiet; the
     // notice is reserved for a catalog that failed outright.
     var fast_notice_count: usize = 0;
@@ -4794,6 +4803,26 @@ test "processQueuedPrompt traces why stale controls are omitted" {
         if (std.mem.find(u8, text, "Fast mode is unavailable") != null) fast_notice_count += 1;
     }
     try std.testing.expectEqual(@as(usize, 0), fast_notice_count);
+}
+
+test "processQueuedPrompt keeps an effort drop quiet when the Gateway catalog failed" {
+    const alloc = std.testing.allocator;
+    const completions = [_]FakeCompletion{.{ .content = "Done" }};
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    hooks.catalog_failure = .gateway_unavailable;
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+    var config = fixture.config();
+    config.effort = types.ReasoningEffort.literal("stale-tier");
+    var job = fixture.job();
+    job.model = @constCast("provider/no-live-controls");
+
+    try runFakePrompt(&gateway, &hooks, config, job);
+
+    try expectBodyNotContains(&gateway, 0, "\"reasoning\"");
+    try std.testing.expectEqual(@as(usize, 0), hooks.session_notices.items.len);
 }
 
 test "processQueuedPrompt notifies once when fast mode drops on a failed catalog" {
