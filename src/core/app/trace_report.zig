@@ -43,7 +43,7 @@
 //!   {`source`, `refreshable`, `gateway_team`}; `process` {`pid`, `open_fds`,
 //!   and `memory` {`pid`, `ppid`, `rss_kib`, `vsz_kib`, `elapsed`, `stat`}, or
 //!   `memory_lines` with the `ps` output when it has another shape. A crash
-//!   report writes `memory` as the text `skipped` and runs no `ps`}; `worker`
+//!   report writes `memory` as {`status`: `unavailable`} and runs no `ps`}; `worker`
 //!   {`processing`, `queued`, `cancel_requested`, `pending_permission`
 //!   (masked)}; `pending_questions` {`count`, `questions`: the first 3 as
 //!   {`question` (masked), `options`, a count}}; `pending_images` {`count`,
@@ -511,11 +511,11 @@ pub fn formatUtcMinute(buf: []u8, ms: i64) ![]const u8 {
     return std.mem.print(buf, "{s} {s} UTC", .{ iso[0..10], iso[11..16] });
 }
 
-/// A saved crash report that a trace includes.
+/// A saved crash report that a trace includes. A report is included only when it
+/// has a time, so the time is always here.
 pub const IncludedCrash = struct {
-    /// When the crash was saved, in Unix milliseconds, or null when the report
-    /// does not give a time the trace can write.
-    at_ms: ?i64,
+    /// When the crash was saved, in Unix milliseconds.
+    at_ms: i64,
 };
 
 /// A trace, and the saved crash report that it includes, if any.
@@ -764,9 +764,12 @@ fn writeProcess(r: *Records, crash_report: bool) !void {
     try r.number("pid", pid);
     if (countOpenFileDescriptors()) |fd_count| try r.number("open_fds", fd_count);
     // A crash report saves while the terminal is still raw, and nothing bounds
-    // `ps`, so it runs no `ps` and records the memory as skipped.
+    // `ps`, so it runs no `ps` and records the memory as unavailable, the object
+    // with a `status` that `/trace` gives a section it cannot read.
     if (crash_report) {
-        try r.text("memory", "skipped");
+        try r.beginObject("memory");
+        try r.text("status", "unavailable");
+        try r.endObject();
     } else if (processMemorySnapshot(r.arena, pid) catch null) |ps_output| {
         try writeProcessMemory(r, ps_output);
     }
@@ -1131,7 +1134,7 @@ fn writeLastCrash(r: *Records, contents: ?[]const u8, now_ms: i64) !void {
         if (known_at_ms) |ms| try r.time("at", ms);
         return r.end();
     }
-    r.included_crash = .{ .at_ms = known_at_ms };
+    if (known_at_ms) |ms| r.included_crash = .{ .at_ms = ms };
     try r.begin("last_crash");
     try r.text("status", "recorded");
     try textField(r, "error", crash, "error");
@@ -2744,19 +2747,27 @@ pub fn writeFile(alloc: std.mem.Allocator, contents: []const u8) ![]u8 {
     return error.PathAlreadyExists;
 }
 
-/// Saves the crash report to `~/.fx/diagnostics/last-crash.jsonl` and returns
-/// its absolute path, which the caller owns and frees with `app.alloc`. The
-/// file holds the same private data as a `/trace` report, and fx overwrites it
-/// on each crash. A failed write is logged to the debug trace and returned as
-/// its error, so the caller can tell the person.
-pub fn writeCrashReport(app: anytype, err: anyerror) anyerror![]u8 {
+/// A saved crash report: its absolute path, which the caller owns and frees with
+/// `app.alloc`, and whether the disk confirmed the save. `synced` is false when
+/// the report is in place but its folder could not be synced, so a power loss
+/// may lose it.
+pub const SavedCrashReport = struct {
+    path: []u8,
+    synced: bool,
+};
+
+/// Saves the crash report to `~/.fx/diagnostics/last-crash.jsonl`. The file holds
+/// the same private data as a `/trace` report, and fx overwrites it on each crash.
+/// A failed write is logged to the debug trace and returned as its error, so the
+/// caller can tell the person.
+pub fn writeCrashReport(app: anytype, err: anyerror) anyerror!SavedCrashReport {
     return writeCrashReportInner(app, err) catch |write_err| {
         debug_trace.logf("core", "crash report write failed err={s}", .{@errorName(write_err)});
         return write_err;
     };
 }
 
-fn writeCrashReportInner(app: anytype, err: anyerror) ![]u8 {
+fn writeCrashReportInner(app: anytype, err: anyerror) !SavedCrashReport {
     const alloc = app.alloc;
     const home = io_mod.homeDir() orelse return error.NoHomeDir;
     const path = try profile_paths.lastCrashReportPath(alloc, home);
@@ -2769,27 +2780,41 @@ fn writeCrashReportInner(app: anytype, err: anyerror) ![]u8 {
         .dir = try std.Io.Dir.openDirAbsolute(io_mod.getIo(), profile_paths.rootParent(home), .{ .iterate = true }),
     };
     defer home_dir.close();
-    var fx_dir = try io_mod.openOrCreateVerifiedPrivateDir(&home_dir, profile_paths.rootName());
+    var fx_dir = try openCrashFolder(&home_dir, profile_paths.rootName(), error.CrashRootUnsafe);
     defer fx_dir.close();
-    var diagnostics_dir = try io_mod.openOrCreateVerifiedPrivateDir(&fx_dir, profile_paths.diagnostics_dir_name);
+    var diagnostics_dir = try openCrashFolder(&fx_dir, profile_paths.diagnostics_dir_name, error.CrashDiagnosticsUnsafe);
     defer diagnostics_dir.close();
-    try replaceCrashReport(alloc, &diagnostics_dir, report, .{});
-    return path;
+    const synced = try replaceCrashReport(alloc, &diagnostics_dir, report, .{});
+    return .{ .path = path, .synced = synced };
 }
 
-/// Replaces the saved crash report in `diagnostics_dir`. A failure before the
-/// rename returns the error that stopped it, so the person sees its real cause
-/// (for example `NoSpaceLeft`), not the wrapper `DurableReplacePreRenameFailed`.
-fn replaceCrashReport(alloc: std.mem.Allocator, diagnostics_dir: *io_mod.VerifiedDir, report: []const u8, ops: io_mod.DurableOps) !void {
+/// Opens `name` under `parent` as a private folder, as `openOrCreateVerifiedPrivateDir`
+/// does. A link or a non-folder there returns `unsafe`, which names the folder
+/// that failed, so the person is told which path to fix.
+fn openCrashFolder(parent: *io_mod.VerifiedDir, name: []const u8, unsafe: anyerror) !io_mod.VerifiedDir {
+    return io_mod.openOrCreateVerifiedPrivateDir(parent, name) catch |err| {
+        if (err == error.DurablePathUnsafe) return unsafe;
+        return err;
+    };
+}
+
+/// Replaces the saved crash report in `diagnostics_dir` and returns whether the
+/// disk confirmed it. A failure before the rename returns the error that stopped
+/// it, so the person sees its real cause (for example `NoSpaceLeft`), not the
+/// wrapper `DurableReplacePreRenameFailed`. A failure after the rename leaves the
+/// new report in place, so it counts as saved, but not synced. A link or a
+/// non-file at the report's path returns `CrashReportFileUnsafe`.
+fn replaceCrashReport(alloc: std.mem.Allocator, diagnostics_dir: *io_mod.VerifiedDir, report: []const u8, ops: io_mod.DurableOps) !bool {
     var cause: ?anyerror = null;
     var with_cause = ops;
     with_cause.pre_rename_cause = &cause;
-    io_mod.durableReplaceVerifiedWithOps(alloc, diagnostics_dir, profile_paths.last_crash_report_file_name, report, with_cause) catch |err| {
-        if (err == error.DurableReplacePreRenameFailed) {
-            if (cause) |real| return real;
-        }
-        return err;
+    io_mod.durableReplaceVerifiedWithOps(alloc, diagnostics_dir, profile_paths.last_crash_report_file_name, report, with_cause) catch |err| switch (err) {
+        error.DurableReplacePostRenameFailed => return false,
+        error.DurableReplacePreRenameFailed => return cause orelse err,
+        error.DurablePathUnsafe => return error.CrashReportFileUnsafe,
+        else => return err,
     };
+    return true;
 }
 
 // Tests read the records back the way a program would: each line on its own,
@@ -3133,7 +3158,7 @@ test "trace last crash record names the time of the crash it includes" {
     const w = try TestWriter.create();
     defer w.destroy();
     try writeLastCrash(&w.records, timed, crash_test_now_ms);
-    try std.testing.expectEqual(@as(?i64, 1_700_000_000_123), w.records.included_crash.?.at_ms);
+    try std.testing.expectEqual(@as(i64, 1_700_000_000_123), w.records.included_crash.?.at_ms);
 
     const none = try TestWriter.create();
     defer none.destroy();
@@ -3198,6 +3223,44 @@ test "trace crash save returns the cause of a failure before the rename" {
     );
 }
 
+fn failDirSyncAfterRename(_: ?*anyopaque, _: std.Io.Dir) anyerror!void {
+    return error.InjectedSyncFailure;
+}
+
+test "trace crash save counts a report the disk did not sync as saved" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dir = io_mod.VerifiedDir{ .dir = try tmp.dir.openDir(io_mod.getIo(), ".", .{ .iterate = true, .follow_symlinks = false }) };
+    defer dir.close();
+    const synced = try replaceCrashReport(std.testing.allocator, &dir, "report\n", .{ .sync_dir = failDirSyncAfterRename });
+    try std.testing.expect(!synced);
+    const bytes = try tmp.dir.readFileAlloc(std.testing.io, "last-crash.jsonl", std.testing.allocator, .limited(64));
+    defer std.testing.allocator.free(bytes);
+    try std.testing.expectEqualStrings("report\n", bytes);
+}
+
+test "trace crash save names the fx folder when it is a link" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "elsewhere");
+    try tmp.dir.symLink(std.testing.io, "elsewhere", ".fx", .{});
+    var parent = io_mod.VerifiedDir{ .dir = try tmp.dir.openDir(io_mod.getIo(), ".", .{ .iterate = true, .follow_symlinks = false }) };
+    defer parent.close();
+    try std.testing.expectError(error.CrashRootUnsafe, openCrashFolder(&parent, ".fx", error.CrashRootUnsafe));
+}
+
+test "trace crash save names the report file when it is a link" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.symLink(std.testing.io, "missing", "last-crash.jsonl", .{});
+    var dir = io_mod.VerifiedDir{ .dir = try tmp.dir.openDir(io_mod.getIo(), ".", .{ .iterate = true, .follow_symlinks = false }) };
+    defer dir.close();
+    try std.testing.expectError(
+        error.CrashReportFileUnsafe,
+        replaceCrashReport(std.testing.allocator, &dir, "report\n", .{}),
+    );
+}
+
 test "trace time to the minute reads as a UTC clock time" {
     var buf: [32]u8 = undefined;
     try std.testing.expectEqualStrings("2026-11-18 01:42 UTC", try formatUtcMinute(&buf, 1_794_966_120_000));
@@ -3216,7 +3279,7 @@ test "trace last crash record shows a crash one hour old" {
     const crash = try trace.one("last_crash");
     try std.testing.expectEqualStrings("recorded", try testString(crash, "status"));
     try std.testing.expectEqual(@as(usize, 2), trace.count("last_crash_record"));
-    try std.testing.expectEqual(crash_at, w.records.included_crash.?.at_ms.?);
+    try std.testing.expectEqual(crash_at, w.records.included_crash.?.at_ms);
 }
 
 test "trace last crash record leaves out a crash 25 hours old and its records" {
@@ -3399,7 +3462,7 @@ test "trace process memory reads ps output and keeps other shapes as lines" {
     try expectAbsent(process, "memory");
 }
 
-test "trace crash report marks process memory as skipped instead of running ps" {
+test "trace crash report marks process memory as unavailable instead of running ps" {
     const w = try TestWriter.create();
     defer w.destroy();
     try w.records.begin("current_state");
@@ -3408,7 +3471,9 @@ test "trace crash report marks process memory as skipped instead of running ps" 
     var trace = try w.trace();
     defer trace.deinit();
     const process = try testObject(try trace.one("current_state"), "process");
-    try std.testing.expectEqualStrings("skipped", try testString(process, "memory"));
+    const memory = try testObject(process, "memory");
+    try std.testing.expectEqualStrings("unavailable", try testString(memory, "status"));
+    try expectAbsent(memory, "pid");
 }
 
 test "trace process memory still runs ps outside a crash report" {

@@ -89,9 +89,8 @@ fn format_trace_notice(
 }
 
 fn writeIncludedCrash(writer: *std.Io.Writer, included: trace_report.IncludedCrash) !void {
-    const at_ms = included.at_ms orelse return writer.writeAll(" Includes the crash report.");
     var time_buf: [32]u8 = undefined;
-    try writer.print(" Includes the crash report from {s}.", .{try trace_report.formatUtcMinute(&time_buf, at_ms)});
+    try writer.print(" Includes the crash report from {s}.", .{try trace_report.formatUtcMinute(&time_buf, included.at_ms)});
 }
 
 fn persistUserPreferences(
@@ -2426,11 +2425,10 @@ test "trace notice says when the trace includes a crash report and when it was s
     defer std.testing.allocator.free(unavailable);
     try std.testing.expectEqualStrings("Could not create trace.", unavailable);
 
-    const untimed: trace_report.IncludedCrash = .{ .at_ms = null };
-    const copied = try format_trace_notice(std.testing.allocator, .{ .copied_file = report_path }, untimed);
+    const copied = try format_trace_notice(std.testing.allocator, .{ .copied_file = report_path }, timed);
     defer std.testing.allocator.free(copied);
     try std.testing.expectEqualStrings(
-        "Trace copied to clipboard. Review and redact it before sharing. Includes the crash report.",
+        "Trace copied to clipboard. Review and redact it before sharing. Includes the crash report from 2026-11-18 01:42 UTC.",
         copied,
     );
 }
