@@ -2038,9 +2038,16 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
     // The ask ends once its whole tree is quiet: mail that waits when a turn
     // ends runs as the ask's next turn, as one wakes an idle main.
     while (ctx.subagent_host) |tree| {
-        switch (tree.awaitMailOrQuiet(&ctx.worker, ctx.cancelFlag())) {
+        switch (tree.awaitMailOrQuiet(&ctx.worker, ctx.cancelFlag(), true)) {
             .quiet, .stopped => break,
             .mail => {},
+            // fx ask cannot show an approval, and main had its turn: refuse
+            // what it left unanswered, so the subagents resume, report, and
+            // their reports wake main again (`ParentApproval.tla` `Fallback`).
+            .approvals_unanswered => {
+                _ = tree.refuseUnansweredApprovals();
+                continue;
+            },
         }
         // The take marks the turn, so mail posted from then on joins it.
         const turn_id = debug_trace.nextTurnId();

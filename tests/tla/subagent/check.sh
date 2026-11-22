@@ -136,6 +136,39 @@
 # trace driver runs fx along it: the inline tests in tool_host.zig and
 # "a wait that starts as a subagent's work ends with nothing to report still
 # returns" in tests/e2e/gateway-stream-lifecycle.test.ts hold fx in the gap.
+#
+# The ParentApproval configs:
+#
+# ParentApproval models a subagent's approval request reaching main and main
+# answering it (requestChildPermission and registerApproval in
+# src/core/subagent/execution.zig, noteChildApproval and answerApproval in
+# tool_host.zig, the registry in approval_registry.zig, awaitMailOrQuiet and
+# the fx ask loop in src/core/cli/cli_ask.zig). The request is registered
+# before its note is posted, and the mark that counts it noted runs only after
+# the post returned; a failed post refuses it at once. `PostNote` and
+# `MarkNoted` are separate because the ask loop can block between them
+# (`Block`), and only the mark's wake (or the loop's 50 ms re-check, `Wake`)
+# lets it look at the fallback again. approve runs the exact call through
+# main's own check, and fx ask's fallback refuses the waiting requests once
+# main is idle with no mail and the loop is not blocked. parent-approval.cfg
+# is the design and must pass. parent-approval-today.cfg is fx before this
+# change: no note and no approve, so a waiting request is never answered,
+# which TLC reports as a deadlock. Each parent-approval-mutation-*.cfg plants
+# one defect, and the rule or deadlock named for it must catch it:
+#
+#   final-answer  approve resolves allowed without main's check      Authority
+#   note-first    the note is posted before the request is
+#                 registered                                         NoLostApprove
+#   early-stall   the fallback counts a request that is not yet
+#                 noted                                              FallbackOnlyAfterSeen
+#   no-fallback   no fallback: a waiting request stays unanswered    deadlock
+#   note-lost     a failed note leaves the request registered
+#                 and waiting                                        deadlock
+#   no-nudge      the mark does not wake the blocked loop, so a
+#                 request noted after the loop looked is never
+#                 answered                                           deadlock
+#
+# No trace driver runs fx along it yet.
 
 set -eu
 
@@ -201,4 +234,12 @@ QuietRelay quiet-relay-mutation-check-first NoSleepOnMail
 WaitNudge wait-nudge -
 WaitNudge wait-nudge-today deadlock
 WaitNudge wait-nudge-mutation-check-first deadlock
+ParentApproval parent-approval -
+ParentApproval parent-approval-today deadlock
+ParentApproval parent-approval-mutation-final-answer Authority
+ParentApproval parent-approval-mutation-note-first NoLostApprove
+ParentApproval parent-approval-mutation-early-stall FallbackOnlyAfterSeen
+ParentApproval parent-approval-mutation-no-fallback deadlock
+ParentApproval parent-approval-mutation-note-lost deadlock
+ParentApproval parent-approval-mutation-no-nudge deadlock
 VERDICTS

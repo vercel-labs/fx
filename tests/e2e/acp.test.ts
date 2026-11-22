@@ -11643,6 +11643,139 @@ describe("acp: model-independent", () => {
   );
 
   test(
+    "ACP sends a subagent's approval to main, and main's approve asks the client",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-parent-approval-");
+      const target = join(root.workspace, "parent-approved.txt");
+      writeAcpProfile(root.workspace, "writer", {
+        description: "Writes one file",
+        tools: ["write_file"],
+        permission_mode: "ask",
+      });
+      const childBodies: string[] = [];
+      const gateway = startDynamicFakeGateway((body) => {
+        if (!body.includes('"name":"subagent"')) {
+          childBodies.push(body);
+          if (childBodies.length === 1) {
+            return fakeGatewayToolCall("child_write", "write_file", { path: target, content: "ACP_PARENT_APPROVED\n" });
+          }
+          return finalText("CHILD_WROTE");
+        }
+        if (body.includes("I wait for your approval to run") && !body.includes("main_approve")) {
+          return fakeGatewayToolCall("main_approve", "subagent", { action: "approve", agent: "writer" });
+        }
+        if (body.includes("main_approve") && !acpLatestUserIsReport(body)) return finalText("MAIN_APPROVED");
+        if (acpLatestUserIsReport(body)) return finalText("PARENT_DONE");
+        // Main ends the turn that delegated; the child's note wakes its next.
+        if (body.includes("main_delegate")) return finalText("MAIN_SENT");
+        return fakeGatewayToolCall("main_delegate", "subagent", {
+          request: { action: "message", agent: "writer", message: "Write the file." },
+        });
+      });
+      let client: AcpClient | undefined;
+      try {
+        client = await AcpClient.create({ cwd: root.workspace, env: fakeGatewayEnv(root, gateway) });
+        await startAutoSession(client);
+        await client.request("session/set_mode", { modeId: "ask" }, 4);
+        client.setPermissionOption("allow_once");
+
+        const run = await runPrompt(client, "Delegate the write.", TIMEOUT);
+
+        expect(run.promptResult.result.stopReason).toBe("end_turn");
+        // The client is asked about the child's waiting call, which main's own
+        // check put in front of it (RULES.md R4.1, R4.3).
+        const permissions = run.messages.filter(
+          (message: any) => message.method === "session/request_permission",
+        );
+        expect(permissions).toHaveLength(1);
+        expect(permissions[0]!.params.toolCall.toolCallId).toBe("child_write");
+        expect(permissions[0]!.params.toolCall.name).toBe("write_file");
+        expect(permissions[0]!.params.toolCall.rawInput).toEqual({
+          path: target,
+          content: "ACP_PARENT_APPROVED\n",
+        });
+        // The child's call is published as a pending tool call under the same
+        // id before the request, so the client can place the question on it.
+        const pendingIndex = run.messages.findIndex(
+          (message: any) =>
+            message.params?.update?.toolCallId === "child_write" &&
+            message.params.update.status === "pending",
+        );
+        const permissionIndex = run.messages.indexOf(permissions[0]!);
+        expect(pendingIndex).toBeGreaterThanOrEqual(0);
+        expect(pendingIndex).toBeLessThan(permissionIndex);
+        expect(readFileSync(target, "utf8")).toBe("ACP_PARENT_APPROVED\n");
+        expect(childBodies).toHaveLength(2);
+        expect(client.stderr).toBe("");
+      } finally {
+        await client?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "ACP sends a subagent's approval to main, and the client's rejection stops the child",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-parent-approval-reject-");
+      const target = join(root.workspace, "parent-rejected.txt");
+      writeAcpProfile(root.workspace, "writer", {
+        description: "Writes one file",
+        tools: ["write_file"],
+        permission_mode: "ask",
+      });
+      const childBodies: string[] = [];
+      const gateway = startDynamicFakeGateway((body) => {
+        if (!body.includes('"name":"subagent"')) {
+          childBodies.push(body);
+          if (childBodies.length === 1) {
+            return fakeGatewayToolCall("child_write", "write_file", { path: target, content: "ACP_PARENT_REJECTED\n" });
+          }
+          return finalText(body.includes("Permission denied by user") ? "CHILD_SAW_DENY" : "CHILD_NO_DENY");
+        }
+        if (body.includes("I wait for your approval to run") && !body.includes("main_approve")) {
+          return fakeGatewayToolCall("main_approve", "subagent", { action: "approve", agent: "writer" });
+        }
+        if (body.includes("main_approve") && !acpLatestUserIsReport(body)) return finalText("MAIN_APPROVED");
+        if (acpLatestUserIsReport(body)) return finalText("PARENT_DONE");
+        // Main ends the turn that delegated; the child's note wakes its next.
+        if (body.includes("main_delegate")) return finalText("MAIN_SENT");
+        return fakeGatewayToolCall("main_delegate", "subagent", {
+          request: { action: "message", agent: "writer", message: "Write the file." },
+        });
+      });
+      let client: AcpClient | undefined;
+      try {
+        client = await AcpClient.create({ cwd: root.workspace, env: fakeGatewayEnv(root, gateway) });
+        await startAutoSession(client);
+        await client.request("session/set_mode", { modeId: "ask" }, 4);
+        client.setPermissionOption("reject_once");
+
+        const run = await runPrompt(client, "Delegate the write.", TIMEOUT);
+
+        expect(run.promptResult.result.stopReason).toBe("end_turn");
+        const permissions = run.messages.filter(
+          (message: any) => message.method === "session/request_permission",
+        );
+        expect(permissions).toHaveLength(1);
+        expect(permissions[0]!.params.toolCall.toolCallId).toBe("child_write");
+        expect(existsSync(target)).toBe(false);
+        expect(childBodies).toHaveLength(2);
+        // The child reads the client's refusal as its action's result.
+        expect(childBodies[1]!).toContain("Permission denied by user");
+        expect(client.stderr).toBe("");
+      } finally {
+        await client?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
     "ACP gives a resumed subagent the prompt of its session's workspace, though fx acp started elsewhere",
     async () => {
       const root = createIsolatedRoot("fx-acp-session-profile-resume-");

@@ -2931,6 +2931,36 @@ fn subagentProviderRefusal(
     return .{ .status = .failure, .body = try why.body(alloc) };
 }
 
+/// Checks a subagent's waiting call as main's own, for `answerApproval`
+/// (`Runtime.ApprovalCheck`). It borrows the caller's tool context, which
+/// this provider call keeps alive while `executeManaged` runs.
+const SubagentApprovalCheck = struct {
+    runtime: Context,
+
+    fn check(raw: *anyopaque, arena: Allocator, call: ToolCall) anyerror!?[]const u8 {
+        const self: *SubagentApprovalCheck = @ptrCast(@alignCast(raw));
+        const ctx = self.runtime;
+        // A name this context cannot resolve is refused, not allowed:
+        // `requestPermissionOutcome` allows a name it has no contract for as
+        // its not-registered default, and the child's own admission runs the
+        // action, so allowing it would grant what main never saw (RULES.md
+        // R4.3). An MCP tool main does not advertise is such a name, since
+        // the child's profile may select servers main never did.
+        if (ctx.tool_registry.lookup(call.name) == null and
+            !containsName(ctx.advertised_dynamic_tool_names, call.name))
+        {
+            return try arena.dupe(u8, "main's permissions cannot check this action");
+        }
+        // No selected MCP view is passed: a dynamic tool is checked as an
+        // advertised name of main's, and one it does not advertise is refused
+        // above, so nothing is checked through a view this path cannot supply.
+        return switch (try checkNestedCall(ctx, arena, call, null)) {
+            .allow => null,
+            .deny => |message| message,
+        };
+    }
+};
+
 fn executeSubagentProvider(
     raw_context: ?*anyopaque,
     arena: Allocator,
@@ -2945,6 +2975,9 @@ fn executeSubagentProvider(
         return subagentProviderRefusal(arena, .{ .caller_unavailable = .unidentified });
     const identity_epoch = host.issueOperationIdentity(invocation_id);
     var progress_bridge = SubagentProgressBridge.init(arena, ctx, state.call);
+    // The parent's answer checks the subagent's waiting call as main's own,
+    // with the permission context this call runs under.
+    var approval_check = SubagentApprovalCheck{ .runtime = ctx };
     const output = host.executeManaged(arena, request, .{
         .observer = ctx.observer,
         .caller_id = caller_id,
@@ -2966,6 +2999,7 @@ fn executeSubagentProvider(
         .identity_epoch = identity_epoch,
         .cancel_flag = runtimeCancelFlag(ctx),
         .caller_worker = ctx.worker,
+        .approval_check = .{ .context = &approval_check, .check_fn = SubagentApprovalCheck.check },
         .progress = if (progress_bridge) |*bridge| bridge.sink() else null,
         .model_capability_resolver = ctx.model_capability_resolver,
         .model_override_resolver = ctx.model_override_resolver,

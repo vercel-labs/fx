@@ -182,6 +182,11 @@ pub const Owner = struct {
     services: execution.Services,
     authority_resolver: *authority.Resolver,
     approvals: *approval_registry.Registry,
+    /// Told when a child's approval request is registered, so its parent hears.
+    approval_note: ?struct {
+        context: *anyopaque,
+        note_fn: *const fn (*anyopaque, []const u8, []const u8, []const u8) bool,
+    } = null,
     max_history_turns: usize = 8,
     mutex: std.Io.Mutex = .init,
     waiters_changed: std.Io.Condition = .init,
@@ -1403,6 +1408,10 @@ fn runOne(slot: *Slot) OneOutcome {
     turn.active_work_id = snapshot.active.id;
     turn.phase_context = owner;
     turn.phase_fn = Owner.phaseTransition;
+    if (owner.approval_note) |hook| {
+        turn.approval_note_context = hook.context;
+        turn.approval_note_fn = hook.note_fn;
+    }
     turn.live_metrics = &slot.metrics;
     // The interactive app runs the turn on the child's own agent. Bound before
     // `slot.worker` is read, so cancel, steering, and approvals reach it.
@@ -2002,7 +2011,7 @@ const CancellationJoinTest = struct {
         const turn = self.turn.?;
         Owner.phaseTransition(self.owner, "child", "work", .awaiting_approval) catch
             return error.PermissionRegistrationFailed;
-        self.owner.approvals.registerTool("approval", "child", "parent", "work", request, &.{}, turn.approval_worker_route.?, 1) catch
+        self.owner.approvals.registerTool("approval", "child", "parent", "work", request, .{ .id = "call-1", .name = "shell", .arguments_json = "{}" }, &.{}, turn.approval_worker_route.?, 1) catch
             return error.PermissionRegistrationFailed;
         self.request_id = request.id;
         self.registered.set(io_mod.getIo());
@@ -2258,6 +2267,7 @@ test "worker detach invalidates approval routes before worker deinit" {
         "root",
         "work",
         .{ .id = 9, .label = "review" },
+        .{ .id = "call-1", .name = "shell", .arguments_json = "{}" },
         &.{},
         route,
         1,

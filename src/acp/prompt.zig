@@ -3368,9 +3368,12 @@ fn runReportTurns(
 ) !?TerminalOutcome {
     const tree = state.subagent_host orelse return null;
     while (true) {
-        switch (tree.awaitMailOrQuiet(&state.worker, &session.cancel_flag)) {
+        switch (tree.awaitMailOrQuiet(&state.worker, &session.cancel_flag, false)) {
             .quiet, .stopped => return null,
             .mail => {},
+            // ACP never asks for the fallback: a person can still answer the
+            // approval there, so it keeps waiting.
+            .approvals_unanswered => {},
         }
         const next = state.worker.takeQueuedPrompt(std.heap.c_allocator) orelse continue;
         defer worker_runtime.freeQueuedPrompt(std.heap.c_allocator, next);
