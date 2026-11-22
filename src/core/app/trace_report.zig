@@ -69,8 +69,8 @@
 //! - `last_shutdown`: `status` (`recorded`, `none`, or `unreadable`),
 //!   `total_ms`, `recorded_at`, and `stages`, a list of {`name`, `step_ms`}.
 //! - `last_crash`: `status` (`recorded`, `none`, `too_large`, `unreadable`, `stale`, `future`, or `undated`), the crash
-//!   report that `writeCrashReport` saved. `none` also covers a file that
-//!   cannot be read. When `recorded`: `error` and `message` (from the
+//!   report that `writeCrashReport` saved. A missing file is `none`, and a file
+//!   that cannot be read is `unreadable`. When `recorded`: `error` and `message` (from the
 //!   `fatal_error` record), `at` and `at_ms`, `fx_version` and `git_commit`
 //!   (from the header), `records` (the lines embedded), and `skipped` (the
 //!   lines that are not JSON objects). Then a `last_crash_record` per embedded
@@ -2740,12 +2740,12 @@ pub fn writeFile(alloc: std.mem.Allocator, contents: []const u8) ![]u8 {
 /// Saves the crash report to `~/.fx/diagnostics/last-crash.jsonl` and returns
 /// its absolute path, which the caller owns and frees with `app.alloc`. The
 /// file holds the same private data as a `/trace` report, and fx overwrites it
-/// on each crash. It never returns an error: a failed write is logged to the
-/// debug trace and returns null.
-pub fn writeCrashReport(app: anytype, err: anyerror) ?[]u8 {
+/// on each crash. A failed write is logged to the debug trace and returned as
+/// its error, so the caller can tell the person.
+pub fn writeCrashReport(app: anytype, err: anyerror) anyerror![]u8 {
     return writeCrashReportInner(app, err) catch |write_err| {
         debug_trace.logf("core", "crash report write failed err={s}", .{@errorName(write_err)});
-        return null;
+        return write_err;
     };
 }
 
