@@ -772,6 +772,8 @@ pub fn clearTranscript(self: anytype, alloc: Allocator) void {
         if (self.transcript_window) |*window| window.reset(alloc);
         if (comptime @hasDecl(@TypeOf(self.*), "discardTranscriptArchive")) self.discardTranscriptArchive();
     }
+    // This call frees every entry, so the hold ends here, with or without a window.
+    if (comptime @hasField(@TypeOf(self.*), "unpainted_resume_hold")) self.unpainted_resume_hold = false;
     for (self.notebook.folded_command_blocks.items) |*block| block.deinit(alloc);
     self.notebook.folded_command_blocks.clearRetainingCapacity();
     for (self.notebook.command_output_blocks.items) |*block| block.deinit(alloc);

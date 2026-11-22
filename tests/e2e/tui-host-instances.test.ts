@@ -7,6 +7,7 @@ import {
   composerContains,
   FAKE_GATEWAY_MODEL,
   fakeGatewaySse,
+  heldFakeGatewayFinalText,
   startDynamicFakeGateway,
   TmuxSession,
   tmuxAvailable,
@@ -2441,6 +2442,77 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
       }
     },
     TIMEOUT * 2,
+  );
+
+  test(
+    "a resumed instance whose unfinished request writes rows while hidden keeps every row when first shown",
+    async () => {
+      const home = createIsolatedTestHome();
+      const workspace = realpathSync(mkdtempSync(join(tmpdir(), "fx-host-resumed-instance-")));
+      const held = heldFakeGatewayFinalText();
+      try {
+        // The saved reply is taller than the screen, so its rows reach the
+        // screen only through scrollback.
+        const rows = Array.from({ length: 300 }, (_, index) => `INST-ROW-${String(index + 1).padStart(4, "0")}`);
+        const news = Array.from({ length: 12 }, (_, index) => `INST-NEW-${String(index + 1).padStart(2, "0")}`);
+        const rowReply = rows.map((marker, index) => `${marker} reply row ${index + 1}: a line kept for the scrollback check.`).join("\n\n");
+        const newReply = news.map((marker) => `${marker} written while the instance is hidden.`).join("\n\n");
+        let followHeld = false;
+        let resumedSent = false;
+        const respond = (body: string): Response => {
+          const latest = userTexts(body).at(-1) ?? "";
+          if (latest.includes("<session_resumed>")) {
+            resumedSent = true;
+            return text("inst_new", newReply);
+          }
+          if (latest.includes("INST_FOLLOW")) {
+            followHeld = true;
+            return held.response;
+          }
+          if (latest.includes("INST_ROW_TASK")) return text("inst_rows", rowReply);
+          return echoMarker(body);
+        };
+        // Main saves a turn. Instance 2 saves its rows, then opens a request
+        // the gateway holds open, and fx quits with that request unfinished.
+        await withHost(respond, { remainOnExit: true, reuse: { home, workspace } }, async ({ session }) => {
+          await promptMarker(session, "MAIN_FIRST");
+          await session.sendText("/launch");
+          await session.waitForPane((pane) => pane.includes("fx 2/2"), 15_000);
+          await session.waitForComposer(15_000);
+          await session.sendText("INST_ROW_TASK write the rows");
+          await session.waitForText("INST-ROW-0300", 60_000);
+          await session.waitForComposer(15_000);
+          await session.sendText("INST_FOLLOW keep this request open");
+          await waitUntil("the held request to reach the gateway", () => followHeld, 60_000, session);
+          // A crash leaves the request unfinished, so the next --resume sends it again.
+          process.kill(session.processPid(), "SIGKILL");
+          await waitUntil("fx to exit after SIGKILL", () => session.paneStatus().dead, 15_000, session);
+        });
+        const mainId = sessionHolding(home, "DONE_MAIN_FIRST")!;
+        const instanceId = sessionHolding(home, "INST-ROW-0300")!;
+        expect(instanceId).not.toBe(mainId);
+
+        // Resuming main restores instance 2 hidden. Its unfinished request
+        // sends again at once, and it writes the new rows while main is on
+        // screen.
+        await withHost(respond, { args: `--resume ${mainId}`, reuse: { home, workspace } }, async ({ session }) => {
+          await session.waitForPane((pane) => pane.includes("DONE_MAIN_FIRST"), 30_000);
+          await session.waitForComposer(15_000);
+          await waitUntil("the restored instance to save its new rows", () => sessionHolding(home, news.at(-1)!) === instanceId, 120_000, session);
+          await switchAgent(session, 2);
+          await session.waitForStableScrollback((scrollback) => scrollback.includes(news.at(-1)!), 30_000);
+          const scrollback = await session.captureFullScrollback();
+          const lost = [...rows, ...news].filter((marker) => !scrollback.includes(marker));
+          expect({ lost: lost.join(" ") }).toEqual({ lost: "" });
+        });
+        expect(resumedSent).toBe(true);
+      } finally {
+        held.dispose();
+        cleanupIsolatedTestHome(home);
+        rmSync(workspace, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT * 3,
   );
 
   test(

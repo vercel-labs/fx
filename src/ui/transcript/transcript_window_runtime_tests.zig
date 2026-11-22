@@ -1288,3 +1288,84 @@ test "a resumed transcript that leaves the screen before its repaint lets its wi
     try std.testing.expect(holds(&runtime, "HIDDEN_TURN"));
     try expectWindowMatchesEntries(&runtime);
 }
+
+test "a resumed transcript released before its first paint keeps the cycle before the newest compaction until that paint" {
+    const alloc = std.testing.allocator;
+    var runtime = testRuntime(alloc);
+    defer runtime.deinit(alloc);
+    var metrics: types.Metrics = .{};
+    try runtime.enableTranscriptWindow(alloc, true);
+    try runTurn(alloc, &runtime, &metrics, "BEFORE_COMPACT", "ANSWER\n");
+    runtime.notebook.pending_resume_source = try source_preparation.prepareFullTranscriptViewportSource(
+        &runtime,
+        alloc,
+        try alloc.dupe(u8, runtime.notebook.transcript.items),
+    );
+    try runtime.transcriptWindowResumed(alloc, true);
+
+    // The child is hidden, so its flow is released before any frame paints it.
+    try std.testing.expect(runtime.releaseUnpaintedResumeSource(alloc) > 0);
+    try std.testing.expect(runtime.notebook.pending_resume_source == null);
+    try std.testing.expect(runtime.unpainted_resume_hold);
+
+    // A turn ends while hidden. The drop of the cycle is held, and the new turn stays.
+    try runTurn(alloc, &runtime, &metrics, "HIDDEN_TURN", "REPLY\n");
+    try std.testing.expect(holds(&runtime, "BEFORE_COMPACT"));
+    try std.testing.expect(holds(&runtime, "HIDDEN_TURN"));
+
+    // The first show clears the screen and replays the entries, so the cycle is still among them.
+    try runtime.transcriptWindowScreenCleared(alloc);
+    try std.testing.expect(holds(&runtime, "BEFORE_COMPACT"));
+
+    // The first paint shows the entries with their rows in terminal history, and it ends the hold.
+    var first_paint = try transcriptFrame(alloc, &runtime, null, .all);
+    defer first_paint.deinit(alloc);
+    runtime.consumeTranscriptTransition(alloc, &first_paint, committedFrameResult());
+    try std.testing.expect(runtime.transcript_commit_state == .stable);
+    try std.testing.expect(!runtime.unpainted_resume_hold);
+
+    // After the paint, the held drop applies at the next sync, as in a painted transcript.
+    try runtime.syncTranscriptWindow(alloc);
+    try std.testing.expect(!holds(&runtime, "BEFORE_COMPACT"));
+
+    // The next turn keeps the cycle dropped.
+    try runTurn(alloc, &runtime, &metrics, "NEXT_TURN", "REPLY\n");
+    try std.testing.expect(!holds(&runtime, "BEFORE_COMPACT"));
+    try std.testing.expect(holds(&runtime, "NEXT_TURN"));
+    try expectWindowMatchesEntries(&runtime);
+}
+
+test "a resumed transcript released before its first paint keeps the cycle before the newest compaction through a visual epoch reset" {
+    const alloc = std.testing.allocator;
+    var runtime = testRuntime(alloc);
+    defer runtime.deinit(alloc);
+    var metrics: types.Metrics = .{};
+    try runtime.enableTranscriptWindow(alloc, true);
+    try runTurn(alloc, &runtime, &metrics, "BEFORE_COMPACT", "ANSWER\n");
+    runtime.notebook.pending_resume_source = try source_preparation.prepareFullTranscriptViewportSource(
+        &runtime,
+        alloc,
+        try alloc.dupe(u8, runtime.notebook.transcript.items),
+    );
+    try runtime.transcriptWindowResumed(alloc, true);
+
+    // The child is hidden, so its flow is released before any frame paints it.
+    try std.testing.expect(runtime.releaseUnpaintedResumeSource(alloc) > 0);
+    try runTurn(alloc, &runtime, &metrics, "HIDDEN_TURN", "REPLY\n");
+    try std.testing.expect(holds(&runtime, "BEFORE_COMPACT"));
+
+    // Ctrl+L runs a visual epoch reset before the first paint, and it must not end the hold.
+    try runtime.resetVisualEpoch(alloc, "welcome\n");
+    try std.testing.expect(runtime.unpainted_resume_hold);
+    try runtime.syncTranscriptWindow(alloc);
+    try std.testing.expect(holds(&runtime, "BEFORE_COMPACT"));
+
+    // The first paint ends the hold, and the next sync drops the cycle.
+    var first_paint = try transcriptFrame(alloc, &runtime, null, .all);
+    defer first_paint.deinit(alloc);
+    runtime.consumeTranscriptTransition(alloc, &first_paint, committedFrameResult());
+    try std.testing.expect(!runtime.unpainted_resume_hold);
+    try runtime.syncTranscriptWindow(alloc);
+    try std.testing.expect(!holds(&runtime, "BEFORE_COMPACT"));
+    try expectWindowMatchesEntries(&runtime);
+}

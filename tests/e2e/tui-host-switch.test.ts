@@ -3222,6 +3222,82 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
     TIMEOUT,
   );
 
+  // A subagent resumed in this process builds its view while main is on
+  // screen. Its first show, while the follow-up's shell call still runs, must
+  // keep every row in scrollback.
+  test(
+    "a resumed subagent shown for the first time keeps every row in scrollback",
+    async () => {
+      const rowMarkers = Array.from({ length: 300 }, (_, index) => `ROW-${String(index + 1).padStart(4, "0")}`);
+      const followMarkers = Array.from({ length: 12 }, (_, index) => `FOLLOW-L${String(index + 1).padStart(2, "0")}`);
+      const rowReply = rowMarkers
+        .map((marker, index) => `${marker} reviewer row ${index + 1}: a final-reply line kept for the scrollback check.`)
+        .join("\n\n");
+      const followUp = followMarkers
+        .map((marker, index) => `${marker} ${index === 0 ? "FOLLOWUP_TASK keep the second batch running." : "follow-up line."}`)
+        .join("\n");
+      let slowCallServed = false;
+      let gateFile = "";
+      await withFx(async (body) => {
+        if (!isMainRequest(body)) {
+          if (latestUserText(body).includes("FOLLOWUP_TASK")) {
+            if (body.includes('"follow_slow"')) return text("follow_done", "FOLLOWUP_DONE");
+            slowCallServed = true;
+            // The loop stops after 1200 checks, so a failed test cannot leave the call running.
+            return toolCall("follow_slow", "shell", {
+              request: { action: "run", command: `i=0; while [ ! -e '${gateFile}' ] && [ "$i" -lt 1200 ]; do sleep 0.1; i=$((i + 1)); done; echo SLOW-DONE`, yield_time_ms: 150_000 },
+            });
+          }
+          return text("row_done", rowReply);
+        }
+        if (latestUserText(body).includes("ROW_FOLLOWUP")) {
+          if (!body.includes('"main_followup"')) {
+            return toolCall("main_followup", "subagent", {
+              request: { action: "message", agent: "reviewer", message: followUp, report: "never" },
+            });
+          }
+          return text("main_two", "SWITCH_MAIN_TWO");
+        }
+        if (!body.includes('"main_start_row"')) {
+          return toolCall("main_start_row", "subagent", {
+            request: { action: "message", agent: "reviewer", message: "ROW_TASK write the transcript rows", report: "never" },
+          });
+        }
+        return text("main_one", "SWITCH_MAIN_ONE");
+      }, async (session, { home, launch, workspace }) => {
+        gateFile = join(workspace, "reviewer-slow-gate");
+        await session.sendText("SWITCH_USER ROW_START start the reviewer");
+        await session.waitForText("SWITCH_MAIN_ONE", 60_000);
+        // The resume must see the whole first turn, so wait until its last row is saved.
+        await until("the reviewer's first turn to be saved", () => sessionsHolding(home, "ROW-0300").length > 0, 60_000);
+        await session.sendText("/quit");
+        expect(await session.waitForSessionEnd(15_000)).toBe(true);
+        const parents = sessionsHolding(home, "SWITCH_MAIN_ONE");
+        expect(parents).toHaveLength(1);
+
+        const resumed = await launch(`--resume ${parents[0]}`);
+        await resumed.waitForText("SWITCH_MAIN_ONE", 30_000);
+        await resumed.sendText("SWITCH_USER ROW_FOLLOWUP send the reviewer a follow-up");
+        await resumed.waitForText("SWITCH_MAIN_TWO", 60_000);
+        await until("the follow-up's shell call to be served", () => slowCallServed, 90_000);
+        await showAgent(resumed, "reviewer");
+        await resumed.waitForPane((pane) => pane.includes("\u2503 FOLLOW-L01") && !pane.includes(LIST_HINT), 20_000);
+        // The follow-up's answer comes only after its shell call returns. The call
+        // waits for a gate file that this test creates after this check, so the
+        // pane shows the switch made while the call still ran. The call's command
+        // text contains SLOW-DONE, so that marker cannot show absence.
+        expect(await resumed.capturePane()).not.toContain("FOLLOWUP_DONE");
+        writeFileSync(gateFile, "");
+        await resumed.waitForStableScrollback((scrollback) => scrollback.includes("FOLLOW-L12"), 30_000);
+
+        const scrollback = await resumed.captureFullScrollback();
+        const lost = [...rowMarkers, ...followMarkers].filter((marker) => !scrollback.includes(marker));
+        expect({ lost: lost.join(" ") }).toEqual({ lost: "" });
+      });
+    },
+    TIMEOUT,
+  );
+
   test(
     "Delete, then Delete again, in the agent list closes a working subagent for good: main hears the user closed it, and a resume doesn't bring it back",
     async () => {

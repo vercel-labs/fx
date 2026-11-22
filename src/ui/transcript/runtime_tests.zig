@@ -9599,8 +9599,10 @@ test "clearTranscript frees entries and command output blocks" {
     try runtime.writeCommandOutputChunk(alloc, &metrics, styles, .stdout, "hidden-command-line\n", true);
     try runtime.flushCommandOutputSummary(alloc, &metrics, styles, true);
 
+    runtime.unpainted_resume_hold = true;
     runtime.clearTranscript(alloc);
 
+    try std.testing.expect(!runtime.unpainted_resume_hold);
     try std.testing.expectEqual(@as(usize, 0), runtime.notebook.entries.items.len);
     try std.testing.expectEqual(@as(usize, 0), runtime.notebook.folded_command_blocks.items.len);
     try std.testing.expectEqual(@as(usize, 0), runtime.notebook.command_output_blocks.items.len);
