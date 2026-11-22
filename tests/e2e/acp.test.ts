@@ -742,6 +742,10 @@ class AcpClient {
     return this._closed;
   }
 
+  get exited(): boolean {
+    return this._closed || this.proc.exitCode !== null;
+  }
+
   setPermissionOption(optionId: "allow_once" | "allow_always" | "reject_once"): void {
     this.permissionOptionId = optionId;
   }
@@ -1196,6 +1200,52 @@ test("ACP shell completed and replayed updates show the command output", async (
     const loaded = await client.request("session/load", { sessionId: created.result.sessionId, cwd: fixture.workspace, mcpServers: [] }, 2) as any;
     if (loaded.error) throw new Error(JSON.stringify(loaded));
     expect(shellText(client.rawLines.map(line => JSON.parse(line)))).toEqual([expected]);
+    expect(client.stderr).toBe("");
+  } finally {
+    await client?.close();
+    fixture.close();
+  }
+}, 45000);
+
+test("ACP exits cleanly at stdin close while a shell command it started is still running", async () => {
+  const fixture = createConfiguredProviderFixture(body => body.messages.some((message: any) => message.role === "tool")
+    ? configuredCompletion(body.model, "done")
+    : configuredToolCompletion(body.model, "shell", { request: { action: "run", yield_time_ms: 300, command: "printf PARTIAL; exec sleep 30" } }, "call_shell"));
+  let client: AcpClient | undefined;
+  try {
+    client = await AcpClient.create({ cwd: fixture.workspace, env: fixture.env });
+    await client.request("initialize", { protocolVersion: 1 }, 1);
+    const created = await client.request("session/new", { cwd: fixture.workspace, mcpServers: [] }, 2) as any;
+    if (created.error) throw new Error(JSON.stringify(created));
+    await client.request("session/set_mode", { modeId: "full-access" }, 3);
+    const prompt = await runPrompt(client, "Start the command.", TIMEOUT);
+    expect(prompt.promptResult.result.stopReason).toBe("end_turn");
+    client.endStdin();
+    expect(await client.waitForExit()).toBe(0);
+    expect(client.stderr).toBe("");
+  } finally {
+    await client?.close();
+    fixture.close();
+  }
+}, 45000);
+
+test("ACP stays alive when a shell command prints after its prompt ended", async () => {
+  const fixture = createConfiguredProviderFixture(body => body.messages.some((message: any) => message.role === "tool")
+    ? configuredCompletion(body.model, "done")
+    : configuredToolCompletion(body.model, "shell", { request: { action: "run", yield_time_ms: 300, command: "for i in 1 2 3 4 5 6; do echo LATE$i; sleep 0.5; done; touch late-output.done" } }, "call_shell"));
+  let client: AcpClient | undefined;
+  try {
+    client = await AcpClient.create({ cwd: fixture.workspace, env: fixture.env });
+    await client.request("initialize", { protocolVersion: 1 }, 1);
+    const created = await client.request("session/new", { cwd: fixture.workspace, mcpServers: [] }, 2) as any;
+    if (created.error) throw new Error(JSON.stringify(created));
+    await client.request("session/set_mode", { modeId: "full-access" }, 3);
+    const prompt = await runPrompt(client, "Start the command.", TIMEOUT);
+    expect(prompt.promptResult.result.stopReason).toBe("end_turn");
+    await waitForCondition("the late command to finish", () => existsSync(join(fixture.workspace, "late-output.done")), 15_000);
+    expect(client.exited).toBe(false);
+    client.endStdin();
+    expect(await client.waitForExit()).toBe(0);
     expect(client.stderr).toBe("");
   } finally {
     await client?.close();
