@@ -653,11 +653,30 @@ fn reportCrashReport(deps: RunDeps, outcome: CrashReportOutcome) void {
         .saved => |path| reportCrashReportPath(deps, path),
         .not_saved => |err| {
             var buffer: [512]u8 = undefined;
-            // Error names are short, so the line always fits the buffer.
-            const message = std.mem.print(&buffer, "fx: crash report not saved ({s})\n", .{@errorName(err)}) catch return;
-            writeStderr(deps, message);
+            writeStderr(deps, crashReportNotSavedText(&buffer, err));
         },
     }
+}
+
+/// The line that says why a crash report was not saved: the next step when fx
+/// knows one, else the error's name. Error names are short, so the name always
+/// fits `buffer`; the fallback is the same line without the name.
+fn crashReportNotSavedText(buffer: []u8, err: anyerror) []const u8 {
+    if (crashReportSaveFaultMessage(err)) |message| return message;
+    return std.mem.print(buffer, "fx: crash report not saved ({s})\n", .{@errorName(err)}) catch "fx: crash report not saved\n";
+}
+
+/// The next step for a save error the person can fix, in one sentence, as
+/// `v2StorageFaultMessage` gives for a session; null for any other error.
+fn crashReportSaveFaultMessage(err: anyerror) ?[]const u8 {
+    return switch (err) {
+        error.AccessDenied => profile_paths.displayText("fx: crash report not saved: permission denied. Check the permissions under ~/.fx/diagnostics, then reproduce the error.\n"),
+        error.ReadOnlyFileSystem => "fx: crash report not saved: the disk is read-only. Make it writable, then reproduce the error.\n",
+        error.NoSpaceLeft, error.DiskQuota => "fx: crash report not saved: the disk is full. Free some space, then reproduce the error.\n",
+        error.DurablePathUnsafe => profile_paths.displayText("fx: crash report not saved: a file or folder in ~/.fx/diagnostics is a link, or is not a folder. Remove it, then reproduce the error.\n"),
+        error.NoHomeDir => "fx: crash report not saved: HOME is not set, or is not a full path. Set HOME, then reproduce the error.\n",
+        else => null,
+    };
 }
 
 /// Says where the crash report was saved. A path too long for the buffer is
@@ -1532,7 +1551,7 @@ test "app entry says the crash report was not saved, after the error and the ter
     capture.crash_report_error = error.AccessDenied;
 
     try std.testing.expectError(error.TestRunFailed, runWithOuterCleanup(TestApp, alloc, &.{}, testConfig(), capture.deps()));
-    try std.testing.expectEqualStrings("fx: test run failed\nfx: crash report not saved (AccessDenied)\n", capture.stderr.written());
+    try std.testing.expectEqualStrings("fx: test run failed\nfx: crash report not saved: permission denied. Check the permissions under ~/.fx/diagnostics, then reproduce the error.\n", capture.stderr.written());
     try std.testing.expectEqual(@as(usize, 2), capture.stderr_calls);
     try expectEvents(&.{ "init:none", "rebind-after-init", "auto-upgrade", "file-index", "worker-thread", "model-cache", "run", "crash-report", "terminal-release", "stderr-attempt", "stderr-attempt", "deinit", "outer-defer" });
 }
@@ -1546,9 +1565,22 @@ test "app entry says the crash report was not saved when a worker thread fails t
     capture.crash_report_error = error.AccessDenied;
 
     try std.testing.expectError(error.TestWorkerStartFailed, runWithDeps(TestApp, alloc, &.{}, testConfig(), capture.deps()));
-    try std.testing.expectEqualStrings("fx: test worker start failed\nfx: crash report not saved (AccessDenied)\n", capture.stderr.written());
+    try std.testing.expectEqualStrings("fx: test worker start failed\nfx: crash report not saved: permission denied. Check the permissions under ~/.fx/diagnostics, then reproduce the error.\n", capture.stderr.written());
     try std.testing.expectEqual(@as(usize, 2), capture.stderr_calls);
     try expectEvents(&.{ "init:none", "rebind-after-init", "auto-upgrade", "file-index", "worker-thread", "crash-report", "terminal-release", "stderr-attempt", "stderr-attempt", "deinit" });
+}
+
+test "crash report not saved names the next step for a full disk" {
+    var buffer: [512]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "fx: crash report not saved: the disk is full. Free some space, then reproduce the error.\n",
+        crashReportNotSavedText(&buffer, error.NoSpaceLeft),
+    );
+}
+
+test "crash report not saved keeps the error name for a save error with no next step" {
+    var buffer: [512]u8 = undefined;
+    try std.testing.expectEqualStrings("fx: crash report not saved (OutOfMemory)\n", crashReportNotSavedText(&buffer, error.OutOfMemory));
 }
 
 test "app entry does not save a crash report for a hang-up" {
