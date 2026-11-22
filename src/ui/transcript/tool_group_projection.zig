@@ -4675,8 +4675,6 @@ fn buildWithStyleAndStats(
     return projection;
 }
 
-/// Fills `projection` with every entry's action. The caller owns the state
-/// it works in and frees it.
 /// The row that shows the call of the group's last status entry.
 fn lastStatusRow(entries: []const TranscriptEntry, status_indices: []const usize, rows: []StoryRow) ?*StoryRow {
     if (status_indices.len == 0) return null;
@@ -4821,6 +4819,8 @@ fn statusDetail(
     return detailForEntry(details, detail_indices, entry_id, null);
 }
 
+/// Fills `projection` with every entry's action. The caller owns the state
+/// it works in and frees it.
 fn fillProjection(
     alloc: std.mem.Allocator,
     projection: *Projection,

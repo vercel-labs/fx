@@ -4082,7 +4082,7 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
       }, async (session) => {
         await session.sendText("SWITCH_USER start them, then close tester");
         await until("main's turn that closes tester", () => mainCalls >= 3);
-        await session.waitForPane((pane) => pane.includes("Messaged tester"), 15_000);
+        await session.waitForPane((pane) => pane.includes("Started tester"), 15_000);
         await session.sendKeys("C-x");
         await session.waitForText(LIST_HINT, 10_000);
         const rows = agentRows(await session.capturePaneEscapes()).map((row) => row.name);
@@ -4158,9 +4158,9 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         }, async (session) => {
           await session.sendText("SWITCH_USER start the reviewer and the builder");
           // The name has arrived and the rest of the call has not.
-          await session.waitForText("Managing reviewer", 15_000);
+          await session.waitForText("Starting reviewer", 15_000);
           nameSent.release();
-          await session.waitForText("Messaged reviewer", 15_000);
+          await session.waitForText("Started reviewer", 15_000);
           // Both are working when main checks on them and then waits.
           await session.waitForText("Checked reviewer, builder", 15_000);
           await session.waitForText("Waiting for reviewer, builder", 15_000);
