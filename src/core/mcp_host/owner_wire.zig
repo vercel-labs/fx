@@ -83,6 +83,10 @@ pub const ClientMessage = union(enum) {
     bye,
 };
 
+/// Why the owner refused one request, so the session falls back for that one
+/// server or call instead of losing the connection.
+pub const Refused = enum { unknown_client, not_registered, too_many_keys, too_many_calls };
+
 /// What the owner sends a session.
 pub const OwnerMessage = union(enum) {
     welcome: struct { owner: u32 },
@@ -103,6 +107,11 @@ pub const OwnerMessage = union(enum) {
     elicitation_complete: struct { key: share_key.Key, slot: u8 },
     elicit_withdrawn: struct { key: share_key.Key, slot: u8 },
     stopped_idle: struct { key: share_key.Key },
+    /// The owner refused one request. `key` names the server it was about when
+    /// it named one, and `call` the call's id when it was a call: the session
+    /// falls back for that server, or ends that call as one that never went
+    /// out, and every other key on the connection keeps working.
+    refused: struct { reason: Refused, key: ?share_key.Key = null, call: ?u32 = null },
     status: struct { key: share_key.Key, phase: mcp.engine.Phase, version: ?[]const u8 = null, last_error: ?[]const u8 = null, stderr_tail: ?[]const u8 = null, instructions: ?[]const u8 = null, exit_code: ?u8 = null, exit_signal: ?u8 = null, stray_line: ?[]const u8 = null },
 };
 
@@ -273,6 +282,11 @@ fn writeOwnerFields(writer: *std.Io.Writer, comptime tag: std.meta.Tag(OwnerMess
             try uint(writer, "slot", m.slot);
         },
         .stopped_idle => try bytes(writer, "key", &m.key),
+        .refused => {
+            try textField(writer, "reason", @tagName(m.reason));
+            if (m.key) |key| try bytes(writer, "key", &key);
+            if (m.call) |id| try uint(writer, "call", id);
+        },
         .status => {
             try bytes(writer, "key", &m.key);
             try textField(writer, "phase", @tagName(m.phase));
@@ -380,6 +394,11 @@ fn ownerMessage(object: std.json.ObjectMap, tag: std.meta.Tag(OwnerMessage)) Dec
             .version = try optionalText(object, "version"),
             .required = try boolFieldDefault(object, "required", false),
         } },
+        .refused => .{ .refused = .{
+            .reason = try enumField(Refused, object, "reason"),
+            .key = try optionalKey(object, "key"),
+            .call = try optionalU32(object, "call"),
+        } },
         .elicitation_complete => .{ .elicitation_complete = .{
             .key = try keyField(object, "key"),
             .slot = try u8Field(object, "slot"),
@@ -483,6 +502,11 @@ fn u32Field(object: std.json.ObjectMap, key: []const u8) DecodeError!u32 {
     return @intCast(value.integer);
 }
 
+fn optionalU32(object: std.json.ObjectMap, key: []const u8) DecodeError!?u32 {
+    if (object.get(key) == null) return null;
+    return try u32Field(object, key);
+}
+
 fn u32FieldDefault(object: std.json.ObjectMap, key: []const u8, default: u32) DecodeError!u32 {
     const value = object.get(key) orelse return default;
     if (value != .integer or value.integer < 0 or value.integer > std.math.maxInt(u32)) return error.Malformed;
@@ -518,6 +542,11 @@ fn optionalFloatField(object: std.json.ObjectMap, key: []const u8) DecodeError!?
 
 fn enumField(comptime E: type, object: std.json.ObjectMap, key: []const u8) DecodeError!E {
     return std.meta.stringToEnum(E, try text(object, key)) orelse error.Malformed;
+}
+
+fn optionalKey(object: std.json.ObjectMap, key: []const u8) DecodeError!?share_key.Key {
+    if (object.get(key) == null) return null;
+    return try keyField(object, key);
 }
 
 fn keyField(object: std.json.ObjectMap, key: []const u8) DecodeError!share_key.Key {
@@ -569,6 +598,24 @@ const testing = std.testing;
 fn expectClient(arena: Allocator, message: ClientMessage) !ClientMessage {
     const frame = try encode(arena, message);
     return (try decode(arena, frame[header_bytes..])).client;
+}
+
+test "a refused request round-trips with its key and its call" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const key: share_key.Key = "00112233445566778899aabbccddeeff".*;
+    const keyed = try expectOwner(a, .{ .refused = .{ .reason = .too_many_keys, .key = key } });
+    try testing.expectEqual(Refused.too_many_keys, keyed.refused.reason);
+    try testing.expectEqual(key, keyed.refused.key.?);
+    try testing.expectEqual(@as(?u32, null), keyed.refused.call);
+    const called = try expectOwner(a, .{ .refused = .{ .reason = .too_many_calls, .key = key, .call = 9 } });
+    try testing.expectEqual(Refused.too_many_calls, called.refused.reason);
+    try testing.expectEqual(key, called.refused.key.?);
+    try testing.expectEqual(@as(?u32, 9), called.refused.call);
+    const bare = try expectOwner(a, .{ .refused = .{ .reason = .unknown_client } });
+    try testing.expectEqual(Refused.unknown_client, bare.refused.reason);
+    try testing.expectEqual(@as(?share_key.Key, null), bare.refused.key);
 }
 
 fn expectOwner(arena: Allocator, message: OwnerMessage) !OwnerMessage {
@@ -782,6 +829,8 @@ test "an owner wire frame decodes or is refused on fuzzed bytes, and what decode
             "{\"v\":2,\"t\":\"called\",\"id\":4,\"outcome\":\"result\",\"maybe_ran\":false,\"timed_out\":false,\"oversized\":false}",
             "{\"v\":2,\"t\":\"question\",\"key\":\"00112233445566778899aabbccddeeff\",\"slot\":256,\"n\":1,\"params\":\"{}\"}",
             "{\"v\":2,\"t\":\"status\",\"key\":\"00112233445566778899aabbccddeeff\",\"phase\":\"ready\",\"exit_code\":256}",
+            "{\"v\":2,\"t\":\"refused\",\"reason\":\"too_many_keys\",\"key\":\"00112233445566778899aabbccddeeff\"}",
+            "{\"v\":2,\"t\":\"refused\",\"reason\":\"too_many_calls\",\"key\":\"00112233445566778899aabbccddeeff\",\"call\":9}",
             "[]",
         }) ++ @import("fuzz_corpus").mcp_owner_wire.*),
     });

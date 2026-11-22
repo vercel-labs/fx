@@ -130,6 +130,10 @@ const Connection = struct {
     /// it, and only while it holds `Owner.mutex`, which is also how the reaper
     /// reads it.
     left_applied: bool = false,
+    /// The owner loop ended this connection's tasks, once, after it took the
+    /// client out of the route table. Written only by the loop, under
+    /// `Owner.mutex`, so a second leave ends nothing twice.
+    cancelled: bool = false,
 
     fn endTask(c: *Connection) void {
         _ = c.running.fetchSub(1, .acq_rel);
@@ -378,15 +382,27 @@ const Owner = struct {
         }
     }
 
-    /// Marks the route table's part of this client's leave as applied. Only the
-    /// owner loop calls it, under `o.mutex`, which is the same rule the reaper
-    /// reads `left_applied` by.
+    /// Marks the route table's part of this client's leave as applied, and ends
+    /// the connection's tasks. Only the owner loop calls it: the owner is not
+    /// one of those tasks, so the loop is the only place that can cancel them
+    /// once the client is out of the route table. A reader blocked in the
+    /// socket ends there, the reaper frees the connection after the close, and
+    /// the session reads EOF.
     fn markLeft(o: *Owner, id: core.ClientId) void {
+        var ended: ?*Connection = null;
         o.mutex.lockUncancelable(o.io);
-        defer o.mutex.unlock(o.io);
         const index = @backingInt(id);
-        if (index == 0 or index > core.max_clients) return;
-        if (o.connections[index - 1]) |conn| conn.left_applied = true;
+        if (index != 0 and index <= core.max_clients) if (o.connections[index - 1]) |conn| {
+            conn.left_applied = true;
+            if (!conn.cancelled and conn.running.load(.acquire) != 0) {
+                conn.cancelled = true;
+                ended = conn;
+            }
+        };
+        o.mutex.unlock(o.io);
+        // Outside the lock: the cancel waits for both tasks, and one of them
+        // may need this lock or the connection's to end.
+        if (ended) |conn| conn.tasks.cancel(o.io);
     }
 
     /// Marks the connection closed, tells the route table once, and wakes its
@@ -743,6 +759,7 @@ fn frameAbout(a: Allocator, message: wire.OwnerMessage) Allocator.Error![]const 
         .elicitation_complete => |m| a.print("key={s} slot={d}", .{ m.key[0..], m.slot }),
         .elicit_withdrawn => |m| a.print("key={s} slot={d}", .{ m.key[0..], m.slot }),
         .stopped_idle => |m| a.print("key={s}", .{m.key[0..]}),
+        .refused => |m| if (m.key) |key| a.print("key={s} reason={s}", .{ key[0..], @tagName(m.reason) }) else a.print("call={?d} reason={s}", .{ m.call, @tagName(m.reason) }),
         .status => |m| a.print("key={s}", .{m.key[0..]}),
         .called => |m| a.print("call={d}", .{m.id}),
         .progress => |m| a.print("call={d}", .{m.id}),
@@ -872,8 +889,14 @@ fn apply(owner: *Owner, state: *core.State, engine_value: *engine.Engine, scratc
         },
         .refuse => |refuse| {
             const conn = owner.connectionOf(refuse.to) orelse continue;
-            debug_trace.logf("mcp-owner", "owner client refused reason={s}", .{@tagName(refuse.reason)});
-            owner.disconnect(conn);
+            // One refused request, not one lost connection: the session falls
+            // back for this server or this call and keeps every other key.
+            debug_trace.logf("mcp-owner", "owner request refused reason={s} client={d} key={?s}", .{ @tagName(refuse.reason), @backingInt(refuse.to), if (refuse.key) |key| key[0..] else null });
+            sendFrame(owner, conn, .{ .refused = .{
+                .reason = refuse.reason,
+                .key = refuse.key,
+                .call = refuse.call,
+            } }, scratch.allocator());
         },
         .log => |log| debug_trace.logf("mcp-owner", "owner dropped user state what={s} client={?d}", .{ @tagName(log.what), if (log.client) |c| @backingInt(c) else null }),
     };
@@ -1501,6 +1524,59 @@ test "a connection whose writer cannot start ends its reader and is reaped" {
     try testing.expect(owner.connections[0] == null);
 }
 
+test "a client the owner disconnects is ended, reaped, and its id used again" {
+    const alloc = testing.allocator;
+    var stop = std.atomic.Value(bool).init(false);
+    var owner: Owner = .{ .io = testing.io, .gpa = alloc, .stop = &stop, .client_version = test_client_version, .engine_arena = .init(alloc) };
+    defer owner.engine_arena.deinit();
+    defer {
+        for (owner.events.items) |*event| event.deinit(alloc);
+        owner.events.deinit(alloc);
+    }
+    const first = try testSocketPair("owner-drop-1");
+    defer first.peer.close(testing.io);
+    try owner.addConnection(first.server);
+    const conn = owner.connections[0] orelse return error.ConnectionGone;
+
+    // The owner's own limit, not the session's: a client that overruns the
+    // event list is dropped by the owner itself.
+    for (0..max_pending_events) |_| owner.push(.{ .core = .{ .hello = conn.id } });
+    owner.push(.{ .core = .{ .hello = conn.id } });
+    try testing.expect(conn.gone and conn.closed);
+
+    // The loop steps the leave and ends both tasks, so the reader stops even
+    // though it is blocked in the socket.
+    owner.markLeft(conn.id);
+    const deadline = std.Io.Clock.awake.now(testing.io).toMilliseconds() + 5_000;
+    while (conn.running.load(.acquire) != 0) {
+        if (std.Io.Clock.awake.now(testing.io).toMilliseconds() > deadline) return error.TasksNeverEnded;
+        // Polls for the cancel to end the reader in its socket read.
+        try testing.io.sleep(.fromMilliseconds(10), .awake);
+    }
+    owner.reapConnections();
+    try testing.expect(owner.connections[0] == null);
+    // The session's end sees the close, so it learns the connection is gone:
+    // it reads what the owner sent first (the welcome), then end of file.
+    var buffer: [64]u8 = undefined;
+    const eof_deadline = std.Io.Clock.awake.now(testing.io).toMilliseconds() + 5_000;
+    while (true) {
+        var data = [_][]u8{buffer[0..]};
+        const read = try first.peer.readWithControl(testing.io, &data, &.{});
+        if (read.data_len == 0) break;
+        if (std.Io.Clock.awake.now(testing.io).toMilliseconds() > eof_deadline) return error.NoEof;
+    }
+
+    // Its id is free again: the next client gets the one the first had.
+    const second = try testSocketPair("owner-drop-2");
+    defer second.peer.close(testing.io);
+    try owner.addConnection(second.server);
+    const next = owner.connections[0] orelse return error.ConnectionGone;
+    try testing.expectEqual(@as(usize, 1), @backingInt(next.id));
+    owner.markLeft(next.id);
+    owner.reapConnections();
+    try testing.expect(owner.connections[0] == null);
+}
+
 test "two clients registered for one key share one server process" {
     const alloc = testing.allocator;
     const home = try shortHome(alloc);
@@ -1546,6 +1622,107 @@ test "two clients registered for one key share one server process" {
     stop.store(true, .release);
     thread.join();
     joined = true;
+}
+
+test "a client's 33rd key is refused for that key, and the connection keeps the rest" {
+    const alloc = testing.allocator;
+    const home = try shortHome(alloc);
+    defer removeHome(alloc, home);
+    var fixture: fake_server.Fixture = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    var stop = std.atomic.Value(bool).init(false);
+    const thread = try std.Thread.spawn(.{}, serveThread, .{ testing.io, alloc, home, &stop });
+    defer {
+        stop.store(true, .release);
+        thread.join();
+    }
+    const path = try socketPath(alloc, home);
+    defer alloc.free(path);
+    try waitForSocket(path);
+
+    var client = try TestClient.connect(path);
+    defer client.close();
+    try client.send(.{ .hello = .{ .pid = 1 } });
+
+    // Each key is its own launch config, so the owner gives each its own slot.
+    const hex = "0123456789abcdef";
+    var keys: [core.max_keys_per_client]core.Key = undefined;
+    var buffer: [40]u8 = undefined;
+    for (&keys, 0..) |*key, i| {
+        key.* = "00000000000000000000000000000000".*;
+        key.*[30] = hex[i / 16];
+        key.*[31] = hex[i % 16];
+        // The first key's server exists, so its need is answered at once; the
+        // others never start, because a registration alone starts nothing.
+        const server = if (i == 0) fixture.server else try std.mem.print(&buffer, "/nonexistent/server-{d}", .{i});
+        try client.send(.{ .register = .{
+            .key = key.*,
+            .config = .{ .argv = &.{server}, .timeouts = .{ .start_ms = 15_000 } },
+            .ask_form = false,
+            .ask_url = false,
+        } });
+    }
+    // One more than a client may hold: the owner refuses that key and says
+    // which, instead of dropping the connection.
+    const extra: core.Key = "ffffffffffffffffffffffffffffffff".*;
+    try client.send(.{ .register = .{
+        .key = extra,
+        .config = .{ .argv = &.{"/nonexistent/server-extra"}, .timeouts = .{ .start_ms = 15_000 } },
+        .ask_form = false,
+        .ask_url = false,
+    } });
+
+    var arena: std.heap.ArenaAllocator = .init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var refused = false;
+    const refusal_deadline = std.Io.Clock.awake.now(testing.io).toMilliseconds() + 15_000;
+    refusal: while (std.Io.Clock.awake.now(testing.io).toMilliseconds() < refusal_deadline) {
+        const message = client.receive(a, 1_000) catch |err| switch (err) {
+            error.Timeout => continue,
+            else => return err,
+        };
+        switch (message) {
+            .owner => |owner| switch (owner) {
+                .refused => |said| {
+                    try testing.expectEqual(wire.Refused.too_many_keys, said.reason);
+                    try testing.expectEqual(extra, said.key.?);
+                    refused = true;
+                    break :refusal;
+                },
+                else => {},
+            },
+            .client => return error.UnexpectedMessage,
+        }
+    }
+    try testing.expect(refused);
+
+    // The connection still works: its first key's need reaches the owner, and
+    // its answer comes back on the same socket.
+    try client.send(.{ .need = .{ .key = keys[0] } });
+    var answered = false;
+    const served_deadline = std.Io.Clock.awake.now(testing.io).toMilliseconds() + 20_000;
+    served: while (std.Io.Clock.awake.now(testing.io).toMilliseconds() < served_deadline) {
+        const message = client.receive(a, 1_000) catch |err| switch (err) {
+            error.Timeout => continue,
+            else => return err,
+        };
+        switch (message) {
+            .owner => |owner| switch (owner) {
+                .tools => |page| if (std.mem.eql(u8, &page.key, &keys[0])) {
+                    // The owner answered this key on the same connection, so
+                    // the refusal cost it nothing.
+                    try testing.expect(page.ok);
+                    answered = true;
+                    break :served;
+                },
+                else => {},
+            },
+            .client => return error.UnexpectedMessage,
+        }
+    }
+    try testing.expect(answered);
 }
 
 test "a client that leaves during a slow call does not end the other client's call" {

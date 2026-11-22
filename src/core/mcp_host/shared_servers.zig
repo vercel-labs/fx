@@ -68,6 +68,9 @@ pub const Slot = struct {
     stray_line: ?[]u8 = null,
     tools_store: tools.Store = .{},
     needing: bool = false,
+    /// The owner refused this key, so the session runs the server itself and
+    /// never registers it again.
+    refused: bool = false,
 };
 
 pub const Shared = struct {
@@ -83,6 +86,9 @@ pub const Shared = struct {
     pending: std.ArrayList(engine.Event) = .empty,
     arena: std.heap.ArenaAllocator,
     disconnected: bool = false,
+    /// Keys the owner refused, as their server names, owned here: the runtime
+    /// takes each one and runs that server in the session.
+    refused: std.ArrayList([]u8) = .empty,
 
     pub fn init(options: Options) Error!Shared {
         var client = owner_client.Client.init(options.io, options.gpa, options.fx_home, options.spawn_owner, options.wake) catch |err| switch (err) {
@@ -198,6 +204,7 @@ pub const Shared = struct {
     fn ensure(s: *Shared, name: []const u8) Error!*Slot {
         const i = s.index(name) orelse return error.SharingUnavailable;
         const slot = &s.slots.items[i];
+        if (slot.refused) return error.SharingUnavailable;
         if (slot.registered and !s.disconnected) return slot;
         s.client.ensureReady(owner_start_wait_ms) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
@@ -237,14 +244,6 @@ pub const Shared = struct {
     /// first.
     pub fn reconnect(s: *Shared, name: []const u8) Error!void {
         return s.needTools(name);
-    }
-
-    /// This session stops using the server. Only its own registration goes:
-    /// the owner keeps the server for every other session, and stops it when
-    /// the last one leaves.
-    pub fn disconnect(s: *Shared, name: []const u8) void {
-        const slot = s.slotOf(name) orelse return;
-        slot.registered = false;
     }
 
     /// The tools the owner last published for this server.
@@ -329,6 +328,13 @@ pub const Shared = struct {
     pub fn instructions(s: *Shared, name: []const u8) ?[]const u8 {
         const slot = s.slotOf(name) orelse return null;
         return slot.instructions;
+    }
+
+    /// The next server the owner refused, owned by the caller: the runtime
+    /// runs it in the session from then on.
+    pub fn nextRefused(s: *Shared) ?[]u8 {
+        if (s.refused.items.len == 0) return null;
+        return s.refused.orderedRemove(0);
     }
 
     /// The next event, or null. Event slices stay valid until the next take,
@@ -546,6 +552,47 @@ pub const Shared = struct {
                 };
                 s.pending.append(s.gpa, .{ .server = s.slots.items[i].name, .kind = .stopped_idle }) catch return;
             },
+            .refused => |refused| {
+                // One request refused: a call ends as one the server never
+                // got, and a key stops sharing, so the session runs that one
+                // server itself and every other key keeps working.
+                if (refused.call) |id| {
+                    const i = s.calls.get(id) orelse {
+                        debug_trace.logf("mcp", "shared refusal dropped reason=unknown call id={d}", .{id});
+                        return;
+                    };
+                    _ = s.calls.swapRemove(id);
+                    const slot = &s.slots.items[i];
+                    s.pending.append(s.gpa, .{ .server = slot.name, .kind = .{ .called = .{
+                        .call = handle_base | id,
+                        .outcome = .transport_failed,
+                        .maybe_ran = false,
+                        .timed_out = false,
+                        .answer = null,
+                    } } }) catch return;
+                    return;
+                }
+                const key = refused.key orelse {
+                    debug_trace.logf("mcp", "shared refusal dropped reason=unknown key reason={s}", .{@tagName(refused.reason)});
+                    return;
+                };
+                const i = s.indexByKey(key) orelse {
+                    debug_trace.logf("mcp", "shared refusal dropped reason=unknown key", .{});
+                    return;
+                };
+                const slot = &s.slots.items[i];
+                slot.refused = true;
+                slot.registered = false;
+                slot.needing = false;
+                const name = s.gpa.dupe(u8, slot.name) catch |err| {
+                    debug_trace.logf("mcp", "shared refusal dropped server={s} reason=out of memory err={s}", .{ slot.name, @errorName(err) });
+                    return;
+                };
+                s.refused.append(s.gpa, name) catch |err| {
+                    s.gpa.free(name);
+                    debug_trace.logf("mcp", "shared refusal dropped server={s} reason=out of memory err={s}", .{ slot.name, @errorName(err) });
+                };
+            },
         }
     }
 
@@ -556,6 +603,8 @@ pub const Shared = struct {
 
     pub fn deinit(s: *Shared) void {
         s.client.deinit();
+        for (s.refused.items) |name| s.gpa.free(name);
+        s.refused.deinit(s.gpa);
         for (s.slots.items) |*slot| {
             slot.tools_store.deinit(s.gpa);
             if (slot.version) |v| s.gpa.free(v);

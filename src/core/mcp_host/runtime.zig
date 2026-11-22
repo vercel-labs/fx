@@ -28,6 +28,7 @@ const tool_mcp_runtime = @import("../tooling/tool_mcp_runtime.zig");
 const json_decode = @import("../shared/json_decode.zig");
 const json_depth = @import("../shared/json_depth.zig");
 const shared_servers = @import("shared_servers.zig");
+const owner_core = @import("owner_core.zig");
 const share_key = @import("share_key.zig");
 
 const Allocator = std.mem.Allocator;
@@ -971,9 +972,23 @@ pub const Runtime = struct {
             };
             // The shared servers' events come from the owner, in the shape
             // the engine's do, so `onEvent` handles both.
-            if (r.shared) |*s| while (s.take()) |e| {
-                r.onEvent(e) catch |err| debug_trace.logf("mcp", "MCP shared event handling failed server={s} err={s}", .{ e.server, @errorName(err) });
-            };
+            if (r.shared) |*s| {
+                while (s.take()) |e| {
+                    r.onEvent(e) catch |err| debug_trace.logf("mcp", "MCP shared event handling failed server={s} err={s}", .{ e.server, @errorName(err) });
+                }
+                // A key the owner refused runs in this session from now on,
+                // while every other shared key keeps its owner.
+                while (s.nextRefused()) |refused| {
+                    defer r.gpa.free(refused);
+                    r.runHere(refused) catch |err| {
+                        debug_trace.logf("mcp", "MCP server not run in this session server={s} reason=owner refused it err={s}", .{ refused, @errorName(err) });
+                        continue;
+                    };
+                    r.engine.needTools(refused) catch |err| {
+                        debug_trace.logf("mcp", "MCP tool list not started server={s} err={s}", .{ refused, @errorName(err) });
+                    };
+                }
+            }
             r.expireLogins();
             r.endLogouts();
             r.retryRefreshes();
@@ -4481,6 +4496,55 @@ test "a failed call's error data is kept whole or cut at a character, within the
     try std.testing.fuzz({}, fuzzErrorData, .{
         .corpus = &(.{""} ++ @import("fuzz_corpus").mcp_error_data.*),
     });
+}
+
+test "a session past the owner's key limit runs the extra server itself" {
+    var f: Fixture = undefined;
+    try f.init();
+    defer f.deinit();
+    const home = try sharedHome("keys");
+    defer freeSharedHome(home);
+    var stop = std.atomic.Value(bool).init(false);
+    const served = try std.Thread.spawn(.{}, serveOwner, .{ testing.io, testing.allocator, home, &stop });
+    defer {
+        stop.store(true, .release);
+        served.join();
+    }
+    try waitForOwner(home);
+
+    // One more server than the owner gives one session, each with its own name
+    // and so its own key.
+    const count = owner_core.max_keys_per_client + 1;
+    var names: [count][16]u8 = undefined;
+    var configs: [count]mcp_contract.McpServerConfig = undefined;
+    for (&configs, &names, 0..) |*server, *name, i| {
+        name.* = "srv-000000000000".*;
+        name.*[14] = "0123456789abcdef"[i / 16];
+        name.*[15] = "0123456789abcdef"[i % 16];
+        server.* = .{ .name = name, .command = f.server };
+    }
+    var options = f.options();
+    options.share = .{ .fx_home = home, .spawn_owner = false };
+    var r: Runtime = undefined;
+    try r.start(testing.allocator, testing.io, &configs, &f.inherited, options);
+    defer r.deinit();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // The owner takes the first 32 and runs them.
+    for (configs[0..owner_core.max_keys_per_client]) |server| {
+        const listed = try r.tools(a, server.name, null);
+        try testing.expectEqual(@as(usize, 1), listed.tools.len);
+    }
+    // The 33rd is refused a key, so this session runs it itself and still
+    // lists its tools.
+    const extra = try r.tools(a, configs[owner_core.max_keys_per_client].name, null);
+    try testing.expectEqual(@as(usize, 1), extra.tools.len);
+    // The refusal cost the connection nothing: a key the owner runs answers
+    // again.
+    const again = try r.tools(a, configs[0].name, null);
+    try testing.expectEqual(@as(usize, 1), again.tools.len);
 }
 
 test "a shared server's status comes from the owner" {

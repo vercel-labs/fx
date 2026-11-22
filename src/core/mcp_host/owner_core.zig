@@ -160,17 +160,10 @@ pub const Broadcast = union(enum) {
     elicit_withdrawn: u8,
 };
 
-/// Why a client's request was refused, so its session can fall back.
-pub const Refuse = enum {
-    /// The shell sent an event for a connection it never numbered.
-    unknown_client,
-    /// The client never registered for that key.
-    not_registered,
-    /// The owner already has 256 keys.
-    too_many_keys,
-    /// The client already holds 24 calls.
-    too_many_calls,
-};
+/// Why a client's request was refused, so its session can fall back. The wire
+/// message carries the same names, so the owner sends one without a mapping
+/// table to keep in step.
+pub const Refuse = wire.Refused;
 
 /// User state the core drops.
 pub const Drop = enum {
@@ -199,7 +192,10 @@ pub const Drop = enum {
 pub const Effect = union(enum) {
     send: struct { to: ClientId, message: wire.OwnerMessage },
     broadcast: struct { key: Key, what: Broadcast },
-    refuse: struct { to: ClientId, reason: Refuse },
+    /// One request refused, so its session falls back for that server or call
+    /// alone. `key` names the server it was about when it named one, and
+    /// `call` the session's call id when it was a call.
+    refuse: struct { to: ClientId, reason: Refuse, key: ?Key = null, call: ?u32 = null },
     /// The shell adds this key's server to the engine.
     register_slot: struct { key: Key },
     /// The last client registered for the key left: the shell disconnects it,
@@ -274,9 +270,9 @@ fn onRegistered(state: *State, added: Registered, out: *Output) void {
     if (registered(state, added.client, added.key)) return;
     const fresh = slotFor(state, added.key) == null;
     if (keysOf(state, added.client) >= max_keys_per_client) {
-        return out.push(.{ .refuse = .{ .to = added.client, .reason = .too_many_keys } });
+        return out.push(.{ .refuse = .{ .to = added.client, .reason = .too_many_keys, .key = added.key } });
     }
-    if (fresh and freeSlots(state) == 0) return out.push(.{ .refuse = .{ .to = added.client, .reason = .too_many_keys } });
+    if (fresh and freeSlots(state) == 0) return out.push(.{ .refuse = .{ .to = added.client, .reason = .too_many_keys, .key = added.key } });
     const slot = ensureSlot(state, added.key).?;
     slot.clients.set(@backingInt(added.client) - 1);
     const stored = &state.clients[@backingInt(added.client) - 1].?;
@@ -368,17 +364,17 @@ fn onUnregister(state: *State, id: ClientId, key: Key, out: *Output) void {
 }
 
 fn onNeed(state: *State, client: ClientId, key: Key, out: *Output) void {
-    if (!registered(state, client, key)) return out.push(.{ .refuse = .{ .to = client, .reason = .not_registered } });
+    if (!registered(state, client, key)) return out.push(.{ .refuse = .{ .to = client, .reason = .not_registered, .key = key } });
     out.push(.{ .need = .{ .key = key } });
 }
 
 fn onCall(state: *State, request: CallRequest, out: *Output) void {
     _ = clientOrRefuse(state, request.client, out) orelse return;
-    if (!registered(state, request.client, request.key)) return out.push(.{ .refuse = .{ .to = request.client, .reason = .not_registered } });
+    if (!registered(state, request.client, request.key)) return out.push(.{ .refuse = .{ .to = request.client, .reason = .not_registered, .key = request.key, .call = request.id } });
     if (heldBy(state, request.client) >= max_calls_per_client) {
-        return out.push(.{ .refuse = .{ .to = request.client, .reason = .too_many_calls } });
+        return out.push(.{ .refuse = .{ .to = request.client, .reason = .too_many_calls, .key = request.key, .call = request.id } });
     }
-    const index = freeCall(state) orelse return out.push(.{ .refuse = .{ .to = request.client, .reason = .too_many_calls } });
+    const index = freeCall(state) orelse return out.push(.{ .refuse = .{ .to = request.client, .reason = .too_many_calls, .key = request.key, .call = request.id } });
     const id: CallId = @fromBackingInt(state.next_call);
     state.next_call += 1;
     state.calls[index] = .{ .id = id, .client = request.client, .client_call = request.id, .key = request.key };
@@ -981,6 +977,32 @@ test "a client that leaves answers the questions it holds and disconnects the ke
     step(&solo, .{ .gone = @fromBackingInt(1) }, &output);
     try testing.expectEqual(@as(usize, 1), output.len);
     try testing.expectEqualSlices(u8, &key_b, &output.effects()[0].disconnect.key);
+}
+
+test "a 33rd key is refused for that key alone, and the keys before it stay" {
+    var s: State = .{};
+    hello(&s, 1);
+    var keys: [max_keys_per_client]Key = undefined;
+    var output: Output = .{};
+    const hex = "0123456789abcdef";
+    for (&keys, 0..) |*key, i| {
+        // One distinct key per slot, spelled as its launch config's hash is.
+        key.* = "00000000000000000000000000000000".*;
+        key.*[30] = hex[i / 16];
+        key.*[31] = hex[i % 16];
+        register(&s, 1, key.*, false, false, &output);
+        try testing.expect(!hasEffect(output.effects(), .refuse));
+    }
+    // The client holds its 32: one more is refused, and the reason names it.
+    const extra: Key = "ffffffffffffffffffffffffffffffff".*;
+    register(&s, 1, extra, false, false, &output);
+    try testing.expectEqual(@as(usize, 1), output.len);
+    try testing.expectEqual(Refuse.too_many_keys, output.effects()[0].refuse.reason);
+    try testing.expectEqual(extra, output.effects()[0].refuse.key.?);
+    // The connection keeps its keys: a need on the first still goes out.
+    output = .{};
+    step(&s, .{ .need = .{ .client = @fromBackingInt(1), .key = keys[0] } }, &output);
+    try testing.expect(!hasEffect(output.effects(), .refuse));
 }
 
 test "a second registration for the same key adds no second slot, and an unregistered need is refused" {
